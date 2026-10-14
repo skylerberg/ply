@@ -1,39 +1,51 @@
 //! A derived `bin` decoder reads a constructor's record argument field by field and builds it in
-//! place, so a value decodes into as many objects as one holding the same fields as arguments.
+//! place: it makes no record of its own to copy in, as a decoder that read the record through the
+//! record's codec and wrapped what that answered would.
 
 import std.bin
 
+type Inner = { name: String, at: Int }
+
 type Named = | Named({ name: String, at: Int }) | Nameless
 
-type Pair = | Pair(String, Int) | Unpaired
+derive bin for Inner
 
 derive bin for Named
 
-derive bin for Pair
+/// `named_bin` as it would be if it read the argument through the record's own codec.
+fn wrapping() -> bin::BinCodec<Named> =
+  {
+    put: named_bin().put,
+    take: |b: Bytes, n: Int|
+      match bin::take_tag(b, n, 2) {
+        Err(e) -> Err(e),
+        Ok(t) -> match t.value {
+          0 -> match inner_bin().take(b, t.at) {
+            Err(e) -> Err(e),
+            Ok(r) -> Ok({ value: Named(r.value), at: r.at }),
+          },
+          _ -> Ok({ value: Nameless, at: t.at }),
+        },
+      },
+    shape: named_bin().shape,
+  }
 
-fn decoded_named(n: Int) -> Int / {abort.raise} = {
+/// The objects decoding `n` values with `codec` allocates.
+fn decoding(n: Int, codec: bin::BinCodec<Named>) -> Int / {abort.raise} = {
   let bytes = bin::encode(
     map(range(0, n), |i: Int| Named({ name: "x", at: i })),
     bin::list_bin(named_bin()),
   );
   metered(||
-    match bin::decode(bytes, bin::list_bin(named_bin())) {
-      Ok(xs) -> len(xs),
-      Err(_) -> 0,
-    }).allocations
+    match bin::decode(bytes, bin::list_bin(codec)) { Ok(xs) -> len(xs), Err(_) -> 0 }).allocations
 }
 
-fn decoded_pair(n: Int) -> Int / {abort.raise} = {
-  let bytes = bin::encode(map(range(0, n), |i: Int| Pair("x", i)), bin::list_bin(pair_bin()));
-  metered(||
-    match bin::decode(bytes, bin::list_bin(pair_bin())) {
-      Ok(xs) -> len(xs),
-      Err(_) -> 0,
-    }).allocations
-}
-
-test "a constructor's record argument decodes as its fields would" {
+test "a constructor's record argument is decoded into the constructor" {
   let x = Named({ name: "n", at: 3 });
   assert_eq(bin::decode(bin::encode(x, named_bin()), named_bin()), Ok(x));
-  assert_eq(decoded_named(100), decoded_pair(100))
+  assert_eq(bin::decode(bin::encode(x, named_bin()), wrapping()), Ok(x));
+  // A record of its own for each value is at least an object more for each.
+  let wrapped = decoding(110, wrapping()) - decoding(10, wrapping());
+  let built = decoding(110, named_bin()) - decoding(10, named_bin());
+  assert(wrapped >= built + 100)
 }

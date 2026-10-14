@@ -1,7 +1,8 @@
 //! The C emitter: writes the C for one lowered body, or `None` for a form it does not cover.
 //! Output is diffed byte for byte against the Rust back end, so emission order and temporary numbering are load-bearing.
 
-import parsing (Ident, Span, dummy_span, span_key, ParseDiag, qname_text, starts_upper)
+import parsing (Ident, Span, dummy_span, span_key, ParseDiag, qname_text, starts_upper,
+                span_between)
 import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpdate,
              NInlined, Lambda, NApp, NRecord, NMatch, CodePattern, PxWild, PxVar, PxLit, PxRange,
              PxCtor, PxRecord, PxList, CodePatternField, NPerform, NLabel, NCell, NLambda,
@@ -163,7 +164,15 @@ pub type Ctors = { names: List<Bytes>, laid: Map<Bytes, List<FieldTy>> }
 fn no_ctors() -> Ctors = { names: [], laid: map_new() }
 
 /// `TyOpen([])` names the type variables that left the layout unknown, which a specialisation settles.
-pub type Ty = | TyOpen(List<Int>) | TyRec(List<FieldTy>) | TyBytes | TyList | TyArr(Option<FieldTy>)
+/// `TyOf` is a word of an `Option` or a `Result`, whose type says what each constructor's argument
+/// is laid out as.
+pub type Ty =
+  | TyOpen(List<Int>)
+  | TyRec(List<FieldTy>)
+  | TyBytes
+  | TyList
+  | TyArr(Option<FieldTy>)
+  | TyOf(Type)
 
 /// The type the checker settled an operator's operands at, which alone decides what the operator
 /// means; how an operand happens to be held only decides how it is read. `OWord` is read by the
@@ -9546,7 +9555,11 @@ fn pat_test(
       match list_at(c.args, 0) {
         None -> Some({ emitter: emitter, expr: case.test }),
         Some(sub) -> if irrefutable(sub) { Some({ emitter: emitter, expr: case.test }) } else {
-          match pat_test(sub, { kind: KBoxed, expr: case.arg, ty: subj.ty }, emitter) {
+          match pat_test(
+              sub,
+              { kind: KBoxed, expr: case.arg, ty: arg_ty(emitter, subj, c.name) },
+              emitter,
+            ) {
             None -> None,
             Some(inner) ->
               Some({
@@ -9587,7 +9600,14 @@ fn pat_test(
                 Some(t) -> match list_at(c.args, k) {
                   None -> None,
                   Some(sub) -> if irrefutable(sub) { Some(t) } else {
-                    let field = arg_tested(t.emitter, t.expr, subj.expr, k, laid);
+                    let read = arg_tested(t.emitter, t.expr, subj.expr, k, laid);
+                    let field = {
+                      emitter: read.emitter,
+                      value: {
+                        ..read.value,
+                        ty: known_or(read.value.ty, arg_ty(read.emitter, subj, c.name)),
+                      },
+                    };
                     match pat_test(sub, field.value, field.emitter) {
                       None -> None,
                       Some(inner) ->
@@ -9886,11 +9906,12 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
         None -> emitter,
         Some(sub) -> {
           let case = sum_case(emitter, subj.kind, c.name, subj.expr);
+          let ty = arg_ty(emitter, subj, c.name);
           if case.arg == subj.expr {
-            let w = bind_keeping(emitter, KBoxed, subj.ty, subj.expr);
+            let w = bind_keeping(emitter, KBoxed, ty, subj.expr);
             pat_bind(ensure_owned(w.emitter, w.value), sub, w.value)
           } else {
-            let w = bind_keeping(emitter, KBoxed, subj.ty, case.arg);
+            let w = bind_keeping(emitter, KBoxed, ty, case.arg);
             if emitter.release && spendable(w.emitter, subj.expr) {
               let moved = line(
                 note_made(spend_made(w.emitter, subj.expr), w.value.expr),
@@ -9913,10 +9934,9 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
           Some(x) -> x,
           None -> { at: i, kind: KBoxed, ty: TyOpen([]) },
         });
-        match list_at(c.args, i) {
-          Some(sub) -> pat_bind(w.emitter, sub, w.value),
-          None -> w.emitter,
-        }
+        // The object holds the argument as a word, which the subject's type says the layout of.
+        let arg = { ..w.value, ty: known_or(w.value.ty, arg_ty(w.emitter, subj, c.name)) };
+        match list_at(c.args, i) { Some(sub) -> pat_bind(w.emitter, sub, arg), None -> w.emitter }
       })
     },
     // A record held back binds its values, each moved out where the record is spent; otherwise the
@@ -11343,6 +11363,7 @@ fn typed_value(emitter: Emitter, code: Code, value: CValue) -> CValue =
           },
           _ -> value,
         },
+        KSum(Tagged) -> if tagged_result(ty) { { ..value, ty: TyOf(ty) } } else { value },
         _ -> value,
       },
     },
@@ -11368,10 +11389,44 @@ fn typed(code: Code, made: Option<WithValue>) -> Option<WithValue> =
   }
 
 /// `value`, a word, read as a value of `ty` is laid out where `ty` is held as a word and says how.
-fn laid_as(value: CValue, ty: Type) -> CValue = {
-  let k = kind_of(ty);
-  if k.kind == KBoxed { { ..value, ty: known_or(k.ty, value.ty) } } else { value }
-}
+fn laid_as(value: CValue, ty: Type) -> CValue =
+  if kind_of(ty).kind == KBoxed { { ..value, ty: known_or(word_ty(ty), value.ty) } } else { value }
+
+/// What a word of type `ty` is laid out as: what `kind_of` reads of it, and an `Option` or a `Result`
+/// as its type, which its constructors' arguments are read by.
+fn word_ty(ty: Type) -> Ty =
+  match kind_of(ty).ty {
+    TyOpen(vs) -> match ty {
+      TyCon(c) -> if (c.name == b"Option" && len(c.args) == 1)
+          || (c.name == b"Result" && len(c.args) == 2) { TyOf(ty) }
+      else { TyOpen(vs) },
+      _ -> TyOpen(vs),
+    },
+    laid -> laid,
+  }
+
+/// What the argument of constructor `name` of the sum `subj` is laid out as, held as its word: an
+/// `Option` held as its payload's word says that payload's own layout, and a word of a known
+/// `Option` or `Result` type its argument's.
+fn arg_ty(emitter: Emitter, subj: CValue, name: Bytes) -> Ty =
+  if subj.kind == KSum(Zeroed) { subj.ty } else {
+    match subj.ty {
+      TyOf(of) -> match of {
+        TyCon(c) -> {
+          let bare = match tag_of(emitter, name) {
+            Some(tag) -> match list_at(emitter.ctors.names, tag) { Some(n) -> n, None -> name },
+            None -> name,
+          };
+          match list_at(c.args, if c.name == b"Result" && bare == b"Err" { 1 } else { 0 }) {
+            Some(t) -> word_ty(t),
+            None -> TyOpen([]),
+          }
+        },
+        _ -> TyOpen([]),
+      },
+      _ -> TyOpen([]),
+    }
+  }
 
 // --- Specialisation ----------------------------------------------------------------------------
 // A generic definition reached with a type argument laid out apart from a word is emitted again for
@@ -13776,6 +13831,34 @@ test "a value's layout is read off its node's type where the value carries none"
   assert_eq(has(b"builtin_max_p"), [true, true, true, true])
 }
 
+test "a constructor pattern reads its argument as the subject's type lays it out" {
+  let src = bytes_concat_all([
+    b"type P = { x: Int, y: Int }\n",
+    b"type E = { why: Bytes }\n",
+    b"fn made(n: Int) -> Result<P, E> = if n > 0 { Ok({ x: n, y: n }) } else { Err({ why: b\"low\" }) }\n",
+    b"fn found(n: Int) -> Option<P> = if n > 0 { Some({ x: n, y: n }) } else { None }\n",
+    b"fn summed(n: Int) -> Int = match made(n) { Ok({ x, y }) -> x + y, Err({ why }) -> bytes_len(why) }\n",
+    b"fn first(n: Int) -> Int = match made(n) { Ok({ x: 7, y }) -> y, Ok(p) -> p.x, Err(e) -> bytes_len(e.why) }\n",
+    b"fn either(n: Int) -> Int = match found(n) { Some({ x, y: 3 }) -> x, Some({ x, y }) -> x + y, None -> 0 }\n",
+    b"fn held(rs: List<Result<P, E>>) -> Int = match list_at(rs, 0) { Some(Ok({ x, y })) -> x + y, Some(Err({ why })) -> bytes_len(why), None -> 0 }\n",
+  ]);
+  let out = emit_all_program(
+    [{ name: b"m", src: src }],
+    [b"Some", b"None", b"Ok", b"Err"],
+    [b"list_at", b"bytes_len"],
+    true,
+  );
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None, None, None]);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(own_code(e.text), text) != None);
+  // Under `Ok`, `Err` and `Some`, held as a word or as an object, a record is read where its
+  // fields lie.
+  assert_eq(has(b"rt_field_p"), [false, false, false, false, false, false]);
+  assert_eq(has(b"rt_record_has_p"), [false, false, false, false, false, false]);
+  assert_eq(has(b"rt_record_fits_p"), [false, false, false, false, false, false]);
+  // A constructor's object holds its argument as a word: none is read as a record held in place.
+  assert_eq(has(b"(intptr_t)(ply_words("), [false, false, false, false, false, false])
+}
+
 test "an Option is its payload's word in the code that knows it, and its object where it leaves" {
   let src = bytes_concat_all([
     b"fn picked(c: Bool, s: String) -> Int = match if c { Some(s) } else { None } { Some(_) -> 1, None -> 0 }\n",
@@ -14043,7 +14126,7 @@ test "a record a pattern binds is read at the offsets its checked type gives" {
 }
 
 test "two operators on one span that the checker settled apart are left unsettled" {
-  let at = { start: 3, end: 9 };
+  let at = span_between(3, 9);
   let sites = [
     { module: 0, span: at, ty: b"Int", owner: b"m.f" },
     { module: 0, span: at, ty: b"U8", owner: b"m.g" },

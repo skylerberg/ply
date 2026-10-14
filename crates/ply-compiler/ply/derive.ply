@@ -1,6 +1,7 @@
 //! `derive D for T` becomes an ordinary definition: generated as source, parsed back, and retargeted.
 
-import parsing (Span, Ident, QName, span_to, is_bare, qname_text)
+import parsing (Span, Ident, QName, span_to, span_key, is_bare, qname_text, span_between,
+                span_generated)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, ty_span, mode_text, angled, generics_text, is_generic,
                     ident_names, type_expr_bin)
@@ -8,15 +9,16 @@ import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
-              MatchArm, HandleClause, ReturnClause, RecField, hidden_binder, ETagged, Hole)
+              MatchArm, HandleClause, ReturnClause, RecField, hidden_binder, ETagged, Hole,
+              expr_span)
 import items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TypeDefBody, TDAlias, TDSum,
               VariantDef, DeriveDef, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric,
               DInteger, DRow, deriver_text, deriver_tag, ImportDecl, ImportKind, IModule, IAlias,
               INames, Vis, VPub, VPriv, Derived, Constraint, SpecClause, parse, constraint_written,
               TDNominal, IInstance, InstanceDef, NKey, NShow)
-import rewrite (expand, find_type)
+import rewrite (expand, find_type, picked_in)
 import resolve (Diag, Source, error_at, error_at_and, dump_diags, path_span)
-import std.list (at, concat, contains)
+import std.list (at, concat, contains, unique)
 import std.bytes (join, ascii_of_int)
 import std.string (eq_ignore_ascii_case)
 import std.bin
@@ -1651,15 +1653,18 @@ fn render_atom(atom: AtomExpr) -> Bytes = {
   ])
 }
 
-// --- Every span in a generated definition becomes the `derive` item's ----------------------------
+// --- Every node of a generated definition stands at the `derive` item's place -------------------
 
-fn ident_at(ident: Ident, span: Span) -> Ident = { name: ident.name, span: span }
+fn ident_at(ident: Ident, span: Span) -> Ident = { name: ident.name, span: sited(ident.span, span) }
+
+/// The `derive` item's `span` as the place of the node generated at `own` in the item's text.
+fn sited(own: Span, span: Span) -> Span = span_generated(span, 1 + own.start * 268435456 + own.end)
 
 fn qname_at(qname: QName, span: Span) -> QName =
   {
     module: match qname.module { Some(m) -> Some(ident_at(m, span)), None -> None },
     name: ident_at(qname.name, span),
-    span: span,
+    span: sited(qname.span, span),
   }
 
 fn opt_ident_at(o: Option<Ident>, span: Span) -> Option<Ident> =
@@ -1668,7 +1673,7 @@ fn opt_ident_at(o: Option<Ident>, span: Span) -> Option<Ident> =
 fn retarget_fn(def: FnDef, span: Span) -> FnDef =
   {
     vis: def.vis,
-    name: ident_at(def.name, span),
+    name: { name: def.name.name, span: span },
     generics: {
       types: map(def.generics.types, |ident: Ident| ident_at(ident, span)),
       effects: map(def.generics.effects, |ident: Ident| ident_at(ident, span)),
@@ -1755,27 +1760,28 @@ fn retarget_field(field: RecField, span: Span) -> RecField =
 
 fn retarget_expr(e: Expr, span: Span) -> Expr =
   match e {
-    ELit(l) -> ELit({ span: span, lit: l.lit }),
-    EVar(v) -> EVar({ span: span, name: qname_at(v.name, span) }),
+    ELit(l) -> ELit({ span: sited(l.span, span), lit: l.lit }),
+    EVar(v) -> EVar({ span: sited(v.span, span), name: qname_at(v.name, span) }),
     EBinary(b) ->
       EBinary({
-        span: span,
+        span: sited(b.span, span),
         op: b.op,
         lhs: retarget_expr(b.lhs, span),
         rhs: retarget_expr(b.rhs, span),
       }),
-    EUnary(u) -> EUnary({ span: span, op: u.op, operand: retarget_expr(u.operand, span) }),
+    EUnary(u) ->
+      EUnary({ span: sited(u.span, span), op: u.op, operand: retarget_expr(u.operand, span) }),
     // A lambda's written return type is deliberately not retargeted.
     ELambda(l) ->
       ELambda({
-        span: span,
+        span: sited(l.span, span),
         body: retarget_expr(l.body, span),
         params: map(l.params, |p: Param| retarget_param(p, span)),
         ret: l.ret,
       }),
     EApp(a) ->
       EApp({
-        span: span,
+        span: sited(a.span, span),
         func: retarget_expr(a.func, span),
         named: map(a.named, |arg: NamedArg|
           { name: arg.name, value: retarget_expr(arg.value, span), span: arg.span }),
@@ -1784,39 +1790,39 @@ fn retarget_expr(e: Expr, span: Span) -> Expr =
       }),
     EIf(i) ->
       EIf({
-        span: span,
+        span: sited(i.span, span),
         cond: retarget_expr(i.cond, span),
         then_branch: retarget_expr(i.then_branch, span),
         else_branch: retarget_expr(i.else_branch, span),
       }),
     EMatch(m) ->
       EMatch({
-        span: span,
+        span: sited(m.span, span),
         scrutinee: retarget_expr(m.scrutinee, span),
         arms: map(m.arms, |arm: MatchArm|
           {
             pat: retarget_pat(arm.pat, span),
             guard: retarget_opt_expr(arm.guard, span),
             body: retarget_expr(arm.body, span),
-            span: span,
+            span: sited(m.span, span),
           }),
       }),
     EBlock(b) ->
       EBlock({
-        span: span,
+        span: sited(b.span, span),
         tail: retarget_opt_expr(b.tail, span),
         stmts: map(b.stmts, |stmt: Stmt|
           match stmt {
             SLet(l) ->
               SLet({
-                span: span,
+                span: sited(l.span, span),
                 pat: retarget_pat(l.pat, span),
                 ty: match l.ty { Some(t) -> Some(retarget_ty(t, span)), None -> None },
                 value: retarget_expr(l.value, span),
               }),
             SLetElse(l) ->
               SLetElse({
-                span: span,
+                span: sited(l.span, span),
                 pat: retarget_pat(l.pat, span),
                 ty: match l.ty { Some(t) -> Some(retarget_ty(t, span)), None -> None },
                 value: retarget_expr(l.value, span),
@@ -1826,20 +1832,28 @@ fn retarget_expr(e: Expr, span: Span) -> Expr =
           }),
       }),
     ERecord(r) ->
-      ERecord({ span: span, fields: map(r.fields, |f: RecField| retarget_field(f, span)) }),
+      ERecord({
+        span: sited(r.span, span),
+        fields: map(r.fields, |f: RecField| retarget_field(f, span)),
+      }),
     ERecordUpdate(r) ->
       ERecordUpdate({
-        span: span,
+        span: sited(r.span, span),
         base: retarget_expr(r.base, span),
         fields: map(r.fields, |f: RecField| retarget_field(f, span)),
       }),
-    ETry(t) -> ETry({ span: span, operand: retarget_expr(t.operand, span) }),
+    ETry(t) -> ETry({ span: sited(t.span, span), operand: retarget_expr(t.operand, span) }),
     EField(f) ->
-      EField({ span: span, base: retarget_expr(f.base, span), field: ident_at(f.field, span) }),
-    EList(l) -> EList({ span: span, items: map(l.items, |x: Expr| retarget_expr(x, span)) }),
+      EField({
+        span: sited(f.span, span),
+        base: retarget_expr(f.base, span),
+        field: ident_at(f.field, span),
+      }),
+    EList(l) ->
+      EList({ span: sited(l.span, span), items: map(l.items, |x: Expr| retarget_expr(x, span)) }),
     EPerform(p) ->
       EPerform({
-        span: span,
+        span: sited(p.span, span),
         eff: qname_at(p.eff, span),
         op: ident_at(p.op, span),
         resource: opt_ident_at(p.resource, span),
@@ -1847,14 +1861,14 @@ fn retarget_expr(e: Expr, span: Span) -> Expr =
       }),
     EHandle(h) ->
       EHandle({
-        span: span,
+        span: sited(h.span, span),
         body: retarget_expr(h.body, span),
         ret: match h.ret {
           Some(rc) ->
             Some({
               binder: ident_at(rc.binder, span),
               body: retarget_expr(rc.body, span),
-              span: span,
+              span: sited(rc.span, span),
             }),
           None -> None,
         },
@@ -1867,13 +1881,13 @@ fn retarget_expr(e: Expr, span: Span) -> Expr =
             label_binder: opt_ident_at(c.label_binder, span),
             resume: opt_ident_at(c.resume, span),
             body: retarget_expr(c.body, span),
-            span: span,
+            span: sited(c.span, span),
             params: map(c.params, |p: Ident| ident_at(p, span)),
           }),
       }),
     EWithCell(c) ->
       EWithCell({
-        span: span,
+        span: sited(c.span, span),
         resource: ident_at(c.resource, span),
         init: retarget_expr(c.init, span),
         binder: ident_at(c.binder, span),
@@ -1881,55 +1895,60 @@ fn retarget_expr(e: Expr, span: Span) -> Expr =
       }),
     EWithHold(c) ->
       EWithHold({
-        span: span,
+        span: sited(c.span, span),
         resource: ident_at(c.resource, span),
         acquire: retarget_expr(c.acquire, span),
         release: retarget_expr(c.release, span),
         binder: ident_at(c.binder, span),
         body: retarget_expr(c.body, span),
       }),
-    ESimulate(x) -> ESimulate({ span: span, body: retarget_expr(x.body, span) }),
+    ESimulate(x) -> ESimulate({ span: sited(x.span, span), body: retarget_expr(x.body, span) }),
     EParallel(x) ->
-      EParallel({ span: span, branches: map(x.branches, |b: Expr| retarget_expr(b, span)) }),
+      EParallel({
+        span: sited(x.span, span),
+        branches: map(x.branches, |b: Expr| retarget_expr(b, span)),
+      }),
     ETagged(t) ->
       ETagged({
         ..t,
-        span: span,
+        span: sited(t.span, span),
         tag: ident_at(t.tag, span),
         quoted: span,
         holes: map(t.holes, |h: Hole|
           { value: retarget_expr(h.value, span), text: h.text, quoted: span }),
       }),
     EBad(_) -> EBad({ span: span }),
-    ETryBlock(x) -> ETryBlock({ ..x, span: span, body: retarget_expr(x.body, span) }),
+    ETryBlock(x) ->
+      ETryBlock({ ..x, span: sited(x.span, span), body: retarget_expr(x.body, span) }),
   }
 
 fn retarget_pat(p: Pattern, span: Span) -> Pattern =
   match p {
     PWild(_) -> PWild({ span: span }),
-    PVar(v) -> PVar({ span: span, name: ident_at(v.name, span) }),
-    PLit(l) -> PLit({ span: span, lit: l.lit }),
-    PRange(r) -> PRange({ ..r, span: span }),
+    PVar(v) -> PVar({ span: sited(v.span, span), name: ident_at(v.name, span) }),
+    PLit(l) -> PLit({ span: sited(l.span, span), lit: l.lit }),
+    PRange(r) -> PRange({ ..r, span: sited(r.span, span) }),
     PCtor(c) ->
       PCtor({
-        span: span,
+        span: sited(c.span, span),
         name: qname_at(c.name, span),
         args: map(c.args, |a: Pattern| retarget_pat(a, span)),
       }),
     PRecord(r) ->
       PRecord({
-        span: span,
+        span: sited(r.span, span),
         rest: r.rest,
         fields: map(r.fields, |f: { name: Ident, pat: Pattern }|
           { name: ident_at(f.name, span), pat: retarget_pat(f.pat, span) }),
       }),
     PList(l) ->
       PList({
-        span: span,
+        span: sited(l.span, span),
         rest: match l.rest { Some(r) -> Some(retarget_pat(r, span)), None -> None },
         items: map(l.items, |i: Pattern| retarget_pat(i, span)),
       }),
-    POr(o) -> POr({ span: span, alts: map(o.alts, |a: Pattern| retarget_pat(a, span)) }),
+    POr(o) ->
+      POr({ span: sited(o.span, span), alts: map(o.alts, |a: Pattern| retarget_pat(a, span)) }),
     PBad(_) -> PBad({ span: span }),
   }
 
@@ -2631,16 +2650,22 @@ test "a selective import of std.json still writes a module binder, stepping arou
   )
 }
 
-test "every span in a generated definition is the derive item's" {
-  let src = b"import std.json\ntype Order = {id: Int}\nderive json for Order";
+test "every node of a generated definition stands at the derive item's place, told apart from the rest" {
+  let src = b"import std.json\ntype Order = {id: Int, name: String}\nderive json for Order";
   let x = expand_derives(0, b"t", parse(src).node);
   assert_eq(len(x.derived), 1);
   let d = at(x.derived, 0);
-  assert_eq(d.span, { start: 39, end: 60 });
+  assert_eq(d.span, span_between(53, 74));
   match at(x.module.items, len(x.module.items) - 1) {
     IFn(f) -> {
       assert_eq(f.span, d.span);
-      assert_eq(f.name.span, d.span)
+      assert_eq(f.name.span, d.span);
+      let spans = map(picked_in({ ..x.module, items: [IFn(f)] }, |_: Expr| true), expr_span);
+      assert(len(spans) > 4);
+      assert_eq(map(spans, |s: Span| span_between(s.start, s.end)), map(spans, |_: Span| d.span));
+      // Each is a site of its own for what the checker files of it.
+      assert_eq(len(unique(map(spans, span_key))), len(spans));
+      assert_eq(filter(spans, |s: Span| s.gen == 0), [])
     },
     _ -> assert(false),
   }
