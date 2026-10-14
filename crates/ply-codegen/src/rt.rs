@@ -4969,6 +4969,11 @@ fn unwrapped(ctx: &mut Ctx, answer: Word) -> Word {
     v
 }
 
+/// A write of one element the emitted code made: in place, or into a copy of `copied` elements.
+pub unsafe extern "C" fn rt_note_update(_ctx: *mut Ctx, in_place: i64, copied: i64) {
+    ply_eval::rc::note_update_of(in_place != 0, copied as usize, Span::DUMMY);
+}
+
 /// `Array::at` as an `Option` held as its payload's word, like [`rt_map_lookup`].
 pub unsafe extern "C" fn rt_array_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
