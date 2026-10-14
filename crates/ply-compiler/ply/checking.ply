@@ -36,7 +36,7 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, Sh
               shipped_data_bin, read_outline, named_imports, Outlined, OTest, OLaw, ShippedWants,
               shipped_wants_bin)
 import items (Module, Item, IType, ILaw, ImportDecl, INames, header, parse, import_decl_bin,
-              calls_on_values, is_written)
+              homes_called, homes_declaring, is_written)
 import derive (dotted)
 import diagnostics (ParsedSource, parse_all, parse_at, parse_from, placed)
 import interface (imported, blanked)
@@ -45,7 +45,6 @@ import pkg (PackageSources, Judged, judged, judged_bin, placeless, place_token, 
 import resolve (Source, ParsedModule, Diag, Label, backticked, diag_bin, error_at, import_binder,
                 path_span, import_module_name, source_bin, qualify)
 import parsing (Ident, Span, ParseDiag, span_bin, dummy_span)
-import exprs (home_modules)
 import infer (DefInfo, TestInfo, walk_order, Walks, Only)
 import hash (Fixed, FixedTest, FixedLaw, Fixing, NodeRef, Shapes, Shape, no_fixing, module_forms,
              hashed_forms, fixing_bin, shapes_bin, fixed_bin, pin_key, joined_forms)
@@ -394,11 +393,8 @@ fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, decode.write, a
       let targets = raw.imports.map(|d: ImportDecl| target_of(module, shipped, prefix, package, d));
       let imported_there = targets.filter(|t: Named|
         if t.shipped { shipped_there(t.module) } else { placing_of(t.module) != None });
-      // A module outside the library calls the language's types' functions with no import.
-      let homes = if shipped || !calls_on_values(src) { [] } else {
-        home_modules().filter(|h: Bytes|
-          shipped_there(h) && !imported_there.any(|t: Named| t.module == h))
-      };
+      let homes = homes_called(module, src, || homes_declaring(shipped_text)).filter(|h: Bytes|
+        shipped_there(h) && !imported_there.any(|t: Named| t.module == h));
       let present = imported_there;
       // An import that names nothing is refused with the shipped modules there are.
       let unread = if present.len() == targets.len() { [] } else {
@@ -1342,18 +1338,68 @@ pub fn group_answer_of(input: Bytes) -> Bytes / {Answering, abort.raise} = {
       },
       None -> {
         let members = asked.owners.map(|o: Bytes| owner_facts(named, o));
-        if alone {
-          let answer = cut_of(
-            asked.module,
-            unit_checked(named, members, imports_of(asked), entire, no_bodies),
-          );
-          offered_forms(group_query(), asked, members.map(|f: OwnerFacts| f.read), answer);
-          owned::group_kept(answer)
-        } else { owned::group_kept(group_settled(named, asked, members)) }
+        match refused_sibling(asked, members) {
+          Some(o) -> owned::group_kept(waiting(asked, o)),
+          None -> if alone {
+            let answer = cut_of(
+              asked.module,
+              unit_checked(named, members, imports_of(asked), entire, no_bodies),
+            );
+            offered_forms(group_query(), asked, members.map(|f: OwnerFacts| f.read), answer);
+            owned::group_kept(answer)
+          } else { owned::group_kept(group_settled(named, asked, members)) },
+        }
       },
     }
   }
 }
+
+/// An owner of `asked`'s module outside its unit, which a member mentions, whose group refuses and
+/// so shows no entry. A check against the module without it would refuse too, and its module's
+/// answer says what a check of it whole says whenever a group refuses.
+fn refused_sibling(
+  asked: GroupNamed,
+  members: List<OwnerFacts>,
+) -> Option<Bytes> / {Answering, abort.raise} = {
+  let at = |o: Bytes|
+    { module: asked.module, shipped: asked.shipped, tested: asked.tested, owner: o };
+  let unit = unit_named_of(at(asked.owners.at_or(0, b""))).owners;
+  members.fold([], |acc: List<Mention>, f: OwnerFacts| acc.concat(f.mentions)).fold(
+    None,
+    |found: Option<Bytes>, m: Mention|
+      match found {
+        Some(_) -> found,
+        None -> if m.module != asked.module && m.module != b"" { None } else {
+          declared_of(asked.module, asked.shipped, asked.tested, m.name).find(|o: Bytes|
+            !unit.contains(o) && (match owner_entry_of(at(o)) { Some(_) -> false, None -> true }))
+        },
+      },
+  )
+}
+
+/// What a group answers that waits on `owner`, whose group refuses: no member's entry, and a
+/// refusal its module's answer takes the whole check's place of, unchecked.
+fn waiting(asked: GroupNamed, owner: Bytes) -> owned::GroupAnswer / {abort.raise} =
+  {
+    ..owned::no_group(),
+    refused: [
+      error_at(
+        b"E0505",
+        0,
+        dummy_span(),
+        Bytes::concat_all([
+          backticked(asked.owners, b", "),
+          b" waits on `",
+          owner,
+          b"`, which does not check, and a check of `",
+          asked.module,
+          b"` whole refuses nothing",
+        ]),
+        b"the check was put off",
+        [b"this is Ply's fault, not the program's"],
+      ),
+    ],
+  }
 
 /// How a check reads an owner of its module that is none of its members: by the entry it shows
 /// any reader; by that entry less its rows, as its signing shows it, which waits on no body; or by
@@ -5151,6 +5197,37 @@ test "a group that refused and is mended checks nothing again, each record taken
   let mended = answered_over(broken.held, source(b"n + 1"));
   assert_eq(said(mended.outcome), said(cold.outcome));
   assert_eq(groups_ran(mended.run, group_query()), [])
+}
+
+test "a group that reads one that refuses waits for it unchecked, and its module says what a check of it whole says" {
+  let source = |body: Bytes|
+    [
+      {
+        name: b"lib",
+        src: Bytes::concat_all([
+          b"pub fn base(n: Int) -> Int = ",
+          body,
+          b"\n\npub fn over(n: Int) -> Int = base(n) + 1\n\npub fn top(n: Int) -> Int = over(n) * 2\n\n",
+          b"pub fn apart(n: Int) -> Int = n - 1\n",
+        ]),
+      },
+    ];
+  let cold = answered_over(nothing_held(), source(b"n + 1"));
+  let broken = answered_over(cold.held, source(b"n + true"));
+  assert_eq(said(broken.outcome), said(analyse(parse_all(source(b"n + true")))));
+  let waiting = memo::current(broken.held).fold([], |acc: List<Bytes>, _key: Bytes, r: Record|
+    if r.query != group_query() { acc } else {
+      match broken.held.outputs.get(r.output) {
+        None -> acc,
+        Some(out) -> {
+          let a = owned::group_whole(decoded(out, owned::kept_group_bin(), "a group's answer"));
+          if a.refused.any(|d: Diag| d.message.index_of(b" waits on ") != None) {
+            acc.concat(decoded(r.input, group_named_bin(), "a group's names").owners)
+          } else { acc }
+        },
+      }
+    });
+  assert_eq(waiting.sort(), [b"over", b"top"])
 }
 
 test "a unit whose group refuses is hashed without asking its own members' hashes" {

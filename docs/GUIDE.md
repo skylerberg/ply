@@ -2878,11 +2878,12 @@ project's: `ply test`, `ply prove` and `ply review` skip them unless you pass
 module `ply std` lists, whichever of them the project imports.
 A module named for a type of the language's is that type's home: it alone
 declares functions of the type (`fn List::name` in `std.list`, §3.1). A module
-outside the library calls them with no import, on a value (`xs.sort()`) or
-through the type (`List::sort(xs)`): `std.list`, `std.string`, `std.map`,
-`std.option`, `std.result`, `std.char`, `std.bytes` and `std.float` are the
-homes, and a load reads one only where a module calls on a value. A module of
-the library imports the homes it calls, as it imports anything else. A few
+calls them with no import, on a value (`xs.sort()`) or through the type
+(`List::sort(xs)`): `std.list`, `std.string`, `std.map`, `std.option`,
+`std.result`, `std.char`, `std.bytes` and `std.float` are the homes, and a load
+reads one only where a module calls a name it declares. The homes and the
+modules of the library they import import the homes they call, as they import
+anything else, so no module sees one that sees it. A few
 names are read with no import too, each where the module declares and imports
 nothing of that name: `print`, `eprint`, `read_line` and `Console` of
 `std.console`, `Set` of `std.set`, and `abs` of `std.math`. A module that
