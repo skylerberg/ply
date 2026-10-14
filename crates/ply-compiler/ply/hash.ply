@@ -3383,6 +3383,77 @@ pub fn chosen_forms(index: Index, packages: List<Int>, chosen: Chosen) -> Shapes
   }
 }
 
+/// Where a node of forms put together comes from: the part that gives its form and its place
+/// there, or `part` -1 for one no part gives a form.
+type Joint = { part: Int, at: Int, shape: Shape }
+
+/// The forms of `parts`, each what hashing reads of some of one module's definitions, tests and
+/// laws, as one reading of them all: each node a part gives a form, in the parts' order, then each
+/// no part gives one, in the order first met.
+pub fn joined_forms(parts: List<Shapes>) -> Shapes / {abort.raise} = {
+  let met = |formed: Bool|
+    |acc: { at: Map<Bytes, Int>, nodes: List<Joint> }, k: Int|
+      range(0, parts.get(k).nodes.len()).fold(
+        acc,
+        |a: { at: Map<Bytes, Int>, nodes: List<Joint> }, v: Int| {
+          let shape = parts.get(k).nodes.get(v);
+          let key = pin_key(shape.name, shape.decl);
+          if formless(shape) == formed || a.at.contains(key) { a } else {
+            {
+              at: a.at.insert(key, a.nodes.len()),
+              nodes: a.nodes.push({ part: if formed { k } else { 0 - 1 }, at: v, shape: shape }),
+            }
+          }
+        },
+      );
+  let formed = range(0, parts.len()).fold({ at: Map::new(), nodes: [] }, met(true));
+  let all = range(0, parts.len()).fold(formed, met(false));
+  let ids = parts.map(|part: Shapes|
+    range(0, part.nodes.len()).fold(Map::new(), |acc: Map<Int, Int>, v: Int| {
+      let shape = part.nodes.get(v);
+      match all.at.get(pin_key(shape.name, shape.decl)) {
+        Some(k) -> acc.insert(v, k),
+        None -> panic("a node of a part is a node of the whole"),
+      }
+    }));
+  let item = |k: Int|
+    |x: ItemShape|
+      {
+        ..x,
+        form: match x.form {
+          None -> None,
+          Some(f) ->
+            Some({
+              pieces: renumbered(f.pieces, ids.get(k)),
+              listed: f.listed.map(|v: Int| match ids.get(k).get(v) { Some(w) -> w, None -> v }),
+              listing: f.listing.map(|v: Int| match ids.get(k).get(v) { Some(w) -> w, None -> v }),
+            }),
+        },
+      };
+  {
+    nodes: all.nodes.map(|j: Joint|
+      match j.shape.form {
+        None -> j.shape,
+        Some(f) ->
+          {
+            ..j.shape,
+            form: Some({
+              pieces: renumbered(f.pieces, ids.get(j.part)),
+              signature: renumbered(f.signature, ids.get(j.part)),
+              clauses: f.clauses.map(|c: ClauseForm|
+                { ..c, pieces: renumbered(c.pieces, ids.get(j.part)) }),
+              transparent: f.transparent,
+            }),
+          },
+      }),
+    order: range(0, formed.nodes.len()),
+    tests: range(0, parts.len()).fold([], |acc: List<ItemShape>, k: Int|
+      acc.concat(parts.get(k).tests.map(item(k)))),
+    laws: range(0, parts.len()).fold([], |acc: List<ItemShape>, k: Int|
+      acc.concat(parts.get(k).laws.map(item(k)))),
+  }
+}
+
 /// What hashing a module's `forms` fixes of its nodes, tests and laws, each node of another module
 /// they reference read as `fixed` holds it, which holds each of those.
 pub fn hashed_forms(forms: Shapes, fixed: List<Fixed>) -> Fixing / {abort.raise} = {
@@ -8064,6 +8135,37 @@ test "a definition's hash follows the name of the effect it performs" {
   );
   // The row `say` publishes names its effect, so a hash that ignored the name would not pin the row.
   assert(by_name(named_hashes(one)).get(b"m.say") != by_name(named_hashes(other)).get(b"m.say"))
+}
+
+test "the forms of a module's parts put together hash as the module's own, whichever order the parts come in" {
+  let index = indexed([
+    {
+      name: b"m",
+      src: b"pub type T = | Leaf | Node(List<T>)\npub fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\npub fn count(t: T) -> Int = match t { Leaf -> 1, Node(ts) -> ts.fold(0, |n: Int, k: T| n + count(k)) }\ntest \"it\" { assert(even(2)) }\n",
+    },
+  ]);
+  let whole = module_forms(index, [0], 0);
+  let part = |names: List<Bytes>, tests: Bool|
+    kept_forms(index, [0], 0, {
+      node: |n: Bytes| names.contains(n),
+      test: |_: Bytes| tests,
+      law: |_: Bytes| false,
+    });
+  let counted = part([b"m.T", b"m.count"], false);
+  let evens = part([b"m.even"], true);
+  let odds = part([b"m.odd"], false);
+  let said = |forms: Shapes| {
+    let f = hashed_forms(forms, []);
+    {
+      nodes: f.nodes.fold(Map::new(), |acc: Map<Bytes, Fixed>, x: Fixed|
+        acc.insert(pin_key(x.name, x.decl), x)),
+      tests: f.tests,
+    }
+  };
+  assert_eq(said(whole).nodes.len(), 4);
+  assert_eq(said(joined_forms([counted, evens, odds])), said(whole));
+  assert_eq(said(joined_forms([odds, evens, counted])), said(whole));
+  assert_eq(joined_forms([whole]), whole)
 }
 
 test "a definition's hash follows each function a call on a value may be, of the modules its own can see" {

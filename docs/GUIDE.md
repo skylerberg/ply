@@ -110,10 +110,19 @@ a file, the project's manifests, a shipped module, an embed, or another query's
 answer — the memo store records beside the digest of what it answered. A module
 is read once into its owners, each definition with the items that belong to it
 (a type with its `derive`s, a function with its cost clauses, a test), and is
-checked a group of owners at a time: owners that mention one another round a
-cycle check together, and a group reads what each owner it names shows — the
-signature, row and counts of a definition, the form of a type or an effect —
-never another group's text, in its own module or another. The store also notes
+checked a group of owners at a time, and a group reads what each owner it
+names shows — the signature, row and counts of a definition, the form of a type
+or an effect — never another group's text, in its own module or another. An
+owner that mentions no owner that mentions it back is a group alone. Owners
+whose texts mention one another round a cycle are a unit, and what a text
+mentions says more than what its bodies call: a call on a value mentions every
+function of that name its module declares. So each owner of a unit is walked
+alone, against what the other owners' signatures say, the unit is cut into
+groups by what the walked bodies call, and each group settles what turns on its
+own calls (whether they end, what it repeats, where a raise starts) from what
+its walks left and what the groups it calls settled. An edit to one body walks
+that owner and settles its group, and no other; a signature is read from text
+with every body cut, so an edit to a body signs nothing again. The store also notes
 what it last saw at each place a record read, and which records read each place
 and asked each record. A run first brings those notes to what the world holds,
 marking every record that read a place that moved and every record that asked a

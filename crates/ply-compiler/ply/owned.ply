@@ -23,11 +23,12 @@ import items (Item, IFn, Module, parse, item_span, item_owner)
 import infer (DefInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo, InstanceInfo,
               NumericInfo, Location, walk_order, SpecInfo, LabelSite, OperandSite, TypedSite,
               UpdateShape, WitnessOp, WitnessRef, WitnessOrder, TrySite, MemberSite, KeptFacts,
-              EmitFacts, test_owner, types_named, types_joined)
+              EmitFacts, test_owner, types_named, types_joined, WalkedBody, HandedBody, moved_body,
+              walked_body_bin, emit_facts_bin, kept_facts_bin, spec_info_bin, Walks, Given, OwnCall)
 import resolve (Diag, Label, Edit, Fix, Source, diag_bin)
 import parsing (Span, span_between)
-import types (HeldType, Holding, Type, TypeTable, held_part, held_type_bin, no_types_held,
-              types_held, types_held_in, types_of, unit_type)
+import types (HeldType, Holding, Type, TypeTable, type_table_bin, held_part, held_type_bin,
+              no_types_held, types_held, types_held_in, types_of, unit_type)
 import exprs (TaggedPart)
 import embed (EmbedAt, EmbedWant, embed_at_bin, embed_key, wants_of)
 import hash (Shapes, UseNode, LawNode, TestNode, chosen_in, chosen_forms, shapes_bin, use_node_bin,
@@ -74,8 +75,7 @@ fn moved_def(d: DefInfo, m: Mover) -> DefInfo =
     spec: d.spec.map(|x: SpecInfo| { ..x, span: moved_spanned(d.at.module, x.span, m) }),
   }
 
-fn moved_tables(t: ModuleTables, m: Mover) -> ModuleTables = {
-  let e = t.facts.elaboration;
+fn moved_tables(t: ModuleTables, m: Mover) -> ModuleTables =
   {
     ..t,
     defs: t.defs.map(|d: DefInfo| moved_def(d, m)),
@@ -95,27 +95,31 @@ fn moved_tables(t: ModuleTables, m: Mover) -> ModuleTables = {
     ctors: t.ctors.map(|c: CtorInfo| { ..c, at: moved_location(c.at, m) }),
     instances: t.instances.map(|x: InstanceInfo| { ..x, at: moved_location(x.at, m) }),
     numeric: t.numeric.map(|x: NumericInfo| { ..x, at: moved_location(x.at, m) }),
-    facts: {
-      ..t.facts,
-      label_sites: t.facts.label_sites.map(|x: LabelSite|
+    facts: moved_facts(t.facts, m),
+  }
+
+fn moved_facts(f: EmitFacts, m: Mover) -> EmitFacts = {
+  let e = f.elaboration;
+  {
+    ..f,
+    label_sites: f.label_sites.map(|x: LabelSite|
+      { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
+    operands: f.operands.map(|x: OperandSite|
+      { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
+    typed: f.typed.map(|x: TypedSite|
+      { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
+    elaboration: {
+      updates: e.updates.map(|x: UpdateShape|
         { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
-      operands: t.facts.operands.map(|x: OperandSite|
+      ops: e.ops.map(|x: WitnessOp|
         { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
-      typed: t.facts.typed.map(|x: TypedSite|
+      refs: e.refs.map(|x: WitnessRef|
         { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
-      elaboration: {
-        updates: e.updates.map(|x: UpdateShape|
-          { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
-        ops: e.ops.map(|x: WitnessOp|
-          { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
-        refs: e.refs.map(|x: WitnessRef|
-          { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
-        orders: e.orders.map(|x: WitnessOrder| { ..x, module: moved_index(x.module, m) }),
-        tries: e.tries.map(|x: TrySite|
-          { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
-        members: e.members.map(|x: MemberSite|
-          { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
-      },
+      orders: e.orders.map(|x: WitnessOrder| { ..x, module: moved_index(x.module, m) }),
+      tries: e.tries.map(|x: TrySite|
+        { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
+      members: e.members.map(|x: MemberSite|
+        { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
     },
   }
 }
@@ -477,6 +481,256 @@ pub fn group_answer(
   }
 }
 
+// --- An owner walked apart from its group -----------------------------------------------------
+// Owners whose texts mention one another round a cycle are each walked alone: its own text against
+// what the other owners' signatures say. What a walk leaves is kept an owner at a time, and each
+// group of them, those whose bodies call one another, is settled from its members' walks with no
+// body walked again.
+
+/// The clauses of the definition `name` as they were checked.
+pub type Clauses = { name: Bytes, spec: List<SpecInfo> }
+
+/// What a walk of one owner's functions answered, before its group is settled: what only a walk
+/// makes of it (the sites the emitter reads, each clause checked, what the emitter reads of each
+/// body as a row files it and the types those name), and each body as its group's settling reads
+/// it. Every place is module 0's and counted from where the owner's text starts.
+pub type TypedAnswer = {
+  facts: EmitFacts,
+  kept: List<KeptFacts>,
+  clauses: List<Clauses>,
+  filed: List<KeptFacts>,
+  types: TypeTable,
+  bodies: List<WalkedBody>,
+  refused: List<Diag>,
+}
+
+derive bin for Clauses
+derive bin for TypedAnswer
+
+/// What an owner that is walked with its group answers of a walk of its own.
+pub fn no_typed() -> TypedAnswer = typed_of(no_answer(), [])
+
+fn typed_of(answer: OwnerAnswer, bodies: List<WalkedBody>) -> TypedAnswer =
+  {
+    facts: answer.tables.facts,
+    kept: answer.tables.kept,
+    clauses: answer.tables.defs.map(|d: DefInfo| { name: d.name, spec: d.spec }),
+    filed: answer.rows.defs.map(|r: KnownDefRow| { name: r.name, facts: r.facts }),
+    types: answer.rows.types,
+    bodies: bodies,
+    refused: [],
+  }
+
+/// What a check that walked `member` alone, an owner of `module` read as its module at `slot` and
+/// written as `text`, answered of it: `items` is where its items stand as [`group_source`] lays
+/// them, and `at` where each stands in the module the check read.
+pub fn typed_answer(
+  out: AnalysisOutcome,
+  slot: Int,
+  text: Bytes,
+  module: Bytes,
+  member: OwnerRead,
+  items: List<ItemAt>,
+  at: (ItemAt) -> Int / {abort.raise},
+) -> TypedAnswer / {abort.raise} = {
+  let cut = group_answer(out, slot, text, module, [member], items, at);
+  match ((out, cut.members)) {
+    (Analysed(w), [m, ..]) -> {
+      let spots = spots_of(items, member.owner, at);
+      typed_of(m.answer, w.bodies.map(|b: WalkedBody| moved_body(b, 0, |p: Int| spotted(spots, p))))
+    },
+    _ -> { ..typed_of(no_answer(), []), refused: cut.refused },
+  }
+}
+
+/// What a check that `said` what it did of the whole of `module` answers of each of `members`
+/// walked alone, as [`typed_answer`] answers one: `stands` is where an item stands in the module
+/// the check read.
+pub fn said_typed(
+  said: Said,
+  module: Bytes,
+  members: List<OwnerRead>,
+  stands: (ItemAt) -> Int / {abort.raise},
+) -> List<TypedAnswer> / {abort.raise} = {
+  let alone = members.map(|o: OwnerRead| { members: [o], items: laid_items([o]) });
+  let cut = said_groups(said, module, alone, stands);
+  range(0, members.len()).map(|i: Int| {
+    let o = members.get(i);
+    let answer = match cut.get(i).members { [m, ..] -> m.answer, [] -> no_answer() };
+    let spots = spots_of(alone.get(i).items, o.owner, stands);
+    let own = answer.tables.defs.map(|d: DefInfo| d.name);
+    typed_of(
+      answer,
+      said.w.bodies.filter(|b: WalkedBody| own.contains(b.name)).map(|b: WalkedBody|
+        moved_body(b, 0, |p: Int| spotted(spots, p))),
+    )
+  })
+}
+
+fn no_answer() -> OwnerAnswer =
+  {
+    tables: no_module_tables(),
+    rows: no_rows(),
+    refused: [],
+    warnings: [],
+    tagged: [],
+    statements: [],
+    consts: [],
+    sets: [],
+    laws: [],
+    uses: [],
+  }
+
+/// Each name of `module` the bodies `typed` walked call, hand on as a value, or reach through an
+/// operator a type states, as the module declares it.
+pub fn called_names(module: Bytes, typed: TypedAnswer) -> List<Bytes> / {abort.raise} = {
+  let prefix = module.concat(b".");
+  typed.bodies.fold([], |acc: List<Bytes>, b: WalkedBody|
+    b.refs.concat(b.calls.concat(b.stated).map(|c: OwnCall| c.callee)).fold(
+      acc,
+      |a: List<Bytes>, n: Bytes|
+        if !n.starts_with(prefix) { a } else {
+          let simple = n.slice(prefix.len(), n.len());
+          if a.contains(simple) { a } else { a.push(simple) }
+        },
+    ))
+}
+
+/// What signing a unit answered: each member's entry less the rows its settling answers, encoded
+/// as a group's record keeps one, before the errors that refused the unit. Its encoding starts
+/// with the entries, so [`group_shown`] reads them.
+pub type SignedUnit = { shown: List<Shown>, refused: List<Diag> }
+
+derive bin for SignedUnit
+
+/// What `answer`, a check of a unit that signed its functions and walked none, says of what each
+/// member shows.
+pub fn signed_unit(answer: GroupAnswer) -> SignedUnit / {abort.raise} =
+  {
+    shown: answer.members.map(|m: MemberAnswer|
+      {
+        owner: m.owner,
+        entry: match m.entry {
+          Some(e) -> bin::encode({ ..e, rows: [] }, entry_bin()),
+          None -> b"",
+        },
+      }),
+    refused: answer.refused,
+  }
+
+/// What `said`, a check of a whole module, shows of each of `owners` less its rows: what a signing
+/// of them answers.
+pub fn signed_shown(said: Said, owners: List<Bytes>) -> SignedUnit / {abort.raise} =
+  {
+    shown: owners.map(|o: Bytes|
+      {
+        owner: o,
+        entry: match said.shown.entries.get(o) {
+          Some(e) -> bin::encode({ ..e, rows: [] }, entry_bin()),
+          None -> b"",
+        },
+      }),
+    refused: [],
+  }
+
+/// The errors that refused the walks of `members`, each moved to where its owner's items stand in
+/// their group's own text, which `items` lays.
+pub fn walk_refusals(members: List<Walked>, items: List<ItemAt>) -> List<Diag> =
+  members.fold([], |acc: List<Diag>, w: Walked| {
+    let base = base_of(items, w.owner);
+    acc.concat(
+      w.typed.refused.map(|d: Diag| moved_diag(d, { from: 0, to: 0, by: |p: Int| base + p })),
+    )
+  })
+
+/// Where `owner`'s text starts in a group's own text whose items `items` lays.
+fn base_of(items: List<ItemAt>, owner: Bytes) -> Int =
+  items.fold(0 - 1, |found: Int, x: ItemAt|
+    if x.owner == owner && (found < 0 || x.from < found) { x.from } else { found })
+
+/// One owner of a group beside what its walk answered.
+pub type Walked = { owner: Bytes, typed: TypedAnswer }
+
+/// What a check that settles a group is handed of its bodies, given the place `slot` its module
+/// has among those the check reads: each member's bodies and what their calls on values call, moved
+/// to where the member stands in the check's text, which holds the group's own text from `offset`
+/// with its items where `items` lays them.
+pub fn handed_bodies(
+  members: List<Walked>,
+  items: List<ItemAt>,
+  offset: Int,
+) -> (Int) -> Walks / {abort.raise} =
+  |slot: Int| {
+    let handed = members.fold(
+      { bodies: Map::new(), sites: [] },
+      |acc: { bodies: Map<Bytes, HandedBody>, sites: List<MemberSite> }, m: Walked| {
+        let base = offset + base_of(items, m.owner);
+        let filed = m.typed.filed.fold(Map::new(), |held: Map<Bytes, Bytes>, k: KeptFacts|
+          held.insert(k.name, k.facts));
+        {
+          bodies: m.typed.bodies.fold(acc.bodies, |held: Map<Bytes, HandedBody>, b: WalkedBody|
+            held.insert(b.name, {
+              body: moved_body(b, slot, |p: Int| base + p),
+              facts: match filed.get(b.name) { Some(f) -> f, None -> b"" },
+            })),
+          sites: acc.sites.concat(
+            m.typed.facts.elaboration.members.map(|x: MemberSite|
+              {
+                ..x,
+                module: slot,
+                span: { ..x.span, start: base + x.span.start, end: base + x.span.end },
+              }),
+          ),
+        }
+      },
+    );
+    Given(handed.bodies, handed.sites)
+  }
+
+/// A group's answer: `settled`, what a check that walked none of its bodies answered of it, with
+/// what only a walk makes of each member laid in from `members`, each moved to where the member's
+/// items stand in the group's own text, which `items` lays.
+pub fn settled_answer(
+  settled: GroupAnswer,
+  members: List<Walked>,
+  items: List<ItemAt>,
+) -> GroupAnswer / {abort.raise} =
+  {
+    ..settled,
+    members: settled.members.map(|m: MemberAnswer|
+      match members.find(|w: Walked| w.owner == m.owner) {
+        None -> m,
+        Some(w) -> {
+          let base = base_of(items, m.owner);
+          let to = { from: 0, to: 0, by: |p: Int| base + p };
+          let clauses = w.typed.clauses.fold(
+            Map::new(),
+            |held: Map<Bytes, List<SpecInfo>>, c: Clauses| held.insert(c.name, c.spec),
+          );
+          {
+            ..m,
+            answer: {
+              ..m.answer,
+              tables: {
+                ..m.answer.tables,
+                defs: m.answer.tables.defs.map(|d: DefInfo|
+                  {
+                    ..d,
+                    spec: match clauses.get(d.name) {
+                      Some(spec) -> spec.map(|x: SpecInfo| { ..x, span: moved_at(x.span, to) }),
+                      None -> d.spec,
+                    },
+                  }),
+                facts: { ..moved_facts(w.typed.facts, to), pure: m.answer.tables.facts.pure },
+                kept: w.typed.kept,
+              },
+              rows: { ..m.answer.rows, types: types_joined(m.answer.rows.types, w.typed.types) },
+            },
+          }
+        },
+      }),
+  }
+
 /// What a check of a module said that each owner's answer reads a part of: the check, the module's
 /// place in it, what it said of the module, every definition's row and what the module shows.
 pub type Said = { w: Analysis, slot: Int, facts: ModuleFacts, rows: Rows, shown: Exports }
@@ -499,6 +753,9 @@ pub fn said_of(
   }
 }
 
+/// Owners that check together, and where their items stand once a group's own text lays them.
+pub type Laid = { members: List<OwnerRead>, items: List<ItemAt> }
+
 /// What a check that `said` what it did of `module` answered of each of `groups`, owners of it whose
 /// items stand where `items` lays them, each item where `stands` says in the module the check read. Each table
 /// is walked once for all of them, so the answers cost what the module does, not that times its
@@ -506,7 +763,7 @@ pub fn said_of(
 pub fn said_groups(
   said: Said,
   module: Bytes,
-  groups: List<{ members: List<OwnerRead>, items: List<ItemAt> }>,
+  groups: List<Laid>,
   stands: (ItemAt) -> Int / {abort.raise},
 ) -> List<GroupAnswer> / {abort.raise} = {
   let w = said.w;
