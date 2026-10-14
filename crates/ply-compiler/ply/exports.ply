@@ -27,7 +27,7 @@ import derive (dotted, runtime_module, same_deriver)
 import lexer (lex, Token, Identifier, Punctuation, StringLiteral, InterpolatedHead, LineString,
               is_ident_start)
 import parsing (Ident, Span, starts_upper, dummy_span)
-import infer (DefInfo, Raise)
+import infer (DefInfo, Raise, Walks, Every)
 import types (canonical_scheme, Scheme)
 
 /// A name another module's text says: `name` is declared by `module`, or every name it declares
@@ -1046,6 +1046,24 @@ pub fn owner_reads(
   })
 }
 
+/// `o`, an owner of the module `raw`, as a signing of it reads it: each of its functions cut where
+/// its body starts, a `transparent` one whole, so an edit to a body leaves it as it was and every
+/// place before a body is where the module writes it.
+pub fn signing_read(raw: Module, o: OwnerRead) -> OwnerRead / {abort.raise} = {
+  let its = owner_items(raw, o.owner);
+  {
+    ..o,
+    texts: range(0, o.texts.len()).map(|k: Int| {
+      let written = o.texts.get(k);
+      match its.at(k) {
+        Some(IFn(d)) -> if d.transparent != None { written }
+        else { written.slice(0, expr_span(d.body).start - o.starts.get(k)).concat(b"{}") },
+        _ -> written,
+      }
+    }),
+  }
+}
+
 /// Where `text` writes `item`: from its `pub` and the words that say what kind of `fn`, `type` or
 /// `effect` it is, which its span leaves out.
 fn written_start(text: Bytes, item: Item) -> Int / {abort.raise} =
@@ -1102,6 +1120,25 @@ pub fn owner_groups(
           )
         },
     ));
+  graph::components({ out: out }).map(|comp: List<Int>|
+    comp.map(|i: Int| owners.get(i)).sort_by(|a: Bytes, b: Bytes|
+      match compare_values(a, b) { Greater -> false, _ -> true }))
+}
+
+/// `owners` cut into those that call one another round a cycle, each group in the order of its
+/// names and after every group it calls: `called` holds, at each owner's place, the owners it calls.
+pub fn call_cycles(
+  owners: List<Bytes>,
+  called: List<List<Bytes>>,
+) -> List<List<Bytes>> / {abort.raise} = {
+  let slot = range(0, owners.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
+    acc.insert(owners.get(i), i));
+  let out = called.map(|cs: List<Bytes>|
+    cs.fold([], |acc: List<Int>, c: Bytes|
+      match slot.get(c) {
+        Some(k) -> if acc.contains(k) { acc } else { acc.push(k) },
+        None -> acc,
+      }));
   graph::components({ out: out }).map(|comp: List<Int>|
     comp.map(|i: Int| owners.get(i)).sort_by(|a: Bytes, b: Bytes|
       match compare_values(a, b) { Greater -> false, _ -> true }))
@@ -1280,15 +1317,23 @@ pub fn owner_source<| e>(
 }
 
 /// `o`, an owner's source, standing where `placed` says, checked against what it reads, each module
-/// it imports standing where `placing` says.
+/// it imports standing where `placing` says. `walks` is how the check treats its bodies where it
+/// does not walk every one, given the place its module has among those it reads.
 pub fn checked_owner(
   o: OwnerSource,
   placed: Placed,
   placing: (Bytes) -> Placed / {abort.raise},
   reading: Reading,
+  walks: Option<(Int) -> Walks / {abort.raise}> = None,
 ) -> { pulled: Pulled, at: Int } / {abort.raise} = {
   let s = staged_against(o.source, placed, o.deps, o.fixed, placing, reading);
-  { pulled: checked_staged(s.staged, { defs: o.rows, tests: [], types: Map::new() }), at: s.at }
+  {
+    pulled: checked_staged(s.staged, { defs: o.rows, tests: [], types: Map::new() }, match walks {
+      Some(at) -> at(s.at),
+      None -> Every,
+    }),
+    at: s.at,
+  }
 }
 
 // --- Tests ----------------------------------------------------------------------------------
