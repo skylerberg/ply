@@ -343,7 +343,18 @@ pub type Emitter = {
   written: List<Lambda>,
   /// Lists this body reads as a word and an offset into it, each made a list only when asked for.
   slices: List<Slice>,
+  /// Sums held back as their constructor and its argument, each until its word is asked for.
+  sums: List<HeldSum>,
+  /// Whether the value at hand goes where a sum is taken as its constructor and argument, so one
+  /// is held back rather than made: a call's argument or an answer carried so, or a `match`'s
+  /// subject. Kept and cleared where `tail` is.
+  leaves: Bool,
 }
+
+/// A sum held back as the index `tag` of its constructor among `cases` and each constructor's
+/// argument, one only where `tag` names its constructor, until its word is asked for: `name` is
+/// its word, zero until made.
+pub type HeldSum = { name: Bytes, cases: SumCases, tag: Bytes, args: List<Option<CValue>> }
 
 /// A list read as `base`'s elements from `from` on, held in `name` once asked for as a list, zero
 /// until then.
@@ -425,19 +436,28 @@ pub type BoundLambda = {
   base: Int,
 }
 
-/// How a value crosses a call between roots: whole, as its word or as its value in its own C type,
-/// or, a small flat record, as each of its fields in its own C type. A record answer returns its
-/// first field and writes the others through pointers its caller hands it.
-pub type Carrier = | Whole(Kind) | Fields(List<FieldTy>)
+/// How a value crosses a call between roots: whole, as its word or as its value in its own C type;
+/// a small flat record as each of its fields in its own C type; or a sum one of whose constructors
+/// holds such a record as its constructor's index and then each constructor's argument as it
+/// crosses. A record answer returns its first field and a sum's its index, and each writes the
+/// rest through pointers its caller hands it.
+pub type Carrier = | Whole(Kind) | Fields(List<FieldTy>) | Cases(SumCases)
+
+/// A sum held as `spec` says where it is a word, and its constructors in their declared order,
+/// each with how its argument crosses: never as a sum's cases.
+pub type SumCases = { spec: SumSpec, cases: List<SumCase> }
+
+pub type SumCase = { name: Bytes, arg: Option<Carrier> }
 
 pub type WithValue = { emitter: Emitter, value: CValue }
 
-/// Where a `match` arm's answer goes: the answer local of its kind, a record's locals, or a fused
-/// `iterate` step's loop control.
+/// Where a `match` arm's answer goes: the answer local of its kind, a record's locals, a fused
+/// `iterate` step's loop control, or a sum's constructor and argument's locals.
 pub type Sink =
   | ToValue({ name: Bytes, kind: Kind })
   | ToRecord(Into)
   | ToLoop({ state: Bytes, answer: Bytes, depth: Int })
+  | ToSum({ cases: SumCases, tag: Bytes, leaves: List<CValue> })
 
 /// The locals a value is assigned into: one per field of `fields` and then `word`, the record's word
 /// where it was made, or the whole value's word where `fields` is empty.
@@ -491,6 +511,8 @@ fn line(emitter: Emitter, text: Bytes) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 fn pad(ind: Int) -> Bytes = if ind <= 0 { b"  " } else { b"  ".concat(pad(ind - 1)) }
@@ -542,6 +564,8 @@ fn indent(emitter: Emitter) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 fn outdent(emitter: Emitter) -> Emitter =
@@ -591,11 +615,18 @@ fn outdent(emitter: Emitter) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
-/// Restoring the node's own `tail` makes an arm a tail again after its scrutinee or condition.
-fn withtail(emitter: Emitter, t: Bool) -> Emitter =
-  if emitter.tail == t { emitter } else {
+/// Where the value at hand goes: the root's answer, and a taker of a sum's constructor and argument.
+type Position = { tail: Bool, leaves: Bool }
+
+fn position(emitter: Emitter) -> Position = { tail: emitter.tail, leaves: emitter.leaves }
+
+/// Restoring the node's own position makes an arm a tail again after its scrutinee or condition.
+fn withtail(emitter: Emitter, at: Position) -> Emitter =
+  if emitter.tail == at.tail && emitter.leaves == at.leaves { emitter } else {
     {
       out: emitter.out,
       temp_count: emitter.temp_count,
@@ -621,7 +652,7 @@ fn withtail(emitter: Emitter, t: Bool) -> Emitter =
       reuse_widths: emitter.reuse_widths,
       alias: emitter.alias,
       by_root: emitter.by_root,
-      tail: t,
+      tail: at.tail,
       calls: emitter.calls,
       generics: emitter.generics,
       refused: emitter.refused,
@@ -642,11 +673,13 @@ fn withtail(emitter: Emitter, t: Bool) -> Emitter =
       lent: emitter.lent,
       written: emitter.written,
       slices: emitter.slices,
+      sums: emitter.sums,
+      leaves: at.leaves,
     }
   }
 
 fn notail(emitter: Emitter) -> Emitter =
-  if !emitter.tail { emitter } else {
+  if !emitter.tail && !emitter.leaves { emitter } else {
     {
       out: emitter.out,
       temp_count: emitter.temp_count,
@@ -693,6 +726,8 @@ fn notail(emitter: Emitter) -> Emitter =
       lent: emitter.lent,
       written: emitter.written,
       slices: emitter.slices,
+      sums: emitter.sums,
+      leaves: false,
     }
   }
 
@@ -744,6 +779,8 @@ fn rescope(emitter: Emitter, conv: List<Unboxed>) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 fn fresh(emitter: Emitter) -> { emitter: Emitter, name: Bytes } =
@@ -794,6 +831,8 @@ fn fresh(emitter: Emitter) -> { emitter: Emitter, name: Bytes } =
       lent: emitter.lent,
       written: emitter.written,
       slices: emitter.slices,
+      sums: emitter.sums,
+      leaves: emitter.leaves,
     },
     name: b"t".concat(ascii_of_int(emitter.temp_count + 1)),
   }
@@ -822,50 +861,56 @@ fn held_copy(emitter: Emitter, value: CValue) -> WithValue =
   match deferred_of(emitter, value.expr) {
     None -> { emitter: emitter, value: value },
     Some(d) -> if !emitter.unboxed.fold(false, |seen: Bool, u: Unboxed|
-        seen || u.expr == value.expr) { { emitter: emitter, value: value } } else {
-      let f = fresh(emitter);
-      let own = d.counts.fold(
-        { emitter: f.emitter, pairs: [] },
-        |acc: { emitter: Emitter, pairs: List<{ from: Bytes, to: Bytes }> }, x: Bytes| {
-          let o = owned_word(acc.emitter, { kind: KBoxed, expr: x, ty: TyOpen([]) });
-          {
-            emitter: note_bound(note_holder(o.emitter, o.value.expr), o.value.expr),
-            pairs: acc.pairs.push({ from: x, to: o.value.expr }),
-          }
-        },
-      );
-      let renamed = |e: Bytes|
-        own.pairs.fold(e, |r: Bytes, p: { from: Bytes, to: Bytes }|
-          if p.from == e { p.to } else { r });
-      let held = line(
-        note_deferred(own.emitter, {
-          ..d,
-          name: f.name,
-          cells: d.cells.map(|c: { at: Int, expr: Bytes }| { at: c.at, expr: renamed(c.expr) }),
-          counts: d.counts.map(renamed),
-        }),
-        Bytes::concat_all([f.name, b" = ", value.expr, b"; ply_inc(", f.name, b");"]),
-      );
+        seen || u.expr == value.expr) { { emitter: emitter, value: value } }
+    else { copied_record(emitter, value, d) },
+  }
+
+/// `value`, the record `d` holds back, as a held-back copy of its own with a count of its own of
+/// each counted field and of its word.
+fn copied_record(emitter: Emitter, value: CValue, d: Deferred) -> WithValue = {
+  let f = fresh(emitter);
+  let own = d.counts.fold(
+    { emitter: f.emitter, pairs: [] },
+    |acc: { emitter: Emitter, pairs: List<{ from: Bytes, to: Bytes }> }, x: Bytes| {
+      let o = owned_word(acc.emitter, { kind: KBoxed, expr: x, ty: TyOpen([]) });
       {
-        emitter: match built_of(held, value.expr) {
-          Some(b) ->
-            remember_built(
-              held,
-              f.name,
-              b.names,
-              b.vals.map(|v: CValue| { ..v, expr: renamed(v.expr) }),
-            ),
-          None -> held,
-        },
-        value: { ..value, expr: f.name },
+        emitter: note_bound(note_holder(o.emitter, o.value.expr), o.value.expr),
+        pairs: acc.pairs.push({ from: x, to: o.value.expr }),
       }
     },
+  );
+  let renamed = |e: Bytes|
+    own.pairs.fold(e, |r: Bytes, p: { from: Bytes, to: Bytes }| if p.from == e { p.to } else { r });
+  let held = line(
+    note_deferred(own.emitter, {
+      ..d,
+      name: f.name,
+      cells: d.cells.map(|c: { at: Int, expr: Bytes }| { at: c.at, expr: renamed(c.expr) }),
+      counts: d.counts.map(renamed),
+    }),
+    Bytes::concat_all([f.name, b" = ", value.expr, b"; ply_inc(", f.name, b");"]),
+  );
+  {
+    emitter: match built_of(held, value.expr) {
+      Some(b) ->
+        remember_built(
+          held,
+          f.name,
+          b.names,
+          b.vals.map(|v: CValue| { ..v, expr: renamed(v.expr) }),
+        ),
+      None -> held,
+    },
+    value: { ..value, expr: f.name },
   }
+}
 
 fn bind(emitter: Emitter, k: Kind, expr: Bytes) -> WithValue = {
   let f = fresh(emitter);
-  // A held-back record is already its local; the temporary number is still spent to keep numbering aligned.
-  if emitter.deferred_locals.fold(false, |acc: Bool, r: Bytes| acc || r == expr) {
+  // A record, list or sum held back is already its local; the temporary number is still spent to
+  // keep numbering aligned. A sum's word once made is a word like any other.
+  if deferred_of(emitter, expr) != None || slice_of(emitter, expr) != None
+      || held_sum_of(emitter, expr) != None {
     { emitter: f.emitter, value: { kind: k, expr: expr, ty: TyOpen([]) } }
   } else {
     let o = line(f.emitter, Bytes::concat_all([ctype(k), b" ", f.name, b" = ", expr, b";"]));
@@ -887,6 +932,338 @@ fn deferred_of(emitter: Emitter, name: Bytes) -> Option<Deferred> =
   emitter.deferred.fold(None, |acc: Option<Deferred>, d: Deferred|
     if d.name == name { Some(d) } else { acc })
 
+fn held_sum_of(emitter: Emitter, name: Bytes) -> Option<HeldSum> =
+  emitter.sums.fold(None, |acc: Option<HeldSum>, h: HeldSum|
+    if h.name == name { Some(h) } else { acc })
+
+/// `emitter` holding `h` back, its word a local declared at the top, zero from here on, as a pass of
+/// a loop that comes here again finds it, and let go at its scope's end.
+fn note_held_sum(emitter: Emitter, h: HeldSum) -> Emitter = {
+  let e = note_holder(line(emitter, h.name.concat(b" = 0;")), h.name);
+  { ..e, sums: e.sums.push(h), deferred_locals: e.deferred_locals.push(h.name) }
+}
+
+/// `emitter` where the value at hand is taken as a sum's constructor and argument.
+fn with_leaves(emitter: Emitter) -> Emitter =
+  if emitter.leaves { emitter } else { { ..emitter, leaves: true } }
+
+fn nth_case(c: SumCases, i: Int) -> SumCase =
+  match c.cases.at(i) { Some(sc) -> sc, None -> { name: b"", arg: None } }
+
+/// The sum of cases `c` at its constructor `i`, of argument `arg`, held back.
+fn held_sum_at(emitter: Emitter, c: SumCases, i: Int, arg: Option<CValue>) -> WithValue = {
+  let f = fresh(emitter);
+  {
+    emitter: note_held_sum(f.emitter, {
+      name: f.name,
+      cases: c,
+      tag: ascii_of_int(i),
+      args: range(0, c.cases.len()).map(|j: Int| if j == i { arg } else { None }),
+    }),
+    value: { kind: KSum(c.spec), expr: f.name, ty: TyOpen([]) },
+  }
+}
+
+/// The sum of cases `c` that crossed as its constructor's index `tag` and the values `leaves`,
+/// held back as them: each constructor's argument one, its counts this scope's.
+fn held_sum_from(emitter: Emitter, c: SumCases, tag: Bytes, leaves: List<CValue>) -> WithValue = {
+  let args = range(0, c.cases.len()).fold(
+    { emitter: emitter, args: [] },
+    |acc: { emitter: Emitter, args: List<Option<CValue>> }, i: Int| {
+      let at = case_start(c, i);
+      match nth_case(c, i).arg {
+        None -> { ..acc, args: acc.args.push(None) },
+        Some(Fields(fs)) -> {
+          let r = held_record(
+            acc.emitter,
+            fs,
+            range(0, fs.len()).map(|k: Int|
+              { ..nth_value(leaves, at + k), ty: nth_field(fs, k).ty }),
+            nth_value(leaves, at + fs.len()).expr,
+          );
+          { emitter: r.emitter, args: acc.args.push(Some(r.value)) }
+        },
+        Some(_) -> {
+          let v = nth_value(leaves, at);
+          {
+            emitter: if counted(v.kind) { note_holder(acc.emitter, v.expr) } else { acc.emitter },
+            args: acc.args.push(Some(v)),
+          }
+        },
+      }
+    },
+  );
+  let f = fresh(args.emitter);
+  {
+    emitter: note_held_sum(f.emitter, { name: f.name, cases: c, tag: tag, args: args.args }),
+    value: { kind: KSum(c.spec), expr: f.name, ty: TyOpen([]) },
+  }
+}
+
+/// The word of the sum `h` holds back, made in its local from its constructor's argument, which
+/// it takes where `takes` and holds one more count of where not. Taken, the sum is no longer held
+/// back: its arguments have nothing left to hand on.
+fn sum_made(emitter: Emitter, h: HeldSum, takes: Bool) -> Emitter = {
+  let opened = indent(line(emitter, Bytes::concat_all([b"if (!", h.name, b") {"])));
+  let cased = range(0, h.cases.cases.len()).fold(opened, |acc: Emitter, i: Int|
+    match h.args.at(i) {
+      Some(Some(v)) -> {
+        let o = indent(
+          line(acc, Bytes::concat_all([b"if (", h.tag, b" == ", ascii_of_int(i), b") {"])),
+        );
+        let w = if v.kind == KBoxed { record_made(o, v.expr, takes, true) } else { o };
+        let word = if v.kind == KBoxed { v.expr } else { as_word(v) };
+        let encoded = if h.cases.spec == Tagged && nth_case(h.cases, i).name == b"Err" {
+          Bytes::concat_all([b"((Word)(", word, b") | 4)"])
+        } else { word };
+        let set = line(w, Bytes::concat_all([h.name, b" = ", encoded, b";"]));
+        let counted_arg = if !counted(v.kind) { set }
+        else if takes { line(set, v.expr.concat(b" = 0;")) }
+        else { line(set, Bytes::concat_all([b"ply_inc(", v.expr, b");"])) };
+        line(outdent(counted_arg), b"}")
+      },
+      _ -> acc,
+    });
+  let closed = line(outdent(cased), b"}");
+  if takes { { ..closed, sums: closed.sums.filter(|x: HeldSum| x.name != h.name) } } else { closed }
+}
+
+/// `value`, a sum of cases `c`, as its constructor's index and each constructor's argument's C
+/// values, each with a count the taker owns: a sum held back hands on its arguments, any other
+/// is opened from its word, which its argument's values take.
+fn handed_sum(
+  emitter: Emitter,
+  value: CValue,
+  c: SumCases,
+) -> { emitter: Emitter, names: List<Bytes> } =
+  match held_sum_of(emitter, value.expr) {
+    // Held back as another root's cases lay it out, it is made and opened as these do.
+    Some(h) -> if h.cases != c { opened_sum(emitter, value, c) } else {
+      range(0, c.cases.len()).fold(
+        { emitter: emitter, names: [h.tag] },
+        |acc: { emitter: Emitter, names: List<Bytes> }, i: Int|
+          match nth_case(c, i).arg {
+            None -> acc,
+            Some(carrier) -> match h.args.at(i) {
+              Some(Some(v)) -> {
+                let w = carried_value(acc.emitter, v, carrier);
+                { emitter: w.emitter, names: acc.names.concat(w.names) }
+              },
+              _ ->
+                {
+                  ..acc,
+                  names: acc.names.concat(
+                    range(0, case_width(Some(carrier))).map(|k: Int|
+                      zero_of(nth_field(sum_leaves(c), case_start(c, i) + k).kind)),
+                  ),
+                },
+            },
+          },
+      )
+    },
+    None -> opened_sum(emitter, value, c),
+  }
+
+/// `value`, a sum of cases `c` as its word or its object, opened into its constructor's index and
+/// each constructor's argument's C values, zero but for its own constructor's: the word's count
+/// is its argument's.
+fn opened_sum(
+  emitter: Emitter,
+  value: CValue,
+  c: SumCases,
+) -> { emitter: Emitter, names: List<Bytes> } = {
+  let w = sum_owned(emitter, value, c.spec);
+  let t = fresh(w.emitter);
+  let declared = sum_leaves(c).fold(
+    { emitter: line(t.emitter, Bytes::concat_all([b"int64_t ", t.name, b" = 0;"])), names: [] },
+    |acc: { emitter: Emitter, names: List<Bytes> }, f: FieldTy| {
+      let l = fresh(acc.emitter);
+      {
+        emitter: line(
+          l.emitter,
+          Bytes::concat_all([carried_type(f.kind), b" ", l.name, b" = ", zero_of(f.kind), b";"]),
+        ),
+        names: acc.names.push(l.name),
+      }
+    },
+  );
+  {
+    emitter: spend_made(
+      line(declared.emitter, sum_opening(c, w.value.expr, t.name, declared.names)),
+      w.value.expr,
+    ),
+    names: push_front_bytes(t.name, declared.names),
+  }
+}
+
+/// C statements handing back the sum of cases `c` whose object is `word`, which they take: its
+/// constructor's index returned and each value past it written through the caller's pointers.
+fn sum_returned(c: SumCases, word: Bytes) -> Bytes = {
+  let leaves = sum_leaves(c);
+  let outs = range(1, leaves.len() + 1).map(|k: Int| b"*o".concat(ascii_of_int(k)));
+  Bytes::concat_all([
+    ctype(KSum(c.spec)),
+    b" ply_s = ",
+    sum_helper(c.spec, b"open"),
+    b"(ctx, ",
+    word,
+    b"); int64_t ply_t = 0;",
+    range(0, outs.len()).fold(b"", |t: Bytes, k: Int|
+      Bytes::concat_all([
+        t,
+        b" ",
+        nth_bytes(outs, k),
+        b" = ",
+        zero_of(nth_field(leaves, k).kind),
+        b";",
+      ])),
+    b" ",
+    sum_opening(c, b"ply_s", b"ply_t", outs),
+    b" return ply_t;",
+  ])
+}
+
+/// C statements declaring `name` the word, as `c.spec` holds it, of the sum of cases `c` that is
+/// constructor `tag` of the values `leaves`, each counted one's count taken: a record argument's
+/// word where it was made, one made of `shapes`' shape for its constructor otherwise, leaving by
+/// `fail` if that fails.
+fn sum_word_lines(
+  name: Bytes,
+  c: SumCases,
+  tag: Bytes,
+  leaves: List<CValue>,
+  shapes: List<Int>,
+  fail: Bytes,
+) -> Bytes =
+  Bytes::concat_all([
+    b"Word ",
+    name,
+    b" = 0;",
+    range(0, c.cases.len()).fold(b"", |acc: Bytes, i: Int| {
+      let sc = nth_case(c, i);
+      let at = case_start(c, i);
+      let made = Bytes::concat_all([name, b"_", ascii_of_int(i)]);
+      let held = match sc.arg {
+        None -> None,
+        Some(Fields(fs)) ->
+          Some({
+            prep: record_word_lines(
+              made,
+              nth_value(leaves, at + fs.len()).expr,
+              fs,
+              match shapes.at(i) { Some(sh) -> sh, None -> 0 },
+              range(0, fs.len()).map(|k: Int|
+                { ..nth_value(leaves, at + k), kind: nth_field(fs, k).kind }),
+              fail,
+            ),
+            word: made,
+          }),
+        Some(_) -> Some({ prep: b"", word: as_word(nth_value(leaves, at)) }),
+      };
+      match held {
+        None -> acc,
+        Some(h) ->
+          Bytes::concat_all([
+            acc,
+            b" if (",
+            tag,
+            b" == ",
+            ascii_of_int(i),
+            b") { ",
+            h.prep,
+            b" ",
+            name,
+            b" = ",
+            if c.spec == Tagged && sc.name == b"Err" {
+              Bytes::concat_all([b"((Word)(", h.word, b") | 4)"])
+            } else { h.word },
+            b"; }",
+          ]),
+      }
+    }),
+  ])
+
+/// The shape of each record argument of a sum of cases `c`, registered; zero for any other.
+fn case_shapes(emitter: Emitter, c: SumCases) -> { emitter: Emitter, shapes: List<Int> } =
+  c.cases.fold(
+    { emitter: emitter, shapes: [] },
+    |acc: { emitter: Emitter, shapes: List<Int> }, sc: SumCase|
+      match sc.arg {
+        Some(Fields(fs)) -> {
+          let sh = shape_of_fields(acc.emitter, fs);
+          { emitter: sh.emitter, shapes: acc.shapes.push(sh.i) }
+        },
+        _ -> { ..acc, shapes: acc.shapes.push(0) },
+      },
+  )
+
+/// The shapes an answer carried as `c` is made of where the runtime takes it as a word.
+fn answer_shapes(emitter: Emitter, c: Carrier) -> { emitter: Emitter, shapes: List<Int> } =
+  match c {
+    Fields(fs) -> {
+      let sh = shape_of_fields(emitter, fs);
+      { emitter: sh.emitter, shapes: [sh.i] }
+    },
+    Cases(sc) -> case_shapes(emitter, sc),
+    Whole(_) -> { emitter: emitter, shapes: [] },
+  }
+
+/// C statements setting `tag` to the index of the constructor the word `w` of a sum of cases `c`
+/// is, and its argument's values among `leaves` to that argument's, which take the word's count.
+fn sum_opening(c: SumCases, w: Bytes, tag: Bytes, leaves: List<Bytes>) -> Bytes =
+  Bytes::concat_all([
+    tag,
+    b" = ",
+    match c.spec {
+      Zeroed -> Bytes::concat_all([b"(", w, b" != 0);"]),
+      Tagged -> Bytes::concat_all([b"((", w, b" & 7) == 4);"]),
+    },
+    range(0, c.cases.len()).fold(b"", |acc: Bytes, i: Int| {
+      let sc = nth_case(c, i);
+      let at = case_start(c, i);
+      let arg = if c.spec == Tagged && sc.name == b"Err" {
+        Bytes::concat_all([b"(", w, b" & ~(Word)7)"])
+      } else { w };
+      let body = match sc.arg {
+        None -> b"",
+        Some(Fields(fs)) -> {
+          let loads = field_loads(arg, fs);
+          let locals = range(0, fs.len()).map(|k: Int|
+            { ..nth_value(loads, k), expr: nth_bytes(leaves, at + k) });
+          Bytes::concat_all([
+            range(0, fs.len()).fold(b"", |t: Bytes, k: Int|
+              Bytes::concat_all([
+                t,
+                nth_value(locals, k).expr,
+                b" = ",
+                nth_value(loads, k).expr,
+                b"; ",
+              ])),
+            counted_incs(locals),
+            nth_bytes(leaves, at + fs.len()),
+            b" = ",
+            arg,
+            b";",
+          ])
+        },
+        Some(Whole(KBoxed)) -> Bytes::concat_all([nth_bytes(leaves, at), b" = ", arg, b";"]),
+        Some(Whole(k)) ->
+          Bytes::concat_all([
+            nth_bytes(leaves, at),
+            b" = ",
+            as_kind({ kind: KBoxed, expr: arg, ty: TyOpen([]) }, k),
+            b"; ply_dec(ctx, ",
+            arg,
+            b");",
+          ]),
+        Some(Cases(_)) -> Bytes::concat_all([nth_bytes(leaves, at), b" = ", arg, b";"]),
+      };
+      if body == b"" { acc } else {
+        Bytes::concat_all([acc, b" if (", tag, b" == ", ascii_of_int(i), b") { ", body, b" }"])
+      }
+    }),
+  ])
+
 /// Built at the first demand for its word; the guard stops a second demand building it twice. The
 /// word takes its counted fields' counts where `takes`, the record spent, and adds to them where not.
 fn materialise(emitter: Emitter, name: Bytes, takes: Bool) -> Emitter =
@@ -895,6 +1272,13 @@ fn materialise(emitter: Emitter, name: Bytes, takes: Bool) -> Emitter =
 /// As `materialise`, but where not `allocs` the record is made only in the cells of a record of its
 /// width this body let go, and otherwise stays held back.
 fn made(emitter: Emitter, name: Bytes, takes: Bool, allocs: Bool) -> Emitter =
+  match held_sum_of(emitter, name) {
+    Some(h) -> sum_made(emitter, h, takes),
+    None -> record_made(emitter, name, takes, allocs),
+  }
+
+/// As `made`, for a record held back.
+fn record_made(emitter: Emitter, name: Bytes, takes: Bool, allocs: Bool) -> Emitter =
   match deferred_of(emitter, name) {
     None -> emitter,
     Some(d) -> {
@@ -980,7 +1364,7 @@ fn word_of(emitter: Emitter, value: CValue) -> { emitter: Emitter, expr: Bytes }
     // A box of its own, which this scope lets go; the value keeps its count.
     KSum(spec) -> {
       let b = bind(
-        emitter,
+        made(emitter, value.expr, false, true),
         KBoxed,
         Bytes::concat_all([sum_helper(spec, b"box"), b"(ctx, ", value.expr, b")"]),
       );
@@ -1041,6 +1425,8 @@ fn with_reads(emitter: Emitter, reads: List<Int>) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 fn with_out(emitter: Emitter, out: List<Bytes>) -> Emitter =
@@ -1090,6 +1476,8 @@ fn with_out(emitter: Emitter, out: List<Bytes>) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 fn with_landing(emitter: Emitter, landing: Option<Bytes>) -> Emitter =
@@ -1139,6 +1527,8 @@ fn with_landing(emitter: Emitter, landing: Option<Bytes>) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 fn note_performs(emitter: Emitter, eff: Bytes) -> Emitter =
@@ -1188,6 +1578,8 @@ fn note_performs(emitter: Emitter, eff: Bytes) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 fn note_handles(emitter: Emitter, eff: Bytes) -> Emitter =
@@ -1237,6 +1629,8 @@ fn note_handles(emitter: Emitter, eff: Bytes) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 fn note_deferred(emitter: Emitter, d: Deferred) -> Emitter =
@@ -1328,6 +1722,8 @@ fn push_deferred(emitter: Emitter, d: Deferred) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 /// Whether a record holds a value of `kind` as its own words rather than as a word: a `Float`, a
@@ -2038,6 +2434,8 @@ fn note_alias(emitter: Emitter, local: Bytes, root: Bytes) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 /// Charge a slot's reads to the object the local holds, once per (object, slot).
@@ -2095,6 +2493,8 @@ fn charge(emitter: Emitter, slot: Int, local: Bytes) -> Emitter = {
       lent: emitter.lent,
       written: emitter.written,
       slices: emitter.slices,
+      sums: emitter.sums,
+      leaves: emitter.leaves,
     }
   }
 }
@@ -2181,6 +2581,8 @@ fn poison(emitter: Emitter, why: Bytes) -> Emitter =
         lent: emitter.lent,
         written: emitter.written,
         slices: emitter.slices,
+        sums: emitter.sums,
+        leaves: emitter.leaves,
       },
   }
 
@@ -2243,6 +2645,8 @@ fn lambda_of(emitter: Emitter, sym: Bytes) -> { emitter: Emitter, i: Int } =
           lent: emitter.lent,
           written: emitter.written,
           slices: emitter.slices,
+          sums: emitter.sums,
+          leaves: emitter.leaves,
         },
         i: emitter.lambdas.len(),
       },
@@ -2295,6 +2699,8 @@ fn note_call(emitter: Emitter, full: Bytes) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 fn spend_made(emitter: Emitter, name: Bytes) -> Emitter =
@@ -2883,6 +3289,8 @@ fn const_of(emitter: Emitter, literal: Lit) -> { emitter: Emitter, i: Int } =
       lent: emitter.lent,
       written: emitter.written,
       slices: emitter.slices,
+      sums: emitter.sums,
+      leaves: emitter.leaves,
     },
     i: emitter.consts.len(),
   }
@@ -2972,6 +3380,13 @@ fn held_tagged(emitter: Emitter, word: Bytes, err: Bool) -> WithValue = {
     value: b.value,
   }
 }
+
+/// The name the constructor table gives the constructor written `name`.
+fn ctor_bare(emitter: Emitter, name: Bytes) -> Bytes =
+  match tag_of(emitter, name) {
+    Some(tag) -> match emitter.ctors.names.at(tag) { Some(n) -> n, None -> name },
+    None -> name,
+  }
 
 /// Whether `tag` is the prelude's constructor `name`, which the table names bare.
 fn is_option(emitter: Emitter, tag: Int, name: Bytes) -> Bool =
@@ -3369,7 +3784,7 @@ fn fused_iterate(
               // A step that answers `Stop` or `Continue` in every arm assigns a record state's
               // fields back itself.
               let fs = if fusable_step(emitter, l.body) {
-                match state_carrier(emitter, l) { Fields(x) -> x, Whole(_) -> [] }
+                match state_carrier(emitter, l) { Fields(x) -> x, _ -> [] }
               } else { [] };
               let ls = record_locals(sv.emitter, fs, empty_inits(fs));
               let state = into_of(fs, ls);
@@ -3549,7 +3964,7 @@ fn named_step(emitter: Emitter, f: Code) -> Option<WithValue> / {abort.raise} =
             let a1 = move_read(a0.emitter, Owned, x);
             let c1 = carried_arg(a1.emitter, a0.value, carrier_at(target.carriers.params, 0));
             let c2 = carried_arg(c1.emitter, a1.value, carrier_at(target.carriers.params, 1));
-            Some(called(c2.emitter, target, f.span, c1.names.concat(c2.names), 2))
+            Some(called(c2.emitter, target, f.span, c1.names.concat(c2.names), 2, false))
           },
         },
       },
@@ -3920,6 +4335,7 @@ fn emit_step(
           ToLoop({ state: state, answer: answer, depth: depth }),
           code.span,
           emitter.tail,
+          emitter.leaves,
         ),
     },
     _ -> None,
@@ -4240,7 +4656,7 @@ fn inlined_fold(
                   NLambda(l) -> state_carrier(emitter, l),
                   _ -> Whole(KBoxed),
                 };
-                let fs = match carrier { Fields(x) -> x, Whole(_) -> [] };
+                let fs = match carrier { Fields(x) -> x, _ -> [] };
                 // An `Option` goes round as its payload's word; any other sum as its object.
                 let k = if carrier == Whole(KSum(Zeroed)) { KSum(Zeroed) }
                 else if is_sum(iv.value.kind) { KBoxed }
@@ -5369,6 +5785,8 @@ fn builtin_of(emitter: Emitter, name: Bytes) -> { emitter: Emitter, i: Int } =
           lent: emitter.lent,
           written: emitter.written,
           slices: emitter.slices,
+          sums: emitter.sums,
+          leaves: emitter.leaves,
         },
         i: emitter.called_builtins.len(),
       },
@@ -5474,13 +5892,13 @@ fn call_value(
           fo.emitter,
           args,
           params,
-          if typed { convention.params.map(|k: Kind| Whole(k)) } else { [] },
+          if typed { convention.params } else { [] },
           0,
           [],
         ) {
         None -> None,
         Some(w) -> if typed {
-          Some(called_by_type(w.emitter, fo.value.expr, convention, w.names, span))
+          Some(called_by_type(w.emitter, fo.value.expr, convention, w.names, span, emitter.leaves))
         } else {
           let arr = fresh(w.emitter);
           let e = line(
@@ -5512,30 +5930,52 @@ fn call_value(
     },
   }
 
-/// The call of the closure `f`, of which this scope holds a count, with `names`, its arguments as
-/// `c` holds them: through its typed entry where the closure's own convention is `c`, and
-/// through the runtime, every value made a word, where it is another or no compiled closure.
+/// The call of the closure `f`, of which this scope holds a count, with `names`, its arguments'
+/// carried values as `c` carries them: through its typed entry where the closure's own convention
+/// is `c`, and through the runtime, every value made a word, where it is another or no compiled
+/// closure. A record answer is held back as the fields it came back as, and a sum's as its cases
+/// where `leaves` says they are taken so.
 fn called_by_type(
   emitter: Emitter,
   f: Bytes,
   c: Convention,
   names: List<Bytes>,
   span: Span,
+  leaves: Bool,
 ) -> WithValue = {
+  let back = written_back(c.ret);
+  let ret = returned_kind(c.ret);
   let r = fresh(emitter);
-  let arr = fresh(r.emitter);
-  let back = fresh(arr.emitter);
-  let n = c.params.len();
-  let word = |j: Int|
-    match match c.params.at(j) { Some(k) -> k, None -> KBoxed } {
-      KBoxed -> nth_bytes(names, j),
-      KSum(spec) ->
-        Bytes::concat_all([sum_helper(spec, b"take"), b"(ctx, ", nth_bytes(names, j), b")"]),
-      k -> as_word({ kind: k, expr: nth_bytes(names, j), ty: TyOpen([]) }),
-    };
+  let outs = back.fold(
+    { emitter: r.emitter, names: [] },
+    |acc: { emitter: Emitter, names: List<Bytes> }, b: FieldTy| {
+      let o = fresh(acc.emitter);
+      { emitter: o.emitter, names: acc.names.push(o.name) }
+    },
+  );
+  let arr = fresh(outs.emitter);
+  let word = fresh(arr.emitter);
   let declared = line(
-    site(back.emitter, span),
-    Bytes::concat_all([carried_type(c.ret), b" ", r.name, b" = ", zero_of(c.ret), b";"]),
+    site(word.emitter, span),
+    Bytes::concat_all([
+      carried_type(ret),
+      b" ",
+      r.name,
+      b" = ",
+      zero_of(ret),
+      b";",
+      range(0, back.len()).fold(b"", |t: Bytes, k: Int|
+        Bytes::concat_all([
+          t,
+          b" ",
+          ctype(nth_field(back, k).kind),
+          b" ",
+          nth_bytes(outs.names, k),
+          b" = ",
+          zero_of(nth_field(back, k).kind),
+          b";",
+        ])),
+    ]),
   );
   let by_type = line(
     indent(line(declared, Bytes::concat_all([b"if (", called_typed(f, c), b") {"]))),
@@ -5547,61 +5987,226 @@ fn called_by_type(
       descriptor_of(f),
       b"[1])(ctx, ",
       f,
-      range(0, n).fold(b"", |acc: Bytes, j: Int|
-        Bytes::concat_all([acc, b", ", nth_bytes(names, j)])),
+      names.fold(b"", |acc: Bytes, nm: Bytes| Bytes::concat_all([acc, b", ", nm])),
+      outs.names.fold(b"", |acc: Bytes, nm: Bytes| Bytes::concat_all([acc, b", &", nm])),
       b"); ply_dec(ctx, ",
       f,
       b");",
     ]),
   );
+  let words = convention_words(outdent(by_type), c, names, leaving(by_type));
   let by_words = line(
     line(
-      indent(line(outdent(by_type), b"} else {")),
+      indent(line(words.emitter, b"} else {")),
       Bytes::concat_all([
+        words.prep,
         b"Word ",
         arr.name,
         b"[] = {",
-        if n == 0 { b"0" } else { bytes_join(range(0, n).map(word), b", ") },
+        if words.words.len() == 0 { b"0" } else { bytes_join(words.words, b", ") },
         b"}; Word ",
-        back.name,
+        word.name,
         b" = rt_call_p(ctx, ",
         f,
         b", (Word)(intptr_t)",
         arr.name,
         b", ",
-        ascii_of_int(n),
+        ascii_of_int(c.params.len()),
         b");",
       ]),
     ),
     match c.ret {
-      KBoxed -> Bytes::concat_all([r.name, b" = ", back.name, b";"]),
-      KSum(spec) ->
+      Whole(KBoxed) -> Bytes::concat_all([r.name, b" = ", word.name, b";"]),
+      Whole(KSum(spec)) ->
         Bytes::concat_all([
           b"if (!ctx->failed) ",
           r.name,
           b" = ",
           sum_helper(spec, b"open"),
           b"(ctx, ",
-          back.name,
+          word.name,
           b");",
         ]),
-      k ->
+      Whole(k) ->
         Bytes::concat_all([
           b"if (!ctx->failed) { ",
           r.name,
           b" = ",
-          as_kind({ kind: KBoxed, expr: back.name, ty: TyOpen([]) }, k),
+          as_kind({ kind: KBoxed, expr: word.name, ty: TyOpen([]) }, k),
           b"; ply_dec(ctx, ",
-          back.name,
+          word.name,
           b"); }",
         ]),
+      // The answer's object is opened into its constructor's index and argument's values.
+      Cases(sc) -> {
+        let opened = Bytes::concat_all([word.name, b"_s"]);
+        Bytes::concat_all([
+          b"if (!ctx->failed) { ",
+          ctype(KSum(sc.spec)),
+          b" ",
+          opened,
+          b" = ",
+          sum_helper(sc.spec, b"open"),
+          b"(ctx, ",
+          word.name,
+          b"); ",
+          sum_opening(sc, opened, r.name, outs.names),
+          b" }",
+        ])
+      },
+      // The answer's word is the record's: its fields are loaded, each counted one counted again.
+      Fields(fs) -> {
+        let loads = field_loads(word.name, fs);
+        let locals = push_front(
+          { ..nth_value(loads, 0), expr: r.name },
+          range(1, fs.len()).map(|k: Int|
+            { ..nth_value(loads, k), expr: nth_bytes(outs.names, k - 1) }),
+        );
+        Bytes::concat_all([
+          b"if (!ctx->failed) { ",
+          range(0, fs.len()).fold(b"", |t: Bytes, k: Int|
+            Bytes::concat_all([
+              t,
+              nth_value(locals, k).expr,
+              b" = ",
+              nth_value(loads, k).expr,
+              b"; ",
+            ])),
+          counted_incs(locals),
+          nth_bytes(outs.names, back.len() - 1),
+          b" = ",
+          word.name,
+          b"; }",
+        ])
+      },
     },
   );
-  let closed = line(outdent(by_words), b"}");
-  {
-    emitter: check(if counted(c.ret) { note_made(closed, r.name) } else { closed }),
-    value: { kind: c.ret, expr: r.name, ty: TyOpen([]) },
+  let closed = check(line(outdent(by_words), b"}"));
+  match c.ret {
+    Cases(sc) ->
+      sum_answer(
+        closed,
+        leaves,
+        sc,
+        r.name,
+        range(0, back.len()).map(|k: Int|
+          { kind: nth_field(back, k).kind, expr: nth_bytes(outs.names, k), ty: TyOpen([]) }),
+      ),
+    Fields(fs) ->
+      held_record(
+        closed,
+        fs,
+        push_front(
+          { kind: ret, expr: r.name, ty: nth_field(fs, 0).ty },
+          range(0, back.len() - 1).map(|k: Int|
+            {
+              kind: nth_field(back, k).kind,
+              expr: nth_bytes(outs.names, k),
+              ty: nth_field(back, k).ty,
+            }),
+        ),
+        nth_bytes(outs.names, back.len() - 1),
+      ),
+    Whole(k) ->
+      {
+        emitter: if counted(k) { note_made(closed, r.name) } else { closed },
+        value: { kind: k, expr: r.name, ty: TyOpen([]) },
+      },
   }
+}
+
+/// The words the runtime is handed for `names`, the carried values of arguments carried as `c`
+/// says: a value its word, a record's fields its word, made of them where it was never made.
+fn convention_words(
+  emitter: Emitter,
+  c: Convention,
+  names: List<Bytes>,
+  fail: Bytes,
+) -> { emitter: Emitter, prep: Bytes, words: List<Bytes> } = {
+  let walked = c.params.fold(
+    { emitter: emitter, prep: b"", words: [], at: 0 },
+    |acc: { emitter: Emitter, prep: Bytes, words: List<Bytes>, at: Int }, p: Carrier|
+      match p {
+        Whole(KBoxed) -> { ..acc, words: acc.words.push(nth_bytes(names, acc.at)), at: acc.at + 1 },
+        Whole(KSum(spec)) ->
+          {
+            ..acc,
+            words: acc.words.push(
+              Bytes::concat_all([
+                sum_helper(spec, b"take"),
+                b"(ctx, ",
+                nth_bytes(names, acc.at),
+                b")",
+              ]),
+            ),
+            at: acc.at + 1,
+          },
+        Whole(k) ->
+          {
+            ..acc,
+            words: acc.words.push(
+              as_word({ kind: k, expr: nth_bytes(names, acc.at), ty: TyOpen([]) }),
+            ),
+            at: acc.at + 1,
+          },
+        Fields(fs) -> {
+          let sh = shape_of_fields(acc.emitter, fs);
+          let made = fresh(sh.emitter);
+          {
+            emitter: made.emitter,
+            prep: Bytes::concat_all([
+              acc.prep,
+              record_word_lines(
+                made.name,
+                nth_bytes(names, acc.at + fs.len()),
+                fs,
+                sh.i,
+                range(0, fs.len()).map(|k: Int|
+                  {
+                    kind: nth_field(fs, k).kind,
+                    expr: nth_bytes(names, acc.at + k),
+                    ty: nth_field(fs, k).ty,
+                  }),
+                fail,
+              ),
+              b" ",
+            ]),
+            words: acc.words.push(made.name),
+            at: acc.at + fs.len() + 1,
+          }
+        },
+        Cases(sc) -> {
+          let shaped = case_shapes(acc.emitter, sc);
+          let made = fresh(shaped.emitter);
+          let leaves = sum_leaves(sc);
+          {
+            emitter: made.emitter,
+            prep: Bytes::concat_all([
+              acc.prep,
+              sum_word_lines(
+                made.name,
+                sc,
+                nth_bytes(names, acc.at),
+                range(0, leaves.len()).map(|k: Int|
+                  {
+                    kind: nth_field(leaves, k).kind,
+                    expr: nth_bytes(names, acc.at + 1 + k),
+                    ty: TyOpen([]),
+                  }),
+                shaped.shapes,
+                fail,
+              ),
+              b" ",
+            ]),
+            words: acc.words.push(
+              Bytes::concat_all([sum_helper(sc.spec, b"take"), b"(ctx, ", made.name, b")"]),
+            ),
+            at: acc.at + 1 + leaves.len(),
+          }
+        },
+      },
+  );
+  { emitter: walked.emitter, prep: walked.prep, words: walked.words }
 }
 
 /// The emitter noting that this body calls the parameter `value` is, where it is one.
@@ -5671,24 +6276,20 @@ fn ty_at(tys: List<Ty>, j: Int) -> Ty = match tys.at(j) { Some(t) -> t, None -> 
 /// `ty` where it says something, else `fallback`.
 fn known_or(ty: Ty, fallback: Ty) -> Ty = match ty { TyOpen(_) -> fallback, _ -> ty }
 
-/// How a function value takes its arguments and answers where a call knows its type: each held as
-/// `value_kind` holds a value of its type. Two reads of one closure agree on it only where they
-/// agree on the type, so a closure carries its own and a call tests for the one it expects.
-type Convention = { params: List<Kind>, ret: Kind }
-
-/// How a value of `t` crosses a call of a function value: a scalar, and an `Option` or a `Result`
-/// held as its word, as itself; anything else, a type variable's value among them, as its word.
-fn value_kind(t: Type) -> Kind = match carrier_of(t) { Whole(k) -> k, Fields(_) -> KBoxed }
+/// How a function value takes its arguments and answers where a call knows its type: each as a
+/// direct call of a definition of that type carries it. Two reads of one closure agree on it only
+/// where they agree on the type, so a closure carries its own and a call tests for the one it expects.
+type Convention = { params: List<Carrier>, ret: Carrier }
 
 fn words_convention(n: Int) -> Convention =
-  { params: range(0, n).map(|_: Int| KBoxed), ret: KBoxed }
+  { params: range(0, n).map(|_: Int| Whole(KBoxed)), ret: Whole(KBoxed) }
 
 /// The convention of a function value of type `ty` that takes `n` arguments: every value a word
 /// where `ty` is no such function's.
 fn convention_of(ty: Option<Type>, n: Int) -> Convention =
   match ty {
     Some(TyFn(f)) -> if f.params.len() != n { words_convention(n) }
-    else { { params: f.params.map(value_kind), ret: value_kind(f.ret) } },
+    else { { params: f.params.map(carrier_of), ret: carrier_of(f.ret) } },
     _ -> words_convention(n),
   }
 
@@ -5698,7 +6299,7 @@ fn called_convention(emitter: Emitter, code: Code, n: Int) -> Convention =
 
 /// Whether `c` holds a value apart from a word, which is what a call by it saves.
 fn typed_convention(c: Convention) -> Bool =
-  c.ret != KBoxed || c.params.fold(false, |any: Bool, k: Kind| any || k != KBoxed)
+  c.ret != Whole(KBoxed) || c.params.fold(false, |any: Bool, p: Carrier| any || p != Whole(KBoxed))
 
 fn kind_spelled(k: Kind) -> Bytes =
   match k {
@@ -5712,19 +6313,58 @@ fn kind_spelled(k: Kind) -> Bytes =
     KNum(w) -> Bytes::concat_all([if w.signed { b"s" } else { b"u" }, ascii_of_int(w.bits)]),
   }
 
-/// A convention as the C integer a closure's descriptor holds: a digest of how each value is held.
+fn carrier_spelled(c: Carrier) -> Bytes =
+  match c {
+    Whole(k) -> kind_spelled(k),
+    Cases(sc) ->
+      Bytes::concat_all([
+        kind_spelled(KSum(sc.spec)),
+        b"<",
+        bytes_join(
+          sc.cases.map(|x: SumCase|
+            match x.arg {
+              Some(a) -> Bytes::concat_all([x.name, b":", carrier_spelled(a)]),
+              None -> x.name,
+            }),
+          b"|",
+        ),
+        b">",
+      ]),
+    Fields(fs) ->
+      Bytes::concat_all([
+        b"{",
+        bytes_join(
+          fs.map(|f: FieldTy| Bytes::concat_all([f.name, b":", kind_spelled(f.kind)])),
+          b",",
+        ),
+        b"}",
+      ]),
+  }
+
+/// A convention as the C integer a closure's descriptor holds: a digest of how each value crosses.
 fn convention_id(c: Convention) -> Bytes =
-  int_lit(root_id(bytes_join(c.params.push(c.ret).map(kind_spelled), b",")))
+  int_lit(root_id(bytes_join(c.params.push(c.ret).map(carrier_spelled), b",")))
 
 /// The C type of the entry a closure of convention `c` is called through by its type: the closure,
-/// then each argument.
-fn typed_entry_type(c: Convention) -> Bytes =
+/// then each argument's carried values, then the pointers a record answer is written through.
+fn typed_entry_type(c: Convention) -> Bytes = {
+  let h = convention_head(c);
   Bytes::concat_all([
-    carried_type(c.ret),
+    h.answer,
     b" (*)(PlyCtx *, Word",
-    c.params.fold(b"", |acc: Bytes, k: Kind| Bytes::concat_all([acc, b", ", carried_type(k)])),
+    h.params.fold(b"", |acc: Bytes, t: Bytes| Bytes::concat_all([acc, b", ", t])),
     b")",
   ])
+}
+
+/// The C head a function of convention `c` has past what it captures.
+fn convention_head(c: Convention) -> Head =
+  {
+    answer: carried_type(returned_kind(c.ret)),
+    params: c.params.fold([], |acc: List<Bytes>, p: Carrier| acc.concat(carried_types(p))).concat(
+      written_back(c.ret).map(|f: FieldTy| carried_type(f.kind).concat(b"*")),
+    ),
+  }
 
 /// The descriptor of the closure `f`, where it has one: the word after its code is the address, as
 /// an immediate, of its convention and typed entry.
@@ -5747,97 +6387,48 @@ fn called_typed(f: Bytes, c: Convention) -> Bytes =
     b")",
   ])
 
-/// What a lambda `name` of `captures` captures and convention `c` is entered through: the entry
-/// the runtime calls with every value a word, past the closure's descriptor; the entry a call by
-/// its type makes with the closure, which hands the function its captures counted once more; and
-/// the descriptor naming that entry.
-fn lambda_entries(name: Bytes, captures: Int, c: Convention) -> Bytes = {
-  let opened = range(0, c.params.len()).fold(
-    { text: b"", args: [] },
-    |acc: { text: Bytes, args: List<Bytes> }, j: Int| {
-      let arg = Bytes::concat_all([b"args[", ascii_of_int(1 + captures + j), b"]"]);
-      let local = b"a".concat(ascii_of_int(j));
-      match match c.params.at(j) { Some(k) -> k, None -> KBoxed } {
-        KBoxed -> { ..acc, args: acc.args.push(arg) },
-        KSum(spec) ->
-          {
-            text: Bytes::concat_all([
-              acc.text,
-              b"  ",
-              ctype(KSum(spec)),
-              b" ",
-              local,
-              b" = ",
-              sum_helper(spec, b"open"),
-              b"(ctx, ",
-              arg,
-              b");\n",
-            ]),
-            args: acc.args.push(local),
-          },
-        k ->
-          {
-            text: Bytes::concat_all([
-              acc.text,
-              b"  ",
-              ctype(k),
-              b" ",
-              local,
-              b" = ",
-              as_kind({ kind: KBoxed, expr: arg, ty: TyOpen([]) }, k),
-              b"; ply_dec(ctx, ",
-              arg,
-              b");\n",
-            ]),
-            args: acc.args.push(local),
-          },
-      }
-    },
-  );
-  let held = range(0, captures).fold(b"", |acc: Bytes, i: Int|
-    Bytes::concat_all([acc, b", args[", ascii_of_int(1 + i), b"]"]));
-  let call = Bytes::concat_all([
-    name,
-    b"(ctx",
-    held,
-    opened.args.fold(b"", |acc: Bytes, a: Bytes| Bytes::concat_all([acc, b", ", a])),
-    b")",
-  ]);
-  let typed_params = range(0, c.params.len()).fold(b"", |acc: Bytes, j: Int|
-    Bytes::concat_all([
-      acc,
-      b", ",
-      carried_type(match c.params.at(j) { Some(k) -> k, None -> KBoxed }),
-      b" a",
-      ascii_of_int(j),
-    ]));
+/// The parameters of a lambda of convention `c` as a definition's are, carried as `c` says.
+fn lambda_params(c: Convention, tys: List<Ty>) -> List<EmitParam> =
+  range(0, c.params.len()).map(|j: Int| {
+    let carrier = carrier_at(c.params, j);
+    {
+      name: b"p".concat(ascii_of_int(j)),
+      kind: match carrier { Whole(k) -> k, Fields(_) -> KBoxed, Cases(sc) -> KSum(sc.spec) },
+      ty: match carrier { Fields(fs) -> TyRec(fs), _ -> ty_at(tys, j) },
+      of: None,
+      carrier: carrier,
+      lambda: None,
+    }
+  })
+
+/// What a lambda `name` of `captures` captures and parameters `params` is entered through: the
+/// entry the runtime calls with every value a word, past the closure's descriptor; the entry a call
+/// by its type makes with the closure, which hands the function its captures counted once more; and
+/// the descriptor naming that entry. `shapes` are an answer's records', which the first entry makes.
+fn lambda_entries(
+  name: Bytes,
+  captures: Int,
+  params: List<EmitParam>,
+  c: Convention,
+  shapes: List<Int>,
+) -> Bytes = {
+  let names = carried_names(params, c.ret);
+  let h = convention_head(c);
   Bytes::concat_all([
-    b"Word ",
-    name,
-    b"_entry(PlyCtx *ctx, const Word *args) {\n",
-    opened.text,
-    match c.ret {
-      KBoxed -> Bytes::concat_all([b"  return ", call, b";\n"]),
-      k ->
-        Bytes::concat_all([
-          b"  ",
-          ctype(k),
-          b" r = ",
-          call,
-          b";\n  if (ctx->failed) return 0;\n  return ",
-          match k {
-            KSum(spec) -> sum_helper(spec, b"take").concat(b"(ctx, r)"),
-            _ -> as_word({ kind: k, expr: b"r", ty: TyOpen([]) }),
-          },
-          b";\n",
-        ]),
-    },
-    b"}\n",
-    carried_type(c.ret),
+    entry_from(
+      name,
+      range(0, captures).map(|i: Int| Bytes::concat_all([b"args[", ascii_of_int(1 + i), b"]"])),
+      1 + captures,
+      params,
+      c.ret,
+      shapes,
+    ),
+    h.answer,
     b" ",
     name,
     b"_typed(PlyCtx *ctx, Word self",
-    typed_params,
+    range(0, h.params.len()).fold(b"", |acc: Bytes, j: Int|
+      Bytes::concat_all([acc, b", ", nth_bytes(h.params, j), b" ", nth_bytes(names, j)])),
     b") {\n",
     range(0, captures).fold(b"", |acc: Bytes, i: Int|
       Bytes::concat_all([
@@ -5855,8 +6446,7 @@ fn lambda_entries(name: Bytes, captures: Int, c: Convention) -> Bytes = {
     b"(ctx",
     range(0, captures).fold(b"", |acc: Bytes, i: Int|
       Bytes::concat_all([acc, b", c", ascii_of_int(i)])),
-    range(0, c.params.len()).fold(b"", |acc: Bytes, j: Int|
-      Bytes::concat_all([acc, b", a", ascii_of_int(j)])),
+    names.fold(b"", |acc: Bytes, n: Bytes| Bytes::concat_all([acc, b", ", n])),
     b");\n}\n",
     b"const int64_t ",
     name,
@@ -5869,7 +6459,7 @@ fn lambda_entries(name: Bytes, captures: Int, c: Convention) -> Bytes = {
 }
 
 /// A lambda's C parameters are its captures, each a word it owns, then its own as its type's
-/// convention holds them; it answers as that convention does.
+/// convention carries them; it answers as that convention does.
 /// It continues the unit's tables from its builder and hands additions back; a fresh copy would renumber from zero.
 fn emit_lambda(
   emitter: Emitter,
@@ -5877,15 +6467,15 @@ fn emit_lambda(
   l: Lambda,
   cap_tys: List<Ty>,
 ) -> Option<{ text: Bytes, extra: Bytes, met: List<Bytes>, consts: List<Lit>, shapes: List<List<Bytes>>, fields: List<Bytes>, lambdas: List<Bytes>, calls: List<Bytes>, generics: Generics, performs: List<Bytes>, handles: List<Bytes>, refused: Option<Bytes> }> / {abort.raise} = {
-  let n = l.captures.len() + l.params;
   let tys = lambda_param_tys(emitter, l);
   let convention = convention_of(
     match emitter.typed.get(span_key(l.at)) { Some(t) -> Some(t.ty), None -> None },
     l.params,
   );
-  let held_as = |j: Int| match convention.params.at(j) { Some(k) -> k, None -> KBoxed };
-  let window = range(0, l.params).fold(
-    range(0, l.captures.len()).fold([], |acc: List<Unboxed>, i: Int|
+  let params = lambda_params(convention, tys);
+  let captures = l.captures.len();
+  let window = range(0, params.len()).fold(
+    range(0, captures).fold([], |acc: List<Unboxed>, i: Int|
       match l.captures.at(i) {
         Some(c) ->
           acc.push({
@@ -5897,12 +6487,13 @@ fn emit_lambda(
         None -> acc,
       }),
     |acc: List<Unboxed>, j: Int|
-      acc.push({
-        slot: j,
-        kind: held_as(j),
-        expr: b"q".concat(ascii_of_int(l.captures.len() + j)),
-        ty: ty_at(tys, j),
-      }),
+      match params.at(j) {
+        Some(p) -> match p.carrier {
+          Whole(k) -> acc.push({ slot: j, kind: k, expr: p.name, ty: p.ty }),
+          _ -> acc,
+        },
+        None -> acc,
+      },
   );
   let reads = slots_read(l.body);
   // Nothing in a lambda's body is a tail, so an update at its end keeps the one-read guard.
@@ -5947,76 +6538,89 @@ fn emit_lambda(
     group: emitter.group,
     operands: emitter.operands,
     typed: emitter.typed,
-    answer: Whole(convention.ret),
+    answer: convention.ret,
     site_root: emitter.site_root,
     lent: emitter.lent,
     written: emitter.written,
     slices: [],
+    sums: [],
+    leaves: answers_cases(convention.ret),
   };
   let charged = window.fold(start, |acc: Emitter, w: Unboxed|
     if counted(w.kind) { note_bound(note_holder(charge(acc, w.slot, w.expr), w.expr), w.expr) }
     else { acc });
-  match expr(charged, l.body, []) {
+  // A record that arrives as its fields is held back as them, and a sum as its cases.
+  let opened = range(0, params.len()).fold(charged, |acc: Emitter, j: Int|
+    match carrier_at(convention.params, j) {
+      Fields(fs) -> {
+        let r = held_record(
+          acc,
+          fs,
+          range(0, fs.len()).map(|k: Int|
+            { kind: nth_field(fs, k).kind, expr: field_param(j, k), ty: nth_field(fs, k).ty }),
+          word_param(j),
+        );
+        remember(r.emitter, j, r.value)
+      },
+      Cases(sc) -> {
+        let h = sum_param(acc, sc, j);
+        remember(h.emitter, j, { ..h.value, ty: ty_at(tys, j) })
+      },
+      Whole(_) -> acc,
+    });
+  match expr(opened, l.body, []) {
     None -> None,
     Some(o0) -> {
-      let w = answered(o0.emitter, o0.value, Whole(convention.ret));
-      let o = { emitter: w.emitter, value: o0.value };
+      let w = answered(o0.emitter, o0.value, convention.ret);
+      let shaped = answer_shapes(w.emitter, convention.ret);
+      // A stack grown re-enters through the runtime's entry: the descriptor's place, then words.
+      let grown = grown_words(shaped.emitter, params, convention.ret);
+      let o = grown.emitter;
+      let h = convention_head(convention);
+      let names = carried_names(params, convention.ret);
       Some({
-        met: o.emitter.called_builtins,
-        consts: o.emitter.consts,
-        shapes: o.emitter.shapes,
-        fields: o.emitter.fields,
-        lambdas: o.emitter.lambdas,
-        calls: o.emitter.calls,
-        generics: o.emitter.generics,
-        performs: o.emitter.performs,
-        handles: o.emitter.handles,
-        refused: o.emitter.refused,
-        extra: o.emitter.lambda_bodies,
+        met: o.called_builtins,
+        consts: o.consts,
+        shapes: o.shapes,
+        fields: o.fields,
+        lambdas: o.lambdas,
+        calls: o.calls,
+        generics: o.generics,
+        performs: o.performs,
+        handles: o.handles,
+        refused: o.refused,
+        extra: o.lambda_bodies,
         text: Bytes::concat_all([
           b"Word ",
           name,
           b"_entry(PlyCtx *ctx, const Word *args);\n",
-          carried_type(convention.ret),
+          h.answer,
           b" ",
           name,
           b"(PlyCtx *ctx",
-          range(0, n).fold(b"", |acc: Bytes, i: Int|
-            Bytes::concat_all([
-              acc,
-              b", ",
-              if i < l.captures.len() { b"Word" }
-              else { carried_type(held_as(i - l.captures.len())) },
-              b" q",
-              ascii_of_int(i),
-            ])),
+          range(0, captures).fold(b"", |acc: Bytes, i: Int|
+            Bytes::concat_all([acc, b", Word q", ascii_of_int(i)])),
+          range(0, h.params.len()).fold(b"", |acc: Bytes, j: Int|
+            Bytes::concat_all([acc, b", ", nth_bytes(h.params, j), b" ", nth_bytes(names, j)])),
           b") {\n",
-          // A stack grown re-enters through the runtime's entry: the descriptor's place, then words.
           fuel_head(
             name.concat(b"_entry"),
-            b"",
-            range(0, n).fold([b"0"], |acc: List<Bytes>, i: Int| {
-              let q = b"q".concat(ascii_of_int(i));
-              acc.push(if i < l.captures.len() { q } else {
-                match held_as(i - l.captures.len()) {
-                  KBoxed -> q,
-                  KSum(spec) -> Bytes::concat_all([sum_helper(spec, b"take"), b"(ctx, ", q, b")"]),
-                  k -> as_word({ kind: k, expr: q, ty: TyOpen([]) }),
-                }
-              })
-            }),
-            Whole(convention.ret),
+            grown.prep,
+            [b"0"].concat(range(0, captures).map(|i: Int| b"q".concat(ascii_of_int(i)))).concat(
+              grown.words,
+            ),
+            convention.ret,
           ),
-          sorted_widths(o.emitter.reuse_widths).fold(b"", |acc: Bytes, w: Int|
-            Bytes::concat_all([acc, b"  Word tok", ascii_of_int(w), b" = 0;\n"])),
-          o.emitter.deferred_locals.fold(b"", |acc: Bytes, r: Bytes|
+          sorted_widths(o.reuse_widths).fold(b"", |acc: Bytes, wd: Int|
+            Bytes::concat_all([acc, b"  Word tok", ascii_of_int(wd), b" = 0;\n"])),
+          o.deferred_locals.fold(b"", |acc: Bytes, r: Bytes|
             Bytes::concat_all([acc, b"  Word ", r, b" = 0;\n"])),
-          bytes_join(o.emitter.out, b""),
-          toks_freed(o.emitter.reuse_widths),
+          bytes_join(o.out, b""),
+          toks_freed(o.reuse_widths),
           b"  ctx->fuel += 1;\n  return ",
           w.expr,
           b";\n}\n",
-          lambda_entries(name, l.captures.len(), convention),
+          lambda_entries(name, captures, params, convention, shaped.shapes),
         ]),
       })
     },
@@ -6056,10 +6660,15 @@ fn args_carried(
   if i >= codes.len() { Some({ emitter: emitter, names: acc }) } else {
     match codes.at(i) {
       None -> None,
-      Some(x) -> match expr(notail(emitter), x, params) {
+      Some(x) -> match expr(
+          if answers_cases(carrier_at(carriers, i)) { with_leaves(notail(emitter)) }
+          else { notail(emitter) },
+          x,
+          params,
+        ) {
         None -> None,
         Some(o) -> {
-          let w = carried_arg(o.emitter, o.value, carrier_at(carriers, i));
+          let w = carried_arg(notail(o.emitter), o.value, carrier_at(carriers, i));
           args_carried(w.emitter, codes, params, carriers, i + 1, acc.concat(w.names))
         },
       },
@@ -6078,6 +6687,17 @@ fn carried_arg(
   c: Carrier,
 ) -> { emitter: Emitter, names: List<Bytes> } =
   match c {
+    Cases(sc) -> handed_sum(emitter, value, sc),
+    other -> carried_value(emitter, value, other),
+  }
+
+/// As `carried_arg`, for a carrier that is not a sum's cases: what a sum's argument crosses as.
+fn carried_value(
+  emitter: Emitter,
+  value: CValue,
+  c: Carrier,
+) -> { emitter: Emitter, names: List<Bytes> } =
+  match c {
     Whole(KBoxed) -> {
       let w = owned(emitter, value);
       { emitter: w.emitter, names: [w.value.expr] }
@@ -6091,6 +6711,10 @@ fn carried_arg(
       { emitter: w.emitter, names: [w.value.expr] }
     },
     Fields(fs) -> handed_record(emitter, value, fs),
+    Cases(_) -> {
+      let w = owned(emitter, value);
+      { emitter: w.emitter, names: [w.value.expr] }
+    },
   }
 
 /// Each field of the record `value` of fields `fs` in a local of its C type and then its word, each
@@ -6146,8 +6770,16 @@ fn handed_word(emitter: Emitter, value: CValue) -> WithValue =
   }
 
 /// The call of `target`, named before its `n` arguments were handed over as `names`, its answer as
-/// the root it names hands it back: a record's held back as the fields it returned.
-fn called(emitter: Emitter, target: Target, span: Span, names: List<Bytes>, n: Int) -> WithValue = {
+/// the root it names hands it back: a record's held back as the fields it returned, and a sum's as
+/// its cases where `leaves` says they are taken so.
+fn called(
+  emitter: Emitter,
+  target: Target,
+  span: Span,
+  names: List<Bytes>,
+  n: Int,
+  leaves: Bool,
+) -> WithValue = {
   let answer = target.carriers.answer;
   let back = written_back(answer);
   let expected = {
@@ -6190,6 +6822,15 @@ fn called(emitter: Emitter, target: Target, span: Span, names: List<Bytes>, n: I
   match answer {
     Whole(KBoxed) -> opened_to(check(o.emitter), o.value, target.ret),
     Whole(_) -> { emitter: check(o.emitter), value: { ..o.value, ty: target.ret.ty } },
+    Cases(sc) ->
+      sum_answer(
+        check(o.emitter),
+        leaves,
+        sc,
+        o.value.expr,
+        range(0, back.len()).map(|k: Int|
+          { kind: nth_field(back, k).kind, expr: nth_bytes(outs.names, k), ty: TyOpen([]) }),
+      ),
     Fields(fs) -> {
       let vals = push_front(
         o.value,
@@ -6202,6 +6843,24 @@ fn called(emitter: Emitter, target: Target, span: Span, names: List<Bytes>, n: I
       );
       held_record(check(o.emitter), fs, vals, nth_bytes(outs.names, back.len() - 1))
     },
+  }
+}
+
+/// A sum of cases `c` a call answered as its constructor's index `tag` and the values `leaves`:
+/// held back as them where `wanted`, and its word made of them otherwise.
+fn sum_answer(
+  emitter: Emitter,
+  wanted: Bool,
+  c: SumCases,
+  tag: Bytes,
+  leaves: List<CValue>,
+) -> WithValue = {
+  let h = held_sum_from(emitter, c, tag, leaves);
+  if wanted { h } else {
+    match held_sum_of(h.emitter, h.value.expr) {
+      Some(held) -> { emitter: sum_made(h.emitter, held, true), value: h.value },
+      None -> h,
+    }
   }
 }
 
@@ -6305,6 +6964,8 @@ fn field_of(emitter: Emitter, name: Bytes) -> { emitter: Emitter, i: Int } =
           lent: emitter.lent,
           written: emitter.written,
           slices: emitter.slices,
+          sums: emitter.sums,
+          leaves: emitter.leaves,
         },
         i: emitter.fields.len(),
       },
@@ -6372,6 +7033,8 @@ fn remember_built(
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 fn shape_of(emitter: Emitter, names: List<Bytes>) -> { emitter: Emitter, i: Int } =
@@ -6429,6 +7092,8 @@ fn shape_of(emitter: Emitter, names: List<Bytes>) -> { emitter: Emitter, i: Int 
           lent: emitter.lent,
           written: emitter.written,
           slices: emitter.slices,
+          sums: emitter.sums,
+          leaves: emitter.leaves,
         },
         i: emitter.shapes.len(),
       },
@@ -6499,6 +7164,8 @@ fn note_tok(emitter: Emitter, w: Int) -> Emitter =
       lent: emitter.lent,
       written: emitter.written,
       slices: emitter.slices,
+      sums: emitter.sums,
+      leaves: emitter.leaves,
     }
   }
 
@@ -6549,6 +7216,8 @@ fn note_released(emitter: Emitter, root: Bytes) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 /// The words a record of `ty` holds, which is the reuse token its cells make.
@@ -6775,6 +7444,8 @@ fn closure_value(
             lent: e.lent,
             written: e.written,
             slices: e.slices,
+            sums: e.sums,
+            leaves: e.leaves,
           };
           let o = bind(
             grown,
@@ -7196,7 +7867,10 @@ fn slot_read(
   match conv_of(emitter, s) {
     Some(v) -> match slice_of(emitter, v.expr) {
       Some(sl) -> Some(sliced_list(emitter, sl, v.ty)),
-      None -> Some(move_read(emitter, c.own, typed_value(emitter, c, v))),
+      None -> match held_sum_of(emitter, v.expr) {
+        Some(h) -> Some(held_sum_read(emitter, c.own, h, typed_value(emitter, c, v))),
+        None -> Some(move_read(emitter, c.own, typed_value(emitter, c, v))),
+      },
     },
     // A parameter the prologue did not open (a record) is read as its own word each time.
     None -> match params.at(s) {
@@ -7230,6 +7904,47 @@ fn slot_read(
       },
     },
   }
+
+/// A read of a slot holding the sum `h` held back, as `value`. Where its constructor and argument are
+/// taken, its last read hands them on and any other a copy of them, counted again; elsewhere its
+/// word is made, taking them at its last read.
+fn held_sum_read(emitter: Emitter, own: Own, h: HeldSum, value: CValue) -> WithValue = {
+  let last = own == Owned && !is_pinned(emitter, value.expr);
+  if emitter.leaves {
+    if last { { emitter: emitter, value: value } } else {
+      let copied = h.args.fold(
+        { emitter: emitter, args: [] },
+        |acc: { emitter: Emitter, args: List<Option<CValue>> }, a: Option<CValue>|
+          match a {
+            None -> { ..acc, args: acc.args.push(None) },
+            Some(v) -> if !counted(v.kind) { { ..acc, args: acc.args.push(Some(v)) } } else {
+              match deferred_of(acc.emitter, v.expr) {
+                Some(d) -> {
+                  let r = copied_record(acc.emitter, v, d);
+                  { emitter: r.emitter, args: acc.args.push(Some(r.value)) }
+                },
+                None -> {
+                  let w = owned_word(acc.emitter, v);
+                  {
+                    emitter: note_holder(w.emitter, w.value.expr),
+                    args: acc.args.push(Some(w.value)),
+                  }
+                },
+              }
+            },
+          },
+      );
+      let f = fresh(copied.emitter);
+      {
+        emitter: note_held_sum(f.emitter, { ..h, name: f.name, args: copied.args }),
+        value: { ..value, expr: f.name },
+      }
+    }
+  } else {
+    let w = sum_made(emitter, h, last);
+    if last { move_read(w, Owned, value) } else { { emitter: w, value: value } }
+  }
+}
 
 fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue> / {abort.raise} =
   match c.node {
@@ -7300,22 +8015,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       _ -> Some(refused(emitter, b"a literal this port does not pool")),
     },
     NVar(v) -> match v.slot {
-      // The table has no arities: the runtime answers a nullary constructor's singleton or a function.
-      None -> if is_ctor_name(v.name) {
-        match tag_of(emitter, v.name) {
-          None -> Some(refused(emitter, b"a constructor not in the table: ".concat(v.name))),
-          Some(tag) -> if is_option(emitter, tag, b"None") {
-            Some(bind(emitter, KSum(Zeroed), b"0"))
-          } else {
-            let o = bind(
-              emitter,
-              KBoxed,
-              Bytes::concat_all([b"rt_ctor_value_p(ctx, ", tag_text(emitter, tag), b")"]),
-            );
-            Some({ emitter: check(o.emitter), value: o.value })
-          },
-        }
-      } else {
+      None -> if is_ctor_name(v.name) { Some(ctor_value(emitter, c, v.name)) } else {
         match def_of(emitter, v.name) {
           // A definition used as a value is a closure over its entry, a nullary one too: calling it here would run its body before, and outside the handlers of, any call.
           Some(d) -> {
@@ -7368,7 +8068,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               );
               let branch = if b.op == b"and" { Bytes::concat_all([b"if (", out.name, b") {"]) }
               else { Bytes::concat_all([b"if (!", out.name, b") {"]) };
-              match expr(withtail(indent(line(opened, branch)), emitter.tail), b.rhs, params) {
+              match expr(withtail(indent(line(opened, branch)), position(emitter)), b.rhs, params) {
                 None -> None,
                 Some(r) -> {
                   let assigned = line(
@@ -7442,12 +8142,12 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
     NBlock(bl) -> match bl.tail {
       None -> match stmts(emitter, bl.stmts, params, 0) {
         None -> None,
-        Some(after) -> Some(bind(withtail(after, emitter.tail), KBoxed, b"ply_unit")),
+        Some(after) -> Some(bind(withtail(after, position(emitter)), KBoxed, b"ply_unit")),
       },
       Some(t) -> match stmts(emitter, bl.stmts, params, 0) {
         None -> None,
         // The block's tail is a tail when the block is; its statements are not.
-        Some(after) -> match expr(withtail(after, emitter.tail), t, params) {
+        Some(after) -> match expr(withtail(after, position(emitter)), t, params) {
           None -> None,
           Some(o) -> Some(bind_keeping(o.emitter, o.value.kind, o.value.ty, o.value.expr)),
         },
@@ -7529,165 +8229,26 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
             let hv = if bv.emitter.release {
               { kind: KBoxed, expr: held.value.expr, ty: bv.value.ty }
             } else { bv.value };
-            // The kind the new record holds its field `at` as: none but a word where it is laid out by
-            // what it holds.
-            let target = |at: Int|
-              match laid { Some(fs) -> kind_at(kinds_of(fs), at), None -> KBoxed };
-            // A field the new record holds as a `Float`'s bits, from a value it holds as a `Float`.
-            let as_bits = |acc: { emitter: Emitter, ws: List<Bytes>, kinds: List<Kind>, vals: List<CValue>, known: Bool }, em: Emitter, v: CValue, at: Int| {
-              let d = held_raw(em, v, target(at));
-              {
-                emitter: d.emitter,
-                ws: acc.ws.push(raw_word(d.value)),
-                kinds: acc.kinds.push(target(at)),
-                vals: acc.vals.push(d.value),
-                known: acc.known,
-              }
-            };
             // A copy the base remembered is its value, not a load; any word read from memory stops the record being held back.
             // `owned`: the written fields' values are words the record takes as they are.
             let built = |from: Emitter, vals: List<CValue>, owned_already: Bool| {
               let filled = range(0, names.len()).fold(
                 { emitter: from, ws: [], kinds: [], vals: [], known: true },
-                |acc: { emitter: Emitter, ws: List<Bytes>, kinds: List<Kind>, vals: List<CValue>, known: Bool }, at: Int| {
-                  let nm = match names.at(at) { Some(x) -> x, None -> b"" };
-                  let tk = target(at);
-                  if u.copies.fold(false, |seen: Bool, c: Bytes| seen || c == nm) {
-                    match built_field(acc.emitter, held.value.expr, nm) {
-                      Some(v) -> if raw_slot(tk) { as_bits(acc, acc.emitter, v, at) } else {
-                        let spent = spendable(acc.emitter, held.value.expr);
-                        let h = match moved_field(acc.emitter, spent, held.value, v) {
-                          Some(m) ->
-                            {
-                              emitter: m.emitter,
-                              word: m.value.expr,
-                              val: taken_as(m.emitter, v, m.value),
-                            },
-                          None -> held_item({ emitter: acc.emitter, value: v }, tk),
-                        };
-                        {
-                          emitter: h.emitter,
-                          ws: acc.ws.push(h.word),
-                          kinds: acc.kinds.push(tk),
-                          vals: acc.vals.push(h.val),
-                          known: acc.known,
-                        }
-                      },
-                      None -> match field_at(bv.value.ty, nm) {
-                        // Read at the field's place in the base's shape, which differs from the new record's when the update adds a field.
-                        Some(f) -> {
-                          let w = bind_word_of(acc.emitter, field_read(held.value.expr, f));
-                          // A base of a known type holds a `Float` or a 64-bit width as its bits.
-                          if raw_slot(f.kind) {
-                            let d = bind(
-                              w.emitter,
-                              f.kind,
-                              raw_at(held.value.expr, ascii_of_int(f.at), f.kind),
-                            );
-                            if raw_slot(tk) { as_bits(acc, d.emitter, d.value, at) } else {
-                              {
-                                emitter: d.emitter,
-                                ws: acc.ws.push(as_word(d.value)),
-                                kinds: acc.kinds.push(tk),
-                                vals: acc.vals.push(d.value),
-                                known: acc.known,
-                              }
-                            }
-                          } else {
-                            match f.kind {
-                              // A counted copy is a word this scope holds, so the record can still
-                              // be held back: one written into a holder makes no object of its own.
-                              k if counted(k) ->
-                                {
-                                  emitter: line(
-                                    w.emitter,
-                                    Bytes::concat_all([b"ply_inc(", w.value.expr, b");"]),
-                                  ),
-                                  ws: acc.ws.push(w.value.expr),
-                                  kinds: acc.kinds.push(tk),
-                                  vals: acc.vals.push({
-                                    kind: word_kind(k),
-                                    expr: w.value.expr,
-                                    ty: f.ty,
-                                  }),
-                                  known: acc.known,
-                                },
-                              // A scalar copy is held in a register of its kind, as `held_item` holds one.
-                              _ -> {
-                                let c = bind(w.emitter, f.kind, as_kind(w.value, f.kind));
-                                {
-                                  emitter: c.emitter,
-                                  ws: acc.ws.push(as_word(c.value)),
-                                  kinds: acc.kinds.push(tk),
-                                  vals: acc.vals.push(c.value),
-                                  known: acc.known,
-                                }
-                              },
-                            }
-                          }
-                        },
-                        None -> {
-                          let idx = field_of(open_needed(acc.emitter, bv.value.ty), nm);
-                          let w = bind(
-                            idx.emitter,
-                            KBoxed,
-                            Bytes::concat_all([
-                              b"rt_field_p(ctx, ",
-                              held.value.expr,
-                              b", @@f",
-                              ascii_of_int(idx.i),
-                              b"@@, 0)",
-                            ]),
-                          );
-                          // The runtime answers the copy duplicated, and the record takes it, or keeps
-                          // it until the block closes where the record holds the `Float` it is as bits.
-                          if raw_slot(tk) { as_bits(acc, check(w.emitter), w.value, at) }
-                          else if tk == KSum(Zeroed) {
-                            let o = sum_owned(check(w.emitter), w.value, Zeroed);
-                            {
-                              emitter: o.emitter,
-                              ws: acc.ws.push(o.value.expr),
-                              kinds: acc.kinds.push(tk),
-                              vals: acc.vals,
-                              known: false,
-                            }
-                          } else {
-                            {
-                              emitter: spend_made(check(w.emitter), w.value.expr),
-                              ws: acc.ws.push(w.value.expr),
-                              kinds: acc.kinds.push(tk),
-                              vals: acc.vals,
-                              known: false,
-                            }
-                          }
-                        },
-                      },
-                    }
-                  } else {
-                    match set_value(u.sets, vals, nm) {
-                      None ->
-                        {
-                          emitter: acc.emitter,
-                          ws: acc.ws.push(b"0"),
-                          kinds: acc.kinds.push(KBoxed),
-                          vals: acc.vals,
-                          known: false,
-                        },
-                      Some(v) -> if raw_slot(tk) { as_bits(acc, acc.emitter, v, at) } else {
-                        // The written field's word is duplicated: the record being built takes it.
-                        let h = if owned_already { { emitter: acc.emitter, word: v.expr, val: v } }
-                        else { held_item({ emitter: acc.emitter, value: v }, tk) };
-                        {
-                          emitter: h.emitter,
-                          ws: acc.ws.push(h.word),
-                          kinds: acc.kinds.push(tk),
-                          vals: acc.vals.push(h.val),
-                          known: acc.known,
-                        }
-                      },
-                    }
-                  }
-                },
+                |acc: Filled, at: Int|
+                  update_field(
+                    acc,
+                    {
+                      copies: u.copies,
+                      sets: u.sets,
+                      names: names,
+                      laid: laid,
+                      base: held.value,
+                      base_ty: bv.value.ty,
+                      vals: vals,
+                      owned: owned_already,
+                    },
+                    at,
+                  ),
               );
               // At the body's tail the release skips the one-read guard: no later read can exist.
               match release_from(filled.emitter, u.base, hv, params, emitter.tail) {
@@ -7781,9 +8342,26 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
         else if is_ctor_name(fv.name) {
           match tag_of(emitter, fv.name) {
             None -> Some(refused(emitter, b"a constructor not in the table: ".concat(fv.name))),
-            // A `Result` the root answers as one word is built as that word; anywhere else it is
-            // the object, which may take the cells of the one a match let go.
-            Some(tag) -> if (is_option(emitter, tag, b"Ok") || is_option(emitter, tag, b"Err"))
+            // A sum taken as its constructor and argument is held back as them. A `Result` the root
+            // answers as one word is built as that word; anywhere else it is the object, which may
+            // take the cells of the one a match let go.
+            Some(tag) -> if ctor_case(emitter, c, tag) != None {
+              let at = ctor_case(emitter, c, tag);
+              match a.args.fold(
+                  Some({ emitter: notail(emitter), vals: [] }),
+                  |acc: Option<{ emitter: Emitter, vals: List<CValue> }>, x: Code|
+                    match acc {
+                      None -> None,
+                      Some(g) -> match expr(notail(g.emitter), x, params) {
+                        None -> None,
+                        Some(o) -> Some({ emitter: o.emitter, vals: g.vals.push(o.value) }),
+                      },
+                    },
+                ) {
+                None -> None,
+                Some(g) -> Some(held_ctor(g.emitter, at, g.vals)),
+              }
+            } else if (is_option(emitter, tag, b"Ok") || is_option(emitter, tag, b"Err"))
                 && a.args.len() == 1
                 && answers_sum(emitter) == Some(Tagged) {
               match items(emitter, a.args, params, 0, []) {
@@ -7939,7 +8517,10 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                   match args_carried(target.emitter, a.args, params, target.carriers.params, 0, [
                     ]) {
                     None -> None,
-                    Some(w) -> Some(called(w.emitter, target, c.span, w.names, a.args.len())),
+                    Some(w) ->
+                      Some(
+                        called(w.emitter, target, c.span, w.names, a.args.len(), emitter.leaves),
+                      ),
                   }
                 }
               },
@@ -7972,7 +8553,8 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               );
               match args_carried(target.emitter, a.args, params, target.carriers.params, 0, []) {
                 None -> None,
-                Some(w) -> Some(called(w.emitter, target, c.span, w.names, a.args.len())),
+                Some(w) ->
+                  Some(called(w.emitter, target, c.span, w.names, a.args.len(), emitter.leaves)),
               }
             }
           }
@@ -8009,48 +8591,21 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
     NKnown(k) -> slot_read(emitter, c, k.slot, k.name, params),
     NMatch(m) -> match match_subject(emitter, m.scrutinee, params) {
       None -> None,
-      Some(s) -> match matched_record(emitter, m.arms) {
-        // A record held back: each arm hands its values and word to locals the record is held back
-        // as after the match, never made to be joined.
-        Some(fields) -> {
-          let ls = record_locals(s.emitter, fields, empty_inits(fields));
-          match match_arms(
-              ls.emitter,
-              s.subj,
-              m.arms,
-              params,
-              ToRecord({ fields: fields, locals: ls.values, word: ls.word }),
-              c.span,
-              emitter.tail,
-            ) {
-            None -> None,
-            Some(after) -> Some(rebuild(after, names_of(fields), ls.values, ls.word)),
-          }
-        },
-        None -> {
-          let k = match answers_sum(emitter) {
-            Some(spec) -> KSum(spec),
-            None -> if matched_option(emitter, m.arms, params) { KSum(Zeroed) } else { KBoxed },
-          };
-          let ans = fresh(s.emitter);
-          let declared = line(ans.emitter, Bytes::concat_all([ctype(k), b" ", ans.name, b" = 0;"]));
-          match match_arms(
-              declared,
-              s.subj,
-              m.arms,
-              params,
-              ToValue({ name: ans.name, kind: k }),
-              c.span,
-              emitter.tail,
-            ) {
-            None -> None,
-            Some(after) ->
-              Some({
-                emitter: note_holder(after, ans.name),
-                value: { kind: k, expr: ans.name, ty: TyOpen([]) },
-              }),
-          }
-        },
+      Some(s) -> {
+        let j = match_join(s.emitter, emitter, c, m.arms, params);
+        match match_arms(
+            j.emitter,
+            s.subj,
+            m.arms,
+            params,
+            j.sink,
+            c.span,
+            emitter.tail,
+            emitter.leaves,
+          ) {
+          None -> None,
+          Some(after) -> Some(joined_value(after, j.sink)),
+        }
       },
     },
     NIf(i) -> match expr(notail(emitter), i.cond, params) {
@@ -8064,215 +8619,222 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
         {
           // The join's number is taken before either arm; arms go into buffers because a record-valued join needs one local per field, numbered after both.
           let j = fresh(cv.emitter);
-          match arm(withtail(blank(j.emitter), emitter.tail), i.then_branch, params) {
+          match arm(withtail(blank(j.emitter), position(emitter)), i.then_branch, params) {
             None -> None,
             Some(t) -> match arm(
                 withtail(
                   with_made(rescope(blank(t.emitter), cv.emitter.unboxed), j.emitter.count_locals),
-                  emitter.tail,
+                  position(emitter),
                 ),
                 i.else_branch,
                 params,
               ) {
               None -> None,
-              Some(e) -> {
-                // Asked with the later table, which holds what both arms built.
-                let shape = shared_shape(e.emitter, t.value, e.value);
-                match shape {
-                  // Both arms built a record of one shape: the join carries one local per field and reassembles; the number taken above is spent, never declared.
-                  Some(names) -> {
-                    let fields = names.map(|nm: Bytes|
-                      {
-                        name: nm,
-                        kind: match built_field(e.emitter, t.value.expr, nm) {
-                          Some(fv) -> fv.kind,
-                          None -> KInt,
-                        },
-                        ty: TyOpen([]),
-                      });
-                    let ls = record_locals(
-                      rescope(blank(e.emitter), cv.emitter.unboxed),
-                      fields,
-                      empty_inits(fields),
-                    );
-                    let tt = joined(
-                      { ..e.emitter, temp_count: ls.emitter.temp_count },
-                      t.emitter,
-                      t.text,
-                      t.value,
-                      fields,
-                      ls,
-                    );
-                    let ee = joined(
-                      { ..e.emitter, temp_count: tt.temps },
-                      e.emitter,
-                      e.text,
-                      e.value,
-                      fields,
-                      ls,
-                    );
-                    let body = Bytes::concat_all([
-                      bytes_join(j.emitter.out, b""),
-                      bytes_join(ls.emitter.out, b""),
-                      pad(ls.emitter.indent),
-                      b"if (",
-                      cv.value.expr,
-                      b") {\n",
-                      tt.text,
-                      pad(ls.emitter.indent),
-                      b"} else {\n",
-                      ee.text,
-                      pad(ls.emitter.indent),
-                      b"}\n",
-                    ]);
-                    Some(
-                      rebuild(
+              Some(e) -> match leaves_cases(emitter, c) {
+                Some(sc) -> Some(if_sum_join(j, cv, t, e, sc)),
+                None -> {
+                  // Asked with the later table, which holds what both arms built.
+                  let shape = shared_shape(e.emitter, t.value, e.value);
+                  match shape {
+                    // Both arms built a record of one shape: the join carries one local per field and reassembles; the number taken above is spent, never declared.
+                    Some(names) -> {
+                      let fields = names.map(|nm: Bytes|
                         {
-                          ..ls.emitter,
-                          out: [body],
-                          temp_count: ee.temps,
-                          count_locals: union_made(tt.made, ee.made),
+                          name: nm,
+                          kind: match built_field(e.emitter, t.value.expr, nm) {
+                            Some(fv) -> fv.kind,
+                            None -> KInt,
+                          },
+                          ty: TyOpen([]),
+                        });
+                      let ls = record_locals(
+                        rescope(blank(e.emitter), cv.emitter.unboxed),
+                        fields,
+                        empty_inits(fields),
+                      );
+                      let tt = joined(
+                        { ..e.emitter, temp_count: ls.emitter.temp_count },
+                        t.emitter,
+                        t.text,
+                        t.value,
+                        fields,
+                        ls,
+                      );
+                      let ee = joined(
+                        { ..e.emitter, temp_count: tt.temps },
+                        e.emitter,
+                        e.text,
+                        e.value,
+                        fields,
+                        ls,
+                      );
+                      let body = Bytes::concat_all([
+                        bytes_join(j.emitter.out, b""),
+                        bytes_join(ls.emitter.out, b""),
+                        pad(ls.emitter.indent),
+                        b"if (",
+                        cv.value.expr,
+                        b") {\n",
+                        tt.text,
+                        pad(ls.emitter.indent),
+                        b"} else {\n",
+                        ee.text,
+                        pad(ls.emitter.indent),
+                        b"}\n",
+                      ]);
+                      Some(
+                        rebuild(
+                          {
+                            ..ls.emitter,
+                            out: [body],
+                            temp_count: ee.temps,
+                            count_locals: union_made(tt.made, ee.made),
+                          },
+                          names,
+                          ls.values,
+                          ls.word,
+                        ),
+                      )
+                    },
+                    None -> {
+                      let kt = join_kind(emitter, t.value.kind, e.value.kind);
+                      let decl = line(
+                        {
+                          out: [],
+                          temp_count: e.emitter.temp_count,
+                          unboxed: cv.emitter.unboxed,
+                          indent: e.emitter.indent,
+                          reads: e.emitter.reads,
+                          shapes: e.emitter.shapes,
+                          built: e.emitter.built,
+                          module: e.emitter.module,
+                          base: e.emitter.base,
+                          count_locals: e.emitter.count_locals,
+                          here: e.emitter.here,
+                          imports: e.emitter.imports,
+                          consts: e.emitter.consts,
+                          ctors: e.emitter.ctors,
+                          lambda_bodies: e.emitter.lambda_bodies,
+                          lambdas: e.emitter.lambdas,
+                          owner: e.emitter.owner,
+                          builtins: e.emitter.builtins,
+                          called_builtins: e.emitter.called_builtins,
+                          fields: e.emitter.fields,
+                          released: e.emitter.released,
+                          reuse_widths: e.emitter.reuse_widths,
+                          alias: e.emitter.alias,
+                          by_root: e.emitter.by_root,
+                          tail: e.emitter.tail,
+                          calls: e.emitter.calls,
+                          generics: e.emitter.generics,
+                          refused: e.emitter.refused,
+                          deferred: e.emitter.deferred,
+                          deferred_locals: e.emitter.deferred_locals,
+                          performs: e.emitter.performs,
+                          handles: e.emitter.handles,
+                          landing: e.emitter.landing,
+                          effects: e.emitter.effects,
+                          release: e.emitter.release,
+                          pinned: e.emitter.pinned,
+                          bound: e.emitter.bound,
+                          group: e.emitter.group,
+                          operands: e.emitter.operands,
+                          typed: e.emitter.typed,
+                          answer: e.emitter.answer,
+                          site_root: e.emitter.site_root,
+                          lent: e.emitter.lent,
+                          written: e.emitter.written,
+                          slices: e.emitter.slices,
+                          sums: e.emitter.sums,
+                          leaves: e.emitter.leaves,
                         },
-                        names,
-                        ls.values,
-                        ls.word,
-                      ),
-                    )
-                  },
-                  None -> {
-                    let kt = join_kind(emitter, t.value.kind, e.value.kind);
-                    let decl = line(
-                      {
-                        out: [],
-                        temp_count: e.emitter.temp_count,
+                        Bytes::concat_all([ctype(kt), b" ", j.name, b" = ", zero_of(kt), b";"]),
+                      );
+                      let ta = assigned(decl, t.emitter, t.text, decl.indent, kt, t.value, j.name);
+                      let ea = assigned(
+                        ta.emitter,
+                        e.emitter,
+                        e.text,
+                        decl.indent,
+                        kt,
+                        e.value,
+                        j.name,
+                      );
+                      let fin = ea.emitter;
+                      let body = Bytes::concat_all([
+                        bytes_join(j.emitter.out, b""),
+                        bytes_join(decl.out, b""),
+                        pad(decl.indent),
+                        b"if (",
+                        cv.value.expr,
+                        b") {\n",
+                        ta.text,
+                        pad(decl.indent),
+                        b"} else {\n",
+                        ea.text,
+                        pad(decl.indent),
+                        b"}\n",
+                      ]);
+                      let fin_em: Emitter = {
+                        out: [body],
+                        temp_count: fin.temp_count,
                         unboxed: cv.emitter.unboxed,
-                        indent: e.emitter.indent,
-                        reads: e.emitter.reads,
-                        shapes: e.emitter.shapes,
-                        built: e.emitter.built,
-                        module: e.emitter.module,
-                        base: e.emitter.base,
-                        count_locals: e.emitter.count_locals,
-                        here: e.emitter.here,
-                        imports: e.emitter.imports,
-                        consts: e.emitter.consts,
-                        ctors: e.emitter.ctors,
-                        lambda_bodies: e.emitter.lambda_bodies,
-                        lambdas: e.emitter.lambdas,
-                        owner: e.emitter.owner,
-                        builtins: e.emitter.builtins,
-                        called_builtins: e.emitter.called_builtins,
-                        fields: e.emitter.fields,
-                        released: e.emitter.released,
-                        reuse_widths: e.emitter.reuse_widths,
-                        alias: e.emitter.alias,
-                        by_root: e.emitter.by_root,
-                        tail: e.emitter.tail,
-                        calls: e.emitter.calls,
-                        generics: e.emitter.generics,
-                        refused: e.emitter.refused,
-                        deferred: e.emitter.deferred,
-                        deferred_locals: e.emitter.deferred_locals,
-                        performs: e.emitter.performs,
-                        handles: e.emitter.handles,
-                        landing: e.emitter.landing,
-                        effects: e.emitter.effects,
-                        release: e.emitter.release,
-                        pinned: e.emitter.pinned,
-                        bound: e.emitter.bound,
-                        group: e.emitter.group,
-                        operands: e.emitter.operands,
-                        typed: e.emitter.typed,
-                        answer: e.emitter.answer,
-                        site_root: e.emitter.site_root,
-                        lent: e.emitter.lent,
-                        written: e.emitter.written,
-                        slices: e.emitter.slices,
-                      },
-                      Bytes::concat_all([ctype(kt), b" ", j.name, b" = ", zero_of(kt), b";"]),
-                    );
-                    let ta = assigned(decl, t.emitter, t.text, decl.indent, kt, t.value, j.name);
-                    let ea = assigned(
-                      ta.emitter,
-                      e.emitter,
-                      e.text,
-                      decl.indent,
-                      kt,
-                      e.value,
-                      j.name,
-                    );
-                    let fin = ea.emitter;
-                    let body = Bytes::concat_all([
-                      bytes_join(j.emitter.out, b""),
-                      bytes_join(decl.out, b""),
-                      pad(decl.indent),
-                      b"if (",
-                      cv.value.expr,
-                      b") {\n",
-                      ta.text,
-                      pad(decl.indent),
-                      b"} else {\n",
-                      ea.text,
-                      pad(decl.indent),
-                      b"}\n",
-                    ]);
-                    let fin_em: Emitter = {
-                      out: [body],
-                      temp_count: fin.temp_count,
-                      unboxed: cv.emitter.unboxed,
-                      indent: fin.indent,
-                      reads: fin.reads,
-                      shapes: fin.shapes,
-                      built: fin.built,
-                      module: fin.module,
-                      base: fin.base,
-                      count_locals: union_made(ta.made, ea.made),
-                      here: fin.here,
-                      imports: fin.imports,
-                      consts: fin.consts,
-                      ctors: fin.ctors,
-                      lambda_bodies: fin.lambda_bodies,
-                      lambdas: fin.lambdas,
-                      owner: fin.owner,
-                      builtins: fin.builtins,
-                      called_builtins: fin.called_builtins,
-                      fields: fin.fields,
-                      released: fin.released,
-                      reuse_widths: fin.reuse_widths,
-                      alias: fin.alias,
-                      by_root: fin.by_root,
-                      tail: fin.tail,
-                      calls: fin.calls,
-                      generics: fin.generics,
-                      refused: fin.refused,
-                      deferred: fin.deferred,
-                      deferred_locals: fin.deferred_locals,
-                      performs: fin.performs,
-                      handles: fin.handles,
-                      landing: fin.landing,
-                      effects: fin.effects,
-                      release: fin.release,
-                      pinned: fin.pinned,
-                      bound: fin.bound,
-                      group: fin.group,
-                      operands: fin.operands,
-                      typed: fin.typed,
-                      answer: fin.answer,
-                      site_root: fin.site_root,
-                      lent: fin.lent,
-                      written: fin.written,
-                      slices: fin.slices,
-                    };
-                    Some({
-                      emitter: if counted(kt) { note_holder(fin_em, j.name) } else { fin_em },
-                      value: {
-                        kind: kt,
-                        expr: j.name,
-                        ty: if t.value.ty == e.value.ty { t.value.ty } else { TyOpen([]) },
-                      },
-                    })
-                  },
-                }
+                        indent: fin.indent,
+                        reads: fin.reads,
+                        shapes: fin.shapes,
+                        built: fin.built,
+                        module: fin.module,
+                        base: fin.base,
+                        count_locals: union_made(ta.made, ea.made),
+                        here: fin.here,
+                        imports: fin.imports,
+                        consts: fin.consts,
+                        ctors: fin.ctors,
+                        lambda_bodies: fin.lambda_bodies,
+                        lambdas: fin.lambdas,
+                        owner: fin.owner,
+                        builtins: fin.builtins,
+                        called_builtins: fin.called_builtins,
+                        fields: fin.fields,
+                        released: fin.released,
+                        reuse_widths: fin.reuse_widths,
+                        alias: fin.alias,
+                        by_root: fin.by_root,
+                        tail: fin.tail,
+                        calls: fin.calls,
+                        generics: fin.generics,
+                        refused: fin.refused,
+                        deferred: fin.deferred,
+                        deferred_locals: fin.deferred_locals,
+                        performs: fin.performs,
+                        handles: fin.handles,
+                        landing: fin.landing,
+                        effects: fin.effects,
+                        release: fin.release,
+                        pinned: fin.pinned,
+                        bound: fin.bound,
+                        group: fin.group,
+                        operands: fin.operands,
+                        typed: fin.typed,
+                        answer: fin.answer,
+                        site_root: fin.site_root,
+                        lent: fin.lent,
+                        written: fin.written,
+                        slices: fin.slices,
+                        sums: fin.sums,
+                        leaves: fin.leaves,
+                      };
+                      Some({
+                        emitter: if counted(kt) { note_holder(fin_em, j.name) } else { fin_em },
+                        value: {
+                          kind: kt,
+                          expr: j.name,
+                          ty: if t.value.ty == e.value.ty { t.value.ty } else { TyOpen([]) },
+                        },
+                      })
+                    },
+                  }
+                },
               },
             },
           }
@@ -8852,6 +9414,174 @@ fn handle_site(
   }
 }
 
+/// What an update gathers its new record of: each field's word, kind and value, and whether every
+/// value is known, which holds the record back.
+type Filled = {
+  emitter: Emitter,
+  ws: List<Bytes>,
+  kinds: List<Kind>,
+  vals: List<CValue>,
+  known: Bool,
+}
+
+/// An update to the fields `names`: `copies` read from `base`, of type `base_ty`, and `sets` written,
+/// their values `vals`, words the record takes as they are where `owned`; laid out as `laid` where
+/// the new record's layout is known.
+type UpdateOf = {
+  copies: List<Bytes>,
+  sets: List<CodeField>,
+  names: List<Bytes>,
+  laid: Option<List<FieldTy>>,
+  base: CValue,
+  base_ty: Ty,
+  vals: List<CValue>,
+  owned: Bool,
+}
+
+/// The kind the new record holds its field `at` as: none but a word where it is laid out by what it
+/// holds.
+fn update_target(u: UpdateOf, at: Int) -> Kind =
+  match u.laid { Some(fs) -> kind_at(kinds_of(fs), at), None -> KBoxed }
+
+/// `acc` with a field the new record holds as a `Float`'s bits, of kind `k`, from `v`.
+fn update_bits(acc: Filled, em: Emitter, v: CValue, k: Kind) -> Filled = {
+  let d = held_raw(em, v, k);
+  {
+    emitter: d.emitter,
+    ws: acc.ws.push(raw_word(d.value)),
+    kinds: acc.kinds.push(k),
+    vals: acc.vals.push(d.value),
+    known: acc.known,
+  }
+}
+
+/// `acc` with field `at` of update `u` gathered: a copy the base remembered is its value, not a
+/// load, and any word read from memory stops the record being held back.
+fn update_field(acc: Filled, u: UpdateOf, at: Int) -> Filled = {
+  let nm = match u.names.at(at) { Some(x) -> x, None -> b"" };
+  let tk = update_target(u, at);
+  if u.copies.fold(false, |seen: Bool, c: Bytes| seen || c == nm) {
+    match built_field(acc.emitter, u.base.expr, nm) {
+      Some(v) -> if raw_slot(tk) { update_bits(acc, acc.emitter, v, tk) } else {
+        let spent = spendable(acc.emitter, u.base.expr);
+        let h = match moved_field(acc.emitter, spent, u.base, v) {
+          Some(m) ->
+            { emitter: m.emitter, word: m.value.expr, val: taken_as(m.emitter, v, m.value) },
+          None -> held_item({ emitter: acc.emitter, value: v }, tk),
+        };
+        {
+          emitter: h.emitter,
+          ws: acc.ws.push(h.word),
+          kinds: acc.kinds.push(tk),
+          vals: acc.vals.push(h.val),
+          known: acc.known,
+        }
+      },
+      None -> match field_at(u.base_ty, nm) {
+        // Read at the field's place in the base's shape, which differs from the new record's when the update adds a field.
+        Some(f) -> {
+          let w = bind_word_of(acc.emitter, field_read(u.base.expr, f));
+          // A base of a known type holds a `Float` or a 64-bit width as its bits.
+          if raw_slot(f.kind) {
+            let d = bind(w.emitter, f.kind, raw_at(u.base.expr, ascii_of_int(f.at), f.kind));
+            if raw_slot(tk) { update_bits(acc, d.emitter, d.value, tk) } else {
+              {
+                emitter: d.emitter,
+                ws: acc.ws.push(as_word(d.value)),
+                kinds: acc.kinds.push(tk),
+                vals: acc.vals.push(d.value),
+                known: acc.known,
+              }
+            }
+          } else {
+            match f.kind {
+              // A counted copy is a word this scope holds, so the record can still
+              // be held back: one written into a holder makes no object of its own.
+              k if counted(k) ->
+                {
+                  emitter: line(w.emitter, Bytes::concat_all([b"ply_inc(", w.value.expr, b");"])),
+                  ws: acc.ws.push(w.value.expr),
+                  kinds: acc.kinds.push(tk),
+                  vals: acc.vals.push({ kind: word_kind(k), expr: w.value.expr, ty: f.ty }),
+                  known: acc.known,
+                },
+              // A scalar copy is held in a register of its kind, as `held_item` holds one.
+              _ -> {
+                let c = bind(w.emitter, f.kind, as_kind(w.value, f.kind));
+                {
+                  emitter: c.emitter,
+                  ws: acc.ws.push(as_word(c.value)),
+                  kinds: acc.kinds.push(tk),
+                  vals: acc.vals.push(c.value),
+                  known: acc.known,
+                }
+              },
+            }
+          }
+        },
+        None -> {
+          let idx = field_of(open_needed(acc.emitter, u.base_ty), nm);
+          let w = bind(
+            idx.emitter,
+            KBoxed,
+            Bytes::concat_all([
+              b"rt_field_p(ctx, ",
+              u.base.expr,
+              b", @@f",
+              ascii_of_int(idx.i),
+              b"@@, 0)",
+            ]),
+          );
+          // The runtime answers the copy duplicated, and the record takes it, or keeps
+          // it until the block closes where the record holds the `Float` it is as bits.
+          if raw_slot(tk) { update_bits(acc, check(w.emitter), w.value, tk) }
+          else if tk == KSum(Zeroed) {
+            let o = sum_owned(check(w.emitter), w.value, Zeroed);
+            {
+              emitter: o.emitter,
+              ws: acc.ws.push(o.value.expr),
+              kinds: acc.kinds.push(tk),
+              vals: acc.vals,
+              known: false,
+            }
+          } else {
+            {
+              emitter: spend_made(check(w.emitter), w.value.expr),
+              ws: acc.ws.push(w.value.expr),
+              kinds: acc.kinds.push(tk),
+              vals: acc.vals,
+              known: false,
+            }
+          }
+        },
+      },
+    }
+  } else {
+    match set_value(u.sets, u.vals, nm) {
+      None ->
+        {
+          emitter: acc.emitter,
+          ws: acc.ws.push(b"0"),
+          kinds: acc.kinds.push(KBoxed),
+          vals: acc.vals,
+          known: false,
+        },
+      Some(v) -> if raw_slot(tk) { update_bits(acc, acc.emitter, v, tk) } else {
+        // The written field's word is duplicated: the record being built takes it.
+        let h = if u.owned { { emitter: acc.emitter, word: v.expr, val: v } }
+        else { held_item({ emitter: acc.emitter, value: v }, tk) };
+        {
+          emitter: h.emitter,
+          ws: acc.ws.push(h.word),
+          kinds: acc.kinds.push(tk),
+          vals: acc.vals.push(h.val),
+          known: acc.known,
+        }
+      },
+    }
+  }
+}
+
 /// Whether what a `handle` body emitted past `opened` holds a `return`, which would leave the frame
 /// installed and a raise bound for it unanswered: a body that fails leaves by `leaving` alone.
 fn leaves_unlanded(opened: List<Bytes>, body: List<Bytes>) -> Bool / {abort.raise} = {
@@ -9415,13 +10145,14 @@ fn arms(
                 params,
                 flag,
                 emitter.tail,
+                emitter.leaves,
               ) {
               None -> None,
               Some(o) -> {
                 let closed = close(close(o));
                 // The next arm is a tail when this one was: the body's own nodes cleared the flag.
                 arms(
-                  withtail(rescope(closed, emitter.unboxed), emitter.tail),
+                  withtail(rescope(closed, emitter.unboxed), position(emitter)),
                   xs,
                   params,
                   i + 1,
@@ -9449,6 +10180,7 @@ fn guarded_body(
   params: List<EmitParam>,
   flag: Bytes,
   tail: Bool,
+  leaves: Bool,
 ) -> Option<Emitter> / {abort.raise} =
   match guard {
     None -> match arm_body(with_pinned(emitter, pinned), sink, body, params) {
@@ -9459,7 +10191,12 @@ fn guarded_body(
       None -> None,
       Some(gv) -> {
         let opened = line(gv.emitter, Bytes::concat_all([b"if (", as_bool(gv.value), b") {"]));
-        match arm_body(with_pinned(withtail(indent(opened), tail), pinned), sink, body, params) {
+        match arm_body(
+            with_pinned(withtail(indent(opened), { tail: tail, leaves: leaves }), pinned),
+            sink,
+            body,
+            params,
+          ) {
           None -> None,
           Some(o) -> {
             let closed = close(line(o, Bytes::concat_all([flag, b" = 1;"])));
@@ -9475,6 +10212,194 @@ fn guarded_body(
     },
   }
 
+/// Where a `match` at `c` joins its arms, declared in `emitter`: a sum taken as its constructor and
+/// argument joins as their locals, a record that crosses a call as its fields as its fields' and its
+/// word's, and any other value as one local, a sum's word where the match answers one.
+fn match_join(
+  emitter: Emitter,
+  at: Emitter,
+  c: Code,
+  arms: List<CodeArm>,
+  params: List<EmitParam>,
+) -> { emitter: Emitter, sink: Sink } =
+  match leaves_cases(at, c) {
+    Some(sc) -> {
+      let j = sum_locals(emitter, sc);
+      { emitter: j.emitter, sink: ToSum({ cases: sc, tag: j.tag, leaves: j.leaves }) }
+    },
+    // A record held back: each arm hands its values and word to locals the record is held back
+    // as after the match, never made to be joined.
+    None -> match matched_record(at, arms) {
+      Some(fields) -> {
+        let ls = record_locals(emitter, fields, empty_inits(fields));
+        {
+          emitter: ls.emitter,
+          sink: ToRecord({ fields: fields, locals: ls.values, word: ls.word }),
+        }
+      },
+      None -> {
+        let k = match answers_sum(at) {
+          Some(spec) -> KSum(spec),
+          None -> if matched_option(at, arms, params) { KSum(Zeroed) } else { KBoxed },
+        };
+        let ans = fresh(emitter);
+        {
+          emitter: line(ans.emitter, Bytes::concat_all([ctype(k), b" ", ans.name, b" = 0;"])),
+          sink: ToValue({ name: ans.name, kind: k }),
+        }
+      },
+    },
+  }
+
+/// What a join's locals hold once each arm has handed its value to them.
+fn joined_value(emitter: Emitter, sink: Sink) -> WithValue =
+  match sink {
+    ToSum(t) -> held_sum_from(emitter, t.cases, t.tag, t.leaves),
+    ToRecord(r) -> rebuild(emitter, names_of(r.fields), r.locals, r.word),
+    ToValue(v) ->
+      {
+        emitter: note_holder(emitter, v.name),
+        value: { kind: v.kind, expr: v.name, ty: TyOpen([]) },
+      },
+    ToLoop(_) -> { emitter: emitter, value: { kind: KBoxed, expr: b"ply_unit", ty: TyOpen([]) } },
+  }
+
+/// The cases of the sum constructor `tag` builds at node `c`, and its index among them, where the
+/// value at hand is taken as a sum's constructor and argument.
+fn ctor_case(emitter: Emitter, c: Code, tag: Int) -> Option<{ cases: SumCases, i: Int }> =
+  match leaves_cases(emitter, c) {
+    Some(sc) -> match emitter.ctors.names.at(tag) {
+      Some(bare) -> match case_index(sc, bare) {
+        Some(i) -> Some({ cases: sc, i: i }),
+        None -> None,
+      },
+      None -> None,
+    },
+    None -> None,
+  }
+
+/// `v`, a held-back sum's argument, as a value of its own with a count of its own.
+fn case_copy(emitter: Emitter, v: CValue) -> WithValue =
+  if !counted(v.kind) { { emitter: emitter, value: v } } else {
+    match deferred_of(emitter, v.expr) {
+      Some(d) -> copied_record(emitter, v, d),
+      None -> {
+        let w = owned_word(emitter, v);
+        { emitter: note_holder(w.emitter, w.value.expr), value: { ..w.value, ty: v.ty } }
+      },
+    }
+  }
+
+/// The constructor `name` at `c` as a value: held back where its sum is taken as its constructor and
+/// argument, `None` as zero, and otherwise as the runtime answers it, which has no arities: a nullary
+/// constructor's singleton or a function.
+fn ctor_value(emitter: Emitter, c: Code, name: Bytes) -> WithValue / {abort.raise} =
+  match tag_of(emitter, name) {
+    None -> refused(emitter, b"a constructor not in the table: ".concat(name)),
+    Some(tag) -> if ctor_case(emitter, c, tag) != None {
+      held_ctor(emitter, ctor_case(emitter, c, tag), [])
+    } else if is_option(emitter, tag, b"None") { bind(emitter, KSum(Zeroed), b"0") } else {
+      let o = bind(
+        emitter,
+        KBoxed,
+        Bytes::concat_all([b"rt_ctor_value_p(ctx, ", tag_text(emitter, tag), b")"]),
+      );
+      { emitter: check(o.emitter), value: o.value }
+    },
+  }
+
+/// The constructor `at` names of `vals`, held back as itself and its argument, which it holds a
+/// count of its own of.
+fn held_ctor(
+  emitter: Emitter,
+  at: Option<{ cases: SumCases, i: Int }>,
+  vals: List<CValue>,
+) -> WithValue =
+  match at {
+    None -> refused(emitter, b"a constructor held back outside its sum"),
+    Some(at) -> match vals.at(0) {
+      None -> held_sum_at(emitter, at.cases, at.i, None),
+      Some(v) -> {
+        let arg = match nth_case(at.cases, at.i).arg {
+          Some(Whole(k)) -> if k == KBoxed { owned_arg(emitter, v) }
+          else { bind(emitter, k, as_kind(v, k)) },
+          Some(Fields(_)) -> match deferred_of(emitter, v.expr) {
+            Some(_) -> held_copy(emitter, v),
+            None -> owned_arg(emitter, v),
+          },
+          _ -> owned_arg(emitter, v),
+        };
+        held_sum_at(arg.emitter, at.cases, at.i, Some(arg.value))
+      },
+    },
+  }
+
+/// `v` as a word this scope holds a count of and lets go at its scope's end unless handed on.
+fn owned_arg(emitter: Emitter, v: CValue) -> WithValue = {
+  let w = owned(emitter, v);
+  {
+    emitter: if is_made(w.emitter, w.value.expr) { w.emitter }
+    else { note_holder(w.emitter, w.value.expr) },
+    value: { ..w.value, ty: v.ty },
+  }
+}
+
+/// The cases of the sum the node `c` is, where the value at hand is taken as its constructor and
+/// argument and its type crosses so: the node's type, or at the root's answer the answer's.
+fn leaves_cases(emitter: Emitter, c: Code) -> Option<SumCases> =
+  if !emitter.leaves { None } else {
+    match match node_type(emitter, c) {
+        Some(t) -> Some(carrier_of(t)),
+        None -> if emitter.tail { Some(emitter.answer) } else { None },
+      } {
+      Some(Cases(sc)) -> Some(sc),
+      _ -> None,
+    }
+  }
+
+/// The locals a sum of cases `c` is joined in: its constructor's index and each value past it.
+fn sum_locals(
+  emitter: Emitter,
+  c: SumCases,
+) -> { emitter: Emitter, tag: Bytes, leaves: List<CValue> } = {
+  let t = fresh(emitter);
+  let declared = sum_leaves(c).fold(
+    { emitter: line(t.emitter, Bytes::concat_all([b"int64_t ", t.name, b" = 0;"])), leaves: [] },
+    |acc: { emitter: Emitter, leaves: List<CValue> }, f: FieldTy| {
+      let l = fresh(acc.emitter);
+      {
+        emitter: line(
+          l.emitter,
+          Bytes::concat_all([carried_type(f.kind), b" ", l.name, b" = ", zero_of(f.kind), b";"]),
+        ),
+        leaves: acc.leaves.push({ kind: f.kind, expr: l.name, ty: f.ty }),
+      }
+    },
+  );
+  { emitter: declared.emitter, tag: t.name, leaves: declared.leaves }
+}
+
+/// `value`, a sum of cases `c`, handed to the locals `tag` and `leaves` it is joined in.
+fn sum_into(
+  emitter: Emitter,
+  value: CValue,
+  c: SumCases,
+  tag: Bytes,
+  leaves: List<CValue>,
+) -> Emitter = {
+  let h = handed_sum(emitter, value, c);
+  range(0, h.names.len()).fold(h.emitter, |acc: Emitter, k: Int|
+    line(
+      acc,
+      Bytes::concat_all([
+        if k == 0 { tag } else { nth_value(leaves, k - 1).expr },
+        b" = ",
+        nth_bytes(h.names, k),
+        b";",
+      ]),
+    ))
+}
+
 fn arm_body(
   emitter: Emitter,
   sink: Sink,
@@ -9482,21 +10407,26 @@ fn arm_body(
   params: List<EmitParam>,
 ) -> Option<Emitter> / {abort.raise} =
   match sink {
-    ToValue(ans) -> match expr(emitter, body, params) {
-      None -> None,
-      Some(o) -> if is_sum(ans.kind) {
-        let w = match ans.kind {
-          KSum(spec) -> sum_owned(o.emitter, o.value, spec),
-          _ -> owned(o.emitter, o.value),
-        };
-        Some(line(w.emitter, Bytes::concat_all([ans.name, b" = ", w.value.expr, b";"])))
-      } else { Some(assigned_word(o.emitter, ans.name, o.value)) },
-    },
-    ToRecord(r) -> match expr(emitter, body, params) {
-      None -> None,
-      Some(o) -> Some(record_into(o.emitter, o.value, r.fields, r.locals, r.word)),
-    },
     ToLoop(l) -> emit_step(emitter, body, l.state, l.answer, params, l.depth),
+    _ -> match expr(emitter, body, params) {
+      None -> None,
+      Some(o) -> Some(sunk(o.emitter, o.value, sink)),
+    },
+  }
+
+/// An arm's answer `value` handed to where its join holds it.
+fn sunk(emitter: Emitter, value: CValue, sink: Sink) -> Emitter =
+  match sink {
+    ToValue(ans) -> if is_sum(ans.kind) {
+      let w = match ans.kind {
+        KSum(spec) -> sum_owned(emitter, value, spec),
+        _ -> owned(emitter, value),
+      };
+      line(w.emitter, Bytes::concat_all([ans.name, b" = ", w.value.expr, b";"]))
+    } else { assigned_word(emitter, ans.name, value) },
+    ToRecord(r) -> record_into(emitter, value, r.fields, r.locals, r.word),
+    ToSum(t) -> sum_into(emitter, value, t.cases, t.tag, t.leaves),
+    ToLoop(_) -> emitter,
   }
 
 /// The fields of the record a `match`'s arm builds, where one builds a record that crosses a call as
@@ -9663,12 +10593,15 @@ fn assigned_state(emitter: Emitter, word: Bytes, value: CValue) -> Emitter =
     None -> assigned_word(emitter, word, value),
   }
 
+/// How a loop state of carrier `c` goes round: a sum as its word.
+fn state_of(c: Carrier) -> Carrier = match c { Cases(sc) -> Whole(KSum(sc.spec)), other -> other }
+
 /// How lambda `l`'s first parameter, a loop's state, goes round the loop: as `carrier_of` has it
 /// cross a call.
 fn state_carrier(emitter: Emitter, l: Lambda) -> Carrier =
   match emitter.typed.get(span_key(l.at)) {
     Some(t) -> match t.ty {
-      TyFn(f) -> match f.params.at(0) { Some(p) -> carrier_of(p), None -> Whole(KBoxed) },
+      TyFn(f) -> match f.params.at(0) { Some(p) -> state_of(carrier_of(p)), None -> Whole(KBoxed) },
       _ -> Whole(KBoxed),
     },
     None -> Whole(KBoxed),
@@ -9747,9 +10680,10 @@ fn match_subject(
       _ -> None,
     } {
     Some(cv) -> Some({ emitter: emitter, subj: cv }),
-    None -> match expr(notail(emitter), scrutinee, params) {
+    None -> match expr(with_leaves(notail(emitter)), scrutinee, params) {
       None -> None,
-      Some(sc) -> {
+      Some(sc0) -> {
+        let sc = { ..sc0, emitter: notail(sc0.emitter) };
         let ty = typed_value(sc.emitter, scrutinee, sc.value).ty;
         if is_sum(sc.value.kind) {
           let subj = bind_keeping(sc.emitter, sc.value.kind, ty, sc.value.expr);
@@ -9763,7 +10697,7 @@ fn match_subject(
     },
   }
 
-/// Arms over one flag; a body falling off the end raises. `tail` is the match's own position, which evaluating the subject cleared.
+/// Arms over one flag; a body falling off the end raises. `tail` and `leaves` are the match's own position, which evaluating the subject cleared.
 fn match_arms(
   emitter: Emitter,
   subj: CValue,
@@ -9772,11 +10706,21 @@ fn match_arms(
   sink: Sink,
   span: Span,
   tail: Bool,
+  leaves: Bool,
 ) -> Option<Emitter> / {abort.raise} = {
   let flag = fresh(emitter);
   let opened = line(flag.emitter, Bytes::concat_all([b"int ", flag.name, b" = 0;"]));
-  match arms(withtail(opened, tail), xs, params, 0, subj, sink, flag.name, opened.count_locals, [
-    ]) {
+  match arms(
+      withtail(opened, { tail: tail, leaves: leaves }),
+      xs,
+      params,
+      0,
+      subj,
+      sink,
+      flag.name,
+      opened.count_locals,
+      [],
+    ) {
     None -> None,
     Some(after) ->
       Some(
@@ -9889,6 +10833,12 @@ fn equal_test(emitter: Emitter, literal: Lit, subj: CValue) -> { emitter: Emitte
   { emitter: check(eq.emitter), expr: eq.value.expr }
 }
 
+/// `v`, a value a pattern tests, as patterns read it: a word, a sum's word, or a record held back,
+/// and any other value made its word.
+fn tested_value(emitter: Emitter, v: CValue) -> WithValue =
+  if v.kind == KBoxed || is_sum(v.kind) { { emitter: emitter, value: v } }
+  else { bind(emitter, KBoxed, as_word(v)) }
+
 /// A nested pattern reads a field into a local under the test so far, since reading a non-record raises. `None` for an unsupported pattern.
 fn pat_test(
   pattern: CodePattern,
@@ -9936,96 +10886,91 @@ fn pat_test(
     // A nested subject is zero when an enclosing test failed, and its header must not be read then.
     // A sum held as its word: `None` zero and `Some` that word otherwise; `Err` the word tagged
     // `100` and `Ok` any other. The argument is the word, untagged for `Err`.
-    PxCtor(c) -> if is_sum(subj.kind) {
-      let case = sum_case(emitter, subj.kind, c.name, subj.expr);
-      match c.args.at(0) {
-        None -> Some({ emitter: emitter, expr: case.test }),
-        Some(sub) -> if irrefutable(sub) { Some({ emitter: emitter, expr: case.test }) } else {
-          match pat_test(
-              sub,
-              { kind: KBoxed, expr: case.arg, ty: arg_ty(emitter, subj, c.name) },
-              emitter,
-            ) {
-            None -> None,
-            Some(inner) ->
-              Some({
-                emitter: inner.emitter,
-                expr: Bytes::concat_all([b"(", case.test, b" && ", inner.expr, b")"]),
-              }),
+    // A sum held back tests its constructor's index, and its argument is the value it holds.
+    PxCtor(c) -> match held_sum_of(emitter, subj.expr) {
+      Some(h) -> match case_index(h.cases, ctor_bare(emitter, c.name)) {
+        None -> None,
+        Some(i) -> {
+          let tested = Bytes::concat_all([b"(", h.tag, b" == ", ascii_of_int(i), b")"]);
+          match c.args.at(0) {
+            None -> Some({ emitter: emitter, expr: tested }),
+            Some(sub) -> if irrefutable(sub) { Some({ emitter: emitter, expr: tested }) } else {
+              match h.args.at(i) {
+                Some(Some(v)) -> {
+                  let w = tested_value(emitter, v);
+                  match pat_test(sub, w.value, w.emitter) {
+                    None -> None,
+                    Some(inner) ->
+                      Some({
+                        emitter: inner.emitter,
+                        expr: Bytes::concat_all([b"(", tested, b" && ", inner.expr, b")"]),
+                      }),
+                  }
+                },
+                _ -> None,
+              }
+            },
           }
         },
-      }
-    } else {
-      match tag_of(emitter, c.name) {
-        None -> None,
-        Some(tag) -> {
-          let head = Bytes::concat_all([
-            b"(",
-            subj.expr,
-            b" != 0 && !ply_is_imm(",
-            subj.expr,
-            b") && ply_obj(",
-            subj.expr,
-            b")->kind == 4 && ply_obj(",
-            subj.expr,
-            b")->layout == ",
-            tag_text(emitter, tag),
-            b" && ply_obj(",
-            subj.expr,
-            b")->len == ",
-            ascii_of_int(ctor_width(emitter, tag, c.args.len())),
-            b")",
-          ]);
-          let laid = ctor_fields(emitter, tag);
-          range(0, c.args.len()).fold(
-            Some({ emitter: emitter, expr: head }),
-            |acc: Option<{ emitter: Emitter, expr: Bytes }>, k: Int|
-              match acc {
-                None -> None,
-                Some(t) -> match c.args.at(k) {
-                  None -> None,
-                  Some(sub) -> if irrefutable(sub) { Some(t) } else {
-                    let read = arg_tested(t.emitter, t.expr, subj.expr, k, laid);
-                    let field = {
-                      emitter: read.emitter,
-                      value: {
-                        ..read.value,
-                        ty: known_or(read.value.ty, arg_ty(read.emitter, subj, c.name)),
-                      },
-                    };
-                    match pat_test(sub, field.value, field.emitter) {
-                      None -> None,
-                      Some(inner) ->
-                        Some({
-                          emitter: inner.emitter,
-                          expr: Bytes::concat_all([b"(", t.expr, b" && ", inner.expr, b")"]),
-                        }),
-                    }
-                  },
-                },
-              },
-          )
-        },
-      }
-    },
-    // Refutable despite the shape: a non-record, the field count without `..`, or a missing field.
-    PxRecord(r) -> match pattern_slots(subj.ty, r.fields) {
-      // A record of a known layout holds every field its type names: only the fields' own
-      // patterns are tested, each on the field read where it stands.
-      Some(slots) ->
-        range(0, r.fields.len()).fold(
-          Some({ emitter: emitter, expr: is_object(subj.expr) }),
-          |acc: Option<{ emitter: Emitter, expr: Bytes }>, i: Int|
-            match acc {
+      },
+      None -> if is_sum(subj.kind) {
+        let case = sum_case(emitter, subj.kind, c.name, subj.expr);
+        match c.args.at(0) {
+          None -> Some({ emitter: emitter, expr: case.test }),
+          Some(sub) -> if irrefutable(sub) { Some({ emitter: emitter, expr: case.test }) } else {
+            match pat_test(
+                sub,
+                { kind: KBoxed, expr: case.arg, ty: arg_ty(emitter, subj, c.name) },
+                emitter,
+              ) {
               None -> None,
-              Some(t) -> match r.fields.at(i) {
-                None -> acc,
-                Some(f) -> if irrefutable(f.pat) { acc } else {
-                  match slots.at(i) {
+              Some(inner) ->
+                Some({
+                  emitter: inner.emitter,
+                  expr: Bytes::concat_all([b"(", case.test, b" && ", inner.expr, b")"]),
+                }),
+            }
+          },
+        }
+      } else {
+        match tag_of(emitter, c.name) {
+          None -> None,
+          Some(tag) -> {
+            let head = Bytes::concat_all([
+              b"(",
+              subj.expr,
+              b" != 0 && !ply_is_imm(",
+              subj.expr,
+              b") && ply_obj(",
+              subj.expr,
+              b")->kind == 4 && ply_obj(",
+              subj.expr,
+              b")->layout == ",
+              tag_text(emitter, tag),
+              b" && ply_obj(",
+              subj.expr,
+              b")->len == ",
+              ascii_of_int(ctor_width(emitter, tag, c.args.len())),
+              b")",
+            ]);
+            let laid = ctor_fields(emitter, tag);
+            range(0, c.args.len()).fold(
+              Some({ emitter: emitter, expr: head }),
+              |acc: Option<{ emitter: Emitter, expr: Bytes }>, k: Int|
+                match acc {
+                  None -> None,
+                  Some(t) -> match c.args.at(k) {
                     None -> None,
-                    Some(x) -> {
-                      let field = laid_tested(t.emitter, t.expr, subj.expr, x);
-                      match pat_test(f.pat, field.value, field.emitter) {
+                    Some(sub) -> if irrefutable(sub) { Some(t) } else {
+                      let read = arg_tested(t.emitter, t.expr, subj.expr, k, laid);
+                      let field = {
+                        emitter: read.emitter,
+                        value: {
+                          ..read.value,
+                          ty: known_or(read.value.ty, arg_ty(read.emitter, subj, c.name)),
+                        },
+                      };
+                      match pat_test(sub, field.value, field.emitter) {
                         None -> None,
                         Some(inner) ->
                           Some({
@@ -10034,70 +10979,130 @@ fn pat_test(
                           }),
                       }
                     },
-                  }
+                  },
                 },
-              },
-            },
-        ),
-      None -> {
-        let head = Bytes::concat_all([
-          b"(",
-          is_object(subj.expr),
-          b" && rt_record_fits_p(ctx, ",
-          subj.expr,
-          b", ",
-          ascii_of_int(r.fields.len()),
-          b", ",
-          if r.rest { b"0" } else { b"1" },
-          b"))",
-        ]);
-        r.fields.fold(
-          Some({ emitter: emitter, expr: head }),
-          |acc: Option<{ emitter: Emitter, expr: Bytes }>, f: CodePatternField|
-            match acc {
-              None -> None,
-              Some(t) -> {
-                let idx = field_of(t.emitter, f.name);
-                let has = Bytes::concat_all([
-                  b"(",
-                  t.expr,
-                  b" && rt_record_has_p(ctx, ",
-                  subj.expr,
-                  b", @@f",
-                  ascii_of_int(idx.i),
-                  b"@@))",
-                ]);
-                if irrefutable(f.pat) { Some({ emitter: idx.emitter, expr: has }) } else {
-                  let field = bind(
-                    idx.emitter,
-                    KBoxed,
-                    Bytes::concat_all([
-                      b"(",
-                      has,
-                      b" ? rt_field_p(ctx, ",
-                      subj.expr,
-                      b", @@f",
-                      ascii_of_int(idx.i),
-                      b"@@, 0) : 0)",
-                    ]),
-                  );
-                  match pat_test(
-                      f.pat,
-                      field.value,
-                      note_holder(check(field.emitter), field.value.expr),
-                    ) {
+            )
+          },
+        }
+      },
+    },
+    // A record held back tests each field's pattern on the value it holds.
+    PxRecord(r) -> if deferred_of(emitter, subj.expr) != None {
+      r.fields.fold(
+        Some({ emitter: emitter, expr: b"1" }),
+        |acc: Option<{ emitter: Emitter, expr: Bytes }>, f: CodePatternField|
+          match acc {
+            None -> None,
+            Some(t) -> if irrefutable(f.pat) { acc } else {
+              match built_field(t.emitter, subj.expr, f.name) {
+                None -> None,
+                Some(v) -> {
+                  let w = tested_value(t.emitter, v);
+                  match pat_test(f.pat, w.value, w.emitter) {
                     None -> None,
                     Some(inner) ->
                       Some({
                         emitter: inner.emitter,
-                        expr: Bytes::concat_all([b"(", has, b" && ", inner.expr, b")"]),
+                        expr: Bytes::concat_all([b"(", t.expr, b" && ", inner.expr, b")"]),
                       }),
                   }
-                }
-              },
+                },
+              }
             },
-        )
-      },
+          },
+      )
+    } else {
+      // Refutable despite the shape: a non-record, the field count without `..`, or a missing field.
+      match pattern_slots(subj.ty, r.fields) {
+        // A record of a known layout holds every field its type names: only the fields' own
+        // patterns are tested, each on the field read where it stands.
+        Some(slots) ->
+          range(0, r.fields.len()).fold(
+            Some({ emitter: emitter, expr: is_object(subj.expr) }),
+            |acc: Option<{ emitter: Emitter, expr: Bytes }>, i: Int|
+              match acc {
+                None -> None,
+                Some(t) -> match r.fields.at(i) {
+                  None -> acc,
+                  Some(f) -> if irrefutable(f.pat) { acc } else {
+                    match slots.at(i) {
+                      None -> None,
+                      Some(x) -> {
+                        let field = laid_tested(t.emitter, t.expr, subj.expr, x);
+                        match pat_test(f.pat, field.value, field.emitter) {
+                          None -> None,
+                          Some(inner) ->
+                            Some({
+                              emitter: inner.emitter,
+                              expr: Bytes::concat_all([b"(", t.expr, b" && ", inner.expr, b")"]),
+                            }),
+                        }
+                      },
+                    }
+                  },
+                },
+              },
+          ),
+        None -> {
+          let head = Bytes::concat_all([
+            b"(",
+            is_object(subj.expr),
+            b" && rt_record_fits_p(ctx, ",
+            subj.expr,
+            b", ",
+            ascii_of_int(r.fields.len()),
+            b", ",
+            if r.rest { b"0" } else { b"1" },
+            b"))",
+          ]);
+          r.fields.fold(
+            Some({ emitter: emitter, expr: head }),
+            |acc: Option<{ emitter: Emitter, expr: Bytes }>, f: CodePatternField|
+              match acc {
+                None -> None,
+                Some(t) -> {
+                  let idx = field_of(t.emitter, f.name);
+                  let has = Bytes::concat_all([
+                    b"(",
+                    t.expr,
+                    b" && rt_record_has_p(ctx, ",
+                    subj.expr,
+                    b", @@f",
+                    ascii_of_int(idx.i),
+                    b"@@))",
+                  ]);
+                  if irrefutable(f.pat) { Some({ emitter: idx.emitter, expr: has }) } else {
+                    let field = bind(
+                      idx.emitter,
+                      KBoxed,
+                      Bytes::concat_all([
+                        b"(",
+                        has,
+                        b" ? rt_field_p(ctx, ",
+                        subj.expr,
+                        b", @@f",
+                        ascii_of_int(idx.i),
+                        b"@@, 0) : 0)",
+                      ]),
+                    );
+                    match pat_test(
+                        f.pat,
+                        field.value,
+                        note_holder(check(field.emitter), field.value.expr),
+                      ) {
+                      None -> None,
+                      Some(inner) ->
+                        Some({
+                          emitter: inner.emitter,
+                          expr: Bytes::concat_all([b"(", has, b" && ", inner.expr, b")"]),
+                        }),
+                    }
+                  }
+                },
+              },
+          )
+        },
+      }
     },
     // A refutable `..rest` would allocate the tail inside a test that may fail, so it is refused.
     PxList(l) -> if match l.rest { Some(r) -> !irrefutable(r), None -> false } { None } else {
@@ -10282,49 +11287,72 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
           TyOpen(_) -> typed_kind(emitter.typed, v.span).ty,
           known -> known,
         };
-        let b = bind_keeping(emitter, subj.kind, ty, subj.expr);
+        // A sum held back is bound as its word.
+        let ready = match held_sum_of(emitter, subj.expr) {
+          Some(h) -> sum_made(emitter, h, !is_pinned(emitter, subj.expr)),
+          None -> emitter,
+        };
+        let b = bind_keeping(ready, subj.kind, ty, subj.expr);
         remember(ensure_owned(b.emitter, b.value), s, b.value)
       },
     },
     // The argument of a sum held as its word is that word, untagged for `Err`; its binder takes
     // the subject's count where the subject moves into it, and holds one of its own where it does not.
-    PxCtor(c) -> if is_sum(subj.kind) {
-      match c.args.at(0) {
+    // A sum held back binds the argument it holds, a copy of it where a failing guard may hand the
+    // subject on to the next arm.
+    PxCtor(c) -> match held_sum_of(emitter, subj.expr) {
+      Some(h) -> match c.args.at(0) {
         None -> emitter,
-        Some(sub) -> {
-          let case = sum_case(emitter, subj.kind, c.name, subj.expr);
-          let ty = arg_ty(emitter, subj, c.name);
-          if case.arg == subj.expr {
-            let w = bind_keeping(emitter, KBoxed, ty, subj.expr);
-            pat_bind(ensure_owned(w.emitter, w.value), sub, w.value)
-          } else {
-            let w = bind_keeping(emitter, KBoxed, ty, case.arg);
-            if emitter.release && spendable(w.emitter, subj.expr) {
-              let moved = line(
-                note_made(spend_made(w.emitter, subj.expr), w.value.expr),
-                Bytes::concat_all([subj.expr, b" = 0;"]),
-              );
-              pat_bind(moved, sub, w.value)
-            } else { pat_bind(ensure_owned(w.emitter, w.value), sub, w.value) }
-          }
+        Some(sub) -> match case_index(h.cases, ctor_bare(emitter, c.name)) {
+          None -> emitter,
+          Some(i) -> match h.args.at(i) {
+            Some(Some(v)) -> {
+              let a = if is_pinned(emitter, subj.expr) { case_copy(emitter, v) }
+              else { { emitter: emitter, value: v } };
+              pat_bind(a.emitter, sub, a.value)
+            },
+            _ -> emitter,
+          },
         },
-      }
-    } else {
-      // Every argument is read and duplicated whether or not the pattern names it, so the arm's scope has one shape.
-      let laid = match tag_of(emitter, c.name) {
-        Some(tag) -> ctor_fields(emitter, tag),
-        None -> None,
-      };
-      range(0, c.args.len()).fold(emitter, |acc: Emitter, i: Int| {
-        let f = match laid { Some(fs) -> arg_at(fs, i), None -> None };
-        let w = laid_held(acc, subj.expr, match f {
-          Some(x) -> x,
-          None -> { at: i, kind: KBoxed, ty: TyOpen([]) },
-        });
-        // The object holds the argument as a word, which the subject's type says the layout of.
-        let arg = { ..w.value, ty: known_or(w.value.ty, arg_ty(w.emitter, subj, c.name)) };
-        match c.args.at(i) { Some(sub) -> pat_bind(w.emitter, sub, arg), None -> w.emitter }
-      })
+      },
+      None -> if is_sum(subj.kind) {
+        match c.args.at(0) {
+          None -> emitter,
+          Some(sub) -> {
+            let case = sum_case(emitter, subj.kind, c.name, subj.expr);
+            let ty = arg_ty(emitter, subj, c.name);
+            if case.arg == subj.expr {
+              let w = bind_keeping(emitter, KBoxed, ty, subj.expr);
+              pat_bind(ensure_owned(w.emitter, w.value), sub, w.value)
+            } else {
+              let w = bind_keeping(emitter, KBoxed, ty, case.arg);
+              if emitter.release && spendable(w.emitter, subj.expr) {
+                let moved = line(
+                  note_made(spend_made(w.emitter, subj.expr), w.value.expr),
+                  Bytes::concat_all([subj.expr, b" = 0;"]),
+                );
+                pat_bind(moved, sub, w.value)
+              } else { pat_bind(ensure_owned(w.emitter, w.value), sub, w.value) }
+            }
+          },
+        }
+      } else {
+        // Every argument is read and duplicated whether or not the pattern names it, so the arm's scope has one shape.
+        let laid = match tag_of(emitter, c.name) {
+          Some(tag) -> ctor_fields(emitter, tag),
+          None -> None,
+        };
+        range(0, c.args.len()).fold(emitter, |acc: Emitter, i: Int| {
+          let f = match laid { Some(fs) -> arg_at(fs, i), None -> None };
+          let w = laid_held(acc, subj.expr, match f {
+            Some(x) -> x,
+            None -> { at: i, kind: KBoxed, ty: TyOpen([]) },
+          });
+          // The object holds the argument as a word, which the subject's type says the layout of.
+          let arg = { ..w.value, ty: known_or(w.value.ty, arg_ty(w.emitter, subj, c.name)) };
+          match c.args.at(i) { Some(sub) -> pat_bind(w.emitter, sub, arg), None -> w.emitter }
+        })
+      },
     },
     // A record held back binds its values, each moved out where the record is spent; otherwise the
     // runtime's read by name answers the field duplicated, with no increment here.
@@ -10467,6 +11495,76 @@ fn arm(
       Some({ emitter: outdent(o.emitter), text: bytes_join(o.emitter.out, b""), value: o.value }),
   }
 
+/// An `if` whose arms answer a sum taken as its constructor and argument: each arm's handed to the
+/// locals the sum is held back as after the `if`, its holders released behind it. `j` is the
+/// join's number and what came before, `cv` the condition, `t` and `e` the arms.
+fn if_sum_join(
+  j: { emitter: Emitter, name: Bytes },
+  cv: WithValue,
+  t: { emitter: Emitter, text: Bytes, value: CValue },
+  e: { emitter: Emitter, text: Bytes, value: CValue },
+  sc: SumCases,
+) -> WithValue = {
+  let locals = sum_locals(rescope(with_out(e.emitter, []), cv.emitter.unboxed), sc);
+  let ind = locals.emitter.indent;
+  let ta = sum_assigned(
+    locals.emitter,
+    t.emitter,
+    t.text,
+    ind,
+    t.value,
+    sc,
+    locals.tag,
+    locals.leaves,
+  );
+  let ea = sum_assigned(ta.emitter, e.emitter, e.text, ind, e.value, sc, locals.tag, locals.leaves);
+  let body = Bytes::concat_all([
+    bytes_join(j.emitter.out, b""),
+    bytes_join(locals.emitter.out, b""),
+    pad(ind),
+    b"if (",
+    cv.value.expr,
+    b") {\n",
+    ta.text,
+    pad(ind),
+    b"} else {\n",
+    ea.text,
+    pad(ind),
+    b"}\n",
+  ]);
+  held_sum_from(
+    {
+      ..ea.emitter,
+      out: [body],
+      unboxed: cv.emitter.unboxed,
+      count_locals: union_made(ta.made, ea.made),
+    },
+    sc,
+    locals.tag,
+    locals.leaves,
+  )
+}
+
+/// An arm of a sum's join: its sum handed to the join's locals, and the arm's holders released.
+fn sum_assigned(
+  emitter: Emitter,
+  arm_em: Emitter,
+  text: Bytes,
+  ind: Int,
+  value: CValue,
+  sc: SumCases,
+  tag: Bytes,
+  leaves: List<CValue>,
+) -> { emitter: Emitter, text: Bytes, made: List<CountLocal> } = {
+  let arm = with_made(indent(with_out(emitter, [])), arm_em.count_locals);
+  let m3 = release_at(sum_into(arm, value, sc, tag, leaves), ind + 1);
+  {
+    emitter: outdent(with_out(with_made(m3, emitter.count_locals), emitter.out)),
+    text: Bytes::concat_all([text, bytes_join(m3.out, b"")]),
+    made: m3.count_locals,
+  }
+}
+
 fn assigned(
   emitter: Emitter,
   arm_em: Emitter,
@@ -10577,6 +11675,8 @@ fn blank(emitter: Emitter) -> Emitter =
     lent: emitter.lent,
     written: emitter.written,
     slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
   }
 
 /// The shape both arms answer when both built a record of the same shape; otherwise the join is one local.
@@ -11369,6 +12469,10 @@ fn tail_args(
               let held = handed_record(o.emitter, o.value, fs);
               tail_args(held.emitter, codes, params, i + 1, acc.push(held.names))
             },
+            Cases(sc) -> {
+              let held = handed_sum(o.emitter, o.value, sc);
+              tail_args(held.emitter, codes, params, i + 1, acc.push(held.names))
+            },
             Whole(KSum(spec)) -> {
               let t = sum_owned(o.emitter, o.value, spec);
               tail_args(t.emitter, codes, params, i + 1, acc.push([t.value.expr]))
@@ -11386,6 +12490,46 @@ fn tail_args(
       },
     }
   }
+
+/// Parameter `i`, a sum of cases `c` held back, given the values `names` a self call hands it.
+fn restarted_sum(emitter: Emitter, c: SumCases, i: Int, names: List<Bytes>) -> Emitter = {
+  let set = range(0, names.len()).fold(emitter, |acc: Emitter, k: Int|
+    line(
+      acc,
+      Bytes::concat_all([
+        if k == 0 { b"p".concat(ascii_of_int(i)) } else { field_param(i, k - 1) },
+        b" = ",
+        nth_bytes(names, k),
+        b";",
+      ]),
+    ));
+  match param_local(set, i) {
+    None -> set,
+    Some(p) -> match held_sum_of(set, p.expr) {
+      None -> set,
+      Some(h) -> {
+        let words = range(0, c.cases.len()).fold(set, |acc: Emitter, j: Int|
+          match nth_case(c, j).arg {
+            Some(Fields(fs)) -> match h.args.at(j) {
+              Some(Some(v)) ->
+                line(
+                  acc,
+                  Bytes::concat_all([
+                    v.expr,
+                    b" = ",
+                    nth_bytes(names, 1 + case_start(c, j) + fs.len()),
+                    b";",
+                  ]),
+                ),
+              _ -> acc,
+            },
+            _ -> acc,
+          });
+        line(words, h.name.concat(b" = 0;"))
+      },
+    },
+  }
+}
 
 /// A self call in tail position: the parameters take the arguments, what this pass of the body holds is released, and the body restarts.
 fn self_tail(
@@ -11415,6 +12559,9 @@ fn self_tail(
                   |a: Emitter, k: Int|
                     line(a, Bytes::concat_all([field_param(i, k), b" = ", nth_bytes(nm, k), b";"])),
                 ),
+              // The sum's index and values are the parameter's again, each record argument's
+              // word its local, and the sum's own word not made.
+              Cases(sc) -> restarted_sum(acc, sc, i, nm),
               Whole(_) -> match match param_local(acc, i) {
                   Some(p) -> slice_of(acc, p.expr),
                   None -> None,
@@ -11525,6 +12672,19 @@ fn group_tail(
     },
   }
 
+/// Parameter `i`, a sum of cases `c` that arrived as its constructor's index and argument's values,
+/// held back as them.
+fn sum_param(emitter: Emitter, c: SumCases, i: Int) -> WithValue = {
+  let leaves = sum_leaves(c);
+  held_sum_from(
+    emitter,
+    c,
+    b"p".concat(ascii_of_int(i)),
+    range(0, leaves.len()).map(|k: Int|
+      { kind: nth_field(leaves, k).kind, expr: field_param(i, k), ty: nth_field(leaves, k).ty }),
+  )
+}
+
 /// Every parameter is opened at entry, in order, read or not: opening lazily writes the temporaries in a different order.
 fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter =
   range(0, params.len()).fold(emitter, |acc: Emitter, i: Int|
@@ -11543,6 +12703,10 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter =
             remember(r.emitter, i, r.value)
           },
           Whole(k) -> remember(acc, i, { kind: k, expr: b"p".concat(ascii_of_int(i)), ty: p.ty }),
+          Cases(sc) -> {
+            let h = sum_param(acc, sc, i);
+            remember(h.emitter, i, { ..h.value, ty: p.ty })
+          },
         }
       } else {
         let acc = note_bound(
@@ -12529,6 +13693,8 @@ pub fn emit_fn_full(
     lent: lent_of(params),
     written: written_in(module, here, imports, body),
     slices: [],
+    sums: [],
+    leaves: answers_cases(answer),
   };
   match emit_body(start, params, body) {
     None -> None,
@@ -12543,10 +13709,7 @@ pub fn emit_fn_full(
       let grown = grown_words(o0.emitter, params, answer);
       let head = fuel_head(name.concat(b"_entry"), grown.prep, grown.words, answer);
       let w = answered(grown.emitter, o0.value, answer);
-      let shaped = match answer {
-        Fields(fs) -> shape_of_fields(w.emitter, fs),
-        Whole(_) -> { emitter: w.emitter, i: 0 },
-      };
+      let shaped = answer_shapes(w.emitter, answer);
       let o = { emitter: shaped.emitter, value: o0.value };
       let epilogue = Bytes::concat_all([
         toks_freed(o.emitter.reuse_widths),
@@ -12554,7 +13717,7 @@ pub fn emit_fn_full(
         w.expr,
         b";\n}\n",
       ]);
-      let entry = entry_text(name, params, answer, shaped.i);
+      let entry = entry_from(name, [], 0, params, answer, shaped.shapes);
       // Token declarations go in front once the body has used them; they take no temporary, so nothing moves.
       let toks = sorted_widths(o.emitter.reuse_widths).fold(b"", |acc: Bytes, w: Int|
         Bytes::concat_all([acc, b"  Word tok", ascii_of_int(w), b" = 0;\n"]));
@@ -12602,7 +13765,19 @@ fn answered(emitter: Emitter, value: CValue, answer: Carrier) -> { emitter: Emit
         ));
       { emitter: release_at(written, 0), expr: nth_bytes(bound.names, 0) }
     },
+    Cases(sc) -> {
+      let h = handed_sum(emitter, value, sc);
+      let written = range(1, h.names.len()).fold(h.emitter, |acc: Emitter, k: Int|
+        line(
+          acc,
+          Bytes::concat_all([b"*o", ascii_of_int(k), b" = ", nth_bytes(h.names, k), b";"]),
+        ));
+      { emitter: release_at(written, 0), expr: nth_bytes(h.names, 0) }
+    },
   }
+
+/// Whether a body answering as `c` hands back a sum as its constructor and argument.
+fn answers_cases(c: Carrier) -> Bool = match c { Cases(_) -> true, _ -> false }
 
 /// The C type a value carried as `k` crosses a call in.
 fn carried_type(k: Kind) -> Bytes = match k { KBoxed -> b"Word", _ -> ctype(k) }
@@ -12675,18 +13850,53 @@ fn grown_words(
               words: acc.words.push(name),
             }
           },
+          Cases(sc) -> {
+            let shaped = case_shapes(acc.emitter, sc);
+            let name = b"ply_g".concat(ascii_of_int(i));
+            {
+              emitter: shaped.emitter,
+              prep: Bytes::concat_all([
+                acc.prep,
+                sum_word_lines(
+                  name,
+                  sc,
+                  b"p".concat(ascii_of_int(i)),
+                  range(0, sum_leaves(sc).len()).map(|k: Int|
+                    {
+                      kind: nth_field(sum_leaves(sc), k).kind,
+                      expr: field_param(i, k),
+                      ty: TyOpen([]),
+                    }),
+                  shaped.shapes,
+                  failing_return(returned_kind(answer)),
+                ),
+                b" ",
+              ]),
+              words: acc.words.push(
+                Bytes::concat_all([sum_helper(sc.spec, b"take"), b"(ctx, ", name, b")"]),
+              ),
+            }
+          },
         },
       },
   )
 
-/// The entry the runtime and closures call a root by, words in and out: each carried argument is
-/// opened, a record's fields loaded and its word handed on with them; a carried answer is boxed, a
-/// record's its word, or one made of `shape`.
-fn entry_text(name: Bytes, params: List<EmitParam>, answer: Carrier, shape: Int) -> Bytes = {
+/// The entry the runtime and closures call a function by, words in and out: `held` are handed first
+/// as they are, then each carried argument from `args[first]` is opened, a record's fields loaded
+/// and its word handed on with them; a carried answer is boxed, a record's its word, or one made of
+/// `shape`.
+fn entry_from(
+  name: Bytes,
+  held: List<Bytes>,
+  first: Int,
+  params: List<EmitParam>,
+  answer: Carrier,
+  shapes: List<Int>,
+) -> Bytes = {
   let opened = range(0, params.len()).fold(
-    { text: b"", args: [] },
+    { text: b"", args: held },
     |acc: { text: Bytes, args: List<Bytes> }, i: Int| {
-      let arg = Bytes::concat_all([b"args[", ascii_of_int(i), b"]"]);
+      let arg = Bytes::concat_all([b"args[", ascii_of_int(first + i), b"]"]);
       match params.at(i) {
         None -> acc,
         Some(p) -> match p.carrier {
@@ -12726,6 +13936,44 @@ fn entry_text(name: Bytes, params: List<EmitParam>, answer: Carrier, shape: Int)
                 b");\n",
               ]),
               args: acc.args.push(local),
+            }
+          },
+          // The argument's object is opened into its constructor's index and argument's values.
+          Cases(sc) -> {
+            let tag = b"a".concat(ascii_of_int(i));
+            let leaves = range(0, sum_leaves(sc).len()).map(|k: Int|
+              Bytes::concat_all([b"a", ascii_of_int(i), b"_", ascii_of_int(k)]));
+            let word = Bytes::concat_all([b"a", ascii_of_int(i), b"_s"]);
+            {
+              text: Bytes::concat_all([
+                acc.text,
+                b"  ",
+                ctype(KSum(sc.spec)),
+                b" ",
+                word,
+                b" = ",
+                sum_helper(sc.spec, b"open"),
+                b"(ctx, ",
+                arg,
+                b"); int64_t ",
+                tag,
+                b" = 0;",
+                range(0, leaves.len()).fold(b"", |t: Bytes, k: Int|
+                  Bytes::concat_all([
+                    t,
+                    b" ",
+                    carried_type(nth_field(sum_leaves(sc), k).kind),
+                    b" ",
+                    nth_bytes(leaves, k),
+                    b" = ",
+                    zero_of(nth_field(sum_leaves(sc), k).kind),
+                    b";",
+                  ])),
+                b"\n  ",
+                sum_opening(sc, word, tag, leaves),
+                b"\n",
+              ]),
+              args: acc.args.push(tag).concat(leaves),
             }
           },
           Fields(fs) -> {
@@ -12789,6 +14037,35 @@ fn entry_text(name: Bytes, params: List<EmitParam>, answer: Carrier, shape: Int)
           },
           b";\n",
         ]),
+      Cases(sc) ->
+        Bytes::concat_all([
+          range(0, back.len()).fold(b"", |t: Bytes, k: Int|
+            Bytes::concat_all([
+              t,
+              b"  ",
+              carried_type(nth_field(back, k).kind),
+              b" ",
+              nth_bytes(outs, k),
+              b" = ",
+              zero_of(nth_field(back, k).kind),
+              b";\n",
+            ])),
+          b"  int64_t r0 = ",
+          call,
+          b";\n  if (ctx->failed) return 0;\n  ",
+          sum_word_lines(
+            b"rw",
+            sc,
+            b"r0",
+            range(0, back.len()).map(|k: Int|
+              { kind: nth_field(back, k).kind, expr: nth_bytes(outs, k), ty: TyOpen([]) }),
+            shapes,
+            b"return 0;",
+          ),
+          b"\n  return ",
+          sum_helper(sc.spec, b"take"),
+          b"(ctx, rw);\n",
+        ]),
       Fields(fs) ->
         Bytes::concat_all([
           range(0, back.len()).fold(b"", |t: Bytes, k: Int|
@@ -12809,7 +14086,7 @@ fn entry_text(name: Bytes, params: List<EmitParam>, answer: Carrier, shape: Int)
             b"rw",
             nth_bytes(outs, back.len() - 1),
             fs,
-            shape,
+            match shapes.at(0) { Some(sh) -> sh, None -> 0 },
             range(0, fs.len()).map(|k: Int|
               {
                 kind: nth_field(fs, k).kind,
@@ -12897,6 +14174,8 @@ pub fn emit_fn_why(
     lent: lent_of(params),
     written: written_in(module, here, imports, body),
     slices: [],
+    sums: [],
+    leaves: answers_cases(answer),
   };
   match emit_body(start, params, body) {
     None -> Some(b"refused without a reason"),
@@ -12974,6 +14253,8 @@ pub fn emit_group_full(
     lent: [],
     written: [],
     slices: [],
+    sums: [],
+    leaves: false,
   };
   match group_cases(start, members, 0) {
     None -> None,
@@ -13070,6 +14351,7 @@ fn group_cases(emitter: Emitter, members: List<Member>, i: Int) -> Option<Emitte
           alias: [],
           by_root: [],
           deferred: [],
+          sums: [],
           pinned: [],
           bound: [],
           tail: true,
@@ -13112,10 +14394,7 @@ fn group_wrapper(
       acc.concat(match grown.words.at(i) { Some(w) -> b", ".concat(w), None -> b", 0" })),
     b")",
   ]);
-  let shaped = match answer {
-    Fields(fs) -> shape_of_fields(grown.emitter, fs),
-    Whole(_) -> { emitter: grown.emitter, i: 0 },
-  };
+  let shaped = answer_shapes(grown.emitter, answer);
   let k = returned_kind(answer);
   // A record answer hands its word back with its fields; a scalar's word is let go.
   let opened = |loads: List<CValue>, record: Bool|
@@ -13171,9 +14450,17 @@ fn group_wrapper(
             false,
           ),
         Fields(fs) -> opened(field_loads(b"r", fs), true),
+        Cases(sc) ->
+          Bytes::concat_all([
+            b"  Word r = ",
+            call,
+            b";\n  if (ctx->failed) return 0;\n  ",
+            sum_returned(sc, b"r"),
+            b"\n",
+          ]),
       },
       b"}\n",
-      entry_text(name, member.params, answer, shaped.i),
+      entry_from(name, [], 0, member.params, answer, shaped.shapes),
     ]),
   }
 }
@@ -13426,6 +14713,14 @@ fn grown_return(grown: Bytes, answer: Carrier) -> Bytes =
       let k = returned_kind(answer);
       let fail = Bytes::concat_all([b"if (ctx->failed) ", failing_return(k), b" "]);
       match answer {
+        Cases(sc) ->
+          Bytes::concat_all([
+            b"Word ply_back = ",
+            grown,
+            b"; ",
+            fail,
+            sum_returned(sc, b"ply_back"),
+          ]),
         Fields(fs) -> {
           let loads = field_loads(b"ply_back", fs);
           Bytes::concat_all([
@@ -14337,8 +15632,9 @@ test "an Option is its payload's word in the code that knows it, and its object 
 
 test "a Result whose error is an object is one word in the code that knows it" {
   let src = Bytes::concat_all([
-    b"type Bad = { why: Bytes }\n",
-    b"fn half(n: Int) -> Result<Int, Bad> = if n % 2 == 0 { Ok(n / 2) } else { Err({ why: b\"odd\" }) }\n",
+    // Wider than a record that crosses a call as its fields.
+    b"type Bad = { why: Bytes, a: Int, b: Int, c: Int, d: Int }\n",
+    b"fn half(n: Int) -> Result<Int, Bad> = if n % 2 == 0 { Ok(n / 2) } else { Err({ why: b\"odd\", a: 0, b: 0, c: 0, d: 0 }) }\n",
     b"fn quarter(n: Int) -> Result<Int, Bad> = { let h = half(n)?; half(h) }\n",
     b"fn told(n: Int) -> Bytes = match quarter(n) { Ok(_) -> b\"\", Err(b) -> b.why }\n",
     b"fn plain(n: Int) -> Result<Int, Int> = if n > 0 { Ok(n) } else { Err(n) }\n",
@@ -14352,6 +15648,36 @@ test "a Result whose error is an object is one word in the code that knows it" {
   assert_eq(has(b"rt_tagged_"), [false, false, false, false]);
   assert_eq(has(b") | 4)"), [true, true, false, false]);
   assert_eq(has(b" & 7) "), [false, true, true, false])
+}
+
+test "a Result whose error is a small record crosses a call as its constructor and the record's fields" {
+  let src = Bytes::concat_all([
+    b"type Bad = { why: Bytes }\n",
+    b"fn half(n: Int) -> Result<Int, Bad> = if n % 2 == 0 { Ok(n / 2) } else { Err({ why: b\"odd\" }) }\n",
+    b"fn quarter(n: Int) -> Result<Int, Bad> = { let h = half(n)?; half(h) }\n",
+    b"fn told(n: Int) -> Bytes = match quarter(n) { Ok(_) -> b\"\", Err(b) -> b.why }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [b"Ok", b"Err"], [], true);
+  let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
+  assert_eq(out.map(|e: Emitted| e.why), [None, None, None]);
+  // Built, answered, handed on by `?` and matched as its constructor and the record's fields: no
+  // record or `Result` is made, and the error's field is read where it came back.
+  assert_eq(has(b"rt_alloc_p"), [false, false, false]);
+  assert_eq(has(b"rt_ctor_p"), [false, false, false]);
+  assert_eq(has(b"rt_tagged_"), [false, false, false]);
+  assert_eq(has(b"rt_field_p"), [false, false, false]);
+  assert_eq(has(b"*o1 = "), [true, true, false])
+}
+
+test "a record rebuilt from a captured record's fields reads them where they lie, run in place or not" {
+  let src = Bytes::concat_all([
+    b"type Sp = { start: Int, end: Int, gen: Int }\n",
+    b"type C = { own: Int, node: Int, span: Sp }\n",
+    b"fn rebuilt(c: C, n: Int) -> C = { let at = |k: Int| { own: 0, node: k, span: c.span }; at(n) }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
+  assert_eq(out.map(|e: Emitted| e.why), [None]);
+  assert_eq(out.map(|e: Emitted| e.text.index_of(b"rt_field_p") != None), [false])
 }
 
 test "a record holds an Option as its payload's word" {
@@ -14600,8 +15926,9 @@ fn carriers_of(
 }
 
 /// How a root of `d` at type arguments `args` takes each parameter and answers: as `carriers_of`
-/// says of the types it declares, and each variable `carried_vars` names as its argument's own C
-/// type. Callers at their type arguments and the root at its own reach the same.
+/// says of the types it declares, and each variable `carried_vars` names as its argument crosses
+/// once `erased`, which is what names the root. Callers at their type arguments and the root at its
+/// own reach the same.
 fn carriers_at(
   d: Def,
   args: List<Type>,
@@ -14613,7 +15940,7 @@ fn carriers_at(
         let raw = carried_vars(sc, args, d.arity);
         let at_var = |t: Type, otherwise: Carrier|
           match t {
-            TyVar(j) -> if raw.contains(j) { carrier_of(args.get(j)) } else { otherwise },
+            TyVar(j) -> if raw.contains(j) { carrier_of(erased(args.get(j))) } else { otherwise },
             _ -> otherwise,
           };
         {
@@ -14637,7 +15964,7 @@ fn carried_vars(scheme: Scheme, args: List<Type>, arity: Int) -> List<Int> / {ab
     TyFn(f) ->
       range(0, args.len()).filter(|j: Int|
         (f.params.contains(TyVar(j)) || (arity > 0 && f.ret == TyVar(j)))
-          && raw_carrier(carrier_of(args.get(j)))),
+          && raw_carrier(carrier_of(erased(args.get(j))))),
     _ -> [],
   }
 
@@ -14759,11 +16086,19 @@ fn reference_args(emitter: Emitter, scheme: Option<Scheme>, at: Span) -> List<Ty
   }
 
 /// How a value declared at `t` crosses a call between roots: a scalar held apart from a word as
-/// itself; a record `carried_record` admits as its fields; anything else as its word.
+/// itself; a record `carried_record` admits as its fields; an `Option` or a `Result` held as one
+/// word as that word, or as its cases where one of its arguments crosses as a record's fields;
+/// anything else as its word.
 fn carrier_of(t: Type) -> Carrier = {
   let k = kind_of(t);
-  if is_option_type(t) { Whole(KSum(Zeroed)) }
-  else if tagged_result(t) { Whole(KSum(Tagged)) } else {
+  let args = if is_option_type(t) || tagged_result(t) {
+    match t { TyCon(c) -> c.args.map(|a: Type| case_carrier(carrier_of(a))), _ -> [] }
+  } else { [] };
+  if is_option_type(t) {
+    sum_carrier(Zeroed, [{ name: b"None", arg: None }, { name: b"Some", arg: args.at(0) }])
+  } else if tagged_result(t) {
+    sum_carrier(Tagged, [{ name: b"Ok", arg: args.at(0) }, { name: b"Err", arg: args.at(1) }])
+  } else {
     match k.ty {
       TyRec(fs) -> if carried_record(fs) { Fields(fs) } else { Whole(KBoxed) },
       _ -> match k.kind {
@@ -14778,6 +16113,43 @@ fn carrier_of(t: Type) -> Carrier = {
   }
 }
 
+/// A sum held as one word as `spec` says, crossing as its cases where a constructor's argument
+/// crosses as a record's fields and as that word otherwise.
+fn sum_carrier(spec: SumSpec, cases: List<SumCase>) -> Carrier =
+  if cases.fold(false, |any: Bool, c: SumCase|
+      any || (match c.arg { Some(Fields(_)) -> true, _ -> false })) {
+    Cases({ spec: spec, cases: cases })
+  } else { Whole(KSum(spec)) }
+
+/// How a sum's argument a call carries as `c` crosses as the sum's: a sum as its object.
+fn case_carrier(c: Carrier) -> Carrier =
+  match c { Whole(KSum(_)) -> Whole(KBoxed), Cases(_) -> Whole(KBoxed), other -> other }
+
+/// The C values a sum carried as `c` crosses in past its constructor's index: each constructor's
+/// argument's in turn, a record's fields and then its word.
+fn sum_leaves(c: SumCases) -> List<FieldTy> =
+  c.cases.fold([], |acc: List<FieldTy>, sc: SumCase|
+    match sc.arg {
+      None -> acc,
+      Some(Fields(fs)) -> acc.concat(fs.push({ name: b"", kind: KBoxed, ty: TyOpen([]) })),
+      Some(Whole(k)) -> acc.push({ name: b"", kind: k, ty: TyOpen([]) }),
+      Some(Cases(_)) -> acc.push({ name: b"", kind: KBoxed, ty: TyOpen([]) }),
+    })
+
+/// How many of a sum's C values past its index the argument `arg` takes.
+fn case_width(arg: Option<Carrier>) -> Int =
+  match arg { None -> 0, Some(Fields(fs)) -> fs.len() + 1, Some(_) -> 1 }
+
+/// Where among a sum's values past its index its `i`th constructor's argument starts.
+fn case_start(c: SumCases, i: Int) -> Int =
+  range(0, i).fold(0, |acc: Int, j: Int|
+    acc + case_width(match c.cases.at(j) { Some(sc) -> sc.arg, None -> None }))
+
+/// The index of constructor `name` among `c`'s.
+fn case_index(c: SumCases, name: Bytes) -> Option<Int> =
+  range(0, c.cases.len()).fold(None, |acc: Option<Int>, i: Int|
+    match c.cases.at(i) { Some(sc) -> if sc.name == name { Some(i) } else { acc }, None -> acc })
+
 /// A record that crosses a call as its fields, each in a C value of its own, and then its word,
 /// zero where it was never made: one held back until its word is asked for, of at most four words.
 /// A record made once crosses any number of calls as that word.
@@ -14788,19 +16160,28 @@ fn carried_types(c: Carrier) -> List<Bytes> =
   match c {
     Whole(k) -> [carried_type(k)],
     Fields(fs) -> fs.map(|f: FieldTy| ctype(f.kind)).push(b"Word"),
+    Cases(sc) ->
+      push_front_bytes(b"int64_t", sum_leaves(sc).map(|f: FieldTy| carried_type(f.kind))),
   }
+
+fn push_front_bytes(x: Bytes, xs: List<Bytes>) -> List<Bytes> = [x].concat(xs)
 
 /// Whether a value carried as `c` crosses in C values of its own rather than as a word: a record's
 /// fields, or a scalar in its C type.
 fn raw_carrier(c: Carrier) -> Bool =
-  match c { Fields(_) -> true, Whole(k) -> k != KBoxed && !is_sum(k) }
+  match c { Fields(_) -> true, Cases(_) -> true, Whole(k) -> k != KBoxed && !is_sum(k) }
 
-/// The kind a root answering as `c` returns: the answer's, or a record's first field's.
+/// The kind a root answering as `c` returns: the answer's, a record's first field's, or a sum's
+/// constructor's index.
 fn returned_kind(c: Carrier) -> Kind =
-  match c { Whole(k) -> k, Fields(fs) -> match fs.at(0) { Some(f) -> f.kind, None -> KBoxed } }
+  match c {
+    Whole(k) -> k,
+    Fields(fs) -> match fs.at(0) { Some(f) -> f.kind, None -> KBoxed },
+    Cases(_) -> KInt,
+  }
 
-/// What a record answer writes through the pointers the caller hands: its fields past its first,
-/// then its word, a word field of no name.
+/// What a record or sum answer writes through the pointers the caller hands: a record's fields
+/// past its first, then its word, a word field of no name; a sum's values past its index.
 fn written_back(c: Carrier) -> List<FieldTy> =
   match c {
     Whole(_) -> [],
@@ -14810,6 +16191,7 @@ fn written_back(c: Carrier) -> List<FieldTy> =
         kind: KBoxed,
         ty: TyOpen([]),
       }),
+    Cases(sc) -> sum_leaves(sc),
   }
 
 /// The C names of each parameter's carried values, `p<i>`, or a record's `p<i>_<k>` and its word
@@ -14821,6 +16203,10 @@ fn carried_names(params: List<EmitParam>, answer: Carrier) -> List<Bytes> =
         Fields(fs) ->
           acc.concat(range(0, fs.len()).map(|k: Int| field_param(i, k))).push(word_param(i)),
         Whole(_) -> acc.push(b"p".concat(ascii_of_int(i))),
+        Cases(sc) ->
+          acc.push(b"p".concat(ascii_of_int(i))).concat(
+            range(0, sum_leaves(sc).len()).map(|k: Int| field_param(i, k)),
+          ),
       },
       None -> acc,
     }).concat(
