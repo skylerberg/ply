@@ -355,12 +355,14 @@ pub unsafe fn counted(o: *mut Obj, i: usize) -> bool {
     }
 }
 
-/// How a record holds a field: a word, a `Float`'s bits, a 64-bit width's bits (the width's place
-/// in [`ply_eval::INT_TYPES`]), a `Decimal`'s two words, or a record of the shape named in place,
-/// its header and words inside the record's own.
+/// How a record holds a field: a word, an `Int`'s 64 bits (a width below 64 bits is held as the
+/// `Int` it stands for), a `Float`'s bits, a 64-bit width's bits (the width's place in
+/// [`ply_eval::INT_TYPES`]), a `Decimal`'s two words, or a record of the shape named in place, its
+/// header and words inside the record's own.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Slot {
     Word,
+    Int,
     Float,
     Wide(u8),
     Decimal,
@@ -378,10 +380,13 @@ impl Slot {
         }
     }
 
-    /// Whether a field of the slot is a scalar held as its own words: a `Float`, a 64-bit width
-    /// or a `Decimal`.
+    /// Whether a field of the slot is a scalar held as its own words: an `Int`, a `Float`, a
+    /// 64-bit width or a `Decimal`.
     pub fn is_raw(self) -> bool {
-        matches!(self, Slot::Float | Slot::Wide(_) | Slot::Decimal)
+        matches!(
+            self,
+            Slot::Int | Slot::Float | Slot::Wide(_) | Slot::Decimal
+        )
     }
 }
 
@@ -393,6 +398,7 @@ pub const RECORD_SLOT: &str = "!r(";
 /// after its name and `!`, below every byte a name holds, so a shape sorts as its names do.
 pub fn spelled(name: &Symbol, slot: Slot) -> Symbol {
     let spelling = match slot {
+        Slot::Int => "int",
         Slot::Float => "f",
         Slot::Wide(t) if t == ply_eval::IntTy::I64 as u8 => "i64",
         Slot::Wide(_) => "u64",
@@ -406,6 +412,7 @@ pub fn spelled(name: &Symbol, slot: Slot) -> Symbol {
 /// The scalar a field spelled `name!<spelling>` holds as its own words.
 fn raw_of(spelling: &str) -> Option<Slot> {
     match spelling {
+        "int" => Some(Slot::Int),
         "f" => Some(Slot::Float),
         "u64" => Some(Slot::Wide(ply_eval::IntTy::U64 as u8)),
         "i64" => Some(Slot::Wide(ply_eval::IntTy::I64 as u8)),
@@ -429,6 +436,7 @@ pub unsafe fn decimal_at(o: *mut Obj, at: usize) -> ply_eval::Decimal {
 unsafe fn raw_value(o: *mut Obj, at: usize, slot: Slot) -> Value {
     unsafe {
         match slot {
+            Slot::Int => Value::Int(word_at(o, at) as i64),
             Slot::Float => Value::Float(f64::from_bits(word_at(o, at) as u64)),
             Slot::Wide(t) => Value::Fixed(Fixed::new(
                 ply_eval::INT_TYPES[t as usize],
@@ -443,10 +451,13 @@ unsafe fn raw_value(o: *mut Obj, at: usize, slot: Slot) -> Value {
 }
 
 /// Copies scalar object `w`'s payload into the words of `o` from `at`, and lets `w` go: for an
-/// `Option`, its payload's word with a count of its own, or zero.
+/// `Int`, its 64 bits whether its word holds them or boxes them; for an `Option`, its payload's
+/// word with a count of its own, or zero.
 pub unsafe fn hold_raw(o: *mut Obj, at: usize, slot: Slot, w: Word) {
     unsafe {
-        if slot == Slot::Maybe {
+        if slot == Slot::Int {
+            set_word(o, at, as_int(w).unwrap_or(0) as Word);
+        } else if slot == Slot::Maybe {
             let held = if (*obj(w)).len == 1 {
                 let p = word_at(obj(w), 0);
                 inc(p);
@@ -467,6 +478,7 @@ pub unsafe fn hold_raw(o: *mut Obj, at: usize, slot: Slot, w: Word) {
 /// The raw slot a record or an array holds a scalar object `w` as, where its unit's code reads one so.
 pub fn raw_slot_of(layouts: &Layouts, w: Word) -> Option<Slot> {
     match kind(w) {
+        KIND_INT if layouts.layout.raw_ints => Some(Slot::Int),
         KIND_FLOAT => Some(Slot::Float),
         KIND_FIXED if unsafe { (*obj(w)).len } == 1 => {
             Some(Slot::Wide(unsafe { (*obj(w)).layout } as u8))
@@ -658,7 +670,7 @@ pub unsafe fn part_word(o: *mut Obj, at: usize, slot: Slot) -> Option<Word> {
         match slot {
             Slot::Word => Some(word_at(o, at)),
             Slot::Record(_) => Some(words(o).add(at) as Word),
-            Slot::Float | Slot::Wide(_) | Slot::Decimal | Slot::Maybe => None,
+            Slot::Int | Slot::Float | Slot::Wide(_) | Slot::Decimal | Slot::Maybe => None,
         }
     }
 }
@@ -669,6 +681,7 @@ pub fn field_word(heap: &mut Heap, layouts: &Layouts, o: *mut Obj, at: usize, sl
     let w = unsafe { word_at(o, at) };
     match slot {
         Slot::Maybe => option_word(heap, layouts, w),
+        Slot::Int => heap.boxed_int(w as i64),
         Slot::Float | Slot::Wide(_) | Slot::Decimal => {
             let (kind, layout) = match slot {
                 Slot::Wide(t) => (KIND_FIXED, u32::from(t)),
@@ -790,7 +803,7 @@ impl Shapes {
                     counted.push(at);
                     at += 1;
                 }
-                Slot::Float | Slot::Wide(_) | Slot::Decimal => at += slot.raw_words(),
+                Slot::Int | Slot::Float | Slot::Wide(_) | Slot::Decimal => at += slot.raw_words(),
                 Slot::Maybe => {
                     counted.push(at);
                     at += 1;
@@ -854,6 +867,8 @@ pub struct Layouts {
 /// it the older way.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RecordLayout {
+    /// An `Int` held as its own 64 bits, rather than by its word.
+    pub raw_ints: bool,
     /// A `Decimal` held as its own two words, rather than by its word.
     pub raw_decimals: bool,
     /// A long slice of a bytes value a view of its bytes, rather than a copy of them.
@@ -865,6 +880,7 @@ pub struct RecordLayout {
 impl RecordLayout {
     /// What this runtime's own emitter writes.
     pub const CURRENT: RecordLayout = RecordLayout {
+        raw_ints: true,
         raw_decimals: true,
         bytes_views: true,
         option_words: true,
@@ -1458,7 +1474,7 @@ impl Heap {
     }
 
     /// A record of `fields`, which it takes, in the order of the names: laid out as a record of
-    /// their type is wherever it is made, each `Float` held as its bits and each record in place.
+    /// their type is wherever it is made, each scalar held as its bits and each record in place.
     pub fn record(&mut self, layouts: &Layouts, fields: &[(Symbol, Word)]) -> Word {
         let mut spelled_fields = Vec::with_capacity(fields.len());
         let mut words = Vec::with_capacity(fields.len());
@@ -1482,6 +1498,14 @@ impl Heap {
         }
         let shape = layouts.shape(spelled_fields);
         self.record_of(layouts, shape, &words)
+    }
+
+    /// A record of `shape` holding `words`, which it takes, one per field in the shape's order, each
+    /// as the shape holds that field.
+    pub fn record_shaped(&mut self, layouts: &Layouts, shape: u32, words: &[Word]) -> Word {
+        let slots = layouts.shape_slots(shape);
+        let held: Vec<(Word, Slot)> = words.iter().copied().zip(slots.iter().copied()).collect();
+        self.record_of(layouts, shape, &held)
     }
 
     /// A record of `shape` holding `words`, which it takes, each as its slot says.
@@ -1808,7 +1832,7 @@ impl Heap {
             Value::Unit => unit(),
             Value::Str(s) if u32::try_from(s.len()).is_ok() => self.str(s),
             Value::Bytes(b) if u32::try_from(b.len()).is_ok() => self.bytes(b),
-            // Each `Float` is held as its bits, as a record of its type is wherever it is made.
+            // Each scalar is held as its bits, as a record of its type is wherever it is made.
             // `Fields` iterates sorted, which is the layout's order.
             Value::Record(fields) => {
                 let words: Vec<(Symbol, Word)> = fields
@@ -2751,6 +2775,8 @@ fn read_held(
 ) -> Value {
     unsafe {
         match slot {
+            // A width below 64 bits is held as an `Int`, which only its carry tells apart.
+            Slot::Int => read_int(word_at(o, at) as i64, carry, walked),
             Slot::Float | Slot::Wide(_) | Slot::Decimal => raw_value(o, at, slot),
             Slot::Maybe => {
                 let p = word_at(o, at);
@@ -2790,7 +2816,7 @@ unsafe fn cmp_fields(
         match slot {
             Slot::Word => Some(word_at(o, at)),
             Slot::Record(_) => Some(words(o).add(at) as Word),
-            Slot::Float | Slot::Wide(_) | Slot::Decimal | Slot::Maybe => None,
+            Slot::Int | Slot::Float | Slot::Wide(_) | Slot::Decimal | Slot::Maybe => None,
         }
     };
     let value = |o: *mut Obj, slot: Slot, at: usize| match word(o, slot, at) {
@@ -2825,7 +2851,7 @@ pub fn native_key(layouts: &Layouts, w: Word) -> bool {
             KIND_RECORD | KIND_CTOR | KIND_ARRAY if (*o).flags & RAW != 0 => {
                 layouts.parts(o).into_iter().all(|(at, slot)| match slot {
                     Slot::Decimal => least_scale(decimal_at(o, at)),
-                    Slot::Float | Slot::Wide(_) => true,
+                    Slot::Int | Slot::Float | Slot::Wide(_) => true,
                     Slot::Maybe => {
                         let p = word_at(o, at);
                         p == 0 || native_key(layouts, p)

@@ -1,7 +1,7 @@
 //! The compiled array: its elements laid out in the object's own payload, so an index is a load.
-//! An array of records, `Float`s, 64-bit widths or `Decimal`s holds each in place, as field `e` of
-//! a run of one-field records: `layout` names that record's shape and `aux` its words, the array's
-//! stride, and the bitmap after the words says which of them it counts.
+//! An array of records or of scalars holds each in place, as field `e` of a run of one-field
+//! records: `layout` names that record's shape and `aux` its words, the array's stride, and the
+//! bitmap after the words says which of them it counts.
 
 use crate::heap::{
     self, FLAT, Heap, KIND_ARRAY, KIND_RECORD, Layouts, MIXED, Obj, RAW, Slot, Word, counted, dec,

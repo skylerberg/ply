@@ -1859,10 +1859,10 @@ fn push_deferred(emitter: Emitter, d: Deferred) -> Emitter =
     leaves: emitter.leaves,
   }
 
-/// Whether a record holds a value of `kind` as its own words rather than as a word: a `Float`, a
-/// 64-bit width or a `Decimal`.
+/// Whether a record holds a value of `kind` as its own words rather than as a word: an `Int`, a
+/// width, a `Float` or a `Decimal`. A width below 64 bits is held as the `Int` it stands for.
 fn raw_slot(kind: Kind) -> Bool =
-  match kind { KFloat -> true, KDec -> true, KNum(w) -> !in_imm(w), _ -> false }
+  match kind { KInt -> true, KFloat -> true, KDec -> true, KNum(_) -> true, _ -> false }
 
 /// The kind a slot holding a value of `kind` as a word reads as: an `Option` its payload's word.
 fn word_kind(kind: Kind) -> Kind = if kind == KSum(Zeroed) { KSum(Zeroed) } else { KBoxed }
@@ -1874,6 +1874,7 @@ fn raw_words(kind: Kind) -> Int = match kind { KDec -> 2, _ -> 1 }
 /// word, or for a `Decimal` the local holding its two, which `cells_of` writes apart.
 fn raw_word(value: CValue) -> Bytes =
   match value.kind {
+    KInt -> Bytes::concat_all([b"(Word)(", value.expr, b")"]),
     KNum(_) -> Bytes::concat_all([b"(Word)(", value.expr, b")"]),
     KDec -> value.expr,
     _ -> Bytes::concat_all([b"ply_f64_bits(", as_float(value), b")"]),
@@ -1884,10 +1885,23 @@ fn raw_word(value: CValue) -> Bytes =
 fn held_word(value: CValue) -> Bytes =
   if value.kind == KSum(Zeroed) { value.expr } else { as_word(value) }
 
+/// The word a record holds `value` in as a field of kind `kind`: its bits read at that kind where
+/// `raw_slot` holds of it, whatever kind the value is held at, and its word otherwise.
+fn field_word(value: CValue, kind: Kind) -> Bytes =
+  if !raw_slot(kind) { held_word(value) }
+  else if value.kind == kind || kind == KDec { raw_word(value) } else {
+    match kind {
+      KInt -> Bytes::concat_all([b"(Word)(", as_int(value), b")"]),
+      KNum(w) -> Bytes::concat_all([b"(Word)(", as_num(value, w), b")"]),
+      _ -> Bytes::concat_all([b"ply_f64_bits(", as_float(value), b")"]),
+    }
+  }
+
 /// The field of `kind` that `base` holds as its own words from word `at` on, read as the kind.
 fn raw_at(base: Bytes, at: Bytes, kind: Kind) -> Bytes = {
   let word = Bytes::concat_all([b"ply_words(", base, b")[", at, b"]"]);
   match kind {
+    KInt -> Bytes::concat_all([b"(int64_t)(", word, b")"]),
     KNum(w) -> Bytes::concat_all([b"(", ctype(KNum(w)), b")(", word, b")"]),
     KDec -> Bytes::concat_all([b"ply_dec_at(", base, b", ", at, b")"]),
     _ -> Bytes::concat_all([b"ply_f64(", word, b")"]),
@@ -1905,6 +1919,8 @@ fn raw_store(base: Bytes, at: Bytes, value: CValue, kind: Kind) -> Bytes =
 /// `value` held at `kind`, a kind `raw_slot` holds of, in a register: a `Decimal` in a local.
 fn held_raw(emitter: Emitter, value: CValue, kind: Kind) -> WithValue =
   match kind {
+    KInt -> if value.kind == KInt { { emitter: emitter, value: value } }
+    else { bind(emitter, KInt, as_int(value)) },
     KNum(w) -> if value.kind == kind { { emitter: emitter, value: value } }
     else { bind(emitter, kind, as_num(value, w)) },
     KDec -> if value.kind == KDec && is_local(value.expr) { { emitter: emitter, value: value } }
@@ -1951,25 +1967,26 @@ fn laid_of(fs: List<FieldTy>) -> Laid = {
   }
 }
 
-/// A field as a shape spells it: a `Float` held as its bits after its name, and a record held in
-/// place after its name with its own shape's fields, both below every byte a name holds so a shape
-/// sorts as its names do.
+/// A field as a shape spells it: a scalar held as its bits after its name, a width below 64 bits as
+/// the `Int` it stands for, and a record held in place after its name with its own shape's fields,
+/// all below every byte a name holds so a shape sorts as its names do.
 pub fn spelled_field(f: FieldTy) -> Bytes =
   match f.ty {
     TyRec(inner) ->
       Bytes::concat_all([f.name, b"!r(", bytes_join(inner.map(spelled_field), b","), b")"]),
     _ -> match f.kind {
+      KInt -> f.name.concat(b"!int"),
       KFloat -> f.name.concat(b"!f"),
       KDec -> f.name.concat(b"!d"),
       KSum(_) -> f.name.concat(b"!m"),
-      KNum(w) -> if raw_slot(f.kind) { f.name.concat(if w.signed { b"!i64" } else { b"!u64" }) }
-      else { f.name },
+      KNum(w) ->
+        f.name.concat(if in_imm(w) { b"!int" } else if w.signed { b"!i64" } else { b"!u64" }),
       _ -> f.name,
     },
   }
 
 /// A record's flags: flat when none of its words holds a count, mixed when its tail says which
-/// do, raw when it holds a `Float`'s bits or a record in place.
+/// do, raw when it holds a scalar's bits or a record in place.
 fn record_flags(fs: List<FieldTy>, l: Laid) -> Int = {
   let raw = if fs.fold(false, |acc: Bool, f: FieldTy|
       acc || raw_slot(f.kind) || f.kind == KSum(Zeroed) || in_place(f) != None) { 4 }
@@ -1983,6 +2000,7 @@ fn leaves_uncounted(fs: List<FieldTy>) -> Bool =
       && (match f.ty {
         TyRec(inner) -> leaves_uncounted(inner),
         _ -> match f.kind {
+          KInt -> true,
           KNum(_) -> true,
           KBool -> true,
           KFloat -> true,
@@ -4663,9 +4681,7 @@ fn fused_fold(
               None -> None,
               Some(lv) -> {
                 let lo = owned(lv.emitter, lv.value);
-                let cnt = line(lo.emitter, Bytes::concat_all([b"ply_inc(", lo.value.expr, b");"]));
-                let raw = bind(cnt, KBoxed, builtin_call_over(b"List::len", [lo.value.expr]));
-                let n = bind(check(raw.emitter), KInt, as_int(raw.value));
+                let n = bind(lo.emitter, KInt, length_of(b"List::len", lo.value.expr));
                 let made = bind(
                   n.emitter,
                   KBoxed,
@@ -4776,12 +4792,7 @@ fn fused_fold(
                 None -> None,
                 Some(lv) -> {
                   let lo = owned(lv.emitter, lv.value);
-                  let cnt = line(
-                    lo.emitter,
-                    Bytes::concat_all([b"ply_inc(", lo.value.expr, b");"]),
-                  );
-                  let raw = bind(cnt, KBoxed, builtin_call_over(b"List::len", [lo.value.expr]));
-                  let n = bind(check(raw.emitter), KInt, as_int(raw.value));
+                  let n = bind(lo.emitter, KInt, length_of(b"List::len", lo.value.expr));
                   // The function value is evaluated once outside the loop, and each iteration hands `rt_call` its own count.
                   // Under release the seed is evaluated before the closure is built: a capture taken at its last use is null afterwards.
                   let ordered = if n.emitter.release {
@@ -4922,9 +4933,7 @@ fn inlined_fold(
           None -> None,
           Some(lv) -> {
             let lo = owned(lv.emitter, lv.value);
-            let cnt = line(lo.emitter, Bytes::concat_all([b"ply_inc(", lo.value.expr, b");"]));
-            let raw = bind(cnt, KBoxed, builtin_call_over(b"List::len", [lo.value.expr]));
-            let n = bind(check(raw.emitter), KInt, as_int(raw.value));
+            let n = bind(lo.emitter, KInt, length_of(b"List::len", lo.value.expr));
             match expr(notail(n.emitter), init, params) {
               None -> None,
               Some(iv) -> {
@@ -5947,8 +5956,8 @@ fn inline_get(
   }
 
 /// Element `i` of array `a`, whose elements are held as a record's field `e` of their type is: a
-/// record in place as the address of its header there, a `Float` or a 64-bit width as its bits,
-/// anything else as its word, each held as the array's element is once read.
+/// record in place as the address of its header there, a scalar as its bits, anything else as its
+/// word, each held as the array's element is once read.
 fn element_read(emitter: Emitter, a: Bytes, i: Bytes, element: FieldTy) -> WithValue = {
   let r = fresh(emitter);
   match element.ty {
@@ -7249,9 +7258,7 @@ fn held_record(emitter: Emitter, fs: List<FieldTy>, vals: List<CValue>, word: By
     names_of(fs),
     range(0, fs.len()).map(|k: Int| {
       let v = nth_value(walked.vals, k);
-      if in_place(nth_field(fs, k)) != None { v.expr }
-      else if raw_slot(v.kind) { raw_word(v) }
-      else { held_word(v) }
+      if in_place(nth_field(fs, k)) != None { v.expr } else { field_word(v, nth_field(fs, k).kind) }
     }),
     fs,
     Some(walked.vals),
@@ -7264,7 +7271,7 @@ fn held_flat(emitter: Emitter, fs: List<FieldTy>, vals: List<CValue>, word: Byte
   build_record(
     emitter,
     names_of(fs),
-    vals.map(|v: CValue| if raw_slot(v.kind) { raw_word(v) } else { held_word(v) }),
+    range(0, fs.len()).map(|k: Int| field_word(nth_value(vals, k), nth_field(fs, k).kind)),
     fs,
     Some(vals),
     word,
@@ -9900,7 +9907,7 @@ fn update_field(acc: Filled, u: UpdateOf, at: Int) -> Filled = {
         // Read at the field's place in the base's shape, which differs from the new record's when the update adds a field.
         Some(f) -> {
           let w = bind_word_of(acc.emitter, field_read(u.base.expr, f));
-          // A base of a known type holds a `Float` or a 64-bit width as its bits.
+          // A base of a known type holds a scalar as its bits.
           if raw_slot(f.kind) {
             let d = bind(w.emitter, f.kind, raw_at(u.base.expr, ascii_of_int(f.at), f.kind));
             if raw_slot(tk) { update_bits(acc, d.emitter, d.value, tk) } else {
@@ -10192,11 +10199,10 @@ fn deferred_cells(
 /// object is remembered to hold.
 fn held_item(o: WithValue, kind: Kind) -> { emitter: Emitter, word: Bytes, val: CValue } =
 
-  // An `Int` is held as its value until the object is made, which boxes one past the word's range;
-  // a record held back and never made then holds no count.
+  // An `Int` is held as its 64 bits, in a register and in the object alike.
   if kind == KInt {
     let b = bind(o.emitter, KInt, as_int(o.value));
-    { emitter: b.emitter, word: as_word(b.value), val: b.value }
+    { emitter: b.emitter, word: raw_word(b.value), val: b.value }
   } else { held_word_of(o, kind) }
 
 fn held_word_of(o: WithValue, kind: Kind) -> { emitter: Emitter, word: Bytes, val: CValue } = {
@@ -12616,22 +12622,21 @@ fn ctor_compared(
   );
   let compared = range(0, vals.len()).fold(opened, |acc: Emitter, k: Int| {
     let v = nth_value(vals, k);
+    // A constructor laid out as words, a generic one's among them, holds every argument as its word.
     let at = match match laid { Some(fs) -> arg_at(fs, k), None -> None } {
       Some(a) -> a,
-      None ->
-        {
-          at: k,
-          kind: if v.kind == KBoxed || is_sum(v.kind) { KBoxed } else { v.kind },
-          ty: TyOpen([]),
-        },
+      None -> { at: k, kind: KBoxed, ty: TyOpen([]) },
     };
     let held = if raw_slot(at.kind) {
       { kind: at.kind, expr: raw_at(xw, ascii_of_int(at.at), at.kind), ty: TyOpen([]) }
     } else { { kind: KBoxed, expr: field_read(xw, at), ty: at.ty } };
     let inside = indent(line(acc, Bytes::concat_all([b"if (", eq.name, b") {"])));
+    // A word held is compared at the argument's own kind, unboxed.
+    let compared_at = if laid == None && v.kind != KBoxed && !is_sum(v.kind) { v.kind }
+    else { at.kind };
     let c = match at.ty {
       TyRec(inner) -> fields_equal(inside, inner, held, v),
-      _ -> field_equal(inside, { name: b"", kind: at.kind, ty: at.ty }, held, v),
+      _ -> field_equal(inside, { name: b"", kind: compared_at, ty: at.ty }, held, v),
     };
     line(
       outdent(
@@ -17272,10 +17277,11 @@ test "a `Decimal` is held in registers as its two words, and in a record or an a
   let out = emit_all_program([{ name: b"m", src: src }], [], [b"Array::get"], true);
   let has = |text: Bytes| out.map(|e: Emitted| e.text.index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None, None, None, None]);
-  // A line holds its price as two words and its count after them: mixed and raw. It crosses a call
-  // as its fields, which an entry handed its word loads and a stack's growth makes it of.
+  // A line holds its price as two words and its count after them, each as its own bits: flat and
+  // raw, as a record of a price alone is. It crosses a call as its fields, which an entry handed its
+  // word loads and a stack's growth makes it of.
   assert_eq(has(b".lo;"), [true, true, true, false, false, false, true]);
-  assert_eq(has(b"@@, 6);"), [true, true, true, false, false, false, false]);
+  assert_eq(has(b"@@, 5);"), [true, true, true, false, false, false, true]);
   // A branch's answer is declared as the struct it is before either arm assigns it.
   assert_eq(has(b" = (PlyDec){0, 0};"), [false, false, false, false, false, true, false]);
   // A price's second word is written after its first, in a line and in a record of a price
@@ -17784,7 +17790,6 @@ fn record_word_lines(
 ) -> Bytes = {
   let l = laid_of(fs);
   let flags = record_flags(fs, l);
-  let held = |v: CValue| if raw_slot(v.kind) { raw_word(v) } else { held_word(v) };
   let let_go = |vs: List<CValue>|
     vs.fold(b"", |t: Bytes, v: CValue|
       if counted(v.kind) { Bytes::concat_all([t, b"ply_dec(ctx, ", v.expr, b"); "]) } else { t });
@@ -17814,7 +17819,7 @@ fn record_word_lines(
         None ->
           {
             at: acc.at + 1,
-            words: acc.words.push(held(nth_value(vals, acc.at))),
+            words: acc.words.push(field_word(nth_value(vals, acc.at), nth_field(fs, i).kind)),
             inner: acc.inner,
           },
       },
@@ -17872,7 +17877,19 @@ fn record_word_lines(
         b", ",
         shape_text(match shapes.at(j + 1) { Some(sh) -> sh, None -> 0 }),
         b");",
-        written(at + 2, put_cells(cells_of(inner, ivals.map(held), [], il, iflags))),
+        written(
+          at + 2,
+          put_cells(
+            cells_of(
+              inner,
+              range(0, inner.len()).map(|k: Int|
+                field_word(nth_value(ivals, k), nth_field(inner, k).kind)),
+              [],
+              il,
+              iflags,
+            ),
+          ),
+        ),
         b" }",
       ])
     }),

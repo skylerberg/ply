@@ -132,7 +132,7 @@ fn everything_read_is_immortal_and_none_of_it_is_the_entrys() {
             }
         }
     }
-    assert!(objects > 800, "the walk reached {objects} objects");
+    assert!(objects > 600, "the walk reached {objects} objects");
 }
 
 #[test]
@@ -607,9 +607,9 @@ fn a_decimal_is_an_object_of_its_own_and_a_record_or_an_array_holds_its_two_word
     assert!(native_key(&l, same));
     let line = record(vec![("price", price.clone()), ("qty", Value::Int(3))]);
     let r = h.to_word(&l, &line);
-    // `price` takes two words, `qty` the third, and a word of bitmap says the third alone counts.
+    // `price` takes two words and `qty` the third, its own 64 bits: none counts, so no bitmap.
     let shape = unsafe { (*obj(r)).layout };
-    assert_eq!(l.shape_words(shape), (3, 1));
+    assert_eq!(l.shape_words(shape), (3, 0));
     assert_eq!(&l.shape_offsets(shape)[..], &[0, 2]);
     assert_eq!(Heap::to_value(&l, r), line);
     let prices = Value::array(vec![decimal("1.5"), decimal("-2.25")]);
@@ -629,6 +629,7 @@ fn a_decimal_is_an_object_of_its_own_and_a_record_or_an_array_holds_its_two_word
         vec![],
         &[],
         RecordLayout {
+            raw_ints: false,
             raw_decimals: false,
             ..RecordLayout::CURRENT
         },
@@ -698,6 +699,7 @@ fn a_record_or_an_array_holds_an_option_as_its_payloads_word() {
         layouts().ctors.clone(),
         &[],
         RecordLayout {
+            raw_ints: false,
             option_words: false,
             ..RecordLayout::CURRENT
         },
