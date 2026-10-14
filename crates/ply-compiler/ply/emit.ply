@@ -11423,18 +11423,19 @@ pub fn specialisation_of(
     }
   }
 
-/// A lambda `specialised_with` spelled as `param=owner:nth`.
+/// A lambda `specialised_with` spelled as `param=owner:nth`. The owner is a root's name, whose
+/// type arguments may hold a `:`, so the lambda's place is what follows the last one.
 fn fn_arg_of(spelled: Bytes) -> Option<FnArg> / {abort.raise} =
   match bytes_index_of(spelled, b"=") {
     None -> None,
     Some(eq) -> {
-      let rest = bytes_slice(spelled, eq + 1, bytes_len(spelled));
-      let parts = bytes_split(rest, b":");
-      if eq == 0 || len(parts) != 2 { None } else {
+      let colon = fold(range(eq + 1, bytes_len(spelled)), 0 - 1, |acc: Int, k: Int|
+        if bytes_at(spelled, k) == 58 { k } else { acc });
+      if eq == 0 || colon < 0 || colon + 1 >= bytes_len(spelled) { None } else {
         Some({
           param: digits(bytes_slice(spelled, 0, eq)),
-          owner: at(parts, 0),
-          nth: digits(at(parts, 1)),
+          owner: bytes_slice(spelled, eq + 1, colon),
+          nth: digits(bytes_slice(spelled, colon + 1, bytes_len(spelled))),
         })
       }
     },
@@ -11877,6 +11878,54 @@ fn witnessed_needs(
     },
   }
 
+/// What a root of `def`, named `full`, at `args` reads its definition as: the body with each
+/// operator whose witness is a parameter held as one numeric type alone done as that type's own,
+/// the operand sites the checker filed at the definition's variables read at the types `args`
+/// give them, and the signature at `args`.
+fn definition_at(
+  full: Bytes,
+  def: FnDef,
+  args: List<Type>,
+  schemes: Map<Bytes, Scheme>,
+  ops: List<WitnessOp>,
+  operands: Map<Bytes, Bytes>,
+) -> { body: Expr, operands: Map<Bytes, Bytes>, sig: Option<Sig> } = {
+  let scheme = map_get(schemes, full);
+  let numbering = match scheme { Some(sc) -> generics_numbered(def, sc), None -> map_new() };
+  // The type a witnessed parameter is at, where its argument is held as one numeric type alone.
+  let numeric = |param: Bytes|
+    match map_get(numbering, param) {
+      Some(i) -> match list_at(args, i) { Some(t) -> numeric_named(t), None -> None },
+      None -> None,
+    };
+  let concrete = map_fold(numbering, map_new(), |acc: Map<Bytes, Bool>, param: Bytes, _: Int|
+    if numeric(param) == None { acc } else { map_insert(acc, witness_param(param), true) });
+  // An operand the checker filed at a variable of the definition is read as the type it is at.
+  let at_args = map_fold(operands, operands, |acc: Map<Bytes, Bytes>, k: Bytes, name: Bytes|
+    if bytes_len(name) < 2 || bytes_at(name, 0) != 39 { acc } else {
+      match list_at(args, digits(bytes_slice(name, 1, bytes_len(name)))) {
+        Some(t) -> if held_apart(t) { match t { TyCon(c) -> map_insert(acc, k, c.name), _ -> acc } }
+        else { acc },
+        None -> acc,
+      }
+    });
+  {
+    body: map_expr(def.body, |e: Expr| unwitnessed(e, |w: Bytes| map_contains(concrete, w))),
+    operands: fold(ops, at_args, |acc: Map<Bytes, Bytes>, o: WitnessOp|
+      if o.owner != full { acc } else {
+        match numeric(o.param) { Some(n) -> map_insert(acc, span_key(o.span), n), None -> acc }
+      }),
+    sig: match sig_of(schemes, full) {
+      Some(s) ->
+        Some({
+          params: map(s.params, |t: Type| substituted(t, args)),
+          ret: substituted(s.ret, args),
+        }),
+      None -> None,
+    },
+  }
+}
+
 /// `def` emitted at `args`: its parameters and sites read at them, and each operator whose witness
 /// is a parameter now held as one numeric type alone done as that type's own.
 fn specialised_emitted(
@@ -11898,38 +11947,10 @@ fn specialised_emitted(
   typed: Map<Bytes, Typed>,
 ) -> Emitted / {abort.raise} = {
   let full = qualify(module, def.name.name);
-  let scheme = map_get(schemes, full);
-  let numbering = match scheme { Some(sc) -> generics_numbered(def, sc), None -> map_new() };
-  // The type a witnessed parameter is at, where its argument is held as one numeric type alone.
-  let numeric = |param: Bytes|
-    match map_get(numbering, param) {
-      Some(i) -> match list_at(args, i) { Some(t) -> numeric_named(t), None -> None },
-      None -> None,
-    };
-  let concrete = map_fold(numbering, map_new(), |acc: Map<Bytes, Bool>, param: Bytes, _: Int|
-    if numeric(param) == None { acc } else { map_insert(acc, witness_param(param), true) });
-  let body = map_expr(def.body, |e: Expr| unwitnessed(e, |w: Bytes| map_contains(concrete, w)));
-  // An operand the checker filed at a variable of the definition is read as the type it is at.
-  let at_args = map_fold(operands, operands, |acc: Map<Bytes, Bytes>, k: Bytes, name: Bytes|
-    if bytes_len(name) < 2 || bytes_at(name, 0) != 39 { acc } else {
-      match list_at(args, digits(bytes_slice(name, 1, bytes_len(name)))) {
-        Some(t) -> if held_apart(t) { match t { TyCon(c) -> map_insert(acc, k, c.name), _ -> acc } }
-        else { acc },
-        None -> acc,
-      }
-    });
-  let settled = fold(ops, at_args, |acc: Map<Bytes, Bytes>, o: WitnessOp|
-    if o.owner != full { acc } else {
-      match numeric(o.param) { Some(n) -> map_insert(acc, span_key(o.span), n), None -> acc }
-    });
-  let sig = match sig_of(schemes, full) {
-    Some(s) ->
-      Some({
-        params: map(s.params, |t: Type| substituted(t, args)),
-        ret: substituted(s.ret, args),
-      }),
-    None -> None,
-  };
+  let source = definition_at(full, def, args, schemes, ops, operands);
+  let body = source.body;
+  let settled = source.operands;
+  let sig = source.sig;
   let names = map(def.params, |param: Param| param.name.name);
   let kinds = map(param_kinds(def, sig), |k: { kind: Kind, ty: Ty }| Some(k));
   let labels = map(def.generics.labels, |ident: Ident| ident.name);
@@ -13560,6 +13581,41 @@ test "a lambda handed to a definition that calls it is run in place by the root 
   }
 }
 
+test "a definition at type arguments that are all known lends its lambdas as a plain one does" {
+  let src = bytes_concat_all([
+    b"fn some<a>(xs: List<a>, f: (a) -> Bool, i: Int) -> Bool = match list_at(xs, i) { Some(x) -> if f(x) { true } else { some(xs, f, i + 1) }, None -> false }\n",
+    b"fn holds<a>(xs: List<a>, x: a) -> Bool = some(xs, |y: a| y == x, 0)\n",
+    b"fn has_three(xs: List<Int>) -> Bool = holds(xs, 3)\n",
+  ]);
+  let int = TyCon({ name: b"Int", args: [] });
+  let holds = specialised(b"m.holds", [int]);
+  let lent = [{ param: 1, owner: holds, nth: 0 }];
+  let some = specialised_with(b"m.some", [int], lent);
+  // A root's name reads back with its lambda's owner whole, type arguments and all.
+  assert_eq(specialisation_of(some), Some({ base: b"m.some", args: [int], fns: lent }));
+  let answers = answers_of([b"m"], [src], [b"Some", b"None"], [b"m.has_three", holds, some]);
+  let body = |name: Bytes|
+    match fold(answers, None, |acc: Option<RootAnswer>, a: RootAnswer|
+        if a.name == name { Some(a) } else { acc }) {
+      Some(a) -> match a.answer { Body(b) -> b, Refused(r) -> panic(string_of_bytes_lossy(r.why)) },
+      None -> panic("no answer"),
+    };
+  // `holds` at `Int` hands `some` its lambda, and `some` runs it in its loop.
+  assert_eq(map(body(holds).tables.generics.calls, |g: GenericCall| g.fns), [lent]);
+  assert(bytes_index_of(own_code(body(some).text), b"rt_call_p") == None, None);
+  assert(bytes_index_of(own_code(body(some).text), b"rt_equal_p") == None, None);
+  assert(bytes_index_of(own_code(body(some).text), b"ply_loop") != None, None);
+  // Asked for alone, `some` still reads the lambda's operator at the type its owner is at.
+  assert_eq(
+    map(answers_of([b"m"], [src], [b"Some", b"None"], [some]), |a: RootAnswer|
+      match a.answer {
+        Body(b) -> own_code(b.text),
+        Refused(r) -> panic(string_of_bytes_lossy(r.why)),
+      }),
+    [own_code(body(some).text)],
+  )
+}
+
 test "a body that hands a lambda on is the same wherever its definition stands, and so are the roots it names" {
   let lent = [{ param: 1, owner: b"m.scaled", nth: 0 }];
   let wanted = [
@@ -14169,14 +14225,21 @@ fn fn_args(
     })
 }
 
-/// Whether the root being emitted is a definition as it stands, of no type variable: one a
-/// lambda of can be read again where another root runs it.
+/// Whether a lambda of the root being emitted can be read again where another root runs it: the
+/// root is a definition of no type variable as it stands, or one at type arguments that are all
+/// known and that runs no lambda of another root itself. Its sites then name no variable.
 fn lends_lambdas(emitter: Emitter) -> Bool / {abort.raise} =
-  specialisation_of(emitter.owner) == None && bytes_index_of(emitter.owner, b"#") == None
-    && (match fold(emitter.here, None, |acc: Option<Def>, d: Def|
-        if qualify(emitter.module, d.name) == emitter.owner { Some(d) } else { acc }) {
-      Some(d) -> match d.scheme { Some(sc) -> len(sc.ty_vars) == 0, None -> true },
-      None -> false,
+  bytes_index_of(emitter.owner, b"#") == None
+    && (match specialisation_of(emitter.owner) {
+      Some(s) ->
+        len(s.fns) == 0 && bytes_index_of(emitter.owner, b"|") == None
+          && fold(s.args, true, |known: Bool, a: Type|
+            known && a != unknown_type() && !has_vars(a)),
+      None -> match fold(emitter.here, None, |acc: Option<Def>, d: Def|
+          if qualify(emitter.module, d.name) == emitter.owner { Some(d) } else { acc }) {
+        Some(d) -> match d.scheme { Some(sc) -> len(sc.ty_vars) == 0, None -> true },
+        None -> false,
+      },
     })
 
 /// The type arguments the checker gave a reference of a generic definition at `at`; none where it
@@ -15087,7 +15150,7 @@ fn emit_program(
                   fold(
                     match specialisation_of(root) { Some(s) -> s.fns, None -> [] },
                     map_insert(acc, own_definition(root), true),
-                    |r: Map<Bytes, Bool>, f: FnArg| map_insert(r, f.owner, true),
+                    |r: Map<Bytes, Bool>, f: FnArg| map_insert(r, own_definition(f.owner), true),
                   )),
               ),
           };
@@ -15120,12 +15183,17 @@ fn emit_program(
               let defs_of = |path: Bytes|
                 fold(program, [], |acc: List<Def>, md: ModuleDefs|
                   if md.module == path { md.defs } else { acc });
-              // A lambda a specialisation runs: read again where its owner, a plain definition, lowers it.
+              // A lambda a specialisation runs: read again where its owner lowers it, a definition
+              // as it stands or at the type arguments the owner's name gives.
               let lambda_at = |owner: Bytes, nth: Int| {
-                let dot = fold(range(0, bytes_len(owner)), 0 - 1, |acc: Int, k: Int|
-                  if bytes_at(owner, k) == 46 { k } else { acc });
-                let module = bytes_slice(owner, 0, if dot < 0 { 0 } else { dot });
-                let short = bytes_slice(owner, dot + 1, bytes_len(owner));
+                let of = match specialisation_of(owner) {
+                  Some(s) -> { base: s.base, args: s.args, lends: len(s.fns) == 0 },
+                  None -> { base: owner, args: [], lends: true },
+                };
+                let dot = fold(range(0, bytes_len(of.base)), 0 - 1, |acc: Int, k: Int|
+                  if bytes_at(of.base, k) == 46 { k } else { acc });
+                let module = bytes_slice(of.base, 0, if dot < 0 { 0 } else { dot });
+                let short = bytes_slice(of.base, dot + 1, bytes_len(of.base));
                 match fold(range(0, len(mods)), None, |acc: Option<Int>, k: Int|
                     match acc {
                       Some(_) -> acc,
@@ -15136,40 +15204,56 @@ fn emit_program(
                     let m = at(mods, i);
                     match fold(m.module.items, None, |acc: Option<FnDef>, item: Item|
                         match item {
-                          IFn(d) -> if d.name.name == short { Some(d) } else { acc },
+                          IFn(d) -> if d.name.name == short && of.lends { Some(d) } else { acc },
                           _ -> acc,
                         }) {
                       None -> None,
-                      Some(d) -> match lower_to_emit(
-                          map(d.params, |param: Param| param.name.name),
-                          map(d.generics.labels, |ident: Ident| ident.name),
-                          sites_in(facts.label_sites, i),
-                          d.body,
-                        ) {
-                        None -> None,
-                        Some(l) -> match list_at(lambdas_of(l.code), nth) {
+                      Some(d) -> {
+                        let source = definition_at(
+                          of.base,
+                          d,
+                          of.args,
+                          schemes,
+                          filter(facts.elaboration.ops, |o: WitnessOp| o.module == i),
+                          operands_in(facts.operands, i),
+                        );
+                        match lower_to_emit(
+                            map(d.params, |param: Param| param.name.name),
+                            map(d.generics.labels, |ident: Ident| ident.name),
+                            sites_in(facts.label_sites, i),
+                            source.body,
+                          ) {
                           None -> None,
-                          Some(code) ->
-                            Some({
-                              owner: owner,
-                              nth: nth,
-                              code: code,
-                              module: m.name,
-                              here: defs_in(m.name, m.module, pure, schemes),
-                              imports: resolved_imports(
-                                x.r,
-                                i,
-                                mods,
-                                m.module,
-                                defs_of,
-                                filter(facts.elaboration.members, |s: MemberSite| s.module == i),
-                              ),
-                              effects: effects_in(x.r, i, mods),
-                              typed: typed_in(facts, i),
-                              operands: operands_in(facts.operands, i),
-                              base: d.span.start,
-                            }),
-                        },
+                          Some(l) -> match list_at(lambdas_of(l.code), nth) {
+                            None -> None,
+                            Some(code) ->
+                              Some({
+                                owner: owner,
+                                nth: nth,
+                                code: code,
+                                module: m.name,
+                                here: defs_in(m.name, m.module, pure, schemes),
+                                imports: resolved_imports(
+                                  x.r,
+                                  i,
+                                  mods,
+                                  m.module,
+                                  defs_of,
+                                  filter(facts.elaboration.members, |s: MemberSite| s.module == i),
+                                ),
+                                effects: effects_in(x.r, i, mods),
+                                // Typed with its owner's whole body, which is what types its captures.
+                                typed: node_types(
+                                  if len(of.args) == 0 { typed_in(facts, i) }
+                                  else { typed_at(typed_in(facts, i), of.args) },
+                                  param_types(d, source.sig),
+                                  l.code,
+                                ),
+                                operands: source.operands,
+                                base: d.span.start,
+                              }),
+                          },
+                        }
                       },
                     }
                   },
