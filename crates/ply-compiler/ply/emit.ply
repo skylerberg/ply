@@ -5430,7 +5430,22 @@ fn width_builtin(
   span: Span,
   at: Span,
 ) -> Option<WithValue> / {abort.raise} =
-  if (is_wrap(name) || is_saturating(name) || is_checked(name)) && args.len() == width_arity(name) {
+  if (name == b"compare" || name == b"compare_values") && args.len() == 2
+      && ordered_at(emitter, at) != None {
+    match args_evaled(emitter, args, params, 0, []) {
+      None -> None,
+      Some(e0) ->
+        Some(
+          compared_order(
+            site(e0.emitter, span),
+            ordered_at(emitter, at),
+            nth_value(e0.vals, 0),
+            nth_value(e0.vals, 1),
+          ),
+        ),
+    }
+  } else if (is_wrap(name) || is_saturating(name) || is_checked(name))
+      && args.len() == width_arity(name) {
     let emitter = operand_needed(emitter, at);
     match operand_at(emitter, at) {
       None -> Some(unsettled_operator(emitter, name)),
@@ -12937,6 +12952,144 @@ fn field_equal(emitter: Emitter, f: FieldTy, a: CValue, b: CValue) -> WithValue 
     },
   }
 
+/// How `compare` orders two values of the type the checker settled its reference at `at` at, where
+/// the type is one C orders: a number, a character, or a string or byte string by its bytes.
+fn ordered_at(emitter: Emitter, at: Span) -> Option<Bytes> =
+  match emitter.typed.get(span_key(at)) {
+    Some(t) -> match t.args.at(0) {
+      Some(TyCon(c)) -> if c.args.len() > 0 { None }
+      else if c.name == b"Int" || c.name == b"Char" || c.name == b"Decimal" || c.name == b"String"
+          || c.name == b"Bytes" { Some(c.name) } else {
+        match width_named(c.name) {
+          Some(w) -> if carried(w) { Some(c.name) } else { None },
+          None -> None,
+        }
+      },
+      _ -> None,
+    },
+    None -> None,
+  }
+
+/// The `Ordering` of `a` and `b`, values of the type `t` names, as the evaluator orders them: a
+/// `Decimal` by its value, a string by its bytes; the constructor's own word, which no count holds.
+fn compared_order(
+  emitter: Emitter,
+  t: Option<Bytes>,
+  a: CValue,
+  b: CValue,
+) -> WithValue / {abort.raise} = {
+  let name = t.unwrap_or(b"");
+  let o = if name == b"String" || name == b"Bytes" {
+    let x = bind(emitter, KBoxed, as_word(a));
+    let y = bind(x.emitter, KBoxed, as_word(b));
+    bytes_order(y.emitter, x.value.expr, y.value.expr)
+  } else if name == b"Decimal" {
+    let x = held_raw(emitter, a, KDec);
+    let y = held_raw(x.emitter, b, KDec);
+    let c = bind(
+      y.emitter,
+      KInt,
+      Bytes::concat_all([
+        b"rt_decimal_compare_p(ctx, ",
+        x.value.expr,
+        b".lo, ",
+        x.value.expr,
+        b".hi, ",
+        y.value.expr,
+        b".lo, ",
+        y.value.expr,
+        b".hi)",
+      ]),
+    );
+    { emitter: c.emitter, expr: c.value.expr }
+  } else if name == b"Char" { signed_order(emitter, as_word(a), as_word(b)) }
+  else if name == b"Int" { signed_order(emitter, as_int(a), as_int(b)) } else {
+    match width_named(name) {
+      Some(w) -> signed_order(emitter, as_num(a, w), as_num(b, w)),
+      None -> signed_order(emitter, as_int(a), as_int(b)),
+    }
+  };
+  let tag = |ctor: Bytes|
+    match tag_of(o.emitter, ctor) { Some(i) -> tag_text(o.emitter, i), None -> b"0" };
+  bind(
+    o.emitter,
+    KBoxed,
+    Bytes::concat_all([
+      b"rt_ctor_value_p(ctx, ",
+      o.expr,
+      b" < 0 ? ",
+      tag(b"Less"),
+      b" : ",
+      o.expr,
+      b" == 0 ? ",
+      tag(b"Equal"),
+      b" : ",
+      tag(b"Greater"),
+      b")",
+    ]),
+  )
+}
+
+/// A local holding below zero, zero or above zero as `x` and `y`, C values of one ordered type,
+/// order.
+fn signed_order(emitter: Emitter, x: Bytes, y: Bytes) -> { emitter: Emitter, expr: Bytes } = {
+  let o = bind(
+    emitter,
+    KInt,
+    Bytes::concat_all([b"(int64_t)((", x, b") > (", y, b")) - (int64_t)((", x, b") < (", y, b"))"]),
+  );
+  { emitter: o.emitter, expr: o.value.expr }
+}
+
+/// A local holding below zero, zero or above zero as the strings or byte strings `x` and `y`
+/// order: by their bytes from the first, and where one begins the other, by their lengths.
+fn bytes_order(emitter: Emitter, x: Bytes, y: Bytes) -> { emitter: Emitter, expr: Bytes } = {
+  let lx = bind(emitter, KInt, Bytes::concat_all([b"(int64_t)ply_obj(", x, b")->len"]));
+  let ly = bind(lx.emitter, KInt, Bytes::concat_all([b"(int64_t)ply_obj(", y, b")->len"]));
+  let a = lx.value.expr;
+  let b = ly.value.expr;
+  let o = bind(
+    ly.emitter,
+    KInt,
+    Bytes::concat_all([
+      b"(int64_t)memcmp(ply_bytes(",
+      x,
+      b"), ply_bytes(",
+      y,
+      b"), (size_t)(",
+      a,
+      b" < ",
+      b,
+      b" ? ",
+      a,
+      b" : ",
+      b,
+      b"))",
+    ]),
+  );
+  {
+    emitter: line(
+      o.emitter,
+      Bytes::concat_all([
+        b"if (",
+        o.value.expr,
+        b" == 0) ",
+        o.value.expr,
+        b" = (",
+        a,
+        b" > ",
+        b,
+        b") - (",
+        a,
+        b" < ",
+        b,
+        b");",
+      ]),
+    ),
+    expr: o.value.expr,
+  }
+}
+
 /// Whether the strings or byte strings `x` and `y` hold the same bytes, read where they lie.
 fn bytes_equal(x: Bytes, y: Bytes) -> Bytes =
   Bytes::concat_all([
@@ -16779,6 +16932,28 @@ test "a record holding a small record in place crosses a call as its leaves and 
       ],
     },
   ])
+}
+
+test "compare at a number, a character or a string orders in C and answers its constructor" {
+  let src = Bytes::concat_all([
+    b"fn by_name(a: Bytes, b: Bytes) -> Bool = compare(a, b) == Less\n",
+    b"fn by_int(a: Int, b: Int) -> Ordering = compare(a, b)\n",
+    b"fn by_text(a: String, b: String) -> Ordering = compare_values(a, b)\n",
+    b"fn by_list(a: List<Int>, b: List<Int>) -> Ordering = compare(a, b)\n",
+  ]);
+  let out = emit_all_program(
+    [{ name: b"m", src: src }],
+    [b"Less", b"Equal", b"Greater"],
+    [b"compare", b"compare_values"],
+    true,
+  );
+  let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
+  assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None]);
+  // Only a list, which the runtime orders, is handed to it; the rest answer the constructor the
+  // order names, a word no count holds.
+  assert_eq(has(b"builtin_compare"), [false, false, false, true]);
+  assert_eq(has(b"rt_ctor_value_p(ctx, "), [true, true, true, false]);
+  assert_eq(has(b"memcmp(ply_bytes("), [true, false, true, false])
 }
 
 test "a `Decimal` is held in registers as its two words, and in a record or an array as them" {
