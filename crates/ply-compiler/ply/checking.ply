@@ -12,7 +12,7 @@ import std.fs
 import std.fs (fs)
 import memo
 import memo (memo, memo_keep, Held, Query, Record, Run, Tally, answer, nothing_held, over_held,
-             ran_total, ran_for, started, tallies)
+             ran_total, ran_for, restored_for, started, tallies)
 import memo_files
 import unit (definition_hash)
 import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, ShippedModule,
@@ -3727,11 +3727,14 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
         let times = ran.fold(Map::new(), |acc: Map<Bytes, Int>, k: Bytes|
           acc.insert(k, match acc.get(k) { Some(n) -> n + 1, None -> 1 }));
         let moved = sorted_bytes(now.keys().filter(|k: Bytes| was.get(k) != now.get(k)));
+        // A record taken back from before an edit undone moves its answer with no body run.
+        let back = restored_for(warm.run, query).filter(|k: Bytes|
+          moved.contains(k) && !times.contains(k));
         let thrice = sorted_bytes(
           times.fold([], |acc: List<Bytes>, k: Bytes, n: Int|
             if n > 2 { acc.push(k) } else { acc }),
         );
-        if moved != sorted_bytes(times.keys()) || thrice != [] {
+        if moved != sorted_bytes(times.keys().concat(back)) || thrice != [] {
           Some(
             Bytes::concat_all([
               b": moved ",
@@ -4778,7 +4781,7 @@ test "adding an unrelated effect keeps an answer through the store the fresh one
 /// Every answer the query `name` kept over a check of a small program, as its body wrote it.
 fn kept_answers(name: Bytes) -> List<Bytes> / {abort.raise} = {
   let held = fixed_over(nothing_held(), layered(b"pub fn step(n: Int) -> Int = n + 1\n"), []).held;
-  held.records.fold([], |acc: List<Bytes>, _key: Bytes, r: Record|
+  memo::current(held).fold([], |acc: List<Bytes>, _key: Bytes, r: Record|
     if r.query != name { acc }
     else { match held.outputs.get(r.output) { Some(out) -> acc.push(out), None -> acc } })
 }
@@ -5128,6 +5131,27 @@ fn paired(base: Bytes, step: Bytes) -> List<Source> =
 /// Each owner the run ran the body of the query `name` for.
 fn owners_ran(run: Run, name: Bytes) -> List<Bytes> / {abort.raise} =
   ran_for(run, name).map(|b: Bytes| decoded(b, owner_named_bin(), "an owner's name").owner)
+
+test "a group that refused and is mended checks nothing again, each record taken back" {
+  let source = |body: Bytes|
+    [
+      {
+        name: b"lib",
+        src: Bytes::concat_all([
+          b"pub fn base(n: Int) -> Int = ",
+          body,
+          b"\n\npub fn over(n: Int) -> Int = base(n) + 1\n\npub fn top(n: Int) -> Int = over(n) * 2\n\n",
+          b"pub fn apart(n: Int) -> Int = n - 1\n",
+        ]),
+      },
+    ];
+  let cold = answered_over(nothing_held(), source(b"n + 1"));
+  let broken = answered_over(cold.held, source(b"n + true"));
+  assert_eq(said(broken.outcome), said(analyse(parse_all(source(b"n + true")))));
+  let mended = answered_over(broken.held, source(b"n + 1"));
+  assert_eq(said(mended.outcome), said(cold.outcome));
+  assert_eq(groups_ran(mended.run, group_query()), [])
+}
 
 test "a unit whose group refuses is hashed without asking its own members' hashes" {
   let keyed = |name: Bytes, statement: Bytes, more: Bytes|
@@ -5511,7 +5535,7 @@ test "the groups a signature edit moves in one module are checked again, and no 
 /// Whether the record `held` keeps of the group `g` took what a check of its whole module offered
 /// through `whole`: such a record reads the definition of the query that offered it.
 fn took_whole(held: Held, g: GroupNamed) -> Bool / {abort.raise} =
-  held.records.fold(false, |found: Bool, _: Bytes, r: memo::Record|
+  memo::current(held).fold(false, |found: Bool, _: Bytes, r: memo::Record|
     found
       || (r.query == group_query() && r.input == bin::encode(g, group_named_bin())
       && r.reads.fold(false, |any: Bool, read: memo::Read|
@@ -5542,7 +5566,7 @@ test "an edit that moves one group of a module checks it alone, and one that mov
 /// Whether the record `held` keeps of `module`'s answer under the query hash `hash` read an entry:
 /// only a check of the module whole, made while it was answered, reads one.
 fn checked_whole_in(held: Held, hash: Bytes, module: Bytes) -> Bool / {abort.raise} =
-  held.records.fold(false, |found: Bool, _: Bytes, r: memo::Record|
+  memo::current(held).fold(false, |found: Bool, _: Bytes, r: memo::Record|
     found
       || (r.query == hash
       && r.input == bin::encode({ module: module, shipped: false, tested: false }, named_bin())
@@ -5584,7 +5608,7 @@ fn leaning(lib: Bytes) -> List<Source> =
 /// Whether `held` keeps a check of a module whole that asked for a group of that module or for an
 /// owner's entry there: a group asks for that check, so the check would wait on what waits on it.
 fn whole_asked_its_own(held: Held) -> Bool / {abort.raise} =
-  held.records.fold(false, |found: Bool, _: Bytes, r: memo::Record|
+  memo::current(held).fold(false, |found: Bool, _: Bytes, r: memo::Record|
     found
       || (r.query == whole_query()
       && {
@@ -5745,7 +5769,7 @@ fn shipped_held(shipped: List<Source>) -> Held / {abort.raise} = {
 fn pack_of(held: Held) -> Map<String, Bytes> / {abort.raise} =
   memo::packed_files({
     ..held,
-    records: held.records.fold(Map::new(), |acc: Map<Bytes, Record>, k: Bytes, r: Record|
+    records: memo::current(held).fold(Map::new(), |acc: Map<Bytes, Record>, k: Bytes, r: Record|
       if shipped_queries().contains(r.query) { acc.insert(k, r) } else { acc }),
   })
 
@@ -5791,7 +5815,7 @@ test "a load fetches a module's read from a pack for what the read offered nothi
     },
   ];
   let held = shipped_held(shipped);
-  let read = held.records.fold(b"", |found: Bytes, _: Bytes, r: Record|
+  let read = memo::current(held).fold(b"", |found: Bytes, _: Bytes, r: Record|
     if r.query == owners_query() { r.output } else { found });
   let user = [{ name: b"main", src: b"import std.many (f0)\npub fn main() -> Int = f0()\n" }];
   let load = fixed_beside(nothing_held(), pack_of(held), user, shipped);
