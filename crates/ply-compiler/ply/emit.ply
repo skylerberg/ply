@@ -3640,7 +3640,7 @@ fn inlined_frame(
           let b = bind(
             acc.emitter,
             KBoxed,
-            bytes_concat_all([b"ply_words(", func.expr, b")[", ascii_of_int(ci + 1), b"]"]),
+            bytes_concat_all([b"ply_words(", func.expr, b")[", ascii_of_int(ci + 2), b"]"]),
           );
           {
             emitter: b.emitter,
@@ -3937,7 +3937,7 @@ fn helper_call(
   args: List<Code>,
   params: List<EmitParam>,
 ) -> Option<WithValue> / {abort.raise} =
-  match args_one_pass(emitter, args, params, 0, []) {
+  match args_carried(emitter, args, params, [], 0, []) {
     None -> None,
     Some(w) -> {
       let o = bind(
@@ -5382,7 +5382,7 @@ fn builtin_call_over(name: Bytes, words: List<Bytes>) -> Bytes / {abort.raise} =
     b")",
   ])
 
-/// Two passes: every argument evaluated, the site stored, then each duplicated; a compiled call interleaves (`args_one_pass`).
+/// Two passes: every argument evaluated, the site stored, then each duplicated; a compiled call interleaves (`args_carried`).
 fn args_owned_at(
   emitter: Emitter,
   codes: List<Code>,
@@ -5440,7 +5440,9 @@ fn builtin_call(emitter: Emitter, name: Bytes, vals: List<CValue>) -> WithValue 
   { emitter: check(o.emitter), value: o.value }
 }
 
-/// Whatever the callee evaluates to, called through the runtime: the callee is duplicated, then each argument as evaluated.
+/// Whatever the callee evaluates to, called: by its type's convention where its node's type holds
+/// a value apart from a word, and through the runtime otherwise. The callee is duplicated, then
+/// each argument as evaluated.
 fn call_value(
   emitter: Emitter,
   func: Code,
@@ -5452,9 +5454,20 @@ fn call_value(
     None -> None,
     Some(f) -> {
       let fo = owned(calling(f.emitter, f.value, params), f.value);
-      match args_one_pass(fo.emitter, args, params, 0, []) {
+      let convention = called_convention(fo.emitter, func, len(args));
+      let typed = typed_convention(convention);
+      match args_carried(
+          fo.emitter,
+          args,
+          params,
+          if typed { map(convention.params, |k: Kind| Whole(k)) } else { [] },
+          0,
+          [],
+        ) {
         None -> None,
-        Some(w) -> {
+        Some(w) -> if typed {
+          Some(called_by_type(w.emitter, fo.value.expr, convention, w.names, span))
+        } else {
           let arr = fresh(w.emitter);
           let e = line(
             arr.emitter,
@@ -5484,6 +5497,98 @@ fn call_value(
       }
     },
   }
+
+/// The call of the closure `f`, of which this scope holds a count, with `names`, its arguments as
+/// `c` holds them: through its typed entry where the closure's own convention is `c`, and
+/// through the runtime, every value made a word, where it is another or no compiled closure.
+fn called_by_type(
+  emitter: Emitter,
+  f: Bytes,
+  c: Convention,
+  names: List<Bytes>,
+  span: Span,
+) -> WithValue = {
+  let r = fresh(emitter);
+  let arr = fresh(r.emitter);
+  let back = fresh(arr.emitter);
+  let n = len(c.params);
+  let word = |j: Int|
+    match match list_at(c.params, j) { Some(k) -> k, None -> KBoxed } {
+      KBoxed -> nth_bytes(names, j),
+      KSum(spec) ->
+        bytes_concat_all([sum_helper(spec, b"take"), b"(ctx, ", nth_bytes(names, j), b")"]),
+      k -> as_word({ kind: k, expr: nth_bytes(names, j), ty: TyOpen([]) }),
+    };
+  let declared = line(
+    site(back.emitter, span),
+    bytes_concat_all([carried_type(c.ret), b" ", r.name, b" = ", zero_of(c.ret), b";"]),
+  );
+  let by_type = line(
+    indent(line(declared, bytes_concat_all([b"if (", called_typed(f, c), b") {"]))),
+    bytes_concat_all([
+      r.name,
+      b" = ((",
+      typed_entry_type(c),
+      b")(intptr_t)",
+      descriptor_of(f),
+      b"[1])(ctx, ",
+      f,
+      fold(range(0, n), b"", |acc: Bytes, j: Int|
+        bytes_concat_all([acc, b", ", nth_bytes(names, j)])),
+      b"); ply_dec(ctx, ",
+      f,
+      b");",
+    ]),
+  );
+  let by_words = line(
+    line(
+      indent(line(outdent(by_type), b"} else {")),
+      bytes_concat_all([
+        b"Word ",
+        arr.name,
+        b"[] = {",
+        if n == 0 { b"0" } else { bytes_join(map(range(0, n), word), b", ") },
+        b"}; Word ",
+        back.name,
+        b" = rt_call_p(ctx, ",
+        f,
+        b", (Word)(intptr_t)",
+        arr.name,
+        b", ",
+        ascii_of_int(n),
+        b");",
+      ]),
+    ),
+    match c.ret {
+      KBoxed -> bytes_concat_all([r.name, b" = ", back.name, b";"]),
+      KSum(spec) ->
+        bytes_concat_all([
+          b"if (!ctx->failed) ",
+          r.name,
+          b" = ",
+          sum_helper(spec, b"open"),
+          b"(ctx, ",
+          back.name,
+          b");",
+        ]),
+      k ->
+        bytes_concat_all([
+          b"if (!ctx->failed) { ",
+          r.name,
+          b" = ",
+          as_kind({ kind: KBoxed, expr: back.name, ty: TyOpen([]) }, k),
+          b"; ply_dec(ctx, ",
+          back.name,
+          b"); }",
+        ]),
+    },
+  );
+  let closed = line(outdent(by_words), b"}");
+  {
+    emitter: check(if counted(c.ret) { note_made(closed, r.name) } else { closed }),
+    value: { kind: c.ret, expr: r.name, ty: TyOpen([]) },
+  }
+}
 
 /// The emitter noting that this body calls the parameter `value` is, where it is one.
 fn calling(emitter: Emitter, value: CValue, params: List<EmitParam>) -> Emitter =
@@ -5558,7 +5663,206 @@ fn ty_at(tys: List<Ty>, j: Int) -> Ty = match list_at(tys, j) { Some(t) -> t, No
 /// `ty` where it says something, else `fallback`.
 fn known_or(ty: Ty, fallback: Ty) -> Ty = match ty { TyOpen(_) -> fallback, _ -> ty }
 
-/// A lambda's C parameters are its captures then its own, all words, none opened at entry.
+/// How a function value takes its arguments and answers where a call knows its type: each held as
+/// `value_kind` holds a value of its type. Two reads of one closure agree on it only where they
+/// agree on the type, so a closure carries its own and a call tests for the one it expects.
+type Convention = { params: List<Kind>, ret: Kind }
+
+/// How a value of `t` crosses a call of a function value: a scalar, and an `Option` or a `Result`
+/// held as its word, as itself; anything else, a type variable's value among them, as its word.
+fn value_kind(t: Type) -> Kind = match carrier_of(t) { Whole(k) -> k, Fields(_) -> KBoxed }
+
+fn words_convention(n: Int) -> Convention =
+  { params: map(range(0, n), |_: Int| KBoxed), ret: KBoxed }
+
+/// The convention of a function value of type `ty` that takes `n` arguments: every value a word
+/// where `ty` is no such function's.
+fn convention_of(ty: Option<Type>, n: Int) -> Convention =
+  match ty {
+    Some(TyFn(f)) -> if len(f.params) != n { words_convention(n) }
+    else { { params: map(f.params, value_kind), ret: value_kind(f.ret) } },
+    _ -> words_convention(n),
+  }
+
+/// The convention of the function value the node `code` is, by its node's type.
+fn called_convention(emitter: Emitter, code: Code, n: Int) -> Convention =
+  convention_of(node_type(emitter, code), n)
+
+/// Whether `c` holds a value apart from a word, which is what a call by it saves.
+fn typed_convention(c: Convention) -> Bool =
+  c.ret != KBoxed || fold(c.params, false, |any: Bool, k: Kind| any || k != KBoxed)
+
+fn kind_spelled(k: Kind) -> Bytes =
+  match k {
+    KBoxed -> b"w",
+    KInt -> b"i",
+    KBool -> b"b",
+    KFloat -> b"f",
+    KDec -> b"d",
+    KSum(Zeroed) -> b"m",
+    KSum(Tagged) -> b"t",
+    KNum(w) -> bytes_concat_all([if w.signed { b"s" } else { b"u" }, ascii_of_int(w.bits)]),
+  }
+
+/// A convention as the C integer a closure's descriptor holds: a digest of how each value is held.
+fn convention_id(c: Convention) -> Bytes =
+  int_lit(root_id(bytes_join(map(push(c.params, c.ret), kind_spelled), b",")))
+
+/// The C type of the entry a closure of convention `c` is called through by its type: the closure,
+/// then each argument.
+fn typed_entry_type(c: Convention) -> Bytes =
+  bytes_concat_all([
+    carried_type(c.ret),
+    b" (*)(PlyCtx *, Word",
+    fold(c.params, b"", |acc: Bytes, k: Kind| bytes_concat_all([acc, b", ", carried_type(k)])),
+    b")",
+  ])
+
+/// The descriptor of the closure `f`, where it has one: the word after its code is the address, as
+/// an immediate, of its convention and typed entry.
+fn descriptor_of(f: Bytes) -> Bytes =
+  bytes_concat_all([b"((const int64_t *)(intptr_t)ply_imm_value(ply_words(", f, b")[1]))"])
+
+/// Whether `f` is a closure compiled code made, whose descriptor says convention `c`.
+fn called_typed(f: Bytes, c: Convention) -> Bytes =
+  bytes_concat_all([
+    b"(!ply_is_imm(",
+    f,
+    b") && ply_obj(",
+    f,
+    b")->kind == 6 && (ply_obj(",
+    f,
+    b")->flags & 16) && ",
+    descriptor_of(f),
+    b"[0] == ",
+    convention_id(c),
+    b")",
+  ])
+
+/// What a lambda `name` of `captures` captures and convention `c` is entered through: the entry
+/// the runtime calls with every value a word, past the closure's descriptor; the entry a call by
+/// its type makes with the closure, which hands the function its captures counted once more; and
+/// the descriptor naming that entry.
+fn lambda_entries(name: Bytes, captures: Int, c: Convention) -> Bytes = {
+  let opened = fold(
+    range(0, len(c.params)),
+    { text: b"", args: [] },
+    |acc: { text: Bytes, args: List<Bytes> }, j: Int| {
+      let arg = bytes_concat_all([b"args[", ascii_of_int(1 + captures + j), b"]"]);
+      let local = bytes_concat(b"a", ascii_of_int(j));
+      match match list_at(c.params, j) { Some(k) -> k, None -> KBoxed } {
+        KBoxed -> { ..acc, args: push(acc.args, arg) },
+        KSum(spec) ->
+          {
+            text: bytes_concat_all([
+              acc.text,
+              b"  ",
+              ctype(KSum(spec)),
+              b" ",
+              local,
+              b" = ",
+              sum_helper(spec, b"open"),
+              b"(ctx, ",
+              arg,
+              b");\n",
+            ]),
+            args: push(acc.args, local),
+          },
+        k ->
+          {
+            text: bytes_concat_all([
+              acc.text,
+              b"  ",
+              ctype(k),
+              b" ",
+              local,
+              b" = ",
+              as_kind({ kind: KBoxed, expr: arg, ty: TyOpen([]) }, k),
+              b"; ply_dec(ctx, ",
+              arg,
+              b");\n",
+            ]),
+            args: push(acc.args, local),
+          },
+      }
+    },
+  );
+  let held = fold(range(0, captures), b"", |acc: Bytes, i: Int|
+    bytes_concat_all([acc, b", args[", ascii_of_int(1 + i), b"]"]));
+  let call = bytes_concat_all([
+    name,
+    b"(ctx",
+    held,
+    fold(opened.args, b"", |acc: Bytes, a: Bytes| bytes_concat_all([acc, b", ", a])),
+    b")",
+  ]);
+  let typed_params = fold(range(0, len(c.params)), b"", |acc: Bytes, j: Int|
+    bytes_concat_all([
+      acc,
+      b", ",
+      carried_type(match list_at(c.params, j) { Some(k) -> k, None -> KBoxed }),
+      b" a",
+      ascii_of_int(j),
+    ]));
+  bytes_concat_all([
+    b"Word ",
+    name,
+    b"_entry(PlyCtx *ctx, const Word *args) {\n",
+    opened.text,
+    match c.ret {
+      KBoxed -> bytes_concat_all([b"  return ", call, b";\n"]),
+      k ->
+        bytes_concat_all([
+          b"  ",
+          ctype(k),
+          b" r = ",
+          call,
+          b";\n  if (ctx->failed) return 0;\n  return ",
+          match k {
+            KSum(spec) -> bytes_concat(sum_helper(spec, b"take"), b"(ctx, r)"),
+            _ -> as_word({ kind: k, expr: b"r", ty: TyOpen([]) }),
+          },
+          b";\n",
+        ]),
+    },
+    b"}\n",
+    carried_type(c.ret),
+    b" ",
+    name,
+    b"_typed(PlyCtx *ctx, Word self",
+    typed_params,
+    b") {\n",
+    fold(range(0, captures), b"", |acc: Bytes, i: Int|
+      bytes_concat_all([
+        acc,
+        b"  Word c",
+        ascii_of_int(i),
+        b" = ply_words(self)[",
+        ascii_of_int(2 + i),
+        b"]; ply_inc(c",
+        ascii_of_int(i),
+        b");\n",
+      ])),
+    b"  return ",
+    name,
+    b"(ctx",
+    fold(range(0, captures), b"", |acc: Bytes, i: Int|
+      bytes_concat_all([acc, b", c", ascii_of_int(i)])),
+    fold(range(0, len(c.params)), b"", |acc: Bytes, j: Int|
+      bytes_concat_all([acc, b", a", ascii_of_int(j)])),
+    b");\n}\n",
+    b"const int64_t ",
+    name,
+    b"_desc[2] = { ",
+    convention_id(c),
+    b", (int64_t)(intptr_t)&",
+    name,
+    b"_typed };\n",
+  ])
+}
+
+/// A lambda's C parameters are its captures, each a word it owns, then its own as its type's
+/// convention holds them; it answers as that convention does.
 /// It continues the unit's tables from its builder and hands additions back; a fresh copy would renumber from zero.
 fn emit_lambda(
   emitter: Emitter,
@@ -5568,6 +5872,11 @@ fn emit_lambda(
 ) -> Option<{ text: Bytes, extra: Bytes, met: List<Bytes>, consts: List<Lit>, shapes: List<List<Bytes>>, fields: List<Bytes>, lambdas: List<Bytes>, calls: List<Bytes>, generics: Generics, performs: List<Bytes>, handles: List<Bytes>, refused: Option<Bytes> }> / {abort.raise} = {
   let n = len(l.captures) + l.params;
   let tys = lambda_param_tys(emitter, l);
+  let convention = convention_of(
+    match map_get(emitter.typed, span_key(l.at)) { Some(t) -> Some(t.ty), None -> None },
+    l.params,
+  );
+  let held_as = |j: Int| match list_at(convention.params, j) { Some(k) -> k, None -> KBoxed };
   let window = fold(
     range(0, l.params),
     fold(range(0, len(l.captures)), [], |acc: List<Unboxed>, i: Int|
@@ -5584,7 +5893,7 @@ fn emit_lambda(
     |acc: List<Unboxed>, j: Int|
       push(acc, {
         slot: j,
-        kind: KBoxed,
+        kind: held_as(j),
         expr: bytes_concat(b"q", ascii_of_int(len(l.captures) + j)),
         ty: ty_at(tys, j),
       }),
@@ -5632,18 +5941,19 @@ fn emit_lambda(
     group: emitter.group,
     operands: emitter.operands,
     typed: emitter.typed,
-    answer: Whole(KBoxed),
+    answer: Whole(convention.ret),
     site_root: emitter.site_root,
     lent: emitter.lent,
     written: emitter.written,
     slices: [],
   };
   let charged = fold(window, start, |acc: Emitter, w: Unboxed|
-    note_bound(note_holder(charge(acc, w.slot, w.expr), w.expr), w.expr));
+    if counted(w.kind) { note_bound(note_holder(charge(acc, w.slot, w.expr), w.expr), w.expr) }
+    else { acc });
   match expr(charged, l.body, []) {
     None -> None,
     Some(o0) -> {
-      let w = returned(o0.emitter, o0.value);
+      let w = answered(o0.emitter, o0.value, Whole(convention.ret));
       let o = { emitter: w.emitter, value: o0.value };
       Some({
         met: o.emitter.called_builtins,
@@ -5661,13 +5971,36 @@ fn emit_lambda(
           b"Word ",
           name,
           b"_entry(PlyCtx *ctx, const Word *args);\n",
-          b"Word ",
+          carried_type(convention.ret),
+          b" ",
           name,
           b"(PlyCtx *ctx",
           fold(range(0, n), b"", |acc: Bytes, i: Int|
-            bytes_concat_all([acc, b", Word q", ascii_of_int(i)])),
+            bytes_concat_all([
+              acc,
+              b", ",
+              if i < len(l.captures) { b"Word" }
+              else { carried_type(held_as(i - len(l.captures))) },
+              b" q",
+              ascii_of_int(i),
+            ])),
           b") {\n",
-          fuel_head(bytes_concat(name, b"_entry"), b"", param_names(b"q", n), Whole(KBoxed)),
+          // A stack grown re-enters through the runtime's entry: the descriptor's place, then words.
+          fuel_head(
+            bytes_concat(name, b"_entry"),
+            b"",
+            fold(range(0, n), [b"0"], |acc: List<Bytes>, i: Int| {
+              let q = bytes_concat(b"q", ascii_of_int(i));
+              push(acc, if i < len(l.captures) { q } else {
+                match held_as(i - len(l.captures)) {
+                  KBoxed -> q,
+                  KSum(spec) -> bytes_concat_all([sum_helper(spec, b"take"), b"(ctx, ", q, b")"]),
+                  k -> as_word({ kind: k, expr: q, ty: TyOpen([]) }),
+                }
+              })
+            }),
+            Whole(convention.ret),
+          ),
           fold(sorted_widths(o.emitter.reuse_widths), b"", |acc: Bytes, w: Int|
             bytes_concat_all([acc, b"  Word tok", ascii_of_int(w), b" = 0;\n"])),
           fold(o.emitter.deferred_locals, b"", |acc: Bytes, r: Bytes|
@@ -5677,14 +6010,7 @@ fn emit_lambda(
           b"  ctx->fuel += 1;\n  return ",
           w.expr,
           b";\n}\n",
-          b"Word ",
-          name,
-          b"_entry(PlyCtx *ctx, const Word *args) {\n  return ",
-          name,
-          b"(ctx",
-          fold(range(0, n), b"", |acc: Bytes, i: Int|
-            bytes_concat_all([acc, b", args[", ascii_of_int(i), b"]"])),
-          b");\n}\n",
+          lambda_entries(name, len(l.captures), convention),
         ]),
       })
     },
@@ -5711,28 +6037,8 @@ fn toks_freeing(widths: List<Int>) -> Bytes =
 /// Where a group member returns: what frees the group's tokens, known once every member is emitted.
 fn toks_mark() -> Bytes = b"/*toks*/"
 
-/// A compiled call's arguments: each duplicated as soon as it is evaluated, unlike a builtin's.
-fn args_one_pass(
-  emitter: Emitter,
-  codes: List<Code>,
-  params: List<EmitParam>,
-  i: Int,
-  acc: List<Bytes>,
-) -> Option<{ emitter: Emitter, names: List<Bytes> }> / {abort.raise} =
-  if i >= len(codes) { Some({ emitter: emitter, names: acc }) } else {
-    match list_at(codes, i) {
-      None -> None,
-      Some(x) -> match expr(notail(emitter), x, params) {
-        None -> None,
-        Some(o) -> {
-          let w = owned(o.emitter, o.value);
-          args_one_pass(w.emitter, codes, params, i + 1, push(acc, w.value.expr))
-        },
-      },
-    }
-  }
-
-/// Each argument as the callee carries it: an owned word, or the value in its own C type.
+/// Each argument as the callee carries it, duplicated as soon as it is evaluated, unlike a
+/// builtin's: an owned word where `carriers` names none for it, or the value in its own C type.
 fn args_carried(
   emitter: Emitter,
   codes: List<Code>,
@@ -6401,15 +6707,18 @@ fn closure_value(
       match emit_lambda(entry.emitter, sub, l, map(w.caps, |c: { name: Bytes, ty: Ty }| c.ty)) {
         None -> None,
         Some(sub_out) -> {
+          // The closure's first capture is its descriptor's address, an immediate no walk reads.
           let arr = fresh(entry.emitter);
           let e = line(
-            arr.emitter,
+            line(arr.emitter, bytes_concat_all([b"extern const int64_t ", sub, b"_desc[2];"])),
             bytes_concat_all([
               b"Word ",
               arr.name,
-              b"[] = {",
-              if len(w.caps) == 0 { b"0" }
-              else { bytes_join(map(w.caps, |c: { name: Bytes, ty: Ty }| c.name), b", ") },
+              b"[] = {ply_imm((int64_t)(intptr_t)",
+              sub,
+              b"_desc)",
+              fold(w.caps, b"", |acc: Bytes, c: { name: Bytes, ty: Ty }|
+                bytes_concat_all([acc, b", ", c.name])),
               b"};",
             ]),
           );
@@ -6471,11 +6780,17 @@ fn closure_value(
               b", (Word)(intptr_t)",
               arr.name,
               b", ",
-              ascii_of_int(len(l.captures)),
+              ascii_of_int(len(l.captures) + 1),
               b")",
             ]),
           );
-          Some({ emitter: check(o.emitter), value: o.value })
+          Some({
+            emitter: line(
+              check(o.emitter),
+              bytes_concat_all([b"ply_obj(", o.value.expr, b")->flags |= 16;"]),
+            ),
+            value: o.value,
+          })
         },
       }
     },
@@ -7601,7 +7916,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                         } else {
                           // `map` and `filter` duplicate the list before the closure is built; the rest evaluate everything first.
                           match if fv.name == b"map" || fv.name == b"filter" {
-                              args_one_pass(emitter, a.args, params, 0, [])
+                              args_carried(emitter, a.args, params, [], 0, [])
                             } else if fv.name == b"map_fold" {
                               args_owned(emitter, a.args, params, 0, [])
                             } else { args_owned_at(emitter, a.args, params, c.span) } {
@@ -7976,7 +8291,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
     NPerform(p) -> match effect_named(emitter, p.effect) {
       None ->
         Some(refused(emitter, bytes_concat(b"an effect this port cannot resolve: ", p.effect))),
-      Some(en) -> match args_one_pass(emitter, p.args, params, 0, []) {
+      Some(en) -> match args_carried(emitter, p.args, params, [], 0, []) {
         None -> None,
         Some(w) -> {
           let global = en.global;
@@ -11198,7 +11513,7 @@ fn group_tail(
   params: List<EmitParam>,
   which: Int,
 ) -> Option<WithValue> / {abort.raise} =
-  match args_one_pass(emitter, args, params, 0, []) {
+  match args_carried(emitter, args, params, [], 0, []) {
     None -> None,
     Some(w) -> {
       let assigned = fold(
@@ -13198,10 +13513,6 @@ fn grown_return(grown: Bytes, answer: Carrier) -> Bytes =
       }
     },
   }
-
-/// The names a prologue still holds its arguments under, before any loop has reassigned them.
-fn param_names(prefix: Bytes, n: Int) -> List<Bytes> =
-  map(range(0, n), |i: Int| bytes_concat(prefix, ascii_of_int(i)))
 
 /// A group's are its case selector and the widest member's parameters.
 fn group_args(width: Int) -> List<Bytes> =
