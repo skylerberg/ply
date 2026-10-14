@@ -1,7 +1,7 @@
 //! Content addressing: a definition's identity is its normalized structure, so a name is never part of it.
 //! A float literal hashes by its IEEE bit pattern.
 
-import parsing (Span, Ident, QName, is_bare, starts_upper, span_bin, dummy_span)
+import parsing (Span, Ident, QName, is_bare, starts_upper, span_bin, dummy_span, span_key)
 import std.bin
 import lexer (widths, wide_decimal, utf8_of)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
@@ -12,7 +12,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, MatchArm,
               HandleClause, ReturnClause, RecField, ETagged, Tagged, Hole, tagged_parser,
-              tagged_filler, NamedArg)
+              tagged_filler, NamedArg, expr_span)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
               Constraint, Deriver, deriver_tag, deriver_text, derivers, constraint_kinds,
@@ -717,7 +717,9 @@ type Bound = { name: Bytes, spot: Spot }
 /// A normalized form with all that hashing it reads besides the node itself left open: what a
 /// reference is written as, an effect's slot in its enumeration, a level a commutable run's order
 /// decides, and each set whose order the bytes of its members decide. Filling the holes writes
-/// the bytes; the walk over the tree, every name resolved, is made once.
+/// the bytes; the walk over the tree, every name resolved, is made once. `Chose` writes nothing:
+/// it is which of the functions a call on a value may be, as written just before it, the check
+/// found it calls, -1 where none is known.
 pub type Piece =
   | Raw(Bytes)
   | Ref(Int)
@@ -726,6 +728,7 @@ pub type Piece =
   | Fields(List<List<Piece>>)
   | Atoms(List<AtomForm>)
   | Run(RunForm)
+  | Chose(Int)
 
 /// A row's atom, and the effect declaration's sketch that orders atoms equal in their bytes.
 pub type AtomForm = { pieces: List<Piece>, tie: Bytes }
@@ -758,9 +761,12 @@ type Encoder = {
   /// `values`; `run` -1 outside every run.
   scope: Spot,
   runs: Int,
+  /// The function each call on a value the check resolved calls, by the call's span.
+  chose: Map<Bytes, Bytes>,
 }
 
-type Finished = { bytes: Bytes, refs: List<Int> }
+/// `chosen` is each `Chose` in the order the bytes write it.
+type Finished = { bytes: Bytes, refs: List<Int>, chosen: List<Int> }
 
 fn no_scope() -> Spot = { run: 0 - 1, member: 0, within: 0 }
 
@@ -775,6 +781,7 @@ fn new_encoder(index: Index, module: Int) -> Encoder =
     label_params: [],
     scope: no_scope(),
     runs: 0,
+    chose: Map::new(),
   }
 
 /// What `encode` writes from a fresh encoder in `module` of `index`.
@@ -782,7 +789,15 @@ fn template_of<| e>(
   index: Index,
   module: Int,
   encode: (Encoder) -> Encoder / e,
-) -> List<Piece> / e = compact(encode(new_encoder(index, module)).out)
+) -> List<Piece> / e = chosen_template(index, module, Map::new(), encode)
+
+/// [`template_of`], each call on a value read as calling what `chose` holds at its span.
+fn chosen_template<| e>(
+  index: Index,
+  module: Int,
+  chose: Map<Bytes, Bytes>,
+  encode: (Encoder) -> Encoder / e,
+) -> List<Piece> / e = compact(encode({ ..new_encoder(index, module), chose: chose }).out)
 
 /// Adjacent bytes joined, so a form holds as many pieces as it has holes.
 fn compact(pieces: List<Piece>) -> List<Piece> = {
@@ -872,16 +887,17 @@ type Fill = {
   seen: Map<Int, Bool>,
   deferred: Option<List<Int>>,
   runs: Map<Int, RunAt>,
+  chosen: List<Int>,
 }
 
 /// `pieces` written as `f` fills them.
 fn filled(pieces: List<Piece>, f: Filling) -> Finished / {abort.raise} = {
   let s = fill_all(
     f,
-    { out: [], refs: [], seen: Map::new(), deferred: None, runs: Map::new() },
+    { out: [], refs: [], seen: Map::new(), deferred: None, runs: Map::new(), chosen: [] },
     pieces,
   );
-  { bytes: Bytes::concat_all(s.out), refs: s.refs }
+  { bytes: Bytes::concat_all(s.out), refs: s.refs, chosen: s.chosen }
 }
 
 fn fill_all(f: Filling, s: Fill, pieces: List<Piece>) -> Fill / {abort.raise} =
@@ -904,9 +920,11 @@ fn level_at(s: Fill, spot: Spot) -> Int / {abort.raise} =
 
 type Written = { fill: Fill, bytes: Bytes }
 
+/// `pieces` written apart, for their bytes to be placed by the caller: what they choose is left
+/// for the caller's own writing of them.
 fn written(f: Filling, s: Fill, pieces: List<Piece>) -> Written / {abort.raise} = {
   let inner = fill_all(f, { ..s, out: [] }, pieces);
-  { fill: { ..inner, out: s.out }, bytes: Bytes::concat_all(inner.out) }
+  { fill: { ..inner, out: s.out, chosen: s.chosen }, bytes: Bytes::concat_all(inner.out) }
 }
 
 fn fill(f: Filling, s: Fill, p: Piece) -> Fill / {abort.raise} =
@@ -943,6 +961,7 @@ fn fill(f: Filling, s: Fill, p: Piece) -> Fill / {abort.raise} =
     },
     Atoms(atoms) -> atoms_filled(f, s, atoms),
     Run(r) -> run_filled(f, s, r),
+    Chose(i) -> { ..s, chosen: s.chosen.push(i) },
   }
 
 type AtomEncoding = { bytes: Bytes, tie: Bytes, held: List<Int> }
@@ -1502,10 +1521,11 @@ fn atom(encoder: Encoder, a: AtomExpr) -> Encoder / {abort.raise} = {
 fn atom_label(atom: AtomExpr) -> Option<Ident> =
   if atom.every { Some({ name: b"*", span: atom.span }) } else { atom.resource }
 
-/// What a call on a value written `.name(..)` may call: `m::f` where it names its function in
-/// full, and otherwise every function `X::name` of a module its own can see, in the order of
-/// their program-wide names. Which of them it is the value's type says, which no hash reads.
-fn on_value(encoder: Encoder, name: Ident) -> Encoder / {abort.raise} =
+/// What a call on a value written `.name(..)` at `at` may call: `m::f` where it names its function
+/// in full, and otherwise every function `X::name` of a module its own can see, in the order of
+/// their program-wide names. Which of them it is the value's type says, which no hash reads: the
+/// check's choice follows, written as nothing.
+fn on_value(encoder: Encoder, at: Span, name: Ident) -> Encoder / {abort.raise} =
   match member_of(name.name) {
     Some(of) ->
       value_ref(put_tag(put_u32(encoder, 1), tag_e_var()), {
@@ -1527,7 +1547,13 @@ fn on_value(encoder: Encoder, name: Ident) -> Encoder / {abort.raise} =
           Greater -> false,
           _ -> true,
         });
-      found.fold(put_u32(put_u32(encoder, 0), found.len()), node_ref)
+      let chosen = match encoder.chose.get(span_key(at)) {
+        Some(callee) ->
+          range(0, found.len()).fold(0 - 1, |acc: Int, i: Int|
+            if acc < 0 && index.nodes.get(found.get(i)).name == callee { i } else { acc }),
+        None -> 0 - 1,
+      };
+      put_piece(found.fold(put_u32(put_u32(encoder, 0), found.len()), node_ref), Chose(chosen))
     },
   }
 
@@ -1535,6 +1561,7 @@ fn on_value(encoder: Encoder, name: Ident) -> Encoder / {abort.raise} =
 /// labels, the arguments, those given by name, and every function the call may be.
 fn called_on(
   encoder: Encoder,
+  at: Span,
   name: Ident,
   labels: List<Ident>,
   args: List<Expr>,
@@ -1546,6 +1573,7 @@ fn called_on(
   on_value(
     named.fold(put_u32(passed, named.len()), |acc: Encoder, n: NamedArg|
       expr(put_text(acc, n.name.name), n.value)),
+    at,
     name,
   )
 }
@@ -1579,6 +1607,7 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
       EField(f) ->
         called_on(
           put_text(expr(put_tag(encoder, tag_e_on_value()), f.base), f.field.name),
+          a.span,
           f.field,
           a.labels,
           a.args,
@@ -1645,6 +1674,7 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
             ),
             p.op.name,
           ),
+          p.span,
           p.op,
           match p.resource { Some(r) -> [r], None -> [] },
           p.args,
@@ -2076,16 +2106,59 @@ pub fn spec_hash(owner: Bytes, kind: Int, index: Int, normalized: Bytes) -> Byte
 
 fn member_hash(component: Bytes, class: Int) -> Bytes = blake3(component.concat(u32_le(class)))
 
+/// Where a stored body's parts stand: its kind, a member's class, the choices each member's calls
+/// on values made (`Chose`) from `picks` to `at`, and the bytes its hash is taken over from `at`.
+type Envelope = { kind: Int, class: Int, picks: Int, at: Int }
+
+fn envelope(body: Bytes) -> Option<Envelope> / {abort.raise} = {
+  let kind = if body.len() == 0 { 0 - 1 } else { body.at(0) };
+  let framed = |class: Int, from: Int|
+    match body.u32_at(from) {
+      Some(n) -> if from + 4 + n > body.len() { None }
+      else { Some({ kind: kind, class: class, picks: from + 4, at: from + 4 + n }) },
+      None -> None,
+    };
+  if kind == 0 { framed(0, 1) }
+  else if kind == 1 { match body.u32_at(1) { Some(class) -> framed(class, 5), None -> None } }
+  else { None }
+}
+
 /// The one hash a stored body may be filed under, taken from its own bytes; `None` for bytes no
 /// envelope holds.
 pub fn body_key(body: Bytes) -> Option<Bytes> / {abort.raise} =
-  if body.len() == 0 { None }
-  else if body.at(0) == 0 { Some(blake3(body.slice(1, body.len()))) } else if body.at(0) == 1 {
-    match body.u32_at(1) {
-      Some(class) -> Some(member_hash(blake3(body.slice(5, body.len())), class)),
-      None -> None,
-    }
-  } else { None }
+  match envelope(body) {
+    Some(e) -> {
+      let payload = blake3(body.slice(e.at, body.len()));
+      Some(if e.kind == 0 { payload } else { member_hash(payload, e.class) })
+    },
+    None -> None,
+  }
+
+/// Each member's choices, written as `envelope` reads them.
+fn framed_picks(picks: List<List<Int>>) -> Bytes = {
+  let inner = Bytes::concat_all(
+    picks.map(|p: List<Int>|
+      u32_le(p.len()).concat(Bytes::concat_all(p.map(|x: Int| u32_le(x + 1))))),
+  );
+  u32_le(inner.len()).concat(inner)
+}
+
+/// The choices of a body `e` opens, a list a member; none where it was hashed with none known.
+fn picks_of(body: Bytes, e: Envelope) -> List<List<Int>> / {abort.raise} = {
+  let read = |at: Int| match body.u32_at(at) { Some(n) -> n, None -> panic("a malformed body") };
+  iterate(
+    { at: e.picks, lists: [] },
+    e.at - e.picks + 1,
+    |s: { at: Int, lists: List<List<Int>> }|
+      if s.at >= e.at { Stop(s.lists) } else {
+        let n = read(s.at);
+        Continue({
+          at: s.at + 4 + 4 * n,
+          lists: s.lists.push(range(0, n).map(|i: Int| read(s.at + 4 + 4 * i) - 1)),
+        })
+      },
+  )
+}
 
 /// `bodies` and `test_bodies`: each definition's and test's stored body, the bytes its hash is taken
 /// over. What is said of each test or law is under its key.
@@ -2227,12 +2300,13 @@ fn digest_keyed(e: { key: Bytes, value: Bytes }) -> Bytes =
 pub fn of_key<a>(m: Map<Bytes, a>, key: Bytes) -> a / {abort.raise} =
   match m.get(key) { Some(x) -> x, None -> panic("a key the table does not hold") }
 
-/// A kind byte, then the normalized bytes `blake3` keys the body by.
-fn solo_body(encoding: Bytes) -> Bytes = b"\x00".concat(encoding)
+/// A kind byte, its calls' choices, then the normalized bytes `blake3` keys the body by.
+fn solo_body(f: Finished) -> Bytes = Bytes::concat_all([b"\x00", framed_picks([f.chosen]), f.bytes])
 
-/// The kind byte, the member's class, then the whole component's packed bytes, so any member rebuilds the cycle.
-fn member_body(packed: Bytes, class: Int) -> Bytes =
-  Bytes::concat_all([b"\x01", u32_le(class), packed])
+/// The kind byte, the member's class, every member's choices, then the whole component's packed
+/// bytes, so any member rebuilds the cycle.
+fn member_body(refined: Refined, class: Int) -> Bytes =
+  Bytes::concat_all([b"\x01", u32_le(class), refined.picks, refined.packed])
 
 type Sccs = { component_of: List<Int>, orders: List<List<Int>> }
 
@@ -2341,7 +2415,12 @@ fn filled_item(
 
 fn sketch_lt(a: Bytes, ia: Int, b: Bytes, ib: Int) -> Bool = bytes_lt(a, b) || (a == b && ia < ib)
 
-type Refined = { members: List<{ node: Int, hash: Bytes }>, packed: Bytes, classes: Map<Int, Int> }
+type Refined = {
+  members: List<{ node: Int, hash: Bytes }>,
+  packed: Bytes,
+  picks: Bytes,
+  classes: Map<Int, Int>,
+}
 
 /// A cyclic component hashes as a unit; members are labelled by class refinement to a fixpoint, plus one settling round.
 fn hash_component(
@@ -2357,8 +2436,9 @@ fn hash_component(
       effects: effects,
       by_name: false,
       names: over.names,
-    }).bytes;
-  let relabel = |encodings: List<Bytes>| {
+    });
+  let relabel = |finished: List<Finished>| {
+    let encodings = finished.map(|f: Finished| f.bytes);
     let distinct = dedup_sorted(sort_bytes(encodings));
     range(0, component.len()).fold(Map::new(), |acc: Map<Int, Int>, i: Int|
       acc.insert(component.get(i), position_bytes(distinct, encodings.get(i))))
@@ -2374,7 +2454,7 @@ fn hash_component(
   let settled = iterate(
     { classes: start, encodings: component.map(|v: Int| encode(start, v)) },
     component.len() + 2,
-    |s: { classes: Map<Int, Int>, encodings: List<Bytes> }| {
+    |s: { classes: Map<Int, Int>, encodings: List<Finished> }| {
       let next = relabel(s.encodings);
       let same = grouping(next) == grouping(s.classes);
       let re = { classes: next, encodings: component.map(|v: Int| encode(next, v)) };
@@ -2385,15 +2465,15 @@ fn hash_component(
       max(acc, match settled.classes.get(v) { Some(c) -> c, None -> 0 }))
     + 1;
   let by_class = range(0, component.len()).fold(
-    range(0, width).map(|i: Int| b""),
-    |acc: List<Bytes>, i: Int|
+    range(0, width).map(|i: Int| { bytes: b"", refs: [], chosen: [] }),
+    |acc: List<Finished>, i: Int|
       acc.set(
         match settled.classes.get(component.get(i)) { Some(c) -> c, None -> 0 },
         settled.encodings.get(i),
       ),
   );
   let packed = u32_le(by_class.len()).concat(
-    Bytes::concat_all(by_class.map(|m: Bytes| u32_le(m.len()).concat(m))),
+    Bytes::concat_all(by_class.map(|m: Finished| u32_le(m.bytes.len()).concat(m.bytes))),
   );
   let component_hash = blake3(packed);
   {
@@ -2403,6 +2483,7 @@ fn hash_component(
         hash: member_hash(component_hash, match settled.classes.get(v) { Some(c) -> c, None -> 0 }),
       }),
     packed: packed,
+    picks: framed_picks(by_class.map(|m: Finished| m.chosen)),
     classes: settled.classes,
   }
 }
@@ -2488,18 +2569,19 @@ fn first_of(shapes: Shapes, fixed: Map<Int, List<Int>>) -> List<Finished> / {abo
   range(0, shapes.nodes.len()).map(|v: Int| {
     let edges = fixed.get(v);
     match shapes.nodes.get(v).form {
-      None -> { bytes: b"", refs: match edges { Some(es) -> es, None -> [] } },
+      None -> { bytes: b"", refs: match edges { Some(es) -> es, None -> [] }, chosen: [] },
       Some(f) -> {
         let x: Finished = filled(f.pieces, blank());
-        match edges { Some(es) -> { bytes: x.bytes, refs: es }, None -> x }
+        match edges { Some(es) -> { ..x, refs: es }, None -> x }
       },
     }
   })
 
-/// The node at `v` of `index` normalized, and what another package reads of a function.
-fn node_form(index: Index, v: Int) -> NodeForm / {abort.raise} = {
+/// The node at `v` of `index` normalized, and what another package reads of a function. `chose`
+/// is what [`Chosen`] says of its module's calls on values.
+fn node_form(index: Index, v: Int, chose: Map<Bytes, Bytes>) -> NodeForm / {abort.raise} = {
   let node = index.nodes.get(v);
-  let pieces = template_of(index, node.module, |encoder: Encoder|
+  let pieces = chosen_template(index, node.module, chose, |encoder: Encoder|
     normalize_node(encoder, node.body));
   match node.body {
     NodeFn(d) ->
@@ -2519,9 +2601,9 @@ fn node_form(index: Index, v: Int) -> NodeForm / {abort.raise} = {
   }
 }
 
-fn test_form(index: Index, t: TestNode) -> ItemForm / {abort.raise} =
+fn test_form(index: Index, t: TestNode, chose: Map<Bytes, Bytes>) -> ItemForm / {abort.raise} =
   {
-    pieces: template_of(index, t.module, |encoder: Encoder| test_def(encoder, t.def)),
+    pieces: chosen_template(index, t.module, chose, |encoder: Encoder| test_def(encoder, t.def)),
     listed: listed_refs(index, t),
     listing: match t.def.cases {
       Some(c) -> refs_of(index, t.module, |encoder: Encoder| expr(encoder, test_listing(c))),
@@ -2558,7 +2640,7 @@ fn shapes_of(
       decl: is_decl(node),
       effect: is_effect(index, v),
       package: match packages.at(node.module) { Some(p) -> p, None -> 0 },
-      form: if formed { Some(node_form(index, v)) } else { None },
+      form: if formed { Some(node_form(index, v, Map::new())) } else { None },
     }
   };
   let plain = {
@@ -2568,7 +2650,7 @@ fn shapes_of(
     tests: index.tests.map(|t: TestNode|
       {
         key: t.key,
-        form: if held_tests.contains(t.key) { None } else { Some(test_form(index, t)) },
+        form: if held_tests.contains(t.key) { None } else { Some(test_form(index, t, Map::new())) },
       }),
     laws: index.laws.map(|l: LawNode|
       {
@@ -2695,15 +2777,15 @@ fn key_component(
       {
         ..a,
         fresh: a.fresh.insert(m.node, m.hash),
-        bodies: a.bodies.insert(m.node, member_body(refined.packed, class)),
+        bodies: a.bodies.insert(m.node, member_body(refined, class)),
       }
     })
   } else {
     let v = component.get(0);
-    let encoding = filled_under(over, pieces_of(over, v), acc.hashes, effects, false).bytes;
+    let encoding = filled_under(over, pieces_of(over, v), acc.hashes, effects, false);
     {
       ..acc,
-      fresh: acc.fresh.insert(v, blake3(encoding)),
+      fresh: acc.fresh.insert(v, blake3(encoding.bytes)),
       bodies: acc.bodies.insert(v, solo_body(encoding)),
     }
   };
@@ -2922,7 +3004,7 @@ fn hashed_over(
           let text: Finished = filled_under(over, form.pieces, hashes, effects, true);
           {
             hashes: acc.hashes.push(blake3(f.bytes)),
-            bodies: acc.bodies.push(solo_body(f.bytes)),
+            bodies: acc.bodies.push(solo_body(f)),
             texts: acc.texts.push(own_hash(text.bytes)),
             refs: acc.refs.push(
               form.listed.fold(f.refs, |rs: List<Int>, r: Int| rs.push_unique(r)),
@@ -3308,11 +3390,19 @@ pub fn kept_forms(
     own: c.own.filter(|v: Int| (keeps.node)(index.nodes.get(v).name)),
     tests: c.tests.filter(|t: TestNode| (keeps.test)(t.key)),
     laws: c.laws.filter(|l: LawNode| (keeps.law)(l.key)),
+    called: c.called,
   })
 }
 
 /// Nodes, tests and laws of one module of an index: its nodes in the order the index lists them.
-pub type Chosen = { own: List<Int>, tests: List<TestNode>, laws: List<LawNode> }
+/// `called` is the function each call on a value its check resolved calls, by the call's span:
+/// nothing a hash reads, and empty where no check is read.
+pub type Chosen = {
+  own: List<Int>,
+  tests: List<TestNode>,
+  laws: List<LawNode>,
+  called: Map<Bytes, Bytes>,
+}
 
 /// Every node, test and law of the module at `module` of `index`, found in one walk of it.
 pub fn chosen_in(index: Index, module: Int) -> Chosen / {abort.raise} =
@@ -3324,16 +3414,17 @@ pub fn chosen_in(index: Index, module: Int) -> Chosen / {abort.raise} =
       }),
     tests: index.tests.filter(|t: TestNode| t.module == module),
     laws: index.laws.filter(|l: LawNode| l.module == module),
+    called: Map::new(),
   }
 
 /// The forms hashing reads of `chosen`, nodes, tests and laws of one module, numbered among
 /// themselves as `kept_forms` numbers them.
 pub fn chosen_forms(index: Index, packages: List<Int>, chosen: Chosen) -> Shapes / {abort.raise} = {
   let own = chosen.own;
-  let forms = own.map(|v: Int| node_form(index, v));
+  let forms = own.map(|v: Int| node_form(index, v, chosen.called));
   let tests = chosen.tests;
   let laws = chosen.laws;
-  let test_forms = tests.map(|t: TestNode| test_form(index, t));
+  let test_forms = tests.map(|t: TestNode| test_form(index, t, chosen.called));
   let law_forms = laws.map(|l: LawNode| law_form(index, l));
   let item_nodes = |acc: Taken, x: ItemForm|
     x.listed.concat(x.listing).fold(piece_nodes(x.pieces, acc), |a: Taken, v: Int| taken(a, v));
@@ -4522,6 +4613,7 @@ pub type Printing = | Printed(List<{ module: Bytes, text: Bytes }>) | Unprintabl
 
 type Part = {
   members: List<Bytes>,
+  picks: List<List<Int>>,
   hashes: List<Bytes>,
   names: List<Bytes>,
   public: List<Bool>,
@@ -4554,9 +4646,13 @@ type BodyPrinter = {
 
 /// A hash is thirty-two bytes, so the name after it needs no separator.
 fn meant_key(name: Bytes, hash: Bytes) -> Bytes = hash.concat(name)
+/// `picks` is which candidate each call on a value of the body calls, in the order its bytes write
+/// them (`Chose`), and `picked` how many of them are read.
 type Decoder = {
   bytes: Bytes,
   pos: Int,
+  picks: List<Int>,
+  picked: Int,
   values: Int,
   types: Int,
   rows: Int,
@@ -4576,6 +4672,8 @@ fn cursor(b: Bytes, missing: Map<Bytes, Bool>) -> Decoder =
   {
     bytes: b,
     pos: 0,
+    picks: [],
+    picked: 0,
     values: 0,
     types: 0,
     rows: 0,
@@ -5608,27 +5706,43 @@ fn print_expr(outer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.ra
         let value: Decoded = print_expr(printer, key.decoder, depth);
         { decoder: value.decoder, text: Bytes::concat_all([key.text, b": ", value.text]) }
       });
-      // Every function it may be follows, which the hash reads and the text does not.
+      // Every function it may be follows, which the hash reads and the text does not, and which of
+      // them the check found it calls. Under the program's own names the value's type answers the
+      // call as it did; set apart, a function of a type is a plain function under another name, so
+      // the call is printed as a call of the one it calls.
       let full = read_count(named.decoder);
-      let after: Decoder = if full.value == 1 {
-        read_value(printer, expect(full.decoder, tag_e_var(), b"a function named in full")).decoder
+      let apart = printer.layout.apart;
+      let callee: Decoded = if full.value == 1 {
+        read_value(printer, expect(full.decoder, tag_e_var(), b"a function named in full"))
       } else {
         let c = read_count(full.decoder);
-        read_many(c.decoder, c.value, |g: Decoder|
-          { decoder: seen(printer, read_ref(printer, g)), text: b"" }).decoder
+        let d = c.decoder;
+        let chosen = if !apart { 0 - 1 }
+        else { match d.picks.at(d.picked) { Some(i) -> i, None -> 0 - 1 } };
+        range(0, c.value).fold(
+          { decoder: { ..d, picked: d.picked + 1 }, text: b"" },
+          |acc: Decoded, i: Int| {
+            let r = read_ref(printer, acc.decoder);
+            if i == chosen { qname(printer, r, None) }
+            else if chosen >= 0 { { decoder: r.decoder, text: acc.text } }
+            else { { decoder: seen(printer, r), text: acc.text } }
+          },
+        )
       };
-      {
-        decoder: after,
-        text: Bytes::concat_all([
-          on.text,
-          b".",
-          name.text,
+      let passed = |first: List<Bytes>|
+        Bytes::concat_all([
           if ln.value == 0 { b"" }
           else { Bytes::concat_all([b"[", joined(ls.texts, b", "), b"]"]) },
           b"(",
-          joined(args.texts.concat(named.texts), b", "),
+          joined(first.concat(args.texts).concat(named.texts), b", "),
           b")",
-        ]),
+        ]);
+      {
+        decoder: callee.decoder,
+        text: if callee.text.len() == 0 {
+          Bytes::concat_all([on.text, b".", name.text, passed([])])
+        } else if apart { callee.text.concat(passed([on.text])) }
+        else { Bytes::concat_all([on.text, b".", callee.text, passed([])]) },
       }
     } else if t.value == tag_e_field() {
       let b = parens(print_expr(printer, e, depth), is_base(e));
@@ -6104,7 +6218,13 @@ fn print_test(unsized: BodyPrinter, decoder: Decoder, label: Bytes) -> Decoded /
 }
 
 type Named = { module: Bytes, simple: Bytes, public: Bool }
-type Component = { members: List<Bytes>, hashes: List<Bytes>, id: Bytes, key: Bytes }
+type Component = {
+  members: List<Bytes>,
+  picks: List<List<Int>>,
+  hashes: List<Bytes>,
+  id: Bytes,
+  key: Bytes,
+}
 type Copied = { module: Bytes, names: List<Bytes>, public: List<Bool> }
 type Parting = {
   seen: Map<Bytes, Bool>,
@@ -6117,30 +6237,31 @@ type Sheet = { items: List<Bytes>, imports: Map<Bytes, Bytes> }
 fn refuse(message: Bytes, notes: List<Bytes>) -> Option<Refusal> =
   Some({ message: message, notes: notes })
 
-fn comp_of(body: Bytes) -> Component / {abort.raise} = {
-  let k = read_u8(cursor(body, Map::new()));
-  if k.value == 0 {
-    let payload = body.slice(1, body.len());
-    let id = blake3(payload);
-    { members: [payload], hashes: [id], id: id, key: id }
-  } else if k.value == 1 {
-    let class = read_u32(k.decoder);
-    let payload = body.slice(5, body.len());
-    let c = read_count(cursor(payload, Map::new()));
-    let ms = read_many(c.decoder, c.value, read_text);
-    if ms.decoder.pos != payload.len() || class.value >= c.value {
-      panic("a malformed component body")
-    } else {
+fn comp_of(body: Bytes) -> Component / {abort.raise} =
+  match envelope(body) {
+    None -> panic("a stored body of a kind this build does not read"),
+    Some(e) -> {
+      let payload = body.slice(e.at, body.len());
       let id = blake3(payload);
-      {
-        members: ms.texts,
-        hashes: range(0, c.value).map(|i: Int| member_hash(id, i)),
-        id: id,
-        key: member_hash(id, class.value),
+      if e.kind == 0 {
+        { members: [payload], picks: picks_of(body, e), hashes: [id], id: id, key: id }
+      } else {
+        let c = read_count(cursor(payload, Map::new()));
+        let ms = read_many(c.decoder, c.value, read_text);
+        if ms.decoder.pos != payload.len() || e.class >= c.value {
+          panic("a malformed component body")
+        } else {
+          {
+            members: ms.texts,
+            picks: picks_of(body, e),
+            hashes: range(0, c.value).map(|i: Int| member_hash(id, i)),
+            id: id,
+            key: member_hash(id, e.class),
+          }
+        }
       }
-    }
-  } else { panic("a stored body of a kind this build does not read") }
-}
+    },
+  }
 
 fn listed(ns: List<Named>) -> Bytes / {abort.raise} =
   backticked(ns.map(|n: Named| qualify(n.module, n.simple)), b", ")
@@ -6285,6 +6406,7 @@ fn part_in(
           parts: cs.fold(checked.parts, |ps: List<Part>, cp: Copied|
             ps.push({
               members: component.members,
+              picks: component.picks,
               hashes: component.hashes,
               names: cp.names,
               public: cp.public,
@@ -6399,6 +6521,8 @@ fn print_parts(
                 ..decoded.decoder,
                 bytes: p.members.get(c),
                 pos: 0,
+                picks: match p.picks.at(c) { Some(x) -> x, None -> [] },
+                picked: 0,
                 values: 0,
                 types: 0,
                 rows: 0,
@@ -6437,22 +6561,27 @@ fn print_tests(
     { decoder: cursor(b"", missing), texts: [] },
     |decoded: DecodedList, i: Int| {
       let body = tests.get(i);
-      if body.len() == 0 || body.at(0) != 0 { panic("a test body that is not a solo body") } else {
-        let g = print_test(
-          x,
-          {
-            ..decoded.decoder,
-            bytes: body.slice(1, body.len()),
-            pos: 0,
-            values: 0,
-            types: 0,
-            rows: 0,
-            labels: 0,
-            slots: Map::new(),
-          },
-          b"t".concat(ascii_of_int(i)),
-        );
-        { decoder: g.decoder, texts: decoded.texts.push(g.text) }
+      match envelope(body) {
+        Some(e) -> if e.kind != 0 { panic("a test body that is not a solo body") } else {
+          let g = print_test(
+            x,
+            {
+              ..decoded.decoder,
+              bytes: body.slice(e.at, body.len()),
+              pos: 0,
+              picks: match picks_of(body, e).at(0) { Some(p) -> p, None -> [] },
+              picked: 0,
+              values: 0,
+              types: 0,
+              rows: 0,
+              labels: 0,
+              slots: Map::new(),
+            },
+            b"t".concat(ascii_of_int(i)),
+          );
+          { decoder: g.decoder, texts: decoded.texts.push(g.text) }
+        },
+        None -> panic("a test body that is not a solo body"),
       }
     },
   )
@@ -7559,6 +7688,45 @@ test "a body that calls on a value prints back importing each module whose funct
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
+test "set apart, a call on a value prints as a call of the function its check found it calls" {
+  let src = b"pub type Bag = | Bag(Int)\npub fn Bag::size(b: Bag) -> Int = match b { Bag(n) -> n + 1 }\npub type Cart = | Cart(Int)\npub fn Cart::size(c: Cart) -> Int = match c { Cart(n) -> n }\npub fn total(c: Cart) -> Int = c.size()";
+  let index = indexed([{ name: b"m", src: src }]);
+  let at = index.nodes.fold(dummy_span(), |acc: Span, n: Node|
+    match n.body {
+      NodeFn(d) -> if n.name == b"m.total" { expr_span(d.body) } else { acc },
+      _ -> acc,
+    });
+  let fixed = hashed_forms(
+    chosen_forms(index, [0], {
+      ..chosen_in(index, 0),
+      called: Map::of_entries([{ key: span_key(at), value: b"m.Cart::size" }]),
+    }),
+    [],
+  ).nodes;
+  let total = |apart: Bool|
+    match print_bodies(
+        fixed.map(|f: Fixed| f.body),
+        fixed.map(|f: Fixed| { name: f.name, hash: f.hash, public: true }),
+        [],
+        [],
+        [],
+        apart,
+      ) {
+      Printed(ms) ->
+        ms.get(0).text.split(b"\n\n").fold(b"", |acc: Bytes, item: Bytes|
+          if item.contains(b"fn total(") { item } else { acc }),
+      Unprintable(why) -> panic(String::of_bytes(why.message)),
+    };
+  let apart = total(true);
+  assert(
+    apart.contains(b"Cart::size(_l0)") && !apart.contains(b".size("),
+    Some(String::of_bytes_lossy(apart)),
+  );
+  // Under its own names it is written as it was, which hashes back to what it was stored under.
+  let own = total(false);
+  assert(own.contains(b".size()"), Some(String::of_bytes_lossy(own)))
+}
+
 test "every deriver a constraint names prints back and hashes back to what it was stored under" {
   let out = hash_index(
     indexed([
@@ -8219,8 +8387,21 @@ test "the published hashes digest to a pinned value" {
 }
 
 test "a stored body is keyed by its own bytes, and bytes no envelope holds by nothing" {
-  assert_eq(body_key(solo_body(b"abc")), Some(blake3(b"abc")));
-  assert_eq(body_key(member_body(b"xyz", 2)), Some(member_hash(blake3(b"xyz"), 2)));
+  let solo = solo_body({ bytes: b"abc", refs: [], chosen: [3, 0 - 1] });
+  assert_eq(body_key(solo), Some(blake3(b"abc")));
+  match envelope(solo) {
+    Some(e) -> assert_eq(picks_of(solo, e), [[3, 0 - 1]]),
+    None -> assert(false),
+  };
+  let member = member_body(
+    { members: [], packed: b"xyz", picks: framed_picks([[], [1]]), classes: Map::new() },
+    2,
+  );
+  assert_eq(body_key(member), Some(member_hash(blake3(b"xyz"), 2)));
+  match envelope(member) {
+    Some(e) -> assert_eq(picks_of(member, e), [[], [1]]),
+    None -> assert(false),
+  };
   assert_eq(body_key(b""), None);
   assert_eq(body_key(b"\x07rest"), None);
   assert_eq(body_key(b"\x01\x00"), None)

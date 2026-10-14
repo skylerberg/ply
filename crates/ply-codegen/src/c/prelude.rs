@@ -5,7 +5,36 @@
 /// shared object cannot see symbols the host executable did not export.
 pub const PRELUDE: &str = r#"
 #include <stdint.h>
+/* tcc's arm64 linker writes every call as one branch, which reaches 128 MB and no further, and says
+   nothing of one that falls short. `PLY_FAR` keeps each part's calls within it: another part's
+   function through the part's table, and these, which tcc calls for a struct's copy and a zeroing
+   too, through stubs it lays after all of the code. */
+#if defined(__TINYC__) && defined(__aarch64__)
+#  define PLY_FAR 1
+#endif
+#ifdef PLY_FAR
+#include <stddef.h>
+static void *memcpy(void *d, const void *s, size_t n) {
+  unsigned char *a = d;
+  const unsigned char *b = s;
+  while (n--) *a++ = *b++;
+  return d;
+}
+static void *memmove(void *d, const void *s, size_t n) {
+  unsigned char *a = d;
+  const unsigned char *b = s;
+  if ((uintptr_t)a < (uintptr_t)b) while (n--) *a++ = *b++;
+  else while (n--) a[n] = b[n];
+  return d;
+}
+static void *memset(void *d, int c, size_t n) {
+  unsigned char *a = d;
+  while (n--) *a++ = (unsigned char)c;
+  return d;
+}
+#else
 #include <string.h>
+#endif
 
 typedef int64_t Word;
 

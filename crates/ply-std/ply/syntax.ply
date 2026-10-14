@@ -142,8 +142,13 @@ fn unexpected(source: Bytes, span: Span, message: String, label: String) -> Diag
 
 // --- Nodes ------------------------------------------------------------------
 
-/// The source a node was parsed from, and that source's comments.
-type Origin = { source: Bytes, comments: List<lexer::Comment> }
+/// The source a node was parsed from, that source's comments, and the names each item of it binds,
+/// by where the item lies: a call written on one of those is a call on a value.
+type Origin = {
+  source: Bytes,
+  comments: List<lexer::Comment>,
+  binding: List<{ start: Int, end: Int, names: Map<Bytes, Bool> }>,
+}
 
 /// What a node is, as the compiler holds it.
 type At =
@@ -272,7 +277,9 @@ pub type Kind =
   | Interpolation
   /// `tag"text {x}"`: the value in each hole; `name` is the tag.
   | TaggedLiteral
-  /// `eff.op[r](args)`: each argument; `name` is the operation and `qualifier` the effect.
+  /// `eff.op[r](args)`: each argument; `name` is the operation and `qualifier` the effect. A
+  /// call written so on a name its item binds is a call on that value, a `Call` of an `Access`, as
+  /// `f(x).len()` is.
   | Perform
   /// `handle { .. } with { .. }`: the body, then each `Handler` and the `ReturnHandler`.
   | Handle
@@ -341,8 +348,9 @@ pub type Ident = new { text: String, span: Span }
 pub type Comment = new { span: Span, text: String }
 
 /// The version of this module's vocabulary: it moves when a `Kind` is added, and with what is said
-/// of the release when an accessor comes to answer otherwise for a tree it already read.
-pub fn version() -> Int = 1
+/// of the release when an accessor comes to answer otherwise for a tree it already read. At 2 a
+/// call on a value written on a bare name is no longer a `Perform`.
+pub fn version() -> Int = 2
 
 /// A place the compiler read, as the span of the source it lies at.
 fn written(place: parsing::Span) -> Span = { start: place.start, end: place.end }
@@ -810,7 +818,39 @@ pub fn place(node: Node) -> Place =
 
 /// The nodes directly inside a node, in the order the source writes them: what its `Kind` says.
 pub fn children(node: Node) -> List<Node> / {abort.raise} =
-  match node { Node(origin, at) -> parts_of(origin.source, at).map(|part: At| Node(origin, part)) }
+  match node {
+    Node(origin, at) ->
+      parts_of(origin.source, at).map(|part: At| Node(origin, seen(origin, part))),
+  }
+
+/// `at` as the checker reads it where the parser cannot tell: `x.f(..)` on a name its item binds
+/// is the call of the value's function, and on any other name a perform.
+fn seen(origin: Origin, at: At) -> At / {abort.raise} =
+  match at {
+    AExpr(e) -> match e {
+      EPerform(p) -> if p.eff.module != None || !bound_at(origin, p.span.start, p.eff.name.name) {
+        at
+      } else {
+        let on = EVar({ span: p.eff.span, name: p.eff });
+        AExpr(
+          EApp({
+            span: p.span,
+            func: EField({ span: parsing::span_to(p.eff.span, p.op.span), base: on, field: p.op }),
+            named: [],
+            args: p.args,
+            labels: match p.resource { Some(r) -> [r], None -> [] },
+          }),
+        )
+      },
+      _ -> at,
+    },
+    _ -> at,
+  }
+
+/// Whether the item of `origin` written over `at` binds `name`.
+fn bound_at(origin: Origin, at: Int, name: Bytes) -> Bool =
+  origin.binding.fold(false, |found: Bool, b: { start: Int, end: Int, names: Map<Bytes, Bool> }|
+    found || (at >= b.start && at < b.end && b.names.contains(name)))
 
 /// The name a node declares, binds or refers to, and where it is written: what its `Kind` says.
 /// A test's and a law's is its label.
@@ -975,8 +1015,22 @@ fn part_tag(at: At) -> Bytes =
 /// A source's tree, and what the parser said of it: no diagnostic for a source that parses.
 pub type Parsed = new { tree: Node, diagnostics: List<Diagnostic> }
 
-fn origin_of(source: Bytes) -> Origin / {abort.raise} =
-  { source: source, comments: lexer::lex(source).comments }
+/// `source`'s origin, `spans` the places of its items, each of which binds names apart.
+fn origin_of(source: Bytes, spans: List<parsing::Span>) -> Origin / {abort.raise} =
+  {
+    source: source,
+    comments: lexer::lex(source).comments,
+    binding: spans.map(|s: parsing::Span|
+      {
+        start: s.start,
+        end: s.end,
+        names: lexer::bound_names(lexer::lex(source.slice(s.start, s.end)).tokens),
+      }),
+  }
+
+/// `text`'s origin, read as one item.
+fn origin_whole(text: Bytes) -> Origin / {abort.raise} =
+  origin_of(text, [parsing::span_between(0, text.len())])
 
 /// One module's source as a tree, a `Module` node, with the parser's diagnostics.
 ///
@@ -986,7 +1040,7 @@ fn origin_of(source: Bytes) -> Origin / {abort.raise} =
 pub fn parse(source: Bytes) -> Parsed / {abort.raise} = {
   let read = items::parse(source);
   {
-    tree: Node(origin_of(source), AModule(read.node)),
+    tree: Node(origin_of(source, read.node.items.map(item_span)), AModule(read.node)),
     diagnostics: read.parser.diags.map(|diag: ParseDiag| said(source, diag)),
   }
 }
@@ -1071,7 +1125,10 @@ pub fn expression(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
     Err(parser) -> Err(failed(parser, text)),
     Ok(read) -> match refusal(text, s.input, read.parser, "expression") {
       Some(why) -> Err(why),
-      None -> Ok(Node(origin_of(text), AExpr(read.node))),
+      None -> {
+        let origin = origin_whole(text);
+        Ok(Node(origin, seen(origin, AExpr(read.node))))
+      },
     },
   }
 }
@@ -1083,7 +1140,7 @@ pub fn pattern(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
     Err(parser) -> Err(failed(parser, text)),
     Ok(read) -> match refusal(text, s.input, read.parser, "pattern") {
       Some(why) -> Err(why),
-      None -> Ok(Node(origin_of(text), APattern(read.node))),
+      None -> Ok(Node(origin_whole(text), APattern(read.node))),
     },
   }
 }
@@ -1095,7 +1152,7 @@ pub fn type_expression(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} 
     Err(parser) -> Err(failed(parser, text)),
     Ok(read) -> match refusal(text, s.input, read.parser, "type") {
       Some(why) -> Err(why),
-      None -> Ok(Node(origin_of(text), AType(read.node))),
+      None -> Ok(Node(origin_whole(text), AType(read.node))),
     },
   }
 }
@@ -1107,7 +1164,7 @@ pub fn item(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
   match read.parser.diags.at(0) {
     Some(diag) -> Err(said(text, diag)),
     None -> match ((read.node.imports.filter(is_written), read.node.items)) {
-      ([], [one]) -> Ok(Node(origin_of(text), AItem(one))),
+      ([], [one]) -> Ok(Node(origin_whole(text), AItem(one))),
       _ ->
         Err(
           unexpected(
@@ -1562,7 +1619,7 @@ test "an expression is read as it is written, whatever the compiler makes of it"
 
 test "every name a body refers to is a node, and no name the parser wrote for itself is" {
   let tree = tree_of(
-    b"fn f(xs: List<Int>, m: Map<Int, Int>) -> String = {\n  let total = List::fold(xs, 0, |acc: Int, x: Int| acc + x);\n  match List::at(xs, total) {\n    Some(first) -> f\"{first} of {List::len(xs)}\",\n    None -> show(#{1: total}),\n  }\n}\n",
+    b"fn f(xs: List<Int>, m: Map<Int, Int>) -> String = {\n  let total = xs.fold(0, |acc: Int, x: Int| acc + x);\n  match xs.at(total) {\n    Some(first) -> f\"{first} of {xs.len()}\",\n    None -> show(#{1: total}),\n  }\n}\n",
   );
   assert_eq(names_in(tree), [
     "fold",
@@ -1578,6 +1635,29 @@ test "every name a body refers to is a node, and no name the parser wrote for it
     "show",
     "total",
   ])
+}
+
+test "a call written on a name its item binds is a call on that value, and on any other a perform" {
+  let tree = tree_of(
+    b"effect log { write line(text: String) -> Unit }\n\nfn f(xs: List<Int>) -> Int / {log.line} = {\n  log.line(\"x\");\n  xs.len()\n}\n",
+  );
+  let calls = walked(tree, 64, []).filter(|n: Node| kind(n) == Call || kind(n) == Perform);
+  assert_eq(calls.map(kind), [Perform, Call]);
+  match calls.at(1) {
+    Some(call) -> {
+      let reached = children(call);
+      assert_eq(reached.map(kind), [Access]);
+      assert_eq(reached.map(|n: Node| text(n)), [b"xs.len"]);
+      assert_eq(reached.flat_map(children).map(kind), [Name]);
+      assert_eq(name(reached.get(0)).map(|i: Ident| i.text), Some("len"))
+    },
+    None -> panic("two calls"),
+  };
+  // A fragment binds as one item.
+  match expression(b"|ys: List<Int>| ys.len()") {
+    Ok(lambda) -> assert(walked(lambda, 8, []).any(|n: Node| kind(n) == Access)),
+    Err(_) -> panic("the fragment parses"),
+  }
 }
 
 test "a node is found by a byte of its source, and read by its place" {
