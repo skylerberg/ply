@@ -4124,19 +4124,17 @@ fn metered(ctx: &mut Ctx, f: Word) -> Word {
         *counts.entry(atom.to_string()).or_insert(0) += 1;
     }
     let tables = Arc::clone(&ctx.tables);
-    let per_atom = tables
-        .layouts
-        .shape(vec![Symbol::new("atom"), Symbol::new("count")]);
     let items: Vec<Word> = counts
         .into_iter()
         .map(|(atom, count)| {
             let text = ctx.heap.str(&atom);
-            let r = ctx.heap.alloc(KIND_RECORD, 0, 2, per_atom);
-            unsafe {
-                set_word(r, 0, text);
-                set_word(r, 1, heap::imm(count));
-            }
-            r as Word
+            ctx.heap.record(
+                &tables.layouts,
+                &[
+                    (Symbol::new("atom"), text),
+                    (Symbol::new("count"), heap::imm(count)),
+                ],
+            )
         })
         .collect();
     let performs = ctx.heap.list_from(&items);
