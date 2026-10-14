@@ -1,0 +1,344 @@
+//! The type of each node of a lowered body, rebuilt from the sites the checker files, so a value's
+//! layout is read off its node's type and never off how the value happened to be made.
+
+import parsing (Span, span_key, dummy_span)
+import code (Code, Borrowed, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch,
+             NPerform, NLabel, NCell, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate,
+             NInlined, CodeStmt, CLet, CLetPat, CDo, CodePattern, PxWild, PxVar, PxLit, PxRange,
+             PxCtor, PxRecord, PxList, CodePatternField, CodeArm, Capture, Lambda, CodeField,
+             CodeClause)
+import patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
+import types (Type, TyVar, TyFn, TyRecord, int_type, bool_type, string_type, bytes_type, float_type,
+              decimal_type, unit_type, list_type, named_type, fn_type, row_empty, field_get,
+              record_fields)
+
+/// What is known at a span. `ty` is the type the checker filed there, `unknown` where it filed
+/// none, and `args` the type arguments it filled where the site names a generic definition. `node`
+/// is the type of the node written there: none until `node_types` meets one, and `unknown` where
+/// nodes of different types share the span.
+pub type Typed = { ty: Type, args: List<Type>, node: Option<Type> }
+
+/// No type: what a site holds where nothing is known of it.
+pub fn unknown_type() -> Type = TyVar(0 - 1)
+
+/// What the checker filed at a site, before any node there is typed.
+pub fn filed_as(ty: Type, args: List<Type>) -> Typed = { ty: ty, args: args, node: None }
+
+type Typing = { sites: Map<Bytes, Typed>, ty: Option<Type> }
+
+/// `sites` with the type of every node of `body` that has a place in the source filed as its
+/// site's `node`: a variable's from its binder, a call's from what it calls, a field's from its
+/// record. `params` are the types the body's leading slots hold, none where one is unknown. What
+/// the checker filed is left as it was.
+pub fn node_types(
+  sites: Map<Bytes, Typed>,
+  params: List<Option<Type>>,
+  body: Code,
+) -> Map<Bytes, Typed> = {
+  let env = fold(range(0, len(params)), map_new(), |acc: Map<Int, Type>, i: Int|
+    match list_at(params, i) { Some(Some(t)) -> map_insert(acc, i, t), _ -> acc });
+  typing(sites, env, body).sites
+}
+
+fn typing(sites: Map<Bytes, Typed>, env: Map<Int, Type>, code: Code) -> Typing = {
+  let made = match code.node {
+    NLit(l) -> { sites: sites, ty: lit_type(l) },
+    // A name no slot holds is a definition or a constructor, filed where it is written.
+    NVar(v) ->
+      {
+        sites: sites,
+        ty: match v.slot { Some(s) -> map_get(env, s), None -> filed(sites, code.span) },
+      },
+    NUnary(u) -> {
+      let o = typing(sites, env, u.operand);
+      { sites: o.sites, ty: if u.op == b"not" { Some(bool_type()) } else { o.ty } }
+    },
+    NBinary(b) -> {
+      let l = typing(sites, env, b.lhs);
+      let r = typing(l.sites, env, b.rhs);
+      {
+        sites: r.sites,
+        ty: if answers_bool(b.op) { Some(bool_type()) }
+        else { match l.ty { Some(t) -> Some(t), None -> r.ty } },
+      }
+    },
+    NApp(a) -> {
+      let f = typing(sites, env, a.func);
+      {
+        sites: fold(a.args, f.sites, |acc: Map<Bytes, Typed>, x: Code| typing(acc, env, x).sites),
+        ty: match f.ty { Some(TyFn(t)) -> Some(t.ret), _ -> None },
+      }
+    },
+    NIf(i) -> {
+      let c = typing(sites, env, i.cond);
+      let t = typing(c.sites, env, i.then_branch);
+      let e = typing(t.sites, env, i.else_branch);
+      { sites: e.sites, ty: match t.ty { Some(x) -> Some(x), None -> e.ty } }
+    },
+    NBlock(b) -> {
+      let after = fold(
+        b.stmts,
+        { sites: sites, env: env },
+        |acc: { sites: Map<Bytes, Typed>, env: Map<Int, Type> }, s: CodeStmt|
+          match s {
+            CLet(l) -> {
+              let v = typing(acc.sites, acc.env, l.value);
+              { sites: v.sites, env: slot_typed(acc.env, Some(l.slot), v.ty) }
+            },
+            CLetPat(l) -> {
+              let v = typing(acc.sites, acc.env, l.value);
+              { sites: v.sites, env: bound(v.sites, acc.env, l.pat) }
+            },
+            CDo(d) -> { sites: typing(acc.sites, acc.env, d.code).sites, env: acc.env },
+          },
+      );
+      match b.tail {
+        Some(t) -> typing(after.sites, after.env, t),
+        None -> { sites: after.sites, ty: Some(unit_type()) },
+      }
+    },
+    NList(l) -> {
+      let items = fold(l.items, { sites: sites, ty: None }, |acc: Typing, x: Code| {
+        let o = typing(acc.sites, env, x);
+        { sites: o.sites, ty: match acc.ty { Some(t) -> Some(t), None -> o.ty } }
+      });
+      {
+        sites: items.sites,
+        // The checker files an empty list's type, which no item gives.
+        ty: match items.ty { Some(t) -> Some(list_type(t)), None -> filed(sites, code.span) },
+      }
+    },
+    NRecord(r) ->
+      {
+        sites: fold(r.fields, sites, |acc: Map<Bytes, Typed>, f: CodeField|
+          typing(acc, env, f.value).sites),
+        ty: filed(sites, code.span),
+      },
+    NUpdate(u) ->
+      {
+        sites: fold(
+          u.sets,
+          typing(sites, env, u.base).sites,
+          |acc: Map<Bytes, Typed>, f: CodeField| typing(acc, env, f.value).sites,
+        ),
+        ty: filed(sites, code.span),
+      },
+    NMatch(m) -> {
+      let s = typing(sites, env, m.scrutinee);
+      fold(m.arms, { sites: s.sites, ty: None }, |acc: Typing, a: CodeArm| {
+        let inner = bound(acc.sites, env, a.pat);
+        let g = match a.guard { Some(c) -> typing(acc.sites, inner, c).sites, None -> acc.sites };
+        let o = typing(g, inner, a.body);
+        { sites: o.sites, ty: match acc.ty { Some(t) -> Some(t), None -> o.ty } }
+      })
+    },
+    NPerform(p) -> {
+      let l = match p.label { Some(c) -> typing(sites, env, c).sites, None -> sites };
+      {
+        sites: fold(p.args, l, |acc: Map<Bytes, Typed>, x: Code| typing(acc, env, x).sites),
+        ty: None,
+      }
+    },
+    NLabel(_) -> { sites: sites, ty: None },
+    NCell(c) -> {
+      let i = typing(sites, env, c.init);
+      typing(i.sites, slot_typed(env, c.slot, None), c.body)
+    },
+    NLambda(l) -> {
+      let of = filed(sites, l.at);
+      { sites: typing(sites, lambda_env(of, env, l), l.body).sites, ty: of }
+    },
+    NSimulate(s) -> typing(sites, captured(env, s.captures), s.body),
+    NParallel(p) ->
+      {
+        sites: fold(p.branches, sites, |acc: Map<Bytes, Typed>, x: Code| typing(acc, env, x).sites),
+        ty: None,
+      },
+    NHandle(h) -> {
+      let b = typing(sites, env, h.body);
+      let clauses = fold(h.clauses, b.sites, |acc: Map<Bytes, Typed>, c: CodeClause| {
+        let l = match c.label { Some(x) -> typing(acc, env, x).sites, None -> acc };
+        typing(l, captured(env, c.captures), c.body).sites
+      });
+      match h.ret {
+        None -> { sites: clauses, ty: b.ty },
+        Some(r) -> typing(clauses, slot_typed(captured(env, r.captures), Some(0), b.ty), r.body),
+      }
+    },
+    NField(f) -> {
+      let b = typing(sites, env, f.base);
+      {
+        sites: b.sites,
+        ty: match b.ty {
+          Some(t) -> match record_fields(t) { Some(fs) -> field_get(fs, f.field), None -> None },
+          None -> None,
+        },
+      }
+    },
+    // A lambda run in place is typed by its owner's sites, which this body's are not.
+    NInlined(x) ->
+      {
+        sites: fold(x.args, typing(sites, env, x.func).sites, |acc: Map<Bytes, Typed>, a: Code|
+          typing(acc, env, a).sites),
+        ty: None,
+      },
+  };
+  noted(made, code.span)
+}
+
+/// `made` with its type filed as the node at `span`. Where a node of another type was met there
+/// already, the two share the span and neither is read by it.
+fn noted(made: Typing, span: Span) -> Typing =
+  match made.ty {
+    None -> made,
+    Some(ty) -> if span == dummy_span() { made } else {
+      let key = span_key(span);
+      let at = match map_get(made.sites, key) {
+        Some(t) -> t,
+        None -> filed_as(unknown_type(), []),
+      };
+      match at.node {
+        None -> { sites: map_insert(made.sites, key, { ..at, node: Some(ty) }), ty: made.ty },
+        Some(met) -> if met == ty { made } else {
+          { sites: map_insert(made.sites, key, { ..at, node: Some(unknown_type()) }), ty: made.ty }
+        },
+      }
+    },
+  }
+
+/// The type the checker filed at `span`.
+fn filed(sites: Map<Bytes, Typed>, span: Span) -> Option<Type> =
+  if span == dummy_span() { None } else {
+    match map_get(sites, span_key(span)) {
+      Some(t) -> if t.ty == unknown_type() { None } else { Some(t.ty) },
+      None -> None,
+    }
+  }
+
+/// `env` with `slot` holding a value of `ty`; a slot whose type is unknown holds none, whatever an
+/// earlier binder of the same slot held.
+fn slot_typed(env: Map<Int, Type>, slot: Option<Int>, ty: Option<Type>) -> Map<Int, Type> =
+  match slot {
+    None -> env,
+    Some(s) -> match ty { Some(t) -> map_insert(env, s, t), None -> map_remove(env, s) },
+  }
+
+/// `env` with each binder of `pat` holding the type the checker filed at it.
+fn bound(sites: Map<Bytes, Typed>, env: Map<Int, Type>, pat: CodePattern) -> Map<Int, Type> =
+  match pat {
+    PxVar(v) -> slot_typed(env, v.slot, filed(sites, v.span)),
+    PxCtor(c) -> fold(c.args, env, |acc: Map<Int, Type>, p: CodePattern| bound(sites, acc, p)),
+    PxRecord(r) ->
+      fold(r.fields, env, |acc: Map<Int, Type>, f: CodePatternField| bound(sites, acc, f.pat)),
+    PxList(l) -> {
+      let items = fold(l.items, env, |acc: Map<Int, Type>, p: CodePattern| bound(sites, acc, p));
+      match l.rest { Some(r) -> bound(sites, items, r), None -> items }
+    },
+    PxWild -> env,
+    PxLit(_) -> env,
+    PxRange(_) -> env,
+  }
+
+/// What a barrier's body reads: each capture at its slot inside, typed as its slot outside is.
+fn captured(env: Map<Int, Type>, captures: List<Capture>) -> Map<Int, Type> =
+  fold(captures, map_new(), |acc: Map<Int, Type>, c: Capture|
+    match map_get(env, c.src) { Some(t) -> map_insert(acc, c.dst, t), None -> acc })
+
+/// A lambda's captures, and its parameters in its leading slots at the types its own type `of`
+/// gives them.
+fn lambda_env(of: Option<Type>, env: Map<Int, Type>, l: Lambda) -> Map<Int, Type> = {
+  let inside = captured(env, l.captures);
+  match of {
+    Some(TyFn(f)) -> if len(f.params) != l.params { inside } else {
+      fold(range(0, l.params), inside, |acc: Map<Int, Type>, i: Int|
+        match list_at(f.params, i) { Some(t) -> map_insert(acc, i, t), None -> acc })
+    },
+    _ -> inside,
+  }
+}
+
+fn answers_bool(op: Bytes) -> Bool =
+  op == b"eq" || op == b"ne" || op == b"lt" || op == b"le" || op == b"gt" || op == b"ge"
+    || op == b"and"
+    || op == b"or"
+
+/// A width-suffixed literal is typed by the operand site its operator files.
+fn lit_type(l: Lit) -> Option<Type> =
+  match l {
+    LInt(_) -> Some(int_type()),
+    LBool(_) -> Some(bool_type()),
+    LStr(_) -> Some(string_type()),
+    LBytes(_) -> Some(bytes_type()),
+    LFloat(_) -> Some(float_type()),
+    LDec(_) -> Some(decimal_type()),
+    LChar(_) -> Some(named_type(b"Char")),
+    LUnit -> Some(unit_type()),
+    LFixed(_, _) -> None,
+    LWide(_, _, _) -> None,
+    LBad -> None,
+  }
+
+test "a variable is typed by its binder, a call by what it calls and a field by its record" {
+  let at = |n: Int| { start: n, end: n + 1 };
+  let read = |slot: Int, n: Int|
+    { own: Borrowed, node: NVar({ name: b"x", slot: Some(slot) }), span: at(n) };
+  let point = TyRecord([{ name: b"x", ty: float_type() }, { name: b"y", ty: float_type() }]);
+  let field = { own: Borrowed, node: NField({ base: read(0, 1), field: b"y" }), span: at(2) };
+  let let_then_read = {
+    own: Borrowed,
+    node: NBlock({ stmts: [CLet({ name: b"v", slot: 1, value: field })], tail: Some(read(1, 3)) }),
+    span: at(4),
+  };
+  let sites = node_types(map_new(), [Some(point)], let_then_read);
+  let of = |n: Int| match map_get(sites, span_key(at(n))) { Some(t) -> t.node, None -> None };
+  assert_eq(of(1), Some(point));
+  assert_eq(of(2), Some(float_type()));
+  assert_eq(of(3), Some(float_type()));
+  assert_eq(of(4), Some(float_type()))
+}
+
+test "a slot a later binder takes with no known type holds none" {
+  let at = |n: Int| { start: n, end: n + 1 };
+  let read = |n: Int| { own: Borrowed, node: NVar({ name: b"x", slot: Some(0) }), span: at(n) };
+  let unknown = { own: Borrowed, node: NLabel(b"l"), span: at(1) };
+  let body = {
+    own: Borrowed,
+    node: NBlock({ stmts: [CLet({ name: b"x", slot: 0, value: unknown })], tail: Some(read(2)) }),
+    span: at(3),
+  };
+  let sites = node_types(map_new(), [Some(int_type())], body);
+  assert_eq(map_get(sites, span_key(at(2))), None)
+}
+
+test "a span two nodes of different types share is read as no type" {
+  let at = |n: Int| { start: n, end: n + 1 };
+  let lit = |l: Lit| { own: Borrowed, node: NLit(l), span: at(1) };
+  let body = {
+    own: Borrowed,
+    node: NList({ items: [lit(LInt(1)), lit(LBool(true))] }),
+    span: at(2),
+  };
+  let sites = node_types(map_new(), [], body);
+  assert_eq(
+    map_get(sites, span_key(at(1))),
+    Some({ ty: unknown_type(), args: [], node: Some(unknown_type()) }),
+  )
+}
+
+test "a node that shares a span with what the checker filed leaves the filing as it was" {
+  let at = |n: Int| { start: n, end: n + 1 };
+  let reference = fn_type([int_type()], bool_type(), row_empty());
+  let filing = map_insert(map_new(), span_key(at(1)), filed_as(reference, [int_type()]));
+  let named = { own: Borrowed, node: NVar({ name: b"f", slot: None }), span: at(1) };
+  let witness = { own: Borrowed, node: NLit(LInt(0)), span: at(1) };
+  let call = { own: Borrowed, node: NApp({ func: named, args: [witness] }), span: at(2) };
+  let sites = node_types(filing, [], call);
+  assert_eq(
+    map_get(sites, span_key(at(1))),
+    Some({ ty: reference, args: [int_type()], node: Some(unknown_type()) }),
+  );
+  assert_eq(
+    map_get(sites, span_key(at(2))),
+    Some({ ty: unknown_type(), args: [], node: Some(bool_type()) }),
+  )
+}
