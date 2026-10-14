@@ -12,7 +12,7 @@ import std.fs
 import std.fs (fs)
 import memo
 import memo (memo, memo_keep, Held, Query, Record, Run, Tally, answer, nothing_held, over_held,
-             ran_total, ran_for, started, tallies)
+             ran_total, ran_for, restored_for, started, tallies)
 import memo_files
 import unit (definition_hash)
 import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, ShippedModule,
@@ -36,7 +36,7 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, Sh
               shipped_data_bin, read_outline, named_imports, Outlined, OTest, OLaw, ShippedWants,
               shipped_wants_bin)
 import items (Module, Item, IType, ILaw, ImportDecl, INames, header, parse, import_decl_bin,
-              is_written)
+              homes_called, homes_declaring, is_written)
 import derive (dotted)
 import diagnostics (ParsedSource, parse_all, parse_at, parse_from, placed)
 import interface (imported, blanked)
@@ -391,8 +391,11 @@ fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, decode.write, a
       let package = match placing { Some(p) -> p.package, None -> 0 - 1 };
       let prefix = prefix_in(j, package);
       let targets = raw.imports.map(|d: ImportDecl| target_of(module, shipped, prefix, package, d));
-      let present = targets.filter(|t: Named|
+      let imported_there = targets.filter(|t: Named|
         if t.shipped { shipped_there(t.module) } else { placing_of(t.module) != None });
+      let homes = homes_called(module, src, || homes_declaring(shipped_text)).filter(|h: Bytes|
+        shipped_there(h) && !imported_there.any(|t: Named| t.module == h));
+      let present = imported_there;
       // An import that names nothing is refused with the shipped modules there are.
       let unread = if present.len() == targets.len() { [] } else {
         match memo.world(shipped_names_kind(), b"") {
@@ -433,7 +436,7 @@ fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, decode.write, a
         raw: raw,
         parsed: parsed,
         names: targets.map(|t: Named| t.module),
-        present: present.map(|t: Named| t.module),
+        present: present.map(|t: Named| t.module).concat(homes),
         placed: placed_by(placing),
         reading: {
           pkgs: pkgs,
@@ -776,7 +779,9 @@ pub fn owners_answer(input: Bytes) -> Bytes / {memo.read, decode.write, abort.ra
           },
           imports: imported,
           named: named_imports(m.parsed, imported),
-          written: m.parsed.module.imports.map(import_module_name),
+          written: m.parsed.module.imports.map(import_module_name).concat(
+            m.present.filter(|p: Bytes| !m.names.contains(p)),
+          ),
           embeds: [],
           embed_items: if items.fold(false, |b: Bool, x: ItemWants| b || x.wants.len() > 0) {
             items
@@ -1333,18 +1338,68 @@ pub fn group_answer_of(input: Bytes) -> Bytes / {Answering, abort.raise} = {
       },
       None -> {
         let members = asked.owners.map(|o: Bytes| owner_facts(named, o));
-        if alone {
-          let answer = cut_of(
-            asked.module,
-            unit_checked(named, members, imports_of(asked), entire, no_bodies),
-          );
-          offered_forms(group_query(), asked, members.map(|f: OwnerFacts| f.read), answer);
-          owned::group_kept(answer)
-        } else { owned::group_kept(group_settled(named, asked, members)) }
+        match refused_sibling(asked, members) {
+          Some(o) -> owned::group_kept(waiting(asked, o)),
+          None -> if alone {
+            let answer = cut_of(
+              asked.module,
+              unit_checked(named, members, imports_of(asked), entire, no_bodies),
+            );
+            offered_forms(group_query(), asked, members.map(|f: OwnerFacts| f.read), answer);
+            owned::group_kept(answer)
+          } else { owned::group_kept(group_settled(named, asked, members)) },
+        }
       },
     }
   }
 }
+
+/// An owner of `asked`'s module outside its unit, which a member mentions, whose group refuses and
+/// so shows no entry. A check against the module without it would refuse too, and its module's
+/// answer says what a check of it whole says whenever a group refuses.
+fn refused_sibling(
+  asked: GroupNamed,
+  members: List<OwnerFacts>,
+) -> Option<Bytes> / {Answering, abort.raise} = {
+  let at = |o: Bytes|
+    { module: asked.module, shipped: asked.shipped, tested: asked.tested, owner: o };
+  let unit = unit_named_of(at(asked.owners.at_or(0, b""))).owners;
+  members.fold([], |acc: List<Mention>, f: OwnerFacts| acc.concat(f.mentions)).fold(
+    None,
+    |found: Option<Bytes>, m: Mention|
+      match found {
+        Some(_) -> found,
+        None -> if m.module != asked.module && m.module != b"" { None } else {
+          declared_of(asked.module, asked.shipped, asked.tested, m.name).find(|o: Bytes|
+            !unit.contains(o) && (match owner_entry_of(at(o)) { Some(_) -> false, None -> true }))
+        },
+      },
+  )
+}
+
+/// What a group answers that waits on `owner`, whose group refuses: no member's entry, and a
+/// refusal its module's answer takes the whole check's place of, unchecked.
+fn waiting(asked: GroupNamed, owner: Bytes) -> owned::GroupAnswer / {abort.raise} =
+  {
+    ..owned::no_group(),
+    refused: [
+      error_at(
+        b"E0505",
+        0,
+        dummy_span(),
+        Bytes::concat_all([
+          backticked(asked.owners, b", "),
+          b" waits on `",
+          owner,
+          b"`, which does not check, and a check of `",
+          asked.module,
+          b"` whole refuses nothing",
+        ]),
+        b"the check was put off",
+        [b"this is Ply's fault, not the program's"],
+      ),
+    ],
+  }
 
 /// How a check reads an owner of its module that is none of its members: by the entry it shows
 /// any reader; by that entry less its rows, as its signing shows it, which waits on no body; or by
@@ -3718,11 +3773,14 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
         let times = ran.fold(Map::new(), |acc: Map<Bytes, Int>, k: Bytes|
           acc.insert(k, match acc.get(k) { Some(n) -> n + 1, None -> 1 }));
         let moved = sorted_bytes(now.keys().filter(|k: Bytes| was.get(k) != now.get(k)));
+        // A record taken back from before an edit undone moves its answer with no body run.
+        let back = restored_for(warm.run, query).filter(|k: Bytes|
+          moved.contains(k) && !times.contains(k));
         let thrice = sorted_bytes(
           times.fold([], |acc: List<Bytes>, k: Bytes, n: Int|
             if n > 2 { acc.push(k) } else { acc }),
         );
-        if moved != sorted_bytes(times.keys()) || thrice != [] {
+        if moved != sorted_bytes(times.keys().concat(back)) || thrice != [] {
           Some(
             Bytes::concat_all([
               b": moved ",
@@ -4769,7 +4827,7 @@ test "adding an unrelated effect keeps an answer through the store the fresh one
 /// Every answer the query `name` kept over a check of a small program, as its body wrote it.
 fn kept_answers(name: Bytes) -> List<Bytes> / {abort.raise} = {
   let held = fixed_over(nothing_held(), layered(b"pub fn step(n: Int) -> Int = n + 1\n"), []).held;
-  held.records.fold([], |acc: List<Bytes>, _key: Bytes, r: Record|
+  memo::current(held).fold([], |acc: List<Bytes>, _key: Bytes, r: Record|
     if r.query != name { acc }
     else { match held.outputs.get(r.output) { Some(out) -> acc.push(out), None -> acc } })
 }
@@ -5120,6 +5178,58 @@ fn paired(base: Bytes, step: Bytes) -> List<Source> =
 fn owners_ran(run: Run, name: Bytes) -> List<Bytes> / {abort.raise} =
   ran_for(run, name).map(|b: Bytes| decoded(b, owner_named_bin(), "an owner's name").owner)
 
+test "a group that refused and is mended checks nothing again, each record taken back" {
+  let source = |body: Bytes|
+    [
+      {
+        name: b"lib",
+        src: Bytes::concat_all([
+          b"pub fn base(n: Int) -> Int = ",
+          body,
+          b"\n\npub fn over(n: Int) -> Int = base(n) + 1\n\npub fn top(n: Int) -> Int = over(n) * 2\n\n",
+          b"pub fn apart(n: Int) -> Int = n - 1\n",
+        ]),
+      },
+    ];
+  let cold = answered_over(nothing_held(), source(b"n + 1"));
+  let broken = answered_over(cold.held, source(b"n + true"));
+  assert_eq(said(broken.outcome), said(analyse(parse_all(source(b"n + true")))));
+  let mended = answered_over(broken.held, source(b"n + 1"));
+  assert_eq(said(mended.outcome), said(cold.outcome));
+  assert_eq(groups_ran(mended.run, group_query()), [])
+}
+
+test "a group that reads one that refuses waits for it unchecked, and its module says what a check of it whole says" {
+  let source = |body: Bytes|
+    [
+      {
+        name: b"lib",
+        src: Bytes::concat_all([
+          b"pub fn base(n: Int) -> Int = ",
+          body,
+          b"\n\npub fn over(n: Int) -> Int = base(n) + 1\n\npub fn top(n: Int) -> Int = over(n) * 2\n\n",
+          b"pub fn apart(n: Int) -> Int = n - 1\n",
+        ]),
+      },
+    ];
+  let cold = answered_over(nothing_held(), source(b"n + 1"));
+  let broken = answered_over(cold.held, source(b"n + true"));
+  assert_eq(said(broken.outcome), said(analyse(parse_all(source(b"n + true")))));
+  let waiting = memo::current(broken.held).fold([], |acc: List<Bytes>, _key: Bytes, r: Record|
+    if r.query != group_query() { acc } else {
+      match broken.held.outputs.get(r.output) {
+        None -> acc,
+        Some(out) -> {
+          let a = owned::group_whole(decoded(out, owned::kept_group_bin(), "a group's answer"));
+          if a.refused.any(|d: Diag| d.message.index_of(b" waits on ") != None) {
+            acc.concat(decoded(r.input, group_named_bin(), "a group's names").owners)
+          } else { acc }
+        },
+      }
+    });
+  assert_eq(waiting.sort(), [b"over", b"top"])
+}
+
 test "a unit whose group refuses is hashed without asking its own members' hashes" {
   let keyed = |name: Bytes, statement: Bytes, more: Bytes|
     [
@@ -5395,7 +5505,7 @@ test "a transparent function read from another module calls what its own module 
   )
 }
 
-test "a call on a value reads a home module its module imports, itself or through another, whatever the import names" {
+test "a call on a value reads a home module through any import of it, or none" {
   let shipped = [
     {
       name: b"std.bytes",
@@ -5412,7 +5522,8 @@ test "a call on a value reads a home module its module imports, itself or throug
   assert_eq(refused_over(main(b"import std.bytes (other)\n"), shipped), []);
   assert_eq(refused_over(main(b"import std.bytes as held\n"), shipped), []);
   assert_eq(refused_over(main(b"import std.through\n"), shipped), []);
-  assert_eq(refused_over(main(b""), shipped), [b"`Bytes` has no function `twice`"])
+  // A module outside the library reads it with no import at all.
+  assert_eq(refused_over(main(b""), shipped), [])
 }
 
 test "a group checked against entries reads what a function it calls on a value settled, though its text names nothing of that function's module" {
@@ -5501,7 +5612,7 @@ test "the groups a signature edit moves in one module are checked again, and no 
 /// Whether the record `held` keeps of the group `g` took what a check of its whole module offered
 /// through `whole`: such a record reads the definition of the query that offered it.
 fn took_whole(held: Held, g: GroupNamed) -> Bool / {abort.raise} =
-  held.records.fold(false, |found: Bool, _: Bytes, r: memo::Record|
+  memo::current(held).fold(false, |found: Bool, _: Bytes, r: memo::Record|
     found
       || (r.query == group_query() && r.input == bin::encode(g, group_named_bin())
       && r.reads.fold(false, |any: Bool, read: memo::Read|
@@ -5532,7 +5643,7 @@ test "an edit that moves one group of a module checks it alone, and one that mov
 /// Whether the record `held` keeps of `module`'s answer under the query hash `hash` read an entry:
 /// only a check of the module whole, made while it was answered, reads one.
 fn checked_whole_in(held: Held, hash: Bytes, module: Bytes) -> Bool / {abort.raise} =
-  held.records.fold(false, |found: Bool, _: Bytes, r: memo::Record|
+  memo::current(held).fold(false, |found: Bool, _: Bytes, r: memo::Record|
     found
       || (r.query == hash
       && r.input == bin::encode({ module: module, shipped: false, tested: false }, named_bin())
@@ -5574,7 +5685,7 @@ fn leaning(lib: Bytes) -> List<Source> =
 /// Whether `held` keeps a check of a module whole that asked for a group of that module or for an
 /// owner's entry there: a group asks for that check, so the check would wait on what waits on it.
 fn whole_asked_its_own(held: Held) -> Bool / {abort.raise} =
-  held.records.fold(false, |found: Bool, _: Bytes, r: memo::Record|
+  memo::current(held).fold(false, |found: Bool, _: Bytes, r: memo::Record|
     found
       || (r.query == whole_query()
       && {
@@ -5735,7 +5846,7 @@ fn shipped_held(shipped: List<Source>) -> Held / {abort.raise} = {
 fn pack_of(held: Held) -> Map<String, Bytes> / {abort.raise} =
   memo::packed_files({
     ..held,
-    records: held.records.fold(Map::new(), |acc: Map<Bytes, Record>, k: Bytes, r: Record|
+    records: memo::current(held).fold(Map::new(), |acc: Map<Bytes, Record>, k: Bytes, r: Record|
       if shipped_queries().contains(r.query) { acc.insert(k, r) } else { acc }),
   })
 
@@ -5781,7 +5892,7 @@ test "a load fetches a module's read from a pack for what the read offered nothi
     },
   ];
   let held = shipped_held(shipped);
-  let read = held.records.fold(b"", |found: Bytes, _: Bytes, r: Record|
+  let read = memo::current(held).fold(b"", |found: Bytes, _: Bytes, r: Record|
     if r.query == owners_query() { r.output } else { found });
   let user = [{ name: b"main", src: b"import std.many (f0)\npub fn main() -> Int = f0()\n" }];
   let load = fixed_beside(nothing_held(), pack_of(held), user, shipped);

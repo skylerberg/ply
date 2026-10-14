@@ -26,7 +26,8 @@ import type_syntax (TypeExpr, TRecord, TUnit, TCon, TFn, RowExpr, AtomExpr, Mode
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
 import exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, block_expr, expr_span, no_expr,
               fn_param, param, dump_expr, dump_param, shown_binder, cases_binder, set_binder,
-              hidden_binder, case_at, case_identity, case_body, listing)
+              hidden_binder, free_names, free_binder, case_at, case_identity, case_body, listing,
+              home_modules, sees_homes)
 import patterns (LStr)
 
 // --- The tree ---------------------------------------------------------------
@@ -2201,9 +2202,156 @@ pub fn run(input: Input, parser: Parser) -> Parsed<Module> / {abort.raise} = {
   };
   {
     parser: done.parser,
-    node: { doc: module_doc(input), imports: gathered, items: published(done.items) },
+    node: {
+      doc: module_doc(input),
+      imports: gathered.concat(free_imports(input, gathered)),
+      items: published(done.items),
+    },
   }
 }
+
+/// A hidden import of each module of [`free_names`] whose names the text reads where it declares
+/// and selects none of them, under its [`free_binder`]: a name after `.` or `::` is another's, and
+/// one after `fn`, `type` or `effect set` is the module's own. A parse and a header read alike.
+fn free_imports(input: Input, imports: List<ImportDecl>) -> List<ImportDecl> = {
+  let kind = |i: Int| match input.tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
+  let imported = importing(input);
+  let selected = imports.fold(Map::new(), |acc: Map<Bytes, Bool>, d: ImportDecl|
+    match d.kind {
+      INames(ns) -> ns.fold(acc, |a: Map<Bytes, Bool>, n: Ident| a.insert(n.name, true)),
+      _ -> acc,
+    });
+  let declared = range(1, input.token_count).fold(Map::new(), |acc: Map<Bytes, Bool>, i: Int|
+    match kind(i) {
+      Identifier(n) -> if kind(i - 1) == keyword_fn() || kind(i - 1) == keyword_type()
+          || (i > 1 && kind(i - 2) == keyword_effect()) { acc.insert(n, true) }
+      else { acc },
+      _ -> acc,
+    });
+  free_names().fold([], |acc: List<ImportDecl>, f: { module: Bytes, names: List<Bytes> }| {
+    let used = range(0, input.token_count).fold(None, |found: Option<Span>, i: Int|
+      match found {
+        Some(_) -> found,
+        None -> match kind(i) {
+          Identifier(n) -> if !f.names.contains(n) || declared.contains(n) || selected.contains(n)
+              || imported.at(i) == Some(true)
+              || (i > 0 && (kind(i - 1) == token_dot() || kind(i - 1) == token_coloncolon())) {
+            None
+          } else {
+            match input.tokens.at(i) { Some(t) -> Some(span_between(t.start, t.end)), None -> None }
+          },
+          _ -> None,
+        },
+      });
+    match used {
+      Some(sp) -> acc.push(hidden_import(f.module, free_binder(f.module), sp)),
+      None -> acc,
+    }
+  })
+}
+
+/// The names `src` calls on a value, `x.name(..)`, or names a function through a type under,
+/// `T::name`: what a home module of the language's types may answer. A call on a bare name the
+/// text never binds is a perform, and an import calls nothing.
+pub fn called_names(src: Bytes) -> Map<Bytes, Bool> / {abort.raise} = {
+  let input = start(src).input;
+  let kind = |i: Int| match input.tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
+  let imported = importing(input);
+  let bound = standing(input);
+  let performed = |at: Int|
+    match kind(at) {
+      Identifier(e) -> !bound.contains(e) && kind(at - 1) != token_dot(),
+      _ -> false,
+    };
+  range(2, input.token_count).fold(Map::new(), |acc: Map<Bytes, Bool>, i: Int|
+    match kind(i) {
+      Identifier(n) -> if imported.at(i) == Some(true) { acc }
+      else if kind(i - 1) == token_dot()
+          && (kind(i + 1) == token_lparen() || kind(i + 1) == token_lbracket())
+          && !performed(i - 2) { acc.insert(n, true) }
+      else if kind(i - 1) == token_coloncolon()
+          && (match kind(i - 2) { Identifier(t) -> starts_upper(t), _ -> false }) {
+        acc.insert(n, true)
+      } else { acc },
+      _ -> acc,
+    })
+}
+
+/// The names `text` publishes a function of a type under, `pub fn T::name`, read from its bytes
+/// without a lex: a home module is read so for each module that calls on a value, whole or as an
+/// importer reads it. A comment that spells such a declaration adds its name too, which only reads
+/// a home where none is called.
+pub fn type_function_names(text: Bytes) -> Map<Bytes, Bool> / {abort.raise} =
+  text.split(b"pub fn ").drop(1).fold(Map::new(), |acc: Map<Bytes, Bool>, piece: Bytes| {
+    let head = ident_length(piece, 0);
+    if head == 0 || !starts_upper(piece.slice(0, head)) || head + 2 > piece.len()
+        || piece.slice(head, head + 2) != b"::" { acc } else {
+      let n = ident_length(piece, head + 2);
+      if n == 0 { acc } else { acc.insert(piece.slice(head + 2, head + 2 + n), true) }
+    }
+  })
+
+/// How many bytes of `b` from `from` on a name spells.
+fn ident_length(b: Bytes, from: Int) -> Int / {abort.raise} =
+  iterate(from, b.len() - from + 1, |i: Int|
+    if i < b.len() && is_ident_byte(b.at(i)) { Continue(i + 1) } else { Stop(i - from) })
+
+fn is_ident_byte(c: Int) -> Bool =
+  (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+
+/// A home module and the names it declares a function of a type under.
+pub type HomeNames = { home: Bytes, names: Map<Bytes, Bool> }
+
+/// The home modules the module `name` reads with no import: each that `declared` says declares a
+/// function of a type under a name `src` calls ([`called_names`]), where the module sees them.
+pub fn homes_called<| e>(
+  name: Bytes,
+  src: Bytes,
+  declared: () -> List<HomeNames> / e,
+) -> List<Bytes> / {abort.raise | e} =
+  if !sees_homes(name) { [] } else {
+    let called = called_names(src);
+    if called.len() == 0 { [] } else { homes_for(called, declared()) }
+  }
+
+/// Each home of `declared` that declares one of the names `called`.
+pub fn homes_for(called: Map<Bytes, Bool>, declared: List<HomeNames>) -> List<Bytes> =
+  declared.filter(|d: HomeNames| called.keys().any(|n: Bytes| d.names.contains(n))).map(
+    |d: HomeNames| d.home,
+  )
+
+/// What each home module `text_of` holds declares, as [`homes_called`] reads it.
+pub fn homes_declaring<| e>(
+  text_of: (Bytes) -> Option<Bytes> / e,
+) -> List<HomeNames> / {abort.raise | e} =
+  home_modules().fold([], |acc: List<HomeNames>, h: Bytes|
+    match text_of(h) {
+      Some(text) -> acc.push({ home: h, names: type_function_names(text) }),
+      None -> acc,
+    })
+
+/// Whether each token of `input` is part of an `import`: its keyword, its path and its selection,
+/// which end at a name that follows a name.
+fn importing(input: Input) -> Array<Bool> =
+  Array::of_list(
+    range(0, input.tokens.len()).fold(
+      { flags: [], on: false },
+      |s: { flags: List<Bool>, on: Bool }, i: Int| {
+        let k = token_at(input, i).kind;
+        let on = k == keyword_import()
+          || (s.on
+          && (match k {
+            Identifier(_) -> match token_at(input, i - 1).kind {
+              Identifier(_) -> false,
+              _ -> true,
+            },
+            _ ->
+              k == token_dot() || k == token_lparen() || k == token_comma() || k == token_rparen(),
+          }));
+        { flags: s.flags.push(on), on: on }
+      },
+    ).flags,
+  )
 
 /// Where the module first writes a set literal, which calls `std.set`.
 fn first_set(input: Input) -> Option<Span> =
@@ -2376,14 +2524,37 @@ pub fn header(src: Bytes) -> Option<Module> / {abort.raise} = {
       None -> with_shown,
       Some(sp) -> with_shown.push(hidden_import(b"cases", cases_binder(), sp)),
     };
+    let with_set = match first_set(input) {
+      None -> with_cased,
+      Some(sp) -> with_cased.push(hidden_import(b"set", set_binder(), sp)),
+    };
     Some({
       doc: module_doc(input),
-      imports: match first_set(input) {
-        None -> with_cased,
-        Some(sp) -> with_cased.push(hidden_import(b"set", set_binder(), sp)),
-      },
+      imports: with_set.concat(free_imports(input, with_set)),
       items: [],
     })
+  }
+}
+
+test "a name read with no import pulls its module, and one the module declares or imports pulls nothing" {
+  let freed = |src: Bytes|
+    parse(src).node.imports.fold([], |acc: List<Bytes>, d: ImportDecl|
+      match d.kind {
+        IAlias(a) -> if a.name.starts_with(b"?free.") { acc.push(a.name) } else { acc },
+        _ -> acc,
+      });
+  assert_eq(freed(b"fn main() -> Unit / {Console} = print(\"hi\")\n"), [b"?free.console"]);
+  assert_eq(freed(b"fn f(s: Set<Int>) -> Int = abs(0 - 1)\n"), [b"?free.set", b"?free.math"]);
+  assert_eq(freed(b"fn print(s: String) -> Unit = ()\nfn main() -> Unit = print(\"hi\")\n"), []);
+  assert_eq(
+    freed(b"import std.console (print)\nfn main() -> Unit / {Console} = print(\"hi\")\n"),
+    [b"?free.console"],
+  );
+  assert_eq(freed(b"fn f(x: Int) -> Int = x.abs() + m::abs(x)\n"), []);
+  // A header says the same, for a load to pull what the parse reads.
+  match header(b"fn main() -> Unit / {Console} = print(\"hi\")\n") {
+    Some(m) -> assert_eq(m.imports.len(), 1),
+    None -> assert(false),
   }
 }
 
@@ -2455,31 +2626,20 @@ pub fn unimported(src: Bytes) -> List<Span> / {abort.raise} = {
 /// Each name `input` writes where a local binding of it can stand: not after a dot or a `::`, not
 /// before a dot, not in an `import`, and not as the effect an `effect` declares. A name written
 /// nowhere so is an effect's or a module's, and a call on it a perform.
-fn standing(input: Input) -> Map<Bytes, Bool> =
-  range(0, input.tokens.len()).fold(
-    { names: Map::new(), importing: false },
-    |s: { names: Map<Bytes, Bool>, importing: Bool }, i: Int| {
-      let k = token_at(input, i).kind;
-      let before = if i == 0 { EndOfInput } else { token_at(input, i - 1).kind };
-      // An import runs through its path and its selection, and ends at a name that follows a name.
-      let importing = k == keyword_import()
-        || (s.importing
-        && (match k {
-          Identifier(_) -> match before { Identifier(_) -> false, _ -> true },
-          _ -> k == token_dot() || k == token_lparen() || k == token_comma() || k == token_rparen(),
-        }));
-      {
-        importing: importing,
-        names: match k {
-          Identifier(n) -> if importing || before == token_dot() || before == token_coloncolon()
-              || before == keyword_effect()
-              || token_at(input, i + 1).kind == token_dot() { s.names }
-          else { s.names.insert(n, true) },
-          _ -> s.names,
-        },
-      }
-    },
-  ).names
+fn standing(input: Input) -> Map<Bytes, Bool> = {
+  let imported = importing(input);
+  range(0, input.tokens.len()).fold(Map::new(), |names: Map<Bytes, Bool>, i: Int|
+    match token_at(input, i).kind {
+      Identifier(n) -> {
+        let before = if i == 0 { EndOfInput } else { token_at(input, i - 1).kind };
+        if imported.at(i) == Some(true) || before == token_dot() || before == token_coloncolon()
+            || before == keyword_effect()
+            || token_at(input, i + 1).kind == token_dot() { names }
+        else { names.insert(n, true) }
+      },
+      _ -> names,
+    })
+}
 
 fn scanned(input: Input, parser: Parser, bound: Map<Bytes, Bool>) -> Scan =
   input.tokens.fold(
@@ -3583,6 +3743,37 @@ test "a header holds the imports a whole parse finds, the hidden ones among them
   assert(same(b"type T = | T(Int)\nkey for T by gen\nfn gen(t: T) -> Int = 0\n"), None);
   assert(same(b"import std.bin\ntype T = { a: Int }\nderive bin for T\n"), None);
   assert_eq(header(b"fn f() -> Int = 1\nimport std.list\n"), None)
+}
+
+test "a module calls a name on a value or through a type, and none in an import or a perform" {
+  let called = |src: Bytes| called_names(src).keys();
+  assert_eq(called(b"fn f(xs: List<Int>) -> Int = xs.reverse().len()\n"), [b"len", b"reverse"]);
+  assert_eq(called(b"fn f() -> List<Int> = List::rotate([1], 1)\n"), [b"rotate"]);
+  assert_eq(called(b"import src.z (z)\nfn f() -> Int = z()\n"), []);
+  assert_eq(called(b"fn f() -> Unit / {log.line} = log.line(\"x\")\n"), []);
+  assert_eq(called(b"fn f() -> Int = abs(0 - 1)\n"), [])
+}
+
+test "a module reads the home modules that declare a name it calls, unless it is beneath them" {
+  let declared = [
+    {
+      home: b"std.list",
+      names: type_function_names(
+        b"/// Doc.\npub fn List::reverse<a>(xs: List<a>) -> List<a> = xs\nfn helper() -> Int = 1\n",
+      ),
+    },
+    {
+      home: b"std.option",
+      names: type_function_names(b"pub fn Option::or_else<a>(o: Option<a>) -> Option<a> = o\n"),
+    },
+  ];
+  assert_eq(declared.map(|d: HomeNames| d.names.keys()), [[b"reverse"], [b"or_else"]]);
+  let src = b"fn f(xs: List<Int>) -> Int = xs.reverse().len()\n";
+  let homes = |name: Bytes, src: Bytes| homes_called(name, src, || declared);
+  assert_eq(homes(b"app", src), [b"std.list"]);
+  assert_eq(homes(b"std.oid", src), [b"std.list"]);
+  assert_eq(homes(b"std.gen", src), []);
+  assert_eq(homes(b"app", b"fn f(xs: List<Int>) -> Int = xs.len()\n"), [])
 }
 
 test "an importer reads no test or law, nor a private item or an import only they reach" {

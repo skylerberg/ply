@@ -99,6 +99,8 @@ pub type Run = {
   took: Map<Bytes, Int>,
   ran: Map<Bytes, Int>,
   inputs: List<{ query: Bytes, input: Bytes }>,
+  /// Each record the run took back from before an edit it found undone, with no body run.
+  restored: List<{ query: Bytes, input: Bytes }>,
   settling: Bool,
   marked: Map<Int, List<Bytes>>,
   offers: Map<Bytes, Offer>,
@@ -119,6 +121,7 @@ fn new_run() -> Run =
     took: Map::new(),
     ran: Map::new(),
     inputs: [],
+    restored: [],
     settling: false,
     marked: Map::new(),
     offers: Map::new(),
@@ -199,6 +202,12 @@ pub fn tallies(run: Run) -> List<Tally> =
     if acc.contains(k) { acc } else { acc.insert(k, 0) }).keys(
   ).map(|name: Bytes| { query: name, took: counted(run.took, name), ran: counted(run.ran, name) })
 
+/// Each input of the query `name` the run took a record back for.
+pub fn restored_for(run: Run, name: Bytes) -> List<Bytes> =
+  run.restored.filter(|r: { query: Bytes, input: Bytes }| r.query == name).map(
+    |r: { query: Bytes, input: Bytes }| r.input,
+  )
+
 /// Each input the run ran the body of the query `name` for, in the order it ran them.
 pub fn ran_for(run: Run, name: Bytes) -> List<Bytes> =
   run.inputs.filter(|r: { query: Bytes, input: Bytes }| r.query == name).map(
@@ -255,6 +264,28 @@ pub fn settles(said: Said) -> Option<Bool> =
 
 /// Where a store laid out as a directory keeps a record and an answer, relative to its root.
 pub fn record_path(key: Bytes) -> String / {abort.raise} = "records/" ++ key.hex_of()
+
+/// Where the record a new one under `key` replaced is kept: a key of the same width that no query
+/// makes, so nothing marks it.
+pub fn earlier_key(key: Bytes) -> Bytes = blake3(b"earlier\x00".concat(key))
+
+/// The records `held` keeps as what their keys answer, the earlier ones left out.
+pub fn current(held: Held) -> Map<Bytes, Record> / {abort.raise} = {
+  let earlier = held.records.fold(Map::new(), |acc: Map<Bytes, Bool>, k: Bytes, _: Record|
+    acc.insert(earlier_key(k), true));
+  held.records.fold(Map::new(), |acc: Map<Bytes, Record>, k: Bytes, r: Record|
+    if earlier.contains(k) { acc } else { acc.insert(k, r) })
+}
+
+/// Keeps the record under `key` as the earlier one, where `next` is another: what an edit that is
+/// undone answers again.
+fn kept_earlier(key: Bytes, next: Record) -> Unit / {memo_keep.read, memo_keep.write} =
+  match memo_keep.record(key) {
+    Some(old) -> if old.output != next.output || old.reads != next.reads {
+      memo_keep.adopt(earlier_key(key), old)
+    },
+    None -> (),
+  }
 
 pub fn output_path(digest: Bytes) -> String / {abort.raise} = "outputs/" ++ digest.hex_of()
 
@@ -777,7 +808,36 @@ fn settled_at<| e>(
                   if s.ok {
                     memo_keep.unmark(key, marks);
                     took(s.run, name, r.output)
-                  } else { adopted(queries, s.run, q, key, input, marks, Some(r), left - 1) }
+                  } else {
+                    // An edit undone answers as before: the record it replaced stands again, its
+                    // reads linked to the key since it was first kept.
+                    match memo_keep.record(earlier_key(key)) {
+                      Some(e) -> {
+                        let t = stands(queries, s.run, e.reads, left - 1);
+                        if t.ok && memo_keep.output(e.output) != None {
+                          memo_keep.adopt(earlier_key(key), r);
+                          memo_keep.adopt(key, { ..e, height: max(e.height, r.height) });
+                          memo_keep.unmark(key, marks);
+                          // What asked the answer it replaces asks again where the two differ.
+                          took(
+                            answer_moved(
+                              queries,
+                              {
+                                ..t.run,
+                                restored: t.run.restored.push({ query: name, input: input }),
+                              },
+                              asked_id(name, input),
+                              Some(r.output),
+                              e.output,
+                            ),
+                            name,
+                            e.output,
+                          )
+                        } else { adopted(queries, t.run, q, key, input, marks, Some(r), left - 1) }
+                      },
+                      None -> adopted(queries, s.run, q, key, input, marks, Some(r), left - 1),
+                    }
+                  }
                 },
               }
             }
@@ -1091,11 +1151,9 @@ fn executed<| e>(
       // group gone, say) still settles after what it reads once it reads it again.
       let was = memo_keep.height(key);
       let height = if was > s.height { was } else { s.height };
-      memo_keep.keep(
-        key,
-        { query: q.hash, input: input, reads: s.reads, output: d, height: height },
-        output,
-      );
+      let rec = { query: q.hash, input: input, reads: s.reads, output: d, height: height };
+      kept_earlier(key, rec);
+      memo_keep.keep(key, rec, output);
       // A new record's askers take their heights from it as they finish; one that grew lifts those
       // that asked it before.
       if was > 0 && height > was { raised(queries, asked_id(q.name, input), height) };
@@ -1163,11 +1221,9 @@ pub fn recorded<| e>(
     m || now
   });
   if moved { memo_keep.mark(key) };
-  memo_keep.keep(
-    key,
-    { query: hash, input: b"", reads: reads, output: digest_of(Some(output)), height: 0 },
-    output,
-  );
+  let rec = { query: hash, input: b"", reads: reads, output: digest_of(Some(output)), height: 0 };
+  kept_earlier(key, rec);
+  memo_keep.keep(key, rec, output);
   if marks.len() > 0 { memo_keep.unmark(key, marks) }
 }
 
@@ -1495,6 +1551,21 @@ test "an answer that comes out the same stops what an edit moves" {
   assert_eq(longer_now.executed, 2)
 }
 
+test "an edit undone answers as before with no body run, from the records it replaced" {
+  let q = test_queries(b"h1");
+  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"longer", b"a");
+  let moved = asked_over(q, edited(first.world, b"a", b"forty"), b"longer", b"a");
+  assert_eq(moved.output, b"long 5");
+  assert_eq(moved.executed, 2);
+  let undone = asked_over(q, edited(moved.world, b"a", b"four"), b"longer", b"a");
+  assert_eq(undone.output, b"long 4");
+  assert_eq(undone.executed, 0);
+  // And done again: the record undoing replaced is the earlier one now.
+  let redone = asked_over(q, edited(undone.world, b"a", b"forty"), b"longer", b"a");
+  assert_eq(redone.output, b"long 5");
+  assert_eq(redone.executed, 0)
+}
+
 test "what a driver's asks reach leaves out a record the run settled for a mark" {
   let q = test_queries(b"h1");
   let every = Map::new().insert(b"h1", true).insert(b"l1", true);
@@ -1733,7 +1804,7 @@ test "a trusted packed answer stands as packed, and the run keeps nothing of it"
   // Only `longer` runs: `length` stands as packed, though the world this run reads holds nothing.
   assert_eq(done.value.output, b"long 4");
   assert_eq(done.value.executed, 1);
-  assert_eq(done.held.records.len(), 1)
+  assert_eq(current(done.held).len(), 1)
 }
 
 /// `longer` asked of `a` over `held` with `packed` beside it, trusted.

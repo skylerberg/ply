@@ -787,7 +787,14 @@ fn laid(
 
 // --- Placing it -----------------------------------------------------------------
 
-type Placing = { name: Bytes, bucket: Int, text: Bytes, reaches: List<Bytes> }
+type Placing = {
+  name: Bytes,
+  bucket: Int,
+  text: Bytes,
+  reaches: List<Bytes>,
+  /// The definitions its C defines: a group's members, or its own.
+  defines: List<Bytes>,
+}
 
 /// A body's placeholders and what each names, which its bucket's table is made of.
 type Marked = { body: UnitBody, holes: List<Hole>, keys: List<Option<Bytes>> }
@@ -806,6 +813,52 @@ fn prototype(symbol: Bytes, head: Head) -> Bytes =
     b");\n",
   ])
 
+fn far_table(id: Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all([b"ply_far_", hex_digit(id / 16), hex_digit(id % 16)])
+
+/// Where the head defines `PLY_FAR`, each of `reached`, a bucket's calls into other buckets, is
+/// called through `table`, an address apiece: a load and a call of what it loads, which reaches
+/// anywhere, where a call of the function's name reaches only so far.
+fn far_calls(table: Bytes, reached: List<Taken>) -> Bytes / {abort.raise} =
+  if reached.len() == 0 { b"" } else {
+    Bytes::concat_all([
+      b"#ifdef PLY_FAR\nstatic void *const ",
+      table,
+      b"[] = {",
+      Bytes::concat_all(reached.map(|t: Taken| Bytes::concat_all([b" (void *)&", t.symbol, b","]))),
+      b" 0 };\n",
+      Bytes::concat_all(
+        range(0, reached.len()).map(|i: Int| {
+          let t = reached.get(i);
+          Bytes::concat_all([
+            b"#define ",
+            t.symbol,
+            b"(...) ((",
+            t.head.answer,
+            b" (*)(PlyCtx*",
+            Bytes::concat_all(t.head.params.map(|p: Bytes| b", ".concat(p))),
+            b"))",
+            table,
+            b"[",
+            ascii_of_int(i),
+            b"])(__VA_ARGS__)\n",
+          ])
+        }),
+      ),
+      b"#endif\n",
+    ])
+  }
+
+/// The end of what [`far_calls`] defines, so the bucket after this one reads its names as written.
+fn far_ended(reached: List<Taken>) -> Bytes / {abort.raise} =
+  if reached.len() == 0 { b"" } else {
+    Bytes::concat_all([
+      b"#ifdef PLY_FAR\n",
+      Bytes::concat_all(reached.map(|t: Taken| Bytes::concat_all([b"#undef ", t.symbol, b"\n"]))),
+      b"#endif\n",
+    ])
+  }
+
 fn bucket_key(p: Placing) -> Bytes / {abort.raise} =
   Bytes::concat_all([hex_digit(p.bucket / 16), hex_digit(p.bucket % 16), b"\x00", p.name])
 
@@ -813,7 +866,8 @@ fn bucket_key(p: Placing) -> Bytes / {abort.raise} =
 /// prototypes of what its bodies reach, then the runtime's definitions, what the unit says about
 /// itself and `tables`, what it lays out for its loader: one translation unit that the loader also
 /// compiles in parts, cut on the marks. A bucket declares its table and never defines it, so its C
-/// reads the same whatever positions the table holds.
+/// reads the same whatever positions the table holds, and calls what another defines as
+/// [`far_calls`] says.
 fn assembled(
   runtime: Runtime,
   bodies: List<Placing>,
@@ -829,10 +883,21 @@ fn assembled(
     if last >= 0 && acc.get(last).get(0).bucket == p.bucket { acc.set(last, acc.get(last).push(p)) }
     else { acc.push([p]) }
   });
+  let reached_by = |group: List<Placing>| {
+    let here = group.fold(Map::new(), |acc: Map<Bytes, Bool>, p: Placing|
+      p.defines.fold(acc, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)));
+    ordered(group.fold([], |acc: List<Bytes>, p: Placing| acc.concat(p.reaches))).fold(
+      [],
+      |acc: List<Taken>, name: Bytes|
+        if here.contains(name) { acc }
+        else { match taken.get(name) { Some(t) -> acc.push(t), None -> acc } },
+    )
+  };
   Bytes::concat_all([
     runtime.head,
     Bytes::concat_all(
-      groups.map(|group: List<Placing>|
+      groups.map(|group: List<Placing>| {
+        let reached = reached_by(group);
         Bytes::concat_all([
           bucket_mark(group.get(0).bucket),
           b"\n",
@@ -852,9 +917,12 @@ fn assembled(
                 match taken.get(name) { Some(t) -> prototype(t.symbol, t.head), None -> b"" },
             ),
           ),
+          far_calls(far_table(group.get(0).bucket), reached),
           b"\n",
           Bytes::concat_all(group.map(|p: Placing| p.text.concat(b"\n"))),
-        ])),
+          far_ended(reached),
+        ])
+      }),
     ),
     runtime.tail,
     embedded(exports),
@@ -956,6 +1024,7 @@ pub fn produce(
         match locals.get(b) { Some(l) -> l, None -> Map::new() },
       ),
       reaches: reaches_of(m.body.name, m.body.tables),
+      defines: answered(m.body),
     }
   });
   let rows = keyed.fold([], |acc: List<BucketRow>, b: Int, ks: Map<Bytes, Bool>|
@@ -2445,6 +2514,47 @@ test "a bucket holds the bodies its names decide and declares what they reach, a
     assert_eq(bucket_part(p.text, bucket_of(name)).split(defined).len() - 1, 1);
     assert(head.index_of(b"f_".concat(name)) == None, None)
   })
+}
+
+test "where the head defines `PLY_FAR` a bucket calls what another defines through its table, and its own directly" {
+  let caller = b"m.caller";
+  let callee = bucket_apart(b"m.callee", [caller]);
+  let p = produce(
+    { head: b"/* head */\n", tail: b"/* tail */\n", helpers: [], builtins: [], identity: b"r" },
+    [],
+    [{ name: caller, arity: 0, constant: false }, { name: callee, arity: 2, constant: false }],
+    1,
+    Map::of_entries([
+      { key: caller, value: one_body(caller, [callee]) },
+      { key: callee, value: headed(one_body(callee, []), word_head(2)) },
+    ]),
+  );
+  let calling = bucket_part(p.text, bucket_of(caller));
+  let shown = Some(String::of_bytes_lossy(calling));
+  let table = far_table(bucket_of(caller));
+  let opened = calling.index_of(
+    Bytes::concat_all([
+      b"#ifdef PLY_FAR\nstatic void *const ",
+      table,
+      b"[] = { (void *)&f_",
+      callee,
+      b", 0 };\n#define f_",
+      callee,
+      b"(...) ((Word (*)(PlyCtx*, Word, Word))",
+      table,
+      b"[0])(__VA_ARGS__)\n#endif\n",
+    ]),
+  );
+  let defined = calling.index_of(Bytes::concat_all([b"Word f_", caller, b"(PlyCtx *ctx)"]));
+  let ended = calling.index_of(
+    Bytes::concat_all([b"#ifdef PLY_FAR\n#undef f_", callee, b"\n#endif\n"]),
+  );
+  match ((opened, defined, ended)) {
+    (Some(o), Some(d), Some(x)) -> assert(o < d && d < x, shown),
+    _ -> assert(false, shown),
+  };
+  assert(calling.index_of(b"#define f_".concat(caller)) == None, shown);
+  assert(bucket_part(p.text, bucket_of(callee)).index_of(b"PLY_FAR") == None, None)
 }
 
 // A call written to another head than its callee's is C two compilers disagree over silently, as

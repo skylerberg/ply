@@ -22,7 +22,8 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ESimulate, EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param,
               NamedArg, MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic,
               is_ordered, ETagged, Tagged, Hole, tagged_parser, tagged_filler, case_at,
-              case_identity, call_operator, written_operator, Slot, FromName, FromDefault)
+              case_identity, call_operator, written_operator, Slot, FromName, FromDefault,
+              sees_homes)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -255,7 +256,8 @@ pub type OwnCall = { callee: Bytes, span: Span }
 /// first, or the bare `name` where `qualifier` is empty; with no `name` either it calls the
 /// function the value holds in the field written. A name written `T::name` at `span` is
 /// `qualifier::name`. `callee` is the function's qualified name, empty for a field's, and
-/// `reaches` the modules the defaults the call copies name.
+/// `reaches` the modules the defaults the call copies name. `named` is the place among the
+/// callee's parameters, the value's first, of each argument the call names, in the order written.
 pub type MemberSite = {
   module: Int,
   span: Span,
@@ -264,6 +266,7 @@ pub type MemberSite = {
   callee: Bytes,
   owner: Bytes,
   reaches: List<Bytes>,
+  named: List<Int>,
 }
 /// A tagged literal whose tag's function `name` is one of the module being checked.
 type TagUse = { owner: Bytes, name: Bytes, t: Tagged, callee: QName }
@@ -1581,15 +1584,18 @@ fn global(
   }
 
 /// A name a generated body cannot see is the field type's missing `derive`, not the user's bug.
-fn unresolved_in_derived(checker: Checker, qname: QName, what: Bytes) -> Checker / {abort.raise} = {
+fn unresolved_in_derived(checker: Checker, qname: QName, what: Bytes) -> Checker / {abort.raise} =
+  report(checker, derived_unresolved(checker, qname, what))
+
+fn derived_unresolved(checker: Checker, qname: QName, what: Bytes) -> Diag / {abort.raise} = {
   let d = match checker.derived {
     Some(d) -> d,
     None -> panic("only a generated body reaches this"),
   };
   let dv = deriver_text(d.deriver);
-  report_error_at(
-    checker,
+  error_at(
     b"E0206",
+    checker.module,
     qname.span,
     Bytes::concat_all([b"`", dv, b"` cannot be derived for `", d.target, b"`"]),
     Bytes::concat_all([
@@ -1777,8 +1783,8 @@ fn value_key(
 ) -> { checker: Checker, key: Option<ValueKey> } / {abort.raise} =
   if !is_bare(qname) {
     match of_language_type(checker, qname) {
-      Named(n) -> { checker: checker, key: Some({ name: n, prelude: true }) },
-      InHome(m) -> { checker: checker, key: Some({ name: m.callee, prelude: false }) },
+      Found(m) ->
+        { checker: checker, key: Some({ name: m.callee, prelude: m.qname.module == None }) },
       // A capital no import binds and no module declares is a type of the language's.
       Unnamed(of) -> { checker: no_function_of(checker, of.name, qname.name), key: None },
       Elsewise -> {
@@ -1800,12 +1806,9 @@ fn value_key(
   }
 
 /// What a name written `T::name` is where `T` is a type of the language's, one no import binds
-/// as a module and no module in scope declares: the prelude's name for it, or none it has.
-type OfLanguageType =
-  | Named(Bytes)
-  | InHome({ qname: QName, callee: Bytes })
-  | Unnamed(Ident)
-  | Elsewise
+/// as a module and no module in scope declares: its function so named, a builtin's `qname` with no
+/// module, or none it has.
+type OfLanguageType = | Found({ qname: QName, callee: Bytes }) | Unnamed(Ident) | Elsewise
 
 fn of_language_type(checker: Checker, qname: QName) -> OfLanguageType / {abort.raise} =
   match qname.module {
@@ -1813,12 +1816,9 @@ fn of_language_type(checker: Checker, qname: QName) -> OfLanguageType / {abort.r
     Some(of) -> if !starts_upper(of.name) || of_module(of.name) != None
         || find_module_binding(scope_of(checker).modules, of.name) != None
         || declaring_type(checker.resolved, checker.module, of.name) != None { Elsewise } else {
-      let declared = member_name(of.name, qname.name.name);
-      if env_depth_of(checker.env, declared) == Some(0) { Named(declared) } else {
-        match home_function(checker, of.name, qname.name) {
-          Some(m) -> InHome(m),
-          None -> Unnamed(of),
-        }
+      match language_function(checker, of.name, qname.name, false) {
+        Some(m) -> Found(m),
+        None -> Unnamed(of),
       }
     },
   }
@@ -1935,10 +1935,13 @@ fn kept_ctor(
   }
 
 fn unknown_name(checker: Checker, qname: QName) -> Checker / {abort.raise} =
+  report(checker, unknown_name_said(checker, qname))
+
+fn unknown_name_said(checker: Checker, qname: QName) -> Diag / {abort.raise} =
   match checker.derived {
-    Some(_) -> unresolved_in_derived(checker, qname, b"definition"),
+    Some(_) -> derived_unresolved(checker, qname, b"definition"),
     None -> match kept_named(checker, qname) {
-      Some(closed) -> report(checker, closed),
+      Some(closed) -> closed,
       None -> unknown_name_here(checker, qname),
     },
   }
@@ -1954,7 +1957,7 @@ fn kept_named(checker: Checker, qname: QName) -> Option<Diag> / {abort.raise} =
     },
   }
 
-fn unknown_name_here(checker: Checker, qname: QName) -> Checker / {abort.raise} = {
+fn unknown_name_here(checker: Checker, qname: QName) -> Diag / {abort.raise} = {
   let n = qname.name.name;
   let result = if !is_bare(qname) || n != result_name() { [] } else {
     match checker.spec_kind {
@@ -1994,9 +1997,9 @@ fn unknown_name_here(checker: Checker, qname: QName) -> Checker / {abort.raise} 
       None -> near,
     }
   } else { near };
-  report_error_at(
-    checker,
+  error_at(
     b"E0101",
+    checker.module,
     qname.span,
     Bytes::concat_all([b"unknown name `", n, b"`"]),
     b"not found in this scope",
@@ -4847,7 +4850,16 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
     EPerform(p) -> if !on_a_local(checker, p.eff) {
       infer_perform(checker, p.span, p.eff, p.op, p.resource, p.args)
     } else if names_effect(checker, p.eff) {
-      infer_perform(both_named(checker, p.eff), p.span, p.eff, p.op, p.resource, p.args)
+      let said = both_named(checker, p.eff);
+      // Read as a perform only where the effect has the operation: a call meant for the binding
+      // would otherwise be refused twice.
+      match resolve_op(said, p.eff, p.op).hit {
+        Some(_) -> infer_perform(said, p.span, p.eff, p.op, p.resource, p.args),
+        None -> {
+          let o: WithTy = new_ty(said);
+          { checker: o.checker, ty: o.ty, row: row_empty() }
+        },
+      }
     } else {
       let b: Inferred = infer_var(checker, p.eff);
       let on = EVar({ span: p.eff.span, name: p.eff });
@@ -5364,11 +5376,12 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             // module's. The prelude's is its own name as written.
             None -> if is_bare(qname) { constrained } else if !key.prelude {
               match of_language_type(constrained, qname) {
-                InHome(m) ->
+                Found(m) -> if m.qname.module == None { constrained } else {
                   {
                     ..constrained,
                     member_sites: sited(constrained, {
                       reaches: [],
+                      named: [],
                       module: constrained.module,
                       span: qname.span,
                       qualifier: match m.qname.module { Some(q) -> q.name, None -> b"" },
@@ -5376,7 +5389,8 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
                       callee: b"",
                       owner: constrained.walking,
                     }),
-                  },
+                  }
+                },
                 _ -> constrained,
               }
             } else { constrained },
@@ -5385,6 +5399,7 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
                 ..constrained,
                 member_sites: sited(constrained, {
                   reaches: [],
+                  named: [],
                   module: constrained.module,
                   span: qname.span,
                   qualifier: of_binder(constrained.resolved.scopes.get(t.owner).module),
@@ -5833,32 +5848,39 @@ fn member_function(
         },
         callee: b.qualified,
       }),
-    // A type of the language's: the prelude declares its builtins under it, and a call on a
-    // value is of one whose first parameter is that type.
-    _ -> {
-      let declared = member_name(of, name.name);
-      let takes = match env_lookup(checker.env, declared) {
-        Some(scheme) -> match scheme.ty {
-          TyFn(f) -> match f.params.at(0) {
-            Some(TyCon(c)) -> c.name == of,
-            Some(TyNominal(n)) -> n.name == of,
-            _ -> false,
-          },
+    _ -> if module_declares(checker, of) { None }
+    else { language_function(checker, of, name, true) },
+  }
+
+/// The function `name` of `of`, a type of the language's: a builtin the prelude declares under it,
+/// or what its home module declares where this module sees that module. `on_value` asks for one a
+/// value of the type is called on, so a builtin whose first parameter is another type is none.
+fn language_function(
+  checker: Checker,
+  of: Bytes,
+  name: Ident,
+  on_value: Bool,
+) -> Option<{ qname: QName, callee: Bytes }> / {abort.raise} = {
+  let declared = member_name(of, name.name);
+  let takes = !on_value
+    || (match env_lookup(checker.env, declared) {
+      Some(scheme) -> match scheme.ty {
+        TyFn(f) -> match f.params.at(0) {
+          Some(TyCon(c)) -> c.name == of,
+          Some(TyNominal(n)) -> n.name == of,
           _ -> false,
         },
-        None -> false,
-      };
-      if module_declares(checker, of) { None }
-      else if !takes || env_depth_of(checker.env, declared) != Some(0) {
-        home_function(checker, of, name)
-      } else {
-        Some({
-          qname: { module: None, name: { name: declared, span: name.span }, span: name.span },
-          callee: declared,
-        })
-      }
-    },
-  }
+        _ -> false,
+      },
+      None -> false,
+    });
+  if takes && env_depth_of(checker.env, declared) == Some(0) {
+    Some({
+      qname: { module: None, name: { name: declared, span: name.span }, span: name.span },
+      callee: declared,
+    })
+  } else { home_function(checker, of, name) }
+}
 
 /// The sites of `checker` with `site`, a call the checker writes out, among them. Every node of
 /// a derived definition stands at its statement's span, so a site there that names a function would
@@ -5869,7 +5891,8 @@ fn sited(checker: Checker, site: MemberSite) -> List<MemberSite> / {abort.raise}
   } else { checker.member_sites.push(site) }
 
 /// The function `name` the home module of the language's type `of` declares for it, where this
-/// module can see that module: itself, or one it imports, directly or through others.
+/// module can see that module: every module can but those beneath the homes, which see what they
+/// import, directly or through others.
 fn home_function(
   checker: Checker,
   of: Bytes,
@@ -5896,9 +5919,12 @@ fn module_declares(checker: Checker, of: Bytes) -> Bool =
   checker.types.contains(of) || checker.nominals.contains(of)
 
 fn no_function_of(checker: Checker, of: Bytes, name: Ident) -> Checker / {abort.raise} =
-  report_error_at(
-    checker,
+  report(checker, no_function_said(checker, of, name))
+
+fn no_function_said(checker: Checker, of: Bytes, name: Ident) -> Diag / {abort.raise} =
+  error_at(
     b"E0101",
+    checker.module,
     name.span,
     Bytes::concat_all([b"`", simple_name_of(of), b"` has no function `", name.name, b"`"]),
     b"not a function of the type",
@@ -5917,7 +5943,10 @@ fn no_function_of(checker: Checker, of: Bytes, name: Ident) -> Checker / {abort.
           of,
           b"` has the builtins named for it, and the functions `",
           home_module(of),
-          b"` declares for it where this module imports that one, itself or through another",
+          if sees_homes(checker.resolved.scopes.get(checker.module).module) { b"` declares for it" }
+          else {
+            b"` declares for it where this module imports that one, itself or through another"
+          },
         ])
       },
     ],
@@ -5966,11 +5995,11 @@ fn unnamed(checker: Checker, named: List<NamedArg>) -> Checker =
 
 /// What a call on a value calls: a function its value holds in a field, a function of the value's
 /// type, typed, with its labels filled already where a named value is typed before the call is,
-/// or nothing, which is reported.
+/// or nothing, with the error that says why: there is no calling nothing without one.
 type DottedCallee =
   | HeldInField(Type)
   | OfType({ qname: QName, callee: Bytes, ty: Type, row: Row, labelled: Bool })
-  | NoCallee(Type)
+  | NoCallee(Diag)
 
 /// A call on a value read as far as its callee: the callee's parameters, what the value met of
 /// them, the callee itself where a lambda handed it may be one it repeats, what each parameter
@@ -6054,10 +6083,10 @@ fn dotted_callee(
   match ((written_function(name), field)) {
     (Some(q), _) -> match find(b.checker.resolved, b.checker.module, ValueSpace, q) {
       Some(found) -> of_type({ qname: through_module(b.checker, q), callee: found.qualified }),
-      // Nothing so named: the name is read as any other, which says so.
-      None -> {
-        let o: Inferred = infer_var(b.checker, q);
-        none(o.checker, NoCallee(o.ty))
+      None -> match of_language_type(b.checker, q) {
+        Found(m) -> of_type(m),
+        Unnamed(of) -> none(b.checker, NoCallee(no_function_said(b.checker, of.name, q.name))),
+        Elsewise -> none(b.checker, NoCallee(unknown_name_said(b.checker, q))),
       },
     },
     // A function a field holds has no parameter to name: each named value is refused, and typed
@@ -6071,27 +6100,25 @@ fn dotted_callee(
     (None, None) -> {
       let head = match ty { TyCon(c) -> Some(c.name), TyNominal(n) -> Some(n.name), _ -> None };
       match head {
-        None -> {
-          let o: WithTy = new_ty(
-            report_error_at(
-              b.checker,
-              b"E0201",
-              expr_span(base),
-              Bytes::concat_all([b"cannot call `", name.name, b"` on this value"]),
-              Bytes::concat_all([b"this has type `", type_text(ty), b"`"]),
-              [
-                b"`value.name(..)` calls the function `name` of the value's type, or a function a record holds in a field `name`: a type parameter, a function and a record with no such field have neither",
-                b"annotate the value where its type is not yet known",
-              ],
+        None ->
+          none(
+            b.checker,
+            NoCallee(
+              error_at(
+                b"E0201",
+                b.checker.module,
+                expr_span(base),
+                Bytes::concat_all([b"cannot call `", name.name, b"` on this value"]),
+                Bytes::concat_all([b"this has type `", type_text(ty), b"`"]),
+                [
+                  b"`value.name(..)` calls the function `name` of the value's type, or a function a record holds in a field `name`: a type parameter, a function and a record with no such field have neither",
+                  b"annotate the value where its type is not yet known",
+                ],
+              ),
             ),
-          );
-          none(o.checker, NoCallee(o.ty))
-        },
+          ),
         Some(of) -> match member_function(b.checker, of, name) {
-          None -> {
-            let o: WithTy = new_ty(no_function_of(b.checker, of, name));
-            none(o.checker, NoCallee(o.ty))
-          },
+          None -> none(b.checker, NoCallee(no_function_said(b.checker, of, name))),
           Some(m) -> of_type(m),
         },
       }
@@ -6119,7 +6146,10 @@ fn dotted(
     { checker: k.checker, ty: o.ty, row: k.row }
   };
   match d.callee {
-    NoCallee(ty) -> { checker: taken.checker, ty: ty, row: b.row },
+    NoCallee(said) -> {
+      let o: WithTy = new_ty(report(taken.checker, said));
+      { checker: o.checker, ty: o.ty, row: b.row }
+    },
     HeldInField(held) -> {
       let o: Inferred = applied_call(
         span,
@@ -6143,6 +6173,7 @@ fn dotted(
             callee: b"",
             owner: o.checker.walking,
             reaches: [],
+            named: [],
           }),
         }
       })
@@ -6170,6 +6201,16 @@ fn dotted(
           callee: m.callee,
           owner: o.checker.walking,
           reaches: d.reaches,
+          named: range(0, d.rest.len()).fold(
+            [],
+            |acc: List<{ arg: Int, at: Int }>, k: Int|
+              match d.rest.get(k) {
+                FromName(j) -> acc.push({ arg: j, at: 1 + args.len() + k }),
+                _ -> acc,
+              },
+          ).sort_by(|a: { arg: Int, at: Int }, b: { arg: Int, at: Int }| a.arg <= b.arg).map(
+            |x: { arg: Int, at: Int }| x.at,
+          ),
         }),
         builtins_on: if m.qname.module != None { o.checker.builtins_on }
         else { o.checker.builtins_on.insert(span_key(span), m.qname.name.name) },
@@ -6183,7 +6224,10 @@ fn dotted(
 fn prelude_named(checker: Checker, func: Expr) -> Bytes / {abort.raise} =
   match func {
     EVar(v) -> if !is_bare(v.name) {
-      match of_language_type(checker, v.name) { Named(n) -> n, _ -> b"" }
+      match of_language_type(checker, v.name) {
+        Found(m) -> if m.qname.module == None { m.callee } else { b"" },
+        _ -> b"",
+      }
     } else {
       match value_key(checker, v.name).key {
         Some(k) -> if !k.prelude { b"" } else { k.name },
@@ -10100,7 +10144,7 @@ fn group_callee_kind(
         range(0, qualified.len()).fold(DefinedCallee(n), |acc: Callee, i: Int|
           if qualified.get(i) == n { GroupMember(i) } else { acc }),
       None -> match of_language_type(checker, qname) {
-        Named(builtin) -> BuiltinCallee(builtin),
+        Found(m) -> if m.qname.module == None { BuiltinCallee(m.callee) } else { OtherCallee },
         _ -> if is_bare(qname) && env_depth_of(checker.env, qname.name.name) == Some(0) {
           BuiltinCallee(qname.name.name)
         } else { OtherCallee },
@@ -21058,6 +21102,62 @@ test "a function of a type is declared by the type's module, for a sum or a `new
   )
 }
 
+test "a binding and an effect of one name are refused once, where the effect has no such operation" {
+  assert_eq(
+    check_codes(
+      b"effect log { write say(n: Int) -> Unit }\nfn f(log: List<Int>) -> Int / {log.say} = log.len()",
+    ),
+    [b"E0105"],
+  )
+}
+
+test "a free name is read with no import, where the module declares and imports none of it" {
+  let console = { name: b"std.console", src: b"pub fn print(text: String) -> Int = text.len()\n" };
+  assert_eq(codes_of([console, { name: b"m", src: b"fn f() -> Int = print(\"x\")\n" }]), []);
+  // Its own is the one it reads, and an import is too.
+  assert_eq(
+    codes_of([
+      console,
+      { name: b"m", src: b"fn print(n: Int) -> Int = n\nfn f() -> Int = print(1)\n" },
+    ]),
+    [],
+  );
+  assert_eq(
+    codes_of([
+      console,
+      { name: b"other", src: b"pub fn print(b: Bool) -> Bool = b\n" },
+      { name: b"m", src: b"import other (print)\nfn f() -> Bool = print(true)\n" },
+    ]),
+    [],
+  )
+}
+
+test "a function of a type another module declares is named through that module" {
+  let shapes = {
+    name: b"shapes",
+    src: b"pub type Shape = | Sq(Int)\npub fn Shape::make(n: Int) -> Shape = Sq(n)\npub fn Shape::area(s: Shape) -> Int = match s { Sq(n) -> n * n }\n",
+  };
+  assert_eq(
+    codes_of([
+      shapes,
+      {
+        name: b"m",
+        src: b"import shapes\nfn f(n: Int) -> Int = shapes::Shape::make(n).area() + shapes::Shape::make(n).shapes::Shape::area()\n",
+      },
+    ]),
+    [],
+  );
+  assert_eq(
+    codes_of([
+      shapes,
+      { name: b"m", src: b"import shapes\nfn f(n: Int) -> Int = shapes::Shape::nope(n)\n" },
+    ]),
+    [b"E0101"],
+  );
+  // Only a type sits between a module and a function.
+  assert(parse(b"fn f() -> Int = a::b::c()").parser.diags.len() > 0, None)
+}
+
 test "a call on a value reads a record's field, a binding before an effect, and a known type" {
   // A record that holds a function is called through its field.
   assert_eq(check_codes(b"fn f(codec: { decode: (Int) -> Int }) -> Int = codec.decode(1)"), []);
@@ -21184,7 +21284,7 @@ fn codes_of(sources: List<Source>) -> List<Bytes> / {abort.raise} =
       dedup_diags(check_program(y.r, y.mods).checker.diags).map(|diag: Diag| diag.code),
   }
 
-test "a language type's other functions are its home module's, where the caller's module sees it" {
+test "a language type's other functions are its home module's, which every module sees but those beneath the homes" {
   let home = {
     name: b"std.list",
     src: b"pub fn List::second<a>(xs: List<a>) -> Option<a> = xs.at(1)\n",
@@ -21199,13 +21299,64 @@ test "a language type's other functions are its home module's, where the caller'
     ]),
     [],
   );
-  // A module that imports it nowhere beneath itself does not see it.
-  assert_eq(codes_of([home, { name: b"m", src: calls }]), [b"E0101", b"E0101"]);
+  // A module sees it with no import, one of the library too; one a home imports, what it imports.
+  assert_eq(codes_of([home, { name: b"m", src: calls }]), []);
+  assert_eq(codes_of([home, { name: b"std.other", src: calls }]), []);
+  assert_eq(codes_of([home, { name: b"std.gen", src: calls }]), [b"E0101", b"E0101"]);
   // The prelude's function of a name is the type's one function of it.
   assert_eq(
     codes_of([{ name: b"std.list", src: b"pub fn List::len<a>(xs: List<a>) -> Int = 0\n" }]),
     [b"E0105"],
   )
+}
+
+test "every way a function of a type is written calls it, a declared type's or a language type's alike" {
+  let home = {
+    name: b"std.list",
+    src: b"pub fn List::second<a>(xs: List<a>) -> Option<a> = xs.at(1)\n",
+  };
+  // A function of a type the program declares, a builtin of a language type, and a function a
+  // language type's home module declares, each with the type of a value of it and its answer.
+  let kinds = [
+    { ty: b"Box", f: b"Box::size", answer: b"Int" },
+    { ty: b"String", f: b"String::len", answer: b"Int" },
+    { ty: b"List<Int>", f: b"List::second", answer: b"Option<Int>" },
+  ];
+  let forms = |f: Bytes|
+    [
+      Bytes::concat_all([b"x.", f.slice(f.index_of(b"::").unwrap_or(0) + 2, f.len()), b"()"]),
+      Bytes::concat_all([f, b"(x)"]),
+      Bytes::concat_all([b"x.", f, b"()"]),
+      Bytes::concat_all([b"pass(x).", f, b"()"]),
+      Bytes::concat_all([b"{ let g = ", f, b"; g(x) }"]),
+    ];
+  let module = |body: Bytes|
+    [
+      home,
+      {
+        name: b"m",
+        src: Bytes::concat_all([
+          b"import std.list\ntype Box = | Box(Int)\nfn Box::size(b: Box) -> Int = match b { Box(n) -> n }\n",
+          b"fn pass<a>(v: a) -> a = v\n",
+          body,
+        ]),
+      },
+    ];
+  kinds.fold((), |_: Unit, k: { ty: Bytes, f: Bytes, answer: Bytes }|
+    forms(k.f).fold((), |_: Unit, form: Bytes| {
+      let fine = Bytes::concat_all([b"fn f(x: ", k.ty, b") -> ", k.answer, b" = ", form, b"\n"]);
+      assert(codes_of(module(fine)) == [], Some(String::of_bytes_lossy(fine)));
+      // Its answer is the function's, not the function itself.
+      let wrong = Bytes::concat_all([b"fn f(x: ", k.ty, b") -> Bool = ", form, b"\n"]);
+      assert(codes_of(module(wrong)) == [b"E0201"], Some(String::of_bytes_lossy(wrong)))
+    }));
+  // An argument the function does not take is refused, and one written is typed.
+  kinds.fold((), |_: Unit, k: { ty: Bytes, f: Bytes, answer: Bytes }| {
+    let extra = Bytes::concat_all([b"fn f(x: ", k.ty, b") -> ", k.answer, b" = x.", k.f, b"(1)\n"]);
+    assert(codes_of(module(extra)) != [], Some(String::of_bytes_lossy(extra)))
+  });
+  assert_eq(codes_of(module(b"fn f(s: String) -> Int = s.String::nope()\n")), [b"E0101"]);
+  assert_eq(codes_of(module(b"fn f(s: String) -> Int = s.Nowhere::len()\n")), [b"E0101"])
 }
 
 test "a recursion a builtin called on a value bounds, or runs a lambda of, is seen to end" {

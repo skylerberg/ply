@@ -8,8 +8,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSe
               is_pub, DRow, spec_kind_text, schema_named, schema_guard_name, dump_item, NKey, NShow,
               stated_type, item_span, IAlias, IModule, IDerive, IInstance, INumeric, spec_kind_bin)
 import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text, TCon)
-import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
-              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
+import exprs (sees_homes, Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
+              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, Param, Stmt, SLet, SLetElse, SExpr, MatchArm,
               RecField, expr_span, ETagged, Tagged, Hole, TaggedPart, tagged_parts, hidden_binder,
               tagged_part_bin)
@@ -29,8 +29,8 @@ import resolve (Source, ParsedModule, Diag, Label, Resolved, ResolveSucceeded, R
                 error_at, backticked, import_module_name, path_span, post_order, seeing_all)
 import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOutput, build_index,
              UseNode, hash_index, hashed_and_unused, hex, digest, Pin, Fixing, Rehash, Rehashed,
-             rehash_index, by_name, tagged_target, closure_of, reached_functions, LawNode, Node,
-             NodeFn, NodeType, NodeEffect, Which, TheFn, TheDecl, TheItem, denoted, DenotesFn,
+             body_key, rehash_index, by_name, tagged_target, closure_of, reached_functions, LawNode,
+             Node, NodeFn, NodeType, NodeEffect, Which, TheFn, TheDecl, TheItem, denoted, DenotesFn,
              DenotesCtor, DenotesNothing, effect_called, type_named, NodeRef, pin_key, Skeleton,
              hashes_fixed, fixing_of, of_key)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
@@ -59,7 +59,8 @@ import derive (RowField, row_shape, generated_name, same_deriver, row_field_bin)
 import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, ItemWants, embed_want_bin, embed_read_bin,
               item_wants_bin, embed_key, embed_tables, embedded, rewritten, wants_of, wants_by_item,
               wants_in, want_of_key, embed_at_bin)
-import items (parse, import_decl_bin)
+import items (parse, import_decl_bin, homes_called, homes_declaring, homes_for, called_names,
+              HomeNames)
 import std.bytes (ascii_of_int)
 import lexer (is_ident_start)
 
@@ -3285,19 +3286,9 @@ pub fn interfaces_among(
     })
 }
 
-/// The encoding a body's bytes are written in beneath their envelope; a body filed under another is
+/// The encoding a body's bytes and their envelope are written in; a body filed under another is
 /// not read back.
-pub fn body_encoding() -> Int = 7
-
-/// The hash a stored body is filed under, which its envelope fixes: a definition alone in its
-/// component is its bytes' hash, and a cycle's member the hash of the cycle's with its class.
-pub fn body_key(body: Bytes) -> Option<Bytes> / {abort.raise} = {
-  let n = body.len();
-  let tag = if n == 0 { -1 } else { body.at(0) };
-  if tag == 0 { Some(blake3(body.slice(1, n))) }
-  else if tag == 1 && n >= 5 { Some(blake3(blake3(body.slice(5, n)).concat(body.slice(1, 5)))) }
-  else { None }
-}
+pub fn body_encoding() -> Int = 8
 
 /// Every body hashing answered, each under the hash it verifies as: a name's one body answers for
 /// each hash the name has, and a `fn` and a declaration sharing a name have a body each.
@@ -4538,6 +4529,15 @@ pub fn pulls_of(source: Source) -> Pulls / {abort.raise} =
     wants: if names_embed(source.src) { wants_by_item(parse(source.src).node) } else { [] },
   }
 
+/// An import of each of `homes`, as a load pulls them for a module that calls their functions.
+fn home_imports(homes: List<Bytes>) -> List<ImportDecl> / {abort.raise} =
+  homes.map(|h: Bytes|
+    {
+      path: h.split(b".").map(|part: Bytes| { name: part, span: dummy_span() }),
+      kind: IModule,
+      span: dummy_span(),
+    })
+
 /// The shipping of a load that pulled `pulled`, of `listed`, those there are: each pulled module
 /// read through `read`, and each shipped module whose text one of them embeds, the rest unread, the
 /// data files the read ones embed read through `read_data`, and `asked`, those pulled whatever
@@ -4575,9 +4575,9 @@ pub fn shipping_pulled<| e>(
 }
 
 /// What a load of `user` and its package closure pulls, each module read once through `read`: what
-/// they import and each of `asked`, what those import in turn, and what any of them embeds beside
-/// itself, a data file read once through `read_data`. `pulled` answers what a module's text says
-/// it pulls, as `pulls_of` does. Handed the read ones, the rest as `unread` and `asked`, the front
+/// they import, the home modules they call, and each of `asked`, what those pull in turn, and what
+/// any of them embeds beside itself, a data file read once through `read_data`. `pulled` answers
+/// what a module's text says it pulls, as `pulls_of` does. Handed the read ones, the rest as `unread` and `asked`, the front
 /// end pulls what it would have pulled from every shipped module.
 pub fn shipped_pulled<| e>(
   user: List<Source>,
@@ -4589,9 +4589,14 @@ pub fn shipped_pulled<| e>(
   asked: List<Bytes> = [],
 ) -> Shipping / {abort.raise | e} = {
   let clo = closure(pkgs, user.map(|s: Source| s.name));
-  let own = user.concat(clo.modules.map(|m: { pkg: Int, src: Source }| m.src)).map(
-    |source: Source| { name: source.name, pulls: pulled(source) },
+  let read_own = user.concat(clo.modules.map(|m: { pkg: Int, src: Source }| m.src)).fold(
+    { own: [], declared: None },
+    |acc: { own: List<ModulePulls>, declared: Option<List<HomeNames>> }, source: Source| {
+      let p = homes_added(source, pulled(source), acc.declared, read);
+      { own: acc.own.push({ name: source.name, pulls: p.pulls }), declared: p.declared }
+    },
   );
+  let own = read_own.own;
   let needed = needing(
     own.len(),
     listed,
@@ -4604,6 +4609,7 @@ pub fn shipped_pulled<| e>(
       data: [],
       tried: Map::new(),
       pulls: [],
+      declared: read_own.declared,
     },
     listed.len() + 1,
     asked,
@@ -4619,13 +4625,34 @@ pub fn shipped_pulled<| e>(
   }
 }
 
+/// `declared` is what the home modules declare, once a module that calls on a value has read it.
 type Needed = {
   importers: List<Importer>,
   found: List<Source>,
   data: List<ShippedData>,
   tried: Map<Bytes, Bool>,
   pulls: List<ModulePulls>,
+  declared: Option<List<HomeNames>>,
 }
+
+/// `pulls` of `source` with the home modules it calls ([`homes_called`]), what the homes declare
+/// read through `read` where no module before it read it.
+fn homes_added<| e>(
+  source: Source,
+  pulls: Pulls,
+  declared: Option<List<HomeNames>>,
+  read: (Bytes) -> Option<Bytes> / e,
+) -> { pulls: Pulls, declared: Option<List<HomeNames>> } / {abort.raise | e} =
+  if !sees_homes(source.name) { { pulls: pulls, declared: declared } } else {
+    let called = called_names(source.src);
+    if called.len() == 0 { { pulls: pulls, declared: declared } } else {
+      let d = match declared { Some(d) -> d, None -> homes_declaring(read) };
+      {
+        pulls: { ..pulls, imports: pulls.imports.concat(home_imports(homes_for(called, d))) },
+        declared: Some(d),
+      }
+    }
+  }
 
 /// A round of reads at a time, each of what the last round's modules import and nothing read before;
 /// `room` bounds the rounds, as each reads at least one module no earlier round did.
@@ -4654,7 +4681,8 @@ fn needing<| e>(
           None -> { ..acc, tried: tried },
           Some(src) -> {
             let source = { name: name, src: src };
-            let pulls = pulled(source);
+            let added = homes_added(source, pulled(source), acc.declared, read);
+            let pulls = added.pulls;
             beside(
               listed,
               read,
@@ -4665,6 +4693,7 @@ fn needing<| e>(
                 found: acc.found.push(source),
                 tried: tried,
                 pulls: acc.pulls.push({ name: name, pulls: pulls }),
+                declared: added.declared,
               },
               name,
               wants_in(pulls.wants),
@@ -4880,6 +4909,7 @@ fn pulling(
   x: Pull,
   room: Int,
   asked: List<Bytes>,
+  declared: List<HomeNames>,
 ) -> Pull / {abort.raise} = {
   let early = x.parsed.fold([], |acc: List<Diag>, parsed: ParsedSource| acc.concat(parsed.diags));
   if early.len() > 0 { { ..x, diags: early } } else {
@@ -4907,7 +4937,9 @@ fn pulling(
           }
         }),
         room - 1,
-        asked,
+        r.wanted.fold(asked, |acc: List<Bytes>, name: Bytes, src: Bytes|
+          acc.concat(homes_called(name, src, || declared))),
+        declared,
       )
     }
   }
@@ -5106,6 +5138,9 @@ pub fn staged_pulling_std_with(
   let texts = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
   let sources = user.concat(clo.modules.map(|m: { pkg: Int, src: Source }| m.src));
+  let declared = homes_declaring(|h: Bytes| texts.get(h));
+  let asking = sources.fold(asked, |acc: List<Bytes>, s: Source|
+    acc.concat(homes_called(s.name, s.src, || declared)));
   let read = range(0, sources.len()).fold(
     { parsed: [], cuts: [] },
     |acc: { parsed: List<ParsedSource>, cuts: List<StubCuts> }, i: Int| {
@@ -5153,7 +5188,8 @@ pub fn staged_pulling_std_with(
     tested,
     { parsed: assembled, pulled: [], embeds: [], cuts: read.cuts, diags: [] },
     texts.len(),
-    asked,
+    asking,
+    declared,
   );
   let hashed = |parsed: List<ParsedSource>|
     match hashed_closure(
@@ -6468,10 +6504,10 @@ test "a hash row carries the definition's hash, its own form and its references,
   let placed = range(0, order.len()).fold(0 - 1, |acc: Int, j: Int|
     if order.get(j) == b"m.say" { j } else { acc });
   assert_eq(order.at(placed + 1), Some(b"m.says"));
-  // A solo body is the kind byte and then exactly the bytes the definition's hash is taken over.
+  // A solo body is filed under the hash of the bytes its envelope says it is taken over.
   let body = body_named(d, b"m.say");
   assert_eq(body.at(0), 0);
-  assert_eq(Some(hex(blake3(body.slice(1, body.len())))), say.def)
+  assert_eq(match body_key(body) { Some(k) -> Some(hex(k)), None -> None }, say.def)
 }
 
 test "the ordinals list every fn, test and law in source order" {
