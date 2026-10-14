@@ -277,21 +277,7 @@ pub fn helpers() -> &'static [Helper] {
             answers: true,
             address: crate::rt::builtin_address(*b),
         });
-        // A unit of the last release calls a builtin through the helper its old name made.
-        let to_the_release = ply_eval::Builtin::all().iter().filter_map(|b| {
-            let was = builtin_helper_name(&b.to_the_release()?);
-            (was != builtin_helper_name(b.name())).then(|| Helper {
-                name: Box::leak(was.into_boxed_str()),
-                args: b.arity(),
-                answers: true,
-                address: crate::rt::builtin_address(*b),
-            })
-        });
-        OWN.iter()
-            .copied()
-            .chain(builtins)
-            .chain(to_the_release)
-            .collect()
+        OWN.iter().copied().chain(builtins).collect()
     })
 }
 
