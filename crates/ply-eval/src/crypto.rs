@@ -51,16 +51,16 @@ fn misused(span: Span, what: &str, why: String) -> Diagnostic {
 }
 
 pub(crate) fn utf8(v: &Value, span: Span) -> Result<Value, Diagnostic> {
-    Ok(sealed(opened(v, span, "`secret_bytes`")?))
+    Ok(sealed(opened(v, span, "`Secret::bytes`")?))
 }
 
 pub(crate) fn len(v: &Value, span: Span) -> Result<Value, Diagnostic> {
-    Ok(Value::Int(opened(v, span, "`secret_len`")?.len() as i64))
+    Ok(Value::Int(opened(v, span, "`Secret::len`")?.len() as i64))
 }
 
 pub(crate) fn concat(a: &Value, b: &Value, span: Span) -> Result<Value, Diagnostic> {
-    let a = opened(a, span, "`secret_concat`")?;
-    let b = opened(b, span, "`secret_concat`")?;
+    let a = opened(a, span, "`Secret::concat`")?;
+    let b = opened(b, span, "`Secret::concat`")?;
     let mut out = Zeroizing::new(Vec::with_capacity(a.len() + b.len()));
     out.extend_from_slice(a);
     out.extend_from_slice(b);
@@ -189,7 +189,7 @@ fn typed(text: &[u8]) -> Zeroizing<Vec<u8>> {
 }
 
 pub(crate) fn decode(encoding: &Value, text: &Value, span: Span) -> Result<Value, Diagnostic> {
-    let what = "`secret_decode`";
+    let what = "`Secret::decode`";
     let name = encoding.as_str(span, what)?;
     let text = opened(text, span, what)?;
     let out = match (name, named(name)) {
@@ -251,7 +251,7 @@ fn encoded(e: &Encoding, bytes: &[u8]) -> Zeroizing<Vec<u8>> {
 }
 
 pub(crate) fn encode(encoding: &Value, bytes: &Value, span: Span) -> Result<Value, Diagnostic> {
-    let what = "`secret_encode`";
+    let what = "`Secret::encode`";
     let name = encoding.as_str(span, what)?;
     let bytes = opened(bytes, span, what)?;
     let Some(e) = named(name) else {
@@ -277,7 +277,7 @@ pub struct Framing {
 }
 
 impl Framing {
-    /// The encoding `name` names: `"raw"`, or one `secret_encode` writes. Any other is the runtime
+    /// The encoding `name` names: `"raw"`, or one `Secret::encode` writes. Any other is the runtime
     /// error the operation `what` raises.
     pub fn named(name: &str, what: &str, span: Span) -> Result<Framing, Diagnostic> {
         if name == "raw" {
@@ -345,7 +345,7 @@ pub(crate) fn hmac(
     message: &Value,
     span: Span,
 ) -> Result<Value, Diagnostic> {
-    let what = "`secret_hmac`";
+    let what = "`Secret::hmac`";
     let algorithm = hmac_named(hash.as_str(span, what)?);
     let key = opened(key, span, what)?;
     let message = message.as_bytes(span, what)?;
@@ -363,7 +363,7 @@ pub(crate) fn hkdf_extract(
     key: &Value,
     span: Span,
 ) -> Result<Value, Diagnostic> {
-    let what = "`secret_hkdf_extract`";
+    let what = "`Secret::hkdf_extract`";
     let algorithm = hmac_named(hash.as_str(span, what)?);
     let salt = salt.as_bytes(span, what)?;
     let key = opened(key, span, what)?;
@@ -387,7 +387,7 @@ pub(crate) fn hkdf_expand(
     length: &Value,
     span: Span,
 ) -> Result<Value, Diagnostic> {
-    let what = "`secret_hkdf_expand`";
+    let what = "`Secret::hkdf_expand`";
     let algorithm = match hash.as_str(span, what)? {
         "SHA-1" => Some(ring::hkdf::HKDF_SHA1_FOR_LEGACY_USE_ONLY),
         "SHA-256" => Some(ring::hkdf::HKDF_SHA256),
@@ -413,7 +413,7 @@ pub(crate) fn hkdf_expand(
 const MAX_DERIVED: usize = 1 << 20;
 
 pub(crate) fn pbkdf2(args: &[Value], span: Span) -> Result<Value, Diagnostic> {
-    let what = "`secret_pbkdf2`";
+    let what = "`Secret::pbkdf2`";
     let algorithm = match args[0].as_str(span, what)? {
         "SHA-1" => Some(ring::pbkdf2::PBKDF2_HMAC_SHA1),
         "SHA-256" => Some(ring::pbkdf2::PBKDF2_HMAC_SHA256),
@@ -866,7 +866,7 @@ pub(crate) fn private_key(der: &Value, span: Span) -> Result<Value, Diagnostic> 
     const X25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.110");
     const RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
     const EC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
-    let der = opened(der, span, "`secret_private_key`")?;
+    let der = opened(der, span, "`Secret::private_key`")?;
     let curve25519 = |inner: &[u8]| {
         <&OctetStringRef>::from_der(inner)
             .ok()
@@ -921,7 +921,7 @@ fn integer_der(magnitude: &[u8], out: &mut Vec<u8>) {
 /// is decoded into memory that is wiped, and the document is answered only where `ring` takes it
 /// as a key, so numbers that disagree are no key. The lengths of the numbers are not kept secret.
 pub(crate) fn rsa_jwk(args: &[Value], span: Span) -> Result<Value, Diagnostic> {
-    let what = "`secret_rsa_jwk`";
+    let what = "`Secret::rsa_jwk`";
     let unpadded = Encoding {
         ranges: BASE64URL,
         bits: 6,

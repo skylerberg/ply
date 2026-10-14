@@ -94,7 +94,7 @@ fn reference(b: Builtin, x: f64, y: f64, cc: &mut Consts) -> Option<f64> {
         Builtin::Asin => big(x).asin(p, RM, cc),
         Builtin::Acos => big(x).acos(p, RM, cc),
         Builtin::Atan => big(x).atan(p, RM, cc),
-        // `exp(y * ln |x|)`, odd powers of a negative base negated.
+        // `Float::exp(y * ln |x|)`, odd powers of a negative base negated.
         Builtin::Pow => {
             let wide = p + 128;
             let magnitude = BigFloat::from_f64(y, wide)
@@ -116,7 +116,7 @@ fn reference(b: Builtin, x: f64, y: f64, cc: &mut Consts) -> Option<f64> {
                 .add(&by.mul(&by, p, RM), p, RM)
                 .sqrt(p, RM)
         }
-        // `atan(y / x)` turned by `pi` into the half-plane of a negative `x`.
+        // `Float::atan(y / x)` turned by `pi` into the half-plane of a negative `x`.
         Builtin::Atan2 => {
             let (yy, xx) = (x, y);
             let a = big(yy).div(&big(xx), p, RM).atan(p, RM, cc);

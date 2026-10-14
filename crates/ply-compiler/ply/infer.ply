@@ -1415,102 +1415,21 @@ pub fn builtin_named(name: Bytes) -> Option<Builtin> / {abort.raise} =
   builtins().fold(None, |acc: Option<Builtin>, b: Builtin|
     match acc { Some(_) -> acc, None -> if b.name == name { Some(b) } else { None } })
 
-/// The language's types a signature names, each under its name in lower case.
-fn types_in(ty: Type, acc: Map<Bytes, Bytes>) -> Map<Bytes, Bytes> / {abort.raise} =
-  match ty {
-    TyVar(_) -> acc,
-    TyCon(c) ->
-      c.args.fold(acc.insert(lowered(c.name), c.name), |a: Map<Bytes, Bytes>, x: Type|
-        types_in(x, a)),
-    TyFn(f) -> f.params.fold(types_in(f.ret, acc), |a: Map<Bytes, Bytes>, p: Type| types_in(p, a)),
-    TyRecord(fs) -> fs.fold(acc, |a: Map<Bytes, Bytes>, f: Field| types_in(f.ty, a)),
-    TyNominal(n) ->
-      n.args.fold(acc.insert(lowered(n.name), n.name), |a: Map<Bytes, Bytes>, x: Type|
-        types_in(x, a)),
-  }
-
-fn lowered(name: Bytes) -> Bytes / {abort.raise} =
-  Bytes::of_string(String::of_bytes(name).ascii_lower())
-
-/// The function of a language type each builtin is, by its own name, beside the builtin's name:
-/// `<type>_<name>` is `T::name` whatever it takes, and any other is a function of its first
-/// parameter's type. One named for a type comes first, so `T::name` is that one where two
-/// builtins would both be it. A cell is a name and no value, so its builtins are no type's.
-pub fn builtin_members(
-  all: List<Builtin>,
-) -> List<{ member: Bytes, builtin: Bytes }> / {abort.raise} = {
-  let types = all.fold(
-    prelude_adts().fold(Map::new(), |acc: Map<Bytes, Bytes>, adt: AlgebraicType|
-      acc.insert(lowered(adt.name), adt.name)),
-    |acc: Map<Bytes, Bytes>, b: Builtin| types_in(b.scheme.ty, acc),
-  );
-  let prefixed = |b: Builtin|
-    match b.name.index_of(b"_") {
-      None -> None,
-      Some(i) -> match types.get(b.name.slice(0, i)) {
-        Some(t) -> if i + 1 >= b.name.len() { None }
-        else { Some(member_name(t, b.name.slice(i + 1, b.name.len()))) },
-        None -> None,
-      },
-    };
-  let first = |b: Builtin|
-    match b.scheme.ty {
-      TyFn(f) -> match f.params.at(0) {
-        Some(TyCon(c)) -> Some(member_name(c.name, b.name)),
-        Some(TyNominal(n)) -> Some(member_name(n.name, b.name)),
-        _ -> None,
-      },
-      _ -> None,
-    };
-  let values = all.filter(|b: Builtin| !is_cell_builtin(b.name));
-  let named = values.fold([], |acc: List<{ member: Bytes, builtin: Bytes }>, b: Builtin|
-    match prefixed(b) { Some(m) -> acc.push({ member: m, builtin: b.name }), None -> acc });
-  values.fold(named, |acc: List<{ member: Bytes, builtin: Bytes }>, b: Builtin|
-    match ((prefixed(b), first(b))) {
-      (None, Some(m)) -> if acc.fold(false, |seen: Bool, x: { member: Bytes, builtin: Bytes }|
-          seen || x.member == m) { acc }
-      else { acc.push({ member: m, builtin: b.name }) },
-      _ -> acc,
-    })
-}
-
-/// The builtin a prelude name is: its own, or the one the function of a type it is written as
-/// (`List::len`) names. `declared` says whether a name is a builtin's.
-pub fn builtin_of(name: Bytes, declared: (Bytes) -> Bool / {abort.raise}) -> Bytes / {abort.raise} =
-  match member_of(name) {
-    None -> name,
-    Some(m) -> {
-      let named = Bytes::concat_all([lowered(m.of), b"_", m.member]);
-      if declared(named) { named } else { m.member }
-    },
-  }
-
 /// A builtin's scheme is over variables numbered from zero, so `fresh` starts past every one.
-/// Each is bound under its own name and under the one it has as a function of a type.
 fn install_prelude(bare: Checker) -> Checker / {abort.raise} = {
-  let checker = install_prelude_adts(bare);
-  let all = builtins();
-  let under = |c: Checker, b: Builtin, name: Bytes|
+  let bound: Checker = builtins().fold(install_prelude_adts(bare), |c: Checker, b: Builtin|
     {
       ..c,
-      env: env_bind_global(c.env, name, b.scheme),
+      env: env_bind_global(c.env, b.name, b.scheme),
       constraints: if b.constraints.len() == 0 { c.constraints }
-      else { c.constraints.insert(name, b.constraints) },
-      contracts: c.contracts.insert(name, b.contract),
+      else { c.constraints.insert(b.name, b.constraints) },
+      contracts: c.contracts.insert(b.name, b.contract),
       fresh: {
         next_ty: max(c.fresh.next_ty, b.scheme.ty_vars.len()),
         next_row: max(c.fresh.next_row, b.scheme.row_vars.len()),
       },
-    };
-  let bound: Checker = all.fold(checker, |c: Checker, b: Builtin| under(c, b, b.name));
-  let by_name = all.fold(Map::new(), |acc: Map<Bytes, Builtin>, b: Builtin| acc.insert(b.name, b));
-  let membered: Checker = builtin_members(all).fold(
-    bound,
-    |c: Checker, x: { member: Bytes, builtin: Bytes }|
-      match by_name.get(x.builtin) { Some(b) -> under(c, b, x.member), None -> c },
-  );
-  prelude_effects().fold(membered, |c2: Checker, effect_info: EffectInfo|
-    add_effect(c2, effect_info))
+    });
+  prelude_effects().fold(bound, |c2: Checker, effect_info: EffectInfo| add_effect(c2, effect_info))
 }
 
 /// The name the shipped modules hold the prelude under, which no project's module can take.
@@ -3506,7 +3425,7 @@ fn known_as(before: Checker, bound: Checker, pat: Pattern, value: Expr) -> Check
     _ -> bound,
   }
 
-/// The lambda `map`, `filter` or `fold` calls with each element of a `range` it is handed, by its
+/// The lambda `List::map`, `List::filter` or `List::fold` calls with each element of a `range` it is handed, by its
 /// place among the arguments, and the range's bounds.
 type Ranged = { at: Int, lo: Expr, hi: Expr }
 
@@ -3515,8 +3434,8 @@ fn ranged_lambda(
   builtin: Bytes,
   args: List<Expr>,
 ) -> Option<Ranged> / {abort.raise} = {
-  let place = if builtin == b"map" || builtin == b"filter" { 1 }
-  else if builtin == b"fold" { 2 }
+  let place = if builtin == b"List::map" || builtin == b"List::filter" { 1 }
+  else if builtin == b"List::fold" { 2 }
   else { 0 - 1 };
   if place < 0 { None } else {
     match args.at(0) {
@@ -4373,8 +4292,8 @@ fn fn_holding(
 
 /// The parameters a builtin calls once per element of its argument at `over`.
 fn builtin_repeats(name: Bytes) -> { params: List<Int>, over: Int } =
-  if name == b"map" || name == b"filter" { { params: [1], over: 0 } }
-  else if name == b"fold" || name == b"map_fold" || name == b"bytes_position" {
+  if name == b"List::map" || name == b"List::filter" { { params: [1], over: 0 } }
+  else if name == b"List::fold" || name == b"Map::fold" || name == b"Bytes::position" {
     { params: [2], over: 0 }
   } else if name == b"iterate" { { params: [2], over: 1 } }
   else { { params: [], over: 0 } }
@@ -5356,14 +5275,14 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             None -> None,
           };
           let named: Checker = match through {
-            // A language type's function named through the type is written out as what it is:
-            // its home module's, or a builtin under the builtin's own name.
+            // A language type's function its home module declares is written out as that
+            // module's. The prelude's is its own name as written.
             None -> if is_bare(qname) { constrained } else if !key.prelude {
               match of_language_type(constrained, qname) {
                 InHome(m) ->
                   {
                     ..constrained,
-                    member_sites: constrained.member_sites.push({
+                    member_sites: sited(constrained, {
                       reaches: [],
                       module: constrained.module,
                       span: qname.span,
@@ -5375,25 +5294,11 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
                   },
                 _ -> constrained,
               }
-            } else {
-              let reached = reaching_builtin(constrained, { name: key.name, span: qname.span });
-              {
-                ..reached,
-                member_sites: reached.member_sites.push({
-                  reaches: [],
-                  module: reached.module,
-                  span: qname.span,
-                  qualifier: prelude_binder(),
-                  name: runtime_of(reached, key.name),
-                  callee: b"",
-                  owner: reached.walking,
-                }),
-              }
-            },
+            } else { constrained },
             Some(t) ->
               {
                 ..constrained,
-                member_sites: constrained.member_sites.push({
+                member_sites: sited(constrained, {
                   reaches: [],
                   module: constrained.module,
                   span: qname.span,
@@ -5524,7 +5429,7 @@ fn mixed_concat(checker: Checker, lspan: Span, lt: Type, rspan: Span, rt: Type) 
               label_at(checker.module, lspan, true, Bytes::concat_all([b"this is a `", ln, b"`"])),
               label_at(checker.module, rspan, false, Bytes::concat_all([b"this is a `", rn, b"`"])),
             ],
-            [b"there is no coercion between them: `bytes_of_string` and `string_of_bytes` cross"],
+            [b"there is no coercion between them: `Bytes::of_string` and `String::of_bytes` cross"],
           ),
         )
       },
@@ -5843,8 +5748,8 @@ fn member_function(
         },
         callee: b.qualified,
       }),
-    // A type of the language's: the prelude binds each builtin under the type it is a function
-    // of, and a call on a value is one whose first parameter is that type.
+    // A type of the language's: the prelude declares its builtins under it, and a call on a
+    // value is of one whose first parameter is that type.
     _ -> {
       let declared = member_name(of, name.name);
       let takes = match env_lookup(checker.env, declared) {
@@ -5869,6 +5774,14 @@ fn member_function(
       }
     },
   }
+
+/// The sites of `checker` with `site`, a call the checker writes out, among them. Every node of
+/// a derived definition stands at its statement's span, so a site there that names a function would
+/// be read by each call of the definition: none is ever filed.
+fn sited(checker: Checker, site: MemberSite) -> List<MemberSite> / {abort.raise} =
+  if checker.derived != None && site.name != b"" {
+    panic("a derived definition calls a function the checker writes out, at the one span it has")
+  } else { checker.member_sites.push(site) }
 
 /// The function `name` the home module of the language's type `of` declares for it, where this
 /// module can see that module: itself, or one it imports, directly or through others.
@@ -6027,14 +5940,7 @@ fn dotted_callee(
       reaches: [],
     };
   let of_type = |m: { qname: QName, callee: Bytes }| {
-    let filled = member_args(
-      if m.qname.module == None { reaching_builtin(b.checker, m.qname.name) } else { b.checker },
-      span,
-      m.callee,
-      base,
-      args,
-      named,
-    );
+    let filled = member_args(b.checker, span, m.callee, base, args, named);
     let func = EVar({ span: name.span, name: m.qname });
     let f0: Inferred = infer_var(filled.checker, m.qname);
     let params = match shallow(f0.checker.subst, f0.ty) { TyFn(fn_) -> fn_.params, _ -> [] };
@@ -6144,7 +6050,7 @@ fn dotted(
       answered(o, if !performed { o.checker } else {
         {
           ..o.checker,
-          member_sites: o.checker.member_sites.push({
+          member_sites: sited(o.checker, {
             module: o.checker.module,
             span: span,
             qualifier: b"",
@@ -6169,71 +6075,33 @@ fn dotted(
       );
       answered(o, {
         ..o.checker,
-        member_sites: o.checker.member_sites.push({
+        member_sites: sited(o.checker, {
           module: o.checker.module,
           span: span,
-          // A function of a language type is a builtin: the call is written out as that
-          // builtin's, and what reads the call as it stands asks for it by name.
+          // A builtin is the prelude's: the call is written out through the prelude's binder,
+          // and what reads the call as it stands asks for the builtin by name.
           qualifier: match m.qname.module { Some(q) -> q.name, None -> prelude_binder() },
-          name: match m.qname.module {
-            Some(_) -> m.qname.name.name,
-            None -> runtime_of(o.checker, m.qname.name.name),
-          },
+          name: m.qname.name.name,
           callee: m.callee,
           owner: o.checker.walking,
           reaches: d.reaches,
         }),
-        builtins_on: if m.qname.module != None { o.checker.builtins_on } else {
-          o.checker.builtins_on.insert(span_key(span), runtime_of(o.checker, m.qname.name.name))
-        },
+        builtins_on: if m.qname.module != None { o.checker.builtins_on }
+        else { o.checker.builtins_on.insert(span_key(span), m.qname.name.name) },
       })
     },
   }
 }
 
-/// A builtin is compiled by its own name, so a call on a value cannot reach one whose name the
-/// module binds to something of its own: refused until builtins are compiled by their types'
-/// names alone.
-fn reaching_builtin(checker: Checker, name: Ident) -> Checker / {abort.raise} = {
-  let builtin = runtime_of(checker, name.name);
-  match lookup(scope_of(checker).bound, ValueSpace, builtin) {
-    None -> checker,
-    Some(_) ->
-      report_error_at(
-        checker,
-        b"E0105",
-        name.span,
-        Bytes::concat_all([
-          b"`",
-          name.name,
-          b"` is the builtin `",
-          builtin,
-          b"`, a name this module binds",
-        ]),
-        b"the module's own would be called here",
-        [
-          Bytes::concat_all([
-            b"give the module's `",
-            builtin,
-            b"` another name, or import it through its module",
-          ]),
-        ],
-      ),
-  }
-}
-
-/// The builtin the prelude's function `name` is.
-fn runtime_of(checker: Checker, name: Bytes) -> Bytes / {abort.raise} =
-  builtin_of(name, |n: Bytes| env_depth_of(checker.env, n) == Some(0))
-
-/// The prelude name a bare callee resolves to, or nothing for one the program declares.
+/// The prelude's name for a callee written bare or through a type of the language's, or nothing
+/// for one the program declares.
 fn prelude_named(checker: Checker, func: Expr) -> Bytes / {abort.raise} =
   match func {
     EVar(v) -> if !is_bare(v.name) {
-      match of_language_type(checker, v.name) { Named(n) -> runtime_of(checker, n), _ -> b"" }
+      match of_language_type(checker, v.name) { Named(n) -> n, _ -> b"" }
     } else {
       match value_key(checker, v.name).key {
-        Some(k) -> if !k.prelude { b"" } else { runtime_of(checker, k.name) },
+        Some(k) -> if !k.prelude { b"" } else { k.name },
         None -> b"",
       }
     },
@@ -7023,7 +6891,7 @@ fn hold_written(
       b"a hold is passed down, never kept",
       [
         b"a hold is a parameter of a definition, a lambda or a function type: it is not answered, held in another value or bound by an annotation",
-        b"read it where it is passed, with `hold_get`, and keep what the read answers",
+        b"read it where it is passed, with `Hold::get`, and keep what the read answers",
       ],
     )
   }
@@ -7198,7 +7066,7 @@ fn bind_pattern(
                 with_builtin.push(
                   b"that is deliberate: a pattern binding the payload would be a one-line escape from every guarantee `Secret` makes",
                 ).push(
-                  b"use `secret_verify` to check a candidate, `secret_is_empty` to check presence, or hand the whole `Secret` to a handler clause",
+                  b"use `Secret::verify` to check a candidate, `Secret::is_empty` to check presence, or hand the whole `Secret` to a handler clause",
                 )
               } else { with_builtin }
             },
@@ -8009,7 +7877,7 @@ fn resolve_op(
             b"`hold` is a builtin effect and cannot be performed directly",
             b"not a declared effect",
             [
-              b"read what a hold holds with `hold_get(h)`, inside `with_hold[r](..) { h -> .. }` or in a function it hands the hold to",
+              b"read what a hold holds with `h.get()`, inside `with_hold[r](..) { h -> .. }` or in a function it hands the hold to",
             ],
           ),
           hit: None,
@@ -9735,20 +9603,6 @@ fn signed_fns(
               ],
             ),
           }
-        } else if def.name.name == b"map_of_entries" {
-          {
-            ..acc,
-            checker: report_error_at(
-              acc.checker,
-              b"E0105",
-              def.name.span,
-              b"`map_of_entries` is a builtin",
-              b"cannot be redefined",
-              [
-                b"a map literal `#{k: v}` is written in its name, so a module that redefined it would change what it means",
-              ],
-            ),
-          }
         } else {
           { checker: acc.checker, fns: acc.fns.push(def), names: acc.names.push(def.name.name) }
         },
@@ -9838,15 +9692,26 @@ fn home_module(of: Bytes) -> Bytes / {abort.raise} =
 
 /// A function of a type, `fn T::name`, is declared by the module that declares `T`, a sum or a
 /// `new` record, under no name a field of the record has: a call on a value finds it by the type
-/// alone, and reads a record's fields first.
+/// alone, and reads a record's fields first. A type of the language's has its home module's,
+/// under no name the prelude declares for it.
 fn member_declared(checker: Checker, parsed: ParsedModule, def: FnDef) -> Checker / {abort.raise} =
   match member_of(def.name.name) {
     None -> checker,
     Some(m) -> {
       let type_name = qualify(parsed.name, m.of);
       match checker.types.get(type_name) {
-        None -> if builtin_type_arity(m.of) != None && home_module(m.of) == parsed.name { checker }
-        else {
+        None -> if builtin_type_arity(m.of) != None && home_module(m.of) == parsed.name {
+          if env_depth_of(checker.env, def.name.name) != Some(0) { checker } else {
+            report_error_at(
+              checker,
+              b"E0105",
+              def.name.span,
+              Bytes::concat_all([b"`", def.name.name, b"` is a builtin"]),
+              b"cannot be redefined",
+              [b"a type has one function of a name, and the prelude declares this one"],
+            )
+          }
+        } else {
           report_error_at(
             checker,
             b"E0208",
@@ -9935,8 +9800,7 @@ pub fn walk_order(parsed: ParsedModule) -> List<Bytes> =
       IFn(def) -> if acc.contains(qualify(parsed.name, def.name.name))
           || is_cell_builtin(def.name.name)
           || def.name.name == compare_values_name()
-          || call_operator(def.name.name) != None
-          || def.name.name == b"map_of_entries" { acc }
+          || call_operator(def.name.name) != None { acc }
       else { acc.push(qualify(parsed.name, def.name.name)) },
       _ -> acc,
     })
@@ -10095,9 +9959,12 @@ fn group_callee_kind(
       Some(n) ->
         range(0, qualified.len()).fold(DefinedCallee(n), |acc: Callee, i: Int|
           if qualified.get(i) == n { GroupMember(i) } else { acc }),
-      None -> if is_bare(qname) && env_depth_of(checker.env, qname.name.name) == Some(0) {
-        BuiltinCallee(qname.name.name)
-      } else { OtherCallee },
+      None -> match of_language_type(checker, qname) {
+        Named(builtin) -> BuiltinCallee(builtin),
+        _ -> if is_bare(qname) && env_depth_of(checker.env, qname.name.name) == Some(0) {
+          BuiltinCallee(qname.name.name)
+        } else { OtherCallee },
+      },
     }
   }
 
@@ -11853,7 +11720,7 @@ fn settle_numerics(checker: Checker) -> Checker / {abort.raise} = {
             b"the exact quotient of two decimals is not a decimal",
             [
               b"an operator would have to round, and a rounding nobody wrote down is the defect `Decimal` exists to prevent",
-              b"call `decimal_div(a, b, 2, HalfEven)` and say how to round",
+              b"call `Decimal::div(a, b, 2, HalfEven)` and say how to round",
             ],
           )
         } else { c }
@@ -14740,7 +14607,7 @@ fn check_comparisons(checker: Checker) -> Checker / {abort.raise} =
             b"a hold cannot be compared for equality",
             Bytes::concat_all([b"both sides have type `", type_text(resolved), b"`"]),
             [
-              b"a hold is a key to what its region will release, not a value: compare what `hold_get` reads of each instead",
+              b"a hold is a key to what its region will release, not a value: compare what `Hold::get` reads of each instead",
             ],
           ),
         )
@@ -16820,9 +16687,9 @@ test "a claim may hand a pure callback to a function generic over its row" {
     check_codes(
       Bytes::concat_all([
         b"fn total(xs: List<Int>) -> Int\n",
-        b"  requires fold(xs, 0, |s: Int, x: Int| s + x) < 100\n",
-        b"= fold(xs, 0, |s: Int, x: Int| s + x)\n",
-        b"law \"a fold over nothing is its seed\" { fold([], 7, |s: Int, x: Int| s + x) == 7 }",
+        b"  requires xs.fold(0, |s: Int, x: Int| s + x) < 100\n",
+        b"= xs.fold(0, |s: Int, x: Int| s + x)\n",
+        b"law \"a fold over nothing is its seed\" { [].fold(7, |s: Int, x: Int| s + x) == 7 }",
       ]),
     ),
     [],
@@ -17005,7 +16872,7 @@ test "a hold is read inside its region, whose row is its acquire's, its release'
   assert_eq(
     check_codes(
       held_io(
-        b"fn f() -> Int / {io.open, io.close, io.pull} = with_hold[file](io.open(1), |h: Int| io.close(h)) { h -> io.pull(hold_get(h)) }",
+        b"fn f() -> Int / {io.open, io.close, io.pull} = with_hold[file](io.open(1), |h: Int| io.close(h)) { h -> io.pull(h.get()) }",
       ),
     ),
     [],
@@ -17013,43 +16880,42 @@ test "a hold is read inside its region, whose row is its acquire's, its release'
   assert_eq(
     check_codes(
       held_io(
-        b"fn f() -> Int / {io.open, io.pull} = with_hold[file](io.open(1), |h: Int| io.close(h)) { h -> io.pull(hold_get(h)) }",
+        b"fn f() -> Int / {io.open, io.pull} = with_hold[file](io.open(1), |h: Int| io.close(h)) { h -> io.pull(h.get()) }",
       ),
     ),
     [b"E0302"],
   );
   // The release is a function of what was acquired, answering nothing.
-  assert_eq(
-    check_codes(b"fn f() -> Int = with_hold[file](1, |h: String| ()) { h -> hold_get(h) }"),
-    [b"E0201"],
-  );
-  assert_eq(check_codes(b"fn f() -> Int = with_hold[file](1, |h: Int| h) { h -> hold_get(h) }"), [
+  assert_eq(check_codes(b"fn f() -> Int = with_hold[file](1, |h: String| ()) { h -> h.get() }"), [
+    b"E0201",
+  ]);
+  assert_eq(check_codes(b"fn f() -> Int = with_hold[file](1, |h: Int| h) { h -> h.get() }"), [
     b"E0201",
   ])
 }
 
 test "a function handed a hold reads it under its region's label, which the region answers" {
-  let peek = b"fn peek<[r]>(h: Hold<Int, [r]>) -> Int / {hold.read[r]} = hold_get(h)\n";
+  let peek = b"fn peek<[r]>(h: Hold<Int, [r]>) -> Int / {hold.read[r]} = h.get()\n";
   assert_eq(
     check_codes(
       peek.concat(b"fn f() -> Int = with_hold[file](1, |x: Int| ()) { h -> peek(h) + peek(h) }"),
     ),
     [],
   );
-  assert_eq(check_codes(b"fn peek<[r]>(h: Hold<Int, [r]>) -> Int = hold_get(h)"), [b"E0302"]);
+  assert_eq(check_codes(b"fn peek<[r]>(h: Hold<Int, [r]>) -> Int = h.get()"), [b"E0302"]);
   // A hold's type names its region's label, as its reads do.
   assert_eq(check_codes(b"fn kept(h: Hold<Int>) -> Int = 0"), [b"E0202"]);
   // A region answers the reads of its own hold and of no other: one inside a closure that reads an
   // outer hold too leaves that read in the closure's row, where the outer region sees it leave.
   assert_eq(
     refusals(
-      b"fn f() -> Int = { let k = with_hold[outer](41, |x: Int| ()) { h -> || with_hold[inner](1, |x: Int| ()) { g -> hold_get(h) + hold_get(g) } }; 0 }",
+      b"fn f() -> Int = { let k = with_hold[outer](41, |x: Int| ()) { h -> || with_hold[inner](1, |x: Int| ()) { g -> h.get() + g.get() } }; 0 }",
     ),
     [
       [
         b"E0446",
         b"a hold escapes its `with_hold[outer]` region",
-        b"|| with_hold[inner](1, |x: Int| ()) { g -> hold_get(h) + hold_get(g) }",
+        b"|| with_hold[inner](1, |x: Int| ()) { g -> h.get() + g.get() }",
       ],
     ],
   );
@@ -17058,7 +16924,7 @@ test "a function handed a hold reads it under its region's label, which the regi
 }
 
 test "the labels a call writes fill those that name no region, which the hold passed fills" {
-  let noted = b"effect log { write say[l](n: Int) -> Unit }\nfn noted<[l], [r]>(h: Hold<Int, [r]>) -> Unit / {log.write[l], hold.read[r]} = log.say[l](hold_get(h))\n";
+  let noted = b"effect log { write say[l](n: Int) -> Unit }\nfn noted<[l], [r]>(h: Hold<Int, [r]>) -> Unit / {log.write[l], hold.read[r]} = log.say[l](h.get())\n";
   let inside = |call: Bytes|
     Bytes::concat_all([
       noted,
@@ -17077,7 +16943,7 @@ test "the labels a call writes fill those that name no region, which the hold pa
   assert(
     refused_with(inside(b"noted(h)"), b"E0306", b"this call leaves a label of `noted` unfilled"),
   );
-  let peek = b"fn peek<[r]>(h: Hold<Int, [r]>) -> Int / {hold.read[r]} = hold_get(h)\n";
+  let peek = b"fn peek<[r]>(h: Hold<Int, [r]>) -> Int / {hold.read[r]} = h.get()\n";
   assert(
     refused_with(
       peek.concat(b"fn f() -> Int = with_hold[file](1, |x: Int| ()) { h -> peek[file](h) }"),
@@ -17092,7 +16958,7 @@ test "the labels a call writes fill those that name no region, which the hold pa
       Bytes::concat_all([
         noted,
         through,
-        b"fn f() -> Unit / {log.write[out]} = with_hold[file](1, |x: Int| ()) { h -> through[out](|| hold_get(h)) }",
+        b"fn f() -> Unit / {log.write[out]} = with_hold[file](1, |x: Int| ()) { h -> through[out](|| h.get()) }",
       ]),
     ),
     [],
@@ -17104,21 +16970,17 @@ test "a hold that leaves its region is refused where it leaves" {
     [b"E0446", b"a hold escapes its `with_hold[r]` region", b"h"],
   ]);
   assert_eq(
-    refusals(
-      b"fn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> || hold_get(h) }; 0 }",
-    ),
-    [[b"E0446", b"a hold escapes its `with_hold[r]` region", b"|| hold_get(h)"]],
+    refusals(b"fn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> || h.get() }; 0 }"),
+    [[b"E0446", b"a hold escapes its `with_hold[r]` region", b"|| h.get()"]],
   );
   // A function that answers a closure over a hold says `hold.read` in the closure's row.
   assert_eq(
     check_codes(
-      b"fn later<[l]>(h: Hold<Int, [l]>) -> () -> Int / {hold.read[l]} = || hold_get(h)\nfn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> later(h) }; 0 }",
+      b"fn later<[l]>(h: Hold<Int, [l]>) -> () -> Int / {hold.read[l]} = || h.get()\nfn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> later(h) }; 0 }",
     ),
     [b"E0446"],
   );
-  assert_eq(check_codes(b"fn later<[l]>(h: Hold<Int, [l]>) -> () -> Int = || hold_get(h)"), [
-    b"E0302",
-  ])
+  assert_eq(check_codes(b"fn later<[l]>(h: Hold<Int, [l]>) -> () -> Int = || h.get()"), [b"E0302"])
 }
 
 test "a hold kept in an older cell, handed to an operation, or given an older scheduler's task is refused" {
@@ -17136,13 +16998,13 @@ test "a hold kept in an older cell, handed to an operation, or given an older sc
   );
   assert_eq(
     check_codes(
-      b"fn f() -> Int / {task.spawn} = with_hold[r](1, |x: Int| ()) { h -> { let t = task.spawn(|| hold_get(h)); 0 } }",
+      b"fn f() -> Int / {task.spawn} = with_hold[r](1, |x: Int| ()) { h -> { let t = task.spawn(|| h.get()); 0 } }",
     ),
     [b"E0446"],
   );
   assert_eq(
     check_codes(
-      b"fn f() -> Int / {sim.read, abort.raise} = with_hold[r](1, |x: Int| ()) { h -> simulate { task.join(task.spawn(|| hold_get(h))) } }",
+      b"fn f() -> Int / {sim.read, abort.raise} = with_hold[r](1, |x: Int| ()) { h -> simulate { task.join(task.spawn(|| h.get())) } }",
     ),
     [],
   )
@@ -17194,7 +17056,7 @@ test "a region's label is its own: a row another definition writes names no regi
   );
   assert_eq(
     check_codes(
-      b"fn f() -> Int = with_hold[a](40, |x: Int| ()) { h -> { let k = with_hold[b](2, |x: Int| ()) { g -> { let n = hold_get(g); || hold_get(h) + n } }; k() } }",
+      b"fn f() -> Int = with_hold[a](40, |x: Int| ()) { h -> { let k = with_hold[b](2, |x: Int| ()) { g -> { let n = g.get(); || h.get() + n } }; k() } }",
     ),
     [],
   );
@@ -17290,7 +17152,7 @@ test "no closure, list or record carries a cell out of its region" {
   );
   assert(
     escapes(
-      b"test \"smuggle\" {\n  let xs = with_cell[log](1) { c -> [c] };\n  assert_eq(len(xs), 1)\n}\n",
+      b"test \"smuggle\" {\n  let xs = with_cell[log](1) { c -> [c] };\n  assert_eq(xs.len(), 1)\n}\n",
     ),
     Some("a list"),
   );
@@ -17328,7 +17190,7 @@ test "a declared cell field is refused, and one variant cannot hold cells of two
 test "a secret of bytes is no more ordered, keyed or digested than one of a string" {
   [
     b"fn f(a: Secret<Bytes>, b: Secret<Bytes>) -> Ordering = compare(a, b)\n",
-    b"fn f(m: Map<Secret<Bytes>, Int>) -> Int = map_len(m)\n",
+    b"fn f(m: Map<Secret<Bytes>, Int>) -> Int = m.len()\n",
     b"fn f(s: Secret<Bytes>) -> Bytes = digest(s)\n",
   ].fold((), |u: Unit, src: Bytes|
     assert(check_codes(src).contains(b"E0206"), Some(String::of_bytes_lossy(src))))
@@ -17338,7 +17200,7 @@ test "a secret of bytes is no more ordered, keyed or digested than one of a stri
 // neither a concrete one, which would launder a secret into a string, nor a wrong one.
 test "a clause may not answer a polymorphic operation with a type of its choosing" {
   let laundering = check_diags(
-    b"effect vault { read fetch[k]<a>(s: Secret<String>) -> a }\nfn launder(s: Secret<String>) -> String / {vault.read[k]} = vault.fetch[k](s)\ntest \"launder\" {\n  handle {\n    assert_eq(string_len(launder(secret_of_string(\"hunter2\"))), 7)\n  } with {\n    vault.fetch[k](s) -> s,\n  }\n}\n",
+    b"effect vault { read fetch[k]<a>(s: Secret<String>) -> a }\nfn launder(s: Secret<String>) -> String / {vault.read[k]} = vault.fetch[k](s)\ntest \"launder\" {\n  handle {\n    assert_eq(launder(Secret::of_string(\"hunter2\")).len(), 7)\n  } with {\n    vault.fetch[k](s) -> s,\n  }\n}\n",
   );
   assert(
     laundering.filter(|diag: Diag|
@@ -17353,7 +17215,7 @@ test "a clause may not answer a polymorphic operation with a type of its choosin
   );
   assert(
     check_codes(
-      b"effect box { read take[k]<a>() -> a }\nfn as_string() -> String / {box.read[k]} = box.take[k]()\ntest \"confuse\" {\n  handle {\n    assert_eq(string_len(as_string()), 1)\n  } with {\n    box.take[k]() -> 7,\n  }\n}\n",
+      b"effect box { read take[k]<a>() -> a }\nfn as_string() -> String / {box.read[k]} = box.take[k]()\ntest \"confuse\" {\n  handle {\n    assert_eq(as_string().len(), 1)\n  } with {\n    box.take[k]() -> 7,\n  }\n}\n",
     ).contains(
       b"E0201",
     ),
@@ -17386,8 +17248,8 @@ fn refused_with(src: Bytes, code: Bytes, said: Bytes) -> Bool / {abort.raise} =
 test "every carrier of a cell out of its region is refused before it can dangle" {
   [
     b"fn leak() = with_cell[k](0) { c -> [c] }\n",
-    b"fn leak() = with_cell[k](0) { c -> map_insert(map_new(), c, 1) }\n",
-    b"fn leak() = with_cell[k](0) { c -> map_insert(map_new(), 1, c) }\n",
+    b"fn leak() = with_cell[k](0) { c -> Map::new().insert(c, 1) }\n",
+    b"fn leak() = with_cell[k](0) { c -> Map::new().insert(1, c) }\n",
     b"fn leak() = with_cell[k](0) { c -> {held: c} }\n",
     b"type Box<a> = | B(a)\nfn leak() = with_cell[k](0) { c -> B(c) }\n",
     b"fn leak() = with_cell[k](0) { c -> [{held: [c]}] }\n",
@@ -17677,7 +17539,7 @@ test "a law does not quantify over a sum whose function performs the type's row 
 }
 
 test "a `Map` key an alias leaves unordered is refused at every signature naming the alias" {
-  let src = b"type Keyed = Map<(Int) -> Int, Int>\nfn first(m: Keyed) -> Int = map_len(m)\nfn second(m: Keyed) -> Int = map_len(m)";
+  let src = b"type Keyed = Map<(Int) -> Int, Int>\nfn first(m: Keyed) -> Int = m.len()\nfn second(m: Keyed) -> Int = m.len()";
   let primary = |diag: Diag|
     diag.labels.fold(b"", |acc: Bytes, label: Label|
       if label.primary { src.slice(label.start, label.end) } else { acc });
@@ -17791,20 +17653,23 @@ test "an operation's type variables are the ones its own list declares" {
 }
 
 test "a `cost` clause bounds a definition that ends and only raises, by an `Int` over its parameters" {
-  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int cost len(xs) * (len(xs) + 1) = len(xs)"), []);
-  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int / {abort.raise} cost 1 = 100 / len(xs)"), []);
-  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int cost len(xs) > 0 = 0"), [b"E0201"]);
+  assert_eq(
+    check_codes(b"fn f(xs: List<Int>) -> Int cost xs.len() * (xs.len() + 1) = xs.len()"),
+    [],
+  );
+  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int / {abort.raise} cost 1 = 100 / xs.len()"), []);
+  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int cost xs.len() > 0 = 0"), [b"E0201"]);
   assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int cost result = 0"), [b"E0101"]);
   assert_eq(check_codes(b"fn f(n: Int) -> Int / {diverges} cost n = f(n + 1)"), [b"E0468"]);
   assert_eq(
     check_codes(
-      b"effect tally { write bump() -> Unit }\nfn f(xs: List<Int>) -> Unit / {tally.bump} cost len(xs) = tally.bump()",
+      b"effect tally { write bump() -> Unit }\nfn f(xs: List<Int>) -> Unit / {tally.bump} cost xs.len() = tally.bump()",
     ),
     [b"E0463"],
   );
   assert_eq(check_codes(b"fn f<| e>(g: () -> Int / e cost k) -> Int / e cost k = g()"), []);
   assert_eq(
-    check_codes(b"fn f(g: (Int) -> Int cost k, xs: List<Int>) -> Int cost len(xs) * k = 0"),
+    check_codes(b"fn f(g: (Int) -> Int cost k, xs: List<Int>) -> Int cost xs.len() * k = 0"),
     [],
   );
   // A cost name is read by `cost` clauses alone, and only a function parameter has one.
@@ -17825,7 +17690,7 @@ test "a law binder naming a type nothing declares is refused, and a lowercase on
 
 test "an instantiation is checked where it is written: what it is given, and what its schema quantifies there" {
   let over = |law: Bytes|
-    b"law schema same<a>(f: (a) -> a) forall (x: a) where x == x { f(x) == x }\nfn id(n: Int) -> Int = n\nfn show(n: Int) -> String = int_to_string(n)\nfn held(t: Task<Int>) -> Task<Int> = t\nfn x(n: Int) -> Int = n\n".concat(
+    b"law schema same<a>(f: (a) -> a) forall (x: a) where x == x { f(x) == x }\nfn id(n: Int) -> Int = n\nfn show(n: Int) -> String = n.to_string()\nfn held(t: Task<Int>) -> Task<Int> = t\nfn x(n: Int) -> Int = n\n".concat(
       law,
     );
   assert_eq(check_codes(over(b"law \"l\" = same(id)")), []);
@@ -18024,7 +17889,7 @@ test "a handle over a function value or a lambda is judged by its type" {
     ),
     [],
   );
-  let folded = b"fn f() -> Int = handle { fold([1, 2], 0, |acc: Int, x: Int| { net.send[c](b\"x\"); acc + x }) } with { ";
+  let folded = b"fn f() -> Int = handle { [1, 2].fold(0, |acc: Int, x: Int| { net.send[c](b\"x\"); acc + x }) } with { ";
   assert_eq(check_codes(net_src(folded.concat(b"net.recv[c](n) -> b\"\" }"))), [b"E0305"]);
   assert_eq(check_codes(net_src(folded.concat(b"net.send[c](p) -> () }"))), []);
   let diags = check_diags(net_src(folded.concat(b"net.recv[c](n) -> b\"\" }")));
@@ -18363,11 +18228,11 @@ test "a `try` answers the one raise its body's row names, as an `Err` of what it
   assert_eq(raising(b"fn f(b: Int) -> Result<Int, String> / {} = try { digit(b) }"), [b"E0201"]);
   assert_eq(raising(b"fn f() -> Result<Int, Int> / {} = try { 1 }"), [b"E0311"]);
   assert_eq(
-    raising(b"fn f(xs: List<Int>) -> Result<Int, String> / {abort.raise} = try { 1 / len(xs) }"),
+    raising(b"fn f(xs: List<Int>) -> Result<Int, String> / {abort.raise} = try { 1 / xs.len() }"),
     [b"E0311"],
   );
   assert_eq(
-    raising(b"fn f(xs: List<Int>) -> Result<Int, String> / {} = try[abort.raise] { 1 / len(xs) }"),
+    raising(b"fn f(xs: List<Int>) -> Result<Int, String> / {} = try[abort.raise] { 1 / xs.len() }"),
     [],
   );
   assert_eq(raising(b"fn f(b: Int) -> Result<Int, Int> / {abort.raise} = try { digit(b) / b }"), [])
@@ -18416,19 +18281,19 @@ test "a spec may raise, and a function type that only raises can be generated" {
 
 test "a partial builtin, a division that may meet zero and a refutable let raise" {
   assert_eq(check_codes(b"fn f() -> Int / {} = panic(\"no\")"), [b"E0302"]);
-  assert_eq(check_codes(b"fn f(b: Bytes) -> Int / {} = bytes_at(b, 0)"), [b"E0302"]);
+  assert_eq(check_codes(b"fn f(b: Bytes) -> Int / {} = b.at(0)"), [b"E0302"]);
   assert_eq(check_codes(b"fn f(a: Int, b: Int) -> Int / {} = a / b"), [b"E0302"]);
   assert_eq(check_codes(b"fn f(a: Int) -> Int / {} = a % 0"), [b"E0302"]);
   assert_eq(check_codes(b"fn f(a: U8, b: U8) -> U8 / {} = a % b"), [b"E0302"]);
   assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int / {} = { let [x, ..] = xs; x }"), [b"E0302"]);
-  assert_eq(check_codes(b"fn f(n: Int) -> U8 / {} = u8_of_int(n)"), [b"E0302"])
+  assert_eq(check_codes(b"fn f(n: Int) -> U8 / {} = U8::of_int(n)"), [b"E0302"])
 }
 
 test "a narrowing of a literal its type holds does not raise, and one of any other value does" {
-  assert_eq(check_codes(b"fn f() -> U8 / {} = u8_of_int(200)"), []);
-  assert_eq(check_codes(b"fn f() -> I8 / {} = i8_of_int(-128)"), []);
-  assert_eq(check_codes(b"fn f() -> U8 / {} = u8_of_int(300)"), [b"E0302"]);
-  assert_eq(check_codes(b"fn f() -> U16 / {} = u16_of_int(-1)"), [b"E0302"]);
+  assert_eq(check_codes(b"fn f() -> U8 / {} = U8::of_int(200)"), []);
+  assert_eq(check_codes(b"fn f() -> I8 / {} = I8::of_int(-128)"), []);
+  assert_eq(check_codes(b"fn f() -> U8 / {} = U8::of_int(300)"), [b"E0302"]);
+  assert_eq(check_codes(b"fn f() -> U16 / {} = U16::of_int(-1)"), [b"E0302"]);
   assert_eq(check_codes(b"fn f<a>(x: a) -> a / {} where numeric(a) = x + numeric_of_int(1)"), []);
   assert_eq(check_codes(b"fn f<a>(x: a) -> a / {} where numeric(a) = x + numeric_of_int(128)"), [
     b"E0302",
@@ -18449,33 +18314,33 @@ fn total(bodies: List<Bytes>) -> List<Bool> / {abort.raise} =
 test "an indexed read on the far side of both of its bounds does not raise" {
   assert_eq(
     total([
-      b"if i < 0 || i >= bytes_len(b) { 0 } else { bytes_at(b, i) }",
-      b"if i >= 0 && i < bytes_len(b) { bytes_at(b, i) } else { 0 }",
-      b"if 0 <= i && i + 3 < bytes_len(b) { bytes_at(b, i) + bytes_at(b, i + 3) } else { 0 }",
-      b"if i < 0 || i > bytes_len(b) - 4 { 0 } else { int_of_u32(bytes_u32_le(b, i)) }",
-      b"if 0 <= i && i < array_len(a) { array_get(a, i) } else { 0 }",
-      b"if 0 <= i && i < array_len(a) { array_len(array_set(a, i, 1)) } else { 0 }",
-      b"if 0 <= i && i < len(xs) { len(list_set(xs, i, 1)) } else { 0 }",
-      b"{ let size = bytes_len(b); if i >= 0 && i < size { bytes_at(b, i) } else { 0 } }",
-      b"match i { k if k >= 0 && k < bytes_len(b) -> bytes_at(b, k), _ -> 0 }",
-      b"if (0 <= i && i < bytes_len(b)) && bytes_at(b, i) == 0 { 1 } else { 0 }",
-      b"if i < 0 || i >= bytes_len(b) || bytes_at(b, i) == 0 { 1 } else { 0 }",
+      b"if i < 0 || i >= b.len() { 0 } else { b.at(i) }",
+      b"if i >= 0 && i < b.len() { b.at(i) } else { 0 }",
+      b"if 0 <= i && i + 3 < b.len() { b.at(i) + b.at(i + 3) } else { 0 }",
+      b"if i < 0 || i > b.len() - 4 { 0 } else { Int::of_u32(b.u32_le(i)) }",
+      b"if 0 <= i && i < a.len() { a.get(i) } else { 0 }",
+      b"if 0 <= i && i < a.len() { a.set(i, 1).len() } else { 0 }",
+      b"if 0 <= i && i < xs.len() { xs.set(i, 1).len() } else { 0 }",
+      b"{ let size = b.len(); if i >= 0 && i < size { b.at(i) } else { 0 } }",
+      b"match i { k if k >= 0 && k < b.len() -> b.at(k), _ -> 0 }",
+      b"if (0 <= i && i < b.len()) && b.at(i) == 0 { 1 } else { 0 }",
+      b"if i < 0 || i >= b.len() || b.at(i) == 0 { 1 } else { 0 }",
     ]),
     [true, true, true, true, true, true, true, true, true, true, true],
   );
   assert_eq(
     total([
-      b"bytes_at(b, i)",
-      b"if i < bytes_len(b) { bytes_at(b, i) } else { 0 }",
-      b"if i >= 0 { bytes_at(b, i) } else { 0 }",
-      b"if i >= 0 && i <= bytes_len(b) { bytes_at(b, i) } else { 0 }",
-      b"if i >= 0 && i < bytes_len(b) { bytes_at(b, i + 1) } else { 0 }",
-      b"if i >= 0 && i < bytes_len(b) { 0 } else { bytes_at(b, i) }",
-      b"if i >= 0 && i < string_len(s) { bytes_at(b, i) } else { 0 }",
-      b"if i >= 0 || i < bytes_len(b) { bytes_at(b, i) } else { 0 }",
-      b"if 0 <= i && i < array_len(a) { array_get(a, j) } else { 0 }",
-      b"if 0 <= i && i < len(xs) { len(list_set(xs, i + n, 1)) } else { 0 }",
-      b"{ let ok = if i >= 0 && i < bytes_len(b) { 1 } else { 0 }; bytes_at(b, i) + ok }",
+      b"b.at(i)",
+      b"if i < b.len() { b.at(i) } else { 0 }",
+      b"if i >= 0 { b.at(i) } else { 0 }",
+      b"if i >= 0 && i <= b.len() { b.at(i) } else { 0 }",
+      b"if i >= 0 && i < b.len() { b.at(i + 1) } else { 0 }",
+      b"if i >= 0 && i < b.len() { 0 } else { b.at(i) }",
+      b"if i >= 0 && i < s.len() { b.at(i) } else { 0 }",
+      b"if i >= 0 || i < b.len() { b.at(i) } else { 0 }",
+      b"if 0 <= i && i < a.len() { a.get(j) } else { 0 }",
+      b"if 0 <= i && i < xs.len() { xs.set(i + n, 1).len() } else { 0 }",
+      b"{ let ok = if i >= 0 && i < b.len() { 1 } else { 0 }; b.at(i) + ok }",
     ]),
     [false, false, false, false, false, false, false, false, false, false, false],
   )
@@ -18484,24 +18349,24 @@ test "an indexed read on the far side of both of its bounds does not raise" {
 test "a slice whose ends a condition holds in order and inside the value does not raise" {
   assert_eq(
     total([
-      b"if i < 0 || n < 0 || i > bytes_len(b) || n > bytes_len(b) - i { 0 } else { bytes_len(bytes_slice(b, i, i + n)) }",
-      b"if 0 <= i && i <= j && j <= string_len(s) { string_len(string_slice(s, i, j)) } else { 0 }",
-      b"{ let size = string_len(s); if size == 0 { 0 } else { string_len(string_slice(s, size - 1, size)) } }",
-      b"if n < 0 || n > 15 { 0 } else { string_len(string_slice(\"0123456789abcdef\", n, n + 1)) }",
-      b"{ let digits = b\"0123456789\"; if 0 <= n && n < 10 { bytes_len(bytes_slice(digits, n, n + 1)) } else { 0 } }",
-      b"if 0 <= i && i <= bytes_len(b) { bytes_len(bytes_slice(b, bytes_scan(b, i, b\" \", bytes_len(b)), bytes_len(b))) } else { 0 }",
-      b"len(string_split(s, \",\")) + len(bytes_split(b, b\"\\r\\n\"))",
+      b"if i < 0 || n < 0 || i > b.len() || n > b.len() - i { 0 } else { b.slice(i, i + n).len() }",
+      b"if 0 <= i && i <= j && j <= s.len() { s.slice(i, j).len() } else { 0 }",
+      b"{ let size = s.len(); if size == 0 { 0 } else { s.slice(size - 1, size).len() } }",
+      b"if n < 0 || n > 15 { 0 } else { \"0123456789abcdef\".slice(n, n + 1).len() }",
+      b"{ let digits = b\"0123456789\"; if 0 <= n && n < 10 { digits.slice(n, n + 1).len() } else { 0 } }",
+      b"if 0 <= i && i <= b.len() { b.slice(b.scan(i, b\" \", b.len()), b.len()).len() } else { 0 }",
+      b"s.split(\",\").len() + b.split(b\"\\r\\n\").len()",
     ]),
     [true, true, true, true, true, true, true],
   );
   assert_eq(
     total([
-      b"string_len(string_slice(s, i, j))",
-      b"if 0 <= i && j <= string_len(s) { string_len(string_slice(s, i, j)) } else { 0 }",
-      b"if n < 0 || n > 16 { 0 } else { string_len(string_slice(\"0123456789abcdef\", n, n + 1)) }",
-      b"bytes_len(bytes_slice(b, bytes_scan(b, i, b\" \", bytes_len(b)), bytes_len(b)))",
-      b"len(string_split(s, s))",
-      b"len(bytes_split(b, b\"\"))",
+      b"s.slice(i, j).len()",
+      b"if 0 <= i && j <= s.len() { s.slice(i, j).len() } else { 0 }",
+      b"if n < 0 || n > 16 { 0 } else { \"0123456789abcdef\".slice(n, n + 1).len() }",
+      b"b.slice(b.scan(i, b\" \", b.len()), b.len()).len()",
+      b"s.split(s).len()",
+      b"b.split(b\"\").len()",
     ]),
     [false, false, false, false, false, false],
   )
@@ -18510,23 +18375,23 @@ test "a slice whose ends a condition holds in order and inside the value does no
 test "a lambda called with each element of a range reads within the range's bounds" {
   assert_eq(
     total([
-      b"fold(range(0, bytes_len(b)), 0, |acc: Int, k: Int| acc + bytes_at(b, k))",
-      b"len(map(range(0, bytes_len(b)), |k: Int| bytes_at(b, k)))",
-      b"len(filter(range(0, array_len(a)), |k: Int| array_get(a, k) > 0))",
-      b"fold(range(0, bytes_len(b) / 4), 0, |acc: Int, k: Int| acc + bytes_at(b, k * 4 + 3))",
-      b"fold(range(0, min(bytes_len(b), n)), 0, |acc: Int, k: Int| acc + bytes_at(b, k))",
-      b"fold(range(1, bytes_len(b)), 0, |acc: Int, k: Int| acc + bytes_at(b, k - 1))",
+      b"range(0, b.len()).fold(0, |acc: Int, k: Int| acc + b.at(k))",
+      b"range(0, b.len()).map(|k: Int| b.at(k)).len()",
+      b"range(0, a.len()).filter(|k: Int| a.get(k) > 0).len()",
+      b"range(0, b.len() / 4).fold(0, |acc: Int, k: Int| acc + b.at(k * 4 + 3))",
+      b"range(0, min(b.len(), n)).fold(0, |acc: Int, k: Int| acc + b.at(k))",
+      b"range(1, b.len()).fold(0, |acc: Int, k: Int| acc + b.at(k - 1))",
     ]),
     [true, true, true, true, true, true],
   );
   assert_eq(
     total([
-      b"fold(range(0, n), 0, |acc: Int, k: Int| acc + bytes_at(b, k))",
-      b"fold(range(0, bytes_len(b)), 0, |acc: Int, k: Int| acc + bytes_at(b, acc))",
-      b"fold(range(0, bytes_len(b) + 1), 0, |acc: Int, k: Int| acc + bytes_at(b, k))",
-      b"fold(range(0 - 1, bytes_len(b)), 0, |acc: Int, k: Int| acc + bytes_at(b, k))",
-      b"fold(range(0, bytes_len(b)), 0, |acc: Int, k: Int| fold([k + 1], acc, |x: Int, k: Int| x + bytes_at(b, k)))",
-      b"fold(xs, 0, |acc: Int, k: Int| acc + bytes_at(b, k))",
+      b"range(0, n).fold(0, |acc: Int, k: Int| acc + b.at(k))",
+      b"range(0, b.len()).fold(0, |acc: Int, k: Int| acc + b.at(acc))",
+      b"range(0, b.len() + 1).fold(0, |acc: Int, k: Int| acc + b.at(k))",
+      b"range(0 - 1, b.len()).fold(0, |acc: Int, k: Int| acc + b.at(k))",
+      b"range(0, b.len()).fold(0, |acc: Int, k: Int| [k + 1].fold(acc, |x: Int, k: Int| x + b.at(k)))",
+      b"xs.fold(0, |acc: Int, k: Int| acc + b.at(k))",
     ]),
     [false, false, false, false, false, false],
   )
@@ -18535,30 +18400,30 @@ test "a lambda called with each element of a range reads within the range's boun
 test "a narrowing of a value its type is shown to hold does not raise" {
   assert_eq(
     total([
-      b"bytes_len(byte_of_int(n & 0xFF))",
-      b"bytes_len(byte_of_int(n >>> 24 & 0xFF))",
-      b"bytes_len(byte_of_int(n >>> 56))",
-      b"int_of_u16(u16_of_int(n & 0xFFFF)) + int_of_u32(u32_of_int(n & 0xFFFF_FFFF))",
-      b"if 0 <= n && n < 256 { int_of_u8(u8_of_int(n)) } else { 0 }",
-      b"if i < 0 || i >= bytes_len(b) { 0 } else { bytes_len(byte_of_int(bytes_at(b, i))) }",
-      b"if 0 <= i && i < bytes_len(b) && 0 <= j && j < bytes_len(b) { bytes_len(byte_of_int(bytes_at(b, i) ^ bytes_at(b, j))) } else { 0 }",
-      b"if n < 0 { 0 } else { bytes_len(byte_of_int(n % 256)) + bytes_len(byte_of_int(128 + n % 64)) }",
-      b"if 0 <= n && n < 2048 { bytes_len(byte_of_int(192 + n / 64)) } else { 0 }",
-      b"int_of_i8(i8_of_int(-128)) + bytes_len(byte_of_int(int_of_u8(u8_of_int(7))))",
+      b"byte_of_int(n & 0xFF).len()",
+      b"byte_of_int(n >>> 24 & 0xFF).len()",
+      b"byte_of_int(n >>> 56).len()",
+      b"Int::of_u16(U16::of_int(n & 0xFFFF)) + Int::of_u32(U32::of_int(n & 0xFFFF_FFFF))",
+      b"if 0 <= n && n < 256 { Int::of_u8(U8::of_int(n)) } else { 0 }",
+      b"if i < 0 || i >= b.len() { 0 } else { byte_of_int(b.at(i)).len() }",
+      b"if 0 <= i && i < b.len() && 0 <= j && j < b.len() { byte_of_int(b.at(i) ^ b.at(j)).len() } else { 0 }",
+      b"if n < 0 { 0 } else { byte_of_int(n % 256).len() + byte_of_int(128 + n % 64).len() }",
+      b"if 0 <= n && n < 2048 { byte_of_int(192 + n / 64).len() } else { 0 }",
+      b"Int::of_i8(I8::of_int(-128)) + byte_of_int(Int::of_u8(U8::of_int(7))).len()",
     ]),
     [true, true, true, true, true, true, true, true, true, true],
   );
   assert_eq(
     total([
-      b"bytes_len(byte_of_int(n))",
-      b"bytes_len(byte_of_int(n & 0x1FF))",
-      b"bytes_len(byte_of_int(n >>> 55))",
-      b"bytes_len(byte_of_int(n >> 56))",
-      b"bytes_len(byte_of_int(n % 256))",
-      b"if 0 <= n && n <= 256 { int_of_u8(u8_of_int(n)) } else { 0 }",
-      b"if 0 <= i && i < bytes_len(b) { bytes_len(byte_of_int(bytes_at(b, i) ^ n)) } else { 0 }",
-      b"if 0 <= n && n < 2048 { bytes_len(byte_of_int(225 + n / 64)) } else { 0 }",
-      b"int_of_u64(u64_of_int(n))",
+      b"byte_of_int(n).len()",
+      b"byte_of_int(n & 0x1FF).len()",
+      b"byte_of_int(n >>> 55).len()",
+      b"byte_of_int(n >> 56).len()",
+      b"byte_of_int(n % 256).len()",
+      b"if 0 <= n && n <= 256 { Int::of_u8(U8::of_int(n)) } else { 0 }",
+      b"if 0 <= i && i < b.len() { byte_of_int(b.at(i) ^ n).len() } else { 0 }",
+      b"if 0 <= n && n < 2048 { byte_of_int(225 + n / 64).len() } else { 0 }",
+      b"Int::of_u64(U64::of_int(n))",
     ]),
     [false, false, false, false, false, false, false, false, false],
   )
@@ -18571,11 +18436,11 @@ test "a division by a divisor a condition holds off zero does not raise" {
       b"if n != 0 { i % n } else { 0 }",
       b"if n > 0 { i / n + i % n } else { 0 }",
       b"match n { 0 -> 0, _ -> i / n }",
-      b"if len(xs) == 0 { 0 } else { i / len(xs) }",
-      b"match xs { [] -> 0, _ -> i % len(xs) }",
-      b"i / (bytes_len(b) + 1)",
-      b"if 0 <= i && len(xs) > 0 { len(list_set(xs, i % len(xs), 0)) } else { 0 }",
-      b"if i < 0 || len(xs) == 0 { 0 } else { len(list_set(xs, i % len(xs), 0)) }",
+      b"if xs.len() == 0 { 0 } else { i / xs.len() }",
+      b"match xs { [] -> 0, _ -> i % xs.len() }",
+      b"i / (b.len() + 1)",
+      b"if 0 <= i && xs.len() > 0 { xs.set(i % xs.len(), 0).len() } else { 0 }",
+      b"if i < 0 || xs.len() == 0 { 0 } else { xs.set(i % xs.len(), 0).len() }",
     ]),
     [true, true, true, true, true, true, true, true, true],
   );
@@ -18585,8 +18450,8 @@ test "a division by a divisor a condition holds off zero does not raise" {
       b"if i != 0 { i / n } else { 0 }",
       b"if n >= 0 { i / n } else { 0 }",
       b"match n { 1 -> 0, _ -> i / n }",
-      b"i / bytes_len(b)",
-      b"if len(xs) > 0 { len(list_set(xs, i % len(xs), 0)) } else { 0 }",
+      b"i / b.len()",
+      b"if xs.len() > 0 { xs.set(i % xs.len(), 0).len() } else { 0 }",
     ]),
     [false, false, false, false, false, false],
   )
@@ -18595,23 +18460,23 @@ test "a division by a divisor a condition holds off zero does not raise" {
 test "a pattern that matched says what a condition would" {
   assert_eq(
     total([
-      b"match list_at(xs, i) { Some(_) -> len(list_set(xs, i, 0)), None -> 0 }",
-      b"match array_at(a, i) { Some(_) -> array_get(a, i), None -> 0 }",
-      b"match xs { [_, _, ..] -> len(list_set(xs, 1, 0)), _ -> 0 }",
-      b"match xs { [] -> 0, _ -> len(list_set(xs, 0, 0)) }",
-      b"match i >= 0 && i < bytes_len(b) { true -> bytes_at(b, i), false -> 0 }",
-      b"{ let Some(_) = list_at(xs, i) else { 0 }; len(list_set(xs, i, 0)) }",
+      b"match xs.at(i) { Some(_) -> xs.set(i, 0).len(), None -> 0 }",
+      b"match a.at(i) { Some(_) -> a.get(i), None -> 0 }",
+      b"match xs { [_, _, ..] -> xs.set(1, 0).len(), _ -> 0 }",
+      b"match xs { [] -> 0, _ -> xs.set(0, 0).len() }",
+      b"match i >= 0 && i < b.len() { true -> b.at(i), false -> 0 }",
+      b"{ let Some(_) = xs.at(i) else { 0 }; xs.set(i, 0).len() }",
     ]),
     [true, true, true, true, true, true],
   );
   assert_eq(
     total([
-      b"match list_at(xs, i) { Some(_) -> len(list_set(xs, i + 1, 0)), None -> 0 }",
-      b"match list_at(xs, i) { Some(_) -> 0, None -> len(list_set(xs, i, 0)) }",
-      b"match xs { [_, ..] -> len(list_set(xs, 1, 0)), _ -> 0 }",
-      b"match xs { [_] -> 0, _ -> len(list_set(xs, 0, 0)) }",
-      b"match i >= 0 && i < bytes_len(b) { true -> 0, false -> bytes_at(b, i) }",
-      b"{ let _ = { let Some(_) = list_at(xs, i) else { 0 }; 1 }; len(list_set(xs, i, 0)) }",
+      b"match xs.at(i) { Some(_) -> xs.set(i + 1, 0).len(), None -> 0 }",
+      b"match xs.at(i) { Some(_) -> 0, None -> xs.set(i, 0).len() }",
+      b"match xs { [_, ..] -> xs.set(1, 0).len(), _ -> 0 }",
+      b"match xs { [_] -> 0, _ -> xs.set(0, 0).len() }",
+      b"match i >= 0 && i < b.len() { true -> 0, false -> b.at(i) }",
+      b"{ let _ = { let Some(_) = xs.at(i) else { 0 }; 1 }; xs.set(i, 0).len() }",
     ]),
     [false, false, false, false, false, false],
   )
@@ -18620,11 +18485,11 @@ test "a pattern that matched says what a condition would" {
 test "a range pattern holds an integer between its ends, and alternatives between the least and greatest" {
   assert_eq(
     total([
-      b"match n { 0..=9 -> bytes_len(byte_of_int(n + 48)), _ -> 0 }",
-      b"match n { b'0'..=b'9' -> string_len(string_slice(\"0123456789\", n - 48, n - 47)), _ -> 0 }",
-      b"match n { b'a'..=b'f' | b'A'..=b'F' -> bytes_len(byte_of_int(n)), _ -> 0 }",
+      b"match n { 0..=9 -> byte_of_int(n + 48).len(), _ -> 0 }",
+      b"match n { b'0'..=b'9' -> \"0123456789\".slice(n - 48, n - 47).len(), _ -> 0 }",
+      b"match n { b'a'..=b'f' | b'A'..=b'F' -> byte_of_int(n).len(), _ -> 0 }",
       b"match n { b'-' | b'0'..=b'9' -> 255 / n, _ -> 0 }",
-      b"if i < 0 || i >= bytes_len(b) { 0 } else { match bytes_at(b, i) { b'a'..=b'z' -> bytes_len(byte_of_int(bytes_at(b, i) - 32)), _ -> 0 } }",
+      b"if i < 0 || i >= b.len() { 0 } else { match b.at(i) { b'a'..=b'z' -> byte_of_int(b.at(i) - 32).len(), _ -> 0 } }",
       b"if n < 0 { 0 } else { match n { 0..=9 -> 0, _ -> 100 / (n - 9) } }",
       b"if n > 9 { 0 } else { match n { 0..=9 -> 0, _ -> 100 / n } }",
       b"match n { 0 | 1 -> 0, _ -> 10 / n + 10 / (n - 1) }",
@@ -18633,12 +18498,12 @@ test "a range pattern holds an integer between its ends, and alternatives betwee
   );
   assert_eq(
     total([
-      b"match n { 0..=9 -> bytes_len(byte_of_int(n + 247)), _ -> 0 }",
-      b"match n { b'0'..=b'9' -> 0, _ -> bytes_len(byte_of_int(n)) }",
-      b"match n { b'a'..=b'f' | b'A'..=b'F' -> bytes_len(byte_of_int(n + 154)), _ -> 0 }",
+      b"match n { 0..=9 -> byte_of_int(n + 247).len(), _ -> 0 }",
+      b"match n { b'0'..=b'9' -> 0, _ -> byte_of_int(n).len() }",
+      b"match n { b'a'..=b'f' | b'A'..=b'F' -> byte_of_int(n + 154).len(), _ -> 0 }",
       b"match n { 0..=9 -> 0, _ -> 100 / (n - 9) }",
       b"match n { 0 | 2 -> 0, _ -> 10 / (n - 1) }",
-      b"match i { 0..=9 -> bytes_len(byte_of_int(n)), _ -> 0 }",
+      b"match i { 0..=9 -> byte_of_int(n).len(), _ -> 0 }",
     ]),
     [false, false, false, false, false, false],
   )
@@ -18647,20 +18512,20 @@ test "a range pattern holds an integer between its ends, and alternatives betwee
 test "a name bound again is not the one a condition read" {
   assert_eq(
     total([
-      b"if i >= 0 && i < bytes_len(b) { let i = i + 1; bytes_at(b, i) } else { 0 }",
-      b"if i >= 0 && i < bytes_len(b) { len(map([j], |i: Int| bytes_at(b, i))) } else { 0 }",
-      b"if i >= 0 && i < bytes_len(b) { match j { i -> bytes_at(b, i) } } else { 0 }",
-      b"if i >= 0 && i < bytes_len(b) { let b = b\"\"; bytes_at(b, i) } else { 0 }",
-      b"if i >= 0 && i < bytes_len(b) { handle { 0 } with { return i -> bytes_at(b, i) } } else { 0 }",
-      b"{ let k = i; let i = j; if k >= 0 && k < bytes_len(b) { bytes_at(b, i) } else { 0 } }",
+      b"if i >= 0 && i < b.len() { let i = i + 1; b.at(i) } else { 0 }",
+      b"if i >= 0 && i < b.len() { [j].map(|i: Int| b.at(i)).len() } else { 0 }",
+      b"if i >= 0 && i < b.len() { match j { i -> b.at(i) } } else { 0 }",
+      b"if i >= 0 && i < b.len() { let b = b\"\"; b.at(i) } else { 0 }",
+      b"if i >= 0 && i < b.len() { handle { 0 } with { return i -> b.at(i) } } else { 0 }",
+      b"{ let k = i; let i = j; if k >= 0 && k < b.len() { b.at(i) } else { 0 } }",
     ]),
     [false, false, false, false, false, false],
   );
   assert_eq(
     total([
-      b"{ let k = i; if k >= 0 && k < bytes_len(b) { bytes_at(b, i) } else { 0 } }",
-      b"{ let c = b; if i >= 0 && i < bytes_len(c) { bytes_at(b, i) } else { 0 } }",
-      b"if i >= 0 && i < bytes_len(b) { let i = i; bytes_at(b, i) } else { 0 }",
+      b"{ let k = i; if k >= 0 && k < b.len() { b.at(i) } else { 0 } }",
+      b"{ let c = b; if i >= 0 && i < c.len() { b.at(i) } else { 0 } }",
+      b"if i >= 0 && i < b.len() { let i = i; b.at(i) } else { 0 }",
     ]),
     [true, true, true],
   )
@@ -18673,18 +18538,9 @@ test "a field read through records is one value wherever it is read" {
         body,
       ),
     );
-  assert_eq(
-    over(b"if c.at >= 0 && c.at < bytes_len(c.src) { bytes_at(c.src, c.at) } else { 0 }"),
-    [],
-  );
-  assert_eq(
-    over(b"if c.at >= 0 && c.at < bytes_len(c.src) { bytes_at(d.src, c.at) } else { 0 }"),
-    [b"E0302"],
-  );
-  assert_eq(
-    over(b"if c.at >= 0 && c.at < bytes_len(c.src) { bytes_at(c.src, d.at) } else { 0 }"),
-    [b"E0302"],
-  )
+  assert_eq(over(b"if c.at >= 0 && c.at < c.src.len() { c.src.at(c.at) } else { 0 }"), []);
+  assert_eq(over(b"if c.at >= 0 && c.at < c.src.len() { d.src.at(c.at) } else { 0 }"), [b"E0302"]);
+  assert_eq(over(b"if c.at >= 0 && c.at < c.src.len() { c.src.at(d.at) } else { 0 }"), [b"E0302"])
 }
 
 test "what a call that can raise ensures of its answer holds only past the call" {
@@ -18699,28 +18555,28 @@ test "what a call that can raise ensures of its answer holds only past the call"
   // A scan that answered started inside the bytes, which says nothing where it never ran.
   assert_eq(
     unshown(
-      b"if n > 0 { let stop = bytes_scan(b, i, b\" \", 0); stop } else if i >= 0 { bytes_len(bytes_slice(b, i, bytes_len(b))) } else { 0 }",
+      b"if n > 0 { let stop = b.scan(i, b\" \", 0); stop } else if i >= 0 { b.slice(i, b.len()).len() } else { 0 }",
     ),
     [
-      Unshown({ callee: b"bytes_scan", needs: b"0 <= from" }),
-      Unshown({ callee: b"bytes_slice", needs: b"start <= end" }),
+      Unshown({ callee: b"Bytes::scan", needs: b"0 <= from" }),
+      Unshown({ callee: b"Bytes::slice", needs: b"start <= end" }),
     ],
   );
   assert_eq(
     unshown(
-      b"if i < 0 { 0 } else { let stop = bytes_scan(b, i, b\" \", 0); bytes_len(bytes_slice(b, i, stop)) + bytes_len(bytes_slice(b, i, bytes_len(b))) }",
+      b"if i < 0 { 0 } else { let stop = b.scan(i, b\" \", 0); b.slice(i, stop).len() + b.slice(i, b.len()).len() }",
     ),
-    [Unshown({ callee: b"bytes_scan", needs: b"from <= bytes_len(hay)" })],
+    [Unshown({ callee: b"Bytes::scan", needs: b"from <= Bytes::len(hay)" })],
   )
 }
 
 test "a body's raises are filed with why each was kept, and a group that raises only by recursing has none" {
   let out = checked_cx(
-    b"fn at(b: Bytes, i: Int) -> Int / {abort.raise} = if i < bytes_len(b) { bytes_at(b, i) } else { 0 }\nfn both(b: Bytes, n: Int) -> Int / {abort.raise} = at(b, n) + at(b, 0) + 7 / n + panic(\"no\")\nfn walk(b: Bytes, i: Int) -> Int / {abort.raise} = if i < 0 || i >= bytes_len(b) { 0 } else { bytes_at(b, i) + walk(b, i + 1) }\nfn each(b: Bytes, f: (Int) -> Int / {abort.raise}) -> Int / {abort.raise} = fold(range(0, bytes_len(b)), 0, |acc: Int, k: Int| acc + f(bytes_at(b, k)))\n",
+    b"fn at(b: Bytes, i: Int) -> Int / {abort.raise} = if i < b.len() { b.at(i) } else { 0 }\nfn both(b: Bytes, n: Int) -> Int / {abort.raise} = at(b, n) + at(b, 0) + 7 / n + panic(\"no\")\nfn walk(b: Bytes, i: Int) -> Int / {abort.raise} = if i < 0 || i >= b.len() { 0 } else { b.at(i) + walk(b, i + 1) }\nfn each(b: Bytes, f: (Int) -> Int / {abort.raise}) -> Int / {abort.raise} = range(0, b.len()).fold(0, |acc: Int, k: Int| acc + f(b.at(k)))\n",
   );
   let raises = |name: Bytes|
     match def_of(out, name) { Some(d) -> d.raises.map(|r: Raise| r.why), None -> [] };
-  assert_eq(raises(b"m.at"), [Unshown({ callee: b"bytes_at", needs: b"0 <= i" })]);
+  assert_eq(raises(b"m.at"), [Unshown({ callee: b"Bytes::at", needs: b"0 <= i" })]);
   assert_eq(raises(b"m.both"), [Calls(b"m.at"), ZeroDivisor, Unguarded(b"panic")]);
   assert_eq(raises(b"m.walk"), []);
   assert_eq(raises(b"m.each"), [Handed]);
@@ -18729,7 +18585,7 @@ test "a body's raises are filed with why each was kept, and a group that raises 
   assert_eq(performed(b"m.walk"), 0);
   assert_eq(performed(b"m.at"), 1);
   match def_of(out, b"m.at") {
-    Some(d) -> assert_eq(d.raises.map(|r: Raise| r.span), [span_between(71, 85)]),
+    Some(d) -> assert_eq(d.raises.map(|r: Raise| r.span), [span_between(66, 73)]),
     None -> panic("`at` is defined"),
   }
 }
@@ -18764,37 +18620,37 @@ test "a channel's capacity and a draw's bound raise, unless a literal or a condi
 
 test "what cannot fail does not raise, and overflow is the machine's limit" {
   assert_eq(
-    check_codes(b"fn f(a: Int, b: U8) -> Int / {} = a / 2 + a % -3 + int_of_u8(b % 7u8)"),
+    check_codes(b"fn f(a: Int, b: U8) -> Int / {} = a / 2 + a % -3 + Int::of_u8(b % 7u8)"),
     [],
   );
   assert_eq(check_codes(b"fn f(a: Float, b: Float) -> Float / {} = a / b"), []);
   assert_eq(check_codes(b"fn f(a: Int, b: Int) -> Int / {} = a * b + a - b"), []);
   assert_eq(check_codes(b"fn f(a: Int, n: Int) -> Int / {} = a << n"), []);
   assert_eq(check_codes(b"fn f(p: { a: Int }) -> Int / {} = { let { a } = p; a }"), []);
-  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Option<Int> / {} = list_at(xs, 0)"), [])
+  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Option<Int> / {} = xs.at(0)"), [])
 }
 
 test "a raise the row admits, or a clause answers, is no refusal" {
-  assert_eq(check_codes(b"fn f(b: Bytes) -> Int / {abort.raise} = bytes_at(b, 0)"), []);
+  assert_eq(check_codes(b"fn f(b: Bytes) -> Int / {abort.raise} = b.at(0)"), []);
   assert_eq(
     check_codes(
-      b"fn f(b: Bytes) -> Int / {} = handle { bytes_at(b, 0) } with { abort.raise(m) -> 0 - 1 }",
+      b"fn f(b: Bytes) -> Int / {} = handle { b.at(0) } with { abort.raise(m) -> 0 - 1 }",
     ),
     [],
   )
 }
 
 test "a raise through a builtin is reported at the call, naming the builtin" {
-  let diags = check_diags(b"fn f(b: Bytes) -> Int / {} = bytes_at(b, 0)");
+  let diags = check_diags(b"fn f(b: Bytes) -> Int / {} = b.at(0)");
   assert_eq(diags.map(|dg: Diag| dg.code), [b"E0302"]);
   assert(
     diags.get(0).labels.fold(false, |found: Bool, l: Label|
-      found || l.text == b"reaches `abort.raise` through `bytes_at`"),
+      found || l.text == b"reaches `abort.raise` through `Bytes::at`"),
   )
 }
 
 test "a callback that raises meets a parameter only where the parameter's row admits it" {
-  let caller = b"\nfn g(b: Bytes) -> Int / {abort.raise} = run(|| bytes_at(b, 0))";
+  let caller = b"\nfn g(b: Bytes) -> Int / {abort.raise} = run(|| b.at(0))";
   assert_eq(check_codes(b"fn run(f: () -> Int) -> Int = f()".concat(caller)), [b"E0302"]);
   assert_eq(check_codes(b"fn run<| e>(f: () -> Int / e) -> Int / e = f()".concat(caller)), [])
 }
@@ -18802,7 +18658,7 @@ test "a callback that raises meets a parameter only where the parameter's row ad
 test "a binder named like a definition reads the binder, so it ties no definitions into a group" {
   assert_eq(
     check_codes(
-      b"fn words(xs: List<String>) -> Int / {abort.raise} = match xs { [] -> 0, [w, ..rest] -> string_len(joined([string_slice(w, 0, 1)])) + words(rest) }\nfn joined(words: List<String>) -> String = fold(words, \"\", |acc: String, w: String| acc ++ w)",
+      b"fn words(xs: List<String>) -> Int / {abort.raise} = match xs { [] -> 0, [w, ..rest] -> joined([w.slice(0, 1)]).len() + words(rest) }\nfn joined(words: List<String>) -> String = List::fold(words, \"\", |acc: String, w: String| acc ++ w)",
     ),
     [],
   )
@@ -18864,7 +18720,7 @@ test "a `const fn` answers a value a build can keep" {
   assert_eq(check_codes(b"const fn f() -> Option<Secret<String>> = None"), [b"E0156"]);
   assert_eq(
     check_codes(
-      b"type Row = { name: String, at: Int }\nconst fn rows() -> Array<Row> = array_of_list([{ name: \"a\", at: 1 }])",
+      b"type Row = { name: String, at: Int }\nconst fn rows() -> Array<Row> = Array::of_list([{ name: \"a\", at: 1 }])",
     ),
     [],
   )
@@ -18914,7 +18770,7 @@ test "a function parameter's types and row generalize" {
   let dump = check_dump([
     {
       name: b"m",
-      src: b"pub fn twice<a, b>(f: (a) -> b, x: a) -> b = f(x)\npub fn each<a | e>(f: (a) -> Unit / e, xs: List<a>) -> Unit / e = fold(xs, (), |acc: Unit, x: a| f(x))",
+      src: b"pub fn twice<a, b>(f: (a) -> b, x: a) -> b = f(x)\npub fn each<a | e>(f: (a) -> Unit / e, xs: List<a>) -> Unit / e = xs.fold((), |acc: Unit, x: a| f(x))",
     },
   ]);
   assert_eq(
@@ -18927,7 +18783,7 @@ test "a derivable constraint is published on the type parameter it names" {
   let dump = check_dump([
     {
       name: b"m",
-      src: b"pub fn show<a>(x: a) -> Int where derivable(eq, a) = 1\npub fn keyed<k, v>(m: Map<k, v>) -> Int where derivable(ord, k) = map_len(m)\nfn used() -> Int = show(2) + keyed(map_new())",
+      src: b"pub fn show<a>(x: a) -> Int where derivable(eq, a) = 1\npub fn keyed<k, v>(m: Map<k, v>) -> Int where derivable(ord, k) = m.len()\nfn used() -> Int = show(2) + keyed(Map::new())",
     },
   ]);
   assert_eq(
@@ -18977,10 +18833,10 @@ test "functions cannot be compared and a Float cannot key a Map, judged once the
   let dump = check_dump([
     {
       name: b"m",
-      src: b"fn keyed() -> Map<Float, Int> = map_new()\nfn same(f: (Int) -> Int, g: (Int) -> Int) -> Bool = f == g",
+      src: b"fn keyed() -> Map<Float, Int> = Map::new()\nfn same(f: (Int) -> Int, g: (Int) -> Int) -> Bool = f == g",
     },
   ]);
-  assert_eq(dump, "K;1;X;D;2;!E0201:0:94:100:1:1;=0:94:100:1;!E0206:0:14:29:1:2;=0:14:29:1;")
+  assert_eq(dump, "K;1;X;D;2;!E0201:0:95:101:1:1;=0:95:101:1;!E0206:0:14:29:1:2;=0:14:29:1;")
 }
 
 test "a cell leaving its region is reported at the exit, under the code its form has always used" {
@@ -19083,7 +18939,7 @@ test "a declaration that mentions a `Cell` or a `Task` is refused at the type th
 }
 
 test "a `Task` in a parameter or a type argument is left to the escape check" {
-  assert_eq(check_codes(b"fn serve(running: List<Task<Unit>>) -> Int = len(running)"), []);
+  assert_eq(check_codes(b"fn serve(running: List<Task<Unit>>) -> Int = running.len()"), []);
   assert_eq(
     check_codes(b"type Box<a> = Box(a)\nfn boxed(t: Task<Int>) -> Box<Task<Int>> = Box(t)"),
     [],
@@ -19152,7 +19008,7 @@ test "a task stored in a cell older than its `simulate` region is refused, and i
   );
   assert_eq(
     check_codes(
-      b"fn listed() -> Int / {sim.read, abort.raise} = { let none = []; let wait = |t| task.join(t); simulate { fold(push(none, task.spawn(|| 1)), 0, |n: Int, t: Task<Int>| n + wait(t)) } }",
+      b"fn listed() -> Int / {sim.read, abort.raise} = { let none = []; let wait = |t| task.join(t); simulate { none.push(task.spawn(|| 1)).fold(0, |n: Int, t: Task<Int>| n + wait(t)) } }",
     ),
     [],
   )
@@ -19199,7 +19055,7 @@ test "a channel keeps to its `simulate` region as a task does" {
     ),
     [],
   );
-  assert_eq(check_codes(b"fn keyed(m: Map<Chan<Int>, Int>) -> Int = map_len(m)"), [b"E0206"])
+  assert_eq(check_codes(b"fn keyed(m: Map<Chan<Int>, Int>) -> Int = m.len()"), [b"E0206"])
 }
 
 test "a task from outside a `simulate` region is refused where the region names it or reads it" {
@@ -19217,7 +19073,7 @@ test "a task from outside a `simulate` region is refused where the region names 
   );
   assert_eq(
     check_codes(
-      b"fn listed(ts: List<Task<Int>>) -> Int / {sim.read, abort.raise} = simulate { fold(ts, 0, |n: Int, t: Task<Int>| n + task.join(t)) }",
+      b"fn listed(ts: List<Task<Int>>) -> Int / {sim.read, abort.raise} = simulate { ts.fold(0, |n: Int, t: Task<Int>| n + task.join(t)) }",
     ),
     [b"E0413"],
   );
@@ -19303,7 +19159,7 @@ test "a handler around a spawn may answer from a cell the task cannot outlive, o
   assert_eq(
     check_codes(
       noted(
-        b"fn spawned(n: Int, running: List<Task<Int>>) -> List<Task<Int>> / {task.write, note.read} = if n <= 0 { running } else { spawned(n - 1, push(running, task.spawn(|| work()))) }\nfn joined(ts: List<Task<Int>>) -> Int / {task.write, abort.raise} = fold(ts, 0, |n: Int, t: Task<Int>| n + task.join(t))\nfn serve() -> Int / {task.write, abort.raise} = with_cell[store](1) { c -> handle { joined(spawned(2, [])) } with { note.say() -> cell_get(c) } }",
+        b"fn spawned(n: Int, running: List<Task<Int>>) -> List<Task<Int>> / {task.write, note.read} = if n <= 0 { running } else { spawned(n - 1, running.push(task.spawn(|| work()))) }\nfn joined(ts: List<Task<Int>>) -> Int / {task.write, abort.raise} = ts.fold(0, |n: Int, t: Task<Int>| n + task.join(t))\nfn serve() -> Int / {task.write, abort.raise} = with_cell[store](1) { c -> handle { joined(spawned(2, [])) } with { note.say() -> cell_get(c) } }",
       ),
     ),
     [],
@@ -19391,7 +19247,7 @@ test "a record update takes its shape from the base's inferred type, not from wh
       {
         name: b"m",
         src: p.concat(
-          b"fn g(ps: List<P>) -> P = match list_at(ps, 0) { Some(q) -> {..q, b: 3}, None -> mk() }",
+          b"fn g(ps: List<P>) -> P = match ps.at(0) { Some(q) -> {..q, b: 3}, None -> mk() }",
         ),
       },
     ]),
@@ -19401,7 +19257,7 @@ test "a record update takes its shape from the base's inferred type, not from wh
     codes_across([
       {
         name: b"m",
-        src: p.concat(b"fn h(xs: List<Int>) -> P = fold(xs, mk(), |acc, x| {..acc, a: x})"),
+        src: p.concat(b"fn h(xs: List<Int>) -> P = xs.fold(mk(), |acc, x| {..acc, a: x})"),
       },
     ]),
     [],
@@ -19453,7 +19309,7 @@ test "`++` joins two Strings or two Bytes, and refuses one of each" {
     codes_across([
       {
         name: b"m",
-        src: b"fn f(xs: List<Bytes>) -> Bytes = fold(xs, b\"\", |acc: Bytes, x: Bytes| acc ++ x)",
+        src: b"fn f(xs: List<Bytes>) -> Bytes = xs.fold(b\"\", |acc: Bytes, x: Bytes| acc ++ x)",
       },
     ]),
     [],
@@ -19824,21 +19680,21 @@ fn counted(src: Bytes, name: Bytes) -> { scaling: Bool, repeats: List<Int> } / {
 test "a lookup performs its query a bounded number of times, and the same lookup mapped over its input scales" {
   assert_eq(counted(db_source(b""), b"lookup"), { scaling: false, repeats: [] });
   let mapped = db_source(
-    b"fn all(ids: List<Int>) -> List<Int> / {db.query[conn]} = map(ids, lookup)\n",
+    b"fn all(ids: List<Int>) -> List<Int> / {db.query[conn]} = ids.map(lookup)\n",
   );
   assert_eq(counted(mapped, b"all"), { scaling: true, repeats: [] });
   let lambda = db_source(
-    b"fn all(ids: List<Int>) -> List<Int> / {db.query[conn]} = map(ids, |id: Int| lookup(id))\n",
+    b"fn all(ids: List<Int>) -> List<Int> / {db.query[conn]} = ids.map(|id: Int| lookup(id))\n",
   );
   assert_eq(counted(lambda, b"all"), { scaling: true, repeats: [] });
   // A list the text writes out is a size no input decides.
   let three = db_source(
-    b"fn three() -> List<Int> / {db.query[conn]} = map([1, 2, 3], |id: Int| lookup(id))\n",
+    b"fn three() -> List<Int> / {db.query[conn]} = [1, 2, 3].map(|id: Int| lookup(id))\n",
   );
   assert_eq(counted(three, b"three"), { scaling: false, repeats: [] });
   // What a mapped callback evaluates once, before the iteration, does not scale with it.
   let once = db_source(
-    b"fn first(ids: List<Int>) -> List<Int> / {db.query[conn]} = { let n = lookup(0); map(ids, |id: Int| id + n) }\n",
+    b"fn first(ids: List<Int>) -> List<Int> / {db.query[conn]} = { let n = lookup(0); ids.map(|id: Int| id + n) }\n",
   );
   assert_eq(counted(once, b"first"), { scaling: false, repeats: [] })
 }
@@ -19849,7 +19705,7 @@ test "recursion repeats everything its body performs, and a callback's count com
   );
   assert_eq(counted(walked, b"walk"), { scaling: true, repeats: [] });
   let each = db_source(
-    b"fn each<a | e>(xs: List<a>, f: (a) -> Unit / e) -> Unit / e = fold(xs, (), |u: Unit, x: a| f(x))\nfn once<a | e>(f: () -> a / e) -> a / e = f()\nfn looked(ids: List<Int>) -> Unit / {db.query[conn]} = each(ids, |id: Int| { lookup(id); () })\nfn one() -> Int / {db.query[conn]} = once(|| lookup(1))\n",
+    b"fn each<a | e>(xs: List<a>, f: (a) -> Unit / e) -> Unit / e = xs.fold((), |u: Unit, x: a| f(x))\nfn once<a | e>(f: () -> a / e) -> a / e = f()\nfn looked(ids: List<Int>) -> Unit / {db.query[conn]} = each(ids, |id: Int| { lookup(id); () })\nfn one() -> Int / {db.query[conn]} = once(|| lookup(1))\n",
   );
   assert_eq(counted(each, b"each"), { scaling: false, repeats: [1] });
   assert_eq(counted(each, b"once"), { scaling: false, repeats: [] });
@@ -19869,14 +19725,14 @@ test "a row's `bounded` promise is held to the body, and only a definition's own
   assert_eq(
     check_codes(
       db_source(
-        b"fn per_item(ids: List<Int>) -> Int / {db.query[conn] bounded} = fold(ids, 0, |n: Int, id: Int| n + lookup(id))\n",
+        b"fn per_item(ids: List<Int>) -> Int / {db.query[conn] bounded} = ids.fold(0, |n: Int, id: Int| n + lookup(id))\n",
       ),
     ),
     [b"E0465"],
   );
   assert_eq(
     check_codes(
-      b"fn each<a | e>(xs: List<a>, f: (a) -> Unit / e) -> Unit / e bounded = fold(xs, (), |u: Unit, x: a| f(x))\n",
+      b"fn each<a | e>(xs: List<a>, f: (a) -> Unit / e) -> Unit / e bounded = xs.fold((), |u: Unit, x: a| f(x))\n",
     ),
     [b"E0465"],
   );
@@ -19970,7 +19826,7 @@ test "recursion on a part of an argument terminates, and recursion on the argume
   // A field of a record the call rebuilds is a measure of its own.
   assert(
     !diverges(
-      b"fn drain(s: { todo: List<Int>, done: List<Int> }) -> List<Int> = match s.todo { [] -> s.done, [x, ..rest] -> drain({ todo: rest, done: push(s.done, x) }) }\n",
+      b"fn drain(s: { todo: List<Int>, done: List<Int> }) -> List<Int> = match s.todo { [] -> s.done, [x, ..rest] -> drain({ todo: rest, done: s.done.push(x) }) }\n",
       b"drain",
     ),
   )
@@ -19982,13 +19838,13 @@ test "an integer terminates descending toward a bound a guard holds it above" {
   assert(diverges(b"fn down(n: Int) -> Int = if n == 0 { 0 } else { down(n - 1) }\n", b"down"));
   assert(
     !diverges(
-      b"fn walk(xs: List<Int>, i: Int) -> Int = if i >= len(xs) { 0 } else { walk(xs, i + 1) }\n",
+      b"fn walk(xs: List<Int>, i: Int) -> Int = if i >= xs.len() { 0 } else { walk(xs, i + 1) }\n",
       b"walk",
     ),
   );
   assert(
     diverges(
-      b"fn climb(xs: List<Int>, i: Int) -> Int = if i >= len(xs) { 0 } else { climb(push(xs, i), i + 1) }\n",
+      b"fn climb(xs: List<Int>, i: Int) -> Int = if i >= xs.len() { 0 } else { climb(xs.push(i), i + 1) }\n",
       b"climb",
     ),
   );
@@ -20001,12 +19857,12 @@ test "an integer terminates descending toward a bound a guard holds it above" {
 }
 
 test "a group terminates when every loop through it descends, through a builtin's callback too" {
-  let src = b"type T = | Node(Int, List<T>)\nfn size(t: T) -> Int = match t { Node(v, kids) -> v + total(sizes(kids)) }\nfn sizes(ts: List<T>) -> List<Int> = map(ts, size)\nfn total(xs: List<Int>) -> Int = fold(xs, 0, |a: Int, x: Int| a + x)\nfn deep(t: T) -> Int = match t { Node(v, kids) -> fold(kids, v, |a: Int, k: T| a + deep(k)) }\n";
+  let src = b"type T = | Node(Int, List<T>)\nfn size(t: T) -> Int = match t { Node(v, kids) -> v + total(sizes(kids)) }\nfn sizes(ts: List<T>) -> List<Int> = ts.map(size)\nfn total(xs: List<Int>) -> Int = xs.fold(0, |a: Int, x: Int| a + x)\nfn deep(t: T) -> Int = match t { Node(v, kids) -> kids.fold(v, |a: Int, k: T| a + deep(k)) }\n";
   assert(!diverges(src, b"size"));
   assert(!diverges(src, b"sizes"));
   assert(!diverges(src, b"deep"));
   // A map's entries are made of its parts.
-  let doc = b"type J = | Leaf | Obj(Map<String, J>)\nfn count(j: J) -> Int = match j { Leaf -> 1, Obj(m) -> fold(map_entries(m), 0, |n: Int, e: { key: String, value: J }| n + count(e.value)) }\n";
+  let doc = b"type J = | Leaf | Obj(Map<String, J>)\nfn count(j: J) -> Int = match j { Leaf -> 1, Obj(m) -> m.entries().fold(0, |n: Int, e: { key: String, value: J }| n + count(e.value)) }\n";
   assert(!diverges(doc, b"count"));
   // Handed to a function the check does not read, a member is called with nothing known.
   assert(
@@ -20025,13 +19881,13 @@ test "a group terminates when every loop through it descends, through a builtin'
 
 test "a callback a recursion hands on in its own place is called as that recursion calls it" {
   let tree = b"type T = | Node(Int, List<T>)\n";
-  let trav = b"fn trav(xs: List<T>, f: (T) -> Option<Int>, done: List<Int>) -> Option<List<Int>> = match xs { [] -> Some(done), [x, ..rest] -> match f(x) { None -> None, Some(y) -> trav(rest, f, push(done, y)) } }\n";
-  let total = b"fn total(t: T) -> Option<Int> = match t { Node(v, kids) -> match trav(kids, |k: T| total(k), []) { None -> None, Some(ys) -> Some(fold(ys, v, |a: Int, y: Int| a + y)) } }\n";
+  let trav = b"fn trav(xs: List<T>, f: (T) -> Option<Int>, done: List<Int>) -> Option<List<Int>> = match xs { [] -> Some(done), [x, ..rest] -> match f(x) { None -> None, Some(y) -> trav(rest, f, done.push(y)) } }\n";
+  let total = b"fn total(t: T) -> Option<Int> = match t { Node(v, kids) -> match trav(kids, |k: T| total(k), []) { None -> None, Some(ys) -> Some(ys.fold(v, |a: Int, y: Int| a + y)) } }\n";
   let src = Bytes::concat_all([tree, trav, total]);
   assert(!diverges(src, b"trav"));
   assert(!diverges(src, b"total"));
   // Handed on beside what is not a part of what this call was handed, it is called with that.
-  let grown = b"fn grown(xs: List<T>, ys: List<T>, f: (T) -> Int, n: Int) -> Int = if n <= 0 { 0 } else { match ys { [] -> 0, [y, ..] -> f(y) + grown(xs, fold(xs, ys, |acc: List<T>, x: T| push(acc, x)), f, n - 1) } }\nfn through(t: T) -> Int = match t { Node(v, kids) -> v + grown(kids, kids, |k: T| through(k), 2) }\n";
+  let grown = b"fn grown(xs: List<T>, ys: List<T>, f: (T) -> Int, n: Int) -> Int = if n <= 0 { 0 } else { match ys { [] -> 0, [y, ..] -> f(y) + grown(xs, xs.fold(ys, |acc: List<T>, x: T| acc.push(x)), f, n - 1) } }\nfn through(t: T) -> Int = match t { Node(v, kids) -> v + grown(kids, kids, |k: T| through(k), 2) }\n";
   assert(diverges(tree.concat(grown), b"through"));
   // Handed on in another callback's place, it goes where the check does not follow.
   let swapped = b"fn swapped(xs: List<T>, f: (T) -> Int, g: (T) -> Int) -> Int = match xs { [] -> 0, [x, ..rest] -> f(x) + swapped(rest, g, f) }\nfn through(t: T) -> Int = match t { Node(v, kids) -> v + swapped(kids, |k: T| through(k), |k: T| 0) }\n";
@@ -20060,19 +19916,19 @@ test "a guard an earlier arm failed, an index found, and a write that keeps the 
   );
   assert(
     !diverges(
-      b"fn last(xs: List<Int>, i: Int, seen: Option<Int>) -> Option<Int> = match list_at(xs, i) { None -> seen, Some(x) -> last(xs, i + 1, Some(x)) }\n",
+      b"fn last(xs: List<Int>, i: Int, seen: Option<Int>) -> Option<Int> = match xs.at(i) { None -> seen, Some(x) -> last(xs, i + 1, Some(x)) }\n",
       b"last",
     ),
   );
   assert(
     !diverges(
-      b"fn fill(a: Array<Int>, i: Int) -> Array<Int> = if i >= array_len(a) { a } else { fill(array_set(a, i, i * 2), i + 1) }\n",
+      b"fn fill(a: Array<Int>, i: Int) -> Array<Int> = if i >= a.len() { a } else { fill(a.set(i, i * 2), i + 1) }\n",
       b"fill",
     ),
   );
   assert(
     !diverges(
-      b"fn zero(xs: List<Int>, i: Int) -> List<Int> = if i >= len(xs) { xs } else { zero(list_set(xs, i, 0), i + 1) }\n",
+      b"fn zero(xs: List<Int>, i: Int) -> List<Int> = if i >= xs.len() { xs } else { zero(xs.set(i, 0), i + 1) }\n",
       b"zero",
     ),
   )
@@ -20085,7 +19941,7 @@ fn declared_as(name: Bytes) -> Builtin / {abort.raise} =
   }
 
 test "a builtin is what the prelude declares: its scheme, its parameters' names and its doc" {
-  let slice = declared_as(b"bytes_slice");
+  let slice = declared_as(b"Bytes::slice");
   assert_eq(slice.params, [b"b", b"start", b"end"]);
   assert_eq(slice.doc, [b"Raises out of range."]);
   assert_eq(slice.scheme, {
@@ -20094,7 +19950,7 @@ test "a builtin is what the prelude declares: its scheme, its parameters' names 
     label_vars: [],
     ty: fn_type([bytes_type(), int_type(), int_type()], bytes_type(), row_singleton(abort_atom())),
   });
-  assert_eq(declared_as(b"len").doc, [b"How many items the list holds."]);
+  assert_eq(declared_as(b"List::len").doc, [b"How many items the list holds."]);
   assert_eq(declared_as(b"reflect").doc, [
     b"The value as a `std.value.Value`; a width below 64 bits the program does not fix reads as its",
     b"`Int`.",
@@ -20106,7 +19962,7 @@ test "every function the prelude declares has a doc" {
 }
 
 test "a declaration's generic list is its scheme's variables, numbered from zero" {
-  assert_eq(declared_as(b"map").scheme, {
+  assert_eq(declared_as(b"List::map").scheme, {
     ty_vars: [0, 1],
     row_vars: [0],
     label_vars: [],
@@ -20129,7 +19985,7 @@ test "a declaration's generic list is its scheme's variables, numbered from zero
 test "a declaration's `where` is what a call must show, by the parameter's place" {
   assert_eq(declared_as(b"compare").constraints, [{ deriver: DOrd, param: 0 }]);
   assert_eq(declared_as(b"numeric_of_int").constraints, [{ deriver: DNumeric, param: 0 }]);
-  assert_eq(declared_as(b"push").constraints, [])
+  assert_eq(declared_as(b"List::push").constraints, [])
 }
 
 test "a cell's region is a variable of the declaration's own, after the ones it writes" {
@@ -20149,7 +20005,7 @@ test "a type the prelude imports is the one its module declares" {
 }
 
 test "every builtin is in reach of a module that imports nothing" {
-  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int = len(push(xs, 1))\n"), [])
+  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int = xs.push(1).len()\n"), [])
 }
 
 test "an `extern fn` outside the prelude is refused" {
@@ -20187,7 +20043,7 @@ test "a lookup folded to the part it finds answers a part, however the start hol
   let src = |found: Bytes|
     Bytes::concat_all([
       b"type T = | Leaf | Node(List<{ key: Int, kid: T }>)\n",
-      b"fn find(fs: List<{ key: Int, kid: T }>, k: Int) -> Option<T> =\n  fold(fs, None, |acc: Option<T>, f: { key: Int, kid: T }| if f.key == k { Some(",
+      b"fn find(fs: List<{ key: Int, kid: T }>, k: Int) -> Option<T> =\n  fs.fold(None, |acc: Option<T>, f: { key: Int, kid: T }| if f.key == k { Some(",
       found,
       b") } else { acc })\n",
       b"fn depth(t: T) -> Int = match t { Leaf -> 0, Node(fs) -> match find(fs, 0) { Some(kid) -> 1 + depth(kid), None -> 0 } }\n",
@@ -20203,28 +20059,28 @@ test "a list written of parts, pushed or filtered or mapped to parts, is made of
       tree,
       b"fn ",
       name,
-      b"(t: T) -> Bool = {\n  let any = |xs: List<T>| fold(xs, false, |acc: Bool, x: T| acc || ",
+      b"(t: T) -> Bool = {\n  let any = |xs: List<T>| xs.fold(false, |acc: Bool, x: T| acc || ",
       name,
       b"(x));\n  match t { Leaf -> true, ",
       arms,
       b" }\n}\n",
     ]);
   assert(!diverges(walked(b"listed", b"Node(l, r) -> any([l, r]), _ -> false"), b"listed"));
-  assert(!diverges(walked(b"pushed", b"Node(l, r) -> any(push([l], r)), _ -> false"), b"pushed"));
+  assert(!diverges(walked(b"pushed", b"Node(l, r) -> any([l].push(r)), _ -> false"), b"pushed"));
   assert(
-    !diverges(walked(b"kept", b"Many(xs) -> any(filter(xs, |x: T| true)), _ -> false"), b"kept"),
+    !diverges(walked(b"kept", b"Many(xs) -> any(xs.filter(|x: T| true)), _ -> false"), b"kept"),
   );
   assert(
     !diverges(
       walked(
         b"projected",
-        b"Named(fs) -> any(map(fs, |f: { name: String, value: T }| f.value)), _ -> false",
+        b"Named(fs) -> any(fs.map(|f: { name: String, value: T }| f.value)), _ -> false",
       ),
       b"projected",
     ),
   );
   // Pushing the value itself makes a list one of whose elements is not smaller.
-  assert(diverges(walked(b"again", b"Many(xs) -> any(push(xs, t)), _ -> false"), b"again"))
+  assert(diverges(walked(b"again", b"Many(xs) -> any(xs.push(t)), _ -> false"), b"again"))
 }
 
 /// Where a site's call is in the source the checker read, as an offset.
@@ -20252,10 +20108,10 @@ test "a member of a group that may not return is told first by its own call out"
 }
 
 test "a list rebuilt of parts, a fallback a block takes, and a failure `?` passes on are no smaller" {
-  // `map` rebuilds a list of one part a hundred times, and a tail of it is no part of `xs`.
+  // `List::map` rebuilds a list of one part a hundred times, and a tail of it is no part of `xs`.
   assert(
     diverges(
-      b"fn copies(xs: List<List<Int>>) -> Int = match xs { [h, ..] -> match map(range(0, 100), |i: Int| h) { [_, ..rest] -> copies(rest), [] -> 0 }, [] -> 0 }\n",
+      b"fn copies(xs: List<List<Int>>) -> Int = match xs { [h, ..] -> match range(0, 100).map(|i: Int| h) { [_, ..rest] -> copies(rest), [] -> 0 }, [] -> 0 }\n",
       b"copies",
     ),
   );
@@ -20263,7 +20119,7 @@ test "a list rebuilt of parts, a fallback a block takes, and a failure `?` passe
   assert(
     diverges(
       second.concat(
-        b"fn copies(xs: List<List<Int>>) -> Int / {abort.raise} = match xs { [h, ..] -> copies(second(map(range(0, 100), |i: Int| h))), [] -> 0 }\n",
+        b"fn copies(xs: List<List<Int>>) -> Int / {abort.raise} = match xs { [h, ..] -> copies(second(range(0, 100).map(|i: Int| h))), [] -> 0 }\n",
       ),
       b"copies",
     ),
@@ -20279,19 +20135,19 @@ test "a list rebuilt of parts, a fallback a block takes, and a failure `?` passe
   // Where the pattern fails the block answers `xs` itself.
   assert(
     diverges(
-      b"fn skip(xs: List<Int>) -> Int = if len(xs) == 0 { 0 } else { skip({ let [_, _, ..rest] = xs else { xs }; rest }) }\n",
+      b"fn skip(xs: List<Int>) -> Int = if xs.len() == 0 { 0 } else { skip({ let [_, _, ..rest] = xs else { xs }; rest }) }\n",
       b"skip",
     ),
   );
   assert(
     diverges(
-      b"fn drop2(xs: List<Int>) -> List<Int> = { let [_, _, ..rest] = xs else { xs }; rest }\nfn skip(xs: List<Int>) -> Int = if len(xs) == 0 { 0 } else { skip(drop2(xs)) }\n",
+      b"fn drop2(xs: List<Int>) -> List<Int> = { let [_, _, ..rest] = xs else { xs }; rest }\nfn skip(xs: List<Int>) -> Int = if xs.len() == 0 { 0 } else { skip(drop2(xs)) }\n",
       b"skip",
     ),
   );
   assert(
     !diverges(
-      b"fn drop2(xs: List<Int>) -> List<Int> / {abort.raise} = { let [_, _, ..rest] = xs else { panic(\"short\") }; rest }\nfn skip(xs: List<Int>) -> Int / {abort.raise} = if len(xs) < 2 { 0 } else { skip(drop2(xs)) }\n",
+      b"fn drop2(xs: List<Int>) -> List<Int> / {abort.raise} = { let [_, _, ..rest] = xs else { panic(\"short\") }; rest }\nfn skip(xs: List<Int>) -> Int / {abort.raise} = if xs.len() < 2 { 0 } else { skip(drop2(xs)) }\n",
       b"skip",
     ),
   );
@@ -20323,38 +20179,38 @@ test "a value an `if` chooses, an element a helper finds, and a list made of par
     ),
   );
   // A helper that answers an element answers an element of a list rebuilt of parts, too.
-  let pick = b"fn pick(xs: List<T>, i: Int) -> T / {abort.raise} = match list_at(xs, i) { Some(x) -> x, None -> panic(\"none\") }\n";
+  let pick = b"fn pick(xs: List<T>, i: Int) -> T / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"none\") }\n";
   assert(
     !diverges(
       Bytes::concat_all([
         tree,
         pick,
-        b"fn first(t: T) -> Int / {abort.raise} = match t { Many(kids) -> if len(kids) == 0 { 0 } else { first(pick(map(kids, |k: T| k), 0)) }, _ -> 0 }\n",
+        b"fn first(t: T) -> Int / {abort.raise} = match t { Many(kids) -> if kids.len() == 0 { 0 } else { first(pick(kids.map(|k: T| k), 0)) }, _ -> 0 }\n",
       ]),
       b"first",
     ),
   );
   // Each element of a list written or mapped of parts is smaller than the value they are parts of.
-  let shapes = b"fn shape(t: T) -> Int = match t { Leaf -> 1, Node(a, b) -> shapes([a, b]), Many(ts) -> shapes(map(ts, |x: T| x)) }\nfn shapes(ts: List<T>) -> Int = fold(ts, 0, |n: Int, x: T| n + shape(x))\n";
+  let shapes = b"fn shape(t: T) -> Int = match t { Leaf -> 1, Node(a, b) -> shapes([a, b]), Many(ts) -> shapes(ts.map(|x: T| x)) }\nfn shapes(ts: List<T>) -> Int = ts.fold(0, |n: Int, x: T| n + shape(x))\n";
   assert(!diverges(tree.concat(shapes), b"shape"));
   assert(!diverges(tree.concat(shapes), b"shapes"));
   // A list holding the value itself has an element no smaller.
   assert(
     diverges(
       tree.concat(
-        b"fn shape(t: T) -> Int = match t { Leaf -> 1, Node(a, b) -> shapes([a, t]), Many(ts) -> shapes(ts) }\nfn shapes(ts: List<T>) -> Int = fold(ts, 0, |n: Int, x: T| n + shape(x))\n",
+        b"fn shape(t: T) -> Int = match t { Leaf -> 1, Node(a, b) -> shapes([a, t]), Many(ts) -> shapes(ts) }\nfn shapes(ts: List<T>) -> Int = ts.fold(0, |n: Int, x: T| n + shape(x))\n",
       ),
       b"shape",
     ),
   )
 }
 
-test "a map's keys and values handed to `map_fold`'s callback are parts of the map" {
+test "a map's keys and values handed to `Map::fold`'s callback are parts of the map" {
   let tree = b"type T = | Leaf | Node(Map<Int, T>)\n";
   assert(
     !diverges(
       tree.concat(
-        b"fn size(t: T) -> Int = match t { Node(kids) -> map_fold(kids, 1, |n: Int, k: Int, c: T| n + size(c)), Leaf -> 1 }\n",
+        b"fn size(t: T) -> Int = match t { Node(kids) -> kids.fold(1, |n: Int, k: Int, c: T| n + size(c)), Leaf -> 1 }\n",
       ),
       b"size",
     ),
@@ -20363,7 +20219,7 @@ test "a map's keys and values handed to `map_fold`'s callback are parts of the m
   assert(
     diverges(
       tree.concat(
-        b"fn worse(t: T) -> Int = match t { Node(kids) -> map_fold(kids, 0, |n: Int, k: Int, c: T| n + worse(t)), Leaf -> 0 }\n",
+        b"fn worse(t: T) -> Int = match t { Node(kids) -> kids.fold(0, |n: Int, k: Int, c: T| n + worse(t)), Leaf -> 0 }\n",
       ),
       b"worse",
     ),
@@ -20394,7 +20250,7 @@ test "lambdas bound by `let` are read where they are called, so many deep and no
 }
 
 test "a function an `if` chooses is handed on as each branch is, and a loop that does not descend is told by its calls" {
-  let each = b"type In = { room: Int }\nfn each(i: In, n: Int, f: (In, Int) -> Int) -> Int = fold(range(0, n), 0, |acc: Int, k: Int| acc + f(i, k))\nfn top(i: In, k: Int) -> Int = if i.room <= 0 { 0 } else { inner({ ..i, room: i.room - 1 }, k) }\n";
+  let each = b"type In = { room: Int }\nfn each(i: In, n: Int, f: (In, Int) -> Int) -> Int = range(0, n).fold(0, |acc: Int, k: Int| acc + f(i, k))\nfn top(i: In, k: Int) -> Int = if i.room <= 0 { 0 } else { inner({ ..i, room: i.room - 1 }, k) }\n";
   assert(
     !diverges(
       each.concat(
@@ -20434,7 +20290,7 @@ test "a constructor of one field around a part is no larger than what that is a 
   assert(
     !diverges(
       tree.concat(
-        b"fn kind(t: Option<T>) -> Int = match t { Some(Node(ts)) -> kinds(ts), _ -> 0 }\nfn kinds(ts: List<T>) -> Int = fold(ts, 0, |n: Int, x: T| n + kind(Some(x)))\n",
+        b"fn kind(t: Option<T>) -> Int = match t { Some(Node(ts)) -> kinds(ts), _ -> 0 }\nfn kinds(ts: List<T>) -> Int = ts.fold(0, |n: Int, x: T| n + kind(Some(x)))\n",
       ),
       b"kind",
     ),
@@ -20455,7 +20311,7 @@ test "what a recursive definition answers is read to a fixed point over its grou
   assert(
     !diverges(
       tree.concat(
-        b"fn depth(t: T) -> Int / {abort.raise} = match t { Node(kids) -> if len(kids) == 0 { 0 } else { 1 + depth(last(kids)) }, Leaf -> 0 }\n",
+        b"fn depth(t: T) -> Int / {abort.raise} = match t { Node(kids) -> if kids.len() == 0 { 0 } else { 1 + depth(last(kids)) }, Leaf -> 0 }\n",
       ),
       b"depth",
     ),
@@ -20522,7 +20378,7 @@ test "an operator at a type that states numeric is its function, and what it doe
   // A literal is an `Int`, and nothing converts it.
   assert_eq(over(n, b"fn f(a: N) -> N = a + 1"), [b"E0201"]);
   // `numeric(a)` holds the ordered comparisons, so it takes the type that states a `key` too.
-  let sum = b"fn sum<a>(xs: List<a>) -> a where numeric(a) = fold(xs, numeric_of_int(0), |s: a, x: a| s + x)\n";
+  let sum = b"fn sum<a>(xs: List<a>) -> a where numeric(a) = xs.fold(numeric_of_int(0), |s: a, x: a| s + x)\n";
   assert_eq(over(keyed.concat(sum), b"fn f(xs: List<N>) -> N = sum(xs)"), []);
   assert_eq(over(n.concat(sum), b"fn f(xs: List<N>) -> N = sum(xs)"), [b"E0201"]);
   assert_eq(
@@ -20680,32 +20536,32 @@ test "a declared type that keys a `Map` by its parameter carries the parameter's
   let bag = b"type Bag<a> = | Bag(Map<a, Int>)\n";
   // Taken, the order is assumed in the body; answered, a caller is held to it.
   assert_eq(
-    check_codes(bag.concat(b"fn size<a>(b: Bag<a>) -> Int = match b { Bag(m) -> map_len(m) }\n")),
+    check_codes(bag.concat(b"fn size<a>(b: Bag<a>) -> Int = match b { Bag(m) -> m.len() }\n")),
     [],
   );
   assert_eq(
     check_codes(
-      bag.concat(b"fn none<a>() -> Bag<a> = Bag(map_new())\nfn floats() -> Bag<Float> = none()\n"),
+      bag.concat(b"fn none<a>() -> Bag<a> = Bag(Map::new())\nfn floats() -> Bag<Float> = none()\n"),
     ),
     [b"E0206"],
   );
   // Through a `new` record, and through a declaration holding one in a list.
   assert_eq(
     check_codes(
-      b"type Ranked<a> = new { by: Map<a, Int> }\ntype Held<a> = | Held(List<Ranked<a>>)\nfn first<a>(h: Held<a>) -> Int = match h { Held(rs) -> match list_at(rs, 0) { Some(r) -> map_len(r.by), None -> 0 } }\n",
+      b"type Ranked<a> = new { by: Map<a, Int> }\ntype Held<a> = | Held(List<Ranked<a>>)\nfn first<a>(h: Held<a>) -> Int = match h { Held(rs) -> match rs.at(0) { Some(r) -> r.by.len(), None -> 0 } }\n",
     ),
     [],
   );
   // A parameter a declaration holds without keying a `Map` by it carries nothing.
   assert_eq(
-    check_codes(b"type Box<a> = | Box(a)\nfn keyed<a>(b: Box<a>) -> Map<a, Int> = map_new()\n"),
+    check_codes(b"type Box<a> = | Box(a)\nfn keyed<a>(b: Box<a>) -> Map<a, Int> = Map::new()\n"),
     [b"E0206"],
   );
   // A `key` and a `show` name functions the type's order is carried into, with no `where`.
   assert_eq(
     check_codes(
       bag.concat(
-        b"key for Bag by items\nshow for Bag by shown\nfn items<a>(b: Bag<a>) -> Map<a, Int> = match b { Bag(m) -> m }\nfn shown<a>(b: Bag<a>) -> String = int_to_string(map_len(items(b)))\n",
+        b"key for Bag by items\nshow for Bag by shown\nfn items<a>(b: Bag<a>) -> Map<a, Int> = match b { Bag(m) -> m }\nfn shown<a>(b: Bag<a>) -> String = items(b).len().to_string()\n",
       ),
     ),
     [],
@@ -20797,7 +20653,7 @@ test "a `forall` ranges over an opaque type another module declares" {
 
 test "a `forall` never ranges over a `Hold`, alone or inside another type" {
   assert_eq(check_codes(b"law \"l\" forall (h: Hold<Int, [r]>) { true }"), [b"E0418"]);
-  assert_eq(check_codes(b"law \"l\" forall (hs: List<Hold<Int, [r]>>) { len(hs) >= 0 }"), [
+  assert_eq(check_codes(b"law \"l\" forall (hs: List<Hold<Int, [r]>>) { hs.len() >= 0 }"), [
     b"E0418",
   ]);
   assert_eq(
@@ -20816,45 +20672,38 @@ test "a hold of an opaque value is read where the value's module is called, and 
       { name: b"app", src: b"import vault (Token, mint, spend, worth)\n".concat(app) },
     ]);
   assert_eq(
-    over(b"fn spent(n: Int) -> Int = with_hold[t](mint(n), spend) { h -> worth(hold_get(h)) }"),
+    over(b"fn spent(n: Int) -> Int = with_hold[t](mint(n), spend) { h -> worth(h.get()) }"),
     [],
   );
-  assert_eq(
-    over(b"fn peek<[r]>(h: Hold<Token, [r]>) -> Int / {hold.read[r]} = worth(hold_get(h))"),
-    [],
-  );
+  assert_eq(over(b"fn peek<[r]>(h: Hold<Token, [r]>) -> Int / {hold.read[r]} = worth(h.get())"), [
+  ]);
   // Holding one opens nothing: its constructor is still its module's alone.
   assert_eq(
     over(
-      b"fn opened(n: Int) -> Int = with_hold[t](mint(n), spend) { h -> match hold_get(h) { Token(k) -> k } }",
+      b"fn opened(n: Int) -> Int = with_hold[t](mint(n), spend) { h -> match h.get() { Token(k) -> k } }",
     ),
     [b"E0107"],
   );
-  // What `hold_get` answers is a value like any other, so it may leave where the hold may not: a
+  // What `Hold::get` answers is a value like any other, so it may leave where the hold may not: a
   // module that must not see its value used after the release keeps the value's uses to itself.
-  assert_eq(
-    over(b"fn kept(n: Int) -> Token = with_hold[t](mint(n), spend) { h -> hold_get(h) }"),
-    [],
-  )
+  assert_eq(over(b"fn kept(n: Int) -> Token = with_hold[t](mint(n), spend) { h -> h.get() }"), [])
 }
 
 test "a `Columns` holds a record type of at least one field wherever its type settles" {
   assert_eq(
     check_codes(
-      b"type P = { x: Float, y: Float }\nfn f(xs: List<P>) -> Columns<P> = columns_of_list(xs)\n",
+      b"type P = { x: Float, y: Float }\nfn f(xs: List<P>) -> Columns<P> = Columns::of_list(xs)\n",
     ),
     [],
   );
-  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Columns<Int> = columns_of_list(xs)\n"), [
+  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Columns<Int> = Columns::of_list(xs)\n"), [
     b"E0224",
   ]);
-  assert_eq(check_codes(b"fn f(xs: List<{}>) -> Columns<{}> = columns_of_list(xs)\n"), [b"E0224"]);
+  assert_eq(check_codes(b"fn f(xs: List<{}>) -> Columns<{}> = Columns::of_list(xs)\n"), [b"E0224"]);
   // A type parameter is its callers' to settle.
-  let generic = b"fn f<a>(xs: List<a>) -> Columns<a> = columns_of_list(xs)\n";
+  let generic = b"fn f<a>(xs: List<a>) -> Columns<a> = Columns::of_list(xs)\n";
   assert_eq(check_codes(generic), []);
-  assert_eq(check_codes(generic.concat(b"fn g(xs: List<Int>) -> Int = columns_len(f(xs))\n")), [
-    b"E0224",
-  ])
+  assert_eq(check_codes(generic.concat(b"fn g(xs: List<Int>) -> Int = f(xs).len()\n")), [b"E0224"])
 }
 
 /// A type `N` whose `+`, `-` and `*` are `add`, written as `add`, and what follows it.
@@ -20892,7 +20741,7 @@ test "a comparison, a `Map` and a constrained parameter at a type that states a 
   // Through what holds one, and through a builtin that orders or keys by one.
   assert_eq(keyed(b"if [t] == [t] { 1 } else { 0 }"), [b"E0302"]);
   assert_eq(keyed(b"match compare(t, t) { Equal -> 1, _ -> 0 }"), [b"E0302"]);
-  assert_eq(keyed(b"map_len(map_insert(map_new(), t, 1))"), [b"E0302"]);
+  assert_eq(keyed(b"Map::new().insert(t, 1).len()"), [b"E0302"]);
   let shown = |s: Bytes|
     check_codes(
       Bytes::concat_all([
@@ -20933,7 +20782,7 @@ test "a body in a recursion through an operator performs everything again there"
 
 /// A type `Stack` with a function `size` of it, and what follows.
 fn with_stack(rest: Bytes) -> Bytes =
-  b"type Stack = | Stack(List<Int>)\nfn Stack::size(s: Stack) -> Int = match s { Stack(xs) -> len(xs) }\nfn Stack::of(xs: List<Int>) -> Stack = Stack(xs)\n".concat(
+  b"type Stack = | Stack(List<Int>)\nfn Stack::size(s: Stack) -> Int = match s { Stack(xs) -> xs.len() }\nfn Stack::of(xs: List<Int>) -> Stack = Stack(xs)\n".concat(
     rest,
   )
 
@@ -21046,7 +20895,7 @@ test "a lambda's unwritten parameter is what the arguments before it settle" {
   assert_eq(
     check_codes(
       with_stack(
-        b"type P = { side: Int }\nfn sides(ps: List<P>) -> List<Int> = map(ps, |p| p.side)\nfn sizes(ss: List<Stack>) -> List<Int> = map(ss, |s| s.size())",
+        b"type P = { side: Int }\nfn sides(ps: List<P>) -> List<Int> = ps.map(|p| p.side)\nfn sizes(ss: List<Stack>) -> List<Int> = ss.map(|s| s.size())",
       ),
     ),
     [],
@@ -21057,7 +20906,7 @@ test "a lambda's unwritten parameter is what the arguments before it settle" {
   ])
 }
 
-test "a builtin is a function of the type it is named for, or of the type it first takes" {
+test "a builtin the prelude declares under a type is a function of that type" {
   assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int = xs.len() + xs.push(1).len()"), []);
   assert_eq(check_codes(b"fn f(m: Map<Int, Int>) -> Option<Int> = m.get(1)"), []);
   assert_eq(check_codes(b"fn f(b: Bytes, s: String) -> Int = b.len() + s.trim().len()"), []);
@@ -21074,21 +20923,17 @@ test "a builtin is a function of the type it is named for, or of the type it fir
   assert_eq(check_codes(b"fn f(s: String) -> Int = Bytes::size(s)"), [b"E0101"]);
   // Written through its type it is the same builtin: what it ensures lets its caller raise nothing.
   assert_eq(check_codes(b"fn f(n: U8) -> Bytes = byte_of_int(Int::of_u8(n))"), []);
-  // A builtin is compiled by its own name, which a module that binds it would answer.
-  assert(
-    refused_with(
-      b"fn len(n: Int) -> Int = n\nfn f(xs: List<Int>) -> Int = xs.len()",
-      b"E0105",
-      b"`List::len` is the builtin `len`, a name this module binds",
+  // The name alone is no function: a module's own may take it, and is another function.
+  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int = len(xs)"), [b"E0101"]);
+  assert_eq(
+    check_codes(
+      b"fn len(n: Int) -> Int = n\nfn f(xs: List<Int>) -> Int = len(xs.len()) + List::len(xs)",
     ),
+    [],
   );
-  assert(
-    refused_with(
-      b"fn len(n: Int) -> Int = n\nfn f(xs: List<Int>) -> Int = List::len(xs)",
-      b"E0105",
-      b"`List::len` is the builtin `len`, a name this module binds",
-    ),
-  )
+  // One that is no type's keeps its name, and is no function of what it takes.
+  assert_eq(check_codes(b"fn f(n: Int) -> List<Int> = range(0, n)"), []);
+  assert_eq(check_codes(b"fn f(s: String) -> Int = s.panic()"), [b"E0101"])
 }
 
 test "a guard written on a value's own length lets a builtin that needs it raise nothing" {
@@ -21113,7 +20958,7 @@ fn codes_of(sources: List<Source>) -> List<Bytes> / {abort.raise} =
 test "a language type's other functions are its home module's, where the caller's module sees it" {
   let home = {
     name: b"std.list",
-    src: b"pub fn List::second<a>(xs: List<a>) -> Option<a> = list_at(xs, 1)\n",
+    src: b"pub fn List::second<a>(xs: List<a>) -> Option<a> = xs.at(1)\n",
   };
   let calls = b"fn f(xs: List<Int>) -> Option<Int> = xs.second()\nfn g(xs: List<Int>) -> Option<Int> = List::second(xs)\n";
   assert_eq(codes_of([home, { name: b"m", src: b"import std.list\n".concat(calls) }]), []);
@@ -21126,7 +20971,12 @@ test "a language type's other functions are its home module's, where the caller'
     [],
   );
   // A module that imports it nowhere beneath itself does not see it.
-  assert_eq(codes_of([home, { name: b"m", src: calls }]), [b"E0101", b"E0101"])
+  assert_eq(codes_of([home, { name: b"m", src: calls }]), [b"E0101", b"E0101"]);
+  // The prelude's function of a name is the type's one function of it.
+  assert_eq(
+    codes_of([{ name: b"std.list", src: b"pub fn List::len<a>(xs: List<a>) -> Int = 0\n" }]),
+    [b"E0105"],
+  )
 }
 
 test "a recursion a builtin called on a value bounds, or runs a lambda of, is seen to end" {

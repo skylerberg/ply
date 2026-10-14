@@ -22,7 +22,7 @@ pub fn root(m: *mut Obj) -> Word {
     unsafe { word_at(m, 0) }
 }
 
-/// The entries a map holds: what `map_len` answers.
+/// The entries a map holds: what `Map::len` answers.
 pub fn len(m: *mut Obj) -> usize {
     unsafe { (*m).len as usize }
 }
@@ -389,7 +389,7 @@ impl Heap {
         copy
     }
 
-    /// `map_insert`, replacing key and value when present. Takes all three.
+    /// `Map::insert`, replacing key and value when present. Takes all three.
     pub fn map_insert(&mut self, layouts: &Layouts, m: Word, k: Word, v: Word) -> Word {
         let m = self.writable_map(m);
         let r = root(m);
@@ -573,7 +573,7 @@ impl Heap {
         }
     }
 
-    /// `map_remove`. Takes the map, reads the key.
+    /// `Map::remove`. Takes the map, reads the key.
     pub fn map_remove(&mut self, layouts: &Layouts, m: Word, k: Word) -> Word {
         if get(layouts, obj(m), k).is_none() {
             return m;

@@ -72,17 +72,66 @@ macro_rules! builtins {
     (@raises ends) => { false };
 }
 
+/// The builtins a unit of the last release names by the function's name alone.
+const BARE_TO_THE_RELEASE: &[&str] = &[
+    "Float::acos",
+    "Float::asin",
+    "Float::atan",
+    "Float::atan2",
+    "Float::ceil",
+    "Float::cos",
+    "Float::exp",
+    "List::filter",
+    "Float::floor",
+    "List::fold",
+    "Float::hypot",
+    "List::len",
+    "Float::ln",
+    "Float::log10",
+    "Float::log2",
+    "List::map",
+    "Float::pow",
+    "List::push",
+    "Float::round",
+    "Float::sin",
+    "Float::sqrt",
+    "Float::tan",
+];
+
+impl Builtin {
+    /// The name a unit of the last release has for the builtin, where it differs: `Map::get` for
+    /// `Map::get`.
+    pub fn to_the_release(self) -> Option<String> {
+        let (of, name) = self.name().split_once("::")?;
+        Some(if BARE_TO_THE_RELEASE.contains(&self.name()) {
+            name.to_string()
+        } else {
+            format!("{}_{name}", of.to_ascii_lowercase())
+        })
+    }
+
+    /// The builtin `name` names, to this runtime or to the last release.
+    pub fn named(name: &str) -> Option<Builtin> {
+        Builtin::from_name(name).or_else(|| {
+            Builtin::all()
+                .iter()
+                .copied()
+                .find(|b| b.to_the_release().as_deref() == Some(name))
+        })
+    }
+}
+
 builtins! { $
     Assert = "assert", 2, raises;
     AssertEq = "assert_eq", 2, raises;
-    Len = "len", 1, ends;
-    Push = "push", 2, ends;
-    ListAt = "list_at", 2, ends;
-    /// One element replaced, sharing the rest; raises where `list_at` answers `None`.
-    ListSet = "list_set", 3, raises;
-    Map = "map", 2, ends;
-    Filter = "filter", 2, ends;
-    Fold = "fold", 3, ends;
+    Len = "List::len", 1, ends;
+    Push = "List::push", 2, ends;
+    ListAt = "List::at", 2, ends;
+    /// One element replaced, sharing the rest; raises where `List::at` answers `None`.
+    ListSet = "List::set", 3, raises;
+    Map = "List::map", 2, ends;
+    Filter = "List::filter", 2, ends;
+    Fold = "List::fold", 3, ends;
     Iterate = "iterate", 3, raises;
     Metered = "metered", 1, ends;
     Range = "range", 2, ends;
@@ -98,88 +147,88 @@ builtins! { $
     SaturatingSub = "saturating_sub", 2, ends;
     SaturatingMul = "saturating_mul", 2, ends;
     // Field-less rather than carrying an `IntTy`: the enum is cast to a per-builtin cache index.
-    U8OfInt = "u8_of_int", 1, raises;
-    U16OfInt = "u16_of_int", 1, raises;
-    U32OfInt = "u32_of_int", 1, raises;
-    U64OfInt = "u64_of_int", 1, raises;
-    I8OfInt = "i8_of_int", 1, raises;
-    I16OfInt = "i16_of_int", 1, raises;
-    I32OfInt = "i32_of_int", 1, raises;
-    I64OfInt = "i64_of_int", 1, ends;
-    IntOfU8 = "int_of_u8", 1, ends;
-    IntOfU16 = "int_of_u16", 1, ends;
-    IntOfU32 = "int_of_u32", 1, ends;
-    IntOfU64 = "int_of_u64", 1, raises;
-    IntOfI8 = "int_of_i8", 1, ends;
-    IntOfI16 = "int_of_i16", 1, ends;
-    IntOfI32 = "int_of_i32", 1, ends;
-    IntOfI64 = "int_of_i64", 1, ends;
+    U8OfInt = "U8::of_int", 1, raises;
+    U16OfInt = "U16::of_int", 1, raises;
+    U32OfInt = "U32::of_int", 1, raises;
+    U64OfInt = "U64::of_int", 1, raises;
+    I8OfInt = "I8::of_int", 1, raises;
+    I16OfInt = "I16::of_int", 1, raises;
+    I32OfInt = "I32::of_int", 1, raises;
+    I64OfInt = "I64::of_int", 1, ends;
+    IntOfU8 = "Int::of_u8", 1, ends;
+    IntOfU16 = "Int::of_u16", 1, ends;
+    IntOfU32 = "Int::of_u32", 1, ends;
+    IntOfU64 = "Int::of_u64", 1, raises;
+    IntOfI8 = "Int::of_i8", 1, ends;
+    IntOfI16 = "Int::of_i16", 1, ends;
+    IntOfI32 = "Int::of_i32", 1, ends;
+    IntOfI64 = "Int::of_i64", 1, ends;
     Min = "min", 2, ends;
     Max = "max", 2, ends;
     ByteOfInt = "byte_of_int", 1, raises;
-    IntToString = "int_to_string", 1, ends;
-    FloatToString = "float_to_string", 1, ends;
-    StringConcat = "string_concat", 2, ends;
-    BytesLen = "bytes_len", 1, ends;
-    BytesAt = "bytes_at", 2, raises;
-    BytesU32Le = "bytes_u32_le", 2, raises;
-    BytesSlice = "bytes_slice", 3, raises;
-    BytesConcat = "bytes_concat", 2, ends;
-    BytesConcatAll = "bytes_concat_all", 1, ends;
-    BytesBlake3 = "bytes_blake3", 1, ends;
-    BytesGzip = "bytes_gzip", 1, ends;
-    BytesGunzip = "bytes_gunzip", 1, ends;
-    BytesOfString = "bytes_of_string", 1, ends;
-    BytesIsUtf8 = "bytes_is_utf8", 1, ends;
-    BytesIndexOf = "bytes_index_of", 2, ends;
-    BytesIndexOfFrom = "bytes_index_of_from", 3, raises;
-    BytesIndexOfByte = "bytes_index_of_byte", 2, raises;
-    BytesStartsWith = "bytes_starts_with", 2, ends;
-    BytesEndsWith = "bytes_ends_with", 2, ends;
-    BytesSplit = "bytes_split", 2, raises;
-    BytesScan = "bytes_scan", 4, raises;
-    BytesScanUntil = "bytes_scan_until", 4, raises;
-    BytesPosition = "bytes_position", 3, raises;
-    StringOfBytes = "string_of_bytes", 1, raises;
-    StringOfBytesLossy = "string_of_bytes_lossy", 1, ends;
-    StringLen = "string_len", 1, ends;
-    StringSlice = "string_slice", 3, raises;
-    StringSplit = "string_split", 2, raises;
-    StringTrim = "string_trim", 1, ends;
-    StringLower = "string_lower", 1, ends;
-    StringUpper = "string_upper", 1, ends;
-    StringStartsWith = "string_starts_with", 2, ends;
-    StringEndsWith = "string_ends_with", 2, ends;
-    StringContains = "string_contains", 2, ends;
-    StringFind = "string_find", 2, raises;
-    MapNew = "map_new", 0, ends;
-    MapInsert = "map_insert", 3, ends;
-    MapGet = "map_get", 2, ends;
-    MapContains = "map_contains", 2, ends;
-    MapRemove = "map_remove", 2, ends;
-    MapLen = "map_len", 1, ends;
-    MapKeys = "map_keys", 1, ends;
-    MapValues = "map_values", 1, ends;
-    MapEntries = "map_entries", 1, ends;
-    MapOfEntries = "map_of_entries", 1, ends;
-    MapMerge = "map_merge", 2, ends;
-    MapFold = "map_fold", 3, ends;
+    IntToString = "Int::to_string", 1, ends;
+    FloatToString = "Float::to_string", 1, ends;
+    StringConcat = "String::concat", 2, ends;
+    BytesLen = "Bytes::len", 1, ends;
+    BytesAt = "Bytes::at", 2, raises;
+    BytesU32Le = "Bytes::u32_le", 2, raises;
+    BytesSlice = "Bytes::slice", 3, raises;
+    BytesConcat = "Bytes::concat", 2, ends;
+    BytesConcatAll = "Bytes::concat_all", 1, ends;
+    BytesBlake3 = "Bytes::blake3", 1, ends;
+    BytesGzip = "Bytes::gzip", 1, ends;
+    BytesGunzip = "Bytes::gunzip", 1, ends;
+    BytesOfString = "Bytes::of_string", 1, ends;
+    BytesIsUtf8 = "Bytes::is_utf8", 1, ends;
+    BytesIndexOf = "Bytes::index_of", 2, ends;
+    BytesIndexOfFrom = "Bytes::index_of_from", 3, raises;
+    BytesIndexOfByte = "Bytes::index_of_byte", 2, raises;
+    BytesStartsWith = "Bytes::starts_with", 2, ends;
+    BytesEndsWith = "Bytes::ends_with", 2, ends;
+    BytesSplit = "Bytes::split", 2, raises;
+    BytesScan = "Bytes::scan", 4, raises;
+    BytesScanUntil = "Bytes::scan_until", 4, raises;
+    BytesPosition = "Bytes::position", 3, raises;
+    StringOfBytes = "String::of_bytes", 1, raises;
+    StringOfBytesLossy = "String::of_bytes_lossy", 1, ends;
+    StringLen = "String::len", 1, ends;
+    StringSlice = "String::slice", 3, raises;
+    StringSplit = "String::split", 2, raises;
+    StringTrim = "String::trim", 1, ends;
+    StringLower = "String::lower", 1, ends;
+    StringUpper = "String::upper", 1, ends;
+    StringStartsWith = "String::starts_with", 2, ends;
+    StringEndsWith = "String::ends_with", 2, ends;
+    StringContains = "String::contains", 2, ends;
+    StringFind = "String::find", 2, raises;
+    MapNew = "Map::new", 0, ends;
+    MapInsert = "Map::insert", 3, ends;
+    MapGet = "Map::get", 2, ends;
+    MapContains = "Map::contains", 2, ends;
+    MapRemove = "Map::remove", 2, ends;
+    MapLen = "Map::len", 1, ends;
+    MapKeys = "Map::keys", 1, ends;
+    MapValues = "Map::values", 1, ends;
+    MapEntries = "Map::entries", 1, ends;
+    MapOfEntries = "Map::of_entries", 1, ends;
+    MapMerge = "Map::merge", 2, ends;
+    MapFold = "Map::fold", 3, ends;
     /// `CellUpdate`'s shape over one map entry.
-    MapUpdate = "map_update", 3, ends;
-    DecimalDiv = "decimal_div", 4, raises;
-    DecimalRound = "decimal_round", 3, raises;
-    DecimalOfInt = "decimal_of_int", 1, ends;
-    IntOfDecimal = "int_of_decimal", 2, ends;
-    FloatOfDecimal = "float_of_decimal", 1, ends;
-    DecimalOfFloat = "decimal_of_float", 1, ends;
-    DecimalOfString = "decimal_of_string", 1, ends;
+    MapUpdate = "Map::update", 3, ends;
+    DecimalDiv = "Decimal::div", 4, raises;
+    DecimalRound = "Decimal::round", 3, raises;
+    DecimalOfInt = "Decimal::of_int", 1, ends;
+    IntOfDecimal = "Int::of_decimal", 2, ends;
+    FloatOfDecimal = "Float::of_decimal", 1, ends;
+    DecimalOfFloat = "Decimal::of_float", 1, ends;
+    DecimalOfString = "Decimal::of_string", 1, ends;
     /// The lexer's float parse over text, reaching `Float`s no route through `Decimal` does.
-    FloatOfString = "float_of_string", 1, ends;
-    DecimalToString = "decimal_to_string", 1, ends;
-    DecimalScale = "decimal_scale", 1, ends;
+    FloatOfString = "Float::of_string", 1, ends;
+    DecimalToString = "Decimal::to_string", 1, ends;
+    DecimalScale = "Decimal::scale", 1, ends;
     /// The IEEE 754 bit pattern, as the signed 64-bit `Int` it fits in.
     BitsOfFloat = "bits_of_float", 1, ends;
-    FloatOfBits = "float_of_bits", 1, ends;
+    FloatOfBits = "Float::of_bits", 1, ends;
     Compare = "compare", 2, ends;
     /// The same order as [`Builtin::Compare`], under a name a module may not declare.
     CompareValues = "compare_values", 2, ends;
@@ -190,46 +239,46 @@ builtins! { $
     Panic = "panic", 1, raises;
     /// The identity a benchmark pins a measured value with: opaque, so it is not optimized away.
     Observe = "observe", 1, ends;
-    SecretOfString = "secret_of_string", 1, ends;
-    SecretVerify = "secret_verify", 2, ends;
-    SecretIsEmpty = "secret_is_empty", 1, ends;
+    SecretOfString = "Secret::of_string", 1, ends;
+    SecretVerify = "Secret::verify", 2, ends;
+    SecretIsEmpty = "Secret::is_empty", 1, ends;
     // Appended, so every earlier builtin keeps its cache index.
-    U128OfInt = "u128_of_int", 1, raises;
-    I128OfInt = "i128_of_int", 1, ends;
-    IntOfU128 = "int_of_u128", 1, raises;
-    IntOfI128 = "int_of_i128", 1, raises;
-    U128ToString = "u128_to_string", 1, ends;
-    I128ToString = "i128_to_string", 1, ends;
-    U128OfString = "u128_of_string", 1, ends;
-    I128OfString = "i128_of_string", 1, ends;
+    U128OfInt = "U128::of_int", 1, raises;
+    I128OfInt = "I128::of_int", 1, ends;
+    IntOfU128 = "Int::of_u128", 1, raises;
+    IntOfI128 = "Int::of_i128", 1, raises;
+    U128ToString = "U128::to_string", 1, ends;
+    I128ToString = "I128::to_string", 1, ends;
+    U128OfString = "U128::of_string", 1, ends;
+    I128OfString = "I128::of_string", 1, ends;
     /// Over any integer type: the exact answer, or `None` where it leaves the type.
     CheckedAdd = "checked_add", 2, ends;
     CheckedSub = "checked_sub", 2, ends;
     CheckedMul = "checked_mul", 2, ends;
     CheckedNeg = "checked_neg", 1, ends;
     /// `None` for a surrogate or past `U+10FFFF`, which no `Char` is.
-    CharOfInt = "char_of_int", 1, ends;
-    IntOfChar = "int_of_char", 1, ends;
-    StringChars = "string_chars", 1, ends;
-    StringOfChars = "string_of_chars", 1, ends;
-    ArrayNew = "array_new", 2, raises;
-    ArrayOfList = "array_of_list", 1, ends;
-    ArrayToList = "array_to_list", 1, ends;
-    ArrayLen = "array_len", 1, ends;
-    ArrayAt = "array_at", 2, ends;
-    /// Raises where `array_at` answers `None`.
-    ArrayGet = "array_get", 2, raises;
+    CharOfInt = "Char::of_int", 1, ends;
+    IntOfChar = "Int::of_char", 1, ends;
+    StringChars = "String::chars", 1, ends;
+    StringOfChars = "String::of_chars", 1, ends;
+    ArrayNew = "Array::new", 2, raises;
+    ArrayOfList = "Array::of_list", 1, ends;
+    ArrayToList = "Array::to_list", 1, ends;
+    ArrayLen = "Array::len", 1, ends;
+    ArrayAt = "Array::at", 2, ends;
+    /// Raises where `Array::at` answers `None`.
+    ArrayGet = "Array::get", 2, raises;
     /// In place while the array has one holder; raises out of range.
-    ArraySet = "array_set", 3, raises;
+    ArraySet = "Array::set", 3, raises;
     /// An array of records holding each field apart, the compiled runtime's columns; as a value it
     /// is the array of its records, and each builtin answers as its `array_` namesake does.
-    ColumnsNew = "columns_new", 2, raises;
-    ColumnsOfList = "columns_of_list", 1, ends;
-    ColumnsToList = "columns_to_list", 1, ends;
-    ColumnsLen = "columns_len", 1, ends;
-    ColumnsAt = "columns_at", 2, ends;
-    ColumnsGet = "columns_get", 2, raises;
-    ColumnsSet = "columns_set", 3, raises;
+    ColumnsNew = "Columns::new", 2, raises;
+    ColumnsOfList = "Columns::of_list", 1, ends;
+    ColumnsToList = "Columns::to_list", 1, ends;
+    ColumnsLen = "Columns::len", 1, ends;
+    ColumnsAt = "Columns::at", 2, ends;
+    ColumnsGet = "Columns::get", 2, raises;
+    ColumnsSet = "Columns::set", 3, raises;
     /// The value as a `std.value.Value`, whole.
     Reflect = "reflect", 1, ends;
     /// As `reflect`, with a value whose type states a `show` as `VShown` of what that function
@@ -248,61 +297,61 @@ builtins! { $
     NumericOfInt = "numeric_of_int", 2, raises;
     /// `to_int(x)`, called with the witness the elaboration passes first.
     ToInt = "to_int", 2, ends;
-    FloatOfInt = "float_of_int", 1, ends;
+    FloatOfInt = "Float::of_int", 1, ends;
     /// `None` for a NaN, an infinity, or a value past `Int` once rounded.
-    IntOfFloat = "int_of_float", 2, ends;
-    Floor = "floor", 1, ends;
-    Ceil = "ceil", 1, ends;
-    Round = "round", 2, ends;
-    Sqrt = "sqrt", 1, ends;
-    Pow = "pow", 2, ends;
-    Exp = "exp", 1, ends;
-    Ln = "ln", 1, ends;
-    Log2 = "log2", 1, ends;
-    Log10 = "log10", 1, ends;
-    Sin = "sin", 1, ends;
-    Cos = "cos", 1, ends;
-    Tan = "tan", 1, ends;
-    Asin = "asin", 1, ends;
-    Acos = "acos", 1, ends;
-    Atan = "atan", 1, ends;
-    Atan2 = "atan2", 2, ends;
-    Hypot = "hypot", 2, ends;
+    IntOfFloat = "Int::of_float", 2, ends;
+    Floor = "Float::floor", 1, ends;
+    Ceil = "Float::ceil", 1, ends;
+    Round = "Float::round", 2, ends;
+    Sqrt = "Float::sqrt", 1, ends;
+    Pow = "Float::pow", 2, ends;
+    Exp = "Float::exp", 1, ends;
+    Ln = "Float::ln", 1, ends;
+    Log2 = "Float::log2", 1, ends;
+    Log10 = "Float::log10", 1, ends;
+    Sin = "Float::sin", 1, ends;
+    Cos = "Float::cos", 1, ends;
+    Tan = "Float::tan", 1, ends;
+    Asin = "Float::asin", 1, ends;
+    Acos = "Float::acos", 1, ends;
+    Atan = "Float::atan", 1, ends;
+    Atan2 = "Float::atan2", 2, ends;
+    Hypot = "Float::hypot", 2, ends;
     /// The entry at an end of a map's key order, as `Some({key, value})`.
-    MapFirst = "map_first", 1, ends;
-    MapLast = "map_last", 1, ends;
+    MapFirst = "Map::first", 1, ends;
+    MapLast = "Map::last", 1, ends;
     /// The entry nearest a key from one side, the key's own counted or not.
-    MapFloor = "map_floor", 2, ends;
-    MapCeiling = "map_ceiling", 2, ends;
-    MapBelow = "map_below", 2, ends;
-    MapAbove = "map_above", 2, ends;
+    MapFloor = "Map::floor", 2, ends;
+    MapCeiling = "Map::ceiling", 2, ends;
+    MapBelow = "Map::below", 2, ends;
+    MapAbove = "Map::above", 2, ends;
     /// An end's entry with the map that is left, in place while the map has one holder.
-    MapPopFirst = "map_pop_first", 1, ends;
-    MapPopLast = "map_pop_last", 1, ends;
-    /// `map_range(m, lo, lo_inclusive, hi, hi_inclusive, limit)`.
-    MapRange = "map_range", 6, ends;
-    MapSplit = "map_split", 2, ends;
+    MapPopFirst = "Map::pop_first", 1, ends;
+    MapPopLast = "Map::pop_last", 1, ends;
+    /// `Map::range(m, lo, lo_inclusive, hi, hi_inclusive, limit)`.
+    MapRange = "Map::range", 6, ends;
+    MapSplit = "Map::split", 2, ends;
     /// What a hold holds, while its region has not let it go.
-    HoldGet = "hold_get", 1, ends;
+    HoldGet = "Hold::get", 1, ends;
     /// A hold's contents moved out for its release, so the next read finds them gone. No source
     /// can spell it; the lowering of `with_hold` writes it.
     HoldTake = "?hold_take", 1, ends;
     /// [`Builtin::Bracket`] under a name no module rebinds, for the lowering of `with_hold`.
     HoldBracket = "?hold_bracket", 3, ends;
     /// Bytes as a credential, and what is made of one without opening it.
-    SecretOfBytes = "secret_of_bytes", 1, ends;
-    SecretBytes = "secret_bytes", 1, ends;
-    SecretLen = "secret_len", 1, ends;
-    SecretConcat = "secret_concat", 2, ends;
-    /// `secret_decode(encoding, text)`: `None` for a text the encoding does not write.
-    SecretDecode = "secret_decode", 2, raises;
+    SecretOfBytes = "Secret::of_bytes", 1, ends;
+    SecretBytes = "Secret::bytes", 1, ends;
+    SecretLen = "Secret::len", 1, ends;
+    SecretConcat = "Secret::concat", 2, ends;
+    /// `Secret::decode(encoding, text)`: `None` for a text the encoding does not write.
+    SecretDecode = "Secret::decode", 2, raises;
     /// The private key a DER document holds, with the scheme it is a key of.
-    SecretPrivateKey = "secret_private_key", 1, ends;
+    SecretPrivateKey = "Secret::private_key", 1, ends;
     /// Keyed hashing under a credential; `None` for a hash the runtime does not key.
-    SecretHmac = "secret_hmac", 3, ends;
-    SecretHkdfExtract = "secret_hkdf_extract", 3, ends;
-    SecretHkdfExpand = "secret_hkdf_expand", 4, ends;
-    SecretPbkdf2 = "secret_pbkdf2", 5, ends;
+    SecretHmac = "Secret::hmac", 3, ends;
+    SecretHkdfExtract = "Secret::hkdf_extract", 3, ends;
+    SecretHkdfExpand = "Secret::hkdf_expand", 4, ends;
+    SecretPbkdf2 = "Secret::pbkdf2", 5, ends;
     /// `crypto_seal(cipher, key, nonce, associated, plaintext)` and its inverse.
     CryptoSeal = "crypto_seal", 5, raises;
     CryptoOpen = "crypto_open", 5, raises;
@@ -318,11 +367,11 @@ builtins! { $
     /// database an image holds, answering the image it leaves.
     SqliteRun = "sqlite_run", 6, ends;
     SqliteFunctions = "sqlite_functions", 0, ends;
-    /// `secret_encode(encoding, bytes)`: the text a credential's bytes are in an encoding, sealed.
-    SecretEncode = "secret_encode", 2, raises;
-    /// `secret_rsa_jwk(n, e, [d, p, q, dp, dq, qi])`: the PKCS #1 document an RSA JSON Web Key's
+    /// `Secret::encode(encoding, bytes)`: the text a credential's bytes are in an encoding, sealed.
+    SecretEncode = "Secret::encode", 2, raises;
+    /// `Secret::rsa_jwk(n, e, [d, p, q, dp, dq, qi])`: the PKCS #1 document an RSA JSON Web Key's
     /// numbers make, each private one its base64url text sealed; `None` for numbers that are no key.
-    SecretRsaJwk = "secret_rsa_jwk", 3, raises;
+    SecretRsaJwk = "Secret::rsa_jwk", 3, raises;
 }
 
 impl Builtin {
@@ -369,24 +418,24 @@ fn push(args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
     let x = args.pop().expect("arity checked");
     let mut xs = args.pop().expect("arity checked");
     let Value::List(list) = &mut xs else {
-        return Err(type_error(span, "`push`", "List", &xs));
+        return Err(type_error(span, "`List::push`", "List", &xs));
     };
     let copied = list.push(x);
     crate::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), span);
     Ok(xs)
 }
 
-/// `list_set`, taking the list out of its arguments so the last holder writes in place.
+/// `List::set`, taking the list out of its arguments so the last holder writes in place.
 fn list_set(args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
     let v = args.pop().expect("arity checked");
     let index = args.pop().expect("arity checked");
     let mut xs = args.pop().expect("arity checked");
     let Value::List(list) = &mut xs else {
-        return Err(type_error(span, "`list_set`", "List", &xs));
+        return Err(type_error(span, "`List::set`", "List", &xs));
     };
-    let i = index.as_int(span, "`list_set`")?;
+    let i = index.as_int(span, "`List::set`")?;
     let Some(at) = usize::try_from(i).ok().filter(|at| *at < list.len()) else {
-        return Err(out_of_range(span, "list_set", i, list.len(), "elements"));
+        return Err(out_of_range(span, "List::set", i, list.len(), "elements"));
     };
     let copied = list.set(at, v);
     crate::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), span);
@@ -458,7 +507,7 @@ fn numeric_op(op: &Value, span: Span) -> Result<BinOp, Diagnostic> {
         })
 }
 
-/// `array_set` or `columns_set`, taking the array out of its arguments so the last holder writes in
+/// `Array::set` or `Columns::set`, taking the array out of its arguments so the last holder writes in
 /// place.
 fn array_set(args: &mut Vec<Value>, span: Span, what: &str) -> Result<Value, Diagnostic> {
     let v = args.pop().expect("arity checked");
@@ -515,14 +564,14 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::Len => match &args[0] {
             Value::List(xs) => Ok(Value::Int(xs.len() as i64)),
             Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-            other => Err(type_error(span, "`len`", "a List or String", other)),
+            other => Err(type_error(span, "`List::len`", "a List or String", other)),
         },
 
         Builtin::Push => push(args, span),
 
         Builtin::ListAt => {
-            let xs = args[0].as_list(span, "`list_at`")?;
-            let i = args[1].as_int(span, "`list_at`")?;
+            let xs = args[0].as_list(span, "`List::at`")?;
+            let i = args[1].as_int(span, "`List::at`")?;
             Ok(option(at(xs, i).cloned()))
         }
 
@@ -764,38 +813,38 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         Builtin::IntToString => Ok(Value::str(
-            args[0].as_int(span, "`int_to_string`")?.to_string(),
+            args[0].as_int(span, "`Int::to_string`")?.to_string(),
         )),
 
         // The language's own float spelling, the one a diagnostic prints: shortest round-trip,
         // and `Infinity`/`NaN` rather than the `inf`/`NaN` Rust would write.
         Builtin::FloatToString => Ok(Value::str(crate::render_float(
-            args[0].as_float(span, "`float_to_string`")?,
+            args[0].as_float(span, "`Float::to_string`")?,
         ))),
 
         Builtin::StringConcat => {
-            let a = args[0].as_str(span, "`string_concat`")?;
-            let b = args[1].as_str(span, "`string_concat`")?;
+            let a = args[0].as_str(span, "`String::concat`")?;
+            let b = args[1].as_str(span, "`String::concat`")?;
             Ok(Value::str(format!("{a}{b}")))
         }
 
         Builtin::BytesLen => {
-            let b = args[0].as_bytes(span, "`bytes_len`")?;
+            let b = args[0].as_bytes(span, "`Bytes::len`")?;
             Ok(Value::Int(b.len() as i64))
         }
 
         Builtin::BytesAt => {
-            let b = args[0].as_bytes(span, "`bytes_at`")?;
-            let i = args[1].as_int(span, "`bytes_at`")?;
+            let b = args[0].as_bytes(span, "`Bytes::at`")?;
+            let i = args[1].as_int(span, "`Bytes::at`")?;
             match usize::try_from(i).ok().and_then(|i| b.get(i)) {
                 Some(byte) => Ok(Value::Int(i64::from(*byte))),
-                None => Err(out_of_range(span, "bytes_at", i, b.len(), "bytes")),
+                None => Err(out_of_range(span, "Bytes::at", i, b.len(), "bytes")),
             }
         }
 
         Builtin::BytesU32Le => {
-            let b = args[0].as_bytes(span, "`bytes_u32_le`")?;
-            let i = args[1].as_int(span, "`bytes_u32_le`")?;
+            let b = args[0].as_bytes(span, "`Bytes::u32_le`")?;
+            let i = args[1].as_int(span, "`Bytes::u32_le`")?;
             let four = usize::try_from(i)
                 .ok()
                 .and_then(|i| b.get(i..i + 4))
@@ -806,20 +855,20 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                     u128::from(u32::from_le_bytes(w)),
                 ))),
                 // Reported at the last index it would read: that is the one past the end.
-                None => Err(out_of_range(span, "bytes_u32_le", i + 3, b.len(), "bytes")),
+                None => Err(out_of_range(span, "Bytes::u32_le", i + 3, b.len(), "bytes")),
             }
         }
 
         Builtin::BytesSlice => {
-            let b = args[0].as_bytes(span, "`bytes_slice`")?;
+            let b = args[0].as_bytes(span, "`Bytes::slice`")?;
             let (start, end) =
-                range_args(&args[1], &args[2], b.len(), span, "bytes_slice", "bytes")?;
+                range_args(&args[1], &args[2], b.len(), span, "Bytes::slice", "bytes")?;
             Ok(Value::bytes(&b[start..end]))
         }
 
         Builtin::BytesConcat => {
-            let a = args[0].as_bytes(span, "`bytes_concat`")?;
-            let b = args[1].as_bytes(span, "`bytes_concat`")?;
+            let a = args[0].as_bytes(span, "`Bytes::concat`")?;
+            let b = args[1].as_bytes(span, "`Bytes::concat`")?;
             let mut out = Vec::with_capacity(a.len() + b.len());
             out.extend_from_slice(a);
             out.extend_from_slice(b);
@@ -827,14 +876,14 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         Builtin::BytesBlake3 => {
-            let b = args[0].as_bytes(span, "`bytes_blake3`")?;
+            let b = args[0].as_bytes(span, "`Bytes::blake3`")?;
             Ok(Value::bytes(blake3::hash(b).as_bytes()))
         }
 
         // At the best level, so what a writer seals is a function of the bytes alone.
         Builtin::BytesGzip => {
             use std::io::Write;
-            let b = args[0].as_bytes(span, "`bytes_gzip`")?;
+            let b = args[0].as_bytes(span, "`Bytes::gzip`")?;
             let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
             let sealed = gz.write_all(b).and_then(|()| gz.finish());
             Ok(Value::bytes(sealed.expect("writing to memory cannot fail")))
@@ -842,73 +891,73 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
 
         Builtin::BytesGunzip => {
             use std::io::Read;
-            let b = args[0].as_bytes(span, "`bytes_gunzip`")?;
+            let b = args[0].as_bytes(span, "`Bytes::gunzip`")?;
             let mut out = Vec::new();
             let read = flate2::read::GzDecoder::new(&b[..]).read_to_end(&mut out);
             Ok(option(read.ok().map(|_| Value::bytes(out))))
         }
 
         Builtin::BytesConcatAll => {
-            let pieces = args[0].as_list(span, "`bytes_concat_all`")?.clone();
+            let pieces = args[0].as_list(span, "`Bytes::concat_all`")?.clone();
             let mut total = 0usize;
             for piece in pieces.iter() {
-                total += piece.as_bytes(span, "`bytes_concat_all`")?.len();
+                total += piece.as_bytes(span, "`Bytes::concat_all`")?.len();
             }
             let mut out = Vec::with_capacity(total);
             for piece in pieces.iter() {
-                out.extend_from_slice(piece.as_bytes(span, "`bytes_concat_all`")?);
+                out.extend_from_slice(piece.as_bytes(span, "`Bytes::concat_all`")?);
             }
             Ok(Value::bytes(out))
         }
 
         Builtin::BytesOfString => {
-            let s = args[0].as_str(span, "`bytes_of_string`")?;
+            let s = args[0].as_str(span, "`Bytes::of_string`")?;
             Ok(Value::bytes(s.as_bytes()))
         }
 
         Builtin::BytesIsUtf8 => {
-            let b = args[0].as_bytes(span, "`bytes_is_utf8`")?;
+            let b = args[0].as_bytes(span, "`Bytes::is_utf8`")?;
             Ok(Value::Bool(std::str::from_utf8(b).is_ok()))
         }
 
         Builtin::BytesIndexOf => {
-            let hay = args[0].as_bytes(span, "`bytes_index_of`")?;
-            let needle = args[1].as_bytes(span, "`bytes_index_of`")?;
+            let hay = args[0].as_bytes(span, "`Bytes::index_of`")?;
+            let needle = args[1].as_bytes(span, "`Bytes::index_of`")?;
             Ok(position(find(hay, needle, 0)))
         }
 
         Builtin::BytesIndexOfFrom => {
-            let hay = args[0].as_bytes(span, "`bytes_index_of_from`")?;
-            let needle = args[1].as_bytes(span, "`bytes_index_of_from`")?;
-            let from = start_at(&args[2], hay.len(), span, "bytes_index_of_from")?;
+            let hay = args[0].as_bytes(span, "`Bytes::index_of_from`")?;
+            let needle = args[1].as_bytes(span, "`Bytes::index_of_from`")?;
+            let from = start_at(&args[2], hay.len(), span, "Bytes::index_of_from")?;
             Ok(position(find(hay, needle, from)))
         }
 
         Builtin::BytesIndexOfByte => {
-            let hay = args[0].as_bytes(span, "`bytes_index_of_byte`")?;
-            let byte = one_byte(&args[1], span, "bytes_index_of_byte")?;
+            let hay = args[0].as_bytes(span, "`Bytes::index_of_byte`")?;
+            let byte = one_byte(&args[1], span, "Bytes::index_of_byte")?;
             Ok(position(memchr::memchr(byte, hay)))
         }
 
         Builtin::BytesStartsWith => {
-            let b = args[0].as_bytes(span, "`bytes_starts_with`")?;
-            let prefix = args[1].as_bytes(span, "`bytes_starts_with`")?;
+            let b = args[0].as_bytes(span, "`Bytes::starts_with`")?;
+            let prefix = args[1].as_bytes(span, "`Bytes::starts_with`")?;
             Ok(Value::Bool(b.starts_with(prefix)))
         }
 
         Builtin::BytesEndsWith => {
-            let b = args[0].as_bytes(span, "`bytes_ends_with`")?;
-            let suffix = args[1].as_bytes(span, "`bytes_ends_with`")?;
+            let b = args[0].as_bytes(span, "`Bytes::ends_with`")?;
+            let suffix = args[1].as_bytes(span, "`Bytes::ends_with`")?;
             Ok(Value::Bool(b.ends_with(suffix)))
         }
 
         Builtin::BytesSplit => {
-            let b = args[0].as_bytes(span, "`bytes_split`")?;
-            let sep = args[1].as_bytes(span, "`bytes_split`")?;
+            let b = args[0].as_bytes(span, "`Bytes::split`")?;
+            let sep = args[1].as_bytes(span, "`Bytes::split`")?;
             if sep.is_empty() {
                 return Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
-                    "`bytes_split` needs a separator, and this one is empty",
+                    "`Bytes::split` needs a separator, and this one is empty",
                 )
                 .primary(span, "an empty separator matches everywhere and nowhere")
                 .note("pass the bytes that actually separate the parts, as in `b\"\\r\\n\"`"));
@@ -924,17 +973,17 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         Builtin::BytesScan => {
-            let b = args[0].as_bytes(span, "`bytes_scan`")?;
+            let b = args[0].as_bytes(span, "`Bytes::scan`")?;
             Ok(Value::Int(scan(args, b, span, false)?))
         }
 
         Builtin::BytesScanUntil => {
-            let b = args[0].as_bytes(span, "`bytes_scan_until`")?;
+            let b = args[0].as_bytes(span, "`Bytes::scan_until`")?;
             Ok(Value::Int(scan(args, b, span, true)?))
         }
 
         Builtin::StringOfBytes => {
-            let b = args[0].as_bytes(span, "`string_of_bytes`")?;
+            let b = args[0].as_bytes(span, "`String::of_bytes`")?;
             match std::str::from_utf8(b) {
                 Ok(s) => Ok(Value::str(s)),
                 Err(e) => Err(not_utf8(span, b, &e)),
@@ -942,12 +991,12 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         Builtin::StringOfBytesLossy => {
-            let b = args[0].as_bytes(span, "`string_of_bytes_lossy`")?;
+            let b = args[0].as_bytes(span, "`String::of_bytes_lossy`")?;
             Ok(Value::str(String::from_utf8_lossy(b)))
         }
 
         Builtin::CharOfInt => {
-            let n = args[0].as_int(span, "`char_of_int`")?;
+            let n = args[0].as_int(span, "`Char::of_int`")?;
             Ok(option(
                 u32::try_from(n)
                     .ok()
@@ -957,28 +1006,28 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         Builtin::IntOfChar => Ok(Value::Int(i64::from(u32::from(
-            args[0].as_char(span, "`int_of_char`")?,
+            args[0].as_char(span, "`Int::of_char`")?,
         )))),
 
         Builtin::StringChars => Ok(Value::list(
             args[0]
-                .as_str(span, "`string_chars`")?
+                .as_str(span, "`String::chars`")?
                 .chars()
                 .map(Value::Char)
                 .collect(),
         )),
 
         Builtin::StringOfChars => {
-            let items = args[0].as_list(span, "`string_of_chars`")?;
+            let items = args[0].as_list(span, "`String::of_chars`")?;
             let mut out = String::with_capacity(items.len());
             for c in items.iter() {
-                out.push(c.as_char(span, "`string_of_chars`")?);
+                out.push(c.as_char(span, "`String::of_chars`")?);
             }
             Ok(Value::str(out))
         }
 
         Builtin::StringLen => Ok(Value::Int(
-            args[0].as_str(span, "`string_len`")?.chars().count() as i64,
+            args[0].as_str(span, "`String::len`")?.chars().count() as i64,
         )),
 
         Builtin::ArrayNew | Builtin::ColumnsNew => {
@@ -1113,42 +1162,42 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 .map(Value::Int),
             other => Some(Value::Int(other.as_int(span, "`to_int`")?)),
         })),
-        Builtin::FloatOfInt => Ok(Value::Float(args[0].as_int(span, "`float_of_int`")? as f64)),
+        Builtin::FloatOfInt => Ok(Value::Float(args[0].as_int(span, "`Float::of_int`")? as f64)),
         Builtin::IntOfFloat => {
-            let x = args[0].as_float(span, "`int_of_float`")?;
-            let r = rounded(x, rounding(&args[1], span, "int_of_float")?);
+            let x = args[0].as_float(span, "`Int::of_float`")?;
+            let r = rounded(x, rounding(&args[1], span, "Int::of_float")?);
             Ok(option(int_of_whole(r).map(Value::Int)))
         }
         Builtin::Round => {
-            let x = args[0].as_float(span, "`round`")?;
+            let x = args[0].as_float(span, "`Float::round`")?;
             Ok(Value::Float(rounded(x, rounding(&args[1], span, "round")?)))
         }
-        Builtin::Floor => unary_float(&args[0], span, "`floor`", f64::floor),
-        Builtin::Ceil => unary_float(&args[0], span, "`ceil`", f64::ceil),
-        Builtin::Sqrt => unary_float(&args[0], span, "`sqrt`", f64::sqrt),
-        Builtin::Exp => unary_float(&args[0], span, "`exp`", float::exp),
-        Builtin::Ln => unary_float(&args[0], span, "`ln`", float::ln),
-        Builtin::Log2 => unary_float(&args[0], span, "`log2`", float::log2),
-        Builtin::Log10 => unary_float(&args[0], span, "`log10`", float::log10),
-        Builtin::Sin => unary_float(&args[0], span, "`sin`", float::sin),
-        Builtin::Cos => unary_float(&args[0], span, "`cos`", float::cos),
-        Builtin::Tan => unary_float(&args[0], span, "`tan`", float::tan),
-        Builtin::Asin => unary_float(&args[0], span, "`asin`", float::asin),
-        Builtin::Acos => unary_float(&args[0], span, "`acos`", float::acos),
-        Builtin::Atan => unary_float(&args[0], span, "`atan`", float::atan),
-        Builtin::Pow => binary_float(args, span, "`pow`", float::pow),
-        Builtin::Atan2 => binary_float(args, span, "`atan2`", float::atan2),
-        Builtin::Hypot => binary_float(args, span, "`hypot`", float::hypot),
+        Builtin::Floor => unary_float(&args[0], span, "`Float::floor`", f64::floor),
+        Builtin::Ceil => unary_float(&args[0], span, "`Float::ceil`", f64::ceil),
+        Builtin::Sqrt => unary_float(&args[0], span, "`Float::sqrt`", f64::sqrt),
+        Builtin::Exp => unary_float(&args[0], span, "`Float::exp`", float::exp),
+        Builtin::Ln => unary_float(&args[0], span, "`Float::ln`", float::ln),
+        Builtin::Log2 => unary_float(&args[0], span, "`Float::log2`", float::log2),
+        Builtin::Log10 => unary_float(&args[0], span, "`Float::log10`", float::log10),
+        Builtin::Sin => unary_float(&args[0], span, "`Float::sin`", float::sin),
+        Builtin::Cos => unary_float(&args[0], span, "`Float::cos`", float::cos),
+        Builtin::Tan => unary_float(&args[0], span, "`Float::tan`", float::tan),
+        Builtin::Asin => unary_float(&args[0], span, "`Float::asin`", float::asin),
+        Builtin::Acos => unary_float(&args[0], span, "`Float::acos`", float::acos),
+        Builtin::Atan => unary_float(&args[0], span, "`Float::atan`", float::atan),
+        Builtin::Pow => binary_float(args, span, "`Float::pow`", float::pow),
+        Builtin::Atan2 => binary_float(args, span, "`Float::atan2`", float::atan2),
+        Builtin::Hypot => binary_float(args, span, "`Float::hypot`", float::hypot),
 
         Builtin::StringSlice => {
-            let s = args[0].as_str(span, "`string_slice`")?;
+            let s = args[0].as_str(span, "`String::slice`")?;
             let chars = s.chars().count();
             let (start, end) = range_args(
                 &args[1],
                 &args[2],
                 chars,
                 span,
-                "string_slice",
+                "String::slice",
                 "characters",
             )?;
             let from = char_offset(s, start);
@@ -1157,12 +1206,12 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         Builtin::StringSplit => {
-            let s = args[0].as_str(span, "`string_split`")?;
-            let sep = args[1].as_str(span, "`string_split`")?;
+            let s = args[0].as_str(span, "`String::split`")?;
+            let sep = args[1].as_str(span, "`String::split`")?;
             if sep.is_empty() {
                 return Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
-                    "`string_split` needs a separator, and this one is empty",
+                    "`String::split` needs a separator, and this one is empty",
                 )
                 .primary(span, "an empty separator matches everywhere and nowhere")
                 .note("pass the text that actually separates the parts, as in \"\\r\\n\""));
@@ -1171,45 +1220,45 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         // These three read `std`'s Unicode tables, so their answers move if those tables do.
-        Builtin::StringTrim => Ok(Value::str(args[0].as_str(span, "`string_trim`")?.trim())),
+        Builtin::StringTrim => Ok(Value::str(args[0].as_str(span, "`String::trim`")?.trim())),
 
         Builtin::StringLower => Ok(Value::str(
-            args[0].as_str(span, "`string_lower`")?.to_lowercase(),
+            args[0].as_str(span, "`String::lower`")?.to_lowercase(),
         )),
 
         Builtin::StringUpper => Ok(Value::str(
-            args[0].as_str(span, "`string_upper`")?.to_uppercase(),
+            args[0].as_str(span, "`String::upper`")?.to_uppercase(),
         )),
 
         Builtin::StringStartsWith => {
-            let s = args[0].as_str(span, "`string_starts_with`")?;
-            let prefix = args[1].as_str(span, "`string_starts_with`")?;
+            let s = args[0].as_str(span, "`String::starts_with`")?;
+            let prefix = args[1].as_str(span, "`String::starts_with`")?;
             Ok(Value::Bool(s.starts_with(prefix)))
         }
 
         Builtin::StringEndsWith => {
-            let s = args[0].as_str(span, "`string_ends_with`")?;
-            let suffix = args[1].as_str(span, "`string_ends_with`")?;
+            let s = args[0].as_str(span, "`String::ends_with`")?;
+            let suffix = args[1].as_str(span, "`String::ends_with`")?;
             Ok(Value::Bool(s.ends_with(suffix)))
         }
 
         Builtin::StringContains => {
-            let s = args[0].as_str(span, "`string_contains`")?;
-            let needle = args[1].as_str(span, "`string_contains`")?;
+            let s = args[0].as_str(span, "`String::contains`")?;
+            let needle = args[1].as_str(span, "`String::contains`")?;
             Ok(Value::Bool(s.contains(needle)))
         }
 
         Builtin::StringFind => {
-            let s = args[0].as_str(span, "`string_find`")?;
-            let needle = args[1].as_str(span, "`string_find`")?;
+            let s = args[0].as_str(span, "`String::find`")?;
+            let needle = args[1].as_str(span, "`String::find`")?;
             match s.find(needle) {
                 Some(at) => Ok(Value::Int(s[..at].chars().count() as i64)),
                 None => Err(Diagnostic::error(
                     codes::RUNTIME_ERROR,
-                    format!("`string_find` did not find {} in {}", slot(0), slot(1)),
+                    format!("`String::find` did not find {} in {}", slot(0), slot(1)),
                 )
                 .primary(span, "this substring does not occur")
-                .note("guard with `string_contains`, which answers the same question as a `Bool`")
+                .note("guard with `String::contains`, which answers the same question as a `Bool`")
                 .showing(vec![
                     Plain::Str(needle.to_string()),
                     Plain::Str(s.to_string()),
@@ -1261,12 +1310,12 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         Builtin::DecimalDiv => {
-            let a = args[0].as_decimal(span, "`decimal_div`")?;
-            let b = args[1].as_decimal(span, "`decimal_div`")?;
-            let scale = decimal_scale(&args[2], span, "decimal_div")?;
-            let mode = rounding(&args[3], span, "decimal_div")?;
+            let a = args[0].as_decimal(span, "`Decimal::div`")?;
+            let b = args[1].as_decimal(span, "`Decimal::div`")?;
+            let scale = decimal_scale(&args[2], span, "Decimal::div")?;
+            let mode = rounding(&args[3], span, "Decimal::div")?;
             if b.is_zero() {
-                return Err(crate::semantics::err_zero_divisor(span, "`decimal_div`"));
+                return Err(crate::semantics::err_zero_divisor(span, "`Decimal::div`"));
             }
             decimal_quotient(a, b, scale, mode)
                 .map(Value::Decimal)
@@ -1274,54 +1323,54 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         Builtin::DecimalRound => {
-            let d = args[0].as_decimal(span, "`decimal_round`")?;
-            let scale = decimal_scale(&args[1], span, "decimal_round")?;
-            let mode = rounding(&args[2], span, "decimal_round")?;
+            let d = args[0].as_decimal(span, "`Decimal::round`")?;
+            let scale = decimal_scale(&args[1], span, "Decimal::round")?;
+            let mode = rounding(&args[2], span, "Decimal::round")?;
             decimal_quotient(d, Decimal::ONE, scale, mode)
                 .map(Value::Decimal)
                 .ok_or_else(|| decimal_overflow(span, "rounding"))
         }
 
         Builtin::DecimalOfInt => Ok(Value::Decimal(Decimal::from(
-            args[0].as_int(span, "`decimal_of_int`")?,
+            args[0].as_int(span, "`Decimal::of_int`")?,
         ))),
 
         Builtin::IntOfDecimal => {
-            let d = args[0].as_decimal(span, "`int_of_decimal`")?;
-            let mode = rounding(&args[1], span, "int_of_decimal")?;
+            let d = args[0].as_decimal(span, "`Int::of_decimal`")?;
+            let mode = rounding(&args[1], span, "Int::of_decimal")?;
             Ok(option(
                 d.round_dp_with_strategy(0, mode).to_i64().map(Value::Int),
             ))
         }
 
         Builtin::FloatOfDecimal => {
-            let d = args[0].as_decimal(span, "`float_of_decimal`")?;
+            let d = args[0].as_decimal(span, "`Float::of_decimal`")?;
             Ok(Value::Float(float_of_decimal(d)))
         }
 
         Builtin::DecimalOfFloat => {
-            let f = args[0].as_float(span, "`decimal_of_float`")?;
+            let f = args[0].as_float(span, "`Decimal::of_float`")?;
             Ok(option(decimal_of_float(f).map(Value::Decimal)))
         }
 
         Builtin::DecimalOfString => {
-            let s = args[0].as_str(span, "`decimal_of_string`")?;
+            let s = args[0].as_str(span, "`Decimal::of_string`")?;
             Ok(option(parse_decimal(s).map(Value::Decimal)))
         }
 
         Builtin::FloatOfString => {
-            let s = args[0].as_str(span, "`float_of_string`")?;
+            let s = args[0].as_str(span, "`Float::of_string`")?;
             Ok(option(parse_float(s).map(Value::Float)))
         }
 
-        // Keeps the scale (`1.50m` renders `1.50`), so it round-trips `decimal_of_string`.
+        // Keeps the scale (`1.50m` renders `1.50`), so it round-trips `Decimal::of_string`.
         Builtin::DecimalToString => {
-            let d = args[0].as_decimal(span, "`decimal_to_string`")?;
+            let d = args[0].as_decimal(span, "`Decimal::to_string`")?;
             Ok(Value::str(d.to_string()))
         }
 
         Builtin::DecimalScale => {
-            let d = args[0].as_decimal(span, "`decimal_scale`")?;
+            let d = args[0].as_decimal(span, "`Decimal::scale`")?;
             Ok(Value::Int(i64::from(d.scale())))
         }
 
@@ -1331,7 +1380,7 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         Builtin::FloatOfBits => {
-            let n = args[0].as_int(span, "`float_of_bits`")?;
+            let n = args[0].as_int(span, "`Float::of_bits`")?;
             Ok(Value::Float(f64::from_bits(n as u64)))
         }
 
@@ -1354,15 +1403,15 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         Builtin::SecretOfString => Ok(Value::secret_text(
-            args[0].as_str(span, "`secret_of_string`")?,
+            args[0].as_str(span, "`Secret::of_string`")?,
         )),
 
         // Constant time but not rate limited: preventing a guessing loop is the program's job.
         Builtin::SecretVerify => {
             let Value::Secret(held) = &args[0] else {
-                return Err(type_error(span, "`secret_verify`", "Secret", &args[0]));
+                return Err(type_error(span, "`Secret::verify`", "Secret", &args[0]));
             };
-            let candidate = args[1].as_str(span, "`secret_verify`")?;
+            let candidate = args[1].as_str(span, "`Secret::verify`")?;
             Ok(Value::Bool(
                 held.is_text()
                     && crate::value::constant_time_eq(held.bytes(), candidate.as_bytes()),
@@ -1371,13 +1420,13 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
 
         Builtin::SecretIsEmpty => {
             let Value::Secret(held) = &args[0] else {
-                return Err(type_error(span, "`secret_is_empty`", "Secret", &args[0]));
+                return Err(type_error(span, "`Secret::is_empty`", "Secret", &args[0]));
             };
             Ok(Value::Bool(held.bytes().is_empty()))
         }
 
         Builtin::SecretOfBytes => Ok(Value::secret_bytes(
-            args[0].as_bytes(span, "`secret_of_bytes`")?,
+            args[0].as_bytes(span, "`Secret::of_bytes`")?,
         )),
         Builtin::SecretEncode => crate::crypto::encode(&args[0], &args[1], span),
         Builtin::SecretRsaJwk => crate::crypto::rsa_jwk(args, span),
@@ -1570,7 +1619,7 @@ fn decimal_of_float(f: f64) -> Option<Decimal> {
     parse_decimal(&format!("{f}"))
 }
 
-/// The nearest `f64`, so `float_of_decimal(decimal_of_float(f)) == f` wherever defined.
+/// The nearest `f64`, so `Float::of_decimal(decimal_of_float(f)) == f` wherever defined.
 fn float_of_decimal(d: Decimal) -> f64 {
     d.to_string()
         .parse::<f64>()
@@ -1674,9 +1723,9 @@ fn bytes_arg<'a>(
 
 fn scan(args: &[Value], hay: &[u8], span: Span, want: bool) -> Result<i64, Diagnostic> {
     let what = if want {
-        "bytes_scan_until"
+        "Bytes::scan_until"
     } else {
-        "bytes_scan"
+        "Bytes::scan"
     };
     let from = start_at(&args[1], hay.len(), span, what)?;
     let members = bytes_arg(&args[2], span, what)?;
@@ -1685,7 +1734,7 @@ fn scan(args: &[Value], hay: &[u8], span: Span, want: bool) -> Result<i64, Diagn
 
     // `memchr` is SIMD and the bitmap loop is not, so small sets take it.
     let found = match (want, members.as_ref()) {
-        // Empty class: `bytes_scan_until` runs out the window, `bytes_scan` stops at once.
+        // Empty class: `Bytes::scan_until` runs out the window, `Bytes::scan` stops at once.
         (true, []) => None,
         (true, [a]) => memchr::memchr(*a, window),
         (true, [a, b]) => memchr::memchr2(*a, *b, window),
@@ -1729,7 +1778,7 @@ fn budget(v: &Value, span: Span, what: &str) -> Result<usize, Diagnostic> {
             format!("`{what}` was given a negative budget of {max}"),
         )
         .primary(span, "a scan cannot examine a negative number of bytes")
-        .note("pass `0` to examine nothing, or `bytes_len(b)` to leave it unbounded")
+        .note("pass `0` to examine nothing, or `Bytes::len(b)` to leave it unbounded")
     })
 }
 
@@ -1741,7 +1790,7 @@ fn one_byte(v: &Value, span: Span, what: &str) -> Result<u8, Diagnostic> {
             format!("`{what}` was given {byte}, which is not a byte"),
         )
         .primary(span, "a byte is `0` to `255`")
-        .note("`bytes_at` answers in that range, and so does a byte literal's element")
+        .note("`Bytes::at` answers in that range, and so does a byte literal's element")
     })
 }
 
@@ -1789,10 +1838,10 @@ fn not_utf8(span: Span, b: &[u8], e: &std::str::Utf8Error) -> Diagnostic {
     };
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("`string_of_bytes` was given bytes that are not UTF-8: {what}"),
+        format!("`String::of_bytes` was given bytes that are not UTF-8: {what}"),
     )
     .primary(span, format!("byte {at} of {} is where it fails", b.len()))
-    .note("guard with `bytes_is_utf8`, or use `string_of_bytes_lossy` to accept U+FFFD")
+    .note("guard with `Bytes::is_utf8`, or use `String::of_bytes_lossy` to accept U+FFFD")
 }
 
 #[cold]

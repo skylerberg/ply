@@ -31,6 +31,23 @@ fn every_builtin_has_a_helper_of_its_own() {
     }
 }
 
+/// A unit the last release emitted names a builtin its own way, and calls it through the helper
+/// that name made.
+#[test]
+fn a_builtin_answers_to_the_name_the_last_release_has_for_it() {
+    use ply_eval::Builtin;
+    assert_eq!(Builtin::named("len"), Builtin::from_name("List::len"));
+    assert_eq!(Builtin::named("map_get"), Builtin::from_name("Map::get"));
+    assert_eq!(Builtin::named("List::len"), Builtin::from_name("List::len"));
+    assert_eq!(Builtin::named("range"), Builtin::from_name("range"));
+    assert_eq!(Builtin::named("nothing"), None);
+    assert!(Builtin::from_name("List::len").is_some());
+    let named = |name: &str| helpers().iter().filter(|h| h.name == name).count();
+    assert_eq!(named("builtin_len"), 1);
+    assert_eq!(named("builtin_list_len"), 1);
+    assert_eq!(named("builtin_map_get"), 1);
+}
+
 #[test]
 fn the_prelude_agrees_with_the_layouts_it_mirrors() {
     assert_eq!(ply_codegen::heap::HEADER, 16, "PLY_HEADER");

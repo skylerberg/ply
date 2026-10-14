@@ -82,7 +82,7 @@ fn compare_values_refuses_a_secret_at_run_time() {
     .expect_err("a credential has no order");
     assert_eq!(d.code, codes::RUNTIME_ERROR);
     assert!(
-        d.notes.iter().any(|n| n.contains("secret_verify")),
+        d.notes.iter().any(|n| n.contains("Secret::verify")),
         "{d:#?}"
     );
     assert!(!format!("{d:#?}").contains("\"a\""), "{d:#?}");
@@ -153,7 +153,7 @@ fn map_of_entries_refuses_a_secret_key() {
         ])],
         ply_eval::Span::DUMMY,
     );
-    let d = refused.expect_err("`map_of_entries` refuses a `Secret` key");
+    let d = refused.expect_err("`Map::of_entries` refuses a `Secret` key");
     assert_eq!(d.code, codes::RUNTIME_ERROR, "{d:#?}");
     assert!(
         d.message.contains("cannot order a `Secret`"),
@@ -171,7 +171,7 @@ fn map_merge_refuses_a_secret_key() {
         vec![Value::empty_map(), right],
         ply_eval::Span::DUMMY,
     );
-    let d = refused.expect_err("`map_merge` refuses a `Secret` key");
+    let d = refused.expect_err("`Map::merge` refuses a `Secret` key");
     assert_eq!(d.code, codes::RUNTIME_ERROR, "{d:#?}");
     assert!(d.message.contains("cannot order a `Secret`"), "{d:#?}");
 }
@@ -255,14 +255,14 @@ fn every_map_operation_that_orders_a_key_refuses_a_secret() {
             d.message
         );
     }
-    // No `Secret` is a native key, so `map_update` always reaches its key through `take`.
+    // No `Secret` is a native key, so `Map::update` always reaches its key through `take`.
     let d = ply_eval::map::take(Value::empty_map(), &secret, ply_eval::Span::DUMMY)
-        .expect_err("`map_update` refuses a `Secret` key");
+        .expect_err("`Map::update` refuses a `Secret` key");
     assert_eq!(d.code, codes::RUNTIME_ERROR, "{d:#?}");
     assert!(d.message.contains("cannot order a `Secret`"), "{d:#?}");
 }
 
-/// A `{key, value}` record, as `map_of_entries` reads one.
+/// A `{key, value}` record, as `Map::of_entries` reads one.
 fn entry(k: Value, v: Value) -> Value {
     use std::collections::BTreeMap;
     let mut fields = BTreeMap::new();

@@ -1151,7 +1151,7 @@ fn a_secret_write_refuses_a_plain_body_an_unknown_encoding_and_a_path_out_of_the
             Value::bytes(b""),
         ],
     )
-    .expect_err("a typed text is read by `secret_decode` alone");
+    .expect_err("a typed text is read by `Secret::decode` alone");
     assert_eq!(unread.code, codes::RUNTIME_ERROR);
     let escaped = write_secret(&fs, "../out.key", &key, "hex").expect_err("it leaves the root");
     assert_eq!(escaped.code, codes::FS_PATH_ESCAPES_ROOT);

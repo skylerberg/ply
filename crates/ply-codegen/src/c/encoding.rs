@@ -94,8 +94,7 @@ pub(super) fn decode_pools(s: &str, at: &mut usize) -> Option<Pools> {
     }
     let n = count(line(s, at)?, "builtins")?;
     for _ in 0..n {
-        t.builtins
-            .push(Builtin::from_name(&Symbol::new(line(s, at)?))?);
+        t.builtins.push(Builtin::named(&Symbol::new(line(s, at)?))?);
     }
     let n = count(line(s, at)?, "fields")?;
     for _ in 0..n {

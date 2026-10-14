@@ -314,8 +314,8 @@ fn an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way() {
     assert_eq!(
         shape(&m),
         shape(&other),
-        "two `==`-equal maps render as two different strings, so `map_keys`, `map_entries`, \
-         `map_fold` and every derived encoding over them are functions of insertion history"
+        "two `==`-equal maps render as two different strings, so `Map::keys`, `Map::entries`, \
+         `Map::fold` and every derived encoding over them are functions of insertion history"
     );
 }
 

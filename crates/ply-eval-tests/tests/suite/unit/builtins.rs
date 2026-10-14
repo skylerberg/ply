@@ -366,7 +366,7 @@ fn split_round_trips_against_a_join_and_refuses_an_empty_separator() {
             .collect();
         let split = done(Builtin::BytesSplit, vec![bytes(&hay), bytes(&sep)]).unwrap();
         let Value::List(pieces) = &split else {
-            panic!("`bytes_split` answers a list");
+            panic!("`Bytes::split` answers a list");
         };
         let mut joined: Vec<u8> = Vec::new();
         for (i, piece) in pieces.iter().enumerate() {
@@ -374,7 +374,7 @@ fn split_round_trips_against_a_join_and_refuses_an_empty_separator() {
                 joined.extend_from_slice(&sep);
             }
             let Value::Bytes(p) = piece else {
-                panic!("`bytes_split` answers a list of Bytes");
+                panic!("`Bytes::split` answers a list of Bytes");
             };
             joined.extend_from_slice(p);
         }
@@ -549,7 +549,7 @@ fn the_scans_agree_with_the_folds_they_replace() {
             .collect();
         let len = head.len() as i64;
 
-        // `bytes_index_of_byte`, absent as `None` rather than as `-1`.
+        // `Bytes::index_of_byte`, absent as `None` rather than as `-1`.
         let byte = b'\n';
         let native = at(&done(
             Builtin::BytesIndexOfByte,
@@ -608,7 +608,7 @@ fn the_byte_searches_index_in_bytes_where_the_string_ones_index_in_characters() 
         Value::Int(5)
     );
 
-    // A byte search may cut a character, and `string_of_bytes` refuses the piece.
+    // A byte search may cut a character, and `String::of_bytes` refuses the piece.
     let cut = done(
         Builtin::BytesSlice,
         vec![bytes(text.as_bytes()), Value::Int(0), Value::Int(2)],
@@ -662,12 +662,12 @@ fn the_case_builtins_map_by_unicode_and_not_one_character_to_one() {
         assert_eq!(
             found(Builtin::StringLower, vec![Value::str(text)]),
             Value::str(lower),
-            "`string_lower({text:?})`"
+            "`String::lower({text:?})`"
         );
         assert_eq!(
             found(Builtin::StringUpper, vec![Value::str(text)]),
             Value::str(upper),
-            "`string_upper({text:?})`"
+            "`String::upper({text:?})`"
         );
     }
 }
@@ -734,7 +734,7 @@ fn a_decimal_quotient_has_the_scale_asked_for_and_is_rounded_once() {
         assert_eq!(
             written(found(Builtin::DecimalDiv, args)),
             want,
-            "`decimal_div({a}, {b}, {scale}, {rounding})`"
+            "`Decimal::div({a}, {b}, {scale}, {rounding})`"
         );
     }
 }
@@ -763,7 +763,7 @@ fn a_decimal_rounding_rounds_what_is_past_its_scale_and_fills_what_is_short_of_i
         assert_eq!(
             written(found(Builtin::DecimalRound, args)),
             want,
-            "`decimal_round({d}, {scale}, {rounding})`"
+            "`Decimal::round({d}, {scale}, {rounding})`"
         );
     }
 }
@@ -811,7 +811,7 @@ fn a_decimal_scale_is_the_digits_after_its_point_zeros_included() {
         assert_eq!(
             found(Builtin::DecimalScale, vec![decimal(d)]),
             Value::Int(want),
-            "`decimal_scale({d})`"
+            "`Decimal::scale({d})`"
         );
     }
     let filled = found(
@@ -861,12 +861,12 @@ fn a_decimal_quotient_agrees_with_an_exact_division_rounded_over_ten_thousand_pa
         };
         assert_eq!(
             got, want,
-            "case {case}: `decimal_div({a}, {b}, {scale}, {name})`"
+            "case {case}: `Decimal::div({a}, {b}, {scale}, {name})`"
         );
         assert_eq!(
             got.scale(),
             scale,
-            "case {case}: `decimal_div({a}, {b}, {scale}, {name})` is {got}"
+            "case {case}: `Decimal::div({a}, {b}, {scale}, {name})` is {got}"
         );
     }
 }
@@ -916,7 +916,7 @@ fn list_set_replaces_one_element_keeps_the_original_and_raises_outside_the_list(
             vec![xs.clone(), Value::Int(i), Value::Int(0)],
         )
         .unwrap_err();
-        assert_eq!(d.code, codes::RUNTIME_ERROR, "list_set(xs, {i}, 0)");
+        assert_eq!(d.code, codes::RUNTIME_ERROR, "List::set(xs, {i}, 0)");
         assert!(
             d.message.contains("outside a value of 3 elements"),
             "{}",
@@ -1159,7 +1159,7 @@ fn an_array_is_read_by_index_and_written_through_its_last_holder() {
     }
     for n in [-1, MAX_ARRAY_LEN + 1] {
         let d = done(Builtin::ArrayNew, vec![Value::Int(n), Value::Unit]).unwrap_err();
-        assert_eq!(d.code, codes::RUNTIME_ERROR, "array_new({n})");
+        assert_eq!(d.code, codes::RUNTIME_ERROR, "Array::new({n})");
     }
 }
 

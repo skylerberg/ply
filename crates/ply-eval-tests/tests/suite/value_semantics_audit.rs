@@ -191,8 +191,8 @@ fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
     assert_eq!(
         format!("{long_then_short:?}"),
         "Map([(Decimal(1.5), Int(2))])",
-        "two `==`-equal maps render as two different strings, so `map_keys`, `map_entries`, \
-         `map_fold` and every derived encoding over them are functions of insertion history"
+        "two `==`-equal maps render as two different strings, so `Map::keys`, `Map::entries`, \
+         `Map::fold` and every derived encoding over them are functions of insertion history"
     );
 }
 

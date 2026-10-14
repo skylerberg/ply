@@ -36,7 +36,7 @@ fn set_tail_len(o: *mut Obj, v: usize) {
     unsafe { (*o).flags = v as u8 }
 }
 
-/// The list's length: what `len` answers.
+/// The list's length: what `List::len` answers.
 pub fn len(o: *mut Obj) -> usize {
     unsafe { (*o).len as usize }
 }
