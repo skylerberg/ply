@@ -237,6 +237,9 @@ builtins! { $
     Shown = "shown", 1, ends;
     /// BLAKE3 of the value's canonical encoding, under `derivable(hash, a)`.
     Digest = "digest", 1, ends;
+    /// The value's canonical encoding, whose BLAKE3 is its `digest`: what code written from a type
+    /// reads of a part it does not lay out itself. No source can spell it.
+    Encoded = "?encoded", 1, ends;
     /// `bracket(acquire, release, body)`: `release` runs on every exit from `body` but a failure.
     Bracket = "bracket", 3, ends;
     /// An operator over a `numeric` or `integer` type parameter: `?numeric_binary(op, witness, x,
@@ -1029,6 +1032,7 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::Shown => Ok(crate::reflect::shown_of(&args[0])),
 
         Builtin::Digest => Ok(Value::bytes(crate::digest::digest(&args[0], span)?)),
+        Builtin::Encoded => Ok(Value::bytes(&crate::digest::encoded(&args[0], span)?)),
 
         Builtin::NumericBinary => {
             let op = numeric_op(&args[0], span)?;

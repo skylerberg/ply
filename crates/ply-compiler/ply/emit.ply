@@ -252,7 +252,9 @@ fn builtin_needed(emitter: Emitter, written: Bytes, at: Span) -> Emitter = {
   match emitter.typed.get(span_key(at)) {
     None -> emitter,
     Some(t) -> if name == b"compare" || name == b"compare_values" || name == b"reflect"
-        || name == b"shown" { t.args.fold(emitter, |e: Emitter, a: Type| exact_needed(e, a)) }
+        || name == b"shown"
+        || name == b"digest"
+        || name == b"?encoded" { t.args.fold(emitter, |e: Emitter, a: Type| exact_needed(e, a)) }
     else if name == b"Array::get" || name == b"Columns::get" {
       match t.args.at(0) {
         Some(element) -> if laid_field(b"e", element) == None { layout_needed(emitter, element) }
@@ -5486,6 +5488,18 @@ fn width_builtin(
     match reflection_at(emitter, at) {
       None -> None,
       Some(r) -> reflected(emitter, name == b"shown", r, args, params, span),
+    }
+  } else if (name == b"digest" || name == b"?encoded") && args.len() == 1 {
+    match encoding_at(emitter, at) {
+      None -> None,
+      Some(ty) -> match args_evaled(emitter, args, params, 0, []) {
+        None -> None,
+        Some(e0) -> {
+          let bytes = written_call(site(e0.emitter, span), b"digest", ty, nth_value(e0.vals, 0));
+          if name == b"?encoded" { Some(bytes) }
+          else { Some(builtin_call(bytes.emitter, b"Bytes::blake3", [bytes.value])) }
+        },
+      },
     }
   } else if (name == b"compare" || name == b"compare_values") && args.len() == 2
       && ordered_at(emitter, at) != None {
@@ -12751,7 +12765,7 @@ pub fn derived_of(root: Bytes) -> Option<Bytes> / {abort.raise} =
     Some(root.slice(0, root.len() - 3))
   } else if root.len() > 4 && root.slice(root.len() - 4, root.len()) == b"#cmp" {
     Some(root.slice(0, root.len() - 4))
-  } else { match reflection_of(root) { Some(r) -> Some(spelled_type(r.ty)), None -> None } }
+  } else { match written_root_of(root) { Some(r) -> Some(spelled_type(r.ty)), None -> None } }
 
 /// Whether two values of the declared sum `t` are equal: one of no constructor's argument by the
 /// constructor its header names, any other as `T#eq` compares them; the negation for `!=`.
@@ -13122,28 +13136,31 @@ fn reflection_made(
       let name = from_table(wide.emitter, LStr(w.name));
       value_ctor(name.emitter, b"std.value.VFixed", [name.value, wide.value])
     },
-    RRoot(ty) -> {
-      let root = reflection_root(emitter.module, shown, ty);
-      let taken = Whole(reflected_kind(ty));
-      let a = carried_value(emitter, v, taken);
-      let noted = {
-        ..note_call(a.emitter, root),
-        generics: {
-          ..a.emitter.generics,
-          expects: a.emitter.generics.expects.push({
-            callee: root,
-            head: { answer: b"Word", params: carried_types(taken) },
-          }),
-        },
-      };
-      let e = bind(
-        noted,
-        KBoxed,
-        Bytes::concat_all([symbol_of(root), b"(ctx, ", bytes_join(a.names, b", "), b")"]),
-      );
-      { emitter: check(e.emitter), value: e.value }
-    },
+    RRoot(ty) -> written_call(emitter, if shown { b"shown" } else { b"reflect" }, ty, v),
   }
+
+/// What the root that writes `op` of a value of `ty` answers for `v`, which it takes.
+fn written_call(emitter: Emitter, op: Bytes, ty: Type, v: CValue) -> WithValue / {abort.raise} = {
+  let root = written_root(emitter.module, op, ty);
+  let taken = Whole(reflected_kind(ty));
+  let a = carried_value(emitter, v, taken);
+  let noted = {
+    ..note_call(a.emitter, root),
+    generics: {
+      ..a.emitter.generics,
+      expects: a.emitter.generics.expects.push({
+        callee: root,
+        head: { answer: b"Word", params: carried_types(taken) },
+      }),
+    },
+  };
+  let e = bind(
+    noted,
+    KBoxed,
+    Bytes::concat_all([symbol_of(root), b"(ctx, ", bytes_join(a.names, b", "), b")"]),
+  );
+  { emitter: check(e.emitter), value: e.value }
+}
 
 /// The constructor `name`, program-wide, of `vals`, which it takes, each held as the constructor
 /// holds that argument.
@@ -13183,9 +13200,14 @@ fn reflected_kind(ty: Type) -> Kind =
     Fields(_) -> KBoxed,
   }
 
-/// The root that reflects a value of `ty`, as `reflect` or as `shown` does: a declared sum's in the
-/// module declaring it, which says how it is shown, and any other type's in `module`.
-pub fn reflection_root(module: Bytes, shown: Bool, ty: Type) -> Bytes / {abort.raise} = {
+/// The root that reflects a value of `ty`, as `reflect` or as `shown` does.
+pub fn reflection_root(module: Bytes, shown: Bool, ty: Type) -> Bytes / {abort.raise} =
+  written_root(module, if shown { b"shown" } else { b"reflect" }, ty)
+
+/// The root that writes `op` of a value of `ty`: its reflection as `reflect` or `shown` reads it, or
+/// the encoding `digest` hashes. A declared sum's is in the module declaring it, which says how it
+/// is shown and keyed, and any other type's in `module`.
+pub fn written_root(module: Bytes, op: Bytes, ty: Type) -> Bytes / {abort.raise} = {
   let home = match ty {
     TyCon(c) -> {
       let dot = range(0, c.name.len()).fold(0 - 1, |acc: Int, i: Int|
@@ -13194,32 +13216,191 @@ pub fn reflection_root(module: Bytes, shown: Bool, ty: Type) -> Bytes / {abort.r
     },
     _ -> module,
   };
-  Bytes::concat_all([home, if shown { b".shown#" } else { b".reflect#" }, spelled_type(ty)])
+  Bytes::concat_all([home, b".", op, b"#", spelled_type(ty)])
 }
 
-/// The module a root `reflection_root` names is written in, whether it reflects as `shown` does, and
-/// the type it reflects; `None` for any other root.
-pub fn reflection_of(
+/// The module a root `written_root` names is written in, what it writes, and the type it is written
+/// for; `None` for any other root.
+pub fn written_root_of(
   root: Bytes,
-) -> Option<{ module: Bytes, shown: Bool, ty: Type }> / {abort.raise} =
+) -> Option<{ module: Bytes, op: Bytes, ty: Type }> / {abort.raise} =
   match root.index_of(b"#") {
     None -> None,
     Some(h) -> {
       let head = root.slice(0, h);
-      let shown = head.ends_with(b".shown");
-      if !shown && !head.ends_with(b".reflect") { None } else {
-        match type_spelled(root.slice(h + 1, root.len())) {
+      match [b"reflect", b"shown", b"digest"].fold(None, |acc: Option<Bytes>, o: Bytes|
+          if head.ends_with(b".".concat(o)) { Some(o) } else { acc }) {
+        None -> None,
+        Some(op) -> match type_spelled(root.slice(h + 1, root.len())) {
           None -> None,
-          Some(ty) ->
-            Some({
-              module: head.slice(0, head.len() - (if shown { 6 } else { 8 })),
-              shown: shown,
-              ty: ty,
-            }),
-        }
+          Some(ty) -> Some({ module: head.slice(0, head.len() - op.len() - 1), op: op, ty: ty }),
+        },
       }
     },
   }
+
+/// The type the call of `digest` or of `?encoded` at `at` writes an encoding of through a root:
+/// a record or a declared sum, which the runtime would read by its shape.
+fn encoding_at(emitter: Emitter, at: Span) -> Option<Type> =
+  match emitter.typed.get(span_key(at)) {
+    None -> None,
+    Some(t) -> match t.args.at(0) {
+      None -> None,
+      Some(ty) -> if has_vars(ty) { None } else {
+        match ty {
+          TyCon(c) -> if emitter.ctors.sums.contains(c.name) { Some(ty) } else { None },
+          TyRecord(_) -> Some(ty),
+          TyNominal(_) -> Some(ty),
+          _ -> None,
+        }
+      },
+    },
+  }
+
+/// `n`'s low 64 bits, least significant byte first.
+fn le64(n: Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all(range(0, 8).map(|i: Int| byte_of_int(n >> 8 * i & 255)))
+
+/// The body of a root `written_root` names for `digest`, over its parameter `a`, a value of `ty`,
+/// and the types it files: the encoding `digest.rs` writes, a record's and a constructor's own
+/// bytes written here and each part's encoding at its type. A type whose module states `key` is its
+/// key's encoding; one stated generic is read by the runtime.
+fn digest_code(
+  module: Bytes,
+  ctors: Ctors,
+  here: List<Def>,
+  items: List<Item>,
+  ty: Type,
+) -> { code: Code, typed: Map<Bytes, Typed> } / {abort.raise} = {
+  let at = |node: Node| { own: Borrowed, node: node, span: dummy_span() };
+  let placed = |k: Int| { start: 0, end: k, gen: 1 };
+  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
+  let named = |name: Bytes| at(NVar({ name: name, slot: None }));
+  let call = |f: Code, args: List<Code>| at(NApp({ func: f, args: args }));
+  let written = |b: Bytes| at(NLit(LBytes(b)));
+  let counted = |tag: Int, n: Int| byte_of_int(tag).concat(le64(n));
+  let blob = |tag: Int, b: Bytes| counted(tag, b.len()).concat(b);
+  // `x` encoded at its type: a call the emitter settles by what is filed at `k`.
+  let part = |x: Code, k: Int|
+    at(
+      NApp({
+        func: { own: Borrowed, node: NVar({ name: b"?encoded", slot: None }), span: placed(k) },
+        args: [x],
+      }),
+    );
+  let parted = |m: Map<Bytes, Typed>, t: Type, k: Int|
+    m.insert(span_key(placed(k)), filed_as(unknown_type(), [t]));
+  let joined = |parts: List<Code>| call(named(b"?concat"), [at(NList({ items: parts }))]);
+  // The runtime's encoding, of a type this root cannot write.
+  let read = { code: marked(part(var(b"a", 0), 1)), typed: Map::new() };
+  let fields_of = match ty { TyRecord(fs) -> Some(fs), TyNominal(x) -> Some(x.fields), _ -> None };
+  match fields_of {
+    Some(fs) -> {
+      let walked = range(0, fs.len()).fold(
+        { parts: [written(counted(12, fs.len()))], typed: Map::new() },
+        |acc: { parts: List<Code>, typed: Map<Bytes, Typed> }, i: Int|
+          match fs.at(i) {
+            None -> acc,
+            Some(f) ->
+              {
+                parts: acc.parts.concat([
+                  written(blob(13, f.name)),
+                  part(at(NField({ base: var(b"a", 0), field: f.name })), i + 1),
+                ]),
+                typed: parted(acc.typed, f.ty, i + 1),
+              },
+          },
+      );
+      { code: marked(joined(walked.parts)), typed: walked.typed }
+    },
+    None -> match ty {
+      TyCon(c) -> match ctors.sums.get(c.name) {
+        None -> read,
+        Some(cs) -> {
+          let stated = items.fold(None, |acc: Option<Bytes>, item: Item|
+            match item {
+              IInstance(d) -> if d.kind == NKey && qualify(module, d.target.name) == c.name {
+                Some(d.by.name)
+              } else { acc },
+              _ -> acc,
+            });
+          let scheme = |f: Bytes|
+            here.fold(None, |s: Option<Scheme>, h: Def| if h.name == f { h.scheme } else { s });
+          match stated {
+            // Values whose keys are equal are equal, so the key is what is written.
+            Some(f) -> match scheme(f) {
+              Some(s) -> match s.ty {
+                TyFn(fn_ty) -> if s.ty_vars.len() > 0 { read } else {
+                  {
+                    code: marked(
+                      joined([written(byte_of_int(16)), part(call(named(f), [var(b"a", 0)]), 1)]),
+                    ),
+                    typed: parted(Map::new(), fn_ty.ret, 1),
+                  }
+                },
+                _ -> read,
+              },
+              None -> read,
+            },
+            None -> {
+              let walked = cs.fold(
+                { arms: [], typed: Map::new(), next: 1, slot: 1 },
+                |acc: { arms: List<CodeArm>, typed: Map<Bytes, Typed>, next: Int, slot: Int }, sc: SumCtor| {
+                  let k = sc.fields.len();
+                  let arg = |j: Int|
+                    at_args(
+                      match sc.fields.at(j) { Some(t) -> t, None -> unknown_type() },
+                      sc.params,
+                      c.args,
+                    );
+                  let dot = range(0, sc.name.len()).fold(0 - 1, |d: Int, i: Int|
+                    if sc.name.at(i) == 46 { i } else { d });
+                  let simple = sc.name.slice(dot + 1, sc.name.len());
+                  {
+                    arms: acc.arms.push({
+                      pat: PxCtor({
+                        name: sc.name,
+                        args: range(0, k).map(|j: Int|
+                          PxVar({
+                            name: b"x".concat(ascii_of_int(j)),
+                            slot: Some(acc.slot + j),
+                            span: placed(acc.next + 2 * j),
+                          })),
+                      }),
+                      guard: None,
+                      body: joined(
+                        [written(blob(14, simple).concat(counted(15, k)))].concat(
+                          range(0, k).map(|j: Int|
+                            part(
+                              var(b"x".concat(ascii_of_int(j)), acc.slot + j),
+                              acc.next + 2 * j + 1,
+                            )),
+                        ),
+                      ),
+                    }),
+                    typed: range(0, k).fold(acc.typed, |m: Map<Bytes, Typed>, j: Int|
+                      parted(
+                        m.insert(span_key(placed(acc.next + 2 * j)), filed_as(arg(j), [])),
+                        arg(j),
+                        acc.next + 2 * j + 1,
+                      )),
+                    next: acc.next + 2 * k,
+                    slot: acc.slot + k,
+                  }
+                },
+              );
+              {
+                code: marked(at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms }))),
+                typed: walked.typed,
+              }
+            },
+          }
+        },
+      },
+      _ -> read,
+    },
+  }
+}
 
 /// The type a declared sum's argument of declared type `ty` is, where the sum is at `args`: each of
 /// its parameters' variables `params` read as the argument in its place.
@@ -17766,6 +17947,62 @@ test "a value is reflected as its type says: a scalar as its constructor, a sum 
   assert(body(told).index_of(b"@@Tstd.value.VCtor@@") == None, None)
 }
 
+test "a value is digested through a root written for its type, its parts encoded at theirs" {
+  let src = Bytes::concat_all([
+    b"type TK = | Punct(Bytes) | Pair(TK, TK) | Eof\n",
+    b"type Money = | Money(Int, Bytes)\n",
+    b"key for Money by cents\n",
+    b"fn cents(m: Money) -> Int = match m { Money(c, _) -> c }\n",
+    b"fn hashed(t: TK) -> Bytes = digest(t)\n",
+    b"fn held(p: { a: Int, b: TK }) -> Bytes = digest(p)\n",
+    b"fn priced(m: Money) -> Bytes = digest(m)\n",
+  ]);
+  let sum = written_root(b"m", b"digest", TyCon({ name: b"m.TK", args: [] }));
+  let record = written_root(
+    b"m",
+    b"digest",
+    TyRecord([
+      { name: b"a", ty: TyCon({ name: b"Int", args: [] }) },
+      { name: b"b", ty: TyCon({ name: b"m.TK", args: [] }) },
+    ]),
+  );
+  let keyed = written_root(b"m", b"digest", TyCon({ name: b"m.Money", args: [] }));
+  let answers = answers_of([b"m"], [src], [b"m.Punct", b"m.Pair", b"m.Eof", b"m.Money"], [
+    b"m.hashed",
+    b"m.held",
+    b"m.priced",
+    sum,
+    record,
+    keyed,
+  ]);
+  let body = |name: Bytes|
+    match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
+        if a.name == name { Some(a) } else { acc }) {
+      Some(a) -> match a.answer {
+        Body(b) -> b,
+        Refused(r) -> panic(String::of_bytes_lossy(Bytes::concat_all([name, b": ", r.why]))),
+      },
+      None -> panic("no answer"),
+    };
+  let has = |name: Bytes, text: Bytes| body(name).text.index_of(text) != None;
+  // The call hashes what the root writes, and the runtime reads no shape.
+  [
+    { at: b"m.hashed", root: sum },
+    { at: b"m.held", root: record },
+    { at: b"m.priced", root: keyed },
+  ].fold((), |_: Unit, c: { at: Bytes, root: Bytes }| {
+    assert(has(c.at, symbol_of(c.root).concat(b"(ctx, ")), None);
+    assert(has(c.at, b"builtin_bytes_blake3_p"), None);
+    assert(!has(c.at, b"builtin_digest_p"), None)
+  });
+  // A leaf is the runtime's encoding of it; the sum's own arguments go through the same root.
+  assert(has(sum, b"builtin_elaborated_encoded_p"), None);
+  assert(has(sum, symbol_of(sum).concat(b"(ctx, ")), None);
+  assert(has(record, symbol_of(sum).concat(b"(ctx, ")), None);
+  // A keyed type is its key.
+  assert(body(keyed).tables.calls.contains(b"m.cents"), None)
+}
+
 test "strings and byte strings are compared by their bytes where they lie" {
   let src = Bytes::concat_all([
     b"fn same(a: String, b: String) -> Bool = a == b\n",
@@ -18665,7 +18902,14 @@ fn answers_of(
     names,
     srcs,
     { names: ctors, laid: ctor_layouts(d.ctors), keyed: [], sums: ctor_sums(d.ctors) },
-    [b"?numeric_binary", b"compare"],
+    [
+      b"?numeric_binary",
+      b"compare",
+      b"digest",
+      b"?encoded",
+      b"Bytes::concat_all",
+      b"Bytes::blake3",
+    ],
     wanted,
     [],
     [],
@@ -20086,20 +20330,21 @@ fn emit_module(
       },
       _ -> acc,
     });
-  // A type some body reflects is reflected by a root written from it, in this module where the
-  // body's call names it.
-  let reflections = match wanted {
+  // A type some body reflects or digests is written for by a root, in this module where the body's
+  // call names it.
+  let written = match wanted {
     None -> [],
     Some(w) ->
-      w.keys().fold([], |acc: List<{ root: Bytes, shown: Bool, ty: Type }>, n: Bytes|
-        match reflection_of(n) {
-          Some(r) -> if r.module == module { acc.push({ root: n, shown: r.shown, ty: r.ty }) }
+      w.keys().fold([], |acc: List<{ root: Bytes, op: Bytes, ty: Type }>, n: Bytes|
+        match written_root_of(n) {
+          Some(r) -> if r.module == module { acc.push({ root: n, op: r.op, ty: r.ty }) }
           else { acc },
           None -> acc,
         }),
   };
-  reflections.fold(walked.out, |out: List<Emitted>, r: { root: Bytes, shown: Bool, ty: Type }| {
-    let e = reflection_code(module, ctors, here, x.module.items, r.shown, r.ty);
+  written.fold(walked.out, |out: List<Emitted>, r: { root: Bytes, op: Bytes, ty: Type }| {
+    let e = if r.op == b"digest" { digest_code(module, ctors, here, x.module.items, r.ty) }
+    else { reflection_code(module, ctors, here, x.module.items, r.op == b"shown", r.ty) };
     let held = kind_of(r.ty);
     let word = reflected_kind(r.ty);
     out.push(
@@ -20130,6 +20375,7 @@ fn generated_builtin(name: Bytes) -> Bytes =
   if name == b"?compare" { b"compare" }
   else if name == b"?reflect" { b"reflect" }
   else if name == b"?shown" { b"shown" }
+  else if name == b"?concat" { b"Bytes::concat_all" }
   else { name }
 
 /// `why` is the refusal's reason, and then `text` and `tables` are empty.
