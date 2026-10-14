@@ -1187,6 +1187,23 @@ fn a_digest_agrees_with_equality_and_refuses_what_has_no_hash() {
 }
 
 #[test]
+fn a_value_encoded_is_what_its_digest_hashes() {
+    let v = Value::ctor("orders.Shipped", vec![decimal_of("1.50"), ints(&[1, 2])]);
+    let encoded = found(Builtin::Encoded, vec![v.clone()]);
+    let Value::Bytes(encoded) = &encoded else {
+        panic!("`?encoded` answers bytes");
+    };
+    assert_eq!(
+        Value::bytes(blake3::hash(encoded).as_bytes()),
+        found(Builtin::Digest, vec![v])
+    );
+}
+
+fn decimal_of(s: &str) -> Value {
+    Value::Decimal(s.parse().unwrap())
+}
+
+#[test]
 fn rotr32_turns_the_low_word_and_answers_it_non_negative() {
     let cases: &[(i64, i64, i64)] = &[
         (1, 1, 0x8000_0000),

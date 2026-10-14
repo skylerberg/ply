@@ -22,7 +22,31 @@ pub fn digest(v: &Value, span: Span) -> Result<[u8; 32], Diagnostic> {
     Ok(*h.finalize().as_bytes())
 }
 
-fn write(h: &mut blake3::Hasher, v: &Value, span: Span) -> Result<(), Diagnostic> {
+/// The encoding [`digest`] hashes, or the same refusal.
+pub fn encoded(v: &Value, span: Span) -> Result<Vec<u8>, Diagnostic> {
+    let mut out = Vec::new();
+    write(&mut out, v, span)?;
+    Ok(out)
+}
+
+/// Where an encoding is written: a hasher, or the bytes themselves.
+trait Sink {
+    fn update(&mut self, b: &[u8]);
+}
+
+impl Sink for blake3::Hasher {
+    fn update(&mut self, b: &[u8]) {
+        blake3::Hasher::update(self, b);
+    }
+}
+
+impl Sink for Vec<u8> {
+    fn update(&mut self, b: &[u8]) {
+        self.extend_from_slice(b);
+    }
+}
+
+fn write(h: &mut impl Sink, v: &Value, span: Span) -> Result<(), Diagnostic> {
     match v {
         Value::Unit => tag(h, 0),
         Value::Bool(b) => tag(h, if *b { 2 } else { 1 }),
@@ -103,21 +127,21 @@ fn write(h: &mut blake3::Hasher, v: &Value, span: Span) -> Result<(), Diagnostic
     Ok(())
 }
 
-fn tag(h: &mut blake3::Hasher, t: u8) {
+fn tag(h: &mut impl Sink, t: u8) {
     h.update(&[t]);
 }
 
-fn int(h: &mut blake3::Hasher, n: i64) {
+fn int(h: &mut impl Sink, n: i64) {
     tag(h, 3);
     h.update(&n.to_le_bytes());
 }
 
-fn count(h: &mut blake3::Hasher, t: u8, n: usize) {
+fn count(h: &mut impl Sink, t: u8, n: usize) {
     tag(h, t);
     h.update(&(n as u64).to_le_bytes());
 }
 
-fn blob(h: &mut blake3::Hasher, t: u8, b: &[u8]) {
+fn blob(h: &mut impl Sink, t: u8, b: &[u8]) {
     count(h, t, b.len());
     h.update(b);
 }
