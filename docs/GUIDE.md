@@ -16,8 +16,6 @@ path. After editing the checkout, the same script is the whole rebuild. A Ply fi
 
 ```ply
 // hello/main.ply
-import std.console (Console, print)
-
 fn greeting() -> String = "hello from ply"
 
 fn main() -> Unit / {Console} = print(greeting())
@@ -27,8 +25,9 @@ fn main() -> Unit / {Console} = print(greeting())
 standard output, the run reports the value `main` returned (`()`) and exits `0`.
 Output is an effect, not a builtin: `print` takes a `String` and is
 `std.console`'s wrapper over `std.process`'s `out`, a value that is not one goes
-through interpolation (`print(f"n = {n}")`), `Console` is the two console
-streams as an effect set, and `--host` binds them to the run's own console
+through interpolation (`print(f"n = {n}")`), `Console` is the three console
+streams as an effect set (`read_line` reads one line of input), all named with
+no import (§13), and `--host` binds them to the run's own console
 (`ply doc std.console`, §14); a run
 without it is hermetic and refuses them (`E0424`). The everyday commands are
 `ply check` (parse, resolve, typecheck, infer rows), `ply test` and `ply run`.
@@ -2878,9 +2877,16 @@ project's: `ply test`, `ply prove` and `ply review` skip them unless you pass
 `--std`, which adds those of every
 module `ply std` lists, whichever of them the project imports.
 A module named for a type of the language's is that type's home: it alone
-declares functions of the type (`fn List::name` in `std.list`, §3.1), and a
-call on a value finds one where the caller's module imports the home module,
-itself or through another, with no name selected.
+declares functions of the type (`fn List::name` in `std.list`, §3.1). A module
+outside the library calls them with no import, on a value (`xs.sort()`) or
+through the type (`List::sort(xs)`): `std.list`, `std.string`, `std.map`,
+`std.option`, `std.result`, `std.char`, `std.bytes` and `std.float` are the
+homes, and a load reads one only where a module calls on a value. A module of
+the library imports the homes it calls, as it imports anything else. A few
+names are read with no import too, each where the module declares and imports
+nothing of that name: `print`, `eprint`, `read_line` and `Console` of
+`std.console`, `Set` of `std.set`, and `abs` of `std.math`. A module that
+declares or imports one of those names reads its own.
 Each module is documented in its source: `ply std` lists the modules, each with
 the summary of its doc; `ply doc std.json` documents a module and everything it
 publishes, `ply doc std.json.parse` one definition, `ply doc fs.read_at` one

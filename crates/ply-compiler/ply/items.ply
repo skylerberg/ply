@@ -26,7 +26,7 @@ import type_syntax (TypeExpr, TRecord, TUnit, TCon, TFn, RowExpr, AtomExpr, Mode
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
 import exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, block_expr, expr_span, no_expr,
               fn_param, param, dump_expr, dump_param, shown_binder, cases_binder, set_binder,
-              hidden_binder, case_at, case_identity, case_body, listing)
+              hidden_binder, free_names, free_binder, case_at, case_identity, case_body, listing)
 import patterns (LStr)
 
 // --- The tree ---------------------------------------------------------------
@@ -2201,11 +2201,67 @@ pub fn run(input: Input, parser: Parser) -> Parsed<Module> / {abort.raise} = {
   };
   {
     parser: done.parser,
-    node: { doc: module_doc(input), imports: gathered, items: published(done.items) },
+    node: {
+      doc: module_doc(input),
+      imports: gathered.concat(free_imports(input, gathered)),
+      items: published(done.items),
+    },
   }
 }
 
 /// Where the module first writes a set literal, which calls `std.set`.
+/// A hidden import of each module of [`free_names`] whose names the text reads where it declares
+/// and selects none of them, under its [`free_binder`]: a name after `.` or `::` is another's, and
+/// one after `fn`, `type` or `effect set` is the module's own. A parse and a header read alike.
+fn free_imports(input: Input, imports: List<ImportDecl>) -> List<ImportDecl> = {
+  let kind = |i: Int| match input.tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
+  let selected = imports.fold(Map::new(), |acc: Map<Bytes, Bool>, d: ImportDecl|
+    match d.kind {
+      INames(ns) -> ns.fold(acc, |a: Map<Bytes, Bool>, n: Ident| a.insert(n.name, true)),
+      _ -> acc,
+    });
+  let declared = range(1, input.token_count).fold(Map::new(), |acc: Map<Bytes, Bool>, i: Int|
+    match kind(i) {
+      Identifier(n) -> if kind(i - 1) == keyword_fn() || kind(i - 1) == keyword_type()
+          || (i > 1 && kind(i - 2) == keyword_effect()) { acc.insert(n, true) }
+      else { acc },
+      _ -> acc,
+    });
+  free_names().fold([], |acc: List<ImportDecl>, f: { module: Bytes, names: List<Bytes> }| {
+    let used = range(0, input.token_count).fold(None, |found: Option<Span>, i: Int|
+      match found {
+        Some(_) -> found,
+        None -> match kind(i) {
+          Identifier(n) -> if !f.names.contains(n) || declared.contains(n) || selected.contains(n)
+              || (i > 0 && (kind(i - 1) == token_dot() || kind(i - 1) == token_coloncolon())) {
+            None
+          } else {
+            match input.tokens.at(i) { Some(t) -> Some(span_between(t.start, t.end)), None -> None }
+          },
+          _ -> None,
+        },
+      });
+    match used {
+      Some(sp) -> acc.push(hidden_import(f.module, free_binder(f.module), sp)),
+      None -> acc,
+    }
+  })
+}
+
+/// Whether `src` calls a name on a value, `x.name(`, or names a function through a type,
+/// `T::name`: what a home module of the language's types may answer.
+pub fn calls_on_values(src: Bytes) -> Bool / {abort.raise} = {
+  let input = start(src).input;
+  let kind = |i: Int| match input.tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
+  range(1, input.token_count).any(|i: Int|
+    match kind(i) {
+      Identifier(n) ->
+        (kind(i - 1) == token_dot() && kind(i + 1) == token_lparen())
+          || (starts_upper(n) && kind(i + 1) == token_coloncolon()),
+      _ -> false,
+    })
+}
+
 fn first_set(input: Input) -> Option<Span> =
   input.tokens.fold(None, |acc: Option<Span>, token: Token|
     match acc {
@@ -2376,14 +2432,37 @@ pub fn header(src: Bytes) -> Option<Module> / {abort.raise} = {
       None -> with_shown,
       Some(sp) -> with_shown.push(hidden_import(b"cases", cases_binder(), sp)),
     };
+    let with_set = match first_set(input) {
+      None -> with_cased,
+      Some(sp) -> with_cased.push(hidden_import(b"set", set_binder(), sp)),
+    };
     Some({
       doc: module_doc(input),
-      imports: match first_set(input) {
-        None -> with_cased,
-        Some(sp) -> with_cased.push(hidden_import(b"set", set_binder(), sp)),
-      },
+      imports: with_set.concat(free_imports(input, with_set)),
       items: [],
     })
+  }
+}
+
+test "a name read with no import pulls its module, and one the module declares or imports pulls nothing" {
+  let freed = |src: Bytes|
+    parse(src).node.imports.fold([], |acc: List<Bytes>, d: ImportDecl|
+      match d.kind {
+        IAlias(a) -> if a.name.starts_with(b"?free.") { acc.push(a.name) } else { acc },
+        _ -> acc,
+      });
+  assert_eq(freed(b"fn main() -> Unit / {Console} = print(\"hi\")\n"), [b"?free.console"]);
+  assert_eq(freed(b"fn f(s: Set<Int>) -> Int = abs(0 - 1)\n"), [b"?free.set", b"?free.math"]);
+  assert_eq(freed(b"fn print(s: String) -> Unit = ()\nfn main() -> Unit = print(\"hi\")\n"), []);
+  assert_eq(
+    freed(b"import std.console (print)\nfn main() -> Unit / {Console} = print(\"hi\")\n"),
+    [b"?free.console"],
+  );
+  assert_eq(freed(b"fn f(x: Int) -> Int = x.abs() + m::abs(x)\n"), []);
+  // A header says the same, for a load to pull what the parse reads.
+  match header(b"fn main() -> Unit / {Console} = print(\"hi\")\n") {
+    Some(m) -> assert_eq(m.imports.len(), 1),
+    None -> assert(false),
   }
 }
 
