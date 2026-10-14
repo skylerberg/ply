@@ -8,13 +8,13 @@ import harness (scratch, Source, program, project, write, on_disk, spawned, said
                 diagnostic, refused)
 import compiler.plyx (Header, Section, Placed, decode, encode, digest_of, domain, offset_digest,
                       format)
-import std.bytes (u32_le, u32_at, hex_of, repeat)
+import std.bytes (u32_le)
 import std.fs (fs)
 import std.gzip (try_gunzip)
 import std.json
 import std.json (Json, Null, Array, Str)
 import std.string
-import std.list (concat, contains)
+import std.list
 
 fn source() -> String =
   \\effect log { write emit[c](msg: String) -> Unit }
@@ -73,19 +73,19 @@ type Parts = { head: Header, sections: List<Section> }
 
 fn parts_of(b: Bytes) -> Parts / {abort.raise} =
   match decode(b) {
-    Err(e) -> panic("the artifact does not open: " ++ string_of_bytes_lossy(e.message)),
+    Err(e) -> panic("the artifact does not open: " ++ String::of_bytes_lossy(e.message)),
     Ok(o) ->
       {
         head: { frontend: o.frontend, runtime: o.runtime, entry: o.entry },
-        sections: map(o.sections, |p: Placed|
-          { name: p.name, count: p.count, payload: bytes_slice(b, p.at, p.at + p.len) }),
+        sections: o.sections.map(|p: Placed|
+          { name: p.name, count: p.count, payload: b.slice(p.at, p.at + p.len) }),
       },
   }
 
 /// Where the container placed each section of `b`.
 fn parts_placed(b: Bytes) -> List<Placed> / {abort.raise} =
   match decode(b) {
-    Err(e) -> panic("the artifact does not open: " ++ string_of_bytes_lossy(e.message)),
+    Err(e) -> panic("the artifact does not open: " ++ String::of_bytes_lossy(e.message)),
     Ok(o) -> o.sections,
   }
 
@@ -95,41 +95,40 @@ fn sealed(parts: Parts) -> Bytes / {abort.raise} = {
   match digest_of(domain(), laid) {
     None -> panic("a container this short carries no digest"),
     Some(d) ->
-      bytes_concat_all([
-        bytes_slice(laid, 0, offset_digest()),
+      Bytes::concat_all([
+        laid.slice(0, offset_digest()),
         d,
-        bytes_slice(laid, offset_digest() + 32, bytes_len(laid)),
+        laid.slice(offset_digest() + 32, laid.len()),
       ]),
   }
 }
 
 fn section(parts: Parts, name: Bytes) -> Section / {abort.raise} =
-  match filter(parts.sections, |s: Section| s.name == name) {
+  match parts.sections.filter(|s: Section| s.name == name) {
     [s, ..] -> s,
-    [] -> panic("the artifact carries no `" ++ string_of_bytes(name) ++ "` section"),
+    [] -> panic("the artifact carries no `" ++ String::of_bytes(name) ++ "` section"),
   }
 
 fn replaced(parts: Parts, s: Section) -> Parts =
-  { ..parts, sections: map(parts.sections, |x: Section| if x.name == s.name { s } else { x }) }
+  { ..parts, sections: parts.sections.map(|x: Section| if x.name == s.name { s } else { x }) }
 
 fn word(b: Bytes, i: Int) -> Int / {abort.raise} =
-  match u32_at(b, i) { Some(w) -> w, None -> panic("a record runs past its section") }
+  match b.u32_at(i) { Some(w) -> w, None -> panic("a record runs past its section") }
 
 type Body = { hash: Bytes, body: Bytes }
 
 /// Each record is the hash, the body's length, and the body.
 fn bodies_of(parts: Parts) -> List<Body> / {abort.raise} = {
   let s = section(parts, b"bodies");
-  let walked = fold(
-    range(0, s.count),
+  let walked = range(0, s.count).fold(
     { at: 0, out: [] },
     |acc: { at: Int, out: List<Body> }, _i: Int| {
       let n = word(s.payload, acc.at + 32);
       {
         at: acc.at + 36 + n,
-        out: push(acc.out, {
-          hash: bytes_slice(s.payload, acc.at, acc.at + 32),
-          body: bytes_slice(s.payload, acc.at + 36, acc.at + 36 + n),
+        out: acc.out.push({
+          hash: s.payload.slice(acc.at, acc.at + 32),
+          body: s.payload.slice(acc.at + 36, acc.at + 36 + n),
         }),
       }
     },
@@ -140,9 +139,9 @@ fn bodies_of(parts: Parts) -> List<Body> / {abort.raise} = {
 fn with_bodies(parts: Parts, bodies: List<Body>) -> Parts / {abort.raise} =
   replaced(parts, {
     name: b"bodies",
-    count: len(bodies),
-    payload: bytes_concat_all(
-      map(bodies, |b: Body| bytes_concat_all([b.hash, u32_le(bytes_len(b.body)), b.body])),
+    count: bodies.len(),
+    payload: Bytes::concat_all(
+      bodies.map(|b: Body| Bytes::concat_all([b.hash, u32_le(b.body.len()), b.body])),
     ),
   })
 
@@ -152,45 +151,46 @@ type Named = { name: String, hash: Bytes }
 fn names_of(parts: Parts) -> List<Named> / {abort.raise} = {
   let s = section(parts, b"names");
   let strings = section(parts, b"strings").payload;
-  map(range(0, s.count), |i: Int| {
+  range(0, s.count).map(|i: Int| {
     let off = word(s.payload, i * 40);
     {
-      name: string_of_bytes(bytes_slice(strings, off, off + word(s.payload, i * 40 + 4))),
-      hash: bytes_slice(s.payload, i * 40 + 8, i * 40 + 40),
+      name: String::of_bytes(strings.slice(off, off + word(s.payload, i * 40 + 4))),
+      hash: s.payload.slice(i * 40 + 8, i * 40 + 40),
     }
   })
 }
 
 /// Each name's text is written once, in record order, as the writer lays the string section out.
 fn with_names(parts: Parts, names: List<Named>) -> Parts / {abort.raise} = {
-  let laid = fold(
-    names,
-    { strings: b"", placed: map_new(), records: [] },
+  let laid = names.fold(
+    { strings: b"", placed: Map::new(), records: [] },
     |acc: { strings: Bytes, placed: Map<String, Int>, records: List<Bytes> }, named: Named| {
-      let known = map_get(acc.placed, named.name);
-      let offset = match known { Some(o) -> o, None -> bytes_len(acc.strings) };
-      let text = bytes_of_string(named.name);
+      let known = acc.placed.get(named.name);
+      let offset = match known { Some(o) -> o, None -> acc.strings.len() };
+      let text = Bytes::of_string(named.name);
       {
-        strings: match known { Some(_) -> acc.strings, None -> bytes_concat(acc.strings, text) },
-        placed: map_insert(acc.placed, named.name, offset),
-        records: push(
-          acc.records,
-          bytes_concat_all([u32_le(offset), u32_le(bytes_len(text)), named.hash]),
+        strings: match known { Some(_) -> acc.strings, None -> acc.strings.concat(text) },
+        placed: acc.placed.insert(named.name, offset),
+        records: acc.records.push(
+          Bytes::concat_all([u32_le(offset), u32_le(text.len()), named.hash]),
         ),
       }
     },
   );
   replaced(
-    replaced(parts, { name: b"names", count: len(names), payload: bytes_concat_all(laid.records) }),
-    { name: b"strings", count: bytes_len(laid.strings), payload: laid.strings },
+    replaced(parts, {
+      name: b"names",
+      count: names.len(),
+      payload: Bytes::concat_all(laid.records),
+    }),
+    { name: b"strings", count: laid.strings.len(), payload: laid.strings },
   )
 }
 
 /// Each record is a module's path and its text, each after its length.
 fn shipped_files(parts: Parts) -> List<Source> / {abort.raise} = {
   let s = section(parts, b"closure");
-  let walked = fold(
-    range(0, s.count),
+  let walked = range(0, s.count).fold(
     { at: 0, out: [] },
     |acc: { at: Int, out: List<Source> }, _i: Int| {
       let path_len = word(s.payload, acc.at);
@@ -198,9 +198,9 @@ fn shipped_files(parts: Parts) -> List<Source> / {abort.raise} = {
       let text_len = word(s.payload, acc.at + 4 + path_len);
       {
         at: text_at + text_len,
-        out: push(acc.out, {
-          path: string_of_bytes(bytes_slice(s.payload, acc.at + 4, acc.at + 4 + path_len)),
-          text: string_of_bytes(bytes_slice(s.payload, text_at, text_at + text_len)),
+        out: acc.out.push({
+          path: String::of_bytes(s.payload.slice(acc.at + 4, acc.at + 4 + path_len)),
+          text: String::of_bytes(s.payload.slice(text_at, text_at + text_len)),
         }),
       }
     },
@@ -211,12 +211,12 @@ fn shipped_files(parts: Parts) -> List<Source> / {abort.raise} = {
 fn with_files(parts: Parts, files: List<Source>) -> Parts / {abort.raise} =
   replaced(parts, {
     name: b"closure",
-    count: len(files),
-    payload: bytes_concat_all(
-      map(files, |f: Source| {
-        let file = bytes_of_string(f.path);
-        let text = bytes_of_string(f.text);
-        bytes_concat_all([u32_le(bytes_len(file)), file, u32_le(bytes_len(text)), text])
+    count: files.len(),
+    payload: Bytes::concat_all(
+      files.map(|f: Source| {
+        let file = Bytes::of_string(f.path);
+        let text = Bytes::of_string(f.text);
+        Bytes::concat_all([u32_le(file.len()), file, u32_le(text.len()), text])
       }),
     ),
   })
@@ -226,9 +226,9 @@ fn with_files(parts: Parts, files: List<Source>) -> Parts / {abort.raise} =
 fn runnable_text(parts: Parts) -> String / {abort.raise} = {
   let unpacked = |name: Bytes|
     match try_gunzip(section(parts, name).payload, 67108864) {
-      Ok(b) -> string_of_bytes_lossy(b),
+      Ok(b) -> String::of_bytes_lossy(b),
       Err(refusal) ->
-        panic(f"the {string_of_bytes_lossy(name)} section does not unpack: {refusal}"),
+        panic(f"the {String::of_bytes_lossy(name)} section does not unpack: {refusal}"),
     };
   unpacked(b"runnable") ++ unpacked(b"unit")
 }
@@ -263,8 +263,8 @@ test "two builds from two roots are byte-identical" {
     assert(bytes_of("cold.plyx") == bytes_of("warm.plyx"), None);
     let cold = on_disk(["build", "cold", "--digest"]).out;
     assert(cold == on_disk(["build", "warm", "--digest"]).out, None);
-    let digest = string::join(cold, "");
-    assert(string_starts_with(digest, "b3:") && string_len(digest) == 15, Some(digest))
+    let digest = String::join(cold, "");
+    assert(digest.starts_with("b3:") && digest.len() == 15, Some(digest))
   })
 }
 
@@ -282,33 +282,32 @@ test "an artifact carries no test, no law and nothing unreached" {
     program(source());
     let b = built();
     let p = parts_of(b);
-    let names = map(names_of(p), |n: Named| n.name);
-    let listed = string::join(names, ", ");
+    let names = names_of(p).map(|n: Named| n.name);
+    let listed = String::join(names, ", ");
     assert(
-      contains(names, "m.main") && contains(names, "m.shade") && contains(names, "m.Colour"),
+      names.contains("m.main") && names.contains("m.shade") && names.contains("m.Colour"),
       Some(listed),
     );
-    assert(contains(names, "m.even") && contains(names, "m.odd"), Some(listed));
+    assert(names.contains("m.even") && names.contains("m.odd"), Some(listed));
     assert(
-      !contains(names, "m.unreached"),
+      !names.contains("m.unreached"),
       Some("a definition nothing reaches is not in the closure: " ++ listed),
     );
     assert(
-      !contains(names, "m.announce") && !contains(names, "m.log"),
+      !names.contains("m.announce") && !names.contains("m.log"),
       Some("only what `main` reaches: " ++ listed),
     );
     assert(
-      len(filter(names, |n: String| string_contains(n, "ply_tests"))) == 0,
+      names.filter(|n: String| n.contains("ply_tests")).len() == 0,
       Some("no test key may appear: " ++ listed),
     );
     // A test or a law is declared by its name, so a closure that spells neither declares neither.
-    let shipped = [string_of_bytes_lossy(b), runnable_text(p)];
-    fold(
-      ["unreached", "announce", "shade reads a payload", "even and odd disagree"],
+    let shipped = [String::of_bytes_lossy(b), runnable_text(p)];
+    ["unreached", "announce", "shade reads a payload", "even and odd disagree"].fold(
       (),
       |u: Unit, w: String|
-        fold(shipped, u, |v: Unit, text: String|
-          assert(!string_contains(text, w), Some("`" ++ w ++ "` shipped"))),
+        shipped.fold(u, |v: Unit, text: String|
+          assert(!text.contains(w), Some("`" ++ w ++ "` shipped"))),
     )
   })
 }
@@ -318,11 +317,11 @@ test "an artifact carries nothing of a data file a shipped module embeds and its
   scratch(|| {
     program("import std.oid\n\nfn main() -> Int = len(oid::arcs(oid::common_name()))\n");
     let b = built();
-    let shipped = [string_of_bytes_lossy(b), runnable_text(parts_of(b))];
+    let shipped = [String::of_bytes_lossy(b), runnable_text(parts_of(b))];
     // The module is pulled whole, so its text is among the runnable's files.
-    assert(string_contains(runnable_text(parts_of(b)), "oid/names.txt"), None);
-    fold(shipped, (), |u: Unit, text: String|
-      assert(!string_contains(text, "id-kp-OCSPSigning"), Some("the file's bytes shipped")))
+    assert(runnable_text(parts_of(b)).contains("oid/names.txt"), None);
+    shipped.fold((), |u: Unit, text: String|
+      assert(!text.contains("id-kp-OCSPSigning"), Some("the file's bytes shipped")))
   })
 }
 
@@ -334,19 +333,16 @@ test "an artifact of a program that only writes brotli carries no reader and non
     );
     let b = built();
     let p = parts_of(b);
-    let names = map(names_of(p), |n: Named| n.name);
-    let listed = string::join(names, ", ");
-    assert(contains(names, "std.brotli.compress"), Some(listed));
+    let names = names_of(p).map(|n: Named| n.name);
+    let listed = String::join(names, ", ");
+    assert(names.contains("std.brotli.compress"), Some(listed));
     assert(
-      !contains(names, "std.brotli.words") && !contains(names, "std.brotli.decompress")
-        && !contains(names, "std.brotli.commands"),
+      !names.contains("std.brotli.words") && !names.contains("std.brotli.decompress")
+        && !names.contains("std.brotli.commands"),
       Some("only what `compress` reaches: " ++ listed),
     );
-    fold([string_of_bytes_lossy(b), runnable_text(p)], (), |u: Unit, text: String|
-      assert(
-        !string_contains(text, "timedownlifeleftback"),
-        Some("the dictionary's bytes shipped"),
-      ))
+    [String::of_bytes_lossy(b), runnable_text(p)].fold((), |u: Unit, text: String|
+      assert(!text.contains("timedownlifeleftback"), Some("the dictionary's bytes shipped")))
   })
 }
 
@@ -356,20 +352,20 @@ test "every body is filed under the hash the hash command prints" {
     let report = json_of(on_disk(["hash", ".", "--json"]));
     let p = parts_of(built());
     let names = names_of(p);
-    let bodies = map(bodies_of(p), |b: Body| hex_of(b.hash));
-    let checked = fold(items(at(report, "definitions")), 0, |n: Int, e: Json|
-      match filter(names, |x: Named| x.name == str(at(e, "name"))) {
+    let bodies = bodies_of(p).map(|b: Body| b.hash.hex_of());
+    let checked = items(at(report, "definitions")).fold(0, |n: Int, e: Json|
+      match names.filter(|x: Named| x.name == str(at(e, "name"))) {
         [filed, ..] -> {
           assert(
-            hex_of(filed.hash) == str(at(e, "hash")),
+            filed.hash.hex_of() == str(at(e, "hash")),
             Some("`" ++ filed.name ++ "` is filed under a different hash"),
           );
-          assert(contains(bodies, hex_of(filed.hash)), Some("`" ++ filed.name ++ "` has no body"));
+          assert(bodies.contains(filed.hash.hex_of()), Some("`" ++ filed.name ++ "` has no body"));
           n + 1
         },
         [] -> n,
       });
-    assert(checked >= 4, Some("only " ++ int_to_string(checked) ++ " definitions were compared"))
+    assert(checked >= 4, Some("only " ++ checked.to_string() ++ " definitions were compared"))
   })
 }
 
@@ -381,8 +377,8 @@ test "an artifact runs to the same value as its source" {
     let _ = built();
     let from_artifact = on_disk(["run", "m.plyx"]);
     assert(from_artifact.code == 0, Some(said(from_artifact)));
-    assert(string_contains(stdout(from_source), "42"), Some(stdout(from_source)));
-    assert(string_contains(stdout(from_artifact), "42"), Some(stdout(from_artifact)))
+    assert(stdout(from_source).contains("42"), Some(stdout(from_source)));
+    assert(stdout(from_artifact).contains("42"), Some(stdout(from_artifact)))
   })
 }
 
@@ -418,15 +414,13 @@ test "a closure that is not the closure is refused" {
     program(source());
     let p = parts_of(built());
     let files = shipped_files(p);
-    let altered = map(files, |f: Source|
-      { ..f, text: string::replace(f.text, "Blue(20)", "Blue(19)") });
+    let altered = files.map(|f: Source| { ..f, text: f.text.replace("Blue(20)", "Blue(19)") });
     assert(altered != files, Some("the closure spells the literal"));
     let garbled = match files {
-      [f, ..rest] -> concat([{ ..f, text: "fn (" }], rest),
+      [f, ..rest] -> [{ ..f, text: "fn (" }].concat(rest),
       [] -> panic("the closure is empty"),
     };
-    fold(
-      [{ what: "altered", files: altered }, { what: "garbled", files: garbled }],
+    [{ what: "altered", files: altered }, { what: "garbled", files: garbled }].fold(
       (),
       |u: Unit, c: { what: String, files: List<Source> }| {
         let report = ran_bytes("t.plyx", sealed(with_files(p, c.files)));
@@ -460,25 +454,25 @@ test "a flipped bit in a body is E0443 naming the definition" {
     let b = built();
     // The first record is where the container placed the bodies; its payload, past the 32-byte key and
     // length prefix.
-    let record = match filter(parts_placed(b), |s: Placed| s.name == b"bodies") {
+    let record = match parts_placed(b).filter(|s: Placed| s.name == b"bodies") {
       [s, ..] -> s.at,
       [] -> panic("the artifact carries no bodies"),
     };
-    let flipped = bytes_concat_all([
-      bytes_slice(b, 0, record + 36),
-      byte_of_int(bytes_at(b, record + 36) ^ 0x40),
-      bytes_slice(b, record + 37, bytes_len(b)),
+    let flipped = Bytes::concat_all([
+      b.slice(0, record + 36),
+      byte_of_int(b.at(record + 36) ^ 0x40),
+      b.slice(record + 37, b.len()),
     ]);
     let report = ran_bytes("bad.plyx", flipped);
     assert(refused(report), Some(shown(report)));
     assert(code_of(report) == "E0443", Some(shown(report)));
     let message = str(at(diagnostic(report), "message"));
-    assert(string_contains(message, "offset " ++ int_to_string(record)), Some(message));
+    assert(message.contains("offset " ++ record.to_string()), Some(message));
     let first = match bodies_of(parts_of(b)) {
       [x, ..] -> x,
       [] -> panic("the artifact carries no body"),
     };
-    assert(string_contains(message, string_slice(hex_of(first.hash), 0, 12)), Some(message))
+    assert(message.contains(first.hash.hex_of().slice(0, 12)), Some(message))
   })
 }
 
@@ -486,10 +480,10 @@ test "no prefix of an artifact is believed" {
   scratch(|| {
     program(source());
     let b = built();
-    let n = bytes_len(b);
-    fold([0, 1, 100, 187, 188, 200, n / 2, n - 1], (), |u: Unit, cut: Int| {
-      let report = ran_bytes("t.plyx", bytes_slice(b, 0, cut));
-      assert(code_of(report) == "E0443", Some("at " ++ int_to_string(cut) ++ ": " ++ shown(report)))
+    let n = b.len();
+    [0, 1, 100, 187, 188, 200, n / 2, n - 1].fold((), |u: Unit, cut: Int| {
+      let report = ran_bytes("t.plyx", b.slice(0, cut));
+      assert(code_of(report) == "E0443", Some("at " ++ cut.to_string() ++ ": " ++ shown(report)))
     });
     assert(truth(at(ran_bytes("t.plyx", b), "ok")), None)
   })
@@ -499,14 +493,14 @@ test "removing a body is E0443" {
   scratch(|| {
     program(source());
     let p = parts_of(built());
-    let victim = match filter(names_of(p), |named: Named| named.name == "m.shade") {
+    let victim = match names_of(p).filter(|named: Named| named.name == "m.shade") {
       [named, ..] -> named.hash,
       [] -> panic("`shade` is in the closure"),
     };
     let without = sealed(
       with_names(
-        with_bodies(p, filter(bodies_of(p), |b: Body| b.hash != victim)),
-        filter(names_of(p), |named: Named| named.hash != victim),
+        with_bodies(p, bodies_of(p).filter(|b: Body| b.hash != victim)),
+        names_of(p).filter(|named: Named| named.hash != victim),
       ),
     );
     assert(
@@ -523,17 +517,13 @@ test "another compiler or runtime is E0444 and not E0443" {
   scratch(|| {
     program(source());
     let p = parts_of(built());
-    fold(
-      [
-        { what: "compiler", head: { ..p.head, frontend: repeat(byte_of_int(7), 32) } },
-        { what: "runtime", head: { ..p.head, runtime: repeat(byte_of_int(7), 32) } },
-      ],
-      (),
-      |u: Unit, c: { what: String, head: Header }| {
-        let report = ran_bytes("old.plyx", sealed({ ..p, head: c.head }));
-        assert(code_of(report) == "E0444", Some("another " ++ c.what ++ ": " ++ shown(report)))
-      },
-    )
+    [
+      { what: "compiler", head: { ..p.head, frontend: byte_of_int(7).repeat(32) } },
+      { what: "runtime", head: { ..p.head, runtime: byte_of_int(7).repeat(32) } },
+    ].fold((), |u: Unit, c: { what: String, head: Header }| {
+      let report = ran_bytes("old.plyx", sealed({ ..p, head: c.head }));
+      assert(code_of(report) == "E0444", Some("another " ++ c.what ++ ": " ++ shown(report)))
+    })
   })
 }
 
@@ -548,9 +538,9 @@ test "the digest is one line and agrees with the build" {
   scratch(|| {
     program(source());
     let printed = on_disk(["build", ".", "--digest"]).out;
-    assert(len(printed) == 1, Some(string::join(printed, "\n")));
-    let digest = string::ascii_trim(string::join(printed, ""));
-    assert(string_starts_with(digest, "b3:") && string_len(digest) == 15, Some(digest));
+    assert(printed.len() == 1, Some(String::join(printed, "\n")));
+    let digest = String::join(printed, "").ascii_trim();
+    assert(digest.starts_with("b3:") && digest.len() == 15, Some(digest));
     assert(!fs.exists[cwd]("m.plyx"), Some("`--digest` writes no file"));
     let report = json_of(on_disk(["build", ".", "-o", "m.plyx", "--json"]));
     assert(str(at(report, "digest")) == digest, Some(shown(report)))
@@ -561,42 +551,24 @@ test "the digest moves with the closure and with nothing else" {
   scratch(|| {
     program(source());
     let before = built();
-    fold(
-      [
-        {
-          what: "an unreached definition",
-          edited: string::replace(
-            source(),
-            "fn unreached() -> Int = 99",
-            "fn unreached() -> Int = 98",
-          ),
-        },
-        {
-          what: "a new unreached type",
-          edited: source() ++ "\ntype Spare = | Unused | Kept(Int)\n",
-        },
-        {
-          what: "a test",
-          edited: string::replace(
-            source(),
-            "assert_eq(shade(Blue(7)), 7)",
-            "assert_eq(shade(Blue(8)), 8)",
-          ),
-        },
-        { what: "a law", edited: string::replace(source(), "n >= 0 && n < 4", "n >= 0 && n < 5") },
-        {
-          what: "a local's name",
-          edited: string::replace(source(), "Blue(n) -> n", "Blue(k) -> k"),
-        },
-      ],
-      (),
-      |u: Unit, e: { what: String, edited: String }| {
-        assert(e.edited != source(), Some(e.what ++ ": the edit did not apply"));
-        write("m.ply", e.edited);
-        assert(built() == before, Some(e.what ++ " moved the artifact"))
+    [
+      {
+        what: "an unreached definition",
+        edited: source().replace("fn unreached() -> Int = 99", "fn unreached() -> Int = 98"),
       },
-    );
-    write("m.ply", string::replace(source(), "Blue(21)", "Blue(22)"));
+      { what: "a new unreached type", edited: source() ++ "\ntype Spare = | Unused | Kept(Int)\n" },
+      {
+        what: "a test",
+        edited: source().replace("assert_eq(shade(Blue(7)), 7)", "assert_eq(shade(Blue(8)), 8)"),
+      },
+      { what: "a law", edited: source().replace("n >= 0 && n < 4", "n >= 0 && n < 5") },
+      { what: "a local's name", edited: source().replace("Blue(n) -> n", "Blue(k) -> k") },
+    ].fold((), |u: Unit, e: { what: String, edited: String }| {
+      assert(e.edited != source(), Some(e.what ++ ": the edit did not apply"));
+      write("m.ply", e.edited);
+      assert(built() == before, Some(e.what ++ " moved the artifact"))
+    });
+    write("m.ply", source().replace("Blue(21)", "Blue(22)"));
     assert(digest_of(domain(), built()) != digest_of(domain(), before), None)
   })
 }
@@ -607,27 +579,26 @@ test "diff reports added, changed, dropped and what a change is reached by" {
     let _ = built_to("old.plyx");
     write(
       "m.ply",
-      string::replace(
-        string::replace(source(), "Red -> 0", "Red -> 1"),
+      source().replace("Red -> 0", "Red -> 1").replace(
         "fn unreached() -> Int = 99",
         "fn restock() -> Int = 1\nfn unreached() -> Int = 99",
       ),
     );
     let report = json_of(on_disk(["build", ".", "--diff", "old.plyx", "--json"]));
-    let changed = map(items(at(report, "changed")), str);
-    assert(contains(changed, "m.shade"), Some(shown(report)));
+    let changed = items(at(report, "changed")).map(str);
+    assert(changed.contains("m.shade"), Some(shown(report)));
     assert(
-      contains(changed, "m.main"),
+      changed.contains("m.main"),
       Some("changing a callee changes its caller: " ++ shown(report)),
     );
     assert(items(at(report, "added")) == [], Some(shown(report)));
     assert(items(at(report, "dropped")) == [], Some(shown(report)));
     // The reverse closure: every definition that reaches a changed one, and a definition reaches itself.
-    let reached = map(items(at(report, "reached")), str);
-    fold(changed, (), |u: Unit, name: String|
-      assert(contains(reached, name), Some(name ++ " does not reach itself")));
-    assert(contains(reached, "m.main"), Some(shown(report)));
-    assert(!contains(reached, "m.Colour"), Some("a type reaches no function"));
+    let reached = items(at(report, "reached")).map(str);
+    changed.fold((), |u: Unit, name: String|
+      assert(reached.contains(name), Some(name ++ " does not reach itself")));
+    assert(reached.contains("m.main"), Some(shown(report)));
+    assert(!reached.contains("m.Colour"), Some("a type reaches no function"));
     assert(int(at(report, "artifact_bytes")) > 0, Some(shown(report)))
   })
 }
@@ -681,8 +652,8 @@ test "modules sharing a last segment ship and run" {
       },
     ]);
     assert(runs_as_its_source() == Str("21"), None);
-    let files = map(shipped_files(parts_of(bytes_of("app.plyx"))), |f: Source| f.path);
-    assert(files == ["left/util.ply", "m.ply", "right/util.ply"], Some(string::join(files, ", ")))
+    let files = shipped_files(parts_of(bytes_of("app.plyx"))).map(|f: Source| f.path);
+    assert(files == ["left/util.ply", "m.ply", "right/util.ply"], Some(String::join(files, ", ")))
   })
 }
 
@@ -692,8 +663,8 @@ test "two names for one body ship and run" {
     assert(runs_as_its_source() == Str("11"), None);
     let names = names_of(parts_of(bytes_of("app.plyx")));
     let hash = |name: String|
-      map(filter(names, |named: Named| named.name == name), |named: Named| hex_of(named.hash));
-    assert(hash("m.one") != [], Some(string::join(map(names, |named: Named| named.name), ", ")));
+      names.filter(|named: Named| named.name == name).map(|named: Named| named.hash.hex_of());
+    assert(hash("m.one") != [], Some(String::join(names.map(|named: Named| named.name), ", ")));
     assert(hash("m.one") == hash("m.uno"), Some("one body, two names"))
   })
 }
@@ -732,13 +703,13 @@ test "an artifact of a program that raises through an effect holds nothing the f
     ]);
     assert(runs_as_its_source() == Str("2"), None);
     let p = parts_of(bytes_of("app.plyx"));
-    let names = map(names_of(p), |n: Named| n.name);
-    let listed = string::join(names, ", ");
-    assert(contains(names, "gz.read") && contains(names, "gz.gz"), Some(listed));
-    assert(!contains(names, "gz.written"), Some("the function `gz` calls it: " ++ listed));
-    assert_eq(len(filter(names, |n: String| n == "gz.gz")), 1);
-    let printed = string::join(map(shipped_files(p), |f: Source| f.text), "\n");
-    assert(!string_contains(printed, "31"), Some(printed))
+    let names = names_of(p).map(|n: Named| n.name);
+    let listed = String::join(names, ", ");
+    assert(names.contains("gz.read") && names.contains("gz.gz"), Some(listed));
+    assert(!names.contains("gz.written"), Some("the function `gz` calls it: " ++ listed));
+    assert_eq(names.filter(|n: String| n == "gz.gz").len(), 1);
+    let printed = String::join(shipped_files(p).map(|f: Source| f.text), "\n");
+    assert(!printed.contains("31"), Some(printed))
   })
 }
 
@@ -756,10 +727,10 @@ test "an artifact of a program that reads with std.gzip and answers its refusal 
       \\
     );
     assert(runs_as_its_source() == Str("0"), None);
-    let names = map(names_of(parts_of(bytes_of("app.plyx"))), |n: Named| n.name);
+    let names = names_of(parts_of(bytes_of("app.plyx"))).map(|n: Named| n.name);
     assert(
-      contains(names, "std.gzip.inflate") && !contains(names, "std.gzip.deflate"),
-      Some(string::join(names, ", ")),
+      names.contains("std.gzip.inflate") && !names.contains("std.gzip.deflate"),
+      Some(String::join(names, ", ")),
     )
   })
 }
@@ -797,21 +768,20 @@ test "an artifact of a program that names one module's type and passes a literal
 test/nondet "the build prints the artifact's size beside the binary's" {
   program(source());
   let printed = stdout(spawned(["build", ".", "-o", "m.plyx"], []));
-  assert(string_contains(printed, "artifact"), Some(printed));
-  assert(string_contains(printed, "binary"), Some(printed));
+  assert(printed.contains("artifact"), Some(printed));
+  assert(printed.contains("binary"), Some(printed));
   let report = json_of(spawned(["build", ".", "-o", "m.plyx", "--json"], []));
   assert(int(at(report, "format")) == format(), Some(shown(report)));
   assert(json::get(report, "sources") == None, Some(shown(report)));
   let artifact_bytes = int(at(report, "artifact_bytes"));
   let binary_bytes = int(at(report, "binary_bytes"));
-  assert(artifact_bytes == bytes_len(bytes_of("m.plyx")), Some(shown(report)));
+  assert(artifact_bytes == bytes_of("m.plyx").len(), Some(shown(report)));
   assert(
     binary_bytes > artifact_bytes,
     Some(
-      "the ratio the whole-artifact decision argued from: artifact "
-        ++ int_to_string(artifact_bytes)
+      "the ratio the whole-artifact decision argued from: artifact " ++ artifact_bytes.to_string()
         ++ ", binary "
-        ++ int_to_string(binary_bytes),
+        ++ binary_bytes.to_string(),
     ),
   )
 }
@@ -878,7 +848,7 @@ test "an artifact keeps the names a host handler is registered against" {
     assert(code_of(from_artifact) == code_of(from_source), Some(shown(from_artifact)));
     let message = str(at(diagnostic(from_artifact), "message"));
     assert(
-      string_contains(message, "std.net.net.listen[listener]"),
+      message.contains("std.net.net.listen[listener]"),
       Some("the artifact lost the name a handler is registered against: " ++ message),
     );
     assert(
@@ -895,7 +865,7 @@ test "the entry point keeps its program-wide name" {
     assert(str(at(report, "entry")) == "m.main", Some(shown(report)));
     let p = parts_of(bytes_of("m.plyx"));
     assert(
-      map(filter(names_of(p), |named: Named| named.hash == p.head.entry), |named: Named| named.name)
+      names_of(p).filter(|named: Named| named.hash == p.head.entry).map(|named: Named| named.name)
         == ["m.main"],
       None,
     );
@@ -968,10 +938,7 @@ test/nondet "a config schema named at build time is in the artifact and still re
   assert(refused(bare_run), Some(shown(bare_run)));
   assert(code_of(bare_run) == "E0440", Some(shown(bare_run)));
   assert(
-    string_contains(
-      str(at(diagnostic(bare_run), "message")),
-      "names no definition in this program",
-    ),
+    str(at(diagnostic(bare_run), "message")).contains("names no definition in this program"),
     Some(
       "the schema is absent from the artifact, rather than entered and declined: "
         ++ shown(bare_run),
@@ -980,7 +947,7 @@ test/nondet "a config schema named at build time is in the artifact and still re
   // Named at build time, the schema ships, and the artifact refuses to start on the missing key as
   // the source does.
   let build = stdout(on_disk(["build", "--config-schema", "m.spec", "-o", "with.plyx"]));
-  assert(string_contains(build, "startup m.spec"), Some(build));
+  assert(build.contains("startup m.spec"), Some(build));
   let missing = json_of(
     spawned(["run", "with.plyx", "--host", "--config-schema", "m.spec", "--json"], []),
   );
@@ -1019,11 +986,8 @@ test/nondet "a config schema named at build time is in the artifact and still re
     Some("an artifact that carries a schema is a different artifact"),
   );
   // And it is still the closure of its roots: no test, no law, no fixture.
-  let names = map(names_of(parts_of(bytes_of("w2.plyx"))), |n: Named| n.name);
-  assert(
-    len(filter(names, |n: String| string_contains(n, "test"))) == 0,
-    Some(string::join(names, ", ")),
-  )
+  let names = names_of(parts_of(bytes_of("w2.plyx"))).map(|n: Named| n.name);
+  assert(names.filter(|n: String| n.contains("test")).len() == 0, Some(String::join(names, ", ")))
 }
 
 test "a build schema that names nothing is refused at build time" {
@@ -1031,8 +995,8 @@ test "a build schema that names nothing is refused at build time" {
     program(with_schema());
     let out = on_disk(["build", "--config-schema", "m.absent", "-o", "x.plyx"]);
     assert(out.code != 0, Some(said(out)));
-    assert(string_contains(said(out), "E0440"), Some(said(out)));
-    assert(string_contains(said(out), "this program has: m.spec"), Some(said(out)));
+    assert(said(out).contains("E0440"), Some(said(out)));
+    assert(said(out).contains("this program has: m.spec"), Some(said(out)));
     assert(!fs.exists[cwd]("x.plyx"), None)
   })
 }
@@ -1049,14 +1013,13 @@ fn asks_for_cc() -> String =
 test/nondet "an artifact asks whether its caller bound the label it would start" {
   program(asks_for_cc());
   let _ = built();
-  fold(
-    [{ exec: ["--exec", "cc=/bin/sh"], code: 7 }, { exec: [], code: 9 }],
+  [{ exec: ["--exec", "cc=/bin/sh"], code: 7 }, { exec: [], code: 9 }].fold(
     (),
     |u: Unit, c: { exec: List<String>, code: Int }| {
-      let out = spawned(concat(["run", "m.plyx", "--host"], c.exec), []);
+      let out = spawned(["run", "m.plyx", "--host"].concat(c.exec), []);
       assert(
         out.code == c.code,
-        Some("run with " ++ string::join(c.exec, " ") ++ ":\n" ++ stderr(out)),
+        Some("run with " ++ String::join(c.exec, " ") ++ ":\n" ++ stderr(out)),
       )
     },
   )
@@ -1082,7 +1045,7 @@ test/nondet "an artifact starts what its caller bound to the label, and refuses 
   let bound = spawned(["run", "m.plyx", "--host", "--exec", "cc=/bin/sh"], []);
   assert(bound.code == 7, Some("the child's own code is what came back:\n" ++ said(bound)));
   let unbound = spawned(["run", "m.plyx", "--host"], []);
-  assert(unbound.code != 0 && string_contains(stderr(unbound), "E0456"), Some(said(unbound)))
+  assert(unbound.code != 0 && stderr(unbound).contains("E0456"), Some(said(unbound)))
 }
 
 /// Opens a span and answers without closing it.
@@ -1101,10 +1064,9 @@ test/nondet "an artifact hands back the span its entry left open beside its valu
   let _ = built();
   let out = spawned(["run", "m.plyx", "--host", "--trace", "off"], []);
   assert(out.code == 0, Some(said(out)));
-  assert(string_contains(stdout(out), "3"), Some(said(out)));
+  assert(stdout(out).contains("3"), Some(said(out)));
   assert(
-    string_contains(stderr(out), "span was still open")
-      && string_contains(stderr(out), "`order` on `orders`"),
+    stderr(out).contains("span was still open") && stderr(out).contains("`order` on `orders`"),
     Some(said(out)),
   )
 }
@@ -1122,9 +1084,8 @@ test "a signed artifact runs under --require-signer, and an unsigned or wrongly 
     let trusting = |keys: List<String>|
       json_of(
         on_disk(
-          concat(
-            ["run", "m.plyx", "--json"],
-            fold(keys, [], |acc: List<String>, k: String| concat(acc, ["--require-signer", k])),
+          ["run", "m.plyx", "--json"].concat(
+            keys.fold([], |acc: List<String>, k: String| acc.concat(["--require-signer", k])),
           ),
         ),
       );
@@ -1146,16 +1107,16 @@ test "a signed artifact runs under --require-signer, and an unsigned or wrongly 
     // longer sits beside.
     let verified = on_disk(["build", ".", "-o", "m.plyx", "--verify", "--json"]);
     assert(verified.code == 0, Some(said(verified)));
-    assert_eq(map(items(at(json_of(verified), "signers")), str), [str(at(json_of(made), "key"))]);
-    write("m.ply", string::replace(source(), "Blue(21)", "Blue(22)"));
+    assert_eq(items(at(json_of(verified), "signers")).map(str), [str(at(json_of(made), "key"))]);
+    write("m.ply", source().replace("Blue(21)", "Blue(22)"));
     let moved = json_of(on_disk(["build", ".", "-o", "m.plyx", "--verify", "--json"]));
     assert(
-      code_of(moved) == "E0461" && string_contains(shown(moved), "these sources build"),
+      code_of(moved) == "E0461" && shown(moved).contains("these sources build"),
       Some(shown(moved)),
     );
     let _ = built();
     let stale = trusting(["release.key.pub"]);
     assert(code_of(stale) == "E0460", Some(shown(stale)));
-    assert(string_contains(shown(stale), "vouch for"), Some(shown(stale)))
+    assert(shown(stale).contains("vouch for"), Some(shown(stale)))
   })
 }

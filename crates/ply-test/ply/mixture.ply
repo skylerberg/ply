@@ -2,9 +2,9 @@
 //! which hash each definition is taken at, the redirection that points every reference at the
 //! version taken, and the name each stored body is printed under.
 
-import std.bytes (bytes_of_hex, hex_of, u32_le)
+import std.bytes (u32_le)
 import std.hash (blake3)
-import std.list (sort_by)
+import std.list
 import delta (DefKey, Value, Decl, decl_key, key_before, value_key, key_text)
 import bisect (DoesNotCheck, Unresolved)
 
@@ -16,11 +16,8 @@ pub type Mixture = { eras: List<Era> }
 
 fn eras_with(acc: Map<String, Era>, key: DefKey, update: (Era) -> Era) -> Map<String, Era> = {
   let text = key_text(key);
-  let held = match map_get(acc, text) {
-    Some(e) -> e,
-    None -> { key: key, before: None, after: None },
-  };
-  map_insert(acc, text, update(held))
+  let held = match acc.get(text) { Some(e) -> e, None -> { key: key, before: None, after: None } };
+  acc.insert(text, update(held))
 }
 
 /// The baseline's closure and declarations beside the functions and declarations the test's closure
@@ -32,30 +29,29 @@ pub fn mixture_of(
   defs_now: Map<String, String>,
   decls_now: Map<String, String>,
 ) -> Mixture = {
-  let then = map_fold(
-    decls,
-    map_fold(closure, map_new(), |acc: Map<String, Era>, n: String, h: String|
+  let then = decls.fold(
+    closure.fold(Map::new(), |acc: Map<String, Era>, n: String, h: String|
       eras_with(acc, value_key(n), |e: Era| { ..e, before: Some(h) })),
     |acc: Map<String, Era>, n: String, h: String|
       eras_with(acc, decl_key(n), |e: Era| { ..e, before: Some(h) }),
   );
   let now_of = |acc: Map<String, Era>, names: List<String>, held: Map<String, String>, key: (String) -> DefKey|
-    fold(names, acc, |into: Map<String, Era>, n: String|
-      match map_get(held, n) {
+    names.fold(acc, |into: Map<String, Era>, n: String|
+      match held.get(n) {
         Some(h) -> eras_with(into, key(n), |e: Era| { ..e, after: Some(h) }),
         None -> into,
       });
   let both = now_of(now_of(then, now.fns, defs_now, value_key), now.decls, decls_now, decl_key);
-  { eras: sort_by(map_values(both), |a: Era, b: Era| key_before(a.key, b.key)) }
+  { eras: both.values().sort_by(|a: Era, b: Era| key_before(a.key, b.key)) }
 }
 
 /// Every hash the mixture could take a body at, in either era.
 pub fn hashes_of(m: Mixture) -> List<String> = {
-  let all = fold(m.eras, map_new(), |acc: Map<String, Bool>, e: Era| {
-    let with_before = match e.before { Some(h) -> map_insert(acc, h, true), None -> acc };
-    match e.after { Some(h) -> map_insert(with_before, h, true), None -> with_before }
+  let all = m.eras.fold(Map::new(), |acc: Map<String, Bool>, e: Era| {
+    let with_before = match e.before { Some(h) -> acc.insert(h, true), None -> acc };
+    match e.after { Some(h) -> with_before.insert(h, true), None -> with_before }
   });
-  map_keys(all)
+  all.keys()
 }
 
 /// The hashes a mixture takes, ascending, and where every reference to either era of each
@@ -63,18 +59,17 @@ pub fn hashes_of(m: Mixture) -> List<String> = {
 pub type Chosen = { hashes: List<String>, relink: List<{ from: String, to: String }> }
 
 fn flips(flipped: List<DefKey>, k: DefKey) -> Bool =
-  fold(flipped, false, |found: Bool, f: DefKey| found || key_text(f) == key_text(k))
+  flipped.fold(false, |found: Bool, f: DefKey| found || key_text(f) == key_text(k))
 
 /// The mixture that takes `flipped` from the post-edit era and everything else from the baseline.
 /// Two definitions whose eras share a hash but are taken at different ones cannot both be honoured,
 /// so that mixture does not check.
 pub fn choose(m: Mixture, flipped: List<DefKey>) -> Result<Chosen, Unresolved> = {
   let start: Result<{ hashes: Map<String, Bool>, relink: Map<String, String> }, Unresolved> = Ok({
-    hashes: map_new(),
-    relink: map_new(),
+    hashes: Map::new(),
+    relink: Map::new(),
   });
-  let chosen = fold(
-    m.eras,
+  let chosen = m.eras.fold(
     start,
     |acc: Result<{ hashes: Map<String, Bool>, relink: Map<String, String> }, Unresolved>, e: Era|
       match acc {
@@ -84,14 +79,13 @@ pub fn choose(m: Mixture, flipped: List<DefKey>) -> Result<Chosen, Unresolved> =
           match picked {
             None -> Ok(held),
             Some(to) ->
-              fold(
-                [e.before, e.after],
-                Ok({ hashes: map_insert(held.hashes, to, true), relink: held.relink }),
+              [e.before, e.after].fold(
+                Ok({ hashes: held.hashes.insert(to, true), relink: held.relink }),
                 |r: Result<{ hashes: Map<String, Bool>, relink: Map<String, String> }, Unresolved>, from: Option<String>|
                   match ((r, from)) {
-                    (Ok(x), Some(h)) -> match map_get(x.relink, h) {
+                    (Ok(x), Some(h)) -> match x.relink.get(h) {
                       Some(other) -> if other != to { Err(DoesNotCheck) } else { Ok(x) },
-                      None -> Ok({ ..x, relink: map_insert(x.relink, h, to) }),
+                      None -> Ok({ ..x, relink: x.relink.insert(h, to) }),
                     },
                     _ -> r,
                   },
@@ -104,8 +98,8 @@ pub fn choose(m: Mixture, flipped: List<DefKey>) -> Result<Chosen, Unresolved> =
     Err(why) -> Err(why),
     Ok(x) ->
       Ok({
-        hashes: map_keys(x.hashes),
-        relink: map(map_entries(x.relink), |e: { key: String, value: String }|
+        hashes: x.hashes.keys(),
+        relink: x.relink.entries().map(|e: { key: String, value: String }|
           { from: e.key, to: e.value }),
       }),
   }
@@ -114,19 +108,16 @@ pub fn choose(m: Mixture, flipped: List<DefKey>) -> Result<Chosen, Unresolved> =
 /// A stored body's component: the component's own hash and each member's, in class order. A body
 /// alone in its component is its only member.
 pub fn component(body: Bytes) -> Option<{ id: Bytes, members: List<Bytes> }> / {abort.raise} = {
-  let n = bytes_len(body);
-  if n == 0 { None } else if bytes_at(body, 0) == 0 {
-    let id = blake3(bytes_slice(body, 1, n));
+  let n = body.len();
+  if n == 0 { None } else if body.at(0) == 0 {
+    let id = blake3(body.slice(1, n));
     Some({ id: id, members: [id] })
-  } else if bytes_at(body, 0) == 1 && n >= 9 {
-    let payload = bytes_slice(body, 5, n);
+  } else if body.at(0) == 1 && n >= 9 {
+    let payload = body.slice(5, n);
     let id = blake3(payload);
-    let count = int_of_u32(bytes_u32_le(payload, 0));
-    if count > bytes_len(payload) / 4 { None } else {
-      Some({
-        id: id,
-        members: map(range(0, count), |class: Int| blake3(bytes_concat(id, u32_le(class)))),
-      })
+    let count = Int::of_u32(payload.u32_le(0));
+    if count > payload.len() / 4 { None } else {
+      Some({ id: id, members: range(0, count).map(|class: Int| blake3(id.concat(u32_le(class)))) })
     }
   } else { None }
 }
@@ -136,20 +127,18 @@ pub fn component(body: Bytes) -> Option<{ id: Bytes, members: List<Bytes> }> / {
 pub fn printed_names(
   bodies: List<Bytes>,
 ) -> Option<List<{ name: Bytes, hash: Bytes, public: Bool }>> / {abort.raise} = {
-  let named = fold(bodies, Some(map_new()), |acc: Option<Map<String, Bytes>>, body: Bytes|
+  let named = bodies.fold(Some(Map::new()), |acc: Option<Map<String, Bytes>>, body: Bytes|
     match acc {
       None -> None,
       Some(held) -> match component(body) {
         None -> None,
         Some(c) ->
           Some(
-            fold(c.members, held, |into: Map<String, Bytes>, member: Bytes|
-              map_insert(
-                into,
-                hex_of(member),
-                bytes_of_string(
-                  "m" ++ string_slice(hex_of(c.id), 0, 16) ++ ".d"
-                    ++ string_slice(hex_of(member), 0, 16),
+            c.members.fold(held, |into: Map<String, Bytes>, member: Bytes|
+              into.insert(
+                member.hex_of(),
+                Bytes::of_string(
+                  "m" ++ c.id.hex_of().slice(0, 16) ++ ".d" ++ member.hex_of().slice(0, 16),
                 ),
               )),
           ),
@@ -159,11 +148,10 @@ pub fn printed_names(
     None -> None,
     Some(m) ->
       Some(
-        map_fold(
-          m,
+        m.fold(
           [],
           |acc: List<{ name: Bytes, hash: Bytes, public: Bool }>, hash: String, name: Bytes|
-            push(acc, { name: name, hash: bytes_of_hex(hash), public: true }),
+            acc.push({ name: name, hash: Bytes::of_hex(hash), public: true }),
         ),
       ),
   }
@@ -207,11 +195,11 @@ test "two definitions that share a hash cannot be taken at different ones" {
 
 test "the eras line up by name and namespace, whichever holds a definition" {
   let m = mixture_of(
-    map_insert(map_new(), "m.old", "o1"),
-    map_insert(map_new(), "m.T", "t1"),
+    Map::new().insert("m.old", "o1"),
+    Map::new().insert("m.T", "t1"),
     { fns: ["m.new"], decls: ["m.T"] },
-    map_insert(map_insert(map_new(), "m.new", "n2"), "m.T", "f2"),
-    map_insert(map_new(), "m.T", "t2"),
+    Map::new().insert("m.new", "n2").insert("m.T", "f2"),
+    Map::new().insert("m.T", "t2"),
   );
   // `m.T` is reached as a declaration now; the function of its name is not, and is no era of it.
   assert_eq(m.eras, [
@@ -223,16 +211,16 @@ test "the eras line up by name and namespace, whichever holds a definition" {
 }
 
 test "a body alone in its component is its own member, and a cycle's members follow its class" {
-  let solo = bytes_concat(byte_of_int(0), b"body");
+  let solo = byte_of_int(0).concat(b"body");
   assert_eq(component(solo), Some({ id: blake3(b"body"), members: [blake3(b"body")] }));
-  let payload = bytes_concat(u32_le(2), b"pair");
-  let cycle = bytes_concat_all([byte_of_int(1), u32_le(0), payload]);
+  let payload = u32_le(2).concat(b"pair");
+  let cycle = Bytes::concat_all([byte_of_int(1), u32_le(0), payload]);
   match component(cycle) {
     Some(c) -> {
       assert_eq(c.id, blake3(payload));
       assert_eq(c.members, [
-        blake3(bytes_concat(blake3(payload), u32_le(0))),
-        blake3(bytes_concat(blake3(payload), u32_le(1))),
+        blake3(blake3(payload).concat(u32_le(0))),
+        blake3(blake3(payload).concat(u32_le(1))),
       ])
     },
     None -> panic("a member's envelope reads"),
@@ -242,8 +230,8 @@ test "a body alone in its component is its own member, and a cycle's members fol
 }
 
 test "a definition is printed under its component and its own hash" {
-  let solo = bytes_concat(byte_of_int(0), b"body");
-  let id = hex_of(blake3(b"body"));
-  let expected = bytes_of_string("m" ++ string_slice(id, 0, 16) ++ ".d" ++ string_slice(id, 0, 16));
+  let solo = byte_of_int(0).concat(b"body");
+  let id = blake3(b"body").hex_of();
+  let expected = Bytes::of_string("m" ++ id.slice(0, 16) ++ ".d" ++ id.slice(0, 16));
   assert_eq(printed_names([solo]), Some([{ name: expected, hash: blake3(b"body"), public: true }]))
 }

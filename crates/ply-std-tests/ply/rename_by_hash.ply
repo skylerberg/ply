@@ -10,7 +10,7 @@
 
 import std.checker
 import std.checker (Checked, Source)
-import std.string (replace)
+import std.string
 import std.syntax
 import std.syntax (Edit, Function, Import, ImportedName, Name, Node)
 
@@ -28,7 +28,7 @@ type Refused =
 fn limits() -> checker::Limits = { files: 64, bytes: 1048576 }
 
 fn messages(program: Checked) -> List<String> =
-  map(program.diagnostics, |d: syntax::Diagnostic| d.code ++ ": " ++ d.message)
+  program.diagnostics.map(|d: syntax::Diagnostic| d.code ++ ": " ++ d.message)
 
 fn checked(sources: List<Source>) -> Result<Checked, List<String>> / {abort.raise} =
   match checker::check_alone(sources, limits()) {
@@ -38,16 +38,16 @@ fn checked(sources: List<Source>) -> Result<Checked, List<String>> / {abort.rais
 
 /// The name a module's file is imported under: its path, as a module name.
 fn module_of(path: String) -> String / {abort.raise} =
-  replace(string_slice(path, 0, string_len(path) - 4), "/", ".")
+  path.slice(0, path.len() - 4).replace("/", ".")
 
 fn last_segment(module: String) -> String / {abort.raise} = {
-  let parts = string_split(module, ".");
-  match list_at(parts, len(parts) - 1) { Some(last) -> last, None -> module }
+  let parts = module.split(".");
+  match parts.at(parts.len() - 1) { Some(last) -> last, None -> module }
 }
 
 fn renamed_at(node: Node, to: String) -> List<Edit> =
   match syntax::name(node) {
-    Some(ident) -> [{ path: "", span: ident.span, text: bytes_of_string(to) }],
+    Some(ident) -> [{ path: "", span: ident.span, text: Bytes::of_string(to) }],
     None -> [],
   }
 
@@ -64,12 +64,12 @@ type Reach = { bare: Bool, binder: Option<String> }
 /// What `tree`, the source of the module `own`, reaches the function `from` of `module` by.
 fn reach_of(tree: Node, own: String, module: String, from: String) -> Reach / {abort.raise} =
   if own == module { { bare: true, binder: None } } else {
-    fold(syntax::children(tree), { bare: false, binder: None }, |reach: Reach, node: Node|
+    syntax::children(tree).fold({ bare: false, binder: None }, |reach: Reach, node: Node|
       if syntax::kind(node) != Import || !is_named(node, module) { reach } else {
         match syntax::children(node) {
           [] -> { ..reach, binder: Some(last_segment(module)) },
           parts ->
-            fold(parts, reach, |r: Reach, part: Node|
+            parts.fold(reach, |r: Reach, part: Node|
               match syntax::kind(part) {
                 ImportedName -> if is_named(part, from) { { ..r, bare: true } } else { r },
                 _ -> match syntax::name(part) {
@@ -91,20 +91,19 @@ fn edits_in(
   to: String,
 ) -> List<Edit> / {abort.raise} = {
   let reach = reach_of(tree, own, module, from);
-  fold(syntax::walk(tree), [], |edits: List<Edit>, node: Node|
+  syntax::walk(tree).fold([], |edits: List<Edit>, node: Node|
     match syntax::kind(node) {
       Function -> if own == module && is_named(node, from) {
-        fold(renamed_at(node, to), edits, push_edit)
+        renamed_at(node, to).fold(edits, push_edit)
       } else { edits },
       ImportedName -> if reach.bare && own != module && is_named(node, from) {
-        fold(renamed_at(node, to), edits, push_edit)
+        renamed_at(node, to).fold(edits, push_edit)
       } else { edits },
       Name -> if !is_named(node, from) { edits } else {
         match ((syntax::qualifier(node), reach.binder)) {
-          (None, _) -> if reach.bare { fold(renamed_at(node, to), edits, push_edit) }
-          else { edits },
+          (None, _) -> if reach.bare { renamed_at(node, to).fold(edits, push_edit) } else { edits },
           (Some(_), Some(binder)) -> if is_qualified_by(node, binder) {
-            fold(renamed_at(node, to), edits, push_edit)
+            renamed_at(node, to).fold(edits, push_edit)
           } else { edits },
           (Some(_), None) -> edits,
         }
@@ -113,7 +112,7 @@ fn edits_in(
     })
 }
 
-fn push_edit(edits: List<Edit>, edit: Edit) -> List<Edit> = push(edits, edit)
+fn push_edit(edits: List<Edit>, edit: Edit) -> List<Edit> = edits.push(edit)
 
 fn rewritten(
   sources: List<Source>,
@@ -121,7 +120,7 @@ fn rewritten(
   from: String,
   to: String,
 ) -> List<Source> / {abort.raise} =
-  map(sources, |source: Source| {
+  sources.map(|source: Source| {
     let edits = edits_in(syntax::parse(source.text).tree, module_of(source.path), module, from, to);
     match syntax::edited(source.text, edits) {
       Some(text) -> { path: source.path, text: text },
@@ -142,22 +141,18 @@ fn rename(
     Err(said) -> Err(Unchecked(said)),
     Ok(before) -> {
       let old = module ++ "." ++ from;
-      match map_get(checker::hashes(before), old) {
+      match checker::hashes(before).get(old) {
         None -> Err(NotDefined(old)),
         Some(hash) -> {
           let after_sources = rewritten(sources, module, from, to);
           match checked(after_sources) {
             Err(said) -> Err(Breaks(said)),
             Ok(after) -> {
-              let expected = map_insert(
-                map_remove(checker::hashes(before), old),
-                module ++ "." ++ to,
-                hash,
-              );
+              let expected = checker::hashes(before).remove(old).insert(module ++ "." ++ to, hash);
               if checker::hashes(after) == expected { Ok(after_sources) } else {
                 Err(
                   Moves(
-                    filter(checker::moved(before, after), |name: String|
+                    checker::moved(before, after).filter(|name: String|
                       name != old && name != module ++ "." ++ to),
                   ),
                 )
@@ -184,7 +179,7 @@ fn shop() -> List<Source> =
   ]
 
 fn text_of(sources: List<Source>, path: String) -> Bytes =
-  fold(sources, b"", |found: Bytes, s: Source| if s.path == path { s.text } else { found })
+  sources.fold(b"", |found: Bytes, s: Source| if s.path == path { s.text } else { found })
 
 test "a rename rewrites the definition, its import and every call, and keeps every other byte" {
   match rename(shop(), "shop.prices", "total", "sum_of") {
@@ -212,13 +207,10 @@ test "a renamed program holds the same definitions: each hash stands, the rename
     (Ok(was), Ok(now)) -> {
       assert_eq(checker::moved(was, now), ["shop.prices.sum_of", "shop.prices.total"]);
       assert_eq(
-        map_get(checker::hashes(now), "shop.prices.sum_of"),
-        map_get(checker::hashes(was), "shop.prices.total"),
+        checker::hashes(now).get("shop.prices.sum_of"),
+        checker::hashes(was).get("shop.prices.total"),
       );
-      assert_eq(
-        map_get(checker::hashes(now), "main.main"),
-        map_get(checker::hashes(was), "main.main"),
-      )
+      assert_eq(checker::hashes(now).get("main.main"), checker::hashes(was).get("main.main"))
     },
     _ -> panic("both programs check"),
   }
