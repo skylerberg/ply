@@ -244,8 +244,9 @@ fn open_needed(emitter: Emitter, ty: Ty) -> Emitter =
   }
 
 /// `emitter` noting what builtin `name` reads of the type arguments the reference `at` leaves
-/// unknown: the layout of an element it reads in place (`Array::get`, or a field of
-/// `Columns::get`'s record), or the type `compare` orders by and `reflect` and `shown` reflect at.
+/// unknown: the layout of an element it makes, writes or reads in place (`Array::new`, `set`,
+/// `of_list` and `get`, or a field of `Columns::get`'s record), or the type `compare` orders by and
+/// `reflect`, `shown` and `digest` read at.
 fn builtin_needed(emitter: Emitter, written: Bytes, at: Span) -> Emitter = {
   let name = generated_builtin(written);
   match emitter.typed.get(span_key(at)) {
@@ -254,7 +255,9 @@ fn builtin_needed(emitter: Emitter, written: Bytes, at: Span) -> Emitter = {
         || name == b"shown"
         || name == b"digest"
         || name == b"?encoded" { t.args.fold(emitter, |e: Emitter, a: Type| exact_needed(e, a)) }
-    else if name == b"Array::get" || name == b"Columns::get" {
+    else if name == b"Array::get" || name == b"Columns::get" || name == b"Array::new"
+        || name == b"Array::set"
+        || name == b"Array::of_list" {
       match t.args.at(0) {
         Some(element) -> if laid_field(b"e", element) == None { layout_needed(emitter, element) }
         else { emitter },
@@ -4040,11 +4043,7 @@ fn position_call(
                             indent(
                               line(
                                 check(asked),
-                                Bytes::concat_all([
-                                  b"if (rt_unbox_bool_p(ctx, ",
-                                  called.name,
-                                  b")) {",
-                                ]),
+                                Bytes::concat_all([b"if (", bool_of_word(called.name), b") {"]),
                               ),
                             ),
                             Bytes::concat_all([
@@ -5488,6 +5487,23 @@ fn width_builtin(
       None -> None,
       Some(r) -> reflected(emitter, name == b"shown", r, args, params, span),
     }
+  } else if ((name == b"Array::new" && args.len() == 2)
+      || (name == b"Array::set" && args.len() == 3)
+      || (name == b"Array::of_list" && args.len() == 1))
+      && array_element_at(emitter, at) != None {
+    match array_element_at(emitter, at) {
+      None -> None,
+      Some(e) -> match args_evaled(emitter, args, params, 0, []) {
+        None -> None,
+        Some(e0) -> {
+          let em = site(e0.emitter, span);
+          let v = |i: Int| nth_value(e0.vals, i);
+          if name == b"Array::new" { Some(array_new(em, e, v(0), v(1))) }
+          else if name == b"Array::set" { Some(array_set(em, e, v(0), v(1), v(2))) }
+          else { Some(array_of_list(em, e, v(0))) }
+        },
+      },
+    }
   } else if (name == b"digest" || name == b"?encoded") && args.len() == 1 {
     match encoding_at(emitter, at) {
       None -> None,
@@ -6016,6 +6032,436 @@ fn inline_get(
       },
     },
   }
+
+/// How the call of an `Array` builtin at `at` holds the elements of the type it settled, where it
+/// settled one: as a record's field `e` of that type is held.
+fn array_element_at(emitter: Emitter, at: Span) -> Option<FieldTy> =
+  match emitter.typed.get(span_key(at)) {
+    None -> None,
+    Some(t) -> match t.args.at(0) {
+      Some(ty) -> if has_vars(ty) { None } else { laid_field(b"e", ty) },
+      None -> None,
+    },
+  }
+
+/// Whether an array holds an element held as `e` in place: a record, a scalar as its bits, or an
+/// `Option` as its payload's word; any other element is its word.
+fn element_in_place(e: FieldTy) -> Bool =
+  match e.ty { TyRec(_) -> true, _ -> raw_slot(e.kind) || e.kind == KSum(Zeroed) }
+
+/// Whether an element held as `e` is a scalar's bits, which hold no count.
+fn element_raw(e: FieldTy) -> Bool = match e.ty { TyRec(_) -> false, _ -> raw_slot(e.kind) }
+
+/// `held`, an element as `element_held` holds it, as the word the runtime's builtin takes: a scalar
+/// boxed and an `Option` its object.
+fn element_word(e: FieldTy, held: CValue) -> Bytes =
+  if element_raw(e) || e.kind == KSum(Zeroed) { as_word(held) } else { held.expr }
+
+/// The words of an array an element held as `e` takes.
+fn element_stride(e: FieldTy) -> Int = if element_in_place(e) { laid_of([e]).width } else { 1 }
+
+/// An array of `n` elements held as `e`, allocated as the type lays one out: its stride, its
+/// element's shape and, where it counts some words and not others, a bitmap saying which. Its
+/// elements are for the caller to write; it is `a`, a local already declared.
+fn array_allocated(emitter: Emitter, e: FieldTy, a: Bytes, n: Bytes) -> Emitter / {abort.raise} =
+  if !element_in_place(e) {
+    line(emitter, Bytes::concat_all([a, b" = rt_alloc_p(ctx, 15, ", n, b", 0, 0);"]))
+  } else {
+    let l = laid_of([e]);
+    let s = shape_of_fields(emitter, [e]);
+    let stride = ascii_of_int(l.width);
+    let mixed = l.counted.len() > 0;
+    let width = fresh(s.emitter);
+    let allocated = line(
+      line(
+        line(
+          width.emitter,
+          Bytes::concat_all([b"int64_t ", width.name, b" = ", n, b" * ", stride, b";"]),
+        ),
+        Bytes::concat_all([
+          a,
+          b" = rt_alloc_p(ctx, 15, ",
+          width.name,
+          b", ",
+          shape_text(s.i),
+          b", ",
+          if mixed { b"6" } else { b"5" },
+          b");",
+        ]),
+      ),
+      Bytes::concat_all([b"ply_obj(", a, b")->aux = ", stride, b";"]),
+    );
+    if !mixed { allocated } else {
+      let i = fresh(allocated);
+      let opened = indent(
+        line(
+          line(
+            i.emitter,
+            Bytes::concat_all([
+              b"memset(ply_words(",
+              a,
+              b") + ",
+              width.name,
+              b", 0, (size_t)((",
+              width.name,
+              b" + 63) / 64) * 8);",
+            ]),
+          ),
+          Bytes::concat_all([
+            b"for (int64_t ",
+            i.name,
+            b" = 0; ",
+            i.name,
+            b" < ",
+            n,
+            b"; ",
+            i.name,
+            b"++) {",
+          ]),
+        ),
+      );
+      outdent(
+        line(
+          l.counted.fold(opened, |acc: Emitter, c: Int|
+            line(
+              acc,
+              Bytes::concat_all([
+                b"{ int64_t b = ",
+                i.name,
+                b" * ",
+                stride,
+                b" + ",
+                ascii_of_int(c),
+                b"; ply_words(",
+                a,
+                b")[",
+                width.name,
+                b" + b / 64] |= (Word)1 << (b % 64); }",
+              ]),
+            )),
+          b"}",
+        ),
+      )
+    }
+  }
+
+/// The value `v` holds, written as element `i` of the array `a` holds an element held as `e`:
+/// a record copied in place, a scalar as its bits, any other as its word; it takes `v`'s count.
+fn element_written(a: Bytes, i: Bytes, e: FieldTy, v: Bytes) -> Bytes =
+  match e.ty {
+    TyRec(inner) ->
+      Bytes::concat_all([
+        b"ply_embed(ctx, ",
+        a,
+        b", (int)(",
+        i,
+        b" * ",
+        ascii_of_int(element_stride(e)),
+        b"), ",
+        v,
+        b", ",
+        ascii_of_int(laid_of(inner).tail),
+        b");",
+      ]),
+    _ -> if raw_slot(e.kind) {
+      raw_store(
+        a,
+        Bytes::concat_all([i, b" * ", ascii_of_int(element_stride(e))]),
+        { kind: e.kind, expr: v, ty: TyOpen([]) },
+        e.kind,
+      )
+    } else { Bytes::concat_all([b"ply_words(", a, b")[", i, b"] = ", v, b";"]) },
+  }
+
+/// `v` as element `element_written` writes: a record's or any word's own word, which the array
+/// takes, or a scalar's bits in a local of its kind.
+fn element_held(emitter: Emitter, e: FieldTy, v: CValue) -> WithValue =
+  match e.ty {
+    TyRec(_) -> owned(emitter, v),
+    _ -> if raw_slot(e.kind) { held_raw(emitter, v, e.kind) } else { owned(emitter, v) },
+  }
+
+/// What the element at `i` of the array `a` holds as `e` lets go of before another is written over
+/// it.
+fn element_dropped(a: Bytes, i: Bytes, e: FieldTy) -> Bytes =
+  match e.ty {
+    TyRec(_) ->
+      Bytes::concat_all([
+        b"ply_drop_embedded(ctx, ",
+        a,
+        b", (int)(",
+        i,
+        b" * ",
+        ascii_of_int(element_stride(e)),
+        b"));",
+      ]),
+    _ -> if raw_slot(e.kind) { b"" }
+    else { Bytes::concat_all([b"ply_dec(ctx, ply_words(", a, b")[", i, b"]);"]) },
+  }
+
+/// `Array::new(n, x)`, laid out as an array of `e`'s type is: `n` holders of `x`, which it takes.
+/// A length below zero or past what an array holds is the runtime's to refuse.
+fn array_new(emitter: Emitter, e: FieldTy, n: CValue, x: CValue) -> WithValue / {abort.raise} = {
+  let count = bind(emitter, KInt, as_int(n));
+  let k = count.value.expr;
+  let held = element_held(count.emitter, e, x);
+  let v = held.value.expr;
+  let counted = !element_raw(e);
+  let made = bind(held.emitter, KBoxed, b"0");
+  let a = made.value.expr;
+  let limit = ascii_of_int(2147483647 / element_stride(e));
+  let refused = indent(
+    line(made.emitter, Bytes::concat_all([b"if (", k, b" < 0 || ", k, b" > ", limit, b") {"])),
+  );
+  let to_runtime = line(
+    refused,
+    Bytes::concat_all([
+      a,
+      b" = ",
+      builtin_call_over(b"Array::new", [
+        Bytes::concat_all([
+          b"(ply_fits_imm(",
+          k,
+          b") ? ply_imm(",
+          k,
+          b") : rt_box_int_p(ctx, ",
+          k,
+          b"))",
+        ]),
+        element_word(e, held.value),
+      ]),
+      b";",
+    ]),
+  );
+  let laid = array_allocated(indent(line(outdent(to_runtime), b"} else {")), e, a, k);
+  let i = fresh(laid);
+  let shared = if counted {
+    line(
+      i.emitter,
+      Bytes::concat_all([
+        b"if (",
+        k,
+        b" == 0) { ply_dec(ctx, ",
+        v,
+        b"); } else { for (int64_t ",
+        i.name,
+        b" = 1; ",
+        i.name,
+        b" < ",
+        k,
+        b"; ",
+        i.name,
+        b"++) ply_inc(",
+        v,
+        b"); }",
+      ]),
+    )
+  } else { i.emitter };
+  let filled = line(
+    shared,
+    Bytes::concat_all([
+      b"for (int64_t ",
+      i.name,
+      b" = 0; ",
+      i.name,
+      b" < ",
+      k,
+      b"; ",
+      i.name,
+      b"++) { ",
+      element_written(a, i.name, e, v),
+      b" }",
+    ]),
+  );
+  {
+    emitter: note_made(check(line(outdent(filled), b"}")), a),
+    value: { kind: KBoxed, expr: a, ty: TyArr(Some(e)) },
+  }
+}
+
+/// `Array::set(xs, i, v)`, laid out as an array of `e`'s type is: written in place where `xs` is its
+/// only holder and into a copy otherwise, each counted word of which is held once more. An index
+/// out of range is the runtime's to refuse. Takes `xs` and `v`.
+fn array_set(
+  emitter: Emitter,
+  e: FieldTy,
+  xs: CValue,
+  iv: CValue,
+  v0: CValue,
+) -> WithValue / {abort.raise} = {
+  let arr = owned(emitter, xs);
+  let idx = bind(arr.emitter, KInt, as_int(iv));
+  let held = element_held(idx.emitter, e, v0);
+  let v = held.value.expr;
+  let made = bind(held.emitter, KBoxed, arr.value.expr);
+  let a = made.value.expr;
+  let i = idx.value.expr;
+  let stride = element_stride(e);
+  let to_runtime = line(
+    indent(
+      line(
+        made.emitter,
+        Bytes::concat_all([b"if ((uint64_t)", i, b" >= (uint64_t)ply_array_len(", a, b")) {"]),
+      ),
+    ),
+    Bytes::concat_all([
+      a,
+      b" = ",
+      builtin_call_over(b"Array::set", [
+        a,
+        Bytes::concat_all([
+          b"(ply_fits_imm(",
+          i,
+          b") ? ply_imm(",
+          i,
+          b") : rt_box_int_p(ctx, ",
+          i,
+          b"))",
+        ]),
+        element_word(e, held.value),
+      ]),
+      b";",
+    ]),
+  );
+  let copy = fresh(indent(line(outdent(to_runtime), b"} else {")));
+  let j = fresh(copy.emitter);
+  // Each word of an element the array counts, held once more by the copy.
+  let counts = if element_in_place(e) {
+    laid_of([e]).counted.map(|c: Int|
+      Bytes::concat_all([
+        b"ply_inc(ply_words(",
+        copy.name,
+        b")[",
+        j.name,
+        b" * ",
+        ascii_of_int(stride),
+        b" + ",
+        ascii_of_int(c),
+        b"]);",
+      ]))
+  } else { [Bytes::concat_all([b"ply_inc(ply_words(", copy.name, b")[", j.name, b"]);"])] };
+  let copied = line(
+    line(
+      j.emitter,
+      Bytes::concat_all([
+        b"int in_place = ply_obj(",
+        a,
+        b")->rc == 1; int64_t n = ply_array_len(",
+        a,
+        b");",
+      ]),
+    ),
+    Bytes::concat_all([
+      b"if (!in_place) { PlyObj *o = ply_obj(",
+      a,
+      b"); Word ",
+      copy.name,
+      b" = rt_alloc_p(ctx, 15, o->len, o->layout, o->flags); ",
+      b"ply_obj(",
+      copy.name,
+      b")->aux = o->aux; ",
+      b"memcpy(ply_words(",
+      copy.name,
+      b"), ply_words(",
+      a,
+      b"), (size_t)(o->len + ((o->flags & PLY_MIXED) ? (o->len + 63) / 64 : 0)) * 8); ",
+      b"for (int64_t ",
+      j.name,
+      b" = 0; ",
+      j.name,
+      b" < n; ",
+      j.name,
+      b"++) { ",
+      Bytes::concat_all(counts),
+      b" } ",
+      b"ply_dec(ctx, ",
+      a,
+      b"); ",
+      a,
+      b" = ",
+      copy.name,
+      b"; }",
+    ]),
+  );
+  let written = line(
+    line(
+      line(copied, b"rt_note_update_p(ctx, in_place, in_place ? 0 : n);"),
+      element_dropped(a, i, e),
+    ),
+    element_written(a, i, e, v),
+  );
+  {
+    emitter: note_made(check(line(outdent(written), b"}")), a),
+    value: { kind: KBoxed, expr: a, ty: TyArr(Some(e)) },
+  }
+}
+
+/// `Array::of_list(xs)`, laid out as an array of `e`'s type is: each element of the list written as
+/// the array holds it. Takes `xs`.
+fn array_of_list(emitter: Emitter, e: FieldTy, xs: CValue) -> WithValue / {abort.raise} = {
+  let list = owned(emitter, xs);
+  let l = list.value.expr;
+  let count = bind(list.emitter, KInt, length_of(b"List::len", l));
+  let k = count.value.expr;
+  let made = bind(count.emitter, KBoxed, b"0");
+  let a = made.value.expr;
+  let limit = ascii_of_int(2147483647 / element_stride(e));
+  let to_runtime = line(
+    indent(line(made.emitter, Bytes::concat_all([b"if (", k, b" > ", limit, b") {"]))),
+    Bytes::concat_all([a, b" = ", builtin_call_over(b"Array::of_list", [l]), b";"]),
+  );
+  let laid = array_allocated(indent(line(outdent(to_runtime), b"} else {")), e, a, k);
+  let i = fresh(laid);
+  let w = fresh(i.emitter);
+  let raw = element_raw(e);
+  let word = { kind: KBoxed, expr: w.name, ty: TyOpen([]) };
+  let at = Bytes::concat_all([i.name, b" * ", ascii_of_int(element_stride(e))]);
+  // A scalar arrives as its word, read at its kind: a `Decimal` as its two words.
+  let stored = if e.kind == KDec { raw_store(a, at, word, KDec) } else {
+    Bytes::concat_all([b"ply_words(", a, b")[", at, b"] = ", field_word(word, e.kind), b";"])
+  };
+  let filled = line(
+    line(
+      w.emitter,
+      Bytes::concat_all([
+        b"for (int64_t ",
+        i.name,
+        b" = 0; ",
+        i.name,
+        b" < ",
+        k,
+        b"; ",
+        i.name,
+        b"++) { Word ",
+        w.name,
+        b" = rt_list_at_p(ctx, ",
+        l,
+        b", ",
+        i.name,
+        b"); ",
+        if raw { Bytes::concat_all([stored, b" ply_dec(ctx, ", w.name, b");"]) }
+        // An `Option` arrives as its object and is held as its payload's word.
+        else if e.kind == KSum(Zeroed) {
+          Bytes::concat_all([
+            b"ply_words(",
+            a,
+            b")[",
+            i.name,
+            b"] = rt_maybe_open_p(ctx, ",
+            w.name,
+            b");",
+          ])
+        } else { element_written(a, i.name, e, w.name) },
+        b" }",
+      ]),
+    ),
+    Bytes::concat_all([b"ply_dec(ctx, ", l, b");"]),
+  );
+  {
+    emitter: note_made(check(line(outdent(filled), b"}")), a),
+    value: { kind: KBoxed, expr: a, ty: TyArr(Some(e)) },
+  }
+}
 
 /// Element `i` of array `a`, whose elements are held as a record's field `e` of their type is: a
 /// record in place as the address of its header there, a scalar as its bits, anything else as its
@@ -7727,10 +8173,13 @@ fn as_bool(value: CValue) -> Bytes =
     KSum(_) -> b"ply_maybe_unrouted",
     KNum(_) -> Bytes::concat_all([b"((", value.expr, b") != 0)"]),
     KInt -> Bytes::concat_all([b"((", value.expr, b") != 0)"]),
-    KBoxed -> Bytes::concat_all([b"rt_unbox_bool_p(ctx, ", value.expr, b")"]),
+    KBoxed -> bool_of_word(value.expr),
     KFloat -> Bytes::concat_all([b"rt_unbox_bool_p(ctx, ", as_word(value), b")"]),
     KDec -> Bytes::concat_all([b"rt_unbox_bool_p(ctx, ", as_word(value), b")"]),
   }
+
+/// C's truth of a `Bool` the word `w` holds: the word is `true`'s own.
+fn bool_of_word(w: Bytes) -> Bytes = Bytes::concat_all([b"(", w, b" == ply_true)"])
 
 /// A word is read in place when it is a `Float`'s own object; the runtime reads any other.
 fn as_float(value: CValue) -> Bytes =
@@ -14641,11 +15090,7 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter =
           KBoxed -> charge(acc, i, b"p".concat(ascii_of_int(i))),
           KSum(_) -> charge(acc, i, b"p".concat(ascii_of_int(i))),
           KBool -> {
-            let o = bind(
-              acc,
-              KBool,
-              Bytes::concat_all([b"rt_unbox_bool_p(ctx, p", ascii_of_int(i), b")"]),
-            );
+            let o = bind(acc, KBool, bool_of_word(b"p".concat(ascii_of_int(i))));
             remember(o.emitter, i, o.value)
           },
           KNum(w) -> {
@@ -18002,6 +18447,56 @@ test "a value is digested through a root written for its type, its parts encoded
   assert(body(keyed).tables.calls.contains(b"m.cents"), None)
 }
 
+test "an array is made, written and listed into as the type of its elements lays it out" {
+  let src = Bytes::concat_all([
+    b"type R = { name: Bytes, n: Int }\n",
+    b"fn made(n: Int, r: R) -> Array<R> / {abort.raise} = Array::new(n, r)\n",
+    b"fn put(xs: Array<R>, i: Int, r: R) -> Array<R> / {abort.raise} = xs.set(i, r)\n",
+    b"fn listed(xs: List<Int>) -> Array<Int> = Array::of_list(xs)\n",
+    b"fn words(n: Int, s: Bytes) -> Array<Bytes> / {abort.raise} = Array::new(n, s)\n",
+  ]);
+  let out = emit_all_program(
+    [{ name: b"m", src: src }],
+    [],
+    [b"Array::new", b"Array::set", b"Array::of_list"],
+    true,
+  );
+  let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
+  assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None]);
+  // Allocated as an array, a write's copy too, its elements written by the code that knows their
+  // type.
+  assert_eq(has(b"rt_alloc_p(ctx, 15, "), [true, true, true, true]);
+  // A record is copied in place and let go of where it is written over; an `Int` is its bits.
+  assert_eq(has(b"ply_embed(ctx, "), [true, true, false, false]);
+  assert_eq(has(b"ply_drop_embedded(ctx, "), [false, true, false, false]);
+  assert_eq(has(b"rt_list_at_p(ctx, "), [false, false, true, false]);
+  // A write is counted in place or into a copy.
+  assert_eq(has(b"rt_note_update_p(ctx, "), [false, true, false, false])
+}
+
+test "an array of options holds each as its payload's word, and a generic one is made at its type" {
+  let src = Bytes::concat_all([
+    b"fn opts(xs: List<Option<Bytes>>) -> Array<Option<Bytes>> = Array::of_list(xs)\n",
+    b"fn filled<a>(n: Int, x: a) -> Array<a> / {abort.raise} = Array::new(n, x)\n",
+    b"fn ints(n: Int) -> Array<Int> / {abort.raise} = filled(n, 7)\n",
+  ]);
+  let answers = answers_of([b"m"], [src], [], [b"m.opts", b"m.filled", b"m.ints", b"m.filled@Int"]);
+  let body = |name: Bytes|
+    match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
+        if a.name == name { Some(a) } else { acc }) {
+      Some(a) -> match a.answer {
+        Body(b) -> b,
+        Refused(r) -> panic(String::of_bytes_lossy(Bytes::concat_all([name, b": ", r.why]))),
+      },
+      None -> panic("no answer"),
+    };
+  // A list's `Option` is its object; the array holds its payload's word.
+  assert(body(b"m.opts").text.index_of(b"rt_maybe_open_p(ctx, ") != None, None);
+  // Making an array reads its element's layout, so a generic body is made again at each.
+  assert_eq(body(b"m.filled").tables.generics.needs, [{ var: 0, reads: Layout }]);
+  assert(body(b"m.filled@Int").text.index_of(b"rt_alloc_p(ctx, 15, ") != None, None)
+}
+
 test "strings and byte strings are compared by their bytes where they lie" {
   let src = Bytes::concat_all([
     b"fn same(a: String, b: String) -> Bool = a == b\n",
@@ -18908,6 +19403,9 @@ fn answers_of(
       b"?encoded",
       b"Bytes::concat_all",
       b"Bytes::blake3",
+      b"Array::new",
+      b"Array::set",
+      b"Array::of_list",
     ],
     wanted,
     [],

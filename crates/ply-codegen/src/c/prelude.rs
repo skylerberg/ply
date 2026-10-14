@@ -253,6 +253,7 @@ helpers![
     (rt_parallel, 2, false),
     (rt_parallel_past, 4, false),
     (rt_array_lookup, 2, true),
+    (rt_note_update, 2, false),
     (rt_baked, 2, true),
     (rt_stored, 1, true),
 ];
