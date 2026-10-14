@@ -394,7 +394,7 @@ module.exports = grammar({
       $.parallel_expression,
     ),
 
-    qualified_name: $ => seq($.identifier, '::', $.identifier),
+    qualified_name: $ => seq($.identifier, '::', $.identifier, optional(seq('::', $.identifier))),
 
     field_expression: $ => prec(PREC.field, seq(
       field('base', $._expression),

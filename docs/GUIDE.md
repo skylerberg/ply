@@ -1292,7 +1292,8 @@ builtins (§12) and what its home module declares (§13).
 `value.m::f(args)` is `m::f(value, args)`, whatever the value's type: a
 function that is no function of the type takes its place in a chain,
 `text.trim().parse::number()`. `m` is a module or a type in scope, as before
-any `::`.
+any `::`, and a function of a type another module declares is named through
+that module, `shapes::Shape::make(3)` and `s.shapes::Shape::area()`.
 
 A bare name before the dot is read by what it names: a binding makes
 `x.name(..)` a call on its value, and anything else a perform of the effect `x`
