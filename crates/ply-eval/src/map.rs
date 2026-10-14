@@ -44,77 +44,98 @@ fn put(m: &mut Map, k: Value, v: Value, what: &str, span: Span) -> Result<(), Di
 /// Replaces an equal key's entry, key and value both.
 pub(crate) fn insert(mut m: Value, k: Value, v: Value, span: Span) -> Result<Value, Diagnostic> {
     match &mut m {
-        Value::Map(out) => put(out, k, v, "map_insert", span)?,
-        other => return Err(crate::value::type_error(span, "`map_insert`", "Map", other)),
+        Value::Map(out) => put(out, k, v, "Map::insert", span)?,
+        other => {
+            return Err(crate::value::type_error(
+                span,
+                "`Map::insert`",
+                "Map",
+                other,
+            ));
+        }
     }
     Ok(m)
 }
 
-/// Removes `k`'s entry for `map_update`, so a map held once lends its function the value held once.
+/// Removes `k`'s entry for `Map::update`, so a map held once lends its function the value held once.
 pub fn take(mut m: Value, k: &Value, span: Span) -> Result<(Value, Option<Value>), Diagnostic> {
-    key(k, "map_update", span)?;
+    key(k, "Map::update", span)?;
     let taken = match &mut m {
         Value::Map(out) => out.remove(k),
-        other => return Err(crate::value::type_error(span, "`map_update`", "Map", other)),
+        other => {
+            return Err(crate::value::type_error(
+                span,
+                "`Map::update`",
+                "Map",
+                other,
+            ));
+        }
     };
     Ok((m, taken))
 }
 
 pub(crate) fn get(m: &Value, k: &Value, span: Span) -> Result<Value, Diagnostic> {
-    key(k, "map_get", span)?;
-    Ok(match m.as_map(span, "`map_get`")?.get(k) {
+    key(k, "Map::get", span)?;
+    Ok(match m.as_map(span, "`Map::get`")?.get(k) {
         Some(v) => some(v.clone()),
         None => none(),
     })
 }
 
 pub(crate) fn contains(m: &Value, k: &Value, span: Span) -> Result<Value, Diagnostic> {
-    key(k, "map_contains", span)?;
+    key(k, "Map::contains", span)?;
     Ok(Value::Bool(
-        m.as_map(span, "`map_contains`")?.contains_key(k),
+        m.as_map(span, "`Map::contains`")?.contains_key(k),
     ))
 }
 
 /// An absent key is a no-op, not an error.
 pub(crate) fn remove(mut m: Value, k: &Value, span: Span) -> Result<Value, Diagnostic> {
-    key(k, "map_remove", span)?;
+    key(k, "Map::remove", span)?;
     match &mut m {
         Value::Map(out) => {
             out.remove(k);
         }
-        other => return Err(crate::value::type_error(span, "`map_remove`", "Map", other)),
+        other => {
+            return Err(crate::value::type_error(
+                span,
+                "`Map::remove`",
+                "Map",
+                other,
+            ));
+        }
     }
     Ok(m)
 }
 
 pub(crate) fn len(m: &Value, span: Span) -> Result<Value, Diagnostic> {
-    Ok(Value::Int(m.as_map(span, "`map_len`")?.len() as i64))
+    Ok(Value::Int(m.as_map(span, "`Map::len`")?.len() as i64))
 }
 
 pub(crate) fn keys(m: &Value, span: Span) -> Result<Value, Diagnostic> {
-    let m = m.as_map(span, "`map_keys`")?;
+    let m = m.as_map(span, "`Map::keys`")?;
     Ok(Value::list(m.keys().cloned().collect()))
 }
 
 pub(crate) fn values(m: &Value, span: Span) -> Result<Value, Diagnostic> {
-    let m = m.as_map(span, "`map_values`")?;
+    let m = m.as_map(span, "`Map::values`")?;
     Ok(Value::list(m.values().cloned().collect()))
 }
 
 pub(crate) fn entries(m: &Value, span: Span) -> Result<Value, Diagnostic> {
-    let m = m.as_map(span, "`map_entries`")?;
+    let m = m.as_map(span, "`Map::entries`")?;
     Ok(Value::list(
         m.iter().map(|(k, v)| entry(k.clone(), v.clone())).collect(),
     ))
 }
 
-/// Later entries win, so `map_of_entries(map_entries(m))` is `m`; derived codecs rely on it.
+/// Later entries win, so `Map::of_entries(map_entries(m))` is `m`; derived codecs rely on it.
 pub(crate) fn of_entries(list: &Value, span: Span) -> Result<Value, Diagnostic> {
-    let items = list.as_list(span, "`map_of_entries`")?;
+    let items = list.as_list(span, "`Map::of_entries`")?;
     let mut out = Map::new();
     for item in items.iter() {
         let (k, v) = pair(item, span)?;
-        put(&mut out, k, v, "map_of_entries", span)?;
+        put(&mut out, k, v, "Map::of_entries", span)?;
     }
     Ok(Value::Map(out))
 }
@@ -123,7 +144,7 @@ fn pair(item: &Value, span: Span) -> Result<(Value, Value), Diagnostic> {
     let Value::Record(fields) = item else {
         return Err(crate::value::type_error(
             span,
-            "`map_of_entries`",
+            "`Map::of_entries`",
             "a list of `{key, value}` records",
             item,
         ));
@@ -135,7 +156,7 @@ fn pair(item: &Value, span: Span) -> Result<(Value, Value), Diagnostic> {
         (Some(k), Some(v)) => Ok((k.clone(), v.clone())),
         _ => Err(Diagnostic::error(
             codes::RUNTIME_ERROR,
-            "`map_of_entries` needs each entry to have a `key` and a `value` field",
+            "`Map::of_entries` needs each entry to have a `key` and a `value` field",
         )
         .primary(span, format!("this entry is {}", crate::slot(0)))
         .showing(vec![crate::Plain::shown(item)])),
@@ -144,9 +165,9 @@ fn pair(item: &Value, span: Span) -> Result<(Value, Value), Diagnostic> {
 
 /// The right side wins a shared key.
 pub(crate) fn merge(a: &Value, b: &Value, span: Span) -> Result<Value, Diagnostic> {
-    let mut out = a.as_map(span, "`map_merge`")?.clone();
-    for (k, v) in b.as_map(span, "`map_merge`")?.iter() {
-        put(&mut out, k.clone(), v.clone(), "map_merge", span)?;
+    let mut out = a.as_map(span, "`Map::merge`")?.clone();
+    for (k, v) in b.as_map(span, "`Map::merge`")?.iter() {
+        put(&mut out, k.clone(), v.clone(), "Map::merge", span)?;
     }
     Ok(Value::Map(out))
 }
@@ -162,18 +183,18 @@ fn entry_of(found: Option<(&Value, &Value)>) -> Value {
 /// The builtin as a type error names it.
 fn quoted(which: Builtin) -> &'static str {
     match which {
-        Builtin::MapFirst => "`map_first`",
-        Builtin::MapLast => "`map_last`",
-        Builtin::MapFloor => "`map_floor`",
-        Builtin::MapCeiling => "`map_ceiling`",
-        Builtin::MapBelow => "`map_below`",
-        Builtin::MapAbove => "`map_above`",
-        Builtin::MapPopFirst => "`map_pop_first`",
-        _ => "`map_pop_last`",
+        Builtin::MapFirst => "`Map::first`",
+        Builtin::MapLast => "`Map::last`",
+        Builtin::MapFloor => "`Map::floor`",
+        Builtin::MapCeiling => "`Map::ceiling`",
+        Builtin::MapBelow => "`Map::below`",
+        Builtin::MapAbove => "`Map::above`",
+        Builtin::MapPopFirst => "`Map::pop_first`",
+        _ => "`Map::pop_last`",
     }
 }
 
-/// `map_first` and `map_last`.
+/// `Map::first` and `Map::last`.
 pub(crate) fn end(m: &Value, which: Builtin, span: Span) -> Result<Value, Diagnostic> {
     let m = m.as_map(span, quoted(which))?;
     Ok(entry_of(match which {
@@ -182,7 +203,7 @@ pub(crate) fn end(m: &Value, which: Builtin, span: Span) -> Result<Value, Diagno
     }))
 }
 
-/// `map_floor`, `map_ceiling`, `map_below` and `map_above`.
+/// `Map::floor`, `Map::ceiling`, `Map::below` and `Map::above`.
 pub(crate) fn beside(
     m: &Value,
     k: &Value,
@@ -199,7 +220,7 @@ pub(crate) fn beside(
     }))
 }
 
-/// `map_pop_first` and `map_pop_last`: the entry, beside the map it left.
+/// `Map::pop_first` and `Map::pop_last`: the entry, beside the map it left.
 pub(crate) fn pop(mut m: Value, which: Builtin, span: Span) -> Result<Value, Diagnostic> {
     let taken = match &mut m {
         Value::Map(out) => out.pop(which == Builtin::MapPopLast),
@@ -214,12 +235,12 @@ pub(crate) fn pop(mut m: Value, which: Builtin, span: Span) -> Result<Value, Dia
     })))
 }
 
-/// One end of `map_range`: `Some(key)` with whether the key itself is admitted, or `None`.
+/// One end of `Map::range`: `Some(key)` with whether the key itself is admitted, or `None`.
 fn bound<'a>(k: &'a Value, inclusive: &Value, span: Span) -> Result<Bound<&'a Value>, Diagnostic> {
-    let inclusive = inclusive.as_bool(span, "`map_range`")?;
+    let inclusive = inclusive.as_bool(span, "`Map::range`")?;
     match k {
         Value::Ctor { name, args, .. } if name.as_str() == "Some" && args.len() == 1 => {
-            key(&args[0], "map_range", span)?;
+            key(&args[0], "Map::range", span)?;
             Ok(if inclusive {
                 Bound::Included(&args[0])
             } else {
@@ -231,22 +252,22 @@ fn bound<'a>(k: &'a Value, inclusive: &Value, span: Span) -> Result<Bound<&'a Va
         }
         other => Err(crate::value::type_error(
             span,
-            "`map_range`",
+            "`Map::range`",
             "an Option",
             other,
         )),
     }
 }
 
-/// `map_range(m, lo, lo_inclusive, hi, hi_inclusive, limit)`.
+/// `Map::range(m, lo, lo_inclusive, hi, hi_inclusive, limit)`.
 pub(crate) fn range(args: &[Value], span: Span) -> Result<Value, Diagnostic> {
     let [m, lo, lo_inclusive, hi, hi_inclusive, limit] = args else {
         unreachable!("arity checked");
     };
-    let m = m.as_map(span, "`map_range`")?;
+    let m = m.as_map(span, "`Map::range`")?;
     let lo = bound(lo, lo_inclusive, span)?;
     let hi = bound(hi, hi_inclusive, span)?;
-    let limit = usize::try_from(limit.as_int(span, "`map_range`")?).unwrap_or(0);
+    let limit = usize::try_from(limit.as_int(span, "`Map::range`")?).unwrap_or(0);
     // Bounds that cross admit nothing, and `BTreeMap::range` panics on them.
     let crossed = match (lo, hi) {
         (Bound::Included(a), Bound::Included(b)) => a > b,
@@ -266,12 +287,12 @@ pub(crate) fn range(args: &[Value], span: Span) -> Result<Value, Diagnostic> {
     ))
 }
 
-/// `map_split`: the entries below `k`, the value at it, and the entries above it.
+/// `Map::split`: the entries below `k`, the value at it, and the entries above it.
 pub(crate) fn split(mut m: Value, k: &Value, span: Span) -> Result<Value, Diagnostic> {
-    key(k, "map_split", span)?;
+    key(k, "Map::split", span)?;
     let (at, above) = match &mut m {
         Value::Map(below) => below.split(k),
-        other => return Err(crate::value::type_error(span, "`map_split`", "Map", other)),
+        other => return Err(crate::value::type_error(span, "`Map::split`", "Map", other)),
     };
     Ok(Value::Record(Arc::new(Fields::from_iter([
         (Symbol::new("below"), m),

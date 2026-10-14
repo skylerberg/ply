@@ -223,7 +223,7 @@ fn decimal_arithmetic(
                 "`/` is not defined on `Decimal`",
             )
             .primary(span, "the exact quotient of two decimals is not a decimal")
-            .note("call `decimal_div(a, b, scale, HalfEven)` and say how to round"));
+            .note("call `Decimal::div(a, b, scale, HalfEven)` and say how to round"));
         }
         _ => {
             return Err(Diagnostic::error(

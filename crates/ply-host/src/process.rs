@@ -680,7 +680,7 @@ fn argument_vector(value: &Value, span: Span) -> Result<Vec<String>, Diagnostic>
         .collect()
 }
 
-/// The whole environment a child runs under; a later entry for one name wins, as `map_insert`
+/// The whole environment a child runs under; a later entry for one name wins, as `Map::insert`
 /// does.
 /// `env` and, when a test is observing `machine`, where a `ply` the child is reports what it read.
 fn traced(machine: MachineId, mut env: Vec<(String, String)>) -> Vec<(String, String)> {

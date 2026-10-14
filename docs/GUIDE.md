@@ -224,7 +224,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `f"n = {n + 1}"` | `String` | Interpolated: each `{expr}` hole is what `std.show.display` writes of it, below. |
 | `\\text` | `String` | A line string: lines of verbatim text, below. |
 | `b"GET "` | `Bytes` | ASCII characters plus `\xNN`. |
-| `b'{'`, `b'\n'`, `b'\x1f'` | `Int` | The byte `bytes_at` answers: one ASCII character or one escape. |
+| `b'{'`, `b'\n'`, `b'\x1f'` | `Int` | The byte `Bytes::at` answers: one ASCII character or one escape. |
 | `uuid"6ba7b810-.."`, `html"<b>{x}</b>"` | what its tag answers | A tagged literal: a text its tag's parser read when the program was checked, and holes its tag is handed apart from the text, below. |
 | `'a'`, `'\n'`, `'\u{1F600}'` | `Char` | Exactly one character, or one escape. |
 | `#{"a": 1, k: v}` | `Map<k, v>` | Keys are expressions; a later entry for a key replaces an earlier one. |
@@ -234,7 +234,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 `1`, `1.0`, `1m` and `1u32` have four types and never convert implicitly
 (`fn f() -> Int = 1.0` is `E0201`). A literal is never negative: `-3` is unary
 minus, except in a pattern. The smallest signed value of a width cannot be
-written as a literal; use `i8_of_int(-128)`.
+written as a literal; use `I8::of_int(-128)`.
 
 String and character escapes are `\n` `\t` `\r` `\0` `\\` `\"` `\'` and `\u{...}`, one to six hex
 digits naming a Unicode scalar value (a surrogate or a value past `10FFFF` is `E0211`). Byte
@@ -242,7 +242,7 @@ strings add `\xNN`, refuse `\u{...}` and refuse source characters above `U+007F`
 
 A byte literal `b'x'` holds one byte, written as a byte string writes it or as `\'`, and is the
 `Int` that byte is: `b'{'` and `123` are one literal with one hash, so
-`bytes_at(src, i) == b'{'` reads as it means and a scanner is a `match` (§5.2). An empty one, one
+`src.at(i) == b'{'` reads as it means and a scanner is a `match` (§5.2). An empty one, one
 holding more than a byte, or one that never closes is `E0001` or `E0002`, as for a character.
 
 An interpolated string `f"a {x} b"` is the concatenation `"a " ++ display(x) ++ " b"`, with
@@ -253,7 +253,7 @@ hole's type must be `derivable(show, ·)`, so a `Secret`, a function, a `Task` o
 is `E0206`. A module that interpolates imports `std.show` itself, under a name no source can
 write, so `std.show` and the modules it imports cannot interpolate.
 
-A map literal is the call `map_of_entries([{key: k, value: v}, ..])` and a set literal the same
+A map literal is the call `Map::of_entries([{key: k, value: v}, ..])` and a set literal the same
 with `()` for each value, so either spelling is one definition with one hash; `ply fmt` keeps the
 one written.
 
@@ -361,7 +361,7 @@ Loosest to tightest; all binary operators are left-associative:
   IEEE, so `NaN != NaN`. `<` `<=` `>` `>=` work on numeric types and on `Char`,
   by scalar value, and on a type that states `numeric` and a `key`, by its key
   (§4.4); order anything else with `compare`. Arithmetic on a `Char` is
-  `E0201`: go through `int_of_char`.
+  `E0201`: go through `Int::of_char`.
 * Both operands have one type; there is no widening (`U8 + U16` is `E0201`).
 * `+`, `-`, `*` and prefix `-` at a sum whose module states `numeric` for it are
   the functions it names (§4.4). They perform nothing and cannot raise, and a
@@ -386,13 +386,13 @@ Loosest to tightest; all binary operators are left-associative:
   its own arithmetic (§4.4) `E0223`. A `%` or a `|` touching the `+`, `-` or
   `*` before it is the one operator, so a lambda that is an operator's right
   operand takes a space: `a + |x| x`.
-* `/` on `Decimal` is `E0209`; use `decimal_div`. `%` is allowed.
+* `/` on `Decimal` is `E0209`; use `Decimal::div`. `%` is allowed.
 * `&&`/`||` short-circuit. `&` `|` `^` `~` are integer-only and act at the
   type's own width (`~0u8` is `255u8`). `>>` is arithmetic, `>>>` logical.
   Shifts are adjacent `<`/`>` tokens, so `Map<Int, List<Int>>` still closes.
 * `++` joins two `String`s or two `Bytes`, answering their type. One of each
-  is `E0201`; there is no coercion, so cross with `bytes_of_string` or
-  `string_of_bytes`. An operand nothing determines is `E0210`.
+  is `E0201`; there is no coercion, so cross with `Bytes::of_string` or
+  `String::of_bytes`. An operand nothing determines is `E0210`.
 * `::` qualifies through a module binder (`items::price_of`) and does not chain.
 * `?` binds tightest: `f(x)?.field` is `(f(x)?).field`. There is no `?:`.
 
@@ -438,7 +438,7 @@ as any function is, and it need not take a value of the type: `Stack::empty()`
 makes one. `key`, `show` and `numeric` (§4.4) may name one, `key for Stack by
 Stack::size`.
 
-`reuse fn` promises that every `push` in the body reuses its list (§5.6), and
+`reuse fn` promises that every `List::push` in the body reuses its list (§5.6), and
 `transparent fn` puts the body into what another package reads of it (§10). The
 entry point is `main`, of any type and row: no `main` is `E0101`, several is
 `E0112` (name the file to pick one: `ply run tools/gen.ply` enters that file's
@@ -729,26 +729,28 @@ signatures are checked, not inferred (§4.7).
 There is no numeric tower. An operator's operand type is settled from the whole
 definition, so `fn h(a: U32) -> U32 = a + 1u32` checks and `a + 1` does not. An
 operand nothing determines, as in `let g = |a, b| a + b;`, is `E0210` — the same
-code a `++` that says neither `String` nor `Bytes` raises; there is no default. Conversions are explicit builtins (§12). `u32_of_int` and its
+code a `++` that says neither `String` nor `Bytes` raises; there is no default. Conversions are explicit builtins (§12). `U32::of_int` and its
 siblings raise (§6.8) when the value does not fit (mask to truncate:
-`u8_of_int(n & 0xFF)`); two fixed widths convert through `Int`, which `to_int`
+`U8::of_int(n & 0xFF)`); two fixed widths convert through `Int`, which `to_int`
 reads any of them as and `numeric_of_int` writes at any (§12), and a 128-bit
-value past `Int` through its decimal text (`u128_of_string`).
-`string_of_bytes` raises on invalid UTF-8.
+value past `Int` through its decimal text (`U128::of_string`).
+`String::of_bytes` raises on invalid UTF-8.
 
 A `Decimal` is a 96-bit mantissa and a scale, the count of digits after its
-point, from 0 to 28: `1.5m == 1.50m`, and they print as written. `decimal_div`
-and `decimal_round` take the scale of their answer, and answer with exactly that
+point, from 0 to 28: `1.5m == 1.50m`, and they print as written. `Decimal::div`
+and `Decimal::round` take the scale of their answer, and answer with exactly that
 many digits after the point, the exact value rounded once by the `Rounding`
 given; they raise where 96 bits do not hold the answer at that scale.
-`decimal_scale` reads the scale a value has, and a `decimal_round` to no more
+`Decimal::scale` reads the scale a value has, and a `Decimal::round` to no more
 digits than that only drops digits, so it cannot raise.
 
 A `Float` operation answers the same bits on every machine, every target and in
 every profile. Arithmetic is IEEE-754 binary64 with each operation rounded once,
 as written: no two are fused into one and none is reordered, and a subnormal is
-kept, never flushed to zero. `sqrt`, `exp`, `ln`, `log2`, `log10`, `sin`, `cos`,
-`tan`, `asin`, `acos`, `atan`, `atan2`, `pow` and `hypot` are correctly rounded:
+kept, never flushed to zero. `Float::sqrt`, `Float::exp`, `Float::ln`,
+`Float::log2`, `Float::log10`, `Float::sin`, `Float::cos`, `Float::tan`,
+`Float::asin`, `Float::acos`, `Float::atan`, `Float::atan2`, `Float::pow` and
+`Float::hypot` are correctly rounded:
 each answers the `Float` nearest the exact value, ties to even, which the
 specification fixes rather than an implementation. A program sees one `NaN`:
 whatever NaN a machine makes, `bits_of_float`, an encoding and an order read it
@@ -802,7 +804,7 @@ before the literal is checked:
 * an argument of a call or an operation, at its parameter's type. A type
   parameter of the callee is what the arguments before this one, and the type
   the call is itself expected at, make it, so `assert_eq(d, {..})`,
-  `push(days, {..})` and a `Some({..})` answering `Option<Date>` each take one;
+  `days.push({..})` and a `Some({..})` answering `Option<Date>` each take one;
 * a field of a literal that is itself expected, and a field an update writes;
 * an element of a list, a branch of an `if` and an arm of a `match`, at the type
   expected of the whole or of the elements, branches and arms before it; the
@@ -841,14 +843,14 @@ and either with whether it is `opaque` (§3.2).
 is a fixed number of elements laid out one after another, so reading or
 replacing one by its index is a load or a store; it is a value like a list,
 compared, ordered and derived element by element, and has no literal: build it
-with `array_new` or `array_of_list` (§12). `Columns<a>` is an array of records
-that holds each field apart, an array per field: `columns_get(xs, i).f` reads
+with `Array::new` or `Array::of_list` (§12). `Columns<a>` is an array of records
+that holds each field apart, an array per field: `xs.get(i).f` reads
 field `f` of record `i` without the rest of it, so a pass over one field reads
 only that field's array. It is a value like an array, compared and ordered as
-the array of its records, built with `columns_new` or `columns_of_list`, and
+the array of its records, built with `Columns::new` or `Columns::of_list`, and
 its element type is a record of at least one field (`E0224`). `Map<k, v>`
-is an immutable sorted map, written `#{k: v}` or built with `map_new`,
-`map_insert` or `map_of_entries`. It iterates in `compare` order. Its key type
+is an immutable sorted map, written `#{k: v}` or built with `Map::new`,
+`Map::insert` or `Map::of_entries`. It iterates in `compare` order. Its key type
 must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Task`
 and `Chan` are refused (`E0206`).
 
@@ -1039,7 +1041,7 @@ Each operator fails where it fails at that type: a `/` or `%` by zero raises
 (§6.8), and a width's overflow ends the run:
 
 ```ply
-fn sum<a>(xs: List<a>) -> a where numeric(a) = fold(xs, numeric_of_int(0), |s: a, x: a| s + x)
+fn sum<a>(xs: List<a>) -> a where numeric(a) = xs.fold(numeric_of_int(0), |s: a, x: a| s + x)
 ```
 
 The type a call fills a constrained parameter with is passed as a hidden
@@ -1074,13 +1076,13 @@ tagged literals with its own `Ok` (§2.3), each `E0118`; one that declares its
 own `Stop` loses `iterate`.
 
 **`Secret<a>`** holds a credential, a `String` or `Bytes`, that nothing written
-in Ply reads. `secret_of_string` and `secret_of_bytes` seal a value the program
+in Ply reads. `Secret::of_string` and `Secret::of_bytes` seal a value the program
 already holds, and `config.secret` (`std.config`) answers one it never held.
-These make a secret of a secret without opening it: `secret_bytes` (a string's
-UTF-8), `secret_concat`, `secret_decode` (the bytes a secret text encodes in
+These make a secret of a secret without opening it: `Secret::bytes` (a string's
+UTF-8), `Secret::concat`, `Secret::decode` (the bytes a secret text encodes in
 hex, base64 or base32, under the names `std.hex`, `std.base64` and `std.base32`
-give it) and `secret_encode` (the text of a secret's bytes in those),
-`secret_private_key` (the key a DER document holds), `secret_rsa_jwk` (the
+give it) and `Secret::encode` (the text of a secret's bytes in those),
+`Secret::private_key` (the key a DER document holds), `Secret::rsa_jwk` (the
 document an RSA JSON Web Key's numbers make) and the derivations `std.hash`
 names, `hkdf` and `pbkdf2`. None answers a part of a secret: a slice of one,
 compared with `==` against each of 256 guesses, would read it a byte at a time,
@@ -1090,7 +1092,7 @@ secret holds its bytes in memory no other value shares, and they are
 overwritten with zeros when the last value holding the secret is dropped.
 
 A secret is observed four ways: `==` and `!=` between two of them,
-`secret_verify` against a string, `secret_is_empty` and `secret_len`. A
+`Secret::verify` against a string, `Secret::is_empty` and `Secret::len`. A
 comparison takes time that follows the two lengths and never where the values
 first differ, and it says one thing, so a secret is read only by guessing it
 whole; a length is not kept secret. What a secret is used for is the runtime's
@@ -1191,7 +1193,7 @@ would from the block's tail.
 
 ```ply
 fn first_word(line: String) -> String = {
-  let [word, ..] = string_split(line, " ") else { "" };
+  let [word, ..] = line.split(" ") else { "" };
   word
 }
 ```
@@ -1211,7 +1213,7 @@ fn area(s: Shape) -> Int =
 ```
 
 Arms are comma-separated (optional after a block-like arm) and may carry a
-guard: `[x, y, ..rest] if x > y -> x + len(rest),`. A `match` must be exhaustive
+guard: `[x, y, ..rest] if x > y -> x + rest.len(),`. A `match` must be exhaustive
 (`E0205`, naming a missing case).
 
 | pattern | matches |
@@ -1236,7 +1238,7 @@ the second and neither in parentheses (`E0222`); it binds nothing:
 
 ```ply
 fn value(src: Bytes, i: Int) -> Result<Json, ParseError> / {abort.raise} =
-  match bytes_at(src, i) {
+  match src.at(i) {
     b'"' -> string_value(src, i),
     b'-' | b'0'..=b'9' -> number(src, i),
     b'{' -> object_value(src, i),
@@ -1260,7 +1262,7 @@ literals, so a match over one ends in a `_` arm.
 
 Annotations are optional. A parameter written without one is what the call the
 lambda is handed to expects there, where the arguments before it settle that:
-in `map(accounts, |a| a.balance)` `a` is an `Account`. One nothing settles is
+in `accounts.map(|a| a.balance)` `a` is an `Account`. One nothing settles is
 inferred from how the body uses it, which reads no field and calls nothing on
 it (`E0201`). A lambda captures by value, and its row flows into the enclosing
 function's. A written return type requires a block body and enables `?` inside
@@ -1311,45 +1313,45 @@ keeps its declared type (`E0201`), and it builds one: outside the module of an
 
 ### 5.6 Lists
 
-`list_at(xs, i)` answers `None` for an index past the end **or negative**:
-`list_at(xs, -1)` is `None`, not the last element (that is
-`list_at(xs, len(xs) - 1)`). `list_set(xs, i, v)` raises `E0502` out of range.
+`xs.at(i)` answers `None` for an index past the end **or negative**:
+`xs.at(-1)` is `None`, not the last element (that is
+`xs.at(xs.len() - 1)`). `xs.set(i, v)` raises `E0502` out of range.
 
-`push(xs, x)` appends in place when the caller holds the last reference, and
-otherwise copies one path of the list's trie; `list_set` is the same, and
-`array_set` copies the whole array. A copy is caused by a second owner: a
+`xs.push(x)` appends in place when the caller holds the last reference, and
+otherwise copies one path of the list's trie; `List::set` is the same, and
+`Array::set` copies the whole array. A copy is caused by a second owner: a
 binding read again after the update, a capture of a closure that is called
-again, a value read out with `cell_get`/`map_get`/`list_at`/`array_get` (use
-`cell_update`/`map_update`), or a caller that keeps using what it passed.
+again, a value read out with `cell_get`/`Map::get`/`List::at`/`Array::get` (use
+`cell_update`/`Map::update`), or a caller that keeps using what it passed.
 "Again" is along the path taken: an `if` or `match` branch lets go, as it
 opens, of a binding only another branch reads, and a closure called by the
 only holder of it, as a sequence's step is pulled, gives its call what it
 captured. A variable passed to a call is read after the call's other
-arguments, so `array_set(c, i, array_get(c, i) + 1)` and
-`f(buf, bytes_len(buf))` hand it on, as does the left side of `++`. A record
+arguments, so `c.set(i, c.get(i) + 1)` and
+`f(buf, buf.len())` hand it on, as does the left side of `++`. A record
 is not a second owner once it is done with the value: a field read that
 nothing after it reads again, as the field or as the whole record, takes the
 field out of a record no one else holds; a branch beside one that reads the
 record whole lets go of the fields it does not read; and a `let` or `match`
 pattern lets its subject go once its binders hold their fields (an arm with a
-guard keeps it for the arms after), so `{ ..s, out: push(s.out, x) }` and
+guard keeps it for the arms after), so `{ ..s, out: s.out.push(x) }` and
 `let { out, n } = s` grow `out` in place. A subject let go so is the memory of
 the next record or constructor of its width the body builds, so
-`match s { Set(m) -> Set(map_insert(m, x, ())) }` updates a set no one else
+`match s { Set(m) -> Set(m.insert(x, ())) }` updates a set no one else
 holds without allocating its wrapper again. The same holds for `Bytes` and
 `++`. `ply check --costs` reports every
-copying `push`, `list_set` and `array_set` in the run's own modules with its
+copying `List::push`, `List::set` and `Array::set` in the run's own modules with its
 cause and fix. A `reuse fn` there turns that into an error, `E0127`; a
 dependency's, the shipped modules' included, is checked when that package is
 the one checked:
 
 ```ply
 reuse fn collect(xs: List<Int>, n: Int) -> List<Int> =
-  if n == 0 { xs } else { collect(push(xs, n), n - 1) }   // kept: xs is a parameter at its last use
+  if n == 0 { xs } else { collect(xs.push(n), n - 1) }   // kept: xs is a parameter at its last use
 
 reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = {
-  let ys = push(xs, n);
-  if len(xs) < 0 { xs } else { ys }                       // E0127: xs is read again after the update
+  let ys = xs.push(n);
+  if xs.len() < 0 { xs } else { ys }                       // E0127: xs is read again after the update
 }
 ```
 
@@ -1392,13 +1394,13 @@ billion by default, and none under `ply run`, where an entry that serves forever
 is a program — and a loop that never ends fails with `E0503` when that budget is
 spent. `--steps N` sets it (`0` is no bound), and the count is the same on every
 machine, so the verdict is too (§8.4).
-`map`/`filter`/`fold`/`range` and the byte scanners do not nest calls, and
+`List::map`/`List::filter`/`List::fold`/`range` and the byte scanners do not nest calls, and
 `iterate` is a loop with an early exit and a step budget:
 
 ```ply
 fn first_gap(xs: List<Int>) -> Int =
   iterate({i: 0, want: 0}, 1000, |s: {i: Int, want: Int}|
-    if s.i >= len(xs) { Stop(s.want) }
+    if s.i >= xs.len() { Stop(s.want) }
     else { Continue({i: s.i + 1, want: s.want + 1}) })
 ```
 
@@ -1409,8 +1411,8 @@ fn first_gap(xs: List<Int>) -> Int =
 
 ```ply
 fn int_value(text: String) -> Option<Int> = {
-  let d = decimal_of_string(text)?;
-  int_of_decimal(d, Down)
+  let d = Decimal::of_string(text)?;
+  Int::of_decimal(d, Down)
 }
 ```
 
@@ -1432,7 +1434,7 @@ it and the function's result and everything evaluated before it is pure:
 
 ```ply
 fn both(xs: List<Int>) -> (Int, Int) =
-  parallel { fold(xs, 0, |a: Int, x: Int| a + x), len(filter(xs, |x: Int| x > 0)) }
+  parallel { xs.fold(0, |a: Int, x: Int| a + x), xs.filter(|x: Int| x > 0).len() }
 ```
 
 `parallel { a, b, .. }` answers the tuple `(a, b, ..)` and means exactly that:
@@ -1489,7 +1491,7 @@ measure that every loop of calls back into the group lowers (size-change
 termination): a part of an argument — a constructor's field, a record's field,
 a list's element or tail, a map's key, value or entry, at any depth — or an
 integer moving toward a bound that a guard on the way to the call holds it
-beyond, as `down` does, or as `if i >= len(xs) { .. } else { walk(xs, i + 1) }`
+beyond, as `down` does, or as `if i >= xs.len() { .. } else { walk(xs, i + 1) }`
 does. A value with no parts — a nullary constructor, an empty list, a literal —
 is no larger than any argument, and a constructor of one field no larger than
 what its field is a part of. A quotient by a literal greater than one, a shift right by one, and a
@@ -1501,10 +1503,10 @@ meets it.
 
 A guard is a condition on the way to the call: an `if`, a `match` arm's guard,
 the failed guard of an earlier arm whose pattern always matches, a condition
-matched against `true` or `false`, or `list_at` or `array_at` answering
-`Some`, which holds the index below the length. `list_set` and `array_set`
+matched against `true` or `false`, or `List::at` or `Array::at` answering
+`Some`, which holds the index below the length. `List::set` and `Array::set`
 keep the length. A list written of parts, one they are pushed onto, one
-`filter` keeps, one `map` makes of a part of each element, and what `fold`
+`List::filter` keeps, one `List::map` makes of a part of each element, and what `List::fold`
 answers when each step answers the accumulator or a part (a lookup that starts
 at `None`) are made of parts: each element is a part, though neither the list
 nor its tail need be smaller than what its parts are parts of. A value an `if`
@@ -1512,8 +1514,8 @@ or a `match` chooses is what each branch is, and what a member of the group
 answers is read to a fixed point over the group, so a member that answers a
 part of its argument hands its caller a part.
 
-A function handed to `map`, `filter` or `fold` is called with each element, and
-one handed to `map_fold` with each key and value; one handed to a definition
+A function handed to `List::map`, `List::filter` or `List::fold` is called with each element, and
+one handed to `Map::fold` with each key and value; one handed to a definition
 outside the group is called as that definition calls it, with the parts of its
 arguments it hands on, where a function that definition hands on as it took it,
 in the same place, to its own recursion is called as each call down that
@@ -1664,18 +1666,18 @@ both decide by this.
 
 A row also counts. Each atom a call performs runs a `bounded` number of times,
 one no input decides, or a `scaling` one that grows with its input:
-performed inside a callback that `map`, `filter`, `fold`, `map_fold`,
-`bytes_position` or `iterate` calls once per element (unless the list,
+performed inside a callback that `List::map`, `List::filter`, `List::fold`, `Map::fold`,
+`Bytes::position` or `iterate` calls once per element (unless the list,
 `range` or budget is written out literally), inside a definition that calls
 back into its own recursive group, or by a callee that performs it so. A
 higher-order definition counts its callbacks the same way, so `map(ids,
 lookup)` scales `lookup`'s query, a definition that calls its callback in a
-`fold` scales whatever it is handed, and one that calls it once does not.
+`List::fold` scales whatever it is handed, and one that calls it once does not.
 `ply check --types` prints each atom and row variable with its count:
 
 ```ply
 fn lookup(id: Int) -> Row / {db.query[conn]} = db.query[conn](id)
-fn lookup_all(ids: List<Int>) -> List<Row> / {db.query[conn]} = map(ids, lookup)
+fn lookup_all(ids: List<Int>) -> List<Row> / {db.query[conn]} = ids.map(lookup)
 ```
 
 ```
@@ -1831,7 +1833,7 @@ fn checked(b: Int) -> Result<Int, SyntaxError> = try { digit(b, 1) }
 A `raise` operation does not come back to where it was performed. Its perform
 has whatever type is asked of it and puts the operation in the row, as any
 perform does, so a row names each way a call can fail: inference unions them,
-and they pass through a row variable, so `map(lines, parse_line)` raises what
+and they pass through a row variable, so `lines.map(parse_line)` raises what
 `parse_line` raises. A declaration is the name and its parameters; it writes no
 result, and takes no resource label and no type parameters (`E0001`).
 
@@ -1875,19 +1877,19 @@ Unanswered, it is `E0501` for an assertion and `E0502` for anything else. A
 `try` answers it only by name: `try[abort.raise] { body }`.
 
 ```ply
-fn peek(b: Bytes, i: Int) -> Int = if i < 0 || i >= bytes_len(b) { -1 } else { bytes_at(b, i) }
+fn peek(b: Bytes, i: Int) -> Int = if i < 0 || i >= b.len() { -1 } else { b.at(i) }
 
 fn hex(b: Bytes) -> String =
-  fold(range(0, bytes_len(b)), "", |acc: String, i: Int| {
-    let n = bytes_at(b, i);
-    acc ++ string_slice("0123456789abcdef", n / 16, n / 16 + 1)
-      ++ string_slice("0123456789abcdef", n % 16, n % 16 + 1)
+  range(0, b.len()).fold("", |acc: String, i: Int| {
+    let n = b.at(i);
+    acc ++ "0123456789abcdef".slice(n / 16, n / 16 + 1)
+      ++ "0123456789abcdef".slice(n % 16, n % 16 + 1)
   })
 ```
 
 A call that cannot fail where it stands adds no `abort.raise`, so neither of
 these writes a row. A builtin that can raise states where it cannot, as a
-`requires` over its parameters (`bytes_at`: `0 <= i && i < bytes_len(b)`), and
+`requires` over its parameters (`Bytes::at`: `0 <= i && i < Bytes::len(b)`), and
 a call adds no `abort.raise` when the conditions on the way to it show every
 clause; so does a `/` or `%` whose `Int` divisor they show is not zero, and a
 `task.channel` or `random.below` whose capacity or bound they show in range. A
@@ -1896,30 +1898,30 @@ condition is one the body passed on its way to the call: an `if`, the left of
 pattern an integer or a condition matched or an earlier arm's did not, a range
 pattern an integer matched (`b'0'..=b'9'` holds it between the two, and
 alternatives hold it between the least and the greatest of them), a list
-pattern of so many items, `list_at` or `array_at` answering `Some` in a `match`
-or a `let ... else`, and, inside a lambda `map`, `filter` or `fold` is handed
+pattern of so many items, `List::at` or `Array::at` answering `Some` in a `match`
+or a `let ... else`, and, inside a lambda `List::map`, `List::filter` or `List::fold` is handed
 beside a `range(lo, hi)`, that its last parameter lies in the range. A `let`
 of one name is what its value is, and a field read through records is one value
 wherever it is read.
 
 What is read is linear `Int` arithmetic: literals, bindings, fields, `+`, `-`,
 a product with a literal, and what a builtin answers, by its `ensures`
-(`bytes_at` answers `0..=255`, a length is not negative, `min` answers no more
-than either argument, `bytes_scan` answers between `from` and the end). A
+(`Bytes::at` answers `0..=255`, a length is not negative, `min` answers no more
+than either argument, `Bytes::scan` answers between `from` and the end). A
 quotient or remainder by a literal, a value masked with `&`, an `|` or `^` of
 two values in `0..2^n`, a shift right by a literal and a remainder by a divisor
 held above zero are each bounded as the operator bounds them, so `n & 0xFF` and
 a byte's `n / 16` are in range for `byte_of_int` and for an index into sixteen
 digits. A string or bytes literal has the length it is written with. Nothing
 else is read: a call of a definition is a value nothing is known of, whatever
-its body, and a width other than `Int` is read only where `int_of_u8` and the
+its body, and a width other than `Int` is read only where `Int::of_u8` and the
 like answer one. What a call that can raise ensures holds only past the call.
 
 The check is the checker's own and sees only the body it is in, so a row never
 depends on another body. It decides by elimination over the integers, within a
 bound; where a clause is not shown, by a miss of the method or because it does
 not hold, the call keeps its `abort.raise`, and nothing is refused. So an index
-loop that recurses on `i + 1` past `i >= bytes_len(b)` alone still raises, at
+loop that recurses on `i + 1` past `i >= b.len()` alone still raises, at
 a negative `i`: guard both ends, or fold over a `range`. A definition's own
 `requires` is not read (§10): it is not checked at its callers, so nothing in
 its body may lean on it.
@@ -1927,7 +1929,7 @@ its body may lean on it.
 `ply check --types --explain` lists under a definition each place its body can
 raise `abort.raise` and why: the clause of a builtin's `requires` nothing on
 the way shows, a divisor not shown other than zero, a `let` that can miss, a
-builtin that states no `requires` (`panic`, `string_of_bytes`), a definition
+builtin that states no `requires` (`panic`, `String::of_bytes`), a definition
 whose row names the raise (once, where it is first called), or a function
 value whose type does. A row that names a raise no place in the body makes
 prints as `declared, not performed`, and so does one whose only raise is the
@@ -2020,7 +2022,7 @@ is released; a `release` that raises replaces what was unwinding; holds nested
 in one another are let go innermost first; a runtime failure ends the run and
 releases nothing.
 
-`hold_get(h)` reads what a hold holds, and puts `hold.read[r]` in the row of
+`h.get()` reads what a hold holds, and puts `hold.read[r]` in the row of
 whatever calls it, `r` the region of the hold it is handed. A function that
 takes a hold binds the region as a label (§4.5),
 `fn first<[r]>(h: Hold<Bytes, [r]>) -> Int / {hold.read[r]}`, and a call fills
@@ -2031,14 +2033,14 @@ the language's effect, as `cell` is (`E0105`, `E0103`). A hold is passed and
 never kept:
 `Hold` is written only as the type of a parameter, of a definition, a lambda or
 a function type, and anywhere else is `E0446` (§4.6). So a hold passes to
-functions and into the closures of `map`, `fold` and `iterate`, and the checker
+functions and into the closures of `List::map`, `List::fold` and `iterate`, and the checker
 still sees every way out of the region: the hold itself by its type, and a
 closure that reads it by its row, each naming the region, so what reads one
 hold may leave the region of another. A hold is let go at the `}` of its own
 region, so that region is the hold's alone: a `with_hold[r]` inside a region
 named `r`, or a `with_cell[r]` inside a `with_hold[r]`, is `E0330`.
 
-What `hold_get` answers is a value like any other, and a copy of it may leave
+What `Hold::get` answers is a value like any other, and a copy of it may leave
 the region the hold may not. So a library keeps what is held useless without
 its hold: its functions take the `Hold`, and what they find released they
 refuse, as a `std.io` source pulled after its close raises `io.closed`. A lazy
@@ -2047,7 +2049,7 @@ it is built and consumed inside the region and is `E0446` leaving it.
 
 A continuation captured inside a `with_hold` body and resumed after the hold was
 let go (a clause that resumes twice, §6.6) finds the hold gone: its first
-`hold_get`, or else the region's own `}`, ends the run with `E0331`, and
+`Hold::get`, or else the region's own `}`, ends the run with `E0331`, and
 `release` does not run again. Where what was acquired is a host's, an
 at-most-once operation on it refuses the second resumption first (`E0426`).
 
@@ -2498,8 +2500,8 @@ definition that calls only itself, and that the checker reads as ending
 (§5.10), is unrolled, and over values in view as deep as the unfolding goes. On
 an `Int` binder the claim is proved at `n <= 0` and then at `n > 0` from itself
 at `n - 1`; on a `List` binder (structural induction) at `[]` and then at
-`[h, ..t]` from itself at `t`, with `len` and `push` reduced over a spine in
-view or one the proof comes to know, and `len` known to lie below `i64::MAX`.
+`[h, ..t]` from itself at `t`, with `List::len` and `List::push` reduced over a spine in
+view or one the proof comes to know, and `List::len` known to lie below `i64::MAX`.
 A kernel checks each induction from the claim alone before refuting its cases,
 whatever proposed it: the binder it names, a hypothesis strictly below the case
 it proves, and only definitions the checker reads as ending unrolled.
@@ -2535,14 +2537,14 @@ A law with no guard, once proved, is a lemma for every claim written below it
 in its module. Its trigger is the first call its body always makes whose
 arguments name every binder; where a claim makes a call that fits it, the law
 at that call is a fact, and a trigger that takes an argument apart, as
-`reverse(push(ys, x))` does, stands for the call in place of its body:
+`reverse(ys.push(x))` does, stands for the call in place of its body:
 
 ```ply
 fn reverse(xs: List<Int>) -> List<Int> =
-  match xs { [] -> [], [x, ..rest] -> push(reverse(rest), x) }
+  match xs { [] -> [], [x, ..rest] -> reverse(rest).push(x) }
 
 law "a push reversed leads" forall (ys: List<Int>, x: Int) {
-  match reverse(push(ys, x)) { [h, ..t] -> h == x && t == reverse(ys), [] -> false }
+  match reverse(ys.push(x)) { [h, ..t] -> h == x && t == reverse(ys), [] -> false }
 }
 
 law "reverse twice is identity" forall (xs: List<Int>) { reverse(reverse(xs)) == xs }
@@ -2640,13 +2642,13 @@ A `cost` clause bounds the steps a call of its definition takes:
 
 ```ply
 fn pairs(xs: List<Int>, ys: List<Int>) -> Int
-  cost len(xs) * (len(ys) + 1)
-= fold(xs, 0, |a: Int, x: Int| fold(ys, a, |b: Int, y: Int| b + x * y))
+  cost xs.len() * (ys.len() + 1)
+= xs.fold(0, |a: Int, x: Int| ys.fold(a, |b: Int, y: Int| b + x * y))
 ```
 
 The bound is an `Int` over the parameters, and the steps may be at most a
 constant times it plus a constant at every size, zero included: with `ys`
-empty these steps still grow with `xs`, so `len(xs) * len(ys)` would not hold.
+empty these steps still grow with `xs`, so `xs.len() * ys.len()` would not hold.
 A clause on a definition whose row writes `diverges` is `E0468`, and on one
 that performs more than a raise `E0463`, since a handler could change the
 steps.
@@ -2657,11 +2659,11 @@ least 1 (`E0105` if it is named like a parameter or another cost name):
 
 ```ply
 fn each_of<| e>(xs: List<Int>, f: (Int) -> Int / e cost k) -> Int / e
-  cost len(xs) * k
-= fold(xs, 0, |a: Int, x: Int| a + f(x))
+  cost xs.len() * k
+= xs.fold(0, |a: Int, x: Int| a + f(x))
 
 fn pairs(xs: List<Int>, ys: List<Int>) -> Int
-  cost len(xs) * (len(ys) + 1)
+  cost xs.len() * (ys.len() + 1)
 = each_of(xs, |_x: Int| total(ys))
 ```
 
@@ -2672,7 +2674,7 @@ steps grow with what it is given leaves the call unread.
 
 A `cost` bound is an obligation, `<owner> cost #<n>`, that `ply prove` reads
 off the body and never runs. A builtin is at most a step;
-`map`, `filter`, `fold`, `map_fold`, `iterate`, `map_update`, `bytes_position`
+`List::map`, `List::filter`, `List::fold`, `Map::fold`, `iterate`, `Map::update`, `Bytes::position`
 and `metered` call a literal lambda or a named definition back as many times as
 an argument's size allows; a call of a definition costs its steps at the sizes
 of its arguments, and of one whose body another package keeps, its first `cost`
@@ -2680,8 +2682,8 @@ bound read from above; a raise ends the call. A recursion is read when every
 call back takes a part of one list parameter that a list pattern took a head
 off, no path calls back twice, and every other parameter its steps grow with is
 handed on unchanged or as a part of itself: it takes that list's length in
-calls. The bound is read from below: the lengths of parameters (`len`,
-`map_len`, `string_len`, `bytes_len`, `array_len`, `columns_len`), cost names,
+calls. The bound is read from below: the lengths of parameters (`List::len`,
+`Map::len`, `String::len`, `Bytes::len`, `Array::len`, `Columns::len`), cost names,
 positive literals, `+`, `*`,
 and `ilog2` alone or beside sizes of the one length it is of. Steps within the
 bound are `proved`. Anything else, such as another operation, a call of a
@@ -2711,8 +2713,8 @@ is not a tail call; a number is no object. The bound holds where each argument
 is held by nothing else, all the way down, as an update in place needs (§5.6):
 a `match` or `let` pattern without a guard lets go of a subject at its last
 read held alone, and the next constructor of the same name the body builds
-takes its cells, so `reversed` makes no `Link` it did not take apart. `push`,
-`list_set`, `array_set`, `columns_set`, `map_insert` and `++` update a value
+takes its cells, so `reversed` makes no `Link` it did not take apart. `List::push`,
+`List::set`, `Array::set`, `Columns::set`, `Map::insert` and `++` update a value
 held once in place and copy one held anywhere else, and only a fold's first
 call copies a seed held anywhere else. A record, a record update, a list
 literal, a closure and a list pattern's rest each make an object, as does a
@@ -2823,31 +2825,36 @@ holds a statement's columns to where `std.db`'s `fetch` reads rows by it (§16).
 The functions every module calls without importing them. Each is declared in the
 compiler's prelude as an `extern fn`: a signature the runtime implements, with a
 row and a `where` like any other and no body, and a doc. Only the prelude
-declares one; an `extern fn` in a module is `E0151`. A module may shadow any
-except `compare_values` and `map_of_entries`, which the map literal is
-written in, and the six the wrapping and saturating operators are written in
-(§2.4), which no binding around such an operator may hide either (`E0105`).
+declares one; an `extern fn` in a module is `E0151`. Most are functions of a
+type of the language's, declared under it (`extern fn List::len`) and called on
+a value or through the type as any function of a type is (§5.4): `xs.len()`,
+`Map::new()`. No module declares one of those again, so nothing hides one. The
+rest have a name of their own (`range`, `min`, `panic`), which a module may
+shadow, except `compare_values` and the six the wrapping and saturating
+operators are written in (§2.4), which no binding around such an operator may
+hide either (`E0105`).
 `to_int` reads a value of any integer type as an `Int`, answering `None` past
 its range, so with `numeric_of_int` it converts between any two.
 `ply doc prelude` lists them all, each with the summary of
-its doc, and `ply doc NAME` prints one: its signature with the parameters' names,
-its doc, and its clauses.
+its doc, `ply doc List::len` prints one: its signature with the parameters' names,
+its doc, and its clauses; and `ply doc List` lists the functions of a type of the
+language's, the prelude's and then its home module's (§13).
 
 A builtin whose row names `abort.raise` may state a `requires`: a condition on
 its arguments under which a call cannot raise. For most it is the whole of where
-one cannot; `decimal_round`'s is the part arithmetic can say, since past it a
+one cannot; `Decimal::round`'s is the part arithmetic can say, since past it a
 call raises only where the zeros it fills do not fit. A call that shows the
 clause adds no `abort.raise` (§6.8). An `ensures` says
 what a call answers, as `result`, which is what the checker knows of that value
 when it reads a later clause. One with no `requires` raises on something its
 arguments' values do not say in arithmetic: `panic`, a failed `assert`,
-`string_of_bytes` of bytes that are not UTF-8, `string_find` of an absent
-needle, an `iterate` past its budget, `int_of_u64` of a value past an `Int`.
+`String::of_bytes` of bytes that are not UTF-8, `String::find` of an absent
+needle, an `iterate` past its budget, `Int::of_u64` of a value past an `Int`.
 
 ```
-   bytes_at(b: Bytes, i: Int) -> Int / {abort.raise}
+   Bytes::at(b: Bytes, i: Int) -> Int / {abort.raise}
       `0..=255`; raises out of range.
-      requires 0 <= i && i < bytes_len(b)
+      requires 0 <= i && i < Bytes::len(b)
       ensures 0 <= result && result <= 255
 ```
 
@@ -3468,7 +3475,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0102` | unknown type |
 | `E0103` | unknown effect |
 | `E0104` | unknown operation |
-| `E0105` | duplicate definition, a reserved name, a binding and an effect of one name at `x.name(..)`, or a builtin called on a value in a module that binds its name |
+| `E0105` | duplicate definition, a reserved name, or a binding and an effect of one name at `x.name(..)` |
 | `E0106` | unknown module |
 | `E0107` | private name, or a constructor of an `opaque` type outside its module |
 | `E0108` | ambiguous import |
@@ -3652,9 +3659,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 Sharp edges: `x.f(y)` with a bare variable `x` is a perform; an operation no
 `handle` names is found only when it reaches the host boundary at run time
 (`E0424`), unless its effect is `nondet` in a deterministic test (`E0412`); a
-record update needs the base's type to be known where it stands; two allocating tasks are always ordered; `bytes_at`, `bytes_u32_le`, `string_slice`,
-`string_find`, `list_set`, `array_get` and `array_set` raise where `list_at` and
-`array_at` answer `None`.
+record update needs the base's type to be known where it stands; two allocating tasks are always ordered; `Bytes::at`, `Bytes::u32_le`, `String::slice`,
+`String::find`, `List::set`, `Array::get` and `Array::set` raise where `List::at` and
+`Array::at` answer `None`.
 
 ## 19. Examples
 

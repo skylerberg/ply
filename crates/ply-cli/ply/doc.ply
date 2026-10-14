@@ -1,7 +1,8 @@
 //! `ply doc` — what a name documents, as an agent reads it. A definition: its signature with the
 //! parameter names the source wrote, its doc and clauses, its place, hash and footprint, and the
 //! laws that name it. A law schema: the same, under the schema as it is written. A type, an effect
-//! or a module: its doc and its members'. A builtin: what the prelude declares. Each page is read
+//! or a module: its doc and its members'. A builtin: what the prelude declares. A type of the
+//! language's: its functions, the prelude's and its home module's. Each page is read
 //! off what its module answers it documents, which the memo store keeps for a project's modules
 //! and the toolchain carries for the standard library's, so no command parses a module to print
 //! one. A name under `std` is the toolchain's wherever the command runs; any other is looked for
@@ -78,13 +79,7 @@ fn prelude_page() -> Page / {abort.raise} =
   {
     ..bare_page("module", "prelude", "prelude"),
     doc: lines_of(parse(prelude_source::text()).node.doc),
-    members: builtins().map(|b: Builtin|
-      {
-        kind: "builtin",
-        name: String::of_bytes_lossy(b.name),
-        signature: builtin_signature(b).text,
-        doc: b.doc.map(|l: Bytes| String::of_bytes_lossy(l)),
-      }),
+    members: builtins().map(builtin_member),
   }
 
 // --- Naming one thing --------------------------------------------------------------
@@ -93,7 +88,7 @@ fn prelude_page() -> Page / {abort.raise} =
 fn unknown_name(query: String, names: List<String>) -> Diag = {
   let d: Diag = unknown_def(query, names);
   if names.len() > 0 { d }
-  else { noted(d, b"a builtin is named by its bare name, as in `ply doc map`") }
+  else { noted(d, b"a builtin is named as the prelude declares it, as in `ply doc List::map`") }
 }
 
 /// A page, beside the module that documents it.
@@ -177,12 +172,45 @@ fn shipped_named(
   })
 }
 
-/// A name the program does not hold: a builtin's, else one of the standard library's.
+/// A builtin as a member of the page that lists it.
+fn builtin_member(b: Builtin) -> Member / {abort.raise} =
+  {
+    kind: "builtin",
+    name: String::of_bytes_lossy(b.name),
+    signature: builtin_signature(b).text,
+    doc: b.doc.map(|l: Bytes| String::of_bytes_lossy(l)),
+  }
+
+/// A type of the language's as a page: the functions the prelude declares under it, then those
+/// its home module declares. None for a name that has neither.
+fn language_type_page(
+  query: String,
+) -> Option<Page> / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} = {
+  let under = query ++ "::";
+  let declared = builtins().filter(|b: Builtin| b.name.starts_with(Bytes::of_string(under)));
+  let home = Bytes::of_string("std." ++ query.ascii_lower());
+  let homes = shipped_names().filter(|n: Bytes| n == home);
+  let own = held_of(homes, shipped_documented(homes)).fold([], |acc: List<Member>, h: Held|
+    if h.page.kind != "module" { acc }
+    else { acc.concat(h.page.members.filter(|m: Member| m.name.starts_with(under))) });
+  if declared.len() == 0 && own.len() == 0 { None } else {
+    Some({ ..bare_page("type", query, query), members: declared.map(builtin_member).concat(own) })
+  }
+}
+
+/// A name the program does not hold: a builtin's or a type of the language's, else one of the
+/// standard library's.
 fn elsewhere(
   query: String,
 ) -> Lookup / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} =
   if query == "prelude" { Found(unplaced(prelude_page())) } else {
-    match builtin_page(query) { Some(page) -> Found(unplaced(page)), None -> shipped_named(query) }
+    match builtin_page(query) {
+      Some(page) -> Found(unplaced(page)),
+      None -> match language_type_page(query) {
+        Some(page) -> Found(unplaced(page)),
+        None -> shipped_named(query),
+      },
+    }
   }
 
 /// Whether the module `o` outlines could declare what a simple name whose first word is `head`
@@ -379,26 +407,26 @@ test "a doc's summary is its first sentence, its first paragraph joined into one
 }
 
 test "a builtin prints with the parameter names and the doc the prelude declares" {
-  match builtin_page("map") {
-    None -> panic("`map` is a builtin"),
+  match builtin_page("List::map") {
+    None -> panic("`List::map` is a builtin"),
     Some(page) -> {
       assert_eq(page.kind, "builtin");
-      assert_eq(page.signature, "map<a, b | e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e")
+      assert_eq(page.signature, "List::map<a, b | e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e")
     },
   };
-  match builtin_page("list_at") {
-    None -> panic("`list_at` is a builtin"),
+  match builtin_page("List::at") {
+    None -> panic("`List::at` is a builtin"),
     Some(page) -> assert_eq(page.doc, ["`None` if `i` is negative or past the end."]),
   };
-  match builtin_page("len") {
-    None -> panic("`len` is a builtin"),
-    Some(page) -> assert_eq(page.signature, "len<a>(xs: List<a>) -> Int"),
+  match builtin_page("List::len") {
+    None -> panic("`List::len` is a builtin"),
+    Some(page) -> assert_eq(page.signature, "List::len<a>(xs: List<a>) -> Int"),
   };
-  match builtin_page("bytes_at") {
-    None -> panic("`bytes_at` is a builtin"),
+  match builtin_page("Bytes::at") {
+    None -> panic("`Bytes::at` is a builtin"),
     Some(page) ->
       assert_eq(page.clauses, [
-        "requires 0 <= i && i < bytes_len(b)",
+        "requires 0 <= i && i < Bytes::len(b)",
         "ensures 0 <= result && result <= 255",
       ]),
   };
@@ -447,13 +475,13 @@ test "a query names a page by its full name, or by a simple name only one page g
 
 test "a page with no place names its kind instead" {
   let page: Page = {
-    ..bare_page("builtin", "len", "len<a>(xs: List<a>) -> Int"),
+    ..bare_page("builtin", "List::len", "List::len<a>(xs: List<a>) -> Int"),
     ty: "<a>(List<a>) -> Int",
     params: [{ name: "xs", ty: "List<a>" }],
   };
   assert_eq(page_text(plain(), unplaced(page)), [
     "",
-    "   len<a>(xs: List<a>) -> Int",
+    "   List::len<a>(xs: List<a>) -> Int",
     "",
     "   kind builtin",
     "",
@@ -519,6 +547,6 @@ test "the prelude is a module page: its doc and every builtin with its own" {
   assert_eq(page.kind, "module");
   assert(page.doc.len() > 0);
   assert_eq(page.members.len(), builtins().len());
-  let at = page.members.filter(|m: Member| m.name == "list_at");
+  let at = page.members.filter(|m: Member| m.name == "List::at");
   assert_eq(at.map(|m: Member| m.doc), [["`None` if `i` is negative or past the end."]])
 }

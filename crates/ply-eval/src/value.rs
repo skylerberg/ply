@@ -384,7 +384,7 @@ impl Value {
         Value::Map(Map::new())
     }
 
-    /// Later entries win, as in a fold of `map_insert`.
+    /// Later entries win, as in a fold of `Map::insert`.
     pub fn map(entries: impl IntoIterator<Item = (Value, Value)>) -> Value {
         let mut m = Map::new();
         for (k, v) in entries {
@@ -667,7 +667,7 @@ impl Fixed {
         }
     }
 
-    /// `int_to_string`'s spelling, for `u128_to_string` and `i128_to_string`.
+    /// `Int::to_string`'s spelling, for `U128::to_string` and `I128::to_string`.
     pub fn to_decimal(self) -> String {
         if self.ty.signed() {
             (self.bits() as i128).to_string()
@@ -946,7 +946,7 @@ pub(crate) fn secret_has_no_order(v: &Value, what: &str, span: Span) -> Result<(
         "an ordering over a credential leaks a bit of position per comparison and recovers the \
          value in calls proportional to its length",
     )
-    .note("use `secret_verify` to check a candidate, or `==` to compare two secrets")
+    .note("use `Secret::verify` to check a candidate, or `==` to compare two secrets")
     .note(
         "reaching this is a defect in Ply: `derivable(ord, Secret<a>)` is false, so a `Map` key \
          and a `derive ord` over one are both `E0206` at compile time",

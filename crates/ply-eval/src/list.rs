@@ -1,5 +1,5 @@
 //! A list as it crosses the runtime's boundary: its elements in order, shared until written.
-//! Compiled code holds its own, `ply_codegen::list`, and no program's `push` runs on this one.
+//! Compiled code holds its own, `ply_codegen::list`, and no program's `List::push` runs on this one.
 
 use crate::value::Value;
 use std::sync::Arc;

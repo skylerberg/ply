@@ -219,7 +219,11 @@ pub fn runtime_json() -> String {
             .into_iter()
             .map(|h| serde_json::json!({ "name": h.name, "args": h.args, "answers": h.answers }))
             .collect::<Vec<_>>(),
-        "builtins": ply_eval::Builtin::all().iter().map(|b| b.name()).collect::<Vec<_>>(),
+        // The last release's emitter looks a builtin up by the name it has for it.
+        "builtins": ply_eval::Builtin::all()
+            .iter()
+            .flat_map(|b| std::iter::once(b.name().to_string()).chain(b.to_the_release()))
+            .collect::<Vec<_>>(),
         "identity": c::runtime_identity(),
     })
     .to_string()

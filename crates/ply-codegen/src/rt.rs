@@ -1597,7 +1597,7 @@ pub unsafe extern "C" fn rt_decimal_negate(_ctx: *mut Ctx, lo: i64, hi: i64, out
 
 /// Field `k`, in its records' shape's order, of record `i` of `Columns` `xs`, held once more: a
 /// scalar boxed and a record in place the address of its header there. What is not a columnar
-/// value's in-range record is read through `columns_get`, which raises as it does. Borrows `xs`.
+/// value's in-range record is read through `Columns::get`, which raises as it does. Borrows `xs`.
 pub unsafe extern "C" fn rt_columns_field(ctx: *mut Ctx, xs: i64, i: i64, k: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     let tables = Arc::clone(&c.tables);
@@ -2327,7 +2327,7 @@ pub(crate) fn raise_error(ctx: &mut Ctx, d: Diagnostic) -> i64 {
     ctx.raise(d, message)
 }
 
-/// `bytes_concat_all` over a list literal's pieces, without building the list. Takes the pieces.
+/// `Bytes::concat_all` over a list literal's pieces, without building the list. Takes the pieces.
 pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let pieces = args_of(args, n);
@@ -3412,7 +3412,7 @@ fn entry_option(ctx: &mut Ctx, found: Option<(Word, Word)>) -> Option<Word> {
     })
 }
 
-/// The key a bound of `map_range` holds, none for `None`; nothing where the word is neither, or
+/// The key a bound of `Map::range` holds, none for `None`; nothing where the word is neither, or
 /// holds a key no native map orders in place.
 fn bound_key(layouts: &Layouts, w: Word) -> Option<Option<Word>> {
     if heap::kind(w) != KIND_CTOR {
@@ -3476,7 +3476,7 @@ fn position(ctx: &mut Ctx, at: Option<usize>) -> Word {
     }
 }
 
-/// `map_update(m, k, f)`: the entry leaves the map while `f` runs, so a map held once lends `f` a
+/// `Map::update(m, k, f)`: the entry leaves the map while `f` runs, so a map held once lends `f` a
 /// value held once. Takes all three.
 fn map_update(ctx: &mut Ctx, m: Word, k: Word, f: Word) -> Word {
     let (rest, current) = if heap::kind(m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, k) {
@@ -3515,7 +3515,7 @@ fn map_update(ctx: &mut Ctx, m: Word, k: Word, f: Word) -> Word {
     builtin(ctx, Builtin::MapInsert, &[rest, k, updated])
 }
 
-/// `bytes_position(b, from, p)`: the first index at or past `from` whose byte `p` accepts. Takes
+/// `Bytes::position(b, from, p)`: the first index at or past `from` whose byte `p` accepts. Takes
 /// all three.
 fn bytes_position(ctx: &mut Ctx, b: Word, from: Word, p: Word) -> Word {
     let found = first_accepted(ctx, b, from, p);
@@ -3528,7 +3528,7 @@ fn bytes_position(ctx: &mut Ctx, b: Word, from: Word, p: Word) -> Word {
     }
 }
 
-/// `bytes_position`'s search, or `None` with the context failed. Reads all three.
+/// `Bytes::position`'s search, or `None` with the context failed. Reads all three.
 fn first_accepted(ctx: &mut Ctx, b: Word, from: Word, p: Word) -> Option<Option<usize>> {
     // Only a payload too long for a native object stays bridged.
     let bridged = (heap::kind(b) != KIND_BYTES).then(|| ctx.value(b));
@@ -3537,7 +3537,7 @@ fn first_accepted(ctx: &mut Ctx, b: Word, from: Word, p: Word) -> Option<Option<
         Some(Value::Bytes(bytes)) => bytes,
         Some(other) => {
             let d = error(format!(
-                "`bytes_position` needs Bytes, and this is {}",
+                "`Bytes::position` needs Bytes, and this is {}",
                 other.type_name()
             ));
             ctx.fail(d);
@@ -3548,13 +3548,13 @@ fn first_accepted(ctx: &mut Ctx, b: Word, from: Word, p: Word) -> Option<Option<
         Some(n) if usize::try_from(n).is_ok_and(|n| n <= bytes.len()) => n as usize,
         Some(n) => {
             let site = ctx.site();
-            let d = ply_eval::builtins::start_outside(n, bytes.len(), site, "bytes_position");
+            let d = ply_eval::builtins::start_outside(n, bytes.len(), site, "Bytes::position");
             raise_error(ctx, d);
             return None;
         }
         None => {
             let d = error(format!(
-                "`bytes_position` needs an Int start, and this is {}",
+                "`Bytes::position` needs an Int start, and this is {}",
                 ctx.type_name(from)
             ));
             ctx.fail(d);
@@ -3571,7 +3571,7 @@ fn first_accepted(ctx: &mut Ctx, b: Word, from: Word, p: Word) -> Option<Option<
             Some(false) => {}
             None => {
                 let d = error(format!(
-                    "the predicate given to `bytes_position` answered {}, not a Bool",
+                    "the predicate given to `Bytes::position` answered {}, not a Bool",
                     ctx.type_name(r)
                 ));
                 heap::dec(r);
@@ -4358,10 +4358,10 @@ fn native_list(ctx: &mut Ctx, w: Word, what: &str) -> Option<*mut heap::Obj> {
     None
 }
 
-/// `map(xs, f)`: `f` on every element, in order. Takes the list and the function.
+/// `xs.map(f)`: `f` on every element, in order. Takes the list and the function.
 pub unsafe extern "C" fn rt_map(ctx: *mut Ctx, list: i64, f: i64) -> i64 {
     let c = unsafe { &mut *ctx };
-    let Some(items) = native_list(c, list, "map") else {
+    let Some(items) = native_list(c, list, "List::map") else {
         return 0;
     };
     let items = list::to_vec(items);
@@ -4382,10 +4382,10 @@ pub unsafe extern "C" fn rt_map(ctx: *mut Ctx, list: i64, f: i64) -> i64 {
     out
 }
 
-/// `filter(xs, p)`: the elements `p` answers `true` for. Takes the list and the predicate.
+/// `xs.filter(p)`: the elements `p` answers `true` for. Takes the list and the predicate.
 pub unsafe extern "C" fn rt_filter(ctx: *mut Ctx, list: i64, p: i64) -> i64 {
     let c = unsafe { &mut *ctx };
-    let Some(items) = native_list(c, list, "filter") else {
+    let Some(items) = native_list(c, list, "List::filter") else {
         return 0;
     };
     let items = list::to_vec(items);
@@ -4405,7 +4405,7 @@ pub unsafe extern "C" fn rt_filter(ctx: *mut Ctx, list: i64, p: i64) -> i64 {
             Some(false) => {}
             None => {
                 let d = error(format!(
-                    "the predicate given to `filter` answered {}, not a Bool",
+                    "the predicate given to `List::filter` answered {}, not a Bool",
                     c.type_name(r)
                 ));
                 return c.fail(d);
@@ -4419,10 +4419,10 @@ pub unsafe extern "C" fn rt_filter(ctx: *mut Ctx, list: i64, p: i64) -> i64 {
     out
 }
 
-/// `fold(xs, init, f)`. Takes all three.
+/// `xs.fold(init, f)`. Takes all three.
 pub unsafe extern "C" fn rt_fold(ctx: *mut Ctx, list: i64, init: i64, f: i64) -> i64 {
     let c = unsafe { &mut *ctx };
-    let Some(items) = native_list(c, list, "fold") else {
+    let Some(items) = native_list(c, list, "List::fold") else {
         return 0;
     };
     // The list is held until the walk ends, so `f` may run whatever it likes over it.
@@ -4444,7 +4444,7 @@ pub unsafe extern "C" fn rt_fold(ctx: *mut Ctx, list: i64, init: i64, f: i64) ->
     acc
 }
 
-/// `map_fold(m, init, f)` in ascending key order over a snapshot of the entries. Takes all three.
+/// `Map::fold(m, init, f)` in ascending key order over a snapshot of the entries. Takes all three.
 pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     if heap::kind(map) == KIND_MAP {
@@ -4465,7 +4465,7 @@ pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64)
     let value = (map != 0).then(|| c.value(map));
     let Some(Value::Map(entries)) = &value else {
         let d = error(format!(
-            "`map_fold` needs a Map, and this is {}",
+            "`Map::fold` needs a Map, and this is {}",
             c.type_name(map)
         ));
         return c.fail(d);
@@ -4849,7 +4849,7 @@ pub unsafe extern "C" fn rt_list_rest(ctx: *mut Ctx, value: i64, from: i64) -> i
     ctx.heap.list_skip(value, from.max(0) as usize)
 }
 
-/// `map_get` as an `Option` held as its payload's word: the value held once more, or `0` when
+/// `Map::get` as an `Option` held as its payload's word: the value held once more, or `0` when
 /// absent, with no constructor built. Takes the map and the key.
 pub unsafe extern "C" fn rt_map_lookup(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
@@ -4971,7 +4971,7 @@ fn unwrapped(ctx: &mut Ctx, answer: Word) -> Word {
     v
 }
 
-/// `array_at` as an `Option` held as its payload's word, like [`rt_map_lookup`].
+/// `Array::at` as an `Option` held as its payload's word, like [`rt_map_lookup`].
 pub unsafe extern "C" fn rt_array_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(xs) == KIND_ARRAY
@@ -4989,7 +4989,7 @@ pub unsafe extern "C" fn rt_array_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 
     unwrapped(ctx, answer)
 }
 
-/// `list_at` as an `Option` held as its payload's word, like [`rt_map_lookup`].
+/// `List::at` as an `Option` held as its payload's word, like [`rt_map_lookup`].
 pub unsafe extern "C" fn rt_list_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(xs) == KIND_LIST
