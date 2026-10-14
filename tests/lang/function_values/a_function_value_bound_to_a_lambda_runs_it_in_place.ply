@@ -1,0 +1,135 @@
+//! A function value a `let` binds to a lambda is known wherever it is read. A call of it runs the
+//! lambda's body in place, and a definition it is handed to runs it as it would a literal one. A
+//! definition handed on by its name is called directly by the definition it is handed to. So a
+//! `Float` crosses no closure call boxed, and each call still counts the step it would have.
+
+fn walked(n: Int, x: Float, f: (Float) -> Float) -> Float =
+  if n <= 0 { x } else { walked(n - 1, f(x), f) }
+
+/// `f` is called where it is bound, and again inside the lambda a `fold` runs.
+fn called(n: Int, k: Float) -> Float = {
+  let f = |x: Float| x * k + 1.0;
+  fold(range(0, n), f(0.5), |acc: Float, _: Int| f(acc))
+}
+
+/// `f` is handed on, under its own name and under another.
+fn handed(n: Int, k: Float) -> Float = {
+  let f = |x: Float| x * k + 1.0;
+  let g = f;
+  walked(n, 1.0, f) + walked(n, 1.0, g)
+}
+
+/// One lambda calls another it captures.
+fn nested(n: Int, k: Float) -> Float = {
+  let scale = |x: Float| x * k;
+  let step = |x: Float| scale(x) + 1.0;
+  walked(n, 1.0, step)
+}
+
+/// A later binder of the same name is another lambda, which calls the first.
+fn shadowed(x: Float) -> Float = {
+  let f = |y: Float| y + 1.0;
+  let f = |y: Float| f(y) * 2.0;
+  f(x)
+}
+
+/// Stored, a lambda is the closure it always was.
+fn stored(k: Float) -> List<(Float) -> Float> = {
+  let f = |x: Float| x * k;
+  [f, f]
+}
+
+fn marked(xs: List<String>, suffix: String) -> List<String> = {
+  let mark = |s: String| s ++ suffix;
+  push(map(xs, mark), mark("end"))
+}
+
+/// A lambda that handles what it performs stays a closure.
+fn guarded(x: Int) -> Int = {
+  let safe = |n: Int|
+    handle {
+      if n > 2 { abort.raise("big") } else { n }
+    } with {
+      abort.raise(_) -> 0 - 1,
+      return v -> v,
+    };
+  safe(x) + safe(x + 2)
+}
+
+/// What a lambda run in place performs is answered by the handler around its caller.
+fn checked(x: Int) -> Int / {abort.raise} = {
+  let check = |n: Int| if n > 2 { abort.raise("big") } else { n };
+  check(x) + check(x + 2)
+}
+
+fn caught(x: Int) -> Result<Int, String> =
+  handle { checked(x) } with { abort.raise(m) -> Err(m), return v -> Ok(v) }
+
+/// A call of a lambda is the argument of another call of it: the inner call is the binder's last
+/// read, and the outer one reads what the lambda captured after it.
+fn wrapped(s: String, mark: String) -> String = {
+  let around = |x: String| mark ++ x ++ mark;
+  around(around(s))
+}
+
+/// The same of a lambda that calls one it captures.
+fn edged(s: String, mark: String) -> String = {
+  let edge = |n: Int| if n > 1 { mark ++ mark } else { mark };
+  let around = |x: String| edge(string_len(x)) ++ x;
+  around(around(s))
+}
+
+/// The same of a lambda a definition was handed.
+fn twice(f: (String) -> String, s: String) -> String = f(f(s))
+
+fn quoted(s: String, mark: String) -> String = twice(|x: String| mark ++ x ++ mark, s)
+
+fn half(x: Float) -> Float = x * 0.5
+
+fn same<a>(x: a) -> a = x
+
+/// A definition handed on by its name is called where the function it is handed to calls it.
+fn halved(n: Int) -> Float = walked(n, 1024.0, half)
+
+fn unmoved(n: Int) -> Float = walked(n, 1.5, same)
+
+test "a lambda bound by a let answers what calling its closure answers" {
+  assert_eq(called(3, 0.5), 1.90625);
+  assert_eq(handed(2, 0.5), 3.5);
+  assert_eq(nested(2, 0.5), 1.75);
+  assert_eq(shadowed(1.0), 4.0);
+  assert_eq(map(stored(2.0), |g: (Float) -> Float| g(1.5)), [3.0, 3.0]);
+  assert_eq(marked(["a", "b"], "!"), ["a!", "b!", "end!"]);
+  assert_eq(guarded(1), 0);
+  assert_eq(guarded(3), 0 - 2);
+  assert_eq(caught(0), Ok(2));
+  assert_eq(caught(1), Err("big"));
+  assert_eq(wrapped("a", "|"), "||a||");
+  assert_eq(edged("a", "-"), "---a");
+  assert_eq(quoted("a", "'"), "''a''");
+  assert_eq(halved(3), 128.0);
+  assert_eq(unmoved(3), 1.5)
+}
+
+test "a lambda bound by a let boxes nothing where it is called or handed on" {
+  // `called` folds over a range, whose list is what a longer one allocates more of.
+  let ranged = |n: Int| metered(|| len(range(0, n))).allocations;
+  assert_eq(
+    metered(|| called(1000, 0.5)).allocations - ranged(1000),
+    metered(|| called(10, 0.5)).allocations - ranged(10),
+  );
+  assert_eq(metered(|| handed(1000, 0.5)).allocations, metered(|| handed(10, 0.5)).allocations);
+  assert_eq(metered(|| nested(1000, 0.5)).allocations, metered(|| nested(10, 0.5)).allocations);
+  assert_eq(metered(|| halved(1000)).allocations, metered(|| halved(10)).allocations);
+  assert_eq(metered(|| unmoved(1000)).allocations, metered(|| unmoved(10)).allocations)
+}
+
+test "a lambda run in place gives back every count it took and counts its calls" {
+  assert_eq(metered(|| len(marked(["a", "b"], "!"))).live, 0);
+  let mark = "|";
+  assert_eq(metered(|| string_len(wrapped("a", mark))).live, 0);
+  assert_eq(metered(|| string_len(edged("a", mark))).live, 0);
+  assert_eq(metered(|| string_len(quoted("a", mark))).live, 0);
+  assert_eq(metered(|| called(20, 0.5)).steps - metered(|| called(10, 0.5)).steps, 20);
+  assert_eq(metered(|| halved(20)).steps - metered(|| halved(10)).steps, 20)
+}

@@ -4,7 +4,7 @@
 import parsing (Span, span_key, dummy_span, span_between)
 import code (Code, Borrowed, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch,
              NPerform, NLabel, NCell, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate,
-             NInlined, CodeStmt, CLet, CLetPat, CDo, CodePattern, PxWild, PxVar, PxLit, PxRange,
+             NKnown, CodeStmt, CLet, CLetPat, CDo, CodePattern, PxWild, PxVar, PxLit, PxRange,
              PxCtor, PxRecord, PxList, CodePatternField, CodeArm, Capture, Lambda, CodeField,
              CodeClause)
 import patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
@@ -62,11 +62,12 @@ fn typing(sites: Map<Bytes, Typed>, env: Map<Int, Type>, code: Code) -> Typing =
         else { match l.ty { Some(t) -> Some(t), None -> r.ty } },
       }
     },
+    // A call the checker types by no reference, a cell's read, is filed where the call is.
     NApp(a) -> {
       let f = typing(sites, env, a.func);
       {
         sites: fold(a.args, f.sites, |acc: Map<Bytes, Typed>, x: Code| typing(acc, env, x).sites),
-        ty: match f.ty { Some(TyFn(t)) -> Some(t.ret), _ -> None },
+        ty: match f.ty { Some(TyFn(t)) -> Some(t.ret), _ -> filed(sites, code.span) },
       }
     },
     NIf(i) -> {
@@ -136,7 +137,7 @@ fn typing(sites: Map<Bytes, Typed>, env: Map<Int, Type>, code: Code) -> Typing =
       let l = match p.label { Some(c) -> typing(sites, env, c).sites, None -> sites };
       {
         sites: fold(p.args, l, |acc: Map<Bytes, Typed>, x: Code| typing(acc, env, x).sites),
-        ty: None,
+        ty: filed(sites, code.span),
       }
     },
     NLabel(_) -> { sites: sites, ty: None },
@@ -158,7 +159,7 @@ fn typing(sites: Map<Bytes, Typed>, env: Map<Int, Type>, code: Code) -> Typing =
       let b = typing(sites, env, h.body);
       let clauses = fold(h.clauses, b.sites, |acc: Map<Bytes, Typed>, c: CodeClause| {
         let l = match c.label { Some(x) -> typing(acc, env, x).sites, None -> acc };
-        typing(l, captured(env, c.captures), c.body).sites
+        typing(l, clause_env(filed(sites, c.at), env, c), c.body).sites
       });
       match h.ret {
         None -> { sites: clauses, ty: b.ty },
@@ -175,15 +176,7 @@ fn typing(sites: Map<Bytes, Typed>, env: Map<Int, Type>, code: Code) -> Typing =
         },
       }
     },
-    // A lambda run in place is typed by its owner's sites, which this body's are not; the call
-    // answers what the function value it stands for does.
-    NInlined(x) -> {
-      let f = typing(sites, env, x.func);
-      {
-        sites: fold(x.args, f.sites, |acc: Map<Bytes, Typed>, a: Code| typing(acc, env, a).sites),
-        ty: match f.ty { Some(TyFn(t)) -> Some(t.ret), _ -> None },
-      }
-    },
+    NKnown(k) -> { sites: sites, ty: map_get(env, k.slot) },
   };
   noted(made, code.span)
 }
@@ -282,6 +275,19 @@ fn lambda_env(of: Option<Type>, env: Map<Int, Type>, l: Lambda) -> Map<Int, Type
   match of {
     Some(TyFn(f)) -> if len(f.params) != l.params { inside } else {
       fold(range(0, l.params), inside, |acc: Map<Int, Type>, i: Int|
+        match list_at(f.params, i) { Some(t) -> map_insert(acc, i, t), None -> acc })
+    },
+    _ -> inside,
+  }
+}
+
+/// A clause's captures, and its parameters in its leading slots at the types its operation's type
+/// `of` gives them.
+fn clause_env(of: Option<Type>, env: Map<Int, Type>, c: CodeClause) -> Map<Int, Type> = {
+  let inside = captured(env, c.captures);
+  match of {
+    Some(TyFn(f)) -> if len(f.params) != c.params { inside } else {
+      fold(range(0, c.params), inside, |acc: Map<Int, Type>, i: Int|
         match list_at(f.params, i) { Some(t) -> map_insert(acc, i, t), None -> acc })
     },
     _ -> inside,
