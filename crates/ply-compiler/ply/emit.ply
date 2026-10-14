@@ -12,16 +12,16 @@ import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, N
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, parse, ImportDecl,
               ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires, SEnsures, SCost,
               SSpace, FnDef, test_run, test_listing, IInstance, VariantDef, TDSum, INumeric,
-              NumericOp, member_of, NKey)
+              NumericOp, member_of, NKey, TestDef)
 import resolve (ParsedModule, Source, ResolveSucceeded, ResolveFailed, Diag, resolve_modules,
                 Resolved, Scope, Binding, ModuleBinding, PackageDeps, resolve_packaged, no_packages,
                 default_binder, find_module_binding, qualify, of_module, of_binder)
 import derive (expand_derives)
 import infer (LabelSite, OperandSite, TypedSite, expanded_mods, prelude_effects, EffectInfo, OpInfo,
-              EmitFacts, RootFacts, UpdateShape, TrySite, MemberSite, WitnessOp, WitnessRef,
-              WitnessOrder, facts_at, test_owner, law_root, cases_root)
+              is_test_owner, EmitFacts, RootFacts, UpdateShape, TrySite, MemberSite, WitnessOp,
+              WitnessRef, WitnessOrder, facts_at, test_owner, law_root, cases_root)
 import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Atom, RNamed, type_at,
-              is_diverges, int_type)
+              is_diverges, int_type, bytes_type)
 import typing (Typed, node_types, unknown_type, filed_as)
 import front
 import front (Rows, KnownDefRow, KnownTestRow, Dump, analyse, analyse_with, no_rows,
@@ -12669,10 +12669,16 @@ fn nullary_sum(cs: List<SumCtor>) -> Bool =
 /// The root that compares two values of the declared sum `t`.
 pub fn equality_root(t: Bytes) -> Bytes = t.concat(b"#eq")
 
-/// The sum whose values `root` compares, where it is one `equality_root` names.
-pub fn equality_of(root: Bytes) -> Option<Bytes> =
+/// The root that orders two values of the declared sum `t`.
+pub fn ordering_root(t: Bytes) -> Bytes = t.concat(b"#cmp")
+
+/// The declared sum whose values `root` compares or orders, where it is a root `equality_root` or
+/// `ordering_root` names.
+pub fn derived_of(root: Bytes) -> Option<Bytes> =
   if root.len() > 3 && root.slice(root.len() - 3, root.len()) == b"#eq" {
     Some(root.slice(0, root.len() - 3))
+  } else if root.len() > 4 && root.slice(root.len() - 4, root.len()) == b"#cmp" {
+    Some(root.slice(0, root.len() - 4))
   } else { None }
 
 /// Whether two values of the declared sum `t` are equal: one of no constructor's argument by the
@@ -12817,6 +12823,151 @@ fn equality_code(
   }
 }
 
+/// The body of `T#cmp` for a sum of constructors `cs`, as lowered code over its two parameters, and
+/// the operand types and binder and call types it files: as the evaluator orders two constructors'
+/// values, by the constructors' names and then by each argument in turn as its type orders.
+fn ordering_code(
+  cs: List<SumCtor>,
+) -> { code: Code, operands: Map<Bytes, Bytes>, typed: Map<Bytes, Typed> } = {
+  let at = |node: Node, span: Span| { own: Borrowed, node: node, span: span };
+  let placed = |k: Int| { start: 0, end: k, gen: 1 };
+  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
+  let ctor = |name: Bytes| at(NVar({ name: name, slot: None }), dummy_span());
+  let rank = |c: SumCtor|
+    cs.fold(0, |n: Int, d: SumCtor| if compare(d.name, c.name) == Less { n + 1 } else { n });
+  let ranked = |scrutinee: Code|
+    at(
+      NMatch({
+        scrutinee: scrutinee,
+        arms: cs.map(|c: SumCtor|
+          {
+            pat: PxCtor({ name: c.name, args: c.fields.map(|_: Type| PxWild) }),
+            guard: None,
+            body: at(NLit(LInt(rank(c))), dummy_span()),
+          }),
+      }),
+      dummy_span(),
+    );
+  let walked = range(0, cs.len()).fold(
+    { arms: [], operands: Map::new(), typed: Map::new(), next: 2, slot: 4 },
+    |acc: { arms: List<CodeArm>, operands: Map<Bytes, Bytes>, typed: Map<Bytes, Typed>, next: Int, slot: Int }, i: Int| {
+      let c = match cs.at(i) { Some(x) -> x, None -> { name: b"", index: 0, fields: [] } };
+      let k = c.fields.len();
+      let ty = |j: Int| match c.fields.at(j) { Some(t) -> t, None -> unknown_type() };
+      let binder = |side: Int, j: Int|
+        {
+          name: Bytes::concat_all([if side == 0 { b"x" } else { b"y" }, ascii_of_int(j)]),
+          slot: Some(acc.slot + side * k + j),
+          span: placed(acc.next + side * k + j),
+        };
+      // Each binder's type, and each `compare`'s type argument, filed where the emitter reads it.
+      let typed = range(0, 3 * k).fold(acc.typed, |m: Map<Bytes, Typed>, n: Int|
+        m.insert(span_key(placed(acc.next + n)), if n < 2 * k { filed_as(ty(n % k), []) }
+        else { filed_as(unknown_type(), [ty(n - 2 * k)]) }));
+      let operands = range(0, k).fold(acc.operands, |m: Map<Bytes, Bytes>, j: Int|
+        m.insert(span_key(placed(acc.next + 3 * k + j)), b"Ordering"));
+      let compared = |j: Int|
+        at(
+          NApp({
+            func: at(NVar({ name: b"compare", slot: None }), placed(acc.next + 2 * k + j)),
+            args: [
+              var(b"x".concat(ascii_of_int(j)), acc.slot + j),
+              var(b"y".concat(ascii_of_int(j)), acc.slot + k + j),
+            ],
+          }),
+          dummy_span(),
+        );
+      // The first argument that orders apart decides, from the last back to the first.
+      let lex = range(0, k).fold(ctor(b"Equal"), |later: Code, n: Int| {
+        let j = k - 1 - n;
+        if j == k - 1 { compared(j) } else {
+          let o = b"o".concat(ascii_of_int(j));
+          let os = acc.slot + 2 * k + j;
+          at(
+            NBlock({
+              stmts: [CLet({ name: o, slot: os, value: compared(j) })],
+              tail: Some(
+                at(
+                  NIf({
+                    cond: at(
+                      NBinary({ op: b"eq", lhs: var(o, os), rhs: ctor(b"Equal") }),
+                      placed(acc.next + 3 * k + j),
+                    ),
+                    then_branch: later,
+                    else_branch: var(o, os),
+                  }),
+                  dummy_span(),
+                ),
+              ),
+            }),
+            dummy_span(),
+          )
+        }
+      });
+      let inner = at(
+        NMatch({
+          scrutinee: var(b"b", 1),
+          arms: [
+            {
+              pat: PxCtor({ name: c.name, args: range(0, k).map(|j: Int| PxVar(binder(1, j))) }),
+              guard: None,
+              body: lex,
+            },
+            { pat: PxWild, guard: None, body: ctor(b"Equal") },
+          ],
+        }),
+        dummy_span(),
+      );
+      {
+        arms: acc.arms.push({
+          pat: PxCtor({ name: c.name, args: range(0, k).map(|j: Int| PxVar(binder(0, j))) }),
+          guard: None,
+          body: inner,
+        }),
+        operands: operands,
+        typed: typed,
+        next: acc.next + 4 * k,
+        slot: acc.slot + 3 * k,
+      }
+    },
+  );
+  let operands = walked.operands.insert(span_key(placed(0)), b"Int").insert(
+    span_key(placed(1)),
+    b"Int",
+  );
+  let body = at(
+    NIf({
+      cond: at(NBinary({ op: b"lt", lhs: var(b"ra", 2), rhs: var(b"rb", 3) }), placed(0)),
+      then_branch: ctor(b"Less"),
+      else_branch: at(
+        NIf({
+          cond: at(NBinary({ op: b"gt", lhs: var(b"ra", 2), rhs: var(b"rb", 3) }), placed(1)),
+          then_branch: ctor(b"Greater"),
+          else_branch: at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms }), dummy_span()),
+        }),
+        dummy_span(),
+      ),
+    }),
+    dummy_span(),
+  );
+  {
+    code: marked(
+      at(
+        NBlock({
+          stmts: [
+            CLet({ name: b"ra", slot: 2, value: ranked(var(b"a", 0)) }),
+            CLet({ name: b"rb", slot: 3, value: ranked(var(b"b", 1)) }),
+          ],
+          tail: Some(body),
+        }),
+        dummy_span(),
+      ),
+    ),
+    operands: operands,
+    typed: walked.typed,
+  }
+}
+
 /// How the checker names a compared value's type to the emitter: a type of no arguments by its
 /// name, anything else as a word.
 fn compared_name(t: Type) -> Bytes =
@@ -12952,34 +13103,128 @@ fn field_equal(emitter: Emitter, f: FieldTy, a: CValue, b: CValue) -> WithValue 
     },
   }
 
+/// How `compare` orders two values in C: a type one ordered by its name, or a record field by field
+/// in the order its names sort, each field of such a type.
+type Ordered = | ONamed(Bytes) | OFields({ fields: List<FieldTy>, names: List<Bytes> })
+
 /// How `compare` orders two values of the type the checker settled its reference at `at` at, where
-/// the type is one C orders: a number, a character, or a string or byte string by its bytes.
-fn ordered_at(emitter: Emitter, at: Span) -> Option<Bytes> =
+/// C orders them: a number, a character, a string or byte string by its bytes, a sum a module
+/// declares, which its `T#cmp` root orders, or a record of such fields.
+fn ordered_at(emitter: Emitter, at: Span) -> Option<Ordered> =
   match emitter.typed.get(span_key(at)) {
     Some(t) -> match t.args.at(0) {
-      Some(TyCon(c)) -> if c.args.len() > 0 { None }
-      else if c.name == b"Int" || c.name == b"Char" || c.name == b"Decimal" || c.name == b"String"
-          || c.name == b"Bytes" { Some(c.name) } else {
-        match width_named(c.name) {
-          Some(w) -> if carried(w) { Some(c.name) } else { None },
-          None -> None,
-        }
+      Some(ty) -> match ordered_name(emitter, ty) {
+        Some(n) -> Some(ONamed(n)),
+        None -> match ty {
+          TyRecord(fs) -> fields_ordered(emitter, ty, fs),
+          TyNominal(x) -> fields_ordered(emitter, ty, x.fields),
+          _ -> None,
+        },
       },
-      _ -> None,
+      None -> None,
     },
     None -> None,
   }
 
-/// The `Ordering` of `a` and `b`, values of the type `t` names, as the evaluator orders them: a
-/// `Decimal` by its value, a string by its bytes; the constructor's own word, which no count holds.
+/// A record of type `ty`, of fields `fs`, ordered field by field, where each field's type orders by
+/// its name.
+fn fields_ordered(emitter: Emitter, ty: Type, fs: List<Field>) -> Option<Ordered> =
+  match kind_of(ty).ty {
+    TyRec(laid) -> {
+      let names = fs.map(|f: Field| ordered_name(emitter, f.ty).unwrap_or(b""));
+      if laid.len() == fs.len() && laid.len() > 0 && !names.contains(b"") {
+        Some(OFields({ fields: laid, names: names }))
+      } else { None }
+    },
+    _ -> None,
+  }
+
+/// The name a type C orders goes by: a number, a character, a string or byte string, or a sum a
+/// module declares.
+fn ordered_name(emitter: Emitter, ty: Type) -> Option<Bytes> =
+  match ty {
+    TyCon(c) -> if c.args.len() > 0 { None }
+    else if c.name == b"Int" || c.name == b"Char" || c.name == b"Decimal" || c.name == b"String"
+        || c.name == b"Bytes" { Some(c.name) }
+    else if c.name.index_of(b".") != None && compared_by_ctors(emitter.ctors, c.name) {
+      Some(c.name)
+    } else {
+      match width_named(c.name) {
+        Some(w) -> if carried(w) { Some(c.name) } else { None },
+        None -> None,
+      }
+    },
+    _ -> None,
+  }
+
+/// The `Ordering` of `a` and `b`, values of a type `t` says C orders, as the evaluator orders them:
+/// a `Decimal` by its value, a string by its bytes, a record field by field; the constructor's own
+/// word, which no count holds.
 fn compared_order(
   emitter: Emitter,
-  t: Option<Bytes>,
+  t: Option<Ordered>,
   a: CValue,
   b: CValue,
-) -> WithValue / {abort.raise} = {
-  let name = t.unwrap_or(b"");
-  let o = if name == b"String" || name == b"Bytes" {
+) -> WithValue / {abort.raise} =
+  match t {
+    Some(ONamed(n)) -> if n.index_of(b".") != None { sum_ordered(emitter, a, b, n) }
+    else { ordering_word(order_of(emitter, n, a, b)) },
+    Some(OFields(r)) -> ordering_word(record_order(emitter, r, a, b)),
+    None -> refused(emitter, b"an order of a type C does not order"),
+  }
+
+/// The constructor of `Ordering` that `o`, below zero, zero or above it, names, as its word.
+fn ordering_word(o: { emitter: Emitter, expr: Bytes }) -> WithValue / {abort.raise} = {
+  let tag = |ctor: Bytes|
+    match tag_of(o.emitter, ctor) { Some(i) -> tag_text(o.emitter, i), None -> b"0" };
+  bind(
+    o.emitter,
+    KBoxed,
+    Bytes::concat_all([
+      b"rt_ctor_value_p(ctx, ",
+      o.expr,
+      b" < 0 ? ",
+      tag(b"Less"),
+      b" : ",
+      o.expr,
+      b" == 0 ? ",
+      tag(b"Equal"),
+      b" : ",
+      tag(b"Greater"),
+      b")",
+    ]),
+  )
+}
+
+/// Below zero, zero or above zero as `a` and `b`, values of the type `name` C orders, order: a sum
+/// a module declares as its root answers.
+fn order_of(
+  emitter: Emitter,
+  name: Bytes,
+  a: CValue,
+  b: CValue,
+) -> { emitter: Emitter, expr: Bytes } / {abort.raise} =
+  if name.index_of(b".") != None {
+    let w = sum_ordered(emitter, a, b, name);
+    let tag = |ctor: Bytes|
+      match tag_of(w.emitter, ctor) { Some(i) -> tag_text(w.emitter, i), None -> b"0" };
+    let o = bind(
+      w.emitter,
+      KInt,
+      Bytes::concat_all([
+        b"(ply_obj(",
+        w.value.expr,
+        b")->layout == ",
+        tag(b"Less"),
+        b" ? -1 : ply_obj(",
+        w.value.expr,
+        b")->layout == ",
+        tag(b"Equal"),
+        b" ? 0 : 1)",
+      ]),
+    );
+    { emitter: o.emitter, expr: o.value.expr }
+  } else if name == b"String" || name == b"Bytes" {
     let x = bind(emitter, KBoxed, as_word(a));
     let y = bind(x.emitter, KBoxed, as_word(b));
     bytes_order(y.emitter, x.value.expr, y.value.expr)
@@ -13008,26 +13253,55 @@ fn compared_order(
       Some(w) -> signed_order(emitter, as_num(a, w), as_num(b, w)),
       None -> signed_order(emitter, as_int(a), as_int(b)),
     }
+  }
+
+/// Below zero, zero or above zero as the records `a` and `b` order: by their fields in the order
+/// their names sort, the first that orders them apart deciding.
+fn record_order(
+  emitter: Emitter,
+  r: { fields: List<FieldTy>, names: List<Bytes> },
+  a: CValue,
+  b: CValue,
+) -> { emitter: Emitter, expr: Bytes } / {abort.raise} = {
+  let lv = record_values(emitter, a, r.fields);
+  let rv = record_values(lv.emitter, b, r.fields);
+  let o = fresh(rv.emitter);
+  let opened = line(o.emitter, Bytes::concat_all([b"int64_t ", o.name, b" = 0;"]));
+  let ordered = range(0, r.fields.len()).fold(opened, |acc: Emitter, k: Int| {
+    let inside = indent(line(acc, Bytes::concat_all([b"if (", o.name, b" == 0) {"])));
+    let f = order_of(inside, nth_bytes(r.names, k), nth_value(lv.vals, k), nth_value(rv.vals, k));
+    line(
+      outdent(
+        release_at(
+          line(f.emitter, Bytes::concat_all([o.name, b" = ", f.expr, b";"])),
+          inside.indent,
+        ),
+      ),
+      b"}",
+    )
+  });
+  { emitter: ordered, expr: o.name }
+}
+
+/// The `Ordering` of `l` and `r`, values of the declared sum `t`, as `T#cmp` orders them: the root
+/// takes both words and answers the constructor's.
+fn sum_ordered(emitter: Emitter, l: CValue, r: CValue, t: Bytes) -> WithValue / {abort.raise} = {
+  let full = ordering_root(t);
+  let a = owned(emitter, l);
+  let b = owned(a.emitter, r);
+  let noted = {
+    ..note_call(b.emitter, full),
+    generics: {
+      ..b.emitter.generics,
+      expects: b.emitter.generics.expects.push({ callee: full, head: word_head(2) }),
+    },
   };
-  let tag = |ctor: Bytes|
-    match tag_of(o.emitter, ctor) { Some(i) -> tag_text(o.emitter, i), None -> b"0" };
-  bind(
-    o.emitter,
+  let e = bind(
+    noted,
     KBoxed,
-    Bytes::concat_all([
-      b"rt_ctor_value_p(ctx, ",
-      o.expr,
-      b" < 0 ? ",
-      tag(b"Less"),
-      b" : ",
-      o.expr,
-      b" == 0 ? ",
-      tag(b"Equal"),
-      b" : ",
-      tag(b"Greater"),
-      b")",
-    ]),
-  )
+    Bytes::concat_all([symbol_of(full), b"(ctx, ", a.value.expr, b", ", b.value.expr, b")"]),
+  );
+  { emitter: check(e.emitter), value: e.value }
 }
 
 /// A local holding below zero, zero or above zero as `x` and `y`, C values of one ordered type,
@@ -14028,30 +14302,29 @@ pub fn specialised_with(full: Bytes, args: List<Type>, fns: List<FnArg>) -> Byte
 pub fn specialisation_of(
   root: Bytes,
 ) -> Option<{ base: Bytes, args: List<Type>, fns: List<FnArg> }> / {abort.raise} =
-  if root.index_of(b"#") != None { None } else {
-    match root.index_of(b"@") {
-      None -> None,
-      Some(at) -> {
-        let parts = root.slice(at + 1, root.len()).split(b"|");
-        let layouts = match parts.at(0) { Some(x) -> x, None -> b"" };
-        let fns = range(1, parts.len()).fold(Some([]), |acc: Option<List<FnArg>>, k: Int|
-          match acc {
-            None -> None,
-            Some(fs) -> match fn_arg_of(match parts.at(k) { Some(x) -> x, None -> b"" }) {
-              Some(f) -> Some(fs.push(f)),
-              None -> None,
-            },
-          });
-        match fns {
+  match root.index_of(b"@") {
+    None -> None,
+    // A lambda's owner may be a test, whose name holds a `#`; a definition's never does.
+    Some(at) -> if root.slice(0, at).index_of(b"#") != None { None } else {
+      let parts = root.slice(at + 1, root.len()).split(b"|");
+      let layouts = match parts.at(0) { Some(x) -> x, None -> b"" };
+      let fns = range(1, parts.len()).fold(Some([]), |acc: Option<List<FnArg>>, k: Int|
+        match acc {
           None -> None,
-          Some(fs) -> match if layouts.len() == 0 { Some([]) }
-            else { read_types(layouts, 0, [], layouts.len()) } {
-            Some(args) -> Some({ base: root.slice(0, at), args: args, fns: fs }),
+          Some(fs) -> match fn_arg_of(match parts.at(k) { Some(x) -> x, None -> b"" }) {
+            Some(f) -> Some(fs.push(f)),
             None -> None,
           },
-        }
-      },
-    }
+        });
+      match fns {
+        None -> None,
+        Some(fs) -> match if layouts.len() == 0 { Some([]) }
+          else { read_types(layouts, 0, [], layouts.len()) } {
+          Some(args) -> Some({ base: root.slice(0, at), args: args, fns: fs }),
+          None -> None,
+        },
+      }
+    },
   }
 
 /// A lambda `specialised_with` spelled as `param=owner:nth`. The owner is a root's name, whose
@@ -16791,6 +17064,35 @@ test "two values of a declared sum are compared through a root written from its 
   assert(body(b"m.same").index_of(b"rt_equal_p") == None, None)
 }
 
+test "two values of a declared sum are ordered through a root written from its constructors" {
+  let src = Bytes::concat_all([
+    b"type TK = | Punct(Bytes) | Num(Int, Bytes) | Pair(TK, TK) | Eof\n",
+    b"fn order(a: TK, b: TK) -> Ordering = compare(a, b)\n",
+  ]);
+  let answers = answers_of(
+    [b"m"],
+    [src],
+    [b"m.Punct", b"m.Num", b"m.Pair", b"m.Eof", b"Less", b"Equal", b"Greater"],
+    [b"m.order", b"m.TK#cmp"],
+  );
+  let body = |name: Bytes|
+    match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
+        if a.name == name { Some(a) } else { acc }) {
+      Some(a) -> match a.answer {
+        Body(b) -> b.text,
+        Refused(r) -> panic(String::of_bytes_lossy(r.why)),
+      },
+      None -> panic("no answer"),
+    };
+  let cmp = body(b"m.TK#cmp");
+  // Each argument as its type orders: bytes by their bytes, an `Int` in C, and the sum's own
+  // arguments through the same root; nothing goes to the runtime's order.
+  assert(cmp.index_of(b"builtin_compare") == None, None);
+  assert(cmp.index_of(b"memcmp(ply_bytes(") != None, None);
+  assert(cmp.index_of(symbol_of(b"m.TK#cmp").concat(b"(ctx, ")) != None, None);
+  assert(body(b"m.order").index_of(symbol_of(b"m.TK#cmp").concat(b"(ctx, ")) != None, None)
+}
+
 test "strings and byte strings are compared by their bytes where they lie" {
   let src = Bytes::concat_all([
     b"fn same(a: String, b: String) -> Bool = a == b\n",
@@ -17246,7 +17548,8 @@ fn fn_args(emitter: Emitter, codes: List<Code>) -> List<FnArg> / {abort.raise} =
 /// root is a definition of no type variable as it stands, or one at type arguments that are all
 /// known and that runs no lambda of another root itself. Its sites then name no variable.
 fn lends_lambdas(emitter: Emitter) -> Bool / {abort.raise} =
-  emitter.owner.index_of(b"#") == None
+  is_test_owner(emitter.owner)
+    || (emitter.owner.index_of(b"#") == None
     && (match specialisation_of(emitter.owner) {
       Some(s) ->
         s.fns.len() == 0 && emitter.owner.index_of(b"|") == None
@@ -17256,7 +17559,7 @@ fn lends_lambdas(emitter: Emitter) -> Bool / {abort.raise} =
         Some(d) -> match d.scheme { Some(sc) -> sc.ty_vars.len() == 0, None -> true },
         None -> false,
       },
-    })
+    }))
 
 /// The type arguments the checker gave a reference of a generic definition at `at`; none where it
 /// gave none or not one for each of the scheme's variables.
@@ -18402,7 +18705,67 @@ fn emit_program(
                           IFn(d) -> if d.name.name == short && of.lends { Some(d) } else { acc },
                           _ -> acc,
                         }) {
-                      None -> None,
+                      // A test's lambdas, as its root lowers its run.
+                      None -> match m.module.items.fold(
+                          None,
+                          |acc: Option<TestDef>, item: Item|
+                            match item {
+                              ITest(t) -> if test_owner(m.name, t.name) == owner { Some(t) }
+                              else { acc },
+                              _ -> acc,
+                            },
+                        ) {
+                        None -> None,
+                        Some(t) -> {
+                          let cased = t.cases != None;
+                          match lower_to_emit(
+                              if cased { [case_at(), case_identity()] } else { [] },
+                              [],
+                              sites_in(facts.label_sites, i),
+                              test_run(t),
+                              of_binder(m.name),
+                            ) {
+                            None -> None,
+                            Some(l) -> {
+                              let here = defs_in(m.name, m.module, pure, schemes);
+                              let imports = resolved_imports(
+                                x.r,
+                                i,
+                                mods,
+                                m.module,
+                                defs_of,
+                                facts.elaboration.members.filter(|s: MemberSite| s.module == i),
+                              );
+                              let emitted = known_body(owner, [], l.code);
+                              let lambdas = lambdas_of(emitted);
+                              match lambdas.concat(named_in(m.name, here, imports, emitted)).at(
+                                  nth,
+                                ) {
+                                None -> None,
+                                Some(code) ->
+                                  Some({
+                                    owner: owner,
+                                    nth: nth,
+                                    code: code,
+                                    named: nth >= lambdas.len(),
+                                    module: m.name,
+                                    here: here,
+                                    imports: imports,
+                                    effects: effects_in(x.r, i, mods),
+                                    typed: node_types(
+                                      typed_in(facts, i),
+                                      if cased { [Some(int_type()), Some(bytes_type())] }
+                                      else { [] },
+                                      l.code,
+                                    ),
+                                    operands: operands_in(facts.operands, i),
+                                    base: t.span.start,
+                                  }),
+                              }
+                            },
+                          }
+                        },
+                      },
                       Some(d) -> {
                         let source = definition_at(
                           of.base,
@@ -18949,51 +19312,55 @@ fn emit_module(
           fns: acc.fns,
         }
       },
-      // A sum some body compares is compared through a root written from its constructors.
+      // A sum some body compares or orders is compared through a root written from its
+      // constructors, written only where a body's call asks for it, not with every root a whole
+      // emission takes.
       IType(t) -> {
         let named = qualify(module, t.name.name);
-        let full = equality_root(named);
-        // Written only where a body's call asks for it, not with every root a whole emission takes.
-        match match wanted {
-            Some(w) -> if w.contains(full) { ctors.sums.get(named) } else { None },
-            None -> None,
-          } {
+        let asked = |root: Bytes| match wanted { Some(w) -> w.contains(root), None -> false };
+        match ctors.sums.get(named) {
           None -> acc,
-          Some(cs) -> {
-            let e = equality_code(cs);
-            let word = |n: Bytes|
-              {
-                name: n,
-                kind: KBoxed,
-                ty: TyOpen([]),
-                of: None,
-                carrier: Whole(KBoxed),
-                lambda: None,
-              };
-            {
-              ..acc,
-              out: acc.out.push(
-                emitted_from(
-                  module,
-                  t.span.start,
-                  here,
-                  imports,
-                  ctors,
-                  builtins,
-                  effects,
-                  release,
-                  e.operands.fold(operands, |m: Map<Bytes, Bytes>, k: Bytes, v: Bytes|
-                    m.insert(k, v)),
-                  e.typed.fold(typed, |m: Map<Bytes, Typed>, k: Bytes, v: Typed| m.insert(k, v)),
-                  full,
-                  [word(b"a"), word(b"b")],
-                  true,
-                  ELit({ span: t.span, lit: LBool(false) }),
-                  Some(e.code),
-                ),
-              ),
-            }
-          },
+          Some(cs) ->
+            [
+              { root: equality_root(named), asked: asked(equality_root(named)), eq: true },
+              { root: ordering_root(named), asked: asked(ordering_root(named)), eq: false },
+            ].fold(acc, |a2: Walk, d: { root: Bytes, asked: Bool, eq: Bool }|
+              if !d.asked { a2 } else {
+                let e = if d.eq { equality_code(cs) } else { ordering_code(cs) };
+                let word = |n: Bytes|
+                  {
+                    name: n,
+                    kind: KBoxed,
+                    ty: TyOpen([]),
+                    of: None,
+                    carrier: Whole(KBoxed),
+                    lambda: None,
+                  };
+                {
+                  ..a2,
+                  out: a2.out.push(
+                    emitted_from(
+                      module,
+                      t.span.start,
+                      here,
+                      imports,
+                      ctors,
+                      builtins,
+                      effects,
+                      release,
+                      e.operands.fold(operands, |m: Map<Bytes, Bytes>, k: Bytes, v: Bytes|
+                        m.insert(k, v)),
+                      e.typed.fold(typed, |m: Map<Bytes, Typed>, k: Bytes, v: Typed|
+                        m.insert(k, v)),
+                      d.root,
+                      [word(b"a"), word(b"b")],
+                      true,
+                      ELit({ span: t.span, lit: LBool(false) }),
+                      Some(e.code),
+                    ),
+                  ),
+                }
+              }),
         }
       },
       _ -> acc,
