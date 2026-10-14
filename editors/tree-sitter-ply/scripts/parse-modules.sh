@@ -3,8 +3,7 @@
 # second reading of the language beside `crates/ply-compiler/ply`, so this is what says the two
 # still agree: a rule the language gains or drops shows up here as an `ERROR` or a `MISSING` node.
 #
-# The `phases/` fixtures and `tests/fixtures/` hold inputs written to be refused, and the lexer
-# fixtures under `phases/lexer/` are token fragments rather than programs, so none of them is read.
+# `tests/fixtures/` holds inputs written to be refused, so none of them is read.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -16,7 +15,7 @@ trap 'rm -f "$paths"' EXIT
 
 find "$root/crates" "$root/examples" "$root/tests/lang" \
   -type f -name '*.ply' \
-  ! -path '*/target/*' ! -path '*/bootstrap/*' ! -path '*/phases/*' \
+  ! -path '*/target/*' ! -path '*/bootstrap/*' \
   ! -path "$root/tests/fixtures/*" > "$paths"
 
 cd "$grammar"

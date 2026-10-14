@@ -37,11 +37,8 @@
 #   ci-shards.sh formatted-sources
 #                                the maintained Ply sources, one a line, which the
 #                                gates job holds to `ply fmt --check`
-#   ci-shards.sh nightly-matrix EVENT  the JSON matrix of the nightly jobs, each the arguments of a
-#                                `ci-ply.sh nightly`: under `schedule` or `workflow_dispatch`,
-#                                SWEEP_SHARDS shards of the part of the edit sweep's cases the day
-#                                names, so SWEEP_DAYS days sweep every case, and one job of the other
-#                                modules no pull request runs; none otherwise
+#   ci-shards.sh nightly-modules the modules of the CLI's suite no pull request runs, on one line,
+#                                which the nightly job hands `ci-ply.sh nightly`
 #   ci-shards.sh supersede RUN REF
 #                                delete the entries of REF nothing restores again:
 #                                those this run's replaced, and those no family
@@ -70,15 +67,10 @@ CLI_PARTS=2
 # A package's own tests and proofs share one job, `packages`, in turn: each loads little. These take
 # a job of their own instead: the compiler's own tests take every core.
 RUNS_ALONE=(package-compiler)
-# Modules of the CLI's suite no pull request runs, which the `nightly` jobs do. CLI_SWEPT edits each
-# module of the tree one way and checks it warm and cold, days of runners over the tree, so a night
-# takes a part of its cases. The rest run whole each night: minutes each over the toolchain's whole
-# trees, the reach audit checking packages cold and the copies audit listing every one, or against a
-# postgres they start.
-CLI_NIGHTLY=(edit_sweep phases_whole reached copies db_in_ply db_wire pg_client)
-CLI_SWEPT=edit_sweep
-SWEEP_SHARDS=16
-SWEEP_DAYS=14
+# Modules of the CLI's suite no pull request runs, which the `nightly` job does: minutes each, the
+# reach audit checking packages cold and the copies audit listing every one, or against a postgres
+# they start.
+CLI_NIGHTLY=(reached copies db_in_ply db_wire pg_client)
 # Minutes of a job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the steps
 # that keep what they wrote.
 RUNS_MARGIN=4
@@ -150,7 +142,6 @@ FORMATTED_SOURCES=(
   tests/lang
 )
 FIXTURE_SOURCES=(
-  crates/ply-cli-tests/phases
   crates/ply-codegen-tests/tests
   tests/fixtures
 )
@@ -1260,14 +1251,10 @@ cmd_verify() {
   done
   for module in "${CLI_NIGHTLY[@]}"; do
     if [[ -z $(test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true) ]]; then
-      echo "FAIL: $CLI_SUITE/$module.ply declares no test, and CLI_NIGHTLY leaves it to the nightly jobs" >&2
+      echo "FAIL: $CLI_SUITE/$module.ply declares no test, and CLI_NIGHTLY leaves it to the nightly job" >&2
       failures=$((failures + 1))
     fi
   done
-  if ! named_in "$CLI_SWEPT" "${CLI_NIGHTLY[@]}"; then
-    echo "FAIL: CLI_SWEPT names '$CLI_SWEPT', which CLI_NIGHTLY does not, so a pull request runs it whole" >&2
-    failures=$((failures + 1))
-  fi
   # Each command's runs must reach a job the \`ci\` job waits on, or they run nowhere that counts.
   for runs_command in "ci-shards.sh runs-matrix" "ci-ply.sh run" "ci-ply.sh nightly"; do
     runs_job=$(job_running "$runs_command")
@@ -1322,24 +1309,6 @@ cmd_verify() {
   echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#CLI_TREE_CHECKS[@]} in the CLI's suite, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(grep -c . <<< "$listed") Ply runs in $(jobs | grep -c .) jobs; $NEXTEST_SHARDS nextest shards"
 }
 
-# The nightly jobs, each by the arguments its `ci-ply.sh nightly` takes: the day's shards of
-# CLI_SWEPT's cases, and CLI_NIGHTLY's other modules in one job.
-cmd_nightly_matrix() {
-  local event=$1 module whole=""
-  if [[ $event == schedule || $event == workflow_dispatch ]]; then
-    for module in "${CLI_NIGHTLY[@]}"; do
-      [[ $module == "$CLI_SWEPT" ]] || whole+="${whole:+ }$module"
-    done
-    jq -cn --argjson n "$SWEEP_SHARDS" --argjson days "$SWEEP_DAYS" --argjson day "$(($(date -u +%s) / 86400))" \
-      --arg swept "$CLI_SWEPT" --arg whole "$whole" \
-      '($n * $days) as $of | {include: ([range(1; $n + 1) | (($day % $days) * $n + .) as $k
-        | {name: "\($swept) \($k)/\($of)", args: "\($swept) --shard \($k)/\($of)"}]
-        + [{name: $whole, args: $whole}])}'
-  else
-    echo '{"include":[]}'
-  fi
-}
-
 case "${1:-}" in
   verify) cmd_verify ;;
   cache-keys)
@@ -1361,9 +1330,9 @@ case "${1:-}" in
   tree-check-filter) cmd_tree_check_filter ;;
   rust-inputs) cmd_rust_inputs "${2:-}" ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
-  nightly-matrix) cmd_nightly_matrix "${2:?an event}" ;;
+  nightly-modules) echo "${CLI_NIGHTLY[*]}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-matrix EVENT}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
     exit 2
     ;;
 esac
