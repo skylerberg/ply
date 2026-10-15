@@ -150,35 +150,35 @@ fn a_digest_below_directories_moves_with_a_file_there_and_with_none_outside() {
         read(&binary(b"", files))
             .expect("the pack reads")
             .expect("the binary carries one")
-            .digest_below(&[ply_pack::STD, ply_pack::PRELUDE])
+            .digest_below(&[ply_pack::STD, ply_pack::COMPILER])
     };
     let base = below(&[
         ("crates/ply-std/ply/option.ply", b"a"),
-        ("crates/ply-compiler/prelude.ply", b"p"),
+        ("crates/ply-compiler/ply/infer.ply", b"p"),
         ("program/front", b"f"),
     ]);
     let moved = |files: &[(&str, &[u8])]| below(files) != base;
     assert!(moved(&[
         ("crates/ply-std/ply/option.ply", b"b"),
-        ("crates/ply-compiler/prelude.ply", b"p"),
+        ("crates/ply-compiler/ply/infer.ply", b"p"),
         ("program/front", b"f"),
     ]));
     assert!(moved(&[
         ("crates/ply-std/ply/option.ply", b"a"),
         ("crates/ply-std/ply/oid/names.txt", b"n"),
-        ("crates/ply-compiler/prelude.ply", b"p"),
+        ("crates/ply-compiler/ply/infer.ply", b"p"),
         ("program/front", b"f"),
     ]));
     assert!(moved(&[
         ("crates/ply-std/ply/option.ply", b"a"),
-        ("crates/ply-compiler/prelude.ply", b"q"),
+        ("crates/ply-compiler/ply/infer.ply", b"q"),
         ("program/front", b"f"),
     ]));
     // The program, and a file whose path only starts as a root's does, are no part of it.
     assert!(!moved(&[
         ("crates/ply-std/ply/option.ply", b"a"),
         ("crates/ply-std/ply.txt", b"d"),
-        ("crates/ply-compiler/prelude.ply", b"p"),
+        ("crates/ply-compiler/ply/infer.ply", b"p"),
         ("program/front", b"another"),
     ]));
 }

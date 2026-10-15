@@ -40,10 +40,10 @@ import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo,
               facts_at, facts_by_owner, filed_facts, foreign_facts, no_root_facts, root_facts_bin,
               test_owner, is_test_owner, law_root, cases_root, listing_ty, witness_order_bin,
               elaborated, ended, stated, elaboration_with, updated_mods, check_front_with,
-              is_prelude_effect, Builtin, builtins, published_pure, EmitFacts, emit_facts_bin,
-              written_counts, InstanceInfo, NumericInfo, Raise, raise_bin, Elaboration,
-              def_info_bin, test_info_bin, law_info_bin, effect_info_bin, ctor_info_bin,
-              instance_info_bin, numeric_info_bin, kept_facts_bin, prelude_tables)
+              is_prelude_effect, Builtin, builtins, externs_of, prelude_module, published_pure,
+              EmitFacts, emit_facts_bin, written_counts, InstanceInfo, NumericInfo, Raise,
+              raise_bin, Elaboration, def_info_bin, test_info_bin, law_info_bin, effect_info_bin,
+              ctor_info_bin, instance_info_bin, numeric_info_bin, kept_facts_bin, prelude_tables)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
 import diagnostics (ParsedSource, headed_at, parse_all, parse_at, outside_every_module, placed)
 import pkg (PackageSources, Supplied, Closure, Package, Pinned, Judged, closure, closed, empty,
@@ -3737,13 +3737,26 @@ pub type BuiltinRow = { name: Bytes, scheme: Scheme, params: List<Bytes>, witnes
 
 /// Every builtin, in the prelude's order.
 pub fn builtin_rows() -> List<BuiltinRow> / {abort.raise} =
-  builtins().map(|b: Builtin|
-    {
-      name: b.name,
-      scheme: b.scheme,
-      params: b.params,
-      witnesses: b.constraints.filter(|c: DefConstraint| is_predicate(c.deriver)).len(),
+  builtins().map(|b: Builtin| row_of(b.name, b))
+
+/// Every builtin the toolchain declares, under the name the runtime implements it by: the prelude's,
+/// then each extern of `shipped`, the shipped modules' texts, under its own name.
+pub fn shipped_builtin_rows(shipped: List<Source>) -> List<BuiltinRow> / {abort.raise} =
+  shipped.fold(builtin_rows(), |acc: List<BuiltinRow>, s: Source|
+    if s.name == prelude_module() { acc } else {
+      acc.concat(
+        externs_of(s.name, parse(s.src).node).map(|b: Builtin|
+          row_of(b.name.slice(s.name.len() + 1, b.name.len()), b)),
+      )
     })
+
+fn row_of(name: Bytes, b: Builtin) -> BuiltinRow =
+  {
+    name: name,
+    scheme: b.scheme,
+    params: b.params,
+    witnesses: b.constraints.filter(|c: DefConstraint| is_predicate(c.deriver)).len(),
+  }
 
 fn global_name(r: Resolved, module: Int, written: Bytes) -> Bytes / {abort.raise} = {
   let q: QName = match written.index_of(b"::") {
@@ -4697,8 +4710,8 @@ fn needing<| e>(
   }
 }
 
-/// What a pulled module embeds from beside itself, read once: the prelude beside the compiler's
-/// package is one, which no module imports, and a data file is another.
+/// What a pulled module embeds from beside itself, read once: a module's text, as the prelude's is
+/// read by the compiler, or a data file.
 fn beside<| e>(
   listed: List<Bytes>,
   read: (Bytes) -> Option<Bytes> / e,
@@ -4731,42 +4744,47 @@ fn beside<| e>(
       }
     })
 
-/// The name the shipped modules give what sits at `path` beside the shipped module `module`. They
-/// hold a package, and what lies beside its directory, under the package's one root:
-/// `../prelude.ply` beside `compiler.infer` is `compiler.prelude`.
-fn shipped_name(module: Bytes, path: Bytes) -> Option<Bytes> / {abort.raise} = {
-  let walked = path.split(b"/").fold(
-    module.split(b".").drop_last(1),
-    |dir: List<Bytes>, part: Bytes|
-      if part == b"" || part == b"." { dir }
-      else if part == b".." { if dir.len() > 1 { dir.drop_last(1) } else { dir } }
-      else { dir.push(part) },
-  );
-  match walked.at(walked.len() - 1) {
-    None -> None,
-    Some(file) -> if walked.len() < 2 || !file.ends_with(b".ply") { None }
-    else { Some(Bytes::join(walked.drop_last(1).push(file.slice(0, file.len() - 4)), b".")) },
+/// Where `path` beside the shipped module `module` lies below its package's root, the root first.
+/// `None` for an absolute path or one that leaves the package.
+fn shipped_place(module: Bytes, path: Bytes) -> Option<List<Bytes>> =
+  if path.starts_with(b"/") { None } else {
+    match path.split(b"/").fold(
+        Some(module.split(b".").drop_last(1)),
+        |inside: Option<List<Bytes>>, part: Bytes|
+          match inside {
+            None -> None,
+            Some(dir) -> if part == b"" || part == b"." { inside }
+            else if part != b".." { Some(dir.push(part)) }
+            else if dir.len() > 1 { Some(dir.drop_last(1)) }
+            else { None },
+          },
+      ) {
+      Some(parts) -> if parts.len() < 2 { None } else { Some(parts) },
+      None -> None,
+    }
   }
-}
+
+/// The name the shipped modules give the module at `path` beside the shipped module `module`:
+/// `../b.ply` beside `std.deep.a` is `std.b`. `None` for a path that names no module or that leaves
+/// the package.
+fn shipped_name(module: Bytes, path: Bytes) -> Option<Bytes> / {abort.raise} =
+  if !path.ends_with(b".ply") { None } else {
+    match shipped_place(module, path) {
+      Some(parts) -> {
+        let named = Bytes::join(parts, b".");
+        Some(named.slice(0, named.len() - 4))
+      },
+      None -> None,
+    }
+  }
 
 /// The name the shipped modules give the data file at `path` beside the shipped module `module`:
 /// its place below the package's root, `std/oid/names.txt` for `oid/names.txt` beside `std.oid`.
 /// `None` for a path that names a module, that is absolute, or that leaves the package.
 pub fn shipped_data_name(module: Bytes, path: Bytes) -> Option<Bytes> =
-  if path.starts_with(b"/") || path.ends_with(b".ply") { None } else {
-    let walked = path.split(b"/").fold(
-      Some(module.split(b".").drop_last(1)),
-      |inside: Option<List<Bytes>>, part: Bytes|
-        match inside {
-          None -> None,
-          Some(dir) -> if part == b"" || part == b"." { inside }
-          else if part != b".." { Some(dir.push(part)) }
-          else if dir.len() > 1 { Some(dir.drop_last(1)) }
-          else { None },
-        },
-    );
-    match walked {
-      Some(parts) -> if parts.len() < 2 { None } else { Some(Bytes::join(parts, b"/")) },
+  if path.ends_with(b".ply") { None } else {
+    match shipped_place(module, path) {
+      Some(parts) -> Some(Bytes::join(parts, b"/")),
       None -> None,
     }
   }
@@ -7231,14 +7249,14 @@ test "an asked module the load never read is refused as the front end's own faul
   ])
 }
 
-test "a load reads a compiler module's bare sibling imports and what it embeds beside its package" {
+test "a load reads a compiler module's bare sibling imports and the module text it embeds" {
   let texts = [
     {
       name: b"compiler.fmt",
-      src: b"import lexer\npub fn f() -> Bytes = embed(\"../prelude.ply\")\n",
+      src: b"import lexer\npub fn f() -> Bytes = embed(\"words/table.ply\")\n",
     },
     { name: b"compiler.lexer", src: b"pub fn l() -> Int = 1\n" },
-    { name: b"compiler.prelude", src: b"" },
+    { name: b"compiler.words.table", src: b"" },
     { name: b"compiler.unit", src: b"pub fn u() -> Int = 2\n" },
   ];
   let s = shipped_pulled(
@@ -7253,7 +7271,7 @@ test "a load reads a compiler module's bare sibling imports and what it embeds b
   );
   assert_eq(s.read.map(|t: Source| t.name), [
     b"compiler.fmt",
-    b"compiler.prelude",
+    b"compiler.words.table",
     b"compiler.lexer",
   ]);
   assert_eq(s.unread, [b"compiler.unit"]);
@@ -8261,25 +8279,26 @@ test "a dependency is pinned by what its modules embed as well as by their text"
   assert(embedding_lib(Some(b"one")) != embedding_lib(Some(b"two")))
 }
 
-test "what sits beside a shipped module, or beside its package, is filed under the package's root" {
-  assert_eq(shipped_name(b"compiler.infer", b"../prelude.ply"), Some(b"compiler.prelude"));
+test "what sits beside a shipped module is filed under its package's root, and nothing outside it is" {
+  assert_eq(shipped_name(b"std.internal.prelude_source", b"../prelude.ply"), Some(b"std.prelude"));
   assert_eq(shipped_name(b"std.a", b"b.ply"), Some(b"std.b"));
   assert_eq(shipped_name(b"std.a", b"./deep/b.ply"), Some(b"std.deep.b"));
   assert_eq(shipped_name(b"std.deep.a", b"../b.ply"), Some(b"std.b"));
-  assert_eq(shipped_name(b"std.a", b"../../b.ply"), Some(b"std.b"));
+  assert_eq(shipped_name(b"std.a", b"../b.ply"), None);
+  assert_eq(shipped_name(b"std.a", b"/b.ply"), None);
   assert_eq(shipped_name(b"std.a", b".."), None);
   assert_eq(shipped_name(b"std.a", b"notes.txt"), None)
 }
 
 test "a shipped module embeds what the shipped modules hold beside it, and other bytes are another definition" {
-  let user = [{ name: b"m", src: b"import std.a\npub fn f() -> Bytes = a::text()" }];
-  let embedding = { name: b"std.a", src: b"pub fn text() -> Bytes = embed(\"../note.ply\")" };
+  let user = [{ name: b"m", src: b"import std.deep.a\npub fn f() -> Bytes = a::text()" }];
+  let embedding = { name: b"std.deep.a", src: b"pub fn text() -> Bytes = embed(\"../note.ply\")" };
   let over = |note: Bytes| pulled_answer(user, [embedding, { name: b"std.note", src: note }]);
   let one = over(b"one");
   assert_eq(one.dump.diags, []);
-  assert_eq(one.pulled, [b"std.a"]);
+  assert_eq(one.pulled, [b"std.deep.a"]);
   assert_eq(one.dump.embeds, [
-    { module: b"std.a", key: b"file:../note.ply", read: Ok([{ name: b"", bytes: b"one" }]) },
+    { module: b"std.deep.a", key: b"file:../note.ply", read: Ok([{ name: b"", bytes: b"one" }]) },
   ]);
   assert(one.dump.hashes_digest != over(b"two").dump.hashes_digest)
 }

@@ -15,9 +15,6 @@ pub const COMPILER_ROOT: &str = "compiler";
 const STD_PSEUDO_ROOT: &str = "<std>";
 const COMPILER_PSEUDO_ROOT: &str = "<compiler>";
 
-/// What lies beside the compiler's package is held under its root: the builtins it embeds.
-const PRELUDE_NAME: &str = "prelude";
-
 pub fn is_compiler(name: &str) -> bool {
     name == COMPILER_ROOT || name.starts_with("compiler.")
 }
@@ -32,8 +29,7 @@ pub fn is_shipped_name(name: &str) -> bool {
 }
 
 /// Every shipped module's name: the standard library's, each file at or below its tree named by its
-/// place there (`hash/legacy.ply` is `std.hash.legacy`), the compiler's, then what the compiler
-/// embeds from beside its package. No text is read.
+/// place there (`hash/legacy.ply` is `std.hash.legacy`), then the compiler's. No text is read.
 pub fn names() -> Vec<String> {
     let pack = ply_pack::installed();
     let named = |root: &'static str, dir: &'static str, path: &str| {
@@ -46,7 +42,6 @@ pub fn names() -> Vec<String> {
             pack.files_in(ply_pack::COMPILER)
                 .filter_map(|path| named(COMPILER_ROOT, ply_pack::COMPILER, path)),
         )
-        .chain([format!("{COMPILER_ROOT}.{PRELUDE_NAME}")])
         .collect()
 }
 
@@ -74,9 +69,6 @@ pub fn sources() -> Vec<(String, &'static str)> {
 
 /// Where the pack carries a shipped module.
 fn path_of(module: &str) -> Option<String> {
-    if module == format!("{COMPILER_ROOT}.{PRELUDE_NAME}") {
-        return Some(ply_pack::PRELUDE.to_string());
-    }
     let (dir, stem) = match module.split_once('.')? {
         (STD_ROOT, stem) => (ply_pack::STD, stem),
         (COMPILER_ROOT, stem) => (ply_pack::COMPILER, stem),
@@ -137,7 +129,7 @@ pub fn digests() -> String {
 
 /// Every shipped module and data file, digested: it moves with any of them. No bytes are read.
 pub fn digest() -> ply_pack::Digest {
-    ply_pack::installed().digest_below(&[ply_pack::STD, ply_pack::COMPILER, ply_pack::PRELUDE])
+    ply_pack::installed().digest_below(&[ply_pack::STD, ply_pack::COMPILER])
 }
 
 /// What `name` is of the shipped modules, as a trace holds it: a module's text or a data file's

@@ -8,10 +8,11 @@ import diagnostics (parse_all)
 import exprs (Param)
 import front (analyse, Analysed, Refused)
 import hash (hex)
-import infer (DefInfo)
-import items (Item, IFn, IType, IEffect, IEffectSet, FnDef, TypeDef, TDAlias, TDSum, TDNominal,
-              TDExtern, VariantDef, EffectDef, OpDef, EffectSetDef, FieldDoc, SpecClause,
-              ReturnsFresh, ReturnsParam, Vis, VPub, VPriv, SchemaDef, schema_of, member_of)
+import infer (DefInfo, Builtin, externs_of)
+import items (Item, IFn, IType, IEffect, IEffectSet, IExtern, ExternDef, FnDef, TypeDef, TDAlias,
+              TDSum, TDNominal, TDExtern, VariantDef, EffectDef, OpDef, EffectSetDef, FieldDoc,
+              SpecClause, ReturnsFresh, ReturnsParam, Vis, VPub, VPriv, SchemaDef, schema_of,
+              member_of)
 import parsing (Doc, Ident, Span)
 import resolve (ParsedModule, qualify)
 import type_syntax (TypeExpr, TRecord, ty_span, generics_text)
@@ -335,10 +336,25 @@ fn declared(reading: Reading, kind: String, own: Bytes, span: Span) -> Page =
     at: span.start,
   }
 
-/// The pages of what one item declares: a type's, an effect's and each of its operations', or an
-/// effect set's. A function's page is its definition's, which its check publishes.
+/// The pages of what one item declares: an extern's, a type's, an effect's and each of its
+/// operations', or an effect set's. A function's page is its definition's, which its check
+/// publishes.
 fn item_pages(reading: Reading, it: Item) -> List<Page> / {abort.raise} =
   match it {
+    IExtern(d) -> match native_of(reading, d) {
+      Some(n) ->
+        [
+          {
+            ..declared(reading, "builtin", d.name.name, d.span),
+            signature: n.signed.text,
+            ty: String::of_bytes_lossy(scheme_text(n.builtin.scheme)),
+            params: n.signed.params,
+            doc: n.builtin.doc.map(|l: Bytes| String::of_bytes_lossy(l)),
+            clauses: n.builtin.clauses.map(|c: Bytes| String::of_bytes_lossy(c)),
+          },
+        ],
+      None -> [],
+    },
     IType(d) ->
       [
         {
@@ -376,11 +392,44 @@ fn item_pages(reading: Reading, it: Item) -> List<Page> / {abort.raise} =
     _ -> [],
   }
 
+/// A module's extern as the checker binds it, and its signature with its parameters named.
+type Native = { builtin: Builtin, signed: Signed }
+
+fn native_of(reading: Reading, d: ExternDef) -> Option<Native> / {abort.raise} = {
+  let name = qualify(reading.parsed.name, d.name.name);
+  match externs_of(reading.parsed.name, reading.parsed.module).find(|b: Builtin| b.name == name) {
+    Some(b) ->
+      Some({
+        builtin: b,
+        signed: signature(
+          "",
+          String::of_bytes_lossy(d.name.name),
+          b.scheme,
+          b.params.map(|n: Bytes| String::of_bytes_lossy(n)),
+        ),
+      }),
+    None -> None,
+  }
+}
+
 /// What a module publishes, in its order, each with its signature and doc.
 fn module_members(reading: Reading) -> List<Member> / {abort.raise} = {
   let parsed = reading.parsed;
   parsed.module.items.fold([], |acc: List<Member>, it: Item|
     match it {
+      IExtern(d) -> match d.vis {
+        VPriv -> acc,
+        VPub -> match native_of(reading, d) {
+          Some(n) ->
+            acc.push({
+              kind: "builtin",
+              name: String::of_bytes_lossy(d.name.name),
+              signature: n.signed.text,
+              doc: n.builtin.doc.map(|l: Bytes| String::of_bytes_lossy(l)),
+            }),
+          None -> acc,
+        },
+      },
       IFn(d) -> match d.vis {
         VPriv -> acc,
         VPub -> match ((
@@ -537,6 +586,29 @@ test "a module documents itself, each definition its check published and each na
     },
   ]);
   assert_eq(page("m.ledger.record").signature, "write record(n: Int) -> Unit")
+}
+
+test "a shipped module's extern is a builtin of its module, listed among its members where it is `pub`" {
+  let src = b"//! Natives.\n\n/// Twice the number.\npub extern fn doubled(x: Int) -> Int\n\n/// Kept inside.\nextern fn hidden(x: Int) -> Int\n";
+  match parse_all([{ name: b"std.native", src: src }]) {
+    [p] -> {
+      let pages = documented(p.module, src, {
+        defs: [],
+        hashes: Map::new(),
+        laws: Map::new(),
+      }).pages;
+      assert_eq(pages.map(|page: Page| page.kind ++ " " ++ page.name), [
+        "module std.native",
+        "builtin std.native.doubled",
+        "builtin std.native.hidden",
+      ]);
+      assert_eq(pages.get(0).members.map(|m: Member| m.name ++ ": " ++ m.signature), [
+        "doubled: doubled(x: Int) -> Int",
+      ]);
+      assert_eq(pages.get(1).doc, ["Twice the number."])
+    },
+    _ -> panic("one module"),
+  }
 }
 
 test "a type's page lists its functions after what it is made of, those it publishes where it is published" {

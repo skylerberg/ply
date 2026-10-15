@@ -22,14 +22,14 @@ of it next.
 | --- | --- |
 | `crates/ply-eval` | values, the evaluator, the scheduler and the simulator; spans, diagnostics and their codes; the program record the compiler answers with |
 | `crates/ply-codegen` | the C backend's runtime: loads a compiled unit, or the one an executable was linked with, and runs it |
-| `crates/ply-compiler` | the compiler written in Ply (`ply/`), with its builder (`build.main`) and the C compiling and linking it drives (`cc.ply`, `native.ply`), and the builtins it declares (`prelude.ply`) |
+| `crates/ply-compiler` | the compiler written in Ply (`ply/`), with its builder (`build.main`) and the C compiling and linking it drives (`cc.ply`, `native.ply`) |
 | `crates/ply-store` | what `ply` keeps under `.ply-cache`, as the `store` package in `ply/`; not a cargo crate |
 | `crates/ply-test` | what a test run decides, as the `suite` package in `ply/`; not a cargo crate |
 | `crates/ply-prove` | specification obligations and their discharge, as the `prove` package in `ply/`; not a cargo crate |
 | `crates/ply-sim` | the interleaving search, as the `sim` package in `ply/`; not a cargo crate |
 | `crates/ply-host` | the Rust handlers effects resolve to (db, fs, tcp, tls, ...) |
 | `crates/ply-machine` | the nested-entry capability: a program loading and entering another program; and the runtime `ply test` and `ply prove` drive |
-| `crates/ply-std` | the standard library, as Ply source in `ply/` |
+| `crates/ply-std` | the standard library, as Ply source in `ply/`, the builtins' declarations (`prelude.ply`) among it |
 | `crates/ply-cli` | the `ply` program, as Ply source in `ply/`; not a cargo crate |
 | `crates/ply-registry` | the package registry `ply publish` and `ply resolve` talk to, as Ply source in `ply/`; not a cargo crate |
 | `crates/ply-launcher` | what enters a native program: its pack read, its roots and hosts lent, its entry called |

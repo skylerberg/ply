@@ -130,7 +130,6 @@ FORMATTED_SOURCES=(
   crates/ply-cli-tests/ply
   crates/ply-cli/ply
   crates/ply-compiler/ply
-  crates/ply-compiler/prelude.ply
   crates/ply-prove/ply
   crates/ply-registry/ply
   crates/ply-sim/ply

@@ -54,9 +54,8 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
   `ply` that made, which takes the builder and the shipped modules' answers the first kept unless
   the definitions that make them moved. So only the compiler and the shipped modules it imports (`grep '^import std'
   crates/ply-compiler/ply/*.ply` and what those import) cannot use a language rule the same pull
-  request introduces. The rest of `crates/ply-std/ply` can, and so can
-  `crates/ply-compiler/prelude.ply`, which declares the builtins: the compiler embeds its text and
-  parses it itself. Likewise the release's bootstrap drives the pull request's builder and links
+  request introduces. The rest of `crates/ply-std/ply` can, `prelude.ply` among them, which declares
+  the builtins: the compiler embeds its text and parses it itself. Likewise the release's bootstrap drives the pull request's builder and links
   its runtime, so the builder's arguments, the runtime's description and the pack's layout change
   only in a form the release still speaks.
 - A file below `crates/ply-std/ply` that is not a `.ply` is data a shipped module embeds by its

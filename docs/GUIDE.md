@@ -919,7 +919,7 @@ cheap.
 
 `show for T by g` names `g: (T<a, ..>) -> String`: `show`, `display` and a hole
 write what `g` answers wherever a `T` is shown, and `derivable(show, T)` holds
-whatever `T` holds. It decides nothing about comparison, `reflect` (§12) still
+whatever `T` holds. It decides nothing about comparison, `std.value.reflect` still
 answers the value as it was built, and a diagnostic prints that.
 
 Both are found by the type alone, with no search, so only the module declaring
@@ -2888,9 +2888,10 @@ holds a statement's columns to where `std.db`'s `fetch` reads rows by it (§16).
 
 ## 12. Builtins
 
-The functions every module calls without importing them. Each is declared in the
-compiler's prelude as an `extern fn`: a signature the runtime implements, with a
-row and a `where` like any other and no body, and a doc. A module the toolchain
+The functions every module calls without importing them. Each is declared in
+`std.prelude`, the module of the standard library every module reads without
+naming it, as an `extern fn`: a signature the runtime implements, with a row and
+a `where` like any other and no body, and a doc. `std.prelude` imports nothing. A module the toolchain
 ships may declare one too, a builtin of its own that it calls, or that a module
 importing it calls if it is `pub`, as any of its functions; an `extern fn` in any
 other module is `E0151`. So is an `extern type`, which only a shipped module
@@ -2911,7 +2912,7 @@ operators are written in (§2.4), which no binding around such an operator may
 hide either (`E0105`).
 `to_int` reads a value of any integer type as an `Int`, answering `None` past
 its range, so with `numeric_of_int` it converts between any two.
-`ply doc prelude` lists them all, each with the summary of
+`ply doc std.prelude` lists them all, each with the summary of
 its doc, `ply doc List::len` prints one: its signature with the parameters' names,
 its doc, and its clauses; and `ply doc List` lists the functions of a type of the
 language's, the prelude's and then its home module's (§13).

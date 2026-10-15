@@ -15,9 +15,8 @@ pub const STD: &str = "crates/ply-std/ply";
 
 const MODULE: &str = ".ply";
 
-/// The compiler's own modules, shipped as `compiler.<stem>`, and the builtins it embeds.
+/// The compiler's own modules, shipped as `compiler.<stem>`.
 pub const COMPILER: &str = "crates/ply-compiler/ply";
-pub const PRELUDE: &str = "crates/ply-compiler/prelude.ply";
 
 /// What every shipped module answers, as `ply std --answers` writes it: a file of zstd frames and
 /// its index, itself one frame.
