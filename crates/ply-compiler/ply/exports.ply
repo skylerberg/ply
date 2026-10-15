@@ -15,8 +15,8 @@ import front (no_rows, Analysis, Analysed, Refused, Pulled, Staged, Hashed, Ship
 import pkg (PackageSources, Supplied, Judged)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
               is_std, IInstance, INumeric, TDSum, ImportDecl, IModule, IAlias, INames, VariantDef,
-              OpDef, Derived, DRow, parse, header, is_written, item_span, import_decl_bin, owner_of,
-              item_owner, member_of, member_name)
+              OpDef, Derived, DRow, parse, parse_started, header, header_of, is_written, item_span,
+              import_decl_bin, owner_of, item_owner, member_of, member_name)
 import fmt (printed_alone)
 import exprs (EBlock, expr_span, freed_by)
 import hash (Fixed, Fixing, NodeRef, Index, HashOutput, fixed_nodes, fixing_of, module_forms,
@@ -25,8 +25,8 @@ import resolve (Source, ParsedModule, Diag, Label)
 import diagnostics (ParsedSource, parse_at)
 import derive (dotted, runtime_module, same_deriver)
 import lexer (lex, Token, Identifier, Punctuation, StringLiteral, InterpolatedHead, LineString,
-              is_ident_start, bound_names)
-import parsing (Ident, Span, starts_upper, dummy_span)
+              EndOfInput, is_ident_start, bound_names)
+import parsing (Ident, Span, starts_upper, dummy_span, start, started)
 import infer (DefInfo, Raise, Walks, Every)
 import types (canonical_scheme, Scheme)
 
@@ -259,13 +259,16 @@ fn of_type(scope: Scope, of: Bytes, name: Bytes) -> List<Mention> = {
   else { declared }
 }
 
-/// What `text` names of other items, read off its tokens: a name after an import's binder and `::`
+/// [`mentioned_in`] the tokens of `text`.
+fn mentioned(scope: Scope, text: Bytes) -> List<Mention> / {abort.raise} =
+  mentioned_in(scope, lex(text).tokens)
+
+/// What the text lexed as `tokens` names of other items: a name after an import's binder and `::`
 /// is that module's, one after a type and `::` that type's function, one called on a value a
 /// function of whichever type the value has, and a bare name the module selected or declares is the
 /// selected or declared one. It reads more than the text means wherever a local binder shares a
 /// declared name, never less.
-fn mentioned(scope: Scope, text: Bytes) -> List<Mention> / {abort.raise} = {
-  let tokens = lex(text).tokens;
+fn mentioned_in(scope: Scope, tokens: List<Token>) -> List<Mention> / {abort.raise} = {
   let bound = bound_names(tokens);
   range(0, tokens.len()).fold([], |acc: List<Mention>, i: Int|
     match ident_at(tokens, i) {
@@ -301,6 +304,16 @@ fn mentioned(scope: Scope, text: Bytes) -> List<Mention> / {abort.raise} = {
 /// `gen` or a test over cases calls into a module no source names.
 fn hidden_read(text: Bytes) -> List<Mention> / {abort.raise} =
   hidden_of(match header(text) { Some(m) -> m, None -> parse(text).node })
+
+/// [`hidden_read`] of `text`, lexed as `tokens` at the places `source` holds them.
+fn hidden_lexed(
+  source: Bytes,
+  tokens: List<Token>,
+  text: () -> Bytes / {abort.raise},
+) -> List<Mention> / {abort.raise} = {
+  let s = started(source, tokens);
+  hidden_of(match header_of(s.input, s.parser) { Some(m) -> m, None -> parse(text()).node })
+}
 
 /// The same of a module `parse` made.
 fn hidden_of(raw: Module) -> List<Mention> =
@@ -676,13 +689,15 @@ pub fn hash_owners(
 ) -> { fns: Map<Bytes, Bytes>, owners: Map<Bytes, List<Bytes>> } =
   { fns: fn_owners(raw, parsed), owners: owners_in(raw, parsed) }
 
-/// What `parsed`, written as `text` and parsed alone as `raw`, reads of the modules it imports, each
-/// of which `targets` names: every name it says through them, in its own text and in what its
-/// statements expand to, and in full each module a hidden import or a `derive` reads.
+/// What `parsed`, written as `text`, lexed as `tokens` and parsed alone as `raw`, reads of the
+/// modules it imports, each of which `targets` names: every name it says through them, in its own
+/// text and in what its statements expand to, and in full each module a hidden import or a `derive`
+/// reads.
 pub fn wanted_in(
   parsed: ParsedModule,
   raw: Module,
   text: Bytes,
+  tokens: List<Token>,
   targets: List<Bytes>,
 ) -> List<Mention> / {abort.raise} = {
   let sc = scopes(parsed, raw, targets);
@@ -695,15 +710,23 @@ pub fn wanted_in(
     acc.concat(ms.map(|m: Bytes| { module: m, name: n })));
   let runtimes = runtimes_of(raw.items).map(|m: Bytes| { module: m, name: b"" });
   distinct(
-    mentioned(sc.written, text).concat(expansion).concat(selected).concat(
+    mentioned_in(sc.written, tokens).concat(expansion).concat(selected).concat(
       runtimes.concat(hidden_of(raw)),
     ),
   ).filter(|m: Mention| m.module != parsed.name)
 }
 
 /// `wanted_in` of module `i` of `analysis`, written as `text`.
-pub fn wanted_of(analysis: Analysis, i: Int, text: Bytes) -> List<Mention> / {abort.raise} =
-  wanted_in(analysis.mods.get(i), parse(text).node, text, import_targets(analysis, i))
+pub fn wanted_of(analysis: Analysis, i: Int, text: Bytes) -> List<Mention> / {abort.raise} = {
+  let s = start(text);
+  wanted_in(
+    analysis.mods.get(i),
+    parse_started(s).node,
+    text,
+    s.input.tokens,
+    import_targets(analysis, i),
+  )
+}
 
 // --- What a module is checked against -----------------------------------------------------------
 
@@ -1049,18 +1072,72 @@ pub fn owner_reads(
 /// its body starts, a `transparent` one whole, so an edit to a body leaves it as it was and every
 /// place before a body is where the module writes it.
 pub fn signing_read(raw: Module, o: OwnerRead) -> OwnerRead / {abort.raise} = {
-  let its = owner_items(raw, o.owner);
+  let cuts = signing_cuts(raw, o);
   {
     ..o,
     texts: range(0, o.texts.len()).map(|k: Int| {
       let written = o.texts.get(k);
-      match its.at(k) {
-        Some(IFn(d)) -> if d.transparent != None { written }
-        else { written.slice(0, expr_span(d.body).start - o.starts.get(k)).concat(b"{}") },
-        _ -> written,
+      match cuts.get(k) {
+        Some(c) -> written.slice(0, c - o.starts.get(k)).concat(b"{}"),
+        None -> written,
       }
     }),
   }
+}
+
+/// Where a signing of `o`, an owner of the module `raw`, cuts each of its items in the module: where
+/// the body of a function not `transparent` starts, and nowhere in any other.
+fn signing_cuts(raw: Module, o: OwnerRead) -> List<Option<Int>> =
+  owner_items(raw, o.owner).map(|item: Item|
+    match item {
+      IFn(d) -> if d.transparent != None { None } else { Some(expr_span(d.body).start) },
+      _ -> None,
+    })
+
+/// The tokens of the texts of `o`, an owner of the module `tokens` lexes, laid side by side as a lex
+/// of them joined lays them.
+pub fn owner_tokens(tokens: List<Token>, o: OwnerRead) -> List<Token> / {abort.raise} =
+  read_tokens(tokens, o, o.texts.map(|_: Bytes| None))
+
+/// [`owner_tokens`] of the [`signing_read`] of `o`, an owner of the module `raw`.
+pub fn signing_tokens(
+  raw: Module,
+  tokens: List<Token>,
+  o: OwnerRead,
+) -> List<Token> / {abort.raise} = read_tokens(tokens, o, signing_cuts(raw, o))
+
+/// The tokens of each text of `o` in the module `tokens` lexes, each cut where `cuts` says and
+/// closed there with `{}`, and an end of input after the last.
+fn read_tokens(
+  tokens: List<Token>,
+  o: OwnerRead,
+  cuts: List<Option<Int>>,
+) -> List<Token> / {abort.raise} = {
+  let laid = range(0, o.texts.len()).fold(
+    { tokens: [], end: 0 },
+    |acc: { tokens: List<Token>, end: Int }, k: Int| {
+      let from = o.starts.get(k);
+      let cut = cuts.get(k);
+      let to = match cut { Some(c) -> c, None -> from + o.texts.get(k).len() };
+      let first = tokens.partition_point(|t: Token| t.start < from);
+      let past = tokens.partition_point(|t: Token| t.start < to);
+      let written = range(first, past).fold(acc.tokens, |ts: List<Token>, i: Int|
+        ts.push(tokens.get(i)));
+      match cut {
+        Some(c) ->
+          {
+            tokens: written.push({ start: c, end: c + 1, kind: Punctuation(b"lbrace") }).push({
+              start: c + 1,
+              end: c + 2,
+              kind: Punctuation(b"rbrace"),
+            }),
+            end: c + 2,
+          },
+        None -> { tokens: written, end: to },
+      }
+    },
+  );
+  laid.tokens.push({ start: laid.end, end: laid.end, kind: EndOfInput })
 }
 
 /// Where `text` writes `item`: from its `pub` and the words that say what kind of `fn`, `type` or
@@ -1082,15 +1159,18 @@ fn written_start(text: Bytes, item: Item) -> Int / {abort.raise} =
   })
 
 /// What `o`, an owner of `module`, mentions of what `scope` names: of its own module and of the
-/// modules it imports, never itself.
+/// modules it imports, never itself. `tokens` lex its texts at the places `source`, the module's
+/// text, holds them: [`owner_tokens`] of it, or [`signing_tokens`] of the read it signs.
 pub fn owner_mentions(
   module: Bytes,
   scope: ModuleScope,
   o: OwnerRead,
+  source: Bytes,
+  tokens: List<Token>,
 ) -> List<Mention> / {abort.raise} = {
-  let own = Bytes::join(o.texts, b"\n\n");
   let expansion = if o.generated.len() == 0 { [] } else { mentioned(scope.expanded, o.generated) };
-  distinct(mentioned(scope.written, own).concat(expansion).concat(hidden_read(own))).filter(
+  let hidden = hidden_lexed(source, tokens, || Bytes::join(o.texts, b"\n\n"));
+  distinct(mentioned_in(scope.written, tokens).concat(expansion).concat(hidden)).filter(
     |m: Mention| !(m.module == module && m.name == o.owner),
   )
 }
@@ -1303,8 +1383,9 @@ pub fn owner_source<| e>(
 ) -> OwnerSource / {abort.raise | e} = {
   let scope = module_scope(parsed, raw, targets);
   let members = owner_reads(parsed, raw, text).filter(|o: OwnerRead| o.owner == owner);
+  let tokens = lex(text).tokens;
   let mentions = members.fold([], |acc: List<Mention>, o: OwnerRead|
-    acc.concat(owner_mentions(parsed.name, scope, o)));
+    acc.concat(owner_mentions(parsed.name, scope, o, text, owner_tokens(tokens, o))));
   group_source(
     parsed.name,
     members,
@@ -1673,4 +1754,31 @@ test "a name a text binds, however it binds it, is one it may call on" {
   );
   assert_eq(said_in(b"fn f() -> Int / {x.go} = x.go() + lib::x.go()"), [b"deep.lib x"]);
   assert_eq(said_in(b"fn f() -> Int = (limits.go)() + size(limits.most)"), [b" go"])
+}
+
+test "an owner's tokens, whole and signed, are a lex of its texts joined, and read as it reads" {
+  let src = b"import std.list\npub type Shape =\n  | Dot\n  | Line(Int)\nderive eq for Shape\npub fn size(s: Shape) -> Int =\n  match s {\n    Dot -> 0,\n    Line(n) -> abs(n),\n  }\npub transparent fn twice(n: Int) -> Int = n + n\nfn named(s: Shape) -> String = \"shape of {size(s)}\"\nfn listed(xs: List<Int>) -> Int = {\n  let ys = List::rotate(xs, 1);\n  ys.len() + twice(1)\n}\nfn small() -> Set<Int> = #[1, 2]\ntest \"the size of a line of {n}\" for n: Int in [1, 2] {\n  assert_eq(size(Line(n)), n)\n}\n";
+  let parsed = parse_at(0, { name: b"m", src: src }).module;
+  let raw = parse(src).node;
+  let tokens = lex(src).tokens;
+  let scope = module_scope(parsed, raw, raw.imports.map(dotted));
+  let kinds = |ts: List<Token>| ts.map(|t: Token| t.kind);
+  let reads = owner_reads(parsed, raw, src);
+  assert_eq(reads.len(), 7);
+  for_all(reads, |o: OwnerRead|
+    for_all(
+      [
+        { read: o, lexed: owner_tokens(tokens, o) },
+        { read: signing_read(raw, o), lexed: signing_tokens(raw, tokens, o) },
+      ],
+      |r: { read: OwnerRead, lexed: List<Token> }| {
+        let joined = Bytes::join(r.read.texts, b"\n\n");
+        let alone = lex(joined).tokens;
+        assert_eq(kinds(r.lexed), kinds(alone));
+        assert_eq(
+          owner_mentions(b"m", scope, r.read, src, r.lexed),
+          owner_mentions(b"m", scope, r.read, joined, alone),
+        )
+      },
+    ))
 }
