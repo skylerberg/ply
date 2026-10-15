@@ -1281,6 +1281,8 @@ pub type Builtin = {
   clauses: List<Bytes>,
   /// The same as the checker reads them, a `requires` for each condition `&&` joins.
   contract: Contract,
+  /// Whether the prelude writes its body in Ply, rather than the runtime implementing it.
+  body: Bool,
 }
 
 /// What a declaration's types are read against: the variables its generic list binds, and the types
@@ -1521,11 +1523,32 @@ fn declared(name: Bytes, imported: Map<Bytes, Bytes>, def: ExternDef) -> Builtin
     constraints: dedup_constraints(found),
     clauses: def.spec.map(|c: SpecClause| written_at(def, c.span)),
     contract: contract_of(def, params.tys, ret.ty, row),
+    body: false,
   }
 }
 
-/// Every function the prelude declares that every module calls, in its order. Pure and nullary, so
-/// the runtime reads the prelude once.
+/// A function the prelude writes in Ply, as the declaration its signature is; `source` is the
+/// prelude's text.
+fn signed_extern(source: Bytes, d: FnDef) -> ExternDef / {abort.raise} =
+  {
+    vis: d.vis,
+    name: d.name,
+    generics: d.generics,
+    params: d.params,
+    ret: match d.ret {
+      Some(t) -> t,
+      None -> panic(misdeclared(b"writes no answer's type", d.name.name)),
+    },
+    effects: d.effects,
+    constraints: d.constraints,
+    spec: d.spec,
+    doc: d.doc,
+    span: d.span,
+    written: source.slice(d.span.start, d.span.end),
+  }
+
+/// Every builtin the prelude declares and every function it writes in Ply that a module calls,
+/// in its order. Pure and nullary, so the runtime reads the prelude once.
 pub fn builtins() -> List<Builtin> / {abort.raise} = {
   let source = prelude_source::text();
   let parsed = parse(source);
@@ -1536,14 +1559,13 @@ pub fn builtins() -> List<Builtin> / {abort.raise} = {
         IExtern(def) -> if is_builtin(prelude_module(), parsed.node, def) {
           acc.push(declared(def.name.name, imported, def))
         } else { acc },
+        IFn(d) -> if !is_pub(d.vis) { acc } else {
+          acc.push({ ..declared(d.name.name, imported, signed_extern(source, d)), body: true })
+        },
         _ -> acc,
       })
   }
 }
-
-/// What `std.prelude` says of itself.
-pub fn prelude_doc() -> List<Bytes> / {abort.raise} =
-  match parse(prelude_source::text()).node.doc { Some(d) -> d.lines, None -> [] }
 
 pub fn builtin_named(name: Bytes) -> Option<Builtin> / {abort.raise} =
   builtins().fold(None, |acc: Option<Builtin>, b: Builtin|
@@ -6001,9 +6023,10 @@ fn member_function(
     else { language_function(checker, of, name, true) },
   }
 
-/// The function `name` of `of`, a type of the language's: a builtin the prelude declares under it,
-/// or what its home module declares where this module sees that module. `on_value` asks for one a
-/// value of the type is called on, so a builtin whose first parameter is another type is none.
+/// The function `name` of `of`, a type of the language's: one this module declares itself, which
+/// only the prelude and the type's home may; a builtin the prelude declares under it; or what its
+/// home module declares where this module sees that module. `on_value` asks for one a value of the
+/// type is called on, so a builtin whose first parameter is another type is none.
 fn language_function(
   checker: Checker,
   of: Bytes,
@@ -6011,6 +6034,27 @@ fn language_function(
   on_value: Bool,
 ) -> Option<{ qname: QName, callee: Bytes }> / {abort.raise} = {
   let declared = member_name(of, name.name);
+  match lookup(scope_of(checker).bound, ValueSpace, declared) {
+    Some(own) ->
+      Some({
+        qname: {
+          module: Some({ name: of_binder(scope_of(checker).module), span: name.span }),
+          name: { name: declared, span: name.span },
+          span: name.span,
+        },
+        callee: own.qualified,
+      }),
+    None -> builtin_or_home(checker, of, name, on_value, declared),
+  }
+}
+
+fn builtin_or_home(
+  checker: Checker,
+  of: Bytes,
+  name: Ident,
+  on_value: Bool,
+  declared: Bytes,
+) -> Option<{ qname: QName, callee: Bytes }> / {abort.raise} = {
   let takes = !on_value
     || (match env_lookup(checker.env, declared) {
       Some(scheme) -> match scheme.ty {
@@ -9757,9 +9801,9 @@ fn extern_of(module: Bytes, name: Bytes, b: Builtin) -> Extern =
     raises: b.contract.raises,
   }
 
-/// Each `extern fn` the prelude declares, in its order.
+/// Each `extern fn` the prelude declares, in its order: a function it writes in Ply is none.
 pub fn prelude_externs() -> List<Extern> / {abort.raise} =
-  builtins().map(|b: Builtin| extern_of(prelude_module(), b.name, b))
+  builtins().filter(|b: Builtin| !b.body).map(|b: Builtin| extern_of(prelude_module(), b.name, b))
 
 /// Each `extern fn` a native implements that the module `name` declares in `text`, as the checker
 /// binds it, which only a module the toolchain ships does; a text without the word declares none
@@ -9910,9 +9954,9 @@ fn home_module(of: Bytes) -> Bytes / {abort.raise} =
 /// A function of a type, `fn T::name`, is declared by the module that declares `T`, a sum or a
 /// `new` record, under no name a field of the record has: a call on a value finds it by the type
 /// alone, and reads a record's fields first. A type of the language's has its home module's,
-/// under no name the prelude declares for it.
+/// under no name the prelude declares for it, and the prelude's own.
 fn member_declared(checker: Checker, parsed: ParsedModule, def: FnDef) -> Checker / {abort.raise} =
-  match member_of(def.name.name) {
+  match if parsed.name == prelude_module() { None } else { member_of(def.name.name) } {
     None -> checker,
     Some(m) -> {
       let type_name = qualify(parsed.name, m.of);
@@ -21817,6 +21861,8 @@ test "a call on a value is a call of its type's function with the value first" {
 test "a function of a type is declared by the type's module, for a sum or a `new` record" {
   assert_eq(check_codes(b"fn Option::size(o: Option<Int>) -> Int = 0"), [b"E0208"]);
   assert_eq(check_codes(b"fn Missing::size(n: Int) -> Int = n"), [b"E0208"]);
+  // The prelude writes its own in Ply, which no other module may.
+  assert_eq(check_codes(b"fn List::map(xs: List<Int>, n: Int) -> List<Int> = xs"), [b"E0208"]);
   assert_eq(
     check_codes(b"type Pair = { a: Int, b: Int }\nfn Pair::sum(p: Pair) -> Int = p.a + p.b"),
     [b"E0217"],

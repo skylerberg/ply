@@ -2,9 +2,10 @@
 //! argument owns it, one that reads leaves its count alone, and every answer is the caller's.
 
 use crate::heap::{
-    self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_ARRAY, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE,
-    KIND_COLUMNS, KIND_CTOR, KIND_LIST, KIND_MAP, KIND_MBRANCH, KIND_MLEAF, KIND_RECORD, KIND_STR,
-    Layouts, Stated, Word, bridged, bytes_of, is_unique, obj, set_word, str_of, word_at,
+    self, CLOSURE_CAPTURES, CLOSURE_CODE, CLOSURE_DESCRIBED, Heap, KIND_ARRAY, KIND_BRIDGE,
+    KIND_BYTES, KIND_CLOSURE, KIND_COLUMNS, KIND_CTOR, KIND_LIST, KIND_MAP, KIND_MBRANCH,
+    KIND_MLEAF, KIND_RECORD, KIND_STR, Layouts, Stated, Word, bridged, bytes_of, is_unique, obj,
+    set_word, str_of, word_at,
 };
 use crate::map;
 use crate::native::{Answered, Native, Raising, Signature};
@@ -21,7 +22,7 @@ use ply_eval::{
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::AtomicI64;
-use std::sync::atomic::Ordering::{Acquire, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// A lock nothing poisons: a panic while one is held is already the end of the run.
@@ -52,6 +53,8 @@ pub struct Tables {
     /// before the answer is: a later read charges it, so a cost is the same whether or not it was
     /// memoized.
     pub memo_costs: Box<[(AtomicI64, AtomicI64, AtomicI64)]>,
+    /// Each function's closure over nothing, by index, once a body asked for it; `0` is not yet.
+    pub lambdas: Box<[AtomicI64]>,
     /// Owns the constant pool's and the memo's objects for as long as the unit lives.
     pub immortals: Mutex<Heap>,
     /// The 256 one-byte values, each made immortal when first asked for; `0` is not yet.
@@ -2617,6 +2620,10 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         (Builtin::Push, [xs, x]) if heap::kind(*xs) == KIND_LIST => {
             Some(ctx.heap.list_push(*xs, *x))
         }
+        (Builtin::WithCapacity, [n]) if heap::is_imm(*n) => {
+            let room = heap::imm_value(*n).clamp(0, crate::list::WIDTH as i64) as u32;
+            Some(ctx.heap.alloc_list(room) as Word)
+        }
         (Builtin::HoldGet, [h]) => {
             let o = hold_object(*h)?;
             let held = unsafe { word_at(o, CLOSURE_CAPTURES) };
@@ -3739,6 +3746,38 @@ pub unsafe extern "C" fn rt_closure(
         }
     }
     o as Word
+}
+
+/// The closure over function `index` that captures nothing, taking `arity` arguments: made once
+/// in the unit's immortal heap, so a body that hands it on allocates nothing and counts nothing.
+/// `desc`, where it is not zero, is the immediate word of the function's descriptor, which a call
+/// by type reads.
+pub unsafe extern "C" fn rt_lambda_value(ctx: *mut Ctx, index: i64, arity: i64, desc: i64) -> i64 {
+    let tables = Arc::clone(&unsafe { &*ctx }.tables);
+    let slot = &tables.lambdas[index as usize];
+    let made = slot.load(Acquire);
+    if made != 0 {
+        return made;
+    }
+    let held = usize::from(desc != 0);
+    let o = lock(&tables.immortals).alloc(
+        KIND_CLOSURE,
+        if desc != 0 { CLOSURE_DESCRIBED } else { 0 },
+        (held + CLOSURE_CAPTURES) as u32,
+        arity as u32,
+    );
+    unsafe {
+        set_word(o, CLOSURE_CODE, tables.functions[index as usize] as Word);
+        if desc != 0 {
+            set_word(o, CLOSURE_CAPTURES, desc as Word);
+        }
+    }
+    heap::mark_immortal(o as Word);
+    // Two threads making it at once keep one each, and the unit's heap holds both.
+    match slot.compare_exchange(0, o as i64, AcqRel, Acquire) {
+        Ok(_) => o as i64,
+        Err(first) => first,
+    }
 }
 
 /// Installs a handler and answers its depth; the clause closures and `ret` are taken until it pops.

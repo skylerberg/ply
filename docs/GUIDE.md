@@ -1466,8 +1466,9 @@ billion by default, and none under `ply run`, where an entry that serves forever
 is a program — and a loop that never ends fails with `E0503` when that budget is
 spent. `--steps N` sets it (`0` is no bound), and the count is the same on every
 machine, so the verdict is too (§8.4).
-`List::map`/`List::filter`/`List::fold`/`range` and the byte scanners do not nest calls, and
-`iterate` is a loop with an early exit and a step budget:
+`range` and the byte scanners do not nest calls, and neither do `List::map`, `List::filter` and
+`List::fold`, which `std.prelude` writes as tail calls (§12), each pass a step beside what the
+function they are handed takes. `iterate` is a loop with an early exit and a step budget:
 
 ```ply
 fn first_gap(xs: List<Int>) -> Int =
@@ -2787,8 +2788,9 @@ body, a named definition's, or the caller's own parameter's cost name, so
 steps grow with what it is given leaves the call unread.
 
 A `cost` bound is an obligation, `<owner> cost #<n>`, that `ply prove` reads
-off the body and never runs. A builtin is at most a step;
-`List::map`, `List::filter`, `List::fold`, `Map::fold`, `iterate`, `Map::update`, `Bytes::position`
+off the body and never runs. A native is at most a step, and `List::map`, `List::filter` and
+`List::fold`, which `std.prelude` writes in Ply (§12), take a step per element. Those three,
+`Map::fold`, `iterate`, `Map::update`, `Bytes::position`
 and `metered` call a literal lambda or a named definition back as many times as
 an argument's size allows; a call of a definition costs its steps at the sizes
 of its arguments, and of one whose body another package keeps, its first `cost`
@@ -2938,8 +2940,12 @@ holds a statement's columns to where `std.db`'s `fetch` reads rows by it (§16).
 
 The functions every module calls without importing them. Each is declared in
 `std.prelude`, the module of the standard library every module reads without
-naming it, as an `extern fn`: a signature the runtime implements, with a row and
-a `where` like any other and no body, and a doc. `std.prelude` imports nothing. A module the toolchain
+naming it, with a doc: an `extern fn` is a signature the runtime implements,
+with a row and a `where` like any other and no body, and a `pub fn` is written
+there in Ply (`List::map`, `List::filter`, `List::fold`), which a call reads by
+its signature as it reads an `extern fn`'s. A call of a native is a step; one
+written in Ply takes the steps its body does, as any function. `std.prelude`
+imports nothing. A module the toolchain
 ships may declare one too, a builtin of its own that it calls, or that a module
 importing it calls if it is `pub`, as any of its functions; an `extern fn` in any
 other module is `E0151`. So is an `extern type`, which only a shipped module
@@ -2964,10 +2970,12 @@ operators are written in (§2.4), which no binding around such an operator may
 hide either (`E0105`).
 `to_int` reads a value of any integer type as an `Int`, answering `None` past
 its range, so with `numeric_of_int` it converts between any two.
-`ply doc std.prelude` lists them all, each with the summary of
-its doc, `ply doc List::len` prints one: its signature with the parameters' names,
-its doc, and its clauses; and `ply doc List` lists the functions of a type of the
-language's, the prelude's and then its home module's (§13).
+`ply doc std.prelude` lists them all, the natives first, each with the summary
+of its doc; `ply doc List::len` prints a native: its signature with the parameters'
+names, its doc, and its clauses; `ply doc List::map` prints one written in Ply as
+any definition, with its place and hash; and `ply doc List` lists the functions
+of a type of the language's: the natives, then those `std.prelude` and the
+type's home module write (§13).
 
 A builtin whose row names `abort.raise` may state a `requires`: a condition on
 its arguments under which a call cannot raise. For most it is the whole of where
@@ -2998,8 +3006,9 @@ project's: `ply test`, `ply prove` and `ply review` skip them unless you pass
 module `ply std` lists, whichever of them the project imports. So do `ply check`,
 which then reports each module's errors, warnings and definitions as the project's
 own, and `ply defs`, which then lists their definitions too.
-A module named for a type of the language's is that type's home: it alone
-declares functions of the type (`fn List::name` in `std.list`, §3.1). A module
+A module named for a type of the language's is that type's home: it and
+`std.prelude` (§12) alone declare functions of the type (`fn List::name` in
+`std.list`, §3.1). A module
 calls them with no import, on a value (`xs.sort()`) or through the type
 (`List::sort(xs)`): `std.list`, `std.string`, `std.map`, `std.option`,
 `std.result`, `std.char`, `std.bytes` and `std.float` are the homes, and a load
@@ -3331,7 +3340,7 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [NAME]` (a module's source, or a data file one embeds), `--digest`, `--answers DIR` (answer every shipped module into a pack in `DIR/pack`, a file of Zstandard frames and its index holding those answers and nothing else, through the memo store kept under the stage root, which holds what a bootstrap's builder answered of them checking `ply` and what an earlier answering did: what `ply bootstrap` packs into the `ply` it builds, which every load reads below its own store), `--answering` (one line naming how this `ply` answers the shipped modules: two that print the same answer the same modules alike, and `ply bootstrap` keeps the answers under it); no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
-| `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants (an `opaque` sum's are its module's, and are not listed), an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name under `std` is the toolchain's, and its page is the same wherever the command runs; any other name the program does not hold is looked up among the builtins, then the standard library, which are all there is to look in where no package holds the working directory. A page is read off what its module answers it documents, kept in the memo store for a project's modules and carried by the binary for the standard library's, so none is parsed to print one |
+| `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants (an `opaque` sum's are its module's, and are not listed), an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a native as the prelude declares it, one the prelude writes in Ply as any definition, and `std.prelude` every builtin, the natives first. A name under `std` is the toolchain's, and its page is the same wherever the command runs; any other name the program does not hold is looked up among the builtins, then the standard library, which are all there is to look in where no package holds the working directory. A page is read off what its module answers it documents, kept in the memo store for a project's modules and carried by the binary for the standard library's, so none is parsed to print one |
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths, or under the package the working directory is part of where none is given, in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: its doc and the comment lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |

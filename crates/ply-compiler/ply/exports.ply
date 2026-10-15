@@ -16,13 +16,13 @@ import pkg (PackageSources, Supplied, Judged)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
               is_std, IInstance, INumeric, TDSum, ImportDecl, IModule, IAlias, INames, VariantDef,
               OpDef, Derived, DRow, parse, parse_started, header, header_of, is_written, item_span,
-              import_decl_bin, owner_of, item_owner, member_of, member_name)
+              import_decl_bin, owner_of, item_owner, member_of, member_name, is_builtin)
 import fmt (printed_alone)
-import exprs (EBlock, expr_span, freed_by)
-import hash (Fixed, Fixing, NodeRef, Index, HashOutput, fixed_nodes, fixing_of, module_forms,
-             hashed_forms, fixed_bin)
+import exprs (EBlock, expr_span, freed_by, prelude_module)
+import hash (Fixed, Fixing, NodeRef, Index, HashOutput, fixed_nodes, fixing_of, chosen_forms,
+             chosen_in, called_at, hashed_forms, fixed_bin)
 import resolve (Source, ParsedModule, Diag, Label)
-import diagnostics (ParsedSource, parse_at)
+import diagnostics (ParsedSource, parse_at, with_prelude_source)
 import derive (dotted, runtime_module, same_deriver)
 import embed (EmbedFile)
 import lexer (lex, Token, Identifier, Punctuation, StringLiteral, InterpolatedHead, LineString,
@@ -426,11 +426,16 @@ fn fn_owners(raw: Module, parsed: ParsedModule) -> Map<Bytes, Bytes> = {
     })
 }
 
+/// Whether `item`, of the module `parsed` written as `raw`, is a builtin's declaration: the prelude
+/// declares it for every module to call by its own name, and it is no owner of the prelude's.
+fn declares_builtin(raw: Module, parsed: ParsedModule, item: Item) -> Bool =
+  match item { IExtern(d) -> is_builtin(parsed.name, raw, d), _ -> false }
+
 /// Each name the module declares, under every owner that declares it: a type's constructors are
 /// the type's, and a generated function its statement's owner's.
 fn owners_in(raw: Module, parsed: ParsedModule) -> Map<Bytes, List<Bytes>> = {
   let own = raw.items.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, item: Item|
-    match owner_of(item) {
+    match if declares_builtin(raw, parsed, item) { None } else { owner_of(item) } {
       None -> acc,
       Some(o) -> {
         let named = listed_under(acc, o, o);
@@ -925,8 +930,14 @@ fn staged_against(
   );
   let rooted = standing.fold([], |acc: List<Source>, x: { placed: Placed, source: Source }|
     match x.placed { InRoot -> acc.push(x.source), _ -> acc });
-  let shipped = standing.fold([], |acc: List<Source>, x: { placed: Placed, source: Source }|
+  let standing_in = standing.fold([], |acc: List<Source>, x: { placed: Placed, source: Source }|
     match x.placed { ShippedModule -> acc.push(x.source), _ -> acc });
+  // Every module imports `std.prelude`; one whose check reads none of it reads it empty, as it
+  // reads any module's entries it names and nothing more.
+  let shipped = if source.name == prelude_module()
+      || standing_in.concat(reading.whole).any(|s: Source| s.name == prelude_module()) {
+    standing_in
+  } else { standing_in.push(synthetic(prelude_module(), Map::new())) };
   let supplied = range(0, reading.pkgs.supplied.len()).map(|i: Int| {
     let held = standing.fold([], |acc: List<Source>, x: { placed: Placed, source: Source }|
       match x.placed {
@@ -1054,7 +1065,7 @@ pub fn owner_reads(
   );
   let owners = raw.items.fold([], |os: List<Bytes>, item: Item| {
     let o = item_owner(item);
-    if os.contains(o) { os } else { os.push(o) }
+    if os.contains(o) || declares_builtin(raw, parsed, item) { os } else { os.push(o) }
   });
   owners.map(|o: Bytes| {
     let its = owner_items(raw, o);
@@ -1457,15 +1468,18 @@ fn agreed(w: Analysis, module: Bytes) -> Agreed / {abort.raise} = {
 }
 
 /// Each module of `sources`, each in the root package, checked against the entries it reads and
-/// hashed from its forms and what hashing fixed of the modules it imports, beside `whole`'s check
-/// and hashing of them all.
+/// hashed from its forms, what that check found of its calls on values and what hashing fixed of
+/// the modules it imports, beside `whole`'s check and hashing of them all.
 fn per_module(
   whole: Analysis,
   sources: List<Source>,
 ) -> List<{ module: Bytes, whole: Agreed, apart: Agreed, hashed: Fixing, rehashed: Fixing }> / {abort.raise} = {
   let texts = sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
-  let text_at = |i: Int| match texts.get(whole.mods.get(i).name) { Some(t) -> t, None -> b"" };
+  // `std.prelude`, which every module imports, is read beside them as the toolchain ships it.
+  let read = with_prelude_source(sources).fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
+    acc.insert(s.name, s.src));
+  let text_at = |i: Int| match read.get(whole.mods.get(i).name) { Some(t) -> t, None -> b"" };
   let exports = range(0, whole.mods.len()).fold(Map::new(), |acc: Map<Bytes, Exports>, i: Int|
     acc.insert(whole.mods.get(i).name, exports_of(whole, i, text_at(i))));
   let fixed_of = |keep: (Bytes) -> Bool|
@@ -1510,7 +1524,10 @@ fn per_module(
           apart: agreed(apart, name),
           hashed: fixed_of(|m: Bytes| m == name),
           rehashed: hashed_forms(
-            module_forms(apart.index, apart.module_packages, at_apart),
+            chosen_forms(apart.index, apart.module_packages, {
+              ..chosen_in(apart.index, at_apart),
+              called: Some(called_at(apart.checked.facts.elaboration.members)),
+            }),
             fixed_of(|m: Bytes| m != name).nodes,
           ),
         })
@@ -1541,7 +1558,10 @@ fn per_owner(
 ) -> List<{ owner: Bytes, whole: Agreed, apart: Agreed }> / {abort.raise} = {
   let texts = sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
-  let text_at = |i: Int| match texts.get(whole.mods.get(i).name) { Some(t) -> t, None -> b"" };
+  // `std.prelude`, which every module imports, is read beside them as the toolchain ships it.
+  let read = with_prelude_source(sources).fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
+    acc.insert(s.name, s.src));
+  let text_at = |i: Int| match read.get(whole.mods.get(i).name) { Some(t) -> t, None -> b"" };
   let exports = range(0, whole.mods.len()).fold(Map::new(), |acc: Map<Bytes, Exports>, i: Int|
     acc.insert(whole.mods.get(i).name, exports_of(whole, i, text_at(i))));
   let reading = {

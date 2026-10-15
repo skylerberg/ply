@@ -72,6 +72,7 @@ builtins! { $
     AssertEq = "assert_eq" (actual, expected) -> Raising;
     Len = "List::len" (xs) -> Word;
     Push = "List::push" (xs, x) -> Word;
+    WithCapacity = "List::with_capacity" (n) -> Word;
     ListAt = "List::at" (xs, i) -> Word;
     /// One element replaced, sharing the rest; raises where `List::at` answers `None`.
     ListSet = "List::set" (xs, i, v) -> Raising;
@@ -519,6 +520,11 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         },
 
         Builtin::Push => push(args, span),
+
+        Builtin::WithCapacity => {
+            args[0].as_int(span, "`List::with_capacity`")?;
+            Ok(Value::list(Vec::new()))
+        }
 
         Builtin::ListAt => {
             let xs = args[0].as_list(span, "`List::at`")?;

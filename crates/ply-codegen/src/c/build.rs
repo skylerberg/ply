@@ -180,6 +180,7 @@ fn finish(
     }
     tables.layouts.state_numeric(stated);
     tables.memo = functions.iter().map(|_| AtomicI64::new(0)).collect();
+    tables.lambdas = functions.iter().map(|_| AtomicI64::new(0)).collect();
     tables.memo_costs = functions
         .iter()
         .map(|_| (AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)))
@@ -242,6 +243,7 @@ fn tables_of(mut unit: UnitTables) -> Tables {
         functions: Vec::new(),
         memo: Default::default(),
         memo_costs: Default::default(),
+        lambdas: Default::default(),
         immortals: std::sync::Mutex::new(immortals),
         bytes: std::array::from_fn(|_| AtomicI64::new(0)),
         nullaries,

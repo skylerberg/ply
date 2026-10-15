@@ -1,8 +1,9 @@
 //! `ply doc` — what a name documents, as an agent reads it. A definition: its signature with the
 //! parameter names the source wrote, its doc and clauses, its place, hash and footprint, and the
 //! laws that name it. A law schema: the same, under the schema as it is written. A type, an effect
-//! or a module: its doc and its members'. A builtin: what the prelude declares. A type of the
-//! language's: its functions, the prelude's and its home module's. Each page is read
+//! or a module: its doc and its members'. A native: what the prelude declares; a function the
+//! prelude writes in Ply is a definition of `std.prelude`. A type of the language's: its natives,
+//! then the functions the prelude and its home module write. Each page is read
 //! off what its module answers it documents, which the memo store keeps for a project's modules
 //! and the toolchain carries for the standard library's, so no command parses a module to print
 //! one. A name under `std` is the toolchain's wherever the command runs; any other is looked for
@@ -23,7 +24,8 @@ import sources (is_std, load_resolved, shipped_names)
 import sources
 import std.term (Style, bold, dim, plain)
 import compiler.front (Frame, Outline)
-import compiler.infer (Builtin, builtin_named, builtins, prelude_doc)
+import compiler.exprs (prelude_module)
+import compiler.infer (Builtin, builtin_named, builtins)
 import compiler.items (parse)
 import compiler.pages (Page, Member, Typed, Pages, Signed, bare_page, signature)
 import compiler.resolve (Diag, qualify)
@@ -53,10 +55,15 @@ pub fn summary_of(doc: List<String>) -> String / {abort.raise} = {
 fn builtin_signature(found: Builtin) -> Signed / {abort.raise} =
   signature("", String::of_bytes_lossy(found.name), found.scheme, found.params)
 
+/// The builtins the runtime implements: what the prelude declares with no body.
+fn natives() -> List<Builtin> / {abort.raise} = builtins().filter(|b: Builtin| !b.body)
+
+/// The page of a builtin the runtime implements; none for one the prelude writes in Ply, which its
+/// definition's page documents.
 fn builtin_page(query: String) -> Option<Page> / {abort.raise} =
   match builtin_named(Bytes::of_string(query)) {
     None -> None,
-    Some(found) -> {
+    Some(found) -> if found.body { None } else {
       let signed: Signed = builtin_signature(found);
       Some({
         ..bare_page("builtin", String::of_bytes_lossy(found.name), signed.text),
@@ -68,12 +75,15 @@ fn builtin_page(query: String) -> Option<Page> / {abort.raise} =
     },
   }
 
-/// The prelude as a module: its doc, and every builtin by summary.
-fn prelude_page() -> Page / {abort.raise} =
-  {
-    ..bare_page("module", "std.prelude", "std.prelude"),
-    doc: prelude_doc().map(|l: Bytes| String::of_bytes_lossy(l)),
-    members: builtins().map(builtin_member),
+/// `std.prelude`'s page as it documents itself, with each native it declares listed first.
+fn with_natives(found: Lookup) -> Lookup / {abort.raise} =
+  match found {
+    Found(p) ->
+      Found({
+        ..p,
+        page: { ..p.page, members: natives().map(builtin_member).concat(p.page.members) },
+      }),
+    other -> other,
   }
 
 // --- Naming one thing --------------------------------------------------------------
@@ -82,7 +92,7 @@ fn prelude_page() -> Page / {abort.raise} =
 fn unknown_name(query: String, names: List<String>) -> Diag = {
   let d: Diag = unknown_def(query, names);
   if names.len() > 0 { d }
-  else { noted(d, b"a builtin is named as the prelude declares it, as in `ply doc List::map`") }
+  else { noted(d, b"a builtin is named as the prelude declares it, as in `ply doc List::len`") }
 }
 
 /// A page, beside the module that documents it.
@@ -175,15 +185,17 @@ fn builtin_member(b: Builtin) -> Member / {abort.raise} =
     doc: b.doc.map(|l: Bytes| String::of_bytes_lossy(l)),
   }
 
-/// A type of the language's as a page: the functions the prelude declares under it, then those
-/// its home module declares. None for a name that has neither.
+/// A type of the language's as a page: the natives the prelude declares under it, then the
+/// functions the prelude and its home module write. None for a name that has none.
 fn language_type_page(
   query: String,
 ) -> Option<Page> / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} = {
   let under = query ++ "::";
-  let declared = builtins().filter(|b: Builtin| b.name.starts_with(Bytes::of_string(under)));
-  let home = Bytes::of_string("std." ++ query.ascii_lower());
-  let homes = shipped_names().filter(|n: Bytes| n == home);
+  let declared = natives().filter(|b: Builtin| b.name.starts_with(Bytes::of_string(under)));
+  let names = shipped_names();
+  let homes = [prelude_module(), Bytes::of_string("std." ++ query.ascii_lower())].filter(
+    |n: Bytes| names.contains(n),
+  );
   let own = held_of(homes, shipped_documented(homes)).fold([], |acc: List<Member>, h: Held|
     if h.page.kind != "module" { acc }
     else { acc.concat(h.page.members.filter(|m: Member| m.name.starts_with(under))) });
@@ -193,19 +205,24 @@ fn language_type_page(
 }
 
 /// A name the program does not hold: a builtin's or a type of the language's, else one of the
-/// standard library's.
+/// standard library's. A function the prelude writes in Ply is its definition there.
 fn elsewhere(
   query: String,
-) -> Lookup / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} =
-  if query == "std.prelude" { Found(unplaced(prelude_page())) } else {
+) -> Lookup / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} = {
+  let prelude = String::of_bytes_lossy(prelude_module());
+  if query == prelude { with_natives(shipped_named(query)) } else {
     match builtin_page(query) {
       Some(page) -> Found(unplaced(page)),
-      None -> match language_type_page(query) {
-        Some(page) -> Found(unplaced(page)),
-        None -> shipped_named(query),
+      None -> match builtin_named(Bytes::of_string(query)) {
+        Some(_) -> shipped_named(prelude ++ "." ++ query),
+        None -> match language_type_page(query) {
+          Some(page) -> Found(unplaced(page)),
+          None -> shipped_named(query),
+        },
       },
     }
   }
+}
 
 /// Whether the module `o` outlines could declare what a simple name whose first word is `head`
 /// names: a function, a type or an effect its outline lists, or an effect set, which it does not.
@@ -401,13 +418,15 @@ test "a doc's summary is its first sentence, its first paragraph joined into one
 }
 
 test "a builtin prints with the parameter names and the doc the prelude declares" {
-  match builtin_page("List::map") {
-    None -> panic("`List::map` is a builtin"),
+  match builtin_page("List::push") {
+    None -> panic("`List::push` is a builtin"),
     Some(page) -> {
       assert_eq(page.kind, "builtin");
-      assert_eq(page.signature, "List::map<a, b | e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e")
+      assert_eq(page.signature, "List::push<a>(xs: List<a>, x: a) -> List<a>")
     },
   };
+  // One the prelude writes in Ply is documented by its definition's page.
+  assert_eq(match builtin_page("List::map") { Some(_) -> true, None -> false }, false);
   match builtin_page("List::at") {
     None -> panic("`List::at` is a builtin"),
     Some(page) -> assert_eq(page.doc, ["`None` if `i` is negative or past the end."]),
@@ -536,11 +555,18 @@ test "a page says the laws that name what it documents, and where it stands by l
   ])
 }
 
-test "the prelude is a module page: its doc and every builtin with its own" {
-  let page = prelude_page();
-  assert_eq(page.kind, "module");
-  assert(page.doc.len() > 0);
-  assert_eq(page.members.len(), builtins().len());
-  let at = page.members.filter(|m: Member| m.name == "List::at");
-  assert_eq(at.map(|m: Member| m.doc), [["`None` if `i` is negative or past the end."]])
+test "the prelude's page lists every native it declares, then what it writes in Ply" {
+  let own = { kind: "definition", name: "List::map", signature: "pub fn List::map", doc: [] };
+  match with_natives(
+      Found(unplaced({ ..bare_page("module", "std.prelude", "std.prelude"), members: [own] })),
+    ) {
+    Found(p) -> {
+      let kinds = p.page.members.map(|m: Member| m.kind);
+      assert_eq(kinds.filter(|k: String| k == "builtin").len(), natives().len());
+      assert_eq(p.page.members.at(p.page.members.len() - 1), Some(own));
+      let at = p.page.members.filter(|m: Member| m.name == "List::at");
+      assert_eq(at.map(|m: Member| m.doc), [["`None` if `i` is negative or past the end."]])
+    },
+    _ -> panic("the prelude's page is found"),
+  }
 }
