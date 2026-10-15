@@ -15,7 +15,7 @@ import items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TypeDefBody, TD
               VariantDef, DeriveDef, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric,
               DInteger, DRow, deriver_text, deriver_tag, ImportDecl, ImportKind, IModule, IAlias,
               INames, Vis, VPub, VPriv, Derived, Constraint, SpecClause, parse, constraint_written,
-              TDNominal, IInstance, InstanceDef, NKey, NShow)
+              TDNominal, TDExtern, IInstance, InstanceDef, NKey, NShow)
 import rewrite (expand, find_type, picked_in)
 import resolve (Diag, Source, error_at, error_at_and, dump_diags, path_span)
 import std.list
@@ -33,6 +33,7 @@ pub type DeriveRefusal =
   | Unconstrained(Int)
   | NullInsideOption
   | HoldsSecret
+  | HoldsNative
 pub type ConstructorShape = | Leaf | Structural | Refused(DeriveRefusal) | Nominal
 
 /// The one table the deriver and the checker's `derivable` both read, so the two cannot disagree.
@@ -120,6 +121,13 @@ fn check_decl(deriver: Deriver, def: TypeDef) -> Option<Blocker> / {abort.raise}
               None -> None,
             },
           }),
+      TDExtern ->
+        Some({
+          span: def.name.span,
+          reason: b"laid out by the toolchain, with no field a derivation could read",
+          note: None,
+          variant: None,
+        }),
     }
   }
 
@@ -144,6 +152,7 @@ fn row_fields(def: TypeDef) -> Option<List<{ name: Ident, ty: TypeExpr }>> =
     TDAlias(body) -> match body { TRecord(r) -> Some(r.fields), _ -> None },
     TDNominal(body) -> match body { TRecord(r) -> Some(r.fields), _ -> None },
     TDSum(_) -> None,
+    TDExtern -> None,
   }
 
 /// Whether the module states what `deriver` reads of `target`: its `key` for `eq`, `ord` and `hash`,
@@ -185,6 +194,7 @@ pub fn refusal_reason(w: DeriveRefusal, deriver: Deriver, simple: Bytes) -> Byte
     HoldsFloat -> float_reason(deriver),
     HoldsHandle -> Bytes::concat_all([b"a `", simple, b"` names a location rather than a value"]),
     HoldsSecret -> secret_reason(deriver),
+    HoldsNative -> Bytes::concat_all([b"a `", simple, b"` is laid out by the toolchain"]),
     _ -> b"",
   }
 
@@ -633,11 +643,13 @@ fn dictionary(emitter: DeriveEmitter, def: TypeDef, target: Bytes) -> Bytes / {a
       TDAlias(body) -> codec(emitter, body, target),
       TDNominal(body) -> codec(emitter, body, target),
       TDSum(variants) -> literal(json_sum(emitter, variants, target)),
+      TDExtern -> b"()",
     },
     DBin -> match def.body {
       TDAlias(body) -> codec(emitter, body, target),
       TDNominal(body) -> codec(emitter, body, target),
       TDSum(variants) -> literal(bin_sum(emitter, def, variants, target)),
+      TDExtern -> b"()",
     },
     DRow -> match row_fields(def) {
       Some(fields) -> row_record(emitter, fields, target),
@@ -656,6 +668,7 @@ fn cycle_members(
     TDAlias(body) -> aliased_members(emitter, body, target),
     TDNominal(body) -> aliased_members(emitter, body, target),
     TDSum(variants) -> bin_sum(emitter, def, variants, target),
+    TDExtern -> [],
   }
 
 /// The functions of the `bin` codec of a type on a cycle that is written as `body`.
@@ -2090,7 +2103,10 @@ fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
         Some(prev) -> collision(expander, def, prev, name),
         None -> match if has_instance(expander.module, def.deriver, def.target.name) { None }
           else { check_decl(def.deriver, target) } {
-          Some(blocker) -> not_derivable(expander, def, blocker),
+          Some(blocker) -> match target.body {
+            TDExtern -> native_not_derivable(expander, def, blocker),
+            _ -> not_derivable(expander, def, blocker),
+          },
           None -> {
             let rt: WithPrefix = runtime_prefix(expander, def);
             let json: WithPrefix = match rt.prefix {
@@ -2191,6 +2207,7 @@ fn named_in_def(deriver: Deriver, type_def: TypeDef) -> List<Bytes> =
       variants.fold([], |acc: List<Bytes>, variant: VariantDef|
         variant.fields.fold(acc, |inner: List<Bytes>, ty: TypeExpr|
           inner.concat(named_in(deriver, ty)))),
+    TDExtern -> [],
   }
 
 /// The types `codec` composes through by a name of this module's.
@@ -2365,6 +2382,29 @@ fn collision(expander: Expander, def: DeriveDef, prev: DeriveDef, name: Bytes) -
     ),
   )
 }
+
+/// An `extern type` has no fields, so what a derivation would read of it is stated by hand.
+fn native_not_derivable(expander: Expander, def: DeriveDef, blocker: Blocker) -> Expander =
+  report(
+    expander,
+    error_at_and(
+      b"E0206",
+      expander.m,
+      blocker.span,
+      Bytes::concat_all([
+        b"`",
+        deriver_text(def.deriver),
+        b"` cannot be derived for `",
+        def.target.name,
+        b"`",
+      ]),
+      blocker.reason,
+      expander.m,
+      def.span,
+      b"required by this derivation",
+      [b"write the dictionary by hand over what its module's functions read of a value"],
+    ),
+  )
 
 fn not_derivable(expander: Expander, def: DeriveDef, blocker: Blocker) -> Expander = {
   let head = Bytes::concat_all([
@@ -2555,6 +2595,13 @@ test "a row reads a column per field, and a field that is no scalar as a documen
   assert_eq(refused(b"type P = {x: Int}\nderive row for P"), [b"E0206"]);
   // A row is no constraint a type parameter can be held to.
   assert(parse(b"fn f<a>(x: a) -> a where derivable(row, a) = x").parser.diags.len() > 0)
+}
+
+test "an `extern type` has no field a derivation reads, so nothing derives one" {
+  let refused = |text: Bytes|
+    expand_derives(0, b"std.t", parse(text).node).diags.map(|d: Diag| d.code);
+  assert_eq(refused(b"extern type Node\nderive eq for Node\n"), [b"E0206"]);
+  assert_eq(refused(b"import std.json\nextern type Node<a>\nderive json for Node\n"), [b"E0206"])
 }
 
 test "a bin codec on a cycle calls its cycle by name through a list, and reads a variant's record in place" {

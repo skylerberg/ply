@@ -13,7 +13,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               TDSum, VariantDef, EffectDef, OpDef, TestDef, Cases, LawDef, OfSchema, Binder,
               Constraint, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger, DRow,
               is_predicate, deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures,
-              SCost, SSpace, SpecClause, Derived, DeriveDef, parse, TDNominal, test_run,
+              SCost, SSpace, SpecClause, Derived, DeriveDef, parse, TDNominal, TDExtern, test_run,
               test_listing, IInstance, InstanceDef, InstanceKind, NKey, NShow, instance_text,
               INumeric, NumericDef, member_name, member_of, NumericOp, numeric_ops, numeric_by,
               is_pub, Opaque, spec_kind_bin, deriver_bin, instance_kind_bin)
@@ -65,9 +65,9 @@ import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_bloc
 import embed (rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
-               NullInsideOption, HoldsSecret, ConstructorShape, Leaf, Structural, Refused, Nominal,
-               constructor_shape, null_encoded_name, Expansion, expand_derives, refusal_note,
-               secret_reason, float_reason, null_in_option_note, same_deriver)
+               NullInsideOption, HoldsSecret, HoldsNative, ConstructorShape, Leaf, Structural,
+               Refused, Nominal, constructor_shape, null_encoded_name, Expansion, expand_derives,
+               refusal_note, secret_reason, float_reason, null_in_option_note, same_deriver)
 import std.bytes
 import std.bytes (ascii_of_int)
 import std.option
@@ -80,8 +80,13 @@ import guards (Guards, Contract, Clause, Reader, Local, Elsewhere)
 
 /// A prelude item's `at` is `{ module: 0, span: dummy_span() }`.
 pub type Location = { module: Int, span: Span }
-/// What a `type` declares: an alias each use expands, a record of its own, or a sum.
-type Declaration = | DeclaredAlias(TypeExpr) | DeclaredRecord(TypeExpr) | DeclaredSum
+/// What a `type` declares: an alias each use expands, a record of its own, a sum, or a type the
+/// toolchain lays out.
+type Declaration =
+  | DeclaredAlias(TypeExpr)
+  | DeclaredRecord(TypeExpr)
+  | DeclaredSum
+  | DeclaredExtern
 /// `opaque` is what the declaration says of it: only `owner` builds a value of the type.
 type TypeDecl = {
   params: List<Bytes>,
@@ -1559,6 +1564,25 @@ fn refuse_externs(checker: Checker, parsed: ParsedModule) -> Checker =
               b"write the function's body, or reach what it needs through an `effect` a handler answers",
             ],
           ),
+        IType(def) -> match def.body {
+          TDExtern ->
+            report_error_at(
+              c,
+              b"E0151",
+              def.name.span,
+              Bytes::concat_all([
+                b"`extern type ",
+                def.name.name,
+                b"` declares a type the toolchain lays out",
+              ]),
+              b"only a module the toolchain ships declares one",
+              [
+                b"the toolchain lays out the types its own modules declare and nothing else, so a declaration here has nothing to name",
+                b"declare a `type` with the fields or the variants its values hold",
+              ],
+            ),
+          _ -> c,
+        },
         _ -> c,
       },
   )
@@ -2312,6 +2336,14 @@ fn conv_con(
                       args: applied_args(converted.tys, over.labels, over.rows),
                     }),
                   },
+                DeclaredExtern ->
+                  {
+                    checker: g.checker,
+                    ty: TyCon({
+                      name: qualified,
+                      args: applied_args(converted.tys, over.labels, over.rows),
+                    }),
+                  },
                 DeclaredRecord(body) -> {
                   let o = declared_record(g.checker, name.name, qualified, decl, body, room);
                   match o.record {
@@ -2910,6 +2942,7 @@ fn record_type(checker: Checker, parsed: ParsedModule, def: TypeDef) -> Checker 
           TDAlias(t) -> DeclaredAlias(t),
           TDNominal(t) -> DeclaredRecord(t),
           TDSum(_) -> DeclaredSum,
+          TDExtern -> DeclaredExtern,
         };
         {
           ..checker,
@@ -3137,6 +3170,7 @@ fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort.rai
       IType(def) -> match def.body {
         TDAlias(_) -> c,
         TDNominal(_) -> c,
+        TDExtern -> c,
         TDSum(variants) -> {
           let type_name = qualify(parsed.name, def.name.name);
           match c.types.get(type_name) {
@@ -3228,6 +3262,7 @@ fn check_value_namespace(checker: Checker, parsed: ParsedModule) -> Checker = {
           TDSum(vs) -> vs.map(|variant: VariantDef| { name: variant.name, is_fn: false }),
           TDAlias(_) -> [],
           TDNominal(_) -> [],
+          TDExtern -> [],
         },
         _ -> [],
       };
@@ -10221,6 +10256,7 @@ fn member_declared(checker: Checker, parsed: ParsedModule, def: FnDef) -> Checke
             None -> checker,
           },
           DeclaredSum -> checker,
+          DeclaredExtern -> checker,
         },
       }
     },
@@ -13466,14 +13502,22 @@ fn check_result_shadow(checker: Checker, def: FnDef) -> Checker =
 type Blocked = { ty: Type, why: DeriveRefusal }
 /// `params` are the type's type and label variables and `rows` its row variables, in the order a
 /// use's arguments ride.
-type AlgebraicShape = { name: Bytes, params: List<Int>, rows: List<Int>, fields: List<Type> }
+/// `native` for an `extern type`, which no deriver reads.
+type AlgebraicShape = {
+  name: Bytes,
+  params: List<Int>,
+  rows: List<Int>,
+  fields: List<Type>,
+  native: Bool,
+}
 
 /// Each sum type's shape by the type's name.
 type Shapes = Map<Bytes, AlgebraicShape>
 
-/// Every sum type this run declared, flattened: its parameters and every field of every variant.
-fn algebraic_shapes(checker: Checker) -> Shapes =
-  checker.ctors.fold(Map::new(), |acc: Shapes, ctor_info: CtorInfo|
+/// Every sum type this run declared, flattened: its parameters and every field of every variant;
+/// and every `extern type`, with none.
+fn algebraic_shapes(checker: Checker) -> Shapes = {
+  let sums = checker.ctors.fold(Map::new(), |acc: Shapes, ctor_info: CtorInfo|
     match acc.get(ctor_info.type_name) {
       None -> {
         let scheme = ctor_info.scheme;
@@ -13483,11 +13527,19 @@ fn algebraic_shapes(checker: Checker) -> Shapes =
           else { scheme.ty_vars.concat(scheme.label_vars) },
           rows: scheme.row_vars,
           fields: ctor_info.fields,
+          native: false,
         })
       },
       Some(a) ->
         acc.insert(ctor_info.type_name, { ..a, fields: a.fields.concat(ctor_info.fields) }),
+    });
+  checker.types.fold(sums, |acc: Shapes, name: Bytes, decl: TypeDecl|
+    match decl.declared {
+      DeclaredExtern ->
+        acc.insert(name, { name: name, params: [], rows: [], fields: [], native: true }),
+      _ -> acc,
     })
+}
 
 fn find_adt(adts: Shapes, name: Bytes) -> Option<AlgebraicShape> = adts.get(name)
 
@@ -13540,7 +13592,8 @@ fn derivable_within(
         if visiting.contains(c.name) { None } else {
           match find_adt(adts, c.name) {
             None -> None,
-            Some(adt) -> if room <= 0 { panic("a type entered twice on one path") } else {
+            Some(adt) -> if adt.native { Some({ ty: ty, why: HoldsNative }) }
+            else if room <= 0 { panic("a type entered twice on one path") } else {
               first_blocked(
                 deriver,
                 adt.fields.map(|f: Type| at_arguments(f, adt.params, adt.rows, c.args)),
@@ -13558,6 +13611,17 @@ fn derivable_within(
 /// A flexible variable is a type argument nothing pinned rather than one that is wrong.
 fn skipped_flexible(checker: Checker, b: Blocked) -> Bool =
   match b.why { Unconstrained(v) -> !is_rigid_ty(checker.subst, v), _ -> false }
+
+/// Why no deriver reads an `extern type`'s values.
+fn native_notes(blocker: Bytes, deriver: Deriver) -> List<Bytes> =
+  [
+    Bytes::concat_all([
+      b"`",
+      blocker,
+      b"` is an `extern type`: the toolchain lays out its values, and gives them no ",
+      what_of(deriver),
+    ]),
+  ]
 
 fn secret_notes(deriver: Deriver) -> List<Bytes> =
   match refusal_note(HoldsSecret, deriver) {
@@ -13595,6 +13659,7 @@ fn why_notes_for_map_key(
       ],
     NullInsideOption -> [],
     HoldsSecret -> secret_notes(DOrd),
+    HoldsNative -> native_notes(blocker, DOrd),
     Unconstrained(v) ->
       [
         Bytes::concat_all([
@@ -13637,6 +13702,7 @@ fn why_notes_for_constraint(
         null_in_option_note(),
       ],
     HoldsSecret -> secret_notes(deriver),
+    HoldsNative -> native_notes(blocker, deriver),
     Unconstrained(v) ->
       [
         Bytes::concat_all([
@@ -14246,6 +14312,7 @@ fn derive_target(
     else {
       match decl.declared {
         DeclaredSum -> Some({ checker: checker, ty: TyCon({ name: qualified, args: [] }) }),
+        DeclaredExtern -> Some({ checker: checker, ty: TyCon({ name: qualified, args: [] }) }),
         DeclaredRecord(_) -> match checker.nominals.get(qualified) {
           Some(r) -> Some({ checker: checker, ty: r.ty }),
           None -> None,
@@ -14302,57 +14369,73 @@ fn why_notes_for_derive(
         ]),
       ],
     HoldsSecret -> secret_notes(deriver),
+    HoldsNative -> native_notes(blocker, deriver),
     Unconstrained(_) -> [],
   }
 
-/// `derivable(D, T)` over each `derive`'s target as a solved type.
-fn check_derives(checker: Checker) -> Checker / {abort.raise} = {
+/// A `derive` the checker refuses: where it stands, and what is said of it.
+type RefusedDerive = { at: Place, diag: Diag }
+
+/// `derivable(D, T)` over each `derive`'s target as a solved type, and the derives it refuses,
+/// which are reported once [`attribute_generated`] has set their bodies aside.
+fn check_derives(
+  checker: Checker,
+) -> { checker: Checker, refused: List<RefusedDerive> } / {abort.raise} = {
   let shapes = deriver_shapes(checker.instances, algebraic_shapes(checker));
-  range(0, checker.modules.len()).fold(checker, |c: Checker, i: Int| {
-    let m = c.modules.get(i);
-    m.module.items.fold(c, |cc: Checker, item: Item|
-      match item {
-        IDerive(def) -> if !expanded_here(m, def) { cc } else {
-          match derive_target({ ..cc, module: i }, m, def.target.name) {
-            None -> cc,
-            Some(o) -> match derivable(def.deriver, o.ty, shapes_for(shapes, def.deriver), []) {
-              None -> o.checker,
-              Some(blocked) -> match blocked.why {
-                Unconstrained(_) -> o.checker,
-                _ -> {
-                  let blocker = type_text(blocked.ty);
-                  let dv = deriver_text(def.deriver);
-                  report(
-                    o.checker,
-                    error_at(
-                      b"E0206",
-                      i,
-                      def.span,
-                      Bytes::concat_all([
-                        b"`",
-                        dv,
-                        b"` cannot be derived for `",
-                        def.target.name,
-                        b"`",
-                      ]),
-                      Bytes::concat_all([b"`", blocker, b"` has no ", what_of(def.deriver)]),
-                      why_notes_for_derive(blocked.why, def.deriver, blocked, blocker).push(
-                        Bytes::concat_all([
-                          b"write the dictionary for `",
-                          def.target.name,
-                          b"` by hand, or change the field",
-                        ]),
-                      ),
-                    ),
-                  )
+  range(0, checker.modules.len()).fold(
+    { checker: checker, refused: [] },
+    |acc: { checker: Checker, refused: List<RefusedDerive> }, i: Int| {
+      let m = acc.checker.modules.get(i);
+      m.module.items.fold(
+        acc,
+        |cc: { checker: Checker, refused: List<RefusedDerive> }, item: Item|
+          match item {
+            IDerive(def) -> if !expanded_here(m, def) { cc } else {
+              match derive_target({ ..cc.checker, module: i }, m, def.target.name) {
+                None -> cc,
+                Some(o) -> match derivable(def.deriver, o.ty, shapes_for(shapes, def.deriver), []) {
+                  None -> { ..cc, checker: o.checker },
+                  Some(blocked) -> match blocked.why {
+                    Unconstrained(_) -> { ..cc, checker: o.checker },
+                    _ -> {
+                      let blocker = type_text(blocked.ty);
+                      let dv = deriver_text(def.deriver);
+                      {
+                        checker: o.checker,
+                        refused: cc.refused.push({
+                          at: { module: i, start: def.span.start, end: def.span.end },
+                          diag: error_at(
+                            b"E0206",
+                            i,
+                            def.span,
+                            Bytes::concat_all([
+                              b"`",
+                              dv,
+                              b"` cannot be derived for `",
+                              def.target.name,
+                              b"`",
+                            ]),
+                            Bytes::concat_all([b"`", blocker, b"` has no ", what_of(def.deriver)]),
+                            why_notes_for_derive(blocked.why, def.deriver, blocked, blocker).push(
+                              Bytes::concat_all([
+                                b"write the dictionary for `",
+                                def.target.name,
+                                b"` by hand, or change the field",
+                              ]),
+                            ),
+                          ),
+                        }),
+                      }
+                    },
+                  },
                 },
-              },
+              }
             },
-          }
-        },
-        _ -> cc,
-      })
-  })
+            _ -> cc,
+          },
+      )
+    },
+  )
 }
 
 // --- What a type's module states of it ----------------------------------------------------------
@@ -14388,7 +14471,7 @@ fn instance_shapes(instances: List<InstanceInfo>, adts: Shapes, deriver: Deriver
         match stated.get(name) {
           Some(x) ->
             acc.insert(name, {
-              name: shape.name,
+              ..shape,
               params: x.params,
               rows: x.rows,
               fields: if keyed { [x.answers] } else { [] },
@@ -14529,6 +14612,20 @@ fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checke
               b"` yet",
             ]),
             b"a `new` record runs as the record it is written as, so nothing in a value says which type it is of where it is compared or shown",
+          ),
+        DeclaredExtern ->
+          not_a_sum(
+            checker,
+            def.target,
+            decl,
+            Bytes::concat_all([
+              b"`",
+              def.target.name,
+              b"` is an `extern type`, which states no `",
+              what,
+              b"`",
+            ]),
+            b"the toolchain lays out its values, and nothing compares or shows one",
           ),
         DeclaredSum -> match instance_of(checker.instances, type_name, is_key(def.kind)) {
           Some(first) ->
@@ -14759,6 +14856,14 @@ fn check_numeric(checker: Checker, m: ParsedModule, def: NumericDef) -> Checker 
           decl,
           named(b"` is a `new` record, which cannot state a `numeric` yet"),
           b"a `new` record runs as the record it is written as, so nothing in a value says which type's arithmetic an operator over it is",
+        ),
+      DeclaredExtern ->
+        not_a_sum(
+          checker,
+          def.target,
+          decl,
+          named(b"` is an `extern type`, which states no `numeric`"),
+          b"the toolchain lays out its values, and no operator reads one",
         ),
       DeclaredSum -> if decl.params.len() + decl.labels.len() + decl.rows.len() > 0 {
         report_error_at_and(
@@ -15060,44 +15165,56 @@ fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
   }
 }
 
-/// Anything a generated definition failed on, other than a name it could not see, is Ply's fault.
-fn attribute_generated(checker: Checker) -> Checker / {abort.raise} = {
-  let spans = range(0, checker.modules.len()).fold([], |acc: List<Label>, i: Int|
-    checker.modules.get(i).derived.fold(acc, |labels: List<Label>, d: Derived|
-      labels.push(label_at(i, d.span, true, b""))));
-  if spans.len() == 0 { checker } else {
-    {
-      ..checker,
-      diags: checker.diags.map(|d: Diag| {
-        let primary = d.labels.fold(None, |acc: Option<Label>, l: Label|
-          match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } });
-        let generated = match primary {
-          Some(p) ->
-            spans.fold(false, |b: Bool, s: Label|
-              b || (s.module == p.module && s.start == p.start && s.end == p.end)),
-          None -> false,
-        };
-        if d.code == b"E0206" || !generated { d } else {
-          {
-            code: b"E0505",
-            notes: d.notes + 2,
-            labels: d.labels,
-            text: d.text,
-            message: b"a derived definition does not typecheck",
-            notes_text: push_front_bytes(
-              b"this is a compiler bug in the deriver: ".concat(d.message),
-              d.notes_text,
-            ).push(
-              b"derivation is total, so a generated body that fails to check is Ply's fault rather than yours",
-            ),
-            severity: d.severity,
-            fixes: d.fixes,
-          }
-        }
-      }),
-    }
+/// Anything a generated definition failed on, other than a name it could not see, is Ply's fault,
+/// unless its derive is one of `refused`: a refused derive has no body to fault, so all that is said
+/// of it is its refusal.
+fn attribute_generated(checker: Checker, refused: List<RefusedDerive>) -> Checker / {abort.raise} = {
+  let spans = range(0, checker.modules.len()).fold([], |acc: List<Place>, i: Int|
+    checker.modules.get(i).derived.fold(acc, |places: List<Place>, d: Derived|
+      places.push({ module: i, start: d.span.start, end: d.span.end })));
+  let set_aside = refused.map(|r: RefusedDerive| r.at);
+  let derived_at = |d: Diag|
+    match d.labels.fold(None, |acc: Option<Label>, l: Label|
+        match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } }) {
+      Some(p) -> {
+        let at = { module: p.module, start: p.start, end: p.end };
+        if spans.contains(at) { Some(at) } else { None }
+      },
+      None -> None,
+    };
+  {
+    ..checker,
+    diags: checker.diags.fold([], |acc: List<Diag>, d: Diag|
+      match derived_at(d) {
+        None -> acc.push(d),
+        Some(at) -> if set_aside.contains(at) { acc }
+        else if d.code == b"E0206" { acc.push(d) }
+        else { acc.push(blamed_on_deriver(d)) },
+      }).concat(
+      refused.map(|r: RefusedDerive| r.diag),
+    ),
   }
 }
+
+/// Where a label stands, which a generated definition's diagnostics share with its derive.
+type Place = { module: Int, start: Int, end: Int }
+
+fn blamed_on_deriver(d: Diag) -> Diag =
+  {
+    code: b"E0505",
+    notes: d.notes + 2,
+    labels: d.labels,
+    text: d.text,
+    message: b"a derived definition does not typecheck",
+    notes_text: push_front_bytes(
+      b"this is a compiler bug in the deriver: ".concat(d.message),
+      d.notes_text,
+    ).push(
+      b"derivation is total, so a generated body that fails to check is Ply's fault rather than yours",
+    ),
+    severity: d.severity,
+    fixes: d.fixes,
+  }
 
 // --- Comparisons, simulations and regions, once the module is solved ------------------------------
 
@@ -15114,7 +15231,59 @@ fn contains_fn(t: Type) -> Bool =
 fn push_front_bytes(x: Bytes, xs: List<Bytes>) -> List<Bytes> =
   xs.fold([x], |acc: List<Bytes>, y: Bytes| acc.push(y))
 
-fn check_comparisons(checker: Checker) -> Checker / {abort.raise} =
+/// The declared types whose values hold one of an `extern type` whatever they are applied to, and
+/// for each declared type the positions of the parameters its fields hold.
+type NativeReach = { held: Map<Bytes, Bool>, uses: Map<Bytes, List<Int>> }
+
+/// `shapes`' reach, settled one round at a time: each round adds a type a field of which holds what
+/// the last round found, and one adds none once every such type is in.
+fn native_reach(shapes: Shapes) -> NativeReach / {abort.raise} = {
+  let uses = shapes.fold(
+    Map::new(),
+    |acc: Map<Bytes, List<Int>>, name: Bytes, shape: AlgebraicShape|
+      acc.insert(
+        name,
+        range(0, shape.params.len()).filter(|i: Int|
+          shape.fields.any(|f: Type| occurs_ty(shape.params.get(i), f))),
+      ),
+  );
+  let natives = shapes.fold(
+    Map::new(),
+    |acc: Map<Bytes, Bool>, name: Bytes, shape: AlgebraicShape|
+      if shape.native { acc.insert(name, true) } else { acc },
+  );
+  let held = iterate(natives, shapes.len() + 1, |found: Map<Bytes, Bool>| {
+    let next = shapes.fold(found, |acc: Map<Bytes, Bool>, name: Bytes, shape: AlgebraicShape|
+      if acc.contains(name) { acc }
+      else if shape.fields.any(|f: Type| reaches_native({ held: acc, uses: uses }, f)) {
+        acc.insert(name, true)
+      } else { acc });
+    if next.len() == found.len() { Stop(next) } else { Continue(next) }
+  });
+  { held: held, uses: uses }
+}
+
+/// Whether a value of `ty` holds one of an `extern type`: a declared type's argument counts only
+/// where its fields hold the parameter it fills.
+fn reaches_native(reach: NativeReach, ty: Type) -> Bool / {abort.raise} =
+  match ty {
+    TyCon(c) ->
+      reach.held.contains(c.name)
+        || (match reach.uses.get(c.name) {
+          Some(at) ->
+            at.any(|i: Int|
+              match c.args.at(i) { Some(a) -> reaches_native(reach, a), None -> false }),
+          None -> c.args.any(|a: Type| reaches_native(reach, a)),
+        }),
+    TyRecord(fs) -> fs.any(|f: Field| reaches_native(reach, f.ty)),
+    TyNominal(n) -> n.fields.any(|f: Field| reaches_native(reach, f.ty)),
+    TyFn(_) -> false,
+    TyVar(_) -> false,
+  }
+
+fn check_comparisons(checker: Checker) -> Checker / {abort.raise} = {
+  // A keyed sum's `==` compares what its key answers.
+  let reach = native_reach(instance_shapes(checker.instances, algebraic_shapes(checker), DEq));
   checker.comparisons.fold(
     { ..checker, comparisons: [] },
     |c: Checker, site: { module: Int, span: Span, ty: Type }| {
@@ -15145,9 +15314,22 @@ fn check_comparisons(checker: Checker) -> Checker / {abort.raise} =
             ],
           ),
         )
+      } else if reaches_native(reach, resolved) {
+        report(
+          c,
+          error_at(
+            b"E0201",
+            site.module,
+            site.span,
+            b"a value of an `extern type` cannot be compared for equality",
+            Bytes::concat_all([b"both sides have type `", type_text(resolved), b"`"]),
+            [b"the toolchain lays out an `extern type`'s values, and nothing compares one"],
+          ),
+        )
       } else { c }
     },
   )
+}
 
 fn is_dummy(span: Span) -> Bool = span.start == 0 && span.end == 0
 
@@ -16825,7 +17007,12 @@ pub fn check_program_with(
     check_map_keys(check_comparisons(check_label_apps(settled))),
   );
   let solved: Checker = check_parallels(
-    check_regions(check_simulations(attribute_generated(check_derives(constrained)))),
+    check_regions(
+      check_simulations({
+        let derived = check_derives(constrained);
+        attribute_generated(derived.checker, derived.refused)
+      }),
+    ),
   );
   { checker: solved, ok: !has_error(solved.diags) }
 }
@@ -20760,6 +20947,97 @@ test "a shipped module's extern is called as its module's, and a private one onl
   assert_eq(pairs(b"import std.native (Pair, first)\nfn f(p: Pair<String>) -> Int = first(p)\n"), [
     b"E0201",
   ])
+}
+
+test "an `extern type` is its shipped module's, typed by its parameters, and nothing compares it" {
+  assert_eq(check_codes(b"extern type Node<a>\nfn f() -> Int = 1\n"), [b"E0151"]);
+  let native = {
+    name: b"std.native",
+    src: b"pub extern type Node<a>\nextern type Hidden\npub extern fn node_of<a>(x: a) -> Node<a>\npub extern fn value_of<a>(n: Node<a>) -> a\n",
+  };
+  let codes = |src: Bytes| codes_of([native, { name: b"m", src: src }]);
+  assert_eq(
+    codes(
+      b"import std.native (Node, node_of, value_of)\nfn f() -> Int = value_of(node_of(1))\nfn g(n: Node<String>) -> String = value_of(n)\n",
+    ),
+    [],
+  );
+  assert_eq(codes(b"import std.native (Node, node_of)\nfn f() -> Node<Int> = node_of(\"s\")\n"), [
+    b"E0201",
+  ]);
+  assert_eq(codes(b"import std.native (Hidden)\nfn f(h: Hidden) -> Int = 1\n"), [b"E0107"]);
+  assert_eq(
+    codes(b"import std.native (Node, node_of)\nfn f() -> Bool = node_of(1) == node_of(1)\n"),
+    [b"E0201"],
+  );
+  assert_eq(
+    codes(
+      b"import std.native (Node, node_of)\ntype Held = | Held(Node<Int>)\nfn f() -> Bool = Held(node_of(1)) == Held(node_of(2))\n",
+    ),
+    [b"E0201"],
+  );
+  assert_eq(codes(b"import std.native (Node)\nfn f(m: Map<Node<Int>, Int>) -> Int = m.len()\n"), [
+    b"E0206",
+  ]);
+  assert_eq(
+    codes_of([
+      {
+        name: b"std.native",
+        src: b"extern type Node\nextern fn rank(n: Node) -> Int\nkey for Node by rank\n",
+      },
+      { name: b"m", src: b"fn f() -> Int = 1\n" },
+    ]),
+    [b"E0217"],
+  );
+  let stated = |item: Bytes|
+    codes_of([
+      {
+        name: b"std.native",
+        src: Bytes::concat_all([b"extern type Node\nextern fn rank(n: Node) -> Int\n", item]),
+      },
+      { name: b"m", src: b"fn f() -> Int = 1\n" },
+    ]);
+  assert_eq(stated(b"fn shown_node(n: Node) -> String = \"n\"\nshow for Node by shown_node\n"), [
+    b"E0217",
+  ]);
+  assert_eq(
+    stated(b"numeric for Node by { of_int: of_int }\nextern fn of_int(n: Int) -> Node\n"),
+    [b"E0217"],
+  );
+  // A keyed sum's `==` compares its key, and a parameter no field holds holds nothing.
+  assert_eq(
+    codes(
+      b"import std.native (Node)\ntype Held = | Held(Node<Int>)\nfn size(h: Held) -> Int = 1\nkey for Held by size\nfn f(a: Held, b: Held) -> Bool = a == b\n",
+    ),
+    [],
+  );
+  assert_eq(
+    codes(
+      b"import std.native (Node)\ntype Tag<a> = | Tag(Int)\nfn f(a: Tag<Node<Int>>, b: Tag<Node<Int>>) -> Bool = a == b\n",
+    ),
+    [],
+  );
+  // Thirty sums that each hold the next twice, compared at the first: one walk of each.
+  let chain = range(0, 30).fold(b"import std.native (Node)\n", |acc: Bytes, k: Int| {
+    let next = if k == 29 { b"Node<Int>" }
+    else { b"T".concat(Bytes::of_string((k + 1).to_string())) };
+    acc.concat(
+      Bytes::concat_all([
+        b"type T",
+        Bytes::of_string(k.to_string()),
+        b" = | A",
+        Bytes::of_string(k.to_string()),
+        b"(",
+        next,
+        b", ",
+        next,
+        b") | B",
+        Bytes::of_string(k.to_string()),
+        b"\n",
+      ]),
+    )
+  });
+  assert_eq(codes(chain.concat(b"fn f(a: T0, b: T0) -> Bool = a == b\n")), [b"E0201"])
 }
 
 test "a constant past Int's range leaves the termination check unsure rather than broken" {
