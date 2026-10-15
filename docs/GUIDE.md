@@ -784,10 +784,11 @@ types, values and patterns, accessed as `t._0`. `(A)` only groups; `()` is
 `Unit`.
 
 An alias may take parameters and name a type that constrains them, as
-`type Index<a> = Map<a, Int>` names a map keyed by `a`. The alias carries no
-constraint: each signature that uses it promises what its expansion needs,
-`where derivable(ord, a)` here, and one that does not is `E0206` where it names
-the alias; a `new` record or a sum carries it (below). It may take label and row
+`type Index<a> = Map<a, Int>` names a map keyed by `a`. A signature that names
+it at a parameter of its own is held to what the expansion needs without writing
+it, as one that names the `Map` is (§4.3): `Index<k>` holds it to
+`derivable(ord, k)`, and `Index<Float>` is `E0206` where it names the alias. A
+`new` record or a sum carries the same (below). It may take label and row
 parameters too (§4.5):
 `type Step<a | e> = () -> Option<a> / e` is the function type it expands to, with
 the row a use gives it in place of `e`.
@@ -833,13 +834,17 @@ The declaration is closed, and judged where it is written: a field names only
 the declaration's own type, label and row parameters (§4.5), holds no `Hold`,
 `Task` or `Chan` (`E0446`, §4.6), and does not reach the record itself except
 through a sum (`E0214`), since whatever reads a record's shape reads its fields
-whole. A `Map` key it leaves to a parameter is promised where a value is built,
-as a constructor's is. The type carries that promise: a signature that names
-the record or a sum at a parameter of its own, where the type keys a `Map` by
-it through anything it holds, is held to `where derivable(ord, a)` without
-writing it, so its callers meet it and its body assumes it; `std.set`'s
-`Set<a>` is one. A `key`, a `show` or a `gen` (§4.4) may name such a function,
-since what its types carry is no `where` of its own.
+whole. A record or a sum whose values hold a `Map` keyed by one of its
+parameters, there or in a type they hold, where ordering the key reads the
+parameter, carries that parameter's order: wherever the type is written or
+built, at whatever type, the parameter is ordered, as a `Map`'s key is.
+`std.set`'s `Set<a>` is one. With `type Opt<a> = | Plain(a) | Keyed(Map<a, Int>)`,
+`Opt<Float>` is `E0206` where it is written, and so is `Plain(1.5)`: no value
+of `Opt<Float>` exists to reach `Keyed`. A signature that names the type at a
+parameter of its own is held to `where derivable(ord, a)` without writing it,
+so its callers meet it and its body assumes it. A `key` or a `show` (§4.4) for
+the type may name such a function, since every value of the type meets the
+order it carries.
 
 At run time a `new` record is the record it is written as. `==`, `compare`,
 `digest`, `show`, `reflect` and every derived codec (§11) read its fields as
@@ -863,7 +868,18 @@ its element type is a record of at least one field (`E0224`). `Map<k, v>`
 is an immutable sorted map, written `#{k: v}` or built with `Map::new`,
 `Map::insert` or `Map::of_entries`. It iterates in `compare` order. Its key type
 must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Task`
-and `Chan` are refused (`E0206`).
+and `Chan` are refused (`E0206`). A signature that names a `Map`, or a type
+that carries an order (§4.2), anywhere in a parameter's type or its answer, is
+held to the order of each type parameter of its own that ordering the key reads,
+without writing it: `fn size<k>(m: Map<k, Int>) -> Int` is called only at an
+ordered `k`, and its body may `compare` two `k`s. Ordering a key reads what
+`derivable(ord, ..)` reads (§11), and only that: a record's fields, a sum's
+variants, or what a type's `key` answers (§4.4). So `Map<Id<a>, v>` asks
+nothing of `a` where `Id<a>` holds no `a`, and a body that compares two `a`s
+there writes `where derivable(ord, a)` itself. A `where derivable(ord, k)` that
+a signature already implies is allowed and adds nothing, and a call that fills
+`k` with a type that is not ordered is one `E0206`, for the `Map` its type
+names.
 
 `#[a, b]` is a set, `std.set`'s `Set<a>`, each element once in `compare`
 order, which `show` writes back as the literal (`ply doc std.set`). It is no
@@ -929,7 +945,9 @@ plain record, with no constructor in a value to find them by, so it cannot
 state one yet (`E0217`). The function is one that module declares
 (`E0101`); it takes one `T`, at the type's own type and row parameters and
 nothing narrower (`f: (Held<a | e>) -> K` for `type Held<a | e>`), answers a type
-over those parameters alone, has no `where`, and its row is empty, with no
+over those parameters alone, needs no constraint `T` does not carry itself,
+written in a `where` or implied by a `Map` its types name (§4.2, §4.3), and its
+row is empty, with no
 raise of any kind (§6.8) and no `diverges`: `==` and `show` perform nothing,
 cannot raise and always return, and a key that raised inside a `Map` insert
 would have nowhere to go (`E0218`). It binds
@@ -1635,6 +1653,11 @@ An operation's type parameters sit just before its parameters,
 signature resolves names as a `fn` signature does, so a lowercase name its list
 does not declare, or a type name not in scope, is `E0102`. Each perform picks
 its own `a`, so a clause for the operation has to answer every type (`E0201`).
+An operation writes no `where`. Where its types name a `Map`, or a type that
+carries an order (§4.2), whose ordering reads one of its type parameters, each
+perform is held to the order of what it picks for that parameter (`E0206`), and
+each clause for the operation assumes it; the rest of such a key is judged where
+the operation is declared.
 
 ### 6.2 Atoms and rows
 
@@ -3662,7 +3685,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0215` | a `numeric` that does not name each of `add`, `sub`, `mul`, `neg` and `of_int` once |
 | `E0216` | a `numeric` for a type that takes parameters |
 | `E0217` | a `key`, a `show` or a `numeric` for a type that is not a sum, or a function of an alias |
-| `E0218` | a `key`, a `show` or a `numeric` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, has a `where`, binds a resource label, or does not only answer; a `numeric`'s is not `(T, T) -> T`, `(T) -> T` for `neg` or `(Int) -> T` for `of_int` |
+| `E0218` | a `key`, a `show` or a `numeric` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, needs a constraint the type does not carry, binds a resource label, or does not only answer; a `numeric`'s is not `(T, T) -> T`, `(T) -> T` for `neg` or `(Int) -> T` for `of_int` |
 | `E0219` | a `key` whose answer is compared through the type it is the key of |
 | `E0220` | a record literal or an update that would build an `opaque` record outside its module |
 | `E0221` | `opaque` on an alias, which has no values of its own |
