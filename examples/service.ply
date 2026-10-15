@@ -1332,80 +1332,83 @@ pub fn run_memory(
 /// The API key the *tests* drive the twin with.
 pub fn twin_key() -> String = "twin-key-not-a-credential"
 
-/// The service over a database that is a value, a sink that is a value and a stop flag that is a value:
-/// every operation `Serving` names is answered here, and the credential from `api`.
+/// The service over a database that is a value and a sink that is a value: every operation
+/// `Serving` names is answered here, and the credential from `api`.
 pub fn twin<a | e>(
   api: Option<Secret<String>>,
   body: () -> a / {Serving | e},
 ) -> a / {abort.raise | e} =
-  with_cell[store](stocked(seed_shelf(), seed_orders())) { c -> {
-    with_cell[sink](trace::sink()) { t -> {
-      with_cell[stop](signal::running()) { s -> {
-        let step = |q: sql::Stmt, ps: List<sql::Param>| {
-          let o = db::step(cell_get(c), q, ps);
-          cell_set(c, o.db);
-          o.out
-        };
-        let opened = |level: db::Isolation, access: db::Access| {
-          let o = db::begin_step(cell_get(c), level, access);
-          cell_set(c, o.db);
-          o.out
-        };
-        let committed = || {
-          let o = db::commit_step(cell_get(c));
-          cell_set(c, o.db);
-          o.out
-        };
-        let aborted = || {
-          let o = db::abort_step(cell_get(c));
-          cell_set(c, o.db);
-          o.out
-        };
-        // Four lines that are the whole of "a log is an effect".
-        let noted = |channel: String, level: trace::Level, name: String, fs: trace::Fields| {
-          cell_set(t, trace::event_step(cell_get(t), channel, level, name, fs))
-        };
-        let entered = |channel: String, name: String, fs: trace::Fields| {
-          let o = trace::enter_step(cell_get(t), channel, name, fs);
-          cell_set(t, o.sink);
-          o.span
-        };
-        let exited = |span: trace::Span, outcome: trace::Outcome| {
-          let o = trace::exit_step(cell_get(t), span, outcome);
-          cell_set(t, o.sink);
-          // `exit_step` answers `ok: false` where the bound driver raises `E0445`, because a twin is a
-          // value and a value does not raise.
-          if o.ok { () } else { panic("trace.exit named a span that is not open") }
-        };
-        handle {
-          body()
-        } with {
-          db.query[items](q, ps) -> step(q, ps),
-          db.execute[items](q, ps) -> step(q, ps),
-          db.returning[items](q, ps) -> step(q, ps),
-          db.query[orders](q, ps) -> step(q, ps),
-          db.execute[orders](q, ps) -> step(q, ps),
-          db.returning[orders](q, ps) -> step(q, ps),
-          db.begin(level, access) -> opened(level, access),
-          db.commit() -> committed(),
-          db.abort() -> aborted(),
-          db.rollback(reason) -> (),
-          trace.enter[http](name, fs) -> entered("http", name, fs),
-          trace.exit[http](span, outcome) -> exited(span, outcome),
-          trace.event[http](level, name, fs) -> noted("http", level, name, fs),
-          trace.enter[orders](name, fs) -> entered("orders", name, fs),
-          trace.exit[orders](span, outcome) -> exited(span, outcome),
-          trace.event[orders](level, name, fs) -> noted("orders", level, name, fs),
-          trace.count[orders](name, delta, fs) ->
-            cell_set(t, trace::count_step(cell_get(t), "orders", name, delta, fs)),
-          trace.event[items](level, name, fs) -> noted("items", level, name, fs),
-          // Answered from the argument, and only for the key this service declares.
-          config.secret[credentials](key) -> if key == api_key() { api } else { None },
-          signal.stopping() -> signal::stopping_step(cell_get(s)),
-        }
-      } }
-    } }
-  } }
+  handle {
+    over_values(stocked(seed_shelf(), seed_orders()), body).out
+  } with {
+    // Answered from the argument, and only for the key this service declares.
+    config.secret[credentials](key) -> if key == api_key() { api } else { None },
+    signal.stopping() -> signal::stopping_step(signal::running()),
+  }
+
+/// What `body` answers over the database `d` and an empty sink, beside what it leaves of both: every
+/// `db` and `trace` operation `Serving` names is answered here, and the rest by the caller.
+fn over_values<a | e>(
+  d: db::MemDb,
+  body: () -> a / {Serving | e},
+) -> { out: a, db: db::MemDb, sink: trace::Sink } / {abort.raise, config.secret[credentials], signal.stopping | e} =
+  handle {
+    body()
+  } with {
+    var store = d,
+    var sink = trace::sink(),
+    db.query[*](q, ps) -> {
+      let o = db::step(store, q, ps);
+      store = o.db;
+      o.out
+    },
+    db.execute[*](q, ps) -> {
+      let o = db::step(store, q, ps);
+      store = o.db;
+      o.out
+    },
+    db.returning[*](q, ps) -> {
+      let o = db::step(store, q, ps);
+      store = o.db;
+      o.out
+    },
+    db.begin(level, access) -> {
+      let o = db::begin_step(store, level, access);
+      store = o.db;
+      o.out
+    },
+    db.commit() -> {
+      let o = db::commit_step(store);
+      store = o.db;
+      o.out
+    },
+    db.abort() -> {
+      let o = db::abort_step(store);
+      store = o.db;
+      o.out
+    },
+    db.rollback(reason) -> (),
+    // Four clauses that are the whole of "a log is an effect".
+    trace.enter[*channel](name, fs) -> {
+      let o = trace::enter_step(sink, channel, name, fs);
+      sink = o.sink;
+      o.span
+    },
+    trace.exit[*](span, outcome) -> {
+      let o = trace::exit_step(sink, span, outcome);
+      sink = o.sink;
+      // `exit_step` answers `ok: false` where the bound driver raises `E0445`, because a twin is a
+      // value and a value does not raise.
+      if o.ok { () } else { panic("trace.exit named a span that is not open") }
+    },
+    trace.event[*channel](level, name, fs) -> {
+      sink = trace::event_step(sink, channel, level, name, fs);
+    },
+    trace.count[*channel](name, delta, fs) -> {
+      sink = trace::count_step(sink, channel, name, delta, fs);
+    },
+    return out -> { out: out, db: store, sink: sink },
+  }
 
 /// The entry point: the settings, read once, and the store they name. Where to reach the database
 /// is a setting too, and every `db` operation is answered from here rather than by a host.
@@ -1646,77 +1649,22 @@ fn against<a | e>(
   d: db::MemDb,
   values: config::Values,
   body: () -> a / {Serving | e},
-) -> Ran<a> / {abort.raise, signal.stopping | e} =
-  with_cell[store](d) { c -> {
-    with_cell[sink](trace::sink()) { t -> {
-      let step = |q: sql::Stmt, ps: List<sql::Param>| {
-        let o = db::step(cell_get(c), q, ps);
-        cell_set(c, o.db);
-        o.out
-      };
-      let opened = |level: db::Isolation, access: db::Access| {
-        let o = db::begin_step(cell_get(c), level, access);
-        cell_set(c, o.db);
-        o.out
-      };
-      let committed = || {
-        let o = db::commit_step(cell_get(c));
-        cell_set(c, o.db);
-        o.out
-      };
-      let aborted = || {
-        let o = db::abort_step(cell_get(c));
-        cell_set(c, o.db);
-        o.out
-      };
-      let noted = |channel: String, level: trace::Level, name: String, fs: trace::Fields| {
-        cell_set(t, trace::event_step(cell_get(t), channel, level, name, fs))
-      };
-      let entered = |channel: String, name: String, fs: trace::Fields| {
-        let o = trace::enter_step(cell_get(t), channel, name, fs);
-        cell_set(t, o.sink);
-        o.span
-      };
-      let exited = |span: trace::Span, outcome: trace::Outcome| {
-        let o = trace::exit_step(cell_get(t), span, outcome);
-        cell_set(t, o.sink);
-        if o.ok { () } else { panic("trace.exit named a span that is not open") }
-      };
-      let out = handle {
-        body()
-      } with {
-        db.query[items](q, ps) -> step(q, ps),
-        db.execute[items](q, ps) -> step(q, ps),
-        db.returning[items](q, ps) -> step(q, ps),
-        db.query[orders](q, ps) -> step(q, ps),
-        db.execute[orders](q, ps) -> step(q, ps),
-        db.returning[orders](q, ps) -> step(q, ps),
-        db.begin(level, access) -> opened(level, access),
-        db.commit() -> committed(),
-        db.abort() -> aborted(),
-        db.rollback(reason) -> (),
-        trace.enter[http](name, fs) -> entered("http", name, fs),
-        trace.exit[http](span, outcome) -> exited(span, outcome),
-        trace.event[http](level, name, fs) -> noted("http", level, name, fs),
-        trace.enter[orders](name, fs) -> entered("orders", name, fs),
-        trace.exit[orders](span, outcome) -> exited(span, outcome),
-        trace.event[orders](level, name, fs) -> noted("orders", level, name, fs),
-        trace.count[orders](name, delta, fs) ->
-          cell_set(t, trace::count_step(cell_get(t), "orders", name, delta, fs)),
-        trace.event[items](level, name, fs) -> noted("items", level, name, fs),
-        config.secret[credentials](key) -> config::secret_step(values, key),
-        // And **not** `signal`, which the caller handles.
-      };
-      {
-        out: out,
-        shelf: shelf_of(cell_get(c)),
-        book: book_of(cell_get(c)),
-        // `drain` closes every span the program left open as `Abandoned`, so a hermetic test observes
-        // the same records a bound run would write.
-        records: trace::drain(cell_get(t)),
-      }
-    } }
-  } }
+) -> Ran<a> / {abort.raise, signal.stopping | e} = {
+  let ran = handle {
+    over_values(d, body)
+  } with {
+    config.secret[credentials](key) -> config::secret_step(values, key),
+    // And **not** `signal`, which the caller handles.
+  };
+  {
+    out: ran.out,
+    shelf: shelf_of(ran.db),
+    book: book_of(ran.db),
+    // `drain` closes every span the program left open as `Abandoned`, so a hermetic test observes
+    // the same records a bound run would write.
+    records: trace::drain(ran.sink),
+  }
+}
 
 /// The service as `examples/service.sql` seeds it, with a key configured and nobody asking it to stop.
 fn under<a | e>(d: db::MemDb, body: () -> a / {Serving | e}) -> Ran<a> / {abort.raise | e} =
@@ -1801,22 +1749,21 @@ test "GET /docs serves a page, and names the pages when there is none" {
 // A handler is a capability grant, and this is the one place the grant is a subset: `list_items` is
 // called rather than routed, so its row is one atom and one clause discharges it.
 test "list_items reaches one table, and the type is what says so" {
-  with_cell[store](stock()) { c -> {
-    handle {
-      let r = list_items();
-      assert_eq(r.status, 200);
-      assert_eq(
-        json::decode_bytes(http::whole_bytes(r.body), json::list_json(item_json())),
-        Ok(seed_shelf()),
-      )
-    } with {
-      db.query[items](s, ps) -> {
-        let o = db::step(cell_get(c), s, ps);
-        cell_set(c, o.db);
-        o.out
-      },
-    }
-  } }
+  handle {
+    let r = list_items();
+    assert_eq(r.status, 200);
+    assert_eq(
+      json::decode_bytes(http::whole_bytes(r.body), json::list_json(item_json())),
+      Ok(seed_shelf()),
+    )
+  } with {
+    var c = stock(),
+    db.query[items](s, ps) -> {
+      let o = db::step(c, s, ps);
+      c = o.db;
+      o.out
+    },
+  }
 }
 
 test "GET /items reads the shelf and answers it in sku order" {
@@ -2310,52 +2257,49 @@ fn mentions(text: String, needle: Bytes) -> Bool = Bytes::of_string(text).index_
 // the drain's exit criterion, and it is a claim about what is *absent*: not one line of
 // `serve`, `serve_connection` or the framing changed to make a signal drain this service.
 test "a signal drains the accept loop with no source change" {
-  with_cell[stop](signal::running()) { s -> {
-    with_cell[inbox]([get_line("/health")]) { queue -> {
-      with_cell[outbox]([]) { sent -> {
-        with_cell[closed](0) { shut -> {
-          let r = handle {
-            against(stock(), config::one_secret(api_key(), twin_key()), || {
-              handle {
-                // Asked for eight connections and given one, because a stop arrived.
-                listen_and_serve(8137, 8)
-              } with {
-                net.listen[listener](port) -> 1,
-                // Phase 2 of the shutdown sequence, as this service sees it: the listening socket is closed,
-                // so `accept` answers `0`.
-                net.accept[listener](l) -> if signal::stopping_step(cell_get(s)) { 0 } else { 7 },
-                net.close[listener](l) -> cell_set(shut, cell_get(shut) + 1),
-                net.recv[conn](c, max, timeout_ms) -> {
-                  let queued = cell_get(queue);
-                  cell_set(queue, rest_of(queued));
-                  Some(first_of(queued))
-                },
-                net.send[conn](c, payload, timeout_ms) -> {
-                  cell_set(sent, cell_get(sent).push(payload));
-                  Some(payload.len())
-                },
-                // The signal, arriving.
-                net.close[conn](c) -> cell_set(s, signal::draining(30000)),
-              }
-            })
-          } with {
-            // The clause that reads the flag, written by the test that owns the cell.
-            signal.stopping() -> signal::stopping_step(cell_get(s)),
-          };
-          // One connection served, completely: the request in flight was answered rather than cut off.
-          assert_eq(r.out, 1);
-          let wrote = Bytes::concat_all(cell_get(sent));
-          assert_eq(status_of(wrote), 200);
-          assert(wrote.index_of(b"\"service\":\"parts\"") != None);
-          // And the listener was closed on the way out, which is what `serve` returning means.
-          assert_eq(cell_get(shut), 1);
-          // The drain left nothing open: every span the run produced is closed, so a reader of the
-          // records sees a complete request rather than a dangling one.
-          assert_eq(outcomes_of(r.records), [trace::Ok])
-        } }
-      } }
-    } }
-  } }
+  let r = under(stock(), ||
+    handle {
+      // Asked for eight connections and given one, because a stop arrived.
+      listen_and_serve(8137, 8)
+    } with {
+      var stop = signal::running(),
+      var queue = [get_line("/health")],
+      var sent = [],
+      var shut = 0,
+      net.listen[listener](port) -> 1,
+      // Phase 2 of the shutdown sequence, as this service sees it: the listening socket is closed,
+      // so `accept` answers `0`.
+      net.accept[listener](l) -> if signal::stopping_step(stop) { 0 } else { 7 },
+      net.close[listener](l) -> {
+        shut = shut + 1;
+      },
+      net.recv[conn](c, max, timeout_ms) -> {
+        let queued = queue;
+        queue = rest_of(queued);
+        Some(first_of(queued))
+      },
+      net.send[conn](c, payload, timeout_ms) -> {
+        sent = sent.push(payload);
+        Some(payload.len())
+      },
+      // The signal, arriving.
+      net.close[conn](c) -> {
+        stop = signal::draining(30000);
+      },
+      // The clause that reads the flag, beside the one that sets it.
+      signal.stopping() -> signal::stopping_step(stop),
+      return served -> { served: served, sent: sent, shut: shut },
+    });
+  // One connection served, completely: the request in flight was answered rather than cut off.
+  assert_eq(r.out.served, 1);
+  let wrote = Bytes::concat_all(r.out.sent);
+  assert_eq(status_of(wrote), 200);
+  assert(wrote.index_of(b"\"service\":\"parts\"") != None);
+  // And the listener was closed on the way out, which is what `serve` returning means.
+  assert_eq(r.out.shut, 1);
+  // The drain left nothing open: every span the run produced is closed, so a reader of the
+  // records sees a complete request rather than a dangling one.
+  assert_eq(outcomes_of(r.records), [trace::Ok])
 }
 
 /// What `count` clients each asking for `path` once were answered by a pooled service of one worker
@@ -2449,32 +2393,31 @@ test "a receipt is produced one line at a time and ends" {
 
 // Two clauses, and they are the two atoms `receipt`'s row names.
 test "GET /orders/{id}/receipt streams, and a missing order does not" {
-  with_cell[store](stock()) { c -> {
-    handle {
-      match receipt(Map::of_entries([{ key: "id", value: "1" }])) {
-        Stream(s) -> {
-          assert_eq(s.head.status, 200);
-          assert_eq(http::whole_bytes(s.head.body), b"")
-        },
-        Buffered(_) -> panic("an order that exists is streamed"),
-      };
-      match receipt(Map::of_entries([{ key: "id", value: "99" }])) {
-        Buffered(r) -> assert_eq(r.status, 404),
-        Stream(_) -> panic("an order that does not exist has nothing to stream"),
-      }
-    } with {
-      db.query[orders](s, ps) -> {
-        let o = db::step(cell_get(c), s, ps);
-        cell_set(c, o.db);
-        o.out
+  handle {
+    match receipt(Map::of_entries([{ key: "id", value: "1" }])) {
+      Stream(s) -> {
+        assert_eq(s.head.status, 200);
+        assert_eq(http::whole_bytes(s.head.body), b"")
       },
-      db.query[items](s, ps) -> {
-        let o = db::step(cell_get(c), s, ps);
-        cell_set(c, o.db);
-        o.out
-      },
+      Buffered(_) -> panic("an order that exists is streamed"),
+    };
+    match receipt(Map::of_entries([{ key: "id", value: "99" }])) {
+      Buffered(r) -> assert_eq(r.status, 404),
+      Stream(_) -> panic("an order that does not exist has nothing to stream"),
     }
-  } }
+  } with {
+    var c = stock(),
+    db.query[orders](s, ps) -> {
+      let o = db::step(c, s, ps);
+      c = o.db;
+      o.out
+    },
+    db.query[items](s, ps) -> {
+      let o = db::step(c, s, ps);
+      c = o.db;
+      o.out
+    },
+  }
 }
 
 // --- The whole service, over a simulated socket ---------------------------------------
@@ -2485,39 +2428,39 @@ fn first_of(queued: List<Bytes>) -> Bytes = match queued { [first, ..] -> first,
 
 fn rest_of(queued: List<Bytes>) -> List<Bytes> = match queued { [_, ..rest] -> rest, _ -> [] }
 
-fn exchange(inbox: List<Bytes>, shelf: List<Item>, book: List<Order>) -> Exchange / {abort.raise} =
-  with_cell[inbox](inbox) { queue -> {
-    with_cell[outbox]([]) { sent -> {
-      with_cell[closed](0) { closes -> {
-        let ran = under(stocked(shelf, book), || {
-          handle {
-            serve_connection(7, limits())
-          } with {
-            net.recv[conn](c, max, timeout_ms) -> {
-              let queued = cell_get(queue);
-              cell_set(queue, rest_of(queued));
-              Some(first_of(queued))
-            },
-            net.send[conn](c, payload, timeout_ms) -> {
-              cell_set(sent, cell_get(sent).push(payload));
-              Some(payload.len())
-            },
-            net.close[conn](c) -> cell_set(closes, cell_get(closes) + 1),
-          }
-        });
-        {
-          wrote: Bytes::concat_all(cell_get(sent)),
-          // How many *responses* were written, counted as the writes that begin with a status line:
-          // `send_all` writes a buffered response in one, and `http::respond` writes a stream's head
-          // and then chunks that begin with a hex size.
-          sent: cell_get(sent).filter(|p: Bytes| p.starts_with(b"HTTP/1.1 ")).len(),
-          closes: cell_get(closes),
-          shelf: ran.shelf,
-          book: ran.book,
-        }
-      } }
-    } }
-  } }
+fn exchange(inbox: List<Bytes>, shelf: List<Item>, book: List<Order>) -> Exchange / {abort.raise} = {
+  let ran = under(stocked(shelf, book), ||
+    handle {
+      serve_connection(7, limits())
+    } with {
+      var queue = inbox,
+      var sent = [],
+      var closes = 0,
+      net.recv[conn](c, max, timeout_ms) -> {
+        let queued = queue;
+        queue = rest_of(queued);
+        Some(first_of(queued))
+      },
+      net.send[conn](c, payload, timeout_ms) -> {
+        sent = sent.push(payload);
+        Some(payload.len())
+      },
+      net.close[conn](c) -> {
+        closes = closes + 1;
+      },
+      return u -> { sent: sent, closes: closes },
+    });
+  {
+    wrote: Bytes::concat_all(ran.out.sent),
+    // How many *responses* were written, counted as the writes that begin with a status line:
+    // `send_all` writes a buffered response in one, and `http::respond` writes a stream's head
+    // and then chunks that begin with a hex size.
+    sent: ran.out.sent.filter(|p: Bytes| p.starts_with(b"HTTP/1.1 ")).len(),
+    closes: ran.out.closes,
+    shelf: ran.shelf,
+    book: ran.book,
+  }
+}
 
 fn served(raw: Bytes) -> Exchange / {abort.raise} = exchange([raw], seed_shelf(), seed_orders())
 
@@ -2653,44 +2596,44 @@ test "a peer that opens a connection and says nothing is closed without a respon
 fn over_socket(
   inbox: List<Bytes>,
   s: Settings,
-) -> { wrote: Bytes, sent: Int, said: List<String> } / {sim.read, abort.raise} =
-  with_cell[inbox](inbox) { queue -> {
-    with_cell[outbox]([]) { sent -> {
-      with_cell[said]([]) { said -> {
-        under(stock(), || {
-          handle {
-            // A task per connection needs a scheduler; the sequential loop spawns nothing under it.
-            simulate { assert_eq(listening(s), 1) }
-          } with {
-            net.listen[listener](port) -> 1,
-            net.listen_tls[listener](port, credential) -> {
-              assert_eq(credential, "service");
-              1
-            },
-            net.local_port[listener](l) -> Some(40123),
-            net.accept[listener](l) -> 7,
-            net.close[listener](l) -> (),
-            net.recv[conn](c, max, timeout_ms) -> {
-              let queued = cell_get(queue);
-              cell_set(queue, rest_of(queued));
-              Some(first_of(queued))
-            },
-            net.send[conn](c, payload, timeout_ms) -> {
-              cell_set(sent, cell_get(sent).push(payload));
-              Some(payload.len())
-            },
-            net.close[conn](c) -> (),
-            process.out[proc](line) -> cell_set(said, cell_get(said).push(line)),
-          }
-        });
-        {
-          wrote: Bytes::concat_all(cell_get(sent)),
-          sent: cell_get(sent).filter(|p: Bytes| p.starts_with(b"HTTP/1.1 ")).len(),
-          said: cell_get(said),
-        }
-      } }
-    } }
-  } }
+) -> { wrote: Bytes, sent: Int, said: List<String> } / {sim.read, abort.raise} = {
+  let ran = under(stock(), ||
+    handle {
+      // A task per connection needs a scheduler; the sequential loop spawns nothing under it.
+      simulate { assert_eq(listening(s), 1) }
+    } with {
+      var queue = inbox,
+      var sent = [],
+      var said = [],
+      net.listen[listener](port) -> 1,
+      net.listen_tls[listener](port, credential) -> {
+        assert_eq(credential, "service");
+        1
+      },
+      net.local_port[listener](l) -> Some(40123),
+      net.accept[listener](l) -> 7,
+      net.close[listener](l) -> (),
+      net.recv[conn](c, max, timeout_ms) -> {
+        let queued = queue;
+        queue = rest_of(queued);
+        Some(first_of(queued))
+      },
+      net.send[conn](c, payload, timeout_ms) -> {
+        sent = sent.push(payload);
+        Some(payload.len())
+      },
+      net.close[conn](c) -> (),
+      process.out[proc](line) -> {
+        said = said.push(line);
+      },
+      return u -> { sent: sent, said: said },
+    });
+  {
+    wrote: Bytes::concat_all(ran.out.sent),
+    sent: ran.out.sent.filter(|p: Bytes| p.starts_with(b"HTTP/1.1 ")).len(),
+    said: ran.out.said,
+  }
+}
 
 /// One connection, on whatever port is free.
 fn one_connection(tls: Option<String>, accept: Accept) -> Settings =
@@ -2736,62 +2679,60 @@ test "a task per connection writes the bytes one connection at a time writes" {
 
 // The twin as `main` runs it when the settings name it: nothing granted but sockets and stdout.
 test "the twin serves the service over TLS with a task per connection" {
-  with_cell[inbox]([get_line("/items")]) { queue -> {
-    with_cell[outbox]([]) { sent -> {
-      handle {
-        twin(Some(Secret::of_string(twin_key())), ||
-          simulate { assert_eq(listening(one_connection(Some("service"), TaskPerConnection)), 1) })
-      } with {
-        net.listen[listener](port) -> panic("a service told a credential listens over TLS"),
-        net.listen_tls[listener](port, credential) -> 1,
-        net.local_port[listener](l) -> Some(40123),
-        net.accept[listener](l) -> 7,
-        net.close[listener](l) -> (),
-        net.recv[conn](c, max, timeout_ms) -> {
-          let queued = cell_get(queue);
-          cell_set(queue, rest_of(queued));
-          Some(first_of(queued))
-        },
-        net.send[conn](c, payload, timeout_ms) -> {
-          cell_set(sent, cell_get(sent).push(payload));
-          Some(payload.len())
-        },
-        net.close[conn](c) -> (),
-        process.out[proc](line) -> (),
-      };
-      assert_eq(status_of(Bytes::concat_all(cell_get(sent))), 200);
-      assert(Bytes::concat_all(cell_get(sent)).index_of(b"\"sku\":\"gasket\"") != None)
-    } }
-  } }
+  let sent = handle {
+    twin(Some(Secret::of_string(twin_key())), ||
+      simulate { assert_eq(listening(one_connection(Some("service"), TaskPerConnection)), 1) })
+  } with {
+    var queue = [get_line("/items")],
+    var sent = [],
+    net.listen[listener](port) -> panic("a service told a credential listens over TLS"),
+    net.listen_tls[listener](port, credential) -> 1,
+    net.local_port[listener](l) -> Some(40123),
+    net.accept[listener](l) -> 7,
+    net.close[listener](l) -> (),
+    net.recv[conn](c, max, timeout_ms) -> {
+      let queued = queue;
+      queue = rest_of(queued);
+      Some(first_of(queued))
+    },
+    net.send[conn](c, payload, timeout_ms) -> {
+      sent = sent.push(payload);
+      Some(payload.len())
+    },
+    net.close[conn](c) -> (),
+    process.out[proc](line) -> (),
+    return u -> sent,
+  };
+  assert_eq(status_of(Bytes::concat_all(sent)), 200);
+  assert(Bytes::concat_all(sent).index_of(b"\"sku\":\"gasket\"") != None)
 }
 
 // The twin entry point, driven end to end with nothing granted but sockets.
 test "run_memory serves the service with no database bound and no host at all" {
-  with_cell[inbox]([get_line("/items").concat(get_line("/orders"))]) { queue -> {
-    with_cell[outbox]([]) { sent -> {
-      handle {
-        assert_eq(run_memory(8137, Some(Secret::of_string(twin_key())), 1), 1)
-      } with {
-        net.listen[listener](port) -> 1,
-        net.accept[listener](l) -> 7,
-        net.close[listener](l) -> (),
-        net.recv[conn](c, max, timeout_ms) -> {
-          let queued = cell_get(queue);
-          cell_set(queue, rest_of(queued));
-          Some(first_of(queued))
-        },
-        net.send[conn](c, payload, timeout_ms) -> {
-          cell_set(sent, cell_get(sent).push(payload));
-          Some(payload.len())
-        },
-        net.close[conn](c) -> (),
-      };
-      let wrote = Bytes::concat_all(cell_get(sent));
-      assert_eq(cell_get(sent).filter(|p: Bytes| p.starts_with(b"HTTP/1.1 ")).len(), 2);
-      assert(wrote.index_of(b"\"sku\":\"gasket\"") != None);
-      assert(wrote.index_of(b"\"customer\":\"ada\"") != None)
-    } }
-  } }
+  let sent = handle {
+    assert_eq(run_memory(8137, Some(Secret::of_string(twin_key())), 1), 1)
+  } with {
+    var queue = [get_line("/items").concat(get_line("/orders"))],
+    var sent = [],
+    net.listen[listener](port) -> 1,
+    net.accept[listener](l) -> 7,
+    net.close[listener](l) -> (),
+    net.recv[conn](c, max, timeout_ms) -> {
+      let queued = queue;
+      queue = rest_of(queued);
+      Some(first_of(queued))
+    },
+    net.send[conn](c, payload, timeout_ms) -> {
+      sent = sent.push(payload);
+      Some(payload.len())
+    },
+    net.close[conn](c) -> (),
+    return u -> sent,
+  };
+  let wrote = Bytes::concat_all(sent);
+  assert_eq(sent.filter(|p: Bytes| p.starts_with(b"HTTP/1.1 ")).len(), 2);
+  assert(wrote.index_of(b"\"sku\":\"gasket\"") != None);
+  assert(wrote.index_of(b"\"customer\":\"ada\"") != None)
 }
 
 // --- One case per protocol refusal ---------------------------------------------------

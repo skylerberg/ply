@@ -43,7 +43,6 @@ pub type Expr =
   | EList({ span: Span, items: List<Expr> })
   | EPerform({ span: Span, eff: QName, op: Ident, resource: Option<Ident>, args: List<Expr> })
   | EHandle({ span: Span, body: Expr, ret: Option<ReturnClause>, clauses: List<HandleClause>, vars: List<HandlerVar> })
-  | EWithCell({ span: Span, resource: Ident, init: Expr, binder: Ident, body: Expr })
   /// `with_hold[r](acquire, release) { h -> body }`: `body` with `h` a hold on what `acquire`
   /// answered, and `release` run on it however `body` ends.
   | EWithHold({ span: Span, resource: Ident, acquire: Expr, release: Expr, binder: Ident, body: Expr })
@@ -217,7 +216,6 @@ pub fn expr_span(expr: Expr) -> Span =
     EList(v) -> v.span,
     EPerform(v) -> v.span,
     EHandle(v) -> v.span,
-    EWithCell(v) -> v.span,
     EWithHold(v) -> v.span,
     ESimulate(v) -> v.span,
     EParallel(v) -> v.span,
@@ -294,8 +292,6 @@ fn set_span(expr: Expr, span: Span) -> Expr =
     EPerform(v) ->
       EPerform({ span: span, eff: v.eff, op: v.op, resource: v.resource, args: v.args }),
     EHandle(v) -> EHandle({ ..v, span: span }),
-    EWithCell(v) ->
-      EWithCell({ span: span, resource: v.resource, init: v.init, binder: v.binder, body: v.body }),
     EWithHold(v) -> EWithHold({ ..v, span: span }),
     ESimulate(v) -> ESimulate({ span: span, body: v.body }),
     EParallel(v) -> EParallel({ span: span, branches: v.branches }),
@@ -311,7 +307,6 @@ pub fn is_block_like(expr: Expr) -> Bool =
     EIf(v) -> true,
     EMatch(v) -> true,
     EHandle(v) -> true,
-    EWithCell(v) -> true,
     EWithHold(v) -> true,
     ESimulate(v) -> true,
     EParallel(v) -> true,
@@ -839,9 +834,7 @@ fn primary_ident(
   parser: Parser,
   name: Bytes,
 ) -> Result<Parsed<Expr>, Parser> / {abort.raise} =
-  if name == b"with_cell" && token_kind_at(input, parser, 1) == token_lbracket() {
-    with_cell_expr(input, parser)
-  } else if name == b"with_hold" && token_kind_at(input, parser, 1) == token_lbracket() {
+  if name == b"with_hold" && token_kind_at(input, parser, 1) == token_lbracket() {
     with_hold_expr(input, parser)
   } else if name == b"simulate" && !parser.no_brace
       && token_kind_at(input, parser, 1) == token_lbrace() { simulate_expr(input, parser) }
@@ -2161,71 +2154,6 @@ fn return_clause(
   })
 }
 
-fn with_cell_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
-  let st = advance(input, parser);
-  let { parser, node: br } = expect(
-    input,
-    st.parser,
-    token_lbracket(),
-    b"`[` and a resource name",
-  )?;
-  let { parser, node: resource } = expect_ident(input, parser, b"a resource name inside `[..]`")?;
-  let { parser, .. } = expect_close(input, parser, token_rbracket(), br, b"`]`")?;
-  let saved = parser.no_brace;
-  match with_cell_rest(input, with_no_brace(parser, false), st.node, resource) {
-    Err(q) -> Err(with_no_brace(q, saved)),
-    Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
-  }
-}
-
-fn with_cell_rest(
-  input: Input,
-  parser: Parser,
-  span: Span,
-  resource: Ident,
-) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
-  let { parser, node: paren } = expect(
-    input,
-    parser,
-    token_lparen(),
-    b"`(` and the cell's initial value",
-  )?;
-  let { parser, node: init } = expr(input, parser)?;
-  let { parser, .. } = expect_close(
-    input,
-    parser,
-    token_rparen(),
-    paren,
-    b"`)` after the initial value",
-  )?;
-  let { parser, node: brace } = expect(
-    input,
-    parser,
-    token_lbrace(),
-    b"`{` to start the cell's region",
-  )?;
-  let { parser, node: binder } = expect_ident(input, parser, b"a name to bind the cell to")?;
-  let { parser, .. } = expect(input, parser, token_arrow(), b"`->` and the region body")?;
-  let { parser, node: body } = expr(input, parser)?;
-  let { parser, node: cl } = expect_close(
-    input,
-    parser,
-    token_rbrace(),
-    brace,
-    b"`}` to close the cell's region",
-  )?;
-  Ok({
-    parser: parser,
-    node: EWithCell({
-      span: span_to(span, cl),
-      resource: resource,
-      init: init,
-      binder: binder,
-      body: body,
-    }),
-  })
-}
-
 fn with_hold_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: br } = expect(input, st.parser, token_lbracket(), b"`[` and a region name")?;
@@ -2449,14 +2377,6 @@ pub fn dump_expr(expr: Expr) -> Bytes / {abort.raise} =
         if v.vars.len() == 0 { b"" }
         else { dump_word(b"vars").concat(dump_list(v.vars, dump_var)) },
       ]),
-    EWithCell(v) ->
-      Bytes::concat_all([
-        dump_node(v.span, b"ecel"),
-        dump_ident(v.resource),
-        dump_expr(v.init),
-        dump_ident(v.binder),
-        dump_expr(v.body),
-      ]),
     EWithHold(v) ->
       Bytes::concat_all([
         dump_node(v.span, b"ehld"),
@@ -2615,7 +2535,6 @@ pub fn node_count(expr: Expr) -> Int =
           n + 1 + clause.params.len() + node_count(clause.body))
         + (match v.ret { None -> 0, Some(r) -> 1 + node_count(r.body) })
         + v.vars.fold(0, |n: Int, hv: HandlerVar| n + 1 + node_count(hv.init)),
-    EWithCell(v) -> 1 + node_count(v.init) + node_count(v.body),
     EWithHold(v) -> 1 + node_count(v.acquire) + node_count(v.release) + node_count(v.body),
     ESimulate(v) -> 1 + node_count(v.body),
     EParallel(v) -> 1 + count_all(v.branches),
@@ -3095,15 +3014,10 @@ test "a handler's `var`s come before its clauses" {
   assert(dump_expr_of(b"handle f() with { e.op(a) -> (), var s = 0 }").contains("!E0001:"))
 }
 
-test "`with_cell` and `simulate` are contextual" {
-  assert_eq(
-    dump_expr_of(b"with_cell[u](0) { s -> s }"),
-    "0:26:ecel;10:11:ident;@75;13:14:elit;%int;@30;18:19:ident;@73;23:24:evar;23:24:qname;?0;23:24:ident;@73;#0;",
-  );
+test "`simulate` is contextual" {
   assert_eq(dump_expr_of(b"simulate { 1 }"), "0:14:esim;9:14:eblk;#0;?1;11:12:elit;%int;@31;#0;");
-  // Each is an ordinary name wherever the shape does not hold.
-  assert_eq(dump_expr_of(b"simulate"), "0:8:evar;0:8:qname;?0;0:8:ident;@73696d756c617465;#0;");
-  assert_eq(dump_expr_of(b"with_cell"), "0:9:evar;0:9:qname;?0;0:9:ident;@776974685f63656c6c;#0;");
+  // It is an ordinary name wherever the shape does not hold.
+  assert_eq(dump_expr_of(b"simulate"), "0:8:evar;0:8:qname;?0;0:8:ident;@73696d756c617465;#0;")
 }
 
 test "`with_hold` is contextual: a region, what it acquires, what releases that, and a body" {

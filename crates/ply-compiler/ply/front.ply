@@ -9,15 +9,15 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSe
               item_span, IAlias, IModule, IDerive, IInstance, INumeric, spec_kind_bin)
 import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text, TCon)
 import exprs (sees_homes, Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
-              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
-              ESimulate, EParallel, EBad, ETryBlock, Param, Stmt, SLet, SLetElse, SExpr, SAssign,
-              HandlerVar, MatchArm, RecField, expr_span, ETagged, Tagged, Hole, TaggedPart,
-              tagged_parts, hidden_binder, tagged_part_bin)
+              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
+              EParallel, EBad, ETryBlock, Param, Stmt, SLet, SLetElse, SExpr, SAssign, HandlerVar,
+              MatchArm, RecField, expr_span, ETagged, Tagged, Hole, TaggedPart, tagged_parts,
+              hidden_binder, tagged_part_bin)
 import patterns (Lit, LInt, LStr, LBytes)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform,
-             NLabel, NCell, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, NKnown,
-             CodeField, CodeArm, CodeClause, CodeStmt, CLet, CLetPat, CDo, CodePattern,
-             CodePatternField, Capture, PxCtor, PxRecord, PxList, lower_fn, lower_to_emit, dump)
+             NLabel, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, NKnown, CodeField,
+             CodeArm, CodeClause, CodeStmt, CLet, CLetPat, CDo, CodePattern, CodePatternField,
+             Capture, PxCtor, PxRecord, PxList, lower_fn, lower_to_emit, dump)
 import types (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, TyRecord, TyVar,
               atoms_text, atoms_insert, filed_atoms_text, read_atoms, scheme_text, type_text,
               Printer, printer_new, print_ty, Field, canonical_atoms, canonical_scheme,
@@ -339,7 +339,6 @@ fn lits(acc: List<Bytes>, expr: Expr) -> List<Bytes> / {abort.raise} = {
     EList(v) -> backwards(acc, v.items),
     EPerform(v) -> backwards(acc, v.args),
     EHandle(v) -> backwards(lits(acc, v.body), v.vars.map(|x: HandlerVar| x.init)),
-    EWithCell(v) -> lits(lits(acc, v.body), v.init),
     EWithHold(v) -> lits(lits(lits(acc, v.body), v.release), v.acquire),
     ESimulate(v) -> lits(acc, v.body),
     EParallel(v) -> backwards(acc, v.branches),
@@ -509,7 +508,7 @@ fn law_literals(outlines: List<Outline>) -> List<List<Bytes>> =
       match item { OLaw(l) -> a.push(l.literals), _ -> a }))
 
 // --- A module's effect sets ---------------------------------------------------
-// An atom whose effect resolves to nothing is dropped; a bare `cell` resolves to itself.
+// An atom whose effect resolves to nothing is dropped; a bare `hold` resolves to itself.
 
 fn has_effect(effects: List<EffectInfo>, name: Bytes) -> Bool =
   effects.fold(false, |acc: Bool, effect_info: EffectInfo| acc || effect_info.name == name)
@@ -523,9 +522,7 @@ fn set_effect(
   module: Int,
   qname: QName,
 ) -> Option<Bytes> / {abort.raise} =
-  if is_bare(qname) && (qname.name.name == b"cell" || qname.name.name == b"hold") {
-    Some(qname.name.name)
-  } else {
+  if is_bare(qname) && qname.name.name == b"hold" { Some(qname.name.name) } else {
     let found = if is_bare(qname) {
       lookup(resolved.scopes.get(module).bound, EffectSpace, qname.name.name)
     } else { find(resolved, module, EffectSpace, qname) };
@@ -3854,14 +3851,6 @@ fn named(resolved: Resolved, m: Int, c: Code) -> Code / {abort.raise} = {
         label: named_opt(resolved, m, p.label),
         args: ns(p.args),
       }),
-    NCell(x) ->
-      NCell({
-        resource: x.resource,
-        binder: x.binder,
-        slot: x.slot,
-        init: n(x.init),
-        body: n(x.body),
-      }),
     NLambda(l) -> NLambda({ ..l, body: n(l.body) }),
     NSimulate(x) -> NSimulate({ size: x.size, captures: x.captures, body: n(x.body) }),
     NParallel(x) -> NParallel({ ..x, branches: ns(x.branches) }),
@@ -4061,17 +4050,6 @@ fn given_in(c: Code, given: Map<Int, Code>) -> Code = {
           resource: p.resource,
           label: given_opt(p.label, given),
           args: gs(p.args),
-        }),
-      },
-    NCell(x) ->
-      {
-        ..c,
-        node: NCell({
-          resource: x.resource,
-          binder: x.binder,
-          slot: x.slot,
-          init: g(x.init),
-          body: g(x.body),
         }),
       },
     NLambda(l) -> {
@@ -6356,12 +6334,11 @@ fn test_footprint(src: Bytes, name: Bytes) -> Bytes / {abort.raise} =
     [] -> panic("the dump holds the test"),
   }
 
-// What a test declares of a cell is its footprint; a region discharges its own label, so the same
-// atoms inside it reach nothing.
-test "a declared cell atom reaches a test's footprint, and a region's own never does" {
-  let src = b"fn touches(n: Int) -> Int / {cell.read[log]} = n\nfn writes(n: Int) -> Int / {cell.read[log], cell.write[log]} = n\n\ntest \"a read\" {\n  let seen = with_cell[log](41) { c -> cell_get(c) };\n  assert_eq(touches(seen), 41)\n}\n\ntest \"a read and a write\" {\n  let seen = with_cell[log](1) { c -> { cell_set(c, 9); cell_get(c) } };\n  assert_eq(writes(seen), 9)\n}\n\ntest \"inside the region\" {\n  with_cell[log](41) { c -> { cell_set(c, 9); assert_eq(cell_get(c), 9) } }\n}\n";
-  assert_eq(test_footprint(src, b"a read"), b"cell.read[log]");
-  assert_eq(test_footprint(src, b"a read and a write"), b"cell.read[log],cell.write[log]");
+// What a test declares of a hold is its footprint; a region discharges its own label, so the same
+// atom inside it reaches nothing.
+test "a declared hold atom reaches a test's footprint, and a region's own never does" {
+  let src = b"fn touches(n: Int) -> Int / {hold.read[log]} = n\n\ntest \"a read\" {\n  let seen = with_hold[log](41, |x: Int| ()) { c -> c.get() };\n  assert_eq(touches(seen), 41)\n}\n\ntest \"inside the region\" {\n  with_hold[log](41, |x: Int| ()) { c -> assert_eq(c.get(), 41) }\n}\n";
+  assert_eq(test_footprint(src, b"a read"), b"hold.read[log]");
   assert_eq(test_footprint(src, b"inside the region"), b"")
 }
 
@@ -6369,8 +6346,8 @@ test "a declared cell atom reaches a test's footprint, and a region's own never 
 // tail-resumptive one, the shape handlers are written in, still discharges them. Were the first
 // ever empty, the escape brand's claim would have become true.
 test "a general clause inside a region carries that region's atoms out of it" {
-  let src = b"effect amb { read flip[coin]() -> Bool }\n\nfn leaks(n: Int) -> Int / {cell.read[t], cell.write[t]} =\n  with_cell[t](n) { c ->\n    handle { let b = amb.flip[coin](); cell_set(c, cell_get(c) + 1); cell_get(c) }\n    with { amb.flip[coin]() resume k -> k(true), return x -> x }\n  }\n\nfn discharges(n: Int) -> Int =\n  with_cell[t](n) { c ->\n    handle { cell_set(c, cell_get(c) + 1); cell_get(c) }\n    with { amb.flip[coin]() -> true, return x -> x }\n  }\n\ntest \"through a general clause\" { assert_eq(leaks(1), 2) }\ntest \"through a tail-resumptive one\" { assert_eq(discharges(1), 2) }\n";
-  assert_eq(test_footprint(src, b"through a general clause"), b"cell.read[t],cell.write[t]");
+  let src = b"effect amb { read flip[coin]() -> Bool }\n\nfn leaks(n: Int) -> Int / {hold.read[t]} =\n  with_hold[t](n, |x: Int| ()) { c ->\n    handle { let b = amb.flip[coin](); c.get() + 1 }\n    with { amb.flip[coin]() resume k -> k(true), return x -> x }\n  }\n\nfn discharges(n: Int) -> Int =\n  with_hold[t](n, |x: Int| ()) { c ->\n    handle { c.get() + 1 }\n    with { amb.flip[coin]() -> true, return x -> x }\n  }\n\ntest \"through a general clause\" { assert_eq(leaks(1), 2) }\ntest \"through a tail-resumptive one\" { assert_eq(discharges(1), 2) }\n";
+  assert_eq(test_footprint(src, b"through a general clause"), b"hold.read[t]");
   assert_eq(test_footprint(src, b"through a tail-resumptive one"), b"")
 }
 
@@ -7121,26 +7098,50 @@ fn shipped_text(name: Bytes) -> Option<Bytes> =
   shipped_modules().fold(None, |acc: Option<Bytes>, s: Source|
     if s.name == name { Some(s.src) } else { acc })
 
+/// What a test's load asked to read: a module's text, or a data file.
+effect asking {
+  write module(name: Bytes) -> Unit
+  write data(name: Bytes) -> Unit
+}
+
+/// `body`, and the modules and data files its loads asked to read, in order.
+fn asked_in<a | e>(
+  body: () -> a / {asking.module, asking.data | e},
+) -> { value: a, modules: List<Bytes>, data: List<Bytes> } / e =
+  handle {
+    body()
+  } with {
+    var modules: List<Bytes> = [],
+    var data: List<Bytes> = [],
+    asking.module(name) -> {
+      modules = modules.push(name);
+    },
+    asking.data(name) -> {
+      data = data.push(name);
+    },
+    return value -> { value: value, modules: modules, data: data },
+  }
+
 /// What a load of `user` that pulls `named` whatever it imports reads, and each read it asked for.
 fn pulled_by(
   user: List<Source>,
   named: List<Bytes> = [],
-) -> { shipping: Shipping, asked: List<Bytes> } / {abort.raise} =
-  with_cell[asked]([]) { c -> {
-    let shipping = shipped_pulled(
+) -> { shipping: Shipping, asked: List<Bytes> } / {abort.raise} = {
+  let ran = asked_in(||
+    shipped_pulled(
       user,
       { root: b"", manifest: None, supplied: [] },
       shipped_modules().map(|s: Source| s.name),
       |name: Bytes| {
-        cell_update(c, |xs: List<Bytes>| xs.push(name));
+        asking.module(name);
         shipped_text(name)
       },
       |name: Bytes| None,
       pulls_of,
       named,
-    );
-    { shipping: shipping, asked: cell_get(c) }
-  } }
+    ));
+  { shipping: ran.value, asked: ran.modules }
+}
 
 test "a load reads the shipped modules it imports and what those import, and no other" {
   let p = pulled_by([{ name: b"m", src: b"import std.a\npub fn f() -> Int = 1" }]);
@@ -7291,28 +7292,24 @@ fn data_pulled_by(
     },
     { name: b"std.idle", src: b"pub fn rest() -> Bytes = embed(\"idle/rest.txt\")\n" },
   ];
-  with_cell[asked]({ modules: [], data: [] }) { c -> {
-    let shipping = shipped_pulled(
+  let ran = asked_in(||
+    shipped_pulled(
       user,
       { root: b"", manifest: None, supplied: [] },
       texts.map(|t: Source| t.name),
       |name: Bytes| {
-        cell_update(c, |a: { modules: List<Bytes>, data: List<Bytes> }|
-          { ..a, modules: a.modules.push(name) });
+        asking.module(name);
         texts.fold(None, |acc: Option<Bytes>, t: Source|
           if t.name == name { Some(t.src) } else { acc })
       },
       |name: Bytes| {
-        cell_update(c, |a: { modules: List<Bytes>, data: List<Bytes> }|
-          { ..a, data: a.data.push(name) });
+        asking.data(name);
         if name == b"std/words/list.txt" { Some(b"one\ntwo\n") } else { None }
       },
       pulls_of,
       named,
-    );
-    let asked = cell_get(c);
-    { shipping: shipping, modules: asked.modules, data: asked.data }
-  } }
+    ));
+  { shipping: ran.value, modules: ran.modules, data: ran.data }
 }
 
 test "a load asked for a shipped module reads the data file it embeds, though nothing imports it" {

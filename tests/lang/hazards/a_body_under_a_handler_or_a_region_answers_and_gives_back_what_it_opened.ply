@@ -1,13 +1,24 @@
 import hazards.pure
 
-fn counted(n: Int) -> Int =
-  with_cell[tally](0) { c -> {
-    cell_set(c, pure::step(n));
-    cell_set(c, cell_get(c) + pure::mix(n, 2));
-    cell_get(c)
-  } }
+effect acc {
+  write put(v: Int) -> Unit
+  read got() -> Int
+}
 
-test "a definition that opens its own region answers what it set there" {
+fn counted(n: Int) -> Int =
+  handle {
+    acc.put(pure::step(n));
+    acc.put(acc.got() + pure::mix(n, 2));
+    acc.got()
+  } with {
+    var c = 0,
+    acc.put(v) -> {
+      c = v;
+    },
+    acc.got() -> c,
+  }
+
+test "a definition that handles its own variable answers what it set there" {
   assert_eq(counted(0), 35);
   assert_eq(counted(1), 69);
   assert_eq(counted(7), 273);
@@ -19,17 +30,11 @@ effect halt {
 }
 
 fn failing(n: Int) -> Int / {abort.raise} =
-  with_cell[held](n) { c -> {
-    cell_set(c, pure::share(n, 0));
-    cell_get(c)
-  } }
+  with_hold[held](n, |x: Int| ()) { c -> pure::share(c.get(), 0) }
 
 fn abandoned(n: Int) -> Int =
   handle {
-    with_cell[gone](n) { c -> {
-      cell_set(c, cell_get(c) + 1);
-      halt.stop(cell_get(c))
-    } }
+    with_hold[gone](n, |x: Int| ()) { c -> halt.stop(c.get() + 1) }
   } with {
     halt.stop(code) resume k -> 0 - code,
   }
@@ -39,7 +44,7 @@ fn caught<a>(f: () -> a / {abort.raise}) -> Result<a, String> =
 
 // Both leave past the close the body ends with: a region either kept would unbalance the entry, which
 // the runtime refuses as it ends.
-test "a with_cell left by a failure or by an unwind gives its region back" {
+test "a with_hold left by a failure or by an unwind gives its region back" {
   range(0, 32).fold((), |u: Unit, n: Int| {
     assert_eq(caught(|| failing(n)), Err("division by zero"));
     assert_eq(abandoned(n), 0 - (n + 1))
@@ -106,15 +111,16 @@ fn measured(n: Int) -> Int / {tally.read[log], tally.write[log]} = {
 }
 
 fn handled(n: Int) -> Int =
-  with_cell[log](0) { c -> {
-    let out = handle {
-      measured(n)
-    } with {
-      tally.base[log]() -> 7,
-      tally.note[log](what) -> cell_set(c, cell_get(c) + what),
-    };
-    pure::mix(out, cell_get(c))
-  } }
+  handle {
+    measured(n)
+  } with {
+    var noted = 0,
+    tally.base[log]() -> 7,
+    tally.note[log](what) -> {
+      noted = noted + what;
+    },
+    return out -> pure::mix(out, noted),
+  }
 
 test "a body under a live handler stack answers through it" {
   assert_eq(handled(0), 6744);
@@ -124,18 +130,24 @@ test "a body under a live handler stack answers through it" {
 
 fn raced(n: Int) -> Int / {sim.read, abort.raise} = {
   let base = pure::step(n);
-  with_cell[shared](base) { c ->
+  handle {
     simulate {
-      let a = task.spawn(|| cell_set(c, cell_get(c) + pure::step(n)));
-      let b = task.spawn(|| cell_set(c, cell_get(c) + pure::mix(n, 3)));
+      let a = task.spawn(|| acc.put(acc.got() + pure::step(n)));
+      let b = task.spawn(|| acc.put(acc.got() + pure::mix(n, 3)));
       task.join(a);
       task.join(b);
-      cell_get(c)
+      acc.got()
     }
+  } with {
+    var c = base,
+    acc.put(v) -> {
+      c = v;
+    },
+    acc.got() -> c,
   }
 }
 
-test "a region whose tasks race on a cell answers both writes" {
+test "a region whose tasks race on a handler's variable answers both writes" {
   assert_eq(raced(1), 90);
   assert_eq(raced(4), 201)
 }

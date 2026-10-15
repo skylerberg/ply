@@ -70,7 +70,6 @@
   "try"
   "simulate"
   "parallel"
-  "with_cell"
   "with_hold"
 ] @keyword.control
 

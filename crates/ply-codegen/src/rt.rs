@@ -452,9 +452,9 @@ pub(crate) struct Frames {
     /// The variables of each clause running on this stack, the innermost last, by handler: a
     /// stack's own, since tasks run their clauses interleaved.
     pub(crate) held: Vec<(u64, SharedVars)>,
-    /// How many runtime frames on this stack own memory across a call that may stop a detached
-    /// body there: a snapshot then would free it once per restore, so it is taken as one-shot.
-    pub(crate) owning: u32,
+    /// What runtime frames on this stack hold while they call into the program, the innermost
+    /// last: kept here rather than in their locals, so a snapshot of the stack copies it.
+    pub(crate) kept: Vec<Kept>,
 }
 
 impl Frames {
@@ -465,34 +465,159 @@ impl Frames {
             body: None,
             entered_from: None,
             held: Vec::new(),
-            owning: 0,
+            kept: Vec::new(),
         }
     }
 }
 
-/// A runtime frame owning memory across a call into Ply, for as long as it lives: see
-/// [`Frames::owning`]. A stack left mid-call never runs the drop, which only keeps it one-shot.
-pub(crate) struct Owning {
-    ctx: *mut Ctx,
-    stack: usize,
+/// What a runtime frame holds while it calls into the program. A frame's locals are on the stack a
+/// snapshot copies byte for byte, so memory one owned would be freed once per restore; what is kept
+/// in [`Frames::kept`] is copied with the snapshot instead, and a restore puts the copy back.
+pub(crate) enum Kept {
+    /// The frames a clause runs outside of, by the stack each came off.
+    Hidden(Vec<(usize, Vec<HandlerFrame>)>),
+    /// The frame of a `handle` whose `return` clause runs.
+    Landing(HandlerFrame),
+    /// The raise a `bracket`'s release runs during.
+    Raising(Aborting),
 }
 
-impl Owning {
-    pub(crate) fn on(ctx: *mut Ctx) -> Owning {
-        let c = unsafe { &mut *ctx };
-        let stack = c.current;
-        c.stacks[stack].owning += 1;
-        Owning { ctx, stack }
-    }
-}
-
-impl Drop for Owning {
-    fn drop(&mut self) {
-        let c = unsafe { &mut *self.ctx };
-        if let Some(s) = c.stacks.get_mut(self.stack) {
-            s.owning = s.owning.saturating_sub(1);
+impl Kept {
+    fn release(self) {
+        match self {
+            Kept::Hidden(groups) => groups
+                .into_iter()
+                .flat_map(|(_, frames)| frames)
+                .for_each(drop_frame),
+            Kept::Landing(f) => drop_frame(f),
+            Kept::Raising(a) => {
+                a.into_failure();
+            }
         }
     }
+}
+
+/// A stack's frames, what its runtime frames keep and the variables its running clauses hold, as a
+/// snapshot copies them.
+pub(crate) struct StackCopy {
+    pub(crate) list: Vec<HandlerFrame>,
+    pub(crate) kept: Vec<Kept>,
+    pub(crate) held: Vec<(u64, SharedVars)>,
+}
+
+impl StackCopy {
+    /// Each value held once more and each handler's variables copied; a running clause holds the
+    /// copy of its frame's variables where the frame is among those copied, and a copy of its own
+    /// otherwise.
+    pub(crate) fn of(
+        list: &[HandlerFrame],
+        kept: &[Kept],
+        held: &[(u64, SharedVars)],
+    ) -> StackCopy {
+        let mut copies: Vec<(*const std::cell::RefCell<HandlerVars>, SharedVars)> = Vec::new();
+        let mut frame = |f: &HandlerFrame| {
+            let copy = copied_frame(f, false);
+            if let (Some(old), Some(new)) = (&f.vars, &copy.vars) {
+                copies.push((Rc::as_ptr(old), Rc::clone(new)));
+            }
+            copy
+        };
+        let list = list.iter().map(&mut frame).collect();
+        let kept = kept
+            .iter()
+            .map(|k| match k {
+                Kept::Hidden(groups) => Kept::Hidden(
+                    groups
+                        .iter()
+                        .map(|(s, frames)| (*s, frames.iter().map(&mut frame).collect()))
+                        .collect(),
+                ),
+                Kept::Landing(f) => Kept::Landing(frame(f)),
+                Kept::Raising(a) => Kept::Raising(a.copied()),
+            })
+            .collect();
+        let held = held
+            .iter()
+            .map(|(h, v)| {
+                let mine = copies
+                    .iter()
+                    .find(|(old, _)| *old == Rc::as_ptr(v))
+                    .map(|(_, new)| Rc::clone(new));
+                (*h, mine.unwrap_or_else(|| shared(v.borrow().copied())))
+            })
+            .collect();
+        StackCopy { list, kept, held }
+    }
+
+    pub(crate) fn release(self) {
+        self.list.into_iter().for_each(drop_frame);
+        self.kept.into_iter().for_each(Kept::release);
+        for (_, v) in self.held {
+            release_vars(v);
+        }
+    }
+}
+
+/// A call's arguments held in the calling runtime frame itself, so a snapshot of its stack copies
+/// them with it; past [`ARGS_INLINE`], a flat record nothing counts the words of, which the
+/// snapshot holds as it holds any word on the stack.
+pub(crate) struct Args {
+    len: usize,
+    inline: [Word; ARGS_INLINE],
+    spill: Word,
+}
+
+const ARGS_INLINE: usize = 16;
+
+impl Args {
+    /// Takes `words` whole, so no buffer of theirs outlives this, the call's frame included.
+    pub(crate) fn of(c: &mut Ctx, words: Vec<Word>) -> Args {
+        let mut inline = [0; ARGS_INLINE];
+        let spill = if words.len() <= ARGS_INLINE {
+            inline[..words.len()].copy_from_slice(&words);
+            0
+        } else {
+            uncounted_words(c, &words)
+        };
+        Args {
+            len: words.len(),
+            inline,
+            spill,
+        }
+    }
+
+    pub(crate) fn words(&self) -> &[Word] {
+        if self.spill == 0 {
+            &self.inline[..self.len]
+        } else {
+            unsafe { std::slice::from_raw_parts(heap::words(obj(self.spill)), self.len) }
+        }
+    }
+
+    /// Lets go of the spill, whose words the call took.
+    pub(crate) fn release(self) {
+        if self.spill != 0 {
+            heap::dec(self.spill);
+        }
+    }
+}
+
+/// `words` in a flat record, which holds no count of them.
+fn uncounted_words(c: &mut Ctx, words: &[Word]) -> Word {
+    let spill = uncounted(c, words.len());
+    for (i, w) in words.iter().enumerate() {
+        unsafe { set_word(obj(spill), i, *w) };
+    }
+    spill
+}
+
+/// A flat record of `n` words, which holds no count of what is put in them.
+fn uncounted(c: &mut Ctx, n: usize) -> Word {
+    let o = c.heap.alloc(KIND_RECORD, heap::FLAT, n as u32, 0);
+    for i in 0..n {
+        unsafe { set_word(o, i, heap::unit()) };
+    }
+    o as Word
 }
 
 /// A raise on its way to the `handle` that answers it: that frame's stack and depth, which of its
@@ -507,6 +632,20 @@ pub(crate) struct Aborting {
 }
 
 impl Aborting {
+    /// The same raise, what it carries held once more.
+    fn copied(&self) -> Aborting {
+        for w in &self.args {
+            heap::inc(*w);
+        }
+        Aborting {
+            stack: self.stack,
+            depth: self.depth,
+            clause: self.clause,
+            args: self.args.clone(),
+            diagnostic: self.diagnostic.clone(),
+        }
+    }
+
     /// The failure a raise no clause will now answer carries, with what it held let go.
     pub(crate) fn into_failure(self) -> Diagnostic {
         for w in self.args {
@@ -586,50 +725,46 @@ impl HandlerFrame {
     }
 }
 
-/// The frames a captured continuation holds, each closure held once more for the copy, and each
-/// handler's variables copied, so a resumption starts from them as they were.
-pub(crate) fn clone_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
-    copied_frames(list, false)
+/// `f` again, each closure held once more, and its handler's variables shared with it where
+/// `sharing_vars`, else copied.
+fn copied_frame(f: &HandlerFrame, sharing_vars: bool) -> HandlerFrame {
+    for cl in &f.clauses {
+        heap::inc(cl.closure);
+    }
+    if f.ret != 0 {
+        heap::inc(f.ret);
+    }
+    HandlerFrame {
+        clauses: f
+            .clauses
+            .iter()
+            .map(|cl| FrameClause {
+                effect: cl.effect.clone(),
+                resource: cl.resource.clone(),
+                op: cl.op.clone(),
+                closure: cl.closure,
+                resumes: cl.resumes,
+                binds_label: cl.binds_label,
+            })
+            .collect(),
+        ret: f.ret,
+        simulate: f.simulate,
+        detached: f.detached,
+        regions: f.regions,
+        fuel: f.fuel,
+        handler: f.handler,
+        vars: f.vars.as_ref().map(|v| {
+            if sharing_vars {
+                Rc::clone(v)
+            } else {
+                shared(v.borrow().copied())
+            }
+        }),
+    }
 }
 
 fn copied_frames(list: &[HandlerFrame], sharing_vars: bool) -> Vec<HandlerFrame> {
-    list.iter()
-        .map(|f| {
-            for cl in &f.clauses {
-                heap::inc(cl.closure);
-            }
-            if f.ret != 0 {
-                heap::inc(f.ret);
-            }
-            HandlerFrame {
-                clauses: f
-                    .clauses
-                    .iter()
-                    .map(|cl| FrameClause {
-                        effect: cl.effect.clone(),
-                        resource: cl.resource.clone(),
-                        op: cl.op.clone(),
-                        closure: cl.closure,
-                        resumes: cl.resumes,
-                        binds_label: cl.binds_label,
-                    })
-                    .collect(),
-                ret: f.ret,
-                simulate: f.simulate,
-                detached: f.detached,
-                regions: f.regions,
-                fuel: f.fuel,
-                handler: f.handler,
-                vars: f.vars.as_ref().map(|v| {
-                    if sharing_vars {
-                        Rc::clone(v)
-                    } else {
-                        shared(v.borrow().copied())
-                    }
-                }),
-            }
-        })
-        .collect()
+    list.iter().map(|f| copied_frame(f, sharing_vars)).collect()
 }
 
 /// A spawned task's copies of the handlers around its spawn, at the bottom of its own stack; none
@@ -795,6 +930,8 @@ pub struct Ctx {
     resumed: Option<Word>,
     /// How many `handle`s this context has installed, which names the next one's frame.
     handlers_made: u64,
+    /// How many holds this entry has made, which numbers the next.
+    holds_made: u64,
     /// The heap and poison site of the entry this one began inside, put back when it ends.
     outer: (*mut Heap, *const i64),
     /// What that entry's unit answered of its types' keys, put back with them.
@@ -853,6 +990,7 @@ impl Ctx {
             aborting: None,
             resumed: None,
             handlers_made: 0,
+            holds_made: 0,
             outer: (std::ptr::null_mut(), std::ptr::null()),
             outer_instances: None,
         }
@@ -895,6 +1033,22 @@ impl Ctx {
             at = frames.entered_from.or(frames.parent);
         }
         None
+    }
+
+    /// Keeps `k` on the running stack while a runtime frame calls into the program; answers the
+    /// stack, for [`Ctx::kept_back`].
+    pub(crate) fn keep(&mut self, k: Kept) -> usize {
+        let s = self.current;
+        self.stacks[s].kept.push(k);
+        s
+    }
+
+    /// What the frame that kept on stack `s` kept there: the last kept there.
+    pub(crate) fn kept_back(&mut self, s: usize) -> Kept {
+        self.stacks[s]
+            .kept
+            .pop()
+            .expect("a runtime frame finds what it kept when its call returns")
     }
 
     /// This context as what reads its unit's values asks it, while it runs on this thread; `None`
@@ -1033,6 +1187,7 @@ impl Ctx {
         self.record = None;
         self.entered_sims = 0;
         self.handlers_made = 0;
+        self.holds_made = 0;
         self.unwind = None;
         self.aborting = None;
         self.resumed = None;
@@ -2603,6 +2758,41 @@ fn hold_read(ctx: &Ctx, slot: Slot) -> Result<Word, Diagnostic> {
     }
 }
 
+/// A hold, as a closure no call enters: what it holds in its first capture, the null word once it
+/// has let go, so a second release or a read after is refused; and its number in the entry in its
+/// second, which names it to the scheduler. A continuation resumed twice shares it.
+fn hold_new(c: &mut Ctx, held: Word) -> Word {
+    c.holds_made += 1;
+    let o = c
+        .heap
+        .alloc(KIND_CLOSURE, 0, (2 + CLOSURE_CAPTURES) as u32, 0);
+    unsafe {
+        set_word(o, CLOSURE_CODE, rt_hold_entry as *const () as usize as Word);
+        set_word(o, CLOSURE_CAPTURES, held);
+        set_word(o, CLOSURE_CAPTURES + 1, heap::imm(c.holds_made as i64));
+    }
+    o as Word
+}
+
+/// The object a hold `hold_new` made is, where `w` is one.
+fn hold_object(w: Word) -> Option<*mut heap::Obj> {
+    let entry = rt_hold_entry as *const () as usize as Word;
+    (heap::kind(w) == KIND_CLOSURE && unsafe { word_at(obj(w), CLOSURE_CODE) } == entry)
+        .then(|| obj(w))
+}
+
+/// A hold's number in its entry, where `w` is a hold `hold_new` made.
+pub(crate) fn hold_id(w: Word) -> Option<u64> {
+    hold_object(w).map(|o| heap::imm_value(unsafe { word_at(o, CLOSURE_CAPTURES + 1) }) as u64)
+}
+
+/// The entry of a hold, which nothing calls: a hold is no function.
+unsafe extern "C" fn rt_hold_entry(ctx: *mut Ctx, _args: *const i64) -> i64 {
+    let d = Diagnostic::error(codes::INTERNAL_ERROR, "a hold was called as a function")
+        .note("this is Ply's fault, not the program's");
+    unsafe { &mut *ctx }.fail(d)
+}
+
 /// A hold's contents moved out for its release, leaving the null word: a second release finds it
 /// and is refused, so nothing is released twice.
 fn hold_take(ctx: &mut Ctx, slot: Slot) -> Result<Word, Diagnostic> {
@@ -2693,6 +2883,33 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*c);
             Some(if ctx.failed != 0 { 0 } else { heap::unit() })
         }
+        (Builtin::HoldGet, [h]) if hold_object(*h).is_some() => {
+            let o = hold_object(*h)?;
+            let held = unsafe { word_at(o, CLOSURE_CAPTURES) };
+            let answer = if held == 0 {
+                let site = ctx.site();
+                ctx.fail(hold_released(site, "read"))
+            } else {
+                heap::inc(held);
+                held
+            };
+            heap::dec(*h);
+            Some(answer)
+        }
+        (Builtin::HoldTake, [h]) if hold_object(*h).is_some() => {
+            let o = hold_object(*h)?;
+            let held = unsafe { word_at(o, CLOSURE_CAPTURES) };
+            let answer = if held == 0 {
+                let site = ctx.site();
+                ctx.fail(hold_released(site, "let go"))
+            } else {
+                unsafe { set_word(o, CLOSURE_CAPTURES, 0) };
+                held
+            };
+            heap::dec(*h);
+            Some(answer)
+        }
+        (Builtin::HoldNew, [v]) => Some(hold_new(ctx, *v)),
         (Builtin::HoldGet, [h]) => {
             let slot = cell_of(*h)?;
             let answer = match hold_read(ctx, slot) {
@@ -4028,6 +4245,7 @@ pub unsafe extern "C" fn rt_perform(
     if binds_label && let Some(label) = &resource {
         call_args.push(c.word(&Value::Str(Arc::from(label.as_str()))));
     }
+    drop((effect, op, resource));
     // The clause runs outside its handler: that frame and all above it are hidden until it returns.
     let held = c.stacks[stack].list[depth].held();
     let hidden = hide_above(c, stack, depth);
@@ -4036,10 +4254,14 @@ pub unsafe extern "C" fn rt_perform(
         call_args.push(k);
         c.resumed = None;
     }
-    let owning = Owning::on(ctx);
-    let r = Ctx::holding(ctx, held, || call_value(ctx, closure, &call_args));
-    drop(owning);
+    let call_args = Args::of(c, call_args);
+    let here = c.keep(Kept::Hidden(hidden));
+    let r = Ctx::holding(ctx, held, || call_value(ctx, closure, call_args.words()));
+    call_args.release();
     let c = unsafe { &mut *ctx };
+    let Kept::Hidden(hidden) = c.kept_back(here) else {
+        unreachable!("a clause's call keeps the frames it hid");
+    };
     restore_hidden(c, hidden);
     if c.failed != 0 {
         return 0;
@@ -4170,10 +4392,11 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
         let closure = f.take_clause(a.clause);
         let held = f.held();
         drop_frame(f);
+        let Aborting { args, .. } = a;
+        let args = Args::of(c, args);
         // The clause runs outside its `handle`, which is over: its value is the `handle`'s.
-        let owning = Owning::on(ctx);
-        let r = Ctx::holding(ctx, held, || call_value(ctx, closure, &a.args));
-        drop(owning);
+        let r = Ctx::holding(ctx, held, || call_value(ctx, closure, args.words()));
+        args.release();
         heap::dec(closure);
         return r;
     }
@@ -4203,13 +4426,15 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
     let Some(f) = mine else {
         return value;
     };
-    let r = if f.ret != 0 {
-        let _owning = Owning::on(ctx);
-        Ctx::holding(ctx, f.held(), || call_value(ctx, f.ret, &[value]))
-    } else {
-        value
-    };
-    drop_frame(f);
+    if f.ret == 0 {
+        drop_frame(f);
+        return value;
+    }
+    let (ret, held) = (f.ret, f.held());
+    let here = c.keep(Kept::Landing(f));
+    let r = Ctx::holding(ctx, held, || call_value(ctx, ret, &[value]));
+    let c = unsafe { &mut *ctx };
+    c.kept_back(here).release();
     r
 }
 
@@ -4461,15 +4686,15 @@ fn applied(ctx: *mut Ctx, callee: Word, args: &[Word], give: bool) -> i64 {
             // Uninitialised on purpose, as zeroing costs every call;
             // exactly `total` words are written and read.
             let mut handles = [const { std::mem::MaybeUninit::<i64>::uninit() }; 64];
-            let mut spilled: Vec<i64> = Vec::new();
             let captures = len - CLOSURE_CAPTURES;
             let total = captures + args.len();
             let inline = total <= handles.len();
+            let spill = if inline { 0 } else { uncounted(c, total) };
             let mut push = |w: Word, i: usize| {
                 if inline {
                     handles[i].write(w);
                 } else {
-                    spilled.push(w);
+                    unsafe { set_word(obj(spill), i, w) };
                 }
             };
             for i in 0..captures {
@@ -4487,14 +4712,17 @@ fn applied(ctx: *mut Ctx, callee: Word, args: &[Word], give: bool) -> i64 {
             let ptr = if inline {
                 handles.as_ptr() as *const i64
             } else {
-                spilled.as_ptr()
+                unsafe { heap::words(obj(spill)) as *const i64 }
             };
             let code = unsafe { word_at(o, CLOSURE_CODE) } as usize;
             // SAFETY: `code` is a finalized address from `Tables::functions`, which `Bodies`
             // keeps alive as long as this context, with the signature every compiled function has.
             let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(code) };
-            let _owning = (!inline).then(|| Owning::on(ctx));
-            unsafe { f(ctx, ptr) }
+            let r = unsafe { f(ctx, ptr) };
+            if spill != 0 {
+                heap::dec(spill);
+            }
+            r
         }
         KIND_BRIDGE => {
             let value = unsafe { bridged(obj(callee)) };
@@ -4576,20 +4804,26 @@ pub unsafe extern "C" fn rt_map(ctx: *mut Ctx, list: i64, f: i64) -> i64 {
     let Some(items) = native_list(c, list, "List::map") else {
         return 0;
     };
-    let items = list::to_vec(items);
-    let mut out = Vec::with_capacity(items.len());
-    let _owning = Owning::on(ctx);
-    for x in items {
+    // Walked in place and gathered on the heap, so nothing here is owned across `f`'s calls.
+    let mut out = c.heap.list_from(&[]);
+    let mut failed = false;
+    list::for_each(items, |x| {
+        if failed {
+            return;
+        }
         heap::inc(x);
         let r = call_value(ctx, f, &[x]);
         let c = unsafe { &mut *ctx };
         if c.failed != 0 {
-            return 0;
+            failed = true;
+            return;
         }
-        out.push(r);
+        out = c.heap.list_grown(out, r);
+    });
+    if failed {
+        heap::dec(out);
+        return 0;
     }
-    let c = unsafe { &mut *ctx };
-    let out = c.heap.list_from(&out);
     heap::dec(list);
     heap::dec(f);
     out
@@ -4601,20 +4835,24 @@ pub unsafe extern "C" fn rt_filter(ctx: *mut Ctx, list: i64, p: i64) -> i64 {
     let Some(items) = native_list(c, list, "List::filter") else {
         return 0;
     };
-    let items = list::to_vec(items);
-    let mut kept = Vec::new();
-    let _owning = Owning::on(ctx);
-    for x in items {
+    // Walked in place and gathered on the heap, so nothing here is owned across `p`'s calls.
+    let mut kept = c.heap.list_from(&[]);
+    let mut failed = false;
+    list::for_each(items, |x| {
+        if failed {
+            return;
+        }
         heap::inc(x);
         let r = call_value(ctx, p, &[x]);
         let c = unsafe { &mut *ctx };
         if c.failed != 0 {
-            return 0;
+            failed = true;
+            return;
         }
         match heap::as_bool(r) {
             Some(true) => {
                 heap::inc(x);
-                kept.push(x);
+                kept = c.heap.list_grown(kept, x);
             }
             Some(false) => {}
             None => {
@@ -4622,15 +4860,18 @@ pub unsafe extern "C" fn rt_filter(ctx: *mut Ctx, list: i64, p: i64) -> i64 {
                     "the predicate given to `List::filter` answered {}, not a Bool",
                     c.type_name(r)
                 ));
-                return c.fail(d);
+                c.fail(d);
+                failed = true;
             }
         }
+    });
+    if failed {
+        heap::dec(kept);
+        return 0;
     }
-    let c = unsafe { &mut *ctx };
-    let out = c.heap.list_from(&kept);
     heap::dec(list);
     heap::dec(p);
-    out
+    kept
 }
 
 /// `xs.fold(init, f)`. Takes all three.
@@ -4662,34 +4903,35 @@ pub unsafe extern "C" fn rt_fold(ctx: *mut Ctx, list: i64, init: i64, f: i64) ->
 pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     if heap::kind(map) == KIND_MAP {
-        let o = obj(map);
+        // Walked in place, so nothing here is owned across `f`'s calls.
         let mut acc = init;
-        for (k, v) in map::to_vec(o) {
+        let mut failed = false;
+        map::for_each(obj(map), |k, v| {
+            if failed {
+                return;
+            }
             heap::inc(k);
             heap::inc(v);
             acc = call_value(ctx, f, &[acc, k, v]);
-            if unsafe { &*ctx }.failed != 0 {
-                return 0;
-            }
+            failed = unsafe { &*ctx }.failed != 0;
+        });
+        if failed {
+            return 0;
         }
         heap::dec(map);
         heap::dec(f);
         return acc;
     }
-    let value = (map != 0).then(|| c.value(map));
-    let Some(Value::Map(entries)) = &value else {
+    let bridged = (heap::kind(map) == KIND_BRIDGE).then(|| unsafe { bridged(obj(map)) });
+    let Some(Value::Map(entries)) = bridged else {
         let d = error(format!(
             "`Map::fold` needs a Map, and this is {}",
             c.type_name(map)
         ));
         return c.fail(d);
     };
-    let entries: Vec<(Value, Value)> = entries
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
     let mut acc = init;
-    for (k, v) in &entries {
+    for (k, v) in entries.iter() {
         let c = unsafe { &mut *ctx };
         let kw = c.word(k);
         let vw = c.word(v);
@@ -4819,11 +5061,14 @@ fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
     let raising = c.aborting.take();
     c.failed = 0;
     let entered = crate::simulate::shield(c, Shield::Release);
-    let owning = raising.is_some().then(|| Owning::on(ctx));
+    let raise = raising.map(|a| c.keep(Kept::Raising(a)));
     let released = call_value(ctx, release, &[held]);
-    drop(owning);
     heap::dec(release);
     let c = unsafe { &mut *ctx };
+    let raising = raise.map(|here| match c.kept_back(here) {
+        Kept::Raising(a) => a,
+        _ => unreachable!("a release keeps the raise it runs during"),
+    });
     let cancelled = crate::simulate::unshield(c, entered);
     if c.failed != 0 || cancelled {
         if let Some((_, _, carried)) = unwinding {

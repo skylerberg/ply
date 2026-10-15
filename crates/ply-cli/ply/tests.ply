@@ -66,8 +66,8 @@ import std.bin
 import program
 // What a test's footprint makes it — shared, isolated or host — and the classes the tests that run
 // share are the suite's, from the atoms each row carries and the tests the binding reaches.
-import suite.schedule (Atom, Counts, Scheduled, contends_only_over_regions, counts,
-                       group_by_conflict, isolation_of, isolation_word, parallelism, shared)
+import suite.schedule (Atom, Counts, Scheduled, counts, group_by_conflict, isolation_of,
+                       isolation_word, parallelism, shared)
 // The keys a mixture's result is filed under are the suite's, like every other test result's.
 import suite.keys (case_hash, mixture_key)
 // What decides a cause: the change set, the search over it, and the verdict it reaches.
@@ -324,7 +324,6 @@ pub type Parallelism = {
   total: Int,
   isolated: Int,
   shared: Int,
-  region_contended: Int,
   scheduled: Int,
   groups: Int,
   shared_groups: Int,
@@ -850,9 +849,7 @@ fn run_phases_json(phases: Phases, x: Spent) -> Json =
 // --- `--explain` ------------------------------------------------------------
 
 fn explain_atoms(iso: String, case: Case) -> String =
-  if iso == "region" { "" } else if contends_only_over_regions(atoms_of(case)) {
-    " " ++ shared_of(case) ++ " (region labels)"
-  } else { " " ++ shared_of(case) }
+  if iso == "region" { "" } else { " " ++ shared_of(case) }
 
 fn case_line(
   style: Style,
@@ -956,10 +953,6 @@ fn search_lines(style: Style, program: Program, decided: Decided) -> List<String
 fn group_tally(style: Style, c: Counts, decided: Decided) -> String / {abort.raise} = {
   let hosted = if c.host == 0 { "" }
   else { " · " ++ c.host.to_string() ++ " host-backed and never free" };
-  let regioned = if decided.parallelism.region_contended == 0 { "" } else {
-    " · " ++ decided.parallelism.region_contended.to_string()
-      ++ " of them only over a region label"
-  };
   indent() ++ "  "
     ++ dim(
       style,
@@ -969,7 +962,6 @@ fn group_tally(style: Style, c: Counts, decided: Decided) -> String / {abort.rai
         ++ c.shared.to_string()
         ++ " shared "
         ++ plural(c.shared, "test")
-        ++ regioned
         ++ hosted,
     )
 }
@@ -1555,7 +1547,6 @@ fn parallelism_json(v: Parallelism) -> Json =
     { key: "total", value: int(v.total) },
     { key: "isolated", value: int(v.isolated) },
     { key: "shared", value: int(v.shared) },
-    { key: "region_contended", value: int(v.region_contended) },
     { key: "scheduled", value: int(v.scheduled) },
     { key: "groups", value: int(v.groups) },
     { key: "shared_groups", value: int(v.shared_groups) },
@@ -4557,8 +4548,8 @@ test "a test's contended atoms are in the document unprinted, beside whether it 
     ..a_case(0, "one"),
     atoms: [
       {
-        atom: { effect: "cell", resource: "users", writes: true, nondet: true },
-        text: "cell.write[users]",
+        atom: { effect: "db", resource: "users", writes: true, nondet: true },
+        text: "db.write[users]",
       },
       { atom: { effect: "sim", resource: "", writes: false, nondet: false }, text: "sim.read" },
     ],
@@ -4568,10 +4559,10 @@ test "a test's contended atoms are in the document unprinted, beside whether it 
     case_json(a_run([], 0), c, a_decided(a_program([c]), [a_key(0, "one", false, false, false)])),
   );
   assert(
-    text.contains("\"contends\":[{\"effect\":\"cell\",\"resource\":\"users\",\"writes\":true}]"),
+    text.contains("\"contends\":[{\"effect\":\"db\",\"resource\":\"users\",\"writes\":true}]"),
   );
   assert(text.contains("\"seeded\":true"));
-  assert(text.contains("\"shared_atoms\":[\"cell.write[users]\"]"))
+  assert(text.contains("\"shared_atoms\":[\"db.write[users]\"]"))
 }
 
 // Everything a reader or an agent needs to act on a failure is in its artifact: what failed, whether
@@ -4761,47 +4752,16 @@ test "a test the binding can reach is host rather than isolated" {
   assert_eq(shared_of({ ..c, atoms: [seed, fs_write] }), "{fs.write[/tmp/x]}")
 }
 
-// Contention a rename would remove is what losing the fork costs, so `--explain` names it, and a
-// test that also reaches a real resource is not blamed on its label.
-test "`--explain` names and counts the tests that contend only over a region label" {
-  let cell = |label: String|
-    {
-      atom: { effect: "cell", resource: label, writes: true, nondet: true },
-      text: "cell.write[" ++ label ++ "]",
-    };
-  let ledger = {
-    atom: { effect: "db", resource: "ledger", writes: true, nondet: true },
-    text: "db.write[ledger]",
-  };
-  let labelled = { ..a_case(0, "one"), atoms: [cell("users")] };
-  let mixed = { ..a_case(1, "two"), atoms: [cell("orders"), ledger] };
-  assert_eq(explain_atoms("shared", labelled), " {cell.write[users]} (region labels)");
-  assert_eq(explain_atoms("shared", mixed), " {cell.write[orders], db.write[ledger]}");
-  assert_eq(explain_atoms("region", a_case(2, "three")), "");
-  let p = a_program([labelled, mixed, a_case(2, "three")]);
-  let keys = [
-    a_key(0, "one", false, false, false),
-    a_key(1, "two", false, false, false),
-    a_key(2, "three", false, false, false),
-  ];
-  let r = a_run([], 0);
-  assert_eq(
-    group_tally(plain(), counts_of(p, r.reaches), a_decided(p, keys)),
-    indent()
-      ++ "  1 of 3 region-isolated and free · 1 group for the 2 shared tests · 1 of them only over a region label",
-  )
-}
-
 // Only a run that re-runs every test whatever the cache held needs classes over all of them.
 test "classes over every test are coloured only for a mutation" {
-  let cell = |label: String|
+  let db = |label: String|
     {
-      atom: { effect: "cell", resource: label, writes: true, nondet: true },
-      text: "cell.write[" ++ label ++ "]",
+      atom: { effect: "db", resource: label, writes: true, nondet: true },
+      text: "db.write[" ++ label ++ "]",
     };
   let p = a_program([
-    { ..a_case(0, "one"), atoms: [cell("a")] },
-    { ..a_case(1, "two"), atoms: [cell("a")] },
+    { ..a_case(0, "one"), atoms: [db("a")] },
+    { ..a_case(1, "two"), atoms: [db("a")] },
     a_case(2, "three"),
   ]);
   let options = options_from(parsed(["test"]), "/p");
@@ -4998,50 +4958,26 @@ test "the atoms that serialise them are the set's expansion, and an alias only e
   assert(narrow.fold(true, |ok: Bool, t: String| ok && broad.contains(t)))
 }
 
-fn cell_test(label: String, i: Int) -> String =
-  "test \"contender " ++ label ++ " " ++ i.to_string() ++ "\" { let seen = with_cell[" ++ label
-    ++ "]("
-    ++ i.to_string()
-    ++ ") { c -> { cell_set(c, cell_get(c) * 7); cell_get(c) } }; assert_eq(touches_"
-    ++ label
-    ++ "(seen), "
-    ++ Int::to_string(i * 7)
-    ++ ") }\n"
-
-fn toucher(label: String) -> String =
-  "fn touches_" ++ label ++ "(n: Int) -> Int / {cell.read[" ++ label ++ "], cell.write[" ++ label
-    ++ "]} = n\n"
-
-test "tests naming one region label all conflict, and tests on distinct labels never do" {
-  let one = range(0, 3).fold(toucher("table"), |acc: String, i: Int| acc ++ cell_test("table", i));
-  assert_eq(coloured(compiled(one)), [[0], [1], [2]]);
-  let apart = range(0, 3).fold("", |acc: String, i: Int| {
-    let label = "table" ++ i.to_string();
-    acc ++ toucher(label) ++ cell_test(label, i)
-  });
-  assert_eq(coloured(compiled(apart)), [[0, 1, 2]])
-}
-
 test "an effect whose name merely resembles a region's names a real resource" {
   let w = compiled(
-    "nondet effect cells {\n  write put[rows](v: Int) -> Unit\n}\ntest/nondet \"one\" { cells.put[rows](1) }\ntest/nondet \"two\" { cells.put[rows](2) }\n",
+    "nondet effect holds {\n  write put[rows](v: Int) -> Unit\n}\ntest/nondet \"one\" { holds.put[rows](1) }\ntest/nondet \"two\" { holds.put[rows](2) }\n",
   );
-  assert_eq(texts_of_case(w, 0), ["cells.put[rows]"]);
+  assert_eq(texts_of_case(w, 0), ["holds.put[rows]"]);
   assert_eq(coloured(w), [[0], [1]])
 }
 
-test "a region label beside a real write does not launder the write" {
+test "a hold's label beside a real write does not launder the write" {
   let w = compiled(
-    "nondet effect db {\n  read  get[users]() -> Int\n  write put[users](v: Int) -> Unit\n}\nfn touches(n: Int) -> Int / {cell.read[table]} = n\ntest \"cell only\" { let seen = with_cell[table](1) { c -> cell_get(c) }; assert_eq(touches(seen), 1) }\ntest/nondet \"cell and a real write\" { let seen = with_cell[table](1) { c -> cell_get(c) }; db.put[users](touches(seen)) }\ntest/nondet \"a real read\" { assert_eq(db.get[users](), 0) }\n",
+    "nondet effect db {\n  read  get[users]() -> Int\n  write put[users](v: Int) -> Unit\n}\nfn touches(n: Int) -> Int / {hold.read[table]} = n\ntest \"hold only\" { let seen = with_hold[table](1, |x: Int| ()) { c -> c.get() }; assert_eq(touches(seen), 1) }\ntest/nondet \"hold and a real write\" { let seen = with_hold[table](1, |x: Int| ()) { c -> c.get() }; db.put[users](touches(seen)) }\ntest/nondet \"a real read\" { assert_eq(db.get[users](), 0) }\n",
   );
-  assert_eq(texts_of_case(w, 1), ["cell.read[table]", "db.put[users]"]);
-  // Two readers of one region label share a worker; a writer and a reader of `users` do not.
+  assert_eq(texts_of_case(w, 1), ["db.put[users]", "hold.read[table]"]);
+  // A hold is only read, so it separates no test; a writer and a reader of `users` do not share.
   assert_eq(coloured(w), [[0, 1], [2]])
 }
 
-test "a test whose regions discharge their cells contends over nothing" {
+test "a test whose regions discharge their holds contends over nothing" {
   let w = compiled(
-    "test \"users cell\" { with_cell[users](1) { c -> assert_eq(cell_get(c), 1) } }\ntest \"orders cell\" { with_cell[orders](2) { c -> assert_eq(cell_get(c), 2) } }\ntest \"pure\" { assert_eq(1, 1) }\n",
+    "test \"users hold\" { with_hold[users](1, |x: Int| ()) { c -> assert_eq(c.get(), 1) } }\ntest \"orders hold\" { with_hold[orders](2, |x: Int| ()) { c -> assert_eq(c.get(), 2) } }\ntest \"pure\" { assert_eq(1, 1) }\n",
   );
   assert_eq(cases_of_whole(w).map(|case: Case| case.footprint), ["{}", "{}", "{}"]);
   assert_eq(coloured(w), [[0, 1, 2]])
@@ -5064,7 +5000,7 @@ test "a program cannot declare either effect the scheduler reads a name of" {
       Analysed(_) -> false,
       Refused(_) -> true,
     };
-  assert(refused("cell"));
+  assert(refused("hold"));
   assert(refused("sim"))
 }
 

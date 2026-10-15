@@ -5,9 +5,8 @@ import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad, has_or,
                  alternatives_of)
 import exprs (HandleClause, MatchArm, Param, Expr, ELit, EVar, EBinary, EUnary, EApp, EIf, EBlock,
-              EList, ERecord, EField, ELambda, EMatch, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, ERecordUpdate, ETry, Stmt, SLet, SLetElse, SExpr, SAssign, RecField,
-              expr_span)
+              EList, ERecord, EField, ELambda, EMatch, EPerform, EHandle, ESimulate, EParallel,
+              EBad, ERecordUpdate, ETry, Stmt, SLet, SLetElse, SExpr, SAssign, RecField, expr_span)
 import items (Module, Item, IFn, parse)
 import rewrite (expand)
 import std.list
@@ -37,7 +36,6 @@ pub type Node =
   | NPerform({ effect: Bytes, op: Bytes, resource: Bytes, label: Option<Code>, args: List<Code> })
   /// One label argument of a call: the field-table entry of a resource named here.
   | NLabel(Bytes)
-  | NCell({ resource: Bytes, binder: Bytes, slot: Option<Int>, init: Code, body: Code })
   | NLambda(Lambda)
   | NSimulate({ size: Int, captures: List<Capture>, body: Code })
   /// Each branch a nullary `NLambda`, which the run calls on whichever thread it chooses. `rooted`
@@ -282,20 +280,6 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
         b",",
         resource_tag(p.resource, p.label),
         p.args.fold(b"", |acc: Bytes, a: Code| Bytes::concat_all([acc, b",", dump(a)])),
-        b")",
-      ]),
-    NCell(c) ->
-      Bytes::concat_all([
-        b"cell(",
-        c.resource,
-        b",",
-        c.binder,
-        b",",
-        slot_tag(c.slot),
-        b",",
-        dump(c.init),
-        b",",
-        dump(c.body),
         b")",
       ]),
     NParallel(pr) ->
@@ -697,31 +681,6 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
       },
     },
     // The binder is in scope for the body only; the init is evaluated before it exists.
-    EWithCell(x) -> match lower_in(x.init, stack) {
-      None -> None,
-      Some(i) -> {
-        let depth = depth_of(i.stack);
-        let inner = bind_st(i.stack, x.binder.name);
-        match lower_in(x.body, inner) {
-          None -> None,
-          Some(b) ->
-            Some({
-              code: {
-                own: Borrowed,
-                span: expr_span(e),
-                node: NCell({
-                  resource: x.resource.name,
-                  binder: x.binder.name,
-                  slot: slot_in(st_top(inner), x.binder.name),
-                  init: i.code,
-                  body: b.code,
-                }),
-              },
-              stack: unscope_st(b.stack, depth),
-            }),
-        }
-      },
-    },
     // A lambda opens its own barrier; a name it reads from outside becomes a capture.
     ELambda(x) ->
       lower_lambda(x.params.map(|param: Param| param.name.name), x.body, stack, expr_span(e)),
@@ -1129,10 +1088,6 @@ fn projected_var(e: Expr, stack: Stack, inner: List<Bytes>) -> Option<Bytes> = {
     EList(x) -> first(x.items),
     EPerform(x) -> first(x.args),
     EHandle(x) -> projected_var(x.body, stack, inner),
-    EWithCell(x) -> match projected_var(x.init, stack, inner) {
-      Some(n) -> Some(n),
-      None -> projected_var(x.body, stack, inner.push(x.binder.name)),
-    },
     _ -> None,
   }
 }
@@ -1608,7 +1563,6 @@ fn reads_in(code: Code, acc: Reads) -> Reads =
       let args = p.args.fold(acc, |x: Reads, arg: Code| reads_in(arg, x));
       match p.label { Some(l) -> reads_in(l, args), None -> args }
     },
-    NCell(cl) -> reads_in(cl.body, reads_in(cl.init, acc)),
     NLambda(_) -> acc,
     NSimulate(_) -> acc,
     NParallel(_) -> acc,
@@ -1867,26 +1821,6 @@ pub fn mark(c: Code, live: Live, mv: Moves) -> Marked =
         live: lb.live,
       }
     },
-    // The binder dies at the `with_cell`, as a `let`'s does at its `let`.
-    NCell(cl) -> {
-      let b = mark(cl.body, live, mv);
-      let after = match cl.slot { None -> b.live, Some(s) -> dying(b.live, s) };
-      let i = mark(cl.init, after, mv);
-      {
-        code: {
-          own: Borrowed,
-          span: c.span,
-          node: NCell({
-            resource: cl.resource,
-            binder: cl.binder,
-            slot: cl.slot,
-            init: i.code,
-            body: b.code,
-          }),
-        },
-        live: i.live,
-      }
-    },
     NIf(i) -> {
       let t = mark(i.then_branch, live, mv);
       let e = mark(i.else_branch, live, mv);
@@ -2095,7 +2029,6 @@ pub fn slots_read(code: Code) -> List<Int> =
     NLabel(_) -> [],
     NPerform(p) ->
       List::concat(match p.label { Some(x) -> slots_read(x), None -> [] }, all_read(p.args)),
-    NCell(c2) -> slots_read(c2.init).concat(slots_read(c2.body)),
     // A capture read inside a lambda is a read of the object it copies; the lambda's own parameter is not a read here.
     NLambda(l) -> through_caps(slots_read(l.body), l.captures),
     NSimulate(x) -> x.captures.map(|c2: Capture| c2.src).concat(slots_read(x.body)),

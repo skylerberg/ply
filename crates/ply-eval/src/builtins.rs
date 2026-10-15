@@ -330,6 +330,9 @@ builtins! { $
     HandlerVar = "?handler_var" (i) -> Word;
     /// Variable `i` of the handler whose clause runs, given a new value.
     HandlerSet = "?handler_set" (i, x) -> Word;
+    /// A hold of what it is given, which a bracket's release lets go. No source can spell it; the
+    /// lowering of `with_hold` writes it.
+    HoldNew = "?hold_new" (x) -> Word;
 }
 
 impl Builtin {
@@ -553,7 +556,8 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::HoldPut
         | Builtin::HandlerInit
         | Builtin::HandlerVar
-        | Builtin::HandlerSet => Err(answered_by_the_backend(b, span)),
+        | Builtin::HandlerSet
+        | Builtin::HoldNew => Err(answered_by_the_backend(b, span)),
 
         Builtin::Range => {
             let lo = args[0].as_int(span, "`range`")?;

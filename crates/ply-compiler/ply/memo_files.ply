@@ -1030,232 +1030,263 @@ pub fn kept<a, [r] | e>(
     out: if run == None { segments::refused() } else { segments::unwritten() },
     pack: packs::opened(read),
   };
-  let value = with_cell[memo_store](found) { st -> {
-    // A record's bytes noted for the answer they hold, which the run asks for next.
-    let noted = |found: Option<Bytes>| {
-      match found {
-        Some(b) -> match ((output_named(b), inline_named(b))) {
-          (Some(d), Some(a)) -> {
-            let o = cell_get(st);
-            cell_set(st, { ..o, inlined: o.inlined.insert(d, a) })
+  // Each step of the run over the store takes what it holds open and answers it with what it read.
+  // A record's bytes noted for the answer they hold, which the run asks for next.
+  let noted = |o: Open, found: Option<Bytes>|
+    match found {
+      Some(b) -> match ((output_named(b), inline_named(b))) {
+        (Some(d), Some(a)) -> { ..o, inlined: o.inlined.insert(d, a) },
+        _ -> o,
+      },
+      None -> o,
+    };
+  // The bytes of the record the pack below holds under `key`, read once a run.
+  let packed_at = |o: Open, key: Bytes|
+    match o.packed.get(key) {
+      Some(b) -> { open: o, bytes: b },
+      None -> {
+        let found = packs::record(o.pack, read, key);
+        let now = { ..o, pack: found.reading, packed: o.packed.insert(key, found.bytes) };
+        { open: noted(now, found.bytes), bytes: found.bytes }
+      },
+    };
+  // The longer answer the pack below holds under `digest`, beside `o` with what was read to find it.
+  let packed_answer = |o: Open, digest: Bytes| {
+    let found = packs::answer(o.pack, read, digest);
+    { open: { ..o, pack: found.reading }, answer: found.bytes }
+  };
+  let stored = |o: Open, key: Bytes| known_of[r](dir, o, key);
+  // The answer and the height of the record kept under `key`: the run's word, else the store's.
+  let held = |o: Open, key: Bytes|
+    match o.mine.get(key) {
+      Some(x) -> { open: o, held: Some({ answer: x.answer, height: x.height }) },
+      None -> {
+        let k = stored(o, key);
+        {
+          open: k.open,
+          held: match k.known {
+            Some(kn) -> Some({ answer: kn.row.answer, height: kn.row.height }),
+            None -> None,
           },
-          _ -> (),
-        },
-        None -> (),
-      };
-      found
+        }
+      },
     };
-    // The bytes of the record the pack below holds under `key`, read once a run.
-    let packed_at = |key: Bytes| {
-      let o = cell_get(st);
-      match o.packed.get(key) {
-        Some(b) -> b,
-        None -> {
-          let found = packs::record(o.pack, read, key);
-          let now = cell_get(st);
-          cell_set(st, { ..now, pack: found.reading, packed: now.packed.insert(key, found.bytes) });
-          noted(found.bytes)
-        },
-      }
+  // The marks on `key` as the run leaves them: those it changed, else the store's, all one mark.
+  let marks = |o: Open, key: Bytes|
+    match o.marks.get(key) {
+      Some(ms) -> { open: o, marks: ms },
+      None -> {
+        let k = stored(o, key);
+        {
+          open: k.open,
+          marks: match k.known {
+            Some(kn) -> if kn.row.marked { [b"kept"] } else { [] },
+            None -> [],
+          },
+        }
+      },
     };
-    // The longer answer the pack below holds under `digest`, beside `o` with what was read to find it.
-    let packed_answer = |o: Open, digest: Bytes| {
-      let found = packs::answer(o.pack, read, digest);
-      { open: { ..o, pack: found.reading }, answer: found.bytes }
-    };
-    let stored = |key: Bytes| {
-      let k = known_of[r](dir, cell_get(st), key);
-      cell_set(st, k.open);
-      k.known
-    };
-    // The answer and the height of the record kept under `key`: the run's word, else the store's.
-    let held = |key: Bytes|
-      match cell_get(st).mine.get(key) {
-        Some(x) -> Some({ answer: x.answer, height: x.height }),
-        None -> match stored(key) {
-          Some(k) -> Some({ answer: k.row.answer, height: k.row.height }),
-          None -> None,
-        },
-      };
-    // The marks on `key` as the run leaves them: those it changed, else the store's, all one mark.
-    let marks = |key: Bytes|
-      match cell_get(st).marks.get(key) {
-        Some(ms) -> ms,
-        None -> match stored(key) {
-          Some(k) -> if k.row.marked { [b"kept"] } else { [] },
-          None -> [],
-        },
-      };
-    let marked_as = |key: Bytes, ms: List<Bytes>| {
-      let o = cell_get(st);
-      cell_set(st, { ..o, marks: o.marks.insert(key, ms) })
-    };
-    // What the run says of `key` from here on: `change` of what it said, or of what the store says.
-    // Nothing where no record is kept under the key.
-    let saying = |key: Bytes, change: (Mine) -> Mine| {
-      marked_as(key, marks(key));
-      match cell_get(st).mine.get(key) {
-        Some(x) -> {
-          let o = cell_get(st);
-          cell_set(st, { ..o, mine: o.mine.insert(key, change(x)) })
-        },
-        None -> match stored(key) {
-          Some(k) -> {
-            let o = cell_get(st);
-            cell_set(st, {
-              ..o,
-              mine: o.mine.insert(
+  let marked_as = |o: Open, key: Bytes, ms: List<Bytes>| { ..o, marks: o.marks.insert(key, ms) };
+  // What the run says of `key` from here on: `change` of what it said, or of what the store says.
+  // Nothing where no record is kept under the key.
+  let saying = |o0: Open, key: Bytes, change: (Mine) -> Mine| {
+    let m = marks(o0, key);
+    let o = marked_as(m.open, key, m.marks);
+    match o.mine.get(key) {
+      Some(x) -> { ..o, mine: o.mine.insert(key, change(x)) },
+      None -> {
+        let k = stored(o, key);
+        match k.known {
+          Some(kn) ->
+            {
+              ..k.open,
+              mine: k.open.mine.insert(
                 key,
                 change({
-                  answer: k.row.answer,
-                  query: k.query,
-                  seen: k.seen,
-                  height: k.row.height,
+                  answer: kn.row.answer,
+                  query: kn.query,
+                  seen: kn.seen,
+                  height: kn.row.height,
                   frame: None,
                   vouch: false,
                 }),
               ),
-            })
-          },
-          None -> (),
-        },
-      }
-    };
-    let looked = |kind: Bytes, place: Bytes| {
-      let id = memo::place_id(kind, place);
-      match cell_get(st).looked.get(id) {
-        Some(x) -> x,
-        None -> {
-          let value = look(kind, place);
-          let x = { value: value, digest: digest_of(value) };
-          let o = cell_get(st);
-          cell_set(st, { ..o, looked: o.looked.insert(id, x) });
-          x
-        },
-      }
-    };
-    // The bytes of the record kept under `key`, read once a run.
-    let own = |key: Bytes|
-      match held(key) {
-        None -> None,
-        Some(h) -> {
-          let o = cell_get(st);
-          let lies = match match o.mine.get(key) { Some(x) -> x.frame, None -> None } {
-            Some(f) -> { open: o, at: Some({ token: token, offset: f.offset, size: f.size }) },
-            None -> frame_row[r](dir, o, key, h.answer),
-          };
-          cell_set(st, lies.open);
-          match lies.at {
-            None -> None,
-            Some(at) -> {
-              let name = at.token.concat(u64_le(at.offset));
-              match lies.open.read.get(name) {
-                Some(b) -> Some(b),
-                None -> match noted(frame_of[r](dir, token, lies.open, at)) {
-                  Some(b) -> {
-                    let now = cell_get(st);
-                    cell_set(st, { ..now, read: now.read.insert(name, b) });
-                    Some(b)
-                  },
-                  None -> None,
-                },
-              }
             },
-          }
-        },
-      };
-    // The answer under `digest` where a record holds it: one a row named is read for it.
-    let inside = |digest: Bytes|
-      match cell_get(st).inlined.get(digest) {
-        Some(a) -> Some(a),
-        None -> match cell_get(st).named.get(digest) {
-          Some(key) -> {
-            own(key);
-            cell_get(st).inlined.get(digest)
+          None -> k.open,
+        }
+      },
+    }
+  };
+  let looked = |o: Open, kind: Bytes, place: Bytes| {
+    let id = memo::place_id(kind, place);
+    match o.looked.get(id) {
+      Some(x) -> { open: o, looked: x },
+      None -> {
+        let value = look(kind, place);
+        let x = { value: value, digest: digest_of(value) };
+        { open: { ..o, looked: o.looked.insert(id, x) }, looked: x }
+      },
+    }
+  };
+  // The bytes of the record kept under `key`, read once a run.
+  let own = |o0: Open, key: Bytes| {
+    let h0 = held(o0, key);
+    match h0.held {
+      None -> { open: h0.open, bytes: None },
+      Some(h) -> {
+        let o = h0.open;
+        let lies = match match o.mine.get(key) { Some(x) -> x.frame, None -> None } {
+          Some(f) -> { open: o, at: Some({ token: token, offset: f.offset, size: f.size }) },
+          None -> frame_row[r](dir, o, key, h.answer),
+        };
+        match lies.at {
+          None -> { open: lies.open, bytes: None },
+          Some(at) -> {
+            let name = at.token.concat(u64_le(at.offset));
+            match lies.open.read.get(name) {
+              Some(b) -> { open: lies.open, bytes: Some(b) },
+              None -> {
+                let framed = frame_of[r](dir, token, lies.open, at);
+                let now = noted(lies.open, framed);
+                match framed {
+                  Some(b) -> { open: { ..now, read: now.read.insert(name, b) }, bytes: Some(b) },
+                  None -> { open: now, bytes: None },
+                }
+              },
+            }
           },
-          None -> None,
+        }
+      },
+    }
+  };
+  // The answer under `digest` where a record holds it: one a row named is read for it.
+  let inside = |o: Open, digest: Bytes|
+    match o.inlined.get(digest) {
+      Some(a) -> { open: o, answer: Some(a) },
+      None -> match o.named.get(digest) {
+        Some(key) -> {
+          let got = own(o, key);
+          { open: got.open, answer: got.open.inlined.get(digest) }
         },
-      };
-    let keeping = |key: Bytes, rec: Record, inline: Option<Bytes>, longer: Option<Bytes>|
-      match packs::answer_key(rec.output) {
-        None -> (),
-        Some(name) -> {
-          // A row is a key and what follows it: a key of another length would misplace every row.
-          if key.len() != key_width() { panic("a memo key is thirty-two bytes") };
-          // A fresh record answers for what the store only left unchecked: its marks stay.
-          marked_as(key, marks(key));
-          let was = match held(key) { Some(h) -> h.height, None -> 0 };
-          let bytes = record_bytes(rec, inline);
-          let o = cell_get(st);
-          let f = segments::framing(o.out, bytes);
-          let o1 = { ..o, out: f.writing };
-          let o2 = match inline {
-            Some(a) -> { ..o1, inlined: o1.inlined.insert(rec.output, a) },
-            None -> o1,
-          };
-          let o3 = match longer {
-            None -> o2,
-            Some(body) -> if o2.answers.contains(name) { o2 } else {
-              // An answer a segment names and does not hold is kept again.
-              let there = if o2.unread.contains(name) { { open: o2, at: None } }
-              else { answer_row[r](dir, o2, name) };
-              match there.at {
-                Some(_) -> holding(there.open, name, body),
-                None -> {
-                  let g = segments::framing(there.open.out, body);
-                  {
-                    ..holding(there.open, name, body),
-                    out: g.writing,
-                    answers: there.open.answers.insert(name, lying(g.at, body.len())),
-                  }
-                },
-              }
-            },
-          };
-          cell_set(st, {
-            ..o3,
-            out: segments::appended_when_full[r](dir, shapes(), token, o3.out),
-            mine: o3.mine.insert(key, {
-              answer: name,
-              query: rec.query.blake3(),
-              seen: o3.now,
-              height: if was > rec.height { was } else { rec.height },
-              frame: Some({ offset: f.at, size: bytes.len() }),
-              vouch: true,
-            }),
-          })
-        },
-      };
-    let value = handle {
-      work()
-    } with {
-      memo_keep.head(key) -> match held(key) {
-        Some(h) -> {
-          let digest = answer_digest(h.answer);
-          let o = cell_get(st);
-          cell_set(st, { ..o, named: o.named.insert(digest, key) });
+        None -> { open: o, answer: None },
+      },
+    };
+  let keeping = |o0: Open, key: Bytes, rec: Record, inline: Option<Bytes>, longer: Option<Bytes>|
+    match packs::answer_key(rec.output) {
+      None -> o0,
+      Some(name) -> {
+        // A row is a key and what follows it: a key of another length would misplace every row.
+        if key.len() != key_width() { panic("a memo key is thirty-two bytes") };
+        // A fresh record answers for what the store only left unchecked: its marks stay.
+        let m = marks(o0, key);
+        let h = held(marked_as(m.open, key, m.marks), key);
+        let was = match h.held { Some(x) -> x.height, None -> 0 };
+        let bytes = record_bytes(rec, inline);
+        let o = h.open;
+        let f = segments::framing(o.out, bytes);
+        let o1 = { ..o, out: f.writing };
+        let o2 = match inline {
+          Some(a) -> { ..o1, inlined: o1.inlined.insert(rec.output, a) },
+          None -> o1,
+        };
+        let o3 = match longer {
+          None -> o2,
+          Some(body) -> if o2.answers.contains(name) { o2 } else {
+            // An answer a segment names and does not hold is kept again.
+            let there = if o2.unread.contains(name) { { open: o2, at: None } }
+            else { answer_row[r](dir, o2, name) };
+            match there.at {
+              Some(_) -> holding(there.open, name, body),
+              None -> {
+                let g = segments::framing(there.open.out, body);
+                {
+                  ..holding(there.open, name, body),
+                  out: g.writing,
+                  answers: there.open.answers.insert(name, lying(g.at, body.len())),
+                }
+              },
+            }
+          },
+        };
+        {
+          ..o3,
+          out: segments::appended_when_full[r](dir, shapes(), token, o3.out),
+          mine: o3.mine.insert(key, {
+            answer: name,
+            query: rec.query.blake3(),
+            seen: o3.now,
+            height: if was > rec.height { was } else { rec.height },
+            frame: Some({ offset: f.at, size: bytes.len() }),
+            vouch: true,
+          }),
+        }
+      },
+    };
+  let value = handle {
+    work()
+  } with {
+    var st = found,
+    memo_keep.head(key) -> {
+      let h = held(st, key);
+      st = h.open;
+      match h.held {
+        Some(x) -> {
+          let digest = answer_digest(x.answer);
+          st = { ..st, named: st.named.insert(digest, key) };
           Some(digest)
         },
-        None -> match packed_at(key) { Some(b) -> output_named(b), None -> None },
-      },
-      memo_keep.height(key) -> match held(key) {
-        Some(h) -> h.height,
-        None -> match packed_at(key) { Some(b) -> height_named(b), None -> 0 },
-      },
-      memo_keep.record(key) -> match own(key) {
-        Some(b) -> record_of(Some(b), match held(key) { Some(h) -> h.height, None -> 0 }),
+        None -> {
+          let p = packed_at(st, key);
+          st = p.open;
+          match p.bytes { Some(b) -> output_named(b), None -> None }
+        },
+      }
+    },
+    memo_keep.height(key) -> {
+      let h = held(st, key);
+      st = h.open;
+      match h.held {
+        Some(x) -> x.height,
+        None -> {
+          let p = packed_at(st, key);
+          st = p.open;
+          match p.bytes { Some(b) -> height_named(b), None -> 0 }
+        },
+      }
+    },
+    memo_keep.record(key) -> {
+      let mine = own(st, key);
+      let h = held(mine.open, key);
+      st = h.open;
+      match mine.bytes {
+        Some(b) -> record_of(Some(b), match h.held { Some(x) -> x.height, None -> 0 }),
         // The pack's record only where the store keeps none of its own under the key.
-        None -> match held(key) { Some(_) -> None, None -> record_of(packed_at(key), 0) },
-      },
-      memo_keep.stored(key) -> match held(key) { Some(_) -> true, None -> false },
-      memo_keep.output(digest) -> match inside(digest) {
+        None -> match h.held {
+          Some(_) -> None,
+          None -> {
+            let p = packed_at(st, key);
+            st = p.open;
+            record_of(p.bytes, 0)
+          },
+        },
+      }
+    },
+    memo_keep.stored(key) -> {
+      let h = held(st, key);
+      st = h.open;
+      match h.held { Some(_) -> true, None -> false }
+    },
+    memo_keep.output(digest) -> {
+      let i = inside(st, digest);
+      st = i.open;
+      match i.answer {
         Some(a) -> Some(a),
         None -> match packs::answer_key(digest) {
           None -> None,
-          Some(name) -> match cell_get(st).held.get(name) {
+          Some(name) -> match st.held.get(name) {
             Some(a) -> Some(a),
             None -> {
-              let o = cell_get(st);
+              let o = st;
               let lies = match o.answers.get(name) {
                 Some(b) ->
                   {
@@ -1280,131 +1311,154 @@ pub fn kept<a, [r] | e>(
                 },
                 None -> packed_answer(lies.open, digest),
               };
-              cell_set(st, match found.answer {
+              st = match found.answer {
                 Some(a) -> holding(found.open, name, a),
                 None -> found.open,
-              });
+              };
               found.answer
             },
           },
         },
-      },
-      memo_keep.keep(key, rec, output) -> match kept_inline(output) {
-        Some(a) -> keeping(key, rec, Some(a), None),
-        None -> keeping(key, rec, None, Some(output)),
-      },
-      // An answer its record holds is held by the record kept again.
-      memo_keep.adopt(key, rec) -> keeping(key, rec, cell_get(st).inlined.get(rec.output), None),
-      memo_keep.raise(key, height) ->
-        saying(key, |x: Mine| if height > x.height { { ..x, height: height } } else { x }),
-      memo_keep.now(kind, place) -> looked(kind, place).value,
-      memo_keep.digest(kind, place) -> looked(kind, place).digest,
-      memo_keep.places() -> {
-        let p = places_of[r](dir, cell_get(st));
-        cell_set(st, p.open);
-        p.places.fold([], |acc: List<Seen>, _: Bytes, s: Seen|
-          if covers(s.kind, s.at) { acc.push(s) } else { acc })
-      },
-      memo_keep.seen(id) -> {
-        let p = places_of[r](dir, cell_get(st));
-        cell_set(st, p.open);
-        p.places.get(id)
-      },
-      memo_keep.see(id, s) -> {
-        let p = places_of[r](dir, cell_get(st));
-        cell_set(st, {
-          ..p.open,
-          places: Some(p.places.insert(id, s)),
-          saw: p.open.saw.insert(id, s),
-        })
-      },
-      memo_keep.readers(id) -> {
-        let found = readers_of[r](dir, cell_get(st), id);
-        cell_set(st, found.open);
-        found.keys
-      },
-      memo_keep.link(id, key) -> {
-        let o = cell_get(st);
-        cell_set(st, {
-          ..o,
-          readers: o.readers.insert(
-            id,
-            List::push(match o.readers.get(id) { Some(ks) -> ks, None -> [] }, key),
-          ),
-        })
-      },
-      memo_keep.marks(key) -> {
-        let ms = marks(key);
-        if ms.len() > 0 { ms } else {
-          let vouched = match cell_get(st).mine.get(key) { Some(x) -> x.vouch, None -> false };
-          let unchecked = !vouched
-            && (match stored(key) {
-              Some(k) -> !k.trusted || cell_get(st).lost.len() > 0,
-              // A record of the pack below stands as it is only where the pack does, or where
-              // this run checked it: it notes no reads, so no later run is told that one moved.
-              None ->
-                !cell_get(st).trusted && !cell_get(st).checked.contains(key)
-                  && packed_at(key) != None,
-            });
-          if unchecked { [memo::unchecked()] } else { [] }
-        }
-      },
-      memo_keep.marked() -> {
-        let named = marked_in[r](dir, cell_get(st));
-        cell_set(st, named.open);
-        named.keys.fold([], |acc: List<Bytes>, key: Bytes, _: Bool| {
-          let query = match cell_get(st).mine.get(key) {
-            Some(x) -> Some(x.query),
-            None -> match stored(key) { Some(k) -> Some(k.query), None -> None },
-          };
-          match query {
-            Some(q) -> if cell_get(st).own.contains(q) && marks(key).len() > 0 { acc.push(key) }
-            else { acc },
-            None -> acc,
+      }
+    },
+    memo_keep.keep(key, rec, output) -> {
+      st = match kept_inline(output) {
+        Some(a) -> keeping(st, key, rec, Some(a), None),
+        None -> keeping(st, key, rec, None, Some(output)),
+      };
+    },
+    // An answer its record holds is held by the record kept again.
+    memo_keep.adopt(key, rec) -> {
+      st = keeping(st, key, rec, st.inlined.get(rec.output), None);
+    },
+    memo_keep.raise(key, height) -> {
+      st = saying(st, key, |x: Mine| if height > x.height { { ..x, height: height } } else { x });
+    },
+    memo_keep.now(kind, place) -> {
+      let l = looked(st, kind, place);
+      st = l.open;
+      l.looked.value
+    },
+    memo_keep.digest(kind, place) -> {
+      let l = looked(st, kind, place);
+      st = l.open;
+      l.looked.digest
+    },
+    memo_keep.places() -> {
+      let p = places_of[r](dir, st);
+      st = p.open;
+      p.places.fold([], |acc: List<Seen>, _: Bytes, s: Seen|
+        if covers(s.kind, s.at) { acc.push(s) } else { acc })
+    },
+    memo_keep.seen(id) -> {
+      let p = places_of[r](dir, st);
+      st = p.open;
+      p.places.get(id)
+    },
+    memo_keep.see(id, s) -> {
+      let p = places_of[r](dir, st);
+      st = { ..p.open, places: Some(p.places.insert(id, s)), saw: p.open.saw.insert(id, s) };
+    },
+    memo_keep.readers(id) -> {
+      let found = readers_of[r](dir, st, id);
+      st = found.open;
+      found.keys
+    },
+    memo_keep.link(id, key) -> {
+      st = {
+        ..st,
+        readers: st.readers.insert(
+          id,
+          List::push(match st.readers.get(id) { Some(ks) -> ks, None -> [] }, key),
+        ),
+      };
+    },
+    memo_keep.marks(key) -> {
+      let m = marks(st, key);
+      st = m.open;
+      if m.marks.len() > 0 { m.marks } else {
+        let vouched = match st.mine.get(key) { Some(x) -> x.vouch, None -> false };
+        let unchecked = if vouched { false } else {
+          let k = stored(st, key);
+          st = k.open;
+          match k.known {
+            Some(kn) -> !kn.trusted || st.lost.len() > 0,
+            // A record of the pack below stands as it is only where the pack does, or where
+            // this run checked it: it notes no reads, so no later run is told that one moved.
+            None -> if st.trusted || st.checked.contains(key) { false } else {
+              let p = packed_at(st, key);
+              st = p.open;
+              p.bytes != None
+            },
           }
-        })
-      },
-      memo_keep.mark(key) -> {
-        let ms = marks(key);
-        let o = cell_get(st);
-        cell_set(st, {
+        };
+        if unchecked { [memo::unchecked()] } else { [] }
+      }
+    },
+    memo_keep.marked() -> {
+      let named = marked_in[r](dir, st);
+      let walked = named.keys.fold(
+        { open: named.open, keys: [] },
+        |acc: { open: Open, keys: List<Bytes> }, key: Bytes, _: Bool| {
+          let query = match acc.open.mine.get(key) {
+            Some(x) -> { open: acc.open, query: Some(x.query) },
+            None -> {
+              let k = stored(acc.open, key);
+              { open: k.open, query: match k.known { Some(kn) -> Some(kn.query), None -> None } }
+            },
+          };
+          match query.query {
+            Some(q) -> if query.open.own.contains(q) {
+              let m = marks(query.open, key);
+              { open: m.open, keys: if m.marks.len() > 0 { acc.keys.push(key) } else { acc.keys } }
+            } else { { open: query.open, keys: acc.keys } },
+            None -> { open: query.open, keys: acc.keys },
+          }
+        },
+      );
+      st = walked.open;
+      walked.keys
+    },
+    memo_keep.mark(key) -> {
+      let m = marks(st, key);
+      let o = m.open;
+      st = saying(
+        {
           ..o,
-          marks: o.marks.insert(key, ms.push(Bytes::of_string(o.minted.to_string()))),
+          marks: o.marks.insert(key, m.marks.push(Bytes::of_string(o.minted.to_string()))),
           minted: o.minted + 1,
-        });
-        saying(key, |x: Mine| x)
-      },
-      memo_keep.unmark(key, gone) -> {
-        marked_as(key, marks(key).filter(|m: Bytes| !gone.contains(m)));
-        match held(key) {
-          Some(_) -> saying(key, |x: Mine| { ..x, vouch: true }),
-          None -> {
-            let o = cell_get(st);
-            cell_set(st, { ..o, checked: o.checked.insert(key, true) })
-          },
-        }
-      },
-      memo_keep.stamped(named, queries) -> {
-        let o = cell_get(st);
-        let stamp = stamp_of(named);
-        cell_set(st, {
-          ..o,
-          known: Map::new(),
-          own: queries.fold(Map::new(), |own: Map<Bytes, Bool>, q: Bytes|
-            own.insert(q.blake3(), true)),
-          stamp: packs::above(o.pack.index, stamp, world),
-          trusted: match o.pack.index { Some(i) -> packs::stands(i, stamp, world), None -> false },
-        })
-      },
-      memo_keep.vouches() -> {
-        let o = cell_get(st);
-        o.manifest.segments.fold(false, |any: Bool, seg: Segment|
-          any || (!segments::below_floor(o.manifest, seg) && seg.stamps.contains(o.stamp)))
-      },
-    };
-    match run { Some(path) -> committed[r](dir, path, token, cell_get(st)), None -> () };
-    value
-  } };
+        },
+        key,
+        |x: Mine| x,
+      );
+    },
+    memo_keep.unmark(key, gone) -> {
+      let m = marks(st, key);
+      let h = held(marked_as(m.open, key, m.marks.filter(|mk: Bytes| !gone.contains(mk))), key);
+      st = match h.held {
+        Some(_) -> saying(h.open, key, |x: Mine| { ..x, vouch: true }),
+        None -> { ..h.open, checked: h.open.checked.insert(key, true) },
+      };
+    },
+    memo_keep.stamped(named, queries) -> {
+      let stamp = stamp_of(named);
+      st = {
+        ..st,
+        known: Map::new(),
+        own: queries.fold(Map::new(), |own: Map<Bytes, Bool>, q: Bytes|
+          own.insert(q.blake3(), true)),
+        stamp: packs::above(st.pack.index, stamp, world),
+        trusted: match st.pack.index { Some(i) -> packs::stands(i, stamp, world), None -> false },
+      };
+    },
+    memo_keep.vouches() ->
+      st.manifest.segments.fold(false, |any: Bool, seg: Segment|
+        any || (!segments::below_floor(st.manifest, seg) && seg.stamps.contains(st.stamp))),
+    return value -> {
+      match run { Some(path) -> committed[r](dir, path, token, st), None -> () };
+      value
+    },
+  };
   segments::left[r](run);
   value
 }
@@ -1726,19 +1780,23 @@ test "what moved under one stamp is answered again under another" {
   assert_eq(back.value, { output: b"\"forty\"", ran: 0 })
 }
 
+/// Whether a racing run has yet to begin: the first look begins it.
+effect rival {
+  write first() -> Bool
+}
+
 test "two runs at once over an edit leave a store that answers as a fresh one" {
   // The second run starts at the first's first look at the world, sees the edit and ends first.
   let racing = |tree: fs::MemFs|
     fs::on_mem[abs](tree, || {
       let queries = test_queries(b"");
-      with_cell[raced](false) { begun ->
+      handle {
         kept[abs](
           "s",
           packs::no_pack,
           b"",
           |_: Bytes, _: Bytes| {
-            if !cell_get(begun) {
-              cell_set(begun, true);
+            if rival.first() {
               quoted_over[abs](b"forty");
               ()
             };
@@ -1746,6 +1804,13 @@ test "two runs at once over an edit leave a store that answers as a fresh one" {
           },
           || answer(queries, started(queries), b"quoted", b"a").output,
         )
+      } with {
+        var begun = false,
+        rival.first() -> {
+          let first = !begun;
+          begun = true;
+          first
+        },
       }
     });
   let first = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
