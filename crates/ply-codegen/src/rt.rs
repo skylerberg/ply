@@ -3018,6 +3018,11 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let tables = Arc::clone(&ctx.tables);
             Some(ctx.heap.slice(&tables.layouts, *b, start, end))
         }
+        (Builtin::BytesBlake3, [b]) if heap::kind(*b) == KIND_BYTES => {
+            let digest = blake3::hash(unsafe { bytes_of(obj(*b)) });
+            heap::dec(*b);
+            Some(ctx.heap.bytes(digest.as_bytes()))
+        }
         (Builtin::BytesConcat, [a, b])
             if heap::kind(*a) == KIND_BYTES && heap::kind(*b) == KIND_BYTES =>
         {
