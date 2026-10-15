@@ -3,17 +3,24 @@
 //! failure's diagnosis reads; for `ply prove` and `ply review` evidence and accepted baselines.
 
 import std.bin
+import std.fs
 import std.fs (fs, mem_empty)
+import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
 import std.bytes
-import compiler.front (DefInterface, FiledBody, FiledDef, body_encoding, def_interface_bin)
-import compiler.hash (body_key)
+import compiler.checking (Answering, queries)
+import compiler.front (DefInterface, FiledBody, FiledDef, Analysed, body_encoding,
+                       def_interface_bin, filed_bodies)
+import compiler.hash (body_key, hex)
+import compiler.load (analysed, answers_afresh, assembled, prepared)
 import compiler.resolve (Diag)
+import compiler.unit (shipped)
 import loads
 import paths
 import store.tables
 import store.twin (on_twin)
+import store.engine (Warning)
 import suite.conclude (Filing, Named, PassRecord)
 import suite.select (Pass)
 import claims (proofs, Accepted)
@@ -540,4 +547,58 @@ test "a filing of nothing keeps nothing" {
   assert_eq(back.passes, [None, None]);
   assert_eq(back.seen, [false, false]);
   assert_eq(back.baselines, [None, None])
+}
+
+/// Calls on values: of a module's own type, and of a type another module declares, naming an
+/// argument, where a check of the caller against its imports places that module first.
+fn calling_on_values() -> List<{ path: String, body: Bytes }> =
+  [
+    {
+      path: "p/low.ply",
+      body: b"pub type T = | T(Int)\npub fn T::size(t: T) -> Int = match t { T(n) -> n }\npub fn T::scaled(t: T, by: Int = 2, plus: Int = 0) -> Int = t.size() * by + plus\n",
+    },
+    { path: "p/m.ply", body: b"import low\npub fn f(t: low::T) -> Int = t.scaled(plus: 3)\n" },
+    {
+      path: "p/solo.ply",
+      body: b"pub type U = | U(Int)\nfn U::size(u: U) -> Int = match u { U(n) -> n }\npub fn g(u: U) -> Int = u.size()\n",
+    },
+  ]
+
+test "a program filed read whole and filed from its modules' answers keeps one body under each hash" {
+  let tree = fs::mem_of(calling_on_values());
+  let listed = Bytes::concat_all(
+    queries().map(
+      |q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {Answering, abort.raise} }|
+        Bytes::concat_all([q.definition, b" ", hex(blake3(q.definition)), b"\n"]),
+    ),
+  );
+  let filed = handle {
+    match prepared[t]("p") {
+      Err(_) -> panic("the program is read"),
+      Ok(p) -> match ((assembled(p, answers_afresh[t](p), true), analysed(p.own.files).out)) {
+        (Ok(c), Analysed(w)) -> { answered: filed_bodies(c.hashes), whole: filed_bodies(w.hashes) },
+        _ -> panic("the program checks"),
+      },
+    }
+  } with {
+    fs.list_dir[t](path) -> fs::mem_list(tree, path),
+    fs.kind[t](path) -> fs::mem_kind(tree, path),
+    fs.read_file[t](path) -> fs::mem_read(tree, path),
+    shipped.names() -> [],
+    shipped.module(name) -> None,
+    shipped.reached(view, pulled) -> (),
+    shipped.answer(path, offset, len) -> None,
+    shipped.definitions() -> listed,
+    shipped.stamps() -> "",
+  };
+  assert(filed.whole.len() > 0 && filed.whole.len() == filed.answered.len());
+  let warned = on_twin(mem_empty(), || {
+    let c = kept_over[mem](
+      kept_over[mem](tables::open_cache[mem]("cache", built()), [], filed.answered),
+      [],
+      filed.whole,
+    );
+    tables::warnings(c).map(|w: Warning| w.message)
+  }).value;
+  assert_eq(warned, [])
 }
