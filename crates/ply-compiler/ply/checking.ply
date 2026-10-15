@@ -23,7 +23,8 @@ import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, Sh
                 hashes_bin, placed_bin, mention_bin, owner_read_bin, module_scope, owner_reads,
                 owner_mentions, owner_groups, group_needs, group_source_from, entry_head,
                 mention_key, unplaced_imports, laid_items, checked_owner, needed_through, head_of,
-                called_of, of_any, reaching, signing_read, call_cycles)
+                called_of, of_any, reaching, signing_read, owner_tokens, signing_tokens,
+                call_cycles)
 import owned
 import types (tables_joined)
 import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, ShippedData, Rows,
@@ -36,8 +37,8 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, Sh
               view_over, view_dump, faceted, dump_of, walked_facts_bin, squats, embedded_bin,
               shipped_data_bin, read_outline, named_imports, Outlined, OTest, OLaw, ShippedWants,
               shipped_wants_bin)
-import items (Module, Item, IType, ILaw, ImportDecl, INames, header, parse, import_decl_bin,
-              homes_called, homes_declaring, is_written)
+import items (Module, Item, IType, ILaw, ImportDecl, INames, header, parse, parse_started,
+              import_decl_bin, homes_called, homes_declaring, is_written)
 import derive (dotted)
 import diagnostics (ParsedSource, parse_all, parse_at, parse_from, placed)
 import interface (imported, blanked)
@@ -45,7 +46,8 @@ import embed (EmbedFile, EmbedRead, EmbedWant, ItemWants, embed_key, want_of_key
 import pkg (PackageSources, Judged, judged, judged_bin, placeless, place_token, package_sources_bin)
 import resolve (Source, ParsedModule, Diag, Label, backticked, diag_bin, error_at, import_binder,
                 path_span, import_module_name, source_bin, qualify)
-import parsing (Ident, Span, ParseDiag, span_bin, dummy_span)
+import parsing (Ident, Span, ParseDiag, ParseStart, span_bin, dummy_span, start)
+import lexer (Token)
 import infer (DefInfo, TestInfo, walk_order, Walks, Only)
 import hash (Fixed, FixedTest, FixedLaw, Fixing, NodeRef, Shapes, Shape, no_fixing, module_forms,
              hashed_forms, fixing_bin, shapes_bin, fixed_bin, pin_key, joined_forms)
@@ -180,9 +182,9 @@ pub fn decoding_once<a | e>(work: () -> a / {decode.read, decode.write | e}) -> 
     }
   }
 
-/// `source` parsed: as it is written, and as a check reads it.
-fn parsed(source: Source) -> ModuleParse / {abort.raise} = {
-  let read = parse(source.src);
+/// `source`, its parse begun as `s`, parsed: as it is written, and as a check reads it.
+fn parsed(source: Source, s: ParseStart) -> ModuleParse / {abort.raise} = {
+  let read = parse_started(s);
   { raw: read.node, given: parse_from(0, source, read) }
 }
 
@@ -191,8 +193,8 @@ fn parsed(source: Source) -> ModuleParse / {abort.raise} = {
 /// once, and a parse is most of what a run would hold of a module.
 fn parse_taken(named: Named, source: Source) -> ModuleParse / {decode.write, abort.raise} =
   match decode.take_parse(bin::encode(named, named_bin())) {
-    Some(p) -> if p.given.src == source.src { p } else { parsed(source) },
-    None -> parsed(source),
+    Some(p) -> if p.given.src == source.src { p } else { parsed(source, start(source.src)) },
+    None -> parsed(source, start(source.src)),
   }
 
 /// The context of the module `named` names, decoded once a run.
@@ -350,6 +352,7 @@ pub fn entry_query() -> Bytes = b"entry"
 /// entries it names.
 type ModuleRead = {
   source: Source,
+  tokens: List<Token>,
   raw: Module,
   parsed: ParsedModule,
   names: List<Bytes>,
@@ -381,7 +384,8 @@ fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, decode.write, a
     None -> None,
     Some(src) -> {
       let source = { name: module, src: src };
-      let read = parsed(source);
+      let lexed = start(src);
+      let read = parsed(source, lexed);
       // Held for the check of the module whole, which follows its read where it is checked whole.
       decode.hold_parse(bin::encode(asked, named_bin()), read);
       let raw = read.raw;
@@ -394,8 +398,9 @@ fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, decode.write, a
       let targets = raw.imports.map(|d: ImportDecl| target_of(module, shipped, prefix, package, d));
       let imported_there = targets.filter(|t: Named|
         if t.shipped { shipped_there(t.module) } else { placing_of(t.module) != None });
-      let homes = homes_called(module, src, || homes_declaring(shipped_text)).filter(|h: Bytes|
-        shipped_there(h) && !imported_there.any(|t: Named| t.module == h));
+      let homes = homes_called(module, lexed.input, || homes_declaring(shipped_text)).filter(
+        |h: Bytes| shipped_there(h) && !imported_there.any(|t: Named| t.module == h),
+      );
       let present = imported_there;
       // An import that names nothing is refused with the shipped modules there are.
       let unread = if present.len() == targets.len() { [] } else {
@@ -434,6 +439,7 @@ fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, decode.write, a
         });
       Some({
         source: source,
+        tokens: lexed.input.tokens,
         raw: raw,
         parsed: parsed,
         names: targets.map(|t: Named| t.module),
@@ -712,14 +718,20 @@ pub fn owners_answer(input: Bytes) -> Bytes / {memo.read, decode.write, abort.ra
       let scope = module_scope(m.parsed, m.raw, m.names);
       let reads = owner_reads(m.parsed, m.raw, m.source.src);
       let mentions = reads.fold(Map::new(), |acc: Map<Bytes, List<Mention>>, o: OwnerRead|
-        acc.insert(o.owner, owner_mentions(module, scope, o)));
+        acc.insert(
+          o.owner,
+          owner_mentions(module, scope, o, m.source.src, owner_tokens(m.tokens, o)),
+        ));
       let imported = resolved_imports(m);
       let items = wants_by_item(m.parsed.module);
       let shapes = reads.map(|o: OwnerRead| signing_read(m.raw, o));
-      let shape_mentions = shapes.fold(
+      let shape_mentions = range(0, reads.len()).fold(
         Map::new(),
-        |acc: Map<Bytes, List<Mention>>, o: OwnerRead|
-          acc.insert(o.owner, owner_mentions(module, scope, o)),
+        |acc: Map<Bytes, List<Mention>>, k: Int| {
+          let o = reads.get(k);
+          let lexed = signing_tokens(m.raw, m.tokens, o);
+          acc.insert(o.owner, owner_mentions(module, scope, shapes.get(k), m.source.src, lexed))
+        },
       );
       {
         found: true,
@@ -792,7 +804,7 @@ pub fn owners_answer(input: Bytes) -> Bytes / {memo.read, decode.write, abort.ra
           consts: [],
         },
         order: walk_order(m.parsed),
-        wanted: wanted_in(m.parsed, m.raw, m.source.src, m.names),
+        wanted: wanted_in(m.parsed, m.raw, m.source.src, m.tokens, m.names),
         // What the module publishes for each `opaque` type is its whole text's to say: a check of
         // the type's group alone sees only the functions that group reads.
         publishing: m.parsed.module.items.fold(
