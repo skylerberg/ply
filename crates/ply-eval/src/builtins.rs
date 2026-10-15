@@ -305,9 +305,6 @@ builtins! { $
     CryptoSign = "crypto_sign" (scheme, key, message) -> Raising;
     CryptoVerify = "crypto_verify" (scheme, public, message, signature) -> Raising;
     CryptoAgree = "crypto_agree" (scheme, key, peer) -> Raising;
-    /// Puts what `acquire` answered into a hold that is a cell of its region, inside the bracket's
-    /// own acquire, where a cancel takes no answer.
-    HoldPut = "?hold_put" (h, x) -> Word;
     /// `sqlite_run(image, sql, params, reads_only, strict, limits)`: one statement over the
     /// database an image holds, answering the image it leaves.
     SqliteRun = "sqlite_run" (image, sql, params, reads_only, strict, limits) -> Word;
@@ -544,7 +541,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::HoldGet
         | Builtin::HoldTake
         | Builtin::HoldBracket
-        | Builtin::HoldPut
         | Builtin::HandlerInit
         | Builtin::HandlerVar
         | Builtin::HandlerSet

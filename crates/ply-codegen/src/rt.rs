@@ -2799,17 +2799,6 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         (Builtin::Push, [xs, x]) if heap::kind(*xs) == KIND_LIST => {
             Some(ctx.heap.list_push(*xs, *x))
         }
-        // Cells hold heap words, so their contents never cross the seam.
-        (Builtin::HoldPut, [c, v]) => {
-            let slot = cell_of(*c)?;
-            let site = ctx.site();
-            let stored = ctx.cells.arena_mut().set(slot, HeldWord(*v));
-            heap::dec(*c);
-            if !stored {
-                return Some(ctx.fail(no_such_cell(site, slot)));
-            }
-            Some(heap::unit())
-        }
         (Builtin::HoldGet, [h]) if hold_object(*h).is_some() => {
             let o = hold_object(*h)?;
             let held = unsafe { word_at(o, CLOSURE_CAPTURES) };

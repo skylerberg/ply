@@ -817,7 +817,7 @@ pub fn cell_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Acc
         Builtin::HandlerVar => return var(Mode::Read),
         Builtin::HandlerSet => return var(Mode::Write),
         Builtin::HoldGet => Mode::Read,
-        Builtin::HoldTake | Builtin::HoldPut => Mode::Write,
+        Builtin::HoldTake => Mode::Write,
         _ => return None,
     };
     let Value::Cell(slot) = ctx.value(*args.first()?) else {
