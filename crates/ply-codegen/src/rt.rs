@@ -11,7 +11,7 @@ use crate::native::{Answered, Native, Raising, Signature};
 use crate::stack::{Stack, switch};
 use crate::{array, columns, list};
 use ply_eval::arena::{Owner, RegionId, Slot};
-use ply_eval::builtins::{cell_in_update, hold_released, no_such_cell};
+use ply_eval::builtins::{hold_released, no_such_cell};
 use ply_eval::region::StepSite;
 use ply_eval::sched::Shield;
 use ply_eval::sim::Access;
@@ -1467,23 +1467,6 @@ impl Ctx {
         }
     }
 
-    /// Whether a clause for any raise is in reach.
-    fn raise_in_reach(&self) -> bool {
-        let mut stack = Some(self.current);
-        while let Some(s) = stack {
-            let frames = &self.stacks[s];
-            if frames
-                .list
-                .iter()
-                .any(|f| f.clauses.iter().any(FrameClause::raises))
-            {
-                return true;
-            }
-            stack = frames.parent;
-        }
-        false
-    }
-
     /// How a finished branch failed, a raise bound past it as the failure it carries.
     pub(crate) fn take_branch_failure(&mut self) -> Option<(i64, Option<Diagnostic>)> {
         if self.failed == 0 {
@@ -2729,22 +2712,6 @@ fn cell_of(w: Word) -> Option<Slot> {
     }
 }
 
-/// The cell's contents, as a count of its own.
-fn cell_read(ctx: &Ctx, slot: Slot, what: &str) -> Result<Word, Diagnostic> {
-    let site = ctx.site();
-    let arena = ctx.cells.arena();
-    if arena.is_taken(slot) {
-        return Err(cell_in_update(site, slot, what));
-    }
-    match arena.get(slot) {
-        Some(held) => {
-            heap::inc(held.0);
-            Ok(held.0)
-        }
-        None => Err(no_such_cell(site, slot)),
-    }
-}
-
 /// What a hold holds, as a count of its own. A hold is a cell of its region, and one let go holds
 /// the null word, which no value is.
 fn hold_read(ctx: &Ctx, slot: Slot) -> Result<Word, Diagnostic> {
@@ -2833,55 +2800,15 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(ctx.heap.list_push(*xs, *x))
         }
         // Cells hold heap words, so their contents never cross the seam.
-        (Builtin::CellGet, [c]) => {
-            let slot = cell_of(*c)?;
-            let answer = match cell_read(ctx, slot, "cell_get") {
-                Ok(w) => w,
-                Err(d) => ctx.fail(d),
-            };
-            heap::dec(*c);
-            Some(answer)
-        }
-        (Builtin::CellSet | Builtin::HoldPut, [c, v]) => {
+        (Builtin::HoldPut, [c, v]) => {
             let slot = cell_of(*c)?;
             let site = ctx.site();
-            if ctx.cells.arena().is_taken(slot) {
-                heap::dec(*v);
-                heap::dec(*c);
-                return Some(ctx.fail(cell_in_update(site, slot, "cell_set")));
-            }
             let stored = ctx.cells.arena_mut().set(slot, HeldWord(*v));
             heap::dec(*c);
             if !stored {
                 return Some(ctx.fail(no_such_cell(site, slot)));
             }
             Some(heap::unit())
-        }
-        (Builtin::CellUpdate, [c, f]) => {
-            let slot = cell_of(*c)?;
-            let site = ctx.site();
-            if ctx.cells.arena().is_taken(slot) {
-                heap::dec(*f);
-                heap::dec(*c);
-                return Some(ctx.fail(cell_in_update(site, slot, "cell_update")));
-            }
-            let Some(current) = ctx.cells.arena_mut().take(slot) else {
-                heap::dec(*f);
-                heap::dec(*c);
-                return Some(ctx.fail(no_such_cell(site, slot)));
-            };
-            // A raise caught while the cell is still open must find it as it was, so with a clause
-            // for one in reach the contents are held twice, and `f` updates a copy.
-            let kept = ctx.raise_in_reach().then(|| current.clone());
-            let updated = call_value(std::ptr::from_mut(ctx), *f, &[current.into_word()]);
-            let held = match kept {
-                Some(old) if ctx.failed == FAILED_ABORT => old,
-                _ if ctx.failed != 0 => HeldWord::default(),
-                _ => HeldWord(updated),
-            };
-            ctx.cells.arena_mut().put_back(slot, held);
-            heap::dec(*c);
-            Some(if ctx.failed != 0 { 0 } else { heap::unit() })
         }
         (Builtin::HoldGet, [h]) if hold_object(*h).is_some() => {
             let o = hold_object(*h)?;

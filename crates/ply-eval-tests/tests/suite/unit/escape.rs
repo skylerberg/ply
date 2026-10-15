@@ -203,7 +203,7 @@ fn an_entry_points_answer_refuses_every_handle_and_lets_data_cross() {
 
 #[test]
 fn a_builtin_closure_carries_nothing() {
-    let value = Value::builtin(ply_eval::Builtin::CellGet);
+    let value = Value::builtin(ply_eval::Builtin::Len);
     assert_eq!(carries(&value), None);
 }
 
