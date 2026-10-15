@@ -1015,7 +1015,9 @@ fn merged<[r]>(
 /// copied into `dir`. The stamp the run names the pack and those files too, so a record kept over
 /// another pack or other files is checked before it is taken (`packs`). `covers` says which noted
 /// places the run's world looks at: the rest are not brought to what it holds, so a run that sees
-/// less of the world spoils nothing of what a run that sees more noted.
+/// less of the world spoils nothing of what a run that sees more noted. `commands` are the hashes
+/// the answers of the running `ply`'s own commands are kept under ([`memo::recorded`]), which a run
+/// that writes the store again keeps as it keeps the records of its own queries.
 pub fn kept<a, [r] | e>(
   dir: String,
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
@@ -1023,6 +1025,7 @@ pub fn kept<a, [r] | e>(
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_keep.read, memo_keep.write, abort.raise},
   covers: (Bytes, Bytes) -> Bool = |_: Bytes, _: Bytes| true,
+  commands: List<Bytes> = [],
 ) -> a / {fs.read[r], fs.write[r], abort.raise | e} = {
   let run = segments::entered[r](dir);
   let manifest = segments::manifest[r](dir, shapes());
@@ -1327,14 +1330,12 @@ pub fn kept<a, [r] | e>(
       }
     },
     memo_keep.keep(key, rec, output, lasting) -> {
-      st = if !lasting {
-        let o = keeping(st, key, rec, None, None);
-        { ..o, transient: o.transient.insert(rec.output, output) }
-      } else {
-        match kept_inline(output) {
-          Some(a) -> keeping(st, key, rec, Some(a), None),
-          None -> keeping(st, key, rec, None, Some(output)),
-        }
+      st = match kept_inline(output) {
+        Some(a) -> keeping(st, key, rec, Some(a), None),
+        None -> if lasting { keeping(st, key, rec, None, Some(output)) } else {
+          let o = keeping(st, key, rec, None, None);
+          { ..o, transient: o.transient.insert(rec.output, output) }
+        },
       };
     },
     // An answer its record holds is held by the record kept again.
@@ -1455,7 +1456,7 @@ pub fn kept<a, [r] | e>(
       st = {
         ..st,
         known: Map::new(),
-        own: queries.fold(Map::new(), |own: Map<Bytes, Bool>, q: Bytes|
+        own: queries.concat(commands).fold(Map::new(), |own: Map<Bytes, Bool>, q: Bytes|
           own.insert(q.blake3(), true)),
         stamp: packs::above(st.pack.index, stamp, world),
         trusted: match st.pack.index { Some(i) -> packs::stands(i, stamp, world), None -> false },
@@ -1958,6 +1959,42 @@ test "a store several `ply`s keep holds the one writing and as much again of the
   assert_eq(after(four, b"c").value, 0);
   assert_eq(after(four, b"b").value, 2);
   assert_eq(after(four, b"a").value, 2)
+}
+
+/// `output` kept in the store in `s` as a command's answer under the hash `p`, then `quoted` asked of a
+/// file holding `text` by a run writing the store again: each run counts `commands` as its own.
+/// Whether the command's answer is still kept.
+fn command_outlived<[r]>(
+  output: Bytes,
+  text: Bytes,
+  commands: List<Bytes>,
+) -> Bool / {fs.read[r], fs.write[r], abort.raise} = {
+  let queries = test_queries(b"");
+  let key = b"a command".blake3();
+  kept[r](
+    "s",
+    packs::no_pack,
+    b"",
+    |_: Bytes, _: Bytes| Some(text),
+    || memo::recorded(queries, key, b"p", [], output, []),
+    commands: commands,
+  );
+  kept[r](
+    "s",
+    packs::no_pack,
+    b"",
+    |_: Bytes, _: Bytes| Some(text),
+    || memo::ran_total(answer(queries, started(queries), b"quoted", b"a").run),
+    commands: commands,
+  );
+  record_at[r]("s", key) != None
+}
+
+test "a run writing the store again keeps its own commands' answers, whatever they hold" {
+  let output = b"answer ".repeat(1200);
+  let text = b"text ".repeat(600);
+  assert(fs::on_mem[abs](fs::mem_of([]), || command_outlived[abs](output, text, [b"p"])).value);
+  assert(!fs::on_mem[abs](fs::mem_of([]), || command_outlived[abs](output, text, [])).value)
 }
 
 test "a longer answer is kept once, and one that does not read costs its body once" {
