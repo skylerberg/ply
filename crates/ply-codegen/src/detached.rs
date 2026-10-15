@@ -3,8 +3,8 @@
 
 use crate::heap::{self, Word};
 use crate::rt::{
-    Ctx, FAILED_ABORT, FAILED_UNWIND, FrameClause, HandlerFrame, call_value, drop_frame,
-    release_vars, switch_keeping,
+    Args, Ctx, FAILED_ABORT, FAILED_UNWIND, FrameClause, HandlerFrame, StackCopy, call_value,
+    drop_frame, release_vars, switch_keeping,
 };
 use crate::stack::{Stack, switch};
 use ply_eval::arena::{Owner, Pin, RegionId};
@@ -40,11 +40,11 @@ pub struct Detached {
 struct Capture {
     sp: usize,
     floor: usize,
-    /// The bytes from `sp` to the top of the body's stack; `None` for a stop from a task's stack,
-    /// or where `once` says why a restore could not run again.
+    /// The bytes from `sp` to the top of the body's stack; `None` for a stop from a task's stack.
     bytes: Option<Vec<u8>>,
-    once: Option<Diagnostic>,
-    frames: Vec<HandlerFrame>,
+    /// What the stack held beside its bytes: its frames, what its runtime frames kept, and the
+    /// variables its running clauses hold.
+    stack: StackCopy,
     /// The snapshot's live heap words, held once for it and once more per restore.
     pins: Vec<Word>,
     /// With a snapshot, the regions open on the body's own stack at the stop, outermost first,
@@ -70,8 +70,6 @@ enum Stopped {
 }
 
 const ONE_SHOT: &str = "the region this continuation was captured in has already ended";
-
-const OWNED_ONCE: &str = "this continuation was captured while the runtime held memory of its own around a call into the program, so it resumes once";
 
 /// `rt_handle_detached`: runs the body on a fresh stack until it stops; answers the handle's value.
 pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, body: Word) -> Word {
@@ -210,11 +208,7 @@ pub(crate) unsafe fn resume(
                 return c.fail(dg);
             }
             if !restore(c, id, k) {
-                let site = c.site();
-                let dg = match c.detached[id].captures[k].once.clone() {
-                    Some(once) => once.primary(site, "resumed again here"),
-                    None => Diagnostic::error(codes::TASK_ESCAPES_SCOPE, ONE_SHOT),
-                };
+                let dg = Diagnostic::error(codes::TASK_ESCAPES_SCOPE, ONE_SHOT);
                 return c.fail(dg);
             }
         }
@@ -271,8 +265,10 @@ pub(crate) unsafe fn resume(
             // from what the clause holds, whatever an earlier one did to the body's.
             let frames = c.detached[id].frames;
             let held = c.stacks[frames].list.first().and_then(|f| f.vars_copied());
-            let _owning = crate::rt::Owning::on(ctx);
-            Ctx::holding(ctx, held, || call_value(ctx, closure, &args))
+            let call = Args::of(c, args);
+            let r = Ctx::holding(ctx, held, || call_value(ctx, closure, call.words()));
+            call.release();
+            r
         }
         Some(Stopped::Finished(v)) => {
             finish(c, id);
@@ -329,16 +325,7 @@ fn capture_stop(c: &mut Ctx, id: usize) -> usize {
     } else {
         None
     };
-    let owning = c.stacks[own].owning > 0;
-    let once = match (live, owning) {
-        (None, _) => None,
-        (Some(_), true) => Some(Diagnostic::error(codes::RUNTIME_ERROR, OWNED_ONCE).note(
-            "as inside a clause or a `return` clause of a `handle` the body opened, or a `bracket`'s release during a raise",
-        )),
-        (Some(_), false) => None,
-    };
-    let live = live.filter(|_| !owning);
-    let (bytes, frames, pins, regions) = if let Some(live) = live {
+    let (bytes, stack, pins, regions) = if let Some(live) = live {
         let bytes = live.to_vec();
         let mut pins = Vec::new();
         for chunk in bytes.chunks_exact(8) {
@@ -348,10 +335,12 @@ fn capture_stop(c: &mut Ctx, id: usize) -> usize {
                 pins.push(w);
             }
         }
-        let frames = crate::rt::clone_frames(&c.stacks[own].list);
-        (Some(bytes), frames, pins, pin_open(c, own))
+        let s = &c.stacks[own];
+        let stack = StackCopy::of(&s.list, &s.kept, &s.held);
+        (Some(bytes), stack, pins, pin_open(c, own))
     } else {
-        (None, Vec::new(), Vec::new(), Vec::new())
+        let empty = StackCopy::of(&[], &[], &[]);
+        (None, empty, Vec::new(), Vec::new())
     };
     let born = c.host_ops;
     let d = &mut c.detached[id];
@@ -359,8 +348,7 @@ fn capture_stop(c: &mut Ctx, id: usize) -> usize {
         sp,
         floor,
         bytes,
-        once,
-        frames,
+        stack,
         pins,
         regions,
         born,
@@ -403,11 +391,16 @@ fn restore(c: &mut Ctx, id: usize, k: usize) -> bool {
     for w in &d.captures[k].pins {
         heap::inc(*w);
     }
-    let frames = crate::rt::clone_frames(&d.captures[k].frames);
+    let captured = &d.captures[k].stack;
+    let copy = StackCopy::of(&captured.list, &captured.kept, &captured.held);
     let (own, sp, floor) = (d.frames, d.captures[k].sp, d.captures[k].floor);
-    for f in std::mem::replace(&mut c.stacks[own].list, frames) {
-        drop_frame(f);
+    let s = &mut c.stacks[own];
+    StackCopy {
+        list: std::mem::replace(&mut s.list, copy.list),
+        kept: std::mem::replace(&mut s.kept, copy.kept),
+        held: std::mem::replace(&mut s.held, copy.held),
     }
+    .release();
     // The restored frames close the regions open at the stop, so those go back on, over nothing
     // the stack still holds.
     c.release_regions(own);

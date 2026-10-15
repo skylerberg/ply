@@ -476,28 +476,27 @@ fn ada() -> String =
 fn accepted() -> Bytes / {abort.raise} = answer(post(ada()), Bytes::of_string(ada()))
 
 test "the simulated socket carries a posted order to its receipt" {
-  with_cell[inbox]([request_bytes(ada())]) { inbox -> {
-    with_cell[outbox]([]) { outbox -> {
-      handle {
-        assert_eq(listen_and_serve(0, 1), 1)
-      } with {
-        net.listen[listener](p) -> 1,
-        net.accept[listener](l) -> 7,
-        net.close[listener](l) -> (),
-        net.recv[conn](c, max, timeout_ms) -> {
-          let queued = cell_get(inbox);
-          cell_set(inbox, later_chunks(queued));
-          Some(first_chunk(queued))
-        },
-        net.send[conn](c, payload, timeout_ms) -> {
-          cell_set(outbox, cell_get(outbox).push(payload));
-          Some(payload.len())
-        },
-        net.close[conn](c) -> (),
-      };
-      assert_eq(cell_get(outbox), [accepted()])
-    } }
-  } }
+  let outbox = handle {
+    assert_eq(listen_and_serve(0, 1), 1)
+  } with {
+    var inbox = [request_bytes(ada())],
+    var outbox = [],
+    net.listen[listener](p) -> 1,
+    net.accept[listener](l) -> 7,
+    net.close[listener](l) -> (),
+    net.recv[conn](c, max, timeout_ms) -> {
+      let queued = inbox;
+      inbox = later_chunks(queued);
+      Some(first_chunk(queued))
+    },
+    net.send[conn](c, payload, timeout_ms) -> {
+      outbox = outbox.push(payload);
+      Some(payload.len())
+    },
+    net.close[conn](c) -> (),
+    return u -> outbox,
+  };
+  assert_eq(outbox, [accepted()])
 }
 
 // The case a single `recv` would have passed and a real network would have failed: the head and the
@@ -506,118 +505,112 @@ test "a request whose body arrives after its head is read whole" {
   let whole = request_bytes(ada());
   let cut1 = 40;
   let cut2 = whole.len() - 12;
-  with_cell[inbox]([whole.slice(0, cut1), whole.slice(cut1, cut2), whole.slice(cut2, whole.len())]) { inbox -> {
-    with_cell[outbox]([]) { outbox -> {
-      handle {
-        serve_one(3)
-      } with {
-        net.recv[conn](c, max, timeout_ms) -> {
-          let queued = cell_get(inbox);
-          cell_set(inbox, later_chunks(queued));
-          Some(first_chunk(queued))
-        },
-        net.send[conn](c, payload, timeout_ms) -> {
-          cell_set(outbox, cell_get(outbox).push(payload));
-          Some(payload.len())
-        },
-        net.close[conn](c) -> (),
-      };
-      assert_eq(cell_get(outbox), [accepted()]);
-      assert_eq(cell_get(inbox), [])
-    } }
-  } }
+  let got = handle {
+    serve_one(3)
+  } with {
+    var inbox = [whole.slice(0, cut1), whole.slice(cut1, cut2), whole.slice(cut2, whole.len())],
+    var outbox = [],
+    net.recv[conn](c, max, timeout_ms) -> {
+      let queued = inbox;
+      inbox = later_chunks(queued);
+      Some(first_chunk(queued))
+    },
+    net.send[conn](c, payload, timeout_ms) -> {
+      outbox = outbox.push(payload);
+      Some(payload.len())
+    },
+    net.close[conn](c) -> (),
+    return u -> { inbox: inbox, outbox: outbox },
+  };
+  assert_eq(got.outbox, [accepted()]);
+  assert_eq(got.inbox, [])
 }
 
 // The body is already in hand after the head, so nothing is read for it.
 test "a request that arrives in one packet costs exactly one read" {
-  with_cell[reads](0) { reads -> {
-    with_cell[outbox]([]) { outbox -> {
-      handle {
-        serve_one(3)
-      } with {
-        net.recv[conn](c, max, timeout_ms) -> {
-          cell_set(reads, cell_get(reads) + 1);
-          if cell_get(reads) == 1 { Some(request_bytes(ada())) } else { Some(b"") }
-        },
-        net.send[conn](c, payload, timeout_ms) -> {
-          cell_set(outbox, cell_get(outbox).push(payload));
-          Some(payload.len())
-        },
-        net.close[conn](c) -> (),
-      };
-      assert_eq(cell_get(reads), 1);
-      assert_eq(cell_get(outbox), [accepted()])
-    } }
-  } }
+  let got = handle {
+    serve_one(3)
+  } with {
+    var reads = 0,
+    var outbox = [],
+    net.recv[conn](c, max, timeout_ms) -> {
+      reads = reads + 1;
+      if reads == 1 { Some(request_bytes(ada())) } else { Some(b"") }
+    },
+    net.send[conn](c, payload, timeout_ms) -> {
+      outbox = outbox.push(payload);
+      Some(payload.len())
+    },
+    net.close[conn](c) -> (),
+    return u -> { reads: reads, outbox: outbox },
+  };
+  assert_eq(got.reads, 1);
+  assert_eq(got.outbox, [accepted()])
 }
 
 test "a peer that says nothing is answered rather than waited on" {
-  with_cell[outbox]([]) { outbox -> {
-    handle {
-      serve_one(3)
-    } with {
-      net.recv[conn](c, max, timeout_ms) -> Some(b""),
-      net.send[conn](c, payload, timeout_ms) -> {
-        cell_set(outbox, cell_get(outbox).push(payload));
-        Some(payload.len())
-      },
-      net.close[conn](c) -> (),
-    };
-    assert_eq(cell_get(outbox), [
-      respond(
-        "400 Bad Request",
-        json::encode_bytes(Rejected("the request head never ended"), reply_json()),
-      ),
-    ])
-  } }
+  let outbox = handle {
+    serve_one(3)
+  } with {
+    var outbox = [],
+    net.recv[conn](c, max, timeout_ms) -> Some(b""),
+    net.send[conn](c, payload, timeout_ms) -> {
+      outbox = outbox.push(payload);
+      Some(payload.len())
+    },
+    net.close[conn](c) -> (),
+    return u -> outbox,
+  };
+  assert_eq(outbox, [
+    respond(
+      "400 Bad Request",
+      json::encode_bytes(Rejected("the request head never ended"), reply_json()),
+    ),
+  ])
 }
 
 // A client that promises more body than it sends.
 test "a body shorter than its Content-Length is refused rather than decoded" {
-  with_cell[reads](0) { reads -> {
-    with_cell[outbox]([]) { outbox -> {
-      handle {
-        serve_one(3)
-      } with {
-        net.recv[conn](c, max, timeout_ms) -> {
-          cell_set(reads, cell_get(reads) + 1);
-          if cell_get(reads) == 1 { Some(post(ada()).concat(Bytes::of_string("{\"customer\""))) }
-          else { Some(b"") }
-        },
-        net.send[conn](c, payload, timeout_ms) -> {
-          cell_set(outbox, cell_get(outbox).push(payload));
-          Some(payload.len())
-        },
-        net.close[conn](c) -> (),
-      };
-      assert_eq(cell_get(outbox), [
-        respond(
-          "400 Bad Request",
-          json::encode_bytes(
-            Rejected("the body was shorter than its `Content-Length`"),
-            reply_json(),
-          ),
-        ),
-      ])
-    } }
-  } }
+  let outbox = handle {
+    serve_one(3)
+  } with {
+    var reads = 0,
+    var outbox = [],
+    net.recv[conn](c, max, timeout_ms) -> {
+      reads = reads + 1;
+      if reads == 1 { Some(post(ada()).concat(Bytes::of_string("{\"customer\""))) }
+      else { Some(b"") }
+    },
+    net.send[conn](c, payload, timeout_ms) -> {
+      outbox = outbox.push(payload);
+      Some(payload.len())
+    },
+    net.close[conn](c) -> (),
+    return u -> outbox,
+  };
+  assert_eq(outbox, [
+    respond(
+      "400 Bad Request",
+      json::encode_bytes(Rejected("the body was shorter than its `Content-Length`"), reply_json()),
+    ),
+  ])
 }
 
 test "each accepted connection is answered exactly once" {
-  with_cell[outbox]([]) { outbox -> {
-    handle {
-      assert_eq(listen_and_serve(0, 3), 3)
-    } with {
-      net.listen[listener](p) -> 1,
-      net.accept[listener](l) -> 7,
-      net.close[listener](l) -> (),
-      net.recv[conn](c, max, timeout_ms) -> Some(request_bytes(ada())),
-      net.send[conn](c, payload, timeout_ms) -> {
-        cell_set(outbox, cell_get(outbox).push(payload));
-        Some(payload.len())
-      },
-      net.close[conn](c) -> (),
-    };
-    assert_eq(cell_get(outbox), [accepted(), accepted(), accepted()])
-  } }
+  let outbox = handle {
+    assert_eq(listen_and_serve(0, 3), 3)
+  } with {
+    var outbox = [],
+    net.listen[listener](p) -> 1,
+    net.accept[listener](l) -> 7,
+    net.close[listener](l) -> (),
+    net.recv[conn](c, max, timeout_ms) -> Some(request_bytes(ada())),
+    net.send[conn](c, payload, timeout_ms) -> {
+      outbox = outbox.push(payload);
+      Some(payload.len())
+    },
+    net.close[conn](c) -> (),
+    return u -> outbox,
+  };
+  assert_eq(outbox, [accepted(), accepted(), accepted()])
 }

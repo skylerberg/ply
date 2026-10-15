@@ -209,15 +209,21 @@ impl Heap {
 
     /// `xs` with `x` appended. Takes both; an unshared list grows in place.
     pub fn list_push(&mut self, xs: Word, x: Word) -> Word {
-        let mut o = obj(xs);
-        let n = tail_len(o);
         // The machine's reuse counters, which `ply run --json` reports.
         let in_place = is_unique(xs);
         ply_eval::rc::note_update_of(
             in_place,
-            if in_place { 0 } else { n },
+            if in_place { 0 } else { tail_len(obj(xs)) },
             ply_eval::Span::DUMMY,
         );
+        self.list_grown(xs, x)
+    }
+
+    /// `list_push` as the runtime gathers a list itself: no update the program wrote, so the
+    /// reuse counters are not told.
+    pub fn list_grown(&mut self, xs: Word, x: Word) -> Word {
+        let mut o = obj(xs);
+        let n = tail_len(o);
         if !is_unique(xs) || (n == cap(o) && n < WIDTH) {
             let room = if n == cap(o) {
                 (cap(o) * 2).min(WIDTH)

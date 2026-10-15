@@ -161,7 +161,6 @@ builtins! { $
     MapOfEntries = "Map::of_entries" (es) -> Word;
     MapMerge = "Map::merge" (a, b) -> Word;
     MapFold = "Map::fold" (m, init, f) -> Word;
-    /// `CellUpdate`'s shape over one map entry.
     MapUpdate = "Map::update" (m, key, f) -> Word;
     DecimalDiv = "Decimal::div" (a, b, scale, mode) -> Raising;
     DecimalRound = "Decimal::round" (d, scale, mode) -> Raising;
@@ -180,10 +179,6 @@ builtins! { $
     Compare = "compare" (x, y) -> Word;
     /// The same order as [`Builtin::Compare`], under a name a module may not declare.
     CompareValues = "compare_values" (x, y) -> Word;
-    CellGet = "cell_get" (c) -> Word;
-    CellSet = "cell_set" (c, v) -> Word;
-    /// Takes the contents out for the call, so an append inside the function owns them.
-    CellUpdate = "cell_update" (c, f) -> Word;
     Panic = "panic" (message) -> Raising;
     /// The identity a benchmark pins a measured value with: opaque, so it is not optimized away.
     Observe = "observe" (value) -> Word;
@@ -310,10 +305,6 @@ builtins! { $
     CryptoSign = "crypto_sign" (scheme, key, message) -> Raising;
     CryptoVerify = "crypto_verify" (scheme, public, message, signature) -> Raising;
     CryptoAgree = "crypto_agree" (scheme, key, peer) -> Raising;
-    /// [`Builtin::CellSet`] under a name no module rebinds: the lowering of `with_hold` puts what
-    /// `acquire` answered into the hold inside the bracket's own acquire, where a cancel takes no
-    /// answer.
-    HoldPut = "?hold_put" (h, x) -> Word;
     /// `sqlite_run(image, sql, params, reads_only, strict, limits)`: one statement over the
     /// database an image holds, answering the image it leaves.
     SqliteRun = "sqlite_run" (image, sql, params, reads_only, strict, limits) -> Word;
@@ -330,6 +321,9 @@ builtins! { $
     HandlerVar = "?handler_var" (i) -> Word;
     /// Variable `i` of the handler whose clause runs, given a new value.
     HandlerSet = "?handler_set" (i, x) -> Word;
+    /// A hold of what it is given, which a bracket's release lets go. No source can spell it; the
+    /// lowering of `with_hold` writes it.
+    HoldNew = "?hold_new" (x) -> Word;
 }
 
 impl Builtin {
@@ -543,17 +537,14 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::BytesPosition
         | Builtin::MapUpdate
         | Builtin::MapFold
-        | Builtin::CellGet
-        | Builtin::CellSet
-        | Builtin::CellUpdate
         | Builtin::Bracket
         | Builtin::HoldGet
         | Builtin::HoldTake
         | Builtin::HoldBracket
-        | Builtin::HoldPut
         | Builtin::HandlerInit
         | Builtin::HandlerVar
-        | Builtin::HandlerSet => Err(answered_by_the_backend(b, span)),
+        | Builtin::HandlerSet
+        | Builtin::HoldNew => Err(answered_by_the_backend(b, span)),
 
         Builtin::Range => {
             let lo = args[0].as_int(span, "`range`")?;
@@ -1890,18 +1881,6 @@ pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
         Some(other) => diag.note(slot(0)).showing(vec![Plain::shown(other)]),
         None => diag,
     }
-}
-
-#[cold]
-#[inline(never)]
-pub fn cell_in_update(span: Span, slot: Slot, what: &str) -> Diagnostic {
-    Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("`{what}` reached cell {slot} while a `cell_update` holds its contents"),
-    )
-    .primary(span, "the cell is being updated here")
-    .note("`cell_update` takes the contents out of the region for the length of its function, so nothing can read or write them until it stores the answer")
-    .note("perform the read or write after the update, or outside the function you pass to it")
 }
 
 /// A cell whose region has closed.

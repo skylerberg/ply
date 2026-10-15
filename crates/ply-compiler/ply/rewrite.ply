@@ -14,11 +14,10 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               SCost, SSpace, EffectSetDef, ImportDecl, ImportKind, INames, Binder, OpDef, EffectDef,
               TestDef, SchemaDef, schema_guard_name, parse, dump_module, TDNominal, TDExtern)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
-              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
-              ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign,
-              HandlerVar, Param, NamedArg, MatchArm, HandleClause, ReturnClause, RecField,
-              expr_span, ETagged, Tagged, tagged_call, tagged_fill, Hole, with_hole_values, slotted,
-              slot_args)
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
+              EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign, HandlerVar, Param,
+              NamedArg, MatchArm, HandleClause, ReturnClause, RecField, expr_span, ETagged, Tagged,
+              tagged_call, tagged_fill, Hole, with_hole_values, slotted, slot_args)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PRange, PBad, Lit, LUnit,
                  LInt, LStr)
 import std.bytes (ascii_of_int)
@@ -48,7 +47,6 @@ pub fn is_pure(e: Expr) -> Bool =
     EApp(_) -> false,
     EPerform(_) -> false,
     EHandle(_) -> false,
-    EWithCell(_) -> false,
     EWithHold(_) -> false,
     ESimulate(_) -> false,
     EParallel(v) -> v.branches.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
@@ -198,14 +196,6 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
             params: c.params,
           }),
         vars: h.vars.map(|v: HandlerVar| { ..v, init: go(v.init) }),
-      }),
-    EWithCell(c) ->
-      EWithCell({
-        span: c.span,
-        resource: c.resource,
-        init: go(c.init),
-        binder: c.binder,
-        body: go(c.body),
       }),
     EWithHold(c) ->
       EWithHold({ ..c, acquire: go(c.acquire), release: go(c.release), body: go(c.body) }),
@@ -477,7 +467,6 @@ fn picked(e: Expr, wanted: (Expr) -> Bool, found: List<Expr>) -> List<Expr> = {
       );
       match h.ret { None -> clauses, Some(rc) -> picked(rc.body, wanted, clauses) }
     },
-    EWithCell(c) -> picked(c.body, wanted, picked(c.init, wanted, out)),
     EWithHold(c) ->
       picked(c.body, wanted, picked(c.release, wanted, picked(c.acquire, wanted, out))),
     ESimulate(x) -> picked(x.body, wanted, out),
@@ -628,7 +617,7 @@ pub fn elaborated_natives() -> List<Elaborated> =
     { name: b"?numeric_unary", words: 3, raises: false },
     { name: b"?hold_take", words: 1, raises: false },
     { name: b"?hold_bracket", words: 3, raises: false },
-    { name: b"?hold_put", words: 2, raises: false },
+    { name: b"?hold_new", words: 1, raises: false },
     { name: b"?handler_init", words: 2, raises: false },
     { name: b"?handler_var", words: 1, raises: false },
     { name: b"?handler_set", words: 2, raises: false },
@@ -812,10 +801,10 @@ pub fn expand_try_blocks(module: Module, answered: Map<Bytes, Answered>) -> Modu
   }
 
 // --- The hold --------------------------------------------------------------------------------
-// `with_hold[r](acquire, release) { h -> body }` is a cell of region `r` around a bracket: the
-// bracket's acquire runs `acquire` and puts what it answered into the cell, so a cancel takes no
-// answer from it, and its release takes that out of the cell and hands it to `release`. The
-// builtins it calls have names no source can spell, so no module rebinds them.
+// `with_hold[r](acquire, release) { h -> body }` is a bracket whose acquire runs `acquire` and makes
+// a hold of what it answered, so a cancel takes no answer from it, and whose release takes that out
+// of the hold and hands it to `release`; the hold is the body's `h`. The builtins it calls have
+// names no source can spell, so no module rebinds them.
 
 fn unwritten_param(name: Bytes, span: Span) -> Param =
   { name: { name: name, span: span }, keep: false, ty: None, cost: None, default: None, span: span }
@@ -840,25 +829,26 @@ fn expanded_hold(expr: Expr) -> Expr =
       let bound = |name: Ident, value: Expr|
         SLet({ span: h.span, pat: var_pattern(name), ty: None, value: value });
       let acquired = EApp({ span: h.span, func: var_of(acquire), named: [], args: [], labels: [] });
-      let region = EWithCell({
-        span: h.span,
-        resource: h.resource,
-        init: ELit({ span: h.span, lit: LUnit }),
-        binder: h.binder,
-        body: hidden_call(h.span, b"?hold_bracket", [
-          thunk(
-            EBlock({
-              span: h.span,
-              tail: Some(var_of(h.binder)),
-              stmts: [SExpr(hidden_call(h.span, b"?hold_put", [var_of(h.binder), acquired]))],
-            }),
-          ),
-          over_held(
-            applied_to(var_of(release), hidden_call(h.span, b"?hold_take", [var_of(held)]), h.span),
-          ),
-          over_held(h.body),
-        ]),
+      // The hold is a word of no type the checker filed, so its call sits at no place in the source.
+      let made = EApp({
+        span: dummy_span(),
+        func: EVar({ span: dummy_span(), name: bare({ name: b"?hold_new", span: dummy_span() }) }),
+        named: [],
+        args: [acquired],
+        labels: [],
       });
+      let region = hidden_call(h.span, b"?hold_bracket", [
+        thunk(made),
+        over_held(
+          applied_to(var_of(release), hidden_call(h.span, b"?hold_take", [var_of(held)]), h.span),
+        ),
+        ELambda({
+          span: h.span,
+          body: h.body,
+          params: [unwritten_param(h.binder.name, h.binder.span)],
+          ret: None,
+        }),
+      ]);
       // `acquire` and `release` are written outside the hold's binder, so they are bound outside
       // it: a name either shares with the binder is the one around the region.
       EBlock({
@@ -1018,7 +1008,6 @@ fn in_clause(held: Held, e: Expr) -> Expr =
       EHandle(_) -> snapshot(held, e),
       ESimulate(_) -> snapshot(held, e),
       EParallel(_) -> snapshot(held, e),
-      EWithCell(_) -> snapshot(held, e),
       EWithHold(_) -> snapshot(held, e),
       ETryBlock(_) -> snapshot(held, e),
       EBlock(b) -> {
@@ -1276,11 +1265,6 @@ fn renamed_free(e: Expr, from: Bytes, to: Bytes) -> Renamed = {
           || ret.hit,
       }
     },
-    EWithCell(c) -> {
-      let i = go(c.init);
-      let b = under([c.binder.name], c.body);
-      { e: EWithCell({ ..c, init: i.e, body: b.e }), hit: i.hit || b.hit }
-    },
     EWithHold(c) -> {
       let a = go(c.acquire);
       let r = go(c.release);
@@ -1390,7 +1374,7 @@ fn renamed_fields(
   }
 }
 
-/// Every `with_hold` of a module replaced by the cell and the bracket it stands for.
+/// Every `with_hold` of a module replaced by the bracket it stands for.
 pub fn expand_holds(module: Module) -> Module =
   if !any_expr(module, is_hold) { module }
   else { { ..module, items: module.items.map(|item: Item| map_item(item, expanded_hold)) } }
@@ -1830,8 +1814,8 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
         _ -> { state: o.state, scan: purity(t.holes.len() == 0), expr: rebuilt },
       }
     },
-    // A nested block is not entered; a lambda, handler, cell, region, `simulate` or `parallel` is a
-    // barrier to `?`.
+    // A nested block is not entered; a lambda, handler, region, `simulate` or `parallel` is a barrier
+    // to `?`.
     _ -> { state: state, scan: purity(is_pure(expr)), expr: expr },
   }
 
@@ -2488,20 +2472,6 @@ fn sweep_inner(
         }),
       }
     },
-    EWithCell(c) -> {
-      let i = sweep_within(state, c.init, scope, barrier, room);
-      let b = sweep_within(i.state, c.body, scope, under(barrier, b"a `with_cell` body"), room);
-      {
-        state: b.state,
-        expr: EWithCell({
-          span: c.span,
-          resource: c.resource,
-          init: i.expr,
-          binder: c.binder,
-          body: b.expr,
-        }),
-      }
-    },
     EWithHold(c) -> {
       let a = sweep_within(state, c.acquire, scope, barrier, room);
       let r = sweep_within(
@@ -2772,7 +2742,6 @@ fn count_in(e: Expr, p: (Expr) -> Bool) -> Int = {
         count_in(h.body, p) + h.clauses.fold(0, |n: Int, c: HandleClause| n + count_in(c.body, p))
           + (match h.ret { None -> 0, Some(rc) -> count_in(rc.body, p) })
           + h.vars.fold(0, |n: Int, v: HandlerVar| n + count_in(v.init, p)),
-      EWithCell(c) -> count_in(c.init, p) + count_in(c.body, p),
       EWithHold(c) -> count_in(c.acquire, p) + count_in(c.release, p) + count_in(c.body, p),
       ESimulate(x) -> count_in(x.body, p),
       EParallel(x) -> all(x.branches),

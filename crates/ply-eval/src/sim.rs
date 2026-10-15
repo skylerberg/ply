@@ -161,6 +161,11 @@ pub enum Access {
         at: u32,
         mode: Mode,
     },
+    /// A hold was read or let go; `id` numbers it among the entry's holds.
+    Hold {
+        id: u64,
+        mode: Mode,
+    },
 }
 
 impl Access {
@@ -188,6 +193,9 @@ impl Access {
                     mode: mb,
                 },
             ) => a == b && i == j && (*ma == Mode::Write || *mb == Mode::Write),
+            (Access::Hold { id: a, mode: ma }, Access::Hold { id: b, mode: mb }) => {
+                a == b && (*ma == Mode::Write || *mb == Mode::Write)
+            }
             _ => false,
         }
     }
@@ -202,6 +210,7 @@ impl fmt::Display for Access {
             Access::Var { handler, at, mode } => {
                 write!(f, "var.{}[{handler}.{at}]", mode.as_str())
             }
+            Access::Hold { id, mode } => write!(f, "hold.{}[{id}]", mode.as_str()),
         }
     }
 }

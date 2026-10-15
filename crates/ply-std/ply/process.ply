@@ -313,44 +313,52 @@ pub fn over<a, [p] | e>(
   c: Captured,
   go: () -> a / {process.args[p], process.out[p], process.err[p], process.out_bytes[p], process.err_bytes[p], process.flush[p], process.line[p], process.in_bytes[p], process.exit[p] | e},
 ) -> Over<a> / {abort.raise | e} =
-  with_cell[process_twin](c) { io -> {
-    let lined = |stream: Stream, after: Captured| {
-      let gone = reader_gone(cell_get(io), stream);
-      cell_set(io, if gone { exit_step(cell_get(io), broken_pipe_status()) } else { after });
-      !gone
-    };
-    let wrote = |w: Wrote| {
-      cell_set(io, w.captured);
+  handle {
+    go()
+  } with {
+    var io = c,
+    process.args[p]() -> args_step(io),
+    process.out[p](text) resume k -> {
+      let l = lined(io, Stdout, out_step(io, text));
+      io = l.io;
+      if l.ok { k(()) } else { { value: None, captured: io } }
+    },
+    process.err[p](text) resume k -> {
+      let l = lined(io, Stderr, err_step(io, text));
+      io = l.io;
+      if l.ok { k(()) } else { { value: None, captured: io } }
+    },
+    process.out_bytes[p](bytes) -> {
+      let w = out_bytes_step(io, bytes);
+      io = w.captured;
       w.taken
-    };
-    let value = handle {
-      Some(go())
-    } with {
-      process.args[p]() -> args_step(cell_get(io)),
-      process.out[p](text) resume k -> if lined(Stdout, out_step(cell_get(io), text)) { k(()) }
-      else { None },
-      process.err[p](text) resume k -> if lined(Stderr, err_step(cell_get(io), text)) { k(()) }
-      else { None },
-      process.out_bytes[p](bytes) -> wrote(out_bytes_step(cell_get(io), bytes)),
-      process.err_bytes[p](bytes) -> wrote(err_bytes_step(cell_get(io), bytes)),
-      process.flush[p]() -> flush_step(cell_get(io)),
-      process.line[p]() -> {
-        let read = line_step(cell_get(io));
-        cell_set(io, read.captured);
-        read.line
-      },
-      process.in_bytes[p](max) -> {
-        let read = in_bytes_step(cell_get(io), max);
-        cell_set(io, read.captured);
-        read.bytes
-      },
-      process.exit[p](code) resume k -> {
-        cell_set(io, exit_step(cell_get(io), code));
-        None
-      },
-    };
-    { value: value, captured: cell_get(io) }
-  } }
+    },
+    process.err_bytes[p](bytes) -> {
+      let w = err_bytes_step(io, bytes);
+      io = w.captured;
+      w.taken
+    },
+    process.flush[p]() -> flush_step(io),
+    process.line[p]() -> {
+      let read = line_step(io);
+      io = read.captured;
+      read.line
+    },
+    process.in_bytes[p](max) -> {
+      let read = in_bytes_step(io, max);
+      io = read.captured;
+      read.bytes
+    },
+    process.exit[p](code) resume k -> { value: None, captured: exit_step(io, code) },
+    return value -> { value: Some(value), captured: io },
+  }
+
+/// `after`, what a line written to `stream` of `io` leaves, where its reader is there to take it;
+/// else `io` ended with a broken pipe.
+fn lined(io: Captured, stream: Stream, after: Captured) -> { io: Captured, ok: Bool } = {
+  let gone = reader_gone(io, stream);
+  { io: if gone { exit_step(io, broken_pipe_status()) } else { after }, ok: !gone }
+}
 
 /// What one spawn or start asked for. The executable is not here: the label names it, and the host
 /// binds that.
@@ -531,39 +539,47 @@ fn greet_all() -> Unit / {process.args[proc], process.out[proc], process.err[pro
 }
 
 test "a handled program's lines arrive in order, on the stream each was written to" {
-  with_cell[twin](captured(["ada", "bob"])) { s -> {
-    handle {
-      greet_all()
-    } with {
-      process.args[proc]() -> args_step(cell_get(s)),
-      process.out[proc](t) -> cell_set(s, out_step(cell_get(s), t)),
-      process.err[proc](t) -> cell_set(s, err_step(cell_get(s), t)),
-      process.exit[proc](c) -> cell_set(s, exit_step(cell_get(s), c)),
-    };
-    let c = cell_get(s);
-    assert_eq(c.out, ["hello ada", "hello bob"]);
-    assert_eq(c.err, []);
-    assert_eq(c.code, Some(0))
-  } }
+  let c = handle {
+    greet_all()
+  } with {
+    var s = captured(["ada", "bob"]),
+    process.args[proc]() -> args_step(s),
+    process.out[proc](t) -> {
+      s = out_step(s, t);
+    },
+    process.err[proc](t) -> {
+      s = err_step(s, t);
+    },
+    process.exit[proc](c) -> {
+      s = exit_step(s, c);
+    },
+    return u -> s,
+  };
+  assert_eq(c.out, ["hello ada", "hello bob"]);
+  assert_eq(c.err, []);
+  assert_eq(c.code, Some(0))
 }
 
 // Dropping the continuation ends the program at the exit, as the host does.
 test "an exit clause without a resume ends the program there" {
-  with_cell[twin](captured([])) { s -> {
-    handle {
-      greet_all();
-      process.out[proc]("after the exit")
-    } with {
-      process.args[proc]() -> args_step(cell_get(s)),
-      process.out[proc](t) -> cell_set(s, out_step(cell_get(s), t)),
-      process.err[proc](t) -> cell_set(s, err_step(cell_get(s), t)),
-      process.exit[proc](c) resume k -> cell_set(s, exit_step(cell_get(s), c)),
-    };
-    let c = cell_get(s);
-    assert_eq(c.out, []);
-    assert_eq(c.err, ["no one to greet"]);
-    assert_eq(c.code, Some(2))
-  } }
+  let c = handle {
+    greet_all();
+    process.out[proc]("after the exit")
+  } with {
+    var s = captured([]),
+    process.args[proc]() -> args_step(s),
+    process.out[proc](t) -> {
+      s = out_step(s, t);
+    },
+    process.err[proc](t) -> {
+      s = err_step(s, t);
+    },
+    process.exit[proc](c) resume k -> exit_step(s, c),
+    return u -> s,
+  };
+  assert_eq(c.out, []);
+  assert_eq(c.err, ["no one to greet"]);
+  assert_eq(c.code, Some(2))
 }
 
 test "the twin starts with the arguments and nothing written" {
@@ -593,27 +609,26 @@ fn compile(unit: String) -> Result<Bytes, String> / {process.spawn[cc]} = {
 }
 
 test "a spawn is answered by the twin, which records what it was asked to run" {
-  with_cell[builds](runs([exited(0, b"built", b"")])) { s -> {
-    handle {
-      assert_eq(compile("lexer.c"), Ok(b"built"))
-    } with {
-      process.spawn[cc](args, dir, env) -> {
-        let r = spawn_step(cell_get(s), { args: args, dir: dir, env: env });
-        cell_set(s, r.runs);
-        r.finished
-      },
-    };
-    let seen = cell_get(s);
-    assert_eq(seen.launched.len(), 1);
-    match seen.launched.at(0) {
-      None -> panic("the spawn was recorded"),
-      Some(one) -> {
-        assert_eq(one.args, ["-c", "lexer.c", "-o", "lexer.c.o"]);
-        assert_eq(one.dir, "build");
-        assert_eq(one.env, [var("LANG", "C"), var("TMPDIR", "/tmp")])
-      },
-    }
-  } }
+  let seen = handle {
+    assert_eq(compile("lexer.c"), Ok(b"built"))
+  } with {
+    var s = runs([exited(0, b"built", b"")]),
+    process.spawn[cc](args, dir, env) -> {
+      let r = spawn_step(s, { args: args, dir: dir, env: env });
+      s = r.runs;
+      r.finished
+    },
+    return u -> s,
+  };
+  assert_eq(seen.launched.len(), 1);
+  match seen.launched.at(0) {
+    None -> panic("the spawn was recorded"),
+    Some(one) -> {
+      assert_eq(one.args, ["-c", "lexer.c", "-o", "lexer.c.o"]);
+      assert_eq(one.dir, "build");
+      assert_eq(one.env, [var("LANG", "C"), var("TMPDIR", "/tmp")])
+    },
+  }
 }
 
 // Neither ending is a diagnostic: what the compiler said is the value the driver reads.
@@ -640,22 +655,23 @@ fn echo_lines() -> Unit / {process.line[proc], process.out[proc], diverges} =
   }
 
 test "a program reads lines until the input ends, and each ends at its newline" {
-  with_cell[twin](with_input(captured([]), ["one", "two"])) { s -> {
-    handle {
-      echo_lines()
-    } with {
-      process.line[proc]() -> {
-        let step = line_step(cell_get(s));
-        cell_set(s, step.captured);
-        step.line
-      },
-      process.out[proc](t) -> cell_set(s, out_step(cell_get(s), t)),
-    };
-    let c = cell_get(s);
-    assert_eq(c.out, ["one", "two"]);
-    // The script runs out into end of input, and reading past it is `None` rather than a raise.
-    assert_eq(line_step(captured([])).line, None)
-  } }
+  let c = handle {
+    echo_lines()
+  } with {
+    var s = with_input(captured([]), ["one", "two"]),
+    process.line[proc]() -> {
+      let step = line_step(s);
+      s = step.captured;
+      step.line
+    },
+    process.out[proc](t) -> {
+      s = out_step(s, t);
+    },
+    return u -> s,
+  };
+  assert_eq(c.out, ["one", "two"]);
+  // The script runs out into end of input, and reading past it is `None` rather than a raise.
+  assert_eq(line_step(captured([])).line, None)
 }
 
 test "a spawn a test planned no reply for is a command that could not be run" {
@@ -700,33 +716,32 @@ fn killed(child: Int) -> Result<Finished, String> / {process.signal[srv], proces
 
 /// The supervisor with every child it starts answered by the twin.
 fn supervised(planned: List<Script>) -> Answered<Result<Finished, String>> / {abort.raise} =
-  with_cell[kids](children(planned)) { kids -> {
-    let answer = handle {
-      supervise(5)
-    } with {
-      process.start[srv](args, dir, env, io) -> {
-        let step = start_step(cell_get(kids), { args: args, dir: dir, env: env }, io);
-        cell_set(kids, step.children);
-        step.answer
-      },
-      process.output_line[srv](child, timeout_ms) -> {
-        let step = output_line_step(cell_get(kids), child);
-        cell_set(kids, step.children);
-        step.answer
-      },
-      process.signal[srv](child, signal) -> {
-        let step = signal_step(cell_get(kids), child, signal);
-        cell_set(kids, step.children);
-        step.answer
-      },
-      process.wait[srv](child, timeout_ms) -> {
-        let step = wait_step(cell_get(kids), child);
-        cell_set(kids, step.children);
-        step.answer
-      },
-    };
-    { children: cell_get(kids), answer: answer }
-  } }
+  handle {
+    supervise(5)
+  } with {
+    var kids = children(planned),
+    process.start[srv](args, dir, env, io) -> {
+      let step = start_step(kids, { args: args, dir: dir, env: env }, io);
+      kids = step.children;
+      step.answer
+    },
+    process.output_line[srv](child, timeout_ms) -> {
+      let step = output_line_step(kids, child);
+      kids = step.children;
+      step.answer
+    },
+    process.signal[srv](child, signal) -> {
+      let step = signal_step(kids, child, signal);
+      kids = step.children;
+      step.answer
+    },
+    process.wait[srv](child, timeout_ms) -> {
+      let step = wait_step(kids, child);
+      kids = step.children;
+      step.answer
+    },
+    return answer -> { children: kids, answer: answer },
+  }
 
 fn only_child(c: Children) -> Child / {abort.raise} =
   match c.started { [one] -> one, _ -> panic("one child was started") }
@@ -776,31 +791,33 @@ fn feed(
 }
 
 test "a tool fed over its input gets every byte, then the end of its input" {
-  with_cell[kids](children([script(0, exited(0, b"2 lines\n", b""), [])])) { kids -> {
-    handle {
-      assert_eq(feed(["one", "two"]), Ok(b"2 lines\n"))
-    } with {
-      process.start[tool](args, dir, env, io) -> {
-        let step = start_step(cell_get(kids), { args: args, dir: dir, env: env }, io);
-        cell_set(kids, step.children);
-        step.answer
-      },
-      process.input[tool](child, bytes) -> {
-        let step = input_step(cell_get(kids), child, bytes);
-        cell_set(kids, step.children);
-        step.answer
-      },
-      process.end_input[tool](child) -> cell_set(kids, end_input_step(cell_get(kids), child)),
-      process.wait[tool](child, timeout_ms) -> {
-        let step = wait_step(cell_get(kids), child);
-        cell_set(kids, step.children);
-        step.answer
-      },
-    };
-    let tool = only_child(cell_get(kids));
-    assert_eq(tool.written, b"one\ntwo\n");
-    assert(!tool.open)
-  } }
+  let left = handle {
+    assert_eq(feed(["one", "two"]), Ok(b"2 lines\n"))
+  } with {
+    var kids = children([script(0, exited(0, b"2 lines\n", b""), [])]),
+    process.start[tool](args, dir, env, io) -> {
+      let step = start_step(kids, { args: args, dir: dir, env: env }, io);
+      kids = step.children;
+      step.answer
+    },
+    process.input[tool](child, bytes) -> {
+      let step = input_step(kids, child, bytes);
+      kids = step.children;
+      step.answer
+    },
+    process.end_input[tool](child) -> {
+      kids = end_input_step(kids, child);
+    },
+    process.wait[tool](child, timeout_ms) -> {
+      let step = wait_step(kids, child);
+      kids = step.children;
+      step.answer
+    },
+    return u -> kids,
+  };
+  let tool = only_child(left);
+  assert_eq(tool.written, b"one\ntwo\n");
+  assert(!tool.open)
 }
 
 test "a child's input takes nothing once it is ended or was never opened" {

@@ -1128,109 +1128,233 @@ fn over_mem<a, [l] | e>(
   tree: MemFs,
   left: Int,
   go: () -> a / {fs.read[l], fs.write[l] | e},
-) -> Counted<a> / {abort.raise | e bounded} =
-  with_cell[mem_tree]({ tree: tree, left: left, asked: 0 }) { t -> {
-    // Every operation reads the tree once, as it begins.
-    let now = || {
-      let s = cell_get(t);
-      cell_set(t, { ..s, asked: s.asked + 1 });
-      s.tree
-    };
-    let moved_on = |next: MemFs| cell_set(t, { ..cell_get(t), tree: next });
-    let taken = || {
-      let s = cell_get(t);
-      if s.left > 0 { cell_set(t, { ..s, left: s.left - 1 }) } else { () };
-      s.left != 0
-    };
-    let kept = |w: Written|
-      if taken() {
-        moved_on(w.fs);
-        w.ok
-      } else { false };
-    let value = handle {
-      go()
-    } with {
-      fs.read_file[l](p) -> mem_read(now(), p),
-      fs.read_at[l](p, offset, len) -> mem_read_at(now(), p, offset, len),
-      fs.list_dir[l](p) -> mem_list(now(), p),
-      fs.kind[l](p) -> mem_kind(now(), p),
-      fs.resolved[l](p) -> mem_resolved(now(), p),
-      fs.exists[l](p) -> mem_exists(now(), p),
-      fs.file_size[l](p) -> mem_size(now(), p),
-      fs.modified_ms[l](p) -> mem_modified(now(), p),
-      fs.write_file[l](p, body) -> kept(mem_write(now(), p, body)),
-      fs.write_secret[l](p, before, secret, encoding, after) ->
-        kept(
-          mem_write_secret(now(), p, {
-            before: before,
-            secret: secret,
-            encoding: encoding,
-            after: after,
-          }),
-        ),
-      fs.read_secret[l](p, before, encoding, after) ->
-        mem_read_secret(now(), p, before, encoding, after),
-      fs.append[l](p, body) -> {
-        let a = mem_append(now(), p, body);
-        if taken() {
-          moved_on(a.fs);
-          a.at
-        } else { None }
-      },
-      fs.create_dir[l](p) -> kept(mem_create_dir(now(), p)),
-      fs.remove[l](p) -> kept(mem_remove(now(), p)),
-      fs.rename[l](from, to) -> kept(mem_rename(now(), from, to)),
-      fs.sync[l](p) -> kept(mem_sync(now(), p)),
-      fs.lock[l](p) -> kept(mem_lock(now(), p)),
-      fs.unlock[l](p) -> kept(mem_unlock(now(), p)),
-      fs.copy[l](from, to) -> kept(mem_copy(now(), from, to)),
-      fs.remove_tree[l](p) -> kept(mem_remove_tree(now(), p)),
-      fs.temp_dir[l](dir, prefix) -> {
-        let m = mem_temp_dir(now(), dir, prefix);
-        if taken() {
-          moved_on(m.fs);
-          m.path
-        } else { None }
-      },
-      fs.canonical[l](p) -> mem_canonical(now(), "/mem", p),
-      fs.mode[l](p) -> mem_mode(now(), p),
-      fs.set_mode[l](p, mode) -> kept(mem_set_mode(now(), p, mode)),
-      fs.symlink[l](p, target) -> kept(mem_symlink(now(), p, target)),
-      fs.read_link[l](p) -> mem_read_link(now(), p),
-      fs.walk[l](p) -> mem_walk(now(), p),
-      fs.set_modified[l](p, ms) -> kept(mem_set_modified(now(), p, ms)),
-      fs.open[l](p, how) -> {
-        let o = mem_open(now(), p, how);
-        if how == ToRead || taken() {
-          moved_on(o.fs);
-          o.file
-        } else { Err(failed()) }
-      },
-      fs.read_chunk[l](file, max) -> {
-        let c = mem_read_chunk(now(), file, max);
-        moved_on(c.fs);
-        c.bytes
-      },
-      fs.write_chunk[l](file, body) -> kept(mem_write_chunk(now(), file, body)),
-      fs.close[l](file) -> {
-        let c = mem_close(now(), file);
-        moved_on(c.fs);
-        c.ok
-      },
-      fs.stat[l](p) -> mem_stat(now(), p),
-      fs.scan[l](p, deep) -> mem_scan(now(), p, deep),
-      fs.space[l](p) -> mem_space(now(), p),
-      fs.link[l](p, to) -> {
-        let made = mem_link(now(), p, to);
-        if taken() {
-          moved_on(made.fs);
-          made.done
-        } else { Err(failed()) }
-      },
-    };
-    let end = cell_get(t);
-    { value: value, tree: end.tree, asked: end.asked }
-  } }
+) -> Counted<a> / {abort.raise | e bounded} = {
+  // A write the run may still make, made: whether it was, and what it answers.
+  let kept = |r: MemRun, w: Written| {
+    let c = changed(r, w.fs);
+    { run: c.run, ok: c.made && w.ok }
+  };
+  handle {
+    go()
+  } with {
+    var run: MemRun = { tree: tree, left: left, asked: 0 },
+    fs.read_file[l](p) -> {
+      run = begun(run);
+      mem_read(run.tree, p)
+    },
+    fs.read_at[l](p, offset, len) -> {
+      run = begun(run);
+      mem_read_at(run.tree, p, offset, len)
+    },
+    fs.list_dir[l](p) -> {
+      run = begun(run);
+      mem_list(run.tree, p)
+    },
+    fs.kind[l](p) -> {
+      run = begun(run);
+      mem_kind(run.tree, p)
+    },
+    fs.resolved[l](p) -> {
+      run = begun(run);
+      mem_resolved(run.tree, p)
+    },
+    fs.exists[l](p) -> {
+      run = begun(run);
+      mem_exists(run.tree, p)
+    },
+    fs.file_size[l](p) -> {
+      run = begun(run);
+      mem_size(run.tree, p)
+    },
+    fs.modified_ms[l](p) -> {
+      run = begun(run);
+      mem_modified(run.tree, p)
+    },
+    fs.write_file[l](p, body) -> {
+      run = begun(run);
+      let k = kept(run, mem_write(run.tree, p, body));
+      run = k.run;
+      k.ok
+    },
+    fs.write_secret[l](p, before, secret, encoding, after) -> {
+      run = begun(run);
+      let k = kept(
+        run,
+        mem_write_secret(run.tree, p, {
+          before: before,
+          secret: secret,
+          encoding: encoding,
+          after: after,
+        }),
+      );
+      run = k.run;
+      k.ok
+    },
+    fs.read_secret[l](p, before, encoding, after) -> {
+      run = begun(run);
+      mem_read_secret(run.tree, p, before, encoding, after)
+    },
+    fs.append[l](p, body) -> {
+      run = begun(run);
+      let a = mem_append(run.tree, p, body);
+      let c = changed(run, a.fs);
+      run = c.run;
+      if c.made { a.at } else { None }
+    },
+    fs.create_dir[l](p) -> {
+      run = begun(run);
+      let k = kept(run, mem_create_dir(run.tree, p));
+      run = k.run;
+      k.ok
+    },
+    fs.remove[l](p) -> {
+      run = begun(run);
+      let k = kept(run, mem_remove(run.tree, p));
+      run = k.run;
+      k.ok
+    },
+    fs.rename[l](from, to) -> {
+      run = begun(run);
+      let k = kept(run, mem_rename(run.tree, from, to));
+      run = k.run;
+      k.ok
+    },
+    fs.sync[l](p) -> {
+      run = begun(run);
+      let k = kept(run, mem_sync(run.tree, p));
+      run = k.run;
+      k.ok
+    },
+    fs.lock[l](p) -> {
+      run = begun(run);
+      let k = kept(run, mem_lock(run.tree, p));
+      run = k.run;
+      k.ok
+    },
+    fs.unlock[l](p) -> {
+      run = begun(run);
+      let k = kept(run, mem_unlock(run.tree, p));
+      run = k.run;
+      k.ok
+    },
+    fs.copy[l](from, to) -> {
+      run = begun(run);
+      let k = kept(run, mem_copy(run.tree, from, to));
+      run = k.run;
+      k.ok
+    },
+    fs.remove_tree[l](p) -> {
+      run = begun(run);
+      let k = kept(run, mem_remove_tree(run.tree, p));
+      run = k.run;
+      k.ok
+    },
+    fs.temp_dir[l](dir, prefix) -> {
+      run = begun(run);
+      let m = mem_temp_dir(run.tree, dir, prefix);
+      let c = changed(run, m.fs);
+      run = c.run;
+      if c.made { m.path } else { None }
+    },
+    fs.canonical[l](p) -> {
+      run = begun(run);
+      mem_canonical(run.tree, "/mem", p)
+    },
+    fs.mode[l](p) -> {
+      run = begun(run);
+      mem_mode(run.tree, p)
+    },
+    fs.set_mode[l](p, mode) -> {
+      run = begun(run);
+      let k = kept(run, mem_set_mode(run.tree, p, mode));
+      run = k.run;
+      k.ok
+    },
+    fs.symlink[l](p, target) -> {
+      run = begun(run);
+      let k = kept(run, mem_symlink(run.tree, p, target));
+      run = k.run;
+      k.ok
+    },
+    fs.read_link[l](p) -> {
+      run = begun(run);
+      mem_read_link(run.tree, p)
+    },
+    fs.walk[l](p) -> {
+      run = begun(run);
+      mem_walk(run.tree, p)
+    },
+    fs.set_modified[l](p, ms) -> {
+      run = begun(run);
+      let k = kept(run, mem_set_modified(run.tree, p, ms));
+      run = k.run;
+      k.ok
+    },
+    fs.open[l](p, how) -> {
+      run = begun(run);
+      let o = mem_open(run.tree, p, how);
+      if how == ToRead {
+        run = { ..run, tree: o.fs };
+        o.file
+      } else {
+        let c = changed(run, o.fs);
+        run = c.run;
+        if c.made { o.file } else { Err(failed()) }
+      }
+    },
+    fs.read_chunk[l](file, max) -> {
+      run = begun(run);
+      let c = mem_read_chunk(run.tree, file, max);
+      run = { ..run, tree: c.fs };
+      c.bytes
+    },
+    fs.write_chunk[l](file, body) -> {
+      run = begun(run);
+      let k = kept(run, mem_write_chunk(run.tree, file, body));
+      run = k.run;
+      k.ok
+    },
+    fs.close[l](file) -> {
+      run = begun(run);
+      let c = mem_close(run.tree, file);
+      run = { ..run, tree: c.fs };
+      c.ok
+    },
+    fs.stat[l](p) -> {
+      run = begun(run);
+      mem_stat(run.tree, p)
+    },
+    fs.scan[l](p, deep) -> {
+      run = begun(run);
+      mem_scan(run.tree, p, deep)
+    },
+    fs.space[l](p) -> {
+      run = begun(run);
+      mem_space(run.tree, p)
+    },
+    fs.link[l](p, to) -> {
+      run = begun(run);
+      let made = mem_link(run.tree, p, to);
+      let c = changed(run, made.fs);
+      run = c.run;
+      if c.made { made.done } else { Err(failed()) }
+    },
+    return value -> { value: value, tree: run.tree, asked: run.asked },
+  }
+}
+
+/// The tree an in-memory run holds, how many more changes it may make (below zero, no end to them),
+/// and how many operations it was asked.
+type MemRun = { tree: MemFs, left: Int, asked: Int }
+
+/// `m` once an operation begins: every one reads the tree once, as it begins.
+fn begun(m: MemRun) -> MemRun = { ..m, asked: m.asked + 1 }
+
+/// `m` moved on to `next` where it may make one more change, and whether it could.
+fn changed(m: MemRun, next: MemFs) -> { run: MemRun, made: Bool } =
+  if m.left == 0 { { run: m, made: false } } else {
+    { run: { ..m, tree: next, left: if m.left > 0 { m.left - 1 } else { m.left } }, made: true }
+  }
 
 // --- Writing a file whole or not at all ----------------------------------------
 
@@ -2054,34 +2178,33 @@ test "`resolved` answers what a path names after a symlink, where `kind` names t
 }
 
 test "a handled fs write is det and the next read sees it" {
-  with_cell[tree](mem_empty()) { t ->
-    handle {
-      assert(fs.create_dir[out]("build/cache"));
-      assert(fs.write_file[out]("build/cache/a.plyx", b"artifact"));
-      assert_eq(fs.read_file[out]("build/cache/a.plyx"), Some(b"artifact"));
-      assert_eq(fs.list_dir[out]("build/cache"), Some(["a.plyx"]));
-      assert(fs.rename[out]("build/cache/a.plyx", "build/cache/b.plyx"));
-      assert_eq(fs.read_file[out]("build/cache/a.plyx"), None);
-      assert_eq(fs.read_file[out]("build/cache/b.plyx"), Some(b"artifact"))
-    } with {
-      fs.create_dir[out](p) -> {
-        let w = mem_create_dir(cell_get(t), p);
-        cell_set(t, w.fs);
-        w.ok
-      },
-      fs.write_file[out](p, body) -> {
-        let w = mem_write(cell_get(t), p, body);
-        cell_set(t, w.fs);
-        w.ok
-      },
-      fs.rename[out](from, to) -> {
-        let w = mem_rename(cell_get(t), from, to);
-        cell_set(t, w.fs);
-        w.ok
-      },
-      fs.read_file[out](p) -> mem_read(cell_get(t), p),
-      fs.list_dir[out](p) -> mem_list(cell_get(t), p),
-    }
+  handle {
+    assert(fs.create_dir[out]("build/cache"));
+    assert(fs.write_file[out]("build/cache/a.plyx", b"artifact"));
+    assert_eq(fs.read_file[out]("build/cache/a.plyx"), Some(b"artifact"));
+    assert_eq(fs.list_dir[out]("build/cache"), Some(["a.plyx"]));
+    assert(fs.rename[out]("build/cache/a.plyx", "build/cache/b.plyx"));
+    assert_eq(fs.read_file[out]("build/cache/a.plyx"), None);
+    assert_eq(fs.read_file[out]("build/cache/b.plyx"), Some(b"artifact"))
+  } with {
+    var t = mem_empty(),
+    fs.create_dir[out](p) -> {
+      let w = mem_create_dir(t, p);
+      t = w.fs;
+      w.ok
+    },
+    fs.write_file[out](p, body) -> {
+      let w = mem_write(t, p, body);
+      t = w.fs;
+      w.ok
+    },
+    fs.rename[out](from, to) -> {
+      let w = mem_rename(t, from, to);
+      t = w.fs;
+      w.ok
+    },
+    fs.read_file[out](p) -> mem_read(t, p),
+    fs.list_dir[out](p) -> mem_list(t, p),
   }
 }
 
@@ -2269,39 +2392,38 @@ test "a ranged read answers what is there, and a range past the end is short" {
 
 // The ordering a paired index depends on: the frames are on the disk before anything names them.
 test "a handled append, sync and rename are the store's flush" {
-  with_cell[tree](mem_create_dir(mem_empty(), "cache").fs) { t ->
-    handle {
-      assert_eq(fs.append[cache]("cache/frontend.dat", b"frame"), Some(0));
-      assert(fs.sync[cache]("cache/frontend.dat"));
-      assert(fs.write_file[cache]("cache/frontend.tmp", b"index"));
-      assert(fs.rename[cache]("cache/frontend.tmp", "cache/frontend.idx"));
-      assert(fs.sync[cache]("cache"));
-      assert_eq(fs.read_at[cache]("cache/frontend.dat", 0, 5), Some(b"frame"));
-      // Nothing was ever written here, so there is nothing to make durable.
-      assert(!fs.sync[cache]("cache/absent.dat"))
-    } with {
-      fs.append[cache](p, body) -> {
-        let a = mem_append(cell_get(t), p, body);
-        cell_set(t, a.fs);
-        a.at
-      },
-      fs.write_file[cache](p, body) -> {
-        let w = mem_write(cell_get(t), p, body);
-        cell_set(t, w.fs);
-        w.ok
-      },
-      fs.rename[cache](from, to) -> {
-        let w = mem_rename(cell_get(t), from, to);
-        cell_set(t, w.fs);
-        w.ok
-      },
-      fs.sync[cache](p) -> {
-        let w = mem_sync(cell_get(t), p);
-        cell_set(t, w.fs);
-        w.ok
-      },
-      fs.read_at[cache](p, offset, len) -> mem_read_at(cell_get(t), p, offset, len),
-    }
+  handle {
+    assert_eq(fs.append[cache]("cache/frontend.dat", b"frame"), Some(0));
+    assert(fs.sync[cache]("cache/frontend.dat"));
+    assert(fs.write_file[cache]("cache/frontend.tmp", b"index"));
+    assert(fs.rename[cache]("cache/frontend.tmp", "cache/frontend.idx"));
+    assert(fs.sync[cache]("cache"));
+    assert_eq(fs.read_at[cache]("cache/frontend.dat", 0, 5), Some(b"frame"));
+    // Nothing was ever written here, so there is nothing to make durable.
+    assert(!fs.sync[cache]("cache/absent.dat"))
+  } with {
+    var t = mem_create_dir(mem_empty(), "cache").fs,
+    fs.append[cache](p, body) -> {
+      let a = mem_append(t, p, body);
+      t = a.fs;
+      a.at
+    },
+    fs.write_file[cache](p, body) -> {
+      let w = mem_write(t, p, body);
+      t = w.fs;
+      w.ok
+    },
+    fs.rename[cache](from, to) -> {
+      let w = mem_rename(t, from, to);
+      t = w.fs;
+      w.ok
+    },
+    fs.sync[cache](p) -> {
+      let w = mem_sync(t, p);
+      t = w.fs;
+      w.ok
+    },
+    fs.read_at[cache](p, offset, len) -> mem_read_at(t, p, offset, len),
   }
 }
 
@@ -2327,25 +2449,24 @@ test "a lock is held by one taker at a time, and only its holder releases it" {
 }
 
 test "a handled lock serialises a read-merge-write against a second taker" {
-  with_cell[tree](mem_create_dir(mem_empty(), "cache").fs) { t ->
-    handle {
-      assert(fs.lock[cache]("cache/lock"));
-      assert(!fs.lock[cache]("cache/lock"));
-      assert(fs.unlock[cache]("cache/lock"));
-      assert(!fs.unlock[cache]("cache/lock"));
-      assert(fs.lock[cache]("cache/lock"))
-    } with {
-      fs.lock[cache](p) -> {
-        let w = mem_lock(cell_get(t), p);
-        cell_set(t, w.fs);
-        w.ok
-      },
-      fs.unlock[cache](p) -> {
-        let w = mem_unlock(cell_get(t), p);
-        cell_set(t, w.fs);
-        w.ok
-      },
-    }
+  handle {
+    assert(fs.lock[cache]("cache/lock"));
+    assert(!fs.lock[cache]("cache/lock"));
+    assert(fs.unlock[cache]("cache/lock"));
+    assert(!fs.unlock[cache]("cache/lock"));
+    assert(fs.lock[cache]("cache/lock"))
+  } with {
+    var t = mem_create_dir(mem_empty(), "cache").fs,
+    fs.lock[cache](p) -> {
+      let w = mem_lock(t, p);
+      t = w.fs;
+      w.ok
+    },
+    fs.unlock[cache](p) -> {
+      let w = mem_unlock(t, p);
+      t = w.fs;
+      w.ok
+    },
   }
 }
 
@@ -2537,32 +2658,31 @@ test "a directory moves with everything under it, and never into itself" {
 }
 
 test "a handled temp_dir, copy, walk and remove_tree are the twin's" {
-  with_cell[tree](mem_of([{ path: "src/m.ply", body: b"m" }])) { t ->
-    handle {
-      let made = match fs.temp_dir[work]("", "run-") { Some(p) -> p, None -> panic("a directory") };
-      assert(fs.copy[work]("src/m.ply", made ++ "/m.ply"));
-      assert_eq(fs.walk[work](made), Some([{ path: made ++ "/m.ply", kind: File }]));
-      assert(fs.remove_tree[work](made));
-      assert(!fs.exists[work](made))
-    } with {
-      fs.temp_dir[work](dir, prefix) -> {
-        let m = mem_temp_dir(cell_get(t), dir, prefix);
-        cell_set(t, m.fs);
-        m.path
-      },
-      fs.copy[work](from, to) -> {
-        let w = mem_copy(cell_get(t), from, to);
-        cell_set(t, w.fs);
-        w.ok
-      },
-      fs.walk[work](p) -> mem_walk(cell_get(t), p),
-      fs.remove_tree[work](p) -> {
-        let w = mem_remove_tree(cell_get(t), p);
-        cell_set(t, w.fs);
-        w.ok
-      },
-      fs.exists[work](p) -> mem_exists(cell_get(t), p),
-    }
+  handle {
+    let made = match fs.temp_dir[work]("", "run-") { Some(p) -> p, None -> panic("a directory") };
+    assert(fs.copy[work]("src/m.ply", made ++ "/m.ply"));
+    assert_eq(fs.walk[work](made), Some([{ path: made ++ "/m.ply", kind: File }]));
+    assert(fs.remove_tree[work](made));
+    assert(!fs.exists[work](made))
+  } with {
+    var t = mem_of([{ path: "src/m.ply", body: b"m" }]),
+    fs.temp_dir[work](dir, prefix) -> {
+      let m = mem_temp_dir(t, dir, prefix);
+      t = m.fs;
+      m.path
+    },
+    fs.copy[work](from, to) -> {
+      let w = mem_copy(t, from, to);
+      t = w.fs;
+      w.ok
+    },
+    fs.walk[work](p) -> mem_walk(t, p),
+    fs.remove_tree[work](p) -> {
+      let w = mem_remove_tree(t, p);
+      t = w.fs;
+      w.ok
+    },
+    fs.exists[work](p) -> mem_exists(t, p),
   }
 }
 
@@ -3217,17 +3337,16 @@ fn awaited<[l] | e>(
   looks: Int,
   during: (Int) -> Unit / e,
 ) -> { changes: List<Change>, slept: Int } / {fs.scan[l], abort.raise | e} =
-  with_cell[sleeps](0) { slept ->
-    handle {
-      let found = await_changes[l](watch[l]("", true, 10), millis(50), looks);
-      { changes: found.changes, slept: cell_get(slept) }
-    } with {
-      time.sleep_ms(_) -> {
-        let n = cell_get(slept);
-        cell_set(slept, n + 1);
-        during(n)
-      },
-    }
+  handle {
+    await_changes[l](watch[l]("", true, 10), millis(50), looks)
+  } with {
+    var slept = 0,
+    time.sleep_ms(_) -> {
+      let n = slept;
+      slept = n + 1;
+      during(n)
+    },
+    return found -> { changes: found.changes, slept: slept },
   }
 
 test "a wait answers a burst of writes once, after the directory has held still for one look" {

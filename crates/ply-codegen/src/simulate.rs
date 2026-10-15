@@ -803,13 +803,21 @@ pub fn cell_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Acc
             mode,
         })
     };
+    if let (Builtin::HoldGet | Builtin::HoldTake, Some(id)) =
+        (b, args.first().and_then(|h| crate::rt::hold_id(*h)))
+    {
+        let mode = if b == Builtin::HoldGet {
+            Mode::Read
+        } else {
+            Mode::Write
+        };
+        return Some(Access::Hold { id, mode });
+    }
     let mode = match b {
         Builtin::HandlerVar => return var(Mode::Read),
         Builtin::HandlerSet => return var(Mode::Write),
-        Builtin::CellGet | Builtin::HoldGet => Mode::Read,
-        Builtin::CellSet | Builtin::CellUpdate | Builtin::HoldTake | Builtin::HoldPut => {
-            Mode::Write
-        }
+        Builtin::HoldGet => Mode::Read,
+        Builtin::HoldTake => Mode::Write,
         _ => return None,
     };
     let Value::Cell(slot) = ctx.value(*args.first()?) else {

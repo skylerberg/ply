@@ -5,10 +5,10 @@ import parsing (Ident, Span, dummy_span, span_key, ParseDiag, qname_text, starts
                 span_between)
 import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpdate,
              NKnown, Lambda, NApp, NRecord, NMatch, CodePattern, PxWild, PxVar, PxLit, PxRange,
-             PxCtor, PxRecord, PxList, CodePatternField, NPerform, NLabel, NCell, NLambda,
-             NSimulate, NParallel, NHandle, CodeStmt, CLet, CLetPat, CDo, pat_slots, CodeField,
-             CodeArm, Capture, CodeClause, CodeReturn, Own, Borrowed, Owned, lower_to_emit,
-             irrefutable, slots_read, all_read, marked)
+             PxCtor, PxRecord, PxList, CodePatternField, NPerform, NLabel, NLambda, NSimulate,
+             NParallel, NHandle, CodeStmt, CLet, CLetPat, CDo, pat_slots, CodeField, CodeArm,
+             Capture, CodeClause, CodeReturn, Own, Borrowed, Owned, lower_to_emit, irrefutable,
+             slots_read, all_read, marked)
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, parse, ImportDecl,
               ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires, SEnsures, SCost,
               SSpace, FnDef, test_run, test_listing, IInstance, VariantDef, TDSum, INumeric,
@@ -36,8 +36,8 @@ import diagnostics (parse_all)
 import interface (stub_module)
 import exprs (freed_by, Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, EIf,
               EMatch, EBlock, ERecord, ERecordUpdate, ETry, ETryBlock, EField, EList, EPerform,
-              EWithCell, EWithHold, HandleClause, HandlerVar, MatchArm, RecField, Stmt, SLet,
-              SLetElse, SExpr, SAssign, is_arithmetic, case_at, case_identity, ELit)
+              EWithHold, HandleClause, HandlerVar, MatchArm, RecField, Stmt, SLet, SLetElse, SExpr,
+              SAssign, is_arithmetic, case_at, case_identity, ELit)
 import type_syntax (Mode, MRead, MWrite, MRaise, MBad, is_raise, TypeExpr, TVar, TCon, TFn)
 import rewrite (expand, named_program_wide, stated_witness_name, map_expr, unwitnessed,
                 witness_param, Elaborated, elaborated_natives)
@@ -3096,10 +3096,12 @@ fn close(emitter: Emitter) -> Emitter = line(outdent(release_at(emitter, emitter
 
 /// At a slot's `Owned` read the local is moved to a fresh name and nulled, so the scope's release
 /// skips it. A held-back record moves held back: the fresh name takes its cells and the values it was
-/// built from, and is made only when its word is asked for.
+/// built from, and is made only when its word is asked for. A held-back sum is its own local and is
+/// left as it is: whatever takes it takes its arguments.
 fn move_read(emitter: Emitter, own: Own, value: CValue) -> WithValue =
   if !emitter.release || own != Owned || !counted(value.kind) || !is_made(emitter, value.expr)
-      || is_pinned(emitter, value.expr) { { emitter: emitter, value: value } } else {
+      || is_pinned(emitter, value.expr)
+      || held_sum_of(emitter, value.expr) != None { { emitter: emitter, value: value } } else {
     match deferred_of(emitter, value.expr) {
       Some(d) -> {
         let f = fresh(emitter);
@@ -4547,7 +4549,6 @@ fn known_values(c: Code, bound: List<KnownSlot>, owner: Bytes, own: List<Lambda>
         arms: m.arms.map(|a: CodeArm| { ..a, guard: maybe(a.guard), body: go(a.body) }),
       }),
     NPerform(x) -> NPerform({ ..x, label: maybe(x.label), args: x.args.map(go) }),
-    NCell(cl) -> NCell({ ..cl, init: go(cl.init), body: go(cl.body) }),
     NLambda(l) -> NLambda({ ..l, body: known_values(l.body, inside(l.captures), owner, own) }),
     NSimulate(x) -> NSimulate({ ..x, body: known_values(x.body, inside(x.captures), owner, own) }),
     NParallel(pr) -> NParallel({ ..pr, branches: pr.branches.map(go) }),
@@ -5453,7 +5454,6 @@ fn widths_closed(emitter: Emitter, c: Code) -> Code / {abort.raise} = {
         arms: m.arms.map(|a: CodeArm| { ..a, guard: maybe(a.guard), body: go(a.body) }),
       }),
     NPerform(p) -> NPerform({ ..p, label: maybe(p.label), args: p.args.map(go) }),
-    NCell(cl) -> NCell({ ..cl, init: go(cl.init), body: go(cl.body) }),
     NLambda(l) -> NLambda({ ..l, body: go(l.body) }),
     NSimulate(x) -> NSimulate({ ..x, body: go(x.body) }),
     NParallel(pr) -> NParallel({ ..pr, branches: pr.branches.map(go) }),
@@ -7080,10 +7080,7 @@ fn caps_owned(
           None ->
             Some({ emitter: poison(emitter, b"a capture this port has not bound"), caps: acc }),
           Some(v) -> {
-            let mv = match slice_of(emitter, v.expr) {
-              Some(sl) -> sliced_list(emitter, sl, v.ty),
-              None -> move_read(emitter, c.own, v),
-            };
+            let mv = window_read(emitter, c.own, v, v);
             let w = owned(mv.emitter, mv.value);
             // The closure holds the capture as its word, laid out as the word was here.
             let ty = if v.kind == KBoxed { v.ty } else { TyOpen([]) };
@@ -8785,6 +8782,16 @@ fn column_read(column: Bytes, i: Bytes, f: FieldTy) -> Bytes = {
   }
 }
 
+/// A read, as `own`, of `v`, what the window holds for a slot, typed as `typed`.
+fn window_read(emitter: Emitter, own: Own, v: CValue, typed: CValue) -> WithValue =
+  match slice_of(emitter, v.expr) {
+    Some(sl) -> sliced_list(emitter, sl, v.ty),
+    None -> match held_sum_of(emitter, v.expr) {
+      Some(h) -> held_sum_read(emitter, own, h, typed),
+      None -> move_read(emitter, own, typed),
+    },
+  }
+
 /// The read `c` of the slot `s`, a variable named `name`: what the window holds for it, or a
 /// parameter the prologue did not open as its own word.
 fn slot_read(
@@ -8795,13 +8802,7 @@ fn slot_read(
   params: List<EmitParam>,
 ) -> Option<WithValue> =
   match conv_of(emitter, s) {
-    Some(v) -> match slice_of(emitter, v.expr) {
-      Some(sl) -> Some(sliced_list(emitter, sl, v.ty)),
-      None -> match held_sum_of(emitter, v.expr) {
-        Some(h) -> Some(held_sum_read(emitter, c.own, h, typed_value(emitter, c, v))),
-        None -> Some(move_read(emitter, c.own, typed_value(emitter, c, v))),
-      },
-    },
+    Some(v) -> Some(window_read(emitter, c.own, v, typed_value(emitter, c, v))),
     // A parameter the prologue did not open (a record) is read as its own word each time.
     None -> match params.at(s) {
       None -> Some(refused(emitter, b"a local this port has not bound: ".concat(name))),
@@ -9877,41 +9878,6 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       },
     },
     NHandle(h) -> handle_site(emitter, h.body, h.clauses, h.ret, params),
-    // `with cell`: a shared region holding a cell with the initial value, the binder in scope for the body, the region closed after.
-    NCell(cl) -> match expr(notail(emitter), cl.init, params) {
-      None -> None,
-      Some(iv) -> {
-        // Under release the runtime takes the initial value; otherwise it is handed a word still held.
-        let init = if iv.emitter.release { owned(iv.emitter, iv.value) } else {
-          let w0 = word_of(iv.emitter, iv.value);
-          { emitter: w0.emitter, value: { kind: KBoxed, expr: w0.expr, ty: TyOpen([]) } }
-        };
-        let region = bind(site(init.emitter, c.span), KInt, b"rt_region_p(ctx, 0)");
-        let made = bind(
-          region.emitter,
-          KBoxed,
-          Bytes::concat_all([b"rt_cell_p(ctx, ", init.value.expr, b")"]),
-        );
-        let cell = bind(made.emitter, KBoxed, made.value.expr);
-        let bound = match cl.slot {
-          Some(sl) -> remember(cell.emitter, sl, cell.value),
-          None -> cell.emitter,
-        };
-        match expr(bound, cl.body, params) {
-          None -> None,
-          Some(b) -> {
-            let held = bind_keeping(b.emitter, b.value.kind, b.value.ty, b.value.expr);
-            Some({
-              emitter: line(
-                held.emitter,
-                Bytes::concat_all([b"rt_region_close_p(ctx, ", region.value.expr, b");"]),
-              ),
-              value: held.value,
-            })
-          },
-        }
-      },
-    },
     // `simulate { body }`: the body is a nullary closure run as the root task of a region whose scheduler the runtime drives.
     NSimulate(x) -> {
       match closure_value(
@@ -18743,19 +18709,22 @@ test "what an operation answers and what a clause is handed are read by their ty
     b"type P = { x: Int, y: Int }\n",
     b"effect store { read held() -> P\n write keep(p: P) -> Unit }\n",
     b"fn summed() -> Int / {store.held} = { let p = store.held(); p.x + p.y }\n",
-    b"fn kept(start: P) -> Int = with_cell[seen](0) { c -> { handle { store.keep(start) } with { store.keep(p) -> cell_set(c, p.x + p.y) }; cell_get(c) } }\n",
+    b"fn kept(start: P) -> Int = handle { store.keep(start) } with { var seen = 0, store.keep(p) -> { seen = p.x + p.y; }, return u -> seen }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", src: src }], [], [b"cell_get", b"cell_set"], true);
+  let out = emit_all_program([{ name: b"m", src: src }], [], handler_builtins(), true);
   assert_eq(out.map(|e: Emitted| e.why), [None, None]);
   assert_eq(out.map(|e: Emitted| e.text.index_of(b"rt_field_p") != None), [false, false])
 }
 
-test "what a cell holds is read by its type" {
+fn handler_builtins() -> List<Bytes> = [b"?handler_init", b"?handler_var", b"?handler_set"]
+
+test "what a handler's variable holds is read by its type" {
   let src = Bytes::concat_all([
     b"type Open = { now: Int, mine: List<Int>, held: Int }\n",
-    b"fn bumped(start: Open, by: Int) -> Int = with_cell[store](start) { st -> { let o = cell_get(st); cell_set(st, { ..o, now: o.now + by }); cell_get(st).now + o.held } }\n",
+    b"effect bump { write by(n: Int) -> Int }\n",
+    b"fn bumped(start: Open, by: Int) -> Int = handle { bump.by(by) } with { var st = start, bump.by(n) -> { let o = st; st = { ..o, now: o.now + n }; st.now + o.held } }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", src: src }], [], [b"cell_get", b"cell_set"], true);
+  let out = emit_all_program([{ name: b"m", src: src }], [], handler_builtins(), true);
   assert_eq(out.map(|e: Emitted| e.why), [None]);
   assert_eq(out.map(|e: Emitted| own_code(e.text).index_of(b"rt_field_p") != None), [false])
 }
@@ -22192,7 +22161,6 @@ fn lambdas_of(c: Code) -> List<Lambda> = {
           List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
       ),
     NPerform(x) -> within(x.args),
-    NCell(x) -> within([x.init, x.body]),
     NSimulate(x) -> lambdas_of(x.body),
     NParallel(x) -> within(x.branches),
     NHandle(h) ->
@@ -22310,7 +22278,6 @@ fn named_in(
           List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
       ),
     NPerform(x) -> within(x.args),
-    NCell(x) -> within([x.init, x.body]),
     NSimulate(x) -> named_in(module, here, imports, x.body),
     NParallel(x) -> within(x.branches),
     NHandle(h) ->
@@ -22350,7 +22317,6 @@ fn has_handle(c: Code) -> Bool = {
         || m.arms.fold(false, |acc: Bool, a: CodeArm|
           acc || (match a.guard { Some(g) -> has_handle(g), None -> false }) || has_handle(a.body)),
     NPerform(p) -> within(p.args),
-    NCell(c2) -> within([c2.init, c2.body]),
     NLambda(l) -> has_handle(l.body),
     NSimulate(x) -> has_handle(x.body),
     NKnown(k) -> has_handle(k.lambda.body),
@@ -22405,7 +22371,6 @@ fn walks_by_rest(c: Code, own: Bytes, i: Int) -> Bool = {
           acc || (match arm.guard { Some(g) -> walks_by_rest(g, own, i), None -> false })
             || walks_by_rest(arm.body, own, i)),
     NPerform(p) -> within(p.args),
-    NCell(c2) -> within([c2.init, c2.body]),
     NParallel(pr) -> within(pr.branches),
     _ -> false,
   }
@@ -22786,7 +22751,6 @@ fn ast_handles(e: Expr, effects: List<EffectName>) -> List<Bytes> / {abort.raise
     EField(x) -> ast_handles(x.base, effects),
     EList(x) -> all(x.items),
     EPerform(x) -> all(x.args),
-    EWithCell(x) -> all([x.init, x.body]),
     EWithHold(x) -> all([x.acquire, x.release, x.body]),
     ETryBlock(x) -> ast_handles(x.body, effects),
     _ -> [],
@@ -22828,7 +22792,6 @@ fn walk_handles(c: Code, effects: List<EffectName>) -> List<Bytes> / {abort.rais
       m.arms.fold(walk_handles(m.scrutinee, effects), |acc: List<Bytes>, a: CodeArm|
         here(match a.guard { Some(g) -> here(acc, g), None -> acc }, a.body)),
     NPerform(p) -> p.args.fold([], here),
-    NCell(c2) -> here(walk_handles(c2.init, effects), c2.body),
     NLambda(l) -> walk_handles(l.body, effects),
     NSimulate(x) -> scheduled_ops().concat(walk_handles(x.body, effects)),
     NParallel(pr) -> pr.branches.fold([], here),

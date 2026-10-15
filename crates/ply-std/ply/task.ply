@@ -15,14 +15,13 @@
 //! Retrying, breaking a circuit, limiting a rate and keeping a retry budget are each a value and
 //! the pure functions that step it, which take the reading of the clock they need. The caller
 //! keeps the value, in a handler's variable or threaded through: nothing here is ambient. A
-//! function that steps one while it runs a body (`guarded`, `throttled`, `retry_budgeted`,
-//! `single_flight`) takes `load` and `store`, how the caller reads what it keeps and puts one
-//! back: over a handler's variable, operations its clauses answer. `single_flight`'s flights hold
-//! channels, which no operation carries, so a caller keeps them in a cell, as `|| cell_get(c)` and
-//! `|f: Flights<k, a>| cell_set(c, f)`. Each reads and writes with nothing between that another
-//! task could run in, so tasks sharing one value see each step whole. Jitter is drawn from
-//! `std.random`'s `entropy`, so a run that answers it from a seed waits what the
-//! seed says.
+//! function that steps one while it runs a body (`guarded`, `throttled`, `retry_budgeted`) takes
+//! `load` and `store`, how the caller reads what it keeps and puts one back: over a handler's
+//! variable, operations its clauses answer. Each reads and writes with nothing between that another
+//! task could run in, so tasks sharing one value see each step whole. `single_flight`'s runs are
+//! kept in a channel its callers share, which `flights` makes in the region they run in. Jitter is
+//! drawn from `std.random`'s `entropy`, so a run that answers it from a seed waits what the seed
+//! says.
 //!
 //! Under `simulate` every wait here is virtual time and every interleaving of what these start
 //! is searched. Under `--host` the same waits are on the run's clock, and a task that waits is
@@ -660,76 +659,111 @@ pub fn throttled<a | e>(
 
 // --- One run for many callers -----------------------------------------------
 
-/// The runs under way, by key: `flights` is none. A caller keeps one in a cell opened inside the
-/// region its tasks run in.
-pub type Flights<k, a> = { next: Int, flying: Map<k, { id: Int, waiting: List<Chan<a>> }> }
+/// The runs under way, by key: a channel that holds their table while no caller is changing it.
+pub type Flights<k, a> = { table: Chan<Flying<k, a>> }
 
-/// No run under way.
-pub fn flights<k, a>() -> Flights<k, a>
+/// Each run under way by its key, with the id it runs as and the channel each caller waiting on it
+/// is answered on; `next` is the id the next run takes.
+type Flying<k, a> = { next: Int, runs: Map<k, { id: Int, waiting: List<Chan<a>> }> }
+
+/// What joining answers: run it yourself as this id, or wait on `answered` for its runner's answer,
+/// which closes where that runner was cancelled. A channel is a type argument, where the escape
+/// checks see it.
+type Joined<answered> = | Run(Int) | Wait(answered)
+
+/// Flights with no run under way, for the tasks of the region it is made in.
+pub fn flights<k, a>() -> Flights<k, a> / {task.write}
   where derivable(ord, k)
-= { next: 0, flying: Map::new() }
+= {
+  let table = task.channel(1);
+  task.send(table, { next: 0, runs: Map::new() });
+  { table: table }
+}
 
-/// What `body` answers, run once for every caller that asks for `key` while it runs: the first
-/// runs it and the others wait for its answer. A later caller, once it has answered, runs it
+/// What `body` answers, run once for every caller that asks `flights` for `key` while it runs: the
+/// first runs it and the others wait for its answer. A later caller, once it has answered, runs it
 /// again. Where the caller running it is cancelled, one of those waiting runs it instead.
 pub fn single_flight<k, a | e>(
-  load: () -> Flights<k, a> / e,
-  store: (Flights<k, a>) -> Unit / e,
+  flights: Flights<k, a>,
   key: k,
   body: () -> a / e,
 ) -> a / {task.write, diverges | e}
   where derivable(ord, k)
-= {
-  let mine = task.channel(1);
-  let now = load();
-  match now.flying.get(key) {
-    Some(flight) -> {
-      store({
-        ..now,
-        flying: now.flying.insert(key, { ..flight, waiting: flight.waiting.push(mine) }),
-      });
-      match task.recv(mine) {
-        Some(answer) -> answer,
-        None -> single_flight(load, store, key, body),
-      }
-    },
-    None -> {
-      store({ next: now.next + 1, flying: now.flying.insert(key, { id: now.next, waiting: [] }) });
-      bracket(|| (), |_u: Unit| landed(load, store, key, now.next, None), |_u: Unit| {
-        let answer = body();
-        bracket(|| landed(load, store, key, now.next, Some(answer)), |_u: Unit| (), |_u: Unit|
-          answer)
-      })
+=
+
+  // Joining is the acquire and giving a run back the release, which a cancel waits out, so the
+  // table is always put back and a run handed to this caller is always let go.
+  bracket(
+    || joined(flights, key),
+    |j: Option<Joined<Chan<a>>>|
+      match j { Some(Run(id)) -> landed(flights, key, id, None), _ -> () },
+    |j: Option<Joined<Chan<a>>>|
+      match j {
+        Some(Run(id)) -> {
+          let answer = body();
+          bracket(|| landed(flights, key, id, Some(answer)), |_u: Unit| (), |_u: Unit| answer)
+        },
+        Some(Wait(answered)) -> match task.recv(answered) {
+          Some(answer) -> answer,
+          None -> single_flight(flights, key, body),
+        },
+        None -> body(),
+      },
+  )
+
+/// The run under way for `key` to wait on, or one this caller starts; none where the table is gone.
+fn joined<k, a>(flights: Flights<k, a>, key: k) -> Option<Joined<Chan<a>>> / {task.write}
+  where derivable(ord, k)
+=
+  match task.recv(flights.table) {
+    None -> None,
+    Some(t) -> match t.runs.get(key) {
+      Some(run) -> {
+        let mine = task.channel(1);
+        task.send(flights.table, {
+          ..t,
+          runs: t.runs.insert(key, { ..run, waiting: run.waiting.push(mine) }),
+        });
+        Some(Wait(mine))
+      },
+      None -> {
+        task.send(flights.table, {
+          next: t.next + 1,
+          runs: t.runs.insert(key, { id: t.next, waiting: [] }),
+        });
+        Some(Run(t.next))
+      },
     },
   }
-}
 
-/// Ends the flight `id` for `key`, if it is still the one under way: each caller waiting on it
-/// is sent `answer`, or told there is none.
-fn landed<k, a | e>(
-  load: () -> Flights<k, a> / e,
-  store: (Flights<k, a>) -> Unit / e,
-  key: k,
-  id: Int,
-  answer: Option<a>,
-) -> Unit / {task.write | e}
+/// Ends the run `id` for `key`, if it is still the one under way: each caller waiting on it is sent
+/// `answer`, or told there is none.
+fn landed<k, a>(flights: Flights<k, a>, key: k, id: Int, answer: Option<a>) -> Unit / {task.write}
+  where derivable(ord, k)
+=
+  match task.recv(flights.table) {
+    None -> (),
+    Some(t) -> match t.runs.get(key) {
+      Some(run) -> if run.id != id { put_back(flights, t) } else {
+        put_back(flights, { ..t, runs: t.runs.remove(key) });
+        run.waiting.fold((), |_u: Unit, waiter: Chan<a>|
+          match answer {
+            Some(x) -> {
+              task.send(waiter, x);
+              ()
+            },
+            None -> task.close(waiter),
+          })
+      },
+      None -> put_back(flights, t),
+    },
+  }
+
+fn put_back<k, a>(flights: Flights<k, a>, t: Flying<k, a>) -> Unit / {task.write}
   where derivable(ord, k)
 = {
-  let now = load();
-  match now.flying.get(key) {
-    Some(flight) -> if flight.id != id { () } else {
-      store({ ..now, flying: now.flying.remove(key) });
-      flight.waiting.fold((), |_u: Unit, waiter: Chan<a>|
-        match answer {
-          Some(x) -> {
-            task.send(waiter, x);
-            ()
-          },
-          None -> task.close(waiter),
-        })
-    },
-    None -> (),
-  }
+  task.send(flights.table, t);
+  ()
 }
 
 // --- Ticks ------------------------------------------------------------------
@@ -1548,23 +1582,35 @@ test "tasks through one bucket are spaced as one caller's calls are, in every in
   assert_eq(times.sort(), [Instant(0), Instant(10), Instant(20)])
 }
 
+/// Each run a test's flights start.
+effect ran {
+  write run() -> Unit
+}
+
+/// `body`, and how many runs it started.
+fn counted_runs<a | e>(body: () -> a / {ran.run | e}) -> { value: a, runs: Int } / e =
+  handle {
+    body()
+  } with {
+    var runs = 0,
+    ran.run() -> {
+      runs = runs + 1;
+    },
+    return value -> { value: value, runs: runs },
+  }
+
 test "callers that ask for one key while it runs share one run and its answer, in every interleaving" {
-  with_cell[runs](0) { runs -> {
-    let answers = simulate {
-      let none: Flights<String, Int> = flights();
-      with_cell[flying](none) { f -> {
+  let ran = counted_runs(||
+    simulate {
+      {
+        let f: Flights<String, Int> = flights();
         let ask = |key: String|
           ||
-            single_flight(
-              || cell_get(f),
-              |next: Flights<String, Int>| cell_set(f, next),
-              key,
-              || {
-                cell_set(runs, cell_get(runs) + 1);
-                clock.sleep(Duration(10));
-                key.len()
-              },
-            );
+            single_flight(f, key, || {
+              ran.run();
+              clock.sleep(Duration(10));
+              key.len()
+            });
         all([
           ask("a"),
           ask("a"),
@@ -1573,47 +1619,46 @@ test "callers that ask for one key while it runs share one run and its answer, i
             ask("a")()
           },
         ])
-      } }
-    };
-    assert_eq(answers, [1, 1, 1]);
-    assert_eq(cell_get(runs), 1)
-  } }
+      }
+    });
+  assert_eq(ran.value, [1, 1, 1]);
+  assert_eq(ran.runs, 1)
 }
 
 test "callers that ask for different keys each run their own, and a later caller runs again" {
-  with_cell[runs](0) { runs -> {
-    let answers = simulate {
-      let none: Flights<String, Int> = flights();
-      with_cell[flying](none) { f -> {
+  let ran = counted_runs(||
+    simulate {
+      {
+        let f: Flights<String, Int> = flights();
         let ask = |key: String|
           ||
-            single_flight(
-              || cell_get(f),
-              |next: Flights<String, Int>| cell_set(f, next),
-              key,
-              || {
-                cell_set(runs, cell_get(runs) + 1);
-                clock.sleep(Duration(10));
-                key.len()
-              },
-            );
-        let together = all([ask("a"), ask("bb")]);
+            single_flight(f, key, || {
+              ran.run();
+              clock.sleep(Duration(10));
+              key.len()
+            });
+        let together = all([
+          ask("a"),
+          || {
+            clock.sleep(Duration(1));
+            ask("bb")()
+          },
+        ]);
         together.concat([ask("a")()])
-      } }
-    };
-    assert_eq(answers, [1, 2, 1]);
-    assert_eq(cell_get(runs), 3)
-  } }
+      }
+    });
+  assert_eq(ran.value, [1, 2, 1]);
+  assert_eq(ran.runs, 3)
 }
 
 test "where the caller running a flight is cancelled, a caller waiting on it runs it instead" {
-  with_cell[runs](0) { runs -> {
-    let ended = simulate {
-      let none: Flights<String, Int> = flights();
-      with_cell[flying](none) { f -> {
+  let ran = counted_runs(||
+    simulate {
+      {
+        let f: Flights<String, Int> = flights();
         let ask = ||
-          single_flight(|| cell_get(f), |next: Flights<String, Int>| cell_set(f, next), "a", || {
-            cell_set(runs, cell_get(runs) + 1);
+          single_flight(f, "a", || {
+            ran.run();
             clock.sleep(Duration(10));
             7
           });
@@ -1626,11 +1671,10 @@ test "where the caller running a flight is cancelled, a caller waiting on it run
             },
           ]));
         (answers, clock.now())
-      } }
-    };
-    assert_eq(ended, ([TimedOut, Done(7)], Instant(15)));
-    assert_eq(cell_get(runs), 2)
-  } }
+      }
+    });
+  assert_eq(ran.value, ([TimedOut, Done(7)], Instant(15)));
+  assert_eq(ran.runs, 2)
 }
 
 // --- Tests of ticks ---------------------------------------------------------

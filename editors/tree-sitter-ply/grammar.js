@@ -399,7 +399,6 @@ module.exports = grammar({
       $.parenthesized_expression,
       $.handle_expression,
       $.try_block,
-      $.with_cell_expression,
       $.with_hold_expression,
       $.simulate_expression,
       $.parallel_expression,
@@ -596,14 +595,6 @@ module.exports = grammar({
     try_block: $ => seq('try', optional($.raise_name), field('body', $.block)),
     raise_name: $ => seq('[', $.operation_name, ']'),
 
-    with_cell_expression: $ => seq(
-      'with_cell',
-      field('label', $.resource_label),
-      '(',
-      commaSep1(field('initial', $._expression)),
-      ')',
-      field('body', $.with_binder_body),
-    ),
     with_hold_expression: $ => seq(
       'with_hold',
       field('label', $.resource_label),

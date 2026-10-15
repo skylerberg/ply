@@ -45,18 +45,48 @@ fn joined(s: String) -> String =
     return x -> x,
   }
 
-fn shared(seed: Int) -> Int / {cell.read[trace], cell.write[trace]} =
-  with_cell[trace](seed) { c -> {
-    let answer = handle {
+effect trace {
+  write step() -> Unit
+}
+
+type Saved = | Done(Int) | Parked((Bool) -> Saved)
+
+fn parked() -> Saved =
+  handle {
+    Done(if amb.flip[coin]() { 41 } else { 0 })
+  } with {
+    amb.flip[coin]() resume k -> Parked(k),
+  }
+
+fn resume_it(s: Saved) -> Int =
+  match s { Parked(k) -> match k(true) { Done(n) -> n, Parked(_) -> 0 }, Done(n) -> n }
+
+// `parked` is pure and nullary, so the memo is offered its answer; a `k` it kept would name a body
+// only the first entry held, and this one would resume nothing.
+test "a later entry resumes the continuation it parked itself" {
+  assert_eq(resume_it(parked()), 41);
+  assert_eq(resume_it(parked()), 41)
+}
+
+// A handler around the one that resumes twice is no part of the continuation, so both runs count on
+// one variable.
+fn shared(seed: Int) -> Int =
+  handle {
+    handle {
       let b = amb.flip[coin]();
-      cell_set(c, cell_get(c) + 1);
+      trace.step();
       if b { 10 } else { 20 }
     } with {
       amb.flip[coin]() resume k -> k(true) + k(false),
       return x -> x,
-    };
-    answer * 1000 + cell_get(c)
-  } }
+    }
+  } with {
+    var steps = seed,
+    trace.step() -> {
+      steps = steps + 1;
+    },
+    return answer -> answer * 1000 + steps,
+  }
 
 fn siblings(seed: Int) -> Int =
   handle {
@@ -68,40 +98,99 @@ fn siblings(seed: Int) -> Int =
     return x -> x,
   }
 
-// A cell opened before the operation is the one each resumption reads: the second run reads what the
-// first wrote.
-fn threaded(seed: Int) -> Int =
-  handle {
-    with_cell[inner](seed) { c -> {
-      let b = amb.flip[coin]();
-      cell_set(c, cell_get(c) + (if b { 1 } else { 2 }));
-      cell_get(c)
-    } }
-  } with {
-    amb.flip[coin]() resume k -> k(true) + k(false),
-    return x -> x,
-  }
-
-fn later(seed: Int) -> Int =
-  handle {
-    with_cell[inner](seed) { c -> {
-      let b = amb.flip[coin]();
-      with_cell[step](if b { 1 } else { 2 }) { d -> {
-        cell_set(c, cell_get(c) + cell_get(d));
-        cell_get(c)
-      } }
-    } }
-  } with {
-    amb.flip[coin]() resume k -> k(true) + k(false),
-    return x -> x,
-  }
-
 test "a clause may resume its continuation more than once, each from where it stopped" {
   assert_eq(both(3), 303);
   assert_eq(thrice(7), 42);
   assert_eq(joined("a"), "abdacd");
   assert_eq(shared(0), 30002);
-  assert_eq(siblings(1), 33);
-  assert_eq(threaded(5), 14);
-  assert_eq(later(5), 14)
+  assert_eq(siblings(1), 33)
+}
+
+effect coin {
+  read flip(n: Int) -> Bool
+}
+
+effect ask {
+  read bit(n: Int) -> Bool
+}
+
+effect tally {
+  write add(n: Int) -> Unit
+  read total() -> Int
+}
+
+effect wide {
+  read pick(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int, i: Int, j: Int, k: Int, l: Int, m: Int, n: Int, o: Int, p: Int, q: Int) -> Bool
+}
+
+fn each(chosen: () -> Int / {coin.flip}) -> Int =
+  handle { chosen() } with { coin.flip(n) resume k -> k(true) + k(false) }
+
+fn in_return() -> Int / {coin.flip} =
+  handle { 1 } with { return x -> if coin.flip(x) { x } else { 10 * x } }
+
+fn in_clause() -> Int / {coin.flip} =
+  handle { if ask.bit(2) { 1 } else { 10 } } with { ask.bit(n) -> coin.flip(n) }
+
+fn in_assigning_clause() -> Int / {coin.flip} =
+  handle {
+    tally.add(1);
+    tally.total()
+  } with {
+    var n = 0,
+    tally.add(k) -> {
+      n = n + (if coin.flip(k) { k } else { 10 * k });
+    },
+    tally.total() -> n,
+  }
+
+fn in_reading_return() -> Int / {coin.flip} =
+  handle {
+    1
+  } with {
+    var n = 5,
+    return x -> if coin.flip(x) { x + n } else { n },
+  }
+
+fn spilled_in_clause() -> Int / {coin.flip} =
+  handle {
+    if wide.pick(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17) { 1 } else { 100 }
+  } with {
+    wide.pick(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) -> coin.flip(q),
+  }
+
+fn in_release() -> Int / {coin.flip} =
+  handle {
+    bracket(|| 0, |u: Int| if coin.flip(3) { () } else { () }, |u: Int| panic("gone"))
+  } with {
+    abort.raise(m) -> 5,
+  }
+
+fn mapped() -> Int / {coin.flip} = {
+  let m = List::map;
+  m([1, 2], |x: Int| if coin.flip(x) { x } else { 10 * x }).fold(0, |a: Int, x: Int| a + x)
+}
+
+fn filtered() -> Int / {coin.flip} = {
+  let f = List::filter;
+  f([1, 2], |x: Int| coin.flip(x)).fold(0, |a: Int, x: Int| a + x)
+}
+
+fn widened() -> Int =
+  handle {
+    if wide.pick(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17) { 1 } else { 100 }
+  } with {
+    wide.pick(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) resume r -> r(q > 16) + r(false),
+  }
+
+test "a continuation resumes as often as asked wherever it was captured: in a clause, a `return`, a release, a callback, or past many arguments" {
+  assert_eq(each(in_return), 1 + 10);
+  assert_eq(each(in_clause), 1 + 10);
+  assert_eq(each(in_assigning_clause), 1 + 10);
+  assert_eq(each(in_reading_return), 6 + 5);
+  assert_eq(each(spilled_in_clause), 1 + 100);
+  assert_eq(each(in_release), 5 + 5);
+  assert_eq(each(mapped), 3 + 21 + 12 + 30);
+  assert_eq(each(filtered), 3 + 1 + 2 + 0);
+  assert_eq(widened(), 1 + 100)
 }

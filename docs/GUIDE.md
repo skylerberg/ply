@@ -219,7 +219,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
 | `resume`, `return` | in a handler clause (§6.5, §6.6) |
-| `with_cell`, `with_hold` | before `[` |
+| `with_hold` | before `[` |
 | `simulate` | before `{` where an expression can start |
 | `try` | before `{`, or before `[` and an operation's name, where an expression can start (§6.8) |
 
@@ -822,7 +822,7 @@ before the literal is checked:
   expected of the whole or of the elements, branches and arms before it; the
   right side of an operator, at its left's;
 * a block's tail, a `let ... else` block, and the body of a `handle` (its
-  `return` clause, where it has one), a `with_cell`, a `with_hold` or a `simulate`, where the
+  `return` clause, where it has one), a `with_hold` or a `simulate`, where the
   whole is expected; the body of a `try`, where a `Result` of it is; a handler
   clause, at what it answers: the operation's result, or the `handle`'s value
   for a raise and for a clause that binds `resume`.
@@ -1004,7 +1004,7 @@ among the type parameters and before the `|` — `fn serve<a, [l], [k] | e>(..)`
 and one bracket may hold several, so `<[l, k]>` is `<[l], [k]>`. A call fills
 them left to right, either written, `relay[conn](b)`, or from an argument whose
 row or type names one (§6.2). A binder that names a region (§7), in a `Hold`'s
-type or in a `cell` or `hold` atom, is filled by the argument that carries the
+type or in a `hold` atom, is filled by the argument that carries the
 region and is never written: the labels a call writes fill the others, so
 `fn log_first<[l], [r]>(h: Hold<Bytes, [r]>) -> Unit / {log.write[l], hold.read[r]}`
 is called `log_first[audit](h)`. A printed signature shows
@@ -1149,21 +1149,23 @@ value. So `ply keygen` draws its seed with `entropy.secret` and writes it, and
 region and cannot outlive it. A hold's type names its region, and it is written
 only where a hold is passed: as the type of a parameter of a definition, a
 lambda or a function type. As a result, a `let` annotation or a type argument
-it is `E0446`. A cell (§7) is a name and no value, so `Cell` is no type a
-program writes (`E0446`). A `Hold` is not data: it is not compared or ordered
-(`E0201`), nor hashed, derived over or made a `Map` key (`E0206`), and `reflect`
-answers the cell it is (`VCell`), never what it holds. A
+it is `E0446`. A `Hold` is not data: it is not compared or ordered (`E0201`),
+nor hashed, derived over or made a `Map` key (`E0206`), and `reflect` never
+answers what it holds. A
 declaration is outside every region, so a variant's field, a `new` record's
 field or an operation's parameter or result that mentions a `Hold`, a `Task` or
 a `Chan`, at any depth, is `E0446`. Take it as a type parameter instead,
 `type Held<t> = Held(t)`: the type argument carries the region where the escape
 checks see it. A sum hides the rows its fields write, so a field whose function
-names `cell` or `hold`, or joins a task or works a channel, in its row is `E0446` as well:
+names `hold`, or joins a task or works a channel, in its row is `E0446` as well:
 take the row as a row parameter, `type Held<| e> = Held(() -> Int / e)`, and a
 closure that reaches a region is seen leaving it in the row the type is given.
+An operation's parameter or result is held to the same rule, since a handler
+may keep what it is handed past the region: take the row as the operation's,
+`write put<| e>(f: () -> Int / e) -> Unit`.
 A `new` record's fields are read wherever it goes, so one may write such a row;
 a row a declaration writes names no region (§7), though, so a closure over a
-cell or a hold is held through a row parameter there too, and the row the type
+hold is held through a row parameter there too, and the row the type
 is given is seen leaving the region as a plain record's is.
 
 ### 4.7 Function types, and what is written
@@ -1215,7 +1217,7 @@ a run of operators of one precedence are each one level, however long.
 A block `{ statements... tail }` has its tail's value, or `Unit` with no tail.
 `let <pattern> [: Type] = <expr>;` binds once (the `;` is required) and may
 shadow. An expression statement needs `;` unless it is the tail or block-like
-(`if`, `match`, `handle`, a block, `with_cell`, `with_hold`, `simulate`).
+(`if`, `match`, `handle`, a block, `with_hold`, `simulate`).
 
 A `let` pattern can take apart a record, which is how a function returns several
 values:
@@ -1387,8 +1389,8 @@ keeps its declared type (`E0201`), and it builds one: outside the module of an
 otherwise copies one path of the list's trie; `List::set` is the same, and
 `Array::set` copies the whole array. A copy is caused by a second owner: a
 binding read again after the update, a capture of a closure that is called
-again, a value read out with `cell_get`/`Map::get`/`List::at`/`Array::get` (use
-`cell_update`/`Map::update`), or a caller that keeps using what it passed.
+again, a value read out with `Map::get`/`List::at`/`Array::get` (use `Map::update`),
+or a caller that keeps using what it passed.
 "Again" is along the path taken: an `if` or `match` branch lets go, as it
 opens, of a binding only another branch reads, and a closure called by the
 only holder of it, as a sequence's step is pulled, gives its call what it
@@ -1451,7 +1453,7 @@ each other, so `even`/`odd` mutual recursion does not nest either. A group with
 a `handle` in a member's body is compiled definition by definition and nests.
 
 Every other call nests, at most 10,000 deep (then `E0502`): `1 + f(n - 1)`, a
-call inside `handle`, `with_cell`, `with_hold` or a lambda, and a call of another function.
+call inside `handle`, `with_hold` or a lambda, and a call of another function.
 The depth is each task's own (§9): a task nests from where its region stands,
 whatever the tasks beside it hold, and so does the body of a `handle` whose
 clause resumes anywhere but its tail.
@@ -1489,7 +1491,7 @@ it and the function's result and everything evaluated before it is pure:
 `let x = e?;`, or `parse_or_more(parse_and(ts)?)`.
 
 * It converts no errors: `Result<_, E1>` inside `-> Result<_, E2>` is `E0201`.
-* `E0118`: inside a `handle`, `try`, `with_cell`, `with_hold` or `simulate`; inside a
+* `E0118`: inside a `handle`, `try`, `with_hold` or `simulate`; inside a
   lambda without a written return type; or where `Ok`/`Err`/`Some`/`None` are
   rebound. A lambda with a written return type exits the lambda.
 * `E0119`: in an `if` branch, `match` arm or right of `&&` not in return
@@ -1506,8 +1508,8 @@ fn both(xs: List<Int>) -> (Int, Int) =
 `parallel { a, b, .. }` answers the tuple `(a, b, ..)` and means exactly that:
 the branches evaluated left to right. The runtime runs them at once, on threads
 of its own, wherever that cannot change the answer: the checker admits a block
-only when no two branches' rows conflict (§6.2), cells of a region opened
-outside the block included, so a branch reads nothing another writes. It takes
+only when no two branches' rows conflict (§6.2), so a branch reads nothing
+another writes. It takes
 two or more branches, and `parallel` is a name wherever no `{` follows it.
 
 * The block's row is the union of its branches'; it is as deterministic as they
@@ -1521,7 +1523,7 @@ two or more branches, and `parallel` is a name wherever no `{` follows it.
   definition's own body is held to that definition's row: a `handle` that
   answers no effect in it does not keep the block in turn. One inside a lambda
   or the body of a `handle` is kept in turn by any `handle` around it. So is
-  one whose branches hold a cell, a task or a continuation, and so is every
+  one whose branches hold a task or a continuation, and so is every
   block of a program entered on another's branch, as each test of a `ply test`
   run is. Under `--host` each branch waits on a reactor of its own.
 * `E0309`: two branches perform operations of one effect on one resource, one
@@ -1645,7 +1647,7 @@ where it was performed; a `raise` does not come back, so it writes a name and
 its parameters and no result (§6.8). `[r]` makes a `read` or a `write`
 resource-parameterized: a perform must supply a label (`E0304`). `nondet` marks
 results that are not a function of program state (§8.3). Effects are nominal.
-`task`, `clock`, `random`, `sim`, `abort`, `diverges` and `cell` are taken
+`task`, `clock`, `random`, `sim`, `abort`, `diverges` and `hold` are taken
 (`E0105`).
 
 An operation's type parameters sit just before its parameters,
@@ -1697,7 +1699,7 @@ their rows: given `fn both<| e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / 
 `both(|| a.x(), || b.y())` performs exactly `{a.x, b.y}`, and
 `[|| a.x(), || b.y()]` is a `List<() -> Unit / {a.x, b.y}>`.
 
-Inside a function's parameter, a cell, a `Task`, a `Chan` or a sum type the
+Inside a function's parameter, a `Task`, a `Chan` or a sum type the
 program declares, rows must match exactly, because a function held there can be
 handed what its own type does not admit: a parameter typed
 `() -> Unit / {net.send[conn]}` is not one typed `() -> Unit / {net.write[conn]}`,
@@ -1859,11 +1861,7 @@ by its type.
 In `amb.flip[coin]() resume k -> k(true) + k(false)`, `resume k` binds the
 continuation; the clause then has the `handle`'s type and may call `k` any
 number of times. Without `resume`, a clause's value returns to the perform site,
-except a clause for a `raise` operation (§6.8). A continuation captured while
-the runtime calls into the program holding memory of its own across the call
-resumes once, and a second resumption ends the run with `E0502`: inside a
-clause or a `return` clause of a `handle` the body opened, or a `bracket`'s
-release during a raise.
+except a clause for a `raise` operation (§6.8).
 
 A clause that binds `resume` and never calls it abandons the body where it stood,
 and `bracket(acquire, release, body)` is how a body that holds something lets it
@@ -2016,8 +2014,7 @@ definition's own recursion; under `--json` each definition carries both, as
 A `parallel` branch's raise is answered around the block. A task may raise:
 its raise goes to the task's own `handle`s and then to those around its
 `simulate` region, never to the copies its spawn inherited (§9); outside
-`simulate` it ends the run. A `cell_update` whose function raised leaves the
-cell as it was.
+`simulate` it ends the run.
 
 ### 6.9 Handler variables
 
@@ -2048,8 +2045,8 @@ the body, which reaches them only through the operations its row names.
 
 A clause gives a variable a new value with `name = value;`, anywhere in its
 blocks and in the branches of its `if`s and `match`es. An assignment inside a
-lambda, or inside the body of a nested `handle`, `simulate`, `parallel`, `try`,
-`with_cell` or `with_hold`, is `E0315`, since what runs there may run after
+lambda, or inside the body of a nested `handle`, `simulate`, `parallel`, `try`
+or `with_hold`, is `E0315`, since what runs there may run after
 the clause has returned; so is one in `return`, after which the variables are
 gone. A lambda reads the value a variable had where the lambda was made.
 Assigning a name that is not a variable of the handler whose clause it is in, a
@@ -2063,64 +2060,41 @@ in it unless what it answers carries them out, as `return` can. Where a
 handler stands decides what a resumption sees: one inside the continuation a
 clause resumes twice starts each resumption from the values it had where the
 continuation was captured, and one outside it is shared by every resumption.
-The tasks spawned under a handler share its variables (§9).
-
-## 7. Cells and regions
 
 ```ply
-fn counted(n: Int) -> Int =
-  with_cell[work](0) { c -> {
-    cell_set(c, cell_get(c) + n);
-    cell_get(c)
-  } }
+effect amb {
+  read flip() -> Bool
+}
+
+fn counted() -> Int / {amb.flip} =
+  handle {
+    tally.add(if amb.flip() { 1 } else { 10 })
+  } with {
+    var sum = 0,
+    tally.add(n) -> {
+      sum = sum + n;
+    },
+    return u -> sum,
+  }
+
+fn each() -> Int = handle { counted() } with { amb.flip() resume k -> k(true) + k(false) }
 ```
 
-`with_cell[r](init) { c -> body }` allocates a cell for the duration of `body`,
-in an allocation scope named `r` that closes at the body's `}`. Nest
-`with_cell`s for several cells; reusing the name allocates into the region
-already open.
+`each()` is `1 + 10`: `counted`'s handler stands inside the continuation
+`flip`'s clause resumes, so each resumption starts from `sum = 0`. Moved
+around `each`'s `handle`, the one `sum` would be shared, and the second
+resumption would add to what the first left.
 
-`c` is the cell's name and no value. It stands as the first argument of
-`cell_get`, `cell_set` and `cell_update` and nowhere else: a cell is not bound
-to another name, passed, answered or put in a value, and `Cell` is no type a
-program writes (`E0446`). What reaches a cell from elsewhere is a closure that
-names it. `|| cell_get(c)` is a `() -> Int / {cell.read[r]}`; `cell_set` puts
-`cell.write[r]` in a row and `cell_update` both. The region answers both atoms
-for its own cells, and a closure whose row carries one may not leave it
-(`E0201`). A cell builtin given anything but a cell's name is `E0304`.
+The tasks spawned under a handler share its variables (§9). A clause runs with
+no other task's clause running in between until it performs something that may
+wait, such as a `task` or `clock` operation or a host operation under
+`--host`: one that reads a variable, waits, and then assigns it may write over
+what another task's clause assigned meanwhile. Keep a read and the assignment
+it decides on the same side of every wait. `simulate` searches the orders in
+which tasks reach a handler's variables, so a test of such a handler meets the
+lost update.
 
-Inside the region, `r` in a `cell` atom is the region. Anywhere else it is the
-resource of that name (§6.2), and so it is under every other effect inside the
-region too. A row written outside the region therefore does not name it: a
-parameter typed `() -> Int / {cell.read[r]}` does not take a closure over the
-cell (`E0302`), and a `with_cell[r]` does not answer the `cell.read[r]` of a
-function it calls. A function is handed such a closure through a row parameter,
-`fn twice<| e>(f: () -> Int / e) -> Int / e`. A definition's own row says
-`cell.read[r]` only where a clause that binds `resume` (§6.6) ran the rest of a
-region's body past the region; no region answers that atom, so it is in the
-row of every caller.
-
-The scheduler that runs a spawned task must be younger than the region whose
-cell the task can reach: open it inside the region,
-`with_cell[r](init) { c -> simulate { .. } }`, and not around it,
-`simulate { with_cell[r](init) { c -> .. } }`. An older scheduler — an enclosing
-`simulate` region (§9), or the production one under `--host` — drains the tasks
-nobody joined after the region's `}`, and a `task.join` inside the region does
-not license it, because no type records the join. A task reaches a cell through
-the closure it is handed, and through the handlers around its `task.spawn`: a
-clause answering an operation the task performs runs on the task's behalf, so
-under an older scheduler it may not touch the region's cells either. This judges
-the spawns a body performs itself, not those of a function it calls.
-
-A task or a channel, in turn, may be kept only in a cell younger than the
-`simulate` region that made it. A `simulate` region may not write a cell of a
-region opened around it while that cell can hold a `Task` or a `Chan`, whether it
-writes the cell itself or calls a function whose row writes it: keep the handle in
-a cell opened inside the region, or finish with it there and store what it gave.
-Nor may one come in from outside: the region may not name a binding from outside
-it whose value holds a `Task` or a `Chan` (a parameter, or a local, whether the
-body or a closure inside it names it), nor read a cell of a region opened around
-it while that cell can hold one (`E0413`, §9).
+## 7. Holds and regions
 
 ```ply
 fn first_byte(path: String) -> Bytes / {fs.open[repo], fs.read_chunk[repo], fs.close[repo], io.refused, io.closed} =
@@ -2150,9 +2124,8 @@ takes a hold binds the region as a label (§4.5),
 `fn first<[r]>(h: Hold<Bytes, [r]>) -> Int / {hold.read[r]}`, and a call fills
 it from the hold it passes and never writes it; a closure that reads a hold
 carries the atom in its type; and a `with_hold[r]` answers `hold.read[r]` for
-its own hold and no other, as `with_cell` answers its cells' atoms. `hold` is
-the language's effect, as `cell` is (`E0105`, `E0103`). A hold is passed and
-never kept:
+its own hold and no other. `hold` is the language's effect (`E0105`, `E0103`).
+A hold is passed and never kept:
 `Hold` is written only as the type of a parameter, of a definition, a lambda or
 a function type, and anywhere else is `E0446` (§4.6). So a hold passes to
 functions and into the closures of `List::map`, `List::fold` and `iterate`, and the checker
@@ -2160,7 +2133,30 @@ still sees every way out of the region: the hold itself by its type, and a
 closure that reads it by its row, each naming the region, so what reads one
 hold may leave the region of another. A hold is let go at the `}` of its own
 region, so that region is the hold's alone: a `with_hold[r]` inside a region
-named `r`, or a `with_cell[r]` inside a `with_hold[r]`, is `E0330`.
+named `r` is `E0330`.
+
+Inside the region, `r` in a `hold` atom is the region. Anywhere else it is the
+resource of that name (§6.2), and so it is under every other effect inside the
+region too. A row written outside the region therefore does not name it: a
+parameter typed `() -> Int / {hold.read[r]}` does not take a closure over the
+hold (`E0302`), and a `with_hold[r]` does not answer the `hold.read[r]` of a
+function it calls. A function is handed such a closure through a row parameter,
+`fn twice<| e>(f: () -> Int / e) -> Int / e`. A definition's own row says
+`hold.read[r]` only where a clause that binds `resume` (§6.6) ran the rest of a
+region's body past the region; no region answers that atom, so it is in the
+row of every caller.
+
+The scheduler that runs a spawned task must be younger than the region whose
+hold the task can reach: open it inside the region,
+`with_hold[r](..) { h -> simulate { .. } }`, and not around it,
+`simulate { with_hold[r](..) { h -> .. } }`. An older scheduler — an enclosing
+`simulate` region (§9), or the production one under `--host` — drains the tasks
+nobody joined after the region's `}`, and a `task.join` inside the region does
+not license it, because no type records the join. A task reaches a hold through
+the closure it is handed, and through the handlers around its `task.spawn`: a
+clause answering an operation the task performs runs on the task's behalf, so
+under an older scheduler it may not read the region's hold either. This judges
+the spawns a body performs itself, not those of a function it calls.
 
 What `Hold::get` answers is a value like any other, and a copy of it may leave
 the region the hold may not. So a library keeps what is held useless without
@@ -2175,25 +2171,18 @@ let go (a clause that resumes twice, §6.6) finds the hold gone: its first
 `release` does not run again. Where what was acquired is a host's, an
 at-most-once operation on it refuses the second resumption first (`E0426`).
 
-At run time a hold is a cell of its region, so `E0449` and a failure that names
-its type call it a `Cell`.
-
-* `E0201`: a closure that reads or writes a cell escapes its `with_cell[r]`
-  region.
-* `E0330`: a `with_hold` names a region that is open, or a `with_cell` a
-  `with_hold`'s.
+* `E0330`: a `with_hold` names a region that is open.
 * `E0331`: a hold is read or let go after its region released what it held (at
   run time).
-* `E0446`: a cell's name is used as a value, or `Cell` is written as a type;
-  `Hold` is written where a hold would be kept; a hold, or a closure whose row
-  reads it, escapes its `with_hold[r]` region, at the expression that would
-  carry it out; a value of a region outlives it (stored in an older binding,
-  handed to an operation, or reached by a task whose scheduler is older than
-  the region, through the closure it runs or a handler around its spawn), a
-  task is stored in a cell older than its `simulate` region, a declared type's
-  field or an operation's signature mentions a `Hold`, a `Task` or a `Chan`, or
-  a variant's field holds a function whose written row reaches one (§4.6).
-* `E0449`: a region handle (a cell, a task, a channel, or the continuation a clause's
+* `E0446`: `Hold` is written where a hold would be kept; a hold, or a closure
+  whose row reads it, escapes its `with_hold[r]` region, at the expression that
+  would carry it out; a value of a region outlives it (handed to an operation,
+  or reached by a task whose scheduler is older than the region, through the
+  closure it runs or a handler around its spawn); a declared type's field or an
+  operation's signature mentions a `Hold`, a `Task` or a `Chan`; or a variant's
+  field or an operation's parameter or result holds a function whose written row
+  reaches one (§4.6).
+* `E0449`: a region handle (a task, a channel, or the continuation a clause's
   `resume` binds) reaches a host operation, a host answer, or an entry point's
   argument or answer (at run time). A continuation's type is an ordinary
   function's, so this is the one check that sees it.
@@ -2346,9 +2335,9 @@ effect, or write `test/nondet "label" { ... }`, which is cached as any test is
 
 Tests whose footprints do not conflict run concurrently, under `parallel`
 blocks (§5.9) on one thread per core; a test whose effects are all discharged in
-a region conflicts with nothing. Only an atom of a `nondet` effect or of a
-region's `cell` conflicts with another test's: what answers any other is a
-function of the test's own state. A raise is in no footprint, since the run
+a region conflicts with nothing. Only an atom of a `nondet` effect conflicts
+with another test's: what answers any other is a function of the test's own
+state. A raise is in no footprint, since the run
 answers it as the test's failure. `--jobs N`/`-j` deals them into `N` lanes, each
 lane's tests in turn (default: a lane per test). `ply prove --jobs N` deals its
 claims' points the same way.
@@ -2440,7 +2429,7 @@ simulate {
   let b = task.spawn(|| settle("alice", "carol", 60));
   task.join(a);
   task.join(b);
-  assert_eq(overdrawn(cell_get(ledger)), 0)
+  assert_eq(overdrawn(ledger.balances()), 0)
 }
 ```
 
@@ -2470,7 +2459,7 @@ effect sim           { read  seed() -> Int }
 * Virtual time advances only when no task is enabled, so `clock.sleep` costs no
   wall clock. Outside a region `task` and `clock` are the host's (§14).
 * A task performs against the handlers around its `task.spawn`, so a clause it
-  reaches touches only the cells the task itself may (§7); a clause that binds
+  reaches reads only the holds the task itself may (§7); a clause that binds
   `resume` is unreachable from a task (`E0502`), and a clause for a raise is
   not among them (§6.8).
 * `E0413`: a `Task` or a `Chan` escapes in the region's answer: directly,
@@ -2481,12 +2470,11 @@ effect sim           { read  seed() -> Int }
   either as the `sim.read` of a `simulate` it opens to use one, so a function
   whose row carries any of these may not leave the region. A task or channel
   from outside may not come in either: the region may not name a binding from
-  outside it whose value holds one, nor read one from a cell older than the
-  region (§7). Every region numbers its own tasks and channels, so a handle that
+  outside it whose value holds one. Every region numbers its own tasks and
+  channels, so a handle that
   reaches another region past the checker, in a closure or through a type
   parameter, fails there at run time with `E0413` rather than name one of that
-  region's. `E0446`: a task is stored in a cell older than the region
-  (§7). `E0414`: no progress, or a spent step budget. `E0416`: nested
+  region's. `E0414`: no progress, or a spent step budget. `E0416`: nested
   `simulate`. `E0425`: a host operation inside the region, refused before the
   handler runs and whether or not it is bound; the region answers `task`,
   `clock`, `random` and `sim.seed` itself.
@@ -2545,7 +2533,7 @@ selected over as channels of one sum. A select is ordered against every
 operation on each of its arms' channels.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
-allocations, and two accesses to one cell with a write, are ordered. A
+allocations, and two accesses to one handler's variable with a write, are ordered. A
 read-then-write with no scheduler operation between runs as one step, so put a
 `task.yield()` there. When the default search exhausts its frontier the result
 holds for **every** interleaving and is reported `exhaustive`.
@@ -3710,7 +3698,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0313` | `try` naming an operation that is not a `raise` |
 | `E0314` | assignment to a name that is not a variable of the handler whose clause it is in |
 | `E0315` | handler variable assigned in a lambda, a nested body or `return` |
-| `E0330` | `with_hold` naming a region already open, or a `with_cell` naming a `with_hold`'s |
+| `E0330` | `with_hold` naming a region already open |
 | `E0331` | hold read or let go after its region released what it held |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` or `Chan` escapes its region, or enters another |
@@ -3744,7 +3732,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0443` | artifact does not verify |
 | `E0444` | artifact built by another compiler or for another runtime |
 | `E0445` | `trace.exit` of a span not open on this task |
-| `E0446` | cell or hold kept as a value, or a value that outlives its region |
+| `E0446` | hold kept as a value, or a value that outlives its region |
 | `E0447` | a statement checked against the schema that answers `*` |
 | `E0448` | definition the C backend cannot compile |
 | `E0449` | region handle or continuation reaching a runtime boundary |

@@ -100,114 +100,88 @@ law "a movement between two accounts leaves the bank's total alone"
     total(credited(credited(opening(), "alice", -amount), "bob", amount)) == total(opening())
   }
 
+/// What the accounts and the journal are once `body` has run against them, from the opening
+/// balances.
+type Books = { ledger: List<Account>, journal: List<Movement> }
+
+fn banked<a | e>(
+  body: () -> a / {bank.balance[accounts], bank.take[accounts], bank.credit[accounts], bank.record[journal] | e},
+) -> Books / e =
+  handle {
+    body()
+  } with {
+    var ledger = opening(),
+    var journal = [],
+    bank.balance[accounts](who) -> balance_of(ledger, who),
+    bank.take[accounts](who, amount) -> if balance_of(ledger, who) < amount { false } else {
+      ledger = credited(ledger, who, -amount);
+      true
+    },
+    bank.credit[accounts](who, amount) -> {
+      ledger = credited(ledger, who, amount);
+    },
+    bank.record[journal](m) -> {
+      journal = journal.push(m);
+    },
+    return u -> { ledger: ledger, journal: journal },
+  }
+
 // The concurrency law.
 law "no interleaving of two guarded settlements can overdraw the account" {
-  with_cell[accounts](opening()) { ledger -> {
-    with_cell[journal]([]) { log -> {
-      handle {
-        simulate {
-          let a = task.spawn(|| settle("alice", "bob", 60));
-          let b = task.spawn(|| settle("alice", "carol", 60));
-          task.join(a);
-          task.join(b);
-          overdrawn(cell_get(ledger)) == 0 && total(cell_get(ledger)) == 200
-            && balance_of(cell_get(ledger), "alice") == 40
-            && cell_get(log).len() == 1
-        }
-      } with {
-        bank.take[accounts](who, amount) -> if balance_of(cell_get(ledger), who) < amount { false }
-        else {
-          cell_set(ledger, credited(cell_get(ledger), who, -amount));
-          true
-        },
-        bank.credit[accounts](who, amount) ->
-          cell_set(ledger, credited(cell_get(ledger), who, amount)),
-        bank.record[journal](m) -> cell_set(log, cell_get(log).push(m)),
-      }
-    } }
-  } }
+  let books = banked(||
+    simulate {
+      let a = task.spawn(|| settle("alice", "bob", 60));
+      let b = task.spawn(|| settle("alice", "carol", 60));
+      task.join(a);
+      task.join(b)
+    });
+  overdrawn(books.ledger) == 0 && total(books.ledger) == 200
+    && balance_of(books.ledger, "alice") == 40
+    && books.journal.len() == 1
 }
 
 test "a lone transfer moves the money and stops at the balance" {
-  with_cell[accounts](opening()) { ledger -> {
-    with_cell[journal]([]) { log -> {
-      handle {
-        simulate {
-          assert(settle("alice", "bob", 60));
-          assert(!settle("alice", "bob", 60));
-          assert_eq(balance_of(cell_get(ledger), "alice"), 40);
-          assert_eq(balance_of(cell_get(ledger), "bob"), 110);
-          assert_eq(total(cell_get(ledger)), 200);
-          assert_eq(cell_get(log).len(), 1)
-        }
-      } with {
-        bank.take[accounts](who, amount) -> if balance_of(cell_get(ledger), who) < amount { false }
-        else {
-          cell_set(ledger, credited(cell_get(ledger), who, -amount));
-          true
-        },
-        bank.credit[accounts](who, amount) ->
-          cell_set(ledger, credited(cell_get(ledger), who, amount)),
-        bank.record[journal](m) -> cell_set(log, cell_get(log).push(m)),
-      }
-    } }
-  } }
+  let books = banked(||
+    simulate {
+      assert(settle("alice", "bob", 60));
+      assert(!settle("alice", "bob", 60))
+    });
+  assert_eq(balance_of(books.ledger, "alice"), 40);
+  assert_eq(balance_of(books.ledger, "bob"), 110);
+  assert_eq(total(books.ledger), 200);
+  assert_eq(books.journal.len(), 1)
 }
 
 // The racy version, asserting only what survives every interleaving.
 test "two unguarded transfers conserve the money whichever order they run in" {
-  with_cell[accounts](opening()) { ledger -> {
-    with_cell[journal]([]) { log -> {
-      handle {
-        simulate {
-          let a = task.spawn(|| transfer("alice", "bob", 60));
-          let b = task.spawn(|| transfer("alice", "carol", 60));
-          task.join(a);
-          task.join(b);
-          assert_eq(total(cell_get(ledger)), 200);
-          assert_eq(
-            cell_get(log).fold(0, |acc, m: Movement| acc + m.amount),
-            100 - balance_of(cell_get(ledger), "alice"),
-          )
-        }
-      } with {
-        bank.balance[accounts](who) -> balance_of(cell_get(ledger), who),
-        bank.credit[accounts](who, amount) ->
-          cell_set(ledger, credited(cell_get(ledger), who, amount)),
-        bank.record[journal](m) -> cell_set(log, cell_get(log).push(m)),
-      }
-    } }
-  } }
+  let books = banked(||
+    simulate {
+      let a = task.spawn(|| transfer("alice", "bob", 60));
+      let b = task.spawn(|| transfer("alice", "carol", 60));
+      task.join(a);
+      task.join(b)
+    });
+  assert_eq(total(books.ledger), 200);
+  assert_eq(
+    books.journal.fold(0, |acc, m: Movement| acc + m.amount),
+    100 - balance_of(books.ledger, "alice"),
+  )
 }
 
 // The one the milestone exists for.
 test "the guarded transfer never overdraws, under every interleaving" {
-  with_cell[accounts](opening()) { ledger -> {
-    with_cell[journal]([]) { log -> {
-      handle {
-        simulate {
-          let a = task.spawn(|| settle("alice", "bob", 60));
-          let b = task.spawn(|| settle("alice", "carol", 60));
-          task.join(a);
-          task.join(b);
-          assert_eq(overdrawn(cell_get(ledger)), 0);
-          assert_eq(total(cell_get(ledger)), 200);
-          assert_eq(balance_of(cell_get(ledger), "alice"), 40);
-          assert_eq(cell_get(log).len(), 1);
-          assert_eq(cell_get(log).fold(0, |acc, m: Movement| acc + m.amount), 60)
-        }
-      } with {
-        bank.take[accounts](who, amount) -> if balance_of(cell_get(ledger), who) < amount { false }
-        else {
-          cell_set(ledger, credited(cell_get(ledger), who, -amount));
-          true
-        },
-        bank.credit[accounts](who, amount) ->
-          cell_set(ledger, credited(cell_get(ledger), who, amount)),
-        bank.record[journal](m) -> cell_set(log, cell_get(log).push(m)),
-      }
-    } }
-  } }
+  let books = banked(||
+    simulate {
+      let a = task.spawn(|| settle("alice", "bob", 60));
+      let b = task.spawn(|| settle("alice", "carol", 60));
+      task.join(a);
+      task.join(b)
+    });
+  assert_eq(overdrawn(books.ledger), 0);
+  assert_eq(total(books.ledger), 200);
+  assert_eq(balance_of(books.ledger, "alice"), 40);
+  assert_eq(books.journal.len(), 1);
+  assert_eq(books.journal.fold(0, |acc, m: Movement| acc + m.amount), 60)
 }
 
 // Nothing here is concurrent, so nothing here is seeded: the pure helpers keep their ordinary `det`

@@ -10,7 +10,7 @@ pub const MARSHALLED: &[(&str, &str, &[&str])] = &[
     (
         "sim.recording",
         "Access",
-        &["AAtom", "ACell", "AAlloc", "AVar"],
+        &["AAtom", "ACell", "AAlloc", "AVar", "AHold"],
     ),
     ("sim.recording", "Verdict", &["Passed", "Failed"]),
 ];
@@ -145,6 +145,14 @@ fn access_value(access: &ply_eval::sim::Access) -> PlyValue {
             vec![record(vec![
                 ("handler", PlyValue::Int(*handler as i64)),
                 ("index", PlyValue::Int(i64::from(*at))),
+                ("write", PlyValue::Bool(*mode == ply_eval::Mode::Write)),
+            ])],
+        ),
+        Access::Hold { id, mode } => case(
+            "Access",
+            "AHold",
+            vec![record(vec![
+                ("id", PlyValue::Int(*id as i64)),
                 ("write", PlyValue::Bool(*mode == ply_eval::Mode::Write)),
             ])],
         ),
