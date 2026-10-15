@@ -6,11 +6,11 @@ import parsing (Span, Ident, QName, span_to, dummy_span, is_bare, starts_upper, 
                 span_between)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, RowExpr, AtomExpr, Mode, MRead, MWrite,
                     MBad, mode_text)
-import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, Cases,
-              TypeDefBody, TDSum, TDAlias, VariantDef, SpecClause, SCost, Binder, Vis, VPub, VPriv,
-              ImportDecl, ImportKind, IModule, IAlias, INames, Derived, EffectSetDef, OpDef, LawDef,
-              OfSchema, schema_named, schema_guard_name, parse, dump_module, is_pub, TDNominal,
-              member_name, Opaque)
+import items (Module, Item, IFn, IExtern, is_shipped, IType, IEffect, ITest, ILaw, IDerive,
+              IEffectSet, FnDef, Cases, TypeDefBody, TDSum, TDAlias, VariantDef, SpecClause, SCost,
+              Binder, Vis, VPub, VPriv, ImportDecl, ImportKind, IModule, IAlias, INames, Derived,
+              EffectSetDef, OpDef, LawDef, OfSchema, schema_named, schema_guard_name, parse,
+              dump_module, is_pub, TDNominal, member_name, Opaque)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign, Param,
@@ -375,6 +375,7 @@ fn declarations_of(parsed: ParsedModule) -> Decls =
   parsed.module.items.fold(no_decls(), |decls: Decls, item: Item|
     match item {
       IFn(f) -> declare(decls, ValueSpace, parsed.name, f.name, f.vis),
+      IExtern(f) -> declare(decls, ValueSpace, parsed.name, f.name, f.vis),
       IEffect(e) -> declare(decls, EffectSpace, parsed.name, e.name, e.vis),
       IEffectSet(e) -> declare(decls, SetSpace, parsed.name, e.name, e.vis),
       IType(t) -> {
@@ -540,6 +541,13 @@ fn declared(w: World, i: Int, t: Int) -> ImportTarget / {abort.raise} = {
   }
 }
 
+/// Whether module `i` imports `t`, a module below `std.internal`, which only the toolchain's own
+/// modules may.
+fn internal_import(w: World, i: Int, t: Int) -> Bool / {abort.raise} = {
+  let held = w.mods.get(t).name;
+  (held == b"std.internal" || held.starts_with(b"std.internal.")) && !is_shipped(w.mods.get(i).name)
+}
+
 fn target_or_report(
   w: World,
   i: Int,
@@ -547,7 +555,30 @@ fn target_or_report(
   decl: ImportDecl,
 ) -> { b: Builder, t: Option<Int> } / {abort.raise} =
   match target(w, i, builder, decl) {
-    Found(t) -> { b: builder, t: Some(t) },
+    Found(t) -> if internal_import(w, i, t) {
+      {
+        b: {
+          ..builder,
+          diags: builder.diags.push(
+            error_at(
+              b"E0159",
+              i,
+              path_span(decl),
+              Bytes::concat_all([
+                b"`",
+                w.mods.get(t).name,
+                b"` is the toolchain's own, which only its shipped modules import",
+              ]),
+              b"not importable here",
+              [
+                b"a module below `std.internal` holds what the standard library shares within itself, not what it offers a program",
+              ],
+            ),
+          ),
+        },
+        t: None,
+      }
+    } else { { b: builder, t: Some(t) } },
     Undeclared(u) -> {
       let name = import_module_name(decl);
       let message = if u.holder == 0 {
@@ -3953,6 +3984,24 @@ fn resolved(sources: List<Source>) -> Expanded / {abort.raise} =
     ResolveSucceeded(x) -> x,
     ResolveFailed(ds) -> panic(String::of_bytes(b"refused: ".concat(dump_diags(ds)))),
   }
+
+test "a module below `std.internal` is imported by the toolchain's modules alone" {
+  let internal = { name: b"std.internal.shared", src: b"pub fn one() -> Int = 1\n" };
+  assert_eq(
+    refused_codes([
+      internal,
+      { name: b"std.user", src: b"import std.internal.shared\nfn f() -> Int = shared::one()\n" },
+    ]),
+    [],
+  );
+  assert_eq(
+    refused_codes([
+      internal,
+      { name: b"m", src: b"import std.internal.shared\nfn f() -> Int = shared::one()\n" },
+    ]),
+    [b"E0159"],
+  )
+}
 
 fn refused_codes(sources: List<Source>) -> List<Bytes> / {abort.raise} =
   match resolve(sources) {

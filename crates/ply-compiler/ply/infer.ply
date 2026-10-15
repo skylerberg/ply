@@ -9,14 +9,14 @@ import std.graph
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, MRaise, ty_span, mode_text, is_raise, ident_names, mode_bin)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
-              FnDef, ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum,
-              VariantDef, EffectDef, OpDef, TestDef, Cases, LawDef, OfSchema, Binder, Constraint,
-              Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger, DRow, is_predicate,
-              deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost, SSpace,
-              SpecClause, Derived, DeriveDef, parse, TDNominal, test_run, test_listing, IInstance,
-              InstanceDef, InstanceKind, NKey, NShow, instance_text, INumeric, NumericDef,
-              member_name, member_of, NumericOp, numeric_ops, numeric_by, is_pub, Opaque,
-              spec_kind_bin, deriver_bin, instance_kind_bin)
+              is_shipped, FnDef, ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias,
+              TDSum, VariantDef, EffectDef, OpDef, TestDef, Cases, LawDef, OfSchema, Binder,
+              Constraint, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger, DRow,
+              is_predicate, deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures,
+              SCost, SSpace, SpecClause, Derived, DeriveDef, parse, TDNominal, test_run,
+              test_listing, IInstance, InstanceDef, InstanceKind, NKey, NShow, instance_text,
+              INumeric, NumericDef, member_name, member_of, NumericOp, numeric_ops, numeric_by,
+              is_pub, Opaque, spec_kind_bin, deriver_bin, instance_kind_bin)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr,
@@ -1298,8 +1298,9 @@ fn declared_types(
     { d: o.d, tys: acc.tys.push(o.ty) }
   })
 
-/// A type as a declaration writes it. Only the language's own types and the prelude's imports are
-/// in reach of one, and a cell's region is the call's to fix, so a declaration is generic over it.
+/// A type as a declaration writes it: the language's own, or one its module declares or imports by
+/// name, at the arguments written. A cell's region is the call's to fix, so a declaration is generic
+/// over it.
 fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {abort.raise} =
   match ty {
     TVar(id) -> match d.tys.get(id.name) {
@@ -1328,7 +1329,10 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
       match d.tys.get(name) {
         Some(t) -> { d: d, ty: t },
         None -> match d.imported.get(name) {
-          Some(full) -> { d: d, ty: named_type(full) },
+          Some(full) -> {
+            let args = declared_types(d, c.args);
+            { d: args.d, ty: TyCon({ name: full, args: args.tys }) }
+          },
           None -> {
             let args = declared_types(d, c.args);
             if builtin_type_arity(name) != Some(args.tys.len()) {
@@ -1401,17 +1405,19 @@ fn prelude_imports(imports: List<ImportDecl>) -> Map<Bytes, Bytes> =
     })
 
 /// The conditions `&&` joins, each with the text it is written as.
-fn conjuncts(source: Bytes, e: Expr) -> List<Clause> / {abort.raise} =
+fn conjuncts(def: ExternDef, e: Expr) -> List<Clause> / {abort.raise} =
   match e {
-    EBinary(b) -> if b.op != b"and" { [written_clause(source, e)] }
-    else { conjuncts(source, b.lhs).concat(conjuncts(source, b.rhs)) },
-    _ -> [written_clause(source, e)],
+    EBinary(b) -> if b.op != b"and" { [written_clause(def, e)] }
+    else { conjuncts(def, b.lhs).concat(conjuncts(def, b.rhs)) },
+    _ -> [written_clause(def, e)],
   }
 
-fn written_clause(source: Bytes, e: Expr) -> Clause / {abort.raise} = {
-  let span = expr_span(e);
-  { holds: e, text: source.slice(span.start, span.end) }
-}
+fn written_clause(def: ExternDef, e: Expr) -> Clause / {abort.raise} =
+  { holds: e, text: written_at(def, expr_span(e)) }
+
+/// What `span`, inside the declaration, is written as.
+fn written_at(def: ExternDef, span: Span) -> Bytes / {abort.raise} =
+  def.written.slice(span.start - def.span.start, span.end - def.span.start)
 
 /// What a call's answer is a function of: no parameter is a function or a cell.
 fn answers_by_value(params: List<Type>) -> Bool =
@@ -1419,7 +1425,6 @@ fn answers_by_value(params: List<Type>) -> Bool =
     ok && (match ty { TyFn(_) -> false, TyCon(c) -> c.name != b"Cell", _ -> true }))
 
 fn contract_of(
-  source: Bytes,
   def: ExternDef,
   params: List<Type>,
   ret: Type,
@@ -1429,13 +1434,13 @@ fn contract_of(
     params: def.params.map(|p: Param| p.name.name),
     requires: def.spec.fold([], |acc: List<Clause>, c: SpecClause|
       match c.kind {
-        SRequires -> acc.concat(conjuncts(source, c.expr)),
+        SRequires -> acc.concat(conjuncts(def, c.expr)),
         SEnsures -> acc,
         SCost -> panic(misdeclared(b"states a `cost`", def.name.name)),
         SSpace -> panic(misdeclared(b"states a `space`", def.name.name)),
       }),
     ensures: def.spec.fold([], |acc: List<Clause>, c: SpecClause|
-      match c.kind { SEnsures -> acc.push(written_clause(source, c.expr)), _ -> acc }),
+      match c.kind { SEnsures -> acc.push(written_clause(def, c.expr)), _ -> acc }),
     raises: row.atoms.contains(abort_atom()),
     pure: answers_by_value(params),
     number: ret == int_type(),
@@ -1450,7 +1455,7 @@ fn contract_of(
     },
   }
 
-fn declared(source: Bytes, imported: Map<Bytes, Bytes>, def: ExternDef) -> Builtin / {abort.raise} = {
+fn declared(name: Bytes, imported: Map<Bytes, Bytes>, def: ExternDef) -> Builtin / {abort.raise} = {
   let tys = def.generics.types.fold(
     { fresh: fresh_new(), tys: Map::new() },
     |acc: { fresh: Fresh, tys: Map<Bytes, Type> }, p: Ident| {
@@ -1490,7 +1495,7 @@ fn declared(source: Bytes, imported: Map<Bytes, Bytes>, def: ExternDef) -> Built
     else { insert_constraint(acc, { deriver: c.deriver, param: param }) }
   });
   {
-    name: def.name.name,
+    name: name,
     scheme: {
       ty_vars: range(0, ret.d.fresh.next_ty),
       row_vars: range(0, ret.d.fresh.next_row),
@@ -1500,8 +1505,8 @@ fn declared(source: Bytes, imported: Map<Bytes, Bytes>, def: ExternDef) -> Built
     params: def.params.map(|p: Param| p.name.name),
     doc: match def.doc { Some(d) -> d.lines, None -> [] },
     constraints: dedup_constraints(found),
-    clauses: def.spec.map(|c: SpecClause| source.slice(c.span.start, c.span.end)),
-    contract: contract_of(source, def, params.tys, ret.ty, row),
+    clauses: def.spec.map(|c: SpecClause| written_at(def, c.span)),
+    contract: contract_of(def, params.tys, ret.ty, row),
   }
 }
 
@@ -1513,7 +1518,7 @@ pub fn builtins() -> List<Builtin> / {abort.raise} = {
   if parsed.parser.diags.len() > 0 { panic("the prelude does not parse") } else {
     let imported = prelude_imports(parsed.node.imports);
     parsed.node.items.fold([], |acc: List<Builtin>, item: Item|
-      match item { IExtern(def) -> acc.push(declared(source, imported, def)), _ -> acc })
+      match item { IExtern(def) -> acc.push(declared(def.name.name, imported, def)), _ -> acc })
   }
 }
 
@@ -1523,28 +1528,17 @@ pub fn builtin_named(name: Bytes) -> Option<Builtin> / {abort.raise} =
 
 /// A builtin's scheme is over variables numbered from zero, so `fresh` starts past every one.
 fn install_prelude(bare: Checker) -> Checker / {abort.raise} = {
-  let bound: Checker = builtins().fold(install_prelude_adts(bare), |c: Checker, b: Builtin|
-    {
-      ..c,
-      env: env_bind_global(c.env, b.name, b.scheme),
-      constraints: if b.constraints.len() == 0 { c.constraints }
-      else { c.constraints.insert(b.name, b.constraints) },
-      contracts: c.contracts.insert(b.name, b.contract),
-      fresh: {
-        next_ty: max(c.fresh.next_ty, b.scheme.ty_vars.len()),
-        next_row: max(c.fresh.next_row, b.scheme.row_vars.len()),
-      },
-    });
+  let bound: Checker = builtins().fold(install_prelude_adts(bare), builtin_bound);
   prelude_effects().fold(bound, |c2: Checker, effect_info: EffectInfo| add_effect(c2, effect_info))
 }
 
 /// The name the shipped modules hold the prelude under, which no project's module can take.
 fn prelude_module() -> Bytes = b"compiler.prelude"
 
-/// Only the prelude declares what the runtime implements.
+/// Only a shipped module declares what the toolchain implements.
 fn refuse_externs(checker: Checker, parsed: ParsedModule) -> Checker =
   List::fold(
-    if parsed.name == prelude_module() { [] } else { parsed.module.items },
+    if is_shipped(parsed.name) { [] } else { parsed.module.items },
     checker,
     |c: Checker, item: Item|
       match item {
@@ -1558,9 +1552,9 @@ fn refuse_externs(checker: Checker, parsed: ParsedModule) -> Checker =
               def.name.name,
               b"` declares a function the runtime implements",
             ]),
-            b"only the prelude declares one",
+            b"only a module the toolchain ships declares one",
             [
-              b"the runtime implements the builtins the prelude lists and nothing else, so a declaration here has nothing to name",
+              b"the toolchain implements the functions its own modules declare and nothing else, so a declaration here has nothing to name",
               b"write the function's body, or reach what it needs through an `effect` a handler answers",
             ],
           ),
@@ -9987,10 +9981,44 @@ fn signed_fns(
     |acc: Signed, i: Int| signed_fn(acc, parsed, fns.get(i), names.get(i)),
   );
   {
-    checker: signed.checker,
+    checker: externs_bound(signed.checker, parsed),
     signed: { fns: fns, names: names, sigs: signed.sigs, members: signed.members },
   }
 }
+
+/// A shipped module's own externs bound as builtins under its name; the prelude's are bound before
+/// any module is checked.
+fn externs_bound(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
+  if !is_shipped(parsed.name) || parsed.name == prelude_module() { checker } else {
+    // A type its declarations name is one the module declares or imports by name.
+    let own = parsed.module.items.fold(
+      prelude_imports(parsed.module.imports),
+      |acc: Map<Bytes, Bytes>, item: Item|
+        match item {
+          IType(t) -> acc.insert(t.name.name, qualify(parsed.name, t.name.name)),
+          _ -> acc,
+        },
+    );
+    parsed.module.items.fold(checker, |c: Checker, item: Item|
+      match item {
+        IExtern(def) -> builtin_bound(c, declared(qualify(parsed.name, def.name.name), own, def)),
+        _ -> c,
+      })
+  }
+
+/// `b` bound where a call finds it, with what its declaration states.
+fn builtin_bound(c: Checker, b: Builtin) -> Checker / {abort.raise} =
+  {
+    ..c,
+    env: env_bind_global(c.env, b.name, b.scheme),
+    constraints: if b.constraints.len() == 0 { c.constraints }
+    else { c.constraints.insert(b.name, b.constraints) },
+    contracts: c.contracts.insert(b.name, b.contract),
+    fresh: {
+      next_ty: max(c.fresh.next_ty, b.scheme.ty_vars.len()),
+      next_row: max(c.fresh.next_row, b.scheme.row_vars.len()),
+    },
+  }
 
 /// The module's bodies walked against what every module's functions declare, and its groups
 /// settled; a check that walks only some of its functions settles none.
@@ -20632,8 +20660,50 @@ test "every builtin is in reach of a module that imports nothing" {
   assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int = xs.push(1).len()\n"), [])
 }
 
-test "an `extern fn` outside the prelude is refused" {
-  assert_eq(check_codes(b"extern fn secret(x: Int) -> Int\nfn f() -> Int = 1\n"), [b"E0151"])
+test "an `extern fn` outside a shipped module is refused" {
+  assert_eq(check_codes(b"extern fn secret(x: Int) -> Int\nfn f() -> Int = 1\n"), [b"E0151"]);
+  assert_eq(codes_of([{ name: b"tools.native", src: b"pub extern fn secret(x: Int) -> Int\n" }]), [
+    b"E0151",
+  ])
+}
+
+test "a shipped module's extern is called as its module's, and a private one only there" {
+  let native = {
+    name: b"std.native",
+    src: b"pub type Pair<a> = | Pair(a, a)\npub extern fn doubled(x: Int) -> Int\nextern fn hidden(x: Int) -> Int\npub fn twice(x: Int) -> Int = hidden(x) + hidden(x)\npub extern fn first<a>(p: Pair<a>) -> a\n",
+  };
+  assert_eq(
+    codes_of([
+      native,
+      {
+        name: b"m",
+        src: b"import std.native (doubled)\nimport std.native as n\nfn f() -> Int = doubled(2) + n::doubled(3) + n::twice(4)\n",
+      },
+    ]),
+    [],
+  );
+  assert_eq(
+    codes_of([
+      native,
+      { name: b"m", src: b"import std.native (hidden)\nfn f() -> Int = hidden(1)\n" },
+    ]),
+    [b"E0107"],
+  );
+  assert_eq(
+    codes_of([
+      native,
+      { name: b"m", src: b"import std.native (doubled)\nfn f() -> Int = doubled(true)\n" },
+    ]),
+    [b"E0201"],
+  );
+  let pairs = |src: Bytes| codes_of([native, { name: b"m", src: src }]);
+  assert_eq(
+    pairs(b"import std.native (Pair, first)\nfn f(p: Pair<String>) -> String = first(p)\n"),
+    [],
+  );
+  assert_eq(pairs(b"import std.native (Pair, first)\nfn f(p: Pair<String>) -> Int = first(p)\n"), [
+    b"E0201",
+  ])
 }
 
 test "a constant past Int's range leaves the termination check unsure rather than broken" {

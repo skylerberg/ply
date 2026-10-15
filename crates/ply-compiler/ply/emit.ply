@@ -9362,11 +9362,23 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               },
             }
           } else if !emitter.here.fold(false, |acc: Bool, h: Def| acc || h.name == fv.name) {
-            // Not this module's: an import, which takes the name where it has it, else a builtin.
-            match match qualified(fv.name) {
-                Some(q) -> module_import(emitter.imports, q.binder),
-                None -> from_import(emitter.imports, fv.name),
-              } {
+            // Not this module's: an import, which takes the name where it has it, else a builtin. A
+            // name an imported module holds no definition of is its extern, the builtin of its own
+            // name.
+            let via = match qualified(fv.name) {
+              Some(q) -> module_import(emitter.imports, q.binder),
+              None -> from_import(emitter.imports, fv.name),
+            };
+            let own = match qualified(fv.name) { Some(q) -> q.name, None -> fv.name };
+            let external = match via {
+              Some(imp) -> match def_named(imp.defs, own) {
+                Some(_) -> false,
+                None -> emitter.builtins.fold(false, |acc: Bool, b2: Bytes| acc || b2 == own),
+              },
+              None -> false,
+            };
+            let fv = if external { { ..fv, name: own } } else { fv };
+            match if external { None } else { via } {
               // Callback and inline builtins outside their fused shapes are refused: a plain call for them is a wrong answer, not a slow one.
               None -> match match lookup_helper(fv.name, a.args.len()) {
                   Some(h) -> match args_owned_at(notail(emitter), a.args, params, c.span) {
@@ -19383,6 +19395,44 @@ test "the emitter writes an embed out as the front end's answer says it was read
     ).answer {
     Body(b) -> assert_eq(b.tables.consts, [ConstBytes(b"one")]),
     Refused(r) -> panic(String::of_bytes_lossy(r.why)),
+  }
+}
+
+test "a shipped module's extern is called as the builtin of its own name" {
+  let names = [b"std.native", b"m"];
+  let srcs = [
+    b"pub extern fn doubled(x: Int) -> Int\n",
+    b"import std.native (doubled)\nimport std.native as n\nfn f() -> Int = doubled(2) + n::doubled(3)\n",
+  ];
+  let d = dump_of(
+    analyse_pulling_std_with(
+      [{ name: b"m", src: srcs.get(1) }],
+      [{ name: b"std.native", src: srcs.get(0) }],
+      no_rows(),
+    ).out,
+  );
+  let answers = emit_roots_answer(
+    names,
+    srcs,
+    { names: [], laid: ctor_layouts(d.ctors), keyed: [], sums: ctor_sums(d.ctors) },
+    [b"doubled"],
+    [b"m.f"],
+    [],
+    [],
+    d.embeds,
+    d.rows,
+    d.walked,
+  );
+  match answers.at(0) {
+    Some(a) -> match a.answer {
+      Body(b) -> {
+        let code = own_code(b.text);
+        assert_eq(code.split(b"builtin_doubled_p(ctx").len(), 3);
+        assert(code.index_of(b"native_") == None, Some(String::of_bytes_lossy(code)))
+      },
+      Refused(r) -> panic(String::of_bytes_lossy(r.why)),
+    },
+    None -> panic("no answer"),
   }
 }
 

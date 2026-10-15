@@ -101,6 +101,7 @@ module.exports = grammar({
     ),
 
     extern_function: $ => seq(
+      optional('pub'),
       'extern', 'fn',
       field('name', choice($.identifier, $.qualified_name)),
       optional($.generic_parameters),

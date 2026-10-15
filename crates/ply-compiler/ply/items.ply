@@ -269,6 +269,7 @@ pub type EffectSetDef = {
 /// `extern fn`: a function the runtime implements, with no body to check. The prelude declares
 /// every one; a module that writes one is refused.
 pub type ExternDef = {
+  vis: Vis,
   name: Ident,
   generics: Generics,
   params: List<Param>,
@@ -279,6 +280,8 @@ pub type ExternDef = {
   spec: List<SpecClause>,
   doc: Option<Doc>,
   span: Span,
+  /// The declaration as written, from `extern` on: what a clause's text is read from.
+  written: Bytes,
 }
 
 pub type Item =
@@ -1031,6 +1034,7 @@ fn extern_param(input: Input, parser: Parser) -> Result<Parsed<Param>, Parser> /
 pub fn extern_def(
   input: Input,
   parser: Parser,
+  vis: Vis,
 ) -> Result<Parsed<ExternDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, .. } = expect(input, st.parser, keyword_fn(), b"`fn` after `extern`")?;
@@ -1063,6 +1067,7 @@ pub fn extern_def(
   Ok({
     parser: parser,
     node: {
+      vis: vis,
       name: name,
       generics: g,
       params: ps,
@@ -1072,6 +1077,7 @@ pub fn extern_def(
       spec: sp,
       doc: None,
       span: span_to(st.node, previous_span(input, parser)),
+      written: input.source.slice(st.node.start, previous_span(input, parser).end),
     },
   })
 }
@@ -2096,12 +2102,7 @@ pub fn item_at(
     )?;
     Ok({ parser: d.parser, node: IDerive(d.node) })
   } else if at_extern_start(input, parser) {
-    let d = extern_def(
-      input,
-      no_pub(parser, unexpected(), pub_span, b"an `extern fn` cannot be `pub`", [
-        b"what the prelude declares is in reach of every module already",
-      ]),
-    )?;
+    let d = extern_def(input, parser, vis)?;
     Ok({ parser: d.parser, node: IExtern(d.node) })
   } else if at_instance_start(input, parser) {
     let d = instance_def(
@@ -3118,6 +3119,7 @@ pub fn dump_effect_set(d: EffectSetDef) -> Bytes / {abort.raise} =
 pub fn dump_extern(d: ExternDef) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(d.span, b"ext"),
+    dump_vis(d.vis),
     dump_ident(d.name),
     dump_generics(d.generics),
     dump_list(d.params, dump_param),
@@ -3176,6 +3178,18 @@ pub fn dump(src: Bytes) -> String / {abort.raise} = {
 }
 
 pub fn is_pub(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
+
+/// Whether `name` is a module of the standard library.
+pub fn is_std(name: Bytes) -> Bool = name == b"std" || name.starts_with(b"std.")
+
+/// The compiler's own modules, filed under one reserved root so a program can import the formatter.
+/// A shipped module names its siblings under that root too: the shipped modules are handed over as
+/// text, and the emitter parses the same text to name a call, so the root is in the source and not
+/// in a tree.
+pub fn is_compiler(name: Bytes) -> Bool = name == b"compiler" || name.starts_with(b"compiler.")
+
+/// Whether `name` is a module the toolchain ships: the standard library's or the compiler's.
+pub fn is_shipped(name: Bytes) -> Bool = is_std(name) || is_compiler(name)
 
 pub fn spec_kind_text(k: SpecKind) -> Bytes =
   match k { SRequires -> b"requires", SEnsures -> b"ensures", SCost -> b"cost", SSpace -> b"space" }
@@ -3520,10 +3534,19 @@ test "`extern` stays a name where no `fn` follows it" {
   assert_eq(parse(b"fn extern(extern: Int) -> Int = extern\n").parser.diags.len(), 0)
 }
 
-test "an `extern fn` writes every type and is never `pub`" {
+test "an `extern fn` writes every type, may be `pub`, and keeps its text from `extern` on" {
   assert(parse(b"extern fn f(x) -> Int\n").parser.diags.len() > 0);
   assert(parse(b"extern fn f(x: Int)\n").parser.diags.len() > 0);
-  assert(parse(b"pub extern fn f(x: Int) -> Int\n").parser.diags.len() > 0)
+  let r = parse(b"pub extern fn f(x: Int) -> Int\n  requires x > 0\n");
+  assert_eq(r.parser.diags.len(), 0);
+  match r.node.items {
+    [IExtern(d)] -> {
+      assert_eq(d.vis, VPub);
+      assert_eq(d.written, b"extern fn f(x: Int) -> Int\n  requires x > 0");
+      assert_eq(d.span, span_between(4, 47))
+    },
+    _ -> panic("one `extern fn`"),
+  }
 }
 
 test "a law schema carries its parameters, its binders, a guard and a body, and may be `pub`" {

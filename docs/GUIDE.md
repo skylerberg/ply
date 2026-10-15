@@ -2886,8 +2886,12 @@ holds a statement's columns to where `std.db`'s `fetch` reads rows by it (§16).
 
 The functions every module calls without importing them. Each is declared in the
 compiler's prelude as an `extern fn`: a signature the runtime implements, with a
-row and a `where` like any other and no body, and a doc. Only the prelude
-declares one; an `extern fn` in a module is `E0151`. Most are functions of a
+row and a `where` like any other and no body, and a doc. A module the toolchain
+ships may declare one too, a builtin of its own that it calls, or that a module
+importing it calls if it is `pub`, as any of its functions; an `extern fn` in any
+other module is `E0151`. A module below `std.internal` holds what the standard
+library shares within itself, and only a shipped module imports one (`E0159`).
+Most are functions of a
 type of the language's, declared under it (`extern fn List::len`) and called on
 a value or through the type as any function of a type is (§5.4): `xs.len()`,
 `Map::new()`. No module declares one of those again, so nothing hides one. The
@@ -3589,13 +3593,14 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0148` | a `returns` clause the body does not keep |
 | `E0149` | a dependency's published interface that does not re-derive from its source |
 | `E0150` | a version whose changes need a larger bump than it makes |
-| `E0151` | an `extern fn` outside the prelude |
+| `E0151` | an `extern fn` outside a module the toolchain ships |
 | `E0152` | a tagged literal whose tag's `literal`, or `compile` or `fill` for one with holes, is not what a tagged literal calls |
 | `E0153` | a tagged literal its parser refuses |
 | `E0154` | a tagged literal whose parser raised or spent its budget |
 | `E0156` | a `const fn` that takes or binds a parameter, writes a row, performs more than a raise, may not return, or answers a value a build cannot keep |
 | `E0157` | a `const fn` that raised when the build evaluated it |
 | `E0158` | a `const fn` that spent the build's budget, in calls or in the size of its value |
+| `E0159` | an import of a module below `std.internal` from outside the toolchain's own modules |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
