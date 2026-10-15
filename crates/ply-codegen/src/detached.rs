@@ -333,7 +333,7 @@ fn capture_stop(c: &mut Ctx, id: usize) -> usize {
     let once = match (live, owning) {
         (None, _) => None,
         (Some(_), true) => Some(Diagnostic::error(codes::RUNTIME_ERROR, OWNED_ONCE).note(
-            "that is inside a clause or a `return` clause of a `handle` the body opened, a `bracket`'s release during a raise, a callback of `List::map`, `List::filter` or `Map::fold`, or a call given more than 64 words",
+            "as inside a clause or a `return` clause of a `handle` the body opened, or a `bracket`'s release during a raise",
         )),
         (Some(_), false) => None,
     };

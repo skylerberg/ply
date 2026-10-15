@@ -1801,11 +1801,10 @@ In `amb.flip[coin]() resume k -> k(true) + k(false)`, `resume k` binds the
 continuation; the clause then has the `handle`'s type and may call `k` any
 number of times. Without `resume`, a clause's value returns to the perform site,
 except a clause for a `raise` operation (§6.8). A continuation captured while
-the runtime holds memory of its own around a call into the program resumes
-once, and a second resumption ends the run with `E0502`: inside a clause or a
-`return` clause of a `handle` the body opened, a `bracket`'s release during a
-raise, a callback of `List::map`, `List::filter` or `Map::fold`, or a call
-given more than 64 words of arguments and captures.
+the runtime calls into the program holding memory of its own across the call
+resumes once, and a second resumption ends the run with `E0502`: inside a
+clause or a `return` clause of a `handle` the body opened, or a `bracket`'s
+release during a raise.
 
 A clause that binds `resume` and never calls it abandons the body where it stood,
 and `bracket(acquire, release, body)` is how a body that holds something lets it

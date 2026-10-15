@@ -4681,7 +4681,6 @@ pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64)
     if heap::kind(map) == KIND_MAP {
         let o = obj(map);
         let mut acc = init;
-        let _owning = Owning::on(ctx);
         for (k, v) in map::to_vec(o) {
             heap::inc(k);
             heap::inc(v);
@@ -4707,7 +4706,6 @@ pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let mut acc = init;
-    let _owning = Owning::on(ctx);
     for (k, v) in &entries {
         let c = unsafe { &mut *ctx };
         let kw = c.word(k);
