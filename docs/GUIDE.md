@@ -2991,7 +2991,9 @@ std.<name>`, a name having more segments where a module sits beneath another
 (`std.hash.legacy` beside `std.hash`). Its tests and obligations are no
 project's: `ply test`, `ply prove` and `ply review` skip them unless you pass
 `--std`, which adds those of every
-module `ply std` lists, whichever of them the project imports.
+module `ply std` lists, whichever of them the project imports. So do `ply check`,
+which then reports each module's errors, warnings and definitions as the project's
+own, and `ply defs`, which then lists their definitions too.
 A module named for a type of the language's is that type's home: it alone
 declares functions of the type (`fn List::name` in `std.list`, §3.1). A module
 calls them with no import, on a value (`xs.sort()`) or through the type
@@ -3316,7 +3318,7 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases and how many answers of each query the memo store took as kept and how many it ran again, which a check that refuses prints too; and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases and how many answers of each query the memo store took as kept and how many it ran again, which a check that refuses prints too; and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps`, `--std` |
 | `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, prove, simulation |
@@ -3338,7 +3340,7 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | `ply keygen PATH` | an Ed25519 key pair: the secret key at `PATH`, the public key at `PATH.pub` (§15.2); no path |
 | `ply contracts NAME FROM TO` | the public definitions whose contracts were added, changed or removed between two published versions, the bump that needs, and whether `TO` makes it (`needs`, `kept`); no path |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
-| `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
+| `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING`, `--std` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
 | `ply bootstrap [<checkout>]` | builds a native `ply` from a checkout (default `.`): the checkout's compiler built by this `ply` into the builder, linked with the runtime's library cargo built (`--runtime LIBRARY`, default `target/<profile>/libply_native.a`), the builder run over the checkout's `ply`, that linked with the library, and its pack written with the shipped modules, what they answer (each one `ply` imports answered once, by the builder, through the store the answering reads) and what its front end answered of the definition it enters; the builder is taken from the toolchain's cache where an earlier bootstrap kept it, and so is what the shipped modules answer, kept under how the `ply` answers them and not under its front end, so a `ply` that differs from an earlier one only outside what answers them answers nothing; the C compiles under `--profile development` (default) or `release`, and the `ply` goes to `--out PATH` (default `target/<profile>/ply`) |
 | `ply cache clear\|stats\|compact [path]` | discard the store and the memo store / report what they hold and their reclaimable space / reclaim it: the memo store written again as one segment that keeps the records of this `ply`'s queries and the answers of its own commands, with the answers and reader links those records reach, and the store's definitions no pass record reaches |
