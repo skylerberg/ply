@@ -852,15 +852,16 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             Ok(option(read.ok().map(|_| Value::bytes(out))))
         }
 
+        // One pass, so the frame says how long it is and a reader's window is no larger.
         Builtin::BytesZstd => {
-            use std::io::Write;
             let b = args[0].as_bytes(span, "`Bytes::zstd`")?;
-            let sealed = zstd::stream::Encoder::new(Vec::new(), 3).and_then(|mut z| {
-                z.include_checksum(true)?;
-                z.write_all(b)?;
-                z.finish()
+            let sealed = zstd::bulk::Compressor::new(3).and_then(|mut z| {
+                z.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
+                z.compress(b)
             });
-            Ok(Value::bytes(sealed.expect("writing to memory cannot fail")))
+            Ok(Value::bytes(
+                sealed.expect("compressing in memory cannot fail"),
+            ))
         }
 
         Builtin::BytesConcatAll => {

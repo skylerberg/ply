@@ -9,6 +9,7 @@
 //! pack answers under a stamp naming the pack and the files read, so a record of it that asked a
 //! packed answer is asked again when either moves.
 
+import std.bin
 import std.bytes (u32_le, u64_le)
 import std.hash (blake3)
 import segments
@@ -22,61 +23,25 @@ pub fn index_file() -> String = "index"
 /// Where a frame lies in a pack's file: its first byte and how many bytes it takes.
 pub type Range = { offset: Int, len: Int }
 
+derive bin for Range
+
 /// What a pack says of itself: the stamp its answers were made under; what names the pack, a digest
 /// of each record's key beside its answer's; the shipped files they were made over; and where its
 /// table of records and its table of longer answers lie.
 pub type Index = { stamp: Bytes, id: Bytes, files: Bytes, records: Range, answers: Range }
 
+derive bin for Index
+
 fn index_magic() -> Bytes = b"PLYPACK\x02"
 
-fn sized(b: Bytes) -> Bytes = u64_le(b.len()).concat(b)
-
-fn sized_at(b: Bytes, at: Int) -> Option<{ value: Bytes, next: Int }> / {abort.raise} =
-  if at + 8 > b.len() { None } else {
-    let n = segments::long_at(b, at);
-    if n < 0 || at + 8 + n > b.len() { None }
-    else { Some({ value: b.slice(at + 8, at + 8 + n), next: at + 8 + n }) }
-  }
-
 /// `i` as a pack keeps it.
-pub fn index_bytes(i: Index) -> Bytes =
-  Bytes::concat_all([
-    index_magic(),
-    sized(i.stamp),
-    sized(i.id),
-    sized(i.files),
-    u64_le(i.records.offset),
-    u64_le(i.records.len),
-    u64_le(i.answers.offset),
-    u64_le(i.answers.len),
-  ])
+pub fn index_bytes(i: Index) -> Bytes / {abort.raise} =
+  index_magic().concat(bin::encode(i, index_bin()))
 
 /// The index `b` holds: none for bytes that are not one whole.
 pub fn index_from(b: Bytes) -> Option<Index> / {abort.raise} =
-  if b.len() < 8 || b.slice(0, 8) != index_magic() { None } else {
-    match sized_at(b, 8) {
-      None -> None,
-      Some(stamp) -> match sized_at(b, stamp.next) {
-        None -> None,
-        Some(id) -> match sized_at(b, id.next) {
-          None -> None,
-          Some(files) -> if files.next + 32 != b.len() { None } else {
-            let at = files.next;
-            Some({
-              stamp: stamp.value,
-              id: id.value,
-              files: files.value,
-              records: { offset: segments::long_at(b, at), len: segments::long_at(b, at + 8) },
-              answers: {
-                offset: segments::long_at(b, at + 16),
-                len: segments::long_at(b, at + 24),
-              },
-            })
-          },
-        },
-      },
-    }
-  }
+  if b.len() < 8 || b.slice(0, 8) != index_magic() { None }
+  else { match bin::decode(b.slice(8, b.len()), index_bin()) { Ok(i) -> Some(i), Err(_) -> None } }
 
 /// A table's row: a 32-byte key, then where its frame lies and how long it is.
 fn row_width() -> Int = 44
@@ -99,8 +64,10 @@ pub fn answer_key(digest: Bytes) -> Option<Bytes> =
 // --- Trust ------------------------------------------------------------------------------------
 
 /// Whether a run under `stamp` over the shipped files `world` lists takes the records of the pack
-/// `i` indexes as they stand: they were made under that stamp, over those very files.
-pub fn stands(i: Index, stamp: Bytes, world: Bytes) -> Bool = i.stamp == stamp && i.files == world
+/// `i` indexes as they stand: they were made under that stamp, over those very files. A run
+/// that lists none takes none so.
+pub fn stands(i: Index, stamp: Bytes, world: Bytes) -> Bool =
+  world.len() > 0 && i.stamp == stamp && i.files == world
 
 /// What a store above the pack `i` indexes answers under, for a run under `stamp` over the shipped
 /// files `world` lists: `stamp` where there is no pack, and else a stamp naming the pack and those
@@ -109,7 +76,9 @@ pub fn above(i: Option<Index>, stamp: Bytes, world: Bytes) -> Bytes =
   match i {
     None -> stamp,
     Some(x) ->
-      blake3(Bytes::concat_all([b"ply.pack.above\x00", sized(stamp), sized(x.id), blake3(world)])),
+      blake3(
+        Bytes::concat_all([b"ply.pack.above\x00", blake3(stamp), blake3(x.id), blake3(world)]),
+      ),
   }
 
 // --- Writing a pack ---------------------------------------------------------------------------
@@ -155,7 +124,7 @@ pub fn finished(
   let id = blake3(
     Bytes::concat_all(
       answered.fold([b"ply.pack\x00"], |acc: List<Bytes>, k: Bytes, d: Bytes|
-        acc.push(k).push(sized(d))),
+        acc.push(blake3(k)).push(blake3(d))),
     ),
   );
   {
