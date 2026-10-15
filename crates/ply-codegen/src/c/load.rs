@@ -74,8 +74,8 @@ impl Drop for Library {
 unsafe impl Send for Library {}
 
 /// Where compiled units are kept between runs: the directory `PLY_C_CACHE` names, or the
-/// user's own. Libraries sit at its root, bucket objects under `obj/`, the emitter's answers under
-/// `bodies/`.
+/// user's own. Libraries sit at its root, bucket objects under `obj/`, the C they compile from under
+/// `src/`, the emitter's answers under `bodies/`.
 ///
 /// **Nothing about that directory bounds it**: an entry is keyed by its content, so a changed
 /// definition writes a new one beside the old rather than replacing it, and the system sweeps

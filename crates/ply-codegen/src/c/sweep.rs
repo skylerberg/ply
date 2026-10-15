@@ -92,14 +92,15 @@ struct Entry {
     last_used: std::time::SystemTime,
 }
 
-/// Remove entries under `root`, least recently used first, until the rest fits in `budget` or only
-/// entries used within [`RECENT`] are left. Errors are ignored.
+/// Remove files at any depth under `root`, least recently used first, until the rest fits in
+/// `budget` or only files used within [`RECENT`] are left. Errors are ignored.
 pub fn sweep(root: &Path, budget: u64) -> u64 {
     let mut entries = Vec::new();
     let mut total: u64 = 0;
-    let mut walk = |dir: &Path| {
-        let Ok(read) = std::fs::read_dir(dir) else {
-            return;
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
         };
         for e in read.flatten() {
             let path = e.path();
@@ -112,6 +113,10 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
                 continue;
             }
             let Ok(meta) = e.metadata() else { continue };
+            if meta.is_dir() {
+                dirs.push(path);
+                continue;
+            }
             if !meta.is_file() {
                 continue;
             }
@@ -122,10 +127,7 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
                 last_used: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
             });
         }
-    };
-    walk(root);
-    walk(&root.join("obj"));
-    walk(&root.join("bodies"));
+    }
     if total <= budget {
         return 0;
     }
