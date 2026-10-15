@@ -118,6 +118,23 @@ pub fn data(name: &str) -> Option<&'static [u8]> {
     ply_pack::installed().bytes(&data_path_of(name)?)
 }
 
+/// Each shipped file by the name the launcher lays it out under, `<module>.ply` or a data file's
+/// name, a space, and its bytes' BLAKE3 digest in hex: a line each, ascending by name. What the
+/// shipped modules' answers were made over, and what a run holds them to. No bytes are read.
+pub fn digests() -> String {
+    let mut lines: Vec<String> = names()
+        .into_iter()
+        .filter_map(|name| Some(format!("{name}.ply {}\n", digest_of(&name)?)))
+        .chain(
+            data_names()
+                .into_iter()
+                .filter_map(|name| Some(format!("{name} {}\n", digest_of(&name)?))),
+        )
+        .collect();
+    lines.sort();
+    lines.concat()
+}
+
 /// Every shipped module and data file, digested: it moves with any of them. No bytes are read.
 pub fn digest() -> ply_pack::Digest {
     ply_pack::installed().digest_below(&[ply_pack::STD, ply_pack::COMPILER, ply_pack::PRELUDE])

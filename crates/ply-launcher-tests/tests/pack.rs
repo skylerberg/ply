@@ -36,10 +36,8 @@ fn read(bytes: &[u8]) -> Result<Option<ply_pack::Pack>, String> {
     ply_pack::Pack::of_binary(file.path())
 }
 
-fn gzipped(bytes: &[u8]) -> Vec<u8> {
-    let mut out = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    out.write_all(bytes).expect("deflated");
-    out.finish().expect("deflated")
+fn framed(bytes: &[u8]) -> Vec<u8> {
+    zstd::stream::encode_all(bytes, 3).expect("compressed")
 }
 
 #[test]
@@ -104,13 +102,32 @@ fn a_pack_lists_the_files_directly_in_a_directory_and_the_modules_and_data_below
 }
 
 #[test]
-fn an_answer_reads_back_inflated_from_below_the_answers() {
-    let deflated = gzipped(b"the record");
-    let pack = read(&binary(b"", &[("answers/records/ab", &deflated)]))
-        .expect("the pack reads")
-        .expect("the binary carries one");
-    assert_eq!(pack.answer("records/ab"), Some(b"the record".to_vec()));
-    assert_eq!(pack.answer("records/cd"), None);
+fn an_answer_is_the_frame_a_range_of_the_answers_file_holds() {
+    let one = framed(b"one record");
+    let two = framed(b"another");
+    let store = [one.clone(), two.clone()].concat();
+    let pack = read(&binary(
+        b"",
+        &[
+            ("answers/store", &store),
+            ("answers/index", &framed(b"index")),
+        ],
+    ))
+    .expect("the pack reads")
+    .expect("the binary carries one");
+    assert_eq!(
+        pack.answer("store", 0, one.len()),
+        Some(b"one record".to_vec())
+    );
+    assert_eq!(
+        pack.answer("store", one.len(), two.len()),
+        Some(b"another".to_vec())
+    );
+    assert_eq!(pack.answer("index", 0, 0), Some(b"index".to_vec()));
+    // Not where a frame starts, past the file, or no file at all.
+    assert_eq!(pack.answer("store", 1, one.len()), None);
+    assert_eq!(pack.answer("store", one.len(), two.len() + 1), None);
+    assert_eq!(pack.answer("records", 0, 0), None);
 }
 
 #[test]

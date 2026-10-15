@@ -13,16 +13,17 @@
 //! and a record with no mark stands without its reads being asked again.
 //!
 //! A store vouches for a record only to a run of the stamp that kept or checked it: what names the
-//! queries the run answers under, and the answers the toolchain packed where the run trusts them. A
-//! run under another stamp checks a record read by read before it takes it, so a toolchain that
-//! answers otherwise, or packed another answer, costs a store no write and leaves no record
-//! standing on what it no longer answers.
+//! queries the run answers under and, where the toolchain packed answers below the store, the pack
+//! and the shipped files the run reads (`packs`). A run under another stamp checks a record read by
+//! read before it takes it, so a toolchain that answers otherwise, or packed another answer, costs a
+//! store no write and leaves no record standing on what it no longer answers.
 
 import std.bin
 import std.bytes (u64_le)
 import std.list
 import std.hash (blake3)
 import std.gen
+import packs
 
 pub effect memo {
   /// What the world holds at `at`, as `kind` reads it, or nothing there.
@@ -262,9 +263,6 @@ pub type Said = { own: Bool, stands: Bool, fresh: Bool }
 pub fn settles(said: Said) -> Option<Bool> =
   if said.own { Some(said.stands) } else if !said.stands || said.fresh { Some(false) } else { None }
 
-/// Where a store laid out as a directory keeps a record and an answer, relative to its root.
-pub fn record_path(key: Bytes) -> String / {abort.raise} = "records/" ++ key.hex_of()
-
 /// Where the record a new one under `key` replaced is kept: a key of the same width that no query
 /// makes, so nothing marks it.
 pub fn earlier_key(key: Bytes) -> Bytes = blake3(b"earlier\x00".concat(key))
@@ -286,8 +284,6 @@ fn kept_earlier(key: Bytes, next: Record) -> Unit / {memo_keep.read, memo_keep.w
     },
     None -> (),
   }
-
-pub fn output_path(digest: Bytes) -> String / {abort.raise} = "outputs/" ++ digest.hex_of()
 
 fn record_format() -> Bytes = b"\x05"
 
@@ -390,15 +386,14 @@ pub effect memo_keep {
   read head(key: Bytes) -> Option<Bytes>
   /// The height of the record under `key` in the run's store: none for no record.
   read height(key: Bytes) -> Int
-  /// The record kept under `key` in the run's store.
+  /// The record kept under `key` in the run's store, or else in the pack below it.
   read record(key: Bytes) -> Option<Record>
-  /// The record the toolchain packed beside the store under `key`.
-  read packed(key: Bytes) -> Option<Record>
-  /// The answer kept under its digest, in the store or packed beside it.
+  /// The answer kept under its digest, in the store or the pack below it.
   read output(digest: Bytes) -> Option<Bytes>
   /// Keeps `r` under `key`, and `output` under `r.output`.
   write keep(key: Bytes, r: Record, output: Bytes) -> Unit
-  /// Keeps `r`, a packed record, under `key`; its answer stays where the toolchain packed it.
+  /// Keeps `r`, a record the store or its pack holds already, under `key`; its answer stays where it
+  /// is kept.
   write adopt(key: Bytes, r: Record) -> Unit
   /// Raises the height of the record under `key` to `height`, where it stands lower.
   write raise(key: Bytes, height: Int) -> Unit
@@ -758,9 +753,9 @@ fn fetched<| e>(
 fn took(run: Run, name: Bytes, output: Bytes) -> { run: Run, head: Bytes } =
   { run: { ..run, took: bumped(run.took, name) }, head: output }
 
-/// What the query `name` answers for `input`, by its digest: as kept where no mark is on its record
-/// or each read it made answers as it did, else as packed where each read the packed record made
-/// answers as it did, else as its body answers.
+/// What the query `name` answers for `input`, by its digest: as kept, in the store or the pack below
+/// it, where no mark is on its record or each read it made answers as it did, else as its body
+/// answers.
 fn settled<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -797,12 +792,12 @@ fn settled_at<| e>(
         };
         let opened = { ..run, open: run.open.insert(key, true), trail: run.trail.push(step) };
         let done = match memo_keep.head(key) {
-          None -> adopted(queries, opened, q, key, input, [], None, left - 1),
+          None -> executed(queries, opened, q, key, input, [], None, left - 1),
           Some(out) -> {
             let marks = memo_keep.marks(key);
             if marks.len() == 0 { took(opened, name, out) } else {
               match memo_keep.record(key) {
-                None -> adopted(queries, opened, q, key, input, marks, None, left - 1),
+                None -> executed(queries, opened, q, key, input, marks, None, left - 1),
                 Some(r) -> {
                   let s = stands(queries, opened, r.reads, left - 1);
                   if s.ok {
@@ -833,9 +828,9 @@ fn settled_at<| e>(
                             name,
                             e.output,
                           )
-                        } else { adopted(queries, t.run, q, key, input, marks, Some(r), left - 1) }
+                        } else { executed(queries, t.run, q, key, input, marks, Some(r), left - 1) }
                       },
-                      None -> adopted(queries, s.run, q, key, input, marks, Some(r), left - 1),
+                      None -> executed(queries, s.run, q, key, input, marks, Some(r), left - 1),
                     }
                   }
                 },
@@ -944,40 +939,6 @@ fn read_ids(reads: List<Read>) -> Map<Bytes, Bool> =
 /// definition moved under it, and is marked where that answer moves.
 fn asked_id(name: Bytes, input: Bytes) -> Bytes =
   blake3(Bytes::concat_all([b"ply.memo.asked\x00", sized(name), input]))
-
-/// The record the toolchain packed under `key`, kept in the run's store where each read it made
-/// answers as it did, each noted among the readers of what it reads before it is asked; else `q`'s
-/// body run for `input`, as [`executed`] runs it. A packed record is held to its reads like any
-/// other, since the shipped modules a run reads need not be those it was packed from.
-fn adopted<| e>(
-  queries: Map<Bytes, Query<| e>>,
-  run: Run,
-  q: Query<| e>,
-  key: Bytes,
-  input: Bytes,
-  marks: List<Bytes>,
-  prior: Option<Record>,
-  left: Int,
-) -> { run: Run, head: Bytes } / {memo_keep.read, memo_keep.write, abort.raise | e} =
-  if left <= 0 { panic(String::of_bytes_lossy(too_deep())) } else {
-    match memo_keep.packed(key) {
-      None -> executed(queries, run, q, key, input, marks, prior, left - 1),
-      Some(r) -> {
-        let noted = match prior { Some(p) -> read_ids(p.reads), None -> Map::new() };
-        read_ids(r.reads).fold((), |_: Unit, id: Bytes, _: Bool|
-          if !noted.contains(id) { memo_keep.link(id, key) });
-        let before = memo_keep.head(key);
-        let s = stands(queries, run, r.reads, left - 1);
-        if s.ok {
-          let confirmed = s.run;
-          let changed = answer_moved(queries, confirmed, asked_id(q.name, input), before, r.output);
-          memo_keep.adopt(key, r);
-          if marks.len() > 0 { memo_keep.unmark(key, marks) };
-          took(changed, q.name, r.output)
-        } else { executed(queries, s.run, q, key, input, marks, Some(r), left - 1) }
-      },
-    }
-  }
 
 /// `run` once the answer a query answers for an input, noted under `id` among what its readers read,
 /// is to be `now` where it was `before`: where it moves, the records that asked it are marked before
@@ -1269,41 +1230,62 @@ fn saying(h: Held, key: Bytes, v: Vouch) -> Map<Bytes, List<Vouch>> =
   h.said.insert(key, match h.said.get(key) { Some(vs) -> [v].concat(vs), None -> [v] })
 
 /// `work` run over `held`, with `look` answering what the world holds now: what it answered, and the
-/// store with what it kept. A record or an answer `held` lacks is asked of a read-only store laid out
-/// as a directory, through `beside`, which reads a file of it by its path within it.
+/// store with what it kept. A record or an answer `held` lacks is asked of the pack below it, read
+/// through `read`, which answers what a frame of the pack's file holds. `world` lists the shipped
+/// files the run reads: the pack's records stand as they are where they were made under the run's
+/// stamp over those very files, and are held to their reads otherwise (`packs`).
 pub fn over_held<a | e>(
   held: Held,
-  beside: (String) -> Option<Bytes> / {abort.raise | e},
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_keep.read, memo_keep.write, abort.raise},
-  // Whether the records beside stand as they are, as [`memo_files::kept`] trusts them.
-  trusted: Bool = false,
 ) -> { held: Held, value: a } / {abort.raise | e} =
   with_cell[held](held) { cell ->
     with_cell[inlined](Map::new()) { inlined ->
 
-      // The stamp the run answers under, and what it saw at each place it looked at.
-      with_cell[running]({ stamp: b"", looked: Map::new() }) { running -> {
-        // A packed record, beside the answer it holds, which a later ask of the answer reads.
-        let packed_at = |key: Bytes|
-          match beside(record_path(key)) {
-            None -> None,
-            Some(b) -> match record_from(b) {
-              None -> None,
-              Some(r) -> {
-                match inline_named(b) {
-                  Some(o) -> cell_set(inlined, cell_get(inlined).insert(r.output, o)),
-                  None -> (),
-                };
-                Some(r)
-              },
+      // The stamp the run answers under, what it saw at each place it looked at, the pack below its
+      // store, and whether the pack's records stand as they are.
+      with_cell[running]({
+          stamp: b"",
+          looked: Map::new(),
+          pack: packs::opened(read),
+          trusted: false,
+          packed: Map::new(),
+        }) { running -> {
+        // A packed record, read once a run, beside the answer it holds, which a later ask of the
+        // answer reads.
+        let packed_at = |key: Bytes| {
+          let r = cell_get(running);
+          match r.packed.get(key) {
+            Some(rec) -> rec,
+            None -> {
+              let found = packs::record(r.pack, read, key);
+              let rec = match found.bytes {
+                None -> None,
+                Some(b) -> match record_from(b) {
+                  None -> None,
+                  Some(rec) -> {
+                    match inline_named(b) {
+                      Some(o) -> cell_set(inlined, cell_get(inlined).insert(rec.output, o)),
+                      None -> (),
+                    };
+                    Some(rec)
+                  },
+                },
+              };
+              let now = cell_get(running);
+              cell_set(running, {
+                ..now,
+                pack: found.reading,
+                packed: now.packed.insert(key, rec),
+              });
+              rec
             },
-          };
-        let held_or_beside = |key: Bytes|
-          match cell_get(cell).records.get(key) {
-            Some(r) -> Some(r),
-            None -> if trusted { packed_at(key) } else { None },
-          };
+          }
+        };
+        let held_or_packed = |key: Bytes|
+          match cell_get(cell).records.get(key) { Some(r) -> Some(r), None -> packed_at(key) };
         let looked = |kind: Bytes, at: Bytes| {
           let id = place_id(kind, at);
           match cell_get(running).looked.get(id) {
@@ -1330,18 +1312,22 @@ pub fn over_held<a | e>(
         let value = handle {
           work()
         } with {
-          memo_keep.head(key) -> match held_or_beside(key) {
+          memo_keep.head(key) -> match held_or_packed(key) {
             Some(r) -> Some(r.output),
             None -> None,
           },
-          memo_keep.height(key) -> match held_or_beside(key) { Some(r) -> r.height, None -> 0 },
-          memo_keep.record(key) -> held_or_beside(key),
-          memo_keep.packed(key) -> packed_at(key),
+          memo_keep.height(key) -> match held_or_packed(key) { Some(r) -> r.height, None -> 0 },
+          memo_keep.record(key) -> held_or_packed(key),
           memo_keep.output(digest) -> match cell_get(cell).outputs.get(digest) {
             Some(o) -> Some(o),
             None -> match cell_get(inlined).get(digest) {
               Some(o) -> Some(o),
-              None -> beside(output_path(digest)),
+              None -> {
+                let r = cell_get(running);
+                let found = packs::answer(r.pack, read, digest);
+                cell_set(running, { ..r, pack: found.reading });
+                found.bytes
+              },
             },
           },
           memo_keep.keep(key, rec, output) -> {
@@ -1355,7 +1341,7 @@ pub fn over_held<a | e>(
           },
           memo_keep.adopt(key, rec) -> {
             let h = cell_get(cell);
-            // A packed answer its record holds is held beside the adopted record.
+            // An answer its record holds is held beside the record kept again.
             cell_set(cell, {
               ..h,
               records: h.records.insert(key, rec),
@@ -1395,10 +1381,15 @@ pub fn over_held<a | e>(
           memo_keep.marks(key) -> {
             let h = cell_get(cell);
             let left = match h.marks.get(key) { Some(ms) -> ms, None -> [] };
-            if left.len() > 0 || !h.records.contains(key) { left } else {
-              let said = match h.said.get(key) { Some(vs) -> vs, None -> [] };
+            let said = match h.said.get(key) { Some(vs) -> vs, None -> [] };
+            if left.len() > 0 { left } else if h.records.contains(key) {
               if vouched(said, cell_get(running).stamp) { [] } else { [unchecked()] }
             }
+            // A packed record stands as it is only where the pack does, or a check of this stamp
+            // found it standing.
+            else if cell_get(running).trusted || vouched(said, cell_get(running).stamp)
+                || packed_at(key) == None { [] }
+            else { [unchecked()] }
           },
           memo_keep.marked() ->
             cell_get(cell).marks.fold([], |acc: List<Bytes>, k: Bytes, ms: List<Bytes>|
@@ -1407,23 +1398,23 @@ pub fn over_held<a | e>(
           memo_keep.unmark(key, gone) -> {
             let h = cell_get(cell);
             let ms = match h.marks.get(key) { Some(ms) -> ms, None -> [] };
+            let packed = !h.records.contains(key) && packed_at(key) != None;
             cell_set(cell, {
               ..h,
               marks: h.marks.insert(key, ms.filter(|m: Bytes| !gone.contains(m))),
-              said: if !h.records.contains(key) { h.said } else {
+              said: if !h.records.contains(key) && !packed { h.said } else {
                 saying(h, key, { stamp: cell_get(running).stamp, stands: true, fresh: false })
               },
             })
           },
           memo_keep.stamped(stamp, _) -> {
             let r = cell_get(running);
-            // A trusted pack is part of what the run answers under: `standing` names what it holds.
-            let pack = if trusted { beside("standing") } else { None };
             cell_set(running, {
               ..r,
-              stamp: match pack {
-                Some(b) -> blake3(Bytes::concat_all([stamp, b"\x00", b])),
-                None -> stamp,
+              stamp: packs::above(r.pack.index, stamp, world),
+              trusted: match r.pack.index {
+                Some(i) -> packs::stands(i, stamp, world),
+                None -> false,
               },
             })
           },
@@ -1438,14 +1429,14 @@ pub fn over_held<a | e>(
     }
   }
 
-/// `work` run with no store of its own, asking `beside` as [`over_held`] does: each record it keeps
-/// lives only as long as the run.
+/// `work` run with no store of its own, over the pack `read` reads as [`over_held`] does: each record
+/// it keeps lives only as long as the run.
 pub fn fresh<a | e>(
-  beside: (String) -> Option<Bytes> / {abort.raise | e},
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_keep.read, memo_keep.write, abort.raise},
-  trusted: Bool = false,
-) -> a / {abort.raise | e} = over_held(nothing_held(), beside, look, work, trusted: trusted).value
+) -> a / {abort.raise | e} = over_held(nothing_held(), read, world, look, work).value
 
 // --- Tests ----------------------------------------------------------------------------------
 
@@ -1484,14 +1475,14 @@ fn asked_over(
   name: Bytes,
   input: Bytes,
 ) -> { output: Bytes, executed: Int, lost: Int, read: Int, world: World } / {abort.raise} =
-  asked_with(queries, w, Map::new(), None, name, input)
+  asked_with(queries, w, None, None, name, input)
 
-/// [`asked_over`], with the files of a packed store `beside` the run's own, and the world holding
-/// `after` from its second read on, where that is given.
+/// [`asked_over`], with `packed` below the run's store, made over files `w`'s are listed against,
+/// and the world holding `after` from its second read on, where that is given.
 fn asked_with(
   queries: Map<Bytes, Query<| {}>>,
   w: World,
-  beside: Map<String, Bytes>,
+  packed: Option<packs::Written>,
   after: Option<Map<Bytes, Bytes>>,
   name: Bytes,
   input: Bytes,
@@ -1499,7 +1490,8 @@ fn asked_with(
   with_cell[test_memo](0) { reads -> {
     let done = over_held(
       w.held,
-      |path: String| beside.get(path),
+      |path: String, offset: Int, len: Int| packs::frame_in(packed, path, offset, len),
+      files_of(w),
       |_: Bytes, at: Bytes| {
         let n = cell_get(reads);
         cell_set(reads, n + 1);
@@ -1572,7 +1564,8 @@ test "what a driver's asks reach leaves out a record the run settled for a mark"
   let files = |b: Bytes| Map::new().insert(b"a", b"four").insert(b"b", b);
   let first = over_held(
     nothing_held(),
-    |_: String| None,
+    packs::no_pack,
+    b"",
     |_: Bytes, at: Bytes| files(b"six!!!").get(at),
     || {
       let a = answer(q, started(q), b"longer", b"a");
@@ -1582,7 +1575,8 @@ test "what a driver's asks reach leaves out a record the run settled for a mark"
   assert_eq(first.value, 4);
   let second = over_held(
     first.held,
-    |_: String| None,
+    packs::no_pack,
+    b"",
     |_: Bytes, at: Bytes| files(b"seven!!").get(at),
     || {
       let a = answer(q, started(q), b"longer", b"a");
@@ -1633,7 +1627,7 @@ test "an answer asked for by its digest is the read an ask makes, and is handed 
 test "a store held in memory vouches to a run of a stamp that kept in it, and to no other" {
   let vouched_over = |held: Held, hash: Bytes| {
     let q = test_queries(hash);
-    over_held(held, |_: String| None, |_: Bytes, _: Bytes| Some(b"four"), ||
+    over_held(held, packs::no_pack, b"", |_: Bytes, _: Bytes| Some(b"four"), ||
       vouched_to(answer(q, started(q), b"length", b"a").run))
   };
   let first = vouched_over(nothing_held(), b"h1");
@@ -1733,7 +1727,7 @@ test "a read that moved while its body ran leaves the record marked for the next
   let first = asked_with(
     q,
     test_world([{ at: b"a", text: b"four" }]),
-    Map::new(),
+    None,
     Some(edited_after),
     b"length",
     b"a",
@@ -1744,111 +1738,152 @@ test "a read that moved while its body ran leaves the record marked for the next
   assert_eq(next.executed, 1)
 }
 
-/// The files of a packed store that holds what `held` holds, each answer kept as a store keeps it,
-/// and `standing`, which names what the pack holds.
-pub fn packed_files(held: Held) -> Map<String, Bytes> / {abort.raise} = {
-  let files = held.records.fold(Map::new(), |acc: Map<String, Bytes>, k: Bytes, r: Record| {
-    let output = held.outputs.get(r.output);
-    let inline = match output { Some(o) -> kept_inline(o), None -> None };
-    let files = acc.insert(record_path(k), record_bytes(r, inline));
-    match ((output, inline)) {
-      (Some(o), None) -> files.insert(output_path(r.output), o),
-      _ -> files,
-    }
-  });
-  files.insert(
-    "standing",
-    blake3(
-      Bytes::concat_all(
-        files.fold([], |acc: List<Bytes>, path: String, body: Bytes|
-          acc.push(sized(Bytes::of_string(path))).push(sized(body))),
-      ),
-    ),
+/// A pack of what `held` holds, written with nothing compressed, made under the stamp of `queries`
+/// over the files `files` lists.
+pub fn packed_of<| e>(
+  held: Held,
+  queries: Map<Bytes, Query<| e>>,
+  files: Bytes,
+) -> packs::Written / {abort.raise} = {
+  let records = held.records.fold(
+    { writing: packs::writing(), placed: Map::new(), answered: Map::new() },
+    |acc: { writing: packs::Writing, placed: Map<Bytes, packs::Range>, answered: Map<Bytes, Bytes> }, k: Bytes, r: Record| {
+      let inline = match held.outputs.get(r.output) { Some(o) -> kept_inline(o), None -> None };
+      let f = packs::framing(acc.writing, record_bytes(r, inline), packs::as_is);
+      {
+        writing: f.writing,
+        placed: acc.placed.insert(k, f.at),
+        answered: acc.answered.insert(k, r.output),
+      }
+    },
+  );
+  let answers = held.records.fold(
+    { writing: records.writing, placed: Map::new() },
+    |acc: { writing: packs::Writing, placed: Map<Bytes, packs::Range> }, _: Bytes, r: Record|
+      match ((held.outputs.get(r.output), packs::answer_key(r.output))) {
+        (Some(o), Some(name)) -> if kept_inline(o) != None || acc.placed.contains(name) { acc }
+        else {
+          let f = packs::framing(acc.writing, o, packs::as_is);
+          { writing: f.writing, placed: acc.placed.insert(name, f.at) }
+        },
+        _ -> acc,
+      },
+  );
+  packs::finished(
+    answers.writing,
+    records.placed,
+    answers.placed,
+    records.answered,
+    packs::as_is,
+    stamp_of(queries),
+    files,
   )
 }
 
-test "a packed answer is taken where what it read answers as it did, and kept as the run's own" {
+/// What `w`'s files are, as a run lists the files a pack below it was made over.
+fn files_of(w: World) -> Bytes =
+  Bytes::concat_all(
+    w.files.fold([], |acc: List<Bytes>, at: Bytes, text: Bytes|
+      acc.push(at).push(b" ").push(blake3(text)).push(b"\n")),
+  )
+
+/// The pack cut from `held` over the world `w`'s files, for the queries `q`.
+fn pack_over(q: Map<Bytes, Query<| {}>>, w: World) -> packs::Written / {abort.raise} =
+  packed_of(w.held, q, files_of(w))
+
+test "a packed answer stands as it is over the very files it was made over, and nothing is kept of it" {
   let q = test_queries(b"h1");
   let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  let packed = packed_files(four.world.held);
   let first = asked_with(
     q,
     test_world([{ at: b"a", text: b"four" }]),
-    packed,
+    Some(pack_over(q, four.world)),
+    None,
+    b"longer",
+    b"a",
+  );
+  // Only `longer` runs: `length` stands as packed.
+  assert_eq(first.output, b"long 4");
+  assert_eq(first.executed, 1);
+  assert_eq(current(first.world.held).keys(), [key_of(query_of(q, b"longer"), b"a")])
+}
+
+test "a packed answer over other files is held to its reads, and answered again where they moved" {
+  let q = test_queries(b"h1");
+  let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let packed = pack_over(q, four.world);
+  // Another file beside it: the pack stands for other files, but what `length` read is as it was.
+  let beside = asked_with(
+    q,
+    test_world([{ at: b"a", text: b"four" }, { at: b"z", text: b"more" }]),
+    Some(packed),
+    None,
+    b"longer",
+    b"a",
+  );
+  assert_eq(beside.output, b"long 4");
+  assert_eq(beside.executed, 1);
+  let moved = asked_with(
+    q,
+    test_world([{ at: b"a", text: b"forty" }]),
+    Some(packed),
+    None,
+    b"longer",
+    b"a",
+  );
+  assert_eq(moved.output, b"long 5");
+  assert_eq(moved.executed, 2)
+}
+
+test "what asked a packed answer is answered again where another pack is below the store" {
+  let q = test_queries(b"h1");
+  let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let forty = asked_over(q, test_world([{ at: b"a", text: b"forty" }]), b"length", b"a");
+  let first = asked_with(
+    q,
+    test_world([{ at: b"a", text: b"four" }]),
+    Some(pack_over(q, four.world)),
     None,
     b"longer",
     b"a",
   );
   assert_eq(first.output, b"long 4");
-  assert_eq(first.executed, 1);
-  // Kept as the run's own, the packed record is marked by an edit like any other.
-  let moved = asked_with(q, edited(first.world, b"a", b"forty"), packed, None, b"longer", b"a");
-  assert_eq(moved.output, b"long 5");
-  assert_eq(moved.executed, 2)
-}
-
-test "a trusted packed answer stands as packed, and the run keeps nothing of it" {
-  let q = test_queries(b"h1");
-  let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  let packed = packed_files(four.world.held);
-  let done = over_held(
-    nothing_held(),
-    |path: String| packed.get(path),
-    |_: Bytes, at: Bytes| None,
-    || {
-      let a = answer(q, started(q), b"longer", b"a");
-      { output: a.output, executed: ran_total(a.run) }
-    },
-    trusted: true,
+  let again = asked_with(q, first.world, Some(pack_over(q, four.world)), None, b"longer", b"a");
+  assert_eq(again.executed, 0);
+  // Nothing the store kept read what `length` read: only the pack below says its answer moved.
+  let moved = asked_with(
+    q,
+    { ..again.world, files: forty.world.files },
+    Some(pack_over(q, forty.world)),
+    None,
+    b"longer",
+    b"a",
   );
-  // Only `longer` runs: `length` stands as packed, though the world this run reads holds nothing.
-  assert_eq(done.value.output, b"long 4");
-  assert_eq(done.value.executed, 1);
-  assert_eq(current(done.held).len(), 1)
-}
-
-/// `longer` asked of `a` over `held` with `packed` beside it, trusted.
-fn asked_trusting(
-  held: Held,
-  packed: Map<String, Bytes>,
-) -> { held: Held, value: { output: Bytes, executed: Int } } / {abort.raise} = {
-  let q = test_queries(b"h1");
-  over_held(
-    held,
-    |path: String| packed.get(path),
-    |_: Bytes, _: Bytes| None,
-    || {
-      let a = answer(q, started(q), b"longer", b"a");
-      { output: a.output, executed: ran_total(a.run) }
-    },
-    trusted: true,
+  assert_eq(moved.output, b"long 5");
+  assert_eq(moved.executed, 1);
+  assert_eq(
+    asked_with(q, moved.world, Some(pack_over(q, forty.world)), None, b"longer", b"a").executed,
+    0,
   )
 }
 
-test "what asked a trusted packed answer is answered again where another answer is packed" {
+test "what asked a packed answer is answered again where the files below the pack moved" {
   let q = test_queries(b"h1");
   let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  let forty = asked_over(q, test_world([{ at: b"a", text: b"forty" }]), b"length", b"a");
-  let first = asked_trusting(nothing_held(), packed_files(four.world.held));
-  assert_eq(first.value.output, b"long 4");
-  let again = asked_trusting(first.held, packed_files(four.world.held));
-  assert_eq(again.value.executed, 0);
-  // Nothing the store kept read what `length` read: only the pack says its answer moved.
-  let moved = asked_trusting(again.held, packed_files(forty.world.held));
-  assert_eq(moved.value.output, b"long 5");
-  assert_eq(moved.value.executed, 1);
-  assert_eq(asked_trusting(moved.held, packed_files(forty.world.held)).value.executed, 0)
-}
-
-test "what asked a trusted packed answer is answered again where the pack is trusted no longer" {
-  let q = test_queries(b"h1");
-  let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  let first = asked_trusting(nothing_held(), packed_files(four.world.held));
-  // Held to what it read, the packed record does not stand over a world holding another text.
+  let packed = pack_over(q, four.world);
+  let first = asked_with(
+    q,
+    test_world([{ at: b"a", text: b"four" }]),
+    Some(packed),
+    None,
+    b"longer",
+    b"a",
+  );
+  // The pack stands no longer, and `length` is held to what it read.
   let moved = asked_with(
     q,
-    { ..test_world([{ at: b"a", text: b"forty" }]), held: first.held },
-    packed_files(four.world.held),
+    edited(first.world, b"a", b"forty"),
+    Some(packed),
     None,
     b"longer",
     b"a",
@@ -1857,15 +1892,17 @@ test "what asked a trusted packed answer is answered again where the pack is tru
   assert_eq(moved.executed, 2)
 }
 
-test "a command's answer over a trusted packed answer falls where another answer is packed" {
+test "a command's answer over a packed answer falls where another pack is below the store" {
   let q = test_queries(b"h1");
   let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
   let forty = asked_over(q, test_world([{ at: b"a", text: b"forty" }]), b"length", b"a");
-  let commanded = |held: Held, packed: Map<String, Bytes>|
+  let commanded = |held: Held, w: World| {
+    let packed = Some(pack_over(q, w));
     over_held(
       held,
-      |path: String| packed.get(path),
-      |_: Bytes, _: Bytes| None,
+      |path: String, offset: Int, len: Int| packs::frame_in(packed, path, offset, len),
+      files_of(w),
+      |_: Bytes, at: Bytes| w.files.get(at),
       || {
         let kept = standing(q, started(q), b"k");
         match kept.output {
@@ -1877,39 +1914,24 @@ test "a command's answer over a trusted packed answer falls where another answer
           },
         }
       },
-      trusted: true,
-    );
-  let first = commanded(nothing_held(), packed_files(four.world.held));
+    )
+  };
+  let first = commanded(nothing_held(), four.world);
   assert_eq(first.value.output, b"4");
-  assert(commanded(first.held, packed_files(four.world.held)).value.took);
-  let moved = commanded(first.held, packed_files(forty.world.held));
+  assert(commanded(first.held, four.world).value.took);
+  let moved = commanded(first.held, forty.world);
   assert(!moved.value.took);
   assert_eq(moved.value.output, b"5")
 }
 
-test "a packed answer over other shipped files than the run reads is answered again" {
-  let q = test_queries(b"h1");
-  let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  let first = asked_with(
-    q,
-    test_world([{ at: b"a", text: b"forty" }]),
-    packed_files(four.world.held),
-    None,
-    b"longer",
-    b"a",
-  );
-  assert_eq(first.output, b"long 5");
-  assert_eq(first.executed, 2)
-}
-
-test "a record marked where a packed answer stands for what moved takes that answer" {
+test "a run takes what the pack below its store holds for what moved" {
   let q = test_queries(b"h1");
   let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
   let forty = asked_over(q, test_world([{ at: b"a", text: b"forty" }]), b"length", b"a");
   let first = asked_with(
     q,
     test_world([{ at: b"a", text: b"four" }]),
-    packed_files(four.world.held),
+    Some(pack_over(q, four.world)),
     None,
     b"length",
     b"a",
@@ -1918,7 +1940,7 @@ test "a record marked where a packed answer stands for what moved takes that ans
   let next = asked_with(
     q,
     edited(first.world, b"a", b"forty"),
-    packed_files(forty.world.held),
+    Some(pack_over(q, forty.world)),
     None,
     b"length",
     b"a",
@@ -1934,7 +1956,7 @@ fn commanded(
   w: World,
   key: Bytes,
 ) -> { took: Bool, output: Bytes, world: World } / {abort.raise} = {
-  let done = over_held(w.held, |_: String| None, |_: Bytes, at: Bytes| w.files.get(at), || {
+  let done = over_held(w.held, packs::no_pack, b"", |_: Bytes, at: Bytes| w.files.get(at), || {
     let run = started(q);
     let kept = standing(q, run, key);
     match kept.output {
@@ -2013,7 +2035,7 @@ test "an answer taken from an offer is made again when the query that offered it
 
 test "a mark on a key no record is kept under is let go" {
   let ghost = { ..nothing_held(), marks: Map::new().insert(b"ghost", [b"m"]) };
-  let done = over_held(ghost, |_: String| None, |_: Bytes, _: Bytes| None, || {
+  let done = over_held(ghost, packs::no_pack, b"", |_: Bytes, _: Bytes| None, || {
     started(test_queries(b"h1"));
     ()
   });
