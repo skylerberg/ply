@@ -2958,6 +2958,10 @@ that holds one is `E0201`, as on a function, and no deriver reads one, so
 `compare`, `digest`, `show`, a `Map` key and a `derive` over it are `E0206`; its
 module states no `key`, `show` or `numeric` for it. A module below `std.internal` holds what the standard
 library shares within itself, and only a shipped module imports one (`E0159`).
+The runtime reports each native it implements, the words a call passes, whether
+it answers and whether it raises, as the Rust type of the function it binds says;
+a unit is compiled only against a runtime that implements each native it calls, an
+`extern fn` or one the compiler writes calls of, once and as declared (`E0476`).
 Most are functions of a
 type of the language's, declared under it (`extern fn List::len`) and called on
 a value or through the type as any function of a type is (§5.4): `xs.len()`,
@@ -3079,7 +3083,7 @@ checked against that declaration, so it performs none of it.
 | `--mtls NAME` | repeatable `--tls` credential whose listeners require a client certificate: a client that presents none `--trust` verifies is refused at the handshake; `E0429` if no `--tls` names it, `E0430` without a `--trust` |
 | `--fs NAME=PATH` | repeatable filesystem root, which `std.fs`'s files and `std.sqlite`'s databases under that label live below, and where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts`, `shipped` (declared in `compiler.unit`) or `toolchain` (`compilers` and `toolchain`, declared in `compiler.cc`: compile and link C with the host's compiler below the toolchain's cache) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships, and `reached`, which tells what traces the run what a load read of those modules |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts`, `shipped` (declared in `compiler.unit`) or `toolchain` (`compilers` and `toolchain`, declared in `compiler.cc`: compile and link C with the host's compiler below the toolchain's cache) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime this binary ships with the natives it implements, and `reached`, which tells what traces the run what a load read of those modules |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -3768,6 +3772,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0472` | a law instantiating a definition that is not a `law schema` |
 | `E0474` | obligation nothing proves |
 | `E0475` | a lent function parameter held past the call: answered, stored, performed, or passed where it may be held |
+| `E0476` | a native a unit calls that the runtime it is compiled against implements by none, by two, or otherwise than the compiler declares it |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |

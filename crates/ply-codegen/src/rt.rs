@@ -7,6 +7,7 @@ use crate::heap::{
     bridged, bytes_of, is_unique, obj, set_word, str_of, word_at,
 };
 use crate::map;
+use crate::native::{Answered, Native, Raising, Signature};
 use crate::stack::{Stack, switch};
 use crate::{array, columns, list};
 use ply_eval::arena::{Owner, RegionId, Slot};
@@ -2346,94 +2347,71 @@ pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     }
 }
 
-macro_rules! builtin_helper {
-    ($variant:ident 0) => {
-        pub unsafe extern "C" fn $variant(ctx: *mut Ctx) -> i64 {
-            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[])
-        }
-    };
-    ($variant:ident 1) => {
-        pub unsafe extern "C" fn $variant(ctx: *mut Ctx, a: i64) -> i64 {
-            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a])
-        }
-    };
-    ($variant:ident 2) => {
-        pub unsafe extern "C" fn $variant(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
-            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b])
-        }
-    };
-    ($variant:ident 3) => {
-        pub unsafe extern "C" fn $variant(ctx: *mut Ctx, a: i64, b: i64, c: i64) -> i64 {
-            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c])
-        }
-    };
-    ($variant:ident 4) => {
-        pub unsafe extern "C" fn $variant(ctx: *mut Ctx, a: i64, b: i64, c: i64, d: i64) -> i64 {
-            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c, d])
-        }
-    };
-    ($variant:ident 5) => {
-        pub unsafe extern "C" fn $variant(
-            ctx: *mut Ctx,
-            a: i64,
-            b: i64,
-            c: i64,
-            d: i64,
-            e: i64,
-        ) -> i64 {
-            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c, d, e])
-        }
-    };
-    ($variant:ident 6) => {
-        pub unsafe extern "C" fn $variant(
-            ctx: *mut Ctx,
-            a: i64,
-            b: i64,
-            c: i64,
-            d: i64,
-            e: i64,
-            f: i64,
-        ) -> i64 {
-            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c, d, e, f])
-        }
+/// `Word`, once for each name it is given: a native's parameters as its type spells them.
+macro_rules! word {
+    ($param:ident) => {
+        Word
     };
 }
 
-macro_rules! builtin_helpers {
-    ($($variant:ident $name:literal $arity:tt;)*) => {
+macro_rules! natives {
+    ($($variant:ident $name:literal ($($param:ident),*) $answer:ident;)*) => {
+        /// The type of the function compiled code calls each builtin through.
+        mod native_type {
+            use super::{Ctx, Raising, Word};
+            $( pub type $variant = unsafe extern "C" fn(*mut Ctx $(, word!($param))*) -> $answer; )*
+        }
+
         /// Each builtin as compiled code calls it: its words in, each one the callee's, and its
         /// answer out.
         #[allow(non_snake_case)]
         mod called {
-            use super::{Builtin, Ctx, builtin};
-            $( builtin_helper!($variant $arity); )*
+            use super::{Answered, Builtin, Ctx, Raising, Word, builtin};
+            $(
+                pub unsafe extern "C" fn $variant(ctx: *mut Ctx $(, $param: Word)*) -> $answer {
+                    <$answer as Answered>::of(builtin(
+                        unsafe { &mut *ctx },
+                        Builtin::$variant,
+                        &[$($param),*],
+                    ))
+                }
+            )*
         }
 
-        fn called(b: Builtin) -> *const () {
+        /// What compiled code calls `b` through takes and answers, as that function's type says.
+        pub fn signature(b: Builtin) -> Signature {
             match b {
-                $( Builtin::$variant => called::$variant as *const (), )*
+                $( Builtin::$variant => <native_type::$variant as Native>::SIGNATURE, )*
             }
+        }
+
+        /// What a unit binds a builtin's helper to: the builtin's own road past the dispatch where
+        /// it has one, else its call through [`builtin`]. Either has the type [`signature`] reads.
+        pub fn builtin_address(b: Builtin) -> *const () {
+            road(b).unwrap_or_else(|| match b {
+                $( Builtin::$variant => <native_type::$variant as Native>::address(called::$variant), )*
+            })
         }
     };
 }
 
-ply_eval::each_builtin!(builtin_helpers);
+ply_eval::each_builtin!(natives);
 
-/// What a unit binds a builtin's helper to: the builtin's own road past the dispatch where it has
-/// one, else its call through [`builtin`].
-pub fn builtin_address(b: Builtin) -> *const () {
-    match b {
-        Builtin::Push => rt_push as *const (),
-        Builtin::MapInsert => rt_map_insert as *const (),
-        Builtin::MapContains => rt_map_contains as *const (),
-        Builtin::ByteOfInt => rt_byte_of_int as *const (),
-        Builtin::Map => rt_map as *const (),
-        Builtin::Filter => rt_filter as *const (),
-        Builtin::Fold => rt_fold as *const (),
-        Builtin::MapFold => rt_map_fold as *const (),
-        Builtin::Iterate => rt_iterate as *const (),
-        _ => called(b),
-    }
+/// A builtin's own road past the dispatch, which must have the type of its call through
+/// [`builtin`].
+fn road(b: Builtin) -> Option<*const ()> {
+    Some(match b {
+        Builtin::Push => <native_type::Push as Native>::address(rt_push),
+        Builtin::MapInsert => <native_type::MapInsert as Native>::address(rt_map_insert),
+        Builtin::MapContains => <native_type::MapContains as Native>::address(rt_map_contains),
+        Builtin::ByteOfInt => <native_type::ByteOfInt as Native>::address(rt_byte_of_int),
+        Builtin::Map => <native_type::Map as Native>::address(rt_map),
+        Builtin::Filter => <native_type::Filter as Native>::address(rt_filter),
+        Builtin::Fold => <native_type::Fold as Native>::address(rt_fold),
+        Builtin::MapFold => <native_type::MapFold as Native>::address(rt_map_fold),
+        Builtin::Iterate => <native_type::Iterate as Native>::address(rt_iterate),
+        _ => return None,
+    })
 }
 
 /// Every call of a builtin, whether named or called through a value: natively over words where it
@@ -2473,7 +2451,7 @@ fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     };
     match ply_eval::builtins::call(b, values, site) {
         Ok(v) => ctx.word(&v),
-        Err(d) if b.raises() || divides_by_zero => {
+        Err(d) if signature(b).raises || divides_by_zero => {
             let message = panicked.unwrap_or_else(|| raised_message(&d));
             ctx.raise(d, message)
         }
@@ -2778,7 +2756,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(unsafe { rt_map_fold(std::ptr::from_mut(ctx), *m, *init, *f) })
         }
         (Builtin::Iterate, [seed, budget, f]) => {
-            Some(unsafe { rt_iterate(std::ptr::from_mut(ctx), *seed, *budget, *f) })
+            Some(unsafe { rt_iterate(std::ptr::from_mut(ctx), *seed, *budget, *f) }.0)
         }
         (Builtin::Bracket | Builtin::HoldBracket, [acquire, release, body]) => Some(rt_bracket(
             std::ptr::from_mut(ctx),
@@ -4727,7 +4705,11 @@ pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64)
 }
 
 /// `iterate(seed, budget, f)`: `f` until it answers `Stop` or the budget runs out. Takes all three.
-pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i64) -> i64 {
+pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i64) -> Raising {
+    Raising(iterated(ctx, seed, budget, f))
+}
+
+fn iterated(ctx: *mut Ctx, seed: i64, budget: i64, f: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     let budget = match heap::as_int(budget) {
         Some(n) if n >= 1 => n,
@@ -5281,10 +5263,10 @@ pub unsafe extern "C" fn rt_map_contains(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
     builtin(ctx, Builtin::MapContains, &[m, k])
 }
 
-pub unsafe extern "C" fn rt_byte_of_int(ctx: *mut Ctx, n: i64) -> i64 {
+pub unsafe extern "C" fn rt_byte_of_int(ctx: *mut Ctx, n: i64) -> Raising {
     let ctx = unsafe { &mut *ctx };
-    match heap::as_int(n).and_then(|v| u8::try_from(v).ok()) {
+    Raising(match heap::as_int(n).and_then(|v| u8::try_from(v).ok()) {
         Some(b) => ctx.tables.byte(b),
         None => builtin(ctx, Builtin::ByteOfInt, &[n]),
-    }
+    })
 }

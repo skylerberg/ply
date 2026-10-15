@@ -15,7 +15,9 @@ fn every_declared_helper_has_an_address() {
     }
 }
 
-/// A builtin's helper takes the words a call of it passes, under the name the emitter writes.
+/// A builtin's helper, whose words are read off its function's type, takes as many as its
+/// parameters count, which a call of it through a value is held to, under the name the emitter
+/// writes.
 #[test]
 fn every_builtin_has_a_helper_of_its_own() {
     for b in ply_eval::Builtin::all() {
@@ -26,9 +28,39 @@ fn every_builtin_has_a_helper_of_its_own() {
         );
         let found: Vec<_> = helpers().iter().filter(|h| h.name == name).collect();
         assert_eq!(found.len(), 1, "`{name}`");
-        assert_eq!(found[0].args, b.arity(), "`{name}`");
+        assert_eq!(found[0].args, b.words(), "`{name}`");
         assert!(found[0].answers, "`{name}`");
     }
+}
+
+/// What the runtime reports of a native is read off the type of the function it binds: the words
+/// past the context, whether it answers, and whether what it answers may be a raise.
+#[test]
+fn a_natives_signature_is_its_functions_type() {
+    use ply_codegen::heap::Word;
+    use ply_codegen::native::{Native, Raising, Signature};
+    use ply_codegen::rt::Ctx;
+    let of = |words, answers, raises| Signature {
+        words,
+        answers,
+        raises,
+    };
+    assert_eq!(
+        <unsafe extern "C" fn(*mut Ctx) as Native>::SIGNATURE,
+        of(0, false, false)
+    );
+    assert_eq!(
+        <unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word as Native>::SIGNATURE,
+        of(2, true, false)
+    );
+    assert_eq!(
+        <unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word, Word, Word) -> Raising as Native>::SIGNATURE,
+        of(6, true, true)
+    );
+    let push = ply_eval::Builtin::from_name("List::push").expect("a builtin");
+    assert_eq!(ply_codegen::rt::signature(push), of(2, true, false));
+    let at = ply_eval::Builtin::from_name("Bytes::at").expect("a builtin");
+    assert_eq!(ply_codegen::rt::signature(at), of(2, true, true));
 }
 
 #[test]

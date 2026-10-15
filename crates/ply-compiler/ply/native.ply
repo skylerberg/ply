@@ -6,7 +6,7 @@
 import std.bytes (u32_le, u64_le)
 import std.hash (blake3)
 import std.json (Json, Object, Array, Str, Number, Bool, parse)
-import unit (Helper, Runtime)
+import unit (Helper, Native, Runtime)
 
 /// The `main` every native program has: the runtime entered with the descriptor its unit's C lays
 /// out.
@@ -36,12 +36,48 @@ fn int_at(j: Json, name: String) -> Option<Int> =
 fn list_at_key(j: Json, name: String) -> List<Json> =
   match j { Object(m) -> match m.get(name) { Some(Array(xs)) -> xs, _ -> [] }, _ -> [] }
 
+fn flag_at(j: Json, name: String) -> Bool =
+  match j { Object(m) -> m.get(name) == Some(Bool(true)), _ -> false }
+
+/// A native as a description lists it; `None` for an entry that does not read as one.
+fn described_native(n: Json) -> Option<Native> =
+  match ((text_at(n, "name"), int_at(n, "words"))) {
+    (Some(name), Some(words)) ->
+      Some({
+        name: Bytes::of_string(name),
+        words: words,
+        answers: flag_at(n, "answers"),
+        raises: flag_at(n, "raises"),
+      }),
+    _ -> None,
+  }
+
+/// The natives a description lists; `None` where it lists none or one does not read.
+fn natives_at(j: Json) -> Option<List<Native>> =
+  match j {
+    Object(m) -> match m.get("natives") {
+      Some(Array(xs)) ->
+        xs.fold(Some([]), |acc: Option<List<Native>>, n: Json|
+          match acc {
+            None -> None,
+            Some(ns) -> match described_native(n) { Some(x) -> Some(ns.push(x)), None -> None },
+          }),
+      _ -> None,
+    },
+    _ -> None,
+  }
+
 /// The runtime `json` describes, as a runtime's library describes itself; `None` for anything else.
 pub fn runtime_of(json: Bytes) -> Option<Runtime> / {abort.raise} =
   match parse(json) {
     Err(_) -> None,
-    Ok(j) -> match ((text_at(j, "head"), text_at(j, "tail"), text_at(j, "identity"))) {
-      (Some(head), Some(tail), Some(identity)) ->
+    Ok(j) -> match ((
+        text_at(j, "head"),
+        text_at(j, "tail"),
+        text_at(j, "identity"),
+        natives_at(j),
+      )) {
+      (Some(head), Some(tail), Some(identity), Some(natives)) ->
         Some({
           head: Bytes::of_string(head),
           tail: Bytes::of_string(tail),
@@ -51,15 +87,11 @@ pub fn runtime_of(json: Bytes) -> Option<Runtime> / {abort.raise} =
                 acc.push({
                   name: Bytes::of_string(name),
                   args: args,
-                  answers: match h {
-                    Object(m) -> m.get("answers") == Some(Bool(true)),
-                    _ -> false,
-                  },
+                  answers: flag_at(h, "answers"),
                 }),
               _ -> acc,
             }),
-          builtins: list_at_key(j, "builtins").fold([], |acc: List<Bytes>, b: Json|
-            match b { Str(s) -> acc.push(Bytes::of_string(s)), _ -> acc }),
+          natives: natives,
           identity: Bytes::of_string(identity),
         }),
       _ -> None,
@@ -116,14 +148,23 @@ test "a pack lays its files out by path, then its table, then the lengths and th
 }
 
 test "a runtime reads back from the JSON its library describes itself with" {
-  let json = b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[{\"name\":\"h\",\"args\":2,\"answers\":true}],\"builtins\":[\"len\"]}";
+  let json = b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[{\"name\":\"h\",\"args\":2,\"answers\":true}],\"natives\":[{\"name\":\"List::len\",\"words\":1,\"answers\":true,\"raises\":false},{\"name\":\"panic\",\"words\":1,\"answers\":true,\"raises\":true}],\"builtins\":[\"List::len\",\"panic\"]}";
   match runtime_of(json) {
     None -> assert(false, Some("the description reads")),
     Some(r) -> {
       assert_eq(r.head, b"H");
       assert_eq(r.helpers, [{ name: b"h", args: 2, answers: true }]);
-      assert_eq(r.builtins, [b"len"]);
+      assert_eq(r.natives, [
+        { name: b"List::len", words: 1, answers: true, raises: false },
+        { name: b"panic", words: 1, answers: true, raises: true },
+      ]);
       assert_eq(r.identity, b"I")
     },
-  }
+  };
+  // A library that lists no natives, or one that does not read, describes a runtime this `ply`
+  // cannot hold a program's calls to.
+  let lacking = b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[],\"builtins\":[\"panic\"]}";
+  assert_eq(runtime_of(lacking), None);
+  let unread = b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[],\"natives\":[{\"name\":\"panic\"}]}";
+  assert_eq(runtime_of(unread), None)
 }

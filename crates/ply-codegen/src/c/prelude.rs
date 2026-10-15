@@ -1,6 +1,10 @@
 //! The C every emitted unit opens with. It mirrors `heap.rs` and `rt.rs`, and
 //! `the_prelude_agrees_with_the_layouts_it_mirrors` checks it against them.
 
+use crate::heap::Word;
+use crate::native::{Native, Raising};
+use crate::rt::Ctx;
+
 /// `rt_*` is declared, not defined: `ply_bind` supplies the addresses after `dlopen`, since a
 /// shared object cannot see symbols the host executable did not export.
 pub const PRELUDE: &str = r#"
@@ -196,96 +200,120 @@ pub struct Helper {
 unsafe impl Send for Helper {}
 unsafe impl Sync for Helper {}
 
-macro_rules! helpers {
-    ($(($f:ident, $a:literal, $r:literal)),* $(,)?) => {
-        /// The helpers that are no builtin's: what the emitted C does to values, frames and handlers.
-        const OWN: &[Helper] = &[$(Helper {
-            name: stringify!($f),
-            args: $a,
-            answers: $r,
-            address: crate::rt::$f as *const (),
-        }),*];
+impl Helper {
+    /// The helper `name` bound to `f`, taking and answering what `f`'s type says.
+    fn of<F: Native>(name: &'static str, f: F) -> Helper {
+        Helper {
+            name,
+            args: F::SIGNATURE.words,
+            answers: F::SIGNATURE.answers,
+            address: f.address(),
+        }
+    }
+}
+
+/// A helper's parameter as its function takes it: a `Word` unless written otherwise.
+macro_rules! taken {
+    ($p:ident) => {
+        Word
+    };
+    ($p:ident: $t:ty) => {
+        $t
     };
 }
 
-helpers![
-    (rt_dec, 1, false),
-    (rt_reset, 1, true),
-    (rt_box_int, 1, true),
-    (rt_unbox_int, 1, true),
-    (rt_unbox_bool, 1, true),
-    (rt_box_float, 1, true),
-    (rt_box_fixed, 2, true),
-    (rt_box_decimal, 2, true),
-    (rt_decimal_binary, 6, false),
-    (rt_decimal_compare, 4, true),
-    (rt_decimal_negate, 3, false),
-    (rt_columns_field, 3, true),
-    (rt_unbox_float, 1, true),
-    (rt_float_rem, 2, true),
-    (rt_no_fuel, 0, false),
-    (rt_no_stack, 0, false),
-    (rt_binary, 3, true),
-    (rt_wide_binary, 4, true),
-    (rt_negate, 1, true),
-    (rt_arith, 3, true),
-    (rt_lit, 1, true),
-    (rt_no_match, 0, false),
-    (rt_let_no_match, 0, false),
-    (rt_overflow, 1, false),
-    (rt_not_that_width, 2, false),
-    (rt_equal, 2, true),
-    (rt_between, 3, true),
-    (rt_concat, 2, true),
-    (rt_bytes_join, 2, true),
-    (rt_builtin_value, 1, true),
-    (rt_ctor_value, 1, true),
-    (rt_constant, 1, true),
-    (rt_call, 3, true),
-    (rt_closure, 4, true),
-    (rt_iterate, 3, true),
-    (rt_iterate_bad, 2, false),
-    (rt_shift_count, 2, false),
-    (rt_ctor, 3, true),
-    (rt_field, 3, true),
-    (rt_list, 2, true),
-    (rt_record, 3, true),
-    (rt_record_fits, 3, true),
-    (rt_record_has, 2, true),
-    (rt_list_fits, 3, true),
-    (rt_list_at, 2, true),
-    (rt_list_room, 1, true),
-    (rt_list_rest, 2, true),
-    (rt_alloc, 4, true),
-    (rt_nullary, 1, true),
-    (rt_cell, 1, true),
-    (rt_handle_push, 3, true),
-    (rt_perform, 6, true),
-    (rt_handle_land, 2, true),
-    (rt_simulate, 1, true),
-    (rt_handle_detached, 4, true),
-    (rt_region, 1, true),
-    (rt_region_close, 1, false),
-    (rt_list_lookup, 2, true),
-    (rt_map_lookup, 2, true),
-    (rt_maybe_take, 1, true),
-    (rt_maybe_box, 1, true),
-    (rt_maybe_open, 1, true),
-    (rt_tagged_take, 1, true),
-    (rt_tagged_box, 1, true),
-    (rt_tagged_open, 1, true),
-    (rt_tick, 0, false),
-    (rt_grow, 2, true),
-    (rt_bitnot, 1, true),
-    (rt_inc_shared, 1, false),
-    (rt_dec_shared, 1, false),
-    (rt_parallel, 2, false),
-    (rt_parallel_past, 4, false),
-    (rt_array_lookup, 2, true),
-    (rt_note_update, 2, false),
-    (rt_baked, 2, true),
-    (rt_stored, 1, true),
-];
+macro_rules! helpers {
+    ($($f:ident($($p:ident $(: $t:ty)?),*) $(-> $r:ty)?;)*) => {
+        /// The helpers that are no builtin's: what the emitted C does to values, frames and
+        /// handlers. Each is written as its function's type, which that function must have.
+        fn own() -> Vec<Helper> {
+            vec![$({
+                let f: unsafe extern "C" fn(*mut Ctx $(, taken!($p $(: $t)?))*) $(-> $r)? =
+                    crate::rt::$f;
+                Helper::of(stringify!($f), f)
+            }),*]
+        }
+    };
+}
+
+helpers! {
+    rt_dec(w);
+    rt_reset(w) -> Word;
+    rt_box_int(v) -> Word;
+    rt_unbox_int(w) -> Word;
+    rt_unbox_bool(w) -> Word;
+    rt_box_float(bits) -> Word;
+    rt_box_fixed(bits, t) -> Word;
+    rt_box_decimal(lo, hi) -> Word;
+    rt_decimal_binary(op, a_lo, a_hi, b_lo, b_hi, out);
+    rt_decimal_compare(a_lo, a_hi, b_lo, b_hi) -> Word;
+    rt_decimal_negate(lo, hi, out);
+    rt_columns_field(xs, i, k) -> Word;
+    rt_unbox_float(w) -> Word;
+    rt_float_rem(a, b) -> Word;
+    rt_no_fuel();
+    rt_no_stack();
+    rt_binary(op, a, b) -> Word;
+    rt_wide_binary(op, t, a, b) -> Word;
+    rt_negate(a) -> Word;
+    rt_arith(op, a, b) -> Word;
+    rt_lit(index) -> Word;
+    rt_no_match();
+    rt_let_no_match();
+    rt_overflow(what);
+    rt_not_that_width(which, value);
+    rt_equal(a, b) -> Word;
+    rt_between(v, lo, hi) -> Word;
+    rt_concat(a, b) -> Word;
+    rt_bytes_join(args: *const Word, n) -> Word;
+    rt_builtin_value(index) -> Word;
+    rt_ctor_value(index) -> Word;
+    rt_constant(index) -> Word;
+    rt_call(callee, args: *const Word, n) -> Word;
+    rt_closure(index, arity, env: *const Word, n) -> Word;
+    rt_iterate(seed, budget, f) -> Raising;
+    rt_iterate_bad(what, n);
+    rt_shift_count(n, which);
+    rt_ctor(index, args: *const Word, n) -> Word;
+    rt_field(base, index, own) -> Word;
+    rt_list(args: *const Word, n) -> Word;
+    rt_record(shape, args: *const Word, n) -> Word;
+    rt_record_fits(value, len, exact) -> Word;
+    rt_record_has(value, index) -> Word;
+    rt_list_fits(value, len, exact) -> Word;
+    rt_list_at(value, i) -> Word;
+    rt_list_room(n) -> Word;
+    rt_list_rest(value, from) -> Word;
+    rt_alloc(kind, len, layout, flags) -> Word;
+    rt_nullary(index) -> Word;
+    rt_cell(init) -> Word;
+    rt_handle_push(clauses: *const Word, n, ret) -> Word;
+    rt_perform(effect, op, resource, mode, args: *const Word, n) -> Word;
+    rt_handle_land(depth, value) -> Word;
+    rt_simulate(body) -> Word;
+    rt_handle_detached(clauses: *const Word, n, ret, body) -> Word;
+    rt_region(unique) -> Word;
+    rt_region_close(region);
+    rt_list_lookup(xs, i) -> Word;
+    rt_map_lookup(m, k) -> Word;
+    rt_maybe_take(w) -> Word;
+    rt_maybe_box(w) -> Word;
+    rt_maybe_open(w) -> Word;
+    rt_tagged_take(w) -> Word;
+    rt_tagged_box(w) -> Word;
+    rt_tagged_open(w) -> Word;
+    rt_tick();
+    rt_grow(entry, args) -> Word;
+    rt_bitnot(a) -> Word;
+    rt_inc_shared(w);
+    rt_dec_shared(w);
+    rt_parallel(slots, n);
+    rt_parallel_past(slots, n, reach: *const Word, count);
+    rt_array_lookup(xs, i) -> Word;
+    rt_note_update(in_place, copied);
+    rt_baked(text, len) -> Word;
+    rt_stored(w) -> Word;
+}
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since
 /// no C name holds one, and a function of a type is its type in lower case, `_` and its name.
@@ -301,13 +329,16 @@ pub fn builtin_helper_name(builtin: &str) -> String {
 pub fn helpers() -> &'static [Helper] {
     static ALL: std::sync::OnceLock<Vec<Helper>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
-        let builtins = ply_eval::Builtin::all().iter().map(|b| Helper {
-            name: Box::leak(builtin_helper_name(b.name()).into_boxed_str()),
-            args: b.arity(),
-            answers: true,
-            address: crate::rt::builtin_address(*b),
+        let builtins = ply_eval::Builtin::all().iter().map(|b| {
+            let signature = crate::rt::signature(*b);
+            Helper {
+                name: Box::leak(builtin_helper_name(b.name()).into_boxed_str()),
+                args: signature.words,
+                answers: signature.answers,
+                address: crate::rt::builtin_address(*b),
+            }
         });
-        OWN.iter().copied().chain(builtins).collect()
+        own().into_iter().chain(builtins).collect()
     })
 }
 

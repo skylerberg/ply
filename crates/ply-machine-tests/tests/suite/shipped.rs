@@ -66,3 +66,42 @@ fn a_data_file_a_shipped_module_embeds_is_held_by_name_and_is_no_module() {
             .map(|text| blake3::hash(text.as_bytes()).to_hex().to_string())
     );
 }
+
+/// What a runtime's library describes itself as carries each native under the fields
+/// `compiler.native.runtime_of` reads, and the natives' names alone, which a `ply` that reads no
+/// `natives` builds against.
+#[test]
+fn the_runtime_describes_each_native_under_the_fields_a_build_reads() {
+    let described: serde_json::Value =
+        serde_json::from_str(&ply_machine::shipped::runtime_json()).expect("the description reads");
+    let natives = described["natives"].as_array().expect("natives");
+    let named = |name: &str| {
+        natives
+            .iter()
+            .find(|n| n["name"] == name)
+            .unwrap_or_else(|| panic!("no native `{name}`"))
+    };
+    let push = named("List::push");
+    assert_eq!(
+        (&push["words"], &push["answers"], &push["raises"]),
+        (&2.into(), &true.into(), &false.into())
+    );
+    let range = named("Map::range");
+    assert_eq!(
+        (&range["words"], &range["raises"]),
+        (&6.into(), &false.into())
+    );
+    let decode = named("Secret::decode");
+    assert_eq!(
+        (&decode["words"], &decode["raises"]),
+        (&2.into(), &true.into())
+    );
+    let names: Vec<&str> = described["builtins"]
+        .as_array()
+        .expect("builtins")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let reported: Vec<&str> = natives.iter().filter_map(|n| n["name"].as_str()).collect();
+    assert_eq!(names, reported);
+}

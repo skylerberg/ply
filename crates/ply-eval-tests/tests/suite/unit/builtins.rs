@@ -878,6 +878,23 @@ fn every_builtin_is_reachable_by_the_name_it_reports() {
     }
 }
 
+/// A builtin called through a value with other than its words is refused by name, not read past.
+#[test]
+fn a_builtin_given_other_than_its_words_is_an_arity_error() {
+    for b in Builtin::all() {
+        let given = vec![Value::Unit; b.words() + 1];
+        let refused = ply_eval::builtins::call(*b, given, Span::DUMMY)
+            .expect_err("a call past the words was answered");
+        assert_eq!(
+            refused.code,
+            ply_eval::codes::ARITY_MISMATCH,
+            "`{}`",
+            b.name()
+        );
+        assert!(refused.message.contains(b.name()), "{}", refused.message);
+    }
+}
+
 #[test]
 fn no_builtin_is_listed_twice() {
     let mut names: Vec<&str> = Builtin::all().iter().map(|b| b.name()).collect();
