@@ -16425,22 +16425,25 @@ fn settled_sites(checker: Checker) -> { sites: List<TypedSite>, types: TypeTable
         at.module == t.module && t.span.start >= at.span.start && t.span.end <= at.span.end,
       None -> true,
     };
-  checker.typed.filter(in_own_text).fold(
+  let numbering_of = |owner: Bytes| {
+    let quantified = match def_of(checker, owner) { Some(d) -> d.scheme.ty_vars, None -> [] };
+    range(0, quantified.len()).fold(Map::new(), |m: Map<Int, Int>, i: Int|
+      m.insert(quantified.get(i), i))
+  };
+  let settled = checker.typed.filter(in_own_text).fold(
     // The rows a body is published from name their types in the table handed in with them.
-    { sites: [], types: checker.known.types },
-    |acc: { sites: List<TypedSite>, types: TypeTable }, t: TypedAt| {
-      let quantified = match def_of(checker, t.owner) { Some(d) -> d.scheme.ty_vars, None -> [] };
-      let numbering = range(0, quantified.len()).fold(Map::new(), |m: Map<Int, Int>, i: Int|
-        m.insert(quantified.get(i), i));
+    { sites: [], types: checker.known.types, keyed: Map::new(), owner: b"", numbering: Map::new() },
+    |acc: Settling, t: TypedAt| {
+      let numbering = if t.owner == acc.owner { acc.numbering } else { numbering_of(t.owner) };
       let read = |ty: Type| numbered(resolve(checker, ty), numbering);
       let args = t.args.fold(
-        { table: acc.types, keys: [] },
-        |h: { table: TypeTable, keys: List<Bytes> }, ty: Type| {
-          let held = held_type(h.table, read(ty));
-          { table: held.table, keys: h.keys.push(held.key) }
+        { table: acc.types, keyed: acc.keyed, keys: [] },
+        |h: { table: TypeTable, keyed: Map<Type, Bytes>, keys: List<Bytes> }, ty: Type| {
+          let held = held_once(h.table, h.keyed, read(ty));
+          { table: held.table, keyed: held.keyed, keys: h.keys.push(held.key) }
         },
       );
-      let own = held_type(args.table, read(t.ty));
+      let own = held_once(args.table, args.keyed, read(t.ty));
       {
         sites: acc.sites.push({
           module: t.module,
@@ -16450,30 +16453,75 @@ fn settled_sites(checker: Checker) -> { sites: List<TypedSite>, types: TypeTable
           owner: t.owner,
         }),
         types: own.table,
+        keyed: own.keyed,
+        owner: t.owner,
+        numbering: numbering,
       }
     },
-  )
+  );
+  { sites: settled.sites, types: settled.types }
 }
+
+/// Sites settled so far: each site, the table their types are held in, the key of each type a site
+/// held, and the owner of the last site with its numbering.
+type Settling = {
+  sites: List<TypedSite>,
+  types: TypeTable,
+  keyed: Map<Type, Bytes>,
+  owner: Bytes,
+  numbering: Map<Int, Int>,
+}
+
+/// `ty` held in `table`, found in `keyed` where a site held it already.
+fn held_once(
+  table: TypeTable,
+  keyed: Map<Type, Bytes>,
+  ty: Type,
+) -> { table: TypeTable, keyed: Map<Type, Bytes>, key: Bytes } / {abort.raise} =
+  match keyed.get(ty) {
+    Some(key) -> { table: table, keyed: keyed, key: key },
+    None -> {
+      let h = held_type(table, ty);
+      { table: h.table, keyed: keyed.insert(ty, h.key), key: h.key }
+    },
+  }
 
 /// `ty` with each variable `numbering` holds numbered by it and every other `-1`, and every
 /// function type's row left out: what a value is laid out by, which a row never decides.
 fn numbered(ty: Type, numbering: Map<Int, Int>) -> Type =
+  if !renumbers(ty) { ty } else {
+    match ty {
+      TyVar(v) -> TyVar(match numbering.get(v) { Some(i) -> i, None -> 0 - 1 }),
+      TyCon(c) -> TyCon({ ..c, args: c.args.map(|a: Type| numbered(a, numbering)) }),
+      TyFn(f) ->
+        TyFn({
+          params: f.params.map(|p: Type| numbered(p, numbering)),
+          ret: numbered(f.ret, numbering),
+          effects: row_empty(),
+        }),
+      TyRecord(fs) -> TyRecord(fs.map(|f: Field| { ..f, ty: numbered(f.ty, numbering) })),
+      TyNominal(x) ->
+        TyNominal({
+          ..x,
+          args: x.args.map(|a: Type| numbered(a, numbering)),
+          fields: x.fields.map(|f: Field| { ..f, ty: numbered(f.ty, numbering) }),
+        }),
+    }
+  }
+
+/// Whether `numbered` makes something else of `ty`: it holds a variable, or a function with a row.
+fn renumbers(ty: Type) -> Bool =
   match ty {
-    TyVar(v) -> TyVar(match numbering.get(v) { Some(i) -> i, None -> 0 - 1 }),
-    TyCon(c) -> TyCon({ ..c, args: c.args.map(|a: Type| numbered(a, numbering)) }),
+    TyVar(_) -> true,
+    TyCon(c) -> c.args.fold(false, |found: Bool, a: Type| found || renumbers(a)),
     TyFn(f) ->
-      TyFn({
-        params: f.params.map(|p: Type| numbered(p, numbering)),
-        ret: numbered(f.ret, numbering),
-        effects: row_empty(),
-      }),
-    TyRecord(fs) -> TyRecord(fs.map(|f: Field| { ..f, ty: numbered(f.ty, numbering) })),
+      f.effects.atoms.len() > 0 || f.effects.tail != None
+        || f.params.fold(false, |found: Bool, p: Type| found || renumbers(p))
+        || renumbers(f.ret),
+    TyRecord(fs) -> fs.fold(false, |found: Bool, f: Field| found || renumbers(f.ty)),
     TyNominal(x) ->
-      TyNominal({
-        ..x,
-        args: x.args.map(|a: Type| numbered(a, numbering)),
-        fields: x.fields.map(|f: Field| { ..f, ty: numbered(f.ty, numbering) }),
-      }),
+      x.args.fold(false, |found: Bool, a: Type| found || renumbers(a))
+        || x.fields.fold(false, |found: Bool, f: Field| found || renumbers(f.ty)),
   }
 
 /// A nullary type's name, or `'` and the number its owner's scheme gives a variable it quantifies,
