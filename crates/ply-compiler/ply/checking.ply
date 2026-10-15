@@ -50,7 +50,8 @@ import parsing (Ident, Span, ParseDiag, ParseStart, span_bin, dummy_span, start)
 import lexer (Token)
 import infer (DefInfo, TestInfo, walk_order, Walks, Only)
 import hash (Fixed, FixedTest, FixedLaw, Fixing, NodeRef, Shapes, Shape, no_fixing, module_forms,
-             hashed_forms, fixing_bin, shapes_bin, fixed_bin, pin_key, joined_forms)
+             hashed_forms, fixing_bin, shapes_bin, fixed_bin, pin_key, joined_forms, body_key,
+             checked_body)
 import pages (Page, Pages, documented, pages_bin)
 import std.gen
 
@@ -5111,19 +5112,20 @@ test "a program's tables made from its modules' answers are the tables of its ch
 }
 
 /// A program, and a shipped module it reaches in part: a generic over a numeric type, a tagged
-/// literal's parser, what a type states, and functions nothing reaches.
+/// literal's parser, what a type states, a call on a value naming an argument, and functions
+/// nothing reaches.
 fn pulling() -> { user: List<Source>, shipped: List<Source> } =
   {
     user: [
       {
         name: b"main",
-        src: b"import std.shapes\nimport std.shapes (origin, far, Tag, size)\npub fn main() -> Int = far(origin()) + size(0 - 1) + shapes\"two\"\npub fn named(t: Tag) -> String = \"{t}\"\ntest \"sized\" { assert_eq(size(0 - 3), 3) }\n",
+        src: b"import std.shapes\nimport std.shapes (origin, far, Tag, size)\npub fn main() -> Int = far(origin()) + size(0 - 1) + shapes\"two\"\npub fn named(t: Tag) -> String = \"{t}\"\npub fn ranked(t: Tag) -> Int = t.rank(more: 2)\ntest \"sized\" { assert_eq(size(0 - 3), 3) }\n",
       },
     ],
     shipped: [
       {
         name: b"std.shapes",
-        src: b"pub type Point = { x: Int, y: Int }\npub fn origin() -> Point = { x: 0, y: 0 }\npub fn far(p: Point) -> Int requires p.x >= 0 = p.x + helper(p)\nfn helper(p: Point) -> Int = p.y\nfn spare() -> Int = 5\npub fn unreached() -> Int requires spare() > 0 = spare()\npub type Tag = | A | B\nfn tag_text(t: Tag) -> String = match t { A -> \"a\", B -> \"b\" }\nshow for Tag by tag_text\npub fn size<a>(n: a) -> a where numeric(a) = { let zero: a = numeric_of_int(0); if n < zero { zero - n } else { n } }\npub fn spare_size<a>(n: a) -> a where numeric(a) = n\npub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> = if text == \"two\" { Ok(2) } else { Err({ message: \"not two\", offset: 0 }) }\ntest \"shipped\" { assert_eq(far(origin()), 0) }\n",
+        src: b"pub type Point = { x: Int, y: Int }\npub fn origin() -> Point = { x: 0, y: 0 }\npub fn far(p: Point) -> Int requires p.x >= 0 = p.x + helper(p)\nfn helper(p: Point) -> Int = p.y\nfn spare() -> Int = 5\npub fn unreached() -> Int requires spare() > 0 = spare()\npub type Tag = | A | B\nfn tag_text(t: Tag) -> String = match t { A -> \"a\", B -> \"b\" }\nshow for Tag by tag_text\npub fn Tag::rank(t: Tag, by: Int = 1, more: Int = 0) -> Int = match t { A -> by, B -> by + more }\npub fn size<a>(n: a) -> a where numeric(a) = { let zero: a = numeric_of_int(0); if n < zero { zero - n } else { n } }\npub fn spare_size<a>(n: a) -> a where numeric(a) = n\npub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> = if text == \"two\" { Ok(2) } else { Err({ message: \"not two\", offset: 0 }) }\ntest \"shipped\" { let t = A; assert_eq(far(origin()), t.rank(by: 0)) }\n",
       },
     ],
   }
@@ -5190,6 +5192,15 @@ test "a program assembled from its modules' answers, a shipped module's among th
           assert_eq(assembled.checked.defs, view.checked.defs);
           assert_eq(assembled.checked.facts, view.checked.facts);
           assert_eq(assembled.checked, view.checked);
+          // The call on a value stores what its check found, which a hashing before it has not.
+          match staged_pulling_std_with(f.user, f.shipped, reached: mode.reached).hashed {
+            Ok(h) ->
+              assert(
+                checked_body(body_named(h.hashes.bodies, b"main.ranked"), Map::new())
+                  != body_named(view.frame.hashes.bodies, b"main.ranked"),
+              ),
+            Err(_) -> panic("the fixture hashes"),
+          };
           assert_eq(loaded.frame.hashes, view.frame.hashes);
           assert_eq(assembled, view);
           assert_eq(functions_of(loaded.frame), assembled.checked.defs.len());
@@ -5199,6 +5210,50 @@ test "a program assembled from its modules' answers, a shipped module's among th
       }
     },
   )
+}
+
+/// The stored body `bodies` holds of `name`.
+fn body_named(bodies: List<{ name: Bytes, body: Bytes }>, name: Bytes) -> Bytes / {abort.raise} =
+  match bodies.find(|b: { name: Bytes, body: Bytes }| b.name == name) {
+    Some(b) -> b.body,
+    None -> panic("no body is stored of " ++ String::of_bytes_lossy(name)),
+  }
+
+test "a body that calls on a value stores what its check found, read whole or answered module by module" {
+  // Alone, and after a module it imports, which a check of it against its imports places first.
+  [
+    [
+      {
+        name: b"m",
+        src: b"pub type T = | T(Int)\nfn T::size(t: T) -> Int = match t { T(n) -> n }\npub fn f(t: T) -> Int = t.size()\n",
+      },
+    ],
+    [
+      {
+        name: b"low",
+        src: b"pub type T = | T(Int)\npub fn T::size(t: T) -> Int = match t { T(n) -> n }\npub fn T::scaled(t: T, by: Int = 2, plus: Int = 0) -> Int = t.size() * by + plus\n",
+      },
+      { name: b"m", src: b"import low\npub fn f(t: low::T) -> Int = t.scaled(plus: 3)\n" },
+    ],
+  ].fold((), |u: Unit, sources: List<Source>| {
+    let answered = fixed_over(nothing_held(), sources, []).fixing.nodes.fold(
+      b"",
+      |acc: Bytes, x: Fixed| if x.name == b"m.f" { x.body } else { acc },
+    );
+    match analyse_pulling_std_with(sources, [], no_rows()).out {
+      Refused(_) -> panic("the fixture checks"),
+      Analysed(w) -> assert_eq(body_named(w.hashes.bodies, b"m.f"), answered),
+    };
+    // Hashed before the check, the body is filed under no hash until the check says what it calls.
+    match staged_pulling_std_with(sources, []).hashed {
+      Ok(h) -> {
+        let unchecked = body_named(h.hashes.bodies, b"m.f");
+        assert_eq(body_key(unchecked), None);
+        assert(checked_body(unchecked, Map::new()) != answered)
+      },
+      Err(_) -> panic("the fixture hashes"),
+    }
+  })
 }
 
 fn layered(lib: Bytes) -> List<Source> =

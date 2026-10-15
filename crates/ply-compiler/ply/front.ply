@@ -32,7 +32,7 @@ import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOut
              body_key, rehash_index, by_name, tagged_target, closure_of, reached_functions, LawNode,
              Node, NodeFn, NodeType, NodeEffect, Which, TheFn, TheDecl, TheItem, denoted, DenotesFn,
              DenotesCtor, DenotesNothing, effect_called, type_named, NodeRef, pin_key, Skeleton,
-             hashes_fixed, fixing_of, of_key)
+             hashes_fixed, fixing_of, of_key, checked_hashes, print_bodies, Printed, Unprintable)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, no_known, KnownDef, KnownTest, KeptFacts,
               RootFacts, WalkedBody, Walks, Every, WitnessOrder, LabelSite, OperandSite, TypedSite,
@@ -3518,7 +3518,17 @@ fn checked_closure(h: Hashed, rows: Rows, walks: Walks) -> AnalysisOutcome / {ab
       r: h.r,
       checked: checked,
       index: h.index,
-      hashes: h.hashes,
+      hashes: {
+        let kept = kept_calls(h.mods, checked);
+        checked_hashes(
+          h.hashes,
+          checked.facts.elaboration.members.concat(kept.sites),
+          kept.unread,
+          checked.tests.fold(Map::new(), |acc: Map<Bytes, Bool>, t: TestInfo|
+            if kept.unread.contains(test_owner(t.module, t.name)) { acc.insert(t.key, true) }
+            else { acc }),
+        )
+      },
       // A dependency's unused definitions are its own package's to report.
       warnings: h.unused.filter(|diag: Diag|
         diag.labels.fold(
@@ -3538,6 +3548,53 @@ fn checked_closure(h: Hashed, rows: Rows, walks: Walks) -> AnalysisOutcome / {ab
       embed_items: h.embed_items,
       bodies: out.bodies,
     })
+  }
+}
+
+/// The calls on values made by each body `checked` published from its rows rather than walked, as
+/// its row filed them, placed where its definition or test in `mods` now starts; and each of those
+/// whose row filed no calls, whose body's calls no check here found.
+fn kept_calls(
+  mods: List<ParsedModule>,
+  checked: CheckOutput,
+) -> { sites: List<MemberSite>, unread: Map<Bytes, Bool> } / {abort.raise} = {
+  let kept = checked.kept.fold(Map::new(), |acc: Map<Bytes, Bytes>, k: KeptFacts|
+    acc.insert(k.name, k.facts));
+  let read = range(0, mods.len()).fold(
+    { sites: [], placed: Map::new() },
+    |acc: { sites: List<MemberSite>, placed: Map<Bytes, Bool> }, i: Int| {
+      let m = mods.get(i);
+      m.module.items.fold(
+        acc,
+        |a: { sites: List<MemberSite>, placed: Map<Bytes, Bool> }, item: Item| {
+          let at = match item {
+            IFn(d) -> Some({ owner: qualify(m.name, d.name.name), start: d.span.start }),
+            ITest(d) -> Some({ owner: test_owner(m.name, d.name), start: d.span.start }),
+            _ -> None,
+          };
+          match at {
+            None -> a,
+            Some(x) -> match kept.get(x.owner) {
+              None -> a,
+              Some(filed) -> match facts_at(filed, i, x.start, x.owner) {
+                None -> a,
+                Some(f) ->
+                  { sites: a.sites.concat(f.members), placed: a.placed.insert(x.owner, true) },
+              },
+            },
+          }
+        },
+      )
+    },
+  );
+  {
+    sites: read.sites,
+    unread: checked.seeded.concat(
+      checked.tests.fold([], |acc: List<Bytes>, t: TestInfo|
+        if checked.seeded_tests.contains(t.key) { acc.push(test_owner(t.module, t.name)) }
+        else { acc }),
+    ).fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes|
+      if read.placed.contains(n) { acc } else { acc.insert(n, true) }),
   }
 }
 
@@ -8514,6 +8571,39 @@ test "a module's tables and rows read back as an answer kept them" {
       assert_eq(tables_read(tables_kept(t)), t);
       let r = rows_of(w);
       assert_eq(rows_read(rows_kept(r)), r)
+    },
+  }
+}
+
+test "a body read whole prints each call on a value as a call of what its check found" {
+  let src = b"pub type Bag = | Bag(Int)\npub fn Bag::size(b: Bag) -> Int = match b { Bag(n) -> n + 1 }\npub type Cart = | Cart(Int)\npub fn Cart::size(c: Cart) -> Int = match c { Cart(n) -> n }\npub fn Cart::scaled(c: Cart, by: Int = 2, plus: Int = 0) -> Int = c.size() * by + plus\npub fn total(c: Cart) -> Int = c.size()\npub fn more(c: Cart) -> Int = c.scaled(plus: 3)\n";
+  match analyse(parse_all([{ name: b"m", src: src }])) {
+    Refused(_) -> panic("the fixture checks"),
+    Analysed(w) -> {
+      let item = |apart: Bool, name: Bytes|
+        match print_bodies(
+            w.hashes.bodies.map(|b: { name: Bytes, body: Bytes }| b.body),
+            w.hashes.defs.concat(w.hashes.decls).map(|d: { name: Bytes, hash: Bytes }|
+              { name: d.name, hash: d.hash, public: true }),
+            [],
+            [],
+            [],
+            apart,
+          ) {
+          Printed(ms) ->
+            ms.get(0).text.split(b"\n\n").fold(b"", |acc: Bytes, it: Bytes|
+              if it.contains(Bytes::concat_all([b"fn ", name, b"("])) { it } else { acc }),
+          Unprintable(why) -> panic(String::of_bytes(why.message)),
+        };
+      let shown = |t: Bytes| Some(String::of_bytes_lossy(t));
+      // Set apart, as a bisection prints a mixture, a function of a type is a plain function.
+      let apart = item(true, b"more");
+      assert(apart.contains(b"Cart::scaled(_l0, _l2: 3)"), shown(apart));
+      let total = item(true, b"total");
+      assert(total.contains(b"Cart::size(_l0)") && !total.contains(b".size("), shown(total));
+      // Under its own names, as a deployed program prints, it names the parameter it fills.
+      let own = item(false, b"more");
+      assert(own.contains(b".scaled(_l2: 3)"), shown(own))
     },
   }
 }

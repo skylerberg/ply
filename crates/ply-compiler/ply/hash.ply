@@ -29,10 +29,11 @@ import derive (Expansion, expand_derives)
 import std.bytes (is_digit, ascii_of_int, u32_le, u64_le)
 import std.hash (blake3)
 import std.list
+import std.option
 import std.graph
 import std.bytes
 import std.string
-import infer (test_owner)
+import infer (test_owner, MemberSite)
 
 // --- Bytes ------------------------------------------------------------------------------------
 
@@ -727,6 +728,7 @@ type Bound = { name: Bytes, spot: Spot }
 /// decides, and each set whose order the bytes of its members decide. Filling the holes writes
 /// the bytes; the walk over the tree, every name resolved, is made once. `Chose` writes nothing:
 /// it is what the check found of the call on a value written just before it, as [`Choice`] says.
+/// `Pending` writes nothing either: it is that call hashed before its check, as [`Site`] says.
 pub type Piece =
   | Raw(Bytes)
   | Ref(Int)
@@ -736,6 +738,7 @@ pub type Piece =
   | Atoms(List<AtomForm>)
   | Run(RunForm)
   | Chose(Int, List<Int>)
+  | Pending(Bytes, List<Bytes>)
 
 /// A row's atom, and the effect declaration's sketch that orders atoms equal in their bytes.
 pub type AtomForm = { pieces: List<Piece>, tie: Bytes }
@@ -754,6 +757,21 @@ pub type Choice = { callee: Int, named: List<Int> }
 /// What a check found of a call on a value: the function it calls, by its program-wide name, and
 /// where each argument it names goes, as [`Choice`] says.
 pub type Called = { callee: Bytes, named: List<Int> }
+
+/// A call on a value as hashing that runs before the check leaves it: where the check files what
+/// it found of the call ([`site_key`]), and every function the call may be, by program-wide name,
+/// in the order the bytes write them.
+pub type Site = { at: Bytes, candidates: List<Bytes> }
+
+/// What a filled form says of a call on a value: the check's choice, or the site it is yet to be
+/// read from.
+pub type Pick = | Found(Choice) | Waiting(Site)
+
+derive bin for Choice
+
+derive bin for Site
+
+derive bin for Pick
 
 derive bin for Spot
 
@@ -777,12 +795,13 @@ type Encoder = {
   /// `values`; `run` -1 outside every run.
   scope: Spot,
   runs: Int,
-  /// What the check found of each call on a value, by the call's span.
-  chose: Map<Bytes, Called>,
+  /// What the check found of each call on a value, by `site_key`; `None` where hashing runs
+  /// before the check, which leaves each call pending.
+  chose: Option<Map<Bytes, Called>>,
 }
 
 /// `chosen` is each `Chose` in the order the bytes write it.
-type Finished = { bytes: Bytes, refs: List<Int>, chosen: List<Choice> }
+type Finished = { bytes: Bytes, refs: List<Int>, chosen: List<Pick> }
 
 fn no_scope() -> Spot = { run: 0 - 1, member: 0, within: 0 }
 
@@ -797,21 +816,22 @@ fn new_encoder(index: Index, module: Int) -> Encoder =
     label_params: [],
     scope: no_scope(),
     runs: 0,
-    chose: Map::new(),
+    chose: Some(Map::new()),
   }
 
-/// What `encode` writes from a fresh encoder in `module` of `index`.
+/// What `encode` writes from a fresh encoder in `module` of `index`, of what no stored body holds:
+/// each call on a value found nothing.
 fn template_of<| e>(
   index: Index,
   module: Int,
   encode: (Encoder) -> Encoder / e,
-) -> List<Piece> / e = chosen_template(index, module, Map::new(), encode)
+) -> List<Piece> / e = compact(encode(new_encoder(index, module)).out)
 
-/// [`template_of`], each call on a value read as calling what `chose` holds at its span.
+/// [`template_of`], each call on a value read as calling what `chose` holds at its site.
 fn chosen_template<| e>(
   index: Index,
   module: Int,
-  chose: Map<Bytes, Called>,
+  chose: Option<Map<Bytes, Called>>,
   encode: (Encoder) -> Encoder / e,
 ) -> List<Piece> / e = compact(encode({ ..new_encoder(index, module), chose: chose }).out)
 
@@ -903,7 +923,7 @@ type Fill = {
   seen: Map<Int, Bool>,
   deferred: Option<List<Int>>,
   runs: Map<Int, RunAt>,
-  chosen: List<Choice>,
+  chosen: List<Pick>,
 }
 
 /// `pieces` written as `f` fills them.
@@ -977,7 +997,9 @@ fn fill(f: Filling, s: Fill, p: Piece) -> Fill / {abort.raise} =
     },
     Atoms(atoms) -> atoms_filled(f, s, atoms),
     Run(r) -> run_filled(f, s, r),
-    Chose(callee, named) -> { ..s, chosen: s.chosen.push({ callee: callee, named: named }) },
+    Chose(callee, named) -> { ..s, chosen: s.chosen.push(Found({ callee: callee, named: named })) },
+    Pending(at, candidates) ->
+      { ..s, chosen: s.chosen.push(Waiting({ at: at, candidates: candidates })) },
   }
 
 type AtomEncoding = { bytes: Bytes, tie: Bytes, held: List<Int> }
@@ -1543,10 +1565,17 @@ fn atom_label(atom: AtomExpr) -> Option<Ident> =
 /// What a call on a value written `.name(..)` at `at` may call: `m::f` where it names its function
 /// in full, and otherwise every function `X::name` of a module its own can see, in the order of
 /// their program-wide names. Which of them it is the value's type says, which no hash reads: the
-/// check's choice follows, written as nothing.
-fn on_value(encoder: Encoder, at: Span, name: Ident) -> Encoder / {abort.raise} = {
-  let called = encoder.chose.get(span_key(at));
-  let named = match called { Some(c) -> c.named, None -> [] };
+/// check's choice follows, written as nothing. `names` is whether the call names an argument.
+fn on_value(encoder: Encoder, at: Span, name: Ident, names: Bool) -> Encoder / {abort.raise} = {
+  let site = site_key(encoder.module, at);
+  let chosen = |c: Choice| Chose(c.callee, c.named);
+  // With no function to choose and no argument to place, the check has nothing to say.
+  let picked = |candidates: List<Bytes>|
+    match encoder.chose {
+      Some(chose) -> chosen(choice_of(chose.get(site), candidates)),
+      None -> if candidates.len() == 0 && !names { chosen(choice_of(None, [])) }
+      else { Pending(site, candidates) },
+    };
   match member_of(name.name) {
     Some(of) ->
       put_piece(
@@ -1555,7 +1584,7 @@ fn on_value(encoder: Encoder, at: Span, name: Ident) -> Encoder / {abort.raise} 
           name: { name: of.member, span: name.span },
           span: name.span,
         }),
-        Chose(0 - 1, named),
+        picked([]),
       ),
     None -> {
       let index = encoder.index;
@@ -1571,19 +1600,36 @@ fn on_value(encoder: Encoder, at: Span, name: Ident) -> Encoder / {abort.raise} 
           Greater -> false,
           _ -> true,
         });
-      let chosen = match called {
-        Some(c) ->
-          range(0, found.len()).fold(0 - 1, |acc: Int, i: Int|
-            if acc < 0 && index.nodes.get(found.get(i)).name == c.callee { i } else { acc }),
-        None -> 0 - 1,
-      };
       put_piece(
         found.fold(put_u32(put_u32(encoder, 0), found.len()), node_ref),
-        Chose(chosen, named),
+        picked(found.map(|v: Int| index.nodes.get(v).name)),
       )
     },
   }
 }
+
+/// Where a check files what it found of a call on a value: the call's module and span.
+pub fn site_key(module: Int, at: Span) -> Bytes = u32_le(module).concat(span_key(at))
+
+/// What a check found of each call on a value `sites` record, by `site_key`. A call of a function
+/// a record holds in a field calls none of a type's.
+pub fn called_at(sites: List<MemberSite>) -> Map<Bytes, Called> =
+  sites.fold(Map::new(), |acc: Map<Bytes, Called>, x: MemberSite|
+    if x.callee == b"" { acc }
+    else { acc.insert(site_key(x.module, x.span), { callee: x.callee, named: x.named }) })
+
+/// `called`, what a check found of a call on a value, as a choice among `candidates`: none where
+/// it found nothing or calls a function none of them is.
+fn choice_of(called: Option<Called>, candidates: List<Bytes>) -> Choice / {abort.raise} =
+  match called {
+    None -> { callee: 0 - 1, named: [] },
+    Some(c) ->
+      {
+        callee: range(0, candidates.len()).fold(0 - 1, |acc: Int, i: Int|
+          if acc < 0 && candidates.get(i) == c.callee { i } else { acc }),
+        named: c.named,
+      },
+  }
 
 /// What follows the value and the name in the form of `value.name[labels](args, named)`: the
 /// labels, the arguments, those given by name, and every function the call may be.
@@ -1603,6 +1649,7 @@ fn called_on(
       expr(put_text(acc, n.name.name), n.value)),
     at,
     name,
+    named.len() > 0,
   )
 }
 
@@ -2214,7 +2261,80 @@ fn framed_picks(picks: List<List<Choice>>) -> Bytes = {
   u32_le(inner.len()).concat(inner)
 }
 
-/// The choices of a body `e` opens, a list a member; none where it was hashed with none known.
+fn open_picks_bin() -> bin::BinCodec<List<List<Pick>>> = bin::list_bin(bin::list_bin(pick_bin()))
+
+/// A body, alone in its component where `class` is `None`: a kind byte, the member's class, each
+/// member's choices, then the bytes its hash is taken over. A body with a call on a value its check
+/// is yet to say of is of a kind two past that, its picks written whole: `envelope` reads no key
+/// from it, so no store files it and no printer reads it until [`checked_body`] completes it.
+fn stored_body(
+  class: Option<Int>,
+  picks: List<List<Pick>>,
+  payload: Bytes,
+) -> Bytes / {abort.raise} = {
+  let head = |kind: Int|
+    match class { None -> byte_of_int(kind), Some(c) -> byte_of_int(kind + 1).concat(u32_le(c)) };
+  let found = Option::traverse(picks, |member: List<Pick>|
+    Option::traverse(member, |p: Pick| match p { Found(c) -> Some(c), Waiting(_) -> None }));
+  match found {
+    Some(choices) -> Bytes::concat_all([head(0), framed_picks(choices), payload]),
+    None -> {
+      let open = bin::encode(picks, open_picks_bin());
+      Bytes::concat_all([head(2), u32_le(open.len()), open, payload])
+    },
+  }
+}
+
+/// `body` with each call on a value its hashing left pending written as `chose`, what its check
+/// found of each call by `site_key`, says: the body hashing after the check stores. Any other body
+/// is itself.
+pub fn checked_body(body: Bytes, chose: Map<Bytes, Called>) -> Bytes / {abort.raise} = {
+  let kind = if body.len() == 0 { 0 - 1 } else { body.at(0) };
+  if kind != 2 && kind != 3 { body } else {
+    let from = if kind == 2 { 1 } else { 5 };
+    let n = match body.u32_at(from) { Some(x) -> x, None -> panic("a malformed body") };
+    let picks = match bin::decode(body.slice(from + 4, from + 4 + n), open_picks_bin()) {
+      Ok(p) -> p,
+      Err(_) -> panic("a malformed body"),
+    };
+    Bytes::concat_all([
+      byte_of_int(kind - 2),
+      body.slice(1, from),
+      framed_picks(
+        picks.map(|member: List<Pick>|
+          member.map(|p: Pick|
+            match p { Found(c) -> c, Waiting(s) -> choice_of(chose.get(s.at), s.candidates) })),
+      ),
+      body.slice(from + 4 + n, body.len()),
+    ])
+  }
+}
+
+/// `hashes`, a hashing of a program made before its check, with each body completed as
+/// [`checked_body`] does from `sites`, every call on a value the check found. A definition named
+/// in `unread`, or a test keyed in `unread_tests`, is one the check found none of the calls of,
+/// so its body stays pending.
+pub fn checked_hashes(
+  hashes: HashOutput,
+  sites: List<MemberSite>,
+  unread: Map<Bytes, Bool>,
+  unread_tests: Map<Bytes, Bool>,
+) -> HashOutput / {abort.raise} = {
+  let chose = called_at(sites);
+  {
+    ..hashes,
+    bodies: hashes.bodies.map(|b: { name: Bytes, body: Bytes }|
+      if unread.contains(b.name) { b }
+      else { { name: b.name, body: checked_body(b.body, chose) } }),
+    test_bodies: hashes.test_bodies.fold(
+      Map::new(),
+      |acc: Map<Bytes, Bytes>, k: Bytes, b: Bytes|
+        acc.insert(k, if unread_tests.contains(k) { b } else { checked_body(b, chose) }),
+    ),
+  }
+}
+
+/// The choices of a body `e` opens, a list a member.
 fn picks_of(body: Bytes, e: Envelope) -> List<List<Choice>> / {abort.raise} = {
   let read = |at: Int| match body.u32_at(at) { Some(n) -> n, None -> panic("a malformed body") };
   iterate(
@@ -2241,7 +2361,8 @@ fn picks_of(body: Bytes, e: Envelope) -> List<List<Choice>> / {abort.raise} = {
 }
 
 /// `bodies` and `test_bodies`: each definition's and test's stored body, the bytes its hash is taken
-/// over. What is said of each test or law is under its key.
+/// over; a hashing made before the check leaves a body with a call on a value pending until
+/// [`checked_hashes`]. What is said of each test or law is under its key.
 pub type HashOutput = {
   defs: List<{ name: Bytes, hash: Bytes }>,
   own: List<{ name: Bytes, hash: Bytes }>,
@@ -2380,13 +2501,13 @@ fn digest_keyed(e: { key: Bytes, value: Bytes }) -> Bytes =
 pub fn of_key<a>(m: Map<Bytes, a>, key: Bytes) -> a / {abort.raise} =
   match m.get(key) { Some(x) -> x, None -> panic("a key the table does not hold") }
 
-/// A kind byte, its calls' choices, then the normalized bytes `blake3` keys the body by.
-fn solo_body(f: Finished) -> Bytes = Bytes::concat_all([b"\x00", framed_picks([f.chosen]), f.bytes])
+/// Its calls' choices, then the normalized bytes `blake3` keys the body by.
+fn solo_body(f: Finished) -> Bytes / {abort.raise} = stored_body(None, [f.chosen], f.bytes)
 
-/// The kind byte, the member's class, every member's choices, then the whole component's packed
-/// bytes, so any member rebuilds the cycle.
-fn member_body(refined: Refined, class: Int) -> Bytes =
-  Bytes::concat_all([b"\x01", u32_le(class), refined.picks, refined.packed])
+/// Every member's choices, then the whole component's packed bytes, so any member rebuilds the
+/// cycle.
+fn member_body(refined: Refined, class: Int) -> Bytes / {abort.raise} =
+  stored_body(Some(class), refined.picks, refined.packed)
 
 type Sccs = { component_of: List<Int>, orders: List<List<Int>> }
 
@@ -2498,7 +2619,7 @@ fn sketch_lt(a: Bytes, ia: Int, b: Bytes, ib: Int) -> Bool = bytes_lt(a, b) || (
 type Refined = {
   members: List<{ node: Int, hash: Bytes }>,
   packed: Bytes,
-  picks: Bytes,
+  picks: List<List<Pick>>,
   classes: Map<Int, Int>,
 }
 
@@ -2563,7 +2684,7 @@ fn hash_component(
         hash: member_hash(component_hash, match settled.classes.get(v) { Some(c) -> c, None -> 0 }),
       }),
     packed: packed,
-    picks: framed_picks(by_class.map(|m: Finished| m.chosen)),
+    picks: by_class.map(|m: Finished| m.chosen),
     classes: settled.classes,
   }
 }
@@ -2659,7 +2780,7 @@ fn first_of(shapes: Shapes, fixed: Map<Int, List<Int>>) -> List<Finished> / {abo
 
 /// The node at `v` of `index` normalized, and what another package reads of a function. `chose`
 /// is what [`Chosen`] says of its module's calls on values.
-fn node_form(index: Index, v: Int, chose: Map<Bytes, Called>) -> NodeForm / {abort.raise} = {
+fn node_form(index: Index, v: Int, chose: Option<Map<Bytes, Called>>) -> NodeForm / {abort.raise} = {
   let node = index.nodes.get(v);
   let pieces = chosen_template(index, node.module, chose, |encoder: Encoder|
     normalize_node(encoder, node.body));
@@ -2681,7 +2802,11 @@ fn node_form(index: Index, v: Int, chose: Map<Bytes, Called>) -> NodeForm / {abo
   }
 }
 
-fn test_form(index: Index, t: TestNode, chose: Map<Bytes, Called>) -> ItemForm / {abort.raise} =
+fn test_form(
+  index: Index,
+  t: TestNode,
+  chose: Option<Map<Bytes, Called>>,
+) -> ItemForm / {abort.raise} =
   {
     pieces: chosen_template(index, t.module, chose, |encoder: Encoder| test_def(encoder, t.def)),
     listed: listed_refs(index, t),
@@ -2720,7 +2845,7 @@ fn shapes_of(
       decl: is_decl(node),
       effect: is_effect(index, v),
       package: match packages.at(node.module) { Some(p) -> p, None -> 0 },
-      form: if formed { Some(node_form(index, v, Map::new())) } else { None },
+      form: if formed { Some(node_form(index, v, None)) } else { None },
     }
   };
   let plain = {
@@ -2730,7 +2855,7 @@ fn shapes_of(
     tests: index.tests.map(|t: TestNode|
       {
         key: t.key,
-        form: if held_tests.contains(t.key) { None } else { Some(test_form(index, t, Map::new())) },
+        form: if held_tests.contains(t.key) { None } else { Some(test_form(index, t, None)) },
       }),
     laws: index.laws.map(|l: LawNode|
       {
@@ -3475,13 +3600,13 @@ pub fn kept_forms(
 }
 
 /// Nodes, tests and laws of one module of an index: its nodes in the order the index lists them.
-/// `called` is what its check found of each call on a value, by the call's span: nothing a hash
-/// reads, and empty where no check is read.
+/// `called` is what its check found of each call on a value, by `site_key`: nothing a hash reads,
+/// and `None` where no check is read, which leaves each call pending.
 pub type Chosen = {
   own: List<Int>,
   tests: List<TestNode>,
   laws: List<LawNode>,
-  called: Map<Bytes, Called>,
+  called: Option<Map<Bytes, Called>>,
 }
 
 /// Every node, test and law of the module at `module` of `index`, found in one walk of it.
@@ -3494,7 +3619,7 @@ pub fn chosen_in(index: Index, module: Int) -> Chosen / {abort.raise} =
       }),
     tests: index.tests.filter(|t: TestNode| t.module == module),
     laws: index.laws.filter(|l: LawNode| l.module == module),
-    called: Map::new(),
+    called: None,
   }
 
 /// The forms hashing reads of `chosen`, nodes, tests and laws of one module, numbered among
@@ -7818,12 +7943,18 @@ test "printed bodies hash back to what they were stored under, under their own n
 }
 
 test "a body that calls on a value prints back importing each module whose function it may call" {
-  let out = hash_index(
+  let hashed = hash_index(
     indexed([
       { name: b"low", src: b"pub type A = | A\npub fn A::go(a: A) -> Int = 1" },
       { name: b"app", src: b"import low\npub fn gone(xs: List<Int>) -> Int = xs.go()" },
     ]),
   );
+  // What a check finds of `xs.go()`: none of the functions it may be.
+  let out = {
+    ..hashed,
+    bodies: hashed.bodies.map(|b: { name: Bytes, body: Bytes }|
+      { ..b, body: checked_body(b.body, Map::new()) }),
+  };
   let ms = printed_of(out, []);
   assert(ms.get(0).text.contains(b"import low\n"));
   let again = hash_index(
@@ -7841,10 +7972,15 @@ test "a call on a value prints as a call of what its check found it calls, set a
   let fixed = hashed_forms(
     chosen_forms(index, [0], {
       ..chosen_in(index, 0),
-      called: Map::of_entries([
-        { key: span_key(body_of(b"m.total")), value: { callee: b"m.Cart::size", named: [] } },
-        { key: span_key(body_of(b"m.more")), value: { callee: b"m.Cart::scaled", named: [2] } },
-      ]),
+      called: Some(
+        Map::of_entries([
+          { key: site_key(0, body_of(b"m.total")), value: { callee: b"m.Cart::size", named: [] } },
+          {
+            key: site_key(0, body_of(b"m.more")),
+            value: { callee: b"m.Cart::scaled", named: [2] },
+          },
+        ]),
+      ),
     }),
     [],
   ).nodes;
@@ -8537,22 +8673,18 @@ test "the published hashes digest to a pinned value" {
 
 test "a stored body is keyed by its own bytes, and bytes no envelope holds by nothing" {
   let picked = [{ callee: 3, named: [] }, { callee: 0 - 1, named: [2, 1] }];
-  let solo = solo_body({ bytes: b"abc", refs: [], chosen: picked });
+  let found = picked.map(|c: Choice| Found(c));
+  let solo = solo_body({ bytes: b"abc", refs: [], chosen: found });
   assert_eq(body_key(solo), Some(blake3(b"abc")));
   match envelope(solo) { Some(e) -> assert_eq(picks_of(solo, e), [picked]), None -> assert(false) };
   let member = member_body(
-    { members: [], packed: b"xyz", picks: framed_picks([[], picked]), classes: Map::new() },
+    { members: [], packed: b"xyz", picks: [[], found], classes: Map::new() },
     2,
   );
   assert_eq(body_key(member), Some(member_hash(blake3(b"xyz"), 2)));
   assert_eq(body_component(solo), Some({ id: blake3(b"abc"), members: [blake3(b"abc")] }));
   let pair = member_body(
-    {
-      members: [],
-      packed: u32_le(2).concat(b"pair"),
-      picks: framed_picks([]),
-      classes: Map::new(),
-    },
+    { members: [], packed: u32_le(2).concat(b"pair"), picks: [], classes: Map::new() },
     0,
   );
   assert_eq(
@@ -8571,7 +8703,28 @@ test "a stored body is keyed by its own bytes, and bytes no envelope holds by no
   };
   assert_eq(body_key(b""), None);
   assert_eq(body_key(b"\x07rest"), None);
-  assert_eq(body_key(b"\x01\x00"), None)
+  assert_eq(body_key(b"\x01\x00"), None);
+  // A call its check is yet to say of keys its body under nothing, until the check completes it.
+  let site = { at: site_key(0, dummy_span()), candidates: [b"m.A::f", b"m.B::f"] };
+  let open = [Found(picked.get(0)), Waiting(site)];
+  let found_open = [Found(picked.get(0)), Found({ callee: 1, named: [2, 1] })];
+  let said = Map::new().insert(site.at, { callee: b"m.B::f", named: [2, 1] });
+  let pending = solo_body({ bytes: b"abc", refs: [], chosen: open });
+  let pending_member = member_body(
+    { members: [], packed: b"xyz", picks: [[], open], classes: Map::new() },
+    2,
+  );
+  assert_eq(body_key(pending), None);
+  assert_eq(body_key(pending_member), None);
+  assert_eq(
+    checked_body(pending, said),
+    solo_body({ bytes: b"abc", refs: [], chosen: found_open }),
+  );
+  assert_eq(
+    checked_body(pending_member, said),
+    member_body({ members: [], packed: b"xyz", picks: [[], found_open], classes: Map::new() }, 2),
+  );
+  assert_eq(checked_body(solo, said), solo)
 }
 
 test "a call that leaves an argument to a default naming what its module keeps hashes as one that writes it" {
