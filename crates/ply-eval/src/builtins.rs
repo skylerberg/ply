@@ -129,6 +129,7 @@ builtins! { $
     BytesBlake3 = "Bytes::blake3", 1, ends;
     BytesGzip = "Bytes::gzip", 1, ends;
     BytesGunzip = "Bytes::gunzip", 1, ends;
+    BytesZstd = "Bytes::zstd", 1, ends;
     BytesOfString = "Bytes::of_string", 1, ends;
     BytesIsUtf8 = "Bytes::is_utf8", 1, ends;
     BytesIndexOf = "Bytes::index_of", 2, ends;
@@ -849,6 +850,18 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             let mut out = Vec::new();
             let read = flate2::read::GzDecoder::new(&b[..]).read_to_end(&mut out);
             Ok(option(read.ok().map(|_| Value::bytes(out))))
+        }
+
+        // One pass, so the frame says how long it is and a reader's window is no larger.
+        Builtin::BytesZstd => {
+            let b = args[0].as_bytes(span, "`Bytes::zstd`")?;
+            let sealed = zstd::bulk::Compressor::new(3).and_then(|mut z| {
+                z.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
+                z.compress(b)
+            });
+            Ok(Value::bytes(
+                sealed.expect("compressing in memory cannot fail"),
+            ))
         }
 
         Builtin::BytesConcatAll => {

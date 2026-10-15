@@ -19,8 +19,8 @@ const MODULE: &str = ".ply";
 pub const COMPILER: &str = "crates/ply-compiler/ply";
 pub const PRELUDE: &str = "crates/ply-compiler/prelude.ply";
 
-/// The memo store of what every shipped module answers, as `ply std --answers` writes it, each file
-/// gzipped.
+/// What every shipped module answers, as `ply std --answers` writes it: a file of zstd frames and
+/// its index, itself one frame.
 pub const ANSWERS: &str = "answers";
 
 const MAGIC: &[u8; 8] = b"PLYPACK1";
@@ -96,15 +96,17 @@ impl Pack {
             .map(|entry| &self.mapped[entry.at..entry.at + entry.len])
     }
 
-    /// The file of the answers the pack carries at `path` within them, inflated.
-    pub fn answer(&self, path: &str) -> Option<Vec<u8>> {
-        use std::io::Read;
-        let deflated = self.bytes(&format!("{ANSWERS}/{path}"))?;
-        let mut out = Vec::new();
-        flate2::read::GzDecoder::new(deflated)
-            .read_to_end(&mut out)
-            .ok()?;
-        Some(out)
+    /// What the zstd frame `len` bytes long at `offset` of the answers' file `path` holds; a `len`
+    /// of 0 reads to the file's end. `None` where there is no such file, the range runs past it, or
+    /// its bytes are not whole frames.
+    pub fn answer(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>> {
+        let file = self.bytes(&format!("{ANSWERS}/{path}"))?;
+        let end = if len == 0 {
+            file.len()
+        } else {
+            offset.checked_add(len)?
+        };
+        zstd::stream::decode_all(file.get(offset..end)?).ok()
     }
 
     /// A text the pack carries. The sources are UTF-8, as the front end reads them.

@@ -6,10 +6,11 @@ use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 12] = [
+const OPERATIONS: [(&str, &str); 13] = [
     ("names", "ply_machine::shipped::names"),
     ("module", "ply_machine::shipped::module"),
     ("answer", "ply_machine::shipped::answer"),
+    ("digests", "ply_machine::shipped::digests"),
     ("reached", "ply_machine::shipped::reached"),
     ("version", "ply_machine::shipped::version"),
     ("stamps", "ply_machine::shipped::stamps"),
@@ -120,10 +121,17 @@ impl HostHandler for Shipped {
                         .map(PlyValue::bytes),
                 )
             }
-            ("answer", [path]) => {
+            ("answer", [path, offset, len]) => {
                 let path = path.as_str(span, "a path into what the shipped modules answer")?;
-                crate::payload::option(ply_pack::installed().answer(path).map(PlyValue::bytes))
+                let offset = offset.as_int(span, "where a frame of the answers starts")?;
+                let len = len.as_int(span, "how long a frame of the answers is")?;
+                let frame = match (usize::try_from(offset), usize::try_from(len)) {
+                    (Ok(offset), Ok(len)) => ply_pack::installed().answer(path, offset, len),
+                    _ => None,
+                };
+                crate::payload::option(frame.map(PlyValue::bytes))
             }
+            ("digests", []) => PlyValue::bytes(crate::shipped_modules::digests().as_bytes()),
             ("version", []) => PlyValue::str(env!("CARGO_PKG_VERSION")),
             ("stamps", []) => PlyValue::str(STAMPS.get().map_or("", String::as_str)),
             ("definitions", []) => {

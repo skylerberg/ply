@@ -110,6 +110,8 @@ const STAMPS: &str = "stamps";
 
 const DEFINITIONS: &str = "definitions";
 
+const DIGESTS: &str = "digests";
+
 const RUNTIME_SOURCES: &str = env!("PLY_RUNTIME_SOURCES");
 
 /// The runtime's side of what kept answers are a function of beyond their own keys, as `name hex`
@@ -145,8 +147,9 @@ pub fn shipped_dir_name(stamps: &str, definitions: &str, files: &ply_pack::Diges
 }
 
 /// The shipped modules as files, `<dotted name>.ply` each, the data files they embed below them by
-/// name, and the stamps and definitions beside them. Each file lands by a rename and the marker
-/// last, so a run that finds the marker finds it whole, and reads no file of the pack for it.
+/// name, and the stamps, the definitions and every shipped file's digest beside them. Each file
+/// lands by a rename and the marker last, so a run that finds the marker finds it whole, and reads
+/// no file of the pack for it.
 pub fn shipped_modules(stage: &str, definitions: &str) -> Result<PathBuf, Diagnostic> {
     let stamps = stamps();
     let dir = ply_codegen::c::stage::stage_dir(stage).join(shipped_dir_name(
@@ -191,6 +194,7 @@ fn lay_out(dir: &Path, stamps: &str, definitions: &str) -> std::io::Result<()> {
     }
     write_atomically(&dir.join(STAMPS), stamps.as_bytes())?;
     write_atomically(&dir.join(DEFINITIONS), definitions.as_bytes())?;
+    write_atomically(&dir.join(DIGESTS), shipped_modules::digests().as_bytes())?;
     write_atomically(&dir.join(SHIPPED_MARKER), b"ok")
 }
 

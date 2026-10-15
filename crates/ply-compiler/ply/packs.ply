@@ -1,0 +1,314 @@
+//! What a toolchain packs of what its shipped modules answer, below each run's own memo store: the
+//! records a store kept of them and the longer answers those name, each a Zstandard frame of one
+//! file, found by key through two tables of rows, and an index naming where the tables lie, the
+//! stamp the answers were made under, what the pack is, and the shipped files they were made over,
+//! as the launcher's `digests` lists them.
+//!
+//! A run under that stamp over those very files takes a packed record as it stands. A run over other
+//! files holds each to its reads, as it does a record its stamp does not vouch for. A store above a
+//! pack answers under a stamp naming the pack and the files read, so a record of it that asked a
+//! packed answer is asked again when either moves.
+
+import std.bin
+import std.bytes (u32_le, u64_le)
+import std.hash (blake3)
+import segments
+
+/// The file of frames and tables a pack holds below `answers/`.
+pub fn store_file() -> String = "store"
+
+/// The pack's index below `answers/`, itself one frame.
+pub fn index_file() -> String = "index"
+
+/// Where a frame lies in a pack's file: its first byte and how many bytes it takes.
+pub type Range = { offset: Int, len: Int }
+
+derive bin for Range
+
+/// What a pack says of itself: the stamp its answers were made under; what names the pack, a digest
+/// of each record's key beside its answer's; the shipped files they were made over; and where its
+/// table of records and its table of longer answers lie.
+pub type Index = { stamp: Bytes, id: Bytes, files: Bytes, records: Range, answers: Range }
+
+derive bin for Index
+
+fn index_magic() -> Bytes = b"PLYPACK\x02"
+
+/// `i` as a pack keeps it.
+pub fn index_bytes(i: Index) -> Bytes / {abort.raise} =
+  index_magic().concat(bin::encode(i, index_bin()))
+
+/// The index `b` holds: none for bytes that are not one whole.
+pub fn index_from(b: Bytes) -> Option<Index> / {abort.raise} =
+  if b.len() < 8 || b.slice(0, 8) != index_magic() { None }
+  else { match bin::decode(b.slice(8, b.len()), index_bin()) { Ok(i) -> Some(i), Err(_) -> None } }
+
+/// A table's row: a 32-byte key, then where its frame lies and how long it is.
+fn row_width() -> Int = 44
+
+fn row_of(key: Bytes, at: Range) -> Bytes =
+  Bytes::concat_all([key, u64_le(at.offset), u32_le(at.len)])
+
+/// Where the frame `table` places under `key` lies: none where it places none.
+pub fn placed(table: Bytes, key: Bytes) -> Option<Range> / {abort.raise} =
+  match segments::row_of(table, row_width(), key) {
+    Some(row) -> Some({ offset: segments::long_at(row, 32), len: segments::word_at(row, 40) }),
+    None -> None,
+  }
+
+/// The key a longer answer is found under: its digest without the byte every digest of an answer
+/// leads with.
+pub fn answer_key(digest: Bytes) -> Option<Bytes> =
+  if digest.len() == 33 { Some(digest.slice(1, 33)) } else { None }
+
+// --- Trust ------------------------------------------------------------------------------------
+
+/// Whether a run under `stamp` over the shipped files `world` lists takes the records of the pack
+/// `i` indexes as they stand: they were made under that stamp, over those very files. A run
+/// that lists none takes none so.
+pub fn stands(i: Index, stamp: Bytes, world: Bytes) -> Bool =
+  world.len() > 0 && i.stamp == stamp && i.files == world
+
+/// What a store above the pack `i` indexes answers under, for a run under `stamp` over the shipped
+/// files `world` lists: `stamp` where there is no pack, and else a stamp naming the pack and those
+/// files too.
+pub fn above(i: Option<Index>, stamp: Bytes, world: Bytes) -> Bytes =
+  match i {
+    None -> stamp,
+    Some(x) ->
+      blake3(
+        Bytes::concat_all([b"ply.pack.above\x00", blake3(stamp), blake3(x.id), blake3(world)]),
+      ),
+  }
+
+// --- Writing a pack ---------------------------------------------------------------------------
+
+/// A pack being written: its frames so far, in order, and how many bytes they take.
+pub type Writing = { frames: List<Bytes>, end: Int }
+
+pub fn writing() -> Writing = { frames: [], end: 0 }
+
+/// `w` with `bytes`, compressed by `compress`, framed after what it holds, and where that frame lies.
+pub fn framing(
+  w: Writing,
+  bytes: Bytes,
+  compress: (Bytes) -> Bytes,
+) -> { writing: Writing, at: Range } = {
+  let frame = compress(bytes);
+  {
+    writing: { frames: w.frames.push(frame), end: w.end + frame.len() },
+    at: { offset: w.end, len: frame.len() },
+  }
+}
+
+/// A pack as it is written: its file of frames and tables, and its index.
+pub type Written = { store: Bytes, index: Bytes }
+
+/// The pack `w` holds the frames of, finished: its file, its frames and then its tables, which
+/// place `records` and `answers` by key; and its index, compressed by `compress`, made under
+/// `stamp` over the shipped files `files` lists, and named by `answered`, each record's key and
+/// the digest of its answer.
+pub fn finished(
+  w: Writing,
+  records: Map<Bytes, Range>,
+  answers: Map<Bytes, Range>,
+  answered: Map<Bytes, Bytes>,
+  compress: (Bytes) -> Bytes,
+  stamp: Bytes,
+  files: Bytes,
+) -> Written / {abort.raise} = {
+  let rows = |m: Map<Bytes, Range>|
+    Bytes::concat_all(m.fold([], |acc: List<Bytes>, k: Bytes, at: Range| acc.push(row_of(k, at))));
+  let r = framing(w, rows(records), compress);
+  let a = framing(r.writing, rows(answers), compress);
+  let id = blake3(
+    Bytes::concat_all(
+      answered.fold([b"ply.pack\x00"], |acc: List<Bytes>, k: Bytes, d: Bytes|
+        acc.push(blake3(k)).push(blake3(d))),
+    ),
+  );
+  {
+    store: Bytes::concat_all(a.writing.frames),
+    index: compress(
+      index_bytes({ stamp: stamp, id: id, files: files, records: r.at, answers: a.at }),
+    ),
+  }
+}
+
+// --- Reading a pack ---------------------------------------------------------------------------
+
+/// What a run holds of a pack: its index, none where the toolchain packed none, and its tables once
+/// read.
+pub type Reading = { index: Option<Index>, records: Option<Bytes>, answers: Option<Bytes> }
+
+/// No pack.
+pub fn none() -> Reading = { index: None, records: None, answers: None }
+
+/// The pack `read` reads, which answers what a frame of a pack's file holds: its index, its tables
+/// read when first asked.
+pub fn opened<| e>(
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+) -> Reading / {abort.raise | e} =
+  {
+    index: match read(index_file(), 0, 0) { Some(b) -> index_from(b), None -> None },
+    records: None,
+    answers: None,
+  }
+
+/// What the frame the table `at` of `p` places under `key` holds, and `p` with that table read.
+fn found<| e>(
+  p: Reading,
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  key: Bytes,
+  records: Bool,
+) -> { reading: Reading, bytes: Option<Bytes> } / {abort.raise | e} =
+  match p.index {
+    None -> { reading: p, bytes: None },
+    Some(i) -> {
+      let held = if records { p.records } else { p.answers };
+      let table = match held {
+        Some(t) -> t,
+        None -> {
+          let at = if records { i.records } else { i.answers };
+          // A frame of no length is an empty table, never a read to the end of the file.
+          if at.len == 0 { b"" }
+          else { match read(store_file(), at.offset, at.len) { Some(t) -> t, None -> b"" } }
+        },
+      };
+      let reading = if records { { ..p, records: Some(table) } }
+      else { { ..p, answers: Some(table) } };
+      {
+        reading: reading,
+        bytes: match placed(table, key) {
+          Some(at) -> read(store_file(), at.offset, at.len),
+          None -> None,
+        },
+      }
+    },
+  }
+
+/// The bytes of the record `p` holds under `key`, and `p` with what it read to find them.
+pub fn record<| e>(
+  p: Reading,
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  key: Bytes,
+) -> { reading: Reading, bytes: Option<Bytes> } / {abort.raise | e} = found(p, read, key, true)
+
+/// The longer answer `p` holds under `digest`, and `p` with what it read to find it.
+pub fn answer<| e>(
+  p: Reading,
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  digest: Bytes,
+) -> { reading: Reading, bytes: Option<Bytes> } / {abort.raise | e} =
+  match answer_key(digest) {
+    Some(name) -> found(p, read, name, false),
+    None -> { reading: p, bytes: None },
+  }
+
+/// What the frame of `len` bytes at `offset` of the file `path` of `p` holds, as a binary reads one
+/// of the pack it carries: the pack a test writes with nothing compressed, each frame as it is.
+pub fn frame_in(
+  p: Option<Written>,
+  path: String,
+  offset: Int,
+  len: Int,
+) -> Option<Bytes> / {abort.raise} =
+  match p {
+    None -> None,
+    Some(w) -> if path == index_file() { Some(w.index) }
+    else if path != store_file() || offset < 0 || len < 0 || offset + len > w.store.len() { None }
+    else { Some(w.store.slice(offset, if len == 0 { w.store.len() } else { offset + len })) },
+  }
+
+// --- Tests ------------------------------------------------------------------------------------
+
+/// What reads no pack: a run over it has nothing below its store.
+pub fn no_pack(_: String, _: Int, _: Int) -> Option<Bytes> = None
+
+/// What a test writes a pack with: every frame as it is.
+pub fn as_is(b: Bytes) -> Bytes = b
+
+fn written_with(
+  records: List<{ key: Bytes, bytes: Bytes }>,
+  answers: List<{ key: Bytes, bytes: Bytes }>,
+  files: Bytes,
+) -> Written / {abort.raise} = {
+  let placing = |w: Writing, m: Map<Bytes, Range>, items: List<{ key: Bytes, bytes: Bytes }>|
+    items.fold(
+      { writing: w, placed: m },
+      |acc: { writing: Writing, placed: Map<Bytes, Range> }, it: { key: Bytes, bytes: Bytes }| {
+        let f = framing(acc.writing, it.bytes, as_is);
+        { writing: f.writing, placed: acc.placed.insert(it.key, f.at) }
+      },
+    );
+  let r = placing(writing(), Map::new(), records);
+  let a = placing(r.writing, Map::new(), answers);
+  finished(
+    a.writing,
+    r.placed,
+    a.placed,
+    records.fold(Map::new(), |acc: Map<Bytes, Bytes>, it: { key: Bytes, bytes: Bytes }|
+      acc.insert(it.key, blake3(it.bytes))),
+    as_is,
+    b"stamp",
+    files,
+  )
+}
+
+test "a pack's index reads back as it was written, and bytes that are not one whole read as none" {
+  let i = {
+    stamp: b"s",
+    id: b"id",
+    files: b"a.ply 00\n",
+    records: { offset: 7, len: 44 },
+    answers: { offset: 51, len: 0 },
+  };
+  assert_eq(index_from(index_bytes(i)), Some(i));
+  let b = index_bytes(i);
+  assert_eq(index_from(b.slice(0, b.len() - 1)), None);
+  assert_eq(index_from(b.concat(b"x")), None);
+  assert_eq(index_from(b"PLYPACK\x01"), None)
+}
+
+test "each record and longer answer of a pack is found by its key, and no other" {
+  let a = b"a".blake3();
+  let b = b"b".blake3();
+  let long = b"=".concat(b"long".blake3());
+  let written = written_with(
+    [{ key: b, bytes: b"record b" }, { key: a, bytes: b"record a" }],
+    [{ key: long.slice(1, 33), bytes: b"a longer answer" }],
+    b"files",
+  );
+  let read = |path: String, offset: Int, len: Int| frame_in(Some(written), path, offset, len);
+  let p = opened(read);
+  let first = record(p, read, a);
+  assert_eq(first.bytes, Some(b"record a"));
+  assert_eq(record(first.reading, read, b).bytes, Some(b"record b"));
+  assert_eq(record(first.reading, read, b"c".blake3()).bytes, None);
+  assert_eq(answer(first.reading, read, long).bytes, Some(b"a longer answer"));
+  assert_eq(answer(first.reading, read, b"=".concat(b"short".blake3())).bytes, None);
+  assert_eq(record(none(), read, a).bytes, None)
+}
+
+test "a pack's records stand for a run of its stamp over the very files it was made over" {
+  let written = written_with([{ key: b"a".blake3(), bytes: b"r" }], [], b"files one");
+  let i = match opened(|path: String, offset: Int, len: Int|
+      frame_in(Some(written), path, offset, len)).index {
+    Some(x) -> x,
+    None -> panic("the index reads"),
+  };
+  assert(stands(i, b"stamp", b"files one"));
+  assert(!stands(i, b"another stamp", b"files one"));
+  assert(!stands(i, b"stamp", b"files two"));
+  // Above the pack, a store answers under a stamp that moves with the files and the pack.
+  let other = written_with([{ key: b"a".blake3(), bytes: b"r2" }], [], b"files one");
+  let j = match opened(|path: String, offset: Int, len: Int|
+      frame_in(Some(other), path, offset, len)).index {
+    Some(x) -> x,
+    None -> panic("the index reads"),
+  };
+  assert_eq(above(None, b"stamp", b"files one"), b"stamp");
+  assert(above(Some(i), b"stamp", b"files one") != above(Some(i), b"stamp", b"files two"));
+  assert(above(Some(i), b"stamp", b"files one") != above(Some(j), b"stamp", b"files one"));
+  assert_eq(above(Some(i), b"stamp", b"files one"), above(Some(i), b"stamp", b"files one"))
+}

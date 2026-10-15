@@ -23,6 +23,7 @@ import compiler.interface (sized)
 import compiler.load (LoadedAnalysis, every_root)
 import compiler.native
 import compiler.native (Packed)
+import compiler.packs
 import compiler.parsing (no_module, dummy_span)
 import compiler.resolve (Diag, error_at)
 import compiler.unit (Runtime, shipped, emitted, emitter_identity, held, identity_of, read_kept,
@@ -81,7 +82,7 @@ fn prelude_path() -> String = "crates/ply-compiler/prelude.ply"
 
 /// One file a shipped root holds, by the name it is read under there, and the path a pack keeps it
 /// under.
-type Shipping = { name: String, path: String, bytes: Bytes }
+pub type Shipping = { name: String, path: String, bytes: Bytes }
 
 /// Every file below `dir` but those in a hidden directory, a cache, by its path below it.
 fn files_below(
@@ -140,27 +141,26 @@ fn module_names(files: List<Shipping>) -> List<String> / {abort.raise} =
   files.fold([], |acc: List<String>, f: Shipping|
     if f.name.ends_with(".ply") { acc.push(f.name.slice(0, f.name.len() - 4)) } else { acc })
 
-/// Whether `files` are the very shipped modules this `ply` carries: each file as it carries it, and
-/// no module of its own left out.
-fn carried(
-  files: List<Shipping>,
-) -> Bool / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
-  shipped_names().len() == module_names(files).len()
-    && files.fold(true, |same: Bool, f: Shipping|
-      same && fs.read_file[shipped](f.name) == Some(f.bytes))
+/// What `files` are as a binary lists the shipped files it carries (`digests`): each by its name, a
+/// space and the BLAKE3 digest of its bytes in hex, a line each, ascending.
+pub fn digests_of(files: List<Shipping>) -> Bytes / {abort.raise} = {
+  let lines = files.fold(Map::new(), |acc: Map<String, Bool>, f: Shipping|
+    acc.insert(f.name ++ " " ++ blake3(f.bytes).hex_of() ++ "\n", true));
+  Bytes::concat_all(lines.keys().map(Bytes::of_string))
+}
 
 /// `body` with the shipped modules as `files` hold them in place of this `ply`'s own: what a load of
-/// the checkout's compiler compiles it against. Packed answers still answer where they agree with
-/// what they read, and are taken as standing for these files only where they are the very ones this
-/// `ply` carries.
+/// the checkout's compiler compiles it against. The files this `ply` lists of its own are `files`,
+/// so its packed answers stand as they are only where `files` are the very ones they were answered
+/// over, and are held to what they read otherwise.
 fn over_shipping<a | e>(
   files: List<Shipping>,
-  body: () -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module, shipped.answer | e},
-) -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise | e} = {
+  body: () -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module | e},
+) -> a / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise | e} = {
   let by_name = files.fold(Map::new(), |acc: Map<String, Bytes>, f: Shipping|
     acc.insert(f.name, f.bytes));
   let names = module_names(files);
-  let stands = carried(files);
+  let digests = digests_of(files);
   handle {
     body()
   } with {
@@ -173,14 +173,16 @@ fn over_shipping<a | e>(
     } else { fs.list_dir[shipped](dir) },
     fs.read_file[shipped](name) -> match by_name.get(name) {
       Some(bytes) -> Some(bytes),
-      None -> fs.read_file[shipped](name),
+      // A module or data file the checkout lacks is not this `ply`'s own.
+      None -> if name == "digests" { Some(digests) }
+      else if name.ends_with(".ply") || name.starts_with("std/") { None }
+      else { fs.read_file[shipped](name) },
     },
     shipped.names() -> names,
     shipped.module(name) -> match by_name.get(name ++ ".ply") {
       Some(bytes) -> Some(bytes),
       None -> by_name.get(name),
     },
-    shipped.answer(path) -> if path == "standing" && !stands { None } else { shipped.answer(path) },
   }
 }
 
@@ -308,28 +310,42 @@ fn linking_key(t: Toolchain, library: Bytes, libraries: List<String>) -> Bytes =
     ]),
   )
 
-/// How many bytes of the runtime's library one read takes: under what a read may answer at once.
-fn library_range() -> Int = 16777216
+/// How many bytes of a file one read takes: under what a read may answer at once.
+fn read_range() -> Int = 16777216
+
+/// Each `step` bytes of the file at `path` in turn, as `each` makes of them: none where it does not
+/// read.
+fn ranges_of<a>(
+  path: String,
+  step: Int,
+  each: (Bytes) -> a,
+) -> Option<List<a>> / {fs.read[abs], abort.raise} =
+  match fs.file_size[abs](path) {
+    None -> None,
+    Some(size) ->
+      range(0, (size + step - 1) / step).fold(Some([]), |held: Option<List<a>>, i: Int|
+        match held {
+          None -> None,
+          Some(made) -> match fs.read_at[abs](path, i * step, step) {
+            Some(bytes) -> Some(made.push(each(bytes))),
+            None -> None,
+          },
+        }),
+  }
 
 /// What the file at `path` holds, as the digest of the digests of each `step` bytes of it in turn,
 /// so a file larger than one read answers is still named by its bytes: none where it does not read.
 fn ranged_digest(path: String, step: Int) -> Option<Bytes> / {fs.read[abs], abort.raise} =
-  match fs.file_size[abs](path) {
+  match ranges_of(path, step, blake3) {
+    Some(digests) -> Some(blake3(Bytes::concat_all(digests))),
     None -> None,
-    Some(size) -> match range(0, (size + step - 1) / step).fold(
-        Some([]),
-        |held: Option<List<Bytes>>, i: Int|
-          match held {
-            None -> None,
-            Some(digests) -> match fs.read_at[abs](path, i * step, step) {
-              Some(bytes) -> Some(digests.push(blake3(bytes))),
-              None -> None,
-            },
-          },
-      ) {
-      Some(digests) -> Some(blake3(Bytes::concat_all(digests))),
-      None -> None,
-    },
+  }
+
+/// What the file at `path` holds, read `step` bytes at a time: none where it does not read.
+fn ranged_read(path: String, step: Int) -> Option<Bytes> / {fs.read[abs], abort.raise} =
+  match ranges_of(path, step, |b: Bytes| b) {
+    Some(parts) -> Some(Bytes::concat_all(parts)),
+    None -> None,
   }
 
 /// The definition a builder is a function of besides what it is made from: the one that builds it,
@@ -523,32 +539,32 @@ fn ply_built(
   }
 }
 
-/// What `ply` answers of the shipped modules, as its pack carries it: each record and output of the
-/// store its `std --answers` wrote below `work`, gzipped, and the claim that they stand.
+/// What `ply` answers of the shipped modules, as its pack carries it: the pack its `std --answers`
+/// wrote below `work`, a file of frames and its index, as it wrote them; beside what it said of its
+/// steps.
 fn answers(
   ply: String,
   work: String,
-) -> Result<List<Packed>, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], abort.raise} = {
-  let store = toolchain.cache() ++ "/" ++ work ++ "/answers";
-  let ran = toolchain.ran(relative(ply), ["std", "--answers", store]);
+) -> Result<{ files: List<Packed>, said: Bytes }, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], abort.raise} = {
+  let dir = toolchain.cache() ++ "/" ++ work ++ "/answers";
+  let ran = toolchain.ran(relative(ply), ["std", "--answers", dir]);
+  let at = |name: String| below_root(dir ++ "/pack/" ++ name);
   if ran.code != 0 {
     failed("the new `ply` did not answer the shipped modules:\n" ++ String::of_bytes_lossy(ran.err))
   } else {
-    let gathered = ["records", "outputs"].fold([], |acc: List<Packed>, sub: String|
-      match fs.list_dir[abs](below_root(store ++ "/" ++ sub)) {
-        None -> acc,
-        Some(names) ->
-          names.fold(acc, |a: List<Packed>, n: String|
-            if n.starts_with(".") || n.ends_with(".tmp") { a } else {
-              match fs.read_file[abs](below_root(store ++ "/" ++ sub ++ "/" ++ n)) {
-                Some(bytes) -> a.push({ path: "answers/" ++ sub ++ "/" ++ n, bytes: bytes.gzip() }),
-                None -> a,
-              }
-            }),
-      });
-    match fs.read_file[abs](below_root(store ++ "/standing")) {
-      None -> failed("the new `ply` wrote no claim that its answers stand"),
-      Some(claim) -> Ok(gathered.push({ path: "answers/standing", bytes: claim.gzip() })),
+    match ((
+        ranged_read(at(packs::store_file()), read_range()),
+        fs.read_file[abs](at(packs::index_file())),
+      )) {
+      (Some(store), Some(index)) ->
+        Ok({
+          files: [
+            { path: "answers/" ++ packs::store_file(), bytes: store },
+            { path: "answers/" ++ packs::index_file(), bytes: index },
+          ],
+          said: ran.err,
+        }),
+      _ -> failed("the new `ply` wrote no pack of what the shipped modules answer"),
     }
   }
 }
@@ -564,7 +580,7 @@ fn answered(
   front: Bytes,
   keys: Keys,
   work: String,
-) -> Result<{ answered: List<Packed>, taken: Bool }, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], shipped.definitions, abort.raise} = {
+) -> Result<{ answered: List<Packed>, taken: Bool, said: Bytes }, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], shipped.definitions, abort.raise} = {
   let answering = exe ++ "-answering";
   if !fs.copy[abs](below_root(exe), below_root(answering)) {
     failed("the new `ply` could not be copied to answer with")
@@ -589,13 +605,14 @@ fn answered(
           else { match toolchain.held(at) { Some(bytes) -> unkept(bytes), None -> None } },
         };
         match had {
-          Some(a) -> Ok({ answered: a, taken: true }),
+          Some(a) -> Ok({ answered: a, taken: true, said: b"" }),
           None -> match answers(answering, work) {
             Err(diags) -> Err(diags),
             Ok(a) -> match kept {
-              None -> Ok({ answered: a, taken: false }),
-              Some(at) -> if toolchain.written(at, kept_of(a)) { Ok({ answered: a, taken: false }) }
-              else {
+              None -> Ok({ answered: a.files, taken: false, said: a.said }),
+              Some(at) -> if toolchain.written(at, kept_of(a.files)) {
+                Ok({ answered: a.files, taken: false, said: a.said })
+              } else {
                 failed("what the new `ply` answered could not be kept in the toolchain's cache")
               },
             },
@@ -612,9 +629,9 @@ type Took = { step: String, ms: Int }
 fn took(steps: List<Took>, step: String, since: Int) -> List<Took> / {time.elapsed_ms} =
   steps.push({ step: step, ms: time.elapsed_ms() - since })
 
-/// What a bootstrap that built `ply` made: how many records its answers are, what each step took,
-/// and what the builder said of its own.
-type Built = { answered: Int, steps: List<Took>, said: Bytes }
+/// What a bootstrap that built `ply` made: what each step took, and what the builder and the
+/// answering said of their own.
+type Built = { steps: List<Took>, said: Bytes }
 
 fn wrote(options: Options, built: Built, phases: Bool) -> Answer =
   {
@@ -624,10 +641,7 @@ fn wrote(options: Options, built: Built, phases: Bool) -> Answer =
       { key: "wrote", value: Str(options.out) },
     ]),
     lines: [
-      "built `ply` from " ++ options.root ++ " under " ++ options.profile
-        ++ ", its shipped modules answered in "
-        ++ built.answered.to_string()
-        ++ " records",
+      "built `ply` from " ++ options.root ++ " under " ++ options.profile,
       "wrote " ++ options.out,
     ].concat(if !phases { [] } else {
       built.steps.map(|t: Took| "phases: " ++ t.step ++ " " ++ t.ms.to_string() ++ "ms").concat(
@@ -668,7 +682,7 @@ fn bootstrapped(
   let started = time.elapsed_ms();
   match described(t, options.library, work) {
     Err(diags) -> Err(diags),
-    Ok(runtime) -> match ranged_digest(below_root(options.library), library_range()) {
+    Ok(runtime) -> match ranged_digest(below_root(options.library), read_range()) {
       None -> failed("the runtime's library at `" ++ options.library ++ "` could not be read"),
       Some(library) -> {
         let keys = {
@@ -753,9 +767,8 @@ fn finished(
         Err(diags) -> Err(diags),
         Ok(_) ->
           Ok({
-            answered: a.answered.len(),
             steps: took(steps, "packed and wrote `ply`", at),
-            said: made.said,
+            said: Bytes::concat_all([made.said, b"\n", a.said]),
           }),
       }
     },
@@ -871,8 +884,8 @@ test "what a ply answered is kept under how it answers, and under nothing of its
 
 test "what was kept of a ply's answers reads back, and bytes that are not the whole of it read as none" {
   let answered = [
-    { path: "answers/records/0a", bytes: b"one" },
-    { path: "answers/standing", bytes: b"" },
+    { path: "answers/store", bytes: b"frames" },
+    { path: "answers/index", bytes: b"" },
   ];
   let kept = kept_of(answered);
   assert_eq(unkept(kept), Some(answered));
@@ -881,14 +894,24 @@ test "what was kept of a ply's answers reads back, and bytes that are not the wh
   assert_eq(unkept(b"short"), None)
 }
 
-test "files are the ones this ply carries where each reads as it carries it and none is left out" {
+test "over a checkout's files, a ply lists theirs as it lists its own, and none of its own beside" {
   let files = two_shipped();
-  let module = files.get(0).bytes;
-  let own = |held: List<{ path: String, body: Bytes }>|
-    fs::on_mem[shipped](fs::mem_of(held), || carried(files)).value;
-  let data = { path: "std/a/data.txt", body: b"data" };
-  assert(own([{ path: "std.a.ply", body: module }, data]));
-  assert(!own([{ path: "std.a.ply", body: b"moved" }, data]));
-  assert(!own([{ path: "std.a.ply", body: module }, { path: "std.b.ply", body: b"" }, data]));
-  assert(!own([{ path: "std.a.ply", body: module }]))
+  let read = |name: String|
+    fs::on_mem[shipped](
+      fs::mem_of([{ path: "std.gone.ply", body: b"" }, { path: "stamps", body: b"s" }]),
+      || over_shipping(files, || fs.read_file[shipped](name)),
+    ).value;
+  assert_eq(
+    read("digests"),
+    Some(
+      Bytes::of_string(
+        "std.a.ply " ++ blake3(files.get(0).bytes).hex_of() ++ "\nstd/a/data.txt "
+          ++ blake3(files.get(1).bytes).hex_of()
+          ++ "\n",
+      ),
+    ),
+  );
+  assert_eq(read("std.a.ply"), Some(files.get(0).bytes));
+  assert_eq(read("std.gone.ply"), None);
+  assert_eq(read("stamps"), Some(b"s"))
 }

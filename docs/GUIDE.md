@@ -139,8 +139,11 @@ one that kept or checked it: another holds each read the record made to what it
 answers now before taking it, and notes that it did, so a `ply` that changed
 writes no mark on what an earlier one kept, and two taking turns over one cache
 each keep what they checked. A shipped module (§13) answers
-alike in every project, so the binary carries what each answers, which `cargo
-pack` writes with `ply std --answers` and every load reads beside its own store.
+alike in every project, so the binary carries what each answers, which `ply
+bootstrap` packs with `ply std --answers` and every load reads below its own
+store: a packed record stands as it is where the binary's shipped files are the
+very ones it was answered over, and is held to its reads like any other record
+where they are not.
 
 ## 2. Lexical structure
 
@@ -2314,7 +2317,7 @@ rather than raised.
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
 | `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix; the unit is then partial and a caller of what was dropped is declined, not raised |
-| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, what the builder's steps took when it builds a stage, and allocation counts by kind |
+| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, what the builder's steps took when it builds a stage, what answering and packing the shipped modules took, and allocation counts by kind |
 | `PLY_HEAP_CENSUS=1` | count allocations by constructor, record shape and length class as well, which `PLY_C_PHASES` then prints; a map insert per allocation |
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
@@ -3206,7 +3209,7 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY` (signatures in `<FILE>.sig`), `--verify` (compare, write nothing; §15.2) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
-| `ply std` | `--show [NAME]` (a module's source, or a data file one embeds), `--digest`, `--answers DIR` (answer every shipped module into the memo store at `DIR`, which then holds those answers and nothing else, writing only what `DIR` lacks, through the one kept under the stage root, which holds what a bootstrap's builder answered of them checking `ply` and what an earlier answering did: what `ply bootstrap` packs into the `ply` it builds, which every load reads beside its own store), `--answering` (one line naming how this `ply` answers the shipped modules: two that print the same answer the same modules alike, and `ply bootstrap` keeps the answers under it); no path |
+| `ply std` | `--show [NAME]` (a module's source, or a data file one embeds), `--digest`, `--answers DIR` (answer every shipped module into a pack in `DIR/pack`, a file of Zstandard frames and its index holding those answers and nothing else, through the memo store kept under the stage root, which holds what a bootstrap's builder answered of them checking `ply` and what an earlier answering did: what `ply bootstrap` packs into the `ply` it builds, which every load reads below its own store), `--answering` (one line naming how this `ply` answers the shipped modules: two that print the same answer the same modules alike, and `ply bootstrap` keeps the answers under it); no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
 | `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants (an `opaque` sum's are its module's, and are not listed), an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name under `std` is the toolchain's, and its page is the same wherever the command runs; any other name the program does not hold is looked up among the builtins, then the standard library, which are all there is to look in where no package holds the working directory. A page is read off what its module answers it documents, kept in the memo store for a project's modules and carried by the binary for the standard library's, so none is parsed to print one |
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths, or under the package the working directory is part of where none is given, in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
