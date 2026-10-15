@@ -1,8 +1,6 @@
 //! Reference counting for the values that outlive their region.
 
-use crate::arena::Slot;
-use crate::value::Value;
-use crate::{Diagnostic, Span, codes};
+use crate::Span;
 use rustc_hash::FxHashMap;
 use std::cell::{Cell, RefCell};
 
@@ -13,7 +11,6 @@ pub struct RcStats {
     pub updates_in_place: u64,
     /// Slots copied by the updates that did not rewrite in place.
     pub elements_copied: u64,
-    pub cycles: u64,
 }
 
 impl RcStats {
@@ -30,11 +27,7 @@ thread_local! {
         updates: 0,
         updates_in_place: 0,
         elements_copied: 0,
-        cycles: 0,
     }) };
-    static CYCLES: RefCell<Vec<Diagnostic>> = const { RefCell::new(Vec::new()) };
-    /// Reported `(cell, site)` pairs, so one cycle warns once however often the write runs.
-    static SEEN: RefCell<Vec<(Slot, Span)>> = const { RefCell::new(Vec::new()) };
     static RECORDING: Cell<bool> = const { Cell::new(false) };
     static SITES: RefCell<FxHashMap<Span, SiteCount>> = RefCell::new(FxHashMap::default());
 }
@@ -83,8 +76,6 @@ pub fn stats() -> RcStats {
 pub fn reset() {
     let _ = COUNTERS.try_with(|c| *c.borrow_mut() = RcStats::default());
     let _ = SITES.try_with(|c| c.borrow_mut().clear());
-    let _ = CYCLES.try_with(|c| c.borrow_mut().clear());
-    let _ = SEEN.try_with(|c| c.borrow_mut().clear());
 }
 
 pub fn note_update_of(in_place: bool, copied: usize, span: Span) {
@@ -103,68 +94,5 @@ pub fn note_update_of(in_place: bool, copied: usize, span: Span) {
                 entry.copies += 1;
             }
         });
-    }
-}
-
-pub fn take_cycles() -> Vec<Diagnostic> {
-    // Slot positions restart at every entry point, so a later repeat is a new cycle.
-    let _ = SEEN.try_with(|c| c.borrow_mut().clear());
-    CYCLES
-        .try_with(|c| std::mem::take(&mut *c.borrow_mut()))
-        .unwrap_or_default()
-}
-
-/// Whether `v` reaches cell `slot`, within the walk's budget.
-pub fn value_reaches_cell(v: &Value, slot: Slot) -> bool {
-    let mut budget = CYCLE_WALK_BUDGET;
-    reaches_cell(v, slot, 0, &mut budget)
-}
-
-/// Counts a found cell cycle and warns once per site.
-pub fn note_cell_cycle(slot: Slot, span: Span) {
-    bump(|s| s.cycles += 1);
-    let seen = SEEN
-        .try_with(|c| {
-            let mut seen = c.borrow_mut();
-            let known = seen.contains(&(slot, span));
-            if !known {
-                seen.push((slot, span));
-            }
-            known
-        })
-        .unwrap_or(false);
-    if seen {
-        return;
-    }
-    let d = Diagnostic::warning(
-        codes::REFERENCE_CYCLE,
-        format!("cell {slot} is being made to contain itself"),
-    )
-    .primary(span, "this value reaches the cell it is stored in")
-    .note("reference counting does not collect cycles, so this cell and everything it reaches stay allocated for the rest of the run")
-    .note("break the cycle by storing the part that does not name the cell, or by clearing the cell before the run ends");
-    let _ = CYCLES.try_with(|c| c.borrow_mut().push(d));
-}
-
-/// How many objects a check for a cycle through a cell may visit, on either side of the seam.
-pub const CYCLE_WALK_BUDGET: u32 = 256;
-
-/// Depth- and node-bounded: the program chooses the shape, and the walk spends stack and time.
-fn reaches_cell(v: &Value, slot: Slot, depth: usize, budget: &mut u32) -> bool {
-    if depth >= crate::limit::MAX_VALUE_DEPTH || *budget == 0 {
-        return false;
-    }
-    *budget -= 1;
-    let next = depth + 1;
-    match v {
-        Value::Cell(other) => *other == slot,
-        Value::List(xs) => xs.iter().any(|x| reaches_cell(x, slot, next, budget)),
-        Value::Array(xs) => xs.iter().any(|x| reaches_cell(x, slot, next, budget)),
-        Value::Map(m) => m.iter().any(|(k, x)| {
-            reaches_cell(k, slot, next, budget) || reaches_cell(x, slot, next, budget)
-        }),
-        Value::Record(fields) => fields.values().any(|x| reaches_cell(x, slot, next, budget)),
-        Value::Ctor { args, .. } => args.iter().any(|x| reaches_cell(x, slot, next, budget)),
-        _ => false,
     }
 }

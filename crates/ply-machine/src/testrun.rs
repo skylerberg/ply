@@ -62,7 +62,7 @@ pub struct Usage {
     pub declines: u64,
     /// The operations the test performed, handled ones included.
     pub performs: u64,
-    /// What the entry left behind: cycles teardown collected, and its own warnings.
+    /// The warnings the entry ended with.
     pub teardown: Vec<Diagnostic>,
 }
 
@@ -107,14 +107,12 @@ fn entered(
         machine.set_re_executed(re_executed);
         machine.set_seed(seed.clone(), steps);
     }
-    let (outcome, warnings) = match case {
+    let (outcome, teardown) = match case {
         Some(case) => machine.eval_case(index, case),
         None => machine.eval_test(index),
     }
     .into_parts();
     let (entries, declines) = machine.compiled_counts();
-    let mut teardown = ply_eval::rc::take_cycles();
-    teardown.extend(warnings);
     let interleaving = seeded.and_then(|_| {
         machine
             .simulated()
@@ -266,9 +264,7 @@ pub struct Unlisted {
 /// The cases the test at `index` ranges over, listed on this thread: each one's label and identity.
 pub fn listed(executor: &Executor<'_>, index: usize) -> Result<Value, Unlisted> {
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<Value, Diagnostic> {
-        let answer = executor.machine(index)?.eval_cases(index).into_parts().0;
-        ply_eval::rc::take_cycles();
-        answer
+        executor.machine(index)?.eval_cases(index).into_parts().0
     }));
     match result {
         Ok(listed) => listed.map_err(|failure| Unlisted {

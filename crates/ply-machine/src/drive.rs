@@ -542,8 +542,6 @@ impl Drive {
         note_measurement(&mut self.accounting, &compiled, started, options.hermetic);
         let (answer, warnings) = ended.into_parts();
         let counters = ply_eval::rc::stats();
-        // A cycle among escaped values is never collected, so only this run can report it.
-        let cycles = ply_eval::rc::take_cycles();
         // On the machine's own thread, never from a signal handler.
         let report = teardown(&bound.hosts);
         let stopping = bound.shutdown.filter(|s| s.stopping()).map(|s| {
@@ -560,7 +558,6 @@ impl Drive {
             value: None,
             raised: None,
             counters,
-            cycles,
             warnings,
             stopping,
             teardown: Teardown {
@@ -647,7 +644,6 @@ fn note_measurement(
     accounting.counters.updates += seen.updates;
     accounting.counters.updates_in_place += seen.updates_in_place;
     accounting.counters.elements_copied += seen.elements_copied;
-    accounting.counters.cycles += seen.cycles;
 }
 
 #[cold]
@@ -773,7 +769,6 @@ pub struct Outcome {
     value: Option<ply_eval::Plain>,
     raised: Option<Diagnostic>,
     counters: ply_eval::rc::RcStats,
-    cycles: Vec<Diagnostic>,
     /// What the entry ended with, such as the spans it left open.
     warnings: Vec<Diagnostic>,
     stopping: Option<Stopped>,
@@ -797,7 +792,6 @@ impl Outcome {
                 .note("the operations are performed in order; this is Ply's fault"),
             ),
             counters: ply_eval::rc::RcStats::default(),
-            cycles: Vec::new(),
             warnings: Vec::new(),
             stopping: None,
             teardown: Teardown {
@@ -857,7 +851,6 @@ pub fn outcome_value(o: &Outcome) -> PlyValue {
             option(o.raised.as_ref().map(crate::payload::raised_value)),
         ),
         ("counters", counters_value(&o.counters)),
-        ("cycles", diags_value(&o.cycles)),
         ("warnings", diags_value(&o.warnings)),
         (
             "stopping",
@@ -937,7 +930,6 @@ fn counters_value(stats: &ply_eval::rc::RcStats) -> PlyValue {
                     .map(PlyValue::Decimal),
             ),
         ),
-        ("cycles", tally(stats.cycles)),
     ])
 }
 

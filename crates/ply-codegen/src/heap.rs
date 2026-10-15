@@ -2451,40 +2451,6 @@ pub fn world_independent(w: Word) -> bool {
     true
 }
 
-/// Whether `w` reaches cell `slot`, within the budget `rc::value_reaches_cell` spends.
-pub fn reaches_cell(w: Word, slot: ply_eval::arena::Slot) -> bool {
-    let mut budget = ply_eval::rc::CYCLE_WALK_BUDGET;
-    let mut pending = vec![w];
-    while let Some(w) = pending.pop() {
-        if is_imm(w) {
-            continue;
-        }
-        if budget == 0 {
-            return false;
-        }
-        budget -= 1;
-        let o = obj(w);
-        unsafe {
-            match (*o).kind {
-                KIND_BRIDGE => match bridged(o) {
-                    Value::Cell(s) => {
-                        if *s == slot {
-                            return true;
-                        }
-                    }
-                    v => {
-                        if ply_eval::rc::value_reaches_cell(v, slot) {
-                            return true;
-                        }
-                    }
-                },
-                _ => pending.extend(children(o)),
-            }
-        }
-    }
-    false
-}
-
 /// Adds `by` to the views of `o` it counts; a count past its field stays there, so `o` is held by
 /// views it no longer counts and never grows in place again. A shared value counts none.
 unsafe fn counted_view(o: *mut Obj, by: i32) {
