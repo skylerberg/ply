@@ -340,7 +340,7 @@ pub fn happens_before(earlier: &Stamp, earlier_task: TaskId, later: &Stamp) -> b
 pub fn is_scheduler_bookkeeping(access: &Access) -> bool {
     match access {
         Access::Atom(atom) => matches!(atom.effect.as_str(), "task" | "clock"),
-        Access::Cell { .. } | Access::Alloc => false,
+        Access::Cell { .. } | Access::Alloc | Access::Var { .. } => false,
     }
 }
 

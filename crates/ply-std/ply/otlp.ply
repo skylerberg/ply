@@ -2444,10 +2444,10 @@ pub fn exporting<a, [l] | e>(
 ) -> a / {net.connect[l], net.connect_tls[l], net.send[l], net.recv[l], net.close[l], Exporting, abort.raise | e} = {
   let wall_ms = time.now_ms();
   let mono_us = time.elapsed_us();
-  with_cell[otlp_export](fresh(nanos_now(wall_ms, mono_us, mono_us), time.elapsed_ms())) { st -> {
+  handle {
     // `patience` is how long a flush may still wait; an event's own request waits for nothing.
     let pump = |force: Bool, patience: Int| {
-      let before = cell_get(st);
+      let before = exported.held();
       let plan = planned(
         before,
         cfg,
@@ -2458,24 +2458,24 @@ pub fn exporting<a, [l] | e>(
       match plan.send {
         None -> false,
         Some(out) -> if plan.wait_ms > patience { false } else {
-          cell_set(st, plan.state);
+          exported.hold(plan.state);
           if plan.wait_ms > 0 { time.sleep_ms(plan.wait_ms) } else { () };
           let how = shipped[l](cfg, out);
           let draw = entropy.below(1000);
-          cell_set(st, settled(cell_get(st), cfg, out, how, time.elapsed_ms(), draw));
+          exported.hold(settled(exported.held(), cfg, out, how, time.elapsed_ms(), draw));
           true
         },
       }
     };
     let flushed = || {
-      let held = cell_get(st);
+      let held = exported.held();
       let began = time.elapsed_ms();
       let rounds = (held.queue.len() / max(cfg.batch, 1) + 3) * (max(cfg.attempts, 1) + 1);
       range(0, rounds).fold(true, |more: Bool, _: Int| {
         let left = cfg.flush_ms - (time.elapsed_ms() - began);
         if more && left > 0 { pump(true, left) } else { false }
       });
-      stats_of(cell_get(st))
+      stats_of(exported.held())
     };
     bracket(
       || (),
@@ -2488,7 +2488,7 @@ pub fn exporting<a, [l] | e>(
           body()
         } with {
           trace.enter[*c](name, fields) -> {
-            let held = cell_get(st);
+            let held = exported.held();
             let who = match telemetry::identity(fields) {
               Some(named) -> named,
               None -> {
@@ -2501,8 +2501,7 @@ pub fn exporting<a, [l] | e>(
                 made
               },
             };
-            cell_set(
-              st,
+            exported.hold(
               opened(
                 held,
                 c,
@@ -2515,10 +2514,9 @@ pub fn exporting<a, [l] | e>(
             { id: held.next, channel: c }
           },
           trace.exit[*c](span, outcome) -> {
-            cell_set(
-              st,
+            exported.hold(
               closed(
-                cell_get(st),
+                exported.held(),
                 cfg,
                 span,
                 outcome,
@@ -2530,40 +2528,56 @@ pub fn exporting<a, [l] | e>(
             ()
           },
           trace.count[*c](name, delta, fields) -> {
-            cell_set(
-              st,
-              tallied(cell_get(st), cfg, c, "sum", name, fields, |held: Option<Tallied>|
+            exported.hold(
+              tallied(exported.held(), cfg, c, "sum", name, fields, |held: Option<Tallied>|
                 counted(held, delta)),
             );
             pump(false, 0);
             ()
           },
           trace.gauge[*c](name, value, fields) -> {
-            cell_set(
-              st,
-              tallied(cell_get(st), cfg, c, "gauge", name, fields, |_: Option<Tallied>|
+            exported.hold(
+              tallied(exported.held(), cfg, c, "gauge", name, fields, |_: Option<Tallied>|
                 Level(Float::of_decimal(value))),
             );
             pump(false, 0);
             ()
           },
           trace.time[*c](name, micros, fields) -> {
-            cell_set(
-              st,
-              tallied(cell_get(st), cfg, c, "histogram", name, fields, |held: Option<Tallied>|
-                timed(held, cfg.bounds, Float::of_int(micros) / 1000000.0)),
+            exported.hold(
+              tallied(
+                exported.held(),
+                cfg,
+                c,
+                "histogram",
+                name,
+                fields,
+                |held: Option<Tallied>| timed(held, cfg.bounds, Float::of_int(micros) / 1000000.0),
+              ),
             );
             pump(false, 0);
             ()
           },
           tracing.current() -> None,
           tracing.sampler() -> cfg.sampler,
-          tracing.annotate(span, fields) -> cell_set(st, annotated(cell_get(st), span, fields)),
+          tracing.annotate(span, fields) -> exported.hold(annotated(exported.held(), span, fields)),
           otlp.flush() -> flushed(),
-          otlp.stats() -> stats_of(cell_get(st)),
+          otlp.stats() -> stats_of(exported.held()),
         },
     )
-  } }
+  } with {
+    var st = fresh(nanos_now(wall_ms, mono_us, mono_us), time.elapsed_ms()),
+    exported.held() -> st,
+    exported.hold(next) -> {
+      st = next;
+    },
+  }
+}
+
+/// The state of the exporter `exporting` runs, which its events and its flushes share.
+effect exported {
+  read held() -> State
+  write hold(next: State) -> Unit
 }
 
 /// Sends everything the exporter around the caller holds, waiting out a backoff where a
@@ -3309,21 +3323,20 @@ type Reply =
 
 /// What the collector saw.
 type Collector = {
-  script: List<Reply>,
   traces: List<Traces>,
   metrics: List<Metrics>,
   /// When each request arrived, in milliseconds on the virtual clock.
   arrivals: List<Int>,
   types: List<String>,
   gzipped: Int,
-  conns: Map<Int, Conn>,
-  next: Int,
 }
 
 /// One connection: what its client wrote, and what is left of the answer.
 type Conn = { written: Bytes, answer: Bytes, served: Bool }
 
 effect collector {
+  /// Whether the next connection is refused, which takes a `Down` off the script.
+  write refuses() -> Bool
   write next(content_type: String, gzipped: Bool) -> Reply
   write took_traces(t: Traces) -> Unit
   write took_metrics(m: Metrics) -> Unit
@@ -3425,111 +3438,79 @@ fn collected<a | e>(
   script: List<Reply>,
   body: () -> a / {net.connect[collector], net.connect_tls[collector], net.send[collector], net.recv[collector], net.close[collector] | e},
 ) -> Ran<a> / {clock.now, abort.raise | e} = {
-  let start: Collector = {
-    script: script,
-    traces: [],
-    metrics: [],
-    arrivals: [],
-    types: [],
-    gzipped: 0,
-    conns: Map::new(),
-    next: 1,
-  };
-  with_cell[collector](start) { w -> {
-    let value = handle {
-      handle {
-        body()
-      } with {
-        net.connect[collector](host, port, t) -> {
-          let held: Collector = cell_get(w);
-          match held.script {
-            [Down, ..rest] -> {
-              cell_set(w, { ..held, script: rest });
-              None
-            },
-            _ -> if host != collector_host() || port != 4318 { None } else {
-              let conn: Conn = { written: b"", answer: b"", served: false };
-              cell_set(w, {
-                ..held,
-                next: held.next + 1,
-                conns: held.conns.insert(held.next, conn),
-              });
-              Some(held.next)
-            },
-          }
-        },
-        net.connect_tls[collector](host, port, t) -> None,
-        net.send[collector](conn, payload, t) -> {
-          let held: Collector = cell_get(w);
-          match held.conns.get(conn) {
-            Some(c) -> {
-              cell_set(w, {
-                ..held,
-                conns: held.conns.insert(conn, { ..c, written: c.written.concat(payload) }),
-              });
-              Some(payload.len())
-            },
-            None -> None,
-          }
-        },
-        net.recv[collector](conn, most, t) -> {
-          let before: Collector = cell_get(w);
-          match before.conns.get(conn) {
-            None -> Some(b""),
-            Some(c) -> {
-              let ready = if c.served { c } else {
-                let out: Conn = { written: c.written, answer: answered(c.written), served: true };
-                out
-              };
-              let n = min(most, ready.answer.len());
-              let held: Collector = cell_get(w);
-              cell_set(w, {
-                ..held,
-                conns: held.conns.insert(conn, {
-                  ..ready,
-                  answer: ready.answer.slice(n, ready.answer.len()),
-                }),
-              });
-              Some(ready.answer.slice(0, n))
-            },
-          }
-        },
-        net.close[collector](conn) -> {
-          let held: Collector = cell_get(w);
-          cell_set(w, { ..held, conns: held.conns.remove(conn) })
-        },
-      }
+  handle {
+    handle {
+      body()
     } with {
-      collector.next(kind, packed) -> {
-        let held: Collector = cell_get(w);
-        let noted = {
-          ..held,
-          arrivals: held.arrivals.push(match clock.now() { Instant(n) -> n / 1000000 }),
-          types: held.types.push(kind),
-          gzipped: held.gzipped + (if packed { 1 } else { 0 }),
-        };
-        match held.script {
-          [first, ..rest] -> {
-            cell_set(w, { ..noted, script: rest });
-            first
-          },
-          [] -> {
-            cell_set(w, noted);
-            Take
-          },
-        }
+      var conns: Map<Int, Conn> = Map::new(),
+      var next = 1,
+      net.connect[collector](host, port, t) -> if collector.refuses() || host != collector_host()
+          || port != 4318 { None } else {
+        let conn: Conn = { written: b"", answer: b"", served: false };
+        conns = conns.insert(next, conn);
+        next = next + 1;
+        Some(next - 1)
       },
-      collector.took_traces(t) -> {
-        let held: Collector = cell_get(w);
-        cell_set(w, { ..held, traces: held.traces.push(t) })
+      net.connect_tls[collector](host, port, t) -> None,
+      net.send[collector](conn, payload, t) -> match conns.get(conn) {
+        Some(c) -> {
+          conns = conns.insert(conn, { ..c, written: c.written.concat(payload) });
+          Some(payload.len())
+        },
+        None -> None,
       },
-      collector.took_metrics(m) -> {
-        let held: Collector = cell_get(w);
-        cell_set(w, { ..held, metrics: held.metrics.push(m) })
+      net.recv[collector](conn, most, t) -> match conns.get(conn) {
+        None -> Some(b""),
+        Some(c) -> {
+          let ready = if c.served { c } else {
+            let out: Conn = { written: c.written, answer: answered(c.written), served: true };
+            out
+          };
+          let n = min(most, ready.answer.len());
+          conns = conns.insert(conn, {
+            ..ready,
+            answer: ready.answer.slice(n, ready.answer.len()),
+          });
+          Some(ready.answer.slice(0, n))
+        },
       },
-    };
-    { value: value, seen: cell_get(w) }
-  } }
+      net.close[collector](conn) -> {
+        conns = conns.remove(conn);
+      },
+    }
+  } with {
+    var left = script,
+    var seen: Collector = { traces: [], metrics: [], arrivals: [], types: [], gzipped: 0 },
+    collector.refuses() -> match left {
+      [Down, ..rest] -> {
+        left = rest;
+        true
+      },
+      _ -> false,
+    },
+    collector.next(kind, packed) -> {
+      seen = {
+        ..seen,
+        arrivals: seen.arrivals.push(match clock.now() { Instant(n) -> n / 1000000 }),
+        types: seen.types.push(kind),
+        gzipped: seen.gzipped + (if packed { 1 } else { 0 }),
+      };
+      match left {
+        [first, ..rest] -> {
+          left = rest;
+          first
+        },
+        [] -> Take,
+      }
+    },
+    collector.took_traces(t) -> {
+      seen = { ..seen, traces: seen.traces.push(t) };
+    },
+    collector.took_metrics(m) -> {
+      seen = { ..seen, metrics: seen.metrics.push(m) };
+    },
+    return value -> { value: value, seen: seen },
+  }
 }
 
 /// The wall clock when a test starts: 2023-11-14T22:13:20Z.

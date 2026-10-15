@@ -4,9 +4,9 @@
 
 import std.bin
 import std.list
-import parsing (Span, Ident, ParseDiag, Label, span_to, bare, span_key, error_at, error_at_and,
-                parse_diag, parse_label, dump_diags, is_bare, positional, starts_upper,
-                span_between)
+import parsing (Span, Ident, QName, ParseDiag, Label, span_to, bare, span_key, error_at,
+                error_at_and, parse_diag, parse_label, dump_diags, is_bare, positional,
+                starts_upper, span_between, dummy_span, read_site)
 import type_syntax (TypeExpr, TCon, TRecord, TBad, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad,
                     nullary, is_generic)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, FnDef,
@@ -15,10 +15,12 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               TestDef, SchemaDef, schema_guard_name, parse, dump_module, TDNominal)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
-              ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
-              MatchArm, HandleClause, ReturnClause, RecField, expr_span, ETagged, Tagged,
-              tagged_call, tagged_fill, Hole, with_hole_values, slotted, slot_args)
-import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit, LInt, LStr)
+              ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign,
+              HandlerVar, Param, NamedArg, MatchArm, HandleClause, ReturnClause, RecField,
+              expr_span, ETagged, Tagged, tagged_call, tagged_fill, Hole, with_hole_values, slotted,
+              slot_args)
+import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, POr, PRange, PBad, Lit, LUnit,
+                 LInt, LStr)
 import std.bytes (ascii_of_int)
 
 // --- Shared ---------------------------------------------------------------------
@@ -71,6 +73,7 @@ pub fn is_pure(e: Expr) -> Bool =
               SLet(l) -> is_pure(l.value),
               SLetElse(l) -> is_pure(l.value) && is_pure(l.fallback),
               SExpr(x) -> is_pure(x),
+              SAssign(_) -> false,
             }))
         && (match b.tail { None -> true, Some(t) -> is_pure(t) }),
     ERecord(r) -> r.fields.fold(true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
@@ -88,13 +91,12 @@ fn too_deep() -> Bytes =
   Bytes::concat_all([b"more than ", ascii_of_int(max_alias_depth()), b" type aliases deep"])
 
 /// The literal an update stands for: the base's other fields, in the record's own order, then the
-/// written ones. A call is bound to a name first, so it runs once however many fields are copied.
+/// written ones. A call or a perform is bound to a name first, so it runs once however many fields
+/// are copied.
 fn expand_update(span: Span, base: Expr, written: List<RecField>, names: List<Bytes>) -> Expr = {
   let base_span = expr_span(base);
-  let bound: Option<Ident> = match base {
-    EApp(_) -> Some({ name: b"?u".concat(ascii_of_int(base_span.start)), span: base_span }),
-    _ -> None,
-  };
+  let at = Some({ name: b"?u".concat(ascii_of_int(base_span.start)), span: base_span });
+  let bound: Option<Ident> = match base { EApp(_) -> at, EPerform(_) -> at, _ -> None };
   let source = match bound { Some(b) -> EVar({ span: base_span, name: bare(b) }), None -> base };
   let copies = names.filter(|n: Bytes|
     !written.fold(false, |seen: Bool, w: RecField| seen || w.name.name == n));
@@ -165,6 +167,7 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
                 fallback: go(l.fallback),
               }),
             SExpr(x) -> SExpr(go(x)),
+            SAssign(x) -> SAssign({ ..x, value: go(x.value) }),
           }),
       }),
     ERecord(r) -> ERecord({ span: r.span, fields: fields(r.fields) }),
@@ -194,6 +197,7 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
             span: c.span,
             params: c.params,
           }),
+        vars: h.vars.map(|v: HandlerVar| { ..v, init: go(v.init) }),
       }),
     EWithCell(c) ->
       EWithCell({
@@ -456,6 +460,7 @@ fn picked(e: Expr, wanted: (Expr) -> Bool, found: List<Expr>) -> List<Expr> = {
             SLet(l) -> picked(l.value, wanted, acc),
             SLetElse(l) -> picked(l.fallback, wanted, picked(l.value, wanted, acc)),
             SExpr(x) -> picked(x, wanted, acc),
+            SAssign(x) -> picked(x.value, wanted, acc),
           }),
       ),
     ERecord(r) -> fields(r.fields, out),
@@ -465,8 +470,9 @@ fn picked(e: Expr, wanted: (Expr) -> Bool, found: List<Expr>) -> List<Expr> = {
     EList(l) -> all(l.items, out),
     EPerform(x) -> all(x.args, out),
     EHandle(h) -> {
+      let inits = h.vars.fold(out, |acc: List<Expr>, v: HandlerVar| picked(v.init, wanted, acc));
       let clauses = h.clauses.fold(
-        picked(h.body, wanted, out),
+        picked(h.body, wanted, inits),
         |acc: List<Expr>, c: HandleClause| picked(c.body, wanted, acc),
       );
       match h.ret { None -> clauses, Some(rc) -> picked(rc.body, wanted, clauses) }
@@ -767,6 +773,7 @@ fn expanded_try(answered: Map<Bytes, Answered>, expr: Expr) -> Expr =
               params: binders,
             },
           ],
+          vars: [],
         })
       },
     },
@@ -848,6 +855,521 @@ fn expanded_hold(expr: Expr) -> Expr =
   }
 
 fn is_hold(expr: Expr) -> Bool = match expr { EWithHold(_) -> true, _ -> false }
+
+// --- Handler variables ----------------------------------------------------------------------------
+// A `handle` with variables is written out as one without. The variables' first values are bound
+// before it and handed to its frame as its body starts. A clause reads and assigns them through the
+// runtime, which holds the variables of the clause running; what a clause hands on to run later, a
+// lambda or a nested body, reads the values they had where it was made.
+
+/// Every `handle` with variables of a module written out as one without.
+pub fn expand_handler_vars(module: Module) -> Module =
+  if !any_expr(module, has_vars) { module }
+  else { { ..module, items: module.items.map(|item: Item| map_item(item, expanded_vars)) } }
+
+fn has_vars(expr: Expr) -> Bool = match expr { EHandle(h) -> h.vars.len() > 0, _ -> false }
+
+/// The variables a clause reads through the runtime: each by name, its place among its handler's,
+/// and its declared name's place in the source, where the checker filed its type.
+type Held = { vars: List<{ name: Bytes, at: Int, decl: Span }>, tag: Bytes }
+
+fn expanded_vars(expr: Expr) -> Expr =
+  match expr {
+    EHandle(h) -> if h.vars.len() == 0 { expr } else {
+      // Derived code gives all its nodes one place, told apart by `gen`.
+      let tag = Bytes::concat_all([ascii_of_int(h.span.start), b"g", ascii_of_int(h.span.gen)]);
+      let vs = h.vars.fold([], |acc: List<{ index: Int, value: HandlerVar }>, v: HandlerVar|
+        acc.push({ index: acc.len(), value: v }));
+      let first = |x: { index: Int, value: HandlerVar }|
+        { name: Bytes::concat_all([b"?hv", tag, b"_", ascii_of_int(x.index)]), span: x.value.span };
+      let held = {
+        vars: vs.map(|x: { index: Int, value: HandlerVar }|
+          { name: x.value.name.name, at: x.index, decl: x.value.name.span }),
+        tag: tag,
+      };
+      // Each initializer reads the variables above it from where their first values are bound.
+      let made = vs.map(|x: { index: Int, value: HandlerVar }|
+        SLet({
+          span: x.value.span,
+          pat: var_pattern(first(x)),
+          ty: None,
+          value: vs.take(x.index).fold(
+            x.value.init,
+            |e: Expr, above: { index: Int, value: HandlerVar }|
+              renamed_free(e, above.value.name.name, first(above).name).e,
+          ),
+        }));
+      let installed = vs.map(|x: { index: Int, value: HandlerVar }| {
+        let at = x.value.span;
+        SExpr(hidden_call(at, b"?handler_init", [int_lit(x.index), var_of(first(x))]))
+      });
+      EBlock({
+        span: h.span,
+        stmts: made,
+        tail: Some(
+          EHandle({
+            ..h,
+            body: EBlock({ span: expr_span(h.body), tail: Some(h.body), stmts: installed }),
+            clauses: h.clauses.map(|c: HandleClause|
+              { ..c, body: in_clause(hidden_by(held, clause_binders(c)), c.body) }),
+            ret: match h.ret {
+              Some(rc) ->
+                Some({ ..rc, body: in_clause(hidden_by(held, [rc.binder.name]), rc.body) }),
+              None -> None,
+            },
+            vars: [],
+          }),
+        ),
+      })
+    },
+    _ -> expr,
+  }
+
+/// A variable's place, at no place in the source: the node it shares a call's span with would
+/// otherwise make that span's type unknown.
+fn int_lit(i: Int) -> Expr = ELit({ span: dummy_span(), lit: LInt(i) })
+
+fn clause_binders(c: HandleClause) -> List<Bytes> = {
+  let named = c.params.map(|p: Ident| p.name);
+  let labelled = match c.label_binder { Some(t) -> named.push(t.name), None -> named };
+  match c.resume { Some(k) -> labelled.push(k.name), None -> labelled }
+}
+
+/// `held` without the variables `names` hide.
+fn hidden_by(held: Held, names: List<Bytes>) -> Held =
+  {
+    ..held,
+    vars: held.vars.filter(|x: { name: Bytes, at: Int, decl: Span }| !names.contains(x.name)),
+  }
+
+fn held_named(
+  held: Held,
+  v: { span: Span, name: QName },
+) -> Option<{ name: Bytes, at: Int, decl: Span }> =
+  if v.name.module != None { None } else {
+    held.vars.fold(
+      None,
+      |found: Option<{ name: Bytes, at: Int, decl: Span }>, x: { name: Bytes, at: Int, decl: Span }|
+        if x.name == v.name.name.name { Some(x) } else { found },
+    )
+  }
+
+/// The read of variable `at` written at `span`, typed at its own site: its callee has none, so
+/// neither takes the type the checker filed for the read.
+fn read_of(span: Span, at: Int) -> Expr =
+  EApp({
+    span: read_site(span),
+    func: EVar({ span: dummy_span(), name: bare({ name: b"?handler_var", span: dummy_span() }) }),
+    named: [],
+    args: [int_lit(at)],
+    labels: [],
+  })
+
+fn snap_name(held: Held, at: Int) -> Bytes =
+  Bytes::concat_all([b"?hs", held.tag, b"_", ascii_of_int(at)])
+
+/// The names a pattern binds.
+fn held_binders(p: Pattern, out: List<Bytes>) -> List<Bytes> =
+  match p {
+    PVar(v) -> out.push(v.name.name),
+    PCtor(c) -> c.args.fold(out, |acc: List<Bytes>, a: Pattern| held_binders(a, acc)),
+    PRecord(r) ->
+      r.fields.fold(out, |acc: List<Bytes>, f: { name: Ident, pat: Pattern }|
+        held_binders(f.pat, acc)),
+    PList(l) -> {
+      let items = l.items.fold(out, |acc: List<Bytes>, x: Pattern| held_binders(x, acc));
+      match l.rest { None -> items, Some(r) -> held_binders(r, items) }
+    },
+    POr(o) -> o.alts.fold(out, |acc: List<Bytes>, a: Pattern| held_binders(a, acc)),
+    PWild(_) -> out,
+    PLit(_) -> out,
+    PRange(_) -> out,
+    PBad(_) -> out,
+  }
+
+/// `e`, run as the clause runs: each read of a variable in `held` the runtime's, each assignment
+/// the runtime's, and what runs later reading the values the variables had where it was made.
+fn in_clause(held: Held, e: Expr) -> Expr =
+  if held.vars.len() == 0 { e } else {
+    let go = |x: Expr| in_clause(held, x);
+    match e {
+      // At the name's span, where the checker filed the read, which a parenthesised one is not.
+      EVar(v) -> match held_named(held, v) { Some(x) -> read_of(v.name.span, x.at), None -> e },
+      ELambda(_) -> snapshot(held, e),
+      EHandle(_) -> snapshot(held, e),
+      ESimulate(_) -> snapshot(held, e),
+      EParallel(_) -> snapshot(held, e),
+      EWithCell(_) -> snapshot(held, e),
+      EWithHold(_) -> snapshot(held, e),
+      ETryBlock(_) -> snapshot(held, e),
+      EBlock(b) -> {
+        let walked = b.stmts.fold(
+          { held: held, stmts: [] },
+          |acc: { held: Held, stmts: List<Stmt> }, s: Stmt|
+            match s {
+              SLet(l) ->
+                {
+                  held: hidden_by(acc.held, held_binders(l.pat, [])),
+                  stmts: acc.stmts.push(SLet({ ..l, value: in_clause(acc.held, l.value) })),
+                },
+              SLetElse(l) ->
+                {
+                  held: hidden_by(acc.held, held_binders(l.pat, [])),
+                  stmts: acc.stmts.push(
+                    SLetElse({
+                      ..l,
+                      value: in_clause(acc.held, l.value),
+                      fallback: in_clause(acc.held, l.fallback),
+                    }),
+                  ),
+                },
+              SExpr(x) -> { ..acc, stmts: acc.stmts.push(SExpr(in_clause(acc.held, x))) },
+              // The checker let it stand only for a variable of this handler, unhidden.
+              SAssign(a) -> match held_named(acc.held, { span: a.name.span, name: bare(a.name) }) {
+                Some(x) ->
+                  {
+                    ..acc,
+                    stmts: acc.stmts.push(
+                      SExpr(
+                        hidden_call(a.span, b"?handler_set", [
+                          int_lit(x.at),
+                          in_clause(acc.held, a.value),
+                        ]),
+                      ),
+                    ),
+                  },
+                None ->
+                  {
+                    ..acc,
+                    stmts: acc.stmts.push(SAssign({ ..a, value: in_clause(acc.held, a.value) })),
+                  },
+              },
+            },
+        );
+        EBlock({
+          ..b,
+          stmts: walked.stmts,
+          tail: match b.tail { Some(t) -> Some(in_clause(walked.held, t)), None -> None },
+        })
+      },
+      EMatch(m) ->
+        EMatch({
+          ..m,
+          scrutinee: go(m.scrutinee),
+          arms: m.arms.map(|arm: MatchArm| {
+            let inner = hidden_by(held, held_binders(arm.pat, []));
+            {
+              ..arm,
+              guard: match arm.guard { Some(g) -> Some(in_clause(inner, g)), None -> None },
+              body: in_clause(inner, arm.body),
+            }
+          }),
+        }),
+      EBinary(b) -> EBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
+      EUnary(u) -> EUnary({ ..u, operand: go(u.operand) }),
+      EApp(a) ->
+        EApp({
+          ..a,
+          func: go(a.func),
+          args: a.args.map(go),
+          named: a.named.map(|n: NamedArg| { ..n, value: go(n.value) }),
+        }),
+      EIf(i) ->
+        EIf({
+          ..i,
+          cond: go(i.cond),
+          then_branch: go(i.then_branch),
+          else_branch: go(i.else_branch),
+        }),
+      ERecord(r) ->
+        ERecord({ ..r, fields: r.fields.map(|f: RecField| { ..f, value: go(f.value) }) }),
+      ERecordUpdate(r) ->
+        ERecordUpdate({
+          ..r,
+          base: go(r.base),
+          fields: r.fields.map(|f: RecField| { ..f, value: go(f.value) }),
+        }),
+      ETry(t) -> ETry({ ..t, operand: go(t.operand) }),
+      EField(f) -> EField({ ..f, base: go(f.base) }),
+      EList(l) -> EList({ ..l, items: l.items.map(go) }),
+      EPerform(p) -> EPerform({ ..p, args: p.args.map(go) }),
+      ETagged(t) -> ETagged({ ..t, holes: t.holes.map(|h: Hole| { ..h, value: go(h.value) }) }),
+      ELit(_) -> e,
+      EBad(_) -> e,
+    }
+  }
+
+/// `e`, which runs after the clause may have returned, reading the values the variables it names
+/// had where it was made: each read before it, bound to a name of its own.
+fn snapshot(held: Held, e: Expr) -> Expr = {
+  let taken = held.vars.fold(
+    { e: e, used: [] },
+    |acc: { e: Expr, used: List<{ name: Bytes, at: Int, decl: Span }> }, x: { name: Bytes, at: Int, decl: Span }| {
+      let r = renamed_free(acc.e, x.name, snap_name(held, x.at));
+      { e: r.e, used: if r.hit { acc.used.push(x) } else { acc.used } }
+    },
+  );
+  if taken.used.len() == 0 { e } else {
+    EBlock({
+      span: expr_span(e),
+      stmts: taken.used.map(|x: { name: Bytes, at: Int, decl: Span }|
+        SLet({
+          span: x.decl,
+          pat: PVar({ span: x.decl, name: { name: snap_name(held, x.at), span: x.decl } }),
+          ty: None,
+          value: read_of(x.decl, x.at),
+        })),
+      tail: Some(taken.e),
+    })
+  }
+}
+
+type Renamed = { e: Expr, hit: Bool }
+
+/// `e` with each free `from` read as `to`, and whether there was one.
+fn renamed_free(e: Expr, from: Bytes, to: Bytes) -> Renamed = {
+  let go = |x: Expr| renamed_free(x, from, to);
+  let all = |xs: List<Expr>|
+    xs.fold({ es: [], hit: false }, |acc: { es: List<Expr>, hit: Bool }, x: Expr| {
+      let r = go(x);
+      { es: acc.es.push(r.e), hit: acc.hit || r.hit }
+    });
+  // Under binders that hide `from`, nothing is free.
+  let under = |names: List<Bytes>, x: Expr|
+    if names.contains(from) { { e: x, hit: false } } else { go(x) };
+  match e {
+    EVar(v) -> if v.name.module == None && v.name.name.name == from {
+      { e: EVar({ ..v, name: bare({ name: to, span: v.name.name.span }) }), hit: true }
+    } else { { e: e, hit: false } },
+    ELambda(l) -> {
+      let r = under(l.params.map(|p: Param| p.name.name), l.body);
+      { e: ELambda({ ..l, body: r.e }), hit: r.hit }
+    },
+    EBlock(b) -> {
+      let walked = b.stmts.fold(
+        { stmts: [], hit: false, hidden: false },
+        |acc: { stmts: List<Stmt>, hit: Bool, hidden: Bool }, s: Stmt|
+          if acc.hidden { { ..acc, stmts: acc.stmts.push(s) } } else {
+            match s {
+              SLet(l) -> {
+                let r = go(l.value);
+                {
+                  stmts: acc.stmts.push(SLet({ ..l, value: r.e })),
+                  hit: acc.hit || r.hit,
+                  hidden: held_binders(l.pat, []).contains(from),
+                }
+              },
+              SLetElse(l) -> {
+                let r = go(l.value);
+                let f = go(l.fallback);
+                {
+                  stmts: acc.stmts.push(SLetElse({ ..l, value: r.e, fallback: f.e })),
+                  hit: acc.hit || r.hit || f.hit,
+                  hidden: held_binders(l.pat, []).contains(from),
+                }
+              },
+              SExpr(x) -> {
+                let r = go(x);
+                { ..acc, stmts: acc.stmts.push(SExpr(r.e)), hit: acc.hit || r.hit }
+              },
+              SAssign(a) -> {
+                let r = go(a.value);
+                {
+                  ..acc,
+                  stmts: acc.stmts.push(SAssign({ ..a, value: r.e })),
+                  hit: acc.hit || r.hit,
+                }
+              },
+            }
+          },
+      );
+      let t = match b.tail {
+        Some(x) -> if walked.hidden { { e: x, hit: false } } else { go(x) },
+        None -> { e: EBad({ span: b.span }), hit: false },
+      };
+      {
+        e: EBlock({
+          ..b,
+          stmts: walked.stmts,
+          tail: match b.tail { Some(_) -> Some(t.e), None -> None },
+        }),
+        hit: walked.hit || t.hit,
+      }
+    },
+    EMatch(m) -> {
+      let s = go(m.scrutinee);
+      let arms = m.arms.fold(
+        { arms: [], hit: s.hit },
+        |acc: { arms: List<MatchArm>, hit: Bool }, arm: MatchArm| {
+          let names = held_binders(arm.pat, []);
+          let g = match arm.guard {
+            Some(x) -> {
+              let r = under(names, x);
+              { e: Some(r.e), hit: r.hit }
+            },
+            None -> { e: None, hit: false },
+          };
+          let b = under(names, arm.body);
+          { arms: acc.arms.push({ ..arm, guard: g.e, body: b.e }), hit: acc.hit || g.hit || b.hit }
+        },
+      );
+      { e: EMatch({ ..m, scrutinee: s.e, arms: arms.arms }), hit: arms.hit }
+    },
+    EHandle(h) -> {
+      // Each initializer sees the variables above it, which may hide `from`.
+      let inits = h.vars.fold(
+        { vs: [], hidden: false },
+        |acc: { vs: List<{ v: HandlerVar, hit: Bool }>, hidden: Bool }, v: HandlerVar| {
+          let r = if acc.hidden { { e: v.init, hit: false } } else { go(v.init) };
+          {
+            vs: acc.vs.push({ v: { ..v, init: r.e }, hit: r.hit }),
+            hidden: acc.hidden || v.name.name == from,
+          }
+        },
+      ).vs;
+      let body = go(h.body);
+      let held = h.vars.map(|v: HandlerVar| v.name.name);
+      let cs = h.clauses.fold(
+        { cs: [], hit: false },
+        |acc: { cs: List<HandleClause>, hit: Bool }, c: HandleClause| {
+          let r = under(held.concat(clause_binders(c)), c.body);
+          { cs: acc.cs.push({ ..c, body: r.e }), hit: acc.hit || r.hit }
+        },
+      );
+      let ret = match h.ret {
+        Some(rc) -> {
+          let r = under(held.push(rc.binder.name), rc.body);
+          { e: Some({ ..rc, body: r.e }), hit: r.hit }
+        },
+        None -> { e: None, hit: false },
+      };
+      {
+        e: EHandle({
+          ..h,
+          body: body.e,
+          clauses: cs.cs,
+          ret: ret.e,
+          vars: inits.map(|x: { v: HandlerVar, hit: Bool }| x.v),
+        }),
+        hit: inits.fold(false, |acc: Bool, x: { v: HandlerVar, hit: Bool }| acc || x.hit)
+          || body.hit
+          || cs.hit
+          || ret.hit,
+      }
+    },
+    EWithCell(c) -> {
+      let i = go(c.init);
+      let b = under([c.binder.name], c.body);
+      { e: EWithCell({ ..c, init: i.e, body: b.e }), hit: i.hit || b.hit }
+    },
+    EWithHold(c) -> {
+      let a = go(c.acquire);
+      let r = go(c.release);
+      let b = under([c.binder.name], c.body);
+      { e: EWithHold({ ..c, acquire: a.e, release: r.e, body: b.e }), hit: a.hit || r.hit || b.hit }
+    },
+    ESimulate(x) -> {
+      let r = go(x.body);
+      { e: ESimulate({ ..x, body: r.e }), hit: r.hit }
+    },
+    EParallel(x) -> {
+      let r = all(x.branches);
+      { e: EParallel({ ..x, branches: r.es }), hit: r.hit }
+    },
+    ETryBlock(x) -> {
+      let r = go(x.body);
+      { e: ETryBlock({ ..x, body: r.e }), hit: r.hit }
+    },
+    EBinary(b) -> {
+      let l = go(b.lhs);
+      let r = go(b.rhs);
+      { e: EBinary({ ..b, lhs: l.e, rhs: r.e }), hit: l.hit || r.hit }
+    },
+    EUnary(u) -> {
+      let r = go(u.operand);
+      { e: EUnary({ ..u, operand: r.e }), hit: r.hit }
+    },
+    EApp(a) -> {
+      let f = go(a.func);
+      let xs = all(a.args);
+      let ns = a.named.map(|n: NamedArg| {
+        let r = go(n.value);
+        { n: { ..n, value: r.e }, hit: r.hit }
+      });
+      {
+        e: EApp({
+          ..a,
+          func: f.e,
+          args: xs.es,
+          named: ns.map(|x: { n: NamedArg, hit: Bool }| x.n),
+        }),
+        hit: f.hit || xs.hit
+          || ns.fold(false, |acc: Bool, x: { n: NamedArg, hit: Bool }| acc || x.hit),
+      }
+    },
+    EIf(i) -> {
+      let c = go(i.cond);
+      let t = go(i.then_branch);
+      let f = go(i.else_branch);
+      {
+        e: EIf({ ..i, cond: c.e, then_branch: t.e, else_branch: f.e }),
+        hit: c.hit || t.hit || f.hit,
+      }
+    },
+    ERecord(r) -> {
+      let fs = renamed_fields(r.fields, from, to);
+      { e: ERecord({ ..r, fields: fs.fields }), hit: fs.hit }
+    },
+    ERecordUpdate(r) -> {
+      let b = go(r.base);
+      let fs = renamed_fields(r.fields, from, to);
+      { e: ERecordUpdate({ ..r, base: b.e, fields: fs.fields }), hit: b.hit || fs.hit }
+    },
+    ETry(t) -> {
+      let r = go(t.operand);
+      { e: ETry({ ..t, operand: r.e }), hit: r.hit }
+    },
+    EField(f) -> {
+      let r = go(f.base);
+      { e: EField({ ..f, base: r.e }), hit: r.hit }
+    },
+    EList(l) -> {
+      let r = all(l.items);
+      { e: EList({ ..l, items: r.es }), hit: r.hit }
+    },
+    EPerform(p) -> {
+      let r = all(p.args);
+      { e: EPerform({ ..p, args: r.es }), hit: r.hit }
+    },
+    ETagged(t) -> {
+      let hs = t.holes.map(|h: Hole| {
+        let r = go(h.value);
+        { h: { ..h, value: r.e }, hit: r.hit }
+      });
+      {
+        e: ETagged({ ..t, holes: hs.map(|x: { h: Hole, hit: Bool }| x.h) }),
+        hit: hs.fold(false, |acc: Bool, x: { h: Hole, hit: Bool }| acc || x.hit),
+      }
+    },
+    ELit(_) -> { e: e, hit: false },
+    EBad(_) -> { e: e, hit: false },
+  }
+}
+
+fn renamed_fields(
+  fs: List<RecField>,
+  from: Bytes,
+  to: Bytes,
+) -> { fields: List<RecField>, hit: Bool } = {
+  let rs = fs.map(|f: RecField| {
+    let r = renamed_free(f.value, from, to);
+    { f: { ..f, value: r.e }, hit: r.hit }
+  });
+  {
+    fields: rs.map(|x: { f: RecField, hit: Bool }| x.f),
+    hit: rs.fold(false, |acc: Bool, x: { f: RecField, hit: Bool }| acc || x.hit),
+  }
+}
 
 /// Every `with_hold` of a module replaced by the cell and the bracket it stands for.
 pub fn expand_holds(module: Module) -> Module =
@@ -1559,6 +2081,47 @@ fn take_stmt(state: TryState, stmt: Stmt, room: Int) -> Taken / {abort.raise} =
         }
       },
     },
+    SAssign(a) -> match a.value {
+      ETry(t) -> {
+        let fresh = fresh_binder(state, t.span);
+        let o = take_try(fresh.state, t.operand, t.span, var_pattern(fresh.binder));
+        if o.take.consumes {
+          {
+            state: o.state,
+            stmt: SAssign({ ..a, value: var_of(fresh.binder) }),
+            take: Some({
+              operand: o.take.operand,
+              at: o.take.at,
+              pat: o.take.pat,
+              consumes: false,
+            }),
+          }
+        } else {
+          {
+            state: o.state,
+            stmt: SAssign({ ..a, value: ETry({ span: t.span, operand: o.operand_left }) }),
+            take: Some(o.take),
+          }
+        }
+      },
+      _ -> {
+        let o = scan(state, a.value);
+        match o.scan {
+          ScanFound(lift) ->
+            {
+              state: o.state,
+              stmt: SAssign({ ..a, value: o.expr }),
+              take: Some({
+                operand: lift.operand,
+                at: lift.at,
+                pat: var_pattern(lift.binder),
+                consumes: false,
+              }),
+            },
+          _ -> { state: o.state, stmt: stmt, take: None },
+        }
+      },
+    },
     SExpr(v) -> match v {
       ETry(t) -> {
         let o = take_try(state, t.operand, t.span, PWild({ span: v_span(v) }));
@@ -1807,6 +2370,10 @@ fn sweep_inner(
               let o = sweep_within(acc.state, x, scope, barrier, room);
               { state: o.state, stmts: acc.stmts.push(SExpr(o.expr)) }
             },
+            SAssign(x) -> {
+              let o = sweep_within(acc.state, x.value, scope, barrier, room);
+              { state: o.state, stmts: acc.stmts.push(SAssign({ ..x, value: o.expr })) }
+            },
           },
       );
       let tl = match b.tail {
@@ -1843,7 +2410,14 @@ fn sweep_inner(
       }
     },
     EHandle(h) -> {
-      let b = sweep_within(state, h.body, scope, under(barrier, b"a `handle` body"), room);
+      let vs = h.vars.fold(
+        { state: state, vars: [] },
+        |acc: { state: TryState, vars: List<HandlerVar> }, v: HandlerVar| {
+          let o = sweep_within(acc.state, v.init, scope, barrier, room);
+          { state: o.state, vars: acc.vars.push({ ..v, init: o.expr }) }
+        },
+      );
+      let b = sweep_within(vs.state, h.body, scope, under(barrier, b"a `handle` body"), room);
       let cs = h.clauses.fold(
         { state: b.state, clauses: [] },
         |acc: { state: TryState, clauses: List<HandleClause> }, c: HandleClause| {
@@ -1885,7 +2459,13 @@ fn sweep_inner(
       };
       {
         state: r.state,
-        expr: EHandle({ span: h.span, body: b.expr, ret: r.ret, clauses: cs.clauses }),
+        expr: EHandle({
+          span: h.span,
+          body: b.expr,
+          ret: r.ret,
+          clauses: cs.clauses,
+          vars: vs.vars,
+        }),
       }
     },
     EWithCell(c) -> {
@@ -2158,6 +2738,7 @@ fn count_in(e: Expr, p: (Expr) -> Bool) -> Int = {
                 SLet(l) -> count_in(l.value, p),
                 SLetElse(l) -> count_in(l.value, p) + count_in(l.fallback, p),
                 SExpr(x) -> count_in(x, p),
+                SAssign(x) -> count_in(x.value, p),
               }))
           + maybe(b.tail),
       ERecord(r) -> r.fields.fold(0, |n: Int, f: RecField| n + count_in(f.value, p)),
@@ -2169,7 +2750,8 @@ fn count_in(e: Expr, p: (Expr) -> Bool) -> Int = {
       EPerform(x) -> all(x.args),
       EHandle(h) ->
         count_in(h.body, p) + h.clauses.fold(0, |n: Int, c: HandleClause| n + count_in(c.body, p))
-          + (match h.ret { None -> 0, Some(rc) -> count_in(rc.body, p) }),
+          + (match h.ret { None -> 0, Some(rc) -> count_in(rc.body, p) })
+          + h.vars.fold(0, |n: Int, v: HandlerVar| n + count_in(v.init, p)),
       EWithCell(c) -> count_in(c.init, p) + count_in(c.body, p),
       EWithHold(c) -> count_in(c.acquire, p) + count_in(c.release, p) + count_in(c.body, p),
       ESimulate(x) -> count_in(x.body, p),

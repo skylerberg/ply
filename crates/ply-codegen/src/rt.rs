@@ -313,6 +313,50 @@ pub struct HandlerFrame {
     /// The calls its stack had left when this frame went on, which its `handle` lands with: a
     /// frame a failure returns through gives its call back nowhere else.
     fuel: i64,
+    /// Which `handle` this frame is of, the same in every copy a task inherits or a continuation
+    /// captures, so a resumption finds the variables of a clause of its own handler.
+    pub(crate) handler: u64,
+    /// The handler's variables, from when its body starts.
+    vars: Option<SharedVars>,
+}
+
+/// A handler's variables, held. A task's copy of the frame shares them, so tasks under one handler
+/// see one set; a continuation's copy holds its own, so a resumption starts from them as they were
+/// where it was captured. Given back by [`release_vars`], never by a drop, which could come after
+/// the entry's heap is gone.
+pub(crate) struct HandlerVars(Vec<Word>);
+
+impl HandlerVars {
+    /// The same values, each held once more.
+    pub(crate) fn copied(&self) -> HandlerVars {
+        for w in &self.0 {
+            heap::inc(*w);
+        }
+        HandlerVars(self.0.clone())
+    }
+
+    /// Takes `w` as variable `i`, letting go of what it held.
+    fn set(&mut self, i: usize, w: Word) {
+        if self.0.len() <= i {
+            self.0.resize(i + 1, heap::unit());
+        }
+        heap::dec(std::mem::replace(&mut self.0[i], w));
+    }
+}
+
+pub(crate) type SharedVars = Rc<std::cell::RefCell<HandlerVars>>;
+
+pub(crate) fn shared(vars: HandlerVars) -> SharedVars {
+    Rc::new(std::cell::RefCell::new(vars))
+}
+
+/// Lets go of one holder of `v`; the last gives back the values.
+pub(crate) fn release_vars(v: SharedVars) {
+    if let Ok(only) = Rc::try_unwrap(v) {
+        for w in only.into_inner().0 {
+            heap::dec(w);
+        }
+    }
 }
 
 impl HandlerFrame {
@@ -330,12 +374,19 @@ impl HandlerFrame {
             detached: None,
             regions,
             fuel,
+            handler: 0,
+            vars: None,
         }
     }
 
     /// The bottom of a detached body's own stack, which holds no region yet and starts with the
     /// calls its opener had left.
-    pub(crate) fn detached(clauses: Vec<FrameClause>, id: usize, fuel: i64) -> HandlerFrame {
+    pub(crate) fn detached(
+        clauses: Vec<FrameClause>,
+        id: usize,
+        fuel: i64,
+        handler: u64,
+    ) -> HandlerFrame {
         HandlerFrame {
             clauses,
             ret: 0,
@@ -343,6 +394,33 @@ impl HandlerFrame {
             detached: Some(id),
             regions: 0,
             fuel,
+            handler,
+            vars: None,
+        }
+    }
+
+    /// The variables a clause or the `return` clause of this frame runs with, by its handler.
+    pub(crate) fn held(&self) -> Option<(u64, SharedVars)> {
+        self.vars.as_ref().map(|v| (self.handler, Rc::clone(v)))
+    }
+
+    /// A copy of the frame's variables of its own, for a clause that works on one, by its handler.
+    pub(crate) fn vars_copied(&self) -> Option<(u64, SharedVars)> {
+        self.vars
+            .as_ref()
+            .map(|v| (self.handler, shared(v.borrow().copied())))
+    }
+
+    /// The frame's variables set to `values`, each held once more.
+    pub(crate) fn set_vars(&mut self, values: &HandlerVars) {
+        match &self.vars {
+            Some(v) => {
+                let old = std::mem::replace(&mut *v.borrow_mut(), values.copied());
+                for w in old.0 {
+                    heap::dec(w);
+                }
+            }
+            None => self.vars = Some(shared(values.copied())),
         }
     }
 
@@ -370,6 +448,12 @@ pub(crate) struct Frames {
     /// For a task's stack, the stack its region was entered from, where the task's body was
     /// written; a production task's `parent` is the scheduler loop's, which does not lead there.
     pub(crate) entered_from: Option<usize>,
+    /// The variables of each clause running on this stack, the innermost last, by handler: a
+    /// stack's own, since tasks run their clauses interleaved.
+    pub(crate) held: Vec<(u64, SharedVars)>,
+    /// How many runtime frames on this stack own memory across a call that may stop a detached
+    /// body there: a snapshot then would free it once per restore, so it is taken as one-shot.
+    pub(crate) owning: u32,
 }
 
 impl Frames {
@@ -379,6 +463,33 @@ impl Frames {
             parent,
             body: None,
             entered_from: None,
+            held: Vec::new(),
+            owning: 0,
+        }
+    }
+}
+
+/// A runtime frame owning memory across a call into Ply, for as long as it lives: see
+/// [`Frames::owning`]. A stack left mid-call never runs the drop, which only keeps it one-shot.
+pub(crate) struct Owning {
+    ctx: *mut Ctx,
+    stack: usize,
+}
+
+impl Owning {
+    pub(crate) fn on(ctx: *mut Ctx) -> Owning {
+        let c = unsafe { &mut *ctx };
+        let stack = c.current;
+        c.stacks[stack].owning += 1;
+        Owning { ctx, stack }
+    }
+}
+
+impl Drop for Owning {
+    fn drop(&mut self) {
+        let c = unsafe { &mut *self.ctx };
+        if let Some(s) = c.stacks.get_mut(self.stack) {
+            s.owning = s.owning.saturating_sub(1);
         }
     }
 }
@@ -474,8 +585,13 @@ impl HandlerFrame {
     }
 }
 
-/// The frames a captured continuation holds, each closure held once more for the copy.
+/// The frames a captured continuation holds, each closure held once more for the copy, and each
+/// handler's variables copied, so a resumption starts from them as they were.
 pub(crate) fn clone_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
+    copied_frames(list, false)
+}
+
+fn copied_frames(list: &[HandlerFrame], sharing_vars: bool) -> Vec<HandlerFrame> {
     list.iter()
         .map(|f| {
             for cl in &f.clauses {
@@ -502,15 +618,24 @@ pub(crate) fn clone_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
                 detached: f.detached,
                 regions: f.regions,
                 fuel: f.fuel,
+                handler: f.handler,
+                vars: f.vars.as_ref().map(|v| {
+                    if sharing_vars {
+                        Rc::clone(v)
+                    } else {
+                        shared(v.borrow().copied())
+                    }
+                }),
             }
         })
         .collect()
 }
 
 /// A spawned task's copies of the handlers around its spawn, at the bottom of its own stack; none
-/// may name a detached body, whose clause would capture the spawner's stack.
+/// may name a detached body, whose clause would capture the spawner's stack. They share the
+/// handlers' variables.
 pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
-    clone_frames(list)
+    copied_frames(list, true)
         .into_iter()
         .map(|f| {
             // The `handle` a copy stands for may be over before the task raises, so a raise the task
@@ -536,6 +661,9 @@ pub(crate) fn drop_frame(f: HandlerFrame) {
     }
     if f.ret != 0 {
         heap::dec(f.ret);
+    }
+    if let Some(v) = f.vars {
+        release_vars(v);
     }
 }
 
@@ -664,6 +792,8 @@ pub struct Ctx {
     pub(crate) aborting: Option<Aborting>,
     /// The value a clause handed to `resume` in tail position, read back when the clause returns.
     resumed: Option<Word>,
+    /// How many `handle`s this context has installed, which names the next one's frame.
+    handlers_made: u64,
     /// The heap and poison site of the entry this one began inside, put back when it ends.
     outer: (*mut Heap, *const i64),
     /// What that entry's unit answered of its types' keys, put back with them.
@@ -721,9 +851,49 @@ impl Ctx {
             unwind: None,
             aborting: None,
             resumed: None,
+            handlers_made: 0,
             outer: (std::ptr::null_mut(), std::ptr::null()),
             outer_instances: None,
         }
+    }
+
+    /// A name for the `handle` being installed, which no other in this context shares.
+    pub(crate) fn next_handler(&mut self) -> u64 {
+        self.handlers_made += 1;
+        self.handlers_made
+    }
+
+    /// `call`, made while the handler's variables `held` are the clause's: a clause or the `return`
+    /// clause of a handler that has some. Takes `held`.
+    pub(crate) fn holding<T>(
+        ctx: *mut Ctx,
+        held: Option<(u64, SharedVars)>,
+        call: impl FnOnce() -> T,
+    ) -> T {
+        let Some(h) = held else {
+            return call();
+        };
+        let stack = unsafe { &*ctx }.current;
+        unsafe { &mut *ctx }.stacks[stack].held.push(h);
+        let r = call();
+        if let Some((_, v)) = unsafe { &mut *ctx }.stacks[stack].held.pop() {
+            release_vars(v);
+        }
+        r
+    }
+
+    /// The variables of the running clause of `handler`: on this stack, or on one this stack was
+    /// entered from, as a body or a task opened inside the clause runs.
+    pub(crate) fn held_by(&self, handler: u64) -> Option<SharedVars> {
+        let mut at = Some(self.current);
+        for _ in 0..self.stacks.len() {
+            let frames = &self.stacks[at?];
+            if let Some((_, v)) = frames.held.iter().rev().find(|(h, _)| *h == handler) {
+                return Some(Rc::clone(v));
+            }
+            at = frames.entered_from.or(frames.parent);
+        }
+        None
     }
 
     /// This context as what reads its unit's values asks it, while it runs on this thread; `None`
@@ -861,6 +1031,7 @@ impl Ctx {
         self.trail = ply_eval::region::Trail::new(self.seed.clone());
         self.record = None;
         self.entered_sims = 0;
+        self.handlers_made = 0;
         self.unwind = None;
         self.aborting = None;
         self.resumed = None;
@@ -2470,6 +2641,18 @@ fn hold_take(ctx: &mut Ctx, slot: Slot) -> Result<Word, Diagnostic> {
     Ok(current.into_word())
 }
 
+/// A handler's variables read where no clause of a handler that has some runs: the lowering of
+/// `var` writes the reads inside clauses alone, so this is Ply's defect.
+#[cold]
+#[inline(never)]
+fn no_handler_vars() -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "a handler's variable was read where no clause of its handler runs",
+    )
+    .note("this is Ply's fault, not the program's")
+}
+
 /// The builtins answered over native words; `None` answers the call over values instead.
 fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> {
     match (which, args) {
@@ -2540,6 +2723,41 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             };
             heap::dec(*h);
             Some(answer)
+        }
+        (Builtin::HandlerInit, [i, w]) => {
+            let at = heap::imm_value(*i) as usize;
+            let c = ctx.current;
+            let Some(f) = ctx.stacks[c].list.last_mut() else {
+                heap::dec(*w);
+                return Some(ctx.fail(no_handler_vars()));
+            };
+            match &f.vars {
+                Some(v) => v.borrow_mut().set(at, *w),
+                None => {
+                    let mut vars = HandlerVars(Vec::new());
+                    vars.set(at, *w);
+                    f.vars = Some(shared(vars));
+                }
+            }
+            Some(heap::unit())
+        }
+        (Builtin::HandlerVar, [i]) => {
+            let at = heap::imm_value(*i) as usize;
+            let Some((_, v)) = ctx.stacks[ctx.current].held.last() else {
+                return Some(ctx.fail(no_handler_vars()));
+            };
+            let w = v.borrow().0.get(at).copied().unwrap_or(heap::unit());
+            heap::inc(w);
+            Some(w)
+        }
+        (Builtin::HandlerSet, [i, w]) => {
+            let at = heap::imm_value(*i) as usize;
+            let Some((_, v)) = ctx.stacks[ctx.current].held.last() else {
+                heap::dec(*w);
+                return Some(ctx.fail(no_handler_vars()));
+            };
+            v.borrow_mut().set(at, *w);
+            Some(heap::unit())
         }
         (Builtin::HoldTake, [h]) => {
             let slot = cell_of(*h)?;
@@ -3527,15 +3745,16 @@ fn bytes_position(ctx: &mut Ctx, b: Word, from: Word, p: Word) -> Word {
 
 /// `Bytes::position`'s search, or `None` with the context failed. Reads all three.
 fn first_accepted(ctx: &mut Ctx, b: Word, from: Word, p: Word) -> Option<Option<usize>> {
-    // Only a payload too long for a native object stays bridged.
-    let bridged = (heap::kind(b) != KIND_BYTES).then(|| ctx.value(b));
-    let bytes: &[u8] = match &bridged {
-        None => unsafe { bytes_of(obj(b)) },
+    // Only a payload too long for a native object stays bridged; either is read in place, so
+    // nothing here owns memory across the predicate's calls.
+    let bridged = (heap::kind(b) == KIND_BRIDGE).then(|| unsafe { heap::bridged(obj(b)) });
+    let bytes: &[u8] = match bridged {
+        None if heap::kind(b) == KIND_BYTES => unsafe { bytes_of(obj(b)) },
         Some(Value::Bytes(bytes)) => bytes,
-        Some(other) => {
+        _ => {
             let d = error(format!(
                 "`Bytes::position` needs Bytes, and this is {}",
-                other.type_name()
+                ctx.type_name(b)
             ));
             ctx.fail(d);
             return None;
@@ -3617,6 +3836,7 @@ pub unsafe extern "C" fn rt_handle_push(
     let clauses = clauses_of(c, clauses, n);
     let regions = c.region_depth();
     let fuel = c.fuel;
+    let handler = c.next_handler();
     let frames = c.frames();
     frames.push(HandlerFrame {
         clauses,
@@ -3625,6 +3845,8 @@ pub unsafe extern "C" fn rt_handle_push(
         detached: None,
         regions,
         fuel,
+        handler,
+        vars: None,
     });
     (frames.len() - 1) as i64
 }
@@ -3780,7 +4002,7 @@ pub unsafe extern "C" fn rt_perform(
                     }
                     // Moved in: a local owning memory across the switch is freed once per restore.
                     return unsafe {
-                        crate::detached::stop(ctx, id, closure, &bound, (effect, op, resource))
+                        crate::detached::stop(ctx, id, closure, bound, (effect, op, resource))
                     };
                 }
                 found = Some((stack, i, cl.closure, cl.resumes != 0, cl.binds_label));
@@ -3824,13 +4046,16 @@ pub unsafe extern "C" fn rt_perform(
         call_args.push(c.word(&Value::Str(Arc::from(label.as_str()))));
     }
     // The clause runs outside its handler: that frame and all above it are hidden until it returns.
+    let held = c.stacks[stack].list[depth].held();
     let hidden = hide_above(c, stack, depth);
     if resumes {
         let k = resume_token(c, stack, depth);
         call_args.push(k);
         c.resumed = None;
     }
-    let r = call_value(ctx, closure, &call_args);
+    let owning = Owning::on(ctx);
+    let r = Ctx::holding(ctx, held, || call_value(ctx, closure, &call_args));
+    drop(owning);
     let c = unsafe { &mut *ctx };
     restore_hidden(c, hidden);
     if c.failed != 0 {
@@ -3960,9 +4185,12 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
         let owner = c.owner();
         c.cells.close_regions_above(owner, f.regions);
         let closure = f.take_clause(a.clause);
+        let held = f.held();
         drop_frame(f);
         // The clause runs outside its `handle`, which is over: its value is the `handle`'s.
-        let r = call_value(ctx, closure, &a.args);
+        let owning = Owning::on(ctx);
+        let r = Ctx::holding(ctx, held, || call_value(ctx, closure, &a.args));
+        drop(owning);
         heap::dec(closure);
         return r;
     }
@@ -3993,7 +4221,8 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
         return value;
     };
     let r = if f.ret != 0 {
-        call_value(ctx, f.ret, &[value])
+        let _owning = Owning::on(ctx);
+        Ctx::holding(ctx, f.held(), || call_value(ctx, f.ret, &[value]))
     } else {
         value
     };
@@ -4039,7 +4268,8 @@ pub unsafe extern "C" fn rt_dec_shared(_ctx: *mut Ctx, w: i64) {
 
 /// `parallel { .. }`: the `n` nullary closures at `slots`, each answer written over its closure.
 pub unsafe extern "C" fn rt_parallel(ctx: *mut Ctx, slots: i64, n: i64) {
-    unsafe { crate::parallel::run(ctx, slots as usize as *mut Word, n as usize, None) }
+    let allowed = unsafe { &*ctx }.runs_branches_at_once(None);
+    unsafe { crate::parallel::run(ctx, slots as usize as *mut Word, n as usize, allowed) }
 }
 
 /// A `parallel` block whose site knows what its branches may perform: `reach` holds `count` pairs
@@ -4062,7 +4292,10 @@ pub unsafe extern "C" fn rt_parallel_past(
             })
             .collect()
     };
-    unsafe { crate::parallel::run(ctx, slots as usize as *mut Word, n as usize, Some(&reach)) }
+    // Decided and let go before a branch runs, which may stop a detached body on this stack.
+    let allowed = unsafe { &*ctx }.runs_branches_at_once(Some(&reach));
+    drop(reach);
+    unsafe { crate::parallel::run(ctx, slots as usize as *mut Word, n as usize, allowed) }
 }
 
 /// What a computation cost: the calls it made, the objects it allocated and the bytes they took.
@@ -4277,6 +4510,7 @@ fn applied(ctx: *mut Ctx, callee: Word, args: &[Word], give: bool) -> i64 {
             // SAFETY: `code` is a finalized address from `Tables::functions`, which `Bodies`
             // keeps alive as long as this context, with the signature every compiled function has.
             let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(code) };
+            let _owning = (!inline).then(|| Owning::on(ctx));
             unsafe { f(ctx, ptr) }
         }
         KIND_BRIDGE => {
@@ -4361,6 +4595,7 @@ pub unsafe extern "C" fn rt_map(ctx: *mut Ctx, list: i64, f: i64) -> i64 {
     };
     let items = list::to_vec(items);
     let mut out = Vec::with_capacity(items.len());
+    let _owning = Owning::on(ctx);
     for x in items {
         heap::inc(x);
         let r = call_value(ctx, f, &[x]);
@@ -4385,6 +4620,7 @@ pub unsafe extern "C" fn rt_filter(ctx: *mut Ctx, list: i64, p: i64) -> i64 {
     };
     let items = list::to_vec(items);
     let mut kept = Vec::new();
+    let _owning = Owning::on(ctx);
     for x in items {
         heap::inc(x);
         let r = call_value(ctx, p, &[x]);
@@ -4445,6 +4681,7 @@ pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64)
     if heap::kind(map) == KIND_MAP {
         let o = obj(map);
         let mut acc = init;
+        let _owning = Owning::on(ctx);
         for (k, v) in map::to_vec(o) {
             heap::inc(k);
             heap::inc(v);
@@ -4470,6 +4707,7 @@ pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let mut acc = init;
+    let _owning = Owning::on(ctx);
     for (k, v) in &entries {
         let c = unsafe { &mut *ctx };
         let kw = c.word(k);
@@ -4596,7 +4834,9 @@ fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
     let raising = c.aborting.take();
     c.failed = 0;
     let entered = crate::simulate::shield(c, Shield::Release);
+    let owning = raising.is_some().then(|| Owning::on(ctx));
     let released = call_value(ctx, release, &[held]);
+    drop(owning);
     heap::dec(release);
     let c = unsafe { &mut *ctx };
     let cancelled = crate::simulate::unshield(c, entered);

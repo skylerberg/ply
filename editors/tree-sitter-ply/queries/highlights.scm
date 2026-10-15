@@ -55,6 +55,7 @@
   "raise"
   "resume"
   "return"
+  "var"
   "for"
   "in"
   "by"

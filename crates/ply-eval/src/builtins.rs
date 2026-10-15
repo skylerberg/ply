@@ -327,6 +327,13 @@ builtins! { $
     /// `Secret::rsa_jwk(n, e, [d, p, q, dp, dq, qi])`: the PKCS #1 document an RSA JSON Web Key's
     /// numbers make, each private one its base64url text sealed; `None` for numbers that are no key.
     SecretRsaJwk = "Secret::rsa_jwk", 3, raises;
+    /// Variable `i` of the `handle` whose body starts, given its first value. No source can spell
+    /// these three; the lowering of a handler's `var`s writes them.
+    HandlerInit = "?handler_init", 2, ends;
+    /// Variable `i` of the handler whose clause runs.
+    HandlerVar = "?handler_var", 1, ends;
+    /// Variable `i` of the handler whose clause runs, given a new value.
+    HandlerSet = "?handler_set", 2, ends;
 }
 
 impl Builtin {
@@ -547,7 +554,10 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::HoldGet
         | Builtin::HoldTake
         | Builtin::HoldBracket
-        | Builtin::HoldPut => Err(answered_by_the_backend(b, span)),
+        | Builtin::HoldPut
+        | Builtin::HandlerInit
+        | Builtin::HandlerVar
+        | Builtin::HandlerSet => Err(answered_by_the_backend(b, span)),
 
         Builtin::Range => {
             let lo = args[0].as_int(span, "`range`")?;

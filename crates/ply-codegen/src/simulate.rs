@@ -794,7 +794,18 @@ pub fn seeded_region(c: &Ctx) -> Option<Span> {
 
 pub fn cell_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Access> {
     use ply_eval::{Builtin, Mode};
+    let var = |mode: Mode| {
+        let (handler, _) = ctx.stacks[ctx.current].held.last()?;
+        let at = u32::try_from(crate::heap::imm_value(*args.first()?)).ok()?;
+        Some(Access::Var {
+            handler: *handler,
+            at,
+            mode,
+        })
+    };
     let mode = match b {
+        Builtin::HandlerVar => return var(Mode::Read),
+        Builtin::HandlerSet => return var(Mode::Write),
         Builtin::CellGet | Builtin::HoldGet => Mode::Read,
         Builtin::CellSet | Builtin::CellUpdate | Builtin::HoldTake | Builtin::HoldPut => {
             Mode::Write

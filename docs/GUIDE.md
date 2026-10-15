@@ -1742,7 +1742,8 @@ test "expiry is decided against the deadline, not the wall clock" {
 ```
 
 A clause is `effect.op[resource](params) -> body`; an optional
-`return x -> body` clause maps the result. A clause's label may be `[*]`, which
+`return x -> body` clause maps the result. A handler may hold variables its
+clauses assign (§6.9). A clause's label may be `[*]`, which
 answers the operation on **every** label: `log.note[*](line) -> …` discharges
 `log.note` wherever it is performed, `log.note[users]` and `log.note[orders]`
 alike. This is what lets a library serve an effect whose atoms are
@@ -1799,7 +1800,12 @@ by its type.
 In `amb.flip[coin]() resume k -> k(true) + k(false)`, `resume k` binds the
 continuation; the clause then has the `handle`'s type and may call `k` any
 number of times. Without `resume`, a clause's value returns to the perform site,
-except a clause for a `raise` operation (§6.8).
+except a clause for a `raise` operation (§6.8). A continuation captured while
+the runtime holds memory of its own around a call into the program resumes
+once, and a second resumption ends the run with `E0502`: inside a clause or a
+`return` clause of a `handle` the body opened, a `bracket`'s release during a
+raise, a callback of `List::map`, `List::filter` or `Map::fold`, or a call
+given more than 64 words of arguments and captures.
 
 A clause that binds `resume` and never calls it abandons the body where it stood,
 and `bracket(acquire, release, body)` is how a body that holds something lets it
@@ -1954,6 +1960,52 @@ its raise goes to the task's own `handle`s and then to those around its
 `simulate` region, never to the copies its spawn inherited (§9); outside
 `simulate` it ends the run. A `cell_update` whose function raised leaves the
 cell as it was.
+
+### 6.9 Handler variables
+
+```ply
+effect tally {
+  write add(n: Int) -> Unit
+}
+
+fn total(xs: List<Int>) -> Int =
+  handle {
+    xs.fold((), |u: Unit, x: Int| tally.add(x))
+  } with {
+    var sum = 0,
+    tally.add(n) -> {
+      sum = sum + n;
+    },
+    return u -> sum,
+  }
+```
+
+A handler holds state in variables: `var name = init`, or `var name: T = init`,
+open its `with` block, before any clause. The initializers run in order when
+the `handle` starts, before its body and outside the handler: an operation one
+performs goes to the handlers around the `handle`, and its row is the
+`handle`'s. Each initializer sees the variables above it; two of one name are
+`E0105`. The variables are in scope in every clause and in `return`, never in
+the body, which reaches them only through the operations its row names.
+
+A clause gives a variable a new value with `name = value;`, anywhere in its
+blocks and in the branches of its `if`s and `match`es. An assignment inside a
+lambda, or inside the body of a nested `handle`, `simulate`, `parallel`, `try`,
+`with_cell` or `with_hold`, is `E0315`, since what runs there may run after
+the clause has returned; so is one in `return`, after which the variables are
+gone. A lambda reads the value a variable had where the lambda was made.
+Assigning a name that is not a variable of the handler whose clause it is in, a
+clause's parameter or a `let` that hides one included, is `E0314`: in a clause
+of a nested `handle`, only that handler's variables are assignable.
+
+A clause that does not bind `resume` hands the body back the values it ends
+with. One that binds `resume k` continues the body, each time it calls `k`,
+with the values it holds there, and what that resumption does to them stays
+in it unless what it answers carries them out, as `return` can. Where a
+handler stands decides what a resumption sees: one inside the continuation a
+clause resumes twice starts each resumption from the values it had where the
+continuation was captured, and one outside it is shared by every resumption.
+The tasks spawned under a handler share its variables (§9).
 
 ## 7. Cells and regions
 
@@ -3581,6 +3633,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0311` | `try` whose body's row names no `raise` operation to answer |
 | `E0312` | `try` whose body's row names several `raise` operations, and it names none |
 | `E0313` | `try` naming an operation that is not a `raise` |
+| `E0314` | assignment to a name that is not a variable of the handler whose clause it is in |
+| `E0315` | handler variable assigned in a lambda, a nested body or `return` |
 | `E0330` | `with_hold` naming a region already open, or a `with_cell` naming a `with_hold`'s |
 | `E0331` | hold read or let go after its region released what it held |
 | `E0412` | nondeterministic effect in a deterministic test |
