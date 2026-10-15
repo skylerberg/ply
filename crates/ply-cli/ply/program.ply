@@ -12,8 +12,8 @@ import std.time (time)
 import compiler.front (Refused, Analysed, Analysis, Pulled, Rows, DefInterface, Shipping,
                        ShippedView, Within, View, Frame, TableReads, Outline, Outlined, OFn,
                        FnOutline, ModuleShape, analyse_pulling_std_with, answered_load, dump_of,
-                       view_dump, view_of, no_reads, embeds_now, no_rows, pins_pulling, rows_of,
-                       KnownDefRow, KnownTestRow, statement_modules)
+                       view_dump, view_of, no_reads, no_rows, pins_pulling, rows_of, KnownDefRow,
+                       KnownTestRow, statement_modules)
 import compiler.pkg (PackageSources, Pinned, Supplied)
 import interfaces
 import compiler.hash
@@ -21,7 +21,6 @@ import compiler.hash (HashOutput, NodeRef, TheFn, Which, Fixing, hex, no_fixing)
 import std.hash (blake3)
 import compiler.items (Item, IFn)
 import compiler.infer (DefInfo, TestInfo, LawInfo, Location)
-import compiler.embed (EmbedReader)
 import compiler.termination (Ends, unknown_summary)
 import compiler.resolve (Source, ParsedModule, Diag, Label, error_at, qualify)
 import compiler.types (TyCon, TyFn, tables_joined)
@@ -64,6 +63,8 @@ pub type Program = {
   fixed: Fixing,
   pkgs: PackageSources,
   embeds: List<Embed>,
+  /// The bytes of each file the program embeds, by digest: what its emission writes them out as.
+  inputs: Map<Bytes, Bytes>,
   /// The shipped modules the load read, which a splice of it pulls again.
   shipping: Shipping,
   /// Whether a shipped module was read only for what the program reaches, rather than whole.
@@ -131,6 +132,7 @@ fn broken(project: Project, shipping: Shipping, places: List<Place>, diags: List
     fixed: no_fixing(),
     pkgs: pkgs_of(project),
     embeds: [],
+    inputs: Map::new(),
     shipping: shipping,
     reached: true,
     viewed: [],
@@ -154,6 +156,7 @@ pub fn no_program() -> Program =
     fixed: no_fixing(),
     pkgs: { root: b"", manifest: None, supplied: [] },
     embeds: [],
+    inputs: Map::new(),
     shipping: { read: [], unread: [], data: [], asked: [], pulls: [] },
     reached: true,
     viewed: [],
@@ -275,6 +278,7 @@ fn analysed(
   answers: List<Answered>,
   pulled: List<Bytes>,
   embeds: List<Embed>,
+  inputs: Map<Bytes, Bytes>,
   reached: Bool,
   fixed: Fixing,
   std: Bool,
@@ -317,6 +321,7 @@ fn analysed(
     fixed: fixed,
     pkgs: pkgs,
     embeds: embeds,
+    inputs: inputs,
     shipping: shipping,
     reached: reached,
     viewed: loaded.views,
@@ -480,7 +485,13 @@ fn assembled_from(
         }
       });
       broken(project, shipping, own.modules.concat(pulled).concat(own.manifests), diags)
-    } else { analysed(project, shipping, answers, q.pulled, q.embeds, reached, q.fixing, std) }
+    } else {
+      match q.inputs {
+        Err(moved) -> broken(project, shipping, own.modules.concat(own.manifests), moved),
+        Ok(inputs) ->
+          analysed(project, shipping, answers, q.pulled, q.embeds, inputs, reached, q.fixing, std),
+      }
+    }
   }
 }
 
@@ -684,6 +695,7 @@ pub fn front_of(
   {
     dump: view_dump({ ..view, frame: { ..view.frame, warnings: timed.program.diags } }, within),
     files: placed_sources(timed.program, view.frame),
+    inputs: timed.program.inputs,
     read_ms: timed.read_ms,
     front_ms: timed.front_ms,
     file_ms: timed.file_ms,
@@ -695,7 +707,15 @@ pub fn front_of(
 /// says about what they were given, so nothing loads, and the record exists only because the
 /// effect takes one.
 pub fn no_front() -> LoadedAnalysis / {abort.raise} =
-  { dump: dump_of(Refused([])), files: [], read_ms: 0, front_ms: 0, file_ms: 0, cached: false }
+  {
+    dump: dump_of(Refused([])),
+    files: [],
+    inputs: Map::new(),
+    read_ms: 0,
+    front_ms: 0,
+    file_ms: 0,
+    cached: false,
+  }
 
 /// The same load, with the readings a `--explain` run prints: what the walk, the shipped modules and
 /// the cache read cost, what the front end cost over them, and what filing its answer cost.

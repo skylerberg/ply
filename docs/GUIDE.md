@@ -661,12 +661,16 @@ fn fixtures() -> List<{ name: String, bytes: Bytes }> = embed_dir("fixtures")
 a directory by its path below it (`a/b.txt`), in that order; nothing under a
 name starting with `.` is read. The path is a string literal (`E0147`), read
 relative to the module's own file when the program is loaded, and the call is
-written out as what was read before anything hashes or checks the module. The
-bytes are therefore part of the definition's hash: a test reading an embedded
-file reruns exactly when the file changes, and is cached while it does not. A
-path that does not exist, a directory handed to `embed`, a file handed to
-`embed_dir`, or a file that cannot be read is `E0146`, which refuses the load. A
-module that declares or imports its own `embed` or `embed_dir` calls that one.
+written out as the digest and size of what was read before anything hashes or
+checks the module. The bytes are therefore part of the definition's hash: a test
+reading an embedded file reruns exactly when the file changes, and is cached
+while it does not. Where the file is is no part of it, and nor is a byte string
+literal of the same bytes. What a check keeps holds the digest alone; a load reads
+each file again to emit the program. A path that does not exist, a directory
+handed to `embed`, a file handed to `embed_dir`, a file that cannot be read, or
+one that reads otherwise when the program is emitted than when it was checked is
+`E0146`, which refuses the load. A module that declares or imports its own
+`embed` or `embed_dir` calls that one.
 
 ### 3.5 Constants a build keeps
 
@@ -3652,7 +3656,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0143` | a registry dependency no published version satisfies |
 | `E0144` | a publish or a yank the registry refused |
 | `E0145` | a package or a version no registry takes |
-| `E0146` | an embed whose file or directory could not be read |
+| `E0146` | an embed whose file or directory could not be read, or no longer reads as its check read it |
 | `E0147` | an embed whose path is not a string literal |
 | `E0148` | a `returns` clause the body does not keep |
 | `E0149` | a dependency's published interface that does not re-derive from its source |

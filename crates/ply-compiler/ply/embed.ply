@@ -1,25 +1,45 @@
 //! `embed("path")` and `embed_dir("path")`: a file's bytes, or a directory's files, as constants a
 //! definition's hash covers. The driver reads what a module asks for, relative to the module's own
-//! file, and the front end writes each call out as that literal before anything hashes it, so a
-//! changed file is a changed definition.
+//! file, and the front end writes each call out as a literal of the file's digest and size before
+//! anything hashes it, so a changed file is a changed definition and no answer holds its bytes:
+//! only a program's emission reads them again, by digest.
 
 import parsing (Span, Ident, ParseDiag, error_at)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
               EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign, HandlerVar, Param,
               MatchArm, HandleClause, ReturnClause, RecField, NamedArg, ETagged, Hole)
-import patterns (LStr, LBytes)
+import patterns (LStr, LEmbedded)
 import items (Module, Item, IFn, ITest, ILaw, ISchema, ImportDecl, INames, SpecClause, item_owner)
 import std.list
 import std.bin
+import std.hash (blake3)
 
-/// One file an embed read: its name in the directory, and empty for `embed`'s one file.
-pub type EmbedFile = { name: Bytes, bytes: Bytes }
+/// One file an embed read, as a check and every answer know it: its name in the directory (empty
+/// for `embed`'s one file), and the blake3 digest and the size of its bytes.
+pub type EmbedFile = { name: Bytes, digest: Bytes, size: Int }
+
+/// What an embed read, each file known by its digest, or why nothing could be read. No constructor
+/// of the compiler's own is in it, so it reads the same in every program that hands it on.
+pub type EmbedRead = Result<List<EmbedFile>, Bytes>
+
+/// One file a driver read for an embed, its bytes in hand.
+pub type EmbedBytes = { name: Bytes, bytes: Bytes }
 
 /// What a driver read for one embed: `embed`'s file as the one entry, `embed_dir`'s files in name
-/// order, or why it could not. No constructor of the compiler's own is in it, so it reads the same in
-/// every program that hands it on.
-pub type EmbedRead = Result<List<EmbedFile>, Bytes>
+/// order, or why it could not.
+pub type BytesRead = Result<List<EmbedBytes>, Bytes>
+
+/// The file `name` holding `bytes`, as an answer knows it.
+pub fn embed_file(name: Bytes, bytes: Bytes) -> EmbedFile =
+  { name: name, digest: blake3(bytes), size: bytes.len() }
+
+/// `read` with each file known by its digest.
+pub fn known(read: BytesRead) -> EmbedRead =
+  match read {
+    Ok(files) -> Ok(files.map(|f: EmbedBytes| embed_file(f.name, f.bytes))),
+    Err(why) -> Err(why),
+  }
 
 /// One embed a module asks for: its path as written, and whether it names a directory.
 pub type EmbedWant = { path: Bytes, dir: Bool }
@@ -29,9 +49,6 @@ derive bin for EmbedWant
 /// The key a read is handed under.
 pub fn embed_key(want: EmbedWant) -> Bytes =
   Bytes::concat(if want.dir { b"dir:" } else { b"file:" }, want.path)
-
-/// What a module embeds as it reads now, asked by the module's name in the program and the embed's key.
-pub type EmbedReader = (Bytes, Bytes) -> EmbedRead / {abort.raise}
 
 pub fn want_of_key(key: Bytes) -> EmbedWant / {abort.raise} =
   if key.starts_with(b"dir:") { { path: key.slice(4, key.len()), dir: true } }
@@ -211,7 +228,11 @@ fn written(state: EmbedState, call: Call) -> { state: EmbedState, expr: Expr } =
       Some(Err(why)) -> unread(why),
       Some(Ok(files)) -> if !call.want.dir {
         match files {
-          [file, ..] -> { state: state, expr: ELit({ span: call.span, lit: LBytes(file.bytes) }) },
+          [file, ..] ->
+            {
+              state: state,
+              expr: ELit({ span: call.span, lit: LEmbedded(file.digest, file.size) }),
+            },
           [] -> unread(b"nothing was read for it"),
         }
       } else {
@@ -229,7 +250,7 @@ fn written(state: EmbedState, call: Call) -> { state: EmbedState, expr: Expr } =
                   },
                   {
                     name: { name: b"bytes", span: call.span },
-                    value: ELit({ span: call.span, lit: LBytes(file.bytes) }),
+                    value: ELit({ span: call.span, lit: LEmbedded(file.digest, file.size) }),
                   },
                 ],
               })),
