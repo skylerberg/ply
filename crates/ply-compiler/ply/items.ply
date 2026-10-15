@@ -159,8 +159,13 @@ pub type SchemaDef = {
 
 pub type VariantDef = { name: Ident, fields: List<TypeExpr>, doc: Option<Doc>, span: Span }
 
-/// `TDNominal` holds the record type written after `new`.
-pub type TypeDefBody = | TDAlias(TypeExpr) | TDSum(List<VariantDef>) | TDNominal(TypeExpr)
+/// `TDNominal` holds the record type written after `new`. `TDExtern` is an `extern type`: one the
+/// toolchain lays out, with no constructor or field a program can name.
+pub type TypeDefBody =
+  | TDAlias(TypeExpr)
+  | TDSum(List<VariantDef>)
+  | TDNominal(TypeExpr)
+  | TDExtern
 
 /// A field of the record a `type` declares, with the doc above it.
 pub type FieldDoc = { name: Bytes, doc: Doc }
@@ -461,9 +466,11 @@ pub fn at_numeric_start(input: Input, parser: Parser) -> Bool =
   at_ident_text(input, parser, b"numeric")
     && (match token_kind_at(input, parser, 1) { Identifier(n) -> n == b"for", _ -> false })
 
-/// `extern` is contextual: it opens an item only when `fn` follows.
+/// `extern` is contextual: it opens an item only when `fn` or `type` follows.
 pub fn at_extern_start(input: Input, parser: Parser) -> Bool =
-  at_ident_text(input, parser, b"extern") && token_kind_at(input, parser, 1) == keyword_fn()
+  at_ident_text(input, parser, b"extern")
+    && (token_kind_at(input, parser, 1) == keyword_fn()
+    || token_kind_at(input, parser, 1) == keyword_type())
 
 /// `law` is contextual: it opens an item only before a quoted label or `/host`, so `fn law(..)` keeps its meaning.
 pub fn at_law_start(input: Input, parser: Parser) -> Bool =
@@ -1470,6 +1477,31 @@ fn opaque_alias(parser: Parser, opaque: Option<Span>, body: TypeDefBody, name: I
     _ -> parser,
   }
 
+/// An `extern type`, entered at `extern`: its name and parameters, and nothing after them.
+fn extern_type_def(
+  input: Input,
+  parser: Parser,
+  vis: Vis,
+) -> Result<Parsed<TypeDef>, Parser> / {abort.raise} = {
+  let st = advance(input, parser);
+  let { parser, .. } = expect(input, st.parser, keyword_type(), b"`type` after `extern`")?;
+  let { parser, node: name } = expect_ident(input, parser, b"a type name after `extern type`")?;
+  let { parser, node: g } = opt_generics(input, parser)?;
+  Ok({
+    parser: parser,
+    node: {
+      vis: vis,
+      opaque: None,
+      name: name,
+      generics: g,
+      body: TDExtern,
+      doc: None,
+      field_docs: [],
+      span: span_to(st.node, previous_span(input, parser)),
+    },
+  })
+}
+
 /// A `type`, entered at `opaque` where that is written before it.
 pub fn type_def(
   input: Input,
@@ -1508,6 +1540,7 @@ fn field_docs(input: Input, body: TypeDefBody) -> List<FieldDoc> / {abort.raise}
     TDAlias(t) -> record_docs(input, t),
     TDNominal(t) -> record_docs(input, t),
     TDSum(_) -> [],
+    TDExtern -> [],
   }
 
 fn record_docs(input: Input, t: TypeExpr) -> List<FieldDoc> / {abort.raise} =
@@ -2102,8 +2135,13 @@ pub fn item_at(
     )?;
     Ok({ parser: d.parser, node: IDerive(d.node) })
   } else if at_extern_start(input, parser) {
-    let d = extern_def(input, parser, vis)?;
-    Ok({ parser: d.parser, node: IExtern(d.node) })
+    if token_kind_at(input, parser, 1) == keyword_type() {
+      let d = extern_type_def(input, parser, vis)?;
+      Ok({ parser: d.parser, node: IType(d.node) })
+    } else {
+      let d = extern_def(input, parser, vis)?;
+      Ok({ parser: d.parser, node: IExtern(d.node) })
+    }
   } else if at_instance_start(input, parser) {
     let d = instance_def(
       input,
@@ -2852,6 +2890,7 @@ fn item_docs(item: Item) -> List<Doc> = {
           match v.doc { Some(x) -> acc.push(x), None -> acc }),
       TDAlias(_) -> d.field_docs.map(|f: FieldDoc| f.doc),
       TDNominal(_) -> d.field_docs.map(|f: FieldDoc| f.doc),
+      TDExtern -> [],
     },
     IEffect(d) ->
       d.ops.fold([], |acc: List<Doc>, o: OpDef|
@@ -3036,6 +3075,7 @@ pub fn dump_type_body(b: TypeDefBody) -> Bytes / {abort.raise} =
     TDAlias(t) -> dump_word(b"alias").concat(dump_ty(t)),
     TDSum(vs) -> dump_word(b"sum").concat(dump_list(vs, dump_variant)),
     TDNominal(t) -> dump_word(b"new").concat(dump_ty(t)),
+    TDExtern -> dump_word(b"extern"),
   }
 
 /// Dumped only where it is written, so a declaration without it dumps as it always has.
@@ -3494,6 +3534,23 @@ test "a test over cases names its case's type and its table, and only a quoted l
 
 test "`derive` needs a name after it before it opens an item" {
   assert_eq(dump(b"derive + 1\n"), "#0;#0;#1;!E0001:0:6:1:0;=0:6:1;")
+}
+
+test "an `extern type` is a type with parameters and no body, `pub` where it is written so" {
+  let r = parse(b"pub extern type Node<a>\nextern type Hidden\n");
+  assert_eq(r.parser.diags.len(), 0);
+  match r.node.items {
+    [IType(d), IType(h)] -> {
+      assert(match d.body { TDExtern -> true, _ -> false });
+      assert_eq(d.vis, VPub);
+      assert_eq(d.name.name, b"Node");
+      assert_eq(d.generics.types.map(|i: Ident| i.name), [b"a"]);
+      assert_eq(d.span, span_between(4, 23));
+      assert_eq(h.vis, VPriv)
+    },
+    _ -> panic("two `extern type`s"),
+  };
+  assert(parse(b"extern type Node = Int\n").parser.diags.len() > 0)
 }
 
 test "an `extern fn` is a declaration: generics, parameters, an answer, a row and a `where`, and no body" {

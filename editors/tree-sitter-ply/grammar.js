@@ -73,6 +73,7 @@ module.exports = grammar({
     _item: $ => choice(
       $.function_definition,
       $.extern_function,
+      $.extern_type,
       $.type_definition,
       $.effect_definition,
       $.effect_set_definition,
@@ -175,6 +176,13 @@ module.exports = grammar({
       optional($.generic_parameters),
       '=',
       choice($.new_record_body, $.sum_type_body, $.alias_type),
+    ),
+
+    extern_type: $ => seq(
+      optional('pub'),
+      'extern', 'type',
+      field('name', $.identifier),
+      optional($.generic_parameters),
     ),
 
     new_record_body: $ => seq('new', $.record_type),

@@ -87,6 +87,7 @@
 (extern_function name: (identifier) @function)
 
 (type_definition name: (identifier) @type)
+(extern_type name: (identifier) @type)
 (effect_definition name: (identifier) @type)
 (effect_set_definition name: (identifier) @type)
 (law_schema_declaration name: (identifier) @function)
