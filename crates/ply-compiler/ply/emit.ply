@@ -45,6 +45,12 @@ import embed (EmbedAt, embed_tables, rewritten)
 import patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
 import std.bytes (ascii_of_int)
 import std.math (pow)
+import std.prelude_source
+import layout (layouts, intrinsics, intrinsic_named, Intrinsic, OfList, OfMap, ListOp, ListStart,
+               TailLen, ListRoot, TailAt, NodeLen, LeafAt, KidAt, TailPush, TailSet, LeafSet,
+               RootSwap, KidSwap, TailStart, Spill, NewBranch, MapOp, MapRoot, NodeCount, MapHeight,
+               NodeKey, NodeValue, NodeKid, KidMax, KidSize, NewLeaf, NewMapBranch, PairPut,
+               PairSet, PairTake, LeafCut, BranchCut, KidOut, KidBack, KidPut, KidDrop, MapSwap)
 
 /// `KBoxed` is a tagged word; `KInt` is the untagged 64 bits inside one.
 pub type Kind =
@@ -5655,6 +5661,742 @@ fn width_builtin(
   }
 }
 
+// --- Externs written in place -----------------------------------------------------
+
+/// What the emitter writes in place of a call of `name` from this module: an extern the module, or
+/// one it imports, declares under a program-wide name `intrinsics` lists. No definition has such a
+/// name, since its module declares the extern.
+fn in_place_at(emitter: Emitter, name: Bytes) -> Option<Intrinsic> =
+  intrinsic_named(match qualified(name) {
+    Some(q) -> match module_import(emitter.imports, q.binder) {
+      Some(imp) -> qualify(imp.module, q.name),
+      None -> qualify(emitter.module, name),
+    },
+    None -> match from_import(emitter.imports, name) {
+      Some(imp) -> qualify(imp.module, name),
+      None -> qualify(emitter.module, name),
+    },
+  })
+
+/// A call of an extern the emitter writes in place, over what its arguments evaluated to, at the
+/// types the checker settled the call at.
+fn written_in_place(
+  emitter: Emitter,
+  op: Intrinsic,
+  vals: List<CValue>,
+  settled: Option<Typed>,
+) -> WithValue = {
+  let tys = match settled { Some(t) -> t.args, None -> [] };
+  match op {
+    OfList(o) -> list_node_op(emitter, o, vals, item_type(tys.at(0))),
+    OfMap(o) -> map_node_op(emitter, o, vals, item_type(tys.at(0)), item_type(tys.at(1))),
+  }
+}
+
+/// The type an item is held at in a list's or a map's objects: the type the call settled where it
+/// settled one, else a word's.
+fn item_type(t: Option<Type>) -> Type =
+  match t { Some(ty) -> if has_vars(ty) { word_type() } else { ty }, None -> word_type() }
+
+fn header_of(w: Bytes, field: Bytes) -> Bytes = Bytes::concat_all([b"ply_obj(", w, b")->", field])
+
+fn slot_of(w: Bytes, at: Bytes) -> Bytes = Bytes::concat_all([b"ply_words(", w, b")[", at, b"]"])
+
+/// `at` words past the word `from`, as C reads it.
+fn past(from: Int, at: Bytes) -> Bytes = Bytes::concat_all([ascii_of_int(from), b" + (", at, b")"])
+
+/// A new node of the runtime's `kind`, with room for a full one.
+fn new_node(emitter: Emitter, kind: Int) -> WithValue =
+  bind(emitter, KBoxed, Bytes::concat_all([b"rt_node_p(ctx, ", ascii_of_int(kind), b")"]))
+
+/// The word `w` reads, held once more.
+fn word_held(emitter: Emitter, w: Bytes, kind: Kind, ty: Ty) -> WithValue = {
+  let r = fresh(emitter);
+  let loaded = line(
+    r.emitter,
+    Bytes::concat_all([b"Word ", r.name, b" = ", w, b"; ply_inc(", r.name, b");"]),
+  );
+  { emitter: note_holder(loaded, r.name), value: { kind: kind, expr: r.name, ty: ty } }
+}
+
+/// An item, the word `w` reads, at its type `t`: a scalar read from the word, anything else the
+/// word held once more.
+fn item_read(emitter: Emitter, w: Bytes, t: Type) -> WithValue = {
+  let k = kind_of(t);
+  match k.kind {
+    KBoxed -> word_held(emitter, w, KBoxed, k.ty),
+    kind -> bind(emitter, kind, as_kind({ kind: KBoxed, expr: w, ty: TyOpen([]) }, kind)),
+  }
+}
+
+/// An item, the word `w` the caller now holds, at its type `t`: a scalar read from the word and the
+/// word let go, anything else the word itself.
+fn item_taken(emitter: Emitter, w: Bytes, t: Type) -> WithValue = {
+  let k = kind_of(t);
+  match k.kind {
+    KBoxed -> { emitter: note_made(emitter, w), value: { kind: KBoxed, expr: w, ty: k.ty } },
+    kind -> {
+      let read = bind(emitter, kind, as_kind({ kind: KBoxed, expr: w, ty: TyOpen([]) }, kind));
+      {
+        emitter: line(read.emitter, Bytes::concat_all([b"ply_dec(ctx, ", w, b");"])),
+        value: read.value,
+      }
+    },
+  }
+}
+
+/// The record of `fields`, in their names' order, held back as `words`: what a write that answers
+/// two or three words answers.
+fn written_record(emitter: Emitter, fields: List<Field>, words: List<CValue>) -> WithValue =
+  match kind_of(TyRecord(fields)).ty {
+    TyRec(fs) -> held_record(emitter, fs, words, b"0"),
+    _ -> refused(emitter, b"a write in place that answers no record"),
+  }
+
+/// The object the call takes as its first argument, as a word this body holds and hands on.
+fn taken_first(emitter: Emitter, vals: List<CValue>) -> WithValue = {
+  let taken = owned(emitter, nth_value(vals, 0));
+  bind(taken.emitter, KBoxed, taken.value.expr)
+}
+
+/// `a`, the object a write in place took, as the call's answer.
+fn written_as(emitter: Emitter, a: Bytes, ty: Ty) -> WithValue =
+  { emitter: note_made(emitter, a), value: { kind: KBoxed, expr: a, ty: ty } }
+
+/// Written ahead of a write of an item of the object `a`: `a` held once, by `writable`, its
+/// contents copied where it was not, and the write counted as in place or of a copy of `copied`
+/// words.
+fn counted_writable(a: Bytes, writable: Bytes, copied: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"{ int in_place = ",
+    header_of(a, b"rc"),
+    b" == 1; if (!in_place) ",
+    writable,
+    b" rt_note_update_p(ctx, in_place, in_place ? 0 : ",
+    copied,
+    b"); }",
+  ])
+
+/// What `read` makes of the word of the object a call takes first, which the call then lets go of
+/// as any call does: a count held past the read would make the next write copy what it writes.
+fn read_from(
+  emitter: Emitter,
+  vals: List<CValue>,
+  read: (Emitter, Bytes) -> WithValue,
+) -> WithValue = {
+  let held = owned(emitter, nth_value(vals, 0));
+  let r = read(held.emitter, held.value.expr);
+  {
+    emitter: line(r.emitter, Bytes::concat_all([b"ply_dec(ctx, ", held.value.expr, b");"])),
+    value: r.value,
+  }
+}
+
+/// An `Int` header field of the object a call takes first.
+fn header_read(emitter: Emitter, vals: List<CValue>, field: Bytes) -> WithValue =
+  read_from(emitter, vals, |e: Emitter, w: Bytes|
+    bind(e, KInt, Bytes::concat_all([b"(int64_t)", header_of(w, field)])))
+
+/// A function of `ListNode` over a list's objects as `layouts` lays them out, every item a word:
+/// one that reads them here, one that writes them by `list_node_write`.
+fn list_node_op(em: Emitter, op: ListOp, vals: List<CValue>, item: Type) -> WithValue = {
+  let laid = layouts().list;
+  let index = as_int(nth_value(vals, 1));
+  let read = |r: (Emitter, Bytes) -> WithValue| read_from(em, vals, r);
+  match op {
+    ListStart -> header_read(em, vals, laid.start),
+    TailLen -> header_read(em, vals, laid.tail_len),
+    NodeLen -> header_read(em, vals, b"len"),
+    ListRoot ->
+      read(|e: Emitter, w: Bytes|
+        word_held(e, slot_of(w, ascii_of_int(laid.root)), KSum(Zeroed), TyOpen([]))),
+    TailAt -> read(|e: Emitter, w: Bytes| item_read(e, slot_of(w, past(laid.tail, index)), item)),
+    LeafAt -> read(|e: Emitter, w: Bytes| item_read(e, slot_of(w, past(0, index)), item)),
+    KidAt ->
+      read(|e: Emitter, w: Bytes| word_held(e, slot_of(w, past(0, index)), KBoxed, TyOpen([]))),
+    NewBranch -> new_node(em, layouts().trie.branch),
+    _ -> list_node_write(em, op, vals, item),
+  }
+}
+
+/// A function of `ListNode` that writes the list or node it takes: in place where it is held once,
+/// else in a copy holding its contents once more, a write of an item counting which it was. Each
+/// word taken is the call's to hand on, and each answered the answer's.
+fn list_node_write(em: Emitter, op: ListOp, vals: List<CValue>, item: Type) -> WithValue = {
+  let laid = layouts();
+  let held = taken_first(em, vals);
+  let a = held.value.expr;
+  let header = |field: Bytes| header_of(a, field);
+  let index = as_int(nth_value(vals, 1));
+  let tail = |i: Bytes| slot_of(a, past(laid.list.tail, i));
+  let list_writable = |room: Bytes|
+    Bytes::concat_all([a, b" = rt_list_writable_p(ctx, ", a, b", ", room, b");"]);
+  let node_writable = Bytes::concat_all([a, b" = rt_node_writable_p(ctx, ", a, b");"]);
+  let shared = |writable: Bytes|
+    Bytes::concat_all([b"if (", header(b"rc"), b" != 1) ", writable, b" "]);
+  let list_ty = TyCon({ name: b"List", args: [item] });
+  let node_ty = word_type();
+  let maybe_node = TyCon({ name: b"Option", args: [node_ty] });
+  let set = |e: Emitter, writable: Bytes, copied: Bytes, slot: Bytes| {
+    let v = owned(e, nth_value(vals, 2));
+    let old = fresh(v.emitter);
+    line(
+      old.emitter,
+      Bytes::concat_all([
+        counted_writable(a, writable, copied),
+        b" Word ",
+        old.name,
+        b" = ",
+        slot,
+        b"; ",
+        slot,
+        b" = ",
+        v.value.expr,
+        b"; ply_dec(ctx, ",
+        old.name,
+        b");",
+      ]),
+    )
+  };
+  match op {
+    TailPush -> {
+      let v = owned(held.emitter, nth_value(vals, 1));
+      let room = header(laid.list.room);
+      let grown = line(
+        v.emitter,
+        Bytes::concat_all([
+          b"{ int in_place = ",
+          header(b"rc"),
+          b" == 1; int64_t n = ",
+          header(laid.list.tail_len),
+          b"; if (!in_place || n == ",
+          room,
+          b") ",
+          list_writable(Bytes::concat_all([b"n == ", room, b" ? 2 * ", room, b" : ", room])),
+          b" rt_note_update_p(ctx, in_place, in_place ? 0 : n); }",
+        ]),
+      );
+      let pushed = line(
+        grown,
+        Bytes::concat_all([
+          tail(header(laid.list.tail_len)),
+          b" = ",
+          v.value.expr,
+          b"; ",
+          header(laid.list.tail_len),
+          b" += 1; ",
+          header(b"len"),
+          b" += 1;",
+        ]),
+      );
+      written_as(pushed, a, TyList)
+    },
+    TailStart -> {
+      let v = owned(held.emitter, nth_value(vals, 1));
+      let pushed = line(
+        v.emitter,
+        Bytes::concat_all([
+          tail(b"0"),
+          b" = ",
+          v.value.expr,
+          b"; ",
+          header(laid.list.tail_len),
+          b" = 1; ",
+          header(b"len"),
+          b" += 1;",
+        ]),
+      );
+      written_as(pushed, a, TyList)
+    },
+    TailSet ->
+      written_as(
+        set(
+          held.emitter,
+          list_writable(header(laid.list.room)),
+          header(laid.list.tail_len),
+          tail(index),
+        ),
+        a,
+        TyList,
+      ),
+    LeafSet ->
+      written_as(
+        set(held.emitter, node_writable, header(b"len"), slot_of(a, index)),
+        a,
+        TyOpen([]),
+      ),
+    RootSwap -> {
+      let r = sum_owned(held.emitter, nth_value(vals, 1), Zeroed);
+      let old = fresh(r.emitter);
+      let root = slot_of(a, ascii_of_int(laid.list.root));
+      let swapped = line(
+        old.emitter,
+        Bytes::concat_all([
+          shared(list_writable(header(laid.list.room))),
+          b"Word ",
+          old.name,
+          b" = ",
+          root,
+          b"; ",
+          root,
+          b" = ",
+          r.value.expr,
+          b";",
+        ]),
+      );
+      written_record(
+        note_made(note_made(swapped, a), old.name),
+        [{ name: b"list", ty: list_ty }, { name: b"old", ty: maybe_node }],
+        [
+          { kind: KBoxed, expr: a, ty: TyList },
+          { kind: KSum(Zeroed), expr: old.name, ty: TyOpen([]) },
+        ],
+      )
+    },
+    KidSwap -> {
+      let c = sum_owned(held.emitter, nth_value(vals, 2), Zeroed);
+      let old = fresh(c.emitter);
+      let swapped = line(
+        old.emitter,
+        Bytes::concat_all([
+          shared(node_writable),
+          b"Word ",
+          old.name,
+          b" = 0; if (",
+          index,
+          b" < (int64_t)",
+          header(b"len"),
+          b") ",
+          old.name,
+          b" = ",
+          slot_of(a, index),
+          b"; else ",
+          header(b"len"),
+          b" = (uint32_t)(",
+          index,
+          b") + 1; ",
+          slot_of(a, index),
+          b" = ",
+          c.value.expr,
+          b";",
+        ]),
+      );
+      written_record(
+        note_made(note_made(swapped, a), old.name),
+        [{ name: b"node", ty: node_ty }, { name: b"old", ty: maybe_node }],
+        [
+          { kind: KBoxed, expr: a, ty: TyOpen([]) },
+          { kind: KSum(Zeroed), expr: old.name, ty: TyOpen([]) },
+        ],
+      )
+    },
+    Spill -> {
+      let leaf = fresh(held.emitter);
+      let width = ascii_of_int(laid.trie.width);
+      let spilt = line(
+        leaf.emitter,
+        Bytes::concat_all([
+          counted_writable(a, list_writable(header(laid.list.room)), header(laid.list.tail_len)),
+          b" Word ",
+          leaf.name,
+          b" = rt_node_p(ctx, ",
+          ascii_of_int(laid.trie.leaf),
+          b"); memcpy(ply_words(",
+          leaf.name,
+          b"), &",
+          tail(b"0"),
+          b", ",
+          width,
+          b" * sizeof(Word)); ",
+          header_of(leaf.name, b"len"),
+          b" = ",
+          width,
+          b"; ",
+          header(laid.list.tail_len),
+          b" = 0;",
+        ]),
+      );
+      written_record(
+        note_made(note_made(spilt, a), leaf.name),
+        [{ name: b"leaf", ty: node_ty }, { name: b"list", ty: list_ty }],
+        [{ kind: KBoxed, expr: leaf.name, ty: TyOpen([]) }, { kind: KBoxed, expr: a, ty: TyList }],
+      )
+    },
+    _ -> refused(held.emitter, b"a function of a list's node that reads it, written as a write"),
+  }
+}
+
+/// A function of `MapNode` over a map's objects as `layouts` lays them out, every key and value a
+/// word: one that reads them here, one that writes them by `map_node_write`.
+fn map_node_op(em: Emitter, op: MapOp, vals: List<CValue>, key: Type, value: Type) -> WithValue = {
+  let laid = layouts();
+  let index = as_int(nth_value(vals, 1));
+  let read = |r: (Emitter, Bytes) -> WithValue| read_from(em, vals, r);
+  let pair = |w: Bytes, of: Bytes| slot_of(w, Bytes::concat_all([b"2 * (", index, b")", of]));
+  match op {
+    MapRoot ->
+      read(|e: Emitter, w: Bytes|
+        word_held(e, slot_of(w, ascii_of_int(laid.map.root)), KSum(Zeroed), TyOpen([]))),
+    MapHeight -> header_read(em, vals, laid.map.height),
+    NodeCount -> header_read(em, vals, b"len"),
+    NodeKey -> read(|e: Emitter, w: Bytes| item_read(e, pair(w, b""), key)),
+    NodeValue -> read(|e: Emitter, w: Bytes| item_read(e, pair(w, b" + 1"), value)),
+    NodeKid ->
+      read(|e: Emitter, w: Bytes| word_held(e, slot_of(w, past(0, index)), KBoxed, TyOpen([]))),
+    KidMax ->
+      read(|e: Emitter, w: Bytes| item_read(e, slot_of(w, past(laid.tree.keys, index)), key)),
+    KidSize ->
+      read(|e: Emitter, w: Bytes|
+        bind(
+          e,
+          KInt,
+          Bytes::concat_all([b"ply_imm_value(", slot_of(w, past(laid.tree.sizes, index)), b")"]),
+        )),
+    NewLeaf -> new_node(em, laid.tree.leaf),
+    NewMapBranch -> new_node(em, laid.tree.branch),
+    _ -> map_node_write(em, op, vals, key, value),
+  }
+}
+
+/// A function of `MapNode` that writes the map or node it takes: in place where it is held once,
+/// else in a copy holding its contents once more, a write of a pair counting which it was. Each
+/// word taken is the call's to hand on, and each answered the answer's.
+fn map_node_write(em: Emitter, op: MapOp, vals: List<CValue>, key: Type, value: Type) -> WithValue = {
+  let laid = layouts();
+  let held = taken_first(em, vals);
+  let a = held.value.expr;
+  let header = |field: Bytes| header_of(a, field);
+  let index = Bytes::concat_all([b"(", as_int(nth_value(vals, 1)), b")"]);
+  let at = |i: Bytes| slot_of(a, i);
+  let words_at = |i: Bytes| Bytes::concat_all([b"&", at(i)]);
+  let shifted = |from: Bytes, n: Bytes, by: Bytes|
+    Bytes::concat_all([
+      b"memmove(",
+      words_at(Bytes::concat_all([from, b" + ", by])),
+      b", ",
+      words_at(from),
+      b", (size_t)(",
+      n,
+      b") * sizeof(Word)); ",
+    ]);
+  let node_writable = Bytes::concat_all([a, b" = rt_node_writable_p(ctx, ", a, b");"]);
+  let writable = Bytes::concat_all([b"if (", header(b"rc"), b" != 1) ", node_writable, b" "]);
+  let pairs_writable = counted_writable(
+    a,
+    node_writable,
+    Bytes::concat_all([b"2 * (int64_t)", header(b"len")]),
+  );
+  let keys = |i: Bytes| past(laid.tree.keys, i);
+  let sizes = |i: Bytes| past(laid.tree.sizes, i);
+  let node_ty = word_type();
+  let node_value = { kind: KBoxed, expr: a, ty: TyOpen([]) };
+  let pair = Bytes::concat_all([b"2 * ", index]);
+  let pair_value = Bytes::concat_all([pair, b" + 1"]);
+  let after = |less: Bytes| Bytes::concat_all([b"(int64_t)", header(b"len"), b" - ", index, less]);
+  match op {
+    PairPut -> {
+      let k = owned(held.emitter, nth_value(vals, 2));
+      let v = owned(k.emitter, nth_value(vals, 3));
+      let put = line(
+        v.emitter,
+        Bytes::concat_all([
+          pairs_writable,
+          b" ",
+          shifted(pair, Bytes::concat_all([b"2 * (", after(b""), b")"]), b"2"),
+          at(pair),
+          b" = ",
+          k.value.expr,
+          b"; ",
+          at(pair_value),
+          b" = ",
+          v.value.expr,
+          b"; ",
+          header(b"len"),
+          b" += 1;",
+        ]),
+      );
+      written_as(put, a, TyOpen([]))
+    },
+    PairSet -> {
+      let k = owned(held.emitter, nth_value(vals, 2));
+      let v = owned(k.emitter, nth_value(vals, 3));
+      let old_key = fresh(v.emitter);
+      let old_value = fresh(old_key.emitter);
+      let set = line(
+        old_value.emitter,
+        Bytes::concat_all([
+          pairs_writable,
+          b" Word ",
+          old_key.name,
+          b" = ",
+          at(pair),
+          b"; Word ",
+          old_value.name,
+          b" = ",
+          at(pair_value),
+          b"; ",
+          at(pair),
+          b" = ",
+          k.value.expr,
+          b"; ",
+          at(pair_value),
+          b" = ",
+          v.value.expr,
+          b"; ply_dec(ctx, ",
+          old_key.name,
+          b"); ply_dec(ctx, ",
+          old_value.name,
+          b");",
+        ]),
+      );
+      written_as(set, a, TyOpen([]))
+    },
+    PairTake -> {
+      let k = fresh(held.emitter);
+      let v = fresh(k.emitter);
+      let taken = line(
+        v.emitter,
+        Bytes::concat_all([
+          pairs_writable,
+          b" Word ",
+          k.name,
+          b" = ",
+          at(pair),
+          b"; Word ",
+          v.name,
+          b" = ",
+          at(pair_value),
+          b"; ",
+          shifted(
+            Bytes::concat_all([pair, b" + 2"]),
+            Bytes::concat_all([b"2 * (", after(b" - 1"), b")"]),
+            b"-2",
+          ),
+          header(b"len"),
+          b" -= 1;",
+        ]),
+      );
+      let k_value = item_taken(note_made(taken, a), k.name, key);
+      let v_value = item_taken(k_value.emitter, v.name, value);
+      written_record(
+        v_value.emitter,
+        [{ name: b"key", ty: key }, { name: b"node", ty: node_ty }, { name: b"value", ty: value }],
+        [k_value.value, node_value, v_value.value],
+      )
+    },
+    LeafCut -> cut(held.emitter, a, index, laid.tree.leaf, [{ from: 0, width: 2 }]),
+    BranchCut ->
+      cut(held.emitter, a, index, laid.tree.branch, [
+        { from: 0, width: 1 },
+        { from: laid.tree.keys, width: 1 },
+        { from: laid.tree.sizes, width: 1 },
+      ]),
+    KidOut -> {
+      let kid = fresh(held.emitter);
+      let out = line(
+        kid.emitter,
+        Bytes::concat_all([
+          writable,
+          b"Word ",
+          kid.name,
+          b" = ",
+          at(index),
+          b"; ",
+          at(index),
+          b" = 0;",
+        ]),
+      );
+      written_record(
+        note_made(note_made(out, a), kid.name),
+        [{ name: b"kid", ty: node_ty }, { name: b"node", ty: node_ty }],
+        [{ kind: KBoxed, expr: kid.name, ty: TyOpen([]) }, node_value],
+      )
+    },
+    KidBack -> {
+      let kid = owned(held.emitter, nth_value(vals, 2));
+      let max = owned(kid.emitter, nth_value(vals, 3));
+      let old_max = fresh(max.emitter);
+      let back = line(
+        old_max.emitter,
+        Bytes::concat_all([
+          writable,
+          b"Word ",
+          old_max.name,
+          b" = ",
+          at(keys(index)),
+          b"; ",
+          at(keys(index)),
+          b" = ",
+          max.value.expr,
+          b"; ply_dec(ctx, ",
+          old_max.name,
+          b"); ",
+          at(index),
+          b" = ",
+          kid.value.expr,
+          b"; ",
+          at(sizes(index)),
+          b" = ply_imm(",
+          as_int(nth_value(vals, 4)),
+          b");",
+        ]),
+      );
+      written_as(back, a, TyOpen([]))
+    },
+    KidPut -> {
+      let kid = owned(held.emitter, nth_value(vals, 2));
+      let max = owned(kid.emitter, nth_value(vals, 3));
+      let n = after(b"");
+      let put = line(
+        max.emitter,
+        Bytes::concat_all([
+          writable,
+          shifted(index, n, b"1"),
+          shifted(keys(index), n, b"1"),
+          shifted(sizes(index), n, b"1"),
+          at(index),
+          b" = ",
+          kid.value.expr,
+          b"; ",
+          at(keys(index)),
+          b" = ",
+          max.value.expr,
+          b"; ",
+          at(sizes(index)),
+          b" = ply_imm(",
+          as_int(nth_value(vals, 4)),
+          b"); ",
+          header(b"len"),
+          b" += 1;",
+        ]),
+      );
+      written_as(put, a, TyOpen([]))
+    },
+    KidDrop -> {
+      let n = after(b" - 1");
+      let next = Bytes::concat_all([index, b" + 1"]);
+      let dropped = line(
+        held.emitter,
+        Bytes::concat_all([
+          writable,
+          b"ply_dec(ctx, ",
+          at(index),
+          b"); ply_dec(ctx, ",
+          at(keys(index)),
+          b"); ",
+          shifted(next, n, b"-1"),
+          shifted(keys(next), n, b"-1"),
+          shifted(sizes(next), n, b"-1"),
+          header(b"len"),
+          b" -= 1;",
+        ]),
+      );
+      written_as(dropped, a, TyOpen([]))
+    },
+    MapSwap -> {
+      let root = sum_owned(held.emitter, nth_value(vals, 1), Zeroed);
+      let old = fresh(root.emitter);
+      let slot = at(ascii_of_int(laid.map.root));
+      let swapped = line(
+        old.emitter,
+        Bytes::concat_all([
+          b"if (",
+          header(b"rc"),
+          b" != 1) ",
+          a,
+          b" = rt_map_writable_p(ctx, ",
+          a,
+          b"); Word ",
+          old.name,
+          b" = ",
+          slot,
+          b"; ",
+          slot,
+          b" = ",
+          root.value.expr,
+          b"; ",
+          header(laid.map.height),
+          b" = (uint32_t)(",
+          as_int(nth_value(vals, 2)),
+          b"); ",
+          header(b"len"),
+          b" = (uint32_t)(",
+          as_int(nth_value(vals, 3)),
+          b");",
+        ]),
+      );
+      written_record(
+        note_made(note_made(swapped, a), old.name),
+        [
+          { name: b"map", ty: TyCon({ name: b"Map", args: [key, value] }) },
+          { name: b"old", ty: TyCon({ name: b"Option", args: [node_ty] }) },
+        ],
+        [node_value, { kind: KSum(Zeroed), expr: old.name, ty: TyOpen([]) }],
+      )
+    },
+    _ -> refused(held.emitter, b"a function of a map's node that reads it, written as a write"),
+  }
+}
+
+/// The node `a`, held once, kept up to its entry `index`, and a new node of `kind` holding the
+/// entries from `index` on: each run of words `runs` names, `width` words to an entry from word
+/// `from`, moved across.
+fn cut(
+  emitter: Emitter,
+  a: Bytes,
+  index: Bytes,
+  kind: Int,
+  runs: List<{ from: Int, width: Int }>,
+) -> WithValue = {
+  let r = fresh(emitter);
+  let rest = Bytes::concat_all([b"((int64_t)", header_of(a, b"len"), b" - ", index, b")"]);
+  let moved = runs.fold(b"", |acc: Bytes, run: { from: Int, width: Int }| {
+    let width = ascii_of_int(run.width);
+    Bytes::concat_all([
+      acc,
+      b"memcpy(&",
+      slot_of(r.name, ascii_of_int(run.from)),
+      b", &",
+      slot_of(a, Bytes::concat_all([ascii_of_int(run.from), b" + ", width, b" * ", index])),
+      b", (size_t)(",
+      width,
+      b" * ",
+      rest,
+      b") * sizeof(Word)); ",
+    ])
+  });
+  let written = line(
+    r.emitter,
+    Bytes::concat_all([
+      b"if (",
+      header_of(a, b"rc"),
+      b" != 1) ",
+      a,
+      b" = rt_node_writable_p(ctx, ",
+      a,
+      b"); Word ",
+      r.name,
+      b" = rt_node_p(ctx, ",
+      ascii_of_int(kind),
+      b"); ",
+      moved,
+      header_of(r.name, b"len"),
+      b" = (uint32_t)",
+      rest,
+      b"; ",
+      header_of(a, b"len"),
+      b" = (uint32_t)",
+      index,
+      b";",
+    ]),
+  );
+  written_record(
+    note_made(note_made(written, a), r.name),
+    [{ name: b"left", ty: word_type() }, { name: b"right", ty: word_type() }],
+    [{ kind: KBoxed, expr: a, ty: TyOpen([]) }, { kind: KBoxed, expr: r.name, ty: TyOpen([]) }],
+  )
+}
+
 fn wrapped(emitter: Emitter, name: Bytes, v0: CValue, v1: CValue, t: Width) -> WithValue = {
   let u = unsigned_ctype(t);
   let a = as_num(v0, t);
@@ -9385,6 +10127,22 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                   Bytes::concat_all([b"rt_constant_p(ctx, @@l", ascii_of_int(l.i), b"@@)"]),
                 );
                 Some(opened_to(check(held.emitter), held.value, k.ret))
+              },
+            }
+          } else if in_place_at(emitter, fv.name) != None {
+            match in_place_at(emitter, fv.name) {
+              None -> None,
+              Some(op) -> match args_evaled(emitter, a.args, params, 0, []) {
+                None -> None,
+                Some(w) ->
+                  Some(
+                    written_in_place(
+                      w.emitter,
+                      op,
+                      w.vals,
+                      emitter.typed.get(span_key(a.func.span)),
+                    ),
+                  ),
               },
             }
           } else if !emitter.here.fold(false, |acc: Bool, h: Def| acc || h.name == fv.name) {
@@ -20355,6 +21113,163 @@ test "a shipped module's extern is called as the builtin of its own name" {
   }
 }
 
+/// A function of the prelude calling each extern the emitter writes in place, as the prelude's own
+/// functions call them: at a scalar item, a counted one, an item of a type variable, and through a
+/// value.
+fn in_place_calls() -> List<{ name: Bytes, src: Bytes }> =
+  [
+    { name: b"start", src: b"(xs: List<Int>) -> Int = ListNode::start(xs)" },
+    { name: b"tail_len", src: b"(xs: List<Int>) -> Int = ListNode::tail_len(xs)" },
+    { name: b"root", src: b"(xs: List<Int>) -> Option<ListNode<Int>> = ListNode::root(xs)" },
+    { name: b"tail_at", src: b"(xs: List<String>) -> String = ListNode::tail_at(xs, 1)" },
+    { name: b"len", src: b"(n: ListNode<Int>) -> Int = ListNode::len(n)" },
+    { name: b"leaf_at", src: b"(n: ListNode<Int>) -> Int = ListNode::leaf_at(n, 3)" },
+    { name: b"leaf_at_any", src: b"<a>(n: ListNode<a>) -> a = ListNode::leaf_at(n, 3)" },
+    { name: b"leaf_at_on", src: b"(n: ListNode<String>) -> String = n.leaf_at(3)" },
+    { name: b"kid_at", src: b"(n: ListNode<Int>) -> ListNode<Int> = ListNode::kid_at(n, 1)" },
+    {
+      name: b"tail_push",
+      src: b"(xs: List<String>, x: String) -> List<String> = ListNode::tail_push(xs, x)",
+    },
+    { name: b"tail_set", src: b"(xs: List<Int>) -> List<Int> = ListNode::tail_set(xs, 2, 7)" },
+    {
+      name: b"leaf_set",
+      src: b"(n: ListNode<String>, x: String) -> ListNode<String> = ListNode::leaf_set(n, 2, x)",
+    },
+    {
+      name: b"root_swap",
+      src: b"(xs: List<Int>, r: ListNode<Int>) -> Option<ListNode<Int>> = ListNode::root_swap(xs, Some(r)).old",
+    },
+    {
+      name: b"kid_swap",
+      src: b"(n: ListNode<Int>) -> ListNode<Int> = ListNode::kid_swap(n, 0, None).node",
+    },
+    { name: b"tail_start", src: b"(xs: List<Int>) -> List<Int> = ListNode::tail_start(xs, 7)" },
+    { name: b"spill", src: b"(xs: List<Int>) -> ListNode<Int> = ListNode::spill(xs).leaf" },
+    { name: b"branch", src: b"() -> ListNode<Int> = ListNode::branch()" },
+    {
+      name: b"map_root",
+      src: b"(m: Map<Int, String>) -> Option<MapNode<Int, String>> = MapNode::root(m)",
+    },
+    { name: b"height", src: b"(m: Map<Int, String>) -> Int = MapNode::height(m)" },
+    { name: b"count", src: b"(n: MapNode<Int, String>) -> Int = MapNode::count(n)" },
+    { name: b"key", src: b"(n: MapNode<Int, String>) -> Int = MapNode::key(n, 1)" },
+    { name: b"value", src: b"(n: MapNode<Int, String>) -> String = MapNode::value(n, 1)" },
+    {
+      name: b"kid",
+      src: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid(n, 1)",
+    },
+    { name: b"kid_max", src: b"(n: MapNode<Int, String>) -> Int = MapNode::kid_max(n, 1)" },
+    { name: b"kid_size", src: b"(n: MapNode<Int, String>) -> Int = MapNode::kid_size(n, 1)" },
+    { name: b"leaf", src: b"() -> MapNode<Int, String> = MapNode::leaf()" },
+    { name: b"map_branch", src: b"() -> MapNode<Int, String> = MapNode::branch()" },
+    {
+      name: b"pair_put",
+      src: b"(n: MapNode<Int, String>, v: String) -> MapNode<Int, String> = MapNode::pair_put(n, 1, 5, v)",
+    },
+    {
+      name: b"pair_set",
+      src: b"(n: MapNode<Int, String>, v: String) -> MapNode<Int, String> = MapNode::pair_set(n, 1, 5, v)",
+    },
+    {
+      name: b"pair_take",
+      src: b"(n: MapNode<Int, String>) -> String = MapNode::pair_take(n, 1).value",
+    },
+    {
+      name: b"leaf_cut",
+      src: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::leaf_cut(n, 16).right",
+    },
+    {
+      name: b"branch_cut",
+      src: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::branch_cut(n, 16).left",
+    },
+    {
+      name: b"kid_out",
+      src: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid_out(n, 1).kid",
+    },
+    {
+      name: b"kid_back",
+      src: b"(n: MapNode<Int, String>, k: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid_back(n, 1, k, 9, 4)",
+    },
+    {
+      name: b"kid_put",
+      src: b"(n: MapNode<Int, String>, k: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid_put(n, 1, k, 9, 4)",
+    },
+    {
+      name: b"kid_drop",
+      src: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::kid_drop(n, 1)",
+    },
+    {
+      name: b"map_swap",
+      src: b"(m: Map<Int, String>, r: MapNode<Int, String>) -> Map<Int, String> = MapNode::map_swap(m, Some(r), 1, 40).map",
+    },
+  ]
+
+test "each extern written in place is written over the runtime's objects as the layouts lay them out, and calls no native" {
+  let calls = in_place_calls();
+  let probes = calls.fold(b"\n", |acc: Bytes, c: { name: Bytes, src: Bytes }|
+    Bytes::concat_all([acc, b"fn probe_", c.name, c.src, b"\n"]));
+  // Every extern `intrinsics` lists is called here.
+  let unprobed = intrinsics().filter(|i: { name: Bytes, op: Intrinsic }|
+    probes.index_of(i.name.slice(b"std.prelude.".len(), i.name.len()).concat(b"(")) == None);
+  assert_eq(unprobed.map(|i: { name: Bytes, op: Intrinsic }| i.name), []);
+  let roots = calls.map(|c: { name: Bytes, src: Bytes }| b"std.prelude.probe_".concat(c.name));
+  let answers = answers_of(
+    [b"std.prelude"],
+    [prelude_source::text().concat(probes)],
+    [b"Some", b"None"],
+    roots,
+  );
+  let code = |name: Bytes|
+    match answers.find(|a: RootAnswer| a.name == b"std.prelude.probe_".concat(name)) {
+      Some(a) -> match a.answer {
+        Body(b) -> own_code(b.text),
+        Refused(r) -> panic(String::of_bytes_lossy(Bytes::concat_all([name, b": ", r.why]))),
+      },
+      None -> panic("no answer for probe_" ++ String::of_bytes_lossy(name)),
+    };
+  assert_eq(
+    calls.filter(|c: { name: Bytes, src: Bytes }| code(c.name).index_of(b"builtin_") != None).map(
+      |c: { name: Bytes, src: Bytes }| c.name,
+    ),
+    [],
+  );
+  let laid = layouts();
+  let has = |name: Bytes, text: Bytes| code(name).index_of(text) != None;
+  let field = |name: Bytes| b"->".concat(name);
+  let node = |kind: Int| Bytes::concat_all([b"rt_node_p(ctx, ", ascii_of_int(kind), b")"]);
+  let past = |from: Int| ascii_of_int(from).concat(b" + (");
+  assert_eq(
+    [
+      has(b"start", field(laid.list.start)),
+      has(b"tail_len", field(laid.list.tail_len)),
+      has(b"tail_at", past(laid.list.tail)),
+      has(b"height", field(laid.map.height)),
+      has(b"kid_max", past(laid.tree.keys)),
+      has(b"kid_size", past(laid.tree.sizes)),
+      has(b"branch", node(laid.trie.branch)),
+      has(b"spill", node(laid.trie.leaf)),
+      has(b"leaf", node(laid.tree.leaf)),
+      has(b"map_branch", node(laid.tree.branch)),
+      has(b"branch_cut", node(laid.tree.branch)),
+      has(b"leaf_cut", node(laid.tree.leaf)),
+      has(b"tail_push", field(laid.list.room)),
+    ],
+    [true, true, true, true, true, true, true, true, true, true, true, true, true],
+  );
+  // A write takes what it writes held once, where it is not, and counts an item's or a pair's.
+  assert_eq(
+    [
+      has(b"tail_push", b"rt_list_writable_p(ctx, "),
+      has(b"leaf_set", b"rt_node_writable_p(ctx, "),
+      has(b"map_swap", b"rt_map_writable_p(ctx, "),
+      has(b"pair_set", b"rt_note_update_p(ctx, "),
+      has(b"kid_put", b"rt_note_update_p(ctx, "),
+    ],
+    [true, true, true, true, false],
+  )
+}
+
 test "a list, an array or a map read matched as `Some` or `None` is answered in place by its lookup" {
   let src = Bytes::concat_all([
     b"fn listed(xs: List<Int>, i: Int) -> Int = match xs.at(i) { Some(v) -> v, None -> 0 }\n",
@@ -22213,19 +23128,21 @@ fn named_arity(
     _ -> None,
   }
 
-/// The lambda around a call of the definition `c` names, which takes `n` arguments.
+/// The lambda around a call of the definition `c` names, which takes `n` arguments. The call is
+/// each parameter's only read, so it hands each one on.
 fn named_lambda(c: Code, n: Int) -> Lambda = {
-  let at = |node: Node| { own: Borrowed, node: node, span: c.span };
+  let at = |own: Own, node: Node| { own: own, node: node, span: c.span };
   {
     params: n,
     size: n,
     captures: [],
     at: c.span,
     body: at(
+      Borrowed,
       NApp({
         func: { ..c, own: Borrowed },
         args: range(0, n).map(|i: Int|
-          at(NVar({ name: b"p".concat(ascii_of_int(i)), slot: Some(i) }))),
+          at(Owned, NVar({ name: b"p".concat(ascii_of_int(i)), slot: Some(i) }))),
       }),
     ),
   }

@@ -105,3 +105,40 @@ fn the_runtime_describes_each_native_under_the_fields_a_build_reads() {
     let reported: Vec<&str> = natives.iter().filter_map(|n| n["name"].as_str()).collect();
     assert_eq!(names, reported);
 }
+
+/// What a runtime's library describes itself as carries how it lays out a list's and a map's parts,
+/// under the fields `compiler.native.runtime_of` reads: each a number but the header fields, named.
+#[test]
+fn the_runtime_describes_its_layouts_under_the_fields_a_build_reads() {
+    let described: serde_json::Value =
+        serde_json::from_str(&ply_machine::shipped::runtime_json()).expect("the description reads");
+    let layouts = &described["layouts"];
+    let fields = |object: &str| -> Vec<String> {
+        let mut names: Vec<String> = layouts[object]
+            .as_object()
+            .unwrap_or_else(|| panic!("no layout of `{object}`"))
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        fields("list"),
+        ["room", "root", "start", "tail", "tail_len"]
+    );
+    assert_eq!(fields("trie"), ["branch", "leaf", "width"]);
+    assert_eq!(fields("map"), ["height", "root"]);
+    assert_eq!(fields("tree"), ["branch", "keys", "leaf", "sizes", "width"]);
+    for (object, field) in [
+        ("list", "start"),
+        ("list", "tail_len"),
+        ("list", "room"),
+        ("map", "height"),
+    ] {
+        assert!(
+            ["flags", "aux", "layout"].contains(&layouts[object][field].as_str().unwrap_or("")),
+            "{object}'s {field} names a header field"
+        );
+    }
+}

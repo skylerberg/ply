@@ -313,6 +313,10 @@ helpers! {
     rt_note_update(in_place, copied);
     rt_baked(text, len) -> Word;
     rt_stored(w) -> Word;
+    rt_node(kind) -> Word;
+    rt_node_writable(n) -> Word;
+    rt_list_writable(xs, room) -> Word;
+    rt_map_writable(m) -> Word;
 }
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since

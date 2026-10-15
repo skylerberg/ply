@@ -7,6 +7,7 @@ import std.bytes (u32_le, u64_le)
 import std.hash (blake3)
 import std.json (Json, Object, Array, Str, Number, Bool, parse)
 import unit (Helper, Native, Runtime)
+import layout (Layouts, ListLaid, TrieLaid, MapLaid, TreeLaid, layouts)
 
 /// The `main` every native program has: the runtime entered with the descriptor its unit's C lays
 /// out.
@@ -67,6 +68,69 @@ fn natives_at(j: Json) -> Option<List<Native>> =
     _ -> None,
   }
 
+/// What `read` makes of the member `name` of `j`; `None` where there is none.
+fn read_at<a>(j: Json, name: String, read: (Json) -> Option<a>) -> Option<a> =
+  match j { Object(m) -> match m.get(name) { Some(x) -> read(x), None -> None }, _ -> None }
+
+fn list_laid(j: Json) -> Option<ListLaid> =
+  match ((
+      int_at(j, "root"),
+      int_at(j, "tail"),
+      text_at(j, "start"),
+      text_at(j, "tail_len"),
+      text_at(j, "room"),
+    )) {
+    (Some(root), Some(tail), Some(start), Some(tail_len), Some(room)) ->
+      Some({
+        root: root,
+        tail: tail,
+        start: Bytes::of_string(start),
+        tail_len: Bytes::of_string(tail_len),
+        room: Bytes::of_string(room),
+      }),
+    _ -> None,
+  }
+
+fn trie_laid(j: Json) -> Option<TrieLaid> =
+  match ((int_at(j, "leaf"), int_at(j, "branch"), int_at(j, "width"))) {
+    (Some(leaf), Some(branch), Some(width)) -> Some({ leaf: leaf, branch: branch, width: width }),
+    _ -> None,
+  }
+
+fn map_laid(j: Json) -> Option<MapLaid> =
+  match ((int_at(j, "root"), text_at(j, "height"))) {
+    (Some(root), Some(height)) -> Some({ root: root, height: Bytes::of_string(height) }),
+    _ -> None,
+  }
+
+fn tree_laid(j: Json) -> Option<TreeLaid> =
+  match ((
+      int_at(j, "leaf"),
+      int_at(j, "branch"),
+      int_at(j, "width"),
+      int_at(j, "keys"),
+      int_at(j, "sizes"),
+    )) {
+    (Some(leaf), Some(branch), Some(width), Some(keys), Some(sizes)) ->
+      Some({ leaf: leaf, branch: branch, width: width, keys: keys, sizes: sizes }),
+    _ -> None,
+  }
+
+/// How a description says its runtime lays out what the emitter writes in place; `None` where it
+/// says nothing of it or a part does not read.
+fn layouts_at(j: Json) -> Option<Layouts> =
+  read_at(j, "layouts", |l: Json|
+    match ((
+        read_at(l, "list", list_laid),
+        read_at(l, "trie", trie_laid),
+        read_at(l, "map", map_laid),
+        read_at(l, "tree", tree_laid),
+      )) {
+      (Some(list), Some(trie), Some(map), Some(tree)) ->
+        Some({ list: list, trie: trie, map: map, tree: tree }),
+      _ -> None,
+    })
+
 /// The runtime `json` describes, as a runtime's library describes itself; `None` for anything else.
 pub fn runtime_of(json: Bytes) -> Option<Runtime> / {abort.raise} =
   match parse(json) {
@@ -76,8 +140,9 @@ pub fn runtime_of(json: Bytes) -> Option<Runtime> / {abort.raise} =
         text_at(j, "tail"),
         text_at(j, "identity"),
         natives_at(j),
+        layouts_at(j),
       )) {
-      (Some(head), Some(tail), Some(identity), Some(natives)) ->
+      (Some(head), Some(tail), Some(identity), Some(natives), Some(layouts)) ->
         Some({
           head: Bytes::of_string(head),
           tail: Bytes::of_string(tail),
@@ -92,6 +157,7 @@ pub fn runtime_of(json: Bytes) -> Option<Runtime> / {abort.raise} =
               _ -> acc,
             }),
           natives: natives,
+          layouts: layouts,
           identity: Bytes::of_string(identity),
         }),
       _ -> None,
@@ -148,7 +214,12 @@ test "a pack lays its files out by path, then its table, then the lengths and th
 }
 
 test "a runtime reads back from the JSON its library describes itself with" {
-  let json = b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[{\"name\":\"h\",\"args\":2,\"answers\":true}],\"natives\":[{\"name\":\"List::len\",\"words\":1,\"answers\":true,\"raises\":false},{\"name\":\"panic\",\"words\":1,\"answers\":true,\"raises\":true}],\"builtins\":[\"List::len\",\"panic\"]}";
+  let laid = b"\"layouts\":{\"list\":{\"root\":0,\"tail\":1,\"start\":\"layout\",\"tail_len\":\"flags\",\"room\":\"aux\"},\"trie\":{\"leaf\":11,\"branch\":12,\"width\":32},\"map\":{\"root\":0,\"height\":\"layout\"},\"tree\":{\"leaf\":13,\"branch\":14,\"width\":32,\"keys\":33,\"sizes\":66}}";
+  let json = Bytes::concat_all([
+    b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[{\"name\":\"h\",\"args\":2,\"answers\":true}],\"natives\":[{\"name\":\"List::len\",\"words\":1,\"answers\":true,\"raises\":false},{\"name\":\"panic\",\"words\":1,\"answers\":true,\"raises\":true}],",
+    laid,
+    b",\"builtins\":[\"List::len\",\"panic\"]}",
+  ]);
   match runtime_of(json) {
     None -> assert(false, Some("the description reads")),
     Some(r) -> {
@@ -158,13 +229,31 @@ test "a runtime reads back from the JSON its library describes itself with" {
         { name: b"List::len", words: 1, answers: true, raises: false },
         { name: b"panic", words: 1, answers: true, raises: true },
       ]);
+      assert_eq(r.layouts, layouts());
       assert_eq(r.identity, b"I")
     },
   };
-  // A library that lists no natives, or one that does not read, describes a runtime this `ply`
-  // cannot hold a program's calls to.
-  let lacking = b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[],\"builtins\":[\"panic\"]}";
-  assert_eq(runtime_of(lacking), None);
-  let unread = b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[],\"natives\":[{\"name\":\"panic\"}]}";
-  assert_eq(runtime_of(unread), None)
+  // A library that lists no natives or no layouts, or one where either does not read, describes a
+  // runtime this `ply` cannot hold a program's code to.
+  let head = b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[],";
+  let natives = b"\"natives\":[{\"name\":\"panic\",\"words\":1,\"answers\":true,\"raises\":true}]";
+  assert(runtime_of(Bytes::concat_all([head, natives, b",", laid, b"}"])) != None);
+  assert_eq(runtime_of(Bytes::concat_all([head, laid, b"}"])), None);
+  assert_eq(
+    runtime_of(Bytes::concat_all([head, b"\"natives\":[{\"name\":\"panic\"}],", laid, b"}"])),
+    None,
+  );
+  assert_eq(runtime_of(Bytes::concat_all([head, natives, b"}"])), None);
+  assert_eq(
+    runtime_of(
+      Bytes::concat_all([
+        head,
+        natives,
+        b",",
+        laid.replace(b"\"keys\":33", b"\"keys\":\"33\""),
+        b"}",
+      ]),
+    ),
+    None,
+  )
 }

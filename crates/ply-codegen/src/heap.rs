@@ -20,7 +20,7 @@ pub const KIND_CTOR: u8 = 4;
 pub const KIND_LIST: u8 = 5;
 pub const KIND_CLOSURE: u8 = 6;
 pub const KIND_BRIDGE: u8 = 7;
-/// A map's handle: one word, its tree's root or zero.
+/// A map's handle: one word, its tree's root or zero, and its tree's height in `layout`.
 pub const KIND_MAP: u8 = 8;
 /// `len` bytes of UTF-8 with room for `layout`.
 pub const KIND_STR: u8 = 9;
@@ -78,8 +78,9 @@ pub const VIEW: u8 = 8;
 /// copy costs no more than the view's own object, and keeps nothing larger alive.
 const VIEW_MIN: usize = 64;
 
-/// `len`: payload words, byte count or list length; `layout`: shape, ctor index, capacity, arity
-/// or dropped list prefix; `flags`/`aux`: a `Bool`'s value, a list's tail length and capacity.
+/// `len`: payload words, byte count, list length or map entries; `layout`: shape, ctor index,
+/// capacity, arity, dropped list prefix or map height; `flags`/`aux`: a `Bool`'s value, a list's
+/// tail length and capacity.
 #[repr(C, align(8))]
 pub struct Obj {
     pub rc: u32,
@@ -88,6 +89,53 @@ pub struct Obj {
     pub aux: u16,
     pub len: u32,
     pub layout: u32,
+}
+
+/// A field of an object's header that holds a count, named as [`Obj`] and the C prelude's `PlyObj`
+/// name it: the field a kind keeps one of its counts in, which code the emitter writes reads by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Header {
+    Flags,
+    Aux,
+    Layout,
+}
+
+impl Header {
+    pub fn name(self) -> &'static str {
+        match self {
+            Header::Flags => "flags",
+            Header::Aux => "aux",
+            Header::Layout => "layout",
+        }
+    }
+
+    /// The count `o` holds in this field.
+    ///
+    /// # Safety
+    /// `o` points at a live object.
+    pub unsafe fn of(self, o: *mut Obj) -> usize {
+        unsafe {
+            match self {
+                Header::Flags => (*o).flags as usize,
+                Header::Aux => (*o).aux as usize,
+                Header::Layout => (*o).layout as usize,
+            }
+        }
+    }
+
+    /// `o` holding `v` in this field, cut to the field's width.
+    ///
+    /// # Safety
+    /// `o` points at a live object.
+    pub unsafe fn set(self, o: *mut Obj, v: usize) {
+        unsafe {
+            match self {
+                Header::Flags => (*o).flags = v as u8,
+                Header::Aux => (*o).aux = v as u16,
+                Header::Layout => (*o).layout = v as u32,
+            }
+        }
+    }
 }
 
 static UNIT_OBJ: Obj = Obj {
@@ -1214,7 +1262,7 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
                 words_bytes((*o).kind, (*o).flags, (*o).len)
             }
             KIND_LEAF | KIND_BRANCH => (*o).layout as usize * 8,
-            KIND_LIST => (list::TAIL + (*o).aux as usize) * 8,
+            KIND_LIST => (list::TAIL + list::cap(o)) * 8,
             KIND_MAP => 8,
             KIND_MLEAF => (*o).layout as usize * 16,
             KIND_MBRANCH => map::BRANCH_BYTES,

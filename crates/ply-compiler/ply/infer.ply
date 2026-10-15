@@ -9,21 +9,21 @@ import std.graph
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, MRaise, ty_span, mode_text, is_raise, ident_names, mode_bin)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
-              is_shipped, FnDef, ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias,
-              TDSum, VariantDef, EffectDef, OpDef, TestDef, Cases, LawDef, OfSchema, Binder,
-              Constraint, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger, DRow,
-              is_predicate, deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures,
-              SCost, SSpace, SpecClause, Derived, DeriveDef, parse, TDNominal, TDExtern, test_run,
-              test_listing, IInstance, InstanceDef, InstanceKind, NKey, NShow, instance_text,
-              INumeric, NumericDef, member_name, member_of, NumericOp, numeric_ops, numeric_by,
-              is_pub, Opaque, spec_kind_bin, deriver_bin, instance_kind_bin)
+              is_shipped, is_builtin, FnDef, ExternDef, ImportDecl, INames, TypeDef, TypeDefBody,
+              TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, Cases, LawDef, OfSchema,
+              Binder, Constraint, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger,
+              DRow, is_predicate, deriver_text, deriver_tag, schema_of, SpecKind, SRequires,
+              SEnsures, SCost, SSpace, SpecClause, Derived, DeriveDef, parse, TDNominal, TDExtern,
+              test_run, test_listing, IInstance, InstanceDef, InstanceKind, NKey, NShow,
+              instance_text, INumeric, NumericDef, member_name, member_of, NumericOp, numeric_ops,
+              numeric_by, is_pub, Opaque, spec_kind_bin, deriver_bin, instance_kind_bin)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
               EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, SAssign, Param,
               NamedArg, MatchArm, HandleClause, ReturnClause, HandlerVar, RecField, expr_span,
               is_arithmetic, is_ordered, ETagged, Tagged, Hole, tagged_parser, tagged_filler,
               case_at, case_identity, call_operator, written_operator, Slot, FromName, FromDefault,
-              sees_homes)
+              sees_homes, prelude_module)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -63,6 +63,7 @@ import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_bloc
                 expand_tagged, expand_holds, expand_handler_vars, expand_member_calls, MemberCallee,
                 with_member_calls)
 import embed (rewritten)
+import layout (Intrinsic, intrinsic_named, intrinsics)
 import std.prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
                NullInsideOption, HoldsSecret, HoldsNative, ConstructorShape, Leaf, Structural,
@@ -1522,15 +1523,20 @@ fn declared(name: Bytes, imported: Map<Bytes, Bytes>, def: ExternDef) -> Builtin
   }
 }
 
-/// Every function the prelude declares, in its order. Pure and nullary, so the runtime reads the
-/// prelude once.
+/// Every function the prelude declares that every module calls, in its order. Pure and nullary, so
+/// the runtime reads the prelude once.
 pub fn builtins() -> List<Builtin> / {abort.raise} = {
   let source = prelude_source::text();
   let parsed = parse(source);
   if parsed.parser.diags.len() > 0 { panic("the prelude does not parse") } else {
     let imported = prelude_imports(parsed.node.imports);
     parsed.node.items.fold([], |acc: List<Builtin>, item: Item|
-      match item { IExtern(def) -> acc.push(declared(def.name.name, imported, def)), _ -> acc })
+      match item {
+        IExtern(def) -> if is_builtin(prelude_module(), parsed.node, def) {
+          acc.push(declared(def.name.name, imported, def))
+        } else { acc },
+        _ -> acc,
+      })
   }
 }
 
@@ -1547,9 +1553,6 @@ fn install_prelude(bare: Checker) -> Checker / {abort.raise} = {
   let bound: Checker = builtins().fold(install_prelude_adts(bare), builtin_bound);
   prelude_effects().fold(bound, |c2: Checker, effect_info: EffectInfo| add_effect(c2, effect_info))
 }
-
-/// The name the shipped modules hold the prelude under, which no project's module can take.
-pub fn prelude_module() -> Bytes = b"std.prelude"
 
 /// Only a shipped module declares what the toolchain implements.
 fn refuse_externs(checker: Checker, parsed: ParsedModule) -> Checker =
@@ -9704,14 +9707,15 @@ fn signed_fns(
   }
 }
 
-/// A shipped module's own externs bound as builtins under its name; the prelude's are bound before
-/// any module is checked.
+/// A shipped module's own externs bound as builtins under its name; the prelude's that every module
+/// calls are bound before any module is checked.
 fn externs_bound(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
-  if !is_shipped(parsed.name) || parsed.name == prelude_module() { checker }
+  if !is_shipped(parsed.name) { checker }
   else { externs_of(parsed.name, parsed.module).fold(checker, builtin_bound) }
 
-/// The externs the module `name` declares, each under its program-wide name, at the types the
-/// module declares or imports by name.
+/// The externs the module `name` declares as its own, each under its program-wide name, at the
+/// types the module declares or imports by name: of the prelude's, only the functions of its own
+/// types.
 pub fn externs_of(name: Bytes, module: Module) -> List<Builtin> / {abort.raise} = {
   let own = module.items.fold(
     prelude_imports(module.imports),
@@ -9720,17 +9724,22 @@ pub fn externs_of(name: Bytes, module: Module) -> List<Builtin> / {abort.raise} 
   );
   module.items.fold([], |acc: List<Builtin>, item: Item|
     match item {
-      IExtern(def) -> acc.push(declared(qualify(name, def.name.name), own, def)),
+      IExtern(def) -> if is_builtin(name, module, def) { acc }
+      else { acc.push(declared(qualify(name, def.name.name), own, def)) },
       _ -> acc,
     })
 }
 
-/// A shipped module's own externs, each as the checker binds it under the module's name, with the
-/// name the native implementing it is found by.
-fn module_externs(parsed: ParsedModule) -> List<{ own: Bytes, builtin: Builtin }> / {abort.raise} =
-  if !is_shipped(parsed.name) || parsed.name == prelude_module() { [] } else {
-    externs_of(parsed.name, parsed.module).map(|b: Builtin|
-      { own: b.name.slice(parsed.name.len() + 1, b.name.len()), builtin: b })
+/// The externs of the shipped module `name` a native implements, each as the checker binds it, with
+/// the name the native is found by: every one of its own but those the emitter writes in place.
+pub fn natives_of(
+  name: Bytes,
+  module: Module,
+) -> List<{ own: Bytes, builtin: Builtin }> / {abort.raise} =
+  if !is_shipped(name) { [] } else {
+    externs_of(name, module).filter(|b: Builtin| intrinsic_named(b.name) == None).map(
+      |b: Builtin| { own: b.name.slice(name.len() + 1, b.name.len()), builtin: b },
+    )
   }
 
 /// What an `extern fn` declares of the native that implements it: the module declaring it, the name
@@ -9750,13 +9759,13 @@ fn extern_of(module: Bytes, name: Bytes, b: Builtin) -> Extern =
 pub fn prelude_externs() -> List<Extern> / {abort.raise} =
   builtins().map(|b: Builtin| extern_of(prelude_module(), b.name, b))
 
-/// Each `extern fn` the module `name` declares in `text`, as the checker binds it, which only a
-/// module the toolchain ships does; a text without the word declares none and is not parsed.
+/// Each `extern fn` a native implements that the module `name` declares in `text`, as the checker
+/// binds it, which only a module the toolchain ships does; a text without the word declares none
+/// and is not parsed.
 pub fn externs_in(name: Bytes, text: Bytes) -> List<Extern> / {abort.raise} =
-  if !is_shipped(name) || text.index_of(b"extern") == None { [] } else {
-    module_externs({ name: name, module: parse(text).node, derived: [] }).map(
-      |e: { own: Bytes, builtin: Builtin }| extern_of(name, e.own, e.builtin),
-    )
+  if text.index_of(b"extern") == None { [] } else {
+    natives_of(name, parse(text).node).map(|e: { own: Bytes, builtin: Builtin }|
+      extern_of(name, e.own, e.builtin))
   }
 
 /// `b` bound where a call finds it, with what its declaration states.
@@ -20526,6 +20535,36 @@ test "an `extern type` is its shipped module's, typed by its parameters, and not
     )
   });
   assert_eq(codes(chain.concat(b"fn f(a: T0, b: T0) -> Bool = a == b\n")), [b"E0201"])
+}
+
+// A renamed or deleted declaration of one fails here, not as a call the runtime does not answer.
+test "the externs the emitter writes in place are the prelude's functions of its own types, no builtin and no native" {
+  let text = prelude_source::text();
+  let own = externs_of(prelude_module(), parse(text).node).map(|b: Builtin| b.name);
+  assert_eq(own.sort(), intrinsics().map(|i: { name: Bytes, op: Intrinsic }| i.name).sort());
+  assert_eq(
+    builtins().filter(|b: Builtin| own.contains(qualify(prelude_module(), b.name))).map(
+      |b: Builtin| b.name,
+    ),
+    [],
+  );
+  assert_eq(externs_in(prelude_module(), text), []);
+  // Privacy hides them as it hides any module's own.
+  let prelude = { name: prelude_module(), src: text };
+  let user = |src: Bytes| codes_of([prelude, { name: b"m", src: src }]);
+  assert_eq(user(b"fn f(xs: List<Int>) -> Int = ListNode::start(xs)\n"), [b"E0101"]);
+  assert_eq(user(b"fn f(n: ListNode<Int>) -> Int = 1\n"), [b"E0102"]);
+  assert_eq(user(b"import std.prelude (ListNode)\nfn f(n: ListNode<Int>) -> Int = 1\n"), [
+    b"E0107",
+  ]);
+  assert_eq(user(b"fn f(m: Map<Int, Int>) -> Int = MapNode::height(m)\n"), [b"E0101"]);
+  assert_eq(user(b"fn f(xs: List<Int>) -> Int = xs.tail_len()\n"), [b"E0101"]);
+  assert_eq(
+    user(
+      b"type ListNode = | Leaf(Int)\nfn ListNode::start(l: ListNode) -> Int = match l { Leaf(n) -> n }\nfn f() -> Int = ListNode::start(Leaf(1))\n",
+    ),
+    [],
+  )
 }
 
 test "an extern declares the words a call passes, its witnesses first, and whether it raises" {
