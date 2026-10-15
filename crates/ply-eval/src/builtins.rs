@@ -17,23 +17,21 @@ pub const MAX_ARRAY_LEN: i64 = 1 << 26;
 
 /// `Decimal`'s scale bound, the type's rather than a policy.
 const MAX_DECIMAL_SCALE: u32 = 28;
-/// Every builtin, once: its name in the prelude, the words a call passes, and whether a failure of
-/// it is a raise of `abort.raise`, which the prelude's scheme for it carries in its row and a
-/// `handle` answers (`raises`), or a fault that ends the run (`ends`).
+/// Every builtin, once: its name in the prelude, and the type of the function compiled code calls it
+/// through, off which `ply_codegen::native` reads what the runtime reports of it. That function
+/// takes a word for each parameter, witnesses first, and answers a `Raising` where a failure of it is
+/// a raise of `abort.raise`, which the prelude's scheme for it carries in its row and a `handle`
+/// answers, or a `Word` where a failure ends the run.
 macro_rules! builtins {
-    ($d:tt $( $(#[$doc:meta])* $variant:ident = $name:literal, $arity:tt, $failure:ident; )*) => {
+    (@count) => { 0 };
+    (@count $first:ident $($rest:ident)*) => { 1 + builtins!(@count $($rest)*) };
+    ($d:tt $( $(#[$doc:meta])* $variant:ident = $name:literal ($($param:ident),*) -> $answer:ident; )*) => {
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
         pub enum Builtin {
             $( $(#[$doc])* $variant, )*
         }
 
         impl Builtin {
-            pub fn raises(self) -> bool {
-                match self {
-                    $( Builtin::$variant => builtins!(@raises $failure), )*
-                }
-            }
-
             pub fn from_name(name: &str) -> Option<Builtin> {
                 match name {
                     $( $name => Some(Builtin::$variant), )*
@@ -47,10 +45,10 @@ macro_rules! builtins {
                 }
             }
 
-            /// The words a call passes.
-            pub fn arity(self) -> usize {
+            /// The parameters of the function compiled code calls it through.
+            pub fn words(self) -> usize {
                 match self {
-                    $( Builtin::$variant => $arity, )*
+                    $( Builtin::$variant => builtins!(@count $($param)*), )*
                 }
             }
 
@@ -59,281 +57,279 @@ macro_rules! builtins {
             }
         }
 
-        /// Hands `$m` every builtin as `Variant "name" arity;`: what is made one per builtin is
-        /// made from this table.
+        /// Hands `$m` every builtin as `Variant "name" (parameters) Answer;`: what is made one per
+        /// builtin is made from this table.
         #[macro_export]
         macro_rules! each_builtin {
             ($d m:ident) => {
-                $d m! { $( $variant $name $arity; )* }
+                $d m! { $( $variant $name ($($param),*) $answer; )* }
             };
         }
     };
-    (@raises raises) => { true };
-    (@raises ends) => { false };
 }
 
 builtins! { $
-    Assert = "assert", 2, raises;
-    AssertEq = "assert_eq", 2, raises;
-    Len = "List::len", 1, ends;
-    Push = "List::push", 2, ends;
-    ListAt = "List::at", 2, ends;
+    Assert = "assert" (cond, message) -> Raising;
+    AssertEq = "assert_eq" (actual, expected) -> Raising;
+    Len = "List::len" (xs) -> Word;
+    Push = "List::push" (xs, x) -> Word;
+    ListAt = "List::at" (xs, i) -> Word;
     /// One element replaced, sharing the rest; raises where `List::at` answers `None`.
-    ListSet = "List::set", 3, raises;
-    Map = "List::map", 2, ends;
-    Filter = "List::filter", 2, ends;
-    Fold = "List::fold", 3, ends;
-    Iterate = "iterate", 3, raises;
-    Metered = "metered", 1, ends;
-    Range = "range", 2, ends;
-    WrapAdd = "wrap_add", 2, ends;
-    WrapSub = "wrap_sub", 2, ends;
-    WrapMul = "wrap_mul", 2, ends;
+    ListSet = "List::set" (xs, i, v) -> Raising;
+    Map = "List::map" (xs, f) -> Word;
+    Filter = "List::filter" (xs, f) -> Word;
+    Fold = "List::fold" (xs, init, f) -> Word;
+    Iterate = "iterate" (seed, budget, step) -> Raising;
+    Metered = "metered" (f) -> Word;
+    Range = "range" (lo, hi) -> Word;
+    WrapAdd = "wrap_add" (a, b) -> Word;
+    WrapSub = "wrap_sub" (a, b) -> Word;
+    WrapMul = "wrap_mul" (a, b) -> Word;
     /// The low thirty-two bits of an `Int`, rotated right.
-    Rotr32 = "rotr32", 2, ends;
-    Rotr = "rotr", 2, ends;
-    Rotl = "rotl", 2, ends;
+    Rotr32 = "rotr32" (x, n) -> Word;
+    Rotr = "rotr" (x, n) -> Word;
+    Rotl = "rotl" (x, n) -> Word;
     /// Over any integer type: the exact answer, or the type's nearest value where it leaves it.
-    SaturatingAdd = "saturating_add", 2, ends;
-    SaturatingSub = "saturating_sub", 2, ends;
-    SaturatingMul = "saturating_mul", 2, ends;
+    SaturatingAdd = "saturating_add" (a, b) -> Word;
+    SaturatingSub = "saturating_sub" (a, b) -> Word;
+    SaturatingMul = "saturating_mul" (a, b) -> Word;
     // Field-less rather than carrying an `IntTy`: the enum is cast to a per-builtin cache index.
-    U8OfInt = "U8::of_int", 1, raises;
-    U16OfInt = "U16::of_int", 1, raises;
-    U32OfInt = "U32::of_int", 1, raises;
-    U64OfInt = "U64::of_int", 1, raises;
-    I8OfInt = "I8::of_int", 1, raises;
-    I16OfInt = "I16::of_int", 1, raises;
-    I32OfInt = "I32::of_int", 1, raises;
-    I64OfInt = "I64::of_int", 1, ends;
-    IntOfU8 = "Int::of_u8", 1, ends;
-    IntOfU16 = "Int::of_u16", 1, ends;
-    IntOfU32 = "Int::of_u32", 1, ends;
-    IntOfU64 = "Int::of_u64", 1, raises;
-    IntOfI8 = "Int::of_i8", 1, ends;
-    IntOfI16 = "Int::of_i16", 1, ends;
-    IntOfI32 = "Int::of_i32", 1, ends;
-    IntOfI64 = "Int::of_i64", 1, ends;
-    Min = "min", 2, ends;
-    Max = "max", 2, ends;
-    ByteOfInt = "byte_of_int", 1, raises;
-    IntToString = "Int::to_string", 1, ends;
-    FloatToString = "Float::to_string", 1, ends;
-    StringConcat = "String::concat", 2, ends;
-    BytesLen = "Bytes::len", 1, ends;
-    BytesAt = "Bytes::at", 2, raises;
-    BytesU32Le = "Bytes::u32_le", 2, raises;
-    BytesSlice = "Bytes::slice", 3, raises;
-    BytesConcat = "Bytes::concat", 2, ends;
-    BytesConcatAll = "Bytes::concat_all", 1, ends;
-    BytesBlake3 = "Bytes::blake3", 1, ends;
-    BytesGzip = "Bytes::gzip", 1, ends;
-    BytesGunzip = "Bytes::gunzip", 1, ends;
-    BytesZstd = "Bytes::zstd", 1, ends;
-    BytesOfString = "Bytes::of_string", 1, ends;
-    BytesIsUtf8 = "Bytes::is_utf8", 1, ends;
-    BytesIndexOf = "Bytes::index_of", 2, ends;
-    BytesIndexOfFrom = "Bytes::index_of_from", 3, raises;
-    BytesIndexOfByte = "Bytes::index_of_byte", 2, raises;
-    BytesStartsWith = "Bytes::starts_with", 2, ends;
-    BytesEndsWith = "Bytes::ends_with", 2, ends;
-    BytesSplit = "Bytes::split", 2, raises;
-    BytesScan = "Bytes::scan", 4, raises;
-    BytesScanUntil = "Bytes::scan_until", 4, raises;
-    BytesPosition = "Bytes::position", 3, raises;
-    StringOfBytes = "String::of_bytes", 1, raises;
-    StringOfBytesLossy = "String::of_bytes_lossy", 1, ends;
-    StringLen = "String::len", 1, ends;
-    StringSlice = "String::slice", 3, raises;
-    StringSplit = "String::split", 2, raises;
-    StringTrim = "String::trim", 1, ends;
-    StringLower = "String::lower", 1, ends;
-    StringUpper = "String::upper", 1, ends;
-    StringStartsWith = "String::starts_with", 2, ends;
-    StringEndsWith = "String::ends_with", 2, ends;
-    StringContains = "String::contains", 2, ends;
-    StringFind = "String::find", 2, raises;
-    MapNew = "Map::new", 0, ends;
-    MapInsert = "Map::insert", 3, ends;
-    MapGet = "Map::get", 2, ends;
-    MapContains = "Map::contains", 2, ends;
-    MapRemove = "Map::remove", 2, ends;
-    MapLen = "Map::len", 1, ends;
-    MapKeys = "Map::keys", 1, ends;
-    MapValues = "Map::values", 1, ends;
-    MapEntries = "Map::entries", 1, ends;
-    MapOfEntries = "Map::of_entries", 1, ends;
-    MapMerge = "Map::merge", 2, ends;
-    MapFold = "Map::fold", 3, ends;
+    U8OfInt = "U8::of_int" (n) -> Raising;
+    U16OfInt = "U16::of_int" (n) -> Raising;
+    U32OfInt = "U32::of_int" (n) -> Raising;
+    U64OfInt = "U64::of_int" (n) -> Raising;
+    I8OfInt = "I8::of_int" (n) -> Raising;
+    I16OfInt = "I16::of_int" (n) -> Raising;
+    I32OfInt = "I32::of_int" (n) -> Raising;
+    I64OfInt = "I64::of_int" (n) -> Word;
+    IntOfU8 = "Int::of_u8" (n) -> Word;
+    IntOfU16 = "Int::of_u16" (n) -> Word;
+    IntOfU32 = "Int::of_u32" (n) -> Word;
+    IntOfU64 = "Int::of_u64" (n) -> Raising;
+    IntOfI8 = "Int::of_i8" (n) -> Word;
+    IntOfI16 = "Int::of_i16" (n) -> Word;
+    IntOfI32 = "Int::of_i32" (n) -> Word;
+    IntOfI64 = "Int::of_i64" (n) -> Word;
+    Min = "min" (a, b) -> Word;
+    Max = "max" (a, b) -> Word;
+    ByteOfInt = "byte_of_int" (n) -> Raising;
+    IntToString = "Int::to_string" (n) -> Word;
+    FloatToString = "Float::to_string" (f) -> Word;
+    StringConcat = "String::concat" (a, b) -> Word;
+    BytesLen = "Bytes::len" (b) -> Word;
+    BytesAt = "Bytes::at" (b, i) -> Raising;
+    BytesU32Le = "Bytes::u32_le" (b, i) -> Raising;
+    BytesSlice = "Bytes::slice" (b, start, end) -> Raising;
+    BytesConcat = "Bytes::concat" (a, b) -> Word;
+    BytesConcatAll = "Bytes::concat_all" (bs) -> Word;
+    BytesBlake3 = "Bytes::blake3" (b) -> Word;
+    BytesGzip = "Bytes::gzip" (b) -> Word;
+    BytesGunzip = "Bytes::gunzip" (b) -> Word;
+    BytesZstd = "Bytes::zstd" (b) -> Word;
+    BytesOfString = "Bytes::of_string" (s) -> Word;
+    BytesIsUtf8 = "Bytes::is_utf8" (b) -> Word;
+    BytesIndexOf = "Bytes::index_of" (hay, needle) -> Word;
+    BytesIndexOfFrom = "Bytes::index_of_from" (hay, needle, from) -> Raising;
+    BytesIndexOfByte = "Bytes::index_of_byte" (hay, byte) -> Raising;
+    BytesStartsWith = "Bytes::starts_with" (b, prefix) -> Word;
+    BytesEndsWith = "Bytes::ends_with" (b, suffix) -> Word;
+    BytesSplit = "Bytes::split" (b, sep) -> Raising;
+    BytesScan = "Bytes::scan" (hay, from, class, budget) -> Raising;
+    BytesScanUntil = "Bytes::scan_until" (hay, from, class, budget) -> Raising;
+    BytesPosition = "Bytes::position" (b, from, f) -> Raising;
+    StringOfBytes = "String::of_bytes" (b) -> Raising;
+    StringOfBytesLossy = "String::of_bytes_lossy" (b) -> Word;
+    StringLen = "String::len" (s) -> Word;
+    StringSlice = "String::slice" (s, start, end) -> Raising;
+    StringSplit = "String::split" (s, sep) -> Raising;
+    StringTrim = "String::trim" (s) -> Word;
+    StringLower = "String::lower" (s) -> Word;
+    StringUpper = "String::upper" (s) -> Word;
+    StringStartsWith = "String::starts_with" (s, prefix) -> Word;
+    StringEndsWith = "String::ends_with" (s, suffix) -> Word;
+    StringContains = "String::contains" (s, t) -> Word;
+    StringFind = "String::find" (s, needle) -> Raising;
+    MapNew = "Map::new" () -> Word;
+    MapInsert = "Map::insert" (m, key, value) -> Word;
+    MapGet = "Map::get" (m, key) -> Word;
+    MapContains = "Map::contains" (m, key) -> Word;
+    MapRemove = "Map::remove" (m, key) -> Word;
+    MapLen = "Map::len" (m) -> Word;
+    MapKeys = "Map::keys" (m) -> Word;
+    MapValues = "Map::values" (m) -> Word;
+    MapEntries = "Map::entries" (m) -> Word;
+    MapOfEntries = "Map::of_entries" (es) -> Word;
+    MapMerge = "Map::merge" (a, b) -> Word;
+    MapFold = "Map::fold" (m, init, f) -> Word;
     /// `CellUpdate`'s shape over one map entry.
-    MapUpdate = "Map::update", 3, ends;
-    DecimalDiv = "Decimal::div", 4, raises;
-    DecimalRound = "Decimal::round", 3, raises;
-    DecimalOfInt = "Decimal::of_int", 1, ends;
-    IntOfDecimal = "Int::of_decimal", 2, ends;
-    FloatOfDecimal = "Float::of_decimal", 1, ends;
-    DecimalOfFloat = "Decimal::of_float", 1, ends;
-    DecimalOfString = "Decimal::of_string", 1, ends;
+    MapUpdate = "Map::update" (m, key, f) -> Word;
+    DecimalDiv = "Decimal::div" (a, b, scale, mode) -> Raising;
+    DecimalRound = "Decimal::round" (d, scale, mode) -> Raising;
+    DecimalOfInt = "Decimal::of_int" (n) -> Word;
+    IntOfDecimal = "Int::of_decimal" (d, mode) -> Word;
+    FloatOfDecimal = "Float::of_decimal" (d) -> Word;
+    DecimalOfFloat = "Decimal::of_float" (f) -> Word;
+    DecimalOfString = "Decimal::of_string" (s) -> Word;
     /// The lexer's float parse over text, reaching `Float`s no route through `Decimal` does.
-    FloatOfString = "Float::of_string", 1, ends;
-    DecimalToString = "Decimal::to_string", 1, ends;
-    DecimalScale = "Decimal::scale", 1, ends;
+    FloatOfString = "Float::of_string" (s) -> Word;
+    DecimalToString = "Decimal::to_string" (d) -> Word;
+    DecimalScale = "Decimal::scale" (d) -> Word;
     /// The IEEE 754 bit pattern, as the signed 64-bit `Int` it fits in.
-    BitsOfFloat = "bits_of_float", 1, ends;
-    FloatOfBits = "Float::of_bits", 1, ends;
-    Compare = "compare", 2, ends;
+    BitsOfFloat = "bits_of_float" (f) -> Word;
+    FloatOfBits = "Float::of_bits" (n) -> Word;
+    Compare = "compare" (x, y) -> Word;
     /// The same order as [`Builtin::Compare`], under a name a module may not declare.
-    CompareValues = "compare_values", 2, ends;
-    CellGet = "cell_get", 1, ends;
-    CellSet = "cell_set", 2, ends;
+    CompareValues = "compare_values" (x, y) -> Word;
+    CellGet = "cell_get" (c) -> Word;
+    CellSet = "cell_set" (c, v) -> Word;
     /// Takes the contents out for the call, so an append inside the function owns them.
-    CellUpdate = "cell_update", 2, ends;
-    Panic = "panic", 1, raises;
+    CellUpdate = "cell_update" (c, f) -> Word;
+    Panic = "panic" (message) -> Raising;
     /// The identity a benchmark pins a measured value with: opaque, so it is not optimized away.
-    Observe = "observe", 1, ends;
-    SecretOfString = "Secret::of_string", 1, ends;
-    SecretVerify = "Secret::verify", 2, ends;
-    SecretIsEmpty = "Secret::is_empty", 1, ends;
+    Observe = "observe" (value) -> Word;
+    SecretOfString = "Secret::of_string" (s) -> Word;
+    SecretVerify = "Secret::verify" (stored, supplied) -> Word;
+    SecretIsEmpty = "Secret::is_empty" (s) -> Word;
     // Appended, so every earlier builtin keeps its cache index.
-    U128OfInt = "U128::of_int", 1, raises;
-    I128OfInt = "I128::of_int", 1, ends;
-    IntOfU128 = "Int::of_u128", 1, raises;
-    IntOfI128 = "Int::of_i128", 1, raises;
-    U128ToString = "U128::to_string", 1, ends;
-    I128ToString = "I128::to_string", 1, ends;
-    U128OfString = "U128::of_string", 1, ends;
-    I128OfString = "I128::of_string", 1, ends;
+    U128OfInt = "U128::of_int" (n) -> Raising;
+    I128OfInt = "I128::of_int" (n) -> Word;
+    IntOfU128 = "Int::of_u128" (n) -> Raising;
+    IntOfI128 = "Int::of_i128" (n) -> Raising;
+    U128ToString = "U128::to_string" (n) -> Word;
+    I128ToString = "I128::to_string" (n) -> Word;
+    U128OfString = "U128::of_string" (s) -> Word;
+    I128OfString = "I128::of_string" (s) -> Word;
     /// Over any integer type: the exact answer, or `None` where it leaves the type.
-    CheckedAdd = "checked_add", 2, ends;
-    CheckedSub = "checked_sub", 2, ends;
-    CheckedMul = "checked_mul", 2, ends;
-    CheckedNeg = "checked_neg", 1, ends;
+    CheckedAdd = "checked_add" (a, b) -> Word;
+    CheckedSub = "checked_sub" (a, b) -> Word;
+    CheckedMul = "checked_mul" (a, b) -> Word;
+    CheckedNeg = "checked_neg" (a) -> Word;
     /// `None` for a surrogate or past `U+10FFFF`, which no `Char` is.
-    CharOfInt = "Char::of_int", 1, ends;
-    IntOfChar = "Int::of_char", 1, ends;
-    StringChars = "String::chars", 1, ends;
-    StringOfChars = "String::of_chars", 1, ends;
-    ArrayNew = "Array::new", 2, raises;
-    ArrayOfList = "Array::of_list", 1, ends;
-    ArrayToList = "Array::to_list", 1, ends;
-    ArrayLen = "Array::len", 1, ends;
-    ArrayAt = "Array::at", 2, ends;
+    CharOfInt = "Char::of_int" (n) -> Word;
+    IntOfChar = "Int::of_char" (c) -> Word;
+    StringChars = "String::chars" (s) -> Word;
+    StringOfChars = "String::of_chars" (cs) -> Word;
+    ArrayNew = "Array::new" (n, x) -> Raising;
+    ArrayOfList = "Array::of_list" (xs) -> Word;
+    ArrayToList = "Array::to_list" (xs) -> Word;
+    ArrayLen = "Array::len" (xs) -> Word;
+    ArrayAt = "Array::at" (xs, i) -> Word;
     /// Raises where `Array::at` answers `None`.
-    ArrayGet = "Array::get", 2, raises;
+    ArrayGet = "Array::get" (xs, i) -> Raising;
     /// In place while the array has one holder; raises out of range.
-    ArraySet = "Array::set", 3, raises;
+    ArraySet = "Array::set" (xs, i, v) -> Raising;
     /// An array of records holding each field apart, the compiled runtime's columns; as a value it
     /// is the array of its records, and each builtin answers as its `array_` namesake does.
-    ColumnsNew = "Columns::new", 2, raises;
-    ColumnsOfList = "Columns::of_list", 1, ends;
-    ColumnsToList = "Columns::to_list", 1, ends;
-    ColumnsLen = "Columns::len", 1, ends;
-    ColumnsAt = "Columns::at", 2, ends;
-    ColumnsGet = "Columns::get", 2, raises;
-    ColumnsSet = "Columns::set", 3, raises;
+    ColumnsNew = "Columns::new" (n, x) -> Raising;
+    ColumnsOfList = "Columns::of_list" (xs) -> Word;
+    ColumnsToList = "Columns::to_list" (xs) -> Word;
+    ColumnsLen = "Columns::len" (xs) -> Word;
+    ColumnsAt = "Columns::at" (xs, i) -> Word;
+    ColumnsGet = "Columns::get" (xs, i) -> Raising;
+    ColumnsSet = "Columns::set" (xs, i, v) -> Raising;
     /// The value as a `std.value.Value`, whole.
-    Reflect = "reflect", 1, ends;
+    Reflect = "reflect" (x) -> Word;
     /// As `reflect`, with a value whose type states a `show` as `VShown` of what that function
     /// writes: what `std.show.show` renders.
-    Shown = "shown", 1, ends;
+    Shown = "shown" (x) -> Word;
     /// BLAKE3 of the value's canonical encoding, under `derivable(hash, a)`.
-    Digest = "digest", 1, ends;
+    Digest = "digest" (x) -> Word;
     /// The value's canonical encoding, whose BLAKE3 is its `digest`: what code written from a type
     /// reads of a part it does not lay out itself. No source can spell it.
-    Encoded = "?encoded", 1, ends;
+    Encoded = "?encoded" (x) -> Word;
     /// `bracket(acquire, release, body)`: `release` runs on every exit from `body` but a failure.
-    Bracket = "bracket", 3, ends;
+    Bracket = "bracket" (acquire, release, body) -> Word;
     /// An operator over a `numeric` or `integer` type parameter: `?numeric_binary(op, witness, x,
     /// y)`, its operands read as the type the witness names. No source can spell it; the
     /// elaboration writes it.
-    NumericBinary = "?numeric_binary", 4, ends;
-    NumericUnary = "?numeric_unary", 3, ends;
+    NumericBinary = "?numeric_binary" (op, witness, x, y) -> Word;
+    NumericUnary = "?numeric_unary" (op, witness, x) -> Word;
     /// `numeric_of_int(n)`, called with the witness the elaboration passes first.
-    NumericOfInt = "numeric_of_int", 2, raises;
+    NumericOfInt = "numeric_of_int" (witness, n) -> Raising;
     /// `to_int(x)`, called with the witness the elaboration passes first.
-    ToInt = "to_int", 2, ends;
-    FloatOfInt = "Float::of_int", 1, ends;
+    ToInt = "to_int" (witness, x) -> Word;
+    FloatOfInt = "Float::of_int" (n) -> Word;
     /// `None` for a NaN, an infinity, or a value past `Int` once rounded.
-    IntOfFloat = "Int::of_float", 2, ends;
-    Floor = "Float::floor", 1, ends;
-    Ceil = "Float::ceil", 1, ends;
-    Round = "Float::round", 2, ends;
-    Sqrt = "Float::sqrt", 1, ends;
-    Pow = "Float::pow", 2, ends;
-    Exp = "Float::exp", 1, ends;
-    Ln = "Float::ln", 1, ends;
-    Log2 = "Float::log2", 1, ends;
-    Log10 = "Float::log10", 1, ends;
-    Sin = "Float::sin", 1, ends;
-    Cos = "Float::cos", 1, ends;
-    Tan = "Float::tan", 1, ends;
-    Asin = "Float::asin", 1, ends;
-    Acos = "Float::acos", 1, ends;
-    Atan = "Float::atan", 1, ends;
-    Atan2 = "Float::atan2", 2, ends;
-    Hypot = "Float::hypot", 2, ends;
+    IntOfFloat = "Int::of_float" (x, mode) -> Word;
+    Floor = "Float::floor" (x) -> Word;
+    Ceil = "Float::ceil" (x) -> Word;
+    Round = "Float::round" (x, mode) -> Word;
+    Sqrt = "Float::sqrt" (x) -> Word;
+    Pow = "Float::pow" (x, y) -> Word;
+    Exp = "Float::exp" (x) -> Word;
+    Ln = "Float::ln" (x) -> Word;
+    Log2 = "Float::log2" (x) -> Word;
+    Log10 = "Float::log10" (x) -> Word;
+    Sin = "Float::sin" (x) -> Word;
+    Cos = "Float::cos" (x) -> Word;
+    Tan = "Float::tan" (x) -> Word;
+    Asin = "Float::asin" (x) -> Word;
+    Acos = "Float::acos" (x) -> Word;
+    Atan = "Float::atan" (x) -> Word;
+    Atan2 = "Float::atan2" (y, x) -> Word;
+    Hypot = "Float::hypot" (x, y) -> Word;
     /// The entry at an end of a map's key order, as `Some({key, value})`.
-    MapFirst = "Map::first", 1, ends;
-    MapLast = "Map::last", 1, ends;
+    MapFirst = "Map::first" (m) -> Word;
+    MapLast = "Map::last" (m) -> Word;
     /// The entry nearest a key from one side, the key's own counted or not.
-    MapFloor = "Map::floor", 2, ends;
-    MapCeiling = "Map::ceiling", 2, ends;
-    MapBelow = "Map::below", 2, ends;
-    MapAbove = "Map::above", 2, ends;
+    MapFloor = "Map::floor" (m, key) -> Word;
+    MapCeiling = "Map::ceiling" (m, key) -> Word;
+    MapBelow = "Map::below" (m, key) -> Word;
+    MapAbove = "Map::above" (m, key) -> Word;
     /// An end's entry with the map that is left, in place while the map has one holder.
-    MapPopFirst = "Map::pop_first", 1, ends;
-    MapPopLast = "Map::pop_last", 1, ends;
+    MapPopFirst = "Map::pop_first" (m) -> Word;
+    MapPopLast = "Map::pop_last" (m) -> Word;
     /// `Map::range(m, lo, lo_inclusive, hi, hi_inclusive, limit)`.
-    MapRange = "Map::range", 6, ends;
-    MapSplit = "Map::split", 2, ends;
+    MapRange = "Map::range" (m, lo, lo_inclusive, hi, hi_inclusive, limit) -> Word;
+    MapSplit = "Map::split" (m, key) -> Word;
     /// What a hold holds, while its region has not let it go.
-    HoldGet = "Hold::get", 1, ends;
+    HoldGet = "Hold::get" (h) -> Word;
     /// A hold's contents moved out for its release, so the next read finds them gone. No source
     /// can spell it; the lowering of `with_hold` writes it.
-    HoldTake = "?hold_take", 1, ends;
+    HoldTake = "?hold_take" (h) -> Word;
     /// [`Builtin::Bracket`] under a name no module rebinds, for the lowering of `with_hold`.
-    HoldBracket = "?hold_bracket", 3, ends;
+    HoldBracket = "?hold_bracket" (acquire, release, body) -> Word;
     /// Bytes as a credential, and what is made of one without opening it.
-    SecretOfBytes = "Secret::of_bytes", 1, ends;
-    SecretBytes = "Secret::bytes", 1, ends;
-    SecretLen = "Secret::len", 1, ends;
-    SecretConcat = "Secret::concat", 2, ends;
+    SecretOfBytes = "Secret::of_bytes" (b) -> Word;
+    SecretBytes = "Secret::bytes" (s) -> Word;
+    SecretLen = "Secret::len" (s) -> Word;
+    SecretConcat = "Secret::concat" (a, b) -> Word;
     /// `Secret::decode(encoding, text)`: `None` for a text the encoding does not write.
-    SecretDecode = "Secret::decode", 2, raises;
+    SecretDecode = "Secret::decode" (encoding, text) -> Raising;
     /// The private key a DER document holds, with the scheme it is a key of.
-    SecretPrivateKey = "Secret::private_key", 1, ends;
+    SecretPrivateKey = "Secret::private_key" (der) -> Word;
     /// Keyed hashing under a credential; `None` for a hash the runtime does not key.
-    SecretHmac = "Secret::hmac", 3, ends;
-    SecretHkdfExtract = "Secret::hkdf_extract", 3, ends;
-    SecretHkdfExpand = "Secret::hkdf_expand", 4, ends;
-    SecretPbkdf2 = "Secret::pbkdf2", 5, ends;
+    SecretHmac = "Secret::hmac" (hash, key, message) -> Word;
+    SecretHkdfExtract = "Secret::hkdf_extract" (hash, salt, key) -> Word;
+    SecretHkdfExpand = "Secret::hkdf_expand" (hash, key, info, length) -> Word;
+    SecretPbkdf2 = "Secret::pbkdf2" (hash, password, salt, iterations, length) -> Word;
     /// `crypto_seal(cipher, key, nonce, associated, plaintext)` and its inverse.
-    CryptoSeal = "crypto_seal", 5, raises;
-    CryptoOpen = "crypto_open", 5, raises;
-    CryptoPublic = "crypto_public", 2, raises;
-    CryptoSign = "crypto_sign", 3, raises;
-    CryptoVerify = "crypto_verify", 4, raises;
-    CryptoAgree = "crypto_agree", 3, raises;
+    CryptoSeal = "crypto_seal" (cipher, key, nonce, associated, plaintext) -> Raising;
+    CryptoOpen = "crypto_open" (cipher, key, nonce, associated, sealed) -> Raising;
+    CryptoPublic = "crypto_public" (scheme, key) -> Raising;
+    CryptoSign = "crypto_sign" (scheme, key, message) -> Raising;
+    CryptoVerify = "crypto_verify" (scheme, public, message, signature) -> Raising;
+    CryptoAgree = "crypto_agree" (scheme, key, peer) -> Raising;
     /// [`Builtin::CellSet`] under a name no module rebinds: the lowering of `with_hold` puts what
     /// `acquire` answered into the hold inside the bracket's own acquire, where a cancel takes no
     /// answer.
-    HoldPut = "?hold_put", 2, ends;
+    HoldPut = "?hold_put" (h, x) -> Word;
     /// `sqlite_run(image, sql, params, reads_only, strict, limits)`: one statement over the
     /// database an image holds, answering the image it leaves.
-    SqliteRun = "sqlite_run", 6, ends;
-    SqliteFunctions = "sqlite_functions", 0, ends;
+    SqliteRun = "sqlite_run" (image, sql, params, reads_only, strict, limits) -> Word;
+    SqliteFunctions = "sqlite_functions" () -> Word;
     /// `Secret::encode(encoding, bytes)`: the text a credential's bytes are in an encoding, sealed.
-    SecretEncode = "Secret::encode", 2, raises;
+    SecretEncode = "Secret::encode" (encoding, bytes) -> Raising;
     /// `Secret::rsa_jwk(n, e, [d, p, q, dp, dq, qi])`: the PKCS #1 document an RSA JSON Web Key's
     /// numbers make, each private one its base64url text sealed; `None` for numbers that are no key.
-    SecretRsaJwk = "Secret::rsa_jwk", 3, raises;
+    SecretRsaJwk = "Secret::rsa_jwk" (n, e, private) -> Raising;
     /// Variable `i` of the `handle` whose body starts, given its first value. No source can spell
     /// these three; the lowering of a handler's `var`s writes them.
-    HandlerInit = "?handler_init", 2, ends;
+    HandlerInit = "?handler_init" (i, x) -> Word;
     /// Variable `i` of the handler whose clause runs.
-    HandlerVar = "?handler_var", 1, ends;
+    HandlerVar = "?handler_var" (i) -> Word;
     /// Variable `i` of the handler whose clause runs, given a new value.
-    HandlerSet = "?handler_set", 2, ends;
+    HandlerSet = "?handler_set" (i, x) -> Word;
 }
 
 impl Builtin {
@@ -498,11 +494,11 @@ pub fn call(b: Builtin, mut args: Vec<Value>, span: Span) -> Result<Value, Diagn
 }
 
 fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
-    if args.len() != b.arity() {
+    if args.len() != b.words() {
         return Err(arity_error(
             span,
             &format!("`{}`", b.name()),
-            b.arity(),
+            b.words(),
             args.len(),
         ));
     }

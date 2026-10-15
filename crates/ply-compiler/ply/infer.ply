@@ -131,6 +131,13 @@ pub type CtorInfo = {
   at: Location,
 }
 pub type DefConstraint = { deriver: Deriver, param: Int }
+
+/// The type parameters a call passes a witness for, each once, in the order the constraints first
+/// name them: one for each parameter a `numeric` or `integer` constrains, however many do.
+pub fn witnessed(constraints: List<DefConstraint>) -> List<Int> =
+  constraints.fold([], |acc: List<Int>, c: DefConstraint|
+    if !is_predicate(c.deriver) || acc.contains(c.param) { acc } else { acc.push(c.param) })
+
 /// What a type's module states its values go through: `by` is the function, and `answers` what it
 /// answers over the type's own type and row parameters, as the function's signature numbers them.
 pub type InstanceInfo = {
@@ -10050,6 +10057,40 @@ pub fn externs_of(name: Bytes, module: Module) -> List<Builtin> / {abort.raise} 
       _ -> acc,
     })
 }
+
+/// A shipped module's own externs, each as the checker binds it under the module's name, with the
+/// name the native implementing it is found by.
+fn module_externs(parsed: ParsedModule) -> List<{ own: Bytes, builtin: Builtin }> / {abort.raise} =
+  if !is_shipped(parsed.name) || parsed.name == prelude_module() { [] } else {
+    externs_of(parsed.name, parsed.module).map(|b: Builtin|
+      { own: b.name.slice(parsed.name.len() + 1, b.name.len()), builtin: b })
+  }
+
+/// What an `extern fn` declares of the native that implements it: the module declaring it, the name
+/// the native is found by, the words a call passes, its witnesses first, and whether a failure of it
+/// raises rather than ending the run.
+pub type Extern = { module: Bytes, name: Bytes, words: Int, raises: Bool }
+
+fn extern_of(module: Bytes, name: Bytes, b: Builtin) -> Extern =
+  {
+    module: module,
+    name: name,
+    words: witnessed(b.constraints).len() + b.params.len(),
+    raises: b.contract.raises,
+  }
+
+/// Each `extern fn` the prelude declares, in its order.
+pub fn prelude_externs() -> List<Extern> / {abort.raise} =
+  builtins().map(|b: Builtin| extern_of(prelude_module(), b.name, b))
+
+/// Each `extern fn` the module `name` declares in `text`, as the checker binds it, which only a
+/// module the toolchain ships does; a text without the word declares none and is not parsed.
+pub fn externs_in(name: Bytes, text: Bytes) -> List<Extern> / {abort.raise} =
+  if !is_shipped(name) || text.index_of(b"extern") == None { [] } else {
+    module_externs({ name: name, module: parse(text).node, derived: [] }).map(
+      |e: { own: Bytes, builtin: Builtin }| extern_of(name, e.own, e.builtin),
+    )
+  }
 
 /// `b` bound where a call finds it, with what its declaration states.
 fn builtin_bound(c: Checker, b: Builtin) -> Checker / {abort.raise} =
@@ -21090,6 +21131,25 @@ test "an `extern type` is its shipped module's, typed by its parameters, and not
     )
   });
   assert_eq(codes(chain.concat(b"fn f(a: T0, b: T0) -> Bool = a == b\n")), [b"E0201"])
+}
+
+test "an extern declares the words a call passes, its witnesses first, and whether it raises" {
+  let named = |name: Bytes|
+    prelude_externs().filter(|e: Extern| e.name == name).map(|e: Extern|
+      { words: e.words, raises: e.raises });
+  assert_eq(named(b"List::len"), [{ words: 1, raises: false }]);
+  assert_eq(named(b"numeric_of_int"), [{ words: 2, raises: true }]);
+  assert_eq(
+    externs_in(
+      b"std.native",
+      b"  extern  fn spaced<a, b>(x: a, y: b) -> a\n  where numeric(a), integer(a), numeric(b)\n\n/// Doubled.\npub extern fn doubled<a>(x: a) -> a / {abort.raise}\n  where numeric(a)\n\nfn not_one() -> Bytes = b\"extern fn one()\"\n",
+    ),
+    [
+      { module: b"std.native", name: b"spaced", words: 4, raises: false },
+      { module: b"std.native", name: b"doubled", words: 2, raises: true },
+    ],
+  );
+  assert_eq(externs_in(b"m", b"extern fn doubled(x: Int) -> Int\n"), [])
 }
 
 test "a constant past Int's range leaves the termination check unsure rather than broken" {

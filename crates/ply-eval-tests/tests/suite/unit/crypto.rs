@@ -262,7 +262,7 @@ fn a_misuse_raises_and_names_no_key() {
         ),
     ];
     for (builtin, args) in misuses {
-        assert!(builtin.raises(), "{builtin:?}");
+        assert!(ply_codegen::rt::signature(builtin).raises, "{builtin:?}");
         let d = call(builtin, args, Span::DUMMY).expect_err("a misuse raises");
         assert_eq!(d.code, codes::RUNTIME_ERROR, "{builtin:?}");
         assert!(!format!("{d:#?}").contains("hunter2"), "{d:#?}");

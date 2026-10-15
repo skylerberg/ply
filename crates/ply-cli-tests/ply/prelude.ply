@@ -1,6 +1,7 @@
-//! The runtime's builtins and the shipped modules' externs that type them: the same names, each
-//! call passing as many words as the checker binds it to, its witnesses first, and none raising
-//! where its `requires` says it cannot or answering what its `ensures` rules out.
+//! The natives the runtime reports, read off the functions it binds, and the shipped modules'
+//! externs that type them: the same names, each call passing as many words as the checker binds it
+//! to, its witnesses first, and none raising where its `requires` says it cannot or answering what
+//! its `ensures` rules out.
 
 import compiler.emit (builtin_helper)
 import compiler.exprs (Param, expr_span)
@@ -9,7 +10,8 @@ import compiler.items (DNumeric, DOrd, ExternDef, IExtern, Item, SEnsures, SRequ
                        SpecKind, parse)
 import compiler.type_syntax (TypeExpr, TCon, TFn, TVar)
 import compiler.types (Atom, TyFn)
-import compiler.unit (Helper, shipped)
+import compiler.rewrite (Elaborated, elaborated_natives)
+import compiler.unit (Helper, Native, Unbound, declared_natives, shipped, unbound)
 import harness (in_memory, one, prelude_file, said, json_of, at, path, items, str, int, std_modules,
                 StdModule)
 import std.bytes
@@ -32,12 +34,12 @@ fn words(row: BuiltinRow) -> Int / {abort.raise} =
       _ -> panic(named(row.name) ++ "'s scheme is not a function"),
     })
 
+fn natives() -> Map<Bytes, Native> / {shipped.runtime} =
+  shipped.runtime().natives.fold(Map::new(), |acc: Map<Bytes, Native>, n: Native|
+    acc.insert(n.name, n))
+
 test "every builtin a shipped module declares passes the words the runtime's takes" {
-  let runtime = shipped.builtins().fold(
-    Map::new(),
-    |acc: Map<Bytes, Int>, b: { name: Bytes, arity: Int, raises: Bool }|
-      acc.insert(b.name, b.arity),
-  );
+  let runtime = natives();
   rows().fold((), |_u: Unit, row: BuiltinRow|
     match runtime.get(row.name) {
       None ->
@@ -47,9 +49,9 @@ test "every builtin a shipped module declares passes the words the runtime's tak
         ),
       Some(n) ->
         assert(
-          n == words(row),
+          n.words == words(row) && n.answers,
           Some(
-            named(row.name) ++ " takes " ++ n.to_string() ++ " words in the runtime and "
+            named(row.name) ++ " takes " ++ n.words.to_string() ++ " words in the runtime and "
               ++ words(row).to_string()
               ++ " in its declaration's scheme",
           ),
@@ -57,12 +59,26 @@ test "every builtin a shipped module declares passes the words the runtime's tak
     })
 }
 
+// What a unit calls is checked as it is linked; this holds all of it, called or not.
+test "the runtime implements every native the compiler declares, once and as declared" {
+  assert_eq(
+    unbound(shipped.runtime().natives, declared_natives()).map(|u: Unbound| u.declared.name),
+    [],
+  );
+  let written = elaborated_natives().map(|n: Elaborated| n.name);
+  assert_eq(
+    shipped.runtime().natives.map(|n: Native| n.name).filter(|n: Bytes|
+      n.starts_with(b"?") && !written.contains(n)),
+    [],
+  )
+}
+
 // A name no source can spell is the elaboration's to write, never a program's to call.
 test "every builtin the runtime implements is one a program can call" {
   let typed = rows().fold(Map::new(), |acc: Map<Bytes, Bool>, row: BuiltinRow|
     acc.insert(row.name, true));
-  let untyped = shipped.builtins().map(|b: { name: Bytes, arity: Int, raises: Bool }|
-    b.name).filter(|n: Bytes| !typed.contains(n) && !n.starts_with(b"?"));
+  let untyped = shipped.runtime().natives.map(|n: Native| n.name).filter(|n: Bytes|
+    !typed.contains(n) && !n.starts_with(b"?"));
   assert(
     untyped.len() == 0,
     Some("builtins no shipped module declares: " ++ String::of_bytes(Bytes::join(untyped, b", "))),
@@ -77,21 +93,17 @@ fn typed_raises(row: BuiltinRow) -> Bool =
 
 // The runtime answers a builtin's failure with a raise only where the scheme lets a `handle` see one.
 test "every builtin raises exactly when its scheme says it may" {
-  let runtime = shipped.builtins().fold(
-    Map::new(),
-    |acc: Map<Bytes, Bool>, b: { name: Bytes, arity: Int, raises: Bool }|
-      acc.insert(b.name, b.raises),
-  );
+  let runtime = natives();
   rows().fold((), |_u: Unit, row: BuiltinRow|
     match runtime.get(row.name) {
       None -> (),
-      Some(raises) ->
+      Some(n) ->
         assert(
-          raises == typed_raises(row),
+          n.raises == typed_raises(row),
           Some(
             named(row.name) ++ (if typed_raises(row) { " raises" } else { " cannot raise" })
               ++ " by its scheme, and the runtime says "
-              ++ (if raises { "it raises" } else { "it cannot" }),
+              ++ (if n.raises { "it raises" } else { "it cannot" }),
           ),
         ),
     })
@@ -101,14 +113,14 @@ test "every builtin raises exactly when its scheme says it may" {
 test "every builtin has the helper the emitter calls it through, taking the words a call passes" {
   let helpers = shipped.runtime().helpers.fold(Map::new(), |acc: Map<Bytes, Helper>, h: Helper|
     acc.insert(h.name, h));
-  shipped.builtins().fold((), |_u: Unit, b: { name: Bytes, arity: Int, raises: Bool }|
-    match helpers.get(builtin_helper(b.name)) {
-      None -> panic("the runtime has no helper for " ++ named(b.name)),
+  shipped.runtime().natives.fold((), |_u: Unit, n: Native|
+    match helpers.get(builtin_helper(n.name)) {
+      None -> panic("the runtime has no helper for " ++ named(n.name)),
       Some(h) ->
         assert(
-          h.args == b.arity && h.answers,
+          h.args == n.words && h.answers == n.answers,
           Some(
-            named(b.name) ++ " passes " ++ b.arity.to_string() ++ " words, and its helper takes "
+            named(n.name) ++ " passes " ++ n.words.to_string() ++ " words, and its helper takes "
               ++ h.args.to_string(),
           ),
         ),

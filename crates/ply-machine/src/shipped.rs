@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 13] = [
+const OPERATIONS: [(&str, &str); 12] = [
     ("names", "ply_machine::shipped::names"),
     ("module", "ply_machine::shipped::module"),
     ("answer", "ply_machine::shipped::answer"),
@@ -18,7 +18,6 @@ const OPERATIONS: [(&str, &str); 13] = [
     ("runnable", "ply_machine::shipped::runnable"),
     ("front", "ply_machine::shipped::front"),
     ("values", "ply_machine::shipped::values"),
-    ("builtins", "ply_machine::shipped::builtins"),
     ("definitions", "ply_machine::shipped::definitions"),
 ];
 
@@ -138,18 +137,6 @@ impl HostHandler for Shipped {
                 PlyValue::bytes(ENTERED.get().map_or("", String::as_str).as_bytes())
             }
             ("runtime", []) => runtime(),
-            ("builtins", []) => PlyValue::list(
-                ply_eval::Builtin::all()
-                    .iter()
-                    .map(|b| {
-                        crate::payload::record(vec![
-                            ("name", PlyValue::bytes(b.name())),
-                            ("arity", PlyValue::Int(b.arity() as i64)),
-                            ("raises", PlyValue::Bool(b.raises())),
-                        ])
-                    })
-                    .collect(),
-            ),
             ("runnable", [entry, files, dump]) => {
                 let entry = entry.as_str(span, "an entry point's name")?;
                 let bytes = crate::runnable::encode(entry, files, dump).map_err(|why| {
@@ -216,6 +203,12 @@ fn values(
     ))
 }
 
+/// Each builtin by its name in the prelude, with what the function compiled code calls it through
+/// takes and answers, as that function's type says.
+fn natives() -> impl Iterator<Item = (&'static str, ply_codegen::native::Signature)> {
+    (ply_eval::Builtin::all().iter()).map(|b| (b.name(), ply_codegen::rt::signature(*b)))
+}
+
 /// The runtime a unit is compiled against, as [`runtime`] answers it, written as JSON: what a build
 /// of a program for this runtime by another `ply` reads it from.
 pub fn runtime_json() -> String {
@@ -227,15 +220,24 @@ pub fn runtime_json() -> String {
             .into_iter()
             .map(|h| serde_json::json!({ "name": h.name, "args": h.args, "answers": h.answers }))
             .collect::<Vec<_>>(),
-        "builtins": ply_eval::Builtin::all().iter().map(|b| b.name()).collect::<Vec<_>>(),
+        "natives": natives()
+            .map(|(name, s)| serde_json::json!({
+                "name": name,
+                "words": s.words,
+                "answers": s.answers,
+                "raises": s.raises,
+            }))
+            .collect::<Vec<_>>(),
+        // The natives' names alone, which a `ply` that reads no `natives` emits a builder against.
+        "builtins": natives().map(|(name, _)| name).collect::<Vec<_>>(),
         "identity": c::runtime_identity(),
     })
     .to_string()
 }
 
 /// The runtime a unit is compiled against, as `compiler.unit.Runtime` reads it: the C a unit opens
-/// and closes with, the helpers it binds by position, the builtins a body may call, and what all of
-/// that is a function of.
+/// and closes with, the helpers it binds by position, the natives an `extern fn` names, and what all
+/// of that is a function of.
 fn runtime() -> PlyValue {
     use crate::payload::record;
     use ply_codegen::c;
@@ -258,11 +260,17 @@ fn runtime() -> PlyValue {
             ),
         ),
         (
-            "builtins",
+            "natives",
             PlyValue::list(
-                ply_eval::Builtin::all()
-                    .iter()
-                    .map(|b| PlyValue::bytes(b.name()))
+                natives()
+                    .map(|(name, s)| {
+                        record(vec![
+                            ("name", PlyValue::bytes(name)),
+                            ("words", PlyValue::Int(s.words as i64)),
+                            ("answers", PlyValue::Bool(s.answers)),
+                            ("raises", PlyValue::Bool(s.raises)),
+                        ])
+                    })
                     .collect(),
             ),
         ),

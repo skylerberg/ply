@@ -16,6 +16,7 @@ pub mod heap;
 pub mod host;
 pub mod list;
 pub mod map;
+pub mod native;
 mod parallel;
 pub mod rt;
 pub mod simulate;

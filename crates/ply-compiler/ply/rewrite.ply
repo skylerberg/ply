@@ -617,6 +617,24 @@ pub fn unwitnessed(e: Expr, concrete: (Bytes) -> Bool) -> Expr =
     _ -> e,
   }
 
+/// A native the compiler writes calls of where no source can: the words each call passes, and
+/// whether a failure of it raises rather than ending the run.
+pub type Elaborated = { name: Bytes, words: Int, raises: Bool }
+
+/// Every native the elaboration writes calls of, and `?encoded`, which the emitter writes.
+pub fn elaborated_natives() -> List<Elaborated> =
+  [
+    { name: b"?numeric_binary", words: 4, raises: false },
+    { name: b"?numeric_unary", words: 3, raises: false },
+    { name: b"?hold_take", words: 1, raises: false },
+    { name: b"?hold_bracket", words: 3, raises: false },
+    { name: b"?hold_put", words: 2, raises: false },
+    { name: b"?handler_init", words: 2, raises: false },
+    { name: b"?handler_var", words: 1, raises: false },
+    { name: b"?handler_set", words: 2, raises: false },
+    { name: b"?encoded", words: 1, raises: false },
+  ]
+
 fn hidden_call(span: Span, name: Bytes, args: List<Expr>) -> Expr =
   EApp({
     span: span,
@@ -3012,4 +3030,46 @@ test "a tagged literal and a `try` in a schema or in what a law instantiates one
       b"type Mine = | Ok(Int) | Err(Int)\nlaw schema s(f: (Int) -> Int) forall (x: Int) { try { f(x) } == Mine::Ok(x) }\n",
     ),
   )
+}
+
+test "each native the elaboration writes a call of is passed the words it is declared to take" {
+  let declared = elaborated_natives().fold(Map::new(), |acc: Map<Bytes, Int>, n: Elaborated|
+    acc.insert(n.name, n.words));
+  let numeric = parse(b"fn f<a>(x: a, y: a) -> a where numeric(a) = x + -y\n").node;
+  let operators = picked_in(numeric, |e: Expr| true).fold(
+    Map::new(),
+    |acc: Map<Bytes, Bytes>, e: Expr|
+      match e {
+        EBinary(b) -> acc.insert(span_key(b.span), b"a"),
+        EUnary(u) -> acc.insert(span_key(u.span), b"a"),
+        _ -> acc,
+      },
+  );
+  let written = [
+    expand_witnesses(numeric, operators, Map::new(), Map::new()),
+    expand_holds(parse(b"fn f() -> Int = with_hold[r](1, |x: Int| ()) { h -> h.get() }\n").node),
+    expand_handler_vars(
+      parse(
+        b"effect e { write op(k: Int) -> Int }\nfn f() -> Int = handle { e.op(1) } with { var n = 0, e.op(k) -> { n = k; n }, return x -> x + n }\n",
+      ).node,
+    ),
+  ].fold([], |acc: List<{ name: Bytes, args: Int }>, m: Module|
+    picked_in(m, |e: Expr| true).fold(acc, |found: List<{ name: Bytes, args: Int }>, e: Expr|
+      match e {
+        EApp(a) -> match a.func {
+          EVar(v) -> if declared.contains(v.name.name.name) {
+            found.push({ name: v.name.name.name, args: a.args.len() })
+          } else { found },
+          _ -> found,
+        },
+        _ -> found,
+      }));
+  assert_eq(
+    written.filter(|c: { name: Bytes, args: Int }| declared.get(c.name) != Some(c.args)),
+    [],
+  );
+  // Each but the one the emitter writes is written here.
+  let names = written.fold(Map::new(), |acc: Map<Bytes, Bool>, c: { name: Bytes, args: Int }|
+    acc.insert(c.name, true));
+  assert_eq(names.keys(), declared.remove(b"?encoded").keys())
 }

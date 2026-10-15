@@ -346,18 +346,6 @@ impl Synth {
     }
 }
 
-impl Closure {
-    pub fn arity(&self) -> usize {
-        match &self.kind {
-            ClosureKind::Builtin(b) => b.arity(),
-            ClosureKind::Ctor { arity, .. }
-            | ClosureKind::Native { arity, .. }
-            | ClosureKind::Continuation { arity, .. } => *arity,
-            ClosureKind::Synth { arity, .. } => usize::from(*arity),
-        }
-    }
-}
-
 impl Value {
     // Never inlined, so allocation attribution by backtrace sees these frames.
     #[inline(never)]
