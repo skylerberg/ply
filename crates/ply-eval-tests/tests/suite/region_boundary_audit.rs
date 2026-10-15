@@ -1,38 +1,15 @@
 // `Value`'s shared payloads are `Arc` and deliberately thread-confined.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_eval::arena::Owner;
 use ply_eval::escape::Boundary;
-use ply_eval::{Arena, Diagnostic, RegionKind, Span, Symbol, TaskRegions, Value, codes};
+use ply_eval::{Diagnostic, Span, Symbol, Value, codes};
 use std::sync::Arc;
 
-/// A cell over a still-open region's slot, so what is under test is the boundary and not staleness.
-fn live_cell() -> (Arena, Value) {
-    let mut arena = Arena::new();
-    arena.open(Owner::ENTRY, RegionKind::Shared);
-    let slot = arena
-        .alloc(Owner::ENTRY, Value::Int(41))
-        .expect("the region is open");
-    (arena, Value::Cell(slot))
-}
-
-/// Why the entry-point check is load-bearing: a reset restores the fixture's generations.
-#[test]
-fn an_entry_point_reset_leaves_an_earlier_runs_slot_resolvable() {
-    let mut regions = TaskRegions::new();
-    let slot = regions
-        .arena_mut()
-        .alloc(Owner::ENTRY, Value::Int(1))
-        .expect("the root region is open");
-    regions.seal();
-
-    regions.arena_mut().set(slot, Value::Int(2));
-    regions.reset();
-
-    assert!(
-        regions.arena().contains(slot),
-        "a reset restores generations, so nothing downstream reports a smuggled slot"
-    );
+fn task() -> Value {
+    Value::Task(ply_eval::TaskHandle::unowned(
+        ply_eval::SimId(0),
+        ply_eval::sim::TaskId(0),
+    ))
 }
 
 /// A handler that answers with the boundary's own code has its classification taken back: the run
@@ -68,14 +45,13 @@ fn a_handler_may_not_answer_with_the_boundarys_own_code() {
 
 #[test]
 fn a_handle_in_a_host_operations_argument_is_refused_and_the_position_named() {
-    let (_arena, cell) = live_cell();
     let d = ply_eval::escape::check_arguments(
         "ext.ask[socket]",
         "test::forge",
-        &[Value::Int(1), cell],
+        &[Value::Int(1), task()],
         Span::DUMMY,
     )
-    .expect_err("argument 2 carries a cell");
+    .expect_err("argument 2 carries a task");
 
     assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY);
     assert!(d.message.contains("argument 2"), "{}", d.message);
@@ -89,10 +65,9 @@ fn a_handle_in_a_host_operations_argument_is_refused_and_the_position_named() {
 /// `std.trace` is a host handler, so a trace field crosses `perform_host` like any argument.
 #[test]
 fn a_handle_in_a_trace_field_is_the_host_boundary_and_nothing_further() {
-    let (_arena, cell) = live_cell();
     let fields = Value::list(vec![Value::Ctor {
         name: Symbol::new("std.trace.Str"),
-        args: Arc::new(vec![Value::str("k"), cell]),
+        args: Arc::new(vec![Value::str("k"), task()]),
     }]);
 
     let d = ply_eval::escape::check(
@@ -106,38 +81,4 @@ fn a_handle_in_a_trace_field_is_the_host_boundary_and_nothing_further() {
     )
     .expect_err("a field carrying a handle is refused");
     assert!(d.message.contains("item 0"), "{}", d.message);
-
-    // A handle is copied out as its slot and never dereferenced.
-    let (_a, c) = live_cell();
-    let copied = ply_eval::Plain::of(&c);
-    assert!(matches!(copied, ply_eval::Plain::Cell { .. }), "{copied:?}");
-    assert!(
-        !format!("{copied:?}").contains("41"),
-        "the slot's contents are not read"
-    );
-}
-
-#[test]
-fn a_stale_slot_reports_rather_than_reading_what_replaced_it() {
-    let mut arena = Arena::new();
-    let first = arena.open(Owner::ENTRY, RegionKind::Unique);
-    let stale = arena
-        .alloc(Owner::ENTRY, Value::Int(41))
-        .expect("inside a region");
-    arena.close(first);
-
-    let second = arena.open(Owner::ENTRY, RegionKind::Unique);
-    let fresh = arena
-        .alloc(Owner::ENTRY, Value::Int(99))
-        .expect("inside a region");
-
-    assert_eq!(
-        stale.index(),
-        fresh.index(),
-        "the bump pointer reused the position, which is the whole hazard"
-    );
-    assert!(arena.get(stale).is_none(), "the read is refused");
-    assert!(!arena.set(stale, Value::Int(0)), "so is the write");
-    assert_eq!(arena.get(fresh), Some(&Value::Int(99)));
-    arena.close(second);
 }

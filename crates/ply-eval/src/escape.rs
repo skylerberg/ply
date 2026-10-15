@@ -7,7 +7,6 @@ use std::borrow::Cow;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Handle {
-    Cell,
     Task,
     Chan,
     Continuation,
@@ -17,7 +16,6 @@ impl Handle {
     /// A continuation has no type of its own to name: its type is a function's.
     fn noun(self) -> &'static str {
         match self {
-            Handle::Cell => "a `Cell`",
             Handle::Task => "a `Task`",
             Handle::Chan => "a `Chan`",
             Handle::Continuation => "a continuation",
@@ -26,10 +24,6 @@ impl Handle {
 
     fn why(self) -> &'static str {
         match self {
-            Handle::Cell => {
-                "a `Cell` is a key into the region that allocated it, and the region frees its \
-                 slots at its `}`"
-            }
             Handle::Task => {
                 "a `Task` is a key into a scheduler, and the scheduler dies with the region that \
                  opened it"
@@ -40,7 +34,7 @@ impl Handle {
             }
             Handle::Continuation => {
                 "a continuation resumes a body that lives only as long as the entry that captured \
-                 it, and that body reaches every region open at the capture"
+                 it"
             }
         }
     }
@@ -48,7 +42,7 @@ impl Handle {
     /// Why no type refused it before the boundary did.
     fn unseen(self) -> &'static str {
         match self {
-            Handle::Cell | Handle::Task | Handle::Chan => {
+            Handle::Task | Handle::Chan => {
                 "the escape brand makes this a type error wherever a type still mentions the \
                  brand; this is the boundary where none does, so it is refused here instead of \
                  read later"
@@ -151,9 +145,8 @@ impl Boundary<'_> {
                  this run allocated",
             ),
             Boundary::EntryPoint { .. } => Cow::Borrowed(
-                "an entry point resets its region stack to the fixture before it runs, restoring \
-                 the fixture's generations — so a slot carried out of an earlier run resolves \
-                 here and reads whatever this run put at that position",
+                "an entry point starts a run of its own, so a handle carried in from another run \
+                 names nothing this one made",
             ),
             Boundary::EntryAnswer { .. } => Cow::Borrowed(
                 "an entry point's answer goes to its caller, which keeps it after the entry has \
@@ -164,7 +157,7 @@ impl Boundary<'_> {
 
     fn remedy(&self, handle: Handle) -> &'static str {
         match (self, handle) {
-            (Boundary::HostArgument { .. }, Handle::Cell | Handle::Task | Handle::Chan) => {
+            (Boundary::HostArgument { .. }, Handle::Task | Handle::Chan) => {
                 "read the value inside the region and perform the operation with something that \
                  does not reach a region"
             }
@@ -177,10 +170,10 @@ impl Boundary<'_> {
                  is in a position to have"
             }
             (Boundary::EntryPoint { .. }, _) => {
-                "call the entry point with data, and let the program make its own cells, tasks, \
-                 channels and continuations"
+                "call the entry point with data, and let the program make its own tasks, channels \
+                 and continuations"
             }
-            (Boundary::EntryAnswer { .. }, Handle::Cell | Handle::Task | Handle::Chan) => {
+            (Boundary::EntryAnswer { .. }, Handle::Task | Handle::Chan) => {
                 "read the value inside the region and answer with something that does not reach \
                  a region"
             }
@@ -243,7 +236,6 @@ fn refuse(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic 
 /// Builds `route` innermost-first as the `Some` unwinds, so a clean value allocates nothing.
 fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
     match value {
-        Value::Cell(_) => Some(Handle::Cell),
         Value::Task(_) => Some(Handle::Task),
         Value::Chan(_) => Some(Handle::Chan),
 
@@ -309,6 +301,7 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
             ClosureKind::Synth { rule, .. } => {
                 rule.values().into_iter().find_map(|v| find(v, route))
             }
+            ClosureKind::Hold { held, .. } => held.as_ref().and_then(|v| find(v, route)),
         }),
     }
 }

@@ -10,8 +10,7 @@ use crate::map;
 use crate::native::{Answered, Native, Raising, Signature};
 use crate::stack::{Stack, switch};
 use crate::{array, columns, list};
-use ply_eval::arena::{Owner, RegionId, Slot};
-use ply_eval::builtins::{hold_released, no_such_cell};
+use ply_eval::builtins::hold_released;
 use ply_eval::region::StepSite;
 use ply_eval::sched::Shield;
 use ply_eval::sim::Access;
@@ -256,7 +255,6 @@ impl Tables {
 pub(crate) fn holds_a_handle(value: &Value) -> Option<&'static str> {
     match value {
         Value::Secret(_) => Some("a Secret"),
-        Value::Cell(_) => Some("a Cell"),
         Value::Task(_) => Some("a Task"),
         Value::Chan(_) => Some("a Chan"),
         Value::Closure(_) => Some("a Closure"),
@@ -307,10 +305,6 @@ pub struct HandlerFrame {
     simulate: bool,
     /// For a `handle` resuming off the tail: the detached body whose own stack this frame bottoms.
     detached: Option<usize>,
-    /// How deep its stack's regions stood when this frame went on: an unwind caught at this
-    /// `handle` closes that stack's back to here, since the body it abandons never reaches the
-    /// closes below its jump.
-    regions: usize,
     /// The calls its stack had left when this frame went on, which its `handle` lands with: a
     /// frame a failure returns through gives its call back nowhere else.
     fuel: i64,
@@ -367,21 +361,19 @@ impl HandlerFrame {
         self.clauses.swap_remove(at).closure
     }
 
-    fn simulate(regions: usize, fuel: i64) -> HandlerFrame {
+    fn simulate(fuel: i64) -> HandlerFrame {
         HandlerFrame {
             clauses: Vec::new(),
             ret: 0,
             simulate: true,
             detached: None,
-            regions,
             fuel,
             handler: 0,
             vars: None,
         }
     }
 
-    /// The bottom of a detached body's own stack, which holds no region yet and starts with the
-    /// calls its opener had left.
+    /// The bottom of a detached body's own stack, which starts with the calls its opener had left.
     pub(crate) fn detached(
         clauses: Vec<FrameClause>,
         id: usize,
@@ -393,7 +385,6 @@ impl HandlerFrame {
             ret: 0,
             simulate: false,
             detached: Some(id),
-            regions: 0,
             fuel,
             handler,
             vars: None,
@@ -750,7 +741,6 @@ fn copied_frame(f: &HandlerFrame, sharing_vars: bool) -> HandlerFrame {
         ret: f.ret,
         simulate: f.simulate,
         detached: f.detached,
-        regions: f.regions,
         fuel: f.fuel,
         handler: f.handler,
         vars: f.vars.as_ref().map(|v| {
@@ -784,7 +774,6 @@ pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
             HandlerFrame {
                 clauses,
                 detached: None,
-                regions: 0,
                 ..f
             }
         })
@@ -800,42 +789,6 @@ pub(crate) fn drop_frame(f: HandlerFrame) {
     }
     if let Some(v) = f.vars {
         release_vars(v);
-    }
-}
-
-/// A heap word a cell holds; clone and drop are counts, so the arena drops before the heap.
-pub struct HeldWord(pub Word);
-
-impl HeldWord {
-    fn into_word(self) -> Word {
-        let w = self.0;
-        std::mem::forget(self);
-        w
-    }
-}
-
-impl Clone for HeldWord {
-    fn clone(&self) -> HeldWord {
-        heap::inc(self.0);
-        HeldWord(self.0)
-    }
-}
-
-impl Drop for HeldWord {
-    fn drop(&mut self) {
-        heap::dec(self.0);
-    }
-}
-
-impl Default for HeldWord {
-    fn default() -> HeldWord {
-        HeldWord(heap::unit())
-    }
-}
-
-impl std::fmt::Debug for HeldWord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "HeldWord({:#x})", self.0)
     }
 }
 
@@ -873,11 +826,6 @@ pub struct Ctx {
     /// When the running entry's time budget is spent, if it has one.
     deadline: Option<std::time::Instant>,
     time_budget_ms: u64,
-    /// The cells, holding heap words: declared before the heap, so their counts go back first.
-    /// Each stack in `stacks` owns the regions it opens, under the index that names it.
-    pub(crate) cells: ply_eval::TaskRegions<HeldWord>,
-    /// The arena's `(total depth, live)` when the running entry began, for [`Ctx::cells_balanced`].
-    cells_baseline: (usize, usize),
     pub heap: Heap,
     /// Objects the last entry allocated, kept because [`Ctx::end`] clears the heap's count.
     last_entry: usize,
@@ -940,8 +888,6 @@ pub struct Ctx {
 
 impl Ctx {
     pub fn new(tables: Arc<Tables>) -> Ctx {
-        let cells = ply_eval::TaskRegions::new();
-        let baseline = (cells.total_depth(), cells.live());
         Ctx {
             failed: 0,
             fuel: 0,
@@ -959,8 +905,6 @@ impl Ctx {
             heap: Heap::new(),
             last_entry: 0,
             tables,
-            cells,
-            cells_baseline: baseline,
             diagnostic: None,
             stacks: vec![Frames::under(None)],
             free_stacks: Vec::new(),
@@ -1091,15 +1035,12 @@ impl Ctx {
         b.id = self.id;
         b.seed = self.seed.clone();
         b.sim_steps = self.sim_steps;
-        b.cells_baseline = b.cell_extent();
         b
     }
 
     /// Takes back what a finished branch did, in the order the branches are written: its memory,
     /// its calls, and what it performed.
     pub(crate) fn absorb(&mut self, mut branch: Ctx) {
-        crate::detached::release_all(&mut branch);
-        branch.cells.close_program_regions();
         self.heap.adopt_heap(std::mem::take(&mut branch.heap));
         self.ticks = self.ticks.saturating_add(branch.ticks);
         self.charged = self.charged.plus(branch.charged);
@@ -1191,21 +1132,12 @@ impl Ctx {
         self.unwind = None;
         self.aborting = None;
         self.resumed = None;
-        // Every path out of an entry calls `end`; this catches one that did not, before the
-        // detached bodies that pin regions are dropped.
+        // Every path out of an entry calls `end`; this catches one that did not.
         if self.heap.allocated() != 0 {
             self.end();
         }
         self.detached.clear();
         self.entry = ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        // No cell outlives its entry, so each entry can name its cells as a fresh backend would.
-        let renewed = self.cells.renew();
-        debug_assert!(
-            renewed,
-            "an entry began with a region above the floor open or pinned, or a cell live"
-        );
-        // After the recovery above, which gives back what that entry held.
-        self.cells_baseline = self.cell_extent();
         // Another unit's entry may be running further up this thread: it gets its own back at `end`.
         self.outer = (
             heap::swap_current(&mut self.heap),
@@ -1260,16 +1192,6 @@ impl Ctx {
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
-        // Only this runs on every exit, so a region a failure or an unwind jumped past, a
-        // suspended stack still holds, or a detached body pins, closes here; the cells go back
-        // before the heap their words live in.
-        crate::detached::release_all(self);
-        self.cells.close_program_regions();
-        // A leak here is the runtime's, and cheap to see, so every build looks.
-        assert!(
-            self.cells_balanced(),
-            "closing the entry's regions left slots the arena did not reclaim"
-        );
         heap::poison::swap(self.outer.1);
         heap::swap_current(self.outer.0);
         ply_eval::instances::swap(self.outer_instances.take());
@@ -1320,33 +1242,6 @@ impl Ctx {
         self.heap.end();
     }
 
-    /// Whether the entry gave back every region it opened and cell slot it took; a cell word in the
-    /// answer is refused separately.
-    pub fn cells_balanced(&self) -> bool {
-        self.cell_extent() == self.cells_baseline
-    }
-
-    /// The cell arena's `(regions open on every stack, slots live)`, which an entry has to leave
-    /// as it found.
-    pub fn cell_extent(&self) -> (usize, usize) {
-        (self.cells.total_depth(), self.cells.live())
-    }
-
-    /// The running stack, which owns the regions it opens.
-    fn owner(&self) -> Owner {
-        Owner(self.current)
-    }
-
-    /// How deep the running stack's regions stand, for a handler frame that closes back to it.
-    pub(crate) fn region_depth(&self) -> usize {
-        self.cells.depth(self.owner())
-    }
-
-    /// A stack that will not run again gives back the regions it still holds.
-    pub(crate) fn release_regions(&mut self, stack: usize) {
-        self.cells.close_regions_above(Owner(stack), 0);
-    }
-
     /// The singleton a nullary constructor is.
     pub fn nullary(&self, index: u32) -> Word {
         self.tables.nullaries[index as usize]
@@ -1391,11 +1286,11 @@ impl Ctx {
         }
     }
 
-    /// Gives back a dead stack's index, its frames and regions already gone; nothing may name it.
+    /// Gives back a dead stack's index, its frames already gone; nothing may name it.
     pub(crate) fn close_stack(&mut self, stack: usize) {
         debug_assert!(
-            self.stacks[stack].list.is_empty() && self.cells.depth(Owner(stack)) == 0,
-            "a stack gave its index back while still holding frames or regions"
+            self.stacks[stack].list.is_empty(),
+            "a stack gave its index back while still holding frames"
         );
         self.free_stacks.push(stack);
     }
@@ -1403,11 +1298,6 @@ impl Ctx {
     /// The stacks' frame tables this entry holds, given-back ones included: what a leak grows.
     pub fn stack_slots(&self) -> usize {
         self.stacks.len()
-    }
-
-    /// The stacks the cell arena keeps a nesting for: what a leak grows.
-    pub fn cell_owners(&self) -> usize {
-        self.cells.owners()
     }
 
     pub(crate) fn fail(&mut self, d: Diagnostic) -> i64 {
@@ -1592,41 +1482,6 @@ pub(crate) fn values_taken(ctx: &mut Ctx, args: &[Word]) -> Vec<Value> {
         heap::dec(*w);
     }
     out
-}
-
-/// Opens a `with cell` region on the running stack; `unique` is the site's proof that no
-/// continuation crosses it.
-pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, unique: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let kind = match unique {
-        0 => ply_eval::RegionKind::Shared,
-        _ => ply_eval::RegionKind::Unique,
-    };
-    let owner = ctx.owner();
-    ctx.cells.open(owner, kind).to_bits() as i64
-}
-
-/// Closes a region, reclaiming its cells unless something that can still run reaches them: a
-/// snapshot of its stack, or a detached body opened inside it. The emitter puts it after the body,
-/// on the stack that opened it, so only a body that ran to its end reaches it; an abandoned one is
-/// closed by its `handle`, by its stack's release, or by [`Ctx::end`].
-pub unsafe extern "C" fn rt_region_close(ctx: *mut Ctx, region: i64) {
-    let ctx = unsafe { &mut *ctx };
-    ctx.cells.close(RegionId::from_bits(region as u64));
-}
-
-/// Allocates a cell in the running stack's innermost region.
-pub unsafe extern "C" fn rt_cell(ctx: *mut Ctx, init: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    if !ctx.sims.is_empty() {
-        ctx.record_access(Access::Alloc);
-    }
-    let owner = ctx.owner();
-    let slot = ctx
-        .cells
-        .alloc(owner, HeldWord(init))
-        .expect("a `with_cell` allocates in the region its stack just opened");
-    ctx.heap.bridge(Value::Cell(slot))
 }
 
 /// Perceus's `drop`: one holder fewer.
@@ -2556,7 +2411,7 @@ fn road(b: Builtin) -> Option<*const ()> {
 /// can be, else over the values they denote. Takes the arguments.
 fn builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     if !ctx.sims.is_empty()
-        && let Some(access) = crate::simulate::cell_access(ctx, b, args)
+        && let Some(access) = crate::simulate::shared_access(ctx, b, args)
     {
         ctx.record_access(access);
     }
@@ -2701,54 +2556,33 @@ fn narrow_binary(op: i64, w: i64, a: i64, b: i64) -> Option<Word> {
     }
 }
 
-/// The cell a word names, when it is one.
-fn cell_of(w: Word) -> Option<Slot> {
-    if heap::kind(w) != crate::heap::KIND_BRIDGE {
-        return None;
-    }
-    match unsafe { crate::heap::bridged(obj(w)) } {
-        Value::Cell(slot) => Some(*slot),
-        _ => None,
-    }
-}
-
-/// What a hold holds, as a count of its own. A hold is a cell of its region, and one let go holds
-/// the null word, which no value is.
-fn hold_read(ctx: &Ctx, slot: Slot) -> Result<Word, Diagnostic> {
-    match ctx.cells.arena().get(slot) {
-        Some(held) if held.0 != 0 => {
-            heap::inc(held.0);
-            Ok(held.0)
-        }
-        Some(_) => Err(hold_released(ctx.site(), "read")),
-        None => Err(no_such_cell(ctx.site(), slot)),
-    }
+/// The entry's next hold, holding `held`.
+fn hold_new(c: &mut Ctx, held: Word) -> Word {
+    c.holds_made += 1;
+    hold_word(&mut c.heap, held, c.holds_made)
 }
 
 /// A hold, as a closure no call enters: what it holds in its first capture, the null word once it
-/// has let go, so a second release or a read after is refused; and its number in the entry in its
-/// second, which names it to the scheduler. A continuation resumed twice shares it.
-fn hold_new(c: &mut Ctx, held: Word) -> Word {
-    c.holds_made += 1;
-    let o = c
-        .heap
-        .alloc(KIND_CLOSURE, 0, (2 + CLOSURE_CAPTURES) as u32, 0);
+/// has let go, so a second release or a read after is refused; and `id`, its number in the entry,
+/// in its second, which names it to the scheduler. A continuation resumed twice shares it.
+pub(crate) fn hold_word(heap: &mut Heap, held: Word, id: u64) -> Word {
+    let o = heap.alloc(KIND_CLOSURE, 0, (2 + CLOSURE_CAPTURES) as u32, 0);
     unsafe {
         set_word(o, CLOSURE_CODE, rt_hold_entry as *const () as usize as Word);
         set_word(o, CLOSURE_CAPTURES, held);
-        set_word(o, CLOSURE_CAPTURES + 1, heap::imm(c.holds_made as i64));
+        set_word(o, CLOSURE_CAPTURES + 1, heap::imm(id as i64));
     }
     o as Word
 }
 
-/// The object a hold `hold_new` made is, where `w` is one.
+/// The object a hold is, where `w` is one.
 fn hold_object(w: Word) -> Option<*mut heap::Obj> {
     let entry = rt_hold_entry as *const () as usize as Word;
     (heap::kind(w) == KIND_CLOSURE && unsafe { word_at(obj(w), CLOSURE_CODE) } == entry)
         .then(|| obj(w))
 }
 
-/// A hold's number in its entry, where `w` is a hold `hold_new` made.
+/// A hold's number in its entry, where `w` is a hold.
 pub(crate) fn hold_id(w: Word) -> Option<u64> {
     hold_object(w).map(|o| heap::imm_value(unsafe { word_at(o, CLOSURE_CAPTURES + 1) }) as u64)
 }
@@ -2758,22 +2592,6 @@ unsafe extern "C" fn rt_hold_entry(ctx: *mut Ctx, _args: *const i64) -> i64 {
     let d = Diagnostic::error(codes::INTERNAL_ERROR, "a hold was called as a function")
         .note("this is Ply's fault, not the program's");
     unsafe { &mut *ctx }.fail(d)
-}
-
-/// A hold's contents moved out for its release, leaving the null word: a second release finds it
-/// and is refused, so nothing is released twice.
-fn hold_take(ctx: &mut Ctx, slot: Slot) -> Result<Word, Diagnostic> {
-    let site = ctx.site();
-    match ctx.cells.arena().get(slot) {
-        Some(held) if held.0 != 0 => {}
-        Some(_) => return Err(hold_released(site, "let go")),
-        None => return Err(no_such_cell(site, slot)),
-    }
-    let Some(current) = ctx.cells.arena_mut().take(slot) else {
-        return Err(no_such_cell(site, slot));
-    };
-    ctx.cells.arena_mut().put_back(slot, HeldWord(0));
-    Ok(current.into_word())
 }
 
 /// A handler's variables read where no clause of a handler that has some runs: the lowering of
@@ -2799,7 +2617,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         (Builtin::Push, [xs, x]) if heap::kind(*xs) == KIND_LIST => {
             Some(ctx.heap.list_push(*xs, *x))
         }
-        (Builtin::HoldGet, [h]) if hold_object(*h).is_some() => {
+        (Builtin::HoldGet, [h]) => {
             let o = hold_object(*h)?;
             let held = unsafe { word_at(o, CLOSURE_CAPTURES) };
             let answer = if held == 0 {
@@ -2812,7 +2630,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*h);
             Some(answer)
         }
-        (Builtin::HoldTake, [h]) if hold_object(*h).is_some() => {
+        (Builtin::HoldTake, [h]) => {
             let o = hold_object(*h)?;
             let held = unsafe { word_at(o, CLOSURE_CAPTURES) };
             let answer = if held == 0 {
@@ -2826,15 +2644,6 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(answer)
         }
         (Builtin::HoldNew, [v]) => Some(hold_new(ctx, *v)),
-        (Builtin::HoldGet, [h]) => {
-            let slot = cell_of(*h)?;
-            let answer = match hold_read(ctx, slot) {
-                Ok(w) => w,
-                Err(d) => ctx.fail(d),
-            };
-            heap::dec(*h);
-            Some(answer)
-        }
         (Builtin::HandlerInit, [i, w]) => {
             let at = heap::imm_value(*i) as usize;
             let c = ctx.current;
@@ -2869,15 +2678,6 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             };
             v.borrow_mut().set(at, *w);
             Some(heap::unit())
-        }
-        (Builtin::HoldTake, [h]) => {
-            let slot = cell_of(*h)?;
-            let answer = match hold_take(ctx, slot) {
-                Ok(w) => w,
-                Err(d) => ctx.fail(d),
-            };
-            heap::dec(*h);
-            Some(answer)
         }
         // Only compiled code can enter a closure, so these answer whatever they are given.
         (Builtin::Map, [xs, f]) => Some(unsafe { rt_map(std::ptr::from_mut(ctx), *xs, *f) }),
@@ -3950,7 +3750,6 @@ pub unsafe extern "C" fn rt_handle_push(
 ) -> i64 {
     let c = unsafe { &mut *ctx };
     let clauses = clauses_of(c, clauses, n);
-    let regions = c.region_depth();
     let fuel = c.fuel;
     let handler = c.next_handler();
     let frames = c.frames();
@@ -3959,7 +3758,6 @@ pub unsafe extern "C" fn rt_handle_push(
         ret,
         simulate: false,
         detached: None,
-        regions,
         fuel,
         handler,
         vars: None,
@@ -4257,9 +4055,8 @@ pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
     c.trail.enter(site);
     let stack = c.current;
     let depth = c.frames().len();
-    let regions = c.region_depth();
     let fuel = c.fuel;
-    c.frames().push(HandlerFrame::simulate(regions, fuel));
+    c.frames().push(HandlerFrame::simulate(fuel));
     let sim = crate::simulate::Simulation::new(
         ply_eval::sched::Scheduler::new(id, site).with_step_budget(c.sim_steps),
         site,
@@ -4303,8 +4100,6 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
     {
         c.failed = 0;
         let mut f = mine.expect("a raise is bound for a frame still installed");
-        let owner = c.owner();
-        c.cells.close_regions_above(owner, f.regions);
         let closure = f.take_clause(a.clause);
         let held = f.held();
         drop_frame(f);
@@ -4322,11 +4117,6 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
         if target_stack == stack && target == depth {
             c.failed = 0;
             if let Some(f) = mine {
-                // The body is abandoned where it stood, above the closes the emitter put after
-                // the regions it opened on this stack; they go back here so the entry stays
-                // balanced.
-                let owner = c.owner();
-                c.cells.close_regions_above(owner, f.regions);
                 drop_frame(f);
             }
             return v;
@@ -4685,7 +4475,9 @@ fn applied(ctx: *mut Ctx, callee: Word, args: &[Word], give: bool) -> i64 {
                     }
                 }
                 // `Heap::to_word` rebuilds a native closure as one, so it never crosses as a bridge.
-                ClosureKind::Native { .. } | ClosureKind::Continuation { .. } => {
+                ClosureKind::Native { .. }
+                | ClosureKind::Continuation { .. }
+                | ClosureKind::Hold { .. } => {
                     let d = error("a compiled closure arrived bridged rather than native");
                     c.fail(d)
                 }

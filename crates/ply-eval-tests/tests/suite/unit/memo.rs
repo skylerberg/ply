@@ -9,13 +9,19 @@ fn nested(levels: usize, bottom: Value) -> Value {
     })
 }
 
-/// A parsed program is a constant deeper than any recursion budget.
+/// A parsed program is a constant deeper than any recursion budget; a hold is its entry's, whatever
+/// it holds.
 #[test]
 fn a_constant_is_judged_by_its_leaves_however_deep_they_lie() {
     assert!(world_independent(&nested(2_000, Value::Unit)));
-    let mut regions: ply_eval::TaskRegions = ply_eval::TaskRegions::new();
-    let cell = Value::Cell(regions.alloc_cell(Value::Unit));
-    assert!(!world_independent(&nested(2_000, cell)));
+    let hold = Value::Closure(Arc::new(Closure {
+        name: None,
+        kind: ClosureKind::Hold {
+            held: Some(Value::Unit),
+            id: 1,
+        },
+    }));
+    assert!(!world_independent(&nested(2_000, hold)));
 }
 
 /// A continuation's captures are numbers, so its kind is all that keeps it out of a memo.

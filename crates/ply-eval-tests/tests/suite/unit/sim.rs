@@ -1,4 +1,3 @@
-use ply_eval::arena::Slot;
 use ply_eval::sim::*;
 use ply_eval::{EffectAtom, Mode, Span, Symbol, Value, codes};
 
@@ -94,41 +93,21 @@ fn a_write_does_not_commute_with_a_read_of_the_same_resource() {
 }
 
 #[test]
-fn two_cells_are_two_locations_whatever_they_were_labelled() {
-    let one = StepFootprint::from_accesses([Access::Cell {
-        id: Slot::new(1, 0),
-        mode: Mode::Write,
-    }]);
-    let two = StepFootprint::from_accesses([Access::Cell {
-        id: Slot::new(2, 0),
-        mode: Mode::Write,
-    }]);
-    let also_one = StepFootprint::from_accesses([Access::Cell {
-        id: Slot::new(1, 0),
-        mode: Mode::Read,
-    }]);
-    assert!(!one.conflicts_with(&two));
-    assert!(one.conflicts_with(&also_one));
+fn two_holds_are_two_locations_and_one_conflicts_where_either_writes() {
+    let hold = |id, mode| StepFootprint::from_accesses([Access::Hold { id, mode }]);
+    assert!(!hold(1, Mode::Write).conflicts_with(&hold(2, Mode::Write)));
+    assert!(hold(1, Mode::Write).conflicts_with(&hold(1, Mode::Read)));
+    assert!(!hold(1, Mode::Read).conflicts_with(&hold(1, Mode::Read)));
 }
 
 #[test]
-fn cell_accesses_are_in_the_relation() {
-    let write = StepFootprint::from_accesses([Access::Cell {
-        id: Slot::new(7, 0),
+fn an_atom_and_a_hold_name_disjoint_state() {
+    let atoms = StepFootprint::from_accesses([Access::Atom(atom("hold", Some("1"), Mode::Write))]);
+    let holds = StepFootprint::from_accesses([Access::Hold {
+        id: 1,
         mode: Mode::Write,
     }]);
-    assert!(write.conflicts_with(&write));
-    assert!(!write.is_empty());
-}
-
-#[test]
-fn an_atom_and_a_cell_name_disjoint_state() {
-    let atoms = StepFootprint::from_accesses([Access::Atom(atom("cell", Some("u"), Mode::Write))]);
-    let cells = StepFootprint::from_accesses([Access::Cell {
-        id: Slot::new(0, 0),
-        mode: Mode::Write,
-    }]);
-    assert!(!atoms.conflicts_with(&cells));
+    assert!(!atoms.conflicts_with(&holds));
 }
 
 #[test]

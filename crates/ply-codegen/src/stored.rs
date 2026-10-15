@@ -2,7 +2,7 @@
 //! value is written as the heap lays it out, so a word reads back as the word it was: a record
 //! names its shape's fields and a constructor its name, which any unit holding the value's types
 //! places; a map's entries are in its tree's order, so reading one compares nothing; and an object
-//! met twice is written once. A closure, and a bridged cell, task, channel or secret, has no text.
+//! met twice is written once. A closure, and a bridged task, channel or secret, has no text.
 
 use crate::heap::{
     self, FLAT, Heap, KIND_ARRAY, KIND_BOOL, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_COLUMNS,

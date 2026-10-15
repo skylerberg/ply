@@ -1,4 +1,3 @@
-use crate::arena::Slot;
 use crate::builtins::Builtin;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
 use crate::sched::{ChanHandle, TaskHandle};
@@ -232,8 +231,6 @@ pub enum Value {
         args: Arc<Vec<Value>>,
     },
     Closure(Arc<Closure>),
-    /// An index and generation, so a cell of a closed region reads `None` instead of aliasing.
-    Cell(Slot),
     /// Compared by region and id; its count is what tells a production region the task can retire.
     Task(TaskHandle),
     Chan(ChanHandle),
@@ -302,6 +299,12 @@ pub enum ClosureKind {
     Synth {
         arity: u8,
         rule: Synth,
+    },
+    /// What a `with_hold` binds, which no call enters: what it holds, `None` once it has let go,
+    /// and its number among its entry's holds.
+    Hold {
+        held: Option<Value>,
+        id: u64,
     },
 }
 
@@ -431,7 +434,6 @@ impl Value {
             Value::Record(_) => "record",
             Value::Ctor { .. } => "variant",
             Value::Closure(_) => "function",
-            Value::Cell(_) => "Cell",
             Value::Task(_) => "Task",
             Value::Chan(_) => "Chan",
             Value::Secret(_) => "Secret",
@@ -528,13 +530,6 @@ impl Value {
         match self {
             Value::Map(m) => Ok(m),
             other => Err(type_error(span, what, "Map", other)),
-        }
-    }
-
-    pub fn as_cell(&self, span: Span, what: &str) -> Result<Slot, Diagnostic> {
-        match self {
-            Value::Cell(slot) => Ok(*slot),
-            other => Err(type_error(span, what, "Cell", other)),
         }
     }
 
@@ -794,7 +789,6 @@ fn discriminant(v: &Value) -> u8 {
         Value::Record(_) => 9,
         Value::Ctor { .. } => 10,
         Value::Closure(_) => 11,
-        Value::Cell(_) => 12,
         Value::Task(_) => 13,
         Value::Secret(_) => 14,
         Value::Fixed(_) => 15,
@@ -834,7 +828,6 @@ impl Ord for Value {
                 }
                 grow(|| n1.cmp(n2).then_with(|| a1.iter().cmp(a2.iter())))
             }
-            (Value::Cell(x), Value::Cell(y)) => x.cmp(y),
             (Value::Task(x), Value::Task(y)) => (x.region(), x.id()).cmp(&(y.region(), y.id())),
             (Value::Chan(x), Value::Chan(y)) => x.cmp(y),
             // Unreachable from a well-typed program: a `Secret` has no order.
@@ -1048,7 +1041,6 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
                 Ok(true)
             });
         }
-        (Value::Cell(x), Value::Cell(y)) => x == y,
         (Value::Task(x), Value::Task(y)) => x.region() == y.region() && x.id() == y.id(),
         (Value::Chan(x), Value::Chan(y)) => x == y,
         (Value::Secret(x), Value::Secret(y)) => {

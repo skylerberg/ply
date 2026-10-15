@@ -1,4 +1,5 @@
-use ply_eval::{Plain, Span, Value, codes};
+use ply_eval::{Closure, ClosureKind, Plain, Span, Value, codes};
+use std::sync::Arc;
 
 /// A small stack, where unbounded host recursion aborts the whole test binary.
 fn on_a_small_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
@@ -16,6 +17,24 @@ fn chain(depth: usize) -> Value {
         v = Value::ctor("Link", vec![v]);
     }
     v
+}
+
+/// What it holds is never copied out, and which hold it is is its run's own.
+#[test]
+fn a_hold_shows_as_its_kind_alone() {
+    let hold = Value::Closure(Arc::new(Closure {
+        name: None,
+        kind: ClosureKind::Hold {
+            held: Some(Value::Int(41)),
+            id: 3,
+        },
+    }));
+    assert_eq!(Plain::of(&hold), Plain::Hold);
+    assert_eq!(
+        ply_eval::reflect::value_of(&Plain::Hold),
+        Value::ctor("std.value.VHold", Vec::new())
+    );
+    assert!(Plain::Hold.into_value().is_err());
 }
 
 #[test]

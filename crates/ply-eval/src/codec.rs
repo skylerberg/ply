@@ -1,5 +1,5 @@
-//! Plain values as bytes: how a cache keeps an answer it does not interpret. A closure, cell, task
-//! or secret has no bytes.
+//! Plain values as bytes: how a cache keeps an answer it does not interpret. A closure, task or
+//! secret has no bytes.
 
 use crate::value::{Decimal, Fields, Fixed, Value};
 use crate::{INT_TYPES, IntTy, List, Symbol};
@@ -133,11 +133,7 @@ impl<'v> Encoder<'v> {
                     self.value(arg)?;
                 }
             }
-            Value::Closure(_)
-            | Value::Cell(_)
-            | Value::Task(_)
-            | Value::Chan(_)
-            | Value::Secret(_) => {
+            Value::Closure(_) | Value::Task(_) | Value::Chan(_) | Value::Secret(_) => {
                 return Err(format!("a {} is not plain data", v.type_name()));
             }
         }

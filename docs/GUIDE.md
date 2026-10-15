@@ -1189,7 +1189,7 @@ Functions cannot be compared, encoded, ordered or used as map keys.
   is written as a function type is *lent* to the call. The body may call it, pass
   it to a parameter lent in turn, capture it in a lambda, or read it in a
   `handle`, whose lambda or continuation is then lent too (§5.3), and nothing
-  more: answering it, putting it in a record, list, constructor, cell or handler
+  more: answering it, putting it in a record, list, constructor or handler
   variable, performing it, or passing it to a parameter of another type, a type
   parameter among them, or to a function value would hold it past the call
   (`E0475`). Written `keep`

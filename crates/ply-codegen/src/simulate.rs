@@ -229,8 +229,8 @@ fn ended_under_root(c: &mut Ctx) -> Word {
     sim.answer
 }
 
-/// Drops a task's stack, frames and the regions a failure or an unwind left open on it, or the
-/// frames it holds unstarted; the production root runs on the opening stack and keeps all three.
+/// Drops a task's stack and frames, or the frames it holds unstarted; the production root runs on
+/// the opening stack and keeps both.
 fn release(c: &mut Ctx, task: TaskId) {
     let sim = c.sims.last_mut().expect("a region is running");
     let slot = sim.slot(task);
@@ -244,7 +244,6 @@ fn release(c: &mut Ctx, task: TaskId) {
     for f in std::mem::take(&mut c.stacks[frames].list) {
         drop_frame(f);
     }
-    c.release_regions(frames);
 }
 
 /// A finished production task's slot and stack index go back, since nothing names a dead stack.
@@ -792,36 +791,32 @@ pub fn seeded_region(c: &Ctx) -> Option<Span> {
     (sim.policy == Policy::Seeded).then_some(sim.site)
 }
 
-pub fn cell_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Access> {
+/// What builtin `b` over `args` reads or writes that another task may share: a handler's variable
+/// or a hold.
+pub fn shared_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Access> {
     use ply_eval::{Builtin, Mode};
-    let var = |mode: Mode| {
-        let (handler, _) = ctx.stacks[ctx.current].held.last()?;
-        let at = u32::try_from(crate::heap::imm_value(*args.first()?)).ok()?;
-        Some(Access::Var {
-            handler: *handler,
-            at,
-            mode,
-        })
-    };
-    if let (Builtin::HoldGet | Builtin::HoldTake, Some(id)) =
-        (b, args.first().and_then(|h| crate::rt::hold_id(*h)))
-    {
-        let mode = if b == Builtin::HoldGet {
-            Mode::Read
-        } else {
-            Mode::Write
-        };
-        return Some(Access::Hold { id, mode });
+    let first = *args.first()?;
+    match b {
+        Builtin::HoldGet | Builtin::HoldTake => Some(Access::Hold {
+            id: crate::rt::hold_id(first)?,
+            mode: if b == Builtin::HoldGet {
+                Mode::Read
+            } else {
+                Mode::Write
+            },
+        }),
+        Builtin::HandlerVar | Builtin::HandlerSet => {
+            let (handler, _) = ctx.stacks[ctx.current].held.last()?;
+            Some(Access::Var {
+                handler: *handler,
+                at: u32::try_from(crate::heap::imm_value(first)).ok()?,
+                mode: if b == Builtin::HandlerVar {
+                    Mode::Read
+                } else {
+                    Mode::Write
+                },
+            })
+        }
+        _ => None,
     }
-    let mode = match b {
-        Builtin::HandlerVar => return var(Mode::Read),
-        Builtin::HandlerSet => return var(Mode::Write),
-        Builtin::HoldGet => Mode::Read,
-        Builtin::HoldTake => Mode::Write,
-        _ => return None,
-    };
-    let Value::Cell(slot) = ctx.value(*args.first()?) else {
-        return None;
-    };
-    Some(Access::Cell { id: slot, mode })
 }

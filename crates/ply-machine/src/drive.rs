@@ -911,7 +911,6 @@ pub fn accounting_value(m: &Measured) -> PlyValue {
                 ("scheduled", tally(m.held.scheduled)),
                 ("task_stacks", tally(m.held.task_stacks)),
                 ("frame_tables", tally(m.held.frame_tables)),
-                ("cell_owners", tally(m.held.cell_owners)),
             ]),
         ),
     ])

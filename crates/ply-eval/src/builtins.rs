@@ -1,6 +1,5 @@
 //! The prelude, in one definition per builtin.
 
-use crate::arena::Slot;
 use crate::semantics::arity_error;
 use crate::value::{
     Decimal, Fixed, FixedOp, List, Value, first_difference, type_error, values_equal,
@@ -478,8 +477,8 @@ fn array_set(args: &mut Vec<Value>, span: Span, what: &str) -> Result<Value, Dia
     Ok(xs)
 }
 
-/// A builtin over values. One that calls back into the program, or reads a cell, is the compiled
-/// backend's to answer, since only it can enter a closure or reach a cell.
+/// A builtin over values. One that calls back into the program, or reaches a hold or a handler's
+/// variables, is the compiled backend's to answer, since only it holds them.
 pub fn call(b: Builtin, mut args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
     let out = call_with(b, &mut args, span);
     args.clear();
@@ -1883,17 +1882,6 @@ pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
     }
 }
 
-/// A cell whose region has closed.
-#[cold]
-pub fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("cell {slot} does not belong to the region this code is running in"),
-    )
-    .primary(span, "this cell was made by a different run")
-    .note("please report this: a cell value escaped the region that allocated it")
-}
-
 /// A hold reached after its region let it go, which only a continuation captured inside the region
 /// and resumed after the release can do.
 #[cold]
@@ -1907,7 +1895,8 @@ pub fn hold_released(span: Span, doing: &str) -> Diagnostic {
     .note("resume a continuation captured inside a `with_hold` at most once, or open the `with_hold` after the choice the continuation replays")
 }
 
-/// The C backend answers every builtin that calls back into the program or reads a cell.
+/// The C backend answers every builtin that calls back into the program or reaches what only it
+/// holds.
 #[cold]
 fn answered_by_the_backend(b: Builtin, span: Span) -> Diagnostic {
     Diagnostic::error(
@@ -1917,6 +1906,9 @@ fn answered_by_the_backend(b: Builtin, span: Span) -> Diagnostic {
             b.name()
         ),
     )
-    .primary(span, "it calls back into the program or reads a cell")
+    .primary(
+        span,
+        "it calls back into the program or reaches what only compiled code holds",
+    )
     .note("this is Ply's fault: the C backend answers this builtin over its own words")
 }

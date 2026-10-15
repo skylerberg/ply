@@ -108,13 +108,7 @@ pub fn value_of(p: &Plain) -> PlyValue {
                 ),
             }],
         ),
-        Plain::Cell { index, generation } => value_ctor(
-            "VCell",
-            vec![record(vec![
-                ("index", PlyValue::Int(i64::from(*index))),
-                ("generation", PlyValue::Int(i64::from(*generation))),
-            ])],
-        ),
+        Plain::Hold => value_ctor("VHold", vec![]),
         Plain::Task(id) => value_ctor("VTask", vec![PlyValue::Int(*id as i64)]),
         Plain::Chan(id) => value_ctor("VChan", vec![PlyValue::Int(*id as i64)]),
         Plain::Secret => value_ctor("VSecret", vec![]),
@@ -311,12 +305,7 @@ pub fn plain_of(v: &PlyValue, span: Span) -> Result<Plain, Diagnostic> {
                 },
             )
         }
-        "VCell" => Plain::Cell {
-            index: u32::try_from(int(&field(arg(0)?, "index")?)?)
-                .map_err(|_| bad("names no cell"))?,
-            generation: u32::try_from(int(&field(arg(0)?, "generation")?)?)
-                .map_err(|_| bad("names no cell"))?,
-        },
+        "VHold" => Plain::Hold,
         "VTask" => Plain::Task(u64::try_from(int(arg(0)?)?).map_err(|_| bad("names no task"))?),
         "VChan" => Plain::Chan(u64::try_from(int(arg(0)?)?).map_err(|_| bad("names no channel"))?),
         "VSecret" => Plain::Secret,

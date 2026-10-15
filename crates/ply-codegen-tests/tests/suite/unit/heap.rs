@@ -821,19 +821,20 @@ fn an_object_dying_under_another_heap_goes_back_to_its_own() {
     outer.end();
 }
 
-/// A cell is a slot of one entry's arena: nothing under words that reach one is marked.
+/// A task is a handle into this thread's scheduler: nothing under words that reach one is marked.
 #[test]
-fn sharing_what_reaches_a_cell_marks_nothing() {
+fn sharing_what_reaches_a_task_marks_nothing() {
     let mut h = Heap::new();
     let l = layouts();
     let plain = h.to_word(&l, &Value::list(vec![Value::Int(1)]));
-    let holder = h.to_word(
-        &l,
-        &Value::ctor("Some", vec![Value::Cell(ply_eval::arena::Slot::new(0, 0))]),
-    );
-    let cell = unsafe { word_at(obj(holder), 0) };
+    let task = Value::Task(ply_eval::TaskHandle::unowned(
+        ply_eval::SimId(0),
+        ply_eval::sim::TaskId(0),
+    ));
+    let holder = h.to_word(&l, &Value::ctor("Some", vec![task]));
+    let handle = unsafe { word_at(obj(holder), 0) };
     assert!(!share(&[plain, holder]));
-    for w in [plain, holder, cell] {
+    for w in [plain, holder, handle] {
         assert!(
             unsafe { (*obj(w)).rc } < SHARED,
             "a refused share left a mark"

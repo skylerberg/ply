@@ -1,4 +1,3 @@
-use ply_eval::arena::Slot;
 use ply_eval::host::{HostRuntime, MachineId, Pending};
 use ply_eval::region::{StepSite, Trail};
 use ply_eval::sched::*;
@@ -1257,8 +1256,8 @@ fn the_schedulers_own_bookkeeping_is_not_an_access_but_a_draw_is() {
     trail.record_access(atom("random", None, Mode::Write), site("m.f", 3));
     trail.record_access(atom("db", Some("orders"), Mode::Write), site("m.f", 4));
     trail.record_access(
-        Access::Cell {
-            id: Slot::new(3, 0),
+        Access::Hold {
+            id: 3,
             mode: Mode::Write,
         },
         site("m.f", 5),
@@ -1283,8 +1282,8 @@ fn a_step_is_placed_at_its_first_shared_access() {
         site("m.transfer", 10),
     );
     trail.record_access(
-        Access::Cell {
-            id: Slot::new(1, 0),
+        Access::Hold {
+            id: 1,
             mode: Mode::Read,
         },
         site("m.test#0", 20),
@@ -1301,7 +1300,14 @@ fn a_step_is_placed_at_its_first_shared_access() {
     let Turn::Run { .. } = sched.next(&mut clock, &mut trail).expect("still enabled") else {
         panic!("expected a third step");
     };
-    trail.record_access(Access::Alloc, site("m.open", 50));
+    trail.record_access(
+        Access::Var {
+            handler: 1,
+            at: 0,
+            mode: Mode::Write,
+        },
+        site("m.open", 50),
+    );
 
     let placed: Vec<(Option<String>, Span)> = trail
         .record()
@@ -1323,7 +1329,7 @@ fn a_step_is_placed_at_its_first_shared_access() {
 }
 
 #[test]
-fn two_steps_touching_one_cell_are_dependent() {
+fn two_steps_touching_one_hold_are_dependent() {
     let (mut sched, mut clock, mut trail) = solo(0);
     let Turn::Run { .. } = sched
         .next(&mut clock, &mut trail)
@@ -1332,8 +1338,8 @@ fn two_steps_touching_one_cell_are_dependent() {
         panic!("expected the root's step");
     };
     trail.record_access(
-        Access::Cell {
-            id: Slot::new(1, 0),
+        Access::Hold {
+            id: 1,
             mode: Mode::Write,
         },
         site("m.f", 0),
@@ -1343,8 +1349,8 @@ fn two_steps_touching_one_cell_are_dependent() {
         panic!("expected a second step");
     };
     trail.record_access(
-        Access::Cell {
-            id: Slot::new(1, 0),
+        Access::Hold {
+            id: 1,
             mode: Mode::Read,
         },
         site("m.g", 0),

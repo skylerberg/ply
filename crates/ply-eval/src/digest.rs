@@ -109,7 +109,6 @@ fn write(h: &mut impl Sink, v: &Value, span: Span) -> Result<(), Diagnostic> {
         }
         Value::Float(_)
         | Value::Closure(_)
-        | Value::Cell(_)
         | Value::Task(_)
         | Value::Chan(_)
         | Value::Secret(_) => {

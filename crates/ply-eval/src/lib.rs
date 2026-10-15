@@ -4,7 +4,6 @@
 // `Value` mixes `Arc` payloads with a task handle's `Rc`, so it is never `Send` by design.
 #![allow(clippy::arc_with_non_send_sync)]
 
-pub mod arena;
 pub mod argv;
 pub mod backend;
 pub mod builtins;
@@ -44,12 +43,9 @@ pub mod semantics;
 pub mod sim;
 mod span;
 pub mod sqlite;
-pub mod task_regions;
 pub mod trace;
 mod value;
 
-// `Slot` and `RegionId` stay behind `arena::`: each name means something else here.
-pub use arena::{Arena, RegionKind};
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
 pub use backend::{Compilation, Counters, Offers, Provider};
 pub use builtins::{Builtin, assert_failure, assertion_failure};
@@ -87,7 +83,6 @@ pub use span::{
     Diagnostic, Edit, Fix, Label, Severity, SourceFile, SourceId, SourceMap, Span, Sparse, Symbol,
     intern_code, slot,
 };
-pub use task_regions::{Fixture, TaskRegions};
 pub use trace::Trace;
 pub use value::{
     Closure, ClosureKind, Decimal, Difference, Fields, Fixed, FixedOp, Map, PathStep, Sealed,
