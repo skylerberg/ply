@@ -682,8 +682,8 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Every `.ply` source of this checkout's packages and the prelude, which is production the same
-/// way `src/` is; the `-tests` crates are not.
+/// Every `.ply` source of this checkout's packages, which is production the same way `src/` is; the
+/// `-tests` crates are not.
 fn ply_sources(root: &Path) -> Vec<Source> {
     fn ply_files(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("a readable source directory") {
@@ -695,7 +695,7 @@ fn ply_sources(root: &Path) -> Vec<Source> {
             }
         }
     }
-    let mut paths = vec![root.join("crates/ply-compiler/prelude.ply")];
+    let mut paths = Vec::new();
     for entry in std::fs::read_dir(root.join("crates")).expect("a readable crates directory") {
         let dir = entry.expect("a directory entry").path();
         let name = dir.file_name().unwrap_or_default().to_string_lossy();
