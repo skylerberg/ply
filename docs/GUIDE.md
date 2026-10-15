@@ -2084,7 +2084,6 @@ its type call it a `Cell`.
   `resume` binds) reaches a host operation, a host answer, or an entry point's
   argument or answer (at run time). A continuation's type is an ordinary
   function's, so this is the one check that sees it.
-* `W0610`: a reference cycle; cycles are never freed.
 
 ## 8. Tests
 
@@ -3650,7 +3649,6 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `W0607` | supplied configuration key the schema does not declare |
 | `W0608` | drain deadline expired with requests in flight |
 | `W0609` | spans still open when their task or the entry point ended |
-| `W0610` | reference cycle, never freed |
 | `W0611` | definition no `pub` item, `main`, test or law reaches; a leading `_` in its name keeps it quiet |
 | `W0612` | run abandoned at its wall clock; nothing recorded |
 

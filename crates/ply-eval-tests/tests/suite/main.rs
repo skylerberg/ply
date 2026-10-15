@@ -5,7 +5,6 @@ mod host_boundary;
 mod host_trust_audit;
 mod map_order;
 mod position_invariance;
-mod reference_cycles;
 mod region_boundary_audit;
 mod region_isolation_audit;
 mod secrets;

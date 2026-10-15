@@ -2499,9 +2499,6 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 heap::dec(*c);
                 return Some(ctx.fail(cell_in_update(site, slot, "cell_set")));
             }
-            if heap::reaches_cell(*v, slot) {
-                ply_eval::rc::note_cell_cycle(slot, site);
-            }
             let stored = ctx.cells.arena_mut().set(slot, HeldWord(*v));
             heap::dec(*c);
             if !stored {
