@@ -155,6 +155,12 @@ pub enum Access {
     },
     /// A `with_cell` took the lowest free slot of the store every stack shares.
     Alloc,
+    /// A clause read or assigned its handler's variable `at`; `handler` names the `handle`.
+    Var {
+        handler: u64,
+        at: u32,
+        mode: Mode,
+    },
 }
 
 impl Access {
@@ -170,6 +176,18 @@ impl Access {
                 },
             ) => a == b && (*ma == Mode::Write || *mb == Mode::Write),
             (Access::Alloc, Access::Alloc) => true,
+            (
+                Access::Var {
+                    handler: a,
+                    at: i,
+                    mode: ma,
+                },
+                Access::Var {
+                    handler: b,
+                    at: j,
+                    mode: mb,
+                },
+            ) => a == b && i == j && (*ma == Mode::Write || *mb == Mode::Write),
             _ => false,
         }
     }
@@ -181,6 +199,9 @@ impl fmt::Display for Access {
             Access::Atom(a) => write!(f, "{a}"),
             Access::Cell { id, mode } => write!(f, "cell.{}[{id}]", mode.as_str()),
             Access::Alloc => f.write_str("cell.alloc"),
+            Access::Var { handler, at, mode } => {
+                write!(f, "var.{}[{handler}.{at}]", mode.as_str())
+            }
         }
     }
 }

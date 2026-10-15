@@ -38,8 +38,8 @@ import compiler.exprs
 import compiler.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                        ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell,
                        EWithHold, ESimulate, EParallel, ETagged, EBad, ETryBlock, Param, Stmt, SLet,
-                       SLetElse, SExpr, MatchArm, HandleClause, ReturnClause, NamedArg, RecField,
-                       Hole, expr_span, written_operator)
+                       SLetElse, SExpr, SAssign, MatchArm, HandleClause, ReturnClause, HandlerVar,
+                       NamedArg, RecField, Hole, expr_span, written_operator)
 import compiler.fmt
 import compiler.items
 import compiler.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet,
@@ -168,6 +168,7 @@ type At =
   | AArm(MatchArm)
   | AHandler(HandleClause)
   | AReturn(ReturnClause)
+  | AVar(HandlerVar)
   | AField({ name: parsing::Ident, value: Expr })
   | APatField({ name: parsing::Ident, pat: Pattern })
   | ATypeField({ name: parsing::Ident, ty: TypeExpr })
@@ -281,7 +282,8 @@ pub type Kind =
   /// call written so on a name its item binds is a call on that value, a `Call` of an `Access`, as
   /// `f(x).len()` is.
   | Perform
-  /// `handle { .. } with { .. }`: the body, then each `Handler` and the `ReturnHandler`.
+  /// `handle { .. } with { .. }`: the body, then each `HandlerVariable`, each `Handler` and the
+  /// `ReturnHandler`.
   | Handle
   /// `with_cell[r](init) { c -> body }`: the initial value, the binder, the body.
   | WithCell
@@ -297,6 +299,8 @@ pub type Kind =
   | Let
   /// `let p = v else { .. };`: as a `Let`, then the block.
   | LetElse
+  /// `x = v;` in a handler's clause: the value; `name` is the variable.
+  | Assignment
   /// An arm of a `match`: the pattern, the guard where written, the body.
   | Arm
   /// A clause of a `handle`: its parameters, then its body; `name` is the operation and
@@ -304,6 +308,9 @@ pub type Kind =
   | Handler
   /// `return x -> ..` in a `handle`: the binder, then the body.
   | ReturnHandler
+  /// `var x: T = v` in a `handle`: the type where written, then the first value; `name` is the
+  /// variable.
+  | HandlerVariable
   /// A named part: a record's field, a named argument, a record pattern's field or a record
   /// type's: the value, pattern or type. A field written by its name alone holds the node of that
   /// name, at the same span.
@@ -349,8 +356,9 @@ pub type Comment = new { span: Span, text: String }
 
 /// The version of this module's vocabulary: it moves when a `Kind` is added, and with what is said
 /// of the release when an accessor comes to answer otherwise for a tree it already read. At 2 a
-/// call on a value written on a bare name is no longer a `Perform`.
-pub fn version() -> Int = 2
+/// call on a value written on a bare name is no longer a `Perform`; at 3 a handler has its
+/// `HandlerVariable`s and a clause its `Assignment`s.
+pub fn version() -> Int = 3
 
 /// A place the compiler read, as the span of the source it lies at.
 fn written(place: parsing::Span) -> Span = { start: place.start, end: place.end }
@@ -399,10 +407,16 @@ fn read_at(source: Bytes, at: At) -> parsing::Span =
     ADecreases(e) -> expr_span(e),
     ARow(r) -> r.span,
     AExpr(e) -> expr_span(e),
-    ALet(stmt) -> match stmt { SLet(v) -> v.span, SLetElse(v) -> v.span, SExpr(e) -> expr_span(e) },
+    ALet(stmt) -> match stmt {
+      SLet(v) -> v.span,
+      SLetElse(v) -> v.span,
+      SExpr(e) -> expr_span(e),
+      SAssign(v) -> v.span,
+    },
     AArm(arm) -> arm.span,
     AHandler(c) -> c.span,
     AReturn(r) -> r.span,
+    AVar(v) -> v.span,
     AField(f) -> parsing::span_to(f.name.span, expr_span(f.value)),
     APatField(f) -> parsing::span_to(f.name.span, pat_span(f.pat)),
     ATypeField(f) -> parsing::span_to(f.name.span, ty_span(f.ty)),
@@ -538,6 +552,7 @@ fn expr_parts(source: Bytes, e: Expr) -> List<At> / {abort.raise} =
           source,
           all_of([
             [AExpr(v.body)],
+            v.vars.map(|x: HandlerVar| AVar(x)),
             v.clauses.map(|c: HandleClause| AHandler(c)),
             optional(v.ret, |r: ReturnClause| AReturn(r)),
           ]),
@@ -616,7 +631,9 @@ fn parts_of(source: Bytes, at: At) -> List<At> / {abort.raise} =
           [AExpr(v.value), AExpr(v.fallback)],
         ]),
       SExpr(e) -> [AExpr(e)],
+      SAssign(v) -> [AExpr(v.value)],
     },
+    AVar(v) -> all_of([optional(v.ty, |t: TypeExpr| AType(t)), [AExpr(v.init)]]),
     AArm(arm) ->
       all_of([[APattern(arm.pat)], optional(arm.guard, |e: Expr| AExpr(e)), [AExpr(arm.body)]]),
     AHandler(c) ->
@@ -702,10 +719,11 @@ fn kind_of(source: Bytes, at: At) -> Kind / {abort.raise} =
     ADecreases(_) -> Decreases,
     ARow(_) -> Row,
     AExpr(e) -> expr_kind(source, e),
-    ALet(stmt) -> match stmt { SLetElse(_) -> LetElse, _ -> Let },
+    ALet(stmt) -> match stmt { SLetElse(_) -> LetElse, SAssign(_) -> Assignment, _ -> Let },
     AArm(_) -> Arm,
     AHandler(_) -> Handler,
     AReturn(_) -> ReturnHandler,
+    AVar(_) -> HandlerVariable,
     AField(_) -> Field,
     APatField(_) -> Field,
     ATypeField(_) -> Field,
@@ -771,6 +789,8 @@ fn name_of(at: At) -> Option<parsing::Ident> =
       _ -> None,
     },
     AHandler(c) -> Some(c.op),
+    AVar(v) -> Some(v.name),
+    ALet(stmt) -> match stmt { SAssign(v) -> Some(v.name), _ -> None },
     AField(f) -> Some(f.name),
     APatField(f) -> Some(f.name),
     ATypeField(f) -> Some(f.name),
@@ -1000,10 +1020,11 @@ fn part_tag(at: At) -> Bytes =
     AOperation(_) -> b"operation",
     AClause(c) -> items::spec_kind_text(c.kind),
     ADecreases(_) -> b"decreases",
-    ALet(stmt) -> match stmt { SLetElse(_) -> b"let-else", _ -> b"let" },
+    ALet(stmt) -> match stmt { SLetElse(_) -> b"let-else", SAssign(_) -> b"assign", _ -> b"let" },
     AArm(_) -> b"arm",
     AHandler(_) -> b"handler",
     AReturn(_) -> b"return",
+    AVar(_) -> b"var",
     AField(_) -> b"field",
     APatField(_) -> b"field",
     ATypeField(_) -> b"field",

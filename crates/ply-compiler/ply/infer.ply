@@ -1,7 +1,7 @@
 //! The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
 
 import parsing (Span, Ident, QName, span_to, dummy_span, span_key, span_bin, is_bare, qname_text,
-                starts_upper, prelude_binder, span_between)
+                starts_upper, prelude_binder, span_between, read_site)
 import std.bin
 import std.hash (blake3)
 import std.list (prepend)
@@ -19,11 +19,11 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               spec_kind_bin, deriver_bin, instance_kind_bin)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
-              ESimulate, EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param,
-              NamedArg, MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic,
-              is_ordered, ETagged, Tagged, Hole, tagged_parser, tagged_filler, case_at,
-              case_identity, call_operator, written_operator, Slot, FromName, FromDefault,
-              sees_homes)
+              ESimulate, EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr,
+              SAssign, Param, NamedArg, MatchArm, HandleClause, ReturnClause, HandlerVar, RecField,
+              expr_span, is_arithmetic, is_ordered, ETagged, Tagged, Hole, tagged_parser,
+              tagged_filler, case_at, case_identity, call_operator, written_operator, Slot,
+              FromName, FromDefault, sees_homes)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -60,7 +60,8 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 of_binder, of_module, Parameters, ParamInfo, filled_args)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
                 NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
-                expand_tagged, expand_holds, expand_member_calls, MemberCallee, with_member_calls)
+                expand_tagged, expand_holds, expand_handler_vars, expand_member_calls, MemberCallee,
+                with_member_calls)
 import embed (rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
@@ -655,7 +656,24 @@ type Checker = {
   /// True while the first argument of `cell_get`, `cell_set` or `cell_update` is read, which is the
   /// one place a cell's name stands.
   cell_named: Bool,
+  assignable: Assignable,
 }
+
+/// The variables of the handler whose clause is being walked, each by the stamp its name is bound
+/// at, which an assignment may give a new value; `barred` names the place in the clause where none
+/// may, since what runs there may run after the clause has returned.
+type Assignable = { vars: List<{ stamp: Int, name: Bytes, ty: Type }>, barred: Option<Bytes> }
+
+/// `checker` where no assignment may give the variables of the clause around it a value: inside
+/// `place`, whose walk `unbarred` ends.
+fn barred(checker: Checker, place: Bytes) -> Checker =
+  if checker.assignable.vars.len() == 0 { checker }
+  else { { ..checker, assignable: { ..checker.assignable, barred: Some(place) } } }
+
+/// `o`, walked from `barred(outer, ..)`, with the assignments `outer` allowed allowed again.
+fn unbarred(outer: Checker, o: Inferred) -> Inferred =
+  if outer.assignable.vars.len() == 0 { o }
+  else { { ..o, checker: { ..o.checker, assignable: outer.assignable } } }
 
 type Inferred = { checker: Checker, ty: Type, row: Row }
 type WithTy = { checker: Checker, ty: Type }
@@ -4558,6 +4576,8 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
     },
     EBinary(b) -> infer_binary(checker, b.span, b.op, b.lhs, b.rhs),
     ELambda(l) -> {
+      let outer = checker;
+      let checker = barred(outer, b"a lambda");
       let pushed: Checker = { ..checker, env: env_push(checker.env) };
       let expected = match hinted(checker, hint) { Some(TyFn(f)) -> f.params, _ -> [] };
       let ps = l.params.fold(
@@ -4626,7 +4646,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
           ),
         None -> body.checker,
       };
-      {
+      let made: Inferred = {
         checker: note_typed(
           leaving({ ..checked, env: env_pop(checked.env) }, checker.guards),
           l.span,
@@ -4635,7 +4655,8 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         ),
         ty: fn_type(ps.tys, body.ty, body.row),
         row: row_empty(),
-      }
+      };
+      unbarred(outer, made)
     },
     EApp(a) -> match a.func {
       EField(f) -> {
@@ -4867,13 +4888,49 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       let d = dotted_callee(p.span, b, on, p.op, p.args, [], labels);
       dotted(p.span, d, defaults_taken(d), b, on, p.op, p.args, labels, hint, true)
     },
-    EHandle(h) -> infer_handle(checker, h.span, h.body, h.clauses, h.ret, hint),
-    EWithCell(c) -> infer_with_cell(checker, c.span, c.resource, c.init, c.binder, c.body, hint),
+    EHandle(h) -> infer_handle(checker, h.span, h.body, h.clauses, h.ret, h.vars, hint),
+    EWithCell(c) ->
+      unbarred(
+        checker,
+        infer_with_cell(
+          barred(checker, b"a `with_cell` region"),
+          c.span,
+          c.resource,
+          c.init,
+          c.binder,
+          c.body,
+          hint,
+        ),
+      ),
     EWithHold(c) ->
-      infer_with_hold(checker, c.span, c.resource, c.acquire, c.release, c.binder, c.body, hint),
-    ESimulate(s) -> infer_simulate(checker, s.span, s.body, hint),
-    EParallel(v) -> infer_parallel(checker, v.span, v.branches),
-    ETryBlock(t) -> infer_try_block(checker, t.span, t.raise, t.body, hint),
+      unbarred(
+        checker,
+        infer_with_hold(
+          barred(checker, b"a `with_hold` region"),
+          c.span,
+          c.resource,
+          c.acquire,
+          c.release,
+          c.binder,
+          c.body,
+          hint,
+        ),
+      ),
+    ESimulate(s) ->
+      unbarred(
+        checker,
+        infer_simulate(barred(checker, b"a `simulate` body"), s.span, s.body, hint),
+      ),
+    EParallel(v) ->
+      unbarred(
+        checker,
+        infer_parallel(barred(checker, b"a `parallel` branch"), v.span, v.branches),
+      ),
+    ETryBlock(t) ->
+      unbarred(
+        checker,
+        infer_try_block(barred(checker, b"a `try` body"), t.span, t.raise, t.body, hint),
+      ),
     ETagged(t) -> infer_tagged(checker, t),
   }
 
@@ -5332,6 +5389,21 @@ fn settle_updates(checker: Checker) -> Checker / {abort.raise} = {
   })
 }
 
+/// `checker` with the type of a read of `name` at `span` filed where the name is a variable of the
+/// handler whose clause is walked: the read is written out as one of the runtime's, which no
+/// binding's layout describes.
+fn held_read(checker: Checker, name: Bytes, span: Span, ty: Type) -> Checker =
+  if checker.assignable.vars.len() == 0 { checker } else {
+    match env_local(checker.env, name) {
+      Some(l) -> if checker.assignable.vars.fold(
+          false,
+          |found: Bool, v: { stamp: Int, name: Bytes, ty: Type }| found || v.stamp == l.stamp,
+        ) { note_typed(checker, read_site(span), ty, []) }
+      else { checker },
+      None -> checker,
+    }
+  }
+
 fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
   let k: WithKey = value_key(checker, qname);
   match k.key {
@@ -5434,7 +5506,7 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             }
           } else { noted };
           let typed: Checker = match env_depth_of(columned.env, key.name) {
-            Some(d) -> if d > 0 { columned }
+            Some(d) -> if d > 0 { held_read(columned, key.name, qname.span, inst.ty) }
             else { note_typed(columned, qname.span, inst.ty, inst.args) },
             None -> note_typed(columned, qname.span, inst.ty, inst.args),
           };
@@ -5701,6 +5773,74 @@ fn infer_stmt(checker: Checker, stmt: Stmt, hint: Option<Hint>) -> StmtOut / {ab
           fallback: None,
         }
       } else { { checker: bound, row: b.row, fallback: None } }
+    },
+    SAssign(a) -> {
+      // The binding the name stands for here, which a `let` or a parameter of the same name hides.
+      let target = match env_local(checker.env, a.name.name) {
+        Some(l) ->
+          checker.assignable.vars.fold(
+            None,
+            |found: Option<{ stamp: Int, name: Bytes, ty: Type }>, v: { stamp: Int, name: Bytes, ty: Type }|
+              if v.stamp == l.stamp { Some(v) } else { found },
+          ),
+        None -> None,
+      };
+      match target {
+        None -> {
+          let o: Inferred = infer(checker, a.value);
+          {
+            checker: report_error_at(
+              o.checker,
+              b"E0314",
+              a.name.span,
+              Bytes::concat_all([
+                b"`",
+                a.name.name,
+                b"` is not a variable of the handler whose clause this is",
+              ]),
+              b"assigned here",
+              [
+                b"a handler declares its variables with `var` in its `with` block, and only its clauses assign them; bind a new name with `let` instead",
+              ],
+            ),
+            row: o.row,
+            fallback: None,
+          }
+        },
+        Some(v) -> match checker.assignable.barred {
+          Some(place) -> {
+            let o: Inferred = infer(checker, a.value, hint_of(v.ty));
+            {
+              checker: report_error_at(
+                o.checker,
+                b"E0315",
+                a.span,
+                Bytes::concat_all([b"`", a.name.name, b"` is assigned in ", place]),
+                b"assigned here",
+                [
+                  b"what runs there may run after the clause has returned: assign the variable in the clause's own blocks, from the value this answers",
+                ],
+              ),
+              row: o.row,
+              fallback: None,
+            }
+          },
+          None -> {
+            let o: Inferred = infer(checker, a.value, hint_of(v.ty));
+            {
+              checker: expect(
+                o.checker,
+                expr_span(a.value),
+                v.ty,
+                o.ty,
+                b"a handler's variable keeps the type it was declared with",
+              ).checker,
+              row: o.row,
+              fallback: None,
+            }
+          },
+        },
+      }
     },
     // The `else` block runs where the pattern matched nothing, so it sees none of its names.
     SLetElse(l) -> {
@@ -8441,18 +8581,97 @@ fn answers_raise(checker: Checker, clause: HandleClause) -> Bool / {abort.raise}
     None -> false,
   }
 
+/// The variables a `handle` declares, typed where it stands: what each holds, and what making them
+/// performs.
+type MadeVars = { checker: Checker, row: Row, vars: List<{ name: Ident, ty: Type }> }
+
+/// Each initializer sees the variables above it, as values: none of them is assignable there.
+fn made_vars(checker: Checker, vars: List<HandlerVar>) -> MadeVars / {abort.raise} = {
+  let pushed: Checker = { ..checker, env: env_push(checker.env) };
+  let made = vars.fold(
+    { checker: pushed, row: row_empty(), vars: [] },
+    |acc: MadeVars, v: HandlerVar| {
+      let written: { checker: Checker, ty: Option<Type> } = match v.ty {
+        Some(te) -> {
+          let w: WithTy = conv_type(acc.checker, te);
+          { checker: hold_written(w.checker, te, w.ty, false), ty: Some(w.ty) }
+        },
+        None -> { checker: acc.checker, ty: None },
+      };
+      let o: Inferred = infer(written.checker, v.init, match written.ty {
+        Some(t) -> hint_of(t),
+        None -> None,
+      });
+      let ty = match written.ty { Some(t) -> t, None -> o.ty };
+      let checked: Checker = match written.ty {
+        Some(t) ->
+          expect(o.checker, expr_span(v.init), t, o.ty, b"the variable's written type").checker,
+        None -> o.checker,
+      };
+      let j: WithRow = join(checked, v.span, acc.row, o.row);
+      let once: Checker = match acc.vars.filter(|x: { name: Ident, ty: Type }|
+          x.name.name == v.name.name) {
+        [first, ..] ->
+          duplicate(j.checker, v.name, location_of(j.checker, first.name.span), b"variable"),
+        [] -> j.checker,
+      };
+      let noted: Checker = note_typed(
+        note_typed(once, v.name.span, ty, []),
+        read_site(v.name.span),
+        ty,
+        [],
+      );
+      {
+        checker: { ..noted, env: env_bind(noted.env, v.name.name, monomorphic(ty)) },
+        row: j.row,
+        vars: acc.vars.push({ name: v.name, ty: ty }),
+      }
+    },
+  );
+  { ..made, checker: { ..made.checker, env: env_pop(made.checker.env) } }
+}
+
+/// `checker` with a handler's variables bound in a new scope, each its own type: what a clause or
+/// the `return` clause starts from. An assignment may give them new values unless `barred`.
+fn with_vars(
+  checker: Checker,
+  vars: List<{ name: Ident, ty: Type }>,
+  barred: Option<Bytes>,
+) -> Checker / {abort.raise} = {
+  let pushed: Checker = { ..checker, env: env_push(checker.env) };
+  let bound = vars.fold(
+    { checker: pushed, stamps: [] },
+    |acc: { checker: Checker, stamps: List<{ stamp: Int, name: Bytes, ty: Type }> }, v: { name: Ident, ty: Type }|
+      {
+        checker: { ..acc.checker, env: env_bind(acc.checker.env, v.name.name, monomorphic(v.ty)) },
+        stamps: acc.stamps.push({ stamp: acc.checker.env.binds, name: v.name.name, ty: v.ty }),
+      },
+  );
+  { ..bound.checker, assignable: { vars: bound.stamps, barred: barred } }
+}
+
 fn infer_handle(
   checker: Checker,
   span: Span,
   body: Expr,
   clauses: List<HandleClause>,
   ret: Option<ReturnClause>,
+  vars: List<HandlerVar>,
   hint: Option<Hint>,
 ) -> Inferred / {abort.raise} = {
-  let mark = checker.performs.len();
+  // The variables are made where the `handle` stands, before its body runs, outside the handler.
+  let made: MadeVars = made_vars(checker, vars);
+  let around: Assignable = checker.assignable;
+  let mark = made.checker.performs.len();
   // The `handle` answers what its `return` clause does, and without one what its body does.
-  let b: Inferred = infer(checker, body, match ret { Some(_) -> None, None -> hint });
-  let spawned = { before: spawn_counts(checker), after: spawn_counts(b.checker) };
+  let b: Inferred = unbarred(
+    made.checker,
+    infer(barred(made.checker, b"the body of a `handle` inside the clause"), body, match ret {
+      Some(_) -> None,
+      None -> hint,
+    }),
+  );
+  let spawned = { before: spawn_counts(made.checker), after: spawn_counts(b.checker) };
   let general = clauses.fold(false, |acc: Bool, c: HandleClause|
     acc || (match c.resume { Some(_) -> true, None -> false }));
   let escapes = clauses.fold(general, |acc: Bool, c: HandleClause|
@@ -8559,10 +8778,13 @@ fn infer_handle(
                   })
                 } else { shape.checker };
                 // What a clause's parameters hold is its operation's, filed where the clause is.
-                let pushed: Checker = {
-                  ..note_typed(c0, clause.span, fn_type(shape.params, shape.ret, row_empty()), []),
-                  env: env_push(c0.env),
-                };
+                // A clause's parameters bind after the handler's variables, so one of a variable's
+                // name is the parameter.
+                let pushed: Checker = with_vars(
+                  note_typed(c0, clause.span, fn_type(shape.params, shape.ret, row_empty()), []),
+                  made.vars,
+                  None,
+                );
                 let bound: Checker = range(0, clause.params.len()).fold(
                   pushed,
                   |c: Checker, i: Int|
@@ -8625,7 +8847,11 @@ fn infer_handle(
                 let answer = if !whole { hint_of(shape.ret) }
                 else { match ret { Some(_) -> hint, None -> hint_after(hint, b.ty) } };
                 let body_: Inferred = infer(with_resume, clause.body, answer);
-                let popped: Checker = { ..body_.checker, env: env_pop(body_.checker.env) };
+                let popped: Checker = {
+                  ..body_.checker,
+                  env: env_pop(body_.checker.env),
+                  assignable: around,
+                };
                 let checked: Checker = match clause.resume {
                   Some(_) ->
                     expect(
@@ -8684,13 +8910,17 @@ fn infer_handle(
   let under: Checker = spawned_under(walked.checker, spawned.before, spawned.after, walked.around);
   let returned = match ret {
     Some(rc) -> {
-      let pushed: Checker = { ..under, env: env_push(under.env) };
+      let pushed: Checker = with_vars(under, made.vars, Some(b"the `return` clause"));
       let bound: Checker = {
         ..pushed,
         env: env_bind(pushed.env, rc.binder.name, monomorphic(b.ty)),
       };
       let o: Inferred = infer(bound, rc.body, hint);
-      { checker: { ..o.checker, env: env_pop(o.checker.env) }, ty: o.ty, row: o.row }
+      {
+        checker: { ..o.checker, env: env_pop(o.checker.env), assignable: around },
+        ty: o.ty,
+        row: o.row,
+      }
     },
     None -> { checker: under, ty: b.ty, row: row_empty() },
   };
@@ -8736,7 +8966,9 @@ fn infer_handle(
     Some(v) -> { ..j2.checker, subst: solve_continuation_row(j2.checker.subst, v, j2.row) },
     None -> j2.checker,
   };
-  { checker: solved, ty: returned.ty, row: j2.row }
+  // What making the variables performs is the `handle`'s, outside its own clauses' reach.
+  let j3: WithRow = join(solved, span, j2.row, made.row);
+  { checker: j3.checker, ty: returned.ty, row: j3.row }
 }
 
 /// The raise a `try` names.
@@ -9611,6 +9843,7 @@ fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
         |acc: { bound: List<Bytes>, out: Refs }, s: Stmt|
           match s {
             SExpr(x) -> { ..acc, out: collect_refs(x, acc.bound, acc.out) },
+            SAssign(x) -> { ..acc, out: collect_refs(x.value, acc.bound, acc.out) },
             SLet(l) ->
               {
                 bound: pattern_binders(l.pat, acc.bound),
@@ -9634,14 +9867,21 @@ fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
     EList(l) -> l.items.fold(out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
     EPerform(p) -> p.args.fold(out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
     EHandle(h) -> {
-      let b = collect_refs(h.body, bound, out);
+      // Each initializer sees the variables above it.
+      let inits = h.vars.fold(
+        { refs: out, bound: bound },
+        |acc: { refs: Refs, bound: List<Bytes> }, v: HandlerVar|
+          { refs: collect_refs(v.init, acc.bound, acc.refs), bound: acc.bound.push(v.name.name) },
+      );
+      let b = collect_refs(h.body, bound, inits.refs);
+      let held = bound.concat(h.vars.map(|v: HandlerVar| v.name.name));
       let cs = h.clauses.fold(b, |acc: Refs, c: HandleClause| {
-        let named = bound.concat(c.params.map(|i: Ident| i.name));
+        let named = held.concat(c.params.map(|i: Ident| i.name));
         let labelled = match c.label_binder { Some(t) -> named.push(t.name), None -> named };
         let inner = match c.resume { Some(k) -> labelled.push(k.name), None -> labelled };
         collect_refs(c.body, inner, acc)
       });
-      match h.ret { Some(rc) -> collect_refs(rc.body, bound.push(rc.binder.name), cs), None -> cs }
+      match h.ret { Some(rc) -> collect_refs(rc.body, held.push(rc.binder.name), cs), None -> cs }
     },
     EWithCell(c) ->
       collect_refs(c.body, bound.push(c.binder.name), collect_refs(c.init, bound, out)),
@@ -15804,6 +16044,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     keyed_names: [],
     copied: false,
     cell_named: false,
+    assignable: { vars: [], barred: None },
   })
 
 /// `ok` is `false` when the program has an *error* in it. A warning is not one: the program
@@ -16296,20 +16537,26 @@ fn members_in(
 /// A module with every tagged literal written out as the call it runs as, every call on a value
 /// as the call of its type's function, every record update as the literal it stands for, and
 /// every `try` as its `handle`. The tagged literals go first: they need nothing of the checker,
-/// and what they become is forms the others already walk.
+/// and what they become is forms the others already walk. A handler's variables go last, so what
+/// reads them is in the forms it is lowered in.
 fn written_out(
   module: Module,
   elaboration: Elaboration,
   i: Int,
   signatures: Map<Bytes, Parameters>,
 ) -> Module =
-  expand_holds(
-    expand_try_blocks(
-      expand_record_updates(
-        expand_member_calls(expand_tagged(module), members_in(elaboration.members, i, signatures)),
-        shapes_in(elaboration.updates, i),
+  expand_handler_vars(
+    expand_holds(
+      expand_try_blocks(
+        expand_record_updates(
+          expand_member_calls(
+            expand_tagged(module),
+            members_in(elaboration.members, i, signatures),
+          ),
+          shapes_in(elaboration.updates, i),
+        ),
+        answered_in(elaboration.tries, i),
       ),
-      answered_in(elaboration.tries, i),
     ),
   )
 
@@ -18505,6 +18752,114 @@ test "a `try` answers the one raise its body's row names, as an `Err` of what it
     [],
   );
   assert_eq(raising(b"fn f(b: Int) -> Result<Int, Int> / {abort.raise} = try { digit(b) / b }"), [])
+}
+
+fn tallied(rest: Bytes) -> List<Bytes> / {abort.raise} =
+  check_codes(
+    b"effect tally { write add(n: Int) -> Unit read total() -> Int }\nfn run(xs: List<Int>) -> Int / {tally.add, tally.total} = { xs.fold((), |u: Unit, x: Int| tally.add(x)); tally.total() }\n".concat(
+      rest,
+    ),
+  )
+
+test "a handler's variables are typed by their first values, and a clause assigns them in its branches" {
+  assert_eq(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, var big: Bool = false, tally.add(n) -> { sum = sum + n; if n > 9 { big = true } }, tally.total() -> if big { 0 } else { sum } }",
+    ),
+    [],
+  );
+  assert_eq(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> { sum = \"no\" }, tally.total() -> sum }",
+    ),
+    [b"E0201"],
+  );
+  assert_eq(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum: Int = \"no\", tally.add(n) -> (), tally.total() -> sum }",
+    ),
+    [b"E0201"],
+  );
+  // What making a variable performs is the `handle`'s, which the handler's own clauses do not answer.
+  assert_eq(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int / {} = handle { run(xs) } with { var sum = tally.total(), tally.add(n) -> (), tally.total() -> sum }",
+    ),
+    [b"E0302"],
+  );
+  // Each first value sees the variables above it, and none of them twice.
+  assert_eq(
+    tallied(
+      b"fn f(n: Bool) -> Int = handle { run([]) } with { var n = 10, var m = n + 1, tally.add(k) -> (), tally.total() -> m }",
+    ),
+    [],
+  );
+  assert_eq(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var n = 0, var n = 1, tally.add(k) -> (), tally.total() -> n }",
+    ),
+    [b"E0105"],
+  )
+}
+
+test "only a variable of the handler whose clause it is in is assigned" {
+  // A body sees none of its handler's variables.
+  assert(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int = handle { sum = 1; run(xs) } with { var sum = 0, tally.add(n) -> (), tally.total() -> sum }",
+    ).contains(
+      b"E0314",
+    ),
+  );
+  // A parameter or a `let` of the variable's name hides it.
+  assert_eq(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var n = 0, tally.add(n) -> { n = 1 }, tally.total() -> n }",
+    ),
+    [b"E0314"],
+  );
+  assert_eq(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> { let sum = 2; sum = n }, tally.total() -> sum }",
+    ),
+    [b"E0314"],
+  );
+  // An inner handler's clause assigns its own variables, not those of a handler around it.
+  assert_eq(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> { handle { run([n]) } with { var m = 0, tally.add(k) -> { sum = k }, tally.total() -> m }; () }, tally.total() -> sum }",
+    ),
+    [b"E0314"],
+  );
+  assert_eq(tallied(b"fn f(n: Int) -> Int = { n = 2; n }"), [b"E0314"])
+}
+
+test "a clause does not assign its handler's variables where what runs may run after it returns" {
+  assert_eq(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> { let g = || { sum = n }; g() }, tally.total() -> sum }",
+    ),
+    [b"E0315"],
+  );
+  assert_eq(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> { handle { sum = n; run([n]) } with { tally.add(k) -> (), tally.total() -> 0 }; () }, tally.total() -> sum }",
+    ),
+    [b"E0315"],
+  );
+  assert_eq(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> (), tally.total() -> sum, return x -> { sum = x; sum } }",
+    ),
+    [b"E0315"],
+  );
+  // A lambda reads them.
+  assert_eq(
+    tallied(
+      b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> { let g = || sum + n; sum = g() }, tally.total() -> sum }",
+    ),
+    [],
+  )
 }
 
 test "a `try` over several raises names the one it answers, and the others stay in the row" {

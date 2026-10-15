@@ -14,12 +14,14 @@
 //!
 //! Retrying, breaking a circuit, limiting a rate and keeping a retry budget are each a value and
 //! the pure functions that step it, which take the reading of the clock they need. The caller
-//! keeps the value, in a cell or threaded through: nothing here is ambient. A function that
-//! steps one while it runs a body (`guarded`, `throttled`, `retry_budgeted`, `single_flight`)
-//! takes `load` and `store`, how the caller reads what it keeps and puts one back, which over a
-//! cell are `|| cell_get(c)` and `|s: S| cell_set(c, s)`. It reads and writes with nothing
-//! between that another task could run in, so tasks sharing a cell see each step whole. Jitter
-//! is drawn from `std.random`'s `entropy`, so a run that answers it from a seed waits what the
+//! keeps the value, in a handler's variable or threaded through: nothing here is ambient. A
+//! function that steps one while it runs a body (`guarded`, `throttled`, `retry_budgeted`,
+//! `single_flight`) takes `load` and `store`, how the caller reads what it keeps and puts one
+//! back: over a handler's variable, operations its clauses answer. `single_flight`'s flights hold
+//! channels, which no operation carries, so a caller keeps them in a cell, as `|| cell_get(c)` and
+//! `|f: Flights<k, a>| cell_set(c, f)`. Each reads and writes with nothing between that another
+//! task could run in, so tasks sharing one value see each step whole. Jitter is drawn from
+//! `std.random`'s `entropy`, so a run that answers it from a seed waits what the
 //! seed says.
 //!
 //! Under `simulate` every wait here is virtual time and every interleaving of what these start
@@ -800,12 +802,51 @@ fn nap(n: Int) -> Int / {clock.write} = {
   n
 }
 
-/// How many are inside now, and the most there have been at once.
-type Gauge = { inside: Int, most: Int }
+/// What a test's tasks note as they go.
+effect log {
+  write note(line: String) -> Unit
+  read notes() -> List<String>
+}
 
-fn entered(g: Gauge) -> Gauge = { inside: g.inside + 1, most: max(g.most, g.inside + 1) }
+/// `body` noting into a log that starts empty, and what it noted.
+fn logged<a | e>(
+  body: () -> a / {log.note, log.notes | e},
+) -> { value: a, notes: List<String> } / e =
+  handle {
+    body()
+  } with {
+    var lines: List<String> = [],
+    log.note(line) -> {
+      lines = lines.push(line);
+    },
+    log.notes() -> lines,
+    return value -> { value: value, notes: lines },
+  }
 
-fn left(g: Gauge) -> Gauge = { ..g, inside: g.inside - 1 }
+/// A level a test's tasks raise as they enter and lower as they leave.
+effect level {
+  write up() -> Unit
+  write down() -> Unit
+}
+
+/// `body`, where the level it raises and lowers ended, and the highest it reached.
+fn peak<a | e>(
+  body: () -> a / {level.up, level.down | e},
+) -> { value: a, inside: Int, most: Int } / e =
+  handle {
+    body()
+  } with {
+    var inside = 0,
+    var most = 0,
+    level.up() -> {
+      inside = inside + 1;
+      most = max(most, inside);
+    },
+    level.down() -> {
+      inside = inside - 1;
+    },
+    return value -> { value: value, inside: inside, most: most },
+  }
 
 /// Work that takes `work` under a timeout of `budget`: how it ends, and when.
 type Bounded = { name: String, budget: Int, work: Int, ended: Timed<Int>, at: Int }
@@ -921,30 +962,26 @@ test "the raising form by an instant raises that instant" {
 }
 
 test "work a timeout stops has released what it held when the timeout answers" {
-  with_cell[seen]([]) { c -> {
+  logged(||
     simulate {
       unbounded(|| {
         let ended = timeout(Duration(5), ||
-          bracket(
-            || cell_set(c, cell_get(c).push("open")),
-            |_u: Unit| cell_set(c, cell_get(c).push("close")),
-            |_u: Unit| nap(10),
-          ));
+          bracket(|| log.note("open"), |_u: Unit| log.note("close"), |_u: Unit| nap(10)));
         assert_eq(ended, TimedOut);
-        assert_eq(cell_get(c), ["open", "close"])
+        assert_eq(log.notes(), ["open", "close"])
       })
-    }
-  } }
+    });
+  ()
 }
 
 test "a cancelled timeout stops its work and its timer: nothing of either runs on" {
-  with_cell[seen]([]) { c -> {
+  let ran = logged(||
     simulate {
       let outer = task.spawn(||
         unbounded(||
           timeout(Duration(50), || {
             clock.sleep(Duration(10));
-            cell_set(c, cell_get(c).push("late"))
+            log.note("late")
           })));
       clock.sleep(Duration(5));
       assert(task.cancel(outer));
@@ -952,23 +989,21 @@ test "a cancelled timeout stops its work and its timer: nothing of either runs o
       assert_eq(clock.now(), Instant(5));
       clock.sleep(Duration(100));
       assert_eq(clock.now(), Instant(105))
-    };
-    assert_eq(cell_get(c), [])
-  } }
+    });
+  assert_eq(ran.notes, [])
 }
 
 test "each loser of a race has released what it held when the race answers" {
-  with_cell[seen]([]) { c -> {
-    let won = simulate {
+  let won = logged(||
+    simulate {
       let runner = |name: String, takes: Int|
-        || bracket(|| (), |_u: Unit| cell_set(c, cell_get(c).push(name)), |_u: Unit| nap(takes));
+        || bracket(|| (), |_u: Unit| log.note(name), |_u: Unit| nap(takes));
       let first = race([runner("a", 30), runner("b", 10), runner("c", 20)]);
-      (first, cell_get(c), clock.now())
-    };
-    assert_eq(won._0, Some(10));
-    assert_eq(won._1.sort(), ["a", "b", "c"]);
-    assert_eq(won._2, Instant(10))
-  } }
+      (first, log.notes(), clock.now())
+    }).value;
+  assert_eq(won._0, Some(10));
+  assert_eq(won._1.sort(), ["a", "b", "c"]);
+  assert_eq(won._2, Instant(10))
 }
 
 law "a race answers the body that ends first and takes no longer, in every interleaving"
@@ -1011,20 +1046,19 @@ test "all_ok answers every success in the bodies' order" {
 }
 
 test "all_ok stops at the first failure, and no body is left running" {
-  with_cell[seen]([]) { c -> {
+  let ran = logged(||
     simulate {
       let late = |takes: Int|
         || {
           let r = checked(takes, true);
-          cell_set(c, cell_get(c).push("late"));
+          log.note("late");
           r
         };
       assert_eq(all_ok([late(50), || checked(10, false), late(40)]), Err("failed at 10"));
       assert_eq(clock.now(), Instant(10));
       clock.sleep(Duration(100))
-    };
-    assert_eq(cell_get(c), [])
-  } }
+    });
+  assert_eq(ran.notes, [])
 }
 
 test "first_ok answers the first success and stops the rest" {
@@ -1046,17 +1080,15 @@ test "first_ok of bodies that all fail answers every failure in the bodies' orde
 law "map_concurrent answers in the order given and never runs more than its limit at once"
   forall (items: Few, at_once: Few) where at_once != Zero && (items != Three || at_once != Three) {
     simulate {
-      with_cell[gauge]({ inside: 0, most: 0 }) { g -> {
-        let n = count(items);
-        let got = map_concurrent(range(0, n), count(at_once), |x: Int| {
-          cell_set(g, entered(cell_get(g)));
+      let n = count(items);
+      let got = peak(||
+        map_concurrent(range(0, n), count(at_once), |x: Int| {
+          level.up();
           task.yield();
-          cell_set(g, left(cell_get(g)));
+          level.down();
           x * 2
-        });
-        got == range(0, n).map(|x: Int| x * 2) && cell_get(g).most <= count(at_once)
-          && cell_get(g).inside == 0
-      } }
+        }));
+      got.value == range(0, n).map(|x: Int| x * 2) && got.most <= count(at_once) && got.inside == 0
     }
   }
 
@@ -1074,60 +1106,72 @@ law "a semaphore never admits more holders than it has permits, in every interle
   forall (permits: Few, tasks: Few)
   where permits != Zero && permits != Three && (permits == One || tasks != Three) {
     simulate {
-      with_cell[gauge]({ inside: 0, most: 0 }) { g -> {
-        let sem = semaphore(count(permits));
+      let sem = semaphore(count(permits));
+      let got = peak(||
         all(
           range(0, count(tasks)).map(|_i: Int|
             ||
               with_permit(sem, || {
-                cell_set(g, entered(cell_get(g)));
+                level.up();
                 task.yield();
-                cell_set(g, left(cell_get(g)))
+                level.down()
               })),
-        );
-        cell_get(g).most <= count(permits) && cell_get(g).inside == 0
-          && (count(tasks) == 0 || cell_get(g).most >= 1)
-      } }
+        ));
+      got.most <= count(permits) && got.inside == 0 && (count(tasks) == 0 || got.most >= 1)
     }
   }
+
+/// The order a test's tasks asked for a permit in, and the order they were let in.
+effect queue {
+  write asked(i: Int) -> Unit
+  write entered(i: Int) -> Unit
+}
 
 law "a semaphore of one permit admits its waiters in the order they asked, in every interleaving"
   forall (tasks: Few) {
     simulate {
-      with_cell[order]({ asked: [], entered: [] }) { o -> {
-        let sem = semaphore(1);
+      let sem = semaphore(1);
+      handle {
         all(
           range(0, count(tasks)).map(|i: Int|
             || {
-              cell_set(o, { ..cell_get(o), asked: cell_get(o).asked.push(i) });
+              queue.asked(i);
               with_permit(sem, || {
-                cell_set(o, { ..cell_get(o), entered: cell_get(o).entered.push(i) });
+                queue.entered(i);
                 task.yield()
               })
             }),
-        );
-        cell_get(o).asked == cell_get(o).entered
-      } }
+        )
+      } with {
+        var asked: List<Int> = [],
+        var entered: List<Int> = [],
+        queue.asked(i) -> {
+          asked = asked.push(i);
+        },
+        queue.entered(i) -> {
+          entered = entered.push(i);
+        },
+        return _done -> asked == entered,
+      }
     }
   }
 
 test "a semaphore serves its waiters in the order they began to wait" {
-  with_cell[seen]([]) { c -> {
+  let ran = logged(||
     simulate {
       let sem = semaphore(1);
       let waiter = |name: String, from: Int|
         || {
           clock.sleep(Duration(from));
           with_permit(sem, || {
-            cell_set(c, cell_get(c).push(name));
+            log.note(name);
             clock.sleep(Duration(10))
           })
         };
       all([waiter("third", 3), waiter("first", 0), waiter("second", 2), waiter("fourth", 4)]);
       ()
-    };
-    assert_eq(cell_get(c), ["first", "second", "third", "fourth"])
-  } }
+    });
+  assert_eq(ran.notes, ["first", "second", "third", "fourth"])
 }
 
 test "a permit goes back however its holder ends: cancelled anywhere, or by a raise" {
@@ -1145,21 +1189,20 @@ test "a permit goes back however its holder ends: cancelled anywhere, or by a ra
 }
 
 test "scoped ends every task it started when its caller is cancelled" {
-  with_cell[seen]([]) { c -> {
+  let ran = logged(||
     simulate {
       let late = |name: String|
         || {
           clock.sleep(Duration(10));
-          cell_set(c, cell_get(c).push(name))
+          log.note(name)
         };
       let outer = task.spawn(||
         scoped([late("a"), late("b")], |_kids: List<Task<Unit>>| clock.sleep(Duration(100))));
       task.cancel(outer);
       task.await(outer);
       clock.sleep(Duration(50))
-    };
-    assert_eq(cell_get(c), [])
-  } }
+    });
+  assert_eq(ran.notes, [])
 }
 
 // --- Tests of retrying ------------------------------------------------------
@@ -1274,23 +1317,36 @@ test "a retry stops at a failure its policy does not retry, and at the first suc
 }
 
 test "a retry under a budget is made only while the budget pays, and each call pays in" {
-  with_cell[paid](budget(50, 1)) { b -> {
-    let ended = simulate {
+  let ended = handle {
+    simulate {
       unbounded(||
         random::with_rand(random::rand(1), || {
           let call = ||
             retry_budgeted(
               spread(NoJitter, 10, 40, 5, None),
-              || cell_get(b),
-              |next: Budget| cell_set(b, next),
+              || budgets.load(),
+              |next: Budget| budgets.store(next),
               refused,
             );
           [call(), call(), call()]
         }).value)
-    };
-    assert_eq(ended, [over_budget(2), over_budget(1), over_budget(2)]);
-    assert_eq(retries_left(cell_get(b)), 0)
-  } }
+    }
+  } with {
+    var kept = budget(50, 1),
+    budgets.load() -> kept,
+    budgets.store(next) -> {
+      kept = next;
+    },
+    return calls -> (calls, kept),
+  };
+  assert_eq(ended._0, [over_budget(2), over_budget(1), over_budget(2)]);
+  assert_eq(retries_left(ended._1), 0)
+}
+
+/// The retry budget a test's calls share.
+effect budgets {
+  read load() -> Budget
+  write store(b: Budget) -> Unit
 }
 
 fn over_budget(attempts: Int) -> Result<Int, GaveUp<String>> =
@@ -1382,20 +1438,37 @@ test "an open breaker refuses every call before its cooldown ends, and lets one 
 }
 
 test "a call behind a breaker is refused while it is open, probes after the cooldown, and closes it" {
-  with_cell[state](breaker(2, Duration(10), 1)) { c -> {
+  breaking(breaker(2, Duration(10), 1), ||
     simulate {
       let call = |ok: Bool|
-        guarded(|| cell_get(c), |b: Breaker| cell_set(c, b), ||
+        guarded(|| breakers.load(), |b: Breaker| breakers.store(b), ||
           if ok { Ok(1) } else { Err("down") });
       assert_eq(call(false), Err(Failed("down")));
       assert_eq(call(false), Err(Failed("down")));
       assert_eq(call(true), Err(Rejected));
       clock.sleep(Duration(10));
       assert_eq(call(true), Ok(1));
-      assert_eq(circuit(cell_get(c)), Closed(0))
-    }
-  } }
+      assert_eq(circuit(breakers.load()), Closed(0))
+    })
 }
+
+/// The breaker a test's calls share.
+effect breakers {
+  read load() -> Breaker
+  write store(b: Breaker) -> Unit
+}
+
+/// `body` with its calls sharing the breaker `b` through `breakers`.
+fn breaking<a | e>(b: Breaker, body: () -> a / {breakers.load, breakers.store | e}) -> a / e =
+  handle {
+    body()
+  } with {
+    var kept = b,
+    breakers.load() -> kept,
+    breakers.store(next) -> {
+      kept = next;
+    },
+  }
 
 fn slow_ok(takes: Int) -> Result<Int, String> / {clock.write} = {
   clock.sleep(Duration(takes));
@@ -1403,19 +1476,18 @@ fn slow_ok(takes: Int) -> Result<Int, String> / {clock.write} = {
 }
 
 test "a probe that is cancelled is given back, so the next call may probe" {
-  with_cell[state](record(breaker(1, Duration(0), 1), false, Instant(0))) { c -> {
+  breaking(record(breaker(1, Duration(0), 1), false, Instant(0)), ||
     simulate {
       let call = |takes: Int|
-        guarded(|| cell_get(c), |b: Breaker| cell_set(c, b), || slow_ok(takes));
+        guarded(|| breakers.load(), |b: Breaker| breakers.store(b), || slow_ok(takes));
       let probe = task.spawn(|| call(50));
       clock.sleep(Duration(1));
       assert_eq(call(1), Err(Rejected));
       assert(task.cancel(probe));
       assert_eq(task.await(probe), None);
-      assert_eq(circuit(cell_get(c)), HalfOpen(0, false));
+      assert_eq(circuit(breakers.load()), HalfOpen(0, false));
       assert_eq(call(1), Ok(1))
-    }
-  } }
+    })
 }
 
 test "a bucket left alone fills again, to its capacity and no further" {
@@ -1438,26 +1510,42 @@ test "a bucket left alone fills again, to its capacity and no further" {
   )
 }
 
+/// The bucket a test's calls share.
+effect buckets {
+  read load() -> Bucket
+  write store(b: Bucket) -> Unit
+}
+
+/// `body` with its calls sharing the bucket `b` through `buckets`.
+fn metered<a | e>(b: Bucket, body: () -> a / {buckets.load, buckets.store | e}) -> a / e =
+  handle {
+    body()
+  } with {
+    var kept = b,
+    buckets.load() -> kept,
+    buckets.store(next) -> {
+      kept = next;
+    },
+  }
+
 test "calls through a bucket go at once while it holds tokens, and then one each period" {
-  with_cell[rate](bucket(2, Duration(10), Instant(0))) { c -> {
-    let times = simulate {
+  let times = metered(bucket(2, Duration(10), Instant(0)), ||
+    simulate {
       range(0, 5).map(|_i: Int|
-        throttled(|| cell_get(c), |b: Bucket| cell_set(c, b), || clock.now()))
-    };
-    assert_eq(times, [Instant(0), Instant(0), Instant(10), Instant(20), Instant(30)])
-  } }
+        throttled(|| buckets.load(), |b: Bucket| buckets.store(b), || clock.now()))
+    });
+  assert_eq(times, [Instant(0), Instant(0), Instant(10), Instant(20), Instant(30)])
 }
 
 test "tasks through one bucket are spaced as one caller's calls are, in every interleaving" {
-  with_cell[rate](bucket(1, Duration(10), Instant(0))) { c -> {
-    let times = simulate {
+  let times = metered(bucket(1, Duration(10), Instant(0)), ||
+    simulate {
       all(
         range(0, 3).map(|_i: Int|
-          || throttled(|| cell_get(c), |b: Bucket| cell_set(c, b), || clock.now())),
+          || throttled(|| buckets.load(), |b: Bucket| buckets.store(b), || clock.now())),
       )
-    };
-    assert_eq(times.sort(), [Instant(0), Instant(10), Instant(20)])
-  } }
+    });
+  assert_eq(times.sort(), [Instant(0), Instant(10), Instant(20)])
 }
 
 test "callers that ask for one key while it runs share one run and its answer, in every interleaving" {

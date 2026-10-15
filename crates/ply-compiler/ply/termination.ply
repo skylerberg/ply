@@ -10,9 +10,9 @@ import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
                  LWide, LBad, LBool)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
-              ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
-              MatchArm, HandleClause, RecField, expr_span, ETagged, Tagged, Hole, tagged_parser,
-              tagged_filler)
+              ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign,
+              HandlerVar, Param, NamedArg, MatchArm, HandleClause, RecField, expr_span, ETagged,
+              Tagged, Hole, tagged_parser, tagged_filler)
 import items (FnDef)
 import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, record_fields)
 import std.bin
@@ -1472,6 +1472,7 @@ fn statement_scope(context: MemberContext, scope: Scope, x: Stmt) -> Scope / {ab
     },
     SLetElse(l) -> bind(scope, l.pat, term(context, scope, l.value)),
     SExpr(_) -> scope,
+    SAssign(a) -> bound(scope, a.name.name, UnknownTerm),
   }
 
 /// What holds where `e` evaluated to `truth`.
@@ -1787,13 +1788,24 @@ fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.r
     EList(l) -> l.items.fold(acc, |a: Seen, x: Expr| walk(context, s, a, x)),
     EPerform(p) -> p.args.fold(acc, |a: Seen, x: Expr| walk(context, s, a, x)),
     EHandle(h) -> {
-      let body = walk(context, s, acc, h.body);
+      // Each initializer sees the variables above it.
+      let inits = h.vars.fold(
+        { seen: acc, scope: s },
+        |a: { seen: Seen, scope: Scope }, v: HandlerVar|
+          {
+            seen: walk(context, a.scope, a.seen, v.init),
+            scope: bound(a.scope, v.name.name, UnknownTerm),
+          },
+      );
+      let body = walk(context, s, inits.seen, h.body);
+      // A clause and `return` read the handler's variables, of which nothing is known.
+      let held = h.vars.fold(s, |sc: Scope, v: HandlerVar| bound(sc, v.name.name, UnknownTerm));
       let returned = match h.ret {
-        Some(r) -> walk(context, bound(s, r.binder.name, UnknownTerm), body, r.body),
+        Some(r) -> walk(context, bound(held, r.binder.name, UnknownTerm), body, r.body),
         None -> body,
       };
       h.clauses.fold(returned, |a: Seen, k: HandleClause| {
-        let params = k.params.fold(s, |sc: Scope, p: Ident| bound(sc, p.name, UnknownTerm));
+        let params = k.params.fold(held, |sc: Scope, p: Ident| bound(sc, p.name, UnknownTerm));
         let resumed = match k.resume {
           Some(r) -> bound(params, r.name, UnknownTerm),
           None -> params,
@@ -1887,6 +1899,8 @@ fn statements(
           acc: walk(context, st.s, walk(context, st.s, st.acc, l.value), l.fallback),
         },
       SExpr(y) -> { s: st.s, acc: walk(context, st.s, st.acc, y) },
+      SAssign(y) ->
+        { s: statement_scope(context, st.s, x), acc: walk(context, st.s, st.acc, y.value) },
     })
 
 /// Past this many lambdas' bodies read within one another, a body is not read.

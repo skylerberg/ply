@@ -42,7 +42,7 @@ pub type Expr =
   | EField({ span: Span, base: Expr, field: Ident })
   | EList({ span: Span, items: List<Expr> })
   | EPerform({ span: Span, eff: QName, op: Ident, resource: Option<Ident>, args: List<Expr> })
-  | EHandle({ span: Span, body: Expr, ret: Option<ReturnClause>, clauses: List<HandleClause> })
+  | EHandle({ span: Span, body: Expr, ret: Option<ReturnClause>, clauses: List<HandleClause>, vars: List<HandlerVar> })
   | EWithCell({ span: Span, resource: Ident, init: Expr, binder: Ident, body: Expr })
   /// `with_hold[r](acquire, release) { h -> body }`: `body` with `h` a hold on what `acquire`
   /// answered, and `release` run on it however `body` ends.
@@ -166,6 +166,8 @@ pub type Stmt =
   /// value and the statements after this one do not run.
   | SLetElse({ span: Span, pat: Pattern, ty: Option<TypeExpr>, value: Expr, fallback: Expr })
   | SExpr(Expr)
+  /// `name = value;`: a clause giving its handler's variable a new value.
+  | SAssign({ span: Span, name: Ident, value: Expr })
 
 pub type MatchArm = { pat: Pattern, guard: Option<Expr>, body: Expr, span: Span }
 
@@ -186,6 +188,10 @@ pub type HandleClause = {
 }
 
 pub type ReturnClause = { binder: Ident, body: Expr, span: Span }
+
+/// `var name: T = init` in a `with` block: a variable the handler holds, made when its `handle`
+/// starts, which its clauses assign and its `return` reads.
+pub type HandlerVar = { name: Ident, ty: Option<TypeExpr>, init: Expr, span: Span }
 
 /// A variant of its own rather than `()`, so a placeholder that reaches the dump is visible.
 pub fn no_expr() -> Expr = EBad({ span: dummy_span() })
@@ -284,7 +290,7 @@ fn set_span(expr: Expr, span: Span) -> Expr =
     EList(v) -> EList({ span: span, items: v.items }),
     EPerform(v) ->
       EPerform({ span: span, eff: v.eff, op: v.op, resource: v.resource, args: v.args }),
-    EHandle(v) -> EHandle({ span: span, body: v.body, ret: v.ret, clauses: v.clauses }),
+    EHandle(v) -> EHandle({ ..v, span: span }),
     EWithCell(v) ->
       EWithCell({ span: span, resource: v.resource, init: v.init, binder: v.binder, body: v.body }),
     EWithHold(v) -> EWithHold({ ..v, span: span }),
@@ -1364,19 +1370,46 @@ fn record_update_base(
           }
         },
     )?;
-    if at_token(input, path.parser, token_lparen()) {
-      let a = call_args(input, path.parser)?;
-      Ok({
-        parser: a.parser,
-        node: EApp({
-          span: span_to(expr_span(path.node), a.close),
-          func: path.node,
-          named: a.named,
-          args: a.args,
-          labels: [],
-        }),
-      })
-    } else { Ok(path) }
+    let op_of: Option<{ eff: QName, op: Ident }> = match path.node {
+      EField(f) -> match f.base { EVar(v) -> Some({ eff: v.name, op: f.field }), _ -> None },
+      _ -> None,
+    };
+    let opens = at_token(input, path.parser, token_lparen());
+    match op_of {
+      // `name.op(..)` performs here as it does anywhere else.
+      Some(p) -> if !opens && !at_token(input, path.parser, token_lbracket()) { Ok(path) } else {
+        let { parser, node: res } = opt_resource(input, path.parser)?;
+        let a = call_args(input, parser)?;
+        let span = span_to(expr_span(path.node), a.close);
+        Ok({
+          parser: a.parser,
+          node: if a.named.len() == 0 {
+            EPerform({ span: span, eff: p.eff, op: p.op, resource: res, args: a.args })
+          } else {
+            EApp({
+              span: span,
+              func: path.node,
+              named: a.named,
+              args: a.args,
+              labels: match res { Some(r) -> [r], None -> [] },
+            })
+          },
+        })
+      },
+      None -> if !opens { Ok(path) } else {
+        let a = call_args(input, path.parser)?;
+        Ok({
+          parser: a.parser,
+          node: EApp({
+            span: span_to(expr_span(path.node), a.close),
+            func: path.node,
+            named: a.named,
+            args: a.args,
+            labels: [],
+          }),
+        })
+      },
+    }
   }
 }
 
@@ -1434,6 +1467,11 @@ fn block_inner(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {
         Stop(Err(unclosed(input, s.parser, o, b"`}` to close the block")))
       } else if at_token(input, s.parser, keyword_let()) {
         match let_stmt(input, s.parser) {
+          Err(q) -> Stop(Err(q)),
+          Ok(st) -> Continue({ parser: st.parser, tail: s.tail, stmts: s.stmts.push(st.node) }),
+        }
+      } else if is_ident_at(input, s.parser, 0) && token_kind_at(input, s.parser, 1) == token_eq() {
+        match assign_stmt(input, s.parser) {
           Err(q) -> Stop(Err(q)),
           Ok(st) -> Continue({ parser: st.parser, tail: s.tail, stmts: s.stmts.push(st.node) }),
         }
@@ -1534,6 +1572,22 @@ fn let_else(
       fallback: fallback,
     }),
   })
+}
+
+/// `name = value;`, whose `;` may be left off before the block's `}`.
+fn assign_stmt(input: Input, parser: Parser) -> Result<Parsed<Stmt>, Parser> / {abort.raise} = {
+  let { parser, node: name } = expect_ident(input, parser, b"the name of the variable to assign")?;
+  let eq = advance(input, parser);
+  let { parser, node: value } = expr(input, eq.parser)?;
+  let semi = eat(input, parser, token_semi());
+  if semi.ok || at_token(input, semi.parser, token_rbrace()) {
+    Ok({
+      parser: semi.parser,
+      node: SAssign({ span: span_to(name.span, expr_span(value)), name: name, value: value }),
+    })
+  } else {
+    Err(error_here(input, semi.parser, b"`;` to end the assignment, or `}` to end the block"))
+  }
 }
 
 /// The block nests in the statement.
@@ -1864,7 +1918,12 @@ fn handle_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {
   }
 }
 
-type ParsedClauses = { parser: Parser, ret: Option<ReturnClause>, clauses: List<HandleClause> }
+type ParsedClauses = {
+  parser: Parser,
+  ret: Option<ReturnClause>,
+  clauses: List<HandleClause>,
+  vars: List<HandlerVar>,
+}
 
 fn handle_rest(
   input: Input,
@@ -1885,7 +1944,7 @@ fn handle_rest(
     b"`{` to start the handler clauses",
   )?;
   let acc = iterate(
-    { parser: parser, ret: None, clauses: [] },
+    { parser: parser, ret: None, clauses: [], vars: [] },
     input.token_count - parser.pos + 1,
     |s: ParsedClauses|
       if at_token(input, s.parser, token_rbrace()) { Stop(Ok(s)) } else if at_eof(input, s.parser) {
@@ -1901,11 +1960,17 @@ fn handle_rest(
   )?;
   Ok({
     parser: parser,
-    node: EHandle({ span: span_to(span, cl), body: body, ret: acc.ret, clauses: acc.clauses }),
+    node: EHandle({
+      span: span_to(span, cl),
+      body: body,
+      ret: acc.ret,
+      clauses: acc.clauses,
+      vars: acc.vars,
+    }),
   })
 }
 
-/// `return` is contextual here too: it is a clause only when a name follows it.
+/// `return` and `var` are contextual here too: each starts an item only when a name follows it.
 fn handle_step(
   input: Input,
   s: ParsedClauses,
@@ -1915,10 +1980,11 @@ fn handle_step(
       Err(q) -> Stop(Err(q)),
       Ok(rc) -> {
         let next = match s.ret {
-          None -> { parser: rc.parser, clauses: s.clauses, ret: Some(rc.node) },
+          None -> { ..s, parser: rc.parser, ret: Some(rc.node) },
           // A duplicate `return` is reported and dropped; the parse carries on.
           Some(prev) ->
             {
+              ..s,
               parser: push_diag(
                 rc.parser,
                 error_at_and(
@@ -1931,12 +1997,32 @@ fn handle_step(
                   [],
                 ),
               ),
-              clauses: s.clauses,
-              ret: s.ret,
             },
         };
         let comma = eat(input, next.parser, token_comma());
-        Continue({ parser: comma.parser, ret: next.ret, clauses: next.clauses })
+        Continue({ ..next, parser: comma.parser })
+      },
+    }
+  } else if at_ident_text(input, s.parser, b"var") && is_ident_at(input, s.parser, 1) {
+    match handler_var(input, s.parser) {
+      Err(q) -> Stop(Err(q)),
+      Ok(v) -> {
+        // A variable written after a clause is reported and kept; the parse carries on.
+        let first = s.clauses.len() == 0 && (match s.ret { None -> true, Some(_) -> false });
+        let placed = if first { v.parser } else {
+          push_diag(
+            v.parser,
+            error_at(
+              unexpected(),
+              v.node.span,
+              b"a handler's `var`s come before its clauses",
+              b"move this `var` above the first clause",
+              [],
+            ),
+          )
+        };
+        let comma = eat(input, placed, token_comma());
+        Continue({ ..s, parser: comma.parser, vars: s.vars.push(v.node) })
       },
     }
   } else {
@@ -1944,10 +2030,23 @@ fn handle_step(
       Err(q) -> Stop(Err(q)),
       Ok(cl) -> {
         let comma = eat(input, cl.parser, token_comma());
-        Continue({ parser: comma.parser, ret: s.ret, clauses: s.clauses.push(cl.node) })
+        Continue({ ..s, parser: comma.parser, clauses: s.clauses.push(cl.node) })
       },
     }
   }
+
+/// `var name: T = init`, the type optional.
+fn handler_var(input: Input, parser: Parser) -> Result<Parsed<HandlerVar>, Parser> / {abort.raise} = {
+  let st = advance(input, parser);
+  let { parser, node: name } = expect_ident(input, st.parser, b"the variable's name after `var`")?;
+  let { parser, node: t } = let_ty(input, parser)?;
+  let { parser, .. } = expect(input, parser, token_eq(), b"`=` and the variable's first value")?;
+  let { parser, node: init } = expr(input, parser)?;
+  Ok({
+    parser: parser,
+    node: { name: name, ty: t, init: init, span: span_to(st.node, expr_span(init)) },
+  })
+}
 
 fn is_ident_at(input: Input, parser: Parser, n: Int) -> Bool =
   match token_kind_at(input, parser, n) { Identifier(x) -> true, _ -> false }
@@ -2305,6 +2404,9 @@ pub fn dump_expr(expr: Expr) -> Bytes / {abort.raise} =
         dump_expr(v.body),
         dump_list(v.clauses, dump_clause),
         dump_opt(v.ret, dump_return),
+        // Written only where there are any, so a handle without variables dumps as it always has.
+        if v.vars.len() == 0 { b"" }
+        else { dump_word(b"vars").concat(dump_list(v.vars, dump_var)) },
       ]),
     EWithCell(v) ->
       Bytes::concat_all([
@@ -2375,6 +2477,8 @@ pub fn dump_stmt(stmt: Stmt) -> Bytes / {abort.raise} =
         dump_expr(v.fallback),
       ]),
     SExpr(e) -> dump_node(expr_span(e), b"sexp").concat(dump_expr(e)),
+    SAssign(v) ->
+      Bytes::concat_all([dump_node(v.span, b"sasg"), dump_ident(v.name), dump_expr(v.value)]),
   }
 
 pub fn dump_arm(arm: MatchArm) -> Bytes / {abort.raise} =
@@ -2395,6 +2499,14 @@ pub fn dump_clause(clause: HandleClause) -> Bytes / {abort.raise} =
     dump_list(clause.params, dump_ident),
     dump_opt(clause.resume, dump_ident),
     dump_expr(clause.body),
+  ])
+
+pub fn dump_var(v: HandlerVar) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    dump_node(v.span, b"hvar"),
+    dump_ident(v.name),
+    dump_opt(v.ty, dump_ty),
+    dump_expr(v.init),
   ])
 
 pub fn dump_return(clause: ReturnClause) -> Bytes / {abort.raise} =
@@ -2459,7 +2571,8 @@ pub fn node_count(expr: Expr) -> Int =
       1 + node_count(v.body)
         + v.clauses.fold(0, |n: Int, clause: HandleClause|
           n + 1 + clause.params.len() + node_count(clause.body))
-        + (match v.ret { None -> 0, Some(r) -> 1 + node_count(r.body) }),
+        + (match v.ret { None -> 0, Some(r) -> 1 + node_count(r.body) })
+        + v.vars.fold(0, |n: Int, hv: HandlerVar| n + 1 + node_count(hv.init)),
     EWithCell(v) -> 1 + node_count(v.init) + node_count(v.body),
     EWithHold(v) -> 1 + node_count(v.acquire) + node_count(v.release) + node_count(v.body),
     ESimulate(v) -> 1 + node_count(v.body),
@@ -2481,6 +2594,7 @@ fn count_stmt(stmt: Stmt) -> Int =
     SLet(v) -> 1 + node_count(v.value),
     SLetElse(v) -> 1 + node_count(v.value) + node_count(v.fallback),
     SExpr(e) -> 1 + node_count(e),
+    SAssign(v) -> 1 + node_count(v.value),
   }
 
 pub fn parse_count(src: Bytes) -> Int / {abort.raise} = {
@@ -2580,7 +2694,10 @@ test "the base of a record update may be a qualified name, or a call of one" {
   assert(dump_expr_of(b"{..m::b, x: 1}").starts_with("0:14:erup;3:7:evar;3:7:qname;?1;"));
   let call = dump_expr_of(b"{..m::f(x)}");
   assert(call.starts_with("0:11:erup;3:10:eapp;"));
-  assert(call.contains("3:7:qname;?1;"))
+  assert(call.contains("3:7:qname;?1;"));
+  // An operation is performed there as anywhere else, on a label too.
+  assert(dump_expr_of(b"{..store.held(), x: 1}").starts_with("0:22:erup;3:15:eprf;"));
+  assert(dump_expr_of(b"{..store.held[db]()}").starts_with("0:20:erup;3:19:eprf;"))
 }
 
 test "a named argument is a node with its own span, its name and its value" {
@@ -2913,6 +3030,11 @@ test "a handler takes clauses, a resume binder and at most one `return`" {
   );
   let two = dump_expr_of(b"handle f() with { return a -> a, return b -> b }");
   assert(two.contains("!E0001:33:46:2:0;=33:46:1;=18:31:0;"));
+}
+
+test "a handler's `var`s come before its clauses" {
+  assert(!dump_expr_of(b"handle f() with { var s = 0, e.op(a) -> () }").contains("!E0"));
+  assert(dump_expr_of(b"handle f() with { e.op(a) -> (), var s = 0 }").contains("!E0001:"))
 }
 
 test "`with_cell` and `simulate` are contextual" {

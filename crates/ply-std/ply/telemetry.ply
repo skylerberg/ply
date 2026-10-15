@@ -291,19 +291,31 @@ fn spanned<a, [c] | e>(
   let context = begin(above, tracing.sampler());
   let parent = match above { Some(up) -> Some(up.parent.parent_id), None -> None };
   let span = trace.enter[c](name, identified(fields, context, parent, kind));
-  with_cell[span_end](false) { closed ->
+  handle {
     bracket(
       || span,
       |s: trace::Span|
-        if cell_get(closed) { () } else { trace.exit[c](s, trace::Failed(unwound())) },
+        if span_end.ended() { () } else { trace.exit[c](s, trace::Failed(unwound())) },
       |s: trace::Span| {
         let out = handle { body(context) } with { tracing.current() -> Some(context) };
-        cell_set(closed, true);
+        span_end.end();
         trace.exit[c](s, outcome(out));
         out
       },
     )
+  } with {
+    var ended = false,
+    span_end.end() -> {
+      ended = true;
+    },
+    span_end.ended() -> ended,
   }
+}
+
+/// Whether a span's body got as far as closing the span itself, which its release reads.
+effect span_end {
+  write end() -> Unit
+  read ended() -> Bool
 }
 
 // --- Across std.http ------------------------------------------------------------
@@ -542,23 +554,24 @@ fn collecting<a | e>(
   seed: Int,
   body: () -> a / {trace.enter[*], trace.exit[*], trace.event[*], entropy.next, entropy.below | e},
 ) -> Ran<a> / {abort.raise | e} =
-  with_cell[sink](trace::sink()) { s -> {
-    let value = with_rand(rand(seed), ||
-      handle {
-        body()
-      } with {
-        trace.enter[*c](name, fields) -> {
-          let out = trace::enter_step(cell_get(s), c, name, fields);
-          cell_set(s, out.sink);
-          out.span
-        },
-        trace.exit[*c](span, outcome) ->
-          cell_set(s, trace::exit_step(cell_get(s), span, outcome).sink),
-        trace.event[*c](level, name, fields) ->
-          cell_set(s, trace::event_step(cell_get(s), c, level, name, fields)),
-      }).value;
-    { value: value, records: trace::drain(cell_get(s)) }
-  } }
+  with_rand(rand(seed), ||
+    handle {
+      body()
+    } with {
+      var s = trace::sink(),
+      trace.enter[*c](name, fields) -> {
+        let out = trace::enter_step(s, c, name, fields);
+        s = out.sink;
+        out.span
+      },
+      trace.exit[*c](span, outcome) -> {
+        s = trace::exit_step(s, span, outcome).sink;
+      },
+      trace.event[*c](level, name, fields) -> {
+        s = trace::event_step(s, c, level, name, fields);
+      },
+      return value -> { value: value, records: trace::drain(s) },
+    }).value
 
 fn entered(records: List<trace::Record>) -> List<trace::Record> =
   records.filter(|r: trace::Record| r.kind == trace::KEnter)
@@ -738,19 +751,18 @@ type Noted = { span: String, fields: Fields }
 
 /// `body` under a root that keeps what is annotated, as an exporter does.
 fn annotated<a | e>(body: () -> a / {Tracing | e}) -> { value: a, notes: List<Noted> } / e =
-  with_cell[notes]([]) { notes -> {
-    let value = handle {
-      body()
-    } with {
-      tracing.current() -> None,
-      tracing.sampler() -> AlwaysOn,
-      tracing.annotate(span, fields) -> {
-        let note: Noted = { span: traceparent::span_id_hex(span), fields: fields };
-        cell_set(notes, cell_get(notes).push(note))
-      },
-    };
-    { value: value, notes: cell_get(notes) }
-  } }
+  handle {
+    body()
+  } with {
+    var notes: List<Noted> = [],
+    tracing.current() -> None,
+    tracing.sampler() -> AlwaysOn,
+    tracing.annotate(span, fields) -> {
+      let note: Noted = { span: traceparent::span_id_hex(span), fields: fields };
+      notes = notes.push(note);
+    },
+    return value -> { value: value, notes: notes },
+  }
 
 test "an asked request names its client span to the server, and the answer's status to the span" {
   let ran = collecting(5, ||
@@ -822,26 +834,25 @@ type Sight = { request: String, trace: String }
 test "two requests served at once each see their own span, whatever order they run in" {
   let first = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-00f067aa0ba902b7-01";
   let second = "00-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-00f067aa0ba902b7-00";
-  let sights = with_cell[sights]([]) { log -> {
-    handle {
-      traced(AlwaysOn, ||
-        simulate {
-          let a = task.spawn(|| served[web](arriving(first), |r: Request| relayed("a", r)));
-          let b = task.spawn(|| served[web](arriving(second), |r: Request| relayed("b", r)));
-          assert_eq(task.join(a).status, 204);
-          assert_eq(task.join(b).status, 204)
-        })
-    } with {
-      witness.saw(request, trace) -> {
-        let sight: Sight = { request: request, trace: trace };
-        cell_set(log, cell_get(log).push(sight))
-      },
-      trace.enter[*c](name, fields) -> { id: 1, channel: c },
-      trace.exit[*c](span, outcome) -> (),
-      entropy.next() -> 11,
-    };
-    cell_get(log)
-  } };
+  let sights = handle {
+    traced(AlwaysOn, ||
+      simulate {
+        let a = task.spawn(|| served[web](arriving(first), |r: Request| relayed("a", r)));
+        let b = task.spawn(|| served[web](arriving(second), |r: Request| relayed("b", r)));
+        assert_eq(task.join(a).status, 204);
+        assert_eq(task.join(b).status, 204)
+      })
+  } with {
+    var log: List<Sight> = [],
+    witness.saw(request, trace) -> {
+      let sight: Sight = { request: request, trace: trace };
+      log = log.push(sight);
+    },
+    trace.enter[*c](name, fields) -> { id: 1, channel: c },
+    trace.exit[*c](span, outcome) -> (),
+    entropy.next() -> 11,
+    return u -> log,
+  };
   let seen_by = |who: String| sights.filter(|s: Sight| s.request == who).map(|s: Sight| s.trace);
   assert_eq(seen_by("a"), [
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

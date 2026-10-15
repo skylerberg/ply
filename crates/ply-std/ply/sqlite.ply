@@ -456,23 +456,35 @@ fn scoped<a, [d] | e>(
   body: () -> a / e,
 ) -> a / {sqlite.control[d], sql.refused | e} = {
   settled(sqlite.control[d](conn, opens));
-  with_cell[sqlite_scope](false) { closed ->
+  handle {
     bracket(
       || (),
       |_u: Unit|
-        if !cell_get(closed) {
+        if !scope_end.ended() {
           sqlite.control[d](conn, Rollback);
           ()
         },
       |_u: Unit| {
         let value = body();
         // Whatever the commit answers, its scope is closed.
-        cell_set(closed, true);
+        scope_end.end();
         settled(sqlite.control[d](conn, Commit));
         value
       },
     )
+  } with {
+    var ended = false,
+    scope_end.end() -> {
+      ended = true;
+    },
+    scope_end.ended() -> ended,
   }
+}
+
+/// Whether a transaction's body got as far as its commit, which its release reads.
+effect scope_end {
+  write end() -> Unit
+  read ended() -> Bool
 }
 
 /// `f` over each row a statement that only reads answers, fetched `page` rows at a time, so a
@@ -603,46 +615,62 @@ pub fn on_memory<a, [d] | e>(
   m: Memory,
   go: () -> a / {sqlite.read[d], sqlite.write[d] | e},
 ) -> Over<a> / {abort.raise | e bounded} =
-  with_cell[sqlite_memory](match m { Memory(t) -> t }) { t -> {
-    let stepped = |s: Stepped| {
-      cell_set(t, s.twin);
+  handle {
+    go()
+  } with {
+    var t = match m { Memory(t) -> t },
+    sqlite.open[d](path, mode, options) -> {
+      let opened = twin_open(t, path, mode, options);
+      t = opened.twin;
+      opened.conn
+    },
+    sqlite.close[d](conn) -> {
+      let now = t;
+      t = twin_close(now, conn);
+      now.open.contains(conn)
+    },
+    sqlite.query[d](conn, sql, params, limits) -> {
+      let s = twin_run(t, conn, sql, params, limits, true);
+      t = s.twin;
       s.reply
-    };
-    let value = handle {
-      go()
-    } with {
-      sqlite.open[d](path, mode, options) -> {
-        let opened = twin_open(cell_get(t), path, mode, options);
-        cell_set(t, opened.twin);
-        opened.conn
-      },
-      sqlite.close[d](conn) -> {
-        let now = cell_get(t);
-        cell_set(t, twin_close(now, conn));
-        now.open.contains(conn)
-      },
-      sqlite.query[d](conn, sql, params, limits) ->
-        stepped(twin_run(cell_get(t), conn, sql, params, limits, true)),
-      sqlite.execute[d](conn, sql, params, limits) ->
-        stepped(twin_run(cell_get(t), conn, sql, params, limits, false)),
-      sqlite.control[d](conn, step) -> stepped(twin_control(cell_get(t), conn, step)),
-      sqlite.backup[d](conn, path) -> stepped(twin_backup(cell_get(t), conn, path)),
-      sqlite.cursor[d](conn, sql, params, limits) ->
-        stepped(twin_cursor(cell_get(t), conn, sql, params, limits)),
-      sqlite.fetch[d](conn, rows) -> stepped(twin_fetch(cell_get(t), conn, rows)),
-      sqlite.finish[d](conn) -> {
-        let now = cell_get(t);
-        match now.open.get(conn) {
-          Some(o) -> {
-            cell_set(t, { ..now, open: now.open.insert(conn, { ..o, folding: None }) });
-            o.folding != None
-          },
-          None -> false,
-        }
-      },
-    };
-    { value: value, memory: Memory(cell_get(t)) }
-  } }
+    },
+    sqlite.execute[d](conn, sql, params, limits) -> {
+      let s = twin_run(t, conn, sql, params, limits, false);
+      t = s.twin;
+      s.reply
+    },
+    sqlite.control[d](conn, step) -> {
+      let s = twin_control(t, conn, step);
+      t = s.twin;
+      s.reply
+    },
+    sqlite.backup[d](conn, path) -> {
+      let s = twin_backup(t, conn, path);
+      t = s.twin;
+      s.reply
+    },
+    sqlite.cursor[d](conn, sql, params, limits) -> {
+      let s = twin_cursor(t, conn, sql, params, limits);
+      t = s.twin;
+      s.reply
+    },
+    sqlite.fetch[d](conn, rows) -> {
+      let s = twin_fetch(t, conn, rows);
+      t = s.twin;
+      s.reply
+    },
+    sqlite.finish[d](conn) -> {
+      let now = t;
+      match now.open.get(conn) {
+        Some(o) -> {
+          t = { ..now, open: now.open.insert(conn, { ..o, folding: None }) };
+          o.folding != None
+        },
+        None -> false,
+      }
+    },
+    return value -> { value: value, memory: Memory(t) },
+  }
 
 /// `go` over a root that holds no database yet: what a test hands code written against a root.
 pub fn in_memory<a, [d] | e>(

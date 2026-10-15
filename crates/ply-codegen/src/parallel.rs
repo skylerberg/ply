@@ -2,7 +2,7 @@
 //! threads of their own and answered as evaluating them left to right answers.
 
 use crate::heap::{self, Word};
-use crate::rt::{Ctx, FAILED_OUT_OF_STEPS, PROGRAM_STACK, Reached, call_value, stack_floor};
+use crate::rt::{Ctx, FAILED_OUT_OF_STEPS, PROGRAM_STACK, call_value, stack_floor};
 use std::cell::Cell;
 use std::sync::OnceLock;
 
@@ -30,16 +30,16 @@ fn pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-/// Runs the `n` nullary closures at `slots`, writing each one's answer over it. `reach` is what the
-/// closures may perform, where the block's site knows it.
-pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, reach: Option<&[Reached]>) {
+/// Runs the `n` nullary closures at `slots`, writing each one's answer over it, at once where
+/// `allowed`.
+pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: bool) {
     let branches = unsafe { std::slice::from_raw_parts_mut(slots, n) };
     let c = unsafe { &*ctx };
     // A thread that waits on a block takes up the pool's other branches meanwhile. A machine
     // entered inside another's branch, as a test a run's lane enters is, would then carry a whole
     // other test on its stack and its clock, so its own blocks run in turn.
     let nested = BRANCH_OF.with(|of| of.get() != 0 && of.get() != c.id.0);
-    let at_once = !nested && c.runs_branches_at_once(reach);
+    let at_once = !nested && allowed;
     match pool() {
         Some(pool) if n >= 2 && at_once && heap::share(branches) => unsafe {
             in_parallel(ctx, pool, branches)
