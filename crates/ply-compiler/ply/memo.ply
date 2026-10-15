@@ -279,7 +279,8 @@ pub fn current(held: Held) -> Map<Bytes, Record> / {abort.raise} = {
 /// undone answers again.
 fn kept_earlier(key: Bytes, next: Record) -> Unit / {memo_keep.read, memo_keep.write} =
   match memo_keep.record(key) {
-    Some(old) -> if old.output != next.output || old.reads != next.reads {
+    Some(old) -> if memo_keep.stored(key)
+        && (old.output != next.output || old.reads != next.reads) {
       memo_keep.adopt(earlier_key(key), old)
     },
     None -> (),
@@ -388,6 +389,9 @@ pub effect memo_keep {
   read height(key: Bytes) -> Int
   /// The record kept under `key` in the run's store, or else in the pack below it.
   read record(key: Bytes) -> Option<Record>
+  /// Whether the run's store holds the record under `key` itself, its reads noted among their
+  /// readers, rather than the pack below it.
+  read stored(key: Bytes) -> Bool
   /// The answer kept under its digest, in the store or the pack below it.
   read output(digest: Bytes) -> Option<Bytes>
   /// Keeps `r` under `key`, and `output` under `r.output`.
@@ -804,9 +808,15 @@ fn settled_at<| e>(
                     memo_keep.unmark(key, marks);
                     took(s.run, name, r.output)
                   } else {
+                    // A record of the pack below noted none of its reads: one answered again notes
+                    // them all.
+                    let prior = if memo_keep.stored(key) { Some(r) } else { None };
                     // An edit undone answers as before: the record it replaced stands again, its
                     // reads linked to the key since it was first kept.
-                    match memo_keep.record(earlier_key(key)) {
+                    match match prior {
+                        Some(_) -> memo_keep.record(earlier_key(key)),
+                        None -> None,
+                      } {
                       Some(e) -> {
                         let t = stands(queries, s.run, e.reads, left - 1);
                         if t.ok && memo_keep.output(e.output) != None {
@@ -828,9 +838,9 @@ fn settled_at<| e>(
                             name,
                             e.output,
                           )
-                        } else { executed(queries, t.run, q, key, input, marks, Some(r), left - 1) }
+                        } else { executed(queries, t.run, q, key, input, marks, prior, left - 1) }
                       },
-                      None -> executed(queries, s.run, q, key, input, marks, Some(r), left - 1),
+                      None -> executed(queries, s.run, q, key, input, marks, prior, left - 1),
                     }
                   }
                 },
@@ -1245,13 +1255,15 @@ pub fn over_held<a | e>(
     with_cell[inlined](Map::new()) { inlined ->
 
       // The stamp the run answers under, what it saw at each place it looked at, the pack below its
-      // store, and whether the pack's records stand as they are.
+      // store, whether the pack's records stand as they are, each of them read, and those this run
+      // found standing.
       with_cell[running]({
           stamp: b"",
           looked: Map::new(),
           pack: packs::opened(read),
           trusted: false,
           packed: Map::new(),
+          checked: Map::new(),
         }) { running -> {
         // A packed record, read once a run, beside the answer it holds, which a later ask of the
         // answer reads.
@@ -1318,6 +1330,7 @@ pub fn over_held<a | e>(
           },
           memo_keep.height(key) -> match held_or_packed(key) { Some(r) -> r.height, None -> 0 },
           memo_keep.record(key) -> held_or_packed(key),
+          memo_keep.stored(key) -> cell_get(cell).records.contains(key),
           memo_keep.output(digest) -> match cell_get(cell).outputs.get(digest) {
             Some(o) -> Some(o),
             None -> match cell_get(inlined).get(digest) {
@@ -1381,13 +1394,13 @@ pub fn over_held<a | e>(
           memo_keep.marks(key) -> {
             let h = cell_get(cell);
             let left = match h.marks.get(key) { Some(ms) -> ms, None -> [] };
-            let said = match h.said.get(key) { Some(vs) -> vs, None -> [] };
             if left.len() > 0 { left } else if h.records.contains(key) {
+              let said = match h.said.get(key) { Some(vs) -> vs, None -> [] };
               if vouched(said, cell_get(running).stamp) { [] } else { [unchecked()] }
             }
-            // A packed record stands as it is only where the pack does, or a check of this stamp
-            // found it standing.
-            else if cell_get(running).trusted || vouched(said, cell_get(running).stamp)
+            // A record of the pack below stands as it is only where the pack does, or where this
+            // run checked it: it notes no reads, so no later run is told that one moved.
+            else if cell_get(running).trusted || cell_get(running).checked.contains(key)
                 || packed_at(key) == None { [] }
             else { [unchecked()] }
           },
@@ -1398,14 +1411,17 @@ pub fn over_held<a | e>(
           memo_keep.unmark(key, gone) -> {
             let h = cell_get(cell);
             let ms = match h.marks.get(key) { Some(ms) -> ms, None -> [] };
-            let packed = !h.records.contains(key) && packed_at(key) != None;
             cell_set(cell, {
               ..h,
               marks: h.marks.insert(key, ms.filter(|m: Bytes| !gone.contains(m))),
-              said: if !h.records.contains(key) && !packed { h.said } else {
+              said: if !h.records.contains(key) { h.said } else {
                 saying(h, key, { stamp: cell_get(running).stamp, stands: true, fresh: false })
               },
-            })
+            });
+            if !h.records.contains(key) {
+              let r = cell_get(running);
+              cell_set(running, { ..r, checked: r.checked.insert(key, true) })
+            }
           },
           memo_keep.stamped(stamp, _) -> {
             let r = cell_get(running);

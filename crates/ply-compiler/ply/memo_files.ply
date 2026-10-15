@@ -150,8 +150,8 @@ type Looked = { value: Option<Bytes>, digest: Bytes }
 /// where each longer answer it kept lies; the answers records hold inside them, and for each answer
 /// a row named, a key whose record may hold it; each record read; the longer answers read or kept,
 /// held while they come to no more than a bound, and how many bytes they are; those a segment names
-/// and does not hold; and the pack below the store, whether its records stand as they are, and each
-/// record of it read.
+/// and does not hold; and the pack below the store, whether its records stand as they are, each
+/// record of it read, and those this run found standing.
 type Open = {
   stamp: Bytes,
   own: Map<Bytes, Bool>,
@@ -178,6 +178,7 @@ type Open = {
   pack: packs::Reading,
   trusted: Bool,
   packed: Map<Bytes, Option<Bytes>>,
+  checked: Map<Bytes, Bool>,
 }
 
 /// How many bytes of longer answers a run holds, so that one asked again is not read again.
@@ -218,6 +219,7 @@ fn opened(m: Manifest, now: Int) -> Open =
     pack: packs::none(),
     trusted: false,
     packed: Map::new(),
+    checked: Map::new(),
   }
 
 /// The rows of `table` in `seg`, read once a run: a table that does not read is no rows, and its
@@ -1242,17 +1244,10 @@ pub fn kept<a, [r] | e>(
       },
       memo_keep.record(key) -> match own(key) {
         Some(b) -> record_of(Some(b), match held(key) { Some(h) -> h.height, None -> 0 }),
-        // The pack's record, where the store names no answer of its own for the key, or names its.
-        None -> match packed_at(key) {
-          None -> None,
-          Some(b) -> match held(key) {
-            None -> record_of(Some(b), 0),
-            Some(h) -> if output_named(b) == Some(answer_digest(h.answer)) {
-              record_of(Some(b), h.height)
-            } else { None },
-          },
-        },
+        // The pack's record only where the store keeps none of its own under the key.
+        None -> match held(key) { Some(_) -> None, None -> record_of(packed_at(key), 0) },
       },
+      memo_keep.stored(key) -> match held(key) { Some(_) -> true, None -> false },
       memo_keep.output(digest) -> match inside(digest) {
         Some(a) -> Some(a),
         None -> match packs::answer_key(digest) {
@@ -1345,10 +1340,10 @@ pub fn kept<a, [r] | e>(
           let unchecked = !vouched
             && (match stored(key) {
               Some(k) -> !k.trusted || cell_get(st).lost.len() > 0,
-              // A packed record stands as it is only where the pack does; one this run checked
-              // has its marks already.
+              // A record of the pack below stands as it is only where the pack does, or where
+              // this run checked it: it notes no reads, so no later run is told that one moved.
               None ->
-                !cell_get(st).trusted && !cell_get(st).marks.contains(key)
+                !cell_get(st).trusted && !cell_get(st).checked.contains(key)
                   && packed_at(key) != None,
             });
           if unchecked { [memo::unchecked()] } else { [] }
@@ -1381,7 +1376,13 @@ pub fn kept<a, [r] | e>(
       },
       memo_keep.unmark(key, gone) -> {
         marked_as(key, marks(key).filter(|m: Bytes| !gone.contains(m)));
-        saying(key, |x: Mine| { ..x, vouch: true })
+        match held(key) {
+          Some(_) -> saying(key, |x: Mine| { ..x, vouch: true }),
+          None -> {
+            let o = cell_get(st);
+            cell_set(st, { ..o, checked: o.checked.insert(key, true) })
+          },
+        }
       },
       memo_keep.stamped(named, queries) -> {
         let o = cell_get(st);
@@ -1854,31 +1855,64 @@ test "each longer answer is found again once a store is written again as one seg
   assert_eq(fs::on_mem[abs](small.tree, || all()).value, 0)
 }
 
-test "a pack holds the records asked for and the answers they name, and a run below takes them" {
-  let long = b"long ".repeat(1000);
+/// The pack of what `text` and `quoted` answer of a file holding `text`, and of the keys `also`,
+/// made over the files `b"files"` lists.
+fn quoted_pack(
+  text: Bytes,
+  also: List<Bytes>,
+) -> { written: packs::Written, records: Int } / {abort.raise} = {
   let queries = test_queries(b"");
   let keys = [b"text", b"quoted"].map(|name: Bytes|
     match queries.get(name) { Some(q) -> memo::key_of(q, b"a"), None -> b"" });
-  let made = fs::on_mem[abs](fs::mem_of([]), || {
-    quoted_over[abs](long);
-    packed[abs]("s", keys.push(b"none".blake3()), packs::as_is, memo::stamp_of(queries), b"files")
-  }).value;
-  assert_eq(made.records, 2);
-  let read = |path: String, offset: Int, len: Int|
-    packs::frame_in(Some(made.written), path, offset, len);
-  // A run over an empty store and that pack, over the files it lists or others, or over an edit.
-  let below = |files: Bytes, text: Bytes|
-    fs::on_mem[abs](fs::mem_of([]), ||
-      kept[abs]("s", read, files, |_: Bytes, _: Bytes| Some(text), || {
+  fs::on_mem[abs](fs::mem_of([]), || {
+    quoted_over[abs](text);
+    packed[abs]("s", keys.concat(also), packs::as_is, memo::stamp_of(queries), b"files")
+  }).value
+}
+
+/// What `quoted` answers over the store in `tree` with `pack` below it, for a run over the files
+/// `files` lists of a file holding `text`, and how many bodies ran.
+fn quoted_below(
+  tree: fs::MemFs,
+  pack: packs::Written,
+  files: Bytes,
+  text: Bytes,
+) -> fs::Over<{ output: Bytes, ran: Int }> / {abort.raise} = {
+  let queries = test_queries(b"");
+  fs::on_mem[abs](tree, ||
+    kept[abs](
+      "s",
+      |path: String, offset: Int, len: Int| packs::frame_in(Some(pack), path, offset, len),
+      files,
+      |_: Bytes, _: Bytes| Some(text),
+      || {
         let a = answer(queries, started(queries), b"quoted", b"a");
         { output: a.output, ran: memo::ran_total(a.run) }
-      }));
+      },
+    ))
+}
+
+test "a pack holds the records asked for and the answers they name, and a run below takes them" {
+  let long = b"long ".repeat(1000);
+  let made = quoted_pack(long, [b"none".blake3()]);
+  assert_eq(made.records, 2);
+  let below = |files: Bytes, text: Bytes| quoted_below(fs::mem_of([]), made.written, files, text);
   let quoted_long = Bytes::concat_all([b"\"", long, b"\""]);
   let stands = below(b"files", long);
   assert_eq(stands.value, { output: quoted_long, ran: 0 });
   assert_eq(segments_in(stands.tree), []);
   assert_eq(below(b"other files", long).value, { output: quoted_long, ran: 0 });
   assert_eq(below(b"other files", b"four").value, { output: b"\"four\"", ran: 2 })
+}
+
+// The files listed are the same in both runs, so only what the store noted says the text moved.
+test "what a run answered again over a pack it does not trust is answered again where its reads move" {
+  let pack = quoted_pack(b"long ".repeat(1000), []).written;
+  let first = quoted_below(fs::mem_of([]), pack, b"other files", b"four");
+  assert_eq(first.value, { output: b"\"four\"", ran: 2 });
+  let moved = quoted_below(first.tree, pack, b"other files", b"forty");
+  assert_eq(moved.value, { output: b"\"forty\"", ran: 2 });
+  assert_eq(quoted_below(moved.tree, pack, b"other files", b"forty").value.ran, 0)
 }
 
 test "taking back a command's answer asks the file system the same handful of things, however much is kept" {
