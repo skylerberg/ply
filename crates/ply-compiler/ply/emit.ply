@@ -22,7 +22,8 @@ import infer (LabelSite, OperandSite, TypedSite, expanded_mods, prelude_effects,
               is_test_owner, EmitFacts, RootFacts, UpdateShape, TrySite, MemberSite, WitnessOp,
               WitnessRef, WitnessOrder, facts_at, test_owner, law_root, cases_root)
 import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Atom, RNamed, type_at,
-              is_diverges, int_type, bytes_type)
+              is_diverges, int_type, bytes_type, string_type, spelled_type, type_spelled,
+              read_types, digits)
 import typing (Typed, node_types, unknown_type, filed_as)
 import front
 import front (Rows, KnownDefRow, KnownTestRow, Dump, analyse, analyse_with, no_rows,
@@ -207,12 +208,22 @@ pub type Ty =
   | TyOf(Type)
 
 /// The type the checker settled an operator's operands at, which alone decides what the operator
-/// means; how an operand happens to be held only decides how it is read. `OWord` is read by the
-/// runtime's own operators: whatever `==` compares structurally.
-type Operand = | OInt | OBool | OWidth(Width) | OFloat | ODec | OChar | OText | OSum(Bytes) | OWord
+/// means; how an operand happens to be held only decides how it is read. `OWhole` is a type of
+/// arguments or fields, and `OWord` one read by the runtime's own operators.
+type Operand =
+  | OInt
+  | OBool
+  | OWidth(Width)
+  | OFloat
+  | ODec
+  | OChar
+  | OText
+  | OSum(Bytes)
+  | OWhole(Type)
+  | OWord
 
 /// `None` where the checker settled no type, which it does for every operator of a checked program.
-fn operand_at(emitter: Emitter, span: Span) -> Option<Operand> =
+fn operand_at(emitter: Emitter, span: Span) -> Option<Operand> / {abort.raise} =
   match emitter.operands.get(span_key(span)) {
     None -> None,
     Some(name) -> if name == unsettled() { None }
@@ -222,17 +233,26 @@ fn operand_at(emitter: Emitter, span: Span) -> Option<Operand> =
     else if name == b"Decimal" { Some(ODec) }
     else if name == b"Char" { Some(OChar) }
     else if name == b"String" || name == b"Bytes" { Some(OText) }
-    else if compared_by_ctors(emitter.ctors, name) { Some(OSum(name)) }
-    else { match width_named(name) { Some(w) -> Some(OWidth(w)), None -> Some(OWord) } },
+    else if compared_by_ctors(emitter.ctors, name) { Some(OSum(name)) } else if spells_whole(name) {
+      match type_spelled(name) { Some(t) -> Some(OWhole(t)), None -> Some(OWord) }
+    } else { match width_named(name) { Some(w) -> Some(OWidth(w)), None -> Some(OWord) } },
   }
+
+/// Whether an operand's name spells a type of arguments or fields rather than naming one.
+fn spells_whole(name: Bytes) -> Bool = name.index_of(b"<") != None || name.index_of(b"{") != None
 
 /// `emitter` noting that the operator at `span` is done by the runtime because the checker settled its
 /// operands at type variable `'i`, which a scalar argument would do in C, and an argument of any
 /// type would where the operator `compares` for equality.
-fn operand_needed(emitter: Emitter, span: Span, compares: Bool) -> Emitter =
+fn operand_needed(emitter: Emitter, span: Span, compares: Bool) -> Emitter / {abort.raise} =
   match emitter.operands.get(span_key(span)) {
     Some(name) -> if name.len() > 1 && name.at(0) == 39 {
       needing(emitter, digits(name.slice(1, name.len())), if compares { Exact } else { Scalar })
+    } else if compares && spells_whole(name) {
+      match type_spelled(name) {
+        Some(t) -> type_vars(t).fold(emitter, |e: Emitter, v: Int| needing(e, v, Exact)),
+        None -> emitter,
+      }
     } else { emitter },
     None -> emitter,
   }
@@ -3807,14 +3827,17 @@ fn ctor_index(ctors: List<Bytes>, want: Bytes, bare: Bytes) -> Option<Int> =
 /// Whether `name` names a constructor: as written, `binder::Name`, or program-wide, as code the
 /// emitter writes names one, `m.Name`.
 fn is_ctor_name(name: Bytes) -> Bool / {abort.raise} =
-  starts_upper(match qualified(name) {
-    Some(q) -> q.name,
-    None -> if name.index_of(b".") == None { name } else {
-      let dot = range(0, name.len()).fold(0, |acc: Int, i: Int|
-        if name.at(i) == 46 { i } else { acc });
-      name.slice(dot + 1, name.len())
-    },
-  })
+
+  // A written root's name spells a type, whose last segment may be a type's name.
+  name.index_of(b"#") == None
+    && starts_upper(match qualified(name) {
+      Some(q) -> q.name,
+      None -> if name.index_of(b".") == None { name } else {
+        let dot = range(0, name.len()).fold(0, |acc: Int, i: Int|
+          if name.at(i) == 46 { i } else { acc });
+        name.slice(dot + 1, name.len())
+      },
+    })
 
 fn last_segment(path: List<Ident>) -> Bytes =
   match path.at(path.len() - 1) { Some(i) -> i.name, None -> b"" }
@@ -5528,6 +5551,7 @@ fn width_builtin(
             ordered_at(emitter, at),
             nth_value(e0.vals, 0),
             nth_value(e0.vals, 1),
+            span,
           ),
         ),
     }
@@ -9061,6 +9085,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                       l.value,
                       r.value,
                       t,
+                      c.span,
                     ),
                 },
               },
@@ -11693,22 +11718,18 @@ fn between_test(
   { emitter: check(held.emitter), expr: held.value.expr }
 }
 
-/// As `==` compares, against the unit's constant; a zero subject is an enclosing test that failed.
+/// As `==` compares, against the unit's constant: a string or byte string by its bytes, a character
+/// by its word, anything else as the runtime compares it. A zero subject is an enclosing test that
+/// failed.
 fn equal_test(emitter: Emitter, literal: Lit, subj: CValue) -> { emitter: Emitter, expr: Bytes } = {
   let k = from_table(emitter, literal);
-  let eq = bind(
-    k.emitter,
-    KBool,
-    Bytes::concat_all([
-      b"(",
-      subj.expr,
-      b" != 0 && rt_equal_p(ctx, ",
-      subj.expr,
-      b", ",
-      k.value.expr,
-      b"))",
-    ]),
-  );
+  let same = match literal {
+    LStr(_) -> bytes_equal(subj.expr, k.value.expr),
+    LBytes(_) -> bytes_equal(subj.expr, k.value.expr),
+    LChar(_) -> Bytes::concat_all([b"(", subj.expr, b" == ", k.value.expr, b")"]),
+    _ -> Bytes::concat_all([b"rt_equal_p(ctx, ", subj.expr, b", ", k.value.expr, b")"]),
+  };
+  let eq = bind(k.emitter, KBool, Bytes::concat_all([b"(", subj.expr, b" != 0 && ", same, b")"]));
   { emitter: check(eq.emitter), expr: eq.value.expr }
 }
 
@@ -12952,11 +12973,12 @@ fn binary_rest(
   l: CValue,
   r: CValue,
   t: Operand,
+  at: Span,
 ) -> Option<WithValue> / {abort.raise} =
   match t {
     OInt -> Some(int_binary(emitter, op, l, r)),
     OWidth(w) -> if carried(w) { width_binary(emitter, op, l, r, w) }
-    else { word_binary(emitter, op, l, r) },
+    else { word_binary(emitter, op, l, r, None, at) },
     OBool -> if op == b"eq" || op == b"ne" {
       Some(
         bind(
@@ -12996,11 +13018,647 @@ fn binary_rest(
         bind(b.emitter, KBool, if op == b"ne" { b"!".concat(bytes_equal(x, y)) }
         else { bytes_equal(x, y) }),
       )
-    } else { word_binary(emitter, op, l, r) },
+    } else { word_binary(emitter, op, l, r, None, at) },
     OSum(t) -> if op == b"eq" || op == b"ne" { Some(sum_equal(emitter, op, l, r, t)) }
-    else { word_binary(emitter, op, l, r) },
-    OWord -> word_binary(emitter, op, l, r),
+    else { word_binary(emitter, op, l, r, None, at) },
+    OWhole(t) -> if (op == b"eq" || op == b"ne") && (walked_container(t) || is_result(t)) {
+      let o = container_called(emitter, b"equal", t, [l, r], at);
+      Some(if op == b"ne" { not_of(o) } else { o })
+    } else if (op == b"eq" || op == b"ne") && generic_sum(emitter.ctors, t) {
+      Some(sum_equal_by_root(emitter, op, l, r, spelled_type(t)))
+    } else if op == b"eq" || op == b"ne" { word_binary(emitter, op, l, r, Some(t), at) }
+    else { word_binary(emitter, op, l, r, None, at) },
+    OWord -> word_binary(emitter, op, l, r, None, at),
   }
+
+/// Whether `==` and `compare` of two values of `t` walk them through roots written for `t`: a
+/// `List`, an `Array` or a `Map` whose type is known throughout.
+fn walked_container(t: Type) -> Bool =
+  !has_vars(t)
+    && (match t {
+      TyCon(c) -> c.name == b"List" || c.name == b"Array" || c.name == b"Map",
+      _ -> false,
+    })
+
+/// The `Bool` `o` holds, negated.
+fn not_of(o: WithValue) -> WithValue =
+  bind(o.emitter, KBool, Bytes::concat_all([b"!(", as_bool(o.value), b")"]))
+
+/// Whether two `Some`s' payload words `a` and `b`, of type `t` where it is known, are equal: a
+/// string or byte string by its bytes, an `Int` by its value, a `Bool`, a `Char` or `Unit` by its
+/// word, and anything else as the runtime compares two words.
+fn payload_compared(a: Bytes, b: Bytes, t: Option<Type>) -> Bytes =
+  match t {
+    Some(TyCon(c)) -> if c.args.len() > 0 { runtime_equal(a, b) }
+    else if c.name == b"String" || c.name == b"Bytes" { bytes_equal(a, b) }
+    else if c.name == b"Int" {
+      let value = |w: Bytes|
+        Bytes::concat_all([
+          b"(ply_is_imm(",
+          w,
+          b") ? ply_imm_value(",
+          w,
+          b") : rt_unbox_int_p(ctx, ",
+          w,
+          b"))",
+        ]);
+      Bytes::concat_all([b"(", value(a), b" == ", value(b), b")"])
+    } else if c.name == b"Bool" || c.name == b"Char" || c.name == b"Unit" {
+      Bytes::concat_all([b"(", a, b" == ", b, b")"])
+    } else { runtime_equal(a, b) },
+    _ -> runtime_equal(a, b),
+  }
+
+/// Whether `t` is a record whose fields' types are known, compared through the root written for it
+/// where it is held as a word rather than in place.
+fn rooted_record(t: Option<Type>) -> Bool =
+  match t {
+    Some(TyRecord(_)) -> !has_vars(t.unwrap_or(unknown_type())),
+    Some(TyNominal(_)) -> !has_vars(t.unwrap_or(unknown_type())),
+    _ -> false,
+  }
+
+/// The name a sum of type `t` is compared by through `T#eq`: a declared one by its name, a generic
+/// one at known arguments as spelled.
+fn declared_sum(emitter: Emitter, t: Option<Type>) -> Option<Bytes> =
+  match t {
+    Some(TyCon(c)) -> if c.args.len() == 0 && compared_by_ctors(emitter.ctors, c.name) {
+      Some(c.name)
+    } else if generic_sum(emitter.ctors, TyCon(c)) { Some(spelled_type(TyCon(c))) }
+    else { None },
+    _ -> None,
+  }
+
+fn runtime_equal(a: Bytes, b: Bytes) -> Bytes =
+  Bytes::concat_all([b"rt_equal_p(ctx, ", a, b", ", b, b")"])
+
+/// What an `Option` of type `t` holds, where `t` is one.
+fn payload_type(t: Option<Type>) -> Option<Type> =
+  match t { Some(TyCon(c)) -> if c.name == b"Option" { c.args.at(0) } else { None }, _ -> None }
+
+fn is_text(t: Option<Type>) -> Bool =
+  match t {
+    Some(TyCon(c)) -> c.args.len() == 0 && (c.name == b"String" || c.name == b"Bytes"),
+    _ -> false,
+  }
+
+/// Whether `t` is the record a map's entries list holds, `{key, value}`.
+fn is_entry(t: Type) -> Bool =
+  match t { TyRecord(fs) -> fs.map(|f: Field| f.name) == [b"key", b"value"], _ -> false }
+
+/// The type of field `name` of a record of type `t`.
+fn field_type(t: Option<Type>, name: Bytes) -> Option<Type> =
+  match t {
+    Some(TyRecord(fs)) ->
+      fs.fold(None, |acc: Option<Type>, f: Field| if f.name == name { Some(f.ty) } else { acc }),
+    Some(TyNominal(x)) ->
+      x.fields.fold(None, |acc: Option<Type>, f: Field|
+        if f.name == name { Some(f.ty) } else { acc }),
+    _ -> None,
+  }
+
+/// `t` where it is a container `walked_container` walks.
+fn walked_type(t: Option<Type>) -> Option<Type> =
+  match t { Some(ty) -> if walked_container(ty) { Some(ty) } else { None }, None -> None }
+
+/// Whether two `Option`s held as their payloads' words `a` and `b` are equal: `None` is zero, and
+/// two `Some`s are equal as the root written for their payloads' type `t` compares them.
+fn payloads_equal(
+  emitter: Emitter,
+  a: Bytes,
+  b: Bytes,
+  t: Type,
+  at: Span,
+) -> WithValue / {abort.raise} = {
+  let eq = fresh(emitter);
+  let opened = indent(
+    line(
+      line(
+        eq.emitter,
+        Bytes::concat_all([
+          b"int64_t ",
+          eq.name,
+          b" = (",
+          a,
+          b" == 0 || ",
+          b,
+          b" == 0) ? (",
+          a,
+          b" == ",
+          b,
+          b") : 1;",
+        ]),
+      ),
+      Bytes::concat_all([b"if (", a, b" != 0 && ", b, b" != 0) {"]),
+    ),
+  );
+  let e = container_called(
+    opened,
+    b"equal",
+    t,
+    // Copies the root takes, made only where it runs: the operands stay their holders'.
+    [
+      { kind: KBoxed, expr: Bytes::concat_all([b"(Word)(", a, b")"]), ty: TyOpen([]) },
+      { kind: KBoxed, expr: Bytes::concat_all([b"(Word)(", b, b")"]), ty: TyOpen([]) },
+    ],
+    at,
+  );
+  let closed = line(
+    outdent(
+      release_at(
+        line(e.emitter, Bytes::concat_all([eq.name, b" = ", as_bool(e.value), b";"])),
+        opened.indent,
+      ),
+    ),
+    b"}",
+  );
+  { emitter: closed, value: { kind: KBool, expr: eq.name, ty: TyOpen([]) } }
+}
+
+/// The roots written for containers beside those of `reflect`, `shown` and `digest`: `equal` and
+/// `ordered` of two, answering as `==` and `compare` do, and the loops the roots run from an index:
+/// over two containers for those, and over one, gathering what each item writes, for the others.
+fn container_ops() -> List<Bytes> =
+  [
+    b"equal",
+    b"equal_from",
+    b"ordered",
+    b"ordered_from",
+    b"reflect_from",
+    b"shown_from",
+    b"digest_from",
+    b"reflect_entries_from",
+    b"shown_entries_from",
+    b"digest_entries_from",
+  ]
+
+/// Each root written for containers of type `t` in `module`, as a definition of the module, so a
+/// root's call of another, or of itself, is a call of a definition: the two-container ones take
+/// both and the loops an index after, the others take the container and the loops a list they add
+/// to and an index after.
+fn container_defs(module: Bytes, t: Type) -> List<Def> / {abort.raise} =
+  [b"reflect", b"shown", b"digest"].concat(container_ops()).map(|op: Bytes| {
+    let root = written_root(module, op, t);
+    let arity = if op.ends_with(b"_from") { 3 }
+    else if op == b"equal" || op == b"ordered" { 2 }
+    else { 1 };
+    let answer = if op == b"equal" || op == b"equal_from" { KBool } else { KBoxed };
+    {
+      name: local_root(module, root),
+      ret: Some(answer),
+      ret_ty: TyOpen([]),
+      pure: true,
+      arity: arity,
+      scheme: None,
+      carriers: range(0, arity).map(|i: Int| Whole(if i == 2 { KInt } else { KBoxed })),
+      answer: Whole(answer),
+      witnesses: 0,
+    }
+  })
+
+/// The body of the root written for `op` of containers of type `t`, as lowered code over its
+/// parameters `a`, `b` and, for the loops, `i`, the operand and binder types it files, and the
+/// definitions its calls name. Two lists or arrays are equal where they have one length and each
+/// pair at an index is equal, and ordered by the first pair that is not equal, a shorter one first
+/// where the other begins with it; two maps as the lists of their entries in key order are. A
+/// container is reflected, shown or digested item by item at the items' type, a map entry by entry.
+fn container_code(
+  module: Bytes,
+  op: Bytes,
+  t: Type,
+) -> { code: Code, operands: Map<Bytes, Bytes>, typed: Map<Bytes, Typed>, here: List<Def> } / {abort.raise} = {
+  let at = |node: Node, span: Span| { own: Borrowed, node: node, span: span };
+  let placed = |k: Int| { start: 0, end: k, gen: 1 };
+  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
+  let named = |name: Bytes| at(NVar({ name: name, slot: None }), dummy_span());
+  let lit = |l: Lit| at(NLit(l), dummy_span());
+  let call = |f: Code, args: List<Code>| at(NApp({ func: f, args: args }), dummy_span());
+  let builtin = |name: Bytes, k: Int| at(NVar({ name: name, slot: None }), placed(k));
+  let binary = |op2: Bytes, l: Code, r: Code, k: Int|
+    at(NBinary({ op: op2, lhs: l, rhs: r }), placed(k));
+  let args = match t { TyCon(c) -> c.args, _ -> [] };
+  let kind = match t { TyCon(c) -> c.name, _ -> b"" };
+  let fields_of = match t { TyRecord(fs) -> fs, TyNominal(x) -> x.fields, _ -> [] };
+  let value = TyCon({ name: b"std.value.Value", args: [] });
+  // What a `Result`'s `Err` holds.
+  let failure = match args.at(1) { Some(e) -> e, None -> unknown_type() };
+  // A map is walked as the list of its entries.
+  let walked = if kind == b"Map" {
+    TyCon({
+      name: b"List",
+      args: [
+        TyRecord([
+          { name: b"key", ty: match args.at(0) { Some(k) -> k, None -> unknown_type() } },
+          { name: b"value", ty: match args.at(1) { Some(v) -> v, None -> unknown_type() } },
+        ]),
+      ],
+    })
+  } else { t };
+  let item = match walked {
+    TyCon(c) -> match c.args.at(0) { Some(e) -> e, None -> unknown_type() },
+    _ -> unknown_type(),
+  };
+  let field = |name: Bytes|
+    match item {
+      TyRecord(fs) ->
+        fs.fold(unknown_type(), |acc: Type, f: Field| if f.name == name { f.ty } else { acc }),
+      _ -> unknown_type(),
+    };
+  let of = if kind == b"Array" { b"Array::" } else { b"List::" };
+  let loop_named = |name: Bytes| {
+    let root = written_root(module, name, walked);
+    local_root(module, root)
+  };
+  let here = if kind == b"Map" { container_defs(module, t).concat(container_defs(module, walked)) }
+  else { container_defs(module, t) };
+  let typed = [
+    { k: 0, ty: filed_as(unknown_type(), args) },
+    { k: 1, ty: filed_as(unknown_type(), args) },
+    { k: 3, ty: filed_as(unknown_type(), [item]) },
+    { k: 4, ty: filed_as(unknown_type(), [item]) },
+    { k: 5, ty: filed_as(item, []) },
+    { k: 6, ty: filed_as(item, []) },
+    { k: 9, ty: filed_as(unknown_type(), [item]) },
+    { k: 13, ty: filed_as(unknown_type(), [item]) },
+    { k: 14, ty: filed_as(TyCon({ name: b"List", args: [value] }), []) },
+    { k: 15, ty: filed_as(unknown_type(), [item]) },
+    { k: 16, ty: filed_as(unknown_type(), [field(b"key")]) },
+    { k: 17, ty: filed_as(unknown_type(), [field(b"value")]) },
+    {
+      k: 18,
+      ty: filed_as(TyRecord([{ name: b"key", ty: value }, { name: b"value", ty: value }]), []),
+    },
+    {
+      k: 19,
+      ty: filed_as(
+        TyCon({
+          name: b"List",
+          args: [TyRecord([{ name: b"key", ty: value }, { name: b"value", ty: value }])],
+        }),
+        [],
+      ),
+    },
+    { k: 20, ty: filed_as(TyCon({ name: b"List", args: [bytes_type()] }), []) },
+    { k: 21, ty: filed_as(unknown_type(), [int_type()]) },
+    { k: 23, ty: filed_as(failure, []) },
+    { k: 24, ty: filed_as(failure, []) },
+    { k: 25, ty: filed_as(unknown_type(), [failure]) },
+  ].fold(Map::new(), |m: Map<Bytes, Typed>, x: { k: Int, ty: Typed }|
+    m.insert(span_key(placed(x.k)), x.ty));
+  let operands = Map::new().insert(span_key(placed(2)), b"Int").insert(
+    span_key(placed(7)),
+    compared_name(item),
+  ).insert(
+    span_key(placed(8)),
+    b"Int",
+  ).insert(
+    span_key(placed(10)),
+    b"Ordering",
+  ).insert(
+    span_key(placed(12)),
+    b"Int",
+  ).insert(
+    span_key(placed(22)),
+    b"Ordering",
+  ).insert(
+    span_key(placed(26)),
+    compared_name(failure),
+  ).insert(
+    span_key(placed(27)),
+    b"Int",
+  );
+  let operands = range(0, fields_of.len()).fold(operands, |m: Map<Bytes, Bytes>, k: Int|
+    m.insert(span_key(placed(40 + k)), compared_name(fields_of.get(k).ty)));
+  let a = var(b"a", 0);
+  let b = var(b"b", 1);
+  let i = var(b"i", 2);
+  let x = var(b"x", 3);
+  let next = binary(b"add", i, lit(LInt(1)), 8);
+  let length = |c: Code, k: Int|
+    call(builtin(if kind == b"Map" { b"Map::len" } else { of.concat(b"len") }, k), [c]);
+  let some = |name: Bytes, slot: Int, k: Int|
+    PxCtor({ name: b"Some", args: [PxVar({ name: name, slot: Some(slot), span: placed(k) })] });
+  let none = PxCtor({ name: b"None", args: [] });
+  // An array's item is read by the inline `Array::get`, so no root calls a prelude function the
+  // program may not reach.
+  let match_at = |list: Code, k: Int, name: Bytes, slot: Int, binder: Int, found: Code, ended: Code|
+    if kind == b"Array" {
+      at(
+        NIf({
+          cond: binary(b"lt", i, length(list, k), 27),
+          then_branch: at(
+            NBlock({
+              stmts: [
+                CLet({ name: name, slot: slot, value: call(builtin(b"Array::get", k), [list, i]) }),
+              ],
+              tail: Some(found),
+            }),
+            dummy_span(),
+          ),
+          else_branch: ended,
+        }),
+        dummy_span(),
+      )
+    } else {
+      at(
+        NMatch({
+          scrutinee: call(builtin(b"List::at", k), [list, i]),
+          arms: [
+            { pat: some(name, slot, binder), guard: None, body: found },
+            { pat: none, guard: None, body: ended },
+          ],
+        }),
+        dummy_span(),
+      )
+    };
+  // The list or array walked, a map's entries for a map.
+  let walked_of = |c: Code, k: Int|
+    if kind == b"Map" { call(builtin(b"Map::entries", k), [c]) } else { c };
+  // What a loop over one container adds to `b` for the item `x`.
+  let part = |builtin_name: Bytes, c: Code, k: Int| call(builtin(builtin_name, k), [c]);
+  let gathered = |name: Bytes, pushed: (Code) -> Code|
+    match_at(a, 3, b"x", 3, 5, call(named(loop_named(name)), [a, pushed(b), next]), b);
+  let push = |list: Code, v: Code| call(named(b"List::push"), [list, v]);
+  let entry = |builtin_name: Bytes|
+    at(
+      NRecord({
+        fields: [
+          {
+            name: b"key",
+            value: part(builtin_name, at(NField({ base: x, field: b"key" }), dummy_span()), 16),
+          },
+          {
+            name: b"value",
+            value: part(builtin_name, at(NField({ base: x, field: b"value" }), dummy_span()), 17),
+          },
+        ],
+      }),
+      placed(18),
+    );
+  let empty = |k: Int| at(NList({ items: [] }), placed(k));
+  // `?compare` of the two items, or of their field `name`, and `then` where it answers `Equal`.
+  let ordered_then = |name: Bytes, k: Int, slot: Int, eq_at: Int, then: Code| {
+    let read = |c: Code|
+      if name == b"" { c } else { at(NField({ base: c, field: name }), dummy_span()) };
+    let o = b"o".concat(ascii_of_int(slot));
+    at(
+      NBlock({
+        stmts: [
+          CLet({
+            name: o,
+            slot: slot,
+            value: call(builtin(b"?compare", k), [read(x), read(var(b"y", 4))]),
+          }),
+        ],
+        tail: Some(
+          at(
+            NIf({
+              cond: binary(b"eq", var(o, slot), named(b"Equal"), eq_at),
+              then_branch: then,
+              else_branch: var(o, slot),
+            }),
+            dummy_span(),
+          ),
+        ),
+      }),
+      dummy_span(),
+    )
+  };
+  let body = if kind == b"" && op == b"equal" {
+    // A record's fields in the order their names sort, each compared at its own type.
+    range(0, fields_of.len()).fold(lit(LBool(true)), |acc: Code, k: Int| {
+      let f = fields_of.get(k);
+      let read = |c: Code| at(NField({ base: c, field: f.name }), dummy_span());
+      let eq = binary(b"eq", read(a), read(b), 40 + k);
+      if k == 0 { eq } else { at(NBinary({ op: b"and", lhs: acc, rhs: eq }), dummy_span()) }
+    })
+  } else if kind == b"Result" {
+    let arm = |pat: CodePattern, body2: Code| { pat: pat, guard: None, body: body2 };
+    let on = |scrutinee: Code, arms: List<CodeArm>|
+      at(NMatch({ scrutinee: scrutinee, arms: arms }), dummy_span());
+    let one = |ctor: Bytes, slot: Int, k: Int|
+      PxCtor({
+        name: ctor,
+        args: [
+          PxVar({ name: if slot == 3 { b"x" } else { b"y" }, slot: Some(slot), span: placed(k) }),
+        ],
+      });
+    let other = |ctor: Bytes| PxCtor({ name: ctor, args: [PxWild] });
+    let y = var(b"y", 4);
+    if op == b"equal" {
+      on(a, [
+        arm(
+          one(b"Ok", 3, 5),
+          on(b, [arm(one(b"Ok", 4, 6), binary(b"eq", x, y, 7)), arm(PxWild, lit(LBool(false)))]),
+        ),
+        arm(
+          one(b"Err", 3, 23),
+          on(b, [arm(one(b"Err", 4, 24), binary(b"eq", x, y, 26)), arm(PxWild, lit(LBool(false)))]),
+        ),
+      ])
+    } else {
+      on(a, [
+        arm(
+          one(b"Err", 3, 23),
+          on(b, [
+            arm(one(b"Err", 4, 24), call(builtin(b"?compare", 25), [x, y])),
+            arm(other(b"Ok"), named(b"Less")),
+          ]),
+        ),
+        arm(
+          one(b"Ok", 3, 5),
+          on(b, [
+            arm(one(b"Ok", 4, 6), call(builtin(b"?compare", 9), [x, y])),
+            arm(other(b"Err"), named(b"Greater")),
+          ]),
+        ),
+      ])
+    }
+  } else if kind == b"Option" {
+    let arm = |pat: CodePattern, body2: Code| { pat: pat, guard: None, body: body2 };
+    let on = |scrutinee: Code, arms: List<CodeArm>|
+      at(NMatch({ scrutinee: scrutinee, arms: arms }), dummy_span());
+    on(a, [
+      arm(none, on(b, [arm(none, named(b"Equal")), arm(PxWild, named(b"Less"))])),
+      arm(
+        some(b"x", 3, 5),
+        on(b, [
+          arm(none, named(b"Greater")),
+          arm(some(b"y", 4, 6), call(builtin(b"?compare", 9), [x, var(b"y", 4)])),
+        ]),
+      ),
+    ])
+  } else if op == b"equal" {
+    at(
+      NIf({
+        cond: binary(b"eq", length(a, 0), length(b, 1), 2),
+        then_branch: call(named(loop_named(b"equal_from")), [
+          walked_of(a, 0),
+          walked_of(b, 1),
+          lit(LInt(0)),
+        ]),
+        else_branch: lit(LBool(false)),
+      }),
+      dummy_span(),
+    )
+  } else if op == b"ordered" {
+    call(named(loop_named(b"ordered_from")), [walked_of(a, 0), walked_of(b, 1), lit(LInt(0))])
+  } else if op == b"equal_from" {
+    match_at(
+      a,
+      3,
+      b"x",
+      3,
+      5,
+      match_at(
+        b,
+        4,
+        b"y",
+        4,
+        6,
+        at(
+          NIf({
+            cond: binary(b"eq", x, var(b"y", 4), 7),
+            then_branch: call(named(loop_named(b"equal_from")), [a, b, next]),
+            else_branch: lit(LBool(false)),
+          }),
+          dummy_span(),
+        ),
+        lit(LBool(false)),
+      ),
+      lit(LBool(true)),
+    )
+  } else if op == b"ordered_from" {
+    match_at(
+      a,
+      3,
+      b"x",
+      3,
+      5,
+      match_at(
+        b,
+        4,
+        b"y",
+        4,
+        6,
+        // Item by item, a map's entry by its key and then its value.
+        if is_entry(item) {
+          ordered_then(
+            b"key",
+            16,
+            5,
+            10,
+            ordered_then(
+              b"value",
+              17,
+              6,
+              22,
+              call(named(loop_named(b"ordered_from")), [a, b, next]),
+            ),
+          )
+        } else {
+          ordered_then(b"", 9, 5, 10, call(named(loop_named(b"ordered_from")), [a, b, next]))
+        },
+        named(b"Greater"),
+      ),
+      at(
+        NIf({
+          cond: binary(b"lt", i, call(builtin(of.concat(b"len"), 13), [b]), 12),
+          then_branch: named(b"Less"),
+          else_branch: named(b"Equal"),
+        }),
+        dummy_span(),
+      ),
+    )
+  } else if op == b"reflect_from" || op == b"shown_from" {
+    let name = if op == b"reflect_from" { b"?reflect" } else { b"?shown" };
+    gathered(op, |out: Code| push(out, part(name, x, 15)))
+  } else if op == b"digest_from" { gathered(op, |out: Code| push(out, part(b"?encoded", x, 15))) }
+  else if op == b"reflect_entries_from" || op == b"shown_entries_from" {
+    let name = if op == b"reflect_entries_from" { b"?reflect" } else { b"?shown" };
+    gathered(op, |out: Code| push(out, entry(name)))
+  } else if op == b"digest_entries_from" {
+    gathered(op, |out: Code|
+      push(
+        push(out, part(b"?encoded", at(NField({ base: x, field: b"key" }), dummy_span()), 16)),
+        part(b"?encoded", at(NField({ base: x, field: b"value" }), dummy_span()), 17),
+      ))
+  } else if op == b"digest" {
+    // The encoding `digest.rs` writes: the container's tag and count, then each item's encoding;
+    // a count's eight bytes are an `Int` encoding's past its tag.
+    let tag = if kind == b"Map" { 11 } else if kind == b"Array" { 10 } else { 9 };
+    let loop_name = if kind == b"Map" { b"digest_entries_from" } else { b"digest_from" };
+    call(named(b"?concat"), [
+      at(
+        NList({
+          items: [
+            lit(LBytes(byte_of_int(tag))),
+            call(named(b"Bytes::slice"), [
+              part(b"?encoded", length(a, 0), 21),
+              lit(LInt(1)),
+              lit(LInt(9)),
+            ]),
+            call(named(b"?concat"), [
+              call(named(loop_named(loop_name)), [walked_of(a, 1), empty(20), lit(LInt(0))]),
+            ]),
+          ],
+        }),
+        dummy_span(),
+      ),
+    ])
+  } else {
+    // `reflect` or `shown`: the container's constructor of `std.value.Value` over its items'.
+    let reflecting = op == b"reflect";
+    let made = if kind == b"Map" { b"std.value.VMap" }
+    else if kind == b"Array" { b"std.value.VArray" }
+    else { b"std.value.VList" };
+    let loop_name = if kind == b"Map" {
+      if reflecting { b"reflect_entries_from" } else { b"shown_entries_from" }
+    } else if reflecting { b"reflect_from" }
+    else { b"shown_from" };
+    call(named(made), [
+      call(named(loop_named(loop_name)), [
+        walked_of(a, 1),
+        empty(if kind == b"Map" { 19 } else { 14 }),
+        lit(LInt(0)),
+      ]),
+    ])
+  };
+  { code: marked(body), operands: operands, typed: typed, here: here }
+}
+
+/// The name `root`, written in `module`, has there.
+fn local_root(module: Bytes, root: Bytes) -> Bytes / {abort.raise} =
+  if module.len() == 0 { root } else { root.slice(module.len() + 1, root.len()) }
+
+/// A call of the root written for `op` of containers of type `t`, handed `vals`.
+fn container_called(
+  emitter: Emitter,
+  op: Bytes,
+  t: Type,
+  vals: List<CValue>,
+  at: Span,
+) -> WithValue / {abort.raise} = {
+  let root = written_root(emitter.module, op, t);
+  let d = match container_defs(emitter.module, t).find(|x: Def|
+      x.name == local_root(emitter.module, root)) {
+    Some(x) -> x,
+    None -> panic("a container's root is one of those written for it"),
+  };
+  let target = call_target(emitter, root, Some(d), at, []);
+  let w = range(0, vals.len()).fold(
+    { emitter: target.emitter, names: [] },
+    |acc: { emitter: Emitter, names: List<Bytes> }, i: Int| {
+      let a = carried_arg(
+        notail(acc.emitter),
+        nth_value(vals, i),
+        carrier_at(target.carriers.params, i),
+      );
+      { emitter: a.emitter, names: acc.names.concat(a.names) }
+    },
+  );
+  called(w.emitter, target, at, w.names, vals.len(), false)
+}
 
 /// C's own `double` operators, which round as IEEE-754 does and compare as the evaluator does:
 /// `NaN` is unordered and unequal to itself.
@@ -13100,8 +13758,8 @@ fn compared_ctor(
   x: CValue,
   rhs: Code,
 ) -> Option<Int> / {abort.raise} =
-  if (op != b"eq" && op != b"ne") || (t != OWord && !is_sum_operand(t)) || x.kind != KBoxed { None }
-  else {
+  if (op != b"eq" && op != b"ne") || (!is_word_operand(t) && !is_sum_operand(t))
+      || x.kind != KBoxed { None } else {
     let named = match rhs.node {
       NApp(a) -> match a.func.node {
         NVar(fv) -> if fv.slot == None && is_ctor_name(fv.name) { Some(fv.name) } else { None },
@@ -13177,8 +13835,16 @@ fn ctor_compared(
     let compared_at = if laid == None && v.kind != KBoxed && !is_sum(v.kind) { v.kind }
     else { at.kind };
     let c = match at.ty {
-      TyRec(inner) -> fields_equal(inside, inner, held, v),
-      _ -> field_equal(inside, { name: b"", kind: compared_at, ty: at.ty }, held, v),
+      TyRec(inner) -> fields_equal(inside, inner, held, v, None, dummy_span()),
+      _ ->
+        field_equal(
+          inside,
+          { name: b"", kind: compared_at, ty: at.ty },
+          held,
+          v,
+          None,
+          dummy_span(),
+        ),
     };
     line(
       outdent(
@@ -13196,6 +13862,8 @@ fn ctor_compared(
 
 fn is_sum_operand(t: Operand) -> Bool = match t { OSum(_) -> true, _ -> false }
 
+fn is_word_operand(t: Operand) -> Bool = match t { OWord -> true, OWhole(_) -> true, _ -> false }
+
 /// Whether two values of the type `name` compare as the constructors of a sum the program declares
 /// do: not an `Option` or a `Result`, which are held as words, not a type whose module states a
 /// `key`, whose values compare as their keys do, and, where no module declares it, one of no
@@ -13208,6 +13876,127 @@ fn compared_by_ctors(ctors: Ctors, name: Bytes) -> Bool =
           && (name.index_of(b".") != None || nullary_sum(cs)),
       None -> false,
     })
+
+/// Whether `t` is a sum a module declares generic, at arguments known throughout, which roots
+/// written for it at those arguments compare and order as `T#eq` and `T#cmp` do its declared type.
+fn generic_sum(ctors: Ctors, t: Type) -> Bool =
+  !has_vars(t)
+    && (match t {
+      TyCon(c) ->
+        c.args.len() > 0 && c.name.index_of(b".") != None && compared_by_ctors(ctors, c.name)
+          && regular_sum(ctors, c.name),
+      _ -> false,
+    })
+
+/// Whether the roots written for the declared sum `name` at arguments are finitely many: no chain of
+/// sums from one of its parameters back to one holds it at a grown type, as `Nest<a>` holding a
+/// `Nest<List<a>>`, or `A<a>` a `B<List<a>>` holding an `A<a>`, does.
+fn regular_sum(ctors: Ctors, name: Bytes) -> Bool = {
+  let steps = sums_reached(ctors, name).fold([], |acc: List<ParamStep>, s: Bytes|
+    acc.concat(param_steps(ctors, s)));
+  let from = |p: Bytes| positions_reached(steps, p).push(p);
+  let own = steps.fold([], |acc: List<Bytes>, s: ParamStep|
+    if s.from.starts_with(name.concat(b"#")) && !acc.contains(s.from) { acc.push(s.from) }
+    else { acc });
+  steps.all(|s: ParamStep|
+    !s.grown || !own.any(|p: Bytes| from(s.to).contains(p) && from(p).contains(s.from)))
+}
+
+/// Whether `reflect`, `shown` and `digest` of a value of the sum `c` names are written by a root:
+/// the runtime reads one whose roots would be endless.
+fn written_sum(ctors: Ctors, c: { name: Bytes, args: List<Type> }) -> Bool =
+  ctors.sums.contains(c.name) && (c.args.len() == 0 || regular_sum(ctors, c.name))
+
+/// A sum's parameter, `from`, in a constructor's argument as a sum's argument `to`, or inside it
+/// (`grown`); a position is the sum's name and the parameter's index.
+type ParamStep = { from: Bytes, to: Bytes, grown: Bool }
+
+/// Every declared sum `name`'s constructors hold, through chains of sums, `name` first.
+fn sums_reached(ctors: Ctors, name: Bytes) -> List<Bytes> =
+  range(0, ctors.sums.len()).fold(
+    { seen: [name], at: 0 },
+    |s: { seen: List<Bytes>, at: Int }, _: Int|
+      match s.seen.at(s.at) {
+        None -> s,
+        Some(n) ->
+          {
+            seen: held_sums(ctors, n).fold(s.seen, |acc: List<Bytes>, o: Bytes|
+              if acc.contains(o) { acc } else { acc.push(o) }),
+            at: s.at + 1,
+          },
+      },
+  ).seen
+
+fn held_sums(ctors: Ctors, n: Bytes) -> List<Bytes> =
+  match ctors.sums.get(n) {
+    None -> [],
+    Some(cs) ->
+      cs.fold([], |acc: List<Bytes>, c: SumCtor|
+        c.fields.fold(acc, |a: List<Bytes>, f: Type|
+          a.concat(sums_in(ctors, f).map(|o: { name: Bytes, args: List<Type> }| o.name)))),
+  }
+
+fn param_steps(ctors: Ctors, s: Bytes) -> List<ParamStep> =
+  match ctors.sums.get(s) {
+    None -> [],
+    Some(cs) ->
+      cs.fold([], |acc: List<ParamStep>, c: SumCtor|
+        c.fields.fold(acc, |a: List<ParamStep>, f: Type|
+          sums_in(ctors, f).fold(a, |b: List<ParamStep>, o: { name: Bytes, args: List<Type> }|
+            range(0, o.args.len()).fold(b, |d: List<ParamStep>, j: Int|
+              range(0, c.params.len()).fold(d, |e: List<ParamStep>, i: Int|
+                match c.params.at(i) {
+                  None -> e,
+                  Some(p) -> match o.args.at(j) {
+                    None -> e,
+                    Some(arg) -> {
+                      let step = |grown: Bool|
+                        e.push({
+                          from: s.concat(b"#").concat(ascii_of_int(i)),
+                          to: o.name.concat(b"#").concat(ascii_of_int(j)),
+                          grown: grown,
+                        });
+                      if arg == TyVar(p) { step(false) }
+                      else if type_vars(arg).contains(p) { step(true) }
+                      else { e }
+                    },
+                  },
+                }))))),
+  }
+
+/// Each declared sum `t` names, at the arguments it names it at, those inside them included.
+fn sums_in(ctors: Ctors, t: Type) -> List<{ name: Bytes, args: List<Type> }> =
+  match t {
+    TyVar(_) -> [],
+    TyCon(k) -> {
+      let inner = k.args.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, a: Type|
+        acc.concat(sums_in(ctors, a)));
+      if ctors.sums.contains(k.name) { inner.push({ name: k.name, args: k.args }) } else { inner }
+    },
+    TyFn(f) ->
+      f.params.fold(
+        sums_in(ctors, f.ret),
+        |acc: List<{ name: Bytes, args: List<Type> }>, a: Type| acc.concat(sums_in(ctors, a)),
+      ),
+    TyRecord(fs) ->
+      fs.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, f: Field|
+        acc.concat(sums_in(ctors, f.ty))),
+    TyNominal(x) ->
+      x.fields.fold(
+        x.args.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, a: Type|
+          acc.concat(sums_in(ctors, a))),
+        |acc: List<{ name: Bytes, args: List<Type> }>, f: Field| acc.concat(sums_in(ctors, f.ty)),
+      ),
+  }
+
+/// Every position a chain of one or more steps leads to from `from`: no chain is longer than the steps.
+fn positions_reached(steps: List<ParamStep>, from: Bytes) -> List<Bytes> = {
+  let next = |n: Bytes| steps.filter(|s: ParamStep| s.from == n).map(|s: ParamStep| s.to);
+  range(0, steps.len()).fold(next(from), |seen: List<Bytes>, _: Int|
+    seen.fold(seen, |acc: List<Bytes>, n: Bytes|
+      next(n).fold(acc, |more: List<Bytes>, m: Bytes|
+        if more.contains(m) { more } else { more.push(m) })))
+}
 
 /// Whether every constructor of a sum is of no argument, so a value of it is its constructor alone.
 fn nullary_sum(cs: List<SumCtor>) -> Bool =
@@ -13542,7 +14331,8 @@ fn reflection_at(emitter: Emitter, at: Span) -> Option<Reflection> =
 
 fn reflection_of_type(ctors: Ctors, ty: Type) -> Option<Reflection> =
   match ty {
-    TyCon(c) -> if ctors.sums.contains(c.name) { Some(RRoot(ty)) }
+    TyCon(c) -> if written_sum(ctors, c) || walked_container(ty) { Some(RRoot(ty)) }
+    else if ctors.sums.contains(c.name) { None }
     else if c.args.len() > 0 { None }
     else if c.name == b"Int" { Some(RCtor(b"std.value.VInt")) }
     else if c.name == b"Bool" { Some(RCtor(b"std.value.VBool")) }
@@ -13678,7 +14468,7 @@ pub fn written_root(module: Bytes, op: Bytes, ty: Type) -> Bytes / {abort.raise}
     },
     _ -> module,
   };
-  Bytes::concat_all([home, b".", op, b"#", spelled_type(ty)])
+  qualify(home, Bytes::concat_all([op, b"#", spelled_type(ty)]))
 }
 
 /// The module a root `written_root` names is written in, what it writes, and the type it is written
@@ -13690,12 +14480,16 @@ pub fn written_root_of(
     None -> None,
     Some(h) -> {
       let head = root.slice(0, h);
-      match [b"reflect", b"shown", b"digest"].fold(None, |acc: Option<Bytes>, o: Bytes|
-          if head.ends_with(b".".concat(o)) { Some(o) } else { acc }) {
+      match [b"reflect", b"shown", b"digest"].concat(container_ops()).fold(
+          None,
+          |acc: Option<Bytes>, o: Bytes|
+            if head == o || head.ends_with(b".".concat(o)) { Some(o) } else { acc },
+        ) {
         None -> None,
         Some(op) -> match type_spelled(root.slice(h + 1, root.len())) {
           None -> None,
-          Some(ty) -> Some({ module: head.slice(0, head.len() - op.len() - 1), op: op, ty: ty }),
+          Some(ty) ->
+            Some({ module: head.slice(0, max(0, head.len() - op.len() - 1)), op: op, ty: ty }),
         },
       }
     },
@@ -13710,7 +14504,8 @@ fn encoding_at(emitter: Emitter, at: Span) -> Option<Type> =
       None -> None,
       Some(ty) -> if has_vars(ty) { None } else {
         match ty {
-          TyCon(c) -> if emitter.ctors.sums.contains(c.name) { Some(ty) } else { None },
+          TyCon(c) -> if written_sum(emitter.ctors, c) || walked_container(ty) { Some(ty) }
+          else { None },
           TyRecord(_) -> Some(ty),
           TyNominal(_) -> Some(ty),
           _ -> None,
@@ -14043,9 +14838,22 @@ fn reflection_code(
 }
 
 /// How the checker names a compared value's type to the emitter: a type of no arguments by its
-/// name, anything else as a word.
+/// name, a function's as a word, and any other spelled.
 fn compared_name(t: Type) -> Bytes =
-  match t { TyCon(c) -> if c.args.len() == 0 { c.name } else { b"" }, _ -> b"" }
+  match t {
+    TyCon(c) -> if c.args.len() == 0 { c.name } else { spelled_type(t) },
+    TyFn(_) -> b"",
+    _ -> spelled_type(t),
+  }
+
+/// The operand name of `t`, a type a specialisation settled an operand's variables at, where
+/// it is known: `compared_name`, and a variable as the checker names one.
+fn operand_spelled(t: Type) -> Option<Bytes> =
+  match t {
+    TyVar(v) -> if v < 0 { None } else { Some(b"'".concat(ascii_of_int(v))) },
+    TyCon(c) -> if c.args.len() == 0 && c.name == b"_" { None } else { Some(compared_name(t)) },
+    _ -> Some(compared_name(t)),
+  }
 
 /// The fields two records compared are laid out by, where both are known and alike.
 fn compared_fields(l: CValue, r: CValue) -> Option<List<FieldTy>> =
@@ -14062,7 +14870,14 @@ fn compared_fields(l: CValue, r: CValue) -> Option<List<FieldTy>> =
 /// Whether the records `l` and `r` of fields `fs` are equal, as the evaluator says: field by field
 /// in the order their names sort, the first unequal one the answer, each compared as its type
 /// compares, a record held in place field by field again. A field the runtime compares can raise.
-fn records_equal(emitter: Emitter, fs: List<FieldTy>, l: CValue, r: CValue) -> WithValue = {
+fn records_equal(
+  emitter: Emitter,
+  fs: List<FieldTy>,
+  l: CValue,
+  r: CValue,
+  whole: Option<Type>,
+  at: Span,
+) -> WithValue / {abort.raise} = {
   let lv = record_values(emitter, l, fs);
   let rv = record_values(lv.emitter, r, fs);
   let eq = fresh(rv.emitter);
@@ -14073,8 +14888,8 @@ fn records_equal(emitter: Emitter, fs: List<FieldTy>, l: CValue, r: CValue) -> W
     let b = nth_value(rv.vals, k);
     let inside = indent(line(acc, Bytes::concat_all([b"if (", eq.name, b") {"])));
     let c = match in_place(f) {
-      Some(inner) -> fields_equal(inside, inner, a, b),
-      None -> field_equal(inside, f, a, b),
+      Some(inner) -> fields_equal(inside, inner, a, b, field_type(whole, f.name), at),
+      None -> field_equal(inside, f, a, b, field_type(whole, f.name), at),
     };
     line(
       outdent(
@@ -14090,14 +14905,29 @@ fn records_equal(emitter: Emitter, fs: List<FieldTy>, l: CValue, r: CValue) -> W
 }
 
 /// As `records_equal`, a record a record holds in place being compared as its word.
-fn fields_equal(emitter: Emitter, fs: List<FieldTy>, l: CValue, r: CValue) -> WithValue = {
+fn fields_equal(
+  emitter: Emitter,
+  fs: List<FieldTy>,
+  l: CValue,
+  r: CValue,
+  whole: Option<Type>,
+  at: Span,
+) -> WithValue / {abort.raise} = {
   let lv = record_values(emitter, l, fs);
   let rv = record_values(lv.emitter, r, fs);
   let eq = fresh(rv.emitter);
   let opened = line(eq.emitter, Bytes::concat_all([b"int64_t ", eq.name, b" = 1;"]));
   let compared = range(0, fs.len()).fold(opened, |acc: Emitter, k: Int| {
     let inside = indent(line(acc, Bytes::concat_all([b"if (", eq.name, b") {"])));
-    let c = field_equal(inside, nth_field(fs, k), nth_value(lv.vals, k), nth_value(rv.vals, k));
+    let f = nth_field(fs, k);
+    let c = field_equal(
+      inside,
+      f,
+      nth_value(lv.vals, k),
+      nth_value(rv.vals, k),
+      field_type(whole, f.name),
+      at,
+    );
     line(
       outdent(
         release_at(
@@ -14111,8 +14941,16 @@ fn fields_equal(emitter: Emitter, fs: List<FieldTy>, l: CValue, r: CValue) -> Wi
   { emitter: compared, value: { kind: KBool, expr: eq.name, ty: TyOpen([]) } }
 }
 
-/// Whether two values of field `f` are equal, as `records_equal` compares them.
-fn field_equal(emitter: Emitter, f: FieldTy, a: CValue, b: CValue) -> WithValue =
+/// Whether two values of field `f` are equal, as `records_equal` compares them: a container of
+/// type `ply` through the prelude.
+fn field_equal(
+  emitter: Emitter,
+  f: FieldTy,
+  a: CValue,
+  b: CValue,
+  ply: Option<Type>,
+  at: Span,
+) -> WithValue / {abort.raise} =
   match f.kind {
     KFloat ->
       bind(emitter, KBool, Bytes::concat_all([b"(", as_float(a), b" == ", as_float(b), b")"])),
@@ -14140,31 +14978,44 @@ fn field_equal(emitter: Emitter, f: FieldTy, a: CValue, b: CValue) -> WithValue 
     KNum(w) ->
       bind(emitter, KBool, Bytes::concat_all([b"(", as_num(a, w), b" == ", as_num(b, w), b")"])),
     // An `Option` as its payload's word: `None` is zero, two `Some`s equal as their payloads are.
-    KSum(Zeroed) -> {
-      let e = bind(
-        emitter,
-        KBool,
-        Bytes::concat_all([
-          b"((",
-          a.expr,
-          b" == 0 || ",
-          b.expr,
-          b" == 0) ? (",
-          a.expr,
-          b" == ",
-          b.expr,
-          b") : rt_equal_p(ctx, ",
-          a.expr,
-          b", ",
-          b.expr,
-          b"))",
-        ]),
-      );
-      { emitter: check(e.emitter), value: e.value }
+    KSum(Zeroed) -> match walked_type(payload_type(ply)) {
+      Some(t) -> payloads_equal(emitter, a.expr, b.expr, t, at),
+      None -> {
+        let e = bind(
+          emitter,
+          KBool,
+          Bytes::concat_all([
+            b"((",
+            a.expr,
+            b" == 0 || ",
+            b.expr,
+            b" == 0) ? (",
+            a.expr,
+            b" == ",
+            b.expr,
+            b") : ",
+            payload_compared(a.expr, b.expr, payload_type(ply)),
+            b")",
+          ]),
+        );
+        { emitter: check(e.emitter), value: e.value }
+      },
     },
-    // Byte strings are equal as their bytes are; anything else as the runtime compares its word.
-    _ -> if a.ty == TyBytes || b.ty == TyBytes {
+    // Byte strings are equal as their bytes are, a container of known type as its type compares,
+    // and anything else as the runtime compares its word.
+    _ -> if a.ty == TyBytes || b.ty == TyBytes || is_text(ply) {
       bind(emitter, KBool, bytes_equal(as_word(a), as_word(b)))
+    } else if walked_type(ply) != None || rooted_record(ply)
+        || is_result(ply.unwrap_or(unknown_type())) {
+      container_called(
+        emitter,
+        b"equal",
+        match ply { Some(t) -> t, None -> unknown_type() },
+        [a, b],
+        at,
+      )
+    } else if declared_sum(emitter, ply) != None {
+      sum_equal_by_root(emitter, b"eq", a, b, declared_sum(emitter, ply).unwrap_or(b""))
     } else {
       let x = word_of(emitter, a);
       let y = word_of(x.emitter, b);
@@ -14177,9 +15028,13 @@ fn field_equal(emitter: Emitter, f: FieldTy, a: CValue, b: CValue) -> WithValue 
     },
   }
 
-/// How `compare` orders two values in C: a type one ordered by its name, or a record field by field
-/// in the order its names sort, each field of such a type.
-type Ordered = | ONamed(Bytes) | OFields({ fields: List<FieldTy>, names: List<Bytes> })
+/// How `compare` orders two values in C: a type one ordered by its name, a record field by field in
+/// the order its names sort, each field of such a type, or a container through the roots written
+/// for its type.
+type Ordered =
+  | ONamed(Bytes)
+  | OFields({ fields: List<FieldTy>, names: List<Bytes> })
+  | OWalked(Type)
 
 /// How `compare` orders two values of the type the checker settled its reference at `at` at, where
 /// C orders them: a number, a character, a string or byte string by its bytes, a sum a module
@@ -14192,7 +15047,7 @@ fn ordered_at(emitter: Emitter, at: Span) -> Option<Ordered> =
         None -> match ty {
           TyRecord(fs) -> fields_ordered(emitter, ty, fs),
           TyNominal(x) -> fields_ordered(emitter, ty, x.fields),
-          _ -> None,
+          _ -> if walked_container(ty) || ordered_option(ty) { Some(OWalked(ty)) } else { None },
         },
       },
       None -> None,
@@ -14200,12 +15055,37 @@ fn ordered_at(emitter: Emitter, at: Span) -> Option<Ordered> =
     None -> None,
   }
 
+/// Whether `t` is an `Option` of a type known throughout, which a root written for it orders:
+/// `None` first, then two `Some`s as their payloads order; or a `Result`, as `is_result` says.
+fn ordered_option(t: Type) -> Bool =
+  !has_vars(t)
+    && (match t {
+      TyCon(c) -> (c.name == b"Option" && c.args.len() == 1) || is_result(t),
+      _ -> false,
+    })
+
+/// Whether `t` is a `Result` known throughout, which roots written for it compare and order: an
+/// `Err` before an `Ok`, then two of one constructor as their arguments do.
+fn is_result(t: Type) -> Bool =
+  !has_vars(t) && (match t { TyCon(c) -> c.name == b"Result" && c.args.len() == 2, _ -> false })
+
+/// Whether `t` is a record known throughout whose fields C orders, as a field of a record it orders.
+fn ordered_record(emitter: Emitter, t: Type) -> Bool =
+  rooted_record(Some(t)) && ordered_fields_of(emitter, t) != None
+
 /// A record of type `ty`, of fields `fs`, ordered field by field, where each field's type orders by
-/// its name.
+/// its name or is a container, an `Option`, a `Result` or such a record, named by its spelled type,
+/// which the roots written for it order.
 fn fields_ordered(emitter: Emitter, ty: Type, fs: List<Field>) -> Option<Ordered> =
   match kind_of(ty).ty {
     TyRec(laid) -> {
-      let names = fs.map(|f: Field| ordered_name(emitter, f.ty).unwrap_or(b""));
+      let names = fs.map(|f: Field|
+        match ordered_name(emitter, f.ty) {
+          Some(n) -> n,
+          None -> if walked_container(f.ty) || ordered_option(f.ty)
+              || ordered_record(emitter, f.ty) { spelled_type(f.ty) }
+          else { b"" },
+        });
       if laid.len() == fs.len() && laid.len() > 0 && !names.contains(b"") {
         Some(OFields({ fields: laid, names: names }))
       } else { None }
@@ -14217,9 +15097,12 @@ fn fields_ordered(emitter: Emitter, ty: Type, fs: List<Field>) -> Option<Ordered
 /// module declares.
 fn ordered_name(emitter: Emitter, ty: Type) -> Option<Bytes> =
   match ty {
-    TyCon(c) -> if c.args.len() > 0 { None }
+    TyCon(c) -> if generic_sum(emitter.ctors, ty) { Some(spelled_type(ty)) }
+    else if c.args.len() > 0 { None }
     else if c.name == b"Int" || c.name == b"Char" || c.name == b"Decimal" || c.name == b"String"
-        || c.name == b"Bytes" { Some(c.name) }
+        || c.name == b"Bytes"
+        || c.name == b"Bool"
+        || c.name == b"Unit" { Some(c.name) }
     else if c.name.index_of(b".") != None && compared_by_ctors(emitter.ctors, c.name) {
       Some(c.name)
     } else {
@@ -14239,11 +15122,13 @@ fn compared_order(
   t: Option<Ordered>,
   a: CValue,
   b: CValue,
+  at: Span,
 ) -> WithValue / {abort.raise} =
   match t {
     Some(ONamed(n)) -> if n.index_of(b".") != None { sum_ordered(emitter, a, b, n) }
     else { ordering_word(order_of(emitter, n, a, b)) },
-    Some(OFields(r)) -> ordering_word(record_order(emitter, r, a, b)),
+    Some(OFields(r)) -> ordering_word(record_order(emitter, r.fields, r.names, a, b)),
+    Some(OWalked(t)) -> container_called(emitter, b"ordered", t, [a, b], at),
     None -> refused(emitter, b"an order of a type C does not order"),
   }
 
@@ -14278,8 +15163,14 @@ fn order_of(
   a: CValue,
   b: CValue,
 ) -> { emitter: Emitter, expr: Bytes } / {abort.raise} =
-  if name.index_of(b".") != None {
-    let w = sum_ordered(emitter, a, b, name);
+  if name.index_of(b".") != None || spells_whole(name) {
+    // A container's spelled type orders through its root, a sum's name through `T#cmp`.
+    let w = match if spells_whole(name) { type_spelled(name) } else { None } {
+      Some(t) -> if walked_container(t) || ordered_option(t) {
+        container_called(emitter, b"ordered", t, [a, b], dummy_span())
+      } else { sum_ordered(emitter, a, b, name) },
+      None -> sum_ordered(emitter, a, b, name),
+    };
     let tag = |ctor: Bytes|
       match tag_of(w.emitter, ctor) { Some(i) -> tag_text(w.emitter, i), None -> b"0" };
     let o = bind(
@@ -14322,39 +15213,73 @@ fn order_of(
     );
     { emitter: c.emitter, expr: c.value.expr }
   } else if name == b"Char" { signed_order(emitter, as_word(a), as_word(b)) }
-  else if name == b"Int" { signed_order(emitter, as_int(a), as_int(b)) } else {
+  else if name == b"Int" { signed_order(emitter, as_int(a), as_int(b)) }
+  else if name == b"Bool" { signed_order(emitter, as_bool(a), as_bool(b)) }
+  else if name == b"Unit" { { emitter: emitter, expr: b"0" } } else {
     match width_named(name) {
       Some(w) -> signed_order(emitter, as_num(a, w), as_num(b, w)),
       None -> signed_order(emitter, as_int(a), as_int(b)),
     }
   }
 
+/// The names the fields of the record type `t` order by, where C orders each.
+fn ordered_fields_of(emitter: Emitter, t: Type) -> Option<List<Bytes>> =
+  match match t {
+      TyRecord(fs) -> fields_ordered(emitter, t, fs),
+      TyNominal(x) -> fields_ordered(emitter, t, x.fields),
+      _ -> None,
+    } {
+    Some(OFields(r)) -> Some(r.names),
+    _ -> None,
+  }
+
 /// Below zero, zero or above zero as the records `a` and `b` order: by their fields in the order
-/// their names sort, the first that orders them apart deciding.
+/// their names sort, the first that orders them apart deciding; a record held in place in turn.
 fn record_order(
   emitter: Emitter,
-  r: { fields: List<FieldTy>, names: List<Bytes> },
+  fields: List<FieldTy>,
+  names: List<Bytes>,
   a: CValue,
   b: CValue,
 ) -> { emitter: Emitter, expr: Bytes } / {abort.raise} = {
-  let lv = record_values(emitter, a, r.fields);
-  let rv = record_values(lv.emitter, b, r.fields);
+  let lv = record_values(emitter, a, fields);
+  let rv = record_values(lv.emitter, b, fields);
   let o = fresh(rv.emitter);
   let opened = line(o.emitter, Bytes::concat_all([b"int64_t ", o.name, b" = 0;"]));
-  let ordered = range(0, r.fields.len()).fold(opened, |acc: Emitter, k: Int| {
-    let inside = indent(line(acc, Bytes::concat_all([b"if (", o.name, b" == 0) {"])));
-    let f = order_of(inside, nth_bytes(r.names, k), nth_value(lv.vals, k), nth_value(rv.vals, k));
-    line(
-      outdent(
-        release_at(
-          line(f.emitter, Bytes::concat_all([o.name, b" = ", f.expr, b";"])),
-          inside.indent,
+  let ordered = fields.fold(
+    { emitter: opened, k: 0 },
+    |acc: { emitter: Emitter, k: Int }, field: FieldTy| {
+      let k = acc.k;
+      let inside = indent(line(acc.emitter, Bytes::concat_all([b"if (", o.name, b" == 0) {"])));
+      let name = nth_bytes(names, k);
+      let x = nth_value(lv.vals, k);
+      let y = nth_value(rv.vals, k);
+      // A record held in place is ordered field by field where it is, not through its root.
+      let f = match field.ty {
+        TyRec(inner) -> match match type_spelled(name) {
+            Some(t) -> ordered_fields_of(inside, t),
+            None -> None,
+          } {
+          Some(inner_names) -> record_order(inside, inner, inner_names, x, y),
+          None -> order_of(inside, name, x, y),
+        },
+        _ -> order_of(inside, name, x, y),
+      };
+      {
+        emitter: line(
+          outdent(
+            release_at(
+              line(f.emitter, Bytes::concat_all([o.name, b" = ", f.expr, b";"])),
+              inside.indent,
+            ),
+          ),
+          b"}",
         ),
-      ),
-      b"}",
-    )
-  });
-  { emitter: ordered, expr: o.name }
+        k: k + 1,
+      }
+    },
+  );
+  { emitter: ordered.emitter, expr: o.name }
 }
 
 /// The `Ordering` of `l` and `r`, values of the declared sum `t`, as `T#cmp` orders them: the root
@@ -14460,7 +15385,16 @@ fn bytes_equal(x: Bytes, y: Bytes) -> Bytes =
 
 /// Equality is structural, and every other operator is the runtime's own over the words, which a
 /// width past 32 bits, a `Float` and a `Decimal` are.
-fn word_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> Option<WithValue> =
+/// `whole` is the type both are of where the checker spelled it, which says how a container a
+/// record or an `Option` holds is compared.
+fn word_binary(
+  emitter: Emitter,
+  op: Bytes,
+  l: CValue,
+  r: CValue,
+  whole: Option<Type>,
+  at: Span,
+) -> Option<WithValue> / {abort.raise} =
   if (op == b"eq" || op == b"ne") && l.kind == KSum(Zeroed) && r.kind == KSum(Zeroed)
       && compared_fields(l, r) != None {
     // Two `Option`s of a record of known layout: `None` is zero, two `Some`s equal as their
@@ -14494,11 +15428,14 @@ fn word_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> Option<With
       ),
     );
     let fs = match compared_fields(l, r) { Some(x) -> x, None -> [] };
-    let e = records_equal(opened, fs, { kind: KBoxed, expr: a, ty: l.ty }, {
-      kind: KBoxed,
-      expr: b,
-      ty: r.ty,
-    });
+    let e = records_equal(
+      opened,
+      fs,
+      { kind: KBoxed, expr: a, ty: l.ty },
+      { kind: KBoxed, expr: b, ty: r.ty },
+      payload_type(whole),
+      at,
+    );
     let closed = line(
       outdent(
         release_at(
@@ -14521,34 +15458,40 @@ fn word_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> Option<With
     else { bind(lb.emitter, r.kind, r.expr) };
     let a = lb.value.expr;
     let b = rb.value.expr;
-    let e = bind(
-      rb.emitter,
-      KBool,
-      Bytes::concat_all([
-        b"((",
-        a,
-        b" == 0 || ",
-        b,
-        b" == 0) ? (",
-        a,
-        b" == ",
-        b,
-        b") : rt_equal_p(ctx, ",
-        a,
-        b", ",
-        b,
-        b"))",
-      ]),
-    );
-    Some(
-      bind(check(e.emitter), KBool, if op == b"ne" {
-        Bytes::concat_all([b"!(", e.value.expr, b")"])
-      } else { e.value.expr }),
-    )
+    match walked_type(payload_type(whole)) {
+      Some(t) -> {
+        let e = payloads_equal(rb.emitter, a, b, t, at);
+        Some(if op == b"ne" { not_of(e) } else { e })
+      },
+      None -> {
+        let e = bind(
+          rb.emitter,
+          KBool,
+          Bytes::concat_all([
+            b"((",
+            a,
+            b" == 0 || ",
+            b,
+            b" == 0) ? (",
+            a,
+            b" == ",
+            b,
+            b") : ",
+            payload_compared(a, b, payload_type(whole)),
+            b")",
+          ]),
+        );
+        Some(
+          bind(check(e.emitter), KBool, if op == b"ne" {
+            Bytes::concat_all([b"!(", e.value.expr, b")"])
+          } else { e.value.expr }),
+        )
+      },
+    }
   } else if (op == b"eq" || op == b"ne") && compared_fields(l, r) != None {
     match compared_fields(l, r) {
       Some(fs) -> {
-        let e = records_equal(emitter, fs, l, r);
+        let e = records_equal(emitter, fs, l, r, whole, at);
         Some(
           bind(e.emitter, KBool, if op == b"ne" { Bytes::concat_all([b"!(", e.value.expr, b")"]) }
           else { e.value.expr }),
@@ -15446,46 +16389,6 @@ fn laid_scalar(name: Bytes) -> Bool =
   name == b"Int" || name == b"Bool" || name == b"Float" || name == b"Decimal" || name == b"Bytes"
     || width_named(name) != None
 
-/// `ty` as `specialised` spells it: `_`, a type's name and arguments, a record's fields, a `new`
-/// record's name and arguments then its fields, a variable of the spelling body as `'0`, and a
-/// position left unknown as `?`. A function's type is a word's.
-fn spelled_type(ty: Type) -> Bytes =
-  match ty {
-    TyVar(v) -> if v < 0 { b"?" } else { b"'".concat(ascii_of_int(v)) },
-    TyCon(c) -> spelled_named(c.name, c.args),
-    TyRecord(fs) -> spelled_fields(fs),
-    TyNominal(x) -> spelled_named(x.name, x.args).concat(spelled_fields(x.fields)),
-    TyFn(_) -> b"_",
-  }
-
-fn spelled_named(name: Bytes, args: List<Type>) -> Bytes = {
-  let n = if [b",", b"<", b">", b"{", b"}", b":", b"|", b"@", b"?", b"'", b"#", b" "].fold(
-      false,
-      |marked: Bool, d: Bytes| marked || name.index_of(d) != None,
-    ) { Bytes::concat_all([b"\"", name, b"\""]) }
-  else { name };
-  if args.len() == 0 { n }
-  else { Bytes::concat_all([n, b"<", bytes_join(args.map(spelled_type), b","), b">"]) }
-}
-
-/// A byte a type's name is spelled with as it is: a name holding any other, a label's, is spelled
-/// between quotes.
-fn type_name_byte(c: Int) -> Bool = c_ident_byte(c) || c == 46
-
-fn spelled_fields(fs: List<Field>) -> Bytes =
-  Bytes::concat_all([
-    b"{",
-    bytes_join(fs.map(|f: Field| Bytes::concat_all([f.name, b":", spelled_type(f.ty)])), b","),
-    b"}",
-  ])
-
-/// The one type `s` spells, as `spelled_type` spells it.
-pub fn type_spelled(s: Bytes) -> Option<Type> / {abort.raise} =
-  match read_type(s, 0, 2 * s.len() + 2) {
-    Some(r) -> if r.at == s.len() { Some(r.ty) } else { None },
-    None -> None,
-  }
-
 /// Whether `ty` names a type variable anywhere in it.
 pub fn has_vars(ty: Type) -> Bool =
   match ty {
@@ -15502,106 +16405,6 @@ pub fn held_apart(ty: Type) -> Bool =
     TyCon(c) -> c.args.len() == 0 && (kind_of(ty).kind != KBoxed || c.name == b"Char"),
     _ -> false,
   }
-
-/// The types spelled from `at` to the end of `s`, each after a comma; `room` is how many more a
-/// spelling of `s`'s length can hold.
-fn read_types(s: Bytes, at: Int, acc: List<Type>, room: Int) -> Option<List<Type>> / {abort.raise} =
-  if room <= 0 { None } else {
-    match read_type(s, at, 2 * s.len() + 2) {
-      None -> None,
-      Some(r) -> if r.at == s.len() { Some(acc.push(r.ty)) }
-      else if s.at(r.at) == 44 { read_types(s, r.at + 1, acc.push(r.ty), room - 1) }
-      else { None },
-    }
-  }
-
-/// The type spelled at `at`, and where its spelling ends; `room` is how many more reads a spelling
-/// of `s`'s length can nest.
-fn read_type(s: Bytes, at: Int, room: Int) -> Option<{ ty: Type, at: Int }> / {abort.raise} =
-  if room <= 0 || at >= s.len() { None }
-  else if s.at(at) == 63 { Some({ ty: unknown_type(), at: at + 1 }) } else if s.at(at) == 39 {
-    let end = digits_end(s, at + 1);
-    if end == at + 1 { None } else { Some({ ty: TyVar(digits(s.slice(at + 1, end))), at: end }) }
-  } else if s.at(at) == 123 {
-    match read_fields(s, at + 1, [], room - 1) {
-      Some(r) -> Some({ ty: TyRecord(r.fields), at: r.at }),
-      None -> None,
-    }
-  } else {
-    let quoted = s.at(at) == 34;
-    let end = if quoted {
-      match s.slice(at + 1, s.len()).index_of(b"\"") { Some(k) -> at + 2 + k, None -> at }
-    } else { type_name_end(s, at) };
-    let name = if quoted { s.slice(at + 1, end - 1) } else { s.slice(at, end) };
-    if end == at || name.len() == 0 { None } else {
-      match if end < s.len() && s.at(end) == 60 { read_args(s, end + 1, [], room - 1) }
-        else { Some({ args: [], at: end }) } {
-        None -> None,
-        // A `new` record's fields follow its name and arguments.
-        Some(r) -> if r.at < s.len() && s.at(r.at) == 123 {
-          match read_fields(s, r.at + 1, [], room - 1) {
-            Some(f) ->
-              Some({ ty: TyNominal({ name: name, args: r.args, fields: f.fields }), at: f.at }),
-            None -> None,
-          }
-        } else { Some({ ty: TyCon({ name: name, args: r.args }), at: r.at }) },
-      }
-    }
-  }
-
-/// Where the type's name that starts at `at` ends: a program-wide name holds its modules' dots.
-fn type_name_end(s: Bytes, at: Int) -> Int / {abort.raise} =
-  if at < s.len() && type_name_byte(s.at(at)) { type_name_end(s, at + 1) } else { at }
-
-/// The arguments spelled from `at` to the `>` that closes them, and where it ends.
-fn read_args(
-  s: Bytes,
-  at: Int,
-  acc: List<Type>,
-  room: Int,
-) -> Option<{ args: List<Type>, at: Int }> / {abort.raise} =
-  if room <= 0 { None } else {
-    match read_type(s, at, room - 1) {
-      None -> None,
-      Some(r) -> if r.at >= s.len() { None }
-      else if s.at(r.at) == 44 { read_args(s, r.at + 1, acc.push(r.ty), room - 1) }
-      else if s.at(r.at) == 62 { Some({ args: acc.push(r.ty), at: r.at + 1 }) }
-      else { None },
-    }
-  }
-
-/// The fields spelled from `at` to the `}` that closes them, and where it ends.
-fn read_fields(
-  s: Bytes,
-  at: Int,
-  acc: List<Field>,
-  room: Int,
-) -> Option<{ fields: List<Field>, at: Int }> / {abort.raise} =
-  if room <= 0 { None }
-  else if at < s.len() && s.at(at) == 125 && acc.len() == 0 { Some({ fields: acc, at: at + 1 }) }
-  else {
-    let end = name_end(s, at);
-    if end == at || end >= s.len() || s.at(end) != 58 { None } else {
-      match read_type(s, end + 1, room - 1) {
-        None -> None,
-        Some(r) -> {
-          let fields = acc.push({ name: s.slice(at, end), ty: r.ty });
-          if r.at >= s.len() { None }
-          else if s.at(r.at) == 44 { read_fields(s, r.at + 1, fields, room - 1) }
-          else if s.at(r.at) == 125 { Some({ fields: fields, at: r.at + 1 }) }
-          else { None }
-        },
-      }
-    }
-  }
-
-/// Where the decimal digits that start at `at` end.
-fn digits_end(s: Bytes, at: Int) -> Int / {abort.raise} =
-  if at < s.len() && s.at(at) >= 48 && s.at(at) <= 57 { digits_end(s, at + 1) } else { at }
-
-/// Where the name that starts at `at` ends.
-fn name_end(s: Bytes, at: Int) -> Int / {abort.raise} =
-  if at < s.len() && c_ident_byte(s.at(at)) { name_end(s, at + 1) } else { at }
 
 /// `ty`, in a definition's numbering, with each variable a specialisation settles read as the layout
 /// it is at; one it leaves unknown stays a variable.
@@ -15633,10 +16436,6 @@ fn numeric_named(ty: Type) -> Option<Bytes> =
     TyCon(c) -> match kind_of(ty).kind { KBoxed -> None, KBool -> None, _ -> Some(c.name) },
     _ -> None,
   }
-
-/// The number decimal digits `b` spell.
-pub fn digits(b: Bytes) -> Int =
-  range(0, b.len()).fold(0, |acc: Int, i: Int| acc * 10 + b.at(i) - 48)
 
 fn def_named(defs: List<Def>, name: Bytes) -> Option<Def> =
   defs.fold(None, |acc: Option<Def>, d: Def| if d.name == name { Some(d) } else { acc })
@@ -15890,7 +16689,7 @@ fn definition_at(
   schemes: Map<Bytes, Scheme>,
   ops: List<WitnessOp>,
   operands: Map<Bytes, Bytes>,
-) -> { body: Expr, operands: Map<Bytes, Bytes>, sig: Option<Sig> } = {
+) -> { body: Expr, operands: Map<Bytes, Bytes>, sig: Option<Sig> } / {abort.raise} = {
   let scheme = schemes.get(full);
   let numbering = match scheme { Some(sc) -> generics_numbered(def, sc), None -> Map::new() };
   // The type a witnessed parameter is at, where its argument is held as one numeric type alone.
@@ -15903,11 +16702,12 @@ fn definition_at(
     if numeric(param) == None { acc } else { acc.insert(witness_param(param), true) });
   // An operand the checker filed at a variable of the definition is read as the type it is at.
   let at_args = operands.fold(operands, |acc: Map<Bytes, Bytes>, k: Bytes, name: Bytes|
-    if name.len() < 2 || name.at(0) != 39 { acc } else {
-      match args.at(digits(name.slice(1, name.len()))) {
-        Some(t) -> if held_apart(t) || (!has_vars(t) && compared_name(t).len() > 1) {
-          match t { TyCon(c) -> acc.insert(k, c.name), _ -> acc }
-        } else { acc },
+    if name.index_of(b"'") == None { acc } else {
+      match type_spelled(name) {
+        Some(t) -> match operand_spelled(substituted(t, args)) {
+          Some(n) -> acc.insert(k, n),
+          None -> acc,
+        },
         None -> acc,
       }
     });
@@ -18030,7 +18830,7 @@ test "an Option is its payload's word in the code that knows it, and its object 
     false,
     false,
   ]);
-  assert_eq(has(b"rt_equal_p"), [false, false, false, false, false, true, false, false, false]);
+  assert_eq(has(b"rt_equal_p"), [false, false, false, false, false, false, false, false, false]);
   assert_eq(has(b"rt_list_lookup_p"), [
     false,
     true,
@@ -18112,9 +18912,8 @@ test "records of a known type are compared field by field, not by the runtime" {
   let out = emit_all_program([{ name: b"m", src: src }], [b"Some", b"None"], [], true);
   let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None]);
-  // Scalars and a `Decimal` in C; an `Option`'s payloads by the runtime only where both are `Some`
-  // and the payload's layout is not known.
-  assert_eq(has(b"rt_equal_p"), [false, false, true, false]);
+  // Scalars and a `Decimal` in C, and an `Option`'s payloads at their type where both are `Some`.
+  assert_eq(has(b"rt_equal_p"), [false, false, false, false]);
   assert_eq(has(b"rt_decimal_compare_p"), [true, true, false, true]);
   assert_eq(has(b" == 0 || "), [false, false, true, true])
 }
@@ -18511,16 +19310,140 @@ test "an array of options holds each as its payload's word, and a generic one is
   assert(body(b"m.filled@Int").text.index_of(b"rt_alloc_p(ctx, 15, ") != None, None)
 }
 
+test "a list, an array or a map is compared and digested by roots written for its type" {
+  let src = Bytes::concat_all([
+    b"type Rec = { name: String, tags: List<Int> }\n",
+    b"fn same(a: List<Int>, b: List<Int>) -> Bool = a == b\n",
+    b"fn other(a: Array<String>, b: Array<String>) -> Bool = a != b\n",
+    b"fn alike(a: Map<Int, List<Int>>, b: Map<Int, List<Int>>) -> Bool = a == b\n",
+    b"fn order(a: List<List<Int>>, b: List<List<Int>>) -> Ordering = compare(a, b)\n",
+    b"fn held(a: Option<List<Int>>, b: Option<List<Int>>) -> Bool = a == b\n",
+    b"fn fields(a: Rec, b: Rec) -> Bool = a == b\n",
+    b"fn eq<a>(x: a, y: a) -> Bool = x == y\n",
+    b"fn hashed(a: List<Int>) -> Bytes = digest(a)\n",
+    b"fn some_int(a: Option<Int>, b: Option<Int>) -> Bool = a == b\n",
+    b"fn some_text(a: Option<String>, b: Option<String>) -> Bool = a == b\n",
+    b"type Tree<a> = | Leaf(a) | Node(List<Tree<a>>)\n",
+    b"fn trees(a: Tree<Int>, b: Tree<Int>) -> Bool = a == b\n",
+    b"fn ranked(a: { o: Option<Int>, p: Rec }, b: { o: Option<Int>, p: Rec }) -> Ordering = compare(a, b)\n",
+  ]);
+  let ints = TyCon({ name: b"List", args: [int_type()] });
+  let lists = TyCon({ name: b"List", args: [ints] });
+  let map = TyCon({ name: b"Map", args: [int_type(), ints] });
+  let entries = TyCon({
+    name: b"List",
+    args: [TyRecord([{ name: b"key", ty: int_type() }, { name: b"value", ty: ints }])],
+  });
+  let texts = TyCon({ name: b"Array", args: [string_type()] });
+  let trees = TyCon({ name: b"List", args: [TyCon({ name: b"m.Tree", args: [int_type()] })] });
+  let written = |op: Bytes, t: Type| written_root(b"m", op, t);
+  let roots = [
+    b"m.same",
+    b"m.other",
+    b"m.alike",
+    b"m.order",
+    b"m.held",
+    b"m.fields",
+    specialised(b"m.eq", [ints]),
+    b"m.hashed",
+    written(b"equal_from", ints),
+    written(b"equal", map),
+    written(b"equal_from", entries),
+    written(b"ordered_from", lists),
+    written(b"digest", ints),
+    written(b"digest_from", ints),
+    b"m.trees",
+    b"m.Tree<Int>#eq",
+    b"m.some_int",
+    b"m.some_text",
+    written(b"equal_from", texts),
+    b"m.ranked",
+    written(b"equal", trees),
+    written(b"equal_from", trees),
+  ];
+  let ctors = [b"Less", b"Equal", b"Greater", b"Some", b"None", b"m.Leaf", b"m.Node"];
+  let answers = answers_of([b"m"], [src], ctors, roots);
+  let body = |name: Bytes|
+    match answers.find(|a: RootAnswer| a.name == name) {
+      Some(a) -> match a.answer {
+        Body(b) -> b,
+        Refused(r) -> panic(String::of_bytes_lossy(Bytes::concat_all([name, b": ", r.why]))),
+      },
+      None -> panic("no answer"),
+    };
+  let written_called = |name: Bytes|
+    body(name).tables.calls.filter(|c: Bytes| c.index_of(b"#") != None && c != name);
+  assert_eq(roots.map(written_called), [
+    [written(b"equal", ints)],
+    [written(b"equal", texts)],
+    [written(b"equal", map)],
+    [written(b"ordered", lists)],
+    [written(b"equal", ints)],
+    [written(b"equal", ints)],
+    [written(b"equal", ints)],
+    [written(b"digest", ints)],
+    [],
+    [written(b"equal_from", entries)],
+    [written(b"equal", ints)],
+    [written(b"ordered", ints)],
+    [written(b"digest_from", ints)],
+    [],
+    [b"m.Tree<Int>#eq"],
+    [
+      written(
+        b"equal",
+        TyCon({ name: b"List", args: [TyCon({ name: b"m.Tree", args: [int_type()] })] }),
+      ),
+    ],
+    [],
+    [],
+    [],
+    [
+      written(b"ordered", TyCon({ name: b"Option", args: [int_type()] })),
+      written(b"ordered", ints),
+    ],
+    [written(b"equal_from", trees)],
+    [b"m.Tree<Int>#eq"],
+  ]);
+  // An array is read by the inline `Array::get`, not the prelude's `Array::at`.
+  assert_eq(
+    body(written(b"equal_from", texts)).tables.calls.filter(|c: Bytes|
+      c.index_of(b"Array::at") != None),
+    [],
+  );
+  // Nothing is handed to the runtime to compare, and a walk is a loop.
+  assert_eq(
+    roots.filter(|n: Bytes|
+      own_code(body(n).text).index_of(b"rt_equal_p") != None
+        || own_code(body(n).text).index_of(b"builtin_compare") != None),
+    [],
+  );
+  assert_eq(
+    [
+      written(b"equal_from", ints),
+      written(b"equal_from", entries),
+      written(b"ordered_from", lists),
+      written(b"digest_from", ints),
+      written(b"equal_from", texts),
+    ].filter(|n: Bytes| own_code(body(n).text).index_of(b"goto ply_loop") == None),
+    [],
+  )
+}
+
 test "strings and byte strings are compared by their bytes where they lie" {
   let src = Bytes::concat_all([
     b"fn same(a: String, b: String) -> Bool = a == b\n",
     b"fn other(a: Bytes, b: Bytes) -> Bool = a != b\n",
+    b"fn named(b: Bytes) -> Int = match b { b\"List\" -> 1, b\"Map\" -> 2, _ -> 0 }\n",
+    b"fn worded(s: String) -> Int = match s { \"x\" -> 1, _ -> 0 }\n",
+    b"fn lettered(c: Char) -> Int = match c { 'a' -> 1, _ -> 0 }\n",
   ]);
   let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
   let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
-  assert_eq(out.map(|e: Emitted| e.why), [None, None]);
-  assert_eq(has(b"rt_equal_p"), [false, false]);
-  assert_eq(has(b"memcmp(ply_bytes("), [true, true])
+  assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None, None]);
+  // A literal pattern compares as `==` at its type does.
+  assert_eq(has(b"rt_equal_p"), [false, false, false, false, false]);
+  assert_eq(has(b"memcmp(ply_bytes("), [true, true, true, true, false])
 }
 
 test "a record holds an Option as its payload's word" {
@@ -18669,9 +19592,9 @@ test "compare at a number, a character or a string orders in C and answers its c
   );
   let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None]);
-  // Only a list, which the runtime orders, is handed to it; the rest answer the constructor the
-  // order names, a word no count holds.
-  assert_eq(has(b"builtin_compare"), [false, false, false, true]);
+  // None is handed to the runtime: a list is ordered by the prelude's function at its items' type,
+  // and the rest answer the constructor the order names, a word no count holds.
+  assert_eq(has(b"builtin_compare"), [false, false, false, false]);
   assert_eq(has(b"rt_ctor_value_p(ctx, "), [true, true, true, false]);
   assert_eq(has(b"memcmp(ply_bytes("), [true, false, true, false])
 }
@@ -19436,6 +20359,26 @@ test "a shipped module's extern is called as the builtin of its own name" {
   }
 }
 
+test "a list, an array or a map read matched as `Some` or `None` is answered in place by its lookup" {
+  let src = Bytes::concat_all([
+    b"fn listed(xs: List<Int>, i: Int) -> Int = match xs.at(i) { Some(v) -> v, None -> 0 }\n",
+    b"fn arrayed(xs: Array<Int>, i: Int) -> Int = match xs.at(i) { Some(v) -> v, None -> 0 }\n",
+    b"fn mapped(xs: Map<Int, Int>, k: Int) -> Int = match xs.get(k) { Some(v) -> v, None -> 0 }\n",
+  ]);
+  let out = emit_all_program(
+    [{ name: b"m", src: src }],
+    [b"Some", b"None"],
+    [b"List::at", b"Array::at", b"Map::get"],
+    true,
+  );
+  assert_eq(out.map(|e: Emitted| e.why), [None, None, None]);
+  let calls = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
+  assert_eq(calls(b"rt_list_lookup_p"), [true, false, false]);
+  assert_eq(calls(b"rt_array_lookup_p"), [false, true, false]);
+  assert_eq(calls(b"rt_map_lookup_p"), [false, false, true]);
+  assert_eq(calls(b"rt_ctor_p"), [false, false, false])
+}
+
 /// The roots `wanted` names as the emitter answers them over what the front end read of the program.
 fn answers_of(
   names: List<Bytes>,
@@ -19458,6 +20401,10 @@ fn answers_of(
       b"Array::new",
       b"Array::set",
       b"Array::of_list",
+      b"List::push",
+      b"Map::len",
+      b"Map::entries",
+      b"Bytes::slice",
     ],
     wanted,
     [],
@@ -20832,14 +21779,49 @@ fn emit_module(
       IType(t) -> {
         let named = qualify(module, t.name.name);
         let asked = |root: Bytes| match wanted { Some(w) -> w.contains(root), None -> false };
+        // At its own name, and at each list of arguments a body asked for one at.
+        let at_types = match wanted {
+          Some(w) ->
+            w.keys().fold(
+              [],
+              |acc2: List<{ root: Bytes, eq: Bool, args: List<Type> }>, n: Bytes|
+                if !n.starts_with(named.concat(b"<")) { acc2 } else {
+                  let eq = n.ends_with(b"#eq");
+                  if !eq && !n.ends_with(b"#cmp") { acc2 } else {
+                    match type_spelled(n.slice(0, n.len() - (if eq { 3 } else { 4 }))) {
+                      Some(TyCon(c)) -> acc2.push({ root: n, eq: eq, args: c.args }),
+                      _ -> acc2,
+                    }
+                  }
+                },
+            ),
+          None -> [],
+        };
         match ctors.sums.get(named) {
           None -> acc,
-          Some(cs) ->
+          Some(declared) ->
             [
-              { root: equality_root(named), asked: asked(equality_root(named)), eq: true },
-              { root: ordering_root(named), asked: asked(ordering_root(named)), eq: false },
-            ].fold(acc, |a2: Walk, d: { root: Bytes, asked: Bool, eq: Bool }|
+              {
+                root: equality_root(named),
+                asked: asked(equality_root(named)),
+                eq: true,
+                args: [],
+              },
+              {
+                root: ordering_root(named),
+                asked: asked(ordering_root(named)),
+                eq: false,
+                args: [],
+              },
+            ].concat(
+              at_types.map(|x: { root: Bytes, eq: Bool, args: List<Type> }|
+                { root: x.root, asked: true, eq: x.eq, args: x.args }),
+            ).fold(acc, |a2: Walk, d: { root: Bytes, asked: Bool, eq: Bool, args: List<Type> }|
               if !d.asked { a2 } else {
+                let cs = if d.args.len() == 0 { declared } else {
+                  declared.map(|c: SumCtor|
+                    { ..c, fields: c.fields.map(|f: Type| at_args(f, c.params, d.args)) })
+                };
                 let e = if d.eq { equality_code(cs) } else { ordering_code(cs) };
                 let word = |n: Bytes|
                   {
@@ -20891,31 +21873,72 @@ fn emit_module(
           None -> acc,
         }),
   };
-  written.fold(walked.out, |out: List<Emitted>, r: { root: Bytes, op: Bytes, ty: Type }| {
-    let e = if r.op == b"digest" { digest_code(module, ctors, here, x.module.items, r.ty) }
-    else { reflection_code(module, ctors, here, x.module.items, r.op == b"shown", r.ty) };
-    let held = kind_of(r.ty);
-    let word = reflected_kind(r.ty);
-    out.push(
-      emitted_from(
-        module,
-        0,
-        here,
-        imports,
-        ctors,
-        builtins,
-        effects,
-        release,
-        operands,
-        e.typed.fold(typed, |m: Map<Bytes, Typed>, k: Bytes, v: Typed| m.insert(k, v)),
-        r.root,
-        [{ name: b"a", kind: word, ty: held.ty, of: None, carrier: Whole(word), lambda: None }],
-        true,
-        ELit({ span: dummy_span(), lit: LBool(false) }),
-        Some(e.code),
-      ),
-    )
-  })
+  written.fold(walked.out, |out: List<Emitted>, r: { root: Bytes, op: Bytes, ty: Type }|
+    if container_ops().contains(r.op) || walked_container(r.ty) {
+      let e = container_code(module, r.op, r.ty);
+      let word = |n: Bytes|
+        {
+          name: n,
+          kind: KBoxed,
+          ty: kind_of(r.ty).ty,
+          of: Some(r.ty),
+          carrier: Whole(KBoxed),
+          lambda: None,
+        };
+      let index = {
+        name: b"i",
+        kind: KInt,
+        ty: TyOpen([]),
+        of: Some(int_type()),
+        carrier: Whole(KInt),
+        lambda: None,
+      };
+      out.push(
+        emitted_from(
+          module,
+          0,
+          here.concat(e.here),
+          imports,
+          ctors,
+          builtins,
+          effects,
+          release,
+          e.operands.fold(operands, |m: Map<Bytes, Bytes>, k: Bytes, v: Bytes| m.insert(k, v)),
+          e.typed.fold(typed, |m: Map<Bytes, Typed>, k: Bytes, v: Typed| m.insert(k, v)),
+          r.root,
+          if r.op.ends_with(b"_from") { [word(b"a"), word(b"b"), index] }
+          else if r.op == b"equal" || r.op == b"ordered" { [word(b"a"), word(b"b")] }
+          else { [word(b"a")] },
+          true,
+          ELit({ span: dummy_span(), lit: LBool(false) }),
+          Some(e.code),
+        ),
+      )
+    } else {
+      let e = if r.op == b"digest" { digest_code(module, ctors, here, x.module.items, r.ty) }
+      else { reflection_code(module, ctors, here, x.module.items, r.op == b"shown", r.ty) };
+      let held = kind_of(r.ty);
+      let word = reflected_kind(r.ty);
+      out.push(
+        emitted_from(
+          module,
+          0,
+          here,
+          imports,
+          ctors,
+          builtins,
+          effects,
+          release,
+          operands,
+          e.typed.fold(typed, |m: Map<Bytes, Typed>, k: Bytes, v: Typed| m.insert(k, v)),
+          r.root,
+          [{ name: b"a", kind: word, ty: held.ty, of: None, carrier: Whole(word), lambda: None }],
+          true,
+          ELit({ span: dummy_span(), lit: LBool(false) }),
+          Some(e.code),
+        ),
+      )
+    })
 }
 
 /// The builtin a name in code the emitter writes from a type calls: `?` and the builtin's name,

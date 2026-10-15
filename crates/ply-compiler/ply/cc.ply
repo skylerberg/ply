@@ -323,24 +323,41 @@ pub fn objects_kept<[c]>(
   }
 }
 
+/// Why a library was not built: what refused it, or that its code is wider than a direct call reaches
+/// on the machine it is for, which only a linker that lays out veneers links right.
+pub type Unbuilt = | BuildFailed(String) | TooWide
+
+/// What a person is told of why a library was not built.
+pub fn why_unbuilt(u: Unbuilt) -> String =
+  match u {
+    BuildFailed(why) -> why,
+    TooWide -> "the library's code is wider than a direct call reaches",
+  }
+
 /// The library `objects` link into, kept in the cache by what decides it, so a unit linked once opens
-/// from the cache: its path.
+/// from the cache: its path. Where the linker lays out no `veneers`, a library a direct call cannot
+/// span is refused, and the cache keeps the refusal.
 pub fn shared<[c]>(
   t: Toolchain,
   objects: List<String>,
   work: String,
-) -> Result<String, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  veneers: Bool = true,
+) -> Result<String, Unbuilt> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
   let cache = toolchain.cache();
   let library = library_of(t, objects);
-  if toolchain.holds(library) { Ok(cache ++ "/" ++ library) } else {
+  if toolchain.holds(library) { Ok(cache ++ "/" ++ library) }
+  else if !veneers && toolchain.holds(too_wide(library)) { Err(TooWide) } else {
     let made = work ++ "/unit.so";
     match ran[c]([t.support.concat(["-shared", "-o", cache ++ "/" ++ made].concat(objects))]) {
-      Err(why) -> Err(why),
+      Err(why) -> Err(BuildFailed(why)),
       Ok(_) -> match toolchain.held(made) {
-        None -> Err("the C compiler linked no library"),
-        Some(linked) -> if toolchain.written(made, stack_marked(linked))
-            && toolchain.moved(made, library) { Ok(cache ++ "/" ++ library) }
-        else { Err("the library could not be kept in the toolchain's cache") },
+        None -> Err(BuildFailed("the C compiler linked no library")),
+        Some(linked) -> if !veneers && !spanned(linked) {
+          let _ = toolchain.written(too_wide(library), b"");
+          Err(TooWide)
+        } else if toolchain.written(made, stack_marked(linked)) && toolchain.moved(made, library) {
+          Ok(cache ++ "/" ++ library)
+        } else { Err(BuildFailed("the library could not be kept in the toolchain's cache")) },
       },
     }
   }
@@ -349,6 +366,69 @@ pub fn shared<[c]>(
 /// Where the cache keeps the library `objects`, by their paths in it, link into.
 fn library_of(t: Toolchain, objects: List<String>) -> String / {abort.raise} =
   key_of(t, ["-shared", "stack-marked"], objects.map(Bytes::of_string)) ++ ".so"
+
+/// Where the cache keeps word that `library` is too wide to link without veneers.
+fn too_wide(library: String) -> String = library ++ ".wide"
+
+/// How far a direct call reaches on arm64, either way.
+fn branch_reach() -> Int = 134217728
+
+/// The addresses a segment of a library's code is mapped at, `to` past its end.
+type Mapped = { from: Int, to: Int }
+
+/// Where each executable segment of `library` is mapped, where it is a 64-bit little-endian Mach-O
+/// library for arm64.
+fn macho_code(library: Bytes) -> List<Mapped> / {abort.raise} =
+  if library.len() < 32 || !library.starts_with(b"\xCF\xFA\xED\xFE")
+      || le(library, 4, 4) != 0x0100000C { [] } else {
+    range(0, le(library, 16, 4)).fold(
+      { at: 32, code: [] },
+      |s: { at: Int, code: List<Mapped> }, _i: Int|
+        if s.at + 8 > library.len() { s } else {
+          let next = s.at + le(library, s.at + 4, 4);
+          // `LC_SEGMENT_64`, mapped executable.
+          if le(library, s.at, 4) != 0x19 || s.at + 72 > library.len()
+              || le(library, s.at + 60, 4) / 4 % 2 == 0 { { ..s, at: next } } else {
+            let from = le(library, s.at + 24, 8);
+            { at: next, code: s.code.push({ from: from, to: from + le(library, s.at + 32, 8) }) }
+          }
+        },
+    ).code
+  }
+
+/// Where each executable segment of `library` is mapped, where it is a 64-bit little-endian ELF
+/// library for arm64.
+fn elf_code(library: Bytes) -> List<Mapped> / {abort.raise} =
+  if library.len() < 64 || !library.starts_with(b"\x7FELF\x02\x01") || le(library, 18, 2) != 183 {
+    []
+  } else {
+    let at = le(library, 32, 8);
+    let each = le(library, 54, 2);
+    let count = le(library, 56, 2);
+    if each < 56 || at + count * each > library.len() { [] } else {
+      range(0, count).fold([], |code: List<Mapped>, i: Int| {
+        let h = at + i * each;
+        // `PT_LOAD`, mapped executable.
+        if le(library, h, 4) != 1 || le(library, h + 4, 4) % 2 == 0 { code } else {
+          let from = le(library, h + 16, 8);
+          code.push({ from: from, to: from + le(library, h + 40, 8) })
+        }
+      })
+    }
+  }
+
+/// Whether a direct call reaches from any of `library`'s code to any other: 128 MB either way on
+/// arm64, and further on any other machine a unit is built for.
+pub fn spanned(library: Bytes) -> Bool / {abort.raise} = {
+  let code = macho_code(library).concat(elf_code(library));
+  match code.at(0) {
+    None -> true,
+    Some(first) ->
+      code.fold(first.to, |hi: Int, m: Mapped| if m.to > hi { m.to } else { hi })
+        - code.fold(first.from, |lo: Int, m: Mapped| if m.from < lo { m.from } else { lo })
+        <= branch_reach(),
+  }
+}
 
 /// The integer `count` bytes of `b` from `from` hold, least significant first.
 fn le(b: Bytes, from: Int, count: Int) -> Int / {abort.raise} =
@@ -401,14 +481,15 @@ pub fn stack_marked(library: Bytes) -> Bytes / {abort.raise} = {
 pub fn library_flags() -> List<String> = ["-fPIC", "-fno-strict-aliasing"]
 
 /// `text`, a unit's C, compiled by the compiler labelled `c` at `level` with `flags` and linked into a
-/// library the cache keeps: its path, or why it was not built.
+/// library the cache keeps: its path, or why it was not built. `veneers` is [`shared`]'s.
 pub fn library<[c]>(
   level: String,
   flags: List<String>,
   text: Bytes,
-) -> Result<String, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} =
+  veneers: Bool = true,
+) -> Result<String, Unbuilt> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} =
   match compilers.found[c]() {
-    None -> Err("no C compiler is installed to compile the unit with"),
+    None -> Err(BuildFailed("no C compiler is installed to compile the unit with")),
     Some(compiler) -> {
       let t = toolchain_of(compiler, level);
       let parts = split(text);
@@ -420,11 +501,11 @@ pub fn library<[c]>(
       // A unit built before is a library the cache holds, which needs no room to build in.
       if toolchain.holds(made) { Ok(cache ++ "/" ++ made) } else {
         match toolchain.scratch() {
-          None -> Err("the toolchain's cache has no room to compile in"),
+          None -> Err(BuildFailed("the toolchain's cache has no room to compile in")),
           Some(work) -> {
             let built = match objects[c](t, parts, flags, work) {
-              Err(why) -> Err(why),
-              Ok(objects) -> shared[c](t, objects, work),
+              Err(why) -> Err(BuildFailed(why)),
+              Ok(objects) -> shared[c](t, objects, work, veneers),
             };
             toolchain.cleared(work);
             built
@@ -515,10 +596,12 @@ test "an object's key moves with its compiler, its level, its flags and its C" {
   assert(key_of(t, ["-c"], [b"head", b"text2"]) != base)
 }
 
-fn elf_of(headers: Bytes, count: Int) -> Bytes / {abort.raise} =
+fn elf_of(machine: Int, headers: Bytes, count: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     b"\x7FELF\x02\x01",
-    b"\x00".repeat(26),
+    b"\x00".repeat(12),
+    le_of(machine, 2),
+    b"\x00".repeat(12),
     le_of(64, 8),
     b"\x00".repeat(14),
     le_of(56, 2),
@@ -529,7 +612,7 @@ fn elf_of(headers: Bytes, count: Int) -> Bytes / {abort.raise} =
 
 test "a library with no stack header gains one after its end, and one that has it is left alone" {
   let load = le_of(1, 4).concat(b"\x00".repeat(52));
-  let marked = stack_marked(elf_of(load, 1).concat(b"body"));
+  let marked = stack_marked(elf_of(0, load, 1).concat(b"body"));
   assert_eq(marked.len(), 128 + 2 * 56);
   assert_eq(le(marked, 32, 8), 128);
   assert_eq(le(marked, 56, 2), 2);
@@ -547,4 +630,59 @@ test "what is not a 64-bit little-endian ELF file is left as it is" {
   );
   let big_endian = b"\x7FELF\x02\x02".concat(b"\x00".repeat(120));
   assert_eq(stack_marked(big_endian), big_endian)
+}
+
+fn macho_of(cpu: Int, segments: List<Bytes>) -> Bytes / {abort.raise} =
+  Bytes::concat_all(
+    [
+      b"\xCF\xFA\xED\xFE",
+      le_of(cpu, 4),
+      b"\x00".repeat(8),
+      le_of(segments.len(), 4),
+      b"\x00".repeat(12),
+    ].concat(
+      segments,
+    ),
+  )
+
+/// A Mach-O segment mapped `size` bytes from `at`, with `prot` as its initial protection.
+fn segment(prot: Int, at: Int, size: Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    le_of(0x19, 4),
+    le_of(72, 4),
+    b"\x00".repeat(16),
+    le_of(at, 8),
+    le_of(size, 8),
+    b"\x00".repeat(20),
+    le_of(prot, 4),
+    b"\x00".repeat(8),
+  ])
+
+/// An ELF program header loading `size` bytes at `at`, with `flags`.
+fn loaded(flags: Int, at: Int, size: Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    le_of(1, 4),
+    le_of(flags, 4),
+    b"\x00".repeat(8),
+    le_of(at, 8),
+    b"\x00".repeat(16),
+    le_of(size, 8),
+    b"\x00".repeat(8),
+  ])
+
+test "an arm64 Mach-O library is spanned while its code is within a direct call's reach" {
+  let arm64 = 0x0100000C;
+  let data = segment(3, branch_reach(), 3 * branch_reach());
+  assert(spanned(macho_of(arm64, [segment(5, 0, branch_reach()), data])));
+  assert(!spanned(macho_of(arm64, [segment(5, 0, branch_reach() + 1), data])));
+  assert(!spanned(macho_of(arm64, [segment(5, 0, 64), data, segment(5, branch_reach(), 64)])));
+  assert(spanned(macho_of(0x01000007, [segment(5, 0, 2 * branch_reach())])));
+  assert(spanned(macho_of(arm64, [segment(5, 0, 2 * branch_reach())]).slice(0, 80)))
+}
+
+test "an arm64 ELF library is spanned while its code is within a direct call's reach" {
+  let code = |size: Int| loaded(5, 0, size).concat(loaded(6, branch_reach(), 3 * branch_reach()));
+  assert(spanned(elf_of(183, code(branch_reach()), 2)));
+  assert(!spanned(elf_of(183, code(branch_reach() + 1), 2)));
+  assert(spanned(elf_of(62, code(2 * branch_reach()), 2)))
 }
