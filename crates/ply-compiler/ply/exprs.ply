@@ -154,6 +154,9 @@ pub fn slot_args(slots: List<Slot>, args: List<Expr>, named: List<NamedArg>) -> 
 /// it takes, which only that definition's `cost` clauses read.
 pub type Param = {
   name: Ident,
+  /// Written `keep` before a function type: the function may hold the function it is handed past
+  /// the call, where any other parameter of a function type is only called or handed on.
+  keep: Bool,
   ty: Option<TypeExpr>,
   cost: Option<Ident>,
   default: Option<Expr>,
@@ -1207,7 +1210,16 @@ pub fn listing(binder: Ident, ty: TypeExpr, table: Expr, label: Expr, for_span: 
         ELambda({
           span: span_to(expr_span(label), binder.span),
           body: label,
-          params: [{ name: binder, ty: Some(ty), cost: None, default: None, span: binder.span }],
+          params: [
+            {
+              name: binder,
+              keep: false,
+              ty: Some(ty),
+              cost: None,
+              default: None,
+              span: binder.span,
+            },
+          ],
           ret: None,
         }),
       ]),
@@ -1610,7 +1622,8 @@ fn param_inner(
   allow_default: Bool,
 ) -> Result<Parsed<Param>, Parser> / {abort.raise} = {
   let { parser, node: n } = expect_binder(input, parser, b"a parameter name")?;
-  let { parser, node: t } = param_ty(input, parser)?;
+  let { parser, node: typed } = param_ty(input, parser, allow_default)?;
+  let t = typed.ty;
   let { parser, node: c } = param_cost(input, parser, allow_default, t)?;
   let { parser, node: d } = param_default(input, parser, allow_default)?;
   // A refused default is `None`, so the span stops before the `= 1` that was read.
@@ -1621,7 +1634,10 @@ fn param_inner(
       None -> match t { Some(x) -> ty_span(x), None -> n.span },
     },
   };
-  Ok({ parser: parser, node: { name: n, ty: t, cost: c, default: d, span: span_to(n.span, end) } })
+  Ok({
+    parser: parser,
+    node: { name: n, keep: typed.keep, ty: t, cost: c, default: d, span: span_to(n.span, end) },
+  })
 }
 
 /// `cost k` after a `fn` parameter's function type.
@@ -1653,14 +1669,31 @@ fn param_cost(
     }
   }
 
+/// A parameter's type, and whether a `fn`'s parameter (`kept_allowed`) is written `keep`, which only
+/// a function type may be.
 fn param_ty(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<Option<TypeExpr>>, Parser> / {abort.raise} = {
+  kept_allowed: Bool,
+) -> Result<Parsed<{ keep: Bool, ty: Option<TypeExpr> }>, Parser> / {abort.raise} = {
   let co = eat(input, parser, token_colon());
-  if !co.ok { Ok({ parser: co.parser, node: None }) } else {
-    let { parser, node: t } = ty(input, co.parser)?;
-    Ok({ parser: parser, node: Some(t) })
+  if !co.ok { Ok({ parser: co.parser, node: { keep: false, ty: None } }) } else {
+    let keep = kept_allowed && at_ident_text(input, co.parser, b"keep")
+      && token_kind_at(input, co.parser, 1) == token_lparen();
+    let from = if keep { advance(input, co.parser).parser } else { co.parser };
+    let { parser, node: t } = ty(input, from)?;
+    match ((keep, t)) {
+      (true, TFn(_)) -> Ok({ parser: parser, node: { keep: true, ty: Some(t) } }),
+      (true, _) ->
+        Err(
+          error_here(
+            input,
+            parser,
+            b"a function type after `keep`, which may be held past the call",
+          ),
+        ),
+      _ -> Ok({ parser: parser, node: { keep: false, ty: Some(t) } }),
+    }
   }
 }
 
@@ -1693,7 +1726,7 @@ fn param_default(
   }
 
 pub fn no_param() -> Param =
-  { name: no_ident(), ty: None, cost: None, default: None, span: dummy_span() }
+  { name: no_ident(), keep: false, ty: None, cost: None, default: None, span: dummy_span() }
 
 /// `||` is one token: the empty parameter list.
 fn lambda_params(
@@ -2454,6 +2487,7 @@ pub fn dump_param(param: Param) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(param.span, b"prm"),
     dump_ident(param.name),
+    if param.keep { dump_word(b"keep") } else { b"" },
     dump_opt(param.ty, dump_ty),
     match param.cost { Some(k) -> dump_word(b"cost").concat(dump_ident(k)), None -> b"" },
     dump_opt(param.default, dump_expr),
@@ -2766,6 +2800,22 @@ test "a fn parameter of a function type may name its cost, and no other paramete
   assert(dump_fn_param_of(b"n: Int cost k").contains("!E0001"));
   // A lambda's parameter is called where it is written, so it names no cost.
   assert(!dump_param_of(b"g: (Int) -> Int cost k").contains("%cost;"))
+}
+
+test "a fn parameter of a function type may be written `keep`, and no other may" {
+  let kept = dump_fn_param_of(b"g: keep (Int) -> Int");
+  assert(kept.contains("%keep;"), Some(kept));
+  assert(!dump_fn_param_of(b"g: (Int) -> Int").contains("%keep;"));
+  assert(dump_fn_param_of(b"n: keep ()").contains("!E0001"));
+  assert(dump_fn_param_of(b"n: keep (Int)").contains("!E0001"));
+  // Before anything but `(`, `keep` is a type variable's name.
+  let named = dump_fn_param_of(b"n: keep");
+  assert(
+    named.contains(":tvar;") && !named.contains("%keep;") && !named.contains("!E0001"),
+    Some(named),
+  );
+  // A lambda's parameter is called where it is written, so it is never kept.
+  assert(!dump_param_of(b"g: keep (Int) -> Int").contains("%keep;"))
 }
 
 test "a parameter may be written `_`, binding a name the body cannot write" {
