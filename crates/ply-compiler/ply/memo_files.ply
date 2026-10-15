@@ -150,8 +150,8 @@ type Looked = { value: Option<Bytes>, digest: Bytes }
 /// where each longer answer it kept lies; the answers records hold inside them, and for each answer
 /// a row named, a key whose record may hold it; each record read; the longer answers read or kept,
 /// held while they come to no more than a bound, and how many bytes they are; those a segment names
-/// and does not hold; and the pack below the store, whether its records stand as they are, each
-/// record of it read, and those this run found standing.
+/// and does not hold; the answers kept for the rest of the run only; and the pack below the store,
+/// whether its records stand as they are, each record of it read, and those this run found standing.
 type Open = {
   stamp: Bytes,
   own: Map<Bytes, Bool>,
@@ -175,6 +175,7 @@ type Open = {
   held: Map<Bytes, Bytes>,
   holding: Int,
   unread: Map<Bytes, Bool>,
+  transient: Map<Bytes, Bytes>,
   pack: packs::Reading,
   trusted: Bool,
   packed: Map<Bytes, Option<Bytes>>,
@@ -216,6 +217,7 @@ fn opened(m: Manifest, now: Int) -> Open =
     held: Map::new(),
     holding: 0,
     unread: Map::new(),
+    transient: Map::new(),
     pack: packs::none(),
     trusted: false,
     packed: Map::new(),
@@ -1281,50 +1283,58 @@ pub fn kept<a, [r] | e>(
       st = i.open;
       match i.answer {
         Some(a) -> Some(a),
-        None -> match packs::answer_key(digest) {
-          None -> None,
-          Some(name) -> match st.held.get(name) {
-            Some(a) -> Some(a),
-            None -> {
-              let o = st;
-              let lies = match o.answers.get(name) {
-                Some(b) ->
-                  {
-                    open: o,
-                    at: Some({
-                      token: token,
-                      offset: segments::long_at(b, 0),
-                      size: segments::word_at(b, 8),
-                    }),
+        None -> match st.transient.get(digest) {
+          Some(a) -> Some(a),
+          None -> match packs::answer_key(digest) {
+            None -> None,
+            Some(name) -> match st.held.get(name) {
+              Some(a) -> Some(a),
+              None -> {
+                let o = st;
+                let lies = match o.answers.get(name) {
+                  Some(b) ->
+                    {
+                      open: o,
+                      at: Some({
+                        token: token,
+                        offset: segments::long_at(b, 0),
+                        size: segments::word_at(b, 8),
+                      }),
+                    },
+                  None -> if o.unread.contains(name) { { open: o, at: None } }
+                  else { answer_row[r](dir, o, name) },
+                };
+                let found = match lies.at {
+                  Some(at) -> match frame_of[r](dir, token, lies.open, at) {
+                    Some(a) -> { open: lies.open, answer: Some(a) },
+                    None ->
+                      packed_answer(
+                        { ..lies.open, unread: lies.open.unread.insert(name, true) },
+                        digest,
+                      ),
                   },
-                None -> if o.unread.contains(name) { { open: o, at: None } }
-                else { answer_row[r](dir, o, name) },
-              };
-              let found = match lies.at {
-                Some(at) -> match frame_of[r](dir, token, lies.open, at) {
-                  Some(a) -> { open: lies.open, answer: Some(a) },
-                  None ->
-                    packed_answer(
-                      { ..lies.open, unread: lies.open.unread.insert(name, true) },
-                      digest,
-                    ),
-                },
-                None -> packed_answer(lies.open, digest),
-              };
-              st = match found.answer {
-                Some(a) -> holding(found.open, name, a),
-                None -> found.open,
-              };
-              found.answer
+                  None -> packed_answer(lies.open, digest),
+                };
+                st = match found.answer {
+                  Some(a) -> holding(found.open, name, a),
+                  None -> found.open,
+                };
+                found.answer
+              },
             },
           },
         },
       }
     },
-    memo_keep.keep(key, rec, output) -> {
-      st = match kept_inline(output) {
-        Some(a) -> keeping(st, key, rec, Some(a), None),
-        None -> keeping(st, key, rec, None, Some(output)),
+    memo_keep.keep(key, rec, output, lasting) -> {
+      st = if !lasting {
+        let o = keeping(st, key, rec, None, None);
+        { ..o, transient: o.transient.insert(rec.output, output) }
+      } else {
+        match kept_inline(output) {
+          Some(a) -> keeping(st, key, rec, Some(a), None),
+          None -> keeping(st, key, rec, None, Some(output)),
+        }
       };
     },
     // An answer its record holds is held by the record kept again.
@@ -1588,53 +1598,99 @@ pub fn packed<[r]>(
 }
 
 /// What the store in `dir` holds: its records, the longer answers it keeps and their bytes, the
-/// bytes of those no record names, which compaction reclaims, and the segments it is and their
-/// bytes.
+/// bytes of those no record names, the records of queries other than the running `ply`'s and the
+/// bytes a compaction under its queries drops, and the segments it is and their bytes.
 pub type Usage = {
   records: Int,
   answers: Int,
   answer_bytes: Int,
   unread_bytes: Int,
+  foreign: Int,
+  reclaimable_bytes: Int,
   segments: Int,
   bytes: Int,
 }
 
-pub fn usage<[r]>(dir: String) -> Usage / {fs.read[r], abort.raise} = {
+/// What a key's newest row says: the answer its record names and that record's query; and the size
+/// of the newest frame that brought it a record.
+type Newest = { answer: Bytes, query: Bytes, frame: Int }
+
+/// [`Usage`] of the store in `dir`, where `queries`, each a query's hash, are what the running `ply`
+/// answers under.
+pub fn usage<[r]>(dir: String, queries: List<Bytes>) -> Usage / {fs.read[r], abort.raise} = {
   let m = segments::manifest[r](dir, shapes());
-  let over = |table: Int, width: Int, each: (Map<Bytes, Bytes>, Bytes) -> Map<Bytes, Bytes> / {abort.raise}|
-    m.segments.fold(Map::new(), |acc: Map<Bytes, Bytes>, seg: Segment|
-      match segments::rows[r](dir, seg, table) {
-        None -> acc,
-        Some(rows) ->
-          range(0, rows.len() / width).fold(acc, |into: Map<Bytes, Bytes>, i: Int|
-            each(into, rows.slice(i * width, (i + 1) * width))),
-      });
-  // Each key's answer as its newest row names it, and each longer answer's length.
-  let named = over(records_table(), record_width(), |acc: Map<Bytes, Bytes>, row: Bytes|
-    acc.insert(row.slice(0, 32), row.slice(56, 88)));
-  let lengths = over(answers_table(), placed_width(), |acc: Map<Bytes, Bytes>, row: Bytes|
-    acc.insert(row.slice(0, 32), row.slice(40, 44)));
-  let read = named.fold(Map::new(), |acc: Map<Bytes, Bool>, _: Bytes, answer: Bytes|
-    acc.insert(answer, true));
-  lengths.fold(
-    {
-      records: named.len(),
-      answers: 0,
-      answer_bytes: 0,
-      unread_bytes: 0,
-      segments: m.segments.len(),
-      bytes: m.segments.fold(0, |n: Int, seg: Segment| n + seg.size),
-    },
-    |u: Usage, name: Bytes, length: Bytes| {
-      let n = segments::word_at(length, 0);
+  let current = queries.fold(Map::new(), |acc: Map<Bytes, Bool>, q: Bytes|
+    acc.insert(q.blake3(), true));
+  let rows_in = |seg: Segment, table: Int|
+    match segments::rows[r](dir, seg, table) { Some(rows) -> rows, None -> b"" };
+  // Oldest segment first, so a key's newest row is the last laid over it.
+  let read = m.segments.fold(
+    { newest: Map::new(), frames: 0, lengths: Map::new() },
+    |acc: { newest: Map<Bytes, Newest>, frames: Int, lengths: Map<Bytes, Int> }, seg: Segment| {
+      let qs = rows_in(seg, queries_table());
+      let rows = rows_in(seg, records_table());
+      let answers = rows_in(seg, answers_table());
+      let laid = range(0, rows.len() / record_width()).fold(
+        { newest: acc.newest, frames: acc.frames },
+        |x: { newest: Map<Bytes, Newest>, frames: Int }, i: Int| {
+          let b = rows.slice(i * record_width(), (i + 1) * record_width());
+          let row = row_from(b);
+          let was = match x.newest.get(b.slice(0, 32)) { Some(n) -> n.frame, None -> 0 };
+          {
+            newest: x.newest.insert(b.slice(0, 32), {
+              answer: row.answer,
+              query: query_in(qs, row.query).query,
+              frame: if row.brought { row.size } else { was },
+            }),
+            frames: x.frames + (if row.brought { row.size } else { 0 }),
+          }
+        },
+      );
       {
-        ..u,
-        answers: u.answers + 1,
-        answer_bytes: u.answer_bytes + n,
-        unread_bytes: if read.contains(name) { u.unread_bytes } else { u.unread_bytes + n },
+        newest: laid.newest,
+        frames: laid.frames,
+        lengths: range(0, answers.len() / placed_width()).fold(
+          acc.lengths,
+          |l: Map<Bytes, Int>, i: Int| {
+            let b = answers.slice(i * placed_width(), (i + 1) * placed_width());
+            l.insert(b.slice(0, 32), segments::word_at(b, 40))
+          },
+        ),
       }
     },
-  )
+  );
+  let kept = read.newest.fold(
+    { answers: Map::new(), named: Map::new(), frames: 0, foreign: 0 },
+    |acc: { answers: Map<Bytes, Bool>, named: Map<Bytes, Bool>, frames: Int, foreign: Int }, _: Bytes, n: Newest|
+      if current.contains(n.query) {
+        {
+          ..acc,
+          answers: acc.answers.insert(n.answer, true),
+          named: acc.named.insert(n.answer, true),
+          frames: acc.frames + n.frame,
+        }
+      } else { { ..acc, named: acc.named.insert(n.answer, true), foreign: acc.foreign + 1 } },
+  );
+  let answers = read.lengths.fold(
+    { count: 0, bytes: 0, unread: 0, dropped: 0 },
+    |u: { count: Int, bytes: Int, unread: Int, dropped: Int }, name: Bytes, n: Int|
+      {
+        count: u.count + 1,
+        bytes: u.bytes + n,
+        unread: if kept.named.contains(name) { u.unread } else { u.unread + n },
+        dropped: if kept.answers.contains(name) { u.dropped } else { u.dropped + n },
+      },
+  );
+  {
+    records: read.newest.len(),
+    answers: answers.count,
+    answer_bytes: answers.bytes,
+    unread_bytes: answers.unread,
+    foreign: kept.foreign,
+    reclaimable_bytes: answers.dropped + read.frames - kept.frames,
+    segments: m.segments.len(),
+    bytes: m.segments.fold(0, |n: Int, seg: Segment| n + seg.size),
+  }
 }
 
 /// The store in `dir` written again as one segment that keeps only the records of `queries`, each
@@ -1672,10 +1728,10 @@ fn quoted(input: Bytes) -> Bytes / {memo.read} =
 
 /// The queries of the tests, and one nothing asks, whose hash alone tells two stamps apart.
 fn test_queries(spare: Bytes) -> Map<Bytes, memo::Query<| {}>> =
-  Map::new().insert(b"text", { name: b"text", hash: b"t1", body: text_of }).insert(
+  Map::new().insert(b"text", { name: b"text", hash: b"t1", body: text_of, kept: true }).insert(
     b"quoted",
-    { name: b"quoted", hash: b"q1", body: quoted },
-  ).insert(b"spare", { name: b"spare", hash: spare, body: text_of })
+    { name: b"quoted", hash: b"q1", body: quoted, kept: true },
+  ).insert(b"spare", { name: b"spare", hash: spare, body: text_of, kept: true })
 
 /// What `quoted` answers over the store in `s` for a file holding `text`, asked by a run whose
 /// queries hash `spare` among them, and how many bodies ran.
@@ -1692,6 +1748,25 @@ fn quoted_under<[r]>(
 
 fn quoted_over<[r]>(text: Bytes) -> Bytes / {fs.read[r], fs.write[r], abort.raise} =
   quoted_under[r](text, b"").output
+
+/// What `name` answers over the store in `s` for a file holding `text`, the query `text` keeping its
+/// answers where `lasting` says, and how many bodies ran.
+fn asked_keeping<[r]>(
+  text: Bytes,
+  name: Bytes,
+  lasting: Bool,
+) -> { output: Bytes, ran: Int } / {fs.read[r], fs.write[r], abort.raise} = {
+  let queries = test_queries(b"").insert(b"text", {
+    name: b"text",
+    hash: b"t1",
+    body: text_of,
+    kept: lasting,
+  });
+  kept[r]("s", packs::no_pack, b"", |_: Bytes, _: Bytes| Some(text), || {
+    let a = answer(queries, started(queries), name, b"a");
+    { output: a.output, ran: memo::ran_total(a.run) }
+  })
+}
 
 /// What the directory of the tests' store holds.
 fn stored(tree: fs::MemFs) -> List<String> / {abort.raise} =
@@ -1853,9 +1928,21 @@ fn quoted_tagged<[r]>(tag: Bytes) -> Int / {fs.read[r], fs.write[r], abort.raise
     name: b"text",
     hash: b"t".concat(tag),
     body: text_of,
-  }).insert(b"quoted", { name: b"quoted", hash: b"q".concat(tag), body: quoted });
+    kept: true,
+  }).insert(b"quoted", { name: b"quoted", hash: b"q".concat(tag), body: quoted, kept: true });
   kept[r]("s", packs::no_pack, b"", |_: Bytes, _: Bytes| Some(b"four"), ||
     memo::ran_total(answer(queries, started(queries), b"quoted", b"a").run))
+}
+
+test "what a store holds of another `ply`'s queries is counted as what a compaction reclaims" {
+  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_tagged[abs](b"a"));
+  let own = fs::on_mem[abs](first.tree, || usage[abs]("s", [b"ta", b"qa"])).value;
+  let other = fs::on_mem[abs](first.tree, || usage[abs]("s", [b"tb", b"qb"])).value;
+  assert_eq([own.records, own.foreign, own.reclaimable_bytes], [2, 0, 0]);
+  assert_eq([other.records, other.foreign], [2, 2]);
+  assert(other.reclaimable_bytes > 0);
+  let compacted = fs::on_mem[abs](first.tree, || compacted[abs]("s", [b"tb", b"qb"]));
+  assert_eq(fs::on_mem[abs](compacted.tree, || usage[abs]("s", [b"tb", b"qb"])).value.records, 0)
 }
 
 test "a store several `ply`s keep holds the one writing and as much again of the latest others" {
@@ -1896,6 +1983,21 @@ test "a longer answer is kept once, and one that does not read costs its body on
   assert_eq(torn.value.output, Bytes::concat_all([b"\"", long, b"\""]));
   assert_eq(torn.value.ran, 2);
   assert_eq(fs::on_mem[abs](torn.tree, || quoted_under[abs](long, b"")).value.ran, 0)
+}
+
+test "a query that keeps no answers writes none, and a later run that needs one answers it again" {
+  let long = b"long ".repeat(1000);
+  let first = fs::on_mem[abs](fs::mem_of([]), || asked_keeping[abs](long, b"quoted", false));
+  assert_eq(first.value.ran, 2);
+  let name = match segments_in(first.tree) { [name] -> "s/" ++ name, _ -> "" };
+  let bytes = match fs::mem_read(first.tree, name) { Some(b) -> b, None -> b"" };
+  // Only the quoted answer holds the text.
+  assert(bytes.len() > 5000 && bytes.len() < 10000);
+  let again = fs::on_mem[abs](first.tree, || asked_keeping[abs](long, b"quoted", false));
+  assert_eq(again.value.ran, 0);
+  let text = fs::on_mem[abs](again.tree, || asked_keeping[abs](long, b"text", false));
+  assert_eq(text.value.output, long);
+  assert_eq(text.value.ran, 1)
 }
 
 test "each longer answer is found again once a store is written again as one segment" {

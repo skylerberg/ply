@@ -3492,12 +3492,15 @@ beside the phases of this run, all of it read.
 
 Where a load ran, the `--json` documents of `ply check`, `ply test` and
 `ply prove` also say under `front_end` what the memo store gave it: `queries`,
-each query the load asked with the answers it took as kept (`taken`) and the
-bodies it ran (`run`); `vouched`, whether the store held, when the load opened
-it, a record it vouches for to this `ply`; and `lost`, how many answers the load
-made again because a record that stood named one no store held, which is none
-over a store that is whole. A load that refused says the same: refusing can
-cost as much as checking.
+each query the load asked with the answers it took as kept (`taken`), the
+bodies it ran (`run`), and of those the answers it made again because a record
+that stood named one no store held (`lost`), counting the run that settled the
+store to see whether an earlier answer stood; `vouched`, whether the store held,
+when the load opened it, a record it vouches for to this `ply`; and `lost`, those
+answers over every query, which is none over a store that is whole. Some queries
+keep only their answers' digests: a load that needs one of their answers runs
+its body again, which counts as run and not as lost. A load that refused says
+the same: refusing can cost as much as checking.
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
