@@ -60,6 +60,15 @@ fn the_oldest_entries_go_until_the_rest_fits() {
 }
 
 #[test]
+fn a_file_at_any_depth_is_swept() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = ["src/a.c", "programs/b", "work/1-2-0/c.o", "obj/d.o"];
+    stock(dir.path(), &names, 100);
+    assert_eq!(sweep(dir.path(), 100), 300);
+    assert_eq!(present(dir.path(), &names), ["obj/d.o"]);
+}
+
+#[test]
 fn an_object_is_as_removable_as_an_answer() {
     let dir = tempfile::tempdir().unwrap();
     let names = ["old.dylib", "obj/older.o", "bodies/new"];
