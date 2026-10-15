@@ -17,6 +17,8 @@ import typing (unknown_type)
 import diagnostics (parse_all)
 import infer (dump_flag, Extern, prelude_externs, externs_in)
 import rewrite (Elaborated, elaborated_natives)
+import layout (Intrinsic, Layouts, intrinsics, layouts)
+import std.prelude_source
 import interface (read_key, sized, stubbed)
 import embed (EmbedAt)
 import resolve (PackageDeps, Diag, Label, error_with_labels)
@@ -43,12 +45,14 @@ pub type Native = { name: Bytes, words: Int, answers: Bool, raises: Bool }
 
 /// The runtime a unit is compiled against: the C every unit opens with, through the runtime's
 /// declarations, and closes with, its definitions; the helpers those bind by position; the natives
-/// a body may call; and the digest of the runtime's sources and helper table.
+/// a body may call; how it lays out the objects the emitter writes code over in place; and the
+/// digest of the runtime's sources and helper table.
 pub type Runtime = {
   head: Bytes,
   tail: Bytes,
   helpers: List<Helper>,
   natives: List<Native>,
+  layouts: Layouts,
   identity: Bytes,
 }
 
@@ -2426,7 +2430,7 @@ test "an identity moves with the hash of a root it names, and with no other defi
 }
 
 fn a_runtime(identity: Bytes) -> Runtime =
-  { head: b"", tail: b"", helpers: [], natives: [], identity: identity }
+  { head: b"", tail: b"", helpers: [], natives: [], layouts: layouts(), identity: identity }
 
 fn a_builder(main: Bytes) -> Bytes = Bytes::concat_all([b"build.main ", main, b"\nbuild.told e5\n"])
 
@@ -2538,7 +2542,7 @@ fn codes_over(
 ) -> Map<Bytes, Bytes> / {abort.raise} =
   codes(
     produce(
-      { head: b"", tail: b"", helpers: [], natives: [], identity: b"r" },
+      a_runtime(b"r"),
       [],
       offered.map(|n: Bytes|
         { name: n, arity: 0, constant: constants.filter(|c: Bytes| c == n).len() > 0 }),
@@ -2606,7 +2610,7 @@ test "a cycle is digested whole, whatever order the unit holds its roots in" {
 // A body names a constructor's tag by the constructor, so the same answer serves programs whose
 // tables differ, and each unit writes the position its own table gives.
 test "a constructor's tag is its bucket's to read, at the position the unit's own table gives it" {
-  let runtime = { head: b"", tail: b"", helpers: [], natives: [], identity: b"r" };
+  let runtime = a_runtime(b"r");
   let answer = Body({
     text: b"Word f_m.f(PlyCtx *ctx) { return @@Tm.Line@@ + @@TNone@@; }",
     tables: { ..no_tables(), symbols: [{ symbol: b"f_m.f", entry: b"e_m.f", head: word_head(0) }] },
@@ -2655,13 +2659,7 @@ fn bucket_part(unit: Bytes, id: Int) -> Bytes / {abort.raise} =
   }
 
 test "a bucket's C reads the same whatever another bucket adds to the unit's tables" {
-  let runtime = {
-    head: b"/* head */\n",
-    tail: b"/* --- the runtime --- */\n",
-    helpers: [],
-    natives: [],
-    identity: b"r",
-  };
+  let runtime = { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* --- the runtime --- */\n" };
   let other = range(0, 4096).fold(b"", |found: Bytes, i: Int| {
     let n = b"a.other".concat(ascii_of_int(i));
     if found == b"" && bucket_of(n) != bucket_of(b"m.f") { n } else { found }
@@ -2697,7 +2695,7 @@ test "a bucket holds the bodies its names decide and declares what they reach, a
   let callee = bucket_apart(b"m.callee", [caller]);
   let apart = bucket_apart(b"m.apart", [caller, callee]);
   let p = produce(
-    { head: b"/* head */\n", tail: b"/* tail */\n", helpers: [], natives: [], identity: b"r" },
+    { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* tail */\n" },
     [],
     [
       { name: caller, arity: 0, constant: false },
@@ -2740,7 +2738,7 @@ test "where the head defines `PLY_FAR` a bucket calls what another defines throu
   let caller = b"m.caller";
   let callee = bucket_apart(b"m.callee", [caller]);
   let p = produce(
-    { head: b"/* head */\n", tail: b"/* tail */\n", helpers: [], natives: [], identity: b"r" },
+    { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* tail */\n" },
     [],
     [{ name: caller, arity: 0, constant: false }, { name: callee, arity: 2, constant: false }],
     1,
@@ -2822,7 +2820,7 @@ test "a call written to another head than the callee defines fails the unit" {
   let made = |head: Head|
     try[abort.raise] {
       produce(
-        { head: b"", tail: b"", helpers: [], natives: [], identity: b"r" },
+        a_runtime(b"r"),
         [],
         [{ name: caller, arity: 0, constant: false }, { name: callee, arity: 1, constant: false }],
         1,
@@ -2854,7 +2852,7 @@ test "a constant two bodies read is one entry of the pool" {
       other -> other,
     };
   let p = produce(
-    { head: b"", tail: b"", helpers: [], natives: [], identity: b"r" },
+    a_runtime(b"r"),
     [],
     [{ name: b"m.one", arity: 0, constant: false }, { name: b"m.two", arity: 0, constant: false }],
     1,
@@ -3028,7 +3026,7 @@ test "the emitter answers roots dealt over calls as it answers them in one" {
   let dump = three_modules_dump();
   let p = program_of(dump, three_modules());
   let missed = dump.emitter_roots.map(|r: EmitterRoot| r.root);
-  let runtime = { head: b"", tail: b"", helpers: [], natives: [], identity: b"r" };
+  let runtime = a_runtime(b"r");
   let lists = dealt(p, missed);
   let rows = |answers: List<RootAnswer>|
     answers_of(answers).fold([], |acc: List<RootAnswer>, n: Bytes, a: Answer|
@@ -3050,7 +3048,7 @@ test "a unit holds a `const` definition as the value a build kept, and makes its
   let source = b"const fn table() -> List<Int> = spread(3)\nfn spread(n: Int) -> List<Int> = [n, n + 1]\nfn first() -> Int = match table() { [x, ..] -> x, [] -> 0 }\n";
   let dump = dump_of(analyse(parse_all([{ name: b"m", src: source }])));
   assert_eq(dump.baked.map(|row: { name: Bytes, hash: Bytes }| row.name), [b"m.table"]);
-  let runtime = { head: b"", tail: b"", helpers: [], natives: [], identity: b"r" };
+  let runtime = a_runtime(b"r");
   let unit = |every: List<Bytes>, baked: List<Baked>|
     match emitted(
         runtime,
@@ -3163,7 +3161,7 @@ fn held_over(
     dump,
     every,
     emitted(
-      { head: b"", tail: b"", helpers: [], natives: natives, identity: b"r" },
+      { ..a_runtime(b"r"), natives: natives },
       dump,
       sources,
       every,
@@ -3219,6 +3217,30 @@ test "a unit is refused where the runtime does not implement a native it calls a
   )
 }
 
+test "a unit whose bodies write externs in place asks the runtime for no native of them" {
+  let implemented = declared_natives().map(native_of);
+  let names = implemented.map(|n: Native| n.name);
+  assert_eq(
+    intrinsics().filter(|i: { name: Bytes, op: Intrinsic }|
+      names.contains(i.name.slice(b"std.prelude.".len(), i.name.len()))).len(
+    ),
+    0,
+  );
+  let calls = b"\npub fn pushed(xs: List<Int>) -> List<Int> = ListNode::tail_push(xs, 1)\npub fn emptied(m: Map<Int, Int>) -> Map<Int, Int> = MapNode::map_swap(m, None, 0, 0).map\n";
+  let program = [{ name: b"std.prelude", src: prelude_source::text().concat(calls) }];
+  match held_over(program, [], implemented) {
+    Ok(c) ->
+      assert_eq(
+        [
+          c.index_of(b"rt_list_writable_p(ctx, ") != None,
+          c.index_of(b"rt_map_writable_p(ctx, ") != None,
+        ],
+        [true, true],
+      ),
+    Err(diags) -> assert_eq(diags.map(|d: Diag| d.code), []),
+  }
+}
+
 test "a unit is refused where the runtime implements a shipped module's `extern fn` it calls otherwise" {
   let native = [{ name: b"std.native", src: b"pub extern fn doubled(x: Int) -> Int\n" }];
   let program = [{ name: b"m", src: b"import std.native (doubled)\nfn f() -> Int = doubled(2)\n" }];
@@ -3237,7 +3259,7 @@ test "a root the emitter refuses is asked again, and nothing of the refusal is k
   // The text the emitter reads names a module the program does not hold: the refusal is the
   // program's doing, which nothing the root is filed under says.
   let source = b"import gone (x)\n\npub fn f() -> Int = 1\n";
-  let runtime = { head: b"", tail: b"", helpers: [], natives: [], identity: b"r" };
+  let runtime = a_runtime(b"r");
   kept_bodies(|| {
     let run = ||
       match emitted(
@@ -3262,7 +3284,7 @@ test "a root the emitter refuses is asked again, and nothing of the refusal is k
 
 test "a unit asks the emitter for a root a kept body names, though the body's definition has moved" {
   let lending = b"fn each(n: Int, f: (Int) -> Int, i: Int, acc: Int) -> Int = if i >= n { acc } else { each(n, f, i + 1, acc + f(i)) }\nfn total(n: Int, f: (Int) -> Int) -> Int = each(n, f, 0, 0)\nfn scaled(n: Int, k: Int) -> Int = total(n, |x: Int| x * k)\n";
-  let runtime = { head: b"", tail: b"", helpers: [], natives: [], identity: b"r" };
+  let runtime = a_runtime(b"r");
   kept_bodies(|| {
     let unit = |source: Bytes|
       match emitted(
@@ -3370,11 +3392,10 @@ test "a value is kept under the runtime, the compiler and the hash of all its de
 
 test "a unit takes what its callees let it, resolves its bodies and says what it holds" {
   let runtime = {
+    ..a_runtime(b"r"),
     head: b"/* head */\n",
     tail: b"/* tail */\n",
     helpers: [{ name: b"rt_a", args: 1, answers: true }],
-    natives: [],
-    identity: b"r",
   };
   let answers = Map::new().insert(b"m.f", one_body(b"m.f", [])).insert(
     b"m.g",
@@ -3423,7 +3444,7 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
 test "a unit lays its definitions out by name in byte order, each name as a C literal holds it" {
   let names = [b"m.z", b"m.a#stored", b"m.B"];
   let p = produce(
-    { head: b"", tail: b"", helpers: [], natives: [], identity: b"r" },
+    a_runtime(b"r"),
     [],
     names.map(|n: Bytes| { name: n, arity: 2, constant: false }),
     1,
@@ -3450,7 +3471,7 @@ test "a unit lays its definitions out by name in byte order, each name as a C li
 
 test "a unit says which constructors are read through a function, and which function it lacks" {
   let p = produce(
-    { head: b"/* head */\n", tail: b"/* tail */\n", helpers: [], natives: [], identity: b"r" },
+    { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* tail */\n" },
     [{ name: b"m.Box", arity: 2, args: [] }, { name: b"m.Dot", arity: 0, args: [] }],
     [
       { name: b"m.area", arity: 1, constant: false },
@@ -3467,7 +3488,7 @@ test "a unit says which constructors are read through a function, and which func
   assert(p.text.index_of(b"\"instances 1\\n\"\n\"m.Box m.area !\\n\"") != None, None);
   // A body that names the constructor is not taken without the key its type states.
   let alone = produce(
-    { head: b"", tail: b"", helpers: [], natives: [], identity: b"r" },
+    a_runtime(b"r"),
     [{ name: b"m.Box", arity: 2, args: [] }],
     [{ name: b"m.make", arity: 0, constant: false }],
     1,
@@ -3478,7 +3499,7 @@ test "a unit says which constructors are read through a function, and which func
   assert_eq(alone.dropped.map(|d: Dropped| d.missing), [Some(b"m.area")]);
   // A unit none of whose types states one says nothing of it.
   let plain = produce(
-    { head: b"", tail: b"", helpers: [], natives: [], identity: b"r" },
+    a_runtime(b"r"),
     [],
     [{ name: b"m.f", arity: 0, constant: false }],
     1,

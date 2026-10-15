@@ -14,6 +14,7 @@ pub mod columns;
 pub mod detached;
 pub mod heap;
 pub mod host;
+pub mod laid;
 pub mod list;
 pub mod map;
 pub mod native;

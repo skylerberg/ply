@@ -1,5 +1,5 @@
 use ply_codegen::heap::{self, Heap, KIND_DEAD, Layouts, Word, dec, inc, kind, obj, str_of};
-use ply_codegen::map::{at, for_each_from, get, len, locate, root, to_vec};
+use ply_codegen::map::{at, for_each_from, get, height, len, locate, root, to_vec};
 use ply_eval::Symbol;
 
 fn layouts() -> Layouts {
@@ -27,7 +27,8 @@ fn evens(h: &mut Heap, l: &Layouts, n: i64) -> Word {
 }
 
 /// Every place, and every key's place, is the one the entries in order have: what a branch's
-/// sizes say, checked against a walk that never reads them.
+/// sizes say, checked against a walk that never reads them. The height the map keeps is the depth
+/// of every leaf.
 fn placed(l: &Layouts, m: Word) {
     let all = entries(m);
     assert_eq!(len(obj(m)), all.len());
@@ -37,6 +38,38 @@ fn placed(l: &Layouts, m: Word) {
         assert_eq!((below, found.and_then(heap::as_int)), (i, Some(*v)));
     }
     assert!(at(obj(m), all.len()).is_none());
+    let r = root(obj(m));
+    if r != 0 {
+        let d = depths(r, 0);
+        assert_eq!(d, vec![height(obj(m)); d.len()], "the height the map keeps");
+    } else {
+        assert_eq!(height(obj(m)), 0, "the empty map's height");
+    }
+}
+
+/// The depth of each leaf under `node`, which stands `depth` below the root, in key order.
+fn depths(node: Word, depth: usize) -> Vec<usize> {
+    if kind(node) == heap::KIND_MLEAF {
+        return vec![depth];
+    }
+    (0..unsafe { (*obj(node)).len } as usize)
+        .flat_map(|i| depths(unsafe { heap::word_at(obj(node), i) }, depth + 1))
+        .collect()
+}
+
+#[test]
+fn a_map_built_from_sorted_entries_keeps_its_height() {
+    let mut h = Heap::new();
+    let l = layouts();
+    for n in [0usize, 1, 32, 33, 1024, 1025, 40_000] {
+        let pairs: Vec<(Word, Word)> = (0..n as i64)
+            .map(|i| (heap::imm(i), heap::imm(-i)))
+            .collect();
+        let m = h.map_from_sorted(&pairs);
+        placed(&l, m);
+        dec(m);
+    }
+    h.end();
 }
 
 #[test]

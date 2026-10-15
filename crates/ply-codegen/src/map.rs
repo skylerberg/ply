@@ -4,8 +4,8 @@
 //! cut at one, without comparing or walking what lies beside the path.
 
 use crate::heap::{
-    self, Heap, KIND_MAP, KIND_MBRANCH, KIND_MLEAF, Layouts, Obj, Word, dec, inc, is_unique, obj,
-    set_word, word_at,
+    self, Header, Heap, KIND_MAP, KIND_MBRANCH, KIND_MLEAF, Layouts, Obj, Word, dec, inc,
+    is_unique, obj, set_word, word_at,
 };
 use std::cmp::Ordering;
 
@@ -18,13 +18,29 @@ pub const KEYS: usize = WIDTH + 1;
 pub const SIZES: usize = 2 * KEYS;
 pub const BRANCH_BYTES: usize = 3 * KEYS * 8;
 
+/// A map's own object: its tree's root at this word, zero for none.
+pub const ROOT: usize = 0;
+
+/// The header field of a map's own object that holds its tree's height.
+pub const HEIGHT: Header = Header::Layout;
+
 pub fn root(m: *mut Obj) -> Word {
-    unsafe { word_at(m, 0) }
+    unsafe { word_at(m, ROOT) }
 }
 
 /// The entries a map holds: what `Map::len` answers.
 pub fn len(m: *mut Obj) -> usize {
     unsafe { (*m).len as usize }
+}
+
+/// The levels of branches above a map's leaves, every leaf at that depth: zero while its root is a
+/// leaf, and for the empty map.
+pub fn height(m: *mut Obj) -> usize {
+    unsafe { HEIGHT.of(m) }
+}
+
+fn set_height(m: *mut Obj, height: usize) {
+    unsafe { HEIGHT.set(m, height) }
 }
 
 fn count(node: *mut Obj) -> usize {
@@ -271,37 +287,41 @@ struct Taken {
     entry: Option<(Word, Word)>,
 }
 
-/// The root a map holds a tree by: a branch of one child is that child, and no node is none.
-fn settled(node: Option<Word>) -> Word {
+/// The root a map holds a tree of `height` by, and that root's height: a branch of one child is
+/// that child, and no node is none.
+fn settled(node: Option<Word>, height: usize) -> (Word, usize) {
     let Some(mut node) = node else {
-        return 0;
+        return (0, 0);
     };
+    let mut height = height;
     while !is_leaf(obj(node)) && count(obj(node)) == 1 {
         let only = child(obj(node), 0);
         inc(only);
         dec(node);
         node = only;
+        height -= 1;
     }
-    node
+    (node, height)
 }
 
 impl Heap {
     pub fn map_new(&mut self) -> Word {
-        self.map_over(0, 0) as Word
+        self.map_over(0, 0, 0) as Word
     }
 
-    /// A map of `entries` entries under `root`, which it takes.
-    fn map_over(&mut self, root: Word, entries: usize) -> *mut Obj {
+    /// A map of `entries` entries under `root`, which it takes, a tree of `height`.
+    fn map_over(&mut self, root: Word, entries: usize, height: usize) -> *mut Obj {
         let m = self.raw_alloc(KIND_MAP, 0, entries as u32, 0, 8);
-        unsafe { set_word(m, 0, root) };
+        unsafe { set_word(m, ROOT, root) };
+        set_height(m, height);
         m
     }
 
-    fn alloc_leaf(&mut self) -> *mut Obj {
+    pub fn alloc_leaf(&mut self) -> *mut Obj {
         self.raw_alloc(KIND_MLEAF, 0, 0, WIDTH as u32, WIDTH * 16)
     }
 
-    fn alloc_branch(&mut self) -> *mut Obj {
+    pub fn alloc_branch(&mut self) -> *mut Obj {
         self.raw_alloc(KIND_MBRANCH, 0, 0, WIDTH as u32, BRANCH_BYTES)
     }
 
@@ -324,7 +344,9 @@ impl Heap {
             unsafe { (*leaf).len = run.len() as u32 };
             level.push((leaf as Word, run.len()));
         }
+        let mut height = 0;
         while level.len() > 1 {
+            height += 1;
             let mut above = Vec::with_capacity(level.len().div_ceil(WIDTH));
             for run in level.chunks(WIDTH) {
                 let branch = self.alloc_branch();
@@ -343,14 +365,15 @@ impl Heap {
             level = above;
         }
         unsafe {
-            set_word(m, 0, level[0].0);
+            set_word(m, ROOT, level[0].0);
             (*m).len = entries.len() as u32;
         }
+        set_height(m, height);
         mw
     }
 
     /// Itself when held once, else a copy holding its children and keys once more.
-    fn writable_node(&mut self, node: Word) -> *mut Obj {
+    pub fn writable_node(&mut self, node: Word) -> *mut Obj {
         if is_unique(node) {
             return obj(node);
         }
@@ -375,7 +398,7 @@ impl Heap {
     }
 
     /// Itself when held once, else a copy holding the root once more.
-    fn writable_map(&mut self, m: Word) -> *mut Obj {
+    pub fn writable_map(&mut self, m: Word) -> *mut Obj {
         if is_unique(m) {
             return obj(m);
         }
@@ -384,7 +407,7 @@ impl Heap {
         if r != 0 {
             inc(r);
         }
-        let copy = self.map_over(r, len(o));
+        let copy = self.map_over(r, len(o), height(o));
         dec(m);
         copy
     }
@@ -399,9 +422,10 @@ impl Heap {
                 set_word(leaf, 0, k);
                 set_word(leaf, 1, v);
                 (*leaf).len = 1;
-                set_word(m, 0, leaf as Word);
+                set_word(m, ROOT, leaf as Word);
                 (*m).len = 1;
             }
+            set_height(m, 0);
             return m as Word;
         }
         let put = self.put(layouts, r, k, v);
@@ -420,11 +444,12 @@ impl Heap {
                 }
                 set_child_size(branch, 0, entries(obj(put.node)));
                 set_child_size(branch, 1, entries(obj(right)));
+                set_height(m, height(m) + 1);
                 branch as Word
             }
         };
         unsafe {
-            set_word(m, 0, new_root);
+            set_word(m, ROOT, new_root);
             if put.added {
                 (*m).len += 1;
             }
@@ -614,12 +639,14 @@ impl Heap {
     ) -> (Word, Option<(Word, Word)>) {
         let m = self.writable_map(m);
         let taken = self.take(layouts, root(m), which);
+        let (r, h) = settled(taken.node, height(m));
         unsafe {
-            set_word(m, 0, settled(taken.node));
+            set_word(m, ROOT, r);
             if taken.entry.is_some() {
                 (*m).len -= 1;
             }
         }
+        set_height(m, h);
         (m as Word, taken.entry)
     }
 
@@ -728,11 +755,14 @@ impl Heap {
         }
         let m = self.writable_map(m);
         let (lower, upper) = self.cut(root(m), index);
-        let rest = self.map_over(settled(Some(upper)), total - index);
+        let (upper, upper_height) = settled(Some(upper), height(m));
+        let rest = self.map_over(upper, total - index, upper_height);
+        let (lower, lower_height) = settled(Some(lower), height(m));
         unsafe {
-            set_word(m, 0, settled(Some(lower)));
+            set_word(m, ROOT, lower);
             (*m).len = index as u32;
         }
+        set_height(m, lower_height);
         (m as Word, rest as Word)
     }
 

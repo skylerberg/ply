@@ -230,14 +230,57 @@ pub fn runtime_json() -> String {
             .collect::<Vec<_>>(),
         // The natives' names alone, which a `ply` that reads no `natives` emits a builder against.
         "builtins": natives().map(|(name, _)| name).collect::<Vec<_>>(),
+        "layouts": layouts_json(),
         "identity": c::runtime_identity(),
     })
     .to_string()
 }
 
+fn layouts_json() -> serde_json::Value {
+    use ply_codegen::laid::Fact;
+    serde_json::Value::Object(
+        ply_codegen::laid::layouts()
+            .into_iter()
+            .map(|(object, facts)| {
+                let facts = facts.into_iter().map(|(name, fact)| {
+                    let value = match fact {
+                        Fact::Number(n) => serde_json::json!(n),
+                        Fact::Field(field) => serde_json::json!(field),
+                    };
+                    (name.to_string(), value)
+                });
+                (
+                    object.to_string(),
+                    serde_json::Value::Object(facts.collect()),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn layouts_value() -> PlyValue {
+    use crate::payload::record;
+    use ply_codegen::laid::Fact;
+    record(
+        ply_codegen::laid::layouts()
+            .into_iter()
+            .map(|(object, facts)| {
+                let facts = facts.into_iter().map(|(name, fact)| {
+                    let value = match fact {
+                        Fact::Number(n) => PlyValue::Int(n as i64),
+                        Fact::Field(field) => PlyValue::bytes(field),
+                    };
+                    (name, value)
+                });
+                (object, record(facts.collect()))
+            })
+            .collect(),
+    )
+}
+
 /// The runtime a unit is compiled against, as `compiler.unit.Runtime` reads it: the C a unit opens
-/// and closes with, the helpers it binds by position, the natives an `extern fn` names, and what all
-/// of that is a function of.
+/// and closes with, the helpers it binds by position, the natives an `extern fn` names, how it lays
+/// out what the emitter writes in place, and what all of that is a function of.
 fn runtime() -> PlyValue {
     use crate::payload::record;
     use ply_codegen::c;
@@ -274,6 +317,7 @@ fn runtime() -> PlyValue {
                     .collect(),
             ),
         ),
+        ("layouts", layouts_value()),
         ("identity", PlyValue::bytes(c::runtime_identity())),
     ])
 }

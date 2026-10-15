@@ -2,8 +2,8 @@
 //! an inline tail, with a dropped-prefix offset so `[x, ..rest]` shares the trie.
 
 use crate::heap::{
-    self, Heap, KIND_BRANCH, KIND_LEAF, KIND_LIST, Obj, Word, dec, inc, is_unique, obj, set_word,
-    word_at,
+    self, Header, Heap, KIND_BRANCH, KIND_LEAF, KIND_LIST, Obj, Word, dec, inc, is_unique, obj,
+    set_word, word_at,
 };
 
 /// Elements per leaf, children per branch, and the most a tail holds.
@@ -12,8 +12,14 @@ const BITS: u32 = 5;
 const MASK: usize = WIDTH - 1;
 
 /// The payload: the trie's root (zero for none), then the tail.
-const ROOT: usize = 0;
+pub const ROOT: usize = 0;
 pub const TAIL: usize = 1;
+
+/// The header fields of a list's own object: the prefix a `rest` dropped, the tail's length, and
+/// the tail's capacity.
+pub const START: Header = Header::Layout;
+pub const TAIL_LEN: Header = Header::Flags;
+pub const ROOM: Header = Header::Aux;
 
 pub fn root(o: *mut Obj) -> Word {
     unsafe { word_at(o, ROOT) }
@@ -21,19 +27,19 @@ pub fn root(o: *mut Obj) -> Word {
 
 /// The prefix a `rest` dropped: the list's first element is at this physical index.
 fn start(o: *mut Obj) -> usize {
-    unsafe { (*o).layout as usize }
+    unsafe { START.of(o) }
 }
 
 pub fn tail_len(o: *mut Obj) -> usize {
-    unsafe { (*o).flags as usize }
+    unsafe { TAIL_LEN.of(o) }
 }
 
 fn set_start(o: *mut Obj, v: usize) {
-    unsafe { (*o).layout = v as u32 }
+    unsafe { START.set(o, v) }
 }
 
 fn set_tail_len(o: *mut Obj, v: usize) {
-    unsafe { (*o).flags = v as u8 }
+    unsafe { TAIL_LEN.set(o, v) }
 }
 
 /// The list's length: what `List::len` answers.
@@ -42,8 +48,8 @@ pub fn len(o: *mut Obj) -> usize {
 }
 
 /// The tail's capacity in words.
-fn cap(o: *mut Obj) -> usize {
-    unsafe { (*o).aux as usize }
+pub fn cap(o: *mut Obj) -> usize {
+    unsafe { ROOM.of(o) }
 }
 
 /// The physical index of the first tail element: how many elements the trie holds.
@@ -78,13 +84,15 @@ impl Heap {
         let cap = (cap as usize).clamp(1, WIDTH);
         let o = self.raw_alloc(KIND_LIST, 0, 0, 0, (TAIL + cap) * 8);
         unsafe {
-            (*o).aux = cap as u16;
+            ROOM.set(o, cap);
             set_word(o, ROOT, 0);
         }
         o
     }
 
-    fn alloc_node(&mut self, kind: u8, items: &[Word]) -> Word {
+    /// A node of `kind`, a leaf or a branch, holding `items`, which it takes, with room for a full
+    /// one.
+    pub fn alloc_node(&mut self, kind: u8, items: &[Word]) -> Word {
         let o = self.raw_alloc(kind, 0, items.len() as u32, WIDTH as u32, WIDTH * 8);
         for (i, w) in items.iter().enumerate() {
             unsafe { set_word(o, i, *w) };
@@ -172,7 +180,7 @@ impl Heap {
     }
 
     /// Itself when held once, else a copy holding its children once more (the original released).
-    fn writable(&mut self, node: Word) -> Word {
+    pub fn writable(&mut self, node: Word) -> Word {
         if is_unique(node) {
             return node;
         }
@@ -207,6 +215,18 @@ impl Heap {
         out
     }
 
+    /// `xs`, which it takes, held once with room for `room` tail elements: itself where it is held
+    /// once and has the room, else a copy holding its contents once more (the original released).
+    pub fn list_writable(&mut self, xs: Word, room: usize) -> Word {
+        let o = obj(xs);
+        if is_unique(xs) && cap(o) >= room {
+            return xs;
+        }
+        let copy = self.clone_list(o, room.max(cap(o)).min(WIDTH));
+        dec(xs);
+        copy as Word
+    }
+
     /// `xs` with `x` appended. Takes both; an unshared list grows in place.
     pub fn list_push(&mut self, xs: Word, x: Word) -> Word {
         // The machine's reuse counters, which `ply run --json` reports.
@@ -222,18 +242,13 @@ impl Heap {
     /// `list_push` as the runtime gathers a list itself: no update the program wrote, so the
     /// reuse counters are not told.
     pub fn list_grown(&mut self, xs: Word, x: Word) -> Word {
-        let mut o = obj(xs);
-        let n = tail_len(o);
-        if !is_unique(xs) || (n == cap(o) && n < WIDTH) {
-            let room = if n == cap(o) {
-                (cap(o) * 2).min(WIDTH)
-            } else {
-                cap(o)
-            };
-            let copy = self.clone_list(o, room);
-            dec(xs);
-            o = copy;
-        }
+        let n = tail_len(obj(xs));
+        let room = if n == cap(obj(xs)) {
+            cap(obj(xs)) * 2
+        } else {
+            cap(obj(xs))
+        };
+        let o = obj(self.list_writable(xs, room.min(WIDTH)));
         let n = tail_len(o);
         if n == WIDTH {
             let leaf = self.alloc_node(KIND_LEAF, tail(o));
@@ -252,15 +267,9 @@ impl Heap {
 
     /// `xs` with in-range element `i` replaced by `v`, in place when unshared. Takes both.
     pub fn list_set(&mut self, xs: Word, i: usize, v: Word) -> Word {
-        let mut o = obj(xs);
-        debug_assert!(i < len(o));
-        let mut copied: Option<usize> = None;
-        if !is_unique(xs) {
-            copied = Some(tail_len(o));
-            let copy = self.clone_list(o, cap(o));
-            dec(xs);
-            o = copy;
-        }
+        debug_assert!(i < len(obj(xs)));
+        let mut copied = (!is_unique(xs)).then(|| tail_len(obj(xs)));
+        let o = obj(self.list_writable(xs, cap(obj(xs))));
         let p = start(o) + i;
         let offset = tail_offset(o);
         let (node, at) = if p >= offset {

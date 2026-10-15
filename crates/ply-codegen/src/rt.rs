@@ -3,8 +3,8 @@
 
 use crate::heap::{
     self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_ARRAY, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE,
-    KIND_COLUMNS, KIND_CTOR, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, Layouts, Stated, Word,
-    bridged, bytes_of, is_unique, obj, set_word, str_of, word_at,
+    KIND_COLUMNS, KIND_CTOR, KIND_LIST, KIND_MAP, KIND_MBRANCH, KIND_MLEAF, KIND_RECORD, KIND_STR,
+    Layouts, Stated, Word, bridged, bytes_of, is_unique, obj, set_word, str_of, word_at,
 };
 use crate::map;
 use crate::native::{Answered, Native, Raising, Signature};
@@ -5355,6 +5355,41 @@ fn unwrapped(ctx: &mut Ctx, answer: Word) -> Word {
 /// A write of one element the emitted code made: in place, or into a copy of `copied` elements.
 pub unsafe extern "C" fn rt_note_update(_ctx: *mut Ctx, in_place: i64, copied: i64) {
     ply_eval::rc::note_update_of(in_place != 0, copied as usize, Span::DUMMY);
+}
+
+/// An empty node of a list's trie or a map's tree, of `kind`, with room for a full one.
+pub unsafe extern "C" fn rt_node(ctx: *mut Ctx, kind: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    match kind as u8 {
+        KIND_MLEAF => ctx.heap.alloc_leaf() as Word,
+        KIND_MBRANCH => ctx.heap.alloc_branch() as Word,
+        kind => ctx.heap.alloc_node(kind, &[]),
+    }
+}
+
+/// The node `n` of a list's trie or a map's tree, which it takes, held once: itself where it
+/// already is, else a copy holding what it holds once more.
+pub unsafe extern "C" fn rt_node_writable(ctx: *mut Ctx, n: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    match heap::kind(n) {
+        KIND_MLEAF | KIND_MBRANCH => ctx.heap.writable_node(n) as Word,
+        _ => ctx.heap.writable(n),
+    }
+}
+
+/// The list `xs`, which it takes, held once with room for `room` tail elements: itself where it
+/// already is, else a copy holding its contents once more.
+pub unsafe extern "C" fn rt_list_writable(ctx: *mut Ctx, xs: i64, room: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    ctx.heap
+        .list_writable(xs, room.clamp(1, list::WIDTH as i64) as usize)
+}
+
+/// The map `m`, which it takes, held once: itself where it already is, else a copy holding its
+/// root once more.
+pub unsafe extern "C" fn rt_map_writable(ctx: *mut Ctx, m: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    ctx.heap.writable_map(m) as Word
 }
 
 /// `Array::at` as an `Option` held as its payload's word, like [`rt_map_lookup`].
