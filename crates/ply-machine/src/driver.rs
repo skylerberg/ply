@@ -104,11 +104,10 @@ pub fn load_over_analysis_taken(
     let mut sources = SourceMap::new();
     let mut files = Vec::with_capacity(handed.files.len());
     let mut shipped = Vec::new();
-    let ships = crate::shipped_modules::name_set();
     for file in handed.files {
         let path = PathBuf::from(&file.path);
         let source = sources.add(&path, file.text);
-        if ships.contains(ModuleName::from_dotted(&file.name).as_str()) {
+        if crate::shipped_modules::is_shipped(&ModuleName::from_dotted(&file.name)) {
             shipped.push(source);
         }
         files.push(Found { path });

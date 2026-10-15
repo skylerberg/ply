@@ -60,7 +60,7 @@ import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, ItemWants, embed_want_
               item_wants_bin, embed_key, embed_tables, embedded, rewritten, wants_of, wants_by_item,
               wants_in, want_of_key, embed_at_bin)
 import items (parse, import_decl_bin, homes_called, homes_declaring, homes_for, called_names,
-              HomeNames)
+              HomeNames, builtins_module, prelude_text)
 import std.bytes (ascii_of_int)
 import lexer (is_ident_start)
 
@@ -3327,8 +3327,13 @@ pub fn analyse_with(
   pkgs: PackageSources = { root: b"", manifest: None, supplied: [] },
 ) -> AnalysisOutcome / {abort.raise} = {
   let clo = closure(pkgs, parsed.map(|p: ParsedSource| p.name));
-  let all = clo.modules.fold(parsed, |acc: List<ParsedSource>, m: { pkg: Int, src: Source }|
+  let closed = clo.modules.fold(parsed, |acc: List<ParsedSource>, m: { pkg: Int, src: Source }|
     acc.push({ ..parse_at(acc.len(), m.src), src: m.src.src }));
+  let all = if closed.fold(false, |found: Bool, p: ParsedSource|
+      found || p.name == builtins_module()) { closed } else {
+    let src = prelude_text();
+    closed.push({ ..parse_at(closed.len(), { name: builtins_module(), src: src }), src: src })
+  };
   // The toolchain's own tree loads without its implicit self; this path has no shipped modules list
   // to check the coverage half of that against, and only the toolchain's listings use it.
   let toolchain = parsed.fold(true, |acc: Bool, p: ParsedSource| acc && is_std(p.name));
@@ -3341,6 +3346,24 @@ pub fn analyse_with(
 /// modules. The built-in packages: every package's implicit dependencies, pulled on demand like the
 /// shipped modules but owned as packages — the two the runtime pre-seeds.
 pub fn std_pkg() -> PackageDeps = { prefix: b"std", deps: [] }
+
+/// `sources` with the prelude's functions written in Ply among them, which every module imports,
+/// and `module_packages` with theirs, the compiler's, where packages are given.
+fn with_prelude_module(
+  sources: List<Source>,
+  pkgs: List<PackageDeps>,
+  module_packages: List<Int>,
+  shipped: Int,
+) -> { sources: List<Source>, module_packages: List<Int> } / {abort.raise} =
+  if sources.any(|x: Source| x.name == builtins_module()) {
+    { sources: sources, module_packages: module_packages }
+  } else {
+    {
+      sources: sources.push({ name: builtins_module(), src: prelude_text() }),
+      module_packages: if pkgs.len() == 0 { module_packages }
+      else { module_packages.push(shipped - 1) },
+    }
+  }
 
 pub fn compiler_pkg() -> PackageDeps = { prefix: b"compiler", deps: [b"std"] }
 
@@ -3554,7 +3577,13 @@ fn analyse_closure(
 ) -> AnalysisOutcome / {abort.raise} =
   match hashed_closure(parsed, clo, root_count, toolchain) {
     Err(diags) -> Refused(diags),
-    Ok(h) -> checked_closure(h, rows, Every),
+    Ok(h) -> match builtins_cut(parsed, h) {
+      None -> checked_closure(h, rows, Every),
+      Some(cut) -> match hashed_closure(cut, clo, root_count, toolchain) {
+        Err(diags) -> Refused(diags),
+        Ok(kept) -> checked_closure(kept, rows, Every),
+      },
+    },
   }
 
 /// The answer as a program ships it: the tables the runtime binds the program's unit to and enters
@@ -3735,9 +3764,10 @@ pub type Within = { owners: Map<Bytes, Bool>, tests: Map<Bytes, Bool> }
 /// witnesses a `numeric` or `integer` constraint has the elaboration pass ahead of them.
 pub type BuiltinRow = { name: Bytes, scheme: Scheme, params: List<Bytes>, witnesses: Int }
 
-/// Every builtin, in the prelude's order.
+/// Every builtin the runtime implements, in the prelude's order; one the prelude writes in Ply is a
+/// definition of its module.
 pub fn builtin_rows() -> List<BuiltinRow> / {abort.raise} =
-  builtins().map(|b: Builtin|
+  builtins().filter(|b: Builtin| !b.body).map(|b: Builtin|
     {
       name: b.name,
       scheme: b.scheme,
@@ -4236,12 +4266,14 @@ fn claims_of_modules(
   })
 
 pub fn claims(
-  sources: List<Source>,
+  given: List<Source>,
   pkgs: List<PackageDeps> = [],
-  module_packages: List<Int> = [],
+  given_packages: List<Int> = [],
   shipped: Int = 0,
 ) -> List<Claim> / {abort.raise} = {
-  let mods = parse_all(sources).map(|parsed: ParsedSource| parsed.module);
+  let read = with_prelude_module(given, pkgs, given_packages, shipped);
+  let module_packages = read.module_packages;
+  let mods = parse_all(read.sources).map(|parsed: ParsedSource| parsed.module);
   // The published table ends with the built-in packages; the shipped modules sit one past them.
   let packaged = if pkgs.len() == 0 { no_packages(mods) } else {
     {
@@ -4331,15 +4363,17 @@ fn rechecked(analysis: Analysis, wanted: List<Int>) -> Elaboration / {abort.rais
 /// modules as root ones — and the shipped modules sit one past the published table, as `claims` has
 /// it.
 pub fn rehash(
-  sources: List<Source>,
+  given: List<Source>,
   pins: List<Pin>,
   pkgs: List<PackageDeps> = [],
-  module_packages: List<Int> = [],
+  given_packages: List<Int> = [],
   shipped: Int = 0,
   embeds: List<EmbedAt> = [],
 ) -> Rehashed / {abort.raise} = {
+  let read = with_prelude_module(given, pkgs, given_packages, shipped);
+  let module_packages = read.module_packages;
   let tables = embed_tables(embeds);
-  let mods = parse_all(sources).map(|parsed: ParsedSource|
+  let mods = parse_all(read.sources).map(|parsed: ParsedSource|
     { ..parsed.module, module: rewritten(tables, parsed.name, parsed.module.module).module });
   let packaged = if pkgs.len() == 0 { no_packages(mods) } else {
     {
@@ -4550,9 +4584,11 @@ pub fn shipping_pulled<| e>(
   wanted: (Source) -> ShippedWants / {abort.raise | e},
   asked: List<Bytes>,
 ) -> Shipping / {abort.raise | e} = {
+  // The prelude's functions written in Ply, which every load pulls, are the toolchain's own text.
+  let text_of = |n: Bytes| if n == builtins_module() { Some(prelude_text()) } else { read(n) };
   let reading = |acc: List<Source>, n: Bytes|
     if acc.fold(false, |b: Bool, s: Source| b || s.name == n) { acc }
-    else { match read(n) { Some(src) -> acc.push({ name: n, src: src }), None -> acc } };
+    else { match text_of(n) { Some(src) -> acc.push({ name: n, src: src }), None -> acc } };
   let pulled_read = pulled.fold([], reading);
   let wants = pulled_read.fold(Map::new(), |acc: Map<Bytes, ShippedWants>, source: Source|
     acc.insert(source.name, wanted(source)));
@@ -4617,7 +4653,8 @@ pub fn shipped_pulled<| e>(
   let held = needed.found.fold(Map::new(), |acc: Map<Bytes, Bool>, s: Source|
     acc.insert(s.name, true));
   {
-    read: needed.found,
+    // Every module imports the prelude's functions written in Ply, which no file holds.
+    read: needed.found.push({ name: builtins_module(), src: prelude_text() }),
     unread: listed.filter(|name: Bytes| !held.contains(name)),
     data: needed.data,
     asked: asked,
@@ -5135,8 +5172,10 @@ pub fn staged_pulling_std_with(
   };
   let told = pulls.fold(Map::new(), |acc: Map<Bytes, Pulls>, m: ModulePulls|
     acc.insert(m.name, m.pulls));
-  let texts = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
+  let given_texts = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
+  let texts = if given_texts.contains(builtins_module()) { given_texts }
+  else { given_texts.insert(builtins_module(), prelude_text()) };
   let sources = user.concat(clo.modules.map(|m: { pkg: Int, src: Source }| m.src));
   let declared = homes_declaring(|h: Bytes| texts.get(h));
   let asking = sources.fold(asked, |acc: List<Bytes>, s: Source|
@@ -5175,7 +5214,7 @@ pub fn staged_pulling_std_with(
   let assembled = written.parsed;
   // The toolchain's own tree loads without its implicit self: every root module under `std`
   // with the whole shipped set among them is the built-in package's sources.
-  let listed = shipped.map(|s: Source| s.name).concat(unread);
+  let listed = texts.keys().concat(unread.filter(|n: Bytes| !texts.contains(n)));
   let toolchain = if apart { user.fold(true, |acc: Bool, s: Source| acc && is_std(s.name)) }
   else { toolchain_tree(user.map(|u: Source| u.name), listed) };
   let x = pulling(
@@ -5220,6 +5259,49 @@ pub fn staged_pulling_std_with(
         }
       },
     }
+  }
+}
+
+/// `parsed` with the prelude's functions written in Ply cut to those the rest of the load reaches,
+/// every other module read as the load reads it; `None` where it keeps all of them. A program read
+/// whole reads these for what it calls, as a load reads a shipped module's.
+fn builtins_cut(
+  parsed: List<ParsedSource>,
+  h: Hashed,
+) -> Option<List<ParsedSource>> / {abort.raise} = {
+  let own = |name: Bytes| module_of_root(name) == builtins_module();
+  let roots = h.hashes.defs.fold([], |acc: List<Which>, d: { name: Bytes, hash: Bytes }|
+    if own(d.name) { acc } else { acc.push(TheFn(d.name)) }).concat(
+    h.index.nodes.fold([], |acc: List<Which>, n: Node|
+      match n.body { NodeFn(_) -> acc, _ -> acc.push(TheDecl(n.name)) }),
+  ).concat(
+    h.index.tests.map(|t: TestNode| TheItem(t.key)),
+  ).concat(
+    h.index.laws.map(|l: LawNode| TheItem(l.key)),
+  );
+  let reach = reached_functions(h.hashes, roots);
+  let kept = |p: ParsedSource, item: Item|
+    match item { IFn(d) -> reach.contains(qualify(p.name, d.name.name)), _ -> true };
+  let cut = parsed.fold(false, |b: Bool, p: ParsedSource|
+    b
+      || (p.name == builtins_module()
+      && p.module.module.items.fold(false, |c: Bool, item: Item| c || !kept(p, item))));
+  if !cut { None } else {
+    Some(
+      parsed.map(|p: ParsedSource|
+        if p.name != builtins_module() { p } else {
+          {
+            ..p,
+            module: {
+              ..p.module,
+              module: {
+                ..p.module.module,
+                items: p.module.module.items.filter(|item: Item| kept(p, item)),
+              },
+            },
+          }
+        }),
+    )
   }
 }
 
@@ -6005,7 +6087,7 @@ test "a program's tables made from its modules' facts, each shipped module's cut
   let answered = answered_program(
     facts,
     fixing,
-    Map::new().insert(b"std.shapes", shipped.get(0).src),
+    Map::new().insert(b"std.shapes", shipped.get(0).src).insert(builtins_module(), prelude_text()),
     true,
     true,
     cut.warnings,
@@ -6200,6 +6282,17 @@ test "a carry follows a width into lists, maps, records, sum types, functions an
       { root: b"m.plain", params: [CPlain, CPlain], answer: CSum([]) },
       { root: b"m.apply", params: [CFn([CPlain], CVar(0)), CPlain], answer: CVar(0) },
       { root: b"m.sent", params: [CList(CWidth(0))], answer: CPlain },
+      // `wrap` reaches the prelude's `map`, generic over what it carries.
+      {
+        root: b"compiler.builtins.mapped_from",
+        params: [CList(CVar(0)), CFn([CVar(0)], CVar(1)), CPlain, CList(CVar(1))],
+        answer: CList(CVar(1)),
+      },
+      {
+        root: b"compiler.builtins.List::map",
+        params: [CList(CVar(0)), CFn([CVar(0)], CVar(1))],
+        answer: CList(CVar(1)),
+      },
     ],
   );
   assert_eq(effect_named(d, b"m.probe").ops.map(|o: OpRow| o.carries), [
@@ -6305,19 +6398,20 @@ test "a program's answer holds its warnings, its order, its packages and its mod
       fixes: [],
     },
   ]);
-  assert_eq(d.order, [b"m"]);
+  // Every module imports the prelude's functions written in Ply, which the compiler's package holds.
+  assert_eq(d.order, [b"compiler.builtins", b"m"]);
   assert_eq(d.packages, [
     { prefix: b"", deps: [] },
     { prefix: b"std", deps: [] },
     { prefix: b"compiler", deps: [b"std"] },
   ]);
-  assert_eq(d.module_packages, [0]);
+  assert_eq(d.module_packages, [0, 2]);
   assert_eq(d.modules, [
     {
       name: b"m",
       index: 0,
       items: [b"m.log", b"m.Shape", b"m.Dot", b"m.Line", b"m.say"],
-      imports: [],
+      imports: [b"compiler.builtins"],
       sets: [],
       // `say`'s body and the whole test, which a stub of the module blanks.
       cuts: [
@@ -6325,6 +6419,7 @@ test "a program's answer holds its warnings, its order, its packages and its mod
         { start: 127, end: 152, braced: false, name: b"", test: false },
       ],
     },
+    { name: b"compiler.builtins", index: 1, items: [], imports: [], sets: [], cuts: [] },
   ])
 }
 
@@ -6513,6 +6608,7 @@ test "a hash row carries the definition's hash, its own form and its references,
 test "the ordinals list every fn, test and law in source order" {
   assert_eq(dump_of(analyse(parse_all(program()))).ordinals, [
     { module: b"m", items: [b"fn m.say", b"test m.says"] },
+    { module: b"compiler.builtins", items: [] },
   ])
 }
 
@@ -6545,6 +6641,7 @@ test "a definition's row holds its row aliases and each clause with its kind, in
   assert_eq(inc.literals, [b"int 0"]);
   assert_eq(d.ordinals, [
     { module: b"m", items: [b"fn m.say", b"fn m.inc requires,ensures", b"law m.inc grows"] },
+    { module: b"compiler.builtins", items: [] },
   ])
 }
 
@@ -6671,6 +6768,7 @@ test "a law's row holds its binders with their spans and types, and its hashes c
         atoms: [{ effect: b"m.log", resource: RSingleton, mode: MWrite, op: None }],
       },
     ],
+    [],
   ]);
   let law = match d.hashes.fold(None, |acc: Option<ItemHashRow>, h: HashFrame|
       match h { HLaw(r) -> Some(r), _ -> acc }) {
@@ -6700,7 +6798,7 @@ fn claimed() -> List<Source> =
 fn code_text(c: Option<Code>) -> Bytes / {abort.raise} = match c { Some(x) -> dump(x), None -> b"" }
 
 test "a claim is lowered with each global named program-wide, and a builtin and a prelude constructor as written" {
-  let out = claims(claimed());
+  let out = program_claims(claimed());
   assert_eq(out.len(), 4);
   match out.get(0) {
     ClaimDef(d) -> {
@@ -6738,7 +6836,7 @@ test "a claim is lowered with each global named program-wide, and a builtin and 
 }
 
 test "an instantiation claims its schema's guard and body with what it was given written in place" {
-  let out = claims([
+  let out = program_claims([
     {
       name: b"lib",
       src: b"pub fn limit() -> Int = 100\npub law schema fixed(f: (Int) -> Int, low: Int) forall (x: Int) where x > low && x < limit() { f(x) == x }",
@@ -6767,7 +6865,7 @@ test "an instantiation claims its schema's guard and body with what it was given
 }
 
 test "a record update reaches a claim as the literal it stands for" {
-  let out = claims([
+  let out = program_claims([
     { name: b"m", src: b"pub type P = { a: Int, b: Int }\npub fn bump(p: P) -> P = {..p, b: 3}" },
   ]);
   assert_eq(out.len(), 1);
@@ -6789,7 +6887,7 @@ test "claims lowered from an analysis are the claims lowered from its sources" {
     },
   ];
   let w = analysis_of(sources);
-  assert_eq(claims_in(w, range(0, w.mods.len())), claims(sources))
+  assert_eq(claims_in(w, range(0, w.mods.len())).filter(own_claim), program_claims(sources))
 }
 
 test "a builtin is published with its scheme and the names its parameters are documented under" {
@@ -6828,6 +6926,12 @@ test "a program reads of a shipped module the functions it reaches and the names
   assert_eq(def_names(cut), [b"m.f", b"std.r.imported", b"std.r.used", b"std.s.helper"]);
   let whole = analyse_pulling_std_with(user, reached_fixture(), no_rows(), reached: false);
   assert_eq(def_names(whole), [
+    b"compiler.builtins.List::filter",
+    b"compiler.builtins.List::fold",
+    b"compiler.builtins.List::map",
+    b"compiler.builtins.folded_from",
+    b"compiler.builtins.kept_from",
+    b"compiler.builtins.mapped_from",
     b"m.f",
     b"std.r.imported",
     b"std.r.unused",
@@ -7019,7 +7123,7 @@ fn view_names(v: ShippedView) -> List<Bytes> =
 test "a load's view of a shipped module is its form and the functions the program reached" {
   let user = [{ name: b"m", src: b"import std.r (used, imported)\npub fn f() -> Int = used()\n" }];
   let viewed = analyse_pulling_std_with(user, reached_fixture(), no_rows()).viewed;
-  assert_eq(viewed.map(|v: ShippedView| v.module), [b"std.r", b"std.s"]);
+  assert_eq(viewed.map(|v: ShippedView| v.module), [b"compiler.builtins", b"std.r", b"std.s"]);
   assert_eq(view_names(view_named(viewed, b"std.r")), [b"std.r.imported", b"std.r.used"]);
   assert_eq(view_names(view_named(viewed, b"std.s")), [b"std.s.helper"]);
   assert_eq(view_named(viewed, b"std.s").text, hex(blake3(reached_fixture().get(1).src)));
@@ -7050,6 +7154,34 @@ test "a load's view of a shipped module is its form and the functions the progra
   }
 }
 
+test "every load reads the prelude's functions written in Ply, keeping the ones it reaches" {
+  let viewed = |src: Bytes|
+    analyse_pulling_std_with([{ name: b"m", src: src }], [], no_rows()).viewed;
+  let mapping = viewed(b"pub fn f(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + 1)\n");
+  // The prelude's imports name what its declarations read, which no load pulls for its functions.
+  assert_eq(mapping.map(|v: ShippedView| v.module), [builtins_module()]);
+  assert_eq(view_names(view_named(mapping, builtins_module())), [
+    b"compiler.builtins.List::map",
+    b"compiler.builtins.mapped_from",
+  ]);
+  assert_eq(view_names(view_named(viewed(b"pub fn g() -> Int = 1\n"), builtins_module())), [])
+}
+
+test "a builtin the prelude writes in Ply is checked at the scheme its callers read" {
+  let src = b"pub fn g(xs: List<Int>) -> Int = xs.map(|x: Int| x + 1).filter(|x: Int| x > 2).fold(0, |a: Int, x: Int| a + x)\n";
+  match analyse(parse_all([{ name: b"m", src: src }])) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> {
+      let checked = w.checked.defs.fold(Map::new(), |acc: Map<Bytes, Scheme>, d: DefInfo|
+        acc.insert(d.name, d.scheme));
+      let bodied = builtins().filter(|b: Builtin| b.body);
+      assert(bodied.len() > 0, None);
+      bodied.fold((), |u: Unit, b: Builtin|
+        assert_eq(checked.get(qualify(builtins_module(), b.name)), Some(b.scheme)))
+    },
+  }
+}
+
 test "a function nothing reaches leaves a view's form alone and a type moves it" {
   let user = [{ name: b"m", src: b"import std.r (used)\npub fn f() -> Int = used()\n" }];
   let with_s = |text: Bytes|
@@ -7075,7 +7207,7 @@ test "the shipped modules a program imports follow it a round at a time, each ro
     [{ name: b"m", src: b"import std.b\nimport std.a\npub fn f() -> Int = 1" }],
     shipped_modules(),
   );
-  assert_eq(a.pulled, [b"std.a", b"std.b", b"std.c"]);
+  assert_eq(a.pulled, [b"compiler.builtins", b"std.a", b"std.b", b"std.c"]);
   assert_eq(a.dump.diags, []);
   assert(a.dump.order.len() > 0)
 }
@@ -7132,7 +7264,7 @@ fn pulled_by(
 test "a load reads the shipped modules it imports and what those import, and no other" {
   let p = pulled_by([{ name: b"m", src: b"import std.a\npub fn f() -> Int = 1" }]);
   assert_eq(p.asked, [b"std.a", b"std.c"]);
-  assert_eq(p.shipping.read.map(|s: Source| s.name), [b"std.a", b"std.c"]);
+  assert_eq(p.shipping.read.map(|s: Source| s.name), [b"std.a", b"std.c", b"compiler.builtins"]);
   assert_eq(p.shipping.unread, [b"std.b", b"std.d"])
 }
 
@@ -7150,8 +7282,14 @@ test "a load asked for a shipped module reads and pulls it, and what it imports,
       reached: false,
       asked: asked,
     );
-  assert_eq(pulling(p.shipping.asked).pulled, [b"std.a", b"std.b", b"std.d", b"std.c"]);
-  assert_eq(pulling([]).pulled, [b"std.b"])
+  assert_eq(pulling(p.shipping.asked).pulled, [
+    b"compiler.builtins",
+    b"std.a",
+    b"std.b",
+    b"std.d",
+    b"std.c",
+  ]);
+  assert_eq(pulling([]).pulled, [b"compiler.builtins", b"std.b"])
 }
 
 test "an asked module's tests are in a load that reads it whole, and in none that only imports another" {
@@ -7168,10 +7306,10 @@ test "an asked module's tests are in a load that reads it whole, and in none tha
     reached: false,
     asked: [b"std.r"],
   );
-  assert_eq(asked.pulled, [b"std.r", b"std.s"]);
+  assert_eq(asked.pulled, [b"compiler.builtins", b"std.r", b"std.s"]);
   assert_eq(tests_of(asked), [b"std.r.r holds"]);
   let plain = analyse_pulling_std_with(user, reached_fixture(), no_rows(), reached: false);
-  assert_eq(plain.pulled, []);
+  assert_eq(plain.pulled, [builtins_module()]);
   assert_eq(tests_of(plain), [])
 }
 
@@ -7260,6 +7398,7 @@ test "a load reads a compiler module's bare sibling imports and what it embeds b
     b"compiler.fmt",
     b"compiler.prelude",
     b"compiler.lexer",
+    b"compiler.builtins",
   ]);
   assert_eq(s.unread, [b"compiler.unit"]);
   assert_eq(s.data, [])
@@ -7333,7 +7472,7 @@ test "handed only what a load reads, the front end pulls and answers as it does 
 test "a module that does not ship is reported listing every one that does, read or not" {
   let user = [{ name: b"m", src: b"import std.e\npub fn f() -> Int = 1" }];
   let p = pulled_by(user);
-  assert_eq(p.shipping.read, []);
+  assert_eq(p.shipping.read.map(|s: Source| s.name), [builtins_module()]);
   let lazy = analyse_pulling_std_with(user, [], no_rows(), unread: p.shipping.unread);
   let whole = analyse_pulling_std(user, shipped_modules());
   assert_eq(dump_of(lazy.out), dump_of(whole.out))
@@ -7350,7 +7489,7 @@ test "a shipped compiler module is pulled in under the compiler's root" {
     [{ name: b"m", src: b"import compiler.a (first)\npub fn f() -> Int = first()" }],
     compiler_shipped(),
   );
-  assert_eq(a.pulled, [b"compiler.a", b"compiler.b"]);
+  assert_eq(a.pulled, [b"compiler.a", b"compiler.builtins", b"compiler.b"]);
   assert_eq(a.dump.diags, []);
   assert_eq(a.dump.defs.filter(|row: DefRow| row.name == b"compiler.a.first").len(), 1)
 }
@@ -7376,7 +7515,7 @@ test "library modules read apart pull the compiler's modules they import, and wh
   let all = library_over_compiler();
   let own = all.filter(|s: Source| s.name == b"std.base" || s.name == b"std.reader");
   let pulled = analyse_shipped(own, all, []);
-  assert_eq(pulled.pulled, [b"compiler.a", b"compiler.b", b"std.deep"]);
+  assert_eq(pulled.pulled, [b"compiler.a", b"compiler.builtins", b"compiler.b", b"std.deep"]);
   let d = dump_of(pulled.out);
   assert_eq(d.diags, []);
   assert_eq(d.defs.map(|row: DefRow| row.name), [
@@ -7387,7 +7526,7 @@ test "library modules read apart pull the compiler's modules they import, and wh
     b"std.deep.two",
   ]);
   assert_eq(d.packages, [{ prefix: b"", deps: [] }, { prefix: b"compiler", deps: [b"std"] }]);
-  assert_eq(d.module_packages, [0, 0, 1, 1, 2])
+  assert_eq(d.module_packages, [0, 0, 1, 1, 1, 2])
 }
 
 fn messages(d: Dump) -> List<Bytes> = d.diags.map(|diag: Diag| diag.message)
@@ -7408,13 +7547,13 @@ test "a shipped module importing outside the shipped ones is placed in that modu
   let a = pulled_answer([{ name: b"m", src: b"import std.x\npub fn f() -> Int = 1" }], [
     { name: b"std.x", src: b"import m\npub fn x() -> Int = 1" },
   ]);
-  assert_eq(a.pulled, [b"std.x"]);
+  assert_eq(a.pulled, [b"compiler.builtins", b"std.x"]);
   let said = a.dump.diags.filter(|diag: Diag|
     diag.message == b"the shipped module `std.x` imports `m`, which this build does not ship");
   assert_eq(said.map(|diag: Diag| diag.labels), [
     [
       {
-        module: 1,
+        module: 2,
         start: 7,
         end: 8,
         primary: true,
@@ -7442,7 +7581,7 @@ fn def_named(d: Dump, name: Bytes) -> DefRow / {abort.raise} =
 
 test "the answer's rows hold each type and row as the checker's value" {
   let a = pulled_answer(answered(), shipped_modules());
-  assert_eq(a.pulled, [b"std.b"]);
+  assert_eq(a.pulled, [b"compiler.builtins", b"std.b"]);
   let same = def_named(a.dump, b"base.same");
   assert_eq(same.footprint, []);
   let write: Atom = { effect: b"base.log", resource: RSingleton, mode: MWrite, op: None };
@@ -7456,7 +7595,7 @@ test "the answer's rows hold each type and row as the checker's value" {
 test "a refused program's answer is its diagnostics, placed where it went wrong, with no rows" {
   let bad = [{ name: b"m", src: b"fn f() -> Int = \"x\"" }];
   let a = pulled_answer(bad, []);
-  assert_eq(a.pulled, []);
+  assert_eq(a.pulled, [builtins_module()]);
   assert_eq(a.dump.diags, [
     {
       code: b"E0201",
@@ -7849,9 +7988,23 @@ test "every body is filed under the hash it verifies as, a cycle's members inclu
   assert(bodies.fold(false, |acc: Bool, b: FiledBody| acc || b.hash == even))
 }
 
+/// What `sources` claim, read beside the prelude's functions written in Ply, which claim nothing of
+/// the program's.
+fn program_claims(sources: List<Source>) -> List<Claim> / {abort.raise} =
+  claims(with_builtins_source(sources)).filter(own_claim)
+
+fn own_claim(c: Claim) -> Bool / {abort.raise} =
+  match c { ClaimDef(d) -> module_of_root(d.name) != builtins_module(), _ -> true }
+
+/// `sources` with the prelude's functions written in Ply past them, as every load reads them.
+fn with_builtins_source(sources: List<Source>) -> List<Source> / {abort.raise} =
+  sources.push({ name: builtins_module(), src: prelude_text() })
+
 /// Hashed without being checked, so a program that no longer compiles still has hashes to compare.
 fn hash_of(sources: List<Source>, name: Bytes) -> Bytes / {abort.raise} =
-  match resolve_modules(parse_all(sources).map(|parsed: ParsedSource| parsed.module)) {
+  match resolve_modules(
+      parse_all(with_builtins_source(sources)).map(|parsed: ParsedSource| parsed.module),
+    ) {
     ResolveFailed(_) -> b"",
     ResolveSucceeded(x) -> match by_name(hash_index(build_index(x.mods, x.r).index).defs).get(
         name,
@@ -7917,8 +8070,8 @@ test "a project's manifest is checked ahead of the program and carried decoded" 
     Analysed(_) -> assert(false),
     Refused(ds) -> {
       assert_eq(ds.get(0).code, b"E0129");
-      // One module of program text, so the manifest's label points one past it.
-      assert_eq(ds.get(0).labels.get(0).module, 1)
+      // The program's module and the prelude's functions, so the manifest's label points past them.
+      assert_eq(ds.get(0).labels.get(0).module, 2)
     },
   };
   match analyse_with(parse_all(program()), no_rows()) {
@@ -8010,8 +8163,10 @@ test "a rehash resolves a dependency's own modules with the program's packages" 
     Analysed(w) -> {
       // What a rehash is given: the modules the front end read, in its own order, named as it
       // named them. Only the tables make `lib.answer`'s bare `extra` resolve.
-      let sources = user.concat(
-        lib.map(|source: Source| { name: b"lib.".concat(source.name), src: source.src }),
+      let sources = with_builtins_source(
+        user.concat(
+          lib.map(|source: Source| { name: b"lib.".concat(source.name), src: source.src }),
+        ),
       );
       let r = rehash(sources, [], w.packages, w.module_packages, w.packages.len());
       assert(r.nodes.len() > 0);
@@ -8205,7 +8360,16 @@ test "a rehash writes the embeds the answer carries" {
     embedding_in({ root: b"r", manifest: None, supplied: [] }, sources, [a_file(b"one")]),
   );
   assert(
-    rehash(sources, [], w.packages, w.module_packages, w.packages.len(), w.embeds).nodes.len() > 0,
+    rehash(
+        with_builtins_source(sources),
+        [],
+        w.packages,
+        w.module_packages,
+        w.packages.len(),
+        w.embeds,
+      ).nodes.len(
+      )
+      > 0,
   )
 }
 
@@ -8282,7 +8446,7 @@ test "a shipped module embeds what the shipped modules hold beside it, and other
   let over = |note: Bytes| pulled_answer(user, [embedding, { name: b"std.note", src: note }]);
   let one = over(b"one");
   assert_eq(one.dump.diags, []);
-  assert_eq(one.pulled, [b"std.a"]);
+  assert_eq(one.pulled, [b"compiler.builtins", b"std.a"]);
   assert_eq(one.dump.embeds, [
     { module: b"std.a", key: b"file:../note.ply", read: Ok([{ name: b"", bytes: b"one" }]) },
   ]);
@@ -8422,21 +8586,21 @@ test "a data file the shipped modules do not hold, or a path that leaves them, i
       Analysed(_) -> [],
       Refused(ds) -> ds.map(|d: Diag| { code: d.code, modules: d.labels.map(|l: Label| l.module) }),
     };
-  assert_eq(placed_at(over_words(src, [])), [{ code: b"E0146", modules: [1] }]);
+  assert_eq(placed_at(over_words(src, [])), [{ code: b"E0146", modules: [2] }]);
   let leaving = analyse_pulling_std_with(
     user,
     [words_module(b"../list.txt")],
     no_rows(),
     data: [{ name: b"list.txt", bytes: b"x" }, { name: b"std/list.txt", bytes: b"x" }],
   );
-  assert_eq(placed_at(leaving), [{ code: b"E0146", modules: [1] }]);
+  assert_eq(placed_at(leaving), [{ code: b"E0146", modules: [2] }]);
   let directory = analyse_pulling_std_with(
     user,
     [{ name: b"std.words", src: b"pub fn count() -> Int = embed_dir(\"words\").len()\n" }],
     no_rows(),
     data: words_data(b"one\n"),
   );
-  assert_eq(placed_at(directory), [{ code: b"E0146", modules: [1] }])
+  assert_eq(placed_at(directory), [{ code: b"E0146", modules: [2] }])
 }
 
 test "a shipped module read as its stub still answers the data file its text embeds" {

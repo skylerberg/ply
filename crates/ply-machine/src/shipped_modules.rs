@@ -50,16 +50,6 @@ pub fn names() -> Vec<String> {
         .collect()
 }
 
-/// Whether `module` is one this binary ships, read off the listing.
-pub fn ships(module: &ModuleName) -> bool {
-    names().iter().any(|name| name == module.as_str())
-}
-
-/// [`names`] as a set, for a caller asking of many modules.
-pub fn name_set() -> std::collections::HashSet<String> {
-    names().into_iter().collect()
-}
-
 /// Every shipped module as `(name, text)`, in [`names`]'s order. The pack reads each file once, so
 /// the front end and the emitter are handed the same bytes.
 pub fn sources() -> Vec<(String, &'static str)> {

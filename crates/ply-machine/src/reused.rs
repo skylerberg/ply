@@ -6,6 +6,7 @@
 
 use crate::driver::{LoadedAnalysis, LoadedFile};
 use crate::payload::record;
+use crate::shipped_modules::is_shipped;
 use ply_eval::decode::{AnswerValue, Error};
 use ply_eval::{ModuleName, SourceId, Value};
 use std::io::{Read, Write};
@@ -48,10 +49,9 @@ pub fn front(
     let pulled = filed.files.len().checked_sub(own + manifests.len())?;
     let mut walked = modules.into_iter().chain(manifests);
     let mut files = Vec::with_capacity(filed.files.len());
-    let ships = crate::shipped_modules::name_set();
     for (i, file) in filed.files.into_iter().enumerate() {
         let (path, text) = if (own..own + pulled).contains(&i) {
-            if !ships.contains(ModuleName::from_dotted(&file.name).as_str()) {
+            if !is_shipped(&ModuleName::from_dotted(&file.name)) {
                 return None;
             }
             (file.path, file.text)
@@ -116,7 +116,6 @@ impl<'v> Filed<'v> {
 /// when the answer does not encode, or when the entry is more than one read of the file it is filed
 /// in would answer.
 pub fn entry(files: &[LoadedFile], dump: &Value, library: &str) -> Option<Vec<u8>> {
-    let ships = crate::shipped_modules::name_set();
     let entry = record(vec![
         ("format", Value::str(FORMAT)),
         (
@@ -125,7 +124,7 @@ pub fn entry(files: &[LoadedFile], dump: &Value, library: &str) -> Option<Vec<u8
                 files
                     .iter()
                     .map(|file| {
-                        let shipped = ships.contains(ModuleName::from_dotted(&file.name).as_str());
+                        let shipped = is_shipped(&ModuleName::from_dotted(&file.name));
                         record(vec![
                             ("path", Value::str(&file.path)),
                             ("name", Value::str(&file.name)),

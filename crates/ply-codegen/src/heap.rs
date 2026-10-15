@@ -709,6 +709,9 @@ pub fn field_word(heap: &mut Heap, layouts: &Layouts, o: *mut Obj, at: usize, sl
 /// A closure's payload: its compiled code's address first, then the captured values.
 pub const CLOSURE_CODE: usize = 0;
 pub const CLOSURE_CAPTURES: usize = 1;
+/// A closure flag: its first capture is the immediate address of the descriptor compiled code
+/// reads to call it by its type.
+pub const CLOSURE_DESCRIBED: u8 = 16;
 
 /// A bridge's payload: one owned `Value`.
 const BRIDGE_BYTES: usize = std::mem::size_of::<Value>();

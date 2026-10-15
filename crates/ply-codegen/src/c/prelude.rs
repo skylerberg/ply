@@ -243,6 +243,7 @@ helpers![
     (rt_constant, 1, true),
     (rt_call, 3, true),
     (rt_closure, 4, true),
+    (rt_lambda_value, 3, true),
     (rt_iterate, 3, true),
     (rt_iterate_bad, 2, false),
     (rt_shift_count, 2, false),

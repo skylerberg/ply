@@ -2832,9 +2832,10 @@ holds a statement's columns to where `std.db`'s `fetch` reads rows by it (§16).
 ## 12. Builtins
 
 The functions every module calls without importing them. Each is declared in the
-compiler's prelude as an `extern fn`: a signature the runtime implements, with a
-row and a `where` like any other and no body, and a doc. Only the prelude
-declares one; an `extern fn` in a module is `E0151`. Most are functions of a
+compiler's prelude with a doc: an `extern fn` is a signature the runtime
+implements, with a row and a `where` like any other and no body, and a `pub fn`
+is written there in Ply (`List::map`, `List::filter`, `List::fold`). Only the
+prelude declares one; an `extern fn` in a module is `E0151`. Most are functions of a
 type of the language's, declared under it (`extern fn List::len`) and called on
 a value or through the type as any function of a type is (§5.4): `xs.len()`,
 `Map::new()`. No module declares one of those again, so nothing hides one. The

@@ -36,7 +36,7 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, Sh
               shipped_data_bin, read_outline, named_imports, Outlined, OTest, OLaw, ShippedWants,
               shipped_wants_bin)
 import items (Module, Item, IType, ILaw, ImportDecl, INames, header, parse, import_decl_bin,
-              homes_called, homes_declaring, is_written)
+              homes_called, homes_declaring, is_written, builtins_module, prelude_text)
 import derive (dotted)
 import diagnostics (ParsedSource, parse_all, parse_at, parse_from, placed)
 import interface (imported, blanked)
@@ -436,7 +436,10 @@ fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, decode.write, a
         raw: raw,
         parsed: parsed,
         names: targets.map(|t: Named| t.module),
-        present: present.map(|t: Named| t.module).concat(homes),
+        // What every module imports past its text: the prelude's functions written in Ply.
+        present: present.map(|t: Named| t.module).concat(homes).concat(
+          if module == builtins_module() { [] } else { [builtins_module()] },
+        ),
         placed: placed_by(placing),
         reading: {
           pkgs: pkgs,
@@ -812,7 +815,7 @@ pub fn owners_answer(input: Bytes) -> Bytes / {memo.read, decode.write, abort.ra
         // Its text, or its imports alone: one naming no module there is, or two binding one name.
         refusing: m.reading.given.fold(false, |b: Bool, g: ParsedSource|
             b || g.diags.fold(false, |c: Bool, d: Diag| c || d.severity == b"error"))
-          || m.present.len() < m.names.len()
+          || m.names.filter(|n: Bytes| !m.present.contains(n)).len() > 0
           || colliding(m.raw.imports).len() > 0,
       }
     },
@@ -1332,7 +1335,7 @@ pub fn group_answer_of(input: Bytes) -> Bytes / {Answering, abort.raise} = {
             acc.concat(owner_facts(named, x).mentions)),
           imports_of(asked),
           // A unit's group stands on its members' walks, which take what the same check offered.
-          if alone { entire } else { beside(called_by(named, asked)) },
+          if alone { entire } else { beside(walked_calls(named, asked)) },
         );
         o
       },
@@ -1471,12 +1474,23 @@ fn imports_of(asked: GroupNamed) -> List<Imported> / {memo.read, abort.raise} =
     "a group's imports",
   )
 
-/// The owners of its module, itself left out, that the group `asked` calls: what its members'
-/// walks left.
-fn called_by(named: Named, asked: GroupNamed) -> List<Bytes> / {memo.read, abort.raise} =
-  asked.owners.fold([], |acc: List<Bytes>, o: Bytes|
-    calls_of(named, o).fold(acc, |a: List<Bytes>, c: Bytes|
-      if asked.owners.contains(c) || a.contains(c) { a } else { a.push(c) }))
+/// The owners of its module, itself left out, that the group `asked` calls, read off its members'
+/// walks themselves: a kept `calls` answer may stand for an earlier walk while marks settle.
+fn walked_calls(named: Named, asked: GroupNamed) -> List<Bytes> / {memo.read, abort.raise} =
+  called_in(asked, asked.owners.map(|o: Bytes| { owner: o, typed: walk_of(named, o) }))
+
+/// As `walked_calls`, of walks `walked` already read.
+fn called_in(
+  asked: GroupNamed,
+  walked: List<{ owner: Bytes, typed: owned::TypedAnswer }>,
+) -> List<Bytes> / {memo.read, abort.raise} =
+  walked.fold([], |acc: List<Bytes>, w: { owner: Bytes, typed: owned::TypedAnswer }|
+    called_owners(w.owner, owned::called_names(asked.module, w.typed), |n: Bytes|
+      declared_of(asked.module, asked.shipped, asked.tested, n)).fold(
+      acc,
+      |a: List<Bytes>, c: Bytes|
+        if asked.owners.contains(c) || a.contains(c) { a } else { a.push(c) },
+    ))
 
 /// How a group that calls `called` reads each other owner of its module: one it calls by what
 /// that owner's group settled, which its own settling reads, and any other by its signature.
@@ -1498,7 +1512,7 @@ fn group_settled(
       named,
       members,
       imports_of(asked),
-      beside(called_by(named, asked)),
+      beside(called_in(asked, walked)),
       |source: OwnerSource| Some(owned::handed_bodies(walked, source.items, source.offset)),
     );
     owned::settled_answer(cut_of(asked.module, c), walked, c.source.items)
@@ -3032,12 +3046,22 @@ pub fn looked<| e>(
   at: Bytes,
 ) -> Option<Bytes> / {abort.raise | e} =
   if kind == layout_kind() { Some(w.layout) } else if kind == shipped_names_kind() {
-    Some(bin::encode(names(), bin::list_bin(bin::bytes_bin())))
+    let listed = names();
+    Some(
+      bin::encode(
+        if listed.contains(builtins_module()) { listed } else { listed.push(builtins_module()) },
+        bin::list_bin(bin::bytes_bin()),
+      ),
+    )
   } else if kind == module_kind() { w.places.get(at) }
   else if kind == text_kind() { w.texts.get(at) }
-  else if kind == shipped_kind() { shipped(at) }
-  else if kind == shipped_there_kind() { match shipped(at) { Some(_) -> Some(b""), None -> None } }
-  else if kind == data_kind() { data(at) }
+  // The prelude's functions written in Ply are shipped with the toolchain, which no file holds.
+  else if kind == shipped_kind() {
+    if at == builtins_module() { Some(prelude_text()) } else { shipped(at) }
+  } else if kind == shipped_there_kind() {
+    if at == builtins_module() { Some(b"") }
+    else { match shipped(at) { Some(_) -> Some(b""), None -> None } }
+  } else if kind == data_kind() { data(at) }
   else if kind == embed_kind() { embedded_at(w, reader, at) }
   else { None }
 
@@ -3242,10 +3266,13 @@ pub fn shipped_all(
   shipped: List<Bytes>,
   run: Run,
 ) -> Run / {Driving, abort.raise} = {
+  // The prelude's functions written in Ply ship with every load, though no file holds them.
+  let every = if shipped.contains(builtins_module()) { shipped }
+  else { shipped.push(builtins_module()) };
   let ordered = dependencies_first(
     qs,
     run,
-    shipped.map(|m: Bytes| { module: m, shipped: true, tested: false }),
+    every.map(|m: Bytes| { module: m, shipped: true, tested: false }),
   );
   declaring_in(
     qs,
@@ -4194,6 +4221,28 @@ test "an answer through the store is the fresh one through every kind of edit a 
   )
 }
 
+test "a group whose member now calls another sibling settles through the store as fresh" {
+  let src = Bytes::concat_all([
+    b"pub fn even(n: Int) -> Bool = if n <= 0 { here() } else { odd(n - 1) }\n",
+    b"pub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\n",
+    b"fn here() -> Bool = true\n",
+    b"fn there() -> Bool = 1 > 0\n",
+    b"pub fn other(n: Int) -> Int = n + 1\n",
+  ]);
+  let s0 = [{ name: b"cycle", src: src }];
+  let s1 = edited(s0, b"cycle", b"{ here() }", b"{ there() }");
+  let s2 = edited(s1, b"cycle", b"{ false }", b"{ here() }");
+  assert_eq(
+    disagreements([
+      step(b"cold", s0),
+      step(b"a member calls another sibling", s1),
+      step(b"the other member calls the first's old one", s2),
+      step(b"back", s0),
+    ]),
+    [],
+  )
+}
+
 test "moving, removing and re-signing definitions leaves an answer through the store the fresh one" {
   let s0 = shop();
   let twice = b"pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\n";
@@ -4991,7 +5040,7 @@ test "a program's tables made from its modules' answers are the tables of its ch
           let answered = answered_program(
             fixed.answers.map(|a: Answered| facts_answered(a.answer)),
             fixed.fixing,
-            Map::new(),
+            Map::new().insert(builtins_module(), prelude_text()),
             true,
             true,
             w.warnings,
@@ -5063,10 +5112,12 @@ test "a program assembled from its modules' answers, a shipped module's among th
     { root: b"", manifest: None, files: f.user.map(|s: Source| { module: s.name, text: s.src }) },
     [],
   );
-  let texts = f.shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
-    acc.insert(s.name, s.src));
+  let texts = f.shipped.fold(
+    Map::new().insert(builtins_module(), prelude_text()),
+    |acc: Map<Bytes, Bytes>, s: Source| acc.insert(s.name, s.src),
+  );
   let held = |name: Bytes| texts.get(name);
-  let names = f.shipped.map(|s: Source| s.name);
+  let names = f.shipped.map(|s: Source| s.name).push(builtins_module());
   // As a program reads a shipped module, cut to its reach; and as a run over the standard library's
   // own tests reads it, whole and with its tests.
   [{ tested: false, reached: true }, { tested: true, reached: false }].fold(
@@ -5112,7 +5163,7 @@ test "a program assembled from its modules' answers, a shipped module's among th
             done.answers.fold(Map::new(), |acc: Map<Bytes, ModuleAnswer>, a: Answered|
               acc.insert(a.module, a.answer)),
           );
-          assert_eq(loaded.pulled, [b"std.shapes"]);
+          assert_eq(loaded.pulled, [b"compiler.builtins", b"std.shapes"]);
           assert_eq(assembled.checked.tests.len(), if mode.tested { 2 } else { 1 });
           assert_eq(loaded.frame.outlines, view.frame.outlines);
           assert_eq(assembled.checked.defs, view.checked.defs);
@@ -5139,7 +5190,8 @@ fn layered(lib: Bytes) -> List<Source> =
 test "a run over an unchanged program runs no query again" {
   let sources = layered(b"pub fn step(n: Int) -> Int = n + 1\n");
   let cold = answered_over(nothing_held(), sources);
-  assert_eq(ran_of(cold.run, module_query()), 3);
+  // Its three modules and the prelude's functions written in Ply, which each of them imports.
+  assert_eq(ran_of(cold.run, module_query()), 4);
   assert_eq(ran_total(answered_over(cold.held, sources).run), 0)
 }
 
@@ -5666,7 +5718,7 @@ test "where only what puts a module together is defined anew, its groups stand a
   );
   // Every query's hash names the run's stamp, so the store vouches for nothing to this one.
   let warm = answered_under(qs, cold.held, sources);
-  assert_eq([ran_of(warm.run, module_query()), ran_of(warm.run, group_query())], [2, 0]);
+  assert_eq([ran_of(warm.run, module_query()), ran_of(warm.run, group_query())], [3, 0]);
   assert(!checked_whole_in(warm.held, anew, b"app"));
   assert_eq(warm.answers, cold.answers)
 }
@@ -5974,8 +6026,12 @@ test "a load that refuses checks no module that imports a refused one, and no gr
     b"aside",
     b"lib",
   ]);
-  assert_eq(ran_of(cold.run, module_query()), 2);
-  assert_eq(ran_of(cold.run, group_query()), 0);
+  // The two refused and the prelude's functions written in Ply, whose groups are its own to check.
+  assert_eq(ran_of(cold.run, module_query()), 3);
+  assert_eq(
+    groups_ran(cold.run, group_query()).filter(|g: GroupNamed| g.module != builtins_module()),
+    [],
+  );
   let mended = with_module(
     with_module(sources, b"lib", b"pub fn broken() -> Int = 3\n\npub fn fine() -> Int = 1\n"),
     b"aside",

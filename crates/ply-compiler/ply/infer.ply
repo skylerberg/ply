@@ -8,15 +8,15 @@ import std.list (prepend)
 import std.graph
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, MRaise, ty_span, mode_text, is_raise, ident_names, mode_bin)
-import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
-              FnDef, ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum,
-              VariantDef, EffectDef, OpDef, TestDef, Cases, LawDef, OfSchema, Binder, Constraint,
-              Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger, DRow, is_predicate,
-              deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost, SSpace,
-              SpecClause, Derived, DeriveDef, parse, TDNominal, test_run, test_listing, IInstance,
-              InstanceDef, InstanceKind, NKey, NShow, instance_text, INumeric, NumericDef,
-              member_name, member_of, NumericOp, numeric_ops, numeric_by, is_pub, Opaque,
-              spec_kind_bin, deriver_bin, instance_kind_bin)
+import items (builtins_module, Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive,
+              IEffectSet, IExtern, FnDef, ExternDef, ImportDecl, INames, VPub, TypeDef, TypeDefBody,
+              TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, Cases, LawDef, OfSchema,
+              Binder, Constraint, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger,
+              DRow, is_predicate, deriver_text, deriver_tag, schema_of, SpecKind, SRequires,
+              SEnsures, SCost, SSpace, SpecClause, Derived, DeriveDef, parse, TDNominal, test_run,
+              test_listing, IInstance, InstanceDef, InstanceKind, NKey, NShow, instance_text,
+              INumeric, NumericDef, member_name, member_of, NumericOp, numeric_ops, numeric_by,
+              is_pub, Opaque, spec_kind_bin, deriver_bin, instance_kind_bin)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param,
@@ -1256,6 +1256,8 @@ pub type Builtin = {
   clauses: List<Bytes>,
   /// The same as the checker reads them, a `requires` for each condition `&&` joins.
   contract: Contract,
+  /// Whether the prelude writes its body in Ply, rather than the runtime implementing it.
+  body: Bool,
 }
 
 /// What a declaration's types are read against: the variables its generic list binds, and the types
@@ -1484,8 +1486,26 @@ fn declared(source: Bytes, imported: Map<Bytes, Bytes>, def: ExternDef) -> Built
     constraints: dedup_constraints(found),
     clauses: def.spec.map(|c: SpecClause| source.slice(c.span.start, c.span.end)),
     contract: contract_of(source, def, params.tys, ret.ty, row),
+    body: false,
   }
 }
+
+/// A prelude function written in Ply, as the declaration its signature is.
+fn extern_of(d: FnDef) -> ExternDef / {abort.raise} =
+  {
+    name: d.name,
+    generics: d.generics,
+    params: d.params,
+    ret: match d.ret {
+      Some(t) -> t,
+      None -> panic(misdeclared(b"writes no answer's type", d.name.name)),
+    },
+    effects: d.effects,
+    constraints: d.constraints,
+    spec: d.spec,
+    doc: d.doc,
+    span: d.span,
+  }
 
 /// Every function the prelude declares, in its order. Pure and nullary, so the runtime reads the
 /// prelude once.
@@ -1495,7 +1515,12 @@ pub fn builtins() -> List<Builtin> / {abort.raise} = {
   if parsed.parser.diags.len() > 0 { panic("the prelude does not parse") } else {
     let imported = prelude_imports(parsed.node.imports);
     parsed.node.items.fold([], |acc: List<Builtin>, item: Item|
-      match item { IExtern(def) -> acc.push(declared(source, imported, def)), _ -> acc })
+      match item {
+        IExtern(def) -> acc.push(declared(source, imported, def)),
+        IFn(d) -> if d.vis != VPub { acc }
+        else { acc.push({ ..declared(source, imported, extern_of(d)), body: true }) },
+        _ -> acc,
+      })
   }
 }
 
@@ -9879,82 +9904,86 @@ fn home_module(of: Bytes) -> Bytes / {abort.raise} =
 /// alone, and reads a record's fields first. A type of the language's has its home module's,
 /// under no name the prelude declares for it.
 fn member_declared(checker: Checker, parsed: ParsedModule, def: FnDef) -> Checker / {abort.raise} =
-  match member_of(def.name.name) {
-    None -> checker,
-    Some(m) -> {
-      let type_name = qualify(parsed.name, m.of);
-      match checker.types.get(type_name) {
-        None -> if builtin_type_arity(m.of) != None && home_module(m.of) == parsed.name {
-          if env_depth_of(checker.env, def.name.name) != Some(0) { checker } else {
+
+  // The prelude writes the language's own functions of its types, the builtins it declares.
+  if parsed.name == builtins_module() { checker } else {
+    match member_of(def.name.name) {
+      None -> checker,
+      Some(m) -> {
+        let type_name = qualify(parsed.name, m.of);
+        match checker.types.get(type_name) {
+          None -> if builtin_type_arity(m.of) != None && home_module(m.of) == parsed.name {
+            if env_depth_of(checker.env, def.name.name) != Some(0) { checker } else {
+              report_error_at(
+                checker,
+                b"E0105",
+                def.name.span,
+                Bytes::concat_all([b"`", def.name.name, b"` is a builtin"]),
+                b"cannot be redefined",
+                [b"a type has one function of a name, and the prelude declares this one"],
+              )
+            }
+          } else {
             report_error_at(
               checker,
-              b"E0105",
+              b"E0208",
               def.name.span,
-              Bytes::concat_all([b"`", def.name.name, b"` is a builtin"]),
-              b"cannot be redefined",
-              [b"a type has one function of a name, and the prelude declares this one"],
-            )
-          }
-        } else {
-          report_error_at(
-            checker,
-            b"E0208",
-            def.name.span,
-            Bytes::concat_all([b"`", m.of, b"` is not a type this module declares"]),
-            b"declared in another module, or not at all",
-            [
-              b"a function of a type is found by the type alone, with no search, so only the module that declares the type declares one",
-            ],
-          )
-        },
-        Some(decl) -> match decl.declared {
-          DeclaredAlias(_) ->
-            report_error_at_and(
-              checker,
-              b"E0217",
-              def.name.span,
-              Bytes::concat_all([
-                b"`",
-                m.of,
-                b"` is an alias, and a function of a type is of a sum or a `new` record",
-              ]),
-              b"no type of its own",
-              { module: decl.owner, span: decl.span },
-              b"declared here",
+              Bytes::concat_all([b"`", m.of, b"` is not a type this module declares"]),
+              b"declared in another module, or not at all",
               [
-                b"an alias is the type it names, so a function of one would be of every value of that type",
+                b"a function of a type is found by the type alone, with no search, so only the module that declares the type declares one",
               ],
-            ),
-          DeclaredRecord(_) -> match checker.nominals.get(type_name) {
-            Some(r) -> match record_fields(r.ty) {
-              Some(fs) -> if field_get(fs, m.member) == None { checker } else {
-                report_error_at_and(
-                  checker,
-                  b"E0105",
-                  def.name.span,
-                  Bytes::concat_all([
-                    b"`",
-                    m.of,
-                    b"` has a field `",
-                    m.member,
-                    b"` and a function of that name",
-                  ]),
-                  b"declared again here",
-                  { module: decl.owner, span: decl.span },
-                  b"the field is declared here",
-                  [
-                    b"`value.name` reads a record's field and `value.name(..)` calls it, so a function of the record under the same name could never be called on a value; rename one",
-                  ],
-                )
+            )
+          },
+          Some(decl) -> match decl.declared {
+            DeclaredAlias(_) ->
+              report_error_at_and(
+                checker,
+                b"E0217",
+                def.name.span,
+                Bytes::concat_all([
+                  b"`",
+                  m.of,
+                  b"` is an alias, and a function of a type is of a sum or a `new` record",
+                ]),
+                b"no type of its own",
+                { module: decl.owner, span: decl.span },
+                b"declared here",
+                [
+                  b"an alias is the type it names, so a function of one would be of every value of that type",
+                ],
+              ),
+            DeclaredRecord(_) -> match checker.nominals.get(type_name) {
+              Some(r) -> match record_fields(r.ty) {
+                Some(fs) -> if field_get(fs, m.member) == None { checker } else {
+                  report_error_at_and(
+                    checker,
+                    b"E0105",
+                    def.name.span,
+                    Bytes::concat_all([
+                      b"`",
+                      m.of,
+                      b"` has a field `",
+                      m.member,
+                      b"` and a function of that name",
+                    ]),
+                    b"declared again here",
+                    { module: decl.owner, span: decl.span },
+                    b"the field is declared here",
+                    [
+                      b"`value.name` reads a record's field and `value.name(..)` calls it, so a function of the record under the same name could never be called on a value; rename one",
+                    ],
+                  )
+                },
+                None -> checker,
               },
               None -> checker,
             },
-            None -> checker,
+            DeclaredSum -> checker,
           },
-          DeclaredSum -> checker,
-        },
-      }
-    },
+        }
+      },
+    }
   }
 
 /// The order a module's bodies are walked in: each after those its body names, where the names
@@ -21079,6 +21108,8 @@ test "a call on a value is a call of its type's function with the value first" {
 test "a function of a type is declared by the type's module, for a sum or a `new` record" {
   assert_eq(check_codes(b"fn Option::size(o: Option<Int>) -> Int = 0"), [b"E0208"]);
   assert_eq(check_codes(b"fn Missing::size(n: Int) -> Int = n"), [b"E0208"]);
+  // The prelude writes its own in Ply, which no other module may.
+  assert_eq(check_codes(b"fn List::map(xs: List<Int>, n: Int) -> List<Int> = xs"), [b"E0208"]);
   assert_eq(
     check_codes(b"type Pair = { a: Int, b: Int }\nfn Pair::sum(p: Pair) -> Int = p.a + p.b"),
     [b"E0217"],
