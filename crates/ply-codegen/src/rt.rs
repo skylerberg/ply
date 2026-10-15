@@ -2624,6 +2624,14 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let room = heap::imm_value(*n).clamp(0, crate::list::WIDTH as i64) as u32;
             Some(ctx.heap.alloc_list(room) as Word)
         }
+        (Builtin::ListLeafOf, [xs, j]) if heap::kind(*xs) == KIND_LIST && heap::is_imm(*j) => {
+            let leaf = list::leaf_of(obj(*xs), heap::imm_value(*j));
+            if leaf != 0 {
+                heap::inc(leaf);
+            }
+            heap::dec(*xs);
+            Some(leaf)
+        }
         (Builtin::HoldGet, [h]) => {
             let o = hold_object(*h)?;
             let held = unsafe { word_at(o, CLOSURE_CAPTURES) };

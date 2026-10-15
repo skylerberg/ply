@@ -29,20 +29,10 @@ extern fn List::len<a>(xs: List<a>) -> Int
 /// allocation holds, or below zero, takes what it can.
 extern fn List::with_capacity<a>(n: Int) -> List<a>
 
-/// A new list with `x` at the end.
-extern fn List::push<a>(xs: List<a>, x: a) -> List<a>
-
-/// `None` if `i` is negative or past the end.
-extern fn List::at<a>(xs: List<a>, i: Int) -> Option<a>
-
-/// Raises if `i` is out of range.
-extern fn List::set<a>(xs: List<a>, i: Int, v: a) -> List<a> / {abort.raise}
-  requires 0 <= i && i < List::len(xs)
-
 /// A node of a list's trie: a leaf of up to 32 items, or a branch of up to 32 children. A list
 /// holds its items in a trie but for its last few, up to 32, which its tail holds, and a `rest` cut
-/// shares the list's trie, dropping a prefix of it. The emitter writes each function of it in place
-/// over those objects, and checks no index: each is one the object holds.
+/// shares the list's trie, dropping a prefix of it. The emitter writes each function of it but
+/// `leaf_of` in place over those objects, and checks no index: each is one the object holds.
 extern type ListNode<a>
 
 /// How many items a `rest` dropped from the front of the list's trie.
@@ -106,6 +96,112 @@ extern fn ListNode::tail_start<a>(xs: List<a>, x: a) -> List<a>
 
 /// A branch with no child.
 extern fn ListNode::branch<a>() -> ListNode<a>
+
+/// The leaf that holds the list's items from the `j`-th 32 of its trie on, counting from the leaf
+/// its first item lies in, which a `rest` cut may have dropped items of; `None` past its last leaf,
+/// and for a list that is its tail. The runtime's native, which reads down from the root.
+extern fn ListNode::leaf_of<a>(xs: List<a>, j: Int) -> Option<ListNode<a>>
+
+fn shift_from(count: Int, shift: Int) -> Int =
+  if shift >= 60 || 32 << shift >= count { shift } else { shift_from(count, shift + 5) }
+
+/// How far the root of a trie of `count` items shifts an index: zero while the root is a leaf.
+fn trie_shift(count: Int) -> Int = shift_from(count, 0)
+
+/// `None` if `i` is negative or past the end.
+pub fn List::at<a>(xs: List<a>, i: Int) -> Option<a> =
+  if i < 0 || i >= List::len(xs) { None } else {
+    let start = ListNode::start(xs);
+    let p = start + i;
+    let held = start + List::len(xs) - ListNode::tail_len(xs);
+    if p >= held { Some(ListNode::tail_at(xs, p - held)) } else {
+      match ListNode::leaf_of(xs, (p >> 5) - (start >> 5)) {
+        Some(n) -> Some(ListNode::leaf_at(n, p & 31)),
+        None -> None,
+      }
+    }
+  }
+
+/// `leaf` under a branch of one child for each level down to where nodes `shift` apart hold leaves.
+fn trie_path<a>(leaf: ListNode<a>, shift: Int) -> ListNode<a> =
+  if shift <= 0 { leaf }
+  else { ListNode::kid_swap(ListNode::branch(), 0, Some(trie_path(leaf, shift - 5))).node }
+
+/// The node `n`, whose children lie `shift` apart, with the full `leaf` holding its items from
+/// `index` on.
+fn trie_inserted<a>(n: ListNode<a>, shift: Int, index: Int, leaf: ListNode<a>) -> ListNode<a> =
+  if shift <= 0 { n } else {
+    let k = index >> shift & 31;
+    if k < ListNode::len(n) {
+      let taken = ListNode::kid_swap(n, k, None);
+      match taken.old {
+        Some(child) ->
+          ListNode::kid_swap(
+            taken.node,
+            k,
+            Some(trie_inserted(child, shift - 5, index, leaf)),
+          ).node,
+        None -> taken.node,
+      }
+    } else { ListNode::kid_swap(n, k, Some(trie_path(leaf, shift - 5))).node }
+  }
+
+/// The root of a trie of `count` items, `root`, with the full `leaf` after them.
+fn trie_pushed<a>(root: Option<ListNode<a>>, count: Int, leaf: ListNode<a>) -> ListNode<a> =
+  match root {
+    None -> leaf,
+    Some(r) -> {
+      let shift = trie_shift(count);
+      if count == 32 << shift {
+        let up = ListNode::kid_swap(ListNode::branch(), 0, Some(r)).node;
+        ListNode::kid_swap(up, 1, Some(trie_path(leaf, shift))).node
+      } else { trie_inserted(r, shift, count, leaf) }
+    },
+  }
+
+/// A new list with `x` at the end: in place where the list is held once.
+pub fn List::push<a>(xs: List<a>, x: a) -> List<a> =
+  if ListNode::tail_len(xs) < 32 { ListNode::tail_push(xs, x) } else {
+    let held = ListNode::start(xs) + List::len(xs) - 32;
+    let spilt = ListNode::spill(xs);
+    let taken = ListNode::root_swap(spilt.list, None);
+    let root = trie_pushed(taken.old, held, spilt.leaf);
+    ListNode::tail_start(ListNode::root_swap(taken.list, Some(root)).list, x)
+  }
+
+/// The node `n`, whose children lie `shift` apart, with its item `p` replaced by `v`.
+fn trie_set<a>(n: ListNode<a>, shift: Int, p: Int, v: a) -> ListNode<a> =
+  if shift <= 0 { ListNode::leaf_set(n, p & 31, v) } else {
+    let k = p >> shift & 31;
+    let taken = ListNode::kid_swap(n, k, None);
+    match taken.old {
+      Some(child) -> ListNode::kid_swap(taken.node, k, Some(trie_set(child, shift - 5, p, v))).node,
+      None -> taken.node,
+    }
+  }
+
+/// In place where the list is held once; raises if `i` is out of range.
+pub fn List::set<a>(xs: List<a>, i: Int, v: a) -> List<a> / {abort.raise}
+  requires 0 <= i && i < List::len(xs)
+=
+  if i < 0 || i >= List::len(xs) {
+    panic(
+      "`List::set` index " ++ Int::to_string(i) ++ " is outside a value of "
+        ++ Int::to_string(List::len(xs))
+        ++ " elements",
+    )
+  } else {
+    let start = ListNode::start(xs);
+    let p = start + i;
+    let held = start + List::len(xs) - ListNode::tail_len(xs);
+    if p >= held { ListNode::tail_set(xs, p - held, v) } else {
+      let taken = ListNode::root_swap(xs, None);
+      match taken.old {
+        Some(r) -> ListNode::root_swap(taken.list, Some(trie_set(r, trie_shift(held), p, v))).list,
+        None -> taken.list,
+      }
+    }
+  }
 
 /// `n` of `x`; raises if `n` is negative or past `2^26`.
 extern fn Array::new<a>(n: Int, x: a) -> Array<a> / {abort.raise}
@@ -172,29 +268,131 @@ extern fn numeric_of_int<a>(n: Int) -> a / {abort.raise}
   where numeric(a)
   requires 0 <= n && n <= 127
 
-fn mapped_from<a, b | e>(xs: List<a>, f: (a) -> b / e, i: Int, out: List<b>) -> List<b> / e =
-  match xs.at(i) { Some(x) -> mapped_from(xs, f, i + 1, out.push(f(x))), None -> out }
+// Each walk is one loop over the positions of the list's items, carrying the leaf `n` that held the
+// item before the one at `p`, of the trie's first `held` items, which a `rest` cut's `start`
+// offsets, and asking for the next leaf only where an item opens one; past them it walks the tail,
+// which calls back nothing.
+
+fn leaves_mapped<a, b | e>(
+  xs: List<a>,
+  start: Int,
+  held: Int,
+  p: Int,
+  n: Option<ListNode<a>>,
+  f: (a) -> b / e,
+  out: List<b>,
+) -> List<b> / e =
+  if p >= List::len(xs) { out }
+  else if p >= held { tail_mapped(xs, 0, f, out) } else {
+    let q = start + p;
+    let leaf = match n {
+      Some(_) -> if q & 31 == 0 { ListNode::leaf_of(xs, (q >> 5) - (start >> 5)) } else { n },
+      None -> ListNode::leaf_of(xs, (q >> 5) - (start >> 5)),
+    };
+    match leaf {
+      Some(m) ->
+        leaves_mapped(
+          xs,
+          start,
+          held,
+          p + 1,
+          leaf,
+          f,
+          List::push(out, f(ListNode::leaf_at(m, q & 31))),
+        ),
+      None -> out,
+    }
+  }
+
+fn tail_mapped<a, b | e>(xs: List<a>, i: Int, f: (a) -> b / e, out: List<b>) -> List<b> / e =
+  if i >= 32 || i >= ListNode::tail_len(xs) { out }
+  else { tail_mapped(xs, i + 1, f, List::push(out, f(ListNode::tail_at(xs, i)))) }
 
 /// `f` of each item, in order.
 pub fn List::map<a, b | e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e =
-  mapped_from(xs, f, 0, List::with_capacity(xs.len()))
+  leaves_mapped(
+    xs,
+    ListNode::start(xs),
+    List::len(xs) - ListNode::tail_len(xs),
+    0,
+    None,
+    f,
+    List::with_capacity(List::len(xs)),
+  )
 
-fn kept_from<a | e>(xs: List<a>, f: (a) -> Bool / e, i: Int, out: List<a>) -> List<a> / e =
-  match xs.at(i) {
-    Some(x) -> kept_from(xs, f, i + 1, if f(x) { out.push(x) } else { out }),
-    None -> out,
+fn leaves_kept<a | e>(
+  xs: List<a>,
+  start: Int,
+  held: Int,
+  p: Int,
+  n: Option<ListNode<a>>,
+  f: (a) -> Bool / e,
+  out: List<a>,
+) -> List<a> / e =
+  if p >= List::len(xs) { out }
+  else if p >= held { tail_kept(xs, 0, f, out) } else {
+    let q = start + p;
+    let leaf = match n {
+      Some(_) -> if q & 31 == 0 { ListNode::leaf_of(xs, (q >> 5) - (start >> 5)) } else { n },
+      None -> ListNode::leaf_of(xs, (q >> 5) - (start >> 5)),
+    };
+    match leaf {
+      Some(m) -> {
+        let x = ListNode::leaf_at(m, q & 31);
+        leaves_kept(xs, start, held, p + 1, leaf, f, if f(x) { List::push(out, x) } else { out })
+      },
+      None -> out,
+    }
+  }
+
+fn tail_kept<a | e>(xs: List<a>, i: Int, f: (a) -> Bool / e, out: List<a>) -> List<a> / e =
+  if i >= 32 || i >= ListNode::tail_len(xs) { out } else {
+    let x = ListNode::tail_at(xs, i);
+    tail_kept(xs, i + 1, f, if f(x) { List::push(out, x) } else { out })
   }
 
 /// The items `f` keeps, in order.
 pub fn List::filter<a | e>(xs: List<a>, f: (a) -> Bool / e) -> List<a> / e =
-  kept_from(xs, f, 0, List::with_capacity(xs.len()))
+  leaves_kept(
+    xs,
+    ListNode::start(xs),
+    List::len(xs) - ListNode::tail_len(xs),
+    0,
+    None,
+    f,
+    List::with_capacity(List::len(xs)),
+  )
 
-fn folded_from<a, b | e>(xs: List<a>, f: (b, a) -> b / e, i: Int, acc: b) -> b / e =
-  match xs.at(i) { Some(x) -> folded_from(xs, f, i + 1, f(acc, x)), None -> acc }
+fn leaves_folded<a, b | e>(
+  xs: List<a>,
+  start: Int,
+  held: Int,
+  p: Int,
+  n: Option<ListNode<a>>,
+  f: (b, a) -> b / e,
+  acc: b,
+) -> b / e =
+  if p >= List::len(xs) { acc }
+  else if p >= held { tail_folded(xs, 0, f, acc) } else {
+    let q = start + p;
+    let leaf = match n {
+      Some(_) -> if q & 31 == 0 { ListNode::leaf_of(xs, (q >> 5) - (start >> 5)) } else { n },
+      None -> ListNode::leaf_of(xs, (q >> 5) - (start >> 5)),
+    };
+    match leaf {
+      Some(m) ->
+        leaves_folded(xs, start, held, p + 1, leaf, f, f(acc, ListNode::leaf_at(m, q & 31))),
+      None -> acc,
+    }
+  }
+
+fn tail_folded<a, b | e>(xs: List<a>, i: Int, f: (b, a) -> b / e, acc: b) -> b / e =
+  if i >= 32 || i >= ListNode::tail_len(xs) { acc }
+  else { tail_folded(xs, i + 1, f, f(acc, ListNode::tail_at(xs, i))) }
 
 /// Left to right.
 pub fn List::fold<a, b | e>(xs: List<a>, init: b, f: (b, a) -> b / e) -> b / e =
-  folded_from(xs, f, 0, init)
+  leaves_folded(xs, ListNode::start(xs), List::len(xs) - ListNode::tail_len(xs), 0, None, f, init)
 
 /// `step` answers `Continue(next)` or `Stop(result)`; the budget bounds the steps.
 extern fn iterate<a, b | e>(

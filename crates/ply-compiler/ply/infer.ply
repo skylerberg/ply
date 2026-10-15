@@ -6035,7 +6035,15 @@ fn language_function(
 ) -> Option<{ qname: QName, callee: Bytes }> / {abort.raise} = {
   let declared = member_name(of, name.name);
   match lookup(scope_of(checker).bound, ValueSpace, declared) {
-    Some(own) ->
+    // The prelude's own call of a function it writes is the builtin's, as every module's is, so
+    // what is known of the builtin by name is known there too.
+    Some(own) -> if own.qualified == qualify(prelude_module(), declared)
+        && checker.contracts.contains(declared) {
+      Some({
+        qname: { module: None, name: { name: declared, span: name.span }, span: name.span },
+        callee: declared,
+      })
+    } else {
       Some({
         qname: {
           module: Some({ name: of_binder(scope_of(checker).module), span: name.span }),
@@ -6043,7 +6051,8 @@ fn language_function(
           span: name.span,
         },
         callee: own.qualified,
-      }),
+      })
+    },
     None -> builtin_or_home(checker, of, name, on_value, declared),
   }
 }
@@ -10057,12 +10066,22 @@ fn walked_first(fns: List<FnDef>) -> List<Int> / {abort.raise} = {
 /// them, which is the order they are written in: a function named twice, or by a name a builtin
 /// holds, is refused rather than walked.
 pub fn walk_order(parsed: ParsedModule) -> List<Bytes> =
-  parsed.module.items.fold([], |acc: List<Bytes>, item: Item|
+  walked_defs(parsed).map(|d: FnDef| qualify(parsed.name, d.name.name))
+
+/// The functions of `parsed` a check walks, by program-wide name, in the order it walks their
+/// bodies, which is the order it files what it finds in them: each after those its body names.
+pub fn walked_order(parsed: ParsedModule) -> List<Bytes> / {abort.raise} = {
+  let defs = walked_defs(parsed);
+  walked_first(defs).map(|i: Int| qualify(parsed.name, defs.get(i).name.name))
+}
+
+fn walked_defs(parsed: ParsedModule) -> List<FnDef> =
+  parsed.module.items.fold([], |acc: List<FnDef>, item: Item|
     match item {
-      IFn(def) -> if acc.contains(qualify(parsed.name, def.name.name))
+      IFn(def) -> if acc.any(|d: FnDef| d.name.name == def.name.name)
           || def.name.name == compare_values_name()
           || call_operator(def.name.name) != None { acc }
-      else { acc.push(qualify(parsed.name, def.name.name)) },
+      else { acc.push(def) },
       _ -> acc,
     })
 
@@ -20579,17 +20598,23 @@ test "an `extern type` is its shipped module's, typed by its parameters, and not
 }
 
 // A renamed or deleted declaration of one fails here, not as a call the runtime does not answer.
-test "the externs the emitter writes in place are the prelude's functions of its own types, no builtin and no native" {
+test "the prelude's functions of its own types are the externs the emitter writes in place and a native that reads a list's leaves, no builtin" {
   let text = prelude_source::text();
   let own = externs_of(prelude_module(), parse(text).node).map(|b: Builtin| b.name);
-  assert_eq(own.sort(), intrinsics().map(|i: { name: Bytes, op: Intrinsic }| i.name).sort());
+  let leaf_of = qualify(prelude_module(), b"ListNode::leaf_of");
+  assert_eq(
+    own.sort(),
+    intrinsics().map(|i: { name: Bytes, op: Intrinsic }| i.name).push(leaf_of).sort(),
+  );
   assert_eq(
     builtins().filter(|b: Builtin| own.contains(qualify(prelude_module(), b.name))).map(
       |b: Builtin| b.name,
     ),
     [],
   );
-  assert_eq(externs_in(prelude_module(), text), []);
+  assert_eq(externs_in(prelude_module(), text), [
+    { module: prelude_module(), name: b"ListNode::leaf_of", words: 2, raises: false },
+  ]);
   // Privacy hides them as it hides any module's own.
   let prelude = { name: prelude_module(), src: text };
   let user = |src: Bytes| codes_of([prelude, { name: b"m", src: src }]);

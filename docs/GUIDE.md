@@ -1467,8 +1467,10 @@ is a program — and a loop that never ends fails with `E0503` when that budget 
 spent. `--steps N` sets it (`0` is no bound), and the count is the same on every
 machine, so the verdict is too (§8.4).
 `range` and the byte scanners do not nest calls, and neither do `List::map`, `List::filter` and
-`List::fold`, which `std.prelude` writes as tail calls (§12), each pass a step beside what the
-function they are handed takes. `iterate` is a loop with an early exit and a step budget:
+`List::fold`, which `std.prelude` writes as tail calls over the leaves of the list's trie and its
+tail (§12): each item takes a step of the walk, and `map`'s and `filter`'s the steps of their push,
+beside what the function they are handed takes. `iterate` is a loop with an early exit and a step
+budget:
 
 ```ply
 fn first_gap(xs: List<Int>) -> Int =
@@ -2788,8 +2790,10 @@ body, a named definition's, or the caller's own parameter's cost name, so
 steps grow with what it is given leaves the call unread.
 
 A `cost` bound is an obligation, `<owner> cost #<n>`, that `ply prove` reads
-off the body and never runs. A native is at most a step, and `List::map`, `List::filter` and
-`List::fold`, which `std.prelude` writes in Ply (§12), take a step per element. Those three,
+off the body and never runs. A native is at most a step; `List::at`, `List::push` and
+`List::set`, which `std.prelude` writes in Ply (§12), at most a constant number, since a list's
+trie is no deeper than an `Int` has bits for; and `List::map`, `List::filter` and `List::fold`
+that per element. Those three,
 `Map::fold`, `iterate`, `Map::update`, `Bytes::position`
 and `metered` call a literal lambda or a named definition back as many times as
 an argument's size allows; a call of a definition costs its steps at the sizes
@@ -2942,8 +2946,13 @@ The functions every module calls without importing them. Each is declared in
 `std.prelude`, the module of the standard library every module reads without
 naming it, with a doc: an `extern fn` is a signature the runtime implements,
 with a row and a `where` like any other and no body, and a `pub fn` is written
-there in Ply (`List::map`, `List::filter`, `List::fold`), which a call reads by
-its signature as it reads an `extern fn`'s. A call of a native is a step; one
+there in Ply (`List::at`, `List::push`, `List::set`, `List::map`, `List::filter`,
+`List::fold`), which a call reads by its signature and its clauses as it reads an
+`extern fn`'s, so `List::set`'s `requires` is read where it is called (§6.8). A
+body that compares (`==`, `!=`, `compare`, `compare_values`), digests (`digest`)
+or reflects (`reflect`, `shown`) a value references `List::at` and `List::push`
+as well, which the code written for a list or a map there calls, so its hash
+covers them and a load that reaches it reaches them. A call of a native is a step; one
 written in Ply takes the steps its body does, as any function. `std.prelude`
 imports nothing. A module the toolchain
 ships may declare one too, a builtin of its own that it calls, or that a module

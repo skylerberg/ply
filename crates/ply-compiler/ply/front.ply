@@ -12,7 +12,7 @@ import exprs (sees_homes, Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf,
               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
               EParallel, EBad, ETryBlock, Param, Stmt, SLet, SLetElse, SExpr, SAssign, HandlerVar,
               MatchArm, RecField, expr_span, ETagged, Tagged, Hole, TaggedPart, tagged_parts,
-              hidden_binder, tagged_part_bin, prelude_module)
+              hidden_binder, tagged_part_bin, prelude_module, written_code)
 import patterns (Lit, LInt, LStr, LBytes)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform,
              NLabel, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, NKnown, CodeField,
@@ -6250,20 +6250,38 @@ test "the types a body binds and uses are filed by key, read from one table the 
   }
 }
 
+/// What a program that compares, digests or shows a value reaches of `std.prelude`: what the code
+/// the emitter writes for a container calls, in the order a check walks it.
+fn written_reach() -> List<Bytes> =
+  [
+    b"shift_from",
+    b"trie_shift",
+    b"List::at",
+    b"trie_path",
+    b"trie_inserted",
+    b"trie_pushed",
+    b"List::push",
+  ].map(|n: Bytes| qualify(prelude_module(), n))
+
 test "the emitter's root keys cover every root and no two share one" {
   let src = b"fn pos(x: Int) -> Bool = x > 0\nfn f(x: Int) -> Int requires pos(x) ensures x >= 0 = x\ntest \"t\" { assert_eq(f(1), 1) }\nlaw \"l\" forall (x: Int) { f(x) == x }";
   match analyse(parse_all([{ name: b"m", src: src }])) {
     Refused(_) -> panic("the program checks"),
     Analysed(w) -> {
       let keys = root_keys(outlines_of(w), w.checked, w.hashes);
-      assert_eq(keys.map(|k: KeyRow| k.root), [
-        b"m.pos",
-        b"m.f#requires#0",
-        b"m.f#ensures#0",
-        b"m.f",
-        test_owner(b"m", b"t"),
-        law_root(b"m", b"l", b"body"),
-      ]);
+      assert_eq(
+        keys.map(|k: KeyRow| k.root),
+        [
+          b"m.pos",
+          b"m.f#requires#0",
+          b"m.f#ensures#0",
+          b"m.f",
+          test_owner(b"m", b"t"),
+          law_root(b"m", b"l", b"body"),
+        ].concat(
+          written_reach(),
+        ),
+      );
       // No two roots share a key, or a cache would serve one body for another.
       let distinct = Map::of_entries(keys.map(|k: KeyRow| { key: k.key, value: () })).keys();
       assert_eq(distinct.len(), keys.len());
@@ -6274,15 +6292,21 @@ test "the emitter's root keys cover every root and no two share one" {
 test "a root is pure only as a definition with no row and no constraint" {
   let src = b"effect log { write emit(Bytes) -> Unit }\nfn origin() -> Int = 0\nfn hello() -> Unit / { log.write } = log.emit(b\"hi\")\nfn same<a>(x: a, y: a) -> Bool where derivable(eq, a) = x == y\nfn positive(n: Int) -> Int requires n > 0 = n\ntest \"t\" { assert_eq(origin(), 0) }\nlaw \"l\" forall (n: Int) { same(n, n) }";
   let d = dump_of(analyse(parse_all([{ name: b"m", src: src }])));
-  assert_eq(d.emitter_roots.map(|root: EmitterRoot| { root: root.root, pure: root.pure }), [
-    { root: b"m.origin", pure: true },
-    { root: b"m.hello", pure: false },
-    { root: b"m.same", pure: false },
-    { root: b"m.positive", pure: true },
-    { root: test_owner(b"m", b"t"), pure: false },
-    { root: b"m.positive#requires#0", pure: false },
-    { root: law_root(b"m", b"l", b"body"), pure: false },
-  ])
+  assert_eq(
+    d.emitter_roots.map(|root: EmitterRoot| { root: root.root, pure: root.pure }),
+    [
+      { root: b"m.origin", pure: true },
+      { root: b"m.hello", pure: false },
+      { root: b"m.same", pure: false },
+      { root: b"m.positive", pure: true },
+    ].concat(
+      written_reach().map(|n: Bytes| { root: n, pure: true }),
+    ).concat([
+      { root: test_owner(b"m", b"t"), pure: false },
+      { root: b"m.positive#requires#0", pure: false },
+      { root: law_root(b"m", b"l", b"body"), pure: false },
+    ]),
+  )
 }
 
 test "a test's root is named by its module and its label, in the program's test order" {
@@ -6351,9 +6375,11 @@ test "a dump within a run keeps every test's root, and keys what it keeps as the
 test "a root carries a width exactly where a value it is entered with or answers is one" {
   let src = b"fn low_bit(b: U8) -> Int requires Int::of_u8(b) < 200 ensures result < 2 = Int::of_u8(b & 1u8)\nfn narrow(n: Int) -> U8 / {abort.raise} requires n >= 0 ensures Int::of_u8(result) == n = U8::of_int(n)\nfn inc(x: Int) -> Int requires x > 0 ensures result > x = x + 1\ntest \"t\" { assert_eq(inc(1), 2) }\nlaw \"low\" forall (b: U8) where Int::of_u8(b) > 0 { low_bit(b) < 2 }\nlaw \"grows\" forall (x: Int) where x > 0 { inc(x) > x }";
   let d = dump_of(analyse(parse_all([{ name: b"m", src: src }])));
+  // What comparing reaches of `std.prelude` carries no width of the program's.
   assert_eq(
-    d.emitter_roots.map(|root: EmitterRoot|
-      { root: root.root, params: root.params, answer: root.answer }),
+    d.emitter_roots.filter(|root: EmitterRoot| !written_reach().contains(root.root)).map(
+      |root: EmitterRoot| { root: root.root, params: root.params, answer: root.answer },
+    ),
     [
       { root: b"m.low_bit", params: [CWidth(0)], answer: CPlain },
       { root: b"m.narrow", params: [CPlain], answer: CWidth(0) },
@@ -6377,8 +6403,9 @@ test "a carry follows a width into lists, maps, records, sum types, functions an
   let src = b"effect probe { write put(xs: List<U8>, n: Int) -> Unit }\ntype Byte = | Byte(U8)\ntype Tree = | Leaf | Node(Tree, I16, Tree)\ntype Pair<a, b> = | Pair(b, a)\ntype Color = | Red | Green\nfn wrap(xs: List<U8>) -> List<Byte> = xs.map(|x: U8| Byte(x))\nfn pick<a>(xs: List<a>, r: { v: I16, n: Int }) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\nfn swap(m: Map<String, I8>) -> Pair<Int, U64> / {abort.raise} = Pair(U64::of_int(1), 0)\nfn plain(c: Color, o: Option<Int>) -> Tree = Leaf\nfn apply<a>(f: (Int) -> a, x: Int) -> a = f(x)\nfn sent(xs: List<U8>) -> Unit / { probe.write } = probe.put(xs, 1)";
   let d = dump_of(analyse(parse_all([{ name: b"m", src: src }])));
   assert_eq(
-    d.emitter_roots.map(|root: EmitterRoot|
-      { root: root.root, params: root.params, answer: root.answer }),
+    d.emitter_roots.filter(|root: EmitterRoot| !written_reach().contains(root.root)).map(
+      |root: EmitterRoot| { root: root.root, params: root.params, answer: root.answer },
+    ),
     [
       { root: b"m.wrap", params: [CList(CWidth(0))], answer: CList(CSum([])) },
       {
@@ -6395,10 +6422,23 @@ test "a carry follows a width into lists, maps, records, sum types, functions an
       { root: b"m.plain", params: [CPlain, CPlain], answer: CSum([]) },
       { root: b"m.apply", params: [CFn([CPlain], CVar(0)), CPlain], answer: CVar(0) },
       { root: b"m.sent", params: [CList(CWidth(0))], answer: CPlain },
-      // `wrap` reaches the prelude's `map`, generic over what it carries.
+      // `wrap` reaches the prelude's `map` and its walks, generic over what they carry.
       {
-        root: b"std.prelude.mapped_from",
-        params: [CList(CVar(0)), CFn([CVar(0)], CVar(1)), CPlain, CList(CVar(1))],
+        root: b"std.prelude.leaves_mapped",
+        params: [
+          CList(CVar(0)),
+          CPlain,
+          CPlain,
+          CPlain,
+          CPlain,
+          CFn([CVar(0)], CVar(1)),
+          CList(CVar(1)),
+        ],
+        answer: CList(CVar(1)),
+      },
+      {
+        root: b"std.prelude.tail_mapped",
+        params: [CList(CVar(0)), CPlain, CFn([CVar(0)], CVar(1)), CList(CVar(1))],
         answer: CList(CVar(1)),
       },
       {
@@ -7012,13 +7052,15 @@ test "claims lowered from an analysis are the claims lowered from its sources" {
     },
   ];
   let w = analysis_of(sources);
-  assert_eq(claims_in(w, range(0, w.mods.len())), claims(sources))
+  // The modules given, as `claims` lowers them: what their comparisons reach of `std.prelude` is
+  // the prelude's to claim.
+  assert_eq(claims_in(w, range(0, sources.len())), claims(sources))
 }
 
 test "a builtin is published with its scheme and the names its parameters are documented under" {
-  let rows = builtin_rows().filter(|r: BuiltinRow| r.name == b"List::push");
+  let rows = builtin_rows().filter(|r: BuiltinRow| r.name == b"Array::get");
   assert_eq(rows.len(), 1);
-  assert_eq(rows.get(0).params, [b"xs", b"x"]);
+  assert_eq(rows.get(0).params, [b"xs", b"i"]);
   match rows.get(0).scheme.ty { TyFn(f) -> assert_eq(f.params.len(), 2), _ -> assert(false) }
 }
 
@@ -7051,7 +7093,7 @@ test "a program reads of a shipped module the functions it reaches and the names
   assert_eq(def_names(cut), [b"m.f", b"std.r.imported", b"std.r.used", b"std.s.helper"]);
   let whole = analyse_pulling_std_with(user, reached_fixture(), no_rows(), reached: false);
   // `std.prelude` is read whole too, which every module imports.
-  assert(def_names(whole).contains(b"std.prelude.mapped_from"), None);
+  assert(def_names(whole).contains(b"std.prelude.leaves_mapped"), None);
   assert_eq(def_names(whole).filter(|n: Bytes| module_of_root(n) != prelude_module()), [
     b"m.f",
     b"std.r.imported",
@@ -7085,8 +7127,16 @@ test "a shipped function is read with what its specifications name" {
     no_rows(),
   );
   assert_eq(match cut.out { Analysed(_) -> [], Refused(diags) -> diags.map(|d: Diag| d.code) }, []);
+  // `used`'s `ensures` compares, so it reaches what the code written for a container calls.
   assert_eq(def_names(cut), [
     b"m.f",
+    b"std.prelude.List::at",
+    b"std.prelude.List::push",
+    b"std.prelude.shift_from",
+    b"std.prelude.trie_inserted",
+    b"std.prelude.trie_path",
+    b"std.prelude.trie_pushed",
+    b"std.prelude.trie_shift",
     b"std.q.further",
     b"std.q.model",
     b"std.q.used",
@@ -7120,13 +7170,26 @@ test "a shipped type is read with what its module states of it, though the progr
     b"std.n.written",
     b"std.s.helper",
   ]);
-  // Reached only through an operator and a comparison, they are the same functions.
+  // Reached only through an operator and a comparison, they are the same functions, and the
+  // comparison reaches what the code written to compare a container calls.
   let used = analyse_pulling_std_with(
     [{ name: b"m", src: b"import std.n (N)\npub fn f(a: N, b: N) -> Bool = a + b == a\n" }],
     stating,
     no_rows(),
   );
-  assert_eq(def_names(used), def_names(idle))
+  assert_eq(
+    def_names(used),
+    def_names(idle).concat([
+      b"std.prelude.List::at",
+      b"std.prelude.List::push",
+      b"std.prelude.shift_from",
+      b"std.prelude.trie_inserted",
+      b"std.prelude.trie_path",
+      b"std.prelude.trie_pushed",
+      b"std.prelude.trie_shift",
+    ]).sort(
+    ),
+  )
 }
 
 /// `std.z` declares an effect and a function named `pack`, and an effect, a type and a constructor
@@ -7277,14 +7340,49 @@ test "a load's view of a shipped module is its form and the functions the progra
 
 test "every load reads `std.prelude`, keeping the functions it writes in Ply that the load reaches" {
   let viewed = |src: Bytes|
-    analyse_pulling_std_with([{ name: b"m", src: src }], [], no_rows()).viewed;
-  let mapping = viewed(b"pub fn f(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + 1)\n");
-  assert_eq(mapping.map(|v: ShippedView| v.module), [prelude_module()]);
-  assert_eq(view_names(view_named(mapping, prelude_module())), [
-    b"std.prelude.List::map",
-    b"std.prelude.mapped_from",
+    view_names(
+      view_named(
+        analyse_pulling_std_with([{ name: b"m", src: src }], [], no_rows()).viewed,
+        prelude_module(),
+      ),
+    );
+  let read = [b"std.prelude.List::at"];
+  let pushed = [
+    b"std.prelude.List::push",
+    b"std.prelude.shift_from",
+    b"std.prelude.trie_inserted",
+    b"std.prelude.trie_path",
+    b"std.prelude.trie_pushed",
+    b"std.prelude.trie_shift",
+  ];
+  assert_eq(viewed(b"pub fn g() -> Int = 1\n"), []);
+  // `map` walks the list's leaves and its tail, reading no item by its index; the `==` that finds
+  // where a leaf opens reaches what the code written for a container calls.
+  assert_eq(
+    viewed(b"pub fn f(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + 1)\n"),
+    read.concat(pushed).concat([
+      b"std.prelude.List::map",
+      b"std.prelude.leaves_mapped",
+      b"std.prelude.tail_mapped",
+    ]).sort(
+    ),
+  );
+  assert_eq(viewed(b"pub fn h(xs: List<Int>) -> List<Int> / {abort.raise} = xs.set(0, 1)\n"), [
+    b"std.prelude.List::set",
+    b"std.prelude.shift_from",
+    b"std.prelude.trie_set",
+    b"std.prelude.trie_shift",
   ]);
-  assert_eq(view_names(view_named(viewed(b"pub fn g() -> Int = 1\n"), prelude_module())), [])
+  // What the code the emitter writes to compare, digest or show a list calls is reached where a
+  // body compares, digests or shows anything, though it calls none of it itself.
+  let written = read.concat(pushed).sort();
+  assert_eq(viewed(b"pub fn same(a: List<Int>, b: List<Int>) -> Bool = a == b\n"), written);
+  assert_eq(viewed(b"pub fn hashed(a: List<Int>) -> Bytes = digest(a)\n"), written);
+  assert_eq(viewed(b"pub fn less(a: Int, b: Int) -> Bool = a < b\n"), []);
+  assert_eq(
+    written_code().calls.filter(|n: Bytes| !builtins().any(|b: Builtin| b.body && b.name == n)),
+    [],
+  )
 }
 
 test "the prelude's bodies call its externs and its own functions of a type by the names it declares" {
@@ -7306,7 +7404,10 @@ test "the prelude's bodies call its externs and its own functions of a type by t
 }
 
 test "a function `std.prelude` writes in Ply is checked at the scheme its callers read" {
-  let src = b"pub fn g(xs: List<Int>) -> Int = xs.map(|x: Int| x + 1).filter(|x: Int| x > 2).fold(0, |a: Int, x: Int| a + x)\n";
+  let src = Bytes::concat_all([
+    b"pub fn g(xs: List<Int>) -> Int = xs.map(|x: Int| x + 1).filter(|x: Int| x > 2).fold(0, |a: Int, x: Int| a + x)\n",
+    b"pub fn k(xs: List<Int>) -> Option<Int> / {abort.raise} = xs.set(0, 1).push(2).at(0)\n",
+  ]);
   match analyse(parse_all([{ name: b"m", src: src }])) {
     Refused(_) -> panic("the program checks"),
     Analysed(w) -> {
@@ -7315,7 +7416,13 @@ test "a function `std.prelude` writes in Ply is checked at the scheme its caller
       let bodied = builtins().filter(|b: Builtin| b.body);
       assert(bodied.len() > 0, None);
       bodied.fold((), |u: Unit, b: Builtin|
-        assert_eq(checked.get(qualify(prelude_module(), b.name)), Some(b.scheme)))
+        assert_eq(checked.get(qualify(prelude_module(), b.name)), Some(b.scheme)));
+      // The prelude's loops read `List::at` answering `Some` as any module does, so each ends.
+      assert_eq(
+        w.checked.defs.filter(|d: DefInfo|
+          module_of_root(d.name) == prelude_module() && d.ending != Ends).map(|d: DefInfo| d.name),
+        [],
+      )
     },
   }
 }
@@ -8120,12 +8227,17 @@ test "a seeded definition raises where a walk of it found, however it moved" {
   let rows = rows_of(analysis_of(reading(b"")));
   let moved = reading(b"pub fn aside() -> Int = 3\n");
   let seeded = analyse_with(parse_all(moved), { ..rows, tests: [] });
-  assert_eq(seeded_of(seeded), [b"m.at", b"m.walk"]);
-  assert_eq(raises_filed(seeded), [
-    { name: b"m.aside", raises: 0, performed: 0 },
-    { name: b"m.at", raises: 1, performed: 1 },
-    { name: b"m.walk", raises: 0, performed: 0 },
-  ]);
+  // `b.at(i)` may call the prelude's `List::at` as far as its text says, so that is read too.
+  assert_eq(seeded_of(seeded), [b"std.prelude.List::at", b"m.at", b"m.walk"]);
+  assert_eq(
+    raises_filed(seeded).filter(|r: { name: Bytes, raises: Int, performed: Int }|
+      module_of_root(r.name) == b"m"),
+    [
+      { name: b"m.aside", raises: 0, performed: 0 },
+      { name: b"m.at", raises: 1, performed: 1 },
+      { name: b"m.walk", raises: 0, performed: 0 },
+    ],
+  );
   assert_eq(raises_filed(seeded), raises_filed(analyse(parse_all(moved))))
 }
 
