@@ -422,12 +422,16 @@ type Simulation = {
 type ParallelSite = { module: Int, span: Span, branches: List<{ span: Span, row: Row }> }
 /// `params` names the signature's rigid type parameters, so a refusal can say which to constrain.
 type RigidParam = { name: Bytes, var: Int }
-/// `via` is the alias a use named when the `Map` came from its expansion, else empty.
+/// `key` is what is judged and `whole` the key it stands in, which a refusal names; `via` is the
+/// alias a use named when the `Map` came from its expansion, else empty; `carrier` is the declared
+/// type that keys a `Map` by `whole`, where no `Map` is written.
 type MapKeySite = {
   module: Int,
   span: Span,
   scope: Int,
   key: Type,
+  whole: Type,
+  carrier: Option<Type>,
   assumed: List<Int>,
   params: List<RigidParam>,
   via: Bytes,
@@ -657,6 +661,10 @@ type Checker = {
   /// reads which types state `numeric`, and `keyed_names` which state a `key`.
   numeric_types: List<NumericInfo>,
   keyed_names: List<Bytes>,
+  /// Read once the declarations are collected: the shapes ordering reads, and the positions of the
+  /// parameters each declared type needs ordered wherever it is written or built.
+  ordering: Shapes,
+  carrying: Map<Bytes, List<Int>>,
   /// True while a `pub fn`'s default is walked: a caller in another module is handed a copy of it.
   copied: Bool,
   /// True while the first argument of `cell_get`, `cell_set` or `cell_update` is read, which is the
@@ -1494,12 +1502,27 @@ fn declared(name: Bytes, imported: Map<Bytes, Bytes>, def: ExternDef) -> Builtin
   );
   let ret = declared_type(params.d, def.ret);
   let row = declared_row(ret.d, def.effects);
-  let found = def.constraints.fold([], |acc: List<DefConstraint>, c: Constraint| {
+  let written = def.constraints.fold([], |acc: List<DefConstraint>, c: Constraint| {
     let param = range(0, def.generics.types.len()).fold(0 - 1, |p: Int, i: Int|
       if p >= 0 { p } else if def.generics.types.get(i).name == c.param.name { i } else { p });
     if param < 0 { panic(misdeclared(b"constrains what no generic list binds", c.param.name)) }
     else { insert_constraint(acc, { deriver: c.deriver, param: param }) }
   });
+  // A `Map` key's order is implied, as a `fn`'s signature implies it; a declared type in a key is
+  // judged where it is used, by what the program declares of it.
+  let keyed = params.tys.push(ret.ty).fold([], |acc: List<Type>, t: Type|
+    map_key_types(t, acc)).fold([], |acc: List<Int>, k: Type|
+    ints_union(acc, ord_needs(k, Map::new())));
+  let found = range(0, def.generics.types.len()).fold(
+    written,
+    |acc: List<DefConstraint>, i: Int|
+      match tys.tys.get(def.generics.types.get(i).name) {
+        Some(TyVar(v)) -> if keyed.contains(v) {
+          insert_constraint(acc, { deriver: DOrd, param: i })
+        } else { acc },
+        _ -> acc,
+      },
+  );
   {
     name: name,
     scheme: {
@@ -2298,7 +2321,7 @@ fn conv_con(
         )
       } else {
         let built = TyCon({ name: name.name.name, args: converted.tys });
-        { checker: note_map_keys(c, span, built), ty: built }
+        { checker: note_parts(c, span, own_parts(c.carrying, built, [])), ty: built }
       },
       None -> {
         let g: WithName = global(c, TypeSpace, name);
@@ -2332,14 +2355,16 @@ fn conv_con(
               )
             } else {
               match decl.declared {
-                DeclaredSum ->
+                DeclaredSum -> {
+                  let built = TyCon({
+                    name: qualified,
+                    args: applied_args(converted.tys, over.labels, over.rows),
+                  });
                   {
-                    checker: g.checker,
-                    ty: TyCon({
-                      name: qualified,
-                      args: applied_args(converted.tys, over.labels, over.rows),
-                    }),
-                  },
+                    checker: note_parts(g.checker, span, own_parts(g.checker.carrying, built, [])),
+                    ty: built,
+                  }
+                },
                 DeclaredExtern ->
                   {
                     checker: g.checker,
@@ -2359,7 +2384,14 @@ fn conv_con(
                         r.row_vars,
                         applied_args(converted.tys, over.labels, over.rows),
                       );
-                      { checker: note_map_keys(o.checker, span, built), ty: built }
+                      {
+                        checker: note_parts(
+                          o.checker,
+                          span,
+                          own_parts(o.checker.carrying, built, []),
+                        ),
+                        ty: built,
+                      }
                     },
                   }
                 },
@@ -3115,15 +3147,28 @@ fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                       ops: acc.ops,
                     }
                   } else {
-                    let c1: Checker = bind_ty_params(
+                    let bound: Checker = bind_ty_params(
                       { ..acc.checker, ty_params: Map::new() },
                       op.ty_params,
                     );
+                    // A `Map` key's order is each perform's to meet, as a call meets a signature's.
+                    let c1: Checker = {
+                      ..bound,
+                      assumed: bound.ty_params.fold(
+                        bound.assumed,
+                        |xs: List<Assumed>, k: Bytes, t: Type|
+                          match t { TyVar(v) -> assume(xs, DOrd, v), _ -> xs },
+                      ),
+                    };
                     let ps: WithTys = conv_types(c1, op.params);
                     // A raise answers nothing, so each perform of it has the type asked of it.
                     let r: WithTy = if is_raise(op.mode) { new_ty(ps.checker) }
                     else { conv_type(ps.checker, op.ret) };
-                    let c2: Checker = { ..r.checker, ty_params: Map::new() };
+                    let c2: Checker = {
+                      ..r.checker,
+                      ty_params: Map::new(),
+                      assumed: acc.checker.assumed,
+                    };
                     let c3: Checker = range(0, ps.tys.len()).fold(c2, |cc: Checker, i: Int|
                       reject_declared_brand(
                         cc,
@@ -5465,10 +5510,11 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
           let inst = instantiate_with(sc, k.checker.fresh);
           let c: Checker = crossed({ ..k.checker, fresh: inst.fresh }, key.name, qname.span);
           let constrained: Checker = note_constraints(
-            note_map_keys(c, qname.span, inst.ty),
+            note_instance(c, qname.span, inst.ty),
             qname.span,
             key.name,
             inst.args,
+            inst.ty,
           );
           let own = constrained.own_fns.contains(key.name);
           let through = match qname.module {
@@ -8414,6 +8460,19 @@ fn instantiate_op(checker: Checker, op_info: OpInfo) -> OpShape / {abort.raise} 
   }
 }
 
+/// A perform of `op_info` as `shape` instantiates it, held to the order of what its type parameters
+/// stand for where the parts of its types that must be ordered need them, which its handlers assume.
+/// The rest of those parts is the declaration's, judged where it is written.
+fn performed_op(shape: OpShape, span: Span, op_info: OpInfo) -> OpShape / {abort.raise} =
+  if op_free_vars(op_info).len() == 0 { shape }
+  else { { ..shape, checker: note_instance(shape.checker, span, op_type(shape)) } }
+
+/// The variables a clause for `op_info`, its types `shape`, assumes ordered, which each perform meets.
+fn clause_ordered(op_info: OpInfo, shape: OpShape) -> List<Int> / {abort.raise} =
+  if op_free_vars(op_info).len() == 0 { [] } else { ordered_vars(shape.checker, op_type(shape)) }
+
+fn op_type(shape: OpShape) -> Type = fn_type(shape.params, shape.ret, row_empty())
+
 fn instantiate_op_for_clause(checker: Checker, op_info: OpInfo) -> OpShape / {abort.raise} = {
   let sc = op_scheme(op_info);
   let tys: { checker: Checker, vs: List<Int> } = sc.ty_vars.fold(
@@ -8497,7 +8556,7 @@ fn infer_perform(
           { checker: o.checker, ty: o.ty, row: as_.row }
         },
         Some(resource_) -> {
-          let shape: OpShape = instantiate_op(res.checker, hit.op);
+          let shape: OpShape = performed_op(instantiate_op(res.checker, hit.op), span, hit.op);
           if shape.params.len() != args.len() {
             let n = shape.params.len();
             {
@@ -8880,11 +8939,19 @@ fn infer_handle(
                 let whole = raise || (match clause.resume { Some(_) -> true, None -> false });
                 let answer = if !whole { hint_of(shape.ret) }
                 else { match ret { Some(_) -> hint, None -> hint_after(hint, b.ty) } };
-                let body_: Inferred = infer(with_resume, clause.body, answer);
+                let ordered: Checker = {
+                  ..with_resume,
+                  assumed: clause_ordered(hit.op, shape).fold(
+                    with_resume.assumed,
+                    |xs: List<Assumed>, v: Int| assume(xs, DOrd, v),
+                  ),
+                };
+                let body_: Inferred = infer(ordered, clause.body, answer);
                 let popped: Checker = {
                   ..body_.checker,
                   env: env_pop(body_.checker.env),
                   assignable: around,
+                  assumed: with_resume.assumed,
                 };
                 let checked: Checker = match clause.resume {
                   Some(_) ->
@@ -10012,7 +10079,7 @@ fn signed_fns(
         _ -> acc,
       },
   );
-  let fns = collected.fns.map(|d: FnDef| carried(collected.checker, d));
+  let fns = carried(collected.checker, collected.fns);
   let names = fns.map(|d: FnDef| qualify(parsed.name, d.name.name));
   let placed: Checker = fns.fold(collected.checker, |c: Checker, d: FnDef|
     member_declared(c, parsed, d));
@@ -10409,8 +10476,9 @@ fn stated_calls(
     |acc: List<OwnCall>, x: { module: Int, span: Span, ty: Type }|
       at_(acc, x.span, reached(x.ty, true)),
   );
+  // Only a `Map` orders its keys: a type that carries an order calls nothing where it is built.
   let keyed = body.map_keys.fold(compared, |acc: List<OwnCall>, x: MapKeySite|
-    at_(acc, x.span, reached(x.key, true)));
+    match x.carrier { Some(_) -> acc, None -> at_(acc, x.span, reached(x.whole, true)) });
   body.constrained.fold(keyed, |acc: List<OwnCall>, x: ConstraintSite|
     at_(acc, x.span, match x.deriver {
       DShow -> reached(x.ty, false),
@@ -13325,7 +13393,7 @@ fn check_specs(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
 
 /// A clause's scope: the parameters, and what the body assumes, its definition's constraints.
 fn spec_scope(checker: Checker, written: FnDef, env: SpecEnv) -> Checker / {abort.raise} = {
-  let def = carried(checker, written);
+  let def = carried(checker, [written]).get(0);
   let c0: Checker = {
     ..checker,
     ty_params: env.ty_params,
@@ -13613,9 +13681,11 @@ fn derivable_within(
     },
   }
 
-/// A flexible variable is a type argument nothing pinned rather than one that is wrong.
-fn skipped_flexible(checker: Checker, b: Blocked) -> Bool =
-  match b.why { Unconstrained(v) -> !is_rigid_ty(checker.subst, v), _ -> false }
+/// `assumed` and every flexible variable of the solved type `ty`: one nothing pinned is no refusal,
+/// and the rest of `ty` is still judged.
+fn with_flexible(checker: Checker, ty: Type, assumed: List<Int>) -> List<Int> / {abort.raise} =
+  vars_of_type(ty).fold(assumed, |vs: List<Int>, v: Int|
+    if is_rigid_ty(checker.subst, v) { vs } else { ints_insert(vs, v) })
 
 /// Why no deriver reads an `extern type`'s values.
 fn native_notes(blocker: Bytes, deriver: Deriver) -> List<Bytes> =
@@ -13670,7 +13740,7 @@ fn why_notes_for_map_key(
         Bytes::concat_all([
           b"add `where derivable(ord, ",
           param_name(params, v, blocker),
-          b")` to this signature; the body may then                          assume it",
+          b")` to this signature; the body may then assume it",
         ]),
       ],
   }
@@ -13732,123 +13802,208 @@ fn assumed_for(checker: Checker, deriver: Deriver) -> List<Int> / {abort.raise} 
       a.vars.fold(acc, |b: List<Int>, v: Int| ints_insert(b, v))
     } else { acc })
 
-/// `def` with `where derivable(ord, a)` for each type parameter `a` its signature writes inside an
-/// argument a declared type keys a `Map` by: the type carries the constraint, so callers meet it
-/// and the body assumes it as though the signature wrote it.
-fn carried(checker: Checker, def: FnDef) -> FnDef / {abort.raise} = {
-  let names = def.generics.types.map(|g: Ident| g.name);
-  if names.len() == 0 { def } else {
-    let written = def.params.fold(
-      match def.ret { Some(t) -> [t], None -> [] },
-      |acc: List<TypeExpr>, p: Param| match p.ty { Some(t) -> acc.push(t), None -> acc },
-    );
-    let found = written.fold([], |acc: List<KeyedMention>, t: TypeExpr|
-      keyed_mentions(checker, t, names, acc));
-    found.fold(def, |d: FnDef, k: KeyedMention|
-      if d.constraints.fold(false, |has: Bool, c: Constraint|
-          has || (c.param.name == k.param.name && same_deriver(c.deriver, DOrd))) { d } else {
+/// `defs`, each with `where derivable(ord, a)` for each type parameter `a` its signature's types need
+/// ordered: `a` is in a `Map`'s key where ordering the key reads it, or in an argument a declared type
+/// keys a `Map` by. The signature implies the constraint, so callers meet it and the body assumes it
+/// as though the signature wrote it.
+fn carried(checker: Checker, defs: List<FnDef>) -> List<FnDef> / {abort.raise} =
+  defs.map(|d: FnDef| if may_carry(d) { carried_by(checker, d) } else { d })
+
+fn carried_by(checker: Checker, def: FnDef) -> FnDef / {abort.raise} = {
+  let s = written_signature(checker, def);
+  let needed = s.sig.params.push(s.sig.ret).fold([], |acc: List<Int>, t: Type|
+    ints_union(acc, ordered_vars(checker, t)));
+  def.generics.types.fold(def, |d: FnDef, g: Ident|
+    match s.sig.ty_params.get(g.name) {
+      Some(TyVar(v)) -> if !needed.contains(v)
+          || d.constraints.any(|c: Constraint|
+            c.param.name == g.name && same_deriver(c.deriver, DOrd)) { d } else {
         {
           ..d,
           constraints: d.constraints.push({
             deriver: DOrd,
-            deriver_span: k.at,
-            param: k.param,
-            span: k.at,
+            deriver_span: g.span,
+            param: g,
+            span: g.span,
           }),
         }
-      })
-  }
+      },
+      _ -> d,
+    })
 }
 
-/// A type parameter written inside an argument a declared type keys a `Map` by, and the type's use.
-type KeyedMention = { at: Span, param: Ident }
+/// Whether `def`'s signature could need a type parameter ordered: it writes one in an argument of a
+/// `Map` or of a type the language does not declare, the only places an order can come from.
+fn may_carry(def: FnDef) -> Bool = {
+  let names = def.generics.types.map(|g: Ident| g.name);
+  let carries = |t: TypeExpr| type_may_carry(t, names);
+  names.len() > 0
+    && (def.params.any(|p: Param| match p.ty { Some(t) -> carries(t), None -> false })
+    || (match def.ret { Some(t) -> carries(t), None -> false }))
+}
 
-fn keyed_mentions(
-  checker: Checker,
-  t: TypeExpr,
-  names: List<Bytes>,
-  out: List<KeyedMention>,
-) -> List<KeyedMention> / {abort.raise} =
+fn type_may_carry(t: TypeExpr, names: List<Bytes>) -> Bool =
   match t {
-    TCon(c) -> {
-      let inner = c.args.fold(out, |acc: List<KeyedMention>, a: TypeExpr|
-        keyed_mentions(checker, a, names, acc));
-      if is_bare(c.name)
-          && (builtin_type_arity(c.name.name.name) != None || names.contains(c.name.name.name)) {
-        inner
-      } else {
-        match global(checker, TypeSpace, c.name).name {
-          None -> inner,
-          Some(q) ->
-            keyed_positions(checker, q, [], keyed_room(checker)).fold(
-              inner,
-              |acc: List<KeyedMention>, j: Int|
-                match c.args.at(j) {
-                  Some(a) ->
-                    params_written(a, names).fold(acc, |b: List<KeyedMention>, p: Ident|
-                      b.push({ at: c.span, param: p })),
-                  None -> acc,
-                },
-            ),
-        }
-      }
-    },
-    TFn(f) ->
-      f.params.fold(
-        keyed_mentions(checker, f.ret, names, out),
-        |acc: List<KeyedMention>, p: TypeExpr| keyed_mentions(checker, p, names, acc),
-      ),
-    TRecord(r) ->
-      r.fields.fold(out, |acc: List<KeyedMention>, f: { name: Ident, ty: TypeExpr }|
-        keyed_mentions(checker, f.ty, names, acc)),
-    _ -> out,
-  }
-
-/// The type parameters among `names` that `t` writes anywhere in it.
-fn params_written(t: TypeExpr, names: List<Bytes>) -> List<Ident> =
-  match t {
-    TVar(id) -> if names.contains(id.name) { [id] } else { [] },
     TCon(c) ->
-      c.args.fold(
-        if is_bare(c.name) && c.args.len() == 0 && names.contains(c.name.name.name) {
-          [c.name.name]
-        } else { [] },
-        |acc: List<Ident>, a: TypeExpr| acc.concat(params_written(a, names)),
-      ),
-    TFn(f) ->
-      f.params.fold(params_written(f.ret, names), |acc: List<Ident>, p: TypeExpr|
-        acc.concat(params_written(p, names))),
-    TRecord(r) ->
-      r.fields.fold([], |acc: List<Ident>, f: { name: Ident, ty: TypeExpr }|
-        acc.concat(params_written(f.ty, names))),
-    _ -> [],
+      ((!is_bare(c.name) || c.name.name.name == b"Map"
+        || (builtin_type_arity(c.name.name.name) == None && !names.contains(c.name.name.name)))
+        && c.args.any(|a: TypeExpr| writes_param(a, names)))
+        || c.args.any(|a: TypeExpr| type_may_carry(a, names)),
+    TFn(f) -> type_may_carry(f.ret, names) || f.params.any(|p: TypeExpr| type_may_carry(p, names)),
+    TRecord(r) -> r.fields.any(|f: { name: Ident, ty: TypeExpr }| type_may_carry(f.ty, names)),
+    _ -> false,
   }
 
-/// The positions of the declared type `name`'s parameters a value of it keys a `Map` by, through
-/// anything it holds; `seen` are the types being walked, so a recursive one ends, and `room` is
-/// how many more declarations a walk may enter.
-fn keyed_positions(
-  checker: Checker,
-  name: Bytes,
-  seen: List<Bytes>,
-  room: Int,
-) -> List<Int> / {abort.raise} =
-  if room <= 0 || seen.contains(name) { [] } else {
-    let within = seen.push(name);
-    match checker.nominals.get(name) {
-      Some(r) -> positions_among(r.ty_vars, keyed_vars(checker, r.ty, within, room - 1)),
-      None -> match checker.ctors.filter(|c: CtorInfo| c.type_name == name) {
-        [] -> [],
-        [first, ..rest] ->
-          positions_among(
-            first.scheme.ty_vars,
-            rest.push(first).fold([], |acc: List<Int>, c: CtorInfo|
-              c.fields.fold(acc, |held: List<Int>, f: Type|
-                ints_union(held, keyed_vars(checker, f, within, room - 1)))),
-          ),
-      },
-    }
+fn writes_param(t: TypeExpr, names: List<Bytes>) -> Bool =
+  match t {
+    TVar(id) -> names.contains(id.name),
+    TCon(c) ->
+      (is_bare(c.name) && c.args.len() == 0 && names.contains(c.name.name.name))
+        || c.args.any(|a: TypeExpr| writes_param(a, names)),
+    TFn(f) -> writes_param(f.ret, names) || f.params.any(|p: TypeExpr| writes_param(p, names)),
+    TRecord(r) -> r.fields.any(|f: { name: Ident, ty: TypeExpr }| writes_param(f.ty, names)),
+    _ -> false,
   }
+
+/// The shapes ordering reads before any body is walked: each sum's variants, and a sum that states
+/// a `key` as what its key's signature answers, or as nothing where that is not over the type's
+/// own parameters alone.
+fn ordering_shapes(checker: Checker) -> Shapes / {abort.raise} =
+  if checker.keyed_names.len() == 0 { algebraic_shapes(checker) } else {
+    range(0, checker.modules.len()).fold(algebraic_shapes(checker), |acc: Shapes, i: Int| {
+      let m = checker.modules.get(i);
+      m.module.items.fold(acc, |shapes: Shapes, item: Item|
+        match item {
+          IInstance(def) -> if !is_key(def.kind) { shapes } else {
+            let type_name = qualify(m.name, def.target.name);
+            match shapes.get(type_name) {
+              None -> shapes,
+              Some(shape) -> {
+                let by = m.module.items.fold(None, |found: Option<FnDef>, it: Item|
+                  match found {
+                    Some(_) -> found,
+                    None -> match it {
+                      IFn(f) -> if f.name.name == def.by.name { Some(f) } else { None },
+                      _ -> None,
+                    },
+                  });
+                let answered = match by {
+                  None -> None,
+                  Some(f) -> {
+                    let s = written_signature({ ..checker, module: i }, f);
+                    match s.sig.params.at(0) {
+                      None -> None,
+                      Some(p) -> match own_params(p, type_name) {
+                        Some(own) -> if vars_of_type(s.sig.ret).all(|v: Int|
+                            own.params.contains(v)) {
+                          Some({ params: own.params, rows: own.rows, answer: s.sig.ret })
+                        } else { None },
+                        None -> None,
+                      },
+                    }
+                  },
+                };
+                shapes.insert(type_name, match answered {
+                  Some(a) -> { ..shape, params: a.params, rows: a.rows, fields: [a.answer] },
+                  None -> { ..shape, fields: [] },
+                })
+              },
+            }
+          },
+          _ -> shapes,
+        })
+    })
+  }
+
+/// `checker` with what ordering reads, worked out once its declarations are collected: nothing it
+/// reads changes after.
+fn with_orders(checker: Checker) -> Checker / {abort.raise} = {
+  let ordering = ordering_shapes(checker);
+  let sums = algebraic_shapes(checker).fold(
+    [],
+    |acc: List<Holding>, name: Bytes, s: AlgebraicShape|
+      acc.push({ name: name, params: s.params, fields: s.fields }),
+  );
+  let held = checker.nominals.fold(sums, |acc: List<Holding>, name: Bytes, r: RecordDecl|
+    match r.ty {
+      TyNominal(n) ->
+        acc.push({ name: name, params: r.ty_vars, fields: n.fields.map(|f: Field| f.ty) }),
+      _ -> acc,
+    });
+  let carrying = carrying_of(held.filter(|h: Holding| h.params.len() > 0), ordering);
+  // The declarations and operations were read before the table was: a type they write that
+  // carries an order is judged where they are written, beside the `Map`s judged then, and an alias
+  // expanded then is expanded again.
+  let carried_in = |tys: List<Type>|
+    tys.fold([], |ps: List<OrderedPart>, t: Type| ordered_parts(carrying, t, ps)).filter(
+      |p: OrderedPart| match p.carrier { Some(_) -> true, None -> false },
+    );
+  let typed = held.fold(
+    { ..checker, ordering: ordering, carrying: carrying, aliases: Map::new() },
+    |c: Checker, h: Holding|
+      match c.types.get(h.name) {
+        None -> c,
+        Some(decl) -> judged_at(c, decl.owner, decl.span, h.params, carried_in(h.fields)),
+      },
+  );
+  typed.effects.fold(typed, |c: Checker, e: EffectInfo|
+    e.ops.fold(c, |cc: Checker, op: OpInfo|
+      judged_at(
+        cc,
+        op.at.module,
+        op.at.span,
+        op_free_vars(op),
+        carried_in(op.params.push(op.ret)),
+      )))
+}
+
+/// `parts` of what `module` declares at `span`, judged with `params` assumed ordered: what those
+/// stand for is each use's to meet.
+fn judged_at(
+  checker: Checker,
+  module: Int,
+  span: Span,
+  params: List<Int>,
+  parts: List<OrderedPart>,
+) -> Checker / {abort.raise} =
+  if parts.len() == 0 { checker } else {
+    let noted = note_parts(
+      {
+        ..checker,
+        module: module,
+        assumed: params.fold([], |xs: List<Assumed>, v: Int| assume(xs, DOrd, v)),
+      },
+      span,
+      parts,
+    );
+    { ..noted, module: checker.module, assumed: checker.assumed }
+  }
+
+/// A declared type as what its values hold: its parameters and the type of everything a value of it
+/// may hold.
+type Holding = { name: Bytes, params: List<Int>, fields: List<Type> }
+
+/// The positions of the parameters each declared type needs ordered, because what it holds keys a
+/// `Map` by them, there or in a declared type it holds: the least table that holds of itself, so a
+/// type that holds itself is read whole.
+fn carrying_of(held: List<Holding>, ordering: Shapes) -> Map<Bytes, List<Int>> / {abort.raise} = {
+  let room = held.fold(2, |n: Int, h: Holding| n + h.params.len());
+  iterate(Map::new(), room, |table: Map<Bytes, List<Int>>| {
+    let next = held.fold(
+      { table: table, grew: false },
+      |acc: { table: Map<Bytes, List<Int>>, grew: Bool }, h: Holding| {
+        let needed = h.fields.fold([], |vs: List<Int>, f: Type|
+          ordered_parts(acc.table, f, []).fold(vs, |ws: List<Int>, p: OrderedPart|
+            ints_union(ws, ord_needs(p.key, ordering))));
+        let ps = positions_among(h.params, needed);
+        let had = match acc.table.get(h.name) { Some(xs) -> xs, None -> [] };
+        if ps.len() == had.len() { acc }
+        else { { table: acc.table.insert(h.name, ps), grew: true } }
+      },
+    );
+    if next.grew { Continue(next.table) } else { Stop(next.table) }
+  })
+}
 
 /// Enough room for a walk to enter every declaration there is.
 fn keyed_room(checker: Checker) -> Int = checker.ctors.len() + checker.nominals.len() + 1
@@ -13857,35 +14012,70 @@ fn positions_among(vars: List<Int>, keyed: List<Int>) -> List<Int> =
   range(0, vars.len()).filter(|i: Int|
     match vars.at(i) { Some(v) -> keyed.contains(v), None -> false })
 
-/// The variables a value of `t` needs ordered: a `Map` key's, and those of an argument a declared
-/// type it holds keys a `Map` by.
-fn keyed_vars(
-  checker: Checker,
+/// A part of a type that must be ordered: a `Map`'s key, or an argument a declared type `carrier`
+/// keys a `Map` by, which holds wherever the type is written or built.
+type OrderedPart = { key: Type, carrier: Option<Type> }
+
+/// The parts of `t` that must be ordered, reading what each declared type carries from `carrying`.
+fn ordered_parts(
+  carrying: Map<Bytes, List<Int>>,
   t: Type,
-  seen: List<Bytes>,
-  room: Int,
-) -> List<Int> / {abort.raise} =
+  out: List<OrderedPart>,
+) -> List<OrderedPart> / {abort.raise} = {
+  let within = |tys: List<Type>|
+    tys.fold(own_parts(carrying, t, out), |acc: List<OrderedPart>, a: Type|
+      ordered_parts(carrying, a, acc));
   match t {
-    TyCon(c) -> {
-      let inner = c.args.fold([], |acc: List<Int>, a: Type|
-        ints_union(acc, keyed_vars(checker, a, seen, room)));
-      if c.name == b"Map" && c.args.len() == 2 { ints_union(inner, vars_of_type(c.args.get(0))) }
-      else if builtin_type_arity(c.name) != None { inner } else {
-        keyed_positions(checker, c.name, seen, room).fold(inner, |acc: List<Int>, j: Int|
-          match c.args.at(j) { Some(a) -> ints_union(acc, vars_of_type(a)), None -> acc })
-      }
-    },
-    TyNominal(n) ->
-      n.fields.fold([], |acc: List<Int>, f: Field|
-        ints_union(acc, keyed_vars(checker, f.ty, seen, room))),
-    TyRecord(fs) ->
-      fs.fold([], |acc: List<Int>, f: Field|
-        ints_union(acc, keyed_vars(checker, f.ty, seen, room))),
-    TyFn(f) ->
-      f.params.fold(keyed_vars(checker, f.ret, seen, room), |acc: List<Int>, p: Type|
-        ints_union(acc, keyed_vars(checker, p, seen, room))),
-    TyVar(_) -> [],
+    TyCon(c) -> within(c.args),
+    TyNominal(n) -> within(n.args),
+    TyRecord(fs) -> within(fs.map(|f: Field| f.ty)),
+    TyFn(f) -> within(f.params.push(f.ret)),
+    TyVar(_) -> out,
   }
+}
+
+/// The parts `t` itself asks ordered, leaving those of the types it is built from: a `Map`'s key, or
+/// the arguments a declared type keys a `Map` by.
+fn own_parts(
+  carrying: Map<Bytes, List<Int>>,
+  t: Type,
+  out: List<OrderedPart>,
+) -> List<OrderedPart> / {abort.raise} = {
+  let carried = |name: Bytes, args: List<Type>|
+    if carrying.len() == 0 { out } else {
+      match carrying.get(name) {
+        None -> out,
+        Some(ps) ->
+          ps.fold(out, |acc: List<OrderedPart>, j: Int|
+            match args.at(j) { Some(a) -> acc.push({ key: a, carrier: Some(t) }), None -> acc }),
+      }
+    };
+  match t {
+    TyCon(c) -> if c.name == b"Map" && c.args.len() == 2 {
+      out.push({ key: c.args.get(0), carrier: None })
+    } else if builtin_type_arity(c.name) != None { out }
+    else { carried(c.name, c.args) },
+    TyNominal(n) -> carried(n.name, n.args),
+    _ -> out,
+  }
+}
+
+/// The variables ordering the parts of `t` needs ordered.
+fn ordered_vars(checker: Checker, t: Type) -> List<Int> / {abort.raise} =
+  ordered_parts(checker.carrying, t, []).fold([], |acc: List<Int>, p: OrderedPart|
+    ints_union(acc, ord_needs(p.key, checker.ordering)))
+
+/// The variables `derivable` needs ordered to order `ty`, reading declared types through `shapes`:
+/// each one it finds unassumed, as far as a refusal no assumption lifts.
+fn ord_needs(ty: Type, shapes: Shapes) -> List<Int> / {abort.raise} =
+  iterate([], vars_of_type(ty).len() + 2, |found: List<Int>|
+    match derivable(DOrd, ty, shapes, found) {
+      Some(b) -> match b.why {
+        Unconstrained(v) -> Continue(ints_insert(found, v)),
+        _ -> Stop(found),
+      },
+      None -> Stop(found),
+    })
 
 fn vars_of_type(t: Type) -> List<Int> / {abort.raise} =
   free_vars(subst_new(), t, { tys: [], rows: [] }).tys
@@ -13903,21 +14093,46 @@ fn map_key_types(t: Type, out: List<Type>) -> List<Type> / {abort.raise} =
     TyVar(_) -> out,
   }
 
-/// Every `Map` in a type as it was written or instantiated, judged once the module is solved.
-fn note_map_keys(checker: Checker, span: Span, ty: Type) -> Checker / {abort.raise} = {
-  let found = map_key_types(ty, []);
+/// Every part of a type that must be ordered, judged once the module is solved.
+fn note_map_keys(checker: Checker, span: Span, ty: Type) -> Checker / {abort.raise} =
+  note_parts(checker, span, ordered_parts(checker.carrying, ty, []))
+
+/// The parts of `ty`, a scheme its declaration was judged by instantiated at fresh variables, that
+/// what those variables stand for decides: each is judged for them alone, as the key it stands in.
+fn note_instance(checker: Checker, span: Span, ty: Type) -> Checker / {abort.raise} =
+  note_sites(
+    checker,
+    span,
+    ordered_parts(checker.carrying, ty, []).fold([], |acc: List<Judged>, p: OrderedPart|
+      ord_needs(p.key, checker.ordering).fold(acc, |b: List<Judged>, v: Int|
+        b.push({ key: TyVar(v), whole: p.key, carrier: p.carrier }))),
+  )
+
+fn note_parts(checker: Checker, span: Span, found: List<OrderedPart>) -> Checker / {abort.raise} =
+  note_sites(
+    checker,
+    span,
+    found.map(|p: OrderedPart| { key: p.key, whole: p.key, carrier: p.carrier }),
+  )
+
+/// What a site judges, the key it names and the declared type that asks it, if no `Map` does.
+type Judged = { key: Type, whole: Type, carrier: Option<Type> }
+
+fn note_sites(checker: Checker, span: Span, found: List<Judged>) -> Checker / {abort.raise} =
   if found.len() == 0 { checker } else {
     let assumed = assumed_for(checker, DOrd);
     let params = rigid_params(checker);
     {
       ..checker,
       map_keys: checker.map_keys.concat(
-        found.map(|k: Type|
+        found.map(|j: Judged|
           {
             module: checker.module,
             span: span,
             scope: checker.scope,
-            key: k,
+            key: j.key,
+            whole: j.whole,
+            carrier: j.carrier,
             assumed: assumed,
             params: params,
             via: b"",
@@ -13925,7 +14140,6 @@ fn note_map_keys(checker: Checker, span: Span, ty: Type) -> Checker / {abort.rai
       ),
     }
   }
-}
 
 fn from_index(sites: List<MapKeySite>, from: Int) -> List<MapKeySite> / {abort.raise} =
   range(from, sites.len()).fold([], |acc: List<MapKeySite>, i: Int| acc.push(sites.get(i)))
@@ -13943,12 +14157,15 @@ fn relocated_keys(
     acc.set(i, { ..s, module: module, span: span, via: alias })
   })
 
-/// A reference that instantiated a parameter its callee constrained.
+/// A reference that instantiated a parameter its callee constrained, its type `ty`. An order on a
+/// parameter that a part of `ty` needs ordered is that part's to promise, read as `note_map_keys`
+/// records it, so `check_map_keys` judges it there, once.
 fn note_constraints(
   checker: Checker,
   span: Span,
   callee: Bytes,
   args: List<Type>,
+  ty: Type,
 ) -> Checker / {abort.raise} =
   match checker.constraints.get(callee) {
     None -> checker,
@@ -13958,8 +14175,12 @@ fn note_constraints(
         None -> { module: checker.module, span: span },
       };
       let params = rigid_params(checker);
+      let keyed = ordered_vars(checker, ty);
       let sites = cs.fold([], |acc: List<ConstraintSite>, c: DefConstraint|
-        if c.param >= args.len() { acc } else {
+        if c.param >= args.len()
+            || (same_deriver(c.deriver, DOrd)
+            && (match args.get(c.param) { TyVar(v) -> keyed.contains(v), _ -> false })) { acc }
+        else {
           acc.push({
             module: checker.module,
             span: span,
@@ -14014,17 +14235,22 @@ fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
   let ordered = instance_shapes(checker.instances, algebraic_shapes(checker), DOrd);
   let walked = checker.map_keys.fold(
     { checker: { ..checker, map_keys: [] }, seen: [] },
-    |acc: { checker: Checker, seen: List<{ scope: Int, text: Bytes }> }, site: MapKeySite| {
+    |acc: { checker: Checker, seen: List<SeenKey> }, site: MapKeySite| {
       let key = resolve(acc.checker, site.key);
-      match derivable(DOrd, key, ordered, site.assumed) {
+      match derivable(DOrd, key, ordered, with_flexible(acc.checker, key, site.assumed)) {
         None -> acc,
-        Some(blocked) -> if skipped_flexible(acc.checker, blocked) { acc } else {
-          let pr = print_ty(printer_new(), key);
+        Some(blocked) -> {
+          let pr = print_ty(printer_new(), resolve(acc.checker, site.whole));
           let rendered = pr.text;
-          let dup = acc.seen.fold(false, |b: Bool, s: { scope: Int, text: Bytes }|
-            b || (s.scope == site.scope && s.text == rendered));
+          let blocker = print_ty(pr.printer, blocked.ty).text;
+          let carried = match site.carrier { Some(_) -> true, None -> false };
+          // One refusal per key in a scope, and a type that carries an order and a `Map` key it
+          // stands in are one refusal for what blocks them both.
+          let dup = acc.seen.fold(false, |b: Bool, s: SeenKey|
+            b
+              || (s.scope == site.scope
+              && (s.text == rendered || (s.blocker == blocker && (s.carried || carried)))));
           if dup { acc } else {
-            let blocker = print_ty(pr.printer, blocked.ty).text;
             {
               checker: report(
                 acc.checker,
@@ -14037,14 +14263,35 @@ fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
                     blocker,
                     b"` is not an ordered type, so it cannot be a `Map` key",
                   ]),
-                  Bytes::concat_all([b"this map's key type is `", rendered, b"`"]),
+                  match site.carrier {
+                    None -> Bytes::concat_all([b"this map's key type is `", rendered, b"`"]),
+                    Some(t) ->
+                      Bytes::concat_all([
+                        b"`",
+                        type_text(resolve(acc.checker, t)),
+                        b"` keys a `Map` by `",
+                        rendered,
+                        b"`",
+                      ]),
+                  },
                   alias_noted(
                     why_notes_for_map_key(blocked.why, blocked, blocker, site.params),
                     site.via,
-                  ),
+                  ).concat(match site.carrier {
+                    None -> [],
+                    Some(_) ->
+                      [
+                        b"a type that keys a `Map` by a parameter needs it ordered wherever the type is written or built",
+                      ],
+                  }),
                 ),
               ),
-              seen: acc.seen.push({ scope: site.scope, text: rendered }),
+              seen: acc.seen.push({
+                scope: site.scope,
+                text: rendered,
+                blocker: blocker,
+                carried: carried,
+              }),
             }
           }
         },
@@ -14053,6 +14300,9 @@ fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
   );
   walked.checker
 }
+
+/// A key `check_map_keys` refused in `scope`, what blocked it, and whether a carrier asked it.
+type SeenKey = { scope: Int, text: Bytes, blocker: Bytes, carried: Bool }
 
 fn alias_noted(notes: List<Bytes>, via: Bytes) -> List<Bytes> =
   if via == b"" { notes } else {
@@ -14076,14 +14326,10 @@ fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
         { checker: check_predicate(acc.checker, site, ty), seen: acc.seen }
       } else {
         let through = shapes_for(shapes, site.deriver);
-        match derivable(
-            site.deriver,
-            ty,
-            if of_case(site) { adts } else { through },
-            site.assumed,
-          ) {
+        let assumed = with_flexible(acc.checker, ty, site.assumed);
+        match derivable(site.deriver, ty, if of_case(site) { adts } else { through }, assumed) {
           None -> acc,
-          Some(blocked) -> if skipped_flexible(acc.checker, blocked) { acc } else {
+          Some(blocked) -> {
             let pr = print_ty(printer_new(), ty);
             let rendered = pr.text;
             let tag = deriver_tag(site.deriver);
@@ -14129,7 +14375,7 @@ fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
                     blocker,
                     site.params,
                   ).concat(
-                    if of_case(site) && derivable(site.deriver, ty, through, site.assumed) == None {
+                    if of_case(site) && derivable(site.deriver, ty, through, assumed) == None {
                       [
                         b"a case is told from another by what it holds, so a `key` does not stand in for the type that states it",
                       ]
@@ -14654,18 +14900,13 @@ fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checke
                 Bytes::concat_all([b"a `", what, b"` names a function of its type's own module"]),
                 [],
               ),
-            Some(f) -> fitted(checker, def, type_name, f, writes_where(m, def.by.name)),
+            Some(f) -> fitted(checker, def, type_name, f),
           },
         },
       }
     },
   }
 }
-
-/// Whether the function `name` of `m` writes a `where`; what its signature's types carry is none.
-fn writes_where(m: ParsedModule, name: Bytes) -> Bool =
-  m.module.items.fold(false, |found: Bool, item: Item|
-    found || (match item { IFn(d) -> d.name.name == name && d.constraints.len() > 0, _ -> false }))
 
 fn not_a_sum(
   checker: Checker,
@@ -14699,18 +14940,9 @@ fn fitted(
   def: InstanceDef,
   type_name: Bytes,
   f: DefInfo,
-  where_written: Bool,
 ) -> Checker / {abort.raise} =
   match resolve(checker, f.scheme.ty) {
-    TyFn(sig) -> if where_written {
-      unfit(
-        checker,
-        def,
-        f,
-        b"this function has a `where` clause",
-        b"it is called with the value alone, wherever two are compared or one is shown, so no call fills a constraint",
-      )
-    } else if sig.params.len() != 1 {
+    TyFn(sig) -> if sig.params.len() != 1 {
       unfit(
         checker,
         def,
@@ -14746,7 +14978,19 @@ fn fitted(
               b"` there is",
             ]),
           ),
-        Some(own) -> if !row_is_pure(sig.effects) {
+        Some(own) -> if beyond_carried(checker, type_name, f, own) {
+          unfit(
+            checker,
+            def,
+            f,
+            Bytes::concat_all([
+              b"this function is constrained beyond what `",
+              def.target.name,
+              b"` carries",
+            ]),
+            b"it is called with the value alone, wherever two are compared or one is shown, so no call meets a constraint: its signature may need only the order the type itself carries, where what it holds keys a `Map` by the parameter",
+          )
+        } else if !row_is_pure(sig.effects) {
           unfit(
             checker,
             def,
@@ -14787,6 +15031,23 @@ fn fitted(
       }
     },
     _ -> checker,
+  }
+
+/// Whether `f`, taking the type `type_name` at its own parameters `own`, is constrained, written or
+/// implied, beyond the order the type carries of those parameters.
+fn beyond_carried(
+  checker: Checker,
+  type_name: Bytes,
+  f: DefInfo,
+  own: OwnParams,
+) -> Bool / {abort.raise} =
+  if f.constraints.len() == 0 { false } else {
+    let positions = match checker.carrying.get(type_name) { Some(ps) -> ps, None -> [] };
+    let carried = positions.fold([], |acc: List<Int>, j: Int|
+      match own.params.at(j) { Some(v) -> acc.push(v), None -> acc });
+    f.constraints.any(|c: DefConstraint|
+      !same_deriver(c.deriver, DOrd)
+        || (match f.scheme.ty_vars.at(c.param) { Some(v) -> !carried.contains(v), None -> true }))
   }
 
 /// Whether every variable an answer's type holds is one of the type's own parameters.
@@ -16258,6 +16519,8 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     instances: [],
     numeric_types: [],
     keyed_names: [],
+    ordering: Map::new(),
+    carrying: Map::new(),
     copied: false,
     cell_named: false,
     assignable: { vars: [], barred: None },
@@ -16977,7 +17240,7 @@ pub fn check_program_with(
     collect_stated(check_value_namespace(collect_ctors(typed, m), m), m)
   });
   let signed = resolved.order.fold(
-    { checker: declared, by: Map::new() },
+    { checker: with_orders(declared), by: Map::new() },
     |acc: { checker: Checker, by: Map<Int, SignedModule> }, i: Int| {
       let o = signed_fns({ ..acc.checker, module: i }, mods.get(i));
       { checker: o.checker, by: acc.by.insert(i, o.signed) }
@@ -19689,6 +19952,11 @@ test "a derivable constraint is published on the type parameter it names" {
   assert_eq(
     dump,
     "K;1;F;m.show;<a>(a) -> Int;;;eq0;F;m.keyed;<a, b>(Map<a, b>) -> Int;;;ord0;F;m.used;() -> Int;;;;",
+  );
+  // Implied by the `Map` the signature names, it is published as though written.
+  assert_eq(
+    check_dump([{ name: b"m", src: b"pub fn keyed<k, v>(m: Map<k, v>) -> Int = m.len()" }]),
+    "K;1;F;m.keyed;<a, b>(Map<a, b>) -> Int;;;ord0;",
   )
 }
 
@@ -21576,7 +21844,9 @@ test "a declared type that keys a `Map` by its parameter carries the parameter's
   );
   // A parameter a declaration holds without keying a `Map` by it carries nothing.
   assert_eq(
-    check_codes(b"type Box<a> = | Box(a)\nfn keyed<a>(b: Box<a>) -> Map<a, Int> = Map::new()\n"),
+    check_codes(
+      b"type Box<a> = | Box(a)\nfn keyed<a>(b: Box<a>, x: a) -> Ordering = compare(x, x)\n",
+    ),
     [b"E0206"],
   );
   // A `key` and a `show` name functions the type's order is carried into, with no `where`.
@@ -21588,6 +21858,444 @@ test "a declared type that keys a `Map` by its parameter carries the parameter's
     ),
     [],
   )
+}
+
+test "a signature that names a `Map` keyed by its parameter implies the parameter's order" {
+  let size = b"fn size<k>(m: Map<k, Int>) -> Int = m.len()\n";
+  let empty = b"fn empty<k>() -> Map<k, Int> = Map::new()\n";
+  assert_eq(check_codes(size.concat(empty)), []);
+  assert_eq(
+    check_codes(b"fn size<k>(m: Map<k, Int>) -> Int where derivable(ord, k) = m.len()\n"),
+    [],
+  );
+  // The body assumes it, as it would a `where`.
+  assert_eq(check_codes(b"fn c<k>(m: Map<k, Int>, a: k, b: k) -> Ordering = compare(a, b)\n"), []);
+  assert_eq(check_codes(b"fn c<k>(a: k, b: k) -> Ordering = compare(a, b)\n"), [b"E0206"]);
+  // A caller meets it.
+  assert_eq(
+    check_codes(size.concat(b"fn floats(x: Float) -> Int = size(Map::new().insert(x, 1))\n")),
+    [b"E0206"],
+  );
+  assert_eq(
+    check_codes(empty.concat(b"fn floats(x: Float) -> Int = empty().insert(x, 1).len()\n")),
+    [b"E0206"],
+  )
+}
+
+test "a `key` or a `show` names no function constrained beyond the order its type carries" {
+  let t = b"type T<a> = | T(List<a>)\n";
+  let counted = b"fn counted<a>(t: T<a>) -> Map<a, Int> = match t { T(xs) -> xs.fold(Map::new(), |m: Map<a, Int>, x: a| m.insert(x, 1)) }\n";
+  // Nothing holds `==` to the order its `Map` implies, so `T([1.5])` would be keyed by `Float`.
+  assert_eq(
+    check_codes(
+      Bytes::concat_all([
+        t,
+        b"key for T by counted\n",
+        counted,
+        b"fn bad() -> Bool = T([1.5]) == T([2.5])\n",
+      ]),
+    ),
+    [b"E0218"],
+  );
+  assert_eq(
+    check_codes(
+      t.concat(
+        b"show for T by shown\nfn shown<a>(t: T<a>) -> String where derivable(ord, a) = \"t\"\n",
+      ),
+    ),
+    [b"E0218"],
+  );
+  let bag = b"type Bag<a> = | Bag(Map<a, Int>)\n";
+  assert_eq(
+    check_codes(
+      Bytes::concat_all([
+        t,
+        bag,
+        b"key for T by bagged\nfn bagged<a>(t: T<a>) -> Bag<a> = Bag(Map::new())\n",
+      ]),
+    ),
+    [b"E0218"],
+  );
+  // An order the type carries itself may be asked, written or implied; no other constraint may.
+  assert_eq(
+    check_codes(
+      bag.concat(
+        b"key for Bag by items\nfn items<a>(b: Bag<a>) -> Map<a, Int> where derivable(ord, a) = match b { Bag(m) -> m }\n",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      bag.concat(
+        b"key for Bag by items\nfn items<a>(b: Bag<a>) -> List<a> where derivable(eq, a) = match b { Bag(m) -> m.keys() }\n",
+      ),
+    ),
+    [b"E0218"],
+  )
+}
+
+test "a type that keys a `Map` by its parameter is ordered wherever it is written or built" {
+  let opt = b"type Opt<a> = | Plain(a) | Keyed(Map<a, Int>)\n";
+  // A `key` that keys a `Map` by what a variant holds is reached only through a value, and no
+  // value of `Opt<Float>` is built.
+  assert_eq(
+    check_codes(
+      opt.concat(
+        b"key for Opt by k\nfn k<a>(o: Opt<a>) -> Int = match o { Plain(x) -> Map::new().insert(x, 1).len(), Keyed(m) -> m.len() }\nfn bad() -> Bool = Plain(1.5) == Plain(2.5)\n",
+      ),
+    ),
+    [b"E0206"],
+  );
+  assert_eq(check_codes(opt.concat(b"fn floats() -> Opt<Float> = Keyed(Map::new())\n")), [
+    b"E0206",
+  ]);
+  assert_eq(check_codes(opt.concat(b"fn ints() -> Bool = Plain(1) == Plain(2)\n")), []);
+  // Through a `show`, a `Map` in a list, and a sum the type holds.
+  assert_eq(
+    check_codes(
+      b"type S<a> = | S(List<Map<a, Int>>) | P(a)\nshow for S by shown\nfn shown<a>(s: S<a>) -> String = match s { P(x) -> Map::new().insert(x, 1).len().to_string(), S(_) -> \"s\" }\nfn bad() -> String = shown(P(1.5))\n",
+    ),
+    [b"E0206"],
+  );
+  let nested = b"type Opt2<a> = | N | S(Map<a, Int>)\ntype T<a> = | T(Opt2<a>, a)\n";
+  assert_eq(check_codes(nested.concat(b"fn bad() -> Int = { let _ = T(N, 1.5); 0 }\n")), [
+    b"E0206",
+  ]);
+  assert_eq(check_codes(nested.concat(b"fn good() -> Int = { let _ = T(N, 1); 0 }\n")), []);
+  // Where a declaration's field writes it.
+  assert_eq(check_codes(opt.concat(b"type W = | W(Opt<Float>)\n")), [b"E0206"]);
+  assert_eq(check_codes(opt.concat(b"type R = new { o: Opt<(Int) -> Int> }\n")), [b"E0206"]);
+  assert_eq(check_codes(opt.concat(b"type W<a> = | W(Opt<a>)\n")), []);
+  // A generic body builds one only where its parameter is ordered.
+  assert_eq(check_codes(opt.concat(b"fn wrap<a>(x: a) -> Int = { let _ = Plain(x); 0 }\n")), [
+    b"E0206",
+  ]);
+  assert_eq(check_codes(opt.concat(b"fn wrap<a>(x: a) -> Opt<a> = Plain(x)\n")), [])
+}
+
+test "a type that carries an order is judged once, where it is written, and calls nothing" {
+  let opt = b"type Opt<a> = | Plain(a) | Keyed(Map<a, Int>)\n";
+  // Building one orders nothing, so a `key` may build one of its own type.
+  assert_eq(
+    check_codes(
+      opt.concat(
+        b"type T = | T(Int)\nkey for T by k\nfn k(t: T) -> Int = match t { T(n) -> { let _ = Plain(t); n } }\n",
+      ),
+    ),
+    [],
+  );
+  // Written in a signature, through an alias, in an annotation and at a law's binder.
+  assert_eq(check_codes(opt.concat(b"fn f(o: Opt<Float>) -> Int = 0\n")), [b"E0206"]);
+  assert_eq(check_codes(opt.concat(b"type A = Opt<Float>\nfn f(o: A) -> Int = 0\n")), [b"E0206"]);
+  assert_eq(
+    check_codes(opt.concat(b"fn f() -> Int = { let o: Option<Opt<Float>> = None; 0 }\n")),
+    [b"E0206"],
+  );
+  assert_eq(check_codes(opt.concat(b"law \"l\" forall (o: Opt<Float>) { true }\n")), [b"E0206"]);
+  // An alias read while the declarations were is read again once orders are known.
+  assert_eq(
+    check_codes(
+      b"type Bag<a> = new { m: Map<a, Int> }\ntype B = Bag<Float>\ntype S = | S(B)\nfn f(b: B) -> Int = 0\n",
+    ),
+    [b"E0206", b"E0206"],
+  );
+  // A `Map` keyed by a type that carries an order is one refusal; so is each use of a variant
+  // that holds a fixed one, refused where the variant is declared.
+  assert_eq(check_codes(opt.concat(b"fn f(m: Map<Opt<Float>, Int>) -> Int = m.len()\n")), [
+    b"E0206",
+  ]);
+  assert_eq(
+    check_codes(
+      opt.concat(b"type W = | W(Opt<Float>)\nfn g() -> Int = { let _ = W; let _ = W; 0 }\n"),
+    ),
+    [b"E0206"],
+  )
+}
+
+test "a part of a type nothing pinned hides no other part a constraint refuses" {
+  let needs = b"fn needs<a>(x: a) -> Int where derivable(ord, a) = Map::new().insert(x, 1).len()\n";
+  assert_eq(check_codes(needs.concat(b"fn f() -> Int = needs(([], 1.5))\n")), [b"E0206"]);
+  assert_eq(check_codes(needs.concat(b"fn f() -> Int = needs(([], 1))\n")), []);
+  assert_eq(
+    check_codes(
+      b"type Bag<a> = | Bag(Map<a, Int>)\nfn f<a>(b: Option<Bag<a>>, x: a) -> Int = Map::new().insert(x, 1).len()\nfn g() -> Int = f(None, ([], 1.5))\n",
+    ),
+    [b"E0206"],
+  )
+}
+
+test "an implied order is what ordering the key reads, not every parameter the key writes" {
+  let id = b"type Id<a> = | Id(Int)\n";
+  assert_eq(
+    check_codes(
+      id.concat(
+        b"fn lookup<a>(m: Map<Id<a>, a>, id: Id<a>) -> Option<a> = m.get(id)\nfn f() -> Option<(Int) -> Int> = lookup(Map::new(), Id(1))\n",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(id.concat(b"fn c<a>(m: Map<Id<a>, Int>, x: a) -> Ordering = compare(x, x)\n")),
+    [b"E0206"],
+  );
+  // Through an alias, and through a declared type that holds the `Map`.
+  assert_eq(
+    check_codes(
+      id.concat(
+        b"type ById<a> = Map<Id<a>, a>\nfn size<a>(m: ById<a>) -> Int = m.len()\nfn f(m: ById<(Int) -> Int>) -> Int = size(m)\n",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      id.concat(
+        b"type Tagged<a> = | Tagged(Map<Id<a>, Int>)\nfn size<a>(t: Tagged<a>) -> Int = match t { Tagged(m) -> m.len() }\nfn f(t: Tagged<(Int) -> Int>) -> Int = size(t)\n",
+      ),
+    ),
+    [],
+  );
+  // A type that states a `key` is ordered by what the key answers.
+  let k = b"type K<a> = | K(a, Int)\nkey for K by kk\n";
+  assert_eq(
+    check_codes(
+      k.concat(
+        b"fn kk<a>(k: K<a>) -> Int = match k { K(_, n) -> n }\nfn size<a>(m: Map<K<a>, Int>) -> Int = m.len()\nfn f(m: Map<K<(Int) -> Int>, Int>) -> Int = size(m)\n",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      k.concat(
+        b"fn kk<a>(k: K<a>) -> List<a> = match k { K(x, _) -> [x] }\nfn c<a>(m: Map<K<a>, Int>, x: a) -> Ordering = compare(x, x)\n",
+      ),
+    ),
+    [],
+  )
+}
+
+test "a part of a `Map` key nothing pinned hides no other part that has no order" {
+  let pair = b"fn pair<j, k>(m: Map<(j, k), Int>, x: k, y: k) -> Ordering where derivable(ord, j), derivable(ord, k) = compare(x, y)\n";
+  assert_eq(check_codes(pair.concat(b"fn f() -> Ordering = pair(Map::new(), 1.5, 2.5)\n")), [
+    b"E0206",
+  ]);
+  assert_eq(check_codes(pair.concat(b"fn f() -> Ordering = pair(Map::new(), 1, 2)\n")), []);
+  assert_eq(check_codes(b"fn f(x: Float) -> Int = Map::new().insert(([], x), 1).len()\n"), [
+    b"E0206",
+  ]);
+  assert_eq(check_codes(b"fn f() -> Int = Map::new().len()\n"), [])
+}
+
+test "an operation's `Map` key implies its order, which each perform meets and each handler assumes" {
+  let store = b"effect store { write keyed<a>(x: a) -> Map<a, Int> }\n";
+  assert_eq(check_codes(store), []);
+  assert_eq(
+    check_codes(
+      store.concat(
+        b"fn go() -> Int = handle { store.keyed(1).len() } with { store.keyed(x) -> Map::new().insert(x, 1) }\n",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      store.concat(b"fn go(x: Float) -> Bool / {store.keyed} = { let _ = store.keyed(x); true }\n"),
+    ),
+    [b"E0206"],
+  );
+  assert_eq(check_codes(b"effect store { write floats(x: Int) -> Map<Float, Int> }\n"), [b"E0206"]);
+  // What the declaration writes is judged there alone, however often the operation is performed.
+  let bad = b"effect bad { raise oops(m: Map<Float, Int>) }\n";
+  assert_eq(
+    check_codes(
+      bad.concat(
+        b"fn f(m: Map<Float, Int>) -> Int / {bad.oops} = if m.len() > 0 { bad.oops(m) } else { bad.oops(m) }\n",
+      ),
+    ),
+    check_codes(bad.concat(b"fn f(m: Map<Float, Int>) -> Int = 0\n")),
+  );
+  // A type that carries an order is the same: the clause assumes it and each perform meets it.
+  let wrap = b"type Wrap<a> = new { m: Map<a, Int> }\ntype Box<a> = | Box(a)\n";
+  assert_eq(
+    check_codes(
+      wrap.concat(
+        b"effect cmp { write same<a>(w: Wrap<a>, x: a) -> Ordering }\nfn empty<a>() -> Wrap<a> = { m: Map::new() }\nfn go() -> Ordering = handle { cmp.same(empty(), 1) } with { cmp.same(w, x) -> compare(x, x) }\n",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      wrap.concat(
+        b"effect cmp { write same<a>(w: Box<a>, x: a) -> Ordering }\nfn go() -> Ordering = handle { cmp.same(Box(1), 1) } with { cmp.same(w, x) -> compare(x, x) }\n",
+      ),
+    ),
+    [b"E0206"],
+  );
+  assert_eq(
+    check_codes(
+      wrap.concat(
+        b"effect cmp { write same<a>(w: Wrap<a>, x: a) -> Ordering }\nfn go(w: Wrap<Float>) -> Ordering / {cmp.same} = cmp.same(w, 1.5)\n",
+      ),
+    ),
+    [b"E0206"],
+  );
+  // Where the declaration writes one, at a fixed type or beside a parameter.
+  assert_eq(check_codes(wrap.concat(b"effect e { write put(w: Wrap<Float>) -> Unit }\n")), [
+    b"E0206",
+  ]);
+  assert_eq(
+    check_codes(wrap.concat(b"effect e { write put<a>(w: Wrap<(a, Float)>, x: a) -> Unit }\n")),
+    [b"E0206"],
+  );
+  assert_eq(
+    check_codes(wrap.concat(b"effect e { write put<a>(w: Wrap<(a, Int)>, x: a) -> Unit }\n")),
+    [],
+  );
+  // A perform judges what the parameter stands for once, naming the key it stands in.
+  let refused = check_diags(
+    b"effect e { write put<a>(m: Map<(a, Int), Int>) -> Unit }\nfn f() -> Unit / {e.put} = e.put(Map::new().insert((1.5, 1), 1))\n",
+  ).filter(|d: Diag| d.code == b"E0206");
+  assert_eq(
+    refused.map(|d: Diag|
+      d.labels.fold(b"", |t: Bytes, l: Label| if l.primary { l.text } else { t })),
+    [b"this map's key type is `(Float, Int)`"],
+  )
+}
+
+test "a `Map` implies its key's order wherever its signature names it" {
+  let assumes = |held: Bytes|
+    check_codes(
+      Bytes::concat_all([b"fn c<k>(held: ", held, b", a: k, b: k) -> Ordering = compare(a, b)\n"]),
+    );
+  assert_eq(assumes(b"List<Map<k, Int>>"), []);
+  assert_eq(assumes(b"{ by: Map<k, Int> }"), []);
+  assert_eq(assumes(b"(Map<k, Int>) -> Int"), []);
+  assert_eq(assumes(b"Map<(k, Int), Int>"), []);
+  assert_eq(assumes(b"Map<Int, k>"), [b"E0206"]);
+  assert_eq(
+    check_codes(
+      b"fn c<k>(a: k, b: k) -> { o: Ordering, by: Option<Map<k, Int>> } = { o: compare(a, b), by: None }\n",
+    ),
+    [],
+  )
+}
+
+test "a signature that names an alias of a `Map` implies the order its expansion needs" {
+  let index = b"type Index<a> = Map<a, Int>\n";
+  assert_eq(
+    check_codes(
+      index.concat(
+        b"fn size<k>(m: Index<k>) -> Int = m.len()\nfn empty<k>() -> Index<k> = Map::new()\n",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      index.concat(
+        b"fn size<k>(m: Index<k>) -> Int = m.len()\nfn floats(x: Float) -> Int = size(Map::new().insert(x, 1))\n",
+      ),
+    ),
+    [b"E0206"],
+  );
+  assert_eq(check_codes(index.concat(b"fn floats(m: Index<Float>) -> Int = m.len()\n")), [
+    b"E0206",
+  ]);
+  // Through an alias of the alias; an alias's parameter that is no key carries nothing.
+  assert_eq(
+    check_codes(
+      index.concat(
+        b"type Indices<a> = List<Index<a>>\nfn c<k>(i: Indices<k>, a: k, b: k) -> Ordering = compare(a, b)\n",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      b"type Counts<a> = Map<Int, a>\nfn c<v>(m: Counts<v>, a: v, b: v) -> Ordering = compare(a, b)\n",
+    ),
+    [b"E0206"],
+  );
+  // An alias of a declared type that keys a `Map` carries that type's order.
+  let sack = b"type Bag<a> = | Bag(Map<a, Int>)\ntype Sack<a> = Bag<a>\nfn none<a>() -> Sack<a> = Bag(Map::new())\n";
+  assert_eq(check_codes(sack), []);
+  assert_eq(check_codes(sack.concat(b"fn floats() -> Sack<Float> = none()\n")), [b"E0206"])
+}
+
+test "a generic caller meets the order its callee's `Map` implies" {
+  let size = b"fn size<k>(m: Map<k, Int>) -> Int = m.len()\n";
+  assert_eq(
+    check_codes(
+      size.concat(b"fn both<j>(a: Map<j, Int>, b: Map<j, Int>) -> Int = size(a) + size(b)\n"),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(size.concat(b"fn one<j>(x: j) -> Int = size(Map::new().insert(x, 1))\n")),
+    [b"E0206"],
+  );
+  assert_eq(
+    check_codes(
+      size.concat(
+        b"fn one<j>(x: j) -> Int where derivable(ord, j) = size(Map::new().insert(x, 1))\n",
+      ),
+    ),
+    [],
+  )
+}
+
+test "an unordered key reaching an implied `Map` order is reported once, at the `Map`" {
+  let over = |callee: Bytes, caller: Bytes|
+    check_codes(
+      Bytes::concat_all([b"type Node = | Node((Int) -> Int)\n", callee, b"\n", caller, b"\n"]),
+    );
+  let size = b"fn size<k>(m: Map<k, Int>) -> Int = m.len()";
+  assert_eq(over(size, b"fn f(x: Float) -> Int = size(Map::new().insert(x, 1))"), [b"E0206"]);
+  assert_eq(over(size, b"fn f(n: Node) -> Int = size(Map::new().insert(n, 1))"), [b"E0206"]);
+  assert_eq(over(size, b"fn f(m: Map<Float, Int>) -> Int = size(m)"), [b"E0206"]);
+  // Written, the order is judged as the implied one is; inside the key, too.
+  assert_eq(
+    over(
+      b"fn size<k>(m: Map<k, Int>) -> Int where derivable(ord, k) = m.len()",
+      b"fn f(x: Float) -> Int = size(Map::new().insert(x, 1))",
+    ),
+    [b"E0206"],
+  );
+  assert_eq(
+    over(
+      b"fn size<k>(m: Map<(k, Int), Int>) -> Int = m.len()",
+      b"fn f(x: Float) -> Int = size(Map::new().insert((x, 1), 1))",
+    ),
+    [b"E0206"],
+  );
+  // Read through a declared type, as the signature's order is.
+  assert_eq(
+    over(
+      b"type Pair<a> = | Pair(a, a)\nfn size<a>(m: Map<Pair<a>, Int>) -> Int = m.len()",
+      b"fn f(x: Float) -> Int = size(Map::new().insert(Pair(x, x), 1))",
+    ),
+    [b"E0206"],
+  );
+  assert_eq(
+    over(
+      b"type Bag<a> = | Bag(Map<a, Int>)\nfn size<a>(b: Bag<a>) -> Int = 0",
+      b"fn f(b: Bag<Float>) -> Int = size(b)",
+    ),
+    [b"E0206"],
+  )
+}
+
+test "a shipped module's extern that names a `Map` implies its key's order" {
+  assert_eq(declared_as(b"Map::insert").constraints, [{ deriver: DOrd, param: 0 }]);
+  assert_eq(declared_as(b"Map::values").constraints, [{ deriver: DOrd, param: 0 }]);
+  let native = { name: b"std.native", src: b"pub extern fn size<k>(m: Map<k, Int>) -> Int\n" };
+  let calls = |src: Bytes|
+    codes_of([native, { name: b"m", src: b"import std.native (size)\n".concat(src) }]);
+  assert_eq(calls(b"fn twice<j>(m: Map<j, Int>) -> Int = size(m) + size(m)\n"), []);
+  assert_eq(calls(b"fn floats(x: Float) -> Int = size(Map::new().insert(x, 1))\n"), [b"E0206"])
 }
 
 test "a key answers a type that is ordered and hashed, and that does not hold its own" {
