@@ -1165,6 +1165,10 @@ Functions cannot be compared, encoded, ordered or used as map keys.
   what it names: the mode atom `net.write[conn]` covers every `write` operation
   of `net` on `conn`, the operation atom `net.send[conn]` covers `send` alone
   (§6.2).
+* **Kept:** a top-level `fn`'s parameter of a function type written `keep`
+  (`f: keep (Int) -> Int`) says the function may hold the function it is handed
+  past the call. It is part of the signature and of the function's hash; `keep`
+  stands only before a function type (a parse error elsewhere).
 * **Inferred inside bodies:** lambda binders and rows, `let`s, everything else.
   A local `let` is monomorphic, so `let f = |x| x;` used at two types is
   `E0201`.

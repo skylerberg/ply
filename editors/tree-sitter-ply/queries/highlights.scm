@@ -75,6 +75,7 @@
 ] @keyword.control
 
 "fn" @keyword.function
+(keep_marker) @keyword
 
 [
   (boolean)

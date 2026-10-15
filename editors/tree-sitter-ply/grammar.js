@@ -146,9 +146,11 @@ module.exports = grammar({
     space_clause: $ => seq('space', field('bound', $._expression)),
 
     parameter_list: $ => seq('(', optional(commaSep1($.parameter)), ')'),
+    keep_marker: $ => 'keep',
     parameter: $ => seq(
       field('name', choice($.identifier, $.wildcard)),
       ':',
+      optional($.keep_marker),
       field('type', $._type),
       optional(seq('=', field('default', $._expression))),
     ),
