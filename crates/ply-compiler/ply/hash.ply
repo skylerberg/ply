@@ -1,7 +1,7 @@
 //! Content addressing: a definition's identity is its normalized structure, so a name is never part of it.
 //! A float literal hashes by its IEEE bit pattern.
 
-import parsing (Span, Ident, QName, is_bare, starts_upper, span_bin, dummy_span, span_key)
+import parsing (Span, Ident, QName, is_bare, bare, starts_upper, span_bin, dummy_span, span_key)
 import std.bin
 import lexer (widths, wide_decimal, utf8_of)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
@@ -10,9 +10,9 @@ import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
-              ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, MatchArm,
-              HandleClause, ReturnClause, RecField, ETagged, Tagged, Hole, tagged_parser,
-              tagged_filler, NamedArg, expr_span)
+              ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign, Param,
+              MatchArm, HandleClause, ReturnClause, HandlerVar, RecField, ETagged, Tagged, Hole,
+              tagged_parser, tagged_filler, NamedArg, expr_span)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
               Constraint, Deriver, deriver_tag, deriver_text, derivers, constraint_kinds,
@@ -636,9 +636,12 @@ fn tag_e_filled() -> Int = 150
 fn tag_e_parallel() -> Int = 100
 fn tag_e_try_block() -> Int = 131
 fn tag_e_record_update() -> Int = 67
+/// A `handle` with variables, apart from `tag_e_handle` so one without any hashes as it did.
+fn tag_e_handle_vars() -> Int = 68
 fn tag_s_let() -> Int = 70
 fn tag_s_expr() -> Int = 71
 fn tag_s_let_else() -> Int = 72
+fn tag_s_assign() -> Int = 73
 fn tag_p_wildcard() -> Int = 80
 fn tag_p_var() -> Int = 81
 fn tag_p_lit() -> Int = 82
@@ -1698,35 +1701,20 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
           [],
         ),
     },
-    EHandle(h) -> {
-      let clauses: Encoder = h.clauses.fold(
-        put_u32(expr(put_tag(encoder, tag_e_handle()), h.body), h.clauses.len()),
-        |acc: Encoder, c: HandleClause| {
-          let head: Encoder = put_u32(
-            opt_label(
-              put_text(effect_ref(put_tag(acc, tag_clause()), c.eff), c.op.name),
-              clause_label(c),
-            ),
-            c.params.len(),
-          );
-          let bound: Encoder = bind_all(head, c.params.map(|p: Ident| p.name));
-          // Whether a clause binds a continuation is part of what the definition is.
-          let resumed: Encoder = match c.resume {
-            None -> put_tag(bound, tag_none()),
-            Some(k) -> bind(put_tag(bound, tag_some()), k.name),
-          };
-          let inner: Encoder = expr(resumed, c.body);
-          { ..inner, values: acc.values }
-        },
+    EHandle(h) -> if h.vars.len() == 0 {
+      handled(expr(put_tag(encoder, tag_e_handle()), h.body), h.clauses, h.ret)
+    } else {
+      // The first values are read where the `handle` stands, before its body, each seeing the
+      // variables above it; the clauses and the `return` see the variables, the body does not.
+      let inits: Encoder = h.vars.fold(
+        put_u32(put_tag(encoder, tag_e_handle_vars()), h.vars.len()),
+        |acc: Encoder, v: HandlerVar| bind(expr(opt_type(acc, v.ty), v.init), v.name.name),
       );
-      match h.ret {
-        None -> put_tag(clauses, tag_none()),
-        Some(rc) -> {
-          let head: Encoder = put_tag(put_tag(clauses, tag_some()), tag_return_clause());
-          let inner: Encoder = expr(bind(head, rc.binder.name), rc.body);
-          { ..inner, values: clauses.values }
-        },
-      }
+      let held: Encoder = bind_all(
+        expr({ ..inits, values: encoder.values }, h.body),
+        h.vars.map(|v: HandlerVar| v.name.name),
+      );
+      { ..handled(held, h.clauses, h.ret), values: encoder.values }
     },
     EWithCell(c) -> {
       let head: Encoder = expr(
@@ -1823,6 +1811,42 @@ fn sorted_run(encoder: Encoder, stmts: List<Stmt>, from: Int, to: Int) -> Encode
   }
 }
 
+/// A `handle`'s clauses and `return`, after its body.
+fn handled(
+  encoder: Encoder,
+  clauses: List<HandleClause>,
+  ret: Option<ReturnClause>,
+) -> Encoder / {abort.raise} = {
+  let walked: Encoder = clauses.fold(
+    put_u32(encoder, clauses.len()),
+    |acc: Encoder, c: HandleClause| {
+      let head: Encoder = put_u32(
+        opt_label(
+          put_text(effect_ref(put_tag(acc, tag_clause()), c.eff), c.op.name),
+          clause_label(c),
+        ),
+        c.params.len(),
+      );
+      let bound: Encoder = bind_all(head, c.params.map(|p: Ident| p.name));
+      // Whether a clause binds a continuation is part of what the definition is.
+      let resumed: Encoder = match c.resume {
+        None -> put_tag(bound, tag_none()),
+        Some(k) -> bind(put_tag(bound, tag_some()), k.name),
+      };
+      let inner: Encoder = expr(resumed, c.body);
+      { ..inner, values: acc.values }
+    },
+  );
+  match ret {
+    None -> put_tag(walked, tag_none()),
+    Some(rc) -> {
+      let head: Encoder = put_tag(put_tag(walked, tag_some()), tag_return_clause());
+      let inner: Encoder = expr(bind(head, rc.binder.name), rc.body);
+      { ..inner, values: walked.values }
+    },
+  }
+}
+
 fn stmt(encoder: Encoder, s: Stmt) -> Encoder / {abort.raise} =
   match s {
     SLet(l) -> pattern(expr(opt_type(put_tag(encoder, tag_s_let()), l.ty), l.value), l.pat),
@@ -1832,6 +1856,7 @@ fn stmt(encoder: Encoder, s: Stmt) -> Encoder / {abort.raise} =
         l.fallback,
       ),
     SExpr(e) -> expr(put_tag(encoder, tag_s_expr()), e),
+    SAssign(a) -> expr(value_ref(put_tag(encoder, tag_s_assign()), bare(a.name)), a.value),
   }
 
 fn lit(encoder: Encoder, literal: Lit) -> Encoder / {abort.raise} =
@@ -2019,6 +2044,7 @@ pub fn is_pure(e: Expr) -> Bool =
               SLet(l) -> is_pure(l.value),
               SLetElse(l) -> is_pure(l.value) && is_pure(l.fallback),
               SExpr(x) -> is_pure(x),
+              SAssign(_) -> false,
             }))
         && (match b.tail { Some(t) -> is_pure(t), None -> true }),
     ERecord(r) -> r.fields.fold(true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
@@ -2059,6 +2085,7 @@ fn mentions(e: Expr, names: List<Bytes>) -> Bool =
                 pattern_mentions(l.pat, names) || mentions(l.value, names)
                   || mentions(l.fallback, names),
               SExpr(x) -> mentions(x, names),
+              SAssign(x) -> names.contains(x.name.name) || mentions(x.value, names),
             }))
         || (match b.tail { Some(t) -> mentions(t, names), None -> false }),
     ERecord(r) -> r.fields.fold(false, |acc: Bool, f: RecField| acc || mentions(f.value, names)),
@@ -2070,7 +2097,9 @@ fn mentions(e: Expr, names: List<Bytes>) -> Bool =
     EList(l) -> l.items.fold(false, |acc: Bool, x: Expr| acc || mentions(x, names)),
     EPerform(p) -> p.args.fold(false, |acc: Bool, x: Expr| acc || mentions(x, names)),
     EHandle(h) ->
-      mentions(h.body, names)
+      h.vars.fold(false, |acc: Bool, v: HandlerVar|
+          acc || names.contains(v.name.name) || mentions(v.init, names))
+        || mentions(h.body, names)
         || h.clauses.fold(false, |acc: Bool, c: HandleClause|
           acc || c.params.fold(false, |b: Bool, p: Ident| b || names.contains(p.name))
             || mentions(c.body, names))
@@ -4512,6 +4541,7 @@ fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
           SLet(x) -> lambda_rets(x.value, acc),
           SLetElse(x) -> lambda_rets(x.fallback, lambda_rets(x.value, acc)),
           SExpr(x) -> lambda_rets(x, acc),
+          SAssign(x) -> lambda_rets(x.value, acc),
         });
       match b.tail { Some(t) -> lambda_rets(t, walked), None -> walked }
     },
@@ -4524,8 +4554,9 @@ fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
     EList(l) -> l.items.fold(out, |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
     EPerform(p) -> p.args.fold(out, |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
     EHandle(h) -> {
+      let inits = h.vars.fold(out, |acc: List<TypeExpr>, v: HandlerVar| lambda_rets(v.init, acc));
       let clauses = h.clauses.fold(
-        lambda_rets(h.body, out),
+        lambda_rets(h.body, inits),
         |acc: List<TypeExpr>, c: HandleClause| lambda_rets(c.body, acc),
       );
       match h.ret { Some(rc) -> lambda_rets(rc.body, clauses), None -> clauses }
@@ -5856,65 +5887,43 @@ fn print_expr(outer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.ra
       }
     } else if t.value == tag_e_handle() {
       let body = print_expr(printer, e, depth);
-      let n = read_count(body.decoder);
-      let clauses = read_many(n.decoder, n.value, |g: Decoder| {
-        let eff = read_effect(printer, expect(g, tag_clause(), b"a handler clause"));
-        let op = read_text(eff.decoder);
-        let r = read_opt(op.decoder, read_label);
-        let k: DecodedInt = read_binders(r.decoder);
-        let bound = g.values + k.value;
-        let resumed: DecodedOption = read_opt({ ..k.decoder, values: bound }, |h: Decoder|
-          { decoder: h, text: b" resume ".concat(local_name(bound)) });
-        let cb: Decoded = print_expr(
-          printer,
-          { ..resumed.decoder, values: if resumed.some { bound + 1 } else { bound } },
-          inner,
-        );
-        {
-          decoder: { ..cb.decoder, values: g.values },
-          text: Bytes::concat_all([
-            line_break(inner),
-            eff.text,
-            b".",
-            op.text,
-            bracketed(r),
-            b"(",
-            joined(range(0, k.value).map(|i: Int| local_name(g.values + i)), b", "),
-            b")",
-            resumed.text,
-            b" -> ",
-            cb.text,
-            b",",
-          ]),
-        }
-      });
-      let ret = read_opt(clauses.decoder, |g: Decoder| {
-        let h: Decoder = expect(g, tag_return_clause(), b"a return clause");
-        let rb: Decoded = print_expr(printer, { ..h, values: g.values + 1 }, inner);
-        {
-          decoder: { ..rb.decoder, values: g.values },
-          text: Bytes::concat_all([
-            line_break(inner),
-            b"return ",
-            local_name(g.values),
-            b" -> ",
-            rb.text,
-            b",",
-          ]),
-        }
-      });
-      {
-        decoder: ret.decoder,
-        text: Bytes::concat_all([
-          b"handle ",
-          body.text,
-          b" with {",
-          Bytes::concat_all(clauses.texts),
-          ret.text,
-          line_break(depth),
-          b"}",
-        ]),
-      }
+      print_handled(
+        printer,
+        body.decoder,
+        depth,
+        Bytes::concat_all([b"handle ", body.text, b" with {"]),
+      )
+    } else if t.value == tag_e_handle_vars() {
+      let n = read_count(e);
+      let level = n.decoder.values;
+      let inits = range(0, n.value).fold(
+        { decoder: n.decoder, texts: [] },
+        |acc: { decoder: Decoder, texts: List<Bytes> }, i: Int| {
+          let ty = read_opt({ ..acc.decoder, values: level + i }, |h: Decoder|
+            print_type(printer, h));
+          let v = print_expr(printer, ty.decoder, inner);
+          {
+            decoder: { ..v.decoder, values: level },
+            texts: acc.texts.push(Bytes::concat_all([prefixed(ty, b": "), b" = ", v.text])),
+          }
+        },
+      );
+      let body = print_expr(printer, inits.decoder, depth);
+      let vars = range(0, n.value).map(|i: Int|
+        Bytes::concat_all([
+          line_break(inner),
+          b"var ",
+          local_name(level + i),
+          inits.texts.get(i),
+          b",",
+        ]));
+      let h = print_handled(
+        printer,
+        { ..body.decoder, values: level + n.value },
+        depth,
+        Bytes::concat_all([b"handle ", body.text, b" with {", Bytes::concat_all(vars)]),
+      );
+      { ..h, decoder: { ..h.decoder, values: level } }
     } else if t.value == tag_e_with_cell() {
       let r = read_text(e);
       let init: Decoded = print_expr(printer, r.decoder, depth);
@@ -6013,6 +6022,73 @@ fn print_expr(outer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.ra
     }
   }
 
+/// A `handle`'s clauses and `return` after its body, `head` the text through its `with {`.
+fn print_handled(
+  printer: BodyPrinter,
+  d: Decoder,
+  depth: Int,
+  head: Bytes,
+) -> Decoded / {abort.raise} = {
+  let inner = depth + 1;
+  let n = read_count(d);
+  let clauses = read_many(n.decoder, n.value, |g: Decoder| {
+    let eff = read_effect(printer, expect(g, tag_clause(), b"a handler clause"));
+    let op = read_text(eff.decoder);
+    let r = read_opt(op.decoder, read_label);
+    let k: DecodedInt = read_binders(r.decoder);
+    let bound = g.values + k.value;
+    let resumed: DecodedOption = read_opt({ ..k.decoder, values: bound }, |h: Decoder|
+      { decoder: h, text: b" resume ".concat(local_name(bound)) });
+    let cb: Decoded = print_expr(
+      printer,
+      { ..resumed.decoder, values: if resumed.some { bound + 1 } else { bound } },
+      inner,
+    );
+    {
+      decoder: { ..cb.decoder, values: g.values },
+      text: Bytes::concat_all([
+        line_break(inner),
+        eff.text,
+        b".",
+        op.text,
+        bracketed(r),
+        b"(",
+        joined(range(0, k.value).map(|i: Int| local_name(g.values + i)), b", "),
+        b")",
+        resumed.text,
+        b" -> ",
+        cb.text,
+        b",",
+      ]),
+    }
+  });
+  let ret = read_opt(clauses.decoder, |g: Decoder| {
+    let h: Decoder = expect(g, tag_return_clause(), b"a return clause");
+    let rb: Decoded = print_expr(printer, { ..h, values: g.values + 1 }, inner);
+    {
+      decoder: { ..rb.decoder, values: g.values },
+      text: Bytes::concat_all([
+        line_break(inner),
+        b"return ",
+        local_name(g.values),
+        b" -> ",
+        rb.text,
+        b",",
+      ]),
+    }
+  });
+  {
+    decoder: ret.decoder,
+    text: Bytes::concat_all([
+      head,
+      Bytes::concat_all(clauses.texts),
+      ret.text,
+      line_break(depth),
+      b"}",
+    ]),
+  }
+}
+
 fn print_stmt(printer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.raise} = {
   let t = read_u8(d);
   if t.value == tag_s_let() {
@@ -6045,6 +6121,10 @@ fn print_stmt(printer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.
   } else if t.value == tag_s_expr() {
     let g = print_expr(printer, t.decoder, depth);
     { decoder: g.decoder, text: g.text.concat(b";") }
+  } else if t.value == tag_s_assign() {
+    let target = read_value(printer, t.decoder);
+    let v = print_expr(printer, target.decoder, depth);
+    { decoder: v.decoder, text: Bytes::concat_all([target.text, b" = ", v.text, b";"]) }
   } else { panic("a tag that does not begin a statement") }
 }
 
@@ -7502,7 +7582,7 @@ test "every form a pattern is written in is stored, and prints back to what it w
     assert(printed_back(matching(sample)).same, Some(String::of_bytes_lossy(sample.pattern))))
 }
 
-type StmtForms = { bound: Bool, bound_or_left: Bool, run: Bool }
+type StmtForms = { bound: Bool, bound_or_left: Bool, run: Bool, assigned: Bool }
 
 /// `seen` with the form `s` is written in. A form added to `Stmt` is added here and to the block
 /// the test below stores and prints back.
@@ -7511,24 +7591,32 @@ fn stmt_forms(s: Stmt, seen: StmtForms) -> StmtForms =
     SLet(_) -> { ..seen, bound: true },
     SLetElse(_) -> { ..seen, bound_or_left: true },
     SExpr(_) -> { ..seen, run: true },
+    SAssign(_) -> { ..seen, assigned: true },
+  }
+
+/// The statements of a body's block, and of its handler clauses' blocks, where an assignment is.
+fn body_stmts(body: Expr) -> List<Stmt> =
+  match body {
+    EBlock(b) -> b.stmts,
+    EHandle(h) ->
+      h.clauses.fold([], |acc: List<Stmt>, c: HandleClause|
+        match c.body { EBlock(b) -> acc.concat(b.stmts), _ -> acc }),
+    _ -> [],
   }
 
 test "every form a statement is written in is stored, and prints back to what it was stored under" {
   let src = trees().concat(
-    b"pub fn f(t: Tree, xs: List<Int>, c: Bool) -> Int / {abort.raise} = {\n  let Node(_, n) | Other(n, _) = t else { 0 - 1 };\n  let [h, ..] = xs else { if c { n } else { 0 } };\n  let () = (if c { assert(h > 0) }) else { 2 };\n  let (a, b): (Int, Int) = (n, h);\n  assert(a <= b);\n  a + b\n}",
+    b"pub fn f(t: Tree, xs: List<Int>, c: Bool) -> Int / {abort.raise} = {\n  let Node(_, n) | Other(n, _) = t else { 0 - 1 };\n  let [h, ..] = xs else { if c { n } else { 0 } };\n  let () = (if c { assert(h > 0) }) else { 2 };\n  let (a, b): (Int, Int) = (n, h);\n  assert(a <= b);\n  a + b\n}\npub effect tally { write add(n: Int) -> Unit }\npub fn g(xs: List<Int>) -> Int = handle { xs.fold((), |u: Unit, x: Int| tally.add(x)) } with {\n  var sum: Int = 0,\n  tally.add(n) -> {\n    sum = sum + n;\n  },\n  return u -> sum,\n}",
   );
   let seen = parse(src).node.items.fold(
-    { bound: false, bound_or_left: false, run: false },
+    { bound: false, bound_or_left: false, run: false, assigned: false },
     |forms: StmtForms, it: Item|
       match it {
-        IFn(d) -> match d.body {
-          EBlock(b) -> b.stmts.fold(forms, |f: StmtForms, s: Stmt| stmt_forms(s, f)),
-          _ -> forms,
-        },
+        IFn(d) -> body_stmts(d.body).fold(forms, |f: StmtForms, s: Stmt| stmt_forms(s, f)),
         _ -> forms,
       },
   );
-  assert_eq(seen, { bound: true, bound_or_left: true, run: true });
+  assert_eq(seen, { bound: true, bound_or_left: true, run: true, assigned: true });
   let back = printed_back(src);
   assert(back.text.contains(b" else {"), Some(String::of_bytes_lossy(back.text)));
   assert(back.same, Some(String::of_bytes_lossy(back.text)))
@@ -7634,6 +7722,7 @@ fn expr_samples() -> List<Bytes> =
     b"[x, 1]",
     b"net.send[conn](x)",
     b"handle { net.send[conn](x) } with { net.send[conn](y) resume k -> k(y), return v -> v }",
+    b"handle { net.send[conn](x) } with { var sent = x, net.send[conn](y) -> { sent = sent + y; y }, return v -> v + sent }",
     b"with_cell[work](x) { c -> cell_get(c) }",
     b"with_hold[file](x + 1, |v: Int| net.send[conn](v)) { h -> h.get() + x }",
     b"simulate { x }",

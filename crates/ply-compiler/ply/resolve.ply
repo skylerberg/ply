@@ -13,10 +13,10 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               member_name, Opaque)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
-              ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
-              MatchArm, HandleClause, ReturnClause, RecField, expr_span, ETagged, Hole, slotted,
-              slot_args, Slot, FromDefault, Unplaced, NoSuchParameter, FilledByPosition,
-              GivenByName, freed_by, home_modules, sees_homes)
+              ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign, Param,
+              NamedArg, MatchArm, HandleClause, ReturnClause, HandlerVar, RecField, expr_span,
+              ETagged, Hole, slotted, slot_args, Slot, FromDefault, Unplaced, NoSuchParameter,
+              FilledByPosition, GivenByName, freed_by, home_modules, sees_homes)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad)
 import std.list
 import std.bin
@@ -1171,6 +1171,7 @@ fn is_default_expr(expr: Expr) -> Bool / {abort.raise} =
               SLet(l) -> is_default_expr(l.value),
               SLetElse(l) -> is_default_expr(l.value) && is_default_expr(l.fallback),
               SExpr(x) -> is_default_expr(x),
+              SAssign(_) -> false,
             }))
         && (match b.tail { None -> true, Some(t) -> is_default_expr(t) }),
     ERecord(r) -> r.fields.fold(true, |acc: Bool, f: RecField| acc && is_default_expr(f.value)),
@@ -1258,6 +1259,7 @@ fn mentions(e: Expr, params: List<Bytes>, bound: List<Bytes>, out: List<Bytes>) 
                 ),
               },
             SExpr(x) -> { ..acc, out: mentions(x, params, acc.bound, acc.out) },
+            SAssign(x) -> { ..acc, out: mentions(x.value, params, acc.bound, acc.out) },
           },
       );
       match b.tail { None -> walked.out, Some(t) -> mentions(t, params, walked.bound, walked.out) }
@@ -1271,7 +1273,20 @@ fn mentions(e: Expr, params: List<Bytes>, bound: List<Bytes>, out: List<Bytes>) 
     EList(l) -> l.items.fold(out, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc)),
     ETry(t) -> mentions(t.operand, params, bound, out),
     EPerform(p) -> p.args.fold(out, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc)),
-    EHandle(h) -> mentions(h.body, params, bound, out),
+    EHandle(h) ->
+      mentions(
+        h.body,
+        params,
+        bound,
+        h.vars.fold(
+          { out: out, bound: bound },
+          |acc: { out: List<Bytes>, bound: List<Bytes> }, v: HandlerVar|
+            {
+              out: mentions(v.init, params, acc.bound, acc.out),
+              bound: acc.bound.push(v.name.name),
+            },
+        ).out,
+      ),
     EWithCell(c) -> mentions(c.body, params, bound, out),
     EWithHold(c) ->
       mentions(
@@ -1425,6 +1440,10 @@ fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualifi
               let o: Qualified = qualify_expr(resolved, acc.q, x);
               { q: o.q, xs: acc.xs.push(SExpr(o.e)) }
             },
+            SAssign(x) -> {
+              let o: Qualified = qualify_expr(resolved, acc.q, x.value);
+              { q: o.q, xs: acc.xs.push(SAssign({ ..x, value: o.e })) }
+            },
           },
       );
       let tail: { q: Qualifier, e: Option<Expr> } = match b.tail {
@@ -1485,7 +1504,7 @@ fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualifi
     },
     EHandle(h) -> {
       let o: Qualified = qualify_expr(resolved, qualifier, h.body);
-      { q: o.q, e: EHandle({ span: h.span, body: o.e, ret: h.ret, clauses: h.clauses }) }
+      { q: o.q, e: EHandle({ ..h, body: o.e }) }
     },
     EWithCell(c) -> {
       let o: Qualified = qualify_expr(resolved, qualifier, c.body);
@@ -2310,6 +2329,10 @@ fn rows_expr(
               let o = rows_expr(acc.expander, x);
               { expander: o.expander, ss: acc.ss.push(SExpr(o.e)) }
             },
+            SAssign(x) -> {
+              let o = rows_expr(acc.expander, x.value);
+              { expander: o.expander, ss: acc.ss.push(SAssign({ ..x, value: o.e })) }
+            },
           },
       );
       let tl = rows_opt_expr(stmts.expander, b.tail);
@@ -2344,7 +2367,15 @@ fn rows_expr(
       }
     },
     EHandle(h) -> {
-      let b = rows_expr(expander, h.body);
+      let vs = h.vars.fold(
+        { expander: expander, vs: [] },
+        |acc: { expander: RowExpander, vs: List<HandlerVar> }, v: HandlerVar| {
+          let t = rows_opt_ty(acc.expander, v.ty);
+          let i = rows_expr(t.expander, v.init);
+          { expander: i.expander, vs: acc.vs.push({ ..v, ty: t.t, init: i.e }) }
+        },
+      );
+      let b = rows_expr(vs.expander, h.body);
       let cs = h.clauses.fold(
         { expander: b.expander, cs: [] },
         |acc: { expander: RowExpander, cs: List<HandleClause> }, c: HandleClause| {
@@ -2372,7 +2403,10 @@ fn rows_expr(
           { expander: o.expander, r: Some({ binder: rc.binder, body: o.e, span: rc.span }) }
         },
       };
-      { expander: r.expander, e: EHandle({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs }) }
+      {
+        expander: r.expander,
+        e: EHandle({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs, vars: vs.vs }),
+      }
     },
     EWithCell(c) -> {
       let i = rows_expr(expander, c.init);
@@ -3010,6 +3044,10 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
               let o: Filled = fill_expr(f, acc.filler, x);
               { filler: o.filler, xs: acc.xs.push(SExpr(o.expr)) }
             },
+            SAssign(x) -> {
+              let o: Filled = fill_expr(f, acc.filler, x.value);
+              { filler: o.filler, xs: acc.xs.push(SAssign({ ..x, value: o.expr })) }
+            },
           },
       );
       let tail: { filler: Filler, expr: Option<Expr> } = match b.tail {
@@ -3053,13 +3091,34 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
       }
     },
     EHandle(h) -> {
-      let body: Filled = fill_expr(f, filler, h.body);
+      // The variables' first values are made before the body, where the `handle` stands.
+      let vars: { filler: Filler, xs: List<HandlerVar> } = h.vars.fold(
+        { filler: filler, xs: [] },
+        |acc: { filler: Filler, xs: List<HandlerVar> }, v: HandlerVar| {
+          // Each initializer sees the variables above it.
+          let mark = acc.filler.scope.len();
+          let above = acc.xs.map(|x: HandlerVar| x.name.name);
+          let o: Filled = fill_expr(
+            f,
+            { ..acc.filler, scope: acc.filler.scope.concat(above) },
+            v.init,
+          );
+          {
+            filler: { ..o.filler, scope: o.filler.scope.take(mark) },
+            xs: acc.xs.push({ ..v, init: o.expr }),
+          }
+        },
+      );
+      let names = h.vars.map(|v: HandlerVar| v.name.name);
+      let body: Filled = fill_expr(f, vars.filler, h.body);
       let clauses: { filler: Filler, xs: List<HandleClause> } = h.clauses.fold(
         { filler: body.filler, xs: [] },
         |acc: { filler: Filler, xs: List<HandleClause> }, c: HandleClause| {
           let mark = acc.filler.scope.len();
-          let with_params = c.params.fold(acc.filler.scope, |sc: List<Bytes>, p: Ident|
-            sc.push(p.name));
+          let with_params = c.params.fold(
+            acc.filler.scope.concat(names),
+            |sc: List<Bytes>, p: Ident| sc.push(p.name),
+          );
           let with_label = match c.label_binder {
             None -> with_params,
             Some(t) -> with_params.push(t.name),
@@ -3091,7 +3150,7 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
           let mark = clauses.filler.scope.len();
           let o: Filled = fill_expr(
             f,
-            { ..clauses.filler, scope: clauses.filler.scope.push(rc.binder.name) },
+            { ..clauses.filler, scope: clauses.filler.scope.concat(names).push(rc.binder.name) },
             rc.body,
           );
           {
@@ -3102,7 +3161,13 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
       };
       {
         filler: ret.filler,
-        expr: EHandle({ span: h.span, body: body.expr, ret: ret.expr, clauses: clauses.xs }),
+        expr: EHandle({
+          span: h.span,
+          body: body.expr,
+          ret: ret.expr,
+          clauses: clauses.xs,
+          vars: vars.xs,
+        }),
       }
     },
     EWithCell(c) -> {

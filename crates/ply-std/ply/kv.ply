@@ -1559,17 +1559,16 @@ test "a key, a value or a batch past a store's limits is refused, and nothing is
 fn counting<a, [l] | e>(
   go: () -> a / {fs.read_at[l] | e},
 ) -> { value: a, reads: Int } / {fs.read_at[l] | e} =
-  with_cell[tally](0) { n -> {
-    let value = handle {
-      go()
-    } with {
-      fs.read_at[l](path, at, most) -> {
-        cell_set(n, cell_get(n) + 1);
-        fs.read_at[l](path, at, most)
-      },
-    };
-    { value: value, reads: cell_get(n) }
-  } }
+  handle {
+    go()
+  } with {
+    var n = 0,
+    fs.read_at[l](path, at, most) -> {
+      n = n + 1;
+      fs.read_at[l](path, at, most)
+    },
+    return value -> { value: value, reads: n },
+  }
 
 fn keys_of<| e>(found: Seq<Pair | e>) -> List<Bytes> / {abort.raise | e} =
   listed(found).map(|p: Pair| p.key)
@@ -1986,23 +1985,47 @@ test "a frame that lands past another writer's is refused as stale, and is no ba
 /// What became of a store whose lock a rival asked for.
 type Rivalry = { packed: Option<Why>, taken: Bool, idle: Option<Why> }
 
-/// `go` with `slowly` run before each ranged read of the root and `stamped` after each whole
-/// write of a file, and every other operation of the root passed on as it is.
-fn tapped<a, [l] | e>(
-  slowly: () -> Unit / {fs.read[l], fs.write[l] | e},
-  stamped: (String) -> Unit / {fs.read[l], fs.write[l] | e},
-  go: () -> a / {fs.read[l], fs.write[l] | e},
+/// The rival `rivalling` runs.
+effect rival {
+  /// Whether the rival has taken the lock.
+  read taken() -> Bool
+  /// Lets `ms` pass, after which the rival asks for the lock.
+  write idle(ms: Int) -> Unit
+}
+
+/// `go` on a clock that each ranged read of the root advances by `read_ms`, with a rival that
+/// asks for the lock after each such read and each `rival.idle`. A whole write of the lock file is
+/// stamped with the clock, and every other operation of the root is passed on as it is.
+fn rivalling<a, [l] | e>(
+  read_ms: Int,
+  go: () -> a / {fs.read[l], fs.write[l], rival.taken, rival.idle | e},
 ) -> a / {fs.read[l], fs.write[l] | e} =
   handle {
     go()
   } with {
+    var now = 0,
+    var taken = false,
+    rival.taken() -> taken,
+    rival.idle(ms) -> {
+      now = now + ms;
+      let had = taken;
+      taken = asked[l](now, taken);
+      if taken && !had {
+        fs.set_modified[l]("db/lock", now);
+        ()
+      } else { () }
+    },
     fs.read_at[l](p, offset, most) -> {
-      slowly();
+      now = now + read_ms;
+      taken = asked[l](now, taken);
       fs.read_at[l](p, offset, most)
     },
     fs.write_file[l](p, body) -> {
       let wrote = fs.write_file[l](p, body);
-      stamped(p);
+      if p == "db/lock" {
+        fs.set_modified[l](p, now);
+        ()
+      } else { () };
       wrote
     },
     fs.read_file[l](p) -> fs.read_file[l](p),
@@ -2039,55 +2062,42 @@ fn tapped<a, [l] | e>(
     fs.link[l](p, to) -> fs.link[l](p, to),
   }
 
+/// Whether the rival holds the lock once it asks at `now`, `taken` saying whether it held it
+/// already: a lock file thirty seconds old is the rival's to take.
+fn asked<[l]>(now: Int, taken: Bool) -> Bool / {fs.read[l], fs.write[l]} =
+  match fs.modified_ms[l]("db/lock") {
+    Some(stamp) -> if now - stamp >= 30000 && !taken {
+      fs.remove[l]("db/lock");
+      fs.write_file[l]("db/lock", b"a rival's token, and its place");
+      true
+    } else { taken },
+    None -> taken,
+  }
+
 /// A store of two hundred values that compacts, sits idle for thirty-one seconds and commits
 /// once more, on a disk where each ranged read takes `read_ms` and a rival asks for the lock
 /// after every one as `fs.lock` gives it: a lock file thirty seconds old is the rival's.
 fn rivalled(read_ms: Int) -> Over<Rivalry> / {abort.raise} =
   on_mem[d](mem_empty(), ||
     with_rand(rand(1), ||
-      with_cell[age]({ now: 0, taken: false }) { c -> {
-        let asked = || {
-          let at = cell_get(c);
-          match fs.modified_ms[d]("db/lock") {
-            Some(stamp) -> if at.now - stamp >= 30000 && !at.taken {
-              fs.remove[d]("db/lock");
-              fs.write_file[d]("db/lock", b"a rival's token, and its place");
-              cell_set(c, { ..at, taken: true })
-            } else { () },
-            None -> (),
-          }
+      rivalling[d](read_ms, || {
+        let filled: Result<Store, Why> = try[kv.refused] {
+          range(0, 200).fold(open[d]("db", roomy(), Manual, raw(), 1), |s: Store, i: Int|
+            put[d](s, Bytes::of_string(i.to_string()), b"value", Fast))
         };
-        tapped[d](
-          || {
-            cell_set(c, { ..cell_get(c), now: cell_get(c).now + read_ms });
-            asked()
-          },
-          |path: String|
-            if path == "db/lock" {
-              fs.set_modified[d](path, cell_get(c).now);
-              ()
-            } else { () },
-          || {
-            let filled: Result<Store, Why> = try[kv.refused] {
-              range(0, 200).fold(open[d]("db", roomy(), Manual, raw(), 1), |s: Store, i: Int|
-                put[d](s, Bytes::of_string(i.to_string()), b"value", Fast))
+        match filled {
+          Err(refusal) -> { packed: Some(refusal), taken: false, idle: None },
+          Ok(full) -> {
+            let packed: Result<Store, Why> = try[kv.refused] { compact[d](full) };
+            let taken = rival.taken();
+            rival.idle(31000);
+            let idle: Result<Store, Why> = try[kv.refused] {
+              put[d](match packed { Ok(s) -> s, Err(_) -> full }, b"late", b"l", Fast)
             };
-            match filled {
-              Err(refusal) -> { packed: Some(refusal), taken: false, idle: None },
-              Ok(full) -> {
-                let packed: Result<Store, Why> = try[kv.refused] { compact[d](full) };
-                let taken = cell_get(c).taken;
-                cell_set(c, { ..cell_get(c), now: cell_get(c).now + 31000 });
-                asked();
-                let idle: Result<Store, Why> = try[kv.refused] {
-                  put[d](match packed { Ok(s) -> s, Err(_) -> full }, b"late", b"l", Fast)
-                };
-                { packed: why(packed), taken: taken, idle: why(idle) }
-              },
-            }
+            { packed: why(packed), taken: taken, idle: why(idle) }
           },
-        )
-      } }).value)
+        }
+      })).value)
 
 test "a lock renewed as a compaction copies is never old enough to take, and a store that sat idle past the age has lost it and writes nothing" {
   let kept = rivalled(400);
@@ -2175,27 +2185,49 @@ fn one_more(had: Option<Bytes>) -> Bytes / {abort.raise} =
     ),
   )
 
+/// The store a test's tasks share.
+effect newest {
+  read store() -> Store
+  write keep(s: Store) -> Unit
+}
+
+/// `body` with its tasks sharing the store `s` through `newest`, and that store once it is done.
+fn sharing<a | e>(
+  s: Store,
+  body: () -> a / {newest.store, newest.keep | e},
+) -> { value: a, store: Store } / e =
+  handle {
+    body()
+  } with {
+    var held = s,
+    newest.store() -> held,
+    newest.keep(next) -> {
+      held = next;
+    },
+    return value -> { value: value, store: held },
+  }
+
 test "two tasks that add to one count by compare-and-set lose no addition, wherever their reads and commits fall" {
   let over = on_mem[d](mem_empty(), ||
     with_rand(rand(1), || {
       let ran: Result<{ ended: List<Option<Why>>, held: Shown }, Why> = try[kv.refused] {
-        with_cell[newest](open[d]("db", roomy(), Manual, raw(), 1)) { c -> {
-          let ended = simulate {
+        let shared = sharing(open[d]("db", roomy(), Manual, raw(), 1), ||
+          simulate {
             let adding = || {
               let tried: Result<Int, Why> = try[kv.refused] {
                 [1, 2].fold(0, |_: Int, _: Int|
                   iterate(1, 8, |attempt: Int| {
-                    let seen = cell_get(c);
+                    let seen = newest.store();
                     let next = one_more(get[d](seen, b"count"));
                     task.yield();
                     let swapped = compare_and_set[d](
-                      cell_get(c),
+                      newest.store(),
                       b"count",
                       version(seen, b"count"),
                       Some(next),
                       Fast,
                     );
-                    cell_set(c, swapped.store);
+                    newest.keep(swapped.store);
                     if swapped.done { Stop(attempt) } else { Continue(attempt + 1) }
                   }))
               };
@@ -2204,10 +2236,9 @@ test "two tasks that add to one count by compare-and-set lose no addition, where
             let first = task.spawn(adding);
             let second = task.spawn(adding);
             [task.join(first), task.join(second)]
-          };
-          close[d](cell_get(c));
-          { ended: ended, held: shown[d](cell_get(c)) }
-        } }
+          });
+        close[d](shared.store);
+        { ended: shared.value, held: shown[d](shared.store) }
       };
       ran
     }).value);
@@ -2224,12 +2255,12 @@ test "a reader sees all of a batch or none of it, wherever its reads fall among 
   let over = on_mem[d](mem_empty(), ||
     with_rand(rand(1), || {
       let ran: Result<{ wrote: Option<Why>, read: Result<Bool, Why> }, Why> = try[kv.refused] {
-        with_cell[newest](open[d]("db", roomy(), Manual, raw(), 1)) { c -> {
-          let seen = simulate {
+        let shared = sharing(open[d]("db", roomy(), Manual, raw(), 1), ||
+          simulate {
             let writer = task.spawn(|| {
               let wrote: Result<Unit, Why> = try[kv.refused] {
                 [b"1", b"2", b"3"].fold((), |_: Unit, value: Bytes| {
-                  cell_set(c, batch[d](cell_get(c), [Put(b"x", value), Put(b"y", value)], Fast));
+                  newest.keep(batch[d](newest.store(), [Put(b"x", value), Put(b"y", value)], Fast));
                   task.yield()
                 })
               };
@@ -2237,7 +2268,7 @@ test "a reader sees all of a batch or none of it, wherever its reads fall among 
             });
             let reader = task.spawn(|| {
               let read: Result<Bool, Why> = try[kv.refused] {
-                let snap = snapshot(cell_get(c));
+                let snap = snapshot(newest.store());
                 task.yield();
                 let x = read[d](snap, b"x");
                 task.yield();
@@ -2246,10 +2277,9 @@ test "a reader sees all of a batch or none of it, wherever its reads fall among 
               read
             });
             { wrote: task.join(writer), read: task.join(reader) }
-          };
-          close[d](cell_get(c));
-          seen
-        } }
+          });
+        close[d](shared.store);
+        shared.value
       };
       ran
     }).value);

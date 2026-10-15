@@ -16,8 +16,9 @@ import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, At
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, RaiseName, RecField, NamedArg, Param, Stmt,
-              SLet, SLetElse, SExpr, MatchArm, HandleClause, ReturnClause, expr_span, is_block_like,
-              ETagged, Tagged, Hole, written_operator, call_operator, set_binder)
+              SLet, SLetElse, SExpr, SAssign, MatchArm, HandleClause, ReturnClause, HandlerVar,
+              expr_span, is_block_like, ETagged, Tagged, Hole, written_operator, call_operator,
+              set_binder)
 import rewrite (map_expr, map_item)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad, pat_span)
@@ -1080,13 +1081,14 @@ fn flat_node(input: PrintInput, e: Expr) -> Option<Bytes> / {abort.raise} =
         sep(v.args.map(|x: Expr| flat_expr(input, x)), b", "),
         Some(b")"),
       ]),
-    EHandle(v) ->
+    EHandle(v) -> if v.vars.len() > 0 { None } else {
       cat([
         Some(b"handle "),
         flat_expr(input, v.body),
         Some(b" with "),
         flat_clauses(input, v.clauses, v.ret),
-      ]),
+      ])
+    },
     EWithCell(v) ->
       cat([
         Some(Bytes::concat_all([b"with_cell[", v.resource.name, b"]("])),
@@ -1307,7 +1309,7 @@ fn broken_node(
         indent,
         after,
       ),
-    EHandle(v) -> handle_expr(input, printer, v.body, v.clauses, v.ret, v.span, indent),
+    EHandle(v) -> handle_expr(input, printer, v, indent),
     EWithCell(v) -> cell_expr(input, printer, v.resource, v.init, v.binder, v.body, v.span, indent),
     EWithHold(v) -> {
       let head = emit(printer, Bytes::concat_all([b"with_hold[", v.resource.name, b"]"]));
@@ -1395,6 +1397,12 @@ fn stmt(input: PrintInput, printer: Printer, x: Stmt, indent: Int) -> Printer / 
       let s1 = open_line(input, printer, sp.start, indent, true);
       let s2 = emit(expr(input, s1, e, indent, 1), b";");
       trail(input, set_prev(s2, sp.end), sp.end)
+    },
+    SAssign(v) -> {
+      let s1 = open_line(input, printer, v.span.start, indent, true);
+      let s2 = emit(s1, v.name.name.concat(b" = "));
+      let s3 = emit(expr(input, s2, v.value, indent, 1), b";");
+      trail(input, set_prev(s3, v.span.end), v.span.end)
     },
   }
 
@@ -1820,18 +1828,29 @@ fn arm_body(
 fn handle_expr(
   input: PrintInput,
   printer: Printer,
-  body: Expr,
-  clauses: List<HandleClause>,
-  ret: Option<ReturnClause>,
-  span: Span,
+  h: { span: Span, body: Expr, ret: Option<ReturnClause>, clauses: List<HandleClause>, vars: List<HandlerVar> },
   indent: Int,
 ) -> Printer / {abort.raise} = {
+  let clauses = h.clauses;
+  let ret = h.ret;
   let s1 = emit(printer, b"handle ");
-  let s2 = match body {
+  let s2 = match h.body {
     EBlock(v) -> block_of(input, s1, v, indent),
-    _ -> expr(input, s1, body, indent + 2, 7),
+    _ -> expr(input, s1, h.body, indent + 2, 7),
   };
-  let s3 = emit(s2, b" with {");
+  let s3v = emit(s2, b" with {");
+  let s3 = range(0, h.vars.len()).fold(s3v, |s: Printer, i: Int| {
+    let v = h.vars.get(i);
+    let ty = match v.ty { Some(t) -> b": ".concat(type_text(input, t)), None -> b"" };
+    let o = emit(
+      open_line(input, s, v.span.start, indent + 2, false),
+      Bytes::concat_all([b"var ", v.name.name, ty, b" = "]),
+    );
+    let last = i == h.vars.len() - 1 && clauses.len() == 0
+      && (match ret { Some(_) -> false, None -> true });
+    let bd = separated(input, expr(input, o, v.init, indent + 2, 1), v.init, last);
+    trail(input, set_prev(bd, v.span.end), v.span.end)
+  });
   let s4 = range(0, clauses.len()).fold(s3, |s: Printer, i: Int| {
     let c = clauses.get(i);
     let o = emit(
@@ -1853,7 +1872,7 @@ fn handle_expr(
     },
     None -> s4,
   };
-  close(input, s5, span.end, indent, b"}")
+  close(input, s5, h.span.end, indent, b"}")
 }
 
 fn cell_expr(
@@ -3208,6 +3227,7 @@ test "every expression kind prints back to the same tree" {
     b"  let w = |x, y: Int| -> Int { x + y };\n",
     b"  let z = (r.a)(1)? + m::g(1, k: 2);\n",
     b"  let c = handle { db.get[users](1) } with { db.get[users](k) resume q -> q(Some(k)), return x -> x };\n",
+    b"  let g = handle { db.get[users](1) } with { var n = 0, var seen: List<Int> = [], db.get[users](k) -> { if k > n { n = k } else { seen = seen.push(k) }; n }, return x -> x + n };\n",
     b"  let d = with_cell[work](0) { cell -> { cell_set(cell, 1); cell_get(cell) } };\n",
     b"  let o = with_hold[file](opened(a), |x: Int| closed(x)) { h -> { used(h); h.get() } };\n",
     b"  simulate { a };\n",

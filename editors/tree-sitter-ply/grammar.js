@@ -501,7 +501,15 @@ module.exports = grammar({
     block: $ => prec.dynamic(2, prec(2, seq('{', repeat($._statement), '}'))),
     _statement: $ => choice(
       $.let_statement,
+      $.assignment_statement,
       $.expression_statement,
+    ),
+    // `x = v` gives a handler's variable a new value; its `;` may be left off before the `}`.
+    assignment_statement: $ => seq(
+      field('name', $.identifier),
+      '=',
+      field('value', $._expression),
+      optional(';'),
     ),
     let_statement: $ => seq(
       'let',
@@ -547,8 +555,15 @@ module.exports = grammar({
       field('body', $._expression),
       'with',
       '{',
-      commaSep1($.handler_clause),
+      commaSep1(choice($.handler_variable, $.handler_clause)),
       '}',
+    ),
+    handler_variable: $ => seq(
+      'var',
+      field('name', $.identifier),
+      optional(seq(':', field('type', $._type))),
+      '=',
+      field('value', $._expression),
     ),
     handler_clause: $ => choice($.return_clause, $.operation_clause),
     return_clause: $ => seq('return', field('binder', $.identifier), '->', field('body', $._expression)),

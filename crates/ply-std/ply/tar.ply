@@ -2862,23 +2862,21 @@ test "an archive that is cut short, or whose headers do not fit the window, extr
 fn measured<a>(
   go: () -> a / {fs.read[d], fs.write[d], io.refused, io.closed, tar.refused, tar.unsafe, abort.raise},
 ) -> { value: a, asked: Int, wrote: Int } / {fs.read[d], fs.write[d], io.refused, io.closed, tar.refused, tar.unsafe, abort.raise} =
-  with_cell[sizes]({ asked: 0, wrote: 0 }) { sizes -> {
-    let value = handle {
-      go()
-    } with {
-      fs.read_chunk[d](file, most) -> {
-        let so_far = cell_get(sizes);
-        cell_set(sizes, { ..so_far, asked: max(so_far.asked, most) });
-        fs.read_chunk[d](file, most)
-      },
-      fs.write_chunk[d](file, body) -> {
-        let so_far = cell_get(sizes);
-        cell_set(sizes, { ..so_far, wrote: max(so_far.wrote, body.len()) });
-        fs.write_chunk[d](file, body)
-      },
-    };
-    { value: value, asked: cell_get(sizes).asked, wrote: cell_get(sizes).wrote }
-  } }
+  handle {
+    go()
+  } with {
+    var asked = 0,
+    var wrote = 0,
+    fs.read_chunk[d](file, most) -> {
+      asked = max(asked, most);
+      fs.read_chunk[d](file, most)
+    },
+    fs.write_chunk[d](file, body) -> {
+      wrote = max(wrote, body.len());
+      fs.write_chunk[d](file, body)
+    },
+    return value -> { value: value, asked: asked, wrote: wrote },
+  }
 
 test "a file larger than the window is unpacked in pieces no longer than the window" {
   let body = b"0123456789".repeat(2000);
@@ -2893,26 +2891,34 @@ test "a file larger than the window is unpacked in pieces no longer than the win
   assert(body.len() > 4 * 4096)
 }
 
+/// How many bytes a test's sink was pushed at once.
+effect pushed {
+  write push(bytes: Int) -> Unit
+}
+
 test "a file larger than a chunk is packed in pushes no longer than a header's blocks" {
   let body = b"0123456789".repeat(2000);
   let tree = fs::mem_of([{ path: "src/large", body: body }]);
   let over = fs::on_mem[d](tree, ||
-    with_cell[pushes]({ longest: 0, total: 0 }) { pushes -> {
-      let sink: Sink<| {cell.read[pushes], cell.write[pushes]}> = {
+    handle {
+      let sink: Sink<| {pushed.push}> = {
         push: |bytes: Bytes| {
-          let so_far = cell_get(pushes);
-          cell_set(pushes, {
-            longest: max(so_far.longest, bytes.len()),
-            total: so_far.total + bytes.len(),
-          });
+          pushed.push(bytes.len());
           true
         },
         close: || (),
       };
       let how: Packing = { times: false, modes: false, entries: 1, bytes: 20000, chunk: 700 };
-      let packed = with_hold[out](sink, io::shut_sink) { out -> pack[d]("src", [""], out, how) };
-      { packed: packed, longest: cell_get(pushes).longest, total: cell_get(pushes).total }
-    } });
+      with_hold[out](sink, io::shut_sink) { out -> pack[d]("src", [""], out, how) }
+    } with {
+      var longest = 0,
+      var total = 0,
+      pushed.push(n) -> {
+        longest = max(longest, n);
+        total = total + n;
+      },
+      return packed -> { packed: packed, longest: longest, total: total },
+    });
   assert_eq(over.value.total, over.value.packed.bytes);
   assert_eq(over.value.packed.bytes, 512 + 20480 + 1024);
   assert_eq(over.value.longest, 1024)

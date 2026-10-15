@@ -430,24 +430,24 @@ fn merged<a>(
 // --- Tests: what the language's channels do ---------------------------------
 
 test "a sender to a full channel waits until a receive makes room" {
-  with_cell[seen]([]) { c -> {
-    simulate {
-      let ch = task.channel(1);
-      let sender = task.spawn(|| {
-        task.send(ch, 1);
-        cell_set(c, cell_get(c).push("sent 1"));
-        task.send(ch, 2);
-        cell_set(c, cell_get(c).push("sent 2"))
-      });
-      clock.sleep(Duration(1));
-      assert_eq(cell_get(c), ["sent 1"]);
-      assert_eq(try_send(ch, 9), Full);
-      assert_eq(task.recv(ch), Some(1));
-      task.join(sender);
-      assert_eq(cell_get(c), ["sent 1", "sent 2"]);
-      assert_eq(task.recv(ch), Some(2))
-    }
-  } }
+  simulate {
+    let ch = task.channel(1);
+    let notes = task.channel(2);
+    let sender = task.spawn(|| {
+      task.send(ch, 1);
+      task.send(notes, "sent 1");
+      task.send(ch, 2);
+      task.send(notes, "sent 2")
+    });
+    clock.sleep(Duration(1));
+    assert_eq(try_recv(notes), Got("sent 1"));
+    assert_eq(try_recv(notes), Empty);
+    assert_eq(try_send(ch, 9), Full);
+    assert_eq(task.recv(ch), Some(1));
+    task.join(sender);
+    assert_eq(try_recv(notes), Got("sent 2"));
+    assert_eq(task.recv(ch), Some(2))
+  }
 }
 
 test "a closed channel refuses a send, gives up what was queued in order, and then answers the end" {
@@ -463,6 +463,29 @@ test "a closed channel refuses a send, gives up what was queued in order, and th
     assert_eq(try_recv(ch), Ended)
   }
 }
+
+/// A level a test's tasks raise and lower.
+effect level {
+  write up() -> Unit
+  write down() -> Unit
+}
+
+/// `body`, and the highest the level it raises and lowers reached.
+fn peak<a | e>(body: () -> a / {level.up, level.down | e}) -> { value: a, most: Int } / e =
+  handle {
+    body()
+  } with {
+    var now = 0,
+    var most = 0,
+    level.up() -> {
+      now = now + 1;
+      most = max(most, now);
+    },
+    level.down() -> {
+      now = now - 1;
+    },
+    return value -> { value: value, most: most },
+  }
 
 /// A count small enough that a law runs every interleaving at each one.
 type Few = | Zero | One | Two
@@ -493,31 +516,25 @@ law "every value sent is received once, each sender's in the order it sent them,
 law "a channel never holds more values than its capacity, in every interleaving"
   forall (room: Few, values: Few) {
     simulate {
-      with_cell[held]({ sent: 0, asked: 0, most: 0 }) { h -> {
-        let ch = task.channel(count(room));
-        let n = count(values);
-        task::scoped(
-          [
-            ||
-              range(0, n).fold((), |_u: Unit, i: Int| {
-                task.send(ch, i);
-                let now = cell_get(h);
-                cell_set(h, {
-                  ..now,
-                  sent: now.sent + 1,
-                  most: max(now.most, now.sent + 1 - now.asked),
-                })
+      let ch = task.channel(count(room));
+      let n = count(values);
+      peak(||
+          task::scoped(
+            [
+              ||
+                range(0, n).fold((), |_u: Unit, i: Int| {
+                  task.send(ch, i);
+                  level.up()
+                }),
+            ],
+            |_sender: List<Task<Unit>>|
+              range(0, n).fold((), |_u: Unit, _i: Int| {
+                level.down();
+                task.recv(ch);
+                ()
               }),
-          ],
-          |_sender: List<Task<Unit>>|
-            range(0, n).fold((), |_u: Unit, _i: Int| {
-              cell_set(h, { ..cell_get(h), asked: cell_get(h).asked + 1 });
-              task.recv(ch);
-              ()
-            }),
-        );
-        cell_get(h).most <= count(room)
-      } }
+          )).most
+        <= count(room)
     }
   }
 
@@ -736,24 +753,22 @@ fn loads() -> List<Load> =
 test "fan_out runs its function on no more of {count(c.values)} values at once than its {count(c.workers)} workers, and carries every answer" for c: Load in loads(
   ).filter(|l: Load| l.values != Two || l.workers != Two) {
   simulate {
-    with_cell[gauge]({ inside: 0, most: 0 }) { g -> {
-      let n = count(c.values);
-      let got = fan_out(
+    let n = count(c.values);
+    let got = peak(||
+      fan_out(
         filled(range(0, n)),
         count(c.workers),
         n,
         |x: Int| {
-          let now = cell_get(g);
-          cell_set(g, { inside: now.inside + 1, most: max(now.most, now.inside + 1) });
+          level.up();
           task.yield();
-          cell_set(g, { ..cell_get(g), inside: cell_get(g).inside - 1 });
+          level.down();
           x * 2
         },
         |out: Chan<Int>| drain(out, 10),
-      );
-      assert_eq(got.sort(), range(0, n).map(|x: Int| x * 2));
-      assert(cell_get(g).most <= count(c.workers))
-    } }
+      ));
+    assert_eq(got.value.sort(), range(0, n).map(|x: Int| x * 2));
+    assert(got.most <= count(c.workers))
   }
 }
 
