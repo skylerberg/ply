@@ -1,9 +1,9 @@
 //! `model` — enough of a scheduler to exercise the search, and none of the runtime: tasks that load
-//! and store cells, perform atoms, spawn, join and yield, scheduled as the runtime schedules a
-//! region, from the same stream. Its counts are the Rust search's on the same programs.
+//! and store a handler's variables, perform atoms, spawn, join and yield, scheduled as the runtime
+//! schedules a region, from the same stream. Its counts are the Rust search's on the same programs.
 
 import plan (Seed, Plan, Dpor, Once, Random, default_plan, once, root_seed, u64_le)
-import recording (Step, Interleaving, Passed, Failed, Access, AAtom, ACell)
+import recording (Step, Interleaving, Passed, Failed, Access, AAtom, AVar)
 import search (Exploration, Explored, Exact, All, Cost, explore, explore_under, measure_reduction,
                backtracks, passed, Unscheduled, Diverged)
 import std.list
@@ -28,12 +28,12 @@ type Actor = {
   clock: List<Int>,
 }
 
-type Model = { main: List<Op>, expect: List<{ cell: Int, value: Int }> }
+type Model = { main: List<Op>, expect: List<{ variable: Int, value: Int }> }
 
 fn program(main: List<Op>) -> Model = { main: main, expect: [] }
 
-fn expecting(model: Model, cells: List<{ cell: Int, value: Int }>) -> Model =
-  { ..model, expect: cells }
+fn expecting(model: Model, expected: List<{ variable: Int, value: Int }>) -> Model =
+  { ..model, expect: expected }
 
 fn step_cap() -> Int = 4096
 
@@ -112,7 +112,7 @@ fn below(root: U64, counter: Int, n: Int) -> { value: Int, counter: Int } / {abo
 
 type Running = {
   tasks: List<Actor>,
-  cells: Map<Int, Int>,
+  vars: Map<Int, Int>,
   counter: Int,
   steps: List<Step>,
   capped: Bool,
@@ -128,7 +128,7 @@ fn run(model: Model, seed: Seed) -> Interleaving<String> / {abort.raise} = {
     blocked: None,
     clock: [0],
   };
-  let start = { tasks: [main], cells: Map::new(), counter: 0, steps: [], capped: false };
+  let start = { tasks: [main], vars: Map::new(), counter: 0, steps: [], capped: false };
   let end = iterate(start, step_cap() + 2, |st: Running| {
     let enabled = enabled_of(st.tasks);
     if enabled.len() == 0 { Stop(st) }
@@ -140,16 +140,16 @@ fn run(model: Model, seed: Seed) -> Interleaving<String> / {abort.raise} = {
   } else if range(0, end.tasks.len()).fold(false, |b: Bool, t: Int| b || !finished(end.tasks, t)) {
     { steps: end.steps, verdict: Failed("no task can make progress"), virtual_time: 0 }
   } else {
-    let wrong = model.expect.filter(|e: { cell: Int, value: Int }|
-      cell_of(end.cells, e.cell) != e.value);
+    let wrong = model.expect.filter(|e: { variable: Int, value: Int }|
+      variable_of(end.vars, e.variable) != e.value);
     match wrong {
       [first, ..] ->
         {
           steps: end.steps,
           verdict: Failed(
-            "expected " ++ first.value.to_string() ++ " in cell #" ++ first.cell.to_string()
+            "expected " ++ first.value.to_string() ++ " in variable #" ++ first.variable.to_string()
               ++ ", found "
-              ++ cell_of(end.cells, first.cell).to_string(),
+              ++ variable_of(end.vars, first.variable).to_string(),
           ),
           virtual_time: 0,
         },
@@ -158,7 +158,7 @@ fn run(model: Model, seed: Seed) -> Interleaving<String> / {abort.raise} = {
   }
 }
 
-fn cell_of(cells: Map<Int, Int>, c: Int) -> Int = match cells.get(c) { Some(v) -> v, None -> 0 }
+fn variable_of(vars: Map<Int, Int>, v: Int) -> Int = match vars.get(v) { Some(x) -> x, None -> 0 }
 
 fn stepped(st: Running, seed: Seed, enabled: List<Int>) -> Running / {abort.raise} = {
   let point = st.steps.len();
@@ -172,22 +172,22 @@ fn stepped(st: Running, seed: Seed, enabled: List<Int>) -> Running / {abort.rais
   let op = task.ops.get(task.pc);
   let moved = ticked(st.tasks.set(t, { ..task, pc: task.pc + 1 }), t);
   let did = match op {
-    Load(c) ->
+    Load(v) ->
       {
-        tasks: moved.set(t, { ..moved.get(t), register: cell_of(st.cells, c) }),
-        cells: st.cells,
-        accesses: [ACell({ index: c, generation: 0, write: false })],
+        tasks: moved.set(t, { ..moved.get(t), register: variable_of(st.vars, v) }),
+        vars: st.vars,
+        accesses: [AVar({ handler: 0, index: v, write: false })],
       },
-    Store(c) ->
+    Store(v) ->
       {
         tasks: moved,
-        cells: st.cells.insert(c, moved.get(t).register + 1),
-        accesses: [ACell({ index: c, generation: 0, write: true })],
+        vars: st.vars.insert(v, moved.get(t).register + 1),
+        accesses: [AVar({ handler: 0, index: v, write: true })],
       },
     Perform(resource, write) ->
       {
         tasks: moved,
-        cells: st.cells,
+        vars: st.vars,
         accesses: [AAtom({ effect: "db", resource: Some(resource), write: write, op: None })],
       },
     Spawn(name, ops) -> {
@@ -204,23 +204,23 @@ fn stepped(st: Running, seed: Seed, enabled: List<Int>) -> Running / {abort.rais
       };
       {
         tasks: moved.set(t, { ..parent, children: parent.children.push(child) }).push(born),
-        cells: st.cells,
+        vars: st.vars,
         accesses: [],
       }
     },
     Join(nth) -> {
       let child = moved.get(t).children.get(nth);
       if finished(moved, child) {
-        { tasks: absorbed(moved, t, child), cells: st.cells, accesses: [] }
+        { tasks: absorbed(moved, t, child), vars: st.vars, accesses: [] }
       } else {
         {
           tasks: moved.set(t, { ..moved.get(t), blocked: Some(child) }),
-          cells: st.cells,
+          vars: st.vars,
           accesses: [],
         }
       }
     },
-    Yield -> { tasks: moved, cells: st.cells, accesses: [] },
+    Yield -> { tasks: moved, vars: st.vars, accesses: [] },
   };
   // A task blocked on a join observes everything its target did once the target finishes.
   let woken = range(0, did.tasks.len()).fold(did.tasks, |ts: List<Actor>, i: Int|
@@ -230,7 +230,7 @@ fn stepped(st: Running, seed: Seed, enabled: List<Int>) -> Running / {abort.rais
     });
   {
     tasks: woken,
-    cells: did.cells,
+    vars: did.vars,
     counter: drawn.counter,
     steps: st.steps.push({
       region: 0,
@@ -274,7 +274,7 @@ fn lost_update() -> Model =
 
 test "tasks that never conflict explore exactly one interleaving" {
   let e = explored(
-    expecting(independent(), [{ cell: 1, value: 1 }, { cell: 2, value: 1 }]),
+    expecting(independent(), [{ variable: 1, value: 1 }, { variable: 2, value: 1 }]),
     dpor(64),
   );
   assert_eq(
@@ -284,13 +284,13 @@ test "tasks that never conflict explore exactly one interleaving" {
 }
 
 test "the naive count for the same program is larger" {
-  let m = expecting(independent(), [{ cell: 1, value: 1 }, { cell: 2, value: 1 }]);
+  let m = expecting(independent(), [{ variable: 1, value: 1 }, { variable: 2, value: 1 }]);
   let e = measure_reduction(dpor(4096), |seed: Seed| run(m, seed));
   assert_eq(e.exploration.explored, 1);
   assert_eq(e.exploration.naive, Some({ explored: 71, bounded: false }))
 }
 
-test "a shared cell costs interleavings and still reduces" {
+test "a shared variable costs interleavings and still reduces" {
   assert_eq(explored(lost_update(), dpor(4096)).exploration.explored, 9);
   assert_eq(
     explore_under(dpor(4096), All, |seed: Seed| run(lost_update(), seed)).exploration.explored,
@@ -323,7 +323,7 @@ test "a spent naive budget is reported as a bound" {
 test "a conflicting pair is explored in both orders, and a lost update is found and named" {
   let pair = expecting(
     program([Spawn("a", [Store(1)]), Spawn("b", [Store(1)]), Join(0), Join(1)]),
-    [{ cell: 1, value: 1 }],
+    [{ variable: 1, value: 1 }],
   );
   let e = explored(pair, dpor(64));
   assert(passed(e) && e.exploration.exhaustive && e.exploration.explored >= 2);
@@ -335,14 +335,14 @@ test "a conflicting pair is explored in both orders, and a lost update is found 
       Join(0),
       Join(1),
     ]),
-    [{ cell: 1, value: 2 }],
+    [{ variable: 1, value: 2 }],
   );
   let raced = explored(race_model, dpor(256));
   assert(!passed(raced));
   match ((raced.exploration.failure, raced.exploration.race)) {
     (Some(seed), Some(race)) -> {
       assert(race.left.task != race.right.task);
-      assert(race.left.access.starts_with("cell.") && race.right.access.starts_with("cell."));
+      assert(race.left.access.starts_with("var.") && race.right.access.starts_with("var."));
       assert(race.left.definition != None && race.right.definition != None);
       // The seed the artifact prints reproduces the failure, and a sampled run infers no race.
       let again = explored(race_model, once(seed));
@@ -390,7 +390,7 @@ test "a nested spawn racing a sibling is found, and one that conflicts with noth
       Join(0),
       Join(1),
     ]),
-    [{ cell: 1, value: 2 }],
+    [{ variable: 1, value: 2 }],
   );
   let e = explored(nested, dpor(256));
   assert(!passed(e));
@@ -405,7 +405,7 @@ test "a nested spawn racing a sibling is found, and one that conflicts with noth
       Join(0),
       Join(1),
     ]),
-    [{ cell: 2, value: 1 }, { cell: 3, value: 1 }],
+    [{ variable: 2, value: 1 }, { variable: 3, value: 1 }],
   );
   let q = explored(quiet, dpor(64));
   assert_eq((passed(q), q.exploration.explored, q.exploration.exhaustive), (true, 1, true))
@@ -419,7 +419,7 @@ test "a race with a task that was blocked at the backtrack point is still found"
       Store(1),
       Join(0),
     ]),
-    [{ cell: 1, value: 2 }],
+    [{ variable: 1, value: 2 }],
   );
   range(0, 8).fold((), |_u: Unit, root: Int| {
     let e = explored(m, { ..default_plan(), roots: [U64::of_int(root)], budget: 512 });
@@ -428,7 +428,7 @@ test "a race with a task that was blocked at the backtrack point is still found"
 }
 
 test "the backtrack rule queues alternatives when the racer is not enabled" {
-  let cell = |w: Bool| [ACell({ index: 1, generation: 0, write: w })];
+  let var = |w: Bool| [AVar({ handler: 0, index: 1, write: w })];
   let step = |task: Int, enabled: List<Int>, choice: Int, accesses: List<Access>|
     {
       region: 0,
@@ -440,7 +440,7 @@ test "the backtrack rule queues alternatives when the racer is not enabled" {
       stamp: [],
     };
   let blocked = backtracks(
-    [step(0, [0, 1], 0, cell(true)), step(1, [0, 1], 1, []), step(2, [0, 1, 2], 2, cell(true))],
+    [step(0, [0, 1], 0, var(true)), step(1, [0, 1], 1, []), step(2, [0, 1, 2], 2, var(true))],
     Exact,
   );
   match blocked.get(0) {
@@ -450,7 +450,7 @@ test "the backtrack rule queues alternatives when the racer is not enabled" {
     },
     None -> panic("no backtrack point at 0"),
   };
-  let direct = backtracks([step(0, [0, 1], 0, cell(true)), step(1, [0, 1], 1, cell(true))], Exact);
+  let direct = backtracks([step(0, [0, 1], 0, var(true)), step(1, [0, 1], 1, var(true))], Exact);
   assert_eq(match direct.get(0) { Some(m) -> m.get(1), None -> None }, Some(Some(1)))
 }
 
@@ -464,7 +464,7 @@ test "a read the join already ordered costs no interleavings, and the clock-blin
       Load(1),
       Load(2),
     ]),
-    [{ cell: 1, value: 1 }, { cell: 2, value: 1 }],
+    [{ variable: 1, value: 1 }, { variable: 2, value: 1 }],
   );
   let e = explored(m, dpor(4096));
   assert_eq((passed(e), e.exploration.explored, e.exploration.exhaustive), (true, 1, true));

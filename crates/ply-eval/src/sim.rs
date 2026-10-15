@@ -4,7 +4,6 @@ use crate::{Diagnostic, EffectAtom, Mode, Span, Symbol, codes};
 use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::arena::Slot;
 use crate::semantics::arity_error;
 use crate::value::Value;
 
@@ -149,12 +148,6 @@ pub const DEFAULT_STEPS: u32 = 100_000;
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Access {
     Atom(EffectAtom),
-    Cell {
-        id: Slot,
-        mode: Mode,
-    },
-    /// A `with_cell` took the lowest free slot of the store every stack shares.
-    Alloc,
     /// A clause read or assigned its handler's variable `at`; `handler` names the `handle`.
     Var {
         handler: u64,
@@ -169,18 +162,10 @@ pub enum Access {
 }
 
 impl Access {
-    /// Cells conflict when one writes the same slot; allocations always, as the order they run in
-    /// decides which slot each takes.
+    /// Two accesses of one place conflict when either writes it.
     pub fn conflicts_with(&self, other: &Access) -> bool {
         match (self, other) {
             (Access::Atom(a), Access::Atom(b)) => a.conflicts_with(b),
-            (
-                Access::Cell { id: a, mode: ma },
-                Access::Cell {
-                    id: b, mode: mb, ..
-                },
-            ) => a == b && (*ma == Mode::Write || *mb == Mode::Write),
-            (Access::Alloc, Access::Alloc) => true,
             (
                 Access::Var {
                     handler: a,
@@ -205,8 +190,6 @@ impl fmt::Display for Access {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Access::Atom(a) => write!(f, "{a}"),
-            Access::Cell { id, mode } => write!(f, "cell.{}[{id}]", mode.as_str()),
-            Access::Alloc => f.write_str("cell.alloc"),
             Access::Var { handler, at, mode } => {
                 write!(f, "var.{}[{handler}.{at}]", mode.as_str())
             }
@@ -384,7 +367,7 @@ pub fn channel_access(chan: ChanId) -> Access {
     channel_atom(format!("{chan}"))
 }
 
-/// What making a channel writes, as allocating a cell does: the order two run in decides each id.
+/// What making a channel writes: the order two run in decides each id.
 pub fn channel_made() -> Access {
     channel_atom("new".to_string())
 }

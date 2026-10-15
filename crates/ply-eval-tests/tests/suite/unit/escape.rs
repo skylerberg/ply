@@ -1,19 +1,7 @@
-use ply_eval::arena::{Arena, Owner, RegionKind};
 use ply_eval::escape::*;
 use ply_eval::{Closure, ClosureKind, Span, Symbol, Value, codes};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-
-/// A real slot, because a [`Slot`](ply_eval::arena::Slot) carries a generation only the allocator assigns.
-fn cell() -> Value {
-    let mut arena = Arena::new();
-    arena.open(Owner::ENTRY, RegionKind::Shared);
-    Value::Cell(
-        arena
-            .alloc(Owner::ENTRY, Value::Int(0))
-            .expect("the region is open"),
-    )
-}
 
 fn task() -> Value {
     Value::Task(ply_eval::TaskHandle::unowned(
@@ -38,8 +26,8 @@ fn continuation() -> Value {
 
 #[test]
 fn a_bare_handle_is_found_with_an_empty_route() {
-    let found = carries(&cell()).expect("a cell is a handle");
-    assert_eq!(found.handle, Handle::Cell);
+    let found = carries(&task()).expect("a task is a handle");
+    assert_eq!(found.handle, Handle::Task);
     assert!(found.route.is_empty());
     assert_eq!(found.reached(), "");
 }
@@ -59,10 +47,10 @@ fn data_without_a_handle_crosses() {
 fn a_handle_inside_a_constructor_is_found_and_the_route_names_it() {
     let value = Value::Ctor {
         name: Symbol::new("m.Just"),
-        args: Arc::new(vec![cell()]),
+        args: Arc::new(vec![task()]),
     };
     let found = carries(&value).expect("the constructor carries it");
-    assert_eq!(found.handle, Handle::Cell);
+    assert_eq!(found.handle, Handle::Task);
     assert_eq!(found.route, vec!["`m.Just`'s argument 1"]);
 }
 
@@ -70,7 +58,7 @@ fn a_handle_inside_a_constructor_is_found_and_the_route_names_it() {
 fn the_route_reads_outermost_first() {
     let inner = Value::Ctor {
         name: Symbol::new("m.Just"),
-        args: Arc::new(vec![cell()]),
+        args: Arc::new(vec![task()]),
     };
     let mut fields = BTreeMap::new();
     fields.insert(Symbol::new("saved"), inner);
@@ -97,11 +85,7 @@ fn a_secret_holds_bytes_alone_and_so_no_handle() {
 }
 
 #[test]
-fn a_task_and_a_continuation_are_handles_too() {
-    assert_eq!(
-        carries(&task()).expect("a task is a handle").handle,
-        Handle::Task
-    );
+fn a_continuation_is_a_handle_too() {
     let found = carries(&continuation()).expect("a continuation is a handle");
     assert_eq!(found.handle, Handle::Continuation);
     assert!(found.route.is_empty());
@@ -125,7 +109,7 @@ fn a_native_closure_carries_a_continuation_only_by_capturing_one() {
     assert_eq!(found.handle, Handle::Continuation);
 }
 
-/// One classification: each boundary refuses a continuation as it refuses a cell, and names it as
+/// One classification: each boundary refuses a continuation as it refuses a task, and names it as
 /// what it is rather than as a type it does not have.
 #[test]
 fn every_boundary_refuses_a_continuation_and_names_it() {
@@ -173,7 +157,6 @@ fn an_entry_points_answer_refuses_every_handle_and_lets_data_cross() {
     let unreached = "answer with something that does not reach a region";
     let resumed = "resume the continuation before the entry answers";
     for (handle, noun, remedy) in [
-        (cell(), "a `Cell`", unreached),
         (task(), "a `Task`", unreached),
         (continuation(), "a continuation", resumed),
     ] {
@@ -217,21 +200,21 @@ fn a_generated_function_holding_a_handle_is_found() {
         kind: ClosureKind::Synth {
             arity: 1,
             rule: Synth::Table {
-                entries: vec![(Value::Int(1), cell())],
+                entries: vec![(Value::Int(1), task())],
                 default: Value::Int(0),
             },
         },
     }));
 
-    let found = carries(&closure).expect("the table reaches the cell");
-    assert_eq!(found.handle, Handle::Cell);
+    let found = carries(&closure).expect("the table reaches the task");
+    assert_eq!(found.handle, Handle::Task);
 }
 
 #[test]
 fn the_diagnostic_names_the_boundary_the_handle_and_the_route_and_no_value() {
     let value = Value::Ctor {
         name: Symbol::new("m.Just"),
-        args: Arc::new(vec![cell()]),
+        args: Arc::new(vec![task()]),
     };
     let boundary = Boundary::HostArgument {
         operation: "net.recv[conn]",
@@ -242,7 +225,7 @@ fn the_diagnostic_names_the_boundary_the_handle_and_the_route_and_no_value() {
 
     assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY);
     assert!(d.message.contains("argument 2"), "{}", d.message);
-    assert!(d.message.contains("`Cell`"), "{}", d.message);
+    assert!(d.message.contains("`Task`"), "{}", d.message);
     assert!(d.message.contains("`m.Just`'s argument 1"), "{}", d.message);
     assert!(
         d.notes.iter().any(|n| n.contains("ply_host::tcp")),
@@ -251,16 +234,16 @@ fn the_diagnostic_names_the_boundary_the_handle_and_the_route_and_no_value() {
     );
     assert!(
         !d.message.contains('@'),
-        "the slot's identity is not printed: {}",
+        "the task's identity is not printed: {}",
         d.message
     );
 }
 
 #[test]
 fn check_arguments_names_the_first_position_that_carries_one() {
-    let args = vec![Value::Int(1), Value::Int(2), cell(), cell()];
+    let args = vec![Value::Int(1), Value::Int(2), task(), task()];
     let d = check_arguments("net.send[s]", "ply_host::tcp", &args, Span::DUMMY)
-        .expect_err("argument 3 carries a cell");
+        .expect_err("argument 3 carries a task");
     assert!(d.message.contains("argument 3"), "{}", d.message);
 }
 
@@ -271,7 +254,7 @@ fn an_answer_and_an_entry_point_each_say_what_outlives_the_region() {
             operation: "net.recv[s]",
             path: "ply_host::tcp",
         },
-        &cell(),
+        &task(),
         Span::DUMMY,
     )
     .expect_err("a forged handle is refused");
@@ -288,7 +271,7 @@ fn an_answer_and_an_entry_point_each_say_what_outlives_the_region() {
         &Boundary::EntryPoint {
             name: "m.resume_it",
         },
-        &cell(),
+        &task(),
         Span::DUMMY,
     )
     .expect_err("a smuggled handle is refused");
@@ -296,7 +279,7 @@ fn an_answer_and_an_entry_point_each_say_what_outlives_the_region() {
         entry
             .notes
             .iter()
-            .any(|n| n.contains("resets its region stack to the fixture")),
+            .any(|n| n.contains("starts a run of its own")),
         "{:#?}",
         entry.notes
     );

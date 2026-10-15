@@ -1,7 +1,6 @@
 // `Value` pins `Arc` for its shared payloads.
 #![allow(clippy::arc_with_non_send_sync)]
 
-mod arena;
 mod argv;
 mod builtins;
 mod carry;
@@ -24,5 +23,4 @@ mod sched;
 mod sim;
 mod span;
 mod sqlite;
-mod task_regions;
 mod value;

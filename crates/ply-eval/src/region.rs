@@ -25,7 +25,8 @@ pub struct Step {
     pub enabled: Vec<TaskId>,
     /// The index into `enabled` that was taken; `enabled[choice] == task`.
     pub choice: u16,
-    /// Every cell and `random.write` touched, but not the terminating `task.*`/`clock.*` atom.
+    /// Every handler variable, hold and `random.write` touched, but not the terminating
+    /// `task.*`/`clock.*` atom.
     pub accesses: StepFootprint,
     pub definition: Option<Symbol>,
     pub span: Span,

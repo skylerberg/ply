@@ -101,8 +101,7 @@ pub struct Declines {
     pub arity: u64,
     /// An entry arrived while another was running.
     pub reentered: u64,
-    /// A builtin touched cells, so the compile-time refusal of `cell_get`/`cell_set` has a hole.
-    pub touched_cells: u64,
+
     /// The answer held a closure or a secret, which cannot cross out; a handle raises `E0449`.
     pub answer: u64,
     /// The answer held an `Int` word where neither its type nor the arguments say whether it is
@@ -112,12 +111,7 @@ pub struct Declines {
 
 impl Declines {
     pub fn total(&self) -> u64 {
-        self.not_compiled
-            + self.arity
-            + self.reentered
-            + self.touched_cells
-            + self.answer
-            + self.unread
+        self.not_compiled + self.arity + self.reentered + self.answer + self.unread
     }
 }
 
@@ -418,11 +412,6 @@ impl Bodies {
         self.admitted.contains_key(&Symbol::new(name))
     }
 
-    /// The cell arena's `(regions open, slots live)` between entries: what a leak grows.
-    pub fn cell_extent(&self) -> (usize, usize) {
-        self.ctx.borrow().cell_extent()
-    }
-
     pub fn reset_counts(&self) {
         self.entered.set(0);
         self.declines.set(Declines::default());
@@ -497,7 +486,6 @@ impl Bodies {
             scheduled: production.map_or(0, |sim| sim.scheduled() as u64),
             task_stacks: production.map_or(0, |sim| sim.task_slots() as u64),
             frame_tables: ctx.stack_slots() as u64,
-            cell_owners: ctx.cell_owners() as u64,
         };
         if ctx.sims.last().is_some_and(|sim| sim.is_production()) {
             out = unsafe { crate::simulate::finish_root(&mut *ctx as *mut crate::rt::Ctx, out) };
@@ -545,12 +533,7 @@ impl Bodies {
             ctx.fuel, calls,
             "`{name}` returned without every call it made given back, or with more"
         );
-        crate::detached::release_all(&mut ctx);
-        if !ctx.cells_balanced() {
-            ctx.end();
-            drop(ctx);
-            return self.decline(|d| d.touched_cells += 1);
-        }
+
         // Memoize the word and its converted value, so later entries skip both run and conversion.
         let mut walked = crate::heap::Walked::default();
         let ctors = &self.unit.source.front.ctor_carries;

@@ -6,7 +6,3 @@ mod counting;
 static ALLOCATOR: counting::Counting = counting::Counting;
 
 mod bridge_reuse;
-mod cell_write_cost;
-mod fixture_open_cost;
-mod region_arena_cost;
-mod region_reclamation_audit;

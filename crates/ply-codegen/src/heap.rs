@@ -1945,6 +1945,10 @@ impl Heap {
                     }
                     o as Word
                 }
+                ClosureKind::Hold { held, id } => {
+                    let held = held.as_ref().map_or(0, |x| self.to_word(layouts, x));
+                    crate::rt::hold_word(self, held, *id)
+                }
                 ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) | ClosureKind::Synth { .. } => {
                     self.bridge(v.clone())
                 }
@@ -2087,23 +2091,32 @@ impl Heap {
                 }
                 KIND_CLOSURE => {
                     walked.handle = true;
-                    let code = word_at(o, CLOSURE_CODE) as usize;
-                    let arity = (*o).layout as usize;
-                    let captured: Vec<Value> = (CLOSURE_CAPTURES..(*o).len as usize)
-                        .map(|i| Heap::to_value_counted(layouts, word_at(o, i), walked))
-                        .collect();
-                    // Only the code tells: a continuation's captures are plain immediates.
-                    let kind = if crate::detached::is_continuation(code) {
-                        ClosureKind::Continuation {
-                            code,
-                            arity,
-                            captured,
+                    let kind = if let Some(id) = crate::rt::hold_id(w) {
+                        let held = word_at(o, CLOSURE_CAPTURES);
+                        ClosureKind::Hold {
+                            held: (held != 0)
+                                .then(|| Heap::to_value_counted(layouts, held, walked)),
+                            id,
                         }
                     } else {
-                        ClosureKind::Native {
-                            code,
-                            arity,
-                            captured,
+                        let code = word_at(o, CLOSURE_CODE) as usize;
+                        let arity = (*o).layout as usize;
+                        let captured: Vec<Value> = (CLOSURE_CAPTURES..(*o).len as usize)
+                            .map(|i| Heap::to_value_counted(layouts, word_at(o, i), walked))
+                            .collect();
+                        // Only the code tells: a continuation's captures are plain immediates.
+                        if crate::detached::is_continuation(code) {
+                            ClosureKind::Continuation {
+                                code,
+                                arity,
+                                captured,
+                            }
+                        } else {
+                            ClosureKind::Native {
+                                code,
+                                arity,
+                                captured,
+                            }
                         }
                     };
                     Value::Closure(Arc::new(Closure { name: None, kind }))
@@ -2229,7 +2242,7 @@ pub fn dec_shared(w: Word) {
 }
 
 /// Marks everything under `words` shared, or nothing when something under them names what only
-/// this thread's context holds: a cell, a task or a continuation.
+/// this thread's context holds: a task, a channel or a continuation.
 pub fn share(words: &[Word]) -> bool {
     let mut marked: Vec<*mut Obj> = Vec::new();
     let mut pending: Vec<Word> = words.to_vec();
@@ -2271,13 +2284,14 @@ pub fn share(words: &[Word]) -> bool {
     true
 }
 
-/// Whether a bridged value may be held by another thread: a cell is a slot of this entry's arena,
-/// and a task or a channel a handle into this thread's scheduler.
+/// Whether a bridged value may be held by another thread: a task or a channel is a handle into
+/// this thread's scheduler.
 fn crosses_threads(v: &Value) -> bool {
     match v {
-        Value::Cell(_) | Value::Task(_) | Value::Chan(_) => false,
+        Value::Task(_) | Value::Chan(_) => false,
         Value::Closure(c) => match &c.kind {
             ClosureKind::Native { captured, .. } => captured.iter().all(crosses_threads),
+            ClosureKind::Hold { held, .. } => held.iter().all(crosses_threads),
             _ => true,
         },
         Value::List(items) => items.iter().all(crosses_threads),
@@ -2478,9 +2492,11 @@ pub fn world_independent(w: Word) -> bool {
         let o = obj(w);
         unsafe {
             match (*o).kind {
-                // A continuation's captures are immediates naming a body its entry alone holds.
+                // A continuation's captures are immediates naming a body its entry alone holds, and
+                // a hold is its entry's.
                 KIND_CLOSURE
-                    if crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize) =>
+                    if crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize)
+                        || crate::rt::hold_id(w).is_some() =>
                 {
                     return false;
                 }
@@ -2618,7 +2634,6 @@ fn rank(w: Word) -> u8 {
                 Value::Record(_) => 9,
                 Value::Ctor { .. } => 10,
                 Value::Closure(_) => 11,
-                Value::Cell(_) => 12,
                 Value::Task(_) => 13,
                 Value::Chan(_) => 18,
                 Value::Secret(_) => 14,

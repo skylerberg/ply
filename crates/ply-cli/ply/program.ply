@@ -277,11 +277,14 @@ fn analysed(
   embeds: List<Embed>,
   reached: Bool,
   fixed: Fixing,
+  std: Bool,
 ) -> Program / {abort.raise} = {
   let texts = shipping.read.fold(Map::new(), |acc: Map<String, Bytes>, source: Source|
     acc.insert(String::of_bytes_lossy(source.name), source.src));
   let pkgs: PackageSources = pkgs_of(project);
-  let warnings = root_warnings(answers, project.sources.len());
+  let warnings = root_warnings(answers, project.sources.len()).concat(if std {
+    std_warnings(answers, project.sources.len())
+  } else { [] });
   let loaded = answered_load(
     project.sources.map(|s: Source| s.name),
     pkgs,
@@ -324,7 +327,10 @@ fn analysed(
   };
   let owned = project.sources.fold(Map::new(), |acc: Map<Bytes, Bool>, source: Source|
     acc.insert(source.name, true));
-  let own = loaded.frame.outlines.take(project.files.len());
+  let mine = |m: Bytes| owned.contains(m) || (std && is_std(String::of_bytes_lossy(m)));
+  let own = loaded.frame.outlines.take(project.files.len()).concat(if std {
+    loaded.frame.outlines.drop(project.files.len()).filter(|o: Outline| mine(o.name))
+  } else { [] });
   let held = |pick: (FnOutline) -> Bool|
     own.fold(false, |b: Bool, o: Outline|
       b
@@ -335,7 +341,7 @@ fn analysed(
     let refused = |ds: List<Diag>| { ..program, diags: ds, frame: None };
     match whole_of(program) {
       Err(ds) -> refused(ds),
-      Ok(w) -> match if measured { unshown(w, |m: Bytes| owned.contains(m)) } else { [] } {
+      Ok(w) -> match if measured { unshown(w, mine) } else { [] } {
         [] -> { ..program, whole: Some(w) },
         missing -> refused(missing.map(undescended)),
       },
@@ -416,16 +422,17 @@ pub fn usable(project: Project) -> Bool = project.diags.len() == 0 && project.so
 
 /// The program `answers` says `project` is: refused with the errors of each of its own modules that
 /// no refusal of a module it imports explains, else analysed whole, each definition and test taken as
-/// its module's answer published it.
+/// its module's answer published it. With `std`, the standard library's warnings are its own too.
 fn assembled(
   project: Project,
   shipping: Shipping,
   paths: List<paths::Resolved>,
   q: Queried,
   reached: Bool = true,
+  std: Bool = false,
 ) -> Program / {abort.raise} =
   {
-    ..assembled_from(project, shipping, paths, q, reached),
+    ..assembled_from(project, shipping, paths, q, reached, std),
     tallies: q.tallies,
     vouched: q.vouched,
     lost: q.lost,
@@ -438,6 +445,7 @@ fn assembled_from(
   paths: List<paths::Resolved>,
   q: Queried,
   reached: Bool,
+  std: Bool,
 ) -> Program / {abort.raise} = {
   let answers = q.answers;
   if project.diags.len() > 0 { broken(project, shipping, own_places(project), project.diags) }
@@ -472,7 +480,7 @@ fn assembled_from(
         }
       });
       broken(project, shipping, own.modules.concat(pulled).concat(own.manifests), diags)
-    } else { analysed(project, shipping, answers, q.pulled, q.embeds, reached, q.fixing) }
+    } else { analysed(project, shipping, answers, q.pulled, q.embeds, reached, q.fixing, std) }
   }
 }
 
@@ -719,7 +727,7 @@ pub fn timed_over(
     project,
     shipping,
     verify,
-    assembled(project, shipping, paths, answers, interfaced),
+    assembled(project, shipping, paths, answers, interfaced, every),
   );
   tell_viewed(p.viewed, true);
   {
@@ -756,7 +764,7 @@ pub fn timed_uncached_over(
     project,
     shipping,
     verify,
-    assembled(project, shipping, paths, answers, reached: !every),
+    assembled(project, shipping, paths, answers, reached: !every, std: every),
   );
   tell_viewed(p.viewed, true);
   {
@@ -807,10 +815,6 @@ pub fn sourced(program: Program, frame: Frame) -> List<Source> / {abort.raise} =
       src: match program.places.at(i) { Some(place) -> place.text, None -> b"" },
     })
 
-fn first_primary(labels: List<Label>) -> Option<Label> =
-  labels.fold(None, |acc: Option<Label>, label: Label|
-    match acc { Some(_) -> acc, None -> if label.primary { Some(label) } else { None } })
-
 /// What a run answers for: its root package's modules, and the standard library's when it asks for
 /// them. Another package's definitions are claimed by their specs: that package's own run proves
 /// them, as the compiler's own run proves the compiler's.
@@ -827,16 +831,26 @@ pub fn owned_of(frame: Frame, std: Bool) -> (Bytes) -> Bool = {
   |m: Bytes| roots.contains(m) || (std && is_std(String::of_bytes_lossy(m)))
 }
 
-/// A diagnostic raised inside a module the project did not write, which is the shipped modules'
-/// business. A run reports its own modules' tests and laws, however its dependencies were read.
+/// A run reports its own modules' tests and laws, however its dependencies were read.
 pub fn own_tests(program: Program, view: View) -> List<TestInfo> =
   view.checked.tests.filter(|test_info: TestInfo| test_info.at.module < program.files.len())
 
 pub fn own_laws(program: Program, view: View) -> List<LawInfo> =
   view.checked.laws.filter(|law_info: LawInfo| law_info.at.module < program.files.len())
 
-pub fn in_shipped_module(program: Program, diag: Diag) -> Bool =
-  match first_primary(diag.labels) { Some(l) -> l.module >= program.files.len(), None -> false }
+/// The warnings of each module of the standard library `answers` holds past the project's own
+/// `root`, each at its place in the load.
+fn std_warnings(answers: List<Answered>, root: Int) -> List<Diag> =
+  range(root, answers.len()).fold([], |acc: List<Diag>, i: Int|
+    match answers.at(i) {
+      Some(a) -> if !is_std(String::of_bytes_lossy(a.module)) { acc } else {
+        acc.concat(
+          a.answer.warnings.map(|d: Diag|
+            { ..d, labels: d.labels.map(|l: Label| { ..l, module: i }) }),
+        )
+      },
+      None -> acc,
+    })
 
 pub fn place_of(program: Program, location: Location) -> Option<Place> =
   if location.module == no_module() { None } else { program.places.at(location.module) }

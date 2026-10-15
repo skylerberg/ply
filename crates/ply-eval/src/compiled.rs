@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// what grows with the work a long-running program does if anything is never given back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Held {
-    /// Heap objects standing for a runtime value, such as a task's handle or a region's cell.
+    /// Heap objects standing for a runtime value, such as a task's handle.
     pub bridges: u64,
     /// Tasks the production region's scheduler still tracks.
     pub scheduled: u64,
@@ -20,8 +20,6 @@ pub struct Held {
     pub task_stacks: u64,
     /// Frame tables kept for stacks that are or were running.
     pub frame_tables: u64,
-    /// Stacks the cell arena keeps a nesting of regions for.
-    pub cell_owners: u64,
 }
 
 impl Held {
@@ -32,7 +30,6 @@ impl Held {
             scheduled: self.scheduled.max(other.scheduled),
             task_stacks: self.task_stacks.max(other.task_stacks),
             frame_tables: self.frame_tables.max(other.frame_tables),
-            cell_owners: self.cell_owners.max(other.cell_owners),
         }
     }
 }

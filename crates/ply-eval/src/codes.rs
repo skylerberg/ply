@@ -79,7 +79,7 @@ pub const HOLD_RELEASED: &str = "E0331";
 pub const REGION_ESCAPE: &str = "E0446";
 /// A definition the program reaches that the C backend cannot compile.
 pub const DEFINITION_REFUSED: &str = "E0448";
-/// A cell, task or continuation crossing a runtime boundary, where no type is left to check it.
+/// A task, channel or continuation crossing a runtime boundary, where no type is left to check it.
 pub const REGION_ESCAPE_AT_BOUNDARY: &str = "E0449";
 pub const BACKEND_UNAVAILABLE: &str = "E0450";
 /// An `fs` operation named a resource label the run bound no root to.

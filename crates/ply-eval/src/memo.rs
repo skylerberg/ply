@@ -4,7 +4,7 @@ use crate::value::{ClosureKind, Value};
 
 /// Whether the value means the same thing in a world it was not produced in.
 pub fn world_independent(value: &Value) -> bool {
-    // Explicit stack, since a constant may hold a whole syntax tree; any cycle ends at a cell.
+    // Explicit stack, since a constant may hold a whole syntax tree.
     let mut pending = vec![value];
     while let Some(value) = pending.pop() {
         match value {
@@ -18,7 +18,7 @@ pub fn world_independent(value: &Value) -> bool {
             | Value::Bytes(_)
             | Value::Secret(_)
             | Value::Unit => {}
-            Value::Cell(_) | Value::Task(_) | Value::Chan(_) => return false,
+            Value::Task(_) | Value::Chan(_) => return false,
             Value::List(items) => pending.extend(items.iter()),
             Value::Array(items) => pending.extend(items.iter()),
             Value::Map(map) => {
@@ -32,7 +32,7 @@ pub fn world_independent(value: &Value) -> bool {
             Value::Closure(closure) => match &closure.kind {
                 ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => {}
                 ClosureKind::Native { captured, .. } => pending.extend(captured.iter()),
-                ClosureKind::Continuation { .. } => return false,
+                ClosureKind::Continuation { .. } | ClosureKind::Hold { .. } => return false,
                 ClosureKind::Synth { rule, .. } => pending.extend(rule.values()),
             },
         }

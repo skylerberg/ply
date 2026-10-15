@@ -286,14 +286,13 @@ helpers! {
     rt_list_rest(value, from) -> Word;
     rt_alloc(kind, len, layout, flags) -> Word;
     rt_nullary(index) -> Word;
-    rt_cell(init) -> Word;
+
     rt_handle_push(clauses: *const Word, n, ret) -> Word;
     rt_perform(effect, op, resource, mode, args: *const Word, n) -> Word;
     rt_handle_land(depth, value) -> Word;
     rt_simulate(body) -> Word;
     rt_handle_detached(clauses: *const Word, n, ret, body) -> Word;
-    rt_region(unique) -> Word;
-    rt_region_close(region);
+
     rt_list_lookup(xs, i) -> Word;
     rt_map_lookup(m, k) -> Word;
     rt_maybe_take(w) -> Word;

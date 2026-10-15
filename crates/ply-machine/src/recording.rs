@@ -7,11 +7,7 @@ use ply_eval::{Diagnostic, Interleaving, Span, Value as PlyValue, codes};
 
 /// Where each type this side marshals is declared, and every case it builds of it.
 pub const MARSHALLED: &[(&str, &str, &[&str])] = &[
-    (
-        "sim.recording",
-        "Access",
-        &["AAtom", "ACell", "AAlloc", "AVar", "AHold"],
-    ),
+    ("sim.recording", "Access", &["AAtom", "AVar", "AHold"]),
     ("sim.recording", "Verdict", &["Passed", "Failed"]),
 ];
 
@@ -129,16 +125,6 @@ fn access_value(access: &ply_eval::sim::Access) -> PlyValue {
                 ),
             ])],
         ),
-        Access::Cell { id, mode } => case(
-            "Access",
-            "ACell",
-            vec![record(vec![
-                ("index", PlyValue::Int(i64::from(id.index()))),
-                ("generation", PlyValue::Int(i64::from(id.generation()))),
-                ("write", PlyValue::Bool(*mode == ply_eval::Mode::Write)),
-            ])],
-        ),
-        Access::Alloc => case("Access", "AAlloc", Vec::new()),
         Access::Var { handler, at, mode } => case(
             "Access",
             "AVar",
