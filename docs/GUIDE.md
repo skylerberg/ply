@@ -1165,10 +1165,21 @@ Functions cannot be compared, encoded, ordered or used as map keys.
   what it names: the mode atom `net.write[conn]` covers every `write` operation
   of `net` on `conn`, the operation atom `net.send[conn]` covers `send` alone
   (§6.2).
-* **Kept:** a top-level `fn`'s parameter of a function type written `keep`
-  (`f: keep (Int) -> Int`) says the function may hold the function it is handed
-  past the call. It is part of the signature and of the function's hash; `keep`
-  stands only before a function type (a parse error elsewhere).
+* **Lent and kept:** a parameter of a top-level `fn` or an `extern fn` whose type
+  is written as a function type is *lent* to the call. The body may call it, pass
+  it to a parameter lent in turn, capture it in a lambda, or read it in a
+  `handle`, whose lambda or continuation is then lent too (§5.3), and nothing
+  more: answering it, putting it in a record, list, constructor, cell or handler
+  variable, performing it, or passing it to a parameter of another type, a type
+  parameter among them, or to a function value would hold it past the call
+  (`E0475`). Written `keep`
+  (`f: keep (Int) -> Int`), the function may hold it. `keep` is part of the
+  signature and of the function's hash, and stands only before a function type (a
+  parse error elsewhere). A call is checked against it, never against the body, so
+  a function a caller lends a parameter not written `keep` never outlives the call.
+  A parameter whose type is written as an alias or a type parameter is not lent,
+  even where that is a function type: it may hold what it is passed, so nothing
+  lent may be passed to it.
 * **Inferred inside bodies:** lambda binders and rows, `let`s, everything else.
   A local `let` is monomorphic, so `let f = |x| x;` used at two types is
   `E0201`.
@@ -1282,6 +1293,27 @@ inferred from how the body uses it, which reads no field and calls nothing on
 it (`E0201`). A lambda captures by value, and its row flows into the enclosing
 function's. A written return type requires a block body and enables `?` inside
 it.
+
+A lent parameter (§4.7) is lent wherever it goes in the body: a `let` bound to
+it, an `if` or `match` that may answer it, a lambda that captures it, and the
+continuation of a `handle` whose body, `return` or clauses read it are lent too:
+handlers are deep, so each runs in the body's place. Each may be called,
+passed to a lent parameter, or read in a `parallel` branch, which joins before
+the block ends. Held past the call, it is `E0475`, whose fix writes `keep` on the
+parameter:
+
+```ply
+fn twice(f: (Int) -> Int, x: Int) -> Int = f(f(x))
+fn each_twice(xs: List<Int>, f: (Int) -> Int) -> List<Int> = xs.map(|x: Int| twice(f, x))
+fn later(f: keep (Int) -> Int) -> () -> Int = || f(1)
+```
+
+`each_twice` lends `f` on through a lambda `List::map` only calls; `later` answers
+a lambda that holds `f`, which only `keep` allows. A lambda's own parameters are
+not lent, and neither is what a call answers, but for a continuation's: its call
+answers what its `handle` may, and a continuation whose `handle` may answer a
+lent function is passed to no parameter, since the callee could answer what it
+answers.
 
 ### 5.4 Calls
 
@@ -2634,7 +2666,8 @@ law "a URL round-trips" = round_trip(url_encode, url_decode)
 ```
 
 A schema has a name, type parameters and at most one row parameter, parameters
-whose types are written, and then what a law has: binders, a guard
+whose types are written, each of a function type kept (§4.7), and then what a
+law has: binders, a guard
 and a body, pure as a law's are (`E0417`), so what a function parameter's
 written row performs past a raise or `diverges` is refused where the body calls
 it. The row parameter is what the definitions a schema is given may raise:
@@ -3711,6 +3744,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0471` | a module whose statements reach two `const fn`s of `std.sql.Schema` |
 | `E0472` | a law instantiating a definition that is not a `law schema` |
 | `E0474` | obligation nothing proves |
+| `E0475` | a lent function parameter held past the call: answered, stored, performed, or passed where it may be held |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |

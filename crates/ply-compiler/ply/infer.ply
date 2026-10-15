@@ -75,6 +75,8 @@ import std.string
 import std.text (closest)
 import guards
 import guards (Guards, Contract, Clause, Reader, Local, Elsewhere)
+import lent
+import lent (Passed, Takes, Target, ToFunction, ToConstructor, ToUnknown, passed)
 
 // --- What the checker keeps ----------------------------------------------------------
 
@@ -580,6 +582,8 @@ type Checker = {
   tag_uses: List<TagUse>,
   /// The parameters of each definition called so far whose types hold a function.
   fn_holding: Map<Bytes, List<Int>>,
+  /// How each function and builtin takes its arguments, by the name a call finds it under.
+  takings: Map<Bytes, Takes>,
   auto_ty_params: Bool,
   alias_stack: List<Bytes>,
   /// Each parameterless alias as an expansion made it, and the `Map` keys that expansion noted.
@@ -1273,7 +1277,7 @@ fn simulated_atoms() -> List<Atom> / {abort.raise} =
 pub type Builtin = {
   name: Bytes,
   scheme: Scheme,
-  params: List<Bytes>,
+  params: List<Passed>,
   doc: List<Bytes>,
   constraints: List<DefConstraint>,
   /// Each `requires` and `ensures` as the prelude writes it.
@@ -1508,7 +1512,7 @@ fn declared(name: Bytes, imported: Map<Bytes, Bytes>, def: ExternDef) -> Builtin
       label_vars: [],
       ty: fn_type(params.tys, ret.ty, row),
     },
-    params: def.params.map(|p: Param| p.name.name),
+    params: def.params.map(passed),
     doc: match def.doc { Some(d) -> d.lines, None -> [] },
     constraints: dedup_constraints(found),
     clauses: def.spec.map(|c: SpecClause| written_at(def, c.span)),
@@ -10055,6 +10059,7 @@ fn builtin_bound(c: Checker, b: Builtin) -> Checker / {abort.raise} =
     constraints: if b.constraints.len() == 0 { c.constraints }
     else { c.constraints.insert(b.name, b.constraints) },
     contracts: c.contracts.insert(b.name, b.contract),
+    takings: c.takings.insert(b.name, { name: b.name, params: b.params }),
     fresh: {
       next_ty: max(c.fresh.next_ty, b.scheme.ty_vars.len()),
       next_row: max(c.fresh.next_row, b.scheme.row_vars.len()),
@@ -10490,6 +10495,10 @@ fn signed_fn(acc: Signed, parsed: ParsedModule, def: FnDef, name: Bytes) -> Sign
     derived: None,
     env: env_bind_global(s.checker.env, name, scheme),
     constraints: s.checker.constraints.insert(name, constraints),
+    takings: s.checker.takings.insert(name, {
+      name: def.name.name,
+      params: def.params.map(passed),
+    }),
   };
   {
     checker: set_def(bound, {
@@ -10697,9 +10706,13 @@ fn walked_or_filed(
       let settled: Checker = settle_columns(
         settle_bit_ops(settle_numerics(settle_concats(settle_updates(walked)))),
       );
-      let judged: Checker = close_unreachable_row(
-        bounded_row(require_written_signature(settled, def, sig), def, sig),
-        sig,
+      let judged: Checker = lent_refused(
+        close_unreachable_row(
+          bounded_row(require_written_signature(settled, def, sig), def, sig),
+          sig,
+        ),
+        def,
+        walked.member_sites.drop(checker.member_sites.len()),
       );
       let p = published_fn(judged, parsed, def, name, sig, o.row);
       let c = p.checker;
@@ -10774,6 +10787,37 @@ fn walked_or_filed(
     left: match taken { None -> Walked, Some(_) -> Taken },
   }
 }
+
+/// `checker` with each place `def`'s body would hold a function lent to it past its call refused,
+/// `sites` being the calls on values the walk of that body wrote out.
+fn lent_refused(checker: Checker, def: FnDef, sites: List<MemberSite>) -> Checker / {abort.raise} =
+  if !lent::lends(def) { checker } else {
+    let at = sites.fold(Map::new(), |m: Map<Bytes, Bytes>, x: MemberSite|
+      m.insert(span_key(x.span), x.callee));
+    lent::refusals(checker.module, def, {
+      named: |q: QName| lent_target(checker, q),
+      member: |s: Span| at.get(span_key(s)),
+      takes: |n: Bytes| checker.takings.get(n),
+    }).fold(
+      checker,
+      report,
+    )
+  }
+
+/// What a name a body calls without binding it is: a function written through a type of the
+/// language's is the one its home module or the prelude declares, as `value_key` reads it.
+fn lent_target(checker: Checker, q: QName) -> Target / {abort.raise} =
+  if starts_upper(q.name.name) { ToConstructor } else {
+    match declared_value(checker, q) {
+      Some(n) -> ToFunction(n),
+      None -> match of_language_type(checker, q) {
+        Found(m) -> ToFunction(m.callee),
+        _ -> if is_bare(q) && env_depth_of(checker.env, q.name.name) == Some(0) {
+          ToFunction(q.name.name)
+        } else { ToUnknown },
+      },
+    }
+  }
 
 /// Publishes of `def` what no group decides: its scheme, the row a caller reads and what its
 /// signature alone says of its counts. `row` is what its body performs. An unwritten row the body
@@ -16202,6 +16246,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     calls: [],
     tag_uses: [],
     fn_holding: Map::new(),
+    takings: Map::new(),
     auto_ty_params: false,
     alias_stack: [],
     aliases: Map::new(),
@@ -17524,7 +17569,7 @@ test "a function's parameter and a declared type hold their rows exactly" {
     net,
     b"type Box<a> = Box(a)\n",
     b"fn open(b: Box<() -> Unit / {net.write[x]}>) -> Unit / {net.write[x]} = match b { Box(f) -> f() }\n",
-    b"fn go(f: () -> Unit / {net.send[x]}) -> Unit / {net.write[x]} = open(Box(f))",
+    b"fn go(f: keep () -> Unit / {net.send[x]}) -> Unit / {net.write[x]} = open(Box(f))",
   ]);
   assert_eq(check_codes(boxed), [b"E0302"])
 }
@@ -18241,7 +18286,7 @@ test "a sum's row argument is exact, and an alias's lands in a function type a n
       net,
       b"type Box<| e> = | Box(() -> Unit / e)\n",
       b"fn open(b: Box<| {net.write[x]}>) -> Unit / {net.write[x]} = match b { Box(f) -> f() }\n",
-      b"fn go(f: () -> Unit / {net.send[x]}) -> Unit / {net.write[x]} = ",
+      b"fn go(f: keep () -> Unit / {net.send[x]}) -> Unit / {net.write[x]} = ",
       made,
     ]);
   assert_eq(check_codes(boxed(b"open(Box(f))")), [b"E0302"]);
@@ -20842,8 +20887,21 @@ fn declared_as(name: Bytes) -> Builtin / {abort.raise} =
 
 test "a builtin is what the prelude declares: its scheme, its parameters' names and its doc" {
   let slice = declared_as(b"Bytes::slice");
-  assert_eq(slice.params, [b"b", b"start", b"end"]);
+  assert_eq(slice.params.map(|p: Passed| p.name), [b"b", b"start", b"end"]);
   assert_eq(slice.doc, [b"Raises out of range."]);
+  // A function parameter is lent to the native as to any function, unless written `keep`.
+  assert_eq(declared_as(b"List::map").params, [
+    { name: b"xs", lent: false, keep: false },
+    { name: b"f", lent: true, keep: false },
+  ]);
+  match parse(b"extern fn hold<a>(f: keep (a) -> a, g: (a) -> a) -> Unit\n").node.items {
+    [IExtern(d)] ->
+      assert_eq(declared(b"hold", Map::new(), d).params, [
+        { name: b"f", lent: false, keep: true },
+        { name: b"g", lent: true, keep: false },
+      ]),
+    _ -> panic("one `extern fn`"),
+  };
   assert_eq(slice.scheme, {
     ty_vars: [],
     row_vars: [],
@@ -22143,4 +22201,211 @@ test "a recursion through a call on a value is a recursion, and a type states it
     ),
     [],
   )
+}
+
+test "a lent function parameter may be called, lent on, captured by a lambda lent in turn, and read in a `parallel` branch" {
+  let lent = [
+    b"fn f(g: (Int) -> Int) -> Int = g(1)",
+    b"fn twice(h: (Int) -> Int, x: Int) -> Int = h(h(x))\nfn f(g: (Int) -> Int) -> Int = twice(g, 1)",
+    b"fn f(g: (Int) -> Int) -> List<Int> = [1, 2].map(g)",
+    b"fn f(g: (Int) -> Int) -> List<Int> = [1, 2].map(|x: Int| g(x) + 1)",
+    b"fn f(g: (Int) -> Int) -> Int = { let h = |x: Int| g(x); let k = h; k(1) + [1].fold(0, |a: Int, x: Int| a + h(x)) }",
+    b"fn f(g: (Int) -> Int, n: Int) -> Int = if n <= 0 { g(0) } else { f(g, n - 1) }",
+    b"fn f(g: (Int) -> Int) -> (Int, Int) = parallel { g(1), g(2) }",
+    b"effect ask { read get() -> Int }\nfn f(g: (Int) -> Int) -> Int = handle { g(ask.get()) } with { ask.get() resume k -> k(1) + k(2) }",
+    // A lambda's parameter is not lent, and neither is what a call answers.
+    b"fn f() -> ((Int) -> Int) -> (Int) -> Int = |h: (Int) -> Int| h",
+  ];
+  assert_eq(lent.filter(|src: Bytes| check_codes(src) != []), [])
+}
+
+/// Each way a body may hold its parameter `g` past the call, with `g` written `param`.
+fn holding(param: Bytes) -> List<Bytes> / {abort.raise} = {
+  let f = |rest: Bytes| Bytes::concat_all([b"fn f(", param, rest]);
+  [
+    f(b") -> (Int) -> Int = g"),
+    f(b") -> { h: (Int) -> Int } = { h: g }"),
+    f(b") -> List<(Int) -> Int> = [g]"),
+    f(b") -> Option<(Int) -> Int> = Some(g)"),
+    b"effect sink { write put((Int) -> Int) -> Unit }\n".concat(
+      f(b") -> Unit / {sink.put} = sink.put(g)"),
+    ),
+    b"fn hold(h: keep (Int) -> Int) -> Int = 0\n".concat(f(b") -> Int = hold(g)")),
+    b"fn id<a>(x: a) -> a = x\n".concat(f(b") -> Int = id(g)(1)")),
+    f(b") -> Int = { let apply = |h: (Int) -> Int| h(1); apply(g) }"),
+    f(b") -> () -> Int = || g(1)"),
+    f(b") -> (Int) -> Int = { let h = g; h }"),
+    f(b", c: Bool) -> (Int) -> Int = if c { g } else { |x: Int| x }"),
+    b"effect ask { read get() -> Int }\nfn forget<a>(x: a) -> Unit = ()\n".concat(
+      f(b") -> Int = handle { g(ask.get()) } with { ask.get() resume k -> { forget(k); 0 } }"),
+    ),
+  ]
+}
+
+test "a lent function parameter held past the call is refused, and `keep` lets the function hold it" {
+  let lent = holding(b"g: (Int) -> Int");
+  assert_eq(lent.map(check_codes), lent.map(|_: Bytes| [b"E0475"]));
+  assert_eq(holding(b"g: keep (Int) -> Int").filter(|src: Bytes| check_codes(src) != []), [])
+}
+
+test "a refused lent parameter names the place that holds it and offers `keep`" {
+  let src = b"fn f(g: (Int) -> Int) -> Option<(Int) -> Int> = Some(g)";
+  let diags = check_diags(src);
+  assert_eq(diags.map(|d: Diag| d.message), [
+    b"`g` is lent to `f`, and would be held past its call",
+  ]);
+  match fixes_of(diags) {
+    [fix] -> {
+      let fixed = fixed_by(src, fix);
+      assert_eq(fixed, b"fn f(g: keep (Int) -> Int) -> Option<(Int) -> Int> = Some(g)");
+      assert_eq(check_codes(fixed), [])
+    },
+    _ -> panic("one fix"),
+  }
+}
+
+test "a call reads `keep` off its callee's signature, in another module or through a type" {
+  let lib = {
+    name: b"lib",
+    src: b"pub fn hold(h: keep (Int) -> Int) -> Int = 0\npub fn lend(h: (Int) -> Int) -> Int = h(0)\n",
+  };
+  let calling = |call: Bytes|
+    codes_of([
+      lib,
+      {
+        name: b"m",
+        src: Bytes::concat_all([b"import lib\nfn f(g: (Int) -> Int) -> Int = ", call, b"\n"]),
+      },
+    ]);
+  assert_eq(calling(b"lib::lend(g)"), []);
+  assert_eq(calling(b"lib::hold(g)"), [b"E0475"]);
+  let boxed = |call: Bytes|
+    check_codes(
+      Bytes::concat_all([
+        b"type Box = | Box(Int)\nfn Box::hold(b: Box, h: keep (Int) -> Int) -> Int = 0\nfn Box::lend(b: Box, h: (Int) -> Int) -> Int = h(0)\nfn f(g: (Int) -> Int, b: Box) -> Int = ",
+        call,
+      ]),
+    );
+  assert_eq(boxed(b"b.lend(g) + Box::lend(b, g) + b.lend(h: g)"), []);
+  assert_eq(boxed(b"b.hold(g)"), [b"E0475"]);
+  assert_eq(boxed(b"b.hold(h: g)"), [b"E0475"])
+}
+
+test "a pattern binds every name it takes from a lent value to that value" {
+  assert_eq(check_codes(b"fn f(g: (Int) -> Int) -> (Int) -> Int = match g { h -> h }"), [b"E0475"]);
+  assert_eq(check_codes(b"fn f(g: (Int) -> Int) -> (Int) -> Int = match g { h | h -> h }"), [
+    b"E0475",
+  ]);
+  assert_eq(check_codes(b"fn f(g: (Int) -> Int) -> (Int) -> Int = { let h | h = g; h }"), [
+    b"E0475",
+  ])
+}
+
+/// A `handle` around `ask.get()`, its clauses `with`, in `fn f(g: <param>)`.
+fn asking(param: Bytes, rest: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"effect ask { read get() -> Int }\neffect sink { write put((Int) -> Int) -> Unit }\n",
+    b"type Step = | Done(Int) | Wait((Int) -> Step)\n",
+    b"fn apply(h: (Int) -> (Int) -> Int, x: Int) -> (Int) -> Int = h(x)\n",
+    b"fn f(g: ",
+    param,
+    rest,
+  ])
+
+test "a continuation holds what its handler reads, and a call of it answers what its `handle` may" {
+  let held = [
+    // The `return` clause reads `g` after a resumption, so the continuation holds it.
+    b") -> Step = handle { ask.get() } with { return n -> Done(g(n)), ask.get() resume k -> Wait(k) }",
+    // `k(0)` answers what the `handle` may, `g` among it.
+    b") -> Unit / {sink.put} = { handle { let _ = ask.get(); g } with { ask.get() resume k -> { sink.put(k(0)); g } }; () }",
+    // Lent on, `k` would hand `apply` what a call of it answers.
+    b") -> Int = { let r = handle { let _ = ask.get(); g } with { ask.get() resume k -> apply(k, 0) }; r(1) }",
+  ];
+  assert_eq(
+    held.map(|rest: Bytes| check_codes(asking(b"(Int) -> Int", rest))),
+    held.map(|_: Bytes| [b"E0475"]),
+  );
+  assert_eq(held.filter(|rest: Bytes| check_codes(asking(b"keep (Int) -> Int", rest)) != []), []);
+  // A continuation whose `handle` answers no lent value is lent on as any lent value is.
+  assert_eq(
+    check_codes(
+      asking(
+        b"(Int) -> Int",
+        b") -> Int = handle { g(ask.get()) } with { ask.get() resume k -> [1].map(k).len() }",
+      ),
+    ),
+    [],
+  )
+}
+
+test "a function of a language type written through the type is its home module's, lent or kept as it says" {
+  let home = |param: Bytes|
+    {
+      name: b"std.list",
+      src: Bytes::concat_all([
+        b"pub fn List::ordered<a>(xs: List<a>, before: ",
+        param,
+        b") -> List<a> = xs\n",
+      ]),
+    };
+  let calls = {
+    name: b"m",
+    src: b"import std.list\nfn f(xs: List<Int>, g: (Int, Int) -> Bool) -> List<Int> = List::ordered(xs, g)\nfn h(xs: List<Int>, g: (Int, Int) -> Bool) -> List<Int> = xs.ordered(g)\n",
+  };
+  assert_eq(codes_of([home(b"(a, a) -> Bool"), calls]), []);
+  assert_eq(codes_of([home(b"keep (a, a) -> Bool"), calls]), [b"E0475", b"E0475"])
+}
+
+test "a lent parameter is held by a lambda answering it, an `else`, a region, a handler's variable, a `try`, a `parallel` and a tagged literal" {
+  let held = [
+    b"fn f(g: (Int) -> Int) -> List<(Int) -> Int> = [1].map(|x: Int| g)",
+    b"fn f(g: (Int) -> Int, o: Option<Int>) -> (Int) -> Int = { let Some(_) = o else { g }; |x: Int| x }",
+    b"fn f(g: (Int) -> Int) -> Int = with_cell[r](g) { c -> 1 }",
+    b"fn f(g: (Int) -> Int) -> Int = with_hold[r](g, |h: (Int) -> Int| ()) { h -> 1 }",
+    b"effect tally { write add(n: Int) -> Unit }\nfn f(g: (Int) -> Int) -> Int = handle { tally.add(1) } with { var h: (Int) -> Int = g, tally.add(n) -> (), return u -> 0 }",
+    b"effect tally { write add(n: Int) -> Unit }\nfn f(g: (Int) -> Int) -> Int = handle { tally.add(1) } with { var h: (Int) -> Int = |x: Int| x, tally.add(n) -> { h = g; }, return u -> 0 }",
+    b"fn f(g: (Int) -> Int) -> Result<(Int) -> Int, String> = try[abort.raise] { g }",
+    b"fn f(g: (Int) -> Int) -> ((Int) -> Int, Int) = parallel { g, 1 }",
+  ];
+  assert_eq(held.map(check_codes), held.map(|_: Bytes| [b"E0475"]));
+  // A `with_hold` runs its release before it ends, so it may be lent one.
+  assert_eq(check_codes(b"fn f(g: (Int) -> Unit) -> Int = with_hold[r](1, g) { h -> 2 }"), []);
+  let marks = {
+    name: b"marks",
+    src: b"pub fn compile(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(1)\npub fn fill(c: Int, holes: List<(Int) -> Int>) -> Int = c\n",
+  };
+  assert_eq(
+    codes_of([
+      marks,
+      { name: b"m", src: b"import marks\nfn f(g: (Int) -> Int) -> Int = marks\"a{g}b\"\n" },
+    ]),
+    [b"E0475"],
+  )
+}
+
+test "a law schema's function parameters are kept" {
+  assert_eq(
+    check_codes(
+      b"fn hold(h: keep (Int) -> Int) -> Int = 0\nlaw schema held_once(f: (Int) -> Int) forall (x: Int) { hold(f) == x - x }\n",
+    ),
+    [],
+  )
+}
+
+test "a lent parameter held at several places is offered `keep` once" {
+  let diags = check_diags(b"fn f(g: (Int) -> Int) -> List<(Int) -> Int> = [g, g]");
+  assert_eq(diags.map(|d: Diag| d.code), [b"E0475", b"E0475"]);
+  assert_eq(fixes_of(diags).len(), 1)
+}
+
+test "a named argument is held as the parameter it names takes it, and a constructor takes none" {
+  let named = b"fn hold(n: Int, h: keep (Int) -> Int) -> Int = n\nfn lend(n: Int, h: (Int) -> Int) -> Int = h(n)\n";
+  assert_eq(check_codes(named.concat(b"fn f(g: (Int) -> Int) -> Int = hold(h: g, n: 1)")), [
+    b"E0475",
+  ]);
+  assert_eq(check_codes(named.concat(b"fn f(g: (Int) -> Int) -> Int = lend(h: g, n: 1)")), []);
+  // A constructor's arguments are positional, so a named one is refused before any is held.
+  assert_eq(check_codes(b"fn f(g: (Int) -> Int) -> Option<(Int) -> Int> = Some(value: g)"), [
+    b"E0123",
+  ])
 }
