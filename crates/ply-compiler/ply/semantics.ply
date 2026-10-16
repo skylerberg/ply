@@ -1,0 +1,595 @@
+//! How a function calls the function it is handed, where no clause states it yet: one entry for
+//! each such function, keyed on its program-wide name, which the termination check, the checker's
+//! counts, the ownership report and the prover's step and space readers all read. An entry for a
+//! function `std.prelude` writes in Ply is held to its body by this module's tests; a native's is
+//! the runtime's to keep.
+
+import patterns (PCtor, PVar, LInt)
+import exprs (Expr, ELit, EVar, EBinary, EApp, EIf, EMatch, EField, EBlock, EList, EPerform, Param,
+              MatchArm, SLet, prelude_module)
+import items (Item, IFn, IExtern, FnDef, parse)
+import type_syntax (TFn)
+import std.list
+import std.prelude_source
+
+/// How a function calls the function it is handed at `callback`, which takes one parameter for
+/// each of `params`: at most as many times as the sizes of its arguments at `over` add up to, or
+/// once where `over` is empty. A parameter handed an `Element` is handed each element of the
+/// argument at `over`'s first in turn, once each, in order.
+pub type Iterates = { callback: Int, over: List<Int>, params: List<Handed>, answer: Answer }
+
+/// What a parameter of the function handed in is handed.
+pub type Handed =
+  /// An element of the argument at `over`'s first, which goes on holding it: a list's element, or
+  /// a map's key or value.
+  | Element
+  /// The argument at this place on the first call, and what the call before answered on each one
+  /// after it.
+  | Threaded(Int)
+  /// What the argument at this place holds, taken out of it for the call: held as that is.
+  | Taken(Int)
+  /// A number.
+  | Number
+  /// A value nothing is said of.
+  | Unsaid
+
+/// What the function answers.
+pub type Answer =
+  /// A list of what each call answered, in order.
+  | Mapped
+  /// A list of the elements whose call answered `true`, in order.
+  | Kept
+  /// What the last call answered, or the `Threaded` argument where there was none.
+  | Folded
+  /// The argument at this place, with what the call answered in it.
+  | Updated(Int)
+  /// A value nothing is said of.
+  | Unstated
+
+/// The entry for the function `name`, a program-wide name.
+pub fn iterates(name: Bytes) -> Option<Iterates> = table().get(name)
+
+/// The entry for `name`, a function of `std.prelude` named as the prelude declares it.
+pub fn prelude_iterates(name: Bytes) -> Option<Iterates> = table().get(in_prelude(name))
+
+fn in_prelude(name: Bytes) -> Bytes = Bytes::concat_all([prelude_module(), b".", name])
+
+/// Every entry, by program-wide name. Pure and nullary, so it is made once.
+fn table() -> Map<Bytes, Iterates> =
+  entries().fold(Map::new(), |acc: Map<Bytes, Iterates>, e: Entry| acc.insert(e.name, e.iterates))
+
+type Entry = { name: Bytes, iterates: Iterates }
+
+fn entries() -> List<Entry> =
+  [
+    {
+      name: b"std.prelude.List::map",
+      iterates: { callback: 1, over: [0], params: [Element], answer: Mapped },
+    },
+    {
+      name: b"std.prelude.List::filter",
+      iterates: { callback: 1, over: [0], params: [Element], answer: Kept },
+    },
+    {
+      name: b"std.prelude.List::fold",
+      iterates: { callback: 2, over: [0], params: [Threaded(1), Element], answer: Folded },
+    },
+    {
+      name: b"std.prelude.Map::fold",
+      iterates: { callback: 2, over: [0], params: [Threaded(1), Element, Element], answer: Folded },
+    },
+    {
+      name: b"std.prelude.Map::update",
+      iterates: { callback: 2, over: [], params: [Taken(0)], answer: Updated(0) },
+    },
+    // `from` is never negative, so the bytes from it are no more than `b` holds.
+    {
+      name: b"std.prelude.Bytes::position",
+      iterates: { callback: 2, over: [0], params: [Number], answer: Unstated },
+    },
+    {
+      name: b"std.prelude.iterate",
+      iterates: { callback: 2, over: [1], params: [Unsaid], answer: Unstated },
+    },
+    {
+      name: b"std.prelude.metered",
+      iterates: { callback: 0, over: [], params: [], answer: Unstated },
+    },
+  ]
+
+// --- Tests ----------------------------------------------------------------------------------------
+
+/// A declaration of the prelude: its parameters, and itself where the prelude writes its body.
+type Declared = { params: List<Param>, written: Option<FnDef> }
+
+fn prelude_items() -> List<Item> / {abort.raise} = parse(prelude_source::text()).node.items
+
+fn declared(name: Bytes) -> Option<Declared> / {abort.raise} =
+  prelude_items().fold(None, |found: Option<Declared>, item: Item|
+    match found {
+      Some(_) -> found,
+      None -> match item {
+        IFn(d) -> if d.name.name == name { Some({ params: d.params, written: Some(d) }) }
+        else { None },
+        IExtern(d) -> if d.name.name == name { Some({ params: d.params, written: None }) }
+        else { None },
+        _ -> None,
+      },
+    })
+
+fn fns_of(items: List<Item>) -> Map<Bytes, FnDef> =
+  items.fold(Map::new(), |acc: Map<Bytes, FnDef>, item: Item|
+    match item { IFn(d) -> acc.insert(d.name.name, d), _ -> acc })
+
+fn bare(name: Bytes) -> Bytes / {abort.raise} = name.slice(prelude_module().len() + 1, name.len())
+
+/// How many parameters the function a parameter is written to take takes.
+fn takes(p: Option<Param>) -> Option<Int> =
+  match p {
+    Some(x) -> match x.ty { Some(TFn(f)) -> Some(f.params.len()), _ -> None },
+    None -> None,
+  }
+
+/// Every place an entry names.
+fn places(i: Iterates) -> List<Int> =
+  i.params.fold(i.over.push(i.callback), |acc: List<Int>, h: Handed|
+    match h { Threaded(k) -> acc.push(k), Taken(k) -> acc.push(k), _ -> acc }).concat(
+    match i.answer { Updated(k) -> [k], _ -> [] },
+  )
+
+test "every entry names a function the prelude declares, and a function parameter it calls" {
+  entries().fold((), |u: Unit, e: Entry| {
+    let i = e.iterates;
+    assert_eq(in_prelude(bare(e.name)), e.name);
+    match declared(bare(e.name)) {
+      None ->
+        panic("`" ++ String::of_bytes_lossy(e.name) ++ "` names nothing the prelude declares"),
+      Some(d) -> {
+        assert_eq(takes(d.params.at(i.callback)), Some(i.params.len()));
+        assert(places(i).fold(true, |ok: Bool, k: Int| ok && k >= 0 && k < d.params.len()));
+        assert(!i.over.contains(i.callback));
+        assert(i.over.len() > 0 || !i.params.contains(Element))
+      },
+    }
+  })
+}
+
+// An entry read off a body the prelude writes: the walk over the positions of the list's items, one
+// call back on `p + 1` from 0 below the list's length while `p` is below what its trie holds, then
+// the walk over the tail, one call back on `i + 1` from 0 below the tail's length; each pass calls
+// the function it is handed once, with the item it reads or the accumulator, and hands the call
+// back the accumulator grown by what that call answered. That `ListNode::leaf_at` of the leaf the
+// walk carries reads the item at `p`, and `ListNode::tail_at` the tail's item `i`, is the natives'
+// to keep.
+
+fn var_name(e: Expr) -> Option<Bytes> =
+  match plain(e) {
+    EVar(v) -> match v.name.module { None -> Some(v.name.name.name), Some(_) -> None },
+    _ -> None,
+  }
+
+fn is_var(e: Expr, name: Bytes) -> Bool = var_name(e) == Some(name)
+
+/// `e` without the braces of a block that holds nothing else.
+fn plain(e: Expr) -> Expr =
+  match e {
+    EBlock(b) -> match b.tail {
+      Some(t) -> if b.stmts.len() == 0 { plain(t) } else { e },
+      None -> e,
+    },
+    _ -> e,
+  }
+
+fn index_of(params: List<Param>, name: Bytes) -> Option<Int> / {abort.raise} =
+  range(0, params.len()).fold(None, |found: Option<Int>, k: Int|
+    match found {
+      Some(_) -> found,
+      None -> if params.get(k).name.name == name { Some(k) } else { None },
+    })
+
+/// The arguments of a call of `name`, written `Type::f(..)`.
+fn called(e: Expr, name: Bytes) -> Option<List<Expr>> =
+  match plain(e) {
+    EApp(a) -> match a.func {
+      EVar(v) -> if Bytes::concat_all([
+            match v.name.module { Some(m) -> m.name.concat(b"::"), None -> b"" },
+            v.name.name.name,
+          ])
+          == name { Some(a.args) }
+      else { None },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+/// What `List::push(onto, x)` pushes onto what, written either way.
+fn pushed(e: Expr) -> Option<{ onto: Expr, x: Expr }> =
+  match called(e, b"List::push") {
+    Some([onto, x]) -> Some({ onto: onto, x: x }),
+    _ -> match plain(e) {
+      EApp(a) -> match ((a.func, a.args)) {
+        (EField(f), [x]) -> if f.field.name == b"push" { Some({ onto: f.base, x: x }) }
+        else { None },
+        _ -> None,
+      },
+      EPerform(p) -> match p.args {
+        [x] -> if p.op.name == b"push" && p.resource == None {
+          Some({ onto: EVar({ span: p.span, name: p.eff }), x: x })
+        } else { None },
+        _ -> None,
+      },
+      _ -> None,
+    },
+  }
+
+/// A list nothing is in yet.
+fn empty_list(e: Expr) -> Bool =
+  match plain(e) { EList(l) -> l.items.len() == 0, _ -> called(e, b"List::with_capacity") != None }
+
+fn is_int(e: Expr, n: Int) -> Bool = match plain(e) { ELit(l) -> l.lit == LInt(n), _ -> false }
+
+/// `a op b`.
+fn binary(e: Expr, op: Bytes) -> Option<{ lhs: Expr, rhs: Expr }> =
+  match plain(e) {
+    EBinary(b) -> if b.op == op { Some({ lhs: b.lhs, rhs: b.rhs }) } else { None },
+    _ -> None,
+  }
+
+/// `name + 1`.
+fn next_of(e: Expr, name: Bytes) -> Bool =
+  match binary(e, b"add") { Some(b) -> is_var(b.lhs, name) && is_int(b.rhs, 1), None -> false }
+
+/// `name >= bound`, the bound.
+fn at_least(e: Expr, name: Bytes) -> Option<Expr> =
+  match binary(e, b"ge") {
+    Some(b) -> if is_var(b.lhs, name) { Some(b.rhs) } else { None },
+    None -> None,
+  }
+
+/// A call of `name` on these variables.
+fn calls_on(e: Expr, name: Bytes, vars: List<Bytes>) -> Bool =
+  match called(e, name) {
+    Some(args) -> args.map(var_name) == vars.map(|v: Bytes| Some(v)),
+    None -> false,
+  }
+
+type Uses = { calls: List<List<Expr>>, reads: Int }
+
+/// The calls of `name` in `e`, and how many times it is read otherwise; any form this reading does
+/// not take reads it.
+fn uses(e: Expr, name: Bytes) -> Uses =
+  match plain(e) {
+    EVar(_) -> { calls: [], reads: if is_var(e, name) { 1 } else { 0 } },
+    ELit(_) -> { calls: [], reads: 0 },
+    EApp(a) ->
+      a.args.fold(
+        if is_var(a.func, name) { { calls: [a.args], reads: 0 } } else { uses(a.func, name) },
+        |acc: Uses, x: Expr| both(acc, uses(x, name)),
+      ),
+    EField(f) -> uses(f.base, name),
+    EPerform(p) ->
+      p.args.fold(
+        { calls: [], reads: if p.eff.module == None && p.eff.name.name == name { 1 } else { 0 } },
+        |acc: Uses, x: Expr| both(acc, uses(x, name)),
+      ),
+    EBinary(b) -> both(uses(b.lhs, name), uses(b.rhs, name)),
+    EIf(i) -> both(uses(i.cond, name), both(uses(i.then_branch, name), uses(i.else_branch, name))),
+    _ -> { calls: [], reads: 1 },
+  }
+
+fn both(a: Uses, b: Uses) -> Uses = { calls: a.calls.concat(b.calls), reads: a.reads + b.reads }
+
+/// What a walk does on each call: what each parameter of the function it calls is handed, the
+/// accumulator as `Threaded(0)`, and what the walk answers.
+type Pass = { params: List<Handed>, answer: Answer }
+
+/// The pass whose call back is `r.back`, a call of `walk` handed back the function at `f` in its own
+/// place and the accumulator at `acc` grown; the item is what `read` tells, or `r.bound`.
+fn pass(
+  walk: FnDef,
+  f: Int,
+  acc: Int,
+  r: Reading,
+  read: (Expr) -> Bool,
+) -> Option<Pass> / {abort.raise} = {
+  let ps = walk.params;
+  let fname = ps.get(f).name.name;
+  let acc_name = ps.get(acc).name.name;
+  let item = |x: Expr| read(x) || (r.bound != None && var_name(x) == r.bound);
+  match plain(r.back) {
+    EApp(b) -> if !is_var(b.func, walk.name.name) || b.args.len() != ps.len()
+        || !is_var(b.args.get(f), fname) { None } else {
+      let seen = range(0, ps.len()).fold({ calls: [], reads: 0 }, |u: Uses, k: Int|
+        if k == f { u } else { both(u, uses(b.args.get(k), fname)) });
+      match ((seen.calls, seen.reads)) {
+        ([args], 0) -> {
+          let call = |e: Expr|
+            match plain(e) { EApp(c) -> is_var(c.func, fname) && c.args == args, _ -> false };
+          let params = args.map(|x: Expr|
+            if item(x) { Element } else if is_var(x, acc_name) { Threaded(0) } else { Unsaid });
+          let next = b.args.get(acc);
+          let answer = match pushed(next) {
+            Some(p) -> if is_var(p.onto, acc_name) && call(p.x) { Some(Mapped) } else { None },
+            None -> match plain(next) {
+              EIf(c) -> match pushed(c.then_branch) {
+                Some(p) -> if call(c.cond) && is_var(p.onto, acc_name) && item(p.x)
+                    && is_var(c.else_branch, acc_name) { Some(Kept) }
+                else { None },
+                None -> None,
+              },
+              other -> if call(other) { Some(Folded) } else { None },
+            },
+          };
+          match answer {
+            None -> None,
+            Some(a) -> if params.contains(Unsaid) || a == Folded != params.contains(Threaded(0)) {
+              None
+            } else { Some({ params: params, answer: a }) },
+          }
+        },
+        _ -> None,
+      }
+    },
+    _ -> None,
+  }
+}
+
+/// A pass's call back, and the variable a `let` before it binds the item to.
+type Reading = { back: Expr, bound: Option<Bytes> }
+
+/// `{ let x = item; back }` or `back`, where `read` tells the item.
+fn reading(body: Expr, read: (Expr) -> Bool) -> Reading =
+  match plain(body) {
+    EBlock(b) -> match ((b.stmts, b.tail)) {
+      ([SLet(l)], Some(t)) -> match l.pat {
+        PVar(v) -> if read(l.value) { { back: t, bound: Some(v.name.name) } }
+        else { { back: body, bound: None } },
+        _ -> { back: body, bound: None },
+      },
+      _ -> { back: body, bound: None },
+    },
+    _ -> { back: body, bound: None },
+  }
+
+/// The pass of `tail`, the walk over the list's tail, handed the list, the position, the function
+/// and the accumulator, which answers the accumulator once the position reaches 32 or the tail's
+/// length and otherwise calls back on the next position.
+fn tail_pass(tail: FnDef) -> Option<Pass> / {abort.raise} =
+  match tail.params {
+    [xs, i, _, acc] -> {
+      let xn = xs.name.name;
+      let iname = i.name.name;
+      match plain(tail.body) {
+        EIf(w) -> match binary(w.cond, b"or") {
+          Some(o) -> {
+            let bounded = match ((at_least(o.lhs, iname), at_least(o.rhs, iname))) {
+              (Some(l), Some(r)) -> is_int(l, 32) && calls_on(r, b"ListNode::tail_len", [xn]),
+              _ -> false,
+            };
+            if !bounded || !is_var(w.then_branch, acc.name.name) { None } else {
+              let read = |e: Expr| calls_on(e, b"ListNode::tail_at", [xn, iname]);
+              let r = reading(w.else_branch, read);
+              match plain(r.back) {
+                EApp(b) -> if b.args.len() == 4 && is_var(b.args.get(0), xn)
+                    && next_of(b.args.get(1), iname) { pass(tail, 2, 3, r, read) }
+                else { None },
+                _ -> None,
+              }
+            }
+          },
+          None -> None,
+        },
+        _ -> None,
+      }
+    },
+    _ -> None,
+  }
+
+/// The pass of `leaves`, the walk over the items the list's trie holds, handed the list, where the
+/// trie starts, how many items it holds, the position, the leaf, the function and the
+/// accumulator; the walk over the tail it hands off to makes the same pass.
+fn leaves_pass(fns: Map<Bytes, FnDef>, leaves: FnDef) -> Option<Pass> / {abort.raise} =
+  match leaves.params {
+    [xs, start, held, p, _, f, acc] -> {
+      let xn = xs.name.name;
+      let pn = p.name.name;
+      let an = acc.name.name;
+      match plain(leaves.body) {
+        EIf(outer) -> match ((at_least(outer.cond, pn), plain(outer.else_branch))) {
+          (Some(len), EIf(inner)) -> if !calls_on(len, b"List::len", [xn])
+              || !is_var(outer.then_branch, an) { None } else {
+            match ((at_least(inner.cond, pn), plain(inner.then_branch), plain(inner.else_branch))) {
+              (Some(h), EApp(handoff), EBlock(b)) -> match ((
+                  var_name(handoff.func),
+                  b.stmts.last(),
+                  b.tail,
+                )) {
+                (Some(t), Some(SLet(l)), Some(EMatch(m))) -> match ((l.pat, m.arms)) {
+                  (PVar(leaf), [some, none]) -> if !is_var(h, held.name.name)
+                      || handoff.args.len() != 4
+                      || !is_var(handoff.args.get(0), xn)
+                      || !is_zero(handoff.args.get(1))
+                      || !is_var(handoff.args.get(2), f.name.name)
+                      || !is_var(handoff.args.get(3), an)
+                      || !is_var(m.scrutinee, leaf.name.name)
+                      || !none_arm(none, an) { None } else {
+                    match ((some_arm(some), fns.get(t))) {
+                      (Some(s), Some(tail)) -> {
+                        let read = |e: Expr|
+                          match called(e, b"ListNode::leaf_at") {
+                            Some([node, _]) -> is_var(node, s.element),
+                            _ -> false,
+                          };
+                        let r = reading(s.body, read);
+                        let unchanged = match plain(r.back) {
+                          EApp(back) ->
+                            back.args.len() == 7 && is_var(back.args.get(0), xn)
+                              && is_var(back.args.get(1), start.name.name)
+                              && is_var(back.args.get(2), held.name.name)
+                              && next_of(back.args.get(3), pn)
+                              && is_var(back.args.get(4), leaf.name.name),
+                          _ -> false,
+                        };
+                        match ((unchanged, pass(leaves, 5, 6, r, read), tail_pass(tail))) {
+                          (true, Some(a), Some(b)) -> if a == b { Some(a) } else { None },
+                          _ -> None,
+                        }
+                      },
+                      _ -> None,
+                    }
+                  },
+                  _ -> None,
+                },
+                _ -> None,
+              },
+              _ -> None,
+            }
+          },
+          _ -> None,
+        },
+        _ -> None,
+      }
+    },
+    _ -> None,
+  }
+
+fn is_zero(e: Expr) -> Bool = is_int(e, 0)
+
+/// `Some(m) -> body`: the name and the body.
+fn some_arm(a: MatchArm) -> Option<{ element: Bytes, body: Expr }> =
+  match ((a.guard, a.pat)) {
+    (None, PCtor(c)) -> match c.args {
+      [PVar(v)] -> if c.name.name.name == b"Some" { Some({ element: v.name.name, body: a.body }) }
+      else { None },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+/// `None -> acc`.
+fn none_arm(a: MatchArm, acc: Bytes) -> Bool =
+  match ((a.guard, a.pat)) {
+    (None, PCtor(c)) -> c.name.name.name == b"None" && c.args.len() == 0 && is_var(a.body, acc),
+    _ -> false,
+  }
+
+/// The entry a body the prelude writes earns, where it enters its walk with the list, where its
+/// trie starts, how many items the trie holds, position 0, no leaf, the function, and an empty
+/// list or the seed.
+fn derived(fns: Map<Bytes, FnDef>, def: FnDef) -> Option<Iterates> / {abort.raise} =
+  match plain(def.body) {
+    EApp(a) -> match ((var_name(a.func), a.args)) {
+      (Some(w), [xs, start, held, p, n, f, init]) -> match ((
+          fns.get(w),
+          var_name(xs),
+          var_name(f),
+        )) {
+        (Some(walk), Some(xn), Some(fname)) -> {
+          let entered = calls_on(start, b"ListNode::start", [xn]) && is_zero(p)
+            && is_var(n, b"None")
+            && (match binary(held, b"sub") {
+              Some(h) ->
+                calls_on(h.lhs, b"List::len", [xn]) && calls_on(h.rhs, b"ListNode::tail_len", [xn]),
+              None -> false,
+            });
+          match ((
+              entered,
+              leaves_pass(fns, walk),
+              index_of(def.params, xn),
+              index_of(def.params, fname),
+            )) {
+            (true, Some(walked), Some(over), Some(callback)) -> if walked.answer == Folded {
+              match var_name(init) {
+                Some(seed) -> match index_of(def.params, seed) {
+                  Some(k) ->
+                    Some({
+                      callback: callback,
+                      over: [over],
+                      params: walked.params.map(|h: Handed|
+                        match h { Threaded(_) -> Threaded(k), x -> x }),
+                      answer: Folded,
+                    }),
+                  None -> None,
+                },
+                None -> None,
+              }
+            } else if empty_list(init) {
+              Some({
+                callback: callback,
+                over: [over],
+                params: walked.params,
+                answer: walked.answer,
+              })
+            } else { None },
+            _ -> None,
+          }
+        },
+        _ -> None,
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+test "each entry for a function the prelude writes in Ply is what its body does" {
+  let fns = fns_of(prelude_items());
+  let written = entries().filter(|e: Entry|
+    match declared(bare(e.name)) { Some(d) -> d.written != None, None -> false });
+  assert(written.len() > 0);
+  written.fold((), |u: Unit, e: Entry|
+    match fns.get(bare(e.name)) {
+      Some(d) -> assert_eq(derived(fns, d), Some(e.iterates)),
+      None -> panic("a function the prelude writes"),
+    })
+}
+
+/// The parts of a map written as the prelude's walk: what it does at the end of the trie, its
+/// position's step, its call, the position it enters at, and its tail's step.
+type MapWalk = { handoff: Bytes, step: Bytes, call: Bytes, start: Bytes, tail_step: Bytes }
+
+fn as_written() -> MapWalk =
+  {
+    handoff: b"tail_mapped(xs, 0, f, out)",
+    step: b"p + 1",
+    call: b"f(ListNode::leaf_at(m, q & 31))",
+    start: b"0",
+    tail_step: b"i + 1",
+  }
+
+fn mapped_by(w: MapWalk) -> Option<Iterates> / {abort.raise} = {
+  let fns = fns_of(
+    parse(
+      Bytes::concat_all([
+        b"fn leaves_mapped<a, b | e>(xs: List<a>, start: Int, held: Int, p: Int, n: Option<ListNode<a>>, f: (a) -> b / e, out: List<b>) -> List<b> / e =\n",
+        b"  if p >= List::len(xs) { out } else if p >= held { ",
+        w.handoff,
+        b" } else { let q = start + p; let leaf = ListNode::leaf_of(xs, q >> 5); match leaf { Some(m) -> leaves_mapped(xs, start, held, ",
+        w.step,
+        b", leaf, f, List::push(out, ",
+        w.call,
+        b")), None -> out } }\n",
+        b"fn tail_mapped<a, b | e>(xs: List<a>, i: Int, f: (a) -> b / e, out: List<b>) -> List<b> / e =\n",
+        b"  if i >= 32 || i >= ListNode::tail_len(xs) { out } else { tail_mapped(xs, ",
+        w.tail_step,
+        b", f, List::push(out, f(ListNode::tail_at(xs, i)))) }\n",
+        b"pub fn List::map<a, b | e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e =\n",
+        b"  leaves_mapped(xs, ListNode::start(xs), List::len(xs) - ListNode::tail_len(xs), ",
+        w.start,
+        b", None, f, List::with_capacity(List::len(xs)))\n",
+      ]),
+    ).node.items,
+  );
+  match fns.get(b"List::map") { Some(d) -> derived(fns, d), None -> None }
+}
+
+test "a walk that skips the tail or an item, calls twice, reads no item, or starts past the first earns no entry" {
+  assert_eq(mapped_by(as_written()), iterates(b"std.prelude.List::map"));
+  [
+    { ..as_written(), handoff: b"out" },
+    { ..as_written(), step: b"p + 2" },
+    { ..as_written(), tail_step: b"i + 2" },
+    { ..as_written(), call: b"f(f(ListNode::leaf_at(m, q & 31)))" },
+    { ..as_written(), call: b"f(ListNode::leaf_at(n, q & 31))" },
+    { ..as_written(), start: b"1" },
+  ].fold((), |u: Unit, w: MapWalk| assert_eq(mapped_by(w), None))
+}

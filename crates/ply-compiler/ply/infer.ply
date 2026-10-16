@@ -65,6 +65,7 @@ import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_bloc
                 with_member_calls)
 import embed (rewritten)
 import layout (Intrinsic, intrinsic_named, intrinsics)
+import semantics (Element, prelude_iterates)
 import std.prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
                NullInsideOption, HoldsSecret, HoldsNative, ConstructorShape, Leaf, Structural,
@@ -1560,7 +1561,17 @@ pub fn builtins() -> List<Builtin> / {abort.raise} = {
           acc.push(declared(def.name.name, imported, def))
         } else { acc },
         IFn(d) -> if !is_pub(d.vis) { acc } else {
-          acc.push({ ..declared(d.name.name, imported, signed_extern(source, d)), body: true })
+          let whole = signed_extern(source, d);
+          // A `cost` or `space` bound is its body's, which the prover reads off the definition.
+          let called = {
+            ..whole,
+            spec: whole.spec.filter(|c: SpecClause| c.kind == SRequires || c.kind == SEnsures),
+          };
+          acc.push({
+            ..declared(d.name.name, imported, called),
+            clauses: whole.spec.map(|c: SpecClause| written_at(whole, c.span)),
+            body: true,
+          })
         },
         _ -> acc,
       })
@@ -3606,29 +3617,29 @@ fn known_as(before: Checker, bound: Checker, pat: Pattern, value: Expr) -> Check
     _ -> bound,
   }
 
-/// The lambda `List::map`, `List::filter` or `List::fold` calls with each element of a `range` it is handed, by its
-/// place among the arguments, and the range's bounds.
+/// The lambda a builtin calls with each element of a `range` it is handed as its last parameter, by
+/// its place among the arguments, and the range's bounds.
 type Ranged = { at: Int, lo: Expr, hi: Expr }
 
 fn ranged_lambda(
   checker: Checker,
   builtin: Bytes,
   args: List<Expr>,
-) -> Option<Ranged> / {abort.raise} = {
-  let place = if builtin == b"List::map" || builtin == b"List::filter" { 1 }
-  else if builtin == b"List::fold" { 2 }
-  else { 0 - 1 };
-  if place < 0 { None } else {
-    match args.at(0) {
-      Some(EApp(r)) -> match r.args {
-        [lo, hi] -> if prelude_named(checker, r.func) != b"range" { None }
-        else { Some({ at: place, lo: lo, hi: hi }) },
+) -> Option<Ranged> / {abort.raise} =
+  match prelude_iterates(builtin) {
+    None -> None,
+    Some(it) -> match ((it.over, it.params.last())) {
+      ([k], Some(Element)) -> match args.at(k) {
+        Some(EApp(r)) -> match r.args {
+          [lo, hi] -> if prelude_named(checker, r.func) != b"range" { None }
+          else { Some({ at: it.callback, lo: lo, hi: hi }) },
+          _ -> None,
+        },
         _ -> None,
       },
       _ -> None,
-    }
+    },
   }
-}
 
 fn note_raise(checker: Checker, span: Span, why: RaiseWhy) -> Checker =
   { ..checker, raise_notes: checker.raise_notes.push({ span: span, why: why }) }
@@ -4429,11 +4440,13 @@ fn callee_repeats(
 ) -> { params: List<Int>, waits: Option<Bytes> } / {abort.raise} = {
   let builtin = prelude_named(checker, func);
   if builtin != b"" {
-    let r = builtin_repeats(builtin);
     {
-      params: match args.at(r.over) {
-        Some(x) -> if fixed_size(checker, x) { [] } else { r.params },
-        None -> r.params,
+      params: match prelude_iterates(builtin) {
+        None -> [],
+        Some(it) -> if it.over.len() == 0 { [] }
+        else if it.over.fold(true, |all: Bool, k: Int|
+            all && (match args.at(k) { Some(x) -> fixed_size(checker, x), None -> false })) { [] }
+        else { [it.callback] },
       },
       waits: None,
     }
@@ -4468,14 +4481,6 @@ fn fn_holding(
       }
     },
   }
-
-/// The parameters a builtin calls once per element of its argument at `over`.
-fn builtin_repeats(name: Bytes) -> { params: List<Int>, over: Int } =
-  if name == b"List::map" || name == b"List::filter" { { params: [1], over: 0 } }
-  else if name == b"List::fold" || name == b"Map::fold" || name == b"Bytes::position" {
-    { params: [2], over: 0 }
-  } else if name == b"iterate" { { params: [2], over: 1 } }
-  else { { params: [], over: 0 } }
 
 /// A literal, a list literal, or a `range` between two literals: a size the text fixes.
 fn fixed_size(checker: Checker, e: Expr) -> Bool / {abort.raise} =
@@ -20315,7 +20320,20 @@ test "an integer terminates descending toward a bound a guard holds it above" {
   )
 }
 
-test "a group terminates when every loop through it descends, through a builtin's callback too" {
+test "a recursion through `map`, `filter` and `fold` ends by the elements their entries hand on" {
+  let rose = b"type Rose = | Rose(Int, List<Rose>)\nfn size(t: Rose) -> Int = match t { Rose(_, kids) -> 1 + kids.map(|k: Rose| size(k)).fold(0, |a: Int, n: Int| a + n) }\nfn deep(t: Rose) -> Int = match t { Rose(v, kids) -> kids.filter(|k: Rose| true).fold(v, |a: Int, k: Rose| a + deep(k)) }\n";
+  assert(!diverges(rose, b"size"));
+  assert(!diverges(rose, b"deep"));
+  // What the lambda is handed besides an element is no part of the tree.
+  assert(
+    diverges(
+      b"type Rose = | Rose(Int, List<Rose>)\nfn again(t: Rose) -> Int = match t { Rose(_, kids) -> kids.fold(0, |a: Int, k: Rose| a + again(t)) }\n",
+      b"again",
+    ),
+  )
+}
+
+test "a group terminates when every loop through it descends, through a callback too" {
   let src = b"type T = | Node(Int, List<T>)\nfn size(t: T) -> Int = match t { Node(v, kids) -> v + total(sizes(kids)) }\nfn sizes(ts: List<T>) -> List<Int> = ts.map(size)\nfn total(xs: List<Int>) -> Int = xs.fold(0, |a: Int, x: Int| a + x)\nfn deep(t: T) -> Int = match t { Node(v, kids) -> kids.fold(v, |a: Int, k: T| a + deep(k)) }\n";
   assert(!diverges(src, b"size"));
   assert(!diverges(src, b"sizes"));

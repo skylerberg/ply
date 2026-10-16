@@ -2792,17 +2792,27 @@ steps grow with what it is given leaves the call unread.
 A `cost` bound is an obligation, `<owner> cost #<n>`, that `ply prove` reads
 off the body and never runs. A native is at most a step; `List::at`, `List::push` and
 `List::set`, which `std.prelude` writes in Ply (§12), at most a constant number, since a list's
-trie is no deeper than an `Int` has bits for; and `List::map`, `List::filter` and `List::fold`
-that per element. Those three,
-`Map::fold`, `iterate`, `Map::update`, `Bytes::position`
-and `metered` call a literal lambda or a named definition back as many times as
-an argument's size allows; a call of a definition costs its steps at the sizes
-of its arguments, and of one whose body another package keeps, its first `cost`
-bound read from above; a raise ends the call. A recursion is read when every
-call back takes a part of one list parameter that a list pattern took a head
-off, no path calls back twice, and every other parameter its steps grow with is
-handed on unchanged or as a part of itself: it takes that list's length in
-calls. The bound is read from below: the lengths of parameters (`List::len`,
+trie is no deeper than an `Int` has bits for. `Map::fold`, `iterate`, `Map::update`,
+`Bytes::position` and `metered` call a literal lambda or a named definition back as many times
+as an argument's size allows; a call of a definition costs its steps at the sizes of its
+arguments, and of one whose body another package keeps, its first `cost` bound read from above.
+So `List::map`, `List::filter` and `List::fold`, which `std.prelude` writes in Ply, cost what
+each states, `cost xs.len() * k`: a step per element beside each call of the function they are
+handed; and what `map` and `filter` answer is no longer than the list. A raise ends the call.
+A recursion is read when every call back takes a part of one list parameter that a list
+pattern took a head off, or hands on an `Int` parameter moved by a positive literal toward a limit
+the way to the call holds it short of, and the parameter that limit is of
+unchanged: a literal, from below or above, the length of a parameter, from
+below (`if i >= xs.len() { 0 } else { walk(xs, i + 1) }`, read through `!`, a
+`&&` that held and an `||` that did not), or the length of a list where
+`List::at` found an element at it (`match xs.at(i) { Some(x) -> walk(xs, i + 1),
+None -> 0 }`). No path calls back twice, and every other parameter its steps
+grow with is handed on unchanged or as a part of itself. It takes that list's
+length in calls, or as many as lie between the index and its limit, which grow
+with the `Int` itself unless `List::at` found an element at it, since it may
+start below zero; an `Int` literal's size is its magnitude, so a call starting
+at `0` grows with the limit alone. The
+bound is read from below: the lengths of parameters (`List::len`,
 `Map::len`, `String::len`, `Bytes::len`, `Array::len`, `Columns::len`), cost names,
 positive literals, `+`, `*`,
 and `ilog2` alone or beside sizes of the one length it is of. Steps within the
@@ -2845,7 +2855,11 @@ off the body with the reading of calls and recursion a `cost` bound has, except
 that a recursion whose paths that call back make nothing and call back last
 holds what its last call does, whatever it descends on. A call of a definition
 whose body another package keeps holds its first `space` bound, and only where
-each argument it is handed that is not a number is held alone. A clause on a
+each argument it is handed that is not a number is held alone; `List::map`,
+`List::filter` and `List::fold`, which state none, hold what the function they
+are handed holds once for each element, as `Map::fold`, `iterate`,
+`Map::update`, `Bytes::position` and `metered` do for each call they make, and
+`map` and `filter` a list as long as the one they walk. A clause on a
 definition that performs more than a raise is `E0463`. Anything else leaves the
 bound `unproved` (`E0474`), stopped at `unbounded` with why.
 
