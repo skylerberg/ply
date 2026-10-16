@@ -661,12 +661,16 @@ fn fixtures() -> List<{ name: String, bytes: Bytes }> = embed_dir("fixtures")
 a directory by its path below it (`a/b.txt`), in that order; nothing under a
 name starting with `.` is read. The path is a string literal (`E0147`), read
 relative to the module's own file when the program is loaded, and the call is
-written out as what was read before anything hashes or checks the module. The
-bytes are therefore part of the definition's hash: a test reading an embedded
-file reruns exactly when the file changes, and is cached while it does not. A
-path that does not exist, a directory handed to `embed`, a file handed to
-`embed_dir`, or a file that cannot be read is `E0146`, which refuses the load. A
-module that declares or imports its own `embed` or `embed_dir` calls that one.
+written out as the digest and size of what was read before anything hashes or
+checks the module. The bytes are therefore part of the definition's hash: a test
+reading an embedded file reruns exactly when the file changes, and is cached
+while it does not. Where the file is is no part of it, and nor is a byte string
+literal of the same bytes. What a check keeps holds the digest alone; a load reads
+each file again to emit the program. A path that does not exist, a directory
+handed to `embed`, a file handed to `embed_dir`, a file that cannot be read, or
+one that reads otherwise when the program is emitted than when it was checked is
+`E0146`, which refuses the load. A module that declares or imports its own
+`embed` or `embed_dir` calls that one.
 
 ### 3.5 Constants a build keeps
 
@@ -3492,12 +3496,15 @@ beside the phases of this run, all of it read.
 
 Where a load ran, the `--json` documents of `ply check`, `ply test` and
 `ply prove` also say under `front_end` what the memo store gave it: `queries`,
-each query the load asked with the answers it took as kept (`taken`) and the
-bodies it ran (`run`); `vouched`, whether the store held, when the load opened
-it, a record it vouches for to this `ply`; and `lost`, how many answers the load
-made again because a record that stood named one no store held, which is none
-over a store that is whole. A load that refused says the same: refusing can
-cost as much as checking.
+each query the load asked with the answers it took as kept (`taken`), the
+bodies it ran (`run`), and of those the answers it made again because a record
+that stood named one no store held (`lost`), counting the run that settled the
+store to see whether an earlier answer stood; `vouched`, whether the store held,
+when the load opened it, a record it vouches for to this `ply`; and `lost`, those
+answers over every query, which is none over a store that is whole. Some queries
+keep only their answers' digests: a load that needs one of their answers runs
+its body again, which counts as run and not as lost. A load that refused says
+the same: refusing can cost as much as checking.
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
@@ -3649,7 +3656,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0143` | a registry dependency no published version satisfies |
 | `E0144` | a publish or a yank the registry refused |
 | `E0145` | a package or a version no registry takes |
-| `E0146` | an embed whose file or directory could not be read |
+| `E0146` | an embed whose file or directory could not be read, or no longer reads as its check read it |
 | `E0147` | an embed whose path is not a string literal |
 | `E0148` | a `returns` clause the body does not keep |
 | `E0149` | a dependency's published interface that does not re-derive from its source |

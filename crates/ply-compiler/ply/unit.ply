@@ -4,13 +4,13 @@
 
 import hash (hex)
 import types (Type, TyVar, type_text, type_spelled, digits)
-import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBytes, ConstFixed,
-             ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, Defined, Head, Expect,
-             word_head, no_generics, builtin_helper, answer_bin, tables_bin, emit_roots_answer,
-             symbol_of, entry_of, no_tables, without, literal_bits, specialisation_of,
-             own_definition, ctor_layouts, spelled_field, GenericCall, Generics, Need, FnArg,
-             specialised, specialised_with, Pass, root_id, laid_vars, has_vars, held_apart,
-             ctor_sums, derived_of, Reads, Scalar, Layout, Exact, type_vars, erased)
+import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBytes, ConstEmbedded,
+             ConstFixed, ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, Defined, Head,
+             Expect, word_head, no_generics, builtin_helper, answer_bin, tables_bin,
+             emit_roots_answer, symbol_of, entry_of, no_tables, without, literal_bits,
+             specialisation_of, own_definition, ctor_layouts, spelled_field, GenericCall, Generics,
+             Need, FnArg, specialised, specialised_with, Pass, root_id, laid_vars, has_vars,
+             held_apart, ctor_sums, derived_of, Reads, Scalar, Layout, Exact, type_vars, erased)
 import front (Dump, EmitterRoot, EmitterCtor, CtorRow, KeyRow, Linked, ModuleRow, OrdinalRow,
               analyse, analyse_pulling_std_with, no_rows, dump_of, module_of_root)
 import typing (unknown_type)
@@ -20,7 +20,7 @@ import rewrite (Elaborated, elaborated_natives)
 import layout (Intrinsic, Layouts, intrinsics, layouts)
 import std.prelude_source
 import interface (read_key, sized, stubbed)
-import embed (EmbedAt)
+import embed (EmbedAt, embed_file)
 import resolve (PackageDeps, Diag, Label, error_with_labels)
 import std.bin
 import std.list
@@ -574,12 +574,19 @@ fn decimal_line(literal: Bytes) -> Bytes / {abort.raise} =
   }
 
 /// One pooled constant's line: its identity, which the pool sorts and deduplicates by, and what the
-/// runtime reads it back from.
-pub fn const_line(c: Const) -> Bytes / {abort.raise} =
+/// runtime reads it back from. An embedded file's line is its bytes, out of `inputs` by digest.
+pub fn const_line(c: Const, inputs: Map<Bytes, Bytes>) -> Bytes / {abort.raise} =
   match c {
     ConstUnit -> b"u",
     ConstStr(s) -> b"s ".concat(hex(s)),
     ConstBytes(b) -> b"b ".concat(hex(b)),
+    ConstEmbedded(digest) -> match inputs.get(digest) {
+      Some(b) -> b"b ".concat(hex(b)),
+      None ->
+        panic(
+          "a unit holds an embedded file it was not handed the bytes of, which its driver reads for every embed it emits",
+        ),
+    },
     ConstFixed(f) -> fixed_line(f.width, wide_of(f.bits)),
     ConstWide(x) -> fixed_line(x.width, word_of(x.high) << 64 | word_of(x.low)),
     ConstChar(v) -> b"c ".concat(ascii_of_int(v)),
@@ -1081,13 +1088,15 @@ fn assembled(
 
 /// The unit over `offered`, from each root's answer: closed under calls, its tables sorted by
 /// content, its bodies resolved against them and bucketed, and what it holds embedded in its C.
-/// `modules` is how many modules the program it was emitted from has.
+/// `modules` is how many modules the program it was emitted from has, and `inputs` the bytes of
+/// each file it embeds, by digest.
 pub fn produce(
   runtime: Runtime,
   ctors: List<Ctor>,
   offered: List<Offered>,
   modules: Int,
   answers: Map<Bytes, Answer>,
+  inputs: Map<Bytes, Bytes>,
   stated: List<Stated> = [],
 ) -> Produced / {abort.raise} = {
   let arity = offered.fold(Map::new(), |acc: Map<Bytes, Offered>, o: Offered|
@@ -1100,7 +1109,7 @@ pub fn produce(
     };
   let constants = s.taken.filter(|n: Bytes|
     match arity.get(n) { Some(o) -> o.constant, None -> false });
-  let lines = s.bodies.map(|k: UnitBody| k.tables.consts.map(const_line));
+  let lines = s.bodies.map(|k: UnitBody| k.tables.consts.map(|c: Const| const_line(c, inputs)));
   let pools = pools_of(s.bodies, lines, constants.map(|n: Bytes| published(n).entry));
   let placed = placed_of(pools);
   let tags = positions(ctors.map(|c: Ctor| c.name));
@@ -1789,7 +1798,8 @@ fn stored_body(root: Bytes, of: Bytes) -> Answer / {abort.raise} = {
 
 /// The unit over `every` root offered: each one's answer taken from what an earlier run kept where it
 /// stands, the emitter entered once for the rest, what it answered kept for the next run, and the
-/// unit produced over all of it. `emitter` is what the emitter's answers are a function of on its
+/// unit produced over all of it. `inputs` holds the bytes of each file `dump` says the program
+/// embeds, by digest. `emitter` is what the emitter's answers are a function of on its
 /// side, which every kept answer is filed under. `Err` says why the emitter answered nothing at all.
 /// A root `baked` names is held as that value in place of its body, and a `stored_root` offered is
 /// made here: the emitter is asked for neither.
@@ -1797,6 +1807,7 @@ pub fn emitted<| e>(
   runtime: Runtime,
   dump: Dump,
   sources: List<Bytes>,
+  inputs: Map<Bytes, Bytes>,
   every: List<Bytes>,
   emitter: Bytes,
   read: (Bytes) -> Option<Bytes> / e,
@@ -1849,6 +1860,7 @@ pub fn emitted<| e>(
           p.modules.len(),
           every.fold(held, |acc: Map<Bytes, Answer>, n: Bytes|
             match stored_of(n) { Some(of) -> acc.insert(n, stored_body(n, of)), None -> acc }),
+          inputs,
           dump.emitter_ctors.fold([], |acc: List<Stated>, c: EmitterCtor|
             if c.key == None && c.show == None && c.numeric.len() == 0 { acc }
             else { acc.push({ ctor: c.name, key: c.key, show: c.show, numeric: c.numeric }) }),
@@ -2299,12 +2311,13 @@ pub fn compiled<| e>(
   runtime: Runtime,
   dump: Dump,
   sources: List<Bytes>,
+  inputs: Map<Bytes, Bytes>,
   offered: List<Bytes>,
   emitter: Bytes,
   read: (Bytes) -> Option<Bytes> / e,
   write: (Bytes, Bytes) -> Unit / e,
 ) -> Result<Bytes, List<Diag>> / {abort.raise | e} =
-  held(dump, offered, emitted(runtime, dump, sources, offered, emitter, read, write))
+  held(dump, offered, emitted(runtime, dump, sources, inputs, offered, emitter, read, write))
 
 // --- Tests ------------------------------------------------------------------
 
@@ -2446,35 +2459,44 @@ test "a program's key moves with the definition it enters, the runtime and the b
   assert(program_key(b"entry", a_runtime(b"rt"), a_builder(b"c4")) != key)
 }
 
+/// `c`'s line in a unit that embeds nothing.
+fn line(c: Const) -> Bytes / {abort.raise} = const_line(c, Map::new())
+
 test "a pooled constant's line is the one the runtime reads it back from" {
-  assert_eq(const_line(ConstUnit), b"u");
-  assert_eq(const_line(ConstStr(b"hi")), b"s 6869");
-  assert_eq(const_line(ConstBytes(b"\x00\xff")), b"b 00ff");
-  assert_eq(const_line(ConstChar(65)), b"c 65");
-  assert_eq(const_line(ConstFixed({ width: 0, bits: 255 })), b"f 0 255");
-  assert_eq(const_line(ConstFixed({ width: 4, bits: 127 })), b"f 4 127")
+  assert_eq(line(ConstUnit), b"u");
+  assert_eq(line(ConstStr(b"hi")), b"s 6869");
+  assert_eq(line(ConstBytes(b"\x00\xff")), b"b 00ff");
+  assert_eq(line(ConstChar(65)), b"c 65");
+  assert_eq(line(ConstFixed({ width: 0, bits: 255 })), b"f 0 255");
+  assert_eq(line(ConstFixed({ width: 4, bits: 127 })), b"f 4 127");
+  // An embedded file's line is its bytes, as a byte string's is.
+  let digest = b"\x00\xff".blake3();
+  assert_eq(
+    const_line(ConstEmbedded(digest), Map::new().insert(digest, b"\x00\xff")),
+    line(ConstBytes(b"\x00\xff")),
+  )
 }
 
 test "a fixed-width constant is held truncated to its width, a signed one sign-extended" {
   assert_eq(
-    const_line(ConstFixed({ width: 4, bits: 0 - 1 })),
+    line(ConstFixed({ width: 4, bits: 0 - 1 })),
     b"f 4 340282366920938463463374607431768211455",
   );
-  assert_eq(const_line(ConstFixed({ width: 1, bits: 0 - 1 })), b"f 1 65535");
+  assert_eq(line(ConstFixed({ width: 1, bits: 0 - 1 })), b"f 1 65535");
   assert_eq(
-    const_line(ConstWide({ width: 8, high: 0 - 1, low: 0 - 1 })),
+    line(ConstWide({ width: 8, high: 0 - 1, low: 0 - 1 })),
     b"f 8 340282366920938463463374607431768211455",
   );
-  assert_eq(const_line(ConstWide({ width: 9, high: 0, low: 5 })), b"f 9 5");
-  assert_eq(const_line(ConstWide({ width: 8, high: 1, low: 0 })), b"f 8 18446744073709551616")
+  assert_eq(line(ConstWide({ width: 9, high: 0, low: 5 })), b"f 9 5");
+  assert_eq(line(ConstWide({ width: 8, high: 1, low: 0 })), b"f 8 18446744073709551616")
 }
 
 test "a float is its bits and a decimal its mantissa and scale, as the literal reads" {
-  assert_eq(const_line(ConstFloat(b"1.5")), b"x 3ff8000000000000");
-  assert_eq(const_line(ConstFloat(b"-2_000.0")), b"x c09f400000000000");
-  assert_eq(const_line(ConstDecimal(b"1.50m")), b"d 150 2");
-  assert_eq(const_line(ConstDecimal(b"-0.05m")), b"d -5 2");
-  assert_eq(const_line(ConstDecimal(b"12m")), b"d 12 0")
+  assert_eq(line(ConstFloat(b"1.5")), b"x 3ff8000000000000");
+  assert_eq(line(ConstFloat(b"-2_000.0")), b"x c09f400000000000");
+  assert_eq(line(ConstDecimal(b"1.50m")), b"d 150 2");
+  assert_eq(line(ConstDecimal(b"-0.05m")), b"d -5 2");
+  assert_eq(line(ConstDecimal(b"12m")), b"d 12 0")
 }
 
 test "a C string literal holds printable bytes as they are and the rest in octal" {
@@ -2548,6 +2570,7 @@ fn codes_over(
         { name: n, arity: 0, constant: constants.filter(|c: Bytes| c == n).len() > 0 }),
       1,
       Map::of_entries(answers),
+      Map::new(),
     ).made,
   )
 
@@ -2622,6 +2645,7 @@ test "a constructor's tag is its bucket's to read, at the position the unit's ow
       [{ name: b"m.f", arity: 0, constant: false }],
       1,
       Map::new().insert(b"m.f", answer),
+      Map::new(),
     ).text;
   let alone = unit([
     { name: b"None", arity: 0, args: [] },
@@ -2671,6 +2695,7 @@ test "a bucket's C reads the same whatever another bucket adds to the unit's tab
       names.map(|n: Bytes| { name: n, arity: 0, constant: false }),
       1,
       names.fold(Map::new(), |acc: Map<Bytes, Answer>, n: Bytes| acc.insert(n, one_body(n, []))),
+      Map::new(),
     ).text;
   let alone = unit([b"m.f"]);
   let beside = unit([b"m.f", other]);
@@ -2708,6 +2733,7 @@ test "a bucket holds the bodies its names decide and declares what they reach, a
       { key: callee, value: headed(one_body(callee, []), word_head(2)) },
       { key: apart, value: one_body(apart, []) },
     ]),
+    Map::new(),
   );
   let declares = |part: Bytes, name: Bytes, arity: Int|
     part.index_of(prototype(b"f_".concat(name), word_head(arity))) != None;
@@ -2746,6 +2772,7 @@ test "where the head defines `PLY_FAR` a bucket calls what another defines throu
       { key: caller, value: one_body(caller, [callee]) },
       { key: callee, value: headed(one_body(callee, []), word_head(2)) },
     ]),
+    Map::new(),
   );
   let calling = bucket_part(p.text, bucket_of(caller));
   let shown = Some(String::of_bytes_lossy(calling));
@@ -2831,6 +2858,7 @@ test "a call written to another head than the callee defines fails the unit" {
             value: headed(one_body(callee, []), { answer: b"double", params: [b"double"] }),
           },
         ]),
+        Map::new(),
       ).taken
     };
   assert_eq(made({ answer: b"double", params: [b"double"] }), Ok([callee, caller]));
@@ -2860,9 +2888,10 @@ test "a constant two bodies read is one entry of the pool" {
       { key: b"m.one", value: reading(b"m.one") },
       { key: b"m.two", value: reading(b"m.two") },
     ]),
+    Map::new(),
   );
   assert_eq(p.taken, [b"m.one", b"m.two"]);
-  assert_eq(p.text.split(const_line(ConstStr(b"shared-constant"))).len() - 1, 1)
+  assert_eq(p.text.split(line(ConstStr(b"shared-constant"))).len() - 1, 1)
 }
 
 /// A name in `name`'s bucket that is not `name`, for a test that wants two roots to share one.
@@ -2986,7 +3015,7 @@ test "a root's kept answer moves with what its module embeds, and with no other 
     program_of(
       {
         ..dump,
-        embeds: [{ module: b"c", key: b"file:data.txt", read: Ok([{ name: b"", bytes: bytes }]) }],
+        embeds: [{ module: b"c", key: b"file:data.txt", read: Ok([embed_file(b"", bytes)]) }],
       },
       three_modules(),
     );
@@ -3054,6 +3083,7 @@ test "a unit holds a `const` definition as the value a build kept, and makes its
         runtime,
         dump,
         [source],
+        Map::new(),
         every,
         b"",
         |_: Bytes| None,
@@ -3164,6 +3194,7 @@ fn held_over(
       { ..a_runtime(b"r"), natives: natives },
       dump,
       sources,
+      Map::new(),
       every,
       b"",
       |_: Bytes| None,
@@ -3266,6 +3297,7 @@ test "a root the emitter refuses is asked again, and nothing of the refusal is k
           runtime,
           dump,
           [source],
+          Map::new(),
           [b"m.f"],
           b"",
           |k: Bytes| body_store.get(k),
@@ -3291,6 +3323,7 @@ test "a unit asks the emitter for a root a kept body names, though the body's de
           runtime,
           dump_of(analyse(parse_all([{ name: b"m", src: source }]))),
           [source],
+          Map::new(),
           [b"m.each", b"m.total", b"m.scaled"],
           b"",
           |k: Bytes| body_store.get(k),
@@ -3407,6 +3440,7 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
     [{ name: b"m.g", arity: 0, constant: false }, { name: b"m.f", arity: 0, constant: true }],
     1,
     answers,
+    Map::new(),
   );
   assert_eq(p.taken, [b"m.f"]);
   assert_eq(p.dropped.map(|d: Dropped| d.function), [b"m.g"]);
@@ -3449,6 +3483,7 @@ test "a unit lays its definitions out by name in byte order, each name as a C li
     names.map(|n: Bytes| { name: n, arity: 2, constant: false }),
     1,
     names.fold(Map::new(), |acc: Map<Bytes, Answer>, n: Bytes| acc.insert(n, one_body(n, []))),
+    Map::new(),
   );
   assert(
     p.text.index_of(
@@ -3482,6 +3517,7 @@ test "a unit says which constructors are read through a function, and which func
       { key: b"m.area", value: one_body(b"m.area", [b"m.area"]) },
       { key: b"m.make", value: one_body(b"m.make", [b"m.area"]) },
     ]),
+    Map::new(),
     [{ ctor: b"m.Box", key: Some(b"m.area"), show: Some(b"m.text"), numeric: [] }],
   );
   assert_eq(p.taken, [b"m.area", b"m.make"]);
@@ -3493,6 +3529,7 @@ test "a unit says which constructors are read through a function, and which func
     [{ name: b"m.make", arity: 0, constant: false }],
     1,
     Map::of_entries([{ key: b"m.make", value: one_body(b"m.make", [b"m.area"]) }]),
+    Map::new(),
     [{ ctor: b"m.Box", key: Some(b"m.area"), show: None, numeric: [] }],
   );
   assert_eq(alone.taken, []);
@@ -3504,6 +3541,7 @@ test "a unit says which constructors are read through a function, and which func
     [{ name: b"m.f", arity: 0, constant: false }],
     1,
     Map::of_entries([{ key: b"m.f", value: one_body(b"m.f", []) }]),
+    Map::new(),
   );
   assert(plain.text.index_of(b"instances") == None, None);
   // Last, every unit says it holds a `Decimal` as its two words.

@@ -8,8 +8,8 @@
 import front (no_rows, Dump, EmitterRoot, AnalysisOutcome, Analysed, Refused, Rows, Shipping,
               ShippedView, analyse_pulling_std_with, checked_staged, dump_of, module_of, pulls_of,
               shipped_pulled, staged_pulling_std_with, viewed_text, ModuleShape, answered_load,
-              view_dump)
-import embed (EmbedAt, EmbedRead, EmbedFile, EmbedWant)
+              view_dump, inputs_of, shipped_bytes, Embedded, embeds_wanted, HashFrame, HDef)
+import embed (EmbedAt, BytesRead, EmbedRead, EmbedWant, embed_file, want_of_key)
 import hash (HashOutput, Fixing, no_fixing, hex)
 import interface (imported)
 import memo
@@ -18,7 +18,7 @@ import memo_files
 import checking (Answered, Answering, CheckQuery, Driving, ModuleAnswer, OwnPackage, World,
                  asked_all, decoding_once, entry_hash, evaluator_of, hashed_all, looked,
                  packages_refused, queries, refused_first, registry, root_warnings, view_answered,
-                 world_of)
+                 world_of, world_placing)
 import pkg (PackageSources, Supplied, closure, git_spec, wants)
 import resolve (Source, Diag, Label, error_at)
 import unit (Runtime, shipped, compiled, pack_frame, declared_natives)
@@ -35,10 +35,11 @@ import parsing (no_module, dummy_span)
 pub type SourceFile = { path: String, name: String, text: Bytes }
 
 /// What a machine is handed for a program: the front end's answer, every source its ids run over in
-/// that order, and what its load cost.
+/// that order, the bytes of each file the answer says it embeds, by digest, and what its load cost.
 pub type LoadedAnalysis = {
   dump: Dump,
   files: List<SourceFile>,
+  inputs: Map<Bytes, Bytes>,
   read_ms: Int,
   front_ms: Int,
   file_ms: Int,
@@ -174,7 +175,7 @@ fn packages_of<[r]>(
 /// A path an embed names, relative to the directory of the module's own file.
 fn embed_target(file: String, path: String) -> String = normalize(join(parent(file), path))
 
-fn unread(target: String, what: String) -> EmbedRead =
+fn unread(target: String, what: String) -> BytesRead =
   Err(Bytes::of_string("`" ++ target ++ "` " ++ what))
 
 /// Every file under `dir`, by its path below it and in that order; nothing under a name starting
@@ -205,11 +206,11 @@ fn listed<[r]>(
         }),
   }
 
-fn read_dir<[r]>(dir: String) -> EmbedRead / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} =
+fn read_dir<[r]>(dir: String) -> BytesRead / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} =
   match listed[r](dir, "", Map::new(), walk_room()) {
     Err(why) -> Err(why),
     Ok(found) ->
-      found.fold(Ok([]), |acc: EmbedRead, name: String, path: String|
+      found.fold(Ok([]), |acc: BytesRead, name: String, path: String|
         match acc {
           Err(_) -> acc,
           Ok(files) -> match fs.read_file[r](path) {
@@ -223,7 +224,7 @@ fn read_embed<[r]>(
   file: String,
   path: String,
   dir: Bool,
-) -> EmbedRead / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} =
+) -> BytesRead / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} =
   if is_absolute(path) {
     unread(path, "is absolute, and a program's own load reads below its root")
   } else {
@@ -249,7 +250,7 @@ fn embed_read<[r]>(
   k: Int,
   name: Bytes,
   want: EmbedWant,
-) -> EmbedRead / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} = {
+) -> BytesRead / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} = {
   let files = if k == 0 { p.own.files }
   else { match p.deps.at(k - 1) { Some(d) -> d.files, None -> [] } };
   match files.filter(|f: SourceFile| Bytes::of_string(f.name) == name) {
@@ -488,12 +489,13 @@ fn refusals(
 }
 
 /// The program `p` as its modules' answers in `asked` say it checked and hashed, or what refuses it.
-/// `tested` reads its tests and laws, which a program to ship has none of.
-pub fn assembled(
+/// `tested` reads its tests and laws, which a program to ship has none of. What its modules embed is
+/// read again under `s`, and what the shipped modules embed off the binary.
+pub fn assembled<[s]>(
   p: Prepared,
   asked: Asked,
   tested: Bool,
-) -> Result<Checked, Unloaded> / {shipped.names, shipped.module, shipped.reached, abort.raise} = {
+) -> Result<Checked, Unloaded> / {shipped.names, shipped.module, shipped.reached, fs.list_dir[s], fs.kind[s], fs.read_file[s], abort.raise} = {
   let texts = pulled_texts(asked.pulled);
   let listed = shipped.names().map(Bytes::of_string);
   let mine = placed(p.own, p.deps, asked.pulled, texts);
@@ -528,17 +530,29 @@ pub fn assembled(
           acc.insert(a.module, a.answer)),
       );
       tell_viewed(loaded.views, true);
-      Ok({
-        front: {
-          dump: view_dump(view, None),
-          files: placed(p.own, p.deps, loaded.pulled, texts),
-          read_ms: 0,
-          front_ms: 0,
-          file_ms: 0,
-          cached: false,
-        },
-        hashes: view.frame.hashes,
-      })
+      let dump = view_dump(view, None);
+      let w = world_for(p);
+      let read = |e: EmbedAt|
+        match world_placing(w, e.module) {
+          Some(at) -> embed_read[s](p, at.package, at.relative, want_of_key(e.key)),
+          None -> shipped_bytes(e.module, e.key, held_module, held_module),
+        };
+      match inputs_of(dump.embeds, read) {
+        Err(ds) -> Err({ diags: ds, files: mine }),
+        Ok(inputs) ->
+          Ok({
+            front: {
+              dump: dump,
+              files: placed(p.own, p.deps, loaded.pulled, texts),
+              inputs: inputs,
+              read_ms: 0,
+              front_ms: 0,
+              file_ms: 0,
+              cached: false,
+            },
+            hashes: view.frame.hashes,
+          }),
+      }
     },
     ds -> Err({ diags: ds, files: mine }),
   }
@@ -568,9 +582,23 @@ fn texts_of(shipped_sources: List<Source>) -> Map<Bytes, Bytes> =
 /// run over, in their order.
 pub type Held = { out: AnalysisOutcome, files: List<SourceFile> }
 
-/// A program held in memory, one package with no manifest, analysed against the shipped modules.
+/// The bytes `inputs` holds under the digest an embed names in hex: how a closure printed back to
+/// source embeds a file.
+fn input_bytes(inputs: Map<Bytes, Bytes>, want: EmbedWant) -> Option<Bytes> / {abort.raise} =
+  if want.dir || want.path.len() != 64 { None }
+  else { inputs.get(Bytes::of_hex(String::of_bytes(want.path))) }
+
+fn input_read(inputs: Map<Bytes, Bytes>, want: EmbedWant) -> EmbedRead / {abort.raise} =
+  match input_bytes(inputs, want) {
+    Some(b) -> Ok([embed_file(b"", b)]),
+    None -> Err(b"the program was handed no file of that digest"),
+  }
+
+/// A program held in memory, one package with no manifest, analysed against the shipped modules. A
+/// module of it embeds what `inputs` holds under the digest its embed names in hex.
 pub fn analysed(
   files: List<SourceFile>,
+  inputs: Map<Bytes, Bytes>,
 ) -> Held / {shipped.names, shipped.module, shipped.reached, abort.raise} = {
   let pkgs = { root: b"", manifest: None, supplied: [] };
   let shipping = shipped_for(sources_of(files), pkgs);
@@ -580,6 +608,8 @@ pub fn analysed(
     shipping.read,
     no_rows(),
     pkgs,
+    embeds: embeds_wanted(b"", sources_of(files)).map(|e: Embedded|
+      { ..e, read: input_read(inputs, e.want) }),
     unread: shipping.unread,
     data: shipping.data,
   );
@@ -587,22 +617,41 @@ pub fn analysed(
   { out: pulled.out, files: placed(own, [], pulled.pulled, texts_of(shipping.read)) }
 }
 
-/// A program held in memory, one package with no manifest, checked against the shipped modules.
+/// A program held in memory, one package with no manifest, checked against the shipped modules: its
+/// own modules embed what `inputs` holds by digest, and what the shipped modules embed is read off
+/// the binary.
 pub fn held(
   files: List<SourceFile>,
+  inputs: Map<Bytes, Bytes>,
 ) -> Result<LoadedAnalysis, Unloaded> / {shipped.names, shipped.module, shipped.reached, abort.raise} = {
-  let answered = analysed(files);
+  let answered = analysed(files, inputs);
+  let own = files.fold(Map::new(), |acc: Map<Bytes, Bool>, f: SourceFile|
+    acc.insert(Bytes::of_string(f.name), true));
   match answered.out {
     Refused(diags) -> Err({ diags: diags, files: answered.files }),
-    Analysed(w) ->
-      Ok({
-        dump: dump_of(Analysed(w)),
-        files: answered.files,
-        read_ms: 0,
-        front_ms: 0,
-        file_ms: 0,
-        cached: false,
-      }),
+    Analysed(w) -> {
+      let dump = dump_of(Analysed(w));
+      match inputs_of(dump.embeds, |e: EmbedAt|
+          if !own.contains(e.module) { shipped_bytes(e.module, e.key, held_module, held_module) }
+          else {
+            match input_bytes(inputs, want_of_key(e.key)) {
+              Some(b) -> Ok([{ name: b"", bytes: b }]),
+              None -> Err(b"the program was handed no file of that digest"),
+            }
+          }) {
+        Err(diags) -> Err({ diags: diags, files: answered.files }),
+        Ok(inputs) ->
+          Ok({
+            dump: dump,
+            files: answered.files,
+            inputs: inputs,
+            read_ms: 0,
+            front_ms: 0,
+            file_ms: 0,
+            cached: false,
+          }),
+      }
+    },
   }
 }
 
@@ -617,12 +666,13 @@ pub fn load<[r]>(
 ) -> Result<Loaded, List<Diag>> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], shipped.answer, shipped.names, shipped.module, shipped.reached, shipped.runtime, shipped.definitions, shipped.stamps, abort.raise} =
   match prepared[r](root) {
     Err(u) -> Err(u.diags),
-    Ok(p) -> match assembled(p, answers_afresh[r](p), true) {
+    Ok(p) -> match assembled[r](p, answers_afresh[r](p), true) {
       Err(u) -> Err(u.diags),
       Ok(c) -> match compiled(
           shipped.runtime(),
           c.front.dump,
           c.front.files.map(|f: SourceFile| f.text),
+          c.front.inputs,
           every_root(c.front),
           b"",
           |_: Bytes| None,
@@ -779,17 +829,95 @@ test "a dependency's module that does not check is labelled in its own file" {
   }
 }
 
-test "a module embeds a file beside it" {
-  match loaded_from([
-      {
-        path: "p/m.ply",
-        body: b"fn greeting() -> Bytes = embed(\"hello.txt\")\n\nfn main() -> Int = greeting().len()\n",
-      },
-      { path: "p/hello.txt", body: b"hello" },
-    ]) {
+/// A module that embeds `hello.txt` beside it, which holds `hello`.
+fn greeting() -> List<{ path: String, body: Bytes }> =
+  [
+    {
+      path: "p/m.ply",
+      body: b"fn greeting() -> Bytes = embed(\"hello.txt\")\n\nfn main() -> Int = greeting().len()\n",
+    },
+    { path: "p/hello.txt", body: b"hello" },
+  ]
+
+test "a module embeds a file beside it, which its answer knows by digest and its unit holds" {
+  match loaded_from(greeting()) {
     Err(diags) -> panic(said(diags)),
-    Ok(l) -> assert(l.unit.len() > 0),
+    Ok(l) -> {
+      assert_eq(l.front.dump.embeds.map(|e: EmbedAt| e.read), [Ok([embed_file(b"", b"hello")])]);
+      assert_eq(l.front.inputs, Map::new().insert(b"hello".blake3(), b"hello"));
+      assert(l.unit.index_of(b"b 68656c6c6f") != None)
+    },
   }
+}
+
+/// The definition hash `name` is filed under in `d`.
+fn def_hash(d: Dump, name: Bytes) -> Option<Bytes> =
+  d.hashes.fold(None, |acc: Option<Bytes>, f: HashFrame|
+    match f { HDef(r) -> if r.name == name { r.def } else { acc }, _ -> acc })
+
+test "a program held in memory embeds the file its embed names by digest, as one read from disk" {
+  let digest = b"hello".blake3();
+  let files = [
+    {
+      path: "m.ply",
+      name: "m",
+      text: Bytes::concat_all([
+        b"fn greeting() -> Bytes = embed(\"",
+        hex(digest),
+        b"\")\n\nfn main() -> Int = greeting().len()\n",
+      ]),
+    },
+  ];
+  let over = |inputs: Map<Bytes, Bytes>|
+    handle {
+      held(files, inputs)
+    } with {
+      shipped.names() -> [],
+      shipped.module(name) -> None,
+      shipped.reached(view, pulled) -> (),
+    };
+  let read = match loaded_from(greeting()) {
+    Ok(l) -> l.front.dump,
+    Err(diags) -> panic(said(diags)),
+  };
+  match over(Map::new().insert(digest, b"hello")) {
+    Err(u) -> panic(said(u.diags)),
+    Ok(h) -> {
+      assert_eq(h.inputs, Map::new().insert(digest, b"hello"));
+      assert(def_hash(h.dump, b"m.greeting") != None);
+      assert_eq(def_hash(h.dump, b"m.greeting"), def_hash(read, b"m.greeting"))
+    },
+  };
+  assert_eq(match over(Map::new()) { Ok(_) -> [], Err(u) -> u.diags.map(|d: Diag| d.code) }, [
+    b"E0146",
+  ])
+}
+
+test "an embed whose file reads otherwise once the program is checked is refused, not emitted" {
+  let tree = fs::mem_of(greeting());
+  let loaded = handle {
+    load[t]("p")
+  } with {
+    var reads: Int = 0,
+    fs.list_dir[t](path) -> fs::mem_list(tree, path),
+    fs.kind[t](path) -> fs::mem_kind(tree, path),
+    fs.read_file[t](path) -> if path != "p/hello.txt" { fs::mem_read(tree, path) } else {
+      reads = reads + 1;
+      Some(if reads == 1 { b"hello" } else { b"moved" })
+    },
+    shipped.names() -> [],
+    shipped.module(name) -> None,
+    shipped.reached(view, pulled) -> (),
+    shipped.runtime() -> bare_runtime(),
+    shipped.answer(path, offset, len) -> None,
+    shipped.definitions() -> listed_queries(),
+    shipped.stamps() -> "",
+  };
+  assert_eq(codes(loaded), [b"E0146"]);
+  assert_eq(
+    said(match loaded { Ok(_) -> [], Err(diags) -> diags }),
+    "`hello.txt`, which `m` embeds, could not be embedded",
+  )
 }
 
 test "a shipped module a program imports embeds a data file the binary holds" {
@@ -817,10 +945,10 @@ test "a shipped module a program imports embeds a data file the binary holds" {
   match over(Some(b"one\ntwo\n")) {
     Err(diags) -> panic(said(diags)),
     Ok(l) -> {
-      assert(l.unit.len() > 0);
       assert_eq(l.front.dump.embeds.map(|e: EmbedAt| e.read), [
-        Ok([{ name: b"", bytes: b"one\ntwo\n" }]),
-      ])
+        Ok([embed_file(b"", b"one\ntwo\n")]),
+      ]);
+      assert(l.unit.index_of(b"b 6f6e650a74776f0a") != None)
     },
   };
   assert_eq(codes(over(None)), [b"E0146"])

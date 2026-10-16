@@ -3,7 +3,7 @@
 //! `--explain` says where the time went and where each row came from, and `--costs` says where an
 //! update copies.
 
-import compiler.memo (Tally)
+import compiler.memo (Tally, joined_tallies)
 import compiler.unit (shipped)
 import std.random (entropy)
 import builder (builder)
@@ -24,8 +24,8 @@ import std.bytes
 import compiler.hash (hex)
 import std.bin
 import std.hash (blake3)
-import report (Answer, ok_code, count_of, indent, refused, reuse_members, warning_lines,
-               with_front_end)
+import report (Answer, ok_code, count_of, indent, refused, reuse_members, tally_members,
+               warning_lines, with_front_end)
 import signature (SetLine, Provenance, counted_lines, effect_sets, provenance, provenance_lines,
                   set_lines, atom_texts, raise_text, raise_kind)
 import std.term (Style, bold, dim, green, plain)
@@ -146,7 +146,8 @@ fn tally_lines(style: Style, program: Program) -> List<String> =
         ++ t.took.to_string().pad_left(8, " ")
         ++ " taken "
         ++ t.ran.to_string().pad_left(8, " ")
-        ++ " run"),
+        ++ " run"
+        ++ (if t.lost > 0 { ", " ++ t.lost.to_string() ++ " not kept" } else { "" })),
   )
 
 /// What the cost pass walked, where it ran: the bodies it walked rather than took as an earlier run
@@ -751,12 +752,24 @@ fn refused_load(flags: Flags, timed: Timed) -> Answer / {abort.raise} = {
 
 /// A check run now, beside its load, and the answer a later check may take back: one the front end
 /// answered whole.
+/// A check's answer from a load now. `settled` and `settled_lost` are what the run that settled the
+/// store before it did, which its tallies count beside the load's own.
 fn checked_now(
   flags: Flags,
   project: Project,
   started: Int,
+  settled: List<Tally> = [],
+  settled_lost: Int = 0,
 ) -> { answer: Answer, filed: Option<Answer>, program: Program } / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, abort.raise, shipped.reached, env.reused[sys]} = {
-  let t: Timed = timed_over(flags.paths, project, started, true, flags.verify_deps, flags.std);
+  let loaded: Timed = timed_over(flags.paths, project, started, true, flags.verify_deps, flags.std);
+  let t = {
+    ..loaded,
+    program: {
+      ..loaded.program,
+      tallies: joined_tallies(settled, loaded.program.tallies),
+      lost: loaded.program.lost + settled_lost,
+    },
+  };
   match t.program.frame {
     None -> { answer: refused_load(flags, t), filed: None, program: t.program },
     Some(f) -> {
@@ -779,10 +792,20 @@ pub fn run(
     match replayed(kept.output) {
       Some(answer) -> if !flags.json { answer } else {
         with_front(answer, |_: Json|
-          object([{ key: "reused", value: Bool(true) }, { key: "key", value: Str(shown) }]))
+          object(
+            [{ key: "reused", value: Bool(true) }, { key: "key", value: Str(shown) }].concat(
+              tally_members(kept.tallies, kept.lost),
+            ),
+          ))
       },
       None -> {
-        let now = checked_now(flags, project, started);
+        let now = checked_now(
+          flags,
+          project,
+          started,
+          settled: kept.tallies,
+          settled_lost: kept.lost,
+        );
         let filed = match now.filed {
           Some(own) ->
             keep_command(flags.paths, project, key, now.program, filed_answer(own), kept.marks),

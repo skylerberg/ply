@@ -27,22 +27,22 @@ import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, Sh
                 call_cycles)
 import owned
 import types (tables_joined)
-import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, ShippedData, Rows,
-              KnownDefRow, KnownTestRow, Published, embeds_wanted, module_embeds_wanted,
-              known_def_row_bin, shipped_wants_of, rows_of, no_rows, rows_kept, rows_read, analyse,
-              analyse_with, published, staged_pulling_std_with, analyse_pulling_std_with, of_module,
-              ModuleFacts, ModuleShape, ModuleTables, Frame, TableReads, View, Outline,
-              module_facts, no_shape, no_module_tables, module_shape_bin, tables_kept, tables_read,
-              answered_program, answered_load, pulled_next, view_of, functions_of, tests_of,
-              view_over, view_dump, faceted, dump_of, walked_facts_bin, squats, embedded_bin,
-              shipped_data_bin, read_outline, named_imports, Outlined, OTest, OLaw, ShippedWants,
-              shipped_wants_bin)
+import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, Rows, KnownDefRow,
+              KnownTestRow, Published, embeds_wanted, module_embeds_wanted, known_def_row_bin,
+              shipped_wants_of, rows_of, no_rows, rows_kept, rows_read, analyse, analyse_with,
+              published, staged_pulling_std_with, analyse_pulling_std_with, of_module, ModuleFacts,
+              ModuleShape, ModuleTables, Frame, TableReads, View, Outline, module_facts, no_shape,
+              no_module_tables, module_shape_bin, tables_kept, tables_read, answered_program,
+              answered_load, pulled_next, view_of, functions_of, tests_of, view_over, view_dump,
+              faceted, dump_of, walked_facts_bin, squats, embedded_bin, read_outline, named_imports,
+              Outlined, OTest, OLaw, ShippedWants, shipped_wants_bin)
 import items (Module, Item, IType, ILaw, ImportDecl, INames, header, parse, parse_started,
               import_decl_bin, homes_called, homes_declaring, is_written)
 import derive (dotted)
 import diagnostics (ParsedSource, parse_all, parse_at, parse_from, placed)
 import interface (imported, blanked)
-import embed (EmbedFile, EmbedRead, EmbedWant, ItemWants, embed_key, want_of_key, wants_by_item)
+import embed (EmbedAt, EmbedFile, EmbedBytes, BytesRead, EmbedWant, ItemWants, embed_file,
+              embed_file_bin, embed_key, want_of_key, wants_by_item)
 import pkg (PackageSources, Judged, judged, judged_bin, placeless, place_token, package_sources_bin)
 import resolve (Source, ParsedModule, Diag, Label, backticked, diag_bin, error_at, import_binder,
                 path_span, import_module_name, source_bin, qualify)
@@ -67,8 +67,8 @@ pub type Named = { module: Bytes, shipped: Bool, tested: Bool }
 /// An entry a query is asked for: the module's, under `name`, or under every name for none.
 pub type EntryNamed = { module: Bytes, shipped: Bool, tested: Bool, name: Bytes }
 
-/// What an embed read: its files, or why it read none.
-pub type Embedding = { files: List<{ name: Bytes, bytes: Bytes }>, refused: Option<Bytes> }
+/// What an embed read: its files, each known by its digest, or why it read none.
+pub type Embedding = { files: List<EmbedFile>, refused: Option<Bytes> }
 
 /// What a module answers checked: what it shows its importers, the errors that refuse it, the
 /// warnings it holds, how many definitions and tests it checked, and the rows they published. A label points into the module
@@ -419,14 +419,7 @@ fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, decode.write, a
             None -> Err(b"no file is there"),
             Some(b) -> {
               let got = decoded(b, embedding_bin(), "an embed");
-              match got.refused {
-                Some(why) -> Err(why),
-                None ->
-                  Ok(
-                    got.files.map(|f: { name: Bytes, bytes: Bytes }|
-                      { name: f.name, bytes: f.bytes }),
-                  ),
-              }
+              match got.refused { Some(why) -> Err(why), None -> Ok(got.files) }
             },
           };
           { ..e, read: read }
@@ -435,11 +428,8 @@ fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, decode.write, a
       let wants = if shipped { shipped_wants_of(source, raw) } else { { texts: [], data: [] } };
       let whole = wants.texts.fold([], |acc: List<Source>, n: Bytes|
         match shipped_text(n) { Some(t) -> acc.push({ name: n, src: t }), None -> acc });
-      let data = wants.data.fold([], |acc: List<ShippedData>, n: Bytes|
-        match memo.world(data_kind(), n) {
-          Some(b) -> acc.push({ name: n, bytes: b }),
-          None -> acc,
-        });
+      let data = wants.data.fold([], |acc: List<EmbedFile>, n: Bytes|
+        match memo.world(data_kind(), n) { Some(b) -> acc.push(embed_file(n, b)), None -> acc });
       Some({
         source: source,
         tokens: lexed.input.tokens,
@@ -559,7 +549,8 @@ pub type Setting = {
   tested: Bool,
   unread: List<Bytes>,
   whole: List<Source>,
-  data: List<ShippedData>,
+  /// Each data file the module embeds of the shipped modules, under its name among them.
+  data: List<EmbedFile>,
   embeds: List<Embedded>,
 }
 
@@ -1073,10 +1064,7 @@ pub fn setting_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
 pub fn wants_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let setting = decoded(memo.ask(setting_query(), input), setting_bin(), "a module's setting");
   bin::encode(
-    {
-      texts: setting.whole.map(|s: Source| s.name),
-      data: setting.data.map(|d: ShippedData| d.name),
-    },
+    { texts: setting.whole.map(|s: Source| s.name), data: setting.data.map(|d: EmbedFile| d.name) },
     shipped_wants_bin(),
   )
 }
@@ -2937,10 +2925,10 @@ pub type World = {
   deps: List<Bytes>,
 }
 
-fn embedding_of(read: EmbedRead) -> Embedding =
+/// What a driver read for an embed as the world holds it: each file by its digest, never its bytes.
+fn embedding_of(read: BytesRead) -> Embedding =
   match read {
-    Ok(files) ->
-      { files: files.map(|f: EmbedFile| { name: f.name, bytes: f.bytes }), refused: None },
+    Ok(files) -> { files: files.map(|f: EmbedBytes| embed_file(f.name, f.bytes)), refused: None },
     Err(why) -> { files: [], refused: Some(why) },
   }
 
@@ -3016,7 +3004,7 @@ pub fn world_placing(w: World, module: Bytes) -> Option<Placing> / {abort.raise}
 /// package, its name there and what it asks for: nothing for a module `w` does not hold.
 fn embedded_at<| e>(
   w: World,
-  reader: (Int, Bytes, EmbedWant) -> EmbedRead / {abort.raise | e},
+  reader: (Int, Bytes, EmbedWant) -> BytesRead / {abort.raise | e},
   at: Bytes,
 ) -> Option<Bytes> / {abort.raise | e} = {
   let parts = at.split(b"\x00");
@@ -3044,7 +3032,7 @@ pub fn looked<| e>(
   shipped: (Bytes) -> Option<Bytes> / {abort.raise | e},
   data: (Bytes) -> Option<Bytes> / {abort.raise | e},
   names: () -> List<Bytes> / {abort.raise | e},
-  reader: (Int, Bytes, EmbedWant) -> EmbedRead / {abort.raise | e},
+  reader: (Int, Bytes, EmbedWant) -> BytesRead / {abort.raise | e},
   kind: Bytes,
   at: Bytes,
 ) -> Option<Bytes> / {abort.raise | e} =
@@ -3080,6 +3068,7 @@ pub fn registry(definitions: Bytes, evaluator: Bytes) -> Map<Bytes, CheckQuery> 
             ),
         },
         body: q.body,
+        kept: !unkept_queries().contains(q.name),
       }),
   )
 
@@ -3088,7 +3077,7 @@ pub fn fresh_registry() -> Map<Bytes, CheckQuery> =
   queries().fold(
     Map::new(),
     |acc: Map<Bytes, CheckQuery>, q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {Answering, abort.raise} }|
-      acc.insert(q.name, { name: q.name, hash: q.name, body: q.body }),
+      acc.insert(q.name, { name: q.name, hash: q.name, body: q.body, kept: true }),
   )
 
 /// A module of a load, by its name in the program, and what it answered.
@@ -3251,26 +3240,55 @@ pub fn shipped_queries() -> List<Bytes> =
     declaring_query(),
   ]
 
+/// The queries whose answers a store keeps only the digests of, so a load that needs one answers it
+/// again: no later load reads them back, and each is a cheap reading of answers that are kept.
+pub fn unkept_queries() -> List<Bytes> =
+  [
+    owner_query(),
+    shape_query(),
+    sign_unit_query(),
+    context_query(),
+    setting_query(),
+    sees_query(),
+    group_imports_query(),
+    names_query(),
+    signature_query(),
+    signed_query(),
+    owner_entry_query(),
+    shown_query(),
+    header_text_query(),
+    exported_query(),
+  ]
+
 /// What a load asks of each of `shipped`, the shipped modules, of `qs` over a run: its answer and its
 /// hashing, which ask all the rest, and of the standard library which of its modules declare each
-/// name, which asks each what it documents: what `ply doc` reads wherever it runs.
+/// name, which asks each what it documents: what `ply doc` reads wherever it runs. Beside the run,
+/// the answer of each module that refuses, in the order they were asked.
 pub fn shipped_all(
   qs: Map<Bytes, CheckQuery>,
   shipped: List<Bytes>,
   run: Run,
-) -> Run / {Driving, abort.raise} = {
+) -> { run: Run, refused: List<Answered> } / {Driving, abort.raise} = {
   let ordered = dependencies_first(
     qs,
     run,
     shipped.map(|m: Bytes| { module: m, shipped: true, tested: false }),
   );
-  declaring_in(
-    qs,
-    b"std",
-    ordered.order.fold(ordered.run, |r: Run, named: Named|
-      [module_query(), hashes_query(), wants_query()].fold(r, |at: Run, query: Bytes|
-        answer(qs, at, query, bin::encode(named, named_bin())).run)),
-  ).run
+  let asked = ordered.order.fold(
+    { run: ordered.run, refused: [] },
+    |acc: { run: Run, refused: List<Answered> }, named: Named| {
+      let at = bin::encode(named, named_bin());
+      let m = answer(qs, acc.run, module_query(), at);
+      let a = decoded(m.output, module_answer_bin(), "a module's answer");
+      {
+        run: [hashes_query(), wants_query()].fold(m.run, |r: Run, query: Bytes|
+          answer(qs, r, query, at).run),
+        refused: if a.refused.len() == 0 { acc.refused }
+        else { acc.refused.push({ module: named.module, answer: a }) },
+      }
+    },
+  );
+  { run: declaring_in(qs, b"std", asked.run).run, refused: asked.refused }
 }
 
 /// What each of `pulled`, shipped modules a load pulled, read with their tests where `tested` says,
@@ -3578,7 +3596,7 @@ fn said(outcome: AnalysisOutcome) -> Said / {abort.raise} =
     Analysed(_) -> Publishing(published(outcome)),
   }
 
-fn nothing_embedded(package: Int, module: Bytes, want: EmbedWant) -> EmbedRead =
+fn nothing_embedded(package: Int, module: Bytes, want: EmbedWant) -> BytesRead =
   Err(b"no file is there")
 
 /// `work` run over `held` as [`over_held`] runs it, with what its queries decode held meanwhile.
@@ -3687,6 +3705,7 @@ fn answered_in(
     name: b"spare",
     hash: if company == Turns && nth % 2 == 1 { b"odd" } else { b"even" },
     body: |input: Bytes| input,
+    kept: true,
   });
   let done = fs::on_mem[abs](tree, ||
     handle {
@@ -3947,10 +3966,12 @@ fn inputs_over(
         name: b"group inputs",
         hash: b"group inputs",
         body: group_inputs_answer,
+        kept: true,
       }).insert(b"hash inputs", {
         name: b"hash inputs",
         hash: b"hash inputs",
         body: hash_inputs_answer,
+        kept: true,
       });
       let cycles = cycles_among(qs, started(qs), w.own);
       if cycles.refused.len() > 0 { None } else {
@@ -4162,6 +4183,10 @@ fn session(edits: List<List<Change>>) -> List<Step> =
       }
     },
   ).steps
+
+test "every query whose answers the toolchain ships keeps its answers" {
+  assert_eq(shipped_queries().filter(|n: Bytes| unkept_queries().contains(n)), [])
+}
 
 test "an answer through the store is the fresh one through every kind of edit a session makes" {
   let s0 = shop();
@@ -4655,13 +4680,9 @@ fn entry_nameds() -> gen::Gen<EntryNamed> =
 /// A `Embedding` as a test draws one.
 fn embeddings() -> gen::Gen<Embedding> =
   gen::map2(
-    gen::list(
-      gen::map2(gen::bytes(), gen::bytes(), |name: Bytes, bytes: Bytes|
-        { name: name, bytes: bytes }),
-    ),
+    gen::list(gen::map2(gen::bytes(), gen::bytes(), embed_file)),
     gen::option_of(gen::bytes()),
-    |files: List<{ name: Bytes, bytes: Bytes }>, refused: Option<Bytes>|
-      { files: files, refused: refused },
+    |files: List<EmbedFile>, refused: Option<Bytes>| { files: files, refused: refused },
   )
 
 /// A `Placing` as a test draws one.
@@ -4923,6 +4944,75 @@ test "what a module query is asked reads back as it was asked" {
         && bin::round_trips(p, placing_bin())
     },
   )
+}
+
+// --- What an embed answers ------------------------------------------------------------------
+
+/// The module `m` of `src` answered and hashed through a store of its own, each file it embeds
+/// read out of `files` by its path: what the store holds after, and what the run answered.
+fn embedding_answered(
+  src: Bytes,
+  files: Map<Bytes, Bytes>,
+) -> { held: Held, answers: List<Answered>, fixing: Fixing } / {abort.raise} = {
+  let w = world_alone([{ name: b"m", src: src }]);
+  let none = |name: Bytes| None;
+  let read = |package: Int, module: Bytes, want: EmbedWant|
+    match files.get(want.path) {
+      Some(bytes) -> Ok([{ name: b"", bytes: bytes }]),
+      None -> Err(b"no file is there"),
+    };
+  let done = over_decoding(
+    nothing_held(),
+    packs::no_pack,
+    b"",
+    |kind: Bytes, at: Bytes| looked(w, none, none, || [], read, kind, at),
+    || asked_alone(fresh_registry(), w),
+  );
+  { held: done.held, answers: done.value.answers, fixing: done.value.fixing }
+}
+
+fn fixed_hash(fixing: Fixing, name: Bytes) -> Option<Bytes> =
+  fixing.nodes.fold(None, |acc: Option<Bytes>, f: Fixed|
+    if f.name == name { Some(f.hash) } else { acc })
+
+/// Two definitions, each of which embeds a file of its own.
+fn two_embeds() -> Bytes =
+  b"pub fn a() -> Bytes = embed(\"a.bin\")\npub fn b() -> Bytes = embed(\"b.bin\")\n"
+
+test "a module's answers know a file it embeds by its digest, and none holds the file's bytes" {
+  let line = Bytes::concat_all(range(0, 10).map(|_: Int| b"0123456789"));
+  let big = Bytes::concat_all(
+    range(0, 1000).map(|i: Int| Bytes::concat_all([Bytes::of_string(i.to_string()), b":", line])),
+  );
+  let src = b"pub fn data() -> Bytes = embed(\"big.bin\")\npub fn size() -> Int = data().len()\ntest \"sized\" { assert(size() > 0) }\n";
+  let done = embedding_answered(src, Map::new().insert(b"big.bin", big));
+  assert_eq(refused_first(done.answers), []);
+  assert(fixed_hash(done.fixing, b"m.data") != None);
+  assert_eq(done.answers.map(|a: Answered| a.answer.shape.embeds.map(|e: EmbedAt| e.read)), [
+    [Ok([embed_file(b"", big)])],
+  ]);
+  let largest = done.held.outputs.fold(0, |most: Int, _: Bytes, answer: Bytes|
+    if answer.len() > most { answer.len() } else { most });
+  assert(
+    largest < big.len() / 10,
+    Some(
+      "an answer of " ++ largest.to_string() ++ " bytes, beside a file of "
+        ++ big.len().to_string(),
+    ),
+  )
+}
+
+test "an embedded file's bytes move the definition that embeds it, and no other" {
+  let over = |a: Bytes, b: Bytes|
+    embedding_answered(two_embeds(), Map::new().insert(b"a.bin", a).insert(b"b.bin", b)).fixing;
+  let first = over(b"one", b"two");
+  let moved = over(b"one", b"three");
+  assert(fixed_hash(first, b"m.a") != None);
+  assert_eq(fixed_hash(moved, b"m.a"), fixed_hash(first, b"m.a"));
+  assert(fixed_hash(moved, b"m.b") != fixed_hash(first, b"m.b"));
+  // Two files of the same bytes are the same constant, wherever each is.
+  let same = over(b"one", b"one");
+  assert_eq(fixed_hash(same, b"m.a"), fixed_hash(same, b"m.b"))
 }
 
 // --- What an edit runs again ------------------------------------------------------------------
@@ -5950,7 +6040,10 @@ test "a definition added to a shipped module checks and hashes no module that im
 }
 
 /// What a toolchain that ships `shipped` answers of them, as the store its pack is cut from holds it.
-fn shipped_held(shipped: List<Source>) -> Held / {abort.raise} = {
+fn shipped_held(shipped: List<Source>) -> Held / {abort.raise} = shipped_asked(shipped).held
+
+/// [`shipped_held`], beside each of `shipped` that refuses.
+fn shipped_asked(shipped: List<Source>) -> { held: Held, value: List<Answered> } / {abort.raise} = {
   let texts = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
   let held_text = |name: Bytes| texts.get(name);
@@ -5964,10 +6057,18 @@ fn shipped_held(shipped: List<Source>) -> Held / {abort.raise} = {
       looked(nowhere, held_text, held_text, || names, nothing_embedded, kind, at),
     || {
       let qs = fresh_registry();
-      shipped_all(qs, names, started(qs));
-      ()
+      shipped_all(qs, names, started(qs)).refused
     },
-  ).held
+  )
+}
+
+test "answering the shipped modules names each one that refuses" {
+  let refused = shipped_asked([
+    { name: b"std.a", src: b"pub fn a() -> Int = 1\n" },
+    { name: b"std.b", src: b"import std.a (a)\n\npub fn b() -> Int = a(2)\n" },
+  ]).value;
+  assert_eq(refused.map(|x: Answered| x.module), [b"std.b"]);
+  assert_eq(refused.map(|x: Answered| x.answer.refused.map(|d: Diag| d.code)), [[b"E0202"]])
 }
 
 /// The pack cut from `held`: what it holds of the queries a pack carries, over shipped files a

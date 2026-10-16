@@ -57,9 +57,9 @@ import std.list
 import fmt (item_range, replace_item)
 import rewrite (fn_has_update, tagged_in, picked_in)
 import derive (RowField, row_shape, generated_name, same_deriver, row_field_bin)
-import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, ItemWants, embed_want_bin, embed_read_bin,
-              item_wants_bin, embed_key, embed_tables, embedded, rewritten, wants_of, wants_by_item,
-              wants_in, want_of_key, embed_at_bin)
+import embed (EmbedAt, EmbedRead, EmbedFile, EmbedBytes, BytesRead, EmbedWant, ItemWants,
+              embed_want_bin, embed_read_bin, item_wants_bin, embed_key, embed_tables, embedded,
+              rewritten, wants_of, wants_by_item, wants_in, want_of_key, embed_at_bin, embed_file)
 import items (parse, import_decl_bin, homes_called, homes_declaring, homes_for, called_names,
               is_std, is_compiler, is_shipped, HomeNames)
 import std.bytes (ascii_of_int)
@@ -4532,8 +4532,9 @@ fn unread_shipped(name: Bytes) -> Diag =
     [b"this is Ply's fault, not the program's"],
   )
 
-/// A data file a shipped module embeds: the name the shipped modules hold it under, which is its
-/// place below its package's root (`std/oid/names.txt`), and its bytes.
+/// A data file a shipped module embeds as a driver read it: the name the shipped modules hold it
+/// under, which is its place below its package's root (`std/oid/names.txt`), and its bytes. A check
+/// knows it as an `EmbedFile` under that name.
 pub type ShippedData = { name: Bytes, bytes: Bytes }
 
 derive bin for ShippedData
@@ -4876,14 +4877,14 @@ pub fn shipped_data_embeds(
   module: Source,
   data: List<ShippedData>,
 ) -> List<EmbedAt> / {abort.raise} = {
-  let held = data_held(data);
+  let held = data_held(data_known(data));
   data_wants(module).fold([], |acc: List<EmbedAt>, w: { want: EmbedWant, name: Bytes }|
     match held.get(w.name) {
-      Some(bytes) ->
+      Some(file) ->
         acc.push({
           module: module.name,
           key: embed_key(w.want),
-          read: Ok([{ name: b"", bytes: bytes }]),
+          read: Ok([{ ..file, name: b"" }]),
         }),
       None -> acc,
     })
@@ -4944,7 +4945,7 @@ fn pulling(
   shipped: Map<Bytes, Bytes>,
   whole: Map<Bytes, Bytes>,
   told: Map<Bytes, Pulls>,
-  data: Map<Bytes, Bytes>,
+  data: Map<Bytes, EmbedFile>,
   listed: List<Bytes>,
   tested: Bool,
   x: Pull,
@@ -4988,34 +4989,71 @@ fn pulling(
   }
 }
 
-/// What the shipped modules hold at `want` beside the shipped module `module`: another module's
-/// text out of `whole`, or a data file's bytes out of `data`.
-fn shipped_read(
-  whole: Map<Bytes, Bytes>,
-  data: Map<Bytes, Bytes>,
-  module: Bytes,
-  want: EmbedWant,
-) -> EmbedRead / {abort.raise} =
+/// What `want` beside a shipped module names among what the shipped modules hold: a module's text
+/// or a data file, each by its name among them.
+type HeldAt = | HeldText(Bytes) | HeldData(Bytes)
+
+fn held_at(module: Bytes, want: EmbedWant) -> Result<HeldAt, Bytes> / {abort.raise} =
   if want.dir { Err(b"a shipped module embeds a file the shipped modules hold, never a directory") }
   else {
-    let held = match shipped_name(module, want.path) {
-      Some(name) -> Some(whole.get(name)),
+    match shipped_name(module, want.path) {
+      Some(name) -> Ok(HeldText(name)),
       None -> match shipped_data_name(module, want.path) {
-        Some(name) -> Some(data.get(name)),
-        None -> None,
+        Some(name) -> Ok(HeldData(name)),
+        None ->
+          Err(Bytes::concat_all([b"`", want.path, b"` names nothing shipped modules could hold"])),
       },
-    };
-    match held {
-      None ->
-        Err(Bytes::concat_all([b"`", want.path, b"` names nothing shipped modules could hold"])),
-      Some(None) ->
-        Err(Bytes::concat_all([b"`", want.path, b"` is not among what the shipped modules hold"])),
-      Some(Some(bytes)) -> Ok([{ name: b"", bytes: bytes }]),
     }
   }
 
-fn data_held(data: List<ShippedData>) -> Map<Bytes, Bytes> =
-  data.fold(Map::new(), |acc: Map<Bytes, Bytes>, d: ShippedData| acc.insert(d.name, d.bytes))
+fn not_held(want: EmbedWant) -> Bytes =
+  Bytes::concat_all([b"`", want.path, b"` is not among what the shipped modules hold"])
+
+/// What the shipped modules hold at `want` beside the shipped module `module`: another module's
+/// text out of `whole`, or a data file out of `data`.
+fn shipped_read(
+  whole: Map<Bytes, Bytes>,
+  data: Map<Bytes, EmbedFile>,
+  module: Bytes,
+  want: EmbedWant,
+) -> EmbedRead / {abort.raise} =
+  match held_at(module, want) {
+    Err(why) -> Err(why),
+    Ok(HeldText(name)) -> match whole.get(name) {
+      Some(text) -> Ok([embed_file(b"", text)]),
+      None -> Err(not_held(want)),
+    },
+    Ok(HeldData(name)) -> match data.get(name) {
+      Some(file) -> Ok([{ ..file, name: b"" }]),
+      None -> Err(not_held(want)),
+    },
+  }
+
+/// What a shipped module's embed under `key` reads now, beside the shipped module `module`: a
+/// module's text through `text`, or a data file's bytes through `data`, each asked by its name among
+/// the shipped modules.
+pub fn shipped_bytes<| e>(
+  module: Bytes,
+  key: Bytes,
+  text: (Bytes) -> Option<Bytes> / {abort.raise | e},
+  data: (Bytes) -> Option<Bytes> / {abort.raise | e},
+) -> BytesRead / {abort.raise | e} = {
+  let want = want_of_key(key);
+  match held_at(module, want) {
+    Err(why) -> Err(why),
+    Ok(at) -> {
+      let held = match at { HeldText(name) -> text(name), HeldData(name) -> data(name) };
+      match held { Some(bytes) -> Ok([{ name: b"", bytes: bytes }]), None -> Err(not_held(want)) }
+    },
+  }
+}
+
+/// Each data file of `data` as a check knows it, under its name among the shipped modules.
+fn data_known(data: List<ShippedData>) -> List<EmbedFile> =
+  data.map(|d: ShippedData| embed_file(d.name, d.bytes))
+
+fn data_held(data: List<EmbedFile>) -> Map<Bytes, EmbedFile> =
+  data.fold(Map::new(), |acc: Map<Bytes, EmbedFile>, d: EmbedFile| acc.insert(d.name, d))
 
 /// A pulled module parsed, with what it embeds written out from the shipped modules: no driver reads
 /// beside a module that has no file. What it embeds is asked of its text as the shipped modules hold
@@ -5023,7 +5061,7 @@ fn data_held(data: List<ShippedData>) -> Map<Bytes, Bytes> =
 fn shipped_embedded(
   whole: Map<Bytes, Bytes>,
   told: Map<Bytes, Pulls>,
-  data: Map<Bytes, Bytes>,
+  data: Map<Bytes, EmbedFile>,
   index: Int,
   source: Source,
 ) -> { parsed: ParsedSource, embeds: List<EmbedAt> } / {abort.raise} = {
@@ -5063,7 +5101,7 @@ pub fn parse_shipped(
 ) -> List<ParsedSource> / {abort.raise} = {
   let whole = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
-  let held = data_held(data);
+  let held = data_held(data_known(data));
   range(0, modules.len()).map(|i: Int|
     shipped_embedded(whole, Map::new(), held, i, modules.get(i)).parsed)
 }
@@ -5085,12 +5123,13 @@ pub fn analyse_shipped(
 ) -> Pulled / {abort.raise} = {
   let whole = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
-  let held = data_held(data);
+  let known = data_known(data);
+  let held = data_held(known);
   let embeds = modules.fold([], |acc: List<Embedded>, module: Source|
     embeds_wanted(b"", [module]).fold(acc, |a: List<Embedded>, asked: Embedded|
       a.push({ ..asked, read: shipped_read(whole, held, module.name, asked.want) })));
   checked_staged(
-    staged_pulling_std_with(modules, shipped, embeds: embeds, data: data, apart: true),
+    staged_pulling_std_with(modules, shipped, embeds: embeds, data: known, apart: true),
     no_rows(),
   )
 }
@@ -5153,8 +5192,9 @@ pub fn staged_pulling_std_with(
   // every one whole, its tests and laws among them; the toolchain's own tree is whole as any root
   // is, and what it pulls of the compiler is read for what it reaches.
   reached: Bool = true,
-  // The data files the modules of `shipped` embed (`shipped_pulled`).
-  data: List<ShippedData> = [],
+  // The data files the modules of `shipped` embed (`shipped_pulled`), each under its name among the
+  // shipped modules.
+  data: List<EmbedFile> = [],
   // Shipped modules pulled whatever the program imports: `ply test --std` asks for every module of
   // the standard library.
   asked: List<Bytes> = [],
@@ -5477,7 +5517,7 @@ pub fn shipped_views(
       tested: false,
       unread: unread,
       reached: false,
-      data: data,
+      data: data_known(data),
     ).hashed {
     Err(diags) -> Err(diags),
     Ok(h) -> Ok(views_of(h, |name: Bytes| true)),
@@ -5518,7 +5558,7 @@ pub fn analyse_pulling_std_with(
       embeds: embeds,
       unread: unread,
       reached: reached,
-      data: data,
+      data: data_known(data),
       asked: asked,
       pulls: pulls,
     ),
@@ -5648,45 +5688,51 @@ fn past_spaces(src: Bytes, at: Int) -> Int / {abort.raise} =
     past_spaces(src, at + 1)
   } else { at }
 
-/// Of a module the driver read beside, what `embeds` holds; of a shipped one, what the shipped
-/// modules do, `data` being the data files they embed.
-pub fn embeds_now(
-  pkgs: PackageSources,
-  user: List<Source>,
-  shipped: List<Source>,
-  embeds: List<Embedded>,
-  data: List<ShippedData> = [],
-) -> EmbedReader / {abort.raise} = {
-  let clo = closure(pkgs, user.map(|s: Source| s.name));
-  let names = user.map(|s: Source| s.name).concat(
-    clo.modules.map(|m: { pkg: Int, src: Source }| m.src.name),
-  );
-  let slots = own_names(pkgs, user);
-  let tables = embed_reads(embeds);
-  let beside = range(0, names.len()).fold(
-    Map::new(),
-    |acc: Map<Bytes, Map<Bytes, EmbedRead>>, i: Int|
-      match slots.at(i) {
-        None -> acc,
-        Some(slot) -> match tables.get(slot) {
-          Some(table) -> acc.insert(names.get(i), table),
-          None -> acc,
+/// The bytes of each file `embeds` read, by digest, each embed read again through `read`: what a
+/// program's emission writes its embeds out as. `Err` refuses each embed that no longer reads as
+/// the check read it. One the check could not read is left out: its program emits nothing.
+pub fn inputs_of<| e>(
+  embeds: List<EmbedAt>,
+  read: (EmbedAt) -> BytesRead / {abort.raise | e},
+) -> Result<Map<Bytes, Bytes>, List<Diag>> / {abort.raise | e} = {
+  let held = embeds.fold(
+    { inputs: Map::new(), moved: [] },
+    |acc: { inputs: Map<Bytes, Bytes>, moved: List<EmbedAt> }, embed: EmbedAt|
+      match embed.read {
+        Err(_) -> acc,
+        Ok(was) -> match read(embed) {
+          Err(_) -> { ..acc, moved: acc.moved.push(embed) },
+          Ok(files) -> {
+            let now = files.map(|f: EmbedBytes| embed_file(f.name, f.bytes));
+            if now != was { { ..acc, moved: acc.moved.push(embed) } } else {
+              {
+                ..acc,
+                inputs: range(0, files.len()).fold(acc.inputs, |m: Map<Bytes, Bytes>, i: Int|
+                  m.insert(now.get(i).digest, files.get(i).bytes)),
+              }
+            }
+          },
         },
       },
   );
-  let whole = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
-    acc.insert(s.name, s.src));
-  let held = data_held(data);
-  |module: Bytes, key: Bytes|
-    match beside.get(module) {
-      Some(table) -> match table.get(key) {
-        Some(read) -> read,
-        None -> Err(b"the module asks for no such embed now"),
-      },
-      None -> if whole.contains(module) { shipped_read(whole, held, module, want_of_key(key)) }
-      else { Err(b"the module asks for no such embed now") },
-    }
+  if held.moved.len() == 0 { Ok(held.inputs) } else { Err(held.moved.map(moved_embed)) }
 }
+
+fn moved_embed(embed: EmbedAt) -> Diag / {abort.raise} =
+  error_at(
+    b"E0146",
+    no_module(),
+    dummy_span(),
+    Bytes::concat_all([
+      b"`",
+      want_of_key(embed.key).path,
+      b"`, which `",
+      embed.module,
+      b"` embeds, could not be embedded",
+    ]),
+    b"it reads otherwise now than when the program was checked",
+    [b"a file an embed reads changed while the program was loaded; run again"],
+  )
 
 /// What the modules of the package at `root` ask to embed. Only a module that may call `embed` is
 /// parsed for it.
@@ -7032,7 +7078,7 @@ test "a data file a shipped function embeds moves what reaches the function, and
     pulled_hash(one, b"std.w.table") != pulled_hash(over(named, b"one\ntwo\n"), b"std.w.table"),
   );
   assert_eq(dump_of(one.out).embeds, [
-    { module: b"std.w", key: b"file:w/table.txt", read: Ok([{ name: b"", bytes: b"one\n" }]) },
+    { module: b"std.w", key: b"file:w/table.txt", read: Ok([embed_file(b"", b"one\n")]) },
   ])
 }
 
@@ -8133,8 +8179,10 @@ fn embedding_in(
 fn embedding(src: Bytes, reads: List<Read>) -> AnalysisOutcome / {abort.raise} =
   embedding_in({ root: b"r", manifest: None, supplied: [] }, [{ name: b"m", src: src }], reads)
 
-fn a_file(bytes: Bytes) -> Read =
-  { want: { path: b"d.txt", dir: false }, read: Ok([{ name: b"", bytes: bytes }]) }
+fn a_file(bytes: Bytes) -> Read = file_at(b"d.txt", bytes)
+
+fn file_at(path: Bytes, bytes: Bytes) -> Read =
+  { want: { path: path, dir: false }, read: Ok([embed_file(b"", bytes)]) }
 
 fn checked_analysis(outcome: AnalysisOutcome) -> Analysis / {abort.raise} =
   match outcome {
@@ -8191,7 +8239,7 @@ test "a load hands on what each item asks to embed, from what the text was kept 
       root: b"",
       module: b"a",
       want: { path: b"x.txt", dir: false },
-      read: Ok([{ name: b"", bytes: b"one" }]),
+      read: Ok([embed_file(b"", b"one")]),
     },
   ];
   let items = |pulls: List<ModulePulls>|
@@ -8205,18 +8253,29 @@ test "a load hands on what each item asks to embed, from what the text was kept 
   assert_eq(items([{ name: b"a", pulls: { imports: [], wants: kept } }]), Some(kept))
 }
 
-test "an embed is the bytes read for it, and other bytes are another definition" {
+test "an embed is the digest of the bytes read for it, and other bytes are another definition" {
   let src = b"fn data() -> Bytes = embed(\"d.txt\")\nfn other() -> Int = 1\n";
   let one = embedding(src, [a_file(b"one")]);
   let two = embedding(src, [a_file(b"two")]);
   assert(def_hash_in(one, b"m.data") != def_hash_in(two, b"m.data"));
   assert_eq(def_hash_in(one, b"m.other"), def_hash_in(two, b"m.other"));
+  // Where the bytes were read from is no part of it.
   assert_eq(
     def_hash_in(one, b"m.data"),
     def_hash_in(
-      embedding(b"fn data() -> Bytes = b\"one\"\nfn other() -> Int = 1\n", []),
+      embedding(b"fn data() -> Bytes = embed(\"e.txt\")\nfn other() -> Int = 1\n", [
+        file_at(b"e.txt", b"one"),
+      ]),
       b"m.data",
     ),
+  );
+  // Nor is it the literal its bytes would spell, whose form holds them.
+  assert(
+    def_hash_in(one, b"m.data")
+      != def_hash_in(
+        embedding(b"fn data() -> Bytes = b\"one\"\nfn other() -> Int = 1\n", []),
+        b"m.data",
+      ),
   )
 }
 
@@ -8226,7 +8285,7 @@ test "a directory embed is its files as records, by their paths below it" {
     embedding(src, [
       {
         want: { path: b"t", dir: true },
-        read: Ok([{ name: b"a", bytes: b"1" }, { name: b"b/c", bytes: b"2" }]),
+        read: Ok([embed_file(b"a", b"1"), embed_file(b"b/c", b"2")]),
       },
     ]),
   );
@@ -8261,13 +8320,17 @@ test "a module that binds `embed` itself calls its own" {
   assert_eq(w.embeds, [])
 }
 
-test "a rehash writes the embeds the answer carries" {
+test "a rehash writes the embeds the answer carries, as the check wrote them" {
   let sources = [{ name: b"m", src: b"fn data() -> Bytes = embed(\"d.txt\")\n" }];
-  let w = checked_analysis(
-    embedding_in({ root: b"r", manifest: None, supplied: [] }, sources, [a_file(b"one")]),
-  );
-  assert(
-    rehash(sources, [], w.packages, w.module_packages, w.packages.len(), w.embeds).nodes.len() > 0,
+  let checked = embedding_in({ root: b"r", manifest: None, supplied: [] }, sources, [
+    a_file(b"one"),
+  ]);
+  let w = checked_analysis(checked);
+  assert_eq(
+    rehash(sources, [], w.packages, w.module_packages, w.packages.len(), w.embeds).nodes.filter(
+      |n: Rehash| n.name == b"m.data",
+    ).map(|n: Rehash| n.table),
+    [def_hash_in(checked, b"m.data")],
   )
 }
 
@@ -8289,7 +8352,7 @@ test "the pins read off the closure are the pins an analysis answers, embeds inc
       root: b"lib",
       module: b"answer",
       want: { path: b"n.txt", dir: false },
-      read: Ok([{ name: b"", bytes: b"one" }]),
+      read: Ok([embed_file(b"", b"one")]),
     },
   ];
   let analysed = checked_analysis(
@@ -8316,7 +8379,7 @@ test "a dependency is pinned by what its modules embed as well as by their text"
             root: b"lib",
             module: b"answer",
             want: { path: b"n.txt", dir: false },
-            read: Ok([{ name: b"", bytes: b }]),
+            read: Ok([embed_file(b"", b)]),
           },
         ],
       None -> [],
@@ -8347,7 +8410,7 @@ test "a shipped module embeds what the shipped modules hold beside it, and other
   assert_eq(one.dump.diags, []);
   assert_eq(one.pulled, [b"std.deep.a"]);
   assert_eq(one.dump.embeds, [
-    { module: b"std.deep.a", key: b"file:../note.ply", read: Ok([{ name: b"", bytes: b"one" }]) },
+    { module: b"std.deep.a", key: b"file:../note.ply", read: Ok([embed_file(b"", b"one")]) },
   ]);
   assert(one.dump.hashes_digest != over(b"two").dump.hashes_digest)
 }
@@ -8362,7 +8425,7 @@ test "a shipped module read as its stub still answers what the shipped modules' 
     src: b"pub fn text() -> Bytes = b\"\"",
   });
   assert_eq(stub.embeds, [
-    { module: b"std.a", key: b"file:note.ply", read: Ok([{ name: b"", bytes: b"one" }]) },
+    { module: b"std.a", key: b"file:note.ply", read: Ok([embed_file(b"", b"one")]) },
   ])
 }
 
@@ -8464,24 +8527,8 @@ test "a shipped module embeds a data file, and other bytes are another definitio
   });
   [b"std.words.idle", b"m.still"].fold((), |u: Unit, name: Bytes|
     assert_eq(pulled_hash(one, name), pulled_hash(two, name)));
-  // The call is the bytes, as a literal written in its place is.
-  let written = analyse_pulling_std_with(
-    [{ name: b"m", src: user }],
-    [
-      {
-        name: b"std.words",
-        src: b"pub fn list() -> Bytes = b\"one\\n\"\npub fn count() -> Int = list().len()\npub fn idle() -> Int = 7\n",
-      },
-    ],
-    no_rows(),
-  );
-  assert_eq(pulled_hash(one, b"std.words.list"), pulled_hash(written, b"std.words.list"));
   assert_eq(dump_of(one.out).embeds, [
-    {
-      module: b"std.words",
-      key: b"file:words/list.txt",
-      read: Ok([{ name: b"", bytes: b"one\n" }]),
-    },
+    { module: b"std.words", key: b"file:words/list.txt", read: Ok([embed_file(b"", b"one\n")]) },
   ])
 }
 
@@ -8521,16 +8568,12 @@ test "a data file the shipped modules do not hold, or a path that leaves them, i
 
 test "a shipped module read as its stub still answers the data file its text embeds" {
   let whole = Map::new().insert(b"std.words", words_module(b"words/list.txt").src);
-  let stub = shipped_embedded(whole, Map::new(), data_held(words_data(b"one\n")), 0, {
+  let stub = shipped_embedded(whole, Map::new(), data_held(data_known(words_data(b"one\n"))), 0, {
     name: b"std.words",
     src: b"pub fn list() -> Bytes = b\"\"",
   });
   assert_eq(stub.embeds, [
-    {
-      module: b"std.words",
-      key: b"file:words/list.txt",
-      read: Ok([{ name: b"", bytes: b"one\n" }]),
-    },
+    { module: b"std.words", key: b"file:words/list.txt", read: Ok([embed_file(b"", b"one\n")]) },
   ])
 }
 
@@ -8540,7 +8583,7 @@ test "a shipped module read as its stub answers what its text's read kept that i
     imports: [],
     wants: wants_by_item(parse(words_module(b"words/list.txt").src).node),
   });
-  let stub = shipped_embedded(whole, told, data_held(words_data(b"one\n")), 0, {
+  let stub = shipped_embedded(whole, told, data_held(data_known(words_data(b"one\n"))), 0, {
     name: b"std.words",
     src: b"pub fn list() -> Bytes = b\"\"",
   });

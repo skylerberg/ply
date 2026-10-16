@@ -84,11 +84,15 @@ pub type Seen = { kind: Bytes, at: Bytes, digest: Bytes }
 
 derive bin for Seen
 
-/// A query: its name, the hash of its definition, which keys what it answered, and its body.
+/// A query: its name, the hash of its definition, which keys what it answered, its body, and whether
+/// a store keeps its longer answers or only their digests: a query whose answers no later run reads,
+/// or are cheaper made again than read, keeps only its records and the answers short enough to sit
+/// inside them, and a later run that asks for a longer one runs the body again.
 pub type Query<| e> = {
   name: Bytes,
   hash: Bytes,
   body: (Bytes) -> Bytes / {memo.read, abort.raise | e},
+  kept: Bool,
 }
 
 /// What a run has settled: the digest of the answer under each key it settled, what its driver asked,
@@ -99,8 +103,9 @@ pub type Query<| e> = {
 /// marks are still to settle, lowest first. `offers` holds what a body offered for another key, the
 /// query whose body offered it, the key that body was answering and which of its runs made the
 /// offer; and `runs` how many times the run has run the body under each key. `vouched` is whether
-/// the store vouched for any record to the run when it started, and `lost` how many answers a
-/// record that stood named and no store held, which the run made again. `judged` holds each record
+/// the store vouched for any record to the run when it started, and `lost`, by query, how many
+/// answers a record that stood named and no store held though its query keeps them, which the run
+/// made again. `judged` holds each record
 /// [`would_stand`] judged, by its key.
 pub type Run = {
   settled: Map<Bytes, Bytes>,
@@ -117,7 +122,7 @@ pub type Run = {
   offers: Map<Bytes, Offer>,
   runs: Map<Bytes, Int>,
   vouched: Bool,
-  lost: Int,
+  lost: Map<Bytes, Int>,
   judged: Map<Bytes, Bool>,
 }
 
@@ -138,7 +143,7 @@ fn new_run() -> Run =
     offers: Map::new(),
     runs: Map::new(),
     vouched: false,
-    lost: 0,
+    lost: Map::new(),
     judged: Map::new(),
   }
 
@@ -196,10 +201,11 @@ pub fn vouched_to(run: Run) -> Bool = run.vouched
 
 /// How many answers the run made again because a record that stood named one no store held: none
 /// over a store that is whole.
-pub fn lost_in(run: Run) -> Int = run.lost
+pub fn lost_in(run: Run) -> Int = run.lost.fold(0, |n: Int, _: Bytes, k: Int| n + k)
 
-/// What a run did of one query: answers taken as kept, and bodies run.
-pub type Tally = { query: Bytes, took: Int, ran: Int }
+/// What a run did of one query: answers taken as kept, bodies run, and of those the answers made again
+/// because no store held them though the query keeps its answers.
+pub type Tally = { query: Bytes, took: Int, ran: Int, lost: Int }
 
 derive bin for Tally
 
@@ -211,7 +217,26 @@ fn bumped(m: Map<Bytes, Int>, name: Bytes) -> Map<Bytes, Int> = m.insert(name, c
 pub fn tallies(run: Run) -> List<Tally> =
   run.ran.fold(run.took, |acc: Map<Bytes, Int>, k: Bytes, _: Int|
     if acc.contains(k) { acc } else { acc.insert(k, 0) }).keys(
-  ).map(|name: Bytes| { query: name, took: counted(run.took, name), ran: counted(run.ran, name) })
+  ).map(|name: Bytes|
+    {
+      query: name,
+      took: counted(run.took, name),
+      ran: counted(run.ran, name),
+      lost: counted(run.lost, name),
+    })
+
+/// `a`'s tallies and `b`'s together, a query's counts summed where both ran it.
+pub fn joined_tallies(a: List<Tally>, b: List<Tally>) -> List<Tally> =
+  b.fold(
+    a.fold(Map::new(), |acc: Map<Bytes, Tally>, t: Tally| acc.insert(t.query, t)),
+    |acc: Map<Bytes, Tally>, t: Tally|
+      acc.insert(t.query, match acc.get(t.query) {
+        Some(u) ->
+          { query: t.query, took: u.took + t.took, ran: u.ran + t.ran, lost: u.lost + t.lost },
+        None -> t,
+      }),
+  ).values(
+  )
 
 /// Each input of the query `name` the run took a record back for.
 pub fn restored_for(run: Run, name: Bytes) -> List<Bytes> =
@@ -404,8 +429,9 @@ pub effect memo_keep {
   read stored(key: Bytes) -> Bool
   /// The answer kept under its digest, in the store or the pack below it.
   read output(digest: Bytes) -> Option<Bytes>
-  /// Keeps `r` under `key`, and `output` under `r.output`.
-  write keep(key: Bytes, r: Record, output: Bytes) -> Unit
+  /// Keeps `r` under `key`, and `output` under `r.output`: in the store where `lasting` or where it is
+  /// short enough to sit inside its record, else for the rest of the run only.
+  write keep(key: Bytes, r: Record, output: Bytes, lasting: Bool) -> Unit
   /// Keeps `r`, a record the store or its pack holds already, under `key`; its answer stays where it
   /// is kept.
   write adopt(key: Bytes, r: Record) -> Unit
@@ -749,11 +775,17 @@ fn fetched<| e>(
     let s = settled_at(queries, run, q, key, input, left - 1);
     match memo_keep.output(s.head) {
       Some(o) -> { run: s.run, output: o, head: s.head },
-      // An answer no store keeps any more is answered again.
+      // An answer no store holds is answered again, lost where its query keeps its answers. A
+      // record taken while what it read was still to settle may answer otherwise now, which moves
+      // it as any answer that moves does.
       None -> {
         let e = executed(queries, s.run, q, key, input, [], None, left - 1);
         {
-          run: { ..e.run, lost: e.run.lost + 1, settled: e.run.settled.insert(key, e.head) },
+          run: {
+            ..e.run,
+            lost: if q.kept { bumped(e.run.lost, q.name) } else { e.run.lost },
+            settled: e.run.settled.insert(key, e.head),
+          },
           output: match memo_keep.output(e.head) {
             Some(o) -> o,
             None -> panic("a store does not hold an answer it was just handed to keep"),
@@ -1139,8 +1171,9 @@ fn executed<| e>(
     let was = memo_keep.height(key);
     let height = if was > s.height { was } else { s.height };
     let rec = { query: q.hash, input: input, reads: s.reads, output: d, height: height };
-    kept_earlier(key, rec);
-    memo_keep.keep(key, rec, output);
+    // Only an answer kept is worth restoring when an edit is undone.
+    if q.kept { kept_earlier(key, rec) };
+    memo_keep.keep(key, rec, output, q.kept);
     // A new record's askers take their heights from it as they finish; one that grew lifts those
     // that asked it before.
     if was > 0 && height > was { raised(queries, asked_id(q.name, input), height) };
@@ -1209,7 +1242,7 @@ pub fn recorded<| e>(
   if moved { memo_keep.mark(key) };
   let rec = { query: hash, input: b"", reads: reads, output: digest_of(Some(output)), height: 0 };
   kept_earlier(key, rec);
-  memo_keep.keep(key, rec, output);
+  memo_keep.keep(key, rec, output, true);
   if marks.len() > 0 { memo_keep.unmark(key, marks) }
 }
 
@@ -1336,6 +1369,7 @@ pub fn over_held<a | e>(
   } with {
     var store = held,
     var inlined: Map<Bytes, Bytes> = Map::new(),
+    var transient: Map<Bytes, Bytes> = Map::new(),
     var running: Pulling = {
       stamp: b"",
       looked: Map::new(),
@@ -1367,18 +1401,25 @@ pub fn over_held<a | e>(
       Some(o) -> Some(o),
       None -> match inlined.get(digest) {
         Some(o) -> Some(o),
-        None -> {
-          let found = packs::answer(running.pack, read, digest);
-          running = { ..running, pack: found.reading };
-          found.bytes
+        None -> match transient.get(digest) {
+          Some(o) -> Some(o),
+          None -> {
+            let found = packs::answer(running.pack, read, digest);
+            running = { ..running, pack: found.reading };
+            found.bytes
+          },
         },
       },
     },
-    memo_keep.keep(key, rec, output) -> {
+    memo_keep.keep(key, rec, output, lasting) -> {
+      let held = lasting || kept_inline(output) != None;
+      if !held {
+        transient = transient.insert(rec.output, output);
+      };
       store = {
         ..store,
         records: store.records.insert(key, rec),
-        outputs: store.outputs.insert(rec.output, output),
+        outputs: if held { store.outputs.insert(rec.output, output) } else { store.outputs },
         said: saying(store, key, { stamp: running.stamp, stands: true, fresh: true }),
       };
     },
@@ -1506,10 +1547,12 @@ fn longer(input: Bytes) -> Bytes / {memo.read} = {
 }
 
 fn test_queries(length_hash: Bytes) -> Map<Bytes, Query<| {}>> =
-  Map::new().insert(b"length", { name: b"length", hash: length_hash, body: length_of }).insert(
-    b"longer",
-    { name: b"longer", hash: b"l1", body: longer },
-  )
+  Map::new().insert(b"length", {
+    name: b"length",
+    hash: length_hash,
+    body: length_of,
+    kept: true,
+  }).insert(b"longer", { name: b"longer", hash: b"l1", body: longer, kept: true })
 
 /// `name` asked of `input` over `w` from a run of its own: what it answered, how many bodies ran,
 /// how many times it read the world, and the world it left.
@@ -1659,7 +1702,12 @@ fn loudest_by_digest(input: Bytes) -> Bytes / {memo.read} =
 
 test "an answer asked for by its digest is the read an ask makes, and is handed over by it" {
   let by = |body: (Bytes) -> Bytes / {memo.read}|
-    test_queries(b"h1").insert(b"loudest", { name: b"loudest", hash: b"d1", body: body });
+    test_queries(b"h1").insert(b"loudest", {
+      name: b"loudest",
+      hash: b"d1",
+      body: body,
+      kept: true,
+    });
   let asked = asked_over(by(loudest), test_world([{ at: b"a", text: b"four" }]), b"loudest", b"a");
   let headed = asked_over(
     by(loudest_by_digest),
@@ -1693,7 +1741,12 @@ test "a store held in memory vouches to a run of a stamp that kept in it, and to
 }
 
 test "an edit marks the records that read what moved, and what asked them only where it moved" {
-  let q = test_queries(b"h1").insert(b"loudest", { name: b"loudest", hash: b"d1", body: loudest });
+  let q = test_queries(b"h1").insert(b"loudest", {
+    name: b"loudest",
+    hash: b"d1",
+    body: loudest,
+    kept: true,
+  });
   let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"loudest", b"a");
   assert_eq(first.output, b"long 4!");
   // Another text of the same length: `length` answers alike, so neither query above it is marked.
@@ -1761,6 +1814,7 @@ test "a query whose definition moved marks what asked it, though nothing it read
     name: b"length",
     hash: b"h1",
     body: |input: Bytes| length_of(input),
+    kept: true,
   });
   let first = asked_over(q1, test_world([{ at: b"a", text: b"four" }]), b"longer", b"a");
   let counting_twice = test_queries(b"h2").insert(b"length", {
@@ -1771,6 +1825,7 @@ test "a query whose definition moved marks what asked it, though nothing it read
         Some(text) -> Bytes::of_string(Int::to_string(2 * text.len())),
         None -> b"none",
       },
+    kept: true,
   });
   let moved = asked_over(counting_twice, first.world, b"longer", b"a");
   assert_eq(moved.output, b"long 8");
@@ -2059,6 +2114,36 @@ test "a record whose answer is no longer kept is answered again" {
   assert_eq([first.lost, lost.lost], [0, 1])
 }
 
+fn read_whole(input: Bytes) -> Bytes / {memo.read} =
+  match memo.world(b"file", input) { Some(t) -> t, None -> b"" }
+
+test "a query that keeps no longer answers keeps its records, and a run that needs one makes it again" {
+  let text = b"word ".repeat(1000);
+  let q = test_queries(b"h1").insert(b"length", {
+    name: b"length",
+    hash: b"h1",
+    body: read_whole,
+    kept: false,
+  });
+  let first = asked_over(q, test_world([{ at: b"a", text: text }]), b"longer", b"a");
+  assert_eq(first.output, b"long ".concat(text));
+  assert(!first.world.held.outputs.contains(digest_of(Some(text))));
+  assert(first.world.held.outputs.contains(digest_of(Some(first.output))));
+  let again = asked_over(q, first.world, b"longer", b"a");
+  assert_eq([again.executed, again.lost], [0, 0]);
+  let whole = asked_over(q, again.world, b"length", b"a");
+  assert_eq(whole.output, text);
+  assert_eq([whole.executed, whole.lost], [1, 0]);
+  let short = test_queries(b"h1").insert(b"length", {
+    name: b"length",
+    hash: b"h1",
+    body: length_of,
+    kept: false,
+  });
+  let held = asked_over(short, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  assert(held.world.held.outputs.contains(digest_of(Some(b"4"))))
+}
+
 fn offering(input: Bytes) -> Bytes / {memo.read} = {
   memo.offer(b"taken", input, b"v ".concat(input));
   b"offered"
@@ -2073,10 +2158,17 @@ fn both(input: Bytes) -> Bytes / {memo.read} = {
 }
 
 fn offer_queries(offering_hash: Bytes) -> Map<Bytes, Query<| {}>> =
-  Map::new().insert(b"offering", { name: b"offering", hash: offering_hash, body: offering }).insert(
-    b"taken",
-    { name: b"taken", hash: b"t1", body: taking },
-  ).insert(b"both", { name: b"both", hash: b"b1", body: both })
+  Map::new().insert(b"offering", {
+    name: b"offering",
+    hash: offering_hash,
+    body: offering,
+    kept: true,
+  }).insert(b"taken", { name: b"taken", hash: b"t1", body: taking, kept: true }).insert(b"both", {
+    name: b"both",
+    hash: b"b1",
+    body: both,
+    kept: true,
+  })
 
 test "an answer taken from an offer is made again when the query that offered it is defined anew" {
   let first = asked_over(offer_queries(b"o1"), test_world([]), b"both", b"a");
@@ -2103,6 +2195,7 @@ test "a query asking for its own answer is refused" {
     name: b"self",
     hash: b"s",
     body: |input: Bytes| memo.ask(b"self", input),
+    kept: true,
   });
   assert_eq(try_answer(|| asked_over(looping, test_world([]), b"self", b"x").output), None)
 }
