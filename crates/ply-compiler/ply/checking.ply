@@ -3262,24 +3262,33 @@ pub fn unkept_queries() -> List<Bytes> =
 
 /// What a load asks of each of `shipped`, the shipped modules, of `qs` over a run: its answer and its
 /// hashing, which ask all the rest, and of the standard library which of its modules declare each
-/// name, which asks each what it documents: what `ply doc` reads wherever it runs.
+/// name, which asks each what it documents: what `ply doc` reads wherever it runs. Beside the run,
+/// the answer of each module that refuses, in the order they were asked.
 pub fn shipped_all(
   qs: Map<Bytes, CheckQuery>,
   shipped: List<Bytes>,
   run: Run,
-) -> Run / {Driving, abort.raise} = {
+) -> { run: Run, refused: List<Answered> } / {Driving, abort.raise} = {
   let ordered = dependencies_first(
     qs,
     run,
     shipped.map(|m: Bytes| { module: m, shipped: true, tested: false }),
   );
-  declaring_in(
-    qs,
-    b"std",
-    ordered.order.fold(ordered.run, |r: Run, named: Named|
-      [module_query(), hashes_query(), wants_query()].fold(r, |at: Run, query: Bytes|
-        answer(qs, at, query, bin::encode(named, named_bin())).run)),
-  ).run
+  let asked = ordered.order.fold(
+    { run: ordered.run, refused: [] },
+    |acc: { run: Run, refused: List<Answered> }, named: Named| {
+      let at = bin::encode(named, named_bin());
+      let m = answer(qs, acc.run, module_query(), at);
+      let a = decoded(m.output, module_answer_bin(), "a module's answer");
+      {
+        run: [hashes_query(), wants_query()].fold(m.run, |r: Run, query: Bytes|
+          answer(qs, r, query, at).run),
+        refused: if a.refused.len() == 0 { acc.refused }
+        else { acc.refused.push({ module: named.module, answer: a }) },
+      }
+    },
+  );
+  { run: declaring_in(qs, b"std", asked.run).run, refused: asked.refused }
 }
 
 /// What each of `pulled`, shipped modules a load pulled, read with their tests where `tested` says,
@@ -6031,7 +6040,10 @@ test "a definition added to a shipped module checks and hashes no module that im
 }
 
 /// What a toolchain that ships `shipped` answers of them, as the store its pack is cut from holds it.
-fn shipped_held(shipped: List<Source>) -> Held / {abort.raise} = {
+fn shipped_held(shipped: List<Source>) -> Held / {abort.raise} = shipped_asked(shipped).held
+
+/// [`shipped_held`], beside each of `shipped` that refuses.
+fn shipped_asked(shipped: List<Source>) -> { held: Held, value: List<Answered> } / {abort.raise} = {
   let texts = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
   let held_text = |name: Bytes| texts.get(name);
@@ -6045,10 +6057,18 @@ fn shipped_held(shipped: List<Source>) -> Held / {abort.raise} = {
       looked(nowhere, held_text, held_text, || names, nothing_embedded, kind, at),
     || {
       let qs = fresh_registry();
-      shipped_all(qs, names, started(qs));
-      ()
+      shipped_all(qs, names, started(qs)).refused
     },
-  ).held
+  )
+}
+
+test "answering the shipped modules names each one that refuses" {
+  let refused = shipped_asked([
+    { name: b"std.a", src: b"pub fn a() -> Int = 1\n" },
+    { name: b"std.b", src: b"import std.a (a)\n\npub fn b() -> Int = a(2)\n" },
+  ]).value;
+  assert_eq(refused.map(|x: Answered| x.module), [b"std.b"]);
+  assert_eq(refused.map(|x: Answered| x.answer.refused.map(|d: Diag| d.code)), [[b"E0202"]])
 }
 
 /// The pack cut from `held`: what it holds of the queries a pack carries, over shipped files a
