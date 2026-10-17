@@ -303,6 +303,7 @@ helpers! {
     rt_tagged_box(w) -> Word;
     rt_tagged_open(w) -> Word;
     rt_tick();
+    rt_stack_more() -> Word;
     rt_grow(entry, args) -> Word;
     rt_bitnot(a) -> Word;
     rt_inc_shared(w);

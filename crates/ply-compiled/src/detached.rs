@@ -4,7 +4,7 @@
 use crate::heap::{self, Word};
 use crate::rt::{
     Args, Ctx, FAILED_ABORT, FAILED_UNWIND, FrameClause, HandlerFrame, StackCopy, call_value,
-    drop_frame, release_vars, switch_keeping,
+    drop_frame, no_stack_to_take, release_vars, switch_keeping,
 };
 use crate::stack::{Stack, switch};
 use ply_core::{Diagnostic, Symbol, codes};
@@ -13,14 +13,12 @@ pub struct Detached {
     stack: Option<Stack>,
     /// The body's own frames, the handle's at the bottom; its parent is where `k` was last called.
     frames: usize,
-    /// The body's saved stack pointer, the frames and the floor current when it stopped.
+    /// The body's saved stack pointer, and the frames current when it stopped.
     sp: usize,
     saved_current: usize,
-    saved_floor: usize,
     /// The stack that entered or resumed the body, to come back to when it stops.
     resumer_sp: usize,
     resumer_current: usize,
-    resumer_floor: usize,
     request: Option<Stopped>,
     answer: Word,
     /// Owned here, not by the entry frame, which every restored snapshot would release again.
@@ -35,7 +33,6 @@ pub struct Detached {
 /// What a stop on the body's own stack leaves behind, so the body can be run from it again.
 struct Capture {
     sp: usize,
-    floor: usize,
     /// The bytes from `sp` to the top of the body's stack; `None` for a stop from a task's stack.
     bytes: Option<Vec<u8>>,
     /// What the stack held beside its bytes: its frames, what its runtime frames kept, and the
@@ -67,6 +64,12 @@ const ONE_SHOT: &str = "the `handle` this continuation was captured in has alrea
 /// `rt_handle_detached`: runs the body on a fresh stack until it stops; answers the handle's value.
 pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, body: Word) -> Word {
     let c = unsafe { &mut *ctx };
+    let Some(stack) = Stack::take() else {
+        clauses.into_iter().for_each(FrameClause::release);
+        heap::dec(ret);
+        heap::dec(body);
+        return no_stack_to_take(c);
+    };
     let id = c.detached.len();
     let opener = c.current;
     let fuel = c.fuel;
@@ -76,18 +79,14 @@ pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, b
     c.stacks[frames]
         .list
         .push(HandlerFrame::detached(clauses, id, fuel, handler));
-    let stack = Stack::new();
     let sp = stack.prepare(entry, ctx as usize);
-    let floor = stack.floor();
     c.detached.push(Detached {
         stack: Some(stack),
         frames,
         sp,
         saved_current: frames,
-        saved_floor: floor,
         resumer_sp: 0,
         resumer_current: 0,
-        resumer_floor: 0,
         request: None,
         answer: 0,
         body,
@@ -168,12 +167,10 @@ pub(crate) unsafe fn resume(
         d.answer = a;
     }
     d.resumer_current = c.current;
-    d.resumer_floor = c.stack_floor;
     d.state = State::Running;
-    let (frames, current, floor, sp) = (d.frames, d.saved_current, d.saved_floor, d.sp);
+    let (frames, current, sp) = (d.frames, d.saved_current, d.sp);
     c.stacks[frames].parent = Some(c.current);
     c.current = current;
-    c.stack_floor = floor;
     if d.state == State::Running && d.starting.is_some() {
         c.starting_detached = Some(id);
     }
@@ -183,7 +180,6 @@ pub(crate) unsafe fn resume(
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
     c.current = d.resumer_current;
-    c.stack_floor = d.resumer_floor;
     match d.request.take() {
         Some(Stopped::Performed { closure, mut args }) => {
             d.state = State::Suspended;
@@ -238,9 +234,9 @@ fn finish(c: &mut Ctx, id: usize) {
 /// Records the stop the body just made and answers its capture's index.
 fn capture_stop(c: &mut Ctx, id: usize) -> usize {
     let d = &c.detached[id];
-    let (sp, floor, own) = (d.sp, d.saved_floor, d.frames);
-    // A stop from a task's stack has none to copy, and so has one the body grew onto: the frames
-    // waiting there are not the ones a restore would write back.
+    let (sp, own) = (d.sp, d.frames);
+    // A stop from a task's stack has none to copy: the frames waiting there are not the ones a
+    // restore would write back.
     let live = if d.saved_current == own {
         d.stack.as_ref().and_then(|stack| stack.live(sp))
     } else {
@@ -267,7 +263,6 @@ fn capture_stop(c: &mut Ctx, id: usize) -> usize {
     let d = &mut c.detached[id];
     d.captures.push(Capture {
         sp,
-        floor,
         bytes,
         stack,
         pins,
@@ -312,7 +307,7 @@ fn restore(c: &mut Ctx, id: usize, k: usize) -> bool {
     }
     let captured = &d.captures[k].stack;
     let copy = StackCopy::of(&captured.list, &captured.kept, &captured.held);
-    let (own, sp, floor) = (d.frames, d.captures[k].sp, d.captures[k].floor);
+    let (own, sp) = (d.frames, d.captures[k].sp);
     let s = &mut c.stacks[own];
     StackCopy {
         list: std::mem::replace(&mut s.list, copy.list),
@@ -323,7 +318,6 @@ fn restore(c: &mut Ctx, id: usize, k: usize) -> bool {
     let d = &mut c.detached[id];
     d.sp = sp;
     d.saved_current = own;
-    d.saved_floor = floor;
     d.state = State::Suspended;
     d.live = Some(k);
     true
@@ -344,7 +338,6 @@ pub(crate) unsafe fn stop(
     let d = &mut c.detached[id];
     d.request = Some(Stopped::Performed { closure, args });
     d.saved_current = c.current;
-    d.saved_floor = c.stack_floor;
     let to = d.resumer_sp;
     let from = &mut d.sp as *mut usize;
     unsafe { switch_keeping(ctx, from, to) };
@@ -364,6 +357,8 @@ extern "C" fn entry(arg: usize) {
             .starting
             .take()
             .expect("a detached body starts with its closure");
+        let own = c.detached[id].stack.as_ref();
+        c.stack_floor = unsafe { own.expect("a detached body starts on its stack").enter() };
         (id, body)
     };
     let mut r = call_value(ctx, body, &[]);

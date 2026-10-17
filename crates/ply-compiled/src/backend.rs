@@ -476,10 +476,12 @@ impl Bodies {
             return EntryOutcome::Answered(value);
         }
         let inward = (ctx.heap.allocated() - before) as u64;
+        let entering = &mut *ctx as *mut crate::rt::Ctx;
         // SAFETY: `self._code` owns the entry's pages, `ctx` is uniquely borrowed, and
         // `handles` is `MAX_ARITY` wide, which `Bodies::new` refused to exceed.
-        let mut out =
-            unsafe { (admitted.entry)(&mut *ctx as *mut crate::rt::Ctx, handles.as_ptr()) };
+        let mut out = crate::rt::on_known_stack(entering, || unsafe {
+            (admitted.entry)(entering, handles.as_ptr())
+        });
         let production = ctx.sims.last().filter(|sim| sim.is_production());
         let held = ply_core::Held {
             bridges: ctx.heap.bridges() as u64,
