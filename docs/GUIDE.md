@@ -2856,18 +2856,34 @@ call copies a seed held anywhere else. A record, a record update, a list
 literal, a closure and a list pattern's rest each make an object, as does a
 constructor no subject left cells for.
 
+A function parameter may name the memory a call of it holds, after its type and
+its cost name if it has one, and only the definition's `space` clauses read that
+name, as an `Int` that may be `0` (`E0105` if it is named like a parameter or
+another space name):
+
+```ply
+fn wrapped<| e>(xs: List<Int>, f: (Int) -> List<Int> / e space s) -> List<List<Int>> / e
+  space xs.len() + xs.len() * s
+= xs.map(f)
+```
+
+At a call the name stands for what one call of the function given holds, as a
+cost name stands for its steps. A function may hold nothing, so `space xs.len() * s`
+would not hold here: `map` makes the list it answers whatever `f` holds.
+
 A `space` bound is an obligation, `<owner> space #<n>`, that `ply prove` reads
 off the body with the reading of calls and recursion a `cost` bound has, except
 that a recursion whose paths that call back make nothing and call back last
-holds what its last call does, whatever it descends on. A call of a definition
-whose body another package keeps holds its first `space` bound, and only where
-each argument it is handed that is not a number is held alone; `List::map`,
-`List::filter` and `List::fold`, which state none, hold what the function they
-are handed holds once for each element, as `Map::fold`, `iterate`,
-`Map::update`, `Bytes::position` and `metered` do for each call they make, and
-`map` and `filter` a list as long as the one they walk. A clause on a
-definition that performs more than a raise is `E0463`. Anything else leaves the
-bound `unproved` (`E0474`), stopped at `unbounded` with why.
+holds what its last call does, whatever it descends on, and that a parameter a
+call back hands a value something else holds is read held so on every call. A
+call of a definition whose body another package keeps holds its first `space`
+bound, and only where each argument it is handed that is neither a number nor a
+function is held alone; `List::map`, `List::filter` and `List::fold`, which
+state none, hold what the function they are handed holds once for each element,
+as `Map::fold`, `iterate`, `Map::update`, `Bytes::position` and `metered` do for
+each call they make, and `map` and `filter` a list as long as the one they walk.
+A clause on a definition that performs more than a raise is `E0463`. Anything
+else leaves the bound `unproved` (`E0474`), stopped at `unbounded` with why.
 
 `ply review` reports, per definition changed since the last
 `ply review --accept`, whether the implementation, the spec and the obligations

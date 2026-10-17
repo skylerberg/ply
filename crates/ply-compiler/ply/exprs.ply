@@ -150,7 +150,8 @@ pub fn slot_args(slots: List<Slot>, args: List<Expr>, named: List<NamedArg>) -> 
     })
 
 /// A parameter; only a `fn` parameter may carry a `default`, or name with `cost` the steps a call of
-/// it takes, which only that definition's `cost` clauses read.
+/// it takes and with `space` the memory a call of it holds, which only that definition's `cost` and
+/// `space` clauses read.
 pub type Param = {
   name: Ident,
   /// Written `keep` before a function type: the function may hold the function it is handed past
@@ -158,6 +159,7 @@ pub type Param = {
   keep: Bool,
   ty: Option<TypeExpr>,
   cost: Option<Ident>,
+  space: Option<Ident>,
   default: Option<Expr>,
   span: Span,
 }
@@ -1212,6 +1214,7 @@ pub fn listing(binder: Ident, ty: TypeExpr, table: Expr, label: Expr, for_span: 
               keep: false,
               ty: Some(ty),
               cost: None,
+              space: None,
               default: None,
               span: binder.span,
             },
@@ -1627,37 +1630,63 @@ fn param_inner(
   let { parser, node: n } = expect_binder(input, parser, b"a parameter name")?;
   let { parser, node: typed } = param_ty(input, parser, allow_keep)?;
   let t = typed.ty;
-  let { parser, node: c } = param_cost(input, parser, allow_default, t)?;
+  let { parser, node: c } = param_named(
+    input,
+    parser,
+    allow_default,
+    t,
+    b"cost",
+    b"steps a call of it takes",
+  )?;
+  let { parser, node: s } = param_named(
+    input,
+    parser,
+    allow_default,
+    t,
+    b"space",
+    b"memory a call of it holds",
+  )?;
   let { parser, node: d } = param_default(input, parser, allow_default)?;
   // A refused default is `None`, so the span stops before the `= 1` that was read.
   let end = match d {
     Some(e) -> expr_span(e),
-    None -> match c {
-      Some(k) -> k.span,
-      None -> match t { Some(x) -> ty_span(x), None -> n.span },
+    None -> match ((s, c)) {
+      (Some(k), _) -> k.span,
+      (None, Some(k)) -> k.span,
+      _ -> match t { Some(x) -> ty_span(x), None -> n.span },
     },
   };
   Ok({
     parser: parser,
-    node: { name: n, keep: typed.keep, ty: t, cost: c, default: d, span: span_to(n.span, end) },
+    node: {
+      name: n,
+      keep: typed.keep,
+      ty: t,
+      cost: c,
+      space: s,
+      default: d,
+      span: span_to(n.span, end),
+    },
   })
 }
 
-/// `cost k` after a `fn` parameter's function type.
-fn param_cost(
+/// `cost k` or `space s` after a `fn` parameter's function type, the `word` naming what one call of
+/// the function takes.
+fn param_named(
   input: Input,
   parser: Parser,
   allowed: Bool,
   t: Option<TypeExpr>,
+  word: Bytes,
+  what: Bytes,
 ) -> Result<Parsed<Option<Ident>>, Parser> / {abort.raise} =
-  if !allowed || !at_ident_text(input, parser, b"cost") { Ok({ parser: parser, node: None }) }
-  else {
+  if !allowed || !at_ident_text(input, parser, word) { Ok({ parser: parser, node: None }) } else {
     match t {
       Some(TFn(_)) -> {
         let { parser, node: k } = expect_binder(
           input,
           advance(input, parser).parser,
-          b"a name for the steps a call of it takes",
+          Bytes::concat_all([b"a name for the ", what]),
         )?;
         Ok({ parser: parser, node: Some(k) })
       },
@@ -1666,7 +1695,7 @@ fn param_cost(
           error_here(
             input,
             parser,
-            b"a function type before `cost`, which names the steps a call of it takes",
+            Bytes::concat_all([b"a function type before `", word, b"`, which names the ", what]),
           ),
         ),
     }
@@ -1729,7 +1758,15 @@ fn param_default(
   }
 
 pub fn no_param() -> Param =
-  { name: no_ident(), keep: false, ty: None, cost: None, default: None, span: dummy_span() }
+  {
+    name: no_ident(),
+    keep: false,
+    ty: None,
+    cost: None,
+    space: None,
+    default: None,
+    span: dummy_span(),
+  }
 
 /// `||` is one token: the empty parameter list.
 fn lambda_params(
@@ -2412,7 +2449,8 @@ fn dump_field(field: RecField) -> Bytes / {abort.raise} =
 fn dump_named(arg: NamedArg) -> Bytes / {abort.raise} =
   Bytes::concat_all([dump_node(arg.span, b"narg"), dump_ident(arg.name), dump_expr(arg.value)])
 
-/// A cost name is written only where one is, so a parameter without one dumps as it always has.
+/// A cost or space name is written only where one is, so a parameter without one dumps as it always
+/// has.
 pub fn dump_param(param: Param) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(param.span, b"prm"),
@@ -2420,6 +2458,7 @@ pub fn dump_param(param: Param) -> Bytes / {abort.raise} =
     if param.keep { dump_word(b"keep") } else { b"" },
     dump_opt(param.ty, dump_ty),
     match param.cost { Some(k) -> dump_word(b"cost").concat(dump_ident(k)), None -> b"" },
+    match param.space { Some(s) -> dump_word(b"space").concat(dump_ident(s)), None -> b"" },
     dump_opt(param.default, dump_expr),
   ])
 
@@ -2729,6 +2768,18 @@ test "a fn parameter of a function type may name its cost, and no other paramete
   assert(dump_fn_param_of(b"n: Int cost k").contains("!E0001"));
   // A lambda's parameter is called where it is written, so it names no cost.
   assert(!dump_param_of(b"g: (Int) -> Int cost k").contains("%cost;"))
+}
+
+test "a fn parameter of a function type may name its space after its cost, and no other parameter may" {
+  let named = dump_fn_param_of(b"g: (Int) -> Int space s");
+  assert(named.contains("%space;") && !named.contains("%cost;"), Some(named));
+  assert(named.ends_with(";@73;?0;#0;"), Some(named));
+  let both = dump_fn_param_of(b"g: (Int) -> Int cost k space s");
+  assert(both.contains("%cost;") && both.ends_with(";@73;?0;#0;"), Some(both));
+  assert(dump_fn_param_of(b"n: Int space s").contains("!E0001"));
+  // Written after the space name, `cost` is no name of the parameter's.
+  assert(!dump_fn_param_of(b"g: (Int) -> Int space s cost k").contains("%cost;"));
+  assert(!dump_param_of(b"g: (Int) -> Int space s").contains("%space;"))
 }
 
 test "a fn parameter of a function type may be written `keep`, and no other may" {
