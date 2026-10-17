@@ -9,13 +9,14 @@ import diagnostics (parse_all)
 import front (Analysed, analyse, dump_of, analyse_pulling_std_with, no_rows)
 import resolve (qualify)
 import layout (Intrinsic, intrinsics, layouts)
-import emit (emit_roots_answer, ctor_layouts, ctor_sums, RootAnswer)
+import emit (emit_roots_answer, ctor_layouts, ctor_sums, RootAnswer, Need, Layout)
 import emit.keys (Named)
 import emit.pieces (spelled)
 import emit.tir (Rep, RInt, RWord, RMaybe, RNum, Var, Arg, AVar, Val, Make, Made, MList, Call,
                  Native, Op, OContainer, Operation, Pack, Uses, Inst, Let, Fn, Declined, Spine,
                  Data, Containers, rep_of_arg)
-import emit.tir.containers (Laid, Length, Elements, ByteAt, U32At, Joined)
+import emit.tir.containers (Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew, ArraySet,
+                            ArrayOfList, ArrayGet, Bits, IntBits, FloatBits, DecimalBits)
 import emit.lower (lowered_fn)
 import emit.lower.setting (Root, setting_in)
 import emit.print (printed_fn)
@@ -35,6 +36,7 @@ fn natives() -> List<Bytes> =
     b"Map::len",
     b"Array::to_list",
     b"Array::at",
+    b"Array::new",
     b"Int::to_string",
     b"List::with_capacity",
   ]
@@ -216,6 +218,69 @@ test "a lookup answers an Option held as its payload's word, with no object made
   )
 }
 
+test "an array is made, written and read as its elements' type lays it out" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn made(n: Int) -> Array<Int> / {abort.raise} = Array::new(n, 0)\n",
+      b"fn written(a: Array<Float>, x: Float) -> Array<Float> / {abort.raise} = a.set(1, x)\n",
+      b"fn laid(xs: List<Decimal>) -> Array<Decimal> = Array::of_list(xs)\n",
+      b"fn read(a: Array<Int>, i: Int) -> Int / {abort.raise} = a.get(i)\n",
+      b"fn words(a: Array<String>, i: Int) -> String / {abort.raise} = a.get(i)\n",
+      b"fn records(n: Int, r: { x: Int, y: Int }) -> Array<{ x: Int, y: Int }> / {abort.raise} = Array::new(n, r)\n",
+    ]),
+  );
+  let op = |name: Bytes|
+    ops_in(bound_in(p, name)).map(
+      |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }|
+        { op: o.op, answer: o.answer, takes: o.uses.takes },
+    );
+  let bits = |b: Bits, stride: Int, shape: Bytes|
+    { bits: Some(b), stride: stride, shape: [shape], counted: [] };
+  // A scalar is held as its bits in place, an element of any other type as its word.
+  assert_eq(op(b"made"), [
+    { op: OContainer(ArrayNew(bits(IntBits, 1, b"e!int"))), answer: RWord, takes: [false, true] },
+  ]);
+  assert_eq(op(b"written"), [
+    {
+      op: OContainer(ArraySet(bits(FloatBits, 1, b"e!f"))),
+      answer: RWord,
+      takes: [true, false, true],
+    },
+  ]);
+  assert_eq(op(b"laid"), [
+    { op: OContainer(ArrayOfList(bits(DecimalBits, 2, b"e!d"))), answer: RWord, takes: [true] },
+  ]);
+  assert_eq(op(b"read"), [
+    { op: OContainer(ArrayGet(bits(IntBits, 1, b"e!int"))), answer: RInt, takes: [false, false] },
+  ]);
+  assert_eq(op(b"words"), [
+    {
+      op: OContainer(ArrayGet({ bits: None, stride: 1, shape: [], counted: [] })),
+      answer: RWord,
+      takes: [false, false],
+    },
+  ]);
+  // The element written is handed over as the array holds it, a scalar unboxed.
+  assert_eq(packs_in(bound_in(p, b"made")), []);
+  assert_eq(match formed(p, b"records") { Ok(_) -> None, Err(no) -> Some(no.by) }, Some(Containers))
+}
+
+test "an array of a type variable's elements is made by the runtime, its layout noted for a specialisation" {
+  let p = program(b"fn made<a>(n: Int, x: a) -> Array<a> / {abort.raise} = Array::new(n, x)\n");
+  match formed(p, b"made") {
+    Ok(f) -> {
+      assert_eq(f.links.needs.map(|n: Need| n.reads), [Layout]);
+      assert_eq(
+        natives_in(bound_in(p, b"made")).map(
+          |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
+        ),
+        [b"builtin_array_new_p"],
+      )
+    },
+    Err(no) -> panic(String::of_bytes_lossy(no.why)),
+  }
+}
+
 test "a builtin the runtime lacks is declined, and one written at a scalar's type goes on to scalars" {
   let src = Bytes::concat_all([
     b"fn size(s: String) -> Int = s.len()\n",
@@ -283,6 +348,14 @@ fn corpus() -> Bytes =
     b"fn text(n: Int) -> String = n.to_string()\n",
     b"fn element(a: Array<String>, i: Int) -> Option<String> = a.at(i)\n",
     b"fn reserved(n: Int) -> List<String> = List::with_capacity(n)\n",
+    b"fn filled(n: Int, x: Float) -> Array<Float> / {abort.raise} = Array::new(n, x)\n",
+    b"fn shared(n: Int, s: String) -> Array<String> / {abort.raise} = Array::new(n, s)\n",
+    b"fn replaced(a: Array<Int>, i: Int, x: Int) -> Array<Int> / {abort.raise} = a.set(i, x)\n",
+    b"fn renamed(a: Array<String>, s: String) -> Array<String> / {abort.raise} = a.set(0, s)\n",
+    b"fn arrayed(xs: List<Int>) -> Array<Int> = Array::of_list(xs)\n",
+    b"fn decimals(xs: List<Decimal>) -> Array<Decimal> = Array::of_list(xs)\n",
+    b"fn got(a: Array<Float>, i: Int) -> Float / {abort.raise} = a.get(i)\n",
+    b"fn small(a: Array<U8>) -> U8 / {abort.raise} = a.get(2)\n",
   ])
 
 fn corpus_names() -> List<Bytes> =
@@ -313,6 +386,14 @@ fn corpus_names() -> List<Bytes> =
     b"text",
     b"element",
     b"reserved",
+    b"filled",
+    b"shared",
+    b"replaced",
+    b"renamed",
+    b"arrayed",
+    b"decimals",
+    b"got",
+    b"small",
   ]
 
 /// What today's emitter answers for the roots `m.<name>` of `p` that `names` name, the runtime
@@ -346,10 +427,12 @@ fn read_past_counts(text: Bytes) -> List<Bytes> / {abort.raise} =
     ),
   )
 
-/// Whether `l` is `x = 0;` for a local `x`.
+/// Whether `l` is `x = 0;` for a local `x`, or blank.
 fn moved_out(l: Bytes) -> Bool / {abort.raise} = {
   let words = l.split(b" ").filter(|w: Bytes| w.len() > 0);
-  words.len() == 3 && words.get(1) == b"=" && words.get(2) == b"0;" && local_name(words.get(0))
+  words.len() == 0
+    || (words.len() == 3 && words.get(1) == b"=" && words.get(2) == b"0;"
+    && local_name(words.get(0)))
 }
 
 fn local_name(w: Bytes) -> Bool / {abort.raise} =

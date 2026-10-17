@@ -4,7 +4,7 @@
 //! runtime's helper named for it.
 
 import parsing (Span, prelude_binder)
-import types (Type, TyFn, list_type)
+import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, list_type)
 import typing (unknown_type)
 import resolve (qualify)
 import layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt, NodeLen, LeafAt,
@@ -12,12 +12,16 @@ import layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt, N
                MapRoot, NodeCount, MapHeight, NodeKey, NodeValue, NodeKid, KidMax, KidSize, NewLeaf,
                NewMapBranch, PairPut, PairSet, PairTake, LeafCut, BranchCut, KidOut, KidBack,
                KidPut, KidDrop, MapSwap, intrinsic_named)
-import emit (Def, Imported, builtin_helper)
+import emit (Def, Imported, KInt, KFloat, KDec, KNum, KSum, TyRec, Layout, builtin_helper, kind_of,
+             has_vars, laid_vars, spelled_field)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, Var, Arg, AVar, Make, MList,
                  Native, Op, OContainer, Let, Containers)
-import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined)
+import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew,
+                            ArraySet, ArrayOfList, ArrayGet, Element, Bits, IntBits, WidthBits,
+                            FloatBits, DecimalBits)
 import emit.lower.held (held_as)
-import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, type_at, type_of)
+import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, noted, type_at,
+                        type_of)
 import emit.lower.scalars (operated)
 
 /// Builtin `name` called on `args`; `callee` is where its name is written, which the checker files
@@ -128,12 +132,43 @@ fn contained(
     refuse(st, Containers, b"a callback builtin outside its fused shape: ".concat(name))
   } else if name == b"Bytes::position" && cx.setting.release {
     refuse(st, Containers, b"a byte string's position found by a loop in the body")
-  } else if is_array_write(name) || name == b"Array::get" {
-    refuse(st, Containers, b"an array written or read at the layout of its elements: ".concat(name))
-  } else if !cx.setting.builtins.contains(name) {
+  } else {
+    match laid_element(name, args, f) {
+      Some(t) -> if has_vars(t) { called(cx, layout_needed(st, t), name, args, f, at) }
+      else if name == b"Columns::get" { called(cx, st, name, args, f, at) }
+      else { arrayed(cx, st, name, args, t, f.ret, at) },
+      None -> called(cx, st, name, args, f, at),
+    }
+  }
+
+/// A builtin called through the runtime, which must implement it.
+fn called(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  f: Settled,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  if !cx.setting.builtins.contains(name) {
     refuse(st, Containers, b"a name the runtime implements no builtin of: ".concat(name))
   } else if is_lookup(name) && args.len() == 2 { looked_up(cx, st, name, args, f.ret, at) }
   else { through_runtime(cx, st, name, args, f.ret, at) }
+
+/// `st` noting each type variable that leaves the layout of an element of type `t` unknown, which a
+/// specialisation would lay its elements out by.
+fn layout_needed(st: Lowering, t: Type) -> Lowering =
+  if !open(t) { st }
+  else { laid_vars(t).fold(st, |acc: Lowering, v: Int| noted(acc, { var: v, reads: Layout })) }
+
+/// Whether a value of type `t` is laid out by a type variable: one, or a record holding one.
+fn open(t: Type) -> Bool =
+  match t {
+    TyVar(_) -> true,
+    TyRecord(fs) -> fs.any(|x: Field| open(x.ty)),
+    TyNominal(x) -> x.fields.any(|y: Field| open(y.ty)),
+    _ -> false,
+  }
 
 /// An operation that reads `args`, written in place, its answer held as `rep`: the object first,
 /// as a word, and then each index as an `Int`.
@@ -358,8 +393,107 @@ fn laying(op: Intrinsic) -> Option<Laying> = {
 
 fn is_lookup(name: Bytes) -> Bool = name == b"Array::at" || name == b"ListNode::leaf_of"
 
-fn is_array_write(name: Bytes) -> Bool =
-  name == b"Array::new" || name == b"Array::set" || name == b"Array::of_list"
+/// The type of the elements a call of `name` lays out or reads where they lie: an array's for
+/// `Array::new`, `set`, `of_list` and `get`, and a `Columns`' for `Columns::get`.
+fn laid_element(name: Bytes, args: List<Arg>, f: Settled) -> Option<Type> = {
+  let held = if (name == b"Array::new" && args.len() == 2)
+      || (name == b"Array::set" && args.len() == 3)
+      || (name == b"Array::of_list" && args.len() == 1) { Some(f.ret) }
+  else if (name == b"Array::get" || name == b"Columns::get") && args.len() == 2 { f.params.at(0) }
+  else { None };
+  match held {
+    Some(TyCon(c)) -> if c.name != b"Array" && c.name != b"Columns" { None } else { c.args.at(0) },
+    _ -> None,
+  }
+}
+
+/// Array builtin `name` called on `args`, written over an array laid out for elements of type `ty`,
+/// answering a value of type `answer`.
+fn arrayed(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  ty: Type,
+  answer: Type,
+  at: Span,
+) -> Lowered =
+  match element_of(ty) {
+    None ->
+      refuse(
+        st,
+        Containers,
+        b"an array holding records or options in place, which waits for their layouts",
+      ),
+    Some(e) -> {
+      let item = match e.bits {
+        Some(IntBits) -> RInt,
+        Some(WidthBits(w)) -> RNum(w),
+        Some(FloatBits) -> RFloat,
+        Some(DecimalBits) -> RDec,
+        None -> RWord,
+      };
+      // What each operand is held as and whether the operation takes it.
+      let shape = if name == b"Array::new" {
+        { op: ArrayNew(e), reps: [RInt, item], takes: [false, true] }
+      } else if name == b"Array::set" {
+        { op: ArraySet(e), reps: [RWord, RInt, item], takes: [true, false, true] }
+      } else if name == b"Array::of_list" { { op: ArrayOfList(e), reps: [RWord], takes: [true] } }
+      else { { op: ArrayGet(e), reps: [RWord, RInt], takes: [false, false] } };
+      let got = name == b"Array::get";
+      let operands = range(0, args.len()).fold(
+        { st: st, args: [] },
+        |acc: { st: Lowering, args: List<Arg> }, i: Int|
+          match args.at(i) {
+            None -> acc,
+            Some(a) -> {
+              let h = handed(
+                { st: acc.st, arg: a },
+                match shape.reps.at(i) { Some(r) -> r, None -> RWord },
+                at,
+              );
+              { st: h.st, args: acc.args.push(h.arg) }
+            },
+          },
+      );
+      let answered = bound_as(
+        operands.st,
+        answer,
+        if got { item } else { RWord },
+        Op({
+          op: OContainer(shape.op),
+          args: operands.args,
+          uses: { takes: shape.takes, owned: !got, fails: true, stops: false },
+        }),
+        at,
+      );
+      handed(answered, held_as(cx.setting, answer), at)
+    },
+  }
+
+/// How an array holds elements of type `ty`: a scalar's bits in place, any other but a record or an
+/// `Option` as its word; nothing for those, which an array holds in place as their layouts say.
+fn element_of(ty: Type) -> Option<Element> =
+  if is_option(ty) { None } else {
+    let k = kind_of(ty);
+    let spelled = [spelled_field({ name: b"e", kind: k.kind, ty: k.ty })];
+    let bits = |b: Bits, stride: Int|
+      Some({ bits: Some(b), stride: stride, shape: spelled, counted: [] });
+    match k.ty {
+      TyRec(_) -> None,
+      _ -> match k.kind {
+        KInt -> bits(IntBits, 1),
+        KFloat -> bits(FloatBits, 1),
+        KDec -> bits(DecimalBits, 2),
+        KNum(w) -> if w.bits > 64 { None } else { bits(WidthBits(w), 1) },
+        KSum(_) -> None,
+        _ -> Some({ bits: None, stride: 1, shape: [], counted: [] }),
+      },
+    }
+  }
+
+fn is_option(t: Type) -> Bool =
+  match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
 
 /// A builtin that calls a function it is handed in a shape only a fused loop writes.
 fn is_callback(name: Bytes) -> Bool = name == b"iterate"
