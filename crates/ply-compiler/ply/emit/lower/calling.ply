@@ -13,7 +13,8 @@ import resolve (qualify)
 import infer (is_test_owner)
 import std.bytes (ascii_of_int)
 import emit (Def, Imported, EmitParam, Carrier, Whole, KBoxed, FnArg, erased, has_vars)
-import emit.keys (Named, At, KeyType, KeyLayout, Callee, Root, Generic, root_name, definition_of)
+import emit.keys (Named, At, KeyArg, KeyType, KeyLayout, Callee, Root, Generic, root_name,
+                  definition_of)
 import emit.tir (Rep, RWord, RFlat, RCases, Var, Arg, AVar, AZero, Given, Convention, Make, Get, Op,
                  OCalling, MClosure, PCapture, Call, Apply, Inst, Let, Restart, Return, Fn, Rooted,
                  Closure, Declined, Calling, no_links, falls_through)
@@ -851,16 +852,32 @@ fn named_in(cx: Context, c: Code) -> List<Lambda> / {abort.raise} = {
     NBinary(b) -> within([b.lhs, b.rhs]),
     NField(f) -> named_in(cx, f.base),
     NIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
-    NBlock(b) -> within(statements(b.stmts, b.tail)),
+    NBlock(b) ->
+      within(
+        b.stmts.fold(
+          match b.tail { Some(t) -> [t], None -> [] },
+          |acc: List<Code>, stmt: CodeStmt|
+            acc.push(match stmt { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code }),
+        ),
+      ),
     NList(l) -> within(l.items),
     NRecord(r) -> within(r.fields.map(|f: CodeField| f.value)),
     NUpdate(u) -> within(u.sets.map(|f: CodeField| f.value).push(u.base)),
-    NMatch(m) -> within(arms_of(m.scrutinee, m.arms)),
+    NMatch(m) ->
+      within(
+        m.arms.fold([m.scrutinee], |acc: List<Code>, a: CodeArm|
+          List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
+      ),
     NPerform(x) -> within(x.args),
     NSimulate(x) -> named_in(cx, x.body),
     NParallel(x) -> within(x.branches),
     NHandle(h) ->
-      within(handled_of(h.body, h.clauses, match h.ret { Some(r) -> Some(r.body), None -> None })),
+      within(
+        h.clauses.fold(
+          match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
+          |acc: List<Code>, cl: CodeClause| acc.push(cl.body),
+        ),
+      ),
     _ -> [],
   }
 }
@@ -876,35 +893,35 @@ fn lambdas_of(c: Code) -> List<Lambda> = {
     NField(f) -> lambdas_of(f.base),
     NApp(a) -> within(a.args.push(a.func)),
     NIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
-    NBlock(b) -> within(statements(b.stmts, b.tail)),
+    NBlock(b) ->
+      within(
+        b.stmts.fold(
+          match b.tail { Some(t) -> [t], None -> [] },
+          |acc: List<Code>, stmt: CodeStmt|
+            acc.push(match stmt { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code }),
+        ),
+      ),
     NList(l) -> within(l.items),
     NRecord(r) -> within(r.fields.map(|f: CodeField| f.value)),
     NUpdate(u) -> within(u.sets.map(|f: CodeField| f.value).push(u.base)),
-    NMatch(m) -> within(arms_of(m.scrutinee, m.arms)),
+    NMatch(m) ->
+      within(
+        m.arms.fold([m.scrutinee], |acc: List<Code>, a: CodeArm|
+          List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
+      ),
     NPerform(x) -> within(x.args),
     NSimulate(x) -> lambdas_of(x.body),
     NParallel(x) -> within(x.branches),
     NHandle(h) ->
-      within(handled_of(h.body, h.clauses, match h.ret { Some(r) -> Some(r.body), None -> None })),
+      within(
+        h.clauses.fold(
+          match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
+          |acc: List<Code>, cl: CodeClause| acc.push(cl.body),
+        ),
+      ),
     _ -> [],
   }
 }
-
-/// A block's parts in the order the walks over lambdas read them: its tail first, then each
-/// statement's value.
-fn statements(stmts: List<CodeStmt>, tail: Option<Code>) -> List<Code> =
-  stmts.fold(match tail { Some(t) -> [t], None -> [] }, |acc: List<Code>, s: CodeStmt|
-    acc.push(match s { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code }))
-
-fn arms_of(subject: Code, arms: List<CodeArm>) -> List<Code> =
-  arms.fold([subject], |acc: List<Code>, a: CodeArm|
-    (match a.guard { Some(g) -> acc.push(g), None -> acc }).push(a.body))
-
-fn handled_of(body: Code, clauses: List<CodeClause>, ret: Option<Code>) -> List<Code> =
-  clauses.fold(
-    match ret { Some(r) -> [body, r], None -> [body] },
-    |acc: List<Code>, cl: CodeClause| acc.push(cl.body),
-  )
 
 /// Where `l` first stands in `ls`.
 fn position_in(ls: List<Lambda>, l: Lambda) -> Option<Int> =
@@ -920,11 +937,22 @@ fn has_handle(c: Code) -> Bool = {
     NField(f) -> has_handle(f.base),
     NApp(a) -> within(a.args.push(a.func)),
     NIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
-    NBlock(b) -> within(statements(b.stmts, b.tail)),
+    NBlock(b) ->
+      (match b.tail { Some(t) -> has_handle(t), None -> false })
+        || b.stmts.fold(false, |acc: Bool, stmt: CodeStmt|
+          acc
+            || (match stmt {
+              CLet(l) -> has_handle(l.value),
+              CLetPat(l) -> has_handle(l.value),
+              CDo(d) -> has_handle(d.code),
+            })),
     NList(l) -> within(l.items),
     NRecord(r) -> within(r.fields.map(|f: CodeField| f.value)),
     NUpdate(u) -> within(u.sets.map(|f: CodeField| f.value).push(u.base)),
-    NMatch(m) -> within(arms_of(m.scrutinee, m.arms)),
+    NMatch(m) ->
+      has_handle(m.scrutinee)
+        || m.arms.fold(false, |acc: Bool, a: CodeArm|
+          acc || (match a.guard { Some(g) -> has_handle(g), None -> false }) || has_handle(a.body)),
     NPerform(p) -> within(p.args),
     NLambda(l) -> has_handle(l.body),
     NSimulate(x) -> has_handle(x.body),
