@@ -1,0 +1,1961 @@
+//! What the checker keeps and threads: its state and tables, fresh variables, reporting, and the prelude's types, effects and builtins.
+
+import syntax.parsing (Span, Ident, QName, dummy_span, span_bin, is_bare)
+import std.bin
+import std.hash (blake3)
+import syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode,
+                           MRead, MWrite, MBad, MRaise, is_raise, mode_bin)
+import syntax.items (Item, IFn, IType, IExtern, is_shipped, is_builtin, FnDef, ExternDef,
+                     ImportDecl, INames, Constraint, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash,
+                     DNumeric, DInteger, DRow, is_predicate, deriver_tag, SpecKind, SRequires,
+                     SEnsures, SCost, SSpace, SpecClause, Derived, parse, TDExtern, InstanceKind,
+                     is_pub, Opaque, spec_kind_bin, deriver_bin, instance_kind_bin)
+import syntax.exprs (Expr, EBinary, Param, expr_span, Tagged, prelude_module)
+import syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded, LFloat, LDec,
+                        LChar)
+import check.types (Resource, RSingleton, RVar, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord,
+                    Field, Scheme, Fresh, Subst, TypeEnv, Unified, atoms_insert, row_empty,
+                    row_open, row_singleton, named_type, applied_type, int_type, bool_type,
+                    string_type, bytes_type, float_type, decimal_type, unit_type, list_type,
+                    option_type, fn_type, fields_sorted, ints_insert, ints_union, fresh_new,
+                    fresh_ty_var, fresh_ty, fresh_row_var, fresh_row, subst_new, with_bindings,
+                    resolve_row, free_vars, env_bind_global, at_arguments, TyNominal, atom_bin,
+                    type_bin, scheme_bin, TypeTable)
+import check.termination (Callee, Ending, Summary, summary_bin, ending_bin, callee_bin)
+import check.resolve.tables (ParsedModule, Resolved, Scope, Diag, diag_bin, Label, qualify,
+                             error_with_labels, error_at, error_at_and)
+import expand.rewrite (NumericWitness, numeric_witness_bin, MemberCallee)
+import std.prelude_source
+import expand.derive (DeriveRefusal, HoldsFunction, Unconstrained, NullInsideOption, HoldsNative,
+                      Leaf, Structural, Refused, Nominal, constructor_shape, null_encoded_name,
+                      same_deriver)
+import std.bytes
+import std.bytes (ascii_of_int)
+import std.option
+import std.string
+import check.guards (Guards, Contract, Clause)
+import check.lent (Passed, Takes, passed)
+
+// --- What the checker keeps ----------------------------------------------------------
+
+/// A prelude item's `at` is `{ module: 0, span: dummy_span() }`.
+pub type Location = { module: Int, span: Span }
+
+/// What a `type` declares: an alias each use expands, a record of its own, a sum, or a type the
+/// toolchain lays out.
+pub type Declaration =
+  | DeclaredAlias(TypeExpr)
+  | DeclaredRecord(TypeExpr)
+  | DeclaredSum
+  | DeclaredExtern
+
+/// `opaque` is what the declaration says of it: only `owner` builds a value of the type.
+pub type TypeDecl = {
+  params: List<Bytes>,
+  labels: List<Bytes>,
+  rows: List<Bytes>,
+  declared: Declaration,
+  opaque: Option<Opaque>,
+  owner: Int,
+  span: Span,
+}
+
+/// A `new` record as its declaration converts: its type over the variables its parameters became,
+/// types then labels in `ty_vars` and rows in `row_vars`, which a use's arguments take the place of.
+pub type RecordDecl = { ty: Type, ty_vars: List<Int>, row_vars: List<Int> }
+
+pub type OpInfo = {
+  name: Bytes,
+  mode: Mode,
+  resource_param: Bool,
+  params: List<Type>,
+  ret: Type,
+  at: Location,
+  scheme: Option<Scheme>,
+}
+
+pub type EffectInfo = {
+  name: Bytes,
+  module: Bytes,
+  simple_name: Bytes,
+  nondet: Bool,
+  ops: List<OpInfo>,
+  at: Location,
+}
+
+pub type CtorInfo = {
+  name: Bytes,
+  module: Bytes,
+  simple_name: Bytes,
+  type_name: Bytes,
+  index: Int,
+  arity: Int,
+  fields: List<Type>,
+  scheme: Scheme,
+  at: Location,
+}
+
+pub type DefConstraint = { deriver: Deriver, param: Int }
+
+/// The type parameters a call passes a witness for, each once, in the order the constraints first
+/// name them: one for each parameter a `numeric` or `integer` constrains, however many do.
+pub fn witnessed(constraints: List<DefConstraint>) -> List<Int> =
+  constraints.fold([], |acc: List<Int>, c: DefConstraint|
+    if !is_predicate(c.deriver) || acc.contains(c.param) { acc } else { acc.push(c.param) })
+
+/// What a type's module states its values go through: `by` is the function, and `answers` what it
+/// answers over the type's own type and row parameters, as the function's signature numbers them.
+pub type InstanceInfo = {
+  type_name: Bytes,
+  kind: InstanceKind,
+  by: Bytes,
+  params: List<Int>,
+  rows: List<Int>,
+  answers: Type,
+  at: Location,
+}
+
+/// The arithmetic a type's module states the operators mean at it: `fns` are its functions in
+/// `numeric_ops`' order, and `ctor` one of its constructors, which a witness names it by.
+pub type NumericInfo = { type_name: Bytes, ctor: Bytes, fns: List<Bytes>, at: Location }
+
+pub type SpecInfo = { kind: SpecKind, index: Int, footprint: List<Atom>, span: Span }
+
+pub type DefInfo = {
+  name: Bytes,
+  module: Bytes,
+  simple_name: Bytes,
+  scheme: Scheme,
+  footprint: List<Atom>,
+  performed: List<Atom>,
+  /// The atoms of `footprint` performed a number of times that grows with the input, and the
+  /// parameters whose functions are called so.
+  scaling: List<Atom>,
+  repeats: List<Int>,
+  /// What the written row promises bounded, which is all a caller in another package reads.
+  bounded: List<Atom>,
+  tail_bounded: Bool,
+  /// Whether its calls are known to return (`diverges` where they may not).
+  ending: Ending,
+  /// How it calls the functions it is handed and what it answers, which callers' endings read.
+  summary: Summary,
+  /// Where its body can raise `abort.raise`, and why nothing there rules the raise out.
+  raises: List<Raise>,
+  row_aliases: List<Bytes>,
+  constraints: List<DefConstraint>,
+  spec: List<SpecInfo>,
+  at: Location,
+}
+
+/// Why a place in a body can raise `abort.raise`.
+pub type RaiseWhy =
+  /// A builtin called where `needs`, a clause of its `requires` as the prelude writes it, is not
+  /// shown.
+  | Unshown({ callee: Bytes, needs: Bytes })
+  /// A builtin that states no `requires`: nothing a call shows rules its raise out.
+  | Unguarded(Bytes)
+  /// A definition whose row names the raise.
+  | Calls(Bytes)
+  /// A `/` or `%` whose divisor nothing shows is other than zero.
+  | ZeroDivisor
+  /// A `let` whose pattern can miss.
+  | Misses
+  /// An operation that raises it, performed.
+  | Performed
+  /// A function value whose type says it may.
+  | Handed
+
+/// `span` counts from where the definition starts, so a raise filed for a definition is where it
+/// is wherever the definition moves to.
+pub type Raise = { span: Span, why: RaiseWhy }
+
+derive bin for RaiseWhy
+
+derive bin for Raise
+
+pub type RaiseNote = { span: Span, why: RaiseWhy }
+
+pub type TestInfo = {
+  name: Bytes,
+  module: Bytes,
+  key: Bytes,
+  index: Int,
+  nondet: Bool,
+  /// Over cases: `name` is its label's template, and a run makes a test of each case it lists.
+  cases: Bool,
+  /// What a run of it must be given: no raise, which fails it, and no `diverges`, which its steps bound.
+  footprint: List<Atom>,
+  at: Location,
+}
+
+pub type LawBinder = { name: Bytes, ty: Type, span: Span }
+
+pub type LawInfo = {
+  name: Bytes,
+  module: Bytes,
+  key: Bytes,
+  index: Int,
+  binders: List<LawBinder>,
+  has_guard: Bool,
+  /// As a test's: a discharge answers a raise as a gap.
+  footprint: List<Atom>,
+  at: Location,
+}
+
+derive bin for Location
+
+derive bin for OpInfo
+
+derive bin for EffectInfo
+
+derive bin for CtorInfo
+
+derive bin for DefConstraint
+
+derive bin for InstanceInfo
+
+derive bin for NumericInfo
+
+derive bin for SpecInfo
+
+derive bin for DefInfo
+
+derive bin for TestInfo
+
+derive bin for LawBinder
+
+derive bin for LawInfo
+
+/// Where an atom entered a body's row: an operation performed here, a named definition's row,
+/// arguments alone (a builtin or constructor), or a function value.
+pub type PerformSource = | DirectPerform | PerformVia(Bytes) | PerformThroughArgs | OpaquePerform
+
+/// `over` is the iteration the site repeats with: a call that runs it once per element of its input,
+/// or a recursive call; `None` where it runs a number of times no input decides.
+pub type PerformSite = {
+  atom: Atom,
+  module: Int,
+  span: Span,
+  source: PerformSource,
+  over: Option<Span>,
+  /// The iterations around it that wait on a callee's counts, innermost first: the first that
+  /// holds is the site's, before `over`.
+  maybe: List<Maybe>,
+}
+
+/// An iteration a call turns out to be once the definition `callee` is counted: it calls its parameter `param` a number of times that grows with its input, or, with
+/// no `param`, performs the site's own atom so.
+pub type Maybe = { callee: Bytes, param: Option<Int>, span: Span }
+
+/// A row variable performed under an iteration, as a `PerformSite` is.
+pub type Repeated = { var: Int, over: Option<Span>, maybe: List<Maybe> }
+
+/// A row variable a body performs under an iteration, as its group reads it with nothing of the
+/// walk's substitution: the parameters whose types hold the variable, and whether it is the
+/// definition's own row parameter.
+pub type RepeatedRow = { params: List<Int>, tail: Bool, over: Option<Span>, maybe: List<Maybe> }
+
+/// A call of a function of the module being checked.
+pub type OwnCall = { callee: Bytes, span: Span }
+
+/// A use of a function of a type, or a call on a value, which the rewrite writes as later passes
+/// read it. A call on a value, `base.name(args)`, at `span` calls `qualifier::name` with the value
+/// first, or the bare `name` where `qualifier` is empty; with no `name` either it calls the
+/// function the value holds in the field written. A name written `T::name` at `span` is
+/// `qualifier::name`. `callee` is the function's qualified name, empty for a field's, and
+/// `reaches` the modules the defaults the call copies name. `named` is the place among the
+/// callee's parameters, the value's first, of each argument the call names, in the order written.
+pub type MemberSite = {
+  module: Int,
+  span: Span,
+  qualifier: Bytes,
+  name: Bytes,
+  callee: Bytes,
+  owner: Bytes,
+  reaches: List<Bytes>,
+  named: List<Int>,
+}
+
+/// A tagged literal whose tag's function `name` is one of the module being checked.
+pub type TagUse = { owner: Bytes, name: Bytes, t: Tagged, callee: QName }
+
+pub type OpKey = { effect: Bytes, op: Bytes, resource: Resource }
+
+pub type Numeric = { span: Span, op: Bytes, ty: Type }
+
+/// A bit operator's or integer builtin's operand, kept until its type is known. `what` names the site in a diagnostic.
+pub type BitOp = { span: Span, what: Bytes, ty: Type, builtin: Bool }
+
+/// A type parameter a `numeric` or `integer` constraint makes the witness of: a hidden argument each
+/// call fills with the type it instantiates the parameter at.
+type Witnessed = { param: Bytes, integer: Bool }
+
+/// An operator over a witnessed parameter, which the elaboration rewrites to read the witness.
+pub type WitnessOp = { module: Int, span: Span, param: Bytes, owner: Bytes }
+
+/// `params` are the callee's type parameters the witnesses are for, so one constrained twice is
+/// passed once.
+pub type WitnessRef = {
+  module: Int,
+  span: Span,
+  witnesses: List<NumericWitness>,
+  params: List<Int>,
+  owner: Bytes,
+}
+
+/// A definition's witnessed type parameters in its scheme's order, which is the order a call passes
+/// their witnesses in.
+pub type WitnessOrder = { module: Int, name: Bytes, params: List<Bytes> }
+
+/// A reference inside the group being walked that filled a member's type parameters: `args` are
+/// what it gave them, in the order the member's scheme takes them.
+pub type GroupFill = { module: Int, span: Span, callee: Bytes, args: List<Type> }
+
+/// The one type both sides of a `++` share, kept until the substitution has it: `String` and `Bytes` both join.
+pub type ConcatSite = { module: Int, span: Span, ty: Type }
+
+/// A definition named at `span` whose answer at its instantiation, `ty`, holds a `Columns`, waiting
+/// to be settled.
+pub type ColumnsSite = { module: Int, span: Span, ty: Type }
+
+/// A written field of `{..b, f: e}` with the type its value inferred to.
+pub type UpdateField = { name: Bytes, span: Span, ty: Type }
+
+/// An update whose base was still a variable where it was written; `result` is what the site answered.
+pub type UpdateSite = {
+  module: Int,
+  span: Span,
+  base_span: Span,
+  base: Type,
+  written: List<UpdateField>,
+  result: Type,
+  owner: Bytes,
+}
+
+/// What the lowering needs: the field list of the record an update copies, in the record's own order.
+pub type UpdateShape = { module: Int, span: Span, names: List<Bytes>, owner: Bytes }
+
+/// The raise a `try` answers, by its effect's program-wide name, and how many values it carries.
+pub type TrySite = { module: Int, span: Span, effect: Bytes, op: Bytes, arity: Int, owner: Bytes }
+
+pub type Signature = {
+  ty_params: Map<Bytes, Type>,
+  row_params: Map<Bytes, Int>,
+  label_params: Map<Bytes, Int>,
+  fn_ty: Type,
+  params: List<Type>,
+  ret: Type,
+  declared: Option<Row>,
+  published_row: Row,
+  /// The written row's atoms marked `bounded`, and whether its variable is.
+  bounded: List<Atom>,
+  tail_bounded: Bool,
+  scope: Int,
+}
+
+/// One use of a label-generic definition: `vars` are the variables its label parameters became,
+/// `called` is false while it is still only a value, and `written` records `f[conn](..)`.
+pub type LabelApplication = {
+  module: Int,
+  span: Span,
+  /// Where the callee's name ends: where a call writes the labels it fills.
+  named: Int,
+  callee: Bytes,
+  vars: List<Int>,
+  /// Those of `vars` a call writes: the ones that name no region.
+  written: List<Int>,
+  params: Map<Bytes, Int>,
+  called: Bool,
+  owner: Bytes,
+}
+
+/// What the emitter needs: the labels a call fills, in declaration order.
+pub type LabelSite = { module: Int, span: Span, labels: List<Bytes>, owner: Bytes }
+
+/// The type an operator reads its operands at, which is all its meaning turns on: the name of a
+/// type with no arguments, any other type as `spelled_type` spells it, and `""` for a function's.
+/// A wrapping builtin's site is its name.
+pub type OperandSite = { module: Int, span: Span, ty: Bytes, owner: Bytes }
+
+pub type OperandAt = { module: Int, span: Span, ty: Type, owner: Bytes }
+
+/// A type the emitter reads off the checker rather than off what is written: a pattern's binder, a
+/// lambda, an empty list, a law's binder, and a global named at a use with the type arguments it is
+/// used at. Resolved when the check ends.
+pub type TypedAt = { module: Int, span: Span, ty: Type, args: List<Type>, owner: Bytes }
+
+/// A `TypedAt` resolved, with each variable its owner's scheme quantifies numbered as the scheme's
+/// canonical form numbers it and every other variable `-1`, and no function type carrying a row.
+/// `ty` and `args` are keys of a `TypeTable` beside the sites: a body names a few types at many
+/// places, and one record type can be large.
+pub type TypedSite = { module: Int, span: Span, ty: Bytes, args: List<Bytes>, owner: Bytes }
+
+pub type Assumed = { deriver: Deriver, vars: List<Int> }
+
+/// A clause of a `handle` around a spawn, typed as the function its task calls by performing `op`.
+pub type ClauseSite = { span: Span, op: Atom, ty: Type }
+
+/// `around` holds the clauses of every `handle` between the spawn and the region's open.
+pub type SpawnSite = { span: Span, ty: Type, around: List<ClauseSite> }
+
+pub type HandoffSite = { span: Span, ty: Type, op: Bytes }
+
+pub type OpenRegion = {
+  name: Bytes,
+  label: Bytes,
+  span: Span,
+  simulate_depth: Int,
+  spawns: List<SpawnSite>,
+  handoffs: List<HandoffSite>,
+}
+
+pub type RegionSite = {
+  module: Int,
+  name: Bytes,
+  label: Bytes,
+  span: Span,
+  body_span: Span,
+  body_ty: Type,
+  exits: List<Span>,
+  spawns: List<SpawnSite>,
+  handoffs: List<HandoffSite>,
+}
+
+/// What may not outlive a region: a `with_hold[r]` region's hold and every function that reads it, a
+/// `simulate` region's tasks.
+pub type Brand = | HoldsOf(Bytes) | Tasks
+
+/// A local bound outside the innermost `simulate` region, named inside it.
+pub type Crossing = { name: Bytes, span: Span }
+
+/// A `simulate` region: `entering` names each binding from outside it whose value holds a task.
+pub type Simulation = {
+  module: Int,
+  span: Span,
+  body_span: Span,
+  body_ty: Type,
+  body_row: Row,
+  exits: List<Span>,
+  entering: List<{ name: Bytes, span: Span, ty: Type }>,
+}
+
+/// A `parallel` block's branches and what each performs, judged once the module is solved.
+pub type ParallelSite = { module: Int, span: Span, branches: List<{ span: Span, row: Row }> }
+
+/// `params` names the signature's rigid type parameters, so a refusal can say which to constrain.
+pub type RigidParam = { name: Bytes, var: Int }
+
+/// `key` is what is judged and `whole` the key it stands in, which a refusal names; `via` is the
+/// alias a use named when the `Map` came from its expansion, else empty; `carrier` is the declared
+/// type that keys a `Map` by `whole`, where no `Map` is written.
+pub type MapKeySite = {
+  module: Int,
+  span: Span,
+  scope: Int,
+  key: Type,
+  whole: Type,
+  carrier: Option<Type>,
+  assumed: List<Int>,
+  params: List<RigidParam>,
+  via: Bytes,
+}
+
+pub type ConstraintSite = {
+  module: Int,
+  span: Span,
+  deriver: Deriver,
+  param: Int,
+  ty: Type,
+  callee: Bytes,
+  callee_at: Location,
+  assumed: List<Int>,
+  params: List<RigidParam>,
+  called: Bool,
+  owner: Bytes,
+}
+
+pub type SpecEnv = {
+  name: Bytes,
+  ty_params: Map<Bytes, Type>,
+  row_params: Map<Bytes, Int>,
+  params: List<Type>,
+  ret: Type,
+}
+
+/// A member of the recursive group being walked, with the variables its binders took: `types` are
+/// its own type parameters a call fills, in its scheme's order.
+pub type GroupDef = { name: Bytes, labels: List<Int>, types: List<RigidParam> }
+
+/// The rows the driver hands in for a definition, which are taken as they are. The rest of a
+/// published interface is the written signature, which is on hand.
+pub type KnownDef = {
+  footprint: List<Atom>,
+  performed: List<Atom>,
+  scaling: List<Atom>,
+  repeats: List<Int>,
+  ending: Ending,
+  summary: Summary,
+  raises: List<Raise>,
+  /// What the emitter reads of the body, as `root_facts` encoded it when the body was walked.
+  facts: Bytes,
+}
+
+pub type KnownTest = { footprint: List<Atom>, facts: Bytes }
+
+/// What the emitter reads of one body published from its rows: `name` is the definition, or a test
+/// as `test_owner` names it.
+pub type KeptFacts = { name: Bytes, facts: Bytes }
+
+derive bin for KeptFacts
+
+/// The name a test's roots and sites go by: its module, `test#` and a digest of its label, which
+/// the module's tests do not share (E0105) and which no definition's name can spell.
+pub fn test_owner(module: Bytes, label: Bytes) -> Bytes / {abort.raise} =
+  by_label(module, b"test", label)
+
+/// Whether `name` is one `test_owner` makes.
+pub fn is_test_owner(name: Bytes) -> Bool =
+  match name.split(b"#") {
+    [named, digest] ->
+      (named == b"test" || named.ends_with(b".test")) && digest.len() == 16
+        && digest.position(0, |c: Int| bytes::hex_value(c) < 0) == None,
+    _ -> false,
+  }
+
+/// The root of `part` (`guard` or `body`) of the law labelled `label`, named as a test's is.
+pub fn law_root(module: Bytes, label: Bytes, part: Bytes) -> Bytes / {abort.raise} =
+  Bytes::concat_all([by_label(module, b"law", label), b".", part])
+
+fn by_label(module: Bytes, kind: Bytes, label: Bytes) -> Bytes / {abort.raise} =
+  qualify(
+    module,
+    Bytes::concat_all([kind, b"#", Bytes::of_string(blake3(label).slice(0, 8).hex_of())]),
+  )
+
+/// The root a test over cases lists its cases by, beside the root that runs one.
+pub fn cases_root(owner: Bytes) -> Bytes = owner.concat(b".cases")
+
+/// What the listing root of a test over cases answers: each case's label and identity, in the
+/// table's order.
+pub fn listing_ty() -> Type / {abort.raise} =
+  list_type(
+    TyRecord(
+      fields_sorted([
+        { name: b"identity", ty: bytes_type() },
+        { name: b"label", ty: string_type() },
+      ]),
+    ),
+  )
+
+/// `tests` is by test key. `root`: the modules below it are the run's own;
+/// a definition of any other is counted by what its row writes, whatever its body does, so its
+/// `bounded` promises were checked when its package was.
+/// `types` holds the types the rows' facts name, by key.
+/// `walks` is how the check treats the bodies of its module's functions.
+pub type Known = {
+  defs: Map<Bytes, KnownDef>,
+  tests: Map<Bytes, KnownTest>,
+  root: Int,
+  types: TypeTable,
+  walks: Walks,
+}
+
+pub fn no_known() -> Known =
+  { defs: Map::new(), tests: Map::new(), root: 1 << 62, types: Map::new(), walks: Every }
+
+/// How a check treats the bodies of its module's functions. A function whose rows are handed in
+/// (`Known.defs`) is published from them whichever this is.
+pub type Walks =
+  /// Each is walked, and every group settled.
+  | Every
+  /// Those named are walked and any other is published from its signature. No group is settled.
+  | Only(List<Bytes>)
+  /// None is walked. One whose body another check walked, held here by function, is published
+  /// from its signature and that body's row, and any other from its signature. A group is settled
+  /// where every member's body or rows are in hand. The sites are what the calls on values in
+  /// those bodies call.
+  | Given(Map<Bytes, HandedBody>, List<MemberSite>)
+
+/// A body another check walked, and what the emitter reads of it as that check filed it.
+pub type HandedBody = { body: WalkedBody, facts: Bytes }
+
+pub type Checker = {
+  resolved: Resolved,
+  modules: List<ParsedModule>,
+  module: Int,
+  subst: Subst,
+  fresh: Fresh,
+  env: TypeEnv,
+  diags: List<Diag>,
+  types: Map<Bytes, TypeDecl>,
+  effects: List<EffectInfo>,
+  effect_index: Map<Bytes, Int>,
+  ctors: List<CtorInfo>,
+  ctor_index: Map<Bytes, Int>,
+  defs: List<DefInfo>,
+  def_index: Map<Bytes, Int>,
+  tests: List<TestInfo>,
+  laws: List<LawInfo>,
+  ty_params: Map<Bytes, Type>,
+  row_params: Map<Bytes, Int>,
+  label_params: Map<Bytes, Int>,
+  label_apps: List<LabelApplication>,
+  label_sites: List<LabelSite>,
+  /// The group being settled.
+  group_defs: List<GroupDef>,
+  /// The functions of the module whose bodies are being walked, each by its qualified name: the
+  /// groups they form are read off what each body names and calls of them.
+  own_fns: Map<Bytes, Int>,
+  /// Those the body being walked names, the calls it makes of them, its tagged literals of them, and
+  /// (`group_fills`) the types it fills their parameters with.
+  refs: List<Bytes>,
+  calls: List<OwnCall>,
+  tag_uses: List<TagUse>,
+  /// The parameters of each definition called so far whose types hold a function.
+  fn_holding: Map<Bytes, List<Int>>,
+  /// How each function and builtin takes its arguments, by the name a call finds it under.
+  takings: Map<Bytes, Takes>,
+  auto_ty_params: Bool,
+  alias_stack: List<Bytes>,
+  /// Each parameterless alias as an expansion made it, and the `Map` keys that expansion noted.
+  aliases: Map<Bytes, { t: Type, keys: List<MapKeySite> }>,
+  /// Each `new` record declared so far.
+  nominals: Map<Bytes, RecordDecl>,
+  refused_atoms: List<Location>,
+  performs: List<PerformSite>,
+  /// The iteration around the expression being inferred, as `PerformSite.over` reads, and those
+  /// that wait on a callee's counts.
+  over: Option<Span>,
+  maybe: List<Maybe>,
+  /// Each row variable a body performs under an iteration.
+  repeated_vars: List<Repeated>,
+  /// The first call into the group being settled: a recursive body performs all it does again there.
+  recursed: Option<Span>,
+  /// The written row of the definition being checked; empty when it wrote none, or for a test or law.
+  declared_atoms: List<Atom>,
+  /// What the conditions on the way to the expression being inferred hold.
+  guards: Guards,
+  /// What the prelude states of each builtin.
+  contracts: Map<Bytes, Contract>,
+  /// Why a raise recorded in `performs` was kept, by where it is.
+  raise_notes: List<RaiseNote>,
+  comparisons: List<{ module: Int, span: Span, ty: Type }>,
+  scope: Int,
+  constraints: Map<Bytes, List<DefConstraint>>,
+  numerics: List<Numeric>,
+  bit_ops: List<BitOp>,
+  operands: List<OperandAt>,
+  typed: List<TypedAt>,
+  witnessed: Map<Int, Witnessed>,
+  witness_refs: List<WitnessRef>,
+  witness_orders: List<WitnessOrder>,
+  group_fills: List<GroupFill>,
+  /// How each definition checked so far calls the functions it is handed, and what it answers.
+  summaries: Map<Bytes, Summary>,
+  concats: List<ConcatSite>,
+  columns: List<ColumnsSite>,
+  updates: List<UpdateSite>,
+  update_shapes: List<UpdateShape>,
+  try_sites: List<TrySite>,
+  member_sites: List<MemberSite>,
+  /// The defaults calls on values copied, each beside its parameter's type, not yet typed.
+  copied_defaults: List<{ expr: Expr, ty: Type }>,
+  /// The builtin each call on a value of a language type calls, by the call's span.
+  builtins_on: Map<Bytes, Bytes>,
+  simulate_depth: Int,
+  /// The scopes open around the innermost `simulate` body, and the locals of those it names.
+  sim_scope: Int,
+  crossings: List<Crossing>,
+  open_regions: List<OpenRegion>,
+  regions: List<RegionSite>,
+  simulations: List<Simulation>,
+  parallels: List<ParallelSite>,
+  map_keys: List<MapKeySite>,
+  constrained_uses: List<ConstraintSite>,
+  spec_kind: Option<SpecKind>,
+  spec_envs: List<SpecEnv>,
+  derived: Option<Derived>,
+  known: Known,
+  seeded: List<Bytes>,
+  /// The tests published from the rows handed in, by key.
+  seeded_tests: List<Bytes>,
+  /// The definition or test whose body is being walked, which every site the walk records is
+  /// filed under; empty for a clause or a law, which are walked afresh each time.
+  walking: Bytes,
+  /// What the rows handed in say the emitter reads of each body published from them.
+  kept: List<KeptFacts>,
+  /// Each body this check walked, as another check reads it.
+  bodies: List<WalkedBody>,
+  assumed: List<Assumed>,
+  instances: List<InstanceInfo>,
+  /// Filled as the declarations are collected, before any body is checked: an operator in a body
+  /// reads which types state `numeric`, and `keyed_names` which state a `key`.
+  numeric_types: List<NumericInfo>,
+  keyed_names: List<Bytes>,
+  /// Read once the declarations are collected: the shapes ordering reads, and the positions of the
+  /// parameters each declared type needs ordered wherever it is written or built.
+  ordering: Shapes,
+  carrying: Map<Bytes, List<Int>>,
+  /// True while a `pub fn`'s default is walked: a caller in another module is handed a copy of it.
+  copied: Bool,
+  assignable: Assignable,
+}
+
+/// The variables of the handler whose clause is being walked, each by the stamp its name is bound
+/// at, which an assignment may give a new value; `barred` names the place in the clause where none
+/// may, since what runs there may run after the clause has returned.
+pub type Assignable = { vars: List<{ stamp: Int, name: Bytes, ty: Type }>, barred: Option<Bytes> }
+
+/// `checker` where no assignment may give the variables of the clause around it a value: inside
+/// `place`, whose walk `unbarred` ends.
+pub fn barred(checker: Checker, place: Bytes) -> Checker =
+  if checker.assignable.vars.len() == 0 { checker }
+  else { { ..checker, assignable: { ..checker.assignable, barred: Some(place) } } }
+
+/// `o`, walked from `barred(outer, ..)`, with the assignments `outer` allowed allowed again.
+pub fn unbarred(outer: Checker, o: Inferred) -> Inferred =
+  if outer.assignable.vars.len() == 0 { o }
+  else { { ..o, checker: { ..o.checker, assignable: outer.assignable } } }
+
+pub type Inferred = { checker: Checker, ty: Type, row: Row }
+
+pub type WithTy = { checker: Checker, ty: Type }
+
+pub type WithVar = { checker: Checker, var: Int }
+
+pub type WithRow = { checker: Checker, row: Row }
+
+pub type WithName = { checker: Checker, name: Option<Bytes> }
+
+pub type Expected = { checker: Checker, ok: Bool }
+
+pub type WithTys = { checker: Checker, tys: List<Type> }
+
+pub type WithSig = { checker: Checker, sig: Signature }
+
+pub type WithAtom = { checker: Checker, atom: Option<Atom> }
+
+pub type WithKey = { checker: Checker, key: Option<ValueKey> }
+
+pub type WithHit = { checker: Checker, hit: Option<{ info: EffectInfo, op: OpInfo }> }
+
+pub type WithResource = { checker: Checker, resource: Option<Resource> }
+
+pub type WithBodyRow = { checker: Checker, row: Row }
+
+/// A module's functions as their signatures bind them, each for every body of the module to call.
+pub type Signed = { checker: Checker, sigs: List<Signature>, members: List<GroupDef> }
+
+/// A body's walk as it stands in the checker's substitution, before it is closed.
+pub type Walk = {
+  checker: Checker,
+  row: Row,
+  performs: List<PerformSite>,
+  repeated_vars: List<Repeated>,
+  raise_notes: List<RaiseNote>,
+  refs: List<Bytes>,
+  calls: List<OwnCall>,
+  tag_uses: List<TagUse>,
+  fills: List<GroupFill>,
+}
+
+/// What a function's walk leaves for its group, closed: every type, atom and variable in it is as
+/// the walk settled it, so its group reads it without the walk's substitution. Its row; what its
+/// group reads of its signature (`params` and `tail` for what it performs through its parameters,
+/// what its row promises `bounded`, whether it says `diverges`, and `written`, what the signature
+/// alone says of its counts); what it performs and where; what it names and calls of its module's
+/// functions, `stated` those an operator, a comparison or a constraint calls because a type states
+/// them; and what each name it reads refers to. `filed` and `count` are the rows it was published
+/// from, where its body was not walked.
+pub type Body = {
+  row: Row,
+  filed: Option<KnownDef>,
+  count: Option<Count>,
+  params: List<Type>,
+  tail: Option<Int>,
+  bounded: List<{ atom: Atom, written: Bytes }>,
+  tail_bounded: Bool,
+  tail_name: Option<Bytes>,
+  says_diverges: Bool,
+  written: { scaling: List<Atom>, repeats: List<Int> },
+  performs: List<PerformSite>,
+  repeated: List<RepeatedRow>,
+  raise_notes: List<RaiseNote>,
+  refs: List<Bytes>,
+  calls: List<OwnCall>,
+  stated: List<OwnCall>,
+  tags: List<TagRefusal>,
+  fills: List<Fill>,
+  names: List<NamedCallee>,
+}
+
+/// A tagged literal whose tag's function `name` is of its own module: what to say if the two turn
+/// out to be in one recursion.
+pub type TagRefusal = { name: Bytes, refusal: Diag }
+
+/// A parameter a call fills with a type built from its caller's own, as the type prints.
+pub type Growth = { param: Int, ty: Bytes }
+
+/// A call that fills `callee`'s type parameters: those it fills with a type built from the
+/// caller's own.
+pub type Fill = { module: Int, span: Span, callee: Bytes, grows: List<Growth> }
+
+/// What a name a body reads refers to, `module` empty where it is written bare.
+pub type NamedCallee = { module: Bytes, name: Bytes, callee: Callee }
+
+/// What the walk of the function `name` leaves its group beside what its signature says, as
+/// another check reads it: what it performs with each label parameter of the definition named by
+/// its place (`filed_atoms`), `through` where it performs what its row parameter stands for too,
+/// and each place as the check that walked it counted it.
+pub type WalkedBody = {
+  name: Bytes,
+  atoms: List<Atom>,
+  through: Bool,
+  performs: List<PerformSite>,
+  repeated: List<RepeatedRow>,
+  raise_notes: List<RaiseNote>,
+  refs: List<Bytes>,
+  calls: List<OwnCall>,
+  stated: List<OwnCall>,
+  tags: List<TagRefusal>,
+  fills: List<Fill>,
+  names: List<NamedCallee>,
+}
+
+derive bin for PerformSource
+
+derive bin for Maybe
+
+derive bin for PerformSite
+
+derive bin for RepeatedRow
+
+derive bin for RaiseNote
+
+derive bin for OwnCall
+
+derive bin for TagRefusal
+
+derive bin for Growth
+
+derive bin for Fill
+
+derive bin for NamedCallee
+
+derive bin for WalkedBody
+
+/// `b` with each place in it moved through `by`, read as module `module` of a check.
+pub fn moved_body(b: WalkedBody, module: Int, by: (Int) -> Int) -> WalkedBody = {
+  let at = |s: Span| { ..s, start: by(s.start), end: by(s.end) };
+  let over = |o: Option<Span>| match o { Some(s) -> Some(at(s)), None -> None };
+  let waits = |ms: List<Maybe>| ms.map(|m: Maybe| { ..m, span: at(m.span) });
+  let call = |c: OwnCall| { ..c, span: at(c.span) };
+  {
+    ..b,
+    performs: b.performs.map(|s: PerformSite|
+      { ..s, module: module, span: at(s.span), over: over(s.over), maybe: waits(s.maybe) }),
+    repeated: b.repeated.map(|r: RepeatedRow| { ..r, over: over(r.over), maybe: waits(r.maybe) }),
+    raise_notes: b.raise_notes.map(|n: RaiseNote| { ..n, span: at(n.span) }),
+    calls: b.calls.map(call),
+    stated: b.stated.map(call),
+    tags: b.tags.map(|t: TagRefusal|
+      {
+        ..t,
+        refusal: {
+          ..t.refusal,
+          labels: t.refusal.labels.map(|l: Label|
+            { ..l, module: module, start: by(l.start), end: by(l.end) }),
+        },
+      }),
+    fills: b.fills.map(|f: Fill| { ..f, module: module, span: at(f.span) }),
+  }
+}
+
+/// A module's functions in the order it writes them, each with its qualified name, what its group
+/// reads of its generic list and its body.
+pub type ModuleFns = {
+  fns: List<FnDef>,
+  names: List<Bytes>,
+  members: List<GroupDef>,
+  bodies: List<Body>,
+  /// What each call on a value in the module calls, by the call's span.
+  written: Map<Bytes, MemberCallee>,
+}
+
+/// The sites of a body an operator, a comparison, a `Map` or a constraint is read at.
+pub type TypedSites = {
+  numerics: List<Numeric>,
+  comparisons: List<{ module: Int, span: Span, ty: Type }>,
+  map_keys: List<MapKeySite>,
+  constrained: List<ConstraintSite>,
+}
+
+/// What a module's type states: its key, its show and its arithmetic in `numeric_ops`' order, each
+/// a function of the module by its qualified name.
+pub type StatedFns = { key: Option<Bytes>, show: Option<Bytes>, numeric: List<Bytes> }
+
+pub type Reached = { seen: List<Bytes>, fns: List<Bytes> }
+
+/// What a group member performs a number of times that grows with its input: its atoms, the sites a
+/// walk of its body found them at, and the parameters it calls so.
+pub type Count = {
+  scaling: List<Atom>,
+  sites: List<PerformSite>,
+  repeats: List<Int>,
+  tail_over: Option<Span>,
+  recursed: Option<Span>,
+  raises: List<Raise>,
+}
+
+pub type Generalized = { env: TypeEnv, scheme: Scheme }
+
+/// The effect of reading a hold, which a `with_hold` region answers.
+pub fn hold() -> Bytes = b"hold"
+
+/// A read of the hold a region labelled `resource` holds.
+pub fn hold_atom(resource: Resource) -> Atom =
+  { effect: hold(), resource: resource, mode: MRead, op: None }
+
+/// The effect a region answers and nothing declares.
+pub fn is_region_effect(name: Bytes) -> Bool = name == hold()
+
+pub fn compare_values_name() -> Bytes = b"compare_values"
+
+pub fn result_name() -> Bytes = b"result"
+
+pub fn location_of(checker: Checker, span: Span) -> Location =
+  { module: checker.module, span: span }
+
+pub fn module_name(checker: Checker, i: Int) -> Bytes / {abort.raise} = checker.modules.get(i).name
+
+pub fn scope_of(checker: Checker) -> Scope / {abort.raise} =
+  checker.resolved.scopes.get(checker.module)
+
+pub fn report(checker: Checker, diag: Diag) -> Checker =
+  { ..checker, diags: checker.diags.push(diag) }
+
+pub fn report_error_at(
+  checker: Checker,
+  code: Bytes,
+  span: Span,
+  message: Bytes,
+  label: Bytes,
+  notes: List<Bytes>,
+) -> Checker = report(checker, error_at(code, checker.module, span, message, label, notes))
+
+pub fn report_error_at_and(
+  checker: Checker,
+  code: Bytes,
+  span: Span,
+  message: Bytes,
+  label: Bytes,
+  also: Location,
+  also_text: Bytes,
+  notes: List<Bytes>,
+) -> Checker =
+  report(
+    checker,
+    error_at_and(
+      code,
+      checker.module,
+      span,
+      message,
+      label,
+      also.module,
+      also.span,
+      also_text,
+      notes,
+    ),
+  )
+
+pub fn err_labels(
+  checker: Checker,
+  code: Bytes,
+  message: Bytes,
+  labels: List<Label>,
+  notes: List<Bytes>,
+) -> Checker = report(checker, error_with_labels(code, message, labels, notes))
+
+pub fn backticked_text(x: Bytes) -> Bytes = Bytes::concat_all([b"`", x, b"`"])
+
+pub fn plural(n: Int) -> Bytes = if n == 1 { b"" } else { b"s" }
+
+pub fn supplied(n: Int) -> Bytes =
+  if n == 1 { b"1 was supplied" } else { ascii_of_int(n).concat(b" were supplied") }
+
+pub fn what_of(deriver: Deriver) -> Bytes =
+  match deriver {
+    DJson -> b"JSON encoding",
+    DEq -> b"structural equality",
+    DOrd -> b"order",
+    DBin -> b"binary encoding",
+    DShow -> b"rendering",
+    DHash -> b"content hash",
+    DNumeric -> b"arithmetic",
+    DInteger -> b"integer arithmetic",
+    DRow -> b"row",
+  }
+
+pub fn row_aliases(def: FnDef) -> List<Bytes> =
+  match def.effects { Some(r) -> r.aliases.map(|qname: QName| qname.name.name), None -> [] }
+
+// --- Fresh variables, threaded ---------------------------------------------------------
+
+pub fn new_ty(checker: Checker) -> { checker: Checker, ty: Type } = {
+  let o = fresh_ty(checker.fresh);
+  { checker: { ..checker, fresh: o.fresh }, ty: o.ty }
+}
+
+pub fn new_ty_var(checker: Checker) -> { checker: Checker, var: Int } = {
+  let o = fresh_ty_var(checker.fresh);
+  { checker: { ..checker, fresh: o.fresh }, var: o.var }
+}
+
+pub fn new_row(checker: Checker) -> { checker: Checker, row: Row } = {
+  let o = fresh_row(checker.fresh);
+  { checker: { ..checker, fresh: o.fresh }, row: o.row }
+}
+
+pub fn new_row_var(checker: Checker) -> { checker: Checker, var: Int } = {
+  let o = fresh_row_var(checker.fresh);
+  { checker: { ..checker, fresh: o.fresh }, var: o.var }
+}
+
+pub fn resolve(checker: Checker, ty: Type) -> Type / {abort.raise} =
+  with_bindings(checker.subst, ty)
+
+pub fn resolve_row_in(checker: Checker, row: Row) -> Row / {abort.raise} =
+  resolve_row(checker.subst, row)
+
+pub fn with_unified(checker: Checker, unified: Unified) -> Checker =
+  { ..checker, subst: unified.subst, fresh: unified.fresh }
+
+// --- The prelude ----------------------------------------------------------------------
+
+fn prelude_effect_names() -> List<Bytes> =
+  [b"task", b"clock", b"random", b"sim", b"abort", b"diverges"]
+
+pub fn is_prelude_effect(name: Bytes) -> Bool = prelude_effect_names().contains(name)
+
+pub fn simulated_names() -> List<Bytes> = [b"task", b"clock", b"random"]
+
+pub fn seed_atom() -> Atom = { effect: b"sim", resource: RSingleton, mode: MRead, op: None }
+
+pub fn abort_atom() -> Atom =
+  { effect: b"abort", resource: RSingleton, mode: MRaise, op: Some(b"raise") }
+
+fn abort_row() -> Row = row_singleton(abort_atom())
+
+fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
+  [
+    { name: b"Int", arity: 0 },
+    { name: b"Bool", arity: 0 },
+    { name: b"String", arity: 0 },
+    { name: b"Bytes", arity: 0 },
+    { name: b"U8", arity: 0 },
+    { name: b"U16", arity: 0 },
+    { name: b"U32", arity: 0 },
+    { name: b"U64", arity: 0 },
+    { name: b"I8", arity: 0 },
+    { name: b"I16", arity: 0 },
+    { name: b"I32", arity: 0 },
+    { name: b"I64", arity: 0 },
+    { name: b"U128", arity: 0 },
+    { name: b"I128", arity: 0 },
+    { name: b"Float", arity: 0 },
+    { name: b"Decimal", arity: 0 },
+    { name: b"Char", arity: 0 },
+    { name: b"Unit", arity: 0 },
+    { name: b"List", arity: 1 },
+    { name: b"Array", arity: 1 },
+    { name: b"Columns", arity: 1 },
+    { name: b"Map", arity: 2 },
+    { name: b"Hold", arity: 1 },
+    { name: b"Secret", arity: 1 },
+    { name: b"Task", arity: 1 },
+    { name: b"Chan", arity: 1 },
+    { name: b"Option", arity: 1 },
+    { name: b"Result", arity: 2 },
+    { name: b"Ordering", arity: 0 },
+    { name: b"Rounding", arity: 0 },
+    { name: b"Iter", arity: 2 },
+    { name: b"Instant", arity: 0 },
+    { name: b"Duration", arity: 0 },
+  ]
+
+/// Pure and nullary, so the runtime builds it once and each type conversion only looks a name up.
+fn builtin_type_arity_map() -> Map<Bytes, Int> =
+  builtin_type_arities().fold(Map::new(), |acc: Map<Bytes, Int>, x: { name: Bytes, arity: Int }|
+    if acc.contains(x.name) { acc } else { acc.insert(x.name, x.arity) })
+
+pub fn builtin_type_arity(name: Bytes) -> Option<Int> = builtin_type_arity_map().get(name)
+
+/// A field names one of `params`, or else a builtin type.
+type AlgebraicType = {
+  name: Bytes,
+  params: List<Bytes>,
+  variants: List<{ name: Bytes, fields: List<Bytes> }>,
+}
+
+fn prelude_adts() -> List<AlgebraicType> =
+  [
+    {
+      name: b"Option",
+      params: [b"a"],
+      variants: [{ name: b"None", fields: [] }, { name: b"Some", fields: [b"a"] }],
+    },
+    {
+      name: b"Result",
+      params: [b"a", b"e"],
+      variants: [{ name: b"Ok", fields: [b"a"] }, { name: b"Err", fields: [b"e"] }],
+    },
+    {
+      name: b"Ordering",
+      params: [],
+      variants: [
+        { name: b"Less", fields: [] },
+        { name: b"Equal", fields: [] },
+        { name: b"Greater", fields: [] },
+      ],
+    },
+    {
+      name: b"Rounding",
+      params: [],
+      variants: [
+        { name: b"HalfEven", fields: [] },
+        { name: b"HalfUp", fields: [] },
+        { name: b"Down", fields: [] },
+        { name: b"Up", fields: [] },
+        { name: b"Ceiling", fields: [] },
+        { name: b"Floor", fields: [] },
+      ],
+    },
+    {
+      name: b"Iter",
+      params: [b"s", b"r"],
+      variants: [{ name: b"Continue", fields: [b"s"] }, { name: b"Stop", fields: [b"r"] }],
+    },
+    // Nanoseconds: a point on a clock, and a span between two points, kept apart by their types.
+    { name: b"Instant", params: [], variants: [{ name: b"Instant", fields: [b"Int"] }] },
+    { name: b"Duration", params: [], variants: [{ name: b"Duration", fields: [b"Int"] }] },
+  ]
+
+fn position_bytes(xs: List<Bytes>, v: Bytes) -> Int / {abort.raise} =
+  range(0, xs.len()).fold(0 - 1, |acc: Int, i: Int|
+    if acc >= 0 { acc } else if xs.get(i) == v { i } else { acc })
+
+fn install_prelude_adts(checker: Checker) -> Checker / {abort.raise} =
+  prelude_adts().fold(checker, |c: Checker, adt: AlgebraicType| {
+    let vars = range(0, adt.params.len());
+    let result = TyCon({ name: adt.name, args: vars.map(|v: Int| TyVar(v)) });
+    range(0, adt.variants.len()).fold(c, |c2: Checker, index: Int| {
+      let v = adt.variants.get(index);
+      let fields = v.fields.map(|p: Bytes| {
+        let at = position_bytes(adt.params, p);
+        if at >= 0 { TyVar(at) } else { named_type(p) }
+      });
+      let ty = if fields.len() == 0 { result } else { fn_type(fields, result, row_empty()) };
+      let sc = { ty_vars: vars, row_vars: [], label_vars: [], ty: ty };
+      add_ctor({ ..c2, env: env_bind_global(c2.env, v.name, sc) }, {
+        name: v.name,
+        module: b"",
+        simple_name: v.name,
+        type_name: adt.name,
+        index: index,
+        arity: fields.len(),
+        fields: fields,
+        scheme: sc,
+        at: { module: 0, span: dummy_span() },
+      })
+    })
+  })
+
+pub fn add_ctor(checker: Checker, info: CtorInfo) -> Checker =
+  {
+    ..checker,
+    ctors: checker.ctors.push(info),
+    ctor_index: checker.ctor_index.insert(info.name, checker.ctors.len()),
+  }
+
+pub fn ctor_of(checker: Checker, name: Bytes) -> Option<CtorInfo> / {abort.raise} =
+  match checker.ctor_index.get(name) { Some(i) -> Some(checker.ctors.get(i)), None -> None }
+
+pub fn add_effect(checker: Checker, info: EffectInfo) -> Checker =
+  {
+    ..checker,
+    effects: checker.effects.push(info),
+    effect_index: checker.effect_index.insert(info.name, checker.effects.len()),
+  }
+
+pub fn effect_of(checker: Checker, name: Bytes) -> Option<EffectInfo> / {abort.raise} =
+  match checker.effect_index.get(name) { Some(i) -> Some(checker.effects.get(i)), None -> None }
+
+pub fn def_of(checker: Checker, name: Bytes) -> Option<DefInfo> / {abort.raise} =
+  match checker.def_index.get(name) { Some(i) -> Some(checker.defs.get(i)), None -> None }
+
+pub fn set_def(checker: Checker, info: DefInfo) -> Checker / {abort.raise} =
+  match checker.def_index.get(info.name) {
+    Some(i) -> { ..checker, defs: checker.defs.set(i, info) },
+    None ->
+      {
+        ..checker,
+        defs: checker.defs.push(info),
+        def_index: checker.def_index.insert(info.name, checker.defs.len()),
+      },
+  }
+
+fn prelude_op(
+  name: Bytes,
+  mode: Mode,
+  ty_vars: List<Int>,
+  row_vars: List<Int>,
+  params: List<Type>,
+  ret: Type,
+  row: Row,
+) -> OpInfo =
+  {
+    name: name,
+    mode: mode,
+    resource_param: false,
+    params: params,
+    ret: ret,
+    at: { module: 0, span: dummy_span() },
+    scheme: Some({
+      ty_vars: ty_vars,
+      row_vars: row_vars,
+      label_vars: [],
+      ty: fn_type(params, ret, row),
+    }),
+  }
+
+fn pair_type(first: Type, second: Type) -> Type =
+  TyRecord([{ name: b"_0", ty: first }, { name: b"_1", ty: second }])
+
+/// The operations whose place in a closure's row shows a channel it captured.
+pub fn channel_ops() -> List<Bytes> = [b"send", b"recv", b"close", b"select"]
+
+pub fn prelude_effects() -> List<EffectInfo> = {
+  let ta = TyVar(0);
+  let body = fn_type([], ta, row_open(0));
+  let task = applied_type(b"Task", ta);
+  let chan = applied_type(b"Chan", ta);
+  let none = { module: 0, span: dummy_span() };
+  [
+    {
+      name: b"task",
+      module: b"",
+      simple_name: b"task",
+      nondet: true,
+      at: none,
+      ops: [
+        prelude_op(b"spawn", MWrite, [0], [0], [body], task, row_open(0)),
+        // A join of a cancelled task raises; `await` answers `None` for one.
+        prelude_op(b"join", MWrite, [0], [], [task], ta, abort_row()),
+        prelude_op(b"yield", MWrite, [], [], [], unit_type(), row_empty()),
+        // Stops a task where it stands; `true` when it had not yet ended.
+        prelude_op(b"cancel", MWrite, [0], [], [task], bool_type(), row_empty()),
+        // A join that answers `None` for a cancelled task.
+        prelude_op(b"await", MWrite, [0], [], [task], option_type(ta), row_empty()),
+        prelude_op(b"channel", MWrite, [0], [], [int_type()], chan, row_empty()),
+        // `false` once the channel is closed.
+        prelude_op(b"send", MWrite, [0], [], [chan, ta], bool_type(), row_empty()),
+        // `None` once the channel is closed and empty.
+        prelude_op(b"recv", MWrite, [0], [], [chan], option_type(ta), row_empty()),
+        prelude_op(b"close", MWrite, [0], [], [chan], unit_type(), row_empty()),
+        // An arm is a channel beside `Some` of what to send on it, or `None` to receive; the
+        // answer is the arm that went beside what it took or sent, `None` for a closed channel.
+        prelude_op(
+          b"select",
+          MWrite,
+          [0],
+          [],
+          [list_type(pair_type(chan, option_type(ta))), bool_type()],
+          option_type(pair_type(int_type(), option_type(ta))),
+          row_empty(),
+        ),
+      ],
+    },
+    {
+      name: b"clock",
+      module: b"",
+      simple_name: b"clock",
+      nondet: true,
+      at: none,
+      ops: [
+        prelude_op(b"now", MRead, [], [], [], named_type(b"Instant"), row_empty()),
+        prelude_op(b"sleep", MWrite, [], [], [named_type(b"Duration")], unit_type(), row_empty()),
+      ],
+    },
+    {
+      name: b"random",
+      module: b"",
+      simple_name: b"random",
+      nondet: true,
+      at: none,
+      ops: [
+        prelude_op(b"next", MWrite, [], [], [], int_type(), row_empty()),
+        prelude_op(b"below", MWrite, [], [], [int_type()], int_type(), row_empty()),
+      ],
+    },
+    {
+      name: b"sim",
+      module: b"",
+      simple_name: b"sim",
+      nondet: false,
+      at: none,
+      ops: [prelude_op(b"seed", MRead, [], [], [], int_type(), row_empty())],
+    },
+    {
+      name: b"abort",
+      module: b"",
+      simple_name: b"abort",
+      nondet: false,
+      at: none,
+      ops: [prelude_op(b"raise", MRaise, [0], [], [string_type()], ta, row_empty())],
+    },
+    // Divergence names no operation: nothing performs it, and nothing handles it.
+    { name: b"diverges", module: b"", simple_name: b"diverges", nondet: false, at: none, ops: [] },
+  ]
+}
+
+pub fn simulated_atoms() -> List<Atom> / {abort.raise} =
+  prelude_effects().fold([], |acc: List<Atom>, effect_info: EffectInfo|
+    if simulated_names().contains(effect_info.name) {
+      effect_info.ops.fold(acc, |atoms: List<Atom>, op_info: OpInfo|
+        atoms_insert(atoms, {
+          effect: effect_info.name,
+          resource: RSingleton,
+          mode: op_info.mode,
+          op: None,
+        }))
+    } else { acc })
+
+// --- The prelude's functions -------------------------------------------------------------------
+
+/// A function the prelude declares: its scheme, the names its declaration gives its parameters, the
+/// lines of its doc, and what a call must show of the types it fixes.
+pub type Builtin = {
+  name: Bytes,
+  scheme: Scheme,
+  params: List<Passed>,
+  doc: List<Bytes>,
+  constraints: List<DefConstraint>,
+  /// Each `requires` and `ensures` as the prelude writes it.
+  clauses: List<Bytes>,
+  /// The same as the checker reads them, a `requires` for each condition `&&` joins.
+  contract: Contract,
+  /// Whether the prelude writes its body in Ply, rather than the runtime implementing it.
+  body: Bool,
+}
+
+/// What a declaration's types are read against: the variables its generic list binds, and the types
+/// the prelude imports, each under the name its module declares it by.
+type Declaring = {
+  fresh: Fresh,
+  tys: Map<Bytes, Type>,
+  labels: Map<Bytes, Type>,
+  rows: Map<Bytes, Int>,
+  imported: Map<Bytes, Bytes>,
+}
+
+fn misdeclared(what: Bytes, name: Bytes) -> String =
+  "the prelude " ++ String::of_bytes_lossy(what) ++ ": `" ++ String::of_bytes_lossy(name) ++ "`"
+
+fn declared_types(
+  d: Declaring,
+  tys: List<TypeExpr>,
+) -> { d: Declaring, tys: List<Type> } / {abort.raise} =
+  tys.fold({ d: d, tys: [] }, |acc: { d: Declaring, tys: List<Type> }, ty: TypeExpr| {
+    let o = declared_type(acc.d, ty);
+    { d: o.d, tys: acc.tys.push(o.ty) }
+  })
+
+/// A type as a declaration writes it: the language's own, or one its module declares or imports by
+/// name, at the arguments written.
+fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {abort.raise} =
+  match ty {
+    TVar(id) -> match d.tys.get(id.name) {
+      Some(t) -> { d: d, ty: t },
+      None -> panic(misdeclared(b"names a type variable no generic list binds", id.name)),
+    },
+    TUnit(_) -> { d: d, ty: unit_type() },
+    TBad(_) -> panic("the prelude does not parse"),
+    TRecord(r) -> {
+      let fs = r.fields.fold(
+        { d: d, fs: [] },
+        |acc: { d: Declaring, fs: List<Field> }, f: { name: Ident, ty: TypeExpr }| {
+          let o = declared_type(acc.d, f.ty);
+          { d: o.d, fs: acc.fs.push({ name: f.name.name, ty: o.ty }) }
+        },
+      );
+      { d: fs.d, ty: TyRecord(fields_sorted(fs.fs)) }
+    },
+    TFn(f) -> {
+      let ps = declared_types(d, f.params);
+      let r = declared_type(ps.d, f.ret);
+      { d: r.d, ty: fn_type(ps.tys, r.ty, declared_row(r.d, f.effects)) }
+    },
+    TCon(c) -> {
+      let name = c.name.name.name;
+      match d.tys.get(name) {
+        Some(t) -> { d: d, ty: t },
+        None -> match d.imported.get(name) {
+          Some(full) -> {
+            let args = declared_types(d, c.args);
+            { d: args.d, ty: TyCon({ name: full, args: args.tys }) }
+          },
+          None -> {
+            let args = declared_types(d, c.args);
+            if builtin_type_arity(name) != Some(args.tys.len()) {
+              panic(misdeclared(b"names a type that is not the language's own at that arity", name))
+            } else if name == b"Hold" {
+              match c.labels {
+                [l] -> match args.d.labels.get(l.name) {
+                  Some(label) ->
+                    { d: args.d, ty: TyCon({ name: name, args: [label, args.tys.get(0)] }) },
+                  None -> panic(misdeclared(b"names a label no generic list binds", l.name)),
+                },
+                _ -> panic(misdeclared(b"names a hold without its region's label", name)),
+              }
+            } else { { d: args.d, ty: TyCon({ name: name, args: args.tys }) } }
+          },
+        },
+      }
+    },
+  }
+
+/// A declaration's row: `abort.raise`, a `hold.read` of a label it binds, a row variable, or none of them.
+fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
+  match row {
+    None -> row_empty(),
+    Some(r) ->
+      {
+        atoms: r.atoms.fold([], |acc: List<Atom>, a: AtomExpr|
+          if is_bare(a.eff) && a.eff.name.name == b"abort"
+              && (match a.op { Some(op) -> op.name == b"raise", None -> false }) {
+            atoms_insert(acc, abort_atom())
+          } else if is_bare(a.eff) && a.eff.name.name == hold()
+              && (match a.op { Some(_) -> false, None -> mode_eq(a.mode, MRead) }) {
+            match a.resource {
+              Some(l) -> match d.labels.get(l.name) {
+                Some(TyVar(v)) -> atoms_insert(acc, hold_atom(RVar(v))),
+                _ ->
+                  panic(misdeclared(b"reads a hold under a label no generic list binds", l.name)),
+              },
+              None -> panic(misdeclared(b"reads a hold without its region's label", hold())),
+            }
+          } else {
+            panic(misdeclared(b"performs more than `abort.raise` and `hold.read`", a.eff.name.name))
+          }),
+        tail: match r.tail {
+          None -> None,
+          Some(v) -> match d.rows.get(v.name) {
+            Some(var) -> Some(var),
+            None -> panic(misdeclared(b"names a row variable no generic list binds", v.name)),
+          },
+        },
+      },
+  }
+
+/// Each type the prelude imports by name, under the name its module declares it by.
+pub fn prelude_imports(imports: List<ImportDecl>) -> Map<Bytes, Bytes> =
+  imports.fold(Map::new(), |acc: Map<Bytes, Bytes>, decl: ImportDecl|
+    match decl.kind {
+      INames(names) -> {
+        let module = decl.path.fold(b"", |path: Bytes, segment: Ident|
+          Bytes::concat_all([path, segment.name, b"."]));
+        names.fold(acc, |m: Map<Bytes, Bytes>, n: Ident| m.insert(n.name, module.concat(n.name)))
+      },
+      _ -> acc,
+    })
+
+/// The conditions `&&` joins, each with the text it is written as.
+fn conjuncts(def: ExternDef, e: Expr) -> List<Clause> / {abort.raise} =
+  match e {
+    EBinary(b) -> if b.op != b"and" { [written_clause(def, e)] }
+    else { conjuncts(def, b.lhs).concat(conjuncts(def, b.rhs)) },
+    _ -> [written_clause(def, e)],
+  }
+
+fn written_clause(def: ExternDef, e: Expr) -> Clause / {abort.raise} =
+  { holds: e, text: written_at(def, expr_span(e)) }
+
+/// What `span`, inside the declaration, is written as.
+fn written_at(def: ExternDef, span: Span) -> Bytes / {abort.raise} =
+  def.written.slice(span.start - def.span.start, span.end - def.span.start)
+
+/// What a call's answer is a function of: no parameter is a function.
+fn answers_by_value(params: List<Type>) -> Bool =
+  params.fold(true, |ok: Bool, ty: Type| ok && (match ty { TyFn(_) -> false, _ -> true }))
+
+fn contract_of(
+  def: ExternDef,
+  params: List<Type>,
+  ret: Type,
+  row: Row,
+) -> Contract / {abort.raise} =
+  {
+    params: def.params.map(|p: Param| p.name.name),
+    requires: def.spec.fold([], |acc: List<Clause>, c: SpecClause|
+      match c.kind {
+        SRequires -> acc.concat(conjuncts(def, c.expr)),
+        SEnsures -> acc,
+        SCost -> panic(misdeclared(b"states a `cost`", def.name.name)),
+        SSpace -> panic(misdeclared(b"states a `space`", def.name.name)),
+      }),
+    ensures: def.spec.fold([], |acc: List<Clause>, c: SpecClause|
+      match c.kind { SEnsures -> acc.push(written_clause(def, c.expr)), _ -> acc }),
+    raises: row.atoms.contains(abort_atom()),
+    pure: answers_by_value(params),
+    number: ret == int_type(),
+    like: match ret {
+      TyVar(v) ->
+        range(0, params.len()).fold(None, |acc: Option<Int>, i: Int|
+          match acc {
+            Some(_) -> acc,
+            None -> if params.get(i) == TyVar(v) { Some(i) } else { None },
+          }),
+      _ -> None,
+    },
+  }
+
+pub fn declared(
+  name: Bytes,
+  imported: Map<Bytes, Bytes>,
+  def: ExternDef,
+) -> Builtin / {abort.raise} = {
+  let tys = def.generics.types.fold(
+    { fresh: fresh_new(), tys: Map::new() },
+    |acc: { fresh: Fresh, tys: Map<Bytes, Type> }, p: Ident| {
+      let o = fresh_ty(acc.fresh);
+      { fresh: o.fresh, tys: acc.tys.insert(p.name, o.ty) }
+    },
+  );
+  // A label a declaration binds is what an argument's type fixes, so it is a variable like the rest.
+  let labels = def.generics.labels.fold(
+    { fresh: tys.fresh, tys: Map::new() },
+    |acc: { fresh: Fresh, tys: Map<Bytes, Type> }, p: Ident| {
+      let o = fresh_ty(acc.fresh);
+      { fresh: o.fresh, tys: acc.tys.insert(p.name, o.ty) }
+    },
+  );
+  let rows = def.generics.effects.fold(
+    { fresh: labels.fresh, rows: Map::new() },
+    |acc: { fresh: Fresh, rows: Map<Bytes, Int> }, p: Ident| {
+      let o = fresh_row_var(acc.fresh);
+      { fresh: o.fresh, rows: acc.rows.insert(p.name, o.var) }
+    },
+  );
+  let params = declared_types(
+    { fresh: rows.fresh, tys: tys.tys, labels: labels.tys, rows: rows.rows, imported: imported },
+    def.params.map(|p: Param|
+      match p.ty {
+        Some(t) -> t,
+        None -> panic(misdeclared(b"leaves a parameter untyped", p.name.name)),
+      }),
+  );
+  let ret = declared_type(params.d, def.ret);
+  let row = declared_row(ret.d, def.effects);
+  let written = def.constraints.fold([], |acc: List<DefConstraint>, c: Constraint| {
+    let param = range(0, def.generics.types.len()).fold(0 - 1, |p: Int, i: Int|
+      if p >= 0 { p } else if def.generics.types.get(i).name == c.param.name { i } else { p });
+    if param < 0 { panic(misdeclared(b"constrains what no generic list binds", c.param.name)) }
+    else { insert_constraint(acc, { deriver: c.deriver, param: param }) }
+  });
+  // A `Map` key's order is implied, as a `fn`'s signature implies it; a declared type in a key is
+  // judged where it is used, by what the program declares of it.
+  let keyed = params.tys.push(ret.ty).fold([], |acc: List<Type>, t: Type|
+    map_key_types(t, acc)).fold([], |acc: List<Int>, k: Type|
+    ints_union(acc, ord_needs(k, Map::new())));
+  let found = range(0, def.generics.types.len()).fold(
+    written,
+    |acc: List<DefConstraint>, i: Int|
+      match tys.tys.get(def.generics.types.get(i).name) {
+        Some(TyVar(v)) -> if keyed.contains(v) {
+          insert_constraint(acc, { deriver: DOrd, param: i })
+        } else { acc },
+        _ -> acc,
+      },
+  );
+  {
+    name: name,
+    scheme: {
+      ty_vars: range(0, ret.d.fresh.next_ty),
+      row_vars: range(0, ret.d.fresh.next_row),
+      label_vars: [],
+      ty: fn_type(params.tys, ret.ty, row),
+    },
+    params: def.params.map(passed),
+    doc: match def.doc { Some(d) -> d.lines, None -> [] },
+    constraints: dedup_constraints(found),
+    clauses: def.spec.map(|c: SpecClause| written_at(def, c.span)),
+    contract: contract_of(def, params.tys, ret.ty, row),
+    body: false,
+  }
+}
+
+/// A function the prelude writes in Ply, as the declaration its signature is; `source` is the
+/// prelude's text.
+fn signed_extern(source: Bytes, d: FnDef) -> ExternDef / {abort.raise} =
+  {
+    vis: d.vis,
+    name: d.name,
+    generics: d.generics,
+    params: d.params,
+    ret: match d.ret {
+      Some(t) -> t,
+      None -> panic(misdeclared(b"writes no answer's type", d.name.name)),
+    },
+    effects: d.effects,
+    constraints: d.constraints,
+    spec: d.spec,
+    doc: d.doc,
+    span: d.span,
+    written: source.slice(d.span.start, d.span.end),
+  }
+
+/// Every builtin the prelude declares and every function it writes in Ply that a module calls,
+/// in its order. Pure and nullary, so the runtime reads the prelude once.
+pub fn builtins() -> List<Builtin> / {abort.raise} = {
+  let source = prelude_source::text();
+  let parsed = parse(source);
+  if parsed.parser.diags.len() > 0 { panic("the prelude does not parse") } else {
+    let imported = prelude_imports(parsed.node.imports);
+    parsed.node.items.fold([], |acc: List<Builtin>, item: Item|
+      match item {
+        IExtern(def) -> if is_builtin(prelude_module(), parsed.node, def) {
+          acc.push(declared(def.name.name, imported, def))
+        } else { acc },
+        IFn(d) -> if !is_pub(d.vis) { acc } else {
+          let whole = signed_extern(source, d);
+          // A `cost` or `space` bound is its body's, which the prover reads off the definition.
+          let called = {
+            ..whole,
+            spec: whole.spec.filter(|c: SpecClause| c.kind == SRequires || c.kind == SEnsures),
+          };
+          acc.push({
+            ..declared(d.name.name, imported, called),
+            clauses: whole.spec.map(|c: SpecClause| written_at(whole, c.span)),
+            body: true,
+          })
+        },
+        _ -> acc,
+      })
+  }
+}
+
+pub fn builtin_named(name: Bytes) -> Option<Builtin> / {abort.raise} =
+  builtins().fold(None, |acc: Option<Builtin>, b: Builtin|
+    match acc { Some(_) -> acc, None -> if b.name == name { Some(b) } else { None } })
+
+/// A builtin's scheme is over variables numbered from zero, so `fresh` starts past every one.
+pub fn install_prelude(bare: Checker) -> Checker / {abort.raise} = {
+  let bound: Checker = builtins().fold(install_prelude_adts(bare), builtin_bound);
+  prelude_effects().fold(bound, |c2: Checker, effect_info: EffectInfo| add_effect(c2, effect_info))
+}
+
+/// Only a shipped module declares what the toolchain implements.
+pub fn refuse_externs(checker: Checker, parsed: ParsedModule) -> Checker =
+  List::fold(
+    if is_shipped(parsed.name) { [] } else { parsed.module.items },
+    checker,
+    |c: Checker, item: Item|
+      match item {
+        IExtern(def) ->
+          report_error_at(
+            c,
+            b"E0151",
+            def.name.span,
+            Bytes::concat_all([
+              b"`extern fn ",
+              def.name.name,
+              b"` declares a function the runtime implements",
+            ]),
+            b"only a module the toolchain ships declares one",
+            [
+              b"the toolchain implements the functions its own modules declare and nothing else, so a declaration here has nothing to name",
+              b"write the function's body, or reach what it needs through an `effect` a handler answers",
+            ],
+          ),
+        IType(def) -> match def.body {
+          TDExtern ->
+            report_error_at(
+              c,
+              b"E0151",
+              def.name.span,
+              Bytes::concat_all([
+                b"`extern type ",
+                def.name.name,
+                b"` declares a type the toolchain lays out",
+              ]),
+              b"only a module the toolchain ships declares one",
+              [
+                b"the toolchain lays out the types its own modules declare and nothing else, so a declaration here has nothing to name",
+                b"declare a `type` with the fields or the variants its values hold",
+              ],
+            ),
+          _ -> c,
+        },
+        _ -> c,
+      },
+  )
+
+// --- Names ------------------------------------------------------------------------------
+
+pub type ValueKey = { name: Bytes, prelude: Bool }
+
+// --- Types from type expressions ----------------------------------------------------------
+
+pub fn mode_eq(a: Mode, b: Mode) -> Bool =
+  match a {
+    MRead -> match b { MRead -> true, _ -> false },
+    MWrite -> match b { MWrite -> true, _ -> false },
+    MBad -> false,
+    MRaise -> is_raise(b),
+  }
+
+// --- Expressions ------------------------------------------------------------------------------
+
+pub fn lit_type(literal: Lit) -> Type / {abort.raise} =
+  match literal {
+    LInt(_) -> int_type(),
+    LFixed(ty, _) -> named_type(Bytes::of_string(String::of_bytes(ty).ascii_upper())),
+    LWide(ty, _, _) -> named_type(Bytes::of_string(String::of_bytes(ty).ascii_upper())),
+    LBool(_) -> bool_type(),
+    LStr(_) -> string_type(),
+    LBytes(_) -> bytes_type(),
+    LEmbedded(_, _) -> bytes_type(),
+    LFloat(_) -> float_type(),
+    LDec(_) -> decimal_type(),
+    LChar(_) -> named_type(b"Char"),
+    _ -> unit_type(),
+  }
+
+pub fn record_site(checker: Checker, atom: Atom, span: Span, source: PerformSource) -> Checker =
+  record_over(checker, atom, span, source, checker.over, checker.maybe)
+
+pub fn record_over(
+  checker: Checker,
+  atom: Atom,
+  span: Span,
+  source: PerformSource,
+  over: Option<Span>,
+  maybe: List<Maybe>,
+) -> Checker =
+  if span.start == 0 && span.end == 0 { checker } else {
+    {
+      ..checker,
+      performs: checker.performs.push({
+        atom: atom,
+        module: checker.module,
+        span: span,
+        source: source,
+        over: over,
+        maybe: maybe,
+      }),
+    }
+  }
+
+pub fn is_direct(site: PerformSite) -> Bool =
+  match site.source { DirectPerform -> true, _ -> false }
+
+// --- Definitions ----------------------------------------------------------------------------------
+
+/// `b` bound where a call finds it, with what its declaration states.
+pub fn builtin_bound(c: Checker, b: Builtin) -> Checker / {abort.raise} =
+  {
+    ..c,
+    env: env_bind_global(c.env, b.name, b.scheme),
+    constraints: if b.constraints.len() == 0 { c.constraints }
+    else { c.constraints.insert(b.name, b.constraints) },
+    contracts: c.contracts.insert(b.name, b.contract),
+    takings: c.takings.insert(b.name, { name: b.name, params: b.params }),
+    fresh: {
+      next_ty: max(c.fresh.next_ty, b.scheme.ty_vars.len()),
+      next_row: max(c.fresh.next_row, b.scheme.row_vars.len()),
+    },
+  }
+
+fn constraint_lt(a: DefConstraint, b: DefConstraint) -> Bool =
+  a.param < b.param || (a.param == b.param && deriver_tag(a.deriver) < deriver_tag(b.deriver))
+
+pub fn insert_constraint(
+  sorted: List<DefConstraint>,
+  c: DefConstraint,
+) -> List<DefConstraint> / {abort.raise} = {
+  let n = sorted.len();
+  let i = range(0, n).fold(n, |acc: Int, j: Int|
+    if acc < n { acc } else if constraint_lt(c, sorted.get(j)) { j } else { acc });
+  sorted.take(i).push(c).concat(sorted.drop(i))
+}
+
+pub fn dedup_constraints(xs: List<DefConstraint>) -> List<DefConstraint> / {abort.raise} =
+  xs.fold([], |acc: List<DefConstraint>, c: DefConstraint|
+    if acc.len() > 0 && acc.get(acc.len() - 1).param == c.param
+        && same_deriver(acc.get(acc.len() - 1).deriver, c.deriver) { acc }
+    else { acc.push(c) })
+
+// --- Derivability ------------------------------------------------------------------------------
+
+// The one predicate a `where` clause, a `Map` key type and a `derive` ask.
+
+pub type Blocked = { ty: Type, why: DeriveRefusal }
+
+/// `params` are the type's type and label variables and `rows` its row variables, in the order a
+/// use's arguments ride.
+/// `native` for an `extern type`, which no deriver reads.
+pub type AlgebraicShape = {
+  name: Bytes,
+  params: List<Int>,
+  rows: List<Int>,
+  fields: List<Type>,
+  native: Bool,
+}
+
+/// Each sum type's shape by the type's name.
+pub type Shapes = Map<Bytes, AlgebraicShape>
+
+pub fn find_adt(adts: Shapes, name: Bytes) -> Option<AlgebraicShape> = adts.get(name)
+
+fn json_null_encoded(ty: Type) -> Bool =
+  match ty { TyCon(c) -> null_encoded_name(c.name), _ -> false }
+
+pub fn derivable(
+  deriver: Deriver,
+  ty: Type,
+  adts: Shapes,
+  assumed: List<Int>,
+) -> Option<Blocked> / {abort.raise} = derivable_within(deriver, ty, adts, assumed, [], adts.len())
+
+fn first_blocked(
+  deriver: Deriver,
+  tys: List<Type>,
+  adts: Shapes,
+  assumed: List<Int>,
+  visiting: List<Bytes>,
+  room: Int,
+) -> Option<Blocked> / {abort.raise} =
+  tys.fold(None, |acc: Option<Blocked>, ty: Type|
+    match acc {
+      Some(_) -> acc,
+      None -> derivable_within(deriver, ty, adts, assumed, visiting, room),
+    })
+
+/// `room` is how many more declared types the walk may enter: a path enters each one once.
+fn derivable_within(
+  deriver: Deriver,
+  ty: Type,
+  adts: Shapes,
+  assumed: List<Int>,
+  visiting: List<Bytes>,
+  room: Int,
+) -> Option<Blocked> / {abort.raise} =
+  match ty {
+    TyVar(v) -> if assumed.contains(v) { None } else { Some({ ty: ty, why: Unconstrained(v) }) },
+    TyFn(_) -> Some({ ty: ty, why: HoldsFunction }),
+    TyRecord(fs) -> first_blocked(deriver, fs.map(|f: Field| f.ty), adts, assumed, visiting, room),
+    TyNominal(n) ->
+      first_blocked(deriver, n.fields.map(|f: Field| f.ty), adts, assumed, visiting, room),
+    TyCon(c) -> match constructor_shape(deriver, c.name) {
+      Leaf -> None,
+      Refused(why) -> Some({ ty: ty, why: why }),
+      Structural -> if same_deriver(deriver, DJson) && c.name == b"Option" && c.args.len() > 0
+          && json_null_encoded(c.args.get(0)) { Some({ ty: ty, why: NullInsideOption }) }
+      else { first_blocked(deriver, c.args, adts, assumed, visiting, room) },
+      Nominal ->        // A recursive type is derivable exactly when its non-recursive parts are.
+        if visiting.contains(c.name) { None } else {
+          match find_adt(adts, c.name) {
+            None -> None,
+            Some(adt) -> if adt.native { Some({ ty: ty, why: HoldsNative }) }
+            else if room <= 0 { panic("a type entered twice on one path") } else {
+              first_blocked(
+                deriver,
+                adt.fields.map(|f: Type| at_arguments(f, adt.params, adt.rows, c.args)),
+                adts,
+                assumed,
+                visiting.push(c.name),
+                room - 1,
+              )
+            },
+          }
+        },
+    },
+  }
+
+/// The variables `derivable` needs ordered to order `ty`, reading declared types through `shapes`:
+/// each one it finds unassumed, as far as a refusal no assumption lifts.
+pub fn ord_needs(ty: Type, shapes: Shapes) -> List<Int> / {abort.raise} =
+  iterate([], vars_of_type(ty).len() + 2, |found: List<Int>|
+    match derivable(DOrd, ty, shapes, found) {
+      Some(b) -> match b.why {
+        Unconstrained(v) -> Continue(ints_insert(found, v)),
+        _ -> Stop(found),
+      },
+      None -> Stop(found),
+    })
+
+pub fn vars_of_type(t: Type) -> List<Int> / {abort.raise} =
+  free_vars(subst_new(), t, { tys: [], rows: [] }).tys
+
+fn map_key_types(t: Type, out: List<Type>) -> List<Type> / {abort.raise} =
+  match t {
+    TyCon(c) -> {
+      let own = if c.name == b"Map" && c.args.len() == 2 { out.push(c.args.get(0)) } else { out };
+      c.args.fold(own, |acc: List<Type>, a: Type| map_key_types(a, acc))
+    },
+    TyFn(f) ->
+      map_key_types(f.ret, f.params.fold(out, |acc: List<Type>, p: Type| map_key_types(p, acc))),
+    TyRecord(fs) -> fs.fold(out, |acc: List<Type>, f: Field| map_key_types(f.ty, acc)),
+    TyNominal(n) -> n.args.fold(out, |acc: List<Type>, a: Type| map_key_types(a, acc)),
+    TyVar(_) -> out,
+  }
+
+// --- `check_program` --------------------------------------------------------------------------------------
+
+// The facts cross from the program that checked to the one that lowers as bytes: a constructor's
+// name is each program's own, its index in its type is not.
+derive bin for UpdateShape
+
+derive bin for TrySite
+
+derive bin for MemberSite
+
+derive bin for LabelSite
+
+derive bin for OperandSite
+
+derive bin for TypedSite
+
+derive bin for WitnessOp
+
+derive bin for WitnessRef
+
+derive bin for WitnessOrder
+
+// --- Tests ------------------------------------------------------------------
+
+// A `simulate` region answers the clock and randomness itself, from its seed, so an operation
+// declared here and not answered there is refused inside every region; `tests/lang` performs each of
+// these inside one.
+test "the clock and randomness declare exactly the operations a region answers itself" {
+  let ops_of = |name: Bytes|
+    match prelude_effects().filter(|e: EffectInfo| e.name == name) {
+      [e, ..] -> e.ops.map(|o: OpInfo| o.name),
+      [] -> [],
+    };
+  assert_eq(ops_of(b"clock"), [b"now", b"sleep"]);
+  assert_eq(ops_of(b"random"), [b"next", b"below"])
+}
+
+test "the prelude's effect names are the effects it declares" {
+  assert_eq(
+    prelude_effect_names(),
+    prelude_effects().map(|effect_info: EffectInfo| effect_info.name),
+  )
+}
+
+// --- How many times a body performs what its row names --------------------------------------
+
+test "every function the prelude declares has a doc" {
+  assert_eq(builtins().filter(|b: Builtin| b.doc.len() == 0).map(|b: Builtin| b.name), [])
+}

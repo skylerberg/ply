@@ -1,12 +1,12 @@
 //! The filesystem, as operations confined to roots the run names.
 
 use crate::pool::{JobOutput, MAX_BLOCKING_OPERATIONS, Pool, Pooled, option, record};
-use ply_eval::crypto::Framing;
-use ply_eval::host::{
+use ply_core::crypto::Framing;
+use ply_core::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity, MachineId,
 };
-use ply_eval::{Diagnostic, Resource, Span, Symbol, Value, codes};
+use ply_core::{Diagnostic, Resource, Span, Symbol, Value, codes};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -1749,7 +1749,7 @@ fn not_an_opening(span: Span) -> Diagnostic {
 pub fn unbound(op: Op, at: &Resource, span: Span) -> Diagnostic {
     let label = match at {
         Resource::Named(name) => name.as_str().to_string(),
-        Resource::Var(v) => ply_eval::label_var_name(*v),
+        Resource::Var(v) => ply_core::label_var_name(*v),
         Resource::Singleton => "the singleton resource".to_string(),
         Resource::Every => "every label".to_string(),
     };

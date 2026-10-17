@@ -4,8 +4,8 @@
 //! is reproducible; a run that is not simulated has this instead, and it is the host's because
 //! `/dev/urandom` is the only source a run has.
 
-use ply_eval::host::HostRegistry;
-use ply_eval::{
+use ply_core::host::HostRegistry;
+use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, Linearity,
     Span, Symbol, Value, codes,
 };
@@ -84,7 +84,7 @@ struct Entropy {
 impl HostHandler for Entropy {
     fn call(
         &self,
-        _: &dyn ply_eval::HostRuntime,
+        _: &dyn ply_core::HostRuntime,
         req: &HostRequest<'_>,
     ) -> Result<HostAnswer, Diagnostic> {
         match req.op.op.as_str() {

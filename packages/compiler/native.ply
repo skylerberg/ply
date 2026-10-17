@@ -1,0 +1,266 @@
+//! A native program: its unit's C linked with the runtime's library into an executable, with a pack
+//! after it that carries what the program reads at run time: the shipped modules a load of another
+//! program compiles against, the answers they gave, and what the program's own front end answered
+//! of the definition it enters, which the runtime binds its code to.
+
+import std.bytes (u32_le, u64_le)
+import std.hash (blake3)
+import std.json (Json, Object, Array, Str, Number, Bool, parse)
+import unit (Helper, Native, Runtime)
+import emit.layout (Layouts, ListLaid, TrieLaid, MapLaid, TreeLaid, layouts)
+
+/// The `main` every native program has: the runtime entered with the descriptor its unit's C lays
+/// out.
+pub fn main_c() -> Bytes =
+  b"struct ply_descriptor;\nextern const struct ply_descriptor ply_descriptor;\nint ply_native_enter(int, char **, const struct ply_descriptor *);\nint main(int argc, char **argv) { return ply_native_enter(argc, argv, &ply_descriptor); }\n"
+
+/// A program that prints the runtime its library is, as JSON.
+pub fn describer_c() -> Bytes =
+  b"#include <stdio.h>\nconst char *ply_runtime_describe(void);\nint main(void) { fputs(ply_runtime_describe(), stdout); return 0; }\n"
+
+/// What a native program's objects compile with: nothing of the program is exported, so a unit it
+/// loads later binds only to its own code.
+pub fn native_flags() -> List<String> = ["-fvisibility=hidden", "-fno-strict-aliasing"]
+
+/// Where the pack carries a native program's front end, as the runtime reads it.
+pub fn front_path() -> String = "program/front"
+
+/// Where the pack carries the standard library's files, each by its place below the library's
+/// directory, whatever a checkout calls that directory.
+pub fn std_root() -> String = "std"
+
+/// Where the pack carries the compiler's modules, each by its place below the compiler's directory.
+pub fn compiler_root() -> String = "compiler"
+
+fn text_at(j: Json, name: String) -> Option<String> =
+  match j { Object(m) -> match m.get(name) { Some(Str(s)) -> Some(s), _ -> None }, _ -> None }
+
+fn int_at(j: Json, name: String) -> Option<Int> =
+  match j {
+    Object(m) -> match m.get(name) { Some(Number(d)) -> Int::of_decimal(d, Down), _ -> None },
+    _ -> None,
+  }
+
+fn list_at_key(j: Json, name: String) -> List<Json> =
+  match j { Object(m) -> match m.get(name) { Some(Array(xs)) -> xs, _ -> [] }, _ -> [] }
+
+fn flag_at(j: Json, name: String) -> Bool =
+  match j { Object(m) -> m.get(name) == Some(Bool(true)), _ -> false }
+
+/// A native as a description lists it; `None` for an entry that does not read as one.
+fn described_native(n: Json) -> Option<Native> =
+  match ((text_at(n, "name"), int_at(n, "words"))) {
+    (Some(name), Some(words)) ->
+      Some({
+        name: Bytes::of_string(name),
+        words: words,
+        answers: flag_at(n, "answers"),
+        raises: flag_at(n, "raises"),
+      }),
+    _ -> None,
+  }
+
+/// The natives a description lists; `None` where it lists none or one does not read.
+fn natives_at(j: Json) -> Option<List<Native>> =
+  match j {
+    Object(m) -> match m.get("natives") {
+      Some(Array(xs)) ->
+        xs.fold(Some([]), |acc: Option<List<Native>>, n: Json|
+          match acc {
+            None -> None,
+            Some(ns) -> match described_native(n) { Some(x) -> Some(ns.push(x)), None -> None },
+          }),
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+/// What `read` makes of the member `name` of `j`; `None` where there is none.
+fn read_at<a>(j: Json, name: String, read: (Json) -> Option<a>) -> Option<a> =
+  match j { Object(m) -> match m.get(name) { Some(x) -> read(x), None -> None }, _ -> None }
+
+fn list_laid(j: Json) -> Option<ListLaid> =
+  match ((
+      int_at(j, "root"),
+      int_at(j, "tail"),
+      text_at(j, "start"),
+      text_at(j, "tail_len"),
+      text_at(j, "room"),
+    )) {
+    (Some(root), Some(tail), Some(start), Some(tail_len), Some(room)) ->
+      Some({
+        root: root,
+        tail: tail,
+        start: Bytes::of_string(start),
+        tail_len: Bytes::of_string(tail_len),
+        room: Bytes::of_string(room),
+      }),
+    _ -> None,
+  }
+
+fn trie_laid(j: Json) -> Option<TrieLaid> =
+  match ((int_at(j, "leaf"), int_at(j, "branch"), int_at(j, "width"))) {
+    (Some(leaf), Some(branch), Some(width)) -> Some({ leaf: leaf, branch: branch, width: width }),
+    _ -> None,
+  }
+
+fn map_laid(j: Json) -> Option<MapLaid> =
+  match ((int_at(j, "root"), text_at(j, "height"))) {
+    (Some(root), Some(height)) -> Some({ root: root, height: Bytes::of_string(height) }),
+    _ -> None,
+  }
+
+fn tree_laid(j: Json) -> Option<TreeLaid> =
+  match ((
+      int_at(j, "leaf"),
+      int_at(j, "branch"),
+      int_at(j, "width"),
+      int_at(j, "keys"),
+      int_at(j, "sizes"),
+    )) {
+    (Some(leaf), Some(branch), Some(width), Some(keys), Some(sizes)) ->
+      Some({ leaf: leaf, branch: branch, width: width, keys: keys, sizes: sizes }),
+    _ -> None,
+  }
+
+/// How a description says its runtime lays out what the emitter writes in place; `None` where it
+/// says nothing of it or a part does not read.
+fn layouts_at(j: Json) -> Option<Layouts> =
+  read_at(j, "layouts", |l: Json|
+    match ((
+        read_at(l, "list", list_laid),
+        read_at(l, "trie", trie_laid),
+        read_at(l, "map", map_laid),
+        read_at(l, "tree", tree_laid),
+      )) {
+      (Some(list), Some(trie), Some(map), Some(tree)) ->
+        Some({ list: list, trie: trie, map: map, tree: tree }),
+      _ -> None,
+    })
+
+/// The runtime `json` describes, as a runtime's library describes itself; `None` for anything else.
+pub fn runtime_of(json: Bytes) -> Option<Runtime> / {abort.raise} =
+  match parse(json) {
+    Err(_) -> None,
+    Ok(j) -> match ((
+        text_at(j, "head"),
+        text_at(j, "tail"),
+        text_at(j, "identity"),
+        natives_at(j),
+        layouts_at(j),
+      )) {
+      (Some(head), Some(tail), Some(identity), Some(natives), Some(layouts)) ->
+        Some({
+          head: Bytes::of_string(head),
+          tail: Bytes::of_string(tail),
+          helpers: list_at_key(j, "helpers").fold([], |acc: List<Helper>, h: Json|
+            match ((text_at(h, "name"), int_at(h, "args"))) {
+              (Some(name), Some(args)) ->
+                acc.push({
+                  name: Bytes::of_string(name),
+                  args: args,
+                  answers: flag_at(h, "answers"),
+                }),
+              _ -> acc,
+            }),
+          natives: natives,
+          layouts: layouts,
+          identity: Bytes::of_string(identity),
+        }),
+      _ -> None,
+    },
+  }
+
+/// One file a pack carries, by the path it is read under.
+pub type Packed = { path: String, bytes: Bytes }
+
+/// `files` as the pack a binary carries after its code: each file's bytes, then a table of each
+/// one's path, where its bytes are, how many and their digest, ascending by path, then the lengths
+/// of the pack and of the table and `PLYPACK1`. A path given twice is carried once, as last given.
+pub fn pack(files: List<Packed>) -> Bytes = {
+  let by_path = files.fold(Map::new(), |acc: Map<String, Bytes>, f: Packed|
+    acc.insert(f.path, f.bytes));
+  let laid = by_path.fold(
+    { data: [], table: [], at: 0 },
+    |acc: { data: List<Bytes>, table: List<Bytes>, at: Int }, path: String, bytes: Bytes|
+      {
+        data: acc.data.push(bytes),
+        table: acc.table.push(
+          Bytes::concat_all([
+            u32_le(Bytes::of_string(path).len()),
+            Bytes::of_string(path),
+            u64_le(acc.at),
+            u64_le(bytes.len()),
+            blake3(bytes),
+          ]),
+        ),
+        at: acc.at + bytes.len(),
+      },
+  );
+  let table = u32_le(by_path.len()).concat(Bytes::concat_all(laid.table));
+  Bytes::concat_all([
+    Bytes::concat_all(laid.data),
+    table,
+    u64_le(laid.at + table.len()),
+    u64_le(table.len()),
+    b"PLYPACK1",
+  ])
+}
+
+// --- Tests -----------------------------------------------------------------------
+
+test "a pack lays its files out by path, then its table, then the lengths and the mark" {
+  let b = pack([{ path: "b", bytes: b"22" }, { path: "a", bytes: b"1" }]);
+  // `a` first, then `b`, though they were given the other way round.
+  assert_eq(b.slice(0, 3), b"122");
+  let table_len = 4 + (4 + 1 + 8 + 8 + 32) * 2;
+  assert_eq(b.len(), 3 + table_len + 8 + 8 + 8);
+  assert_eq(b.slice(b.len() - 8, b.len()), b"PLYPACK1");
+  assert_eq(b.slice(b.len() - 16, b.len() - 8), u64_le(table_len));
+  assert_eq(b.slice(b.len() - 24, b.len() - 16), u64_le(3 + table_len))
+}
+
+test "a runtime reads back from the JSON its library describes itself with" {
+  let laid = b"\"layouts\":{\"list\":{\"root\":0,\"tail\":1,\"start\":\"layout\",\"tail_len\":\"flags\",\"room\":\"aux\"},\"trie\":{\"leaf\":11,\"branch\":12,\"width\":32},\"map\":{\"root\":0,\"height\":\"layout\"},\"tree\":{\"leaf\":13,\"branch\":14,\"width\":32,\"keys\":33,\"sizes\":66}}";
+  let json = Bytes::concat_all([
+    b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[{\"name\":\"h\",\"args\":2,\"answers\":true}],\"natives\":[{\"name\":\"List::len\",\"words\":1,\"answers\":true,\"raises\":false},{\"name\":\"panic\",\"words\":1,\"answers\":true,\"raises\":true}],",
+    laid,
+    b",\"builtins\":[\"List::len\",\"panic\"]}",
+  ]);
+  match runtime_of(json) {
+    None -> assert(false, Some("the description reads")),
+    Some(r) -> {
+      assert_eq(r.head, b"H");
+      assert_eq(r.helpers, [{ name: b"h", args: 2, answers: true }]);
+      assert_eq(r.natives, [
+        { name: b"List::len", words: 1, answers: true, raises: false },
+        { name: b"panic", words: 1, answers: true, raises: true },
+      ]);
+      assert_eq(r.layouts, layouts());
+      assert_eq(r.identity, b"I")
+    },
+  };
+  // A library that lists no natives or no layouts, or one where either does not read, describes a
+  // runtime this `ply` cannot hold a program's code to.
+  let head = b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[],";
+  let natives = b"\"natives\":[{\"name\":\"panic\",\"words\":1,\"answers\":true,\"raises\":true}]";
+  assert(runtime_of(Bytes::concat_all([head, natives, b",", laid, b"}"])) != None);
+  assert_eq(runtime_of(Bytes::concat_all([head, laid, b"}"])), None);
+  assert_eq(
+    runtime_of(Bytes::concat_all([head, b"\"natives\":[{\"name\":\"panic\"}],", laid, b"}"])),
+    None,
+  );
+  assert_eq(runtime_of(Bytes::concat_all([head, natives, b"}"])), None);
+  assert_eq(
+    runtime_of(
+      Bytes::concat_all([
+        head,
+        natives,
+        b",",
+        laid.replace(b"\"keys\":33", b"\"keys\":\"33\""),
+        b"}",
+      ]),
+    ),
+    None,
+  )
+}

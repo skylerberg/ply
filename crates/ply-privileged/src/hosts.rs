@@ -1,0 +1,1162 @@
+//! The trusted computing base, as the CLI reads and reports it.
+
+use crate::config::Configuration;
+use crate::payload::{count, diags_value, option, places_value, record, strings};
+use ply_core::host::{
+    Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
+    HostRequest, HostResource, HostRow, HostRuntime, Linearity, MachineId,
+};
+use ply_core::{CheckOutput, Diagnostic, Footprint, SourceMap, Span, Symbol, Value as PlyValue};
+use ply_host::tls;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+/// The trusted computing base this binary was built with.
+pub fn registry() -> HostRegistry {
+    ply_host::registry()
+}
+
+/// One host operation and the handler that serves it, as a caller lends it to an entry.
+pub type LentOp = (HostOp, Arc<dyn HostHandler>);
+
+/// One operation of a privileged family. Each family reads the world, a tree, a clock, a cache, a
+/// toolchain or the process environment, so none is a function of program state; each answers
+/// before the perform returns rather than handing back a token to poll; and none is handed a
+/// `Secret`.
+pub fn privileged_op(effect: &str, op: &str, linearity: Linearity, path: &'static str) -> HostOp {
+    HostOp {
+        effect: Symbol::new(effect),
+        op: Symbol::new(op),
+        resource: HostResource::Any,
+        determinism: Determinism::Nondeterministic,
+        linearity,
+        blocking: false,
+        secrets: false,
+        path,
+    }
+}
+
+/// One operation of a hermetic half, served by a deterministic handler.
+pub fn hermetic_op(effect: &str, op: &str, linearity: Linearity, path: &'static str) -> HostOp {
+    HostOp {
+        determinism: Determinism::Deterministic,
+        ..privileged_op(effect, op, linearity, path)
+    }
+}
+
+/// A hermetic half's handler as each machine that asks holds it: a state of its own, made at its
+/// first operation and gone when it ends. A deterministic handler answers from the asking program's
+/// state alone, so two tests that perform its operations at once share nothing of it.
+pub struct Apart<H> {
+    made: Box<dyn Fn() -> H + Send + Sync>,
+    held: Mutex<HashMap<MachineId, Arc<H>>>,
+}
+
+impl<H: HostHandler + 'static> Apart<H> {
+    pub fn of(made: impl Fn() -> H + Send + Sync + 'static) -> Arc<dyn HostHandler> {
+        Arc::new(Apart {
+            made: Box::new(made),
+            held: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+impl<H: HostHandler> HostHandler for Apart<H> {
+    fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+        let own = Arc::clone(
+            self.held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(req.machine)
+                .or_insert_with(|| Arc::new((self.made)())),
+        );
+        own.call(rt, req)
+    }
+
+    fn machine_ended(&self, machine: MachineId) {
+        // Dropped after the lock is: a state may join a thread on its way out.
+        let gone = self
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&machine);
+        drop(gone);
+    }
+}
+
+/// A perform of a privileged family's operation that its handler does not serve.
+#[cold]
+pub fn unserved(effect: &str, op: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        ply_core::codes::INTERNAL_ERROR,
+        format!("`{effect}.{op}` is not an operation this command serves"),
+    )
+    .primary(span, "performed here")
+    .note("the effect and its handler are written together; this is Ply's fault")
+}
+
+fn registry_for(trace: Option<Arc<ply_host::trace::Trace>>) -> HostRegistry {
+    match trace {
+        Some(trace) => ply_host::registry_over(trace),
+        None => ply_host::registry(),
+    }
+}
+
+/// What a run has bound, and what it *could* have bound.
+pub struct Hosts {
+    /// The facilities the bound handlers act on; the source of every [`HostRuntime`].
+    host: Option<Arc<ply_host::Host>>,
+    /// One binding serves the whole run.
+    binding: Arc<HostBinding>,
+    /// Every triple the registry resolves against this program, whether or not it is bound.
+    listing: HostListing,
+    /// Read by the `configuration` block, the banner and the digest; never re-derived from flags.
+    config: Configuration,
+    /// Where this run's records go and on which channels, when the program records at all.
+    observability: Option<Observability>,
+    shutdown: Option<Shutdown>,
+}
+
+impl Hosts {
+    /// The binding a run gets: what this binary compiled in, against this program.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open(
+        check: &CheckOutput,
+        host: bool,
+        credentials: &crate::options::TlsOptions,
+        roots: &[ply_host::fs::RootSpec],
+        config: Configuration,
+        trace: &crate::trace::TraceOptions,
+    ) -> Result<Hosts, Vec<Diagnostic>> {
+        Hosts::open_stopping(
+            check,
+            host,
+            credentials,
+            roots,
+            config,
+            trace,
+            None,
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// [`Hosts::open`] with the rest of what a run may bind: a stop to listen for (only `ply run`, so
+    /// ctrl-C ends no test), a `process` host, and `lent`, the registrations of the families a
+    /// caller serves beside the ones this binary compiles in.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_stopping(
+        check: &CheckOutput,
+        host: bool,
+        credentials: &crate::options::TlsOptions,
+        roots: &[ply_host::fs::RootSpec],
+        config: Configuration,
+        trace: &crate::trace::TraceOptions,
+        shutdown: Option<Arc<ply_host::signal::Shutdown>>,
+        process: Option<ply_host::process::ProcessHost>,
+        lent: Vec<LentOp>,
+    ) -> Result<Hosts, Vec<Diagnostic>> {
+        Hosts::open_over(
+            check,
+            host,
+            credentials,
+            roots,
+            config,
+            trace,
+            shutdown,
+            process,
+            lent,
+            false,
+        )
+    }
+
+    /// The hosts of a program a runnable holds, which was built against the effects of its day:
+    /// an operation one of them has gained since is not that program's to perform, so it is
+    /// bound to the operations it declares.
+    pub fn open_built(
+        check: &CheckOutput,
+        credentials: &crate::options::TlsOptions,
+        roots: &[ply_host::fs::RootSpec],
+        process: ply_host::process::ProcessHost,
+        lent: Vec<LentOp>,
+    ) -> Result<Hosts, Vec<Diagnostic>> {
+        Hosts::open_over(
+            check,
+            true,
+            credentials,
+            roots,
+            Configuration::default(),
+            &crate::trace::TraceOptions::default(),
+            None,
+            Some(process),
+            lent,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_over(
+        check: &CheckOutput,
+        host: bool,
+        credentials: &crate::options::TlsOptions,
+        roots: &[ply_host::fs::RootSpec],
+        config: Configuration,
+        trace: &crate::trace::TraceOptions,
+        shutdown: Option<Arc<ply_host::signal::Shutdown>>,
+        process: Option<ply_host::process::ProcessHost>,
+        lent: Vec<LentOp>,
+        declared_only: bool,
+    ) -> Result<Hosts, Vec<Diagnostic>> {
+        if !host {
+            let mut registry = registry_for(None);
+            for (op, handler) in lent {
+                registry.register(op, handler);
+            }
+            return Ok(Hosts {
+                host: None,
+                binding: Arc::new(HostBinding::hermetic_with(registry)),
+                listing: HostListing::default(),
+                config: Configuration::default(),
+                observability: None,
+                shutdown: None,
+            });
+        }
+        let material =
+            tls::Credentials::load(&credentials.tls, &credentials.trust, &credentials.mtls)?;
+        // Loaded up front so a bad root is `E0454` before anything runs.
+        let roots = ply_host::fs::Roots::load(roots, Span::DUMMY).map_err(|d| vec![d])?;
+        // Opened only when a `db` operation can reach it, and probed now so an unreachable database
+        // fails start-up rather than the first request.
+        let mut facilities = ply_host::Host::with_credentials(material)
+            .configured(Arc::clone(&config.snapshot))
+            .rooted(roots)
+            .traced(trace.open());
+        if let Some(process) = process {
+            facilities = facilities.with_process(process);
+        }
+        if let Some(shutdown) = shutdown {
+            facilities = facilities.stopping_on(shutdown);
+        }
+        let facilities = Arc::new(facilities);
+        let mut registry = facilities.registry();
+        for (op, handler) in lent {
+            registry.register(op, handler);
+        }
+        if declared_only {
+            registry.retain_declared(check);
+        }
+        let binding = registry.bind(check)?;
+        let listing = binding.listing().clone();
+        let observability = Observability::of(&listing, facilities.tracing(), trace.level_name());
+        let stopping = facilities
+            .stop()
+            .and_then(|shutdown| Shutdown::of(&listing, shutdown));
+        Ok(Hosts {
+            host: Some(facilities),
+            binding: Arc::new(binding),
+            listing,
+            config,
+            observability,
+            shutdown: stopping,
+        })
+    }
+
+    /// The run's resolved configuration.
+    pub fn configuration(&self) -> &Configuration {
+        &self.config
+    }
+
+    /// What the sink saw, for the line a stopping service prints.
+    pub fn trace_counts(&self) -> Option<ply_host::trace::Counts> {
+        self.host.as_ref().map(|host| host.tracing().counts())
+    }
+
+    /// The TLS stack and configured credentials, or `None` when neither exists.
+    pub fn transport(&self) -> Option<Transport> {
+        Transport::of(&self.listing, self.host.as_ref().map(|h| h.credentials()))
+    }
+
+    /// Every block the rows cannot carry; printed and hashed together.
+    pub fn disclosures(&self) -> Disclosures {
+        Disclosures {
+            transport: self.transport(),
+            filesystem: Filesystem::of(&self.listing, self.host.as_ref().map(|h| h.roots())),
+            configuration: Some(self.config.clone()).filter(Configuration::is_opened),
+            observability: self.observability.clone(),
+            shutdown: self.shutdown,
+        }
+    }
+
+    /// [`Hosts::open`] against an explicit registry, for tests.
+    pub fn bind(
+        registry: HostRegistry,
+        check: &CheckOutput,
+        host: bool,
+    ) -> Result<Hosts, Vec<Diagnostic>> {
+        if !host {
+            return Ok(Hosts {
+                host: None,
+                binding: Arc::new(HostBinding::hermetic_with(registry)),
+                listing: HostListing::default(),
+                config: Configuration::default(),
+                observability: None,
+                shutdown: None,
+            });
+        }
+        let binding = registry.bind(check)?;
+        let listing = binding.listing().clone();
+        Ok(Hosts {
+            host: None,
+            binding: Arc::new(binding),
+            listing,
+            config: Configuration::default(),
+            observability: None,
+            shutdown: None,
+        })
+    }
+
+    /// A reactor for one machine, on the thread that will drive it.
+    pub fn runtime(&self) -> Option<Rc<dyn HostRuntime>> {
+        self.host.as_ref().map(|host| host.runtime())
+    }
+
+    /// The same thing, as something a worker thread can call for itself.
+    pub fn runtime_factory(&self) -> Option<ply_core::RuntimeFactory> {
+        self.host.as_ref().map(Arc::clone).map(|host| {
+            let factory: ply_core::RuntimeFactory = Arc::new(move || host.runtime());
+            factory
+        })
+    }
+
+    pub fn binding(&self) -> Arc<HostBinding> {
+        Arc::clone(&self.binding)
+    }
+
+    /// The code `process.exit` asked for, once the run is over.
+    pub fn requested_exit(&self) -> Option<i32> {
+        self.host.as_ref()?.process()?.requested_exit()
+    }
+
+    pub fn listing(&self) -> &HostListing {
+        &self.listing
+    }
+
+    pub fn is_hermetic(&self) -> bool {
+        self.binding.is_hermetic()
+    }
+
+    pub fn label(&self) -> &'static str {
+        if self.is_hermetic() {
+            "hermetic"
+        } else {
+            "host"
+        }
+    }
+
+    pub fn reaches(&self, footprint: &Footprint) -> bool {
+        self.binding.reaches(footprint)
+    }
+
+    pub fn summary_json(&self) -> Value {
+        let disclosures = self.disclosures();
+        let mut summary = json!({
+            "handlers": self.listing.handlers,
+            "operations": self.listing.rows.len(),
+            "digest": digest_short(&self.listing, &disclosures),
+        });
+        if let Some(transport) = &disclosures.transport {
+            summary["transport"] = transport.json();
+            // Counts, not diagnostics: a client speaking no TLS is attributable to no definition.
+            summary["handshakes"] = handshakes_json(&self.handshakes());
+        }
+        if let Some(filesystem) = &disclosures.filesystem {
+            summary["filesystem"] = filesystem.json();
+        }
+        summary
+    }
+
+    /// Handshakes this run completed and refused, with the reasons.
+    pub fn handshakes(&self) -> tls::HandshakeCounts {
+        self.host
+            .as_ref()
+            .map(|h| h.handshakes())
+            .unwrap_or_default()
+    }
+}
+
+pub fn handshake_lines(counts: &tls::HandshakeCounts) -> Vec<String> {
+    if counts.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "handshakes: {} completed, {} refused",
+        counts.completed, counts.refused
+    )];
+    for (reason, n) in &counts.reasons {
+        lines.push(format!("  {n} {reason}"));
+    }
+    lines
+}
+
+pub fn handshakes_json(counts: &tls::HandshakeCounts) -> Value {
+    json!({
+        "completed": counts.completed,
+        "refused": counts.refused,
+        "reasons": counts.reasons.iter().map(|(reason, n)| json!({
+            "reason": reason,
+            "count": n,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// The roots the run bound: what each `fs` label in a row actually names.
+pub struct Filesystem {
+    /// By name, ascending. Empty is reported, since an `fs` operation with no root is `E0451`.
+    pub roots: Vec<RootView>,
+}
+
+pub struct RootView {
+    pub name: String,
+    /// Canonical, since that (not the path as written) is what confines the run.
+    pub path: String,
+}
+
+impl Filesystem {
+    /// `Some` when the program can perform an operation under a root, a file's or a database's,
+    /// or the run bound one.
+    pub fn of(listing: &HostListing, roots: Option<&ply_host::fs::Roots>) -> Option<Filesystem> {
+        let reachable = listing.rows.iter().any(|row| {
+            row.path.starts_with("ply_host::fs::") || row.path.starts_with("ply_host::sqlite::")
+        });
+        let configured = roots.is_some_and(|r| !r.is_empty());
+        if !reachable && !configured {
+            return None;
+        }
+        Some(Filesystem {
+            roots: roots
+                .into_iter()
+                .flat_map(|r| r.listing())
+                .map(|(name, path)| RootView {
+                    name: name.to_string(),
+                    path: path.display().to_string(),
+                })
+                .collect(),
+        })
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "roots": self.roots.iter().map(|r| json!({
+                "name": r.name,
+                "path": r.path,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Names only, since paths differ per machine; repointing a root changes the listing, not this.
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(FILESYSTEM_DOMAIN);
+        for root in &self.roots {
+            hasher.update(root.name.as_bytes());
+            hasher.update(b"\0");
+        }
+    }
+}
+
+/// The TLS stack in the trusted computing base, and the credentials the run was configured with.
+pub struct Transport {
+    pub library: &'static str,
+    pub version: &'static str,
+    pub provider: &'static str,
+    pub versions: &'static [&'static str],
+    pub alpn: &'static [&'static str],
+    pub roots: &'static str,
+    pub roots_version: &'static str,
+    /// `--trust` certificates joining the roots.
+    pub trusted: usize,
+    /// By name, ascending.
+    pub credentials: Vec<CredentialView>,
+}
+
+pub struct CredentialView {
+    pub name: String,
+    pub fingerprint: String,
+    pub certificates: usize,
+}
+
+impl Transport {
+    /// `Some` when the program can create a TLS listener or the run was given credentials.
+    pub fn of(listing: &HostListing, credentials: Option<&tls::Credentials>) -> Option<Transport> {
+        let reachable = listing.rows.iter().any(|row| {
+            [
+                tls::HANDLER,
+                tls::CONNECT_HANDLER,
+                tls::START_HANDLER,
+                tls::SERVE_HANDLER,
+            ]
+            .contains(&row.path)
+        });
+        let configured = credentials.is_some_and(|c| !c.is_empty() || c.trusted() > 0);
+        if !reachable && !configured {
+            return None;
+        }
+        Some(Transport {
+            library: tls::LIBRARY,
+            version: tls::VERSION,
+            provider: tls::PROVIDER,
+            versions: &tls::VERSIONS,
+            alpn: &tls::ALPN,
+            roots: tls::ROOTS,
+            roots_version: tls::ROOTS_VERSION,
+            trusted: credentials.map_or(0, |c| c.trusted()),
+            credentials: credentials
+                .into_iter()
+                .flat_map(|c| c.iter())
+                .map(|(name, credential)| CredentialView {
+                    name: name.to_string(),
+                    fingerprint: credential.fingerprint().to_string(),
+                    certificates: credential.certificates(),
+                })
+                .collect(),
+        })
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "library": self.library,
+            "version": self.version,
+            "provider": self.provider,
+            "versions": self.versions,
+            "alpn": self.alpn,
+            "roots": { "library": self.roots, "version": self.roots_version, "trusted": self.trusted },
+            "credentials": self.credentials.iter().map(|c| json!({
+                "name": c.name,
+                "fingerprint": c.fingerprint,
+                "certificates": c.certificates,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// What the digest covers: the credential *names*, the provider and the library version.
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        for text in [
+            self.library,
+            self.version,
+            self.provider,
+            self.roots,
+            self.roots_version,
+        ] {
+            hasher.update(&(text.len() as u64).to_le_bytes());
+            hasher.update(text.as_bytes());
+        }
+        hasher.update(&(self.trusted as u64).to_le_bytes());
+        hasher.update(&(self.credentials.len() as u64).to_le_bytes());
+        for credential in &self.credentials {
+            hasher.update(&(credential.name.len() as u64).to_le_bytes());
+            hasher.update(credential.name.as_bytes());
+        }
+    }
+}
+
+/// Where a run's records go and on which channels.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Observability {
+    sink: &'static str,
+    destination: &'static str,
+    /// `None` for `ply_host::trace::discard`.
+    level: Option<&'static str>,
+    channels: Vec<String>,
+}
+
+impl Observability {
+    /// `None` for a program that never mentions `std.trace`.
+    fn of(
+        listing: &HostListing,
+        trace: &Arc<ply_host::trace::Trace>,
+        level: &'static str,
+    ) -> Option<Observability> {
+        let mut channels: Vec<String> = listing
+            .rows
+            .iter()
+            .filter(|row| row.effect.as_str() == ply_host::trace::EFFECT)
+            .filter_map(|row| match &row.resource {
+                ply_core::Resource::Named(name) => Some(name.as_str().to_string()),
+                // A host row names a resource or none: nothing holds a label a caller fills,
+                // and a binding that answers every label has no one name to list.
+                ply_core::Resource::Var(_)
+                | ply_core::Resource::Singleton
+                | ply_core::Resource::Every => None,
+            })
+            .collect();
+        channels.sort();
+        channels.dedup();
+        if channels.is_empty() {
+            return None;
+        }
+        let sink = trace.sink_path();
+        Some(Observability {
+            sink,
+            destination: trace.sink_destination(),
+            level: (sink != ply_host::trace::DISCARD_PATH).then_some(level),
+            channels,
+        })
+    }
+
+    /// The same three facts on one line, for the start-up banner.
+    pub fn banner(&self) -> String {
+        format!(
+            "{} → {}{} · channels {}",
+            self.sink,
+            self.destination,
+            self.level_suffix(),
+            self.channels.join(" "),
+        )
+    }
+
+    fn level_suffix(&self) -> String {
+        match self.level {
+            Some(level) => format!(" · level {level}"),
+            None => String::new(),
+        }
+    }
+
+    /// The sink's path, its level and the channel list.
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        for text in [self.sink, self.destination, self.level.unwrap_or("")] {
+            hasher.update(&(text.len() as u64).to_le_bytes());
+            hasher.update(text.as_bytes());
+        }
+        hasher.update(&(self.channels.len() as u64).to_le_bytes());
+        for channel in &self.channels {
+            hasher.update(&(channel.len() as u64).to_le_bytes());
+            hasher.update(channel.as_bytes());
+        }
+    }
+}
+
+/// What a `SIGINT` or a `SIGTERM` does to this run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shutdown {
+    /// `SIGTERM` does not exist on Windows, so the signals listened for are printed.
+    signals: [Option<&'static str>; 2],
+    lead_ms: u128,
+    drain_ms: u128,
+}
+
+impl Shutdown {
+    /// `None` for a program that never mentions `std.signal`.
+    fn of(listing: &HostListing, shutdown: &Arc<ply_host::signal::Shutdown>) -> Option<Shutdown> {
+        if !listing
+            .rows
+            .iter()
+            .any(|row| row.effect.as_str() == ply_host::signal::EFFECT)
+        {
+            return None;
+        }
+        let mut signals = [None, None];
+        for (slot, signal) in signals.iter_mut().zip(shutdown.signals()) {
+            *slot = Some(signal.name());
+        }
+        let bounds = shutdown.bounds();
+        Some(Shutdown {
+            signals,
+            lead_ms: bounds.lead.as_millis(),
+            drain_ms: bounds.drain.as_millis(),
+        })
+    }
+
+    fn names(&self) -> Vec<&'static str> {
+        self.signals.iter().flatten().copied().collect()
+    }
+
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        for name in self.names() {
+            hasher.update(&(name.len() as u64).to_le_bytes());
+            hasher.update(name.as_bytes());
+        }
+        hasher.update(&(self.lead_ms as u64).to_le_bytes());
+        hasher.update(&(self.drain_ms as u64).to_le_bytes());
+    }
+}
+
+/// The blocks `ply hosts` prints under the table: facts no row can carry.
+#[derive(Default)]
+pub struct Disclosures {
+    pub transport: Option<Transport>,
+    /// `None` when no root is bound and the program performs no `fs` operation.
+    pub filesystem: Option<Filesystem>,
+    /// The run's configuration, when it opened any source.
+    pub configuration: Option<Configuration>,
+    pub observability: Option<Observability>,
+    pub shutdown: Option<Shutdown>,
+}
+
+impl Disclosures {
+    /// For `ply hosts`, which resolves the listing without binding a [`Hosts`].
+    #[allow(clippy::too_many_arguments)]
+    fn of(
+        listing: &HostListing,
+        credentials: Option<&tls::Credentials>,
+        roots: Option<&ply_host::fs::Roots>,
+        configuration: Option<Configuration>,
+        trace: Option<&Arc<ply_host::trace::Trace>>,
+        level: &'static str,
+        shutdown: Option<&Arc<ply_host::signal::Shutdown>>,
+    ) -> Disclosures {
+        Disclosures {
+            transport: Transport::of(listing, credentials),
+            filesystem: Filesystem::of(listing, roots),
+            configuration: configuration.filter(Configuration::is_opened),
+            observability: trace.and_then(|trace| Observability::of(listing, trace, level)),
+            shutdown: shutdown.and_then(|shutdown| Shutdown::of(listing, shutdown)),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.transport.is_none()
+            && self.filesystem.is_none()
+            && self.observability.is_none()
+            && self.shutdown.is_none()
+            && !self
+                .configuration
+                .as_ref()
+                .is_some_and(Configuration::is_pinned)
+    }
+}
+
+/// The one line a CI check pins against the trusted computing base.
+pub fn digest_short(listing: &HostListing, disclosures: &Disclosures) -> String {
+    if disclosures.is_empty() {
+        return listing.digest_short();
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DISCLOSURE_DOMAIN);
+    hasher.update(&listing.digest());
+    if let Some(transport) = &disclosures.transport {
+        transport.hash_into(&mut hasher);
+    }
+    if let Some(filesystem) = &disclosures.filesystem {
+        filesystem.hash_into(&mut hasher);
+    }
+    // Names and shapes only, never resolved values: a deployment's own settings must not move it.
+    if let Some(configuration) = disclosures.configuration.as_ref().filter(|c| c.is_pinned()) {
+        hasher.update(CONFIGURATION_DOMAIN);
+        configuration.digest_into(&mut |text| {
+            hasher.update(&(text.len() as u64).to_le_bytes());
+            hasher.update(text.as_bytes());
+        });
+    }
+    if let Some(observability) = &disclosures.observability {
+        hasher.update(OBSERVABILITY_DOMAIN);
+        observability.hash_into(&mut hasher);
+    }
+    if let Some(shutdown) = &disclosures.shutdown {
+        hasher.update(SHUTDOWN_DOMAIN);
+        shutdown.hash_into(&mut hasher);
+    }
+    ply_core::digest::short(hasher.finalize().as_bytes())
+}
+
+/// Domain-separated so a listing with an empty disclosure cannot collide with one that has none.
+const DISCLOSURE_DOMAIN: &[u8] = b"ply.hosts.transport.v1\0";
+
+// One domain per block, so listings with different blocks cannot collide.
+const FILESYSTEM_DOMAIN: &[u8] = b"ply.hosts.filesystem.v1\0";
+const CONFIGURATION_DOMAIN: &[u8] = b"ply.hosts.configuration.v1\0";
+const OBSERVABILITY_DOMAIN: &[u8] = b"ply.hosts.observability.v1\0";
+const SHUTDOWN_DOMAIN: &[u8] = b"ply.hosts.shutdown.v1\0";
+
+// --- What `ply hosts` is lent ------------------------------------------------
+
+/// The effect `packages/cli/hosts.ply` declares. It is lent to that one entry and nowhere
+/// else: what a run would bind is assembled here, and the program is handed what it says.
+const EFFECT: &str = "hosts";
+
+/// A preview that would read a credential or a root off the disk is refused.
+const HERMETIC: &str = "hermetic_hosts";
+
+const OPERATIONS: [(&str, &str); 3] = [
+    ("preview", "ply_privileged::hosts::preview"),
+    ("registrations", "ply_privileged::hosts::registrations"),
+    ("shapes", "ply_privileged::hosts::shapes"),
+];
+
+const HERMETIC_OPERATIONS: [(&str, &str); 3] = [
+    ("preview", "ply_privileged::hosts::hermetic::preview"),
+    (
+        "registrations",
+        "ply_privileged::hosts::hermetic::registrations",
+    ),
+    ("shapes", "ply_privileged::hosts::hermetic::shapes"),
+];
+
+/// `module` is where the program lent it declares `hosts`, which is where `Stage` is declared too.
+pub fn lent(module: &str) -> Vec<LentOp> {
+    let mut ops = lent_by(module, false);
+    ops.extend(lent_by(module, true));
+    ops
+}
+
+fn lent_by(module: &str, hermetic: bool) -> Vec<LentOp> {
+    let facility: Arc<dyn HostHandler> = Arc::new(Facility {
+        module: module.to_string(),
+        hermetic,
+    });
+    let operations = if hermetic {
+        HERMETIC_OPERATIONS
+    } else {
+        OPERATIONS
+    };
+    operations
+        .into_iter()
+        .map(|(op, path)| {
+            let op = if hermetic {
+                hermetic_op(HERMETIC, op, Linearity::Repeatable, path)
+            } else {
+                privileged_op(EFFECT, op, Linearity::Repeatable, path)
+            };
+            (op, Arc::clone(&facility))
+        })
+        .collect()
+}
+
+struct Facility {
+    module: String,
+    hermetic: bool,
+}
+
+impl HostHandler for Facility {
+    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+        let span = req.span;
+        let value = match (req.op.op.as_str(), req.args) {
+            ("preview", [path, options, front, config]) => {
+                let path = std::path::PathBuf::from(path.as_str(span, "the project's path")?);
+                let mut options = crate::drive::run_options_of(options, span)?;
+                options.hermetic = self.hermetic;
+                let front = crate::driver::loaded_analysis_of(front, span)?;
+                let configuration = Configuration::of(config, span)?;
+                Assembled::of(&path, &options, &front, configuration).preview(&self.module)
+            }
+            ("registrations", []) => registrations(),
+            ("shapes", []) => shapes(),
+            (other, _) => return Err(unserved(EFFECT, other, span)),
+        };
+        Ok(HostAnswer::Value(value))
+    }
+}
+
+/// The binding this invocation's flags define.
+struct Assembled {
+    /// The `Stage` constructor the program matches on, by simple name.
+    stage: &'static str,
+    root: String,
+    listing: HostListing,
+    disclosures: Disclosures,
+    digest: String,
+    hermetic: bool,
+    /// The refusal that stopped it, if one did.
+    diagnostics: Vec<Diagnostic>,
+    sources: SourceMap,
+}
+
+impl Assembled {
+    fn of(
+        path: &std::path::Path,
+        options: &crate::drive::RunOptions,
+        front: &crate::driver::LoadedAnalysis,
+        configuration: Configuration,
+    ) -> Assembled {
+        let loaded = match loaded_over(path, front, options.hermetic) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                return Assembled::refused(
+                    "NotLoaded",
+                    String::new(),
+                    err.diagnostics,
+                    err.sources,
+                );
+            }
+        };
+        let root = loaded.root.display().to_string();
+        match bind(options, &loaded, configuration) {
+            Ok(bound) => Assembled {
+                stage: "Bound",
+                root,
+                digest: digest_short(&bound.listing, &bound.disclosures),
+                hermetic: bound.hermetic,
+                listing: bound.listing,
+                disclosures: bound.disclosures,
+                diagnostics: Vec::new(),
+                sources: loaded.sources,
+            },
+            Err((stage, diagnostics)) => {
+                Assembled::refused(stage, root, diagnostics, loaded.sources)
+            }
+        }
+    }
+
+    fn refused(
+        stage: &'static str,
+        root: String,
+        diagnostics: Vec<Diagnostic>,
+        sources: SourceMap,
+    ) -> Assembled {
+        Assembled {
+            stage,
+            root,
+            listing: HostListing::default(),
+            disclosures: Disclosures::default(),
+            digest: String::new(),
+            hermetic: true,
+            diagnostics,
+            sources,
+        }
+    }
+
+    fn preview(&self, module: &str) -> PlyValue {
+        let d = &self.disclosures;
+        record(vec![
+            (
+                "stage",
+                PlyValue::ctor(Symbol::new(format!("{module}.{}", self.stage)), Vec::new()),
+            ),
+            ("root", PlyValue::str(&self.root)),
+            ("handlers", count(self.listing.handlers)),
+            (
+                "rows",
+                PlyValue::list(self.listing.rows.iter().map(row_value).collect()),
+            ),
+            ("digest", PlyValue::str(&self.digest)),
+            ("hermetic", PlyValue::Bool(self.hermetic)),
+            (
+                "transport",
+                option(d.transport.as_ref().map(transport_value)),
+            ),
+            (
+                "filesystem",
+                option(d.filesystem.as_ref().map(filesystem_value)),
+            ),
+            (
+                "observability",
+                option(d.observability.as_ref().map(observability_value)),
+            ),
+            ("shutdown", option(d.shutdown.as_ref().map(shutdown_value))),
+            ("diags", diags_value(&self.diagnostics)),
+            ("places", places_value(&self.sources)),
+        ])
+    }
+}
+
+/// What the host flags open, over a program that loaded.
+struct Bound {
+    listing: HostListing,
+    disclosures: Disclosures,
+    hermetic: bool,
+}
+
+/// The stage that refused, and why.
+type Refusal = (&'static str, Vec<Diagnostic>);
+
+/// The root is decided lexically when nothing may be read off the disk.
+fn loaded_over(
+    path: &std::path::Path,
+    front: &crate::driver::LoadedAnalysis,
+    hermetic: bool,
+) -> Result<crate::load::Loaded, crate::load::LoadError> {
+    if hermetic {
+        crate::driver::load_over_analysis_in(crate::load::tidy(path), front)
+    } else {
+        crate::driver::load_over_analysis(path, front)
+    }
+}
+
+fn bind(
+    args: &crate::drive::RunOptions,
+    loaded: &crate::load::Loaded,
+    configuration: Configuration,
+) -> Result<Bound, Refusal> {
+    if args.hermetic
+        && !(args.tls.tls.is_empty() && args.tls.trust.is_empty() && args.fs.is_empty())
+    {
+        return Err(("NotBound", vec![hermetic_disk()]));
+    }
+    // Whether or not `--host` was passed: a digest that moved with a flag would pin nothing.
+    let trace = args.trace.open();
+    let stopping = ply_host::signal::Shutdown::new(args.shutdown.bounds());
+    let registry = registry_for(Some(Arc::clone(&trace)));
+    let listing = registry
+        .preview(&loaded.check)
+        .map_err(|diagnostics| ("NotResolved", diagnostics))?;
+    let binding = if args.host {
+        registry
+            .bind(&loaded.check)
+            .map_err(|diagnostics| ("NotResolved", diagnostics))?
+    } else {
+        HostBinding::hermetic_with(registry)
+    };
+    // Loaded even without `--host`: this command answers what a run trusts, and whether it starts.
+    let credentials = tls::Credentials::load(&args.tls.tls, &args.tls.trust, &args.tls.mtls)
+        .map_err(|diagnostics| ("NotBound", diagnostics))?;
+    // Likewise, so an unresolvable root is `E0454` before the listing overstates what is reached.
+    let roots = ply_host::fs::Roots::load(&args.fs, Span::DUMMY)
+        .map_err(|diagnostic| ("NotBound", vec![diagnostic]))?;
+    Ok(Bound {
+        disclosures: Disclosures::of(
+            &listing,
+            Some(&credentials),
+            Some(&roots),
+            Some(configuration),
+            Some(&trace),
+            args.trace.level_name(),
+            Some(&stopping),
+        ),
+        listing,
+        hermetic: binding.is_hermetic(),
+    })
+}
+
+#[cold]
+fn hermetic_disk() -> Diagnostic {
+    Diagnostic::error(
+        ply_core::codes::CAPABILITY_UNDECLARED,
+        format!(
+            "`{HERMETIC}` reads nothing off the disk, and the run names a credential or a root"
+        ),
+    )
+    .note("a preview of `--tls`, `--trust` or `--fs` reads files, and performs `hosts`")
+}
+
+// --- The payload -------------------------------------------------------------
+
+/// Every operation the host registers a handler for, as `hosts.Registration` reads it.
+fn registrations() -> PlyValue {
+    PlyValue::list(
+        ply_host::registry::registry()
+            .ops()
+            .map(|op| {
+                record(vec![
+                    ("effect", PlyValue::str(op.effect.as_str())),
+                    ("op", PlyValue::str(op.op.as_str())),
+                    (
+                        "deterministic",
+                        PlyValue::Bool(op.determinism == ply_core::Determinism::Deterministic),
+                    ),
+                    (
+                        "repeatable",
+                        PlyValue::Bool(op.linearity == ply_core::Linearity::Repeatable),
+                    ),
+                    ("handler", PlyValue::str(op.path)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn shapes() -> PlyValue {
+    PlyValue::list(
+        ply_host::shapes::shapes()
+            .iter()
+            .map(|(shape, value)| {
+                record(vec![
+                    ("shape", PlyValue::str(*shape)),
+                    (
+                        "value",
+                        ply_core::reflect::value_of(&ply_core::Plain::of(value)),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn row_value(row: &HostRow) -> PlyValue {
+    record(vec![
+        ("effect", PlyValue::str(row.effect.as_str())),
+        ("op", PlyValue::str(row.op.as_str())),
+        (
+            "resource",
+            option(match &row.resource {
+                ply_core::Resource::Named(name) => Some(PlyValue::str(name.as_str())),
+                ply_core::Resource::Var(_)
+                | ply_core::Resource::Singleton
+                | ply_core::Resource::Every => None,
+            }),
+        ),
+        ("triple", PlyValue::str(row.to_string())),
+        ("handler", PlyValue::str(row.path)),
+        ("deterministic", PlyValue::Bool(row.deterministic)),
+        ("linear", PlyValue::Bool(row.linearity.is_linear())),
+        ("blocking", PlyValue::Bool(row.blocking)),
+        ("secrets", PlyValue::Bool(row.secrets)),
+        ("declared_nondet", PlyValue::Bool(row.declared_nondet)),
+    ])
+}
+
+fn transport_value(transport: &Transport) -> PlyValue {
+    record(vec![
+        ("library", PlyValue::str(transport.library)),
+        ("version", PlyValue::str(transport.version)),
+        ("provider", PlyValue::str(transport.provider)),
+        ("versions", strings(transport.versions.iter().copied())),
+        ("alpn", strings(transport.alpn.iter().copied())),
+        ("roots", PlyValue::str(transport.roots)),
+        ("roots_version", PlyValue::str(transport.roots_version)),
+        ("trusted", count(transport.trusted)),
+        (
+            "credentials",
+            PlyValue::list(
+                transport
+                    .credentials
+                    .iter()
+                    .map(|c| {
+                        record(vec![
+                            ("name", PlyValue::str(&c.name)),
+                            ("fingerprint", PlyValue::str(&c.fingerprint)),
+                            ("certificates", count(c.certificates)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn filesystem_value(filesystem: &Filesystem) -> PlyValue {
+    record(vec![(
+        "roots",
+        PlyValue::list(
+            filesystem
+                .roots
+                .iter()
+                .map(|r| {
+                    record(vec![
+                        ("name", PlyValue::str(&r.name)),
+                        ("path", PlyValue::str(&r.path)),
+                    ])
+                })
+                .collect(),
+        ),
+    )])
+}
+
+fn observability_value(observability: &Observability) -> PlyValue {
+    record(vec![
+        ("sink", PlyValue::str(observability.sink)),
+        ("destination", PlyValue::str(observability.destination)),
+        ("level", option(observability.level.map(PlyValue::str))),
+        (
+            "channels",
+            strings(observability.channels.iter().map(String::as_str)),
+        ),
+    ])
+}
+
+fn shutdown_value(shutdown: &Shutdown) -> PlyValue {
+    record(vec![
+        ("signals", strings(shutdown.names())),
+        ("lead_ms", PlyValue::Int(shutdown.lead_ms as i64)),
+        ("drain_ms", PlyValue::Int(shutdown.drain_ms as i64)),
+    ])
+}

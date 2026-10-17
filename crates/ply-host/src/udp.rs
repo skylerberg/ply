@@ -4,8 +4,8 @@
 use crate::pool::JobOutput;
 use crate::tcp::wire::{self, Endpoint, Refusal, SocketOption};
 use crate::tcp::{Net, TcpHost};
-use ply_eval::host::HostRegistry;
-use ply_eval::{
+use ply_core::host::HostRegistry;
+use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
     HostRuntime, Linearity, Span, Symbol, Value, codes,
 };

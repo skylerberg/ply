@@ -1,7 +1,7 @@
 # tree-sitter-ply
 
 A tree-sitter grammar for Ply. It is a second reading of the language beside
-`crates/ply-compiler/ply`, written so editors highlight Ply and so a rule the
+`packages/compiler`, written so editors highlight Ply and so a rule the
 language gains or drops fails a check here.
 
 | path | holds |

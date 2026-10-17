@@ -1,4 +1,4 @@
-// Tree-sitter grammar for Ply. The language is defined by `crates/ply-compiler/ply`; this grammar
+// Tree-sitter grammar for Ply. The language is defined by `packages/compiler`; this grammar
 // follows the lexer and the parser there, and parses every `.ply` file in the tree without error.
 //
 // Reserved words (from `lexer.ply`'s `is_keyword`): pub import fn type effect nondet test let if

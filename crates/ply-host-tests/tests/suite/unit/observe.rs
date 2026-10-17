@@ -1,4 +1,4 @@
-use ply_eval::host::MachineId;
+use ply_core::host::MachineId;
 use ply_host::observe::{self, Binary, Read, World};
 use std::path::{Path, PathBuf};
 

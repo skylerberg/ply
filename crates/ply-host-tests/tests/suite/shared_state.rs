@@ -1,10 +1,10 @@
-// A `Value::Record` holds an `Arc` and a `Value` is not `Send`, by `ply-eval`'s design.
+// A `Value::Record` holds an `Arc` and a `Value` is not `Send`, by `ply-core`'s design.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_eval::host::{
+use ply_core::host::{
     HostAnswer, HostOp, HostRegistry, HostRequest, HostRuntime, MachineId, Pending,
 };
-use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskId, Value, codes};
+use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskId, Value, codes};
 use ply_host::config::{Entry, Snapshot};
 use ply_host::pool::Pooled;
 use ply_host::signal::{Accepting, Bounds, Shutdown, ShutdownSignal};

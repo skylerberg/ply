@@ -9,8 +9,8 @@ pub use children::{Ended, Finished, Heard};
 use crate::pool::{JobOutput, Pool, Pooled, option};
 use crate::stdio;
 use children::{Child, Launch, Refusal, Unusable};
-use ply_eval::host::{HostRegistry, MachineId};
-use ply_eval::{
+use ply_core::host::{HostRegistry, MachineId};
+use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
     HostRuntime, Linearity, Plain, Resource, Span, Symbol, Value, codes, slot,
 };
@@ -891,7 +891,7 @@ fn run_to_end(
 pub fn unbound(op: Op, at: &Resource, span: Span) -> Diagnostic {
     let label = match at {
         Resource::Named(name) => name.as_str().to_string(),
-        Resource::Var(v) => ply_eval::label_var_name(*v),
+        Resource::Var(v) => ply_core::label_var_name(*v),
         Resource::Singleton => "the singleton resource".to_string(),
         Resource::Every => "every label".to_string(),
     };

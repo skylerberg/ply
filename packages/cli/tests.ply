@@ -1,0 +1,1029 @@
+//! `ply test` — which tests this run executes, what each of them did, what the run proves, and what
+//! it exits with. The runtime holds what a program cannot — compiled units, the host binding, a
+//! test's run and the result cache's format — behind `tester`. Which tests run, the classes they
+//! share, the keys each result is read and filed under, what the run concludes, why a failure
+//! happened, the mutants and mixtures tried, and everything said about all of it are decided here,
+//! in both forms, along with the code the run exits with.
+
+import args (from_argv)
+import compiler.front.diagnostics (parse_all)
+import compiler.front.published (no_rows, analyse)
+import compiler.front.seam (Analysed, Refused, view_dump, view_of)
+import compiler.front.facts (View)
+import compiler.front (analyse_pulling_std_with)
+import compiler.front.rows (KeyRow, EmitterRoot)
+import compiler.store.hash.forms (TheItem, reach)
+import compiler.check.infer.checker (TestInfo, cases_root, test_owner)
+import compiler.check.resolve.tables (error_with_labels)
+import diagnostic (Place, diag_of)
+import report (indent)
+import std.json (Null, Bool, to_string)
+import std.term (plain)
+import tester (tester)
+import testing.keys (case_hash)
+import testing.bisect (Auto, NoBodies, Skipped, Trial, a_failure, a_pass)
+import testing.delta (DefKey, Edited, Value)
+import testing.diagnose (Suspect)
+import testing.select
+import testing.select (Moved, Row, Search, Stands, decide, to_run)
+import std.bytes
+import sim.plan
+import std.string
+import surface (parsed)
+import std.option
+import tests.report (Printed, options_from, Phases, Entry, Case, Decided, shared_of, classes_of,
+                     every_of, counts_of, decided_of, Program, Outcome, Bisect, Failed, Fault,
+                     RunReport, no_spent, display_of, isolated_as, Opening, binding_lines,
+                     handshake_lines, simulation_line, opening_lines, phase_lines, run_total,
+                     run_phase_lines, explain_lines, name_column, result_line, summary_line,
+                     bisect_lines, secondary_lines, at_lines, seed_lines, described, case_json,
+                     placed_cases, fault_json, answered, test_at)
+import tests.concluded (entry_of, job_of, ran_job, fault_of, replay_of)
+import tests.cases (scope_of, over_cases, listing_within, run_within, ranged)
+import tests.run (rows_of, declared_effects, case_view)
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_place() -> List<Place> =
+  [{ path: "m.ply", text: b"test \"two is two\" { assert_eq(1 + 1, 2) }\n" }]
+
+fn no_phases() -> Phases = { read_us: 0, front_us: 0, write_back_us: 0 }
+
+fn a_hash() -> String = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+
+fn a_key(index: Int, label: String, answered: Bool, seeded: Bool, unstable: Bool) -> select::Case =
+  {
+    index: index,
+    label: label,
+    name: "m." ++ label,
+    module: "m",
+    hash: Some(a_hash()),
+    cache_key: Some(a_hash()),
+    seeded: seeded,
+    nondet: unstable,
+    cached: if answered { Some(Stands) } else { None },
+    owed: None,
+  }
+
+fn a_search() -> Search = { mode: "dpor", roots: [0], budget: 256, steps: 100000, path: [] }
+
+fn a_case(index: Int, name: String) -> Case =
+  {
+    index: index,
+    entry: entry_of(index, "m." ++ name),
+    key: "m." ++ name,
+    name: name,
+    module: "m",
+    nondet: false,
+    hash: Some(a_hash()),
+    footprint: "{}",
+    atoms: [],
+    seeded: false,
+  }
+
+/// The decision a fixture's keys imply: the reasons come from `decide`, so a fixture that wants a
+/// cached test says its key was answered rather than naming the reason. The classes are the ones the
+/// decision's own runs make, with a placeholder rendering — a fixture reads the shape, not the atoms.
+fn a_decided(program: Program, keys: List<select::Case>) -> Decided / {abort.raise} = {
+  let decisions = decide(keys);
+  let classes = classes_of(program, to_run(decisions));
+  decided_of(
+    program,
+    decisions,
+    a_search(),
+    Null,
+    classes.map(|class: List<Int>| { tests: class, footprint: "{}" }),
+    classes,
+  )
+}
+
+fn an_opening() -> Opening = { hermetic: true, operations: 0, digest: "", reaches: [], workers: 4 }
+
+fn a_program(cases: List<Case>) -> Program =
+  {
+    root: "/p",
+    files: ["m.ply"],
+    places: a_place(),
+    modules: [{ name: "m", file: "m.ply" }],
+    incremental: true,
+    phases: no_phases(),
+    reuse: [],
+    declared: cases.len(),
+    cases: cases,
+    positions: placed_cases(cases),
+    filtered_out: 0,
+    warnings: [],
+    options: Null,
+    filed_under: Some("aabbccddeeff00112233"),
+    unit: 0,
+  }
+
+fn an_outcome(index: Int, name: String, status: String) -> Outcome =
+  {
+    index: index,
+    name: name,
+    hash: None,
+    duration_us: 1500,
+    status: status,
+    diagnostic: None,
+    search: None,
+    cached: Some(true),
+    performs: 0,
+  }
+
+fn a_run(results: List<Outcome>, failed: Int) -> RunReport =
+  {
+    hermetic: true,
+    label: "hermetic",
+    operations: 0,
+    digest: "",
+    handshakes: [],
+    hosts: Null,
+    reaches: [],
+    workers: 4,
+    backend: None,
+    results: results,
+    failures: [],
+    summary: {
+      passed: results.filter(|outcome: Outcome| outcome.status == "passed").len(),
+      failed: failed,
+      abandoned: results.filter(|outcome: Outcome| outcome.status == "abandoned").len(),
+      cached: 0,
+      duration_us: 20000,
+    },
+    simulation: {
+      simulated: 0,
+      total: results.len(),
+      seeds: 0,
+      interleavings: 0,
+      exhaustive: 0,
+      exhausted: 0,
+      failed: 0,
+    },
+    escapes: [],
+    warnings: [],
+    mutants: None,
+    coverage: None,
+    spent: no_spent(),
+  }
+
+fn no_bisect() -> Bisect =
+  {
+    conclusive: false,
+    requested: false,
+    reason: "",
+    culprits: [],
+    verdict: "not_attempted",
+    skipped: Some("not_requested"),
+    confidence: "none",
+    groups: [],
+    search: {
+      candidates: 0,
+      clusters: 0,
+      evaluated: 0,
+      cached: 0,
+      memoized: 0,
+      unresolved: 0,
+      exhausted: false,
+    },
+  }
+
+fn a_fault() -> Fault =
+  {
+    key: "m.two is two",
+    name: "two is two",
+    diagnostic: error_with_labels(b"E0502", b"assertion failed", [], []),
+    defect: false,
+    bisect: no_bisect(),
+    suspects: [],
+    unchanged: false,
+    seed: None,
+    race: None,
+    replay: None,
+    module: Some("m"),
+    test_hash: None,
+    nondet: Some(false),
+    status: Some("failed"),
+    declared: None,
+  }
+
+fn a_suspect(name: String) -> Suspect =
+  { name: name, hash: None, before: None, change: None, culprit: false }
+
+/// A failure the runtime reports with two edits since its test last passed.
+fn a_failed(defect: Bool, host: Bool, absent: Option<Skipped>) -> Failed =
+  {
+    key: "m.two is two",
+    name: "two is two",
+    diagnostic: { diag: error_with_labels(b"E0501", b"assertion failed", [], []), values: [] },
+    defect: defect,
+    host: host,
+    search: Some({
+      facts: {
+        own: { name: "m.two is two", before: "01", after: Some("02"), rehashed: Some("01") },
+        rows: [
+          {
+            name: "m.a",
+            ns: Value,
+            before: Some("a1"),
+            after: Some("a2"),
+            rehashed: Some("a2"),
+            stable: None,
+            kept: false,
+            renamed: false,
+            component: [],
+            referrers: [],
+          },
+          {
+            name: "m.b",
+            ns: Value,
+            before: Some("b1"),
+            after: Some("b2"),
+            rehashed: Some("b2"),
+            stable: None,
+            kept: false,
+            renamed: false,
+            component: [],
+            referrers: [],
+          },
+        ],
+      },
+      absent: absent,
+      at: [],
+    }),
+    suspects: [{ name: "m.a", hash: Some("a2") }, { name: "m.b", hash: Some("b2") }],
+    unchanged: false,
+    seed: None,
+    race: None,
+    module: Some("m"),
+    test_hash: None,
+    nondet: Some(false),
+    status: Some("failed"),
+    declared: None,
+  }
+
+/// The verdict on one failure, from mixtures that fail exactly when they take `m.b`.
+fn caused(failed: Failed) -> Bisect / {abort.raise} =
+  fault_of(
+    failed,
+    { bisect: Auto, budget: { max_trials: Some(64) } },
+    |keys: List<DefKey>, filed: Option<String>| taking_b_fails(keys),
+  ).bisect
+
+fn taking_b_fails(keys: List<DefKey>) -> Trial =
+  if keys.filter(|k: DefKey| k.name == "m.b").len() > 0 { a_failure() } else { a_pass() }
+
+test "a green run is exit 0, and the head says what was selected of what before a test runs" {
+  let p = a_program([a_case(0, "one"), a_case(1, "two")]);
+  let keys = [a_key(0, "one", false, false, false), a_key(1, "two", true, false, false)];
+  let opening = opening_lines(plain(), from_argv("test", []), p, a_decided(p, keys), an_opening());
+  assert_eq(opening, [
+    "   selected 1 of 2 (1 cached)",
+    "   1 group · 4 workers",
+    "   isolated 2 of 2",
+    "",
+  ]);
+  let answer = answered(
+    plain(),
+    from_argv("test", []),
+    p,
+    a_run([an_outcome(0, "one", "passed")], 0),
+    [],
+    a_decided(p, keys),
+  );
+  assert_eq(answer.code, 0);
+  // The head and the results went out as the run went; the answer is what follows them.
+  assert(!answer.lines.contains("   selected 1 of 2 (1 cached)"));
+  assert_eq(answer.lines.filter(|l: String| l.starts_with("   ok ")), []);
+  assert_eq(answer.errs, [])
+}
+
+test "a failure is exit 1 and the culprit is printed before the diff" {
+  let p = a_program([a_case(0, "two is two")]);
+  let keys = [a_key(0, "two is two", false, false, false)];
+  let culprit = {
+    ..a_fault(),
+    bisect: {
+      ..no_bisect(),
+      conclusive: true,
+      requested: true,
+      reason: "narrowed to one body",
+      culprits: [{ names: ["m.total"], at: None }],
+    },
+  };
+  let answer = answered(
+    plain(),
+    from_argv("test", []),
+    p,
+    a_run([an_outcome(0, "two is two", "failed")], 1),
+    [culprit],
+    a_decided(p, keys),
+  );
+  assert_eq(answer.code, 1);
+  assert(answer.lines.contains("   m.two is two"));
+  assert(answer.lines.contains("     culprit: m.total"));
+  assert(answer.lines.contains("       narrowed to one body"));
+  assert(answer.lines.contains("     assertion failed"))
+}
+
+test "a bisection nobody asked for says nothing, and one that failed says why" {
+  assert_eq(bisect_lines(plain(), a_place(), no_bisect()), []);
+  assert_eq(
+    bisect_lines(plain(), a_place(), {
+      ..no_bisect(),
+      requested: true,
+      reason: "no baseline to compare",
+    }),
+    ["  no culprit: no baseline to compare"],
+  )
+}
+
+test "the runtime's marks decide whether a failure is searched, and a search names the edit" {
+  assert_eq(caused(a_failed(false, false, None)).groups, [["m.b"]]);
+  // A defect in Ply and a run that reached the host are refused before any mixture is tried.
+  let defect = caused(a_failed(true, false, None));
+  assert_eq(defect.skipped, Some("panicked"));
+  assert_eq(defect.search.evaluated, 0);
+  let host = caused(a_failed(false, true, None));
+  assert_eq(host.skipped, Some("host"));
+  assert_eq(host.search.evaluated, 0);
+  // Two edits need a mixture to tell apart, so a store that cannot build one is the reason.
+  let pruned = caused(a_failed(false, false, Some(NoBodies)));
+  assert_eq(pruned.skipped, Some("no_bodies"));
+  assert_eq(pruned.search.evaluated, 0)
+}
+
+test "a test the clock stopped is abandoned rather than judged, and the run is not a success" {
+  let p = a_program([a_case(0, "slow")]);
+  let keys = [a_key(0, "slow", false, false, false)];
+  let stopped = {
+    ..an_outcome(0, "slow", "abandoned"),
+    diagnostic: Some({
+      diag: error_with_labels(b"E0504", b"the run was abandoned", [], [b"raise the clock"]),
+      values: [],
+    }),
+  };
+  let answer = answered(
+    plain(),
+    from_argv("test", []),
+    p,
+    a_run([stopped], 0),
+    [],
+    a_decided(p, keys),
+  );
+  assert_eq(answer.code, 1);
+  assert(answer.lines.contains("   slow abandoned"));
+  assert(answer.lines.contains("     the run was abandoned"));
+  assert(answer.lines.contains("     = raise the clock"))
+}
+
+// A pass a later hermetic run would believe is not a warning: the run is red over it.
+test "an escaped cache entry fails the run even with every test green" {
+  let p = a_program([a_case(0, "one")]);
+  let keys = [a_key(0, "one", false, false, false)];
+  let escaped = {
+    ..a_run([an_outcome(0, "one", "passed")], 0),
+    escapes: [error_with_labels(b"E0001", b"`m.one` can reach the host binding", [], [])],
+  };
+  assert_eq(answered(plain(), from_argv("test", []), p, escaped, [], a_decided(p, keys)).code, 1)
+}
+
+test "a mutant no test kills fails the run and is named with what it changed" {
+  let p = a_program([a_case(0, "one")]);
+  let keys = [a_key(0, "one", false, false, false)];
+  let mutated = {
+    ..a_run([an_outcome(0, "one", "passed")], 0),
+    mutants: Some({
+      killed: 2,
+      survived: 1,
+      skipped: 0,
+      budget_spent: false,
+      unreached: [],
+      survivors: [{ definition: "m.total", from: "+", to: "-", at: None }],
+      json: Null,
+    }),
+  };
+  let answer = answered(plain(), from_argv("test", []), p, mutated, [], a_decided(p, keys));
+  assert_eq(answer.code, 1);
+  assert(answer.lines.contains("   mutants 2 killed, 1 survived, 0 skipped"));
+  assert(answer.lines.contains("      m.total survives `+` -> `-` at "))
+}
+
+test "a result line pads the name to the column and the reading to one decimal" {
+  let p = a_program([a_case(0, "two is two")]);
+  let keys = [a_key(0, "two is two", false, false, false)];
+  assert_eq(
+    result_line(plain(), p, an_outcome(0, "two is two", "passed"), 24),
+    "   ok      two is two                    1.5ms",
+  )
+}
+
+// The column never narrows below 24 and never widens past 64, so long names still line up.
+test "the name column is the widest name the run will run, clamped" {
+  let column = |names: List<String>| {
+    let p = a_program(range(0, names.len()).map(|i: Int| a_case(i, names.at_or(i, ""))));
+    name_column(
+      p,
+      a_decided(
+        p,
+        range(0, names.len()).map(|i: Int| a_key(i, names.at_or(i, ""), false, false, false)),
+      ),
+    )
+  };
+  assert_eq(column([]), 24);
+  assert_eq(column(["short", "x".repeat(30)]), 30);
+  assert_eq(column(["x".repeat(90)]), 64);
+  let p = a_program([a_case(0, "x".repeat(40)), a_case(1, "two")]);
+  let cached_long = a_decided(p, [
+    a_key(0, "x".repeat(40), true, false, false),
+    a_key(1, "two", false, false, false),
+  ]);
+  assert_eq(name_column(p, cached_long), 24)
+}
+
+test "the summary counts what was decided and how long it took" {
+  let p = a_program([a_case(0, "one")]);
+  let r = a_run([an_outcome(0, "one", "passed")], 0);
+  assert_eq(
+    summary_line(plain(), r, counts_of(p, r.reaches)),
+    "   0 failed, 1 passed, 0 cached (0.02s)",
+  );
+  let hosted = { ..r, reaches: [0] };
+  assert(summary_line(plain(), hosted, counts_of(p, hosted.reaches)).contains("1 host-backed"))
+}
+
+test "`--explain` says why each test ran, once per reason, and how the groups formed" {
+  let p = a_program([a_case(0, "one"), a_case(1, "two")]);
+  let keys = [a_key(0, "one", false, false, false), a_key(1, "two", true, false, false)];
+  let lines = explain_lines(plain(), p, [], a_decided(p, keys));
+  assert(lines.at_or(1, "").contains("run  abcdef012345 new "));
+  assert(lines.at_or(1, "").contains("isolation: region"));
+  assert(lines.at_or(2, "").contains("skip abcdef012345 cached "));
+  assert(lines.contains("   why"));
+  assert(lines.contains("   concurrency groups"));
+  // One class, holding the one test that runs: a cached test shares a worker with nobody.
+  assert(lines.contains("     group 0 · 1 test · {}"));
+  assert(lines.contains("       one"))
+}
+
+// What `shipped` answers is the binary's, so a test reading it is cached across a change to it.
+test "`--explain` says what a pass is filed under and what moved under a changed one" {
+  let p = a_program([a_case(0, "one"), a_case(1, "two")]);
+  let keys = [
+    { ..a_key(0, "one", false, false, false), cached: Some(Moved("the file `a.ply` under `cwd`")) },
+    a_key(1, "two", false, false, false),
+  ];
+  let lines = explain_lines(plain(), p, [], a_decided(p, keys));
+  assert(lines.at_or(1, "").contains(" changed "));
+  assert(lines.at_or(1, "").contains(" · moved: the file `a.ply` under `cwd`"));
+  assert(!lines.at_or(2, "").contains("moved"));
+  assert(lines.contains("   key"));
+  assert(
+    lines.contains(
+      "     a pass is filed under its test's hash and the runtime stamp aabbccddeeff, and under the code the test ran, with what its run read",
+    ),
+  );
+  let uncached = explain_lines(plain(), { ..p, filed_under: None }, [], a_decided(p, keys));
+  assert(uncached.contains("     no pass is filed: `--no-cache` reads and writes none"));
+  let text = to_string(
+    answered(plain(), from_argv("test", ["--json"]), p, a_run([], 0), [], a_decided(p, keys)).json,
+  );
+  assert(text.contains("\"filed_under\":\"aabbccddeeff00112233\""));
+  assert(text.contains("\"moved\":\"the file `a.ply` under `cwd`\""))
+}
+
+test "the document keys off `command` and `exit_code` and names the schema it publishes" {
+  let p = a_program([a_case(0, "one")]);
+  let keys = [a_key(0, "one", false, false, false)];
+  let text = to_string(
+    answered(
+      plain(),
+      from_argv("test", ["--json"]),
+      p,
+      a_run([an_outcome(0, "one", "passed")], 0),
+      [],
+      a_decided(p, keys),
+    ).json,
+  );
+  assert(text.contains("\"command\":\"test\""));
+  assert(text.contains("\"exit_code\":0"));
+  assert(text.contains("\"schema_version\":6"));
+  assert(text.contains("\"binding\":\"hermetic\""));
+  assert(text.contains("\"root\":\"/p\""));
+  assert(text.contains("\"duration_ms\":1.5"));
+  assert(text.contains("\"reason\":\"new\""))
+}
+
+// The seed a test reads is handed to it alone, so it is no atom another test contends over.
+test "a test's contended atoms are in the document unprinted, beside whether it is seeded" {
+  let c = {
+    ..a_case(0, "one"),
+    atoms: [
+      {
+        atom: { effect: "db", resource: "users", writes: true, nondet: true },
+        text: "db.write[users]",
+      },
+      { atom: { effect: "sim", resource: "", writes: false, nondet: false }, text: "sim.read" },
+    ],
+    seeded: true,
+  };
+  let text = to_string(
+    case_json(a_run([], 0), c, a_decided(a_program([c]), [a_key(0, "one", false, false, false)])),
+  );
+  assert(
+    text.contains("\"contends\":[{\"effect\":\"db\",\"resource\":\"users\",\"writes\":true}]"),
+  );
+  assert(text.contains("\"seeded\":true"));
+  assert(text.contains("\"shared_atoms\":[\"db.write[users]\"]"))
+}
+
+// Everything a reader or an agent needs to act on a failure is in its artifact: what failed, whether
+// it is Ply's fault, how to replay it, where the race was, and the cause, led by the culprit.
+test "a failure's artifact says what failed, how to replay it, and what caused it" {
+  let p = a_program([a_case(0, "two is two")]);
+  let site = { task: "t1", definition: Some("m.bump"), access: "write", at: None };
+  let raced = {
+    ..a_fault(),
+    seed: Some("0:1.0"),
+    replay: replay_of("0:1.0", "two is two"),
+    race: Some({ left: site, right: { ..site, task: "t2" }, step: 3 }),
+    suspects: [{ ..a_suspect("m.bump"), change: Some(Edited), culprit: true }],
+  };
+  let text = to_string(fault_json(p, raced));
+  assert(text.contains("\"key\":\"m.two is two\""));
+  assert(text.contains("\"name\":\"two is two\""));
+  assert(text.contains("\"defect\":false"));
+  assert(text.contains("\"module\":\"m\""));
+  assert(text.contains("\"status\":\"failed\""));
+  assert(text.contains("\"nondet\":false"));
+  assert(text.contains("\"replay\":\"ply test --seed 0:1.0 --filter 'two is two'\""));
+  assert(text.contains("\"at\":3"));
+  assert(text.contains("\"task\":\"t2\""));
+  assert(text.contains("\"change\":\"edited\""));
+  assert(text.contains("\"culprit\":true"));
+  // A test that searched nothing has no seed, so nothing replays it and no race is named.
+  let plain_fault = to_string(fault_json(p, a_fault()));
+  assert(plain_fault.contains("\"replay\":null"));
+  assert(plain_fault.contains("\"race\":null"))
+}
+
+test "a program with no tests at all says so, and one narrowed to none says that instead" {
+  let empty = { ..a_program([]), declared: 0 };
+  assert(
+    answered(
+      plain(),
+      from_argv("test", []),
+      empty,
+      a_run([], 0),
+      [],
+      a_decided(empty, []),
+    ).lines.contains(
+      "   no `test` items in this program",
+    ),
+  );
+  let hidden = { ..a_program([]), declared: 3, filtered_out: 3 };
+  assert(
+    answered(
+      plain(),
+      from_argv("test", ["--filter=none"]),
+      hidden,
+      a_run([], 0),
+      [],
+      a_decided(hidden, []),
+    ).lines.contains(
+      "   no test key contains a `--filter` substring; nothing was verified",
+    ),
+  )
+}
+
+test "a suspect is named with what changed" {
+  assert_eq(described(a_suspect("m.total")), "m.total");
+  assert_eq(described({ ..a_suspect("m.total"), change: Some(Edited) }), "m.total (edited)")
+}
+
+test "the repro is a seed and the command that replays it" {
+  let f = { ..a_fault(), seed: Some("0:0.1.0.2"), replay: replay_of("0:0.1.0.2", "two is two") };
+  assert_eq(seed_lines(plain(), a_place(), f), [
+    "  seed: 0:0.1.0.2",
+    "  replay: ply test --seed 0:0.1.0.2 --filter 'two is two'",
+  ])
+}
+
+test "the simulation line counts the searches and says a spent budget out loud" {
+  let quiet = a_run([], 0);
+  assert_eq(simulation_line(plain(), quiet), []);
+  let counted = {
+    simulated: 3,
+    total: 47,
+    seeds: 3,
+    interleavings: 61,
+    exhaustive: 3,
+    exhausted: 0,
+    failed: 0,
+  };
+  assert_eq(simulation_line(plain(), { ..quiet, simulation: counted }), [
+    indent() ++ "simulated: 3 of 47 · 61 interleavings · 3 exhaustive",
+  ]);
+  let spent = {
+    ..counted,
+    simulated: 1,
+    total: 1,
+    interleavings: 256,
+    exhaustive: 0,
+    exhausted: 1,
+  };
+  assert_eq(simulation_line(plain(), { ..quiet, simulation: spent }), [
+    indent() ++ "simulated: 1 of 1 · 256 interleavings · 1 budget spent, not cached",
+  ])
+}
+
+test "a phase reading is two decimals of a millisecond, longest phase first" {
+  assert_eq(phase_lines(plain(), { ..no_phases(), read_us: 2000, front_us: 98000 }), [
+    "",
+    "   front-end time",
+    "     front          98.00ms  98.0%",
+    "     read            2.00ms   2.0%",
+    "     write back      0.00ms   0.0%",
+    "     total         100.00ms",
+  ])
+}
+
+test "a run's time is its load and every phase after it, longest first" {
+  let load = { ..no_phases(), front_us: 2000 };
+  let spent = { ..no_spent(), before_us: 1000, handoff_us: 5000, tests_us: 2000 };
+  assert_eq(run_total(load, spent), 10000);
+  assert_eq(run_phase_lines(plain(), load, spent), [
+    "",
+    "   run time",
+    "     handoff         5.00ms  50.0%",
+    "     load            2.00ms  20.0%",
+    "     tests           2.00ms  20.0%",
+    "     before          1.00ms  10.0%",
+    "     promises        0.00ms   0.0%",
+    "     store           0.00ms   0.0%",
+    "     selection       0.00ms   0.0%",
+    "     unit            0.00ms   0.0%",
+    "     bind            0.00ms   0.0%",
+    "     conclude        0.00ms   0.0%",
+    "     total          10.00ms",
+  ])
+}
+
+// A socket lives outside every region, so a test the binding can reach is neither isolated nor
+// cached, whatever its footprint says.
+test "a test the binding can reach is host rather than isolated" {
+  let c = a_case(0, "one");
+  let hermetic = a_run([], 0);
+  assert_eq(isolated_as(hermetic.reaches, c), "region");
+  assert_eq(isolated_as([0], c), "host");
+  // A test is shared exactly when one of the atoms the row carries can be contended over, and a
+  // seed it reads is not one of them.
+  let fs_write = {
+    atom: { effect: "fs", resource: "/tmp/x", writes: true, nondet: true },
+    text: "fs.write[/tmp/x]",
+  };
+  let seed = {
+    atom: { effect: "sim", resource: "", writes: false, nondet: false },
+    text: "sim.read",
+  };
+  assert_eq(isolated_as(hermetic.reaches, { ..c, atoms: [seed] }), "region");
+  assert_eq(isolated_as(hermetic.reaches, { ..c, atoms: [seed, fs_write] }), "shared");
+  assert_eq(shared_of({ ..c, atoms: [seed, fs_write] }), "{fs.write[/tmp/x]}")
+}
+
+// Only a run that re-runs every test whatever the cache held needs classes over all of them.
+test "classes over every test are coloured only for a mutation" {
+  let db = |label: String|
+    {
+      atom: { effect: "db", resource: label, writes: true, nondet: true },
+      text: "db.write[" ++ label ++ "]",
+    };
+  let p = a_program([
+    { ..a_case(0, "one"), atoms: [db("a")] },
+    { ..a_case(1, "two"), atoms: [db("a")] },
+    a_case(2, "three"),
+  ]);
+  let options = options_from(parsed(["test"]), "/p");
+  assert_eq(every_of(p, options), []);
+  assert_eq(every_of(p, { ..options, mutate: Some("*") }), [[0, 2], [1]])
+}
+
+test "a bound run says how many tests reach the host and what it bound, and after the run what it shook hands on" {
+  let o = { ..an_opening(), hermetic: false, operations: 7, digest: "b3:aabbccddeeff" };
+  let c = { total: 3, isolated: 1, shared: 0, host: 2 };
+  assert_eq(binding_lines(plain(), o, c), [
+    "   host 2 of 3 · cached by what each read",
+    "   binding host · 7 operations · b3:aabbccddeeff",
+  ]);
+  assert_eq(binding_lines(plain(), an_opening(), c), []);
+  let bound = {
+    ..a_run([], 0),
+    hermetic: false,
+    handshakes: ["handshakes: 1 completed, 0 refused"],
+  };
+  assert_eq(handshake_lines(plain(), bound), ["   handshakes: 1 completed, 0 refused"]);
+  assert_eq(handshake_lines(plain(), a_run([], 0)), [])
+}
+
+test "a label is bare in a single-module run and qualified across several" {
+  let one = a_program([a_case(0, "same")]);
+  let c = one.cases.at_or(0, a_case(0, ""));
+  assert_eq(display_of(one, c), "same");
+  let two = {
+    ..one,
+    modules: [{ name: "alpha", file: "alpha.ply" }, { name: "beta", file: "beta.ply" }],
+  };
+  assert_eq(display_of(two, c), "m.same")
+}
+
+// A deadlock's cycle lives only in its secondary labels, so each is printed where it points.
+
+test "a failure's other labels are printed under it, each with its own place" {
+  let d = error_with_labels(
+    b"E0414",
+    b"these tasks are deadlocked",
+    [
+      { module: 0, start: 0, end: 4, primary: true, text: b"here" },
+      { module: 0, start: 5, end: 16, primary: false, text: b"waits on `b`" },
+    ],
+    [],
+  );
+  assert_eq(at_lines(plain(), a_place(), d), ["    at m.ply:1:1"]);
+  assert_eq(secondary_lines(plain(), a_place(), d), ["    waits on `b`   m.ply:1:6"])
+}
+
+test "a seeded test searches the roots it still owes, and any other runs once" {
+  let p = a_program([a_case(0, "plain"), { ..a_case(1, "seeded"), seeded: true }]);
+  let searching = plan::random(4);
+  assert_eq(job_of(p, 0, 0, [], searching), {
+    unit: 0,
+    test: 0,
+    entry: entry_of(0, "m.plain"),
+    search: None,
+  });
+  assert_eq(job_of(p, 0, 1, [], searching).search, Some(searching));
+  assert_eq(job_of(p, 2, 1, [{ index: 1, roots: [2, 3] }], searching), {
+    unit: 2,
+    test: 1,
+    entry: entry_of(1, "m.seeded"),
+    search: Some({ ..searching, roots: [2u64, 3u64] }),
+  })
+}
+
+// --- Footprints over real programs --------------------------------------------
+
+fn analysed_as(name: String, src: String) -> View / {abort.raise} =
+  match analyse(parse_all([{ name: Bytes::of_string(name), src: Bytes::of_string(src) }])) {
+    Analysed(w) -> view_of(w),
+    Refused(_) -> panic("the fixture checks"),
+  }
+
+fn compiled(src: String) -> View / {abort.raise} = analysed_as("", src)
+
+fn cases_of_whole(analysis: View) -> List<Case> / {abort.raise} = {
+  let declared = declared_effects(analysis);
+  range(0, analysis.checked.tests.len()).fold([], |acc: List<Case>, i: Int|
+    match test_at(analysis, i) {
+      Some(t) -> acc.push(case_view(analysis, declared, i, t)),
+      None -> acc,
+    })
+}
+
+/// The classes every test of a program is coloured into, as a run that executes them all colours them.
+fn coloured(analysis: View) -> List<List<Int>> / {abort.raise} = {
+  let cases = cases_of_whole(analysis);
+  classes_of(a_program(cases), cases.map(|case: Case| case.index))
+}
+
+fn texts_of_case(analysis: View, i: Int) -> List<String> / {abort.raise} =
+  match cases_of_whole(analysis).at(i) {
+    Some(c) -> c.atoms.map(|printed: Printed| printed.text),
+    None -> [],
+  }
+
+fn a_store() -> String =
+  "nondet effect store {\n  read  all[r]() -> Int\n  write save[r](n: Int) -> Unit\n}\n"
+
+fn precise() -> String =
+  a_store()
+    ++ "fn list_items() -> Int / {store.read[items]} = store.all[items]()\nfn place_order() -> Int / {store.write[orders]} = { store.save[orders](1); 2 }\ntest/nondet \"items\" { assert_eq(list_items(), 0) }\ntest/nondet \"orders\" { assert_eq(place_order(), 2) }\n"
+
+fn aliased() -> String =
+  a_store()
+    ++ "effect set Service = {store.read[items], store.write[orders]}\nfn list_items() -> Int / {Service} = store.all[items]()\nfn place_order() -> Int / {Service} = { store.save[orders](1); 2 }\ntest/nondet \"items\" { assert_eq(list_items(), 0) }\ntest/nondet \"orders\" { assert_eq(place_order(), 2) }\n"
+
+/// `src` with its effects and tests declared deterministic.
+fn deterministic(src: String) -> String =
+  String::join(String::join(src.split("nondet effect "), "effect ").split("test/nondet "), "test ")
+
+test "precise rows leave two endpoints nothing to contend over, and one broad set serialises them" {
+  assert_eq(coloured(compiled(precise())), [[0, 1]]);
+  assert_eq(coloured(compiled(aliased())), [[0], [1]]);
+  // What answers an effect that is not `nondet` answers each test from that test's own state.
+  assert_eq(coloured(compiled(deterministic(aliased()))), [[0, 1]])
+}
+
+test "the atoms that serialise them are the set's expansion, and an alias only ever widens" {
+  let broad = texts_of_case(compiled(aliased()), 0);
+  let narrow = texts_of_case(compiled(precise()), 0);
+  assert(broad.filter(|t: String| t.ends_with("store.write[orders]")).len() > 0);
+  assert(broad.filter(|t: String| t.contains("Service")).len() == 0);
+  assert(narrow.filter(|t: String| t.ends_with("store.write[orders]")).len() == 0);
+  assert(narrow.fold(true, |ok: Bool, t: String| ok && broad.contains(t)))
+}
+
+test "an effect whose name merely resembles a region's names a real resource" {
+  let w = compiled(
+    "nondet effect holds {\n  write put[rows](v: Int) -> Unit\n}\ntest/nondet \"one\" { holds.put[rows](1) }\ntest/nondet \"two\" { holds.put[rows](2) }\n",
+  );
+  assert_eq(texts_of_case(w, 0), ["holds.put[rows]"]);
+  assert_eq(coloured(w), [[0], [1]])
+}
+
+test "a hold's label beside a real write does not launder the write" {
+  let w = compiled(
+    "nondet effect db {\n  read  get[users]() -> Int\n  write put[users](v: Int) -> Unit\n}\nfn touches(n: Int) -> Int / {hold.read[table]} = n\ntest \"hold only\" { let seen = with_hold[table](1, |x: Int| ()) { c -> c.get() }; assert_eq(touches(seen), 1) }\ntest/nondet \"hold and a real write\" { let seen = with_hold[table](1, |x: Int| ()) { c -> c.get() }; db.put[users](touches(seen)) }\ntest/nondet \"a real read\" { assert_eq(db.get[users](), 0) }\n",
+  );
+  assert_eq(texts_of_case(w, 1), ["db.put[users]", "hold.read[table]"]);
+  // A hold is only read, so it separates no test; a writer and a reader of `users` do not share.
+  assert_eq(coloured(w), [[0, 1], [2]])
+}
+
+test "a test whose regions discharge their holds contends over nothing" {
+  let w = compiled(
+    "test \"users hold\" { with_hold[users](1, |x: Int| ()) { c -> assert_eq(c.get(), 1) } }\ntest \"orders hold\" { with_hold[orders](2, |x: Int| ()) { c -> assert_eq(c.get(), 2) } }\ntest \"pure\" { assert_eq(1, 1) }\n",
+  );
+  assert_eq(cases_of_whole(w).map(|case: Case| case.footprint), ["{}", "{}", "{}"]);
+  assert_eq(coloured(w), [[0, 1, 2]])
+}
+
+test "a test that reads a seed is searched, and one that does not runs once" {
+  let w = compiled(
+    "test \"once\" { assert_eq(1, 1) }\ntest \"searched\" { let n = simulate { task.join(task.spawn(|| 1)) }; assert_eq(n, 1) }\n",
+  );
+  assert_eq(cases_of_whole(w).map(|case: Case| case.seeded), [false, true]);
+  assert_eq(rows_of(w).map(|row: Row| row.seeded), [false, true])
+}
+
+test "a run reports on the tests `--filter` keeps, and counts the ones it hid" {
+  let w = analysed_as(
+    "m",
+    "test \"alpha\" { assert_eq(1, 1) }\ntest \"beta\" { assert_eq(2, 2) }\ntest \"gamma\" { assert_eq(3, 3) }\n",
+  );
+  let options = options_from(parsed(["test", "--filter", "alpha"]), "/p");
+  let scope = scope_of(w, options);
+  assert_eq(scope.visible, [0]);
+  assert_eq(scope.filtered_out, 2);
+  assert_eq(scope.out, []);
+  let either = options_from(parsed(["test", "--filter", "m.gam", "--filter", "alpha"]), "/p");
+  assert_eq(scope_of(w, either).visible, [0, 2]);
+  assert_eq(scope_of(w, options_from(parsed(["test"]), "/p")).visible, [0, 1, 2])
+}
+
+test "the parts of a run hold each of its tests once, a case as a test, each key in one part whatever else runs" {
+  let whole = ranging();
+  let over = ranged(
+    whole,
+    Map::new().insert(
+      1,
+      Ok(
+        range(0, 12).map(|n: Int|
+          { label: "holds " ++ n.to_string(), identity: Bytes::of_string(n.to_string()) }),
+      ),
+    ),
+  );
+  let part = |k: Int, more: List<String>|
+    scope_of(
+      over.analysis,
+      options_from(parsed(["test", "--shard", k.to_string() ++ "/3"].concat(more)), "/p"),
+    );
+  let parts = [1, 2, 3].map(|k: Int| part(k, []).visible);
+  assert(parts.all(|held: List<Int>| held.len() > 0));
+  assert(range(0, 13).all(|i: Int| parts.filter(|held: List<Int>| held.contains(i)).len() == 1));
+  assert_eq(part(2, []).filtered_out, 13 - parts.at_or(1, []).len());
+  // Narrowed by `--filter` to `holds 1`, `holds 10` and `holds 11`, each part keeps those it held.
+  assert(
+    [1, 2, 3].all(|k: Int|
+      part(k, ["--filter", "holds 1"]).visible
+        == parts.at_or(k - 1, []).filter(|i: Int| i == 2 || i >= 11)),
+  );
+  // A part of one is the run, and listing asks for every test over cases whatever the part.
+  assert_eq(
+    scope_of(over.analysis, options_from(parsed(["test", "--shard", "1/1"]), "/p")).visible,
+    range(0, 13),
+  );
+  assert_eq(over_cases(whole, options_from(parsed(["test", "--shard", "3/3"]), "/p")), [1])
+}
+
+// --- What a watching run stamps -----------------------------------------------
+
+/// A program with a test over cases, over stand-ins for the two shipped modules its item reads
+/// through.
+fn ranging() -> View / {abort.raise} =
+  match analyse_pulling_std_with(
+      [
+        {
+          name: b"m",
+          src: b"fn table() -> List<Int> = [1, 2]\nfn held(n: Int) -> Bool = n > 0\ntest \"plain\" { assert(held(1)) }\ntest \"holds {n}\" for n: Int in table() { assert(held(n)) }\n",
+        },
+      ],
+      [
+        {
+          name: b"std.cases",
+          src: b"pub type Table<a> = List<a>\npub fn listed<a | e>(t: List<a>, l: (a) -> String / e) -> List<{ label: String, identity: Bytes }> / e where derivable(hash, a) = t.map(|c: a| { label: l(c), identity: b\"\" })\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a / {abort.raise} where derivable(hash, a) = panic(\"\")\n",
+        },
+        { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"\n" },
+      ],
+      no_rows(),
+    ).out {
+    Analysed(w) -> view_of(w),
+    Refused(_) -> panic("the fixture checks"),
+  }
+
+test "a case is a test of its own: its label names it, its test's hash and its identity key it, and it runs no table" {
+  let whole = ranging();
+  let over = ranged(
+    whole,
+    Map::new().insert(
+      1,
+      Ok([{ label: "holds 1", identity: b"one" }, { label: "holds 2", identity: b"two" }]),
+    ),
+  );
+  assert_eq(over.analysis.checked.tests.map(|t: TestInfo| t.key), [
+    b"m.plain",
+    b"m.holds 1",
+    b"m.holds 2",
+  ]);
+  assert_eq(over.analysis.checked.tests.map(|t: TestInfo| t.index), [0, 1, 2]);
+  assert_eq(over.entries.map(|e: Entry| e.test), [0, 1, 1]);
+  assert_eq(over.entries.map(|e: Entry| e.of), ["m.plain", "m.holds {n}", "m.holds {n}"]);
+  assert_eq(over.entries.map(|e: Entry| e.case), [
+    None,
+    Some({ at: 0, identity: b"one" }),
+    Some({ at: 1, identity: b"two" }),
+  ]);
+  let hashes = over.analysis.frame.hashes.tests;
+  let of_whole = |key: Bytes| whole.frame.hashes.tests.get(key);
+  assert_eq(hashes.get(b"m.plain"), of_whole(b"m.plain"));
+  assert_eq(hashes.get(b"m.holds 1"), match of_whole(b"m.holds {n}") {
+    Some(h) -> Some(case_hash(h, b"one")),
+    None -> None,
+  });
+  assert(hashes.get(b"m.holds 1") != hashes.get(b"m.holds 2"), None);
+  // A case reaches its table where a definition is covered, and not where a failure is suspected.
+  let reached = |a: View| reach(a.frame.hashes, [TheItem(b"m.holds 1")]).fns.keys();
+  assert(reached(over.analysis).contains(b"m.table") && reached(over.analysis).contains(b"m.held"));
+  assert(!reached(over.judged).contains(b"m.table") && reached(over.judged).contains(b"m.held"))
+}
+
+test "a run enters what the tests it runs reach, and listing enters what lists their tables" {
+  let whole = ranging();
+  let over = ranged(whole, Map::new().insert(1, Ok([{ label: "holds 1", identity: b"one" }])));
+  let plain = run_within(over, [0]);
+  assert(plain.owners.contains(b"m.held") && !plain.owners.contains(b"m.table"));
+  assert_eq(plain.tests.keys(), [b"m.plain"]);
+  // A case is entered through its test's root, and its table is listed again to choose it.
+  let case = run_within(over, [1]);
+  assert(case.owners.contains(b"m.held") && case.owners.contains(b"m.table"));
+  assert_eq(case.tests.keys(), [b"m.holds {n}"]);
+  let keyed = view_dump(whole, Some(case)).keys.map(|k: KeyRow| k.root);
+  let holds = test_owner(b"m", b"holds {n}");
+  assert(keyed.contains(holds) && keyed.contains(cases_root(holds)));
+  assert(!keyed.contains(test_owner(b"m", b"plain")));
+  let listing = listing_within(whole, [1]);
+  assert(listing.owners.contains(b"m.table") && !listing.owners.contains(b"m.held"));
+  assert_eq(listing.tests.keys(), [b"m.holds {n}"]);
+  // A run that executes nothing enters nothing but its tests' roots.
+  let idle = run_within(over, []);
+  assert_eq(idle.owners.len() + idle.tests.len(), 0);
+  assert_eq(view_dump(whole, Some(idle)).keys, []);
+  let rooted = view_dump(whole, Some(idle)).emitter_roots.map(|r: EmitterRoot| r.root);
+  assert(rooted.contains(test_owner(b"m", b"plain")));
+  assert(rooted.contains(test_owner(b"m", b"holds {n}")))
+}
+
+test "a test whose cases could not be listed stays one test, and ends as the listing did" {
+  let whole = ranging();
+  let why = {
+    status: "failed",
+    failure: { diag: diag_of("error", "E0502", "division by zero", [], []), values: [] },
+  };
+  let over = ranged(whole, Map::new().insert(1, Err(why)));
+  assert_eq(over.analysis.checked.tests.map(|t: TestInfo| t.key), [b"m.plain", b"m.holds {n}"]);
+  assert_eq(over.analysis.frame.hashes.tests, whole.frame.hashes.tests);
+  let p = a_program(
+    cases_of_whole(over.analysis).map(|case: Case|
+      { ..case, entry: over.entries.at_or(case.index, case.entry) }),
+  );
+  let ended = handle {
+    ran_job(job_of(p, 0, 1, [], plan::random(1)), false)
+  } with {
+    tester.executed[tests](unit, index, case) -> panic("a test with no cases was run"),
+    tester.interleaved[tests](unit, index, case, seed, steps, again) ->
+      panic("a test with no cases was searched"),
+  };
+  assert_eq(ended.status, "failed");
+  assert_eq(ended.failure, Some(why.failure));
+  // A program with no test over cases in scope is asked for nothing, and is itself.
+  assert_eq(ranged(whole, Map::new()).entries, [entry_of(0, "m.plain"), entry_of(1, "m.holds {n}")])
+}

@@ -1,8 +1,8 @@
-use ply_eval::host::MachineId;
-use ply_eval::sched::{HostPolicy, Scheduler};
-use ply_eval::sched::{Policy, Resumption, Turn};
-use ply_eval::sim::TASK_OPS;
-use ply_eval::{
+use ply_core::host::MachineId;
+use ply_core::sched::{HostPolicy, Scheduler};
+use ply_core::sched::{Policy, Resumption, Turn};
+use ply_core::sim::TASK_OPS;
+use ply_core::{
     Diagnostic, EffectAtom, HostBinding, HostRegistry, HostRequest, HostRuntime, Mode, Pending,
     Resource, SimId, Span, Symbol, TaskHandle, TaskId, Value, codes,
 };
@@ -265,7 +265,7 @@ fn run(program: &Program, rt: &dyn HostRuntime) -> Result<Run, Diagnostic> {
                             return Err(sched.fail(
                                 Diagnostic::error(codes::RUNTIME_ERROR, "the task failed")
                                     .primary(Span::DUMMY, "here"),
-                                &ply_eval::Seed::at(0, Vec::new()),
+                                &ply_core::Seed::at(0, Vec::new()),
                             ));
                         }
                     }
@@ -311,12 +311,12 @@ fn refused<T>(outcome: Result<T, Diagnostic>, why: &str) -> Diagnostic {
 
 /// `fn spin() -> Unit / {task.write}`: its footprint contains `task.write`, so the `Any`
 /// registrations have an atom to resolve against.
-fn spawns() -> ply_eval::CheckOutput {
-    ply_sketch::Sketch::program()
+fn spawns() -> ply_core::CheckOutput {
+    ply_test_support::Sketch::program()
         .def(
             "m",
             "spin",
-            vec![ply_sketch::atom("task", "", ply_eval::Mode::Write)],
+            vec![ply_test_support::atom("task", "", ply_core::Mode::Write)],
         )
         .check()
 }
@@ -404,7 +404,7 @@ fn a_sleeper_wakes_near_its_deadline_while_the_task_beside_it_keeps_running() {
         let Turn::Run { task, .. } = sched.next_host(&*rt).expect("a task is enabled") else {
             panic!("the region ended while its root slept");
         };
-        if task == ply_eval::sched::ROOT {
+        if task == ply_core::sched::ROOT {
             break;
         }
         assert_eq!(task, beside.id());
@@ -493,7 +493,7 @@ fn the_task_registrations_are_what_ply_hosts_prints() {
     );
     for row in &listing.rows {
         assert_eq!(row.atom.to_string(), row.to_string());
-        assert_eq!(row.atom.mode, ply_eval::Mode::Write);
+        assert_eq!(row.atom.mode, ply_core::Mode::Write);
         assert!(!row.deterministic);
         assert!(!row.linearity.is_linear());
         assert!(!row.blocking);
@@ -505,7 +505,7 @@ fn the_task_registrations_are_what_ply_hosts_prints() {
 fn a_program_that_never_spawns_binds_cleanly_and_lists_nothing() {
     let binding = registry()
         .bind(
-            &ply_sketch::Sketch::program()
+            &ply_test_support::Sketch::program()
                 .def("m", "f", Vec::new())
                 .check(),
         )
@@ -521,7 +521,7 @@ fn dispatching_a_task_perform_to_the_handler_is_refused() {
         .resolve(&Symbol::new("task"), &Symbol::new("spawn"), None)
         .expect("the triple is bound");
     let request = HostRequest {
-        machine: ply_eval::host::MachineId(1),
+        machine: ply_core::host::MachineId(1),
         atom: bound_op.atom.clone(),
         op: bound_op.op,
         args: &[],
@@ -648,7 +648,7 @@ fn a_failed_production_region_answers_with_its_failure_forever() {
     };
     sched.fail(
         Diagnostic::error(codes::RUNTIME_ERROR, "boom"),
-        &ply_eval::Seed::at(0, Vec::new()),
+        &ply_core::Seed::at(0, Vec::new()),
     );
     for _ in 0..4 {
         let err = refused(sched.next_host(&*rt), "the region is over");
@@ -768,7 +768,7 @@ fn a_retired_tasks_open_span_is_closed_abandoned_at_retirement() {
     let Turn::Run { task, .. } = sched.next_host(&*rt).expect("the root is enabled") else {
         panic!("expected the root's step");
     };
-    assert_eq!(task, ply_eval::sched::ROOT);
+    assert_eq!(task, ply_core::sched::ROOT);
     assert_eq!(trace.open_spans(), 0, "the retirement closed it");
     let last = sink.records().pop().expect("the span's records");
     assert_eq!(

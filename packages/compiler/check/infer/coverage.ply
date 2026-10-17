@@ -1,0 +1,447 @@
+//! Exhaustiveness: usefulness over a matrix with one row per unguarded arm.
+
+import syntax.parsing (Span, Ident)
+import std.list (prepend)
+import syntax.exprs (MatchArm)
+import syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit,
+                        LInt, LFixed, LWide, LBool, LUnit)
+import std.bytes
+import std.bytes (ascii_of_int)
+import std.option
+import std.string
+import check.infer.checker (CtorInfo, Checker, report_error_at, backticked_text, ctor_of)
+import check.infer.names (covered_ctor, kept_named)
+
+// --- Patterns and matches -----------------------------------------------------------------------
+
+/// The integer type a literal is of, by its name.
+pub fn integer_of(literal: Lit) -> Option<Bytes> / {abort.raise} =
+  match literal {
+    LInt(_) -> Some(b"Int"),
+    LFixed(ty, _) -> Some(Bytes::of_string(String::of_bytes(ty).ascii_upper())),
+    LWide(ty, _, _) -> Some(Bytes::of_string(String::of_bytes(ty).ascii_upper())),
+    _ -> None,
+  }
+
+// --- Exhaustiveness: usefulness over a matrix with one row per unguarded arm ---------------------
+
+/// `CoverNothing` is a constructor that does not resolve: it matches nothing, so its arm covers nothing.
+pub type CoveragePattern =
+  | CoverAny
+  | CoverNothing
+  | CoverCtor({ family: Bytes, key: Bytes, name: Bytes, args: List<CoveragePattern> })
+  | CoverRecord(List<{ name: Bytes, pat: CoveragePattern }>)
+  /// The integers of the type `family` names from `lo` through `hi`: a literal's one, or a range's.
+  | CoverSpan({ family: Bytes, lo: Int, hi: Int })
+  /// Never a row's head inside the search: `uncovered` splits it into a row per alternative first.
+  | CoverEither(List<CoveragePattern>)
+
+/// `lo` and `hi` are the integers a cell of an integer column holds, and zero for a constructor.
+type CoverageCtor = { key: Bytes, name: Bytes, arity: Int, lo: Int, hi: Int }
+
+pub fn check_exhaustive(
+  checker: Checker,
+  span: Span,
+  arms: List<MatchArm>,
+) -> Checker / {abort.raise} = {
+  let rows = arms.fold([], |acc: List<List<CoveragePattern>>, arm: MatchArm|
+    match arm.guard { None -> acc.push([coverage_pat(checker, arm.pat)]), Some(_) -> acc });
+  let missing = uncovered(checker, rows, 1);
+  if missing.len() == 0 { checker } else {
+    report_error_at(
+      checker,
+      b"E0205",
+      span,
+      b"match does not cover every case",
+      b"not covered: ".concat(
+        Bytes::join(
+          missing.map(|patterns: List<CoveragePattern>| backticked_text(shown(patterns.get(0)))),
+          b", ",
+        ),
+      ),
+      [b"add the missing arms, or a `_` arm"],
+    )
+  }
+}
+
+pub fn coverage_pat(checker: Checker, p: Pattern) -> CoveragePattern / {abort.raise} =
+  match p {
+    PCtor(c) -> {
+      let info = match covered_ctor(checker, c.name) {
+        Some(q) -> ctor_of(checker, q),
+        None -> None,
+      };
+      match info {
+        Some(k) ->
+          CoverCtor({
+            family: k.type_name,
+            key: k.name,
+            name: k.simple_name,
+            args: c.args.map(|a: Pattern| coverage_pat(checker, a)),
+          }),
+        // A constructor its type's module keeps is refused where it is named, and said once.
+        None -> match kept_named(checker, c.name) { Some(_) -> CoverAny, None -> CoverNothing },
+      }
+    },
+    PLit(l) -> match l.lit {
+      LBool(b) -> {
+        let k = if b { b"true" } else { b"false" };
+        CoverCtor({ family: b"#bool", key: k, name: k, args: [] })
+      },
+      LUnit -> CoverCtor({ family: b"#unit", key: b"()", name: b"()", args: [] }),
+      other -> cover_span(other, other),
+    },
+    PRange(r) -> cover_span(r.lo, r.hi),
+    PList(l) -> {
+      let n = l.items.len();
+      let last = match l.rest { Some(r) -> coverage_pat(checker, r), None -> list_con(b"[]", []) };
+      range(0, n).fold(last, |tail: CoveragePattern, i: Int|
+        list_con(b"::", [coverage_pat(checker, l.items.get(n - 1 - i)), tail]))
+    },
+    PRecord(r) ->
+      CoverRecord(
+        r.fields.map(|f: { name: Ident, pat: Pattern }|
+          { name: f.name.name, pat: coverage_pat(checker, f.pat) }),
+      ),
+    POr(o) -> CoverEither(o.alts.map(|a: Pattern| coverage_pat(checker, a))),
+    PWild(_) -> CoverAny,
+    PVar(_) -> CoverAny,
+    PBad(_) -> CoverAny,
+  }
+
+/// The values from one literal through another. Over `U8`, `U16` or `U32` they are a span of the
+/// type; no other integer type's least and greatest values are both literals, so no list of arms
+/// exhausts one and its literals stand as any other literal does.
+fn cover_span(lo: Lit, hi: Lit) -> CoveragePattern / {abort.raise} = {
+  let literal = CoverCtor({ family: b"#lit", key: b"", name: b"", args: [] });
+  match ((lo, hi)) {
+    (LFixed(_, a), LFixed(_, b)) -> match ((integer_of(lo), integer_of(hi))) {
+      (Some(ty), Some(other)) -> if ty != other { CoverNothing }
+      else if ty != b"U8" && ty != b"U16" && ty != b"U32" { literal }
+      else if a > b { CoverNothing }
+      else { CoverSpan({ family: int_family().concat(ty), lo: a, hi: b }) },
+      _ -> literal,
+    },
+    _ -> literal,
+  }
+}
+
+fn int_family() -> Bytes = b"#int:"
+
+/// The greatest value of the unsigned width an integer column is of; its least is zero.
+fn int_top(family: Bytes) -> Int / {abort.raise} = {
+  let ty = family.slice(int_family().len(), family.len());
+  if ty == b"U8" { 255 } else if ty == b"U16" { 65535 } else { 4294967295 }
+}
+
+/// A cell as a pattern writes it: `7u8`, `0u8..=9u8`.
+fn span_text(family: Bytes, lo: Int, hi: Int) -> Bytes / {abort.raise} = {
+  let suffix = Bytes::of_string(
+    String::of_bytes(family.slice(int_family().len(), family.len())).ascii_lower(),
+  );
+  if lo == hi { ascii_of_int(lo).concat(suffix) }
+  else { Bytes::concat_all([ascii_of_int(lo), suffix, b"..=", ascii_of_int(hi), suffix]) }
+}
+
+/// The cells an integer column's heads cut its type into, least first. Each head holds whole cells
+/// and nothing else, so the cells stand for every value of the type as its constructors do a sum's.
+fn int_cells(
+  rows: List<List<CoveragePattern>>,
+  family: Bytes,
+) -> List<CoverageCtor> / {abort.raise} = {
+  let top = int_top(family);
+  let starts = rows.fold([0], |acc: List<Int>, r: List<CoveragePattern>|
+    match r.get(0) {
+      CoverSpan(s) -> if s.family != family { acc } else {
+        let from = acc.push_unique(s.lo);
+        if s.hi < top { from.push_unique(s.hi + 1) } else { from }
+      },
+      _ -> acc,
+    }).sort(
+  );
+  range(0, starts.len()).map(|i: Int| {
+    let lo = starts.get(i);
+    let hi = if i + 1 < starts.len() { starts.get(i + 1) - 1 } else { top };
+    let text = span_text(family, lo, hi);
+    { key: text, name: text, arity: 0, lo: lo, hi: hi }
+  })
+}
+
+/// Whether a row's head is this constructor; a span is every cell it holds.
+fn heads(pattern: CoveragePattern, family: Bytes, k: CoverageCtor) -> Bool =
+  match pattern {
+    CoverCtor(c) -> c.family == family && c.key == k.key,
+    CoverSpan(s) -> s.family == family && s.lo <= k.lo && k.hi <= s.hi,
+    _ -> false,
+  }
+
+fn list_con(key: Bytes, args: List<CoveragePattern>) -> CoveragePattern =
+  CoverCtor({ family: b"#list", key: key, name: key, args: args })
+
+fn wilds(n: Int) -> List<CoveragePattern> = range(0, n).map(|_: Int| CoverAny)
+
+fn family_of(pattern: CoveragePattern) -> Bytes =
+  match pattern {
+    CoverCtor(c) -> c.family,
+    CoverSpan(s) -> s.family,
+    CoverRecord(_) -> b"#rec",
+    _ -> b"",
+  }
+
+fn heads_ctor(
+  rows: List<List<CoveragePattern>>,
+  family: Bytes,
+  k: CoverageCtor,
+) -> Bool / {abort.raise} =
+  rows.fold(false, |b: Bool, r: List<CoveragePattern>| b || heads(r.get(0), family, k))
+
+/// `None` for a family no list of arms exhausts: literals, and a column that names no constructor.
+fn family_ctors(
+  checker: Checker,
+  rows: List<List<CoveragePattern>>,
+  family: Bytes,
+) -> Option<List<CoverageCtor>> / {abort.raise} = {
+  let named = |key: Bytes, arity: Int| { key: key, name: key, arity: arity, lo: 0, hi: 0 };
+  if family == b"#bool" { Some([named(b"true", 0), named(b"false", 0)]) }
+  else if family == b"#unit" { Some([named(b"()", 0)]) }
+  else if family == b"#list" { Some([named(b"[]", 0), named(b"::", 2)]) }
+  else if family == b"#lit" || family == b"" { None }
+  else if family.starts_with(int_family()) { Some(int_cells(rows, family)) } else {
+    Some(
+      checker.ctors.filter(|ctor_info: CtorInfo| ctor_info.type_name == family).map(
+        |ctor_info: CtorInfo|
+          {
+            key: ctor_info.name,
+            name: ctor_info.simple_name,
+            arity: ctor_info.arity,
+            lo: 0,
+            hi: 0,
+          },
+      ),
+    )
+  }
+}
+
+/// Rows of values no row matches, each `n` wide; empty when the rows are exhaustive.
+pub fn uncovered(
+  checker: Checker,
+  rows: List<List<CoveragePattern>>,
+  n: Int,
+) -> List<List<CoveragePattern>> / {abort.raise} =
+  uncovered_within(checker, rows, n, search_room(checker, rows, n))
+
+/// Each step of the search puts the columns of what heads the first column in its place, and a path
+/// steps through each place once: so the columns there are, and those each pattern can bring (a
+/// constructor at most as many as any has), are room enough.
+fn search_room(checker: Checker, rows: List<List<CoveragePattern>>, n: Int) -> Int = {
+  let most = checker.ctors.fold(2, |m: Int, c: CtorInfo| if c.arity > m { c.arity } else { m });
+  rows.fold(n + 1, |acc: Int, r: List<CoveragePattern>|
+    r.fold(acc, |a: Int, p: CoveragePattern| a + brought(p, most)))
+}
+
+fn brought(p: CoveragePattern, most: Int) -> Int =
+  match p {
+    CoverAny -> 0,
+    CoverNothing -> 0,
+    CoverCtor(c) -> c.args.fold(most, |n: Int, a: CoveragePattern| n + brought(a, most)),
+    CoverSpan(_) -> 0,
+    CoverRecord(fs) ->
+      fs.fold(fs.len(), |n: Int, f: { name: Bytes, pat: CoveragePattern }|
+        n + brought(f.pat, most)),
+    CoverEither(alts) -> alts.fold(0, |n: Int, a: CoveragePattern| n + brought(a, most)),
+  }
+
+fn uncovered_within(
+  checker: Checker,
+  rows: List<List<CoveragePattern>>,
+  n: Int,
+  room: Int,
+) -> List<List<CoveragePattern>> / {abort.raise} =
+  if room <= 0 { panic("a coverage search past its columns") } else {
+    uncovered_split(
+      checker,
+      rows.fold([], |acc: List<List<CoveragePattern>>, patterns: List<CoveragePattern>|
+        acc.concat(split_or(patterns))),
+      n,
+      room - 1,
+    )
+  }
+
+/// A row headed by an or-pattern is one row per alternative, nested ones included.
+fn split_or(patterns: List<CoveragePattern>) -> List<List<CoveragePattern>> =
+  match patterns {
+    [CoverEither(alts), ..rest] ->
+      alternatives(CoverEither(alts)).map(|pattern: CoveragePattern| prepend(pattern, rest)),
+    _ -> [patterns],
+  }
+
+fn alternatives(pattern: CoveragePattern) -> List<CoveragePattern> =
+  match pattern {
+    CoverEither(alts) ->
+      alts.fold([], |acc: List<CoveragePattern>, alt: CoveragePattern|
+        acc.concat(alternatives(alt))),
+    _ -> [pattern],
+  }
+
+fn uncovered_split(
+  checker: Checker,
+  rows: List<List<CoveragePattern>>,
+  n: Int,
+  room: Int,
+) -> List<List<CoveragePattern>> / {abort.raise} =
+  if rows.len() == 0 { [wilds(n)] }
+  else if n == 0 { [] } else {
+    let family = rows.fold(b"", |acc: Bytes, r: List<CoveragePattern>|
+      if acc.len() > 0 { acc } else { family_of(r.get(0)) });
+    if family == b"#rec" { uncovered_record(checker, rows, n, room) } else {
+      match family_ctors(checker, rows, family) {
+        None ->
+          uncovered_within(checker, default_rows(rows, family), n - 1, room).map(
+            |w: List<CoveragePattern>| prepend(CoverAny, w),
+          ),
+        Some(all) -> if all.fold(true, |b: Bool, k: CoverageCtor|
+            b && heads_ctor(rows, family, k)) {
+          all.fold([], |acc: List<List<CoveragePattern>>, k: CoverageCtor|
+            acc.concat(through(checker, rows, n, family, k, room)))
+        } else {
+          // A constructor no arm names is left uncovered exactly when the default rows are; then the named ones are searched too.
+          match uncovered_within(checker, default_rows(rows, family), n - 1, room).at(0) {
+            None -> [],
+            Some(w) ->
+              all.fold([], |acc: List<List<CoveragePattern>>, k: CoverageCtor|
+                if heads_ctor(rows, family, k) {
+                  acc.concat(through(checker, rows, n, family, k, room))
+                } else {
+                  acc.push(
+                    prepend(
+                      CoverCtor({ family: family, key: k.key, name: k.name, args: wilds(k.arity) }),
+                      w,
+                    ),
+                  )
+                }),
+          }
+        },
+      }
+    }
+  }
+
+fn through(
+  checker: Checker,
+  rows: List<List<CoveragePattern>>,
+  n: Int,
+  family: Bytes,
+  k: CoverageCtor,
+  room: Int,
+) -> List<List<CoveragePattern>> / {abort.raise} =
+  uncovered_within(checker, specialize(rows, family, k), k.arity + n - 1, room).map(
+    |patterns: List<CoveragePattern>|
+      prepend(
+        CoverCtor({ family: family, key: k.key, name: k.name, args: patterns.take(k.arity) }),
+        patterns.drop(k.arity),
+      ),
+  )
+
+/// A head of another family, or of the wrong arity, counts as a wildcard: its error is already reported.
+fn specialize(
+  rows: List<List<CoveragePattern>>,
+  family: Bytes,
+  k: CoverageCtor,
+) -> List<List<CoveragePattern>> / {abort.raise} =
+  rows.fold([], |acc: List<List<CoveragePattern>>, patterns: List<CoveragePattern>|
+    match patterns.get(0) {
+      CoverNothing -> acc,
+      CoverCtor(c) -> if c.family != family { acc.push(wilds(k.arity).concat(patterns.drop(1))) }
+      else if c.key != k.key { acc }
+      else if c.args.len() == k.arity { acc.push(c.args.concat(patterns.drop(1))) }
+      else { acc.push(wilds(k.arity).concat(patterns.drop(1))) },
+      CoverSpan(s) -> if s.family == family && !heads(patterns.get(0), family, k) { acc }
+      else { acc.push(wilds(k.arity).concat(patterns.drop(1))) },
+      _ -> acc.push(wilds(k.arity).concat(patterns.drop(1))),
+    })
+
+fn default_rows(
+  rows: List<List<CoveragePattern>>,
+  family: Bytes,
+) -> List<List<CoveragePattern>> / {abort.raise} =
+  rows.fold([], |acc: List<List<CoveragePattern>>, patterns: List<CoveragePattern>|
+    match patterns.get(0) {
+      CoverNothing -> acc,
+      CoverCtor(c) -> if c.family == family { acc } else { acc.push(patterns.drop(1)) },
+      CoverSpan(s) -> if s.family == family { acc } else { acc.push(patterns.drop(1)) },
+      _ -> acc.push(patterns.drop(1)),
+    })
+
+/// A record is one constructor over every field some arm names; the rest are wildcards everywhere.
+fn uncovered_record(
+  checker: Checker,
+  rows: List<List<CoveragePattern>>,
+  n: Int,
+  room: Int,
+) -> List<List<CoveragePattern>> / {abort.raise} = {
+  let names = rows.fold([], |acc: List<Bytes>, r: List<CoveragePattern>|
+    match r.get(0) {
+      CoverRecord(fs) ->
+        fs.fold(acc, |a: List<Bytes>, f: { name: Bytes, pat: CoveragePattern }|
+          if a.contains(f.name) { a } else { a.push(f.name) }),
+      _ -> acc,
+    });
+  let k = names.len();
+  let spread = rows.fold([], |acc: List<List<CoveragePattern>>, r: List<CoveragePattern>|
+    match r.get(0) {
+      CoverNothing -> acc,
+      CoverRecord(fs) -> acc.push(names.map(|nm: Bytes| field_pat(fs, nm)).concat(r.drop(1))),
+      _ -> acc.push(wilds(k).concat(r.drop(1))),
+    });
+  uncovered_within(checker, spread, k + n - 1, room).map(|w: List<CoveragePattern>|
+    prepend(
+      CoverRecord(range(0, k).map(|i: Int| { name: names.get(i), pat: w.get(i) })),
+      w.drop(k),
+    ))
+}
+
+fn field_pat(fs: List<{ name: Bytes, pat: CoveragePattern }>, name: Bytes) -> CoveragePattern =
+  fs.fold(CoverAny, |acc: CoveragePattern, f: { name: Bytes, pat: CoveragePattern }|
+    if f.name == name { f.pat } else { acc })
+
+pub fn shown(x: CoveragePattern) -> Bytes / {abort.raise} =
+  match x {
+    CoverCtor(c) -> if c.family == b"#list" { shown_list(x, []) }
+    else if c.args.len() == 0 { c.name } else {
+      Bytes::concat_all([
+        c.name,
+        b"(",
+        Bytes::join(c.args.map(|a: CoveragePattern| shown(a)), b", "),
+        b")",
+      ])
+    },
+    CoverRecord(fs) -> shown_record(fs),
+    _ -> b"_",
+  }
+
+fn shown_list(pattern: CoveragePattern, items: List<Bytes>) -> Bytes / {abort.raise} =
+  match pattern {
+    CoverCtor(c) -> if c.key == b"::" && c.args.len() == 2 {
+      shown_list(c.args.get(1), items.push(shown(c.args.get(0))))
+    } else { Bytes::concat_all([b"[", Bytes::join(items, b", "), b"]"]) },
+    _ -> Bytes::concat_all([b"[", Bytes::join(items.push(b".."), b", "), b"]"]),
+  }
+
+/// A tuple is the record `{_0, _1, ..}` and is shown as one; a record's other fields may be unnamed, so it ends in `..`.
+fn shown_record(fs: List<{ name: Bytes, pat: CoveragePattern }>) -> Bytes / {abort.raise} = {
+  let parts = fs.map(|f: { name: Bytes, pat: CoveragePattern }| shown(f.pat));
+  let tuple = fs.len() > 1
+    && range(0, fs.len()).fold(true, |b: Bool, i: Int|
+      b && fs.get(i).name == b"_".concat(ascii_of_int(i)));
+  if !parts.fold(false, |b: Bool, t: Bytes| b || t != b"_") { b"_" }
+  else if tuple { Bytes::concat_all([b"(", Bytes::join(parts, b", "), b")"]) } else {
+    let named = range(0, fs.len()).filter(|i: Int| parts.get(i) != b"_");
+    Bytes::concat_all([
+      b"{",
+      Bytes::join(
+        named.map(|i: Int| Bytes::concat_all([fs.get(i).name, b": ", parts.get(i)])).push(b".."),
+        b", ",
+      ),
+      b"}",
+    ])
+  }
+}

@@ -50,8 +50,8 @@ set -uo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ply="$root/target/debug/ply"
 shards="$root/.github/ci-shards.sh"
-cli_suite=crates/ply-cli-tests/ply
-std_tests=crates/ply-std-tests/ply
+# Each path `ply.work` gives a role, as the job's `ply` reads it.
+work() { "$ply" work "$root" | awk -v r="$1" '$1 == r { print $2 }'; }
 TAB=$'\t'
 # The caches `ply` reads, where the workflow restores them.
 caches=/tmp
@@ -116,12 +116,12 @@ stopped_run() {
 tested() {
   local path=$1 status=0 dir
   shift
-  if [[ $path == "$cli_suite" ]]; then
+  if [[ $path == "$(work cli-tests)" ]]; then
     dir=$(mktemp -d)
     touch "$dir/.ply-scratch"
     (cd "$dir" && bounded "$ply" test "$root/$path" "$@" "${cli_grants[@]}") || status=$?
     rm -rf "$dir"
-  elif [[ $path == "$std_tests" ]]; then
+  elif [[ $path == "$(work std-tests)" ]]; then
     bounded "$ply" test --std "$path" --json "$@" || status=$?
   else
     bounded "$ply" test "$path" --json "$@" || status=$?
@@ -278,12 +278,13 @@ marked() {
   [ -f "$mark" ] || { echo "nothing is marked: run 'ci-ply.sh mark' before the runs" >&2; return 1; }
 }
 
-# Every directory a run keeps a store under, as the workflow's cache steps list them.
+# Every directory a run keeps a store under: each `ply.work` places, but its fixtures.
 store_dirs() {
   local dir
-  for dir in "$root"/crates/*/ply "$root"/examples "$root"/tests/lang; do
-    printf '%s\n' "$dir"
-  done
+  for dir in $(work std) $(work std-tests) $(work compiler) $(work cli) $(work cli-tests) \
+    $(work package) $(work suite); do
+    printf '%s\n' "$root/$dir"
+  done | LC_ALL=C sort -u
 }
 
 # The emitter's answers `ply` wrote or read since the mark, into DIR.
@@ -337,7 +338,7 @@ case "${1:-}" in
       if ((given)); then args+=("$arg"); else args+=(--filter "$arg."); fi
     done
     [ "${#args[@]}" -gt 0 ] || { echo "usage: ci-ply.sh nightly [MODULE...] [ARG...]" >&2; exit 2; }
-    tested "$cli_suite" "${args[@]}" > "$out" || status=$?
+    tested "$(work cli-tests)" "${args[@]}" > "$out" || status=$?
     listed "$out"
     selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
     if [ "$status" -ne 0 ] || [ "$selected" -eq 0 ]; then

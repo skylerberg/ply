@@ -1,0 +1,1800 @@
+//! Operators, comparisons and the per-type operations at a site.
+
+import syntax.parsing (Span, dummy_span, span_key)
+import emit.code (Code, NVar, NUnary, NApp)
+import check.types (Type, TyCon, TyRecord, TyNominal, Field, spelled_type, type_spelled)
+import emit.typing (unknown_type)
+import std.list
+import syntax.exprs (is_arithmetic)
+import syntax.patterns (LStr)
+import std.bytes (ascii_of_int)
+import emit.c (KBool, KBoxed, KDec, KFloat, KInt, KNum, KSum, Kind, Tagged, Zeroed, is_sum, Width,
+               ctype, unsigned_ctype, width_named, width_index, carried, in_imm, width_min,
+               width_max, nth_bytes, bytes_join, int_lit, lit_int, checked_sub, is_bitop, is_shift,
+               bitop_c)
+import emit.roots (equality_root, ordering_root, written_root, generated_builtin, symbol_of)
+import emit.answer (word_head)
+import emit.reps (Ctors, TyBytes, TyOpen, TyRec, FieldTy, Def, Cases, Fields, Whole, raw_slot,
+                  in_place, spelled_field, nth_field, compared_by_ctors, generic_sum, written_sum,
+                  nullary_sum, kind_of, has_vars, carrier_of, carried_types)
+import emit.written (container_defs, local_root)
+import emit.state (CValue, OBool, OChar, ODec, OFloat, OInt, OSum, OText, OWhole, OWidth, OWord,
+                   Operand, spells_whole, unsettled_operator, Emitter, WithValue, line, indent,
+                   outdent, notail, fresh, is_local, refused, note_call, site, check, leaving,
+                   nth_value)
+import emit.scope (tag_of, is_option, tag_text, ctor_index, is_ctor_name, imported_target)
+import emit.values (as_num, bind, word_of, raw_at, held_raw, ctor_built, ctor_laid, ctor_fields,
+                    ctor_width, release_at, owned, as_int, from_table, carrier_at, carried_arg,
+                    carried_value, field_read, as_bool, as_float, as_word, held_item, arg_at,
+                    record_values)
+import emit.calls (called, arith_code, binary_code, is_add_or_sub, def_named, call_target)
+import emit.builtins (in_place_at, builtin_call)
+
+// --- Externs written in place -----------------------------------------------------
+
+/// `rt_overflow`'s numbering of the operation that overflowed; a remainder never leaves its width.
+fn overflow_code(op: Bytes) -> Int =
+  if op == b"add" { 0 }
+  else if op == b"sub" { 1 }
+  else if op == b"neg" { 2 }
+  else if op == b"mul" { 3 }
+  else { 4 }
+
+fn narrow(wide: WithValue, width: Width, code: Int) -> Option<WithValue> = {
+  let g = line(
+    wide.emitter,
+    Bytes::concat_all([
+      b"if (",
+      wide.value.expr,
+      b" < ",
+      int_lit(width_min(width)),
+      b" || ",
+      wide.value.expr,
+      b" > ",
+      int_lit(width_max(width)),
+      b") { rt_overflow_p(ctx, ",
+      ascii_of_int(code),
+      b"); ",
+      leaving(wide.emitter),
+      b" }",
+    ]),
+  );
+  Some(bind(g, KNum(width), Bytes::concat_all([b"(", ctype(KNum(width)), b")", wide.value.expr])))
+}
+
+pub fn negated(emitter: Emitter, value: CValue, t: Operand, span: Span) -> Option<WithValue> =
+  match t {
+    // A width negates wide and narrows back, under the same guard as a subtraction.
+    OWidth(w) -> if in_imm(w) {
+      narrow(
+        bind(
+          site(emitter, span),
+          KInt,
+          Bytes::concat_all([b"-(int64_t)(", as_num(value, w), b")"]),
+        ),
+        w,
+        overflow_code(b"neg"),
+      )
+    } else if carried(w) && w.signed {
+      let a = bind(site(emitter, span), KNum(w), as_num(value, w));
+      let g = line(
+        a.emitter,
+        Bytes::concat_all([
+          b"if (",
+          a.value.expr,
+          b" == INT64_MIN) { rt_overflow_p(ctx, ",
+          ascii_of_int(overflow_code(b"neg")),
+          b"); ",
+          leaving(emitter),
+          b" }",
+        ]),
+      );
+      Some(bind(g, KNum(w), Bytes::concat_all([b"-(", a.value.expr, b")"])))
+    } else { by_runtime(site(emitter, span), b"rt_negate_p", value) },
+    OInt -> {
+      // Negation overflows at one input; the guard runs before the value exists.
+      let a = as_int(value);
+      let g = line(
+        site(emitter, span),
+        Bytes::concat_all([
+          b"if (",
+          a,
+          b" == INT64_MIN) { rt_overflow_p(ctx, ",
+          ascii_of_int(overflow_code(b"neg")),
+          b"); ",
+          leaving(emitter),
+          b" }",
+        ]),
+      );
+      Some(bind(g, KInt, Bytes::concat_all([b"-(", a, b")"])))
+    },
+    OFloat -> Some(bind(emitter, KFloat, Bytes::concat_all([b"-(", as_float(value), b")"]))),
+    ODec -> {
+      let d = held_raw(emitter, value, KDec);
+      let out = fresh(d.emitter);
+      let e = line(
+        out.emitter,
+        Bytes::concat_all([
+          b"PlyDec ",
+          out.name,
+          b"; rt_decimal_negate_p(ctx, ",
+          d.value.expr,
+          b".lo, ",
+          d.value.expr,
+          b".hi, (Word)(intptr_t)&",
+          out.name,
+          b");",
+        ]),
+      );
+      Some({ emitter: e, value: { kind: KDec, expr: out.name, ty: TyOpen([]) } })
+    },
+    _ -> by_runtime(site(emitter, span), b"rt_negate_p", value),
+  }
+
+pub fn inverted(emitter: Emitter, value: CValue, t: Operand) -> Option<WithValue> =
+  match t {
+    OWidth(w) -> if carried(w) {
+      Some(
+        bind(
+          emitter,
+          KNum(w),
+          Bytes::concat_all([b"(", ctype(KNum(w)), b") ~(", as_num(value, w), b")"]),
+        ),
+      )
+    } else { by_runtime(emitter, b"rt_bitnot_p", value) },
+    _ -> Some(bind(emitter, KInt, Bytes::concat_all([b"~(", as_int(value), b")"]))),
+  }
+
+/// A unary operator over the runtime's own word: a `Float`, a `Decimal` or a width past 32 bits.
+fn by_runtime(emitter: Emitter, helper: Bytes, value: CValue) -> Option<WithValue> = {
+  let held = owned(emitter, value);
+  let out = bind(
+    held.emitter,
+    KBoxed,
+    Bytes::concat_all([helper, b"(ctx, ", held.value.expr, b")"]),
+  );
+  Some({ emitter: check(out.emitter), value: out.value })
+}
+
+/// The count is tested against the width (64 for `Int`), and the shift done unsigned where C would leave it undefined.
+fn shift(emitter: Emitter, op: Bytes, l: CValue, r: CValue, width: Option<Width>) -> WithValue = {
+  let bound = match width { Some(t) -> t.bits, None -> 64 };
+  let count = bind(emitter, KInt, as_int(r));
+  let which = match width { Some(t) -> ascii_of_int(width_index(t)), None -> b"-1" };
+  let g = line(
+    count.emitter,
+    Bytes::concat_all([
+      b"if ((uint64_t)",
+      count.value.expr,
+      b" >= (uint64_t)",
+      ascii_of_int(bound),
+      b") { rt_shift_count_p(ctx, ",
+      count.value.expr,
+      b", ",
+      which,
+      b"); ",
+      leaving(emitter),
+      b" }",
+    ]),
+  );
+  match width {
+    Some(t) -> {
+      let a = as_num(l, t);
+      let u = unsigned_ctype(t);
+      bind(g, KNum(t), if op == b"shl" {
+        Bytes::concat_all([b"(", u, b")((", u, b")(", a, b") << ", count.value.expr, b")"])
+      } else if op == b"shr" && t.signed {
+        Bytes::concat_all([b"(", a, b") >> ", count.value.expr])
+      } else {
+        Bytes::concat_all([b"(", u, b")((", u, b")(", a, b") >> ", count.value.expr, b")"])
+      })
+    },
+    None -> {
+      let a = as_int(l);
+      bind(g, KInt, if op == b"shl" {
+        Bytes::concat_all([b"(int64_t)((uint64_t)(", a, b") << ", count.value.expr, b")"])
+      } else if op == b"shr" { Bytes::concat_all([b"(", a, b") >> ", count.value.expr]) }
+      else { Bytes::concat_all([b"(int64_t)((uint64_t)(", a, b") >> ", count.value.expr, b")"]) })
+    },
+  }
+}
+
+/// Arithmetic over a width is done wide and narrowed back under the overflow guard; the rest in the width itself.
+/// At 64 bits there is no wider type: a sum or difference is guarded as it is formed, and the rest is the runtime's.
+fn width_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue, t: Width) -> Option<WithValue> = {
+  let a = as_num(l, t);
+  let bb = as_num(r, t);
+  if is_arithmetic(op) && !in_imm(t) { Some(wide_arithmetic(emitter, op, a, bb, t)) }
+  else if is_arithmetic(op) {
+    let wide = if op == b"add" {
+      bind(emitter, KInt, Bytes::concat_all([b"(int64_t)(", a, b") + (int64_t)(", bb, b")"]))
+    } else if op == b"sub" {
+      bind(emitter, KInt, Bytes::concat_all([b"(int64_t)(", a, b") - (int64_t)(", bb, b")"]))
+    } else {
+      let w = bind(
+        emitter,
+        KInt,
+        Bytes::concat_all([
+          b"rt_arith_p(ctx, ",
+          ascii_of_int(arith_code(op)),
+          b", (int64_t)(",
+          a,
+          b"), (int64_t)(",
+          bb,
+          b"))",
+        ]),
+      );
+      { emitter: check(w.emitter), value: w.value }
+    };
+    narrow(wide, t, overflow_code(op))
+  } else if is_bitop(op) {
+    Some(bind(emitter, KNum(t), Bytes::concat_all([b"(", a, b") ", bitop_c(op), b" (", bb, b")"])))
+  } else if is_shift(op) { Some(shift(emitter, op, l, r, Some(t))) } else if op == b"eq" {
+    Some(bind(emitter, KBool, Bytes::concat_all([b"(", a, b") == (", bb, b")"])))
+  } else if op == b"ne" {
+    Some(bind(emitter, KBool, Bytes::concat_all([b"!((", a, b") == (", bb, b"))"])))
+  } else {
+    match compare_op(op) {
+      Some(c) ->
+        Some(bind(emitter, KBool, Bytes::concat_all([b"(", a, b") ", c, b" (", bb, b")"]))),
+      None -> None,
+    }
+  }
+}
+
+/// `a op b` over a 64-bit width.
+fn wide_arithmetic(emitter: Emitter, op: Bytes, a: Bytes, b: Bytes, t: Width) -> WithValue =
+  if op == b"add" || op == b"sub" {
+    let r = fresh(emitter);
+    let declared = line(r.emitter, Bytes::concat_all([ctype(KNum(t)), b" ", r.name, b";"]));
+    let over = if t.signed {
+      Bytes::concat_all([
+        if op == b"add" { b"ply_add_ov(" } else { b"ply_sub_ov(" },
+        a,
+        b", ",
+        b,
+        b", &",
+        r.name,
+        b")",
+      ])
+    } else {
+      Bytes::concat_all([
+        b"(",
+        r.name,
+        b" = (uint64_t)(",
+        a,
+        if op == b"add" { b") + (uint64_t)(" } else { b") - (uint64_t)(" },
+        b,
+        b"), ",
+        if op == b"add" { Bytes::concat_all([r.name, b" < (uint64_t)(", a, b"))"]) }
+        else { Bytes::concat_all([b"(uint64_t)(", a, b") < (uint64_t)(", b, b"))"]) },
+      ])
+    };
+    let g = line(
+      declared,
+      Bytes::concat_all([
+        b"if (",
+        over,
+        b") { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        leaving(emitter),
+        b" }",
+      ]),
+    );
+    { emitter: g, value: { kind: KNum(t), expr: r.name, ty: TyOpen([]) } }
+  } else {
+    let w = bind(
+      emitter,
+      KNum(t),
+      Bytes::concat_all([
+        b"(",
+        ctype(KNum(t)),
+        b")rt_wide_binary_p(ctx, ",
+        ascii_of_int(binary_code(op)),
+        b", ",
+        ascii_of_int(width_index(t)),
+        b", (Word)(",
+        a,
+        b"), (Word)(",
+        b,
+        b"))",
+      ]),
+    );
+    { emitter: check(w.emitter), value: w.value }
+  }
+
+/// The operand type decides the whole operator, wherever the operands came from.
+pub fn binary_rest(
+  emitter: Emitter,
+  op: Bytes,
+  l: CValue,
+  r: CValue,
+  t: Operand,
+  at: Span,
+) -> Option<WithValue> / {abort.raise} =
+  match t {
+    OInt -> Some(int_binary(emitter, op, l, r)),
+    OWidth(w) -> if carried(w) { width_binary(emitter, op, l, r, w) }
+    else { word_binary(emitter, op, l, r, None, at) },
+    OBool -> if op == b"eq" || op == b"ne" {
+      Some(
+        bind(
+          emitter,
+          KBool,
+          Bytes::concat_all([
+            if op == b"ne" { b"!((" } else { b"((" },
+            as_bool(l),
+            b") == (",
+            as_bool(r),
+            b"))",
+          ]),
+        ),
+      )
+    } else { Some(unsettled_operator(emitter, op)) },
+    OFloat -> float_binary(emitter, op, l, r),
+    ODec -> dec_binary(emitter, op, l, r),
+    // A `Char`'s word is its code point above a tag, so its words compare as its code points do.
+    OChar -> match compare_op(op) {
+      Some(c) ->
+        Some(
+          bind(
+            emitter,
+            KBool,
+            Bytes::concat_all([b"(", as_word(l), b") ", c, b" (", as_word(r), b")"]),
+          ),
+        ),
+      None -> Some(unsettled_operator(emitter, op)),
+    },
+    // Two strings or byte strings are equal as their bytes are, compared where they lie.
+    OText -> if op == b"eq" || op == b"ne" {
+      let a = bind(emitter, KBoxed, as_word(l));
+      let b = bind(a.emitter, KBoxed, as_word(r));
+      let x = a.value.expr;
+      let y = b.value.expr;
+      Some(
+        bind(b.emitter, KBool, if op == b"ne" { b"!".concat(bytes_equal(x, y)) }
+        else { bytes_equal(x, y) }),
+      )
+    } else { word_binary(emitter, op, l, r, None, at) },
+    OSum(t) -> if op == b"eq" || op == b"ne" { Some(sum_equal(emitter, op, l, r, t)) }
+    else { word_binary(emitter, op, l, r, None, at) },
+    OWhole(t) -> if (op == b"eq" || op == b"ne") && (walked_container(t) || is_result(t)) {
+      let o = container_called(emitter, b"equal", t, [l, r], at);
+      Some(if op == b"ne" { not_of(o) } else { o })
+    } else if (op == b"eq" || op == b"ne") && generic_sum(emitter.ctors, t) {
+      Some(sum_equal_by_root(emitter, op, l, r, spelled_type(t)))
+    } else if op == b"eq" || op == b"ne" { word_binary(emitter, op, l, r, Some(t), at) }
+    else { word_binary(emitter, op, l, r, None, at) },
+    OWord -> word_binary(emitter, op, l, r, None, at),
+  }
+
+/// Whether `==` and `compare` of two values of `t` walk them through roots written for `t`: a
+/// `List`, an `Array` or a `Map` whose type is known throughout.
+pub fn walked_container(t: Type) -> Bool =
+  !has_vars(t)
+    && (match t {
+      TyCon(c) -> c.name == b"List" || c.name == b"Array" || c.name == b"Map",
+      _ -> false,
+    })
+
+/// The `Bool` `o` holds, negated.
+fn not_of(o: WithValue) -> WithValue =
+  bind(o.emitter, KBool, Bytes::concat_all([b"!(", as_bool(o.value), b")"]))
+
+/// Whether two `Some`s' payload words `a` and `b`, of type `t` where it is known, are equal: a
+/// string or byte string by its bytes, an `Int` by its value, a `Bool`, a `Char` or `Unit` by its
+/// word, and anything else as the runtime compares two words.
+fn payload_compared(a: Bytes, b: Bytes, t: Option<Type>) -> Bytes =
+  match t {
+    Some(TyCon(c)) -> if c.args.len() > 0 { runtime_equal(a, b) }
+    else if c.name == b"String" || c.name == b"Bytes" { bytes_equal(a, b) }
+    else if c.name == b"Int" {
+      let value = |w: Bytes|
+        Bytes::concat_all([
+          b"(ply_is_imm(",
+          w,
+          b") ? ply_imm_value(",
+          w,
+          b") : rt_unbox_int_p(ctx, ",
+          w,
+          b"))",
+        ]);
+      Bytes::concat_all([b"(", value(a), b" == ", value(b), b")"])
+    } else if c.name == b"Bool" || c.name == b"Char" || c.name == b"Unit" {
+      Bytes::concat_all([b"(", a, b" == ", b, b")"])
+    } else { runtime_equal(a, b) },
+    _ -> runtime_equal(a, b),
+  }
+
+/// Whether `t` is a record whose fields' types are known, compared through the root written for it
+/// where it is held as a word rather than in place.
+fn rooted_record(t: Option<Type>) -> Bool =
+  match t {
+    Some(TyRecord(_)) -> !has_vars(t.unwrap_or(unknown_type())),
+    Some(TyNominal(_)) -> !has_vars(t.unwrap_or(unknown_type())),
+    _ -> false,
+  }
+
+/// The name a sum of type `t` is compared by through `T#eq`: a declared one by its name, a generic
+/// one at known arguments as spelled.
+fn declared_sum(emitter: Emitter, t: Option<Type>) -> Option<Bytes> =
+  match t {
+    Some(TyCon(c)) -> if c.args.len() == 0 && compared_by_ctors(emitter.ctors, c.name) {
+      Some(c.name)
+    } else if generic_sum(emitter.ctors, TyCon(c)) { Some(spelled_type(TyCon(c))) }
+    else { None },
+    _ -> None,
+  }
+
+fn runtime_equal(a: Bytes, b: Bytes) -> Bytes =
+  Bytes::concat_all([b"rt_equal_p(ctx, ", a, b", ", b, b")"])
+
+/// What an `Option` of type `t` holds, where `t` is one.
+fn payload_type(t: Option<Type>) -> Option<Type> =
+  match t { Some(TyCon(c)) -> if c.name == b"Option" { c.args.at(0) } else { None }, _ -> None }
+
+fn is_text(t: Option<Type>) -> Bool =
+  match t {
+    Some(TyCon(c)) -> c.args.len() == 0 && (c.name == b"String" || c.name == b"Bytes"),
+    _ -> false,
+  }
+
+/// The type of field `name` of a record of type `t`.
+fn field_type(t: Option<Type>, name: Bytes) -> Option<Type> =
+  match t {
+    Some(TyRecord(fs)) ->
+      fs.fold(None, |acc: Option<Type>, f: Field| if f.name == name { Some(f.ty) } else { acc }),
+    Some(TyNominal(x)) ->
+      x.fields.fold(None, |acc: Option<Type>, f: Field|
+        if f.name == name { Some(f.ty) } else { acc }),
+    _ -> None,
+  }
+
+/// `t` where it is a container `walked_container` walks.
+fn walked_type(t: Option<Type>) -> Option<Type> =
+  match t { Some(ty) -> if walked_container(ty) { Some(ty) } else { None }, None -> None }
+
+/// Whether two `Option`s held as their payloads' words `a` and `b` are equal: `None` is zero, and
+/// two `Some`s are equal as the root written for their payloads' type `t` compares them.
+fn payloads_equal(
+  emitter: Emitter,
+  a: Bytes,
+  b: Bytes,
+  t: Type,
+  at: Span,
+) -> WithValue / {abort.raise} = {
+  let eq = fresh(emitter);
+  let opened = indent(
+    line(
+      line(
+        eq.emitter,
+        Bytes::concat_all([
+          b"int64_t ",
+          eq.name,
+          b" = (",
+          a,
+          b" == 0 || ",
+          b,
+          b" == 0) ? (",
+          a,
+          b" == ",
+          b,
+          b") : 1;",
+        ]),
+      ),
+      Bytes::concat_all([b"if (", a, b" != 0 && ", b, b" != 0) {"]),
+    ),
+  );
+  let e = container_called(
+    opened,
+    b"equal",
+    t,
+    // Copies the root takes, made only where it runs: the operands stay their holders'.
+    [
+      { kind: KBoxed, expr: Bytes::concat_all([b"(Word)(", a, b")"]), ty: TyOpen([]) },
+      { kind: KBoxed, expr: Bytes::concat_all([b"(Word)(", b, b")"]), ty: TyOpen([]) },
+    ],
+    at,
+  );
+  let closed = line(
+    outdent(
+      release_at(
+        line(e.emitter, Bytes::concat_all([eq.name, b" = ", as_bool(e.value), b";"])),
+        opened.indent,
+      ),
+    ),
+    b"}",
+  );
+  { emitter: closed, value: { kind: KBool, expr: eq.name, ty: TyOpen([]) } }
+}
+
+/// A call of the root written for `op` of containers of type `t`, handed `vals`.
+fn container_called(
+  emitter: Emitter,
+  op: Bytes,
+  t: Type,
+  vals: List<CValue>,
+  at: Span,
+) -> WithValue / {abort.raise} = {
+  let root = written_root(emitter.module, op, t);
+  let d = match container_defs(emitter.module, t).find(|x: Def|
+      x.name == local_root(emitter.module, root)) {
+    Some(x) -> x,
+    None -> panic("a container's root is one of those written for it"),
+  };
+  let target = call_target(emitter, root, Some(d), at, []);
+  let w = range(0, vals.len()).fold(
+    { emitter: target.emitter, names: [] },
+    |acc: { emitter: Emitter, names: List<Bytes> }, i: Int| {
+      let a = carried_arg(
+        notail(acc.emitter),
+        nth_value(vals, i),
+        carrier_at(target.carriers.params, i),
+      );
+      { emitter: a.emitter, names: acc.names.concat(a.names) }
+    },
+  );
+  called(w.emitter, target, at, w.names, vals.len(), false)
+}
+
+/// C's own `double` operators, which round as IEEE-754 does and compare as the evaluator does:
+/// `NaN` is unordered and unequal to itself.
+fn float_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> Option<WithValue> = {
+  let a = as_float(l);
+  let b = as_float(r);
+  let infix = |kind: Kind, c: Bytes|
+    Some(bind(emitter, kind, Bytes::concat_all([b"(", a, b") ", c, b" (", b, b")"])));
+  match compare_op(op) {
+    Some(c) -> infix(KBool, c),
+    None -> if op == b"add" { infix(KFloat, b"+") }
+    else if op == b"sub" { infix(KFloat, b"-") }
+    else if op == b"mul" { infix(KFloat, b"*") }
+    else if op == b"div" { infix(KFloat, b"/") } else if op == b"rem" {
+      Some(
+        bind(
+          emitter,
+          KFloat,
+          Bytes::concat_all([
+            b"ply_f64(rt_float_rem_p(ctx, ply_f64_bits(",
+            a,
+            b"), ply_f64_bits(",
+            b,
+            b")))",
+          ]),
+        ),
+      )
+    } else { Some(unsettled_operator(emitter, op)) },
+  }
+}
+
+/// The runtime's own `Decimal` operators over the two words of each operand, which allocate
+/// nothing: arithmetic writes its answer into a local, and a comparison orders the two as numbers,
+/// equal at any scale that holds the same one.
+fn dec_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> Option<WithValue> = {
+  let a = held_raw(emitter, l, KDec);
+  let b = held_raw(a.emitter, r, KDec);
+  let x = a.value.expr;
+  let y = b.value.expr;
+  let words = Bytes::concat_all([x, b".lo, ", x, b".hi, ", y, b".lo, ", y, b".hi"]);
+  match compare_op(op) {
+    Some(c) ->
+      Some(
+        bind(
+          b.emitter,
+          KBool,
+          Bytes::concat_all([b"(rt_decimal_compare_p(ctx, ", words, b") ", c, b" 0)"]),
+        ),
+      ),
+    None -> if op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem" {
+      let out = fresh(b.emitter);
+      let e = line(
+        out.emitter,
+        Bytes::concat_all([
+          b"PlyDec ",
+          out.name,
+          b"; rt_decimal_binary_p(ctx, ",
+          ascii_of_int(binary_code(op)),
+          b", ",
+          words,
+          b", (Word)(intptr_t)&",
+          out.name,
+          b");",
+        ]),
+      );
+      Some({ emitter: check(e), value: { kind: KDec, expr: out.name, ty: TyOpen([]) } })
+    } else { Some(unsettled_operator(b.emitter, op)) },
+  }
+}
+
+fn int_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> WithValue =
+  if is_shift(op) { shift(emitter, op, l, r, None) } else if is_bitop(op) {
+    bind(
+      emitter,
+      KInt,
+      Bytes::concat_all([b"(", as_int(l), b") ", bitop_c(op), b" (", as_int(r), b")"]),
+    )
+  } else {
+    let a = { kind: KInt, expr: as_int(l), ty: TyOpen([]) };
+    let bb = { kind: KInt, expr: as_int(r), ty: TyOpen([]) };
+    match compare_op(op) {
+      Some(c) ->
+        bind(emitter, KBool, if op == b"ne" {
+          Bytes::concat_all([b"!((", a.expr, b") == (", bb.expr, b"))"])
+        } else { Bytes::concat_all([b"(", a.expr, b") ", c, b" (", bb.expr, b")"]) }),
+      None -> arithmetic(emitter, op, a, bb),
+    }
+  }
+
+/// The tag of the constructor `rhs` builds where `==` or `!=` compares a value of a declared sum
+/// with it and the sum compares as its constructors do: not an `Option` or a `Result`, held as a
+/// word, and not a type whose module states a `key`.
+pub fn compared_ctor(
+  emitter: Emitter,
+  op: Bytes,
+  t: Operand,
+  x: CValue,
+  rhs: Code,
+) -> Option<Int> / {abort.raise} =
+  if (op != b"eq" && op != b"ne") || (!is_word_operand(t) && !is_sum_operand(t))
+      || x.kind != KBoxed { None } else {
+    let named = match rhs.node {
+      NApp(a) -> match a.func.node {
+        NVar(fv) -> if fv.slot == None && is_ctor_name(fv.name) { Some(fv.name) } else { None },
+        _ -> None,
+      },
+      NVar(v) -> if v.slot == None && is_ctor_name(v.name) { Some(v.name) } else { None },
+      _ -> None,
+    };
+    match named {
+      None -> None,
+      Some(name) -> match tag_of(emitter, name) {
+        None -> None,
+        Some(tag) -> if is_option(emitter, tag, b"Some") || is_option(emitter, tag, b"None")
+            || is_option(emitter, tag, b"Ok")
+            || is_option(emitter, tag, b"Err")
+            || (match emitter.ctors.names.at(tag) {
+              Some(n) -> emitter.ctors.keyed.contains(n),
+              None -> true,
+            }) { None }
+        else { Some(tag) },
+      },
+    }
+  }
+
+/// Whether `x`, a word of a declared sum, is constructor `tag` of the arguments `vals`, as `==`
+/// compares two of them: its tag, then each argument where `x` holds its own, compared as the
+/// argument's type compares; the negation for `!=`.
+pub fn ctor_compared(
+  emitter: Emitter,
+  op: Bytes,
+  x: CValue,
+  tag: Int,
+  vals: List<CValue>,
+) -> WithValue / {abort.raise} = {
+  let w = bind(emitter, KBoxed, as_word(x));
+  let xw = w.value.expr;
+  let laid = ctor_fields(w.emitter, tag);
+  let eq = fresh(w.emitter);
+  let opened = line(
+    eq.emitter,
+    Bytes::concat_all([
+      b"int64_t ",
+      eq.name,
+      b" = (",
+      xw,
+      b" != 0 && !ply_is_imm(",
+      xw,
+      b") && ply_obj(",
+      xw,
+      b")->kind == 4 && ply_obj(",
+      xw,
+      b")->layout == ",
+      tag_text(w.emitter, tag),
+      b" && ply_obj(",
+      xw,
+      b")->len == ",
+      ascii_of_int(ctor_width(w.emitter, tag, vals.len())),
+      b");",
+    ]),
+  );
+  let compared = range(0, vals.len()).fold(opened, |acc: Emitter, k: Int| {
+    let v = nth_value(vals, k);
+    // A constructor laid out as words, a generic one's among them, holds every argument as its word.
+    let at = match match laid { Some(fs) -> arg_at(fs, k), None -> None } {
+      Some(a) -> a,
+      None -> { at: k, kind: KBoxed, ty: TyOpen([]) },
+    };
+    let held = if raw_slot(at.kind) {
+      { kind: at.kind, expr: raw_at(xw, ascii_of_int(at.at), at.kind), ty: TyOpen([]) }
+    } else { { kind: KBoxed, expr: field_read(xw, at), ty: at.ty } };
+    let inside = indent(line(acc, Bytes::concat_all([b"if (", eq.name, b") {"])));
+    // A word held is compared at the argument's own kind, unboxed.
+    let compared_at = if laid == None && v.kind != KBoxed && !is_sum(v.kind) { v.kind }
+    else { at.kind };
+    let c = match at.ty {
+      TyRec(inner) -> fields_equal(inside, inner, held, v, None, dummy_span()),
+      _ ->
+        field_equal(
+          inside,
+          { name: b"", kind: compared_at, ty: at.ty },
+          held,
+          v,
+          None,
+          dummy_span(),
+        ),
+    };
+    line(
+      outdent(
+        release_at(
+          line(c.emitter, Bytes::concat_all([eq.name, b" = ", c.value.expr, b";"])),
+          inside.indent,
+        ),
+      ),
+      b"}",
+    )
+  });
+  bind(compared, KBool, if op == b"ne" { Bytes::concat_all([b"!(", eq.name, b")"]) }
+  else { eq.name })
+}
+
+fn is_sum_operand(t: Operand) -> Bool = match t { OSum(_) -> true, _ -> false }
+
+fn is_word_operand(t: Operand) -> Bool = match t { OWord -> true, OWhole(_) -> true, _ -> false }
+
+/// Whether two values of the declared sum `t` are equal: one of no constructor's argument by the
+/// constructor its header names, any other as `T#eq` compares them; the negation for `!=`.
+fn sum_equal(
+  emitter: Emitter,
+  op: Bytes,
+  l: CValue,
+  r: CValue,
+  t: Bytes,
+) -> WithValue / {abort.raise} =
+  if nullary_sum(match emitter.ctors.sums.get(t) { Some(cs) -> cs, None -> [] }) {
+    // Each value is its constructor's object, which its header names.
+    let a = word_of(emitter, l);
+    let b = word_of(a.emitter, r);
+    bind(
+      b.emitter,
+      KBool,
+      Bytes::concat_all([
+        b"(ply_obj(",
+        a.expr,
+        b")->layout ",
+        if op == b"ne" { b"!=" } else { b"==" },
+        b" ply_obj(",
+        b.expr,
+        b")->layout)",
+      ]),
+    )
+  } else { sum_equal_by_root(emitter, op, l, r, t) }
+
+/// As `sum_equal`, through the root `T#eq`, which takes both words and answers a `Bool`'s.
+fn sum_equal_by_root(
+  emitter: Emitter,
+  op: Bytes,
+  l: CValue,
+  r: CValue,
+  t: Bytes,
+) -> WithValue / {abort.raise} = {
+  let full = equality_root(t);
+  let a = owned(emitter, l);
+  let b = owned(a.emitter, r);
+  let noted = {
+    ..note_call(b.emitter, full),
+    generics: {
+      ..b.emitter.generics,
+      expects: b.emitter.generics.expects.push({ callee: full, head: word_head(2) }),
+    },
+  };
+  let e = bind(
+    noted,
+    KInt,
+    Bytes::concat_all([symbol_of(full), b"(ctx, ", a.value.expr, b", ", b.value.expr, b")"]),
+  );
+  bind(
+    check(e.emitter),
+    KBool,
+    Bytes::concat_all([
+      b"(",
+      e.value.expr,
+      if op == b"ne" { b" != " } else { b" == " },
+      b"ply_true)",
+    ]),
+  )
+}
+
+/// What `reflect` or `shown` makes of a value of a type the program fixes, where the program holds
+/// `std.value`: a scalar is its constructor of the value, a width below 64 bits its constructor of
+/// the bits, and a sum or a record what a root answers. The runtime reads every other value.
+pub type Reflection = | RCtor(Bytes) | RUnit | RWidth({ name: Bytes, width: Width }) | RRoot(Type)
+
+/// How the call of `reflect` or `shown` at `at` reflects its argument, at the type the checker
+/// settled it at.
+pub fn reflection_at(emitter: Emitter, at: Span) -> Option<Reflection> =
+  if ctor_index(emitter.ctors.names, b"std.value.VUnit", b"") == None { None } else {
+    match emitter.typed.get(span_key(at)) {
+      None -> None,
+      Some(t) -> match t.args.at(0) {
+        Some(ty) -> if has_vars(ty) { None } else { reflection_of_type(emitter.ctors, ty) },
+        None -> None,
+      },
+    }
+  }
+
+fn reflection_of_type(ctors: Ctors, ty: Type) -> Option<Reflection> =
+  match ty {
+    TyCon(c) -> if written_sum(ctors, c) || walked_container(ty) { Some(RRoot(ty)) }
+    else if ctors.sums.contains(c.name) { None }
+    else if c.args.len() > 0 { None }
+    else if c.name == b"Int" { Some(RCtor(b"std.value.VInt")) }
+    else if c.name == b"Bool" { Some(RCtor(b"std.value.VBool")) }
+    else if c.name == b"Float" { Some(RCtor(b"std.value.VFloat")) }
+    else if c.name == b"Decimal" { Some(RCtor(b"std.value.VDecimal")) }
+    else if c.name == b"Char" { Some(RCtor(b"std.value.VChar")) }
+    else if c.name == b"String" { Some(RCtor(b"std.value.VStr")) }
+    else if c.name == b"Bytes" { Some(RCtor(b"std.value.VBytes")) }
+    else if c.name == b"Unit" { Some(RUnit) } else {
+      // A 64-bit width is the runtime's own object, which says what it is.
+      match width_named(c.name) {
+        Some(w) -> if in_imm(w) { Some(RWidth({ name: c.name, width: w })) } else { None },
+        None -> None,
+      }
+    },
+    TyRecord(_) -> Some(RRoot(ty)),
+    TyNominal(_) -> Some(RRoot(ty)),
+    _ -> None,
+  }
+
+/// `v` reflected as `r` says.
+pub fn reflection_made(
+  emitter: Emitter,
+  shown: Bool,
+  r: Reflection,
+  v: CValue,
+) -> WithValue / {abort.raise} =
+  match r {
+    RCtor(ctor) -> value_ctor(emitter, ctor, [v]),
+    RUnit -> value_ctor(emitter, b"std.value.VUnit", []),
+    // A width's bits with nothing above them: a signed one's `Int` cut to its width.
+    RWidth(w) -> {
+      let int = Bytes::concat_all([b"((int64_t)", as_num(v, w.width), b")"]);
+      let bits = if !w.width.signed { int }
+      else { Bytes::concat_all([b"(", int, b" & ", int_lit((1 << w.width.bits) - 1), b")"]) };
+      let wide = builtin_call(emitter, b"U128::of_int", [
+        { kind: KInt, expr: bits, ty: TyOpen([]) },
+      ]);
+      let name = from_table(wide.emitter, LStr(w.name));
+      value_ctor(name.emitter, b"std.value.VFixed", [name.value, wide.value])
+    },
+    RRoot(ty) -> written_call(emitter, if shown { b"shown" } else { b"reflect" }, ty, v),
+  }
+
+/// What the root that writes `op` of a value of `ty` answers for `v`, which it takes.
+pub fn written_call(emitter: Emitter, op: Bytes, ty: Type, v: CValue) -> WithValue / {abort.raise} = {
+  let root = written_root(emitter.module, op, ty);
+  let taken = Whole(reflected_kind(ty));
+  let a = carried_value(emitter, v, taken);
+  let noted = {
+    ..note_call(a.emitter, root),
+    generics: {
+      ..a.emitter.generics,
+      expects: a.emitter.generics.expects.push({
+        callee: root,
+        head: { answer: b"Word", params: carried_types(taken) },
+      }),
+    },
+  };
+  let e = bind(
+    noted,
+    KBoxed,
+    Bytes::concat_all([symbol_of(root), b"(ctx, ", bytes_join(a.names, b", "), b")"]),
+  );
+  { emitter: check(e.emitter), value: e.value }
+}
+
+/// The constructor `name`, program-wide, of `vals`, which it takes, each held as the constructor
+/// holds that argument.
+fn value_ctor(emitter: Emitter, name: Bytes, vals: List<CValue>) -> WithValue / {abort.raise} =
+  match ctor_index(emitter.ctors.names, name, b"") {
+    None -> refused(emitter, b"a constructor not in the table: ".concat(name)),
+    Some(tag) -> {
+      let laid = ctor_fields(emitter, tag);
+      let held = range(0, vals.len()).fold(
+        { emitter: emitter, words: [], vals: [] },
+        |acc: { emitter: Emitter, words: List<Bytes>, vals: List<CValue> }, i: Int| {
+          let kind = match laid { Some(fs) -> nth_field(fs, i).kind, None -> KBoxed };
+          let h = held_item({ emitter: acc.emitter, value: nth_value(vals, i) }, kind);
+          { emitter: h.emitter, words: acc.words.push(h.word), vals: acc.vals.push(h.val) }
+        },
+      );
+      match laid {
+        Some(fs) -> ctor_laid(held.emitter, tag, fs, held.words, held.vals),
+        None -> if held.words.len() > 0 { ctor_built(held.emitter, tag, held.words) } else {
+          let o = bind(
+            held.emitter,
+            KBoxed,
+            Bytes::concat_all([b"rt_ctor_value_p(ctx, ", tag_text(held.emitter, tag), b")"]),
+          );
+          { emitter: check(o.emitter), value: o.value }
+        },
+      }
+    },
+  }
+
+/// The kind a root written from a type takes a value of `ty` at: the word it crosses a call as, an
+/// `Option` its payload's, a `Result` its tagged word, any other its object.
+pub fn reflected_kind(ty: Type) -> Kind =
+  match carrier_of(ty) {
+    Whole(k) -> if is_sum(k) { k } else { KBoxed },
+    Cases(sc) -> KSum(sc.spec),
+    Fields(_) -> KBoxed,
+  }
+
+/// The type the call of `digest` or of `?encoded` at `at` writes an encoding of through a root:
+/// a record or a declared sum, which the runtime would read by its shape.
+pub fn encoding_at(emitter: Emitter, at: Span) -> Option<Type> =
+  match emitter.typed.get(span_key(at)) {
+    None -> None,
+    Some(t) -> match t.args.at(0) {
+      None -> None,
+      Some(ty) -> if has_vars(ty) { None } else {
+        match ty {
+          TyCon(c) -> if written_sum(emitter.ctors, c) || walked_container(ty) { Some(ty) }
+          else { None },
+          TyRecord(_) -> Some(ty),
+          TyNominal(_) -> Some(ty),
+          _ -> None,
+        }
+      },
+    },
+  }
+
+/// The fields two records compared are laid out by, where both are known and alike.
+fn compared_fields(l: CValue, r: CValue) -> Option<List<FieldTy>> =
+  match l.ty {
+    TyRec(fs) -> match r.ty {
+      TyRec(gs) -> if fs.map(spelled_field) == gs.map(spelled_field) && fs.len() > 0
+          && fs.fold(true, |ok: Bool, f: FieldTy| ok && f.kind != KSum(Tagged)) { Some(fs) }
+      else { None },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+/// Whether the records `l` and `r` of fields `fs` are equal, as the evaluator says: field by field
+/// in the order their names sort, the first unequal one the answer, each compared as its type
+/// compares, a record held in place field by field again. A field the runtime compares can raise.
+fn records_equal(
+  emitter: Emitter,
+  fs: List<FieldTy>,
+  l: CValue,
+  r: CValue,
+  whole: Option<Type>,
+  at: Span,
+) -> WithValue / {abort.raise} = {
+  let lv = record_values(emitter, l, fs);
+  let rv = record_values(lv.emitter, r, fs);
+  let eq = fresh(rv.emitter);
+  let opened = line(eq.emitter, Bytes::concat_all([b"int64_t ", eq.name, b" = 1;"]));
+  let compared = range(0, fs.len()).fold(opened, |acc: Emitter, k: Int| {
+    let f = nth_field(fs, k);
+    let a = nth_value(lv.vals, k);
+    let b = nth_value(rv.vals, k);
+    let inside = indent(line(acc, Bytes::concat_all([b"if (", eq.name, b") {"])));
+    let c = match in_place(f) {
+      Some(inner) -> fields_equal(inside, inner, a, b, field_type(whole, f.name), at),
+      None -> field_equal(inside, f, a, b, field_type(whole, f.name), at),
+    };
+    line(
+      outdent(
+        release_at(
+          line(c.emitter, Bytes::concat_all([eq.name, b" = ", c.value.expr, b";"])),
+          inside.indent,
+        ),
+      ),
+      b"}",
+    )
+  });
+  { emitter: compared, value: { kind: KBool, expr: eq.name, ty: TyOpen([]) } }
+}
+
+/// As `records_equal`, a record a record holds in place being compared as its word.
+fn fields_equal(
+  emitter: Emitter,
+  fs: List<FieldTy>,
+  l: CValue,
+  r: CValue,
+  whole: Option<Type>,
+  at: Span,
+) -> WithValue / {abort.raise} = {
+  let lv = record_values(emitter, l, fs);
+  let rv = record_values(lv.emitter, r, fs);
+  let eq = fresh(rv.emitter);
+  let opened = line(eq.emitter, Bytes::concat_all([b"int64_t ", eq.name, b" = 1;"]));
+  let compared = range(0, fs.len()).fold(opened, |acc: Emitter, k: Int| {
+    let inside = indent(line(acc, Bytes::concat_all([b"if (", eq.name, b") {"])));
+    let f = nth_field(fs, k);
+    let c = field_equal(
+      inside,
+      f,
+      nth_value(lv.vals, k),
+      nth_value(rv.vals, k),
+      field_type(whole, f.name),
+      at,
+    );
+    line(
+      outdent(
+        release_at(
+          line(c.emitter, Bytes::concat_all([eq.name, b" = ", c.value.expr, b";"])),
+          inside.indent,
+        ),
+      ),
+      b"}",
+    )
+  });
+  { emitter: compared, value: { kind: KBool, expr: eq.name, ty: TyOpen([]) } }
+}
+
+/// Whether two values of field `f` are equal, as `records_equal` compares them: a container of
+/// type `ply` through the prelude.
+fn field_equal(
+  emitter: Emitter,
+  f: FieldTy,
+  a: CValue,
+  b: CValue,
+  ply: Option<Type>,
+  at: Span,
+) -> WithValue / {abort.raise} =
+  match f.kind {
+    KFloat ->
+      bind(emitter, KBool, Bytes::concat_all([b"(", as_float(a), b" == ", as_float(b), b")"])),
+    KDec -> {
+      let x = held_raw(emitter, a, KDec);
+      let y = held_raw(x.emitter, b, KDec);
+      bind(
+        y.emitter,
+        KBool,
+        Bytes::concat_all([
+          b"(rt_decimal_compare_p(ctx, ",
+          x.value.expr,
+          b".lo, ",
+          x.value.expr,
+          b".hi, ",
+          y.value.expr,
+          b".lo, ",
+          y.value.expr,
+          b".hi) == 0)",
+        ]),
+      )
+    },
+    KInt -> bind(emitter, KBool, Bytes::concat_all([b"(", as_int(a), b" == ", as_int(b), b")"])),
+    KBool -> bind(emitter, KBool, Bytes::concat_all([b"(", as_bool(a), b" == ", as_bool(b), b")"])),
+    KNum(w) ->
+      bind(emitter, KBool, Bytes::concat_all([b"(", as_num(a, w), b" == ", as_num(b, w), b")"])),
+    // An `Option` as its payload's word: `None` is zero, two `Some`s equal as their payloads are.
+    KSum(Zeroed) -> match walked_type(payload_type(ply)) {
+      Some(t) -> payloads_equal(emitter, a.expr, b.expr, t, at),
+      None -> {
+        let e = bind(
+          emitter,
+          KBool,
+          Bytes::concat_all([
+            b"((",
+            a.expr,
+            b" == 0 || ",
+            b.expr,
+            b" == 0) ? (",
+            a.expr,
+            b" == ",
+            b.expr,
+            b") : ",
+            payload_compared(a.expr, b.expr, payload_type(ply)),
+            b")",
+          ]),
+        );
+        { emitter: check(e.emitter), value: e.value }
+      },
+    },
+    // Byte strings are equal as their bytes are, a container of known type as its type compares,
+    // and anything else as the runtime compares its word.
+    _ -> if a.ty == TyBytes || b.ty == TyBytes || is_text(ply) {
+      bind(emitter, KBool, bytes_equal(as_word(a), as_word(b)))
+    } else if walked_type(ply) != None || rooted_record(ply)
+        || is_result(ply.unwrap_or(unknown_type())) {
+      container_called(
+        emitter,
+        b"equal",
+        match ply { Some(t) -> t, None -> unknown_type() },
+        [a, b],
+        at,
+      )
+    } else if declared_sum(emitter, ply) != None {
+      sum_equal_by_root(emitter, b"eq", a, b, declared_sum(emitter, ply).unwrap_or(b""))
+    } else {
+      let x = word_of(emitter, a);
+      let y = word_of(x.emitter, b);
+      let e = bind(
+        y.emitter,
+        KBool,
+        Bytes::concat_all([b"rt_equal_p(ctx, ", x.expr, b", ", y.expr, b")"]),
+      );
+      { emitter: check(e.emitter), value: e.value }
+    },
+  }
+
+/// How `compare` orders two values in C: a type one ordered by its name, a record field by field in
+/// the order its names sort, each field of such a type, or a container through the roots written
+/// for its type.
+type Ordered =
+  | ONamed(Bytes)
+  | OFields({ fields: List<FieldTy>, names: List<Bytes> })
+  | OWalked(Type)
+
+/// How `compare` orders two values of the type the checker settled its reference at `at` at, where
+/// C orders them: a number, a character, a string or byte string by its bytes, a sum a module
+/// declares, which its `T#cmp` root orders, or a record of such fields.
+pub fn ordered_at(emitter: Emitter, at: Span) -> Option<Ordered> =
+  match emitter.typed.get(span_key(at)) {
+    Some(t) -> match t.args.at(0) {
+      Some(ty) -> match ordered_name(emitter, ty) {
+        Some(n) -> Some(ONamed(n)),
+        None -> match ty {
+          TyRecord(fs) -> fields_ordered(emitter, ty, fs),
+          TyNominal(x) -> fields_ordered(emitter, ty, x.fields),
+          _ -> if walked_container(ty) || ordered_option(ty) { Some(OWalked(ty)) } else { None },
+        },
+      },
+      None -> None,
+    },
+    None -> None,
+  }
+
+/// Whether `t` is an `Option` of a type known throughout, which a root written for it orders:
+/// `None` first, then two `Some`s as their payloads order; or a `Result`, as `is_result` says.
+fn ordered_option(t: Type) -> Bool =
+  !has_vars(t)
+    && (match t {
+      TyCon(c) -> (c.name == b"Option" && c.args.len() == 1) || is_result(t),
+      _ -> false,
+    })
+
+/// Whether `t` is a `Result` known throughout, which roots written for it compare and order: an
+/// `Err` before an `Ok`, then two of one constructor as their arguments do.
+fn is_result(t: Type) -> Bool =
+  !has_vars(t) && (match t { TyCon(c) -> c.name == b"Result" && c.args.len() == 2, _ -> false })
+
+/// Whether `t` is a record known throughout whose fields C orders, as a field of a record it orders.
+fn ordered_record(emitter: Emitter, t: Type) -> Bool =
+  rooted_record(Some(t)) && ordered_fields_of(emitter, t) != None
+
+/// A record of type `ty`, of fields `fs`, ordered field by field, where each field's type orders by
+/// its name or is a container, an `Option`, a `Result` or such a record, named by its spelled type,
+/// which the roots written for it order.
+fn fields_ordered(emitter: Emitter, ty: Type, fs: List<Field>) -> Option<Ordered> =
+  match kind_of(ty).ty {
+    TyRec(laid) -> {
+      let names = fs.map(|f: Field|
+        match ordered_name(emitter, f.ty) {
+          Some(n) -> n,
+          None -> if walked_container(f.ty) || ordered_option(f.ty)
+              || ordered_record(emitter, f.ty) { spelled_type(f.ty) }
+          else { b"" },
+        });
+      if laid.len() == fs.len() && laid.len() > 0 && !names.contains(b"") {
+        Some(OFields({ fields: laid, names: names }))
+      } else { None }
+    },
+    _ -> None,
+  }
+
+/// The name a type C orders goes by: a number, a character, a string or byte string, or a sum a
+/// module declares.
+fn ordered_name(emitter: Emitter, ty: Type) -> Option<Bytes> =
+  match ty {
+    TyCon(c) -> if generic_sum(emitter.ctors, ty) { Some(spelled_type(ty)) }
+    else if c.args.len() > 0 { None }
+    else if c.name == b"Int" || c.name == b"Char" || c.name == b"Decimal" || c.name == b"String"
+        || c.name == b"Bytes"
+        || c.name == b"Bool"
+        || c.name == b"Unit" { Some(c.name) }
+    else if c.name.index_of(b".") != None && compared_by_ctors(emitter.ctors, c.name) {
+      Some(c.name)
+    } else {
+      match width_named(c.name) {
+        Some(w) -> if carried(w) { Some(c.name) } else { None },
+        None -> None,
+      }
+    },
+    _ -> None,
+  }
+
+/// The `Ordering` of `a` and `b`, values of a type `t` says C orders, as the evaluator orders them:
+/// a `Decimal` by its value, a string by its bytes, a record field by field; the constructor's own
+/// word, which no count holds.
+pub fn compared_order(
+  emitter: Emitter,
+  t: Option<Ordered>,
+  a: CValue,
+  b: CValue,
+  at: Span,
+) -> WithValue / {abort.raise} =
+  match t {
+    Some(ONamed(n)) -> if n.index_of(b".") != None { sum_ordered(emitter, a, b, n) }
+    else { ordering_word(order_of(emitter, n, a, b)) },
+    Some(OFields(r)) -> ordering_word(record_order(emitter, r.fields, r.names, a, b)),
+    Some(OWalked(t)) -> container_called(emitter, b"ordered", t, [a, b], at),
+    None -> refused(emitter, b"an order of a type C does not order"),
+  }
+
+/// The constructor of `Ordering` that `o`, below zero, zero or above it, names, as its word.
+fn ordering_word(o: { emitter: Emitter, expr: Bytes }) -> WithValue / {abort.raise} = {
+  let tag = |ctor: Bytes|
+    match tag_of(o.emitter, ctor) { Some(i) -> tag_text(o.emitter, i), None -> b"0" };
+  bind(
+    o.emitter,
+    KBoxed,
+    Bytes::concat_all([
+      b"rt_ctor_value_p(ctx, ",
+      o.expr,
+      b" < 0 ? ",
+      tag(b"Less"),
+      b" : ",
+      o.expr,
+      b" == 0 ? ",
+      tag(b"Equal"),
+      b" : ",
+      tag(b"Greater"),
+      b")",
+    ]),
+  )
+}
+
+/// The C relation to zero of an order that `c`, a constructor of `Ordering`, names.
+fn ordering_relation(emitter: Emitter, c: Code) -> Option<Bytes> =
+  match c.node {
+    NVar(v) -> if v.slot != None { None } else {
+      match tag_of(emitter, v.name) {
+        None -> None,
+        Some(t) -> if Some(t) == tag_of(emitter, b"Less") { Some(b"<") }
+        else if Some(t) == tag_of(emitter, b"Equal") { Some(b"==") }
+        else if Some(t) == tag_of(emitter, b"Greater") { Some(b">") }
+        else { None },
+      }
+    },
+    _ -> None,
+  }
+
+/// The builtin a call of `func` reaches: a name nothing this module defines or imports a
+/// definition of.
+fn builtin_callee(emitter: Emitter, func: Code) -> Option<Bytes> / {abort.raise} =
+  match func.node {
+    NVar(fv) -> if fv.slot != None || is_ctor_name(fv.name) || in_place_at(emitter, fv.name) != None
+        || emitter.here.fold(false, |acc: Bool, h: Def| acc || h.name == fv.name) { None } else {
+      match imported_target(emitter.imports, fv.name) {
+        None -> Some(generated_builtin(fv.name)),
+        Some(t) -> match def_named(t.imp.defs, t.name) {
+          Some(_) -> None,
+          None -> if emitter.builtins.fold(false, |acc: Bool, b2: Bytes| acc || b2 == t.name) {
+            Some(generated_builtin(t.name))
+          } else { None },
+        },
+      }
+    },
+    _ -> None,
+  }
+
+/// Where `lhs == rhs`, or `!=`, tests `compare(x, y)` against a constructor of `Ordering` at a type
+/// C orders without a root's constructor: the C relation to zero the constructor is, and how the
+/// type orders.
+pub fn sign_test(
+  emitter: Emitter,
+  op: Bytes,
+  lhs: Code,
+  rhs: Code,
+) -> Option<{ rel: Bytes, t: Ordered }> / {abort.raise} =
+  if op != b"eq" && op != b"ne" { None } else {
+    match ordering_relation(emitter, rhs) {
+      None -> None,
+      Some(rel) -> match lhs.node {
+        NApp(a) -> if a.args.len() != 2 { None } else {
+          match builtin_callee(emitter, a.func) {
+            None -> None,
+            Some(name) -> if name != b"compare" && name != b"compare_values" { None } else {
+              match ordered_at(emitter, a.func.span) {
+                Some(OWalked(_)) -> None,
+                Some(t) -> Some({ rel: rel, t: t }),
+                None -> None,
+              }
+            },
+          }
+        },
+        _ -> None,
+      },
+    }
+  }
+
+/// `compare(a, b)` tested against a constructor of `Ordering` as `sign_test` reads `lhs op rhs`:
+/// the sign of their order, with no constructor made.
+pub fn sign_tested(
+  emitter: Emitter,
+  op: Bytes,
+  lhs: Code,
+  rhs: Code,
+  a: CValue,
+  b: CValue,
+) -> Option<WithValue> / {abort.raise} =
+  match sign_test(emitter, op, lhs, rhs) {
+    None -> None,
+    Some(s) -> {
+      let signed = |o: { emitter: Emitter, expr: Bytes }| {
+        let held = Bytes::concat_all([b"((", o.expr, b") ", s.rel, b" 0)"]);
+        bind(o.emitter, KBool, if op == b"ne" { Bytes::concat_all([b"!", held]) } else { held })
+      };
+      match s.t {
+        OFields(r) -> Some(signed(record_order(emitter, r.fields, r.names, a, b))),
+        ONamed(n) -> Some(signed(order_of(emitter, n, a, b))),
+        OWalked(_) -> None,
+      }
+    },
+  }
+
+/// Below zero, zero or above zero as `a` and `b`, values of the type `name` C orders, order: a sum
+/// a module declares as its root answers.
+fn order_of(
+  emitter: Emitter,
+  name: Bytes,
+  a: CValue,
+  b: CValue,
+) -> { emitter: Emitter, expr: Bytes } / {abort.raise} =
+  if name.index_of(b".") != None || spells_whole(name) {
+    // A container's spelled type orders through its root, a sum's name through `T#cmp`.
+    let w = match if spells_whole(name) { type_spelled(name) } else { None } {
+      Some(t) -> if walked_container(t) || ordered_option(t) {
+        container_called(emitter, b"ordered", t, [a, b], dummy_span())
+      } else { sum_ordered(emitter, a, b, name) },
+      None -> sum_ordered(emitter, a, b, name),
+    };
+    let tag = |ctor: Bytes|
+      match tag_of(w.emitter, ctor) { Some(i) -> tag_text(w.emitter, i), None -> b"0" };
+    let o = bind(
+      w.emitter,
+      KInt,
+      Bytes::concat_all([
+        b"(ply_obj(",
+        w.value.expr,
+        b")->layout == ",
+        tag(b"Less"),
+        b" ? -1 : ply_obj(",
+        w.value.expr,
+        b")->layout == ",
+        tag(b"Equal"),
+        b" ? 0 : 1)",
+      ]),
+    );
+    { emitter: o.emitter, expr: o.value.expr }
+  } else if name == b"String" || name == b"Bytes" {
+    let x = bind(emitter, KBoxed, as_word(a));
+    let y = bind(x.emitter, KBoxed, as_word(b));
+    bytes_order(y.emitter, x.value.expr, y.value.expr)
+  } else if name == b"Decimal" {
+    let x = held_raw(emitter, a, KDec);
+    let y = held_raw(x.emitter, b, KDec);
+    let c = bind(
+      y.emitter,
+      KInt,
+      Bytes::concat_all([
+        b"rt_decimal_compare_p(ctx, ",
+        x.value.expr,
+        b".lo, ",
+        x.value.expr,
+        b".hi, ",
+        y.value.expr,
+        b".lo, ",
+        y.value.expr,
+        b".hi)",
+      ]),
+    );
+    { emitter: c.emitter, expr: c.value.expr }
+  } else if name == b"Char" { signed_order(emitter, as_word(a), as_word(b)) }
+  else if name == b"Int" { signed_order(emitter, as_int(a), as_int(b)) }
+  else if name == b"Bool" { signed_order(emitter, as_bool(a), as_bool(b)) }
+  else if name == b"Unit" { { emitter: emitter, expr: b"0" } } else {
+    match width_named(name) {
+      Some(w) -> signed_order(emitter, as_num(a, w), as_num(b, w)),
+      None -> signed_order(emitter, as_int(a), as_int(b)),
+    }
+  }
+
+/// The names the fields of the record type `t` order by, where C orders each.
+fn ordered_fields_of(emitter: Emitter, t: Type) -> Option<List<Bytes>> =
+  match match t {
+      TyRecord(fs) -> fields_ordered(emitter, t, fs),
+      TyNominal(x) -> fields_ordered(emitter, t, x.fields),
+      _ -> None,
+    } {
+    Some(OFields(r)) -> Some(r.names),
+    _ -> None,
+  }
+
+/// Below zero, zero or above zero as the records `a` and `b` order: by their fields in the order
+/// their names sort, the first that orders them apart deciding; a record held in place in turn.
+fn record_order(
+  emitter: Emitter,
+  fields: List<FieldTy>,
+  names: List<Bytes>,
+  a: CValue,
+  b: CValue,
+) -> { emitter: Emitter, expr: Bytes } / {abort.raise} = {
+  let lv = record_values(emitter, a, fields);
+  let rv = record_values(lv.emitter, b, fields);
+  let o = fresh(rv.emitter);
+  let opened = line(o.emitter, Bytes::concat_all([b"int64_t ", o.name, b" = 0;"]));
+  let ordered = fields.fold(
+    { emitter: opened, k: 0 },
+    |acc: { emitter: Emitter, k: Int }, field: FieldTy| {
+      let k = acc.k;
+      let inside = indent(line(acc.emitter, Bytes::concat_all([b"if (", o.name, b" == 0) {"])));
+      let name = nth_bytes(names, k);
+      let x = nth_value(lv.vals, k);
+      let y = nth_value(rv.vals, k);
+      // A record held in place is ordered field by field where it is, not through its root.
+      let f = match field.ty {
+        TyRec(inner) -> match match type_spelled(name) {
+            Some(t) -> ordered_fields_of(inside, t),
+            None -> None,
+          } {
+          Some(inner_names) -> record_order(inside, inner, inner_names, x, y),
+          None -> order_of(inside, name, x, y),
+        },
+        _ -> order_of(inside, name, x, y),
+      };
+      {
+        emitter: line(
+          outdent(
+            release_at(
+              line(f.emitter, Bytes::concat_all([o.name, b" = ", f.expr, b";"])),
+              inside.indent,
+            ),
+          ),
+          b"}",
+        ),
+        k: k + 1,
+      }
+    },
+  );
+  { emitter: ordered.emitter, expr: o.name }
+}
+
+/// The `Ordering` of `l` and `r`, values of the declared sum `t`, as `T#cmp` orders them: the root
+/// takes both words and answers the constructor's.
+fn sum_ordered(emitter: Emitter, l: CValue, r: CValue, t: Bytes) -> WithValue / {abort.raise} = {
+  let full = ordering_root(t);
+  let a = owned(emitter, l);
+  let b = owned(a.emitter, r);
+  let noted = {
+    ..note_call(b.emitter, full),
+    generics: {
+      ..b.emitter.generics,
+      expects: b.emitter.generics.expects.push({ callee: full, head: word_head(2) }),
+    },
+  };
+  let e = bind(
+    noted,
+    KBoxed,
+    Bytes::concat_all([symbol_of(full), b"(ctx, ", a.value.expr, b", ", b.value.expr, b")"]),
+  );
+  { emitter: check(e.emitter), value: e.value }
+}
+
+/// A local holding below zero, zero or above zero as `x` and `y`, C values of one ordered type,
+/// order.
+fn signed_order(emitter: Emitter, x: Bytes, y: Bytes) -> { emitter: Emitter, expr: Bytes } = {
+  let o = bind(
+    emitter,
+    KInt,
+    Bytes::concat_all([b"(int64_t)((", x, b") > (", y, b")) - (int64_t)((", x, b") < (", y, b"))"]),
+  );
+  { emitter: o.emitter, expr: o.value.expr }
+}
+
+/// A local holding below zero, zero or above zero as the strings or byte strings `x` and `y`
+/// order: by their bytes from the first, and where one begins the other, by their lengths.
+fn bytes_order(emitter: Emitter, x: Bytes, y: Bytes) -> { emitter: Emitter, expr: Bytes } = {
+  let lx = bind(emitter, KInt, Bytes::concat_all([b"(int64_t)ply_obj(", x, b")->len"]));
+  let ly = bind(lx.emitter, KInt, Bytes::concat_all([b"(int64_t)ply_obj(", y, b")->len"]));
+  let a = lx.value.expr;
+  let b = ly.value.expr;
+  let o = bind(
+    ly.emitter,
+    KInt,
+    Bytes::concat_all([
+      b"(int64_t)memcmp(ply_bytes(",
+      x,
+      b"), ply_bytes(",
+      y,
+      b"), (size_t)(",
+      a,
+      b" < ",
+      b,
+      b" ? ",
+      a,
+      b" : ",
+      b,
+      b"))",
+    ]),
+  );
+  {
+    emitter: line(
+      o.emitter,
+      Bytes::concat_all([
+        b"if (",
+        o.value.expr,
+        b" == 0) ",
+        o.value.expr,
+        b" = (",
+        a,
+        b" > ",
+        b,
+        b") - (",
+        a,
+        b" < ",
+        b,
+        b");",
+      ]),
+    ),
+    expr: o.value.expr,
+  }
+}
+
+/// Whether the strings or byte strings `x` and `y` hold the same bytes, read where they lie.
+pub fn bytes_equal(x: Bytes, y: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"(",
+    x,
+    b" == ",
+    y,
+    b" || (ply_obj(",
+    x,
+    b")->len == ply_obj(",
+    y,
+    b")->len && memcmp(ply_bytes(",
+    x,
+    b"), ply_bytes(",
+    y,
+    b"), ply_obj(",
+    x,
+    b")->len) == 0))",
+  ])
+
+/// Equality is structural, and every other operator is the runtime's own over the words, which a
+/// width past 32 bits, a `Float` and a `Decimal` are.
+/// `whole` is the type both are of where the checker spelled it, which says how a container a
+/// record or an `Option` holds is compared.
+fn word_binary(
+  emitter: Emitter,
+  op: Bytes,
+  l: CValue,
+  r: CValue,
+  whole: Option<Type>,
+  at: Span,
+) -> Option<WithValue> / {abort.raise} =
+  if (op == b"eq" || op == b"ne") && l.kind == KSum(Zeroed) && r.kind == KSum(Zeroed)
+      && compared_fields(l, r) != None {
+    // Two `Option`s of a record of known layout: `None` is zero, two `Some`s equal as their
+    // records are, field by field.
+    let lb = if is_local(l.expr) { { emitter: emitter, value: l } }
+    else { bind(emitter, l.kind, l.expr) };
+    let rb = if is_local(r.expr) { { emitter: lb.emitter, value: r } }
+    else { bind(lb.emitter, r.kind, r.expr) };
+    let a = lb.value.expr;
+    let b = rb.value.expr;
+    let eq = fresh(rb.emitter);
+    let opened = indent(
+      line(
+        line(
+          eq.emitter,
+          Bytes::concat_all([
+            b"int64_t ",
+            eq.name,
+            b" = (",
+            a,
+            b" == 0 || ",
+            b,
+            b" == 0) ? (",
+            a,
+            b" == ",
+            b,
+            b") : 1;",
+          ]),
+        ),
+        Bytes::concat_all([b"if (", a, b" != 0 && ", b, b" != 0) {"]),
+      ),
+    );
+    let fs = match compared_fields(l, r) { Some(x) -> x, None -> [] };
+    let e = records_equal(
+      opened,
+      fs,
+      { kind: KBoxed, expr: a, ty: l.ty },
+      { kind: KBoxed, expr: b, ty: r.ty },
+      payload_type(whole),
+      at,
+    );
+    let closed = line(
+      outdent(
+        release_at(
+          line(e.emitter, Bytes::concat_all([eq.name, b" = ", e.value.expr, b";"])),
+          opened.indent,
+        ),
+      ),
+      b"}",
+    );
+    Some(
+      bind(closed, KBool, if op == b"ne" { Bytes::concat_all([b"!(", eq.name, b")"]) }
+      else { eq.name }),
+    )
+  } else if (op == b"eq" || op == b"ne") && l.kind == KSum(Zeroed) && r.kind == KSum(Zeroed) {
+    // Two `Option`s as their payloads' words: `None` is zero, and two `Some`s are equal where their
+    // payloads are.
+    let lb = if is_local(l.expr) { { emitter: emitter, value: l } }
+    else { bind(emitter, l.kind, l.expr) };
+    let rb = if is_local(r.expr) { { emitter: lb.emitter, value: r } }
+    else { bind(lb.emitter, r.kind, r.expr) };
+    let a = lb.value.expr;
+    let b = rb.value.expr;
+    match walked_type(payload_type(whole)) {
+      Some(t) -> {
+        let e = payloads_equal(rb.emitter, a, b, t, at);
+        Some(if op == b"ne" { not_of(e) } else { e })
+      },
+      None -> {
+        let e = bind(
+          rb.emitter,
+          KBool,
+          Bytes::concat_all([
+            b"((",
+            a,
+            b" == 0 || ",
+            b,
+            b" == 0) ? (",
+            a,
+            b" == ",
+            b,
+            b") : ",
+            payload_compared(a, b, payload_type(whole)),
+            b")",
+          ]),
+        );
+        Some(
+          bind(check(e.emitter), KBool, if op == b"ne" {
+            Bytes::concat_all([b"!(", e.value.expr, b")"])
+          } else { e.value.expr }),
+        )
+      },
+    }
+  } else if (op == b"eq" || op == b"ne") && compared_fields(l, r) != None {
+    match compared_fields(l, r) {
+      Some(fs) -> {
+        let e = records_equal(emitter, fs, l, r, whole, at);
+        Some(
+          bind(e.emitter, KBool, if op == b"ne" { Bytes::concat_all([b"!(", e.value.expr, b")"]) }
+          else { e.value.expr }),
+        )
+      },
+      None -> None,
+    }
+  } else if op == b"eq" || op == b"ne" {
+    // Under release both are handed over as held, and a temporary among them is released at its scope's end.
+    let lo = if emitter.release {
+      let w = word_of(emitter, l);
+      { emitter: w.emitter, value: { kind: KBoxed, expr: w.expr, ty: l.ty } }
+    } else { owned(emitter, l) };
+    let ro = if lo.emitter.release {
+      let w = word_of(lo.emitter, r);
+      { emitter: w.emitter, value: { kind: KBoxed, expr: w.expr, ty: r.ty } }
+    } else { owned(lo.emitter, r) };
+    let e = bind(
+      ro.emitter,
+      KBool,
+      Bytes::concat_all([b"rt_equal_p(ctx, ", lo.value.expr, b", ", ro.value.expr, b")"]),
+    );
+    // For `!=` the answer's binding is the negation.
+    Some(
+      bind(check(e.emitter), KBool, if op == b"ne" {
+        Bytes::concat_all([b"!(", e.value.expr, b")"])
+      } else { e.value.expr }),
+    )
+  } else {
+    let lo = owned(emitter, l);
+    let ro = owned(lo.emitter, r);
+    let o = bind(
+      ro.emitter,
+      KBoxed,
+      Bytes::concat_all([
+        b"rt_binary_p(ctx, ",
+        ascii_of_int(binary_code(op)),
+        b", ",
+        lo.value.expr,
+        b", ",
+        ro.value.expr,
+        b")",
+      ]),
+    );
+    Some({ emitter: check(o.emitter), value: o.value })
+  }
+
+/// The six orderings compile to C's own on untagged integers: an `Int` comparison cannot raise.
+pub fn compare_op(op: Bytes) -> Option<Bytes> =
+  if op == b"lt" { Some(b"<") }
+  else if op == b"le" { Some(b"<=") }
+  else if op == b"gt" { Some(b">") }
+  else if op == b"ge" { Some(b">=") }
+  else if op == b"eq" { Some(b"==") }
+  else if op == b"ne" { Some(b"!=") }
+  else { None }
+
+/// The literal an `Int` is divided by, or its remainder taken by, where that can neither raise nor
+/// overflow: anything but zero and minus one.
+pub fn by_literal(t: Operand, op: Bytes, rhs: Code) -> Option<Int> =
+  match t {
+    OInt -> if op != b"div" && op != b"rem" { None } else {
+      let d = match rhs.node {
+        NUnary(u) -> if u.op != b"neg" { None }
+        else { match lit_int(u.operand) { Some(v) -> checked_sub(0, v), None -> None } },
+        _ -> lit_int(rhs),
+      };
+      match d { Some(x) -> if x == 0 || x == 0 - 1 { None } else { Some(x) }, None -> None }
+    },
+    _ -> None,
+  }
+
+/// `l` divided by `d`, or its remainder by `d`, as `by_literal` allows: C's own operator, which
+/// truncates as the language does.
+pub fn quotient(emitter: Emitter, op: Bytes, l: CValue, d: Int) -> WithValue =
+  bind(
+    emitter,
+    KInt,
+    Bytes::concat_all([b"(", as_int(l), if op == b"div" { b") / " } else { b") % " }, int_lit(d)]),
+  )
+
+/// Addition and subtraction are overflow-checked in the C; the rest go through `rt_arith`, which raises on a zero divisor.
+fn arithmetic(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> WithValue =
+  if is_add_or_sub(op) {
+    let f = fresh(emitter);
+    let e1 = line(f.emitter, Bytes::concat_all([b"int64_t ", f.name, b";"]));
+    let e2 = line(
+      e1,
+      Bytes::concat_all([
+        b"if (ply_",
+        op,
+        b"_ov(",
+        l.expr,
+        b", ",
+        r.expr,
+        b", &",
+        f.name,
+        b")) { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        leaving(emitter),
+        b" }",
+      ]),
+    );
+    { emitter: e2, value: { kind: KInt, expr: f.name, ty: TyOpen([]) } }
+  } else {
+    let o = bind(
+      emitter,
+      KInt,
+      Bytes::concat_all([
+        b"rt_arith_p(ctx, ",
+        ascii_of_int(arith_code(op)),
+        b", ",
+        l.expr,
+        b", ",
+        r.expr,
+        b")",
+      ]),
+    );
+    { emitter: check(o.emitter), value: o.value }
+  }

@@ -2,11 +2,11 @@
 //! tests, beside the TLS code that loads the ones a run is given.
 
 use crate::tls;
-use ply_eval::host::{
+use ply_core::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     Linearity,
 };
-use ply_eval::{Diagnostic, Symbol, Value, codes};
+use ply_core::{Diagnostic, Symbol, Value, codes};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -89,7 +89,7 @@ struct Operation {
 impl HostHandler for Operation {
     fn call(
         &self,
-        _: &dyn ply_eval::host::HostRuntime,
+        _: &dyn ply_core::host::HostRuntime,
         req: &HostRequest<'_>,
     ) -> Result<HostAnswer, Diagnostic> {
         if req.args.len() != self.op.arity() {
@@ -108,7 +108,7 @@ impl HostHandler for Operation {
 }
 
 #[cold]
-fn arity(op: Op, got: usize, span: ply_eval::Span) -> Diagnostic {
+fn arity(op: Op, got: usize, span: ply_core::Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!(

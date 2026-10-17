@@ -1,8 +1,8 @@
 //! The production task scheduler's half of the boundary.
 
-use ply_eval::host::HostRegistry;
-use ply_eval::sim::TASK_OPS;
-use ply_eval::{
+use ply_core::host::HostRegistry;
+use ply_core::sim::TASK_OPS;
+use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
     HostRuntime, Linearity, Symbol, codes,
 };

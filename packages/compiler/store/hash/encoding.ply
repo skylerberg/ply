@@ -1,0 +1,537 @@
+//! The bytes a stored node is written as: the tag each node begins with, and the encoder that writes its pieces.
+
+import std.bin
+import syntax.lexer (widths)
+import syntax.type_syntax (Mode, MRead, MWrite, MBad, MRaise)
+import syntax.items (Deriver, deriver_tag, SpecKind, SRequires, SEnsures, SCost, SSpace)
+import std.bytes (is_digit, u32_le)
+import std.list
+import std.option
+import std.bytes
+import std.string
+import store.hash.graph (Index)
+
+// --- Bytes ------------------------------------------------------------------------------------
+
+/// The position of `v` in `xs`, searching from the end: a binder's de Bruijn level.
+pub fn rposition(xs: List<Bytes>, v: Bytes) -> Option<Int> / {abort.raise} =
+  range(0, xs.len()).fold(None, |acc: Option<Int>, i: Int|
+    if xs.get(i) == v { Some(i) } else { acc })
+
+/// The width's position in `lexer::widths`: the discriminant the encoding writes.
+pub fn width_index(ty: Bytes) -> Bytes / {abort.raise} = {
+  let want = Bytes::of_string(String::of_bytes(ty).ascii_lower());
+  byte_of_int(
+    range(0, widths().len()).fold(0, |at: Int, i: Int|
+      match widths().at(i) { Some(w) -> if w.name == want { i } else { at }, None -> at }),
+  )
+}
+
+pub fn i64_le(v: Int) -> Bytes =
+  Bytes::concat_all(range(0, 8).map(|i: Int| byte_of_int(v >>> 8 * i & 0xFF)))
+
+pub fn hex_digit(v: Int) -> Bytes / {abort.raise} =
+  if v < 10 { byte_of_int(48 + v) } else { byte_of_int(87 + v) }
+
+/// Every byte's two digits, so a byte of `hex` is one lookup.
+fn hex_pairs() -> List<Bytes> / {abort.raise} =
+  range(0, 256).map(|v: Int| hex_digit(v >>> 4).concat(hex_digit(v & 15)))
+
+pub fn hex(b: Bytes) -> Bytes / {abort.raise} = {
+  let pairs = hex_pairs();
+  Bytes::concat_all(range(0, b.len()).map(|i: Int| pairs.get(b.at(i))))
+}
+
+/// A `Decimal` mantissa has up to 96 bits, more than an `Int`, so it is accumulated a byte at a time.
+pub fn i128_le_of_digits(digits: Bytes) -> Bytes / {abort.raise} = {
+  let limbs = range(0, digits.len()).fold(range(0, 16).map(|i: Int| 0), |acc: List<Int>, i: Int| {
+    let d = digits.at(i) - 48;
+    let carried = range(0, 16).fold(
+      { limbs: [], carry: d },
+      |s: { limbs: List<Int>, carry: Int }, k: Int| {
+        let v = acc.get(k) * 10 + s.carry;
+        { limbs: s.limbs.push(v & 0xFF), carry: v >>> 8 }
+      },
+    );
+    carried.limbs
+  });
+  Bytes::concat_all(limbs.map(|v: Int| byte_of_int(v)))
+}
+
+pub fn float_bits(text: Bytes) -> Int / {abort.raise} =
+  match Float::of_string(String::of_bytes(text)) {
+    Some(f) -> bits_of_float(f),
+    None -> panic("a float literal the hasher cannot read"),
+  }
+
+/// A `Decimal` literal's `(mantissa, scale)`: the digits without the point, and how many followed it.
+pub fn decimal_parts(text: Bytes) -> { mantissa: Bytes, scale: Int } / {abort.raise} = {
+  let body = text.slice(0, text.len() - 1);
+  let split = range(0, body.len()).fold(
+    { digits: b"", scale: 0, after: false },
+    |s: { digits: Bytes, scale: Int, after: Bool }, i: Int| {
+      let c = body.at(i);
+      if c == 46 { { ..s, after: true } }
+      else if !is_digit(c) { s } else {
+        {
+          digits: s.digits.concat(byte_of_int(c)),
+          scale: if s.after { s.scale + 1 } else { s.scale },
+          after: s.after,
+        }
+      }
+    },
+  );
+  { mantissa: i128_le_of_digits(split.digits), scale: split.scale }
+}
+
+// --- The byte encoding ----------------------------------------------------------------
+
+pub fn tag_local() -> Int = 1
+
+pub fn tag_ref_hash() -> Int = 2
+
+pub fn tag_ref_self() -> Int = 3
+
+pub fn tag_ref_index() -> Int = 4
+
+pub fn tag_free() -> Int = 5
+
+pub fn tag_ctor() -> Int = 6
+
+pub fn tag_ty_param() -> Int = 7
+
+pub fn tag_row_param() -> Int = 8
+
+pub fn tag_free_qualified() -> Int = 9
+
+pub fn tag_none() -> Int = 10
+
+pub fn tag_some() -> Int = 11
+
+pub fn tag_ref_name() -> Int = 12
+
+pub fn tag_param_default() -> Int = 13
+
+/// A `fn` parameter written `keep`.
+pub fn tag_param_kept() -> Int = 172
+
+/// A `fn` parameter that names the space a call of it holds, which a caller's `space` bound reads.
+pub fn tag_param_spaced() -> Int = 175
+
+pub fn tag_fn() -> Int = 20
+
+pub fn tag_type_alias() -> Int = 21
+
+pub fn tag_type_sum() -> Int = 22
+
+pub fn tag_effect() -> Int = 23
+
+pub fn tag_test() -> Int = 24
+
+pub fn tag_variant() -> Int = 25
+
+pub fn tag_op() -> Int = 26
+
+pub fn tag_type() -> Int = 27
+
+pub fn tag_law() -> Int = 28
+
+pub fn tag_spec() -> Int = 29
+
+pub fn tag_ty_con() -> Int = 30
+
+pub fn tag_ty_fn() -> Int = 31
+
+pub fn tag_ty_record() -> Int = 32
+
+pub fn tag_ty_unit() -> Int = 33
+
+pub fn tag_lit_int() -> Int = 40
+
+pub fn tag_lit_bool() -> Int = 41
+
+pub fn tag_lit_str() -> Int = 42
+
+pub fn tag_lit_unit() -> Int = 43
+
+pub fn tag_lit_bytes() -> Int = 44
+
+pub fn tag_lit_float() -> Int = 45
+
+pub fn tag_lit_decimal() -> Int = 46
+
+pub fn tag_lit_char() -> Int = 47
+
+/// An embedded file by its digest and size, apart from a byte string that happens to be a digest.
+pub fn tag_lit_embedded() -> Int = 48
+
+/// A tag of its own: `5` and `5u32` are different definitions. Tags never renumber, or stored hashes move.
+pub fn tag_lit_fixed() -> Int = 96
+
+pub fn tag_lit_wide() -> Int = 99
+
+pub fn tag_e_lit() -> Int = 50
+
+pub fn tag_e_var() -> Int = 51
+
+pub fn tag_e_binary() -> Int = 52
+
+pub fn tag_e_unary() -> Int = 53
+
+pub fn tag_e_lambda() -> Int = 54
+
+pub fn tag_e_app() -> Int = 55
+
+pub fn tag_e_if() -> Int = 56
+
+pub fn tag_e_match() -> Int = 57
+
+pub fn tag_e_block() -> Int = 58
+
+pub fn tag_e_record() -> Int = 59
+
+pub fn tag_e_field() -> Int = 60
+
+pub fn tag_e_list() -> Int = 61
+
+pub fn tag_e_perform() -> Int = 62
+
+pub fn tag_e_handle() -> Int = 63
+
+pub fn tag_e_with_hold() -> Int = 170
+
+pub fn tag_e_on_value() -> Int = 171
+
+pub fn tag_type_extern() -> Int = 173
+
+/// What follows every binary operator and every value the encoding names by its name alone: the
+/// references `written_block` writes, none where nothing calls for them.
+pub fn tag_written() -> Int = 174
+
+pub fn tag_e_simulate() -> Int = 65
+
+pub fn tag_e_tagged() -> Int = 66
+
+pub fn tag_e_filled() -> Int = 150
+
+pub fn tag_e_parallel() -> Int = 100
+
+pub fn tag_e_try_block() -> Int = 131
+
+pub fn tag_e_record_update() -> Int = 67
+
+/// A `handle` with variables, apart from `tag_e_handle` so one without any hashes as it did.
+pub fn tag_e_handle_vars() -> Int = 68
+
+pub fn tag_s_let() -> Int = 70
+
+pub fn tag_s_expr() -> Int = 71
+
+pub fn tag_s_let_else() -> Int = 72
+
+pub fn tag_s_assign() -> Int = 73
+
+pub fn tag_p_wildcard() -> Int = 80
+
+pub fn tag_p_var() -> Int = 81
+
+pub fn tag_p_lit() -> Int = 82
+
+pub fn tag_p_ctor() -> Int = 83
+
+pub fn tag_p_record() -> Int = 84
+
+pub fn tag_p_list() -> Int = 85
+
+pub fn tag_p_or() -> Int = 86
+
+pub fn tag_p_range() -> Int = 87
+
+/// In a later alternative of an or-pattern: the first alternative's binder a variable there is.
+pub fn tag_p_again() -> Int = 162
+
+pub fn tag_row() -> Int = 90
+
+pub fn tag_atom() -> Int = 91
+
+pub fn tag_atom_op() -> Int = 97
+
+pub fn tag_label_param() -> Int = 98
+
+pub fn tag_arm() -> Int = 92
+
+pub fn tag_clause() -> Int = 93
+
+pub fn tag_return_clause() -> Int = 94
+
+pub fn tag_constraint() -> Int = 95
+
+pub fn tag_returns_fresh() -> Int = 101
+
+pub fn tag_returns_param() -> Int = 102
+
+pub fn tag_bounded() -> Int = 103
+
+pub fn tag_decreases() -> Int = 104
+
+pub fn tag_const() -> Int = 160
+
+pub fn tag_type_nominal() -> Int = 112
+
+pub fn tag_cases() -> Int = 105
+
+// A type that binds, and one applied to, labels or rows beside its types.
+pub fn tag_type_over() -> Int = 120
+
+pub fn tag_ty_con_over() -> Int = 121
+
+/// The function a type's values are compared through, and the one they are shown through.
+pub fn tag_key() -> Int = 140
+
+pub fn tag_show() -> Int = 141
+
+/// One function a type's arithmetic is, after the operation it is.
+pub fn tag_numeric() -> Int = 142
+
+/// A type only its own module builds a value of.
+pub fn tag_opaque() -> Int = 161
+
+/// An explicit table: renumbering a row invalidates every cached result in every store.
+pub fn binop_byte(op: Bytes) -> Int =
+  if op == b"add" { 1 }
+  else if op == b"sub" { 2 }
+  else if op == b"mul" { 3 }
+  else if op == b"div" { 4 }
+  else if op == b"rem" { 5 }
+  else if op == b"eq" { 6 }
+  else if op == b"ne" { 7 }
+  else if op == b"lt" { 8 }
+  else if op == b"le" { 9 }
+  else if op == b"gt" { 10 }
+  else if op == b"ge" { 11 }
+  else if op == b"and" { 12 }
+  else if op == b"or" { 13 }
+  else if op == b"concat" { 14 }
+  else if op == b"bitand" { 15 }
+  else if op == b"bitor" { 16 }
+  else if op == b"bitxor" { 17 }
+  else if op == b"shl" { 18 }
+  else if op == b"shr" { 19 }
+  else { 20 }
+
+pub fn unop_byte(op: Bytes) -> Int = if op == b"neg" { 1 } else if op == b"not" { 2 } else { 3 }
+
+pub fn mode_byte(mode: Mode) -> Int = match mode { MRead -> 0, MWrite -> 1, MBad -> 0, MRaise -> 2 }
+
+pub fn spec_tag(k: SpecKind) -> Int =
+  match k { SRequires -> 1, SEnsures -> 2, SCost -> 3, SSpace -> 4 }
+
+pub fn deriver_byte(deriver: Deriver) -> Int = deriver_tag(deriver) + 1
+
+/// `out` is chunks concatenated once at the end; `refs` is first-mention order; the binder lists are de Bruijn levels.
+/// Where the binder a level names stands: `run` -1 for one whose level is fixed where it is written,
+/// at `within`; else `within` the binders member `member` of commutable run `run` writes from where
+/// that member starts, which the member's place in the run's order decides.
+pub type Spot = { run: Int, member: Int, within: Int }
+
+pub type Bound = { name: Bytes, spot: Spot }
+
+/// A normalized form with all that hashing it reads besides the node itself left open: what a
+/// reference is written as, an effect's slot in its enumeration, a level a commutable run's order
+/// decides, and each set whose order the bytes of its members decide. Filling the holes writes
+/// the bytes; the walk over the tree, every name resolved, is made once. `Chose` writes nothing:
+/// it is what the check found of the call on a value written just before it, as [`Choice`] says.
+/// `Pending` writes nothing either: it is that call hashed before its check, as [`Site`] says.
+pub type Piece =
+  | Raw(Bytes)
+  | Ref(Int)
+  | Slot(Int)
+  | Level(Spot)
+  | Fields(List<List<Piece>>)
+  | Atoms(List<AtomForm>)
+  | Run(RunForm)
+  | Chose(Int, List<Int>)
+  | Pending(Bytes, List<Bytes>)
+
+/// A row's atom, and the effect declaration's sketch that orders atoms equal in their bytes.
+pub type AtomForm = { pieces: List<Piece>, tie: Bytes }
+
+/// A `let` of a commutable run, and how many binders it writes.
+pub type RunMember = { pieces: List<Piece>, binders: Int }
+
+/// `let`s that commute, written in the order their encodings at `base` sort in.
+pub type RunForm = { id: Int, base: Spot, members: List<RunMember> }
+
+/// Which of the functions a call on a value may be the check found it calls, -1 where none is
+/// known or the call names its function in full, and the place among that function's parameters,
+/// the value's first, of each argument the call names, in the order written.
+pub type Choice = { callee: Int, named: List<Int> }
+
+/// What a check found of a call on a value: the function it calls, by its program-wide name, and
+/// where each argument it names goes, as [`Choice`] says.
+pub type Called = { callee: Bytes, named: List<Int> }
+
+/// A call on a value as hashing that runs before the check leaves it: where the check files what
+/// it found of the call ([`site_key`]), and every function the call may be, by program-wide name,
+/// in the order the bytes write them.
+pub type Site = { at: Bytes, candidates: List<Bytes> }
+
+/// What a filled form says of a call on a value: the check's choice, or the site it is yet to be
+/// read from.
+pub type Pick = | Found(Choice) | Waiting(Site)
+
+derive bin for Choice
+
+derive bin for Site
+
+derive bin for Pick
+
+derive bin for Spot
+
+derive bin for Piece
+
+derive bin for AtomForm
+
+derive bin for RunMember
+
+derive bin for RunForm
+
+pub type Encoder = {
+  index: Index,
+  module: Int,
+  out: List<Piece>,
+  values: List<Bound>,
+  ty_params: List<Bytes>,
+  row_params: List<Bytes>,
+  label_params: List<Bytes>,
+  /// The member of a commutable run being written, with `within` where its binders start among
+  /// `values`; `run` -1 outside every run.
+  scope: Spot,
+  runs: Int,
+  /// What the check found of each call on a value, by `site_key`; `None` where hashing runs
+  /// before the check, which leaves each call pending.
+  chose: Option<Map<Bytes, Called>>,
+}
+
+/// `chosen` is each `Chose` in the order the bytes write it.
+pub type Finished = { bytes: Bytes, refs: List<Int>, chosen: List<Pick> }
+
+fn no_scope() -> Spot = { run: 0 - 1, member: 0, within: 0 }
+
+fn new_encoder(index: Index, module: Int) -> Encoder =
+  {
+    index: index,
+    module: module,
+    out: [],
+    values: [],
+    ty_params: [],
+    row_params: [],
+    label_params: [],
+    scope: no_scope(),
+    runs: 0,
+    chose: Some(Map::new()),
+  }
+
+/// What `encode` writes from a fresh encoder in `module` of `index`, of what no stored body holds:
+/// each call on a value found nothing.
+pub fn template_of<| e>(
+  index: Index,
+  module: Int,
+  encode: (Encoder) -> Encoder / e,
+) -> List<Piece> / e = compact(encode(new_encoder(index, module)).out)
+
+/// [`template_of`], each call on a value read as calling what `chose` holds at its site.
+pub fn chosen_template<| e>(
+  index: Index,
+  module: Int,
+  chose: Option<Map<Bytes, Called>>,
+  encode: (Encoder) -> Encoder / e,
+) -> List<Piece> / e = compact(encode({ ..new_encoder(index, module), chose: chose }).out)
+
+/// Adjacent bytes joined, so a form holds as many pieces as it has holes.
+pub fn compact(pieces: List<Piece>) -> List<Piece> = {
+  let flushed = |acc: { out: List<Piece>, raw: List<Bytes> }|
+    if acc.raw.len() == 0 { acc.out } else { acc.out.push(Raw(Bytes::concat_all(acc.raw))) };
+  flushed(
+    pieces.fold({ out: [], raw: [] }, |acc: { out: List<Piece>, raw: List<Bytes> }, p: Piece|
+      match p {
+        Raw(b) -> { ..acc, raw: acc.raw.push(b) },
+        _ -> { out: flushed(acc).push(p), raw: [] },
+      }),
+  )
+}
+
+pub fn put_piece(encoder: Encoder, p: Piece) -> Encoder = { ..encoder, out: encoder.out.push(p) }
+
+pub fn put_bytes(encoder: Encoder, b: Bytes) -> Encoder = put_piece(encoder, Raw(b))
+
+pub fn put_tag(encoder: Encoder, t: Int) -> Encoder / {abort.raise} =
+  put_bytes(encoder, byte_of_int(t))
+
+pub fn put_u32(encoder: Encoder, v: Int) -> Encoder = put_bytes(encoder, u32_le(v))
+
+pub fn put_bool(encoder: Encoder, b: Bool) -> Encoder / {abort.raise} =
+  put_bytes(encoder, byte_of_int(if b { 1 } else { 0 }))
+
+pub fn put_text(encoder: Encoder, s: Bytes) -> Encoder = put_bytes(put_u32(encoder, s.len()), s)
+
+/// Where the next binder stands: within the member being written, if any.
+pub fn spot_here(encoder: Encoder) -> Spot = {
+  let n = encoder.values.len();
+  if encoder.scope.run < 0 { { run: 0 - 1, member: 0, within: n } }
+  else { { ..encoder.scope, within: n - encoder.scope.within } }
+}
+
+pub fn bind(encoder: Encoder, name: Bytes) -> Encoder =
+  { ..encoder, values: encoder.values.push({ name: name, spot: spot_here(encoder) }) }
+
+pub fn bind_all(encoder: Encoder, names: List<Bytes>) -> Encoder = names.fold(encoder, bind)
+
+/// The binder `name` names, searching from the last bound: its place in `values`.
+pub fn bound_at(values: List<Bound>, name: Bytes) -> Option<Int> / {abort.raise} =
+  range(0, values.len()).fold(None, |acc: Option<Int>, i: Int|
+    if values.get(i).name == name { Some(i) } else { acc })
+
+/// The level of the binder at `i` of `values`: written now where no run's order moves it.
+pub fn put_level(encoder: Encoder, i: Int) -> Encoder / {abort.raise} = {
+  let spot = encoder.values.get(i).spot;
+  if spot.run < 0 { put_u32(encoder, spot.within) } else { put_piece(encoder, Level(spot)) }
+}
+
+pub type Captured = { encoder: Encoder, pieces: List<Piece> }
+
+/// The pieces `f` writes, kept apart from the encoding so far.
+pub fn capture<| e>(encoder: Encoder, f: (Encoder) -> Encoder / e) -> Captured / e = {
+  let inner: Encoder = f({ ..encoder, out: [] });
+  { encoder: { ..inner, out: encoder.out }, pieces: compact(inner.out) }
+}
+
+pub fn node_ref(encoder: Encoder, node: Int) -> Encoder = put_piece(encoder, Ref(node))
+
+// --- Stored bodies back to source ------------------------------------------------------------
+
+pub type Slot = { part: Int, class: Int }
+
+// --- Tests ------------------------------------------------------------------
+
+test "the little-endian encoders write what the reference writes" {
+  assert_eq(u32_le(1), b"\x01\x00\x00\x00");
+  assert_eq(u32_le(0x01020304), b"\x04\x03\x02\x01");
+  assert_eq(i64_le(0 - 1), b"\xff\xff\xff\xff\xff\xff\xff\xff");
+  assert_eq(hex(b"\x00\xab\xff"), b"00abff");
+  assert_eq(
+    i128_le_of_digits(b"256"),
+    b"\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+  )
+}
+
+test "a float literal is read as its correctly rounded bit pattern" {
+  assert_eq(float_bits(b"1.5"), 0x3FF8000000000000);
+  assert_eq(float_bits(b"1e2"), bits_of_float(100.0));
+  assert_eq(float_bits(b"2.5e-1"), bits_of_float(0.25));
+  assert_eq(float_bits(b"1.0e300"), 0x7E37E43C8800759C);
+  assert_eq(float_bits(b"1.0e-30"), 0x39B4484BFEEBC2A0);
+  let parts = decimal_parts(b"1.50m");
+  assert_eq(parts.scale, 2);
+  assert_eq(parts.mantissa.at(0), 150)
+}

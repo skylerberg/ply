@@ -1,12 +1,12 @@
-use ply_eval::Mode;
-use ply_eval::host::MachineId;
-use ply_eval::{HostAnswer, HostBinding, HostRequest, Span, Symbol, Value};
+use ply_core::Mode;
+use ply_core::host::MachineId;
+use ply_core::{HostAnswer, HostBinding, HostRequest, Span, Symbol, Value};
 use ply_host::Host;
 use ply_host::clock::*;
-use ply_sketch::{Sketch, atom};
+use ply_test_support::{Sketch, atom};
 
 /// Reads the language's clock and sleeps on it, so both rows bind.
-fn timed() -> ply_eval::CheckOutput {
+fn timed() -> ply_core::CheckOutput {
     Sketch::program()
         .def(
             "m",
@@ -21,14 +21,14 @@ fn timed() -> ply_eval::CheckOutput {
 
 /// Declares a `clock` of its own, `nondet effect clock { read now() -> Int }`, which hides the
 /// language's in this module.
-fn own() -> ply_eval::CheckOutput {
+fn own() -> ply_core::CheckOutput {
     Sketch::program()
         .effect("m", "clock", true, &[("now", Mode::Read, false)])
         .def("m", "stamp", vec![atom("m.clock", "", Mode::Read)])
         .check()
 }
 
-fn bound(host: &Host, check: ply_eval::CheckOutput) -> HostBinding {
+fn bound(host: &Host, check: ply_core::CheckOutput) -> HostBinding {
     host.registry()
         .bind(&check)
         .unwrap_or_else(|d| panic!("the host binds: {d:?}"))
@@ -55,7 +55,7 @@ fn answer(host: &Host, binding: &HostBinding, op: Op, args: &[Value]) -> Value {
 }
 
 fn nanos(value: &Value) -> i64 {
-    ply_eval::sim::nanos_of(value, Span::DUMMY, "a reading").expect("an `Instant`")
+    ply_core::sim::nanos_of(value, Span::DUMMY, "a reading").expect("an `Instant`")
 }
 
 #[test]

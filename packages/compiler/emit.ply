@@ -1,0 +1,1373 @@
+//! The C emitter: writes the C for one lowered body, or `None` for a form it does not cover.
+//! Output is diffed byte for byte against the Rust back end, so emission order and temporary numbering are load-bearing.
+
+import syntax.parsing (Ident, dummy_span, span_key, ParseDiag)
+import emit.code (Code, NVar, NBinary, NIf, NBlock, NApp, NMatch, CodeArm, lower_to_emit)
+import syntax.items (Module, Derived, Item, IFn, ITest, ILaw, IType, parse, with_prelude, INames,
+                     IModule, IAlias, Binder, SpecClause, SRequires, SEnsures, SCost, SSpace, FnDef,
+                     test_run, test_listing, IInstance, VariantDef, TDSum, INumeric, NumericOp,
+                     NKey, TestDef)
+import check.resolve.tables (ParsedModule, Source, Diag, Resolved, ModuleBinding, qualify, lookup,
+                             ValueSpace)
+import check.resolve (ResolveSucceeded, ResolveFailed, resolve_packaged)
+import check.resolve.scopes (PackageDeps, no_packages, of_module, of_binder)
+import expand.derive (expand_derives)
+import check.infer.checker (LabelSite, OperandSite, TypedSite, MemberSite, WitnessOp, test_owner,
+                            law_root, cases_root)
+import check.infer (expanded_mods, EmitFacts)
+import check.types (Type, TyCon, Scheme, type_at, int_type, bytes_type, type_spelled)
+import emit.typing (Typed, node_types, unknown_type, filed_as)
+import front.rows (Rows, KnownDefRow)
+import front.seam (WalkedFacts, walked_facts_bin)
+import front.published (facts_read, lowered_modules, lowers, wants)
+import std.bin
+import std.list
+import std.graph
+import front.diagnostics (with_prelude_source)
+import store.hash.forms (written_code)
+import syntax.exprs (freed_by, Param, Expr, case_at, case_identity, ELit)
+import expand.rewrite (expand)
+import expand.embed (EmbedAt, embed_tables, rewritten)
+import syntax.patterns (LBool)
+import std.bytes (ascii_of_int)
+import emit.c (KBoxed, KInt, Kind, position_of, bytes_join, unsettled, bytes_join_dots)
+import emit.roots (container_ops, equality_root, ordering_root, written_root_of, specialisation_of,
+                   own_definition, FnArg)
+import emit.answer (no_tables, sorted_widths, Emitted, Body, Refused, RootAnswer)
+import emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, Imported, ModuleDefs, Whole, kind_of,
+                  boxed, Sig, sig_of, param_kinds, param_types, typed_kind, typed_at, def_entry,
+                  carriers_of)
+import emit.written (container_code, equality_code, ordering_code, digest_code, at_args,
+                     reflection_code)
+import emit.state (EffectName, EmitParam, BoundLambda, OwnerLambdas)
+import emit.scope (is_ctor_name, last_segment, module_import, def_in, lambdas_of, named_in,
+                   has_handle)
+import emit.calls (known_body)
+import emit.ops (walked_container, reflected_kind)
+import emit.effects (effects_in)
+import emit.entry (Prepared, group_emitted, params_of, params_carried, root_emitted, emitted_from)
+import emit.special (specialisations_wanted, Specialised, ModuleTables, witnessed_needs,
+                     definition_at, specialised_emitted)
+
+// --- the emitter's entry ----------------------------------------------------
+
+fn defs_in(
+  module: Bytes,
+  m: Module,
+  pure: Map<Bytes, Bool>,
+  schemes: Map<Bytes, Scheme>,
+) -> List<Def> =
+  m.items.fold([], |acc: List<Def>, item: Item|
+    match item { IFn(d) -> acc.push(def_entry(module, d, pure, schemes)), _ -> acc })
+
+/// What an arm that refuses a program before lowering anything can say: the checker's own words, one
+/// per diagnostic. There is no renderer for a diagnostic on this side -- the driver's `explain` has
+/// the prose -- so the code and the message are what a refusal carries.
+pub fn said(diags: List<Diag>) -> Bytes =
+  match diags {
+    [] -> b"a program the emitter will not lower, and no diagnostic explains it",
+    _ ->
+      bytes_join(
+        diags.map(|diag: Diag| Bytes::concat_all([diag.code, b": ", diag.message])),
+        b"; ",
+      ),
+  }
+
+/// The same for the parser's diagnostics, which are a different record: a module that does not parse
+/// has not reached the point where the other kind exist.
+fn said_p(diags: List<ParseDiag>) -> Bytes =
+  match diags {
+    [] -> b"a module the emitter cannot parse, and no diagnostic explains it",
+    _ ->
+      bytes_join(
+        diags.map(|diag: ParseDiag| Bytes::concat_all([diag.code, b": ", diag.message])),
+        b"; ",
+      ),
+  }
+
+/// Every root the caller wanted, refused for the same reason. An arm that refuses a whole program has
+/// no body to hang the reason on, and the answer's reader keys a refusal by root name, so the refusal
+/// has to ride on the roots it was asked for. A caller that wanted everything names its sources
+/// instead: those are the names it has.
+pub fn refused_rather_than_emitted(
+  sources: List<Source>,
+  wanted: Option<Map<Bytes, Bool>>,
+  why: Bytes,
+) -> List<Emitted> =
+  List::map(
+    match wanted {
+      Some(m) -> m.keys(),
+      None -> sources.map(|source: Source| source.name).map(|n: Bytes| n),
+    },
+    |n: Bytes| { name: n, text: b"", tables: no_tables(), why: Some(why), handles: [] },
+  )
+
+/// Resolved together first, so defaults are filled and derives expanded; a program that does not resolve emits nothing.
+/// Every root is resolved against, but only those `wanted` names are emitted; `None` wants them all.
+/// `pkgs` and `placed` are the program's package tables, empty for one without packages:
+/// resolution then treats every module as one package's, which is what no packages means.
+pub fn emit_program(
+  given: List<Source>,
+  ctors: Ctors,
+  builtins: List<Bytes>,
+  release: Bool,
+  wanted: Option<Map<Bytes, Bool>>,
+  pkgs: List<PackageDeps>,
+  placed: List<Int>,
+  embeds: List<EmbedAt>,
+  rows: Rows,
+  walked: Bytes,
+) -> List<Emitted> / {abort.raise} = {
+  // Every module imports `std.prelude`, which a caller may leave out; it is a shipped module.
+  let sources = with_prelude_source(given);
+  let module_packages = if sources.len() == given.len() || pkgs.len() == 0 { placed }
+  else { placed.push(pkgs.len()) };
+  let tables = embed_tables(embeds);
+  let parsed = range(0, sources.len()).map(|i: Int| {
+    let s = match sources.at(i) { Some(x) -> x, None -> { name: b"", src: b"" } };
+    let r = parse(s.src);
+    let x = expand(with_prelude(s.name, r.node), r.parser.diags);
+    let d = expand_derives(i, s.name, x.module);
+    let e = rewritten(tables, s.name, d.module);
+    {
+      name: s.name,
+      module: e.module,
+      derived: d.derived,
+      bad: r.parser.diags.len() > 0 || d.diags.len() > 0 || e.diags.len() > 0,
+      // A module that does not parse is not also reported against what its recovery expanded to.
+      why: if r.parser.diags.len() > 0 { said_p(r.parser.diags) }
+      else if d.diags.len() > 0 { said(d.diags) }
+      else { said_p(e.diags) },
+    }
+  });
+  match parsed.fold(
+      None,
+      |acc: Option<Bytes>, p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool, why: Bytes }|
+        match acc { Some(_) -> acc, None -> if p.bad { Some(p.why) } else { None } },
+    ) {
+    Some(why) -> refused_rather_than_emitted(sources, wanted, why),
+    None -> {
+      let mods0: List<ParsedModule> = parsed.map(
+        |p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool, why: Bytes }|
+          { name: p.name, module: p.module, derived: p.derived },
+      );
+      // The published table ends with the built-in packages; the shipped modules sit one past them.
+      let packaged = if pkgs.len() == 0 { no_packages(mods0) } else {
+        {
+          pkgs: pkgs,
+          module_packages: module_packages,
+          std: pkgs.len() - 2,
+          compiler: pkgs.len() - 1,
+          shipped: pkgs.len(),
+        }
+      };
+      match resolve_packaged(
+          mods0,
+          packaged.pkgs,
+          packaged.module_packages,
+          packaged.std,
+          packaged.compiler,
+          packaged.shipped,
+        ) {
+        ResolveFailed(diags) -> refused_rather_than_emitted(sources, wanted, said(diags)),
+        ResolveSucceeded(x) -> {
+          // A specialisation is lowered from its definition's facts, and the lambdas it runs from
+          // their owners'.
+          let reading = match wanted {
+            None -> None,
+            Some(w) ->
+              Some(
+                w.fold(w, |acc: Map<Bytes, Bool>, root: Bytes, _: Bool|
+                  List::fold(
+                    match specialisation_of(root) { Some(s) -> s.fns, None -> [] },
+                    acc.insert(own_definition(root), true),
+                    |r: Map<Bytes, Bool>, f: FnArg| r.insert(own_definition(f.owner), true),
+                  )),
+              ),
+          };
+          let lowered = lowered_modules(reading);
+          match match walked_read(walked) {
+              None ->
+                Err(
+                  b"the front end's answer carries nothing its check read, so nothing is lowered from it",
+                ),
+              Some(w) -> facts_read(rows, w, reading, x.mods),
+            } {
+            Err(why) -> refused_rather_than_emitted(sources, wanted, why),
+            Ok(facts) -> {
+              let pure = facts.pure.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes|
+                acc.insert(n, true));
+              // The checker has the shape of every update, so the literals they stand for are written in here.
+              let mods: List<ParsedModule> = expanded_mods(
+                x.mods,
+                facts.elaboration,
+                x.r.signatures,
+              );
+              let schemes = rows.defs.fold(
+                Map::new(),
+                |acc: Map<Bytes, Scheme>, row: KnownDefRow| acc.insert(row.name, row.scheme),
+              );
+              let program = mods.map(|m: ParsedModule|
+                { module: m.name, defs: defs_in(m.name, m.module, pure, schemes) });
+              let stated = stated_by_tag(mods);
+              let ctors = {
+                ..ctors,
+                keyed: keyed_tags(mods).fold(ctors.keyed, |acc: List<Bytes>, k: Bytes|
+                  if acc.contains(k) { acc } else { acc.push(k) }),
+              };
+              let defs_of = |path: Bytes|
+                program.fold([], |acc: List<Def>, md: ModuleDefs|
+                  if md.module == path { md.defs } else { acc });
+              // Each lowered module's definitions, imports and the types and operands its check filed,
+              // which its roots and the lambdas its definitions lend are read under.
+              let tables_of = |i: Int, m: ParsedModule|
+                {
+                  here: defs_in(m.name, m.module, pure, schemes),
+                  imports: resolved_imports(
+                    x.r,
+                    i,
+                    mods,
+                    m.module,
+                    defs_of,
+                    facts.elaboration.members.filter(|s: MemberSite| s.module == i),
+                  ),
+                  typed: typed_in(facts, i),
+                  operands: operands_in(facts.operands, i),
+                };
+              let tables = range(0, mods.len()).map(|i: Int|
+                match mods.at(i) {
+                  Some(m) -> if lowers(lowered, m.name) { Some(tables_of(i, m)) } else { None },
+                  None -> None,
+                });
+              let tables_at = |i: Int, m: ParsedModule|
+                match tables.at(i) { Some(Some(t)) -> t, _ -> tables_of(i, m) };
+              let specialised = specialisations_wanted(wanted);
+              // What an owner lends: its lambdas, read where it lowers them, a definition as it stands
+              // or at the type arguments the owner's name gives; past the first `lambdas` it writes are
+              // the definitions it names as values.
+              let owner_read = |owner: Bytes| {
+                let of = match specialisation_of(owner) {
+                  Some(s) -> { base: s.base, args: s.args, lends: s.fns.len() == 0 },
+                  None -> { base: owner, args: [], lends: true },
+                };
+                let dot = range(0, of.base.len()).fold(0 - 1, |acc: Int, k: Int|
+                  if of.base.at(k) == 46 { k } else { acc });
+                let module = of.base.slice(0, if dot < 0 { 0 } else { dot });
+                let short = of.base.slice(dot + 1, of.base.len());
+                match range(0, mods.len()).fold(None, |acc: Option<Int>, k: Int|
+                    match acc {
+                      Some(_) -> acc,
+                      None -> if mods.get(k).name == module { Some(k) } else { None },
+                    }) {
+                  None -> None,
+                  Some(i) -> {
+                    let m = mods.get(i);
+                    match m.module.items.fold(None, |acc: Option<FnDef>, item: Item|
+                        match item {
+                          IFn(d) -> if d.name.name == short && of.lends { Some(d) } else { acc },
+                          _ -> acc,
+                        }) {
+                      // A test's lambdas, as its root lowers its run.
+                      None -> match m.module.items.fold(
+                          None,
+                          |acc: Option<TestDef>, item: Item|
+                            match item {
+                              ITest(t) -> if test_owner(m.name, t.name) == owner { Some(t) }
+                              else { acc },
+                              _ -> acc,
+                            },
+                        ) {
+                        None -> None,
+                        Some(t) -> {
+                          let cased = t.cases != None;
+                          match lower_to_emit(
+                              if cased { [case_at(), case_identity()] } else { [] },
+                              [],
+                              sites_in(facts.label_sites, i),
+                              test_run(t),
+                              of_binder(m.name),
+                            ) {
+                            None -> None,
+                            Some(l) -> {
+                              let tab = tables_at(i, m);
+                              let here = tab.here;
+                              let imports = tab.imports;
+                              let emitted = known_body(owner, [], l.code);
+                              let lambdas = lambdas_of(emitted);
+                              match lambdas.concat(named_in(m.name, here, imports, emitted)).at(0) {
+                                None -> None,
+                                Some(code) ->
+                                  Some({
+                                    lambdas: lambdas.len(),
+                                    bound: {
+                                      owner: owner,
+                                      nth: 0,
+                                      code: code,
+                                      named: false,
+                                      module: m.name,
+                                      here: here,
+                                      imports: imports,
+                                      effects: effects_in(x.r, i, mods),
+                                      typed: node_types(
+                                        tables_at(i, m).typed,
+                                        if cased { [Some(int_type()), Some(bytes_type())] }
+                                        else { [] },
+                                        l.code,
+                                      ),
+                                      operands: tables_at(i, m).operands,
+                                      base: t.span.start,
+                                      written: lambdas.concat(
+                                        named_in(m.name, here, imports, emitted),
+                                      ),
+                                    },
+                                  }),
+                              }
+                            },
+                          }
+                        },
+                      },
+                      Some(d) -> {
+                        let source = definition_at(
+                          of.base,
+                          d,
+                          of.args,
+                          schemes,
+                          facts.elaboration.ops.filter(|o: WitnessOp| o.module == i),
+                          tables_at(i, m).operands,
+                        );
+                        match lower_to_emit(
+                            d.params.map(|param: Param| param.name.name),
+                            d.generics.labels.map(|ident: Ident| ident.name),
+                            sites_in(facts.label_sites, i),
+                            source.body,
+                            of_binder(m.name),
+                          ) {
+                          None -> None,
+                          Some(l) -> {
+                            let tab = tables_at(i, m);
+                            let here = tab.here;
+                            let imports = tab.imports;
+                            let emitted = known_body(owner, [], l.code);
+                            let lambdas = lambdas_of(emitted);
+                            match lambdas.concat(named_in(m.name, here, imports, emitted)).at(0) {
+                              None -> None,
+                              Some(code) ->
+                                Some({
+                                  lambdas: lambdas.len(),
+                                  bound: {
+                                    owner: owner,
+                                    nth: 0,
+                                    code: code,
+                                    named: false,
+                                    module: m.name,
+                                    here: here,
+                                    imports: imports,
+                                    effects: effects_in(x.r, i, mods),
+                                    // Typed with its owner's whole body, which is what types its captures.
+                                    typed: node_types(
+                                      if of.args.len() == 0 { tables_at(i, m).typed }
+                                      else { typed_at(tables_at(i, m).typed, of.args) },
+                                      param_types(d, source.sig),
+                                      l.code,
+                                    ),
+                                    operands: source.operands,
+                                    base: d.span.start,
+                                    written: lambdas.concat(
+                                      named_in(m.name, here, imports, emitted),
+                                    ),
+                                  },
+                                }),
+                            }
+                          },
+                        }
+                      },
+                    }
+                  },
+                }
+              };
+              // Each owner a wanted specialisation runs a lambda of is read once, for all of them.
+              let lent_by = specialised.fold(
+                Map::new(),
+                |acc: Map<Bytes, Option<OwnerLambdas>>, _: Bytes, sps: List<Specialised>|
+                  sps.fold(acc, |held: Map<Bytes, Option<OwnerLambdas>>, sp: Specialised|
+                    sp.fns.fold(held, |h: Map<Bytes, Option<OwnerLambdas>>, f: FnArg|
+                      if h.contains(f.owner) { h }
+                      else { h.insert(f.owner, owner_read(f.owner)) })),
+              );
+              let lambda_at = |owner: Bytes, nth: Int|
+                match match lent_by.get(owner) { Some(o) -> o, None -> owner_read(owner) } {
+                  None -> None,
+                  Some(o) -> match o.bound.written.at(nth) {
+                    None -> None,
+                    Some(code) ->
+                      Some({ ..o.bound, nth: nth, code: code, named: nth >= o.lambdas }),
+                  },
+                };
+              range(0, mods.len()).fold([], |acc: List<Emitted>, i: Int|
+                match mods.at(i) {
+                  None -> acc,
+                  Some(m) -> if !lowers(lowered, m.name) { acc } else {
+                    emit_module(
+                      m.name,
+                      m.module,
+                      ctors,
+                      builtins,
+                      program,
+                      schemes,
+                      pure,
+                      effects_in(x.r, i, mods),
+                      release,
+                      wanted,
+                      specialised,
+                      tables_at(i, m),
+                      {
+                        labels: sites_in(facts.label_sites, i),
+                        operands: tables_at(i, m).operands,
+                        typed: tables_at(i, m).typed,
+                        ops: facts.elaboration.ops.filter(|o: WitnessOp| o.module == i),
+                        members: facts.elaboration.members.filter(|s: MemberSite| s.module == i),
+                      },
+                      lambda_at,
+                    ).fold(acc, |a: List<Emitted>, e: Emitted| a.push(calling_instances(stated, e)))
+                  },
+                })
+            },
+          }
+        },
+      }
+    },
+  }
+}
+
+/// Each constructor whose type's module states a `key`, which its values are compared by.
+fn keyed_tags(mods: List<ParsedModule>) -> List<Bytes> =
+  mods.fold([], |acc: List<Bytes>, m: ParsedModule|
+    m.module.items.fold(acc, |a: List<Bytes>, item: Item|
+      match item {
+        IInstance(d) -> if d.kind != NKey { a }
+        else { a.concat(stating(m, Map::new(), d.target.name, [d.by.name]).keys()) },
+        _ -> a,
+      }))
+
+/// Each constructor whose type's module states a `key` or a `show`, with those functions under
+/// their program-wide names.
+fn stated_by_tag(mods: List<ParsedModule>) -> Map<Bytes, List<Bytes>> =
+  mods.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, m: ParsedModule|
+    m.module.items.fold(acc, |a: Map<Bytes, List<Bytes>>, item: Item|
+      match item {
+        IInstance(d) -> stating(m, a, d.target.name, [d.by.name]),
+        INumeric(d) -> stating(m, a, d.target.name, d.ops.map(|x: NumericOp| x.by.name)),
+        _ -> a,
+      }))
+
+/// `stated` with `fns` of module `m` under each constructor of its type `target`.
+fn stating(
+  m: ParsedModule,
+  stated: Map<Bytes, List<Bytes>>,
+  target: Bytes,
+  fns: List<Bytes>,
+) -> Map<Bytes, List<Bytes>> =
+  m.module.items.fold(stated, |b: Map<Bytes, List<Bytes>>, other: Item|
+    match other {
+      IType(t) -> if t.name.name != target { b } else {
+        match t.body {
+          TDSum(variants) ->
+            variants.fold(b, |c: Map<Bytes, List<Bytes>>, v: VariantDef| {
+              let tag = qualify(m.name, v.name.name);
+              c.insert(
+                tag,
+                fns.fold(
+                  match c.get(tag) { Some(fs) -> fs, None -> [] },
+                  |fs: List<Bytes>, f: Bytes| fs.push(qualify(m.name, f)),
+                ),
+              )
+            }),
+          _ -> b,
+        }
+      },
+      _ -> b,
+    })
+
+/// The constructors a body's C names a tag of, as its placeholders spell them.
+fn tags_named(text: Bytes) -> List<Bytes> / {abort.raise} =
+  iterate({ from: 0, out: [] }, text.len() + 1, |s: { from: Int, out: List<Bytes> }|
+    match text.index_of_from(b"@@", s.from) {
+      None -> Stop(s.out),
+      Some(open) -> match text.index_of_from(b"@@", open + 2) {
+        None -> Stop(s.out),
+        Some(close) ->
+          Continue({
+            from: close + 2,
+            out: if text.at(open + 2) == 84 { s.out.push(text.slice(open + 3, close)) }
+            else { s.out },
+          }),
+      },
+    })
+
+/// A body that names a constructor's tag holds values the runtime reads through what the type's
+/// module states of it, wherever they are compared or shown: so it calls those functions, which the
+/// unit then takes with it and a kept answer is checked against.
+fn calling_instances(stated: Map<Bytes, List<Bytes>>, e: Emitted) -> Emitted / {abort.raise} =
+  if stated.len() == 0 { e } else {
+    match e.why {
+      Some(_) -> e,
+      None ->
+        {
+          ..e,
+          tables: {
+            ..e.tables,
+            calls: tags_named(e.text).fold(e.tables.calls, |acc: List<Bytes>, tag: Bytes|
+              match stated.get(tag) {
+                None -> acc,
+                Some(fs) ->
+                  fs.fold(acc, |calls: List<Bytes>, f: Bytes|
+                    if calls.contains(f) { calls } else { calls.push(f) }),
+              }),
+          },
+        },
+    }
+  }
+
+/// One import's module as it is written and as it resolves: a dependency's sibling import is
+/// written bare and means the module of the same package, which the scope's binders name.
+fn resolved_path(
+  resolved: Resolved,
+  index: Int,
+  mods: List<ParsedModule>,
+  j: Int,
+  written: Bytes,
+) -> Bytes / {abort.raise} =
+  match resolved.imports.get(index).at(j) { Some(t) -> mods.get(t).name, None -> written }
+
+fn resolved_imports(
+  resolved: Resolved,
+  index: Int,
+  mods: List<ParsedModule>,
+  x_module: Module,
+  defs_of: (Bytes) -> List<Def>,
+  members: List<MemberSite>,
+) -> List<Imported> / {abort.raise} = {
+  let written = range(0, x_module.imports.len()).fold([], |acc: List<Imported>, j: Int| {
+    let im = x_module.imports.get(j);
+    let full = resolved_path(
+      resolved,
+      index,
+      mods,
+      j,
+      bytes_join_dots(im.path.map(|i: Ident| i.name)),
+    );
+    match im.kind {
+      INames(ns) ->
+        ns.fold(acc, |a: List<Imported>, n: Ident|
+          a.push({ name: n.name, module: full, defs: defs_of(full), whole: false })),
+      IModule ->
+        acc.push({ name: last_segment(im.path), module: full, defs: defs_of(full), whole: true }),
+      // A module the parser imports for names read with no import names each the resolver bound
+      // to it.
+      IAlias(a2) ->
+        freed_by(a2.name).fold(
+          acc.push({ name: a2.name, module: full, defs: defs_of(full), whole: true }),
+          |a: List<Imported>, n: Bytes|
+            match resolved.scopes.at(index) {
+              Some(sc) -> match lookup(sc.bound, ValueSpace, n) {
+                Some(b) -> if b.qualified != qualify(full, n) { a }
+                else { a.push({ name: n, module: full, defs: defs_of(full), whole: false }) },
+                None -> a,
+              },
+              None -> a,
+            },
+        ),
+    }
+  });
+  // A function of a type is named through a binder of its module no import wrote, and so is
+  // each name of a default a call on a value copied.
+  let through = members.fold(written, |acc: List<Imported>, m: MemberSite|
+    List::concat(match of_module(m.qualifier) { Some(home) -> [home], None -> [] }, m.reaches).fold(
+      acc,
+      |a: List<Imported>, home: Bytes|
+        match module_import(a, of_binder(home)) {
+          Some(_) -> a,
+          None -> a.push({ name: of_binder(home), module: home, defs: defs_of(home), whole: true }),
+        },
+    ));
+  // A default copied into a call names its own module through a binder no import wrote.
+  match resolved.scopes.at(index) {
+    None -> through,
+    Some(scope) ->
+      scope.modules.fold(through, |acc: List<Imported>, mb: ModuleBinding|
+        match module_import(acc, mb.binder) {
+          Some(_) -> acc,
+          None -> {
+            let full = mods.get(mb.target).name;
+            acc.push({ name: mb.binder, module: full, defs: defs_of(full), whole: true })
+          },
+        }),
+  }
+}
+
+/// The labels each call in this module fills, keyed by the call's span, which the lowering reads.
+fn sites_in(all: List<LabelSite>, module: Int) -> Map<Bytes, List<Bytes>> =
+  all.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, site: LabelSite|
+    if site.module != module { acc } else { acc.insert(span_key(site.span), site.labels) })
+
+/// Each operator's operand type in this module, by its span. A default argument is written in its
+/// own module's positions, so two sites can share a span: where their types differ, neither is read.
+pub fn operands_in(all: List<OperandSite>, module: Int) -> Map<Bytes, Bytes> =
+  all.fold(Map::new(), |acc: Map<Bytes, Bytes>, site: OperandSite|
+    if site.module != module { acc } else {
+      let key = span_key(site.span);
+      match acc.get(key) {
+        None -> acc.insert(key, site.ty),
+        Some(t) -> if t == site.ty { acc } else { acc.insert(key, unsettled()) },
+      }
+    })
+
+/// Each typed site in this module, by its span. A default argument is written in its own module's
+/// positions, so two sites can share a span: where they differ, neither is read.
+fn typed_in(facts: EmitFacts, module: Int) -> Map<Bytes, Typed> =
+  facts.typed.fold(
+    { sites: Map::new(), read: Map::new() },
+    |acc: { sites: Map<Bytes, Typed>, read: Map<Bytes, Type> }, site: TypedSite|
+      if site.module != module { acc } else {
+        let own = type_at(facts.types, site.ty, acc.read);
+        let args = site.args.fold(
+          { tys: [], read: own.read },
+          |a: { tys: List<Type>, read: Map<Bytes, Type> }, k: Bytes| {
+            let t = type_at(facts.types, k, a.read);
+            { tys: a.tys.push(t.ty), read: t.read }
+          },
+        );
+        let key = span_key(site.span);
+        let here = filed_as(own.ty, args.tys);
+        {
+          sites: match acc.sites.get(key) {
+            None -> acc.sites.insert(key, here),
+            Some(t) -> if t == here { acc.sites }
+            else { acc.sites.insert(key, filed_as(unknown_type(), [])) },
+          },
+          read: args.read,
+        }
+      },
+  ).sites
+
+/// What the front end's check read, or nothing when its answer carried none or one this program does
+/// not read.
+fn walked_read(walked: Bytes) -> Option<WalkedFacts> / {abort.raise} =
+  if walked.len() == 0 { None }
+  else { match bin::decode(walked, walked_facts_bin()) { Ok(w) -> Some(w), Err(_) -> None } }
+
+/// What the checker filed of one module's sites, by span: each call's labels, each operator's
+/// operand type, each typed site, and each operator done through a witness.
+type SitesRead = {
+  labels: Map<Bytes, List<Bytes>>,
+  operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
+  ops: List<WitnessOp>,
+  members: List<MemberSite>,
+}
+
+fn emit_module(
+  module: Bytes,
+  x_module: Module,
+  ctors: Ctors,
+  builtins: List<Bytes>,
+  program: List<ModuleDefs>,
+  schemes: Map<Bytes, Scheme>,
+  pure: Map<Bytes, Bool>,
+  effects: List<EffectName>,
+  release: Bool,
+  wanted: Option<Map<Bytes, Bool>>,
+  specialised: Map<Bytes, List<Specialised>>,
+  tables: ModuleTables,
+  read: SitesRead,
+  lambda_at: (Bytes, Int) -> Option<BoundLambda> / {abort.raise},
+) -> List<Emitted> / {abort.raise} = {
+  let sites = read.labels;
+  let operands = read.operands;
+  let typed = read.typed;
+  let ops = read.ops;
+  let x = { module: x_module };
+  let imports = tables.imports;
+  let here = tables.here;
+  let fns = x.module.items.fold([], |acc: List<Prepared>, item: Item|
+    match item { IFn(d) -> acc.push(prepare(module, schemes, wanted, sites, d)), _ -> acc });
+  let groups = tail_groups(module, here, fns);
+  let walked = x.module.items.fold({ out: [], fns: 0 }, |acc: Walk, item: Item|
+    match item {
+      IFn(d) -> {
+        let p = match fns.at(acc.fns) {
+          Some(q) -> q,
+          None -> prepare(module, schemes, wanted, sites, d),
+        };
+        let specialisations = (match specialised.get(p.full) { Some(l) -> l, None -> [] }).fold(
+          acc.out,
+          |a: List<Emitted>, sp: Specialised|
+            a.push(
+              specialised_emitted(
+                module,
+                d,
+                sp.args,
+                sp.fns,
+                lambda_at,
+                schemes,
+                ops,
+                sites,
+                held_whole(here, tail_cycle(module, here, sites, x.module.items, d)),
+                imports,
+                ctors,
+                builtins,
+                effects,
+                release,
+                operands,
+                typed,
+              ),
+            ),
+        );
+        let out = match group_of(groups, acc.fns) {
+          None -> if !wants(wanted, p.full) { specialisations } else {
+            specialisations.push(
+              witnessed_needs(
+                emitted_from(
+                  module,
+                  p.base,
+                  here,
+                  imports,
+                  ctors,
+                  builtins,
+                  effects,
+                  release,
+                  operands,
+                  typed,
+                  p.full,
+                  p.ps,
+                  p.known,
+                  p.body,
+                  p.code,
+                ),
+                d,
+                schemes.get(p.full),
+                ops,
+              ),
+            )
+          },
+          // The group is emitted where its first member stands; the others are its cases.
+          Some(g) -> if g.at(0) != Some(acc.fns) { specialisations } else {
+            group_emitted(
+              module,
+              here,
+              imports,
+              ctors,
+              builtins,
+              effects,
+              release,
+              operands,
+              typed,
+              g.map(|i: Int| match fns.at(i) { Some(q) -> q, None -> p }),
+            ).fold(specialisations, |a: List<Emitted>, e: Emitted| a.push(e))
+          },
+        };
+        clause_roots(
+          { out: out, fns: acc.fns + 1 },
+          d,
+          p.names,
+          p.kinds,
+          module,
+          here,
+          imports,
+          ctors,
+          builtins,
+          effects,
+          release,
+          operands,
+          typed,
+          sig_of(schemes, qualify(module, d.name.name)),
+          wanted,
+          sites,
+        )
+      },
+      // A test is a root named by its label: nullary, or over cases entered with a case's place
+      // and identity beside a nullary root that lists them.
+      ITest(t) -> {
+        let full = test_owner(module, t.name);
+        let ps = if t.cases == None { [] } else {
+          [
+            {
+              name: case_at(),
+              kind: KInt,
+              ty: TyOpen([]),
+              of: None,
+              carrier: Whole(KBoxed),
+              lambda: None,
+            },
+            {
+              name: case_identity(),
+              kind: KBoxed,
+              ty: TyBytes,
+              of: None,
+              carrier: Whole(KBoxed),
+              lambda: None,
+            },
+          ]
+        };
+        let rooted = |name: Bytes, taken: List<EmitParam>, body: Expr|
+          root_emitted(
+            module,
+            t.span.start,
+            here,
+            imports,
+            ctors,
+            builtins,
+            effects,
+            release,
+            operands,
+            typed,
+            name,
+            taken.map(|p: EmitParam| p.name),
+            taken,
+            true,
+            sites,
+            body,
+          );
+        let run = if !wants(wanted, full) { acc.out }
+        else { acc.out.push(rooted(full, ps, test_run(t))) };
+        let out = match t.cases {
+          None -> run,
+          Some(c) -> if !wants(wanted, cases_root(full)) { run }
+          else { run.push(rooted(cases_root(full), [], test_listing(c))) },
+        };
+        { out: out, fns: acc.fns }
+      },
+      // A law's guard and body are roots the judge enters with the binders' values.
+      ILaw(d) -> {
+        let names = d.binders.map(|binder: Binder| binder.name.name);
+        let kinds = d.binders.map(|binder: Binder| Some(typed_kind(typed, binder.name.span)));
+        let ps = params_of(names, kinds);
+        let known = kinds.fold(true, |acc2: Bool, k: Option<{ kind: Kind, ty: Ty }>|
+          acc2 && k != None);
+        let part = |which: Bytes| law_root(module, d.name, which);
+        let with_guard = match d.guard {
+          None -> acc.out,
+          Some(g) -> if !wants(wanted, part(b"guard")) { acc.out } else {
+            acc.out.push(
+              root_emitted(
+                module,
+                d.span.start,
+                here,
+                imports,
+                ctors,
+                builtins,
+                effects,
+                release,
+                operands,
+                typed,
+                part(b"guard"),
+                names,
+                ps,
+                known,
+                sites,
+                g,
+              ),
+            )
+          },
+        };
+        {
+          out: if !wants(wanted, part(b"body")) { with_guard } else {
+            with_guard.push(
+              root_emitted(
+                module,
+                d.span.start,
+                here,
+                imports,
+                ctors,
+                builtins,
+                effects,
+                release,
+                operands,
+                typed,
+                part(b"body"),
+                names,
+                ps,
+                known,
+                sites,
+                d.body,
+              ),
+            )
+          },
+          fns: acc.fns,
+        }
+      },
+      // A sum some body compares or orders is compared through a root written from its
+      // constructors, written only where a body's call asks for it, not with every root a whole
+      // emission takes.
+      IType(t) -> {
+        let named = qualify(module, t.name.name);
+        let asked = |root: Bytes| match wanted { Some(w) -> w.contains(root), None -> false };
+        // At its own name, and at each list of arguments a body asked for one at.
+        let at_types = match wanted {
+          Some(w) ->
+            w.keys().fold(
+              [],
+              |acc2: List<{ root: Bytes, eq: Bool, args: List<Type> }>, n: Bytes|
+                if !n.starts_with(named.concat(b"<")) { acc2 } else {
+                  let eq = n.ends_with(b"#eq");
+                  if !eq && !n.ends_with(b"#cmp") { acc2 } else {
+                    match type_spelled(n.slice(0, n.len() - (if eq { 3 } else { 4 }))) {
+                      Some(TyCon(c)) -> acc2.push({ root: n, eq: eq, args: c.args }),
+                      _ -> acc2,
+                    }
+                  }
+                },
+            ),
+          None -> [],
+        };
+        match ctors.sums.get(named) {
+          None -> acc,
+          Some(declared) ->
+            [
+              {
+                root: equality_root(named),
+                asked: asked(equality_root(named)),
+                eq: true,
+                args: [],
+              },
+              {
+                root: ordering_root(named),
+                asked: asked(ordering_root(named)),
+                eq: false,
+                args: [],
+              },
+            ].concat(
+              at_types.map(|x: { root: Bytes, eq: Bool, args: List<Type> }|
+                { root: x.root, asked: true, eq: x.eq, args: x.args }),
+            ).fold(acc, |a2: Walk, d: { root: Bytes, asked: Bool, eq: Bool, args: List<Type> }|
+              if !d.asked { a2 } else {
+                let cs = if d.args.len() == 0 { declared } else {
+                  declared.map(|c: SumCtor|
+                    { ..c, fields: c.fields.map(|f: Type| at_args(f, c.params, d.args)) })
+                };
+                let e = if d.eq { equality_code(cs) } else { ordering_code(cs) };
+                let word = |n: Bytes|
+                  {
+                    name: n,
+                    kind: KBoxed,
+                    ty: TyOpen([]),
+                    of: None,
+                    carrier: Whole(KBoxed),
+                    lambda: None,
+                  };
+                {
+                  ..a2,
+                  out: a2.out.push(
+                    emitted_from(
+                      module,
+                      t.span.start,
+                      here,
+                      imports,
+                      ctors,
+                      builtins,
+                      effects,
+                      release,
+                      e.operands.fold(operands, |m: Map<Bytes, Bytes>, k: Bytes, v: Bytes|
+                        m.insert(k, v)),
+                      e.typed.fold(typed, |m: Map<Bytes, Typed>, k: Bytes, v: Typed|
+                        m.insert(k, v)),
+                      d.root,
+                      [word(b"a"), word(b"b")],
+                      true,
+                      ELit({ span: t.span, lit: LBool(false) }),
+                      Some(e.code),
+                    ),
+                  ),
+                }
+              }),
+        }
+      },
+      _ -> acc,
+    });
+  // A type some body reflects or digests is written for by a root, in this module where the body's
+  // call names it.
+  let written = match wanted {
+    None -> [],
+    Some(w) ->
+      w.keys().fold([], |acc: List<{ root: Bytes, op: Bytes, ty: Type }>, n: Bytes|
+        match written_root_of(n) {
+          Some(r) -> if r.module == module { acc.push({ root: n, op: r.op, ty: r.ty }) }
+          else { acc },
+          None -> acc,
+        }),
+  };
+  // What a container's roots call of `std.prelude` the load reaches wherever a body writes one.
+  let unreached = written_code().calls.filter(|n: Bytes|
+    match def_in(module, here, imports, n) { Some(_) -> false, None -> true });
+  written.fold(walked.out, |out: List<Emitted>, r: { root: Bytes, op: Bytes, ty: Type }|
+    if (container_ops().contains(r.op) || walked_container(r.ty)) && unreached.len() > 0 {
+      out.push({
+        name: r.root,
+        text: b"",
+        tables: no_tables(),
+        why: Some(
+          b"a container's root calls what the load did not reach of `std.prelude`: ".concat(
+            Bytes::join(unreached, b", "),
+          ),
+        ),
+        handles: [],
+      })
+    } else if container_ops().contains(r.op) || walked_container(r.ty) {
+      let e = container_code(module, r.op, r.ty);
+      let word = |n: Bytes|
+        {
+          name: n,
+          kind: KBoxed,
+          ty: kind_of(r.ty).ty,
+          of: Some(r.ty),
+          carrier: Whole(KBoxed),
+          lambda: None,
+        };
+      let index = {
+        name: b"i",
+        kind: KInt,
+        ty: TyOpen([]),
+        of: Some(int_type()),
+        carrier: Whole(KInt),
+        lambda: None,
+      };
+      out.push(
+        emitted_from(
+          module,
+          0,
+          here.concat(e.here),
+          imports,
+          ctors,
+          builtins,
+          effects,
+          release,
+          e.operands.fold(operands, |m: Map<Bytes, Bytes>, k: Bytes, v: Bytes| m.insert(k, v)),
+          e.typed.fold(typed, |m: Map<Bytes, Typed>, k: Bytes, v: Typed| m.insert(k, v)),
+          r.root,
+          if r.op.ends_with(b"_from") { [word(b"a"), word(b"b"), index] }
+          else if r.op == b"equal" || r.op == b"ordered" { [word(b"a"), word(b"b")] }
+          else { [word(b"a")] },
+          true,
+          ELit({ span: dummy_span(), lit: LBool(false) }),
+          Some(e.code),
+        ),
+      )
+    } else {
+      let e = if r.op == b"digest" { digest_code(module, ctors, here, x.module.items, r.ty) }
+      else { reflection_code(module, ctors, here, x.module.items, r.op == b"shown", r.ty) };
+      let held = kind_of(r.ty);
+      let word = reflected_kind(r.ty);
+      out.push(
+        emitted_from(
+          module,
+          0,
+          here,
+          imports,
+          ctors,
+          builtins,
+          effects,
+          release,
+          operands,
+          e.typed.fold(typed, |m: Map<Bytes, Typed>, k: Bytes, v: Typed| m.insert(k, v)),
+          r.root,
+          [{ name: b"a", kind: word, ty: held.ty, of: None, carrier: Whole(word), lambda: None }],
+          true,
+          ELit({ span: dummy_span(), lit: LBool(false) }),
+          Some(e.code),
+        ),
+      )
+    })
+}
+
+type Walk = { out: List<Emitted>, fns: Int }
+
+/// A label parameter is a hidden trailing `Int`: the caller passes the resource's field-table entry.
+fn prepare(
+  module: Bytes,
+  schemes: Map<Bytes, Scheme>,
+  wanted: Option<Map<Bytes, Bool>>,
+  sites: Map<Bytes, List<Bytes>>,
+  def: FnDef,
+) -> Prepared / {abort.raise} = {
+  let names = def.params.map(|param: Param| param.name.name);
+  let kinds = param_kinds(def, sig_of(schemes, qualify(module, def.name.name))).map(
+    |k: { kind: Kind, ty: Ty }| Some(k),
+  );
+  let labels = def.generics.labels.map(|ident: Ident| ident.name);
+  let all_names = labels.fold(names, |acc: List<Bytes>, n: Bytes| acc.push(n));
+  let all_kinds = labels.fold(kinds, |acc: List<Option<{ kind: Kind, ty: Ty }>>, n: Bytes|
+    acc.push(Some({ kind: KInt, ty: TyOpen([]) })));
+  let known = kinds.fold(true, |acc: Bool, k: Option<{ kind: Kind, ty: Ty }>| acc && k != None);
+  let full = qualify(module, def.name.name);
+  {
+    full: full,
+    base: def.span.start,
+    names: names,
+    kinds: kinds,
+    ps: params_carried(
+      all_names,
+      all_kinds,
+      carriers_of(def, sig_of(schemes, full)).params,
+      param_types(def, sig_of(schemes, full)),
+    ),
+    known: known,
+    body: def.body,
+    code: if known && wants(wanted, full) {
+      match lower_to_emit(names, labels, sites, def.body, of_binder(module)) {
+        Some(l) -> Some(l.code),
+        None -> None,
+      }
+    } else { None },
+  }
+}
+
+/// The other definitions of the module whose tail calls lead from `def` round to it again, each
+/// lowered as far as the walk reaches, wanted or not: the members of the loop `def` runs in.
+fn tail_cycle(
+  module: Bytes,
+  here: List<Def>,
+  sites: Map<Bytes, List<Bytes>>,
+  items: List<Item>,
+  def: FnDef,
+) -> List<Bytes> / {abort.raise} = {
+  let fns = items.fold(Map::new(), |acc: Map<Bytes, FnDef>, item: Item|
+    match item { IFn(d) -> acc.insert(d.name.name, d), _ -> acc });
+  let callees = |name: Bytes|
+    match fns.get(name) {
+      None -> [],
+      Some(d) -> match lower_to_emit(
+          d.params.map(|param: Param| param.name.name),
+          d.generics.labels.map(|ident: Ident| ident.name),
+          sites,
+          d.body,
+          of_binder(module),
+        ) {
+        Some(l) -> tail_callees(here, l.code, []),
+        None -> [],
+      },
+    };
+  let own = def.name.name;
+  let edges = iterate(
+    { edges: Map::new(), work: [own] },
+    1000000,
+    |s: { edges: Map<Bytes, List<Bytes>>, work: List<Bytes> }|
+      match s.work {
+        [] -> Stop(s),
+        [n, ..rest] -> if s.edges.contains(n) { Continue({ ..s, work: rest }) } else {
+          let out = callees(n);
+          Continue({ edges: s.edges.insert(n, out), work: rest.concat(out) })
+        },
+      },
+  ).edges;
+  let back = iterate(Map::new().insert(own, true), edges.len() + 1, |seen: Map<Bytes, Bool>| {
+    let more = edges.fold(seen, |acc: Map<Bytes, Bool>, n: Bytes, out: List<Bytes>|
+      if acc.contains(n) || !out.fold(false, |b: Bool, m: Bytes| b || acc.contains(m)) { acc }
+      else { acc.insert(n, true) });
+    if more.len() == seen.len() { Stop(seen) } else { Continue(more) }
+  });
+  back.keys().filter(|n: Bytes| n != own)
+}
+
+/// `here` with each definition named in `names` as a call reaches one that takes no type parameter:
+/// as it stands, at no specialisation.
+fn held_whole(here: List<Def>, names: List<Bytes>) -> List<Def> =
+  if names.len() == 0 { here }
+  else { here.map(|d: Def| if names.contains(d.name) { { ..d, scheme: None } } else { d }) }
+
+/// The module's definitions in tail-call cycles of two or more, each cycle's members in module order: a call in tail
+/// position of one member from another is an edge, so a group is exactly what can run as one loop. A member holding a
+/// `handle` keeps the whole cycle out, and only wanted, lowered definitions have edges, so every member is emitted.
+fn tail_groups(
+  module: Bytes,
+  here: List<Def>,
+  fns: List<Prepared>,
+) -> List<List<Int>> / {abort.raise} = {
+  let fulls = fns.map(|p: Prepared| p.full);
+  let adj = fns.map(|p: Prepared|
+    match p.code {
+      None -> [],
+      Some(c) ->
+        tail_callees(here, c, []).fold([], |acc: List<Int>, nm: Bytes|
+          match position_of(fulls, qualify(module, nm)) {
+            None -> acc,
+            Some(i) -> if acc.fold(false, |seen: Bool, j: Int| seen || j == i) { acc }
+            else { acc.push(i) },
+          }),
+    });
+  graph::components({ out: adj }).map(|c: List<Int>| sorted_widths(c)).filter(|c: List<Int>|
+    c.len() >= 2 && c.fold(true, |ok: Bool, i: Int| ok && loops_as_case(fns, i)))
+}
+
+fn loops_as_case(fns: List<Prepared>, i: Int) -> Bool =
+  match fns.at(i) {
+    Some(p) -> match p.code { Some(code) -> !has_handle(code), None -> false },
+    None -> false,
+  }
+
+fn group_of(groups: List<List<Int>>, i: Int) -> Option<List<Int>> =
+  groups.fold(None, |acc: Option<List<Int>>, g: List<Int>|
+    if g.fold(false, |seen: Bool, j: Int| seen || j == i) { Some(g) } else { acc })
+
+/// The same-module definitions called in tail position, walking the positions `tail` is kept into.
+fn tail_callees(here: List<Def>, code: Code, acc: List<Bytes>) -> List<Bytes> / {abort.raise} =
+  match code.node {
+    NApp(a) -> match a.func.node {
+      NVar(fv) -> if fv.slot == None && !is_ctor_name(fv.name)
+          && here.fold(false, |ok: Bool, h: Def|
+            ok || (h.name == fv.name && h.arity == a.args.len())) { acc.push(fv.name) }
+      else { acc },
+      _ -> acc,
+    },
+    NBinary(b) -> if b.op == b"and" || b.op == b"or" { tail_callees(here, b.rhs, acc) }
+    else { acc },
+    NIf(i) -> tail_callees(here, i.else_branch, tail_callees(here, i.then_branch, acc)),
+    NBlock(b) -> match b.tail { Some(t) -> tail_callees(here, t, acc), None -> acc },
+    NMatch(m) -> m.arms.fold(acc, |a: List<Bytes>, arm: CodeArm| tail_callees(here, arm.body, a)),
+    _ -> acc,
+  }
+
+/// `requires` and `ensures` clauses as roots: `<owner>#requires#<k>`, `<owner>#ensures#<k>`.
+fn clause_roots(
+  acc: Walk,
+  def: FnDef,
+  names: List<Bytes>,
+  kinds: List<Option<{ kind: Kind, ty: Ty }>>,
+  module: Bytes,
+  here: List<Def>,
+  imports: List<Imported>,
+  ctors: Ctors,
+  builtins: List<Bytes>,
+  effects: List<EffectName>,
+  release: Bool,
+  operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
+  sig: Option<Sig>,
+  wanted: Option<Map<Bytes, Bool>>,
+  sites: Map<Bytes, List<Bytes>>,
+) -> Walk / {abort.raise} = {
+  let known = kinds.fold(true, |acc2: Bool, k: Option<{ kind: Kind, ty: Ty }>| acc2 && k != None);
+  let clause = |kind: Bytes, k: Int|
+    qualify(module, Bytes::concat_all([def.name.name, b"#", kind, b"#", ascii_of_int(k)]));
+  let walked = def.spec.fold(
+    { out: acc.out, requires: 0, ensures: 0 },
+    |s: { out: List<Emitted>, requires: Int, ensures: Int }, c: SpecClause|
+      match c.kind {
+        SRequires -> {
+          let full = clause(b"requires", s.requires);
+          {
+            out: if !wants(wanted, full) { s.out } else {
+              s.out.push(
+                root_emitted(
+                  module,
+                  def.span.start,
+                  here,
+                  imports,
+                  ctors,
+                  builtins,
+                  effects,
+                  release,
+                  operands,
+                  typed,
+                  full,
+                  names,
+                  params_of(names, kinds),
+                  known,
+                  sites,
+                  c.expr,
+                ),
+              )
+            },
+            requires: s.requires + 1,
+            ensures: s.ensures,
+          }
+        },
+        SEnsures -> match def.ret {
+          None -> { out: s.out, requires: s.requires, ensures: s.ensures + 1 },
+          Some(r) -> {
+            let full = clause(b"ensures", s.ensures);
+            let rnames = names.push(b"result");
+            let rkinds = kinds.push(Some(match sig { Some(s) -> kind_of(s.ret), None -> boxed() }));
+            let rknown = known;
+            {
+              out: if !wants(wanted, full) { s.out } else {
+                s.out.push(
+                  root_emitted(
+                    module,
+                    def.span.start,
+                    here,
+                    imports,
+                    ctors,
+                    builtins,
+                    effects,
+                    release,
+                    operands,
+                    typed,
+                    full,
+                    rnames,
+                    params_of(rnames, rkinds),
+                    rknown,
+                    sites,
+                    c.expr,
+                  ),
+                )
+              },
+              requires: s.requires,
+              ensures: s.ensures + 1,
+            }
+          },
+        },
+        // A bound is read off the body, and never run.
+        SCost -> s,
+        SSpace -> s,
+      },
+  );
+  { out: walked.out, fns: acc.fns }
+}
+
+/// The roots `wanted` names, resolved against the whole program: one entry per root emitted or
+/// refused, in its order, so the driver can drop what was refused. `embeds` is what the front end's
+/// answer says it embedded, `rows` what it published for every definition and test, which spare a
+/// walk of every module no wanted root is in, and `walked` what its check read of the modules it
+/// walked whole, which spares a walk of those too.
+pub fn emit_roots_answer(
+  names: List<Bytes>,
+  srcs: List<Bytes>,
+  ctors: Ctors,
+  builtins: List<Bytes>,
+  wanted: List<Bytes>,
+  pkgs: List<PackageDeps>,
+  module_packages: List<Int>,
+  embeds: List<EmbedAt>,
+  rows: Rows,
+  walked: Bytes,
+) -> List<RootAnswer> / {abort.raise} =
+  emit_program(
+    zip_sources(names, srcs),
+    ctors,
+    builtins,
+    true,
+    Some(wanted.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true))),
+    pkgs,
+    module_packages,
+    embeds,
+    rows,
+    walked,
+  ).map(
+    answer_of,
+  )
+
+fn answer_of(e: Emitted) -> RootAnswer =
+  {
+    name: e.name,
+    answer: match e.why {
+      Some(w) -> Refused({ why: w, handles: e.handles }),
+      None -> Body({ text: e.text, tables: e.tables }),
+    },
+  }
+
+pub fn zip_sources(names: List<Bytes>, srcs: List<Bytes>) -> List<Source> =
+  range(0, names.len()).map(|i: Int|
+    {
+      name: match names.at(i) { Some(n) -> n, None -> b"" },
+      src: match srcs.at(i) { Some(t) -> t, None -> b"" },
+    })

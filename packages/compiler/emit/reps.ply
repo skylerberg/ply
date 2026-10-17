@@ -1,0 +1,949 @@
+//! How the emitter holds a value of a type: kinds, carriers, record and constructor layouts, and erasure.
+
+import syntax.parsing (Ident, Span, span_key)
+import syntax.items (FnDef)
+import check.resolve.tables (qualify)
+import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, int_type)
+import emit.typing (Typed, unknown_type)
+import front.rows (CtorRow)
+import std.list
+import check.lent (passed)
+import std.bytes (ascii_of_int)
+import emit.c (KBool, KBoxed, KDec, KFloat, KInt, KNum, KSum, Kind, SumSpec, Tagged, Zeroed, is_sum,
+               ctype, width_named, carried, in_imm, bytes_join, int_lit, push_front_bytes)
+import emit.roots (specialised, specialised_with, specialisation_of)
+
+/// `TyArr`: an array, with how it holds its elements where its element type says (as a record's field
+/// `e` of that type is held), and `None` where the type is a variable's.
+/// The program's constructor table: the names its tags are positions of, and the arguments of each
+/// constructor whose declaration lays one out other than as its word.
+pub type Ctors = {
+  names: List<Bytes>,
+  laid: Map<Bytes, List<FieldTy>>,
+  keyed: List<Bytes>,
+  /// Each declared sum's constructors in their order, by the sum's name.
+  sums: Map<Bytes, List<SumCtor>>,
+}
+
+/// A constructor of a declared sum, by its program-wide name, its arguments' declared types, and the
+/// variable each of the sum's parameters is in them, in the parameters' order.
+pub type SumCtor = { name: Bytes, index: Int, fields: List<Type>, params: List<Int> }
+
+pub fn no_ctors() -> Ctors = { names: [], laid: Map::new(), keyed: [], sums: Map::new() }
+
+/// Each declared sum's constructors, by the sum's name, in their declared order.
+pub fn ctor_sums(rows: List<CtorRow>) -> Map<Bytes, List<SumCtor>> =
+  rows.fold(Map::new(), |acc: Map<Bytes, List<SumCtor>>, c: CtorRow| {
+    let had = match acc.get(c.type_name) { Some(cs) -> cs, None -> [] };
+    // The arguments' types and the type made of them, in the scheme's one numbering.
+    let typed = match c.scheme.ty {
+      TyFn(f) -> { fields: f.params, made: f.ret },
+      t -> { fields: c.fields, made: t },
+    };
+    let params = match typed.made {
+      TyCon(t) -> t.args.map(|a: Type| match a { TyVar(v) -> v, _ -> 0 - 1 }),
+      _ -> [],
+    };
+    let mine = { name: c.name, index: c.index, fields: typed.fields, params: params };
+    acc.insert(
+      c.type_name,
+      had.filter(|x: SumCtor| x.index < c.index).concat(
+        [mine].concat(had.filter(|x: SumCtor| x.index > c.index)),
+      ),
+    )
+  })
+
+/// `TyOpen([])` names the type variables that left the layout unknown, which a specialisation settles.
+/// `TyOf` is a word of an `Option` or a `Result`, whose type says what each constructor's argument
+/// is laid out as.
+pub type Ty =
+  | TyOpen(List<Int>)
+  | TyRec(List<FieldTy>)
+  | TyBytes
+  | TyList
+  | TyArr(Option<FieldTy>)
+  | TyOf(Type)
+
+/// The type variables `ty` names, each once.
+pub fn type_vars(ty: Type) -> List<Int> =
+  match ty {
+    TyVar(v) -> if v >= 0 { [v] } else { [] },
+    TyCon(c) -> c.args.fold([], |acc: List<Int>, a: Type| ints_joined(acc, type_vars(a))),
+    TyFn(f) ->
+      f.params.push(f.ret).fold([], |acc: List<Int>, a: Type| ints_joined(acc, type_vars(a))),
+    TyRecord(fs) -> fs.fold([], |acc: List<Int>, f: Field| ints_joined(acc, type_vars(f.ty))),
+    TyNominal(x) -> x.args.fold([], |acc: List<Int>, a: Type| ints_joined(acc, type_vars(a))),
+  }
+
+fn ints_joined(a: List<Int>, b: List<Int>) -> List<Int> =
+  b.fold(a, |acc: List<Int>, x: Int| if acc.contains(x) { acc } else { acc.push(x) })
+
+pub fn laid_vars(ty: Type) -> List<Int> =
+  match ty {
+    TyVar(v) -> if v >= 0 { [v] } else { [] },
+    TyRecord(fs) -> fs.fold([], |acc: List<Int>, f: Field| acc.concat(laid_vars(f.ty))),
+    TyNominal(x) -> x.fields.fold([], |acc: List<Int>, f: Field| acc.concat(laid_vars(f.ty))),
+    TyCon(c) -> if (c.name == b"Array" || c.name == b"Columns") && c.args.len() == 1 {
+      c.args.fold([], |acc: List<Int>, a: Type| acc.concat(laid_vars(a)))
+    } else { [] },
+    _ -> [],
+  }
+
+/// Fields in written order; a field's kind decides whether reading it unboxes, so it must not default to `KInt`.
+pub type FieldTy = { name: Bytes, kind: Kind, ty: Ty }
+
+/// `ret_ty` keeps a record answer's fields so later reads get offsets; `pure` lets a nullary call come from the constant table.
+pub type Def = {
+  name: Bytes,
+  ret: Option<Kind>,
+  ret_ty: Ty,
+  pure: Bool,
+  arity: Int,
+  scheme: Option<Scheme>,
+  /// How each parameter its function takes and its answer cross a call, as `carriers_of` says, and
+  /// how many witnesses come before the parameters its scheme writes.
+  carriers: List<Carrier>,
+  answer: Carrier,
+  witnesses: Int,
+  /// The parameters, by place, whose functions a call lends: the callee only calls them and hands
+  /// them on to parameters it lends in turn.
+  lent: List<Int>,
+}
+
+/// An imported name lowers like a builtin; only the import list tells them apart. `defs` is empty when the module is out of reach.
+/// `whole` binds the module itself, which only a qualified name reaches: a bare `min` is never a module `min`.
+pub type Imported = { name: Bytes, module: Bytes, defs: List<Def>, whole: Bool }
+
+pub type ModuleDefs = { module: Bytes, defs: List<Def> }
+
+/// How a value crosses a call between roots: whole, as its word or as its value in its own C type;
+/// a small flat record as each of its fields in its own C type; or a sum one of whose constructors
+/// holds such a record as its constructor's index and then each constructor's argument as it
+/// crosses. A record answer returns its first field and a sum's its index, and each writes the
+/// rest through pointers its caller hands it.
+pub type Carrier = | Whole(Kind) | Fields(List<FieldTy>) | Cases(SumCases)
+
+/// A sum held as `spec` says where it is a word, and its constructors in their declared order,
+/// each with how its argument crosses: never as a sum's cases.
+pub type SumCases = { spec: SumSpec, cases: List<SumCase> }
+
+pub type SumCase = { name: Bytes, arg: Option<Carrier> }
+
+/// Whether a record holds a value of `kind` as its own words rather than as a word: an `Int`, a
+/// width, a `Float` or a `Decimal`. A width below 64 bits is held as the `Int` it stands for.
+pub fn raw_slot(kind: Kind) -> Bool =
+  match kind { KInt -> true, KFloat -> true, KDec -> true, KNum(_) -> true, _ -> false }
+
+/// The kind a slot holding a value of `kind` as a word reads as: an `Option` its payload's word.
+pub fn word_kind(kind: Kind) -> Kind = if kind == KSum(Zeroed) { KSum(Zeroed) } else { KBoxed }
+
+/// The words a record holds a field of `kind` in: a `Decimal`'s two, and one for any other.
+pub fn raw_words(kind: Kind) -> Int = match kind { KDec -> 2, _ -> 1 }
+
+/// The fields of the record a field holds in place: one of a record type, which its record copies
+/// into its own words.
+pub fn in_place(f: FieldTy) -> Option<List<FieldTy>> =
+  match f.ty { TyRec(fs) -> Some(fs), _ -> None }
+
+/// Where a record of `fs` holds each field, how many words it holds, the words of the tail a mixed
+/// one's bitmap takes after them, and which words it counts: a field takes a word, and a record held
+/// in place its header's two, its own and its tail's. `heap::Shapes` lays a shape out alike.
+pub type Laid = { width: Int, tail: Int, offsets: List<Int>, counted: List<Int> }
+
+pub fn laid_of(fs: List<FieldTy>) -> Laid = {
+  let s = fs.fold(
+    { at: 0, offsets: [], counted: [] },
+    |acc: { at: Int, offsets: List<Int>, counted: List<Int> }, f: FieldTy|
+      match f.ty {
+        TyRec(inner) -> {
+          let l = laid_of(inner);
+          {
+            at: acc.at + 2 + l.width + l.tail,
+            offsets: acc.offsets.push(acc.at),
+            counted: acc.counted.concat(l.counted.map(|c: Int| acc.at + 2 + c)),
+          }
+        },
+        _ ->
+          {
+            at: acc.at + raw_words(f.kind),
+            offsets: acc.offsets.push(acc.at),
+            counted: if raw_slot(f.kind) { acc.counted } else { acc.counted.push(acc.at) },
+          },
+      },
+  );
+  let n = s.counted.len();
+  {
+    width: s.at,
+    tail: if n > 0 && n < s.at { (s.at + 63) / 64 } else { 0 },
+    offsets: s.offsets,
+    counted: s.counted,
+  }
+}
+
+/// A field as a shape spells it: a scalar held as its bits after its name, a width below 64 bits as
+/// the `Int` it stands for, and a record held in place after its name with its own shape's fields,
+/// all below every byte a name holds so a shape sorts as its names do.
+pub fn spelled_field(f: FieldTy) -> Bytes =
+  match f.ty {
+    TyRec(inner) ->
+      Bytes::concat_all([f.name, b"!r(", bytes_join(inner.map(spelled_field), b","), b")"]),
+    _ -> match f.kind {
+      KInt -> f.name.concat(b"!int"),
+      KFloat -> f.name.concat(b"!f"),
+      KDec -> f.name.concat(b"!d"),
+      KSum(_) -> f.name.concat(b"!m"),
+      KNum(w) ->
+        f.name.concat(if in_imm(w) { b"!int" } else if w.signed { b"!i64" } else { b"!u64" }),
+      _ -> f.name,
+    },
+  }
+
+/// A record's flags: flat when none of its words holds a count, mixed when its tail says which
+/// do, raw when it holds a scalar's bits or a record in place.
+pub fn record_flags(fs: List<FieldTy>, l: Laid) -> Int = {
+  let raw = if fs.fold(false, |acc: Bool, f: FieldTy|
+      acc || raw_slot(f.kind) || f.kind == KSum(Zeroed) || in_place(f) != None) { 4 }
+  else { 0 };
+  if l.width > 0 && leaves_uncounted(fs) { 1 + raw } else if l.tail > 0 { 2 + raw } else { raw }
+}
+
+fn leaves_uncounted(fs: List<FieldTy>) -> Bool =
+  fs.fold(true, |acc: Bool, f: FieldTy|
+    acc
+      && (match f.ty {
+        TyRec(inner) -> leaves_uncounted(inner),
+        _ -> match f.kind {
+          KInt -> true,
+          KNum(_) -> true,
+          KBool -> true,
+          KFloat -> true,
+          KDec -> true,
+          _ -> false,
+        },
+      }))
+
+pub fn has_tail(flags: Int) -> Bool = flags & 2 != 0
+
+/// Whether a record of `fs` is held back as its fields' values until its word is asked for: one of
+/// no record held in place.
+fn holdable(fs: List<FieldTy>) -> Bool =
+  fs.len() > 0 && fs.fold(true, |ok: Bool, f: FieldTy| ok && in_place(f) == None)
+
+/// The bitmap after a mixed record's words: a bit set for each word it counts, 64 to a word.
+pub fn tail_bits(l: Laid) -> List<Bytes> =
+  range(0, l.tail).map(|t: Int|
+    int_lit(
+      l.counted.fold(0, |acc: Int, c: Int| if c / 64 == t { acc | 1 << c % 64 } else { acc }),
+    ))
+
+pub fn kinds_of(fs: List<FieldTy>) -> List<Kind> = fs.map(|f: FieldTy| f.kind)
+
+pub fn kind_at(kinds: List<Kind>, at: Int) -> Kind =
+  match kinds.at(at) { Some(k) -> k, None -> KBoxed }
+
+/// Whether `t` is a `Result` whose error is always an object, which compiled code holds as one word.
+pub fn tagged_result(t: Type) -> Bool =
+  match t {
+    TyCon(c) ->
+      c.name == b"Result" && c.args.len() == 2
+        && (match c.args.at(1) { Some(e) -> always_object(e), None -> false }),
+    _ -> false,
+  }
+
+/// Whether every value of `t` is an object's word: a record, a function, a list, map, array or
+/// columns, bytes or a string, a sum a module declares or a `Result`; never an immediate or zero.
+fn always_object(t: Type) -> Bool =
+  match t {
+    TyRecord(_) -> true,
+    TyNominal(_) -> true,
+    TyFn(_) -> true,
+    TyCon(c) ->
+      c.name.index_of(b".") != None || c.name == b"Result" || c.name == b"Bytes"
+        || c.name == b"String"
+        || c.name == b"List"
+        || c.name == b"Map"
+        || c.name == b"Array"
+        || c.name == b"Columns",
+    _ -> false,
+  }
+
+fn is_option_type(t: Type) -> Bool =
+  match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
+
+// --- Externs written in place -----------------------------------------------------
+
+/// Field `k` of `fs`; one of no name past the end.
+pub fn nth_field(fs: List<FieldTy>, k: Int) -> FieldTy =
+  match fs.at(k) { Some(f) -> f, None -> { name: b"", kind: KBoxed, ty: TyOpen([]) } }
+
+/// The words a record of `ty` holds, which is the reuse token its cells make.
+pub fn width_of(ty: Ty) -> Option<Int> =
+  match ty { TyRec(fs) -> Some(laid_of(fs).width), _ -> None }
+
+/// Where field `name` starts among a record's words: after the words of the fields that sort
+/// before it.
+pub fn field_at(ty: Ty, name: Bytes) -> Option<{ at: Int, kind: Kind, ty: Ty }> =
+  match ty {
+    TyRec(fs) -> {
+      let offsets = laid_of(fs).offsets;
+      range(0, fs.len()).fold(None, |acc: Option<{ at: Int, kind: Kind, ty: Ty }>, i: Int|
+        match fs.at(i) {
+          Some(field) -> if field.name == name {
+            Some({
+              at: match offsets.at(i) { Some(o) -> o, None -> i },
+              kind: field.kind,
+              ty: field.ty,
+            })
+          } else { acc },
+          None -> acc,
+        })
+    },
+    _ -> None,
+  }
+
+/// Whether two values of the type `name` compare as the constructors of a sum the program declares
+/// do: not an `Option` or a `Result`, which are held as words, not a type whose module states a
+/// `key`, whose values compare as their keys do, and, where no module declares it, one of no
+/// constructor's argument, which has no module to write its root in.
+pub fn compared_by_ctors(ctors: Ctors, name: Bytes) -> Bool =
+  name != b"Option" && name != b"Result"
+    && (match ctors.sums.get(name) {
+      Some(cs) ->
+        cs.len() > 0 && cs.fold(true, |ok: Bool, c: SumCtor| ok && !ctors.keyed.contains(c.name))
+          && (name.index_of(b".") != None || nullary_sum(cs)),
+      None -> false,
+    })
+
+/// Whether `t` is a sum a module declares generic, at arguments known throughout, which roots
+/// written for it at those arguments compare and order as `T#eq` and `T#cmp` do its declared type.
+pub fn generic_sum(ctors: Ctors, t: Type) -> Bool =
+  !has_vars(t)
+    && (match t {
+      TyCon(c) ->
+        c.args.len() > 0 && c.name.index_of(b".") != None && compared_by_ctors(ctors, c.name)
+          && regular_sum(ctors, c.name),
+      _ -> false,
+    })
+
+/// Whether the roots written for the declared sum `name` at arguments are finitely many: no chain of
+/// sums from one of its parameters back to one holds it at a grown type, as `Nest<a>` holding a
+/// `Nest<List<a>>`, or `A<a>` a `B<List<a>>` holding an `A<a>`, does.
+fn regular_sum(ctors: Ctors, name: Bytes) -> Bool = {
+  let steps = sums_reached(ctors, name).fold([], |acc: List<ParamStep>, s: Bytes|
+    acc.concat(param_steps(ctors, s)));
+  let from = |p: Bytes| positions_reached(steps, p).push(p);
+  let own = steps.fold([], |acc: List<Bytes>, s: ParamStep|
+    if s.from.starts_with(name.concat(b"#")) && !acc.contains(s.from) { acc.push(s.from) }
+    else { acc });
+  steps.all(|s: ParamStep|
+    !s.grown || !own.any(|p: Bytes| from(s.to).contains(p) && from(p).contains(s.from)))
+}
+
+/// Whether `reflect`, `shown` and `digest` of a value of the sum `c` names are written by a root:
+/// the runtime reads one whose roots would be endless.
+pub fn written_sum(ctors: Ctors, c: { name: Bytes, args: List<Type> }) -> Bool =
+  ctors.sums.contains(c.name) && (c.args.len() == 0 || regular_sum(ctors, c.name))
+
+/// A sum's parameter, `from`, in a constructor's argument as a sum's argument `to`, or inside it
+/// (`grown`); a position is the sum's name and the parameter's index.
+type ParamStep = { from: Bytes, to: Bytes, grown: Bool }
+
+/// Every declared sum `name`'s constructors hold, through chains of sums, `name` first.
+fn sums_reached(ctors: Ctors, name: Bytes) -> List<Bytes> =
+  range(0, ctors.sums.len()).fold(
+    { seen: [name], at: 0 },
+    |s: { seen: List<Bytes>, at: Int }, _: Int|
+      match s.seen.at(s.at) {
+        None -> s,
+        Some(n) ->
+          {
+            seen: held_sums(ctors, n).fold(s.seen, |acc: List<Bytes>, o: Bytes|
+              if acc.contains(o) { acc } else { acc.push(o) }),
+            at: s.at + 1,
+          },
+      },
+  ).seen
+
+fn held_sums(ctors: Ctors, n: Bytes) -> List<Bytes> =
+  match ctors.sums.get(n) {
+    None -> [],
+    Some(cs) ->
+      cs.fold([], |acc: List<Bytes>, c: SumCtor|
+        c.fields.fold(acc, |a: List<Bytes>, f: Type|
+          a.concat(sums_in(ctors, f).map(|o: { name: Bytes, args: List<Type> }| o.name)))),
+  }
+
+fn param_steps(ctors: Ctors, s: Bytes) -> List<ParamStep> =
+  match ctors.sums.get(s) {
+    None -> [],
+    Some(cs) ->
+      cs.fold([], |acc: List<ParamStep>, c: SumCtor|
+        c.fields.fold(acc, |a: List<ParamStep>, f: Type|
+          sums_in(ctors, f).fold(a, |b: List<ParamStep>, o: { name: Bytes, args: List<Type> }|
+            range(0, o.args.len()).fold(b, |d: List<ParamStep>, j: Int|
+              range(0, c.params.len()).fold(d, |e: List<ParamStep>, i: Int|
+                match c.params.at(i) {
+                  None -> e,
+                  Some(p) -> match o.args.at(j) {
+                    None -> e,
+                    Some(arg) -> {
+                      let step = |grown: Bool|
+                        e.push({
+                          from: s.concat(b"#").concat(ascii_of_int(i)),
+                          to: o.name.concat(b"#").concat(ascii_of_int(j)),
+                          grown: grown,
+                        });
+                      if arg == TyVar(p) { step(false) }
+                      else if type_vars(arg).contains(p) { step(true) }
+                      else { e }
+                    },
+                  },
+                }))))),
+  }
+
+/// Each declared sum `t` names, at the arguments it names it at, those inside them included.
+fn sums_in(ctors: Ctors, t: Type) -> List<{ name: Bytes, args: List<Type> }> =
+  match t {
+    TyVar(_) -> [],
+    TyCon(k) -> {
+      let inner = k.args.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, a: Type|
+        acc.concat(sums_in(ctors, a)));
+      if ctors.sums.contains(k.name) { inner.push({ name: k.name, args: k.args }) } else { inner }
+    },
+    TyFn(f) ->
+      f.params.fold(
+        sums_in(ctors, f.ret),
+        |acc: List<{ name: Bytes, args: List<Type> }>, a: Type| acc.concat(sums_in(ctors, a)),
+      ),
+    TyRecord(fs) ->
+      fs.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, f: Field|
+        acc.concat(sums_in(ctors, f.ty))),
+    TyNominal(x) ->
+      x.fields.fold(
+        x.args.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, a: Type|
+          acc.concat(sums_in(ctors, a))),
+        |acc: List<{ name: Bytes, args: List<Type> }>, f: Field| acc.concat(sums_in(ctors, f.ty)),
+      ),
+  }
+
+/// Every position a chain of one or more steps leads to from `from`: no chain is longer than the steps.
+fn positions_reached(steps: List<ParamStep>, from: Bytes) -> List<Bytes> = {
+  let next = |n: Bytes| steps.filter(|s: ParamStep| s.from == n).map(|s: ParamStep| s.to);
+  range(0, steps.len()).fold(next(from), |seen: List<Bytes>, _: Int|
+    seen.fold(seen, |acc: List<Bytes>, n: Bytes|
+      next(n).fold(acc, |more: List<Bytes>, m: Bytes|
+        if more.contains(m) { more } else { more.push(m) })))
+}
+
+/// Whether every constructor of a sum is of no argument, so a value of it is its constructor alone.
+pub fn nullary_sum(cs: List<SumCtor>) -> Bool =
+  cs.fold(true, |ok: Bool, c: SumCtor| ok && c.fields.len() == 0)
+
+/// How a value of `ty` is held: an `Int` or a `Bool` untagged, a width below 64 bits in its own C
+/// type, a `Float` in a `double`, anything else a word, with what a field read or an inline builtin
+/// can take of its type.
+pub fn kind_of(ty: Type) -> { kind: Kind, ty: Ty } =
+  match ty {
+    TyCon(c) -> if c.args.len() == 0 && c.name == b"Int" { { kind: KInt, ty: TyOpen([]) } }
+    else if c.args.len() == 0 && c.name == b"Bool" { { kind: KBool, ty: TyOpen([]) } }
+    else if c.args.len() == 0 && c.name == b"Float" { { kind: KFloat, ty: TyOpen([]) } }
+    else if c.args.len() == 0 && c.name == b"Decimal" { { kind: KDec, ty: TyOpen([]) } }
+    else if c.args.len() == 0 && c.name == b"Bytes" { { kind: KBoxed, ty: TyBytes } }
+    else if c.args.len() == 1 && c.name == b"List" { { kind: KBoxed, ty: TyList } }
+    else if c.args.len() == 1 && c.name == b"Array" {
+      {
+        kind: KBoxed,
+        ty: TyArr(match c.args.at(0) { Some(e) -> laid_field(b"e", e), None -> None }),
+      }
+    }
+    // A width below 64 bits is carried in a register; the wider ones are the runtime's own words.
+    else if c.args.len() == 0 {
+      match width_named(c.name) {
+        Some(w) -> if carried(w) { { kind: KNum(w), ty: TyOpen([]) } } else { boxed() },
+        None -> boxed(),
+      }
+    } else { boxed() },
+    // Field order is the checker's, sorted by name. A field of a variable's type may hold any kind's
+    // word or bits, and a record it holds in place any width, so such a record is read by name, as
+    // the runtime reads it.
+    TyRecord(fs) -> if open_fields(fs) { { kind: KBoxed, ty: TyOpen(laid_vars(ty)) } }
+    else { { kind: KBoxed, ty: TyRec(fs.map(field_ty)) } },
+    // At run time a `new` record is the record it is written as.
+    TyNominal(x) -> if open_fields(x.fields) { { kind: KBoxed, ty: TyOpen(laid_vars(ty)) } }
+    else { { kind: KBoxed, ty: TyRec(x.fields.map(field_ty)) } },
+    TyVar(v) -> { kind: KBoxed, ty: TyOpen(if v >= 0 { [v] } else { [] }) },
+    _ -> boxed(),
+  }
+
+pub fn boxed() -> { kind: Kind, ty: Ty } = { kind: KBoxed, ty: TyOpen([]) }
+
+/// Each constructor whose declaration lays out an argument other than as its word: its arguments,
+/// `a000` first, each held as a record's field of its declared type is. An argument of a variable's
+/// type, or of a record holding one, is its word, so a constructor's layout is its own.
+pub fn ctor_layouts(ctors: List<CtorRow>) -> Map<Bytes, List<FieldTy>> =
+  ctors.fold(Map::new(), |acc: Map<Bytes, List<FieldTy>>, c: CtorRow| {
+    let args = range(0, c.fields.len()).map(|i: Int| {
+      let name = Bytes::concat_all([
+        b"a",
+        ascii_of_int(i / 100),
+        ascii_of_int(i / 10 % 10),
+        ascii_of_int(i % 10),
+      ]);
+      match match c.fields.at(i) { Some(t) -> laid_field(name, t), None -> None } {
+        Some(f) -> f,
+        None -> { name: name, kind: KBoxed, ty: TyOpen([]) },
+      }
+    });
+    if args.fold(false, |laid: Bool, f: FieldTy|
+        laid || raw_slot(f.kind) || f.kind == KSum(Zeroed) || in_place(f) != None) {
+      acc.insert(c.name, args)
+    } else { acc }
+  })
+
+/// How a record's field `name` of type `t` is held, wherever the record is made; `None` where that
+/// depends on what the field turns out to hold: a variable's type, or a record holding one.
+pub fn laid_field(name: Bytes, t: Type) -> Option<FieldTy> =
+  match t {
+    TyVar(_) -> None,
+    TyRecord(fs) -> if open_fields(fs) { None } else { Some(field_ty({ name: name, ty: t })) },
+    TyNominal(x) -> if open_fields(x.fields) { None }
+    else { Some(field_ty({ name: name, ty: t })) },
+    _ -> Some(field_ty({ name: name, ty: t })),
+  }
+
+fn open_fields(fs: List<Field>) -> Bool =
+  fs.fold(false, |open: Bool, f: Field|
+    open
+      || (match f.ty {
+        TyVar(_) -> true,
+        TyRecord(inner) -> open_fields(inner),
+        TyNominal(x) -> open_fields(x.fields),
+        _ -> false,
+      }))
+
+fn field_ty(f: Field) -> FieldTy = {
+  let k = kind_of(f.ty);
+  // An `Option` is held as its payload's word, as the runtime holds one it lays out.
+  { name: f.name, kind: if is_option_type(f.ty) { KSum(Zeroed) } else { k.kind }, ty: k.ty }
+}
+
+/// What a definition's scheme says it takes and answers.
+pub type Sig = { params: List<Type>, ret: Type }
+
+pub fn sig_of(schemes: Map<Bytes, Scheme>, full: Bytes) -> Option<Sig> =
+  match schemes.get(full) {
+    Some(s) -> match s.ty { TyFn(f) -> Some({ params: f.params, ret: f.ret }), _ -> None },
+    None -> None,
+  }
+
+/// How each parameter of `def` arrives: the witnesses the expansion put before what the definition
+/// writes are `Int`s, and the rest are as its scheme says. A parameter no scheme speaks for is a word,
+/// which every parameter arrives as.
+pub fn param_kinds(def: FnDef, sig: Option<Sig>) -> List<{ kind: Kind, ty: Ty }> = {
+  let given = match sig { Some(s) -> s.params, None -> [] };
+  let witnesses = def.params.len() - given.len();
+  range(0, def.params.len()).map(|i: Int|
+    if i < witnesses { { kind: KInt, ty: TyOpen([]) } }
+    else { match given.at(i - witnesses) { Some(t) -> kind_of(t), None -> boxed() } })
+}
+
+/// The type of each parameter of `def`, as `param_kinds` reads them; none where no scheme speaks.
+pub fn param_types(def: FnDef, sig: Option<Sig>) -> List<Option<Type>> = {
+  let given = match sig { Some(s) -> s.params, None -> [] };
+  let witnesses = def.params.len() - given.len();
+  range(0, def.params.len()).map(|i: Int|
+    if i < witnesses { Some(int_type()) } else { given.at(i - witnesses) })
+}
+
+/// The type the checker filed at `span`, as a value of it is held; a word where it filed none.
+pub fn typed_kind(typed: Map<Bytes, Typed>, span: Span) -> { kind: Kind, ty: Ty } =
+  match typed.get(span_key(span)) { Some(t) -> kind_of(t.ty), None -> boxed() }
+
+// --- Specialisation ----------------------------------------------------------------------------
+
+/// What a value's layout reads of its type, every other part a known word, `_`: a scalar, a byte
+/// string, an `Option` or a list whatever it holds, an array or columns by its element, a record by
+/// its fields, and a variable as itself, for what the type it stands for reads.
+pub fn erased(ty: Type) -> Type =
+  match ty {
+    TyVar(_) -> ty,
+    TyCon(c) -> if c.args.len() == 0 && laid_scalar(c.name) { ty }
+    else if c.args.len() == 1 && (c.name == b"List" || c.name == b"Option") {
+      TyCon({ name: c.name, args: [word_type()] })
+    } else if c.args.len() == 1 && (c.name == b"Array" || c.name == b"Columns") {
+      TyCon({ name: c.name, args: c.args.map(erased) })
+    } else { word_type() },
+    TyRecord(fs) -> TyRecord(fs.map(erased_field)),
+    TyNominal(x) -> TyRecord(x.fields.map(erased_field)),
+    _ -> word_type(),
+  }
+
+/// A position a specialisation leaves as its definition has it: a variable no call settles.
+fn erased_field(f: Field) -> Field = { name: f.name, ty: erased(f.ty) }
+
+/// A type whose values are words and say nothing more of their layout.
+pub fn word_type() -> Type = TyCon({ name: b"_", args: [] })
+
+fn laid_scalar(name: Bytes) -> Bool =
+  name == b"Int" || name == b"Bool" || name == b"Float" || name == b"Decimal" || name == b"Bytes"
+    || width_named(name) != None
+
+/// Whether `ty` names a type variable anywhere in it.
+pub fn has_vars(ty: Type) -> Bool =
+  match ty {
+    TyVar(_) -> true,
+    TyCon(c) -> c.args.fold(false, |any: Bool, a: Type| any || has_vars(a)),
+    TyFn(f) -> f.params.push(f.ret).fold(false, |any: Bool, a: Type| any || has_vars(a)),
+    TyRecord(fs) -> fs.fold(false, |any: Bool, f: Field| any || has_vars(f.ty)),
+    TyNominal(x) -> x.fields.fold(false, |any: Bool, f: Field| any || has_vars(f.ty)),
+  }
+
+/// Whether a specialisation holds a value of `ty` apart from a word, or does its operators in C.
+pub fn held_apart(ty: Type) -> Bool =
+  match ty {
+    TyCon(c) -> c.args.len() == 0 && (kind_of(ty).kind != KBoxed || c.name == b"Char"),
+    _ -> false,
+  }
+
+/// `ty`, in a definition's numbering, with each variable a specialisation settles read as the layout
+/// it is at; one it leaves unknown stays a variable.
+pub fn substituted(ty: Type, args: List<Type>) -> Type =
+  match ty {
+    TyVar(v) -> match args.at(v) {
+      Some(t) -> if t == unknown_type() { ty } else { t },
+      None -> ty,
+    },
+    TyCon(c) -> TyCon({ ..c, args: c.args.map(|a: Type| substituted(a, args)) }),
+    TyFn(f) ->
+      TyFn({
+        ..f,
+        params: f.params.map(|p: Type| substituted(p, args)),
+        ret: substituted(f.ret, args),
+      }),
+    TyRecord(fs) -> TyRecord(fs.map(|f: Field| { ..f, ty: substituted(f.ty, args) })),
+    TyNominal(x) ->
+      TyNominal({
+        ..x,
+        args: x.args.map(|a: Type| substituted(a, args)),
+        fields: x.fields.map(|f: Field| { ..f, ty: substituted(f.ty, args) }),
+      }),
+  }
+
+/// The numeric type a value of `ty` is held as alone, apart from a word: its own arithmetic.
+pub fn numeric_named(ty: Type) -> Option<Bytes> =
+  match ty {
+    TyCon(c) -> match kind_of(ty).kind { KBoxed -> None, KBool -> None, _ -> Some(c.name) },
+    _ -> None,
+  }
+
+/// `ty` with each variable read as the type argument at its number.
+pub fn substituted_fully(ty: Type, args: List<Type>) -> Type =
+  match ty {
+    TyVar(v) -> match args.at(v) { Some(t) -> t, None -> ty },
+    TyCon(c) -> TyCon({ ..c, args: c.args.map(|a: Type| substituted_fully(a, args)) }),
+    TyFn(f) ->
+      TyFn({
+        ..f,
+        params: f.params.map(|p: Type| substituted_fully(p, args)),
+        ret: substituted_fully(f.ret, args),
+      }),
+    TyRecord(fs) -> TyRecord(fs.map(|f: Field| { ..f, ty: substituted_fully(f.ty, args) })),
+    TyNominal(x) ->
+      TyNominal({
+        ..x,
+        args: x.args.map(|a: Type| substituted_fully(a, args)),
+        fields: x.fields.map(|f: Field| { ..f, ty: substituted_fully(f.ty, args) }),
+      }),
+  }
+
+/// Each typed site of `typed` read at `args`, for a specialisation whose sites are these.
+pub fn typed_at(typed: Map<Bytes, Typed>, args: List<Type>) -> Map<Bytes, Typed> =
+  typed.fold(Map::new(), |acc: Map<Bytes, Typed>, k: Bytes, t: Typed|
+    acc.insert(k, {
+      ..t,
+      ty: substituted(t.ty, args),
+      args: t.args.map(|a: Type| substituted(a, args)),
+    }))
+
+/// The C type a value carried as `k` crosses a call in.
+pub fn carried_type(k: Kind) -> Bytes = match k { KBoxed -> b"Word", _ -> ctype(k) }
+
+// --- the emitter's entry ----------------------------------------------------
+
+/// A definition as its callers read it, its answer as its scheme says.
+pub fn def_entry(
+  module: Bytes,
+  d: FnDef,
+  pure: Map<Bytes, Bool>,
+  schemes: Map<Bytes, Scheme>,
+) -> Def = {
+  let full = qualify(module, d.name.name);
+  let ret = match sig_of(schemes, full) { Some(s) -> Some(kind_of(s.ret)), None -> None };
+  let carried = carriers_of(d, sig_of(schemes, full));
+  {
+    name: d.name.name,
+    ret: match ret { Some(r) -> Some(r.kind), None -> None },
+    ret_ty: match ret { Some(r) -> r.ty, None -> TyOpen([]) },
+    pure: pure.contains(full),
+    arity: d.params.len() + d.generics.labels.len(),
+    scheme: schemes.get(full),
+    carriers: carried.params,
+    answer: carried.answer,
+    witnesses: carried.witnesses,
+    lent: range(0, d.params.len()).filter(|i: Int|
+      match d.params.at(i) { Some(p) -> passed(p).lent, None -> false }),
+  }
+}
+
+/// How each parameter of `d`, witnesses first and labels last as its function takes them, and its
+/// answer cross a call between roots, from the types its scheme declares; a nullary root's answer
+/// is a word, as a constant's is.
+pub fn carriers_of(
+  d: FnDef,
+  sig: Option<Sig>,
+) -> { params: List<Carrier>, answer: Carrier, witnesses: Int } = {
+  let given = match sig { Some(s) -> s.params, None -> [] };
+  let witnesses = d.params.len() - given.len();
+  let written = range(0, d.params.len()).map(|i: Int|
+    if i < witnesses { Whole(KBoxed) }
+    else { match given.at(i - witnesses) { Some(t) -> carrier_of(t), None -> Whole(KBoxed) } });
+  {
+    params: d.generics.labels.fold(written, |acc: List<Carrier>, _: Ident| acc.push(Whole(KBoxed))),
+    answer: if d.params.len() + d.generics.labels.len() == 0 { Whole(KBoxed) }
+    else { match sig { Some(s) -> carrier_of(s.ret), None -> Whole(KBoxed) } },
+    witnesses: witnesses,
+  }
+}
+
+/// How a root of `d` at type arguments `args` takes each parameter and answers: as `carriers_of`
+/// says of the types it declares, and each variable `carried_vars` names as its argument crosses
+/// once `erased`, which is what names the root. Callers at their type arguments and the root at its
+/// own reach the same.
+pub fn carriers_at(
+  d: Def,
+  args: List<Type>,
+) -> { params: List<Carrier>, answer: Carrier } / {abort.raise} =
+  match d.scheme {
+    None -> { params: d.carriers, answer: d.answer },
+    Some(sc) -> match sc.ty {
+      TyFn(f) -> {
+        let raw = carried_vars(sc, args, d.arity);
+        let at_var = |t: Type, otherwise: Carrier|
+          match t {
+            TyVar(j) -> if raw.contains(j) { carrier_of(erased(args.get(j))) } else { otherwise },
+            _ -> otherwise,
+          };
+        {
+          params: range(0, d.carriers.len()).map(|i: Int| {
+            let k = d.carriers.get(i);
+            if i < d.witnesses { k }
+            else { match f.params.at(i - d.witnesses) { Some(t) -> at_var(t, k), None -> k } }
+          }),
+          answer: at_var(f.ret, d.answer),
+        }
+      },
+      _ -> { params: d.carriers, answer: d.answer },
+    },
+  }
+
+/// The variables of `scheme` a call at `args` carries raw: each standing bare as a parameter, or as
+/// the answer of a function taking any, at an argument whose word would be an allocation, an
+/// `Option` held as its payload's word among them. The unit settles such a call on the callee's
+/// specialisation at each.
+pub fn carried_vars(scheme: Scheme, args: List<Type>, arity: Int) -> List<Int> / {abort.raise} =
+  match scheme.ty {
+    TyFn(f) ->
+      range(0, args.len()).filter(|j: Int|
+        (f.params.contains(TyVar(j)) || (arity > 0 && f.ret == TyVar(j)))
+          && (match carrier_of(erased(args.get(j))) {
+            Whole(k) -> k != KBoxed,
+            c -> raw_carrier(c),
+          })),
+    _ -> [],
+  }
+
+/// How a value declared at `t` crosses a call between roots: a scalar held apart from a word as
+/// itself; a record `carried_record` admits as its fields; an `Option` or a `Result` held as one
+/// word as that word, or as its cases where one of its arguments crosses as a record's fields;
+/// anything else as its word.
+pub fn carrier_of(t: Type) -> Carrier = {
+  let k = kind_of(t);
+  let args = if is_option_type(t) || tagged_result(t) {
+    match t { TyCon(c) -> c.args.map(|a: Type| case_carrier(carrier_of(a))), _ -> [] }
+  } else { [] };
+  if is_option_type(t) {
+    sum_carrier(Zeroed, [{ name: b"None", arg: None }, { name: b"Some", arg: args.at(0) }])
+  } else if tagged_result(t) {
+    sum_carrier(Tagged, [{ name: b"Ok", arg: args.at(0) }, { name: b"Err", arg: args.at(1) }])
+  } else {
+    match k.ty {
+      TyRec(fs) -> if carried_record(fs) { Fields(fs) } else { Whole(KBoxed) },
+      _ -> match k.kind {
+        KFloat -> Whole(KFloat),
+        KDec -> Whole(KDec),
+        KInt -> Whole(KInt),
+        KBool -> Whole(KBool),
+        KNum(w) -> if carried(w) { Whole(KNum(w)) } else { Whole(KBoxed) },
+        _ -> Whole(KBoxed),
+      },
+    }
+  }
+}
+
+/// A sum held as one word as `spec` says, crossing as its cases where a constructor's argument
+/// crosses as a record's fields and as that word otherwise.
+fn sum_carrier(spec: SumSpec, cases: List<SumCase>) -> Carrier =
+  if cases.fold(false, |any: Bool, c: SumCase|
+      any || (match c.arg { Some(Fields(_)) -> true, _ -> false })) {
+    Cases({ spec: spec, cases: cases })
+  } else { Whole(KSum(spec)) }
+
+/// How a sum's argument a call carries as `c` crosses as the sum's: a sum as its object.
+fn case_carrier(c: Carrier) -> Carrier =
+  match c { Whole(KSum(_)) -> Whole(KBoxed), Cases(_) -> Whole(KBoxed), other -> other }
+
+/// The C values a sum carried as `c` crosses in past its constructor's index: each constructor's
+/// argument's in turn, a record's fields and then its word.
+pub fn sum_leaves(c: SumCases) -> List<FieldTy> =
+  c.cases.fold([], |acc: List<FieldTy>, sc: SumCase|
+    match sc.arg {
+      None -> acc,
+      Some(Fields(fs)) ->
+        acc.concat(record_leaves(fs).push({ name: b"", kind: KBoxed, ty: TyOpen([]) })),
+      Some(Whole(k)) -> acc.push({ name: b"", kind: k, ty: TyOpen([]) }),
+      Some(Cases(_)) -> acc.push({ name: b"", kind: KBoxed, ty: TyOpen([]) }),
+    })
+
+/// How many of a sum's C values past its index the argument `arg` takes.
+pub fn case_width(arg: Option<Carrier>) -> Int =
+  match arg { None -> 0, Some(Fields(fs)) -> record_leaves(fs).len() + 1, Some(_) -> 1 }
+
+/// Where among a sum's values past its index its `i`th constructor's argument starts.
+pub fn case_start(c: SumCases, i: Int) -> Int =
+  range(0, i).fold(0, |acc: Int, j: Int|
+    acc + case_width(match c.cases.at(j) { Some(sc) -> sc.arg, None -> None }))
+
+/// The index of constructor `name` among `c`'s.
+pub fn case_index(c: SumCases, name: Bytes) -> Option<Int> =
+  range(0, c.cases.len()).fold(None, |acc: Option<Int>, i: Int|
+    match c.cases.at(i) { Some(sc) -> if sc.name == name { Some(i) } else { acc }, None -> acc })
+
+/// A record that crosses a call as its leaves, each in a C value of its own, and then its word,
+/// zero where it was never made: one held back until its word is asked for, whose records in place
+/// hold none, of at most four words of values. A record made once crosses any number of calls as
+/// that word.
+pub fn carried_record(fs: List<FieldTy>) -> Bool =
+  fs.len() > 0
+    && fs.fold(true, |ok: Bool, f: FieldTy|
+      ok && (match in_place(f) { Some(inner) -> holdable(inner), None -> true }))
+    && fs.fold(0, |n: Int, f: FieldTy|
+      n + (match in_place(f) { Some(inner) -> laid_of(inner).width, None -> raw_words(f.kind) }))
+    <= 4
+
+/// The C values a record of `fs` crosses a call in before its word: each field's, and for a record
+/// it holds in place, that record's fields and then its word.
+pub fn record_leaves(fs: List<FieldTy>) -> List<FieldTy> =
+  fs.fold([], |acc: List<FieldTy>, f: FieldTy|
+    match in_place(f) {
+      Some(inner) -> acc.concat(inner).push({ name: b"", kind: KBoxed, ty: TyOpen([]) }),
+      None -> acc.push(f),
+    })
+
+/// The C types `c` crosses a call in, one per C parameter.
+pub fn carried_types(c: Carrier) -> List<Bytes> =
+  match c {
+    Whole(k) -> [carried_type(k)],
+    Fields(fs) -> record_leaves(fs).map(|f: FieldTy| ctype(f.kind)).push(b"Word"),
+    Cases(sc) ->
+      push_front_bytes(b"int64_t", sum_leaves(sc).map(|f: FieldTy| carried_type(f.kind))),
+  }
+
+/// Whether a value carried as `c` crosses in C values of its own rather than as a word: a record's
+/// fields, or a scalar in its C type.
+pub fn raw_carrier(c: Carrier) -> Bool =
+  match c { Fields(_) -> true, Cases(_) -> true, Whole(k) -> k != KBoxed && !is_sum(k) }
+
+/// The kind a root answering as `c` returns: the answer's, a record's first leaf's, or a sum's
+/// constructor's index.
+pub fn returned_kind(c: Carrier) -> Kind =
+  match c {
+    Whole(k) -> k,
+    Fields(fs) -> match record_leaves(fs).at(0) { Some(f) -> f.kind, None -> KBoxed },
+    Cases(_) -> KInt,
+  }
+
+/// What a record or sum answer writes through the pointers the caller hands: a record's leaves
+/// past its first, then its word, a word field of no name; a sum's values past its index.
+pub fn written_back(c: Carrier) -> List<FieldTy> =
+  match c {
+    Whole(_) -> [],
+    Fields(fs) -> {
+      let leaves = record_leaves(fs);
+      range(1, leaves.len()).map(|k: Int| nth_field(leaves, k)).push({
+        name: b"",
+        kind: KBoxed,
+        ty: TyOpen([]),
+      })
+    },
+    Cases(sc) -> sum_leaves(sc),
+  }
+
+pub fn field_param(i: Int, k: Int) -> Bytes =
+  Bytes::concat_all([b"p", ascii_of_int(i), b"_", ascii_of_int(k)])
+
+pub fn word_param(i: Int) -> Bytes = Bytes::concat_all([b"p", ascii_of_int(i), b"_w"])
+
+test "a specialisation's root spells its layouts and the lambdas it runs, and reads back as them" {
+  let args = [
+    TyRecord([
+      {
+        name: b"a",
+        ty: TyCon({
+          name: b"Array",
+          args: [TyRecord([{ name: b"x", ty: TyCon({ name: b"Float", args: [] }) }])],
+        }),
+      },
+      { name: b"b", ty: TyCon({ name: b"_", args: [] }) },
+    ]),
+    TyCon({ name: b"List", args: [TyCon({ name: b"_", args: [] })] }),
+    TyCon({ name: b"U32", args: [] }),
+  ];
+  let root = specialised(b"m.f", args);
+  assert_eq(root, b"m.f@{a:Array<{x:Float}>,b:_},List<_>,U32");
+  assert_eq(specialisation_of(root), Some({ base: b"m.f", args: args, fns: [] }));
+  assert_eq(specialisation_of(b"m.f@{a:"), None);
+  // A program-wide name, a `new` record and a label, whose name is spelled as its bytes, read back.
+  let whole = [
+    TyCon({ name: b"std.json.Json", args: [] }),
+    TyNominal({
+      name: b"m.Date",
+      args: [],
+      fields: [{ name: b"day", ty: TyCon({ name: b"Int", args: [] }) }],
+    }),
+    TyCon({
+      name: b"Hold",
+      args: [TyCon({ name: b"#label:held", args: [] }), TyCon({ name: b"Int", args: [] })],
+    }),
+  ];
+  assert_eq(
+    specialisation_of(specialised(b"m.g", whole)),
+    Some({ base: b"m.g", args: whole, fns: [] }),
+  );
+  // A lambda a caller hands is spelled by the root that wrote it and which of its lambdas it is.
+  let fns = [{ param: 1, owner: b"app.main", nth: 0 }, { param: 2, owner: b"lib.h", nth: 3 }];
+  let lent = specialised_with(b"m.f", [TyCon({ name: b"U32", args: [] })], fns);
+  assert_eq(lent, b"m.f@U32|1=app.main:0|2=lib.h:3");
+  assert_eq(
+    specialisation_of(lent),
+    Some({ base: b"m.f", args: [TyCon({ name: b"U32", args: [] })], fns: fns }),
+  );
+  // What a layout does not read is a word.
+  assert_eq(
+    erased(TyCon({ name: b"Option", args: [TyCon({ name: b"Float", args: [] })] })),
+    TyCon({ name: b"Option", args: [TyCon({ name: b"_", args: [] })] }),
+  );
+  assert_eq(
+    erased(TyCon({ name: b"List", args: [TyCon({ name: b"Float", args: [] })] })),
+    TyCon({ name: b"List", args: [TyCon({ name: b"_", args: [] })] }),
+  )
+}

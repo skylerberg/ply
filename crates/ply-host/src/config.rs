@@ -1,11 +1,11 @@
 //! What `config.get` and `config.secret` answer from: the snapshot the program resolved before
 //! anything was bound.
 
-use ply_eval::host::{
+use ply_core::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity,
 };
-use ply_eval::{Diagnostic, Span, Symbol, Value, codes};
+use ply_core::{Diagnostic, Span, Symbol, Value, codes};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

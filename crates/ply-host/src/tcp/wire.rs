@@ -1,7 +1,7 @@
 //! The values `std.net`, `std.udp` and `std.dns` exchange with their handlers, each built and read
 //! by the name its Ply declaration gives it.
 
-use ply_eval::{Diagnostic, Fixed, IntTy, Span, Symbol, Value, codes};
+use ply_core::{Diagnostic, Fixed, IntTy, Span, Symbol, Value, codes};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;

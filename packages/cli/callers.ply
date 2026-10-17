@@ -1,0 +1,261 @@
+//! `ply callers` — what mentions a definition: directly, and through any number of calls.
+
+import env (env)
+import compiler.unit (shipped)
+import std.random (entropy)
+import std.time (time)
+import builder (builder)
+import args (Flags, style_of)
+import program (Program, Tables, load_program, published, tables_of, location_of, resolve_def,
+                unknown_def, own_tests, own_laws, reached_from, mentioning, program_view)
+import report (Answer, schema_version, ok_code, indent, count_of, refused, reported)
+import std.term (Style, bold)
+import compiler.front.facts (View)
+import compiler.store.hash (no_hashes, no_refs)
+import compiler.check.infer.checker (DefInfo, TestInfo, LawInfo)
+import std.fs (fs)
+import std.json (Json, Null, Str, Bool, Number, Array, object, string_or_null)
+import compiler.syntax.parsing (dummy_span)
+
+/// The keys that mention a definition, sorted into what each one names. A key that is none of the
+/// three is a declaration and is dropped.
+type Group = { definitions: List<DefInfo>, tests: List<TestInfo>, laws: List<LawInfo> }
+
+type Index = { defs: Map<Bytes, DefInfo>, tests: Map<Bytes, TestInfo>, laws: Map<Bytes, LawInfo> }
+
+fn indexed(program: Program, analysis: View) -> Index =
+  {
+    defs: analysis.checked.defs.fold(Map::new(), |acc: Map<Bytes, DefInfo>, def_info: DefInfo|
+      acc.insert(def_info.name, def_info)),
+    tests: own_tests(program, analysis).fold(
+      Map::new(),
+      |acc: Map<Bytes, TestInfo>, x: TestInfo| acc.insert(x.key, x),
+    ),
+    laws: own_laws(program, analysis).fold(Map::new(), |acc: Map<Bytes, LawInfo>, x: LawInfo|
+      acc.insert(x.key, x)),
+  }
+
+fn sorted_into(ix: Index, keys: List<Bytes>) -> Group =
+  keys.fold({ definitions: [], tests: [], laws: [] }, |acc: Group, key: Bytes|
+    match ix.defs.get(key) {
+      Some(d) -> { ..acc, definitions: acc.definitions.push(d) },
+      None -> match ix.tests.get(key) {
+        Some(x) -> { ..acc, tests: acc.tests.push(x) },
+        None -> match ix.laws.get(key) {
+          Some(x) -> { ..acc, laws: acc.laws.push(x) },
+          None -> acc,
+        },
+      },
+    })
+
+fn summary(group: Group) -> String / {abort.raise} =
+  count_of(group.definitions.len(), "definition") ++ ", " ++ count_of(group.tests.len(), "test")
+    ++ ", "
+    ++ count_of(group.laws.len(), "law")
+
+// --- The listing ------------------------------------------------------------
+
+fn quoted(name: Bytes) -> String = "\"" ++ String::of_bytes_lossy(name) ++ "\""
+
+fn group_lines(title: String, group: Group, lines: List<String>) -> List<String> / {abort.raise} = {
+  let head = lines.push(indent() ++ title ++ ": " ++ summary(group));
+  let after_defs = group.definitions.fold(head, |acc: List<String>, def_info: DefInfo|
+    acc.push(indent() ++ indent() ++ String::of_bytes_lossy(def_info.name)));
+  let after_tests = group.tests.fold(after_defs, |acc: List<String>, x: TestInfo|
+    acc.push(indent() ++ indent() ++ "test " ++ quoted(x.name)));
+  group.laws.fold(after_tests, |acc: List<String>, x: LawInfo|
+    acc.push(indent() ++ indent() ++ "law " ++ quoted(x.name)))
+}
+
+fn text_lines(
+  style: Style,
+  name: Bytes,
+  direct: Group,
+  transitive: Group,
+) -> List<String> / {abort.raise} =
+  group_lines(
+    "reached from",
+    transitive,
+    group_lines("mentioned by", direct, [
+      "",
+      indent() ++ bold(style, String::of_bytes_lossy(name)),
+    ]),
+  )
+
+// --- The document -----------------------------------------------------------
+
+fn definition_json(program: Program, def_info: DefInfo) -> Json / {abort.raise} =
+  object([
+    { key: "name", value: Str(String::of_bytes_lossy(def_info.name)) },
+    { key: "location", value: string_or_null(location_of(program, def_info.at)) },
+  ])
+
+fn test_json(program: Program, test_info: TestInfo) -> Json / {abort.raise} =
+  object([
+    { key: "index", value: Number(Decimal::of_int(test_info.index)) },
+    { key: "key", value: Str(String::of_bytes_lossy(test_info.key)) },
+    { key: "name", value: Str(String::of_bytes_lossy(test_info.name)) },
+    { key: "module", value: Str(String::of_bytes_lossy(test_info.module)) },
+    { key: "location", value: string_or_null(location_of(program, test_info.at)) },
+  ])
+
+fn law_json(program: Program, law_info: LawInfo) -> Json / {abort.raise} =
+  object([
+    { key: "index", value: Number(Decimal::of_int(law_info.index)) },
+    { key: "key", value: Str(String::of_bytes_lossy(law_info.key)) },
+    { key: "name", value: Str(String::of_bytes_lossy(law_info.name)) },
+    { key: "module", value: Str(String::of_bytes_lossy(law_info.module)) },
+    { key: "location", value: string_or_null(location_of(program, law_info.at)) },
+  ])
+
+fn group_json(program: Program, group: Group) -> Json / {abort.raise} =
+  object([
+    {
+      key: "definitions",
+      value: Array(group.definitions.map(|def_info: DefInfo| definition_json(program, def_info))),
+    },
+    { key: "tests", value: Array(group.tests.map(|x: TestInfo| test_json(program, x))) },
+    { key: "laws", value: Array(group.laws.map(|x: LawInfo| law_json(program, x))) },
+  ])
+
+fn answered(
+  style: Style,
+  program: Program,
+  def_info: DefInfo,
+  direct: Group,
+  transitive: Group,
+) -> Answer / {abort.raise} =
+  {
+    json: object([
+      { key: "command", value: Str("callers") },
+      { key: "schema_version", value: Number(Decimal::of_int(schema_version())) },
+      { key: "ok", value: Bool(true) },
+      { key: "exit_code", value: Number(Decimal::of_int(ok_code())) },
+      {
+        key: "definition",
+        value: object([
+          { key: "name", value: Str(String::of_bytes_lossy(def_info.name)) },
+          { key: "module", value: Str(String::of_bytes_lossy(def_info.module)) },
+          { key: "location", value: string_or_null(location_of(program, def_info.at)) },
+        ]),
+      },
+      { key: "direct", value: group_json(program, direct) },
+      { key: "transitive", value: group_json(program, transitive) },
+      { key: "diagnostics", value: Array([]) },
+    ]),
+    lines: text_lines(style, def_info.name, direct, transitive),
+    errs: [],
+    code: ok_code(),
+  }
+
+fn mentioned(
+  style: Style,
+  program: Program,
+  analysis: View,
+  def_info: DefInfo,
+) -> Answer / {abort.raise} = {
+  let tables: Tables = tables_of(analysis.frame.hashes);
+  let ix: Index = indexed(program, analysis);
+  answered(
+    style,
+    program,
+    def_info,
+    sorted_into(ix, mentioning(tables, def_info.name)),
+    sorted_into(ix, reached_from(tables, def_info.name)),
+  )
+}
+
+pub fn run(
+  flags: Flags,
+) -> Answer / {shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
+  let loaded: Program = load_program(flags.paths);
+  let s = style_of(flags);
+  match program_view(loaded) {
+    None -> refused(s, "callers", loaded.diags, loaded.places),
+    Some(w) -> match resolve_def(published(w), flags.query) {
+      Err(names) -> reported(s, "callers", [unknown_def(flags.query, names)], loaded.places),
+      Ok(d) -> mentioned(s, loaded, w, d),
+    },
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_test(name: Bytes, key: Bytes, index: Int) -> TestInfo =
+  {
+    name: name,
+    module: b"m",
+    key: key,
+    index: index,
+    nondet: false,
+    cases: false,
+    footprint: [],
+    at: { module: 0, span: dummy_span() },
+  }
+
+fn a_law(name: Bytes, key: Bytes, index: Int) -> LawInfo =
+  {
+    name: name,
+    module: b"m",
+    key: key,
+    index: index,
+    binders: [],
+    has_guard: false,
+    footprint: [],
+    at: { module: 0, span: dummy_span() },
+  }
+
+/// `m.one` called by `m.two`, called by `m.three`; an effect `m.one` that `m.uses` performs; and a
+/// test keyed `m.one` that calls `m.three`.
+fn a_table() -> Tables =
+  {
+    defs: Map::new(),
+    own: Map::new(),
+    specs: Map::new(),
+    hashes: {
+      ..no_hashes(),
+      refs: {
+        ..no_refs(),
+        names: [b"m.one", b"m.two", b"m.three", b"m.one", b"m.uses"],
+        decls: [false, false, false, true, false],
+        edges: [[], [0], [1], [], [3]],
+        fns: Map::of_entries([
+          { key: b"m.one", value: 0 },
+          { key: b"m.two", value: 1 },
+          { key: b"m.three", value: 2 },
+          { key: b"m.uses", value: 4 },
+        ]),
+        declared: Map::of_entries([{ key: b"m.one", value: [3] }]),
+        items: Map::of_entries([{ key: b"m.one", value: [2] }]),
+      },
+    },
+  }
+
+test "what mentions a definition is what names it, and what reaches it is every closure holding it" {
+  assert_eq(mentioning(a_table(), b"m.one"), [b"m.two"]);
+  assert_eq(mentioning(a_table(), b"m.three"), [b"m.one"]);
+  // A key whose own closure holds it is not one of its own callers, and an effect of its name is
+  // not it: what performs the effect `m.one` neither mentions nor reaches the function.
+  assert_eq(reached_from(a_table(), b"m.one"), [b"m.three", b"m.two", b"m.one"])
+}
+
+test "a key that names no definition, test or law is a declaration and is dropped" {
+  let ix: Index = {
+    defs: Map::new(),
+    tests: Map::new().insert(b"m.two is two", a_test(b"two is two", b"m.two is two", 0)),
+    laws: Map::new().insert(b"m.three", a_law(b"three is three", b"m.three", 0)),
+  };
+  let g = sorted_into(ix, [b"m.two is two", b"m.three", b"m.Shape"]);
+  assert_eq(g.definitions.len(), 0);
+  assert_eq(g.tests.map(|x: TestInfo| x.name), [b"two is two"]);
+  assert_eq(g.laws.map(|x: LawInfo| x.name), [b"three is three"]);
+  assert_eq(summary(g), "0 definitions, 1 test, 1 law")
+}
+
+test "a group is titled, counted, and one indented line each" {
+  let g: Group = { definitions: [], tests: [a_test(b"two is two", b"m.two is two", 0)], laws: [] };
+  assert_eq(group_lines("mentioned by", g, []), [
+    "   mentioned by: 0 definitions, 1 test, 0 laws",
+    "      test \"two is two\"",
+  ])
+}

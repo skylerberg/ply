@@ -2,13 +2,13 @@
 //! datagrams and the resolver.
 
 use crate::support::declared::{labelled, shipped};
-use ply_eval::host::MachineId;
-use ply_eval::{
+use ply_core::host::MachineId;
+use ply_core::{
     Diagnostic, HostAnswer, HostBinding, HostRequest, HostRuntime, Span, Symbol, Value, codes,
 };
 use ply_host::tcp::wire::{Endpoint, Probing, SocketOption};
 use ply_host::{Credentials, Host};
-use ply_sketch::Sketch;
+use ply_test_support::Sketch;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
 use std::time::Duration;
@@ -18,14 +18,14 @@ const UDP: &str = "std.udp.udp";
 const DNS: &str = "std.dns.dns";
 
 /// Names every operation the tests perform, under the labels they perform it under.
-fn driver() -> ply_eval::CheckOutput {
+fn driver() -> ply_core::CheckOutput {
     let both = |effect: &str, label: &str| {
         [
-            labelled(effect, label, ply_eval::Mode::Read),
-            labelled(effect, label, ply_eval::Mode::Write),
+            labelled(effect, label, ply_core::Mode::Read),
+            labelled(effect, label, ply_core::Mode::Write),
         ]
     };
-    let row: Vec<ply_eval::EffectAtom> = [
+    let row: Vec<ply_core::EffectAtom> = [
         both(NET, "listener"),
         both(NET, "conn"),
         both(NET, "client"),
@@ -35,10 +35,10 @@ fn driver() -> ply_eval::CheckOutput {
     .into_iter()
     .flatten()
     .chain(["lookup", "reverse", "servers"].map(|op| {
-        ply_eval::EffectAtom::operation(
+        ply_core::EffectAtom::operation(
             DNS,
-            ply_eval::Resource::Singleton,
-            ply_eval::Mode::Read,
+            ply_core::Resource::Singleton,
+            ply_core::Mode::Read,
             op,
         )
     }))
@@ -1413,7 +1413,7 @@ fn the_servers_of_a_resolver_configuration_are_read_in_its_order() {
 
 #[test]
 fn the_script_keeps_the_sockets_rules_without_a_socket() {
-    use ply_eval::Resource;
+    use ply_core::Resource;
     use ply_host::tcp::{Net, SimNet, Upgrade};
     let net = SimNet::with_credentials(
         vec![vec![b"220 go ahead\r\n".to_vec()], vec![b"S".to_vec()]],

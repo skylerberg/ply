@@ -15,7 +15,7 @@
 //! and the network are. A `ply` that ended without finishing its report leaves the record
 //! incomplete, which files no pass.
 
-use ply_eval::host::MachineId;
+use ply_core::host::MachineId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

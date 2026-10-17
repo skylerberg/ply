@@ -8,7 +8,7 @@ use super::{
 use crate::fs;
 use crate::pool::{Inbox, JobOutput, Pool, Pooled};
 use crate::tls::{self, Credentials as TlsCredentials, Handshakes};
-use ply_eval::{
+use ply_core::{
     Diagnostic, HostAnswer, HostRuntime, Pending, Resource, Span, Symbol, Value, codes,
 };
 use rustls::pki_types::ServerName;

@@ -1,0 +1,3929 @@
+//! Definitions checked: groups settled, bodies, tests, laws and spec clauses.
+
+import syntax.parsing (Span, Ident, QName, dummy_span, span_key, is_bare, qname_text, starts_upper,
+                       prelude_binder, span_between)
+import std.graph
+import syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr,
+                           MRead, ty_span, is_raise)
+import syntax.items (Module, Item, IFn, IType, ITest, ILaw, ISchema, IEffectSet, IExtern,
+                     is_shipped, is_builtin, FnDef, TestDef, Cases, LawDef, OfSchema, Binder,
+                     Constraint, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger, is_predicate,
+                     deriver_text, schema_of, SRequires, SEnsures, SCost, SSpace, SpecClause,
+                     Derived, parse, test_run, test_listing, IInstance, InstanceKind, NKey, NShow,
+                     INumeric, member_name, member_of, numeric_ops, numeric_by, is_pub)
+import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
+                     ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
+                     EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign, Param,
+                     MatchArm, HandleClause, HandlerVar, RecField, expr_span, is_ordered, ETagged,
+                     Hole, tagged_parser, tagged_filler, case_at, case_identity, call_operator,
+                     prelude_module)
+import check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord,
+                    Field, Scheme, Free, atoms_covered, atoms_sorted, row_empty, row_open,
+                    row_is_pure_but_raise, run_needs, is_diverges, atom_covers, placed_labels,
+                    filed_atoms, int_type, bool_type, bytes_type, unit_type, fn_type, monomorphic,
+                    field_get, ints_union, ints_difference, subst_new, mark_rigid_ty, is_rigid_row,
+                    free_vars, unify, unify_row, env_push, env_pop, env_bind, env_bind_global,
+                    env_remove_global, env_depth_of, generalize, leaving_row, resolve_atom,
+                    atom_text, resource_text, type_text, row_text, Printer, printer_new,
+                    printer_naming, print_ty, TyNominal, record_fields)
+import check.termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
+                          OtherCallee, Ending, Ends, Diverges, Summary, Verdict, verdict,
+                          unknown_summary)
+import check.resolve.tables (ParsedModule, Binding, ModuleBinding, Declared, Diag, Label, Edit,
+                             with_fix, insertion, TypeSpace, qualify, error_with_labels, error_at,
+                             label_at, backticked, Parameters, ParamInfo)
+import check.resolve.scopes (find, of_module)
+import check.resolve.sets (pattern_binders)
+import expand.rewrite (MemberCallee, with_member_calls)
+import emit.layout (intrinsic_named)
+import expand.derive (HoldsFunction, HoldsHandle, Unconstrained, HoldsSecret, same_deriver)
+import std.bytes
+import std.bytes (ascii_of_int)
+import std.option
+import std.string
+import check.guards
+import check.lent
+import check.lent (Target, ToFunction, ToConstructor, ToUnknown, passed)
+import check.infer.checker (DeclaredAlias, DeclaredExtern, DeclaredRecord, DeclaredSum, TypeDecl,
+                            OpInfo, EffectInfo, CtorInfo, DefConstraint, witnessed, SpecInfo,
+                            DefInfo, Calls, Handed, Performed, RaiseWhy, Unguarded, Raise,
+                            RaiseNote, DirectPerform, OpaquePerform, PerformThroughArgs, PerformVia,
+                            PerformSite, Maybe, Repeated, RepeatedRow, OwnCall, MemberSite, TagUse,
+                            Numeric, GroupFill, Signature, RigidParam, MapKeySite, ConstraintSite,
+                            SpecEnv, GroupDef, KnownDef, test_owner, listing_ty, Every, Given, Only,
+                            HandedBody, Checker, Inferred, WithTy, WithTys, WithSig, Signed, Walk,
+                            Body, TagRefusal, Growth, NamedCallee, WalkedBody, ModuleFns,
+                            TypedSites, StatedFns, Reached, Count, Generalized, compare_values_name,
+                            result_name, location_of, scope_of, report, report_error_at,
+                            report_error_at_and, err_labels, backticked_text, plural, row_aliases,
+                            new_ty, resolve, resolve_row_in, with_unified, simulated_names,
+                            seed_atom, builtin_type_arity, effect_of, def_of, set_def, Builtin,
+                            prelude_imports, declared, builtins, refuse_externs, mode_eq, is_direct,
+                            builtin_bound, insert_constraint, dedup_constraints, Shapes, derivable)
+import check.infer.names (Found, of_language_type, declared_value, written_binder, simple_name_of,
+                          home_module)
+import check.infer.declarations (conv_type, conv_atom, op_named, duplicate, constraints_in_force,
+                                 member_scheme, written_signature, first_reason, witnessing)
+import check.infer.expr (site_for, resolved_sites, site_among, report_unify, expect, note_typed,
+                         settle_bit_ops, settle_concats, settle_columns, hint_of, infer_whole,
+                         rows_in, scales_like, tag_rule, settle_updates, is_int_name, group_member,
+                         expect_met, refuse_growth, Taken, written_as, as_written, holds_fn,
+                         atom_written, numeric_of, ordered_vars)
+
+// --- Definitions ----------------------------------------------------------------------------------
+
+type Refs = { names: List<QName> }
+
+/// Every name a body reads that no binder inside it shadows: a parameter or a `let` named like a
+/// top-level definition reads the binder, not the definition.
+fn refs_of(expr: Expr, bound: List<Bytes>) -> Refs = collect_refs(expr, bound, { names: [] })
+
+fn param_names(params: List<Param>) -> List<Bytes> = params.map(|param: Param| param.name.name)
+
+fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
+  match e {
+    ELit(_) -> out,
+    ETagged(t) ->
+      t.holes.fold(
+        {
+          names: if t.holes.len() == 0 { out.names.push(tagged_parser(t)) }
+          else { out.names.push(tagged_parser(t)).push(tagged_filler(t)) },
+        },
+        |acc: Refs, h: Hole| collect_refs(h.value, bound, acc),
+      ),
+    EBad(_) -> out,
+    EVar(v) -> if is_bare(v.name) && bound.contains(v.name.name.name) { out }
+    else { { names: out.names.push(v.name) } },
+    EBinary(b) -> collect_refs(b.rhs, bound, collect_refs(b.lhs, bound, out)),
+    EUnary(u) -> collect_refs(u.operand, bound, out),
+    ELambda(l) -> collect_refs(l.body, bound.concat(param_names(l.params)), out),
+    EApp(a) ->
+      a.args.fold(collect_refs(a.func, bound, out), |acc: Refs, x: Expr|
+        collect_refs(x, bound, acc)),
+    EIf(i) ->
+      collect_refs(
+        i.else_branch,
+        bound,
+        collect_refs(i.then_branch, bound, collect_refs(i.cond, bound, out)),
+      ),
+    EMatch(m) ->
+      m.arms.fold(collect_refs(m.scrutinee, bound, out), |acc: Refs, arm: MatchArm| {
+        let inner = pattern_binders(arm.pat, bound);
+        collect_refs(arm.body, inner, match arm.guard {
+          Some(g) -> collect_refs(g, inner, acc),
+          None -> acc,
+        })
+      }),
+    EBlock(b) -> {
+      let ss = b.stmts.fold(
+        { bound: bound, out: out },
+        |acc: { bound: List<Bytes>, out: Refs }, s: Stmt|
+          match s {
+            SExpr(x) -> { ..acc, out: collect_refs(x, acc.bound, acc.out) },
+            SAssign(x) -> { ..acc, out: collect_refs(x.value, acc.bound, acc.out) },
+            SLet(l) ->
+              {
+                bound: pattern_binders(l.pat, acc.bound),
+                out: collect_refs(l.value, acc.bound, acc.out),
+              },
+            SLetElse(l) ->
+              {
+                bound: pattern_binders(l.pat, acc.bound),
+                out: collect_refs(l.fallback, acc.bound, collect_refs(l.value, acc.bound, acc.out)),
+              },
+          },
+      );
+      match b.tail { Some(t) -> collect_refs(t, ss.bound, ss.out), None -> ss.out }
+    },
+    ERecord(r) -> r.fields.fold(out, |acc: Refs, f: RecField| collect_refs(f.value, bound, acc)),
+    ERecordUpdate(r) ->
+      r.fields.fold(collect_refs(r.base, bound, out), |acc: Refs, f: RecField|
+        collect_refs(f.value, bound, acc)),
+    EField(f) -> collect_refs(f.base, bound, out),
+    ETry(t) -> collect_refs(t.operand, bound, out),
+    EList(l) -> l.items.fold(out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
+    EPerform(p) -> p.args.fold(out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
+    EHandle(h) -> {
+      // Each initializer sees the variables above it.
+      let inits = h.vars.fold(
+        { refs: out, bound: bound },
+        |acc: { refs: Refs, bound: List<Bytes> }, v: HandlerVar|
+          { refs: collect_refs(v.init, acc.bound, acc.refs), bound: acc.bound.push(v.name.name) },
+      );
+      let b = collect_refs(h.body, bound, inits.refs);
+      let held = bound.concat(h.vars.map(|v: HandlerVar| v.name.name));
+      let cs = h.clauses.fold(b, |acc: Refs, c: HandleClause| {
+        let named = held.concat(c.params.map(|i: Ident| i.name));
+        let labelled = match c.label_binder { Some(t) -> named.push(t.name), None -> named };
+        let inner = match c.resume { Some(k) -> labelled.push(k.name), None -> labelled };
+        collect_refs(c.body, inner, acc)
+      });
+      match h.ret { Some(rc) -> collect_refs(rc.body, held.push(rc.binder.name), cs), None -> cs }
+    },
+    EWithHold(c) ->
+      collect_refs(
+        c.body,
+        bound.push(c.binder.name),
+        collect_refs(c.release, bound, collect_refs(c.acquire, bound, out)),
+      ),
+    ESimulate(s) -> collect_refs(s.body, bound, out),
+    EParallel(v) -> v.branches.fold(out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
+    ETryBlock(t) -> collect_refs(t.body, bound, out),
+  }
+
+/// A module's functions as their signatures bind them, for the walk of its bodies.
+pub type SignedModule = {
+  fns: List<FnDef>,
+  names: List<Bytes>,
+  sigs: List<Signature>,
+  members: List<GroupDef>,
+}
+
+/// The module's functions bound by what they declare. Every module's are, before any body of
+/// the program is walked: a body calls a function of a type in whichever module declares it,
+/// which its own need not import.
+pub fn signed_fns(
+  checker: Checker,
+  parsed: ParsedModule,
+) -> { checker: Checker, signed: SignedModule } / {abort.raise} = {
+  let collected = parsed.module.items.fold(
+    { checker: refuse_externs(checker, parsed), fns: [], names: [] },
+    |acc: { checker: Checker, fns: List<FnDef>, names: List<Bytes> }, item: Item|
+      match item {
+        IFn(def) -> if acc.names.contains(def.name.name) {
+          let prev = acc.fns.fold(dummy_span(), |span: Span, f: FnDef|
+            if f.name.name == def.name.name { f.name.span } else { span });
+          {
+            ..acc,
+            checker: duplicate(
+              acc.checker,
+              def.name,
+              { module: acc.checker.module, span: prev },
+              b"function",
+            ),
+          }
+        } else if def.name.name == compare_values_name() {
+          {
+            ..acc,
+            checker: report_error_at(
+              acc.checker,
+              b"E0105",
+              def.name.span,
+              b"`compare_values` is a builtin",
+              b"cannot be redefined",
+              [
+                b"it is the order `Map` iterates in, and `derive ord` builds a dictionary out of it \xe2\x80\x94 a module that could redefine it would give one type two orders",
+                b"`compare` is the same operation under a name you may shadow",
+              ],
+            ),
+          }
+        } else if call_operator(def.name.name) != None {
+          {
+            ..acc,
+            checker: report_error_at(
+              acc.checker,
+              b"E0105",
+              def.name.span,
+              Bytes::concat_all([b"`", def.name.name, b"` is a builtin"]),
+              b"cannot be redefined",
+              [
+                Bytes::concat_all([
+                  b"the operator `",
+                  match call_operator(def.name.name) { Some(o) -> o.text, None -> b"" },
+                  b"` is written in its name, so a module that redefined it would change what the operator means",
+                ]),
+              ],
+            ),
+          }
+        } else {
+          { checker: acc.checker, fns: acc.fns.push(def), names: acc.names.push(def.name.name) }
+        },
+        _ -> acc,
+      },
+  );
+  let fns = carried(collected.checker, collected.fns);
+  let names = fns.map(|d: FnDef| qualify(parsed.name, d.name.name));
+  let placed: Checker = fns.fold(collected.checker, |c: Checker, d: FnDef|
+    member_declared(c, parsed, d));
+  let signed: Signed = range(0, fns.len()).fold(
+    { checker: placed, sigs: [], members: [] },
+    |acc: Signed, i: Int| signed_fn(acc, parsed, fns.get(i), names.get(i)),
+  );
+  {
+    checker: externs_bound(signed.checker, parsed),
+    signed: { fns: fns, names: names, sigs: signed.sigs, members: signed.members },
+  }
+}
+
+/// A shipped module's own externs bound as builtins under its name; the prelude's that every module
+/// calls are bound before any module is checked.
+fn externs_bound(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
+  if !is_shipped(parsed.name) { checker }
+  else { externs_of(parsed.name, parsed.module).fold(checker, builtin_bound) }
+
+/// The externs the module `name` declares as its own, each under its program-wide name, at the
+/// types the module declares or imports by name: of the prelude's, only the functions of its own
+/// types.
+pub fn externs_of(name: Bytes, module: Module) -> List<Builtin> / {abort.raise} = {
+  let own = module.items.fold(
+    prelude_imports(module.imports),
+    |acc: Map<Bytes, Bytes>, item: Item|
+      match item { IType(t) -> acc.insert(t.name.name, qualify(name, t.name.name)), _ -> acc },
+  );
+  module.items.fold([], |acc: List<Builtin>, item: Item|
+    match item {
+      IExtern(def) -> if is_builtin(name, module, def) { acc }
+      else { acc.push(declared(qualify(name, def.name.name), own, def)) },
+      _ -> acc,
+    })
+}
+
+/// The externs of the shipped module `name` a native implements, each as the checker binds it, with
+/// the name the native is found by: every one of its own but those the emitter writes in place.
+pub fn natives_of(
+  name: Bytes,
+  module: Module,
+) -> List<{ own: Bytes, builtin: Builtin }> / {abort.raise} =
+  if !is_shipped(name) { [] } else {
+    externs_of(name, module).filter(|b: Builtin| intrinsic_named(b.name) == None).map(
+      |b: Builtin| { own: b.name.slice(name.len() + 1, b.name.len()), builtin: b },
+    )
+  }
+
+/// What an `extern fn` declares of the native that implements it: the module declaring it, the name
+/// the native is found by, the words a call passes, its witnesses first, and whether a failure of it
+/// raises rather than ending the run.
+pub type Extern = { module: Bytes, name: Bytes, words: Int, raises: Bool }
+
+fn extern_of(module: Bytes, name: Bytes, b: Builtin) -> Extern =
+  {
+    module: module,
+    name: name,
+    words: witnessed(b.constraints).len() + b.params.len(),
+    raises: b.contract.raises,
+  }
+
+/// Each `extern fn` the prelude declares, in its order: a function it writes in Ply is none.
+pub fn prelude_externs() -> List<Extern> / {abort.raise} =
+  builtins().filter(|b: Builtin| !b.body).map(|b: Builtin| extern_of(prelude_module(), b.name, b))
+
+/// Each `extern fn` a native implements that the module `name` declares in `text`, as the checker
+/// binds it, which only a module the toolchain ships does; a text without the word declares none
+/// and is not parsed.
+pub fn externs_in(name: Bytes, text: Bytes) -> List<Extern> / {abort.raise} =
+  if text.index_of(b"extern") == None { [] } else {
+    natives_of(name, parse(text).node).map(|e: { own: Bytes, builtin: Builtin }|
+      extern_of(name, e.own, e.builtin))
+  }
+
+/// The module's bodies walked against what every module's functions declare, and its groups
+/// settled; a check that walks only some of its functions settles none.
+pub fn walked_fns(
+  checker: Checker,
+  parsed: ParsedModule,
+  signed: SignedModule,
+) -> Checker / {abort.raise} = {
+  let fns = signed.fns;
+  let names = signed.names;
+  let own = range(0, names.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int|
+    m.insert(names.get(i), i));
+  let stated = stated_of(parsed);
+  // What a key answers is compared in its turn, so a comparison reads through it.
+  let answers = |f: Bytes|
+    match own.get(f) { Some(i) -> Some(signed.sigs.get(i).ret), None -> None };
+  let walked = walked_first(fns).fold(
+    { checker: { ..checker, own_fns: own }, bodies: Map::new(), signed: Map::new() },
+    |acc: { checker: Checker, bodies: Map<Int, Body>, signed: Map<Int, Bool> }, i: Int| {
+      let o = walked_fn(
+        acc.checker,
+        parsed,
+        fns.get(i),
+        names.get(i),
+        signed.sigs.get(i),
+        signed.members.get(i),
+        stated,
+        answers,
+      );
+      {
+        checker: if o.left != Walked { o.checker } else {
+          {
+            ..o.checker,
+            bodies: o.checker.bodies.push(
+              kept_walk(names.get(i), signed.members.get(i).labels, o.body),
+            ),
+          }
+        },
+        bodies: acc.bodies.insert(i, o.body),
+        signed: if o.left == Signed { acc.signed.insert(i, true) } else { acc.signed },
+      }
+    },
+  );
+  let bodies = range(0, fns.len()).map(|i: Int|
+    match walked.bodies.get(i) {
+      Some(b) -> b,
+      None -> panic("a function of the module was not walked"),
+    });
+  let out = bodies.map(|b: Body|
+    b.refs.concat(b.calls.concat(b.stated).map(|c: OwnCall| c.callee)).fold(
+      [],
+      |acc: List<Int>, n: Bytes|
+        match own.get(n) {
+          Some(i) -> if acc.contains(i) { acc } else { acc.push(i) },
+          None -> acc,
+        },
+    ));
+  let module: ModuleFns = {
+    fns: fns,
+    names: names,
+    members: signed.members,
+    bodies: bodies,
+    written: members_in(
+      walked.checker.member_sites,
+      walked.checker.module,
+      walked.checker.resolved.signatures,
+    ),
+  };
+  let done: Checker = { ..walked.checker, own_fns: Map::new() };
+  match checker.known.walks {
+    Only(_) -> done,
+    // Groups come callees first, so a callee is counted before its callers.
+    _ ->
+      graph::components({ out: out }).fold(done, |c: Checker, comp: List<Int>|
+        if comp.any(|i: Int| walked.signed.contains(i)) { c } else {
+          // What a group reads of a function it calls is what that function's group settled.
+          comp.fold((), |_: Unit, i: Int|
+            if out.get(i).any(|k: Int| walked.signed.contains(k)) {
+              panic(
+                "a group is settled before a function it calls: "
+                  ++ String::of_bytes_lossy(names.get(i)),
+              )
+            });
+          settle_group(c, module, comp)
+        }),
+  }
+}
+
+/// Whether a check walks the function `name`'s body.
+fn walks(checker: Checker, name: Bytes) -> Bool =
+  match checker.known.walks {
+    Every -> true,
+    Only(names) -> names.contains(name),
+    Given(_, _) -> false,
+  }
+
+/// The body another check walked of the function `name`, where this check is handed one.
+fn handed_body(checker: Checker, name: Bytes) -> Option<HandedBody> =
+  match checker.known.walks { Given(bodies, _) -> bodies.get(name), _ -> None }
+
+/// What `body`, walked as the function `name` whose label parameters are `labels`, leaves for
+/// another check.
+fn kept_walk(name: Bytes, labels: List<Int>, body: Body) -> WalkedBody =
+  {
+    name: name,
+    atoms: filed_atoms(body.row.atoms, labels),
+    through: body.row.tail != None,
+    performs: body.performs.map(|s: PerformSite|
+      { ..s, atom: List::at_or(filed_atoms([s.atom], labels), 0, s.atom) }),
+    repeated: body.repeated,
+    raise_notes: body.raise_notes,
+    refs: body.refs,
+    calls: body.calls,
+    stated: body.stated,
+    tags: body.tags,
+    fills: body.fills,
+    names: body.names,
+  }
+
+/// A function of a type, `fn T::name`, is declared by the module that declares `T`, a sum or a
+/// `new` record, under no name a field of the record has: a call on a value finds it by the type
+/// alone, and reads a record's fields first. A type of the language's has its home module's,
+/// under no name the prelude declares for it, and the prelude's own.
+fn member_declared(checker: Checker, parsed: ParsedModule, def: FnDef) -> Checker / {abort.raise} =
+  match if parsed.name == prelude_module() { None } else { member_of(def.name.name) } {
+    None -> checker,
+    Some(m) -> {
+      let type_name = qualify(parsed.name, m.of);
+      match checker.types.get(type_name) {
+        None -> if builtin_type_arity(m.of) != None && home_module(m.of) == parsed.name {
+          if env_depth_of(checker.env, def.name.name) != Some(0) { checker } else {
+            report_error_at(
+              checker,
+              b"E0105",
+              def.name.span,
+              Bytes::concat_all([b"`", def.name.name, b"` is a builtin"]),
+              b"cannot be redefined",
+              [b"a type has one function of a name, and the prelude declares this one"],
+            )
+          }
+        } else {
+          report_error_at(
+            checker,
+            b"E0208",
+            def.name.span,
+            Bytes::concat_all([b"`", m.of, b"` is not a type this module declares"]),
+            b"declared in another module, or not at all",
+            [
+              b"a function of a type is found by the type alone, with no search, so only the module that declares the type declares one",
+            ],
+          )
+        },
+        Some(decl) -> match decl.declared {
+          DeclaredAlias(_) ->
+            report_error_at_and(
+              checker,
+              b"E0217",
+              def.name.span,
+              Bytes::concat_all([
+                b"`",
+                m.of,
+                b"` is an alias, and a function of a type is of a sum or a `new` record",
+              ]),
+              b"no type of its own",
+              { module: decl.owner, span: decl.span },
+              b"declared here",
+              [
+                b"an alias is the type it names, so a function of one would be of every value of that type",
+              ],
+            ),
+          DeclaredRecord(_) -> match checker.nominals.get(type_name) {
+            Some(r) -> match record_fields(r.ty) {
+              Some(fs) -> if field_get(fs, m.member) == None { checker } else {
+                report_error_at_and(
+                  checker,
+                  b"E0105",
+                  def.name.span,
+                  Bytes::concat_all([
+                    b"`",
+                    m.of,
+                    b"` has a field `",
+                    m.member,
+                    b"` and a function of that name",
+                  ]),
+                  b"declared again here",
+                  { module: decl.owner, span: decl.span },
+                  b"the field is declared here",
+                  [
+                    b"`value.name` reads a record's field and `value.name(..)` calls it, so a function of the record under the same name could never be called on a value; rename one",
+                  ],
+                )
+              },
+              None -> checker,
+            },
+            None -> checker,
+          },
+          DeclaredSum -> checker,
+          DeclaredExtern -> checker,
+        },
+      }
+    },
+  }
+
+/// The order a module's bodies are walked in: each after those its body names, where the names
+/// alone say. Nothing a module that checks means turns on it. A body that performs more than its
+/// unwritten row is read by the bodies walked after it as performing that, so one check names
+/// every row the program has to write.
+fn walked_first(fns: List<FnDef>) -> List<Int> / {abort.raise} = {
+  let index = range(0, fns.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
+    acc.insert(fns.get(i).name.name, i));
+  let adj = fns.map(|d: FnDef|
+    refs_of(d.body, param_names(d.params)).names.fold([], |acc: List<Int>, qname: QName|
+      if !is_bare(qname) { acc } else {
+        match index.get(qname.name.name) {
+          Some(i) -> if acc.contains(i) { acc } else { acc.push(i) },
+          None -> acc,
+        }
+      }));
+  graph::components({ out: adj }).fold([], |acc: List<Int>, comp: List<Int>| acc.concat(comp))
+}
+
+/// The functions of `parsed` a check walks, each by its program-wide name, in the order it files
+/// them, which is the order they are written in: a function named twice, or by a name a builtin
+/// holds, is refused rather than walked.
+pub fn walk_order(parsed: ParsedModule) -> List<Bytes> =
+  walked_defs(parsed).map(|d: FnDef| qualify(parsed.name, d.name.name))
+
+/// The functions of `parsed` a check walks, by program-wide name, in the order it walks their
+/// bodies, which is the order it files what it finds in them: each after those its body names.
+pub fn walked_order(parsed: ParsedModule) -> List<Bytes> / {abort.raise} = {
+  let defs = walked_defs(parsed);
+  walked_first(defs).map(|i: Int| qualify(parsed.name, defs.get(i).name.name))
+}
+
+fn walked_defs(parsed: ParsedModule) -> List<FnDef> =
+  parsed.module.items.fold([], |acc: List<FnDef>, item: Item|
+    match item {
+      IFn(def) -> if acc.any(|d: FnDef| d.name.name == def.name.name)
+          || def.name.name == compare_values_name()
+          || call_operator(def.name.name) != None { acc }
+      else { acc.push(def) },
+      _ -> acc,
+    })
+
+/// What each type of `parsed` states, by the type's qualified name.
+fn stated_of(parsed: ParsedModule) -> Map<Bytes, StatedFns> = {
+  let none: StatedFns = { key: None, show: None, numeric: [] };
+  let of = |m: Map<Bytes, StatedFns>, target: Ident|
+    match m.get(qualify(parsed.name, target.name)) { Some(x) -> x, None -> none };
+  parsed.module.items.fold(Map::new(), |acc: Map<Bytes, StatedFns>, item: Item|
+    match item {
+      IInstance(def) -> {
+        let by = Some(qualify(parsed.name, def.by.name));
+        let was = of(acc, def.target);
+        acc.insert(qualify(parsed.name, def.target.name), if is_key(def.kind) { { ..was, key: by } }
+        else { { ..was, show: by } })
+      },
+      INumeric(def) ->
+        acc.insert(qualify(parsed.name, def.target.name), {
+          ..of(acc, def.target),
+          numeric: numeric_ops().map(|op: Bytes|
+            match numeric_by(def, op) { Some(by) -> qualify(parsed.name, by.name), None -> b"" }),
+        }),
+      _ -> acc,
+    })
+}
+
+/// The functions `stated` names that comparing a value of `ty`, or with `key` false showing one,
+/// calls: a type that states one is read through it, a key's answer compared in its turn, and any
+/// other type through what it holds. `room` is how many more declarations the walk may enter.
+fn stated_in(
+  checker: Checker,
+  stated: Map<Bytes, StatedFns>,
+  answers: (Bytes) -> Option<Type> / {abort.raise},
+  ty: Type,
+  key: Bool,
+  room: Int,
+  acc: Reached,
+) -> Reached / {abort.raise} =
+  match ty {
+    TyVar(_) -> acc,
+    TyFn(_) -> acc,
+    TyRecord(fs) ->
+      fs.fold(acc, |a: Reached, f: Field| stated_in(checker, stated, answers, f.ty, key, room, a)),
+    TyNominal(n) ->
+      n.fields.fold(acc, |a: Reached, f: Field|
+        stated_in(checker, stated, answers, f.ty, key, room, a)),
+    TyCon(c) -> {
+      let args = c.args.fold(acc, |a: Reached, x: Type|
+        stated_in(checker, stated, answers, x, key, room, a));
+      if room <= 0 || args.seen.contains(c.name) { args } else {
+        let within: Reached = { seen: args.seen.push(c.name), fns: args.fns };
+        let said = match stated.get(c.name) {
+          Some(x) -> if key { x.key } else { x.show },
+          None -> None,
+        };
+        match said {
+          Some(f) -> {
+            let called: Reached = {
+              seen: within.seen,
+              fns: if within.fns.contains(f) { within.fns } else { within.fns.push(f) },
+            };
+            match ((key, answers(f))) {
+              (true, Some(t)) ->
+                stated_in(checker, stated, answers, resolve(checker, t), key, room - 1, called),
+              _ -> called,
+            }
+          },
+          None ->
+            checker.ctors.filter(|k: CtorInfo| k.type_name == c.name).fold(
+              within,
+              |a: Reached, k: CtorInfo|
+                k.fields.fold(a, |b: Reached, f: Type|
+                  stated_in(checker, stated, answers, f, key, room - 1, b)),
+            ),
+        }
+      }
+    },
+  }
+
+/// The calls `body` makes of what the module's types state, each at the expression that makes it:
+/// an operator at a type that states its arithmetic, and a comparison, a `Map` or a constrained
+/// parameter at a type that holds one stating a key or a show.
+fn stated_calls(
+  checker: Checker,
+  stated: Map<Bytes, StatedFns>,
+  answers: (Bytes) -> Option<Type> / {abort.raise},
+  body: TypedSites,
+) -> List<OwnCall> / {abort.raise} = {
+  let reached = |ty: Type, key: Bool|
+    stated_in(checker, stated, answers, resolve(checker, ty), key, keyed_room(checker), {
+      seen: [],
+      fns: [],
+    }).fns;
+  let arithmetic = |ty: Type|
+    match resolve(checker, ty) {
+      TyCon(c) -> match stated.get(c.name) { Some(x) -> x.numeric, None -> [] },
+      _ -> [],
+    };
+  let at_ = |acc: List<OwnCall>, span: Span, fns: List<Bytes>|
+    fns.fold(acc, |a: List<OwnCall>, f: Bytes|
+      if f == b"" { a } else { a.push({ callee: f, span: span }) });
+  let operators = body.numerics.fold([], |acc: List<OwnCall>, n: Numeric|
+    at_(acc, n.span, if is_ordered(n.op) { reached(n.ty, true) } else {
+      match numeric_slot(n.op) {
+        Some(i) -> match arithmetic(n.ty).at(i) { Some(f) -> [f], None -> [] },
+        None -> [],
+      }
+    }));
+  let compared = body.comparisons.fold(
+    operators,
+    |acc: List<OwnCall>, x: { module: Int, span: Span, ty: Type }|
+      at_(acc, x.span, reached(x.ty, true)),
+  );
+  // Only a `Map` orders its keys: a type that carries an order calls nothing where it is built.
+  let keyed = body.map_keys.fold(compared, |acc: List<OwnCall>, x: MapKeySite|
+    match x.carrier { Some(_) -> acc, None -> at_(acc, x.span, reached(x.whole, true)) });
+  body.constrained.fold(keyed, |acc: List<OwnCall>, x: ConstraintSite|
+    at_(acc, x.span, match x.deriver {
+      DShow -> reached(x.ty, false),
+      DEq -> reached(x.ty, true),
+      DOrd -> reached(x.ty, true),
+      DHash -> reached(x.ty, true),
+      DNumeric -> arithmetic(x.ty).concat(reached(x.ty, true)),
+      DInteger -> arithmetic(x.ty).concat(reached(x.ty, true)),
+      _ -> [],
+    }))
+}
+
+/// An operation atom's mode is its declaration's; a row read back from text does not carry it.
+fn settled_atom(checker: Checker, atom: Atom) -> Atom / {abort.raise} =
+  match atom.op {
+    None -> atom,
+    Some(name) -> match effect_of(checker, atom.effect) {
+      None -> atom,
+      Some(info) -> match op_named(info, name) {
+        Some(o) -> { ..atom, mode: o.mode },
+        None -> atom,
+      },
+    },
+  }
+
+fn settled_row(checker: Checker, atoms: List<Atom>) -> Row / {abort.raise} =
+  { atoms: atoms_sorted(atoms.map(|atom: Atom| settled_atom(checker, atom))), tail: None }
+
+/// The rows handed in for a definition.
+fn seeded_rows(checker: Checker, name: Bytes) -> Option<KnownDef> = checker.known.defs.get(name)
+
+/// What a name the termination walk leaves free refers to.
+fn group_callee_kind(
+  checker: Checker,
+  qualified: List<Bytes>,
+  qname: QName,
+) -> Callee / {abort.raise} =
+  if starts_upper(qname.name.name) { ConstructorCallee } else {
+    match declared_value(checker, qname) {
+      Some(n) ->
+        range(0, qualified.len()).fold(DefinedCallee(n), |acc: Callee, i: Int|
+          if qualified.get(i) == n { GroupMember(i) } else { acc }),
+      None -> match of_language_type(checker, qname) {
+        Found(m) -> if m.qname.module == None { BuiltinCallee(m.callee) } else { OtherCallee },
+        _ -> if is_bare(qname) && env_depth_of(checker.env, qname.name.name) == Some(0) {
+          BuiltinCallee(qname.name.name)
+        } else { OtherCallee },
+      },
+    }
+  }
+
+/// Where `op` stands among the operations a `numeric` names.
+fn numeric_slot(op: Bytes) -> Option<Int> / {abort.raise} =
+  range(0, numeric_ops().len()).fold(None, |found: Option<Int>, i: Int|
+    match found {
+      Some(_) -> found,
+      None -> if numeric_ops().get(i) == op { Some(i) } else { None },
+    })
+
+/// Binds `def` by what its signature writes, for every body of its module to call it by, and files
+/// what the signature alone says of it. The constraints it writes stand for each walk, so a call
+/// from its own module answers for them as a call from outside will.
+fn signed_fn(acc: Signed, parsed: ParsedModule, def: FnDef, name: Bytes) -> Signed / {abort.raise} = {
+  let s: WithSig = written_signature({ ..acc.checker, derived: derived_of(parsed, def) }, def);
+  let scheme = member_scheme(s.checker, def, s.sig);
+  let labels = def.generics.labels.fold([], |vs: List<Int>, ident: Ident|
+    match s.sig.label_params.get(ident.name) { Some(v) -> vs.push(v), None -> vs });
+  let types = def.generics.types.fold([], |ps: List<RigidParam>, ident: Ident|
+    match s.sig.ty_params.get(ident.name) {
+      Some(TyVar(v)) -> if scheme.ty_vars.contains(v) { ps.push({ name: ident.name, var: v }) }
+      else { ps },
+      _ -> ps,
+    });
+  let constraints = published_constraints({ ..s.checker, ty_params: s.sig.ty_params }, def, scheme);
+  let bound: Checker = {
+    ..s.checker,
+    derived: None,
+    env: env_bind_global(s.checker.env, name, scheme),
+    constraints: s.checker.constraints.insert(name, constraints),
+    takings: s.checker.takings.insert(name, {
+      name: def.name.name,
+      params: def.params.map(passed),
+    }),
+  };
+  {
+    checker: set_def(bound, {
+      name: name,
+      module: parsed.name,
+      simple_name: def.name.name,
+      scheme: scheme,
+      footprint: resolve_row_in(bound, s.sig.published_row).atoms,
+      performed: [],
+      scaling: [],
+      repeats: [],
+      bounded: s.sig.bounded.map(|a: Atom| resolve_atom(bound.subst, a)),
+      tail_bounded: s.sig.tail_bounded,
+      ending: Ends,
+      summary: unknown_summary(),
+      raises: [],
+      row_aliases: row_aliases(def),
+      constraints: constraints,
+      spec: [],
+      at: location_of(bound, def.span),
+    }),
+    sigs: acc.sigs.push(s.sig),
+    members: acc.members.push({ name: name, labels: labels, types: types }),
+  }
+}
+
+/// How a check came by what a function leaves its group: it walked the body; it took a body
+/// another check walked, or the rows one filed; or it read the signature alone, which leaves
+/// nothing a group can be settled from.
+type Left = | Walked | Taken | Signed
+
+/// What `def` leaves its group: its body walked ([`walked_or_filed`]), or the body another check
+/// walked where one is handed in, or what its signature alone says where the check walks only
+/// other functions.
+fn walked_fn(
+  checker: Checker,
+  parsed: ParsedModule,
+  def: FnDef,
+  name: Bytes,
+  sig: Signature,
+  member: GroupDef,
+  stated: Map<Bytes, StatedFns>,
+  answers: (Bytes) -> Option<Type> / {abort.raise},
+) -> { checker: Checker, body: Body, left: Left } / {abort.raise} =
+  match handed_body(checker, name) {
+    Some(kept) -> {
+      let o = handed_fn(checker, parsed, def, name, sig, member, kept);
+      { checker: o.checker, body: o.body, left: Taken }
+    },
+    None -> if !walks(checker, name) && seeded_rows(checker, name) == None {
+      let filed: Checker = {
+        ..checker,
+        seeded: checker.seeded.push(name),
+        kept: checker.kept.push({ name: name, facts: b"" }),
+      };
+      let p = published_fn(filed, parsed, def, name, sig, resolve_row_in(filed, sig.published_row));
+      { checker: p.checker, body: signed_body(p.checker, sig, p.row, p.written), left: Signed }
+    } else { walked_or_filed(checker, parsed, def, name, sig, member, stated, answers) },
+  }
+
+/// A function another check walked, published from its signature and the row that walk found,
+/// with the body that walk left for its group read as this check binds the definition.
+fn handed_fn(
+  checker: Checker,
+  parsed: ParsedModule,
+  def: FnDef,
+  name: Bytes,
+  sig: Signature,
+  member: GroupDef,
+  kept: HandedBody,
+) -> { checker: Checker, body: Body } / {abort.raise} =
+  match ((
+      placed_labels(kept.body.atoms, member.labels),
+      placed_labels(kept.body.performs.map(|s: PerformSite| s.atom), member.labels),
+    )) {
+    (Some(atoms), Some(performed)) -> {
+      let filed: Checker = {
+        ..checker,
+        seeded: checker.seeded.push(name),
+        kept: checker.kept.push({ name: name, facts: kept.facts }),
+      };
+      let row = {
+        ..settled_row(filed, atoms),
+        tail: if kept.body.through { resolve_row_in(filed, sig.published_row).tail } else { None },
+      };
+      let p = published_fn(filed, parsed, def, name, sig, row);
+      {
+        checker: p.checker,
+        body: {
+          ..signed_body(p.checker, sig, p.row, p.written),
+          performs: range(0, performed.len()).map(|i: Int|
+            { ..kept.body.performs.get(i), atom: performed.get(i) }),
+          repeated: kept.body.repeated,
+          raise_notes: kept.body.raise_notes,
+          refs: kept.body.refs,
+          calls: kept.body.calls,
+          stated: kept.body.stated,
+          tags: kept.body.tags,
+          fills: kept.body.fills,
+          names: kept.body.names,
+        },
+      }
+    },
+    _ -> panic("a body handed in names a label parameter its definition does not write"),
+  }
+
+/// Walks `def`'s body against the signatures of its module, holds it to what its signature writes,
+/// publishes what no group decides of it, and closes what its group reads. A definition whose rows
+/// are handed in is published from its written signature and them instead. A row that will not
+/// unify is one the caller should never have filed, which is nothing this program's author can act
+/// on, so the body is walked: slower, and right whatever the row said. `stated` is what the
+/// module's types state, and `answers` what a function of the module answers.
+fn walked_or_filed(
+  checker: Checker,
+  parsed: ParsedModule,
+  def: FnDef,
+  name: Bytes,
+  sig: Signature,
+  member: GroupDef,
+  stated: Map<Bytes, StatedFns>,
+  answers: (Bytes) -> Option<Type> / {abort.raise},
+) -> { checker: Checker, body: Body, left: Left } / {abort.raise} = {
+  let handed = seeded_rows(checker, name);
+  let taken: Option<{ checker: Checker, row: Row, count: Count }> = match handed {
+    None -> None,
+    Some(rows) -> match ((
+        placed_labels(rows.footprint, member.labels),
+        placed_labels(rows.performed, member.labels),
+        placed_labels(rows.scaling, member.labels),
+      )) {
+      (Some(footprint), Some(performed), Some(scaling)) -> {
+        // The rows handed in carry atoms alone; a row ends in what the signature writes, the
+        // definition's own row parameter when it is generic over one.
+        let u = unify_row(checker.subst, checker.fresh, sig.published_row, {
+          ..settled_row(checker, footprint),
+          tail: resolve_row_in(checker, sig.published_row).tail,
+        });
+        // Left uninstalled when it failed, so a walk starts from the substitution it would have.
+        match u.error {
+          Some(_) -> None,
+          None -> {
+            let c: Checker = with_unified(checker, u);
+            Some({
+              checker: c,
+              row: settled_row(c, performed),
+              count: {
+                scaling: settled_row(c, scaling).atoms,
+                sites: [],
+                repeats: rows.repeats,
+                tail_over: None,
+                recursed: None,
+                raises: rows.raises,
+              },
+            })
+          },
+        }
+      },
+      _ -> None,
+    },
+  };
+  let stepped: { checker: Checker, body: Body } = match taken {
+    Some(x) -> {
+      let filed: Checker = {
+        ..x.checker,
+        seeded: x.checker.seeded.push(name),
+        kept: x.checker.kept.push({
+          name: name,
+          facts: match handed { Some(rows) -> rows.facts, None -> b"" },
+        }),
+      };
+      let p = published_fn(filed, parsed, def, name, sig, x.row);
+      {
+        checker: p.checker,
+        body: {
+          ..signed_body(p.checker, sig, p.row, p.written),
+          filed: handed,
+          count: Some(x.count),
+        },
+      }
+    },
+    None -> {
+      let o: Walk = check_fn_body(
+        { ..checker, derived: derived_of(parsed, def), walking: name },
+        def,
+        sig,
+      );
+      let walked: Checker = { ..o.checker, derived: None, walking: b"" };
+      // Typed, its operators and comparisons say which of the module's functions they call, as
+      // its calls on values do.
+      let members = walked.member_sites.drop(checker.member_sites.len()).fold(
+        [],
+        |acc: List<OwnCall>, m: MemberSite|
+          if m.callee.len() == 0 { acc } else { acc.push({ callee: m.callee, span: m.span }) },
+      );
+      let calls = if stated.len() == 0 { members } else {
+        members.concat(
+          stated_calls(walked, stated, answers, {
+            numerics: walked.numerics.drop(checker.numerics.len()),
+            comparisons: walked.comparisons.drop(checker.comparisons.len()),
+            map_keys: walked.map_keys.drop(checker.map_keys.len()),
+            constrained: walked.constrained_uses.drop(checker.constrained_uses.len()),
+          }),
+        )
+      };
+      let settled: Checker = settle_columns(
+        settle_bit_ops(settle_numerics(settle_concats(settle_updates(walked)))),
+      );
+      let judged: Checker = lent_refused(
+        close_unreachable_row(
+          bounded_row(require_written_signature(settled, def, sig), def, sig),
+          sig,
+        ),
+        def,
+        walked.member_sites.drop(checker.member_sites.len()),
+      );
+      let p = published_fn(judged, parsed, def, name, sig, o.row);
+      let c = p.checker;
+      let published = resolve_row_in(c, sig.published_row);
+      let held = sig.params.map(|ty: Type| rows_in(c, ty, { atoms: [], vars: [] }).vars);
+      let own = member.types.map(|t: RigidParam| t.var);
+      let naming = member.types.fold(printer_new(), |printer: Printer, t: RigidParam|
+        printer_naming(printer, t.var, t.name));
+      {
+        checker: c,
+        body: {
+          ..signed_body(c, sig, p.row, p.written),
+          performs: o.performs.map(|site: PerformSite|
+            { ..site, atom: resolve_atom(c.subst, site.atom) }),
+          repeated: o.repeated_vars.map(|r: Repeated| {
+            let v = match resolve_row_in(c, row_open(r.var)).tail { Some(v) -> v, None -> r.var };
+            {
+              params: range(0, held.len()).filter(|i: Int| held.get(i).contains(v)),
+              tail: published.tail == Some(v),
+              over: r.over,
+              maybe: r.maybe,
+            }
+          }),
+          raise_notes: o.raise_notes,
+          refs: o.refs,
+          calls: o.calls,
+          stated: calls,
+          tags: o.tag_uses.map(|u: TagUse|
+            {
+              name: u.name,
+              refusal: error_at(
+                b"E0152",
+                c.module,
+                u.t.tag.span,
+                Bytes::concat_all([
+                  b"`",
+                  u.t.tag.name,
+                  b"::",
+                  u.callee.name.name,
+                  b"` is in a recursion with what holds the literal",
+                ]),
+                b"a tag is whole before a literal of it is checked",
+                [tag_rule(u.t)],
+              ),
+            }),
+          fills: o.fills.map(|f: GroupFill|
+            {
+              module: f.module,
+              span: f.span,
+              callee: f.callee,
+              grows: range(0, f.args.len()).fold([], |acc: List<Growth>, i: Int| {
+                let ty = resolve(c, f.args.get(i));
+                let grows = match ty {
+                  TyVar(_) -> false,
+                  _ ->
+                    free_vars(c.subst, ty, { tys: [], rows: [] }).tys.fold(
+                      false,
+                      |b: Bool, v: Int| b || own.contains(v),
+                    ),
+                };
+                if grows { acc.push({ param: i, ty: print_ty(naming, ty).text }) } else { acc }
+              }),
+            }),
+          names: named_callees(c, def),
+        },
+      }
+    },
+  };
+  {
+    checker: record_spec_env(stepped.checker, def, name, sig),
+    body: stepped.body,
+    left: match taken { None -> Walked, Some(_) -> Taken },
+  }
+}
+
+/// `checker` with each place `def`'s body would hold a function lent to it past its call refused,
+/// `sites` being the calls on values the walk of that body wrote out.
+fn lent_refused(checker: Checker, def: FnDef, sites: List<MemberSite>) -> Checker / {abort.raise} =
+  if !lent::lends(def) { checker } else {
+    let at = sites.fold(Map::new(), |m: Map<Bytes, Bytes>, x: MemberSite|
+      m.insert(span_key(x.span), x.callee));
+    lent::refusals(checker.module, def, {
+      named: |q: QName| lent_target(checker, q),
+      member: |s: Span| at.get(span_key(s)),
+      takes: |n: Bytes| checker.takings.get(n),
+    }).fold(
+      checker,
+      report,
+    )
+  }
+
+/// What a name a body calls without binding it is: a function written through a type of the
+/// language's is the one its home module or the prelude declares, as `value_key` reads it.
+fn lent_target(checker: Checker, q: QName) -> Target / {abort.raise} =
+  if starts_upper(q.name.name) { ToConstructor } else {
+    match declared_value(checker, q) {
+      Some(n) -> ToFunction(n),
+      None -> match of_language_type(checker, q) {
+        Found(m) -> ToFunction(m.callee),
+        _ -> if is_bare(q) && env_depth_of(checker.env, q.name.name) == Some(0) {
+          ToFunction(q.name.name)
+        } else { ToUnknown },
+      },
+    }
+  }
+
+/// Publishes of `def` what no group decides: its scheme, the row a caller reads and what its
+/// signature alone says of its counts. `row` is what its body performs. An unwritten row the body
+/// overran is reported already; its callers are checked against what the body performs, so one
+/// check names every row the program has to write. A `const` publishes the empty row whatever its
+/// body raises: the build saw it raise nothing.
+fn published_fn(
+  checker: Checker,
+  parsed: ParsedModule,
+  def: FnDef,
+  name: Bytes,
+  sig: Signature,
+  row: Row,
+) -> { checker: Checker, row: Row, written: { scaling: List<Atom>, repeats: List<Int> } } / {abort.raise} = {
+  let c: Checker = { ..checker, env: env_remove_global(checker.env, name) };
+  let body_row = resolve_row_in(c, row);
+  let overran = match def.effects {
+    Some(_) -> false,
+    None -> def.baked == None && (body_row.atoms.len() > 0 || body_row.tail != None),
+  };
+  let fn_ty = if overran { fn_type(sig.params, sig.ret, body_row) } else { sig.fn_ty };
+  let g: Generalized = generalize(c.subst, c.env, fn_ty);
+  let sc: Scheme = split_labels(g.scheme, def, sig);
+  let footprint = if overran { body_row } else { resolve_row_in(c, sig.published_row) };
+  let bounded = sig.bounded.map(|a: Atom| resolve_atom(c.subst, a));
+  let bound: Checker = { ..c, env: env_bind_global(g.env, name, sc), ty_params: sig.ty_params };
+  let constraints = published_constraints(bound, def, sc);
+  let ordered: Checker = witness_order(bound, def, sc);
+  {
+    checker: set_def(
+      {
+        ..ordered,
+        ty_params: Map::new(),
+        constraints: ordered.constraints.insert(name, constraints),
+      },
+      {
+        name: name,
+        module: parsed.name,
+        simple_name: def.name.name,
+        scheme: sc,
+        footprint: footprint.atoms,
+        performed: body_row.atoms,
+        scaling: [],
+        repeats: [],
+        bounded: bounded,
+        tail_bounded: sig.tail_bounded,
+        ending: Ends,
+        summary: unknown_summary(),
+        raises: [],
+        row_aliases: row_aliases(def),
+        constraints: constraints,
+        spec: [],
+        at: location_of(bound, def.span),
+      },
+    ),
+    row: body_row,
+    written: written_counts(fn_ty, footprint.atoms, bounded, sig.tail_bounded),
+  }
+}
+
+/// What a group reads of a function's signature, closed, around the row its body performs.
+fn signed_body(
+  checker: Checker,
+  sig: Signature,
+  row: Row,
+  written: { scaling: List<Atom>, repeats: List<Int> },
+) -> Body / {abort.raise} = {
+  let published = resolve_row_in(checker, sig.published_row);
+  {
+    row: row,
+    filed: None,
+    count: None,
+    params: sig.params.map(|ty: Type| resolve(checker, ty)),
+    tail: published.tail,
+    bounded: sig.bounded.map(|a: Atom| {
+      let atom = resolve_atom(checker.subst, a);
+      { atom: atom, written: atom_written(checker, atom) }
+    }),
+    tail_bounded: sig.tail_bounded,
+    tail_name: match published.tail {
+      Some(v) ->
+        sig.row_params.fold(None, |found: Option<Bytes>, n: Bytes, w: Int|
+          match found { Some(_) -> found, None -> if w == v { Some(n) } else { None } }),
+      None -> None,
+    },
+    says_diverges: published.atoms.fold(false, |found: Bool, a: Atom| found || is_diverges(a)),
+    written: written,
+    performs: [],
+    repeated: [],
+    raise_notes: [],
+    refs: [],
+    calls: [],
+    stated: [],
+    tags: [],
+    fills: [],
+    names: [],
+  }
+}
+
+/// What each name `def` reads refers to, as the termination walk asks of a name it did not bind:
+/// read once here, where the module's scope is at hand.
+fn named_callees(checker: Checker, def: FnDef) -> List<NamedCallee> / {abort.raise} = {
+  let read = def.params.fold(refs_of(def.body, []).names, |acc: List<QName>, p: Param|
+    match p.default { Some(d) -> acc.concat(refs_of(d, []).names), None -> acc });
+  read.fold(
+    { seen: Map::new(), out: [] },
+    |acc: { seen: Map<Bytes, Bool>, out: List<NamedCallee> }, q: QName| {
+      let module = match q.module { Some(m) -> m.name, None -> b"" };
+      let key = member_name(module, q.name.name);
+      if acc.seen.contains(key) { acc } else {
+        {
+          seen: acc.seen.insert(key, true),
+          out: acc.out.push({
+            module: module,
+            name: q.name.name,
+            callee: group_callee_kind(checker, [], q),
+          }),
+        }
+      }
+    },
+  ).out
+}
+
+/// `callee`, or the slot it has in the group `qualified` where it is a member.
+fn member_or(qualified: List<Bytes>, callee: Callee) -> Callee / {abort.raise} =
+  match callee {
+    DefinedCallee(n) ->
+      range(0, qualified.len()).fold(callee, |kind: Callee, i: Int|
+        if qualified.get(i) == n { GroupMember(i) } else { kind }),
+    other -> other,
+  }
+
+/// Settles one group of a module's functions, `comp`, whose bodies call one another round a cycle:
+/// what each performs and calls a number of times that grows, whether its calls end, where it can
+/// raise, and what its signature promised of those. It reads what each walk left closed and what
+/// the groups it calls, each settled before it, published; nothing of the walks' substitution.
+fn settle_group(checker: Checker, m: ModuleFns, comp: List<Int>) -> Checker / {abort.raise} = {
+  let qualified = comp.map(|i: Int| m.names.get(i));
+  let defs = comp.map(|i: Int| m.fns.get(i));
+  let members = comp.map(|i: Int| m.members.get(i));
+  let bodies = comp.map(|i: Int| m.bodies.get(i));
+  let grouped: Checker = { ..checker, group_defs: members };
+  let tagged: Checker = bodies.fold(grouped, |c: Checker, b: Body|
+    b.tags.fold(c, |cc: Checker, u: TagRefusal|
+      if qualified.contains(u.name) { report(cc, u.refusal) } else { cc }));
+  let counts = range(0, comp.len()).map(|slot: Int|
+    match bodies.get(slot).count {
+      Some(count) -> count,
+      None -> counted_body(tagged, defs.get(slot), bodies.get(slot)),
+    });
+  // A definition published from its rows answers what they say. A group published wholly so has no
+  // body walked to read an ending from.
+  let filed = bodies.map(|b: Body| b.filed);
+  let walked = filed.fold(false, |any: Bool, k: Option<KnownDef>| any || k == None);
+  let names = bodies.fold(Map::new(), |acc: Map<Bytes, Callee>, b: Body|
+    b.names.fold(acc, |held: Map<Bytes, Callee>, x: NamedCallee|
+      held.insert(member_name(x.module, x.name), member_or(qualified, x.callee))));
+  // A body is read with its calls on values written out: one of a builtin through the prelude's
+  // binder, one of a function of a type through its module's.
+  let named = |qname: QName| {
+    let through = match qname.module { Some(x) -> x.name, None -> b"" };
+    if through == prelude_binder() { BuiltinCallee(qname.name.name) } else {
+      match of_module(through) {
+        Some(home) -> member_or(qualified, DefinedCallee(qualify(home, qname.name.name))),
+        None -> match names.get(member_name(through, qname.name.name)) {
+          Some(callee) -> callee,
+          None -> OtherCallee,
+        },
+      }
+    }
+  };
+  let stated = bodies.fold(Map::new(), |acc: Map<Bytes, List<Callee>>, b: Body|
+    b.stated.fold(acc, |held: Map<Bytes, List<Callee>>, call: OwnCall| {
+      let key = span_key(call.span);
+      held.insert(
+        key,
+        List::push(
+          match held.get(key) { Some(cs) -> cs, None -> [] },
+          member_or(qualified, DefinedCallee(call.callee)),
+        ),
+      )
+    }));
+  let read: Verdict = if !walked { { endings: [], summaries: [] } } else {
+    verdict({
+      defs: defs.map(|d: FnDef| with_member_calls(d, m.written)),
+      names: qualified,
+      params: bodies.map(|b: Body| b.params),
+      resolve: named,
+      stated: |span: Span| match stated.get(span_key(span)) { Some(cs) -> cs, None -> [] },
+      ending_of: |n: Bytes| match def_of(tagged, n) { Some(d) -> d.ending, None -> Ends },
+      summary_of: |n: Bytes| tagged.summaries.get(n),
+    })
+  };
+  let ending_of = |slot: Int|
+    match filed.get(slot) { Some(k) -> k.ending, None -> read.endings.get(slot) };
+  let summary_of = |slot: Int|
+    match filed.get(slot) { Some(k) -> k.summary, None -> read.summaries.get(slot) };
+  let summarized: Checker = {
+    ..tagged,
+    summaries: range(0, comp.len()).fold(tagged.summaries, |acc: Map<Bytes, Summary>, slot: Int|
+      acc.insert(qualified.get(slot), summary_of(slot))),
+  };
+  let grown: Checker = bodies.fold(summarized, |c: Checker, b: Body|
+    refuse_growth(c, members, b.fills));
+  // Only the run's own definitions are counted off their bodies, so only they are held to `bounded`.
+  let kept: Checker = range(0, comp.len()).fold(grown, |c: Checker, slot: Int|
+    unwritten_divergence(
+      if c.module >= c.known.root { c }
+      else { kept_promises(c, bodies.get(slot), counts.get(slot)) },
+      defs.get(slot),
+      bodies.get(slot).says_diverges,
+      ending_of(slot),
+      |caller: Bytes|
+        range(0, comp.len()).fold(0, |start: Int, k: Int|
+          if qualified.get(k) == caller { defs.get(k).span.start } else { start }),
+    ));
+  // A group whose every raise is a call back into it has no place a raise starts.
+  let raised_inside = counts.fold(false, |any: Bool, count: Count| any || count.raises.len() > 0)
+    && counts.fold(true, |inside: Bool, count: Count|
+      inside && count.raises.fold(true, |ok: Bool, r: Raise| ok && raised_within(qualified, r)));
+  let published: Checker = range(0, comp.len()).fold(kept, |c: Checker, slot: Int|
+    match def_of(c, qualified.get(slot)) {
+      None -> c,
+      Some(info) -> {
+        let def = defs.get(slot);
+        let count = counts.get(slot);
+        // Another package's definition is read by what its row writes, whatever its body does.
+        let counted = if c.module >= c.known.root { bodies.get(slot).written } else {
+          {
+            scaling: info.footprint.fold([], |acc: List<Atom>, w: Atom|
+              if count.scaling.fold(false, |b: Bool, a: Atom| b || atoms_covered([w], a)) {
+                acc.push(w)
+              } else { acc }),
+            repeats: count.repeats,
+          }
+        };
+        set_def(c, {
+          ..info,
+          performed: if raised_inside { info.performed.filter(|a: Atom| !is_abort(a)) }
+          else { info.performed },
+          scaling: counted.scaling,
+          repeats: counted.repeats,
+          ending: ending_of(slot),
+          summary: summary_of(slot),
+          // A `const` raised nothing when the build evaluated it, so no place in it is one to guard.
+          raises: if raised_inside || def.baked != None { [] } else { count.raises },
+        })
+      },
+    });
+  { ..published, group_defs: [] }
+}
+
+/// The signature's label parameters generalize among the type variables; they belong in their own
+/// list, in the order the generic list wrote them, and a phantom one is still a parameter.
+fn split_labels(scheme: Scheme, def: FnDef, signature: Signature) -> Scheme = {
+  let ids = def.generics.labels.fold([], |acc: List<Int>, ident: Ident|
+    match signature.label_params.get(ident.name) { Some(v) -> acc.push(v), None -> acc });
+  if ids.len() == 0 { scheme } else {
+    {
+      ty_vars: ints_difference(scheme.ty_vars, ids),
+      row_vars: scheme.row_vars,
+      label_vars: ids,
+      ty: scheme.ty,
+    }
+  }
+}
+
+/// A generated definition carries its `derive` item's span and nothing hand-written does.
+fn derived_of(parsed: ParsedModule, def: FnDef) -> Option<Derived> =
+  parsed.derived.fold(None, |acc: Option<Derived>, d: Derived|
+    match acc { Some(_) -> acc, None -> if d.span == def.span { Some(d) } else { None } })
+
+fn published_constraints(
+  checker: Checker,
+  def: FnDef,
+  scheme: Scheme,
+) -> List<DefConstraint> / {abort.raise} = {
+  let found = def.constraints.fold([], |acc: List<DefConstraint>, c: Constraint|
+    match checker.ty_params.get(c.param.name) {
+      Some(TyVar(v)) -> {
+        let param = range(0, scheme.ty_vars.len()).fold(0 - 1, |p: Int, i: Int|
+          if p >= 0 { p } else if scheme.ty_vars.get(i) == v { i } else { p });
+        if param < 0 { acc } else { acc.push({ deriver: c.deriver, param: param }) }
+      },
+      _ -> acc,
+    });
+  dedup_constraints(
+    found.fold([], |acc: List<DefConstraint>, c: DefConstraint| insert_constraint(acc, c)),
+  )
+}
+
+/// The parameters a definition's `numeric` and `integer` constraints are about, in its scheme's
+/// order. One its signature never mentions is refused: no call fixes it, so none could pass it.
+fn witness_order(checker: Checker, def: FnDef, scheme: Scheme) -> Checker / {abort.raise} = {
+  let found = def.constraints.fold(
+    { checker: checker, ranked: [] },
+    |acc: { checker: Checker, ranked: List<{ at: Int, name: Bytes }> }, c: Constraint|
+      if !is_predicate(c.deriver)
+          || acc.ranked.fold(false, |b: Bool, r: { at: Int, name: Bytes }|
+            b || r.name == c.param.name) { acc } else {
+        match acc.checker.ty_params.get(c.param.name) {
+          Some(TyVar(v)) -> {
+            let position = range(0, scheme.ty_vars.len()).fold(0 - 1, |p: Int, i: Int|
+              if p >= 0 { p } else if scheme.ty_vars.get(i) == v { i } else { p });
+            if position >= 0 {
+              let n = acc.ranked.len();
+              let i = range(0, n).fold(n, |k: Int, j: Int|
+                if k < n { k } else if position < acc.ranked.get(j).at { j } else { k });
+              {
+                checker: acc.checker,
+                ranked: acc.ranked.take(i).push({ at: position, name: c.param.name }).concat(
+                  acc.ranked.drop(i),
+                ),
+              }
+            } else {
+              {
+                checker: report_error_at(
+                  acc.checker,
+                  b"E0310",
+                  c.param.span,
+                  Bytes::concat_all([
+                    b"`",
+                    c.param.name,
+                    b"` appears in no parameter or answer of `",
+                    def.name.name,
+                    b"`",
+                  ]),
+                  Bytes::concat_all([
+                    b"`",
+                    deriver_text(c.deriver),
+                    b"` is about a type each call fixes",
+                  ]),
+                  [
+                    b"a call passes the type its arguments or answer give the parameter, and nothing here gives it one",
+                  ],
+                ),
+                ranked: acc.ranked,
+              }
+            }
+          },
+          _ -> acc,
+        }
+      },
+  );
+  if found.ranked.len() == 0 { found.checker } else {
+    {
+      ..found.checker,
+      witness_orders: found.checker.witness_orders.push({
+        module: found.checker.module,
+        name: def.name.name,
+        params: found.ranked.map(|r: { at: Int, name: Bytes }| r.name),
+      }),
+    }
+  }
+}
+
+fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Walk / {abort.raise} = {
+  let checker: Checker = {
+    ..outer,
+    scope: signature.scope,
+    ty_params: signature.ty_params,
+    row_params: signature.row_params,
+    label_params: signature.label_params,
+    performs: [],
+    over: None,
+    maybe: [],
+    repeated_vars: [],
+    recursed: None,
+    refs: [],
+    calls: [],
+    tag_uses: [],
+    group_fills: [],
+    declared_atoms: match signature.declared {
+      Some(r) -> resolve_row_in(outer, r).atoms,
+      None -> [],
+    },
+    guards: guards::none(),
+    raise_notes: [],
+  };
+  let assumed: Checker = witnessing(
+    { ..checker, assumed: constraints_in_force(checker, def.constraints) },
+    def.constraints,
+  );
+  let defaults: Checker = range(0, def.params.len()).fold(assumed, |c: Checker, i: Int|
+    match def.params.get(i).default {
+      None -> c,
+      Some(d) -> {
+        let o: Inferred = infer_whole(
+          { ..c, copied: is_pub(def.vis) },
+          d,
+          hint_of(signature.params.get(i)),
+        );
+        expect(
+          { ..o.checker, copied: false },
+          expr_span(d),
+          signature.params.get(i),
+          o.ty,
+          b"parameter default",
+        ).checker
+      },
+    });
+  let pushed: Checker = { ..defaults, env: env_push(defaults.env) };
+  let bound: Checker = range(0, def.params.len()).fold(pushed, |c: Checker, i: Int|
+    {
+      ..c,
+      env: env_bind(c.env, def.params.get(i).name.name, monomorphic(signature.params.get(i))),
+    });
+  let body: Inferred = infer_whole(bound, def.body, hint_of(signature.ret));
+  let checked: Checker = expect_met(
+    body.checker,
+    expr_span(def.body),
+    signature.ret,
+    body.ty,
+    match schema_of(bound.modules.get(bound.module).module, def) {
+      Some(schema) -> if def.name.name == schema.name.name { b"a law states a proposition" }
+      else { b"a `where` guard states a proposition" },
+      None -> b"function body type",
+    },
+  );
+  let popped: Checker = { ..checked, env: env_pop(checked.env) };
+  let shaped: Checker = match def.baked {
+    Some(at) -> check_const_shape(popped, def, at, signature),
+    None -> popped,
+  };
+  let left = leaving_row(resolve_row_in(shaped, body.row));
+  let rowed: Checker = match signature.declared {
+    Some(declared) -> check_upper_bound(shaped, def, declared, left),
+    None -> {
+      let u = unify_row(shaped.subst, shaped.fresh, signature.published_row, left);
+      let c = with_unified(shaped, u);
+      match u.error {
+        Some(e) -> report_unify(c, e, expr_span(def.body), b"inferred effect row"),
+        None -> c,
+      }
+    },
+  };
+  {
+    checker: {
+      ..rowed,
+      ty_params: Map::new(),
+      row_params: Map::new(),
+      label_params: Map::new(),
+      assumed: [],
+      over: None,
+      maybe: [],
+      repeated_vars: [],
+      guards: guards::none(),
+      raise_notes: [],
+      refs: [],
+      calls: [],
+      tag_uses: [],
+      group_fills: [],
+    },
+    row: left,
+    performs: rowed.performs,
+    repeated_vars: rowed.repeated_vars,
+    raise_notes: rowed.raise_notes,
+    refs: rowed.refs,
+    calls: rowed.calls,
+    tag_uses: rowed.tag_uses,
+    fills: rowed.group_fills,
+  }
+}
+
+/// The iteration a site stands under now that every definition outside its group is counted:
+/// the innermost of `maybe` that holds, or else `over`. A callee of the site's own group is not
+/// asked: a body that calls into its group performs everything again there.
+fn iteration(
+  checker: Checker,
+  atom: Atom,
+  over: Option<Span>,
+  maybe: List<Maybe>,
+) -> Option<Span> / {abort.raise} =
+  match maybe.fold(None, |found: Option<Span>, m: Maybe|
+      match found {
+        Some(_) -> found,
+        None -> if group_member(checker, m.callee) { None } else {
+          match def_of(checker, m.callee) {
+            None -> None,
+            Some(d) -> if match m.param {
+                Some(i) -> d.repeats.contains(i),
+                None -> scales_like(d.scaling, atom),
+              } { Some(m.span) }
+            else { None },
+          }
+        },
+      }) {
+    Some(span) -> Some(span),
+    None -> over,
+  }
+
+/// What a walked body performs and calls a number of times that grows with its input, and where it
+/// can raise, read with its group `checker.group_defs` known.
+fn counted_body(checker: Checker, def: FnDef, body: Body) -> Count / {abort.raise} = {
+  let again = body.calls.concat(body.stated).fold(None, |acc: Option<Span>, call: OwnCall|
+    match acc {
+      Some(_) -> acc,
+      None -> if group_member(checker, call.callee) { Some(call.span) } else { None },
+    });
+  let view: Checker = {
+    ..checker,
+    performs: body.performs.map(|site: PerformSite|
+      { ..site, over: iteration(checker, site.atom, site.over, site.maybe), maybe: [] }),
+    raise_notes: body.raise_notes,
+    recursed: again,
+  };
+  let repeated = body.repeated.fold([], |acc: List<RepeatedRow>, r: RepeatedRow|
+    match iteration(checker, no_atom(), r.over, r.maybe) {
+      Some(o) -> acc.push({ ..r, over: Some(o), maybe: [] }),
+      None -> acc,
+    });
+  let counted = counts_of(view, body.params, body.tail != None, body.row, repeated);
+  {
+    scaling: counted.scaling.map(|site: PerformSite| site.atom),
+    sites: counted.scaling,
+    repeats: counted.repeats,
+    tail_over: counted.tail_over,
+    recursed: again,
+    raises: raises_of(view, def.span.start),
+  }
+}
+
+fn is_abort(a: Atom) -> Bool = a.effect == b"abort" && a.op == Some(b"raise")
+
+/// Why a call of `name` raises: by its own row, or, where that names no raise, by a function it
+/// was handed.
+fn raise_through(checker: Checker, name: Bytes) -> RaiseWhy / {abort.raise} =
+  if group_member(checker, name) { Calls(name) } else {
+    match checker.contracts.get(name) {
+      Some(c) -> if c.raises { Unguarded(name) } else { Handed },
+      None -> match def_of(checker, name) {
+        Some(d) -> if d.footprint.fold(false, |any: Bool, a: Atom| any || is_abort(a)) {
+          Calls(name)
+        } else { Handed },
+        None -> Calls(name),
+      },
+    }
+  }
+
+/// Where the body just walked can raise `abort.raise`, each place counted from `start`: every
+/// place it is performed, a definition whose row names it once, where it is first called, and a
+/// call that raises only as a function it is handed does where no raise inside it says more.
+fn raises_of(checker: Checker, start: Int) -> List<Raise> / {abort.raise} = {
+  let found = checker.performs.fold(
+    { out: [], called: [] },
+    |acc: { out: List<Raise>, called: List<Bytes> }, site: PerformSite|
+      if !is_abort(site.atom) || site.module != checker.module { acc } else {
+        let noted = checker.raise_notes.fold(None, |known: Option<RaiseWhy>, n: RaiseNote|
+          match known {
+            Some(_) -> known,
+            None -> if n.span == site.span { Some(n.why) } else { None },
+          });
+        let why = match noted {
+          Some(w) -> w,
+          None -> match site.source {
+            PerformVia(name) -> raise_through(checker, name),
+            DirectPerform -> Performed,
+            _ -> Handed,
+          },
+        };
+        let raise = {
+          span: span_between(site.span.start - start, site.span.end - start),
+          why: why,
+        };
+        match why {
+          Calls(name) -> if acc.called.contains(name) { acc }
+          else { { out: acc.out.push(raise), called: acc.called.push(name) } },
+          _ -> { ..acc, out: acc.out.push(raise) },
+        }
+      },
+  ).out;
+  found.filter(|r: Raise|
+    match r.why {
+      Handed ->
+        !found.fold(false, |inside: Bool, other: Raise|
+          inside
+            || (other.span != r.span && other.span.start >= r.span.start
+            && other.span.end <= r.span.end)),
+      _ -> true,
+    })
+}
+
+/// Whether a raise is only a call back into the group `names`.
+fn raised_within(names: List<Bytes>, raise: Raise) -> Bool =
+  match raise.why { Calls(name) -> names.contains(name), _ -> false }
+
+/// What a body performs a number of times that grows with its input: what it performs under an
+/// iteration, or everything, when it calls back into its own group. A parameter is called so when a
+/// row variable its type holds is: `repeated` are those the body performs under an iteration, and
+/// `tailed` whether the definition has a row parameter of its own.
+fn counts_of(
+  checker: Checker,
+  params: List<Type>,
+  tailed: Bool,
+  body: Row,
+  repeated: List<RepeatedRow>,
+) -> { scaling: List<PerformSite>, repeats: List<Int>, tail_over: Option<Span> } / {abort.raise} = {
+  let row = resolve_row_in(checker, body);
+  let sites = resolved_sites(checker.subst, checker.performs);
+  let scaling = match checker.recursed {
+    Some(again) ->
+      row.atoms.fold([], |acc: List<PerformSite>, atom: Atom| {
+        let s = match site_among(sites, atom) {
+          Some(x) -> x,
+          None ->
+            {
+              atom: atom,
+              module: checker.module,
+              span: again,
+              source: DirectPerform,
+              over: None,
+              maybe: [],
+            },
+        };
+        acc.push({ ..s, over: Some(again) })
+      }),
+    None ->
+      row.atoms.fold([], |acc: List<PerformSite>, atom: Atom|
+        match sites.fold(None, |found: Option<PerformSite>, s: PerformSite|
+            match found {
+              Some(_) -> found,
+              None -> if s.atom == atom && s.over != None { Some(s) } else { None },
+            }) {
+          Some(s) -> acc.push(s),
+          None -> acc,
+        }),
+  };
+  let repeats = range(0, params.len()).fold([], |acc: List<Int>, i: Int| {
+    let called = match checker.recursed {
+      Some(_) -> {
+        let held = rows_in(checker, params.get(i), { atoms: [], vars: [] });
+        held.vars.len() > 0 || held.atoms.len() > 0
+      },
+      None -> repeated.fold(false, |b: Bool, r: RepeatedRow| b || r.params.contains(i)),
+    };
+    if called { acc.push(i) } else { acc }
+  });
+  let tail_over = if !tailed { None } else {
+    match checker.recursed {
+      Some(again) -> Some(again),
+      None ->
+        repeated.fold(None, |found: Option<Span>, r: RepeatedRow|
+          match found { Some(_) -> found, None -> if r.tail { r.over } else { None } }),
+    }
+  };
+  { scaling: scaling, repeats: repeats, tail_over: tail_over }
+}
+
+/// A written row's `bounded` atoms and variable, held to what the body performs: an atom that grows
+/// with the input is refused where it is performed, naming the iteration that repeats it.
+fn kept_promises(checker: Checker, body: Body, count: Count) -> Checker / {abort.raise} = {
+  let atoms: Checker = body.bounded.fold(
+    checker,
+    |c: Checker, w: { atom: Atom, written: Bytes }|
+      match count.sites.fold(None, |found: Option<PerformSite>, s: PerformSite|
+          match found {
+            Some(_) -> found,
+            None -> if atoms_covered([w.atom], s.atom) { Some(s) } else { None },
+          }) {
+        None -> c,
+        Some(s) -> broken_promise(c, backticked_text(w.written), s, count.recursed),
+      },
+  );
+  if !body.tail_bounded { atoms } else {
+    match count.tail_over {
+      None -> atoms,
+      Some(over) ->
+        broken_promise(
+          atoms,
+          match body.tail_name {
+            Some(n) -> backticked_text(n).concat(b"'s operations"),
+            None -> b"the row variable",
+          },
+          {
+            atom: no_atom(),
+            module: atoms.module,
+            span: over,
+            source: PerformThroughArgs,
+            over: Some(over),
+            maybe: [],
+          },
+          count.recursed,
+        ),
+    }
+  }
+}
+
+fn no_atom() -> Atom = { effect: b"", resource: RSingleton, mode: MRead, op: None }
+
+/// What a signature alone says of its counts: an atom not promised `bounded` may grow with the input,
+/// and each parameter holding a function is called so unless the row variable is promised.
+pub fn written_counts(
+  fn_ty: Type,
+  footprint: List<Atom>,
+  bounded: List<Atom>,
+  tail_bounded: Bool,
+) -> { scaling: List<Atom>, repeats: List<Int> } / {abort.raise} =
+  {
+    scaling: footprint.filter(|atom: Atom| !atoms_covered(bounded, atom)),
+    repeats: if tail_bounded { [] } else {
+      match fn_ty {
+        TyFn(f) ->
+          range(0, f.params.len()).fold([], |acc: List<Int>, i: Int|
+            if holds_fn(f.params.get(i)) { acc.push(i) } else { acc }),
+        _ -> [],
+      }
+    },
+  }
+
+/// Where the promise breaks: the operation, and the iteration that repeats it, which is the call
+/// itself when the callee iterates.
+fn broken_promise(
+  checker: Checker,
+  what: Bytes,
+  site: PerformSite,
+  recursed: Option<Span>,
+) -> Checker / {abort.raise} = {
+  let again = site.over != None && site.over == recursed;
+  let here = if again { b"performed here, and again at each call back into its own group" }
+  else if site.over != Some(site.span) { b"performed here" } else {
+    match site.source {
+      PerformVia(name) ->
+        Bytes::concat_all([
+          backticked_text(simple_name_of(name)),
+          b" performs it once per element of its input",
+        ]),
+      _ -> b"performed once for each element this iterates over",
+    }
+  };
+  let iteration = match site.over {
+    Some(o) -> if o == site.span || again { [] }
+    else { [label_at(site.module, o, false, b"once for each element this iterates over")] },
+    None -> [],
+  };
+  err_labels(
+    checker,
+    b"E0465",
+    Bytes::concat_all([
+      what,
+      if what.ends_with(b"operations") {
+        b" grow with the input, and the signature promises them `bounded`"
+      } else { b" grows with the input, and the signature promises it `bounded`" },
+    ]),
+    [label_at(site.module, site.span, true, here)].concat(iteration),
+    [
+      b"a `bounded` operation runs a number of times no input decides",
+      b"batch the operation over the whole input into one, or move it out of the iteration",
+    ],
+  )
+}
+
+type Offence = { atom: Atom, site: Option<PerformSite> }
+
+/// Each inferred atom the written row does not cover, with the first site that contributed it.
+fn offences(checker: Checker, dec: List<Atom>, inf: List<Atom>) -> List<Offence> / {abort.raise} =
+  inf.fold([], |acc: List<Offence>, atom: Atom|
+    if atoms_covered(dec, atom) { acc }
+    else { acc.push({ atom: atom, site: site_for(checker, atom) }) })
+
+/// The written atoms of the same effect and resource as `a`.
+fn named_for(dec: List<Atom>, a: Atom) -> List<Atom> =
+  dec.filter(|d: Atom| d.effect == a.effect && d.resource == a.resource)
+
+/// A mode atom reached through a call, where the row names operations of its effect: the callee may perform any of them.
+fn narrowed_site(dec: List<Atom>, site: PerformSite) -> Bool =
+  !is_direct(site)
+    && (match site.atom.op { None -> named_for(dec, site.atom).len() > 0, Some(_) -> false })
+
+fn site_label(dec: List<Atom>, site: PerformSite) -> Bytes / {abort.raise} = {
+  let a = atom_text(site.atom);
+  let through = match site.source {
+    PerformVia(name) -> backticked_text(simple_name_of(name)),
+    OpaquePerform -> b"a function value",
+    _ -> b"its arguments",
+  };
+  match site.source {
+    DirectPerform -> Bytes::concat_all([b"performs `", a, b"`"]),
+    PerformThroughArgs -> Bytes::concat_all([b"reaches `", a, b"`"]),
+    _ -> if narrowed_site(dec, site) {
+      Bytes::concat_all([
+        b"reaches `",
+        a,
+        b"` through ",
+        through,
+        b", which may perform any of its operations; this row names only ",
+        backticked(named_for(dec, site.atom).map(atom_text), b", "),
+      ])
+    } else { Bytes::concat_all([b"reaches `", a, b"` through ", through]) },
+  }
+}
+
+fn narrowed_by_row(dec: List<Atom>, o: Offence) -> Bool =
+  match o.site { Some(s) -> narrowed_site(dec, s), None -> false }
+
+/// Where an atom joins a written row: before `}`, after `{` when a tail follows, or braces around a
+/// bare variable, its `bounded` inside them.
+fn row_edit(checker: Checker, row: RowExpr, text: Bytes) -> Edit =
+  match row.tail {
+    None ->
+      insertion(checker.module, row.span.end - 1, if row.atoms.len() + row.aliases.len() == 0 {
+        text
+      } else { b", ".concat(text) }),
+    Some(t) -> if t.span.start == row.span.start {
+      {
+        module: checker.module,
+        start: row.span.start,
+        end: row.span.end,
+        text: Bytes::concat_all([
+          b"{",
+          text,
+          b" | ",
+          t.name,
+          if row.tail_bounded { b" bounded" } else { b"" },
+          b"}",
+        ]),
+      }
+    } else { insertion(checker.module, row.span.start + 1, text.concat(b", ")) },
+  }
+
+fn check_upper_bound(
+  checker: Checker,
+  def: FnDef,
+  declared: Row,
+  inferred: Row,
+) -> Checker / {abort.raise} =
+  match def.effects {
+    None -> match def.baked {
+      Some(at) -> check_const_row(checker, def, at, inferred),
+      None -> check_unwritten(checker, def, inferred),
+    },
+    Some(_) -> match schema_of(checker.modules.get(checker.module).module, def) {
+      None -> check_written(checker, def, declared, inferred),
+      // A schema's guard and body are a law's: what they may not perform is said as it is of one.
+      Some(schema) -> {
+        let row = resolve_row_in(checker, inferred);
+        check_written(
+          check_spec_purity(
+            checker,
+            if def.name.name == schema.name.name { InSchemaBody } else { InWhere },
+            [],
+            expr_span(def.body),
+            { atoms: row.atoms, tail: None },
+          ),
+          def,
+          declared,
+          { atoms: [], tail: row.tail },
+        )
+      },
+    },
+  }
+
+/// The name a forwarded row variable is written under: the signature's own row parameter.
+fn row_param_named(checker: Checker, v: Int) -> Option<Bytes> =
+  checker.row_params.fold(None, |found: Option<Bytes>, name: Bytes, w: Int|
+    match found { Some(_) -> found, None -> if w == v { Some(name) } else { None } })
+
+/// A set this module can name, as it names it, and the atoms it stands for.
+type Nameable = { name: Bytes, atoms: List<Atom> }
+
+/// The atoms of `owner`'s set `name`, resolved where they were written; none when one does not resolve.
+fn set_atoms_of(checker: Checker, owner: Int, name: Bytes) -> Option<List<Atom>> / {abort.raise} =
+  match checker.modules.at(owner) {
+    None -> None,
+    Some(md) ->
+      md.module.items.fold(None, |found: Option<List<Atom>>, item: Item|
+        match found {
+          Some(_) -> found,
+          None -> match item {
+            IEffectSet(d) -> if d.name.name == name {
+              let there: Checker = {
+                ..checker,
+                module: owner,
+                label_params: Map::new(),
+                diags: [],
+              };
+              Option::traverse(d.expansion, |a: AtomExpr| conv_atom(there, a).atom)
+            } else { None },
+            _ -> None,
+          },
+        }),
+  }
+
+/// Every set this module names: its own and those it imports by name, then those of each module it
+/// imports, through the binder.
+fn nameable_sets(checker: Checker) -> List<Nameable> / {abort.raise} = {
+  let scope = scope_of(checker);
+  let bound = scope.bound.sets.fold([], |acc: List<Nameable>, b: Binding|
+    match set_atoms_of(checker, b.owner, b.name) {
+      Some(xs) -> acc.push({ name: b.name, atoms: xs }),
+      None -> acc,
+    });
+  scope.modules.filter(written_binder).fold(bound, |acc: List<Nameable>, mb: ModuleBinding|
+    checker.resolved.declarations.get(mb.target).sets.fold(
+      acc,
+      |a: List<Nameable>, declared: Declared|
+        if !declared.public { a } else {
+          match set_atoms_of(checker, mb.target, declared.name) {
+            Some(xs) ->
+              a.push({ name: Bytes::concat_all([mb.binder, b"::", declared.name]), atoms: xs }),
+            None -> a,
+          }
+        },
+    ))
+}
+
+fn set_before(a: Nameable, b: Nameable) -> Bool =
+  a.atoms.len() > b.atoms.len()
+    || (a.atoms.len() == b.atoms.len()
+    && (match compare(a.name, b.name) { Less -> true, _ -> false }))
+
+/// The sets a written row can name in place of `atoms`: each set every atom of which the row holds,
+/// the largest first, and one only when it holds an atom no earlier one does; and the atoms nothing
+/// else written covers.
+fn folded(
+  checker: Checker,
+  atoms: List<Atom>,
+) -> { sets: List<Bytes>, rest: List<Atom> } / {abort.raise} = {
+  let fits = nameable_sets(checker).filter(|c: Nameable|
+    c.atoms.len() > 0 && c.atoms.fold(true, |all: Bool, a: Atom| all && atoms.contains(a)));
+  let sorted = fits.fold([], |acc: List<Nameable>, c: Nameable| {
+    let n = acc.len();
+    let i = range(0, n).fold(n, |found: Int, j: Int|
+      if found < n { found } else if set_before(c, acc.get(j)) { j } else { found });
+    range(i, n).fold(acc.take(i).push(c), |out: List<Nameable>, j: Int| out.push(acc.get(j)))
+  });
+  let picked = sorted.fold(
+    { sets: [], covered: [] },
+    |acc: { sets: List<Bytes>, covered: List<Atom> }, c: Nameable|
+      if c.atoms.fold(true, |all: Bool, a: Atom| all && atoms_covered(acc.covered, a)) { acc }
+      else { { sets: acc.sets.push(c.name), covered: acc.covered.concat(c.atoms) } },
+  );
+  let rest = atoms.filter(|a: Atom| !atoms_covered(picked.covered, a));
+  {
+    sets: picked.sets,
+    rest: rest.filter(|a: Atom|
+      !rest.fold(false, |hit: Bool, x: Atom| hit || (x != a && atom_covers(x, a)))),
+  }
+}
+
+fn const_refused(
+  checker: Checker,
+  def: FnDef,
+  at: Span,
+  what: Bytes,
+  primary: Label,
+  notes: List<Bytes>,
+) -> Checker =
+  err_labels(
+    checker,
+    b"E0156",
+    Bytes::concat_all([b"`", def.name.name, b"` is `const`, and ", what]),
+    [primary, label_at(checker.module, at, false, b"a build evaluates this and keeps its value")],
+    notes,
+  )
+
+/// What a build can evaluate once and keep as data: a definition nothing is handed to, that writes
+/// no row, and answers no function, `Hold`, `Task`, `Chan` or `Secret`.
+fn check_const_shape(
+  checker: Checker,
+  def: FnDef,
+  at: Span,
+  sig: Signature,
+) -> Checker / {abort.raise} = {
+  let handed = [
+    b"a build evaluates a `const fn` once, before any call of it, so nothing can be handed to it",
+  ];
+  let binders = def.generics.types.concat(def.generics.labels).concat(def.generics.effects);
+  let bound: Checker = match binders.at(0) {
+    None -> checker,
+    Some(b) ->
+      const_refused(
+        checker,
+        def,
+        at,
+        b"binds a parameter of its own",
+        label_at(checker.module, b.span, true, b"a `const fn` binds no type, label or row"),
+        handed,
+      ),
+  };
+  let taken: Checker = match def.params.at(0) {
+    None -> bound,
+    Some(p) ->
+      const_refused(
+        bound,
+        def,
+        at,
+        b"takes a parameter",
+        label_at(bound.module, p.span, true, b"a `const fn` takes none"),
+        handed,
+      ),
+  };
+  let rowed: Checker = match def.effects {
+    None -> taken,
+    Some(r) ->
+      const_refused(
+        taken,
+        def,
+        at,
+        b"writes a row",
+        label_at(taken.module, r.span, true, b"a `const fn` writes none"),
+        [
+          b"a `const fn` performs nothing: what its body could raise, the build that evaluates it sees it not raise",
+        ],
+      ),
+  };
+  // A type parameter is refused above; the type it leaves open says nothing more.
+  match derivable(DBin, resolve(rowed, sig.ret), algebraic_shapes(rowed), []) {
+    None -> rowed,
+    Some(b) -> match b.why {
+      Unconstrained(_) -> rowed,
+      why ->
+        const_refused(
+          rowed,
+          def,
+          at,
+          b"answers a value a build cannot keep",
+          label_at(
+            rowed.module,
+            match def.ret { Some(t) -> ty_span(t), None -> def.name.span },
+            true,
+            Bytes::concat_all([
+              b"holds `",
+              print_ty(printer_new(), b.ty).text,
+              b"`, ",
+              match why {
+                HoldsFunction -> b"a function",
+                HoldsHandle -> b"which names a location rather than a value",
+                HoldsSecret -> b"a credential",
+                _ -> b"which has no stored form",
+              },
+            ]),
+          ),
+          [
+            b"a build keeps a `const fn`'s value as data, which a function, a `Hold`, a `Task`, a `Chan` and a `Secret` are not",
+          ],
+        ),
+    },
+  }
+}
+
+/// A build evaluates a `const fn` where nothing answers an effect: its body may raise, which the
+/// build sees it not do, and performs nothing else, a call that may not return included.
+fn check_const_row(
+  unclosed: Checker,
+  def: FnDef,
+  at: Span,
+  inferred: Row,
+) -> Checker / {abort.raise} = {
+  let checker: Checker = match resolve_row_in(unclosed, inferred).tail {
+    None -> unclosed,
+    Some(v) -> {
+      let u = unify_row(unclosed.subst, unclosed.fresh, row_empty(), row_open(v));
+      match u.error { Some(_) -> unclosed, None -> with_unified(unclosed, u) }
+    },
+  };
+  resolve_row_in(checker, inferred).atoms.filter(|atom: Atom| !is_raise(atom.mode)).fold(
+    checker,
+    |c: Checker, atom: Atom| {
+      let site = site_for(c, atom);
+      let (module, span) = match site {
+        Some(s) -> (s.module, s.span),
+        None -> (c.module, expr_span(def.body)),
+      };
+      if is_diverges(atom) {
+        const_refused(
+          c,
+          def,
+          at,
+          b"may not return",
+          label_at(module, span, true, b"this call may not return"),
+          [b"a build evaluates a `const fn`, so it ends: call only what ends"],
+        )
+      } else {
+        const_refused(
+          c,
+          def,
+          at,
+          Bytes::concat_all([b"its body performs `", atom_text(atom), b"`"]),
+          label_at(module, span, true, match site {
+            Some(s) -> site_label([], s),
+            None -> b"performed in this body",
+          }),
+          [
+            b"a build evaluates a `const fn` before the program runs, where nothing answers an effect: its body may raise, and performs nothing else",
+            b"read a file with `embed`, and handle any other effect inside the body",
+          ],
+        )
+      }
+    },
+  )
+}
+
+/// With no `/` the row is empty: what the body performs or forwards is reported at once, with the
+/// row that would write it, naming a set wherever the module can.
+fn check_unwritten(unclosed: Checker, def: FnDef, inferred: Row) -> Checker / {abort.raise} = {
+  let unclosed_row = resolve_row_in(unclosed, inferred);
+  // A tail nothing constrains closes on the empty row; only a row parameter is forwarded.
+  let closed: { checker: Checker, forwarded: Bool } = match unclosed_row.tail {
+    None -> { checker: unclosed, forwarded: false },
+    Some(v) -> {
+      let u = unify_row(unclosed.subst, unclosed.fresh, row_empty(), row_open(v));
+      match u.error {
+        Some(_) -> { checker: unclosed, forwarded: true },
+        None -> { checker: with_unified(unclosed, u), forwarded: false },
+      }
+    },
+  };
+  let checker = closed.checker;
+  let closed_row = resolve_row_in(checker, inferred);
+  let forwarded = closed.forwarded;
+  if closed_row.atoms.len() == 0 && !forwarded { checker } else {
+    let grouped = folded(checker, closed_row.atoms);
+    let atoms = grouped.sets.concat(grouped.rest.map(|atom: Atom| atom_written(checker, atom)));
+    let tail: Option<Bytes> = match closed_row.tail {
+      None -> None,
+      Some(v) -> row_param_named(checker, v),
+    };
+    let row = if atoms.len() == 0 { match tail { Some(name) -> name, None -> b"e" } } else {
+      Bytes::concat_all([
+        b"{",
+        Bytes::join(atoms, b", "),
+        match tail { Some(name) -> b" | ".concat(name), None -> b"" },
+        b"}",
+      ])
+    };
+    let sites = offences(checker, [], closed_row.atoms).fold([], |acc: List<Label>, o: Offence|
+      match o.site {
+        Some(s) -> acc.push(label_at(s.module, s.span, true, site_label([], s))),
+        None -> acc,
+      });
+    let primaries = if sites.len() == 0 {
+      [
+        label_at(
+          checker.module,
+          expr_span(def.body),
+          true,
+          b"body has row ".concat(row_text(closed_row)),
+        ),
+      ]
+    } else { sites };
+    let d: Diag = error_with_labels(
+      b"E0302",
+      Bytes::concat_all([
+        b"`",
+        def.name.name,
+        b"` writes no `/`, so its row is empty, and its body ",
+        if forwarded && atoms.len() == 0 { b"forwards a row" } else { b"performs effects" },
+      ]),
+      primaries.push(
+        label_at(checker.module, def.name.span, false, b"no `/` written: the row is empty"),
+      ),
+      [
+        if closed_row.atoms.len() > 0 && closed_row.tail == None
+            && closed_row.atoms.fold(true, |all: Bool, a: Atom| all && is_diverges(a)) {
+          Bytes::concat_all([
+            b"a call that may not return makes `",
+            def.name.name,
+            b"` one too: write `/ ",
+            row,
+            b"` after the return type, or call only what ends",
+          ])
+        } else {
+          Bytes::concat_all([
+            b"a function performs only what its signature writes: write `/ ",
+            row,
+            b"` after the return type, or handle the effects inside `",
+            def.name.name,
+            b"`",
+          ])
+        },
+      ],
+    );
+    let nameable = grouped.rest.fold(true, |all: Bool, atom: Atom|
+      all && written_as(checker, atom.effect) != None);
+    let fixable = nameable && (!forwarded || tail != None);
+    let fixed: Diag = match def.ret {
+      Some(t) -> if fixable {
+        with_fix(d, Bytes::concat_all([b"write the row `/ ", row, b"`"]), [
+          insertion(checker.module, ty_span(t).end, b" / ".concat(row)),
+        ])
+      } else { d },
+      None -> d,
+    };
+    report(checker, fixed)
+  }
+}
+
+/// A bound on the steps a call takes says the call ends, which a row writing `diverges` denies; and
+/// a bound on its steps or its space is read from the body, which a handler of anything but a raise
+/// could change. A row variable is what a function parameter performs, whose steps its cost name
+/// stands for.
+fn bounded_row(checker: Checker, def: FnDef, sig: Signature) -> Checker / {abort.raise} = {
+  let row = resolve_row_in(checker, sig.published_row);
+  let diverges = row.atoms.fold(false, |found: Bool, a: Atom| found || is_diverges(a));
+  let performs = run_needs(row.atoms).len() > 0;
+  let written = match def.effects { Some(r) -> r.span, None -> def.name.span };
+  def.spec.filter(|c: SpecClause| c.kind == SCost || c.kind == SSpace).fold(
+    checker,
+    |c: Checker, clause: SpecClause| {
+      let what = if clause.kind == SCost { b"steps" } else { b"space" };
+      if diverges && clause.kind == SCost {
+        report(
+          c,
+          error_with_labels(
+            b"E0468",
+            Bytes::concat_all([
+              b"`",
+              def.name.name,
+              b"` bounds its steps, and its row says it may not return",
+            ]),
+            [
+              label_at(c.module, clause.span, true, b"this bound says every call ends"),
+              label_at(c.module, written, false, b"`diverges` is written here"),
+            ],
+            [b"make its recursion descend and drop `diverges`, or drop the bound"],
+          ),
+        )
+      } else if performs {
+        report(
+          c,
+          error_with_labels(
+            b"E0463",
+            Bytes::concat_all([
+              b"`",
+              def.name.name,
+              b"` bounds its ",
+              what,
+              b", and performs more than a raise",
+            ]),
+            [
+              label_at(c.module, clause.span, true, b"this bound is proved from the body alone"),
+              label_at(c.module, written, false, b"its row is written here"),
+            ],
+            [
+              Bytes::concat_all([
+                b"a handler could change the ",
+                what,
+                b" a call takes, so only a definition that performs nothing but raises states a bound",
+              ]),
+            ],
+          ),
+        )
+      } else { c }
+    },
+  )
+}
+
+/// A definition whose own recursion is not seen to descend may not return, which its row has to say.
+/// Nothing is offered to write: the fix is usually a recursion that descends.
+fn unwritten_divergence(
+  checker: Checker,
+  def: FnDef,
+  says_diverges: Bool,
+  ending: Ending,
+  start_of: (Bytes) -> Int / {abort.raise},
+) -> Checker / {abort.raise} =
+  match ending {
+    Diverges(d) -> if d.through != None || says_diverges { checker } else if def.baked != None {
+      const_refused(
+        checker,
+        def,
+        match def.baked { Some(at) -> at, None -> def.name.span },
+        b"may not return",
+        label_at(
+          checker.module,
+          span_between(
+            start_of(d.at.caller) + d.at.span.start,
+            start_of(d.at.caller) + d.at.span.end,
+          ),
+          true,
+          b"this call back into its group is not seen to descend",
+        ),
+        [b"a build evaluates a `const fn`, so it ends: call only what ends"],
+      )
+    } else {
+      report(
+        checker,
+        error_with_labels(
+          b"E0302",
+          Bytes::concat_all([
+            b"`",
+            def.name.name,
+            b"` may not return, and its row does not say so",
+          ]),
+          [
+            label_at(
+              checker.module,
+              span_between(
+                start_of(d.at.caller) + d.at.span.start,
+                start_of(d.at.caller) + d.at.span.end,
+              ),
+              true,
+              if d.loop.len() > 0 { b"this call back into its group is not seen to descend" }
+              else { b"this recursion is past what the termination check follows" },
+            ),
+            label_at(
+              checker.module,
+              match def.effects { Some(r) -> r.span, None -> def.name.span },
+              false,
+              b"no `diverges` written",
+            ),
+          ],
+          [
+            b"a call back into the group descends when it hands on a part of an argument, or an `Int` moved toward a bound a guard on the way holds it beyond",
+            b"a loop with no such measure can spend a budget, with `iterate`, or state a `decreases` a proof shows falls",
+            b"write `diverges` in the row only of a loop that waits on something outside, such as a stream or a peer",
+          ],
+        ),
+      )
+    },
+    _ -> checker,
+  }
+
+fn check_written(
+  checker: Checker,
+  def: FnDef,
+  declared: Row,
+  inferred: Row,
+) -> Checker / {abort.raise} = {
+  let ann_span = match def.effects { Some(r) -> r.span, None -> def.span };
+  let inf = resolve_row_in(checker, inferred);
+  let dec = resolve_row_in(checker, declared);
+  let extra = offences(checker, dec.atoms, inf.atoms);
+  let c1: Checker = if extra.len() == 0 { checker } else {
+    let names = backticked(extra.map(|o: Offence| atom_text(o.atom)), b", ");
+    let sites = extra.fold([], |acc: List<Label>, o: Offence|
+      match o.site {
+        Some(s) -> acc.push(label_at(s.module, s.span, true, site_label(dec.atoms, s))),
+        None -> acc,
+      });
+    let primaries = if sites.len() == 0 {
+      [
+        label_at(
+          checker.module,
+          expr_span(def.body),
+          true,
+          b"this body performs more than it declares",
+        ),
+      ]
+    } else { sites };
+    let notes = if extra.fold(true, |all: Bool, o: Offence| all && is_diverges(o.atom)) {
+      [
+        Bytes::concat_all([
+          b"a call that may not return makes `",
+          def.name.name,
+          b"` one too: add `diverges` to its row, or call only what ends",
+        ]),
+      ]
+    } else {
+      [
+        Bytes::concat_all([
+          b"add ",
+          names,
+          b" to the `/ {..}` annotation, or handle ",
+          if extra.len() == 1 { b"it" } else { b"them" },
+          b" inside `",
+          def.name.name,
+          b"`",
+        ]),
+      ]
+    };
+    let narrowed = extra.fold(false, |acc: Bool, o: Offence| acc || narrowed_by_row(dec.atoms, o));
+    let d: Diag = error_with_labels(
+      b"E0302",
+      Bytes::concat_all([
+        b"effect",
+        plural(extra.len()),
+        b" not permitted by the signature of `",
+        def.name.name,
+        b"`: ",
+        names,
+      ]),
+      primaries.push(
+        label_at(checker.module, ann_span, false, b"declared row is ".concat(row_text(dec))),
+      ),
+      if narrowed {
+        notes.push(
+          b"a row that names operations permits a call only when the callee's row names them too: widen this row to the mode atom, or narrow the callee's row",
+        )
+      } else { notes },
+    );
+    // An atom this module cannot name has no text that would parse, so it gets no fix.
+    let fixed: Diag = match def.effects {
+      Some(r) ->
+        extra.fold(d, |acc: Diag, o: Offence|
+          if written_as(checker, o.atom.effect) == None { acc } else {
+            let text = atom_written(checker, o.atom);
+            with_fix(acc, Bytes::concat_all([b"add `", text, b"` to the row"]), [
+              row_edit(checker, r, text),
+            ])
+          }),
+      None -> d,
+    };
+    report(checker, fixed)
+  };
+  match inf.tail {
+    None -> c1,
+    Some(v) -> if dec.tail == Some(v) { c1 } else {
+      let u = unify_row(c1.subst, c1.fresh, { atoms: [], tail: dec.tail }, row_open(v));
+      let c2: Checker = with_unified(c1, u);
+      match u.error {
+        Some(_) ->
+          err_labels(
+            c2,
+            b"E0302",
+            Bytes::concat_all([
+              b"the signature of `",
+              def.name.name,
+              b"` does not permit the effects its body forwards",
+            ]),
+            [
+              label_at(
+                c2.module,
+                expr_span(def.body),
+                true,
+                b"body has row ".concat(row_text(inf)),
+              ),
+              label_at(c2.module, ann_span, false, b"declared row cannot absorb it"),
+            ],
+            [b"add the missing effect variable to the generic list, or widen the annotation"],
+          ),
+        None -> c2,
+      }
+    },
+  }
+}
+
+pub fn settle_numerics(checker: Checker) -> Checker / {abort.raise} = {
+  let entries = checker.numerics;
+  entries.fold({ ..checker, numerics: [] }, |c: Checker, entry: Numeric| {
+    let ty = resolve(c, entry.ty);
+    let what = if is_ordered(entry.op) { b"ordered comparison" } else { b"arithmetic" };
+    match ty {
+      TyVar(v) -> match c.witnessed.get(v) {
+        Some(w) -> if (entry.op == b"div" || entry.op == b"rem") && !w.integer {
+          report_error_at(
+            c,
+            b"E0209",
+            entry.span,
+            Bytes::concat_all([
+              b"`",
+              op_text(entry.op),
+              b"` is not defined on every `numeric` type, so not on `",
+              w.param,
+              b"`",
+            ]),
+            if entry.op == b"div" { b"divided here" } else { b"the remainder taken here" },
+            [
+              Bytes::concat_all([
+                b"`integer(",
+                w.param,
+                b")` admits `/` and `%`; a `Decimal` has no `/`, since its exact quotient is not a decimal, and a type that states its own arithmetic has neither",
+              ]),
+            ],
+          )
+        } else { c },
+        None ->
+          report_error_at(
+            c,
+            b"E0210",
+            entry.span,
+            Bytes::concat_all([b"the numeric type of this ", what, b" is not determined"]),
+            b"nothing here says which numeric type this is",
+            [
+              b"the numeric types are `Int`, the eight fixed-width integers, `Float` and `Decimal`, and there is no tower",
+              b"annotate the operand, or write a literal that pins it (`1`, `1.0`, `1m`)",
+              b"a type parameter takes arithmetic under `where numeric(a)`, and `/`, `%` and the bit operators under `where integer(a)`",
+            ],
+          ),
+      },
+      TyCon(k) -> if k.args.len() != 0 { numeric_mismatch(c, entry, ty, what) }
+      else if is_int_name(k.name) || k.name == b"Float" { c }
+      // Characters order by scalar value, which is what a range test such as `c >= 'a'` reads.
+      else if k.name == b"Char" && is_ordered(entry.op) { c } else if k.name == b"Decimal" {
+        if entry.op == b"div" {
+          report_error_at(
+            c,
+            b"E0209",
+            entry.span,
+            b"`/` is not defined on `Decimal`",
+            b"the exact quotient of two decimals is not a decimal",
+            [
+              b"an operator would have to round, and a rounding nobody wrote down is the defect `Decimal` exists to prevent",
+              b"call `Decimal::div(a, b, 2, HalfEven)` and say how to round",
+            ],
+          )
+        } else { c }
+      } else {
+        match numeric_of(c.numeric_types, k.name) {
+          Some(_) -> stated_operator(c, entry, ty, k.name),
+          None -> numeric_mismatch(c, entry, ty, what),
+        }
+      },
+      _ -> numeric_mismatch(c, entry, ty, what),
+    }
+  })
+}
+
+/// An operator at a type that states `numeric`: `+`, `-` and `*` are its functions, the ordered
+/// comparisons its `key`'s where it states one, and `/` and `%` are no operator of it.
+fn stated_operator(
+  checker: Checker,
+  entry: Numeric,
+  ty: Type,
+  type_name: Bytes,
+) -> Checker / {abort.raise} =
+  if entry.op == b"add" || entry.op == b"sub" || entry.op == b"mul" || entry.op == b"neg" {
+    checker
+  } else if is_ordered(entry.op) {
+    if checker.keyed_names.contains(type_name) { checker } else {
+      report_error_at(
+        checker,
+        b"E0201",
+        entry.span,
+        Bytes::concat_all([b"`", op_text(entry.op), b"` is not defined on `", type_text(ty), b"`"]),
+        b"ordered comparison here",
+        [
+          Bytes::concat_all([
+            b"`",
+            simple_name_of(type_name),
+            b"` states `numeric` and no `key`, and a type is ordered by its `key`",
+          ]),
+        ],
+      )
+    }
+  } else {
+    report_error_at(
+      checker,
+      b"E0201",
+      entry.span,
+      Bytes::concat_all([b"`", op_text(entry.op), b"` is not defined on `", type_text(ty), b"`"]),
+      b"arithmetic here",
+      [
+        Bytes::concat_all([
+          b"a type that states `numeric` takes `+`, `-`, `*` and unary `-`; `",
+          op_text(entry.op),
+          b"` has no answer at every pair of its values, so its module has a function for it instead",
+        ]),
+      ],
+    )
+  }
+
+fn op_text(op: Bytes) -> Bytes =
+  if op == b"add" { b"+" }
+  else if op == b"sub" || op == b"neg" { b"-" }
+  else if op == b"mul" { b"*" }
+  else if op == b"div" { b"/" }
+  else if op == b"rem" { b"%" }
+  else if op == b"lt" { b"<" }
+  else if op == b"le" { b"<=" }
+  else if op == b"gt" { b">" }
+  else if op == b"ge" { b">=" }
+  else { op }
+
+fn numeric_mismatch(
+  checker: Checker,
+  entry: Numeric,
+  ty: Type,
+  what: Bytes,
+) -> Checker / {abort.raise} =
+  report_error_at(
+    checker,
+    b"E0201",
+    entry.span,
+    Bytes::concat_all([b"`", op_text(entry.op), b"` is not defined on `", type_text(ty), b"`"]),
+    what.concat(b" here"),
+    [
+      b"the numeric types are `Int`, the eight fixed-width integers, `Float` and `Decimal`, and a type whose module states `numeric` for it takes `+`, `-` and `*`",
+    ],
+  )
+
+/// The resolved type, rendered, when the signature's generics bind every variable in it, so the author can paste it.
+fn writable(checker: Checker, signature: Signature, t: Type) -> Option<Bytes> / {abort.raise} = {
+  let resolved = resolve(checker, t);
+  let bound = signature.ty_params.fold([], |acc: List<Int>, k: Bytes, p: Type|
+    match resolve(checker, p) { TyVar(v) -> acc.push(v), _ -> acc });
+  let found = free_vars(subst_new(), resolved, { tys: [], rows: [] }).tys;
+  if found.fold(false, |b: Bool, v: Int| b || !bound.contains(v)) { None }
+  else { Some(type_text(resolved)) }
+}
+
+fn require_written_signature(
+  checker: Checker,
+  def: FnDef,
+  signature: Signature,
+) -> Checker / {abort.raise} = {
+  let why = b"a signature is a claim about what a definition means, so it is written rather than inferred; the effect row is the exception and stays inferred";
+  let params = range(0, def.params.len()).fold(checker, |c: Checker, i: Int| {
+    let p = def.params.get(i);
+    match p.ty {
+      Some(_) -> c,
+      None -> {
+        let label = match writable(c, signature, signature.params.get(i)) {
+          Some(shown) -> Bytes::concat_all([b"write `", p.name.name, b": ", shown, b"`"]),
+          None -> b"write a type here",
+        };
+        report_error_at(
+          c,
+          b"E0126",
+          p.span,
+          Bytes::concat_all([b"parameter `", p.name.name, b"` has no written type"]),
+          label,
+          [why],
+        )
+      },
+    }
+  });
+  match def.ret {
+    Some(_) -> params,
+    None -> {
+      let label = match writable(params, signature, signature.ret) {
+        Some(shown) -> Bytes::concat_all([b"write `-> ", shown, b"`"]),
+        None -> b"write a return type here",
+      };
+      report_error_at(
+        params,
+        b"E0126",
+        def.name.span,
+        Bytes::concat_all([b"`", def.name.name, b"` has no written return type"]),
+        label,
+        [why],
+      )
+    },
+  }
+}
+
+fn close_unreachable_row(checker: Checker, signature: Signature) -> Checker / {abort.raise} =
+  match resolve(checker, signature.fn_ty) {
+    TyFn(f) -> match f.effects.tail {
+      None -> checker,
+      Some(tail) -> if is_rigid_row(checker.subst, tail) { checker } else {
+        let fv = f.params.fold({ tys: [], rows: [] }, |acc: Free, ty: Type|
+          free_vars(checker.subst, ty, acc));
+        let all = free_vars(checker.subst, f.ret, fv);
+        if all.rows.contains(tail) { checker } else {
+          let u = unify_row(checker.subst, checker.fresh, row_empty(), row_open(tail));
+          with_unified(checker, u)
+        }
+      },
+    },
+    _ -> checker,
+  }
+
+// --- Tests and laws --------------------------------------------------------------------------------
+
+/// A cached footprint carries the determinism verdict: an effect's `nondet` marker is part of its declaration's hash.
+/// The first of `labels` named `name`, where one is.
+fn labelled(labels: List<{ name: Bytes, span: Span }>, name: Bytes) -> Option<Span> =
+  labels.fold(None, |span: Option<Span>, l: { name: Bytes, span: Span }|
+    match span { Some(_) -> span, None -> if l.name == name { Some(l.span) } else { None } })
+
+pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
+  let walked = parsed.module.items.fold(
+    { checker: checker, labels: [] },
+    |acc: { checker: Checker, labels: List<{ name: Bytes, span: Span }> }, item: Item|
+      match item {
+        ITest(def) -> {
+          let seen: Checker = match labelled(acc.labels, def.name) {
+            None -> acc.checker,
+            Some(first) ->
+              report_error_at_and(
+                acc.checker,
+                b"E0105",
+                def.name_span,
+                Bytes::concat_all([b"two tests are labelled ", debug_quoted(def.name)]),
+                b"relabelled here",
+                { module: acc.checker.module, span: first },
+                b"first labelled here",
+                [
+                  b"a test is keyed `<module>.<label>`, so one label names one test; a test over cases that shares another's body and case type can range over both tables at once",
+                ],
+              ),
+          };
+          let c: Checker = { ..seen, scope: seen.scope + 1 };
+          let owner = test_owner(parsed.name, def.name);
+          let footprint: WithAtoms = match c.known.tests.get(qualify(parsed.name, def.name)) {
+            Some(cached) ->
+              {
+                checker: {
+                  ..c,
+                  seeded_tests: c.seeded_tests.push(qualify(parsed.name, def.name)),
+                  kept: c.kept.push({ name: owner, facts: cached.facts }),
+                },
+                atoms: settled_row(c, cached.footprint).atoms,
+              },
+            None -> {
+              let c1: Checker = {
+                ..c,
+                ty_params: Map::new(),
+                row_params: Map::new(),
+                label_params: Map::new(),
+                performs: [],
+                declared_atoms: [],
+                guards: guards::none(),
+                raise_notes: [],
+                walking: owner,
+              };
+              let pushed: Checker = { ..c1, env: env_push(c1.env) };
+              let entered: Checker = match def.cases {
+                None -> pushed,
+                Some(_) ->
+                  {
+                    ..pushed,
+                    env: env_bind(
+                      env_bind(pushed.env, case_at(), monomorphic(int_type())),
+                      case_identity(),
+                      monomorphic(bytes_type()),
+                    ),
+                  },
+              };
+              let o: Inferred = infer_whole(entered, test_run(def), hint_of(unit_type()));
+              let answered: Checker = check_test_answer(o.checker, def, o.ty);
+              let listed: Checker = match def.cases {
+                None -> answered,
+                Some(cases) -> check_listing(answered, def, cases),
+              };
+              let popped: Checker = { ..listed, env: env_pop(listed.env) };
+              let row = leaving_row(resolve_row_in(popped, o.row));
+              // A table refused for what it performs is not also held to the test's determinism.
+              let unlisted = listed.diags.len() > answered.diags.len();
+              {
+                checker: if def.is_nondet || unlisted { popped }
+                else { check_determinism(popped, def, row.atoms) },
+                atoms: run_needs(row.atoms),
+              }
+            },
+          };
+          let checked: Checker = footprint.checker;
+          {
+            checker: {
+              ..checked,
+              tests: checked.tests.push({
+                name: def.name,
+                module: parsed.name,
+                key: qualify(parsed.name, def.name),
+                index: checked.tests.len(),
+                nondet: def.is_nondet,
+                cases: def.cases != None,
+                footprint: footprint.atoms,
+                at: location_of(checked, def.span),
+              }),
+              walking: b"",
+            },
+            labels: acc.labels.push({ name: def.name, span: def.name_span }),
+          }
+        },
+        _ -> acc,
+      },
+  );
+  walked.checker
+}
+
+fn check_test_answer(checker: Checker, def: TestDef, ty: Type) -> Checker / {abort.raise} = {
+  let u = unify(checker.subst, checker.fresh, unit_type(), ty);
+  let c = with_unified(checker, u);
+  match u.error {
+    None -> c,
+    Some(_) -> {
+      let span = expr_span(tail_value(def.body));
+      let found = resolve(c, ty);
+      let shown = print_ty(printer_new(), found).text;
+      let d = error_at(
+        b"E0201",
+        c.module,
+        span,
+        Bytes::concat_all([b"type mismatch: the body of test `", def.name, b"`"]),
+        Bytes::concat_all([b"expected `Unit`, found `", shown, b"`"]),
+        [b"a test passes when its body finishes, so a value it ends on is never read"],
+      );
+      report(c, if found == bool_type() {
+        with_fix(d, b"wrap it in `assert`", [
+          insertion(c.module, span.start, b"assert("),
+          insertion(c.module, span.end, b")"),
+        ])
+      } else { with_fix(d, b"end the body with `()`", [insertion(c.module, span.end, b"; ()")]) })
+    },
+  }
+}
+
+fn tail_value(expr: Expr) -> Expr =
+  match expr { EBlock(b) -> match b.tail { Some(t) -> tail_value(t), None -> expr }, _ -> expr }
+
+/// A test's cases are listed before any of them runs, where nothing answers an effect: the table
+/// and the label may raise, and perform nothing else.
+fn check_listing(checker: Checker, def: TestDef, cases: Cases) -> Checker / {abort.raise} = {
+  let o: Inferred = infer_whole(checker, test_listing(cases), hint_of(listing_ty()));
+  let c = o.checker;
+  match run_needs(resolve_row_in(c, o.row).atoms).at(0) {
+    None -> c,
+    Some(atom) ->
+      err_labels(
+        c,
+        b"E0469",
+        Bytes::concat_all([
+          b"the cases of test `",
+          def.name,
+          b"` perform `",
+          atom_text(atom),
+          b"`",
+        ]),
+        [
+          label_at(
+            c.module,
+            match site_for(c, atom) { Some(s) -> s.span, None -> expr_span(cases.table) },
+            true,
+            b"performed while the cases are listed",
+          ),
+        ],
+        [
+          b"a test's cases are listed before any test runs, to decide which of them run: its table and its label may raise, and perform nothing else",
+          b"handle the effect inside the table, or build the table from what `embed_dir` read",
+        ],
+      ),
+  }
+}
+
+type WithAtoms = { checker: Checker, atoms: List<Atom> }
+
+fn check_determinism(
+  checker: Checker,
+  def: TestDef,
+  footprint: List<Atom>,
+) -> Checker / {abort.raise} =
+  footprint.fold(checker, |c: Checker, atom: Atom|
+    match effect_of(c, atom.effect) {
+      None -> c,
+      Some(info) -> if !info.nondet { c } else {
+        let site = site_for(c, atom);
+        let (span, direct) = match site {
+          Some(s) -> (s.span, is_direct(s)),
+          None -> (expr_span(def.body), false),
+        };
+        let a = atom_text(atom);
+        let remedy = if simulated_names().contains(atom.effect) {
+          b"handle it here, e.g. `simulate { <body> }`"
+        } else {
+          Bytes::concat_all([
+            b"handle it here, e.g. `handle <body> with { ",
+            example_clause(c, info, atom),
+            b" }`",
+          ])
+        };
+        let indirect = if direct { [] } else {
+          [Bytes::concat_all([b"`", a, b"` is performed inside something this expression calls"])]
+        };
+        err_labels(
+          c,
+          b"E0412",
+          b"nondeterministic effect in a deterministic test",
+          [
+            label_at(
+              c.module,
+              span,
+              true,
+              Bytes::concat_all([
+                if direct { b"performs `" } else { b"reaches `" },
+                a,
+                b"`, and `",
+                atom.effect,
+                b"` is declared `nondet`",
+              ]),
+            ),
+            label_at(
+              c.module,
+              def.name_span,
+              false,
+              Bytes::concat_all([b"test `", def.name, b"` is deterministic"]),
+            ),
+          ],
+          indirect.concat([
+            remedy,
+            b"or declare this `test/nondet`, which opts out of the cache and re-runs every time",
+          ]),
+        )
+      },
+    })
+
+/// A clause the reader could paste, for the operation the atom names.
+fn example_clause(checker: Checker, info: EffectInfo, atom: Atom) -> Bytes / {abort.raise} = {
+  let written = as_written(checker, info.name);
+  let named = match atom.resource {
+    RNamed(_) -> true,
+    RVar(_) -> true,
+    RSingleton -> false,
+    RAny -> true,
+  };
+  let first = |ok: (OpInfo) -> Bool|
+    info.ops.fold(None, |acc: Option<OpInfo>, o: OpInfo|
+      match acc { Some(_) -> acc, None -> if ok(o) { Some(o) } else { None } });
+  let op = match atom.op {
+    Some(name) -> op_named(info, name),
+    None -> match first(|o: OpInfo| mode_eq(o.mode, atom.mode) && named == o.resource_param) {
+      Some(o) -> Some(o),
+      None -> match first(|o: OpInfo| mode_eq(o.mode, atom.mode)) {
+        Some(o) -> Some(o),
+        None -> info.ops.at(0),
+      },
+    },
+  };
+  match op {
+    Some(o) -> {
+      let resource = if o.resource_param { resource_text(atom.resource) } else { b"" };
+      let args = Bytes::join(
+        range(0, o.params.len()).map(|i: Int| b"a".concat(ascii_of_int(i))),
+        b", ",
+      );
+      Bytes::concat_all([written, b".", o.name, resource, b"(", args, b") -> <value>"])
+    },
+    None -> written.concat(b".<op>() -> <value>"),
+  }
+}
+
+pub fn check_laws(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
+  let walked = parsed.module.items.fold(
+    { checker: checker, labels: [] },
+    |acc: { checker: Checker, labels: List<{ name: Bytes, span: Span }> }, item: Item|
+      match item {
+        ILaw(def) -> {
+          let c: Checker = { ..acc.checker, scope: acc.checker.scope + 1 };
+          match labelled(acc.labels, def.name) {
+            Some(first) ->
+              {
+                ..acc,
+                checker: report_error_at_and(
+                  c,
+                  b"E0105",
+                  def.name_span,
+                  Bytes::concat_all([b"two laws are labelled ", debug_quoted(def.name)]),
+                  b"relabelled here",
+                  { module: c.module, span: first },
+                  b"first labelled here",
+                  [b"a law is keyed `<module>.<label>`, so one label names one claim"],
+                ),
+              },
+            None ->
+              {
+                checker: check_law(c, parsed, def),
+                labels: acc.labels.push({ name: def.name, span: def.name_span }),
+              },
+          }
+        },
+        _ -> acc,
+      },
+  );
+  walked.checker
+}
+
+/// `{:?}` over a label: quoted, with `"` and `\` escaped.
+fn debug_quoted(s: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"\"",
+    Bytes::concat_all(
+      range(0, s.len()).map(|i: Int| {
+        let c = s.at(i);
+        if c == 34 { b"\\\"" }
+        else if c == 92 { b"\\\\" }
+        else if c == 10 { b"\\n" }
+        else if c == 9 { b"\\t" }
+        else { s.slice(i, i + 1) }
+      }),
+    ),
+    b"\"",
+  ])
+
+fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {abort.raise} = {
+  let checker: Checker = {
+    ..outer,
+    ty_params: Map::new(),
+    row_params: Map::new(),
+    label_params: Map::new(),
+    performs: [],
+    declared_atoms: [],
+    guards: guards::none(),
+    raise_notes: [],
+    auto_ty_params: true,
+  };
+  let types: WithTys = def.binders.fold(
+    { checker: checker, tys: [] },
+    |acc: { checker: Checker, tys: List<Type> }, b: Binder| {
+      // An instantiation's binders are typed by what its schema's definitions take them at.
+      let o: WithTy = if def.of != None { new_ty(acc.checker) } else { law_binder(acc.checker, b) };
+      { checker: o.checker, tys: acc.tys.push(o.ty) }
+    },
+  );
+  let c1: Checker = { ..types.checker, auto_ty_params: false };
+  let sorts = c1.ty_params.fold([], |acc: List<Int>, k: Bytes, ty: Type|
+    match ty { TyVar(v) -> acc.push(v), _ -> acc });
+  let rigid: Checker = sorts.fold(c1, |c: Checker, v: Int|
+    { ..c, subst: mark_rigid_ty(c.subst, v) });
+  let pushed: Checker = { ..rigid, env: env_push(rigid.env) };
+  let bound: Checker = range(0, def.binders.len()).fold(pushed, |c: Checker, i: Int|
+    {
+      ..note_typed(c, def.binders.get(i).name.span, types.tys.get(i), []),
+      env: env_bind(c.env, def.binders.get(i).name.name, monomorphic(types.tys.get(i))),
+    });
+  let guarded: Checker = match def.guard {
+    Some(g) -> {
+      let o: Inferred = infer_whole({ ..bound, performs: [] }, g);
+      let c: Checker = unfilled(
+        expect(
+          o.checker,
+          expr_span(g),
+          bool_type(),
+          o.ty,
+          b"a `where` guard states a proposition",
+        ).checker,
+        def,
+        o.row,
+      );
+      check_spec_purity(c, InWhere, [], expr_span(g), resolve_row_in(c, o.row))
+    },
+    None -> bound,
+  };
+  let body: Inferred = infer_whole({ ..guarded, performs: [] }, def.body);
+  let stated: Checker = expect(
+    body.checker,
+    expr_span(def.body),
+    bool_type(),
+    body.ty,
+    b"a law states a proposition",
+  ).checker;
+  let c2: Checker = unfilled(stated, def, body.row);
+  let row = resolve_row_in(c2, body.row);
+  let c3: Checker = check_spec_purity(c2, InLawBody, [seed_atom()], expr_span(def.body), row);
+  let closed: Checker = { ..c3, env: env_pop(c3.env) };
+  let shown = |i: Int|
+    match def.of {
+      Some(u) -> match u.shown.at(i) { Some(n) -> n, None -> def.binders.get(i).name.name },
+      None -> def.binders.get(i).name.name,
+    };
+  let popped: Checker = match def.of {
+    None -> closed,
+    Some(u) -> if closed.diags.len() != outer.diags.len() { closed } else {
+      range(0, def.binders.len()).fold(closed, |c: Checker, i: Int|
+        instantiable(c, u, shown(i), resolve(c, types.tys.get(i))))
+    },
+  };
+  let binders = range(0, def.binders.len()).map(|i: Int|
+    { name: shown(i), ty: resolve(popped, types.tys.get(i)), span: def.binders.get(i).span });
+  {
+    ..popped,
+    ty_params: Map::new(),
+    row_params: Map::new(),
+    laws: popped.laws.push({
+      name: def.name,
+      module: parsed.name,
+      key: qualify(parsed.name, def.name),
+      index: popped.laws.len(),
+      binders: binders,
+      has_guard: match def.guard { Some(_) -> true, None -> false },
+      footprint: run_needs(row.atoms),
+      at: location_of(popped, def.span),
+    }),
+  }
+}
+
+/// A schema's row parameter that nothing an instantiation gave it fills is empty there: a law
+/// names no row of its own, so it states what its arguments raise and no more.
+fn unfilled(checker: Checker, def: LawDef, row: Row) -> Checker / {abort.raise} =
+  match ((def.of, resolve_row_in(checker, row).tail)) {
+    (Some(_), Some(v)) -> {
+      let u = unify_row(checker.subst, checker.fresh, row_empty(), row_open(v));
+      match u.error { Some(_) -> checker, None -> with_unified(checker, u) }
+    },
+    _ -> checker,
+  }
+
+/// A schema's binder at the type an instantiation gives it, which the generator must inhabit as it
+/// must a written binder's.
+fn instantiable(
+  checker: Checker,
+  of: OfSchema,
+  binder: Bytes,
+  ty: Type,
+) -> Checker / {abort.raise} =
+  match ungeneratable(checker, ty) {
+    None -> checker,
+    Some(reason) ->
+      report_error_at(
+        checker,
+        b"E0418",
+        of.span,
+        Bytes::concat_all([b"`forall` cannot quantify over `", binder, b"`"]),
+        reason,
+        [
+          Bytes::concat_all([
+            b"the schema `",
+            of.schema.name.name,
+            b"` binds `",
+            binder,
+            b"`, which is a `",
+            type_text(ty),
+            b"` here",
+          ]),
+          b"a law over a type nothing can produce is a claim nothing can ever check, so it is refused here rather than reported as a gap at discharge time",
+        ],
+      ),
+  }
+
+/// A schema's binders are quantified as a law's are. What else is wrong with a binder's type is said
+/// of the definitions made of the schema.
+pub fn check_schemas(outer: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
+  parsed.module.items.fold(outer, |acc: Checker, item: Item|
+    match item {
+      ISchema(d) -> {
+        let typed: Checker = d.binders.fold(
+          { ..acc, ty_params: Map::new(), auto_ty_params: true },
+          |c: Checker, b: Binder| law_binder(c, b).checker,
+        );
+        {
+          ..typed,
+          ty_params: acc.ty_params,
+          auto_ty_params: acc.auto_ty_params,
+          diags: acc.diags.concat(
+            typed.diags.drop(acc.diags.len()).filter(|diag: Diag| diag.code == b"E0418"),
+          ),
+        }
+      },
+      _ -> acc,
+    })
+
+/// A binder's type must be one the generator can inhabit: no handler, written row beyond a raise,
+/// `Hold`, `Task` or `Secret`.
+fn law_binder(checker: Checker, binder: Binder) -> { checker: Checker, ty: Type } / {abort.raise} =
+  match handler_mention(checker, binder.ty) {
+    Some(span) ->
+      new_ty(
+        report_error_at(
+          checker,
+          b"E0418",
+          span,
+          b"`forall` cannot quantify over a handler",
+          b"a handler is syntax, not a value",
+          [
+            b"`handle body with { .. }` is an expression form: there is no type a handler inhabits and no value for a binder to range over",
+            b"a handler-parametric law would take a handler type, a `Value::Handler` and a normalization story, and what such a law could prove is too little to be worth that yet",
+            b"quantify over the values the handler would answer with instead",
+          ],
+        ),
+      ),
+    None -> match written_row_reason(binder.ty) {
+      Some(reason) -> new_ty(unquantifiable(checker, binder, reason)),
+      None -> {
+        let o: WithTy = conv_type(checker, binder.ty);
+        match ungeneratable(o.checker, o.ty) {
+          Some(reason) -> { checker: unquantifiable(o.checker, binder, reason), ty: o.ty },
+          None -> o,
+        }
+      },
+    },
+  }
+
+fn unquantifiable(checker: Checker, binder: Binder, reason: Bytes) -> Checker =
+  report_error_at(
+    checker,
+    b"E0418",
+    ty_span(binder.ty),
+    Bytes::concat_all([b"`forall` cannot quantify over `", binder.name.name, b"`"]),
+    reason,
+    [
+      b"a law over a type nothing can produce is a claim nothing can ever check, so it is refused here rather than reported as a gap at discharge time",
+    ],
+  )
+
+/// The raw variable, not the printer's letter.
+fn row_display(row: Row) -> Bytes / {abort.raise} = {
+  let atoms = Bytes::join(row.atoms.map(atom_text), b", ");
+  match row.tail {
+    None -> Bytes::concat_all([b"{", atoms, b"}"]),
+    Some(v) -> if row.atoms.len() == 0 { Bytes::concat_all([b"{| e", ascii_of_int(v), b"}"]) }
+    else { Bytes::concat_all([b"{", atoms, b" | e", ascii_of_int(v), b"}"]) },
+  }
+}
+
+fn handler_named(checker: Checker, name: Bytes, span: Span) -> Option<Span> / {abort.raise} = {
+  let is_handler = name == b"Handler" || name == b"handler";
+  let declared = match find(checker.resolved, checker.module, TypeSpace, {
+      module: None,
+      name: { name: name, span: span },
+      span: span,
+    }) {
+    Some(_) -> true,
+    None -> false,
+  };
+  if is_handler && !declared { Some(span) } else { None }
+}
+
+fn handler_mention(checker: Checker, ty: TypeExpr) -> Option<Span> / {abort.raise} =
+  match ty {
+    TUnit(_) -> None,
+    TBad(_) -> None,
+    TVar(id) -> handler_named(checker, id.name, id.span),
+    TCon(c) -> {
+      let own = if is_bare(c.name) { handler_named(checker, c.name.name.name, c.span) }
+      else { None };
+      match own { Some(_) -> own, None -> first_handler_mention(checker, c.args) }
+    },
+    TFn(f) -> match first_handler_mention(checker, f.params) {
+      Some(s) -> Some(s),
+      None -> handler_mention(checker, f.ret),
+    },
+    TRecord(r) ->
+      r.fields.fold(None, |acc: Option<Span>, f: { name: Ident, ty: TypeExpr }|
+        match acc { Some(_) -> acc, None -> handler_mention(checker, f.ty) }),
+  }
+
+fn first_handler_mention(checker: Checker, tys: List<TypeExpr>) -> Option<Span> / {abort.raise} =
+  tys.fold(None, |acc: Option<Span>, ty: TypeExpr|
+    match acc { Some(_) -> acc, None -> handler_mention(checker, ty) })
+
+fn raises(atom: AtomExpr) -> Bool = is_bare(atom.eff) && atom.eff.name.name == b"abort"
+
+/// A function's row, or the row a declared type is given for the functions it holds.
+fn law_row_reason(row: RowExpr) -> Option<Bytes> =
+  match row.tail {
+    Some(_) ->
+      Some(
+        b"an effect variable has no binder here, and a law quantifies over values rather than over rows",
+      ),
+    None -> match row.atoms.filter(|a: AtomExpr| !raises(a)).at(0) {
+      Some(a) ->
+        Some(
+          Bytes::concat_all([
+            b"applying this inside the body would perform `",
+            qname_text(a.eff),
+            b"`, and a law body is pure",
+          ]),
+        ),
+      None -> None,
+    },
+  }
+
+fn written_row_reason(ty: TypeExpr) -> Option<Bytes> =
+  match ty {
+    TVar(_) -> None,
+    TUnit(_) -> None,
+    TBad(_) -> None,
+    TCon(c) -> match first_reason(c.rows, law_row_reason) {
+      Some(r) -> Some(r),
+      None -> first_reason(c.args, written_row_reason),
+    },
+    TRecord(r) ->
+      first_reason(r.fields, |f: { name: Ident, ty: TypeExpr }| written_row_reason(f.ty)),
+    TFn(f) -> {
+      let own = match f.effects { Some(row) -> law_row_reason(row), None -> None };
+      match own {
+        Some(_) -> own,
+        None -> match first_reason(f.params, written_row_reason) {
+          Some(r) -> Some(r),
+          None -> written_row_reason(f.ret),
+        },
+      }
+    },
+  }
+
+fn ungeneratable(checker: Checker, ty: Type) -> Option<Bytes> / {abort.raise} =
+  ungeneratable_within(checker, ty, [], checker.ctors.len())
+
+/// `room` is how many more declared types the walk may enter: a path enters each one once, and each
+/// has a constructor.
+fn ungeneratable_within(
+  checker: Checker,
+  ty: Type,
+  seen: List<Bytes>,
+  room: Int,
+) -> Option<Bytes> / {abort.raise} =
+  match ty {
+    TyVar(_) -> None,
+    TyCon(c) -> if c.name == b"Hold" {
+      Some(b"a `Hold` is created by `with_hold` and exists only inside its region")
+    } else if c.name == b"Task" {
+      Some(b"a `Task` is a key into the scheduler of the `simulate` region that spawned it")
+    } else if c.name == b"Chan" {
+      Some(b"a `Chan` is a key into the scheduler of the `simulate` region that made it")
+    } else if c.name == b"Secret" {
+      Some(
+        b"a `Secret` is a credential: quantifying over one would have the prover mint credentials and print them in counterexamples",
+      )
+    } else {
+      match first_reason(c.args, |a: Type| ungeneratable_within(checker, a, seen, room)) {
+        Some(r) -> Some(r),
+        None -> if seen.contains(c.name) { None } else {
+          let ctors = checker.ctors.filter(|ctor_info: CtorInfo| ctor_info.type_name == c.name);
+          if ctors.len() == 0 { None }
+          else if room <= 0 { panic("a type entered twice on one path") } else {
+            let inner = seen.push(c.name);
+            first_reason(ctors, |ctor_info: CtorInfo|
+              first_reason(ctor_info.fields, |f: Type|
+                ungeneratable_within(checker, f, inner, room - 1)))
+          }
+        },
+      }
+    },
+    // A binder writes no row variable, so one here is a declared type's own row parameter.
+    TyFn(f) -> if f.effects.tail != None {
+      Some(
+        b"a function a declared type holds under its row parameter is not generated, whatever row the type is given",
+      )
+    } else if !row_is_pure_but_raise(f.effects) {
+      Some(
+        Bytes::concat_all([
+          b"a function with row ",
+          row_display(f.effects),
+          b" cannot be applied inside a pure body",
+        ]),
+      )
+    } else {
+      match first_reason(f.params, |p: Type| ungeneratable_within(checker, p, seen, room)) {
+        Some(r) -> Some(r),
+        None -> ungeneratable_within(checker, f.ret, seen, room),
+      }
+    },
+    TyRecord(fs) -> first_reason(fs, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
+    TyNominal(n) ->
+      first_reason(n.fields, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
+  }
+
+type SpecSite =
+  | InRequires
+  | InEnsures
+  | InCost
+  | InSpace
+  | SSDecreases
+  | InWhere
+  | InLawBody
+  | InSchemaBody
+
+fn site_phrase(s: SpecSite) -> Bytes =
+  match s {
+    InRequires -> b"a `requires` clause",
+    InEnsures -> b"an `ensures` clause",
+    InCost -> b"a `cost` bound",
+    InSpace -> b"a `space` bound",
+    SSDecreases -> b"a `decreases` measure",
+    InWhere -> b"a `where` guard",
+    InLawBody -> b"a law body",
+    InSchemaBody -> b"a law schema's body",
+  }
+
+fn site_short(s: SpecSite) -> Bytes =
+  match s {
+    InRequires -> b"`requires`",
+    InEnsures -> b"`ensures`",
+    InCost -> b"`cost` bound",
+    InSpace -> b"`space` bound",
+    SSDecreases -> b"`decreases` measure",
+    InWhere -> b"`where` guard",
+    InLawBody -> b"law body",
+    InSchemaBody -> b"schema body",
+  }
+
+/// Every atom past the allowed set is `E0417`, and an open row too.
+fn check_spec_purity(
+  checker: Checker,
+  site: SpecSite,
+  allowed: List<Atom>,
+  body_span: Span,
+  row: Row,
+) -> Checker / {abort.raise} = {
+  let law_body = match site { InLawBody -> true, _ -> false };
+  let c1: Checker = run_needs(row.atoms).filter(|a: Atom| !atoms_covered(allowed, a)).fold(
+    checker,
+    |c: Checker, atom: Atom| {
+      let found = site_for(c, atom);
+      let (span, direct) = match found {
+        Some(s) -> (s.span, is_direct(s)),
+        None -> (body_span, false),
+      };
+      let fixed = [
+        b"a claim that can perform an effect can change what it observes: an obligation that writes to the resource it judges reports the post-state it caused",
+        b"and a discharge evaluates it hundreds of times, against a world nothing set up",
+      ];
+      let carried = allowed.fold(fixed, |acc: List<Bytes>, a: Atom|
+        acc.push(
+          Bytes::concat_all([
+            b"a law body may carry `",
+            atom_text(a),
+            b"` \xe2\x80\x94 the seed a `simulate` region reads \xe2\x80\x94 and nothing else",
+          ]),
+        ));
+      let hosted = if law_body {
+        carried.push(
+          b"what reaches the world is no claim a proof closes: check it in a test, under the handlers or the host it needs",
+        )
+      } else { carried };
+      err_labels(
+        c,
+        b"E0417",
+        site_phrase(site).concat(b" cannot perform an effect"),
+        [
+          label_at(
+            c.module,
+            span,
+            true,
+            Bytes::concat_all([
+              if direct { b"performs `" } else { b"reaches `" },
+              atom_text(atom),
+              b"`",
+            ]),
+          ),
+          label_at(
+            c.module,
+            body_span,
+            false,
+            Bytes::concat_all([b"this ", site_short(site), b" must be pure"]),
+          ),
+        ],
+        hosted.push(
+          Bytes::concat_all([
+            b"compute this with a pure function, or handle `",
+            atom.effect,
+            b"` inside the definition and state a claim about its result",
+          ]),
+        ),
+      )
+    },
+  );
+  match row.tail {
+    Some(_) ->
+      report_error_at(
+        c1,
+        b"E0417",
+        body_span,
+        Bytes::concat_all([b"the row of this ", site_short(site), b" is not known to be empty"]),
+        b"has row ".concat(row_text(row)),
+        [
+          b"an effect variable is pure for some instantiations and not for others, and a claim has to hold for every one",
+          b"call something whose row is closed and empty here",
+        ],
+      ),
+    None -> c1,
+  }
+}
+
+// --- Spec clauses ------------------------------------------------------------------------------
+
+// Typed after the whole module is published: a clause may name anything the module can reach.
+
+fn has_spec(def: FnDef) -> Bool =
+  def.spec.len() > 0 || (match def.decreases { Some(_) -> true, None -> false })
+
+fn record_spec_env(checker: Checker, def: FnDef, name: Bytes, signature: Signature) -> Checker =
+  if !has_spec(def) { checker } else {
+    {
+      ..checker,
+      spec_envs: checker.spec_envs.push({
+        name: name,
+        ty_params: signature.ty_params,
+        row_params: signature.row_params,
+        params: signature.params,
+        ret: signature.ret,
+      }),
+    }
+  }
+
+fn spec_env_of(checker: Checker, name: Bytes) -> Option<SpecEnv> =
+  checker.spec_envs.fold(None, |acc: Option<SpecEnv>, e: SpecEnv|
+    match acc { Some(_) -> acc, None -> if e.name == name { Some(e) } else { None } })
+
+pub fn check_specs(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
+  let walked: Checker = parsed.module.items.fold(checker, |c: Checker, item: Item|
+    match item {
+      IFn(def) -> if !has_spec(def) { c } else {
+        let name = qualify(parsed.name, def.name.name);
+        match spec_env_of(c, name) {
+          None -> c,
+          Some(env) -> {
+            let shadowed: Checker = check_cost_names(check_result_shadow(c, def), def);
+            let walked = range(0, def.spec.len()).fold(
+              { checker: shadowed, specs: [] },
+              |acc: { checker: Checker, specs: List<SpecInfo> }, i: Int| {
+                let clause = def.spec.get(i);
+                let o: WithAtoms = check_clause(acc.checker, def, clause, env);
+                {
+                  checker: o.checker,
+                  specs: acc.specs.push({
+                    kind: clause.kind,
+                    index: i,
+                    footprint: o.atoms,
+                    span: clause.span,
+                  }),
+                }
+              },
+            );
+            let measured: Checker = match def.decreases {
+              Some(e) -> check_measure(walked.checker, def, e, env),
+              None -> walked.checker,
+            };
+            match def_of(measured, name) {
+              Some(d) -> {
+                let info: DefInfo = d;
+                set_def(measured, { ..info, spec: walked.specs })
+              },
+              None -> measured,
+            }
+          },
+        }
+      },
+      _ -> c,
+    });
+  { ..walked, ty_params: Map::new(), row_params: Map::new() }
+}
+
+/// A clause's scope: the parameters, and what the body assumes, its definition's constraints.
+fn spec_scope(checker: Checker, written: FnDef, env: SpecEnv) -> Checker / {abort.raise} = {
+  let def = carried(checker, [written]).get(0);
+  let c0: Checker = {
+    ..checker,
+    ty_params: env.ty_params,
+    row_params: env.row_params,
+    performs: [],
+    declared_atoms: [],
+    guards: guards::none(),
+    raise_notes: [],
+  };
+  let assumed: Checker = witnessing(
+    { ..c0, assumed: constraints_in_force(c0, def.constraints) },
+    def.constraints,
+  );
+  let pushed: Checker = { ..assumed, env: env_push(assumed.env) };
+  range(0, def.params.len()).fold(pushed, |c: Checker, i: Int|
+    if i >= env.params.len() { c } else {
+      { ..c, env: env_bind(c.env, def.params.get(i).name.name, monomorphic(env.params.get(i))) }
+    })
+}
+
+fn check_measure(
+  checker: Checker,
+  def: FnDef,
+  expr: Expr,
+  env: SpecEnv,
+) -> Checker / {abort.raise} = {
+  let o: Inferred = infer_whole(spec_scope(checker, def, env), expr);
+  let popped: Checker = { ..o.checker, env: env_pop(o.checker.env) };
+  let c1: Checker = expect(
+    popped,
+    expr_span(expr),
+    int_type(),
+    o.ty,
+    b"a `decreases` measure is an `Int`",
+  ).checker;
+  check_spec_purity(
+    { ..c1, assumed: checker.assumed },
+    SSDecreases,
+    [],
+    expr_span(expr),
+    resolve_row_in(c1, o.row),
+  )
+}
+
+fn check_clause(
+  checker: Checker,
+  def: FnDef,
+  clause: SpecClause,
+  env: SpecEnv,
+) -> WithAtoms / {abort.raise} = {
+  let bound: Checker = spec_scope(checker, def, env);
+  // A cost name is the steps one call of its parameter takes, and a space name what one holds.
+  let named = |names: List<Option<Ident>>|
+    names.fold(bound, |c: Checker, name: Option<Ident>|
+      match name {
+        Some(k) -> { ..c, env: env_bind(c.env, k.name, monomorphic(int_type())) },
+        None -> c,
+      });
+  let with_result: Checker = match clause.kind {
+    SEnsures -> { ..bound, env: env_bind(bound.env, result_name(), monomorphic(env.ret)) },
+    SRequires -> bound,
+    SSpace -> named(def.params.map(|param: Param| param.space)),
+    SCost -> named(def.params.map(|param: Param| param.cost)),
+  };
+  let outer = with_result.spec_kind;
+  let o: Inferred = infer_whole(
+    {
+      ..with_result,
+      spec_kind: Some(clause.kind),
+      walking: if clause.kind == SCost || clause.kind == SSpace { unlowered() }
+      else { with_result.walking },
+    },
+    clause.expr,
+  );
+  let popped: Checker = {
+    ..o.checker,
+    spec_kind: outer,
+    walking: with_result.walking,
+    env: env_pop(o.checker.env),
+  };
+  let c1: Checker = match clause.kind {
+    SCost ->
+      expect(
+        popped,
+        expr_span(clause.expr),
+        int_type(),
+        o.ty,
+        b"a `cost` bound is an `Int`",
+      ).checker,
+    SSpace ->
+      expect(
+        popped,
+        expr_span(clause.expr),
+        int_type(),
+        o.ty,
+        b"a `space` bound is an `Int`",
+      ).checker,
+    _ ->
+      expect(
+        popped,
+        expr_span(clause.expr),
+        bool_type(),
+        o.ty,
+        b"a spec clause states a proposition",
+      ).checker,
+  };
+  let row = resolve_row_in(c1, o.row);
+  {
+    checker: check_spec_purity(
+      { ..c1, assumed: checker.assumed },
+      match clause.kind {
+        SRequires -> InRequires,
+        SEnsures -> InEnsures,
+        SCost -> InCost,
+        SSpace -> InSpace,
+      },
+      [],
+      clause.span,
+      row,
+    ),
+    atoms: run_needs(row.atoms),
+  }
+}
+
+/// A cost or space name is introduced beside the parameters, so one named like a parameter or
+/// another of its kind is reported.
+fn check_cost_names(checker: Checker, def: FnDef) -> Checker / {abort.raise} =
+  check_names(
+    check_names(checker, def, def.params.map(|param: Param| param.cost), b"cost"),
+    def,
+    def.params.map(|param: Param| param.space),
+    b"space",
+  )
+
+/// `names`, each parameter's name of the `word` it takes, against the parameters and each other.
+fn check_names(
+  checker: Checker,
+  def: FnDef,
+  names: List<Option<Ident>>,
+  word: Bytes,
+) -> Checker / {abort.raise} =
+  range(0, def.params.len()).fold(checker, |c: Checker, i: Int|
+    match names.get(i) {
+      None -> c,
+      Some(k) -> match range(0, def.params.len()).fold(None, |found: Option<Span>, j: Int|
+          match found {
+            Some(_) -> found,
+            None -> {
+              let other = def.params.get(j);
+              if other.name.name == k.name { Some(other.name.span) }
+              else if j < i && (match names.get(j) { Some(o) -> o.name == k.name, None -> false }) {
+                match names.get(j) { Some(o) -> Some(o.span), None -> None }
+              } else { None }
+            },
+          }) {
+        None -> c,
+        Some(first) ->
+          err_labels(
+            c,
+            b"E0105",
+            Bytes::concat_all([b"`", k.name, b"` is bound twice on `", def.name.name, b"`"]),
+            [
+              label_at(
+                c.module,
+                k.span,
+                true,
+                Bytes::concat_all([b"this names a parameter's ", word]),
+              ),
+              label_at(c.module, first, false, b"and this is named alike"),
+            ],
+            [
+              Bytes::concat_all([
+                b"a `",
+                word,
+                b"` clause reads parameters and ",
+                word,
+                b" names alike, so each needs its own name",
+              ]),
+            ],
+          ),
+      },
+    })
+
+/// `result` is introduced beside the parameters, so a definition that has both is reported.
+fn check_result_shadow(checker: Checker, def: FnDef) -> Checker =
+  match def.spec.fold(None, |acc: Option<Span>, c: SpecClause|
+      match acc { Some(_) -> acc, None -> match c.kind { SEnsures -> Some(c.span), _ -> None } }) {
+    None -> checker,
+    Some(ensures) ->
+      def.params.fold(checker, |c: Checker, param: Param|
+        if param.name.name != result_name() { c } else {
+          err_labels(
+            c,
+            b"E0105",
+            Bytes::concat_all([b"`result` is bound twice on `", def.name.name, b"`"]),
+            [
+              label_at(c.module, param.name.span, true, b"this parameter is named `result`"),
+              label_at(c.module, ensures, false, b"`ensures` binds `result` to the return value"),
+            ],
+            [b"rename the parameter; a definition with no `ensures` may still call one `result`"],
+          )
+        }),
+  }
+
+// --- Derivability ------------------------------------------------------------------------------
+
+/// Every sum type this run declared, flattened: its parameters and every field of every variant;
+/// and every `extern type`, with none.
+pub fn algebraic_shapes(checker: Checker) -> Shapes = {
+  let sums = checker.ctors.fold(Map::new(), |acc: Shapes, ctor_info: CtorInfo|
+    match acc.get(ctor_info.type_name) {
+      None -> {
+        let scheme = ctor_info.scheme;
+        acc.insert(ctor_info.type_name, {
+          name: ctor_info.type_name,
+          params: if scheme.label_vars.len() == 0 { scheme.ty_vars }
+          else { scheme.ty_vars.concat(scheme.label_vars) },
+          rows: scheme.row_vars,
+          fields: ctor_info.fields,
+          native: false,
+        })
+      },
+      Some(a) ->
+        acc.insert(ctor_info.type_name, { ..a, fields: a.fields.concat(ctor_info.fields) }),
+    });
+  checker.types.fold(sums, |acc: Shapes, name: Bytes, decl: TypeDecl|
+    match decl.declared {
+      DeclaredExtern ->
+        acc.insert(name, { name: name, params: [], rows: [], fields: [], native: true }),
+      _ -> acc,
+    })
+}
+
+/// `defs`, each with `where derivable(ord, a)` for each type parameter `a` its signature's types need
+/// ordered: `a` is in a `Map`'s key where ordering the key reads it, or in an argument a declared type
+/// keys a `Map` by. The signature implies the constraint, so callers meet it and the body assumes it
+/// as though the signature wrote it.
+fn carried(checker: Checker, defs: List<FnDef>) -> List<FnDef> / {abort.raise} =
+  defs.map(|d: FnDef| if may_carry(d) { carried_by(checker, d) } else { d })
+
+fn carried_by(checker: Checker, def: FnDef) -> FnDef / {abort.raise} = {
+  let s = written_signature(checker, def);
+  let needed = s.sig.params.push(s.sig.ret).fold([], |acc: List<Int>, t: Type|
+    ints_union(acc, ordered_vars(checker, t)));
+  def.generics.types.fold(def, |d: FnDef, g: Ident|
+    match s.sig.ty_params.get(g.name) {
+      Some(TyVar(v)) -> if !needed.contains(v)
+          || d.constraints.any(|c: Constraint|
+            c.param.name == g.name && same_deriver(c.deriver, DOrd)) { d } else {
+        {
+          ..d,
+          constraints: d.constraints.push({
+            deriver: DOrd,
+            deriver_span: g.span,
+            param: g,
+            span: g.span,
+          }),
+        }
+      },
+      _ -> d,
+    })
+}
+
+/// Whether `def`'s signature could need a type parameter ordered: it writes one in an argument of a
+/// `Map` or of a type the language does not declare, the only places an order can come from.
+fn may_carry(def: FnDef) -> Bool = {
+  let names = def.generics.types.map(|g: Ident| g.name);
+  let carries = |t: TypeExpr| type_may_carry(t, names);
+  names.len() > 0
+    && (def.params.any(|p: Param| match p.ty { Some(t) -> carries(t), None -> false })
+    || (match def.ret { Some(t) -> carries(t), None -> false }))
+}
+
+fn type_may_carry(t: TypeExpr, names: List<Bytes>) -> Bool =
+  match t {
+    TCon(c) ->
+      ((!is_bare(c.name) || c.name.name.name == b"Map"
+        || (builtin_type_arity(c.name.name.name) == None && !names.contains(c.name.name.name)))
+        && c.args.any(|a: TypeExpr| writes_param(a, names)))
+        || c.args.any(|a: TypeExpr| type_may_carry(a, names)),
+    TFn(f) -> type_may_carry(f.ret, names) || f.params.any(|p: TypeExpr| type_may_carry(p, names)),
+    TRecord(r) -> r.fields.any(|f: { name: Ident, ty: TypeExpr }| type_may_carry(f.ty, names)),
+    _ -> false,
+  }
+
+fn writes_param(t: TypeExpr, names: List<Bytes>) -> Bool =
+  match t {
+    TVar(id) -> names.contains(id.name),
+    TCon(c) ->
+      (is_bare(c.name) && c.args.len() == 0 && names.contains(c.name.name.name))
+        || c.args.any(|a: TypeExpr| writes_param(a, names)),
+    TFn(f) -> writes_param(f.ret, names) || f.params.any(|p: TypeExpr| writes_param(p, names)),
+    TRecord(r) -> r.fields.any(|f: { name: Ident, ty: TypeExpr }| writes_param(f.ty, names)),
+    _ -> false,
+  }
+
+/// Enough room for a walk to enter every declaration there is.
+fn keyed_room(checker: Checker) -> Int = checker.ctors.len() + checker.nominals.len() + 1
+
+// --- What a type's module states of it ----------------------------------------------------------
+
+pub fn is_key(kind: InstanceKind) -> Bool = match kind { NKey -> true, NShow -> false }
+
+// --- `check_program` --------------------------------------------------------------------------------------
+
+/// The owner a `cost` clause's walk with its definition's header records under: the law the clause
+/// makes is walked again, and only that walk is lowered.
+pub fn unlowered() -> Bytes = b"#"
+
+/// One module's calls on values that call a function of the value's type, keyed by span, as
+/// `expand_member_calls` reads them, each with its callee's parameters out of `signatures`.
+pub fn members_in(
+  all: List<MemberSite>,
+  module: Int,
+  signatures: Map<Bytes, Parameters>,
+) -> Map<Bytes, MemberCallee> =
+  all.fold(Map::new(), |acc: Map<Bytes, MemberCallee>, s: MemberSite|
+    if s.module != module { acc } else {
+      let params = match signatures.get(s.callee) { Some(g) -> g.params, None -> [] };
+      acc.insert(span_key(s.span), {
+        qualifier: s.qualifier,
+        name: s.name,
+        names: params.map(|p: ParamInfo| p.name),
+        defaults: params.map(|p: ParamInfo| p.default),
+      })
+    })
+
+// --- How many times a body performs what its row names --------------------------------------
+
+test "an extern declares the words a call passes, its witnesses first, and whether it raises" {
+  let named = |name: Bytes|
+    prelude_externs().filter(|e: Extern| e.name == name).map(|e: Extern|
+      { words: e.words, raises: e.raises });
+  assert_eq(named(b"List::len"), [{ words: 1, raises: false }]);
+  assert_eq(named(b"numeric_of_int"), [{ words: 2, raises: true }]);
+  assert_eq(
+    externs_in(
+      b"std.native",
+      b"  extern  fn spaced<a, b>(x: a, y: b) -> a\n  where numeric(a), integer(a), numeric(b)\n\n/// Doubled.\npub extern fn doubled<a>(x: a) -> a / {abort.raise}\n  where numeric(a)\n\nfn not_one() -> Bytes = b\"extern fn one()\"\n",
+    ),
+    [
+      { module: b"std.native", name: b"spaced", words: 4, raises: false },
+      { module: b"std.native", name: b"doubled", words: 2, raises: true },
+    ],
+  );
+  assert_eq(externs_in(b"m", b"extern fn doubled(x: Int) -> Int\n"), [])
+}

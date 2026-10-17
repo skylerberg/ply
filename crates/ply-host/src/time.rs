@@ -2,8 +2,8 @@
 //! time. Its wait is the thread's, so every task of the run waits with it; the wait that parks one
 //! task is the language's `clock.sleep`.
 
-use ply_eval::host::HostRegistry;
-use ply_eval::{
+use ply_core::host::HostRegistry;
+use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
     HostRuntime, Linearity, Span, Symbol, Value, codes,
 };

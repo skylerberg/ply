@@ -1,6 +1,6 @@
 //! TLS credentials and sessions, terminated through rustls.
 
-use ply_eval::{Diagnostic, Span, codes};
+use ply_core::{Diagnostic, Span, codes};
 use rustls::client::{ClientConnection, ResolvesClientCert};
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::hash::HashAlgorithm;

@@ -1,0 +1,218 @@
+//! C as the emitter spells it: the C types of kinds and widths, literals, and text joins.
+
+import emit.code (Code, NLit, NBinary)
+import std.list
+import syntax.patterns (LInt)
+import std.bytes (ascii_of_int)
+import std.math (pow)
+
+/// `KBoxed` is a tagged word; `KInt` is the untagged 64 bits inside one.
+pub type Kind =
+  | KBoxed
+  | KInt
+  | KBool
+  /// Below 64 bits a width has its own C type; signed overflow is undefined in C, so casts carry signedness.
+  | KNum(Width)
+  /// A `Float` in a C `double`, whose arithmetic is IEEE-754's own once contraction is off.
+  | KFloat
+  /// A `Decimal` in a `PlyDec`, the two words of its object, whose arithmetic is the runtime's.
+  | KDec
+  /// A sum of known type as one word, as `SumSpec` says, counted as its argument's word is and made
+  /// the sum's object only where it leaves the code that knows it.
+  | KSum(SumSpec)
+
+/// How a sum is one word. `Zeroed`: an `Option` is its payload's word, `0` for `None`; no word of a
+/// value is zero. `Tagged`: a `Result` whose error is always an object is its `Ok`'s argument's word,
+/// or its `Err`'s with the low bits `100`, which no value's word has.
+pub type SumSpec = | Zeroed | Tagged
+
+/// Whether a value of kind `k` is a word that holds a count: a value's word, or a sum's, zero or a
+/// tag holding none of its own.
+pub fn counted(k: Kind) -> Bool = match k { KBoxed -> true, KSum(_) -> true, _ -> false }
+
+pub fn is_sum(k: Kind) -> Bool = match k { KSum(_) -> true, _ -> false }
+
+/// The runtime's helper `what` for a sum held as `spec` says: `take` makes the object, taking the
+/// word's count; `box` makes it, adding one; `open` makes the word, taking the object.
+pub fn sum_helper(spec: SumSpec, what: Bytes) -> Bytes =
+  match spec {
+    Zeroed -> Bytes::concat_all([b"rt_maybe_", what, b"_p"]),
+    Tagged -> Bytes::concat_all([b"rt_tagged_", what, b"_p"]),
+  }
+
+pub type Width = { bits: Int, signed: Bool }
+
+pub fn ctype(k: Kind) -> Bytes =
+  match k {
+    KNum(w) -> if w.signed {
+      if w.bits == 8 { b"int8_t" }
+      else if w.bits == 16 { b"int16_t" }
+      else if w.bits == 32 { b"int32_t" }
+      else { b"int64_t" }
+    } else { unsigned_ctype(w) },
+    KFloat -> b"double",
+    KDec -> b"PlyDec",
+    KSum(Zeroed) -> b"PlyMaybe",
+    KSum(Tagged) -> b"PlyTagged",
+    _ -> b"int64_t",
+  }
+
+/// What a local of `k` is declared holding before a branch assigns it: a `Decimal`'s struct needs
+/// its braces.
+/// A value of `k` that stands for nothing, as an initializer or an expression.
+pub fn zero_of(k: Kind) -> Bytes = match k { KDec -> b"(PlyDec){0, 0}", _ -> b"0" }
+
+pub fn unsigned_ctype(width: Width) -> Bytes =
+  if width.bits == 8 { b"uint8_t" }
+  else if width.bits == 16 { b"uint16_t" }
+  else if width.bits == 32 { b"uint32_t" }
+  else { b"uint64_t" }
+
+/// `width_index`'s order is the runtime's width numbering.
+pub fn width_named(name: Bytes) -> Option<Width> =
+  if name == b"U8" { Some({ bits: 8, signed: false }) }
+  else if name == b"U16" { Some({ bits: 16, signed: false }) }
+  else if name == b"U32" { Some({ bits: 32, signed: false }) }
+  else if name == b"U64" { Some({ bits: 64, signed: false }) }
+  else if name == b"I8" { Some({ bits: 8, signed: true }) }
+  else if name == b"I16" { Some({ bits: 16, signed: true }) }
+  else if name == b"I32" { Some({ bits: 32, signed: true }) }
+  else if name == b"I64" { Some({ bits: 64, signed: true }) }
+  else if name == b"U128" { Some({ bits: 128, signed: false }) }
+  else if name == b"I128" { Some({ bits: 128, signed: true }) }
+  else { None }
+
+pub fn width_index(width: Width) -> Int =
+  if width.bits == 128 { if width.signed { 9 } else { 8 } } else {
+    (if width.signed { 4 } else { 0 })
+      + (if width.bits == 8 { 0 }
+      else if width.bits == 16 { 1 }
+      else if width.bits == 32 { 2 }
+      else { 3 })
+  }
+
+/// Whether a value of the width is held in a C register of its own type: up to 64 bits.
+pub fn carried(width: Width) -> Bool = width.bits <= 64
+
+/// Whether the width's word is an `Int`'s immediate, as below 64 bits; at 64 it is an object of
+/// the width's own, which compares by the width's order.
+pub fn in_imm(width: Width) -> Bool = width.bits < 64
+
+pub fn width_min(width: Width) -> Int = if width.signed { 0 - pow(2, width.bits - 1) } else { 0 }
+
+pub fn width_max(width: Width) -> Int =
+  if width.signed { pow(2, width.bits - 1) - 1 } else { pow(2, width.bits) - 1 }
+
+pub fn pad(ind: Int) -> Bytes = if ind <= 0 { b"  " } else { b"  ".concat(pad(ind - 1)) }
+
+pub fn position_of(xs: List<Bytes>, x: Bytes) -> Option<Int> =
+  range(0, xs.len()).fold(None, |acc: Option<Int>, i: Int|
+    match acc { Some(_) -> acc, None -> if xs.at(i) == Some(x) { Some(i) } else { None } })
+
+/// How a root whose answer is carried as `k` returns once the context has failed.
+pub fn failing_return(k: Kind) -> Bytes = Bytes::concat_all([b"return ", zero_of(k), b";"])
+
+// --- Externs written in place -----------------------------------------------------
+
+pub fn nth_bytes(xs: List<Bytes>, k: Int) -> Bytes = match xs.at(k) { Some(x) -> x, None -> b"" }
+
+pub fn same_names(a: List<Bytes>, b: List<Bytes>) -> Bool =
+  a.len() == b.len()
+    && a.fold(true, |acc: Bool, x: Bytes|
+      acc && b.fold(false, |seen: Bool, y: Bytes| seen || y == x))
+
+pub fn rank_of(names: List<Bytes>, name: Bytes) -> Int =
+  names.fold(0, |acc: Int, n: Bytes| if compare(n, name) == Less { acc + 1 } else { acc })
+
+pub fn bytes_join(xs: List<Bytes>, sep: Bytes) -> Bytes =
+  range(0, xs.len()).fold(b"", |acc: Bytes, i: Int|
+    Bytes::concat_all([
+      acc,
+      if i == 0 { b"" } else { sep },
+      match xs.at(i) { Some(x) -> x, None -> b"" },
+    ]))
+
+/// Sorted by name: the order a shape holds its fields in.
+pub fn sorted_names(ns: List<Bytes>) -> List<Bytes> =
+  range(0, ns.len()).fold([], |acc: List<Bytes>, i: Int|
+    ns.fold(acc, |a2: List<Bytes>, n: Bytes| if rank_of(ns, n) == i { a2.push(n) } else { a2 }))
+
+/// `INT64_C(-9223372036854775808)` negates an unsigned literal, which C cannot write as a constant, so the least `Int` is named.
+pub fn int_lit(n: Int) -> Bytes =
+  if n == 0 - 9223372036854775807 - 1 { b"INT64_MIN" }
+  else { Bytes::concat_all([b"INT64_C(", ascii_of_int(n), b")"]) }
+
+/// Two literals folded under an operator: `+`, `-`, `*` only without overflow, a shift only by a count the width holds.
+pub fn lit_int(code: Code) -> Option<Int> =
+  match code.node {
+    NLit(l) -> match l { LInt(n) -> Some(n), _ -> None },
+    NBinary(b) -> match lit_int(b.lhs) {
+      None -> None,
+      Some(a) -> match lit_int(b.rhs) {
+        None -> None,
+        Some(x) -> if b.op == b"add" { checked_add(a, x) }
+        else if b.op == b"sub" { checked_sub(a, x) }
+        else if b.op == b"mul" { checked_mul(a, x) }
+        else if b.op == b"bitand" { Some(a & x) }
+        else if b.op == b"bitor" { Some(a | x) }
+        else if b.op == b"bitxor" { Some(a ^ x) }
+        else if b.op == b"shl" && x >= 0 && x < 64 { Some(a << x) }
+        else if b.op == b"shr" && x >= 0 && x < 64 { Some(a >> x) }
+        else if b.op == b"ushr" && x >= 0 && x < 64 { Some(a >>> x) }
+        else { None },
+      },
+    },
+    _ -> None,
+  }
+
+fn checked_add(a: Int, b: Int) -> Option<Int> = {
+  let s = wrap_add(a, b);
+  if a >= 0 == (b >= 0) && s >= 0 != (a >= 0) { None } else { Some(s) }
+}
+
+pub fn checked_sub(a: Int, b: Int) -> Option<Int> = {
+  let s = wrap_sub(a, b);
+  if a >= 0 != (b >= 0) && s >= 0 != (a >= 0) { None } else { Some(s) }
+}
+
+fn checked_mul(a: Int, b: Int) -> Option<Int> =
+  if a == 0 || b == 0 { Some(0) }
+  else if a == -1 { checked_sub(0, b) }
+  else if b == -1 { checked_sub(0, a) } else {
+    let p = wrap_mul(a, b);
+    if p / a == b && p % a == 0 { Some(p) } else { None }
+  }
+
+pub fn is_bitop(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor"
+
+pub fn is_shift(op: Bytes) -> Bool = op == b"shl" || op == b"shr" || op == b"ushr"
+
+pub fn bitop_c(op: Bytes) -> Bytes =
+  if op == b"bitand" { b"&" } else if op == b"bitor" { b"|" } else { b"^" }
+
+// --- Specialisation ----------------------------------------------------------------------------
+
+/// One call counted against the entry's step budget: in the prologue, and again at every restart of a loop,
+/// since a restart is the call a tail call would have made. The runtime is asked only when the count reaches
+/// the checkpoint it set, so a call costs an increment and a compare.
+pub fn tick_line(leave: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"if (++ctx->ticks >= ctx->next_tick) { rt_tick_p(ctx); if (ctx->failed) ",
+    leave,
+    b" }",
+  ])
+
+// --- the emitter's entry ----------------------------------------------------
+
+pub fn push_front_bytes(x: Bytes, xs: List<Bytes>) -> List<Bytes> = [x].concat(xs)
+
+/// Never a type's name.
+pub fn unsettled() -> Bytes = b"?"
+
+pub fn bytes_join_dots(xs: List<Bytes>) -> Bytes =
+  range(0, xs.len()).fold(b"", |acc: Bytes, i: Int|
+    Bytes::concat_all([
+      acc,
+      if i == 0 { b"" } else { b"." },
+      match xs.at(i) { Some(x) -> x, None -> b"" },
+    ]))

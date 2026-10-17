@@ -20,8 +20,8 @@ use crate::term;
 use crate::time;
 use crate::trace;
 use crate::udp;
-use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
-use ply_eval::{Diagnostic, Span, Symbol, TaskId, Value, codes};
+use ply_core::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
+use ply_core::{Diagnostic, Span, Symbol, TaskId, Value, codes};
 use std::rc::Rc;
 use std::sync::Arc;
 

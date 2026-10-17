@@ -1,7 +1,7 @@
 //! Trace sinks: where a record goes.
 
 use super::Level;
-use ply_eval::Decimal;
+use ply_core::Decimal;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -422,9 +422,9 @@ fn write_json_field(out: &mut String, field: &Field) {
         Field::Text(s) => write_string(out, s),
         // JSON has no `NaN` or infinity, so those go out as strings.
         Field::Float(f) if f.is_finite() => {
-            let _ = write!(out, "{}", ply_eval::render_float(*f));
+            let _ = write!(out, "{}", ply_core::render_float(*f));
         }
-        Field::Float(f) => write_string(out, &ply_eval::render_float(*f)),
+        Field::Float(f) => write_string(out, &ply_core::render_float(*f)),
         Field::Decimal(d) => write_string(out, &d.to_string()),
         Field::Bytes(bytes) => {
             out.push('"');

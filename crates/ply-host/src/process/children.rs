@@ -2,7 +2,7 @@
 
 use super::{MAX_CAPTURE_BYTES, OutputSink, Stream};
 use crate::pool::record;
-use ply_eval::{Resource, Value};
+use ply_core::{Resource, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
