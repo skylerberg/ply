@@ -7,7 +7,7 @@ import types (Type, TyCon)
 import parsing (Span, dummy_span)
 import patterns (Lit, LUnit)
 import emit (Width, GenericCall, Need, Pass)
-import emit.keys (RootKey, Callee, Generic)
+import emit.keys (RootKey, Callee, Generic, Named)
 import emit.tir.handling (HandleOp, HandleSite, Simulate, Label)
 import emit.tir.containers (ContainerOp)
 import emit.tir.calling (CallingOp)
@@ -107,6 +107,15 @@ pub type Val =
   /// What `path` reads out of `of`: borrowed from it, but by `PNamed`, which the runtime looks up by
   /// name and answers with a count of its own, and which can fail.
   | Get({ of: Var, path: Path })
+  /// The field held as one word that `path` (a `PField` or a `PArg`) reads out of the block `of`
+  /// is held as a word, with a count of its own: where the block is held only here its slot is
+  /// emptied and the count moves to the reader, and otherwise the reader takes one more. Only the
+  /// ownership pass writes one, at a field's last read; the block it leaves may no longer hold the
+  /// field.
+  | Take({ of: Var, path: Path })
+  /// The tag of constructor `name`, as the program's constructor table names it: an `Int` the unit
+  /// writes in.
+  | Tag(Bytes)
   /// `arg` held as `to`: a scalar boxed, a word opened, a flat value made its object.
   | Pack({ arg: Arg, to: Rep })
   /// A value held as more than one part, from its parts in order: an `RFlat`'s leaves and then its
@@ -154,6 +163,10 @@ pub type Inst =
   /// inside it is answered by no clause; a failing instruction inside releases only what the body
   /// holds beyond them.
   | Handle({ body: Block, args: List<Arg>, uses: Uses, site: HandleSite, answer: Var, unwind: List<Var> })
+  /// The failure sites of the instructions after it in its block, and of the blocks they hold, are
+  /// `Some` lender's: a lambda another root lent runs in place there. `None` ends the innermost such
+  /// run this block began. Writes no C, holds and reads nothing.
+  | Sited(Option<Lender>)
   // Written by the ownership pass alone.
   | Inc({ var: Var, n: Int })
   | Dec(Var)
@@ -167,6 +180,10 @@ pub type Inst =
 /// What a `Fail` fails with: no arm of a `match` matched, which fails the run, or a `let`'s pattern
 /// did not hold its value, which raises.
 pub type Failure = | NoArm | NoLet
+
+/// The root that lent a lambda run in place: its key, which the lambda's failure sites name, and
+/// where its definition's text starts, which they count from.
+pub type Lender = { root: RootKey, base: Int }
 
 /// Whether a function is a root a program calls, counting its steps and testing for failure, or
 /// a plain one the emitter writes for a type (a drop, share, keep or copy root), which does
@@ -269,20 +286,26 @@ pub fn var_of(a: Arg) -> Option<Var> = match a { AVar(v) -> Some(v), _ -> None }
 /// Each operand of `v` and whether `v` consumes it, by the fixed signature each operation has: a
 /// call takes what its convention gives and borrows what it lends, and takes the function it
 /// applies, which the runtime lets go of once the call is done; an operator and a field read
-/// borrow; what allocates or answers takes; a runtime function or a family's operation does as its
-/// `uses` say.
+/// borrow, as does holding a value as one that holds no count; what allocates or answers takes but
+/// a stacked closure, which reads its captures while its caller holds them; a runtime function or a
+/// family's operation does as its `uses` say.
 pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
   match v {
     Prim(p) -> p.args.map(|a: Arg| { arg: a, takes: false }),
     Literal(_) -> [],
     Static(_) -> [],
-    Make(m) ->
-      m.args.map(|a: Arg| { arg: a, takes: true }).concat(match m.reuse {
-        Some(t) -> [{ arg: AVar(t), takes: true }],
-        None -> [],
-      }),
+    Make(m) -> {
+      let lent = match m.made { MClosure(c) -> if c.stacked { c.captures } else { 0 }, _ -> 0 };
+      range(0, m.args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
+        match m.args.at(i) {
+          Some(a) -> acc.push({ arg: a, takes: i >= lent }),
+          None -> acc,
+        }).concat(match m.reuse { Some(t) -> [{ arg: AVar(t), takes: true }], None -> [] })
+    },
     Get(g) -> [{ arg: AVar(g.of), takes: false }],
-    Pack(p) -> [{ arg: p.arg, takes: true }],
+    Take(t) -> [{ arg: AVar(t.of), takes: false }],
+    Tag(_) -> [],
+    Pack(p) -> [{ arg: p.arg, takes: counted(p.to) }],
     Gathered(g) -> g.parts.map(|a: Arg| { arg: a, takes: true }),
     Call(c) -> handed(c.args, c.conv),
     Apply(c) -> [{ arg: c.f, takes: true }].concat(handed(c.args, c.conv)),
@@ -314,6 +337,7 @@ pub fn answered(v: Val) -> Answered =
   match v {
     Get(g) -> match g.path { PNamed(_) -> Owns, _ -> ReadsOf(g.of) },
     Static(_) -> Lasts,
+    Tag(_) -> Lasts,
     Native(n) -> by_uses(n.args, n.uses),
     Op(o) -> by_uses(o.args, o.uses),
     _ -> Owns,
@@ -332,6 +356,8 @@ pub fn fails(v: Val) -> Bool =
     Static(_) -> false,
     Make(_) -> true,
     Get(g) -> match g.path { PNamed(_) -> true, _ -> false },
+    Take(_) -> false,
+    Tag(_) -> false,
     Pack(p) -> allocates(rep_of_arg(p.arg), p.to),
     Gathered(_) -> false,
     Call(_) -> true,
@@ -382,9 +408,9 @@ pub fn ends(i: Inst) -> Bool =
     _ -> false,
   }
 
-/// Whether control can leave `b` at its end.
+/// Whether control can leave `b` at its end: its last instruction but a `Sited` does not end.
 pub fn falls_through(b: Block) -> Bool =
-  match b.at(b.len() - 1) { Some(last) -> !ends(last), None -> true }
+  b.fold(true, |falls: Bool, i: Inst| match i { Sited(_) -> falls, _ -> !ends(i) })
 
 test "a word, a sum's word, a view and a flat value hold a count where a scalar holds none" {
   assert_eq([RInt, RBool, RFloat, RDec, RNum({ bits: 8, signed: false })].map(counted), [
@@ -425,6 +451,24 @@ test "each operation consumes or borrows each operand as its signature says" {
   ]);
   assert_eq(takes(Get({ of: s, path: PLeaf(0) })), [false]);
   assert_eq(takes(Gathered({ parts: [AVar(s), AInt(1)] })), [true, true]);
+  // A word read as a scalar is borrowed; a scalar boxed is taken.
+  assert_eq(takes(Pack({ arg: AVar(s), to: RInt })), [false]);
+  assert_eq(takes(Pack({ arg: AInt(1), to: RWord })), [true]);
+  // A stacked closure reads its captures, which its caller holds while it is lent.
+  let closure = |stacked: Bool|
+    Make({
+      made: MClosure({ nth: 0, captures: 2, params: 1, stacked: stacked }),
+      args: [AVar(s), AVar(s)],
+      reuse: None,
+      kept: [],
+    });
+  assert_eq(takes(closure(true)), [false, false]);
+  assert_eq(takes(closure(false)), [true, true]);
+  // A field taken leaves its block held, and answers a count of its own.
+  let taken = Take({ of: s, path: PField({ name: b"buf", at: 1 }) });
+  assert_eq(takes(taken), [false]);
+  assert_eq(answered(taken), Owns);
+  assert_eq(answered(Tag(b"m.Box")), Lasts);
   let lent = { takes: [false, true], owned: false, fails: true, stops: false };
   assert_eq(takes(Op({ op: OHandle(Simulate), args: [AVar(s), AVar(s)], uses: lent })), [
     false,
@@ -456,6 +500,17 @@ test "what can fail is what tests the runtime: a checked operator, a call, an al
   assert_eq(fails(Pack({ arg: AVar(w), to: RMaybe })), false);
   assert_eq(fails(Pack({ arg: AVar(w), to: RFlat([{ name: b"x", rep: RInt }]) })), false);
   assert_eq(fails(Gathered({ parts: [AInt(1)] })), false);
+  assert_eq(fails(Take({ of: w, path: PField({ name: b"x", at: 0 }) })), false);
+  assert_eq(fails(Tag(b"m.Box")), false);
   assert_eq(ends(Miss), true);
   assert_eq(falls_through([Do({ val: Literal(LUnit), at: dummy_span(), unwind: [] })]), true)
+}
+
+test "a block ends where its last instruction but a site's change ends" {
+  let lent = Sited(Some({ root: Named(b"m.g"), base: 40 }));
+  let fail = Fail({ why: NoArm, at: dummy_span() });
+  assert_eq(falls_through([lent, fail, Sited(None)]), false);
+  assert_eq(falls_through([fail, Sited(None), Return(AInt(0)), lent]), false);
+  assert_eq(falls_through([lent, Sited(None)]), true);
+  assert_eq(falls_through([]), true)
 }

@@ -5,14 +5,15 @@
 
 import std.bin
 import std.bytes
-import parsing (Ident, Span, span_key, prelude_binder)
-import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Scheme, type_at, int_type)
+import parsing (Ident, Span, span_key, span_between, prelude_binder)
+import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, type_at, int_type,
+              bytes_type, fn_type, row_empty)
 import typing (Typed, filed_as, unknown_type)
 import items (Module, Item, IFn, IEffect, OpDef, FnDef, INames, IModule, IAlias)
 import exprs (Param, freed_by)
 import resolve (ParsedModule, Resolved, ModuleBinding, Binding, lookup, ValueSpace, of_module,
                 of_binder, qualify)
-import infer (EmitFacts, TypedSite, LabelSite, MemberSite, expanded_mods)
+import infer (EmitFacts, TypedSite, LabelSite, MemberSite, Builtin, builtins, expanded_mods)
 import front (Analysis, Analysed, KnownDefRow, CtorRow, EmitterCtor, WalkedFacts, walked_facts_bin,
               dump_of, facts_read)
 import lent (passed)
@@ -21,13 +22,16 @@ import emit (Def, Imported, Ctors, SumCtor, EffectName, OpMode, EmitParam, Carri
              Cases, SumCase, FieldTy, Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, SumSpec,
              Zeroed, Tagged, Ty, TyOpen, TyRec, Width, kind_of, ctor_layouts, ctor_sums)
 
-/// What the emitter hands the lowering for every root of one module.
+/// What the emitter hands the lowering for every root of one module: `builtins` are those the
+/// runtime implements, and `declared` the scheme the prelude declares each builtin at, by the same
+/// name, over variables numbered from zero in the order a call's type arguments are filed.
 pub type Setting = {
   module: Bytes,
   here: List<Def>,
   imports: List<Imported>,
   ctors: Ctors,
   builtins: List<Bytes>,
+  declared: Map<Bytes, Scheme>,
   effects: List<EffectName>,
   release: Bool,
   typed: Map<Bytes, Typed>,
@@ -94,6 +98,7 @@ pub fn setting_in(
                 sums: ctor_sums(d.ctors),
               },
               builtins: [],
+              declared: declared_schemes(),
               effects: effects_in(a.r, i, mods),
               release: false,
               typed: typed_in(facts, i),
@@ -195,6 +200,66 @@ pub fn ctor_sum(s: Setting, full: Bytes) -> Option<{ ctors: List<SumCtor>, index
 
 fn tabled(s: Setting, name: Bytes) -> Option<Bytes> =
   if s.ctors.names.contains(name) { Some(name) } else { None }
+
+/// Every builtin the prelude declares, by name, at the scheme its declaration gives it: what
+/// `Setting.declared` holds. The prelude is read once.
+pub fn declared_schemes() -> Map<Bytes, Scheme> / {abort.raise} =
+  builtins().fold(Map::new(), |m: Map<Bytes, Scheme>, b: Builtin| m.insert(b.name, b.scheme))
+
+/// The types a call takes and answers.
+pub type CallTypes = { params: List<Type>, ret: Type }
+
+/// The types builtin `name` is called at where its name is written at `callee`: the function type
+/// the checker filed there, else its declared scheme at the type arguments filed there, which are
+/// all that code the emitter writes for a type files.
+pub fn builtin_at(s: Setting, name: Bytes, callee: Span) -> Option<CallTypes> =
+  match s.typed.get(span_key(callee)) {
+    None -> declared_at(s, name, []),
+    Some(t) -> match match t.node { Some(n) -> n, None -> t.ty } {
+      TyFn(f) -> Some({ params: f.params, ret: f.ret }),
+      _ -> declared_at(s, name, t.args),
+    },
+  }
+
+/// The types builtin `name` takes and answers at type arguments `args`, one for each variable of
+/// its scheme in the order they are filed; none where the prelude declares no such builtin or
+/// `args` do not type each of its variables.
+pub fn declared_at(s: Setting, name: Bytes, args: List<Type>) -> Option<CallTypes> =
+  match s.declared.get(name) {
+    None -> None,
+    Some(sc) -> if sc.ty_vars.len() > 0 && args.len() != sc.ty_vars.len() { None } else {
+      let by = range(0, sc.ty_vars.len()).fold(Map::new(), |m: Map<Int, Type>, i: Int|
+        match sc.ty_vars.at(i) {
+          Some(v) -> match args.at(i) { Some(t) -> m.insert(v, t), None -> m },
+          None -> m,
+        });
+      match sc.ty {
+        TyFn(f) ->
+          Some({ params: f.params.map(|p: Type| substituted(p, by)), ret: substituted(f.ret, by) }),
+        _ -> None,
+      }
+    },
+  }
+
+/// `ty` with each variable `by` types written as that type.
+fn substituted(ty: Type, by: Map<Int, Type>) -> Type =
+  match ty {
+    TyVar(v) -> match by.get(v) { Some(t) -> t, None -> ty },
+    TyCon(c) -> TyCon({ ..c, args: c.args.map(|a: Type| substituted(a, by)) }),
+    TyFn(f) ->
+      TyFn({
+        ..f,
+        params: f.params.map(|p: Type| substituted(p, by)),
+        ret: substituted(f.ret, by),
+      }),
+    TyRecord(fs) -> TyRecord(fs.map(|f: Field| { ..f, ty: substituted(f.ty, by) })),
+    TyNominal(x) ->
+      TyNominal({
+        ..x,
+        args: x.args.map(|a: Type| substituted(a, by)),
+        fields: x.fields.map(|f: Field| { ..f, ty: substituted(f.ty, by) }),
+      }),
+  }
 
 /// The import a name no definition of the module answers to reaches, and the name there: one
 /// qualified by a binder (`binder::name`) in the module the binder names, a bare one in the import
@@ -572,10 +637,30 @@ fn ctor_setting(imports: List<Imported>, names: List<Bytes>) -> Setting =
       ]),
     },
     builtins: [],
+    declared: Map::new(),
     effects: [],
     release: false,
     typed: Map::new(),
   }
+
+test "a builtin is typed by the checker's filing where it called it, else by its declared scheme at the filed type arguments" {
+  let s = { ..ctor_setting([], []), declared: declared_schemes() };
+  let ints = TyCon({ name: b"List", args: [int_type()] });
+  let len = Some({ params: [ints], ret: int_type() });
+  assert_eq(declared_at(s, b"List::len", [int_type()]), len);
+  // A generic builtin at no type arguments, or a name the prelude declares nothing by, is untyped.
+  assert_eq(declared_at(s, b"List::len", []), None);
+  assert_eq(declared_at(s, b"m.nothing", []), None);
+  let at = span_between(3, 9);
+  let filed = |t: Typed| { ..s, typed: Map::new().insert(span_key(at), t) };
+  // Code the emitter writes for a type files only the type arguments.
+  assert_eq(builtin_at(filed(filed_as(unknown_type(), [int_type()])), b"List::len", at), len);
+  let checked = fn_type([bytes_type()], int_type(), row_empty());
+  assert_eq(
+    builtin_at(filed(filed_as(checked, [int_type()])), b"List::len", at),
+    Some({ params: [bytes_type()], ret: int_type() }),
+  )
+}
 
 test "a bare constructor is the module's own, else an import's, and only then the prelude's" {
   let names = [b"Less", b"Equal", b"lib.Equal", b"m.Box"];

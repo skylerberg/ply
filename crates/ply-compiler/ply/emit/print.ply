@@ -8,17 +8,17 @@
 import parsing (Span, span_between)
 import types (TyCon)
 import std.bytes (ascii_of_int)
-import emit (symbol_of)
+import emit (symbol_of, root_id)
 import emit.keys (Named, root_name)
-import emit.pieces (Piece, Text, merged, spelled)
-import emit.tir (Rep, RInt, RBool, RWord, Var, Arg, AVar, AInt, AZero, Val, Prim, Literal, Static,
-                 Make, TInt, Get, Pack, Gathered, Call, Apply, Native, Op, OHandle, OContainer,
-                 OCalling, MClosure, MList, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss,
-                 Loop, Next, Done, Return, Restart, Enter, Fail, Handle, Inc, Dec, Reset, Free,
-                 Opened, Block, Fn, Member, Rooted, Given, Lambda, Closure, Uses, NoArm, no_links,
-                 rep_of_arg, falls_through)
-import emit.print.text (Under, Place, Printing, Printed, printing, line, text, named, name_of,
-                        arg_text, assigned, label, check, zero, failing_return, site)
+import emit.pieces (Piece, Text, Hole, TagOf, InGroup, LentBy, merged, spelled)
+import emit.tir (Rep, RInt, RBool, RWord, Var, Arg, AVar, AInt, ABool, AZero, Val, Prim, Literal,
+                 Static, Make, TInt, Get, Take, Tag, Path, PField, PArg, Pack, Gathered, Call,
+                 Apply, Native, Op, OHandle, OContainer, OCalling, MClosure, MList, Inst, Let, Do,
+                 Decl, Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter,
+                 Fail, Handle, Sited, Lender, Inc, Dec, Reset, Free, Opened, Block, Fn, Member,
+                 Rooted, Given, Lambda, Closure, Uses, NoArm, no_links, rep_of_arg, falls_through)
+import emit.print.text (Under, Place, Printing, Printed, printing, line, text, pieces, pad, named,
+                        name_of, arg_text, assigned, label, check, zero, failing_return, site, slot)
 import emit.print.counts (released, count_printed)
 import emit.print.made (c_type, c_types, as_word, word_as, made, got, packed, gathered, statics,
                         declared, set_parts, returned, head_types, head_params, entry_opened,
@@ -44,8 +44,8 @@ pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
     |acc: { pr: Printing, out: List<Piece> }, k: Int|
       match f.lambdas.at(k) {
         Some(l) -> {
-          let inner = closure_printed(name, k, l, acc.pr);
-          { pr: inner, out: acc.out.concat(lambda_text(f, k, l, inner.out)) }
+          let t = lambda_text(f, k, l, closure_printed(name, k, l, acc.pr));
+          { pr: t.pr, out: acc.out.concat(t.out) }
         },
         None -> acc,
       },
@@ -134,7 +134,7 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
             let armed = {
               ..u,
               base: m.base,
-              site: Some(a.when),
+              site: Some(InGroup(a.when)),
               group: Some({ at: a.when, members: f.members, width: width }),
             };
             let opened = range(0, m.params.len()).fold(
@@ -260,129 +260,170 @@ fn leave_of(u: Under, pr: Printing, unwind: List<Var>) -> Bytes = {
   if releases == b"" { out } else { Bytes::concat_all([b"{ ", releases, b" ", out, b" }"]) }
 }
 
+/// A block printed so far: what is printed, what its next instruction is printed under, and what
+/// each lent run it began and has not ended set aside.
+type Sites = { pr: Printing, u: Under, outer: List<Under> }
+
+/// `s` after a `Sited(lent)`: a lender's run begun, its sites the lender's, or the innermost one the
+/// block began ended.
+fn resited(s: Sites, lent: Option<Lender>) -> Sites =
+  match lent {
+    Some(l) ->
+      { ..s, u: { ..s.u, site: Some(LentBy(l.root)), base: l.base }, outer: s.outer.push(s.u) },
+    None -> match s.outer.at(s.outer.len() - 1) {
+      Some(o) -> { ..s, u: o, outer: s.outer.take(s.outer.len() - 1) },
+      None -> s,
+    },
+  }
+
 /// The one recursion over a body: each instruction printed in turn, a block it holds within it.
-fn printed(u: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort.raise} =
-  b.fold(pr, |acc: Printing, i: Inst| {
+fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort.raise} =
+  b.fold({ pr: pr, u: home, outer: [] }, |sites: Sites, i: Inst| {
+    let u = sites.u;
+    let acc = sites.pr;
     let p = { u: u, at: span_between(0, 0), leave: leave_of(u, acc, []), depth: depth };
     match i {
-      Let(l) ->
-        value_printed(
-          { ..p, at: l.at, leave: leave_of(u, acc, l.unwind) },
-          acc,
-          Some(l.var),
-          l.val,
-        ),
-      Do(d) ->
-        value_printed({ ..p, at: d.at, leave: leave_of(u, acc, d.unwind) }, acc, None, d.val),
-      Decl(v) -> declared(acc, depth, v),
-      Assign(s) -> set_parts(acc, depth, s.var, s.arg),
-      If(x) -> {
-        let opened = line(acc, depth, Bytes::concat_all([b"if (", arg_text(acc, x.cond), b") {"]));
-        let t = printed(u, opened, x.then, depth + 1);
-        let e = printed(u, line(t, depth, b"} else {"), x.otherwise, depth + 1);
-        line(e, depth, b"}")
-      },
-      Case(c) -> {
-        let arms = c.arms.fold(
-          case_opened(p, acc, c.on, c.test),
-          |q: Printing, a: { when: Int, body: Block }|
-            case_arm_closed(p, printed(u, case_arm(p, q, c.on, c.test, a.when), a.body, depth + 1)),
-        );
-        case_closed(p, printed(u, case_rest(p, arms, c.on, c.test), c.rest, depth + 1))
-      },
-      Match(m) -> {
-        let l = label(acc);
-        let arms = m.arms.fold(
-          { pr: match_opened(p, l.pr, l.n, m.arms.len()), at: 0 },
-          |q: { pr: Printing, at: Int }, a: Block| {
-            let armed = printed(
-              { ..u, arm: Some({ label: l.n, at: q.at }) },
-              match_arm(p, q.pr, l.n, q.at),
-              a,
-              depth,
-            );
-            {
-              pr: if falls_through(a) { match_arm_closed(p, armed, l.n, q.at) } else { armed },
-              at: q.at + 1,
-            }
+      Sited(lent) -> resited(sites, lent),
+      _ ->
+        {
+          ..sites,
+          pr: match i {
+            Let(l) ->
+              value_printed(
+                { ..p, at: l.at, leave: leave_of(u, acc, l.unwind) },
+                acc,
+                Some(l.var),
+                l.val,
+              ),
+            Do(d) ->
+              value_printed({ ..p, at: d.at, leave: leave_of(u, acc, d.unwind) }, acc, None, d.val),
+            Decl(v) -> declared(acc, depth, v),
+            Assign(s) -> set_parts(acc, depth, s.var, s.arg),
+            If(x) -> {
+              let opened = line(
+                acc,
+                depth,
+                Bytes::concat_all([b"if (", arg_text(acc, x.cond), b") {"]),
+              );
+              let t = printed(u, opened, x.then, depth + 1);
+              let e = printed(u, line(t, depth, b"} else {"), x.otherwise, depth + 1);
+              line(e, depth, b"}")
+            },
+            Case(c) -> {
+              let arms = c.arms.fold(
+                case_opened(p, acc, c.on, c.test),
+                |q: Printing, a: { when: Int, body: Block }|
+                  case_arm_closed(
+                    p,
+                    printed(u, case_arm(p, q, c.on, c.test, a.when), a.body, depth + 1),
+                  ),
+              );
+              case_closed(p, printed(u, case_rest(p, arms, c.on, c.test), c.rest, depth + 1))
+            },
+            Match(m) -> {
+              let l = label(acc);
+              let arms = m.arms.fold(
+                { pr: match_opened(p, l.pr, l.n, m.arms.len()), at: 0 },
+                |q: { pr: Printing, at: Int }, a: Block| {
+                  let armed = printed(
+                    { ..u, arm: Some({ label: l.n, at: q.at }) },
+                    match_arm(p, q.pr, l.n, q.at),
+                    a,
+                    depth,
+                  );
+                  {
+                    pr: if falls_through(a) { match_arm_closed(p, armed, l.n, q.at) }
+                    else { armed },
+                    at: q.at + 1,
+                  }
+                },
+              );
+              match_closed(
+                p,
+                printed(u, match_rest(p, arms.pr, l.n, m.arms.len()), m.rest, depth),
+                l.n,
+              )
+            },
+            Miss -> match u.arm {
+              Some(a) -> missed(p, acc, a.label, a.at),
+              None -> line(acc, depth, b"/* a miss outside a match */"),
+            },
+            Fail(x) -> failed({ ..p, at: x.at }, acc, x.why),
+            Loop(lp) -> {
+              let l = label(acc);
+              let looped = {
+                ..u,
+                looping: Some({ label: l.n, state: lp.state, answer: lp.answer }),
+              };
+              loop_closed(
+                p,
+                printed(
+                  looped,
+                  loop_opened(p, l.pr, l.n, lp.state, lp.init, lp.answer),
+                  lp.body,
+                  depth + 1,
+                ),
+                l.n,
+                lp.answer,
+              )
+            },
+            Next(args) -> match u.looping {
+              Some(lp) -> next(p, acc, lp.label, lp.state, args),
+              None -> line(acc, depth, b"/* a next pass outside a loop */"),
+            },
+            Done(a) -> match u.looping {
+              Some(lp) -> done(p, acc, lp.label, lp.answer, a),
+              None -> line(acc, depth, b"/* a loop's answer outside a loop */"),
+            },
+            // A member of a tail group answers at its own convention, through the group's word.
+            Return(a) -> match u.group {
+              Some(_) ->
+                text(
+                  acc,
+                  Bytes::concat_all([
+                    b"  ctx->fuel += 1;\n  return ",
+                    as_word(arg_text(acc, a), rep_of_arg(a)),
+                    b";\n",
+                  ]),
+                ),
+              None -> {
+                let r = returned(acc, depth, a);
+                text(r.pr, Bytes::concat_all([b"  ctx->fuel += 1;\n  return ", r.value, b";\n"]))
+              },
+            },
+            Restart(args) -> match u.group {
+              Some(g) -> entered_member(p, acc, g.at, args),
+              None -> restarted(p, acc, args),
+            },
+            Enter(e) -> entered_member(p, acc, e.member, e.args),
+            // A failure in the body goes to the landing, which leaves by `hp.leave` where no clause answers.
+            Handle(h) -> {
+              let l = label(acc);
+              let hp = { ..p, leave: leave_of(u, acc, h.unwind) };
+              let inside = { ..u, landing: Some(landing_jump(l.n)) };
+              handle_closed(
+                hp,
+                printed(
+                  inside,
+                  handle_opened(hp, l.pr, l.n, h.args, h.uses, h.site, h.answer),
+                  h.body,
+                  depth + 1,
+                ),
+                l.n,
+                h.site,
+                h.answer,
+              )
+            },
+            Inc(_) -> count_printed(p, acc, i),
+            Dec(_) -> count_printed(p, acc, i),
+            Reset(_) -> count_printed(p, acc, i),
+            Free(_) -> count_printed(p, acc, i),
+            Opened(_) -> count_printed(p, acc, i),
+            Sited(_) -> acc,
           },
-        );
-        match_closed(p, printed(u, match_rest(p, arms.pr, l.n, m.arms.len()), m.rest, depth), l.n)
-      },
-      Miss -> match u.arm {
-        Some(a) -> missed(p, acc, a.label, a.at),
-        None -> line(acc, depth, b"/* a miss outside a match */"),
-      },
-      Fail(x) -> failed({ ..p, at: x.at }, acc, x.why),
-      Loop(lp) -> {
-        let l = label(acc);
-        let looped = { ..u, looping: Some({ label: l.n, state: lp.state, answer: lp.answer }) };
-        loop_closed(
-          p,
-          printed(
-            looped,
-            loop_opened(p, l.pr, l.n, lp.state, lp.init, lp.answer),
-            lp.body,
-            depth + 1,
-          ),
-          l.n,
-          lp.answer,
-        )
-      },
-      Next(args) -> match u.looping {
-        Some(lp) -> next(p, acc, lp.label, lp.state, args),
-        None -> line(acc, depth, b"/* a next pass outside a loop */"),
-      },
-      Done(a) -> match u.looping {
-        Some(lp) -> done(p, acc, lp.label, lp.answer, a),
-        None -> line(acc, depth, b"/* a loop's answer outside a loop */"),
-      },
-      // A member of a tail group answers at its own convention, through the group's word.
-      Return(a) -> match u.group {
-        Some(_) ->
-          text(
-            acc,
-            Bytes::concat_all([
-              b"  ctx->fuel += 1;\n  return ",
-              as_word(arg_text(acc, a), rep_of_arg(a)),
-              b";\n",
-            ]),
-          ),
-        None -> {
-          let r = returned(acc, depth, a);
-          text(r.pr, Bytes::concat_all([b"  ctx->fuel += 1;\n  return ", r.value, b";\n"]))
         },
-      },
-      Restart(args) -> match u.group {
-        Some(g) -> entered_member(p, acc, g.at, args),
-        None -> restarted(p, acc, args),
-      },
-      Enter(e) -> entered_member(p, acc, e.member, e.args),
-      // A failure in the body goes to the landing, which leaves by `hp.leave` where no clause answers.
-      Handle(h) -> {
-        let l = label(acc);
-        let hp = { ..p, leave: leave_of(u, acc, h.unwind) };
-        let inside = { ..u, landing: Some(landing_jump(l.n)) };
-        handle_closed(
-          hp,
-          printed(
-            inside,
-            handle_opened(hp, l.pr, l.n, h.args, h.uses, h.site, h.answer),
-            h.body,
-            depth + 1,
-          ),
-          l.n,
-          h.site,
-          h.answer,
-        )
-      },
-      Inc(_) -> count_printed(p, acc, i),
-      Dec(_) -> count_printed(p, acc, i),
-      Reset(_) -> count_printed(p, acc, i),
-      Free(_) -> count_printed(p, acc, i),
-      Opened(_) -> count_printed(p, acc, i),
     }
-  })
+  }).pr
 
 /// `val` printed by the family whose value it is, its answer into `into`.
 fn value_printed(p: Place, pr: Printing, into: Option<Var>, val: Val) -> Printing / {abort.raise} =
@@ -396,6 +437,8 @@ fn value_printed(p: Place, pr: Printing, into: Option<Var>, val: Val) -> Printin
       _ -> made(p, pr, into, m),
     },
     Get(g) -> got(p, pr, into, g),
+    Take(t) -> taken(p, pr, into, t),
+    Tag(name) -> tagged(p, pr, into, name),
     Pack(k) -> packed(p, pr, into, k),
     Gathered(g) -> gathered(p, pr, into, g.parts),
     Call(c) -> call(p, pr, into, c),
@@ -405,6 +448,57 @@ fn value_printed(p: Place, pr: Printing, into: Option<Var>, val: Val) -> Printin
       OHandle(h) -> effect_op(p, pr, into, h, o.args, o.uses),
       OContainer(x) -> container_op(p, pr, into, x, o.args, o.uses),
       OCalling(x) -> calling_op(p, pr, into, x, o.args, o.uses),
+    },
+  }
+
+/// The field held as one word at `t.path`'s offset in the block `t.of`, read with a count of its own:
+/// moved out of its slot, which is emptied, where the block is held only here, and counted once more
+/// where it is shared.
+fn taken(p: Place, pr: Printing, into: Option<Var>, t: { of: Var, path: Path }) -> Printing =
+  match into {
+    None -> line(pr, p.depth, b"/* a field taken that nothing holds */"),
+    Some(v) -> match if t.of.rep != RWord { None } else { offset_of(t.path) } {
+      None -> line(pr, p.depth, b"/* a field taken other than out of a block's word */"),
+      Some(at) -> {
+        let block = name_of(pr, t.of);
+        let field = slot(block, at);
+        let n = named(pr, v);
+        line(
+          line(
+            n.pr,
+            p.depth,
+            Bytes::concat_all([c_type(v.rep), b" ", n.name, b" = ", field, b";"]),
+          ),
+          p.depth,
+          Bytes::concat_all([
+            b"if (ply_obj(",
+            block,
+            b")->rc == 1) ",
+            field,
+            b" = ply_unit; else ply_inc(",
+            n.name,
+            b");",
+          ]),
+        )
+      },
+    },
+  }
+
+/// The word offset `path` reads at, where it reads at one.
+fn offset_of(path: Path) -> Option<Int> =
+  match path { PField(f) -> Some(f.at), PArg(a) -> Some(a.at), _ -> None }
+
+/// The tag of constructor `name`, which the unit writes in.
+fn tagged(p: Place, pr: Printing, into: Option<Var>, name: Bytes) -> Printing =
+  match into {
+    None -> pr,
+    Some(v) -> {
+      let n = named(pr, v);
+      pieces(n.pr, [
+        Text(Bytes::concat_all([pad(p.depth), c_type(v.rep), b" ", n.name, b" = "])),
+        Hole(TagOf(name)),
+        Text(b";\n"),
+      ])
     },
   }
 
@@ -719,10 +813,103 @@ test "a closure's function follows its root's entry, and its body numbers its te
       Bytes::concat_all([
         b"}\n",
         spelled(entry(name, f, printing(Map::new())).out),
-        spelled(lambda_text(f, 0, l, inner.out)),
+        spelled(lambda_text(f, 0, l, inner).out),
       ]),
     ),
   );
   // The code table holds the entries closures name, never their bodies.
   assert_eq(printed.lambdas, [])
+}
+
+/// A root of `params` answering an `Int`, its text starting at byte 100, whose body is `body`.
+fn int_root(params: List<Var>, body: Block) -> Fn =
+  {
+    key: Named(b"m.sited"),
+    kind: Rooted,
+    params: params,
+    conv: { params: params.map(|_: Var| Given), reps: params.map(|v: Var| v.rep), answer: RInt },
+    body: body,
+    lambdas: [],
+    base: 100,
+    members: [],
+    links: no_links(),
+  }
+
+test "a lent run's failure sites name its lender and count from its text, until the run ends" {
+  let int = TyCon({ name: b"Int", args: [] });
+  let v = |id: Int| { id: id, ty: int, rep: RInt };
+  let add = |x: Var, at: Span|
+    Let({
+      var: { ..x, id: x.id + 1 },
+      val: Prim({ op: b"add", on: RInt, args: [AVar(x), AInt(1)] }),
+      at: at,
+      unwind: [],
+    });
+  let j = v(20);
+  let main = { root: Named(b"app.main"), base: 1000 };
+  let other = { root: Named(b"lib.k"), base: 2000 };
+  let text = spelled(
+    printed_fn(
+      int_root([v(0)], [
+        add(v(0), span_between(110, 115)),
+        Sited(Some(main)),
+        add(v(1), span_between(1004, 1009)),
+        Decl(j),
+        If({
+          cond: ABool(true),
+          then: [
+            Sited(Some(other)),
+            add(v(2), span_between(2001, 2003)),
+            Assign({ var: j, arg: AVar(v(3)) }),
+          ],
+          otherwise: [Assign({ var: j, arg: AVar(v(2)) })],
+        }),
+        add(j, span_between(1020, 1025)),
+        Sited(None),
+        add(v(21), span_between(130, 135)),
+        Return(AVar(v(22))),
+      ]),
+    ).pieces,
+  );
+  let sites = text.split(b"\n").filter(|l: Bytes| l.index_of(b"PLY_SITE(") != None).map(
+    |l: Bytes| match l.index_of(b"PLY_SITE(") { Some(i) -> l.slice(i, l.len()), None -> l },
+  );
+  let lent = |n: Bytes, from: Bytes, to: Bytes|
+    Bytes::concat_all([b"PLY_SITE(ctx, ", ascii_of_int(root_id(n)), b", ", from, b", ", to, b");"]);
+  assert_eq(sites, [
+    b"PLY_SITE(ctx, @@r@@, 10, 15);",
+    lent(b"app.main", b"4", b"9"),
+    lent(b"lib.k", b"1", b"3"),
+    lent(b"app.main", b"20", b"25"),
+    b"PLY_SITE(ctx, @@r@@, 30, 35);",
+  ])
+}
+
+test "a field taken moves out of a block held only here and is counted once more out of a shared one" {
+  let block = { id: 0, ty: TyCon({ name: b"m.Buf", args: [] }), rep: RWord };
+  let field = word_var(1);
+  let f = {
+    ..int_root([block], [Let({ var: field, val: Take({ of: block, path: PField({ name: b"bytes", at: 1 }) }), at: span_between(0, 0), unwind: [] }), Return(AInt(0))]),
+    conv: { params: [Given], reps: [RWord], answer: RWord },
+  };
+  let lines = spelled(printed_fn(f).pieces).split(b"\n");
+  assert_eq(
+    holds_run(lines, [
+      b"  Word t1 = ply_words(p0)[1];",
+      b"  if (ply_obj(p0)->rc == 1) ply_words(p0)[1] = ply_unit; else ply_inc(t1);",
+    ]),
+    true,
+  )
+}
+
+test "a constructor's tag is a hole the unit writes in" {
+  let k = { id: 0, ty: TyCon({ name: b"Int", args: [] }), rep: RInt };
+  let pr = printed_fn(
+    int_root([], [
+      Let({ var: k, val: Tag(b"m.Box"), at: span_between(0, 0), unwind: [] }),
+      Return(AVar(k)),
+    ]),
+  );
+  assert(pr.pieces.contains(Hole(TagOf(b"m.Box"))));
+  assert(spelled(pr.pieces).index_of(b"  int64_t t1 = @@Tm.Box@@;\n") != None)
 }
