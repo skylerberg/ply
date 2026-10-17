@@ -15,15 +15,16 @@ import front (no_rows, Analysis, Analysed, Refused, Pulled, Staged, Hashed, Embe
 import pkg (PackageSources, Supplied, Judged)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
               is_std, IInstance, INumeric, TDSum, ImportDecl, IModule, IAlias, INames, VariantDef,
-              OpDef, Derived, DRow, parse, parse_started, header, header_of, is_written, item_span,
-              import_decl_bin, owner_of, item_owner, member_of, member_name, is_builtin)
+              OpDef, Derived, Derivation, DRow, parse, parse_started, header, header_of, is_written,
+              item_span, import_decl_bin, owner_of, item_owner, member_of, member_name, is_builtin,
+              derivation_bin)
 import fmt (printed_alone)
 import exprs (EBlock, expr_span, freed_by, prelude_module)
 import hash (Fixed, Fixing, NodeRef, Index, HashOutput, fixed_nodes, fixing_of, chosen_forms,
              chosen_in, called_at, hashed_forms, fixed_bin)
 import resolve (Source, ParsedModule, Diag, Label)
-import diagnostics (ParsedSource, parse_at, with_prelude_source)
-import derive (dotted, runtime_module, same_deriver)
+import diagnostics (ParsedSource, parse_at, parse_from, with_prelude_source)
+import derive (dotted, runtime_module, same_deriver, derivation_of)
 import embed (EmbedFile)
 import lexer (lex, Token, Identifier, Punctuation, StringLiteral, InterpolatedHead, LineString,
               EndOfInput, is_ident_start, bound_names)
@@ -1029,13 +1030,14 @@ pub type ModuleScope = { written: Scope, expanded: Scope }
 
 /// One owner as a check of it reads its module: the text of each of its items and where each starts
 /// in the module, the text of the functions its statements generate, the modules its `derive`s call
-/// into, and every name it declares.
+/// into, what its module's expansion wrote of each of them, and every name it declares.
 pub type OwnerRead = {
   owner: Bytes,
   texts: List<Bytes>,
   starts: List<Int>,
   generated: Bytes,
   runtimes: List<Bytes>,
+  derived: List<Derivation>,
   names: List<Bytes>,
 }
 
@@ -1075,6 +1077,14 @@ pub fn owner_reads(
       starts: its.map(|item: Item| written_start(text, item)),
       generated: match generated.get(o) { Some(fs) -> alone(text, fs), None -> b"" },
       runtimes: runtimes_of(its),
+      derived: its.fold([], |acc: List<Derivation>, item: Item|
+        match item {
+          IDerive(d) -> match parsed.derived.find(|x: Derived| x.span == d.span) {
+            Some(x) -> acc.push(derivation_of(x)),
+            None -> acc,
+          },
+          _ -> acc,
+        }),
       names: match declared.get(o) { Some(ns) -> ns, None -> [] },
     }
   })
@@ -1252,12 +1262,14 @@ pub fn laid_items(members: List<OwnerRead>) -> List<ItemAt> / {abort.raise} =
     })).items
 
 /// What a check of a group of owners reads: the source it checks, where the group's own text starts
-/// in it and where each of its items stands there, the modules it imports as their entries stand in
-/// for them, and what their checks and hashing published.
+/// in it and where each of its items stands there, what their module's expansion wrote of their
+/// `derive`s, the modules it imports as their entries stand in for them, and what their checks and
+/// hashing published.
 pub type OwnerSource = {
   source: Source,
   offset: Int,
   items: List<ItemAt>,
+  derived: List<Derivation>,
   deps: Map<Bytes, Map<Bytes, Entry>>,
   rows: List<KnownDefRow>,
   fixed: List<Fixed>,
@@ -1371,6 +1383,7 @@ pub fn group_source_from(
     },
     offset: written.len(),
     items: laid_items(members),
+    derived: members.fold([], |acc: List<Derivation>, o: OwnerRead| acc.concat(o.derived)),
     deps: deps,
     rows: all.fold([], |acc: List<KnownDefRow>, es: Map<Bytes, Entry>|
       es.fold(acc, |a: List<KnownDefRow>, _: Bytes, e: Entry| a.concat(e.rows))),
@@ -1418,7 +1431,12 @@ pub fn checked_owner(
   reading: Reading,
   walks: Option<(Int) -> Walks / {abort.raise}> = None,
 ) -> { pulled: Pulled, at: Int } / {abort.raise} = {
-  let s = staged_against(o.source, placed, o.deps, o.fixed, placing, reading);
+  // Its `derive`s expanded alone would write what the rest of their module decides otherwise.
+  let parsed = parse_from(0, o.source, parse(o.source.src), taken: o.derived);
+  let s = staged_against(o.source, placed, o.deps, o.fixed, placing, {
+    ..reading,
+    given: reading.given.push(parsed),
+  });
   {
     pulled: checked_staged(s.staged, { defs: o.rows, tests: [], types: Map::new() }, match walks {
       Some(at) -> at(s.at),
