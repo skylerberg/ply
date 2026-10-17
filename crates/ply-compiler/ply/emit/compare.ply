@@ -1,0 +1,386 @@
+//! A program's text lowered, checked and printed through the typed form as the emitter would hand
+//! it each root, and the C the form prints held to today's emitter's, read past what two printers
+//! may differ in without computing anything differently: a local copied from another local or a
+//! constant, the dead store after a restart's `goto`, how temporaries are numbered, and, where
+//! asked, the counts each takes and lets go.
+
+import diagnostics (parse_all)
+import front (Analysed, Refused, Analysis, analyse, dump_of)
+import lexer (is_ident_continue)
+import resolve (Diag, qualify)
+import types (TyCon)
+import std.bytes (ascii_of_int)
+import emit (emit_roots_answer, ctor_layouts, ctor_sums, RootAnswer, Body, symbol_of)
+import emit.keys (Named)
+import emit.pieces (spelled)
+import emit.tir (Rep, Var, Arg, AVar, ABool, RInt, RBool, Inst, Decl, Assign, If, Return, Restart, Fn,
+                 Declined, Family, Spine, Data, Calling, Matching, Handling, Scalars, Containers)
+import emit.lower (lowered_fn)
+import emit.lower.setting (Setting, Root, setting_in)
+import emit.print (printed_fn)
+import emit.verify (verified)
+
+/// A program of one module `m`: its text, its analysis, and what the emitter would hand each of its
+/// definitions.
+pub type Program = { src: Bytes, analysis: Analysis, setting: Setting, roots: List<Root> }
+
+/// `src` as module `m` of a program, or what refused it.
+pub fn program_of(src: Bytes) -> Result<Program, Bytes> / {abort.raise} =
+  match analyse(parse_all([{ name: b"m", src: src }])) {
+    Refused(diags) -> Err(Bytes::join(diags.map(|d: Diag| d.message), b"\n")),
+    Analysed(a) -> match setting_in(a, b"m") {
+      Err(why) -> Err(why),
+      Ok(s) -> Ok({ src: src, analysis: a, setting: s.setting, roots: s.roots }),
+    },
+  }
+
+/// Root `m.<name>` of `p` lowered to the form, or why it was not.
+pub fn formed(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.raise} =
+  match p.roots.fold(None, |acc: Option<Root>, r: Root| if r.full == qualify(b"m", name) { Some(r) } else { acc }) {
+    None -> Err({ by: Spine, why: b"no such definition" }),
+    Some(r) -> match r.code {
+      None -> Err({ by: Spine, why: b"a body that does not lower to Code" }),
+      Some(code) ->
+        lowered_fn(
+          {
+            setting: p.setting,
+            key: Named(r.full),
+            full: r.full,
+            base: r.base,
+            params: r.params,
+            types: r.types,
+            answer: r.answer,
+            answer_ty: r.answer_ty,
+            body: code,
+          },
+          code,
+        ),
+    },
+  }
+
+/// Root `m.<name>` of `p` lowered and checked, or why not: what a build prints.
+pub fn checked(p: Program, name: Bytes) -> Result<Fn, Bytes> / {abort.raise} =
+  match formed(p, name) {
+    Err(no) -> Err(no.why),
+    Ok(form) -> match verified(form) {
+      Some(why) -> Err(b"refused by the check: ".concat(why)),
+      None -> Ok(form),
+    },
+  }
+
+/// Root `m.<name>` of `p` as the form prints it once it is checked, or why it was not printed.
+pub fn printed_by_form(p: Program, name: Bytes) -> Result<Bytes, Bytes> / {abort.raise} =
+  match checked(p, name) {
+    Err(why) -> Err(why),
+    Ok(form) -> Ok(spelled(printed_fn(form).pieces)),
+  }
+
+/// What today's emitter answers for the roots `m.<name>` of `p` that `names` name.
+pub fn answered_today(p: Program, names: List<Bytes>) -> List<RootAnswer> / {abort.raise} = {
+  let d = dump_of(Analysed(p.analysis));
+  emit_roots_answer(
+    [b"m"],
+    [p.src],
+    { names: [], laid: ctor_layouts(d.ctors), keyed: [], sums: ctor_sums(d.ctors) },
+    [],
+    names.map(|n: Bytes| qualify(b"m", n)),
+    [],
+    [],
+    d.embeds,
+    d.rows,
+    d.walked,
+  )
+}
+
+/// The C today's emitter wrote for root `m.<name>` among `answers`.
+pub fn today_text(answers: List<RootAnswer>, name: Bytes) -> Bytes =
+  answers.fold(b"", |acc: Bytes, a: RootAnswer|
+    if a.name != qualify(b"m", name) { acc } else {
+      match a.answer { Body(b) -> b.text, _ -> b"refused by today's emitter" }
+    })
+
+/// `text` as a list of lines, read past what two printers may write differently for one
+/// computation: a local declared from another local or a literal and never assigned again is read
+/// as what it copies; lines after a restart's `goto` in its block are dropped; and the temporaries
+/// `t<n>` are renumbered in the order they first appear.
+pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} = {
+  let lines = text.split(b"\n");
+  let assigned = lines.fold(Map::new(), |m: Map<Bytes, Int>, l: Bytes| {
+    let t = trimmed(l);
+    match t.index_of(b" = ") {
+      Some(at) -> if temp_name(t.slice(0, at)) {
+        m.insert(t.slice(0, at), match m.get(t.slice(0, at)) { Some(n) -> n + 1, None -> 1 })
+      } else { m },
+      None -> m,
+    }
+  });
+  let copies = lines.fold({ names: Map::new(), kept: [] },
+    |acc: { names: Map<Bytes, Bytes>, kept: List<Bytes> }, l: Bytes|
+      match copy_of(trimmed(l)) {
+        Some(c) -> if assigned.contains(c.name) { { ..acc, kept: acc.kept.push(l) } } else {
+          {
+            ..acc,
+            names: acc.names.insert(c.name, match acc.names.get(c.value) { Some(v) -> v, None -> c.value }),
+          }
+        },
+        None -> { ..acc, kept: acc.kept.push(l) },
+      });
+  let read = copies.kept.map(|l: Bytes| renamed(l, copies.names));
+  let live = read.fold({ out: [], skip: 0 - 1 }, |acc: { out: List<Bytes>, skip: Int }, l: Bytes| {
+    let depth = indent(l);
+    if acc.skip >= 0 && depth >= acc.skip { acc }
+    else if trimmed(l) == b"goto ply_loop;" { { out: acc.out.push(l), skip: depth } }
+    else { { out: acc.out.push(l), skip: 0 - 1 } }
+  });
+  let numbering = live.out.fold(Map::new(), |m: Map<Bytes, Bytes>, l: Bytes|
+    idents(l).fold(m, |n: Map<Bytes, Bytes>, w: Bytes|
+      if temp_name(w) && !n.contains(w) { n.insert(w, b"t".concat(ascii_of_int(n.len() + 1))) }
+      else { n }));
+  live.out.map(|l: Bytes| renamed(l, numbering))
+}
+
+/// `lines` without a line that only takes or lets go of a count, for holding two printers whose
+/// counts differ by design to each other.
+pub fn past_counts(lines: List<Bytes>) -> List<Bytes> / {abort.raise} =
+  lines.filter(|l: Bytes| {
+    let t = trimmed(l);
+    !((t.starts_with(b"ply_inc(") || t.starts_with(b"ply_dec(")) && t.ends_with(b");") && t.index_of(b";") == Some(t.len() - 1))
+  })
+
+fn trimmed(l: Bytes) -> Bytes / {abort.raise} = l.slice(indent(l), l.len())
+
+fn indent(l: Bytes) -> Int / {abort.raise} =
+  range(0, l.len()).fold(l.len(), |at: Int, i: Int| if at < l.len() || l.at(i) == 32 { at } else { i })
+
+/// `T tN = X;` where `X` is a local or a literal: the copy's name and what it copies.
+fn copy_of(t: Bytes) -> Option<{ name: Bytes, value: Bytes }> / {abort.raise} =
+  match t.index_of(b" ") {
+    None -> None,
+    Some(sp) -> if !c_type(t.slice(0, sp)) || !t.ends_with(b";") { None } else {
+      let rest = t.slice(sp + 1, t.len() - 1);
+      match rest.index_of(b" = ") {
+        None -> None,
+        Some(eq) -> {
+          let name = rest.slice(0, eq);
+          let value = rest.slice(eq + 3, rest.len());
+          if temp_name(name) && atom(value) { Some({ name: name, value: value }) } else { None }
+        },
+      }
+    },
+  }
+
+fn c_type(t: Bytes) -> Bool =
+  [b"int64_t", b"double", b"int8_t", b"int16_t", b"int32_t", b"uint8_t", b"uint16_t", b"uint32_t",
+   b"uint64_t", b"Word", b"PlyDec"].contains(t)
+
+/// A local or a literal: a name of one identifier, or a constant spelled as the printers spell
+/// one, with nothing computed.
+fn atom(v: Bytes) -> Bool / {abort.raise} =
+  local_name(v) || v == b"INT64_MIN"
+    || (v.starts_with(b"INT64_C(") && v.ends_with(b")") && v.index_of(b" ") == None)
+    || (v.starts_with(b"ply_f64(INT64_C(") && v.ends_with(b"))") && v.index_of(b" ") == None)
+    || (v.starts_with(b"((") && v.index_of(b")INT64_C(") != None && v.ends_with(b"))") && v.index_of(b" ") == None)
+    || v == b"0" || v == b"1"
+
+fn local_name(v: Bytes) -> Bool / {abort.raise} = temp_name(v) || param_name(v)
+
+fn temp_name(v: Bytes) -> Bool / {abort.raise} = digits_after(v, 116)
+
+fn param_name(v: Bytes) -> Bool / {abort.raise} = digits_after(v, 112)
+
+/// Whether `v` is the byte `lead` and then one or more digits.
+fn digits_after(v: Bytes, lead: Int) -> Bool / {abort.raise} =
+  v.len() > 1 && v.at(0) == lead && range(1, v.len()).all(|i: Int| v.at(i) >= 48 && v.at(i) <= 57)
+
+/// The identifiers of a line, in order.
+fn idents(l: Bytes) -> List<Bytes> / {abort.raise} =
+  words(l).filter(|w: { text: Bytes, ident: Bool }| w.ident).map(|w: { text: Bytes, ident: Bool }| w.text)
+
+/// `l` with each identifier `names` holds written as what it holds.
+fn renamed(l: Bytes, names: Map<Bytes, Bytes>) -> Bytes / {abort.raise} =
+  Bytes::concat_all(words(l).map(|w: { text: Bytes, ident: Bool }|
+    if w.ident { match names.get(w.text) { Some(n) -> n, None -> w.text } } else { w.text }))
+
+/// `l` cut into runs of identifier bytes and single other bytes.
+fn words(l: Bytes) -> List<{ text: Bytes, ident: Bool }> / {abort.raise} = {
+  let cut = range(0, l.len()).fold({ out: [], from: 0 - 1 },
+    |acc: { out: List<{ text: Bytes, ident: Bool }>, from: Int }, i: Int| {
+      if is_ident_continue(l.at(i)) { if acc.from < 0 { { ..acc, from: i } } else { acc } } else {
+        let flushed = if acc.from < 0 { acc.out } else { acc.out.push({ text: l.slice(acc.from, i), ident: true }) };
+        { out: flushed.push({ text: l.slice(i, i + 1), ident: false }), from: 0 - 1 }
+      }
+    });
+  if cut.from < 0 { cut.out } else { cut.out.push({ text: l.slice(cut.from, l.len()), ident: true }) }
+}
+
+fn scalar_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"fn add(a: Int, b: Int) -> Int = a + b\n",
+    b"fn diff(a: Int, b: Int) -> Int = a - b * 3\n",
+    b"fn quot(a: Int, b: Int) -> Int / {abort.raise} = a / b + a % 7\n",
+    b"fn less(a: Int, b: Int) -> Bool = a < b\n",
+    b"fn apart(a: Int, b: Int) -> Bool = a != b\n",
+    b"fn negated(a: Int) -> Int = -a\n",
+    b"fn bits(a: Int, b: Int) -> Int = (a & b) | 5\n",
+    b"fn folded(a: Int) -> Int = a + (2 * 3 + 1)\n",
+    b"fn pick(c: Bool, a: Int, b: Int) -> Int = if c { a } else { b + 1 }\n",
+    b"fn square(x: Float) -> Float = x * x + 1.5\n",
+    b"fn fless(x: Float, y: Float) -> Bool = x < y\n",
+    b"fn fneg(x: Float) -> Float = -x\n",
+    b"fn twice(x: Int) -> Int = add(x, x)\n",
+    b"fn total(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { total(n - 1, acc + n) }\n",
+    b"fn bound(x: Int) -> Int = { let y = x * 2; let z = y + 3; z - x }\n",
+    b"fn flip(b: Bool) -> Bool = !b\n",
+    b"fn same(a: Bool, b: Bool) -> Bool = a == b\n",
+    b"fn wadd(a: U8, b: U8) -> U8 = a + b\n",
+    b"fn wless(a: U8, b: U8) -> Bool = a < b\n",
+    b"fn wmul(a: I32, b: I32) -> I32 = a * b\n",
+    b"fn wide(a: I64, b: I64) -> I64 = a + b\n",
+    b"fn uwide(a: U64, b: U64) -> U64 = a - b\n",
+    b"fn wand(a: U16, b: U16) -> U16 = a & b\n",
+  ])
+
+fn scalar_names() -> List<Bytes> =
+  [b"add", b"diff", b"quot", b"less", b"apart", b"negated", b"bits", b"folded", b"pick", b"square",
+   b"fless", b"fneg", b"twice", b"total", b"bound", b"flip", b"same", b"wadd", b"wless", b"wmul",
+   b"wide", b"uwide", b"wand"]
+
+test "the scalar subset prints as today's emitter writes it, but for copies and numbering" {
+  match program_of(scalar_corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let today = answered_today(p, scalar_names());
+      let differing = scalar_names().fold([], |acc: List<{ name: Bytes, today: List<Bytes>, form: List<Bytes> }>, n: Bytes| {
+        let form = match printed_by_form(p, n) { Ok(t) -> normalised(t), Err(why) -> [why] };
+        let old = normalised(today_text(today, n));
+        if form == old { acc } else { acc.push({ name: n, today: old, form: form }) }
+      });
+      assert_eq(differing, []);
+      // Each root compared is a whole function: its head, its fuel test, its body and its entry.
+      assert_eq(
+        scalar_names().filter(|n: Bytes| {
+          let t = today_text(today, n);
+          t.index_of(b"ctx->fuel -= 1;") != None && t.index_of(b"_entry(PlyCtx *ctx, const Word *args) {") != None
+        }).len(),
+        scalar_names().len(),
+      );
+      // The texts read past copies still tell an overflow test, a call and a restart apart.
+      let read = |n: Bytes| Bytes::join(normalised(today_text(today, n)), b"\n");
+      assert(read(b"add").index_of(b"if (ply_add_ov(p0, p1, &t1)) { rt_overflow_p(ctx, 0); return 0; }") != None);
+      assert(read(b"twice").index_of(symbol_of(b"m.add").concat(b"(ctx, p0, p0);")) != None);
+      assert(read(b"total").index_of(b"    p0 = t3;\n    p1 = t4;\n    goto ply_loop;\n  }") != None)
+    },
+  }
+}
+
+test "two printers' copies, dead stores after a restart, numbering and counts are read past" {
+  let a = b"  int64_t t4 = p0;\n  int64_t t7 = (t4) < (INT64_C(3));\n  if (t7) {\n    p0 = t4;\n    goto ply_loop;\n    t9 = 0;\n  }\n  return t7;";
+  let b = b"  int64_t t1 = (p0) < (INT64_C(3));\n  if (t1) {\n    p0 = p0;\n    goto ply_loop;\n  }\n  return t1;";
+  assert_eq(normalised(a), normalised(b));
+  // A local assigned again is a join, never a copy.
+  assert_eq(
+    normalised(b"  int64_t t2 = 0;\n  t2 = p1;\n  return t2;"),
+    [b"  int64_t t1 = 0;", b"  t1 = p1;", b"  return t1;"],
+  );
+  assert_eq(
+    past_counts([b"  ply_inc(ctx, p0);", b"  Word t1 = f(ctx, p0);", b"  ply_dec(ctx, p0); return 0;"]),
+    [b"  Word t1 = f(ctx, p0);", b"  ply_dec(ctx, p0); return 0;"],
+  )
+}
+
+/// The body of root `m.<name>` of `src`'s form, or why it was not formed.
+fn body_of(src: Bytes, name: Bytes) -> Result<List<Inst>, Bytes> / {abort.raise} =
+  match program_of(src) {
+    Err(why) -> Err(why),
+    Ok(p) -> match formed(p, name) { Ok(f) -> Ok(f.body), Err(no) -> Err(no.why) },
+  }
+
+fn local(id: Int, ty: Bytes, rep: Rep) -> Var = { id: id, ty: TyCon({ name: ty, args: [] }), rep: rep }
+
+test "an if that answers a value joins in a variable of the type its arms answer" {
+  let j = local(3, b"Int", RInt);
+  assert_eq(
+    body_of(b"fn pick(c: Bool, a: Int, b: Int) -> Int = if c { a } else { b }\n", b"pick"),
+    Ok([
+      Decl(j),
+      If({
+        cond: AVar(local(0, b"Bool", RBool)),
+        then: [Assign({ var: j, arg: AVar(local(1, b"Int", RInt)) })],
+        otherwise: [Assign({ var: j, arg: AVar(local(2, b"Int", RInt)) })],
+      }),
+      Return(AVar(j)),
+    ]),
+  )
+}
+
+test "a self call in tail position restarts the body, and a join's restarting arm sets nothing" {
+  match body_of(b"fn total(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { total(n - 1, acc) }\n", b"total") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> match body.at(2) {
+      Some(If(i)) -> {
+        assert_eq(i.then.len(), 1);
+        assert_eq(i.otherwise.at(i.otherwise.len() - 1), Some(Restart([AVar(local(3, b"Int", RInt)), AVar(local(1, b"Int", RInt))])))
+      },
+      other -> assert_eq(other, None),
+    },
+  }
+}
+
+test "&& joins a Bool from its right operand where the left one does not decide" {
+  let j = local(2, b"Bool", RBool);
+  assert_eq(
+    body_of(b"fn both(a: Bool, b: Bool) -> Bool = a && b\n", b"both"),
+    Ok([
+      Decl(j),
+      If({
+        cond: AVar(local(0, b"Bool", RBool)),
+        then: [Assign({ var: j, arg: AVar(local(1, b"Bool", RBool)) })],
+        otherwise: [Assign({ var: j, arg: ABool(false) })],
+      }),
+      Return(AVar(j)),
+    ]),
+  )
+}
+
+test "each construct reaches the family that lowers it" {
+  let src = Bytes::concat_all([
+    b"type P = { a: Int, b: Int }\n",
+    b"effect amb {\n  read flip() -> Bool\n}\n",
+    b"fn text() -> String = \"a\"\n",
+    b"fn record(x: Int) -> P = { a: x, b: 2 }\n",
+    b"fn read(p: P) -> Int = p.a\n",
+    b"fn some(x: Int) -> Option<Int> = Some(x)\n",
+    b"fn listed(x: Int) -> List<Int> = [x]\n",
+    b"fn matched(x: Int) -> Int = match x { 0 -> 1, _ -> 2 }\n",
+    b"fn none(x: Option<Int>) -> Bool = x == None\n",
+    b"fn applied(f: (Int) -> Int) -> Int = f(1)\n",
+    b"fn lambda(x: Int) -> (Int) -> Int = |y: Int| y + x\n",
+    b"fn flipped() -> Bool / {amb.flip} = amb.flip()\n",
+    b"fn handled() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) }\n",
+  ]);
+  // Each root and the families whose constructs it holds: it lowers, or one of them declines it.
+  let expected = [
+    { name: b"text", by: [Scalars] },
+    { name: b"record", by: [Data] },
+    { name: b"read", by: [Data] },
+    { name: b"some", by: [Data] },
+    { name: b"listed", by: [Containers] },
+    { name: b"matched", by: [Matching] },
+    { name: b"none", by: [Matching] },
+    { name: b"applied", by: [Calling] },
+    { name: b"lambda", by: [Calling] },
+    { name: b"flipped", by: [Handling] },
+    { name: b"handled", by: [Handling, Calling] },
+  ];
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> assert_eq(
+      expected.fold([], |acc: List<{ name: Bytes, declined: Declined }>, e: { name: Bytes, by: List<Family> }|
+        match formed(p, e.name) {
+          Ok(_) -> acc,
+          Err(no) -> if e.by.contains(no.by) { acc } else { acc.push({ name: e.name, declined: no }) },
+        }),
+      [],
+    ),
+  }
+}

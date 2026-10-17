@@ -1,12 +1,16 @@
-//! How a value of a type is held in a body, as the form's representations say.
+//! How a value of a type is held in a body, how a value crossing a call between roots is held, and
+//! where a field or a constructor's argument is read.
 
 import types (Type, TyCon)
-import emit (kind_of, KInt, KBool, KNum, KFloat, KDec)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord)
+import emit (Carrier, Whole, Fields, Cases, SumCase, FieldTy, Kind, KBoxed, KInt, KBool, KNum, KFloat,
+             KDec, KSum, Zeroed, Tagged, kind_of)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases, Leaf,
+                 Path, PNamed, PArg)
+import emit.lower.setting (Setting)
 
 /// How a value of `ty` is held in a body. Scalars as themselves, a carried width in its own C
 /// type, anything else a word until the layouts say more.
-pub fn held_as(ty: Type) -> Rep =
+pub fn held_as(s: Setting, ty: Type) -> Rep =
   match kind_of(ty).kind {
     KInt -> RInt,
     KBool -> RBool,
@@ -16,11 +20,62 @@ pub fn held_as(ty: Type) -> Rep =
     _ -> RWord,
   }
 
-test "a value is held as its type says" {
+/// How a value crossing a call as `c` is held: as the emitter carries it between roots, so a root
+/// the form writes and one today's emitter writes call each other alike.
+pub fn carried_as(c: Carrier) -> Rep =
+  match c {
+    Whole(k) -> kind_held(k),
+    Fields(fs) -> RFlat(fs.map(|f: FieldTy| { name: f.name, rep: kind_held(f.kind) })),
+    Cases(sc) ->
+      RCases({
+        tagged: sc.spec == Tagged,
+        cases: sc.cases.map(|c: SumCase|
+          {
+            name: c.name,
+            leaves: match c.arg {
+              None -> [],
+              Some(Whole(k)) -> [{ name: b"", rep: kind_held(k) }],
+              Some(Fields(fs)) -> fs.map(|f: FieldTy| { name: f.name, rep: kind_held(f.kind) }),
+              Some(Cases(_)) -> [{ name: b"", rep: RWord }],
+            },
+          }),
+      }),
+  }
+
+fn kind_held(k: Kind) -> Rep =
+  match k {
+    KInt -> RInt,
+    KBool -> RBool,
+    KNum(w) -> RNum(w),
+    KFloat -> RFloat,
+    KDec -> RDec,
+    KSum(Zeroed) -> RMaybe,
+    KSum(Tagged) -> RTagged,
+    KBoxed -> RWord,
+  }
+
+/// Where field `name` of a value of type `ty` is read.
+pub fn field_path(s: Setting, ty: Type, name: Bytes) -> Path = PNamed(name)
+
+/// Where argument `at` of constructor `ctor` is read.
+pub fn arg_path(s: Setting, ctor: Bytes, at: Int) -> Path = PArg({ ctor: ctor, at: at })
+
+test "a value is held as its type says, and a carried value as its carrier says" {
   let named = |n: Bytes| TyCon({ name: n, args: [] });
-  assert_eq(held_as(named(b"Int")), RInt);
-  assert_eq(held_as(named(b"Bool")), RBool);
-  assert_eq(held_as(named(b"Float")), RFloat);
-  assert_eq(held_as(named(b"U8")), RNum({ bits: 8, signed: false }));
-  assert_eq(held_as(named(b"String")), RWord)
+  let s = {
+    module: b"m",
+    here: [],
+    imports: [],
+    ctors: { names: [], laid: Map::new(), keyed: [], sums: Map::new() },
+    builtins: [],
+    effects: [],
+    release: false,
+    typed: Map::new(),
+  };
+  assert_eq(held_as(s, named(b"Int")), RInt);
+  assert_eq(held_as(s, named(b"Float")), RFloat);
+  assert_eq(held_as(s, named(b"U8")), RNum({ bits: 8, signed: false }));
+  assert_eq(held_as(s, named(b"String")), RWord);
+  assert_eq(carried_as(Whole(KSum(Zeroed))), RMaybe);
+  assert_eq(carried_as(Whole(KBoxed)), RWord)
 }

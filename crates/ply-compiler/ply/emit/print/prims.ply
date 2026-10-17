@@ -1,0 +1,248 @@
+//! Operators and constants printed: an integer's, a width's and a float's operators as C does them
+//! under the runtime's overflow and division tests, and constants read from the pool.
+
+import std.bytes (ascii_of_int)
+import std.math (pow)
+import patterns (Lit)
+import emit (Width, KNum, ctype)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, Var, Arg, AInt, arithmetic, comparison)
+import emit.print.text (Printing, Place, line, temp, named, arg_text, assigned, site, check, kind,
+                        int_lit)
+import emit.print.made (c_type)
+
+/// A constant read from the pool.
+pub fn literal(p: Place, pr: Printing, into: Option<Var>, l: Lit) -> Printing =
+  line(pr, p.depth, b"/* a pooled constant, which this printer does not write yet */")
+
+/// An operator over operands held as `x.on`, as C does it: an integer's sum or difference under an
+/// overflow test, its other arithmetic through the runtime but for a literal divisor, a width's
+/// arithmetic wide and narrowed back under the same test, a float's as C's own.
+pub fn prim(p: Place, pr: Printing, into: Option<Var>, x: { op: Bytes, on: Rep, args: List<Arg> }) -> Printing / {abort.raise} =
+  match into {
+    None -> line(pr, p.depth, b"/* an operator whose value goes unread */"),
+    Some(v) -> {
+      let op = x.op;
+      let a = match x.args.at(0) { Some(y) -> arg_text(pr, y), None -> b"0" };
+      let b = match x.args.at(1) { Some(y) -> arg_text(pr, y), None -> b"0" };
+      let bound = |q: Printing, k: Rep, e: Bytes| assigned(q, p.depth, v, c_type(k), e);
+      let infix = |c: Bytes| Bytes::concat_all([b"(", a, b") ", c, b" (", b, b")"]);
+      match x.on {
+        RInt -> if comparison(op) {
+          bound(pr, RBool, if op == b"ne" { Bytes::concat_all([b"!((", a, b") == (", b, b"))"]) }
+          else { infix(compare_c(op)) })
+        } else if op == b"bitand" || op == b"bitor" || op == b"bitxor" {
+          bound(pr, RInt, infix(bitop_c(op)))
+        } else if op == b"add" || op == b"sub" {
+          let n = named(site(p, pr), v);
+          line(
+            line(n.pr, p.depth, Bytes::concat_all([b"int64_t ", n.name, b";"])),
+            p.depth,
+            Bytes::concat_all([
+              b"if (ply_",
+              op,
+              b"_ov(",
+              a,
+              b", ",
+              b,
+              b", &",
+              n.name,
+              b")) { rt_overflow_p(ctx, ",
+              ascii_of_int(overflow_code(op)),
+              b"); ",
+              p.leave,
+              b" }",
+            ]),
+          )
+        } else if (op == b"div" || op == b"rem") && literal_divisor(x.args.at(1)) {
+          bound(pr, RInt, Bytes::concat_all([b"(", a, if op == b"div" { b") / " } else { b") % " }, b]))
+        } else if op == b"mul" || op == b"div" || op == b"rem" {
+          check(
+            p,
+            bound(site(p, pr), RInt, Bytes::concat_all([
+              b"rt_arith_p(ctx, ",
+              ascii_of_int(arith_code(op)),
+              b", ",
+              a,
+              b", ",
+              b,
+              b")",
+            ])),
+          )
+        } else if op == b"neg" {
+          let guarded = line(site(p, pr), p.depth, Bytes::concat_all([
+            b"if (",
+            a,
+            b" == INT64_MIN) { rt_overflow_p(ctx, ",
+            ascii_of_int(overflow_code(op)),
+            b"); ",
+            p.leave,
+            b" }",
+          ]));
+          bound(guarded, RInt, Bytes::concat_all([b"-(", a, b")"]))
+        } else if op == b"bitnot" { bound(pr, RInt, Bytes::concat_all([b"~(", a, b")"])) }
+        else { line(pr, p.depth, b"/* an integer operator this printer does not write yet */") },
+        RBool -> if op == b"not" { bound(pr, RBool, Bytes::concat_all([b"!(", a, b")"])) }
+        else if op == b"eq" || op == b"ne" {
+          bound(pr, RBool, Bytes::concat_all([if op == b"ne" { b"!((" } else { b"((" }, a, b") == (", b, b"))"]))
+        } else { line(pr, p.depth, b"/* a boolean operator this printer does not write yet */") },
+        RFloat -> if comparison(op) { bound(pr, RBool, infix(compare_c(op))) }
+        else if op == b"neg" { bound(pr, RFloat, Bytes::concat_all([b"-(", a, b")"])) }
+        else if op == b"rem" {
+          bound(site(p, pr), RFloat, Bytes::concat_all([
+            b"ply_f64(rt_float_rem_p(ctx, ply_f64_bits(",
+            a,
+            b"), ply_f64_bits(",
+            b,
+            b")))",
+          ]))
+        } else if arithmetic(op) { bound(site(p, pr), RFloat, infix(float_c(op))) }
+        else { line(pr, p.depth, b"/* a float operator this printer does not write yet */") },
+        RNum(w) -> width_printed(p, pr, v, op, w, a, b),
+        _ -> line(pr, p.depth, b"/* an operator over words */"),
+      }
+    },
+  }
+
+/// An operator over a width held in its own C type: arithmetic below 64 bits done wide and narrowed
+/// back under an overflow test, at 64 bits a sum or difference tested as it is formed and the rest
+/// through the runtime; bit operators and comparisons in the width itself.
+fn width_printed(p: Place, pr: Printing, v: Var, op: Bytes, w: Width, a: Bytes, b: Bytes) -> Printing / {abort.raise} = {
+  let bound = |q: Printing, k: Rep, e: Bytes| assigned(q, p.depth, v, c_type(k), e);
+  let narrowed = |q: Printing, wide: Bytes| {
+    let g = line(q, p.depth, Bytes::concat_all([
+      b"if (",
+      wide,
+      b" < ",
+      int_lit(width_min(w)),
+      b" || ",
+      wide,
+      b" > ",
+      int_lit(width_max(w)),
+      b") { rt_overflow_p(ctx, ",
+      ascii_of_int(overflow_code(op)),
+      b"); ",
+      p.leave,
+      b" }",
+    ]));
+    bound(g, RNum(w), Bytes::concat_all([b"(", ctype(KNum(w)), b")", wide]))
+  };
+  if arithmetic(op) && w.bits < 64 {
+    let t = temp(site(p, pr));
+    if op == b"add" || op == b"sub" {
+      narrowed(
+        line(t.pr, p.depth, Bytes::concat_all([
+          b"int64_t ",
+          t.name,
+          b" = (int64_t)(",
+          a,
+          if op == b"add" { b") + (int64_t)(" } else { b") - (int64_t)(" },
+          b,
+          b");",
+        ])),
+        t.name,
+      )
+    } else {
+      narrowed(
+        check(p, line(t.pr, p.depth, Bytes::concat_all([
+          b"int64_t ",
+          t.name,
+          b" = rt_arith_p(ctx, ",
+          ascii_of_int(arith_code(op)),
+          b", (int64_t)(",
+          a,
+          b"), (int64_t)(",
+          b,
+          b"));",
+        ]))),
+        t.name,
+      )
+    }
+  } else if arithmetic(op) && (op == b"add" || op == b"sub") {
+    let n = named(site(p, pr), v);
+    let over = if w.signed {
+      Bytes::concat_all([if op == b"add" { b"ply_add_ov(" } else { b"ply_sub_ov(" }, a, b", ", b, b", &", n.name, b")"])
+    } else {
+      Bytes::concat_all([
+        b"(",
+        n.name,
+        b" = (uint64_t)(",
+        a,
+        if op == b"add" { b") + (uint64_t)(" } else { b") - (uint64_t)(" },
+        b,
+        b"), ",
+        if op == b"add" { Bytes::concat_all([n.name, b" < (uint64_t)(", a, b"))"]) }
+        else { Bytes::concat_all([b"(uint64_t)(", a, b") < (uint64_t)(", b, b"))"]) },
+      ])
+    };
+    line(
+      line(n.pr, p.depth, Bytes::concat_all([ctype(KNum(w)), b" ", n.name, b";"])),
+      p.depth,
+      Bytes::concat_all([b"if (", over, b") { rt_overflow_p(ctx, ", ascii_of_int(overflow_code(op)), b"); ", p.leave, b" }"]),
+    )
+  } else if arithmetic(op) {
+    check(
+      p,
+      bound(site(p, pr), RNum(w), Bytes::concat_all([
+        b"(",
+        ctype(KNum(w)),
+        b")rt_wide_binary_p(ctx, ",
+        ascii_of_int(binary_code(op)),
+        b", ",
+        ascii_of_int(width_index(w)),
+        b", (Word)(",
+        a,
+        b"), (Word)(",
+        b,
+        b"))",
+      ])),
+    )
+  } else if op == b"bitand" || op == b"bitor" || op == b"bitxor" {
+    bound(pr, RNum(w), Bytes::concat_all([b"(", a, b") ", bitop_c(op), b" (", b, b")"]))
+  } else if op == b"bitnot" {
+    bound(pr, RNum(w), Bytes::concat_all([b"(", ctype(KNum(w)), b") ~(", a, b")"]))
+  } else if op == b"ne" { bound(pr, RBool, Bytes::concat_all([b"!((", a, b") == (", b, b"))"])) }
+  else if comparison(op) {
+    bound(pr, RBool, Bytes::concat_all([b"(", a, b") ", compare_c(op), b" (", b, b")"]))
+  } else if op == b"neg" && w.bits < 64 {
+    let t = temp(site(p, pr));
+    narrowed(line(t.pr, p.depth, Bytes::concat_all([b"int64_t ", t.name, b" = -(int64_t)(", a, b");"])), t.name)
+  } else { line(pr, p.depth, b"/* a width operator this printer does not write yet */") }
+}
+
+/// Where a literal divides, C's own operator does it: any but zero and minus one.
+fn literal_divisor(d: Option<Arg>) -> Bool =
+  match d { Some(AInt(n)) -> n != 0 && n != 0 - 1, _ -> false }
+
+fn compare_c(op: Bytes) -> Bytes =
+  if op == b"lt" { b"<" }
+  else if op == b"le" { b"<=" }
+  else if op == b"gt" { b">" }
+  else if op == b"ge" { b">=" }
+  else if op == b"eq" { b"==" }
+  else { b"!=" }
+
+fn bitop_c(op: Bytes) -> Bytes = if op == b"bitand" { b"&" } else if op == b"bitor" { b"|" } else { b"^" }
+
+fn float_c(op: Bytes) -> Bytes =
+  if op == b"add" { b"+" } else if op == b"sub" { b"-" } else if op == b"mul" { b"*" } else { b"/" }
+
+/// `rt_overflow`'s numbering of the operation that overflowed.
+fn overflow_code(op: Bytes) -> Int =
+  if op == b"add" { 0 } else if op == b"sub" { 1 } else if op == b"neg" { 2 } else if op == b"mul" { 3 } else { 4 }
+
+/// `rt_arith`'s opcode numbering.
+fn arith_code(op: Bytes) -> Int = if op == b"mul" { 0 } else if op == b"div" { 1 } else { 2 }
+
+/// `rt_binary`'s operator numbering.
+fn binary_code(op: Bytes) -> Int =
+  if op == b"add" { 0 } else if op == b"sub" { 1 } else if op == b"mul" { 2 } else if op == b"div" { 3 } else { 4 }
+
+fn width_index(w: Width) -> Int =
+  if w.bits == 128 { if w.signed { 9 } else { 8 } } else {
+    (if w.signed { 4 } else { 0 })
+      + (if w.bits == 8 { 0 } else if w.bits == 16 { 1 } else if w.bits == 32 { 2 } else { 3 })
+  }
+
+fn width_min(w: Width) -> Int = if w.signed { 0 - pow(2, w.bits - 1) } else { 0 }
+
+fn width_max(w: Width) -> Int = if w.signed { pow(2, w.bits - 1) - 1 } else { pow(2, w.bits) - 1 }
