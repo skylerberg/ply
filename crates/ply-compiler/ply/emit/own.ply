@@ -21,10 +21,11 @@ import emit.keys (Named, Root)
 import emit.tir (Rep, RWord, RInt, RBool, RFlat, RCases, RToken, Var, Arg, AVar, AInt, ABool, Val,
                  Prim, Make, Get, Call, Apply, Native, Gathered, Path, PField, PArg, PLeaf, Made,
                  MRecord, MCtor, MList, TInt, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss,
-                 Loop, Next, Done, Return, Restart, Enter, Fail, Handle, Inc, Dec, Reset, Free,
-                 Opened, Block, Fn, Rooted, Lambda, Closure, Given, Lent, Test, TTag, Owns, ReadsOf,
-                 Lasts, no_links, counted, operands, answered, fails, used_as, var_of, rep_of_arg)
-import emit.verify (verified, parts_of)
+                 Loop, Next, Done, Return, Restart, Enter, Fail, NoArm, Handle, Inc, Dec, Reset,
+                 Free, Opened, Block, Fn, Member, Convention, Rooted, Lambda, Closure, Given, Lent,
+                 Test, TTag, Owns, ReadsOf, Lasts, no_links, counted, operands, answered, fails,
+                 used_as, var_of, rep_of_arg, parts_of)
+import emit.verify (verified)
 
 /// How a counted variable is held: a count of its own, or read out of variable `base` without one
 /// (`-1` where nothing the body lets go of holds it: a constant, a lent parameter).
@@ -74,21 +75,56 @@ type Plan = { incs: List<Inst>, before: List<Var>, after: List<Var>, live: Live 
 
 type Operand = { arg: Arg, takes: Bool }
 
-/// `f` and the closures it makes with every count placed. The form handed in holds none.
+/// `f` and the closures it makes with every count placed. The form handed in holds none. A tail
+/// group's arm `i` is counted as a body of its own holding member `i`'s parameters.
 pub fn owned(f: Fn) -> Fn = {
   let fx = facts_of(f);
   let top = { looped: None, miss: Map::new(), landing: Map::new(), known: Map::new() };
-  let back = walked_back(fx, top, f.body, Map::new(), fx.next);
-  let held = f.params.fold(Map::new(), |m: Live, p: Var|
-    resolved(fx, p).fold(m, |n: Live, w: Var| if owns(fx, w) { n.insert(w.id, w) } else { n }));
-  let opens = f.params.fold([], |acc: List<Inst>, p: Var|
-    match fx.opened.get(p.id) { Some(ws) -> acc.push(Opened({ of: p, words: ws })), None -> acc });
+  let body = if f.members.len() == 0 { headed(fx, top, f.params, f.body, fx.next).block } else {
+    match f.body {
+      [Case(c)] -> {
+        let arms = c.arms.fold(
+          { arms: [], next: fx.next },
+          |s: { arms: List<{ when: Int, body: Block }>, next: Int }, a: { when: Int, body: Block }| {
+            let h = headed(
+              fx,
+              top,
+              match f.members.at(a.when) { Some(m) -> m.params, None -> [] },
+              a.body,
+              s.next,
+            );
+            { arms: s.arms.push({ when: a.when, body: h.block }), next: h.next }
+          },
+        );
+        [Case({ ..c, arms: arms.arms, rest: headed(fx, top, [], c.rest, arms.next).block })]
+      },
+      _ -> headed(fx, top, f.params, f.body, fx.next).block,
+    }
+  };
   {
     ..f,
-    body: opens.concat(entered(fx, top, back, held).block),
+    body: body,
     lambdas: f.lambdas.map(|l: Lambda|
       match l { Closure(c) -> Closure({ ..c, body: owned(c.body) }) }),
   }
+}
+
+/// Body `b` with every count placed, its `params` held at its head: each flat one opened, each owned
+/// one nothing reads let go of there.
+fn headed(
+  fx: Facts,
+  top: Exits,
+  params: List<Var>,
+  b: Block,
+  next: Int,
+) -> { block: Block, next: Int } = {
+  let back = walked_back(fx, top, b, Map::new(), next);
+  let held = params.fold(Map::new(), |m: Live, p: Var|
+    resolved(fx, p).fold(m, |n: Live, w: Var| if owns(fx, w) { n.insert(w.id, w) } else { n }));
+  let opens = params.fold([], |acc: List<Inst>, p: Var|
+    match fx.opened.get(p.id) { Some(ws) -> acc.push(Opened({ of: p, words: ws })), None -> acc });
+  let e = entered(fx, top, back, held);
+  { block: opens.concat(e.block), next: e.next }
 }
 
 /// `f`'s variables read twice: once to learn which flat values can be opened, every read out of
@@ -152,11 +188,17 @@ fn facts_of(f: Fn) -> Facts = {
   }
 }
 
+/// `fx` with `f`'s parameters defined, and each tail group member's: given ones owned, lent ones
+/// outlasting the body.
 fn params_defined(f: Fn, fx: Facts) -> Facts =
-  range(0, f.params.len()).fold(fx, |acc: Facts, i: Int|
-    match f.params.at(i) {
+  f.members.fold(given_defined(f.params, f.conv, fx), |acc: Facts, m: Member|
+    given_defined(m.params, m.conv, acc))
+
+fn given_defined(params: List<Var>, conv: Convention, fx: Facts) -> Facts =
+  range(0, params.len()).fold(fx, |acc: Facts, i: Int|
+    match params.at(i) {
       None -> acc,
-      Some(p) -> if f.conv.params.at(i) == Some(Lent) { defined(acc, p, ReadOf(0 - 1)) }
+      Some(p) -> if conv.params.at(i) == Some(Lent) { defined(acc, p, ReadOf(0 - 1)) }
       else { { ..defined(acc, p, Own), made: acc.made.insert(p.id, true) } },
     })
 
@@ -1179,7 +1221,7 @@ test "an arm lets go before it misses of what only it reads" {
     [
       Match({
         arms: [[If({ cond: ABool(true), then: then, otherwise: miss })], [Return(AVar(q))]],
-        rest: [Fail(b"no arm")],
+        rest: [Fail({ why: NoArm, at: dummy_span() })],
       }),
     ];
   let f = root_of([p, q], [], RWord, matched([Return(AVar(p))], [Miss]));
@@ -1207,7 +1249,7 @@ test "an arm lets go before a miss however deep of what it read with a count of 
   let cased = |on: Var, arm: List<Inst>, rest: List<Inst>|
     Case({ on: on, test: TInt([1]), arms: [{ when: 0, body: arm }], rest: rest });
   let matched = |first: List<Inst>|
-    [Match({ arms: [first, [Return(AVar(xs))]], rest: [Fail(b"no arm")] })];
+    [Match({ arms: [first, [Return(AVar(xs))]], rest: [Fail({ why: NoArm, at: dummy_span() })] })];
   let f = root_of(
     [xs, q],
     [],
@@ -1352,7 +1394,7 @@ test "a handle holds across its body what the body reads, which its landing rele
   let site = { clauses: [], ret: None, detached: None };
   let uses = { takes: [], owned: false, fails: true, stops: false };
   let inside = [
-    If({ cond: AVar(c), then: [Fail(b"no arm")], otherwise: [] }),
+    If({ cond: AVar(c), then: [Fail({ why: NoArm, at: dummy_span() })], otherwise: [] }),
     bind(r, call_of([AVar(p)], [0]), []),
     Assign({ var: a, arg: AVar(r) }),
   ];

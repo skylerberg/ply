@@ -4,7 +4,8 @@
 //! analysed program, for lowering a program's text in tests.
 
 import std.bin
-import parsing (Ident, Span, span_key)
+import std.bytes
+import parsing (Ident, Span, span_key, prelude_binder)
 import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Scheme, type_at, int_type)
 import typing (Typed, filed_as, unknown_type)
 import items (Module, Item, IFn, IEffect, OpDef, FnDef, INames, IModule, IAlias)
@@ -16,9 +17,9 @@ import front (Analysis, Analysed, KnownDefRow, CtorRow, EmitterCtor, WalkedFacts
               dump_of, facts_read)
 import lent (passed)
 import code (Code, lower_to_emit)
-import emit (Def, Imported, Ctors, EffectName, OpMode, EmitParam, Carrier, Whole, Fields, Cases,
-             SumCase, FieldTy, Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, SumSpec, Zeroed,
-             Tagged, Ty, TyOpen, TyRec, Width, kind_of, ctor_layouts, ctor_sums)
+import emit (Def, Imported, Ctors, SumCtor, EffectName, OpMode, EmitParam, Carrier, Whole, Fields,
+             Cases, SumCase, FieldTy, Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, SumSpec,
+             Zeroed, Tagged, Ty, TyOpen, TyRec, Width, kind_of, ctor_layouts, ctor_sums)
 
 /// What the emitter hands the lowering for every root of one module.
 pub type Setting = {
@@ -144,6 +145,99 @@ fn root_of(
     },
   }
 }
+
+/// The name the program's constructor table gives the constructor written `written`. One qualified
+/// by a binder (`binder::Name`) is the module the binder names; a bare one is the module's own, else
+/// the one an import brought in by that name, else the prelude's, so an import shadows a prelude
+/// constructor of the same name.
+pub fn ctor_named(s: Setting, written: Bytes) -> Option<Bytes> =
+  match qualified(written) {
+    Some(q) ->
+      tabled(s, match module_import(s.imports, q.binder) {
+        Some(imp) -> qualify(imp.module, q.name),
+        None -> Bytes::concat_all([b"std.", q.binder, b".", q.name]),
+      }),
+    None -> match tabled(s, qualify(s.module, written)) {
+      Some(own) -> Some(own),
+      None -> match s.imports.fold(None, |acc: Option<Bytes>, imp: Imported|
+          match acc {
+            Some(_) -> acc,
+            None -> if !imp.whole && imp.name == written { tabled(s, qualify(imp.module, written)) }
+            else { None },
+          }) {
+        Some(imported) -> Some(imported),
+        None -> tabled(s, written),
+      },
+    },
+  }
+
+/// The declared sum holding constructor `full`, as the table names it: its constructors in their
+/// declared order, and `full`'s place among them.
+pub fn ctor_sum(s: Setting, full: Bytes) -> Option<{ ctors: List<SumCtor>, index: Int }> =
+  s.ctors.sums.values().fold(
+    None,
+    |acc: Option<{ ctors: List<SumCtor>, index: Int }>, cs: List<SumCtor>|
+      match acc {
+        Some(_) -> acc,
+        None -> match range(0, cs.len()).fold(None, |at: Option<Int>, i: Int|
+            match at {
+              Some(_) -> at,
+              None -> match cs.at(i) {
+                Some(c) -> if c.name == full { Some(i) } else { None },
+                None -> None,
+              },
+            }) {
+          Some(i) -> Some({ ctors: cs, index: i }),
+          None -> None,
+        },
+      },
+  )
+
+fn tabled(s: Setting, name: Bytes) -> Option<Bytes> =
+  if s.ctors.names.contains(name) { Some(name) } else { None }
+
+/// The import a name no definition of the module answers to reaches, and the name there: one
+/// qualified by a binder (`binder::name`) in the module the binder names, a bare one in the import
+/// that brought it in by that name, else the prelude's where it defines one.
+pub fn imported_target(
+  imports: List<Imported>,
+  name: Bytes,
+) -> Option<{ imp: Imported, name: Bytes }> =
+  match match qualified(name) {
+      Some(q) -> match module_import(imports, q.binder) {
+        Some(imp) -> Some({ imp: imp, name: q.name }),
+        None -> None,
+      },
+      None -> match from_import(imports, name) {
+        Some(imp) -> Some({ imp: imp, name: name }),
+        None -> None,
+      },
+    } {
+    Some(t) -> Some(t),
+    None -> match module_import(imports, prelude_binder()) {
+      Some(imp) -> if imp.defs.any(|d: Def| d.name == name) { Some({ imp: imp, name: name }) }
+      else { None },
+      None -> None,
+    },
+  }
+
+/// The import that brought `name` in by that name.
+pub fn from_import(xs: List<Imported>, name: Bytes) -> Option<Imported> =
+  xs.fold(None, |acc: Option<Imported>, i: Imported|
+    if !i.whole && i.name == name { Some(i) } else { acc })
+
+/// `binder::name`'s two parts, where `name` is written so.
+pub fn qualified(name: Bytes) -> Option<{ binder: Bytes, name: Bytes }> =
+  match name.index_of(b"::") {
+    None -> None,
+    Some(i) -> match name.slice_at(0, i) {
+      None -> None,
+      Some(binder) -> match name.slice_at(i + 2, name.len() - i - 2) {
+        Some(rest) -> Some({ binder: binder, name: rest }),
+        None -> None,
+      },
+    },
+  }
 
 // What follows copies the emitter's own readers of a program (`emit.ply`), which are private to it
 // until restructure PR 2 makes them `pub`; the hooks file lists each.
@@ -448,7 +542,8 @@ fn resolved_imports(
   }
 }
 
-fn module_import(xs: List<Imported>, binder: Bytes) -> Option<Imported> =
+/// The import that binds a whole module to `binder`.
+pub fn module_import(xs: List<Imported>, binder: Bytes) -> Option<Imported> =
   xs.fold(None, |acc: Option<Imported>, i: Imported|
     if i.whole && i.name == binder { Some(i) } else { acc })
 
@@ -459,3 +554,48 @@ fn dotted(xs: List<Bytes>) -> Bytes =
       if i == 0 { b"" } else { b"." },
       match xs.at(i) { Some(x) -> x, None -> b"" },
     ]))
+
+/// A setting of module `m` importing `imports`, whose program declares constructors `names`, the
+/// prelude's `Less` and `Equal` an `Ordering`'s.
+fn ctor_setting(imports: List<Imported>, names: List<Bytes>) -> Setting =
+  {
+    module: b"m",
+    here: [],
+    imports: imports,
+    ctors: {
+      names: names,
+      laid: Map::new(),
+      keyed: [],
+      sums: Map::new().insert(b"Ordering", [
+        { name: b"Less", index: 0, fields: [], params: [] },
+        { name: b"Equal", index: 1, fields: [], params: [] },
+      ]),
+    },
+    builtins: [],
+    effects: [],
+    release: false,
+    typed: Map::new(),
+  }
+
+test "a bare constructor is the module's own, else an import's, and only then the prelude's" {
+  let names = [b"Less", b"Equal", b"lib.Equal", b"m.Box"];
+  let by_name = { name: b"Equal", module: b"lib", defs: [], whole: false };
+  let whole = { name: b"lib", module: b"lib", defs: [], whole: true };
+  assert_eq(ctor_named(ctor_setting([by_name], names), b"Equal"), Some(b"lib.Equal"));
+  assert_eq(ctor_named(ctor_setting([], names), b"Equal"), Some(b"Equal"));
+  assert_eq(ctor_named(ctor_setting([], names.push(b"m.Equal")), b"Equal"), Some(b"m.Equal"));
+  assert_eq(ctor_named(ctor_setting([whole], names), b"lib::Equal"), Some(b"lib.Equal"));
+  assert_eq(ctor_named(ctor_setting([], names), b"Box"), Some(b"m.Box"));
+  assert_eq(ctor_named(ctor_setting([], names), b"Gone"), None);
+  assert_eq(
+    ctor_sum(ctor_setting([], names), b"Equal"),
+    Some({
+      ctors: [
+        { name: b"Less", index: 0, fields: [], params: [] },
+        { name: b"Equal", index: 1, fields: [], params: [] },
+      ],
+      index: 1,
+    }),
+  );
+  assert_eq(ctor_sum(ctor_setting([], names), b"m.Box"), None)
+}

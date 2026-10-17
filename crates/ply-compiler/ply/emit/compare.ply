@@ -9,16 +9,20 @@ import front (Analysed, Refused, Analysis, analyse, dump_of)
 import lexer (is_ident_continue)
 import resolve (Diag, qualify)
 import types (TyCon)
-import std.bytes (ascii_of_int)
-import emit (emit_roots_answer, ctor_layouts, ctor_sums, RootAnswer, Body, symbol_of)
-import emit.pieces (spelled)
+import std.bytes (ascii_of_int, hex_digit)
+import emit (emit_roots_answer, RootAnswer, Body, Const, ConstStr, ConstBytes, ConstEmbedded,
+             ConstFixed, ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, GenericCall,
+             FnArg, symbol_of)
+import emit.pieces (Piece, spelled)
 import emit.tir (Rep, Var, Arg, AVar, ABool, RInt, RBool, Inst, Decl, Assign, If, Return, Restart,
                  Fn, Declined, Family, Spine, Data, Calling, Matching, Handling, Scalars,
                  Containers)
 import emit.lower (lowered_fn)
 import emit.lower.base (context_of)
+import emit.lower.calling (known_body)
 import emit.lower.setting (Setting, Root, setting_in)
 import emit.print (printed_fn)
+import emit.own (owned)
 import emit.verify (verified)
 
 /// A program of one module `m`: its text, its analysis, and what the emitter would hand each of its
@@ -35,38 +39,61 @@ pub fn program_of(src: Bytes) -> Result<Program, Bytes> / {abort.raise} =
     },
   }
 
-/// Root `m.<name>` of `p` lowered to the form, or why it was not.
+/// Root `m.<name>` of `p` lowered to the form as a build lowers it, its body after `known_body`, or
+/// why it was not.
 pub fn formed(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.raise} =
   match p.roots.fold(None, |acc: Option<Root>, r: Root|
       if r.full == qualify(b"m", name) { Some(r) } else { acc }) {
     None -> Err({ by: Spine, why: b"no such definition" }),
     Some(r) -> match r.code {
       None -> Err({ by: Spine, why: b"a body that does not lower to Code" }),
-      Some(code) -> lowered_fn(context_of(p.setting, r, code), code),
+      Some(code) -> {
+        let body = known_body(r.full, r.params, code);
+        lowered_fn(context_of(p.setting, r, body), body)
+      },
     },
   }
 
-/// Root `m.<name>` of `p` lowered and checked, or why not: what a build prints.
+/// Root `m.<name>` of `p` lowered, its counts placed and checked, or why not: what a build prints.
 pub fn checked(p: Program, name: Bytes) -> Result<Fn, Bytes> / {abort.raise} =
   match formed(p, name) {
     Err(no) -> Err(no.why),
-    Ok(form) -> match verified(form) {
-      Some(why) -> Err(b"refused by the check: ".concat(why)),
-      None -> Ok(form),
+    Ok(form) -> {
+      let counted = owned(form);
+      match verified(counted) {
+        Some(why) -> Err(b"refused by the check: ".concat(why)),
+        None -> Ok(counted),
+      }
     },
   }
 
 /// Root `m.<name>` of `p` as the form prints it once it is checked, or why it was not printed.
 pub fn printed_by_form(p: Program, name: Bytes) -> Result<Bytes, Bytes> / {abort.raise} =
-  match checked(p, name) { Err(why) -> Err(why), Ok(form) -> Ok(spelled(printed_fn(form).pieces)) }
+  match checked(p, name) { Err(why) -> Err(why), Ok(form) -> Ok(printed_text(form)) }
 
-/// What today's emitter answers for the roots `m.<name>` of `p` that `names` name.
+/// Root `f`'s C as the form prints it, each hole of the unit's tables spelled as the entry it names,
+/// as `today_text` spells today's.
+pub fn printed_text(f: Fn) -> Bytes / {abort.raise} = {
+  let pr = printed_fn(f);
+  let generics = f.links.generics.map(call_spelled);
+  resolved(spelled(pr.pieces), {
+    c: pr.consts.map(const_spelled),
+    b: pr.builtins,
+    f: pr.fields,
+    s: pr.shapes.map(|s: List<Bytes>| Bytes::join(s, b",")),
+    l: pr.lambdas.map(|ps: List<Piece>| entry_spelled(spelled(ps), generics)),
+    g: generics,
+  })
+}
+
+/// What today's emitter answers for the roots `m.<name>` of `p` that `names` name, handed the
+/// program's constructors as the form is.
 pub fn answered_today(p: Program, names: List<Bytes>) -> List<RootAnswer> / {abort.raise} = {
   let d = dump_of(Analysed(p.analysis));
   emit_roots_answer(
     [b"m"],
     [p.src],
-    { names: [], laid: ctor_layouts(d.ctors), keyed: [], sums: ctor_sums(d.ctors) },
+    p.setting.ctors,
     [],
     names.map(|n: Bytes| qualify(b"m", n)),
     [],
@@ -77,34 +104,159 @@ pub fn answered_today(p: Program, names: List<Bytes>) -> List<RootAnswer> / {abo
   )
 }
 
-/// The C today's emitter wrote for root `m.<name>` among `answers`.
-pub fn today_text(answers: List<RootAnswer>, name: Bytes) -> Bytes =
+/// The C today's emitter wrote for root `m.<name>` among `answers`, each hole of the unit's tables
+/// spelled as the entry it names (`@@c=str:one@@`), so two printers that fill a table in different
+/// orders are compared by what they load.
+pub fn today_text(answers: List<RootAnswer>, name: Bytes) -> Bytes / {abort.raise} =
   answers.fold(b"", |acc: Bytes, a: RootAnswer|
-    if a.name != qualify(b"m", name) { acc }
-    else { match a.answer { Body(b) -> b.text, _ -> b"refused by today's emitter" } })
+    if a.name != qualify(b"m", name) { acc } else {
+      match a.answer {
+        Body(b) -> {
+          let generics = b.tables.generics.calls.map(call_spelled);
+          resolved(b.text, {
+            c: b.tables.consts.map(const_spelled),
+            b: b.tables.builtins,
+            f: b.tables.fields,
+            s: b.tables.shapes.map(|s: List<Bytes>| Bytes::join(s, b",")),
+            l: b.tables.lambdas.map(|e: Bytes| entry_spelled(e, generics)),
+            g: generics,
+          })
+        },
+        _ -> b"refused by today's emitter",
+      }
+    })
+
+/// What each hole of a root's tables names, spelled, by table and in the order its holes number it:
+/// constants, builtins, field names, shapes, the code table's entries and generic calls.
+type Entries = {
+  c: List<Bytes>,
+  b: List<Bytes>,
+  f: List<Bytes>,
+  s: List<Bytes>,
+  l: List<Bytes>,
+  g: List<Bytes>,
+}
+
+/// `text` with each hole of a table `e` holds an entry for written as `@@<table>=<entry>@@`.
+fn resolved(text: Bytes, e: Entries) -> Bytes / {abort.raise} = {
+  let cut = text.split(b"@@");
+  Bytes::concat_all(
+    range(0, cut.len()).map(|i: Int| {
+      let s = cut.get(i);
+      if i % 2 == 0 { s }
+      else if i == cut.len() - 1 { b"@@".concat(s) }
+      else { Bytes::concat_all([b"@@", hole_spelled(s, e), b"@@"]) }
+    }),
+  )
+}
+
+/// A hole's content, `c3`, as the entry it names, `c=str:one`, where its table holds one.
+fn hole_spelled(h: Bytes, e: Entries) -> Bytes / {abort.raise} =
+  if !numbered_hole(h) { h } else {
+    let table = h.slice(0, 1);
+    let entries = if table == b"c" { e.c }
+    else if table == b"b" { e.b }
+    else if table == b"f" { e.f }
+    else if table == b"s" { e.s }
+    else if table == b"l" { e.l }
+    else { e.g };
+    match h.slice(1, h.len()).int_of_ascii() {
+      Some(n) -> match entries.at(n) {
+        Some(x) -> Bytes::concat_all([table, b"=", escaped(x)]),
+        None -> h,
+      },
+      None -> h,
+    }
+  }
+
+/// Whether a hole's content is a table's letter and a number.
+fn numbered_hole(h: Bytes) -> Bool / {abort.raise} =
+  [108, 99, 98, 102, 115, 103].any(|t: Int| digits_after(h, t))
+
+/// A code table's entry, whose own holes name the body's generic calls, as those calls.
+fn entry_spelled(entry: Bytes, generics: List<Bytes>) -> Bytes / {abort.raise} =
+  resolved(entry, { c: [], b: [], f: [], s: [], l: [], g: generics })
+
+/// `b` with every byte that is not printable ASCII, and `@`, `\`, `;`, `{` and `}`, written `\xHH`,
+/// so a hole's entry holds no `@@`, no line break, and nothing a statement or a block is read by.
+fn escaped(b: Bytes) -> Bytes / {abort.raise} =
+  Bytes::concat_all(
+    range(0, b.len()).map(|i: Int| {
+      let x = b.at(i);
+      if x >= 32 && x <= 126 && x != 64 && x != 92 && x != 59 && x != 123 && x != 125 {
+        b.slice(i, i + 1)
+      } else { Bytes::concat_all([b"\\x", hex_digit(x / 16), hex_digit(x % 16)]) }
+    }),
+  )
+
+fn const_spelled(k: Const) -> Bytes =
+  match k {
+    ConstStr(s) -> b"str:".concat(s),
+    ConstBytes(s) -> b"bytes:".concat(s),
+    ConstEmbedded(d) -> b"embedded:".concat(d),
+    ConstFixed(x) ->
+      Bytes::concat_all([b"fixed:", ascii_of_int(x.width), b":", ascii_of_int(x.bits)]),
+    ConstWide(x) ->
+      Bytes::concat_all([
+        b"wide:",
+        ascii_of_int(x.width),
+        b":",
+        ascii_of_int(x.high),
+        b":",
+        ascii_of_int(x.low),
+      ]),
+    ConstFloat(t) -> b"float:".concat(t),
+    ConstDecimal(t) -> b"decimal:".concat(t),
+    ConstChar(c) -> b"char:".concat(ascii_of_int(c)),
+    ConstUnit -> b"unit",
+  }
+
+/// A generic call as its callee at its type arguments, the variables it hands over raw, and the
+/// lambdas it hands: `m.f<Int>[0]|1=m.g:0`.
+fn call_spelled(g: GenericCall) -> Bytes =
+  Bytes::concat_all([
+    g.callee,
+    b"<",
+    Bytes::join(g.args, b","),
+    b">",
+    if g.carried.len() == 0 { b"" }
+    else { Bytes::concat_all([b"[", Bytes::join(g.carried.map(ascii_of_int), b","), b"]"]) },
+    Bytes::concat_all(
+      g.fns.map(|x: FnArg|
+        Bytes::concat_all([b"|", ascii_of_int(x.param), b"=", x.owner, b":", ascii_of_int(x.nth)])),
+    ),
+  ])
 
 /// `text` as a list of lines, read past what two printers may write differently for one
-/// computation: a local declared from another local or a literal and never assigned again is read
-/// as what it copies; lines after a restart's `goto` in its block are dropped; the temporaries
-/// `t<n>` are renumbered in the order they first appear; and so are the holes of each of the unit's
-/// tables (`@@c<n>@@`, `@@l<n>@@`, `@@b<n>@@`, `@@f<n>@@`, `@@s<n>@@`, `@@g<n>@@`), each table
-/// apart, since a printer fills a table in the order it prints. What a hole names is not compared.
+/// computation:
+/// - a blank line is dropped;
+/// - `Word` is the `int64_t` it is defined as;
+/// - a temporary (or a part `t<n>_<k>` of one held as several C values) declared from another local
+///   or a literal (a field name's entry among them) and never assigned again is read as what it
+///   copies, unless what it copies is assigned after it;
+/// - a temporary or a part declared from what calls nothing and never read again is dropped;
+/// - lines after a restart's `goto` in its block are dropped;
+/// - the temporaries `t<n>` (a part with its temporary), the landings `land_<n>` and `ply_h<n>`, and
+///   any hole of a table no entry was spelled for are renumbered in the order they first appear,
+///   each kind apart.
 pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} = {
-  let lines = text.split(b"\n");
-  let assigned = lines.fold(Map::new(), |m: Map<Bytes, Int>, l: Bytes| {
-    let t = trimmed(l);
-    match t.index_of(b" = ") {
-      Some(at) -> if temp_name(t.slice(0, at)) {
-        m.insert(t.slice(0, at), match m.get(t.slice(0, at)) { Some(n) -> n + 1, None -> 1 })
-      } else { m },
-      None -> m,
-    }
-  });
-  let copies = lines.fold(
+  let lines = text.split(b"\n").filter(|l: Bytes| trimmed(l) != b"").map(|l: Bytes|
+    renamed(l, Map::new().insert(b"Word", b"int64_t")));
+  let writes = range(0, lines.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int|
+    statements(trimmed(lines.get(i))).fold(m, |n: Map<Bytes, Int>, s: Bytes|
+      match s.index_of(b" = ") {
+        Some(at) -> if temp_local(s.slice(0, at)) { n.insert(s.slice(0, at), i) } else { n },
+        None -> n,
+      }));
+  let copies = range(0, lines.len()).fold(
     { names: Map::new(), kept: [] },
-    |acc: { names: Map<Bytes, Bytes>, kept: List<Bytes> }, l: Bytes|
+    |acc: { names: Map<Bytes, Bytes>, kept: List<Bytes> }, i: Int| {
+      let l = lines.get(i);
       match copy_of(trimmed(l)) {
-        Some(c) -> if assigned.contains(c.name) { { ..acc, kept: acc.kept.push(l) } } else {
+        Some(c) -> if writes.contains(c.name)
+            || (match writes.get(c.value) { Some(last) -> last > i, None -> false }) {
+          { ..acc, kept: acc.kept.push(l) }
+        } else {
           {
             ..acc,
             names: acc.names.insert(c.name, match acc.names.get(c.value) {
@@ -114,7 +266,8 @@ pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} = {
           }
         },
         None -> { ..acc, kept: acc.kept.push(l) },
-      },
+      }
+    },
   );
   let read = copies.kept.map(|l: Bytes| renamed(l, copies.names));
   let live = read.fold(
@@ -125,59 +278,152 @@ pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} = {
       else if trimmed(l) == b"goto ply_loop;" { { out: acc.out.push(l), skip: depth } }
       else { { out: acc.out.push(l), skip: 0 - 1 } }
     },
-  );
-  let numbering = live.out.fold(Map::new(), |m: Map<Bytes, Bytes>, l: Bytes|
-    idents(l).fold(m, |n: Map<Bytes, Bytes>, w: Bytes|
-      if temp_name(w) && !n.contains(w) { n.insert(w, b"t".concat(ascii_of_int(n.len() + 1))) }
-      else { n }));
-  let holes = live.out.fold(Map::new(), |m: Map<Bytes, Bytes>, l: Bytes| {
-    let ws = words(l);
-    range(0, ws.len()).fold(m, |n: Map<Bytes, Bytes>, i: Int|
-      match ws.at(i) {
-        Some(w) -> if !table_hole(ws, i) || n.contains(w.text) { n } else {
-          let table = w.text.slice(0, 1);
-          n.insert(
-            w.text,
-            table.concat(ascii_of_int(n.keys().filter(|k: Bytes| k.slice(0, 1) == table).len())),
-          )
-        },
-        None -> n,
-      })
-  });
-  live.out.map(|l: Bytes| renumbered(renamed(l, numbering), holes))
+  ).out;
+  let mentions = live.fold(Map::new(), |m: Map<Bytes, Int>, l: Bytes|
+    idents(l).fold(m, |n: Map<Bytes, Int>, w: Bytes|
+      if temp_local(w) { n.insert(w, match n.get(w) { Some(k) -> k + 1, None -> 1 }) } else { n }));
+  let used = live.filter(|l: Bytes|
+    match unread_value(trimmed(l)) { Some(t) -> mentions.get(t) != Some(1), None -> true });
+  let numbering = used.fold({ names: Map::new(), counts: Map::new() }, |m: Numbering, l: Bytes|
+    words(l).fold(m, |n: Numbering, w: { text: Bytes, ident: Bool }|
+      if n.names.contains(w.text) { n } else {
+        match temp_part(w.text) {
+          Some(part) -> {
+            let based = numbered(n, { text: part.base, ident: true });
+            {
+              ..based,
+              names: based.names.insert(
+                w.text,
+                Bytes::concat_all([
+                  match based.names.get(part.base) { Some(b) -> b, None -> part.base },
+                  b"_",
+                  part.k,
+                ]),
+              ),
+            }
+          },
+          None -> numbered(n, w),
+        }
+      }));
+  used.map(|l: Bytes| renamed(l, numbering.names))
 }
 
-/// `l` with each table's hole `holes` holds written as what it holds.
-fn renumbered(l: Bytes, holes: Map<Bytes, Bytes>) -> Bytes / {abort.raise} = {
-  let ws = words(l);
-  Bytes::concat_all(
-    range(0, ws.len()).map(|i: Int| {
-      let w = ws.get(i);
-      if table_hole(ws, i) { match holes.get(w.text) { Some(n) -> n, None -> w.text } }
-      else { w.text }
+/// What a renumbering has named so far, and the next number of each kind.
+type Numbering = { names: Map<Bytes, Bytes>, counts: Map<Bytes, Int> }
+
+/// `n` with word `w` named by the next number of its kind where it is numbered and not named yet.
+fn numbered(n: Numbering, w: { text: Bytes, ident: Bool }) -> Numbering / {abort.raise} =
+  if n.names.contains(w.text) { n } else {
+    match numbered_kind(w) {
+      None -> n,
+      Some(k) -> {
+        let next = match n.counts.get(k.lead) { Some(c) -> c, None -> k.first };
+        {
+          names: n.names.insert(w.text, Bytes::concat_all([k.lead, ascii_of_int(next), k.close])),
+          counts: n.counts.insert(k.lead, next + 1),
+        }
+      },
+    }
+  }
+
+/// A temporary or a part of one held as several C values (`t3_1`).
+fn temp_local(v: Bytes) -> Bool / {abort.raise} = temp_name(v) || temp_part(v) != None
+
+/// Part `k` of temporary `base`, where `v` names one (`t3_1`).
+fn temp_part(v: Bytes) -> Option<{ base: Bytes, k: Bytes }> / {abort.raise} =
+  match v.index_of(b"_") {
+    None -> None,
+    Some(u) -> {
+      let base = v.slice(0, u);
+      let k = v.slice(u + 1, v.len());
+      if temp_name(base) && all_digits(k) { Some({ base: base, k: k }) } else { None }
+    },
+  }
+
+/// How a word renumbered by first appearance is spelled around its number, and the number its kind
+/// starts at: a temporary from `t1`, the landings `land_0` and `ply_h0`, and a hole of a table no
+/// entry was spelled for from `@@c0@@`.
+fn numbered_kind(
+  w: { text: Bytes, ident: Bool },
+) -> Option<{ lead: Bytes, close: Bytes, first: Int }> / {abort.raise} =
+  if w.ident {
+    if temp_name(w.text) { Some({ lead: b"t", close: b"", first: 1 }) }
+    else if w.text.starts_with(b"land_") && all_digits(w.text.slice(5, w.text.len())) {
+      Some({ lead: b"land_", close: b"", first: 0 })
+    } else if w.text.starts_with(b"ply_h") && all_digits(w.text.slice(5, w.text.len())) {
+      Some({ lead: b"ply_h", close: b"", first: 0 })
+    } else { None }
+  } else if w.text.starts_with(b"@@") && w.text.ends_with(b"@@") && w.text.len() > 4 {
+    let h = w.text.slice(2, w.text.len() - 2);
+    if numbered_hole(h) { Some({ lead: b"@@".concat(h.slice(0, 1)), close: b"@@", first: 0 }) }
+    else { None }
+  } else { None }
+
+/// The temporary `T tN = X;` declares, where `X` calls nothing (no `ctx` in it), so dropping the
+/// line where nothing reads `tN` changes nothing.
+fn unread_value(t: Bytes) -> Option<Bytes> / {abort.raise} =
+  match declared(t) {
+    Some(d) -> if temp_local(d.name) && d.value.index_of(b"ctx") == None { Some(d.name) }
+    else { None },
+    None -> None,
+  }
+
+/// `text` without the counts today's emitter takes, lets go of and moves, for holding two printers
+/// whose counts differ by design to each other; held before `normalised`, so a local zeroed once its
+/// count moved does not read as assigned. A statement that only takes or lets go of a count
+/// (`ply_inc(..)`, `ply_dec(..)`), zeroes a local (`t1 = 0`), declares or frees a reuse token
+/// (`Word tok2 = 0`, `if (tok2) ply_dec(ctx, tok2)`) goes from its line, and a line left with none
+/// goes; so does a line resetting a token's cells (`if (t2) { if (tok2 == 0) { .. } }`). A line
+/// holding a block keeps its counts: a failure path's releases differ on purpose.
+pub fn past_counts(text: Bytes) -> Bytes / {abort.raise} =
+  Bytes::join(
+    text.split(b"\n").fold([], |out: List<Bytes>, l: Bytes| {
+      let t = trimmed(l);
+      if t.index_of(b"{") != None || t.index_of(b"}") != None {
+        if t.starts_with(b"if (") && t.index_of(b"ply_reset") != None { out } else { out.push(l) }
+      } else {
+        let all = statements(t);
+        let kept = all.filter(|s: Bytes| !bookkeeping(s));
+        if kept.len() == all.len() { out.push(l) }
+        else if kept.len() == 0 { out } else {
+          out.push(Bytes::concat_all([l.slice(0, indent(l)), Bytes::join(kept, b"; "), b";"]))
+        }
+      }
     }),
+    b"\n",
   )
-}
 
-/// Whether word `i` of `ws` is a hole of one of the unit's tables: a table's letter and a number
-/// between `@@`s.
-fn table_hole(ws: List<{ text: Bytes, ident: Bool }>, i: Int) -> Bool / {abort.raise} =
-  i >= 2
-    && (match ws.at(i) {
-      Some(w) -> w.ident && [108, 99, 98, 102, 115, 103].any(|t: Int| digits_after(w.text, t)),
+/// The statements of a line holding no block, each without its `;`.
+fn statements(t: Bytes) -> List<Bytes> / {abort.raise} =
+  t.split(b";").map(|s: Bytes| trimmed(s)).filter(|s: Bytes| s.len() > 0)
+
+/// Whether statement `s` only takes or lets go of a count, zeroes a local, or declares or frees a
+/// reuse token.
+fn bookkeeping(s: Bytes) -> Bool / {abort.raise} =
+  ((s.starts_with(b"ply_inc(") || s.starts_with(b"ply_dec(")) && s.ends_with(b")"))
+    || (match s.index_of(b" = ") {
+      Some(at) ->
+        s.slice(at + 3, s.len()) == b"0"
+          && (local_ident(s.slice(0, at)) || token_decl(s.slice(0, at))),
       None -> false,
     })
-    && [i - 2, i - 1, i + 1, i + 2].all(|k: Int|
-      match ws.at(k) { Some(x) -> x.text == b"@", None -> false })
+    || (s.starts_with(b"if (tok") && s.index_of(b") ply_dec(ctx, tok") != None && s.ends_with(b")"))
 
-/// `lines` without a line that only takes or lets go of a count, for holding two printers whose
-/// counts differ by design to each other.
-pub fn past_counts(lines: List<Bytes>) -> List<Bytes> / {abort.raise} =
-  lines.filter(|l: Bytes| {
-    let t = trimmed(l);
-    !((t.starts_with(b"ply_inc(") || t.starts_with(b"ply_dec(")) && t.ends_with(b");")
-      && t.index_of(b";") == Some(t.len() - 1))
-  })
+/// `Word tokN`, a reuse token's declaration.
+fn token_decl(d: Bytes) -> Bool / {abort.raise} =
+  (d.starts_with(b"Word tok") && all_digits(d.slice(8, d.len())))
+    || (d.starts_with(b"int64_t tok") && all_digits(d.slice(11, d.len())))
+
+/// A local of a C body: a temporary, a parameter or a capture, or a part of one (`p0_1`).
+fn local_ident(v: Bytes) -> Bool / {abort.raise} =
+  v.len() > 1 && (v.at(0) == 116 || v.at(0) == 112 || v.at(0) == 113)
+    && (match v.index_of(b"_") {
+      None -> all_digits(v.slice(1, v.len())),
+      Some(u) -> all_digits(v.slice(1, u)) && all_digits(v.slice(u + 1, v.len())),
+    })
+
+fn all_digits(v: Bytes) -> Bool / {abort.raise} =
+  v.len() > 0 && range(0, v.len()).all(|i: Int| v.at(i) >= 48 && v.at(i) <= 57)
 
 fn trimmed(l: Bytes) -> Bytes / {abort.raise} = l.slice(indent(l), l.len())
 
@@ -185,21 +431,24 @@ fn indent(l: Bytes) -> Int / {abort.raise} =
   range(0, l.len()).fold(l.len(), |at: Int, i: Int|
     if at < l.len() || l.at(i) == 32 { at } else { i })
 
-/// `T tN = X;` where `X` is a local or a literal: the copy's name and what it copies.
-fn copy_of(t: Bytes) -> Option<{ name: Bytes, value: Bytes }> / {abort.raise} =
+/// `T tN = X;`: the local a declaration names and the value it starts holding.
+fn declared(t: Bytes) -> Option<{ name: Bytes, value: Bytes }> / {abort.raise} =
   match t.index_of(b" ") {
     None -> None,
     Some(sp) -> if !c_type(t.slice(0, sp)) || !t.ends_with(b";") { None } else {
       let rest = t.slice(sp + 1, t.len() - 1);
       match rest.index_of(b" = ") {
         None -> None,
-        Some(eq) -> {
-          let name = rest.slice(0, eq);
-          let value = rest.slice(eq + 3, rest.len());
-          if temp_name(name) && atom(value) { Some({ name: name, value: value }) } else { None }
-        },
+        Some(eq) -> Some({ name: rest.slice(0, eq), value: rest.slice(eq + 3, rest.len()) }),
       }
     },
+  }
+
+/// `T tN = X;` where `X` is a local or a literal: the copy's name and what it copies.
+fn copy_of(t: Bytes) -> Option<{ name: Bytes, value: Bytes }> / {abort.raise} =
+  match declared(t) {
+    Some(d) -> if temp_local(d.name) && atom(d.value) { Some(d) } else { None },
+    None -> None,
   }
 
 fn c_type(t: Bytes) -> Bool =
@@ -215,26 +464,25 @@ fn c_type(t: Bytes) -> Bool =
     b"uint64_t",
     b"Word",
     b"PlyDec",
+    b"PlyMaybe",
+    b"PlyTagged",
   ].contains(
     t,
   )
 
 /// A local or a literal: a name of one identifier, or a constant spelled as the printers spell
-/// one, with nothing computed.
+/// one, with nothing computed; a field name's hole is a constant the unit writes in.
 fn atom(v: Bytes) -> Bool / {abort.raise} =
-  local_name(v) || v == b"INT64_MIN"
+  local_ident(v) || v == b"INT64_MIN"
     || (v.starts_with(b"INT64_C(") && v.ends_with(b")") && v.index_of(b" ") == None)
     || (v.starts_with(b"ply_f64(INT64_C(") && v.ends_with(b"))") && v.index_of(b" ") == None)
     || (v.starts_with(b"((") && v.index_of(b")INT64_C(") != None && v.ends_with(b"))")
     && v.index_of(b" ") == None)
     || v == b"0"
     || v == b"1"
-
-fn local_name(v: Bytes) -> Bool / {abort.raise} = temp_name(v) || param_name(v)
+    || (v.starts_with(b"@@f") && v.ends_with(b"@@") && v.split(b"@@").len() == 3)
 
 fn temp_name(v: Bytes) -> Bool / {abort.raise} = digits_after(v, 116)
-
-fn param_name(v: Bytes) -> Bool / {abort.raise} = digits_after(v, 112)
 
 /// Whether `v` is the byte `lead` and then one or more digits.
 fn digits_after(v: Bytes, lead: Int) -> Bool / {abort.raise} =
@@ -246,15 +494,27 @@ fn idents(l: Bytes) -> List<Bytes> / {abort.raise} =
     |w: { text: Bytes, ident: Bool }| w.text,
   )
 
-/// `l` with each identifier `names` holds written as what it holds.
+/// `l` with each word `names` holds written as what it holds.
 fn renamed(l: Bytes, names: Map<Bytes, Bytes>) -> Bytes / {abort.raise} =
   Bytes::concat_all(
     words(l).map(|w: { text: Bytes, ident: Bool }|
-      if w.ident { match names.get(w.text) { Some(n) -> n, None -> w.text } } else { w.text }),
+      match names.get(w.text) { Some(n) -> n, None -> w.text }),
   )
 
-/// `l` cut into runs of identifier bytes and single other bytes.
+/// `l` cut into its words: each hole whole with its `@@`s, and between them runs of identifier
+/// bytes and single other bytes.
 fn words(l: Bytes) -> List<{ text: Bytes, ident: Bool }> / {abort.raise} = {
+  let cut = l.split(b"@@");
+  range(0, cut.len()).fold([], |acc: List<{ text: Bytes, ident: Bool }>, i: Int|
+    if i % 2 == 1 && i < cut.len() - 1 {
+      acc.push({ text: Bytes::concat_all([b"@@", cut.get(i), b"@@"]), ident: false })
+    } else {
+      acc.concat(plain_words(if i % 2 == 1 { b"@@".concat(cut.get(i)) } else { cut.get(i) }))
+    })
+}
+
+/// `l`, which holds no hole, cut into runs of identifier bytes and single other bytes.
+fn plain_words(l: Bytes) -> List<{ text: Bytes, ident: Bool }> / {abort.raise} = {
   let cut = range(0, l.len()).fold(
     { out: [], from: 0 - 1 },
     |acc: { out: List<{ text: Bytes, ident: Bool }>, from: Int }, i: Int| {
@@ -365,35 +625,87 @@ test "two printers' copies, dead stores after a restart, numbering and counts ar
   let a = b"  int64_t t4 = p0;\n  int64_t t7 = (t4) < (INT64_C(3));\n  if (t7) {\n    p0 = t4;\n    goto ply_loop;\n    t9 = 0;\n  }\n  return t7;";
   let b = b"  int64_t t1 = (p0) < (INT64_C(3));\n  if (t1) {\n    p0 = p0;\n    goto ply_loop;\n  }\n  return t1;";
   assert_eq(normalised(a), normalised(b));
-  // A local assigned again is a join, never a copy.
+  // A local assigned again is a join, never a copy, and a copy of a local assigned after it is no
+  // copy either.
   assert_eq(normalised(b"  int64_t t2 = 0;\n  t2 = p1;\n  return t2;"), [
     b"  int64_t t1 = 0;",
     b"  t1 = p1;",
     b"  return t1;",
   ]);
+  assert_eq(normalised(b"  int64_t t4 = t3;\n  t3 = 0;\n  return t4;"), [
+    b"  int64_t t1 = t2;",
+    b"  t2 = 0;",
+    b"  return t1;",
+  ]);
+  // An `Option`'s word is a C value like any other, and a part of a value held as several is a
+  // local numbered with its temporary.
   assert_eq(
-    past_counts([
-      b"  ply_inc(ctx, p0);",
-      b"  Word t1 = f(ctx, p0);",
-      b"  ply_dec(ctx, p0); return 0;",
-    ]),
-    [b"  Word t1 = f(ctx, p0);", b"  ply_dec(ctx, p0); return 0;"],
+    normalised(
+      b"  PlyMaybe t3 = p0;\n  double t4_0 = ply_f64(p1);\n  double t4_1 = ply_f64(p2);\n  f(ctx, t4_1, t3);",
+    ),
+    [b"  double t1_1 = ply_f64(p2);", b"  f(ctx, t1_1, p0);"],
+  );
+  // A word is the `int64_t` it is defined as; a field name's entry is a constant; landings are
+  // numbered as temporaries are.
+  assert_eq(
+    normalised(
+      b"  Word t3 = @@f=name@@;\n  rt_f_p(ctx, t3, (Word)p0);\n  goto land_4;\n  ply_h2: ;",
+    ),
+    [b"  rt_f_p(ctx, @@f=name@@, (int64_t)p0);", b"  goto land_0;", b"  ply_h0: ;"],
   )
 }
 
-test "each table's holes are numbered apart in the order they first appear" {
-  let form = Bytes::concat_all([
-    b"  Word t1 = rt_lit_p(ctx, @@c2@@);\n",
-    b"  Word t2 = rt_closure_p(ctx, @@l1@@, 1, (Word)(intptr_t)t1, 2);\n",
-    b"  Word t3 = rt_lit_p(ctx, @@c0@@);",
+test "past counts, a body that moves, resets and frees reads as one that does none of it" {
+  let counted = Bytes::concat_all([
+    b"  Word tok2 = 0;\n",
+    b"  ply_inc(ctx, p0);\n",
+    b"  Word t1 = rt_list_p(ctx, p0);\n",
+    b"  if (ctx->failed) { ply_dec(ctx, p1); return 0; }\n",
+    b"  int64_t t9 = ply_words(t1)[4];\n",
+    b"  int64_t t2 = t1; t1 = 0;\n",
+    b"  ply_dec(ctx, p0_1); p0_1 = 0;\n",
+    b"  if (t2) { if (tok2 == 0) { tok2 = ply_reset_flat(t2); } }\n",
+    b"  Word t3 = rt_cons_p(ctx, t2, p1);\n",
+    b"  if (tok2) ply_dec(ctx, tok2);\n",
+    b"  p1 = 0;\n",
+    b"  ctx->fuel += 1;\n",
+    b"  return t3;",
   ]);
-  let today = Bytes::concat_all([
-    b"  Word t1 = rt_lit_p(ctx, @@c0@@);\n",
-    b"  Word t2 = rt_closure_p(ctx, @@l0@@, 1, (Word)(intptr_t)t1, 2);\n",
-    b"  Word t3 = rt_lit_p(ctx, @@c1@@);",
+  let plain = Bytes::concat_all([
+    b"  Word t1 = rt_list_p(ctx, p0);\n",
+    b"  if (ctx->failed) { ply_dec(ctx, p1); return 0; }\n",
+    b"  Word t2 = rt_cons_p(ctx, t1, p1);\n",
+    b"  ctx->fuel += 1;\n",
+    b"  return t2;",
   ]);
-  assert_eq(normalised(form), normalised(today));
-  // One entry read twice stays one, and holes that name no table stay as written.
+  assert_eq(normalised(past_counts(counted)), normalised(plain));
+  // Without reading past counts, the move's zeroed source keeps the copy apart.
+  assert(normalised(counted) != normalised(plain))
+}
+
+test "each table's hole is read as the entry it names, so the order a table is filled in is read past" {
+  let none: Entries = { c: [], b: [], f: [], s: [], l: [], g: [] };
+  let one = resolved(b"  Word t1 = rt_lit_p(ctx, @@c0@@);", { ..none, c: [b"str:one"] });
+  let two = resolved(b"  Word t1 = rt_lit_p(ctx, @@c1@@);", {
+    ..none,
+    c: [b"str:zero", b"str:one"],
+  });
+  assert_eq(normalised(one), normalised(two));
+  assert(
+    normalised(resolved(b"  Word t1 = rt_lit_p(ctx, @@c0@@);", { ..none, c: [b"str:zero"] }))
+      != normalised(one),
+  );
+  assert_eq(
+    resolved(b"  f(@@c1@@, @@f0@@, @@c9@@, @@r@@, @@Tm.Box@@);", {
+      ..none,
+      c: [b"str:one", b"str:a\nb"],
+      f: [b"name"],
+    }),
+    b"  f(@@c=str:a\\x0ab@@, @@f=name@@, @@c9@@, @@r@@, @@Tm.Box@@);",
+  );
+  // A code table's entry names a generic call by its own hole.
+  assert_eq(entry_spelled(b"@@g0@@_entry", [b"m.id<Int>"]), b"@@g=m.id<Int>@@_entry");
+  // A hole no entry was spelled for is numbered by first appearance, each table apart.
   assert_eq(normalised(b"  PLY_SITE(ctx, @@r@@, 3, 9); f(@@c3@@, @@c3@@, @@Tm.Box@@, @@b4@@);"), [
     b"  PLY_SITE(ctx, @@r@@, 3, 9); f(@@c0@@, @@c0@@, @@Tm.Box@@, @@b0@@);",
   ])

@@ -1,0 +1,516 @@
+//! The calling family's programs lowered through the form: calls of definitions, generic calls,
+//! closures, function values, bodies run in place, steps and tail groups.
+
+import resolve (qualify)
+import emit.keys (Named, Root, Generic)
+import emit.tir (Rep, RInt, RWord, Var, Arg, AVar, Val, Call, Apply, Make, Get, Pack, Op, OCalling,
+                 MClosure, PCapture, TTag, Inst, Let, Do, If, Case, Loop, Next, Done, Restart,
+                 Enter, Block, Fn, Member, Closure, Declined, Family, Spine, Data, Calling,
+                 Matching, Handling, Scalars, Containers)
+import emit.tir.calling (EntryValue, ConstantRead, Ticked)
+import emit.lower (lowered_fn, lowered_group)
+import emit.lower.base (GroupMember, context_of)
+import emit.lower.calling (known_body)
+import emit.verify (verified)
+import emit.own (owned)
+import emit (symbol_of)
+import emit.compare (Program, program_of, answered_today, today_text, printed_text)
+
+fn corpus() -> Bytes =
+  Bytes::concat_all([
+    b"fn add(a: Int, b: Int) -> Int = a + b\n",
+    b"fn twice(x: Int) -> Int = add(x, x)\n",
+    b"fn same(s: String) -> String = s\n",
+    b"fn handed(s: String) -> String = same(s)\n",
+    b"fn ident<T>(x: T) -> T = x\n",
+    b"fn ident_int(x: Int) -> Int = ident(x)\n",
+    b"fn ident_word(s: String) -> String = ident(s)\n",
+    b"fn adder(x: Int) -> (Int) -> Int = |y: Int| y + x\n",
+    b"fn doubler() -> (Int) -> Int = |y: Int| y * 2\n",
+    b"fn named() -> (Int, Int) -> Int = add\n",
+    b"fn nested(x: Int) -> (Int) -> (Int) -> Int = |y: Int| |z: Int| x + y + z\n",
+    b"fn applied(f: (Int) -> Int, x: Int) -> Int = f(x)\n",
+    b"fn applied_word(f: (String) -> String, s: String) -> String = f(s)\n",
+    b"fn local(x: Int) -> Int = { let f = |y: Int| y + x; f(1) }\n",
+    b"fn count(n: Int) -> Int = if n <= 0 { 0 } else { count(n - 1) }\n",
+    b"fn counter() -> (Int) -> Int = |y: Int| count(y)\n",
+    b"fn kept() -> Int = 42\n",
+    b"fn read_kept(x: Int) -> Int = kept() + x\n",
+    b"fn apply_to<T>(f: (T) -> T, x: T) -> T = f(x)\n",
+    b"fn lends(x: Int) -> Int = apply_to(|y: Int| y + x, x)\n",
+    b"fn steps(n: Int) -> Int / {abort.raise} = iterate(0, n, |i: Int| if i >= 10 { Stop(i) } else { Continue(i + 1) })\n",
+    b"fn step_of(i: Int) -> Iter<Int, Int> = if i >= 10 { Stop(i) } else { Continue(i + 1) }\n",
+    b"fn stepped(n: Int, k: Int) -> Int / {abort.raise} = iterate(0, n, |i: Int| step_of(i + k))\n",
+    b"fn even(n: Int) -> Bool / {diverges} = if n == 0 { true } else { odd(n - 1) }\n",
+    b"fn odd(n: Int) -> Bool / {diverges} = if n == 0 { false } else { even(n - 1) }\n",
+  ])
+
+fn names() -> List<Bytes> =
+  [
+    b"add",
+    b"twice",
+    b"same",
+    b"handed",
+    b"ident",
+    b"ident_int",
+    b"ident_word",
+    b"adder",
+    b"doubler",
+    b"named",
+    b"nested",
+    b"applied",
+    b"applied_word",
+    b"local",
+    b"count",
+    b"counter",
+    b"kept",
+    b"read_kept",
+    b"apply_to",
+    b"lends",
+    b"steps",
+    b"step_of",
+    b"stepped",
+    b"even",
+    b"odd",
+  ]
+
+/// Root `m.<name>` of `p` lowered as a build lowers it: its body after `known_body`.
+fn lowered_as_built(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.raise} =
+  match match range(0, p.roots.len()).fold(None, |acc: Option<Int>, i: Int|
+        match p.roots.at(i) {
+          Some(r) -> if r.full == qualify(b"m", name) { Some(i) } else { acc },
+          None -> acc,
+        }) {
+      Some(i) -> p.roots.at(i),
+      None -> None,
+    } {
+    None -> Err({ by: Spine, why: b"no such definition" }),
+    Some(r) -> match r.code {
+      None -> Err({ by: Spine, why: b"a body that does not lower to Code" }),
+      Some(code) -> {
+        let body = known_body(r.full, r.params, code);
+        lowered_fn(context_of(p.setting, r, body), body)
+      },
+    },
+  }
+
+/// The corpus's root `name` lowered, or why not.
+fn form(name: Bytes) -> Result<Fn, Bytes> / {abort.raise} =
+  match program_of(corpus()) {
+    Err(why) -> Err(why),
+    Ok(p) -> match lowered_as_built(p, name) { Ok(f) -> Ok(f), Err(no) -> Err(no.why) },
+  }
+
+/// Every value `b` binds or does, its branches' too, in order.
+fn vals_in(b: Block) -> List<Val> =
+  b.fold([], |acc: List<Val>, i: Inst|
+    match i {
+      Let(l) -> acc.push(l.val),
+      Do(d) -> acc.push(d.val),
+      If(x) -> acc.concat(vals_in(x.then)).concat(vals_in(x.otherwise)),
+      _ -> acc,
+    })
+
+/// Whether a self call restarts `b` anywhere.
+fn restarts(b: Block) -> Bool =
+  b.fold(false, |found: Bool, i: Inst|
+    found
+      || (match i {
+        Restart(_) -> true,
+        If(x) -> restarts(x.then) || restarts(x.otherwise),
+        _ -> false,
+      }))
+
+/// The body of closure `nth` of `f`, and how many of its parameters are captures.
+fn closure_of(f: Fn, nth: Int) -> Option<{ body: Fn, captures: Int }> =
+  match f.lambdas.at(nth) {
+    Some(Closure(c)) -> Some({ body: c.body, captures: c.captures }),
+    None -> None,
+  }
+
+test "a call of a definition hands its arguments as the callee carries them" {
+  match form(b"twice") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) ->
+      assert_eq(
+        vals_in(f.body).fold([], |acc: List<{ reps: List<Rep>, answer: Rep }>, v: Val|
+          match v {
+            Call(c) -> if c.callee == Root(Named(b"m.add")) {
+              acc.push({ reps: c.conv.reps, answer: c.conv.answer })
+            } else { acc },
+            _ -> acc,
+          }),
+        [{ reps: [RInt, RInt], answer: RInt }],
+      ),
+  };
+  match form(b"handed") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) ->
+      assert_eq(
+        vals_in(f.body).fold([], |acc: List<List<Rep>>, v: Val|
+          match v { Call(c) -> acc.push(c.conv.reps.push(c.conv.answer)), _ -> acc }),
+        [[RWord, RWord]],
+      ),
+  }
+}
+
+test "a call of a generic definition is the body's generic call at the reference's type arguments" {
+  match form(b"ident_int") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(f.links.generics, [{ callee: b"m.ident", args: [b"Int"], carried: [0], fns: [] }]);
+      assert_eq(
+        vals_in(f.body).fold([], |acc: List<List<Rep>>, v: Val|
+          match v {
+            Call(c) -> if c.callee == Generic(0) { acc.push(c.conv.reps.push(c.conv.answer)) }
+            else { acc },
+            _ -> acc,
+          }),
+        [[RInt, RInt]],
+      )
+    },
+  };
+  // A word crosses as itself at any type, so the call carries no variable raw.
+  match form(b"ident_word") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) ->
+      assert_eq(f.links.generics, [
+        { callee: b"m.ident", args: [b"String"], carried: [], fns: [] },
+      ]),
+  }
+}
+
+test "a self call in tail position restarts the body, and a lambda's call of its root's definition calls it" {
+  match form(b"count") { Err(why) -> assert_eq(why, b""), Ok(f) -> assert(restarts(f.body), None) };
+  match form(b"counter") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> match closure_of(f, 0) {
+      None -> assert(false, Some("counter makes no closure")),
+      Some(c) -> {
+        assert(!restarts(c.body.body), None);
+        assert_eq(
+          vals_in(c.body.body).filter(|v: Val|
+            match v { Call(x) -> x.callee == Root(Named(b"m.count")), _ -> false }).len(
+          ),
+          1,
+        )
+      },
+    },
+  }
+}
+
+test "a lambda is a closure of a function of its own taking its captures as words, then its parameters" {
+  match form(b"adder") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(f.lambdas.len(), 1);
+      assert_eq(
+        vals_in(f.body).fold(
+          [],
+          |acc: List<{ captures: Int, params: Int, stacked: Bool, args: Int }>, v: Val|
+            match v {
+              Make(m) -> match m.made {
+                MClosure(c) -> if c.nth == 0 {
+                  acc.push({
+                    captures: c.captures,
+                    params: c.params,
+                    stacked: c.stacked,
+                    args: m.args.len(),
+                  })
+                } else { acc },
+                _ -> acc,
+              },
+              _ -> acc,
+            },
+        ),
+        [{ captures: 1, params: 1, stacked: false, args: 1 }],
+      );
+      match closure_of(f, 0) {
+        None -> assert(false, Some("adder makes no closure")),
+        Some(c) -> {
+          assert_eq(c.captures, 1);
+          assert_eq(c.body.conv.reps, [RWord, RInt]);
+          assert_eq(c.body.conv.answer, RInt);
+          // The captured `Int` is opened where the body starts, so the body adds two `Int`s.
+          assert_eq(
+            vals_in(c.body.body).filter(|v: Val|
+              match v { Pack(k) -> k.to == RInt, _ -> false }).len(
+            ),
+            1,
+          )
+        },
+      }
+    },
+  }
+}
+
+test "a lambda a lambda writes is the root's next closure, numbered in the order they are written" {
+  match form(b"nested") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(f.lambdas.len(), 2);
+      match closure_of(f, 0) {
+        None -> assert(false, Some("nested makes no closure")),
+        Some(outer) ->
+          assert_eq(
+            vals_in(outer.body.body).fold([], |acc: List<{ nth: Int, captures: Int }>, v: Val|
+              match v {
+                Make(m) -> match m.made {
+                  MClosure(c) -> acc.push({ nth: c.nth, captures: c.captures }),
+                  _ -> acc,
+                },
+                _ -> acc,
+              }),
+            [{ nth: 1, captures: 2 }],
+          ),
+      }
+    },
+  }
+}
+
+test "a definition named as a value is the unit's closure over its entry, and a pure one of no parameters is read once" {
+  match form(b"named") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) ->
+      assert_eq(
+        vals_in(f.body).filter(|v: Val|
+          match v {
+            Op(o) -> o.op == OCalling(EntryValue({ callee: Root(Named(b"m.add")), arity: 2 })),
+            _ -> false,
+          }).len(
+        ),
+        1,
+      ),
+  };
+  match form(b"read_kept") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      let vs = vals_in(f.body);
+      assert_eq(
+        vs.filter(|v: Val|
+          match v {
+            Op(o) -> o.op == OCalling(ConstantRead(Root(Named(b"m.kept")))),
+            _ -> false,
+          }).len(
+        ),
+        1,
+      );
+      // The kept word is opened to the `Int` it holds.
+      assert_eq(vs.filter(|v: Val| match v { Pack(k) -> k.to == RInt, _ -> false }).len(), 1);
+      assert_eq(vs.filter(|v: Val| match v { Call(_) -> true, _ -> false }).len(), 0)
+    },
+  }
+}
+
+test "a lambda handed where its callee lends it lies on the caller's stack, and the call is settled with it" {
+  match form(b"lends") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      let vs = vals_in(f.body);
+      assert_eq(
+        vs.fold([], |acc: List<Bool>, v: Val|
+          match v {
+            Make(m) -> match m.made { MClosure(c) -> acc.push(c.stacked), _ -> acc },
+            _ -> acc,
+          }),
+        [true],
+      );
+      assert_eq(f.links.generics, [
+        {
+          callee: b"m.apply_to",
+          args: [b"Int"],
+          carried: [0],
+          fns: [{ param: 0, owner: b"m.lends", nth: 0 }],
+        },
+      ]);
+      assert_eq(
+        vs.filter(|v: Val| match v { Call(c) -> c.callee == Generic(0), _ -> false }).len(),
+        1,
+      )
+    },
+  }
+}
+
+test "a function value is applied through the convention its type has, and the parameter is noted as called" {
+  match form(b"applied") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(
+        vals_in(f.body).fold([], |acc: List<List<Rep>>, v: Val|
+          match v { Apply(a) -> acc.push(a.conv.reps.push(a.conv.answer)), _ -> acc }),
+        [[RInt, RInt]],
+      );
+      assert_eq(f.links.called, [0])
+    },
+  }
+}
+
+test "a lambda a let binds and a call runs in place reads its captures off its closure" {
+  match form(b"local") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      let vs = vals_in(f.body);
+      assert_eq(vs.filter(|v: Val| match v { Apply(_) -> true, _ -> false }).len(), 0);
+      assert_eq(
+        vs.filter(|v: Val| match v { Op(o) -> o.op == OCalling(Ticked), _ -> false }).len(),
+        1,
+      );
+      assert_eq(
+        vs.filter(|v: Val| match v { Get(g) -> g.path == PCapture(0), _ -> false }).len(),
+        1,
+      )
+    },
+  }
+}
+
+test "a step iterate runs is a loop over its state and budget, each pass going on or leaving as its Iter says" {
+  match form(b"stepped") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> match f.body.fold(None, |acc: Option<Inst>, i: Inst|
+        match i { Loop(_) -> Some(i), _ -> acc }) {
+      Some(Loop(l)) -> {
+        assert_eq(l.state.map(|v: Var| v.rep), [RInt, RInt]);
+        assert_eq(l.answer.rep, RInt);
+        // The pass ends testing the `Iter` the step answered: a `Continue` goes on, a `Stop` leaves.
+        match l.body.at(l.body.len() - 1) {
+          Some(Case(c)) -> {
+            assert_eq(c.test, TTag([b"Continue", b"Stop"]));
+            assert_eq(
+              c.arms.map(|a: { when: Int, body: Block }|
+                match a.body.at(a.body.len() - 1) {
+                  Some(Next(_)) -> 0,
+                  Some(Done(_)) -> 1,
+                  _ -> 2,
+                }),
+              [0, 1],
+            )
+          },
+          other -> assert_eq(other, None),
+        }
+      },
+      _ -> assert(false, Some("the step is no loop")),
+    },
+  }
+}
+
+/// The corpus's roots `names` lowered as one tail group, or why not.
+fn group_form(names: List<Bytes>) -> Result<Fn, Bytes> / {abort.raise} =
+  match program_of(corpus()) {
+    Err(why) -> Err(why),
+    Ok(p) -> {
+      let members = names.fold([], |acc: List<GroupMember>, n: Bytes|
+        match range(0, p.roots.len()).fold(None, |found: Option<GroupMember>, i: Int|
+            match p.roots.at(i) {
+              Some(r) -> if r.full != qualify(b"m", n) { found } else {
+                match r.code {
+                  Some(code) -> {
+                    let body = known_body(r.full, r.params, code);
+                    Some({ cx: context_of(p.setting, r, body), body: body })
+                  },
+                  None -> found,
+                }
+              },
+              None -> found,
+            }) {
+          Some(m) -> acc.push(m),
+          None -> acc,
+        });
+      match lowered_group(members) { Ok(f) -> Ok(f), Err(no) -> Err(no.why) }
+    },
+  }
+
+/// Every instruction `b` holds, its branches' and cases' too.
+fn insts_in(b: Block) -> List<Inst> =
+  b.fold([], |acc: List<Inst>, i: Inst|
+    match i {
+      If(x) -> acc.push(i).concat(insts_in(x.then)).concat(insts_in(x.otherwise)),
+      Case(c) ->
+        c.arms.fold(
+          acc.push(i).concat(insts_in(c.rest)),
+          |a: List<Inst>, arm: { when: Int, body: Block }| a.concat(insts_in(arm.body)),
+        ),
+      _ -> acc.push(i),
+    })
+
+test "a tail group is one root whose case runs each member, a tail call into another member entering it" {
+  match group_form([b"even", b"odd"]) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(f.members.map(|m: Member| m.key), [Named(b"m.even"), Named(b"m.odd")]);
+      assert_eq(f.members.map(|m: Member| m.params.map(|v: Var| v.rep)), [[RInt], [RInt]]);
+      assert_eq(
+        insts_in(f.body).fold([], |acc: List<Int>, i: Inst|
+          match i { Enter(e) -> acc.push(e.member), _ -> acc }),
+        [1, 0],
+      );
+      assert_eq(
+        insts_in(f.body).filter(|i: Inst| match i { Restart(_) -> true, _ -> false }).len(),
+        0,
+      )
+    },
+  }
+}
+
+test "every root of the calling corpus lowers and keeps the form's rules, or another family declines it" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let failed = names().fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
+        match lowered_as_built(p, n) {
+          Err(no) -> if no.by != Calling { acc } else { acc.push({ name: n, why: no.why }) },
+          Ok(f) -> match verified(owned(f)) {
+            Some(why) -> acc.push({ name: n, why: why }),
+            None -> acc,
+          },
+        });
+      assert_eq(failed, [])
+    },
+  }
+}
+
+/// The closures' functions of root `symbol`'s C `text`, each but for its body: its declaration,
+/// head and step checks, its entries and its descriptor.
+fn closures_framed(text: Bytes, symbol: Bytes) -> List<Bytes> / {abort.raise} = {
+  let lines = text.split(b"\n");
+  let first = Bytes::concat_all([b"Word ", symbol, b"_lambda"]);
+  match range(0, lines.len()).fold(None, |acc: Option<Int>, i: Int|
+      match acc {
+        Some(_) -> acc,
+        None -> if lines.get(i).starts_with(first) { Some(i) } else { None },
+      }) {
+    None -> [],
+    Some(s) ->
+      lines.drop(s).fold(
+        { inside: false, out: [] },
+        |acc: { inside: Bool, out: List<Bytes> }, l: Bytes|
+          if l == b"  ctx->fuel -= 1;" { { inside: true, out: acc.out.push(l) } }
+          else if l == b"}" { { inside: false, out: acc.out.push(l) } }
+          else if acc.inside { acc }
+          else { { ..acc, out: acc.out.push(l) } },
+      ).out,
+  }
+}
+
+test "a closure's function, its entries and its descriptor print as today's emitter writes them" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let roots = [b"adder", b"doubler", b"nested", b"counter", b"local", b"lends"];
+      let today = answered_today(p, roots);
+      let differing = roots.fold(
+        [],
+        |acc: List<{ name: Bytes, today: List<Bytes>, form: List<Bytes> }>, n: Bytes| {
+          let symbol = symbol_of(qualify(b"m", n));
+          let old = closures_framed(today_text(today, n), symbol);
+          let form = match lowered_as_built(p, n) {
+            Ok(f) -> closures_framed(printed_text(f), symbol),
+            Err(no) -> [no.why],
+          };
+          if old.len() > 0 && form == old { acc }
+          else { acc.push({ name: n, today: old, form: form }) }
+        },
+      );
+      assert_eq(differing, [])
+    },
+  }
+}

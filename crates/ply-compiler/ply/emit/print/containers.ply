@@ -1,13 +1,980 @@
 //! Lists and arrays made, and the operations on a container's cells, printed.
 
-import emit.tir (Var, Arg, Made, Uses)
-import emit.tir.containers (ContainerOp)
-import emit.print.text (Printing, Place, line)
+import std.bytes (ascii_of_int)
+import parsing (span_between)
+import types (TyCon)
+import layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt, NodeLen, LeafAt,
+               KidAt, TailPush, TailSet, LeafSet, TailStart, NewBranch, MapRoot, NodeCount,
+               MapHeight, NodeKey, NodeValue, NodeKid, KidMax, KidSize, NewLeaf, NewMapBranch,
+               PairPut, PairSet, KidBack, KidPut, KidDrop, layouts)
+import emit (builtin_helper)
+import emit.pieces (Text, Hole, ShapeOf, spelled)
+import emit.tir (Rep, RInt, RNum, RFloat, RDec, RWord, Var, Arg, AVar, AInt, AZero, Made, MList,
+                 Uses, rep_of_arg)
+import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew,
+                            ArraySet, ArrayOfList, ArrayGet, Element, Bits, IntBits, WidthBits,
+                            FloatBits, DecimalBits)
+import emit.print.text (Printing, Place, printing, line, pad, pieces, temp, name_of, arg_text,
+                        assigned, site, check, shape_at)
+import emit.print.made (c_type, as_word, word_as)
 
 /// A list or an array made of `m.args`.
-pub fn contained(p: Place, pr: Printing, into: Option<Var>, m: { made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> }) -> Printing =
-  line(pr, p.depth, b"/* a container made, which this printer does not write yet */")
+pub fn contained(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  m: { made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> },
+) -> Printing / {abort.raise} =
+  match m.made {
+    MList(_) -> from_words(p, pr, into, b"rt_list_p", m.args),
+    _ -> line(pr, p.depth, b"/* an array made, which this printer does not write yet */"),
+  }
 
 /// Operation `op` on a container's cells over `args`.
-pub fn container_op(p: Place, pr: Printing, into: Option<Var>, op: ContainerOp, args: List<Arg>, uses: Uses) -> Printing =
-  line(pr, p.depth, b"/* a container's operation, which this printer does not write yet */")
+pub fn container_op(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  op: ContainerOp,
+  args: List<Arg>,
+  uses: Uses,
+) -> Printing / {abort.raise} = {
+  let object = operand(pr, args, 0);
+  let index = operand(pr, args, 1);
+  match into {
+    None -> line(pr, p.depth, b"/* a container's operation whose answer goes unread */"),
+    Some(v) -> match op {
+      Length ->
+        assigned(
+          pr,
+          p.depth,
+          v,
+          c_type(v.rep),
+          Bytes::concat_all([b"(int64_t)ply_obj(", object, b")->len"]),
+        ),
+      Elements ->
+        assigned(
+          pr,
+          p.depth,
+          v,
+          c_type(v.rep),
+          Bytes::concat_all([b"ply_array_len(", object, b")"]),
+        ),
+      ByteAt -> {
+        let tested = bounded(
+          p,
+          site(p, pr),
+          b"Bytes::at",
+          object,
+          args,
+          Bytes::concat_all([b"(uint64_t)", index, b" >= (uint64_t)ply_obj(", object, b")->len"]),
+        );
+        assigned(
+          tested,
+          p.depth,
+          v,
+          c_type(v.rep),
+          Bytes::concat_all([b"(int64_t)(ply_bytes(", object, b"))[", index, b"]"]),
+        )
+      },
+      U32At -> {
+        // Tested against the length less four: four added to a negative index could wrap into range.
+        let tested = bounded(
+          p,
+          site(p, pr),
+          b"Bytes::u32_le",
+          object,
+          args,
+          Bytes::concat_all([
+            b"(uint64_t)ply_obj(",
+            object,
+            b")->len < 4 || (uint64_t)",
+            index,
+            b" > (uint64_t)ply_obj(",
+            object,
+            b")->len - 4",
+          ]),
+        );
+        let w = temp(tested);
+        let loaded = line(
+          w.pr,
+          p.depth,
+          Bytes::concat_all([
+            b"uint32_t ",
+            w.name,
+            b"; memcpy(&",
+            w.name,
+            b", ply_bytes(",
+            object,
+            b") + ",
+            index,
+            b", 4);",
+          ]),
+        );
+        assigned(loaded, p.depth, v, c_type(v.rep), Bytes::concat_all([b"ply_le32(", w.name, b")"]))
+      },
+      Joined -> from_words(p, pr, into, b"rt_bytes_join_p", args),
+      Laid(i) -> laid_printed(p, pr, v, i, args),
+      ArrayNew(e) -> array_new(p, pr, v, e, args),
+      ArraySet(e) -> array_set(p, pr, v, e, args),
+      ArrayOfList(e) -> array_of_list(p, pr, v, e, args),
+      ArrayGet(e) -> array_get(p, pr, v, e, args),
+    },
+  }
+}
+
+/// Extern `op` written over the objects `layouts` lays out, answering into `v`. A read answers
+/// what the object holds without a count of its own, an item as `v` holds it; a write takes the
+/// object into `v`, made writable where another holds it too, and answers it.
+fn laid_printed(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Intrinsic,
+  args: List<Arg>,
+) -> Printing / {abort.raise} = {
+  let laid = layouts();
+  let o = operand(pr, args, 0);
+  let i = operand(pr, args, 1);
+  let raw = |e: Bytes| assigned(pr, p.depth, v, c_type(v.rep), e);
+  let read = |slot: Bytes| raw(word_as(slot, v.rep));
+  let header = |w: Bytes, field: Bytes| Bytes::concat_all([b"ply_obj(", w, b")->", field]);
+  let header_int = |field: Bytes| raw(Bytes::concat_all([b"(int64_t)", header(o, field)]));
+  let made = |kind: Int|
+    assigned(
+      pr,
+      p.depth,
+      v,
+      c_type(v.rep),
+      Bytes::concat_all([b"rt_node_p(ctx, ", ascii_of_int(kind), b")"]),
+    );
+  let held = assigned(pr, p.depth, v, c_type(v.rep), o);
+  let a = name_of(held, v);
+  let at = |k: Bytes| slot_of(a, k);
+  let written = |text: Bytes| line(held, p.depth, text);
+  let node_writable = Bytes::concat_all([a, b" = rt_node_writable_p(ctx, ", a, b");"]);
+  let shared = Bytes::concat_all([b"if (", header(a, b"rc"), b" != 1) ", node_writable, b" "]);
+  let shifted = |from: Bytes, n: Bytes, by: Bytes|
+    Bytes::concat_all([
+      b"memmove(&",
+      at(Bytes::concat_all([from, b" + ", by])),
+      b", &",
+      at(from),
+      b", (size_t)(",
+      n,
+      b") * sizeof(Word)); ",
+    ]);
+  let list_writable = |room: Bytes|
+    Bytes::concat_all([a, b" = rt_list_writable_p(ctx, ", a, b", ", room, b");"]);
+  let tail = |k: Bytes| at(past(laid.list.tail, k));
+  // A map's index is parenthesised where it is written into a larger index.
+  let index = Bytes::concat_all([b"(", i, b")"]);
+  let keys = |k: Bytes| past(laid.tree.keys, k);
+  let sizes = |k: Bytes| past(laid.tree.sizes, k);
+  let after = |less: Bytes|
+    Bytes::concat_all([b"(int64_t)", header(a, b"len"), b" - ", index, less]);
+  let pairs_writable = counted_writable(
+    a,
+    node_writable,
+    Bytes::concat_all([b"2 * (int64_t)", header(a, b"len")]),
+  );
+  let replaced = |q: Printing, writable: Bytes, slot: Bytes, x: Bytes| {
+    let old = temp(q);
+    line(
+      old.pr,
+      p.depth,
+      Bytes::concat_all([
+        writable,
+        b" Word ",
+        old.name,
+        b" = ",
+        slot,
+        b"; ",
+        slot,
+        b" = ",
+        x,
+        b"; ply_dec(ctx, ",
+        old.name,
+        b");",
+      ]),
+    )
+  };
+  match op {
+    OfList(ListStart) -> header_int(laid.list.start),
+    OfList(TailLen) -> header_int(laid.list.tail_len),
+    OfList(NodeLen) -> header_int(b"len"),
+    OfList(ListRoot) -> read(slot_of(o, ascii_of_int(laid.list.root))),
+    OfList(TailAt) -> read(slot_of(o, past(laid.list.tail, i))),
+    OfList(LeafAt) -> read(slot_of(o, past(0, i))),
+    OfList(KidAt) -> read(slot_of(o, past(0, i))),
+    OfList(NewBranch) -> made(laid.trie.branch),
+    OfList(TailPush) -> {
+      let room = header(a, laid.list.room);
+      let grown = written(
+        Bytes::concat_all([
+          b"{ int in_place = ",
+          header(a, b"rc"),
+          b" == 1; int64_t n = ",
+          header(a, laid.list.tail_len),
+          b"; if (!in_place || n == ",
+          room,
+          b") ",
+          list_writable(Bytes::concat_all([b"n == ", room, b" ? 2 * ", room, b" : ", room])),
+          b" rt_note_update_p(ctx, in_place, in_place ? 0 : n); }",
+        ]),
+      );
+      line(
+        grown,
+        p.depth,
+        Bytes::concat_all([
+          tail(header(a, laid.list.tail_len)),
+          b" = ",
+          operand(pr, args, 1),
+          b"; ",
+          header(a, laid.list.tail_len),
+          b" += 1; ",
+          header(a, b"len"),
+          b" += 1;",
+        ]),
+      )
+    },
+    OfList(TailStart) ->
+      written(
+        Bytes::concat_all([
+          tail(b"0"),
+          b" = ",
+          operand(pr, args, 1),
+          b"; ",
+          header(a, laid.list.tail_len),
+          b" = 1; ",
+          header(a, b"len"),
+          b" += 1;",
+        ]),
+      ),
+    OfList(TailSet) ->
+      replaced(
+        held,
+        counted_writable(
+          a,
+          list_writable(header(a, laid.list.room)),
+          header(a, laid.list.tail_len),
+        ),
+        tail(i),
+        operand(pr, args, 2),
+      ),
+    OfList(LeafSet) ->
+      replaced(
+        held,
+        counted_writable(a, node_writable, header(a, b"len")),
+        at(i),
+        operand(pr, args, 2),
+      ),
+    OfMap(MapRoot) -> read(slot_of(o, ascii_of_int(laid.map.root))),
+    OfMap(MapHeight) -> header_int(laid.map.height),
+    OfMap(NodeCount) -> header_int(b"len"),
+    OfMap(NodeKey) -> read(slot_of(o, Bytes::concat_all([b"2 * (", i, b")"]))),
+    OfMap(NodeValue) -> read(slot_of(o, Bytes::concat_all([b"2 * (", i, b") + 1"]))),
+    OfMap(NodeKid) -> read(slot_of(o, past(0, i))),
+    OfMap(KidMax) -> read(slot_of(o, past(laid.tree.keys, i))),
+    OfMap(KidSize) ->
+      raw(Bytes::concat_all([b"ply_imm_value(", slot_of(o, past(laid.tree.sizes, i)), b")"])),
+    OfMap(NewLeaf) -> made(laid.tree.leaf),
+    OfMap(NewMapBranch) -> made(laid.tree.branch),
+    OfMap(PairPut) -> {
+      let pair = Bytes::concat_all([b"2 * ", index]);
+      written(
+        Bytes::concat_all([
+          pairs_writable,
+          b" ",
+          shifted(pair, Bytes::concat_all([b"2 * (", after(b""), b")"]), b"2"),
+          at(pair),
+          b" = ",
+          operand(pr, args, 2),
+          b"; ",
+          at(pair.concat(b" + 1")),
+          b" = ",
+          operand(pr, args, 3),
+          b"; ",
+          header(a, b"len"),
+          b" += 1;",
+        ]),
+      )
+    },
+    OfMap(PairSet) -> {
+      let pair = Bytes::concat_all([b"2 * ", index]);
+      let old_key = temp(held);
+      let old_value = temp(old_key.pr);
+      line(
+        old_value.pr,
+        p.depth,
+        Bytes::concat_all([
+          pairs_writable,
+          b" Word ",
+          old_key.name,
+          b" = ",
+          at(pair),
+          b"; Word ",
+          old_value.name,
+          b" = ",
+          at(pair.concat(b" + 1")),
+          b"; ",
+          at(pair),
+          b" = ",
+          operand(pr, args, 2),
+          b"; ",
+          at(pair.concat(b" + 1")),
+          b" = ",
+          operand(pr, args, 3),
+          b"; ply_dec(ctx, ",
+          old_key.name,
+          b"); ply_dec(ctx, ",
+          old_value.name,
+          b");",
+        ]),
+      )
+    },
+    OfMap(KidBack) -> {
+      let old_max = temp(held);
+      line(
+        old_max.pr,
+        p.depth,
+        Bytes::concat_all([
+          shared,
+          b"Word ",
+          old_max.name,
+          b" = ",
+          at(keys(index)),
+          b"; ",
+          at(keys(index)),
+          b" = ",
+          operand(pr, args, 3),
+          b"; ply_dec(ctx, ",
+          old_max.name,
+          b"); ",
+          at(index),
+          b" = ",
+          operand(pr, args, 2),
+          b"; ",
+          at(sizes(index)),
+          b" = ply_imm(",
+          operand(pr, args, 4),
+          b");",
+        ]),
+      )
+    },
+    OfMap(KidPut) -> {
+      let n = after(b"");
+      written(
+        Bytes::concat_all([
+          shared,
+          shifted(index, n, b"1"),
+          shifted(keys(index), n, b"1"),
+          shifted(sizes(index), n, b"1"),
+          at(index),
+          b" = ",
+          operand(pr, args, 2),
+          b"; ",
+          at(keys(index)),
+          b" = ",
+          operand(pr, args, 3),
+          b"; ",
+          at(sizes(index)),
+          b" = ply_imm(",
+          operand(pr, args, 4),
+          b"); ",
+          header(a, b"len"),
+          b" += 1;",
+        ]),
+      )
+    },
+    OfMap(KidDrop) -> {
+      let n = after(b" - 1");
+      let next = index.concat(b" + 1");
+      written(
+        Bytes::concat_all([
+          shared,
+          b"ply_dec(ctx, ",
+          at(index),
+          b"); ply_dec(ctx, ",
+          at(keys(index)),
+          b"); ",
+          shifted(next, n, b"-1"),
+          shifted(keys(next), n, b"-1"),
+          shifted(sizes(next), n, b"-1"),
+          header(a, b"len"),
+          b" -= 1;",
+        ]),
+      )
+    },
+    _ ->
+      line(
+        pr,
+        p.depth,
+        b"/* a write in place answering a record, which this printer does not write yet */",
+      ),
+  }
+}
+
+fn slot_of(w: Bytes, at: Bytes) -> Bytes = Bytes::concat_all([b"ply_words(", w, b")[", at, b"]"])
+
+/// `at` words past the word `from`, as C reads it.
+fn past(from: Int, at: Bytes) -> Bytes = Bytes::concat_all([ascii_of_int(from), b" + (", at, b")"])
+
+/// Written ahead of a write of an item of the object `a`: `a` held once, by `writable`, its contents
+/// copied where it was not, and the write counted as in place or of a copy of `copied` words.
+fn counted_writable(a: Bytes, writable: Bytes, copied: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"{ int in_place = ply_obj(",
+    a,
+    b")->rc == 1; if (!in_place) ",
+    writable,
+    b" rt_note_update_p(ctx, in_place, in_place ? 0 : ",
+    copied,
+    b"); }",
+  ])
+
+/// The runtime's `make` over `words`, which it takes, laid in an array of them: C has no empty
+/// initialiser, so an empty one still declares a word.
+fn from_words(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  make: Bytes,
+  words: List<Arg>,
+) -> Printing / {abort.raise} = {
+  let arr = temp(pr);
+  let laid = line(
+    arr.pr,
+    p.depth,
+    Bytes::concat_all([
+      b"Word ",
+      arr.name,
+      b"[] = {",
+      if words.len() == 0 { b"0" } else { Bytes::join(words.map(|a: Arg| arg_text(pr, a)), b", ") },
+      b"};",
+    ]),
+  );
+  let call = Bytes::concat_all([
+    make,
+    b"(ctx, (Word)(intptr_t)",
+    arr.name,
+    b", ",
+    ascii_of_int(words.len()),
+    b")",
+  ]);
+  check(p, match into {
+    Some(v) -> assigned(laid, p.depth, v, c_type(v.rep), call),
+    None -> line(laid, p.depth, call.concat(b";")),
+  })
+}
+
+/// Where `outside` holds, the runtime's own call of builtin `name` over the object and the index as
+/// a word raises what the read would, and the function leaves.
+fn bounded(
+  p: Place,
+  pr: Printing,
+  name: Bytes,
+  object: Bytes,
+  args: List<Arg>,
+  outside: Bytes,
+) -> Printing / {abort.raise} = {
+  let index = match args.at(1) { Some(a) -> as_word(arg_text(pr, a), rep_of_arg(a)), None -> b"0" };
+  line(
+    pr,
+    p.depth,
+    Bytes::concat_all([
+      b"if (",
+      outside,
+      b") { ply_inc(",
+      object,
+      b"); ",
+      builtin_helper(name),
+      b"_p(ctx, ",
+      object,
+      b", ",
+      index,
+      b"); ",
+      p.leave,
+      b" }",
+    ]),
+  )
+}
+
+/// `Array::new(n, x)` into `v`: `n` elements as `e` lays them out, each `x`, which it takes. A
+/// length below zero or past what one array holds is the runtime's call to refuse.
+fn array_new(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  e: Element,
+  args: List<Arg>,
+) -> Printing / {abort.raise} = {
+  let n = operand(pr, args, 0);
+  let x = operand(pr, args, 1);
+  let d = p.depth;
+  let started = assigned(site(p, pr), d, v, c_type(v.rep), b"0");
+  let a = name_of(started, v);
+  let limit = ascii_of_int(min(67108864, 4294967295 / e.stride));
+  let to_runtime = line(
+    line(started, d, Bytes::concat_all([b"if (", n, b" < 0 || ", n, b" > ", limit, b") {"])),
+    d + 1,
+    Bytes::concat_all([
+      a,
+      b" = ",
+      builtin_helper(b"Array::new"),
+      b"_p(ctx, ",
+      as_word(n, RInt),
+      b", ",
+      element_word(e, x),
+      b");",
+    ]),
+  );
+  let laid = allocated({ ..p, depth: d + 1 }, line(to_runtime, d, b"} else {"), e, a, n);
+  let i = temp(laid);
+  let shared = if e.bits != None { i.pr } else {
+    line(
+      i.pr,
+      d + 1,
+      Bytes::concat_all([
+        b"if (",
+        n,
+        b" == 0) { ply_dec(ctx, ",
+        x,
+        b"); } else { for (int64_t ",
+        i.name,
+        b" = 1; ",
+        i.name,
+        b" < ",
+        n,
+        b"; ",
+        i.name,
+        b"++) ply_inc(",
+        x,
+        b"); }",
+      ]),
+    )
+  };
+  let filled = line(
+    shared,
+    d + 1,
+    Bytes::concat_all([
+      b"for (int64_t ",
+      i.name,
+      b" = 0; ",
+      i.name,
+      b" < ",
+      n,
+      b"; ",
+      i.name,
+      b"++) { ",
+      element_written(a, i.name, e, x),
+      b" }",
+    ]),
+  );
+  check(p, line(filled, d, b"}"))
+}
+
+/// `Array::set(xs, i, x)` into `v`: written in place where `xs` is held once and into a copy
+/// otherwise, each counted word of which is held once more. Takes `xs` and `x`; an index out of range
+/// is the runtime's call to refuse.
+fn array_set(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  e: Element,
+  args: List<Arg>,
+) -> Printing / {abort.raise} = {
+  let i = operand(pr, args, 1);
+  let x = operand(pr, args, 2);
+  let d = p.depth;
+  let started = assigned(site(p, pr), d, v, c_type(v.rep), operand(pr, args, 0));
+  let a = name_of(started, v);
+  let to_runtime = line(
+    line(
+      started,
+      d,
+      Bytes::concat_all([b"if ((uint64_t)", i, b" >= (uint64_t)ply_array_len(", a, b")) {"]),
+    ),
+    d + 1,
+    Bytes::concat_all([
+      a,
+      b" = ",
+      builtin_helper(b"Array::set"),
+      b"_p(ctx, ",
+      a,
+      b", ",
+      as_word(i, RInt),
+      b", ",
+      element_word(e, x),
+      b");",
+    ]),
+  );
+  let copy = temp(line(to_runtime, d, b"} else {"));
+  let j = temp(copy.pr);
+  let stride = ascii_of_int(e.stride);
+  let counts = if in_place(e) {
+    e.counted.map(|c: Int|
+      Bytes::concat_all([
+        b"ply_inc(ply_words(",
+        copy.name,
+        b")[",
+        j.name,
+        b" * ",
+        stride,
+        b" + ",
+        ascii_of_int(c),
+        b"]);",
+      ]))
+  } else { [Bytes::concat_all([b"ply_inc(ply_words(", copy.name, b")[", j.name, b"]);"])] };
+  let copied = line(
+    line(
+      j.pr,
+      d + 1,
+      Bytes::concat_all([
+        b"int in_place = ply_obj(",
+        a,
+        b")->rc == 1; int64_t n = ply_array_len(",
+        a,
+        b");",
+      ]),
+    ),
+    d + 1,
+    Bytes::concat_all([
+      b"if (!in_place) { PlyObj *o = ply_obj(",
+      a,
+      b"); Word ",
+      copy.name,
+      b" = rt_alloc_p(ctx, 15, o->len, o->layout, o->flags); ply_obj(",
+      copy.name,
+      b")->aux = o->aux; memcpy(ply_words(",
+      copy.name,
+      b"), ply_words(",
+      a,
+      b"), (size_t)(o->len + ((o->flags & PLY_MIXED) ? (o->len + 63) / 64 : 0)) * 8); for (int64_t ",
+      j.name,
+      b" = 0; ",
+      j.name,
+      b" < n; ",
+      j.name,
+      b"++) { ",
+      Bytes::concat_all(counts),
+      b" } ply_dec(ctx, ",
+      a,
+      b"); ",
+      a,
+      b" = ",
+      copy.name,
+      b"; }",
+    ]),
+  );
+  let noted = line(copied, d + 1, b"rt_note_update_p(ctx, in_place, in_place ? 0 : n);");
+  let dropped = if e.bits != None { noted }
+  else { line(noted, d + 1, Bytes::concat_all([b"ply_dec(ctx, ply_words(", a, b")[", i, b"]);"])) };
+  check(p, line(line(dropped, d + 1, element_written(a, i, e, x)), d, b"}"))
+}
+
+/// `Array::of_list(xs)` into `v`: each item of the list written as the array holds an element. Takes
+/// `xs`; a list longer than one array holds is the runtime's call to refuse.
+fn array_of_list(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  e: Element,
+  args: List<Arg>,
+) -> Printing / {abort.raise} = {
+  let l = operand(pr, args, 0);
+  let d = p.depth;
+  let count = temp(site(p, pr));
+  let n = count.name;
+  let started = assigned(
+    line(count.pr, d, Bytes::concat_all([b"int64_t ", n, b" = (int64_t)ply_obj(", l, b")->len;"])),
+    d,
+    v,
+    c_type(v.rep),
+    b"0",
+  );
+  let a = name_of(started, v);
+  let to_runtime = line(
+    line(
+      started,
+      d,
+      Bytes::concat_all([b"if (", n, b" > ", ascii_of_int(4294967295 / e.stride), b") {"]),
+    ),
+    d + 1,
+    Bytes::concat_all([a, b" = ", builtin_helper(b"Array::of_list"), b"_p(ctx, ", l, b");"]),
+  );
+  let laid = allocated({ ..p, depth: d + 1 }, line(to_runtime, d, b"} else {"), e, a, n);
+  let i = temp(laid);
+  let w = temp(i.pr);
+  let at = Bytes::concat_all([i.name, b" * ", ascii_of_int(e.stride)]);
+  let let_go = Bytes::concat_all([b" ply_dec(ctx, ", w.name, b");"]);
+  let stored = match e.bits {
+    Some(DecimalBits) ->
+      Bytes::concat_all([b"ply_set_dec(", a, b", ", at, b", ply_dec_of(", w.name, b"));", let_go]),
+    Some(FloatBits) ->
+      Bytes::concat_all([
+        b"ply_words(",
+        a,
+        b")[",
+        at,
+        b"] = ply_f64_bits(",
+        word_as(w.name, RFloat),
+        b");",
+        let_go,
+      ]),
+    Some(b) ->
+      Bytes::concat_all([
+        b"ply_words(",
+        a,
+        b")[",
+        at,
+        b"] = (Word)(",
+        word_as(w.name, bits_rep(b)),
+        b");",
+        let_go,
+      ]),
+    None -> element_written(a, i.name, e, w.name),
+  };
+  let filled = line(
+    line(
+      w.pr,
+      d + 1,
+      Bytes::concat_all([
+        b"for (int64_t ",
+        i.name,
+        b" = 0; ",
+        i.name,
+        b" < ",
+        n,
+        b"; ",
+        i.name,
+        b"++) { Word ",
+        w.name,
+        b" = rt_list_at_p(ctx, ",
+        l,
+        b", ",
+        i.name,
+        b"); ",
+        stored,
+        b" }",
+      ]),
+    ),
+    d + 1,
+    Bytes::concat_all([b"ply_dec(ctx, ", l, b");"]),
+  );
+  check(p, line(filled, d, b"}"))
+}
+
+/// `Array::get(xs, i)` into `v`: a bounds-tested load of the element as the array holds it, a
+/// scalar's bits as the scalar and any other as its word, held without a count of its own.
+fn array_get(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  e: Element,
+  args: List<Arg>,
+) -> Printing / {abort.raise} = {
+  let a = operand(pr, args, 0);
+  let i = operand(pr, args, 1);
+  let tested = line(
+    site(p, pr),
+    p.depth,
+    Bytes::concat_all([
+      b"if ((uint64_t)",
+      i,
+      b" >= (uint64_t)ply_array_len(",
+      a,
+      b")) { ply_inc(",
+      a,
+      b"); ",
+      builtin_helper(b"Array::get"),
+      b"_p(ctx, ",
+      a,
+      b", ",
+      as_word(i, RInt),
+      b"); ",
+      p.leave,
+      b" }",
+    ]),
+  );
+  let word = |at: Bytes| Bytes::concat_all([b"ply_words(", a, b")[", at, b"]"]);
+  assigned(tested, p.depth, v, c_type(v.rep), match e.bits {
+    Some(IntBits) -> Bytes::concat_all([b"(int64_t)(", word(i), b")"]),
+    Some(WidthBits(w)) -> Bytes::concat_all([b"(", c_type(RNum(w)), b")(", word(i), b")"]),
+    Some(FloatBits) -> Bytes::concat_all([b"ply_f64(", word(i), b")"]),
+    Some(DecimalBits) -> Bytes::concat_all([b"ply_dec_at(", a, b", (", i, b") * 2)"]),
+    None -> word(i),
+  })
+}
+
+/// The array `a`, a local already declared, made to hold `n` elements as `e` lays them out, for the
+/// caller to write: in place by their shape, the words a count is held in marked where only some
+/// are, and as words otherwise.
+fn allocated(p: Place, pr: Printing, e: Element, a: Bytes, n: Bytes) -> Printing / {abort.raise} =
+  if !in_place(e) {
+    line(pr, p.depth, Bytes::concat_all([a, b" = rt_alloc_p(ctx, 15, ", n, b", 0, 0);"]))
+  } else {
+    let stride = ascii_of_int(e.stride);
+    let mixed = e.counted.len() > 0;
+    let width = temp(pr);
+    let sized = line(
+      width.pr,
+      p.depth,
+      Bytes::concat_all([b"int64_t ", width.name, b" = ", n, b" * ", stride, b";"]),
+    );
+    let shape = shape_at(sized, e.shape);
+    let laid = line(
+      pieces(shape.pr, [
+        Text(Bytes::concat_all([pad(p.depth), a, b" = rt_alloc_p(ctx, 15, ", width.name, b", "])),
+        Hole(ShapeOf(shape.at)),
+        Text(if mixed { b", 6);\n" } else { b", 5);\n" }),
+      ]),
+      p.depth,
+      Bytes::concat_all([b"ply_obj(", a, b")->aux = ", stride, b";"]),
+    );
+    if !mixed { laid } else {
+      let i = temp(laid);
+      let opened = line(
+        line(
+          i.pr,
+          p.depth,
+          Bytes::concat_all([
+            b"memset(ply_words(",
+            a,
+            b") + ",
+            width.name,
+            b", 0, (size_t)((",
+            width.name,
+            b" + 63) / 64) * 8);",
+          ]),
+        ),
+        p.depth,
+        Bytes::concat_all([
+          b"for (int64_t ",
+          i.name,
+          b" = 0; ",
+          i.name,
+          b" < ",
+          n,
+          b"; ",
+          i.name,
+          b"++) {",
+        ]),
+      );
+      line(
+        e.counted.fold(opened, |q: Printing, c: Int|
+          line(
+            q,
+            p.depth + 1,
+            Bytes::concat_all([
+              b"{ int64_t b = ",
+              i.name,
+              b" * ",
+              stride,
+              b" + ",
+              ascii_of_int(c),
+              b"; ply_words(",
+              a,
+              b")[",
+              width.name,
+              b" + b / 64] |= (Word)1 << (b % 64); }",
+            ]),
+          )),
+        p.depth,
+        b"}",
+      )
+    }
+  }
+
+/// Whether an array holds elements laid out as `e` in its own words.
+fn in_place(e: Element) -> Bool = e.bits != None || e.shape.len() > 0
+
+/// Element `i` of the array `a` set to `x`, held as `e` holds an element, which the array takes.
+fn element_written(a: Bytes, i: Bytes, e: Element, x: Bytes) -> Bytes = {
+  let at = Bytes::concat_all([i, b" * ", ascii_of_int(e.stride)]);
+  match e.bits {
+    Some(DecimalBits) -> Bytes::concat_all([b"ply_set_dec(", a, b", ", at, b", ", x, b");"]),
+    Some(FloatBits) ->
+      Bytes::concat_all([b"ply_words(", a, b")[", at, b"] = ply_f64_bits(", x, b");"]),
+    Some(_) -> Bytes::concat_all([b"ply_words(", a, b")[", at, b"] = (Word)(", x, b");"]),
+    None -> Bytes::concat_all([b"ply_words(", a, b")[", i, b"] = ", x, b";"]),
+  }
+}
+
+/// An element `x` as the word the runtime's builtin takes: a scalar boxed.
+fn element_word(e: Element, x: Bytes) -> Bytes =
+  match e.bits { Some(b) -> as_word(x, bits_rep(b)), None -> x }
+
+fn bits_rep(b: Bits) -> Rep =
+  match b { IntBits -> RInt, WidthBits(w) -> RNum(w), FloatBits -> RFloat, DecimalBits -> RDec }
+
+fn operand(pr: Printing, args: List<Arg>, k: Int) -> Bytes =
+  match args.at(k) { Some(a) -> arg_text(pr, a), None -> b"0" }
+
+/// Where an instruction of a root answering a word is printed, at the body's own depth.
+fn at_top() -> Place =
+  {
+    u: {
+      symbol: b"ply_m_1f_1",
+      base: 0,
+      answer: RWord,
+      site: None,
+      arm: None,
+      looping: None,
+      landing: None,
+      group: None,
+    },
+    at: span_between(10, 20),
+    leave: b"return 0;",
+    depth: 0,
+  }
+
+fn local(id: Int, ty: Bytes, rep: Rep) -> Var =
+  { id: id, ty: TyCon({ name: ty, args: [] }), rep: rep }
+
+test "an empty list still lays out a word for C to initialise, and the list fails as an allocation does" {
+  let made = |args: List<Arg>|
+    spelled(
+      contained(
+        at_top(),
+        printing(Map::new().insert(0, b"p0")),
+        Some(local(1, b"List", RWord)),
+        { made: MList(args.len()), args: args, reuse: None, kept: [] },
+      ).out,
+    );
+  assert_eq(
+    made([]),
+    b"  Word t1[] = {0};\n  Word t2 = rt_list_p(ctx, (Word)(intptr_t)t1, 0);\n  if (ctx->failed) return 0;\n",
+  );
+  assert(
+    made([AVar(local(0, b"String", RWord)), AZero(RWord)]).index_of(b"[] = {p0, 0};") != None,
+    None,
+  )
+}
+
+test "an array of scalars is laid out by the shape of its element, which the unit's table numbers" {
+  let e = { bits: Some(IntBits), stride: 1, shape: [b"e!int"], counted: [] };
+  let pr = container_op(
+    at_top(),
+    printing(Map::new().insert(0, b"p0")),
+    Some(local(1, b"Array", RWord)),
+    ArrayNew(e),
+    [AVar(local(0, b"Int", RInt)), AInt(7)],
+    { takes: [false, true], owned: true, fails: true, stops: false },
+  );
+  let text = spelled(pr.out);
+  assert_eq(pr.shapes, [[b"e!int"]]);
+  assert(
+    text.index_of(b" = rt_alloc_p(ctx, 15, t2, @@s0@@, 5);") != None,
+    Some(String::of_bytes_lossy(text)),
+  );
+  // Each element is written as its bits, and a length past what an array holds goes to the runtime.
+  assert(
+    text.index_of(b"ply_words(t1)[t3 * 1] = (Word)(INT64_C(7));") != None,
+    Some(String::of_bytes_lossy(text)),
+  );
+  assert(
+    text.index_of(b"t1 = builtin_array_new_p(ctx, ") != None,
+    Some(String::of_bytes_lossy(text)),
+  )
+}
