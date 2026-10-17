@@ -1,0 +1,77 @@
+//! What every C function the form prints does as it starts, and what a body run in place of a call
+//! does for its step: spend a unit of fuel, count a tick, and move to a stack of its own where this
+//! thread's is nearly out.
+
+import std.bytes (ascii_of_int)
+import emit.tir (Rep, RWord)
+import emit.print.text (failing_return)
+import emit.print.made (c_type, word_as)
+
+/// The head of a function answering as `answer`: counts the call, spends a unit of fuel, and hands
+/// the call a stack of its own when this thread's is nearly out, re-entering `entry` with `words`;
+/// the same call on the new stack is counted once.
+pub fn fuel_head(entry: Bytes, words: List<Bytes>, answer: Rep) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); ",
+    failing_return(answer),
+    b" }\n",
+    b"  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { ",
+    grow_call(entry, words, answer),
+    b" } }\n",
+    b"  ",
+    tick_line(failing_return(answer)),
+    b"\n",
+    b"  ctx->fuel -= 1;\n",
+  ])
+
+/// A tick counted, the runtime's tick run when one is due, leaving by `leave` where it failed.
+pub fn tick_line(leave: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"if (++ctx->ticks >= ctx->next_tick) { rt_tick_p(ctx); if (ctx->failed) ",
+    leave,
+    b" }",
+  ])
+
+/// `entry` called on a stack of its own with `args` as its words, and its answer returned as a
+/// function answering as `answer` returns it.
+pub fn grow_call(entry: Bytes, args: List<Bytes>, answer: Rep) -> Bytes / {abort.raise} =
+  if args.len() == 0 {
+    grown_return(Bytes::concat_all([b"rt_grow_p(ctx, (Word)(intptr_t)&", entry, b", 0)"]), answer)
+  } else {
+    Bytes::concat_all([
+      b"Word ply_grown[",
+      ascii_of_int(args.len()),
+      b"];",
+      Bytes::concat_all(
+        range(0, args.len()).map(|i: Int|
+          Bytes::concat_all([b" ply_grown[", ascii_of_int(i), b"] = ", args.get(i), b";"])),
+      ),
+      b" ",
+      grown_return(
+        Bytes::concat_all([
+          b"rt_grow_p(ctx, (Word)(intptr_t)&",
+          entry,
+          b", (Word)(intptr_t)ply_grown)",
+        ]),
+        answer,
+      ),
+    ])
+  }
+
+/// The word the call `grown` answers returned as a function answering as `answer` returns it.
+pub fn grown_return(grown: Bytes, answer: Rep) -> Bytes =
+  match answer {
+    RWord -> Bytes::concat_all([b"return ", grown, b";"]),
+    _ ->
+      Bytes::concat_all([
+        b"Word ply_back = ",
+        grown,
+        b"; if (ctx->failed) ",
+        failing_return(answer),
+        b" ",
+        c_type(answer),
+        b" ply_out = ",
+        word_as(b"ply_back", answer),
+        b"; ply_dec(ctx, ply_back); return ply_out;",
+      ]),
+  }
