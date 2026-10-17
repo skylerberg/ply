@@ -5,7 +5,7 @@ use super::*;
 /// `Ctx::failed` when the fuel ran out.
 pub const FAILED_OUT_OF_FUEL: i64 = 2;
 
-/// A call that had to grow the stack could not be given one.
+/// A call would nest past what its stack holds, or a body or task could not be given a stack.
 pub const FAILED_OUT_OF_STACK: i64 = 3;
 
 /// A clause answered without resuming: `Ctx::unwind` carries its value to its `handle`.
@@ -396,6 +396,11 @@ pub(super) fn is_abort(effect: &str, op: &str) -> bool {
 }
 
 impl FrameClause {
+    /// Lets go of the clause's closure.
+    pub(crate) fn release(self) {
+        heap::dec(self.closure);
+    }
+
     /// `abort.raise` is a raise whatever its clause is marked: the runtime raises it itself.
     pub(super) fn raises(&self) -> bool {
         self.resumes == 3 || is_abort(self.effect.as_str(), self.op.as_str())
@@ -512,9 +517,7 @@ pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
 }
 
 pub(crate) fn drop_frame(f: HandlerFrame) {
-    for c in f.clauses {
-        heap::dec(c.closure);
-    }
+    f.clauses.into_iter().for_each(FrameClause::release);
     if f.ret != 0 {
         heap::dec(f.ret);
     }

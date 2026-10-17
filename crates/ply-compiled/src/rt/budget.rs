@@ -9,77 +9,121 @@ pub unsafe extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
     ctx.fail_with(FAILED_OUT_OF_FUEL, d);
 }
 
-/// What a growth that could not be given a stack raises: the one bound left is the platform's.
+/// What a call that would nest past its stack raises: the one bound left is the platform's.
 pub unsafe extern "C" fn rt_no_stack(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
     let d = error("this call would nest past what the native stack holds");
     ctx.fail_with(FAILED_OUT_OF_STACK, d);
 }
 
-/// The handover a grown call runs from: what to enter, with what, where its answer goes, and the
-/// stack pointer to come back to. It lives in [`rt_grow`]'s frame, which the new stack outlives.
-pub(super) struct Grown {
-    pub(super) ctx: *mut Ctx,
-    pub(super) entry: Entry,
-    pub(super) args: *const i64,
-    pub(super) answer: i64,
-    pub(super) back: usize,
+/// The prologue's slow path, for a frame below `ctx.stack_floor`: makes room below the floor of the
+/// stack it runs on and lowers the floor to match. Answers 1, or 0 with the context failed as
+/// [`rt_no_stack`] fails it, on a thread's own stack, whose floor is final, on a runtime stack whose
+/// reservation is spent, and on a stack the runtime does not know.
+pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
+    let here = 0u8;
+    let at = std::ptr::from_ref(&here) as usize;
+    let c = unsafe { &mut *ctx };
+    // A floor another context's growth or a restored frame left stale needs no system call.
+    let floor = stack_floor();
+    if at >= floor {
+        c.stack_floor = floor;
+        return 1;
+    }
+    if ply_core::limit::running_low(at).is_some() && ply_core::limit::extend_running() {
+        c.grown += 1;
+        c.stack_floor = stack_floor();
+        return 1;
+    }
+    unsafe { rt_no_stack(ctx) };
+    0
 }
 
-/// The new stack's first and only frame: the call, then back to whoever grew it. Nothing switches
-/// into this stack again, so where its own pointer lands is spent with it.
-pub(super) extern "C" fn run_grown(arg: usize) {
-    let g = arg as *mut Grown;
-    let (ctx, entry, args) = unsafe { ((*g).ctx, (*g).entry, (*g).args) };
-    let answer = unsafe { entry(ctx, args) };
+/// The slow path of the prologue an earlier emitter writes, which re-enters the call through
+/// `entry` with its arguments at `args`, both still held by the caller's frame: room is made as
+/// [`rt_stack_more`] makes it, and the call made again on the same stack.
+pub unsafe extern "C" fn rt_grow(ctx: *mut Ctx, entry: i64, args: i64) -> i64 {
+    if unsafe { rt_stack_more(ctx) } == 0 {
+        return 0;
+    }
+    // SAFETY: the emitter passes the address of a compiled function's own `(ctx, args)` entry.
+    let entry = unsafe { std::mem::transmute::<usize, Entry>(entry as usize) };
+    unsafe { entry(ctx, args as usize as *const i64) }
+}
+
+/// [`switch`] between two computations, each nesting on a stack of its own: returns when something
+/// switches back, with [`Ctx::fuel`] as this stack left it, whatever ran meanwhile, this stack the
+/// running one again and the floor its own.
+///
+/// # Safety
+/// As [`switch`], and `ctx` is the context both stacks run under.
+pub unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
+    let fuel = unsafe { (*ctx).fuel };
+    let running = ply_core::limit::running();
+    unsafe { switch(&mut *from, to) };
+    unsafe {
+        ply_core::limit::set_running(running);
+        (*ctx).fuel = fuel;
+        (*ctx).stack_floor = stack_floor();
+    }
+}
+
+/// Runs `call`, which begins compiled code, where that code can make room as it nests: here, on a
+/// stack the runtime knows, or else, on a segment a Rust recursion grew onto, on a runtime stack of
+/// its own for the call's duration. Answers 0 with the context failed when no stack can be had.
+pub fn on_known_stack<F: FnOnce() -> Word>(ctx: *mut Ctx, call: F) -> Word {
+    if let Some(floor) = floor_here() {
+        unsafe { (*ctx).stack_floor = floor };
+        return call();
+    }
+    let Some(stack) = Stack::take() else {
+        return no_stack_to_take(unsafe { &mut *ctx });
+    };
+    let mut hop = Hop {
+        ctx,
+        stack: &stack,
+        call: Some(call),
+        answer: 0,
+        back: 0,
+    };
+    let handover = &raw mut hop;
+    let sp = stack.prepare(hopped::<F>, handover as usize);
+    unsafe { switch_keeping(ctx, &raw mut (*handover).back, sp) };
+    unsafe { (*handover).answer }
+}
+
+/// What [`on_known_stack`] hands the stack it hops onto, from its own frame, which outlives the hop.
+struct Hop<'a, F> {
+    ctx: *mut Ctx,
+    stack: &'a Stack,
+    call: Option<F>,
+    answer: Word,
+    back: usize,
+}
+
+extern "C" fn hopped<F: FnOnce() -> Word>(arg: usize) {
+    let hop = arg as *mut Hop<'_, F>;
+    let call = unsafe {
+        (*(*hop).ctx).stack_floor = (*hop).stack.enter();
+        (*hop).call.take().expect("a hop runs its call once")
+    };
+    let answer = call();
     let to = unsafe {
-        (*g).answer = answer;
-        (*g).back
+        (*hop).answer = answer;
+        (*hop).back
     };
     let mut spent = 0;
     unsafe { switch(&mut spent, to) };
     std::process::abort();
 }
 
-/// The prologue's answer to a frame that would cross the floor: the call runs on a stack of its
-/// own, so how deep a program nests is the fuel's answer and never this thread's. `entry` is the
-/// callee's own `(ctx, args)` form and `args` its arguments, both still held by the caller's frame.
-pub unsafe extern "C" fn rt_grow(ctx: *mut Ctx, entry: i64, args: i64) -> i64 {
-    let Some(stack) = Stack::reserve() else {
-        unsafe { rt_no_stack(ctx) };
-        return 0;
-    };
-    let mut grown = Grown {
-        ctx,
-        // SAFETY: the emitter passes the address of a compiled function's own `(ctx, args)` entry.
-        entry: unsafe { std::mem::transmute::<usize, Entry>(entry as usize) },
-        args: args as usize as *const i64,
-        answer: 0,
-        back: 0,
-    };
-    let handover = &raw mut grown;
-    let sp = stack.prepare(run_grown, handover as usize);
-    let floor = {
-        let c = unsafe { &mut *ctx };
-        c.grown += 1;
-        std::mem::replace(&mut c.stack_floor, stack.floor())
-    };
-    let from = unsafe { &mut (*handover).back };
-    unsafe { switch(from, sp) };
-    let c = unsafe { &mut *ctx };
-    c.stack_floor = floor;
-    unsafe { (*handover).answer }
-}
-
-/// [`switch`] between two computations, each nesting on a stack of its own: returns when something
-/// switches back, with [`Ctx::fuel`] as this stack left it, whatever ran meanwhile.
-///
-/// # Safety
-/// As [`switch`], and `ctx` is the context both stacks run under.
-pub(crate) unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
-    let fuel = unsafe { (*ctx).fuel };
-    unsafe { switch(&mut *from, to) };
-    unsafe { (*ctx).fuel = fuel };
+/// Fails `c` for a stack the system would not map, as when too many bodies and tasks are suspended
+/// at once.
+pub(crate) fn no_stack_to_take(c: &mut Ctx) -> Word {
+    let d = error("the system would map no further stack").note(
+        "each live task, and each `handle` body whose clause resumes off the tail, holds one until it ends",
+    );
+    c.fail_with(FAILED_OUT_OF_STACK, d)
 }
 
 /// The callback the counter reaching [`Ctx::next_tick`] makes: the entry gets more work, or it
@@ -135,32 +179,39 @@ pub fn time_budget_ms() -> u64 {
     THREAD_TIME_BUDGET_MS.with(|t| t.get()).unwrap_or(0)
 }
 
-/// The stack of a thread that runs a program: the runtime recurses on the native stack, a compiled
-/// body honours its call bound there, and an unoptimised frame runs to kilobytes. Reserved, not
-/// committed. A `parallel` block's thread is one: a run's lane enters a whole test on it.
-pub const PROGRAM_STACK: usize = 256 << 20;
+/// The stack of a thread that runs a program, as large as a runtime stack can grow: the runtime
+/// recurses on the native stack, a compiled body honours its call bound there, and an unoptimised
+/// frame runs to tens of kilobytes. Reserved, not committed. A `parallel` block's thread is one: a
+/// run's lane enters a whole test on it.
+pub const PROGRAM_STACK: usize = crate::stack::RESERVE;
 
 /// Room below the floor for the runtime's frames and the deepest compiled frame itself.
-pub(crate) const STACK_MARGIN: usize = 512 * 1024;
+pub const STACK_MARGIN: usize = 512 * 1024;
 
-/// The floor a computation begun here runs under: this thread's, where it begins on the thread's
-/// own stack. On any other, one a call grew onto and a host call or a waiting block then began
-/// more work on, nothing here knows how deep that stack runs, so the floor is above every address
-/// and the first compiled frame takes a stack of its own.
-pub(crate) fn stack_floor() -> usize {
+/// The floor compiled code honours on the stack this frame is on: the running runtime stack's, or
+/// this thread's own. `None` on a stack the runtime does not know, a segment a Rust recursion grew
+/// onto.
+pub(crate) fn floor_here() -> Option<usize> {
     thread_local! {
         // Asked of the platform once per thread: it can be a `/proc` read.
         static OWN: (usize, usize) = stack_of_this_thread();
     }
     let here = 0u8;
     let at = std::ptr::from_ref(&here) as usize;
+    if let Some(low) = ply_core::limit::running_low(at) {
+        return Some(low + STACK_MARGIN);
+    }
     OWN.with(|&(bottom, top)| {
-        if (bottom..top).contains(&at) {
-            bottom.saturating_add(STACK_MARGIN)
-        } else {
-            usize::MAX
-        }
+        (bottom..top)
+            .contains(&at)
+            .then(|| bottom.saturating_add(STACK_MARGIN))
     })
+}
+
+/// [`floor_here`], or above every address on a stack the runtime does not know, where a probe then
+/// asks [`rt_stack_more`], which refuses.
+pub(crate) fn stack_floor() -> usize {
+    floor_here().unwrap_or(usize::MAX)
 }
 
 /// This thread's stack, from its lowest address to its top.

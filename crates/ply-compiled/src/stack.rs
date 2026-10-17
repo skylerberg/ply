@@ -1,46 +1,126 @@
 //! Stacks the runtime owns, and the [`switch`] between them: a suspended computation in the
-//! C backend is a C stack, and nothing emitted knows which stack it is on.
+//! C backend is a C stack, and nothing emitted knows which stack it is on. Each is one reservation
+//! that never moves, made writable from its top down as the computation on it goes deeper, so every
+//! frame keeps its address however deep it lies.
 
+use crate::rt::STACK_MARGIN;
 use crate::vm;
-use std::ptr;
+use ply_core::limit::{self, Reserved};
+use std::cell::{Cell, RefCell};
+use std::mem::ManuallyDrop;
+use std::ptr::{self, NonNull};
 
-/// Reserved per stack, mapped on first touch; a guard page below turns an overrun into a fault.
-pub const STACK_SIZE: usize = 8 * 1024 * 1024;
+/// The address space each stack reserves: 10,000 nested calls of frames past 100 KB each, so the
+/// fuel ends a recursion before its stack does.
+pub const RESERVE: usize = 1 << 30;
 
-const GUARD: usize = 16 * 1024;
+/// Made writable at a time, from the top down; a stack starts with one.
+pub const CHUNK: usize = 8 << 20;
 
-pub struct Stack {
-    base: *mut u8,
-    size: usize,
+/// Reserved below the stack and never made writable: a multiple of every page size (4, 16 and
+/// 64 KB), so the chunks above it start on a page.
+const GUARD: usize = 64 << 10;
+
+/// The stacks a thread keeps that never grew past their first chunk, for its next bodies and tasks.
+const POOLED: usize = 4;
+
+thread_local! {
+    static POOL: RefCell<Vec<Reservation>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A stack of the runtime's. Dropping it gives it back: to this thread's pool while it never grew
+/// past its first chunk, else to the system. Boxed, so the name the running stack goes by holds
+/// wherever the `Stack` moves.
+pub struct Stack(ManuallyDrop<Box<Reservation>>);
+
+struct Reservation {
+    base: usize,
+    /// The lowest writable address.
+    committed: Cell<usize>,
+}
+
+impl Reservation {
+    fn new() -> Option<Reservation> {
+        let base = unsafe { vm::reserve(GUARD + RESERVE) } as usize;
+        if base == 0 {
+            return None;
+        }
+        let r = Reservation {
+            base,
+            committed: Cell::new(base + GUARD + RESERVE),
+        };
+        r.extend().then_some(r)
+    }
+
+    fn top(&self) -> usize {
+        self.base + GUARD + RESERVE
+    }
+}
+
+impl Reserved for Reservation {
+    fn writable(&self) -> (usize, usize) {
+        (self.committed.get(), self.top())
+    }
+
+    fn extend(&self) -> bool {
+        let next = self.committed.get() - CHUNK;
+        if next < self.base + GUARD || !unsafe { vm::commit(next as *mut u8, CHUNK) } {
+            return false;
+        }
+        self.committed.set(next);
+        true
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        unsafe { vm::unmap(self.base as *mut u8, GUARD + RESERVE) };
+    }
 }
 
 impl Stack {
-    pub fn new() -> Stack {
-        Stack::reserve().expect("a task stack could not be reserved")
+    /// A stack of its own: one this thread gave back as it took it, or a new one with its first
+    /// chunk writable. `None` when the system maps no more.
+    pub fn take() -> Option<Stack> {
+        let pooled = POOL.try_with(|p| p.borrow_mut().pop()).ok().flatten();
+        let reservation = pooled.or_else(Reservation::new)?;
+        Some(Stack(ManuallyDrop::new(Box::new(reservation))))
     }
 
-    /// A stack of its own, or nothing when the platform would map no more.
-    pub fn reserve() -> Option<Stack> {
-        let size = STACK_SIZE + GUARD;
-        let base = unsafe { vm::map(size) };
-        if base.is_null() {
-            return None;
-        }
-        unsafe { vm::forbid(base, GUARD) };
-        Some(Stack { base, size })
-    }
-
-    /// The lowest address a compiled frame may begin at: the guard, then the Rust frames' margin.
+    /// The lowest address a compiled frame may begin at: what is writable, less the Rust frames'
+    /// margin.
     pub fn floor(&self) -> usize {
-        self.base as usize + GUARD + crate::rt::STACK_MARGIN
+        self.0.committed.get() + STACK_MARGIN
+    }
+
+    /// Makes the next chunk below writable, lowering the floor by as much; `false` once the
+    /// reservation is spent.
+    pub fn extend(&self) -> bool {
+        self.0.extend()
     }
 
     pub fn top(&self) -> usize {
-        self.base as usize + self.size
+        self.0.top()
     }
 
     pub fn holds(&self, address: usize) -> bool {
-        (self.base as usize..self.top()).contains(&address)
+        (self.0.base..self.top()).contains(&address)
+    }
+
+    /// Names this stack as the one this thread runs on, which a computation's first frame on it
+    /// does before anything else, and answers the floor compiled code honours there.
+    ///
+    /// # Safety
+    /// The stack outlives its time as the running one.
+    #[must_use]
+    pub unsafe fn enter(&self) -> usize {
+        unsafe { limit::set_running(Some(self.reserved())) };
+        self.floor()
+    }
+
+    fn reserved(&self) -> NonNull<dyn Reserved> {
+        let reservation: &(dyn Reserved + 'static) = &**self.0;
+        NonNull::from(reservation)
     }
 
     /// Lays out the frame the first [`switch`] pops, returning into a trampoline that calls
@@ -51,7 +131,7 @@ impl Stack {
     }
 
     /// The bytes live on this stack when `sp` is its stack pointer: from `sp` to the top. Nothing
-    /// when `sp` is not this stack's, as it is for a computation that grew onto another.
+    /// when `sp` is not this stack's, as it is for a computation that stopped on another.
     pub fn live(&self, sp: usize) -> Option<&[u8]> {
         if !self.holds(sp) {
             return None;
@@ -67,13 +147,19 @@ impl Stack {
 
 impl Drop for Stack {
     fn drop(&mut self) {
-        unsafe { vm::unmap(self.base, self.size) };
-    }
-}
-
-impl Default for Stack {
-    fn default() -> Stack {
-        Stack::new()
+        debug_assert!(
+            limit::running().is_none_or(|r| r.cast::<()>() != self.reserved().cast::<()>()),
+            "a stack was given back while this thread runs on it"
+        );
+        let reservation = *unsafe { ManuallyDrop::take(&mut self.0) };
+        if reservation.committed.get() == reservation.top() - CHUNK {
+            let _ = POOL.try_with(move |p| {
+                let mut pool = p.borrow_mut();
+                if pool.len() < POOLED {
+                    pool.push(reservation);
+                }
+            });
+        }
     }
 }
 

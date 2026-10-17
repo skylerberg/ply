@@ -31,7 +31,8 @@ pub struct Ctx {
     /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
     /// read it, so `metered` counts the same whether a constant was memoized or not. Not budgeted.
     pub charged: Cost,
-    /// Stacks this entry has been given beyond the one it started on, so growing is observable.
+    /// Chunks of stack this entry's calls made writable past what their stacks started with, so
+    /// growing is observable.
     pub grown: u64,
     /// When the running entry's time budget is spent, if it has one.
     pub(super) deadline: Option<std::time::Instant>,

@@ -392,33 +392,23 @@ pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64
     raise_error(ctx, d);
 }
 
-/// How far the base of the stack a helper runs on may sit from the one the entry's floor was
-/// taken from and still be that stack: a guard's width, and never a segment's.
-pub(super) const SAME_STACK: usize = 256 * 1024;
-
 /// A `(ctx, args)` entry the unit states of a type, called with one of its values. Takes `w`;
 /// `None` when the call failed, which the context then holds. A value is compared wherever it is
-/// read, which may be in frames that grew onto a segment the entry's floor knows nothing of: the
-/// call then runs on a stack of its own.
+/// read, which may be on a segment a Rust recursion grew onto: the call then runs on a stack of its
+/// own.
 pub(super) fn call_stated(ctx: *mut Ctx, entry: usize, w: Word) -> Option<Word> {
     call_stated_over(ctx, entry, &[w])
 }
 
 /// [`call_stated`] for an entry of any number of words. Takes each.
 pub(super) fn call_stated_over(ctx: *mut Ctx, entry: usize, args: &[Word]) -> Option<Word> {
-    let (floor, site) = {
+    let site = {
         let c = unsafe { &*ctx };
-        (c.stack_floor, (c.site_root, c.site_start, c.site_end))
+        (c.site_root, c.site_start, c.site_end)
     };
-    let on_entry_stack = ply_core::limit::stack_base()
-        .is_some_and(|base| base.abs_diff(floor.saturating_sub(STACK_MARGIN)) <= SAME_STACK);
-    let out = if on_entry_stack {
-        // SAFETY: `entry` is a taken root's address, which the unit keeps as long as its tables.
-        let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(entry) };
-        unsafe { f(ctx, args.as_ptr()) }
-    } else {
-        unsafe { rt_grow(ctx, entry as i64, args.as_ptr() as i64) }
-    };
+    // SAFETY: `entry` is a taken root's address, which the unit keeps as long as its tables.
+    let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(entry) };
+    let out = on_known_stack(ctx, || unsafe { f(ctx, args.as_ptr()) });
     let c = unsafe { &mut *ctx };
     if c.failed != 0 {
         return None;
