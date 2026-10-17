@@ -5,13 +5,13 @@
 //! A body that breaks one is refused, which fails a build.
 
 import emit.tir (Rep, RWord, RInt, RBool, RMaybe, RTagged, RFlat, RCases, RToken, Leaf, Var, Arg,
-                 AVar, AInt, ABool, Val, Call, Apply, Make, Pack, Gathered, Native, Op, Get, Static,
-                 Prim, PLeaf, PField, PArg, Made, MRecord, MCtor, MClosure, Inst, Let, Do, Decl,
-                 Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter, Fail,
-                 NoArm, Handle, Sited, Inc, Dec, Reset, Free, Opened, Block, Fn, Rooted, Lambda,
-                 Closure, Handed, Given, Lent, Convention, Answered, Owns, ReadsOf, Lasts, no_links,
-                 counted, operands, answered, fails, used_as, rep_of_arg, var_of, parts_of, Test,
-                 TTag)
+                 AVar, AInt, ABool, Val, Call, Apply, Make, Pack, Gathered, Native, Op, Get, Take,
+                 Static, Prim, Path, PLeaf, PField, PArg, Made, MRecord, MCtor, MClosure, Inst, Let,
+                 Do, Decl, Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter,
+                 Fail, NoArm, Handle, Sited, Inc, Dec, Reset, Free, Opened, Block, Fn, Rooted,
+                 Lambda, Closure, Handed, Given, Lent, Convention, Answered, Owns, ReadsOf, Lasts,
+                 no_links, counted, operands, answered, fails, used_as, rep_of_arg, var_of,
+                 parts_of, Test, TTag)
 import emit.keys (Named, Root)
 import types (TyCon)
 import parsing (dummy_span)
@@ -20,7 +20,8 @@ import std.bytes (ascii_of_int)
 /// What a path holds: the counts of each owned variable, the variable each borrowed one was read out
 /// of (`-1` for a constant or a lent parameter, which outlast the body), each join declared on it
 /// and whether it was set, the words of each value opened, the word each read of an opened
-/// value's counted leaf is, and the captures of each closure laid on this frame's stack.
+/// value's counted leaf is, the captures of each closure laid on this frame's stack, the fields
+/// taken out of each block, and the block each reuse token holds the cells of.
 type Holding = {
   owned: Map<Int, Int>,
   borrowed: Map<Int, Int>,
@@ -28,6 +29,8 @@ type Holding = {
   opened: Map<Int, List<Var>>,
   alias: Map<Int, Var>,
   stacks: Map<Int, List<Var>>,
+  taken: Map<Int, List<Path>>,
+  cells: Map<Int, Int>,
 }
 
 /// A walk so far: what the path holds, the first fault found, whether control reaches here, what
@@ -114,6 +117,8 @@ fn holding_params(params: List<Var>, conv: Convention) -> Holding =
       opened: Map::new(),
       alias: Map::new(),
       stacks: Map::new(),
+      taken: Map::new(),
+      cells: Map::new(),
     },
     |h: Holding, i: Int|
       match params.at(i) {
@@ -156,51 +161,65 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
   b.fold(w, |acc: Walk, i: Inst|
     if acc.fault != None || !acc.live { acc } else {
       match i {
-        Let(l) -> match token_in(read_args(l.val)) {
-          Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
-          None -> match word_read(acc, l.var, l.val) {
-            Some(w) -> w,
-            None -> match escaping(acc.h, l.val) {
-              Some(c) ->
-                faulted(
-                  acc,
-                  b"a closure on this frame's stack handed beyond the call it is lent to: v",
-                  c,
-                ),
-              None -> match stacked_captures(l.val) {
-                Some(caps) -> {
-                  let read = failing(cx, caps.fold(acc, held), l.val, l.unwind);
-                  {
-                    ..read,
-                    h: {
-                      ..read.h,
-                      stacks: read.h.stacks.insert(
-                        l.var.id,
-                        caps.fold([], |vs: List<Var>, a: Arg|
-                          match var_of(a) {
-                            Some(v) -> if counted(v.rep) { vs.push(v) } else { vs },
-                            None -> vs,
-                          }),
+        Let(l) -> match field_fault(
+            acc.h,
+            match cx.looped { Some(lp) -> lp.held, None -> Map::new() },
+            l.var,
+            l.val,
+          ) {
+          Some(f) -> faulted(acc, f.why, f.v),
+          None ->
+            noted_take(
+              match token_in(read_args(l.val)) {
+                Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
+                None -> match word_read(acc, l.var, l.val) {
+                  Some(w) -> w,
+                  None -> match escaping(acc.h, l.val) {
+                    Some(c) ->
+                      faulted(
+                        acc,
+                        b"a closure on this frame's stack handed beyond the call it is lent to: v",
+                        c,
                       ),
+                    None -> match stacked_captures(l.val) {
+                      Some(caps) -> {
+                        let read = failing(cx, used(acc, operands(l.val)), l.val, l.unwind);
+                        {
+                          ..read,
+                          h: {
+                            ..read.h,
+                            stacks: read.h.stacks.insert(
+                              l.var.id,
+                              caps.fold([], |vs: List<Var>, a: Arg|
+                                match var_of(a) {
+                                  Some(v) -> if counted(v.rep) { vs.push(v) } else { vs },
+                                  None -> vs,
+                                }),
+                            ),
+                          },
+                        }
+                      },
+                      None -> match held_otherwise(l.var, l.val) {
+                        Some(why) -> faulted(acc, why, l.var),
+                        None ->
+                          result(
+                            failing(cx, used(acc, operands(l.val)), l.val, l.unwind),
+                            l.var,
+                            answered(l.val),
+                          ),
+                      },
                     },
-                  }
-                },
-                None -> match held_otherwise(l.var, l.val) {
-                  Some(why) -> faulted(acc, why, l.var),
-                  None ->
-                    result(
-                      failing(cx, used(acc, operands(l.val)), l.val, l.unwind),
-                      l.var,
-                      answered(l.val),
-                    ),
+                  },
                 },
               },
-            },
-          },
+              l.val,
+            ),
         },
         Do(d) -> match token_in(read_args(d.val)) {
           Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
-          None -> if escaping(acc.h, d.val) != None {
+          None -> if taken_whole(acc.h, read_args(d.val)) != None {
+            { ..acc, fault: Some(b"a block used whole after a field was taken out of it") }
+          } else if escaping(acc.h, d.val) != None {
             {
               ..acc,
               fault: Some(b"a closure on this frame's stack handed beyond the call it is lent to"),
@@ -357,7 +376,9 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
           ),
         Handle(x) -> match token_in(x.args) {
           Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
-          None -> {
+          None -> if taken_whole(acc.h, x.args) != None {
+            { ..acc, fault: Some(b"a block used whole after a field was taken out of it") }
+          } else {
             let h = used(acc, used_as(x.args, x.uses));
             let across = h.h;
             let after = {
@@ -419,7 +440,14 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
           faulted(acc, b"cells kept as other than a reuse token: v", r.token)
         } else {
           let c = consumed(acc, r.of);
-          { ..c, h: { ..c.h, owned: c.h.owned.insert(r.token.id, 1) } }
+          {
+            ..c,
+            h: {
+              ..c.h,
+              owned: c.h.owned.insert(r.token.id, 1),
+              cells: c.h.cells.insert(r.token.id, r.of.id),
+            },
+          }
         },
         Free(r) -> if !is_token(r.of) {
           faulted(acc, b"a block freed that is no reuse token: v", r.of)
@@ -439,6 +467,107 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
         Sited(_) -> acc,
       }
     })
+
+/// Why `val`, bound to `y`, reads a block otherwise than the fields taken out of it allow: a field
+/// is taken only once, out of a block's word this body holds a count of and no loop around holds
+/// across its passes (`across`); once taken it is not read
+/// again or kept in the block's cells; and a block a field was taken out of is used only to read its
+/// other fields, test its constructor, or let it go.
+fn field_fault(
+  h: Holding,
+  across: Map<Int, Int>,
+  y: Var,
+  val: Val,
+) -> Option<{ why: Bytes, v: Var }> =
+  match val {
+    Take(t) -> if t.of.rep != RWord || !field_path(t.path) {
+      Some({ why: b"a field taken out of other than a block's word: v", v: t.of })
+    } else if count(h, t.of) == 0 {
+      Some({ why: b"a field taken out of a block this body does not hold: v", v: t.of })
+    } else if across.contains(t.of.id) {
+      Some({ why: b"a field taken out of a block a loop holds across its passes: v", v: t.of })
+    } else if taken_at(h, t.of, t.path) {
+      Some({ why: b"a field taken twice out of its block: v", v: t.of })
+    } else { None },
+    Get(g) -> if taken_at(h, g.of, g.path) {
+      Some({ why: b"a field read after it was taken out of its block: v", v: y })
+    } else { None },
+    Make(m) -> match m.reuse {
+      Some(t) -> match h.cells.get(t.id) {
+        Some(of) -> if kept_taken(m.made, m.kept, match h.taken.get(of) {
+            Some(ps) -> ps,
+            None -> [],
+          }) { Some({ why: b"a field kept in cells it was taken out of: v", v: y }) }
+        else { whole_fault(h, read_args(val)) },
+        None -> whole_fault(h, read_args(val)),
+      },
+      None -> whole_fault(h, read_args(val)),
+    },
+    _ -> whole_fault(h, read_args(val)),
+  }
+
+fn whole_fault(h: Holding, args: List<Arg>) -> Option<{ why: Bytes, v: Var }> =
+  match taken_whole(h, args) {
+    Some(v) -> Some({ why: b"a block used whole after a field was taken out of it: v", v: v }),
+    None -> None,
+  }
+
+/// The first of `args` a field was taken out of.
+fn taken_whole(h: Holding, args: List<Arg>) -> Option<Var> =
+  args.fold(None, |found: Option<Var>, a: Arg|
+    match found {
+      Some(_) -> found,
+      None -> match var_of(a) {
+        Some(v) -> match h.taken.get(v.id) {
+          Some(ps) -> if ps.len() > 0 { Some(v) } else { None },
+          None -> None,
+        },
+        None -> None,
+      },
+    })
+
+fn taken_at(h: Holding, of: Var, p: Path) -> Bool =
+  match h.taken.get(of.id) { Some(ps) -> ps.contains(p), None -> false }
+
+/// Whether `made` keeps in place a field one of `taken` names.
+fn kept_taken(made: Made, kept: List<Int>, taken: List<Path>) -> Bool =
+  kept.any(|k: Int|
+    taken.any(|p: Path|
+      match p {
+        PArg(a) -> a.at == k,
+        PField(f) -> match made { MRecord(r) -> r.names.at(k) == Some(f.name), _ -> false },
+        _ -> false,
+      }))
+
+/// Whether `p` reads a field at its offset in a block: what a `Take` may take.
+pub fn field_path(p: Path) -> Bool = match p { PField(_) -> true, PArg(_) -> true, _ -> false }
+
+/// `w` noting the field `val` takes, where it takes one and the path holds.
+fn noted_take(w: Walk, val: Val) -> Walk =
+  match val {
+    Take(t) -> if w.fault != None { w } else {
+      {
+        ..w,
+        h: {
+          ..w.h,
+          taken: w.h.taken.insert(t.of.id, match w.h.taken.get(t.of.id) {
+            Some(ps) -> ps.push(t.path),
+            None -> [t.path],
+          }),
+        },
+      }
+    },
+    _ -> w,
+  }
+
+/// The fields taken on either of two paths, each block's paths listed once.
+fn taken_either(a: Map<Int, List<Path>>, b: Map<Int, List<Path>>) -> Map<Int, List<Path>> =
+  b.fold(a, |m: Map<Int, List<Path>>, id: Int, ps: List<Path>|
+    m.insert(
+      id,
+      ps.fold(match m.get(id) { Some(qs) -> qs, None -> [] }, |qs: List<Path>, p: Path|
+        if qs.contains(p) { qs } else { qs.push(p) }),
+    ))
 
 /// A match arm's or its rest's state: what the path held at the miss before it, the borrowed values
 /// of the match's entry still readable.
@@ -467,7 +596,14 @@ fn joined(before: Walk, a: Walk, b: Walk) -> Walk =
             { ..a, fault: Some(b"the paths out of a branch hold different counts") }
           } else if a.h.joins != b.h.joins {
             { ..a, fault: Some(b"the paths out of a branch set different joins") }
-          } else { { ..a, h: { ..a.h, borrowed: before.h.borrowed }, missed: missed, done: done } }
+          } else {
+            {
+              ..a,
+              h: { ..a.h, borrowed: before.h.borrowed, taken: taken_either(a.h.taken, b.h.taken) },
+              missed: missed,
+              done: done,
+            }
+          }
         } else if a.live {
           { ..a, h: { ..a.h, borrowed: before.h.borrowed }, missed: missed, done: done }
         } else if b.live {
@@ -488,7 +624,9 @@ fn taken(w: Walk, a: Arg) -> Walk = match a { AVar(v) -> consumed(w, v), _ -> w 
 fn passed(w: Walk, a: Arg) -> Walk =
   match a {
     AVar(v) -> if is_token(v) { faulted(w, b"a reuse token read as a value: v", v) }
-    else if w.h.stacks.contains(v.id) {
+    else if taken_whole(w.h, [a]) != None {
+      faulted(w, b"a block used whole after a field was taken out of it: v", v)
+    } else if w.h.stacks.contains(v.id) {
       faulted(w, b"a closure on this frame's stack handed beyond the call it is lent to: v", v)
     } else { consumed(w, v) },
     _ -> w,
@@ -610,7 +748,7 @@ fn escaping(h: Holding, val: Val) -> Option<Var> =
 pub fn stacked_captures(val: Val) -> Option<List<Arg>> =
   match val {
     Make(m) -> match m.made {
-      MClosure(c) -> if c.stacked { Some(m.args) } else { None },
+      MClosure(c) -> if c.stacked { Some(m.args.take(c.captures)) } else { None },
       _ -> None,
     },
     _ -> None,
@@ -737,6 +875,7 @@ fn answers_count(v: Val) -> Bool =
     Call(c) -> counted(c.conv.answer),
     Apply(c) -> counted(c.conv.answer),
     Make(_) -> true,
+    Take(_) -> true,
     Pack(p) -> counted(p.to),
     Gathered(g) -> g.parts.any(|a: Arg| counted(rep_of_arg(a))),
     Native(n) -> n.uses.owned,
@@ -1187,6 +1326,47 @@ test "an opened value is its parts, each word counted on its own and read only b
   assert_eq(
     verified(root_of([w0], [], RWord, [Opened({ of: w0, words: [w2] }), Return(AVar(w2))])),
     Some(b"a value opened that is not held only here: v1"),
+  )
+}
+
+test "a field taken out of its block is never read again, nor the block used whole" {
+  let p = word(0);
+  let x = word(1);
+  let y = word(2);
+  let take = bind(x, Take({ of: p, path: PField({ name: b"f", at: 0 }) }), []);
+  assert_eq(verified(root_of([p], [], RWord, [take, Dec(p), Return(AVar(x))])), None);
+  assert_eq(
+    verified(
+      root_of([p], [], RWord, [
+        take,
+        bind(y, Get({ of: p, path: PField({ name: b"f", at: 0 }) }), []),
+        Dec(p),
+        Return(AVar(x)),
+      ]),
+    ),
+    Some(b"a field read after it was taken out of its block: v2"),
+  );
+  assert_eq(
+    verified(root_of([p], [], RWord, [take, Dec(x), Return(AVar(p))])),
+    Some(b"a block used whole after a field was taken out of it: v0"),
+  );
+  // Out of a block this body only borrows, the field would be taken from its holder.
+  assert_eq(
+    verified(root_of([p], [0], RWord, [take, Return(AVar(x))])),
+    Some(b"a field taken out of a block this body does not hold: v0"),
+  );
+  assert_eq(
+    verified(
+      root_of([p], [], RWord, [
+        Do({
+          val: Take({ of: p, path: PField({ name: b"f", at: 0 }) }),
+          at: dummy_span(),
+          unwind: [],
+        }),
+        Return(AVar(p)),
+      ]),
+    ),
+    Some(b"a value whose count nothing holds"),
   )
 }
 
