@@ -11,7 +11,7 @@ import emit.keys (Named)
 import emit.pieces (spelled)
 import emit.tir (Rep, RInt, RWord, Var, Arg, AVar, AInt, Prim, Pack, Make, MClosure, Op, OHandle,
                  Uses, Inst, Let, Assign, Return, Handle, Fn, Rooted, Given, Family, Handling,
-                 Calling, Scalars, Containers, Matching, no_links)
+                 Calling, Scalars, Containers, RFlat, Leaf, Get, Path, PLeaf, Closure, no_links)
 import emit.tir.handling (HandleOp, Perform, Label, Parallel, Simulate)
 import emit.lower.setting (Root)
 import emit.lower.base (Context, context_of, started, emitted, opened)
@@ -944,7 +944,18 @@ fn records() -> Bytes =
     b"fn kept(start: P) -> Int = handle { store.keep(start) } with { store.keep(p) -> p.x + p.y }\n",
   ])
 
-test "what an operation answers is read by its type, and a clause that takes a record waits on its closure" {
+/// The paths `body` reads out of `of`, in order.
+fn reads_of(body: List<Inst>, of: Var) -> List<Path> =
+  body.fold([], |acc: List<Path>, i: Inst|
+    match i {
+      Let(l) -> match l.val {
+        Get(g) -> if g.of.id == of.id { acc.push(g.path) } else { acc },
+        _ -> acc,
+      },
+      _ -> acc,
+    })
+
+test "what an operation answers and what its clause is handed are held as their types and read leaf by leaf" {
   match program_of(records()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
@@ -955,12 +966,34 @@ test "what an operation answers is read by its type, and a clause that takes a r
           other -> assert_eq(other.len(), 1),
         },
       };
-      match printed_by_form(p, b"summed") {
+      // The clause's closure takes the record the operation is handed as its leaves, and reads
+      // each field off its leaf.
+      match checked(p, b"kept") {
         Err(why) -> assert_eq(why, b""),
-        Ok(t) -> assert_eq(t.index_of(b"rt_field_p"), None),
+        Ok(f) -> match f.lambdas.at(0) {
+          Some(Closure(c)) -> match c.body.params.at(c.captures) {
+            None -> assert(false),
+            Some(handed) -> {
+              assert_eq(match handed.ty { TyRecord(fs) -> fs.len(), _ -> 0 }, 2);
+              assert_eq(
+                match handed.rep { RFlat(ls) -> Some(ls.map(|l: Leaf| l.rep)), _ -> None },
+                Some([RInt, RInt]),
+              );
+              assert_eq(reads_of(c.body.body, handed), [PLeaf(0), PLeaf(1)])
+            },
+          },
+          None -> assert(false),
+        },
       };
-      // A closure taking a record as its fields is the calling family's to lay out.
-      assert_eq(match formed(p, b"kept") { Ok(_) -> None, Err(no) -> Some(no.by) }, Some(Calling))
+      // Neither reads a field by its name at run time.
+      assert_eq(
+        [b"summed", b"kept"].map(|n: Bytes|
+          match printed_by_form(p, n) {
+            Ok(t) -> Ok(t.index_of(b"rt_field_p")),
+            Err(why) -> Err(why),
+          }),
+        [Ok(None), Ok(None)],
+      )
     },
   }
 }
