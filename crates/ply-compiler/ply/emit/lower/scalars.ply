@@ -10,13 +10,15 @@ import types (Type, TyVar, TyCon, TyRecord, TyNominal, TyFn, Field, named_type, 
 import typing (unknown_type)
 import parsing (Span)
 import std.bytes (ascii_of_int)
-import emit (Width, Ctors, SumCtor, Scalar, Exact, literal_bits, has_vars, type_vars)
+import emit (Width, Ctors, SumCtor, Scalar, Exact, Whole, Cases, KSum, literal_bits, has_vars,
+             type_vars)
 import emit.keys
 import emit.keys (RootKey, TypeOp, Root, Written, Order, Reflect, Shown, Digest, Contained)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases,
                  RSlice, RToken, Arg, AInt, ABool, AFloat, ANum, AChar, Val, Prim, Literal, Call,
                  Native, Given, Scalars, rep_of_arg, comparison, arithmetic, shift)
-import emit.lower.held (held_as)
+import emit.lower.setting (carrier_of)
+import emit.lower.held (held_as, carried_as)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound, bound_as, type_of, handed, noted)
 import emit.lower.data (constructed)
 
@@ -197,9 +199,22 @@ pub fn operated(cx: Context, st: Lowering, name: Bytes, args: List<Arg>, at: Spa
                 at,
               )
             },
-            None -> if name == b"digest" || name.starts_with(b"checked_")
-                || name == b"?stated_witness" { by_runtime_only(st, name) }
-            else { refuse(st, Scalars, b"a builtin no scalar's: ".concat(name)) },
+            None -> if name == b"digest" { by_runtime_only(st, name) }
+            else if name.starts_with(b"checked_") {
+              refuse(
+                st,
+                Scalars,
+                b"a width's checked arithmetic, whose `Option` waits on `data`'s constructors: ".concat(
+                  name,
+                ),
+              )
+            } else if name == b"?stated_witness" {
+              refuse(
+                st,
+                Scalars,
+                b"a stated witness, which names a constructor's tag no operand holds",
+              )
+            } else { refuse(st, Scalars, b"a builtin no scalar's: ".concat(name)) },
           },
         }
       }
@@ -385,16 +400,20 @@ fn rooted(
         },
       },
   );
-  bound_as(
-    given.st,
-    ty,
-    answer,
-    Call({
-      callee: Root(key),
-      args: given.args,
-      conv: { params: given.args.map(|_: Arg| Given), reps: reps, answer: answer },
-      stops: false,
-    }),
+  handed(
+    bound_as(
+      given.st,
+      ty,
+      answer,
+      Call({
+        callee: Root(key),
+        args: given.args,
+        conv: { params: given.args.map(|_: Arg| Given), reps: reps, answer: answer },
+        stops: false,
+      }),
+      at,
+    ),
+    held_as(cx.setting, ty),
     at,
   )
 }
@@ -534,13 +553,10 @@ fn written(cx: Context, st: Lowering, op: TypeOp, ty: Type, a: Arg, at: Span) ->
   )
 
 fn taken_as(ty: Type) -> Rep =
-  if is_option(ty) { RMaybe } else {
-    match ty {
-      TyCon(c) -> if c.name == b"Result"
-          && (match c.args.at(1) { Some(e) -> always_object(e), None -> false }) { RTagged }
-      else { RWord },
-      _ -> RWord,
-    }
+  match carrier_of(ty) {
+    Whole(KSum(s)) -> carried_as(Whole(KSum(s))),
+    Cases(c) -> carried_as(Whole(KSum(c.spec))),
+    _ -> RWord,
   }
 
 /// A width's wrapping or saturating builtin at the type its operands hold, in C where a register
@@ -759,21 +775,6 @@ fn walked_container(t: Type) -> Bool =
 
 fn is_result(t: Type) -> Bool =
   !has_vars(t) && (match t { TyCon(c) -> c.name == b"Result" && c.args.len() == 2, _ -> false })
-
-fn always_object(t: Type) -> Bool =
-  match t {
-    TyRecord(_) -> true,
-    TyNominal(_) -> true,
-    TyFn(_) -> true,
-    TyCon(c) ->
-      c.name.index_of(b".") != None || c.name == b"Result" || c.name == b"Bytes"
-        || c.name == b"String"
-        || c.name == b"List"
-        || c.name == b"Map"
-        || c.name == b"Array"
-        || c.name == b"Columns",
-    _ -> false,
-  }
 
 /// Whether two values of the type `name` compare as the constructors of a sum the program declares
 /// do: not an `Option` or a `Result`, not a type whose module states a `key`, and, where no module
