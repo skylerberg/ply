@@ -87,14 +87,14 @@ pub fn printed_text(f: Fn) -> Bytes / {abort.raise} = {
 }
 
 /// What today's emitter answers for the roots `m.<name>` of `p` that `names` name, handed the
-/// program's constructors as the form is.
+/// program's constructors and the builtins its runtime implements as the form is.
 pub fn answered_today(p: Program, names: List<Bytes>) -> List<RootAnswer> / {abort.raise} = {
   let d = dump_of(Analysed(p.analysis));
   emit_roots_answer(
     [b"m"],
     [p.src],
     p.setting.ctors,
-    [],
+    p.setting.builtins,
     names.map(|n: Bytes| qualify(b"m", n)),
     [],
     [],
@@ -228,20 +228,48 @@ fn call_spelled(g: GenericCall) -> Bytes =
   ])
 
 /// `text` as a list of lines, read past what two printers may write differently for one
-/// computation:
+/// computation, each C function on its own (a line at column 0 ending in `{` opens one, a `}` at
+/// column 0 closes it), so its temporaries and copies are its own:
 /// - a blank line is dropped;
-/// - `Word` is the `int64_t` it is defined as;
+/// - `Word`, `PlyMaybe` and `PlyTagged` are the `int64_t` they are defined as, `INT64_C(n)` is `n`,
+///   and a label's `name:;` is `name: ;`;
+/// - today's names for a record parameter's word, `p<i>_w`, and a sum parameter's index and leaves,
+///   `p<i>` and `p<i>_<k>`, are the form's: the part after the record's leaves, and the sum's parts
+///   from `p<i>_0` on;
+/// - a declaration of zero the next line assigns, not reading it, declares what is assigned;
 /// - a temporary (or a part `t<n>_<k>` of one held as several C values) declared from another local
-///   or a literal (a field name's entry among them) and never assigned again is read as what it
-///   copies, unless what it copies is assigned after it;
-/// - a temporary or a part declared from what calls nothing and never read again is dropped;
+///   or a literal (a field name's or a tag's hole among them) and never assigned again is read as
+///   what it copies, unless what it copies is assigned after it;
 /// - lines after a restart's `goto` in its block are dropped;
-/// - the temporaries `t<n>` (a part with its temporary), the landings `land_<n>` and `ply_h<n>`, and
-///   any hole of a table no entry was spelled for are renumbered in the order they first appear,
-///   each kind apart.
-pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} = {
-  let lines = text.split(b"\n").filter(|l: Bytes| trimmed(l) != b"").map(|l: Bytes|
-    renamed(l, Map::new().insert(b"Word", b"int64_t")));
+/// - a temporary nothing reads goes with each write of it that calls nothing, and then any
+///   temporary only those writes read, so a chain of copies nothing reads goes whole;
+/// - the temporaries `t<n>` (a part with its temporary), the landings (today's `land_<n>` and the
+///   form's `ply_h<n>` alike), and any hole of a table no entry was spelled for are renumbered in
+///   the order they first appear, each kind apart.
+pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} =
+  functions(text.split(b"\n").filter(|l: Bytes| trimmed(l) != b"")).fold(
+    [],
+    |out: List<Bytes>, f: List<Bytes>| out.concat(function_read(f)),
+  )
+
+/// `lines` cut into C functions, each from the line at column 0 ending in `{` that opens it to the
+/// `}` at column 0 that closes it, and the runs of lines between them.
+fn functions(lines: List<Bytes>) -> List<List<Bytes>> / {abort.raise} = {
+  let cut = lines.fold(
+    { done: [], open: [] },
+    |acc: { done: List<List<Bytes>>, open: List<Bytes> }, l: Bytes|
+      if indent(l) > 0 { { ..acc, open: acc.open.push(l) } }
+      else if l == b"}" { { done: acc.done.push(acc.open.push(l)), open: [] } }
+      else if l.ends_with(b"{") {
+        { done: if acc.open.len() == 0 { acc.done } else { acc.done.push(acc.open) }, open: [l] }
+      } else { { ..acc, open: acc.open.push(l) } },
+  );
+  if cut.open.len() == 0 { cut.done } else { cut.done.push(cut.open) }
+}
+
+/// One C function's lines, read as `normalised` says.
+fn function_read(function: List<Bytes>) -> List<Bytes> / {abort.raise} = {
+  let lines = assigned_once(today_parts(function.map(spelled_alike)));
   let writes = range(0, lines.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int|
     statements(trimmed(lines.get(i))).fold(m, |n: Map<Bytes, Int>, s: Bytes|
       match s.index_of(b" = ") {
@@ -279,11 +307,7 @@ pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} = {
       else { { out: acc.out.push(l), skip: 0 - 1 } }
     },
   ).out;
-  let mentions = live.fold(Map::new(), |m: Map<Bytes, Int>, l: Bytes|
-    idents(l).fold(m, |n: Map<Bytes, Int>, w: Bytes|
-      if temp_local(w) { n.insert(w, match n.get(w) { Some(k) -> k + 1, None -> 1 }) } else { n }));
-  let used = live.filter(|l: Bytes|
-    match unread_value(trimmed(l)) { Some(t) -> mentions.get(t) != Some(1), None -> true });
+  let used = unread_dropped(live);
   let numbering = used.fold({ names: Map::new(), counts: Map::new() }, |m: Numbering, l: Bytes|
     words(l).fold(m, |n: Numbering, w: { text: Bytes, ident: Bool }|
       if n.names.contains(w.text) { n } else {
@@ -307,6 +331,51 @@ pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} = {
       }));
   used.map(|l: Bytes| renamed(l, numbering.names))
 }
+
+/// A run of lines two texts differ in: today's lines there and the form's, either of which may be
+/// none.
+pub type Hunk = { today: List<Bytes>, form: List<Bytes> }
+
+/// Every run of lines `today` and `form`, each as `normalised` reads a text, differ in, in order:
+/// what lies outside the longest sequence of lines the two hold in common.
+pub fn hunks(today: List<Bytes>, form: List<Bytes>) -> List<Hunk> / {abort.raise} = {
+  let n = today.len();
+  let m = form.len();
+  // Row `n - i` holds, for each `j`, the longest common sequence of today's lines from `i` on and the
+  // form's from `j` on.
+  let rows = range(0, n).fold([range(0, m + 1).map(|_: Int| 0)], |rs: List<List<Int>>, k: Int| {
+    let below = rs.get(k);
+    let x = today.get(n - 1 - k);
+    rs.push(
+      range(0, m).fold([0], |row: List<Int>, r: Int| {
+        let j = m - 1 - r;
+        row.push(if form.get(j) == x { below.get(j + 1) + 1 } else {
+          let down = below.get(j);
+          let right = row.get(r);
+          if down > right { down } else { right }
+        })
+      }).reverse(
+      ),
+    )
+  });
+  let common = |i: Int, j: Int| rows.get(n - i).get(j);
+  let none = { today: [], form: [] };
+  let walked = range(0, n + m).fold(
+    { i: 0, j: 0, run: none, out: [] },
+    |s: { i: Int, j: Int, run: Hunk, out: List<Hunk> }, _: Int|
+      if s.i < n && s.j < m && today.get(s.i) == form.get(s.j) {
+        { i: s.i + 1, j: s.j + 1, run: none, out: with_run(s.out, s.run) }
+      } else if s.i < n && (s.j >= m || common(s.i + 1, s.j) >= common(s.i, s.j + 1)) {
+        { ..s, i: s.i + 1, run: { ..s.run, today: s.run.today.push(today.get(s.i)) } }
+      } else if s.j < m {
+        { ..s, j: s.j + 1, run: { ..s.run, form: s.run.form.push(form.get(s.j)) } }
+      } else { s },
+  );
+  with_run(walked.out, walked.run)
+}
+
+fn with_run(out: List<Hunk>, run: Hunk) -> List<Hunk> =
+  if run.today.len() == 0 && run.form.len() == 0 { out } else { out.push(run) }
 
 /// What a renumbering has named so far, and the next number of each kind.
 type Numbering = { names: Map<Bytes, Bytes>, counts: Map<Bytes, Int> }
@@ -341,16 +410,15 @@ fn temp_part(v: Bytes) -> Option<{ base: Bytes, k: Bytes }> / {abort.raise} =
   }
 
 /// How a word renumbered by first appearance is spelled around its number, and the number its kind
-/// starts at: a temporary from `t1`, the landings `land_0` and `ply_h0`, and a hole of a table no
-/// entry was spelled for from `@@c0@@`.
+/// starts at: a temporary from `t1`, a landing (today's `land_<n>` and the form's `ply_h<n>`, one
+/// kind) from `ply_h0`, and a hole of a table no entry was spelled for from `@@c0@@`.
 fn numbered_kind(
   w: { text: Bytes, ident: Bool },
 ) -> Option<{ lead: Bytes, close: Bytes, first: Int }> / {abort.raise} =
   if w.ident {
     if temp_name(w.text) { Some({ lead: b"t", close: b"", first: 1 }) }
-    else if w.text.starts_with(b"land_") && all_digits(w.text.slice(5, w.text.len())) {
-      Some({ lead: b"land_", close: b"", first: 0 })
-    } else if w.text.starts_with(b"ply_h") && all_digits(w.text.slice(5, w.text.len())) {
+    else if (w.text.starts_with(b"land_") && all_digits(w.text.slice(5, w.text.len())))
+        || (w.text.starts_with(b"ply_h") && all_digits(w.text.slice(5, w.text.len()))) {
       Some({ lead: b"ply_h", close: b"", first: 0 })
     } else { None }
   } else if w.text.starts_with(b"@@") && w.text.ends_with(b"@@") && w.text.len() > 4 {
@@ -359,14 +427,178 @@ fn numbered_kind(
     else { None }
   } else { None }
 
-/// The temporary `T tN = X;` declares, where `X` calls nothing (no `ctx` in it), so dropping the
-/// line where nothing reads `tN` changes nothing.
-fn unread_value(t: Bytes) -> Option<Bytes> / {abort.raise} =
-  match declared(t) {
-    Some(d) -> if temp_local(d.name) && d.value.index_of(b"ctx") == None { Some(d.name) }
-    else { None },
-    None -> None,
+/// `l` with each C type a word is defined as written `int64_t`, `INT64_C(n)` written `n`, and a
+/// label's `name:;` written `name: ;`.
+fn spelled_alike(l: Bytes) -> Bytes / {abort.raise} = {
+  let ws = words(l).map(|w: { text: Bytes, ident: Bool }| w.text);
+  let read = range(0, ws.len()).fold(
+    { out: [], skip: 0 },
+    |acc: { out: List<Bytes>, skip: Int }, i: Int|
+      if acc.skip > 0 { { ..acc, skip: acc.skip - 1 } } else {
+        match literal_at(ws, i) {
+          Some(lit) -> { out: acc.out.push(lit.text), skip: lit.words - 1 },
+          None -> { ..acc, out: acc.out.push(word_alike(ws.get(i))) },
+        }
+      },
+  ).out;
+  let s = Bytes::concat_all(read);
+  let t = trimmed(s);
+  if t.ends_with(b":;") && label_name(t.slice(0, t.len() - 2)) {
+    Bytes::concat_all([s.slice(0, indent(s)), t.slice(0, t.len() - 2), b": ;"])
+  } else { s }
+}
+
+fn word_alike(w: Bytes) -> Bytes =
+  if w == b"Word" || w == b"PlyMaybe" || w == b"PlyTagged" { b"int64_t" } else { w }
+
+/// The integer `INT64_C(n)` spells where it starts at word `i` of `ws`, and how many words it takes.
+fn literal_at(ws: List<Bytes>, i: Int) -> Option<{ text: Bytes, words: Int }> / {abort.raise} =
+  if ws.at(i) != Some(b"INT64_C") || ws.at(i + 1) != Some(b"(") { None } else {
+    let negative = ws.at(i + 2) == Some(b"-");
+    let at = if negative { i + 3 } else { i + 2 };
+    match ws.at(at) {
+      Some(d) -> if all_digits(d) && ws.at(at + 1) == Some(b")") {
+        Some({ text: if negative { b"-".concat(d) } else { d }, words: at + 2 - i })
+      } else { None },
+      None -> None,
+    }
   }
+
+fn label_name(x: Bytes) -> Bool / {abort.raise} =
+  x.len() > 0 && range(0, x.len()).all(|i: Int| is_ident_continue(x.at(i)))
+
+/// One C function's `lines` with today's names for a parameter's parts written as the form's, which
+/// names every part `p<i>_<k>`: a record's word `p<i>_w` as the part after its leaves, and a sum's
+/// index `p<i>` and leaves `p<i>_<k>` as its parts from `p<i>_0` on. A temporary's word `t<n>_w` is
+/// read as a parameter's is.
+fn today_parts(lines: List<Bytes>) -> List<Bytes> / {abort.raise} = {
+  let ids = lines.fold(Map::new(), |m: Map<Bytes, Bool>, l: Bytes|
+    idents(l).fold(m, |n: Map<Bytes, Bool>, w: Bytes| n.insert(w, true)));
+  let leaves = ids.fold(Map::new(), |m: Map<Bytes, Int>, w: Bytes, _: Bool|
+    match local_part(w) {
+      Some(p) -> match p.k.int_of_ascii() {
+        Some(k) -> if k + 1 > (match m.get(p.base) { Some(n) -> n, None -> 0 }) {
+          m.insert(p.base, k + 1)
+        } else { m },
+        None -> m,
+      },
+      None -> m,
+    });
+  let summed = |b: Bytes|
+    digits_after(b, 112) && ids.contains(b) && leaves.contains(b) && !ids.contains(b.concat(b"_w"));
+  let names = ids.fold(Map::new(), |m: Map<Bytes, Bytes>, w: Bytes, _: Bool|
+    match local_part(w) {
+      Some(p) -> if p.k == b"w" {
+        m.insert(w, nth_part(p.base, match leaves.get(p.base) { Some(n) -> n, None -> 0 }))
+      } else if summed(p.base) {
+        match p.k.int_of_ascii() { Some(k) -> m.insert(w, nth_part(p.base, k + 1)), None -> m }
+      } else { m },
+      None -> if summed(w) { m.insert(w, nth_part(w, 0)) } else { m },
+    });
+  if names.len() == 0 { lines } else { lines.map(|l: Bytes| renamed(l, names)) }
+}
+
+fn nth_part(base: Bytes, k: Int) -> Bytes = Bytes::concat_all([base, b"_", ascii_of_int(k)])
+
+/// The local and the part `w` names, where it names a part of a parameter, a capture or a
+/// temporary held as several C values: `p0_1`, `t3_w`.
+fn local_part(w: Bytes) -> Option<{ base: Bytes, k: Bytes }> / {abort.raise} =
+  match w.index_of(b"_") {
+    None -> None,
+    Some(u) -> {
+      let base = w.slice(0, u);
+      let k = w.slice(u + 1, w.len());
+      if (digits_after(base, 116) || digits_after(base, 112) || digits_after(base, 113))
+          && (all_digits(k) || k == b"w") { Some({ base: base, k: k }) }
+      else { None }
+    },
+  }
+
+/// `lines` with each declaration of zero that the next line, in the same block, assigns without
+/// reading it read as a declaration of what that line assigns.
+fn assigned_once(lines: List<Bytes>) -> List<Bytes> / {abort.raise} =
+  range(0, lines.len()).fold(
+    { out: [], skip: false },
+    |acc: { out: List<Bytes>, skip: Bool }, i: Int|
+      if acc.skip { { ..acc, skip: false } } else {
+        let l = lines.get(i);
+        let t = trimmed(l);
+        let set = match declared(t) {
+          Some(d) -> if d.value != b"0" || statements(t).len() != 1 { None } else {
+            match lines.at(i + 1) {
+              Some(n) -> if indent(n) != indent(l) { None } else {
+                match lone_assignment(trimmed(n)) {
+                  Some(s) -> if s.name != d.name || idents(s.value).contains(d.name) { None }
+                  else { Some(s.value) },
+                  None -> None,
+                }
+              },
+              None -> None,
+            }
+          },
+          None -> None,
+        };
+        match set {
+          Some(value) ->
+            {
+              out: acc.out.push(
+                Bytes::concat_all([l.slice(0, indent(l)), t.slice(0, t.len() - 2), value, b";"]),
+              ),
+              skip: true,
+            },
+          None -> { ..acc, out: acc.out.push(l) },
+        }
+      },
+  ).out
+
+/// `x = E;`, one statement assigning a local: the local and what it is set to.
+fn lone_assignment(t: Bytes) -> Option<{ name: Bytes, value: Bytes }> / {abort.raise} =
+  if !t.ends_with(b";") || t.index_of(b"{") != None || t.index_of(b"}") != None
+      || statements(t).len() != 1 { None } else {
+    match t.index_of(b" = ") {
+      Some(at) -> if local_ident(t.slice(0, at)) {
+        Some({ name: t.slice(0, at), value: t.slice(at + 3, t.len() - 1) })
+      } else { None },
+      None -> None,
+    }
+  }
+
+/// The local a line of one statement declares or assigns, and what it is set to.
+fn written_by(t: Bytes) -> Option<{ name: Bytes, value: Bytes }> / {abort.raise} =
+  match lone_assignment(t) {
+    Some(s) -> Some(s),
+    None -> if statements(t).len() != 1 || t.index_of(b"{") != None { None } else { declared(t) },
+  }
+
+/// `lines` without the writes that call nothing (no `ctx` in them) of each temporary nothing reads,
+/// again until no such temporary is left.
+fn unread_dropped(lines: List<Bytes>) -> List<Bytes> / {abort.raise} =
+  range(0, lines.len()).fold(
+    { lines: lines, stable: false },
+    |acc: { lines: List<Bytes>, stable: Bool }, _: Int|
+      if acc.stable { acc } else {
+        let fewer = unread_once(acc.lines);
+        { lines: fewer, stable: fewer.len() == acc.lines.len() }
+      },
+  ).lines
+
+fn unread_once(lines: List<Bytes>) -> List<Bytes> / {abort.raise} = {
+  let mentions = lines.fold(Map::new(), |m: Map<Bytes, Int>, l: Bytes|
+    idents(l).fold(m, |n: Map<Bytes, Int>, w: Bytes|
+      if temp_local(w) { n.insert(w, match n.get(w) { Some(k) -> k + 1, None -> 1 }) } else { n }));
+  let written = lines.fold(Map::new(), |m: Map<Bytes, Int>, l: Bytes|
+    match written_by(trimmed(l)) {
+      Some(s) -> m.insert(s.name, match m.get(s.name) { Some(k) -> k + 1, None -> 1 }),
+      None -> m,
+    });
+  lines.filter(|l: Bytes|
+    match written_by(trimmed(l)) {
+      Some(s) ->
+        !temp_local(s.name) || s.value.index_of(b"ctx") != None
+          || mentions.get(s.name) != written.get(s.name),
+      None -> true,
+    })
+}
 
 /// `text` without the counts today's emitter takes, lets go of and moves, for holding two printers
 /// whose counts differ by design to each other; held before `normalised`, so a local zeroed once its
@@ -374,24 +606,72 @@ fn unread_value(t: Bytes) -> Option<Bytes> / {abort.raise} =
 /// (`ply_inc(..)`, `ply_dec(..)`), zeroes a local (`t1 = 0`), declares or frees a reuse token
 /// (`Word tok2 = 0`, `if (tok2) ply_dec(ctx, tok2)`) goes from its line, and a line left with none
 /// goes; so does a line resetting a token's cells (`if (t2) { if (tok2 == 0) { .. } }`). A line
-/// holding a block keeps its counts: a failure path's releases differ on purpose.
+/// holding a block keeps its counts: a failure path's releases differ on purpose. Today's reuse at a
+/// make, which the form leaves to its ownership pass, is read past as a record made afresh: a block
+/// `if (!t && tokN) { .. }` goes, `if (tokN) { .. } else { X }` is `X`, and a record's
+/// `if (!t) { X }` wrapper is `X`, each a level out.
 pub fn past_counts(text: Bytes) -> Bytes / {abort.raise} =
   Bytes::join(
-    text.split(b"\n").fold([], |out: List<Bytes>, l: Bytes| {
-      let t = trimmed(l);
-      if t.index_of(b"{") != None || t.index_of(b"}") != None {
-        if t.starts_with(b"if (") && t.index_of(b"ply_reset") != None { out } else { out.push(l) }
-      } else {
-        let all = statements(t);
-        let kept = all.filter(|s: Bytes| !bookkeeping(s));
-        if kept.len() == all.len() { out.push(l) }
-        else if kept.len() == 0 { out } else {
-          out.push(Bytes::concat_all([l.slice(0, indent(l)), Bytes::join(kept, b"; "), b";"]))
-        }
-      }
-    }),
+    text.split(b"\n").fold({ out: [], blocks: [] }, |acc: Reading, l: Bytes| read_past(acc, l)).out,
     b"\n",
   )
+
+/// What `past_counts` has read: the lines kept, and each block of today's reuse the next line is in,
+/// by the indent of the line opening it and whether the part of it being read is kept.
+type Reading = { out: List<Bytes>, blocks: List<{ indent: Int, kept: Bool }> }
+
+/// `acc` with line `l` read.
+fn read_past(acc: Reading, l: Bytes) -> Reading / {abort.raise} = {
+  let t = trimmed(l);
+  let d = indent(l);
+  match acc.blocks.at(acc.blocks.len() - 1) {
+    Some(b) -> if d == b.indent && t.starts_with(b"}") {
+      let inner = acc.blocks.take(acc.blocks.len() - 1);
+      // An `else` reads the part the `if` did not: kept where it was dropped, and dropped where kept.
+      if t == b"} else {" { { ..acc, blocks: inner.push({ indent: b.indent, kept: !b.kept }) } }
+      else { { ..acc, blocks: inner } }
+    } else if acc.blocks.any(|x: { indent: Int, kept: Bool }| !x.kept) { acc }
+    else { line_read(acc, l) },
+    None -> line_read(acc, l),
+  }
+}
+
+/// `acc` with line `l`, in no block being dropped, read: a block of reuse opened, or the line kept
+/// past its counts and a level out for each block it is kept from.
+fn line_read(acc: Reading, l: Bytes) -> Reading / {abort.raise} = {
+  let t = trimmed(l);
+  let opens = t.starts_with(b"if (") && t.ends_with(b") {") && t.index_of(b"}") == None;
+  let cond = if opens { t.slice(4, t.len() - 3) } else { b"" };
+  if opens
+      && (cond.starts_with(b"tok")
+      || (cond.starts_with(b"!") && cond.index_of(b" && tok") != None)) {
+    { ..acc, blocks: acc.blocks.push({ indent: indent(l), kept: false }) }
+  } else if opens && cond.starts_with(b"!") && local_ident(cond.slice(1, cond.len())) {
+    { ..acc, blocks: acc.blocks.push({ indent: indent(l), kept: true }) }
+  } else {
+    match counts_read(l) {
+      None -> acc,
+      Some(k) -> {
+        let out = acc.blocks.len() * 2;
+        { ..acc, out: acc.out.push(if indent(k) >= out { k.slice(out, k.len()) } else { k }) }
+      },
+    }
+  }
+}
+
+/// Line `l` past the counts it takes and lets go of, or nothing where it holds nothing else.
+fn counts_read(l: Bytes) -> Option<Bytes> / {abort.raise} = {
+  let t = trimmed(l);
+  if t.index_of(b"{") != None || t.index_of(b"}") != None {
+    if t.starts_with(b"if (") && t.index_of(b"ply_reset") != None { None } else { Some(l) }
+  } else {
+    let all = statements(t);
+    let kept = all.filter(|s: Bytes| !bookkeeping(s));
+    if kept.len() == all.len() { Some(l) }
+    else if kept.len() == 0 { None }
+    else { Some(Bytes::concat_all([l.slice(0, indent(l)), Bytes::join(kept, b"; "), b";"])) }
+  }
+}
 
 /// The statements of a line holding no block, each without its `;`.
 fn statements(t: Bytes) -> List<Bytes> / {abort.raise} =
@@ -414,12 +694,16 @@ fn token_decl(d: Bytes) -> Bool / {abort.raise} =
   (d.starts_with(b"Word tok") && all_digits(d.slice(8, d.len())))
     || (d.starts_with(b"int64_t tok") && all_digits(d.slice(11, d.len())))
 
-/// A local of a C body: a temporary, a parameter or a capture, or a part of one (`p0_1`).
+/// A local of a C body: a temporary, a parameter or a capture, or a part of one (`p0_1`, today's
+/// record word `p0_w`).
 fn local_ident(v: Bytes) -> Bool / {abort.raise} =
   v.len() > 1 && (v.at(0) == 116 || v.at(0) == 112 || v.at(0) == 113)
     && (match v.index_of(b"_") {
       None -> all_digits(v.slice(1, v.len())),
-      Some(u) -> all_digits(v.slice(1, u)) && all_digits(v.slice(u + 1, v.len())),
+      Some(u) -> {
+        let k = v.slice(u + 1, v.len());
+        all_digits(v.slice(1, u)) && (all_digits(k) || k == b"w")
+      },
     })
 
 fn all_digits(v: Bytes) -> Bool / {abort.raise} =
@@ -471,16 +755,19 @@ fn c_type(t: Bytes) -> Bool =
   )
 
 /// A local or a literal: a name of one identifier, or a constant spelled as the printers spell
-/// one, with nothing computed; a field name's hole is a constant the unit writes in.
+/// one once `INT64_C(n)` is read as `n`, with nothing computed; a field name's or a tag's hole is a
+/// constant the unit writes in.
 fn atom(v: Bytes) -> Bool / {abort.raise} =
-  local_ident(v) || v == b"INT64_MIN"
-    || (v.starts_with(b"INT64_C(") && v.ends_with(b")") && v.index_of(b" ") == None)
-    || (v.starts_with(b"ply_f64(INT64_C(") && v.ends_with(b"))") && v.index_of(b" ") == None)
-    || (v.starts_with(b"((") && v.index_of(b")INT64_C(") != None && v.ends_with(b"))")
-    && v.index_of(b" ") == None)
-    || v == b"0"
-    || v == b"1"
-    || (v.starts_with(b"@@f") && v.ends_with(b"@@") && v.split(b"@@").len() == 3)
+  local_ident(v) || v == b"INT64_MIN" || integer(v)
+    || (v.starts_with(b"ply_f64(") && v.ends_with(b")") && integer(v.slice(8, v.len() - 1)))
+    || (v.starts_with(b"((") && v.ends_with(b")") && v.index_of(b" ") == None
+    && (match v.index_of(b")") { Some(c) -> integer(v.slice(c + 1, v.len() - 1)), None -> false }))
+    || ((v.starts_with(b"@@f") || v.starts_with(b"@@T")) && v.ends_with(b"@@")
+    && v.split(b"@@").len() == 3)
+
+/// An integer as C writes one: digits, after a `-` where it is negative.
+fn integer(v: Bytes) -> Bool / {abort.raise} =
+  all_digits(if v.starts_with(b"-") { v.slice(1, v.len()) } else { v })
 
 fn temp_name(v: Bytes) -> Bool / {abort.raise} = digits_after(v, 116)
 
@@ -627,9 +914,16 @@ test "two printers' copies, dead stores after a restart, numbering and counts ar
   assert_eq(normalised(a), normalised(b));
   // A local assigned again is a join, never a copy, and a copy of a local assigned after it is no
   // copy either.
-  assert_eq(normalised(b"  int64_t t2 = 0;\n  t2 = p1;\n  return t2;"), [
+  assert_eq(normalised(b"  int64_t t2 = 0;\n  if (p0) {\n    t2 = p1;\n  }\n  return t2;"), [
     b"  int64_t t1 = 0;",
-    b"  t1 = p1;",
+    b"  if (p0) {",
+    b"    t1 = p1;",
+    b"  }",
+    b"  return t1;",
+  ]);
+  // A declaration of zero the next line sets is a declaration of what it sets.
+  assert_eq(normalised(b"  int64_t t2 = 0;\n  t2 = f(ctx, p1);\n  return t2;"), [
+    b"  int64_t t1 = f(ctx, p1);",
     b"  return t1;",
   ]);
   assert_eq(normalised(b"  int64_t t4 = t3;\n  t3 = 0;\n  return t4;"), [
@@ -651,8 +945,117 @@ test "two printers' copies, dead stores after a restart, numbering and counts ar
     normalised(
       b"  Word t3 = @@f=name@@;\n  rt_f_p(ctx, t3, (Word)p0);\n  goto land_4;\n  ply_h2: ;",
     ),
-    [b"  rt_f_p(ctx, @@f=name@@, (int64_t)p0);", b"  goto land_0;", b"  ply_h0: ;"],
+    [b"  rt_f_p(ctx, @@f=name@@, (int64_t)p0);", b"  goto ply_h0;", b"  ply_h1: ;"],
   )
+}
+
+test "today's landing, literals, word types and parameter parts read as the form's" {
+  // A handle's landing is one label whether today's emitter or the form names it.
+  assert_eq(normalised(b"  goto land_3;\n  land_3:;"), normalised(b"  goto ply_h0;\n  ply_h0: ;"));
+  // A literal is its value however it is spelled.
+  assert_eq(
+    normalised(b"  rt_binary_p(ctx, INT64_C(0), p0); f(ctx, INT64_C(-5), ((uint8_t)INT64_C(7)));"),
+    normalised(b"  rt_binary_p(ctx, 0, p0); f(ctx, -5, ((uint8_t)7));"),
+  );
+  assert_eq(normalised(b"  PlyTagged t1 = p0;\n  return t1;"), [b"  return p0;"]);
+  // Today's record word `p0_w` is the part after the record's leaves, and a sum's index `p1` its
+  // first part.
+  assert_eq(
+    normalised(
+      b"int64_t m_f(PlyCtx *ctx, int64_t p0_0, double p0_1, Word p0_w) {\n  return g(ctx, p0_w);\n}",
+    ),
+    normalised(
+      b"int64_t m_f(PlyCtx *ctx, int64_t p0_0, double p0_1, Word p0_2) {\n  return g(ctx, p0_2);\n}",
+    ),
+  );
+  assert_eq(
+    normalised(b"int64_t m_s(PlyCtx *ctx, int64_t p1, Word p1_0) {\n  return h(ctx, p1, p1_0);\n}"),
+    normalised(
+      b"int64_t m_s(PlyCtx *ctx, int64_t p1_0, Word p1_1) {\n  return h(ctx, p1_0, p1_1);\n}",
+    ),
+  )
+}
+
+test "each C function's temporaries and copies are its own" {
+  let root = b"int64_t m_f(PlyCtx *ctx, int64_t p0) {\n  int64_t t1[] = {p0, 2};\n  return t1[0];\n}\n";
+  let caught = b"int64_t m_f_lambda0(PlyCtx *ctx, Word q0) {\n  int64_t t1 = q0;\n  return t1;\n}\n";
+  let ticked = b"int64_t m_f_lambda1(PlyCtx *ctx) {\n  int64_t t1 = INT64_C(1);\n  return t1;\n}";
+  let read = normalised(Bytes::concat_all([root, caught, ticked]));
+  assert_eq(read, normalised(root).concat(normalised(caught)).concat(normalised(ticked)));
+  assert(read.contains(b"  int64_t t1[] = {p0, 2};"));
+  assert_eq(read.filter(|l: Bytes| l.starts_with(b"  return ")), [
+    b"  return t1[0];",
+    b"  return q0;",
+    b"  return 1;",
+  ])
+}
+
+test "a temporary nothing reads goes with every write of it that calls nothing, and so does its chain" {
+  assert_eq(
+    normalised(
+      b"  int64_t t2 = 0;\n  int64_t t1 = 0;\n  t1 = p0_w;\n  t2 = t1;\n  int64_t t3 = f(ctx, p1);\n  return p1;",
+    ),
+    [b"  int64_t t1 = f(ctx, p1);", b"  return p1;"],
+  )
+}
+
+test "every run of lines two texts differ in is a hunk of its own" {
+  assert_eq(hunks([b"a", b"b", b"c", b"d"], [b"a", b"x", b"c", b"y"]), [
+    { today: [b"b"], form: [b"x"] },
+    { today: [b"d"], form: [b"y"] },
+  ]);
+  assert_eq(hunks([b"a"], [b"a"]), []);
+  assert_eq(hunks([], [b"a"]), [{ today: [], form: [b"a"] }]);
+  // A test for failure moved down hides nothing after it.
+  let today = normalised(
+    b"  int64_t t1 = f(ctx, p0);\n  if (ctx->failed) return 0;\n  g(ctx, t1);\n  if (ctx->failed) return 0;\n  h(ctx, p0);\n  return t1;",
+  );
+  let form = normalised(
+    b"  int64_t t1 = f(ctx, p0);\n  g(ctx, t1);\n  if (ctx->failed) return 0;\n  k(ctx, p0);\n  return t1;",
+  );
+  assert_eq(hunks(today, form), [
+    { today: [b"  if (ctx->failed) return 0;"], form: [] },
+    { today: [b"  h(ctx, p0);"], form: [b"  k(ctx, p0);"] },
+  ])
+}
+
+test "today's reuse at a make reads as the record made afresh" {
+  let made = b"  Word t1 = rt_alloc_p(ctx, 3, 2, @@s0@@, 5);\n  if (ctx->failed) return 0;\n  ply_words(t1)[0] = p0;\n  return t1;";
+  let reused = Bytes::concat_all([
+    b"  int64_t t5 = 0;\n",
+    b"  if (tok3) {\n",
+    b"    t5 = tok3; tok3 = 0;\n",
+    b"    ply_obj(t5)->rc = 1; ply_obj(t5)->kind = 3;\n",
+    b"  } else {\n",
+    b"    t5 = rt_alloc_p(ctx, 3, 2, @@s0@@, 5);\n",
+    b"    if (ctx->failed) return 0;\n",
+    b"  }\n",
+    b"  ply_words(t5)[0] = p0;\n",
+    b"  return t5;",
+  ]);
+  assert_eq(normalised(past_counts(reused)), normalised(past_counts(made)));
+  let wrapped = Bytes::concat_all([
+    b"  int64_t t5 = 0;\n",
+    b"  if (!t5) {\n",
+    b"    if (tok3 && (ply_obj(tok3)->flags & PLY_MIXED)) {\n",
+    b"      t5 = tok3; tok3 = 0;\n",
+    b"    } else {\n",
+    b"      t5 = rt_alloc_p(ctx, 3, 2, @@s0@@, 5);\n",
+    b"      if (ctx->failed) return 0;\n",
+    b"    }\n",
+    b"    ply_words(t5)[0] = p0;\n",
+    b"  }\n",
+    b"  return t5;",
+  ]);
+  assert_eq(normalised(past_counts(wrapped)), normalised(past_counts(made)));
+  let taken = Bytes::concat_all([
+    b"  if (!t5 && tok3) {\n",
+    b"    t5 = tok3; tok3 = 0;\n",
+    b"    ply_words(t5)[0] = p0;\n",
+    b"  }\n",
+    b"  return p1;",
+  ]);
+  assert_eq(normalised(past_counts(taken)), [b"  return p1;"])
 }
 
 test "past counts, a body that moves, resets and frees reads as one that does none of it" {
