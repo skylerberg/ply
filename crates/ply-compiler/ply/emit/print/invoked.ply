@@ -1,59 +1,236 @@
-//! Calls printed: a root's by its symbol, a function value's, a self tail call as a restart, a tail
-//! call into the group, a loop's passes, closures made, and their bodies' functions.
+//! Calls printed: a root's by its symbol, a function value's by its type or through the runtime, a
+//! self tail call as a restart, a tail call into the group, a loop's passes, closures made, the
+//! unit's closures and constants a body reads, and closures' bodies with their entries.
 
 import std.bytes (ascii_of_int)
-import emit.keys (Callee, Root)
-import emit.pieces (Piece, Text, Hole, Symbol)
-import emit.tir (Var, Arg, Convention, Made, Fn, rep_of_arg)
-import emit.print.text (Printing, Place, line, pad, temp, named, arg_text, site, check)
-import emit.print.made (c_type)
+import emit (symbol_of, root_id)
+import emit.keys (Callee, Root, Generic, root_name)
+import emit.pieces (Piece, Text, Hole, Symbol, LambdaEntry, BuiltinAt, placeholder)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, Var, Arg, Convention,
+                 Made, MClosure, Fn, Lambda, Closure, Uses, rep_of_arg)
+import emit.tir.calling (CallingOp, EntryValue, ConstantRead, BuiltinValue, Ticked)
+import emit.print.text (Printing, Place, line, pad, temp, named, name_of, arg_text, site, check,
+                        int_lit, interned, fuel_head, tick_line)
+import emit.print.made (c_type, c_types, as_word, word_as)
 
-/// A call of `c.callee` on `c.args`, its answer into `into`, its failure tested after it.
+/// A call of `c.callee` on `c.args`, its answer into `into`, its failure tested after it. The head
+/// the call was written to is noted for the unit to hold the callee's own to.
 pub fn call(
   p: Place,
   pr: Printing,
   into: Option<Var>,
   c: { callee: Callee, args: List<Arg>, conv: Convention, stops: Bool },
-) -> Printing = {
+) -> Printing / {abort.raise} = {
   let sited = site(p, pr);
+  let noted = {
+    ..called(sited, c.callee),
+    expects: sited.expects.push({
+      callee: placeholder(Symbol(c.callee)),
+      head: {
+        answer: c_type(c.conv.answer),
+        params: c.conv.reps.fold([], |acc: List<Bytes>, r: Rep| acc.concat(c_types(r))),
+      },
+    }),
+  };
   let args = Bytes::concat_all([
     b"(ctx",
     Bytes::concat_all(c.args.map(|a: Arg| b", ".concat(arg_text(pr, a)))),
-    b");\n",
+    b")",
   ]);
-  let called = match c.callee {
-    Root(k) -> { ..sited, calls: if sited.calls.contains(k) { sited.calls } else { sited.calls.push(k) } },
-    _ -> sited,
-  };
-  let assigned = match into {
-    Some(v) -> {
-      let n = named(called, v);
-      { pr: n.pr, head: Bytes::concat_all([c_type(c.conv.answer), b" ", n.name, b" = "]) }
-    },
-    None -> { pr: called, head: b"" },
-  };
-  check(p, {
-    ..assigned.pr,
-    out: assigned.pr.out.concat([
-      Text(Bytes::concat_all([pad(p.depth), assigned.head])),
-      Hole(Symbol(c.callee)),
-      Text(args),
-    ]),
-  })
+  check(p, valued(p, noted, into, c.conv.answer, [Hole(Symbol(c.callee)), Text(args)]))
 }
 
-/// A call of the function value `c.f` on `c.args`.
+/// A call of the function value `c.f` on `c.args`. Where its convention holds a value apart from a
+/// word, it goes through the closure's typed entry if the closure's descriptor says that
+/// convention, and through the runtime with every value a word otherwise.
 pub fn applied(
   p: Place,
   pr: Printing,
   into: Option<Var>,
   c: { f: Arg, args: List<Arg>, conv: Convention, stops: Bool },
-) -> Printing =
-  line(pr, p.depth, b"/* a call of a function value, which this printer does not write yet */")
+) -> Printing / {abort.raise} = {
+  let f = arg_text(pr, c.f);
+  let names = c.args.map(|a: Arg| arg_text(pr, a));
+  if !c.conv.reps.push(c.conv.answer).all(|r: Rep| r == RWord) {
+    by_type(p, pr, into, f, c.conv, names)
+  } else {
+    let arr = temp(pr);
+    let laid = line(
+      arr.pr,
+      p.depth,
+      Bytes::concat_all([
+        b"Word ",
+        arr.name,
+        b"[] = {",
+        if names.len() == 0 { b"0" } else { Bytes::join(names, b", ") },
+        b"};",
+      ]),
+    );
+    check(
+      p,
+      valued(p, site(p, laid), into, RWord, [
+        Text(
+          Bytes::concat_all([
+            b"rt_call_p(ctx, ",
+            f,
+            b", (Word)(intptr_t)",
+            arr.name,
+            b", ",
+            ascii_of_int(c.args.len()),
+            b")",
+          ]),
+        ),
+      ]),
+    )
+  }
+}
 
-/// A closure made of `m.args`, its captures.
-pub fn closure_made(p: Place, pr: Printing, into: Option<Var>, m: { made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> }) -> Printing =
-  line(pr, p.depth, b"/* a closure, which this printer does not write yet */")
+/// A closure made of its captures `m.args`: the unit's one closure over the body's entry where it
+/// captures nothing, laid out on this frame's stack where it is `stacked`, and made by the runtime
+/// otherwise.
+pub fn closure_made(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  m: { made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> },
+) -> Printing / {abort.raise} =
+  match m.made {
+    MClosure(c) -> {
+      let sub = Bytes::concat_all([p.u.symbol, b"_lambda", ascii_of_int(c.nth)]);
+      let entry = in_code_table(pr, [Text(sub.concat(b"_entry"))]);
+      let arr = temp(entry.pr);
+      let words = Bytes::concat_all([
+        b"ply_imm((int64_t)(intptr_t)",
+        sub,
+        b"_desc)",
+        Bytes::concat_all(m.args.map(|a: Arg| b", ".concat(arg_text(pr, a)))),
+        b"};",
+      ]);
+      let described = line(
+        arr.pr,
+        p.depth,
+        Bytes::concat_all([b"extern const int64_t ", sub, b"_desc[2];"]),
+      );
+      if c.stacked && c.captures > 0 {
+        let laid = line(
+          line(
+            described,
+            p.depth,
+            Bytes::concat_all([b"Word ", sub, b"_entry(PlyCtx *ctx, const Word *args);"]),
+          ),
+          p.depth,
+          Bytes::concat_all([
+            b"Word ",
+            arr.name,
+            b"[] = {0, 0, (Word)(intptr_t)&",
+            sub,
+            b"_entry, ",
+            words,
+            b" { PlyObj *o = (PlyObj *)",
+            arr.name,
+            b"; o->rc = UINT32_MAX; o->kind = 6; o->flags = 16; o->len = ",
+            ascii_of_int(c.captures + 2),
+            b"; o->layout = ",
+            ascii_of_int(c.params),
+            b"; }",
+          ]),
+        );
+        valued(p, laid, into, RWord, [Text(b"(Word)(intptr_t)".concat(arr.name))])
+      } else {
+        let laid = line(
+          described,
+          p.depth,
+          Bytes::concat_all([b"Word ", arr.name, b"[] = {", words]),
+        );
+        if c.captures == 0 {
+          check(
+            p,
+            valued(p, laid, into, RWord, [
+              Text(b"rt_lambda_value_p(ctx, "),
+              Hole(LambdaEntry(entry.at)),
+              Text(Bytes::concat_all([b", ", ascii_of_int(c.params), b", ", arr.name, b"[0])"])),
+            ]),
+          )
+        } else {
+          let made = check(
+            p,
+            valued(p, laid, into, RWord, [
+              Text(b"rt_closure_p(ctx, "),
+              Hole(LambdaEntry(entry.at)),
+              Text(
+                Bytes::concat_all([
+                  b", ",
+                  ascii_of_int(c.params),
+                  b", (Word)(intptr_t)",
+                  arr.name,
+                  b", ",
+                  ascii_of_int(c.captures + 1),
+                  b")",
+                ]),
+              ),
+            ]),
+          );
+          match into {
+            Some(v) ->
+              line(
+                made,
+                p.depth,
+                Bytes::concat_all([b"ply_obj(", name_of(made, v), b")->flags |= 16;"]),
+              ),
+            None -> made,
+          }
+        }
+      }
+    },
+    _ -> line(pr, p.depth, b"/* a value made that is no closure */"),
+  }
+
+/// One of the calling family's operations: the unit's closure over a definition's entry, what a pure
+/// definition answers, a builtin's value, or a step counted.
+pub fn calling_op(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  op: CallingOp,
+  args: List<Arg>,
+  uses: Uses,
+) -> Printing / {abort.raise} =
+  match op {
+    EntryValue(e) -> {
+      let entry = in_code_table(called(pr, e.callee), [Hole(Symbol(e.callee)), Text(b"_entry")]);
+      check(
+        p,
+        valued(p, entry.pr, into, RWord, [
+          Text(b"rt_lambda_value_p(ctx, "),
+          Hole(LambdaEntry(entry.at)),
+          Text(Bytes::concat_all([b", ", ascii_of_int(e.arity), b", 0)"])),
+        ]),
+      )
+    },
+    ConstantRead(c) -> {
+      let entry = in_code_table(called(site(p, pr), c), [Hole(Symbol(c)), Text(b"_entry")]);
+      check(
+        p,
+        valued(p, entry.pr, into, RWord, [
+          Text(b"rt_constant_p(ctx, "),
+          Hole(LambdaEntry(entry.at)),
+          Text(b")"),
+        ]),
+      )
+    },
+    BuiltinValue(name) -> {
+      let b = interned(pr.builtins, name);
+      check(
+        p,
+        valued(p, { ..pr, builtins: b.xs }, into, RWord, [
+          Text(b"rt_builtin_value_p(ctx, "),
+          Hole(BuiltinAt(b.at)),
+          Text(b")"),
+        ]),
+      )
+    },
+    Ticked -> line(pr, p.depth, tick_line(p.leave)),
+  }
 
 /// A self tail call: its arguments into temporaries, then the parameters set from them, then the
 /// body again.
@@ -61,7 +238,11 @@ pub fn restarted(p: Place, pr: Printing, args: List<Arg>) -> Printing / {abort.r
   let held = args.fold({ pr: pr, names: [] }, |h: { pr: Printing, names: List<Bytes> }, a: Arg| {
     let t = temp(h.pr);
     {
-      pr: line(t.pr, p.depth, Bytes::concat_all([c_type(rep_of_arg(a)), b" ", t.name, b" = ", arg_text(h.pr, a), b";"])),
+      pr: line(
+        t.pr,
+        p.depth,
+        Bytes::concat_all([c_type(rep_of_arg(a)), b" ", t.name, b" = ", arg_text(h.pr, a), b";"]),
+      ),
       names: h.names.push(t.name),
     }
   });
@@ -75,8 +256,14 @@ pub fn entered_member(p: Place, pr: Printing, member: Int, args: List<Arg>) -> P
   line(pr, p.depth, b"/* a tail call into the group, which this printer does not write yet */")
 
 /// What opens a `Loop` numbered `label` over `state`, first `init`.
-pub fn loop_opened(p: Place, pr: Printing, label: Int, state: List<Var>, init: List<Arg>, answer: Var) -> Printing =
-  line(pr, p.depth, b"/* a loop, which this printer does not write yet */")
+pub fn loop_opened(
+  p: Place,
+  pr: Printing,
+  label: Int,
+  state: List<Var>,
+  init: List<Arg>,
+  answer: Var,
+) -> Printing = line(pr, p.depth, b"/* a loop, which this printer does not write yet */")
 
 /// What closes `Loop` `label`.
 pub fn loop_closed(p: Place, pr: Printing, label: Int, answer: Var) -> Printing = pr
@@ -89,11 +276,364 @@ pub fn next(p: Place, pr: Printing, label: Int, state: List<Var>, args: List<Arg
 pub fn done(p: Place, pr: Printing, label: Int, answer: Var, arg: Arg) -> Printing =
   line(pr, p.depth, b"/* a loop's answer, which this printer does not write yet */")
 
-/// The C names a closure body's parameters have.
-pub fn lambda_names(f: Fn, nth: Int) -> Map<Int, Bytes> / {abort.raise} =
-  range(0, f.params.len()).fold(Map::new(), |m: Map<Int, Bytes>, i: Int|
-    m.insert(f.params.get(i).id, b"p".concat(ascii_of_int(i))))
+/// The C names a closure body's parameters have: its captures `q<i>`, then its own `p<j>`.
+pub fn lambda_names(l: Lambda, nth: Int) -> Map<Int, Bytes> / {abort.raise} =
+  match l {
+    Closure(c) ->
+      range(0, c.body.params.len()).fold(Map::new(), |m: Map<Int, Bytes>, i: Int|
+        m.insert(c.body.params.get(i).id, if i < c.captures { b"q".concat(ascii_of_int(i)) }
+        else { b"p".concat(ascii_of_int(i - c.captures)) })),
+  }
 
-/// The function of closure body `nth` of `root`, its body printed as `body`.
-pub fn lambda_text(root: Fn, nth: Int, f: Fn, body: List<Piece>) -> List<Piece> =
-  [Text(b"/* a closure's body, which this printer does not write yet */\n")]
+/// The function of closure body `nth` of `root`, its body printed as `body`: its captures, each a
+/// word it holds a count of, then its own parameters as the closure's convention carries them; and
+/// the entries the runtime and a call by the closure's type enter it through, and its descriptor.
+pub fn lambda_text(
+  root: Fn,
+  nth: Int,
+  l: Lambda,
+  body: List<Piece>,
+) -> List<Piece> / {abort.raise} =
+  match l {
+    Closure(c) -> {
+      let name = Bytes::concat_all([symbol_of(root_name(root.key)), b"_lambda", ascii_of_int(nth)]);
+      let caps = range(0, c.captures).map(|i: Int| b"q".concat(ascii_of_int(i)));
+      let own = c.body.conv.reps.drop(c.captures);
+      let answer = c.body.conv.answer;
+      [
+        Text(
+          Bytes::concat_all([
+            b"Word ",
+            name,
+            b"_entry(PlyCtx *ctx, const Word *args);\n",
+            c_type(answer),
+            b" ",
+            name,
+            b"(PlyCtx *ctx",
+            Bytes::concat_all(caps.map(|q: Bytes| b", Word ".concat(q))),
+            Bytes::concat_all(
+              range(0, own.len()).map(|j: Int|
+                Bytes::concat_all([b", ", c_type(own.get(j)), b" p", ascii_of_int(j)])),
+            ),
+            b") {\n",
+            fuel_head(
+              name.concat(b"_entry"),
+              [b"0"].concat(caps).concat(
+                range(0, own.len()).map(|j: Int| word_of(b"p".concat(ascii_of_int(j)), own.get(j))),
+              ),
+              answer,
+            ),
+          ]),
+        ),
+      ].concat(
+        body,
+      ).push(
+        Text(Bytes::concat_all([b"}\n", entries(name, c.captures, own, answer)])),
+      )
+    },
+  }
+
+/// The entry the runtime enters closure function `name` through, words in and out, the closure's
+/// `captures` first; the entry a call by the closure's type enters it through, its captures read
+/// off the closure and counted once more; and the descriptor naming that entry and its convention.
+fn entries(name: Bytes, captures: Int, own: List<Rep>, answer: Rep) -> Bytes / {abort.raise} = {
+  let opened = range(0, own.len()).map(|j: Int| {
+    let arg = Bytes::concat_all([b"args[", ascii_of_int(1 + captures + j), b"]"]);
+    let local = b"a".concat(ascii_of_int(j));
+    match own.get(j) {
+      RWord -> { text: b"", arg: arg },
+      RMaybe ->
+        {
+          text: Bytes::concat_all([
+            b"  PlyMaybe ",
+            local,
+            b" = rt_maybe_open_p(ctx, ",
+            arg,
+            b");\n",
+          ]),
+          arg: local,
+        },
+      RTagged ->
+        {
+          text: Bytes::concat_all([
+            b"  PlyTagged ",
+            local,
+            b" = rt_tagged_open_p(ctx, ",
+            arg,
+            b");\n",
+          ]),
+          arg: local,
+        },
+      r ->
+        {
+          text: Bytes::concat_all([
+            b"  ",
+            c_type(r),
+            b" ",
+            local,
+            b" = ",
+            word_as(arg, r),
+            b"; ply_dec(ctx, ",
+            arg,
+            b");\n",
+          ]),
+          arg: local,
+        },
+    }
+  });
+  let held = range(0, captures).map(|i: Int|
+    Bytes::concat_all([b"args[", ascii_of_int(1 + i), b"]"]));
+  let call = Bytes::concat_all([
+    name,
+    b"(ctx",
+    Bytes::concat_all(
+      held.concat(opened.map(|o: { text: Bytes, arg: Bytes }| o.arg)).map(|a: Bytes|
+        b", ".concat(a)),
+    ),
+    b")",
+  ]);
+  let names = range(0, own.len()).map(|j: Int| b"p".concat(ascii_of_int(j)));
+  let copies = range(0, captures).map(|i: Int| b"c".concat(ascii_of_int(i)));
+  Bytes::concat_all([
+    b"Word ",
+    name,
+    b"_entry(PlyCtx *ctx, const Word *args) {\n",
+    Bytes::concat_all(opened.map(|o: { text: Bytes, arg: Bytes }| o.text)),
+    match answer {
+      RWord -> Bytes::concat_all([b"  return ", call, b";\n"]),
+      r ->
+        Bytes::concat_all([
+          b"  ",
+          c_type(r),
+          b" r = ",
+          call,
+          b";\n  if (ctx->failed) return 0;\n  return ",
+          word_of(b"r", r),
+          b";\n",
+        ]),
+    },
+    b"}\n",
+    c_type(answer),
+    b" ",
+    name,
+    b"_typed(PlyCtx *ctx, Word self",
+    Bytes::concat_all(
+      range(0, own.len()).map(|j: Int|
+        Bytes::concat_all([b", ", c_type(own.get(j)), b" ", names.get(j)])),
+    ),
+    b") {\n",
+    Bytes::concat_all(
+      range(0, captures).map(|i: Int|
+        Bytes::concat_all([
+          b"  Word ",
+          copies.get(i),
+          b" = ply_words(self)[",
+          ascii_of_int(2 + i),
+          b"]; ply_inc(",
+          copies.get(i),
+          b");\n",
+        ])),
+    ),
+    b"  return ",
+    name,
+    b"(ctx",
+    Bytes::concat_all(copies.concat(names).map(|a: Bytes| b", ".concat(a))),
+    b");\n}\n",
+    b"const int64_t ",
+    name,
+    b"_desc[2] = { ",
+    convention_id(own, answer),
+    b", (int64_t)(intptr_t)&",
+    name,
+    b"_typed };\n",
+  ])
+}
+
+/// The call of the closure `f` through its typed entry where its descriptor says convention `c`,
+/// and through the runtime, every value made a word, otherwise; the closure is let go of either way.
+fn by_type(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  f: Bytes,
+  c: Convention,
+  names: List<Bytes>,
+) -> Printing / {abort.raise} = {
+  let sited = site(p, pr);
+  let r = match into { Some(v) -> named(sited, v), None -> temp(sited) };
+  let arr = temp(r.pr);
+  let word = temp(arr.pr);
+  let declared = line(
+    word.pr,
+    p.depth,
+    Bytes::concat_all([c_type(c.answer), b" ", r.name, b" = 0;"]),
+  );
+  let typed = line(
+    line(declared, p.depth, Bytes::concat_all([b"if (", called_typed(f, c), b") {"])),
+    p.depth + 1,
+    Bytes::concat_all([
+      r.name,
+      b" = ((",
+      entry_type(c),
+      b")(intptr_t)",
+      descriptor_of(f),
+      b"[1])(ctx, ",
+      f,
+      Bytes::concat_all(names.map(|n: Bytes| b", ".concat(n))),
+      b"); ply_dec(ctx, ",
+      f,
+      b");",
+    ]),
+  );
+  let words = range(0, names.len()).map(|i: Int|
+    word_of(names.get(i), match c.reps.at(i) { Some(x) -> x, None -> RWord }));
+  let by_words = line(
+    line(
+      line(typed, p.depth, b"} else {"),
+      p.depth + 1,
+      Bytes::concat_all([
+        b"Word ",
+        arr.name,
+        b"[] = {",
+        if words.len() == 0 { b"0" } else { Bytes::join(words, b", ") },
+        b"}; Word ",
+        word.name,
+        b" = rt_call_p(ctx, ",
+        f,
+        b", (Word)(intptr_t)",
+        arr.name,
+        b", ",
+        ascii_of_int(names.len()),
+        b");",
+      ]),
+    ),
+    p.depth + 1,
+    match c.answer {
+      RWord -> Bytes::concat_all([r.name, b" = ", word.name, b";"]),
+      RMaybe ->
+        Bytes::concat_all([
+          b"if (!ctx->failed) ",
+          r.name,
+          b" = rt_maybe_open_p(ctx, ",
+          word.name,
+          b");",
+        ]),
+      RTagged ->
+        Bytes::concat_all([
+          b"if (!ctx->failed) ",
+          r.name,
+          b" = rt_tagged_open_p(ctx, ",
+          word.name,
+          b");",
+        ]),
+      k ->
+        Bytes::concat_all([
+          b"if (!ctx->failed) { ",
+          r.name,
+          b" = ",
+          word_as(word.name, k),
+          b"; ply_dec(ctx, ",
+          word.name,
+          b"); }",
+        ]),
+    },
+  );
+  check(p, line(by_words, p.depth, b"}"))
+}
+
+/// A closure's descriptor, where it has one: the word after its code is the address, as an
+/// immediate, of its convention and typed entry.
+fn descriptor_of(f: Bytes) -> Bytes =
+  Bytes::concat_all([b"((const int64_t *)(intptr_t)ply_imm_value(ply_words(", f, b")[1]))"])
+
+/// Whether `f` is a closure compiled code made, whose descriptor says convention `c`.
+fn called_typed(f: Bytes, c: Convention) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"(!ply_is_imm(",
+    f,
+    b") && ply_obj(",
+    f,
+    b")->kind == 6 && (ply_obj(",
+    f,
+    b")->flags & 16) && ",
+    descriptor_of(f),
+    b"[0] == ",
+    convention_id(c.reps, c.answer),
+    b")",
+  ])
+
+/// The C type of the entry a closure of convention `c` is called through by its type: the closure,
+/// then each argument's value.
+fn entry_type(c: Convention) -> Bytes =
+  Bytes::concat_all([
+    c_type(c.answer),
+    b" (*)(PlyCtx *, Word",
+    Bytes::concat_all(
+      c.reps.fold([], |acc: List<Bytes>, r: Rep| acc.concat(c_types(r))).map(|t: Bytes|
+        b", ".concat(t)),
+    ),
+    b")",
+  ])
+
+/// A convention as the C integer a closure's descriptor holds: a digest of how each value crosses.
+fn convention_id(params: List<Rep>, answer: Rep) -> Bytes / {abort.raise} =
+  int_lit(root_id(Bytes::join(params.push(answer).map(spelled), b",")))
+
+/// How a convention spells a value crossing as `r`.
+fn spelled(r: Rep) -> Bytes =
+  match r {
+    RInt -> b"i",
+    RBool -> b"b",
+    RFloat -> b"f",
+    RDec -> b"d",
+    RMaybe -> b"m",
+    RTagged -> b"t",
+    RNum(w) -> Bytes::concat_all([if w.signed { b"s" } else { b"u" }, ascii_of_int(w.bits)]),
+    _ -> b"w",
+  }
+
+/// `e`, held as `r`, as the word a value of its type is: a sum's object made of its word.
+fn word_of(e: Bytes, r: Rep) -> Bytes =
+  match r {
+    RMaybe -> Bytes::concat_all([b"rt_maybe_take_p(ctx, ", e, b")"]),
+    RTagged -> Bytes::concat_all([b"rt_tagged_take_p(ctx, ", e, b")"]),
+    _ -> as_word(e, r),
+  }
+
+/// `pr` with `expr` written as a value held as `rep`, into `into` where the value is kept.
+fn valued(p: Place, pr: Printing, into: Option<Var>, rep: Rep, expr: List<Piece>) -> Printing =
+  match into {
+    Some(v) -> {
+      let n = named(pr, v);
+      {
+        ..n.pr,
+        out: n.pr.out.push(
+          Text(Bytes::concat_all([pad(p.depth), c_type(rep), b" ", n.name, b" = "])),
+        ).concat(
+          expr,
+        ).push(
+          Text(b";\n"),
+        ),
+      }
+    },
+    None -> { ..pr, out: pr.out.push(Text(pad(p.depth))).concat(expr).push(Text(b";\n")) },
+  }
+
+/// `pr` noting that the body calls the root `callee` names, where it names one.
+fn called(pr: Printing, callee: Callee) -> Printing =
+  match callee {
+    Root(k) -> if pr.calls.contains(k) { pr } else { { ..pr, calls: pr.calls.push(k) } },
+    _ -> pr,
+  }
+
+/// The place among the code table the unit fills `@@l<i>@@` holes from that the entry spelled as
+/// `entry` has, added where it is not there yet.
+fn in_code_table(pr: Printing, entry: List<Piece>) -> { pr: Printing, at: Int } =
+  match range(0, pr.lambdas.len()).fold(None, |acc: Option<Int>, i: Int|
+      match acc {
+        Some(_) -> acc,
+        None -> if pr.lambdas.at(i) == Some(entry) { Some(i) } else { None },
+      }) {
+    Some(i) -> { pr: pr, at: i },
+    None -> { pr: { ..pr, lambdas: pr.lambdas.push(entry) }, at: pr.lambdas.len() },
+  }
