@@ -3,8 +3,9 @@
 //! what reads or writes a container's cells is written in place, and the rest is called through the
 //! runtime's helper named for it.
 
-import parsing (Span, prelude_binder)
-import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, list_type)
+import parsing (Span, span_key, prelude_binder)
+import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, named_type, int_type,
+              bytes_type, list_type)
 import typing (unknown_type)
 import resolve (qualify)
 import layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt, NodeLen, LeafAt,
@@ -35,9 +36,9 @@ pub fn builtin(
   at: Span,
 ) -> Lowered / {abort.raise} =
   match intrinsic_at(cx, name) {
-    Some(op) -> match called_at(cx, callee) {
+    Some(op) -> match called_at(cx, callee).ret {
       None -> refuse(st, Containers, b"an extern written in place the checker filed no type for"),
-      Some(f) -> laid(cx, st, op, args, f.ret, at),
+      Some(ret) -> laid(cx, st, op, args, ret, at),
     },
     None -> match resolved(cx, name) {
       None ->
@@ -46,12 +47,8 @@ pub fn builtin(
           Containers,
           b"an imported name that is neither a definition nor a builtin: ".concat(name),
         ),
-      Some(b) -> if scalar_builtin(b) { operated(cx, st, b, args, at) } else {
-        match called_at(cx, callee) {
-          None -> refuse(st, Containers, b"a builtin the checker filed no type for: ".concat(b)),
-          Some(f) -> contained(cx, st, b, args, f, at),
-        }
-      },
+      Some(b) -> if scalar_builtin(b) { operated(cx, st, b, args, at) }
+      else { contained(cx, st, b, args, called_at(cx, callee), at) },
     },
   }
 
@@ -103,11 +100,16 @@ pub fn through_runtime(
   handed(answer, held_as(cx.setting, ty), at)
 }
 
-/// The types a call of a builtin was settled at: its parameters' and its answer's.
-type Settled = { params: List<Type>, ret: Type }
+/// What the checker filed where a builtin's name is written: the type of the answer it called the
+/// builtin for, where it filed one, and the builtin's type arguments. Code the emitter writes for a
+/// type files only the type arguments.
+type Settled = { ret: Option<Type>, args: List<Type> }
 
-fn called_at(cx: Context, callee: Span) -> Option<Settled> =
-  match type_at(cx, callee) { Some(TyFn(f)) -> Some({ params: f.params, ret: f.ret }), _ -> None }
+fn called_at(cx: Context, callee: Span) -> Settled =
+  {
+    ret: match type_at(cx, callee) { Some(TyFn(f)) -> Some(f.ret), _ -> None },
+    args: match cx.setting.typed.get(span_key(callee)) { Some(t) -> t.args, None -> [] },
+  }
 
 /// A builtin that is no scalar's: written in place where it reads or writes a container's cells, and
 /// otherwise called through the runtime, which must implement it.
@@ -120,13 +122,13 @@ fn contained(
   at: Span,
 ) -> Lowered / {abort.raise} =
   if (name == b"List::len" || name == b"Bytes::len") && args.len() == 1 {
-    read_in_place(st, Length, args, f.ret, RInt, at)
+    read_in_place(st, Length, args, int_type(), RInt, at)
   } else if name == b"Array::len" && args.len() == 1 {
-    read_in_place(st, Elements, args, f.ret, RInt, at)
+    read_in_place(st, Elements, args, int_type(), RInt, at)
   } else if name == b"Bytes::at" && args.len() == 2 {
-    read_in_place(st, ByteAt, args, f.ret, RInt, at)
+    read_in_place(st, ByteAt, args, int_type(), RInt, at)
   } else if name == b"Bytes::u32_le" && args.len() == 2 {
-    read_in_place(st, U32At, args, f.ret, RNum({ bits: 32, signed: false }), at)
+    read_in_place(st, U32At, args, named_type(b"U32"), RNum({ bits: 32, signed: false }), at)
   } else if name == b"Bytes::concat_all" && args.len() == 1 { joined(cx, st, args, f, at) }
   else if is_callback(name) {
     refuse(st, Containers, b"a callback builtin outside its fused shape: ".concat(name))
@@ -136,12 +138,12 @@ fn contained(
     match laid_element(name, args, f) {
       Some(t) -> if has_vars(t) { called(cx, layout_needed(st, t), name, args, f, at) }
       else if name == b"Columns::get" { called(cx, st, name, args, f, at) }
-      else { arrayed(cx, st, name, args, t, f.ret, at) },
+      else { arrayed(cx, st, name, args, t, at) },
       None -> called(cx, st, name, args, f, at),
     }
   }
 
-/// A builtin called through the runtime, which must implement it.
+/// A builtin called through the runtime, which must implement it, at the type the checker filed.
 fn called(
   cx: Context,
   st: Lowering,
@@ -152,8 +154,18 @@ fn called(
 ) -> Lowered / {abort.raise} =
   if !cx.setting.builtins.contains(name) {
     refuse(st, Containers, b"a name the runtime implements no builtin of: ".concat(name))
-  } else if is_lookup(name) && args.len() == 2 { looked_up(cx, st, name, args, f.ret, at) }
-  else { through_runtime(cx, st, name, args, f.ret, at) }
+  } else {
+    match f.ret {
+      None ->
+        refuse(
+          st,
+          Containers,
+          b"a builtin called at a type the checker filed nowhere: ".concat(name),
+        ),
+      Some(ret) -> if is_lookup(name) && args.len() == 2 { looked_up(cx, st, name, args, ret, at) }
+      else { through_runtime(cx, st, name, args, ret, at) },
+    }
+  }
 
 /// `st` noting each type variable that leaves the layout of an element of type `t` unknown, which a
 /// specialisation would lay its elements out by.
@@ -222,7 +234,7 @@ fn joined(
     Some(parts) ->
       bound_as(
         { ..st, insts: st.insts.take(st.insts.len() - 1) },
-        f.ret,
+        bytes_type(),
         RWord,
         Op({
           op: OContainer(Joined),
@@ -391,29 +403,15 @@ fn is_lookup(name: Bytes) -> Bool = name == b"Array::at" || name == b"ListNode::
 
 /// The type of the elements a call of `name` lays out or reads where they lie: an array's for
 /// `Array::new`, `set`, `of_list` and `get`, and a `Columns`' for `Columns::get`.
-fn laid_element(name: Bytes, args: List<Arg>, f: Settled) -> Option<Type> = {
-  let held = if (name == b"Array::new" && args.len() == 2)
-      || (name == b"Array::set" && args.len() == 3)
-      || (name == b"Array::of_list" && args.len() == 1) { Some(f.ret) }
-  else if (name == b"Array::get" || name == b"Columns::get") && args.len() == 2 { f.params.at(0) }
-  else { None };
-  match held {
-    Some(TyCon(c)) -> if c.name != b"Array" && c.name != b"Columns" { None } else { c.args.at(0) },
-    _ -> None,
-  }
-}
+fn laid_element(name: Bytes, args: List<Arg>, f: Settled) -> Option<Type> =
+  if (name == b"Array::new" && args.len() == 2) || (name == b"Array::set" && args.len() == 3)
+      || (name == b"Array::of_list" && args.len() == 1)
+      || ((name == b"Array::get" || name == b"Columns::get") && args.len() == 2) { f.args.at(0) }
+  else { None }
 
-/// Array builtin `name` called on `args`, written over an array laid out for elements of type `ty`,
-/// answering a value of type `answer`.
-fn arrayed(
-  cx: Context,
-  st: Lowering,
-  name: Bytes,
-  args: List<Arg>,
-  ty: Type,
-  answer: Type,
-  at: Span,
-) -> Lowered =
+/// Array builtin `name` called on `args`, written over an array laid out for elements of type `ty`:
+/// `Array::get` answers an element, and the others the array.
+fn arrayed(cx: Context, st: Lowering, name: Bytes, args: List<Arg>, ty: Type, at: Span) -> Lowered =
   match element_of(ty) {
     None ->
       refuse(
@@ -437,6 +435,7 @@ fn arrayed(
       } else if name == b"Array::of_list" { { op: ArrayOfList(e), reps: [RWord], takes: [true] } }
       else { { op: ArrayGet(e), reps: [RWord, RInt], takes: [false, false] } };
       let got = name == b"Array::get";
+      let answer = if got { ty } else { TyCon({ name: b"Array", args: [ty] }) };
       let operands = range(0, args.len()).fold(
         { st: st, args: [] },
         |acc: { st: Lowering, args: List<Arg> }, i: Int|

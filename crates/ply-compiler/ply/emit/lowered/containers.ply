@@ -4,7 +4,8 @@
 
 import std.bytes (ascii_of_int)
 import std.prelude_source
-import types (Type, TyCon)
+import types (Type, TyCon, TyFn)
+import typing (Typed, filed_as, unknown_type)
 import diagnostics (parse_all)
 import front (Analysed, analyse, dump_of, analyse_pulling_std_with, no_rows)
 import resolve (qualify)
@@ -279,6 +280,95 @@ test "an array of a type variable's elements is made by the runtime, its layout 
     },
     Err(no) -> panic(String::of_bytes_lossy(no.why)),
   }
+}
+
+test "a builtin where only its type arguments are filed, as in code written for a type, is still written in place" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn count(xs: List<Int>) -> Int = xs.len()\n",
+      b"fn read(a: Array<Int>, i: Int) -> Int / {abort.raise} = a.get(i)\n",
+      b"fn glued(a: Bytes, b: Bytes) -> Bytes = Bytes::concat_all([a, b])\n",
+      b"fn measured(s: String) -> Int = s.len()\n",
+    ]),
+  );
+  let typed = p.setting.typed.keys().fold(p.setting.typed, |m: Map<Bytes, Typed>, k: Bytes|
+    match m.get(k) {
+      Some(t) -> match t.ty { TyFn(_) -> m.insert(k, filed_as(unknown_type(), t.args)), _ -> m },
+      None -> m,
+    });
+  let q = { ..p, setting: { ..p.setting, typed: typed } };
+  let op = |name: Bytes|
+    ops_in(bound_in(q, name)).map(
+      |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.op,
+    );
+  assert_eq(op(b"count"), [OContainer(Length)]);
+  assert_eq(op(b"read"), [
+    OContainer(ArrayGet({ bits: Some(IntBits), stride: 1, shape: [b"e!int"], counted: [] })),
+  ]);
+  assert_eq(op(b"glued"), [OContainer(Joined)]);
+  // A call through the runtime answers a value of the type the checker filed, so it waits for one.
+  assert_eq(
+    match formed(q, b"measured") { Ok(_) -> None, Err(no) -> Some(no.by) },
+    Some(Containers),
+  )
+}
+
+/// Module `m` of the program of `sources`, run by a runtime implementing `natives`.
+fn program_of_modules(
+  sources: List<{ name: Bytes, src: Bytes }>,
+  natives: List<Bytes>,
+) -> Program / {abort.raise} =
+  match analyse(parse_all(sources)) {
+    Analysed(a) -> match setting_in(a, b"m") {
+      Ok(s) ->
+        { src: b"", analysis: a, setting: { ..s.setting, builtins: natives }, roots: s.roots },
+      Err(why) -> panic(String::of_bytes_lossy(why)),
+    },
+    _ -> panic("the program does not check"),
+  }
+
+test "a name no import takes is the builtin's, and an import that takes a builtin's name is called instead" {
+  let names = |p: Program, root: Bytes|
+    natives_in(bound_in(p, root)).map(
+      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
+    );
+  let whole = program_of_modules(
+    [
+      { name: b"min", src: b"pub fn size(xs: List<Int>) -> Int = xs.len()\n" },
+      {
+        name: b"m",
+        src: b"import min\nfn least(x: Int) -> Int = min(x, 1)\nfn n(xs: List<Int>) -> Int = min::size(xs)\n",
+      },
+    ],
+    [b"min", b"List::len"],
+  );
+  assert_eq(names(whole, b"least"), [b"builtin_min_p"]);
+  assert(
+    match formed(whole, b"n") {
+      Ok(f) ->
+        natives_in(
+            f.body.fold([], |acc: List<Bound>, i: Inst|
+              match i { Let(l) -> acc.push({ var: l.var, val: l.val }), _ -> acc }),
+          )
+          == [],
+      Err(no) -> no.by != Containers,
+    },
+    None,
+  );
+  let taken = program_of_modules(
+    [
+      { name: b"a", src: b"pub fn min(x: Int, y: Int) -> Int = x\n" },
+      { name: b"m", src: b"import a (min)\nfn least(x: Int) -> Int = min(x, 1)\n" },
+    ],
+    [b"min"],
+  );
+  assert(
+    match formed(taken, b"least") {
+      Ok(_) -> names(taken, b"least") == [],
+      Err(no) -> no.by != Containers,
+    },
+    None,
+  )
 }
 
 test "a builtin the runtime lacks is declined, and one written at a scalar's type goes on to scalars" {
