@@ -9,14 +9,14 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// The shipped modules: each `.ply` file at or below it is one, `hash/legacy.ply` being
-/// `std.hash.legacy`. Every other file at or below it is data those modules embed.
-pub const STD: &str = "crates/ply-std/ply";
+/// The standard library: each `.ply` file at or below it is a shipped module, `hash/legacy.ply`
+/// being `std.hash.legacy`. Every other file at or below it is data those modules embed.
+pub const STD: &str = "std";
 
 const MODULE: &str = ".ply";
 
-/// The compiler's own modules, shipped as `compiler.<stem>`.
-pub const COMPILER: &str = "crates/ply-compiler/ply";
+/// The compiler's own modules, `emit/roots.ply` being `compiler.emit.roots`.
+pub const COMPILER: &str = "compiler";
 
 /// What every shipped module answers, as `ply std --answers` writes it: a file of zstd frames and
 /// its index, itself one frame.
@@ -61,15 +61,6 @@ impl Pack {
 
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|entry| entry.path.as_str())
-    }
-
-    /// The paths of the files directly in `dir`, ascending.
-    pub fn files_in<'a>(&'a self, dir: &str) -> impl Iterator<Item = &'a str> + 'a {
-        let prefix = format!("{dir}/");
-        self.paths().filter(move |path| {
-            path.strip_prefix(prefix.as_str())
-                .is_some_and(|name| !name.contains('/'))
-        })
     }
 
     /// The paths of the data files at or below `dir`, ascending: every file there that is no

@@ -1,0 +1,1657 @@
+//! What is checked once a module is solved: derives, instances, numerics, comparisons, simulations and regions.
+
+import syntax.parsing (Span, Ident)
+import syntax.type_syntax (mode_text)
+import syntax.items (Item, IDerive, Deriver, DEq, DOrd, DHash, deriver_text, Derived, DeriveDef,
+                     IInstance, InstanceDef, NKey, NShow, instance_text, INumeric, NumericDef,
+                     NumericOp, numeric_ops, numeric_by)
+import check.types (Resource, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord, Field,
+                    Free, atoms_covered, row_empty, row_is_pure, atom_conflicts, named_type,
+                    int_type, string_type, fresh_new, subst_new, occurs_ty, free_vars, env_new,
+                    label_of, atom_text, type_text, row_text, at_arguments, over_arg, TyNominal)
+import check.resolve.tables (ParsedModule, Resolved, Diag, Label, qualify, error_with_labels,
+                             error_at, label_at)
+import expand.derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
+                      NullInsideOption, HoldsSecret, HoldsNative, float_reason, null_in_option_note,
+                      same_deriver)
+import std.bytes
+import std.bytes (ascii_of_int)
+import std.option
+import std.string
+import check.guards
+import check.infer.checker (DeclaredAlias, DeclaredExtern, DeclaredRecord, DeclaredSum, TypeDecl,
+                            EffectInfo, CtorInfo, DefConstraint, InstanceInfo, DefInfo, ClauseSite,
+                            SpawnSite, HandoffSite, RegionSite, Brand, HoldsOf, Tasks, Simulation,
+                            ParallelSite, Known, no_known, Given, Checker, WithTy, report,
+                            report_error_at, report_error_at_and, err_labels, backticked_text,
+                            what_of, resolve, resolve_row_in, seed_atom, def_of, channel_ops,
+                            install_prelude, mode_eq, Blocked, AlgebraicShape, Shapes, find_adt,
+                            derivable)
+import check.infer.names (simple_name_of)
+import check.infer.declarations (conv_type, scheduler_handle, task_op, row_brands)
+import check.infer.expr (as_written, numeric_of)
+import check.infer.definitions (algebraic_shapes, is_key)
+import check.infer.derivable (native_notes, secret_notes, handle_what, instance_of, instance_shapes,
+                              deriver_shapes, shapes_for, OwnParams, own_params)
+
+// --- The two passes that read what expansion produced --------------------------------------------
+
+fn expanded_here(parsed: ParsedModule, def: DeriveDef) -> Bool =
+  parsed.derived.fold(false, |acc: Bool, d: Derived|
+    acc || (same_deriver(d.deriver, def.deriver) && d.target == def.target.name))
+
+/// The target as a solved type when it has no parameters; an alias's reports are dropped, already made at its declaration.
+fn derive_target(
+  checker: Checker,
+  parsed: ParsedModule,
+  target: Bytes,
+) -> Option<WithTy> / {abort.raise} = {
+  let qualified = qualify(parsed.name, target);
+  match checker.types.get(qualified) {
+    None -> None,
+    Some(decl) -> if decl.params.len() > 0 || decl.labels.len() > 0 || decl.rows.len() > 0 { None }
+    else {
+      match decl.declared {
+        DeclaredSum -> Some({ checker: checker, ty: TyCon({ name: qualified, args: [] }) }),
+        DeclaredExtern -> Some({ checker: checker, ty: TyCon({ name: qualified, args: [] }) }),
+        DeclaredRecord(_) -> match checker.nominals.get(qualified) {
+          Some(r) -> Some({ checker: checker, ty: r.ty }),
+          None -> None,
+        },
+        DeclaredAlias(alias) -> {
+          let mark = checker.diags.len();
+          let inner: Checker = {
+            ..checker,
+            ty_params: Map::new(),
+            row_params: Map::new(),
+            label_params: Map::new(),
+            alias_stack: checker.alias_stack.push(qualified),
+            module: decl.owner,
+          };
+          let o: WithTy = conv_type(inner, alias);
+          Some({
+            checker: {
+              ..o.checker,
+              ty_params: checker.ty_params,
+              row_params: checker.row_params,
+              label_params: checker.label_params,
+              alias_stack: checker.alias_stack,
+              module: checker.module,
+              diags: o.checker.diags.take(mark),
+            },
+            ty: o.ty,
+          })
+        },
+      }
+    },
+  }
+}
+
+fn why_notes_for_derive(
+  w: DeriveRefusal,
+  deriver: Deriver,
+  b: Blocked,
+  blocker: Bytes,
+) -> List<Bytes> =
+  match w {
+    NullInsideOption ->
+      [
+        Bytes::concat_all([b"`", blocker, b"` writes `None` and its payload alike"]),
+        null_in_option_note(),
+      ],
+    HoldsFloat -> [float_reason(deriver)],
+    HoldsFunction -> [b"a function has no encoding to derive"],
+    HoldsHandle ->
+      [
+        Bytes::concat_all([
+          b"a `",
+          handle_what(b.ty),
+          b"` names a location rather than a value, so it has no encoding",
+        ]),
+      ],
+    HoldsSecret -> secret_notes(deriver),
+    HoldsNative -> native_notes(blocker, deriver),
+    Unconstrained(_) -> [],
+  }
+
+/// A `derive` the checker refuses: where it stands, and what is said of it.
+type RefusedDerive = { at: Place, diag: Diag }
+
+/// `derivable(D, T)` over each `derive`'s target as a solved type, and the derives it refuses,
+/// which are reported once [`attribute_generated`] has set their bodies aside.
+pub fn check_derives(
+  checker: Checker,
+) -> { checker: Checker, refused: List<RefusedDerive> } / {abort.raise} = {
+  let shapes = deriver_shapes(checker.instances, algebraic_shapes(checker));
+  range(0, checker.modules.len()).fold(
+    { checker: checker, refused: [] },
+    |acc: { checker: Checker, refused: List<RefusedDerive> }, i: Int| {
+      let m = acc.checker.modules.get(i);
+      m.module.items.fold(
+        acc,
+        |cc: { checker: Checker, refused: List<RefusedDerive> }, item: Item|
+          match item {
+            IDerive(def) -> if !expanded_here(m, def) { cc } else {
+              match derive_target({ ..cc.checker, module: i }, m, def.target.name) {
+                None -> cc,
+                Some(o) -> match derivable(def.deriver, o.ty, shapes_for(shapes, def.deriver), []) {
+                  None -> { ..cc, checker: o.checker },
+                  Some(blocked) -> match blocked.why {
+                    Unconstrained(_) -> { ..cc, checker: o.checker },
+                    _ -> {
+                      let blocker = type_text(blocked.ty);
+                      let dv = deriver_text(def.deriver);
+                      {
+                        checker: o.checker,
+                        refused: cc.refused.push({
+                          at: { module: i, start: def.span.start, end: def.span.end },
+                          diag: error_at(
+                            b"E0206",
+                            i,
+                            def.span,
+                            Bytes::concat_all([
+                              b"`",
+                              dv,
+                              b"` cannot be derived for `",
+                              def.target.name,
+                              b"`",
+                            ]),
+                            Bytes::concat_all([b"`", blocker, b"` has no ", what_of(def.deriver)]),
+                            why_notes_for_derive(blocked.why, def.deriver, blocked, blocker).push(
+                              Bytes::concat_all([
+                                b"write the dictionary for `",
+                                def.target.name,
+                                b"` by hand, or change the field",
+                              ]),
+                            ),
+                          ),
+                        }),
+                      }
+                    },
+                  },
+                },
+              }
+            },
+            _ -> cc,
+          },
+      )
+    },
+  )
+}
+
+// --- What a type's module states of it ----------------------------------------------------------
+
+fn unfit(checker: Checker, def: InstanceDef, f: DefInfo, why: Bytes, note: Bytes) -> Checker =
+  err_labels(
+    checker,
+    b"E0218",
+    Bytes::concat_all([
+      b"`",
+      def.by.name,
+      b"` cannot be the `",
+      instance_text(def.kind),
+      b"` of `",
+      def.target.name,
+      b"`",
+    ]),
+    [
+      label_at(checker.module, def.by.span, true, why),
+      label_at(f.at.module, f.at.span, false, b"the function it names"),
+    ],
+    [
+      note,
+      match def.kind {
+        NKey ->
+          Bytes::concat_all([
+            b"a `key` takes one `",
+            def.target.name,
+            b"` and answers what `==`, `compare`, `digest` and a `Map` read in its place",
+          ]),
+        NShow ->
+          Bytes::concat_all([
+            b"a `show` takes one `",
+            def.target.name,
+            b"` and answers the `String` that `show` and an interpolated string write",
+          ]),
+      },
+    ],
+  )
+
+/// One `key for T by f` or `show for T by f`: the type is a sum of this module's own, it states
+/// each once, and `f` is a function of this module that takes the value alone and only answers.
+fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checker / {abort.raise} = {
+  let what = instance_text(def.kind);
+  let type_name = qualify(m.name, def.target.name);
+  match checker.types.get(type_name) {
+    None ->
+      report_error_at(
+        checker,
+        b"E0208",
+        def.target.span,
+        Bytes::concat_all([b"`", def.target.name, b"` is not a type this module declares"]),
+        b"declared in another module, or not at all",
+        [
+          Bytes::concat_all([
+            b"a `",
+            what,
+            b"` may only name a type its own module declares, so that a type means one thing wherever its values are compared or shown",
+          ]),
+        ],
+      ),
+    Some(decl) -> {
+      match decl.declared {
+        DeclaredAlias(_) ->
+          not_a_sum(
+            checker,
+            def.target,
+            decl,
+            Bytes::concat_all([
+              b"`",
+              def.target.name,
+              b"` is not a sum, and a `",
+              what,
+              b"` is for one",
+            ]),
+            b"an alias is the type it names, so a `key` or a `show` for one would be for every value of that type",
+          ),
+        DeclaredRecord(_) ->
+          not_a_sum(
+            checker,
+            def.target,
+            decl,
+            Bytes::concat_all([
+              b"`",
+              def.target.name,
+              b"` is a `new` record, which cannot state a `",
+              what,
+              b"` yet",
+            ]),
+            b"a `new` record runs as the record it is written as, so nothing in a value says which type it is of where it is compared or shown",
+          ),
+        DeclaredExtern ->
+          not_a_sum(
+            checker,
+            def.target,
+            decl,
+            Bytes::concat_all([
+              b"`",
+              def.target.name,
+              b"` is an `extern type`, which states no `",
+              what,
+              b"`",
+            ]),
+            b"the toolchain lays out its values, and nothing compares or shows one",
+          ),
+        DeclaredSum -> match instance_of(checker.instances, type_name, is_key(def.kind)) {
+          Some(first) ->
+            report_error_at_and(
+              checker,
+              b"E0105",
+              def.span,
+              Bytes::concat_all([b"`", def.target.name, b"` states its `", what, b"` twice"]),
+              b"stated again here",
+              first.at,
+              b"first stated here",
+              [b"a type has one, so that nothing has to choose between two; remove one"],
+            ),
+          None -> match def_of(checker, qualify(m.name, def.by.name)) {
+            None ->
+              report_error_at(
+                checker,
+                b"E0101",
+                def.by.span,
+                Bytes::concat_all([b"`", def.by.name, b"` is not a function this module declares"]),
+                Bytes::concat_all([b"a `", what, b"` names a function of its type's own module"]),
+                [],
+              ),
+            Some(f) -> fitted(checker, def, type_name, f),
+          },
+        },
+      }
+    },
+  }
+}
+
+fn not_a_sum(
+  checker: Checker,
+  target: Ident,
+  decl: TypeDecl,
+  message: Bytes,
+  why: Bytes,
+) -> Checker =
+  report_error_at_and(
+    checker,
+    b"E0217",
+    target.span,
+    message,
+    b"this type has no constructor",
+    { module: decl.owner, span: decl.span },
+    b"declared here",
+    [
+      why,
+      Bytes::concat_all([
+        b"declare a sum, as `type ",
+        target.name,
+        b" = | ",
+        target.name,
+        b"(..)`, whose constructor a value carries",
+      ]),
+    ],
+  )
+
+fn fitted(
+  checker: Checker,
+  def: InstanceDef,
+  type_name: Bytes,
+  f: DefInfo,
+) -> Checker / {abort.raise} =
+  match resolve(checker, f.scheme.ty) {
+    TyFn(sig) -> if sig.params.len() != 1 {
+      unfit(
+        checker,
+        def,
+        f,
+        Bytes::concat_all([
+          b"this function takes ",
+          ascii_of_int(sig.params.len()),
+          b" parameters",
+        ]),
+        b"it is called with the value alone",
+      )
+    } else if f.scheme.label_vars.len() > 0 {
+      unfit(
+        checker,
+        def,
+        f,
+        b"this function binds a resource label",
+        b"it is called with the value alone, and a value does not carry the label its type was given, so a type that binds a label states no `key` and no `show`",
+      )
+    } else {
+      match own_params(sig.params.get(0), type_name) {
+        None ->
+          unfit(
+            checker,
+            def,
+            f,
+            Bytes::concat_all([b"this function takes `", type_text(sig.params.get(0)), b"`"]),
+            Bytes::concat_all([
+              b"its parameter is `",
+              def.target.name,
+              b"` at the type's own parameters, so it reads every `",
+              def.target.name,
+              b"` there is",
+            ]),
+          ),
+        Some(own) -> if beyond_carried(checker, type_name, f, own) {
+          unfit(
+            checker,
+            def,
+            f,
+            Bytes::concat_all([
+              b"this function is constrained beyond what `",
+              def.target.name,
+              b"` carries",
+            ]),
+            b"it is called with the value alone, wherever two are compared or one is shown, so no call meets a constraint: its signature may need only the order the type itself carries, where what it holds keys a `Map` by the parameter",
+          )
+        } else if !row_is_pure(sig.effects) {
+          unfit(
+            checker,
+            def,
+            f,
+            Bytes::concat_all([b"this function's row is `", row_text(sig.effects), b"`"]),
+            b"`==`, `compare` and `show` perform nothing, cannot raise and always return, so the function they read through does the same",
+          )
+        } else if !answers_over(free_vars(checker.subst, sig.ret, { tys: [], rows: [] }), own) {
+          unfit(
+            checker,
+            def,
+            f,
+            Bytes::concat_all([b"this function answers `", type_text(sig.ret), b"`"]),
+            b"what it answers is over the type's own parameters and no others",
+          )
+        } else if !is_key(def.kind) && sig.ret != string_type() {
+          unfit(
+            checker,
+            def,
+            f,
+            Bytes::concat_all([b"this function answers `", type_text(sig.ret), b"`"]),
+            b"what is shown is text",
+          )
+        } else {
+          {
+            ..checker,
+            instances: checker.instances.push({
+              type_name: type_name,
+              kind: def.kind,
+              by: f.name,
+              params: own.params,
+              rows: own.rows,
+              answers: sig.ret,
+              at: { module: checker.module, span: def.span },
+            }),
+          }
+        },
+      }
+    },
+    _ -> checker,
+  }
+
+/// Whether `f`, taking the type `type_name` at its own parameters `own`, is constrained, written or
+/// implied, beyond the order the type carries of those parameters.
+fn beyond_carried(checker: Checker, type_name: Bytes, f: DefInfo, own: OwnParams) -> Bool =
+  if f.constraints.len() == 0 { false } else {
+    let positions = match checker.carrying.get(type_name) { Some(ps) -> ps, None -> [] };
+    let carried = positions.fold([], |acc: List<Int>, j: Int|
+      match own.params.at(j) { Some(v) -> acc.push(v), None -> acc });
+    f.constraints.any(|c: DefConstraint|
+      !same_deriver(c.deriver, DOrd)
+        || (match f.scheme.ty_vars.at(c.param) { Some(v) -> !carried.contains(v), None -> true }))
+  }
+
+/// Whether every variable an answer's type holds is one of the type's own parameters.
+fn answers_over(free: Free, own: OwnParams) -> Bool =
+  free.tys.fold(true, |all: Bool, v: Int| all && own.params.contains(v))
+    && free.rows.fold(true, |all: Bool, v: Int| all && own.rows.contains(v))
+
+/// What a module states of its types, read before any body is: the first `numeric` each type is
+/// given, as written, and each type given a `key`. `check_instances` judges them.
+pub fn collect_stated(checker: Checker, parsed: ParsedModule) -> Checker =
+  parsed.module.items.fold(checker, |c: Checker, item: Item|
+    match item {
+      IInstance(def) -> match def.kind {
+        NKey -> { ..c, keyed_names: c.keyed_names.push(qualify(parsed.name, def.target.name)) },
+        NShow -> c,
+      },
+      INumeric(def) -> {
+        let type_name = qualify(parsed.name, def.target.name);
+        match numeric_of(c.numeric_types, type_name) {
+          Some(_) -> c,
+          None ->
+            {
+              ..c,
+              numeric_types: c.numeric_types.push({
+                type_name: type_name,
+                ctor: c.ctors.fold(b"", |found: Bytes, k: CtorInfo|
+                  if found.len() == 0 && k.type_name == type_name { k.name } else { found }),
+                fns: numeric_ops().map(|op: Bytes|
+                  match numeric_by(def, op) {
+                    Some(by) -> qualify(parsed.name, by.name),
+                    None -> b"",
+                  }),
+                at: { module: c.module, span: def.span },
+              }),
+            },
+        }
+      },
+      _ -> c,
+    })
+
+/// One `numeric for T by { .. }`: the type is a sum of this module's own that takes no parameters
+/// and states it once, the record names each operation once, and each function is one of this
+/// module's that takes and answers the type alone and only answers.
+fn check_numeric(checker: Checker, m: ParsedModule, def: NumericDef) -> Checker / {abort.raise} = {
+  let type_name = qualify(m.name, def.target.name);
+  let named = |text: Bytes| Bytes::concat_all([b"`", def.target.name, text]);
+  match checker.types.get(type_name) {
+    None ->
+      report_error_at(
+        checker,
+        b"E0208",
+        def.target.span,
+        named(b"` is not a type this module declares"),
+        b"declared in another module, or not at all",
+        [
+          b"a `numeric` may only name a type its own module declares, so that an operator means one thing wherever the type's values meet it",
+        ],
+      ),
+    Some(decl) -> match decl.declared {
+      DeclaredAlias(_) ->
+        not_a_sum(
+          checker,
+          def.target,
+          decl,
+          named(b"` is not a sum, and a `numeric` is for one"),
+          b"an alias is the type it names, so a `numeric` for one would be for every value of that type",
+        ),
+      DeclaredRecord(_) ->
+        not_a_sum(
+          checker,
+          def.target,
+          decl,
+          named(b"` is a `new` record, which cannot state a `numeric` yet"),
+          b"a `new` record runs as the record it is written as, so nothing in a value says which type's arithmetic an operator over it is",
+        ),
+      DeclaredExtern ->
+        not_a_sum(
+          checker,
+          def.target,
+          decl,
+          named(b"` is an `extern type`, which states no `numeric`"),
+          b"the toolchain lays out its values, and no operator reads one",
+        ),
+      DeclaredSum -> if decl.params.len() + decl.labels.len() + decl.rows.len() > 0 {
+        report_error_at_and(
+          checker,
+          b"E0216",
+          def.target.span,
+          named(b"` takes parameters, and a `numeric` is for a type that takes none"),
+          b"a type with parameters",
+          { module: decl.owner, span: decl.span },
+          b"declared here",
+          [
+            b"an operator calls the type's functions with its values alone, and `numeric_of_int` with none: nothing there says what a parameter is, or fills a constraint on one",
+          ],
+        )
+      } else {
+        match numeric_of(checker.numeric_types, type_name) {
+          Some(first) -> if first.at.span != def.span {
+            report_error_at_and(
+              checker,
+              b"E0105",
+              def.span,
+              named(b"` states its `numeric` twice"),
+              b"stated again here",
+              first.at,
+              b"first stated here",
+              [b"a type has one, so that nothing has to choose between two; remove one"],
+            )
+          } else {
+            let listed: Checker = numeric_listed(checker, def);
+            if listed.diags.len() > checker.diags.len() { listed } else {
+              def.ops.fold(listed, |c: Checker, x: NumericOp|
+                numeric_fitted(c, m, def, type_name, x))
+            }
+          },
+          None -> checker,
+        }
+      },
+    },
+  }
+}
+
+/// The record names each operation once, and nothing else.
+fn numeric_listed(checker: Checker, def: NumericDef) -> Checker / {abort.raise} = {
+  let why = b"a `numeric` names a function for each of `add`, `sub`, `mul`, `neg` and `of_int`, once: `+`, binary `-`, `*`, unary `-`, and what `numeric_of_int` calls";
+  let named = range(0, def.ops.len()).fold(checker, |c: Checker, i: Int| {
+    let x = def.ops.get(i);
+    if !numeric_ops().contains(x.op.name) {
+      report_error_at(
+        c,
+        b"E0215",
+        x.op.span,
+        Bytes::concat_all([b"`", x.op.name, b"` is no operation a `numeric` states"]),
+        b"not one of the five",
+        [why],
+      )
+    } else if range(0, i).fold(false, |seen: Bool, j: Int|
+        seen || def.ops.get(j).op.name == x.op.name) {
+      report_error_at(
+        c,
+        b"E0215",
+        x.op.span,
+        Bytes::concat_all([b"this `numeric` names `", x.op.name, b"` twice"]),
+        b"named again here",
+        [why],
+      )
+    } else { c }
+  });
+  let missing = numeric_ops().filter(|op: Bytes| numeric_by(def, op) == None);
+  if missing.len() == 0 { named } else {
+    report_error_at(
+      named,
+      b"E0215",
+      def.span,
+      Bytes::concat_all([
+        b"this `numeric` names no function for ",
+        Bytes::join(missing.map(backticked_text), b", "),
+      ]),
+      b"an operation is missing",
+      [why],
+    )
+  }
+}
+
+/// What `x`'s function takes, and that it answers the type: `(T, T) -> T`, `(T) -> T` for `neg`,
+/// `(Int) -> T` for `of_int`.
+fn numeric_fitted(
+  checker: Checker,
+  m: ParsedModule,
+  def: NumericDef,
+  type_name: Bytes,
+  x: NumericOp,
+) -> Checker / {abort.raise} =
+  match def_of(checker, qualify(m.name, x.by.name)) {
+    None ->
+      report_error_at(
+        checker,
+        b"E0101",
+        x.by.span,
+        Bytes::concat_all([b"`", x.by.name, b"` is not a function this module declares"]),
+        b"a `numeric` names functions of its type's own module",
+        [],
+      ),
+    Some(f) -> {
+      let own = named_type(type_name);
+      let takes = if x.op.name == b"of_int" { [int_type()] }
+      else if x.op.name == b"neg" { [own] }
+      else { [own, own] };
+      let unfit = |why: Bytes, note: Bytes|
+        err_labels(
+          checker,
+          b"E0218",
+          Bytes::concat_all([
+            b"`",
+            x.by.name,
+            b"` cannot be the `",
+            x.op.name,
+            b"` of `",
+            def.target.name,
+            b"`",
+          ]),
+          [
+            label_at(checker.module, x.by.span, true, why),
+            label_at(f.at.module, f.at.span, false, b"the function it names"),
+          ],
+          [
+            note,
+            Bytes::concat_all([
+              b"`",
+              x.op.name,
+              b"` is `",
+              type_text(TyFn({ params: takes, ret: own, effects: row_empty() })),
+              b"`",
+            ]),
+          ],
+        );
+      match resolve(checker, f.scheme.ty) {
+        TyFn(sig) -> if f.constraints.len() > 0 || f.scheme.ty_vars.len() > 0
+            || f.scheme.row_vars.len() > 0
+            || f.scheme.label_vars.len() > 0 {
+          unfit(
+            b"this function binds a parameter of its own",
+            b"an operator calls it with the values alone, so no call fills a type, a row, a label or a constraint",
+          )
+        } else if sig.params != takes || sig.ret != own {
+          unfit(
+            Bytes::concat_all([
+              b"this function is `",
+              type_text(resolve(checker, f.scheme.ty)),
+              b"`",
+            ]),
+            b"an operator takes and answers the type it is at",
+          )
+        } else if !row_is_pure(sig.effects) {
+          unfit(
+            Bytes::concat_all([b"this function's row is `", row_text(sig.effects), b"`"]),
+            b"an operator at a number performs nothing, cannot raise and always returns, as `+` does at `Int`, so `a + b` gains no row where the type is this one",
+          )
+        } else { checker },
+        _ -> checker,
+      }
+    },
+  }
+
+fn first_key_loop(
+  tys: List<Type>,
+  instances: List<InstanceInfo>,
+  adts: Shapes,
+  path: List<Bytes>,
+  room: Int,
+) -> Option<List<Bytes>> / {abort.raise} =
+  tys.fold(None, |acc: Option<List<Bytes>>, ty: Type|
+    match acc { Some(_) -> acc, None -> key_loop(ty, instances, adts, path, room) })
+
+/// The declared types a comparison of `ty` reads on the way back to a keyed one it is already
+/// inside: a type that states a `key` is read as what the key answers, and any other as its fields.
+/// `path` is the types entered, and `room` how many more the walk may enter.
+fn key_loop(
+  ty: Type,
+  instances: List<InstanceInfo>,
+  adts: Shapes,
+  path: List<Bytes>,
+  room: Int,
+) -> Option<List<Bytes>> / {abort.raise} =
+  match ty {
+    TyVar(_) -> None,
+    TyFn(_) -> None,
+    TyRecord(fs) -> first_key_loop(fs.map(|f: Field| f.ty), instances, adts, path, room),
+    TyNominal(n) -> first_key_loop(n.fields.map(|f: Field| f.ty), instances, adts, path, room),
+    TyCon(c) -> match instance_of(instances, c.name, true) {
+      Some(x) -> if path.contains(c.name) { Some(path.push(c.name)) } else {
+        if room <= 0 { None } else {
+          key_loop(
+            at_arguments(x.answers, x.params, x.rows, c.args),
+            instances,
+            adts,
+            path.push(c.name),
+            room - 1,
+          )
+        }
+      },
+      None -> match find_adt(adts, c.name) {
+        None -> first_key_loop(c.args, instances, adts, path, room),
+        Some(adt) -> if path.contains(c.name) { None } else {
+          if room <= 0 { None } else {
+            first_key_loop(
+              adt.fields.map(|f: Type| at_arguments(f, adt.params, adt.rows, c.args)),
+              instances,
+              adts,
+              path.push(c.name),
+              room - 1,
+            )
+          }
+        },
+      },
+    },
+  }
+
+/// Every `key` and `show` the program states. A key's type is ordered and hashed, so one function
+/// decides `==`, `compare` and `digest` alike, and is not read through its own type again.
+pub fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
+  let stated: Checker = range(0, checker.modules.len()).fold(checker, |c: Checker, i: Int| {
+    let m = c.modules.get(i);
+    m.module.items.fold(c, |cc: Checker, item: Item|
+      match item {
+        IInstance(def) -> check_instance({ ..cc, module: i }, m, def),
+        INumeric(def) -> check_numeric({ ..cc, module: i }, m, def),
+        _ -> cc,
+      })
+  });
+  if stated.instances.len() == 0 { { ..stated, module: checker.module } } else {
+    let adts = algebraic_shapes(stated);
+    let shapes = deriver_shapes(stated.instances, adts);
+    let judged: Checker = stated.instances.fold(stated, |c: Checker, x: InstanceInfo|
+      if !is_key(x.kind) { c } else {
+        let simple = simple_name_of(x.type_name);
+        match key_loop(x.answers, stated.instances, adts, [x.type_name], adts.len() + 1) {
+          Some(path) ->
+            report(
+              c,
+              error_at(
+                b"E0219",
+                x.at.module,
+                x.at.span,
+                Bytes::concat_all([
+                  b"`",
+                  simple,
+                  b"` is compared through a key that holds `",
+                  simple,
+                  b"`",
+                ]),
+                Bytes::concat_all([b"this key answers `", type_text(x.answers), b"`"]),
+                [
+                  Bytes::concat_all([
+                    b"comparing two of them reads ",
+                    Bytes::join(
+                      path.map(|n: Bytes| backticked_text(simple_name_of(n))),
+                      b", then ",
+                    ),
+                    b", and so never ends",
+                  ]),
+                  Bytes::concat_all([b"answer a type that holds no `", simple, b"`"]),
+                ],
+              ),
+            ),
+          None ->
+            [DOrd, DHash].fold(c, |cc: Checker, deriver: Deriver|
+              if cc.diags.len() > c.diags.len() { cc } else {
+                match derivable(deriver, x.answers, shapes_for(shapes, deriver), x.params) {
+                  None -> cc,
+                  Some(blocked) -> {
+                    let blocker = type_text(blocked.ty);
+                    report(
+                      cc,
+                      error_at(
+                        b"E0206",
+                        x.at.module,
+                        x.at.span,
+                        Bytes::concat_all([
+                          b"`",
+                          blocker,
+                          b"` has no ",
+                          what_of(deriver),
+                          b", so it cannot be the key of `",
+                          simple,
+                          b"`",
+                        ]),
+                        Bytes::concat_all([b"this key answers `", type_text(x.answers), b"`"]),
+                        why_notes_for_derive(blocked.why, deriver, blocked, blocker).push(
+                          b"one key decides `==`, `compare`, `digest` and a `Map`'s order, so what it answers is ordered and hashed",
+                        ),
+                      ),
+                    )
+                  },
+                }
+              }),
+        }
+      });
+    { ..judged, module: checker.module }
+  }
+}
+
+/// Anything a generated definition failed on, other than a name it could not see, is Ply's fault,
+/// unless its derive is one of `refused`: a refused derive has no body to fault, so all that is said
+/// of it is its refusal.
+pub fn attribute_generated(
+  checker: Checker,
+  refused: List<RefusedDerive>,
+) -> Checker / {abort.raise} = {
+  let spans = range(0, checker.modules.len()).fold([], |acc: List<Place>, i: Int|
+    checker.modules.get(i).derived.fold(acc, |places: List<Place>, d: Derived|
+      places.push({ module: i, start: d.span.start, end: d.span.end })));
+  let set_aside = refused.map(|r: RefusedDerive| r.at);
+  let derived_at = |d: Diag|
+    match d.labels.fold(None, |acc: Option<Label>, l: Label|
+        match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } }) {
+      Some(p) -> {
+        let at = { module: p.module, start: p.start, end: p.end };
+        if spans.contains(at) { Some(at) } else { None }
+      },
+      None -> None,
+    };
+  {
+    ..checker,
+    diags: checker.diags.fold([], |acc: List<Diag>, d: Diag|
+      match derived_at(d) {
+        None -> acc.push(d),
+        Some(at) -> if set_aside.contains(at) { acc }
+        else if d.code == b"E0206" { acc.push(d) }
+        else { acc.push(blamed_on_deriver(d)) },
+      }).concat(
+      refused.map(|r: RefusedDerive| r.diag),
+    ),
+  }
+}
+
+/// Where a label stands, which a generated definition's diagnostics share with its derive.
+type Place = { module: Int, start: Int, end: Int }
+
+fn blamed_on_deriver(d: Diag) -> Diag =
+  {
+    code: b"E0505",
+    notes: d.notes + 2,
+    labels: d.labels,
+    text: d.text,
+    message: b"a derived definition does not typecheck",
+    notes_text: push_front_bytes(
+      b"this is a compiler bug in the deriver: ".concat(d.message),
+      d.notes_text,
+    ).push(
+      b"derivation is total, so a generated body that fails to check is Ply's fault rather than yours",
+    ),
+    severity: d.severity,
+    fixes: d.fixes,
+  }
+
+// --- Comparisons, simulations and regions, once the module is solved ------------------------------
+
+/// A row a declared type is given is no function: the ones it holds are its fields'.
+fn contains_fn(t: Type) -> Bool =
+  match t {
+    TyFn(_) -> !over_arg(t),
+    TyCon(c) -> c.args.fold(false, |b: Bool, a: Type| b || contains_fn(a)),
+    TyRecord(fs) -> fs.fold(false, |b: Bool, field: Field| b || contains_fn(field.ty)),
+    TyNominal(n) -> n.fields.fold(false, |b: Bool, field: Field| b || contains_fn(field.ty)),
+    TyVar(_) -> false,
+  }
+
+fn push_front_bytes(x: Bytes, xs: List<Bytes>) -> List<Bytes> =
+  xs.fold([x], |acc: List<Bytes>, y: Bytes| acc.push(y))
+
+/// The declared types whose values hold one of an `extern type` whatever they are applied to, and
+/// for each declared type the positions of the parameters its fields hold.
+type NativeReach = { held: Map<Bytes, Bool>, uses: Map<Bytes, List<Int>> }
+
+/// `shapes`' reach, settled one round at a time: each round adds a type a field of which holds what
+/// the last round found, and one adds none once every such type is in.
+fn native_reach(shapes: Shapes) -> NativeReach / {abort.raise} = {
+  let uses = shapes.fold(
+    Map::new(),
+    |acc: Map<Bytes, List<Int>>, name: Bytes, shape: AlgebraicShape|
+      acc.insert(
+        name,
+        range(0, shape.params.len()).filter(|i: Int|
+          shape.fields.any(|f: Type| occurs_ty(shape.params.get(i), f))),
+      ),
+  );
+  let natives = shapes.fold(
+    Map::new(),
+    |acc: Map<Bytes, Bool>, name: Bytes, shape: AlgebraicShape|
+      if shape.native { acc.insert(name, true) } else { acc },
+  );
+  let held = iterate(natives, shapes.len() + 1, |found: Map<Bytes, Bool>| {
+    let next = shapes.fold(found, |acc: Map<Bytes, Bool>, name: Bytes, shape: AlgebraicShape|
+      if acc.contains(name) { acc }
+      else if shape.fields.any(|f: Type| reaches_native({ held: acc, uses: uses }, f)) {
+        acc.insert(name, true)
+      } else { acc });
+    if next.len() == found.len() { Stop(next) } else { Continue(next) }
+  });
+  { held: held, uses: uses }
+}
+
+/// Whether a value of `ty` holds one of an `extern type`: a declared type's argument counts only
+/// where its fields hold the parameter it fills.
+fn reaches_native(reach: NativeReach, ty: Type) -> Bool / {abort.raise} =
+  match ty {
+    TyCon(c) ->
+      reach.held.contains(c.name)
+        || (match reach.uses.get(c.name) {
+          Some(at) ->
+            at.any(|i: Int|
+              match c.args.at(i) { Some(a) -> reaches_native(reach, a), None -> false }),
+          None -> c.args.any(|a: Type| reaches_native(reach, a)),
+        }),
+    TyRecord(fs) -> fs.any(|f: Field| reaches_native(reach, f.ty)),
+    TyNominal(n) -> n.fields.any(|f: Field| reaches_native(reach, f.ty)),
+    TyFn(_) -> false,
+    TyVar(_) -> false,
+  }
+
+pub fn check_comparisons(checker: Checker) -> Checker / {abort.raise} = {
+  // A keyed sum's `==` compares what its key answers.
+  let reach = native_reach(instance_shapes(checker.instances, algebraic_shapes(checker), DEq));
+  checker.comparisons.fold(
+    { ..checker, comparisons: [] },
+    |c: Checker, site: { module: Int, span: Span, ty: Type }| {
+      let resolved = resolve(c, site.ty);
+      if contains_fn(resolved) {
+        report(
+          c,
+          error_at(
+            b"E0201",
+            site.module,
+            site.span,
+            b"functions cannot be compared for equality",
+            Bytes::concat_all([b"both sides have type `", type_text(resolved), b"`"]),
+            [b"compare the results of calling them instead"],
+          ),
+        )
+      } else if holds_con(resolved, b"Hold") {
+        report(
+          c,
+          error_at(
+            b"E0201",
+            site.module,
+            site.span,
+            b"a hold cannot be compared for equality",
+            Bytes::concat_all([b"both sides have type `", type_text(resolved), b"`"]),
+            [
+              b"a hold is a key to what its region will release, not a value: compare what `Hold::get` reads of each instead",
+            ],
+          ),
+        )
+      } else if reaches_native(reach, resolved) {
+        report(
+          c,
+          error_at(
+            b"E0201",
+            site.module,
+            site.span,
+            b"a value of an `extern type` cannot be compared for equality",
+            Bytes::concat_all([b"both sides have type `", type_text(resolved), b"`"]),
+            [b"the toolchain lays out an `extern type`'s values, and nothing compares one"],
+          ),
+        )
+      } else { c }
+    },
+  )
+}
+
+fn is_dummy(span: Span) -> Bool = span.start == 0 && span.end == 0
+
+fn encloses(outer: Span, inner: Span) -> Bool =
+  !is_dummy(outer) && !is_dummy(inner) && outer.start <= inner.start && inner.end <= outer.end
+
+/// Branches run at once, so no two may touch one resource where either writes. A label parameter or
+/// `[*]` may be any label, and a row variable any row.
+pub fn check_parallels(checker: Checker) -> Checker / {abort.raise} =
+  checker.parallels.fold({ ..checker, parallels: [] }, |c: Checker, site: ParallelSite| {
+    let rows = site.branches.map(|b: { span: Span, row: Row }|
+      { span: b.span, row: resolve_row_in(c, b.row) });
+    match refusal(rows) {
+      None -> c,
+      Some(r) ->
+        err_labels(
+          c,
+          b"E0309",
+          r.message,
+          r.labels.map(|l: { span: Span, primary: Bool, text: Bytes }|
+            label_at(site.module, l.span, l.primary, l.text)),
+          r.notes,
+        ),
+    }
+  })
+
+type Refusal = {
+  message: Bytes,
+  labels: List<{ span: Span, primary: Bool, text: Bytes }>,
+  notes: List<Bytes>,
+}
+
+/// What keeps a block's branches from running at once: a region's schedule, a task's scheduler, or
+/// a resource two of them touch.
+fn refusal(rows: List<Branch>) -> Option<Refusal> / {abort.raise} = {
+  let seed = seed_atom();
+  let performing = |pick: (Atom) -> Bool|
+    rows.fold(None, |acc: Option<{ branch: Branch, atom: Atom }>, b: Branch|
+      match acc {
+        Some(_) -> acc,
+        None -> match b.row.atoms.filter(pick) {
+          [atom, ..] -> Some({ branch: b, atom: atom }),
+          [] -> None,
+        },
+      });
+  let one = |p: { branch: Branch, atom: Atom }, message: Bytes, why: Bytes|
+    Some({
+      message: message,
+      labels: [
+        {
+          span: p.branch.span,
+          primary: true,
+          text: b"this branch performs ".concat(backticked_text(atom_text(p.atom))),
+        },
+      ],
+      notes: [why],
+    });
+  match performing(|atom: Atom| atom == seed) {
+    Some(p) ->
+      one(
+        p,
+        b"a `parallel` branch may not open a `simulate` region",
+        b"a region's schedule is drawn from its entry's seed, in the order its regions open, which branches running at once do not have",
+      ),
+    None -> match performing(|atom: Atom| atom.effect == b"task") {
+      Some(p) ->
+        one(
+          p,
+          b"a `parallel` branch may not spawn, join or yield a task",
+          b"a task is scheduled by the thread that spawned it, and a branch may run on another; spawn the tasks outside the block",
+        ),
+      None -> {
+        let n = rows.len();
+        let found = range(0, n).fold(None, |acc: Option<Clash>, j: Int|
+          range(0, j).fold(acc, |inner: Option<Clash>, i: Int|
+            match inner { Some(_) -> inner, None -> clash(rows.get(i), rows.get(j)) }));
+        match found {
+          None -> None,
+          Some(k) ->
+            Some({
+              message: b"two branches of this `parallel` block may touch one resource",
+              labels: [
+                {
+                  span: k.later.span,
+                  primary: true,
+                  text: b"this branch performs ".concat(k.later_does),
+                },
+                {
+                  span: k.earlier.span,
+                  primary: false,
+                  text: b"and this one performs ".concat(k.earlier_does),
+                },
+              ],
+              notes: [
+                b"branches run at once, so two of them may not perform operations of one effect on one resource where either is a `write`",
+                b"bind the branches with `let` in the order they must run, or move what they share out of the block",
+              ],
+            }),
+        }
+      },
+    },
+  }
+}
+
+type Branch = { span: Span, row: Row }
+
+type Clash = { earlier: Branch, earlier_does: Bytes, later: Branch, later_does: Bytes }
+
+fn may_alias(a: Resource, b: Resource) -> Bool =
+  a == b || (match a { RVar(_) -> true, RAny -> true, _ -> false })
+    || (match b { RVar(_) -> true, RAny -> true, _ -> false })
+
+fn clash(x: Branch, y: Branch) -> Option<Clash> / {abort.raise} = {
+  let atoms = x.row.atoms.fold(None, |acc: Option<Clash>, a: Atom|
+    y.row.atoms.fold(acc, |inner: Option<Clash>, b: Atom|
+      match inner {
+        Some(_) -> inner,
+        None -> if atom_conflicts({ ..a, resource: b.resource }, b)
+            && may_alias(a.resource, b.resource) {
+          Some({
+            earlier: x,
+            earlier_does: backticked_text(atom_text(a)),
+            later: y,
+            later_does: backticked_text(atom_text(b)),
+          })
+        } else { None },
+      }));
+  match atoms {
+    Some(_) -> atoms,
+    None -> {
+      let open = |row: Row| row.tail != None;
+      let busy = |row: Row| row.atoms.len() > 0 || row.tail != None;
+      if (open(x.row) && busy(y.row)) || (open(y.row) && busy(x.row)) {
+        Some({
+          earlier: x,
+          earlier_does: backticked_text(row_text(x.row)),
+          later: y,
+          later_does: backticked_text(row_text(y.row)),
+        })
+      } else { None }
+    },
+  }
+}
+
+pub fn check_simulations(checker: Checker) -> Checker / {abort.raise} = {
+  let seed = seed_atom();
+  let sites = checker.simulations;
+  sites.fold({ ..checker, simulations: [] }, |c: Checker, site: Simulation| {
+    let nested: Checker = if resolve_row_in(c, site.body_row).atoms.contains(seed) {
+      nested_simulation(c, site, sites)
+    } else { c };
+    check_entering(check_simulation_exits(nested, site), site)
+  })
+}
+
+/// What a refusal says of the scheduler key `t` holds: a task, or else a channel.
+type Keyed = { noun: Bytes, made: Bytes, numbered: Bytes, kept: Bytes }
+
+fn keyed(ty: Type) -> Keyed =
+  if holds_con(ty, b"Task") || !holds_con(ty, b"Chan") {
+    {
+      noun: b"task",
+      made: b"spawned",
+      numbered: b"a `Task` is a key into the scheduler that spawned it, and this region's scheduler numbers its own tasks, so the key names one of them or none",
+      kept: b"`join` the task inside the region and return its value instead",
+    }
+  } else {
+    {
+      noun: b"channel",
+      made: b"made",
+      numbered: b"a `Chan` is a key into the scheduler that made it, and this region's scheduler numbers its own channels, so the key names one of them or none",
+      kept: b"receive from the channel inside the region and return what it held instead",
+    }
+  }
+
+/// Whether `t` holds a `name`, in its shape or as the operations a closure's row shows for one.
+fn holds_con(t: Type, name: Bytes) -> Bool =
+  match t {
+    TyCon(c) -> c.name == name || c.args.fold(false, |b: Bool, a: Type| b || holds_con(a, name)),
+    TyRecord(fs) -> fs.fold(false, |b: Bool, f: Field| b || holds_con(f.ty, name)),
+    TyNominal(n) -> n.fields.fold(false, |b: Bool, f: Field| b || holds_con(f.ty, name)),
+    TyFn(f) ->
+      List::fold(
+        if name == b"Task" { [b"join", b"await", b"cancel"] } else { channel_ops() },
+        f.params.fold(holds_con(f.ret, name), |b: Bool, p: Type| b || holds_con(p, name)),
+        |b: Bool, op: Bytes| b || atoms_covered(f.effects.atoms, task_op(op)),
+      ),
+    TyVar(_) -> false,
+  }
+
+fn entered(ty: Type) -> Bytes = {
+  let k = keyed(ty);
+  Bytes::concat_all([
+    b"a ",
+    k.noun,
+    b" enters a `simulate` region that did not ",
+    made_verb(k),
+    b" it",
+  ])
+}
+
+fn made_verb(k: Keyed) -> Bytes = if k.noun == b"task" { b"spawn" } else { b"make" }
+
+fn own_scheduler(site: Simulation) -> Label =
+  label_at(
+    site.module,
+    site.span,
+    false,
+    b"the `simulate` region opens here, with a scheduler of its own",
+  )
+
+fn check_entering(checker: Checker, site: Simulation) -> Checker / {abort.raise} =
+  site.entering.fold(checker, |c: Checker, x: { name: Bytes, span: Span, ty: Type }|
+    err_labels(
+      c,
+      b"E0413",
+      entered(x.ty),
+      [
+        label_at(
+          site.module,
+          x.span,
+          true,
+          Bytes::concat_all([
+            b"`",
+            x.name,
+            b"` has type `",
+            type_text(x.ty),
+            b"`, and it was bound outside the region",
+          ]),
+        ),
+        own_scheduler(site),
+      ],
+      [
+        keyed(x.ty).numbered,
+        if keyed(x.ty).noun == b"task" {
+          b"spawn the task inside the region, or join it where it was spawned and pass in what it answers"
+        } else { b"make the channel inside the region, or pass in what was received from it" },
+      ],
+    ))
+
+fn check_simulation_exits(checker: Checker, site: Simulation) -> Checker / {abort.raise} = {
+  let ty = resolve(checker, site.body_ty);
+  if !brand_in(ty, Tasks) { checker } else {
+    let k = keyed(ty);
+    let key = if k.noun == b"task" {
+      b"a `Task` is a key into the region's scheduler, and the scheduler ends with the region"
+    } else {
+      b"a `Chan` is a key into the region's scheduler, and the scheduler ends with the region"
+    };
+    let fix = k.kept;
+    err_labels(
+      checker,
+      b"E0413",
+      Bytes::concat_all([b"a ", k.noun, b" escapes the `simulate` region that ", k.made, b" it"]),
+      exit_labels(site.module, site.exits, site.body_span, ty),
+      if carries_brand_in_row(ty, Tasks) {
+        [
+          key,
+          b"the closure's row still carries a `task` operation or `sim.read`, so calling it after the region reaches a scheduler that has ended",
+          fix,
+        ]
+      } else { [key, fix] },
+    )
+  }
+}
+
+fn exit_labels(
+  module: Int,
+  exits: List<Span>,
+  body_span: Span,
+  ty: Type,
+) -> List<Label> / {abort.raise} = {
+  let shown = type_text(ty);
+  List::map(if exits.len() == 0 { [body_span] } else { exits }, |span: Span|
+    label_at(module, span, true, Bytes::concat_all([b"this has type `", shown, b"`"])))
+}
+
+fn nested_simulation(checker: Checker, site: Simulation, sites: List<Simulation>) -> Checker = {
+  let inner = sites.fold(None, |acc: Option<Simulation>, other: Simulation|
+    match acc {
+      Some(_) -> acc,
+      None -> if other.module == site.module && other.span != site.span
+          && encloses(site.body_span, other.span) { Some(other) }
+      else { None },
+    });
+  let message = b"a `simulate` region inside another `simulate` region";
+  let primary = label_at(site.module, site.span, true, b"this region's body reaches `sim.read`");
+  let tail = [
+    b"two schedulers means two notions of `runnable`, and a task in the inner region blocking the outer one",
+    b"hoist the inner region out, or drop it and let the outer one schedule",
+  ];
+  match inner {
+    Some(o) ->
+      err_labels(
+        checker,
+        b"E0416",
+        message,
+        [primary, label_at(o.module, o.span, false, b"the region it reaches is here")],
+        tail,
+      ),
+    None ->
+      report(
+        checker,
+        error_with_labels(
+          b"E0416",
+          message,
+          [primary],
+          push_front_bytes(
+            b"something this body calls carries `sim.read`, so it enters a region too",
+            tail,
+          ),
+        ),
+      ),
+  }
+}
+
+/// Whether a resolved type carries a region's brand, by either route a brand travels.
+fn brand_in(t: Type, brand: Brand) -> Bool / {abort.raise} =
+  match t {
+    TyVar(_) -> false,
+    TyCon(c) ->
+      (match brand { HoldsOf(r) -> label_of(t) == Some(r), Tasks -> scheduler_handle(c.name) })
+        || c.args.fold(false, |b: Bool, a: Type| b || brand_in(a, brand)),
+    TyFn(f) ->
+      row_brands(f.effects, brand)
+        || f.params.fold(false, |b: Bool, p: Type| b || brand_in(p, brand))
+        || brand_in(f.ret, brand),
+    TyRecord(fs) -> fs.fold(false, |b: Bool, f: Field| b || brand_in(f.ty, brand)),
+    TyNominal(n) -> n.fields.fold(false, |b: Bool, f: Field| b || brand_in(f.ty, brand)),
+  }
+
+/// Whether the brand reached this type through a function's row rather than through its shape.
+fn carries_brand_in_row(t: Type, brand: Brand) -> Bool =
+  match t {
+    TyVar(_) -> false,
+    TyCon(c) -> c.args.fold(false, |b: Bool, a: Type| b || carries_brand_in_row(a, brand)),
+    TyFn(f) ->
+      row_brands(f.effects, brand)
+        || f.params.fold(false, |b: Bool, p: Type| b || carries_brand_in_row(p, brand))
+        || carries_brand_in_row(f.ret, brand),
+    TyRecord(fs) -> fs.fold(false, |b: Bool, f: Field| b || carries_brand_in_row(f.ty, brand)),
+    TyNominal(n) ->
+      n.fields.fold(false, |b: Bool, f: Field| b || carries_brand_in_row(f.ty, brand)),
+  }
+
+pub fn check_regions(checker: Checker) -> Checker / {abort.raise} =
+  checker.regions.fold({ ..checker, regions: [] }, |c: Checker, site: RegionSite|
+    check_region_handoffs(check_region_spawns(check_region_exits(c, site), site), site))
+
+fn brand_of(site: RegionSite) -> Brand = HoldsOf(site.label)
+
+/// The value the region evaluates to.
+fn check_region_exits(checker: Checker, site: RegionSite) -> Checker / {abort.raise} = {
+  let ty = resolve(checker, site.body_ty);
+  let n = site.name;
+  if !brand_in(ty, brand_of(site)) { checker } else {
+    err_labels(
+      checker,
+      b"E0446",
+      Bytes::concat_all([b"a hold escapes its `with_hold[", n, b"]` region"]),
+      exit_labels(site.module, site.exits, site.body_span, ty),
+      if carries_brand_in_row(ty, brand_of(site)) {
+        [
+          b"the closure's row still carries `hold.read`, so calling it after the region reads a hold the region has let go",
+          b"call the closure inside the region and return what it answers instead",
+        ]
+      } else {
+        [
+          Bytes::concat_all([
+            b"the region releases what the hold holds at its `}`, so the hold names nothing after it",
+          ]),
+          b"read the hold inside the region and return what the body made of it instead",
+        ]
+      },
+    )
+  }
+}
+
+fn opens_here(n: Bytes) -> Bytes =
+  Bytes::concat_all([b"`", n, b"` opens here and lets go of its hold at its `}`"])
+
+fn outlived() -> List<Bytes> =
+  [
+    b"the scheduler that runs the task was installed outside the region, so the task can still be running when the region has let go of its hold",
+    b"a `join` inside the region is not enough: nothing in the types says the task was joined, and a task nobody joins runs on after the region's `}`",
+  ]
+
+fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.raise} =
+  site.spawns.fold(checker, |c: Checker, s: SpawnSite| {
+    let ty = resolve(c, s.ty);
+    if brand_in(ty, brand_of(site)) {
+      err_labels(
+        c,
+        b"E0446",
+        Bytes::concat_all([b"a value of region `", site.name, b"` is sent to another task"]),
+        [
+          label_at(
+            site.module,
+            s.span,
+            true,
+            Bytes::concat_all([b"this has type `", type_text(ty), b"`"]),
+          ),
+          label_at(site.module, site.span, false, opens_here(site.name)),
+        ],
+        outlived().push(
+          Bytes::concat_all([
+            b"open the `simulate` region inside `with_hold[",
+            site.name,
+            b"]`, or pass the task something that does not mention `",
+            site.name,
+            b"`",
+          ]),
+        ),
+      )
+    } else {
+      match reaching_clause(c, ty, s.around, brand_of(site)) {
+        None -> c,
+        Some(cl) -> {
+          let op = backticked_text(
+            Bytes::concat_all([
+              as_written({ ..c, module: site.module }, cl.op.effect),
+              b".",
+              match cl.op.op { Some(o) -> o, None -> mode_text(cl.op.mode) },
+            ]),
+          );
+          err_labels(
+            c,
+            b"E0446",
+            Bytes::concat_all([
+              b"a value of region `",
+              site.name,
+              b"` reaches another task through a handler around its spawn",
+            ]),
+            [
+              label_at(
+                site.module,
+                s.span,
+                true,
+                Bytes::concat_all([
+                  b"this task performs ",
+                  op,
+                  b", which a handler around the spawn answers",
+                ]),
+              ),
+              label_at(
+                site.module,
+                cl.span,
+                false,
+                Bytes::concat_all([b"this clause answers it, and reaches `", site.name, b"`"]),
+              ),
+              label_at(site.module, site.span, false, opens_here(site.name)),
+            ],
+            [
+              b"a task performs against the handlers around its `task.spawn`, so the clause runs on the task's behalf, whenever the task runs",
+            ].concat(
+              outlived().push(
+                Bytes::concat_all([
+                  b"open the `simulate` region inside `with_hold[",
+                  site.name,
+                  b"]`, or answer ",
+                  op,
+                  b" without touching `",
+                  site.name,
+                  b"`",
+                ]),
+              ),
+            ),
+          )
+        },
+      }
+    }
+  })
+
+/// The first clause around a spawn that its task can perform against and that reaches the region.
+fn reaching_clause(
+  checker: Checker,
+  task: Type,
+  around: List<ClauseSite>,
+  brand: Brand,
+) -> Option<ClauseSite> / {abort.raise} =
+  around.fold(None, |acc: Option<ClauseSite>, cl: ClauseSite|
+    match acc {
+      Some(_) -> acc,
+      None -> if may_perform(task, cl.op) && brand_in(resolve(checker, cl.ty), brand) { Some(cl) }
+      else { None },
+    })
+
+/// On any label: an open row may perform anything.
+fn may_perform(task: Type, op: Atom) -> Bool =
+  match task {
+    TyFn(f) ->
+      f.effects.tail != None
+        || f.effects.atoms.fold(false, |b: Bool, a: Atom|
+          b
+            || (a.effect == op.effect
+            && (a.op == op.op || (a.op == None && mode_eq(a.mode, op.mode))))),
+    _ -> true,
+  }
+
+fn check_region_handoffs(checker: Checker, site: RegionSite) -> Checker / {abort.raise} =
+  site.handoffs.fold(checker, |c: Checker, h: HandoffSite| {
+    let ty = resolve(c, h.ty);
+    if !brand_in(ty, brand_of(site)) { c } else {
+      let n = site.name;
+      let carries = if carries_brand_in_row(ty, brand_of(site)) {
+        [
+          b"the closure's row still carries `hold.read`, so whoever handles the operation can read a hold the region has let go",
+        ]
+      } else { [] };
+      err_labels(
+        c,
+        b"E0446",
+        Bytes::concat_all([b"a value of region `", n, b"` is handed to `", h.op, b"`"]),
+        [
+          label_at(
+            site.module,
+            h.span,
+            true,
+            Bytes::concat_all([b"this has type `", type_text(ty), b"`"]),
+          ),
+          label_at(site.module, site.span, false, opens_here(n)),
+        ],
+        carries.concat([
+          Bytes::concat_all([
+            b"`",
+            h.op,
+            b"` is declared outside every region, so its type cannot say the value belongs to `",
+            n,
+            b"`, and the handler \xe2\x80\x94 which may be installed anywhere, and may outlive the region \xe2\x80\x94 receives it at a type variable that mentions no region at all",
+          ]),
+          Bytes::concat_all([
+            b"read the value inside the region and perform the operation with something that does not mention `",
+            n,
+            b"`",
+          ]),
+        ]),
+      )
+    }
+  })
+
+/// What the prelude declares that a program's check tables hold ahead of its own modules': its
+/// effects and its constructors, in that order.
+pub fn prelude_tables() -> { effects: List<EffectInfo>, ctors: List<CtorInfo> } / {abort.raise} = {
+  let c = fresh_cx(
+    {
+      names: [],
+      scopes: [],
+      declarations: [],
+      declared: [],
+      order: [],
+      imports: [],
+      signatures: Map::new(),
+      sees: [],
+    },
+    [],
+    no_known(),
+  );
+  { effects: c.effects, ctors: c.ctors }
+}
+
+// --- `check_program` --------------------------------------------------------------------------------------
+
+pub fn fresh_cx(
+  resolved: Resolved,
+  mods: List<ParsedModule>,
+  known: Known,
+) -> Checker / {abort.raise} =
+  install_prelude({
+    resolved: resolved,
+    modules: mods,
+    module: 0,
+    subst: subst_new(),
+    fresh: fresh_new(),
+    env: env_new(),
+    diags: [],
+    types: Map::new(),
+    effects: [],
+    effect_index: Map::new(),
+    ctors: [],
+    ctor_index: Map::new(),
+    defs: [],
+    def_index: Map::new(),
+    tests: [],
+    laws: [],
+    ty_params: Map::new(),
+    row_params: Map::new(),
+    label_params: Map::new(),
+    label_apps: [],
+    label_sites: [],
+    group_defs: [],
+    own_fns: Map::new(),
+    refs: [],
+    calls: [],
+    tag_uses: [],
+    fn_holding: Map::new(),
+    takings: Map::new(),
+    auto_ty_params: false,
+    alias_stack: [],
+    aliases: Map::new(),
+    nominals: Map::new(),
+    refused_atoms: [],
+    performs: [],
+    over: None,
+    maybe: [],
+    repeated_vars: [],
+    recursed: None,
+    declared_atoms: [],
+    guards: guards::none(),
+    contracts: Map::new(),
+    raise_notes: [],
+    comparisons: [],
+    scope: 0,
+    constraints: Map::new(),
+    numerics: [],
+    bit_ops: [],
+    operands: [],
+    typed: [],
+    witnessed: Map::new(),
+    witness_refs: [],
+    witness_orders: [],
+    group_fills: [],
+    summaries: Map::new(),
+    concats: [],
+    columns: [],
+    updates: [],
+    update_shapes: [],
+    try_sites: [],
+    member_sites: match known.walks { Given(_, sites) -> sites, _ -> [] },
+    copied_defaults: [],
+    builtins_on: Map::new(),
+    simulate_depth: 0,
+    sim_scope: 0,
+    crossings: [],
+    open_regions: [],
+    regions: [],
+    simulations: [],
+    parallels: [],
+    map_keys: [],
+    constrained_uses: [],
+    spec_kind: None,
+    spec_envs: [],
+    derived: None,
+    known: known,
+    seeded: [],
+    seeded_tests: [],
+    walking: b"",
+    kept: [],
+    bodies: [],
+    assumed: [],
+    instances: [],
+    numeric_types: [],
+    keyed_names: [],
+    ordering: Map::new(),
+    carrying: Map::new(),
+    copied: false,
+    assignable: { vars: [], barred: None },
+  })

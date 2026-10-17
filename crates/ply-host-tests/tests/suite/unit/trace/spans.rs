@@ -1,5 +1,5 @@
-use ply_eval::host::MachineId;
-use ply_eval::{Resource, Span, Symbol, TaskId, codes};
+use ply_core::host::MachineId;
+use ply_core::{Resource, Span, Symbol, TaskId, codes};
 use ply_host::trace::Outcome;
 use ply_host::trace::spans::*;
 

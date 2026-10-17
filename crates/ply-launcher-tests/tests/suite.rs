@@ -6,8 +6,8 @@
 #[global_allocator]
 static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 
-use ply_eval::host::{HostAnswer, HostOp, HostRequest, HostRuntime, MachineId, Pending};
-use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, Value};
+use ply_core::host::{HostAnswer, HostOp, HostRequest, HostRuntime, MachineId, Pending};
+use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, Value};
 
 /// A runtime nothing waits on: the environment answers on the spot.
 struct Idle;
@@ -69,7 +69,7 @@ fn a_program_reads_its_environment() {
     let Value::List(vars) = &listed else {
         panic!("`env.vars` answered no list");
     };
-    let marked = ply_machine::payload::record(vec![
+    let marked = ply_privileged::payload::record(vec![
         ("name", Value::str("PLY_LAUNCHER_TEST_MARK")),
         ("value", Value::str("here")),
     ]);

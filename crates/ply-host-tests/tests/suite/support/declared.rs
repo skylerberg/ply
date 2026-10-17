@@ -2,8 +2,8 @@
 //! binding is tested without compiling a program. That the host registers only what `std`
 //! declares is the CLI suite's to hold, over the real declarations.
 
-use ply_eval::{EffectAtom, Mode, Resource, Symbol};
-use ply_sketch::Sketch;
+use ply_core::{EffectAtom, Mode, Resource, Symbol};
+use ply_test_support::Sketch;
 
 const NET: &[(&str, Mode, bool)] = &[
     ("listen", Mode::Write, true),

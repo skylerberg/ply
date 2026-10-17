@@ -20,24 +20,28 @@ of it next.
 
 | path | holds |
 | --- | --- |
-| `crates/ply-eval` | values, the evaluator, the scheduler and the simulator; spans, diagnostics and their codes; the program record the compiler answers with |
-| `crates/ply-codegen` | the C backend's runtime: loads a compiled unit, or the one an executable was linked with, and runs it |
-| `crates/ply-compiler` | the compiler written in Ply (`ply/`), with its builder (`build.main`) and the C compiling and linking it drives (`cc.ply`, `native.ply`) |
-| `crates/ply-store` | what `ply` keeps under `.ply-cache`, as the `store` package in `ply/`; not a cargo crate |
-| `crates/ply-test` | what a test run decides, as the `suite` package in `ply/`; not a cargo crate |
-| `crates/ply-prove` | specification obligations and their discharge, as the `prove` package in `ply/`; not a cargo crate |
-| `crates/ply-sim` | the interleaving search, as the `sim` package in `ply/`; not a cargo crate |
+| `ply.work` | where each package below lies and which parts make `ply`: what `ply bootstrap` builds from and `ply work` prints |
+| `packages/std` | the standard library, the builtins' declarations (`prelude.ply`) among it |
+| `packages/compiler` | the compiler, by phase (`syntax/`, `expand/`, `check/`, `front/`, `store/`, `emit/`), with its builder (`build.main`) and the C compiling and linking it drives (`cc.ply`, `native.ply`) |
+| `packages/cli` | the `ply` program |
+| `packages/testing` | what a test run decides |
+| `packages/proof` | specification obligations and their discharge |
+| `packages/sim` | the interleaving search |
+| `packages/store` | what `ply` keeps under `.ply-cache` |
+| `packages/registry` | the package registry `ply publish` and `ply resolve` talk to |
+| `tests/cli` | the CLI's suite |
+| `tests/std` | the standard library's tests that read fixture files, beside the files |
+| `examples/`, `tests/lang/`, `tests/fixtures/` | Ply programs the suite runs |
+| `crates/ply-core` | what every crate speaks: values and the builtins' Rust, the scheduler and the simulator; spans, diagnostics and their codes; the program record the compiler answers with |
+| `crates/ply-compiled` | the runtime compiled code runs on: loads a compiled unit, or the one an executable was linked with, and runs it |
 | `crates/ply-host` | the Rust handlers effects resolve to (db, fs, tcp, tls, ...) |
-| `crates/ply-machine` | the nested-entry capability: a program loading and entering another program; and the runtime `ply test` and `ply prove` drive |
-| `crates/ply-std` | the standard library, as Ply source in `ply/`, the builtins' declarations (`prelude.ply`) among it |
-| `crates/ply-cli` | the `ply` program, as Ply source in `ply/`; not a cargo crate |
-| `crates/ply-registry` | the package registry `ply publish` and `ply resolve` talk to, as Ply source in `ply/`; not a cargo crate |
+| `crates/ply-privileged` | the privileged families `--allow` lends: a program loading and entering another program, and the runtime `ply test` and `ply prove` drive |
 | `crates/ply-launcher` | what enters a native program: its pack read, its roots and hosts lent, its entry called |
-| `crates/ply-native` | the runtime's static library a native program, `ply` among them, is linked with |
-| `crates/ply-std-tests` | the standard library's tests that read fixture files, as Ply source in `ply/` beside the files; not a cargo crate |
+| `crates/ply-pack` | the pack a native program carries after its code |
+| `crates/ply-runtime` | the runtime's static library a native program, `ply` among them, is linked with |
+| `crates/ply-test-support` | a program's checked declarations written by hand, for Rust tests that compile no Ply |
 | `crates/<crate>-tests` | that crate's tests |
 | `editors/` | the tree-sitter grammar editors read |
-| `examples/`, `tests/lang/`, `tests/fixtures/` | Ply programs the suite runs |
 | `probes/` | standalone C probes, each run by a CI job |
 | `.github/` | CI: `workflows/ci.yml`, the job tables in `ci-shards.sh`, and `ci-timings.sh` to read a run |
 
@@ -67,7 +71,7 @@ name a server.
 
 ## The compiler bootstrap
 
-The compiler is Ply source under `crates/ply-compiler/ply`. `ply bootstrap` describes the runtime's
+The compiler is Ply source under `packages/compiler`. `ply bootstrap` describes the runtime's
 library cargo built of the checkout, builds the builder against it, a native program on that
 runtime that enters the compiler's own `build.main`, and runs the builder over the CLI, whose C it
 links with the library into the new `ply`. That `ply` answers the shipped modules, and its pack

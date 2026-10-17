@@ -1,0 +1,1985 @@
+//! The emitter's state as it writes a body: the values it holds, what it counts, its needs and its sites.
+
+import syntax.parsing (Span, span_key)
+import emit.code (Code, Lambda, Own)
+import check.types (Type, TyCon, type_spelled, digits)
+import emit.typing (Typed, unknown_type)
+import std.list
+import syntax.type_syntax (Mode)
+import syntax.patterns (Lit)
+import std.bytes (ascii_of_int)
+import emit.c (KBoxed, KSum, Kind, Tagged, Zeroed, Width, width_named, pad, position_of,
+               failing_return, sorted_names, unsettled)
+import emit.roots (root_id, generated_builtin, symbol_of, entry_of)
+import emit.answer (Head, word_head, Exact, Layout, Reads, Scalar, Generics, Tables, const_of_lit)
+import emit.reps (Ctors, Ty, TyOf, TyOpen, type_vars, laid_vars, FieldTy, Def, Imported, Carrier,
+                  SumCases, tagged_result, compared_by_ctors, kind_of, laid_field, returned_kind)
+
+/// An emitted value: the kind it is held at and the C expression naming it.
+pub type CValue = { kind: Kind, expr: Bytes, ty: Ty }
+
+/// The type the checker settled an operator's operands at, which alone decides what the operator
+/// means; how an operand happens to be held only decides how it is read. `OWhole` is a type of
+/// arguments or fields, and `OWord` one read by the runtime's own operators.
+pub type Operand =
+  | OInt
+  | OBool
+  | OWidth(Width)
+  | OFloat
+  | ODec
+  | OChar
+  | OText
+  | OSum(Bytes)
+  | OWhole(Type)
+  | OWord
+
+/// `None` where the checker settled no type, which it does for every operator of a checked program.
+pub fn operand_at(emitter: Emitter, span: Span) -> Option<Operand> / {abort.raise} =
+  match emitter.operands.get(span_key(span)) {
+    None -> None,
+    Some(name) -> if name == unsettled() { None }
+    else if name == b"Int" { Some(OInt) }
+    else if name == b"Bool" { Some(OBool) }
+    else if name == b"Float" { Some(OFloat) }
+    else if name == b"Decimal" { Some(ODec) }
+    else if name == b"Char" { Some(OChar) }
+    else if name == b"String" || name == b"Bytes" { Some(OText) }
+    else if compared_by_ctors(emitter.ctors, name) { Some(OSum(name)) } else if spells_whole(name) {
+      match type_spelled(name) { Some(t) -> Some(OWhole(t)), None -> Some(OWord) }
+    } else { match width_named(name) { Some(w) -> Some(OWidth(w)), None -> Some(OWord) } },
+  }
+
+/// Whether an operand's name spells a type of arguments or fields rather than naming one.
+pub fn spells_whole(name: Bytes) -> Bool =
+  name.index_of(b"<") != None || name.index_of(b"{") != None
+
+/// `emitter` noting that the operator at `span` is done by the runtime because the checker settled its
+/// operands at type variable `'i`, which a scalar argument would do in C, and an argument of any
+/// type would where the operator `compares` for equality.
+pub fn operand_needed(emitter: Emitter, span: Span, compares: Bool) -> Emitter / {abort.raise} =
+  match emitter.operands.get(span_key(span)) {
+    Some(name) -> if name.len() > 1 && name.at(0) == 39 {
+      needing(emitter, digits(name.slice(1, name.len())), if compares { Exact } else { Scalar })
+    } else if compares && spells_whole(name) {
+      match type_spelled(name) {
+        Some(t) -> type_vars(t).fold(emitter, |e: Emitter, v: Int| needing(e, v, Exact)),
+        None -> emitter,
+      }
+    } else { emitter },
+    None -> emitter,
+  }
+
+/// `emitter` noting the type variables that left `ty` unknown, where it is.
+pub fn open_needed(emitter: Emitter, ty: Ty) -> Emitter =
+  match ty {
+    TyOpen(vs) -> vs.fold(emitter, |e: Emitter, v: Int| needing(e, v, Layout)),
+    _ -> emitter,
+  }
+
+/// `emitter` noting what builtin `name` reads of the type arguments the reference `at` leaves
+/// unknown: the layout of an element it makes, writes or reads in place (`Array::new`, `set`,
+/// `of_list` and `get`, or a field of `Columns::get`'s record), or the type `compare` orders by and
+/// `reflect`, `shown` and `digest` read at.
+pub fn builtin_needed(emitter: Emitter, written: Bytes, at: Span) -> Emitter = {
+  let name = generated_builtin(written);
+  match emitter.typed.get(span_key(at)) {
+    None -> emitter,
+    Some(t) -> if name == b"compare" || name == b"compare_values" || name == b"reflect"
+        || name == b"shown"
+        || name == b"digest"
+        || name == b"?encoded" { t.args.fold(emitter, |e: Emitter, a: Type| exact_needed(e, a)) }
+    else if name == b"Array::get" || name == b"Columns::get" || name == b"Array::new"
+        || name == b"Array::set"
+        || name == b"Array::of_list" {
+      match t.args.at(0) {
+        Some(element) -> if laid_field(b"e", element) == None { layout_needed(emitter, element) }
+        else { emitter },
+        None -> emitter,
+      }
+    } else { emitter },
+  }
+}
+
+/// `emitter` noting each type variable that left the layout of the value at `span` unknown.
+pub fn layout_needed_at(emitter: Emitter, span: Span) -> Emitter =
+  match emitter.typed.get(span_key(span)) {
+    Some(t) -> layout_needed(emitter, t.ty),
+    None -> emitter,
+  }
+
+/// `emitter` noting each type variable whose layout a value of `ty` is laid out by: the type itself,
+/// a record's fields and an array's or columns' element, through records and arrays.
+fn layout_needed(emitter: Emitter, ty: Type) -> Emitter =
+  laid_vars(ty).fold(emitter, |e: Emitter, v: Int| needing(e, v, Layout))
+
+/// `emitter` noting each type variable in `ty`, whose type an operation done per type reads.
+fn exact_needed(emitter: Emitter, ty: Type) -> Emitter =
+  type_vars(ty).fold(emitter, |e: Emitter, v: Int| needing(e, v, Exact))
+
+/// `emitter` noting that its code took a slow path because type variable `var` was unknown, and
+/// what a specialisation would read of it.
+fn needing(emitter: Emitter, var: Int, reads: Reads) -> Emitter =
+  if emitter.generics.needs.contains({ var: var, reads: reads }) { emitter } else {
+    {
+      ..emitter,
+      generics: {
+        ..emitter.generics,
+        needs: emitter.generics.needs.push({ var: var, reads: reads }),
+      },
+    }
+  }
+
+pub fn unsettled_operator(emitter: Emitter, what: Bytes) -> WithValue =
+  refused(emitter, b"an operator the checker settled no operand type for: ".concat(what))
+
+/// `conv`: slots already unboxed -- a parameter is unboxed once and later reads reuse that temporary.
+/// `reads`: every slot read in the body, counted whole because reads are not emitted in the order they were marked.
+pub type Emitter = {
+  out: List<Bytes>,
+  temp_count: Int,
+  unboxed: List<Unboxed>,
+  indent: Int,
+  reads: List<Int>,
+  shapes: List<List<Bytes>>,
+  built: List<Built>,
+  module: Bytes,
+  base: Int,
+  /// Locals holding a count only this body can name; a callee taking one is handed the count, not a duplicate.
+  count_locals: List<CountLocal>,
+  /// This module's definitions; any other bare name is a builtin or an import.
+  here: List<Def>,
+  imports: List<Imported>,
+  /// Literals in first-met order: a body indexes the unit's tables by its own positions.
+  consts: List<Lit>,
+  /// Every constructor's program-wide name; a tag is its index here.
+  ctors: Ctors,
+  /// Lambda sub-functions, written after the function that builds the closure.
+  lambda_bodies: Bytes,
+  /// This body's code table: each lambda's entry and each pure nullary constant's entry.
+  lambdas: List<Bytes>,
+  /// Sub-functions are numbered under the named function, not an enclosing lambda.
+  /// The definition being emitted, by its full name.
+  owner: Bytes,
+  builtins: List<Bytes>,
+  called_builtins: List<Bytes>,
+  /// Field names met, for reads whose record shape is unknown.
+  fields: List<Bytes>,
+  /// Nothing is emitted after the current node, so a tail update may release its base whatever its read count,
+  /// and a self call restarts the body. Kept into block tails, `if`/`match` arms and the right of `&&`/`||`;
+  /// cleared into call arguments, where a fused loop body runs repeatedly.
+  tail: Bool,
+  /// Program-wide names this body calls: a cached body is checked against this set.
+  calls: List<Bytes>,
+  /// Each call of a generic program definition and each slow path a type variable took here.
+  generics: Generics,
+  /// The first refusal; emission runs on in a poisoned state, so no signature carries it.
+  refused: Option<Bytes>,
+  /// Flat records built from locals, held back until their word is asked for; their locals are declared at the top.
+  deferred: List<Deferred>,
+  deferred_locals: List<Bytes>,
+  /// `landing`: the label a failing call inside a `handle` body jumps to.
+  performs: List<Bytes>,
+  handles: List<Bytes>,
+  landing: Option<Bytes>,
+  effects: List<EffectName>,
+  /// Slots already released: two reads can both be marked `Owned`, and releasing at both double-frees.
+  released: List<Bytes>,
+  /// Reuse-token widths actually used, declared afterwards at the top: predicting them would duplicate the release rule.
+  reuse_widths: List<Int>,
+  /// `by_root` counts reads per object, not per name: an object with three names each read once has three reads.
+  alias: List<{ local: Bytes, root: Bytes }>,
+  by_root: List<{ root: Bytes, n: Int }>,
+  /// Off, every count is held until the entry ends. On: `bound` are locals a slot names, moved only at
+  /// a read marked `Owned`; `pinned` are ones a fused loop body may read but never move.
+  release: Bool,
+  pinned: List<Bytes>,
+  bound: List<Bytes>,
+  /// The full names of the definitions sharing this C function, in case order; empty outside a group.
+  group: List<Bytes>,
+  /// The checker's operand type at each operator's site, as `operand_at` reads it.
+  operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
+  /// How this root hands back its answer; a failing exit returns its zero.
+  answer: Carrier,
+  /// The root a site is filed under where it is not this one's: a lambda of another root's run here.
+  site_root: Option<Bytes>,
+  /// The callers' lambdas this root runs in place of calls of the parameters they were handed as.
+  lent: List<BoundLambda>,
+  /// The lambdas the root's own code writes, which a callee names by their place among them.
+  written: List<Lambda>,
+  /// Lists this body reads as a word and an offset into it, each made a list only when asked for.
+  slices: List<Slice>,
+  /// Sums held back as their constructor and its argument, each until its word is asked for.
+  sums: List<HeldSum>,
+  /// Whether the value at hand goes where a sum is taken as its constructor and argument, so one
+  /// is held back rather than made: a call's argument or an answer carried so, or a `match`'s
+  /// subject. Kept and cleared where `tail` is.
+  leaves: Bool,
+  /// Inside a lambda run in place, whose slots its frame holds, numbered from zero as the root's
+  /// parameters are: no slot of it is one of those ([`frame_param`]).
+  inlined: Bool,
+}
+
+/// A sum held back as the index `tag` of its constructor among `cases` and each constructor's
+/// argument, one only where `tag` names its constructor, until its word is asked for: `name` is
+/// its word, zero until made.
+pub type HeldSum = { name: Bytes, cases: SumCases, tag: Bytes, args: List<Option<CValue>> }
+
+/// A list read as `base`'s elements from `from` on, held in `name` once asked for as a list, zero
+/// until then.
+pub type Slice = { name: Bytes, base: Bytes, from: Bytes }
+
+/// A record this body built: a field read of it reuses the built value (sound: the values are this body's locals).
+pub type Built = { local: Bytes, names: List<Bytes>, vals: List<CValue> }
+
+/// A record held back until something reads it as a word: `n` words of `shape`, each of `cells`
+/// written at its place. `counts` are the locals holding its counted fields, each with a count of
+/// its own, which the word, once made, holds one more of or takes. `inner` are the records it holds
+/// in place, which it alone holds.
+pub type Deferred = {
+  name: Bytes,
+  shape: Int,
+  n: Int,
+  flags: Int,
+  cells: List<{ at: Int, expr: Bytes }>,
+  counts: List<Bytes>,
+  inner: List<Inner>,
+}
+
+/// A record a record held back holds in place, its header at word `at` with `tail` words of bitmap
+/// after its own: `name` is a record of no record in place held back, or a word, either copied
+/// into the holder's words when its word is made.
+pub type Inner = { at: Int, name: Bytes, tail: Int }
+
+/// A C local holding one count, released at its block's close unless spent first.
+pub type CountLocal = { name: Bytes, indent: Int }
+
+pub type EffectName = { written: Bytes, global: Bytes, ops: List<OpMode> }
+
+pub type OpMode = { name: Bytes, mode: Mode }
+
+pub type Unboxed = { slot: Int, kind: Kind, expr: Bytes, ty: Ty }
+
+/// A parameter as the body holds it, and its `carrier`: how it arrives, as a word the prologue
+/// opens to `kind`, as the value itself, or as a record's fields.
+pub type EmitParam = {
+  name: Bytes,
+  kind: Kind,
+  ty: Ty,
+  /// The type the definition's scheme gives it, none where no scheme speaks for it.
+  of: Option<Type>,
+  carrier: Carrier,
+  /// The caller's lambda this parameter is, which a call of it runs in place.
+  lambda: Option<BoundLambda>,
+}
+
+/// A caller's lambda a specialisation runs where it calls the parameter it was handed as: the
+/// lambda as its owner lowered it, and what the owner's body is emitted under.
+pub type BoundLambda = {
+  owner: Bytes,
+  nth: Int,
+  code: Lambda,
+  /// Whether it is a definition its owner named as a value, read as the lambda around a call of
+  /// it: run in place it counts no step but that call's.
+  named: Bool,
+  module: Bytes,
+  here: List<Def>,
+  imports: List<Imported>,
+  effects: List<EffectName>,
+  typed: Map<Bytes, Typed>,
+  operands: Map<Bytes, Bytes>,
+  base: Int,
+  /// Every lambda its owner lends, those within it among them, by their places.
+  written: List<Lambda>,
+}
+
+/// An owner's lambdas as `BoundLambda` reads its first: the rest are its `written`, and those past
+/// `lambdas` are definitions it names as values.
+pub type OwnerLambdas = { bound: BoundLambda, lambdas: Int }
+
+pub type WithValue = { emitter: Emitter, value: CValue }
+
+/// Where a `match` arm's answer goes: the answer local of its kind, a record's locals, a fused
+/// `iterate` step's loop control, or a sum's constructor and argument's locals.
+pub type Sink =
+  | ToValue({ name: Bytes, kind: Kind })
+  | ToRecord(Into)
+  | ToLoop({ state: Into, answer: Bytes, depth: Int })
+  | ToSum({ cases: SumCases, tag: Bytes, leaves: List<CValue> })
+
+/// The locals a value is assigned into: one per field of `fields` and then `word`, the record's word
+/// where it was made, or the whole value's word where `fields` is empty.
+pub type Into = { fields: List<FieldTy>, locals: List<CValue>, word: Bytes }
+
+/// Lines are joined once at the end; appending to one string would be quadratic.
+pub fn line(emitter: Emitter, text: Bytes) -> Emitter =
+  {
+    out: emitter.out.push(Bytes::concat_all([pad(emitter.indent), text, b"\n"])),
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs,
+    handles: emitter.handles,
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+pub fn indent(emitter: Emitter) -> Emitter =
+  {
+    out: emitter.out,
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent + 1,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs,
+    handles: emitter.handles,
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+pub fn outdent(emitter: Emitter) -> Emitter =
+  {
+    out: emitter.out,
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent - 1,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs,
+    handles: emitter.handles,
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+/// Where the value at hand goes: the root's answer, and a taker of a sum's constructor and argument.
+type Position = { tail: Bool, leaves: Bool }
+
+pub fn position(emitter: Emitter) -> Position = { tail: emitter.tail, leaves: emitter.leaves }
+
+/// Restoring the node's own position makes an arm a tail again after its scrutinee or condition.
+pub fn withtail(emitter: Emitter, at: Position) -> Emitter =
+  if emitter.tail == at.tail && emitter.leaves == at.leaves { emitter } else {
+    {
+      out: emitter.out,
+      temp_count: emitter.temp_count,
+      unboxed: emitter.unboxed,
+      indent: emitter.indent,
+      reads: emitter.reads,
+      shapes: emitter.shapes,
+      built: emitter.built,
+      module: emitter.module,
+      base: emitter.base,
+      count_locals: emitter.count_locals,
+      here: emitter.here,
+      imports: emitter.imports,
+      consts: emitter.consts,
+      ctors: emitter.ctors,
+      lambda_bodies: emitter.lambda_bodies,
+      lambdas: emitter.lambdas,
+      owner: emitter.owner,
+      builtins: emitter.builtins,
+      called_builtins: emitter.called_builtins,
+      fields: emitter.fields,
+      released: emitter.released,
+      reuse_widths: emitter.reuse_widths,
+      alias: emitter.alias,
+      by_root: emitter.by_root,
+      tail: at.tail,
+      calls: emitter.calls,
+      generics: emitter.generics,
+      refused: emitter.refused,
+      deferred: emitter.deferred,
+      deferred_locals: emitter.deferred_locals,
+      performs: emitter.performs,
+      handles: emitter.handles,
+      landing: emitter.landing,
+      effects: emitter.effects,
+      release: emitter.release,
+      pinned: emitter.pinned,
+      bound: emitter.bound,
+      group: emitter.group,
+      operands: emitter.operands,
+      typed: emitter.typed,
+      answer: emitter.answer,
+      site_root: emitter.site_root,
+      lent: emitter.lent,
+      written: emitter.written,
+      slices: emitter.slices,
+      sums: emitter.sums,
+      leaves: at.leaves,
+      inlined: emitter.inlined,
+    }
+  }
+
+pub fn notail(emitter: Emitter) -> Emitter =
+  if !emitter.tail && !emitter.leaves { emitter } else {
+    {
+      out: emitter.out,
+      temp_count: emitter.temp_count,
+      unboxed: emitter.unboxed,
+      indent: emitter.indent,
+      reads: emitter.reads,
+      shapes: emitter.shapes,
+      built: emitter.built,
+      module: emitter.module,
+      base: emitter.base,
+      count_locals: emitter.count_locals,
+      here: emitter.here,
+      imports: emitter.imports,
+      consts: emitter.consts,
+      ctors: emitter.ctors,
+      lambda_bodies: emitter.lambda_bodies,
+      lambdas: emitter.lambdas,
+      owner: emitter.owner,
+      builtins: emitter.builtins,
+      called_builtins: emitter.called_builtins,
+      fields: emitter.fields,
+      released: emitter.released,
+      reuse_widths: emitter.reuse_widths,
+      alias: emitter.alias,
+      by_root: emitter.by_root,
+      tail: false,
+      calls: emitter.calls,
+      generics: emitter.generics,
+      refused: emitter.refused,
+      deferred: emitter.deferred,
+      deferred_locals: emitter.deferred_locals,
+      performs: emitter.performs,
+      handles: emitter.handles,
+      landing: emitter.landing,
+      effects: emitter.effects,
+      release: emitter.release,
+      pinned: emitter.pinned,
+      bound: emitter.bound,
+      group: emitter.group,
+      operands: emitter.operands,
+      typed: emitter.typed,
+      answer: emitter.answer,
+      site_root: emitter.site_root,
+      lent: emitter.lent,
+      written: emitter.written,
+      slices: emitter.slices,
+      sums: emitter.sums,
+      leaves: false,
+      inlined: emitter.inlined,
+    }
+  }
+
+/// A branch's unboxed temporaries die at its closing brace, so `conv` must be restored after it.
+pub fn rescope(emitter: Emitter, conv: List<Unboxed>) -> Emitter =
+  {
+    out: emitter.out,
+    temp_count: emitter.temp_count,
+    unboxed: conv,
+    indent: emitter.indent,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs,
+    handles: emitter.handles,
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+pub fn fresh(emitter: Emitter) -> { emitter: Emitter, name: Bytes } =
+  {
+    emitter: {
+      out: emitter.out,
+      temp_count: emitter.temp_count + 1,
+      unboxed: emitter.unboxed,
+      indent: emitter.indent,
+      reads: emitter.reads,
+      shapes: emitter.shapes,
+      built: emitter.built,
+      module: emitter.module,
+      base: emitter.base,
+      count_locals: emitter.count_locals,
+      here: emitter.here,
+      imports: emitter.imports,
+      consts: emitter.consts,
+      ctors: emitter.ctors,
+      lambda_bodies: emitter.lambda_bodies,
+      lambdas: emitter.lambdas,
+      owner: emitter.owner,
+      builtins: emitter.builtins,
+      called_builtins: emitter.called_builtins,
+      fields: emitter.fields,
+      released: emitter.released,
+      reuse_widths: emitter.reuse_widths,
+      alias: emitter.alias,
+      by_root: emitter.by_root,
+      tail: emitter.tail,
+      calls: emitter.calls,
+      generics: emitter.generics,
+      refused: emitter.refused,
+      deferred: emitter.deferred,
+      deferred_locals: emitter.deferred_locals,
+      performs: emitter.performs,
+      handles: emitter.handles,
+      landing: emitter.landing,
+      effects: emitter.effects,
+      release: emitter.release,
+      pinned: emitter.pinned,
+      bound: emitter.bound,
+      group: emitter.group,
+      operands: emitter.operands,
+      typed: emitter.typed,
+      answer: emitter.answer,
+      site_root: emitter.site_root,
+      lent: emitter.lent,
+      written: emitter.written,
+      slices: emitter.slices,
+      sums: emitter.sums,
+      leaves: emitter.leaves,
+      inlined: emitter.inlined,
+    },
+    name: b"t".concat(ascii_of_int(emitter.temp_count + 1)),
+  }
+
+/// The last entry wins: a `let` may shadow a slot an enclosing scope filled.
+pub fn conv_of(emitter: Emitter, slot: Int) -> Option<CValue> =
+  emitter.unboxed.fold(None, |acc: Option<CValue>, unboxed: Unboxed|
+    if unboxed.slot == slot { Some({ kind: unboxed.kind, expr: unboxed.expr, ty: unboxed.ty }) }
+    else { acc })
+
+pub fn deferred_of(emitter: Emitter, name: Bytes) -> Option<Deferred> =
+  emitter.deferred.fold(None, |acc: Option<Deferred>, d: Deferred|
+    if d.name == name { Some(d) } else { acc })
+
+pub fn held_sum_of(emitter: Emitter, name: Bytes) -> Option<HeldSum> =
+  emitter.sums.fold(None, |acc: Option<HeldSum>, h: HeldSum|
+    if h.name == name { Some(h) } else { acc })
+
+/// `emitter` holding `h` back, its word a local declared at the top, zero from here on, as a pass of
+/// a loop that comes here again finds it, and let go at its scope's end.
+pub fn note_held_sum(emitter: Emitter, h: HeldSum) -> Emitter = {
+  let e = note_holder(line(emitter, h.name.concat(b" = 0;")), h.name);
+  { ..e, sums: e.sums.push(h), deferred_locals: e.deferred_locals.push(h.name) }
+}
+
+/// `emitter` where the value at hand is taken as a sum's constructor and argument.
+pub fn with_leaves(emitter: Emitter) -> Emitter =
+  if emitter.leaves { emitter } else { { ..emitter, leaves: true } }
+
+/// A lambda body counts reads in its own window; its captures are charged outside.
+pub fn with_reads(emitter: Emitter, reads: List<Int>) -> Emitter =
+  {
+    out: emitter.out,
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent,
+    reads: reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs,
+    handles: emitter.handles,
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+pub fn with_out(emitter: Emitter, out: List<Bytes>) -> Emitter =
+  {
+    out: out,
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs,
+    handles: emitter.handles,
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+pub fn with_landing(emitter: Emitter, landing: Option<Bytes>) -> Emitter =
+  {
+    out: emitter.out,
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs,
+    handles: emitter.handles,
+    landing: landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+pub fn note_performs(emitter: Emitter, eff: Bytes) -> Emitter =
+  {
+    out: emitter.out,
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs.push(eff),
+    handles: emitter.handles,
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+pub fn note_handles(emitter: Emitter, eff: Bytes) -> Emitter =
+  {
+    out: emitter.out,
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs,
+    handles: emitter.handles.push(eff),
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+pub fn note_deferred(emitter: Emitter, d: Deferred) -> Emitter =
+  note_holder(push_deferred(emitter, d), d.name)
+
+pub fn slice_of(emitter: Emitter, name: Bytes) -> Option<Slice> =
+  emitter.slices.fold(None, |acc: Option<Slice>, sl: Slice|
+    if sl.name == name { Some(sl) } else { acc })
+
+/// `emitter` holding the list `base` read from `from` on as `name`, which the body declares.
+pub fn note_slice(emitter: Emitter, name: Bytes, base: Bytes, from: Bytes) -> Emitter =
+  {
+    ..emitter,
+    slices: emitter.slices.push({ name: name, base: base, from: from }),
+    deferred_locals: emitter.deferred_locals.push(name),
+  }
+
+/// The list `sl` reads, made a list of its own: the elements from its offset on, or its base
+/// itself, counted once more, where the offset is zero.
+pub fn sliced_list(emitter: Emitter, sl: Slice, ty: Ty) -> WithValue = {
+  let f = fresh(emitter);
+  let made = line(
+    f.emitter,
+    Bytes::concat_all([
+      b"Word ",
+      f.name,
+      b" = ",
+      sl.from,
+      b" ? rt_list_rest_p(ctx, ",
+      sl.base,
+      b", ",
+      sl.from,
+      b") : ",
+      sl.base,
+      b"; if (!",
+      sl.from,
+      b") ply_inc(",
+      f.name,
+      b");",
+    ]),
+  );
+  { emitter: note_made(made, f.name), value: { kind: KBoxed, expr: f.name, ty: ty } }
+}
+
+pub fn push_deferred(emitter: Emitter, d: Deferred) -> Emitter =
+  {
+    out: emitter.out,
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred.push(d),
+    deferred_locals: emitter.deferred_locals.push(d.name),
+    performs: emitter.performs,
+    handles: emitter.handles,
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+/// A local name (`t12`, `p0`, a record parameter's field `p0_1`, `q1`) rather than an expression.
+pub fn is_local(e: Bytes) -> Bool =
+  e.len() > 1 && (e.at(0) == 116 || e.at(0) == 112 || e.at(0) == 113)
+    && range(1, e.len()).fold(true, |acc: Bool, i: Int|
+      acc
+        && ((e.at(i) >= 48 && e.at(i) <= 57)
+        || (e.at(0) == 112 && e.at(i) == 95 && i > 1 && i + 1 < e.len())))
+
+/// The parameter whose word `value` is, followed through renames and moves.
+pub fn param_of(emitter: Emitter, value: CValue, params: List<EmitParam>) -> Option<Int> = {
+  let root = root_of(emitter, value.expr);
+  if root.len() < 2 || root.at(0) != 112
+      || !range(1, root.len()).fold(true, |ok: Bool, i: Int|
+        ok && root.at(i) >= 48 && root.at(i) <= 57) { None } else {
+    let i = digits(root.slice(1, root.len()));
+    if i < params.len() { Some(i) } else { None }
+  }
+}
+
+pub fn note_generics(emitter: Emitter, g: Generics) -> Emitter = { ..emitter, generics: g }
+
+pub fn root_of(emitter: Emitter, local: Bytes) -> Bytes =
+  emitter.alias.fold(local, |acc: Bytes, a: { local: Bytes, root: Bytes }|
+    if a.local == local { a.root } else { acc })
+
+pub fn note_alias(emitter: Emitter, local: Bytes, root: Bytes) -> Emitter =
+  {
+    out: emitter.out,
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias.push({ local: local, root: root }),
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs,
+    handles: emitter.handles,
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+/// Charge a slot's reads to the object the local holds, once per (object, slot).
+pub fn charge(emitter: Emitter, slot: Int, local: Bytes) -> Emitter = {
+  let r = root_of(emitter, local);
+  let already = emitter.by_root.fold(false, |acc: Bool, e: { root: Bytes, n: Int }|
+    acc || e.root == Bytes::concat_all([r, b"#", ascii_of_int(slot)]));
+  if already { emitter } else {
+    {
+      out: emitter.out,
+      temp_count: emitter.temp_count,
+      unboxed: emitter.unboxed,
+      indent: emitter.indent,
+      reads: emitter.reads,
+      shapes: emitter.shapes,
+      built: emitter.built,
+      module: emitter.module,
+      base: emitter.base,
+      count_locals: emitter.count_locals,
+      here: emitter.here,
+      imports: emitter.imports,
+      consts: emitter.consts,
+      ctors: emitter.ctors,
+      lambda_bodies: emitter.lambda_bodies,
+      lambdas: emitter.lambdas,
+      owner: emitter.owner,
+      builtins: emitter.builtins,
+      called_builtins: emitter.called_builtins,
+      fields: emitter.fields,
+      released: emitter.released,
+      reuse_widths: emitter.reuse_widths,
+      alias: emitter.alias,
+      by_root: emitter.by_root.push({
+        root: Bytes::concat_all([r, b"#", ascii_of_int(slot)]),
+        n: 0,
+      }).push({ root: r, n: emitter.reads.count(|y: Int| y == slot) }),
+      tail: emitter.tail,
+      calls: emitter.calls,
+      generics: emitter.generics,
+      refused: emitter.refused,
+      deferred: emitter.deferred,
+      deferred_locals: emitter.deferred_locals,
+      performs: emitter.performs,
+      handles: emitter.handles,
+      landing: emitter.landing,
+      effects: emitter.effects,
+      release: emitter.release,
+      pinned: emitter.pinned,
+      bound: emitter.bound,
+      group: emitter.group,
+      operands: emitter.operands,
+      typed: emitter.typed,
+      answer: emitter.answer,
+      site_root: emitter.site_root,
+      lent: emitter.lent,
+      written: emitter.written,
+      slices: emitter.slices,
+      sums: emitter.sums,
+      leaves: emitter.leaves,
+      inlined: emitter.inlined,
+    }
+  }
+}
+
+pub fn reads_of_root(emitter: Emitter, local: Bytes) -> Int = {
+  let r = root_of(emitter, local);
+  emitter.by_root.fold(0, |acc: Int, e: { root: Bytes, n: Int }|
+    if e.root == r { acc + e.n } else { acc })
+}
+
+pub fn built_of(emitter: Emitter, local: Bytes) -> Option<Built> =
+  emitter.built.fold(None, |acc: Option<Built>, b: Built|
+    if b.local == local { Some(b) } else { acc })
+
+/// Only a runtime helper's result hands over its count, a builtin's among them; a compiled call's result is duplicated before it is handed on.
+pub fn answers_owned(emitter: Emitter, expr: Bytes) -> Bool =
+  expr.starts_with(b"rt_") || expr.starts_with(b"builtin_")
+    || (emitter.release
+    && ((expr.len() > 4 && expr.slice(0, 4) == b"ply_" && calls_with_ctx(expr))
+    || (
+
+      // A generic call names its root by a placeholder the unit settles: a compiled call all the same.
+      expr.starts_with(b"@@g")
+    && calls_with_ctx(expr))
+    || (expr.len() > 13 && expr.slice(0, 13) == b"(ply_fits_imm")))
+
+/// A compiled call `ply_<name>(ctx, ...)`, told from a load or immediate by what follows the first parenthesis.
+fn calls_with_ctx(expr: Bytes) -> Bool = {
+  let p = expr.scan_until(0, b"(", expr.len());
+  p + 4 <= expr.len() && expr.slice(p, p + 4) == b"(ctx"
+}
+
+pub fn note_made(emitter: Emitter, name: Bytes) -> Emitter =
+  { ..emitter, count_locals: emitter.count_locals.push({ name: name, indent: emitter.indent }) }
+
+/// A refusal: the first reason is kept, and emission runs out on a placeholder value.
+pub fn poison(emitter: Emitter, why: Bytes) -> Emitter =
+  match emitter.refused {
+    Some(_) -> emitter,
+    None ->
+      {
+        out: emitter.out,
+        temp_count: emitter.temp_count,
+        unboxed: emitter.unboxed,
+        indent: emitter.indent,
+        reads: emitter.reads,
+        shapes: emitter.shapes,
+        built: emitter.built,
+        module: emitter.module,
+        base: emitter.base,
+        count_locals: emitter.count_locals,
+        here: emitter.here,
+        imports: emitter.imports,
+        consts: emitter.consts,
+        ctors: emitter.ctors,
+        lambda_bodies: emitter.lambda_bodies,
+        lambdas: emitter.lambdas,
+        owner: emitter.owner,
+        builtins: emitter.builtins,
+        called_builtins: emitter.called_builtins,
+        fields: emitter.fields,
+        released: emitter.released,
+        reuse_widths: emitter.reuse_widths,
+        alias: emitter.alias,
+        by_root: emitter.by_root,
+        tail: emitter.tail,
+        calls: emitter.calls,
+        generics: emitter.generics,
+        refused: Some(why),
+        deferred: emitter.deferred,
+        deferred_locals: emitter.deferred_locals,
+        performs: emitter.performs,
+        handles: emitter.handles,
+        landing: emitter.landing,
+        effects: emitter.effects,
+        release: emitter.release,
+        pinned: emitter.pinned,
+        bound: emitter.bound,
+        group: emitter.group,
+        operands: emitter.operands,
+        typed: emitter.typed,
+        answer: emitter.answer,
+        site_root: emitter.site_root,
+        lent: emitter.lent,
+        written: emitter.written,
+        slices: emitter.slices,
+        sums: emitter.sums,
+        leaves: emitter.leaves,
+        inlined: emitter.inlined,
+      },
+  }
+
+pub fn refused(emitter: Emitter, why: Bytes) -> WithValue =
+  { emitter: poison(emitter, why), value: { kind: KBoxed, expr: b"0", ty: TyOpen([]) } }
+
+/// The index a symbol takes in this body's code table, added on first use.
+pub fn lambda_of(emitter: Emitter, sym: Bytes) -> { emitter: Emitter, i: Int } =
+  match range(0, emitter.lambdas.len()).fold(None, |acc: Option<Int>, i: Int|
+      match emitter.lambdas.at(i) {
+        Some(x) -> if x == sym { Some(i) } else { acc },
+        None -> acc,
+      }) {
+    Some(i) -> { emitter: emitter, i: i },
+    None ->
+      {
+        emitter: {
+          out: emitter.out,
+          temp_count: emitter.temp_count,
+          unboxed: emitter.unboxed,
+          indent: emitter.indent,
+          reads: emitter.reads,
+          shapes: emitter.shapes,
+          built: emitter.built,
+          module: emitter.module,
+          base: emitter.base,
+          count_locals: emitter.count_locals,
+          here: emitter.here,
+          imports: emitter.imports,
+          consts: emitter.consts,
+          ctors: emitter.ctors,
+          lambda_bodies: emitter.lambda_bodies,
+          lambdas: emitter.lambdas.push(sym),
+          owner: emitter.owner,
+          builtins: emitter.builtins,
+          called_builtins: emitter.called_builtins,
+          fields: emitter.fields,
+          released: emitter.released,
+          reuse_widths: emitter.reuse_widths,
+          alias: emitter.alias,
+          by_root: emitter.by_root,
+          tail: emitter.tail,
+          calls: emitter.calls,
+          generics: emitter.generics,
+          refused: emitter.refused,
+          deferred: emitter.deferred,
+          deferred_locals: emitter.deferred_locals,
+          performs: emitter.performs,
+          handles: emitter.handles,
+          landing: emitter.landing,
+          effects: emitter.effects,
+          release: emitter.release,
+          pinned: emitter.pinned,
+          bound: emitter.bound,
+          group: emitter.group,
+          operands: emitter.operands,
+          typed: emitter.typed,
+          answer: emitter.answer,
+          site_root: emitter.site_root,
+          lent: emitter.lent,
+          written: emitter.written,
+          slices: emitter.slices,
+          sums: emitter.sums,
+          leaves: emitter.leaves,
+          inlined: emitter.inlined,
+        },
+        i: emitter.lambdas.len(),
+      },
+  }
+
+pub fn note_call(emitter: Emitter, full: Bytes) -> Emitter =
+  {
+    out: emitter.out,
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls.push(full),
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs,
+    handles: emitter.handles,
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+pub fn spend_made(emitter: Emitter, name: Bytes) -> Emitter =
+  {
+    ..emitter,
+    count_locals: emitter.count_locals.fold([], |acc: List<CountLocal>, m: CountLocal|
+      if m.name == name { acc } else { acc.push(m) }),
+  }
+
+pub fn is_made(emitter: Emitter, name: Bytes) -> Bool =
+  emitter.count_locals.fold(false, |acc: Bool, m: CountLocal| acc || m.name == name)
+
+fn is_bound(emitter: Emitter, name: Bytes) -> Bool =
+  emitter.bound.fold(false, |acc: Bool, b: Bytes| acc || b == name)
+
+pub fn is_pinned(emitter: Emitter, name: Bytes) -> Bool =
+  emitter.pinned.fold(false, |acc: Bool, p: Bytes| acc || p == name)
+
+/// A count a consumer may take in place: held by a local no slot names and no loop pins.
+pub fn spendable(emitter: Emitter, name: Bytes) -> Bool =
+  is_made(emitter, name) && !is_bound(emitter, name) && !is_pinned(emitter, name)
+
+/// Whether handing `name` on spends it, its count moved rather than duplicated.
+pub fn spends(emitter: Emitter, name: Bytes) -> Bool = emitter.release && spendable(emitter, name)
+
+/// Holders are tracked only under release; otherwise every count lives until the entry ends.
+pub fn note_holder(emitter: Emitter, name: Bytes) -> Emitter =
+  if emitter.release { note_made(emitter, name) } else { emitter }
+
+pub fn note_bound(emitter: Emitter, name: Bytes) -> Emitter =
+  { ..emitter, bound: emitter.bound.push(name) }
+
+/// Pinned for a fused loop body: its text runs once per iteration, so a "last use" mark is about text, not execution.
+pub fn pin_all(emitter: Emitter) -> Emitter =
+  {
+    ..emitter,
+    pinned: emitter.count_locals.fold(emitter.pinned, |acc: List<Bytes>, m: CountLocal|
+      acc.push(m.name)),
+  }
+
+pub fn with_pinned(emitter: Emitter, pinned: List<Bytes>) -> Emitter = { ..emitter, pinned: pinned }
+
+pub fn with_made(emitter: Emitter, made: List<CountLocal>) -> Emitter =
+  { ..emitter, count_locals: made }
+
+/// A branch beside one already written, from that one's state `after`: a sum held back `before`
+/// that the other branch made and took is still held back on this path.
+pub fn beside(after: Emitter, before: Emitter) -> Emitter =
+  {
+    ..after,
+    sums: before.sums.fold(after.sums, |acc: List<HeldSum>, h: HeldSum|
+      if acc.fold(false, |seen: Bool, x: HeldSum| seen || x.name == h.name) { acc }
+      else { acc.push(h) }),
+  }
+
+/// Held after either of two paths; released at scope end, where the path that spent it left it null.
+pub fn union_made(a: List<CountLocal>, b: List<CountLocal>) -> List<CountLocal> =
+  b.fold(a, |acc: List<CountLocal>, m: CountLocal|
+    if acc.fold(false, |seen: Bool, x: CountLocal| seen || x.name == m.name) { acc }
+    else { acc.push(m) })
+
+/// Stores the source place before a call that can fail, as bytes from the root's definition so the C does not change
+/// when the definition moves; a synthesized node (empty span) has none.
+pub fn site(emitter: Emitter, span: Span) -> Emitter =
+  if span.end <= span.start { emitter } else {
+    line(
+      emitter,
+      Bytes::concat_all([
+        b"PLY_SITE(ctx, ",
+        site_key(emitter),
+        b", ",
+        ascii_of_int(span.start - emitter.base),
+        b", ",
+        ascii_of_int(span.end - emitter.base),
+        b");",
+      ]),
+    )
+  }
+
+/// The placeholder the driver resolves to this body's root: a group member's is numbered by its case.
+fn root_key(emitter: Emitter) -> Bytes =
+  match position_of(emitter.group, emitter.owner) {
+    None -> b"r",
+    Some(i) -> b"r".concat(ascii_of_int(i)),
+  }
+
+/// The root id the sites of this body are filed under: the placeholder the unit resolves to this
+/// root's, or another root's id outright.
+fn site_key(emitter: Emitter) -> Bytes =
+  match emitter.site_root {
+    Some(r) -> ascii_of_int(root_id(r)),
+    None -> Bytes::concat_all([b"@@", root_key(emitter), b"@@"]),
+  }
+
+pub fn check(emitter: Emitter) -> Emitter =
+  line(emitter, b"if (ctx->failed) ".concat(leaving(emitter)))
+
+/// The statement a body leaves by once the context has failed. Inside a `handle` body it jumps to the handle,
+/// which pops its frame and answers a raise bound for it; a `return` there would leave both undone.
+pub fn leaving(emitter: Emitter) -> Bytes =
+  match emitter.landing {
+    None -> failing_return(returned_kind(emitter.answer)),
+    Some(l) -> Bytes::concat_all([b"goto ", l, b";"]),
+  }
+
+/// Every occurrence takes a new index: constants are not interned, unlike shapes.
+pub fn const_of(emitter: Emitter, literal: Lit) -> { emitter: Emitter, i: Int } =
+  {
+    emitter: {
+      out: emitter.out,
+      temp_count: emitter.temp_count,
+      unboxed: emitter.unboxed,
+      indent: emitter.indent,
+      reads: emitter.reads,
+      shapes: emitter.shapes,
+      built: emitter.built,
+      module: emitter.module,
+      base: emitter.base,
+      count_locals: emitter.count_locals,
+      here: emitter.here,
+      imports: emitter.imports,
+      consts: emitter.consts.push(literal),
+      ctors: emitter.ctors,
+      lambda_bodies: emitter.lambda_bodies,
+      lambdas: emitter.lambdas,
+      owner: emitter.owner,
+      builtins: emitter.builtins,
+      called_builtins: emitter.called_builtins,
+      fields: emitter.fields,
+      released: emitter.released,
+      reuse_widths: emitter.reuse_widths,
+      alias: emitter.alias,
+      by_root: emitter.by_root,
+      tail: emitter.tail,
+      calls: emitter.calls,
+      generics: emitter.generics,
+      refused: emitter.refused,
+      deferred: emitter.deferred,
+      deferred_locals: emitter.deferred_locals,
+      performs: emitter.performs,
+      handles: emitter.handles,
+      landing: emitter.landing,
+      effects: emitter.effects,
+      release: emitter.release,
+      pinned: emitter.pinned,
+      bound: emitter.bound,
+      group: emitter.group,
+      operands: emitter.operands,
+      typed: emitter.typed,
+      answer: emitter.answer,
+      site_root: emitter.site_root,
+      lent: emitter.lent,
+      written: emitter.written,
+      slices: emitter.slices,
+      sums: emitter.sums,
+      leaves: emitter.leaves,
+      inlined: emitter.inlined,
+    },
+    i: emitter.consts.len(),
+  }
+
+/// Whose names a lambda run in place is read under: those of the frame it is run in, where that
+/// frame's owner wrote it, or those of the root that lent it.
+pub type LambdaFrame = | Own | Lent(BoundLambda)
+
+// --- Externs written in place -----------------------------------------------------
+
+/// Calls of one builtin share an index; constants deliberately do not.
+pub fn builtin_of(emitter: Emitter, name: Bytes) -> { emitter: Emitter, i: Int } =
+  match range(0, emitter.called_builtins.len()).fold(None, |acc: Option<Int>, i: Int|
+      match emitter.called_builtins.at(i) {
+        Some(x) -> if x == name { Some(i) } else { acc },
+        None -> acc,
+      }) {
+    Some(i) -> { emitter: emitter, i: i },
+    None ->
+      {
+        emitter: {
+          out: emitter.out,
+          temp_count: emitter.temp_count,
+          unboxed: emitter.unboxed,
+          indent: emitter.indent,
+          reads: emitter.reads,
+          shapes: emitter.shapes,
+          built: emitter.built,
+          module: emitter.module,
+          base: emitter.base,
+          count_locals: emitter.count_locals,
+          here: emitter.here,
+          imports: emitter.imports,
+          consts: emitter.consts,
+          ctors: emitter.ctors,
+          lambda_bodies: emitter.lambda_bodies,
+          lambdas: emitter.lambdas,
+          owner: emitter.owner,
+          builtins: emitter.builtins,
+          called_builtins: emitter.called_builtins.push(name),
+          fields: emitter.fields,
+          released: emitter.released,
+          reuse_widths: emitter.reuse_widths,
+          alias: emitter.alias,
+          by_root: emitter.by_root,
+          tail: emitter.tail,
+          calls: emitter.calls,
+          generics: emitter.generics,
+          refused: emitter.refused,
+          deferred: emitter.deferred,
+          deferred_locals: emitter.deferred_locals,
+          performs: emitter.performs,
+          handles: emitter.handles,
+          landing: emitter.landing,
+          effects: emitter.effects,
+          release: emitter.release,
+          pinned: emitter.pinned,
+          bound: emitter.bound,
+          group: emitter.group,
+          operands: emitter.operands,
+          typed: emitter.typed,
+          answer: emitter.answer,
+          site_root: emitter.site_root,
+          lent: emitter.lent,
+          written: emitter.written,
+          slices: emitter.slices,
+          sums: emitter.sums,
+          leaves: emitter.leaves,
+          inlined: emitter.inlined,
+        },
+        i: emitter.called_builtins.len(),
+      },
+  }
+
+/// `ty` where it says something, else `fallback`.
+pub fn known_or(ty: Ty, fallback: Ty) -> Ty = match ty { TyOpen(_) -> fallback, _ -> ty }
+
+pub fn nth_value(vs: List<CValue>, k: Int) -> CValue =
+  match vs.at(k) { Some(v) -> v, None -> { kind: KBoxed, expr: b"0", ty: TyOpen([]) } }
+
+/// `x` and then `xs`.
+pub fn push_front(x: CValue, xs: List<CValue>) -> List<CValue> = [x].concat(xs)
+
+pub fn field_of(emitter: Emitter, name: Bytes) -> { emitter: Emitter, i: Int } =
+  match range(0, emitter.fields.len()).fold(None, |acc: Option<Int>, i: Int|
+      match emitter.fields.at(i) {
+        Some(x) -> if x == name { Some(i) } else { acc },
+        None -> acc,
+      }) {
+    Some(i) -> { emitter: emitter, i: i },
+    None ->
+      {
+        emitter: {
+          out: emitter.out,
+          temp_count: emitter.temp_count,
+          unboxed: emitter.unboxed,
+          indent: emitter.indent,
+          reads: emitter.reads,
+          shapes: emitter.shapes,
+          built: emitter.built,
+          module: emitter.module,
+          base: emitter.base,
+          count_locals: emitter.count_locals,
+          here: emitter.here,
+          imports: emitter.imports,
+          consts: emitter.consts,
+          ctors: emitter.ctors,
+          lambda_bodies: emitter.lambda_bodies,
+          lambdas: emitter.lambdas,
+          owner: emitter.owner,
+          builtins: emitter.builtins,
+          called_builtins: emitter.called_builtins,
+          fields: emitter.fields.push(name),
+          released: emitter.released,
+          reuse_widths: emitter.reuse_widths,
+          alias: emitter.alias,
+          by_root: emitter.by_root,
+          tail: emitter.tail,
+          calls: emitter.calls,
+          generics: emitter.generics,
+          refused: emitter.refused,
+          deferred: emitter.deferred,
+          deferred_locals: emitter.deferred_locals,
+          performs: emitter.performs,
+          handles: emitter.handles,
+          landing: emitter.landing,
+          effects: emitter.effects,
+          release: emitter.release,
+          pinned: emitter.pinned,
+          bound: emitter.bound,
+          group: emitter.group,
+          operands: emitter.operands,
+          typed: emitter.typed,
+          answer: emitter.answer,
+          site_root: emitter.site_root,
+          lent: emitter.lent,
+          written: emitter.written,
+          slices: emitter.slices,
+          sums: emitter.sums,
+          leaves: emitter.leaves,
+          inlined: emitter.inlined,
+        },
+        i: emitter.fields.len(),
+      },
+  }
+
+pub fn note_tok(emitter: Emitter, w: Int) -> Emitter =
+  if emitter.reuse_widths.fold(false, |acc: Bool, x: Int| acc || x == w) { emitter } else {
+    {
+      out: emitter.out,
+      temp_count: emitter.temp_count,
+      unboxed: emitter.unboxed,
+      indent: emitter.indent,
+      reads: emitter.reads,
+      shapes: emitter.shapes,
+      built: emitter.built,
+      module: emitter.module,
+      base: emitter.base,
+      count_locals: emitter.count_locals,
+      here: emitter.here,
+      imports: emitter.imports,
+      consts: emitter.consts,
+      ctors: emitter.ctors,
+      lambda_bodies: emitter.lambda_bodies,
+      lambdas: emitter.lambdas,
+      owner: emitter.owner,
+      builtins: emitter.builtins,
+      called_builtins: emitter.called_builtins,
+      fields: emitter.fields,
+      released: emitter.released,
+      reuse_widths: emitter.reuse_widths.push(w),
+      alias: emitter.alias,
+      by_root: emitter.by_root,
+      tail: emitter.tail,
+      calls: emitter.calls,
+      generics: emitter.generics,
+      refused: emitter.refused,
+      deferred: emitter.deferred,
+      deferred_locals: emitter.deferred_locals,
+      performs: emitter.performs,
+      handles: emitter.handles,
+      landing: emitter.landing,
+      effects: emitter.effects,
+      release: emitter.release,
+      pinned: emitter.pinned,
+      bound: emitter.bound,
+      group: emitter.group,
+      operands: emitter.operands,
+      typed: emitter.typed,
+      answer: emitter.answer,
+      site_root: emitter.site_root,
+      lent: emitter.lent,
+      written: emitter.written,
+      slices: emitter.slices,
+      sums: emitter.sums,
+      leaves: emitter.leaves,
+      inlined: emitter.inlined,
+    }
+  }
+
+pub fn note_released(emitter: Emitter, root: Bytes) -> Emitter =
+  {
+    out: emitter.out,
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released.push(root),
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs,
+    handles: emitter.handles,
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+/// The root's parameter that slot `s` of the code being emitted is, which the window does not hold
+/// where the prologue left it as its word: none inside a lambda run in place.
+pub fn frame_param(emitter: Emitter, params: List<EmitParam>, s: Int) -> Option<EmitParam> =
+  if emitter.inlined { None } else { params.at(s) }
+
+/// The local a slot reads as: the window's, or a parameter the prologue did not open.
+pub fn local_of(emitter: Emitter, params: List<EmitParam>, s: Int) -> Option<Bytes> =
+  match conv_of(emitter, s) {
+    Some(cv) -> Some(cv.expr),
+    None -> match frame_param(emitter, params, s) {
+      Some(_) -> Some(b"p".concat(ascii_of_int(s))),
+      None -> None,
+    },
+  }
+
+/// What a slot reads as, with the type the prologue knows a parameter it did not open by.
+pub fn slot_value(emitter: Emitter, params: List<EmitParam>, s: Int) -> Option<CValue> =
+  match conv_of(emitter, s) {
+    Some(cv) -> Some(cv),
+    None -> match frame_param(emitter, params, s) {
+      Some(p) -> if p.kind == KBoxed {
+        Some({ kind: KBoxed, expr: b"p".concat(ascii_of_int(s)), ty: p.ty })
+      } else { None },
+      None -> None,
+    },
+  }
+
+pub fn blank(emitter: Emitter) -> Emitter =
+  {
+    out: [],
+    temp_count: emitter.temp_count,
+    unboxed: emitter.unboxed,
+    indent: emitter.indent,
+    reads: emitter.reads,
+    shapes: emitter.shapes,
+    built: emitter.built,
+    module: emitter.module,
+    base: emitter.base,
+    count_locals: emitter.count_locals,
+    here: emitter.here,
+    imports: emitter.imports,
+    consts: emitter.consts,
+    ctors: emitter.ctors,
+    lambda_bodies: emitter.lambda_bodies,
+    lambdas: emitter.lambdas,
+    owner: emitter.owner,
+    builtins: emitter.builtins,
+    called_builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    released: emitter.released,
+    reuse_widths: emitter.reuse_widths,
+    alias: emitter.alias,
+    by_root: emitter.by_root,
+    tail: emitter.tail,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    refused: emitter.refused,
+    deferred: emitter.deferred,
+    deferred_locals: emitter.deferred_locals,
+    performs: emitter.performs,
+    handles: emitter.handles,
+    landing: emitter.landing,
+    effects: emitter.effects,
+    release: emitter.release,
+    pinned: emitter.pinned,
+    bound: emitter.bound,
+    group: emitter.group,
+    operands: emitter.operands,
+    typed: emitter.typed,
+    answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
+    slices: emitter.slices,
+    sums: emitter.sums,
+    leaves: emitter.leaves,
+    inlined: emitter.inlined,
+  }
+
+/// `value`, what `code` evaluated to, read with the layout its node's type gives it where the value
+/// itself carries none: a word of that type, or an `Option`'s payload held as its word.
+pub fn typed_value(emitter: Emitter, code: Code, value: CValue) -> CValue =
+  match value.ty {
+    TyOpen(_) -> match node_type(emitter, code) {
+      None -> value,
+      Some(ty) -> match value.kind {
+        KBoxed -> laid_as(value, ty),
+        KSum(Zeroed) -> match ty {
+          TyCon(c) -> if c.name != b"Option" { value }
+          else { match c.args.at(0) { Some(payload) -> laid_as(value, payload), None -> value } },
+          _ -> value,
+        },
+        KSum(Tagged) -> if tagged_result(ty) { { ..value, ty: TyOf(ty) } } else { value },
+        _ -> value,
+      },
+    },
+    _ -> value,
+  }
+
+/// The type of the node `code`, where its place in the source is its alone and its type was
+/// rebuilt.
+pub fn node_type(emitter: Emitter, code: Code) -> Option<Type> =
+  match emitter.typed.get(span_key(code.span)) {
+    Some(t) -> match t.node {
+      Some(ty) -> if ty == unknown_type() { None } else { Some(ty) },
+      None -> None,
+    },
+    None -> None,
+  }
+
+/// What `code` evaluated to, as `typed_value` reads it.
+pub fn typed(code: Code, made: Option<WithValue>) -> Option<WithValue> =
+  match made {
+    None -> None,
+    Some(o) -> Some({ emitter: o.emitter, value: typed_value(o.emitter, code, o.value) }),
+  }
+
+/// `value`, a word, read as a value of `ty` is laid out where `ty` is held as a word and says how.
+fn laid_as(value: CValue, ty: Type) -> CValue =
+  if kind_of(ty).kind == KBoxed { { ..value, ty: known_or(word_ty(ty), value.ty) } } else { value }
+
+/// What a word of type `ty` is laid out as: what `kind_of` reads of it, and an `Option` or a `Result`
+/// as its type, which its constructors' arguments are read by.
+pub fn word_ty(ty: Type) -> Ty =
+  match kind_of(ty).ty {
+    TyOpen(vs) -> match ty {
+      TyCon(c) -> if (c.name == b"Option" && c.args.len() == 1)
+          || (c.name == b"Result" && c.args.len() == 2) { TyOf(ty) }
+      else { TyOpen(vs) },
+      _ -> TyOpen(vs),
+    },
+    laid -> laid,
+  }
+
+// --- Specialisation ----------------------------------------------------------------------------
+
+/// The tables of a body defining `full`, or its group's members, each with its head in `heads`.
+pub fn tables_of(emitter: Emitter, full: Bytes, heads: List<Head>) -> Tables / {abort.raise} = {
+  let names = if emitter.group.len() == 0 { [full] } else { emitter.group };
+  {
+    consts: emitter.consts.map(const_of_lit),
+    builtins: emitter.called_builtins,
+    fields: emitter.fields,
+    // A shape's fields in the checker's order, which is what the unit interns a shape by.
+    shapes: emitter.shapes.map(sorted_names),
+    lambdas: emitter.lambdas,
+    calls: emitter.calls,
+    generics: emitter.generics,
+    performs: emitter.performs,
+    handles: emitter.handles,
+    members: emitter.group,
+    // What this body's C calls each definition it holds, so nothing downstream spells a symbol itself.
+    symbols: range(0, names.len()).map(|i: Int|
+      {
+        symbol: symbol_of(names.get(i)),
+        entry: entry_of(names.get(i)),
+        head: match heads.at(i) { Some(h) -> h, None -> word_head(0) },
+      }),
+  }
+}

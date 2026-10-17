@@ -1,0 +1,198 @@
+//! Front-end diagnostics in driver order, where a stage that reports stops the rest.
+
+import syntax.parsing (ParseDiag, Label, Parsed, no_module)
+import syntax.items (Module, Derivation, header, parse, with_prelude)
+import syntax.exprs (prelude_module)
+import expand.rewrite (expand)
+import expand.derive (Expansion, expand_derives)
+import check.resolve.tables (Source, ParsedModule, Diag)
+import check.resolve (ResolveSucceeded, ResolveFailed, resolve_modules)
+import store.hash.forms (build_index)
+import check.infer (check_diagnostics)
+import std.list
+import std.prelude_source
+
+pub fn placed(module: Int, diag: ParseDiag) -> Diag =
+  {
+    code: diag.code,
+    notes: diag.notes,
+    labels: diag.labels.map(|label: Label|
+      {
+        module: module,
+        start: label.start,
+        end: label.end,
+        primary: label.primary,
+        text: label.text,
+      }),
+    text: b"",
+    message: diag.message,
+    notes_text: diag.notes_text,
+    severity: diag.severity,
+    fixes: [],
+  }
+
+/// `src` is the module's text as its source holds it, which is the text parsed unless a caller
+/// parsed it cut.
+pub type ParsedSource = { name: Bytes, module: ParsedModule, diags: List<Diag>, src: Bytes }
+
+pub fn parse_all(sources: List<Source>) -> List<ParsedSource> / {abort.raise} =
+  range(0, sources.len()).map(|i: Int| parse_at(i, sources.get(i)))
+
+pub fn parse_at(i: Int, source: Source) -> ParsedSource / {abort.raise} =
+  parse_from(i, source, parse(source.src))
+
+/// `parse_at` over `r`, what `parse` made of `source`'s text, each derivation `taken` holds expanded
+/// as [`expand_derives`] expands one.
+pub fn parse_from(
+  i: Int,
+  source: Source,
+  r: Parsed<Module>,
+  taken: List<Derivation> = [],
+) -> ParsedSource / {abort.raise} = {
+  let x = expand(with_prelude(source.name, r.node), r.parser.diags);
+  let front = x.diags.map(|d: ParseDiag| placed(i, d));
+  if front.len() > 0 {
+    {
+      name: source.name,
+      module: { name: source.name, module: x.module, derived: [] },
+      diags: front,
+      src: source.src,
+    }
+  } else {
+    let d: Expansion = expand_derives(i, source.name, x.module, taken: taken);
+    {
+      name: source.name,
+      module: { name: source.name, module: d.module, derived: d.derived },
+      diags: d.diags,
+      src: source.src,
+    }
+  }
+}
+
+/// `parse_at` as far as a module's imports go: its header where that says what it imports, which
+/// holds no item, else the whole parse.
+pub fn headed_at(i: Int, source: Source) -> ParsedSource / {abort.raise} =
+  match header(source.src) {
+    None -> parse_at(i, source),
+    Some(m) ->
+      {
+        name: source.name,
+        module: { name: source.name, module: with_prelude(source.name, m), derived: [] },
+        diags: [],
+        src: source.src,
+      },
+  }
+
+/// `sources` with `std.prelude` past them, as the toolchain ships it, where none of them is it:
+/// every module imports it.
+pub fn with_prelude_source(sources: List<Source>) -> List<Source> =
+  if sources.any(|s: Source| s.name == prelude_module()) { sources }
+  else { sources.push({ name: prelude_module(), src: prelude_source::text() }) }
+
+pub fn diagnostics(sources: List<Source>) -> List<Diag> / {abort.raise} = {
+  let parsed = parse_all(with_prelude_source(sources));
+  let front = parsed.fold([], |acc: List<Diag>, p: ParsedSource| acc.concat(p.diags));
+  if front.len() > 0 { front } else {
+    let later = match resolve_modules(parsed.map(|p: ParsedSource| p.module)) {
+      ResolveFailed(ds) -> ds,
+      ResolveSucceeded(x) -> {
+        let built = build_index(x.mods, x.r);
+        if built.diags.len() > 0 { built.diags } else { check_diagnostics(x.r, x.mods) }
+      },
+    };
+    later.map(outside_every_module)
+  }
+}
+
+/// A `(0, 0)` label is `dummy_span`, except on the module-name clash, which really sits at offset 0.
+pub fn outside_every_module(diag: Diag) -> Diag =
+  if diag.code == b"E0105" && diag.message.starts_with(b"two files claim") { diag } else {
+    {
+      code: diag.code,
+      notes: diag.notes,
+      labels: diag.labels.map(
+        |l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
+          if l.start == 0 && l.end == 0 {
+            { module: no_module(), start: 0, end: 0, primary: l.primary, text: l.text }
+          } else { l },
+      ),
+      text: diag.text,
+      message: diag.message,
+      notes_text: diag.notes_text,
+      severity: diag.severity,
+      fixes: diag.fixes,
+    }
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+/// The one diagnostic a program's text draws.
+fn only(src: Bytes) -> Diag / {abort.raise} = {
+  let ds = diagnostics([{ name: b"m", src: src }]);
+  assert_eq(ds.len(), 1);
+  ds.get(0)
+}
+
+test "a parser diagnostic names what it expected and the token it found" {
+  let d = only(b"fn f() -> Int = )");
+  assert_eq(d.code, b"E0001");
+  assert_eq(d.severity, b"error");
+  assert_eq(d.message, b"expected an expression, found `)`");
+  assert_eq(d.labels, [
+    { module: 0, start: 16, end: 17, primary: true, text: b"expected an expression" },
+  ]);
+  assert_eq(d.notes_text, [])
+}
+
+test "a resolve diagnostic carries the reference's note" {
+  let d = only(b"import missing\nfn f() -> Int = 1");
+  assert_eq(d.code, b"E0106");
+  assert_eq(d.message, b"no module named `missing` in this program");
+  assert_eq(d.labels, [{ module: 0, start: 7, end: 14, primary: true, text: b"not found" }]);
+  assert_eq(d.notes_text, [
+    b"a module is a file: `store/orders.ply` is `store.orders`, relative to the project root",
+  ])
+}
+
+test "a check diagnostic prints the two types the way the reference does" {
+  let d = only(b"fn f() -> Int = \"x\"");
+  assert_eq(d.code, b"E0201");
+  assert_eq(d.message, b"type mismatch: function body type");
+  assert_eq(d.labels, [
+    { module: 0, start: 16, end: 19, primary: true, text: b"expected `Int`, found `String`" },
+  ]);
+  assert_eq(d.notes_text, [])
+}
+
+test "a check diagnostic carries its note" {
+  let d = only(b"fn f() -> Int = 1(2)");
+  assert_eq(d.code, b"E0204");
+  assert_eq(d.message, b"this is not a function");
+  assert_eq(d.labels, [{ module: 0, start: 16, end: 17, primary: true, text: b"has type `Int`" }]);
+  assert_eq(d.notes_text, [b"only function values can be applied"])
+}
+
+test "a law instantiates a schema, and gives it as many arguments as it has parameters" {
+  let other = only(b"fn f(n: Int) -> Int = n\nlaw \"l\" = f(f)");
+  assert_eq(other.code, b"E0472");
+  assert_eq(other.message, b"`f` is not a law schema");
+  assert_eq(other.labels, [
+    { module: 0, start: 34, end: 35, primary: true, text: b"a law instantiates a schema" },
+    { module: 0, start: 3, end: 4, primary: false, text: b"declared here" },
+  ]);
+  let short = only(
+    b"fn f(n: Int) -> Int = n\nlaw schema s(g: (Int) -> Int, h: (Int) -> Int) forall (x: Int) { g(x) == h(x) }\nlaw \"l\" = s(f)",
+  );
+  assert_eq(short.code, b"E0202");
+  assert_eq(short.message, b"the schema `s` takes 2 arguments, but 1 was supplied")
+}
+
+test "a secondary label follows the primary, in the reference's order" {
+  let d = only(b"fn g(x: Int) -> Int = x\nfn f() -> Int = g(1, 2)");
+  assert_eq(d.code, b"E0202");
+  assert_eq(d.message, b"this function takes 1 argument, but 2 were supplied");
+  assert_eq(d.labels, [
+    { module: 0, start: 40, end: 47, primary: true, text: b"expected 1, found 2" },
+    { module: 0, start: 40, end: 41, primary: false, text: b"this is the function being called" },
+  ])
+}

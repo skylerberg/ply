@@ -6,7 +6,7 @@ use super::{
     not_upgradable, unknown_handle,
 };
 use crate::tls;
-use ply_eval::{Diagnostic, HostAnswer, HostRuntime, Pending, Resource, Span, Value, codes};
+use ply_core::{Diagnostic, HostAnswer, HostRuntime, Pending, Resource, Span, Value, codes};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Mutex, MutexGuard};

@@ -1,0 +1,1047 @@
+//! What a run establishes of each test it ran, and what decided each cause of a failure.
+
+import args (kept)
+import units (emit)
+import std.fs (fs)
+import machine
+import compiler.front.facts (View)
+import compiler.front.published (FiledBody, FiledDef, filed_bodies, interfaces_among)
+import compiler.front.rows (ModuleSpan)
+import compiler.unit (shipped)
+import compiler.store.hash.forms (TheItem, reach)
+import compiler.check.infer.checker (DefInfo)
+import compiler.check.resolve.tables (Diag, Label)
+import compiler.check.types
+import diagnostic (Raised, diag_of, noted, shown)
+import mutants (Judged, Queue, built, coverage, mutants, queued)
+import program (Timed)
+import std.json (Bool)
+import tester (tester, ledger, Executed, InterleavingFailure, Hosted, Options, Usage, joined_trace,
+               sum_usage, no_usage)
+import trials (Bench, Tried, diagnosed, trial, by_name)
+import trials
+import views
+import testing.keys (mixture_key)
+import testing.bisect (Auto, Bisection, Budget, MissingBody, Mode, NotAttempted, NotRequested,
+                       Trial, confidence_word, is_conclusive, mode_parse, skipped_word,
+                       unresolved_trial, verdict_skipped, verdict_word)
+import testing.conclude (Concluded, Hashes, StaleIndex, UnobservedSearch, written)
+import testing.conclude
+import testing.delta (Delta, DefKey, classified, flipped_keys)
+import testing.diagnose (Attribution, Evidence, diagnose)
+import testing.select
+import testing.select (Held, Moved, Row, Search, Stands, answers_per_root, digest_of, filed, key_of,
+                       owed_roots, seed_keys)
+import std.bytes
+import sim.plan
+import sim.plan (Seed)
+import sim.search
+import sim.search (Exact, Exploration, Failure, Diverged, Unscheduled)
+import std.string
+import std.text (shell_join)
+import signature (atom_texts)
+import std.option
+import compiler.syntax.parsing (no_module)
+import tests.report (Entry, Decided, cached_count, every_of, Program, Cost, Explored, Outcome,
+                     Bisect, Site, Failed, Fault, RunReport, no_spent, case_of, green_run, test_at,
+                     canonical)
+
+// --- What the loaded tree tells a selector ------------------------------------
+
+pub fn hash_at(analysis: View, i: Int) -> Option<String> / {abort.raise} =
+  match test_at(analysis, i) {
+    Some(t) -> match analysis.frame.hashes.tests.get(t.key) {
+      Some(h) -> Some(h.hex_of()),
+      None -> None,
+    },
+    None -> None,
+  }
+
+/// Something in its closure entered a `simulate` region, so it reads a seed and is searched.
+pub fn seeded_of(atoms: List<types::Atom>) -> Bool =
+  atoms.fold(false, |found: Bool, a: types::Atom| found || a.effect == b"sim")
+
+// --- A test over cases --------------------------------------------------------
+
+pub fn entry_of(index: Int, key: String) -> Entry =
+  { test: index, of: key, case: None, unlisted: None }
+
+/// What the run's searches are asked: the plan a seeded test searches, whether to measure what the
+/// pruning saved, and how many lanes run tests at once — one per test when `--jobs` names none.
+type Asked = { plan: plan::Plan, measuring: Bool, lanes: Option<Int> }
+
+/// One test to run in one unit, how that unit is asked for it, and the plan it searches when it is
+/// seeded.
+type Job = { unit: Int, test: Int, entry: Entry, search: Option<plan::Plan> }
+
+/// How one test ended, what running it cost, and what its search explored, when it searched and every
+/// interleaving of it entered a region.
+pub type Done = {
+  test: Int,
+  status: String,
+  failure: Option<Raised>,
+  usage: Usage,
+  /// What every run of it read between them, `None` when no trace stands in for one.
+  trace: Option<Bytes>,
+  searched: Option<{ exploration: Exploration, seeds: Int }>,
+}
+
+/// A seeded test searches the roots it still owes; any other runs once.
+pub fn job_of(
+  program: Program,
+  unit: Int,
+  index: Int,
+  narrowing: List<{ index: Int, roots: List<Int> }>,
+  searching: plan::Plan,
+) -> Job / {abort.raise} =
+  match case_of(program, index) {
+    None -> { unit: unit, test: index, entry: entry_of(index, ""), search: None },
+    Some(c) ->
+      {
+        unit: unit,
+        test: index,
+        entry: c.entry,
+        search: if !c.seeded { None } else {
+          match narrowing.filter(|n: { index: Int, roots: List<Int> }| n.index == index) {
+            [owed, ..] -> Some({ ..searching, roots: owed.roots.map(|r: Int| U64::of_int(r)) }),
+            [] -> Some(searching),
+          }
+        },
+      },
+  }
+
+/// One class's tests at once: each in a lane of its own, or dealt across the lanes `--jobs` names,
+/// a lane's tests in turn, answered in the class's order.
+pub fn ran_class(
+  jobs: List<Job>,
+  asked: Asked,
+) -> List<Done> / {tester.executed[tests], tester.interleaved[tests], abort.raise} = {
+  let lanes = machine::dealt(jobs, asked.lanes);
+  machine::undealt(ran_lanes(lanes, asked.measuring, 0, lanes.len(), 64))
+}
+
+/// Halves under a `parallel` block until one lane is left, so lanes run at once; each lane answers
+/// with its tests' in turn. `room` is the halvings left, and 64 take any length to one.
+fn ran_lanes(
+  lanes: List<List<Job>>,
+  measuring: Bool,
+  lo: Int,
+  hi: Int,
+  room: Int,
+) -> List<List<Done>> / {tester.executed[tests], tester.interleaved[tests], abort.raise} =
+  if hi - lo <= 0 { [] } else if hi - lo == 1 || room <= 0 {
+    range(lo, hi).fold([], |lanes_done: List<List<Done>>, i: Int|
+      match lanes.at(i) {
+        Some(lane) ->
+          lanes_done.push(lane.fold([], |out: List<Done>, j: Job| out.push(ran_job(j, measuring)))),
+        None -> lanes_done,
+      })
+  } else {
+    let mid = lo + (hi - lo) / 2;
+    let halves = parallel {
+      ran_lanes(lanes, measuring, lo, mid, room - 1),
+      ran_lanes(lanes, measuring, mid, hi, room - 1),
+    };
+    halves._0.concat(halves._1)
+  }
+
+/// What a search's runs come to between them: what they cost and read, and whether one of them
+/// never entered a region, which makes the whole search no search.
+type Swept = { usage: Usage, trace: Option<Bytes>, unobserved: Bool }
+
+/// A test once, or a seeded one searched an interleaving at a time. One whose cases could not be
+/// listed ends as the listing did.
+pub fn ran_job(
+  j: Job,
+  measuring: Bool,
+) -> Done / {tester.executed[tests], tester.interleaved[tests], abort.raise} =
+  match j.entry.unlisted {
+    Some(why) ->
+      {
+        test: j.test,
+        status: why.status,
+        failure: Some(why.failure),
+        usage: no_usage(),
+        trace: None,
+        searched: None,
+      },
+    None -> ran_listed(j, measuring),
+  }
+
+fn ran_listed(
+  j: Job,
+  measuring: Bool,
+) -> Done / {tester.executed[tests], tester.interleaved[tests], abort.raise} =
+  match j.search {
+    None -> {
+      let e: Executed = tester.executed[tests](j.unit, j.entry.test, j.entry.case);
+      {
+        test: j.test,
+        status: e.status,
+        failure: e.failure,
+        usage: e.usage,
+        trace: e.trace,
+        searched: None,
+      }
+    },
+    Some(p) -> {
+      // A search re-runs the whole test, so any host operation runs once per interleaving.
+      let again = plan::re_executes(p) || measuring;
+      let run = |st: Swept, seed: Seed| {
+        let one = tester.interleaved[tests](
+          j.unit,
+          j.entry.test,
+          j.entry.case,
+          seed,
+          p.steps,
+          again,
+        );
+        {
+          run: one.run,
+          state: {
+            usage: sum_usage(st.usage, one.usage),
+            trace: joined_trace(st.trace, one.trace),
+            unobserved: st.unobserved || !one.observed,
+          },
+        }
+      };
+      let begun: Swept = { usage: no_usage(), trace: Some(b""), unobserved: false };
+      let kept = if measuring { search::measure_keeping(p, begun, run) }
+      else { search::explore_keeping(p, Exact, begun, run) };
+      let explored = kept.explored;
+      {
+        test: j.test,
+        status: match explored.failure {
+          None -> "passed",
+          // A recording that names no schedule, or a replay that took another, is Ply's fault.
+          Some(fl) -> match search::run_failure(fl) {
+            Some(fell) -> fell.status,
+            None -> "panicked",
+          },
+        },
+        failure: match explored.failure { Some(fl) -> Some(stopped(fl)), None -> None },
+        usage: kept.state.usage,
+        trace: kept.state.trace,
+        searched: if kept.state.unobserved { None } else {
+          Some({ exploration: explored.exploration, seeds: plan::normalized(p).roots.len() })
+        },
+      }
+    },
+  }
+
+fn reproduce(seed: Seed) -> String / {abort.raise} =
+  "reproduce with `--sim once --seed " ++ plan::seed_text(seed)
+    ++ "`, and report it with the test's source"
+
+fn spanned(span: { module: Int, start: Int, end: Int }, said: String) -> Label =
+  {
+    module: span.module,
+    start: span.start,
+    end: span.end,
+    primary: true,
+    text: Bytes::of_string(said),
+  }
+
+/// Why a search stopped at a seed, as the diagnostic a report prints: the run's own failure, or the
+/// defect a recording that names no schedule, or a replay that took another, is.
+fn stopped(fl: Failure<InterleavingFailure>) -> Raised / {abort.raise} =
+  match search::run_failure(fl) {
+    Some(fell) -> { ..fell.failure, diag: noted(fell.failure.diag, fl.notes) },
+    None -> {
+      let d = match fl.cause {
+        Diverged(x) ->
+          diag_of(
+            "error",
+            "E0415",
+            "replaying seed " ++ plan::seed_text(x.seed)
+              ++ " did not reproduce the recorded schedule",
+            [spanned(x.span, "this scheduling point")],
+            [
+              x.what,
+              "a simulated run must be a pure function of its definition set and its seed; this is a defect in Ply rather than in the program under test",
+              reproduce(x.seed),
+            ],
+          ),
+        Unscheduled(x) ->
+          diag_of(
+            "error",
+            "E0505",
+            "the scheduler recorded a step that does not describe a schedule",
+            [spanned(x.span, "this step")],
+            [x.what, reproduce(x.seed)],
+          ),
+        _ -> diag_of("error", "E0505", "a search stopped at a failure it does not hold", [], []),
+      };
+      { diag: noted(d, fl.notes), values: [] }
+    },
+  }
+
+// --- What the run establishes ------------------------------------------------
+
+pub fn hashes_of(analysis: View) -> Hashes / {abort.raise} =
+  {
+    defs: by_name(analysis.frame.hashes.defs),
+    decls: by_name(analysis.frame.hashes.decls),
+    closure: |keys: List<String>| {
+      let reached = reach(
+        analysis.frame.hashes,
+        keys.map(|k: String| TheItem(Bytes::of_string(k))),
+      );
+      {
+        fns: reached.fns.keys().map(String::of_bytes_lossy),
+        decls: reached.decls.keys().map(String::of_bytes_lossy),
+      }
+    },
+  }
+
+pub fn conclude_tests(analysis: View) -> List<conclude::Test> / {abort.raise} =
+  range(0, analysis.checked.tests.len()).fold([], |acc: List<conclude::Test>, i: Int|
+    match test_at(analysis, i) {
+      Some(t) ->
+        acc.push({
+          index: i,
+          key: String::of_bytes_lossy(t.key),
+          seeded: seeded_of(t.footprint),
+          hash: hash_at(analysis, i),
+        }),
+      None -> acc,
+    })
+
+/// Whether the store had seen each definition before this run, which a failure is suspected against.
+pub fn seen_of(h: Hashes) -> Map<String, Bool> / {ledger.seen} = {
+  let hashes = h.defs.values();
+  let answers = ledger.seen(hashes);
+  range(0, hashes.len()).fold(Map::new(), |acc: Map<String, Bool>, i: Int|
+    match ((hashes.at(i), answers.at(i))) {
+      (Some(hash), Some(known)) -> acc.insert(hash, known),
+      _ -> acc,
+    })
+}
+
+pub fn conclusion_of(done: Done) -> conclude::Ran<Raised> =
+  {
+    index: done.test,
+    status: done.status,
+    failure: done.failure,
+    host: done.usage.host,
+    trace: done.trace,
+    searched: match done.searched {
+      Some(x) ->
+        Some({
+          explored: x.exploration.explored,
+          exhaustive: x.exploration.exhaustive,
+          exhausted: x.exploration.exhausted,
+          failed: x.exploration.failure != None,
+        }),
+      None -> None,
+    },
+    seeds: match done.searched { Some(x) -> x.seeds, None -> 0 },
+  }
+
+fn done_at(done: Map<Int, Done>, index: Int) -> Option<Done> = done.get(index)
+
+fn cost_of(c: Option<search::Cost>) -> Option<Cost> =
+  match c {
+    None -> None,
+    Some(x) ->
+      Some({
+        explored: x.explored,
+        bounded: x.bounded,
+        rendered: (if x.bounded { ">= " } else { "" }) ++ x.explored.to_string(),
+      }),
+  }
+
+/// How many times more an unpruned search would have run, in tenths, rounded half up.
+fn tenths_of(e: Exploration) -> Option<Int> =
+  match e.naive {
+    None -> None,
+    Some(naive) -> if e.explored > 0 { Some((naive.explored * 20 + e.explored) / (2 * e.explored)) }
+    else { None },
+  }
+
+fn explored_of(e: Exploration) -> Explored / {abort.raise} =
+  {
+    explored: e.explored,
+    exhaustive: e.exhaustive,
+    exhausted: e.exhausted,
+    blind: cost_of(e.blind),
+    naive: cost_of(e.naive),
+    reduction_tenths: tenths_of(e),
+    steps: e.steps,
+    virtual_time_ns: e.virtual_time,
+    failing_seed: match e.failure { Some(seed) -> Some(plan::seed_text(seed)), None -> None },
+  }
+
+fn exploration_of(done: Map<Int, Done>, index: Int) -> Option<Exploration> =
+  match done_at(done, index) {
+    Some(d) -> match d.searched { Some(x) -> Some(x.exploration), None -> None },
+    None -> None,
+  }
+
+fn site_of(x: search::RaceSite) -> Site =
+  {
+    task: "@" ++ x.task.to_string(),
+    definition: x.definition,
+    access: x.access,
+    at: if x.span.module == no_module() { None } else { Some(x.span) },
+  }
+
+/// A test as its group ran it, which is all its result line says; the conclusion adds the failure
+/// and what was filed.
+pub fn ran_outcome(analysis: View, done: Done) -> Outcome / {abort.raise} =
+  {
+    index: done.test,
+    name: match test_at(analysis, done.test) {
+      Some(t) -> String::of_bytes_lossy(t.name),
+      None -> "",
+    },
+    hash: hash_at(analysis, done.test),
+    duration_us: done.usage.duration_us,
+    status: done.status,
+    diagnostic: None,
+    search: match done.searched { Some(x) -> Some(explored_of(x.exploration)), None -> None },
+    cached: None,
+    performs: done.usage.performs,
+  }
+
+fn outcome_of(
+  analysis: View,
+  done: Map<Int, Done>,
+  outcome: conclude::Outcome<Raised>,
+) -> Outcome / {abort.raise} = {
+  let d = done_at(done, outcome.index);
+  {
+    index: outcome.index,
+    name: match test_at(analysis, outcome.index) {
+      Some(t) -> String::of_bytes_lossy(t.name),
+      None -> "",
+    },
+    hash: hash_at(analysis, outcome.index),
+    duration_us: match d { Some(x) -> x.usage.duration_us, None -> 0 },
+    status: outcome.status,
+    diagnostic: outcome.failure,
+    search: match exploration_of(done, outcome.index) {
+      Some(e) -> Some(explored_of(e)),
+      None -> None,
+    },
+    cached: match outcome.recorded { Some(rec) -> Some(written(rec)), None -> None },
+    performs: match d { Some(x) -> x.usage.performs, None -> 0 },
+  }
+}
+
+fn failed_of(
+  analysis: View,
+  h: Hashes,
+  done: Map<Int, Done>,
+  failed: conclude::Failed<Raised>,
+) -> Failed / {abort.raise} = {
+  let t = test_at(analysis, failed.index);
+  let e = exploration_of(done, failed.index);
+  {
+    key: failed.key,
+    name: match t { Some(x) -> String::of_bytes_lossy(x.name), None -> failed.key },
+    diagnostic: failed.failure,
+    defect: failed.defect,
+    host: failed.host,
+    search: None,
+    suspects: failed.suspects.map(|name: String|
+      {
+        name: name,
+        hash: match h.defs.get(name) { Some(x) -> Some(x), None -> h.decls.get(name) },
+      }),
+    unchanged: failed.suspects.len() == 0,
+    seed: match e {
+      Some(x) -> match x.failure { Some(seed) -> Some(plan::seed_text(seed)), None -> None },
+      None -> None,
+    },
+    race: match e {
+      Some(x) -> match x.race {
+        Some(race) -> Some({ left: site_of(race.left), right: site_of(race.right), step: race.at }),
+        None -> None,
+      },
+      None -> None,
+    },
+    module: match t { Some(x) -> Some(String::of_bytes_lossy(x.module)), None -> None },
+    test_hash: hash_at(analysis, failed.index),
+    nondet: match t { Some(x) -> Some(x.nondet), None -> None },
+    status: match done_at(done, failed.index) { Some(d) -> Some(d.status), None -> None },
+    declared: match t { Some(x) -> Some(atom_texts(canonical(x.footprint))), None -> None },
+  }
+}
+
+/// A pass a later hermetic run would believe, filed for a run that reached the host without the
+/// binding it ran under, and a backend that silently declined every call: each is a run that is
+/// green over a seam nothing reached.
+fn escapes_of(
+  hosted: Hosted,
+  analysis: View,
+  c: Concluded<Raised>,
+  done: Map<Int, Done>,
+) -> List<Diag> = {
+  let unbound = |index: Int|
+    match done_at(done, index) {
+      Some(d) ->
+        d.usage.host
+          && (match d.trace {
+            Some(trace) -> !String::contains("\n" ++ String::of_bytes_lossy(trace), "\nbinding\t"),
+            None -> false,
+          }),
+      None -> false,
+    };
+  let filed_host = if hosted.hermetic { [] } else {
+    c.outcomes.fold([], |acc: List<Diag>, outcome: conclude::Outcome<Raised>| {
+      let wrote = match outcome.recorded { Some(rec) -> written(rec), None -> false };
+      if !wrote || !unbound(outcome.index) { acc } else {
+        acc.push(
+          diag_of(
+            "error",
+            "E0505",
+            "`"
+              ++ (match test_at(analysis, outcome.index) {
+                Some(t) -> String::of_bytes_lossy(t.name),
+                None -> "",
+              })
+              ++ "` reached the host, and its pass was written without the binding it ran under",
+            [],
+            [
+              "a pass that reached the host answers only for the binding it ran under",
+              "run `ply cache clear`: an entry written here would be believed by a later hermetic run",
+              "this is Ply's fault — the runner and the tester disagree about what this test reached",
+            ],
+          ),
+        )
+      }
+    })
+  };
+  let b = hosted.backend;
+  if b.unbuilt == 0 { filed_host } else {
+    filed_host.push(
+      diag_of(
+        "error",
+        "E0505",
+        b.unbuilt.to_string() ++ " thread(s) could not build the `" ++ b.name
+          ++ "` backend, and every call they were offered was declined",
+        [],
+        [
+          "the backend was built once before the run started, so this cannot be a host that has no code generator",
+          "this is Ply's fault — a run that installs a backend and silently does not have one is green over a seam nothing reached",
+        ],
+      ),
+    )
+  }
+}
+
+fn notice_of(n: conclude::Notice) -> Diag =
+  match n {
+    StaleIndex(x) ->
+      diag_of(
+        "warning",
+        "E0505",
+        "a run named test " ++ x.index.to_string() ++ ", but the module defines "
+          ++ x.declared.to_string(),
+        [],
+        ["the choice was made against another program; the stale index was skipped"],
+      ),
+    UnobservedSearch(key) ->
+      diag_of(
+        "warning",
+        "E0505",
+        "`" ++ key ++ "` reads a simulation seed, but the run reported no search",
+        [],
+        [
+          "the test passed and its result was not cached, so it re-runs next time",
+          "this is a defect in Ply rather than in the test; please report it",
+        ],
+      ),
+  }
+
+pub fn ran_of(
+  options: Options,
+  program: Program,
+  analysis: View,
+  h: Hashes,
+  decided: Decided,
+  hosted: Hosted,
+  c: Concluded<Raised>,
+  done: Map<Int, Done>,
+  elapsed: Int,
+  said: List<Diag>,
+) -> RunReport / {abort.raise} = {
+  let ordered = c.outcomes.fold([], |acc: List<Done>, outcome: conclude::Outcome<Raised>|
+    match done_at(done, outcome.index) { Some(d) -> acc.push(d), None -> acc });
+  let teardown = ordered.fold([], |acc: List<Diag>, d: Done| acc.concat(d.usage.teardown));
+  let b = hosted.backend;
+  {
+    hermetic: hosted.hermetic,
+    label: hosted.label,
+    operations: hosted.operations,
+    digest: hosted.digest,
+    handshakes: hosted.handshakes,
+    hosts: hosted.hosts,
+    reaches: hosted.reaches.filter(|i: Int| case_of(program, i) != None),
+    workers: match options.jobs {
+      Some(n) -> if n > 0 { n } else { hosted.cores },
+      None -> hosted.cores,
+    },
+    backend: Some({
+      name: b.name,
+      fragment: b.fragment,
+      offered: b.offered,
+      entered: done.fold(0, |n: Int, i: Int, d: Done| n + d.usage.entries),
+      declined: done.fold(0, |n: Int, i: Int, d: Done| n + d.usage.declines),
+      converted_in: b.converted_in,
+      converted_out: b.converted_out,
+      units: b.units,
+      load_nanos: b.load_nanos,
+    }),
+    results: c.outcomes.map(|outcome: conclude::Outcome<Raised>|
+      outcome_of(analysis, done, outcome)),
+    failures: c.failures.map(|failed: conclude::Failed<Raised>|
+      failed_of(analysis, h, done, failed)),
+    summary: {
+      passed: c.passed,
+      failed: c.failed,
+      abandoned: c.abandoned,
+      cached: cached_count(program, decided),
+      duration_us: elapsed,
+    },
+    simulation: c.simulation,
+    escapes: escapes_of(hosted, analysis, c, done),
+    warnings: teardown.concat(c.notices.map(notice_of)).concat(said),
+    mutants: None,
+    coverage: if options.coverage { Some(coverage(analysis)) } else { None },
+    spent: no_spent(),
+  }
+}
+
+/// A green run's mutants, judged up to the budget; a red run's survivors would say nothing.
+pub fn mutated(
+  timed: Timed,
+  analysis: View,
+  program: Program,
+  report: RunReport,
+  options: Options,
+  asked: Asked,
+  targeted: Option<List<DefInfo>>,
+) -> RunReport / {tester.unit[tests], tester.executed[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise, shipped.reached} =
+  match targeted {
+    None -> report,
+    Some(defs) -> if !green_run(report) { report } else {
+      let queue = queued(timed.program.places, analysis, defs);
+      let every = every_of(program, options);
+      let judged = range(0, min(options.mutate_budget, queue.mutants.len())).map(|id: Int|
+        judged_mutant(timed, analysis, program, queue, id, every, asked));
+      {
+        ..report,
+        mutants: Some(
+          mutants(
+            timed.program.places,
+            analysis,
+            queue,
+            judged,
+            queue.mutants.len() > options.mutate_budget,
+          ),
+        ),
+      }
+    },
+  }
+
+/// The tests that reach a mutant, in the classes every test the run reports on was coloured into: a
+/// subset of a class shares nothing either. Every seed of the plan is owed, and nothing is filed.
+fn judged_mutant(
+  timed: Timed,
+  analysis: View,
+  program: Program,
+  queue: Queue,
+  id: Int,
+  every: List<List<Int>>,
+  asked: Asked,
+) -> Judged / {tester.unit[tests], tester.executed[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise, shipped.reached} =
+  match queue.mutants.at(id) {
+    None -> { id: id, verdict: "unresolved", why: "no mutant " ++ id.to_string() ++ " was queued" },
+    Some(m) -> match built(timed.program, analysis, m.mutation) {
+      Err(j) -> { ..j, id: id },
+      Ok(unit) -> {
+        let classes = every.map(|class: List<Int>|
+          class.filter(|i: Int| m.tests.contains(i))).filter(|class: List<Int>| class.len() > 0);
+        let statuses = classes.flat_map(|class: List<Int>|
+          ran_class(class.map(|i: Int| job_of(program, unit, i, [], asked.plan)), {
+            ..asked,
+            measuring: false,
+          }).map(|done: Done| done.status));
+        let expected = classes.fold(0, |n: Int, class: List<Int>| n + class.len());
+        let judged = |verdict: String, why: String| { id: id, verdict: verdict, why: why };
+        if statuses.contains("failed") { judged("killed", "") }
+        else if statuses.contains("panicked") {
+          judged("unresolved", "Ply failed running the tests")
+        } else if statuses.filter(|s: String| s == "passed").len() == expected {
+          judged("survived", "")
+        } else { judged("unresolved", "not every test answered") }
+      },
+    },
+  }
+
+/// What the store holds for each test, asked under the keys this program computes: the key its
+/// result is filed under, and — for a seeded test whose plan is answered root by root — each
+/// root's own. A run that bypasses the cache asks nothing and finds nothing.
+/// Each test's case, and the keys whose passes answer it where one does: its own, or each root's.
+type Selection = { cases: List<select::Case>, answering: List<List<String>> }
+
+/// `loaded` is what the run's load read of the shipped modules (`views.held_texts`).
+pub fn cases_of(
+  rows: List<Row>,
+  search: Search,
+  bypassed: Bool,
+  loaded: Map<Bytes, Bytes>,
+) -> Selection / {ledger.passes, tester.moved[tests], fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+  let ask = |keys: List<String>|
+    if bypassed { keys.map(|k: String| None) } else { ledger.passes(keys) };
+  let digest = digest_of(search);
+  let keys = rows.map(|r: Row| key_of(r, digest));
+  let filed = ask(
+    keys.fold([], |acc: List<String>, k: Option<String>|
+      match k { Some(key) -> acc.push(key), None -> acc }),
+  );
+  let rooted = rows.map(|r: Row|
+    match r.hash {
+      Some(h) -> if answers_per_root(r, search) { Some(seed_keys(h, search.roots, [])) }
+      else { None },
+      None -> None,
+    });
+  let seeded = rooted.map(|ks: Option<List<String>>|
+    match ks { Some(xs) -> Some(ask(xs)), None -> None });
+  let now = views::now_for(
+    views::viewed_in(
+      traces_of(
+        seeded.fold(filed, |acc: List<Option<Bytes>>, o: Option<List<Option<Bytes>>>|
+          match o { Some(xs) -> acc.concat(xs), None -> acc }),
+      ),
+    ),
+    |m: Bytes| views::read_held(loaded, m),
+  );
+  let answers = filed.map(|held: Option<Bytes>| standing(now, held));
+  // A keyed row's answer is the next one, in the order the keys were asked.
+  let held = keys.fold(
+    { at: 0, out: [] },
+    |st: { at: Int, out: List<Option<Held>> }, k: Option<String>|
+      match k {
+        None -> { ..st, out: st.out.push(None) },
+        Some(_) -> { at: st.at + 1, out: st.out.push(answers.at_or(st.at, None)) },
+      },
+  ).out;
+  let owed = seeded.map(|o: Option<List<Option<Bytes>>>|
+    match o {
+      Some(xs) -> Some(owed_roots(search.roots, xs.map(|held: Option<Bytes>| standing(now, held)))),
+      None -> None,
+    });
+  {
+    cases: range(0, rows.len()).map(|i: Int|
+      select::case_of(
+        rows.at_or(i, no_row()),
+        keys.at_or(i, None),
+        held.at_or(i, None),
+        owed.at_or(i, None),
+      )),
+    answering: range(0, rows.len()).map(|i: Int|
+      match ((keys.at_or(i, None), held.at_or(i, None))) {
+        (Some(key), Some(Stands)) -> [key],
+        (Some(_), None) -> match ((rooted.at_or(i, None), owed.at_or(i, None))) {
+          (Some(ks), Some([])) -> ks,
+          _ -> [],
+        },
+        _ -> [],
+      }),
+  }
+}
+
+pub fn traces_of(held: List<Option<Bytes>>) -> List<Bytes> =
+  held.fold([], |acc: List<Bytes>, h: Option<Bytes>|
+    match h { Some(trace) -> acc.push(trace), None -> acc })
+
+/// What a filed pass says now: it stands while every read its trace holds answers as it did, and
+/// every view of a shipped module it holds stands against `now`.
+pub fn standing(now: views::Now, held: Option<Bytes>) -> Option<Held> / {tester.moved[tests]} =
+  match held {
+    None -> None,
+    Some(trace) -> if trace == b"" { Some(Stands) } else {
+      let split = views::split(trace);
+      match tester.moved[tests](split.rest) {
+        Some(what) -> Some(Moved(what)),
+        None -> match views::moved(now, split.viewed) {
+          None -> Some(Stands),
+          Some(what) -> Some(Moved(what)),
+        },
+      }
+    },
+  }
+
+fn no_row() -> Row =
+  { index: 0, label: "", name: "", module: "", hash: None, seeded: false, nondet: false }
+
+// --- What decided each cause -------------------------------------------------
+
+/// Each failure's facts, read once the run is filed, and the bench its mixtures are tried on. A test
+/// that never passed, or a run that bypassed the cache, has no baseline and so no facts, and a case
+/// of a test over cases has facts and no bench.
+pub fn diagnosed_all(
+  options: Options,
+  timed: Timed,
+  analysis: View,
+  program: Program,
+  c: Concluded<Raised>,
+  done: Map<Int, Done>,
+  failures: List<Failed>,
+) -> { failures: List<Failed>, benches: List<Option<Bench>> } / {ledger.baselines, ledger.interfaces, ledger.bodies, abort.raise} =
+  if options.no_cache || failures.len() == 0 {
+    { failures: failures, benches: failures.map(|f: Failed| None) }
+  } else {
+    let records = ledger.baselines(failures.map(|f: Failed| f.key));
+    if records.fold(true, |none: Bool, r: Option<conclude::PassRecord>| none && r == None) {
+      { failures: failures, benches: failures.map(|f: Failed| None) }
+    } else {
+      let tree = trials::program_of(timed.program, analysis);
+      range(0, failures.len()).fold(
+        { failures: [], benches: [] },
+        |acc: { failures: List<Failed>, benches: List<Option<Bench>> }, i: Int|
+          match ((failures.at(i), records.at(i), c.failures.at(i))) {
+            (Some(f), Some(Some(record)), Some(cf)) -> {
+              let seed = match exploration_of(done, cf.index) {
+                Some(e) -> match e.failure { Some(s) -> s, None -> { root: 0u64, path: [] } },
+                None -> { root: 0u64, path: [] },
+              };
+              let of_cases = match case_of(program, cf.index) {
+                Some(case) -> case.entry.case != None,
+                None -> false,
+              };
+              let d = diagnosed(tree, f.key, f.test_hash, record, f.diagnostic, seed, of_cases);
+              {
+                failures: acc.failures.push({ ..f, search: Some(d.evident) }),
+                benches: acc.benches.push(d.bench),
+              }
+            },
+            (Some(f), _, _) -> { failures: acc.failures.push(f), benches: acc.benches.push(None) },
+            _ -> acc,
+          },
+      )
+    }
+  }
+
+/// Every failure's cause, decided before anything renders one, and the keys of the mixtures that
+/// went green, which the store keeps.
+pub fn decided_faults(
+  report: RunReport,
+  benches: List<Option<Bench>>,
+  asked: Diagnosing,
+) -> { faults: List<Fault>, proved: List<String> } / {ledger.passes, tester.unit[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise} =
+  handle {
+    range(0, report.failures.len()).flat_map(|i: Int|
+      match report.failures.at(i) {
+        None -> [],
+        Some(f) ->
+          [
+            fault_of(f, asked, |keys: List<DefKey>, filed: Option<String>|
+              match benches.at(i) {
+                Some(Some(b)) -> {
+                  let tried: Tried = trial(b, keys, filed);
+                  match tried.proved { Some(k) -> proving.proved(k), None -> () };
+                  tried.trial
+                },
+                _ -> unresolved_trial(MissingBody),
+              }),
+          ],
+      })
+  } with {
+    var proved: List<String> = [],
+    proving.proved(key) -> {
+      proved = proved.push(key);
+    },
+    return faults -> { faults: faults, proved: proved },
+  }
+
+/// The key of a mixture a trial found green, which `decided_faults` keeps.
+effect proving {
+  write proved(key: String) -> Unit
+}
+
+/// What this run's flags ask of a cause: the search mode and the trial budget.
+type Diagnosing = { bisect: Mode, budget: Budget }
+
+pub fn diagnosing(options: Options) -> Diagnosing =
+  {
+    bisect: match mode_parse(options.bisect) { Some(m) -> m, None -> Auto },
+    budget: { max_trials: Some(options.bisect_budget) },
+  }
+
+/// One failure's cause. The gate, the change set, the search over it and the ranking of the
+/// suspects are `suite.diagnose`'s, over the facts the run read and `tried`, which builds and runs
+/// one mixture at a time.
+pub fn fault_of<| e>(
+  failed: Failed,
+  asked: Diagnosing,
+  tried: (List<DefKey>, Option<String>) -> Trial / e,
+) -> Fault / {abort.raise | e} = {
+  let diff = match failed.search { Some(e) -> Some(classified(e.facts)), None -> None };
+  let evidence: Evidence = {
+    nondet: match failed.nondet { Some(x) -> x, None -> false },
+    defect: failed.defect,
+    host: failed.host,
+    suspects: failed.suspects,
+    baseline: match failed.search { Some(_) -> true, None -> false },
+  };
+  let a: Attribution = diagnose(
+    evidence,
+    asked,
+    match diff { Some(d) -> Some(d.delta), None -> None },
+    match diff { Some(d) -> d.unclassified.len(), None -> 0 },
+    match diff { Some(d) -> !d.test_unclassified, None -> true },
+    |d: Delta, flipped: List<Int>| {
+      let keys = flipped_keys(d, flipped);
+      tried(keys, mixture_filed(failed, keys))
+    },
+    match failed.search { Some(e) -> e.absent, None -> None },
+  );
+  let places = match failed.search { Some(e) -> e.at, None -> [] };
+  {
+    key: failed.key,
+    name: failed.name,
+    diagnostic: shown(failed.diagnostic),
+    defect: failed.defect,
+    bisect: bisect_of(a.bisection, places),
+    suspects: a.suspects,
+    unchanged: failed.unchanged,
+    seed: failed.seed,
+    race: failed.race,
+    replay: match failed.seed { Some(seed) -> replay_of(seed, failed.name), None -> None },
+    module: failed.module,
+    test_hash: failed.test_hash,
+    nondet: failed.nondet,
+    status: failed.status,
+    declared: failed.declared,
+  }
+}
+
+/// The command that replays one interleaving of one test, spelled for a shell to read back as
+/// these words; none for a name no shell word can carry.
+pub fn replay_of(seed: String, name: String) -> Option<String> =
+  shell_join(["ply", "test", "--seed", seed, "--filter", name])
+
+/// A mixture's pass is filed under the test as it is now and as it last passed, the definitions
+/// taken, and the interleaving the failure took.
+fn mixture_filed(failed: Failed, keys: List<DefKey>) -> Option<String> / {abort.raise} =
+  match failed.search {
+    None -> None,
+    Some(e) -> match e.facts.own.after {
+      None -> None,
+      Some(now) ->
+        Some(
+          mixture_key(
+            Bytes::of_hex(now),
+            Bytes::of_hex(e.facts.own.before),
+            keys,
+            failed.seed,
+          ).hex_of(
+          ),
+        ),
+    },
+  }
+
+/// A verdict as the report carries it, with the place of the first of each group's definitions.
+fn bisect_of(verdict: Bisection, places: List<{ name: String, at: Option<ModuleSpan> }>) -> Bisect =
+  {
+    conclusive: is_conclusive(verdict),
+    // Silent when no bisection was asked for.
+    requested: match verdict.verdict { NotAttempted(NotRequested) -> false, _ -> true },
+    reason: verdict.reason,
+    culprits: verdict.groups.map(|group: List<String>|
+      { names: group, at: first_at(places, group) }),
+    verdict: verdict_word(verdict.verdict),
+    skipped: match verdict_skipped(verdict.verdict) {
+      Some(why) -> Some(skipped_word(why)),
+      None -> None,
+    },
+    confidence: confidence_word(verdict.confidence),
+    groups: verdict.groups,
+    search: verdict.search,
+  }
+
+/// Where the first of a group's definitions is: the runtime knows the places and this side knows only
+/// the names.
+fn first_at(
+  at: List<{ name: String, at: Option<ModuleSpan> }>,
+  names: List<String>,
+) -> Option<ModuleSpan> =
+  names.fold(None, |found: Option<ModuleSpan>, name: String|
+    match found {
+      Some(_) -> found,
+      None -> match at.filter(|e: { name: String, at: Option<ModuleSpan> }| e.name == name) {
+        [] -> None,
+        hits -> at_at(hits, 0),
+      },
+    })
+
+fn at_at(hits: List<{ name: String, at: Option<ModuleSpan> }>, i: Int) -> Option<ModuleSpan> =
+  match hits.at(i) { Some(hit) -> hit.at, None -> None }
+
+/// What the run's filed pass records reach of `analysis`, as a later era's bisection reads it: the
+/// interface and the body of each definition in a passed test's closure.
+pub fn history_of(
+  analysis: View,
+  records: List<{ key: String, record: conclude::PassRecord }>,
+) -> { defs: List<FiledDef>, bodies: List<FiledBody> } / {abort.raise} =
+  if records.len() == 0 { { defs: [], bodies: [] } } else {
+    let hashes = records.fold(
+      Map::new(),
+      |acc: Map<String, Bool>, e: { key: String, record: conclude::PassRecord }|
+        e.record.closure.concat(e.record.decls).fold(
+          acc,
+          |a: Map<String, Bool>, n: conclude::Named| a.insert(n.hash, true),
+        ),
+    );
+    {
+      defs: interfaces_among(analysis.checked, analysis.frame.hashes, |h: Bytes|
+        hashes.contains(h.hex_of())),
+      bodies: filed_bodies(analysis.frame.hashes).filter(|b: FiledBody|
+        hashes.contains(b.hash.hex_of())),
+    }
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+test "a replay is one command whatever the test is called" {
+  assert_eq(
+    replay_of("0:1", "it's \"$HOME\" `now`"),
+    Some("ply test --seed 0:1 --filter 'it'\\''s \"$HOME\" `now`'"),
+  );
+  assert_eq(replay_of("0:1", "plain"), Some("ply test --seed 0:1 --filter plain"));
+  assert_eq(replay_of("0:1", "a\0b"), None)
+}
+
+// --- What a search's cost reads as --------------------------------------------
+
+test "a bounded count renders as a lower bound, and a reduction needs the naive search" {
+  assert_eq(
+    cost_of(Some({ explored: 4096, bounded: true })),
+    Some({ explored: 4096, bounded: true, rendered: ">= 4096" }),
+  );
+  assert_eq(cost_of(None), None);
+  let e: Exploration = {
+    explored: 12,
+    exhaustive: true,
+    exhausted: false,
+    naive: None,
+    blind: None,
+    steps: 8,
+    virtual_time: 0,
+    failure: None,
+    race: None,
+  };
+  assert_eq(tenths_of(e), None);
+  assert_eq(tenths_of({ ..e, naive: Some({ explored: 120, bounded: false }) }), Some(100));
+  // Rounded half up to a tenth: 40 / 12 is 3.33.
+  assert_eq(tenths_of({ ..e, naive: Some({ explored: 40, bounded: false }) }), Some(33));
+  assert_eq(tenths_of({ ..e, explored: 0, naive: Some({ explored: 40, bounded: false }) }), None);
+  assert_eq(
+    explored_of({ ..e, failure: Some({ root: 7u64, path: [1, 0] }) }).failing_seed,
+    Some("7:1.0"),
+  )
+}

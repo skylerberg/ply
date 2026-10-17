@@ -1,0 +1,693 @@
+//! A test over cases: the cases a table or a generator gives, run one by one.
+
+import compiler.load (LoadedAnalysis, every_root)
+import args (Flags, kept)
+import units
+import units (emit, Emitted, whole_emitted)
+import std.hash (blake3)
+import std.fs (fs)
+import std.time (time)
+import surface
+import machine
+import compiler.front.published (no_rows)
+import compiler.front.seam (Analysed, Refused, Within, view_of, test_root_at)
+import compiler.front.facts (View)
+import compiler.front (analyse_pulling_std_with)
+import compiler.unit (codes, shipped)
+import compiler.store.hash.forms (TheItem, Which, listing_reach, reached_functions)
+import compiler.check.infer.checker (DefInfo, TestInfo, cases_root)
+import compiler.check.resolve.tables (Diag, qualify)
+import diagnostic (Raised, diag_of, shown)
+import program (Timed, is_shipped, keep_command)
+import report (Answer, ok_code)
+import sources (Project, is_std)
+import std.process (process)
+import std.json (Json, Object, Null, Str, Bool, Number, Array, object, to_string, int)
+import std.term (Style, plain)
+import tester (tester, ledger, Filed, Hosted, Listed, Options, Unlisted)
+import views
+import std.bin
+import testing.keys (case_hash)
+import testing.conclude (Concluded)
+import testing.conclude
+import testing.select (Cached, Decision, Pass, Reason, Search, Stands, asked_by_code, filed,
+                       narrowed)
+import std.bytes
+import sim.plan
+import std.string
+import surface (parsed)
+import proof.goal (set_of)
+import std.option
+import tests.report (options_from, Entry, Case, Decided, Group, Program, Spent, opening_of,
+                     opening_lines, name_column, result_lines, printed, answered, test_at, with_sim)
+import tests.concluded (entry_of, Done, job_of, ran_class, hashes_of, conclude_tests, seen_of,
+                        conclusion_of, ran_outcome, ran_of, mutated, traces_of, standing,
+                        diagnosed_all, decided_faults, diagnosing, history_of)
+
+// --- The load ---------------------------------------------------------------
+
+/// Where a run keeps its answer for the next run over the same command: the key, the walk the memo
+/// store's record of it is made over, the marks found on what the key held, and the keys of the
+/// passes it took. `after` is an answer selected again after the run filed its passes, which the
+/// store's warnings on opening are not in.
+pub type Keeping = {
+  key: Bytes,
+  project: Project,
+  marks: List<Bytes>,
+  passes: List<String>,
+  after: Bool,
+}
+
+/// What a run that ran nothing answered: the lines it printed before its answer, the answer, and the
+/// keys of the passes it took.
+pub type Kept = {
+  opening: List<String>,
+  lines: List<String>,
+  errs: List<String>,
+  code: Int,
+  json: String,
+  passes: List<String>,
+}
+
+derive bin for Kept
+
+/// Every test in scope taken from a pass filed under its own key, or under each root's.
+pub fn all_cached(decisions: List<Decision>, scope: Scope) -> Bool = {
+  let visible = set_of(scope.visible);
+  decisions.fold(true, |all: Bool, d: Decision|
+    all && (!visible.contains(d.case.index) || d.reason == Cached))
+}
+
+fn unwarned(answer: Answer) -> Bool =
+  match answer.json {
+    Object(members) -> match members.get("warnings") {
+      Some(Array(ws)) -> ws.len() == 0,
+      _ -> false,
+    },
+    _ -> false,
+  }
+
+// --- What the loaded tree tells a selector ------------------------------------
+
+/// Which tests a run reports on: the package being loaded — a dependency's tests are its own to run,
+/// and a standard library module's are in scope only under `--std`, the compiler's never — narrowed
+/// by a path the line names in the package to the modules under it, by `--filter` to the keys that
+/// contain one of its substrings, and by `--shard` to its part.
+pub type Scope = { visible: List<Int>, out: List<Int>, filtered_out: Int }
+
+fn root_modules(analysis: View) -> Map<String, Bool> =
+  range(0, analysis.frame.outlines.len()).fold(Map::new(), |acc: Map<String, Bool>, i: Int|
+    match ((analysis.frame.outlines.at(i), analysis.frame.module_packages.at(i))) {
+      (Some(o), Some(pkg)) -> if pkg == 0 { acc.insert(String::of_bytes_lossy(o.name), true) }
+      else { acc },
+      _ -> acc,
+    })
+
+pub fn scope_of(
+  analysis: View,
+  options: Options,
+  named: Option<List<String>> = None,
+) -> Scope / {abort.raise} = {
+  let packaged = analysis.frame.packages.len() > 0;
+  let root = root_modules(analysis);
+  let in_scope = |t: TestInfo|
+    (if packaged { root.contains(String::of_bytes_lossy(t.module)) }
+      else { !is_shipped(String::of_bytes_lossy(t.module)) })
+      || (options.std && is_std(String::of_bytes_lossy(t.module)));
+  let matches = |t: TestInfo|
+    kept(options.filters, String::of_bytes_lossy(t.key)) && in_shard(options.shard, t.key)
+      && (match named {
+        Some(modules) -> modules.contains(String::of_bytes_lossy(t.module)),
+        None -> true,
+      });
+  range(0, analysis.checked.tests.len()).fold(
+    { visible: [], out: [], filtered_out: 0 },
+    |acc: Scope, i: Int|
+      match test_at(analysis, i) {
+        None -> acc,
+        Some(t) -> if !in_scope(t) { { ..acc, out: acc.out.push(i) } }
+        else if matches(t) { { ..acc, visible: acc.visible.push(i) } }
+        else { { ..acc, filtered_out: acc.filtered_out + 1 } },
+      },
+  )
+}
+
+/// Whether the test keyed `key` is in the part `--shard` asks for: its key's hash decides, so it is in
+/// the same part every run, whatever else the run selects.
+fn in_shard(shard: Option<surface::Shard>, key: Bytes) -> Bool / {abort.raise} =
+  match shard {
+    None -> true,
+    Some(s) -> match blake3(key).u32_at(0) {
+      Some(n) -> n % s.count == s.index - 1,
+      None -> s.index == 1,
+    },
+  }
+
+// --- A test over cases --------------------------------------------------------
+
+/// The tests over cases this run reports on, whatever `--filter` and `--shard` say: each reads a
+/// case's label, which only its listing knows.
+pub fn over_cases(analysis: View, options: Options) -> List<Int> / {abort.raise} =
+  scope_of(analysis, { ..options, filters: [], shard: None }).visible.filter(|i: Int|
+    match test_at(analysis, i) { Some(t) -> t.cases, None -> false })
+
+/// A dump scoped to what listing some tests over cases enters, and what their listings reach.
+type Lister = { front: LoadedAnalysis, reach: Map<Bytes, Bool> }
+
+/// Each asked test's cases, or why they could not be listed, from a unit of their tables alone.
+pub fn listed(
+  lister: Option<Lister>,
+  asked: List<Int>,
+) -> Result<Map<Int, Result<List<Listed>, Unlisted>>, List<Diag>> / {tester.unit[tests], tester.cases[tests], emit.unit, emit.compiled, abort.raise} =
+  match lister {
+    None -> Ok(Map::new()),
+    Some(l) -> {
+      let handed = l.front;
+      let tables = asked.fold(Map::new(), |acc: Map<Bytes, Bool>, i: Int|
+        match test_root_at(handed.dump, i) {
+          Some(r) -> acc.insert(cases_root(r), true),
+          None -> acc,
+        });
+      match emit.unit(handed, offered_over(handed, tables, l.reach)) {
+        Err(diags) -> Err(diags),
+        Ok(e) -> match units::library(e.text) {
+          Err(diags) -> Err(diags),
+          Ok(library) -> match tester.unit[tests](handed, Some(library), true) {
+            Err(diags) -> Err(diags),
+            Ok(unit) ->
+              Ok(
+                asked.fold(Map::new(), |acc: Map<Int, Result<List<Listed>, Unlisted>>, i: Int|
+                  acc.insert(i, tester.cases[tests](unit, i))),
+              ),
+          },
+        },
+      }
+    },
+  }
+
+/// What listing the tests over cases at `listing` enters of the program: their tables and labels,
+/// and what those reach.
+pub fn listing_within(analysis: View, listing: List<Int>) -> Within / {abort.raise} = {
+  let keys = listing.fold([], |acc: List<Bytes>, i: Int|
+    match test_at(analysis, i) { Some(t) -> acc.push(t.key), None -> acc });
+  {
+    owners: listing_reach(analysis.frame.hashes, keys),
+    tests: Map::of_entries(keys.map(|k: Bytes| { key: k, value: true })),
+  }
+}
+
+/// What running the entries at `running` enters of the program: their tests and all they reach.
+pub fn run_within(over: Ranged, running: List<Int>) -> Within / {abort.raise} =
+  {
+    owners: reached_by(over.analysis, running),
+    tests: running.fold(Map::new(), |acc: Map<Bytes, Bool>, k: Int|
+      match over.entries.at(k) {
+        Some(entry) -> acc.insert(Bytes::of_string(entry.of), true),
+        None -> acc,
+      }),
+  }
+
+/// The functions the tests at `tests` reach, and what a reached definition's clauses reach.
+fn reached_by(analysis: View, tests: List<Int>) -> Map<Bytes, Bool> / {abort.raise} =
+  reached_functions(
+    analysis.frame.hashes,
+    tests.fold([], |acc: List<Which>, i: Int|
+      match test_at(analysis, i) { Some(t) -> acc.push(TheItem(t.key)), None -> acc }),
+  )
+
+/// The roots a unit offers: those of `own`, and each root of a definition `reached` names, so a root
+/// runs here as in the whole program's unit and its code digests alike.
+fn offered_over(
+  front: LoadedAnalysis,
+  own: Map<Bytes, Bool>,
+  reached: Map<Bytes, Bool>,
+) -> List<Bytes> / {abort.raise} =
+  every_root(front).filter(|r: Bytes| own.contains(r) || reached.contains(root_owner(r)))
+
+/// The definition a root answers for: a clause's is its function's.
+fn root_owner(root: Bytes) -> Bytes / {abort.raise} =
+  match root.index_of(b"#") { Some(i) -> root.slice(0, i), None -> root }
+
+/// The unit the run's tests at `tests` execute in: their roots, a test over cases with the root that
+/// lists its table, and all they reach (`reached`); or the whole program's where a schema has
+/// constants to enter.
+pub fn run_unit(
+  front: LoadedAnalysis,
+  over: Ranged,
+  tests: List<Int>,
+  reached: Map<Bytes, Bool>,
+  schema: Bool,
+) -> Result<Option<Emitted>, List<Diag>> / {emit.unit, abort.raise} =
+  if schema { match whole_emitted(front) { Ok(e) -> Ok(Some(e)), Err(diags) -> Err(diags) } }
+  else if tests.len() == 0 { Ok(None) } else {
+    let own = tests.fold(Map::new(), |acc: Map<Bytes, Bool>, k: Int|
+      match over.entries.at(k) {
+        Some(entry) -> match test_root_at(front.dump, entry.test) {
+          Some(r) -> acc.insert(r, true).insert(cases_root(r), true),
+          None -> acc,
+        },
+        None -> acc,
+      });
+    match emit.unit(front, offered_over(front, own, reached)) {
+      Ok(e) -> Ok(Some(e)),
+      Err(diags) -> Err(diags),
+    }
+  }
+
+/// The run's tests, each case of a test over cases a test of its own: its label is its name, and its
+/// test's hash and its identity make its hash. In `analysis` a case reaches what its test does, its
+/// table among it, which is what covers a definition; in `judged` it reaches only what it runs,
+/// which is what a failure of it is suspected against. `entries` is how the runtime is asked for
+/// each, by the index it has here.
+pub type Ranged = { analysis: View, judged: View, entries: List<Entry> }
+
+type Ranging = {
+  tests: List<TestInfo>,
+  hashes: Map<Bytes, Bytes>,
+  entries: List<Entry>,
+  starts: Map<Bytes, List<Int>>,
+  runs: Map<Bytes, List<Int>>,
+}
+
+/// `key` starting where it did and at `reached` besides.
+fn starting(
+  starts: Map<Bytes, List<Int>>,
+  key: Bytes,
+  reached: Option<List<Int>>,
+) -> Map<Bytes, List<Int>> =
+  match reached {
+    None -> starts,
+    Some(vs) ->
+      starts.insert(
+        key,
+        List::concat(match starts.get(key) { Some(held) -> held, None -> [] }, vs),
+      ),
+  }
+
+pub fn ranged(analysis: View, cases: Map<Int, Result<List<Listed>, Unlisted>>) -> Ranged = {
+  let tests = analysis.checked.tests;
+  let plain = range(0, tests.len()).map(|i: Int|
+    entry_of(i, match tests.at(i) { Some(t) -> String::of_bytes_lossy(t.key), None -> "" }));
+  if cases.len() == 0 { { analysis: analysis, judged: analysis, entries: plain } } else {
+    let walked = range(0, tests.len()).fold(
+      {
+        tests: [],
+        hashes: Map::new(),
+        entries: [],
+        starts: analysis.frame.hashes.refs.items,
+        runs: analysis.frame.hashes.refs.items,
+      },
+      |acc: Ranging, i: Int|
+        match ((tests.at(i), plain.at(i))) {
+          (Some(t), Some(whole)) -> {
+            let hash = analysis.frame.hashes.tests.get(t.key);
+            match cases.get(i) {
+              Some(Ok(listing)) ->
+                range(0, listing.len()).fold(acc, |a: Ranging, k: Int|
+                  match listing.at(k) {
+                    None -> a,
+                    Some(c) -> {
+                      let key = qualify(t.module, Bytes::of_string(c.label));
+                      {
+                        tests: a.tests.push({
+                          ..t,
+                          name: Bytes::of_string(c.label),
+                          key: key,
+                          index: a.tests.len(),
+                        }),
+                        hashes: match hash {
+                          Some(h) -> a.hashes.insert(key, case_hash(h, c.identity)),
+                          None -> a.hashes,
+                        },
+                        entries: a.entries.push({
+                          ..whole,
+                          case: Some({ at: k, identity: c.identity }),
+                        }),
+                        starts: starting(
+                          a.starts,
+                          key,
+                          analysis.frame.hashes.refs.items.get(t.key),
+                        ),
+                        runs: starting(a.runs, key, analysis.frame.hashes.refs.cases.get(t.key)),
+                      }
+                    },
+                  }),
+              other ->
+                {
+                  ..acc,
+                  tests: acc.tests.push({ ..t, index: acc.tests.len() }),
+                  hashes: match hash { Some(h) -> acc.hashes.insert(t.key, h), None -> acc.hashes },
+                  entries: acc.entries.push(match other {
+                    Some(Err(why)) -> { ..whole, unlisted: Some(why) },
+                    _ -> whole,
+                  }),
+                },
+            }
+          },
+          _ -> acc,
+        },
+    );
+    let reaching = |starts: Map<Bytes, List<Int>>|
+      {
+        frame: {
+          ..analysis.frame,
+          hashes: {
+            ..analysis.frame.hashes,
+            tests: walked.hashes,
+            refs: { ..analysis.frame.hashes.refs, items: starts },
+          },
+        },
+        checked: { ..analysis.checked, tests: walked.tests },
+      };
+    { analysis: reaching(walked.starts), judged: reaching(walked.runs), entries: walked.entries }
+  }
+}
+
+/// Each test's code by index: the digest of what its root runs in the unit, and for a case its
+/// identity with it.
+pub fn codes_of(
+  front: LoadedAnalysis,
+  emitted: Emitted,
+  entries: List<Entry>,
+) -> Map<Int, String> / {abort.raise} = {
+  let ran = codes(emitted.made);
+  let code_of = |k: Int| match test_root_at(front.dump, k) { Some(r) -> ran.get(r), None -> None };
+  range(0, entries.len()).fold(Map::new(), |acc: Map<Int, String>, i: Int|
+    match entries.at(i) {
+      None -> acc,
+      Some(entry) -> match code_of(entry.test) {
+        None -> acc,
+        Some(code) ->
+          acc.insert(
+            i,
+            Bytes::hex_of(match entry.case {
+              Some(c) -> case_hash(code, c.identity),
+              None -> code,
+            }),
+          ),
+      },
+    })
+}
+
+/// The tests the store holds a pass for under the code they run that still stands, each with the
+/// trace it stands on. `loaded` is what the run's load read of the shipped modules
+/// (`views.held_texts`).
+pub fn passed_by_code(
+  decisions: List<Decision>,
+  keyed: Map<Int, String>,
+  loaded: Map<Bytes, Bytes>,
+) -> Map<Int, Bytes> / {ledger.code_passes, tester.moved[tests], fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+  let asked = asked_by_code(decisions, keyed);
+  let answers = if asked.len() == 0 { [] }
+  else { ledger.code_passes(asked.map(|a: { index: Int, key: String }| a.key)) };
+  let now = views::now_for(views::viewed_in(traces_of(answers)), |m: Bytes|
+    views::read_held(loaded, m));
+  range(0, asked.len()).fold(Map::new(), |acc: Map<Int, Bytes>, i: Int|
+    match answers.at(i) {
+      Some(Some(trace)) -> if standing(now, Some(trace)) == Some(Stands) {
+        acc.insert(asked.at_or(i, { index: 0 - 1, key: "" }).index, trace)
+      } else { acc },
+      _ -> acc,
+    })
+}
+
+/// What the binding came to, its reach said of the run's tests: a case is reached as its test is.
+fn hosted_over(program: Program) -> Hosted / {tester.hosted[tests]} = {
+  let hosted = tester.hosted[tests]();
+  let reached = set_of(hosted.reaches);
+  {
+    ..hosted,
+    reaches: program.cases.filter(|case: Case| reached.contains(case.entry.test)).map(
+      |case: Case| case.index,
+    ),
+  }
+}
+
+/// The run itself, what it establishes, filed, and what it is asked after: a mutation of a green
+/// run, and the cause of every failure. `judged` is the tests as a pass is recorded and a failure
+/// suspected: a case reaching only what it runs.
+pub fn concluded_run(
+  flags: Flags,
+  style: Style,
+  options: Options,
+  program: Program,
+  timed: Timed,
+  analysis: View,
+  judged: View,
+  scope: Scope,
+  decisions: List<Decision>,
+  decided: Decided,
+  keyed: Map<Int, String>,
+  // The passes refiled under their own keys, and where the run keeps its answer.
+  keeps: { refiled: List<Pass>, kept: Option<Keeping> },
+  searching: plan::Plan,
+  configured: List<Diag>,
+  targeted: Option<List<DefInfo>>,
+  spent: Spent,
+) -> Answer / {process.out[proc], time.elapsed_us, tester.unit[tests], tester.hosted[tests], tester.executed[tests], tester.interleaved[tests], ledger.opened, ledger.passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.history, ledger.filed, emit.unit, emit.compiled, shipped.answer, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise, shipped.reached} = {
+  let refiled = keeps.refiled;
+  let kept = keeps.kept;
+  // What the next run answers: this run's notices of its cache and its store are not in it.
+  let after = match kept { Some(k) -> k.after, None -> false };
+  let asked = {
+    plan: searching,
+    measuring: options.sim.measure_reduction,
+    lanes: match options.jobs { Some(n) -> if n > 0 { Some(n) } else { None }, None -> None },
+  };
+  let narrowing = narrowed(decisions, decided.search.roots);
+  // The head and each group's results are printed as they are known, so a long run shows its
+  // progress and its first failure; the document `--json` writes waits for the whole run.
+  let shown = !flags.json;
+  let width = name_column(program, decided);
+  let opening = if shown {
+    opening_lines(
+      style,
+      flags,
+      program,
+      decided,
+      opening_of(options, program, hosted_over(program)),
+    )
+  } else { [] };
+  if shown { printed(opening) };
+  let started = time.elapsed_us();
+  let done = decided.classes.flat_map(|group: Group| {
+    let ran = ran_class(
+      group.tests.map(|i: Int| job_of(program, program.unit, i, narrowing, searching)),
+      asked,
+    );
+    if shown {
+      printed(result_lines(style, program, ran.map(|d: Done| ran_outcome(analysis, d)), width))
+    };
+    ran
+  });
+  let elapsed = time.elapsed_us() - started;
+  let hosted = hosted_over(program);
+  let h = hashes_of(judged);
+  let running = set_of(decided.runs);
+  let by_test = done.fold(Map::new(), |acc: Map<Int, Done>, d: Done| acc.insert(d.test, d));
+  let c: Concluded<Raised> = conclude::concluded(
+    conclude_tests(analysis),
+    h,
+    {
+      groups: decided.classes.map(|group: Group| group.tests),
+      filed: filed(decisions, decided.search).fold(
+        Map::new(),
+        |acc: Map<Int, List<String>>, e: { index: Int, keys: List<String> }|
+          if running.contains(e.index) { acc.insert(e.index, e.keys) } else { acc },
+      ),
+      codes: keyed.fold(Map::new(), |acc: Map<Int, List<String>>, i: Int, k: String|
+        if running.contains(i) { acc.insert(i, [k]) } else { acc }),
+      reasons: decisions.fold(Map::new(), |acc: Map<Int, Reason>, d: Decision|
+        acc.insert(d.case.index, d.reason)),
+      out_of_scope: scope.out,
+    },
+    if options.no_cache { Map::new() } else { seen_of(h) },
+    done.map(conclusion_of),
+  );
+  let said = if options.no_cache { [] } else {
+    let kept = history_of(analysis, c.filing.records);
+    ledger.history(kept.defs, kept.bodies);
+    filing_said(
+      ledger.filed({ ..c.filing, passes: c.filing.passes.concat(refiled) }),
+      "could not write the test cache: ",
+      "the run itself is valid; every test will simply be re-run next time",
+    )
+  };
+  let stored = if after { [] } else { said };
+  let r = mutated(
+    timed,
+    analysis,
+    program,
+    ran_of(
+      options,
+      program,
+      analysis,
+      h,
+      decided,
+      hosted,
+      c,
+      by_test,
+      elapsed,
+      configured.concat(stored),
+    ),
+    options,
+    asked,
+    targeted,
+  );
+  // After the run is filed, since a pass recorded now is a valid baseline for another's failure.
+  let found = diagnosed_all(options, timed, judged, program, c, by_test, r.failures);
+  let cause = decided_faults({ ..r, failures: found.failures }, found.benches, diagnosing(options));
+  let proved = if options.no_cache || cause.proved.len() == 0 { [] } else {
+    filing_said(
+      ledger.filed({
+        passes: cause.proved.map(|key: String| { key: key, trace: b"" }),
+        codes: [],
+        records: [],
+        seen: [],
+      }),
+      "could not write what the bisection's mixtures proved: ",
+      "every verdict stands; the next bisection runs those mixtures again",
+    )
+  };
+  let lazily = if options.no_cache || after { [] } else { ledger.opened() };
+  let concluding = time.elapsed_us() - started - elapsed;
+  let answer = answered(
+    style,
+    flags,
+    program,
+    {
+      ..r,
+      failures: found.failures,
+      warnings: r.warnings.concat(proved).concat(lazily),
+      spent: { ..spent, tests_us: elapsed, conclude_us: concluding },
+    },
+    cause.faults,
+    decided,
+  );
+  match kept {
+    Some(k) -> if decided.runs.len() == 0 && answer.code == ok_code() && unwarned(answer)
+        && all_cached(decisions, scope) {
+      let _ = keep_command(
+        flags.paths,
+        k.project,
+        k.key,
+        timed.program,
+        bin::encode(
+          {
+            opening: opening,
+            lines: answer.lines,
+            errs: answer.errs,
+            code: answer.code,
+            json: to_string(answer.json),
+            passes: k.passes,
+          },
+          kept_bin(),
+        ),
+        k.marks,
+      );
+      ()
+    },
+    None -> (),
+  };
+  answer
+}
+
+/// What writing to the store had to say, its own failure first.
+fn filing_said(f: Filed, unflushed: String, note: String) -> List<Diag> =
+  match f.unflushed {
+    None -> f.warnings,
+    Some(why) -> [diag_of("warning", "W0601", unflushed ++ why, [], [note])].concat(f.warnings),
+  }
+
+/// The search a seeded test's key is computed against, as the selector reads one.
+pub fn search_of(p: plan::Plan) -> Search / {abort.raise} =
+  {
+    mode: plan::mode_word(p.mode),
+    roots: p.roots.map(|r: U64| Int::of_u64(r)),
+    budget: p.budget,
+    steps: p.steps,
+    path: p.path,
+  }
+
+/// The whole plan, as the document's options carry it: every field is in a seeded test's key.
+pub fn sim_json(p: plan::Plan, sim: machine::SimulationOptions) -> Json / {abort.raise} =
+  object([
+    { key: "budget", value: int(p.budget) },
+    { key: "measure_reduction", value: Bool(sim.measure_reduction) },
+    { key: "mode", value: Str(plan::mode_word(p.mode)) },
+    {
+      key: "roots",
+      value: Array(
+        p.roots.map(|r: U64|
+          Number(Decimal::of_string(plan::u64_text(r)).unwrap_or(Decimal::of_int(0)))),
+      ),
+    },
+    {
+      key: "seed",
+      value: match sim.seed {
+        Some(text) -> match plan::parse_seed(text) {
+          Some(seed) -> Str(plan::seed_text(seed)),
+          None -> Null,
+        },
+        None -> Null,
+      },
+    },
+    { key: "seeds", value: int(p.roots.len()) },
+    { key: "steps", value: int(p.steps) },
+  ])
+
+// --- Tests ------------------------------------------------------------------
+
+test "the search a seeded test is keyed on is the plan the flags name, and the document says it" {
+  let p = machine::sim_plan_of({
+    ..machine::no_sim_options(),
+    mode: "random",
+    roots: Some({ from: 0, to: 3 }),
+  });
+  assert_eq(search_of(p), { mode: "random", roots: [0, 1, 2], budget: 1, steps: 100000, path: [] });
+  let seeded = { ..machine::no_sim_options(), seed: Some("0x10:2") };
+  let doc = to_string(with_sim(object([]), sim_json(machine::sim_plan_of(seeded), seeded)));
+  assert(doc.contains("\"seed\":\"16:2\""));
+  assert(doc.contains("\"mode\":\"once\""));
+  assert(doc.contains("\"roots\":[16]"))
+}
+
+// --- Footprints over real programs --------------------------------------------
+
+test "`--std` adds the standard library's tests and never the compiler's, whose own suite runs them" {
+  let w = match analyse_pulling_std_with(
+      [
+        {
+          name: b"m",
+          src: b"import std.y\nimport compiler.x\ntest \"own\" { assert_eq(y::one(), x::one()) }\n",
+        },
+      ],
+      [
+        {
+          name: b"std.y",
+          src: b"pub fn one() -> Int = 1\ntest \"library\" { assert_eq(one(), 1) }\n",
+        },
+        {
+          name: b"compiler.x",
+          src: b"pub fn one() -> Int = 1\ntest \"compiler\" { assert_eq(one(), 1) }\n",
+        },
+      ],
+      no_rows(),
+      reached: false,
+    ).out {
+    Analysed(w) -> view_of(w),
+    Refused(_) -> panic("the fixture checks"),
+  };
+  let keys = |args: List<String>|
+    scope_of(w, options_from(parsed(["test"].concat(args)), "/p")).visible.map(|i: Int|
+      match test_at(w, i) { Some(t) -> t.key, None -> b"" });
+  // `std.prelude`'s tests are the library's too, read as the load reads it whole.
+  let mine = |key: Bytes| !key.starts_with(b"std.prelude.");
+  assert_eq(w.checked.tests.map(|t: TestInfo| t.key).filter(mine).len(), 3);
+  assert_eq(keys([]), [b"m.own"]);
+  let std = keys(["--std"]);
+  assert(
+    std.filter(mine).len() == 2 && std.contains(b"m.own") && std.contains(b"std.y.library")
+      && std.len() > 2,
+  )
+}

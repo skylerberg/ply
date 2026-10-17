@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 /// What runs a test or a law, the handlers a kept pass's trace was read through, and the launcher a
 /// `ply` it started ran under.
 const RUNTIME: &[&str] = &[
-    "ply-eval",
-    "ply-codegen",
-    "ply-machine",
+    "ply-core",
+    "ply-compiled",
+    "ply-privileged",
     "ply-host",
     "ply-launcher",
 ];

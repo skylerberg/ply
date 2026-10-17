@@ -1,5 +1,5 @@
-use ply_eval::host::MachineId;
-use ply_eval::{
+use ply_core::host::MachineId;
+use ply_core::{
     Determinism, Diagnostic, EffectAtom, HostAnswer, HostRequest, HostRuntime, Linearity, Mode,
     Resource, Span, Symbol, Value, codes,
 };
@@ -8,7 +8,7 @@ use ply_host::os::*;
 struct Nothing;
 
 impl HostRuntime for Nothing {
-    fn watch(&self, _: &ply_eval::Pending) -> Result<(), Diagnostic> {
+    fn watch(&self, _: &ply_core::Pending) -> Result<(), Diagnostic> {
         Ok(())
     }
     fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
@@ -17,7 +17,7 @@ impl HostRuntime for Nothing {
     fn park(&self) -> Result<(), Diagnostic> {
         Ok(())
     }
-    fn block_on(&self, _: ply_eval::Pending) -> Result<Value, Diagnostic> {
+    fn block_on(&self, _: ply_core::Pending) -> Result<Value, Diagnostic> {
         Ok(Value::Unit)
     }
 }

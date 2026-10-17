@@ -1,0 +1,1127 @@
+//! The program a command answers about: the files a path names, the shipped modules they pulled off
+//! the shipped modules, and every table the front end holds for them. One load per invocation. A
+//! load answers each module through the memo store and takes the program's tables from what its
+//! modules answered, so a run checks what moved since the last one; a command that reads syntax
+//! analyses the program whole again, each definition taken as its module answered it.
+
+import env (env)
+import compiler.load (LoadedAnalysis, SourceFile, tell_viewed)
+import compiler.unit (shipped)
+import std.fs (fs)
+import std.time (time)
+import compiler.front.seam (Refused, Analysed, Within, view_dump, view_of)
+import compiler.front.facts (Analysis, ShippedView, View, Frame, TableReads, ModuleShape,
+                             answered_load, no_reads, statement_modules)
+import compiler.front (Pulled, Shipping, analyse_pulling_std_with, pins_pulling)
+import compiler.front.rows (Rows, Outline, Outlined, OFn, FnOutline, KnownDefRow, KnownTestRow)
+import compiler.front.published (DefInterface, dump_of, no_rows, rows_of)
+import compiler.front.pkg (PackageSources, Pinned, Supplied)
+import interfaces
+import compiler.store.hash
+import compiler.store.hash.forms (HashOutput, NodeRef, TheFn, Which, Fixing, no_fixing)
+import compiler.store.hash.encoding (hex)
+import std.hash (blake3)
+import compiler.syntax.items (Item, IFn)
+import compiler.check.infer.checker (DefInfo, TestInfo, LawInfo, Location)
+import compiler.check.termination (Ends, unknown_summary)
+import compiler.check.resolve.tables (Source, ParsedModule, Diag, Label, error_at, qualify)
+import compiler.check.types (TyCon, TyFn, tables_joined)
+import diagnostic (Place, spot_of)
+import paths
+import proof.statics (Unshown, unshown)
+import proof.world (measures_in)
+import sources (File, Project, DepPackage, Embed, load_resolved, asked_shipped, shipping_kept_of,
+                shipping_of, shipped_listed, nothing_here, is_std, is_compiler, embeds_moved,
+                embeds_parsed)
+import builder (builder)
+import queried
+import queried (Queried)
+import compiler.store.memo (Read, Tally)
+import compiler.front.checking (Answered, packages_refused, refused_first, root_warnings,
+                                rows_answered, view_answered)
+import compiler.front.checking.world (ModuleAnswer, Named)
+import compiler.front.pages (Pages)
+import std.random (entropy)
+import std.list
+import std.string
+import compiler.syntax.parsing (no_module, dummy_span, span_between)
+import compiler.front.interface (sized)
+import compiler.store.hash.forms
+
+/// `frame` is `None` exactly when `diags` holds an error: a stage that reported stopped the rest.
+/// `pkgs` is kept so a re-analysis (`ply replace`, a mutant) reads what the load did.
+pub type Program = {
+  files: List<File>,
+  places: List<Place>,
+  diags: List<Diag>,
+  frame: Option<Frame>,
+  /// What each module answered, and how the load reads each one's tables: what [`program_view`]
+  /// makes the check's tables of, and [`whole_of`] the rows it seeds an analysis with.
+  answered: Map<Bytes, ModuleAnswer>,
+  reads: TableReads,
+  /// The program analysed whole, where the load read something of its own modules from syntax.
+  whole: Option<Analysis>,
+  /// The root package's modules, and what hashing fixed of every module: what [`whole_of`]
+  /// analyses the program from.
+  sources: List<Source>,
+  fixed: Fixing,
+  pkgs: PackageSources,
+  embeds: List<Embed>,
+  /// The bytes of each file the program embeds, by digest: what its emission writes them out as.
+  inputs: Map<Bytes, Bytes>,
+  /// The shipped modules the load read, which a splice of it pulls again.
+  shipping: Shipping,
+  /// Whether a shipped module was read only for what the program reaches, rather than whole.
+  reached: Bool,
+  /// What the load read of each shipped module it pulled, which it tells whatever observes the run.
+  viewed: List<ShippedView>,
+  /// What the memo run that answered the load's modules did of each query it asked, whether the
+  /// store vouched for any record to it, and how many answers it made again that a standing
+  /// record named and no store held.
+  tallies: List<Tally>,
+  vouched: Bool,
+  lost: Int,
+  /// What that run asked, each by the digest of what it answered: what a command's answer made over
+  /// the load is a function of.
+  asked: List<Read>,
+}
+
+pub type ModuleView = { name: String, path: String }
+
+/// A module as `ply check` reports it: what it declares and what it imports, beside its place.
+/// `index` is the one a label's module points into.
+pub type ModuleReport = {
+  index: Int,
+  name: String,
+  path: String,
+  imports: List<String>,
+  items: List<String>,
+}
+
+/// A load with the clock read between its phases, for the command that reports where the time went:
+/// the walk and the shipped modules; and the front end, its modules answered through the memo store
+/// among it. `cached` and `file_ms` are what no load files any more.
+pub type Timed = { program: Program, read_ms: Int, front_ms: Int, file_ms: Int, cached: Bool }
+
+// --- Where a shipped module's text is said to live ------------------------------
+
+fn without_first(segments: List<String>) -> List<String> =
+  range(1, segments.len()).fold([], |acc: List<String>, i: Int|
+    match segments.at(i) { Some(s) -> acc.push(s), None -> acc })
+
+/// `std.json` is `<std>/json.ply`, as the cache keys it and as a rendered span names it.
+pub fn pseudo_path(name: String) -> String = {
+  let segments = name.split(".");
+  match segments.at(0) {
+    None -> name,
+    Some(root) -> "<" ++ root ++ ">/" ++ String::join(without_first(segments), "/") ++ ".ply",
+  }
+}
+
+fn shipped_place(texts: Map<String, Bytes>, name: String) -> Place =
+  { path: pseudo_path(name), text: match texts.get(name) { Some(t) -> t, None -> b"" } }
+
+// --- Loading --------------------------------------------------------------------
+
+fn broken(project: Project, shipping: Shipping, places: List<Place>, diags: List<Diag>) -> Program =
+  {
+    files: project.files,
+    places: places,
+    diags: diags,
+    frame: None,
+    answered: Map::new(),
+    reads: no_reads(),
+    whole: None,
+    sources: project.sources,
+    fixed: no_fixing(),
+    pkgs: pkgs_of(project),
+    embeds: [],
+    inputs: Map::new(),
+    shipping: shipping,
+    reached: true,
+    viewed: [],
+    tallies: [],
+    vouched: false,
+    lost: 0,
+    asked: [],
+  }
+
+/// A program nothing was loaded for: what a test hands a command that reads only what it is given.
+pub fn no_program() -> Program =
+  {
+    files: [],
+    places: [],
+    diags: [],
+    frame: None,
+    answered: Map::new(),
+    reads: no_reads(),
+    whole: None,
+    sources: [],
+    fixed: no_fixing(),
+    pkgs: { root: b"", manifest: None, supplied: [] },
+    embeds: [],
+    inputs: Map::new(),
+    shipping: { read: [], unread: [], data: [], asked: [], pulls: [] },
+    reached: true,
+    viewed: [],
+    tallies: [],
+    vouched: false,
+    lost: 0,
+    asked: [],
+  }
+
+/// What a load of this project is made of: its root key and manifest text, and every dependency
+/// the walk read. The front end takes this as its package closure.
+pub fn pkgs_of(project: Project) -> PackageSources =
+  {
+    root: Bytes::of_string(project.root_key),
+    manifest: match project.manifest { None -> None, Some(f) -> Some(f.text) },
+    supplied: supplied(project),
+  }
+
+fn own_places(project: Project) -> List<Place> =
+  project.files.map(|file: File| { path: file.path, text: file.text })
+
+fn supplied(project: Project) -> List<Supplied> =
+  project.packages.map(|package: DepPackage|
+    {
+      root: Bytes::of_string(package.root),
+      manifest: package.manifest,
+      modules: package.files.map(|file: File|
+        { name: Bytes::of_string(file.module), src: file.text }),
+    })
+
+fn dep_places(project: Project) -> List<Place> =
+  project.packages.fold([], |acc: List<Place>, package: DepPackage|
+    package.files.fold(acc, |places: List<Place>, file: File|
+      places.push({ path: file.path, text: file.text })))
+
+/// Manifest places in slot order: the root's first, then each dependency's in walk order.
+fn manifest_places(project: Project) -> List<Place> = {
+  let deps = project.packages.fold([], |acc: List<Place>, package: DepPackage|
+    match package.manifest {
+      None -> acc,
+      Some(text) -> acc.push({ path: package.root ++ "/ply.pkg", text: text }),
+    });
+  match project.manifest {
+    None -> deps,
+    Some(f) -> {
+      let root: List<Place> = [{ path: f.path, text: f.text }];
+      deps.fold(root, |acc: List<Place>, place: Place| acc.push(place))
+    },
+  }
+}
+
+/// A walk's own places, in the order a front end places them: the root's modules and then each
+/// dependency's, and the manifests, which follow whatever it pulls from the shipped modules.
+pub type Placed = { modules: List<Place>, manifests: List<Place> }
+
+pub fn placed_of(project: Project) -> Placed =
+  { modules: own_places(project).concat(dep_places(project)), manifests: manifest_places(project) }
+
+/// The program `sources` makes, each definition and test taken as `rows` published it, pulling
+/// what it imports of the shipped modules from `shipping`.
+pub fn front_end(
+  sources: List<Source>,
+  shipping: Shipping,
+  rows: Rows,
+  pkgs: PackageSources,
+  embeds: List<Embed>,
+  reached: Bool,
+  fixed: Fixing,
+) -> Pulled / {abort.raise} =
+  analyse_pulling_std_with(
+    sources,
+    shipping.read,
+    rows,
+    pkgs,
+    embeds: embeds.map(|embed: Embed| embed.embedded),
+    unread: shipping.unread,
+    reached: reached,
+    data: shipping.data,
+    asked: shipping.asked,
+    pulls: shipping.pulls,
+    fixed: fixed,
+  )
+
+/// Seeded with what the load published but for `moved`, the definitions a splice changed, which
+/// are walked again with every definition whose check reads one of them.
+pub fn reanalysed(
+  program: Program,
+  frame: Frame,
+  sources: List<Source>,
+  pkgs: PackageSources,
+  moved: List<Bytes>,
+) -> Pulled / {abort.raise} = {
+  let rows = rows_answered_all(program);
+  let stale = forms::reaching(
+    frame.hashes,
+    moved.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true)),
+  );
+  front_end(
+    sources,
+    program.shipping,
+    {
+      defs: rows.defs.filter(|r: KnownDefRow| !stale.contains(r.name) && !moved.contains(r.name)),
+      tests: [],
+      types: rows.types,
+    },
+    pkgs,
+    program.embeds,
+    program.reached,
+    no_fixing(),
+  )
+}
+
+/// The program `project` makes, its tables taken from what `answers` checked and hashing fixed of
+/// each module, warned of as its root modules' answers warn. It is analysed whole as well where one
+/// of its own modules holds what is read from syntax: a measure, which is held to its proof here, or
+/// a cost promise.
+fn analysed(
+  project: Project,
+  shipping: Shipping,
+  answers: List<Answered>,
+  pulled: List<Bytes>,
+  embeds: List<Embed>,
+  inputs: Map<Bytes, Bytes>,
+  reached: Bool,
+  fixed: Fixing,
+  std: Bool,
+) -> Program / {abort.raise} = {
+  let texts = shipping.read.fold(Map::new(), |acc: Map<String, Bytes>, source: Source|
+    acc.insert(String::of_bytes_lossy(source.name), source.src));
+  let pkgs: PackageSources = pkgs_of(project);
+  let warnings = root_warnings(answers, project.sources.len()).concat(if std {
+    std_warnings(answers, project.sources.len())
+  } else { [] });
+  let loaded = answered_load(
+    project.sources.map(|s: Source| s.name),
+    pkgs,
+    answers.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: Answered|
+      acc.insert(a.module, a.answer.shape)),
+    fixed,
+    pulled,
+    shipped_listed(shipping),
+    shipping.read.fold(Map::new(), |acc: Map<Bytes, Bytes>, source: Source|
+      acc.insert(source.name, source.src)),
+    true,
+    reached,
+    warnings,
+  );
+  let own = placed_of(project);
+  let program = {
+    files: project.files,
+    places: own.modules.concat(
+      loaded.pulled.map(|n: Bytes| shipped_place(texts, String::of_bytes_lossy(n))),
+    ).concat(
+      own.manifests,
+    ),
+    diags: warnings,
+    frame: Some(loaded.frame),
+    answered: answers.fold(Map::new(), |acc: Map<Bytes, ModuleAnswer>, a: Answered|
+      acc.insert(a.module, a.answer)),
+    reads: loaded.reads,
+    whole: None,
+    sources: project.sources,
+    fixed: fixed,
+    pkgs: pkgs,
+    embeds: embeds,
+    inputs: inputs,
+    shipping: shipping,
+    reached: reached,
+    viewed: loaded.views,
+    tallies: [],
+    vouched: false,
+    lost: 0,
+    asked: [],
+  };
+  let owned = project.sources.fold(Map::new(), |acc: Map<Bytes, Bool>, source: Source|
+    acc.insert(source.name, true));
+  let mine = |m: Bytes| owned.contains(m) || (std && is_std(String::of_bytes_lossy(m)));
+  let own = loaded.frame.outlines.take(project.files.len()).concat(if std {
+    loaded.frame.outlines.drop(project.files.len()).filter(|o: Outline| mine(o.name))
+  } else { [] });
+  let held = |pick: (FnOutline) -> Bool|
+    own.fold(false, |b: Bool, o: Outline|
+      b
+        || o.items.fold(false, |m: Bool, item: Outlined|
+          m || (match item { OFn(f) -> pick(f), _ -> false })));
+  let measured = held(|f: FnOutline| f.measured);
+  if !measured && !held(|f: FnOutline| f.reuse || f.returns) { program } else {
+    let refused = |ds: List<Diag>| { ..program, diags: ds, frame: None };
+    match whole_of(program) {
+      Err(ds) -> refused(ds),
+      Ok(w) -> match if measured { unshown(w, mine) } else { [] } {
+        [] -> { ..program, whole: Some(w) },
+        missing -> refused(missing.map(undescended)),
+      },
+    }
+  }
+}
+
+fn stating(own: List<Outline>) -> Bool =
+  own.fold(false, |b: Bool, o: Outline|
+    b
+      || statement_modules().fold(false, |m: Bool, n: Bytes|
+        m || o.name == n || o.imports.contains(n)))
+
+/// Whether one of the program's own modules runs a statement: is or imports a module that declares
+/// what runs one.
+pub fn runs_statements(program: Program, frame: Frame) -> Bool =
+  stating(frame.outlines.take(program.files.len()))
+
+/// What each module of the program published of its definitions and tests.
+fn rows_answered_all(program: Program) -> Rows / {abort.raise} =
+  program.answered.fold(no_rows(), |acc: Rows, _: Bytes, a: ModuleAnswer| {
+    let rows = rows_answered(a);
+    {
+      defs: acc.defs.concat(rows.defs),
+      tests: acc.tests.concat(rows.tests),
+      types: tables_joined(acc.types, rows.types),
+    }
+  })
+
+/// The program's check's tables beside its frame, read from what its modules answered: what a
+/// command that reads the check takes. `None` where the load refused.
+pub fn program_view(program: Program) -> Option<View> / {abort.raise} =
+  match program.frame {
+    None -> None,
+    Some(f) -> Some(view_answered(f, program.reads, program.answered)),
+  }
+
+/// The program analysed whole, each definition and test taken as its module's answer published it
+/// and hashing fixed it: what a command that reads syntax takes. `Err` holds what refuses it.
+pub fn whole_of(program: Program) -> Result<Analysis, List<Diag>> / {abort.raise} =
+  match ((program.frame, program.whole)) {
+    (None, _) -> Err(program.diags),
+    (Some(_), Some(w)) -> Ok(w),
+    (Some(f), None) -> match front_end(
+        program.sources,
+        program.shipping,
+        rows_answered_all(program),
+        program.pkgs,
+        program.embeds,
+        program.reached,
+        program.fixed,
+      ).out {
+      Refused(ds) -> Err(ds),
+      Analysed(w) -> Ok({ ..w, warnings: f.warnings }),
+    },
+  }
+
+fn undescended(u: Unshown) -> Diag =
+  error_at(
+    b"E0467",
+    u.measure.at.module,
+    span_between(u.measure.at.start, u.measure.at.end),
+    Bytes::of_string(
+      "no proof shows `" ++ u.measure.owner
+        ++ "`'s measure descends at every call its group makes back into itself",
+    ),
+    b"this measure is not shown",
+    u.why.map(Bytes::of_string).push(if u.ends {
+      b"the checker sees it end without the measure, which can be deleted"
+    } else {
+      b"a definition is read as ending on its measure only once a proof shows it; restructure it so the checker sees it descend, or state a measure a proof can follow"
+    }),
+  )
+
+/// A project worth pulling shipped modules for: one the walk read whole and that holds at least one
+/// module.
+pub fn usable(project: Project) -> Bool = project.diags.len() == 0 && project.sources.len() > 0
+
+/// The program `answers` says `project` is: refused with the errors of each of its own modules that
+/// no refusal of a module it imports explains, else analysed whole, each definition and test taken as
+/// its module's answer published it. With `std`, the standard library's warnings are its own too.
+fn assembled(
+  project: Project,
+  shipping: Shipping,
+  paths: List<paths::Resolved>,
+  q: Queried,
+  reached: Bool = true,
+  std: Bool = false,
+) -> Program / {abort.raise} =
+  {
+    ..assembled_from(project, shipping, paths, q, reached, std),
+    tallies: q.tallies,
+    vouched: q.vouched,
+    lost: q.lost,
+    asked: q.asked,
+  }
+
+fn assembled_from(
+  project: Project,
+  shipping: Shipping,
+  paths: List<paths::Resolved>,
+  q: Queried,
+  reached: Bool,
+  std: Bool,
+) -> Program / {abort.raise} = {
+  let answers = q.answers;
+  if project.diags.len() > 0 { broken(project, shipping, own_places(project), project.diags) }
+  else if project.sources.len() == 0 {
+    broken(project, shipping, [], [
+      nothing_here(match paths.at(0) { Some(r) -> r.display, None -> "." }),
+    ])
+  } else {
+    let first = refused_first(answers).fold(Map::new(), |acc: Map<Bytes, Bool>, a: Answered|
+      acc.insert(a.module, true));
+    let own = placed_of(project);
+    let packaged = packages_refused(
+      pkgs_of(project),
+      project.sources.map(|s: Source| s.name),
+      own.modules.len(),
+      shipping.read.map(|s: Source| s.name).concat(shipping.unread),
+    );
+    if packaged.len() > 0 { broken(project, shipping, own.modules.concat(own.manifests), packaged) }
+    else if first.len() > 0 {
+      // Each answer at its place: the load's own modules, then the shipped modules it pulled.
+      let texts = shipping.read.fold(Map::new(), |acc: Map<String, Bytes>, source: Source|
+        acc.insert(String::of_bytes_lossy(source.name), source.src));
+      let pulled = answers.drop(own.modules.len()).map(|a: Answered|
+        shipped_place(texts, String::of_bytes_lossy(a.module)));
+      let diags = range(0, answers.len()).fold([], |acc: List<Diag>, i: Int| {
+        let a = answers.get(i);
+        if !first.contains(a.module) { acc } else {
+          acc.concat(
+            a.answer.refused.map(|d: Diag|
+              { ..d, labels: d.labels.map(|l: Label| { ..l, module: i }) }),
+          )
+        }
+      });
+      broken(project, shipping, own.modules.concat(pulled).concat(own.manifests), diags)
+    } else {
+      match q.inputs {
+        Err(moved) -> broken(project, shipping, own.modules.concat(own.manifests), moved),
+        Ok(inputs) ->
+          analysed(project, shipping, answers, q.pulled, q.embeds, inputs, reached, q.fixing, std),
+      }
+    }
+  }
+}
+
+fn slots_of(project: Project) -> List<String> / {abort.raise} =
+  interfaces::slots(project.root_key, project.packages.map(|package: DepPackage| package.root))
+
+/// Each published interface against what this load cut from source; one that differs refuses the load.
+fn verified(
+  project: Project,
+  shipping: Shipping,
+  verify: Bool,
+  program: Program,
+) -> Program / {fs.read_file[abs], abort.raise} =
+  if !verify || program.frame == None { program } else {
+    match whole_of(program) {
+      Err(ds) -> { ..program, diags: ds, frame: None },
+      Ok(w) -> match interfaces::underived(
+          slots_of(project),
+          interfaces::dependency_sources(
+            pkgs_of(project),
+            project.sources.map(|source: Source| source.name),
+          ),
+          w,
+        ) {
+        [] -> program,
+        refused -> { ..program, diags: program.diags.concat(refused), frame: None },
+      },
+    }
+  }
+
+/// The files are the *places* and not the modules: a `ply.pkg` is a file the front end read and a
+/// source id it answers under, so one entry per place is what keeps the ids of everything after it
+/// where the machine's reader expects them. A manifest carries no module, and the runtime files one
+/// under `pkg`.
+fn placed_sources(program: Program, frame: Frame) -> List<SourceFile> / {abort.raise} = {
+  let named = modules_of(program, frame);
+  range(0, program.places.len()).map(|i: Int|
+    {
+      path: match program.places.at(i) { Some(place) -> place.path, None -> "" },
+      name: match named.at(i) { Some(m) -> m.name, None -> "pkg" },
+      text: match program.places.at(i) { Some(place) -> place.text, None -> b"" },
+    })
+}
+
+/// Each module of `project`'s own packages and each shipped module they pull, answered checked
+/// through the memo store beside the project; with `every`, each module of the standard library
+/// pulled whatever imports it and read with its tests, as a run over its own tests reads it.
+fn answers_of(
+  paths: List<paths::Resolved>,
+  project: Project,
+  every: Bool,
+) -> Queried / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], shipped.answer, abort.raise} =
+  if !usable(project) { queried::nothing() } else {
+    let asked = asked_shipped(every);
+    match paths.at(0) {
+      None -> queried::answered_afresh(project, asked, every),
+      Some(r) -> {
+        let dir = paths::in_root(r, ".ply-cache/memo").path;
+        if r.label == "cwd" {
+          queried::answered[cwd](dir, project, asked, every, whole(paths, project))
+        } else { queried::answered[abs](dir, project, asked, every, whole(paths, project)) }
+      },
+    }
+  }
+
+/// Each path a command was given, as it resolved: what its reports' paths are relative to.
+pub fn resolved_fields(paths: List<paths::Resolved>) -> Bytes =
+  sized(Bytes::of_string(paths.len().to_string())).concat(
+    Bytes::concat_all(
+      paths.map(|r: paths::Resolved|
+        Bytes::concat_all(
+          [r.label, r.spelling, r.display, r.inside, r.absolute, r.machine].map(|s: String|
+            sized(Bytes::of_string(s))),
+        )),
+    ),
+  )
+
+/// What names a command line and where it ran: its words, and each path it was given as resolved.
+pub fn asked_line(argv: List<String>, paths: List<paths::Resolved>) -> Bytes =
+  Bytes::concat_all([
+    sized(Bytes::of_string(argv.len().to_string())),
+    Bytes::concat_all(argv.map(|a: String| sized(Bytes::of_string(a)))),
+    resolved_fields(paths),
+  ])
+
+/// Whether the load of `paths` that read `project` walked each root whole: a package is read whole
+/// whatever its line names in it, and a file no package holds is read with the modules it imports,
+/// so its load does not see the rest of its root.
+fn whole(paths: List<paths::Resolved>, project: Project) -> Bool =
+  project.manifest != None || paths.fold(true, |b: Bool, r: paths::Resolved| b && r.inside == ".")
+
+/// The answer kept under `key` for a command over `project`, in the memo store beside it, where it
+/// stands; beside the marks found on it, which keeping it again removes, and what the run that
+/// settled the store to find out did.
+pub fn command_kept(
+  paths: List<paths::Resolved>,
+  project: Project,
+  key: Bytes,
+) -> { output: Option<Bytes>, marks: List<Bytes>, tallies: List<Tally>, lost: Int } / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, abort.raise} =
+  match ((usable(project), paths.at(0))) {
+    (true, Some(r)) -> {
+      let dir = paths::in_root(r, ".ply-cache/memo").path;
+      if r.label == "cwd" { queried::command_kept[cwd](dir, project, key, whole(paths, project)) }
+      else { queried::command_kept[abs](dir, project, key, whole(paths, project)) }
+    },
+    _ -> { output: None, marks: [], tallies: [], lost: 0 },
+  }
+
+/// `output` kept under `key` as a command's answer over `project`, the load `program` made: in the
+/// memo store beside it, as a function of what the load asked. Whether the store holds it now.
+pub fn keep_command(
+  paths: List<paths::Resolved>,
+  project: Project,
+  key: Bytes,
+  program: Program,
+  output: Bytes,
+  marks: List<Bytes>,
+) -> Bool / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, abort.raise} =
+  match ((usable(project), paths.at(0))) {
+    (true, Some(r)) -> {
+      let dir = paths::in_root(r, ".ply-cache/memo").path;
+      let made = queried::program();
+      if r.label == "cwd" {
+        queried::keep_command[cwd](dir, project, key, made, program.asked, output, marks)
+      } else { queried::keep_command[abs](dir, project, key, made, program.asked, output, marks) }
+    },
+    _ -> false,
+  }
+
+/// What each of `asked`, modules of the load of `paths` that read `project`, documents, through the
+/// memo store beside the project: nothing where the walk refused it.
+pub fn documented(
+  paths: List<paths::Resolved>,
+  project: Project,
+  asked: List<Named>,
+) -> List<Pages> / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, abort.raise} =
+  match ((usable(project), paths.at(0))) {
+    (true, Some(r)) -> {
+      let dir = paths::in_root(r, ".ply-cache/memo").path;
+      if r.label == "cwd" { queried::documented[cwd](dir, project, asked, whole(paths, project)) }
+      else { queried::documented[abs](dir, project, asked, whole(paths, project)) }
+    },
+    _ -> [],
+  }
+
+/// [`answers_of`] answered afresh, with nothing kept.
+fn answers_afresh(
+  project: Project,
+  every: Bool,
+) -> Queried / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  if !usable(project) { queried::nothing() }
+  else { queried::answered_afresh(project, asked_shipped(every), every) }
+
+/// `interfaced` is false for a run whose scope takes in the shipped modules: it reads their source.
+/// `verify` holds each published interface to what this load reads of its package's source.
+pub fn load_program(
+  paths: List<paths::Resolved>,
+  interfaced: Bool = true,
+  verify: Bool = false,
+) -> Program / {shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
+  let project: Project = load_resolved(paths);
+  let answers = answers_of(paths, project, false);
+  let shipping = shipping_kept_of(answers.pulled, false, answers.wants);
+  let p: Program = verified(
+    project,
+    shipping,
+    verify,
+    assembled(project, shipping, paths, answers, reached: interfaced),
+  );
+  tell_viewed(p.viewed, true);
+  p
+}
+
+/// What a load of these paths would pin, beside the packages the walk read, with nothing parsed,
+/// checked or filed; or what refuses the walk or the package closure, beside the places a refusal is
+/// rendered against.
+pub fn pins_for(
+  paths: List<paths::Resolved>,
+) -> Result<{ pins: List<Pinned>, pkgs: PackageSources }, { diags: List<Diag>, places: List<Place> }> / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
+  let project: Project = load_resolved(paths);
+  if project.diags.len() > 0 { Err({ diags: project.diags, places: own_places(project) }) } else {
+    let pkgs = pkgs_of(project);
+    match pins_pulling(project.sources, pkgs, embeds_parsed(project).map(|e: Embed| e.embedded)) {
+      Ok(pins) -> Ok({ pins: pins, pkgs: pkgs }),
+      Err(diags) -> {
+        let own = placed_of(project);
+        Err({ diags: diags, places: own.modules.concat(own.manifests) })
+      },
+    }
+  }
+}
+
+/// What the load answered, for the machine to read rather than load again. The dump carries the
+/// load's warnings, the cache's among them, so a command the machine reports for says them too.
+/// `within` scopes it to what a run of tests enters.
+pub fn front_of(
+  timed: Timed,
+  view: View,
+  within: Option<Within> = None,
+) -> LoadedAnalysis / {abort.raise} = {
+  {
+    dump: view_dump({ ..view, frame: { ..view.frame, warnings: timed.program.diags } }, within),
+    files: placed_sources(timed.program, view.frame),
+    inputs: timed.program.inputs,
+    read_ms: timed.read_ms,
+    front_ms: timed.front_ms,
+    file_ms: timed.file_ms,
+    cached: timed.cached,
+  }
+}
+
+/// The front end a command's test hands an effect that takes one: these tests read what a report
+/// says about what they were given, so nothing loads, and the record exists only because the
+/// effect takes one.
+pub fn no_front() -> LoadedAnalysis / {abort.raise} =
+  {
+    dump: dump_of(Refused([])),
+    files: [],
+    inputs: Map::new(),
+    read_ms: 0,
+    front_ms: 0,
+    file_ms: 0,
+    cached: false,
+  }
+
+/// The same load, with the readings a `--explain` run prints: what the walk, the shipped modules and
+/// the cache read cost, what the front end cost over them, and what filing its answer cost.
+pub fn timed_load(
+  paths: List<paths::Resolved>,
+  interfaced: Bool = true,
+  verify: Bool = false,
+  every: Bool = false,
+) -> Timed / {shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
+  let started = time.elapsed_ms();
+  timed_over(paths, load_resolved(paths), started, interfaced, verify, every)
+}
+
+/// [`timed_load`] over a walk already made, with the clock as it read before the walk. `every`
+/// reads every module of the standard library, whole and from source, whatever the project imports:
+/// the load `--std` asks for.
+pub fn timed_over(
+  paths: List<paths::Resolved>,
+  project: Project,
+  started: Int,
+  interfaced: Bool = true,
+  verify: Bool = false,
+  every: Bool = false,
+) -> Timed / {shipped.answer, env.reused[sys], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[abs], entropy.next, time.now_ms, abort.raise, shipped.reached} = {
+  let interfaced = interfaced && !every;
+  let answers = answers_of(paths, project, every);
+  let shipping = shipping_kept_of(answers.pulled, every, answers.wants);
+  let read_done = time.elapsed_ms();
+  let p: Program = verified(
+    project,
+    shipping,
+    verify,
+    assembled(project, shipping, paths, answers, interfaced, every),
+  );
+  tell_viewed(p.viewed, true);
+  {
+    program: p,
+    read_ms: read_done - started,
+    front_ms: time.elapsed_ms() - read_done,
+    file_ms: 0,
+    cached: true,
+  }
+}
+
+/// [`timed_load`], answering every module afresh and keeping nothing.
+pub fn timed_uncached(
+  paths: List<paths::Resolved>,
+  verify: Bool = false,
+  every: Bool = false,
+) -> Timed / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, abort.raise, diverges, shipped.reached} = {
+  let started = time.elapsed_ms();
+  timed_uncached_over(paths, load_resolved(paths), started, verify, every)
+}
+
+/// [`timed_uncached`] over a walk already made, with the clock as it read before the walk.
+pub fn timed_uncached_over(
+  paths: List<paths::Resolved>,
+  project: Project,
+  started: Int,
+  verify: Bool = false,
+  every: Bool = false,
+) -> Timed / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, shipped.reached} = {
+  let answers = answers_afresh(project, every);
+  let shipping = shipping_of(answers.pulled, every);
+  let read_done = time.elapsed_ms();
+  let p: Program = verified(
+    project,
+    shipping,
+    verify,
+    assembled(project, shipping, paths, answers, reached: !every, std: every),
+  );
+  tell_viewed(p.viewed, true);
+  {
+    program: p,
+    read_ms: read_done - started,
+    front_ms: time.elapsed_ms() - read_done,
+    file_ms: 0,
+    cached: false,
+  }
+}
+
+/// Whether a walk read what an earlier load was made of, byte for byte, and every embed of it reads
+/// as it did: then that load's answer is this one's, and nothing need be derived again.
+pub fn unmoved(
+  project: Project,
+  program: Program,
+) -> Bool / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  project.diags.len() == 0 && project.files == program.files && pkgs_of(project) == program.pkgs
+    && !embeds_moved(program.embeds)
+
+// --- Reading the tables ----------------------------------------------------------
+
+pub fn modules_of(program: Program, frame: Frame) -> List<ModuleView> / {abort.raise} =
+  range(0, frame.outlines.len()).map(|i: Int|
+    {
+      name: String::of_bytes_lossy(frame.outlines.get(i).name),
+      path: match program.places.at(i) { Some(place) -> place.path, None -> "" },
+    })
+
+pub fn module_reports(program: Program, frame: Frame) -> List<ModuleReport> / {abort.raise} =
+  range(0, frame.outlines.len()).map(|i: Int| {
+    let o = frame.outlines.get(i);
+    {
+      index: i,
+      name: String::of_bytes_lossy(o.name),
+      path: match program.places.at(i) { Some(place) -> place.path, None -> "" },
+      imports: o.imports.map(String::of_bytes_lossy),
+      items: o.declared.map(String::of_bytes_lossy),
+    }
+  })
+
+/// The modules as the front end took them: the project's own files first, then the shipped modules
+/// it pulled, in the order the label indices count.
+pub fn sourced(program: Program, frame: Frame) -> List<Source> / {abort.raise} =
+  range(0, frame.outlines.len()).map(|i: Int|
+    {
+      name: frame.outlines.get(i).name,
+      src: match program.places.at(i) { Some(place) -> place.text, None -> b"" },
+    })
+
+/// What a run answers for: its root package's modules, and the standard library's when it asks for
+/// them. Another package's definitions are claimed by their specs: that package's own run proves
+/// them, as the compiler's own run proves the compiler's.
+pub fn owned_of(frame: Frame, std: Bool) -> (Bytes) -> Bool = {
+  let roots = frame.outlines.fold(
+    { i: 0, roots: Map::new() },
+    |acc: { i: Int, roots: Map<Bytes, Bool> }, o: Outline|
+      {
+        i: acc.i + 1,
+        roots: if frame.module_packages.at(acc.i) == Some(0) { acc.roots.insert(o.name, true) }
+        else { acc.roots },
+      },
+  ).roots;
+  |m: Bytes| roots.contains(m) || (std && is_std(String::of_bytes_lossy(m)))
+}
+
+/// A run reports its own modules' tests and laws, however its dependencies were read.
+pub fn own_tests(program: Program, view: View) -> List<TestInfo> =
+  view.checked.tests.filter(|test_info: TestInfo| test_info.at.module < program.files.len())
+
+pub fn own_laws(program: Program, view: View) -> List<LawInfo> =
+  view.checked.laws.filter(|law_info: LawInfo| law_info.at.module < program.files.len())
+
+/// The warnings of each module of the standard library `answers` holds past the project's own
+/// `root`, each at its place in the load.
+fn std_warnings(answers: List<Answered>, root: Int) -> List<Diag> =
+  range(root, answers.len()).fold([], |acc: List<Diag>, i: Int|
+    match answers.at(i) {
+      Some(a) -> if !is_std(String::of_bytes_lossy(a.module)) { acc } else {
+        acc.concat(
+          a.answer.warnings.map(|d: Diag|
+            { ..d, labels: d.labels.map(|l: Label| { ..l, module: i }) }),
+        )
+      },
+      None -> acc,
+    })
+
+pub fn place_of(program: Program, location: Location) -> Option<Place> =
+  if location.module == no_module() { None } else { program.places.at(location.module) }
+
+/// `path:line:col`, one-based, as every other command prints a place.
+pub fn location_of(program: Program, location: Location) -> Option<String> / {abort.raise} =
+  match place_of(program, location) {
+    None -> None,
+    Some(place) -> {
+      let spot = spot_of(place.text, location.span.start);
+      Some(place.path ++ ":" ++ spot.line.to_string() ++ ":" ++ spot.col.to_string())
+    },
+  }
+
+type Picking = { seen: Map<Bytes, Bool>, out: List<DefInfo> }
+
+fn pick(acc: Picking, by_name: Map<Bytes, DefInfo>, name: Bytes) -> Picking =
+  match acc.seen.get(name) {
+    Some(_) -> acc,
+    None -> match by_name.get(name) {
+      None -> acc,
+      Some(d) -> { seen: acc.seen.insert(name, true), out: acc.out.push(d) },
+    },
+  }
+
+fn module_fns(acc: List<Bytes>, o: Outline) -> List<Bytes> =
+  o.items.fold(acc, |a: List<Bytes>, it: Outlined|
+    match it { OFn(f) -> a.push(qualify(o.name, f.name)), _ -> a })
+
+/// Every definition in the order its file declares it, module by module, as `ply defs` lists them
+/// and as the driver's `published_order` orders them; anything the tree does not name follows.
+pub fn published(view: View) -> List<DefInfo> = {
+  let by_name = view.checked.defs.fold(Map::new(), |acc: Map<Bytes, DefInfo>, def_info: DefInfo|
+    acc.insert(def_info.name, def_info));
+  let named = view.frame.outlines.fold([], module_fns);
+  let first: Picking = named.fold({ seen: Map::new(), out: [] }, |acc: Picking, name: Bytes|
+    pick(acc, by_name, name));
+  let all: Picking = view.checked.defs.fold(first, |acc: Picking, def_info: DefInfo|
+    pick(acc, by_name, def_info.name));
+  all.out
+}
+
+// --- Naming one definition --------------------------------------------------------
+
+/// The definition a query names: a program-wide name, or a simple name that names exactly one.
+/// `Err` holds the program-wide names a simple name matched, and is empty when nothing matched.
+pub fn resolve_def(defs: List<DefInfo>, query: String) -> Result<DefInfo, List<String>> = {
+  let exact = defs.fold(None, |acc: Option<DefInfo>, d: DefInfo|
+    match acc {
+      Some(_) -> acc,
+      None -> if String::of_bytes_lossy(d.name) == query { Some(d) } else { None },
+    });
+  match exact {
+    Some(d) -> Ok(d),
+    None -> {
+      let matching = defs.filter(|d: DefInfo| String::of_bytes_lossy(d.simple_name) == query);
+      match matching.at(0) {
+        None -> Err([]),
+        Some(d) -> if matching.len() == 1 { Ok(d) }
+        else { Err(matching.map(|x: DefInfo| String::of_bytes_lossy(x.name))) },
+      }
+    },
+  }
+}
+
+/// What [`resolve_def`] refused, as a diagnostic: nothing of that name, or more than one.
+pub fn unknown_def(query: String, names: List<String>) -> Diag =
+  if names.len() == 0 {
+    error_at(
+      b"E0101",
+      no_module(),
+      dummy_span(),
+      Bytes::of_string("no definition is named `" ++ query ++ "`"),
+      b"not a definition of this program",
+      [
+        b"the query is a program-wide name such as `store.orders.place`, or a simple name unique in the program",
+      ],
+    )
+  } else {
+    error_at(
+      b"E0101",
+      no_module(),
+      dummy_span(),
+      Bytes::of_string("`" ++ query ++ "` names " ++ names.len().to_string() ++ " definitions"),
+      b"say which",
+      [Bytes::of_string("one of: " ++ String::join(names, ", "))],
+    )
+  }
+
+/// One more note under a diagnostic, counted as the constructor counts them.
+pub fn noted(diag: Diag, note: Bytes) -> Diag =
+  { ..diag, notes: diag.notes + 1, notes_text: diag.notes_text.push(note) }
+
+/// The hash tables the dump writes as lists, indexed once so a lookup is not a scan, and the
+/// hashing itself, which a closure is walked over when one is asked for.
+pub type Tables = {
+  defs: Map<Bytes, Bytes>,
+  own: Map<Bytes, Bytes>,
+  specs: Map<Bytes, Int>,
+  hashes: HashOutput,
+}
+
+pub fn tables_of(h: HashOutput) -> Tables =
+  {
+    defs: h.defs.fold(Map::new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
+      acc.insert(x.name, x.hash)),
+    own: h.own.fold(Map::new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
+      acc.insert(x.name, x.hash)),
+    specs: h.specs.fold(
+      Map::new(),
+      |acc: Map<Bytes, Int>, x: { name: Bytes, hashes: List<Bytes> }|
+        acc.insert(x.name, x.hashes.len()),
+    ),
+    hashes: h,
+  }
+
+/// A definition's hash as `ply hash` prints it: sixty-four hex characters, or nothing when the
+/// program declares the name without hashing a body for it.
+pub fn hash_of(tables: Tables, name: Bytes) -> Option<String> / {abort.raise} =
+  match tables.defs.get(name) { Some(h) -> Some(String::of_bytes_lossy(hex(h))), None -> None }
+
+pub fn own_of(tables: Tables, name: Bytes) -> Option<String> / {abort.raise} =
+  match tables.own.get(name) { Some(h) -> Some(String::of_bytes_lossy(hex(h))), None -> None }
+
+/// What a function, or a test or a law, names in its own text, each once, in the order first named.
+pub fn deps_of(tables: Tables, which: Which) -> List<String> / {abort.raise} =
+  forms::named_in(tables.hashes, which).fold([], |acc: List<Bytes>, r: NodeRef|
+    acc.push_unique(r.name)).map(|n: Bytes| String::of_bytes_lossy(n))
+
+/// Every name a function, or a test or a law, reaches, the function itself included, ascending.
+pub fn closure_of(tables: Tables, which: Which) -> List<String> / {abort.raise} = {
+  let reached = forms::reach(tables.hashes, [which]);
+  reached.fns.merge(reached.decls).keys().map(|n: Bytes| String::of_bytes_lossy(n))
+}
+
+/// Every function, test and law that reaches the function `name`, but the function itself.
+pub fn reached_from(tables: Tables, name: Bytes) -> List<Bytes> / {abort.raise} = {
+  let n = forms::naming(tables.hashes, TheFn(name), true);
+  n.fns.concat(n.items)
+}
+
+/// Every function, test and law whose own text names the function `name`.
+pub fn mentioning(tables: Tables, name: Bytes) -> List<Bytes> / {abort.raise} = {
+  let n = forms::naming(tables.hashes, TheFn(name), false);
+  n.fns.concat(n.items)
+}
+
+pub fn specs_of(tables: Tables, name: Bytes) -> Int =
+  match tables.specs.get(name) { Some(n) -> n, None -> 0 }
+
+pub fn short_of(hex_text: String) -> String / {abort.raise} = hex_text.slice(0, 12)
+
+pub fn is_shipped(module: String) -> Bool = is_std(module) || is_compiler(module)
+
+// --- Tests ------------------------------------------------------------------
+
+test "a shipped module's text is said to live under its root, outside the identifier space" {
+  assert_eq(pseudo_path("std.json"), "<std>/json.ply");
+  assert_eq(pseudo_path("std.http.server"), "<std>/http/server.ply");
+  assert_eq(pseudo_path("compiler.fmt"), "<compiler>/fmt.ply")
+}
+
+test "under `--std` a proof answers for the standard library's claims and never the compiler's" {
+  let w = match analyse_pulling_std_with(
+      [
+        {
+          name: b"m",
+          src: b"import std.y\nimport compiler.x\nfn own() -> Int = y::one() + x::one()\n",
+        },
+      ],
+      [
+        { name: b"std.y", src: b"pub fn one() -> Int = 1\n" },
+        { name: b"compiler.x", src: b"pub fn one() -> Int = 1\n" },
+      ],
+      no_rows(),
+      reached: false,
+    ).out {
+    Analysed(w) -> w,
+    Refused(_) -> panic("the fixture checks"),
+  };
+  let owned = owned_of(view_of(w).frame, true);
+  assert(owned(b"m") && owned(b"std.y") && !owned(b"compiler.x"));
+  assert(!owned_of(view_of(w).frame, false)(b"std.y"))
+}
+
+test "a shipped module is one under a reserved root and nothing else" {
+  assert(is_shipped("std"));
+  assert(is_shipped("std.json"));
+  assert(is_shipped("compiler.front"));
+  assert(!is_shipped("standard"));
+  assert(!is_shipped("m"))
+}
+
+fn named(name: Bytes, simple: Bytes) -> DefInfo =
+  {
+    name: name,
+    module: b"m",
+    simple_name: simple,
+    scheme: {
+      ty_vars: [],
+      row_vars: [],
+      label_vars: [],
+      ty: TyFn({
+        params: [],
+        ret: TyCon({ name: b"Int", args: [] }),
+        effects: { atoms: [], tail: None },
+      }),
+    },
+    footprint: [],
+    performed: [],
+    scaling: [],
+    repeats: [],
+    bounded: [],
+    tail_bounded: false,
+    ending: Ends,
+    summary: unknown_summary(),
+    raises: [],
+    row_aliases: [],
+    constraints: [],
+    spec: [],
+    at: { module: 0, span: dummy_span() },
+  }
+
+test "a query is a program-wide name, or a simple name that names exactly one definition" {
+  let defs = [named(b"a.total", b"total"), named(b"b.total", b"total"), named(b"a.one", b"one")];
+  assert_eq(match resolve_def(defs, "a.total") { Ok(d) -> d.name, Err(_) -> b"" }, b"a.total");
+  assert_eq(match resolve_def(defs, "one") { Ok(d) -> d.name, Err(_) -> b"" }, b"a.one");
+  assert_eq(match resolve_def(defs, "total") { Ok(_) -> [], Err(ns) -> ns }, [
+    "a.total",
+    "b.total",
+  ]);
+  assert_eq(match resolve_def(defs, "absent") { Ok(_) -> ["found"], Err(ns) -> ns }, [])
+}
+
+test "a name nothing declares is `E0101`, and an ambiguous one says which" {
+  assert_eq(unknown_def("absent", []).code, b"E0101");
+  assert_eq(unknown_def("absent", []).message, b"no definition is named `absent`");
+  let many = unknown_def("total", ["a.total", "b.total"]);
+  assert_eq(many.message, b"`total` names 2 definitions");
+  assert_eq(many.notes_text, [b"one of: a.total, b.total"]);
+  assert_eq(noted(many, b"and one more").notes, 2)
+}
+
+test "a span outside every module has no place and no location" {
+  let p: Program = { ..no_program(), places: [{ path: "m.ply", text: b"fn f() -> Int = 1\n" }] };
+  assert_eq(location_of(p, { module: no_module(), span: dummy_span() }), None);
+  assert_eq(location_of(p, { module: 0, span: span_between(3, 4) }), Some("m.ply:1:4"))
+}

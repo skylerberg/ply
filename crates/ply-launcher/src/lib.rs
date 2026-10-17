@@ -5,8 +5,8 @@
 //! big-stack thread, the program's front end read from the pack, the `cwd` and `shipped` roots, the
 //! process and environment bindings, and the exit code.
 
-use ply_eval::{Analysis, Diagnostic, Ended, codes};
-use ply_machine::enter::{self, Binds};
+use ply_core::{Analysis, Diagnostic, Ended, codes};
+use ply_privileged::enter::{self, Binds};
 use std::path::{Path, PathBuf};
 
 /// Where the pack carries what the linked program's front end answered of the definition it
@@ -32,9 +32,9 @@ pub fn linked_program(version: &str) -> Result<Program, Diagnostic> {
     let (Some(bytes), Some(digest)) = (pack.bytes(FRONT), pack.digest_of(FRONT)) else {
         return Err(unlinked(format!("its pack carries no `{FRONT}`")));
     };
-    let value = ply_eval::codec::decode(bytes)
+    let value = ply_core::codec::decode(bytes)
         .map_err(|why| unlinked(format!("`{FRONT}` does not decode: {why}")))?;
-    let linked = ply_codegen::c::dump::linked(&value).map_err(|why| unlinked(why.to_string()))?;
+    let linked = ply_compiled::c::dump::linked(&value).map_err(|why| unlinked(why.to_string()))?;
     let stage: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     Ok(Program {
         entry: linked.entry.to_string(),
@@ -52,7 +52,7 @@ fn unlinked(why: String) -> Diagnostic {
         format!("this executable's program cannot be entered: {why}"),
     )
     .primary(
-        ply_eval::Span::DUMMY,
+        ply_core::Span::DUMMY,
         "this is Ply's fault, not the program's",
     )
 }
@@ -100,7 +100,7 @@ pub fn executables() -> ply_host::process::Executables {
             .find(|program| program.is_file())
     });
     if let Some(git) = git {
-        let _ = executables.bind("git", &git, ply_eval::Span::DUMMY);
+        let _ = executables.bind("git", &git, ply_core::Span::DUMMY);
     }
     executables
 }
@@ -128,7 +128,7 @@ pub fn stamps() -> String {
     };
     format!(
         "evaluator {}\nruntime {}\n",
-        stamp(&["ply.stamp.evaluator.1", ply_codegen::c::semantics_digest()]),
+        stamp(&["ply.stamp.evaluator.1", ply_compiled::c::semantics_digest()]),
         stamp(&["ply.stamp.runtime.4", RUNTIME_SOURCES])
     )
 }
@@ -152,13 +152,13 @@ pub fn shipped_dir_name(stamps: &str, definitions: &str, files: &ply_pack::Diges
 /// no file of the pack for it.
 pub fn shipped_modules(stage: &str, definitions: &str) -> Result<PathBuf, Diagnostic> {
     let stamps = stamps();
-    let dir = ply_codegen::c::stage::stage_dir(stage).join(shipped_dir_name(
+    let dir = ply_compiled::c::stage::stage_dir(stage).join(shipped_dir_name(
         &stamps,
         definitions,
-        &ply_machine::shipped_modules::digest(),
+        &ply_privileged::shipped_modules::digest(),
     ));
     if dir.join(SHIPPED_MARKER).exists() {
-        ply_codegen::c::sweep::used(&ply_codegen::c::stage::stage_dir(stage));
+        ply_compiled::c::sweep::used(&ply_compiled::c::stage::stage_dir(stage));
         return Ok(dir);
     }
     lay_out(&dir, &stamps, definitions).map_err(|e| {
@@ -170,7 +170,7 @@ pub fn shipped_modules(stage: &str, definitions: &str) -> Result<PathBuf, Diagno
             ),
         )
         .primary(
-            ply_eval::Span::DUMMY,
+            ply_core::Span::DUMMY,
             "this is Ply's fault, not the program's",
         )
     })?;
@@ -178,8 +178,8 @@ pub fn shipped_modules(stage: &str, definitions: &str) -> Result<PathBuf, Diagno
 }
 
 fn lay_out(dir: &Path, stamps: &str, definitions: &str) -> std::io::Result<()> {
-    use ply_eval::files::write_atomically;
-    use ply_machine::shipped_modules;
+    use ply_core::files::write_atomically;
+    use ply_privileged::shipped_modules;
     std::fs::create_dir_all(dir)?;
     for (name, text) in shipped_modules::sources() {
         write_atomically(&dir.join(format!("{name}.ply")), text.as_bytes())?;
@@ -208,8 +208,8 @@ fn reporting() -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
     recorder.ran_program();
     let write: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let binary = ply_host::observe::Binary {
-            shipped: &ply_machine::shipped::module_digest,
-            program: ply_machine::shipped::program_digest(),
+            shipped: &ply_privileged::shipped::module_digest,
+            program: ply_privileged::shipped::program_digest(),
         };
         let _ = std::fs::write(&file, ply_host::observe::report(&recorder, &binary));
     });
@@ -228,16 +228,16 @@ pub fn run(
     mut binds: Binds,
     count: Option<crate::count::Asked>,
 ) -> Ended<i32> {
-    ply_codegen::c::sweep::once();
+    ply_compiled::c::sweep::once();
     let definitions = program.definitions;
     let shipped = match shipped_modules(&program.stage, &definitions) {
         Ok(shipped) => shipped,
         Err(refused) => return Ended::refused(refused),
     };
-    ply_host::observe::laid_out(&shipped, ply_codegen::c::kept_dirs());
+    ply_host::observe::laid_out(&shipped, ply_compiled::c::kept_dirs());
     let reporting = reporting();
-    ply_machine::shipped::stamp(stamps());
-    ply_machine::shipped::entered(&program.entry, definitions);
+    ply_privileged::shipped::stamp(stamps());
+    ply_privileged::shipped::entered(&program.entry, definitions);
     let version = program.version.clone();
     let opened = enter::opened_linked(program.front, &program.entry);
     let mut roots = vec![
@@ -264,12 +264,12 @@ pub fn run(
     // end's recursion wants.
     let work = std::thread::Builder::new()
         .name("ply".to_string())
-        .stack_size(ply_codegen::rt::PROGRAM_STACK)
+        .stack_size(ply_compiled::rt::PROGRAM_STACK)
         .spawn(move || {
             match count {
                 Some(asked) => {
                     let (answer, counted, sites) = crate::count::window_sampled(
-                        || ply_codegen::rt::unbounded(|| enter::enter_linked(opened, argv, binds)),
+                        || ply_compiled::rt::unbounded(|| enter::enter_linked(opened, argv, binds)),
                         asked.every(),
                     );
                     // The entry's answer stands: the run happened, and a count that could not
@@ -283,7 +283,7 @@ pub fn run(
                     }
                     answer
                 }
-                None => ply_codegen::rt::unbounded(|| enter::enter_linked(opened, argv, binds)),
+                None => ply_compiled::rt::unbounded(|| enter::enter_linked(opened, argv, binds)),
             }
         });
     match work {
@@ -301,7 +301,7 @@ pub fn run(
                 codes::INTERNAL_ERROR,
                 format!("the program could not be started on a thread of its own: {e}"),
             )
-            .primary(ply_eval::Span::DUMMY, "this is Ply's fault"),
+            .primary(ply_core::Span::DUMMY, "this is Ply's fault"),
         ),
     }
 }

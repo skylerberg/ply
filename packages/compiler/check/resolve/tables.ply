@@ -1,0 +1,437 @@
+//! What resolution keeps: the module index, the declaration tables, diagnostics and module names.
+
+import syntax.parsing (Span, Ident, span_to)
+import syntax.items (Module, Item, IFn, IExtern, IType, IEffect, IEffectSet, TDSum, TDAlias,
+                     VariantDef, Vis, VPriv, ImportDecl, IModule, IAlias, INames, Derived, is_pub,
+                     TDNominal, TDExtern, is_builtin)
+import syntax.exprs (Expr)
+import std.list
+import std.bin
+import check.types (last_dot)
+
+// --- The tables ---------------------------------------------------------------
+
+pub type Source = { name: Bytes, src: Bytes }
+
+/// `derived` is what `derive.ply`'s expansion generated into `module`, for the checker.
+pub type ParsedModule = { name: Bytes, module: Module, derived: List<Derived> }
+
+pub type Namespace = | ValueSpace | TypeSpace | EffectSpace | SetSpace
+
+pub type Declared = { name: Bytes, qualified: Bytes, public: Bool, span: Span }
+
+/// The lists keep insertion order, which the dump encodes; the maps answer lookups. A name's first entry wins in both.
+pub type Decls = {
+  values: List<Declared>,
+  types: List<Declared>,
+  effects: List<Declared>,
+  sets: List<Declared>,
+  by_value: Map<Bytes, Declared>,
+  by_type: Map<Bytes, Declared>,
+  by_effect: Map<Bytes, Declared>,
+  by_set: Map<Bytes, Declared>,
+}
+
+pub type Binding = { name: Bytes, qualified: Bytes, owner: Int, span: Span }
+
+pub type Bindings = {
+  values: List<Binding>,
+  types: List<Binding>,
+  effects: List<Binding>,
+  sets: List<Binding>,
+  by_value: Map<Bytes, Binding>,
+  by_type: Map<Bytes, Binding>,
+  by_effect: Map<Bytes, Binding>,
+  by_set: Map<Bytes, Binding>,
+}
+
+pub type ModuleBinding = { binder: Bytes, target: Int, span: Span }
+
+pub type Scope = {
+  module: Bytes,
+  modules: List<ModuleBinding>,
+  selective: List<ModuleBinding>,
+  bound: Bindings,
+}
+
+pub type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+
+/// One replacement a fix makes: `text` in place of the span; an empty span inserts, empty text deletes.
+pub type Edit = { module: Int, start: Int, end: Int, text: Bytes }
+
+/// A change that applies as it is and leaves a program the diagnostic no longer holds for.
+pub type Fix = { title: Bytes, edits: List<Edit> }
+
+/// `notes` is always `notes_text.len()`; `text` is the checker's dedup key for the two mismatch printers.
+pub type Diag = {
+  code: Bytes,
+  notes: Int,
+  labels: List<Label>,
+  text: Bytes,
+  message: Bytes,
+  notes_text: List<Bytes>,
+  severity: Bytes,
+  fixes: List<Fix>,
+}
+
+derive bin for Source
+
+derive bin for Label
+
+derive bin for Edit
+
+derive bin for Fix
+
+derive bin for Diag
+
+pub type Edge = { from: Int, target: Int, span: Span }
+
+pub type ModuleEntry = { name: Bytes, at: Int }
+
+pub type Resolved = {
+  names: List<ModuleEntry>,
+  scopes: List<Scope>,
+  declarations: List<Decls>,
+  declared: List<Bindings>,
+  order: List<Int>,
+  /// Each module's imports, one target module index per declaration, in source order: a
+  /// dependency's sibling import and two selective imports sharing a binder both name exactly.
+  imports: List<List<Int>>,
+  /// Each function's parameters as a call fills them, by its qualified name.
+  signatures: Map<Bytes, Parameters>,
+  /// The modules each module can see: itself, and each it imports, directly or through others.
+  /// A function of a type one of them declares is what a call on a value in it may call.
+  sees: List<List<Int>>,
+}
+
+pub fn no_decls() -> Decls =
+  {
+    values: [],
+    types: [],
+    effects: [],
+    sets: [],
+    by_value: Map::new(),
+    by_type: Map::new(),
+    by_effect: Map::new(),
+    by_set: Map::new(),
+  }
+
+fn no_bindings() -> Bindings =
+  {
+    values: [],
+    types: [],
+    effects: [],
+    sets: [],
+    by_value: Map::new(),
+    by_type: Map::new(),
+    by_effect: Map::new(),
+    by_set: Map::new(),
+  }
+
+pub fn namespaces() -> List<Namespace> = [ValueSpace, TypeSpace, EffectSpace, SetSpace]
+
+pub fn space(decls: Decls, namespace: Namespace) -> List<Declared> =
+  match namespace {
+    ValueSpace -> decls.values,
+    TypeSpace -> decls.types,
+    EffectSpace -> decls.effects,
+    SetSpace -> decls.sets,
+  }
+
+fn first_declared(m: Map<Bytes, Declared>, declared: Declared) -> Map<Bytes, Declared> =
+  if m.contains(declared.name) { m } else { m.insert(declared.name, declared) }
+
+fn first_binding(m: Map<Bytes, Binding>, binding: Binding) -> Map<Bytes, Binding> =
+  if m.contains(binding.name) { m } else { m.insert(binding.name, binding) }
+
+pub fn push_declared(decls: Decls, namespace: Namespace, declared: Declared) -> Decls =
+  match namespace {
+    ValueSpace ->
+      {
+        ..decls,
+        values: decls.values.push(declared),
+        by_value: first_declared(decls.by_value, declared),
+      },
+    TypeSpace ->
+      {
+        ..decls,
+        types: decls.types.push(declared),
+        by_type: first_declared(decls.by_type, declared),
+      },
+    EffectSpace ->
+      {
+        ..decls,
+        effects: decls.effects.push(declared),
+        by_effect: first_declared(decls.by_effect, declared),
+      },
+    SetSpace ->
+      { ..decls, sets: decls.sets.push(declared), by_set: first_declared(decls.by_set, declared) },
+  }
+
+pub fn lookup_declared(decls: Decls, namespace: Namespace, name: Bytes) -> Option<Declared> =
+  Map::get(
+    match namespace {
+      ValueSpace -> decls.by_value,
+      TypeSpace -> decls.by_type,
+      EffectSpace -> decls.by_effect,
+      SetSpace -> decls.by_set,
+    },
+    name,
+  )
+
+fn with_space_bindings(b: Bindings, namespace: Namespace, xs: List<Binding>) -> Bindings = {
+  let by = xs.fold(Map::new(), |m: Map<Bytes, Binding>, binding: Binding|
+    first_binding(m, binding));
+  match namespace {
+    ValueSpace -> { ..b, values: xs, by_value: by },
+    TypeSpace -> { ..b, types: xs, by_type: by },
+    EffectSpace -> { ..b, effects: xs, by_effect: by },
+    SetSpace -> { ..b, sets: xs, by_set: by },
+  }
+}
+
+pub fn push_binding(bindings: Bindings, namespace: Namespace, binding: Binding) -> Bindings =
+  match namespace {
+    ValueSpace ->
+      {
+        ..bindings,
+        values: bindings.values.push(binding),
+        by_value: first_binding(bindings.by_value, binding),
+      },
+    TypeSpace ->
+      {
+        ..bindings,
+        types: bindings.types.push(binding),
+        by_type: first_binding(bindings.by_type, binding),
+      },
+    EffectSpace ->
+      {
+        ..bindings,
+        effects: bindings.effects.push(binding),
+        by_effect: first_binding(bindings.by_effect, binding),
+      },
+    SetSpace ->
+      {
+        ..bindings,
+        sets: bindings.sets.push(binding),
+        by_set: first_binding(bindings.by_set, binding),
+      },
+  }
+
+pub fn lookup(bindings: Bindings, namespace: Namespace, name: Bytes) -> Option<Binding> =
+  Map::get(
+    match namespace {
+      ValueSpace -> bindings.by_value,
+      TypeSpace -> bindings.by_type,
+      EffectSpace -> bindings.by_effect,
+      SetSpace -> bindings.by_set,
+    },
+    name,
+  )
+
+pub fn find_module_binding(bindings: List<ModuleBinding>, binder: Bytes) -> Option<ModuleBinding> =
+  bindings.fold(None, |acc: Option<ModuleBinding>, binding: ModuleBinding|
+    match acc {
+      Some(_) -> acc,
+      None -> if binding.binder == binder { Some(binding) } else { None },
+    })
+
+pub fn position(xs: List<Int>, v: Int) -> Option<Int> / {abort.raise} =
+  range(0, xs.len()).fold(None, |acc: Option<Int>, i: Int|
+    match acc { Some(_) -> acc, None -> if xs.get(i) == v { Some(i) } else { None } })
+
+// --- Module names ---------------------------------------------------------------
+
+/// The last dotted segment.
+pub fn default_binder(name: Bytes) -> Bytes / {abort.raise} =
+  name.slice(last_dot(name) + 1, name.len())
+
+/// An anonymous module qualifies nothing.
+pub fn qualify(module: Bytes, name: Bytes) -> Bytes =
+  if module.len() == 0 { name } else { Bytes::concat_all([module, b".", name]) }
+
+pub fn import_module_name(decl: ImportDecl) -> Bytes / {abort.raise} =
+  range(0, decl.path.len()).fold(b"", |acc: Bytes, i: Int|
+    if i == 0 { decl.path.get(i).name }
+    else { Bytes::concat_all([acc, b".", decl.path.get(i).name]) })
+
+pub fn path_span(decl: ImportDecl) -> Span / {abort.raise} =
+  if decl.path.len() == 0 { decl.span }
+  else { span_to(decl.path.get(0).span, decl.path.get(decl.path.len() - 1).span) }
+
+pub fn import_binder(decl: ImportDecl) -> Option<Bytes> / {abort.raise} =
+  match decl.kind {
+    IModule -> if decl.path.len() == 0 { None }
+    else { Some(decl.path.get(decl.path.len() - 1).name) },
+    IAlias(a) -> Some(a.name),
+    INames(_) -> None,
+  }
+
+pub fn binder_span(decl: ImportDecl) -> Span / {abort.raise} =
+  match decl.kind {
+    IModule -> if decl.path.len() == 0 { decl.span }
+    else { decl.path.get(decl.path.len() - 1).span },
+    IAlias(a) -> a.span,
+    INames(_) -> decl.span,
+  }
+
+// --- Diagnostics ---------------------------------------------------------------
+
+pub fn label_at(m: Int, span: Span, primary: Bool, text: Bytes) -> Label =
+  { module: m, start: span.start, end: span.end, primary: primary, text: text }
+
+pub fn error_with_labels(
+  code: Bytes,
+  message: Bytes,
+  labels: List<Label>,
+  notes: List<Bytes>,
+) -> Diag =
+  {
+    code: code,
+    notes: notes.len(),
+    labels: labels,
+    text: b"",
+    message: message,
+    notes_text: notes,
+    severity: b"error",
+    fixes: [],
+  }
+
+pub fn with_fix(diag: Diag, title: Bytes, edits: List<Edit>) -> Diag =
+  { ..diag, fixes: diag.fixes.push({ title: title, edits: edits }) }
+
+pub fn insertion(m: Int, at: Int, text: Bytes) -> Edit =
+  { module: m, start: at, end: at, text: text }
+
+pub fn error_at(
+  code: Bytes,
+  m: Int,
+  span: Span,
+  message: Bytes,
+  label: Bytes,
+  notes: List<Bytes>,
+) -> Diag = error_with_labels(code, message, [label_at(m, span, true, label)], notes)
+
+pub fn error_at_and(
+  code: Bytes,
+  m: Int,
+  span: Span,
+  message: Bytes,
+  label: Bytes,
+  m2: Int,
+  also: Span,
+  also_text: Bytes,
+  notes: List<Bytes>,
+) -> Diag =
+  error_with_labels(
+    code,
+    message,
+    [label_at(m, span, true, label), label_at(m2, also, false, also_text)],
+    notes,
+  )
+
+pub fn backticked(xs: List<Bytes>, sep: Bytes) -> Bytes / {abort.raise} =
+  range(0, xs.len()).fold(b"", |acc: Bytes, i: Int| {
+    let x = Bytes::concat_all([b"`", xs.get(i), b"`"]);
+    if i == 0 { x } else { Bytes::concat_all([acc, sep, x]) }
+  })
+
+/// "nothing", "`a`", "`a` and `b`", "`a`, `b` and `c`".
+pub fn list_names(xs: List<Bytes>) -> Bytes / {abort.raise} =
+  if xs.len() == 0 { b"nothing" } else {
+    range(0, xs.len()).fold(b"", |acc: Bytes, i: Int| {
+      let x = Bytes::concat_all([b"`", xs.get(i), b"`"]);
+      if i == 0 { x }
+      else { Bytes::concat_all([acc, if i + 1 == xs.len() { b" and " } else { b", " }, x]) }
+    })
+  }
+
+pub fn describe_namespace(namespace: Namespace) -> Bytes =
+  match namespace {
+    ValueSpace -> b"definition",
+    TypeSpace -> b"type",
+    EffectSpace -> b"effect",
+    SetSpace -> b"effect set",
+  }
+
+pub fn namespace_keyword(namespace: Namespace) -> Bytes =
+  match namespace {
+    ValueSpace -> b"fn",
+    TypeSpace -> b"type",
+    EffectSpace -> b"effect",
+    SetSpace -> b"effect set",
+  }
+
+pub fn exported_names(decls: Decls) -> List<Bytes> =
+  namespaces().fold([], |acc: List<Bytes>, namespace: Namespace|
+    space(decls, namespace).fold(acc, |a: List<Bytes>, declared: Declared|
+      if declared.public { a.push(declared.name) } else { a }))
+
+// --- Declarations ---------------------------------------------------------------
+
+/// Every name an item declares; the first declaration wins. A builtin declares none: every module
+/// reads one by its own name.
+pub fn declarations_of(parsed: ParsedModule) -> Decls =
+  parsed.module.items.fold(no_decls(), |decls: Decls, item: Item|
+    match item {
+      IFn(f) -> declare(decls, ValueSpace, parsed.name, f.name, f.vis),
+      IExtern(f) -> if is_builtin(parsed.name, parsed.module, f) { decls }
+      else { declare(decls, ValueSpace, parsed.name, f.name, f.vis) },
+      IEffect(e) -> declare(decls, EffectSpace, parsed.name, e.name, e.vis),
+      IEffectSet(e) -> declare(decls, SetSpace, parsed.name, e.name, e.vis),
+      IType(t) -> {
+        let d2 = declare(decls, TypeSpace, parsed.name, t.name, t.vis);
+        match t.body {
+          // A constructor is as public as its type, unless the type is `opaque`: its module keeps them.
+          TDSum(vs) ->
+            vs.fold(d2, |acc: Decls, variant: VariantDef|
+              declare(acc, ValueSpace, parsed.name, variant.name, match t.opaque {
+                Some(_) -> VPriv,
+                None -> t.vis,
+              })),
+          TDAlias(_) -> d2,
+          TDNominal(_) -> d2,
+          TDExtern -> d2,
+        }
+      },
+      // None declares a name a reference could reach.
+      _ -> decls,
+    })
+
+fn declare(decls: Decls, namespace: Namespace, module: Bytes, name: Ident, vis: Vis) -> Decls =
+  match lookup_declared(decls, namespace, name.name) {
+    Some(_) -> decls,
+    None ->
+      push_declared(decls, namespace, {
+        name: name.name,
+        qualified: qualify(module, name.name),
+        public: is_pub(vis),
+        span: name.span,
+      }),
+  }
+
+pub fn bindings_of(owner: Int, decls: Decls) -> Bindings =
+  namespaces().fold(no_bindings(), |bindings: Bindings, namespace: Namespace|
+    with_space_bindings(
+      bindings,
+      namespace,
+      space(decls, namespace).map(|declared: Declared|
+        { name: declared.name, qualified: declared.qualified, owner: owner, span: declared.span }),
+    ))
+
+// --- Defaults: the signatures ---------------------------------------------------------------
+
+/// A parameter as a call fills it: the default a call that leaves it out copies, each name in it
+/// written through a binder of its module, and the modules those are.
+pub type ParamInfo = { name: Bytes, default: Option<Expr>, imports: List<ModuleBinding> }
+
+pub type Parameters = { name: Bytes, params: List<ParamInfo> }
+
+// --- Tests ------------------------------------------------------------------
+
+test "a module name qualifies its declarations and binds its last segment" {
+  assert_eq(default_binder(b"std.db"), b"db");
+  assert_eq(default_binder(b"app"), b"app");
+  assert_eq(qualify(b"store.orders", b"place"), b"store.orders.place");
+  assert_eq(qualify(b"", b"place"), b"place")
+}

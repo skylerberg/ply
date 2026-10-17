@@ -10,8 +10,8 @@ pub use sink::{
 };
 pub use spans::{Owner, Spans};
 
-use ply_eval::host::MachineId;
-use ply_eval::{
+use ply_core::host::MachineId;
+use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity, Resource, Span, Symbol, TaskId, codes,
 };
@@ -248,7 +248,7 @@ impl Operation {
         name_at: usize,
     ) -> Result<HostAnswer, Diagnostic> {
         if !self.trace.sink.wants(level) {
-            return Ok(HostAnswer::Value(ply_eval::Value::Unit));
+            return Ok(HostAnswer::Value(ply_core::Value::Unit));
         }
         let span = req.span;
         let name = req.args[name_at].as_str(span, "a record's name")?;
@@ -274,7 +274,7 @@ impl Operation {
             value,
             fields: &fields,
         });
-        Ok(HostAnswer::Value(ply_eval::Value::Unit))
+        Ok(HostAnswer::Value(ply_core::Value::Unit))
     }
 
     fn enter(
@@ -287,7 +287,7 @@ impl Operation {
         let wanted = self.trace.sink.wants(Level::Info);
         // Shares the argument's `Arc<str>`, so keeping the name is free even under `--trace off`.
         let name = match &req.args[0] {
-            ply_eval::Value::Str(s) => Arc::clone(s),
+            ply_core::Value::Str(s) => Arc::clone(s),
             other => return Err(value_error(span, "a span's name", other)),
         };
         let started = wanted.then(|| self.trace.clock.micros());
@@ -330,7 +330,7 @@ impl Operation {
         for closing in &closings {
             self.trace.emit_close(closing);
         }
-        Ok(HostAnswer::Value(ply_eval::Value::Unit))
+        Ok(HostAnswer::Value(ply_core::Value::Unit))
     }
 
     fn enclosing(&self, owner: Owner) -> (i64, i64) {
@@ -341,11 +341,11 @@ impl Operation {
 pub(crate) static ID: std::sync::LazyLock<Symbol> = std::sync::LazyLock::new(|| Symbol::new("id"));
 static CHANNEL: std::sync::LazyLock<Symbol> = std::sync::LazyLock::new(|| Symbol::new("channel"));
 
-fn span_value(id: i64, channel: &Resource) -> ply_eval::Value {
+fn span_value(id: i64, channel: &Resource) -> ply_core::Value {
     let mut fields = BTreeMap::new();
-    fields.insert(ID.clone(), ply_eval::Value::Int(id));
-    fields.insert(CHANNEL.clone(), ply_eval::Value::str(spans::label(channel)));
-    ply_eval::Value::Record(Arc::new(fields.into_iter().collect()))
+    fields.insert(ID.clone(), ply_core::Value::Int(id));
+    fields.insert(CHANNEL.clone(), ply_core::Value::str(spans::label(channel)));
+    ply_core::Value::Record(Arc::new(fields.into_iter().collect()))
 }
 
 /// Poison is ignored: a panic cannot break "innermost last", since a push is one `Vec::push`.
@@ -368,7 +368,7 @@ fn arity(op: Op, got: usize, span: Span) -> Diagnostic {
 }
 
 #[cold]
-fn value_error(span: Span, what: &str, got: &ply_eval::Value) -> Diagnostic {
+fn value_error(span: Span, what: &str, got: &ply_core::Value) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!("{what} expects String, but got {}", got.type_name()),

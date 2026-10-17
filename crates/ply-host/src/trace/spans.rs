@@ -1,8 +1,8 @@
 //! Which spans each performer has open, and what closes one.
 
 use super::Outcome;
-use ply_eval::host::MachineId;
-use ply_eval::{Diagnostic, Resource, Span, TaskId, codes};
+use ply_core::host::MachineId;
+use ply_core::{Diagnostic, Resource, Span, TaskId, codes};
 use std::collections::BTreeMap;
 
 pub type Owner = (MachineId, Option<TaskId>);

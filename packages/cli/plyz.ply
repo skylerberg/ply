@@ -1,0 +1,192 @@
+//! A library's `.plyz`, section by section: every module's source framed `module <name> <length>`
+//! and its bytes, the package's `ply.pkg` text, and the compiled unit. The container around them is
+//! `compiler.store.plyx`'s; `ply build` writes these sections and `ply resolve` reads them back.
+
+import deployed (Compiled)
+import sources (File)
+import compiler.front.rows (module_of)
+import compiler.store.plyx (Placed, Section, decode_library, digest_of, library_domain)
+import std.bytes
+import std.list
+import std.string
+import deployed
+
+/// One module's source, framed as `module <name> <length>` and its bytes.
+pub fn source_frame(file: File) -> Bytes =
+  Bytes::concat_all([
+    b"module ",
+    Bytes::of_string(file.module),
+    b" ",
+    Bytes::of_string(file.text.len().to_string()),
+    b"\n",
+    file.text,
+  ])
+
+pub fn sections(files: List<File>, manifest: Bytes, unit: Compiled) -> List<Section> =
+  [
+    { name: b"sources", count: files.len(), payload: Bytes::concat_all(files.map(source_frame)) },
+    { name: b"manifest", count: 1, payload: manifest },
+    { name: b"unit", count: unit.count, payload: unit.payload },
+  ]
+
+// --- Reading ------------------------------------------------------------------
+
+pub type Module = { name: String, path: String, text: Bytes }
+
+/// An archive as a consumer takes it: the digest its bytes seal, the `ply.pkg` text, and each
+/// module with the path it is written back to under the package's directory.
+pub type Unpacked = { digest: Bytes, manifest: Bytes, modules: List<Module> }
+
+/// What an archive holds, or why it holds nothing a consumer may use: a container that is not a
+/// library, a digest field its bytes do not seal, or a section that does not read.
+pub fn unpacked(b: Bytes) -> Result<Unpacked, String> / {abort.raise} =
+  match decode_library(b) {
+    Err(r) -> Err(String::of_bytes_lossy(r.message)),
+    Ok(x) -> match digest_of(library_domain(), b) {
+      None -> Err("the archive is too short to be sealed"),
+      Some(d) -> if d != x.digest {
+        Err("the archive's digest field is not the digest of its bytes")
+      } else {
+        match placed(x.sections, b"manifest") {
+          None -> Err("the archive holds no manifest"),
+          Some(m) -> match placed(x.sections, b"sources") {
+            None -> Err("the archive holds no sources"),
+            Some(s) -> match frames(deployed::payload(b, s), s.count, 0, [], s.count + 1) {
+              Err(why) -> Err(why),
+              Ok(modules) -> Ok({ digest: d, manifest: deployed::payload(b, m), modules: modules }),
+            },
+          },
+        }
+      },
+    },
+  }
+
+fn placed(sections: List<Placed>, name: Bytes) -> Option<Placed> =
+  sections.fold(None, |found: Option<Placed>, p: Placed|
+    match found { Some(_) -> found, None -> if p.name == name { Some(p) } else { None } })
+
+/// `left` bounds the rounds: each adds a module, and `count` are wanted.
+fn frames(
+  src: Bytes,
+  count: Int,
+  at: Int,
+  out: List<Module>,
+  left: Int,
+) -> Result<List<Module>, String> / {abort.raise} =
+  if left <= 0 { panic("more frames than asked for") } else {
+    if out.len() == count {
+      if at == src.len() { Ok(out) }
+      else { Err("the sources section runs on past its last module") }
+    } else {
+      match frame_at(src, at) {
+        Err(why) -> Err(why),
+        Ok(f) -> frames(src, count, f.next, out.push(f.module), left - 1),
+      }
+    }
+  }
+
+fn frame_at(src: Bytes, at: Int) -> Result<{ module: Module, next: Int }, String> / {abort.raise} =
+  if !src.slice(at, src.len()).starts_with(b"module ") {
+    Err("a module in the sources section is not framed `module <name> <length>`")
+  } else {
+    match src.index_of_from(b"\n", at) {
+      None -> Err("a module's frame in the sources section never ends"),
+      Some(nl) -> {
+        let head = String::of_bytes_lossy(src.slice(at + 7, nl));
+        match head.split(" ") {
+          [name, size] -> match length_of(size) {
+            None -> Err("the module `" ++ name ++ "` is framed with no length"),
+            Some(n) -> if nl + 1 + n > src.len() {
+              Err("the module `" ++ name ++ "` runs past the end of the sources section")
+            } else {
+              match path_of(name) {
+                Err(why) -> Err(why),
+                Ok(path) ->
+                  Ok({
+                    module: { name: name, path: path, text: src.slice(nl + 1, nl + 1 + n) },
+                    next: nl + 1 + n,
+                  }),
+              }
+            },
+          },
+          _ -> Err("a module in the sources section is not framed `module <name> <length>`"),
+        }
+      },
+    }
+  }
+
+/// A module's name is the path it is written back to, and only a name `module_of` would give a file
+/// is one: a hostile archive cannot name its way out of the package's directory.
+fn path_of(name: String) -> Result<String, String> / {abort.raise} = {
+  let path = slashed(name) ++ ".ply";
+  match module_of(path) {
+    Ok(back) -> if back == name { Ok(path) }
+    else { Err("`" ++ name ++ "` is not a module name a package can hold") },
+    Err(why) -> Err("`" ++ name ++ "` is not a module name a package can hold: " ++ why),
+  }
+}
+
+fn slashed(name: String) -> String =
+  name.split(".").fold("", |acc: String, part: String|
+    if acc == "" { part } else { acc ++ "/" ++ part })
+
+fn length_of(text: String) -> Option<Int> / {abort.raise} =
+  if text.len() > 12 || text.starts_with("-") { None } else { text.int_of_string() }
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_file(module: String, text: Bytes) -> File = {
+  let path = slashed(module) ++ ".ply";
+  { path: path, module: module, text: text, at: { label: "cwd", path: path } }
+}
+
+fn nothing_compiled() -> Compiled =
+  { head: { frontend: b"", runtime: b"", entry: b"" }, count: 0, payload: b"" }
+
+test "a library frames every module's source under its name" {
+  let first = a_file("core", b"pub fn double(n: Int) -> Int = n * 2\n");
+  assert_eq(
+    source_frame(first),
+    Bytes::concat_all([b"module core 37\n", b"pub fn double(n: Int) -> Int = n * 2\n"]),
+  );
+  let parts = sections([first, a_file("math", b"pub fn half(n: Int) -> Int = n / 2\n")], b"m", {
+    ..nothing_compiled(),
+    count: 1,
+    payload: b"unit",
+  });
+  assert_eq(parts.map(|x: Section| x.name), [b"sources", b"manifest", b"unit"]);
+  assert_eq(parts.get(0).count, 2);
+  assert_eq(parts.get(1).payload, b"m");
+  assert_eq(parts.get(2).payload, b"unit")
+}
+
+test "the sources a library frames read back as the files they were, paths and all" {
+  let files = [a_file("core", b"pub fn one() -> Int = 1\n"), a_file("util.math", b"")];
+  let src = Bytes::concat_all(files.map(source_frame));
+  match frames(src, 2, 0, [], 3) {
+    Err(why) -> panic(why),
+    Ok(modules) -> {
+      assert_eq(modules.map(|module: Module| module.name), ["core", "util.math"]);
+      assert_eq(modules.map(|module: Module| module.path), ["core.ply", "util/math.ply"]);
+      assert_eq(modules.get(0).text, b"pub fn one() -> Int = 1\n");
+      assert_eq(modules.get(1).text, b"")
+    },
+  }
+}
+
+test "a frame that lies about its length, its name or its count is refused" {
+  let one = source_frame(a_file("core", b"x"));
+  assert(frames(one.concat(b"junk"), 1, 0, [], 2) != Ok([]));
+  match frames(b"module core 99\nx", 1, 0, [], 2) {
+    Ok(_) -> panic("a length past the end was believed"),
+    Err(why) -> assert(why.contains("runs past the end")),
+  };
+  match frames(b"module ..evil 1\nx", 1, 0, [], 2) {
+    Ok(_) -> panic("a name that leaves the package was believed"),
+    Err(why) -> assert(why.contains("is not a module name")),
+  };
+  match frames(one, 2, 0, [], 3) {
+    Ok(_) -> panic("a count the section does not hold was believed"),
+    Err(_) -> (),
+  }
+}

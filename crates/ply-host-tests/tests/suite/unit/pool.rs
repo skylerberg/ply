@@ -1,4 +1,4 @@
-use ply_eval::{Diagnostic, Pending, Span, Value, codes};
+use ply_core::{Diagnostic, Pending, Span, Value, codes};
 use ply_host::pool::{Inbox, JobOutput, MAX_BLOCKING_OPERATIONS, Pool};
 use std::collections::BTreeSet;
 use std::sync::Arc;

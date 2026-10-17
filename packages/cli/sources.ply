@@ -1,0 +1,1074 @@
+//! A path on the command line turned into the front end's input: the files under it, each named by
+//! its place relative to the root, and the shipped modules the run binds as the root `shipped`.
+
+import std.fs
+import std.fs (fs, MemFs, mem_empty, mem_list, mem_write, on_mem)
+import std.bytes (u64_le)
+import std.hash (blake3)
+import compiler.store.hash.encoding (hex)
+import std.path (join, is_absolute, normalize, parent, below_root)
+import compiler.front.rows (module_of)
+import compiler.front (Embedded, Shipping, ShippedData, ShippedWants, embeds_wanted, pulls_of,
+                       shipped_data_wanted, shipped_pulled, shipped_wants, shipping_pulled)
+import compiler.unit (identity_of, read_kept, write_kept)
+import compiler.front.interface (blanked, imported)
+import compiler.syntax.items (parse, unimported)
+import std.bin
+import std.random (entropy)
+import std.time (time)
+import compiler.expand.embed (EmbedRead, BytesRead, EmbedWant, known)
+import compiler.check.resolve.tables (Source, Diag, Label, error_at)
+import builder (builder)
+import env (env)
+import walk (walk_room)
+import compiler.front.pkg (PackageSources, Supplied, wants)
+import paths
+import paths (Rooted, displayed, read_file)
+import walk (Failure, Found, loading, nothing, is_ply, package)
+import std.list
+import compiler.syntax.parsing (no_module, Span, dummy_span, span_between)
+
+/// One module of the program: its place below the root, which names it, and its bytes.
+pub type File = {
+  path: String,
+  module: String,
+  text: Bytes,
+  /// Where it was read, which is where a rewrite of it goes.
+  at: Rooted,
+}
+
+/// A dependency package the walk read: its manifest text and its modules, as files for
+/// placing and as sources for the front end.
+pub type DepPackage = {
+  /// The key the front end judges it by: a directory for a path dependency, a git key for one
+  /// fetched, and the same key either way when it is vendored.
+  root: String,
+  /// Where its files are: the path itself, the fetched tree, or the vendored copy.
+  dir: String,
+  manifest: Option<Bytes>,
+  files: List<File>,
+}
+
+/// One vendored package: the want it answers, and the directory `ply vendor` put it in.
+pub type Vendored = { want: String, dir: String }
+
+/// The program as the front end takes it, with whatever the walk could not turn into a module.
+pub type Project = {
+  files: List<File>,
+  sources: List<Source>,
+  diags: List<Diag>,
+  manifest: Option<File>,
+  packages: List<DepPackage>,
+  /// The key the package walk rooted at, which dependency paths resolve against.
+  root_key: String,
+  /// The modules a load that followed a file's imports looked for below its root and did not find.
+  absent: List<String>,
+}
+
+/// One embed as the load read it, beside the file of the module that asked: a watching run reads it
+/// again from there.
+pub type Embed = { embedded: Embedded, file: Rooted }
+
+pub fn is_std(name: String) -> Bool = name == "std" || name.starts_with("std.")
+
+pub fn is_compiler(name: String) -> Bool = name == "compiler" || name.starts_with("compiler.")
+
+// --- Reading them ---------------------------------------------------------------
+
+pub fn nowhere(code: Bytes, message: String, label: Bytes, notes: List<Bytes>) -> Diag =
+  error_at(code, no_module(), dummy_span(), Bytes::of_string(message), label, notes)
+
+/// A refused file is recorded for its place alone, so the label names it; `m` is that place.
+fn at_file(code: Bytes, m: Int, message: String, label: Bytes, notes: List<Bytes>) -> Diag =
+  error_at(code, m, dummy_span(), Bytes::of_string(message), label, notes)
+
+fn unaddressable(m: Int, path: String, why: String) -> Diag =
+  at_file(
+    b"E0111",
+    m,
+    "`" ++ path ++ "` cannot be a module: " ++ why,
+    b"this file is not addressable as a module",
+    [b"rename it so every directory and the file stem is a plain identifier"],
+  )
+
+fn unreadable(path: String) -> Diag =
+  nowhere(b"E0502", "could not read `" ++ path ++ "`", b"this path could not be loaded", [
+    b"pass a `.ply` file or a directory containing one",
+  ])
+
+pub fn nothing_here(path: String) -> Diag =
+  nowhere(b"E0502", "no `.ply` files under `" ++ path ++ "`", b"nothing to compile", [
+    b"name a `.ply` file, or a directory that contains one",
+    b"directories whose name starts with `.` are not searched",
+  ])
+
+/// What a command that names no path says where no package holds the working directory `pwd`.
+pub fn no_package(pwd: String) -> Diag =
+  nowhere(
+    b"E0502",
+    "no `ply.pkg` in `" ++ pwd ++ "` or any directory above it",
+    b"no package to load",
+    [
+      b"name a `.ply` file or a directory to load it as it stands",
+      b"`ply new NAME` starts a package",
+    ],
+  )
+
+/// A refused file joins `files` so a label can point at it, and never joins `sources`.
+fn refused_file(project: Project, file: File, diag: Diag) -> Project =
+  { ..project, files: project.files.push(file), diags: project.diags.push(diag) }
+
+fn placed(project: Project, rooted: Rooted, path: String, text: Bytes) -> Project / {abort.raise} = {
+  let here = project.files.len();
+  match module_of(path) {
+    Err(why) ->
+      refused_file(
+        project,
+        { path: path, module: "", text: text, at: rooted },
+        unaddressable(here, path, why),
+      ),
+    // The built-in packages' prefixes collide at the front end, which reports them.
+    Ok(name) -> {
+      {
+        ..project,
+        files: project.files.push({ path: path, module: name, text: text, at: rooted }),
+        sources: project.sources.push({ name: Bytes::of_string(name), src: text }),
+      }
+    },
+  }
+}
+
+/// One file the walk found, read through its own root and named by its place below `strip`.
+fn one_file(
+  strip: String,
+  project: Project,
+  rooted: Rooted,
+) -> Project / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  match read_file(rooted) {
+    None -> { ..project, diags: project.diags.push(unreadable(displayed(rooted))) },
+    Some(text) -> {
+      let display = match paths::strip_prefix(rooted.path, strip) {
+        Some(rest) -> if rest == "" { rooted.path } else { rest },
+        None -> rooted.path,
+      };
+      placed(project, rooted, display, text)
+    },
+  }
+
+fn empty() -> Project =
+  { files: [], sources: [], diags: [], manifest: None, packages: [], root_key: "", absent: [] }
+
+/// Every `.ply` file the walk found, in path order, with the ones that cannot be modules refused.
+fn read(
+  found: Found,
+  strip: String,
+) -> Project / {fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
+  let filed: Project = found.files.values().fold(empty(), |acc: Project, rooted: Rooted|
+    one_file(strip, acc, rooted));
+  found.errors.fold({ ..filed, absent: found.absent }, |acc: Project, e: Failure|
+    { ..acc, diags: acc.diags.push(unreadable(e.path)) })
+}
+
+/// What refuses a path a line names inside a package: nothing is there, or a symlink is.
+fn unnamed(resolved: paths::Resolved) -> List<Diag> / {fs.kind[cwd], fs.kind[abs]} = {
+  let at = paths::rooted(resolved);
+  match paths::kind(at) {
+    fs::Missing -> [unreadable(displayed(at))],
+    fs::Symlink -> [unreadable(displayed(at))],
+    _ -> [],
+  }
+}
+
+/// One path as a load reads it, with its root's manifest: a path a line names in a package must be
+/// there, though the package is read whole.
+fn loaded(
+  resolved: paths::Resolved,
+) -> Project / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
+  let own = read(loading(nothing(), resolved), paths::root_prefix(resolved));
+  match with_manifest(resolved, empty()).manifest {
+    None -> own,
+    Some(manifest) ->
+      { ..own, manifest: Some(manifest), diags: own.diags.concat(unnamed(resolved)) },
+  }
+}
+
+/// Every path a command was given, each read under the root it resolved to, and merged: a package
+/// two of them are part of is read once.
+pub fn load_resolved(
+  rs: List<paths::Resolved>,
+) -> Project / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
+  let rs = if rs.len() == 0 { [paths::here()] } else { rs };
+  let merged = rs.fold(
+    { project: empty(), packages: [] },
+    |acc: { project: Project, packages: List<Rooted> }, resolved: paths::Resolved| {
+      let root: Rooted = { label: resolved.label, path: resolved.spelling };
+      if acc.packages.contains(root) {
+        { ..acc, project: { ..acc.project, diags: acc.project.diags.concat(unnamed(resolved)) } }
+      } else {
+        let one = loaded(resolved);
+        {
+          project: merge(acc.project, one),
+          packages: match one.manifest { Some(_) -> acc.packages.push(root), None -> acc.packages },
+        }
+      }
+    },
+  ).project;
+  match rs.at(0) {
+    None -> merged,
+    Some(first) ->
+      {
+        ..merged,
+        packages: walk_packages(first.absolute, merged.manifest),
+        root_key: first.absolute,
+      },
+  }
+}
+
+// --- Embeds -------------------------------------------------------------------------------------
+// What the loaded packages' modules embed, each read relative to its module's own file when a load
+// asks for it: the front end writes every one out as the digest of what was read here, so a
+// definition's hash covers the bytes it embeds, and a load reads them again for its emission.
+
+/// The files of package `k` of `project`: the root's, then each dependency's in its order.
+fn package_files(project: Project, k: Int) -> List<File> =
+  if k == 0 { project.files }
+  else { match project.packages.at(k - 1) { Some(p) -> p.files, None -> [] } }
+
+/// The key package `k` of `project` is judged by.
+fn package_root(project: Project, k: Int) -> String =
+  if k == 0 { project.root_key }
+  else { match project.packages.at(k - 1) { Some(p) -> p.root, None -> "" } }
+
+/// What the module `module` of package `k` of `project` embeds as `want` asks, read beside its file.
+pub fn embed_now(
+  project: Project,
+  k: Int,
+  module: Bytes,
+  want: EmbedWant,
+) -> BytesRead / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  match package_files(project, k).filter(|f: File| Bytes::of_string(f.module) == module) {
+    [f, ..] -> read_embed(f.at, want),
+    [] -> Err(b"no file is there"),
+  }
+
+/// The embed `module` of package `k` of `project` read as `read` for `want`, beside its module's file.
+pub fn embed_of(
+  project: Project,
+  k: Int,
+  module: Bytes,
+  want: EmbedWant,
+  read: EmbedRead,
+) -> Option<Embed> =
+  match package_files(project, k).filter(|f: File| Bytes::of_string(f.module) == module) {
+    [f, ..] ->
+      Some({
+        embedded: {
+          root: Bytes::of_string(package_root(project, k)),
+          module: module,
+          want: want,
+          read: read,
+        },
+        file: f.at,
+      }),
+    [] -> None,
+  }
+
+/// Every embed of every module of `project`, each module parsed for what it asks: what pins a load
+/// without loading it.
+pub fn embeds_parsed(
+  project: Project,
+) -> List<Embed> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  project.packages.fold(
+    read_embeds(Bytes::of_string(project.root_key), project.files),
+    |acc: List<Embed>, package: DepPackage|
+      acc.concat(read_embeds(Bytes::of_string(package.root), package.files)),
+  )
+
+fn read_embeds(
+  root: Bytes,
+  files: List<File>,
+) -> List<Embed> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  files.fold([], |acc: List<Embed>, file: File|
+    embeds_wanted(root, [{ name: Bytes::of_string(file.module), src: file.text }]).fold(
+      acc,
+      |a: List<Embed>, e: Embedded|
+        a.push({ embedded: { ..e, read: known(read_embed(file.at, e.want)) }, file: file.at }),
+    ))
+
+/// Whether any embed reads otherwise now than the load read it.
+pub fn embeds_moved(
+  embeds: List<Embed>,
+) -> Bool / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  embeds.fold(false, |acc: Bool, embed: Embed|
+    acc || known(read_embed(embed.file, embed.embedded.want)) != embed.embedded.read)
+
+/// A path relative to the directory of the module's own file, under the same root.
+fn embed_target(rooted: Rooted, path: String) -> Rooted / {abort.raise} =
+  if is_absolute(path) { paths::spelled(path) }
+  else { { label: rooted.label, path: normalize(join(parent(rooted.path), path)) } }
+
+fn unread(target: Rooted, what: String) -> BytesRead =
+  Err(Bytes::of_string("`" ++ displayed(target) ++ "` " ++ what))
+
+fn read_embed(
+  rooted: Rooted,
+  w: EmbedWant,
+) -> BytesRead / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
+  let target = embed_target(rooted, String::of_bytes_lossy(w.path));
+  match paths::kind(target) {
+    fs::Missing -> unread(target, "does not exist"),
+    fs::Dir -> if w.dir { read_dir(target) }
+    else { unread(target, "is a directory, and `embed` takes a file") },
+    fs::File -> if w.dir { unread(target, "is a file, and `embed_dir` takes a directory") }
+    else { read_one(target) },
+    fs::Symlink -> if w.dir { read_dir(target) } else { read_one(target) },
+  }
+}
+
+fn read_one(target: Rooted) -> BytesRead / {fs.read_file[cwd], fs.read_file[abs]} =
+  match read_file(target) {
+    Some(b) -> Ok([{ name: b"", bytes: b }]),
+    None -> unread(target, "could not be read"),
+  }
+
+/// Every file under the directory, by its path below it and in that order; nothing under a name
+/// starting with `.` is read.
+fn read_dir(
+  target: Rooted,
+) -> BytesRead / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} =
+  match listed(target, "", Map::new(), walk_room()) {
+    Err(why) -> Err(why),
+    Ok(found) ->
+      found.fold(Ok([]), |acc: BytesRead, name: String, rooted: Rooted|
+        match acc {
+          Err(_) -> acc,
+          Ok(files) -> match read_file(rooted) {
+            Some(b) -> Ok(files.push({ name: Bytes::of_string(name), bytes: b })),
+            None -> unread(rooted, "could not be read"),
+          },
+        }),
+  }
+
+fn listed(
+  dir: Rooted,
+  below: String,
+  found: Map<String, Rooted>,
+  room: Int,
+) -> Result<Map<String, Rooted>, Bytes> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
+  match paths::list_dir(dir) {
+    None -> Err(Bytes::of_string("`" ++ displayed(dir) ++ "` could not be listed")),
+    Some(names) ->
+      names.fold(Ok(found), |acc: Result<Map<String, Rooted>, Bytes>, n: String|
+        match acc {
+          Err(_) -> acc,
+          Ok(m) -> if n.starts_with(".") { acc } else {
+            let entry = paths::child(dir, n);
+            let name = if below == "" { n } else { below ++ "/" ++ n };
+            match paths::kind(entry) {
+              fs::Dir -> if room <= 0 {
+                Err(Bytes::of_string("`" ++ displayed(entry) ++ "` is deeper than a path can name"))
+              } else { listed(entry, name, m, room - 1) },
+              _ -> Ok(m.insert(name, entry)),
+            }
+          },
+        }),
+  }
+
+// --- The package walk ---------------------------------------------------------
+// What the root's manifest asks for, round by round, under `abs` so a sibling directory is
+// as reachable as a child one. All judgments about the graph are the front end's; this walk
+// only reads what `wants` names.
+
+fn read_dep_modules(
+  root: String,
+) -> List<File> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
+  let swept = at_abs(root);
+  let found = package(nothing(), swept);
+  found.files.values().fold([], |acc: List<File>, rooted: Rooted|
+    match paths::strip_prefix(rooted.path, swept.path) {
+      None -> acc,
+      Some(rest) -> match read_file(rooted) {
+        None -> acc,
+        Some(text) -> match module_of(rest) {
+          Err(_) -> acc,
+          Ok(name) -> acc.push({ path: root ++ "/" ++ rest, module: name, text: text, at: rooted }),
+        },
+      },
+    })
+}
+
+/// `abs` is rooted at the filesystem's root and takes paths relative to it, so an absolute key
+/// reads as its own spelling without the leading slash.
+fn at_abs(path: String) -> Rooted / {abort.raise} = { label: "abs", path: below_root(path) }
+
+fn read_dep(
+  root: Bytes,
+  dir: String,
+) -> DepPackage / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
+  let here = String::of_bytes_lossy(root);
+  match read_file(at_abs(join(dir, "ply.pkg"))) {
+    None -> { root: here, dir: dir, manifest: None, files: [] },
+    Some(text) -> { root: here, dir: dir, manifest: Some(text), files: read_dep_modules(dir) },
+  }
+}
+
+// --- Vendored packages ----------------------------------------------------------
+// `ply vendor` copies a closure into `vendor/`, one directory per package, and writes an index of
+// which want each answers. A walk that finds the index reads those trees and asks nothing else:
+// that is what makes a vendored checkout build anywhere, with no cache and no git.
+
+pub fn index_path(project: String) -> String = join(project, "vendor/index")
+
+/// The index a project holds, or none: a project that was not vendored reads nothing extra.
+pub fn vendored(
+  project: String,
+) -> List<Vendored> / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  match read_file(at_abs(index_path(project))) { None -> [], Some(text) -> index_of(text) }
+
+/// One line per package: `<want>\t<dir>`, in the order `ply vendor` wrote them.
+fn index_of(text: Bytes) -> List<Vendored> / {abort.raise} =
+  text.split(b"\n").fold([], |acc: List<Vendored>, line: Bytes|
+    match line.index_of(b"\t") {
+      None -> acc,
+      Some(tab) ->
+        acc.push({
+          want: String::of_bytes_lossy(line.slice(0, tab)),
+          dir: String::of_bytes_lossy(line.slice(tab + 1, line.len())),
+        }),
+    })
+
+/// The index holds a directory relative to the project, so it survives the project moving; what the
+/// walk needs is where that is *here*, which is why the root is an argument.
+pub fn from_vendor(project: String, items: List<Vendored>, want: Bytes) -> Option<String> =
+  items.fold(None, |found: Option<String>, v: Vendored|
+    match found {
+      Some(_) -> found,
+      None -> if Bytes::of_string(v.want) == want { Some(join(project, v.dir)) } else { None },
+    })
+
+fn walk_round(
+  root: String,
+  vendored: List<Vendored>,
+  known: List<Bytes>,
+  manifests: List<Supplied>,
+  supplied: List<DepPackage>,
+) -> List<DepPackage> / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} =
+  match wants(known, manifests) {
+    [] -> supplied,
+    wanted -> {
+      let next = wanted.fold(
+        { known: known, manifests: manifests, supplied: supplied },
+        |acc: { known: List<Bytes>, manifests: List<Supplied>, supplied: List<DepPackage> }, want: Bytes| {
+          match tree_of(root, vendored, want) {
+            // A fetch that failed contributes no package: the walk has asked, and the front end's
+            // judgment says the dependency was not fetched, naming the key it wanted.
+            None -> { ..acc, known: acc.known.push(want) },
+            Some(tree) -> {
+              let package = read_dep(want, tree);
+              {
+                known: acc.known.push(want),
+                manifests: acc.manifests.push({
+                  root: want,
+                  manifest: package.manifest,
+                  modules: [],
+                }),
+                supplied: acc.supplied.push(package),
+              }
+            },
+          }
+        },
+      );
+      walk_round(root, vendored, next.known, next.manifests, next.supplied)
+    },
+  }
+
+fn walk_packages(
+  root: String,
+  manifest: Option<File>,
+) -> List<DepPackage> / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
+  let root_key = Bytes::of_string(root);
+  walk_round(
+    root,
+    vendored(root),
+    [root_key],
+    [
+      {
+        root: root_key,
+        manifest: match manifest { None -> None, Some(f) -> Some(f.text) },
+        modules: [],
+      },
+    ],
+    [],
+  )
+}
+
+/// Where a want's files are: a path is its own directory, and a git key names a tree the project's
+/// cache holds, fetched when it is not there yet. The key is what the package is *named* by, so a
+/// fetch that moves a tree changes nothing the front end sees.
+pub fn tree_of(
+  project: String,
+  vendored: List<Vendored>,
+  want: Bytes,
+) -> Option<String> / {builder.git[vcs]} =
+
+  // A vendored copy answers the want whether it is a path or a git key: that is what it is for.
+  match from_vendor(project, vendored, want) {
+    Some(dir) -> Some(dir),
+    None -> fetched(project, want),
+  }
+
+fn fetched(project: String, want: Bytes) -> Option<String> / {builder.git[vcs]} =
+  if want.starts_with(b"git+") {
+    // A fetch that failed has nothing to read: the front end then reports the dependency as one
+    // that was not fetched, which is what a reader can act on (`ply check` names the key).
+    builder.git[vcs](project, String::of_bytes_lossy(want))
+  } else { Some(String::of_bytes_lossy(want)) }
+
+/// The root's `ply.pkg`, when there is one; the first root to have one wins the merge.
+fn with_manifest(
+  resolved: paths::Resolved,
+  project: Project,
+) -> Project / {fs.read_file[cwd], fs.read_file[abs]} =
+  match project.manifest {
+    Some(_) -> project,
+    None -> {
+      let at = paths::in_root(resolved, "ply.pkg");
+      match read_file(at) {
+        None -> project,
+        Some(text) ->
+          { ..project, manifest: Some({ path: displayed(at), module: "", text: text, at: at }) },
+      }
+    },
+  }
+
+fn merge(a: Project, b: Project) -> Project = {
+  let files = b.files.fold(a.files, |acc: List<File>, file: File| acc.push(file));
+  let sources = b.sources.fold(a.sources, |acc: List<Source>, source: Source| acc.push(source));
+  {
+    files: files,
+    sources: sources,
+    diags: b.diags.fold(a.diags, |acc: List<Diag>, diag: Diag| acc.push(diag)),
+    manifest: match a.manifest { Some(_) -> a.manifest, None -> b.manifest },
+    packages: b.packages.fold(a.packages, |acc: List<DepPackage>, package: DepPackage|
+      acc.push(package)),
+    root_key: if a.root_key == "" { b.root_key } else { a.root_key },
+    absent: a.absent.concat(b.absent),
+  }
+}
+
+// --- The shipped modules ------------------------------------------------------
+// The modules this binary ships, one flat directory of `<dotted name>.ply`, bound as `shipped`, and
+// below it each data file one of them embeds, under its name (`std/oid/names.txt`).
+
+pub fn stem(name: String) -> String / {abort.raise} = name.slice(0, name.len() - 4)
+
+/// The digest over the shipped modules among `srcs` and `data`, the data files they embed: each as
+/// its name's length and bytes then its own hash, the modules hashed in name order and the data
+/// files after them.
+pub fn shipped_digest_of(srcs: List<Source>, data: List<ShippedData>) -> String / {abort.raise} = {
+  let part = |name: Bytes, bytes: Bytes|
+    Bytes::concat_all([u64_le(String::of_bytes_lossy(name).len()), name, blake3(bytes)]);
+  let parts = srcs.filter(|src: Source| is_std(String::of_bytes_lossy(src.name))).map(
+    |src: Source| part(src.name, src.src),
+  ).concat(
+    data.map(|d: ShippedData| part(d.name, d.bytes)),
+  );
+  "b3:" ++ String::of_bytes(hex(blake3(Bytes::concat_all(parts))).slice(0, 12))
+}
+
+/// The names of the shipped modules there are, read off the directory without reading one.
+pub fn shipped_names() -> List<Bytes> / {fs.list_dir[shipped], abort.raise} =
+  match fs.list_dir[shipped](".") {
+    None -> [],
+    Some(names) -> names.filter(is_ply).map(|name: String| Bytes::of_string(stem(name))),
+  }
+
+/// The shipped modules a load of `user` and `pkgs` pulls and the data files those embed, each read
+/// off the directory bound as `shipped` when it is pulled, a module as a module importing it reads
+/// it (`compiler.front.interface.imported`). `every` pulls each module of the standard library there is,
+/// whole, whatever `user` and `pkgs` import.
+pub fn shipping_for(
+  user: List<Source>,
+  pkgs: PackageSources,
+  every: Bool = false,
+) -> Shipping / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+  let listed = shipped_names();
+  shipped_pulled(
+    user,
+    pkgs,
+    listed,
+    |name: Bytes|
+      match fs.read_file[shipped](String::of_bytes_lossy(name) ++ ".ply") {
+        Some(text) -> Some(if every { text } else { imported(text) }),
+        None -> None,
+      },
+    |name: Bytes| fs.read_file[shipped](String::of_bytes_lossy(name)),
+    pulls_of,
+    if every { listed.filter(|name: Bytes| is_std(String::of_bytes_lossy(name))) } else { [] },
+  )
+}
+
+/// The shipped modules a load asks after whatever its modules import: each module of the standard
+/// library where `every` says, as a run over its own tests reads them.
+pub fn asked_shipped(every: Bool) -> List<Bytes> / {fs.list_dir[shipped], abort.raise} =
+  if every { shipped_names().filter(|name: Bytes| is_std(String::of_bytes_lossy(name))) }
+  else { [] }
+
+/// The shipping of a load that pulled `pulled`: each pulled module as a module importing it reads it,
+/// through the reading the machine keeps of it ([`imported_reader`]), or whole where `every` says,
+/// and what those embed, as `wants` says each embeds, or as its text says where `wants` is silent.
+pub fn shipping_kept_of(
+  pulled: List<Bytes>,
+  every: Bool,
+  wants: Map<Bytes, ShippedWants>,
+) -> Shipping / {env.reused[sys], fs.list_dir[shipped], fs.read_file[shipped], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+  let importing = imported_reader();
+  shipping_pulled(
+    pulled,
+    shipped_names(),
+    |name: Bytes|
+      match fs.read_file[shipped](String::of_bytes_lossy(name) ++ ".ply") {
+        Some(text) -> Some(if every { text } else { read_imported(importing, text) }),
+        None -> None,
+      },
+    |name: Bytes| fs.read_file[shipped](String::of_bytes_lossy(name)),
+    |source: Source| match wants.get(source.name) { Some(w) -> w, None -> shipped_wants(source) },
+    asked_shipped(every),
+  )
+}
+
+/// [`shipping_kept_of`] with nothing kept.
+pub fn shipping_of(
+  pulled: List<Bytes>,
+  every: Bool,
+) -> Shipping / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
+  shipping_pulled(
+    pulled,
+    shipped_names(),
+    |name: Bytes|
+      match fs.read_file[shipped](String::of_bytes_lossy(name) ++ ".ply") {
+        Some(text) -> Some(if every { text } else { imported(text) }),
+        None -> None,
+      },
+    |name: Bytes| fs.read_file[shipped](String::of_bytes_lossy(name)),
+    shipped_wants,
+    asked_shipped(every),
+  )
+
+/// How a load reads a shipped module for a module importing it: what that reading is a function of
+/// beside the text, empty where the binary says nothing of it and nothing is kept, and the
+/// toolchain's directory of what `ply` reuses (`env.reused`), where the spans it blanks are kept for
+/// every project on the machine, each under the text's digest and that reading's.
+pub type ImportedReader = { dir: String, importer: Bytes }
+
+pub fn imported_reader() -> ImportedReader / {env.reused[sys], fs.read_file[shipped], abort.raise} =
+  {
+    dir: below_root(env.reused[sys]()),
+    importer: match fs.read_file[shipped]("definitions") {
+      Some(definitions) ->
+        Bytes::concat_all([
+          b"ply.imported.1\x00",
+          hex(bin::shape_digest(blanked_bin())),
+          b"\x00",
+          identity_of(definitions, [b"front.interface.imported"]),
+          b"\x00",
+        ]),
+      None -> b"",
+    },
+  }
+
+/// A shipped module's `text` as a module importing it reads it (`compiler.front.interface.imported`).
+pub fn read_imported(
+  r: ImportedReader,
+  text: Bytes,
+) -> Bytes / {fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
+  if r.importer.len() == 0 { imported(text) } else { kept_imported(r.dir, r.importer, text) }
+
+/// The shipped module `name` as a module importing it reads it, or `None` where this binary ships no
+/// such module.
+pub fn shipped_imported(
+  r: ImportedReader,
+  name: Bytes,
+) -> Option<Bytes> / {fs.read_file[shipped], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
+  match fs.read_file[shipped](String::of_bytes_lossy(name) ++ ".ply") {
+    Some(text) -> Some(read_imported(r, text)),
+    None -> None,
+  }
+
+/// What an importer reads of a shipped module's text, the spans it blanks kept under the text's
+/// digest, so the machine finds them once for each text and each binary's reading of it.
+fn kept_imported(
+  dir: String,
+  importer: Bytes,
+  text: Bytes,
+) -> Bytes / {fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+  let key = hex(blake3(importer.concat(blake3(text))));
+  let kept = match read_kept[abs](dir, key) {
+    Some(bytes) -> match bin::decode(bytes, blanked_bin()) {
+      Ok(b) -> if !fits(b.bounds, text.len()) { None } else {
+        Some(
+          range(0, b.bounds.len() / 2).map(|i: Int|
+            span_between(b.bounds.at_or(2 * i, 0), b.bounds.at_or(2 * i + 1, 0))),
+        )
+      },
+      Err(_) -> None,
+    },
+    None -> None,
+  };
+  let spans = match kept {
+    Some(spans) -> spans,
+    None -> {
+      let spans = unimported(text);
+      let bounds = spans.fold([], |acc: List<Int>, s: Span| acc.push(s.start).push(s.end));
+      write_kept[abs](dir, key, bin::encode({ bounds: bounds }, blanked_bin()));
+      spans
+    },
+  };
+  blanked(text, spans)
+}
+
+/// Where each span of a shipped module's text an importer reads nothing of starts and ends.
+type Blanked = { bounds: List<Int> }
+
+derive bin for Blanked
+
+/// Whether `bounds` pair into spans in order, apart, within a text of `size` bytes: a kept entry
+/// that does not is read as none.
+fn fits(bounds: List<Int>, size: Int) -> Bool =
+  bounds.len() % 2 == 0
+    && bounds.fold({ ok: true, at: 0 }, |s: { ok: Bool, at: Int }, b: Int|
+      { ok: s.ok && s.at <= b && b <= size, at: b }).ok
+
+/// The data files `modules` embed, each read once off the directory bound as `shipped`.
+pub fn shipped_data(
+  modules: List<Source>,
+) -> List<ShippedData> / {fs.read_file[shipped], abort.raise} =
+  modules.fold([], |acc: List<ShippedData>, module: Source|
+    shipped_data_wanted(module).fold(acc, |held: List<ShippedData>, name: Bytes|
+      if held.filter(|d: ShippedData| d.name == name).len() > 0 { held } else {
+        match fs.read_file[shipped](String::of_bytes_lossy(name)) {
+          Some(bytes) -> held.push({ name: name, bytes: bytes }),
+          None -> held,
+        }
+      }))
+
+/// Every shipped module's name, read or not.
+pub fn shipped_listed(s: Shipping) -> List<Bytes> =
+  s.read.map(|source: Source| source.name).concat(s.unread)
+
+pub fn shipped_modules() -> List<Source> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
+  match fs.list_dir[shipped](".") {
+    None -> [],
+    Some(names) ->
+      names.fold([], |acc: List<Source>, name: String|
+        if !is_ply(name) { acc } else {
+          match fs.read_file[shipped](name) {
+            None -> acc,
+            Some(src) -> acc.push({ name: Bytes::of_string(stem(name)), src: src }),
+          }
+        }),
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+test "a path names a module by its place, and a segment that is not an identifier does not" {
+  assert_eq(module_of("m.ply"), Ok("m"));
+  assert_eq(module_of("store/orders.ply"), Ok("store.orders"));
+  assert_eq(module_of("a/b/c.ply"), Ok("a.b.c"));
+  assert_eq(module_of("_kept.ply"), Ok("_kept"));
+  assert_eq(module_of("my-file.ply"), Err("`my-file` is not an identifier"));
+  assert_eq(module_of("9lives.ply"), Err("`9lives` is not an identifier"));
+  assert_eq(module_of("a b/c.ply"), Err("`a b` is not an identifier"));
+  // The rule is ASCII: a non-ASCII segment is refused here as the lexer refuses it in source.
+  assert_eq(module_of("café.ply"), Err("`café` is not an identifier"))
+}
+
+test "the reserved roots are the ones this binary ships under" {
+  assert(is_std("std"));
+  assert(is_std("std.json"));
+  assert(!is_std("standard"));
+  assert(is_compiler("compiler"));
+  assert(is_compiler("compiler.fmt"));
+  assert(!is_compiler("compilers"))
+}
+
+/// The walk's answer for files it found in the working directory.
+fn found_here(names: List<String>) -> Found =
+  {
+    files: names.fold(Map::new(), |acc: Map<String, Rooted>, path: String|
+      acc.insert(path, { label: "cwd", path: path })),
+    errors: [],
+    absent: [],
+  }
+
+test "a file that cannot be a module is refused and does not reach the front end" {
+  let p = handle {
+    read(found_here(["m.ply", "my-file.ply"]), "")
+  } with {
+    fs.read_file[cwd](path) -> Some(b"fn f() -> Int = 1\n"),
+    fs.read_file[abs](path) -> panic("nothing here leaves the working directory"),
+  };
+  assert_eq(p.sources.len(), 1);
+  assert_eq(p.diags.len(), 1);
+  assert_eq(match p.diags.at(0) { Some(d) -> d.code, None -> b"" }, b"E0111");
+  // The refused file is kept only so the label can name it.
+  assert_eq(p.files.map(|file: File| file.path), ["m.ply", "my-file.ply"]);
+  assert_eq(
+    match p.diags.at(0) { Some(d) -> d.labels.map(|label: Label| label.module), None -> [] },
+    [1],
+  )
+}
+
+test "a project file under the compiler root walks on to the front end's collision" {
+  let p = handle {
+    read(found_here(["compiler/fmt.ply"]), "")
+  } with {
+    fs.read_file[cwd](path) -> Some(b"fn f() -> Int = 1\n"),
+    fs.read_file[abs](path) -> panic("nothing here leaves the working directory"),
+  };
+  assert_eq(p.diags.len(), 0);
+  assert_eq(match p.sources.at(0) { Some(s) -> s.name, None -> b"" }, b"compiler.fmt")
+}
+
+test "a project file under std walks on to the front end's collision" {
+  let p = handle {
+    read(found_here(["std/json.ply"]), "")
+  } with {
+    fs.read_file[cwd](path) -> Some(b"fn f() -> Int = 1\n"),
+    fs.read_file[abs](path) -> panic("nothing here leaves the working directory"),
+  };
+  assert_eq(p.diags.len(), 0);
+  assert_eq(match p.sources.at(0) { Some(s) -> s.name, None -> b"" }, b"std.json")
+}
+
+test "a file found outside the working directory is read there, named below its root" {
+  let found: Found = {
+    files: Map::new().insert("/srv/app/store/orders.ply", {
+      label: "abs",
+      path: "srv/app/store/orders.ply",
+    }),
+    errors: [],
+    absent: [],
+  };
+  let p = handle {
+    read(found, "srv/app")
+  } with {
+    fs.read_file[cwd](path) -> panic("a file found under `abs` is read under `abs`"),
+    fs.read_file[abs](path) -> if path == "srv/app/store/orders.ply" {
+      Some(b"fn f() -> Int = 1\n")
+    } else { None },
+  };
+  assert_eq(p.diags.len(), 0);
+  assert_eq(p.files.map(|file: File| file.path), ["store/orders.ply"]);
+  assert_eq(p.files.map(|file: File| file.at), [
+    { label: "abs", path: "srv/app/store/orders.ply" },
+  ]);
+  assert_eq(match p.sources.at(0) { Some(s) -> s.name, None -> b"" }, b"store.orders")
+}
+
+test "the manifest is the one in the root's directory, whichever file in it the path named" {
+  let file: paths::Resolved = {
+    label: "abs",
+    spelling: "srv/app",
+    display: "/srv/app",
+    inside: "main.ply",
+    absolute: "/srv/app",
+    machine: "/srv/app",
+  };
+  let p = handle {
+    with_manifest(file, empty())
+  } with {
+    fs.read_file[cwd](path) -> panic("a root under `abs` is read under `abs`"),
+    fs.read_file[abs](path) -> if path == "srv/app/ply.pkg" { Some(b"manifest") } else { None },
+  };
+  match p.manifest {
+    None -> panic("the manifest beside the file was not read"),
+    Some(f) -> {
+      assert_eq(f.path, "/srv/app/ply.pkg");
+      assert_eq(f.at, { label: "abs", path: "srv/app/ply.pkg" })
+    },
+  }
+}
+
+test "a load reads the shipped modules it pulls and what they embed, and only those" {
+  let got = handle {
+    shipping_for([{ name: b"main", src: b"import std.json\nfn main() -> Unit = ()\n" }], {
+      root: b"",
+      manifest: None,
+      supplied: [],
+    })
+  } with {
+    var files: List<String> = [],
+    fs.list_dir[shipped](p) ->
+      Some(["std.json.ply", "std.bytes.ply", "std.list.ply", "compiler.fmt.ply"]),
+    fs.read_file[shipped](p) -> {
+      files = files.push(p);
+      if p == "std.json.ply" { Some(b"import std.bytes\npub fn j() -> Int = bytes::b()\n") }
+      else if p == "std.bytes.ply" { Some(b"pub fn b() -> Int = 2\n") }
+      else { Some(b"pub fn x() -> Int = 3\n") }
+    },
+    return shipping -> { shipping: shipping, files: files },
+  };
+  assert_eq(got.shipping.read.map(|source: Source| source.name), [b"std.json", b"std.bytes"]);
+  assert_eq(got.shipping.unread, [b"std.list", b"compiler.fmt"]);
+  assert_eq(got.files, ["std.json.ply", "std.bytes.ply"])
+}
+
+test "a load of every standard library module reads each, imported or not, and no other shipped module" {
+  let got = handle {
+    shipping_for(
+      [{ name: b"main", src: b"import std.json\nfn main() -> Unit = ()\n" }],
+      { root: b"", manifest: None, supplied: [] },
+      true,
+    )
+  } with {
+    var files: List<String> = [],
+    fs.list_dir[shipped](p) ->
+      Some(["std.json.ply", "std.bytes.ply", "std.list.ply", "compiler.fmt.ply"]),
+    fs.read_file[shipped](p) -> {
+      files = files.push(p);
+      if p == "std.json.ply" { Some(b"import std.bytes\npub fn j() -> Int = 1\n") }
+      else { Some(b"pub fn x() -> Int = 3\n") }
+    },
+    return shipping -> { shipping: shipping, files: files },
+  };
+  assert_eq(got.shipping.asked, [b"std.json", b"std.bytes", b"std.list"]);
+  assert_eq(got.shipping.unread, [b"compiler.fmt"]);
+  assert_eq(got.files, ["std.bytes.ply", "std.json.ply", "std.list.ply"])
+}
+
+fn exercised() -> Bytes =
+  b"//! Counting.\n\nimport std.laws (agrees)\n\n/// One more.\npub fn more(x: Int) -> Int = bump(x)\n\nfn bump(x: Int) -> Int = x + 1\n\n/// Only the tests ask.\nfn twice(x: Int) -> Int = x * 2\n\ntest \"more adds one\" {\n  assert_eq(more(twice(1)), 3)\n}\n\nlaw \"more is bump\" = agrees(more, bump)\n"
+
+/// What a load of a module importing `std.count`, a shipped module with a test and a law, reads of
+/// the shipped modules: the modules, the text of `std.count` and the files asked for.
+fn counted_load(
+  every: Bool,
+) -> { read: List<Bytes>, text: Bytes, files: List<String> } / {abort.raise} =
+  handle {
+    shipping_for(
+      [{ name: b"main", src: b"import std.count\nfn main() -> Unit = ()\n" }],
+      { root: b"", manifest: None, supplied: [] },
+      every,
+    )
+  } with {
+    var files: List<String> = [],
+    fs.list_dir[shipped](p) -> Some(["std.count.ply", "std.laws.ply"]),
+    fs.read_file[shipped](p) -> {
+      files = files.push(p);
+      if p == "std.count.ply" { Some(exercised()) }
+      else { Some(b"pub fn agrees<a>(f: (Int) -> a, g: (Int) -> a) -> Bool = true\n") }
+    },
+    return shipping ->
+      {
+        read: shipping.read.map(|source: Source| source.name),
+        text: shipping.read.fold(b"", |acc: Bytes, source: Source|
+          if source.name == b"std.count" { source.src } else { acc }),
+        files: files,
+      },
+  }
+
+/// What a load of a module importing `std.count` read of `std.count`, with a fresh project store and
+/// the toolchain's store in `toolchain`, and the toolchain's store it left.
+fn kept_count(toolchain: MemFs) -> { text: Bytes, toolchain: MemFs } / {abort.raise} = {
+  let over = on_mem[cwd](mem_empty(), ||
+    on_mem[abs](toolchain, ||
+      handle {
+        shipping_kept_of([b"std.count"], false, Map::new())
+      } with {
+        env.reused[sys]() -> "/reused",
+        fs.list_dir[shipped](p) -> Some(["std.count.ply"]),
+        fs.read_file[shipped](p) -> if p == "std.count.ply" { Some(exercised()) }
+        else if p == "definitions" { Some(b"front.pulls_of aa\nfront.interface.imported bb\n") }
+        else { None },
+        entropy.next() -> 7,
+        time.now_ms() -> 0,
+      })).value;
+  {
+    text: over.value.read.fold(b"", |acc: Bytes, source: Source|
+      if source.name == b"std.count" { source.src } else { acc }),
+    toolchain: over.tree,
+  }
+}
+
+test "what an importer reads of a shipped module is kept for every project, and a kept entry that does not fit is none" {
+  let viewed = imported(exercised());
+  let cold = kept_count(mem_empty());
+  assert_eq(cold.text, viewed);
+  let kept = match mem_list(cold.toolchain, "reused") { Some(names) -> names, None -> [] };
+  assert_eq(kept.len(), 1);
+  let entry = "reused/" ++ kept.at_or(0, "");
+  // Another project's first load reads what the toolchain kept, and finds nothing itself.
+  let planted = mem_write(cold.toolchain, entry, bin::encode({ bounds: [] }, blanked_bin())).fs;
+  assert_eq(kept_count(planted).text, exercised());
+  let spoiled = mem_write(cold.toolchain, entry, bin::encode({ bounds: [5, 2] }, blanked_bin())).fs;
+  assert_eq(kept_count(spoiled).text, viewed)
+}
+
+test "a project's load reads no shipped test or law, nor what only they reach, and `--std`'s reads all" {
+  let load = counted_load(false);
+  assert_eq(load.read, [b"std.count"]);
+  assert_eq(load.files, ["std.count.ply"]);
+  assert_eq(load.text.len(), exercised().len());
+  let says = |word: Bytes| load.text.index_of(word) != None;
+  assert(says(b"/// One more.\npub fn more(x: Int) -> Int = bump(x)"));
+  assert(says(b"fn bump(x: Int) -> Int = x + 1"));
+  assert(!says(b"std.laws") && !says(b"twice") && !says(b"test") && !says(b"law"));
+  let parsed = parse(load.text);
+  assert_eq(parsed.parser.diags.len(), 0);
+  assert_eq(parsed.node.items.len(), 2);
+  let whole = counted_load(true);
+  assert_eq(whole.read, [b"std.count", b"std.laws"]);
+  assert_eq(whole.text, exercised())
+}
+
+fn embedding_words() -> Bytes = b"pub fn list() -> Bytes = embed(\"words/list.txt\")\n"
+
+test "a load reads the data file a shipped module it pulls embeds, under its name below them" {
+  let got = handle {
+    shipping_for([{ name: b"main", src: b"import std.words\nfn main() -> Unit = ()\n" }], {
+      root: b"",
+      manifest: None,
+      supplied: [],
+    })
+  } with {
+    var files: List<String> = [],
+    fs.list_dir[shipped](p) -> Some(["std", "std.idle.ply", "std.words.ply"]),
+    fs.read_file[shipped](p) -> {
+      files = files.push(p);
+      if p == "std.words.ply" { Some(embedding_words()) }
+      else if p == "std/words/list.txt" { Some(b"one\n") }
+      else { None }
+    },
+    return shipping -> { shipping: shipping, files: files },
+  };
+  assert_eq(got.shipping.data, [{ name: b"std/words/list.txt", bytes: b"one\n" }]);
+  assert_eq(got.shipping.unread, [b"std.idle"]);
+  assert_eq(got.files, ["std.words.ply", "std/words/list.txt"])
+}
+
+test "the digest of the shipped modules covers the data files they embed" {
+  let srcs = [{ name: b"std.words", src: embedding_words() }];
+  let over = |bytes: Bytes|
+    shipped_digest_of(srcs, [{ name: b"std/words/list.txt", bytes: bytes }]);
+  assert_eq(over(b"one\n"), over(b"one\n"));
+  assert(over(b"one\n") != over(b"two\n"));
+  assert(over(b"one\n") != shipped_digest_of(srcs, []));
+  let held = handle {
+    shipped_data(srcs.concat(srcs))
+  } with {
+    fs.read_file[shipped](p) -> if p == "std/words/list.txt" { Some(b"one\n") } else { None },
+  };
+  assert_eq(held, [{ name: b"std/words/list.txt", bytes: b"one\n" }])
+}
+
+test "the shipped modules come back one source per `.ply` file, named by its stem" {
+  let out = handle {
+    shipped_modules()
+  } with {
+    builder.git[vcs](root, key) -> None,
+    fs.list_dir[shipped](p) -> Some(["std.json.ply", "README.md", "compiler.fmt.ply"]),
+    fs.read_file[shipped](p) -> Some(Bytes::of_string(p)),
+  };
+  assert_eq(out.map(|source: Source| source.name), [b"std.json", b"compiler.fmt"])
+}

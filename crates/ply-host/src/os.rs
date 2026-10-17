@@ -1,8 +1,8 @@
 //! The `os` effect: what the machine and the process a program runs in say of themselves. None of
 //! it reads the environment, so no variable a user sets changes an answer.
 
-use ply_eval::host::HostRegistry;
-use ply_eval::{
+use ply_core::host::HostRegistry;
+use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
     HostRuntime, Linearity, Span, Symbol, Value, codes,
 };

@@ -1,0 +1,314 @@
+//! The reference graph over every top-level definition: the index of what each module declares and exports.
+
+import syntax.parsing (Span, Ident, QName)
+import syntax.exprs (Tagged, tagged_parser, prelude_module)
+import syntax.items (Item, FnDef, TypeDef, EffectDef, TestDef, LawDef, is_pub, IInstance,
+                     InstanceDef, NKey, NShow, NumericDef, member_name)
+import check.resolve.tables (ParsedModule, Diag, error_at_and)
+import check.resolve.scopes (of_module)
+import std.list
+import std.option
+import std.bytes
+import std.string
+
+// --- The reference graph over every top-level definition ------------------------------
+
+pub type NodeBody = | NodeFn(FnDef) | NodeType(TypeDef) | NodeEffect(EffectDef)
+
+pub type Node = { name: Bytes, simple: Bytes, module: Int, body: NodeBody }
+
+pub type TestNode = { key: Bytes, module: Int, def: TestDef }
+
+pub type LawNode = { key: Bytes, module: Int, def: LawDef }
+
+pub type IndexEntry = | DefEntry(Int) | TestEntry(Int) | LawEntry(Int)
+
+pub type Target = { owner: Int, name: Bytes }
+
+pub type ValueTarget = | FnTarget(Int) | CtorTarget({ owner: Int, name: Bytes })
+
+type ModuleItems = {
+  fns: Map<Bytes, Int>,
+  /// Its functions of types, `X::name`, under the name each has there.
+  members: Map<Bytes, List<Int>>,
+  types: Map<Bytes, Int>,
+  effects: Map<Bytes, Int>,
+  ctors: Map<Bytes, Int>,
+  // What the module states of each type it names: a type's hash covers these.
+  instances: Map<Bytes, List<InstanceDef>>,
+  numerics: Map<Bytes, NumericDef>,
+}
+
+type ScopeIndex = {
+  values: Map<Bytes, Target>,
+  types: Map<Bytes, Target>,
+  effects: Map<Bytes, Target>,
+  modules: Map<Bytes, Int>,
+  /// The modules whose functions of types a call on a value here may call: itself, and each it
+  /// imports, directly or through others.
+  sees: List<Int>,
+}
+
+pub type Index = {
+  mods: List<ParsedModule>,
+  nodes: List<Node>,
+  tests: List<TestNode>,
+  laws: List<LawNode>,
+  order: List<IndexEntry>,
+  items: List<ModuleItems>,
+  scopes: List<ScopeIndex>,
+  effect_sketches: Map<Int, Bytes>,
+  /// The nodes of what the code the emitter writes for a container calls (`written_code`), which
+  /// a body that compares, digests or shows anything references.
+  written: List<Int>,
+}
+
+pub fn qualifier(qname: QName) -> Option<Bytes> =
+  match qname.module { Some(m) -> Some(m.name), None -> None }
+
+/// The name `qualified` has inside the module that declares it.
+pub fn simple_of(qualified: Bytes, owner: Bytes) -> Bytes / {abort.raise} = {
+  let prefix = owner.concat(b".");
+  if owner.len() > 0 && qualified.starts_with(prefix) {
+    qualified.slice(prefix.len(), qualified.len())
+  } else { qualified }
+}
+
+pub type Building = {
+  nodes: List<Node>,
+  tests: List<TestNode>,
+  laws: List<LawNode>,
+  order: List<IndexEntry>,
+  items: List<ModuleItems>,
+  diags: List<Diag>,
+}
+
+pub type Declaring = { map: Map<Bytes, Int>, spans: Map<Bytes, Span>, diags: List<Diag> }
+
+pub fn declare(d: Declaring, m: Int, name: Ident, id: Int, what: Bytes) -> Declaring =
+  match d.spans.get(name.name) {
+    Some(first) ->
+      {
+        ..d,
+        diags: d.diags.push(
+          error_at_and(
+            b"E0105",
+            m,
+            name.span,
+            Bytes::concat_all([b"duplicate ", what, b" `", name.name, b"`"]),
+            b"redefined here",
+            m,
+            first,
+            b"first defined here",
+            [
+              Bytes::concat_all([
+                b"rename one of them; every ",
+                what,
+                b" in a module needs a distinct name",
+              ]),
+            ],
+          ),
+        ),
+      },
+    None ->
+      {
+        map: d.map.insert(name.name, id),
+        spans: d.spans.insert(name.name, name.span),
+        diags: d.diags,
+      },
+  }
+
+pub fn no_declaring(diags: List<Diag>) -> Declaring =
+  { map: Map::new(), spans: Map::new(), diags: diags }
+
+/// Each type's `key` before its `show`, whatever order the module wrote them in. A `gen` is no part
+/// of what its type is: it decides what a sample draws and nothing a program computes.
+pub fn instances_in(items: List<Item>) -> Map<Bytes, List<InstanceDef>> =
+  items.fold(Map::new(), |acc: Map<Bytes, List<InstanceDef>>, item: Item|
+    match item {
+      IInstance(d) -> {
+        let held = match acc.get(d.target.name) { Some(xs) -> xs, None -> [] };
+        match d.kind {
+          NKey -> acc.insert(d.target.name, [d].concat(held)),
+          NShow -> acc.insert(d.target.name, held.push(d)),
+        }
+      },
+      _ -> acc,
+    })
+
+pub fn is_effect(index: Index, v: Int) -> Bool / {abort.raise} =
+  match index.nodes.get(v).body { NodeEffect(_) -> true, _ -> false }
+
+/// A qualified name consults only the named module's declarations; a bare one only the scope.
+fn target(
+  index: Index,
+  module: Int,
+  ns: Int,
+  qual: Option<Bytes>,
+  name: Bytes,
+) -> Option<Target> / {abort.raise} = {
+  let scope = index.scopes.get(module);
+  match qual {
+    Some(binder) -> match scope.modules.get(binder) {
+      Some(owner) -> Some({ owner: owner, name: name }),
+      // A function of a type is written through a binder of its module that no import wrote,
+      // or through the type.
+      None -> match of_module(binder) {
+        None -> match ((ns, scope.types.get(binder))) {
+          (0, Some(of)) -> Some({ owner: of.owner, name: member_name(of.name, name) }),
+          // A language type's are the prelude's where it writes one in Ply, as the checker binds
+          // them, and else its home module's, where this module can see it.
+          (0, None) -> {
+            let home = b"std.".concat(Bytes::of_string(String::of_bytes(binder).ascii_lower()));
+            let member = member_name(binder, name);
+            let seen = |wanted: (Int) -> Bool / {abort.raise}|
+              scope.sees.fold(None, |found: Option<Target>, k: Int|
+                match found {
+                  Some(_) -> found,
+                  None -> if wanted(k) { Some({ owner: k, name: member }) } else { None },
+                });
+            match seen(|k: Int|
+                index.mods.get(k).name == prelude_module()
+                  && index.items.get(k).fns.contains(member)) {
+              Some(t) -> Some(t),
+              None -> seen(|k: Int| index.mods.get(k).name == home),
+            }
+          },
+          _ -> None,
+        },
+        Some(home) ->
+          range(0, index.mods.len()).fold(None, |found: Option<Target>, k: Int|
+            match found {
+              Some(_) -> found,
+              None -> if index.mods.get(k).name == home { Some({ owner: k, name: name }) }
+              else { None },
+            }),
+      },
+    },
+    None ->
+      Map::get(
+        if ns == 0 { scope.values } else if ns == 1 { scope.types } else { scope.effects },
+        name,
+      ),
+  }
+}
+
+/// `pub` is metadata a definition's own encoding erases, but a reference to one is another matter: a
+/// qualified name reaches only what its module exports, so an unexported one denotes nothing, as it
+/// already does for a bare name the scope never bound. Without this a reference that stopped being
+/// permitted would encode as though it still were, and the caller's hash would not move.
+fn exports(index: Index, qual: Option<Bytes>, node: Int) -> Bool / {abort.raise} =
+  match qual {
+    None -> true,
+    Some(_) -> match index.nodes.get(node).body {
+      NodeFn(d) -> is_pub(d.vis),
+      NodeType(d) -> is_pub(d.vis),
+      NodeEffect(d) -> is_pub(d.vis),
+    },
+  }
+
+/// A default copied back into its own module names it, and reaches what it keeps, as the checker does.
+fn exported(
+  index: Index,
+  qual: Option<Bytes>,
+  from: Int,
+  node: Option<Int>,
+) -> Option<Int> / {abort.raise} =
+  match node {
+    None -> None,
+    Some(v) -> if index.nodes.get(v).module == from || exports(index, qual, v) { Some(v) }
+    else { None },
+  }
+
+pub fn value_target(
+  index: Index,
+  module: Int,
+  qname: QName,
+) -> Option<ValueTarget> / {abort.raise} =
+  match target(index, module, 0, qualifier(qname), qname.name.name) {
+    None -> None,
+    Some(t) -> {
+      let items = index.items.get(t.owner);
+      match exported(index, qualifier(qname), module, items.fns.get(t.name)) {
+        Some(node) -> Some(FnTarget(node)),
+        // A variant is exported exactly when the type that declares it is.
+        None -> match exported(index, qualifier(qname), module, items.ctors.get(t.name)) {
+          Some(owner) -> Some(CtorTarget({ owner: owner, name: t.name })),
+          None -> None,
+        },
+      }
+    },
+  }
+
+/// The definition a tagged literal's check runs, by its program-wide name, as `module` names it.
+pub fn tagged_target(index: Index, module: Int, t: Tagged) -> Option<Bytes> / {abort.raise} =
+  match value_target(index, module, tagged_parser(t)) {
+    Some(FnTarget(node)) -> Some(index.nodes.get(node).name),
+    _ -> None,
+  }
+
+/// What a name `module` writes as a value denotes: a definition, by its program-wide name, or a
+/// constructor, by its own name and its type's program-wide one.
+pub type Denoted =
+  | DenotesFn(Bytes)
+  | DenotesCtor({ type_name: Bytes, name: Bytes })
+  | DenotesNothing
+
+pub fn denoted(index: Index, module: Int, qname: QName) -> Denoted / {abort.raise} =
+  match value_target(index, module, qname) {
+    Some(FnTarget(node)) -> DenotesFn(index.nodes.get(node).name),
+    Some(CtorTarget(c)) -> DenotesCtor({ type_name: index.nodes.get(c.owner).name, name: c.name }),
+    None -> DenotesNothing,
+  }
+
+/// The program-wide name of the effect `module` names `qname`.
+pub fn effect_called(index: Index, module: Int, qname: QName) -> Option<Bytes> / {abort.raise} =
+  match effect_target(index, module, qname) {
+    Some(v) -> Some(index.nodes.get(v).name),
+    None -> None,
+  }
+
+/// The program-wide name of the type `module` names `qname`.
+pub fn type_named(index: Index, module: Int, qname: QName) -> Option<Bytes> / {abort.raise} =
+  match type_target(index, module, qualifier(qname), qname.name.name) {
+    Some(v) -> Some(index.nodes.get(v).name),
+    None -> None,
+  }
+
+pub fn ctor_target(index: Index, module: Int, qname: QName) -> Option<ValueTarget> / {abort.raise} =
+  match target(index, module, 0, qualifier(qname), qname.name.name) {
+    None -> None,
+    Some(t) -> match exported(
+        index,
+        qualifier(qname),
+        module,
+        index.items.get(t.owner).ctors.get(t.name),
+      ) {
+      Some(owner) -> Some(CtorTarget({ owner: owner, name: t.name })),
+      None -> None,
+    },
+  }
+
+pub fn type_target(
+  index: Index,
+  module: Int,
+  qual: Option<Bytes>,
+  name: Bytes,
+) -> Option<Int> / {abort.raise} =
+  match target(index, module, 1, qual, name) {
+    None -> None,
+    Some(t) -> exported(index, qual, module, index.items.get(t.owner).types.get(t.name)),
+  }
+
+pub fn effect_target(index: Index, module: Int, qname: QName) -> Option<Int> / {abort.raise} =
+  match target(index, module, 2, qualifier(qname), qname.name.name) {
+    None -> None,
+    Some(t) ->
+      exported(index, qualifier(qname), module, index.items.get(t.owner).effects.get(t.name)),
+  }
+
+pub fn is_cyclic(component: List<Int>, edges: List<List<Int>>) -> Bool / {abort.raise} =
+  if component.len() != 1 { true } else {
+    let only = component.get(0);
+    edges.get(only).contains(only)
+  }

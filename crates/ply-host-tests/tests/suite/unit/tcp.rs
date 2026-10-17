@@ -1,4 +1,4 @@
-use ply_eval::{
+use ply_core::{
     Bound, CheckOutput, Diagnostic, EffectAtom, HostAnswer, HostBinding, HostRequest, HostRuntime,
     Linearity, Mode, Pending, Resource, Span, Symbol, Value, codes,
 };
@@ -9,7 +9,7 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::Arc;
 
 use crate::support::declared::{labelled, performed, shipped};
-use ply_sketch::Sketch;
+use ply_test_support::Sketch;
 
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n";
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply";
@@ -34,7 +34,7 @@ fn fixture() -> CheckOutput {
 }
 
 /// The shipped declaration as the binder reads it, which a test may change as no source can.
-fn declared(check: &mut CheckOutput) -> &mut ply_eval::EffectInfo {
+fn declared(check: &mut CheckOutput) -> &mut ply_core::EffectInfo {
     check
         .effects
         .get_mut(&Symbol::new(EFFECT))
@@ -65,7 +65,7 @@ fn perform(
         )
         .expect("the registry serves this triple");
     let request = HostRequest {
-        machine: ply_eval::host::MachineId(1),
+        machine: ply_core::host::MachineId(1),
         atom: bound.atom.clone(),
         op: bound.op,
         args: &args,

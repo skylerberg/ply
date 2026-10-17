@@ -650,6 +650,25 @@ check`, `ply test`, `ply prove`) runs the command for every package the path
 reaches by a path dependency as well, each as its own root with its own cache,
 dependencies first; a fetched or vendored dependency is never one of them.
 
+A repository of several packages states where they lie in a `ply.work` at its
+root: one definition, `fn workspace() -> Workspace = ...`, a literal of
+`std.pkg`'s `Workspace` (`ply doc std.pkg.Workspace`), checked as a manifest is
+(`E0129`–`E0131`). It lists the directory of each package whose code the
+repository maintains (`packages`), of each package of tests or examples
+(`suites`, each saying whether `ply prove` discharges it), and of each tree of
+Ply sources no package holds (`fixtures`); every directory is relative to the
+file, below it, and named once. The repository that builds `ply` names its parts
+too (`toolchain`): the standard library, the compiler, the program's package and
+the definition it enters, the suites that test the library and the program, and
+the cargo package of the runtime's library, which is what `ply bootstrap` builds
+from (§16). `ply work [PATH]` prints the workspace at or above a directory, a
+role and a path a line — `std`, `std-tests`, `compiler`, `cli`, `entry`,
+`cli-tests`, `runtime` and `library` (the file of the runtime's static library,
+below `target/<profile>`), then `package`, `suite`, `proved` and `fixtures` —
+or as one document with `--json`; where no directory at or above holds a
+`ply.work`, it is `E0502`. A workspace changes nothing a command does to a
+package: each is still its own root.
+
 ### 3.4 Embedding files
 
 ```ply
@@ -2225,14 +2244,21 @@ under either profile (§8.6); a `const fn` a build kept the value of costs
 nothing to read (§3.5):
 
 ```ply
-test "ten more elements cost twenty more steps: one in each closure" {
-  let small = metered(|| total(squares(10)));
-  let large = metered(|| total(squares(20)));
-  assert_eq(large.steps - small.steps, 20)
+type Chain = | Link(Int, Chain) | End
+
+fn chain(n: Int) -> Chain = if n <= 0 { End } else { Link(n, chain(n - 1)) }
+
+test "ten more levels cost ten more calls and ten more objects" {
+  let small = metered(|| chain(10));
+  let large = metered(|| chain(20));
+  assert_eq(large.steps - small.steps, 10);
+  assert_eq(large.allocations - small.allocations, 10)
 }
 ```
 
-`std.pace::paced` checks how `steps` grows with a size instead of pinning it.
+A call of a function `std.prelude` writes in Ply, such as `List::map` or `List::fold`, costs the
+steps its body takes, which a release may change; `std.pace::paced` checks how `steps` grows with
+a size instead of pinning it.
 
 A test may range over a table, and is then a test for each of its elements, a
 *case*:
@@ -3291,10 +3317,10 @@ at the CA's certificate. A handshake the client cannot complete is `E0141`, and
 says so. `http://` is accepted only for a registry on this machine
 (`localhost`, `127.x.x.x`, `[::1]`), because a publish carries a token.
 
-The registry is a Ply program, `crates/ply-registry/ply`:
+The registry is a Ply program, `packages/registry`:
 
 ```
-$ ply run crates/ply-registry/ply --host --fs store=/srv/ply \
+$ ply run packages/registry --host --fs store=/srv/ply \
     --tls registry=cert.pem,key.pem --set tls=registry --set port=8443 \
     --config tokens.conf
 ```
@@ -3402,21 +3428,22 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING`, `--std` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
-| `ply bootstrap [<checkout>]` | builds a native `ply` from a checkout (default `.`): the checkout's compiler built by this `ply` into the builder, linked with the runtime's library cargo built (`--runtime LIBRARY`, default `target/<profile>/libply_native.a`), the builder run over the checkout's `ply`, that linked with the library, and its pack written with the shipped modules, what they answer (each one `ply` imports answered once, by the builder, through the store the answering reads) and what its front end answered of the definition it enters; the builder is taken from the toolchain's cache where an earlier bootstrap kept it, and so is what the shipped modules answer, kept under how the `ply` answers them and not under its front end, so a `ply` that differs from an earlier one only outside what answers them answers nothing; the C compiles under `--profile development` (default) or `release`, and the `ply` goes to `--out PATH` (default `target/<profile>/ply`) |
+| `ply bootstrap [<checkout>]` | builds a native `ply` from a checkout (default `.`), its parts where its `ply.work` places them (§3.3): the checkout's compiler built by this `ply` into the builder, linked with the runtime's library cargo built (`--runtime LIBRARY`, default the static library of the `runtime` package below `target/<profile>`), the builder run over the checkout's `ply`, that linked with the library, and its pack written with the shipped modules, what they answer (each one `ply` imports answered once, by the builder, through the store the answering reads) and what its front end answered of the definition it enters; the builder is taken from the toolchain's cache where an earlier bootstrap kept it, and so is what the shipped modules answer, kept under how the `ply` answers them and not under its front end, so a `ply` that differs from an earlier one only outside what answers them answers nothing; the C compiles under `--profile development` (default) or `release`, and the `ply` goes to `--out PATH` (default `target/<profile>/ply`) |
+| `ply work [<path>]` | where the `ply.work` at or above a directory (default `.`) places each package and each part of `ply`: a role and a path a line, or `--json` (§3.3) |
 | `ply cache clear\|stats\|compact [path]` | discard the store and the memo store / report what they hold and their reclaimable space / reclaim it: the memo store written again as one segment that keeps the records of this `ply`'s queries and the answers of its own commands, with the answers and reader links those records reach, and the store's definitions no pass record reaches |
 | `ply cache inspect <DEF> [path]` | what a load answers for a definition, a declaration or a test, by full name, simple name or 4+ hex hash prefix: its place, hash, type or form, footprint, the effects it names, its body's size, and whether a run proved a test at its hash |
 
 `ply new`, `ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`,
 `ply show`, `ply replace`, `ply resolve`, `ply vendor`, `ply why`, `ply publish`,
 `ply yank`, `ply callers`,
-`ply std`, `ply explain`, `ply hosts`, `ply cache` and `ply bootstrap` are one
-Ply program (`crates/ply-cli/ply`, entered at `ply.main`). The program itself parses the command line, prints help and
+`ply std`, `ply explain`, `ply hosts`, `ply cache`, `ply bootstrap` and `ply work`
+are one Ply program (the `cli` package, entered at `ply.main`). The program itself parses the command line, prints help and
 refusals, and resolves the paths it is given against the working directory — a
 relative path reads under it, an absolute one reads where it points — and then
 finds the root each is part of (§1): `[path]` in the table above is a `.ply`
 file or a directory, and left off it is the package the working directory is
-part of. `ply fmt` rewrites the paths it is given as they stand, `ply new` and
-`ply bootstrap` take theirs as written, and `ply doc` answers for a builtin or a
+part of. `ply fmt` rewrites the paths it is given as they stand, `ply new`,
+`ply bootstrap` and `ply work` take theirs as written, and `ply doc` answers for a builtin or a
 shipped module where no package holds the working directory. The binary
 answers with the code the program asked to exit with. What a command needs of
 the machine is lent to the program as an effect: `ply run`, `ply test` and
@@ -3696,9 +3723,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0126` | top-level `fn` missing a parameter or return type |
 | `E0127` | `reuse fn` with an update that cannot happen in place |
 | `E0128` | `ply replace` refused: the result would not check or would move another definition |
-| `E0129` | a `ply.pkg` that is not exactly one `fn package` returning `Manifest` |
-| `E0130` | a manifest body that runs rather than being a value |
-| `E0131` | a manifest field that does not decode or fails validation |
+| `E0129` | a `ply.pkg` that is not exactly one `fn package` returning `Manifest`, or a `ply.work` that is not one `fn workspace` returning `Workspace` |
+| `E0130` | a manifest's or a workspace's body that runs rather than being a value |
+| `E0131` | a manifest's or a workspace's field that does not decode or fails validation |
 | `E0132` | an import of a package the manifest does not declare as a dependency |
 | `E0133` | two packages granting one module prefix |
 | `E0134` | packages depending on one another in a cycle |

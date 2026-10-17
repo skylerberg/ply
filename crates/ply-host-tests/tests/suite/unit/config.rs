@@ -1,5 +1,5 @@
-use ply_eval::Symbol;
-use ply_eval::host::{Determinism, Linearity};
+use ply_core::Symbol;
+use ply_core::host::{Determinism, Linearity};
 use ply_host::config::*;
 use std::sync::Arc;
 
@@ -69,7 +69,7 @@ fn an_unsupplied_secret_answers_none_from_both() {
 
 #[test]
 fn two_configuration_readers_never_conflict() {
-    use ply_eval::{EffectAtom, Footprint, Mode, Resource};
+    use ply_core::{EffectAtom, Footprint, Mode, Resource};
 
     let effect = Symbol::new(EFFECT);
     let atom = |namespace: &str| {

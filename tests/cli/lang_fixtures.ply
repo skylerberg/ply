@@ -1,0 +1,183 @@
+//! A fixture under `tests/fixtures/lang/` states in `// raises <test> :: <text>` lines which of its
+//! tests fail with `E0502` carrying `<text>`, and in `// footprint <definition> :: <row>` lines what
+//! the checker infers.
+
+import harness (Ran, in_memory, one, said, json_of, at, items, str, int, shown, Hermetic, Shipped)
+import std.json (Json, Str)
+import std.string
+
+/// Embedded, so a test that reads one is cached until a fixture changes.
+fn fixtures() -> List<{ name: String, bytes: Bytes }> = embed_dir("../fixtures/lang")
+
+fn fixture(name: String) -> String / {abort.raise} =
+  match fixtures().filter(|f: { name: String, bytes: Bytes }| f.name == name ++ ".ply") {
+    [f, ..] -> String::of_bytes(f.bytes),
+    [] -> panic("`tests/fixtures/lang` holds no `" ++ name ++ ".ply`"),
+  }
+
+type Stated = { test: String, text: String }
+
+/// Every `// <word> <first> :: <second>` line of a fixture.
+fn stated(source: String, word: String) -> List<Stated> / {abort.raise} =
+  source.split("\n").fold([], |acc: List<Stated>, line: String| {
+    let lead = "// " ++ word ++ " ";
+    if !line.starts_with(lead) { acc } else {
+      let rest = line.slice(lead.len(), line.len());
+      match rest.split_once(" :: ") {
+        Some(p) -> acc.push({ test: p.head.trim(), text: p.tail.trim() }),
+        None -> panic("`" ++ word ++ " <name> :: <text>`: " ++ line),
+      }
+    }
+  })
+
+/// The message, labels and notes of a diagnostic as one text: the machine labels a span, and
+/// compiled code, which has none, says the same in a note.
+fn carried(d: Json) -> String = {
+  let texts = |key: String|
+    String::join(
+      items(at(d, key)).map(|x: Json| match x { Str(s) -> s, _ -> str(at(x, "message")) }),
+      " ",
+    );
+  str(at(d, "message")) ++ " " ++ texts("labels") ++ " " ++ texts("notes")
+}
+
+fn raises(name: String, source: String) -> List<Stated> / {abort.raise} = {
+  let expected = stated(source, "raises");
+  assert(expected.len() > 0, Some(name ++ " states no raises"));
+  expected
+}
+
+/// The fixture alone, its raises judged on the C backend.
+fn raises_hold(name: String) -> Unit / {Hermetic, Shipped, abort.raise, diverges} = {
+  let source = fixture(name);
+  judged(name, raises(name, source), in_memory(one(source), ["test", "--json", "--no-cache"]))
+}
+
+/// A fixture whose every test holds.
+fn holds(name: String) -> Unit / {Hermetic, Shipped, abort.raise, diverges} = {
+  let r = in_memory(one(fixture(name)), ["test", "--json", "--no-cache"]);
+  let v = json_of(r);
+  assert(items(at(v, "failures")).len() == 0, Some(name ++ ": " ++ said(r)));
+  assert(int(at(at(v, "summary"), "passed")) > 0, Some(name ++ " ran nothing: " ++ said(r)))
+}
+
+test "what a call costs is counted" { holds("costs") }
+
+fn judged(name: String, expected: List<Stated>, ran: Ran) -> Unit / {abort.raise} = {
+  let failed = items(at(json_of(ran), "failures"));
+  expected.fold((), |u: Unit, e: Stated| {
+    let failure = match failed.filter(|f: Json| str(at(f, "name")) == e.test) {
+      [f, ..] -> f,
+      [] -> panic(name ++ ": `" ++ e.test ++ "` did not fail: " ++ said(ran)),
+    };
+    let d = at(failure, "diagnostic");
+    assert(str(at(d, "code")) == "E0502", Some(name ++ ": `" ++ e.test ++ "`: " ++ shown(d)));
+    assert(
+      carried(d).contains(e.text),
+      Some(name ++ ": `" ++ e.test ++ "` raised without `" ++ e.text ++ "`: " ++ shown(d)),
+    )
+  });
+  assert(
+    failed.len() == expected.len(),
+    Some(name ++ ": every failure must be an expected raise: " ++ said(ran)),
+  )
+}
+
+test "the footprints the checker infers are the ones stated" {
+  let source = fixture("footprints");
+  let expected = stated(source, "footprint");
+  assert(expected.len() > 0, Some("the fixture states footprints"));
+  let defs = items(at(json_of(in_memory(one(source), ["check", "--json"])), "definitions"));
+  expected.fold((), |u: Unit, e: Stated| {
+    let name = "m." ++ e.test;
+    match defs.filter(|d: Json| str(at(d, "name")) == name) {
+      [d, ..] -> assert(str(at(d, "footprint")) == e.text, Some("`" ++ name ++ "`: " ++ shown(d))),
+      [] -> panic("`" ++ name ++ "` is not reported"),
+    }
+  })
+}
+
+test "the call bound counts nesting calls only" { raises_hold("recursion_raise") }
+
+test "the numeric raises hold" { raises_hold("numbers_raise") }
+
+test "the shift and overflow raises hold" { raises_hold("bits_raise") }
+
+test "a width raises at its type through every binder" { raises_hold("widths_raise") }
+
+test "the byte builtins' raises hold" { raises_hold("bytes_raise") }
+
+test "the list update raises hold" { raises_hold("lists_raise") }
+
+test "a raise nothing answers fails its test with what it carried" {
+  raises_hold("unanswered_raise")
+}
+
+test "a `?` does not leave a function through a hold's region" {
+  let source =
+    \\fn free(x: Int) -> Unit = ()
+    \\
+    \\fn positive(n: Int) -> Option<Int> = if n > 0 { Some(n) } else { None }
+    \\
+    \\pub fn held(n: Int) -> Option<Int> =
+    \\  with_hold[r](1, free) { h -> Some(positive(n)? + h.get()) }
+    \\
+  ;
+  let report = json_of(in_memory(one(source), ["check", "--json"]));
+  assert_eq(items(at(report, "diagnostics")).map(|d: Json| str(at(d, "code"))), ["E0118"])
+}
+
+// Each inner test resumes one continuation twice through a `with_hold`. The first resumption ends
+// the body, so the hold is let go once, which the clause asserts before it resumes again; the
+// second finds the hold gone, where it reads it or where the region would let it go again.
+test "a continuation resumed after a hold's release is refused, and nothing is released twice" {
+  let source =
+    \\effect amb { write flip() -> Bool }
+    \\effect log { write note(s: String) -> Unit }
+    \\
+    \\fn read_after() -> Int / {amb.flip, log.note} =
+    \\  with_hold[file]("a", |name: String| log.note("close " ++ name)) { h -> {
+    \\    let heads = amb.flip();
+    \\    if heads { 1 } else { h.get().len() }
+    \\  } }
+    \\
+    \\fn ended_after() -> Int / {amb.flip, log.note} =
+    \\  with_hold[file]("a", |name: String| log.note("close " ++ name)) { h -> {
+    \\    let heads = amb.flip();
+    \\    if heads { 1 } else { 2 }
+    \\  } }
+    \\
+    \\effect seen { read notes() -> List<String> }
+    \\
+    \\fn both(chosen: () -> Int / {amb.flip, log.note}) -> Int / {abort.raise} =
+    \\  handle {
+    \\    handle { chosen() } with {
+    \\      amb.flip() resume k -> {
+    \\        let first = k(true);
+    \\        assert_eq(seen.notes(), ["close a"]);
+    \\        first + k(false)
+    \\      },
+    \\    }
+    \\  } with {
+    \\    var notes = [],
+    \\    log.note(s) -> {
+    \\      notes = notes.push(s);
+    \\    },
+    \\    seen.notes() -> notes,
+    \\  }
+    \\
+    \\test "a hold read by a second resumption" { assert_eq(both(read_after), 2) }
+    \\
+    \\test "a hold let go by a second resumption" { assert_eq(both(ended_after), 3) }
+    \\
+  ;
+  let ran = in_memory(one(source), ["test", "--json", "--no-cache"]);
+  let failed = items(at(json_of(ran), "failures"));
+  assert(failed.len() == 2, Some(said(ran)));
+  failed.fold((), |u: Unit, f: Json| {
+    let d = at(f, "diagnostic");
+    assert(str(at(d, "code")) == "E0331", Some(shown(d)))
+  });
+  assert(said(ran).contains("a hold is read after"), Some(said(ran)));
+  assert(said(ran).contains("a hold is let go after"), Some(said(ran)))
+}

@@ -1,0 +1,254 @@
+//! `decide` — the static proof tier: a decision procedure for the decidable fragment, and the
+//! certificate a proof becomes.
+
+import compiler.emit.code (Code)
+import context (Context)
+import goal (Goal, Binder, Limits, Reason, Open, BudgetSpent, Proof, Assertion, run, conjunction,
+             domain_inhabited, uninterpreted_sorts, float_in, key_in, int_ranges, with_true)
+import induct (attempt)
+import lower (Lowering, Blocker, FloatTerm, KeyedTerm, lowering, bind_symbolic, lower_root, assume)
+import rules (Rule, RuleLog, Unfold, Induction, no_rules, rules_of)
+import solve (Answer, Closed, Exhausted)
+import term (Terms, and, eq)
+import std.list
+
+pub type Decision =
+  | Proved(Proof)
+  | GuardUnsatisfiable(Int)
+  | Unknown({ reason: Reason, steps: Int })
+
+pub fn steps_of(d: Decision) -> Int =
+  match d { Proved(p) -> p.steps, GuardUnsatisfiable(s) -> s, Unknown(u) -> u.steps }
+
+/// The word a report prints for it.
+pub fn decision_word(d: Decision) -> String =
+  match d {
+    Proved(_) -> "proved",
+    GuardUnsatisfiable(_) -> "guard_unsatisfiable",
+    Unknown(u) -> match u.reason { Open -> "open", BudgetSpent -> "budget_spent" },
+  }
+
+pub type Diagnosed = { decision: Decision, blockers: List<Blocker> }
+
+pub fn decide(context: Context, g: Goal, limits: Limits) -> Decision / {abort.raise} =
+  decide_and_diagnose(context, g, limits).decision
+
+fn inconclusive(a: Answer) -> Option<Reason> =
+  match a { Closed -> None, Exhausted -> Some(BudgetSpent), _ -> Some(Open) }
+
+pub fn decide_and_diagnose(context: Context, g: Goal, limits: Limits) -> Diagnosed / {abort.raise} = {
+  let start = {
+    ..lowering(no_rules(), limits.unfold_depth),
+    total: g.total.fold(Map::new(), |m: Map<String, Bool>, n: String| m.insert(n, true)),
+    lemmas: g.lemmas,
+  };
+  let bound = g.binders.fold(
+    { lowering: start, ids: [] },
+    |acc: { lowering: Lowering, ids: List<Int> }, b: Binder| {
+      let r = bind_symbolic(acc.lowering, b.ty, context);
+      { lowering: r.lowering, ids: acc.ids.push(r.id) }
+    },
+  );
+  // The evaluator stops at the first false `requires`, so a later one may assume the earlier.
+  let guarded = g.guards.fold(
+    { lowering: bound.lowering, ids: [] },
+    |acc: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
+      let r = lower_root(acc.lowering, context, guard, bound.ids);
+      { lowering: assume(r.lowering, r.id), ids: acc.ids.push(r.id) }
+    },
+  );
+  // Requirements before this mark decide the guard, so they may not assume it.
+  let guard_mark = guarded.lowering.requirements.len();
+  let defined = match g.result {
+    Some(result_body) -> if bound.ids.len() == 0 { { lowering: guarded.lowering, def: None } }
+    else {
+      let r = lower_root(
+        guarded.lowering,
+        context,
+        result_body,
+        bound.ids.take(bound.ids.len() - 1),
+      );
+      {
+        lowering: r.lowering,
+        def: Some({
+          symbol: match bound.ids.at(bound.ids.len() - 1) { Some(t) -> t, None -> 0 },
+          value: r.id,
+        }),
+      }
+    },
+    None -> { lowering: guarded.lowering, def: None },
+  };
+  let body = lower_root(defined.lowering, context, g.body, bound.ids);
+  let lowering = body.lowering;
+  let blockers = lowering.blockers;
+  // `Float`, and a value compared by its type's `key`, are refused before any solver runs, so no
+  // proof or certificate can be built: neither is equal as its constructors and fields say.
+  if lowering.float || float_in(context, lowering.terms) || key_in(context, lowering.terms) {
+    let named = if key_in(context, lowering.terms) { KeyedTerm } else { FloatTerm };
+    {
+      decision: Unknown({ reason: Open, steps: 0 }),
+      blockers: if blockers.fold(false, |f: Bool, b: Blocker|
+          f || b == FloatTerm || b == KeyedTerm) { blockers }
+      else { blockers.push(named) },
+    }
+  } else {
+    let definition = match defined.def {
+      Some(d) -> {
+        let m = eq(lowering.terms, d.symbol, d.value);
+        { terms: m.terms, eq: Some(m.id), symbol: Some(d.symbol) }
+      },
+      None -> { terms: lowering.terms, eq: None, symbol: None },
+    };
+    let guards = guarded.ids.map(|t: Int| { term: t, polarity: true });
+    let ranges = int_ranges(definition.terms, definition.symbol, Map::new());
+    let guard_needs = lowering.requirements.take(guard_mark);
+    let body_needs = if g.partial { [] } else { lowering.requirements.drop(guard_mark) };
+    // A guard that can raise has no domain, so the obligation is not decided at any tier.
+    let needed = conjunction(ranges.terms, guard_needs);
+    let checked = match needed.id {
+      None ->
+        { terms: needed.terms, rules: lowering.rules, budget: limits.steps, spent: 0, stop: None },
+      Some(conjoined) -> {
+        let r = run(
+          needed.terms,
+          context,
+          lowering.rules,
+          limits.steps,
+          limits,
+          ranges.out.push({ term: conjoined, polarity: false }),
+        );
+        {
+          terms: r.terms,
+          rules: r.rules,
+          budget: r.left,
+          spent: limits.steps - r.left,
+          stop: inconclusive(r.answer),
+        }
+      },
+    };
+    match checked.stop {
+      Some(reason) ->
+        { decision: Unknown({ reason: reason, steps: checked.spent }), blockers: blockers },
+      None -> {
+        let vacuity = if guards.len() == 0 {
+          { terms: checked.terms, budget: checked.budget, spent: checked.spent, vacuous: false }
+        } else {
+          let r = run(checked.terms, context, no_rules(), checked.budget, limits, guards);
+          {
+            terms: r.terms,
+            budget: r.left,
+            spent: checked.spent + (checked.budget - r.left),
+            vacuous: r.answer == Closed,
+          }
+        };
+        if vacuity.vacuous { { decision: GuardUnsatisfiable(vacuity.spent), blockers: blockers } }
+        else {
+          let needs = conjunction(vacuity.terms, body_needs);
+          let claim = match needs.id {
+            Some(n) -> {
+              let m = and(needs.terms, body.id, n);
+              { terms: m.terms, id: m.id }
+            },
+            None -> { terms: needs.terms, id: body.id },
+          };
+          let assertions = ranges.out.concat(guards).concat(with_true(lowering.facts)).concat(
+            match definition.eq { Some(d) -> [{ term: d, polarity: true }], None -> [] },
+          ).push({ term: claim.id, polarity: false });
+          let r = run(claim.terms, context, checked.rules, vacuity.budget, limits, assertions);
+          let spent = vacuity.spent + (vacuity.budget - r.left);
+          match inconclusive(r.answer) {
+            Some(reason) -> {
+              let tried = if g.partial { { proof: None, blockers: blockers } }
+              else { attempt(context, g, limits, r.left, spent, blockers) };
+              match tried.proof {
+                Some(p) -> { decision: certified(p, limits), blockers: tried.blockers },
+                None ->
+                  { decision: Unknown({ reason: reason, steps: spent }), blockers: tried.blockers },
+              }
+            },
+            None -> {
+              let sat = if !domain_inhabited(context, g.binders) { { ok: false, spent: spent } }
+              else {
+                let all = conjunction(r.terms, guarded.ids);
+                match all.id {
+                  None -> { ok: true, spent: spent },
+                  // A valid guard over a non-empty domain admits a value.
+                  Some(a) -> {
+                    let v = run(all.terms, context, no_rules(), r.left, limits, [
+                      { term: a, polarity: false },
+                    ]);
+                    { ok: v.answer == Closed, spent: spent + (r.left - v.left) }
+                  },
+                }
+              };
+              {
+                decision: certified(
+                  {
+                    rules: rules_of(r.rules),
+                    steps: sat.spent,
+                    sorts: uninterpreted_sorts(g.binders),
+                    guard_satisfiable: sat.ok,
+                  },
+                  limits,
+                ),
+                blockers: blockers,
+              }
+            },
+          }
+        }
+      },
+    }
+  }
+}
+
+/// `p` as a decision, which raises where `p` is no certificate the decider issues: one names a rule,
+/// inlines no definition past `limits`, and unrolls each definition it inducts over.
+fn certified(p: Proof, limits: Limits) -> Decision / {abort.raise} = {
+  let unrolled = p.rules.fold([], |defs: List<String>, r: Rule|
+    match r {
+      Unfold(u) -> if u.depth < 0 || u.depth > limits.unfold_depth {
+        panic("a certificate inlines `" ++ u.def ++ "` " ++ u.depth.to_string() ++ " deep")
+      } else { defs.push(u.def) },
+      _ -> defs,
+    });
+  let unproved = p.rules.fold(None, |found: Option<String>, r: Rule|
+    match ((found, r)) {
+      (None, Induction(i)) -> if unrolled.contains(i.def) { None } else { Some(i.def) },
+      _ -> found,
+    });
+  match unproved {
+    Some(def) -> panic("a certificate inducts over `" ++ def ++ "` without unrolling it"),
+    None -> if p.rules == [] { panic("a certificate names no rule") } else { Proved(p) },
+  }
+}
+
+/// What a decision leaves a discharge to carry out: a certificate; one that stands once a value its
+/// guard admits is found; a guard nothing satisfies; or nothing settled.
+pub type Static =
+  | Certified(Settlement)
+  | Unwitnessed(Settlement)
+  | GuardRefuted
+  | Undecided(Stopped)
+
+pub type Settlement = { rules: List<Rule>, steps: Int, sorts: List<String> }
+
+/// Where an attempt that closed no proof stopped: whether its budget ran out, and each place it
+/// left the fragment the prover decides.
+pub type Stopped = { spent: Bool, blockers: List<Blocker> }
+
+/// What a claim the static prover is never asked about is left as.
+pub fn unasked() -> Static = Undecided({ spent: false, blockers: [] })
+
+pub fn static_of(d: Diagnosed, variables: List<String>) -> Static =
+  match d.decision {
+    GuardUnsatisfiable(_) -> GuardRefuted,
+    Unknown(u) -> Undecided({ spent: u.reason == BudgetSpent, blockers: d.blockers }),
+    Proved(p) -> {
+      let s = {
+        rules: p.rules,
+        steps: p.steps,
+        sorts: p.sorts.map(|v: Int| match variables.at(v) { Some(n) -> n, None -> "" }),
+      };
+      if p.guard_satisfiable { Certified(s) } else { Unwitnessed(s) }
+    },
+  }

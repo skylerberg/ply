@@ -1,4 +1,4 @@
-use ply_eval::{Diagnostic, Span, codes};
+use ply_core::{Diagnostic, Span, codes};
 use ply_host::tls::*;
 use rustls::crypto::CryptoProvider;
 use rustls::server::ServerConfig;

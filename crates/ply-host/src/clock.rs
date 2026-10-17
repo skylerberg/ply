@@ -4,8 +4,8 @@
 //! performed where no task could run meanwhile.
 
 use crate::time::TimeHost;
-use ply_eval::host::HostRegistry;
-use ply_eval::{
+use ply_core::host::HostRegistry;
+use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
     HostRuntime, Linearity, Span, Symbol, Value, codes,
 };
@@ -69,7 +69,7 @@ impl HostHandler for Operation {
         Ok(HostAnswer::Value(match self.op {
             Op::Now => Value::ctor("Instant", vec![Value::Int(self.time.elapsed_ns())]),
             Op::Sleep => {
-                self.time.sleep_ns(ply_eval::sim::nanos_of(
+                self.time.sleep_ns(ply_core::sim::nanos_of(
                     &req.args[0],
                     req.span,
                     self.op.what(),

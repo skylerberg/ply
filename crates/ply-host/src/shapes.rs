@@ -4,7 +4,7 @@
 
 use crate::dns;
 use crate::tcp::wire::{self, Credentials, Endpoint, Probing, Refusal, SocketOption};
-use ply_eval::Value;
+use ply_core::Value;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 

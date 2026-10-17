@@ -1,0 +1,562 @@
+//! What a name or a place in a body refers to, as the emitter writes it.
+
+import syntax.parsing (Ident, starts_upper, prelude_binder)
+import emit.code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpdate,
+                  NKnown, Lambda, NApp, NRecord, NMatch, PxVar, PxList, NPerform, NLambda,
+                  NSimulate, NParallel, NHandle, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm,
+                  CodeClause, Own, Borrowed, Owned)
+import check.resolve.tables (qualify)
+import check.types (TyCon, TyFn, Scheme)
+import std.list
+import syntax.patterns (LStr)
+import std.bytes (ascii_of_int)
+import emit.c (KInt, KSum, Kind, Tagged, Zeroed)
+import emit.roots (builtin_helper, symbol_of)
+import emit.reps (Ty, TyOf, TyOpen, Def, Imported)
+import emit.state (CValue, Emitter, WithValue, refused, Own, word_ty)
+
+/// A constructor's tag: this module's own, a qualified one, or one an import brought in bare.
+pub fn tag_of(emitter: Emitter, name: Bytes) -> Option<Int> = {
+  let part = qualified(name);
+  let written = match part { Some(q) -> q.name, None -> name };
+  let want = match part {
+    Some(q) -> match module_import(emitter.imports, q.binder) {
+      Some(imp) -> Bytes::concat_all([imp.module, b".", q.name]),
+      None -> Bytes::concat_all([b"std.", q.binder, b".", q.name]),
+    },
+    None -> qualify(emitter.module, name),
+  };
+  match ctor_index(emitter.ctors.names, want, name) {
+    Some(t) -> Some(t),
+    // Only an import that bound this name can be where it came from. Two modules may declare a
+    // constructor of the same name, so matching on the module alone would take the wrong one.
+    None ->
+      emitter.imports.fold(None, |acc: Option<Int>, imp: Imported|
+        match acc {
+          Some(_) -> acc,
+          None -> if !imp.whole && imp.name == written {
+            ctor_index(emitter.ctors.names, Bytes::concat_all([imp.module, b".", written]), b"")
+          } else { None },
+        }),
+  }
+}
+
+/// Constructor `name` of a sum held as `kind` says, over its word `w`: the test that `w` is it, and
+/// its argument's word.
+pub fn sum_case(
+  emitter: Emitter,
+  kind: Kind,
+  name: Bytes,
+  w: Bytes,
+) -> { test: Bytes, arg: Bytes } = {
+  let bare = match tag_of(emitter, name) {
+    Some(tag) -> match emitter.ctors.names.at(tag) { Some(n) -> n, None -> name },
+    None -> name,
+  };
+  match kind {
+    KSum(Tagged) -> if bare == b"Err" {
+      {
+        test: Bytes::concat_all([b"((", w, b" & 7) == 4)"]),
+        arg: Bytes::concat_all([b"(", w, b" & ~(Word)7)"]),
+      }
+    } else { { test: Bytes::concat_all([b"((", w, b" & 7) != 4)"]), arg: w } },
+    _ -> if bare == b"None" { { test: Bytes::concat_all([b"(", w, b" == 0)"]), arg: w } }
+    else { { test: Bytes::concat_all([b"(", w, b" != 0)"]), arg: w } },
+  }
+}
+
+/// The name the constructor table gives the constructor written `name`.
+pub fn ctor_bare(emitter: Emitter, name: Bytes) -> Bytes =
+  match tag_of(emitter, name) {
+    Some(tag) -> match emitter.ctors.names.at(tag) { Some(n) -> n, None -> name },
+    None -> name,
+  }
+
+/// Whether `tag` is the prelude's constructor `name`, which the table names bare.
+pub fn is_option(emitter: Emitter, tag: Int, name: Bytes) -> Bool =
+  emitter.ctors.names.at(tag) == Some(name)
+
+/// The runtime's helper for a builtin answering an element or `None`, which hands the element back
+/// with a count or zero: an `Option` held as its payload's word, no object made. `std.prelude`'s
+/// `ListNode::leaf_of` is a native that answers so.
+pub fn lookup_helper(name: Bytes, n: Int) -> Option<Bytes> / {abort.raise} =
+  if n != 2 { None }
+  else if name == b"Array::at" { Some(b"rt_array_lookup_p") }
+  else if name == b"ListNode::leaf_of" { Some(builtin_helper(name).concat(b"_p")) }
+  else { None }
+
+/// A constructor's tag as the C writes it: by its name in the program's table, which a unit resolves
+/// to the position its own table gives that name, so a body reads the same in every program and does
+/// not move when a constructor is added elsewhere.
+/// The witness of a type that states its own arithmetic, which the elaboration names by one of the
+/// type's constructors: the runtime's first such witness past that constructor's tag, so the body
+/// names the tag and takes what the type states with it.
+pub fn stated_witness(emitter: Emitter, args: List<Code>) -> Option<WithValue> / {abort.raise} =
+  match match args.at(0) {
+      Some(c) -> match c.node {
+        NLit(LStr(name)) -> ctor_index(emitter.ctors.names, name, b""),
+        _ -> None,
+      },
+      None -> None,
+    } {
+    None -> Some(refused(emitter, b"a witness of a type no constructor names")),
+    Some(tag) ->
+      Some({
+        emitter: emitter,
+        value: {
+          kind: KInt,
+          expr: Bytes::concat_all([b"(13 + ", tag_text(emitter, tag), b")"]),
+          ty: TyOpen([]),
+        },
+      }),
+  }
+
+pub fn tag_text(emitter: Emitter, tag: Int) -> Bytes / {abort.raise} =
+  match emitter.ctors.names.at(tag) {
+    Some(name) -> Bytes::concat_all([b"@@T", name, b"@@"]),
+    None -> panic("a tag is a position in the program's constructor table"),
+  }
+
+pub fn ctor_index(ctors: List<Bytes>, want: Bytes, bare: Bytes) -> Option<Int> =
+  range(0, ctors.len()).fold(None, |acc: Option<Int>, i: Int|
+    match ctors.at(i) {
+      Some(c) -> if c == want || (bare != b"" && c == bare) { Some(i) } else { acc },
+      None -> acc,
+    })
+
+/// Whether `name` names a constructor: as written, `binder::Name`, or program-wide, as code the
+/// emitter writes names one, `m.Name`.
+pub fn is_ctor_name(name: Bytes) -> Bool / {abort.raise} =
+
+  // A written root's name spells a type, whose last segment may be a type's name.
+  name.index_of(b"#") == None
+    && starts_upper(match qualified(name) {
+      Some(q) -> q.name,
+      None -> if name.index_of(b".") == None { name } else {
+        let dot = range(0, name.len()).fold(0, |acc: Int, i: Int|
+          if name.at(i) == 46 { i } else { acc });
+        name.slice(dot + 1, name.len())
+      },
+    })
+
+pub fn last_segment(path: List<Ident>) -> Bytes =
+  match path.at(path.len() - 1) { Some(i) -> i.name, None -> b"" }
+
+/// `binder::name` split at the first `::`, when there is one.
+pub fn qualified(name: Bytes) -> Option<{ binder: Bytes, name: Bytes }> =
+  range(0, name.len() - 1).fold(None, |acc: Option<{ binder: Bytes, name: Bytes }>, i: Int|
+    match acc {
+      Some(_) -> acc,
+      None -> if name.at(i) == 58 && name.at(i + 1) == 58 {
+        Some({ binder: name.slice(0, i), name: name.slice(i + 2, name.len()) })
+      } else { None },
+    })
+
+pub fn from_import(xs: List<Imported>, name: Bytes) -> Option<Imported> =
+  xs.fold(None, |acc: Option<Imported>, i: Imported|
+    if !i.whole && i.name == name { Some(i) } else { acc })
+
+pub fn module_import(xs: List<Imported>, binder: Bytes) -> Option<Imported> =
+  xs.fold(None, |acc: Option<Imported>, i: Imported|
+    if i.whole && i.name == binder { Some(i) } else { acc })
+
+pub fn ret_of(here: List<Def>, name: Bytes) -> { kind: Option<Kind>, ty: Ty } =
+  here.fold({ kind: None, ty: TyOpen([]) }, |acc: { kind: Option<Kind>, ty: Ty }, d: Def|
+    if d.name == name { { kind: d.ret, ty: d.ret_ty } } else { acc })
+
+/// A nullary pure definition (here or imported) is read from the constant table, whatever its kind: a call reruns its body at every read.
+pub fn constant_of(
+  emitter: Emitter,
+  name: Bytes,
+) -> Option<{ full: Bytes, ret: { kind: Option<Kind>, ty: Ty } }> / {abort.raise} =
+  if emitter.here.fold(false, |acc: Bool, h: Def| acc || h.name == name) {
+    if is_pure(emitter.here, name) {
+      Some({ full: qualify(emitter.module, name), ret: ret_of(emitter.here, name) })
+    } else { None }
+  } else {
+    match imported_target(emitter.imports, name) {
+      None -> None,
+      Some(t) -> if is_pure(t.imp.defs, t.name) {
+        Some({
+          full: Bytes::concat_all([t.imp.module, b".", t.name]),
+          ret: ret_of(t.imp.defs, t.name),
+        })
+      } else { None },
+    }
+  }
+
+/// The import a name not this module's own reaches a definition through, and the definition's name
+/// there: a name a selective import binds, `binder::name` through a module's binder, or a function
+/// the prelude writes in Ply, which every module reaches by its name as written.
+pub fn imported_target(
+  imports: List<Imported>,
+  name: Bytes,
+) -> Option<{ imp: Imported, name: Bytes }> =
+  match match qualified(name) {
+      Some(q) -> match module_import(imports, q.binder) {
+        Some(imp) -> Some({ imp: imp, name: q.name }),
+        None -> None,
+      },
+      None -> match from_import(imports, name) {
+        Some(imp) -> Some({ imp: imp, name: name }),
+        None -> None,
+      },
+    } {
+    Some(t) -> Some(t),
+    None -> match module_import(imports, prelude_binder()) {
+      Some(imp) -> if imp.defs.fold(false, |found: Bool, d: Def| found || d.name == name) {
+        Some({ imp: imp, name: name })
+      } else { None },
+      None -> None,
+    },
+  }
+
+fn is_pure(here: List<Def>, name: Bytes) -> Bool =
+  here.fold(false, |acc: Bool, d: Def| if d.name == name { d.pure } else { acc })
+
+pub fn def_of(
+  emitter: Emitter,
+  name: Bytes,
+) -> Option<{ full: Bytes, expr: Bytes, arity: Int, scheme: Option<Scheme>, def: Def }> / {abort.raise} =
+  def_in(emitter.module, emitter.here, emitter.imports, name)
+
+/// The definition `name` names in `module`, which defines `here` and imports `imports`.
+pub fn def_in(
+  module: Bytes,
+  here: List<Def>,
+  imports: List<Imported>,
+  name: Bytes,
+) -> Option<{ full: Bytes, expr: Bytes, arity: Int, scheme: Option<Scheme>, def: Def }> / {abort.raise} =
+  if is_ctor_name(name) { None } else {
+    // The module's own comes first: a function of a type is named `T::name`, which reads as
+    // qualified and names no import.
+    let target = if here.fold(false, |acc: Bool, h: Def| acc || h.name == name) {
+      Some({ module: module, name: name, defs: here })
+    } else {
+      match imported_target(imports, name) {
+        Some(t) -> Some({ module: t.imp.module, name: t.name, defs: t.imp.defs }),
+        None -> None,
+      }
+    };
+    match target {
+      None -> None,
+      Some(t) -> match t.defs.fold(None, |acc: Option<Def>, d: Def|
+          if d.name == t.name { Some(d) } else { acc }) {
+        Some(d) -> {
+          let full = Bytes::concat_all([t.module, b".", t.name]);
+          Some({ full: full, expr: symbol_of(full), arity: d.arity, scheme: d.scheme, def: d })
+        },
+        None -> None,
+      },
+    }
+  }
+
+// --- Externs written in place -----------------------------------------------------
+
+/// What the argument of constructor `name` of the sum `subj` is laid out as, held as its word: an
+/// `Option` held as its payload's word says that payload's own layout, and a word of a known
+/// `Option` or `Result` type its argument's.
+pub fn arg_ty(emitter: Emitter, subj: CValue, name: Bytes) -> Ty =
+  if subj.kind == KSum(Zeroed) { subj.ty } else {
+    match subj.ty {
+      TyOf(of) -> match of {
+        TyCon(c) -> {
+          let bare = match tag_of(emitter, name) {
+            Some(tag) -> match emitter.ctors.names.at(tag) { Some(n) -> n, None -> name },
+            None -> name,
+          };
+          match c.args.at(if c.name == b"Result" && bare == b"Err" { 1 } else { 0 }) {
+            Some(t) -> word_ty(t),
+            None -> TyOpen([]),
+          }
+        },
+        _ -> TyOpen([]),
+      },
+      _ -> TyOpen([]),
+    }
+  }
+
+// --- the emitter's entry ----------------------------------------------------
+
+/// The lambdas `c` writes, at any depth, each before those its body writes, in one fixed order.
+pub fn lambdas_of(c: Code) -> List<Lambda> = {
+  let within = |codes: List<Code>|
+    codes.fold([], |acc: List<Lambda>, x: Code| acc.concat(lambdas_of(x)));
+  match c.node {
+    NLambda(l) -> [l].concat(lambdas_of(l.body)),
+    NUnary(u) -> lambdas_of(u.operand),
+    NBinary(b) -> within([b.lhs, b.rhs]),
+    NField(f) -> lambdas_of(f.base),
+    NApp(a) -> within(a.args.push(a.func)),
+    NIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
+    NBlock(b) ->
+      within(
+        b.stmts.fold(
+          match b.tail { Some(t) -> [t], None -> [] },
+          |acc: List<Code>, stmt: CodeStmt|
+            acc.push(match stmt { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code }),
+        ),
+      ),
+    NList(l) -> within(l.items),
+    NRecord(r) -> within(r.fields.map(|f: CodeField| f.value)),
+    NUpdate(u) -> within(u.sets.map(|f: CodeField| f.value).push(u.base)),
+    NMatch(m) ->
+      within(
+        m.arms.fold([m.scrutinee], |acc: List<Code>, a: CodeArm|
+          List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
+      ),
+    NPerform(x) -> within(x.args),
+    NSimulate(x) -> lambdas_of(x.body),
+    NParallel(x) -> within(x.branches),
+    NHandle(h) ->
+      within(
+        h.clauses.fold(
+          match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
+          |acc: List<Code>, cl: CodeClause| acc.push(cl.body),
+        ),
+      ),
+    _ -> [],
+  }
+}
+
+/// Where `l` first stands in `ls`.
+pub fn position_in(ls: List<Lambda>, l: Lambda) -> Option<Int> =
+  range(0, ls.len()).fold(None, |acc: Option<Int>, k: Int|
+    match acc { Some(_) -> acc, None -> if ls.at(k) == Some(l) { Some(k) } else { None } })
+
+/// What a root of `module` lends: the lambdas its `body` writes, and then each definition it hands
+/// a definition as a value, as the lambda around a call of it.
+pub fn written_in(
+  module: Bytes,
+  here: List<Def>,
+  imports: List<Imported>,
+  body: Code,
+) -> List<Lambda> / {abort.raise} = lambdas_of(body).concat(named_in(module, here, imports, body))
+
+/// How many arguments the definition `c` names as a value takes; none where `c` is not a
+/// definition named as a value, or takes a witness or a label a call would fill.
+pub fn named_arity(
+  module: Bytes,
+  here: List<Def>,
+  imports: List<Imported>,
+  c: Code,
+) -> Option<Int> / {abort.raise} =
+  match c.node {
+    NVar(v) -> if v.slot != None { None } else {
+      match def_in(module, here, imports, v.name) {
+        Some(d) -> match d.scheme {
+          Some(sc) -> match sc.ty {
+            TyFn(f) -> if d.def.witnesses == 0 && f.params.len() == d.arity { Some(d.arity) }
+            else { None },
+            _ -> None,
+          },
+          None -> None,
+        },
+        None -> None,
+      }
+    },
+    _ -> None,
+  }
+
+/// The lambda around a call of the definition `c` names, which takes `n` arguments. The call is
+/// each parameter's only read, so it hands each one on.
+pub fn named_lambda(c: Code, n: Int) -> Lambda = {
+  let at = |own: Own, node: Node| { own: own, node: node, span: c.span };
+  {
+    params: n,
+    size: n,
+    captures: [],
+    at: c.span,
+    body: at(
+      Borrowed,
+      NApp({
+        func: { ..c, own: Borrowed },
+        args: range(0, n).map(|i: Int|
+          at(Owned, NVar({ name: b"p".concat(ascii_of_int(i)), slot: Some(i) }))),
+      }),
+    ),
+  }
+}
+
+/// Each definition `c` hands a definition as a value, as `named_lambda` reads it, in one fixed
+/// order.
+pub fn named_in(
+  module: Bytes,
+  here: List<Def>,
+  imports: List<Imported>,
+  c: Code,
+) -> List<Lambda> / {abort.raise} = {
+  let within = |codes: List<Code>|
+    codes.fold([], |acc: List<Lambda>, x: Code| acc.concat(named_in(module, here, imports, x)));
+  match c.node {
+    NApp(a) -> {
+      let callee = match a.func.node {
+        NVar(v) -> v.slot == None && def_in(module, here, imports, v.name) != None,
+        _ -> false,
+      };
+      let handed = if !callee { [] } else {
+        a.args.fold([], |acc: List<Lambda>, x: Code|
+          match named_arity(module, here, imports, x) {
+            Some(n) -> acc.push(named_lambda(x, n)),
+            None -> acc,
+          })
+      };
+      handed.concat(within(a.args.push(a.func)))
+    },
+    NLambda(l) -> named_in(module, here, imports, l.body),
+    NUnary(u) -> named_in(module, here, imports, u.operand),
+    NBinary(b) -> within([b.lhs, b.rhs]),
+    NField(f) -> named_in(module, here, imports, f.base),
+    NIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
+    NBlock(b) ->
+      within(
+        b.stmts.fold(
+          match b.tail { Some(t) -> [t], None -> [] },
+          |acc: List<Code>, stmt: CodeStmt|
+            acc.push(match stmt { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code }),
+        ),
+      ),
+    NList(l) -> within(l.items),
+    NRecord(r) -> within(r.fields.map(|f: CodeField| f.value)),
+    NUpdate(u) -> within(u.sets.map(|f: CodeField| f.value).push(u.base)),
+    NMatch(m) ->
+      within(
+        m.arms.fold([m.scrutinee], |acc: List<Code>, a: CodeArm|
+          List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
+      ),
+    NPerform(x) -> within(x.args),
+    NSimulate(x) -> named_in(module, here, imports, x.body),
+    NParallel(x) -> within(x.branches),
+    NHandle(h) ->
+      within(
+        h.clauses.fold(
+          match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
+          |acc: List<Code>, cl: CodeClause| acc.push(cl.body),
+        ),
+      ),
+    _ -> [],
+  }
+}
+
+pub fn has_handle(c: Code) -> Bool = {
+  let within = |codes: List<Code>| codes.fold(false, |acc: Bool, x: Code| acc || has_handle(x));
+  match c.node {
+    NHandle(_) -> true,
+    NUnary(u) -> has_handle(u.operand),
+    NBinary(b) -> within([b.lhs, b.rhs]),
+    NField(f) -> has_handle(f.base),
+    NApp(a) -> within(a.args.push(a.func)),
+    NIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
+    NBlock(b) ->
+      (match b.tail { Some(t) -> has_handle(t), None -> false })
+        || b.stmts.fold(false, |acc: Bool, stmt: CodeStmt|
+          acc
+            || (match stmt {
+              CLet(l) -> has_handle(l.value),
+              CLetPat(l) -> has_handle(l.value),
+              CDo(d) -> has_handle(d.code),
+            })),
+    NList(l) -> within(l.items),
+    NRecord(r) -> within(r.fields.map(|f: CodeField| f.value)),
+    NUpdate(u) -> within(u.sets.map(|f: CodeField| f.value).push(u.base)),
+    NMatch(m) ->
+      has_handle(m.scrutinee)
+        || m.arms.fold(false, |acc: Bool, a: CodeArm|
+          acc || (match a.guard { Some(g) -> has_handle(g), None -> false }) || has_handle(a.body)),
+    NPerform(p) -> within(p.args),
+    NLambda(l) -> has_handle(l.body),
+    NSimulate(x) -> has_handle(x.body),
+    NKnown(k) -> has_handle(k.lambda.body),
+    NParallel(pr) -> within(pr.branches),
+    _ -> false,
+  }
+}
+
+/// Whether `c` matches parameter `i` against a list pattern whose rest a call of `own` hands back
+/// as its argument `i`: a walk down the list a self call loops through.
+pub fn walks_by_rest(c: Code, own: Bytes, i: Int) -> Bool = {
+  let within = |codes: List<Code>|
+    codes.fold(false, |acc: Bool, x: Code| acc || walks_by_rest(x, own, i));
+  match c.node {
+    NUnary(u) -> walks_by_rest(u.operand, own, i),
+    NBinary(b) -> within([b.lhs, b.rhs]),
+    NField(f) -> walks_by_rest(f.base, own, i),
+    NApp(a) -> within(a.args.push(a.func)),
+    NIf(x) -> within([x.cond, x.then_branch, x.else_branch]),
+    NBlock(b) ->
+      (match b.tail { Some(t) -> walks_by_rest(t, own, i), None -> false })
+        || b.stmts.fold(false, |acc: Bool, stmt: CodeStmt|
+          acc
+            || (match stmt {
+              CLet(l) -> walks_by_rest(l.value, own, i),
+              CLetPat(l) -> walks_by_rest(l.value, own, i),
+              CDo(d) -> walks_by_rest(d.code, own, i),
+            })),
+    NList(l) -> within(l.items),
+    NRecord(r) -> within(r.fields.map(|f: CodeField| f.value)),
+    NUpdate(u) -> within(u.sets.map(|f: CodeField| f.value).push(u.base)),
+    NMatch(m) ->
+      (match m.scrutinee.node {
+          NVar(v) ->
+            v.slot == Some(i)
+              && m.arms.fold(false, |acc: Bool, arm: CodeArm|
+                acc
+                  || (match arm.pat {
+                    PxList(l) -> match l.rest {
+                      Some(PxVar(r)) -> match r.slot {
+                        Some(slot) -> hands_back(arm.body, own, i, slot),
+                        None -> false,
+                      },
+                      _ -> false,
+                    },
+                    _ -> false,
+                  })),
+          _ -> false,
+        })
+        || walks_by_rest(m.scrutinee, own, i)
+        || m.arms.fold(false, |acc: Bool, arm: CodeArm|
+          acc || (match arm.guard { Some(g) -> walks_by_rest(g, own, i), None -> false })
+            || walks_by_rest(arm.body, own, i)),
+    NPerform(p) -> within(p.args),
+    NParallel(pr) -> within(pr.branches),
+    _ -> false,
+  }
+}
+
+/// Whether `c` calls `own` with the binder of slot `r` as its argument `i`.
+fn hands_back(c: Code, own: Bytes, i: Int, r: Int) -> Bool = {
+  let within = |codes: List<Code>|
+    codes.fold(false, |acc: Bool, x: Code| acc || hands_back(x, own, i, r));
+  match c.node {
+    NApp(a) ->
+      (match a.func.node {
+          NVar(f) ->
+            f.name == own && f.slot == None
+              && (match a.args.at(i) {
+                Some(arg) -> match arg.node { NVar(v) -> v.slot == Some(r), _ -> false },
+                None -> false,
+              }),
+          _ -> false,
+        })
+        || within(a.args.push(a.func)),
+    NUnary(u) -> hands_back(u.operand, own, i, r),
+    NBinary(b) -> within([b.lhs, b.rhs]),
+    NField(f) -> hands_back(f.base, own, i, r),
+    NIf(x) -> within([x.cond, x.then_branch, x.else_branch]),
+    NBlock(b) ->
+      (match b.tail { Some(t) -> hands_back(t, own, i, r), None -> false })
+        || b.stmts.fold(false, |acc: Bool, stmt: CodeStmt|
+          acc
+            || (match stmt {
+              CLet(l) -> hands_back(l.value, own, i, r),
+              CLetPat(l) -> hands_back(l.value, own, i, r),
+              CDo(d) -> hands_back(d.code, own, i, r),
+            })),
+    NMatch(m) ->
+      hands_back(m.scrutinee, own, i, r)
+        || m.arms.fold(false, |acc: Bool, arm: CodeArm|
+          acc || (match arm.guard { Some(g) -> hands_back(g, own, i, r), None -> false })
+            || hands_back(arm.body, own, i, r)),
+    _ -> false,
+  }
+}

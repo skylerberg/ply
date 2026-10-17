@@ -1,0 +1,464 @@
+//! What the rewrites share: walking a tree, and what `Ok` and `Err` name in a module.
+
+import std.list
+import syntax.parsing (Span, Ident, ParseDiag, error_at)
+import syntax.items (Module, Item, IFn, IType, ITest, ILaw, ISchema, TypeDef, TDSum, VariantDef,
+                     SpecClause, ImportDecl, INames)
+import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
+                     ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
+                     EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign, HandlerVar,
+                     Param, NamedArg, MatchArm, HandleClause, RecField, expr_span, ETagged, Tagged,
+                     Hole)
+
+// --- Shared ---------------------------------------------------------------------
+
+pub fn max_alias_depth() -> Int = 16
+
+/// This module's own `type` items; the first declaration of a name wins.
+pub fn collect_types(module: Module) -> List<TypeDef> =
+  module.items.fold([], |acc: List<TypeDef>, item: Item|
+    match item {
+      IType(d) -> match find_type(acc, d.name.name) { Some(_) -> acc, None -> acc.push(d) },
+      _ -> acc,
+    })
+
+pub fn find_type(ts: List<TypeDef>, name: Bytes) -> Option<TypeDef> =
+  ts.fold(None, |acc: Option<TypeDef>, type_def: TypeDef|
+    match acc {
+      Some(_) -> acc,
+      None -> if type_def.name.name == name { Some(type_def) } else { None },
+    })
+
+/// Evaluates without calling or performing anything.
+pub fn is_pure(e: Expr) -> Bool =
+  match e {
+    EApp(_) -> false,
+    EPerform(_) -> false,
+    EHandle(_) -> false,
+    EWithHold(_) -> false,
+    ESimulate(_) -> false,
+    EParallel(v) -> v.branches.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
+    ETry(_) -> false,
+    ETryBlock(_) -> false,
+    ELit(_) -> true,
+    ETagged(t) -> t.holes.len() == 0,
+    EVar(_) -> true,
+    EBad(_) -> true,
+    EBinary(b) -> is_pure(b.lhs) && is_pure(b.rhs),
+    EUnary(u) -> is_pure(u.operand),
+    ELambda(l) -> is_pure(l.body),
+    EIf(i) -> is_pure(i.cond) && is_pure(i.then_branch) && is_pure(i.else_branch),
+    EMatch(m) ->
+      is_pure(m.scrutinee)
+        && m.arms.fold(true, |acc: Bool, arm: MatchArm|
+          acc && is_pure(arm.body) && (match arm.guard { None -> true, Some(g) -> is_pure(g) })),
+    EBlock(b) ->
+      b.stmts.fold(true, |acc: Bool, stmt: Stmt|
+          acc
+            && (match stmt {
+              SLet(l) -> is_pure(l.value),
+              SLetElse(l) -> is_pure(l.value) && is_pure(l.fallback),
+              SExpr(x) -> is_pure(x),
+              SAssign(_) -> false,
+            }))
+        && (match b.tail { None -> true, Some(t) -> is_pure(t) }),
+    ERecord(r) -> r.fields.fold(true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
+    ERecordUpdate(r) ->
+      is_pure(r.base) && r.fields.fold(true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
+    EField(f) -> is_pure(f.base),
+    EList(l) -> l.items.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
+  }
+
+// --- Record update -----------------------------------------------------------------------
+
+/// Children first, then the node through `f`: a nested update inside a written field expands
+/// before its owner, and what `f` builds is not visited again.
+pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
+  let go = |x: Expr| map_expr(x, f);
+  let opt = |x: Option<Expr>| match x { None -> None, Some(y) -> Some(map_expr(y, f)) };
+  let fields = |fs: List<RecField>| fs.map(|fl: RecField| { name: fl.name, value: go(fl.value) });
+  f(match e {
+    EBinary(b) -> EBinary({ span: b.span, op: b.op, lhs: go(b.lhs), rhs: go(b.rhs) }),
+    EUnary(u) -> EUnary({ span: u.span, op: u.op, operand: go(u.operand) }),
+    ELambda(l) -> ELambda({ span: l.span, body: go(l.body), params: l.params, ret: l.ret }),
+    EApp(a) ->
+      EApp({
+        span: a.span,
+        func: go(a.func),
+        named: a.named.map(|arg: NamedArg|
+          { name: arg.name, value: go(arg.value), span: arg.span }),
+        args: a.args.map(go),
+        labels: a.labels,
+      }),
+    EIf(i) ->
+      EIf({
+        span: i.span,
+        cond: go(i.cond),
+        then_branch: go(i.then_branch),
+        else_branch: go(i.else_branch),
+      }),
+    EMatch(m) ->
+      EMatch({
+        span: m.span,
+        scrutinee: go(m.scrutinee),
+        arms: m.arms.map(|arm: MatchArm|
+          { pat: arm.pat, guard: opt(arm.guard), body: go(arm.body), span: arm.span }),
+      }),
+    EBlock(b) ->
+      EBlock({
+        span: b.span,
+        tail: opt(b.tail),
+        stmts: b.stmts.map(|stmt: Stmt|
+          match stmt {
+            SLet(l) -> SLet({ span: l.span, pat: l.pat, ty: l.ty, value: go(l.value) }),
+            SLetElse(l) ->
+              SLetElse({
+                span: l.span,
+                pat: l.pat,
+                ty: l.ty,
+                value: go(l.value),
+                fallback: go(l.fallback),
+              }),
+            SExpr(x) -> SExpr(go(x)),
+            SAssign(x) -> SAssign({ ..x, value: go(x.value) }),
+          }),
+      }),
+    ERecord(r) -> ERecord({ span: r.span, fields: fields(r.fields) }),
+    ERecordUpdate(r) -> ERecordUpdate({ span: r.span, base: go(r.base), fields: fields(r.fields) }),
+    EField(fl) -> EField({ span: fl.span, base: go(fl.base), field: fl.field }),
+    ETry(t) -> ETry({ span: t.span, operand: go(t.operand) }),
+    EList(l) -> EList({ span: l.span, items: l.items.map(go) }),
+    EPerform(x) ->
+      EPerform({ span: x.span, eff: x.eff, op: x.op, resource: x.resource, args: x.args.map(go) }),
+    EHandle(h) ->
+      EHandle({
+        span: h.span,
+        body: go(h.body),
+        ret: match h.ret {
+          None -> None,
+          Some(rc) -> Some({ binder: rc.binder, body: go(rc.body), span: rc.span }),
+        },
+        clauses: h.clauses.map(|c: HandleClause|
+          {
+            eff: c.eff,
+            op: c.op,
+            resource: c.resource,
+            every_label: c.every_label,
+            label_binder: c.label_binder,
+            resume: c.resume,
+            body: go(c.body),
+            span: c.span,
+            params: c.params,
+          }),
+        vars: h.vars.map(|v: HandlerVar| { ..v, init: go(v.init) }),
+      }),
+    EWithHold(c) ->
+      EWithHold({ ..c, acquire: go(c.acquire), release: go(c.release), body: go(c.body) }),
+    ESimulate(x) -> ESimulate({ span: x.span, body: go(x.body) }),
+    EParallel(x) -> EParallel({ span: x.span, branches: x.branches.map(go) }),
+    ETryBlock(t) -> ETryBlock({ ..t, body: go(t.body) }),
+    ETagged(t) -> ETagged({ ..t, holes: t.holes.map(|h: Hole| { ..h, value: go(h.value) }) }),
+    _ -> e,
+  })
+}
+
+/// Every expression an item holds, through `map_expr`.
+pub fn map_item(item: Item, f: (Expr) -> Expr) -> Item = {
+  let go = |x: Expr| map_expr(x, f);
+  match item {
+    IFn(d) ->
+      IFn({
+        ..d,
+        params: d.params.map(|param: Param|
+          { ..param, default: match param.default { None -> None, Some(x) -> Some(go(x)) } }),
+        spec: d.spec.map(|clause: SpecClause|
+          { kind: clause.kind, expr: go(clause.expr), span: clause.span }),
+        body: go(d.body),
+      }),
+    ITest(d) ->
+      ITest({
+        ..d,
+        cases: match d.cases {
+          None -> None,
+          Some(c) -> Some({ ..c, table: go(c.table), label: go(c.label) }),
+        },
+        body: go(d.body),
+      }),
+    ILaw(d) ->
+      ILaw({
+        ..d,
+        guard: match d.guard { None -> None, Some(g) -> Some(go(g)) },
+        body: go(d.body),
+      }),
+    _ -> item,
+  }
+}
+
+// --- Tagged literals -----------------------------------------------------------------------
+
+pub fn is_tagged(expr: Expr) -> Bool = match expr { ETagged(_) -> true, _ -> false }
+
+/// Every tagged literal a module's definitions, tests and laws hold, in the order they are written.
+pub fn tagged_in(module: Module) -> List<Tagged> =
+  picked_in(module, is_tagged).fold([], |acc: List<Tagged>, e: Expr|
+    match e { ETagged(t) -> acc.push(t), _ -> acc })
+
+/// Every expression `wanted` picks among those a module's definitions, tests and laws hold, in the
+/// order they are written, one that holds another before it.
+pub fn picked_in(module: Module, wanted: (Expr) -> Bool) -> List<Expr> =
+  module.items.fold([], |acc: List<Expr>, item: Item|
+    match item {
+      IFn(d) ->
+        d.spec.fold(picked(d.body, wanted, acc), |out: List<Expr>, clause: SpecClause|
+          picked(clause.expr, wanted, out)),
+      // Over cases, the label and the table are written before the body.
+      ITest(d) ->
+        picked(d.body, wanted, match d.cases {
+          None -> acc,
+          Some(c) -> picked(c.table, wanted, picked(c.label, wanted, acc)),
+        }),
+      // An instantiation's guard is given what its body is, which is picked once, in the body.
+      ILaw(d) -> {
+        let guarded = match ((d.guard, d.of)) {
+          (Some(g), None) -> picked(g, wanted, acc),
+          _ -> acc,
+        };
+        picked(d.body, wanted, guarded)
+      },
+      _ -> acc,
+    })
+
+fn picked(e: Expr, wanted: (Expr) -> Bool, found: List<Expr>) -> List<Expr> = {
+  let out = if wanted(e) { found.push(e) } else { found };
+  let all = |es: List<Expr>, acc: List<Expr>|
+    es.fold(acc, |a: List<Expr>, x: Expr| picked(x, wanted, a));
+  let maybe = |o: Option<Expr>, acc: List<Expr>|
+    match o { None -> acc, Some(x) -> picked(x, wanted, acc) };
+  let fields = |fs: List<RecField>, acc: List<Expr>|
+    fs.fold(acc, |a: List<Expr>, f: RecField| picked(f.value, wanted, a));
+  match e {
+    EBinary(b) -> picked(b.rhs, wanted, picked(b.lhs, wanted, out)),
+    EUnary(u) -> picked(u.operand, wanted, out),
+    ELambda(l) -> picked(l.body, wanted, out),
+    EApp(a) ->
+      a.named.fold(all(a.args, picked(a.func, wanted, out)), |acc: List<Expr>, arg: NamedArg|
+        picked(arg.value, wanted, acc)),
+    EIf(i) ->
+      picked(i.else_branch, wanted, picked(i.then_branch, wanted, picked(i.cond, wanted, out))),
+    EMatch(m) ->
+      m.arms.fold(picked(m.scrutinee, wanted, out), |acc: List<Expr>, arm: MatchArm|
+        picked(arm.body, wanted, maybe(arm.guard, acc))),
+    EBlock(b) ->
+      maybe(
+        b.tail,
+        b.stmts.fold(out, |acc: List<Expr>, stmt: Stmt|
+          match stmt {
+            SLet(l) -> picked(l.value, wanted, acc),
+            SLetElse(l) -> picked(l.fallback, wanted, picked(l.value, wanted, acc)),
+            SExpr(x) -> picked(x, wanted, acc),
+            SAssign(x) -> picked(x.value, wanted, acc),
+          }),
+      ),
+    ERecord(r) -> fields(r.fields, out),
+    ERecordUpdate(r) -> fields(r.fields, picked(r.base, wanted, out)),
+    ETry(t) -> picked(t.operand, wanted, out),
+    EField(f) -> picked(f.base, wanted, out),
+    EList(l) -> all(l.items, out),
+    EPerform(x) -> all(x.args, out),
+    EHandle(h) -> {
+      let inits = h.vars.fold(out, |acc: List<Expr>, v: HandlerVar| picked(v.init, wanted, acc));
+      let clauses = h.clauses.fold(
+        picked(h.body, wanted, inits),
+        |acc: List<Expr>, c: HandleClause| picked(c.body, wanted, acc),
+      );
+      match h.ret { None -> clauses, Some(rc) -> picked(rc.body, wanted, clauses) }
+    },
+    EWithHold(c) ->
+      picked(c.body, wanted, picked(c.release, wanted, picked(c.acquire, wanted, out))),
+    ESimulate(x) -> picked(x.body, wanted, out),
+    EParallel(x) -> all(x.branches, out),
+    ETryBlock(t) -> picked(t.body, wanted, out),
+    ETagged(t) -> t.holes.fold(out, |acc: List<Expr>, h: Hole| picked(h.value, wanted, acc)),
+    ELit(_) -> out,
+    EVar(_) -> out,
+    EBad(_) -> out,
+  }
+}
+
+// --- The try block ---------------------------------------------------------------------------
+
+pub fn is_try_block(expr: Expr) -> Bool = match expr { ETryBlock(_) -> true, _ -> false }
+
+// --- What `Ok` and `Err` name ----------------------------------------------------------------
+
+// A `try` is written out as a `handle` that answers `Ok` and `Err`, a tagged literal as a `let`
+// read through `Ok`, and `?` as a `match` on either pair. In a module that binds one of those names
+// for itself, what is written out would name the module's own, so the form is refused here, with
+// the grammar: a body taken from its rows is not checked again, and would run as the other thing.
+
+type Rebound = { name: Bytes, imported: Bool }
+
+/// The first of `names` the module binds for itself: one it imports by name, else a variant or a
+/// function it declares.
+pub fn bound_among(module: Module, names: List<Bytes>) -> Option<Rebound> = {
+  let imported = module.imports.fold(None, |acc: Option<Rebound>, d: ImportDecl|
+    match acc {
+      Some(_) -> acc,
+      None -> match d.kind {
+        INames(ns) ->
+          ns.fold(None, |b: Option<Rebound>, ident: Ident|
+            match b {
+              Some(_) -> b,
+              None -> if names.contains(ident.name) { Some({ name: ident.name, imported: true }) }
+              else { None },
+            }),
+        _ -> None,
+      },
+    });
+  match imported {
+    Some(_) -> imported,
+    None ->
+      module.items.fold(None, |acc: Option<Rebound>, item: Item|
+        match acc {
+          Some(_) -> acc,
+          None -> match item {
+            IType(d) -> match d.body {
+              TDSum(vs) ->
+                vs.fold(None, |b: Option<Rebound>, variant: VariantDef|
+                  match b {
+                    Some(_) -> b,
+                    None -> if names.contains(variant.name.name) {
+                      Some({ name: variant.name.name, imported: false })
+                    } else { None },
+                  }),
+              _ -> None,
+            },
+            IFn(d) -> if names.contains(d.name.name) {
+              Some({ name: d.name.name, imported: false })
+            } else { None },
+            _ -> None,
+          },
+        }),
+  }
+}
+
+fn uncaptured(span: Span, form: Bytes, lacks: Bytes, own: Rebound, answers: Bytes) -> ParseDiag =
+  error_at(
+    b"E0118",
+    span,
+    Bytes::concat_all([b"this file gives ", form, b" no meaning here"]),
+    lacks,
+    [
+      Bytes::concat_all([
+        b"this module binds its own `",
+        own.name,
+        b"`, which would capture ",
+        answers,
+      ]),
+    ],
+  )
+
+/// `diags`, and a refusal for every `try` and every tagged literal of a module that binds what it
+/// would be written out with.
+pub fn rebound(module: Module, diags: List<ParseDiag>) -> List<ParseDiag> = {
+  let tried = match bound_among(module, [b"Ok", b"Err"]) {
+    None -> diags,
+    Some(own) ->
+      picked_in(module, is_try_block).fold(diags, |acc: List<ParseDiag>, e: Expr|
+        acc.push(
+          uncaptured(
+            expr_span(e),
+            b"`try`",
+            b"no `Result` to answer with",
+            own,
+            b"the `Ok` and `Err` a `try` answers with; rename it or qualify it, or write the `handle` out",
+          ),
+        )),
+  };
+  match bound_among(module, [b"Ok"]) {
+    None -> tried,
+    Some(own) ->
+      tagged_in(module).fold(tried, |acc: List<ParseDiag>, t: Tagged|
+        acc.push(
+          uncaptured(
+            t.span,
+            b"a tagged literal",
+            b"no `Ok` to read it through",
+            own,
+            b"the `Ok` a tagged literal is read through; rename it or qualify it, or call `literal` and match on what it answers",
+          ),
+        )),
+  }
+}
+
+// --- Running the rewrites --------------------------------------------------------------------
+
+pub fn any_expr(module: Module, p: (Expr) -> Bool) -> Bool =
+  module.items.fold(false, |acc: Bool, item: Item|
+    acc
+      || (match item {
+        IFn(d) ->
+          count_in(d.body, p) > 0
+            || d.spec.fold(false, |b: Bool, clause: SpecClause| b || count_in(clause.expr, p) > 0)
+            || d.params.fold(false, |b: Bool, param: Param|
+              b || (match param.default { None -> false, Some(v) -> count_in(v, p) > 0 })),
+        ITest(d) ->
+          count_in(d.body, p) > 0
+            || (match d.cases {
+              None -> false,
+              Some(c) -> count_in(c.table, p) > 0 || count_in(c.label, p) > 0,
+            }),
+        ILaw(d) ->
+          count_in(d.body, p) > 0
+            || (match d.guard { None -> false, Some(g) -> count_in(g, p) > 0 }),
+        ISchema(d) ->
+          count_in(d.body, p) > 0
+            || (match d.guard { None -> false, Some(g) -> count_in(g, p) > 0 }),
+        _ -> false,
+      }))
+
+/// How many expressions within `e`, itself included, `p` holds for.
+pub fn count_in(e: Expr, p: (Expr) -> Bool) -> Int = {
+  let all = |es: List<Expr>| es.fold(0, |n: Int, x: Expr| n + count_in(x, p));
+  let maybe = |o: Option<Expr>| match o { None -> 0, Some(x) -> count_in(x, p) };
+  (if p(e) { 1 } else { 0 })
+    + (match e {
+      EBinary(b) -> count_in(b.lhs, p) + count_in(b.rhs, p),
+      EUnary(u) -> count_in(u.operand, p),
+      ELambda(l) -> count_in(l.body, p) + l.params.fold(0, |n: Int, x: Param| n + maybe(x.default)),
+      EApp(a) ->
+        count_in(a.func, p) + all(a.args)
+          + a.named.fold(0, |n: Int, arg: NamedArg| n + count_in(arg.value, p)),
+      EIf(i) -> count_in(i.cond, p) + count_in(i.then_branch, p) + count_in(i.else_branch, p),
+      EMatch(m) ->
+        count_in(m.scrutinee, p)
+          + m.arms.fold(0, |n: Int, arm: MatchArm| n + count_in(arm.body, p) + maybe(arm.guard)),
+      EBlock(b) ->
+        b.stmts.fold(0, |n: Int, stmt: Stmt|
+            n
+              + (match stmt {
+                SLet(l) -> count_in(l.value, p),
+                SLetElse(l) -> count_in(l.value, p) + count_in(l.fallback, p),
+                SExpr(x) -> count_in(x, p),
+                SAssign(x) -> count_in(x.value, p),
+              }))
+          + maybe(b.tail),
+      ERecord(r) -> r.fields.fold(0, |n: Int, f: RecField| n + count_in(f.value, p)),
+      ERecordUpdate(r) ->
+        count_in(r.base, p) + r.fields.fold(0, |n: Int, f: RecField| n + count_in(f.value, p)),
+      ETry(t) -> count_in(t.operand, p),
+      EField(f) -> count_in(f.base, p),
+      EList(l) -> all(l.items),
+      EPerform(x) -> all(x.args),
+      EHandle(h) ->
+        count_in(h.body, p) + h.clauses.fold(0, |n: Int, c: HandleClause| n + count_in(c.body, p))
+          + (match h.ret { None -> 0, Some(rc) -> count_in(rc.body, p) })
+          + h.vars.fold(0, |n: Int, v: HandlerVar| n + count_in(v.init, p)),
+      EWithHold(c) -> count_in(c.acquire, p) + count_in(c.release, p) + count_in(c.body, p),
+      ESimulate(x) -> count_in(x.body, p),
+      EParallel(x) -> all(x.branches),
+      ETryBlock(x) -> count_in(x.body, p),
+      ETagged(t) -> t.holes.fold(0, |n: Int, h: Hole| n + count_in(h.value, p)),
+      _ -> 0,
+    })
+}

@@ -1,0 +1,220 @@
+//! `goal` — what the static prover is asked, what it may spend, and the steps `decide` and
+//! `induct` share: the range of every `Int` atom, conjunction, and one refutation on a budget.
+
+import compiler.emit.code (Code)
+import context (Context, inhabited, reaches_float, reaches_key)
+import domain (Ty)
+import lemma (Lemma)
+import rules (RuleLog, Rule)
+import solve (Solver, Answer, Closed, refute)
+import sort (bool_ty, is_con, vars)
+import term (Terms, Made, Node, TInt, TBool, TStr, TDecimal, TFixed, TUnit, TSym, TOpaque, TLin,
+             TApp, TCtor, TNil, TCons, TRecord, TField, TNot, TAnd, TOr, TCmp, TEq, TIf, TMatch,
+             Mono, Arm, TestLit, Ge, Le, size, node, sort_of, int_lit, cmp, and, op_add, op_sub,
+             op_mul, op_div, op_rem, op_concat, op_bit_and, op_bit_or, op_bit_xor, op_bit_not,
+             op_shl, op_shr, op_ushr)
+
+pub type Binder = { name: String, ty: Ty }
+
+/// Binder `i` is slot `i` of every clause's window. For an `ensures`: the owner's parameters then
+/// `result`, the guards are the `requires` beside it, and `result` is the definition's body; for a
+/// law: its `forall` binders and its `where`. `lemmas` are the proved laws the claim may use. `total`
+/// holds the definitions whose calls are values though nothing here shows they end: a measure's own
+/// group, whose calls below it are what the measure is proved by. A `partial` claim speaks only where
+/// it is evaluated, so what evaluating it raises on is not owed: a measure owes nothing where its
+/// definition raises before calling again.
+pub type Goal = {
+  binders: List<Binder>,
+  guards: List<Option<Code>>,
+  result: Option<Option<Code>>,
+  body: Option<Code>,
+  lemmas: List<Lemma>,
+  total: List<String>,
+  partial: Bool,
+}
+
+/// `steps` is charged per obligation.
+pub type Limits = { steps: Int, unfold_depth: Int, split_depth: Int }
+
+pub fn default_prove_budget() -> Int = 10000
+
+pub fn default_unfold_depth() -> Int = 3
+
+pub fn default_limits() -> Limits =
+  { steps: default_prove_budget(), unfold_depth: default_unfold_depth(), split_depth: 48 }
+
+pub type Reason = | Open | BudgetSpent
+
+/// `rules` in application order; `sorts` the type variables left as uninterpreted sorts, ascending;
+/// `guard_satisfiable` when there is no guard, or a valid one over an inhabited domain.
+pub type Proof = { rules: List<Rule>, steps: Int, sorts: List<Int>, guard_satisfiable: Bool }
+
+pub type Assertion = { term: Int, polarity: Bool }
+
+/// A refutation's store and log after it ran, what it came to, and the budget it left.
+pub type Ran = { terms: Terms, rules: RuleLog, answer: Answer, left: Int }
+
+pub fn run(
+  terms: Terms,
+  context: Context,
+  rules: RuleLog,
+  budget: Int,
+  limits: Limits,
+  assertions: List<Assertion>,
+) -> Ran / {abort.raise} = {
+  let r = refute(
+    { terms: terms, rules: rules, budget: budget, split_depth: limits.split_depth, cx: context },
+    assertions,
+  );
+  { terms: r.sv.terms, rules: r.sv.rules, answer: r.answer, left: r.sv.budget }
+}
+
+pub fn conjunction(
+  terms: Terms,
+  guards: List<Int>,
+) -> { terms: Terms, id: Option<Int> } / {abort.raise} =
+  guards.fold({ terms: terms, id: None }, |acc: { terms: Terms, id: Option<Int> }, g: Int|
+    match acc.id {
+      None -> { terms: acc.terms, id: Some(g) },
+      Some(previous) -> {
+        let m = and(acc.terms, previous, g);
+        { terms: m.terms, id: Some(m.id) }
+      },
+    })
+
+pub fn domain_inhabited(context: Context, binders: List<Binder>) -> Bool =
+  binders.fold(true, |ok: Bool, binder: Binder| ok && inhabited(context, binder.ty))
+
+/// The binders' variables, by number, ascending.
+pub fn uninterpreted_sorts(binders: List<Binder>) -> List<Int> = {
+  let found = binders.fold([], |acc: List<Int>, binder: Binder| vars(binder.ty, acc));
+  found.fold([], |acc: List<Int>, v: Int| {
+    let before = acc.filter(|x: Int| x < v);
+    let after = acc.filter(|x: Int| x > v);
+    after.fold(before.push(v), |a: List<Int>, x: Int| a.push(x))
+  })
+}
+
+pub fn float_in(context: Context, terms: Terms) -> Bool =
+  range(0, size(terms)).fold(false, |f: Bool, t: Int|
+    f || (match sort_of(terms, t) { Some(s) -> reaches_float(context, s), None -> false }))
+
+/// Whether any term is of a type that states a `key` or a `numeric`, or holds one.
+pub fn key_in(context: Context, terms: Terms) -> Bool =
+  context.keyed_types.len() > 0
+    && range(0, size(terms)).fold(false, |f: Bool, t: Int|
+      f || (match sort_of(terms, t) { Some(s) -> reaches_key(context, s), None -> false }))
+
+/// `MIN ≤ t ≤ MAX` for every term that denotes a Ply `Int` whenever it is defined: every `Int` atom,
+/// except the ones in `skip`, a call whose value is in question.
+pub fn int_ranges(
+  terms: Terms,
+  computed: Option<Int>,
+  skip: Map<Int, Bool>,
+) -> { terms: Terms, out: List<Assertion> } / {abort.raise} = {
+  let derived = derived_from(terms, computed);
+  let atoms = range(0, size(terms)).filter(|t: Int|
+    derived.at(t) != Some(true) && !skip.contains(t)
+      && (match node(terms, t) {
+        TSym(_) -> true,
+        TField(_) -> true,
+        TApp(a) -> match node(terms, a.head) {
+          TOpaque(name) -> !is_operator_symbol(name),
+          _ -> true,
+        },
+        _ -> false,
+      })
+      && (match sort_of(terms, t) { Some(s) -> is_con(s, "Int"), None -> false }));
+  ranges_of(terms, atoms)
+}
+
+/// `Int` atoms lie in the 64 bits; a `List::len` in `[0, MAX)`, since no list has that many elements.
+pub fn ranges_of(
+  terms: Terms,
+  candidates: List<Int>,
+) -> { terms: Terms, out: List<Assertion> } / {abort.raise} = {
+  let atoms = candidates.filter(|a: Int|
+    match sort_of(terms, a) { Some(s) -> is_con(s, "Int"), None -> false });
+  let min = int_lit(terms, 0 - 9223372036854775807 - 1);
+  let max = int_lit(min.terms, 9223372036854775807);
+  let zero = int_lit(max.terms, 0);
+  let below_max = int_lit(zero.terms, 9223372036854775806);
+  atoms.fold(
+    { terms: below_max.terms, out: [] },
+    |acc: { terms: Terms, out: List<Assertion> }, a: Int| {
+      let length = is_length(acc.terms, a);
+      let low = cmp(acc.terms, Ge, a, if length { zero.id } else { min.id });
+      let high = cmp(low.terms, Le, a, if length { below_max.id } else { max.id });
+      {
+        terms: high.terms,
+        out: acc.out.push({ term: low.id, polarity: true }).push({ term: high.id, polarity: true }),
+      }
+    },
+  )
+}
+
+fn is_length(terms: Terms, t: Int) -> Bool / {abort.raise} =
+  match node(terms, t) {
+    TApp(a) -> match node(terms, a.head) { TOpaque(name) -> name == "List::len", _ -> false },
+    _ -> false,
+  }
+
+/// Terms containing `root`, in one pass: the store makes children before their parents.
+pub fn derived_from(terms: Terms, root: Option<Int>) -> List<Bool> / {abort.raise} =
+  match root {
+    None -> range(0, size(terms)).map(|_: Int| false),
+    Some(r) ->
+      range(0, size(terms)).fold(
+        range(0, size(terms)).map(|t: Int| t == r),
+        |out: List<Bool>, t: Int|
+          if out.at(t) == Some(true) { out }
+          else if children(node(terms, t)).fold(false, |f: Bool, c: Int|
+              f || out.at(c) == Some(true)) { out.set(t, true) }
+          else { out },
+      ),
+  }
+
+pub fn children(n: Node) -> List<Int> =
+  match n {
+    TLin(p) -> p.monomials.map(|m: Mono| m.term),
+    TApp(a) -> a.args.fold([a.head], |acc: List<Int>, x: Int| acc.push(x)),
+    TCtor(c) -> c.args,
+    TCons(c) -> [c.head, c.tail],
+    TRecord(fields) -> fields.map(|f: { name: String, value: Int }| f.value),
+    TField(f) -> [f.base],
+    TNot(a) -> [a],
+    TAnd(a, b) -> [a, b],
+    TOr(a, b) -> [a, b],
+    TCmp(c) -> [c.lhs, c.rhs],
+    TEq(e) -> [e.lhs, e.rhs],
+    TIf(i) -> [i.cond, i.then_branch, i.else_branch],
+    TMatch(m) ->
+      m.arms.fold([m.scrutinee], |acc: List<Int>, arm: Arm| {
+        let with_body = arm.binds.fold(acc, |a: List<Int>, x: Int| a.push(x)).push(arm.body);
+        match arm.test { TestLit(literal) -> with_body.push(literal), _ -> with_body }
+      }),
+    _ -> [],
+  }
+
+/// The heads `int_ranges` declines to call atoms: a shift has a value only at some counts.
+fn is_operator_symbol(name: String) -> Bool =
+  [
+    op_add(),
+    op_sub(),
+    op_mul(),
+    op_div(),
+    op_rem(),
+    op_concat(),
+    op_bit_and(),
+    op_bit_or(),
+    op_bit_xor(),
+    op_bit_not(),
+    op_shl(),
+    op_shr(),
+    op_ushr(),
+  ].fold(false, |f: Bool, op: String| f || op == name)
+
+pub fn set_of(xs: List<Int>) -> Map<Int, Bool> =
+  xs.fold(Map::new(), |m: Map<Int, Bool>, x: Int| m.insert(x, true))
+
+pub fn with_true(ids: List<Int>) -> List<Assertion> = ids.map(|t: Int| { term: t, polarity: true })

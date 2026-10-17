@@ -1,0 +1,2145 @@
+//! Whether an update copies, read off the lowering the emitter compiles so a move here is a move there.
+
+import syntax.parsing (Span, Ident, QName, dummy_span, span_bin, span_between)
+import emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch,
+                  NPerform, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, NKnown, NLabel,
+                  CodeStmt, CLet, CLetPat, CDo, CodeArm, CodeField, CodeClause, Capture, Own, Owned,
+                  pat_slots, lower_to_emit)
+import syntax.items (Module, Derived, Item, IFn, ITest, ILaw, Binder, FnDef, ReturnsFresh,
+                     ReturnsParam, parse)
+import syntax.exprs (Param, Expr)
+import expand.rewrite (expand, witness_param)
+import expand.embed (EmbedAt, EmbedFile, embed_tables, rewritten)
+import expand.derive (expand_derives)
+import check.resolve.tables (ParsedModule, Resolved, ValueSpace, Source, qualify)
+import check.resolve (ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_packaged)
+import check.resolve.scopes (no_packages, find)
+import check.infer.checker (Builtin, builtins, test_owner, LabelSite, UpdateShape, WitnessOp,
+                            WitnessRef, WitnessOrder, OperandSite, TypedSite, TrySite, MemberSite)
+import check.infer (expanded_mods, RootFacts, no_root_facts, root_facts_bin, types_named)
+import front.facts (Analysis, cuts_of)
+import front.rows (Rows, KnownDefRow, KnownTestRow, Cut)
+import front.seam (WalkedFacts, Analysed, Refused)
+import front.published (analyse, facts_read, rows_of, walked_facts)
+import front (analyse_pulling_std)
+import store.hash.encoding (hex)
+import front.interface (stubbed)
+import check.semantics (Handed, Element, Threaded, Taken, Number, Unsaid, Folded, prelude_iterates)
+import front.diagnostics (ParsedSource, parse_all)
+import std.bin
+import std.hash (blake3)
+import std.list
+import std.bytes (ascii_of_int)
+
+type Cause =
+  | CReadAgain
+  | CMapEntry
+  | CCapture
+  | CCallerKeeps
+  | CElement
+  | CProgram
+  | CCall
+  | CHandler
+  | CClosure
+
+type Reason = { cause: Cause, text: Bytes }
+
+/// Who owns a value besides the place it stands; a parameter is sole-owned exactly when every caller hands it over.
+type Owner = | FreshOwner | ParamOwner(Int) | BlockedOwner(Reason) | UnknownOwner(Reason)
+
+type ParamOwnership = | SoleParam | UnsureParam(Reason) | SharedParam(Reason)
+
+type ReturnOwnership =
+  | FreshReturn
+  | ReturnOfParam(Int)
+  | SharedReturn(Reason)
+  | UnsureReturn(Reason)
+
+type Tables = { params: List<List<ParamOwnership>>, rets: List<ReturnOwnership> }
+
+type Bind = { slot: Int, owner: Owner }
+
+type Demand = { callee: Int, param: Int, owner: Owner }
+
+/// `op` is the updating builtin: `List::push`, `List::set` or `Array::set`.
+type RawSite = { span: Span, op: Bytes, owner: Owner }
+
+/// What a walk read of a callee's return: a later run takes the walk while each read answers alike.
+type Read = { callee: Int, ret: ReturnOwnership }
+
+/// A name a walk looked up at the top level: what it is bound to, and the definition that is.
+type Look = { name: Bytes, bound: Option<Bytes>, def: Option<Int> }
+
+type CostState = {
+  chain: List<Bind>,
+  sites: List<RawSite>,
+  demands: List<Demand>,
+  escaped: List<Int>,
+  reads: List<Read>,
+  looked: List<Look>,
+}
+
+// What a run keeps of a module, for a later run to take each body's walk from while every name it
+// looked up is what it was and every callee it read answers as it did. Definitions are named: an
+// index is one run's.
+
+/// What a name is bound to is the module's own text and resolved bodies, which its key holds;
+/// whether that is a definition is the text of the module it is in, which the key does not.
+type Looked = { name: Bytes, bound: Option<Bytes>, def: Bool }
+
+type KeptRead = { callee: Bytes, ret: ReturnOwnership }
+
+type KeptDemand = { callee: Bytes, param: Int, owner: Owner }
+
+type KeptWalk = {
+  reads: List<KeptRead>,
+  sites: List<RawSite>,
+  demands: List<KeptDemand>,
+  escaped: List<Bytes>,
+  ret: Owner,
+}
+
+type KeptBody = {
+  kind: Bytes,
+  name: Bytes,
+  label: Bytes,
+  def: Option<Bytes>,
+  arity: Int,
+  reuse: Option<Span>,
+  looked: List<Looked>,
+  walks: List<KeptWalk>,
+}
+
+type KeptModule = { bodies: List<KeptBody> }
+
+derive bin for Cause
+derive bin for Reason
+derive bin for Owner
+derive bin for ReturnOwnership
+derive bin for RawSite
+derive bin for Looked
+derive bin for KeptRead
+derive bin for KeptDemand
+derive bin for KeptWalk
+derive bin for KeptBody
+derive bin for KeptModule
+
+type WithOwner = { state: CostState, owner: Owner }
+
+type Arms = { state: CostState, owner: Option<Owner> }
+
+type Args = { state: CostState, owners: List<Owner> }
+
+/// A definition, and what its `returns` clause says of its answer. A definition of another package is
+/// never walked: a call of it answers what the clause says, and nothing is known without one.
+type Def = {
+  name: Bytes,
+  module: Int,
+  module_name: Bytes,
+  params: List<Bytes>,
+  arity: Int,
+  own: Bool,
+  says: Option<{ ret: ReturnOwnership, span: Span }>,
+}
+
+/// `def` is the index in `Program.defs`, or -1 for a test or a law, which has no caller. A body an
+/// earlier run walked is lowered only once a round finds none of its `kept` walks answering, and
+/// `lowered` says it has been: `code` and `span` (its item's) are the lowering's. `looked` is what
+/// its kept walks looked up.
+type Body = {
+  kind: Bytes,
+  module: Int,
+  module_name: Bytes,
+  name: Bytes,
+  label: Bytes,
+  def: Int,
+  arity: Int,
+  span: Span,
+  code: Option<Code>,
+  lowered: Bool,
+  reuse: Option<Span>,
+  looked: List<Looked>,
+  kept: List<Found>,
+}
+
+type Found = {
+  sites: List<RawSite>,
+  demands: List<Demand>,
+  escaped: List<Int>,
+  ret: Owner,
+  reads: List<Read>,
+  looked: List<Look>,
+}
+
+type Program = {
+  r: Resolved,
+  index: Map<Bytes, Int>,
+  builtins: Map<Bytes, Bool>,
+  defs: List<Def>,
+  bodies: List<Body>,
+}
+
+type Env = { prog: Program, module: Int, tables: Tables }
+
+type Parsed = { name: Bytes, module: Module, derived: List<Derived>, bad: Bool }
+
+fn blocked(cause: Cause, text: Bytes) -> Owner = BlockedOwner({ cause: cause, text: text })
+
+fn unknown(cause: Cause, text: Bytes) -> Owner = UnknownOwner({ cause: cause, text: text })
+
+fn reworded(reason: Reason, text: Bytes) -> Reason = { cause: reason.cause, text: text }
+
+fn fresh(state: CostState) -> WithOwner = { state: state, owner: FreshOwner }
+
+fn element() -> Owner = blocked(CElement, b"an element the list being walked still holds")
+
+fn owner_at(xs: List<Owner>, i: Int) -> Owner = match xs.at(i) { Some(o) -> o, None -> FreshOwner }
+
+fn owner_of(state: CostState, slot: Int) -> Option<Owner> =
+  state.chain.fold(None, |acc: Option<Owner>, b: Bind|
+    if b.slot == slot { Some(b.owner) } else { acc })
+
+fn bind(state: CostState, slot: Int, owner: Owner) -> CostState =
+  { ..state, chain: state.chain.push({ slot: slot, owner: owner }) }
+
+fn rebind(state: CostState, slot: Int, owner: Owner) -> CostState =
+  {
+    ..state,
+    chain: state.chain.map(|b: Bind| if b.slot == slot { { slot: slot, owner: owner } } else { b }),
+  }
+
+fn add_site(state: CostState, span: Span, op: Bytes, owner: Owner) -> CostState =
+  { ..state, sites: state.sites.push({ span: span, op: op, owner: owner }) }
+
+fn add_demand(state: CostState, d: Demand) -> CostState =
+  { ..state, demands: state.demands.push(d) }
+
+fn add_escaped(state: CostState, d: Int) -> CostState = { ..state, escaped: state.escaped.push(d) }
+
+fn look(state: CostState, name: Bytes, found: Bound) -> CostState =
+  { ..state, looked: state.looked.push({ name: name, bound: found.bound, def: found.def }) }
+
+fn with_chain(state: CostState, chain: List<Bind>) -> CostState = { ..state, chain: chain }
+
+fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
+  match c.node {
+    NLit(_) -> fresh(state),
+    NLabel(_) -> fresh(state),
+    NVar(v) -> var_owner(env, v.name, v.slot, c.own, state),
+    NUnary(u) -> fresh(walk(env, u.operand, state).state),
+    NBinary(b) -> fresh(walk(env, b.rhs, walk(env, b.lhs, state).state).state),
+    NLambda(l) -> fresh(poison(barrier(env, l.params, [], l.body, state), l.captures, l.body)),
+    // The branches' answers are fields of a tuple made here.
+    NParallel(pr) -> fresh(pr.branches.fold(state, |s: CostState, b: Code| walk(env, b, s).state)),
+    NApp(a) -> app(env, c.span, a.func, a.args, state),
+    NKnown(k) -> var_owner(env, k.name, Some(k.slot), c.own, state),
+    NIf(i) -> {
+      let t = walk(env, i.then_branch, walk(env, i.cond, state).state);
+      let e = walk(env, i.else_branch, t.state);
+      { state: e.state, owner: join(t.owner, e.owner) }
+    },
+    NMatch(m) -> {
+      let sc = walk(env, m.scrutinee, state);
+      let arms = m.arms.fold({ state: sc.state, owner: None }, |acc: Arms, a: CodeArm| {
+        let bound = pat_slots(a.pat).fold(acc.state, |s: CostState, slot: Int|
+          bind(s, slot, sc.owner));
+        let guarded = match a.guard { Some(g) -> walk(env, g, bound).state, None -> bound };
+        let w = walk(env, a.body, guarded);
+        {
+          state: w.state,
+          owner: Some(match acc.owner { None -> w.owner, Some(prev) -> join(prev, w.owner) }),
+        }
+      });
+      { state: arms.state, owner: match arms.owner { Some(o) -> o, None -> FreshOwner } }
+    },
+    NBlock(b) -> {
+      let s = b.stmts.fold(state, |acc: CostState, stmt: CodeStmt|
+        match stmt {
+          CLet(l) -> {
+            let w = walk(env, l.value, acc);
+            bind(w.state, l.slot, w.owner)
+          },
+          CLetPat(l) -> {
+            let w = walk(env, l.value, acc);
+            pat_slots(l.pat).fold(w.state, |s2: CostState, slot: Int| bind(s2, slot, w.owner))
+          },
+          CDo(d) -> walk(env, d.code, acc).state,
+        });
+      match b.tail { Some(t) -> walk(env, t, s), None -> fresh(s) }
+    },
+    NRecord(r) ->
+      fresh(r.fields.fold(state, |acc: CostState, f: CodeField| walk(env, f.value, acc).state)),
+    NUpdate(u) ->
+      fresh(
+        walk(
+          env,
+          u.base,
+          u.sets.fold(state, |acc: CostState, f: CodeField| walk(env, f.value, acc).state),
+        ).state,
+      ),
+    // A field read marked `Owned` takes the field from a record nothing after it reads it of.
+    NField(f) -> {
+      let b = walk(env, if c.own == Owned { { ..f.base, own: Owned } } else { f.base }, state);
+      match b.owner {
+        BlockedOwner(reason) ->
+          {
+            state: b.state,
+            owner: blocked(
+              reason.cause,
+              Bytes::concat_all([
+                b"`.",
+                f.field,
+                b"` was read out of a record something else still holds: ",
+                reason.text,
+              ]),
+            ),
+          },
+        _ -> b,
+      }
+    },
+    NList(l) -> fresh(l.items.fold(state, |acc: CostState, x: Code| walk(env, x, acc).state)),
+    NPerform(p) ->
+      {
+        state: p.args.fold(
+          match p.label { Some(x) -> walk(env, x, state).state, None -> state },
+          |acc: CostState, x: Code| walk(env, x, acc).state,
+        ),
+        owner: unknown(CHandler, b"the value a handler answered, which the handler may still hold"),
+      },
+    NHandle(h) -> {
+      let caught = h.clauses.fold(state, |acc: CostState, cl: CodeClause|
+        poison(acc, cl.captures, cl.body));
+      let armed = match h.ret { Some(r) -> poison(caught, r.captures, r.body), None -> caught };
+      let ran = walk(env, h.body, armed).state;
+      let clauses = h.clauses.fold(ran, |acc: CostState, cl: CodeClause|
+        barrier(env, cl.params + (if cl.resume { 1 } else { 0 }), [], cl.body, acc));
+      {
+        state: match h.ret { Some(r) -> barrier(env, 1, [], r.body, clauses), None -> clauses },
+        owner: unknown(CHandler, b"the value a `handle` answered"),
+      }
+    },
+    NSimulate(x) ->
+      {
+        state: barrier(env, 0, [], x.body, poison(state, x.captures, x.body)),
+        owner: unknown(CHandler, b"the value a `simulate` answered"),
+      },
+  }
+
+fn join(a: Owner, b: Owner) -> Owner =
+  match a {
+    BlockedOwner(_) -> a,
+    _ -> match b {
+      BlockedOwner(_) -> b,
+      _ -> match a {
+        UnknownOwner(_) -> a,
+        _ -> match b { UnknownOwner(_) -> b, _ -> match a { ParamOwner(_) -> a, _ -> b } },
+      },
+    },
+  }
+
+/// A body that may run again, later, or beside another task, so it sees no outer bindings.
+fn barrier(
+  env: Env,
+  n: Int,
+  owners: List<Owner>,
+  body: Code,
+  state: CostState,
+) -> CostState / {abort.raise} = {
+  let inner = with_chain(
+    state,
+    range(0, n).map(|i: Int|
+      {
+        slot: i,
+        owner: match owners.at(i) {
+          Some(o) -> o,
+          None ->
+            unknown(CClosure, b"a parameter of a closure whose caller this body does not name"),
+        },
+      }),
+  );
+  with_chain(walk(env, body, inner).state, state.chain)
+}
+
+/// A cloning capture gives the binding a second owner; a moving one leaves it dead.
+fn poison(state: CostState, caps: List<Capture>, body: Code) -> CostState =
+  caps.fold(state, |acc: CostState, capture: Capture|
+    if capture.own == Owned { acc } else {
+      match owner_of(acc, capture.src) {
+        None -> acc,
+        Some(BlockedOwner(_)) -> acc,
+        Some(_) ->
+          rebind(
+            acc,
+            capture.src,
+            blocked(
+              CCapture,
+              Bytes::concat_all([
+                b"a closure captured `",
+                match first_name(body, capture.dst) { Some(n) -> n, None -> b"" },
+                b"` and holds its own copy of the value",
+              ]),
+            ),
+          ),
+      }
+    })
+
+fn first_name(c: Code, slot: Int) -> Option<Bytes> =
+  match c.node {
+    NVar(v) -> if v.slot == Some(slot) { Some(v.name) } else { None },
+    NLambda(l) -> through(l.captures, l.body, slot),
+    NSimulate(x) -> through(x.captures, x.body, slot),
+    NHandle(h) -> {
+      let found = h.clauses.fold(
+        first_name(h.body, slot),
+        |acc: Option<Bytes>, clause: CodeClause|
+          match acc { Some(_) -> acc, None -> through(clause.captures, clause.body, slot) },
+      );
+      match found {
+        Some(_) -> found,
+        None -> match h.ret { Some(r) -> through(r.captures, r.body, slot), None -> None },
+      }
+    },
+    _ ->
+      children(c).fold(None, |acc: Option<Bytes>, x: Code|
+        match acc { Some(_) -> acc, None -> first_name(x, slot) }),
+  }
+
+fn through(caps: List<Capture>, body: Code, slot: Int) -> Option<Bytes> =
+  caps.fold(None, |acc: Option<Bytes>, capture: Capture|
+    match acc {
+      Some(_) -> acc,
+      None -> if capture.src == slot { first_name(body, capture.dst) } else { None },
+    })
+
+fn children(c: Code) -> List<Code> =
+  match c.node {
+    NUnary(u) -> [u.operand],
+    NBinary(b) -> [b.lhs, b.rhs],
+    NApp(a) -> a.args.fold([a.func], |acc: List<Code>, x: Code| acc.push(x)),
+    NKnown(_) -> [],
+    NIf(i) -> [i.cond, i.then_branch, i.else_branch],
+    NBlock(b) -> {
+      let stmts = b.stmts.map(|stmt: CodeStmt|
+        match stmt { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code });
+      match b.tail { Some(t) -> stmts.push(t), None -> stmts }
+    },
+    NList(l) -> l.items,
+    NRecord(r) -> r.fields.map(|f: CodeField| f.value),
+    NUpdate(u) -> u.sets.map(|f: CodeField| f.value).push(u.base),
+    NField(f) -> [f.base],
+    NMatch(m) ->
+      m.arms.fold([m.scrutinee], |acc: List<Code>, a: CodeArm|
+        List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
+    NPerform(p) -> p.args,
+    NParallel(pr) -> pr.branches,
+    _ -> [],
+  }
+
+fn free(name: Bytes) -> Owner =
+  unknown(
+    CClosure,
+    Bytes::concat_all([
+      b"`",
+      name,
+      b"` is free in this closure; whether the closure's copy is the only other owner when the update runs is not a property of this body",
+    ]),
+  )
+
+fn var_owner(
+  env: Env,
+  name: Bytes,
+  slot: Option<Int>,
+  own: Own,
+  state: CostState,
+) -> WithOwner / {abort.raise} =
+  match slot {
+    Some(s) -> match owner_of(state, s) {
+      Some(o) ->
+        {
+          state: state,
+          owner: if own == Owned { o } else {
+            blocked(
+              CReadAgain,
+              Bytes::concat_all([
+                b"`",
+                name,
+                b"` is read again after this point, so this use clones it",
+              ]),
+            )
+          },
+        },
+      None -> { state: state, owner: free(name) },
+    },
+    None -> {
+      let found = bound_in(env.prog, env.module, name);
+      let looked = look(state, name, found);
+      match found.def {
+        Some(d) ->
+          {
+            state: add_escaped(looked, d),
+            owner: blocked(CProgram, b"a top-level definition, which the program holds"),
+          },
+        None ->
+          {
+            state: looked,
+            owner: if sep_at(name) >= 0 && !env.prog.builtins.contains(name) {
+              blocked(CProgram, b"a module-qualified name denotes something the program holds")
+            } else { free(name) },
+          },
+      }
+    },
+  }
+
+fn sep_at(text: Bytes) -> Int =
+  range(0, text.len() - 1).fold(0 - 1, |acc: Int, i: Int|
+    if acc < 0 && text.at(i) == 58 && text.at(i + 1) == 58 { i } else { acc })
+
+fn qname_of(text: Bytes) -> QName / {abort.raise} = {
+  let sep = sep_at(text);
+  if sep < 0 { { module: None, name: { name: text, span: dummy_span() }, span: dummy_span() } }
+  else {
+    {
+      module: Some({ name: text.slice(0, sep), span: dummy_span() }),
+      name: { name: text.slice(sep + 2, text.len()), span: dummy_span() },
+      span: dummy_span(),
+    }
+  }
+}
+
+type Bound = { bound: Option<Bytes>, def: Option<Int> }
+
+fn bound_in(prog: Program, module: Int, name: Bytes) -> Bound / {abort.raise} =
+  match find(prog.r, module, ValueSpace, qname_of(name)) {
+    None -> { bound: None, def: None },
+    Some(b) -> { bound: Some(b.qualified), def: prog.index.get(b.qualified) },
+  }
+
+fn app(
+  env: Env,
+  span: Span,
+  func: Code,
+  args: List<Code>,
+  state: CostState,
+) -> WithOwner / {abort.raise} = {
+  let named = match func.node {
+    NVar(v) -> if v.slot != None { None }
+    else { Some({ name: v.name, found: bound_in(env.prog, env.module, v.name) }) },
+    _ -> None,
+  };
+  let callee = match named { Some(x) -> x.found.def, None -> None };
+  let builtin = match named {
+    Some(x) -> if x.found.def != None || !env.prog.builtins.contains(x.name) { None }
+    else { Some(x.name) },
+    None -> None,
+  };
+  let n = args.len();
+  // A callee written as a name is a call, not the definition escaping.
+  let before = match func.node {
+    NVar(_) -> match named { Some(x) -> look(state, x.name, x.found), None -> state },
+    _ -> walk(env, func, state).state,
+  };
+  let walked: Args = args.fold({ state: before, owners: [] }, |acc: Args, arg: Code| {
+    let w = match callback_owners(builtin, acc.owners.len(), acc.owners) {
+      Some(owners) -> callback(env, owners, arg, acc.state),
+      None -> walk(env, arg, acc.state),
+    };
+    { state: w.state, owners: acc.owners.push(w.owner) }
+  });
+  let sited = match update_of(builtin, n) {
+    Some(op) -> add_site(walked.state, span, op, owner_at(walked.owners, 0)),
+    None -> walked.state,
+  };
+  let demanded = match callee {
+    None -> sited,
+    Some(d) ->
+      range(0, n).fold(sited, |acc: CostState, j: Int|
+        match owner_at(walked.owners, j) {
+          FreshOwner -> acc,
+          o -> add_demand(acc, { callee: d, param: j, owner: o }),
+        }),
+  };
+  let read = match ((builtin, callee)) {
+    (None, Some(d)) -> match env.tables.rets.at(d) {
+      Some(r) -> { ..demanded, reads: demanded.reads.push({ callee: d, ret: r }) },
+      None -> demanded,
+    },
+    _ -> demanded,
+  };
+  { state: read, owner: result_owner(env, builtin, callee, walked.owners) }
+}
+
+/// The builtins that answer their first argument updated: in place when it reaches them at one owner.
+fn update_of(builtin: Option<Bytes>, n: Int) -> Option<Bytes> =
+  match builtin {
+    Some(b) -> if (b == b"List::push" && n == 2)
+        || ((b == b"List::set" || b == b"Array::set") && n == 3) { Some(b) }
+    else { None },
+    None -> None,
+  }
+
+fn held(op: Bytes) -> Bytes = if op == b"Array::set" { b"array" } else { b"list" }
+
+fn result_owner(env: Env, builtin: Option<Bytes>, callee: Option<Int>, args: List<Owner>) -> Owner =
+  match builtin {
+    None -> match callee {
+      None -> unknown(CCall, b"the value a call answered, which the callee may also hold"),
+      Some(d) -> match env.tables.rets.at(d) {
+        Some(ReturnOfParam(k)) -> match args.at(k) {
+          Some(o) -> o,
+          None -> unknown(CCall, b"a call answering an argument it was not given"),
+        },
+        Some(SharedReturn(reason)) -> BlockedOwner(reason),
+        Some(UnsureReturn(reason)) -> UnknownOwner(reason),
+        _ -> FreshOwner,
+      },
+    },
+    Some(b) -> if b == b"Hold::get" {
+      blocked(CElement, b"`Hold::get` answers a clone the hold still holds")
+    } else if b == b"Map::get" || reads_entries(b) {
+      blocked(CMapEntry, Bytes::concat_all([b"`", b, b"` answers a clone the map still holds"]))
+    } else if b == b"Map::pop_first" || b == b"Map::pop_last" || b == b"Map::split" {
+      owner_at(args, 0)
+    } else if b == b"List::at" {
+      blocked(CElement, b"`List::at` answers a clone the list still holds")
+    } else if b == b"Array::at" || b == b"Array::get" {
+      blocked(CElement, Bytes::concat_all([b"`", b, b"` answers a clone the array still holds"]))
+    } else if b == b"bracket" { unknown(CCall, b"`bracket` answers whatever its body answered") }
+    else {
+      match prelude_iterates(b) {
+        Some(it) -> if it.answer == Folded {
+          unknown(CCall, Bytes::concat_all([b"`", b, b"` answers whatever its callback answered"]))
+        } else { FreshOwner },
+        None -> FreshOwner,
+      }
+    },
+  }
+
+/// The builtins that answer entries the map goes on holding; a pop or a split hands over what the
+/// map held, so its answer is owned as the map was.
+fn reads_entries(b: Bytes) -> Bool =
+  b == b"Map::first" || b == b"Map::last" || b == b"Map::floor" || b == b"Map::ceiling"
+    || b == b"Map::below"
+    || b == b"Map::above"
+    || b == b"Map::range"
+
+/// Who owns each parameter of the function a builtin is handed at `position`, as its entry says:
+/// `done` are the owners of the arguments before it.
+fn callback_owners(
+  builtin: Option<Bytes>,
+  position: Int,
+  done: List<Owner>,
+) -> Option<List<Owner>> =
+  match builtin {
+    None -> None,
+    Some(b) -> match prelude_iterates(b) {
+      None -> None,
+      Some(it) -> if it.callback != position { None } else {
+        let given = |k: Int|
+          match done.at(k) {
+            Some(o) -> o,
+            None -> unknown(CCall, b"an argument the call is handed after its callback"),
+          };
+        Some(
+          it.params.map(|h: Handed|
+            match h {
+              Element -> element(),
+              Threaded(k) -> given(k),
+              Taken(k) -> given(k),
+              Number -> FreshOwner,
+              Unsaid ->
+                unknown(CClosure, b"a parameter of a closure whose caller this body does not name"),
+            }),
+        )
+      },
+    },
+  }
+
+fn callback(
+  env: Env,
+  owners: List<Owner>,
+  arg: Code,
+  state: CostState,
+) -> WithOwner / {abort.raise} =
+  match arg.node {
+    NLambda(l) -> fresh(poison(barrier(env, l.params, owners, l.body, state), l.captures, l.body)),
+    _ -> walk(env, arg, state),
+  }
+
+fn rank(p: ParamOwnership) -> Int =
+  match p { SoleParam -> 2, UnsureParam(_) -> 1, SharedParam(_) -> 0 }
+
+fn meet(a: ParamOwnership, b: ParamOwnership) -> ParamOwnership =
+  if rank(b) < rank(a) { b } else { a }
+
+fn param_at(tables: Tables, d: Int, k: Int) -> Option<ParamOwnership> =
+  match tables.params.at(d) { Some(slots) -> slots.at(k), None -> None }
+
+fn meet_all(tables: Tables, d: Int, p: ParamOwnership) -> Tables =
+  match tables.params.at(d) {
+    None -> tables,
+    Some(slots) ->
+      { ..tables, params: tables.params.set(d, slots.map(|s: ParamOwnership| meet(s, p))) },
+  }
+
+fn meet_at(tables: Tables, d: Int, j: Int, p: ParamOwnership) -> Tables =
+  match tables.params.at(d) {
+    None -> tables,
+    Some(slots) -> match slots.at(j) {
+      None -> tables,
+      Some(s) -> { ..tables, params: tables.params.set(d, slots.set(j, meet(s, p))) },
+    },
+  }
+
+fn with_ret(tables: Tables, d: Int, r: ReturnOwnership) -> Tables / {abort.raise} =
+  { ..tables, rets: tables.rets.set(d, r) }
+
+fn ret_of(owner: Owner) -> ReturnOwnership =
+  match owner {
+    FreshOwner -> FreshReturn,
+    ParamOwner(k) -> ReturnOfParam(k),
+    BlockedOwner(reason) -> SharedReturn(reason),
+    UnknownOwner(reason) -> UnsureReturn(reason),
+  }
+
+fn interpret(owner: Owner, caller: Int, tables: Tables, label: Bytes) -> ParamOwnership =
+  match owner {
+    FreshOwner -> SoleParam,
+    BlockedOwner(reason) ->
+      SharedParam(
+        reworded(reason, Bytes::concat_all([label, b" passes a value where ", reason.text])),
+      ),
+    UnknownOwner(reason) ->
+      UnsureParam(
+        reworded(reason, Bytes::concat_all([label, b" passes a value where ", reason.text])),
+      ),
+    ParamOwner(k) -> match param_at(tables, caller, k) {
+      Some(SoleParam) -> SoleParam,
+      Some(UnsureParam(reason)) ->
+        UnsureParam(
+          reworded(
+            reason,
+            Bytes::concat_all([
+              label,
+              b" passes its own parameter ",
+              ascii_of_int(k),
+              b", which is unsettled",
+            ]),
+          ),
+        ),
+      Some(SharedParam(reason)) ->
+        SharedParam(
+          reworded(
+            reason,
+            Bytes::concat_all([
+              label,
+              b" passes its own parameter ",
+              ascii_of_int(k),
+              b", whose callers keep what they pass",
+            ]),
+          ),
+        ),
+      None ->
+        UnsureParam({
+          cause: CCallerKeeps,
+          text: Bytes::concat_all([label, b" passes a parameter this pass cannot name"]),
+        }),
+    },
+  }
+
+fn start_tables(defs: List<Def>) -> Tables =
+  {
+    params: defs.map(|d: Def| range(0, d.arity).map(|_: Int| SoleParam)),
+    rets: defs.map(|d: Def|
+      if d.own { FreshReturn } else {
+        match d.says {
+          Some(x) -> x.ret,
+          None ->
+            UnsureReturn({
+              cause: CCall,
+              text: Bytes::concat_all([
+                b"`",
+                d.name,
+                b"` is another package's, and its signature writes no `returns`",
+              ]),
+            }),
+        }
+      }),
+  }
+
+fn walk_body(env: Env, b: Body) -> Found / {abort.raise} =
+  match b.code {
+    None ->
+      {
+        sites: [],
+        demands: [],
+        escaped: [],
+        ret: unknown(CCall, b"the value a call answered, which the callee may also hold"),
+        reads: [],
+        looked: [],
+      },
+    Some(c) -> {
+      let chain = range(0, b.arity).map(|k: Int|
+        { slot: k, owner: if b.def < 0 { FreshOwner } else { ParamOwner(k) } });
+      let w = walk(env, c, {
+        chain: chain,
+        sites: [],
+        demands: [],
+        escaped: [],
+        reads: [],
+        looked: [],
+      });
+      {
+        sites: w.state.sites,
+        demands: w.state.demands,
+        escaped: w.state.escaped,
+        ret: w.owner,
+        reads: w.state.reads,
+        looked: w.state.looked,
+      }
+    },
+  }
+
+fn settle(program: Program, found: List<Found>, tables: Tables) -> Tables / {abort.raise} =
+  range(0, program.bodies.len()).fold(start_tables(program.defs), |acc: Tables, i: Int| {
+    let b: Body = program.bodies.get(i);
+    let f: Found = found.get(i);
+    let escaped = f.escaped.fold(acc, |s: Tables, d: Int|
+      meet_all(
+        s,
+        d,
+        UnsureParam({
+          cause: CProgram,
+          text: Bytes::concat_all([
+            b"`",
+            program.defs.get(d).name,
+            b"` is used as a value in ",
+            b.label,
+            b", so not every caller of it is known",
+          ]),
+        }),
+      ));
+    let demanded = f.demands.fold(escaped, |s: Tables, dm: Demand|
+      meet_at(s, dm.callee, dm.param, interpret(dm.owner, b.def, tables, b.label)));
+    if b.def < 0 { demanded } else { with_ret(demanded, b.def, ret_of(f.ret)) }
+  })
+
+fn no_found() -> Found =
+  { sites: [], demands: [], escaped: [], ret: FreshOwner, reads: [], looked: [] }
+
+/// What answers a body this round: the walk it had, one this run made or an earlier run kept, by
+/// place, or a walk to make.
+type Try = | Stays | Made(Int) | Kept(Int) | Walks
+
+/// A run so far: `found` is each body's walk under the tables last walked, `took` the kept walks
+/// that answered, by place, and `made` the walks made, each in the order it first answered.
+/// `fresh` are the modules lowered with nothing kept.
+type Run = {
+  prog: Program,
+  found: List<Found>,
+  took: List<List<Int>>,
+  made: List<List<Found>>,
+  whole: Option<Whole>,
+  fresh: Map<Int, Bool>,
+  lowered: Int,
+  failed: Bool,
+}
+
+type Settled = { run: Run, tables: Tables, rounds: Int }
+
+/// A walk reads nothing that moves between runs but the names it looks up and the callees' answers
+/// it reads, so one whose reads all answer alike answers as walking again would.
+fn answers(f: Found, rets: List<ReturnOwnership>) -> Bool =
+  f.reads.fold(true, |acc: Bool, r: Read| acc && rets.at(r.callee) == Some(r.ret))
+
+fn first_answering(walks: List<Found>, rets: List<ReturnOwnership>) -> Option<Int> / {abort.raise} =
+  range(0, walks.len()).fold(None, |acc: Option<Int>, j: Int|
+    match acc { Some(_) -> acc, None -> if answers(walks.get(j), rets) { Some(j) } else { None } })
+
+fn keys_of(m: Map<Int, Bool>) -> List<Int> =
+  m.fold([], |acc: List<Int>, k: Int, _: Bool| acc.push(k))
+
+/// Each body `which` holds answered under `tables`, by a walk that reads alike or by walking it,
+/// lowering first each module a body to walk has no code in.
+fn evaluate(p: Priced, run: Run, which: (Int) -> Bool, tables: Tables) -> Run / {abort.raise} =
+  if run.failed { run } else {
+    let n = run.prog.bodies.len();
+    let tried = range(0, n).map(|i: Int|
+      if !which(i) { Stays } else {
+        match first_answering(run.made.get(i), tables.rets) {
+          Some(j) -> Made(j),
+          None -> match first_answering(run.prog.bodies.get(i).kept, tables.rets) {
+            Some(j) -> Kept(j),
+            None -> Walks,
+          },
+        }
+      });
+    let unlowered = range(0, n).fold(Map::new(), |acc: Map<Int, Bool>, i: Int|
+      match tried.get(i) {
+        Walks -> {
+          let b: Body = run.prog.bodies.get(i);
+          if b.lowered { acc } else { acc.insert(b.module, true) }
+        },
+        _ -> acc,
+      });
+    let ready = if unlowered.len() == 0 { run } else { relowered(p, run, keys_of(unlowered)) };
+    if ready.failed { ready } else {
+      let walks = range(0, n).fold(Map::new(), |acc: Map<Int, Found>, i: Int|
+        match tried.get(i) {
+          Walks -> {
+            let b: Body = ready.prog.bodies.get(i);
+            acc.insert(i, walk_body({ prog: ready.prog, module: b.module, tables: tables }, b))
+          },
+          _ -> acc,
+        });
+      let walked = |i: Int| match walks.get(i) { Some(f) -> f, None -> no_found() };
+      {
+        ..ready,
+        found: range(0, n).map(|i: Int|
+          match tried.get(i) {
+            Stays -> ready.found.get(i),
+            Made(j) -> ready.made.get(i).get(j),
+            Kept(j) -> ready.prog.bodies.get(i).kept.get(j),
+            Walks -> walked(i),
+          }),
+        took: range(0, n).map(|i: Int| {
+          let took: List<Int> = ready.took.get(i);
+          match tried.get(i) {
+            Kept(j) -> if took.contains(j) { took } else { took.push(j) },
+            _ -> took,
+          }
+        }),
+        made: range(0, n).map(|i: Int|
+          match tried.get(i) {
+            Walks -> ready.made.get(i).push(walked(i)),
+            _ -> ready.made.get(i),
+          }),
+      }
+    }
+  }
+
+/// The bodies of `modules`, kept from an earlier run, given the code their lowering makes now. The
+/// module's key holds its text, so the lowering makes the bodies that were kept.
+fn relowered(p: Priced, run: Run, modules: List<Int>) -> Run / {abort.raise} =
+  match lower(p, run.whole, modules, run.prog.index) {
+    None -> { ..run, failed: true },
+    Some(l) -> {
+      let made = range(0, modules.len()).fold(Map::new(), |acc: Map<Int, List<Body>>, k: Int|
+        acc.insert(modules.get(k), l.bodies.get(k)));
+      let placed = run.prog.bodies.fold(
+        { bodies: [], seen: Map::new() },
+        |acc: { bodies: List<Body>, seen: Map<Int, Int> }, b: Body|
+          match made.get(b.module) {
+            None -> { ..acc, bodies: acc.bodies.push(b) },
+            Some(lowered) -> {
+              let k = match acc.seen.get(b.module) { Some(x) -> x, None -> 0 };
+              match lowered.at(k) {
+                Some(m) -> if m.label != b.label || m.kind != b.kind {
+                  panic("a module whose key stands lowered to other bodies than it kept")
+                } else {
+                  {
+                    bodies: acc.bodies.push({ ..b, code: m.code, span: m.span, lowered: true }),
+                    seen: acc.seen.insert(b.module, k + 1),
+                  }
+                },
+                None -> panic("a module whose key stands lowered to fewer bodies than it kept"),
+              }
+            },
+          },
+      );
+      {
+        ..run,
+        prog: { ..run.prog, r: resolution(l.whole, run.prog.r), bodies: placed.bodies },
+        whole: l.whole,
+        lowered: run.lowered + modules.len(),
+      }
+    },
+  }
+
+/// Each definition's readers: the bodies whose walk reads what it answers. Which callees a walk
+/// reads is the body's, whatever the tables say, so any walk of it says.
+fn readers_of(found: List<Found>) -> Map<Int, List<Int>> / {abort.raise} =
+  range(0, found.len()).fold(Map::new(), |acc: Map<Int, List<Int>>, i: Int|
+    found.get(i).reads.fold(acc, |m: Map<Int, List<Int>>, r: Read| {
+      let was = match m.get(r.callee) { Some(xs) -> xs, None -> [] };
+      if was.len() > 0 && was.get(was.len() - 1) == i { m } else { m.insert(r.callee, was.push(i)) }
+    }))
+
+/// The bodies that read a definition `before` and `after` answer apart.
+fn moved_readers(readers: Map<Int, List<Int>>, before: Tables, after: Tables) -> Map<Int, Bool> =
+  range(0, after.rets.len()).fold(Map::new(), |acc: Map<Int, Bool>, d: Int|
+    if before.rets.at(d) == after.rets.at(d) { acc } else {
+      match readers.get(d) {
+        None -> acc,
+        Some(xs) -> xs.fold(acc, |m: Map<Int, Bool>, i: Int| m.insert(i, true)),
+      }
+    })
+
+/// Rounds until the tables settle, or 24 of them; a body is walked again only where a callee it
+/// reads answers otherwise than the round before.
+fn iterate(
+  p: Priced,
+  run: Run,
+  readers: Map<Int, List<Int>>,
+  tables: Tables,
+  rounds: Int,
+) -> Settled / {abort.raise} = {
+  let next = settle(run.prog, run.found, tables);
+  let moved = moved_readers(readers, tables, next);
+  let walked = evaluate(p, run, |i: Int| moved.contains(i), next);
+  if walked.failed || next == tables || rounds + 1 >= 24 {
+    { run: walked, tables: next, rounds: rounds + 1 }
+  } else { iterate(p, walked, readers, next, rounds + 1) }
+}
+
+fn fix(cause: Option<Cause>) -> Bytes =
+  match cause {
+    Some(CReadAgain) ->
+      b"make the update the binding's last use: bind whatever you still need out of it first",
+    Some(CMapEntry) -> b"`Map::update`",
+    Some(CCapture) -> b"bind the value before the closure captures it, or capture less",
+    Some(CCallerKeeps) -> b"the edit is at the call site: the caller keeps what it passes",
+    _ -> b"",
+  }
+
+/// One update (`op` is `List::push`, `List::set` or `Array::set`): where it stands in its module's text,
+/// what it costs, why, the edit that would remove a copy, and the parameter the updated value is
+/// at its last use, or -1 for none.
+pub type Site = {
+  start: Int,
+  end: Int,
+  op: Bytes,
+  verdict: Bytes,
+  reason: Bytes,
+  fix: Bytes,
+  param: Int,
+}
+
+/// A definition, test or law with at least one update. `module` indexes the sources handed over.
+pub type Costed = {
+  kind: Bytes,
+  module: Int,
+  module_name: Bytes,
+  name: Bytes,
+  label: Bytes,
+  reuse: Option<Span>,
+  sites: List<Site>,
+}
+
+/// A `returns` clause the body does not keep: where it is written, and what the body answers instead.
+pub type Unkept = {
+  module: Int,
+  module_name: Bytes,
+  name: Bytes,
+  start: Int,
+  end: Int,
+  said: Bytes,
+  answers: Bytes,
+}
+
+/// `ok` is false for a program that did not resolve, which costs nothing rather than nothing costing.
+pub type Report = { ok: Bool, rounds: Int, defs: List<Costed>, unkept: List<Unkept> }
+
+// A report is kept between runs, a function of the program's text and of this checker.
+derive bin for Site
+derive bin for Costed
+derive bin for Unkept
+derive bin for Report
+
+fn finish(raw: RawSite, def: Int, tables: Tables) -> Site = {
+  let sited = |verdict: Bytes, reason: Bytes, cause: Option<Cause>, param: Int|
+    {
+      start: raw.span.start,
+      end: raw.span.end,
+      op: raw.op,
+      verdict: verdict,
+      reason: reason,
+      fix: fix(cause),
+      param: param,
+    };
+  match raw.owner {
+    FreshOwner ->
+      sited(
+        b"reuses",
+        Bytes::concat_all([b"the ", held(raw.op), b" reaches `", raw.op, b"` at one owner"]),
+        None,
+        0 - 1,
+      ),
+    BlockedOwner(reason) -> sited(b"copies", reason.text, Some(reason.cause), 0 - 1),
+    UnknownOwner(reason) -> sited(b"unknown", reason.text, Some(reason.cause), 0 - 1),
+    ParamOwner(k) -> {
+      let head = Bytes::concat_all([b"the ", held(raw.op), b" is parameter ", ascii_of_int(k)]);
+      match param_at(tables, def, k) {
+        Some(SoleParam) ->
+          sited(
+            b"reuses",
+            head.concat(b", and every call site hands one over and stops reading it"),
+            None,
+            k,
+          ),
+        Some(SharedParam(reason)) ->
+          sited(
+            b"copies",
+            Bytes::concat_all([head, b", and a caller keeps it: ", reason.text]),
+            Some(CCallerKeeps),
+            k,
+          ),
+        Some(UnsureParam(reason)) ->
+          sited(
+            b"unknown",
+            Bytes::concat_all([head, b", and a call site is undecided: ", reason.text]),
+            Some(reason.cause),
+            k,
+          ),
+        None ->
+          sited(
+            b"unknown",
+            head.concat(b" of a definition this pass cannot name"),
+            Some(CCallerKeeps),
+            k,
+          ),
+      }
+    },
+  }
+}
+
+fn quoted(s: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"\"",
+    Bytes::concat_all(
+      range(0, s.len()).map(|i: Int| {
+        let c = s.at(i);
+        if c == 34 { b"\\\"" }
+        else if c == 92 { b"\\\\" }
+        else if c == 10 { b"\\n" }
+        else if c == 13 { b"\\r" }
+        else if c == 9 { b"\\t" }
+        else { s.slice(i, i + 1) }
+      }),
+    ),
+    b"\"",
+  ])
+
+fn code_of(names: List<Bytes>, labels: List<Bytes>, body: Expr) -> Option<Code> / {abort.raise} =
+  match lower_to_emit(names, labels, Map::new(), body) { Some(l) -> Some(l.code), None -> None }
+
+/// Module `i`'s bodies, lowered, in item order.
+fn module_bodies(i: Int, m: ParsedModule, index: Map<Bytes, Int>) -> List<Body> / {abort.raise} =
+  m.module.items.fold([], |a: List<Body>, item: Item|
+    match item {
+      IFn(d) -> {
+        let labels = d.generics.labels.map(|ident: Ident| ident.name);
+        let names = d.params.map(|param: Param| param.name.name);
+        a.push({
+          kind: b"fn",
+          module: i,
+          module_name: m.name,
+          name: d.name.name,
+          label: Bytes::concat_all([m.name, b".", d.name.name]),
+          def: match index.get(qualify(m.name, d.name.name)) { Some(k) -> k, None -> 0 - 1 },
+          arity: names.len() + labels.len(),
+          span: d.span,
+          code: code_of(names, labels, d.body),
+          lowered: true,
+          reuse: d.reuse,
+          looked: [],
+          kept: [],
+        })
+      },
+      // Over cases, the body is read as a function of its case.
+      ITest(t) -> {
+        let names = match t.cases { Some(c) -> [c.binder.name], None -> [] };
+        a.push({
+          kind: b"test",
+          module: i,
+          module_name: m.name,
+          name: t.name,
+          label: Bytes::concat_all([m.name, b": test ", quoted(t.name)]),
+          def: 0 - 1,
+          arity: names.len(),
+          span: t.span,
+          code: code_of(names, [], t.body),
+          lowered: true,
+          reuse: None,
+          looked: [],
+          kept: [],
+        })
+      },
+      ILaw(l) -> {
+        let names = l.binders.map(|binder: Binder| binder.name.name);
+        a.push({
+          kind: b"law",
+          module: i,
+          module_name: m.name,
+          name: l.name,
+          label: Bytes::concat_all([m.name, b": law ", quoted(l.name)]),
+          def: 0 - 1,
+          arity: names.len(),
+          span: l.span,
+          code: code_of(names, [], l.body),
+          lowered: true,
+          reuse: None,
+          looked: [],
+          kept: [],
+        })
+      },
+      _ -> a,
+    })
+
+/// `witnesses` are the parameters the lowering passes ahead of the written ones.
+fn def_of_fn(
+  module: Bytes,
+  i: Int,
+  own: Bool,
+  def: FnDef,
+  witnesses: List<Bytes>,
+) -> Def / {abort.raise} = {
+  let params = witnesses.concat(def.params.map(|param: Param| param.name.name));
+  {
+    name: qualify(module, def.name.name),
+    module: i,
+    module_name: module,
+    params: params,
+    arity: params.len(),
+    own: own,
+    says: match def.returns {
+      None -> None,
+      Some(ReturnsFresh(sp)) -> Some({ ret: FreshReturn, span: sp }),
+      Some(ReturnsParam(x)) ->
+        Some({
+          ret: ReturnOfParam(
+            range(0, params.len()).fold(0, |acc: Int, k: Int|
+              if params.get(k) == x.name { k } else { acc }),
+          ),
+          span: x.span,
+        }),
+    },
+  }
+}
+
+/// What a body answering `got` breaks of a clause saying `said`: fresh keeps either clause, and a
+/// parameter keeps only the clause naming it.
+fn breaks(said: ReturnOwnership, got: ReturnOwnership) -> Bool =
+  match got {
+    FreshReturn -> false,
+    ReturnOfParam(k) -> match said { ReturnOfParam(j) -> j != k, _ -> true },
+    _ -> true,
+  }
+
+fn ret_text(d: Def, r: ReturnOwnership) -> Bytes =
+  match r {
+    FreshReturn -> b"fresh",
+    ReturnOfParam(k) ->
+      Bytes::concat_all([
+        b"its parameter `",
+        match d.params.at(k) { Some(n) -> n, None -> ascii_of_int(k) },
+        b"`",
+      ]),
+    SharedReturn(reason) -> reason.text,
+    UnsureReturn(reason) -> reason.text,
+  }
+
+fn unkept_of(program: Program, tables: Tables) -> List<Unkept> / {abort.raise} =
+  range(0, program.defs.len()).fold([], |acc: List<Unkept>, i: Int| {
+    let d: Def = program.defs.get(i);
+    match d.says {
+      None -> acc,
+      Some(x) -> if !d.own { acc } else {
+        match tables.rets.at(i) {
+          Some(got) -> if !breaks(x.ret, got) { acc } else {
+            acc.push({
+              module: d.module,
+              module_name: d.module_name,
+              name: d.name,
+              start: x.span.start,
+              end: x.span.end,
+              said: ret_text(d, x.ret),
+              answers: ret_text(d, got),
+            })
+          },
+          None -> acc,
+        }
+      },
+    }
+  })
+
+/// Every name the checker binds as a builtin, which is what tells a call to `List::push` from a call to
+/// a definition.
+fn builtin_names() -> List<Bytes> / {abort.raise} = builtins().map(|b: Builtin| b.name)
+
+/// A checked program as the cost checker reads it: the front end's analysis, each module's text as
+/// its source holds it, and what the analysis's check read of each body.
+pub type Priced = { analysis: Analysis, srcs: List<Bytes>, rows: Rows, walked: WalkedFacts }
+
+pub fn priced_of(analysis: Analysis, srcs: List<Bytes>) -> Priced / {abort.raise} =
+  { analysis: analysis, srcs: srcs, rows: rows_of(analysis), walked: walked_facts(analysis) }
+
+/// The root package's modules: the ones whose bodies a run costs.
+fn own_module(a: Analysis, i: Int) -> Bool =
+  match a.module_packages.at(i) { Some(k) -> k == 0, None -> true }
+
+fn places(mods: List<ParsedModule>) -> Map<Bytes, Int> / {abort.raise} =
+  range(0, mods.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
+    acc.insert(mods.get(i).name, i))
+
+/// Where module `k` of the front end's answer stands among the program's modules.
+fn placed(here: Map<Bytes, Int>, names: List<Bytes>, k: Int) -> Option<Int> =
+  match names.at(k) { Some(n) -> here.get(n), None -> None }
+
+/// Each module's witness orders by definition name, by its index among `mods`.
+fn orders_by_module(
+  w: WalkedFacts,
+  mods: List<ParsedModule>,
+) -> Map<Int, Map<Bytes, List<Bytes>>> / {abort.raise} = {
+  let here = places(mods);
+  w.orders.fold(Map::new(), |acc: Map<Int, Map<Bytes, List<Bytes>>>, o: WitnessOrder|
+    match placed(here, w.modules, o.module) {
+      None -> acc,
+      Some(i) -> {
+        let was = match acc.get(i) { Some(m) -> m, None -> Map::new() };
+        acc.insert(i, was.insert(o.name, o.params))
+      },
+    })
+}
+
+/// Every definition of the program as the front end read it. A witnessed definition takes its
+/// witnesses first, as its lowering does.
+fn defs_of(a: Analysis, walked: WalkedFacts) -> List<Def> / {abort.raise} = {
+  let orders = orders_by_module(walked, a.mods);
+  range(0, a.mods.len()).fold([], |acc: List<Def>, i: Int| {
+    let m: ParsedModule = a.mods.get(i);
+    let ws = match orders.get(i) { Some(o) -> o, None -> Map::new() };
+    m.module.items.fold(acc, |xs: List<Def>, item: Item|
+      match item {
+        IFn(d) ->
+          xs.push(
+            def_of_fn(m.name, i, own_module(a, i), d, match ws.get(d.name.name) {
+              Some(w) -> w.map(witness_param),
+              None -> [],
+            }),
+          ),
+        _ -> xs,
+      })
+  })
+}
+
+/// Every module parsed from its source and resolved together: what a module the front end read cut
+/// is lowered from, and the resolution its walk looks names up in, which holds the bindings its
+/// bodies' expansions make.
+type Whole = { mods: List<ParsedModule>, r: Resolved }
+
+fn whole_of(p: Priced) -> Option<Whole> / {abort.raise} = {
+  let a = p.analysis;
+  let tables = embed_tables(a.embeds);
+  let parsed = range(0, a.mods.len()).map(|i: Int| {
+    let name = a.mods.get(i).name;
+    let r = parse(match p.srcs.at(i) { Some(src) -> src, None -> b"" });
+    let x = expand(r.node, r.parser.diags);
+    let d = expand_derives(i, name, x.module);
+    let e = rewritten(tables, name, d.module);
+    {
+      name: name,
+      module: e.module,
+      derived: d.derived,
+      bad: d.diags.len() > 0 || e.diags.len() > 0,
+    }
+  });
+  if parsed.fold(false, |acc: Bool, x: Parsed| acc || x.bad) { None } else {
+    match resolved_as(
+        a,
+        parsed.map(|x: Parsed| { name: x.name, module: x.module, derived: x.derived }),
+      ) {
+      ResolveFailed(_) -> None,
+      ResolveSucceeded(x) -> Some({ mods: x.mods, r: x.r }),
+    }
+  }
+}
+
+/// `mods` resolved in the packages the front end resolved `a` in.
+fn resolved_as(a: Analysis, mods: List<ParsedModule>) -> ResolveOutcome / {abort.raise} = {
+  let shipped = a.packages.len();
+  let packaged = if shipped == 0 { no_packages(mods) } else {
+    {
+      pkgs: a.packages,
+      module_packages: a.module_packages,
+      std: shipped - 2,
+      compiler: shipped - 1,
+      shipped: shipped,
+    }
+  };
+  resolve_packaged(
+    mods,
+    packaged.pkgs,
+    packaged.module_packages,
+    packaged.std,
+    packaged.compiler,
+    packaged.shipped,
+  )
+}
+
+type Lowered = { bodies: List<List<Body>>, whole: Option<Whole> }
+
+/// Modules `wanted`, each one's bodies lowered in item order with what the front end's check read
+/// of each written out. A module the front end read whole is lowered as it read it; one it read
+/// cut, from `whole`, which this resolves on first need. `None` is a module that does
+/// not lower: one the front end holds no facts of a body of.
+fn lower(
+  p: Priced,
+  whole: Option<Whole>,
+  wanted: List<Int>,
+  index: Map<Bytes, Int>,
+) -> Option<Lowered> / {abort.raise} =
+  if wanted.len() == 0 { Some({ bodies: [], whole: whole }) } else {
+    let a = p.analysis;
+    let cut = |i: Int| a.stub_cuts.contains(a.mods.get(i).name);
+    let needs = wanted.fold(false, |acc: Bool, i: Int| acc || cut(i));
+    let taken = match whole { Some(_) -> whole, None -> if needs { whole_of(p) } else { None } };
+    let missing = match taken { Some(_) -> false, None -> needs };
+    if missing { None } else {
+      let tables = embed_tables(a.embeds);
+      let read = wanted.fold(
+        { mods: [], bad: false },
+        |acc: { mods: List<ParsedModule>, bad: Bool }, i: Int|
+          if cut(i) {
+            {
+              ..acc,
+              mods: acc.mods.push(match taken { Some(w) -> w.mods.get(i), None -> a.mods.get(i) }),
+            }
+          } else {
+            let m: ParsedModule = a.mods.get(i);
+            let e = rewritten(tables, m.name, m.module);
+            { mods: acc.mods.push({ ..m, module: e.module }), bad: acc.bad || e.diags.len() > 0 }
+          },
+      );
+      if read.bad { None } else {
+        match facts_read(p.rows, p.walked, None, read.mods) {
+          Err(_) -> None,
+          Ok(facts) -> {
+            let expanded = expanded_mods(read.mods, facts.elaboration, a.r.signatures);
+            Some({
+              bodies: range(0, wanted.len()).map(|k: Int|
+                module_bodies(wanted.get(k), expanded.get(k), index)),
+              whole: taken,
+            })
+          },
+        }
+      }
+    }
+  }
+
+fn found_of(index: Map<Bytes, Int>, w: KeptWalk) -> Option<Found> = {
+  let reads = w.reads.fold(Some([]), |acc: Option<List<Read>>, r: KeptRead|
+    match ((acc, index.get(r.callee))) {
+      (Some(xs), Some(d)) -> Some(xs.push({ callee: d, ret: r.ret })),
+      _ -> None,
+    });
+  let demands = w.demands.fold(Some([]), |acc: Option<List<Demand>>, x: KeptDemand|
+    match ((acc, index.get(x.callee))) {
+      (Some(xs), Some(d)) -> Some(xs.push({ callee: d, param: x.param, owner: x.owner })),
+      _ -> None,
+    });
+  let escaped = w.escaped.fold(Some([]), |acc: Option<List<Int>>, name: Bytes|
+    match ((acc, index.get(name))) { (Some(xs), Some(d)) -> Some(xs.push(d)), _ -> None });
+  match ((reads, demands, escaped)) {
+    (Some(r), Some(d), Some(e)) ->
+      Some({ sites: w.sites, demands: d, escaped: e, ret: w.ret, reads: r, looked: [] }),
+    _ -> None,
+  }
+}
+
+/// A body as an earlier run kept it. Its walks are taken only while every name it looks up is bound
+/// to a definition exactly where it was then.
+fn held_body(prog: Program, i: Int, module_name: Bytes, k: KeptBody) -> Option<Body> = {
+  let def = match k.def { None -> Some(0 - 1), Some(name) -> prog.index.get(name) };
+  match def {
+    None -> None,
+    Some(d) -> {
+      let stands = k.looked.fold(true, |acc: Bool, l: Looked|
+        acc && (match l.bound { None -> true, Some(q) -> prog.index.contains(q) == l.def }));
+      Some({
+        kind: k.kind,
+        module: i,
+        module_name: module_name,
+        name: k.name,
+        label: k.label,
+        def: d,
+        arity: k.arity,
+        span: dummy_span(),
+        code: None,
+        lowered: false,
+        reuse: k.reuse,
+        looked: k.looked,
+        kept: if !stands { [] } else {
+          k.walks.fold([], |acc: List<Found>, w: KeptWalk|
+            match found_of(prog.index, w) { Some(f) -> acc.push(f), None -> acc })
+        },
+      })
+    },
+  }
+}
+
+/// Module `i`'s bodies as an earlier run kept them, or `None` for bytes that do not decode or that
+/// name a definition the program does not hold.
+fn held_bodies(
+  prog: Program,
+  i: Int,
+  module_name: Bytes,
+  bytes: Bytes,
+) -> Option<List<Body>> / {abort.raise} =
+  match bin::decode(bytes, kept_module_bin()) {
+    Err(_) -> None,
+    Ok(m) ->
+      m.bodies.fold(Some([]), |acc: Option<List<Body>>, k: KeptBody|
+        match acc {
+          None -> None,
+          Some(bs) -> match held_body(prog, i, module_name, k) {
+            Some(b) -> Some(bs.push(b)),
+            None -> None,
+          },
+        }),
+  }
+
+/// The whole program's, once a cut module has been lowered: what a cut leaves out binds nothing.
+fn resolution(whole: Option<Whole>, r: Resolved) -> Resolved =
+  match whole { Some(w) -> w.r, None -> r }
+
+fn failed_run(prog: Program) -> Run =
+  {
+    prog: prog,
+    found: [],
+    took: [],
+    made: [],
+    whole: None,
+    fresh: Map::new(),
+    lowered: 0,
+    failed: true,
+  }
+
+/// The program, each own module's bodies taken as an earlier run kept them where `kept` holds them,
+/// and lowered otherwise.
+fn started(p: Priced, kept: List<Option<Bytes>>) -> Run / {abort.raise} = {
+  let a = p.analysis;
+  let defs = defs_of(a, p.walked);
+  let base = {
+    r: a.r,
+    index: range(0, defs.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
+      acc.insert(defs.get(i).name, i)),
+    builtins: builtin_names().fold(Map::new(), |acc: Map<Bytes, Bool>, b: Bytes|
+      acc.insert(b, true)),
+    defs: defs,
+    bodies: [],
+  };
+  let held = range(0, a.mods.len()).map(|i: Int|
+    if !own_module(a, i) { None } else {
+      match kept.at(i) {
+        Some(Some(bytes)) -> held_bodies(base, i, a.mods.get(i).name, bytes),
+        _ -> None,
+      }
+    });
+  let missed = range(0, a.mods.len()).filter(|i: Int|
+    own_module(a, i) && (match held.get(i) { Some(_) -> false, None -> true }));
+  match lower(p, None, missed, base.index) {
+    None -> failed_run(base),
+    Some(l) -> {
+      let fresh = range(0, missed.len()).fold(Map::new(), |acc: Map<Int, List<Body>>, k: Int|
+        acc.insert(missed.get(k), l.bodies.get(k)));
+      let bodies = range(0, a.mods.len()).fold([], |acc: List<Body>, i: Int|
+        match held.get(i) {
+          Some(bs) -> acc.concat(bs),
+          None -> match fresh.get(i) { Some(bs) -> acc.concat(bs), None -> acc },
+        });
+      let none: List<Int> = [];
+      let unmade: List<Found> = [];
+      {
+        prog: { ..base, r: resolution(l.whole, base.r), bodies: bodies },
+        found: bodies.map(|_: Body| no_found()),
+        took: bodies.map(|_: Body| none),
+        made: bodies.map(|_: Body| unmade),
+        whole: l.whole,
+        fresh: missed.fold(Map::new(), |acc: Map<Int, Bool>, i: Int| acc.insert(i, true)),
+        lowered: missed.len(),
+        failed: false,
+      }
+    },
+  }
+}
+
+fn kept_walk(prog: Program, f: Found) -> KeptWalk / {abort.raise} = {
+  let name = |d: Int| prog.defs.get(d).name;
+  {
+    reads: f.reads.map(|r: Read| { callee: name(r.callee), ret: r.ret }),
+    sites: f.sites,
+    demands: f.demands.map(|x: Demand| { callee: name(x.callee), param: x.param, owner: x.owner }),
+    escaped: f.escaped.map(|d: Int| name(d)),
+    ret: f.ret,
+  }
+}
+
+/// What a walk looked up, each name once.
+fn looked_of(f: Found) -> List<Looked> =
+  f.looked.fold(Map::new(), |acc: Map<Bytes, Looked>, l: Look|
+    acc.insert(l.name, { name: l.name, bound: l.bound, def: l.def != None })).fold(
+    [],
+    |acc: List<Looked>, _: Bytes, l: Looked| acc.push(l),
+  )
+
+fn kept_body(run: Run, i: Int) -> KeptBody / {abort.raise} = {
+  let b: Body = run.prog.bodies.get(i);
+  let made: List<Found> = run.made.get(i);
+  {
+    kind: b.kind,
+    name: b.name,
+    label: b.label,
+    def: if b.def < 0 { None } else { Some(run.prog.defs.get(b.def).name) },
+    arity: b.arity,
+    reuse: b.reuse,
+    looked: match made.at(0) { Some(f) -> looked_of(f), None -> b.looked },
+    walks: run.took.get(i).map(|j: Int| kept_walk(run.prog, b.kept.get(j))).concat(
+      made.map(|f: Found| kept_walk(run.prog, f)),
+    ),
+  }
+}
+
+/// A default argument is written at its callee's place, in a text another module's key holds; a
+/// walk that found a site there is not kept.
+fn own_sites(f: Found, span: Span) -> Bool =
+  f.sites.fold(true, |acc: Bool, s: RawSite|
+    acc && s.span.start >= span.start && s.span.end <= span.end)
+
+/// Of each module, the entry to keep under its key where it moved: lowered with nothing kept, or
+/// with a body that made a walk or left one it kept untaken.
+fn kept_of(run: Run, n: Int) -> List<Option<Bytes>> / {abort.raise} = {
+  let prog = run.prog;
+  let by_module = range(0, prog.bodies.len()).fold(
+    Map::new(),
+    |acc: Map<Int, List<Int>>, i: Int| {
+      let m = prog.bodies.get(i).module;
+      acc.insert(m, List::push(match acc.get(m) { Some(xs) -> xs, None -> [] }, i))
+    },
+  );
+  range(0, n).map(|m: Int| {
+    let xs = match by_module.get(m) { Some(xs) -> xs, None -> [] };
+    let moved = run.fresh.contains(m)
+      || xs.fold(false, |acc: Bool, i: Int|
+        acc || run.made.get(i).len() > 0 || run.took.get(i).len() < prog.bodies.get(i).kept.len());
+    let own = xs.fold(true, |acc: Bool, i: Int|
+      acc
+        && run.made.get(i).fold(true, |ok: Bool, f: Found|
+          ok && own_sites(f, prog.bodies.get(i).span)));
+    if !moved || !own { None }
+    else { Some(bin::encode({ bodies: xs.map(|i: Int| kept_body(run, i)) }, kept_module_bin())) }
+  })
+}
+
+fn report_of(run: Run, tables: Tables, rounds: Int) -> Report / {abort.raise} = {
+  let prog = run.prog;
+  {
+    ok: true,
+    rounds: rounds,
+    defs: range(0, prog.bodies.len()).fold([], |acc: List<Costed>, i: Int| {
+      let b: Body = prog.bodies.get(i);
+      let f: Found = run.found.get(i);
+      if f.sites.len() == 0 { acc } else {
+        acc.push({
+          kind: b.kind,
+          module: b.module,
+          module_name: b.module_name,
+          name: b.name,
+          label: b.label,
+          reuse: b.reuse,
+          sites: f.sites.map(|raw: RawSite| finish(raw, b.def, tables)),
+        })
+      }
+    }),
+    unkept: unkept_of(prog, tables),
+  }
+}
+
+/// What `costs` answers: the report, and of each module the entry to keep under its `cost_keys`
+/// key where it moved. `walked` counts the bodies walked rather than taken as a run kept them, and
+/// `lowered` the modules lowered to walk them.
+pub type Costing = { report: Report, kept: List<Option<Bytes>>, walked: Int, lowered: Int }
+
+/// Every update of the program with its verdict. `kept` holds, by module, what an earlier run kept
+/// under the module's `cost_keys` key: a body is walked only where none of the walks kept of it read
+/// alike, and its module lowered only then. A body of the root package the front end holds no facts
+/// for leaves the report not `ok`.
+pub fn costs(p: Priced, kept: List<Option<Bytes>> = []) -> Costing / {abort.raise} = {
+  let n = p.analysis.mods.len();
+  let refused = {
+    report: { ok: false, rounds: 0, defs: [], unkept: [] },
+    kept: range(0, n).map(|_: Int| None),
+    walked: 0,
+    lowered: 0,
+  };
+  let start = started(p, kept);
+  let tables = start_tables(start.prog.defs);
+  let first = evaluate(p, start, |_: Int| true, tables);
+  if first.failed { refused } else {
+    // Verdicts come from a walk under the settled tables, not the round that produced them.
+    let settled = iterate(p, first, readers_of(first.found), tables, 0);
+    if settled.run.failed { refused } else {
+      {
+        report: report_of(settled.run, settled.tables, settled.rounds),
+        kept: kept_of(settled.run, n),
+        walked: settled.run.made.fold(0, |acc: Int, xs: List<Found>|
+          if xs.len() > 0 { acc + 1 } else { acc }),
+        lowered: settled.run.lowered,
+      }
+    }
+  }
+}
+
+/// What each module's kept entry is filed under, by module: its text, what it embeds, each body's own
+/// form (what its references resolve to, and what other modules' text its expansions wrote in) and
+/// the facts the front end's check read of it, what that check walked afresh, and its witness orders,
+/// under the checker's `identity`. A module of another package has none, and nor does one a body of
+/// which has no own form.
+pub fn cost_keys(p: Priced, identity: Bytes) -> List<Bytes> / {abort.raise} = {
+  let a = p.analysis;
+  let owns = a.hashes.own.fold(
+    Map::new(),
+    |acc: Map<Bytes, Bytes>, o: { name: Bytes, hash: Bytes }| acc.insert(o.name, o.hash),
+  );
+  let defs = p.rows.defs.fold(Map::new(), |acc: Map<Bytes, Bytes>, r: KnownDefRow|
+    acc.insert(r.name, blake3(r.facts)));
+  let tests = p.rows.tests.fold(Map::new(), |acc: Map<Bytes, Bytes>, r: KnownTestRow|
+    acc.insert(r.owner, blake3(r.facts)));
+  let embeds = embeds_by_module(a.embeds);
+  let loose = loose_by_module(p.walked, a.mods);
+  let orders = orders_by_module(p.walked, a.mods);
+  let head = Bytes::concat_all([
+    b"ply.costs.module.1\x00",
+    hex(bin::shape_digest(kept_module_bin())),
+    b"\x00",
+    identity,
+    b"\x00",
+  ]);
+  let entry = |m: Map<Bytes, Bytes>, k: Bytes| match m.get(k) { Some(x) -> x, None -> b"!" };
+  range(0, a.mods.len()).map(|i: Int| {
+    let m: ParsedModule = a.mods.get(i);
+    let items = m.module.items.fold(
+      { parts: [], formless: false },
+      |x: { parts: List<Bytes>, formless: Bool }, item: Item|
+        match item {
+          IFn(d) -> {
+            let name = qualify(m.name, d.name.name);
+            match owns.get(name) {
+              None -> { ..x, formless: true },
+              Some(own) ->
+                {
+                  ..x,
+                  parts: x.parts.push(
+                    Bytes::concat_all([b"f", name, b"\x00", own, b"\x00", entry(defs, name)]),
+                  ),
+                },
+            }
+          },
+          ITest(d) -> {
+            let owner = test_owner(m.name, d.name);
+            match a.hashes.test_texts.get(qualify(m.name, d.name)) {
+              None -> { ..x, formless: true },
+              Some(own) ->
+                {
+                  ..x,
+                  parts: x.parts.push(
+                    Bytes::concat_all([b"t", owner, b"\x00", own, b"\x00", entry(tests, owner)]),
+                  ),
+                },
+            }
+          },
+          ILaw(d) -> match a.hashes.law_texts.get(qualify(m.name, d.name)) {
+            None -> { ..x, formless: true },
+            Some(own) -> { ..x, parts: x.parts.push(b"l".concat(own)) },
+          },
+          _ -> x,
+        },
+    );
+    if !own_module(a, i) || items.formless { b"" } else {
+      hex(
+        blake3(
+          Bytes::concat_all([
+            head,
+            m.name,
+            b"\x00",
+            blake3(match p.srcs.at(i) { Some(src) -> src, None -> b"" }),
+            b"\x00",
+            match embeds.get(m.name) { Some(e) -> e, None -> b"" },
+            b"\x00",
+            Bytes::concat_all(items.parts.map(|part: Bytes| part.concat(b"\x00"))),
+            b"\x00",
+            match loose.get(i) { Some(l) -> l, None -> b"" },
+            b"\x00",
+            match orders.get(i) {
+              Some(o) ->
+                o.fold(b"", |acc2: Bytes, name: Bytes, params: List<Bytes>|
+                  Bytes::concat_all([
+                    acc2,
+                    name,
+                    b"(",
+                    Bytes::concat_all(params.map(|q: Bytes| q.concat(b","))),
+                    b")",
+                  ])),
+              None -> b"",
+            },
+          ]),
+        ),
+      )
+    }
+  })
+}
+
+fn embeds_by_module(embeds: List<EmbedAt>) -> Map<Bytes, Bytes> =
+  embeds.fold(Map::new(), |acc: Map<Bytes, Bytes>, e: EmbedAt|
+    acc.insert(
+      e.module,
+      Bytes::concat_all([
+        match acc.get(e.module) { Some(was) -> was, None -> b"" },
+        e.key,
+        b"\x00",
+        match e.read {
+          Ok(files) ->
+            Bytes::concat_all(
+              files.map(|f: EmbedFile| Bytes::concat_all([f.name, b"\x00", f.digest, b"\x00"])),
+            ),
+          Err(why) -> b"!".concat(why),
+        },
+        b"\x00",
+      ]),
+    ))
+
+/// What the front end's check walked afresh of each module (its clauses and laws), by its index among
+/// `mods`, in bytes that do not say where the module stands among them.
+fn loose_by_module(w: WalkedFacts, mods: List<ParsedModule>) -> Map<Int, Bytes> / {abort.raise} = {
+  let here = places(mods);
+  let into = |acc: Map<Int, RootFacts>, k: Int, add: (RootFacts) -> RootFacts|
+    match placed(here, w.modules, k) {
+      None -> acc,
+      Some(i) -> acc.insert(i, add(match acc.get(i) { Some(f) -> f, None -> no_root_facts() })),
+    };
+  let l = w.loose;
+  let labelled = l.label_sites.fold(Map::new(), |acc: Map<Int, RootFacts>, x: LabelSite|
+    into(acc, x.module, |f: RootFacts|
+      { ..f, label_sites: f.label_sites.push({ ..x, module: 0 }) }));
+  let updated = l.updates.fold(labelled, |acc: Map<Int, RootFacts>, x: UpdateShape|
+    into(acc, x.module, |f: RootFacts| { ..f, updates: f.updates.push({ ..x, module: 0 }) }));
+  let witnessed = l.ops.fold(updated, |acc: Map<Int, RootFacts>, x: WitnessOp|
+    into(acc, x.module, |f: RootFacts| { ..f, ops: f.ops.push({ ..x, module: 0 }) }));
+  let referenced = l.refs.fold(witnessed, |acc: Map<Int, RootFacts>, x: WitnessRef|
+    into(acc, x.module, |f: RootFacts| { ..f, refs: f.refs.push({ ..x, module: 0 }) }));
+  let operated = l.operands.fold(referenced, |acc: Map<Int, RootFacts>, x: OperandSite|
+    into(acc, x.module, |f: RootFacts| { ..f, operands: f.operands.push({ ..x, module: 0 }) }));
+  let tried = l.tries.fold(operated, |acc: Map<Int, RootFacts>, x: TrySite|
+    into(acc, x.module, |f: RootFacts| { ..f, tries: f.tries.push({ ..x, module: 0 }) }));
+  let called = l.members.fold(tried, |acc: Map<Int, RootFacts>, x: MemberSite|
+    into(acc, x.module, |f: RootFacts| { ..f, members: f.members.push({ ..x, module: 0 }) }));
+  let typed = l.typed.fold(called, |acc: Map<Int, RootFacts>, x: TypedSite|
+    into(acc, x.module, |f: RootFacts| { ..f, typed: f.typed.push({ ..x, module: 0 }) }));
+  typed.fold(Map::new(), |acc: Map<Int, Bytes>, i: Int, f0: RootFacts| {
+    let f = { ..f0, types: types_named(l.types, f0.typed) };
+    acc.insert(i, bin::encode(f, root_facts_bin()))
+  })
+}
+
+// --- Tests ------------------------------------------------------------------
+
+/// A program the front end checked, as a driver hands it to the cost checker; `module_packages`
+/// puts a module in another package.
+fn checked(
+  names: List<Bytes>,
+  srcs: List<Bytes>,
+  module_packages: List<Int> = [],
+) -> Priced / {abort.raise} =
+  match analyse(
+      parse_all(range(0, names.len()).map(|i: Int| { name: names.get(i), src: srcs.get(i) })),
+    ) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) ->
+      priced_of(
+        {
+          ..w,
+          module_packages: module_packages.concat(w.module_packages.drop(module_packages.len())),
+        },
+        srcs,
+      ),
+  }
+
+fn reported(
+  names: List<Bytes>,
+  srcs: List<Bytes>,
+  module_packages: List<Int> = [],
+) -> Report / {abort.raise} = costs(checked(names, srcs, module_packages)).report
+
+test "an update comes back with its place, its verdict, why, and the edit that would remove a copy" {
+  let src = b"reuse fn grow(m: Map<Int, List<Int>>, n: Int) -> List<Int> =\n  match m.get(0) { Some(xs) -> xs.push(n), None -> [] }\n";
+  let r = reported([b"m"], [src]);
+  assert(r.ok);
+  assert_eq(r.defs.len(), 1);
+  let d = r.defs.get(0);
+  assert_eq([d.kind, d.module_name, d.name], [b"fn", b"m", b"grow"]);
+  assert_eq(d.reuse, Some(span_between(0, 5)));
+  assert_eq(d.sites.len(), 1);
+  let s = d.sites.get(0);
+  assert_eq(src.slice(s.start, s.end), b"xs.push(n)");
+  assert_eq(s.op, b"List::push");
+  assert_eq(s.verdict, b"copies");
+  assert_eq(s.reason, b"`Map::get` answers a clone the map still holds");
+  assert_eq(s.fix, b"`Map::update`");
+  assert_eq(s.param, 0 - 1)
+}
+
+test "an entry read off a map is a clone, and one popped from it is owned as the map was" {
+  let src = b"fn peek(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match m.first() { Some(e) -> e.value.push(n), None -> [] }\nfn near(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match m.floor(n) { Some(e) -> e.value.push(n), None -> [] }\nfn take(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match m.pop_first() { Some(p) -> p.value.push(n), None -> [] }\nfn cut(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match m.split(n).at { Some(xs) -> xs.push(n), None -> [] }\ntest \"fresh\" { assert_eq(take(Map::new().insert(1, [1]), 2), [1, 2]); assert_eq(cut(Map::new().insert(1, [1]), 1), [1, 1]) }\n";
+  let r = reported([b"m"], [src]);
+  assert(r.ok);
+  let site_of = |name: Bytes| r.defs.filter(|d: Costed| d.name == name).get(0).sites.get(0);
+  let peeked = site_of(b"peek");
+  assert_eq([peeked.verdict, peeked.reason, peeked.fix], [
+    b"copies",
+    b"`.value` was read out of a record something else still holds: `Map::first` answers a clone the map still holds",
+    b"`Map::update`",
+  ]);
+  assert_eq(
+    site_of(b"near").reason,
+    b"`.value` was read out of a record something else still holds: `Map::floor` answers a clone the map still holds",
+  );
+  let taken = site_of(b"take");
+  assert_eq([taken.verdict, taken.reason], [
+    b"reuses",
+    b"the list is parameter 0, and every call site hands one over and stops reading it",
+  ]);
+  assert_eq(site_of(b"cut").verdict, b"reuses")
+}
+
+test "an array or list element replaced in place is an update, and one read out first is a copy" {
+  let src = b"fn fill(xs: Array<Int>, i: Int) -> Array<Int> / {abort.raise} = if i <= 0 { xs } else { fill(xs.set(i - 1, i), i - 1) }\nfn twice(xs: Array<Int>) -> Array<Int> / {abort.raise} = { let n = xs.get(0) + xs.len(); xs.set(0, n) }\nfn again(xs: Array<Int>) -> Int / {abort.raise} = xs.set(0, 1).len() + xs.len()\nfn sized(xs: Array<Int>) -> Array<Int> / {abort.raise} = xs.set(0, xs.len())\nfn first(ys: List<Array<Int>>) -> Array<Int> / {abort.raise} = match ys.at(0) { Some(a) -> a.set(0, 1), None -> Array::new(1, 0) }\nfn bump(zs: List<Int>) -> List<Int> / {abort.raise} = zs.set(0, 1)\ntest \"fresh\" { assert_eq(fill(Array::new(3, 0), 3).len(), 3); assert_eq(bump([0]), [1]) }\n";
+  let r = reported([b"m"], [src]);
+  assert(r.ok);
+  let site_of = |name: Bytes| r.defs.filter(|d: Costed| d.name == name).get(0).sites.get(0);
+  let filled = site_of(b"fill");
+  assert_eq([filled.op, filled.verdict, filled.reason], [
+    b"Array::set",
+    b"reuses",
+    b"the array is parameter 0, and every call site hands one over and stops reading it",
+  ]);
+  let twiced = site_of(b"twice");
+  assert_eq([twiced.op, twiced.verdict], [b"Array::set", b"reuses"]);
+  let again = site_of(b"again");
+  assert_eq([again.verdict, again.reason, again.fix], [
+    b"copies",
+    b"`xs` is read again after this point, so this use clones it",
+    b"make the update the binding's last use: bind whatever you still need out of it first",
+  ]);
+  assert_eq(site_of(b"sized").verdict, b"reuses");
+  let read = site_of(b"first");
+  assert_eq([read.op, read.verdict, read.reason], [
+    b"Array::set",
+    b"copies",
+    b"`List::at` answers a clone the list still holds",
+  ]);
+  let bumped = site_of(b"bump");
+  assert_eq([bumped.op, bumped.verdict], [b"List::set", b"reuses"])
+}
+
+// A region and its release are calls the reader cannot name, so what they answer has no known owner.
+test "a hold answers a clone, and what its region answers or hands its release is owned by no one known" {
+  let src = b"fn read(xs: List<Int>, n: Int) -> List<Int> = with_hold[r](xs, |l: List<Int>| ()) { h -> h.get().push(n) }\nfn answered(xs: List<Int>, n: Int) -> List<Int> = List::push(with_hold[r](n, |k: Int| ()) { h -> xs }, n)\nfn released(xs: List<Int>, n: Int) -> Int = with_hold[r](xs, |l: List<Int>| { let grown = l.push(n); () }) { h -> n }\n";
+  let r = reported([b"m"], [src]);
+  assert(r.ok);
+  let site_of = |name: Bytes| r.defs.filter(|d: Costed| d.name == name).get(0).sites.get(0);
+  let read = site_of(b"read");
+  assert_eq([read.verdict, read.reason, read.fix], [
+    b"copies",
+    b"`Hold::get` answers a clone the hold still holds",
+    b"",
+  ]);
+  assert_eq(site_of(b"answered").verdict, b"unknown");
+  assert_eq(site_of(b"released").verdict, b"unknown")
+}
+
+fn verdicts(r: Report) -> List<Bytes> =
+  r.defs.fold([], |acc: List<Bytes>, d: Costed|
+    d.sites.fold(acc, |a: List<Bytes>, s: Site|
+      a.push(Bytes::concat_all([d.name, b" ", s.verdict]))))
+
+test "a `returns` clause is shown of its body, and one the body does not keep is named" {
+  let src = Bytes::concat_all([
+    b"fn mk(n: Int) -> List<Int> returns fresh = range(0, n)\n",
+    b"fn pick(xs: List<Int>, ys: List<Int>) -> List<Int> returns ys = xs\n",
+    b"fn same(xs: List<Int>) -> List<Int> returns xs = xs\n",
+    b"fn folded(xs: List<Int>) -> List<Int> returns fresh = xs.fold([], |acc: List<Int>, x: Int| acc.push(x))\n",
+  ]);
+  let r = reported([b"m"], [src]);
+  assert(r.ok);
+  assert_eq(r.unkept.map(|u: Unkept| (u.name, u.said, u.answers)), [
+    (b"m.pick", b"its parameter `ys`", b"its parameter `xs`"),
+    (b"m.folded", b"fresh", b"`List::fold` answers whatever its callback answered"),
+  ]);
+  assert_eq(src.slice(r.unkept.get(0).start, r.unkept.get(0).end), b"ys")
+}
+
+test "a function a builtin calls back is handed what its entry says, and a fold answers what it answered" {
+  let src = Bytes::concat_all([
+    b"fn grown(xs: List<Int>) -> List<Int> = xs.fold([], |acc: List<Int>, x: Int| acc.push(x))\n",
+    b"fn each(xss: List<List<Int>>) -> List<List<Int>> = xss.map(|ys: List<Int>| ys.push(1))\n",
+    b"fn values(m: Map<Int, Int>) -> List<Int> returns fresh = m.fold([], |acc: List<Int>, k: Int, v: Int| acc.push(v))\n",
+  ]);
+  let r = reported([b"m"], [src]);
+  assert(r.ok);
+  let site_of = |name: Bytes| r.defs.filter(|d: Costed| d.name == name).get(0).sites.get(0);
+  // A fold's accumulator is its seed on the first call, made here.
+  assert_eq(site_of(b"grown").verdict, b"reuses");
+  let each = site_of(b"each");
+  assert_eq([each.verdict, each.reason], [
+    b"copies",
+    b"an element the list being walked still holds",
+  ]);
+  assert_eq(r.unkept.map(|u: Unkept| (u.name, u.answers)), [
+    (b"m.values", b"`Map::fold` answers whatever its callback answered"),
+  ])
+}
+
+test "another package's definition answers what its `returns` clause says, its body unread" {
+  let lib = Bytes::concat_all([
+    b"pub fn made(n: Int) -> List<Int> returns fresh = range(0, n).fold([], |acc: List<Int>, x: Int| acc.push(x))\n",
+    b"pub fn plain(n: Int) -> List<Int> = range(0, n)\n",
+  ]);
+  let app = b"import lib.more\nreuse fn grow(n: Int) -> List<Int> = more::made(n).push(n)\nreuse fn other(n: Int) -> List<Int> = more::plain(n).push(n)\n";
+  let r = reported([b"app", b"lib.more"], [app, lib], [0, 1]);
+  assert(r.ok);
+  assert_eq(verdicts(r), [b"grow reuses", b"other unknown"]);
+  // The dependency's clause is its own run's to show.
+  assert_eq(r.unkept, [])
+}
+
+/// The cost checker run as a driver that keeps what it is handed does, over `store`.
+fn costed_over(
+  store: Map<Bytes, Bytes>,
+  p: Priced,
+) -> { costing: Costing, store: Map<Bytes, Bytes> } / {abort.raise} = {
+  let keys = cost_keys(p, b"checker");
+  let c = costs(p, keys.map(|k: Bytes| if k.len() == 0 { None } else { store.get(k) }));
+  {
+    costing: c,
+    store: range(0, keys.len()).fold(store, |acc: Map<Bytes, Bytes>, i: Int|
+      match c.kept.at(i) { Some(Some(bytes)) -> acc.insert(keys.get(i), bytes), _ -> acc }),
+  }
+}
+
+/// Three modules: `b` reads what `a.mk` and `a.keep` answer, and `c` reads nothing of either.
+fn layered(mk: Bytes) -> Priced / {abort.raise} =
+  checked([b"a", b"b", b"c"], [
+    b"pub fn table() -> Map<Int, List<Int>> = Map::new()\npub fn keep(xs: List<Int>) -> List<Int> = xs\n".concat(
+      mk,
+    ),
+    b"import a (mk, keep)\nfn grow(n: Int) -> List<Int> = mk(n).push(n)\nfn hold(xs: List<Int>, n: Int) -> List<Int> = keep(xs).push(n)\ntest \"grows\" { assert_eq(grow(1), [0, 1]) }\n",
+    b"fn solo(xs: List<Int>) -> List<Int> = xs.push(1)\n",
+  ])
+
+fn made_fresh() -> Bytes = b"pub fn mk(n: Int) -> List<Int> = range(0, n)\n"
+
+fn made_shared() -> Bytes =
+  b"pub fn mk(n: Int) -> List<Int> = match table().get(0) { Some(xs) -> xs, None -> range(0, n) }\n"
+
+test "a run that takes what earlier runs walked answers as a run from nothing, and walks only what moved" {
+  let first = costed_over(Map::new(), layered(made_fresh()));
+  assert_eq([first.costing.walked, first.costing.lowered], [7, 3]);
+  let again = costed_over(first.store, layered(made_fresh()));
+  assert_eq(again.costing.report, first.costing.report);
+  assert_eq([again.costing.walked, again.costing.lowered], [0, 0]);
+  // `mk` answers a clone now: its module is walked again, and of the rest only `grow`, which reads it.
+  let shared = layered(made_shared());
+  let moved = costed_over(again.store, shared);
+  assert_eq(moved.costing.report, costs(shared).report);
+  assert_eq(verdicts(moved.costing.report), [b"grow copies", b"hold reuses", b"solo reuses"]);
+  assert_eq([moved.costing.walked, moved.costing.lowered], [4, 2]);
+  // Each text's walks are kept under its own key, so going back walks nothing.
+  let back = costed_over(moved.store, layered(made_fresh()));
+  assert_eq(back.costing.report, first.costing.report);
+  assert_eq([back.costing.walked, back.costing.lowered], [0, 0])
+}
+
+/// `user` checked with what it pulls of `shipped`, as a driver hands it to the cost checker.
+fn checked_pulling(user: List<Source>, shipped: List<Source>) -> Priced / {abort.raise} = {
+  let texts = user.concat(shipped).fold(Map::new(), |acc: Map<Bytes, Bytes>, x: Source|
+    acc.insert(x.name, x.src));
+  match analyse_pulling_std(user, shipped).out {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) ->
+      priced_of(
+        w,
+        w.mods.map(|m: ParsedModule| match texts.get(m.name) { Some(src) -> src, None -> b"" }),
+      ),
+  }
+}
+
+/// The program as a load reads it once nothing module `name` reaches moved since the build that
+/// kept it: that module's functions' bodies blank, its tests standing, and resolved so, without
+/// what its bodies bind.
+fn as_stub(whole: Priced, name: Bytes) -> Priced / {abort.raise} = {
+  let a = whole.analysis;
+  let i = range(0, a.mods.len()).fold(0, |acc: Int, k: Int|
+    if a.mods.get(k).name == name { k } else { acc });
+  let cuts = cuts_of(a.mods.get(i)).filter(|c: Cut| c.name.len() > 0);
+  let read = range(0, a.mods.len()).map(|k: Int|
+    {
+      name: a.mods.get(k).name,
+      src: if k == i { stubbed(whole.srcs.get(k), cuts) } else { whole.srcs.get(k) },
+    });
+  match resolved_as(a, parse_all(read).map(|x: ParsedSource| x.module)) {
+    ResolveFailed(_) -> panic("the stubbed program resolves"),
+    ResolveSucceeded(x) ->
+      {
+        ..whole,
+        analysis: { ..a, mods: x.mods, r: x.r, stub_cuts: Map::new().insert(name, cuts) },
+      },
+  }
+}
+
+/// `b` interpolates, which binds `std.show` in it where its bodies are read.
+fn interpolating(mk: Bytes) -> Priced / {abort.raise} =
+  checked_pulling(
+    [
+      { name: b"a", src: b"pub fn table() -> Map<Int, List<Int>> = Map::new()\n".concat(mk) },
+      {
+        name: b"b",
+        src: b"import a (mk)\nfn grow(n: Int) -> List<Int> = mk(String::len(f\"{n}\")).push(n)\nfn told(xs: List<Int>, n: Int) -> List<Int> = xs.push(String::len(f\"{n}\"))\n",
+      },
+    ],
+    [{ name: b"std.show", src: b"pub fn display(n: Int) -> String = n.to_string()\n" }],
+  )
+
+test "a module read as its stub is lowered from its source, and walked as a whole read walks it" {
+  let first = costed_over(Map::new(), interpolating(made_fresh()));
+  let shared = interpolating(made_shared());
+  let stubbed_b = as_stub(shared, b"b");
+  assert_eq(costs(stubbed_b).report, costs(shared).report);
+  let moved = costed_over(first.store, stubbed_b);
+  assert_eq(moved.costing.report, costs(shared).report);
+  // `a` again, and of `b` only `grow`, which reads `mk`: `told` looked up what the stub does not bind.
+  assert_eq([moved.costing.walked, moved.costing.lowered], [3, 2]);
+  let key = cost_keys(shared, b"checker").get(1);
+  assert_eq(moved.store.get(key), costed_over(first.store, shared).store.get(key))
+}
+
+test "a kept walk is not taken once what a name its body looks up is bound to stops being a definition" {
+  let p = layered(made_fresh());
+  let first = costed_over(Map::new(), p);
+  let key = cost_keys(p, b"checker").get(1);
+  let kept = match first.store.get(key) {
+    Some(bytes) -> match bin::decode(bytes, kept_module_bin()) {
+      Ok(m) -> m,
+      Err(_) -> panic("a kept entry decodes"),
+    },
+    None -> panic("the module's entry is kept"),
+  };
+  let renamed = {
+    bodies: kept.bodies.map(|k: KeptBody|
+      {
+        ..k,
+        looked: k.looked.map(|l: Looked| if l.name == b"mk" { { ..l, def: false } } else { l }),
+      }),
+  };
+  let again = costed_over(first.store.insert(key, bin::encode(renamed, kept_module_bin())), p);
+  assert_eq(again.costing.report, first.costing.report);
+  assert_eq([again.costing.walked, again.costing.lowered], [1, 1])
+}

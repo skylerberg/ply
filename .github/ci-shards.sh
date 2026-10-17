@@ -10,13 +10,19 @@
 #                                `supersede` prunes, every key that names the
 #                                run is one a later run reads and no job needs,
 #                                every action a workflow uses is one listed with
-#                                the cache entries it saves, every key over a
-#                                crate's Ply sources names every crate's, and
-#                                the toolchain key names what `ply bootstrap`
-#                                reads
+#                                the cache entries it saves, and every file the
+#                                trees `ply bootstrap` reads embed is in one
 #   ci-shards.sh cache-keys      just the checks of the keys a job writes and reads,
 #                                of what `supersede` deletes and of the actions
-#   ci-shards.sh toolchain-inputs  just that last check
+#   ci-shards.sh toolchain-inputs
+#                                each path a bootstrap reads Ply from, one a line,
+#                                which the toolchain key hashes
+#   ci-shards.sh work ROLE       each path `ply.work` gives ROLE (`ply work`), one a
+#                                line
+#   ci-shards.sh store-paths     where the runs keep their stores, one pattern a
+#                                line, as the cache steps save and restore them
+#   ci-shards.sh ply-trees       every tree of Ply sources `ply.work` places, one
+#                                a line
 #   ci-shards.sh nextest-shards  the JSON matrix of the nextest shards
 #   ci-shards.sh durations FILE  `binary_id test milliseconds` per test in a
 #                                nextest JUnit report
@@ -43,6 +49,10 @@
 #                                delete the entries of REF nothing restores again:
 #                                those this run's replaced, and those no family
 #                                here names
+#
+# Where each package lies is `ply.work`'s to say: the commands that place one read it with the `ply`
+# the job has (`target/debug`, `target/release`) or the last release (`target/stage0`, which
+# `scripts/stage0.sh` fetches).
 
 set -euo pipefail
 
@@ -54,12 +64,8 @@ TAB=$'\t'
 
 # The Ply runs, each one `ply test` or `ply prove` of a package, which loads the package once: the
 # library's tests (`stdlib`) and its proofs (`proofs`), the CLI's suite in parts, each package's suite
-# (`package-<id>`) and each package's proofs (`laws-<id>`).
-# The standard library's tests that read fixtures, as a project: `--std` over it tests and proves
-# every module of the library beside its own.
-STD_TESTS=crates/ply-std-tests/ply
-STD_LIBRARY=crates/ply-std/ply
-CLI_SUITE=crates/ply-cli-tests/ply
+# (`package-<id>`) and each package's proofs (`laws-<id>`), each package where `ply.work` places it
+# (`workspace`).
 # The parts the CLI's suite runs in, `cli-part-<k>`, each a job's `ply test --shard K/N`: its
 # `test/nondet` tests drive `ply` in one working directory, so a `ply test` takes those one after
 # another, and with them one job would run close to its limit.
@@ -74,26 +80,6 @@ CLI_NIGHTLY=(reached copies db_in_ply db_wire pg_client)
 # Minutes of a job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the steps
 # that keep what they wrote.
 RUNS_MARGIN=4
-# Packages whose own suites are runs too, as `id:path`: each failing test is named in the log, where
-# a test wrapping the run would report one failure for all of them, and a pass is kept until the code
-# its test runs moves, where a test wrapping the run reruns whenever the CLI moves.
-PACKAGE_SUITES=(
-  "cli:crates/ply-cli/ply"
-  "compiler:crates/ply-compiler/ply"
-  "examples:examples"
-  "lang:tests/lang"
-  "registry:crates/ply-registry/ply"
-  "prove:crates/ply-prove/ply"
-  "sim:crates/ply-sim/ply"
-  "store:crates/ply-store/ply"
-  "suite:crates/ply-test/ply"
-)
-# Packages whose laws and contracts a `ply prove` of their own discharges, as `id:path`, the entry
-# `laws-<id>`: the library's are the `proofs` run's, and a law in any other package fails `verify`.
-PACKAGE_PROOFS=(
-  "examples:examples"
-)
-
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes. The
 # gates job runs them after its own tests.
 HOST_PACKAGES=(ply-host-tests)
@@ -106,13 +92,13 @@ declare -a KNOWN_OUTSIDE=(
 # Checks on the tree, as `package:target:test` (`target` is `lib` for a unit test, named by full
 # module path). The gates job asserts each ran, since a check that stops running reports nothing.
 TREE_CHECKS=(
-  "ply-eval-tests:suite:armed::every_registered_code_is_constructed_in_production"
-  "ply-eval-tests:suite:armed::every_variant_of_a_covered_enum_is_constructed_in_production"
-  "ply-eval-tests:suite:armed::every_diagnostic_constructor_call_names_its_code_literally"
-  "ply-eval-tests:suite:armed::every_code_declared_or_raised_has_one_row_in_the_registry"
-  "ply-eval-tests:suite:armed::the_registry_has_no_row_for_a_code_nothing_declares_or_raises"
-  "ply-eval-tests:suite:armed::no_allowlist_entry_has_outlived_its_reason"
-  "ply-eval-tests:suite:armed::ambiguous_enum_names_are_declared"
+  "ply-core-tests:suite:armed::every_registered_code_is_constructed_in_production"
+  "ply-core-tests:suite:armed::every_variant_of_a_covered_enum_is_constructed_in_production"
+  "ply-core-tests:suite:armed::every_diagnostic_constructor_call_names_its_code_literally"
+  "ply-core-tests:suite:armed::every_code_declared_or_raised_has_one_row_in_the_registry"
+  "ply-core-tests:suite:armed::the_registry_has_no_row_for_a_code_nothing_declares_or_raises"
+  "ply-core-tests:suite:armed::no_allowlist_entry_has_outlived_its_reason"
+  "ply-core-tests:suite:armed::ambiguous_enum_names_are_declared"
 )
 
 # Checks on the tree in the CLI's suite, as `module:test`. Each runs with its module's entry, so the
@@ -121,28 +107,6 @@ CLI_TREE_CHECKS=(
   "copies:no two modules define the same function"
   "fixture_list:every fixture is listed"
   "tree:the harness is the only module that starts the \`ply\` binary"
-)
-
-# The Ply sources the repository maintains, which the gates job holds to `ply fmt --check`: a source
-# committed unformatted puts its reformatting into the next change that touches it. Every committed
-# `.ply` is under one of these or of the fixtures, whose spelling is their point (`verify`).
-FORMATTED_SOURCES=(
-  crates/ply-cli-tests/ply
-  crates/ply-cli/ply
-  crates/ply-compiler/ply
-  crates/ply-prove/ply
-  crates/ply-registry/ply
-  crates/ply-sim/ply
-  crates/ply-std-tests/ply
-  crates/ply-std/ply
-  crates/ply-store/ply
-  crates/ply-test/ply
-  examples
-  tests/lang
-)
-FIXTURE_SOURCES=(
-  crates/ply-codegen-tests/tests
-  tests/fixtures
 )
 
 # `probes/` directories no cargo build reaches, as `dir:job`; the job must be in `ci`'s `needs`.
@@ -157,7 +121,7 @@ SUPERSEDED=(ply-upstream- ply-stores-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
-NEWEST=(nextest-archive- ply-native- ply-built- rust-passed- tree-passed- ply-c-stage-sources- ply-c-runs-)
+NEWEST=(nextest-archive- ply-runtime- ply-built- rust-passed- tree-passed- ply-c-stage-sources- ply-c-runs-)
 
 # Families of the two above that hold an entry a job, `<family><job id>-...`: one whose job the tree
 # no longer lists is restored by no run.
@@ -180,10 +144,82 @@ ACTIONS=(
   taiki-e/install-action
 )
 
-# The key the `ply` a run bootstrapped and the stage it left are kept under, and the source that says
-# what a bootstrap reads of a checkout (`toolchain_inputs`).
-TOOLCHAIN_KEY=.github/actions/toolchain-key/action.yml
-TOOLCHAIN_BOOTSTRAP=crates/ply-cli/ply/bootstrap.ply
+# The file that says where a bootstrap reads a checkout's parts (`toolchain_inputs`).
+TOOLCHAIN_WORKSPACE=ply.work
+
+# What `ply work` prints of this checkout's `ply.work`, a role and a path a line, read once by the
+# commands that place a package, and the tables made of it.
+WORK=
+workspace() {
+  [[ -z $WORK ]] || return 0
+  local ply dir
+  for ply in "$root/target/debug/ply" "$root/target/release/ply" "$root/target/stage0/ply" ""; do
+    [[ -z $ply || -x $ply ]] && break
+  done
+  if [[ -z $ply ]]; then
+    echo "no ply here reads $TOOLCHAIN_WORKSPACE: fetch the last release with scripts/stage0.sh" >&2
+    return 1
+  fi
+  WORK=$("$ply" work "$root") || { echo "$ply did not read $root/$TOOLCHAIN_WORKSPACE" >&2; return 1; }
+  # The standard library's tests that read fixtures, as a project: `--std` over it tests and proves
+  # every module of the library beside its own.
+  STD_TESTS=$(role std-tests)
+  STD_LIBRARY=$(role std)
+  CLI_SUITE=$(role cli-tests)
+  # Packages whose own suites are runs too, as `id:path`, the id the directory's name: each failing
+  # test is named in the log, where a test wrapping the run would report one failure for all of
+  # them, and a pass is kept until the code its test runs moves, where a test wrapping the run reruns
+  # whenever the CLI moves.
+  PACKAGE_SUITES=()
+  for dir in $(role compiler) $(role cli) $(role package) $(role suite); do
+    PACKAGE_SUITES+=("${dir##*/}:$dir")
+  done
+  # Packages whose laws and contracts a `ply prove` of their own discharges, as `id:path`, the entry
+  # `laws-<id>`: the library's are the `proofs` run's, and a law in any other package fails `verify`.
+  PACKAGE_PROOFS=()
+  for dir in $(role proved); do PACKAGE_PROOFS+=("${dir##*/}:$dir"); done
+  # The Ply sources the repository maintains, which the gates job holds to `ply fmt --check`: a
+  # source committed unformatted puts its reformatting into the next change that touches it. Every
+  # committed `.ply` is under one of these or of the fixtures, whose spelling is their point
+  # (`verify`).
+  FORMATTED_SOURCES=()
+  for dir in $(role std) $(role std-tests) $(role compiler) $(role cli) $(role cli-tests) \
+    $(role package) $(role suite); do
+    FORMATTED_SOURCES+=("$dir")
+  done
+  FIXTURE_SOURCES=()
+  for dir in $(role fixtures); do FIXTURE_SOURCES+=("$dir"); done
+}
+
+# Each path `ply.work` gives ROLE, one a line.
+role() { awk -v r="$1" '$1 == r { print $2 }' <<< "$WORK"; }
+
+# Every tree of Ply sources `ply.work` places, one a line.
+cmd_ply_trees() {
+  {
+    role std
+    role std-tests
+    role compiler
+    role cli
+    role cli-tests
+    role package
+    role suite
+    role fixtures
+  } | LC_ALL=C sort -u
+}
+
+# Where the runs keep their stores, as the cache steps save and restore them: one pattern for each
+# directory packages lie in, so a package added there moves no entry's version.
+cmd_store_paths() {
+  local dir
+  for dir in $(role std) $(role std-tests) $(role compiler) $(role cli) $(role cli-tests) \
+    $(role package) $(role suite); do
+    case "$dir" in
+      */*) printf '%s/*/.ply-cache\n' "${dir%/*}" ;;
+      *) printf '%s/.ply-cache\n' "$dir" ;;
+    esac
+  done | LC_ALL=C sort -u
+}
 
 # The path of the file a `package target test` triple names, for tests in `tests/`.
 test_source_file() {
@@ -260,11 +296,15 @@ proofs_path() {
   return 1
 }
 
-# Each `.ply` of a package below `crates/` other than the library's and its tests', and each example,
-# that states a law or an `ensures`, `cost` or `space` clause, which only a `ply prove` discharges.
+# Each `.ply` of the compiler, the CLI, its suite, a package and a proved suite that states a law or an
+# `ensures`, `cost` or `space` clause, which only a `ply prove` discharges.
 claiming_files() {
-  grep -rlE --include='*.ply' '^law "|^[[:space:]]+(ensures|cost|space) ' "$root"/crates/*/ply "$root"/examples 2>/dev/null |
-    grep -v -e "^$root/$STD_LIBRARY/" -e "^$root/$STD_TESTS/" | sed "s|^$root/||" | LC_ALL=C sort || true
+  local dirs=() dir
+  for dir in $(role compiler) $(role cli) $(role cli-tests) $(role package) $(role proved); do
+    dirs+=("$root/$dir")
+  done
+  grep -rlE --include='*.ply' '^law "|^[[:space:]]+(ensures|cost|space) ' "${dirs[@]}" 2>/dev/null |
+    sed "s|^$root/||" | LC_ALL=C sort || true
 }
 
 # The labels of a module's tests, in the order it declares them.
@@ -612,48 +652,6 @@ cmd_cache_keys() {
   ' "${files[@]}"
 }
 
-# What each key above is a key *of*. What a run compiled and what a tree check passed are built from
-# every tree that holds Ply sources, so a key that enumerates those trees by name goes stale the
-# moment a package is added -- and a stale hit serves a build of sources that moved, which no test
-# sees, because the tests then run against the cache rather than the sources. Any `hashFiles` that
-# names a crate's own `ply/` sources -- or any crate tree at all -- must name every one of them. The
-# toolchain key alone names trees one by one, since `ply` is built from some of them and not from the
-# rest: `cmd_toolchain_inputs` holds it to the ones a bootstrap reads.
-cmd_cache_payloads() {
-  local pattern tree pat base covered missing=0 files=() file
-  while IFS= read -r file; do
-    [[ $file == "$root/$TOOLCHAIN_KEY" ]] || files+=("$file")
-  done < <(ci_files)
-  while IFS= read -r pattern; do
-    case "$pattern" in *"/ply/"*) ;; *) continue ;; esac
-    for tree in "$root"/crates/*/ply; do
-      [ -d "$tree" ] || continue
-      tree=${tree#"$root"/}
-      covered=no
-      while IFS= read -r pat; do
-        pat=$(printf '%s' "$pat" | tr -d "\"' ")
-        [ -n "$pat" ] || continue
-        # The tree itself, or its recursive form: `crates/*/ply/**` and `crates/*/ply` both
-        # name the whole tree, and `crates/*/ply/*` -- one level -- names only some of it.
-        base=${pat%%/\*\*}
-        # shellcheck disable=SC2053 # the pattern is a glob on purpose
-        if [[ $tree == $pat || $tree == $base ]]; then
-          covered=yes
-          break
-        fi
-      done < <(printf '%s\n' "$pattern" | tr ',' '\n')
-      if [ "$covered" = no ]; then
-        printf 'FAIL: a cache key hashes crate sources and does not name %s, whose Ply sources the stage is emitted from\n' "$tree" >&2
-        missing=$((missing + 1))
-      fi
-    done
-  done < <(grep -oh 'hashFiles([^)]*)' "${files[@]}" | sed -e 's/.*hashFiles(//' -e 's/)$//')
-  if [ "$missing" -eq 0 ]; then
-    printf 'cache payloads: every key over crate sources names every tree holding Ply sources\n'
-  fi
-  return $((missing > 0))
-}
-
 # A path with each `..` taken with the segment before it and each `.` dropped, as text.
 lexical() {
   awk -v p="$1" 'BEGIN {
@@ -668,11 +666,17 @@ lexical() {
   }'
 }
 
-# Each path of the repository a bootstrap reads Ply from, one a line: every path under `crates/` its
-# source names, and every package the manifest of one of those names by path, and theirs.
+# Each path of the repository a bootstrap reads Ply from, one a line: `ply.work`, the standard
+# library's, the compiler's and the program's trees it places, and every package the manifest of one
+# of those names by path, and theirs.
 toolchain_inputs() {
   local all prev dir rel
-  all=$(grep -oE '"/?crates/[^"]*"' "$root/$TOOLCHAIN_BOOTSTRAP" | tr -d '"' | sed 's|^/||' | LC_ALL=C sort -u)
+  all=$({
+    printf '%s\n' "$TOOLCHAIN_WORKSPACE"
+    role std
+    role compiler
+    role cli
+  } | LC_ALL=C sort -u)
   prev=
   while [[ $all != "$prev" ]]; do
     prev=$all
@@ -690,36 +694,17 @@ toolchain_inputs() {
   printf '%s\n' "$all"
 }
 
-# The toolchain key held to what a bootstrap reads: it hashes each input whole, a tree by `<tree>/**`
-# and a file by its path, and nothing else of the Ply sources. A `ply` kept under a key that missed an
-# input would stand for sources that moved, and one that hashed more would bootstrap for a change the
-# bootstrap never reads. An `embed` that leaves its tree is an input too, and must land in one.
-cmd_toolchain_inputs() {
-  local inputs keyed wanted path file rel target covered bad=0
+# The trees the toolchain key hashes (`toolchain_inputs`) held to what a bootstrap reads: an `embed`
+# that leaves its tree is an input too, and must land in one, or a `ply` kept under the key would
+# stand for a file that moved.
+cmd_toolchain_embeds() {
+  local inputs trees path file rel target covered bad=0
   inputs=$(toolchain_inputs)
-  if [[ -z $inputs ]]; then
-    echo "FAIL: $TOOLCHAIN_BOOTSTRAP names no path under crates/, so the toolchain key is held to nothing" >&2
+  trees=$(grep -vxF -- "$TOOLCHAIN_WORKSPACE" <<< "$inputs" || true)
+  if [[ -z $trees ]]; then
+    echo "FAIL: $TOOLCHAIN_WORKSPACE places no part of the toolchain, so the toolchain key is held to nothing" >&2
     return 1
   fi
-  keyed=$(grep -oh 'hashFiles([^)]*)' "$root/$TOOLCHAIN_KEY" | sed -e 's/.*hashFiles(//' -e 's/)$//' |
-    tr ',' '\n' | tr -d "\"' " | grep . | LC_ALL=C sort -u)
-  wanted=$(while IFS= read -r path; do
-    if [ -d "$root/$path" ]; then printf '%s/**\n' "$path"; else printf '%s\n' "$path"; fi
-  done <<< "$inputs" | LC_ALL=C sort -u)
-  while IFS= read -r path; do
-    [[ -n $path ]] || continue
-    if ! grep -qxF -- "$path" <<< "$keyed"; then
-      echo "FAIL: a bootstrap reads $path, which $TOOLCHAIN_KEY does not hash: a \`ply\` kept under the key would stand for sources that moved" >&2
-      bad=$((bad + 1))
-    fi
-  done <<< "$wanted"
-  while IFS= read -r path; do
-    [[ -n $path ]] || continue
-    if ! grep -qxF -- "$path" <<< "$wanted"; then
-      echo "FAIL: $TOOLCHAIN_KEY hashes $path, which no bootstrap reads: a change there would bootstrap for nothing" >&2
-      bad=$((bad + 1))
-    fi
-  done <<< "$keyed"
   while IFS=: read -r file rel; do
     [[ -n $rel ]] || continue
     target=$(lexical "$(dirname "${file#"$root"/}")/$rel")
@@ -740,7 +725,7 @@ cmd_toolchain_inputs() {
       sed -E 's/^([^:]*):.*embed(_dir)?\("([^"]*)".*/\1:\3/'
   done <<< "$inputs")
   if [ "$bad" -eq 0 ]; then
-    printf 'toolchain key: hashes the %d paths a bootstrap reads Ply from, and no other\n' "$(grep -c . <<< "$inputs")"
+    printf 'toolchain key: the %d paths a bootstrap reads Ply from hold every file they embed\n' "$(grep -c . <<< "$inputs")"
   fi
   return $((bad > 0))
 }
@@ -1284,7 +1269,7 @@ cmd_verify() {
   # --- the stage a job hands the others ---------------------------------------
   # The entries the sweep takes file by file are the ones `ci-warm.sh used` cuts file by file: one it
   # cuts whole carries every file an earlier run left to every job of this one.
-  local sweep_rs="$root/crates/ply-codegen/src/c/sweep.rs" swept cut
+  local sweep_rs="$root/crates/ply-compiled/src/c/sweep.rs" swept cut
   swept=$(sed -n 's/^const BY_FILE: \[&str; [0-9]*\] = \[\(.*\)\];$/\1/p' "$sweep_rs" | tr -d ' ' | tr ',' '\n' |
     while read -r name; do sed -n "s/^pub const $name: &str = \"\\(.*\\)\";$/\\1/p" "$sweep_rs"; done | LC_ALL=C sort)
   cut=$(sed -n 's/^ *\([a-z| ]*\)) find "\$dir" -type f ! -newer "\$mark" -delete ;;$/\1/p' "$root/.github/ci-warm.sh" |
@@ -1298,8 +1283,7 @@ cmd_verify() {
   cmd_cache_keys || failures=$((failures + 1))
   cmd_prune_check || failures=$((failures + 1))
   cmd_actions || failures=$((failures + 1))
-  cmd_cache_payloads || failures=$((failures + 1))
-  cmd_toolchain_inputs || failures=$((failures + 1))
+  cmd_toolchain_embeds || failures=$((failures + 1))
 
   if [[ $failures -gt 0 ]]; then
     echo "$failures problem(s) in the CI tables" >&2
@@ -1308,6 +1292,12 @@ cmd_verify() {
   echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#CLI_TREE_CHECKS[@]} in the CLI's suite, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(grep -c . <<< "$listed") Ply runs in $(jobs | grep -c .) jobs; $NEXTEST_SHARDS nextest shards"
 }
 
+# The commands that place a package read the workspace first, outside the subshells they run.
+case "${1:-}" in
+  verify | toolchain-inputs | work | store-paths | ply-trees | runs-matrix | job-runs | run-line | \
+    formatted-sources | supersede) workspace ;;
+esac
+
 case "${1:-}" in
   verify) cmd_verify ;;
   cache-keys)
@@ -1315,7 +1305,10 @@ case "${1:-}" in
     cmd_prune_check
     cmd_actions
     ;;
-  toolchain-inputs) cmd_toolchain_inputs ;;
+  toolchain-inputs) toolchain_inputs ;;
+  work) role "${2:?a role}" ;;
+  store-paths) cmd_store_paths ;;
+  ply-trees) cmd_ply_trees ;;
   nextest-shards) cmd_nextest_shards ;;
   durations) cmd_durations "${2:?a nextest JUnit report}" ;;
   runs-matrix) cmd_runs_matrix ;;
@@ -1331,7 +1324,7 @@ case "${1:-}" in
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   nightly-modules) echo "${CLI_NIGHTLY[*]}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
     exit 2
     ;;
 esac
