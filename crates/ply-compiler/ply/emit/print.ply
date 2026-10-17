@@ -1,0 +1,705 @@
+//! The typed form printed as C: the only place C is spelled. A root prints as its C function, the
+//! fuel and stack checks every call makes, its body, and the entry the runtime calls it by with
+//! words; what only the unit knows (a root's symbol, a site's root id) is a hole for it to fill.
+
+import parsing (Span, span_between)
+import types (Type, TyCon)
+import std.bytes (ascii_of_int)
+import std.math (pow)
+import emit (Width, Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, ctype, symbol_of)
+import emit.keys (RootKey, Root, Named, root_name)
+import emit.pieces (Piece, Text, Hole, Reloc, Symbol, SiteRoot, merged, spelled)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, Var, Arg, AVar, AInt, ABool, AFloat,
+                 ANum, AChar, AZero, Val, Prim, Call, Inst, Let, Decl, Set, If, Return, Restart,
+                 Block, Fn, Rooted, Given, Convention, arithmetic, shift, comparison)
+
+/// A root printed: its C as pieces, and the roots its C calls.
+pub type Printed = { pieces: List<Piece>, calls: List<RootKey> }
+
+/// What every line of one root's body is printed under: where its definition's text starts, how it
+/// answers, and which root id its failure sites name.
+type Under = { base: Int, answer: Rep, site: Option<Int> }
+
+/// The lines so far, each variable's C name, how many temporaries are named, and the roots called.
+type Printing = { out: List<Piece>, names: Map<Int, Bytes>, temps: Int, calls: List<RootKey> }
+
+/// Root `f` as its C function and entry.
+pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
+  let name = symbol_of(root_name(f.key));
+  let under = { base: f.base, answer: f.conv.answer, site: None };
+  let params = range(0, f.params.len()).fold(Map::new(), |m: Map<Int, Bytes>, i: Int|
+    m.insert(f.params.get(i).id, b"p".concat(ascii_of_int(i))));
+  let start = { out: [], names: params, temps: 0, calls: [] };
+  let looped = if restarts(f.body) {
+    text(start, Bytes::concat_all([pad(0), b"ply_loop: ", tick_line(failing_return(f.conv.answer)), b"\n"]))
+  } else { start };
+  let body = printed(under, looped, f.body, 0);
+  let words = range(0, f.params.len()).map(|i: Int|
+    as_word(b"p".concat(ascii_of_int(i)), f.params.get(i).rep));
+  {
+    pieces: merged(
+      [
+        Text(Bytes::concat_all([
+          b"Word ",
+          name,
+          b"_entry(PlyCtx *ctx, const Word *args);\n",
+          head(name, f.conv),
+          b" {\n",
+          fuel_head(name.concat(b"_entry"), words, f.conv.answer),
+        ])),
+      ].concat(body.out).push(Text(Bytes::concat_all([b"}\n", entry(name, f.conv)]))),
+    ),
+    calls: body.calls,
+  }
+}
+
+/// Whether a self call restarts the body anywhere in `b`.
+fn restarts(b: Block) -> Bool =
+  b.fold(false, |found: Bool, i: Inst|
+    found
+      || (match i {
+        Restart(_) -> true,
+        If(x) -> restarts(x.then) || restarts(x.otherwise),
+        _ -> false,
+      }))
+
+/// The one recursion over a body: each instruction printed in turn, a branch's blocks within it.
+fn printed(u: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort.raise} =
+  b.fold(pr, |acc: Printing, i: Inst|
+    match i {
+      Let(l) -> let_printed(u, acc, l.var, l.val, l.at, depth),
+      Decl(v) -> {
+        let n = named(acc, v);
+        line(n.pr, depth, Bytes::concat_all([ctype(kind(v.rep)), b" ", n.name, b" = ", zero(v.rep), b";"]))
+      },
+      Set(s) -> line(acc, depth, Bytes::concat_all([name_of(acc, s.var), b" = ", arg_text(acc, s.arg), b";"])),
+      If(x) -> {
+        let opened = line(acc, depth, Bytes::concat_all([b"if (", arg_text(acc, x.cond), b") {"]));
+        let t = printed(u, opened, x.then, depth + 1);
+        let e = printed(u, line(t, depth, b"} else {"), x.otherwise, depth + 1);
+        line(e, depth, b"}")
+      },
+      Return(a) ->
+        text(acc, Bytes::concat_all([b"  ctx->fuel += 1;\n  return ", arg_text(acc, a), b";\n"])),
+      Restart(args) -> {
+        let held = args.fold({ pr: acc, names: [] }, |h: { pr: Printing, names: List<Bytes> }, a: Arg| {
+          let t = temp(h.pr);
+          {
+            pr: line(t.pr, depth, Bytes::concat_all([ctype(kind(rep_of_arg(a))), b" ", t.name, b" = ", arg_text(h.pr, a), b";"])),
+            names: h.names.push(t.name),
+          }
+        });
+        let set = range(0, held.names.len()).fold(held.pr, |p: Printing, k: Int|
+          line(p, depth, Bytes::concat_all([b"p", ascii_of_int(k), b" = ", held.names.get(k), b";"])));
+        line(set, depth, b"goto ply_loop;")
+      },
+      _ -> line(acc, depth, b"/* an instruction outside the scalar subset */"),
+    })
+
+/// `l = val` printed, with its failure site before it where it is checked and its test after.
+fn let_printed(
+  u: Under,
+  pr: Printing,
+  v: Var,
+  val: Val,
+  at: Span,
+  depth: Int,
+) -> Printing / {abort.raise} =
+  match val {
+    Prim(p) -> prim_printed(u, pr, v, p.op, p.on, p.args, at, depth),
+    Call(c) -> match c.callee {
+      Root(k) -> {
+        let sited = site(u, pr, at, depth);
+        let n = named(sited, v);
+        let called = Bytes::concat_all([
+          b"(ctx",
+          Bytes::concat_all(c.args.map(|a: Arg| b", ".concat(arg_text(pr, a)))),
+          b")",
+        ]);
+        check(
+          u,
+          {
+            ..n.pr,
+            calls: if n.pr.calls.contains(k) { n.pr.calls } else { n.pr.calls.push(k) },
+            out: n.pr.out.concat([
+              Text(Bytes::concat_all([pad(depth), ctype(kind(c.conv.answer)), b" ", n.name, b" = "])),
+              Hole(Symbol(Root(k))),
+              Text(called.concat(b";\n")),
+            ]),
+          },
+          depth,
+        )
+      },
+      _ -> line(pr, depth, b"/* a call outside the scalar subset */"),
+    },
+    _ -> line(pr, depth, b"/* a value outside the scalar subset */"),
+  }
+
+/// An operator over operands held as `on`, as C does it: an integer's sum or difference under an
+/// overflow test, its other arithmetic through the runtime but for a literal divisor, a width's
+/// arithmetic wide and narrowed back under the same test, a float's as C's own.
+fn prim_printed(
+  u: Under,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  on: Rep,
+  args: List<Arg>,
+  at: Span,
+  depth: Int,
+) -> Printing / {abort.raise} = {
+  let a = match args.at(0) { Some(x) -> arg_text(pr, x), None -> b"0" };
+  let b = match args.at(1) { Some(x) -> arg_text(pr, x), None -> b"0" };
+  let bound = |p: Printing, k: Rep, e: Bytes| {
+    let n = named(p, v);
+    line(n.pr, depth, Bytes::concat_all([ctype(kind(k)), b" ", n.name, b" = ", e, b";"]))
+  };
+  let infix = |c: Bytes| Bytes::concat_all([b"(", a, b") ", c, b" (", b, b")"]);
+  match on {
+    RInt -> if comparison(op) {
+      bound(pr, RBool, if op == b"ne" { Bytes::concat_all([b"!((", a, b") == (", b, b"))"]) }
+      else { infix(compare_c(op)) })
+    } else if op == b"bitand" || op == b"bitor" || op == b"bitxor" {
+      bound(pr, RInt, infix(bitop_c(op)))
+    } else if op == b"add" || op == b"sub" {
+      let n = named(site(u, pr, at, depth), v);
+      line(
+        line(n.pr, depth, Bytes::concat_all([b"int64_t ", n.name, b";"])),
+        depth,
+        Bytes::concat_all([
+          b"if (ply_",
+          op,
+          b"_ov(",
+          a,
+          b", ",
+          b,
+          b", &",
+          n.name,
+          b")) { rt_overflow_p(ctx, ",
+          ascii_of_int(overflow_code(op)),
+          b"); ",
+          failing_return(u.answer),
+          b" }",
+        ]),
+      )
+    } else if (op == b"div" || op == b"rem") && literal_divisor(args.at(1)) {
+      bound(pr, RInt, Bytes::concat_all([b"(", a, if op == b"div" { b") / " } else { b") % " }, b]))
+    } else if op == b"mul" || op == b"div" || op == b"rem" {
+      check(
+        u,
+        bound(site(u, pr, at, depth), RInt, Bytes::concat_all([
+          b"rt_arith_p(ctx, ",
+          ascii_of_int(arith_code(op)),
+          b", ",
+          a,
+          b", ",
+          b,
+          b")",
+        ])),
+        depth,
+      )
+    } else if op == b"neg" {
+      let guarded = line(site(u, pr, at, depth), depth, Bytes::concat_all([
+        b"if (",
+        a,
+        b" == INT64_MIN) { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        failing_return(u.answer),
+        b" }",
+      ]));
+      bound(guarded, RInt, Bytes::concat_all([b"-(", a, b")"]))
+    } else if op == b"bitnot" { bound(pr, RInt, Bytes::concat_all([b"~(", a, b")"])) }
+    else { line(pr, depth, b"/* an integer operator outside the scalar subset */") },
+    RBool -> if op == b"not" { bound(pr, RBool, Bytes::concat_all([b"!(", a, b")"])) }
+    else if op == b"eq" || op == b"ne" {
+      bound(pr, RBool, Bytes::concat_all([if op == b"ne" { b"!((" } else { b"((" }, a, b") == (", b, b"))"]))
+    } else { line(pr, depth, b"/* a boolean operator outside the scalar subset */") },
+    RFloat -> if comparison(op) { bound(pr, RBool, infix(compare_c(op))) }
+    else if op == b"neg" { bound(pr, RFloat, Bytes::concat_all([b"-(", a, b")"])) }
+    else if op == b"rem" {
+      bound(site(u, pr, at, depth), RFloat, Bytes::concat_all([
+        b"ply_f64(rt_float_rem_p(ctx, ply_f64_bits(",
+        a,
+        b"), ply_f64_bits(",
+        b,
+        b")))",
+      ]))
+    } else if arithmetic(op) { bound(site(u, pr, at, depth), RFloat, infix(float_c(op))) }
+    else { line(pr, depth, b"/* a float operator outside the scalar subset */") },
+    RNum(w) -> width_printed(u, pr, v, op, w, a, b, at, depth),
+    _ -> line(pr, depth, b"/* an operator over words */"),
+  }
+}
+
+/// An operator over a width held in its own C type: arithmetic below 64 bits done wide and narrowed
+/// back under an overflow test, at 64 bits a sum or difference tested as it is formed and the rest
+/// through the runtime; bit operators and comparisons in the width itself.
+fn width_printed(
+  u: Under,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  b: Bytes,
+  at: Span,
+  depth: Int,
+) -> Printing / {abort.raise} = {
+  let bound = |p: Printing, k: Rep, e: Bytes| {
+    let n = named(p, v);
+    line(n.pr, depth, Bytes::concat_all([ctype(kind(k)), b" ", n.name, b" = ", e, b";"]))
+  };
+  let narrowed = |p: Printing, wide: Bytes| {
+    let g = line(p, depth, Bytes::concat_all([
+      b"if (",
+      wide,
+      b" < ",
+      int_lit(width_min(w)),
+      b" || ",
+      wide,
+      b" > ",
+      int_lit(width_max(w)),
+      b") { rt_overflow_p(ctx, ",
+      ascii_of_int(overflow_code(op)),
+      b"); ",
+      failing_return(u.answer),
+      b" }",
+    ]));
+    bound(g, RNum(w), Bytes::concat_all([b"(", ctype(KNum(w)), b")", wide]))
+  };
+  if arithmetic(op) && w.bits < 64 {
+    let sited = site(u, pr, at, depth);
+    let t = temp(sited);
+    if op == b"add" || op == b"sub" {
+      narrowed(
+        line(t.pr, depth, Bytes::concat_all([
+          b"int64_t ",
+          t.name,
+          b" = (int64_t)(",
+          a,
+          if op == b"add" { b") + (int64_t)(" } else { b") - (int64_t)(" },
+          b,
+          b");",
+        ])),
+        t.name,
+      )
+    } else {
+      narrowed(
+        check(u, line(t.pr, depth, Bytes::concat_all([
+          b"int64_t ",
+          t.name,
+          b" = rt_arith_p(ctx, ",
+          ascii_of_int(arith_code(op)),
+          b", (int64_t)(",
+          a,
+          b"), (int64_t)(",
+          b,
+          b"));",
+        ])), depth),
+        t.name,
+      )
+    }
+  } else if arithmetic(op) && (op == b"add" || op == b"sub") {
+    let n = named(site(u, pr, at, depth), v);
+    let over = if w.signed {
+      Bytes::concat_all([if op == b"add" { b"ply_add_ov(" } else { b"ply_sub_ov(" }, a, b", ", b, b", &", n.name, b")"])
+    } else {
+      Bytes::concat_all([
+        b"(",
+        n.name,
+        b" = (uint64_t)(",
+        a,
+        if op == b"add" { b") + (uint64_t)(" } else { b") - (uint64_t)(" },
+        b,
+        b"), ",
+        if op == b"add" { Bytes::concat_all([n.name, b" < (uint64_t)(", a, b"))"]) }
+        else { Bytes::concat_all([b"(uint64_t)(", a, b") < (uint64_t)(", b, b"))"]) },
+      ])
+    };
+    line(
+      line(n.pr, depth, Bytes::concat_all([ctype(KNum(w)), b" ", n.name, b";"])),
+      depth,
+      Bytes::concat_all([
+        b"if (",
+        over,
+        b") { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        failing_return(u.answer),
+        b" }",
+      ]),
+    )
+  } else if arithmetic(op) {
+    check(
+      u,
+      bound(site(u, pr, at, depth), RNum(w), Bytes::concat_all([
+        b"(",
+        ctype(KNum(w)),
+        b")rt_wide_binary_p(ctx, ",
+        ascii_of_int(binary_code(op)),
+        b", ",
+        ascii_of_int(width_index(w)),
+        b", (Word)(",
+        a,
+        b"), (Word)(",
+        b,
+        b"))",
+      ])),
+      depth,
+    )
+  } else if op == b"bitand" || op == b"bitor" || op == b"bitxor" {
+    bound(pr, RNum(w), Bytes::concat_all([b"(", a, b") ", bitop_c(op), b" (", b, b")"]))
+  } else if op == b"bitnot" {
+    bound(pr, RNum(w), Bytes::concat_all([b"(", ctype(KNum(w)), b") ~(", a, b")"]))
+  } else if op == b"ne" { bound(pr, RBool, Bytes::concat_all([b"!((", a, b") == (", b, b"))"])) }
+  else if comparison(op) {
+    bound(pr, RBool, Bytes::concat_all([b"(", a, b") ", compare_c(op), b" (", b, b")"]))
+  } else if op == b"neg" && w.bits < 64 {
+    let t = temp(site(u, pr, at, depth));
+    narrowed(line(t.pr, depth, Bytes::concat_all([b"int64_t ", t.name, b" = -(int64_t)(", a, b");"])), t.name)
+  } else { line(pr, depth, b"/* a width operator outside the scalar subset */") }
+}
+
+/// Where a literal divides, C's own operator does it: any but zero and minus one.
+fn literal_divisor(d: Option<Arg>) -> Bool =
+  match d { Some(AInt(n)) -> n != 0 && n != 0 - 1, _ -> false }
+
+/// The failure site stored before a checked operation or a call, as bytes from the root's
+/// definition, so the C does not change when the definition moves.
+fn site(u: Under, pr: Printing, at: Span, depth: Int) -> Printing =
+  if at.end <= at.start { pr } else {
+    {
+      ..pr,
+      out: pr.out.concat([
+        Text(pad(depth).concat(b"PLY_SITE(ctx, ")),
+        Hole(SiteRoot(u.site)),
+        Text(Bytes::concat_all([
+          b", ",
+          ascii_of_int(at.start - u.base),
+          b", ",
+          ascii_of_int(at.end - u.base),
+          b");\n",
+        ])),
+      ]),
+    }
+  }
+
+/// The test after an operation that can fail: leave with the answer's zero.
+fn check(u: Under, pr: Printing, depth: Int) -> Printing =
+  line(pr, depth, b"if (ctx->failed) ".concat(failing_return(u.answer)))
+
+fn line(pr: Printing, depth: Int, t: Bytes) -> Printing =
+  { ..pr, out: pr.out.push(Text(Bytes::concat_all([pad(depth), t, b"\n"]))) }
+
+fn text(pr: Printing, t: Bytes) -> Printing = { ..pr, out: pr.out.push(Text(t)) }
+
+fn pad(depth: Int) -> Bytes = Bytes::concat_all(range(0, depth + 1).map(|_: Int| b"  "))
+
+/// A temporary of its own, `t<n>`.
+fn temp(pr: Printing) -> { pr: Printing, name: Bytes } =
+  { pr: { ..pr, temps: pr.temps + 1 }, name: b"t".concat(ascii_of_int(pr.temps + 1)) }
+
+/// `v` given the next temporary as its C name.
+fn named(pr: Printing, v: Var) -> { pr: Printing, name: Bytes } = {
+  let t = temp(pr);
+  { pr: { ..t.pr, names: t.pr.names.insert(v.id, t.name) }, name: t.name }
+}
+
+fn name_of(pr: Printing, v: Var) -> Bytes = match pr.names.get(v.id) { Some(n) -> n, None -> b"0" }
+
+fn arg_text(pr: Printing, a: Arg) -> Bytes =
+  match a {
+    AVar(v) -> name_of(pr, v),
+    AInt(n) -> int_lit(n),
+    ABool(b) -> if b { b"1" } else { b"0" },
+    AFloat(bits) -> Bytes::concat_all([b"ply_f64(", int_lit(bits), b")"]),
+    ANum(n) -> Bytes::concat_all([b"((", ctype(KNum(n.width)), b")", int_lit(n.bits), b")"]),
+    AChar(c) -> Bytes::concat_all([b"((Word)", int_lit(c * 8 + 2), b")"]),
+    AZero(r) -> zero(r),
+  }
+
+fn rep_of_arg(a: Arg) -> Rep =
+  match a {
+    AVar(v) -> v.rep,
+    AInt(_) -> RInt,
+    ABool(_) -> RBool,
+    AFloat(_) -> RFloat,
+    ANum(n) -> RNum(n.width),
+    AChar(_) -> RWord,
+    AZero(r) -> r,
+  }
+
+/// The C a root's function is declared with: its answer's and each parameter's C type.
+fn head(name: Bytes, conv: Convention) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    carried(conv.answer),
+    b" ",
+    name,
+    b"(PlyCtx *ctx",
+    Bytes::concat_all(range(0, conv.reps.len()).map(|i: Int|
+      Bytes::concat_all([b", ", carried(conv.reps.get(i)), b" p", ascii_of_int(i)]))),
+    b")",
+  ])
+
+/// Counts the call, spends a unit of fuel, and hands the call a stack of its own when this thread's
+/// is nearly out; the same call on the new stack is counted once.
+fn fuel_head(entry: Bytes, words: List<Bytes>, answer: Rep) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); ",
+    failing_return(answer),
+    b" }\n",
+    b"  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { ",
+    grow_call(entry, words, answer),
+    b" } }\n",
+    b"  ",
+    tick_line(failing_return(answer)),
+    b"\n",
+    b"  ctx->fuel -= 1;\n",
+  ])
+
+fn tick_line(leave: Bytes) -> Bytes =
+  Bytes::concat_all([b"if (++ctx->ticks >= ctx->next_tick) { rt_tick_p(ctx); if (ctx->failed) ", leave, b" }"])
+
+fn grow_call(entry: Bytes, args: List<Bytes>, answer: Rep) -> Bytes / {abort.raise} =
+  if args.len() == 0 {
+    grown_return(Bytes::concat_all([b"rt_grow_p(ctx, (Word)(intptr_t)&", entry, b", 0)"]), answer)
+  } else {
+    Bytes::concat_all([
+      b"Word ply_grown[",
+      ascii_of_int(args.len()),
+      b"];",
+      Bytes::concat_all(range(0, args.len()).map(|i: Int|
+        Bytes::concat_all([b" ply_grown[", ascii_of_int(i), b"] = ", args.get(i), b";"]))),
+      b" ",
+      grown_return(
+        Bytes::concat_all([b"rt_grow_p(ctx, (Word)(intptr_t)&", entry, b", (Word)(intptr_t)ply_grown)"]),
+        answer,
+      ),
+    ])
+  }
+
+/// The grown call's word returned as a root answering `answer` returns it.
+fn grown_return(grown: Bytes, answer: Rep) -> Bytes =
+  match answer {
+    RWord -> Bytes::concat_all([b"return ", grown, b";"]),
+    _ ->
+      Bytes::concat_all([
+        b"Word ply_back = ",
+        grown,
+        b"; if (ctx->failed) ",
+        failing_return(answer),
+        b" ",
+        ctype(kind(answer)),
+        b" ply_out = ",
+        word_as(b"ply_back", answer),
+        b"; ply_dec(ctx, ply_back); return ply_out;",
+      ]),
+  }
+
+/// The entry the runtime and closures call a root by, words in and out.
+fn entry(name: Bytes, conv: Convention) -> Bytes / {abort.raise} = {
+  let opened = range(0, conv.reps.len()).map(|i: Int| {
+    let arg = Bytes::concat_all([b"args[", ascii_of_int(i), b"]"]);
+    let r = conv.reps.get(i);
+    match r {
+      RWord -> { text: b"", arg: arg },
+      _ ->
+        {
+          text: Bytes::concat_all([
+            b"  ",
+            ctype(kind(r)),
+            b" a",
+            ascii_of_int(i),
+            b" = ",
+            word_as(arg, r),
+            b"; ply_dec(ctx, ",
+            arg,
+            b");\n",
+          ]),
+          arg: b"a".concat(ascii_of_int(i)),
+        },
+    }
+  });
+  let call = Bytes::concat_all([
+    name,
+    b"(ctx",
+    Bytes::concat_all(opened.map(|o: { text: Bytes, arg: Bytes }| b", ".concat(o.arg))),
+    b")",
+  ]);
+  Bytes::concat_all([
+    b"Word ",
+    name,
+    b"_entry(PlyCtx *ctx, const Word *args) {\n",
+    Bytes::concat_all(opened.map(|o: { text: Bytes, arg: Bytes }| o.text)),
+    match conv.answer {
+      RWord -> Bytes::concat_all([b"  return ", call, b";\n"]),
+      r ->
+        Bytes::concat_all([
+          b"  ",
+          ctype(kind(r)),
+          b" r = ",
+          call,
+          b";\n  if (ctx->failed) return 0;\n  return ",
+          as_word(b"r", r),
+          b";\n",
+        ]),
+    },
+    b"}\n",
+  ])
+}
+
+/// A scalar `e` held as `r` as the word a value of its type is.
+fn as_word(e: Bytes, r: Rep) -> Bytes =
+  match r {
+    RInt -> Bytes::concat_all([b"(ply_fits_imm(", e, b") ? ply_imm(", e, b") : rt_box_int_p(ctx, ", e, b"))"]),
+    RBool -> Bytes::concat_all([b"(", e, b" ? ply_true : ply_false)"]),
+    RFloat -> Bytes::concat_all([b"rt_box_float_p(ctx, ply_f64_bits(", e, b"))"]),
+    RDec -> Bytes::concat_all([b"rt_box_decimal_p(ctx, (", e, b").lo, (", e, b").hi)"]),
+    RNum(w) -> if w.bits < 64 { Bytes::concat_all([b"ply_imm((int64_t)", e, b")"]) } else {
+      Bytes::concat_all([b"rt_box_fixed_p(ctx, (Word)(", e, b"), ", ascii_of_int(width_index(w)), b")"])
+    },
+    _ -> e,
+  }
+
+/// The word `w` read as a value held as `r`.
+fn word_as(w: Bytes, r: Rep) -> Bytes =
+  match r {
+    RInt -> Bytes::concat_all([b"(ply_is_imm(", w, b") ? ply_imm_value(", w, b") : rt_unbox_int_p(ctx, ", w, b"))"]),
+    RBool -> Bytes::concat_all([b"(", w, b" == ply_true)"]),
+    RFloat ->
+      Bytes::concat_all([
+        b"(ply_is_float(",
+        w,
+        b") ? ply_f64(ply_words(",
+        w,
+        b")[0]) : ply_f64(rt_unbox_float_p(ctx, ",
+        w,
+        b")))",
+      ]),
+    RDec -> Bytes::concat_all([b"ply_dec_of(", w, b")"]),
+    RNum(n) -> if n.bits < 64 {
+      Bytes::concat_all([b"(", ctype(KNum(n)), b")ply_imm_value(", w, b")"])
+    } else { Bytes::concat_all([b"(", ctype(KNum(n)), b")ply_words(", w, b")[0]"]) },
+    _ -> w,
+  }
+
+/// The kind today's C spelling helpers name a representation by.
+fn kind(r: Rep) -> Kind =
+  match r {
+    RInt -> KInt,
+    RBool -> KBool,
+    RNum(w) -> KNum(w),
+    RFloat -> KFloat,
+    RDec -> KDec,
+    _ -> KBoxed,
+  }
+
+/// The C type a value held as `r` crosses a call in.
+fn carried(r: Rep) -> Bytes = match r { RWord -> b"Word", _ -> ctype(kind(r)) }
+
+fn zero(r: Rep) -> Bytes = match r { RDec -> b"(PlyDec){0, 0}", _ -> b"0" }
+
+fn failing_return(r: Rep) -> Bytes = Bytes::concat_all([b"return ", zero(r), b";"])
+
+/// `INT64_C(-9223372036854775808)` negates an unsigned literal, which C cannot write as a constant.
+fn int_lit(n: Int) -> Bytes =
+  if n == 0 - 9223372036854775807 - 1 { b"INT64_MIN" }
+  else { Bytes::concat_all([b"INT64_C(", ascii_of_int(n), b")"]) }
+
+fn compare_c(op: Bytes) -> Bytes =
+  if op == b"lt" { b"<" }
+  else if op == b"le" { b"<=" }
+  else if op == b"gt" { b">" }
+  else if op == b"ge" { b">=" }
+  else if op == b"eq" { b"==" }
+  else { b"!=" }
+
+fn bitop_c(op: Bytes) -> Bytes = if op == b"bitand" { b"&" } else if op == b"bitor" { b"|" } else { b"^" }
+
+fn float_c(op: Bytes) -> Bytes =
+  if op == b"add" { b"+" } else if op == b"sub" { b"-" } else if op == b"mul" { b"*" } else { b"/" }
+
+/// `rt_overflow`'s numbering of the operation that overflowed.
+fn overflow_code(op: Bytes) -> Int =
+  if op == b"add" { 0 } else if op == b"sub" { 1 } else if op == b"neg" { 2 } else if op == b"mul" { 3 } else { 4 }
+
+/// `rt_arith`'s opcode numbering.
+fn arith_code(op: Bytes) -> Int = if op == b"mul" { 0 } else if op == b"div" { 1 } else { 2 }
+
+/// `rt_binary`'s operator numbering.
+fn binary_code(op: Bytes) -> Int =
+  if op == b"add" { 0 } else if op == b"sub" { 1 } else if op == b"mul" { 2 } else if op == b"div" { 3 } else { 4 }
+
+fn width_index(w: Width) -> Int =
+  if w.bits == 128 { if w.signed { 9 } else { 8 } } else {
+    (if w.signed { 4 } else { 0 })
+      + (if w.bits == 8 { 0 } else if w.bits == 16 { 1 } else if w.bits == 32 { 2 } else { 3 })
+  }
+
+fn width_min(w: Width) -> Int = if w.signed { 0 - pow(2, w.bits - 1) } else { 0 }
+
+fn width_max(w: Width) -> Int = if w.signed { pow(2, w.bits - 1) - 1 } else { pow(2, w.bits) - 1 }
+
+/// Whether `run` stands in `lines` as consecutive lines.
+fn holds_run(lines: List<Bytes>, run: List<Bytes>) -> Bool =
+  range(0, lines.len()).any(|i: Int| lines.drop(i).take(run.len()) == run)
+
+test "a restart takes its arguments into temporaries before it sets the parameters, then loops" {
+  let int = TyCon({ name: b"Int", args: [] });
+  let local = |id: Int, rep: Rep| { id: id, ty: int, rep: rep };
+  let n = local(0, RInt);
+  let acc = local(1, RInt);
+  let c = local(2, RBool);
+  let j = local(3, RInt);
+  let a = local(4, RInt);
+  let let_of = |v: Var, val: Val, at: Span| Let({ var: v, val: val, at: at, unwind: [] });
+  let f = {
+    key: Named(b"m.count"),
+    kind: Rooted,
+    params: [n, acc],
+    conv: { params: [Given, Given], reps: [RInt, RInt], answer: RInt },
+    body: [
+      let_of(c, Prim({ op: b"eq", on: RInt, args: [AVar(n), AInt(0)] }), span_between(0, 0)),
+      Decl(j),
+      If({
+        cond: AVar(c),
+        then: [Set({ var: j, arg: AVar(acc) })],
+        otherwise: [
+          let_of(a, Prim({ op: b"sub", on: RInt, args: [AVar(n), AInt(1)] }), span_between(10, 15)),
+          Restart([AVar(a), AVar(acc)]),
+        ],
+      }),
+      Return(AVar(j)),
+    ],
+    lambdas: [],
+    base: 0,
+    members: [],
+  };
+  let lines = spelled(printed_fn(f).pieces).split(b"\n");
+  assert_eq(
+    holds_run(lines, [
+      b"  ctx->fuel -= 1;",
+      b"  ply_loop: if (++ctx->ticks >= ctx->next_tick) { rt_tick_p(ctx); if (ctx->failed) return 0; }",
+      b"  int64_t t1 = (p0) == (INT64_C(0));",
+      b"  int64_t t2 = 0;",
+      b"  if (t1) {",
+      b"    t2 = p1;",
+      b"  } else {",
+      b"    PLY_SITE(ctx, @@r@@, 10, 15);",
+      b"    int64_t t3;",
+      b"    if (ply_sub_ov(p0, INT64_C(1), &t3)) { rt_overflow_p(ctx, 1); return 0; }",
+      b"    int64_t t4 = t3;",
+      b"    int64_t t5 = p1;",
+      b"    p0 = t4;",
+      b"    p1 = t5;",
+      b"    goto ply_loop;",
+      b"  }",
+      b"  ctx->fuel += 1;",
+      b"  return t2;",
+      b"}",
+    ]),
+    true,
+  );
+  assert_eq(lines.at(1), Some(Bytes::concat_all([b"int64_t ", symbol_of(b"m.count"), b"(PlyCtx *ctx, int64_t p0, int64_t p1) {"])))
+}

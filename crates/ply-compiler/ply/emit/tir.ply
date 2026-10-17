@@ -1,0 +1,317 @@
+//! The typed form a root's body is lowered to before any C is written. Every value is a variable
+//! holding the checker's type, held as a representation decided from that type; every join is a
+//! variable of its own type; every count is an instruction, which the ownership pass alone writes.
+
+import types (Type, TyCon)
+import parsing (Span)
+import patterns (Lit)
+import emit (Width, kind_of, KInt, KBool, KNum, KFloat, KDec)
+import emit.keys (RootKey, Callee, Generic)
+
+/// How a value is held. A function of the value's type (`rep_of`), but for `RSlice`, a view the
+/// lowering chooses for a list walked by its rest in a loop, which is made a list where it leaves.
+/// `RFlat` is a record as its leaves and then its object's word, zero until one is made; `RCases` a
+/// sum as its constructor's index and each case's leaves.
+pub type Rep =
+  | RInt
+  | RBool
+  | RNum(Width)
+  | RFloat
+  | RDec
+  | RWord
+  | RMaybe
+  | RTagged
+  | RFlat(List<Leaf>)
+  | RCases(Cases)
+  | RSlice
+
+/// A leaf of a flattened record or of a sum's case: never itself flat.
+pub type Leaf = { name: Bytes, rep: Rep }
+
+/// A sum's cases in declared order, and whether the sum is a `Result`'s tagged word where it is
+/// one word rather than an `Option`'s.
+pub type Cases = { tagged: Bool, cases: List<{ name: Bytes, leaves: List<Leaf> }> }
+
+/// A local of a root's body: its number, the checker's type at the root's type arguments, and how
+/// a value of that type is held.
+pub type Var = { id: Int, ty: Type, rep: Rep }
+
+/// An operand: a variable, or a constant C names directly.
+pub type Arg =
+  | AVar(Var)
+  | AInt(Int)
+  | ABool(Bool)
+  | AFloat(Int)
+  | ANum({ width: Width, bits: Int })
+  | AChar(Int)
+  | AZero(Rep)
+
+/// Whether a callee consumes what a parameter is handed or only reads it while the call runs.
+pub type Handed = | Given | Lent
+
+/// How a root takes its parameters and hands back its answer.
+pub type Convention = { params: List<Handed>, reps: List<Rep>, answer: Rep }
+
+/// What a native or intrinsic does with each operand (`takes`), whether it answers a count of its
+/// own, whether it can fail, and whether it can stop for a handler that may resume it later.
+pub type Uses = { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool }
+
+/// What a `Make` allocates.
+pub type Made =
+  | MRecord({ names: List<Bytes>, width: Int })
+  | MCtor({ name: Bytes, width: Int })
+  | MList(Int)
+  | MClosure({ nth: Int, captures: Int })
+  | MArray({ stride: Int })
+
+/// Where a `Get` reads: a field by its word offset, or by name where the layout is unknown (a
+/// need the specialisation answers), a case's argument, a closure's capture, a flat value's leaf.
+pub type Path =
+  | PField({ name: Bytes, at: Int })
+  | PNamed(Bytes)
+  | PArg({ ctor: Bytes, at: Int })
+  | PCapture(Int)
+  | PLeaf(Int)
+
+/// What a `Case` tests its subject against.
+pub type Test =
+  | TTag(List<Bytes>)
+  | TInt(List<Int>)
+  | TRange({ lo: Int, hi: Int })
+  | TLit(Lit)
+  | TLength({ at_least: Int })
+
+pub type Val =
+  /// An operator of C over operands held as `on`, which decides what it means.
+  | Prim({ op: Bytes, on: Rep, args: List<Arg> })
+  | Literal(Lit)
+  /// A constant laid out as static data, by the name its content gives it.
+  | Static(Bytes)
+  | Make({ made: Made, args: List<Arg>, reuse: Option<Var> })
+  | Get({ of: Var, path: Path })
+  | Pack({ arg: Arg, to: Rep })
+  | Call({ callee: Callee, args: List<Arg>, conv: Convention, stops: Bool })
+  | Apply({ f: Arg, args: List<Arg>, conv: Convention, stops: Bool })
+  | Native({ name: Bytes, args: List<Arg>, uses: Uses })
+  | Intrinsic({ op: Bytes, args: List<Arg>, uses: Uses })
+  | Perform({ effect: Bytes, op: Bytes, resource: Bytes, label: Option<Arg>, args: List<Arg> })
+  | Label(Bytes)
+
+pub type Block = List<Inst>
+
+pub type Inst =
+  /// `unwind` are the owned values live across `val` where it may fail, which the failure path
+  /// releases, and which a stop's frame record holds.
+  | Let({ var: Var, val: Val, at: Span, unwind: List<Var> })
+  | Do({ val: Val, at: Span, unwind: List<Var> })
+  /// A join's variable, which each path into the code after it sets once.
+  | Decl(Var)
+  | Set({ var: Var, arg: Arg })
+  | If({ cond: Arg, then: Block, otherwise: Block })
+  | Case({ on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block })
+  /// A loop over `state`, rebound by each `Next` in `body`, left with an answer by `Done`.
+  | Loop({ state: List<Var>, init: List<Arg>, body: Block, answer: Var })
+  | Next(List<Arg>)
+  | Done(Arg)
+  | Return(Arg)
+  /// A self tail call: the root's parameters take the arguments and the body starts again.
+  | Restart(List<Arg>)
+  /// A tail call of member `member` of the root's group.
+  | Enter({ member: Int, args: List<Arg> })
+  | Fail(Bytes)
+  | Handle({ body: Block, clauses: List<Clause>, ret: Option<Fn>, answer: Var })
+  | Parallel({ branches: List<Fn>, rooted: Bool, answer: Var })
+  // Written by the ownership pass alone.
+  | Inc({ var: Var, n: Int })
+  | Dec(Var)
+  /// `of`'s cells kept as `token` where `of` was the only holder, for a later `Make` to take.
+  | Reset({ token: Var, of: Var })
+  /// A reuse token no `Make` took, its block freed.
+  | Free({ of: Var, bytes: Arg })
+  /// A block known to be held only here consumed, and its counted words bound as owned.
+  | Opened({ of: Var, words: List<Var> })
+
+/// A handler clause: the operation it answers, how often its continuation may be resumed (`2` at
+/// most once, `4` again), and its body as a function of its own.
+pub type Clause = { effect: Bytes, op: Bytes, resumes: Int, body: Fn }
+
+/// Whether a function is a root a program calls, counting its steps and testing for failure, or
+/// a plain one the emitter writes for a type (a drop, share, keep or copy root), which does
+/// neither but still grows its stack.
+pub type FnKind = | Rooted | Plain
+
+/// One root's form. `lambdas` are the bodies of the closures it makes; `base` is where its
+/// definition's text starts, which its failure sites count from; `members` are a tail group's roots
+/// in case order, and empty for a root of its own.
+pub type Fn = {
+  key: RootKey,
+  kind: FnKind,
+  params: List<Var>,
+  conv: Convention,
+  body: Block,
+  lambdas: List<Lambda>,
+  base: Int,
+  members: List<RootKey>,
+}
+
+/// The body of a closure a root makes, numbered by its place among them.
+pub type Lambda = | Closure(Fn)
+
+/// How a value of `ty` is held in a body. Scalars as themselves, a carried width in its own C
+/// type, anything else a word until the layouts say more.
+pub fn rep_of(ty: Type) -> Rep =
+  match kind_of(ty).kind {
+    KInt -> RInt,
+    KBool -> RBool,
+    KNum(w) -> RNum(w),
+    KFloat -> RFloat,
+    KDec -> RDec,
+    _ -> RWord,
+  }
+
+/// Whether a value held as `r` holds a count: a word, an `Option`'s or `Result`'s, a view of a
+/// list, or a flat value with a counted leaf (its word always is one).
+pub fn counted(r: Rep) -> Bool =
+  match r {
+    RWord -> true,
+    RMaybe -> true,
+    RTagged -> true,
+    RSlice -> true,
+    RFlat(_) -> true,
+    RCases(c) -> c.cases.fold(false, |any: Bool, x: { name: Bytes, leaves: List<Leaf> }|
+      any || x.leaves.fold(false, |a: Bool, l: Leaf| a || counted(l.rep))),
+    _ -> false,
+  }
+
+/// The variable an operand is, if it is one.
+pub fn var_of(a: Arg) -> Option<Var> = match a { AVar(v) -> Some(v), _ -> None }
+
+/// Each operand of `v` and whether `v` consumes it, by the fixed signature each operation has: a
+/// call takes what its convention gives, borrows what it lends, and borrows the function it applies;
+/// an operator, a field read and a case's subject borrow; what allocates or answers takes.
+pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
+  match v {
+    Prim(p) -> p.args.map(|a: Arg| { arg: a, takes: false }),
+    Literal(_) -> [],
+    Static(_) -> [],
+    Make(m) -> m.args.map(|a: Arg| { arg: a, takes: true }).concat(
+      match m.reuse { Some(t) -> [{ arg: AVar(t), takes: true }], None -> [] },
+    ),
+    Get(g) -> [{ arg: AVar(g.of), takes: false }],
+    Pack(p) -> [{ arg: p.arg, takes: true }],
+    Call(c) -> handed(c.args, c.conv),
+    Apply(c) -> [{ arg: c.f, takes: false }].concat(handed(c.args, c.conv)),
+    Native(n) -> taken(n.args, n.uses),
+    Intrinsic(n) -> taken(n.args, n.uses),
+    Perform(p) -> p.args.map(|a: Arg| { arg: a, takes: true }).concat(
+      match p.label { Some(l) -> [{ arg: l, takes: false }], None -> [] },
+    ),
+    Label(_) -> [],
+  }
+
+fn handed(args: List<Arg>, conv: Convention) -> List<{ arg: Arg, takes: Bool }> =
+  range(0, args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
+    match args.at(i) {
+      Some(a) -> acc.push({ arg: a, takes: conv.params.at(i) != Some(Lent) }),
+      None -> acc,
+    })
+
+fn taken(args: List<Arg>, uses: Uses) -> List<{ arg: Arg, takes: Bool }> =
+  range(0, args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
+    match args.at(i) {
+      Some(a) -> acc.push({ arg: a, takes: uses.takes.at(i) == Some(true) }),
+      None -> acc,
+    })
+
+/// How what `v` answers is held: a count of its own, read out of the operand it names without
+/// one, or a constant no count is kept of.
+pub type Answered = | Owns | ReadsOf(Var) | Lasts
+
+pub fn answered(v: Val) -> Answered =
+  match v {
+    Get(g) -> ReadsOf(g.of),
+    Static(_) -> Lasts,
+    Native(n) -> if n.uses.owned { Owns }
+    else { match n.args.at(0) { Some(AVar(x)) -> ReadsOf(x), _ -> Lasts } },
+    Intrinsic(n) -> if n.uses.owned { Owns }
+    else { match n.args.at(0) { Some(AVar(x)) -> ReadsOf(x), _ -> Lasts } },
+    _ -> Owns,
+  }
+
+/// Whether `v` can fail, so a test follows it and its `unwind` is released on the way out: a
+/// call, a perform, an allocation, a constant read from the pool, a checked operator.
+pub fn fails(v: Val) -> Bool =
+  match v {
+    Prim(p) -> checked(p.op, p.on),
+    Literal(_) -> true,
+    Static(_) -> false,
+    Make(_) -> true,
+    Get(_) -> false,
+    Pack(p) -> counted(p.to),
+    Call(_) -> true,
+    Apply(_) -> true,
+    Native(n) -> n.uses.fails,
+    Intrinsic(n) -> n.uses.fails,
+    Perform(_) -> true,
+    Label(_) -> false,
+  }
+
+/// Whether operator `op` over `on` is checked: an integer's arithmetic and shifts, which overflow
+/// or divide by zero, and a width's.
+pub fn checked(op: Bytes, on: Rep) -> Bool =
+  match on {
+    RInt -> arithmetic(op) || shift(op) || op == b"neg",
+    RNum(_) -> arithmetic(op) || shift(op) || op == b"neg",
+    RFloat -> op == b"rem",
+    _ -> false,
+  }
+
+pub fn arithmetic(op: Bytes) -> Bool =
+  op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
+
+pub fn shift(op: Bytes) -> Bool = op == b"shl" || op == b"shr" || op == b"ushr"
+
+pub fn comparison(op: Bytes) -> Bool =
+  op == b"eq" || op == b"ne" || op == b"lt" || op == b"le" || op == b"gt" || op == b"ge"
+
+/// Whether control never passes `i` to what follows it in its block.
+pub fn ends(i: Inst) -> Bool =
+  match i {
+    Return(_) -> true,
+    Restart(_) -> true,
+    Enter(_) -> true,
+    Next(_) -> true,
+    Done(_) -> true,
+    Fail(_) -> true,
+    _ -> false,
+  }
+
+/// Whether control can leave `b` at its end.
+pub fn falls_through(b: Block) -> Bool =
+  match b.at(b.len() - 1) { Some(last) -> !ends(last), None -> true }
+
+test "a value is held as its type says, and a word holds a count where a scalar holds none" {
+  let named = |n: Bytes| TyCon({ name: n, args: [] });
+  assert_eq(rep_of(named(b"Int")), RInt);
+  assert_eq(rep_of(named(b"Bool")), RBool);
+  assert_eq(rep_of(named(b"Float")), RFloat);
+  assert_eq(rep_of(named(b"U8")), RNum({ bits: 8, signed: false }));
+  assert_eq(rep_of(named(b"String")), RWord);
+  assert_eq([RInt, RBool, RFloat, RDec].map(counted), [false, false, false, false]);
+  assert_eq([RWord, RMaybe, RSlice, RFlat([])].map(counted), [true, true, true, true])
+}
+
+test "each operation consumes or borrows each operand as its signature says" {
+  let int = TyCon({ name: b"Int", args: [] });
+  let s = { id: 1, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
+  let conv = { params: [Given, Lent], reps: [RWord, RWord], answer: RInt };
+  let call = Call({ callee: Generic(0), args: [AVar(s), AVar(s)], conv: conv, stops: false });
+  assert_eq(operands(call).map(|o: { arg: Arg, takes: Bool }| o.takes), [true, false]);
+  assert_eq(operands(Get({ of: s, path: PLeaf(0) })).map(|o: { arg: Arg, takes: Bool }| o.takes), [false]);
+  assert_eq(answered(Get({ of: s, path: PLeaf(0) })), ReadsOf(s));
+  assert_eq(answered(call), Owns);
+  assert_eq(fails(Prim({ op: b"add", on: RInt, args: [AInt(1), AInt(2)] })), true);
+  assert_eq(fails(Prim({ op: b"lt", on: RInt, args: [AInt(1), AInt(2)] })), false);
+  assert_eq(fails(Prim({ op: b"add", on: RFloat, args: [AFloat(0), AFloat(0)] })), false);
+  assert_eq(rep_of(int), RInt)
+}

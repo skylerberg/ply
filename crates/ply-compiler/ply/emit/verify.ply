@@ -1,0 +1,324 @@
+//! The typed form checked before it is printed: every count a body holds is consumed exactly once on
+//! every path, a borrowed value is read only while what it was read out of is held, a value that
+//! can fail names exactly what its failure path releases, and each join is set once on every path
+//! into it with a value held as the join is. A body that breaks one is refused, which fails a build.
+
+import emit.tir (Rep, RWord, RInt, Var, Arg, AVar, AInt, ABool, Val, Call, Get, Static, PLeaf, Inst,
+                 Let, Do, Decl, Set, If, Case, Loop, Next, Done, Return, Restart, Enter, Fail, Handle,
+                 Parallel, Inc, Dec, Reset, Free, Opened, Block, Fn, Rooted, Handed, Given, Lent,
+                 Answered, Owns, ReadsOf, Lasts, counted, operands, answered, fails)
+import emit.keys (Named, Root)
+import types (TyCon)
+import parsing (dummy_span)
+import std.bytes (ascii_of_int)
+
+/// What a path holds: the counts of each owned variable, the variable each borrowed one was read out
+/// of (`-1` for a constant or a lent parameter, which outlast the body), and each join declared on
+/// it and whether it was set.
+type Holding = { owned: Map<Int, Int>, borrowed: Map<Int, Int>, joins: Map<Int, Bool> }
+
+/// A walk so far: what the path holds, the first fault found, and whether control reaches here.
+type Walk = { h: Holding, fault: Option<Bytes>, live: Bool }
+
+/// Why `f` breaks a rule of the form, or nothing where it keeps them all.
+pub fn verified(f: Fn) -> Option<Bytes> = {
+  let start = range(0, f.params.len()).fold(
+    { owned: Map::new(), borrowed: Map::new(), joins: Map::new() },
+    |h: Holding, i: Int|
+      match f.params.at(i) {
+        None -> h,
+        Some(p) -> if !counted(p.rep) { h }
+        else if f.conv.params.at(i) == Some(Lent) { { ..h, borrowed: h.borrowed.insert(p.id, 0 - 1) } }
+        else { { ..h, owned: h.owned.insert(p.id, 1) } },
+      },
+  );
+  let w = walked(f, { h: start, fault: None, live: true }, f.body);
+  match w.fault {
+    Some(why) -> Some(why),
+    None -> if w.live { Some(b"a body that falls off its end without answering") } else { None },
+  }
+}
+
+/// The one recursion: each instruction in turn, a branch's blocks walked from the state before it
+/// and joined after it.
+fn walked(f: Fn, w: Walk, b: Block) -> Walk =
+  b.fold(w, |acc: Walk, i: Inst|
+    if acc.fault != None || !acc.live { acc } else {
+      match i {
+        Let(l) -> result(failing(used(acc, operands(l.val)), l.val, l.unwind), l.var, answered(l.val)),
+        Do(d) -> failing(used(acc, operands(d.val)), d.val, d.unwind),
+        Decl(v) -> { ..acc, h: { ..acc.h, joins: acc.h.joins.insert(v.id, false) } },
+        Set(s) -> match acc.h.joins.get(s.var.id) {
+          Some(false) -> if !same_rep(s.arg, s.var.rep) {
+            faulted(acc, b"a join set from a value held otherwise: v", s.var)
+          } else {
+            let consumed = taken(acc, s.arg);
+            {
+              ..consumed,
+              h: {
+                ..consumed.h,
+                joins: consumed.h.joins.insert(s.var.id, true),
+                owned: if counted(s.var.rep) { consumed.h.owned.insert(s.var.id, 1) } else { consumed.h.owned },
+              },
+            }
+          },
+          Some(true) -> faulted(acc, b"a join set twice on one path: v", s.var),
+          None -> faulted(acc, b"a join set before it is declared: v", s.var),
+        },
+        If(x) -> {
+          let read = held(acc, x.cond);
+          joined(read, walked(f, read, x.then), walked(f, read, x.otherwise))
+        },
+        Case(c) -> {
+          let read = read_of(acc, c.on);
+          let arms = c.arms.fold(walked(f, read, c.rest), |j: Walk, a: { when: Int, body: Block }|
+            joined(read, j, walked(f, read, a.body)));
+          arms
+        },
+        Return(a) ->
+          if !same_rep(a, f.conv.answer) { { ..acc, fault: Some(b"an answer held otherwise than the root answers") } }
+          else { ended(taken(acc, a), b"a count left held where the body answers: v") },
+        Restart(args) -> ended(args.fold(acc, taken), b"a count left held where the body restarts: v"),
+        Enter(e) -> ended(e.args.fold(acc, taken), b"a count left held where the body enters its group: v"),
+        Fail(_) -> ended(acc, b"a count left held where the body fails: v"),
+        Inc(n) -> {
+          let read = read_of(acc, n.var);
+          if read.fault != None { read } else {
+            {
+              ..read,
+              h: { ..read.h, owned: read.h.owned.insert(n.var.id, count(read.h, n.var) + n.n) },
+            }
+          }
+        },
+        Dec(v) -> consumed(acc, v),
+        Reset(r) -> {
+          let c = consumed(acc, r.of);
+          { ..c, h: { ..c.h, owned: c.h.owned.insert(r.token.id, 1) } }
+        },
+        Free(r) -> consumed(acc, r.of),
+        Opened(o) -> {
+          let c = consumed(acc, o.of);
+          o.words.fold(c, |x: Walk, v: Var|
+            if counted(v.rep) { { ..x, h: { ..x.h, owned: x.h.owned.insert(v.id, 1) } } } else { x })
+        },
+        Loop(_) -> { ..acc, fault: Some(b"a loop, which this check does not walk yet") },
+        Next(_) -> { ..acc, fault: Some(b"a loop's next pass outside a loop") },
+        Done(_) -> { ..acc, fault: Some(b"a loop's answer outside a loop") },
+        Handle(_) -> { ..acc, fault: Some(b"a handle, which this check does not walk yet") },
+        Parallel(_) -> { ..acc, fault: Some(b"a parallel block, which this check does not walk yet") },
+      }
+    })
+
+/// Two paths out of a branch: where both go on they must hold the same counts and have set the
+/// same joins; a value borrowed inside one is gone after it.
+fn joined(before: Walk, a: Walk, b: Walk) -> Walk =
+  match a.fault {
+    Some(_) -> a,
+    None -> match b.fault {
+      Some(_) -> b,
+      None -> if a.live && b.live {
+        if a.h.owned != b.h.owned { { ..a, fault: Some(b"the paths out of a branch hold different counts") } }
+        else if a.h.joins != b.h.joins { { ..a, fault: Some(b"the paths out of a branch set different joins") } }
+        else { { ..a, h: { ..a.h, borrowed: before.h.borrowed } } }
+      } else if a.live { { ..a, h: { ..a.h, borrowed: before.h.borrowed } } }
+      else if b.live { { ..b, h: { ..b.h, borrowed: before.h.borrowed } } }
+      else { { ..a, live: false } },
+    },
+  }
+
+/// Each operand used as the operation's signature says: consumed, or only read.
+fn used(w: Walk, ops: List<{ arg: Arg, takes: Bool }>) -> Walk =
+  ops.fold(w, |acc: Walk, o: { arg: Arg, takes: Bool }| if o.takes { taken(acc, o.arg) } else { held(acc, o.arg) })
+
+fn taken(w: Walk, a: Arg) -> Walk = match a { AVar(v) -> consumed(w, v), _ -> w }
+
+fn held(w: Walk, a: Arg) -> Walk = match a { AVar(v) -> read_of(w, v), _ -> w }
+
+/// One count of `v` consumed: it must hold one of its own.
+fn consumed(w: Walk, v: Var) -> Walk =
+  if w.fault != None || !counted(v.rep) { w } else {
+    let n = count(w.h, v);
+    if n > 0 {
+      { ..w, h: { ..w.h, owned: if n == 1 { w.h.owned.remove(v.id) } else { w.h.owned.insert(v.id, n - 1) } } }
+    } else if w.h.borrowed.contains(v.id) { faulted(w, b"a borrowed value consumed with no count of its own: v", v) }
+    else { faulted(w, b"a value consumed with no count left: v", v) }
+  }
+
+/// `v` read: it must be held, or borrowed out of something still held.
+fn read_of(w: Walk, v: Var) -> Walk =
+  if w.fault != None || !counted(v.rep) || count(w.h, v) > 0 { w } else {
+    match w.h.borrowed.get(v.id) {
+      Some(base) -> if base < 0 || w.h.owned.contains(base) || w.h.borrowed.contains(base) { w }
+      else { faulted(w, b"a value read after what it was read out of was let go: v", v) },
+      None -> faulted(w, b"a value read with no count left: v", v),
+    }
+  }
+
+/// Where `val` can fail, what its failure path releases must be exactly what the path holds.
+fn failing(w: Walk, val: Val, unwind: List<Var>) -> Walk =
+  if w.fault != None || !fails(val) {
+    if unwind.len() > 0 && w.fault == None { { ..w, fault: Some(b"a release on the failure path of a value that cannot fail") } }
+    else { w }
+  } else {
+    let named = unwind.fold(Map::new(), |m: Map<Int, Int>, v: Var|
+      m.insert(v.id, match m.get(v.id) { Some(n) -> n + 1, None -> 1 }));
+    if named == w.h.owned { w } else { { ..w, fault: Some(b"a failure path that releases other than what it holds") } }
+  }
+
+/// The variable `v` a `Let` binds, holding what the operation answers.
+fn result(w: Walk, v: Var, a: Answered) -> Walk =
+  if w.fault != None || !counted(v.rep) { w } else {
+    match a {
+      Owns -> { ..w, h: { ..w.h, owned: w.h.owned.insert(v.id, 1) } },
+      ReadsOf(x) -> {
+        let base = if count(w.h, x) > 0 { x.id } else {
+          match w.h.borrowed.get(x.id) { Some(b) -> b, None -> x.id }
+        };
+        { ..w, h: { ..w.h, borrowed: w.h.borrowed.insert(v.id, base) } }
+      },
+      Lasts -> { ..w, h: { ..w.h, borrowed: w.h.borrowed.insert(v.id, 0 - 1) } },
+    }
+  }
+
+/// Control leaves: nothing may be held past it.
+fn ended(w: Walk, why: Bytes) -> Walk =
+  if w.fault != None { w } else {
+    match w.h.owned.keys().at(0) {
+      Some(id) -> { ..w, fault: Some(why.concat(ascii_of_int(id))), live: false },
+      None -> { ..w, live: false },
+    }
+  }
+
+fn count(h: Holding, v: Var) -> Int = match h.owned.get(v.id) { Some(n) -> n, None -> 0 }
+
+fn faulted(w: Walk, why: Bytes, v: Var) -> Walk = { ..w, fault: Some(why.concat(ascii_of_int(v.id))) }
+
+/// Whether operand `a` is held as `r`: a variable by its own representation, a constant always.
+fn same_rep(a: Arg, r: Rep) -> Bool = match a { AVar(v) -> v.rep == r, _ -> true }
+
+fn word(id: Int) -> Var = { id: id, ty: TyCon({ name: b"String", args: [] }), rep: RWord }
+
+fn int(id: Int) -> Var = { id: id, ty: TyCon({ name: b"Int", args: [] }), rep: RInt }
+
+/// A root over `params`, each given unless `lent` names it, answering as `answer`.
+fn root_of(params: List<Var>, lent: List<Int>, answer: Rep, body: Block) -> Fn =
+  {
+    key: Named(b"m.f"),
+    kind: Rooted,
+    params: params,
+    conv: {
+      params: range(0, params.len()).map(|i: Int| if lent.contains(i) { Lent } else { Given }),
+      reps: params.map(|p: Var| p.rep),
+      answer: answer,
+    },
+    body: body,
+    lambdas: [],
+    base: 0,
+    members: [],
+  }
+
+/// A call of `m.g` handing `args`, each given unless `lent` names it, answering a word.
+fn call_of(args: List<Arg>, lent: List<Int>) -> Val =
+  Call({
+    callee: Root(Named(b"m.g")),
+    args: args,
+    conv: {
+      params: range(0, args.len()).map(|i: Int| if lent.contains(i) { Lent } else { Given }),
+      reps: args.map(|_: Arg| RWord),
+      answer: RWord,
+    },
+    stops: false,
+  })
+
+fn bind(v: Var, val: Val, unwind: List<Var>) -> Inst =
+  Let({ var: v, val: val, at: dummy_span(), unwind: unwind })
+
+test "a count is consumed exactly once on every path, or the body is refused" {
+  let p = word(0);
+  let r = word(1);
+  assert_eq(verified(root_of([p], [], RWord, [Return(AVar(p))])), None);
+  assert_eq(
+    verified(root_of([p], [], RInt, [Return(AInt(0))])),
+    Some(b"a count left held where the body answers: v0"),
+  );
+  assert_eq(
+    verified(root_of([p], [], RWord, [bind(r, call_of([AVar(p), AVar(p)], []), []), Return(AVar(r))])),
+    Some(b"a value consumed with no count left: v0"),
+  );
+  assert_eq(
+    verified(root_of([p], [], RWord, [
+      Inc({ var: p, n: 1 }),
+      bind(r, call_of([AVar(p), AVar(p)], []), []),
+      Return(AVar(r)),
+    ])),
+    None,
+  );
+  // A lent parameter is read, never consumed, and the root holds no count of it.
+  assert_eq(verified(root_of([p], [0], RWord, [bind(r, call_of([AVar(p)], [0]), []), Return(AVar(r))])), None)
+}
+
+test "what a failing call's path releases is exactly what the path holds across it" {
+  let p = word(0);
+  let r = word(1);
+  let body = |unwind: List<Var>|
+    [Inc({ var: p, n: 1 }), bind(r, call_of([AVar(p)], []), unwind), Dec(p), Return(AVar(r))];
+  assert_eq(verified(root_of([p], [], RWord, body([p]))), None);
+  assert_eq(
+    verified(root_of([p], [], RWord, body([]))),
+    Some(b"a failure path that releases other than what it holds"),
+  )
+}
+
+test "the paths out of a branch hold the same counts and set the same joins" {
+  let p = word(0);
+  let s = word(1);
+  let j = int(2);
+  assert_eq(
+    verified(root_of([p], [], RInt, [If({ cond: ABool(true), then: [Dec(p)], otherwise: [] }), Return(AInt(0))])),
+    Some(b"the paths out of a branch hold different counts"),
+  );
+  assert_eq(
+    verified(root_of([p], [], RWord, [
+      If({
+        cond: ABool(true),
+        then: [Return(AVar(p))],
+        otherwise: [Dec(p), bind(s, Static(b"k"), []), Inc({ var: s, n: 1 }), Return(AVar(s))],
+      }),
+    ])),
+    None,
+  );
+  assert_eq(
+    verified(root_of([p], [], RInt, [
+      Dec(p),
+      Decl(j),
+      If({ cond: ABool(true), then: [Set({ var: j, arg: AInt(1) })], otherwise: [] }),
+      Return(AVar(j)),
+    ])),
+    Some(b"the paths out of a branch set different joins"),
+  )
+}
+
+test "a borrowed value is read only while what it was read out of is held" {
+  let p = word(0);
+  let x = word(1);
+  let r = word(2);
+  let read_after = |first: List<Inst>|
+    root_of([p], [], RWord, [bind(x, Get({ of: p, path: PLeaf(0) }), [])].concat(first).concat([
+      bind(r, call_of([AVar(x)], [0]), []),
+      Return(AVar(r)),
+    ]));
+  assert_eq(verified(read_after([Dec(p)])), Some(b"a value read after what it was read out of was let go: v1"));
+  assert_eq(
+    verified(root_of([p], [], RWord, [
+      bind(x, Get({ of: p, path: PLeaf(0) }), []),
+      bind(r, call_of([AVar(x)], [0]), [p]),
+      Dec(p),
+      Return(AVar(r)),
+    ])),
+    None,
+  );
+  assert_eq(
+    verified(root_of([p], [], RWord, [bind(x, Get({ of: p, path: PLeaf(0) }), []), Dec(p), Return(AVar(x))])),
+    Some(b"a borrowed value consumed with no count of its own: v1"),
+  )
+}
