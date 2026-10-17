@@ -17,7 +17,8 @@ import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, R
 import emit.lower.held (Laid, laid_of, record_flags, tail_bits, in_place, fields_of, slot_kind,
                         case_leaves_all, case_span, enumerated)
 import emit.print.text (Printing, Place, printing, line, pieces, pad, temp, named, name_of,
-                        arg_text, check, zero, int_lit, field_hole, part_names, part_name, shape_at)
+                        arg_text, check, zero, int_lit, field_hole, part_names, part_name, shape_at,
+                        slot)
 
 /// The C type a value held as `r` is declared in where it is one C value, and otherwise the type of
 /// the first of its C values, which a root answering it returns.
@@ -118,16 +119,16 @@ pub fn word_as(w: Bytes, r: Rep) -> Bytes =
       Bytes::concat_all([
         b"(ply_is_float(",
         w,
-        b") ? ply_f64(ply_words(",
-        w,
-        b")[0]) : ply_f64(rt_unbox_float_p(ctx, ",
+        b") ? ply_f64(",
+        slot(w, 0),
+        b") : ply_f64(rt_unbox_float_p(ctx, ",
         w,
         b")))",
       ]),
     RDec -> Bytes::concat_all([b"ply_dec_of(", w, b")"]),
     RNum(n) -> if n.bits < 64 {
       Bytes::concat_all([b"(", ctype(KNum(n)), b")ply_imm_value(", w, b")"])
-    } else { Bytes::concat_all([b"(", ctype(KNum(n)), b")ply_words(", w, b")[0]"]) },
+    } else { Bytes::concat_all([b"(", ctype(KNum(n)), b")", slot(w, 0)]) },
     RMaybe -> Bytes::concat_all([b"rt_maybe_open_p(ctx, ", w, b")"]),
     RTagged -> Bytes::concat_all([b"rt_tagged_open_p(ctx, ", w, b")"]),
     _ -> w,
@@ -651,19 +652,7 @@ fn ctor_built(
       );
       let stored = range(0, ws.len()).fold(headed, |q: Printing, k: Int|
         if kept.contains(k) { q } else {
-          line(
-            q,
-            p.depth + 1,
-            Bytes::concat_all([
-              b"ply_words(",
-              n.name,
-              b")[",
-              ascii_of_int(k),
-              b"] = ",
-              nth(ws, k),
-              b";",
-            ]),
-          )
+          line(q, p.depth + 1, Bytes::concat_all([slot(n.name, k), b" = ", nth(ws, k), b";"]))
         });
       line(
         check(
@@ -710,18 +699,26 @@ fn ctor_laid(
 ) -> Printing = {
   let fs = range(0, args.len()).map(|i: Int|
     slot_field(arg_name(i), match args.at(i) { Some(a) -> rep_of_arg(a), None -> RWord }));
-  let vals = args.fold([], |acc: List<Held>, a: Arg| {
+  // A float's or a width's bits are held in a word of their own first, as today's emitter holds
+  // them before it makes the object.
+  let given = args.fold({ pr: pr, vals: [] }, |acc: { pr: Printing, vals: List<Held> }, a: Arg| {
     let ps = arg_parts(pr, a);
     match rep_of_arg(a) {
       RFlat(ls) ->
-        acc.concat(
-          range(0, ps.len()).map(|k: Int|
-            { rep: match ls.at(k) { Some(l) -> l.rep, None -> RWord }, expr: nth(ps, k) }),
-        ),
-      r -> acc.push({ rep: r, expr: nth(ps, 0) }),
+        {
+          ..acc,
+          vals: acc.vals.concat(
+            range(0, ps.len()).map(|k: Int|
+              { rep: match ls.at(k) { Some(l) -> l.rep, None -> RWord }, expr: nth(ps, k) }),
+          ),
+        },
+      RFloat -> bits_held(acc, p.depth, { rep: RFloat, expr: nth(ps, 0) }),
+      RNum(w) -> bits_held(acc, p.depth, { rep: RNum(w), expr: nth(ps, 0) }),
+      r -> { ..acc, vals: acc.vals.push({ rep: r, expr: nth(ps, 0) }) },
     }
   });
-  let sh = inner_shapes(pr, fs);
+  let vals = given.vals;
+  let sh = inner_shapes(given.pr, fs);
   let n = named(sh.pr, v);
   let l = laid_of(fs);
   let flags = ascii_of_int(record_flags(fs, l));
@@ -784,6 +781,19 @@ fn ctor_laid(
       );
       line(cells(made_else, p.depth + 1, []), p.depth, b"}")
     },
+  }
+}
+
+/// `acc` holding `v`'s bits in a word of their own, which the object's cell takes as it is.
+fn bits_held(
+  acc: { pr: Printing, vals: List<Held> },
+  depth: Int,
+  v: Held,
+) -> { pr: Printing, vals: List<Held> } = {
+  let t = temp(acc.pr);
+  {
+    pr: line(t.pr, depth, Bytes::concat_all([b"Word ", t.name, b" = ", field_word(v), b";"])),
+    vals: acc.vals.push({ rep: RWord, expr: t.name }),
   }
 }
 
@@ -918,7 +928,7 @@ fn loaded(p: Place, pr: Printing, v: Var, base: Bytes, at: Int) -> Printing =
 
 /// The field held as `r` at word `at` of `base`.
 fn slot_load(base: Bytes, at: Int, r: Rep) -> Bytes = {
-  let word = Bytes::concat_all([b"ply_words(", base, b")[", ascii_of_int(at), b"]"]);
+  let word = slot(base, at);
   match r {
     RInt -> Bytes::concat_all([b"(int64_t)(", word, b")"]),
     RNum(w) -> Bytes::concat_all([b"(", ctype(KNum(w)), b")(", word, b")"]),
@@ -1449,11 +1459,7 @@ fn laid_lines(
 ) -> Printing = {
   let parts = laid_parts(name, fs, vals, shapes, skip);
   let stored = parts.cells.fold(pr, |q: Printing, c: { at: Int, expr: Bytes }|
-    line(
-      q,
-      depth,
-      Bytes::concat_all([b"ply_words(", name, b")[", ascii_of_int(c.at), b"] = ", c.expr, b";"]),
-    ));
+    line(q, depth, Bytes::concat_all([slot(name, c.at), b" = ", c.expr, b";"])));
   parts.inners.fold(stored, |q: Printing, x: List<Piece>|
     pieces(q, [Text(pad(depth))].concat(x).push(Text(b"\n"))))
 }
@@ -1545,15 +1551,7 @@ fn laid_parts(
 fn written(name: Bytes, at: Int, cells: List<{ at: Int, expr: Bytes }>) -> Bytes =
   Bytes::concat_all(
     cells.map(|c: { at: Int, expr: Bytes }|
-      Bytes::concat_all([
-        b" ply_words(",
-        name,
-        b")[",
-        ascii_of_int(at + c.at),
-        b"] = ",
-        c.expr,
-        b";",
-      ])),
+      Bytes::concat_all([b" ", slot(name, at + c.at), b" = ", c.expr, b";"])),
   )
 
 /// The words an object laid out as a record of `fs` holds, but those of the records it holds in
