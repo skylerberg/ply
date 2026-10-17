@@ -14,8 +14,8 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
 import items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TypeDefBody, TDAlias, TDSum,
               VariantDef, DeriveDef, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric,
               DInteger, DRow, deriver_text, deriver_tag, ImportDecl, ImportKind, IModule, IAlias,
-              INames, Vis, VPub, VPriv, Derived, Constraint, SpecClause, parse, constraint_written,
-              TDNominal, TDExtern, IInstance, InstanceDef, NKey, NShow)
+              INames, Vis, VPub, VPriv, Derived, Derivation, RuntimeBinder, Constraint, SpecClause,
+              parse, constraint_written, TDNominal, TDExtern, IInstance, InstanceDef, NKey, NShow)
 import rewrite (expand, find_type, picked_in)
 import resolve (Diag, Source, error_at, error_at_and, dump_diags, path_span)
 import std.list
@@ -757,7 +757,7 @@ derive bin for RowField
 /// The fields `derive row for target` reads, in order, as the module that declares the type writes
 /// them; `None` for a type the module does not declare as a record.
 pub fn row_shape(module: Module, target: Bytes) -> Option<List<RowField>> / {abort.raise} = {
-  let ex = new_expander(0, b"", module);
+  let ex = new_expander(0, b"", module, []);
   match find_type(ex.types, target) {
     None -> None,
     Some(def) -> match row_fields(def) {
@@ -1951,12 +1951,15 @@ fn retarget_pat(p: Pattern, span: Span) -> Pattern =
 type Runtime = { wanted: Bytes, prefix: Bytes, added: Option<ImportDecl> }
 type Claimed = { name: Bytes, def: DeriveDef }
 type Generated = { source: Bytes, defs: List<FnDef>, derived: Derived }
+/// `taken` holds what the module's own expansion wrote of the derivations of the part of it being
+/// expanded, which are expanded to that.
 type Expander = {
   m: Int,
   path: Bytes,
   module: Module,
   types: List<TypeDef>,
   aliases: List<Alias>,
+  taken: List<Derivation>,
   claimed: List<Claimed>,
   generated: List<Generated>,
   runtimes: List<Runtime>,
@@ -2003,7 +2006,7 @@ fn eq_ignore_case(a: Bytes, b: Bytes) -> Bool / {abort.raise} =
   String::of_bytes(a).eq_ignore_ascii_case(String::of_bytes(b))
 
 /// Each table keeps the first of a name on its own, so an alias may follow a same-named sum type.
-fn new_expander(m: Int, path: Bytes, module: Module) -> Expander = {
+fn new_expander(m: Int, path: Bytes, module: Module, taken: List<Derivation>) -> Expander = {
   let walked = module.items.fold(
     { types: [], aliases: [] },
     |acc: { types: List<TypeDef>, aliases: List<Alias> }, item: Item|
@@ -2031,6 +2034,7 @@ fn new_expander(m: Int, path: Bytes, module: Module) -> Expander = {
     module: module,
     types: walked.types,
     aliases: walked.aliases,
+    taken: taken,
     claimed: [],
     generated: [],
     runtimes: [],
@@ -2098,47 +2102,122 @@ fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
             TDExtern -> native_not_derivable(expander, def, blocker),
             _ -> not_derivable(expander, def, blocker),
           },
-          None -> {
-            let rt: WithPrefix = runtime_prefix(expander, def);
-            let json: WithPrefix = match rt.prefix {
-              None -> rt,
-              Some(_) -> documents_prefix(rt.ex, def, target),
-            };
-            let ex1: Expander = json.ex;
-            match ((rt.prefix, json.prefix)) {
-              (Some(prefix), Some(documents)) -> {
-                let cycle = cycle_of(codec_calls(ex1, def.deriver), def.target.name);
-                let written = emit_item(
-                  emitter(
-                    def.deriver,
-                    prefix,
-                    target.generics.types,
-                    ex1.aliases,
-                    ex1.path,
-                    cycle,
-                    documents,
+          None -> match expander.taken.find(|d: Derivation|
+              same_deriver(d.deriver, def.deriver) && d.target == def.target.name) {
+            Some(d) ->
+              wrote(
+                d.binders.fold(expander, |ex: Expander, b: RuntimeBinder| bound(ex, def, b)),
+                def,
+                d.written,
+                d.binders,
+              ),
+            None -> {
+              let rt: WithPrefix = runtime_prefix(expander, def);
+              let json: WithPrefix = match rt.prefix {
+                None -> rt,
+                Some(_) -> documents_prefix(rt.ex, def, target),
+              };
+              let ex1: Expander = json.ex;
+              match ((rt.prefix, json.prefix)) {
+                (Some(prefix), Some(documents)) ->
+                  wrote(
+                    ex1,
+                    def,
+                    emit_item(
+                      emitter(
+                        def.deriver,
+                        prefix,
+                        target.generics.types,
+                        ex1.aliases,
+                        ex1.path,
+                        cycle_of(codec_calls(ex1, def.deriver), def.target.name),
+                        documents,
+                      ),
+                      target,
+                    ),
+                    binders_of(def.deriver, prefix, documents),
                   ),
-                  target,
-                );
-                let source = Bytes::join(written, b"\n");
-                match parse_generated(source, def.span, written.len()) {
-                  None -> internal(ex1, def, source),
-                  Some(defs) ->
-                    {
-                      ..ex1,
-                      claimed: ex1.claimed.push({ name: name, def: def }),
-                      generated: ex1.generated.push({
-                        source: source,
-                        defs: defs,
-                        derived: { deriver: def.deriver, target: def.target.name, span: def.span },
-                      }),
-                    },
-                }
-              },
-              _ -> ex1,
-            }
+                _ -> ex1,
+              }
+            },
           },
         },
+      }
+    },
+  }
+
+/// `def` expanded to the functions `written`, whose text names each runtime module as `binders`
+/// says.
+fn wrote(
+  expander: Expander,
+  def: DeriveDef,
+  written: List<Bytes>,
+  binders: List<RuntimeBinder>,
+) -> Expander / {abort.raise} = {
+  let source = Bytes::join(written, b"\n");
+  let name = generated_name(def.deriver, def.target.name);
+  match parse_generated(source, def.span, written.len()) {
+    None -> internal(expander, def, source),
+    Some(defs) ->
+      {
+        ..expander,
+        claimed: expander.claimed.push({ name: name, def: def }),
+        generated: expander.generated.push({
+          source: source,
+          defs: defs,
+          derived: {
+            deriver: def.deriver,
+            target: def.target.name,
+            span: def.span,
+            written: written,
+            binders: binders,
+          },
+        }),
+      },
+  }
+}
+
+/// What `d` wrote, wherever its item stands.
+pub fn derivation_of(d: Derived) -> Derivation =
+  { deriver: d.deriver, target: d.target, written: d.written, binders: d.binders }
+
+/// The runtime modules a text a `deriver` wrote with `prefix`, and a row's `documents`, calls into.
+fn binders_of(
+  deriver: Deriver,
+  prefix: Bytes,
+  documents: Bytes,
+) -> List<RuntimeBinder> / {abort.raise} = {
+  let named = |module: Option<Bytes>, p: Bytes|
+    match module {
+      Some(m) -> if p.len() == 0 { [] } else { [{ module: m, binder: p.slice(0, p.len() - 2) }] },
+      None -> [],
+    };
+  named(runtime_module(deriver), prefix).concat(named(runtime_module(DJson), documents))
+}
+
+/// `expander` with the runtime module `b` names bound to its binder: by an import of the module that
+/// binds it so, else by one `def` adds. A runtime bound already keeps its binder, which every
+/// derivation of one module's expansion names it by.
+fn bound(expander: Expander, def: DeriveDef, b: RuntimeBinder) -> Expander / {abort.raise} =
+  match find_runtime(expander.runtimes, b.module) {
+    Some(_) -> expander,
+    None -> {
+      let imports = expander.module.imports.filter(|decl: ImportDecl| dotted(decl) == b.module);
+      let span = match imports.at(0) { Some(decl) -> path_span(decl), None -> def.span };
+      {
+        ..expander,
+        runtimes: expander.runtimes.push({
+          wanted: b.module,
+          prefix: b.binder.concat(b"::"),
+          added: if imports.any(|decl: ImportDecl| import_binder(decl) == Some(b.binder)) { None }
+          else {
+            Some({
+              path: b.module.split(b".").map(|s: Bytes| { name: s, span: span }),
+              kind: IAlias({ name: b.binder, span: span }),
+              span: span,
+            })
+          },
+        }),
       }
     },
   }
@@ -2460,12 +2539,19 @@ fn internal(expander: Expander, def: DeriveDef, source: Bytes) -> Expander =
   )
 
 /// Appends the generated definitions and any import a runtime module needed; `path` names the module.
-pub fn expand_derives(m: Int, path: Bytes, module: Module) -> Expansion / {abort.raise} =
+/// `module` is part of that module where `taken` holds what the module's expansion wrote of each
+/// derivation of the part: each is expanded to that.
+pub fn expand_derives(
+  m: Int,
+  path: Bytes,
+  module: Module,
+  taken: List<Derivation> = [],
+) -> Expansion / {abort.raise} =
   if !module.items.fold(false, |b: Bool, item: Item|
       b || (match item { IDerive(_) -> true, _ -> false })) {
     { module: module, derived: [], diags: [] }
   } else {
-    let ex = run_expander(new_expander(m, path, module));
+    let ex = run_expander(new_expander(m, path, module, taken));
     let added = ex.runtimes.fold([], |acc: List<ImportDecl>, runtime: Runtime|
       match runtime.added { Some(i) -> acc.push(i), None -> acc });
     {
@@ -2482,7 +2568,8 @@ pub fn expand_derives(m: Int, path: Bytes, module: Module) -> Expansion / {abort
 
 /// The source each of this module's derivations generates, in `derive` order.
 pub fn preview(path: Bytes, module: Module) -> List<Bytes> / {abort.raise} =
-  run_expander(new_expander(0, path, module)).generated.map(|generated: Generated| generated.source)
+  run_expander(new_expander(0, path, module, [])).generated.map(|generated: Generated|
+    generated.source)
 
 /// Each module expanded on its own: its generated sources length-prefixed, then its diagnostics.
 pub fn derive_dump(sources: List<Source>) -> String / {abort.raise} = {
@@ -2664,6 +2751,19 @@ test "a selective import of std.json still writes a module binder, stepping arou
       b"fn order_json() -> json_::JsonCodec<Order>",
     ),
   )
+}
+
+test "part of a module expands a derivation as its module's expansion wrote it, cycle and binder alike" {
+  let module = b"import other.json\nimport std.json (Json)\ntype Tree = {groves: List<Grove>}\ntype Grove = {trees: List<Tree>}\nderive json for Tree\nderive json for Grove";
+  let part = b"import std.json (Json)\ntype Tree = {groves: List<Grove>}\nderive json for Tree";
+  let written = |x: Expansion| x.derived.map(|d: Derived| d.written);
+  let whole = expand_derives(0, b"t", parse(module).node);
+  let tree = whole.derived.filter(|d: Derived| d.target == b"Tree").map(|d: Derived| d.written);
+  assert(written(expand_derives(0, b"t", parse(part).node)) != tree);
+  let taken = expand_derives(0, b"t", parse(part).node, taken: whole.derived.map(derivation_of));
+  assert_eq(taken.diags.len(), 0);
+  assert_eq(written(taken), tree);
+  assert_eq(taken.module.imports.map(import_binder), [None, Some(b"json_")])
 }
 
 test "every node of a generated definition stands at the derive item's place, told apart from the rest" {
