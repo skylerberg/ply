@@ -1,0 +1,196 @@
+//! What a call calls and how: a definition's root by its convention, a self call in tail position as
+//! a restart, a function value, a body run in place of the call, a closure made of a lambda's body,
+//! and a tail group's roots as one.
+
+import code (Code, NVar, NKnown, Lambda)
+import types (TyFn)
+import parsing (Span, starts_upper, prelude_binder)
+import resolve (qualify)
+import emit (Def, Imported, EmitParam)
+import emit.keys (Named, Root)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, Arg, AZero, Given, Convention, Call, Restart, Fn,
+                 Declined, Calling)
+import emit.lower.held (carried_as)
+import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
+                        ToInPlace, Frame, Opened, GroupMember, refuse, bound_as, emitted, continued,
+                        unnested, started)
+import emit.lower.data (constructed)
+
+/// How the root takes its parameters and hands back its answer: as the emitter carries them.
+pub fn convention(cx: Context) -> Convention =
+  {
+    params: cx.params.map(|_: EmitParam| Given),
+    reps: cx.params.map(|p: EmitParam| carried_as(p.carrier)),
+    answer: carried_as(cx.answer),
+  }
+
+/// What the call of `func` on `args` calls, or nothing where no definition, constructor or builtin
+/// answers to it.
+pub fn target(cx: Context, func: Code, args: List<Code>) -> Option<Target> / {abort.raise} =
+  match func.node {
+    NKnown(_) -> Some(ToInPlace(None)),
+    NVar(f) -> match f.slot {
+      Some(_) -> Some(ToValue),
+      None -> match def_named(cx, f.name) {
+        Some(d) -> Some(ToDef(d.full)),
+        None -> if is_ctor_name(f.name) { Some(ToCtor(f.name)) } else { Some(ToBuiltin(f.name)) },
+      },
+    },
+    _ -> Some(ToValue),
+  }
+
+/// A name no slot holds read as a value: a constructor of no arguments, or a definition.
+pub fn global(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered / {abort.raise} =
+  if is_ctor_name(name) { constructed(cx, st, name, [], at) }
+  else { refuse(st, Calling, b"a global read as a value: ".concat(name)) }
+
+/// A read of a slot known to hold the closure of a lambda its owner wrote.
+pub fn known(
+  cx: Context,
+  st: Lowering,
+  k: { name: Bytes, slot: Int, lambda: Lambda, owner: Bytes, nth: Int },
+  at: Span,
+) -> Lowered =
+  refuse(st, Calling, b"a known lambda read as a value")
+
+/// A call of definition `full` on `args`: a restart where it is the root's own definition called
+/// in tail position with every parameter, and otherwise a call through its convention.
+pub fn called(cx: Context, st: Lowering, full: Bytes, args: List<Arg>, tail: Bool, at: Span) -> Lowered / {abort.raise} =
+  match def_named(cx, full_short(cx, full)) {
+    None -> refuse(st, Calling, b"a call of a name the module does not define: ".concat(full)),
+    Some(d) -> match d.def.scheme {
+      None -> refuse(st, Calling, b"a call of a definition with no scheme"),
+      Some(sc) -> if sc.ty_vars.len() > 0 { refuse(st, Calling, b"a call of a generic definition") } else {
+        match sc.ty {
+          TyFn(f) -> {
+            let reps = d.def.carriers.map(carried_as);
+            let answer = carried_as(d.def.answer);
+            if reps.len() != args.len() { refuse(st, Calling, b"a call that does not fill its parameters") }
+            else if !reps.all(scalar) || !scalar(answer) {
+              refuse(st, Calling, b"a call of a definition taking or answering a word")
+            } else if tail && full == cx.full && args.len() == cx.params.len() {
+              { st: emitted(st, Restart(args)), arg: AZero(answer) }
+            } else {
+              bound_as(st, f.ret, answer, Call({
+                callee: Root(Named(full)),
+                args: args,
+                conv: { params: reps.map(|_: Rep| Given), reps: reps, answer: answer },
+                stops: false,
+              }), at)
+            }
+          },
+          _ -> refuse(st, Calling, b"a call of a name that is no function"),
+        }
+      },
+    },
+  }
+
+/// A call of the function value `f` on `args`.
+pub fn applied(cx: Context, st: Lowering, f: Arg, args: List<Arg>, tail: Bool, at: Span) -> Lowered =
+  refuse(st, Calling, b"a call of a function value")
+
+/// The state a body run in place of the call of `func` on `args` is lowered in: `lowered` are the
+/// arguments lowered, nothing where `which` names the lambda run in place.
+pub fn entered(
+  cx: Context,
+  st: Lowering,
+  func: Code,
+  args: List<Code>,
+  lowered: List<Option<Arg>>,
+  which: Option<Int>,
+  at: Span,
+) -> Opened =
+  { cx: cx, st: refuse(st, Calling, b"a body run in place of a call").st }
+
+/// The call's value once the body run in place was lowered to `body` from `entered`'s state.
+pub fn left(cx: Context, before: Lowering, entered: Opened, body: Lowered, which: Option<Int>, at: Span) -> Lowered =
+  refuse(continued(before, body.st), Calling, b"a body run in place of a call")
+
+/// The state the body of a function of its own laid out as `frame` is lowered in, inside `st`.
+pub fn lambda_opened(cx: Context, st: Lowering, frame: Frame, at: Span) -> Opened =
+  { cx: cx, st: refuse(st, Calling, b"a lambda").st }
+
+/// The closure of the body lowered to `inner` from `lambda_opened`'s state, made after `outer`.
+pub fn closure(cx: Context, outer: Lowering, inner: Lowered, frame: Frame, at: Span) -> Lowered =
+  refuse(unnested(outer, inner.st), Calling, b"a lambda")
+
+/// The state each member of a tail group is lowered in.
+pub fn group_opened(members: List<GroupMember>) -> List<Opened> =
+  members.map(|m: GroupMember| { cx: m.cx, st: refuse(started([]), Calling, b"a tail group").st })
+
+/// The group's root from each member's body lowered from `group_opened`'s state.
+pub fn grouped(members: List<GroupMember>, bodies: List<Lowered>) -> Result<Fn, Declined> =
+  Err({ by: Calling, why: b"a tail group" })
+
+fn scalar(r: Rep) -> Bool =
+  match r { RInt -> true, RBool -> true, RNum(_) -> true, RFloat -> true, _ -> false }
+
+/// `full` as the root's module names it: its own definitions by their short names.
+fn full_short(cx: Context, full: Bytes) -> Bytes / {abort.raise} =
+  if full.starts_with(cx.setting.module.concat(b".")) { full.slice(cx.setting.module.len() + 1, full.len()) }
+  else { full }
+
+/// The definition `name` names in the root's module: its own first, then what an import reaches.
+fn def_named(cx: Context, name: Bytes) -> Option<{ full: Bytes, def: Def }> / {abort.raise} =
+  if is_ctor_name(name) { None } else {
+    match cx.setting.here.fold(None, |acc: Option<Def>, d: Def| if d.name == name { Some(d) } else { acc }) {
+      Some(d) -> Some({ full: qualify(cx.setting.module, name), def: d }),
+      None -> match imported_target(cx.setting.imports, name) {
+        None -> None,
+        Some(t) -> match t.imp.defs.fold(None, |acc: Option<Def>, d: Def| if d.name == t.name { Some(d) } else { acc }) {
+          Some(d) -> Some({ full: qualify(t.imp.module, t.name), def: d }),
+          None -> None,
+        },
+      },
+    }
+  }
+
+// Copies of the emitter's private name resolution (`emit.ply`), listed in the hooks file.
+
+fn imported_target(imports: List<Imported>, name: Bytes) -> Option<{ imp: Imported, name: Bytes }> =
+  match match qualified(name) {
+      Some(q) -> match module_import(imports, q.binder) {
+        Some(imp) -> Some({ imp: imp, name: q.name }),
+        None -> None,
+      },
+      None -> match from_import(imports, name) {
+        Some(imp) -> Some({ imp: imp, name: name }),
+        None -> None,
+      },
+    } {
+    Some(t) -> Some(t),
+    None -> match module_import(imports, prelude_binder()) {
+      Some(imp) -> if imp.defs.fold(false, |found: Bool, d: Def| found || d.name == name) {
+        Some({ imp: imp, name: name })
+      } else { None },
+      None -> None,
+    },
+  }
+
+fn qualified(name: Bytes) -> Option<{ binder: Bytes, name: Bytes }> =
+  range(0, name.len() - 1).fold(None, |acc: Option<{ binder: Bytes, name: Bytes }>, i: Int|
+    match acc {
+      Some(_) -> acc,
+      None -> if name.at(i) == 58 && name.at(i + 1) == 58 {
+        Some({ binder: name.slice(0, i), name: name.slice(i + 2, name.len()) })
+      } else { None },
+    })
+
+fn from_import(xs: List<Imported>, name: Bytes) -> Option<Imported> =
+  xs.fold(None, |acc: Option<Imported>, i: Imported|
+    if !i.whole && i.name == name { Some(i) } else { acc })
+
+fn module_import(xs: List<Imported>, binder: Bytes) -> Option<Imported> =
+  xs.fold(None, |acc: Option<Imported>, i: Imported|
+    if i.whole && i.name == binder { Some(i) } else { acc })
+
+fn is_ctor_name(name: Bytes) -> Bool / {abort.raise} =
+  name.index_of(b"#") == None
+    && starts_upper(match qualified(name) {
+      Some(q) -> q.name,
+      None -> if name.index_of(b".") == None { name } else {
+        let dot = range(0, name.len()).fold(0, |acc: Int, i: Int|
+          if name.at(i) == 46 { i } else { acc });
+        name.slice(dot + 1, name.len())
+      },
+    })

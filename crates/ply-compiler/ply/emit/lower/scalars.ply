@@ -1,0 +1,137 @@
+//! Literals, operators and widths, and every operation done per type at a site: equality, order,
+//! show, digest and reflection.
+
+import code (Code, NLit, NBinary, NUnary)
+import patterns (Lit, LInt, LBool, LFloat, LFixed)
+import types (Type, named_type)
+import parsing (Span)
+import emit (Width, literal_bits)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, Arg, AInt, ABool, AFloat, ANum, Prim, Scalars, comparison)
+import emit.lower.held (held_as)
+import emit.lower.base (Context, Lowering, Lowered, refuse, bound, type_of)
+
+/// A literal as the operand it is: no variable holds one.
+pub fn literal(cx: Context, st: Lowering, l: Lit, at: Span) -> Lowered / {abort.raise} =
+  match l {
+    LInt(n) -> { st: st, arg: AInt(n) },
+    LBool(b) -> { st: st, arg: ABool(b) },
+    LFloat(x) -> { st: st, arg: AFloat(literal_bits(x)) },
+    LFixed(name, bits) -> match width_named(name) {
+      Some(w) -> if w.bits <= 64 { { st: st, arg: ANum({ width: w, bits: bits }) } }
+      else { refuse(st, Scalars, b"a literal of a width wider than a register") },
+      None -> refuse(st, Scalars, b"a literal of no known width"),
+    },
+    _ -> refuse(st, Scalars, b"a literal held as a word"),
+  }
+
+/// A node folded to a constant without lowering anything: two `Int` literals under an operator
+/// whose result is exact.
+pub fn constant(cx: Context, c: Code) -> Option<Arg> =
+  match folded(c) { Some(n) -> Some(AInt(n)), None -> None }
+
+/// The right operand of `op` taken as a constant where its node is one C's own operator takes: a
+/// negated literal divisor.
+pub fn operand(cx: Context, op: Bytes, rhs: Code) -> Option<Arg> =
+  match divisor(op, rhs) { Some(d) -> Some(AInt(d)), None -> None }
+
+pub fn unary(cx: Context, o: Lowered, op: Bytes, at: Span) -> Lowered =
+  if op == b"not" { bound(cx, o.st, named_type(b"Bool"), Prim({ op: op, on: RBool, args: [o.arg] }), at) }
+  else if op == b"neg" || op == b"bitnot" {
+    let on = held_as(cx.setting, type_of(o.arg));
+    if !scalar(on) { refuse(o.st, Scalars, b"an operator over a value held as a word: ".concat(op)) }
+    else { bound(cx, o.st, type_of(o.arg), Prim({ op: op, on: on, args: [o.arg] }), at) }
+  } else { refuse(o.st, Scalars, b"an operator outside the scalar subset: ".concat(op)) }
+
+/// `l op r`, read at the type of whichever operand says more than an `Int` literal does: a
+/// comparison answers a `Bool`, any other operator the operands' type.
+pub fn binary(cx: Context, l: Lowered, r: Lowered, op: Bytes, at: Span) -> Lowered = {
+  let ty = match l.arg { AInt(_) -> type_of(r.arg), _ -> type_of(l.arg) };
+  let on = held_as(cx.setting, ty);
+  if !scalar(on) { refuse(r.st, Scalars, b"an operator over a value held as a word: ".concat(op)) } else {
+    bound(cx, r.st, if comparison(op) { named_type(b"Bool") } else { ty }, Prim({
+      op: op,
+      on: on,
+      args: [l.arg, r.arg],
+    }), at)
+  }
+}
+
+/// Builtin `name` over `args`, which `containers` hands on as no container's.
+pub fn operated(cx: Context, st: Lowering, name: Bytes, args: List<Arg>, at: Span) -> Lowered =
+  refuse(st, Scalars, b"a builtin: ".concat(name))
+
+fn scalar(r: Rep) -> Bool =
+  match r { RInt -> true, RBool -> true, RNum(_) -> true, RFloat -> true, _ -> false }
+
+/// The divisor an `Int` division or remainder takes as a literal where it is a negated one:
+/// C's own operator then divides by it.
+fn divisor(op: Bytes, rhs: Code) -> Option<Int> =
+  if op != b"div" && op != b"rem" { None } else {
+    match rhs.node {
+      NUnary(u) -> if u.op != b"neg" { None } else {
+        match u.operand.node {
+          NLit(l) -> match l {
+            LInt(v) -> if v == 0 || v == 1 { None } else { Some(0 - v) },
+            _ -> None,
+          },
+          _ -> None,
+        }
+      },
+      _ -> None,
+    }
+  }
+
+/// Two `Int` literals under an operator, folded where the result is exact: `+`, `-` and `*` without
+/// overflow, the bit operators, and shifts by a count the word holds.
+fn folded(c: Code) -> Option<Int> =
+  match c.node {
+    NLit(l) -> match l { LInt(n) -> Some(n), _ -> None },
+    NBinary(b) -> match folded(b.lhs) {
+      None -> None,
+      Some(a) -> match folded(b.rhs) {
+        None -> None,
+        Some(x) -> if b.op == b"add" { exact_add(a, x) }
+        else if b.op == b"sub" { exact_sub(a, x) }
+        else if b.op == b"mul" { exact_mul(a, x) }
+        else if b.op == b"bitand" { Some(a & x) }
+        else if b.op == b"bitor" { Some(a | x) }
+        else if b.op == b"bitxor" { Some(a ^ x) }
+        else if b.op == b"shl" && x >= 0 && x < 64 { Some(a << x) }
+        else if b.op == b"shr" && x >= 0 && x < 64 { Some(a >> x) }
+        else if b.op == b"ushr" && x >= 0 && x < 64 { Some(a >>> x) }
+        else { None },
+      },
+    },
+    _ -> None,
+  }
+
+fn exact_add(a: Int, b: Int) -> Option<Int> = {
+  let s = wrap_add(a, b);
+  if a >= 0 == (b >= 0) && s >= 0 != (a >= 0) { None } else { Some(s) }
+}
+
+fn exact_sub(a: Int, b: Int) -> Option<Int> = {
+  let s = wrap_sub(a, b);
+  if a >= 0 != (b >= 0) && s >= 0 != (a >= 0) { None } else { Some(s) }
+}
+
+fn exact_mul(a: Int, b: Int) -> Option<Int> =
+  if a == 0 || b == 0 { Some(0) }
+  else if a == -1 { exact_sub(0, b) }
+  else if b == -1 { exact_sub(0, a) } else {
+    let p = wrap_mul(a, b);
+    if p / a == b && p % a == 0 { Some(p) } else { None }
+  }
+
+pub fn width_named(name: Bytes) -> Option<Width> =
+  if name == b"U8" { Some({ bits: 8, signed: false }) }
+  else if name == b"U16" { Some({ bits: 16, signed: false }) }
+  else if name == b"U32" { Some({ bits: 32, signed: false }) }
+  else if name == b"U64" { Some({ bits: 64, signed: false }) }
+  else if name == b"I8" { Some({ bits: 8, signed: true }) }
+  else if name == b"I16" { Some({ bits: 16, signed: true }) }
+  else if name == b"I32" { Some({ bits: 32, signed: true }) }
+  else if name == b"I64" { Some({ bits: 64, signed: true }) }
+  else if name == b"U128" { Some({ bits: 128, signed: false }) }
+  else if name == b"I128" { Some({ bits: 128, signed: true }) }
+  else { None }

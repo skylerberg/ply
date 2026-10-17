@@ -1,0 +1,433 @@
+//! What a module's roots are lowered among: the module's and its imports' definitions with how
+//! each crosses a call, its constructors, builtins and effects, and the types its check filed. The
+//! emitter hands the lowering what it holds for every root; `setting_in` builds the same from an
+//! analysed program, for lowering a program's text in tests.
+
+import std.bin
+import parsing (Ident, Span, span_key)
+import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Scheme, type_at, int_type)
+import typing (Typed, filed_as, unknown_type)
+import items (Module, Item, IFn, IEffect, OpDef, FnDef, INames, IModule, IAlias)
+import exprs (Param, freed_by)
+import resolve (ParsedModule, Resolved, ModuleBinding, Binding, lookup, ValueSpace, of_module, of_binder,
+                qualify)
+import infer (EmitFacts, TypedSite, LabelSite, MemberSite, expanded_mods)
+import front (Analysis, Analysed, KnownDefRow, CtorRow, EmitterCtor, WalkedFacts, walked_facts_bin,
+              dump_of, facts_read)
+import lent (passed)
+import code (Code, lower_to_emit)
+import emit (Def, Imported, Ctors, EffectName, OpMode, EmitParam, Carrier, Whole, Fields, Cases, SumCase,
+             FieldTy, Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, SumSpec, Zeroed, Tagged, Ty,
+             TyOpen, TyRec, Width, kind_of, ctor_layouts, ctor_sums)
+
+/// What the emitter hands the lowering for every root of one module.
+pub type Setting = {
+  module: Bytes,
+  here: List<Def>,
+  imports: List<Imported>,
+  ctors: Ctors,
+  builtins: List<Bytes>,
+  effects: List<EffectName>,
+  release: Bool,
+  typed: Map<Bytes, Typed>,
+}
+
+/// A definition of the module as a root: its full name, where its text starts, its parameters as
+/// the emitter holds them (each label a trailing `Int`), the types its scheme gives them and its
+/// answer (unknown where none speaks), how its answer crosses a call, and its body lowered to
+/// `Code`, where it lowers.
+pub type Root = {
+  full: Bytes,
+  base: Int,
+  params: List<EmitParam>,
+  types: List<Type>,
+  answer: Carrier,
+  answer_ty: Type,
+  code: Option<Code>,
+}
+
+/// Module `module` of the analysed program `a` as the emitter reads it, and each definition it
+/// writes as a root, or why the program's facts cannot be read.
+pub fn setting_in(a: Analysis, module: Bytes) -> Result<{ setting: Setting, roots: List<Root> }, Bytes> / {abort.raise} = {
+  let d = dump_of(Analysed(a));
+  match walked_read(d.walked) {
+    None -> Err(b"the analysis carries nothing its check read"),
+    Some(w) -> match facts_read(d.rows, w, None, a.mods) {
+      Err(why) -> Err(why),
+      Ok(facts) -> {
+        let mods = expanded_mods(a.mods, facts.elaboration, a.r.signatures);
+        let pure = facts.pure.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
+        let schemes = d.rows.defs.fold(Map::new(), |acc: Map<Bytes, Scheme>, row: KnownDefRow|
+          acc.insert(row.name, row.scheme));
+        let defs_of = |path: Bytes|
+          mods.fold([], |acc: List<Def>, m: ParsedModule|
+            if m.name == path { defs_in(m.name, m.module, pure, schemes) } else { acc });
+        match range(0, mods.len()).fold(None, |acc: Option<Int>, k: Int|
+            if mods.get(k).name == module { Some(k) } else { acc }) {
+          None -> Err(b"no such module"),
+          Some(i) -> {
+            let m = mods.get(i);
+            let here = defs_in(module, m.module, pure, schemes);
+            let sites = sites_in(facts.label_sites, i);
+            let setting = {
+              module: module,
+              here: here,
+              imports: resolved_imports(
+                a.r,
+                i,
+                mods,
+                m.module,
+                defs_of,
+                facts.elaboration.members.filter(|s: MemberSite| s.module == i),
+              ),
+              ctors: {
+                names: d.ctors.map(|c: CtorRow| c.name),
+                laid: ctor_layouts(d.ctors),
+                keyed: d.emitter_ctors.filter(|c: EmitterCtor| c.key != None).map(|c: EmitterCtor| c.name),
+                sums: ctor_sums(d.ctors),
+              },
+              builtins: [],
+              effects: effects_in(a.r, i, mods),
+              release: false,
+              typed: typed_in(facts, i),
+            };
+            Ok({
+              setting: setting,
+              roots: m.module.items.fold([], |acc: List<Root>, item: Item|
+                match item { IFn(def) -> acc.push(root_of(module, schemes, sites, here, def)), _ -> acc }),
+            })
+          },
+        }
+      },
+    },
+  }
+}
+
+/// Definition `def` of `module` as a root, as the emitter prepares one.
+fn root_of(
+  module: Bytes,
+  schemes: Map<Bytes, Scheme>,
+  sites: Map<Bytes, List<Bytes>>,
+  here: List<Def>,
+  def: FnDef,
+) -> Root / {abort.raise} = {
+  let full = qualify(module, def.name.name);
+  let sig = sig_of(schemes, full);
+  let names = def.params.map(|p: Param| p.name.name);
+  let labels = def.generics.labels.map(|i: Ident| i.name);
+  let kinds = param_kinds(def, sig).map(|k: { kind: Kind, ty: Ty }| Some(k)).concat(
+    labels.map(|_: Bytes| Some({ kind: KInt, ty: TyOpen([]) })),
+  );
+  let written = param_types(def, sig);
+  let ps = params_carried(names.concat(labels), kinds, carriers_of(def, sig).params, written);
+  {
+    full: full,
+    base: def.span.start,
+    params: ps,
+    types: range(0, ps.len()).map(|k: Int|
+      match written.at(k) { Some(Some(t)) -> t, Some(None) -> unknown_type(), None -> int_type() }),
+    answer: here.fold(Whole(KBoxed), |acc: Carrier, h: Def| if h.name == def.name.name { h.answer } else { acc }),
+    answer_ty: match sig { Some(s) -> s.ret, None -> unknown_type() },
+    code: match lower_to_emit(names, labels, sites, def.body, of_binder(module)) {
+      Some(l) -> Some(l.code),
+      None -> None,
+    },
+  }
+}
+
+// What follows copies the emitter's own readers of a program (`emit.ply`), which are private to it
+// until restructure PR 2 makes them `pub`; the hooks file lists each.
+
+type Sig = { params: List<Type>, ret: Type }
+
+fn sig_of(schemes: Map<Bytes, Scheme>, full: Bytes) -> Option<Sig> =
+  match schemes.get(full) {
+    Some(s) -> match s.ty { TyFn(f) -> Some({ params: f.params, ret: f.ret }), _ -> None },
+    None -> None,
+  }
+
+fn walked_read(walked: Bytes) -> Option<WalkedFacts> / {abort.raise} =
+  if walked.len() == 0 { None }
+  else { match bin::decode(walked, walked_facts_bin()) { Ok(w) -> Some(w), Err(_) -> None } }
+
+fn sites_in(all: List<LabelSite>, module: Int) -> Map<Bytes, List<Bytes>> =
+  all.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, site: LabelSite|
+    if site.module != module { acc } else { acc.insert(span_key(site.span), site.labels) })
+
+fn typed_in(facts: EmitFacts, module: Int) -> Map<Bytes, Typed> =
+  facts.typed.fold(
+    { sites: Map::new(), read: Map::new() },
+    |acc: { sites: Map<Bytes, Typed>, read: Map<Bytes, Type> }, site: TypedSite|
+      if site.module != module { acc } else {
+        let own = type_at(facts.types, site.ty, acc.read);
+        let args = site.args.fold(
+          { tys: [], read: own.read },
+          |a: { tys: List<Type>, read: Map<Bytes, Type> }, k: Bytes| {
+            let t = type_at(facts.types, k, a.read);
+            { tys: a.tys.push(t.ty), read: t.read }
+          },
+        );
+        let key = span_key(site.span);
+        let here = filed_as(own.ty, args.tys);
+        {
+          sites: match acc.sites.get(key) {
+            None -> acc.sites.insert(key, here),
+            Some(t) -> if t == here { acc.sites }
+            else { acc.sites.insert(key, filed_as(unknown_type(), [])) },
+          },
+          read: args.read,
+        }
+      },
+  ).sites
+
+fn defs_in(module: Bytes, m: Module, pure: Map<Bytes, Bool>, schemes: Map<Bytes, Scheme>) -> List<Def> =
+  m.items.fold([], |acc: List<Def>, item: Item|
+    match item { IFn(d) -> acc.push(def_entry(module, d, pure, schemes)), _ -> acc })
+
+fn def_entry(module: Bytes, d: FnDef, pure: Map<Bytes, Bool>, schemes: Map<Bytes, Scheme>) -> Def = {
+  let full = qualify(module, d.name.name);
+  let ret = match sig_of(schemes, full) { Some(s) -> Some(kind_of(s.ret)), None -> None };
+  let carried = carriers_of(d, sig_of(schemes, full));
+  {
+    name: d.name.name,
+    ret: match ret { Some(r) -> Some(r.kind), None -> None },
+    ret_ty: match ret { Some(r) -> r.ty, None -> TyOpen([]) },
+    pure: pure.contains(full),
+    arity: d.params.len() + d.generics.labels.len(),
+    scheme: schemes.get(full),
+    carriers: carried.params,
+    answer: carried.answer,
+    witnesses: carried.witnesses,
+    lent: range(0, d.params.len()).filter(|i: Int|
+      match d.params.at(i) { Some(p) -> passed(p).lent, None -> false }),
+  }
+}
+
+fn param_kinds(def: FnDef, sig: Option<Sig>) -> List<{ kind: Kind, ty: Ty }> = {
+  let given = match sig { Some(s) -> s.params, None -> [] };
+  let witnesses = def.params.len() - given.len();
+  range(0, def.params.len()).map(|i: Int|
+    if i < witnesses { { kind: KInt, ty: TyOpen([]) } }
+    else { match given.at(i - witnesses) { Some(t) -> kind_of(t), None -> { kind: KBoxed, ty: TyOpen([]) } } })
+}
+
+fn param_types(def: FnDef, sig: Option<Sig>) -> List<Option<Type>> = {
+  let given = match sig { Some(s) -> s.params, None -> [] };
+  let witnesses = def.params.len() - given.len();
+  range(0, def.params.len()).map(|i: Int|
+    if i < witnesses { Some(int_type()) } else { given.at(i - witnesses) })
+}
+
+fn params_carried(
+  names: List<Bytes>,
+  kinds: List<Option<{ kind: Kind, ty: Ty }>>,
+  carriers: List<Carrier>,
+  types: List<Option<Type>>,
+) -> List<EmitParam> =
+  range(0, names.len()).map(|i: Int|
+    {
+      name: match names.at(i) { Some(n) -> n, None -> b"" },
+      kind: match carriers.at(i) {
+        Some(Whole(KSum(spec))) -> KSum(spec),
+        _ -> match kinds.at(i) { Some(Some(p)) -> p.kind, _ -> KInt },
+      },
+      ty: match kinds.at(i) { Some(Some(p)) -> p.ty, _ -> TyOpen([]) },
+      of: match types.at(i) { Some(t) -> t, None -> None },
+      carrier: match carriers.at(i) { Some(c) -> c, None -> Whole(KBoxed) },
+      lambda: None,
+    })
+
+fn carriers_of(d: FnDef, sig: Option<Sig>) -> { params: List<Carrier>, answer: Carrier, witnesses: Int } = {
+  let given = match sig { Some(s) -> s.params, None -> [] };
+  let witnesses = d.params.len() - given.len();
+  let written = range(0, d.params.len()).map(|i: Int|
+    if i < witnesses { Whole(KBoxed) }
+    else { match given.at(i - witnesses) { Some(t) -> carrier_of(t), None -> Whole(KBoxed) } });
+  {
+    params: d.generics.labels.fold(written, |acc: List<Carrier>, _: Ident| acc.push(Whole(KBoxed))),
+    answer: if d.params.len() + d.generics.labels.len() == 0 { Whole(KBoxed) }
+    else { match sig { Some(s) -> carrier_of(s.ret), None -> Whole(KBoxed) } },
+    witnesses: witnesses,
+  }
+}
+
+fn carrier_of(t: Type) -> Carrier = {
+  let k = kind_of(t);
+  let args = if is_option_type(t) || tagged_result(t) {
+    match t { TyCon(c) -> c.args.map(|a: Type| case_carrier(carrier_of(a))), _ -> [] }
+  } else { [] };
+  if is_option_type(t) {
+    sum_carrier(Zeroed, [{ name: b"None", arg: None }, { name: b"Some", arg: args.at(0) }])
+  } else if tagged_result(t) {
+    sum_carrier(Tagged, [{ name: b"Ok", arg: args.at(0) }, { name: b"Err", arg: args.at(1) }])
+  } else {
+    match k.ty {
+      TyRec(fs) -> if carried_record(fs) { Fields(fs) } else { Whole(KBoxed) },
+      _ -> match k.kind {
+        KFloat -> Whole(KFloat),
+        KDec -> Whole(KDec),
+        KInt -> Whole(KInt),
+        KBool -> Whole(KBool),
+        KNum(w) -> if w.bits <= 64 { Whole(KNum(w)) } else { Whole(KBoxed) },
+        _ -> Whole(KBoxed),
+      },
+    }
+  }
+}
+
+fn sum_carrier(spec: SumSpec, cases: List<SumCase>) -> Carrier =
+  if cases.fold(false, |any: Bool, c: SumCase|
+      any || (match c.arg { Some(Fields(_)) -> true, _ -> false })) {
+    Cases({ spec: spec, cases: cases })
+  } else { Whole(KSum(spec)) }
+
+fn case_carrier(c: Carrier) -> Carrier =
+  match c { Whole(KSum(_)) -> Whole(KBoxed), Cases(_) -> Whole(KBoxed), other -> other }
+
+fn carried_record(fs: List<FieldTy>) -> Bool =
+  fs.len() > 0
+    && fs.fold(true, |ok: Bool, f: FieldTy|
+      ok && (match in_place(f) { Some(inner) -> holdable(inner), None -> true }))
+    && fs.fold(0, |n: Int, f: FieldTy|
+      n + (match in_place(f) { Some(inner) -> plain_width(inner), None -> raw_words(f.kind) }))
+    <= 4
+
+fn in_place(f: FieldTy) -> Option<List<FieldTy>> = match f.ty { TyRec(fs) -> Some(fs), _ -> None }
+
+fn holdable(fs: List<FieldTy>) -> Bool =
+  fs.len() > 0 && fs.fold(true, |ok: Bool, f: FieldTy| ok && in_place(f) == None)
+
+/// The words a record of `fs`, none held in place, lays out: the emitter's `laid_of(fs).width`.
+fn plain_width(fs: List<FieldTy>) -> Int = fs.fold(0, |n: Int, f: FieldTy| n + raw_words(f.kind))
+
+fn raw_words(kind: Kind) -> Int = match kind { KDec -> 2, _ -> 1 }
+
+fn is_option_type(t: Type) -> Bool =
+  match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
+
+fn tagged_result(t: Type) -> Bool =
+  match t {
+    TyCon(c) ->
+      c.name == b"Result" && c.args.len() == 2
+        && (match c.args.at(1) { Some(e) -> always_object(e), None -> false }),
+    _ -> false,
+  }
+
+fn always_object(t: Type) -> Bool =
+  match t {
+    TyRecord(_) -> true,
+    TyNominal(_) -> true,
+    TyFn(_) -> true,
+    TyCon(c) ->
+      c.name.index_of(b".") != None || c.name == b"Result" || c.name == b"Bytes"
+        || c.name == b"String"
+        || c.name == b"List"
+        || c.name == b"Map"
+        || c.name == b"Array"
+        || c.name == b"Columns",
+    _ -> false,
+  }
+
+fn effects_in(resolved: Resolved, i: Int, mods: List<ParsedModule>) -> List<EffectName> =
+  match resolved.scopes.at(i) {
+    None -> [],
+    Some(scope) -> {
+      let bare = scope.bound.effects.map(|b: Binding|
+        { written: b.name, global: b.qualified, ops: ops_of(mods, b.owner, b.name) });
+      scope.modules.fold(bare, |acc: List<EffectName>, mb: ModuleBinding|
+        match resolved.declared.at(mb.target) {
+          None -> acc,
+          Some(theirs) ->
+            theirs.effects.fold(acc, |a: List<EffectName>, b: Binding|
+              a.push({
+                written: Bytes::concat_all([mb.binder, b"::", b.name]),
+                global: b.qualified,
+                ops: ops_of(mods, mb.target, b.name),
+              })),
+        })
+    },
+  }
+
+fn ops_of(mods: List<ParsedModule>, owner: Int, name: Bytes) -> List<OpMode> =
+  match mods.at(owner) {
+    None -> [],
+    Some(m) ->
+      m.module.items.fold([], |acc: List<OpMode>, item: Item|
+        match item {
+          IEffect(e) -> if e.name.name == name {
+            e.ops.map(|op: OpDef| { name: op.name.name, mode: op.mode })
+          } else { acc },
+          _ -> acc,
+        }),
+  }
+
+fn resolved_imports(
+  resolved: Resolved,
+  index: Int,
+  mods: List<ParsedModule>,
+  x_module: Module,
+  defs_of: (Bytes) -> List<Def>,
+  members: List<MemberSite>,
+) -> List<Imported> / {abort.raise} = {
+  let written = range(0, x_module.imports.len()).fold([], |acc: List<Imported>, j: Int| {
+    let im = x_module.imports.get(j);
+    let full = match resolved.imports.get(index).at(j) {
+      Some(t) -> mods.get(t).name,
+      None -> dotted(im.path.map(|i: Ident| i.name)),
+    };
+    match im.kind {
+      INames(ns) ->
+        ns.fold(acc, |a: List<Imported>, n: Ident|
+          a.push({ name: n.name, module: full, defs: defs_of(full), whole: false })),
+      IModule ->
+        acc.push({
+          name: match im.path.at(im.path.len() - 1) { Some(i) -> i.name, None -> b"" },
+          module: full,
+          defs: defs_of(full),
+          whole: true,
+        }),
+      IAlias(a2) ->
+        freed_by(a2.name).fold(
+          acc.push({ name: a2.name, module: full, defs: defs_of(full), whole: true }),
+          |a: List<Imported>, n: Bytes|
+            match resolved.scopes.at(index) {
+              Some(sc) -> match lookup(sc.bound, ValueSpace, n) {
+                Some(b) -> if b.qualified != qualify(full, n) { a }
+                else { a.push({ name: n, module: full, defs: defs_of(full), whole: false }) },
+                None -> a,
+              },
+              None -> a,
+            },
+        ),
+    }
+  });
+  let through = members.fold(written, |acc: List<Imported>, m: MemberSite|
+    List::concat(match of_module(m.qualifier) { Some(home) -> [home], None -> [] }, m.reaches).fold(
+      acc,
+      |a: List<Imported>, home: Bytes|
+        match module_import(a, of_binder(home)) {
+          Some(_) -> a,
+          None -> a.push({ name: of_binder(home), module: home, defs: defs_of(home), whole: true }),
+        },
+    ));
+  match resolved.scopes.at(index) {
+    None -> through,
+    Some(scope) ->
+      scope.modules.fold(through, |acc: List<Imported>, mb: ModuleBinding|
+        match module_import(acc, mb.binder) {
+          Some(_) -> acc,
+          None -> {
+            let full = mods.get(mb.target).name;
+            acc.push({ name: mb.binder, module: full, defs: defs_of(full), whole: true })
+          },
+        }),
+  }
+}
+
+fn module_import(xs: List<Imported>, binder: Bytes) -> Option<Imported> =
+  xs.fold(None, |acc: Option<Imported>, i: Imported|
+    if i.whole && i.name == binder { Some(i) } else { acc })
+
+fn dotted(xs: List<Bytes>) -> Bytes =
+  range(0, xs.len()).fold(b"", |acc: Bytes, i: Int|
+    Bytes::concat_all([acc, if i == 0 { b"" } else { b"." }, match xs.at(i) { Some(x) -> x, None -> b"" }]))

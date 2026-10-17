@@ -12,9 +12,11 @@ import emit.tir.handling (HandleOp, HandleSite, Simulate, Label)
 import emit.tir.containers (ContainerOp)
 
 /// How a value is held. A function of the value's type (`lower.held`), but for `RSlice`, a view the
-/// lowering chooses for a list walked by its rest in a loop, which is made a list where it leaves.
-/// `RFlat` is a record as its leaves and then its object's word, zero until one is made; `RCases` a
-/// sum as its constructor's index and each case's leaves.
+/// lowering chooses for a list walked by its rest in a loop, which is made a list where it leaves,
+/// and `RToken`, which the ownership pass alone writes. `RFlat` is a record as its leaves and then
+/// its object's word, zero until one is made; `RCases` a sum as its constructor's index and each
+/// case's leaves; `RToken(n)` the cells of a block of `n` payload words whose fields a `Reset` let
+/// go of, or zero: freed where it is let go, never released as a value.
 pub type Rep =
   | RInt
   | RBool
@@ -27,6 +29,7 @@ pub type Rep =
   | RFlat(List<Leaf>)
   | RCases(Cases)
   | RSlice
+  | RToken(Int)
 
 /// A leaf of a flattened record or of a sum's case: never itself flat.
 pub type Leaf = { name: Bytes, rep: Rep }
@@ -118,12 +121,13 @@ pub type Inst =
   | Do({ val: Val, at: Span, unwind: List<Var> })
   /// A join's variable, which each path into the code after it sets once.
   | Decl(Var)
-  | Set({ var: Var, arg: Arg })
+  | Assign({ var: Var, arg: Arg })
   | If({ cond: Arg, then: Block, otherwise: Block })
   | Case({ on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block })
   /// Arms tried in order, each leaving for the next by `Miss`, and `rest` where none is taken.
   | Match({ arms: List<Block>, rest: Block })
-  /// The arm's tests failed: control goes to the next arm holding what it held entering this one.
+  /// The arm's tests failed: control goes to the next arm, which starts holding what the path held
+  /// at this miss; every miss of one arm holds the same.
   | Miss
   /// A loop over `state`, rebound by each `Next` in `body`, left with an answer by `Done`.
   | Loop({ state: List<Var>, init: List<Arg>, body: Block, answer: Var })
@@ -136,7 +140,10 @@ pub type Inst =
   | Enter({ member: Int, args: List<Arg> })
   | Fail(Bytes)
   /// `body` run under the handlers `site` lays out over `args`, its answer or a clause's in `answer`.
-  | Handle({ body: Block, args: List<Arg>, uses: Uses, site: HandleSite, answer: Var })
+  /// `unwind` are the owned values held across the body, which its landing releases where a failure
+  /// inside it is answered by no clause; a failing instruction inside releases only what the body
+  /// holds beyond them.
+  | Handle({ body: Block, args: List<Arg>, uses: Uses, site: HandleSite, answer: Var, unwind: List<Var> })
   // Written by the ownership pass alone.
   | Inc({ var: Var, n: Int })
   | Dec(Var)
@@ -164,10 +171,10 @@ pub type Links = {
 
 pub fn no_links() -> Links = { generics: [], needs: [], called: [], passes: [] }
 
-/// One root's form. `lambdas` are the bodies of the closures it makes, in the order its owner's
-/// `Code` numbers them (`FnArg.nth`); `base` is where its definition's text starts, which its
-/// failure sites count from; `members` are a tail group's roots in case order, and empty for a root
-/// of its own.
+/// One root's form. `lambdas` are the bodies of the closures it makes (its lambdas, its handlers'
+/// clauses, a `simulate`'s body), each `MClosure`'s `nth` its place among them; `base` is where its
+/// definition's text starts, which its failure sites count from; `members` are a tail group's roots
+/// in case order, and empty for a root of its own.
 pub type Fn = {
   key: RootKey,
   kind: FnKind,
@@ -190,13 +197,14 @@ pub type Family = | Spine | Data | Calling | Matching | Handling | Scalars | Con
 pub type Declined = { by: Family, why: Bytes }
 
 /// Whether a value held as `r` holds a count: a word, an `Option`'s or `Result`'s, a view of a
-/// list, or a flat value with a counted leaf (its word always is one).
+/// list, a reuse token, or a flat value with a counted leaf (its word always is one).
 pub fn counted(r: Rep) -> Bool =
   match r {
     RWord -> true,
     RMaybe -> true,
     RTagged -> true,
     RSlice -> true,
+    RToken(_) -> true,
     RFlat(_) -> true,
     RCases(c) -> c.cases.fold(false, |any: Bool, x: { name: Bytes, leaves: List<Leaf> }|
       any || x.leaves.fold(false, |a: Bool, l: Leaf| a || counted(l.rep))),
@@ -333,7 +341,7 @@ pub fn falls_through(b: Block) -> Bool =
 
 test "a word, a sum's word, a view and a flat value hold a count where a scalar holds none" {
   assert_eq([RInt, RBool, RFloat, RDec, RNum({ bits: 8, signed: false })].map(counted), [false, false, false, false, false]);
-  assert_eq([RWord, RMaybe, RTagged, RSlice, RFlat([])].map(counted), [true, true, true, true, true]);
+  assert_eq([RWord, RMaybe, RTagged, RSlice, RToken(2), RFlat([])].map(counted), [true, true, true, true, true, true]);
   assert_eq(counted(RCases({ tagged: false, cases: [{ name: b"None", leaves: [] }] })), false);
   assert_eq(
     counted(RCases({ tagged: false, cases: [{ name: b"Some", leaves: [{ name: b"0", rep: RWord }] }] })),

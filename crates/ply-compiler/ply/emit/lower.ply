@@ -1,126 +1,108 @@
 //! A root's `Code` lowered to the typed form. Each node is typed from its parts as it is lowered, so
-//! a type belongs to its node and not to its place in the text; each value is held as its type says;
-//! a value-producing `if` joins in a variable of its own type; a self call in tail position restarts
-//! the body. It covers the scalar subset: `Int`, `Bool`, `Float` and carried widths, their literals
-//! and operators, `let`, blocks, `if`, `&&`/`||`, and calls of the module's own definitions whose
-//! parameters and answers are scalars. Any other node is refused, with what it was.
+//! a type belongs to its node and not to its place in the text; each value is held as its type
+//! says. This module holds the one recursion over a body; each construct's family lowers it from its
+//! parts (`emit.lower.*`), and where a construct holds code, says what state each part is lowered
+//! in and assembles the construct from the parts lowered.
 
-import code (Code, NLit, NVar, NBinary, NUnary, NIf, NBlock, NApp, CodeStmt, CLet, CLetPat, CDo,
-             lower_to_emit)
-import patterns (Lit, LInt, LBool, LFloat, LFixed)
-import types (Type, TyCon, TyFn, Scheme, named_type, row_empty)
-import diagnostics (parse_all)
-import items (Item, IFn, FnDef)
-import exprs (Param)
-import typing (Typed)
-import parsing (Span, dummy_span)
-import resolve (qualify)
-import emit (Width, literal_bits)
-import std.bytes (ascii_of_int)
-import emit.keys (RootKey, Named, Root, definition_of)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, Var, Arg, AVar, AInt, ABool, AFloat, ANum,
-                 AZero, Given, Convention, Val, Prim, Call, Inst, Let, Decl, Set, If, Return, Restart,
-                 Block, Fn, Rooted, Declined, Family, Spine, Calling, Matching, Scalars, no_links,
-                 comparison, ends, falls_through)
-import emit.lower.held (held_as)
-
-/// What a root's body is lowered under: its module and key, where its definition's text starts,
-/// its parameters' and answer's types, the scheme of each definition it may call by full name, and
-/// the types the checker filed by place.
-pub type Context = {
-  module: Bytes,
-  key: RootKey,
-  base: Int,
-  params: List<Type>,
-  answer: Type,
-  schemes: Map<Bytes, Scheme>,
-  typed: Map<Bytes, Typed>,
-}
-
-/// The body lowered so far: the next variable's number, what each slot holds, the block being
-/// written, the first refusal, and whether a self call restarts the body.
-type Lowering = {
-  next: Int,
-  env: Map<Int, Arg>,
-  insts: List<Inst>,
-  refused: Option<Declined>,
-  loops: Bool,
-}
-
-/// A node lowered: the state after it and the operand holding its value.
-type Lowered = { st: Lowering, arg: Arg }
+import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform,
+             NLabel, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, NKnown, CodeStmt, CLet,
+             CLetPat, CDo, CodeField, CodeArm, CodeClause)
+import patterns (LUnit)
+import typing (unknown_type)
+import emit.tir (Var, Arg, AZero, RWord, Return, Fn, Rooted, Declined, Spine, Calling, falls_through)
+import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
+                        ToInPlace, Armed, ClauseMade, GroupMember, Opened, started, refuse, opened,
+                        continued, joined, short_circuit, handed)
+import emit.lower.data (constructed, recorded, field, updated)
+import emit.lower.scalars (literal, constant, operand, unary, binary)
+import emit.lower.containers (builtin, listed)
+import emit.lower.matching (arm_opened, closed, let_bound, compared_side, compared)
+import emit.lower.calling (convention, target, global, known, called, applied, entered, left,
+                           lambda_opened, closure, group_opened, grouped)
+import emit.lower.handling (performed, label, clause_frame, body_frame, handled, branched, simulated)
 
 /// The root lowered, or why its body is outside what the lowering covers.
 pub fn lowered_fn(cx: Context, body: Code) -> Result<Fn, Declined> / {abort.raise} = {
-  let params = range(0, cx.params.len()).map(|i: Int|
-    { id: i, ty: cx.params.get(i), rep: held_as(cx.params.get(i)) });
-  let answer = held_as(cx.answer);
-  if !params.all(|p: Var| scalar(p.rep)) || !scalar(answer) {
-    Err({ by: Spine, why: b"a parameter or answer held as a word" })
-  } else {
-    let start = {
-      next: params.len(),
-      env: range(0, params.len()).fold(Map::new(), |m: Map<Int, Arg>, i: Int|
-        m.insert(i, AVar(params.get(i)))),
-      insts: [],
-      refused: None,
-      loops: false,
-    };
-    let out = lowered(cx, start, body, true);
-    match out.st.refused {
-      Some(why) -> Err(why),
-      None ->
-        Ok({
-          key: cx.key,
-          kind: Rooted,
-          params: params,
-          conv: { params: params.map(|_: Var| Given), reps: params.map(|p: Var| p.rep), answer: answer },
-          body: if falls_through(out.st.insts) { out.st.insts.push(Return(out.arg)) }
-          else { out.st.insts },
-          lambdas: [],
-          base: cx.base,
-          members: [],
-          links: no_links(),
-        }),
-    }
+  let conv = convention(cx);
+  let params = range(0, conv.reps.len()).map(|i: Int|
+    {
+      id: i,
+      ty: match cx.types.at(i) { Some(t) -> t, None -> unknown_type() },
+      rep: conv.reps.get(i),
+    });
+  let out = lowered(cx, started(params), body, true);
+  let answered = if falls_through(out.st.insts) { handed(out, conv.answer, body.span) } else { out };
+  match answered.st.refused {
+    Some(no) -> Err(no),
+    None ->
+      Ok({
+        key: cx.key,
+        kind: Rooted,
+        params: params,
+        conv: conv,
+        body: if falls_through(answered.st.insts) { answered.st.insts.push(Return(answered.arg)) }
+        else { answered.st.insts },
+        lambdas: answered.st.lambdas,
+        base: cx.base,
+        members: [],
+        links: answered.st.links,
+      }),
   }
 }
 
-/// Whether the subset holds a value held as `r`.
-fn scalar(r: Rep) -> Bool =
-  match r { RInt -> true, RBool -> true, RNum(_) -> true, RFloat -> true, _ -> false }
+/// A tail group's members lowered as one root, or why the form does not cover it.
+pub fn lowered_group(members: List<GroupMember>) -> Result<Fn, Declined> / {abort.raise} = {
+  let starts = group_opened(members);
+  let bodies = range(0, members.len()).fold({ after: None, out: [] },
+    |acc: { after: Option<Lowering>, out: List<Lowered> }, i: Int|
+      match members.at(i) {
+        None -> acc,
+        Some(m) -> match starts.at(i) {
+          None -> acc,
+          Some(o) -> {
+            let from = match acc.after { Some(a) -> continued(o.st, a), None -> o.st };
+            let b = lowered(o.cx, from, m.body, true);
+            { after: Some(b.st), out: acc.out.push(b) }
+          },
+        },
+      });
+  grouped(members, bodies.out)
+}
 
-/// The one recursion over a body: each node lowered after its parts, which are lowered here or in
-/// a fold over them, so the recursion descends through the node and nothing else.
+/// The one recursion over a body: each node lowered after its parts, which are lowered here or in a
+/// fold over them, so the recursion descends through the node and nothing else.
 fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.raise} =
-  if st.refused != None { { st: st, arg: AZero(RInt) } } else {
+  if st.refused != None { { st: st, arg: AZero(RWord) } } else {
     match c.node {
-      NLit(l) -> literal(st, l),
+      NLit(l) -> literal(cx, st, l, c.span),
       NVar(v) -> match v.slot {
         Some(s) -> match st.env.get(s) {
           Some(a) -> { st: st, arg: a },
           None -> refuse(st, Spine, b"a slot nothing bound: ".concat(v.name)),
         },
-        None -> refuse(st, Calling, b"a global read as a value: ".concat(v.name)),
+        None -> global(cx, st, v.name, c.span),
       },
-      NUnary(u) -> {
-        let o = lowered(cx, st, u.operand, false);
-        unary(o, u.op, c.span)
-      },
-      NBinary(b) -> match folded(c) {
-        Some(n) -> { st: st, arg: AInt(n) },
-        None -> if b.op == b"and" || b.op == b"or" {
-          let l = lowered(cx, st, b.lhs, false);
-          let r = lowered(cx, { ..l.st, insts: [] }, b.rhs, tail);
-          short_circuit(l, r, b.op == b"and")
-        } else {
-          let l = lowered(cx, st, b.lhs, false);
-          let r = match divisor(b.op, b.rhs) {
-            Some(d) -> { st: l.st, arg: AInt(d) },
-            None -> lowered(cx, l.st, b.rhs, false),
-          };
-          binary(l.arg, r, b.op, c.span)
-        },
+      NKnown(k) -> known(cx, st, k, c.span),
+      NUnary(u) -> unary(cx, lowered(cx, st, u.operand, false), u.op, c.span),
+      NBinary(b) -> if b.op == b"and" || b.op == b"or" {
+        let l = lowered(cx, st, b.lhs, false);
+        short_circuit(cx, l, lowered(cx, opened(l.st), b.rhs, tail), b.op == b"and", c.span)
+      } else {
+        match compared_side(cx, b.op, b.lhs, b.rhs) {
+          Some(true) -> compared(cx, lowered(cx, st, b.rhs, false), b.lhs, b.op, c.span),
+          Some(false) -> compared(cx, lowered(cx, st, b.lhs, false), b.rhs, b.op, c.span),
+          None -> match constant(cx, c) {
+            Some(a) -> { st: st, arg: a },
+            None -> {
+              let l = lowered(cx, st, b.lhs, false);
+              let r = match operand(cx, b.op, b.rhs) {
+                Some(a) -> { st: l.st, arg: a },
+                None -> lowered(cx, l.st, b.rhs, false),
+              };
+              binary(cx, l, r, b.op, c.span)
+            },
+          },
+        }
       },
       NBlock(bl) -> {
         let after = bl.stmts.fold(st, |acc: Lowering, s: CodeStmt|
@@ -129,357 +111,176 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
               let v = lowered(cx, acc, l.value, false);
               { ..v.st, env: v.st.env.insert(l.slot, v.arg) }
             },
-            CLetPat(_) -> refuse(acc, Matching, b"a pattern bound by `let`").st,
+            CLetPat(l) -> let_bound(cx, lowered(cx, acc, l.value, false), l.pat, l.span),
             CDo(d) -> lowered(cx, acc, d.code, false).st,
           });
         match bl.tail {
           Some(t) -> lowered(cx, after, t, tail),
-          None -> refuse(after, Spine, b"a block answering the unit"),
+          None -> literal(cx, after, LUnit, c.span),
         }
       },
       NIf(i) -> {
         let cond = lowered(cx, st, i.cond, false);
-        let then = lowered(cx, { ..cond.st, insts: [] }, i.then_branch, tail);
-        let otherwise = lowered(cx, { ..then.st, insts: [], env: cond.st.env }, i.else_branch, tail);
-        joined(cx, cond, then, otherwise)
+        let then = lowered(cx, opened(cond.st), i.then_branch, tail);
+        let otherwise = lowered(cx, continued(opened(cond.st), then.st), i.else_branch, tail);
+        joined(cx, cond, then, otherwise, c.span)
       },
-      NApp(a) -> match a.func.node {
-        NVar(f) -> if f.slot != None { refuse(st, Calling, b"a call of a function value") } else {
-          let args = a.args.fold({ st: st, args: [] },
-            |acc: { st: Lowering, args: List<Arg> }, x: Code| {
-              let o = lowered(cx, acc.st, x, false);
-              { st: o.st, args: acc.args.push(o.arg) }
-            });
-          called(cx, args.st, qualify(cx.module, f.name), args.args, tail, c.span)
-        },
-        _ -> refuse(st, Calling, b"a call of a computed function"),
-      },
-      _ -> refuse(st, Spine, b"a node outside the scalar subset"),
-    }
-  }
-
-fn refuse(st: Lowering, by: Family, why: Bytes) -> Lowered =
-  {
-    st: match st.refused { Some(_) -> st, None -> { ..st, refused: Some({ by: by, why: why }) } },
-    arg: AZero(RInt),
-  }
-
-/// A literal as the operand it is: no variable holds one.
-fn literal(st: Lowering, l: Lit) -> Lowered / {abort.raise} =
-  match l {
-    LInt(n) -> { st: st, arg: AInt(n) },
-    LBool(b) -> { st: st, arg: ABool(b) },
-    LFloat(x) -> { st: st, arg: AFloat(literal_bits(x)) },
-    LFixed(name, bits) -> match width_named(name) {
-      Some(w) -> if w.bits <= 64 { { st: st, arg: ANum({ width: w, bits: bits }) } }
-      else { refuse(st, Scalars, b"a literal of a width wider than a register") },
-      None -> refuse(st, Scalars, b"a literal of no known width"),
-    },
-    _ -> refuse(st, Scalars, b"a literal held as a word"),
-  }
-
-/// `st` with `val` bound to a new variable of type `ty`, and that variable.
-fn bound(st: Lowering, ty: Type, val: Val, at: Span) -> Lowered = {
-  let v = { id: st.next, ty: ty, rep: held_as(ty) };
-  {
-    st: { ..st, next: st.next + 1, insts: st.insts.push(Let({ var: v, val: val, at: at, unwind: [] })) },
-    arg: AVar(v),
-  }
-}
-
-fn unary(o: Lowered, op: Bytes, at: Span) -> Lowered =
-  if op == b"not" { bound(o.st, named_type(b"Bool"), Prim({ op: op, on: RBool, args: [o.arg] }), at) }
-  else if op == b"neg" || op == b"bitnot" {
-    bound(o.st, type_of(o.arg), Prim({ op: op, on: held_as(type_of(o.arg)), args: [o.arg] }), at)
-  } else { refuse(o.st, Scalars, b"an operator outside the scalar subset: ".concat(op)) }
-
-/// `l op r`, read at the type of whichever operand says more than an `Int` literal does: a
-/// comparison answers a `Bool`, any other operator the operands' type.
-fn binary(l: Arg, r: Lowered, op: Bytes, at: Span) -> Lowered = {
-  let on = match l { AInt(_) -> type_of(r.arg), _ -> type_of(l) };
-  bound(r.st, if comparison(op) { named_type(b"Bool") } else { on }, Prim({
-    op: op,
-    on: held_as(on),
-    args: [l, r.arg],
-  }), at)
-}
-
-/// The divisor an `Int` division or remainder takes as a literal where it is a negated one:
-/// C's own operator then divides by it.
-fn divisor(op: Bytes, rhs: Code) -> Option<Int> =
-  if op != b"div" && op != b"rem" { None } else {
-    match rhs.node {
-      NUnary(u) -> if u.op != b"neg" { None } else {
-        match u.operand.node {
-          NLit(l) -> match l {
-            LInt(v) -> if v == 0 || v == 1 { None } else { Some(0 - v) },
-            _ -> None,
-          },
-          _ -> None,
-        }
-      },
-      _ -> None,
-    }
-  }
-
-/// Two `Int` literals under an operator, folded where the result is exact: `+`, `-` and `*` without
-/// overflow, the bit operators, and shifts by a count the word holds.
-fn folded(c: Code) -> Option<Int> =
-  match c.node {
-    NLit(l) -> match l { LInt(n) -> Some(n), _ -> None },
-    NBinary(b) -> match folded(b.lhs) {
-      None -> None,
-      Some(a) -> match folded(b.rhs) {
-        None -> None,
-        Some(x) -> if b.op == b"add" { exact_add(a, x) }
-        else if b.op == b"sub" { exact_sub(a, x) }
-        else if b.op == b"mul" { exact_mul(a, x) }
-        else if b.op == b"bitand" { Some(a & x) }
-        else if b.op == b"bitor" { Some(a | x) }
-        else if b.op == b"bitxor" { Some(a ^ x) }
-        else if b.op == b"shl" && x >= 0 && x < 64 { Some(a << x) }
-        else if b.op == b"shr" && x >= 0 && x < 64 { Some(a >> x) }
-        else if b.op == b"ushr" && x >= 0 && x < 64 { Some(a >>> x) }
-        else { None },
-      },
-    },
-    _ -> None,
-  }
-
-fn exact_add(a: Int, b: Int) -> Option<Int> = {
-  let s = wrap_add(a, b);
-  if a >= 0 == (b >= 0) && s >= 0 != (a >= 0) { None } else { Some(s) }
-}
-
-fn exact_sub(a: Int, b: Int) -> Option<Int> = {
-  let s = wrap_sub(a, b);
-  if a >= 0 != (b >= 0) && s >= 0 != (a >= 0) { None } else { Some(s) }
-}
-
-fn exact_mul(a: Int, b: Int) -> Option<Int> =
-  if a == 0 || b == 0 { Some(0) }
-  else if a == -1 { exact_sub(0, b) }
-  else if b == -1 { exact_sub(0, a) } else {
-    let p = wrap_mul(a, b);
-    if p / a == b && p % a == 0 { Some(p) } else { None }
-  }
-
-/// `l && r` or `l || r`: a `Bool` joined from the right operand where the left one does not decide.
-fn short_circuit(l: Lowered, r: Lowered, both: Bool) -> Lowered = {
-  let j = { id: r.st.next, ty: named_type(b"Bool"), rep: RBool };
-  let right = if falls_through(r.st.insts) { r.st.insts.push(Set({ var: j, arg: r.arg })) }
-  else { r.st.insts };
-  let decided = [Set({ var: j, arg: ABool(!both) })];
-  {
-    st: {
-      ..r.st,
-      next: r.st.next + 1,
-      insts: l.st.insts.push(Decl(j)).push(If({
-        cond: l.arg,
-        then: if both { right } else { decided },
-        otherwise: if both { decided } else { right },
-      })),
-    },
-    arg: AVar(j),
-  }
-}
-
-/// An `if` whose arms join in a variable of the type they answer; an arm that restarts the body
-/// or leaves it sets nothing.
-fn joined(cx: Context, cond: Lowered, then: Lowered, otherwise: Lowered) -> Lowered = {
-  let ty = if falls_through(then.st.insts) { type_of(then.arg) }
-  else if falls_through(otherwise.st.insts) { type_of(otherwise.arg) }
-  else { cx.answer };
-  let j = { id: otherwise.st.next, ty: ty, rep: held_as(ty) };
-  let set = |arm: Lowered|
-    if falls_through(arm.st.insts) { arm.st.insts.push(Set({ var: j, arg: arm.arg })) }
-    else { arm.st.insts };
-  {
-    st: {
-      ..otherwise.st,
-      next: otherwise.st.next + 1,
-      env: cond.st.env,
-      insts: cond.st.insts.push(Decl(j)).push(If({ cond: cond.arg, then: set(then), otherwise: set(otherwise) })),
-    },
-    arg: AVar(j),
-  }
-}
-
-/// A call of definition `full` of the module: a restart where it is the root's own definition
-/// called in tail position with every parameter, and otherwise a call through its convention.
-fn called(
-  cx: Context,
-  st: Lowering,
-  full: Bytes,
-  args: List<Arg>,
-  tail: Bool,
-  at: Span,
-) -> Lowered =
-  match cx.schemes.get(full) {
-    None -> refuse(st, Calling, b"a call of a name the module does not define: ".concat(full)),
-    Some(sc) -> if sc.ty_vars.len() > 0 { refuse(st, Calling, b"a call of a generic definition") } else {
-      match sc.ty {
-        TyFn(f) -> if f.params.len() != args.len() { refuse(st, Calling, b"a call that does not fill its parameters") }
-        else if !f.params.all(|t: Type| scalar(held_as(t))) || !scalar(held_as(f.ret)) {
-          refuse(st, Calling, b"a call of a definition taking or answering a word")
-        } else if tail && definition_of(cx.key) == Some(full) && args.len() == cx.params.len() {
-          { st: { ..st, loops: true, insts: st.insts.push(Restart(args)) }, arg: AZero(held_as(f.ret)) }
-        } else {
-          bound(st, f.ret, Call({
-            callee: Root(Named(full)),
-            args: args,
-            conv: {
-              params: f.params.map(|_: Type| Given),
-              reps: f.params.map(held_as),
-              answer: held_as(f.ret),
+      NApp(a) -> match target(cx, a.func, a.args) {
+        None -> refuse(st, Calling, b"a callee the lowering does not resolve"),
+        Some(ToInPlace(which)) -> {
+          let args = a.args.fold({ st: st, args: [], at: 0 },
+            |acc: { st: Lowering, args: List<Option<Arg>>, at: Int }, x: Code|
+              if which == Some(acc.at) { { ..acc, args: acc.args.push(None), at: acc.at + 1 } } else {
+                let o = lowered(cx, acc.st, x, false);
+                { st: o.st, args: acc.args.push(Some(o.arg)), at: acc.at + 1 }
+              });
+          let e = entered(cx, args.st, a.func, a.args, args.args, which, c.span);
+          let body = match which {
+            None -> match a.func.node {
+              NKnown(k) -> lowered(e.cx, e.st, k.lambda.body, false),
+              _ -> refuse(e.st, Calling, b"a body run in place that is no lambda"),
             },
-            stops: false,
-          }), at)
+            Some(n) ->
+              a.args.fold({ at: 0, out: refuse(e.st, Calling, b"a step that is no lambda") },
+                |acc: { at: Int, out: Lowered }, x: Code|
+                  {
+                    at: acc.at + 1,
+                    out: if acc.at != n { acc.out } else {
+                      match x.node { NLambda(l) -> lowered(e.cx, e.st, l.body, false), _ -> acc.out }
+                    },
+                  }).out,
+          };
+          left(cx, args.st, e, body, which, c.span)
         },
-        _ -> refuse(st, Calling, b"a call of a name that is no function"),
-      }
-    },
-  }
-
-/// The type an operand holds.
-pub fn type_of(a: Arg) -> Type =
-  match a {
-    AVar(v) -> v.ty,
-    AInt(_) -> named_type(b"Int"),
-    ABool(_) -> named_type(b"Bool"),
-    AFloat(_) -> named_type(b"Float"),
-    ANum(n) -> named_type(width_name(n.width)),
-    _ -> named_type(b"Int"),
-  }
-
-fn width_named(name: Bytes) -> Option<Width> =
-  if name == b"U8" { Some({ bits: 8, signed: false }) }
-  else if name == b"U16" { Some({ bits: 16, signed: false }) }
-  else if name == b"U32" { Some({ bits: 32, signed: false }) }
-  else if name == b"U64" { Some({ bits: 64, signed: false }) }
-  else if name == b"I8" { Some({ bits: 8, signed: true }) }
-  else if name == b"I16" { Some({ bits: 16, signed: true }) }
-  else if name == b"I32" { Some({ bits: 32, signed: true }) }
-  else if name == b"I64" { Some({ bits: 64, signed: true }) }
-  else if name == b"U128" { Some({ bits: 128, signed: false }) }
-  else if name == b"I128" { Some({ bits: 128, signed: true }) }
-  else { None }
-
-fn width_name(w: Width) -> Bytes =
-  Bytes::concat_all([if w.signed { b"I" } else { b"U" }, ascii_of_int(w.bits)])
-
-/// `m.<name>` of `src` lowered, under `schemes` for the definitions it calls, each a function of
-/// the named types.
-fn form_of(src: Bytes, name: Bytes, sigs: List<{ name: Bytes, params: List<Bytes>, ret: Bytes }>) -> Result<Fn, Bytes> / {abort.raise} = {
-  let schemes = sigs.fold(Map::new(), |m: Map<Bytes, Scheme>, s: { name: Bytes, params: List<Bytes>, ret: Bytes }|
-    m.insert(qualify(b"m", s.name), {
-      ty_vars: [],
-      row_vars: [],
-      label_vars: [],
-      ty: TyFn({ params: s.params.map(named_type), ret: named_type(s.ret), effects: row_empty() }),
-    }));
-  match parse_all([{ name: b"m", src: src }]).get(0).module.module.items.fold(None, |acc: Option<FnDef>, i: Item|
-      match i { IFn(d) -> if d.name.name == name { Some(d) } else { acc }, _ -> acc }) {
-    None -> Err(b"no such definition"),
-    Some(d) -> match schemes.get(qualify(b"m", name)) {
-      Some(sc) -> match sc.ty {
-        TyFn(f) -> match lower_to_emit(d.params.map(|p: Param| p.name.name), [], Map::new(), d.body) {
-          Some(l) -> match lowered_fn(
-              {
-                module: b"m",
-                key: Named(qualify(b"m", name)),
-                base: d.span.start,
-                params: f.params,
-                answer: f.ret,
-                schemes: schemes,
-                typed: Map::new(),
-              },
-              l.code,
-            ) {
-            Ok(form) -> Ok(form),
-            Err(no) -> Err(no.why),
+        Some(ToValue) -> {
+          let f = lowered(cx, st, a.func, false);
+          let args = a.args.fold({ st: f.st, args: [] }, |acc: { st: Lowering, args: List<Arg> }, x: Code| {
+            let o = lowered(cx, acc.st, x, false);
+            { st: o.st, args: acc.args.push(o.arg) }
+          });
+          applied(cx, args.st, f.arg, args.args, tail, c.span)
+        },
+        Some(t) -> {
+          let args = a.args.fold({ st: st, args: [] }, |acc: { st: Lowering, args: List<Arg> }, x: Code| {
+            let o = lowered(cx, acc.st, x, false);
+            { st: o.st, args: acc.args.push(o.arg) }
+          });
+          match t {
+            ToCtor(name) -> constructed(cx, args.st, name, args.args, c.span),
+            ToBuiltin(name) -> builtin(cx, args.st, name, args.args, c.span),
+            ToDef(full) -> called(cx, args.st, full, args.args, tail, c.span),
+            _ -> refuse(args.st, Spine, b"a target taken above"),
+          }
+        },
+      },
+      NList(l) -> {
+        let items = l.items.fold({ st: st, args: [] }, |acc: { st: Lowering, args: List<Arg> }, x: Code| {
+          let o = lowered(cx, acc.st, x, false);
+          { st: o.st, args: acc.args.push(o.arg) }
+        });
+        listed(cx, items.st, items.args, c.span)
+      },
+      NRecord(r) -> {
+        let fs = r.fields.fold({ st: st, fields: [] },
+          |acc: { st: Lowering, fields: List<{ name: Bytes, arg: Arg }> }, f: CodeField| {
+            let o = lowered(cx, acc.st, f.value, false);
+            { st: o.st, fields: acc.fields.push({ name: f.name, arg: o.arg }) }
+          });
+        recorded(cx, fs.st, fs.fields, c.span)
+      },
+      NField(f) -> field(cx, lowered(cx, st, f.base, false), f.field, c.span),
+      NUpdate(u) -> {
+        let b = lowered(cx, st, u.base, false);
+        let sets = u.sets.fold({ st: b.st, fields: [] },
+          |acc: { st: Lowering, fields: List<{ name: Bytes, arg: Arg }> }, f: CodeField| {
+            let o = lowered(cx, acc.st, f.value, false);
+            { st: o.st, fields: acc.fields.push({ name: f.name, arg: o.arg }) }
+          });
+        updated(cx, sets.st, b.arg, u.copies, sets.fields, c.span)
+      },
+      NMatch(m) -> {
+        let s = lowered(cx, st, m.scrutinee, false);
+        let arms = m.arms.fold({ after: s.st, out: [] }, |acc: { after: Lowering, out: List<Armed> }, arm: CodeArm| {
+          let o = arm_opened(cx, continued(opened(s.st), acc.after), s.arg, arm);
+          match arm.guard {
+            None -> {
+              let b = lowered(cx, o, arm.body, tail);
+              { after: b.st, out: acc.out.push({ arm: arm, guard: None, body: b }) }
+            },
+            Some(g) -> {
+              let gl = lowered(cx, o, g, false);
+              let b = lowered(cx, opened(gl.st), arm.body, tail);
+              { after: b.st, out: acc.out.push({ arm: arm, guard: Some(gl), body: b }) }
+            },
+          }
+        });
+        closed(cx, s.st, s.arg, arms.out, arms.after, tail, c.span)
+      },
+      NPerform(p) -> {
+        let lb = match p.label {
+          Some(lc) -> {
+            let o = lowered(cx, st, lc, false);
+            { st: o.st, arg: Some(o.arg) }
           },
-          None -> Err(b"not lowered"),
-        },
-        _ -> Err(b"no function"),
+          None -> { st: st, arg: None },
+        };
+        let args = p.args.fold({ st: lb.st, args: [] }, |acc: { st: Lowering, args: List<Arg> }, x: Code| {
+          let o = lowered(cx, acc.st, x, false);
+          { st: o.st, args: acc.args.push(o.arg) }
+        });
+        performed(cx, args.st, { effect: p.effect, op: p.op, resource: p.resource }, lb.arg, args.args, c.span)
       },
-      None -> Err(b"no scheme"),
-    },
-  }
-}
-
-fn local(id: Int, ty: Bytes) -> Var = { id: id, ty: named_type(ty), rep: held_as(named_type(ty)) }
-
-test "an if that answers a value joins in a variable of the type its arms answer" {
-  let f = form_of(b"fn pick(c: Bool, a: Int, b: Int) -> Int = if c { a } else { b }\n", b"pick", [
-    { name: b"pick", params: [b"Bool", b"Int", b"Int"], ret: b"Int" },
-  ]);
-  let j = local(3, b"Int");
-  assert_eq(
-    match f { Ok(x) -> Ok(x.body), Err(why) -> Err(why) },
-    Ok([
-      Decl(j),
-      If({
-        cond: AVar(local(0, b"Bool")),
-        then: [Set({ var: j, arg: AVar(local(1, b"Int")) })],
-        otherwise: [Set({ var: j, arg: AVar(local(2, b"Int")) })],
-      }),
-      Return(AVar(j)),
-    ]),
-  )
-}
-
-test "a self call in tail position restarts the body, and a join's restarting arm sets nothing" {
-  let f = form_of(
-    b"fn total(n: Int, acc: Int) -> Int = if n == 0 { acc } else { total(n - 1, acc) }\n",
-    b"total",
-    [{ name: b"total", params: [b"Int", b"Int"], ret: b"Int" }],
-  );
-  match f {
-    Err(why) -> assert_eq(why, b""),
-    Ok(x) -> match x.body.at(2) {
-      Some(If(i)) -> {
-        assert_eq(i.then.len(), 1);
-        assert_eq(i.otherwise.at(i.otherwise.len() - 1), Some(Restart([AVar(local(3, b"Int")), AVar(local(1, b"Int"))])))
+      NLabel(n) -> label(cx, st, n, c.span),
+      NLambda(l) -> {
+        let frame = { params: l.params, size: l.size, captures: l.captures };
+        let o = lambda_opened(cx, st, frame, l.at);
+        closure(cx, st, lowered(o.cx, o.st, l.body, true), frame, l.at)
       },
-      other -> assert_eq(other, None),
-    },
+      NSimulate(x) -> {
+        let frame = { params: 0, size: x.size, captures: x.captures };
+        let o = lambda_opened(cx, st, frame, x.body.span);
+        let k = closure(cx, st, lowered(o.cx, o.st, x.body, true), frame, x.body.span);
+        simulated(cx, k.st, k.arg, c.span)
+      },
+      NParallel(pr) -> {
+        let bs = pr.branches.fold({ st: st, args: [] }, |acc: { st: Lowering, args: List<Arg> }, x: Code| {
+          let o = lowered(cx, acc.st, x, false);
+          { st: o.st, args: acc.args.push(o.arg) }
+        });
+        branched(cx, bs.st, bs.args, pr.rooted, c.span)
+      },
+      NHandle(h) -> {
+        let clauses = h.clauses.fold({ st: st, out: [] },
+          |acc: { st: Lowering, out: List<ClauseMade> }, cl: CodeClause| {
+            let lb = match cl.label {
+              Some(lc) -> {
+                let o = lowered(cx, acc.st, lc, false);
+                { st: o.st, arg: Some(o.arg) }
+              },
+              None -> { st: acc.st, arg: None },
+            };
+            let frame = clause_frame(cx, cl);
+            let o = lambda_opened(cx, lb.st, frame, cl.at);
+            let k = closure(cx, lb.st, lowered(o.cx, o.st, cl.body, true), frame, cl.at);
+            { st: k.st, out: acc.out.push({ label: lb.arg, closure: k.arg }) }
+          });
+        let ret = match h.ret {
+          Some(r) -> {
+            let frame = { params: 1, size: r.size, captures: r.captures };
+            let o = lambda_opened(cx, clauses.st, frame, r.body.span);
+            let k = closure(cx, clauses.st, lowered(o.cx, o.st, r.body, true), frame, r.body.span);
+            { st: k.st, arg: Some(k.arg) }
+          },
+          None -> { st: clauses.st, arg: None },
+        };
+        let body = match body_frame(cx, h) {
+          Some(frame) -> {
+            let o = lambda_opened(cx, ret.st, frame, h.body.span);
+            closure(cx, ret.st, lowered(o.cx, o.st, h.body, true), frame, h.body.span)
+          },
+          None -> lowered(cx, opened(ret.st), h.body, false),
+        };
+        handled(cx, ret.st, body, clauses.out, ret.arg, h, c.span)
+      },
+    }
   }
-}
-
-test "&& joins a Bool from its right operand where the left one does not decide" {
-  let f = form_of(b"fn both(a: Bool, b: Bool) -> Bool = a && b\n", b"both", [
-    { name: b"both", params: [b"Bool", b"Bool"], ret: b"Bool" },
-  ]);
-  let j = local(2, b"Bool");
-  assert_eq(
-    match f { Ok(x) -> Ok(x.body), Err(why) -> Err(why) },
-    Ok([
-      Decl(j),
-      If({
-        cond: AVar(local(0, b"Bool")),
-        then: [Set({ var: j, arg: AVar(local(1, b"Bool")) })],
-        otherwise: [Set({ var: j, arg: ABool(false) })],
-      }),
-      Return(AVar(j)),
-    ]),
-  )
-}
-
-test "a body outside the scalar subset is refused with what it held" {
-  let sigs = [
-    { name: b"name", params: [b"String"], ret: b"String" },
-    { name: b"pair", params: [b"Int"], ret: b"Int" },
-    { name: b"upper", params: [b"String"], ret: b"Int" },
-  ];
-  let src = b"fn name(s: String) -> String = s\nfn pair(x: Int) -> Int = match x { 0 -> 1, _ -> 2 }\nfn upper(s: String) -> Int = 1\n";
-  assert_eq(match form_of(src, b"name", sigs) { Ok(_) -> b"", Err(w) -> w }, b"a parameter or answer held as a word");
-  assert_eq(match form_of(src, b"pair", sigs) { Ok(_) -> b"", Err(w) -> w }, b"a node outside the scalar subset");
-  assert_eq(
-    match form_of(b"fn g(x: Int) -> Int = upper(x)\n", b"g", sigs.push({ name: b"g", params: [b"Int"], ret: b"Int" })) {
-      Ok(_) -> b"",
-      Err(w) -> w,
-    },
-    b"a call of a definition taking or answering a word",
-  )
-}
