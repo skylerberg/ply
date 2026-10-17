@@ -4,19 +4,20 @@ import std.bytes (ascii_of_int)
 import parsing (span_between)
 import types (TyCon)
 import layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt, NodeLen, LeafAt,
-               KidAt, TailPush, TailSet, LeafSet, TailStart, NewBranch, MapRoot, NodeCount,
-               MapHeight, NodeKey, NodeValue, NodeKid, KidMax, KidSize, NewLeaf, NewMapBranch,
-               PairPut, PairSet, KidBack, KidPut, KidDrop, layouts)
+               KidAt, TailPush, TailSet, LeafSet, RootSwap, KidSwap, TailStart, Spill, NewBranch,
+               MapRoot, NodeCount, MapHeight, NodeKey, NodeValue, NodeKid, KidMax, KidSize, NewLeaf,
+               NewMapBranch, PairPut, PairSet, PairTake, LeafCut, BranchCut, KidOut, KidBack,
+               KidPut, KidDrop, MapSwap, layouts)
 import emit (builtin_helper)
 import emit.pieces (Text, Hole, ShapeOf, spelled)
-import emit.tir (Rep, RInt, RNum, RFloat, RDec, RWord, Var, Arg, AVar, AInt, AZero, Made, MList,
-                 Uses, rep_of_arg)
+import emit.tir (Rep, RInt, RNum, RFloat, RDec, RWord, RMaybe, RFlat, Var, Arg, AVar, AInt, AZero,
+                 Made, MList, Uses, rep_of_arg, counted)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew,
-                            ArraySet, ArrayOfList, ArrayGet, Element, Bits, IntBits, WidthBits,
-                            FloatBits, DecimalBits)
-import emit.print.text (Printing, Place, printing, line, pad, pieces, temp, name_of, arg_text,
-                        assigned, site, check, shape_at)
-import emit.print.made (c_type, as_word, word_as)
+                            ArraySet, ArrayOfList, ArrayGet, ColumnField, Element, Words, Bits,
+                            Payloads, Records, IntBits, WidthBits, FloatBits, DecimalBits)
+import emit.print.text (Printing, Place, printing, line, pad, pieces, temp, named, name_of,
+                        arg_text, assigned, site, check, shape_at, zero, part_names)
+import emit.print.made (c_type, c_types, as_word, word_as)
 
 /// A list or an array made of `m.args`.
 pub fn contained(
@@ -46,7 +47,7 @@ pub fn container_op(
     Some(v) -> match op {
       Length ->
         assigned(
-          pr,
+          site(p, pr),
           p.depth,
           v,
           c_type(v.rep),
@@ -54,7 +55,7 @@ pub fn container_op(
         ),
       Elements ->
         assigned(
-          pr,
+          site(p, pr),
           p.depth,
           v,
           c_type(v.rep),
@@ -119,6 +120,7 @@ pub fn container_op(
       ArraySet(e) -> array_set(p, pr, v, e, args),
       ArrayOfList(e) -> array_of_list(p, pr, v, e, args),
       ArrayGet(e) -> array_get(p, pr, v, e, args),
+      ColumnField(c) -> column_printed(p, pr, v, c.k, c.column, args),
     },
   }
 }
@@ -406,14 +408,292 @@ fn laid_printed(
         ]),
       )
     },
-    _ ->
-      line(
-        pr,
-        p.depth,
-        b"/* a write in place answering a record, which this printer does not write yet */",
-      ),
+    _ -> record_printed(p, pr, v, op, args),
   }
 }
+
+/// A word an extern answering a record sets field `name` from, and whether it is an item, read as
+/// the record holds the field's type, or a word held as the field already is.
+type Answered = { name: Bytes, word: Bytes, item: Bool }
+
+/// Extern `op`, which answers a record of what it wrote and what it took out, into `v`, held as the
+/// record's fields: the object it takes written in a temporary of its own, made writable where
+/// another holds it too, and each field set from the word that holds it, the record's word none.
+fn record_printed(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Intrinsic,
+  args: List<Arg>,
+) -> Printing / {abort.raise} = {
+  let laid = layouts();
+  let d = p.depth;
+  let held = temp(pr);
+  let a = held.name;
+  let started = line(
+    held.pr,
+    d,
+    Bytes::concat_all([b"Word ", a, b" = ", operand(pr, args, 0), b";"]),
+  );
+  let i = operand(pr, args, 1);
+  let index = Bytes::concat_all([b"(", i, b")"]);
+  let header = |field: Bytes| Bytes::concat_all([b"ply_obj(", a, b")->", field]);
+  let at = |k: Bytes| slot_of(a, k);
+  let node_writable = Bytes::concat_all([a, b" = rt_node_writable_p(ctx, ", a, b");"]);
+  let shared = |writable: Bytes|
+    Bytes::concat_all([b"if (", header(b"rc"), b" != 1) ", writable, b" "]);
+  let list_writable = Bytes::concat_all([
+    a,
+    b" = rt_list_writable_p(ctx, ",
+    a,
+    b", ",
+    header(laid.list.room),
+    b");",
+  ]);
+  let whole = |name: Bytes, word: Bytes| { name: name, word: word, item: false };
+  // A word taken out of the object, and the record set from it and the object.
+  let took = |text: (Bytes) -> Bytes, fields: (Bytes) -> List<Answered>| {
+    let t = temp(started);
+    fields_set(p, line(t.pr, d, text(t.name)), v, fields(t.name))
+  };
+  let cut = |kind: Int, runs: List<{ from: Int, width: Int }>|
+    took(
+      |r: Bytes| {
+        let rest = Bytes::concat_all([b"((int64_t)", header(b"len"), b" - ", index, b")"]);
+        Bytes::concat_all([
+          shared(node_writable),
+          b"Word ",
+          r,
+          b" = rt_node_p(ctx, ",
+          ascii_of_int(kind),
+          b"); ",
+          Bytes::concat_all(
+            runs.map(|run: { from: Int, width: Int }|
+              Bytes::concat_all([
+                b"memcpy(&",
+                slot_of(r, ascii_of_int(run.from)),
+                b", &",
+                at(
+                  Bytes::concat_all([
+                    ascii_of_int(run.from),
+                    b" + ",
+                    ascii_of_int(run.width),
+                    b" * ",
+                    index,
+                  ]),
+                ),
+                b", (size_t)(",
+                ascii_of_int(run.width),
+                b" * ",
+                rest,
+                b") * sizeof(Word)); ",
+              ])),
+          ),
+          b"ply_obj(",
+          r,
+          b")->len = (uint32_t)",
+          rest,
+          b"; ",
+          header(b"len"),
+          b" = (uint32_t)",
+          index,
+          b";",
+        ])
+      },
+      |r: Bytes| [whole(b"left", a), whole(b"right", r)],
+    );
+  match op {
+    OfList(RootSwap) -> {
+      let root = at(ascii_of_int(laid.list.root));
+      took(
+        |old: Bytes|
+          Bytes::concat_all([
+            shared(list_writable),
+            b"Word ",
+            old,
+            b" = ",
+            root,
+            b"; ",
+            root,
+            b" = ",
+            i,
+            b";",
+          ]),
+        |old: Bytes| [whole(b"list", a), whole(b"old", old)],
+      )
+    },
+    OfList(KidSwap) ->
+      took(
+        |old: Bytes|
+          Bytes::concat_all([
+            shared(node_writable),
+            b"Word ",
+            old,
+            b" = 0; if (",
+            i,
+            b" < (int64_t)",
+            header(b"len"),
+            b") ",
+            old,
+            b" = ",
+            at(i),
+            b"; else ",
+            header(b"len"),
+            b" = (uint32_t)(",
+            i,
+            b") + 1; ",
+            at(i),
+            b" = ",
+            operand(pr, args, 2),
+            b";",
+          ]),
+        |old: Bytes| [whole(b"node", a), whole(b"old", old)],
+      ),
+    OfList(Spill) -> {
+      let width = ascii_of_int(laid.trie.width);
+      took(
+        |leaf: Bytes|
+          Bytes::concat_all([
+            counted_writable(a, list_writable, header(laid.list.tail_len)),
+            b" Word ",
+            leaf,
+            b" = rt_node_p(ctx, ",
+            ascii_of_int(laid.trie.leaf),
+            b"); memcpy(ply_words(",
+            leaf,
+            b"), &",
+            at(past(laid.list.tail, b"0")),
+            b", ",
+            width,
+            b" * sizeof(Word)); ply_obj(",
+            leaf,
+            b")->len = ",
+            width,
+            b"; ",
+            header(laid.list.tail_len),
+            b" = 0;",
+          ]),
+        |leaf: Bytes| [whole(b"leaf", leaf), whole(b"list", a)],
+      )
+    },
+    OfMap(PairTake) -> {
+      let pair = Bytes::concat_all([b"2 * ", index]);
+      let key = temp(started);
+      let value = temp(key.pr);
+      let taken = line(
+        value.pr,
+        d,
+        Bytes::concat_all([
+          counted_writable(a, node_writable, Bytes::concat_all([b"2 * (int64_t)", header(b"len")])),
+          b" Word ",
+          key.name,
+          b" = ",
+          at(pair),
+          b"; Word ",
+          value.name,
+          b" = ",
+          at(pair.concat(b" + 1")),
+          b"; memmove(&",
+          at(Bytes::concat_all([pair, b" + 2 + -2"])),
+          b", &",
+          at(Bytes::concat_all([pair, b" + 2"])),
+          b", (size_t)(2 * ((int64_t)",
+          header(b"len"),
+          b" - ",
+          index,
+          b" - 1)) * sizeof(Word)); ",
+          header(b"len"),
+          b" -= 1;",
+        ]),
+      );
+      fields_set(p, taken, v, [
+        { name: b"key", word: key.name, item: true },
+        whole(b"node", a),
+        { name: b"value", word: value.name, item: true },
+      ])
+    },
+    OfMap(LeafCut) -> cut(laid.tree.leaf, [{ from: 0, width: 2 }]),
+    OfMap(BranchCut) ->
+      cut(laid.tree.branch, [
+        { from: 0, width: 1 },
+        { from: laid.tree.keys, width: 1 },
+        { from: laid.tree.sizes, width: 1 },
+      ]),
+    OfMap(KidOut) ->
+      took(
+        |kid: Bytes|
+          Bytes::concat_all([
+            shared(node_writable),
+            b"Word ",
+            kid,
+            b" = ",
+            at(index),
+            b"; ",
+            at(index),
+            b" = 0;",
+          ]),
+        |kid: Bytes| [whole(b"kid", kid), whole(b"node", a)],
+      ),
+    OfMap(MapSwap) -> {
+      let root = at(ascii_of_int(laid.map.root));
+      took(
+        |old: Bytes|
+          Bytes::concat_all([
+            b"if (",
+            header(b"rc"),
+            b" != 1) ",
+            a,
+            b" = rt_map_writable_p(ctx, ",
+            a,
+            b"); Word ",
+            old,
+            b" = ",
+            root,
+            b"; ",
+            root,
+            b" = ",
+            i,
+            b"; ",
+            header(laid.map.height),
+            b" = (uint32_t)(",
+            operand(pr, args, 2),
+            b"); ",
+            header(b"len"),
+            b" = (uint32_t)(",
+            operand(pr, args, 3),
+            b");",
+          ]),
+        |old: Bytes| [whole(b"map", a), whole(b"old", old)],
+      )
+    },
+    _ -> line(pr, d, b"/* an extern answering no record, printed as one that does */"),
+  }
+}
+
+/// `v`, a record held as its fields, each set from the word `fields` names for it: an item read as
+/// the field holds it, its word let go where a scalar is read out of it; the record's word none.
+fn fields_set(p: Place, pr: Printing, v: Var, fields: List<Answered>) -> Printing = {
+  let n = named(pr, v);
+  let ns = part_names(n.name, v.rep);
+  let ts = c_types(v.rep);
+  let ls = match v.rep { RFlat(x) -> x, _ -> [] };
+  let set = range(0, ls.len()).fold(n.pr, |q: Printing, k: Int|
+    match ls.at(k) {
+      None -> q,
+      Some(l) -> {
+        let value = match fields.find(|x: Answered| x.name == l.name) {
+          Some(x) -> if !x.item { x.word.concat(b";") }
+          else if counted(l.rep) { word_as(x.word, l.rep).concat(b";") }
+          else { Bytes::concat_all([word_as(x.word, l.rep), b"; ply_dec(ctx, ", x.word, b");"]) },
+          None -> b"0;",
+        };
+        line(q, p.depth, Bytes::concat_all([nth(ts, k), b" ", nth(ns, k), b" = ", value]))
+      },
+    });
+  line(set, p.depth, Bytes::concat_all([nth(ts, ls.len()), b" ", nth(ns, ls.len()), b" = 0;"]))
+}
+
+fn nth(xs: List<Bytes>, k: Int) -> Bytes = match xs.at(k) { Some(x) -> x, None -> b"" }
 
 fn slot_of(w: Bytes, at: Bytes) -> Bytes = Bytes::concat_all([b"ply_words(", w, b")[", at, b"]"])
 
@@ -531,7 +811,7 @@ fn array_new(
   );
   let laid = allocated({ ..p, depth: d + 1 }, line(to_runtime, d, b"} else {"), e, a, n);
   let i = temp(laid);
-  let shared = if e.bits != None { i.pr } else {
+  let shared = if as_bits(e) { i.pr } else {
     line(
       i.pr,
       d + 1,
@@ -668,8 +948,16 @@ fn array_set(
     ]),
   );
   let noted = line(copied, d + 1, b"rt_note_update_p(ctx, in_place, in_place ? 0 : n);");
-  let dropped = if e.bits != None { noted }
-  else { line(noted, d + 1, Bytes::concat_all([b"ply_dec(ctx, ply_words(", a, b")[", i, b"]);"])) };
+  let dropped = match e.held {
+    Bits(_) -> noted,
+    Records(_) ->
+      line(
+        noted,
+        d + 1,
+        Bytes::concat_all([b"ply_drop_embedded(ctx, ", a, b", (int)(", i, b" * ", stride, b"));"]),
+      ),
+    _ -> line(noted, d + 1, Bytes::concat_all([b"ply_dec(ctx, ply_words(", a, b")[", i, b"]);"])),
+  };
   check(p, line(line(dropped, d + 1, element_written(a, i, e, x)), d, b"}"))
 }
 
@@ -708,10 +996,10 @@ fn array_of_list(
   let w = temp(i.pr);
   let at = Bytes::concat_all([i.name, b" * ", ascii_of_int(e.stride)]);
   let let_go = Bytes::concat_all([b" ply_dec(ctx, ", w.name, b");"]);
-  let stored = match e.bits {
-    Some(DecimalBits) ->
+  let stored = match e.held {
+    Bits(DecimalBits) ->
       Bytes::concat_all([b"ply_set_dec(", a, b", ", at, b", ply_dec_of(", w.name, b"));", let_go]),
-    Some(FloatBits) ->
+    Bits(FloatBits) ->
       Bytes::concat_all([
         b"ply_words(",
         a,
@@ -722,7 +1010,7 @@ fn array_of_list(
         b");",
         let_go,
       ]),
-    Some(b) ->
+    Bits(b) ->
       Bytes::concat_all([
         b"ply_words(",
         a,
@@ -733,7 +1021,10 @@ fn array_of_list(
         b");",
         let_go,
       ]),
-    None -> element_written(a, i.name, e, w.name),
+    // An `Option` arrives as its object, which the array holds as its payload's word.
+    Payloads ->
+      Bytes::concat_all([b"ply_words(", a, b")[", i.name, b"] = ", word_as(w.name, RMaybe), b";"]),
+    _ -> element_written(a, i.name, e, w.name),
   };
   let filled = line(
     line(
@@ -766,7 +1057,8 @@ fn array_of_list(
 }
 
 /// `Array::get(xs, i)` into `v`: a bounds-tested load of the element as the array holds it, a
-/// scalar's bits as the scalar and any other as its word, held without a count of its own.
+/// scalar's bits as the scalar, a record held in place as the address of its header there, and any
+/// other as its word, held without a count of its own.
 fn array_get(
   p: Place,
   pr: Printing,
@@ -798,13 +1090,107 @@ fn array_get(
     ]),
   );
   let word = |at: Bytes| Bytes::concat_all([b"ply_words(", a, b")[", at, b"]"]);
-  assigned(tested, p.depth, v, c_type(v.rep), match e.bits {
-    Some(IntBits) -> Bytes::concat_all([b"(int64_t)(", word(i), b")"]),
-    Some(WidthBits(w)) -> Bytes::concat_all([b"(", c_type(RNum(w)), b")(", word(i), b")"]),
-    Some(FloatBits) -> Bytes::concat_all([b"ply_f64(", word(i), b")"]),
-    Some(DecimalBits) -> Bytes::concat_all([b"ply_dec_at(", a, b", (", i, b") * 2)"]),
-    None -> word(i),
+  assigned(tested, p.depth, v, c_type(v.rep), match e.held {
+    Bits(IntBits) -> Bytes::concat_all([b"(int64_t)(", word(i), b")"]),
+    Bits(WidthBits(w)) -> Bytes::concat_all([b"(", c_type(RNum(w)), b")(", word(i), b")"]),
+    Bits(FloatBits) -> Bytes::concat_all([b"ply_f64(", word(i), b")"]),
+    Bits(DecimalBits) -> Bytes::concat_all([b"ply_dec_at(", a, b", (", i, b") * 2)"]),
+    Records(_) ->
+      Bytes::concat_all([
+        b"(Word)(intptr_t)(ply_words(",
+        a,
+        b") + ",
+        i,
+        b" * ",
+        ascii_of_int(e.stride),
+        b")",
+      ]),
+    _ -> word(i),
   })
+}
+
+/// Field `k` of record `i` of the `Columns` `xs` into `v`: element `i` of the array `xs` holds the
+/// field's column in, loaded as the column holds it with a count of its own taken, where `xs` is laid
+/// out in columns and holds that record; read by the runtime otherwise, which raises as
+/// `Columns::get` does.
+fn column_printed(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  k: Int,
+  e: Element,
+  args: List<Arg>,
+) -> Printing / {abort.raise} = {
+  let xs = operand(pr, args, 0);
+  let i = operand(pr, args, 1);
+  let d = p.depth;
+  let column = Bytes::concat_all([b"ply_words(", xs, b")[", ascii_of_int(k), b"]"]);
+  let started = assigned(site(p, pr), d, v, c_type(v.rep), zero(v.rep));
+  let out = name_of(started, v);
+  let opened = line(
+    started,
+    d,
+    Bytes::concat_all([
+      b"if (ply_obj(",
+      xs,
+      b")->kind == PLY_KIND_COLUMNS && (uint64_t)",
+      i,
+      b" < (uint64_t)ply_array_len(",
+      column,
+      b")) {",
+    ]),
+  );
+  let word = |at: Bytes| Bytes::concat_all([b"ply_words(", column, b")[", at, b"]"]);
+  let at = Bytes::concat_all([b"(", i, b") * ply_obj(", column, b")->aux"]);
+  let read = match e.held {
+    Records(_) -> Bytes::concat_all([b"((Word)(intptr_t)(ply_words(", column, b") + ", at, b"))"]),
+    Bits(IntBits) -> Bytes::concat_all([b"(int64_t)(", word(at), b")"]),
+    Bits(WidthBits(w)) -> Bytes::concat_all([b"(", c_type(RNum(w)), b")(", word(at), b")"]),
+    Bits(FloatBits) -> Bytes::concat_all([b"ply_f64(", word(at), b")"]),
+    Bits(DecimalBits) -> Bytes::concat_all([b"ply_dec_at(", column, b", ", at, b")"]),
+    Payloads -> word(i),
+    Words -> word_as(word(i), v.rep),
+  };
+  let fast = line(
+    opened,
+    d + 1,
+    Bytes::concat_all([
+      out,
+      b" = ",
+      read,
+      b";",
+      if counted(v.rep) { Bytes::concat_all([b" ply_inc(", out, b");"]) } else { b"" },
+    ]),
+  );
+  let call = Bytes::concat_all([
+    b"rt_columns_field_p(ctx, ",
+    xs,
+    b", ",
+    i,
+    b", ",
+    ascii_of_int(k),
+    b")",
+  ]);
+  let inside = { ..p, depth: d + 1 };
+  let otherwise = line(fast, d, b"} else {");
+  let slow = match v.rep {
+    RWord -> check(inside, line(otherwise, d + 1, Bytes::concat_all([out, b" = ", call, b";"]))),
+    // The runtime answers the `Option`'s object, which opening takes.
+    RMaybe ->
+      check(
+        inside,
+        line(otherwise, d + 1, Bytes::concat_all([out, b" = rt_maybe_open_p(ctx, ", call, b");"])),
+      ),
+    _ -> {
+      let w = temp(otherwise);
+      line(
+        check(inside, line(w.pr, d + 1, Bytes::concat_all([b"Word ", w.name, b" = ", call, b";"]))),
+        d + 1,
+        Bytes::concat_all([out, b" = ", word_as(w.name, v.rep), b"; ply_dec(ctx, ", w.name, b");"]),
+      )
+    },
+  };
+  line(slow, d, b"}")
 }
 
 /// The array `a`, a local already declared, made to hold `n` elements as `e` lays them out, for the
@@ -822,7 +1208,10 @@ fn allocated(p: Place, pr: Printing, e: Element, a: Bytes, n: Bytes) -> Printing
       p.depth,
       Bytes::concat_all([b"int64_t ", width.name, b" = ", n, b" * ", stride, b";"]),
     );
-    let shape = shape_at(sized, e.shape);
+    let shape = e.shapes.fold(
+      { pr: sized, at: 0 },
+      |acc: { pr: Printing, at: Int }, s: List<Bytes>| shape_at(acc.pr, s),
+    );
     let laid = line(
       pieces(shape.pr, [
         Text(Bytes::concat_all([pad(p.depth), a, b" = rt_alloc_p(ctx, 15, ", width.name, b", "])),
@@ -880,30 +1269,47 @@ fn allocated(p: Place, pr: Printing, e: Element, a: Bytes, n: Bytes) -> Printing
               b" + b / 64] |= (Word)1 << (b % 64); }",
             ]),
           )),
-        p.depth,
+        p.depth + 1,
         b"}",
       )
     }
   }
 
 /// Whether an array holds elements laid out as `e` in its own words.
-fn in_place(e: Element) -> Bool = e.bits != None || e.shape.len() > 0
+fn in_place(e: Element) -> Bool = e.held != Words
 
-/// Element `i` of the array `a` set to `x`, held as `e` holds an element, which the array takes.
+/// Whether an array holds elements laid out as `e` as a scalar's bits, which hold no count.
+fn as_bits(e: Element) -> Bool = match e.held { Bits(_) -> true, _ -> false }
+
+/// Element `i` of the array `a` set to `x`, held as `e` holds an element, which the array takes: a
+/// record copied in place behind its header, a scalar as its bits, anything else as its word.
 fn element_written(a: Bytes, i: Bytes, e: Element, x: Bytes) -> Bytes = {
   let at = Bytes::concat_all([i, b" * ", ascii_of_int(e.stride)]);
-  match e.bits {
-    Some(DecimalBits) -> Bytes::concat_all([b"ply_set_dec(", a, b", ", at, b", ", x, b");"]),
-    Some(FloatBits) ->
+  match e.held {
+    Bits(DecimalBits) -> Bytes::concat_all([b"ply_set_dec(", a, b", ", at, b", ", x, b");"]),
+    Bits(FloatBits) ->
       Bytes::concat_all([b"ply_words(", a, b")[", at, b"] = ply_f64_bits(", x, b");"]),
-    Some(_) -> Bytes::concat_all([b"ply_words(", a, b")[", at, b"] = (Word)(", x, b");"]),
-    None -> Bytes::concat_all([b"ply_words(", a, b")[", i, b"] = ", x, b";"]),
+    Bits(_) -> Bytes::concat_all([b"ply_words(", a, b")[", at, b"] = (Word)(", x, b");"]),
+    Records(r) ->
+      Bytes::concat_all([
+        b"ply_embed(ctx, ",
+        a,
+        b", (int)(",
+        at,
+        b"), ",
+        x,
+        b", ",
+        ascii_of_int(r.tail),
+        b");",
+      ]),
+    _ -> Bytes::concat_all([b"ply_words(", a, b")[", i, b"] = ", x, b";"]),
   }
 }
 
-/// An element `x` as the word the runtime's builtin takes: a scalar boxed.
+/// An element `x` as the word the runtime's builtin takes: a scalar boxed, an `Option` made its
+/// object.
 fn element_word(e: Element, x: Bytes) -> Bytes =
-  match e.bits { Some(b) -> as_word(x, bits_rep(b)), None -> x }
+  match e.held { Bits(b) -> as_word(x, bits_rep(b)), Payloads -> as_word(x, RMaybe), _ -> x }
 
 fn bits_rep(b: Bits) -> Rep =
   match b { IntBits -> RInt, WidthBits(w) -> RNum(w), FloatBits -> RFloat, DecimalBits -> RDec }
@@ -953,7 +1359,7 @@ test "an empty list still lays out a word for C to initialise, and the list fail
 }
 
 test "an array of scalars is laid out by the shape of its element, which the unit's table numbers" {
-  let e = { bits: Some(IntBits), stride: 1, shape: [b"e!int"], counted: [] };
+  let e = { held: Bits(IntBits), stride: 1, shapes: [[b"e!int"]], counted: [] };
   let pr = container_op(
     at_top(),
     printing(Map::new().insert(0, b"p0")),
@@ -977,4 +1383,23 @@ test "an array of scalars is laid out by the shape of its element, which the uni
     text.index_of(b"t1 = builtin_array_new_p(ctx, ") != None,
     Some(String::of_bytes_lossy(text)),
   )
+}
+
+test "a field of a Columns' record is loaded from its column where the record is there, and read by the runtime else" {
+  let e = { held: Bits(FloatBits), stride: 1, shapes: [[b"x!f"]], counted: [] };
+  let pr = container_op(
+    at_top(),
+    printing(Map::new().insert(0, b"p0").insert(1, b"p1")),
+    Some(local(2, b"Float", RFloat)),
+    ColumnField({ k: 2, column: e }),
+    [AVar(local(0, b"Columns", RWord)), AVar(local(1, b"Int", RInt))],
+    { takes: [false, false], owned: true, fails: true, stops: false },
+  );
+  let text = spelled(pr.out);
+  let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
+  has(
+    b"if (ply_obj(p0)->kind == PLY_KIND_COLUMNS && (uint64_t)p1 < (uint64_t)ply_array_len(ply_words(p0)[2])) {",
+  );
+  has(b"t1 = ply_f64(ply_words(ply_words(p0)[2])[(p1) * ply_obj(ply_words(p0)[2])->aux]);");
+  has(b"Word t2 = rt_columns_field_p(ctx, p0, p1, 2);")
 }
