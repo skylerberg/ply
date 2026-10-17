@@ -1,0 +1,250 @@
+//! Ply values, as a lent effect hands them to the program in `packages/cli`.
+
+use ply_core::{Diagnostic, Severity, SourceMap, Span, Symbol, Value as PlyValue, codes};
+use std::sync::Arc;
+
+/// `Value::Record` holds an `Arc`, and its fields are not `Send`; every construction site says so.
+#[allow(clippy::arc_with_non_send_sync)]
+pub fn record(fields: Vec<(&str, PlyValue)>) -> PlyValue {
+    PlyValue::Record(Arc::new(
+        fields
+            .into_iter()
+            .map(|(name, value)| (Symbol::new(name), value))
+            .collect(),
+    ))
+}
+
+/// A constructor of a type the program declares, by its program-wide name.
+pub fn ctor(module: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
+    PlyValue::ctor(Symbol::new(format!("{module}.{name}")), args)
+}
+
+pub fn option(value: Option<PlyValue>) -> PlyValue {
+    match value {
+        Some(value) => PlyValue::ctor("Some", vec![value]),
+        None => PlyValue::ctor("None", Vec::new()),
+    }
+}
+
+pub fn count(n: usize) -> PlyValue {
+    PlyValue::Int(n as i64)
+}
+
+pub fn strings<'a>(items: impl IntoIterator<Item = &'a str>) -> PlyValue {
+    PlyValue::list(items.into_iter().map(PlyValue::str).collect())
+}
+
+/// A document this side wrote as `std.json.Json`: what a facility discloses about itself, which
+/// the program places under the keys its own report gives it.
+pub fn json(value: &serde_json::Value) -> PlyValue {
+    match value {
+        serde_json::Value::Null => ctor("std.json", "Null", Vec::new()),
+        serde_json::Value::Bool(b) => ctor("std.json", "Bool", vec![PlyValue::Bool(*b)]),
+        serde_json::Value::Number(n) => ctor("std.json", "Number", vec![number(n)]),
+        serde_json::Value::String(s) => ctor("std.json", "Str", vec![PlyValue::str(s)]),
+        serde_json::Value::Array(items) => ctor(
+            "std.json",
+            "Array",
+            vec![PlyValue::list(items.iter().map(json).collect())],
+        ),
+        serde_json::Value::Object(fields) => ctor(
+            "std.json",
+            "Object",
+            vec![PlyValue::map(
+                fields
+                    .iter()
+                    .map(|(key, value)| (PlyValue::str(key), json(value))),
+            )],
+        ),
+    }
+}
+
+/// A number written back through `Decimal`, which is what a `Json` number is. A magnitude it
+/// cannot hold is no count or ratio this side ever writes.
+fn number(n: &serde_json::Number) -> PlyValue {
+    PlyValue::Decimal(n.to_string().parse().unwrap_or_default())
+}
+
+/// `compiler.check.resolve.tables.Diag`, as `packages/cli/diagnostic.ply` renders it. A label carries
+/// the source id its span names, which is the index of its file in `places`. A carried value is
+/// said as what it is: only a crossing that hands the values over, [`raised_value`], keeps them.
+pub fn diag_value(diagnostic: &Diagnostic) -> PlyValue {
+    diag_record(diagnostic, &|text| diagnostic.described(text))
+}
+
+/// `diagnostic.Raised`: a runtime diagnostic beside the values its text names, which the
+/// program renders.
+pub fn raised_value(diagnostic: &Diagnostic) -> PlyValue {
+    record(vec![
+        ("diag", diag_record(diagnostic, &|text| text.to_string())),
+        (
+            "values",
+            PlyValue::list(
+                diagnostic
+                    .values
+                    .iter()
+                    .map(ply_core::reflect::value_of)
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn diag_record(diagnostic: &Diagnostic, text: &dyn Fn(&str) -> String) -> PlyValue {
+    record(vec![
+        ("code", PlyValue::bytes(diagnostic.code.as_bytes())),
+        ("notes", count(diagnostic.notes.len())),
+        (
+            "labels",
+            PlyValue::list(
+                diagnostic
+                    .labels
+                    .iter()
+                    .map(|l| {
+                        record(vec![
+                            ("module", PlyValue::Int(l.span.source.0 as i64)),
+                            ("start", PlyValue::Int(l.span.start as i64)),
+                            ("end", PlyValue::Int(l.span.end as i64)),
+                            ("primary", PlyValue::Bool(l.primary)),
+                            ("text", PlyValue::bytes(text(&l.message).as_bytes())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("text", PlyValue::bytes(b"")),
+        (
+            "message",
+            PlyValue::bytes(text(&diagnostic.message).as_bytes()),
+        ),
+        (
+            "notes_text",
+            PlyValue::list(
+                diagnostic
+                    .notes
+                    .iter()
+                    .map(|n| PlyValue::bytes(text(n).as_bytes()))
+                    .collect(),
+            ),
+        ),
+        (
+            "severity",
+            PlyValue::bytes(
+                match diagnostic.severity {
+                    Severity::Error => "error",
+                    Severity::Warning => "warning",
+                    Severity::Note => "note",
+                }
+                .as_bytes(),
+            ),
+        ),
+        (
+            "fixes",
+            PlyValue::list(
+                diagnostic
+                    .fixes
+                    .iter()
+                    .map(|f| {
+                        record(vec![
+                            ("title", PlyValue::bytes(f.title.as_bytes())),
+                            (
+                                "edits",
+                                PlyValue::list(
+                                    f.edits
+                                        .iter()
+                                        .map(|e| {
+                                            record(vec![
+                                                ("module", PlyValue::Int(e.span.source.0 as i64)),
+                                                ("start", PlyValue::Int(e.span.start as i64)),
+                                                ("end", PlyValue::Int(e.span.end as i64)),
+                                                ("text", PlyValue::bytes(e.text.as_bytes())),
+                                            ])
+                                        })
+                                        .collect(),
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+pub fn diags_value(diagnostics: &[Diagnostic]) -> PlyValue {
+    PlyValue::list(diagnostics.iter().map(diag_value).collect())
+}
+
+/// The modules a label can point into, in source-id order, which is what a label's index is.
+pub fn places_value(sources: &SourceMap) -> PlyValue {
+    PlyValue::list(
+        sources
+            .files()
+            .iter()
+            .map(|f| {
+                record(vec![
+                    ("path", PlyValue::str(f.path.display().to_string())),
+                    ("text", PlyValue::bytes(f.text.as_bytes())),
+                ])
+            })
+            .collect(),
+    )
+}
+
+// --- Reading records the program hands the machine -------------------------------------------
+
+pub fn field_of<'a>(
+    value: &'a PlyValue,
+    name: &str,
+    span: Span,
+) -> Result<&'a PlyValue, Diagnostic> {
+    match value {
+        PlyValue::Record(fields) => fields
+            .iter()
+            .find(|(k, _)| k.as_str() == name)
+            .map(|(_, value)| value)
+            .ok_or_else(|| missing(name, span)),
+        _ => Err(missing(name, span)),
+    }
+}
+
+/// An `Option` a caller built, read without knowing what is inside it.
+pub fn option_of<'v>(
+    value: &'v PlyValue,
+    what: &str,
+    span: Span,
+) -> Result<Option<&'v PlyValue>, Diagnostic> {
+    match value {
+        PlyValue::Ctor { name, args } if name.as_str() == "Some" => {
+            args.first().map(Some).ok_or_else(|| {
+                Diagnostic::error(codes::INTERNAL_ERROR, format!("`Some` holds no {what}"))
+                    .primary(span, "empty `Some`")
+            })
+        }
+        PlyValue::Ctor { name, .. } if name.as_str() == "None" => Ok(None),
+        other => Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("`{what}` is an option, and this is a {}", other.type_name()),
+        )
+        .primary(span, "an option")),
+    }
+}
+
+pub fn str_list_at(value: &PlyValue, name: &str, span: Span) -> Result<Vec<String>, Diagnostic> {
+    field_of(value, name, span)?
+        .as_list(span, name)?
+        .iter()
+        .map(|v| v.as_str(span, "an entry").map(str::to_string))
+        .collect::<Result<Vec<String>, Diagnostic>>()
+}
+
+pub fn missing(name: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("the options record has no `{name}`"),
+    )
+    .primary(
+        span,
+        "the program and the machine agree on the record; this is Ply's fault",
+    )
+}

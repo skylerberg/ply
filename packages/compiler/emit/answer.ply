@@ -1,0 +1,188 @@
+//! What the emitter answers for a root: its C text, the tables beside it, its head and its needs.
+
+import std.bin
+import std.list
+import syntax.patterns (Lit, LFixed, LWide, LStr, LBytes, LEmbedded, LFloat, LDec, LChar)
+import emit.c (width_named, width_index)
+import emit.roots (FnArg, fn_arg_bin)
+
+// --- Specialisation ----------------------------------------------------------------------------
+
+/// A constant of a body's table. A width is the runtime's numbering of it, and a float or a decimal
+/// is its literal as written, which the driver converts by the lexer's own rule. `ConstUnit` is the
+/// unit, and any literal the table has no entry for.
+pub type Const =
+  | ConstStr(Bytes)
+  | ConstBytes(Bytes)
+  /// An embedded file's bytes by their digest, which a unit is handed the bytes of.
+  | ConstEmbedded(Bytes)
+  | ConstFixed({ width: Int, bits: Int })
+  | ConstWide({ width: Int, high: Int, low: Int })
+  | ConstFloat(Bytes)
+  | ConstDecimal(Bytes)
+  | ConstChar(Int)
+  | ConstUnit
+
+/// What the emitted C calls one definition, and the entry the loader binds it by.
+pub type Defined = { symbol: Bytes, entry: Bytes, head: Head }
+
+/// A root's C function as a call declares it: its answer's and each parameter's carried C type.
+pub type Head = { answer: Bytes, params: List<Bytes> }
+
+/// The head a body's call of `callee` was written to: a root, or a generic call's placeholder.
+pub type Expect = { callee: Bytes, head: Head }
+
+/// The head of a root of `n` parameters that takes and answers words.
+pub fn word_head(n: Int) -> Head = { answer: b"Word", params: range(0, n).map(|_: Int| b"Word") }
+
+/// What one body names of the unit around it, each table in the order its own text numbers it.
+/// `members` are a group's definitions in case order, and empty for a body of its own.
+/// A call of a generic definition: the callee, and each type argument as `spelled_type` spells its
+/// layout, a variable of the calling body spelled as itself (`'0`), which the unit settles the
+/// callee's root by; `carried` are the variables the call hands over raw, which it settles on; and
+/// `fns` the lambdas it hands, which the root it settles on may run in place of its calls of them.
+pub type GenericCall = { callee: Bytes, args: List<Bytes>, carried: List<Int>, fns: List<FnArg> }
+
+/// Where a body's code took a slow path because type variable `var` was unknown, and what a
+/// specialisation would read of it.
+pub type Need = { var: Int, reads: Reads }
+
+/// Whether the variable's type is a scalar the code holds apart from a word, its layout, or the
+/// type itself: an operation done per type, `==` or `compare`, reads which type it is.
+pub type Reads = | Scalar | Layout | Exact
+
+/// A body's calls of generic definitions, numbered as their `@@gN@@` placeholders are, and its
+/// needs: what a specialisation at its type arguments would read of each; the head each call of a
+/// root was written to, which the unit holds the callee's own to; and the parameters it calls as
+/// functions, or hands on to calls, which the unit closes to know where a function argument is called.
+pub type Generics = {
+  calls: List<GenericCall>,
+  needs: List<Need>,
+  expects: List<Expect>,
+  called: List<Int>,
+  passes: List<Pass>,
+}
+
+/// A body's parameter `param` handed on as argument `at` of a call of definition `callee`.
+pub type Pass = { param: Int, callee: Bytes, at: Int }
+
+pub fn no_generics() -> Generics = { calls: [], needs: [], expects: [], called: [], passes: [] }
+
+pub type Tables = {
+  consts: List<Const>,
+  builtins: List<Bytes>,
+  fields: List<Bytes>,
+  shapes: List<List<Bytes>>,
+  lambdas: List<Bytes>,
+  calls: List<Bytes>,
+  generics: Generics,
+  performs: List<Bytes>,
+  handles: List<Bytes>,
+  members: List<Bytes>,
+  symbols: List<Defined>,
+}
+
+/// What a body that names nothing of its unit holds.
+pub fn no_tables() -> Tables =
+  {
+    consts: [],
+    builtins: [],
+    fields: [],
+    shapes: [],
+    lambdas: [],
+    calls: [],
+    generics: no_generics(),
+    performs: [],
+    handles: [],
+    members: [],
+    symbols: [],
+  }
+
+/// `s` with every `byte` taken out.
+pub fn without(s: Bytes, byte: Int) -> Bytes =
+  Bytes::concat_all(
+    range(0, s.len()).map(|i: Int| if s.at(i) == byte { b"" } else { s.slice(i, i + 1) }),
+  )
+
+/// The bits of the `Float` a literal's text names, its `_`s read past.
+pub fn literal_bits(literal: Bytes) -> Int / {abort.raise} =
+  match Float::of_string(String::of_bytes(without(unspaced(literal), 95))) {
+    Some(x) -> bits_of_float(x),
+    None -> panic("a float literal that does not read"),
+  }
+
+pub fn const_of_lit(literal: Lit) -> Const =
+  match literal {
+    LStr(x) -> ConstStr(x),
+    LBytes(x) -> ConstBytes(x),
+    LEmbedded(digest, _) -> ConstEmbedded(digest),
+    LFixed(name, bits) -> match width_named(name) {
+      Some(w) -> ConstFixed({ width: width_index(w), bits: bits }),
+      None -> ConstUnit,
+    },
+    LWide(name, high, low) -> match width_named(name) {
+      Some(w) -> ConstWide({ width: width_index(w), high: high, low: low }),
+      None -> ConstUnit,
+    },
+    LFloat(x) -> ConstFloat(unspaced(x)),
+    LDec(x) -> ConstDecimal(unspaced(x)),
+    LChar(v) -> ConstChar(v),
+    _ -> ConstUnit,
+  }
+
+/// A negative pattern literal's text runs from its `-`, across any space written after it.
+fn unspaced(s: Bytes) -> Bytes =
+  Bytes::concat_all(
+    range(0, s.len()).map(|i: Int| if s.at(i) <= 32 { b"" } else { s.slice(i, i + 1) }),
+  )
+
+/// Ascending: declarations come out sorted, not in the order the widths were found.
+pub fn sorted_widths(xs: List<Int>) -> List<Int> =
+  range(0, xs.len()).fold([], |acc: List<Int>, _: Int|
+    match xs.fold(None, |best: Option<Int>, x: Int|
+        if acc.fold(false, |seen: Bool, y: Int| seen || y == x) { best }
+        else { match best { None -> Some(x), Some(b2) -> if x < b2 { Some(x) } else { best } } }) {
+      Some(m) -> acc.push(m),
+      None -> acc,
+    })
+
+// --- the emitter's entry ----------------------------------------------------
+
+/// `why` is the refusal's reason, and then `text` and `tables` are empty.
+pub type Emitted = {
+  name: Bytes,
+  text: Bytes,
+  tables: Tables,
+  why: Option<Bytes>,
+  handles: List<Bytes>,
+}
+
+/// A body's C and the tables it names, or why it was refused and the operations it would have
+/// handled, which a refusal still names so the fixpoint drops their performers.
+pub type Answer =
+  | Body({ text: Bytes, tables: Tables })
+  | Refused({ why: Bytes, handles: List<Bytes> })
+
+pub type RootAnswer = { name: Bytes, answer: Answer }
+
+derive bin for Const
+
+derive bin for Head
+
+derive bin for Defined
+
+derive bin for Expect
+
+derive bin for Pass
+
+derive bin for GenericCall
+
+derive bin for Reads
+
+derive bin for Need
+
+derive bin for Generics
+
+derive bin for Tables
+
+derive bin for Answer

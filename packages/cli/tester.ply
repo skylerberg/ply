@@ -1,0 +1,229 @@
+//! What `ply test` asks of the runtime: a unit per program its tests run in, the host binding over
+//! the first, the cases a test ranges over, and one test or one interleaving of one on whichever
+//! thread asks. A compiled unit, a
+//! binding and a Rust unwind are not values a program can hold; everything a run decides, and what
+//! the cache keeps, is the program's.
+
+import compiler.load (LoadedAnalysis)
+import compiler.front.published (DefInterface, FiledBody, FiledDef)
+import compiler.check.resolve.tables (Diag)
+import diagnostic (Raised)
+import machine
+import sim.plan (Seed)
+import sim.recording (Interleaving)
+import std.bin
+import std.json (Json)
+import std.value (Value)
+import testing.conclude (Filing, PassRecord)
+import surface (Shard)
+import units
+import units (emit)
+
+/// What a run is configured with: the report flags, the machine's budgets and bounds, and the host
+/// it may bind. The runtime reads the budgets, the profile and the binding's flags from it.
+pub type Options = {
+  path: String,
+  json: Bool,
+  explain: Bool,
+  no_cache: Bool,
+  filters: List<String>,
+  /// `--shard K/N`: of the tests the rest selects, those whose key hashes into part K.
+  shard: Option<Shard>,
+  jobs: Option<Int>,
+  steps: Int,
+  timeout: Int,
+  bisect: String,
+  bisect_budget: Int,
+  coverage: Bool,
+  mutate: Option<String>,
+  mutate_budget: Int,
+  profile: String,
+  watch: Bool,
+  std: Bool,
+  host: Bool,
+  tls: List<machine::TlsCredential>,
+  trust: List<String>,
+  mtls: List<String>,
+  fs: List<machine::Named>,
+  /// The programs a test's `process.spawn` may start, and the families the tests are lent.
+  exec: List<machine::Named>,
+  allow: List<String>,
+  config: machine::ConfigOptions,
+  sim: machine::SimulationOptions,
+}
+
+pub nondet effect tester {
+  write configure[r](options: Options) -> Unit
+  /// A program tests run in, from a front end the program ran and the library it compiled the unit
+  /// it emitted into: the loaded program first, then each mutant and mixture. A run that executes
+  /// nothing hands no library, and one that is not `hosted` reaches no binding.
+  write unit[r](front: LoadedAnalysis, library: Option<String>, hosted: Bool) -> Result<Int, List<Diag>>
+  /// The value of the nullary definition `--config-schema` names, entered on the first unit.
+  read schema[r](name: String) -> Result<Value, List<Diag>>
+  /// The host binding over the first unit, answering `config` as the program resolved it.
+  write bound[r](config: machine::Configured) -> Result<Unit, List<Diag>>
+  /// What the binding and the first unit's backend came to, once the run is over.
+  read hosted[r]() -> Hosted
+  /// The run is over: the binding stops and the units go, and the compiled program stays for the
+  /// next run over the same definitions.
+  write ended[r]() -> Unit
+  /// The cases a test of the unit ranges over, in its table's order, or why they could not be
+  /// listed.
+  read cases[r](unit: Int, index: Int) -> Result<List<Listed>, Unlisted>
+  /// A test run once: over cases, the one `case` names.
+  read executed[r](unit: Int, index: Int, case: Option<Chosen>) -> Executed
+  /// One interleaving of a seeded test, the one `seed` names: over cases, of the one `case` names.
+  read interleaved[r](unit: Int, index: Int, case: Option<Chosen>, seed: Seed, steps: Int, re_executed: Bool) -> Interleaved
+  /// The first read a pass's trace holds that no longer answers as it did, as a person reads it.
+  read moved[r](trace: Bytes) -> Option<String>
+}
+
+/// A unit tests run in, from a front end the program ran: its C emitted and compiled here under
+/// `profile` and the unit made of it, or one that compiles nothing for a run that executes nothing.
+pub fn unit_over(
+  front: LoadedAnalysis,
+  build: Bool,
+  hosted: Bool,
+  profile: String = "development",
+) -> Result<Int, List<Diag>> / {tester.unit[tests], emit.unit, emit.compiled} =
+  match units::wanted(front, build, profile) {
+    Err(diags) -> Err(diags),
+    Ok(library) -> tester.unit[tests](front, library, hosted),
+  }
+
+/// `tester` answered from what it is handed alone: no host, clock, kept unit or measurement.
+pub effect hermetic_tester {
+  write configure[r](options: Options) -> Unit
+  write unit[r](front: LoadedAnalysis, library: Option<String>, hosted: Bool) -> Result<Int, List<Diag>>
+  read schema[r](name: String) -> Result<Value, List<Diag>>
+  write bound[r](config: machine::Configured) -> Result<Unit, List<Diag>>
+  read hosted[r]() -> Hosted
+  write ended[r]() -> Unit
+  read cases[r](unit: Int, index: Int) -> Result<List<Listed>, Unlisted>
+  read executed[r](unit: Int, index: Int, case: Option<Chosen>) -> Executed
+  read interleaved[r](unit: Int, index: Int, case: Option<Chosen>, seed: Seed, steps: Int, re_executed: Bool) -> Interleaved
+  read moved[r](trace: Bytes) -> Option<String>
+}
+
+/// The result cache, which whoever opened it handles: what opening it degraded past, the pass filed
+/// under each key and each code key as the trace its run read, whether each definition was ever
+/// seen, each test's last pass, stored bodies, and filed interfaces.
+pub effect ledger {
+  read opened() -> List<Diag>
+  read passes(keys: List<String>) -> List<Option<Bytes>>
+  read code_passes(keys: List<String>) -> List<Option<Bytes>>
+  read seen(hashes: List<String>) -> List<Bool>
+  read baselines(keys: List<String>) -> List<Option<PassRecord>>
+  read bodies(hashes: List<String>) -> List<Option<Bytes>>
+  read interfaces(asked: List<{ hash: String, name: String }>) -> List<Option<DefInterface>>
+  /// What a filed pass ran, as a later era's bisection reads it: each definition's interface by its
+  /// hash and name, and each body by its hash.
+  write history(defs: List<FiledDef>, bodies: List<FiledBody>) -> Unit
+  write filed(filing: Filing) -> Filed
+}
+
+/// What running a test, or one interleaving of it, cost and reached, whatever it decided. `host` is
+/// whether it reached a host handler, so that running it again acts on the world again.
+pub type Usage = {
+  duration_us: Int,
+  host: Bool,
+  /// Bodies run natively, and calls the backend was offered and declined.
+  entries: Int,
+  declines: Int,
+  /// The operations it performed, handled ones included.
+  performs: Int,
+  /// The warnings the entry ended with.
+  teardown: List<Diag>,
+}
+
+/// How one run of a test ended: `passed`, `failed`, `panicked` or `abandoned`; and what it read,
+/// which its pass is filed with, `None` when no trace stands in for the run.
+pub type Executed = { status: String, failure: Option<Raised>, usage: Usage, trace: Option<Bytes> }
+
+/// A case as its test lists it: the label it is reported under, and BLAKE3 of its value as built.
+pub type Listed = { label: String, identity: Bytes }
+
+derive bin for Listed
+
+/// A case as a run names it: its place in the table, and the identity the table is held to there.
+pub type Chosen = { at: Int, identity: Bytes }
+
+/// Why a test's cases could not be listed, and how a report classes it: `status` is `failed`,
+/// `panicked` or `abandoned`.
+pub type Unlisted = { status: String, failure: Raised }
+
+/// A failing interleaving's failure, and how a report classes it.
+pub type InterleavingFailure = { status: String, failure: Raised }
+
+/// `observed` is whether the test entered a `simulate` region, and so had a schedule to vary.
+pub type Interleaved = {
+  run: Interleaving<InterleavingFailure>,
+  observed: Bool,
+  usage: Usage,
+  trace: Option<Bytes>,
+}
+
+/// What the first unit's backend did, apart from the entries each test counted. `unbuilt` counts the
+/// threads that could not build it and so declined every call.
+pub type Compiled = {
+  name: String,
+  fragment: Int,
+  offered: Int,
+  converted_in: Int,
+  converted_out: Int,
+  /// Absent unless the provider loaded a unit: once per worker, each load counted in `load_nanos`.
+  units: Option<Int>,
+  load_nanos: Option<Int>,
+  unbuilt: Int,
+}
+
+/// The binding a run had, and the tests of the first unit it reaches.
+pub type Hosted = {
+  hermetic: Bool,
+  /// `hermetic` or `host`.
+  label: String,
+  operations: Int,
+  digest: String,
+  handshakes: List<String>,
+  hosts: Json,
+  reaches: List<Int>,
+  cores: Int,
+  backend: Compiled,
+}
+
+/// Why writing to the store failed, when it did, and what the store had to say.
+pub type Filed = { unflushed: Option<String>, warnings: List<Diag> }
+
+pub fn no_usage() -> Usage =
+  { duration_us: 0, host: false, entries: 0, declines: 0, performs: 0, teardown: [] }
+
+/// Two runs' costs, as one test that ran both.
+/// What two runs of one test read between them: every line of either, sorted, as a trace is. `None`
+/// when either has no trace to stand in for it.
+pub fn joined_trace(a: Option<Bytes>, b: Option<Bytes>) -> Option<Bytes> =
+  match ((a, b)) {
+    (Some(x), Some(y)) -> if x == y { Some(x) } else {
+      let held = |m: Map<String, Bool>, t: Bytes|
+        String::of_bytes_lossy(t).split("\n").fold(m, |n: Map<String, Bool>, line: String|
+          if line == "" { n } else { n.insert(line, true) });
+      let lines = held(held(Map::new(), x), y);
+      Some(Bytes::of_string(lines.keys().fold("", |acc: String, line: String| acc ++ line ++ "\n")))
+    },
+    _ -> None,
+  }
+
+pub fn sum_usage(a: Usage, b: Usage) -> Usage =
+  {
+    duration_us: a.duration_us + b.duration_us,
+    host: a.host || b.host,
+    entries: a.entries + b.entries,
+    declines: a.declines + b.declines,
+    performs: a.performs + b.performs,
+    teardown: b.teardown.fold(a.teardown, |acc: List<Diag>, diag: Diag| acc.push(diag)),
+  }
+
+test "two runs' traces join into every line either read, in a trace's order" {
+  assert_eq(joined_trace(Some(b"b\ty\n"), Some(b"a\tx\nb\ty\n")), Some(b"a\tx\nb\ty\n"));
+  assert_eq(joined_trace(Some(b""), Some(b"")), Some(b""));
+  assert_eq(joined_trace(Some(b"a\tx\n"), None), None)
+}

@@ -1,0 +1,606 @@
+//! Names as the checker looks them up, and what it says of one it cannot find.
+
+import syntax.parsing (Span, Ident, QName, is_bare, qname_text, starts_upper)
+import syntax.items (deriver_text, SRequires, SCost, SSpace, member_name)
+import syntax.exprs (sees_homes, prelude_module)
+import check.types (TyCon, TyFn, env_lookup, env_depth_of, TyNominal)
+import check.resolve.tables (Binding, ModuleBinding, Declared, ModuleEntry, Diag, Namespace,
+                             ValueSpace, TypeSpace, lookup, lookup_declared, space, qualify,
+                             default_binder, error_at, label_at, backticked, describe_namespace,
+                             find_module_binding)
+import check.resolve.scopes (find, private_name, closed_ctor, declaring_type, of_binder, of_module)
+import std.bytes
+import std.option
+import std.string
+import std.text (closest)
+import check.infer.checker (Checker, WithName, result_name, module_name, scope_of, report,
+                            report_error_at, err_labels, ctor_of, ValueKey)
+
+// --- Names ------------------------------------------------------------------------------
+
+/// A bare name through this module's scope, a qualified one through the resolver.
+pub fn global(
+  checker: Checker,
+  namespace: Namespace,
+  qname: QName,
+) -> { checker: Checker, name: Option<Bytes> } / {abort.raise} =
+  if is_bare(qname) {
+    match lookup(scope_of(checker).bound, namespace, qname.name.name) {
+      Some(b) -> { checker: checker, name: Some(b.qualified) },
+      None -> { checker: checker, name: None },
+    }
+  } else {
+    match find(checker.resolved, checker.module, namespace, qname) {
+      Some(b) -> { checker: checker, name: Some(b.qualified) },
+      None ->
+        {
+          checker: match checker.derived {
+            Some(_) ->
+              unresolved_in_derived(checker, qname, match namespace {
+                TypeSpace -> b"type",
+                _ -> b"definition",
+              }),
+            None -> lookup_failure(checker, namespace, qname),
+          },
+          name: None,
+        },
+    }
+  }
+
+/// A name a generated body cannot see is the field type's missing `derive`, not the user's bug.
+pub fn unresolved_in_derived(
+  checker: Checker,
+  qname: QName,
+  what: Bytes,
+) -> Checker / {abort.raise} = report(checker, derived_unresolved(checker, qname, what))
+
+fn derived_unresolved(checker: Checker, qname: QName, what: Bytes) -> Diag / {abort.raise} = {
+  let d = match checker.derived {
+    Some(d) -> d,
+    None -> panic("only a generated body reaches this"),
+  };
+  let dv = deriver_text(d.deriver);
+  error_at(
+    b"E0206",
+    checker.module,
+    qname.span,
+    Bytes::concat_all([b"`", dv, b"` cannot be derived for `", d.target, b"`"]),
+    Bytes::concat_all([
+      b"the generated body needs the ",
+      what,
+      b" `",
+      qname_text(qname),
+      b"`, which is not in scope",
+    ]),
+    [
+      Bytes::concat_all([
+        b"a derivation composes through named types by calling their own dictionaries, so every field type needs `derive ",
+        dv,
+        b" for` it in the module that declares it",
+      ]),
+      Bytes::concat_all([
+        b"`",
+        qname_text(qname),
+        b"` is what `derive ",
+        dv,
+        b" for <that type>` generates",
+      ]),
+    ],
+  )
+}
+
+fn lookup_failure(checker: Checker, namespace: Namespace, qname: QName) -> Checker / {abort.raise} =
+  match qname.module {
+    None -> checker,
+    Some(binder) -> if namespace == ValueSpace
+        && declaring_type(checker.resolved, checker.module, binder.name) != None {
+      no_function_of(checker, binder.name, qname.name)
+    } else {
+      let scope = scope_of(checker);
+      match scope.modules.fold(
+          None,
+          |acc: Option<Int>, binding: { binder: Bytes, target: Int, span: Span }|
+            match acc {
+              Some(_) -> acc,
+              None -> if binding.binder == binder.name { Some(binding.target) } else { None },
+            },
+        ) {
+        // One note either way, plus a secondary when a selective import bound it.
+        None -> {
+          let selective = scope.selective.fold(
+            None,
+            |acc: Option<{ binder: Bytes, target: Int, span: Span }>, binding: { binder: Bytes, target: Int, span: Span }|
+              match acc {
+                Some(_) -> acc,
+                None -> if binding.binder == binder.name { Some(binding) } else { None },
+              },
+          );
+          let message = Bytes::concat_all([b"no module is imported as `", binder.name, b"`"]);
+          let label = b"not a module imported by this file";
+          match selective {
+            Some(sel) -> {
+              let module = checker.resolved.scopes.get(sel.target).module;
+              err_labels(
+                checker,
+                b"E0106",
+                message,
+                [
+                  label_at(checker.module, binder.span, true, label),
+                  label_at(
+                    checker.module,
+                    sel.span,
+                    false,
+                    Bytes::concat_all([b"this import brings in names from `", module, b"`"]),
+                  ),
+                ],
+                [
+                  Bytes::concat_all([
+                    b"a selective import binds no module name: add `import ",
+                    module,
+                    b"` as well, or write `",
+                    qname.name.name,
+                    b"` unqualified",
+                  ]),
+                ],
+              )
+            },
+            None -> {
+              // A module of the program named like the binder, else what this file does import.
+              let candidate = checker.resolved.names.fold(
+                None,
+                |acc: Option<Bytes>, e: ModuleEntry|
+                  match acc {
+                    Some(_) -> acc,
+                    None -> if e.name == binder.name || default_binder(e.name) == binder.name {
+                      Some(e.name)
+                    } else { None },
+                  },
+              );
+              let note = match candidate {
+                Some(name) ->
+                  Bytes::concat_all([
+                    b"`",
+                    name,
+                    b"` is a module in this program: add `import ",
+                    name,
+                    b"` above the first item",
+                  ]),
+                None -> {
+                  let imported = scope.modules.filter(written_binder);
+                  if imported.len() == 0 {
+                    Bytes::concat_all([
+                      b"`",
+                      scope.module,
+                      b"` imports no modules; add `import <module>` above the first item",
+                    ])
+                  } else {
+                    b"modules imported here: ".concat(
+                      backticked(imported.map(|binding: ModuleBinding| binding.binder), b", "),
+                    )
+                  }
+                },
+              };
+              report_error_at(checker, b"E0106", binder.span, message, label, [note])
+            },
+          }
+        },
+        Some(owner) -> {
+          let decls = checker.resolved.declarations.get(owner);
+          let module = checker.resolved.scopes.get(owner).module;
+          match lookup_declared(decls, namespace, qname.name.name) {
+            None -> {
+              let exported = space(decls, namespace).fold(
+                [],
+                |acc: List<Bytes>, declared: Declared|
+                  if declared.public { acc.push(declared.name) } else { acc },
+              );
+              report_error_at(
+                checker,
+                b"E0101",
+                qname.span,
+                Bytes::concat_all([
+                  b"module `",
+                  module,
+                  b"` has no ",
+                  describe_namespace(namespace),
+                  b" `",
+                  qname.name.name,
+                  b"`",
+                ]),
+                Bytes::concat_all([b"not declared in `", module, b"`"]),
+                [
+                  if exported.len() == 0 {
+                    Bytes::concat_all([
+                      b"`",
+                      module,
+                      b"` exports no ",
+                      describe_namespace(namespace),
+                      b"s",
+                    ])
+                  } else {
+                    Bytes::concat_all([b"`", module, b"` exports: ", backticked(exported, b", ")])
+                  },
+                ],
+              )
+            },
+            Some(d) -> if !d.public {
+              report(checker, match kept_ctor(checker, namespace, qname, [owner]) {
+                Some(closed) -> closed,
+                None ->
+                  private_name(
+                    checker.module,
+                    qname.span,
+                    owner,
+                    d.span,
+                    namespace,
+                    qname.name.name,
+                    module,
+                  ),
+              })
+            } else { checker },
+          }
+        },
+      }
+    },
+  }
+
+pub fn value_key(
+  checker: Checker,
+  qname: QName,
+) -> { checker: Checker, key: Option<ValueKey> } / {abort.raise} =
+  if !is_bare(qname) {
+    match of_language_type(checker, qname) {
+      Found(m) ->
+        { checker: checker, key: Some({ name: m.callee, prelude: m.qname.module == None }) },
+      // A capital no import binds and no module declares is a type of the language's.
+      Unnamed(of) -> { checker: no_function_of(checker, of.name, qname.name), key: None },
+      Elsewise -> {
+        let g: WithName = global(checker, ValueSpace, qname);
+        match g.name {
+          Some(n) -> { checker: g.checker, key: Some({ name: n, prelude: false }) },
+          None -> { checker: g.checker, key: None },
+        }
+      },
+    }
+  } else {
+    let name = qname.name.name;
+    match env_depth_of(checker.env, name) {
+      Some(depth) -> if depth > 0 {
+        { checker: checker, key: Some({ name: name, prelude: false }) }
+      } else { value_key_global(checker, qname) },
+      None -> value_key_global(checker, qname),
+    }
+  }
+
+/// What a name written `T::name` is where `T` is a type of the language's, one no import binds
+/// as a module and no module in scope declares: its function so named, a builtin's `qname` with no
+/// module, or none it has.
+pub type OfLanguageType = | Found({ qname: QName, callee: Bytes }) | Unnamed(Ident) | Elsewise
+
+pub fn of_language_type(checker: Checker, qname: QName) -> OfLanguageType / {abort.raise} =
+  match qname.module {
+    None -> Elsewise,
+    Some(of) -> if !starts_upper(of.name) || of_module(of.name) != None
+        || find_module_binding(scope_of(checker).modules, of.name) != None
+        || declaring_type(checker.resolved, checker.module, of.name) != None { Elsewise } else {
+      match language_function(checker, of.name, qname.name, false) {
+        Some(m) -> Found(m),
+        None -> Unnamed(of),
+      }
+    },
+  }
+
+fn value_key_global(
+  checker: Checker,
+  qname: QName,
+) -> { checker: Checker, key: Option<ValueKey> } / {abort.raise} = {
+  let name = qname.name.name;
+  match lookup(scope_of(checker).bound, ValueSpace, name) {
+    Some(b) -> { checker: checker, key: Some({ name: b.qualified, prelude: false }) },
+    None -> match env_depth_of(checker.env, name) {
+      Some(0) -> { checker: checker, key: Some({ name: name, prelude: true }) },
+      _ -> { checker: unknown_name(checker, qname), key: None },
+    },
+  }
+}
+
+pub fn declared_value(checker: Checker, qname: QName) -> Option<Bytes> / {abort.raise} =
+  if is_bare(qname) {
+    match lookup(scope_of(checker).bound, ValueSpace, qname.name.name) {
+      Some(b) -> Some(b.qualified),
+      None -> None,
+    }
+  } else {
+    match find(checker.resolved, checker.module, ValueSpace, qname) {
+      Some(b) -> Some(b.qualified),
+      None -> None,
+    }
+  }
+
+fn prelude_ctor(checker: Checker, qname: QName) -> Option<Bytes> / {abort.raise} =
+  if is_bare(qname) {
+    match ctor_of(checker, qname.name.name) { Some(_) -> Some(qname.name.name), None -> None }
+  } else { None }
+
+pub fn ctor_name(
+  checker: Checker,
+  qname: QName,
+) -> { checker: Checker, name: Option<Bytes> } / {abort.raise} = {
+  let g: WithName = global(checker, ValueSpace, qname);
+  match g.name {
+    Some(n) -> g,
+    None -> { checker: g.checker, name: prelude_ctor(g.checker, qname) },
+  }
+}
+
+pub fn covered_ctor(checker: Checker, qname: QName) -> Option<Bytes> / {abort.raise} =
+  match declared_value(checker, qname) { Some(n) -> Some(n), None -> prelude_ctor(checker, qname) }
+
+/// Another module that declares `name` publicly in `namespace`.
+pub fn exporter(
+  checker: Checker,
+  namespace: Namespace,
+  name: Bytes,
+) -> Option<Int> / {abort.raise} =
+  range(0, checker.resolved.declarations.len()).fold(None, |acc: Option<Int>, i: Int|
+    match acc {
+      Some(_) -> acc,
+      None -> if i == checker.module { None } else {
+        match lookup_declared(checker.resolved.declarations.get(i), namespace, name) {
+          Some(d) -> if d.public { Some(i) } else { None },
+          None -> None,
+        }
+      },
+    })
+
+/// The name in scope a slip of the hand makes `name` of: an edit for every three characters.
+fn nearest_name(checker: Checker, name: Bytes) -> Option<Bytes> / {abort.raise} = {
+  let written = String::of_bytes_lossy(name);
+  let others = scope_of(checker).bound.values.map(|binding: Binding|
+    String::of_bytes_lossy(binding.name)).filter(|other: String| other != written);
+  match closest(written, others, name.len() / 3) {
+    Some(near) -> Some(Bytes::of_string(near)),
+    None -> None,
+  }
+}
+
+/// The modules this one imports, whether by a binder or for some of their names.
+fn imported(checker: Checker) -> List<Int> / {abort.raise} = {
+  let scope = scope_of(checker);
+  scope.selective.concat(scope.modules).map(|binding: ModuleBinding| binding.target)
+}
+
+/// What to say of a name that is a constructor one of `owners` keeps, its type being `opaque`.
+fn kept_ctor(
+  checker: Checker,
+  namespace: Namespace,
+  qname: QName,
+  owners: List<Int>,
+) -> Option<Diag> / {abort.raise} =
+  match namespace {
+    ValueSpace ->
+      owners.fold(None, |found: Option<Diag>, owner: Int|
+        match found {
+          Some(_) -> found,
+          None -> if owner == checker.module { None }
+          else { closed_ctor(checker.modules, checker.module, qname.span, owner, qname.name.name) },
+        }),
+    _ -> None,
+  }
+
+pub fn unknown_name(checker: Checker, qname: QName) -> Checker / {abort.raise} =
+  report(checker, unknown_name_said(checker, qname))
+
+pub fn unknown_name_said(checker: Checker, qname: QName) -> Diag / {abort.raise} =
+  match checker.derived {
+    Some(_) -> derived_unresolved(checker, qname, b"definition"),
+    None -> match kept_named(checker, qname) {
+      Some(closed) -> closed,
+      None -> unknown_name_here(checker, qname),
+    },
+  }
+
+/// What to say of a name no scope binds where its type's module keeps it: a bare name's may be any
+/// module imported here, a qualified one's is the module it names.
+pub fn kept_named(checker: Checker, qname: QName) -> Option<Diag> / {abort.raise} =
+  match qname.module {
+    None -> kept_ctor(checker, ValueSpace, qname, imported(checker)),
+    Some(binder) -> match find_module_binding(scope_of(checker).modules, binder.name) {
+      Some(binding) -> kept_ctor(checker, ValueSpace, qname, [binding.target]),
+      None -> None,
+    },
+  }
+
+fn unknown_name_here(checker: Checker, qname: QName) -> Diag / {abort.raise} = {
+  let n = qname.name.name;
+  let result = if !is_bare(qname) || n != result_name() { [] } else {
+    match checker.spec_kind {
+      Some(SRequires) ->
+        [
+          b"`result` is bound only in an `ensures`: a precondition that could name the result would be a claim about a value the call has not produced yet",
+        ],
+      Some(SCost) ->
+        [
+          b"`result` is bound only in an `ensures`: a `cost` bound is over the parameters a call is given",
+        ],
+      Some(SSpace) ->
+        [
+          b"`result` is bound only in an `ensures`: a `space` bound is over the parameters a call is given",
+        ],
+      _ -> [],
+    }
+  };
+  let near = match nearest_name(checker, n) {
+    Some(x) -> result.push(Bytes::concat_all([b"a name in scope looks similar: `", x, b"`"])),
+    None -> result,
+  };
+  let exported = if is_bare(qname) {
+    match exporter(checker, ValueSpace, n) {
+      Some(i) ->
+        near.push(
+          Bytes::concat_all([
+            b"module `",
+            module_name(checker, i),
+            b"` exports it: add `import ",
+            module_name(checker, i),
+            b" (",
+            n,
+            b")`",
+          ]),
+        ),
+      None -> near,
+    }
+  } else { near };
+  error_at(
+    b"E0101",
+    checker.module,
+    qname.span,
+    Bytes::concat_all([b"unknown name `", n, b"`"]),
+    b"not found in this scope",
+    exported,
+  )
+}
+
+// --- What a place expects ----------------------------------------------------------------------
+
+/// The function `name` of `of`, a type of the language's: one this module declares itself, which
+/// only the prelude and the type's home may; a builtin the prelude declares under it; or what its
+/// home module declares where this module sees that module. `on_value` asks for one a value of the
+/// type is called on, so a builtin whose first parameter is another type is none.
+pub fn language_function(
+  checker: Checker,
+  of: Bytes,
+  name: Ident,
+  on_value: Bool,
+) -> Option<{ qname: QName, callee: Bytes }> / {abort.raise} = {
+  let declared = member_name(of, name.name);
+  match lookup(scope_of(checker).bound, ValueSpace, declared) {
+    // The prelude's own call of a function it writes is the builtin's, as every module's is, so
+    // what is known of the builtin by name is known there too.
+    Some(own) -> if own.qualified == qualify(prelude_module(), declared)
+        && checker.contracts.contains(declared) {
+      Some({
+        qname: { module: None, name: { name: declared, span: name.span }, span: name.span },
+        callee: declared,
+      })
+    } else {
+      Some({
+        qname: {
+          module: Some({ name: of_binder(scope_of(checker).module), span: name.span }),
+          name: { name: declared, span: name.span },
+          span: name.span,
+        },
+        callee: own.qualified,
+      })
+    },
+    None -> builtin_or_home(checker, of, name, on_value, declared),
+  }
+}
+
+fn builtin_or_home(
+  checker: Checker,
+  of: Bytes,
+  name: Ident,
+  on_value: Bool,
+  declared: Bytes,
+) -> Option<{ qname: QName, callee: Bytes }> / {abort.raise} = {
+  let takes = !on_value
+    || (match env_lookup(checker.env, declared) {
+      Some(scheme) -> match scheme.ty {
+        TyFn(f) -> match f.params.at(0) {
+          Some(TyCon(c)) -> c.name == of,
+          Some(TyNominal(n)) -> n.name == of,
+          _ -> false,
+        },
+        _ -> false,
+      },
+      None -> false,
+    });
+  if takes && env_depth_of(checker.env, declared) == Some(0) {
+    Some({
+      qname: { module: None, name: { name: declared, span: name.span }, span: name.span },
+      callee: declared,
+    })
+  } else { home_function(checker, of, name) }
+}
+
+/// The function `name` the home module of the language's type `of` declares for it, where this
+/// module can see that module: every module can but those beneath the homes, which see what they
+/// import, directly or through others.
+fn home_function(
+  checker: Checker,
+  of: Bytes,
+  name: Ident,
+) -> Option<{ qname: QName, callee: Bytes }> / {abort.raise} = {
+  let home = home_module(of);
+  let seen = match checker.resolved.sees.at(checker.module) { Some(ks) -> ks, None -> [] };
+  if !seen.fold(false, |found: Bool, k: Int|
+      found || checker.resolved.scopes.get(k).module == home) { None } else {
+    let qname = {
+      module: Some({ name: of_binder(home), span: name.span }),
+      name: { name: member_name(of, name.name), span: name.span },
+      span: name.span,
+    };
+    match find(checker.resolved, checker.module, ValueSpace, qname) {
+      Some(b) -> Some({ qname: qname, callee: b.qualified }),
+      None -> None,
+    }
+  }
+}
+
+/// Whether `of` is a type a module declares, which the prelude has no function of.
+pub fn module_declares(checker: Checker, of: Bytes) -> Bool =
+  checker.types.contains(of) || checker.nominals.contains(of)
+
+fn no_function_of(checker: Checker, of: Bytes, name: Ident) -> Checker / {abort.raise} =
+  report(checker, no_function_said(checker, of, name))
+
+pub fn no_function_said(checker: Checker, of: Bytes, name: Ident) -> Diag / {abort.raise} =
+  error_at(
+    b"E0101",
+    checker.module,
+    name.span,
+    Bytes::concat_all([b"`", simple_name_of(of), b"` has no function `", name.name, b"`"]),
+    b"not a function of the type",
+    [
+      if module_declares(checker, of) {
+        Bytes::concat_all([
+          b"a function of a type is declared `fn ",
+          simple_name_of(of),
+          b"::",
+          name.name,
+          b"(..)` in the module that declares the type",
+        ])
+      } else {
+        Bytes::concat_all([
+          b"`",
+          of,
+          b"` has the builtins named for it, and the functions `",
+          home_module(of),
+          if sees_homes(checker.resolved.scopes.get(checker.module).module) { b"` declares for it" }
+          else {
+            b"` declares for it where this module imports that one, itself or through another"
+          },
+        ])
+      },
+    ],
+  )
+
+// --- Effects ----------------------------------------------------------------------------------
+
+/// A binder an import wrote; one the resolver added for a spliced default or an expanded set has no
+/// span, and no source can spell it.
+pub fn written_binder(binding: ModuleBinding) -> Bool = binding.span.end > binding.span.start
+
+pub fn simple_name_of(name: Bytes) -> Bytes / {abort.raise} =
+  match range(0, name.len()).fold(None, |acc: Option<Int>, i: Int|
+      if name.at(i) == 46 { Some(i) } else { acc }) {
+    Some(i) -> name.slice(i + 1, name.len()),
+    None -> name,
+  }
+
+// --- Definitions ----------------------------------------------------------------------------------
+
+/// The module that declares the functions of the language's type `of` beside the prelude's.
+pub fn home_module(of: Bytes) -> Bytes / {abort.raise} =
+  b"std.".concat(Bytes::of_string(String::of_bytes(of).ascii_lower()))

@@ -1,0 +1,614 @@
+//! The rows the front end's answer holds, and what the source wrote of each.
+
+import syntax.parsing (Span, Ident, QName, is_bare, no_module, span_bin)
+import syntax.items (Item, IFn, IType, IEffect, IEffectSet, TDSum, VariantDef, SpecKind, ImportDecl,
+                     spec_kind_bin)
+import syntax.type_syntax (AtomExpr)
+import check.types (Atom, RNamed, RSingleton, Scheme, Type, atoms_insert, atom_bin, scheme_bin,
+                    TypeTable, type_table_bin)
+import check.resolve.tables (ParsedModule, Diag, Resolved, EffectSpace, qualify, lookup)
+import check.resolve.scopes (find)
+import store.hash.graph (DefEntry, TestEntry, LawEntry)
+import store.hash.forms (Skeleton)
+import check.infer.checker (Location, DefConstraint, EffectInfo, is_prelude_effect, Raise,
+                            raise_bin)
+import check.termination (Ending, Summary, ending_bin, summary_bin)
+import front.pkg (Pinned)
+import check.resolve.scopes (PackageDeps)
+import std.bin
+import std.list
+import expand.embed (EmbedAt, ItemWants, wants_of, wants_by_item, wants_in)
+import syntax.items (parse)
+import syntax.lexer (is_ident_start)
+
+pub fn span_at(module: Int, span: Span) -> ModuleSpan =
+  {
+    module: if span.start == 0 && span.end == 0 { no_module() } else { module },
+    start: span.start,
+    end: span.end,
+  }
+
+pub fn loc_at(location: Location) -> ModuleSpan = span_at(location.module, location.span)
+
+// --- What the source wrote ----------------------------------------------------
+
+// What the driver reads from the tree that the checker's tables do not keep.
+
+pub type Written = { public: Bool, reuse: Bool, params: List<Placed>, literals: List<Bytes> }
+
+fn no_written() -> Written = { public: false, reuse: false, params: [], literals: [] }
+
+pub fn fn_written(outlines: List<Outline>) -> Map<Bytes, Written> =
+  outlines.fold(Map::new(), |acc: Map<Bytes, Written>, o: Outline|
+    o.items.fold(acc, |a: Map<Bytes, Written>, item: Outlined|
+      match item {
+        OFn(f) ->
+          a.insert(qualify(o.name, f.name), {
+            public: f.public,
+            reuse: f.reuse,
+            params: f.params,
+            literals: f.literals,
+          }),
+        _ -> a,
+      }))
+
+pub fn written_of(m: Map<Bytes, Written>, name: Bytes) -> Written =
+  match m.get(name) { Some(w) -> w, None -> no_written() }
+
+// --- A module's outline ----------------------------------------------------------
+
+// What the tables read of a module's text that its checked rows do not hold, each span its own: a
+// load of a program assembled from its modules' answers reads them there rather than parse them.
+
+/// A name, and where in its module it is written.
+pub type Placed = { name: Bytes, span: Span }
+
+/// A function as the tables read it: whether it is written `pub` and `reuse`, whether it promises
+/// what it `returns` and states a `decreases` measure, its parameters, the literals its `requires`
+/// clauses are written with, each clause's kind, whether it is a `const`, and where its name is.
+pub type FnOutline = {
+  name: Bytes,
+  public: Bool,
+  reuse: Bool,
+  returns: Bool,
+  measured: Bool,
+  params: List<Placed>,
+  literals: List<Bytes>,
+  spec: List<SpecKind>,
+  baked: Bool,
+  name_span: Span,
+  span: Span,
+}
+
+pub type TestOutline = { name: Bytes, name_span: Span, cases: Bool }
+
+/// A law, and the literals its guard is written with: its own, or its schema's.
+pub type LawOutline = { name: Bytes, literals: List<Bytes> }
+
+pub type TypeOutline = { name: Bytes, public: Bool, arity: Int, span: Span }
+
+pub type Outlined =
+  | OFn(FnOutline)
+  | OTest(TestOutline)
+  | OLaw(LawOutline)
+  | OType(TypeOutline)
+  | OEffect({ name: Bytes, public: Bool })
+
+/// A module as the tables read it: its items in source order, everything it declares by its
+/// program-wide name, the modules it imports as written, each once, its effect sets, and the cuts a
+/// unit that does not lower it blanks it by.
+pub type Outline = {
+  name: Bytes,
+  items: List<Outlined>,
+  declared: List<Bytes>,
+  imports: List<Bytes>,
+  /// Each schema it declares, and each schema's guard, by program-wide name.
+  schemas: List<Bytes>,
+  sets: List<SetView>,
+  cuts: List<Cut>,
+  /// Each type a `key`, `show` or `numeric` names, by its program-wide name: what a load reads of
+  /// a module it pulls whatever the program reaches.
+  stated: List<Bytes>,
+  /// Each `effect set` as written.
+  set_texts: List<Bytes>,
+}
+
+derive bin for Placed
+
+derive bin for FnOutline
+
+derive bin for TestOutline
+
+derive bin for LawOutline
+
+derive bin for TypeOutline
+
+derive bin for Outlined
+
+derive bin for Outline
+
+// --- A module's effect sets ---------------------------------------------------
+
+// An atom whose effect resolves to nothing is dropped; a bare `hold` resolves to itself.
+
+fn has_effect(effects: List<EffectInfo>, name: Bytes) -> Bool =
+  effects.fold(false, |acc: Bool, effect_info: EffectInfo| acc || effect_info.name == name)
+
+fn bare_prelude(qname: QName) -> Option<Bytes> =
+  if is_bare(qname) && is_prelude_effect(qname.name.name) { Some(qname.name.name) } else { None }
+
+fn set_effect(
+  resolved: Resolved,
+  effects: List<EffectInfo>,
+  module: Int,
+  qname: QName,
+) -> Option<Bytes> / {abort.raise} =
+  if is_bare(qname) && qname.name.name == b"hold" { Some(qname.name.name) } else {
+    let found = if is_bare(qname) {
+      lookup(resolved.scopes.get(module).bound, EffectSpace, qname.name.name)
+    } else { find(resolved, module, EffectSpace, qname) };
+    match found {
+      Some(b) -> if has_effect(effects, b.qualified) { Some(b.qualified) }
+      else { bare_prelude(qname) },
+      None -> bare_prelude(qname),
+    }
+  }
+
+fn set_atoms(
+  resolved: Resolved,
+  effects: List<EffectInfo>,
+  module: Int,
+  atoms: List<AtomExpr>,
+) -> List<Atom> / {abort.raise} =
+  atoms.fold([], |acc: List<Atom>, atom: AtomExpr|
+    match set_effect(resolved, effects, module, atom.eff) {
+      Some(eff) ->
+        atoms_insert(acc, {
+          effect: eff,
+          resource: match atom.resource { Some(x) -> RNamed(x.name), None -> RSingleton },
+          mode: atom.mode,
+          op: match atom.op { Some(x) -> Some(x.name), None -> None },
+        }),
+      None -> acc,
+    })
+
+/// One `effect set` of a module: the simple name a row writes, the sets it includes in source
+/// order, and the expansion as program-wide atoms.
+pub type SetView = { name: Bytes, includes: List<Bytes>, atoms: List<Atom> }
+
+derive bin for SetView
+
+// --- Module names -------------------------------------------------------------
+
+// A module is a file: `store/orders.ply` is `store.orders`, relative to the project root. The
+// rule lives here rather than with the walk that reads a project, because the front end is what
+// names a module to everything downstream of it.
+
+fn continue_ok(c: Int) -> Bool = is_ident_start(c) || (c >= 48 && c <= 57)
+
+fn ident_ok(segment: String) -> Bool = {
+  let b = Bytes::of_string(segment);
+  if b.len() == 0 { false } else {
+    is_ident_start(b.at(0))
+      && range(1, b.len()).fold(true, |ok: Bool, i: Int| ok && continue_ok(b.at(i)))
+  }
+}
+
+fn drop_extension(path: String) -> String / {abort.raise} =
+  if path.ends_with(".ply") { path.slice(0, path.len() - 4) } else { path }
+
+fn dotted(segments: List<String>) -> String =
+  range(0, segments.len()).fold("", |acc: String, i: Int|
+    match segments.at(i) { Some(s) -> if i == 0 { s } else { acc ++ "." ++ s }, None -> acc })
+
+/// The first segment that is not an identifier, which is what a refusal names.
+fn bad_segment(segments: List<String>) -> Option<String> =
+  segments.fold(None, |acc: Option<String>, s: String|
+    match acc { Some(_) -> acc, None -> if ident_ok(s) { None } else { Some(s) } })
+
+pub fn module_of(path: String) -> Result<String, String> / {abort.raise} = {
+  let segments = drop_extension(path).split("/");
+  match bad_segment(segments) {
+    Some(s) -> Err("`" ++ s ++ "` is not an identifier"),
+    None -> if segments.len() == 0 { Err("it has no name") } else { Ok(dotted(segments)) },
+  }
+}
+
+pub fn effect_sets_of(
+  resolved: Resolved,
+  effects: List<EffectInfo>,
+  module: Int,
+  parsed: ParsedModule,
+) -> List<SetView> / {abort.raise} =
+  parsed.module.items.fold([], |acc: List<SetView>, item: Item|
+    match item {
+      IEffectSet(d) ->
+        acc.push({
+          name: d.name.name,
+          includes: d.includes.map(|qname: QName| qname.name.name),
+          atoms: set_atoms(resolved, effects, module, d.expansion),
+        }),
+      _ -> acc,
+    })
+
+// --- The rows the answer holds -----------------------------------------------
+
+// Each type, scheme and footprint numbered as its text names its variables, so two answers about
+// one program are equal values however the checker numbered them.
+
+/// Program-wide names of everything a module declares, in source order.
+pub fn module_items(parsed: ParsedModule) -> List<Bytes> =
+  parsed.module.items.fold([], |acc: List<Bytes>, item: Item|
+    match item {
+      IFn(d) -> acc.push(qualify(parsed.name, d.name.name)),
+      IType(d) -> {
+        let named = acc.push(qualify(parsed.name, d.name.name));
+        match d.body {
+          TDSum(vs) ->
+            vs.fold(named, |a: List<Bytes>, variant: VariantDef|
+              a.push(qualify(parsed.name, variant.name.name))),
+          _ -> named,
+        }
+      },
+      IEffect(d) -> acc.push(qualify(parsed.name, d.name.name)),
+      _ -> acc,
+    })
+
+/// The modules a module imports, each named once, in source order.
+pub fn module_imports(parsed: ParsedModule) -> List<Bytes> = imported_names(parsed.module.imports)
+
+pub fn imported_names(imports: List<ImportDecl>) -> List<Bytes> =
+  imports.fold([], |acc: List<Bytes>, decl: ImportDecl| {
+    let name = Bytes::join(decl.path.map(|x: Ident| x.name), b".");
+    if acc.fold(false, |b: Bool, x: Bytes| b || x == name) { acc } else { acc.push(name) }
+  })
+
+/// `imports` names each module this one imports as the program names it, which a dependency's bare
+/// sibling import does not.
+pub fn module_row(i: Int, o: Outline, imports: List<Bytes>) -> ModuleRow =
+  { name: o.name, index: i, items: o.declared, imports: imports, sets: o.sets, cuts: o.cuts }
+
+/// The modules each of `mods` imports, each named once, as `resolved` resolved them.
+pub fn imports_resolved(
+  mods: List<ParsedModule>,
+  resolved: Resolved,
+) -> List<List<Bytes>> / {abort.raise} =
+  range(0, mods.len()).map(|i: Int|
+    resolved.imports.get(i).fold([], |acc: List<Bytes>, t: Int| {
+      let name = mods.get(t).name;
+      if acc.fold(false, |b: Bool, x: Bytes| b || x == name) { acc } else { acc.push(name) }
+    }))
+
+/// What `outlines` lay a program's hash tables out over, as its index would.
+pub fn skeleton_of_outlines(outlines: List<Outline>) -> Skeleton =
+  outlines.fold({ nodes: [], order: [], tests: [], laws: [] }, |acc: Skeleton, o: Outline|
+    o.items.fold(acc, |a: Skeleton, item: Outlined| {
+      let node = |name: Bytes, decl: Bool|
+        {
+          ..a,
+          nodes: a.nodes.push({ name: qualify(o.name, name), decl: decl }),
+          order: a.order.push(DefEntry(a.nodes.len())),
+        };
+      match item {
+        OFn(f) -> node(f.name, false),
+        OType(t) -> node(t.name, true),
+        OEffect(e) -> node(e.name, true),
+        OTest(t) ->
+          {
+            ..a,
+            tests: a.tests.push({ key: qualify(o.name, t.name), cases: t.cases }),
+            order: a.order.push(TestEntry(a.tests.len())),
+          },
+        OLaw(l) ->
+          {
+            ..a,
+            laws: a.laws.push(qualify(o.name, l.name)),
+            order: a.order.push(LawEntry(a.laws.len())),
+          },
+      }
+    }))
+
+/// Whether `name` is a declaration of `module` itself, not of a module beneath it.
+pub fn of_module(module: Bytes, name: Bytes) -> Bool / {abort.raise} =
+  name.starts_with(module.concat(b".")) && name.index_of_from(b".", module.len() + 1) == None
+
+// --- Cuts -------------------------------------------------------------------
+
+// A module with its bodies blanked, every byte of a cut but a newline a space, so every offset
+// holds: what a unit holds of a module it does not lower.
+
+/// A braced cut keeps `{` and `}` at its ends: an empty block over exactly the body's own span. It
+/// names the function whose body it blanks, or with `test` the test (by its owner).
+pub type Cut = { start: Int, end: Int, braced: Bool, name: Bytes, test: Bool }
+
+derive bin for Cut
+
+// --- The emitter's root keys -------------------------------------------------
+
+/// One root the emitter caches a compiled body under, and the key it caches it by: a digest of
+/// what emitting it reads of the rest of the program. `crates/ply-compiled`'s `Source` reads these.
+pub type KeyRow = { root: Bytes, key: Bytes }
+
+// --- The emitter's roots -----------------------------------------------------
+
+/// One root the emitter offers: a definition, a spec clause, a test, the listing of a test's cases
+/// or a law part, with the arity its body is emitted at. `pure` is a definition's published purity, which lets a memo answer for
+/// it; any other root runs each time. `params` and `answer` say how what it is entered with and
+/// answers read at the seam. `witnesses` are the type variables whose witnesses lead `params`, which
+/// an entry from outside fills from what its arguments show of each.
+pub type EmitterRoot = {
+  root: Bytes,
+  arity: Int,
+  pure: Bool,
+  at: ModuleSpan,
+  params: List<Carry>,
+  answer: Carry,
+  witnesses: List<Int>,
+}
+
+/// One constructor, with its arity and how its fields read over its type's parameters; the
+/// emitter orders tags by position here. `key` and `show` are the functions its type's module
+/// states its values are compared and shown through.
+pub type EmitterCtor = {
+  name: Bytes,
+  arity: Int,
+  fields: List<Carry>,
+  key: Option<Bytes>,
+  show: Option<Bytes>,
+  /// The functions its type's `numeric` names, in `numeric_ops`' order; none where it states none.
+  numeric: List<Bytes>,
+}
+
+// --- How a value reads at the compiled seam ------------------------------------
+
+/// Compiled code holds a width below 64 bits as a tagged `Int`, so only a value's type tells a `U8`
+/// from an `Int`; every other word says what it is. A carry is that type, cut to what decides a
+/// reading: `CPlain` where no width can sit, `CSum` a sum type at its parameters, whose
+/// constructor's fields read as its declaration types them, and `CVar` a type variable of the
+/// scheme around it, or a parameter of the declaration, by number. A function's words are never
+/// read, but a function the prover generated shows what its variables are.
+pub type Carry =
+  | CPlain
+  | CWidth(Int)
+  | CList(Carry)
+  | CMap(Carry, Carry)
+  | CRecord(List<CarriedField>)
+  | CSum(List<Carry>)
+  | CFn(List<Carry>, Carry)
+  | CVar(Int)
+
+pub type CarriedField = { name: Bytes, carry: Carry }
+
+/// A definition's or a test's published rows, which the checker takes in place of walking its body:
+/// what its module's check answered. A row's atoms name effects the item may never mention;
+/// `effect_hashes` is the name and hash each of those declarations had.
+pub type EffectHash = { name: Bytes, hash: Bytes }
+
+pub type KnownDefRow = {
+  name: Bytes,
+  hash: Bytes,
+  effect_hashes: List<EffectHash>,
+  footprint: Bytes,
+  performed: Bytes,
+  scaling: Bytes,
+  repeats: List<Int>,
+  /// Whether its calls end and how it calls what it is handed.
+  ending: Ending,
+  summary: Summary,
+  /// Where its body can raise.
+  raises: List<Raise>,
+  /// What the emitter reads of its body, as `filed_facts` writes it.
+  facts: Bytes,
+  /// Its scheme, canonical.
+  scheme: Scheme,
+}
+
+/// `owner` is the test as the checker files its sites: its module and its place among the module's.
+pub type KnownTestRow = {
+  key: Bytes,
+  hash: Bytes,
+  effect_hashes: List<EffectHash>,
+  footprint: Bytes,
+  owner: Bytes,
+  facts: Bytes,
+}
+
+// --- The rows an analysis publishes -----------------------------------------------
+
+/// `types` holds each type the rows' facts name, by key, once for all of them.
+pub type Rows = { defs: List<KnownDefRow>, tests: List<KnownTestRow>, types: TypeTable }
+
+// What the store keeps of a definition and a test, in the encoding it keeps them in.
+derive bin for EffectHash
+
+derive bin for KnownDefRow
+
+derive bin for KnownTestRow
+
+derive bin for Rows
+
+// --- The rows an answer is made of ----------------------------------------------
+
+// Types and rows are held as the checker's values.
+
+/// A span: a module index, `no_module` outside every module, and the offsets.
+pub type ModuleSpan = { module: Int, start: Int, end: Int }
+
+pub type ModuleRow = {
+  name: Bytes,
+  index: Int,
+  items: List<Bytes>,
+  imports: List<Bytes>,
+  sets: List<SetView>,
+  cuts: List<Cut>,
+}
+
+pub type ParamRow = { name: Bytes, at: ModuleSpan }
+
+pub type SpecRow = { kind: Bytes, index: Int, footprint: List<Atom>, at: ModuleSpan }
+
+pub type DefRow = {
+  name: Bytes,
+  module: Bytes,
+  simple_name: Bytes,
+  public: Bool,
+  reuse: Bool,
+  footprint: List<Atom>,
+  performed: List<Atom>,
+  constraints: List<DefConstraint>,
+  row_aliases: List<Bytes>,
+  params: List<ParamRow>,
+  spec: List<SpecRow>,
+  at: ModuleSpan,
+  literals: List<Bytes>,
+}
+
+pub type TypeRow = {
+  name: Bytes,
+  module: Bytes,
+  simple_name: Bytes,
+  public: Bool,
+  arity: Int,
+  at: ModuleSpan,
+}
+
+pub type TestRow = {
+  key: Bytes,
+  name: Bytes,
+  module: Bytes,
+  index: Int,
+  nondet: Bool,
+  footprint: List<Atom>,
+  at: ModuleSpan,
+  name_at: ModuleSpan,
+}
+
+pub type BinderRow = { name: Bytes, at: ModuleSpan, ty: Type }
+
+pub type LawRow = {
+  key: Bytes,
+  name: Bytes,
+  module: Bytes,
+  index: Int,
+  binders: List<BinderRow>,
+  has_guard: Bool,
+  footprint: List<Atom>,
+  at: ModuleSpan,
+  literals: List<Bytes>,
+}
+
+/// `carries` says how each argument a host handler is given reads at the compiled seam.
+pub type OpRow = {
+  name: Bytes,
+  mode: Bytes,
+  resource_param: Bool,
+  params: List<Type>,
+  ret: Type,
+  scheme: Option<Scheme>,
+  at: ModuleSpan,
+  carries: List<Carry>,
+}
+
+pub type EffectRow = {
+  name: Bytes,
+  module: Bytes,
+  simple_name: Bytes,
+  public: Bool,
+  nondet: Bool,
+  ops: List<OpRow>,
+  at: ModuleSpan,
+}
+
+pub type CtorRow = {
+  name: Bytes,
+  module: Bytes,
+  simple_name: Bytes,
+  type_name: Bytes,
+  index: Int,
+  arity: Int,
+  fields: List<Type>,
+  scheme: Scheme,
+  at: ModuleSpan,
+}
+
+pub type HashRow = {
+  name: Bytes,
+  def: Option<Bytes>,
+  own: Option<Bytes>,
+  decl: Option<Bytes>,
+  specs: List<Bytes>,
+  spec_texts: List<Bytes>,
+  deps: List<Bytes>,
+}
+
+/// A test's or a law's hash row, under the index of the item it is about; `text` is a law's
+/// sentence hash and is empty for a test.
+pub type ItemHashRow = { key: Bytes, hash: Bytes, text: Bytes, deps: List<Bytes> }
+
+pub type HashFrame = | HDef(HashRow) | HTest(ItemHashRow) | HLaw(ItemHashRow)
+
+pub type OrdinalRow = { module: Bytes, items: List<Bytes> }
+
+pub type BodyRow = { name: Bytes, body: Bytes }
+
+pub type BakedRow = { name: Bytes, hash: Bytes }
+
+/// Every table of the front end's answer.
+pub type Dump = {
+  diags: List<Diag>,
+  order: List<Bytes>,
+  packages: List<PackageDeps>,
+  pins: List<Pinned>,
+  module_packages: List<Int>,
+  modules: List<ModuleRow>,
+  defs: List<DefRow>,
+  types: List<TypeRow>,
+  tests: List<TestRow>,
+  laws: List<LawRow>,
+  effects: List<EffectRow>,
+  ctors: List<CtorRow>,
+  hashes: List<HashFrame>,
+  hashes_digest: Bytes,
+  keys: List<KeyRow>,
+  emitter_roots: List<EmitterRoot>,
+  /// Each `const` definition, with the hash of all it reaches: what a unit finds its value by.
+  baked: List<BakedRow>,
+  emitter_ctors: List<EmitterCtor>,
+  ordinals: List<OrdinalRow>,
+  bodies: List<BodyRow>,
+  embeds: List<EmbedAt>,
+  /// What every definition and test published, which spares the emitter a walk of the bodies it
+  /// does not lower.
+  rows: Rows,
+  /// A `WalkedFacts`, in the encoding both programs read with the type: the emitter lowers a body the
+  /// checker walked without walking it again.
+  walked: Bytes,
+}
+
+/// A diagnostic as the answer carries it: no dedup key, and the note count is the notes.
+pub fn answered_diag(diag: Diag) -> Diag =
+  {
+    code: diag.code,
+    notes: diag.notes_text.len(),
+    labels: diag.labels,
+    text: b"",
+    message: diag.message,
+    notes_text: diag.notes_text,
+    severity: diag.severity,
+    fixes: diag.fixes,
+  }
+
+// --- Embeds: tests ---------------------------------------------------------------
+
+test "what a module's items ask to embed is what the module asks, each once" {
+  let m = parse(
+    b"fn a() -> Bytes = embed(\"x\")\nfn b() -> Bytes = embed(\"x\")\nfn c() -> List<Int> = embed_dir(\"d\").map(|f: { name: String, bytes: Bytes }| 1)\ntest \"t\" { assert(embed(\"y\").len() > 0) }\n",
+  ).node;
+  assert_eq(wants_in(wants_by_item(m)), wants_of(m));
+  assert_eq(wants_by_item(m).map(|i: ItemWants| i.name), [
+    Some(b"a"),
+    Some(b"b"),
+    Some(b"c"),
+    Some(b"test t"),
+  ])
+}

@@ -1,0 +1,345 @@
+//! The builder: the compiler's own program, which makes a program's front end and C out of that
+//! program's sources for `ply bootstrap` to link against the runtime the builder runs on. It reads
+//! the program below the root it is handed and hashes it. A program is the definition it enters and
+//! all that reaches, so where that hashes as a program this builder already built, what it made then
+//! is the program, whatever else of the text moved. Otherwise it checks the program seeded with the
+//! rows a build of it by this front end kept, emits its unit, keeping the emitter's answers between
+//! builds under this emitter's own identity, holds the value of each `const` definition, keeps the
+//! C's parts in the toolchain's cache, and writes the front end and their manifest.
+
+import cc
+import cc (compilers, toolchain)
+import load (Checked, SourceFile, answers_of, assembled, entry_hash_of, every_root, prepared)
+import front.rows (BakedRow)
+import front.published (linked_of)
+import store.hash.forms (TheFn, reach)
+import check.resolve.tables (Diag, Label)
+import unit (Baked, Runtime, shipped, baked_key, const_budget, const_room, emitted,
+             emitter_identity, held, keep_value, kept_value, program_key, programs_kept, read_kept,
+             stored_root, write_kept)
+import std.bytes (u64_le)
+import std.fs (fs)
+import std.list
+import std.process (process)
+import std.random (entropy)
+import std.time (time)
+import std.path (below_root)
+
+fn usage() -> String =
+  "the builder takes ROOT ENTRY FRONT SOURCES MEMO KEPT PHASES: the program's package at the absolute path ROOT, the definition it enters, where its front end and the manifest of its C, which is kept in the toolchain's cache, are written, where what its modules answered is kept between builds (nothing kept: an empty MEMO), `kept` to keep the emitter's answers in the toolchain's cache (else `fresh`), and `phases` to say what each step took (else `quiet`)"
+
+/// The line and column of byte `at` of `text`, from one.
+fn line_col(text: Bytes, at: Int) -> String / {abort.raise} = {
+  let before = text.slice(0, if at > text.len() { text.len() } else { at });
+  let lines = before.split(b"\n");
+  lines.len().to_string() ++ ":"
+    ++ Int::to_string(match lines.at(lines.len() - 1) { Some(l) -> l.len() + 1, None -> 1 })
+}
+
+/// Where a diagnostic points: its first primary label's file, line and column, when it has one.
+fn place(diag: Diag, files: List<SourceFile>) -> String / {abort.raise} =
+  match diag.labels.filter(|label: Label| label.primary) {
+    [label, ..] -> match files.at(label.module) {
+      Some(f) -> f.path ++ ":" ++ line_col(f.text, label.start) ++ ": ",
+      None -> "",
+    },
+    [] -> "",
+  }
+
+fn told(diags: List<Diag>, files: List<SourceFile>) -> Unit / {process.err[proc], abort.raise} =
+  diags.fold((), |_: Unit, diag: Diag|
+    process.err[proc](
+      diag.notes_text.fold(
+        place(diag, files) ++ String::of_bytes_lossy(diag.code) ++ ": "
+          ++ String::of_bytes_lossy(diag.message),
+        |told: String, note: Bytes| told ++ "\n  = " ++ String::of_bytes_lossy(note),
+      ),
+    ))
+
+fn texts(files: List<SourceFile>) -> List<Bytes> = files.map(|f: SourceFile| f.text)
+
+fn ms(from: Int, to: Int) -> String = Int::to_string(to - from) ++ "ms"
+
+/// What a build made: the front end the runtime reads and the manifest of the unit's C, whose parts
+/// the toolchain's cache keeps.
+type Made = { front: Bytes, sources: Bytes }
+
+/// `made` as one value kept between builds: the front end's length, the front end, the manifest.
+fn packed(made: Made) -> Bytes =
+  Bytes::concat_all([u64_le(made.front.len()), made.front, made.sources])
+
+/// What `packed` kept, while the cache still holds every part of its C.
+fn unpacked(bytes: Bytes) -> Option<Made> / {toolchain.read, abort.raise} =
+  match bytes.u64_at(0) {
+    Some(n) -> if 8 + n > bytes.len() { None } else {
+      let made = { front: bytes.slice(8, 8 + n), sources: bytes.slice(8 + n, bytes.len()) };
+      match cc::manifested(made.sources) {
+        Some(sources) -> if cc::holds_sources(sources) { Some(made) } else { None },
+        None -> None,
+      }
+    },
+    None -> None,
+  }
+
+/// What a build reaches: the program's sources and the stores below the filesystem's root, the
+/// runtime it runs on, which it emits for, the compilers and their cache, and its own streams.
+pub effect set Builds = {shipped.answer, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.stamps, shipped.runtime, shipped.front, shipped.values, fs.list_dir[abs], fs.kind[abs], fs.read_file[abs], fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise}
+
+/// `made` written where its front end and its manifest go: 0 when both were, 2 when one could not be.
+fn written(
+  made: Made,
+  front: String,
+  sources: String,
+) -> Int / {fs.write[abs], process.err[proc], abort.raise} =
+  if fs.write_file[abs](below_root(front), made.front)
+      && fs.write_file[abs](below_root(sources), made.sources) { 0 } else {
+    process.err[proc](
+      "what was built could not be written to `" ++ front ++ "` and `" ++ sources ++ "`",
+    );
+    2
+  }
+
+/// The program at `root` built: 0 when its front end and its C's manifest were written, 1 when the program
+/// was refused, and 2 when what was built could not be written. `memo` is where what its modules
+/// answered is kept between builds (none where it is empty).
+pub fn built(
+  root: String,
+  entry: String,
+  front: String,
+  sources: String,
+  memo: String,
+  kept: Bool,
+  phases: Bool,
+) -> Int / {Builds} = {
+  let started = time.elapsed_ms();
+  let definitions = shipped.definitions();
+  let cache = toolchain.cache();
+  let programs = below_root(cache ++ "/" ++ programs_kept());
+  match prepared[abs](below_root(root)) {
+    Err(u) -> {
+      told(u.diags, u.files);
+      1
+    },
+    Ok(p) -> {
+      let store = if memo == "" { "" } else { below_root(memo) };
+      // A program is the definition it enters and all that reaches, so what was built under its
+      // entry's hash is the program.
+      let key = match entry_hash_of[abs, abs](p, store, Bytes::of_string(entry)) {
+        Some(h) -> Some(program_key(h, shipped.runtime(), definitions)),
+        None -> None,
+      };
+      let reading = time.elapsed_ms();
+      let had = match key {
+        Some(k) -> match read_kept[abs](programs, k) { Some(b) -> unpacked(b), None -> None },
+        None -> None,
+      };
+      match had {
+        Some(made) -> {
+          let wrote = written(made, front, sources);
+          if phases {
+            process.err[proc](
+              "phases: " ++ entry ++ " answered " ++ ms(started, reading)
+                ++ ", and enters what a program already built does",
+            )
+          };
+          wrote
+        },
+        None -> match assembled[abs](p, answers_of[abs, abs](p, store), false) {
+          Err(u) -> {
+            told(u.diags, u.files);
+            1
+          },
+          Ok(checked) -> match linked_of(
+              checked.front.dump,
+              Bytes::of_string(entry),
+              checked.front.files.len(),
+            ) {
+            None -> {
+              process.err[proc]("the program defines no `" ++ entry ++ "` to enter");
+              1
+            },
+            Some(carried) -> {
+              let f = checked.front;
+              let checking = time.elapsed_ms();
+              let offered = every_root(f);
+              let bodies = below_root(cache ++ "/bodies");
+              let emitter = if kept { emitter_identity(definitions) } else { b"" };
+              let values = constants(checked, offered, kept, emitter, bodies);
+              let valuing = time.elapsed_ms();
+              let emission = emitted(
+                shipped.runtime(),
+                f.dump,
+                texts(f.files),
+                f.inputs,
+                offered,
+                emitter,
+                |k: Bytes| answer_kept(kept, bodies, k),
+                |k: Bytes, bytes: Bytes| keep_answer(kept, bodies, k, bytes),
+                values,
+              );
+              match held(f.dump, offered, emission) {
+                Err(diags) -> {
+                  told(diags, f.files);
+                  1
+                },
+                Ok(unit) -> match cc::kept(cc::split(unit)) {
+                  Err(why) -> {
+                    process.err[proc](why);
+                    2
+                  },
+                  Ok(kept_sources) -> {
+                    let made = {
+                      front: shipped.front(carried),
+                      sources: cc::manifest(kept_sources),
+                    };
+                    let wrote = written(made, front, sources);
+                    match key {
+                      Some(k) -> if wrote == 0 { write_kept[abs](programs, k, packed(made)) },
+                      None -> (),
+                    };
+                    if phases {
+                      process.err[proc](
+                        "phases: " ++ entry ++ " answered " ++ ms(started, reading) ++ ", checked "
+                          ++ ms(reading, checking)
+                          ++ ", constants held "
+                          ++ ms(checking, valuing)
+                          ++ ", emitted and written "
+                          ++ ms(valuing, time.elapsed_ms()),
+                      )
+                    };
+                    wrote
+                  },
+                },
+              }
+            },
+          },
+        },
+      }
+    },
+  }
+}
+
+/// An emitter's answer kept below `bodies` between builds, when a build keeps them.
+fn answer_kept(
+  kept: Bool,
+  bodies: String,
+  key: Bytes,
+) -> Option<Bytes> / {fs.read[abs], fs.write[abs], time.now_ms, abort.raise} =
+  if kept { read_kept[abs](bodies, key) } else { None }
+
+fn keep_answer(
+  kept: Bool,
+  bodies: String,
+  key: Bytes,
+  bytes: Bytes,
+) -> Unit / {fs.write[abs], entropy.next, time.now_ms, abort.raise} =
+  if kept { write_kept[abs](bodies, key, bytes) } else { () }
+
+/// The value of each `const` definition among `offered`, which the unit holds in place of its body:
+/// read back where a build or a check kept it, under the runtime, the emitter and the hash of all the
+/// definition reaches, and else entered here and kept beside the emitter's answers. One that raises,
+/// runs past `const_budget` or answers past `const_room` is left to its body, which answers the same
+/// in every process that reaches it.
+fn constants(
+  checked: Checked,
+  offered: List<Bytes>,
+  kept: Bool,
+  emitter: Bytes,
+  bodies: String,
+) -> List<Baked> / {shipped.runtime, shipped.values, fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, entropy.next, time.now_ms, abort.raise} = {
+  let runtime = shipped.runtime();
+  let wanted = offered.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
+  let rows = checked.front.dump.baked.filter(|row: BakedRow| wanted.contains(row.name));
+  let key = |row: BakedRow| baked_key(runtime.identity, emitter, row.hash);
+  let had = rows.map(|row: BakedRow| if kept { kept_value[abs](bodies, key(row)) } else { None });
+  let open = range(0, rows.len()).filter(|i: Int| had.get(i) == None);
+  let names = open.map(|i: Int| rows.get(i).name);
+  let found = if names.len() == 0 { [] }
+  else { entered(checked, runtime, names, offered, kept, emitter, bodies) };
+  let fresh = range(0, names.len()).fold(Map::new(), |acc: Map<Bytes, Bytes>, k: Int|
+    match found.at(k) {
+      Some(Some(text)) -> if text.len() > const_room() { acc } else {
+        if kept { keep_value[abs](bodies, key(rows.get(open.get(k))), text) };
+        acc.insert(names.get(k), text)
+      },
+      _ -> acc,
+    });
+  range(0, rows.len()).fold([], |acc: List<Baked>, i: Int| {
+    let name = rows.get(i).name;
+    match match had.get(i) { Some(text) -> Some(text), None -> fresh.get(name) } {
+      Some(text) -> acc.push({ name: name, text: text }),
+      None -> acc,
+    }
+  })
+}
+
+/// What each of `names`, `const` definitions, answers through its stored root on a unit of all they
+/// reach, compiled here and entered on the runtime the builder runs on: none for one it could not
+/// answer.
+fn entered(
+  checked: Checked,
+  runtime: Runtime,
+  names: List<Bytes>,
+  offered: List<Bytes>,
+  kept: Bool,
+  emitter: Bytes,
+  bodies: String,
+) -> List<Option<Bytes>> / {shipped.values, fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, entropy.next, time.now_ms, abort.raise} = {
+  let unanswered = names.map(|_: Bytes| None);
+  let reached = reach(checked.hashes, names.map(|n: Bytes| TheFn(n))).fns;
+  let roots = offered.filter(|n: Bytes| reached.contains(n)).concat(names.map(stored_root));
+  match emitted(
+      runtime,
+      checked.front.dump,
+      texts(checked.front.files),
+      checked.front.inputs,
+      roots,
+      emitter,
+      |k: Bytes| answer_kept(kept, bodies, k),
+      |k: Bytes, bytes: Bytes| keep_answer(kept, bodies, k, bytes),
+    ) {
+    Err(_) -> unanswered,
+    Ok(e) -> match ((compilers.found[cc](), toolchain.scratch())) {
+      (Some(compiler), Some(work)) -> {
+        let t = cc::toolchain_of(compiler, "-O0");
+        let library = match cc::objects[cc](
+            t,
+            cc::split(e.produced.text),
+            ["-fPIC", "-fno-strict-aliasing"],
+            work,
+          ) {
+          Err(_) -> None,
+          Ok(objects) -> match cc::shared[cc](t, objects, work) {
+            Ok(l) -> Some(l),
+            Err(_) -> None,
+          },
+        };
+        toolchain.cleared(work);
+        match library {
+          None -> unanswered,
+          Some(l) ->
+            shipped.values(
+              checked.front.files,
+              checked.front.dump,
+              l,
+              names.map(|n: Bytes| String::of_bytes(stored_root(n))),
+              const_budget(),
+            ),
+        }
+      },
+      _ -> unanswered,
+    },
+  }
+}
+
+pub fn main() -> Unit / {Builds, process.args[proc], process.exit[proc]} =
+  match process.args[proc]() {
+    [root, entry, front, sources, memo, kept, phases] ->
+      process.exit[proc](
+        built(root, entry, front, sources, memo, kept == "kept", phases == "phases"),
+      ),
+    _ -> {
+      process.err[proc](usage());
+      process.exit[proc](2)
+    },
+  }

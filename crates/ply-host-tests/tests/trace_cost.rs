@@ -1,7 +1,7 @@
-use ply_eval::host::{
+use ply_core::host::{
     HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostRuntime, MachineId, Pending,
 };
-use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskId, Value};
+use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskId, Value};
 use ply_host::trace::{Clock, Discard, Json, Level, Op, Sink, Trace};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

@@ -18,25 +18,6 @@ const MODULE: &str = ".ply";
 /// The compiler's own modules, `emit/roots.ply` being `compiler.emit.roots`.
 pub const COMPILER: &str = "compiler";
 
-/// Where the last release's `ply bootstrap` keeps the shipped files, read as [`STD`] and
-/// [`COMPILER`]: CI's first bootstrap links the pack that release writes with this runtime.
-const RELEASED_ROOTS: [(&str, &str); 2] = [
-    ("crates/ply-std/ply", STD),
-    ("crates/ply-compiler/ply", COMPILER),
-];
-
-/// `path` under the root this runtime reads it by.
-fn logical(path: String) -> String {
-    for (released, root) in RELEASED_ROOTS {
-        if let Some(rest) = path.strip_prefix(released)
-            && (rest.is_empty() || rest.starts_with('/'))
-        {
-            return format!("{root}{rest}");
-        }
-    }
-    path
-}
-
 /// What every shipped module answers, as `ply std --answers` writes it: a file of zstd frames and
 /// its index, itself one frame.
 pub const ANSWERS: &str = "answers";
@@ -210,10 +191,6 @@ fn read_table(table: &[u8], start: usize, end: usize) -> Result<Vec<Entry>, Stri
     if entries.windows(2).any(|pair| pair[0].path >= pair[1].path) {
         return Err("the pack's table is not in ascending order".to_string());
     }
-    for entry in &mut entries {
-        entry.path = logical(std::mem::take(&mut entry.path));
-    }
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
 }
 

@@ -5,8 +5,8 @@
 use crate::pool::{JobOutput, Pooled};
 use crate::process::ProcessHost;
 use crate::stdio::{self, Mode, Standard};
-use ply_eval::host::HostRegistry;
-use ply_eval::{
+use ply_core::host::HostRegistry;
+use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
     HostRuntime, Linearity, Plain, Span, Symbol, Value, codes, slot,
 };

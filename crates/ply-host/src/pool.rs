@@ -1,7 +1,7 @@
 //! Where a host operation goes when it has to wait.
 //! One [`Pool`] per facility, all minting from one count of tokens.
 
-use ply_eval::{Diagnostic, Pending, Span, Symbol, Value, codes};
+use ply_core::{Diagnostic, Pending, Span, Symbol, Value, codes};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};

@@ -1,0 +1,492 @@
+//! Lent functions. A parameter of a top-level function or an `extern fn` written with a function
+//! type is lent to the call unless written `keep`: the body may call it, pass it to a parameter
+//! that is lent in turn, capture it in a lambda, which is then lent too, or read it in a `handle`,
+//! whose continuation is then lent, and nothing more. A call is checked against its callee's
+//! signature alone, so a callee's body never decides what a caller may lend it.
+
+import syntax.parsing (Span, Ident, QName, is_bare)
+import syntax.patterns (Pattern)
+import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
+                     ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
+                     EParallel, EBad, ETryBlock, ETagged, Stmt, SLet, SLetElse, SExpr, SAssign,
+                     Param, NamedArg, MatchArm, HandleClause, ReturnClause, HandlerVar, RecField,
+                     Hole, expr_span)
+import syntax.items (FnDef)
+import syntax.type_syntax (TFn, ty_span)
+import check.resolve.tables (Diag, Edit, error_at, with_fix, insertion, list_names)
+import check.resolve.sets (pattern_binders)
+import std.list
+
+/// How a function takes what a call passes its parameter `name`: `lent`, a function it may only
+/// call and hand on; `keep`, a function it may hold past the call; neither, a value of a type not
+/// written as a function type, a type parameter's or an alias's among them, which it may hold too.
+pub type Passed = { name: Bytes, lent: Bool, keep: Bool }
+
+/// A function's parameters as a call passes them, with `name`, the function as a diagnostic names it.
+pub type Takes = { name: Bytes, params: List<Passed> }
+
+/// How a function takes what a call passes at `p`.
+pub fn passed(p: Param) -> Passed =
+  {
+    name: p.name.name,
+    lent: !p.keep && (match p.ty { Some(TFn(_)) -> true, _ -> false }),
+    keep: p.keep,
+  }
+
+/// What a call names that the body does not bind: a function, by the name `Callees.takes` knows
+/// it under, a constructor, or something the check could not tell.
+pub type Target = | ToFunction(Bytes) | ToConstructor | ToUnknown
+
+/// What a walk asks of the check: what a name calls; what the call on a value the check wrote out
+/// at a span calls with the value first, empty for a function a record's field holds; and how a
+/// function takes its arguments.
+pub type Callees = {
+  named: (QName) -> Target / {abort.raise},
+  member: (Span) -> Option<Bytes> / {abort.raise},
+  takes: (Bytes) -> Option<Takes> / {abort.raise},
+}
+
+/// Where a lent value would be held past the call.
+type Place =
+  | Answered
+  | Stored
+  | Performed
+  | Kept({ callee: Bytes, param: Bytes })
+  | Held({ callee: Bytes, param: Bytes })
+  | Applied
+  /// A continuation lent on, whose callee may answer what a call of it answers.
+  | Relayed({ callee: Bytes, param: Bytes })
+
+/// A lent parameter a value may be, as the value is written at `span`.
+type Lent = { param: Bytes, span: Span }
+
+type Escape = { lent: List<Lent>, place: Place }
+
+/// What a walk has found: each place a lent value would be held, and every lent parameter read.
+type Seen = { escapes: List<Escape>, read: List<Bytes> }
+
+/// An expression walked: the lent parameters its value may be, and those a call of it may answer,
+/// which only a continuation's may, since a lambda that answers one is refused.
+type Valued = { seen: Seen, lent: List<Lent>, answers: List<Bytes> }
+
+/// What a local may be, as `Valued` says of a value.
+type Local = { lent: List<Bytes>, answers: List<Bytes> }
+
+/// Each local, and `room`, the rounds a `handle`'s answer is read again in, one more than there
+/// are lent parameters, since each round that changes it adds one.
+type Scope = { locals: Map<Bytes, Local>, callees: Callees, room: Int }
+
+type Stated = { s: Scope, v: Valued }
+
+/// The diagnostics so far, and the parameters one of them already offers to write `keep` on.
+type Refused = { diags: List<Diag>, fixed: List<Bytes> }
+
+/// Whether a parameter of `def` is lent to it.
+pub fn lends(def: FnDef) -> Bool = def.params.any(|p: Param| passed(p).lent)
+
+/// Where `def`'s body would hold a parameter lent to it past its call, each refused as a diagnostic
+/// of the module numbered `module`, the fix for a parameter offered once.
+pub fn refusals(module: Int, def: FnDef, callees: Callees) -> List<Diag> / {abort.raise} =
+  if !lends(def) { [] } else {
+    let lent = def.params.filter(|p: Param| passed(p).lent).map(|p: Param| p.name.name);
+    let s = def.params.fold(
+      { locals: Map::new(), callees: callees, room: lent.len() + 1 },
+      |sc: Scope, p: Param|
+        bound(sc, p.name.name, if lent.contains(p.name.name) { [p.name.name] } else { [] }),
+    );
+    held(s, quiet(), def.body, Answered).escapes.fold(
+      { diags: [], fixed: [] },
+      |acc: Refused, e: Escape| refused(module, def, e, acc),
+    ).diags
+  }
+
+fn quiet() -> Seen = { escapes: [], read: [] }
+
+/// One diagnostic for each place `e` is written at.
+fn refused(module: Int, def: FnDef, e: Escape, acc: Refused) -> Refused / {abort.raise} =
+  e.lent.fold([], |spans: List<Span>, l: Lent| spans.push_unique(l.span)).fold(
+    acc,
+    |r: Refused, span: Span| {
+      let params = e.lent.fold([], |ps: List<Bytes>, l: Lent|
+        if l.span == span { ps.push_unique(l.param) } else { ps });
+      {
+        diags: r.diags.push(
+          refusal(
+            module,
+            def,
+            span,
+            params,
+            params.filter(|p: Bytes| !r.fixed.contains(p)),
+            e.place,
+          ),
+        ),
+        fixed: params.fold(r.fixed, |fs: List<Bytes>, p: Bytes| fs.push_unique(p)),
+      }
+    },
+  )
+
+/// `unfixed` are those of `params` no diagnostic before this one offers to write `keep` on.
+fn refusal(
+  module: Int,
+  def: FnDef,
+  span: Span,
+  params: List<Bytes>,
+  unfixed: List<Bytes>,
+  place: Place,
+) -> Diag / {abort.raise} = {
+  let d = error_at(
+    b"E0475",
+    module,
+    span,
+    Bytes::concat_all([
+      list_names(params),
+      if params.len() == 1 { b" is" } else { b" are" },
+      b" lent to `",
+      def.name.name,
+      b"`, and would be held past its call",
+    ]),
+    place_text(place),
+    [
+      b"a parameter of a function type is lent unless written `keep`: the function may call it, pass it to a parameter lent in turn, or capture it in a lambda, which is then lent too",
+      b"write `keep` before its type to hold it, and each caller passes a function that may be held",
+    ],
+  );
+  if unfixed.len() == 0 { d } else {
+    with_fix(
+      d,
+      b"write `keep` on ".concat(list_names(unfixed)),
+      def.params.fold([], |edits: List<Edit>, p: Param|
+        match p.ty {
+          Some(t) -> if unfixed.contains(p.name.name) {
+            edits.push(insertion(module, ty_span(t).start, b"keep "))
+          } else { edits },
+          None -> edits,
+        }),
+    )
+  }
+}
+
+fn place_text(place: Place) -> Bytes =
+  match place {
+    Answered -> b"answered here",
+    Stored -> b"held in a value here",
+    Performed -> b"passed to an operation, whose handler may hold it",
+    Kept(k) ->
+      Bytes::concat_all([b"passed to `", k.param, b"` of `", k.callee, b"`, written `keep`"]),
+    Held(h) ->
+      Bytes::concat_all([
+        b"passed to `",
+        h.param,
+        b"` of `",
+        h.callee,
+        b"`, which is not written as a function type and may hold what it is passed",
+      ]),
+    Applied -> b"passed to a function value, which may hold it",
+    Relayed(r) ->
+      Bytes::concat_all([
+        b"passed to `",
+        r.param,
+        b"` of `",
+        r.callee,
+        b"`, which may answer what a call of it answers",
+      ]),
+  }
+
+fn local(s: Scope, q: QName) -> Option<Local> =
+  if is_bare(q) { s.locals.get(q.name.name) } else { None }
+
+fn bound(s: Scope, name: Bytes, lent: List<Bytes>) -> Scope =
+  bound_local(s, name, { lent: lent, answers: [] })
+
+fn bound_local(s: Scope, name: Bytes, l: Local) -> Scope = { ..s, locals: s.locals.insert(name, l) }
+
+/// Every binder of `p`, each bound to what the value it takes apart may be.
+fn bound_pattern(s: Scope, p: Pattern, l: Local) -> Scope =
+  pattern_binders(p, []).fold(s, |sc: Scope, n: Bytes| bound_local(sc, n, l))
+
+fn params_of(lent: List<Lent>) -> List<Bytes> =
+  lent.fold([], |ps: List<Bytes>, l: Lent| ps.push_unique(l.param))
+
+fn local_of(v: Valued) -> Local = { lent: params_of(v.lent), answers: v.answers }
+
+fn joined(a: List<Bytes>, b: List<Bytes>) -> List<Bytes> =
+  b.fold(a, |acc: List<Bytes>, p: Bytes| acc.push_unique(p))
+
+fn read(seen: Seen, params: List<Bytes>) -> Seen = { ..seen, read: joined(seen.read, params) }
+
+fn plain(seen: Seen) -> Valued = { seen: seen, lent: [], answers: [] }
+
+fn either(a: Valued, b: Valued) -> Valued =
+  { seen: b.seen, lent: a.lent.concat(b.lent), answers: joined(a.answers, b.answers) }
+
+fn escaped(seen: Seen, lent: List<Lent>, place: Place) -> Seen =
+  if lent.len() == 0 { seen }
+  else { { ..seen, escapes: seen.escapes.push({ lent: lent, place: place }) } }
+
+/// `e` walked where its value is let go of: called, dropped, or passed to a lent parameter.
+fn spent(s: Scope, seen: Seen, e: Expr) -> Seen / {abort.raise} = walk(s, seen, e).seen
+
+/// `e` walked where its value is held at `place`.
+fn held(s: Scope, seen: Seen, e: Expr, place: Place) -> Seen / {abort.raise} = {
+  let v = walk(s, seen, e);
+  escaped(v.seen, v.lent, place)
+}
+
+fn each(s: Scope, seen: Seen, xs: List<Expr>, place: Place) -> Seen / {abort.raise} =
+  xs.fold(seen, |acc: Seen, x: Expr| held(s, acc, x, place))
+
+/// `args` and `named` each held at `place`.
+fn passed_all(
+  s: Scope,
+  seen: Seen,
+  args: List<Expr>,
+  named: List<NamedArg>,
+  place: Place,
+) -> Seen / {abort.raise} =
+  named.fold(each(s, seen, args, place), |acc: Seen, n: NamedArg| held(s, acc, n.value, place))
+
+fn walk(s: Scope, seen: Seen, e: Expr) -> Valued / {abort.raise} =
+  match e {
+    ELit(_) -> plain(seen),
+    EBad(_) -> plain(seen),
+    EVar(v) -> match local(s, v.name) {
+      Some(l) ->
+        {
+          seen: read(seen, l.lent),
+          lent: l.lent.map(|p: Bytes| { param: p, span: v.span }),
+          answers: l.answers,
+        },
+      None -> plain(seen),
+    },
+    EBinary(b) -> plain(spent(s, spent(s, seen, b.lhs), b.rhs)),
+    EUnary(u) -> plain(spent(s, seen, u.operand)),
+    ELambda(l) -> {
+      let inner = l.params.fold(s, |sc: Scope, p: Param| bound(sc, p.name.name, []));
+      let body = held(inner, { ..seen, read: [] }, l.body, Answered);
+      {
+        seen: read({ ..body, read: seen.read }, body.read),
+        lent: body.read.map(|p: Bytes| { param: p, span: l.span }),
+        answers: [],
+      }
+    },
+    EApp(a) -> applied(s, seen, a.span, a.func, a.args, a.named),
+    EIf(i) -> {
+      let t = walk(s, spent(s, seen, i.cond), i.then_branch);
+      either(t, walk(s, t.seen, i.else_branch))
+    },
+    EMatch(m) -> {
+      let on = walk(s, seen, m.scrutinee);
+      m.arms.fold(plain(on.seen), |acc: Valued, arm: MatchArm| {
+        let inner = bound_pattern(s, arm.pat, local_of(on));
+        let guarded = match arm.guard { Some(g) -> spent(inner, acc.seen, g), None -> acc.seen };
+        either(acc, walk(inner, guarded, arm.body))
+      })
+    },
+    EBlock(b) -> {
+      let st = statements(s, seen, b.stmts);
+      match b.tail { Some(t) -> either(st.v, walk(st.s, st.v.seen, t)), None -> st.v }
+    },
+    ERecord(r) -> plain(each(s, seen, r.fields.map(|f: RecField| f.value), Stored)),
+    ERecordUpdate(r) ->
+      plain(each(s, spent(s, seen, r.base), r.fields.map(|f: RecField| f.value), Stored)),
+    ETry(t) -> plain(spent(s, seen, t.operand)),
+    EField(f) -> plain(spent(s, seen, f.base)),
+    EList(l) -> plain(each(s, seen, l.items, Stored)),
+    EPerform(p) -> match s.callees.member(p.span) {
+      Some(callee) -> plain(on_value(s, seen, callee, None, p.args, [])),
+      None -> plain(each(s, seen, p.args, Performed)),
+    },
+    EHandle(h) -> handled(s, seen, h.body, h.ret, h.clauses, h.vars),
+    EWithHold(w) ->
+      walk(
+        bound(s, w.binder.name, []),
+        spent(s, held(s, seen, w.acquire, Stored), w.release),
+        w.body,
+      ),
+    ESimulate(x) -> walk(s, seen, x.body),
+    EParallel(p) -> plain(each(s, seen, p.branches, Stored)),
+    ETagged(t) -> plain(each(s, seen, t.holes.map(|h: Hole| h.value), Stored)),
+    ETryBlock(t) -> plain(held(s, seen, t.body, Stored)),
+  }
+
+/// A call: of a local value, of a function by name, of a function of a value's type, or of what a
+/// field or another expression holds. Only a continuation's call answers a lent value.
+fn applied(
+  s: Scope,
+  seen: Seen,
+  span: Span,
+  func: Expr,
+  args: List<Expr>,
+  named: List<NamedArg>,
+) -> Valued / {abort.raise} =
+  match func {
+    EVar(v) -> match local(s, v.name) {
+      Some(l) ->
+        {
+          seen: passed_all(s, read(seen, l.lent), args, named, Applied),
+          lent: l.answers.map(|p: Bytes| { param: p, span: span }),
+          answers: [],
+        },
+      None -> {
+        let callee = match s.callees.member(v.name.span) {
+          Some(m) -> if m.len() > 0 { ToFunction(m) } else { s.callees.named(v.name) },
+          None -> s.callees.named(v.name),
+        };
+        plain(match callee {
+          ToFunction(n) -> passed_to(s, seen, s.callees.takes(n), 0, args, named),
+          ToConstructor -> passed_all(s, seen, args, named, Stored),
+          ToUnknown -> passed_all(s, seen, args, named, Applied),
+        })
+      },
+    },
+    EField(f) ->
+      plain(match s.callees.member(span) {
+        Some(callee) -> on_value(s, seen, callee, Some(f.base), args, named),
+        None -> passed_all(s, spent(s, seen, f.base), args, named, Applied),
+      }),
+    other -> plain(passed_all(s, spent(s, seen, other), args, named, Applied)),
+  }
+
+/// The call of `callee` on a value, `base` where the value is walked, empty for a function the
+/// value's field holds.
+fn on_value(
+  s: Scope,
+  seen: Seen,
+  callee: Bytes,
+  base: Option<Expr>,
+  args: List<Expr>,
+  named: List<NamedArg>,
+) -> Seen / {abort.raise} = {
+  let on = match base { Some(b) -> spent(s, seen, b), None -> seen };
+  if callee.len() == 0 { passed_all(s, on, args, named, Applied) }
+  else { passed_to(s, on, s.callees.takes(callee), 1, args, named) }
+}
+
+/// `args` passed from the parameter at `from` on, then each of `named` to the parameter it names.
+fn passed_to(
+  s: Scope,
+  seen: Seen,
+  takes: Option<Takes>,
+  from: Int,
+  args: List<Expr>,
+  named: List<NamedArg>,
+) -> Seen / {abort.raise} =
+  match takes {
+    None -> passed_all(s, seen, args, named, Applied),
+    Some(t) ->
+      named.fold(
+        args.fold({ seen: seen, at: from }, |acc: { seen: Seen, at: Int }, x: Expr|
+          { seen: passed_at(s, acc.seen, t, Some(acc.at), x), at: acc.at + 1 }).seen,
+        |acc: Seen, x: NamedArg|
+          passed_at(s, acc, t, t.params.find_index(|p: Passed| p.name == x.name.name), x.value),
+      ),
+  }
+
+/// A lent parameter may be handed a continuation only where no call of it answers a lent value,
+/// which the callee could answer in turn.
+fn passed_at(s: Scope, seen: Seen, t: Takes, at: Option<Int>, arg: Expr) -> Seen / {abort.raise} = {
+  let param = match at { Some(i) -> t.params.at(i), None -> None };
+  match param {
+    Some(p) -> if p.lent {
+      let v = walk(s, seen, arg);
+      escaped(
+        v.seen,
+        v.answers.map(|q: Bytes| { param: q, span: expr_span(arg) }),
+        Relayed({ callee: t.name, param: p.name }),
+      )
+    } else if p.keep { held(s, seen, arg, Kept({ callee: t.name, param: p.name })) }
+    else { held(s, seen, arg, Held({ callee: t.name, param: p.name })) },
+    None -> held(s, seen, arg, Applied),
+  }
+}
+
+/// A block's statements walked: the scope past them, what they saw, and what the `else` of a
+/// `let ... else`, which is the block's value where it runs, may answer.
+fn statements(s: Scope, seen: Seen, stmts: List<Stmt>) -> Stated / {abort.raise} =
+  stmts.fold({ s: s, v: plain(seen) }, |st: Stated, x: Stmt|
+    match x {
+      SLet(l) -> {
+        let v = walk(st.s, st.v.seen, l.value);
+        { s: bound_pattern(st.s, l.pat, local_of(v)), v: { ..st.v, seen: v.seen } }
+      },
+      SLetElse(l) -> {
+        let v = walk(st.s, st.v.seen, l.value);
+        let f = walk(st.s, v.seen, l.fallback);
+        { s: bound_pattern(st.s, l.pat, local_of(v)), v: either(st.v, f) }
+      },
+      SExpr(y) -> { ..st, v: { ..st.v, seen: spent(st.s, st.v.seen, y) } },
+      SAssign(y) -> { ..st, v: { ..st.v, seen: held(st.s, st.v.seen, y.value, Stored) } },
+    })
+
+/// A clause's scope: its parameters and the label it binds, none of them lent.
+fn clause_scope(s: Scope, c: HandleClause) -> Scope = {
+  let given = c.params.fold(s, |sc: Scope, p: Ident| bound(sc, p.name, []));
+  match c.label_binder { Some(t) -> bound(given, t.name, []), None -> given }
+}
+
+/// A `handle`: its value is its body's, or its `return` clause's, or a resuming clause's, and what
+/// a clause that does not resume answers goes back to the perform. Handlers are deep, so the
+/// continuation holds every lent parameter the body, `return` or any clause reads, and a call of
+/// it answers whatever the `handle` may.
+fn handled(
+  s: Scope,
+  seen: Seen,
+  body: Expr,
+  ret: Option<ReturnClause>,
+  clauses: List<HandleClause>,
+  vars: List<HandlerVar>,
+) -> Valued / {abort.raise} = {
+  let inits = vars.fold({ s: s, seen: seen }, |acc: { s: Scope, seen: Seen }, v: HandlerVar|
+    { s: bound(acc.s, v.name.name, []), seen: held(acc.s, acc.seen, v.init, Stored) });
+  let b = walk(s, { ..inits.seen, read: [] }, body);
+  let returning = match ret {
+    Some(r) -> bound_local(inits.s, r.binder.name, local_of(b)),
+    None -> inits.s,
+  };
+  let caught = clauses.fold(
+    joined(b.seen.read, match ret {
+      Some(r) -> walk(returning, quiet(), r.body).seen.read,
+      None -> [],
+    }),
+    |acc: List<Bytes>, c: HandleClause|
+      joined(acc, walk(clause_scope(inits.s, c), quiet(), c.body).seen.read),
+  );
+  let after = read({ ..b.seen, read: inits.seen.read }, caught);
+  let returned: Valued = match ret {
+    Some(r) -> walk(returning, after, r.body),
+    None -> { seen: after, lent: b.lent, answers: b.answers },
+  };
+  let resumed = |c: HandleClause, k: Ident, answers: List<Bytes>|
+    bound_local(clause_scope(inits.s, c), k.name, { lent: caught, answers: answers });
+  let answers = answering(
+    clauses,
+    resumed,
+    joined(params_of(returned.lent), returned.answers),
+    s.room,
+  );
+  clauses.fold(returned, |acc: Valued, c: HandleClause|
+    match c.resume {
+      Some(k) -> either(acc, walk(resumed(c, k, answers), acc.seen, c.body)),
+      None -> { ..acc, seen: held(clause_scope(inits.s, c), acc.seen, c.body, Answered) },
+    })
+}
+
+/// The lent parameters a `handle` may answer: `known` so far, with what each resuming clause
+/// answers where its continuation answers those, read again until a round adds none.
+fn answering(
+  clauses: List<HandleClause>,
+  resumed: (HandleClause, Ident, List<Bytes>) -> Scope,
+  known: List<Bytes>,
+  room: Int,
+) -> List<Bytes> / {abort.raise} =
+  if room <= 0 { known } else {
+    let next = clauses.fold(known, |acc: List<Bytes>, c: HandleClause|
+      match c.resume {
+        Some(k) -> {
+          let v = walk(resumed(c, k, known), quiet(), c.body);
+          joined(acc, joined(params_of(v.lent), v.answers))
+        },
+        None -> acc,
+      });
+    if next.len() == known.len() { known } else { answering(clauses, resumed, next, room - 1) }
+  }

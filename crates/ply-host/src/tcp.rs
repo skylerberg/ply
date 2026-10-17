@@ -10,8 +10,8 @@ pub use socket::TcpHost;
 pub(crate) use socket::apply;
 pub use wire::{Credentials, Endpoint, Probing, Refusal, SocketOption};
 
-use ply_eval::crypto::Framing;
-use ply_eval::{
+use ply_core::crypto::Framing;
+use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity, Resource, Span, Symbol, codes,
 };
@@ -444,7 +444,7 @@ impl HostHandler for Operation {
             }
             Op::SendSecret => {
                 let before = req.args[1].as_bytes(span, "the bytes before the secret")?;
-                let ply_eval::Value::Secret(held) = &req.args[2] else {
+                let ply_core::Value::Secret(held) = &req.args[2] else {
                     return Err(not_sealed(&req.args[2], span));
                 };
                 let encoding = req.args[3].as_str(span, "an encoding")?;
@@ -509,7 +509,7 @@ fn empty_payload(op: Op, span: Span) -> Diagnostic {
 }
 
 #[cold]
-fn not_sealed(got: &ply_eval::Value, span: Span) -> Diagnostic {
+fn not_sealed(got: &ply_core::Value, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!(

@@ -1,4 +1,4 @@
-use ply_eval::{
+use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity,
     Resource, Span, Symbol, Value, codes,
 };
@@ -385,14 +385,14 @@ fn an_ask_is_answered_through_its_handler() {
         .iter()
         .find(|(op, _)| op.op.as_str() == "resized")
         .expect("`resized` is registered");
-    let atom = ply_eval::EffectAtom::new(
+    let atom = ply_core::EffectAtom::new(
         Symbol::new(EFFECT),
         Resource::Singleton,
-        ply_eval::Mode::Write,
+        ply_core::Mode::Write,
     );
     struct Nothing;
     impl HostRuntime for Nothing {
-        fn watch(&self, _: &ply_eval::Pending) -> Result<(), Diagnostic> {
+        fn watch(&self, _: &ply_core::Pending) -> Result<(), Diagnostic> {
             Ok(())
         }
         fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
@@ -401,7 +401,7 @@ fn an_ask_is_answered_through_its_handler() {
         fn park(&self) -> Result<(), Diagnostic> {
             Ok(())
         }
-        fn block_on(&self, _: ply_eval::Pending) -> Result<Value, Diagnostic> {
+        fn block_on(&self, _: ply_core::Pending) -> Result<Value, Diagnostic> {
             Ok(Value::Unit)
         }
     }
@@ -413,7 +413,7 @@ fn an_ask_is_answered_through_its_handler() {
                 op: declaration,
                 args: &[],
                 span: Span::DUMMY,
-                machine: ply_eval::host::MachineId(0),
+                machine: ply_core::host::MachineId(0),
                 task: None,
                 declared: None,
             },
@@ -428,14 +428,14 @@ fn the_handler_answers_the_flag_and_the_clock() {
     let handlers = registrations(Some(&shutdown));
     let stopping = &handlers[0].1;
     let deadline = &handlers[1].1;
-    let atom = ply_eval::EffectAtom::new(
+    let atom = ply_core::EffectAtom::new(
         Symbol::new(EFFECT),
         Resource::Singleton,
-        ply_eval::Mode::Read,
+        ply_core::Mode::Read,
     );
     let declaration = Op::Stopping.declaration();
     fn request<'a>(
-        atom: &ply_eval::EffectAtom,
+        atom: &ply_core::EffectAtom,
         declaration: &'a HostOp,
         args: &'a [Value],
     ) -> HostRequest<'a> {
@@ -444,7 +444,7 @@ fn the_handler_answers_the_flag_and_the_clock() {
             op: declaration,
             args,
             span: Span::DUMMY,
-            machine: ply_eval::host::MachineId(0),
+            machine: ply_core::host::MachineId(0),
             task: None,
             declared: None,
         }
@@ -452,7 +452,7 @@ fn the_handler_answers_the_flag_and_the_clock() {
 
     struct Nothing;
     impl HostRuntime for Nothing {
-        fn watch(&self, _: &ply_eval::Pending) -> Result<(), Diagnostic> {
+        fn watch(&self, _: &ply_core::Pending) -> Result<(), Diagnostic> {
             Ok(())
         }
         fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
@@ -461,7 +461,7 @@ fn the_handler_answers_the_flag_and_the_clock() {
         fn park(&self) -> Result<(), Diagnostic> {
             Ok(())
         }
-        fn block_on(&self, _: ply_eval::Pending) -> Result<Value, Diagnostic> {
+        fn block_on(&self, _: ply_core::Pending) -> Result<Value, Diagnostic> {
             Ok(Value::Unit)
         }
     }

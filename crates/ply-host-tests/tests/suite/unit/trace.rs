@@ -1,8 +1,8 @@
 mod spans;
 
-use ply_eval::host::MachineId;
-use ply_eval::host::Pending;
-use ply_eval::{
+use ply_core::host::MachineId;
+use ply_core::host::Pending;
+use ply_core::{
     Determinism, Diagnostic, EffectAtom, HostAnswer, HostHandler, HostRequest, HostResource,
     HostRuntime, Linearity, Mode, Resource, Span, Symbol, TaskId, codes,
 };
@@ -39,13 +39,13 @@ impl HostRuntime for NoRuntime {
     fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
         unreachable!("nothing here answers `Pending`")
     }
-    fn resolved(&self) -> Vec<(u64, Result<ply_eval::Value, Diagnostic>)> {
+    fn resolved(&self) -> Vec<(u64, Result<ply_core::Value, Diagnostic>)> {
         unreachable!("nothing here answers `Pending`")
     }
     fn park(&self) -> Result<(), Diagnostic> {
         unreachable!("nothing here answers `Pending`")
     }
-    fn block_on(&self, _: Pending) -> Result<ply_eval::Value, Diagnostic> {
+    fn block_on(&self, _: Pending) -> Result<ply_core::Value, Diagnostic> {
         unreachable!("nothing here answers `Pending`")
     }
 }
@@ -86,20 +86,20 @@ fn discarding() -> (Arc<Trace>, Arc<Counting>) {
     )
 }
 
-fn ctor(name: &str, args: Vec<ply_eval::Value>) -> ply_eval::Value {
-    ply_eval::Value::ctor(format!("{MODULE}.{name}"), args)
+fn ctor(name: &str, args: Vec<ply_core::Value>) -> ply_core::Value {
+    ply_core::Value::ctor(format!("{MODULE}.{name}"), args)
 }
 
-fn no_fields() -> ply_eval::Value {
-    ply_eval::Value::empty_map()
+fn no_fields() -> ply_core::Value {
+    ply_core::Value::empty_map()
 }
 
-fn field(key: &str, value: ply_eval::Value) -> ply_eval::Value {
-    ply_eval::Value::map([(ply_eval::Value::str(key), value)])
+fn field(key: &str, value: ply_core::Value) -> ply_core::Value {
+    ply_core::Value::map([(ply_core::Value::str(key), value)])
 }
 
 impl Fixture {
-    fn perform(&self, op: Op, at: &str, args: Vec<ply_eval::Value>) -> ply_eval::Value {
+    fn perform(&self, op: Op, at: &str, args: Vec<ply_core::Value>) -> ply_core::Value {
         self.as_task(None, op, at, args)
             .unwrap_or_else(|d| panic!("{d:?}"))
     }
@@ -109,8 +109,8 @@ impl Fixture {
         task: Option<TaskId>,
         op: Op,
         at: &str,
-        args: Vec<ply_eval::Value>,
-    ) -> Result<ply_eval::Value, Diagnostic> {
+        args: Vec<ply_core::Value>,
+    ) -> Result<ply_core::Value, Diagnostic> {
         perform_on(&self.trace, self.machine, task, op, at, args)
     }
 
@@ -129,8 +129,8 @@ fn perform_on(
     task: Option<TaskId>,
     op: Op,
     at: &str,
-    args: Vec<ply_eval::Value>,
-) -> Result<ply_eval::Value, Diagnostic> {
+    args: Vec<ply_core::Value>,
+) -> Result<ply_core::Value, Diagnostic> {
     let handler = Operation {
         op,
         trace: Arc::clone(trace),
@@ -156,21 +156,21 @@ fn perform_on(
     }
 }
 
-fn enter(f: &Fixture, at: &str, name: &str) -> ply_eval::Value {
-    f.perform(Op::Enter, at, vec![ply_eval::Value::str(name), no_fields()])
+fn enter(f: &Fixture, at: &str, name: &str) -> ply_core::Value {
+    f.perform(Op::Enter, at, vec![ply_core::Value::str(name), no_fields()])
 }
 
-fn exit(f: &Fixture, at: &str, span: ply_eval::Value) -> ply_eval::Value {
+fn exit(f: &Fixture, at: &str, span: ply_core::Value) -> ply_core::Value {
     f.perform(Op::Exit, at, vec![span, ctor("Ok", Vec::new())])
 }
 
-fn event(f: &Fixture, at: &str, level: &str, name: &str) -> ply_eval::Value {
+fn event(f: &Fixture, at: &str, level: &str, name: &str) -> ply_core::Value {
     f.perform(
         Op::Event,
         at,
         vec![
             ctor(level, Vec::new()),
-            ply_eval::Value::str(name),
+            ply_core::Value::str(name),
             no_fields(),
         ],
     )
@@ -212,13 +212,13 @@ fn the_listing_names_the_sink_that_actually_serves_the_run() {
 fn enter_answers_a_span_carrying_its_id_and_its_channel() {
     let f = fixture();
     let span = enter(&f, "orders", "place_order");
-    let ply_eval::Value::Record(fields) = &span else {
+    let ply_core::Value::Record(fields) = &span else {
         panic!("a `Span` is a record: {span:?}");
     };
-    assert_eq!(fields[&Symbol::new("id")], ply_eval::Value::Int(1));
+    assert_eq!(fields[&Symbol::new("id")], ply_core::Value::Int(1));
     assert_eq!(
         fields[&Symbol::new("channel")],
-        ply_eval::Value::str("orders")
+        ply_core::Value::str("orders")
     );
 }
 
@@ -261,7 +261,7 @@ fn a_span_opened_in_one_task_does_not_close_in_another() {
             Some(TaskId(1)),
             Op::Enter,
             "http",
-            vec![ply_eval::Value::str("request"), no_fields()],
+            vec![ply_core::Value::str("request"), no_fields()],
         )
         .expect("task 1 opens a span");
 
@@ -304,10 +304,10 @@ fn two_tasks_interleaving_produce_correctly_nested_parent_links() {
             .expect("task 2")
     };
 
-    let a = one(Op::Enter, vec![ply_eval::Value::str("a"), no_fields()]);
-    let b = two(Op::Enter, vec![ply_eval::Value::str("b"), no_fields()]);
-    let a_inner = one(Op::Enter, vec![ply_eval::Value::str("a2"), no_fields()]);
-    let b_inner = two(Op::Enter, vec![ply_eval::Value::str("b2"), no_fields()]);
+    let a = one(Op::Enter, vec![ply_core::Value::str("a"), no_fields()]);
+    let b = two(Op::Enter, vec![ply_core::Value::str("b"), no_fields()]);
+    let a_inner = one(Op::Enter, vec![ply_core::Value::str("a2"), no_fields()]);
+    let b_inner = two(Op::Enter, vec![ply_core::Value::str("b2"), no_fields()]);
     two(Op::Exit, vec![b_inner, ctor("Ok", Vec::new())]);
     one(Op::Exit, vec![a_inner, ctor("Ok", Vec::new())]);
     two(Op::Exit, vec![b, ctor("Ok", Vec::new())]);
@@ -345,7 +345,7 @@ fn closing_an_outer_span_abandons_the_spans_above_it() {
         "orders",
         vec![
             outer,
-            ctor("Failed", vec![ply_eval::Value::str("rolled back")]),
+            ctor("Failed", vec![ply_core::Value::str("rolled back")]),
         ],
     );
 
@@ -414,7 +414,7 @@ fn a_retired_task_writes_the_spans_it_left_open_as_abandoned() {
             Some(task),
             Op::Enter,
             at,
-            vec![ply_eval::Value::str(name), no_fields()],
+            vec![ply_core::Value::str(name), no_fields()],
         )
         .unwrap_or_else(|d| panic!("{d:?}"));
     }
@@ -455,7 +455,7 @@ fn a_retired_tasks_open_span_is_still_reported_as_w0609_when_the_entry_point_end
         Some(TaskId(3)),
         Op::Enter,
         "db",
-        vec![ply_eval::Value::str("query"), no_fields()],
+        vec![ply_core::Value::str("query"), no_fields()],
     )
     .unwrap_or_else(|d| panic!("{d:?}"));
     f.trace.end_task(f.machine, TaskId(3));
@@ -496,7 +496,7 @@ fn the_spans_left_open_are_what_the_warnings_counted() {
         Some(TaskId(3)),
         Op::Enter,
         "db",
-        vec![ply_eval::Value::str("query"), no_fields()],
+        vec![ply_core::Value::str("query"), no_fields()],
     )
     .unwrap_or_else(|d| panic!("{d:?}"));
     f.trace.end_task(f.machine, TaskId(3));
@@ -551,8 +551,8 @@ fn a_metric_is_a_record_on_the_channel_the_call_site_named() {
         Op::Count,
         "orders",
         vec![
-            ply_eval::Value::str("orders_placed"),
-            ply_eval::Value::Int(3),
+            ply_core::Value::str("orders_placed"),
+            ply_core::Value::Int(3),
             no_fields(),
         ],
     );
@@ -560,8 +560,8 @@ fn a_metric_is_a_record_on_the_channel_the_call_site_named() {
         Op::Gauge,
         "orders",
         vec![
-            ply_eval::Value::str("shelf"),
-            ply_eval::Value::Decimal("41.75".parse().expect("a decimal")),
+            ply_core::Value::str("shelf"),
+            ply_core::Value::Decimal("41.75".parse().expect("a decimal")),
             no_fields(),
         ],
     );
@@ -569,8 +569,8 @@ fn a_metric_is_a_record_on_the_channel_the_call_site_named() {
         Op::Time,
         "orders",
         vec![
-            ply_eval::Value::str("place_order"),
-            ply_eval::Value::Int(8213),
+            ply_core::Value::str("place_order"),
+            ply_core::Value::Int(8213),
             no_fields(),
         ],
     );
@@ -603,7 +603,7 @@ fn a_discarded_record_reads_no_clock_and_writes_nothing() {
         None,
         Op::Enter,
         "orders",
-        vec![ply_eval::Value::str("place_order"), no_fields()],
+        vec![ply_core::Value::str("place_order"), no_fields()],
     )
     .expect("a span opens whatever the sink does");
 
@@ -616,8 +616,8 @@ fn a_discarded_record_reads_no_clock_and_writes_nothing() {
             "orders",
             vec![
                 ctor("Error", Vec::new()),
-                ply_eval::Value::str("placed"),
-                field("sku", ctor("FText", vec![ply_eval::Value::str("BOLT-1")])),
+                ply_core::Value::str("placed"),
+                field("sku", ctor("FText", vec![ply_core::Value::str("BOLT-1")])),
             ],
         )
         .expect("an event is discarded, not refused");
@@ -651,7 +651,7 @@ fn spans_are_tracked_under_discard_so_a_verdict_does_not_depend_on_the_sink() {
         Some(TaskId(1)),
         Op::Enter,
         "http",
-        vec![ply_eval::Value::str("request"), no_fields()],
+        vec![ply_core::Value::str("request"), no_fields()],
     )
     .expect("a span opens");
     assert_eq!(trace.open_spans(), 1);
@@ -728,19 +728,19 @@ fn a_program_field_named_like_an_envelope_key_does_not_shadow_it() {
         "orders",
         vec![
             ctor("Info", Vec::new()),
-            ply_eval::Value::str("placed"),
-            ply_eval::Value::map([
+            ply_core::Value::str("placed"),
+            ply_core::Value::map([
                 (
-                    ply_eval::Value::str("level"),
-                    ctor("FText", vec![ply_eval::Value::str("error")]),
+                    ply_core::Value::str("level"),
+                    ctor("FText", vec![ply_core::Value::str("error")]),
                 ),
                 (
-                    ply_eval::Value::str("span"),
-                    ctor("FInt", vec![ply_eval::Value::Int(9999)]),
+                    ply_core::Value::str("span"),
+                    ctor("FInt", vec![ply_core::Value::Int(9999)]),
                 ),
                 (
-                    ply_eval::Value::str("ts"),
-                    ctor("FInt", vec![ply_eval::Value::Int(0)]),
+                    ply_core::Value::str("ts"),
+                    ctor("FInt", vec![ply_core::Value::Int(0)]),
                 ),
             ]),
         ],
@@ -755,13 +755,13 @@ fn a_program_field_named_like_an_envelope_key_does_not_shadow_it() {
 #[test]
 fn every_field_shape_renders_and_an_empty_field_set_still_writes_the_object() {
     let f = fixture();
-    let render = |value: ply_eval::Value| -> String {
+    let render = |value: ply_core::Value| -> String {
         f.perform(
             Op::Event,
             "orders",
             vec![
                 ctor("Info", Vec::new()),
-                ply_eval::Value::str("x"),
+                ply_core::Value::str("x"),
                 field("f", value),
             ],
         );
@@ -770,38 +770,38 @@ fn every_field_shape_renders_and_an_empty_field_set_still_writes_the_object() {
         line[at..].to_string()
     };
     assert_eq!(
-        render(ctor("FInt", vec![ply_eval::Value::Int(-3)])),
+        render(ctor("FInt", vec![ply_core::Value::Int(-3)])),
         r#""fields":{"f":-3}}"#
     );
     assert_eq!(
-        render(ctor("FBool", vec![ply_eval::Value::Bool(true)])),
+        render(ctor("FBool", vec![ply_core::Value::Bool(true)])),
         r#""fields":{"f":true}}"#
     );
     assert_eq!(
-        render(ctor("FText", vec![ply_eval::Value::str("a\"b\nc")])),
+        render(ctor("FText", vec![ply_core::Value::str("a\"b\nc")])),
         r#""fields":{"f":"a\"b\nc"}}"#
     );
     // A `Decimal` is a string: a JSON number consumer would round its scale away.
     assert_eq!(
         render(ctor(
             "FDecimal",
-            vec![ply_eval::Value::Decimal(
+            vec![ply_core::Value::Decimal(
                 "41.750".parse().expect("a decimal")
             )]
         )),
         r#""fields":{"f":"41.750"}}"#
     );
     assert_eq!(
-        render(ctor("FBytes", vec![ply_eval::Value::bytes([0u8, 255, 16])])),
+        render(ctor("FBytes", vec![ply_core::Value::bytes([0u8, 255, 16])])),
         r#""fields":{"f":"00ff10"}}"#
     );
     // JSON has no NaN, so a writer that emitted one would produce a document no parser accepts.
     assert_eq!(
-        render(ctor("FFloat", vec![ply_eval::Value::Float(f64::NAN)])),
+        render(ctor("FFloat", vec![ply_core::Value::Float(f64::NAN)])),
         r#""fields":{"f":"NaN"}}"#
     );
     assert_eq!(
-        render(ctor("FFloat", vec![ply_eval::Value::Float(1.5)])),
+        render(ctor("FFloat", vec![ply_core::Value::Float(1.5)])),
         r#""fields":{"f":1.5}}"#
     );
 
@@ -810,7 +810,7 @@ fn every_field_shape_renders_and_an_empty_field_set_still_writes_the_object() {
         "orders",
         vec![
             ctor("Info", Vec::new()),
-            ply_eval::Value::str("x"),
+            ply_core::Value::str("x"),
             no_fields(),
         ],
     );
@@ -827,31 +827,31 @@ fn every_field_shape_renders_and_an_empty_field_set_still_writes_the_object() {
 #[test]
 fn a_json_field_is_serialized_by_the_one_writer_this_crate_has() {
     let f = fixture();
-    let json = |name: &str, args: Vec<ply_eval::Value>| {
-        ply_eval::Value::ctor(format!("std.json.{name}"), args)
+    let json = |name: &str, args: Vec<ply_core::Value>| {
+        ply_core::Value::ctor(format!("std.json.{name}"), args)
     };
     f.perform(
         Op::Event,
         "orders",
         vec![
             ctor("Info", Vec::new()),
-            ply_eval::Value::str("x"),
+            ply_core::Value::str("x"),
             field(
                 "body",
                 ctor(
                     "FJson",
                     vec![json(
                         "Object",
-                        vec![ply_eval::Value::map([
+                        vec![ply_core::Value::map([
                             (
-                                ply_eval::Value::str("sku"),
-                                json("Str", vec![ply_eval::Value::str("BOLT-1")]),
+                                ply_core::Value::str("sku"),
+                                json("Str", vec![ply_core::Value::str("BOLT-1")]),
                             ),
                             (
-                                ply_eval::Value::str("n"),
+                                ply_core::Value::str("n"),
                                 json(
                                     "Number",
-                                    vec![ply_eval::Value::Decimal("2".parse().expect("a decimal"))],
+                                    vec![ply_core::Value::Decimal("2".parse().expect("a decimal"))],
                                 ),
                             ),
                         ])],
@@ -874,7 +874,7 @@ fn an_exit_carries_its_outcome_and_a_failure_carries_its_reason() {
     f.perform(
         Op::Exit,
         "orders",
-        vec![span, ctor("Failed", vec![ply_eval::Value::str("23514")])],
+        vec![span, ctor("Failed", vec![ply_core::Value::str("23514")])],
     );
     let line = f.sink.lines().pop().expect("a line");
     assert!(
@@ -894,11 +894,11 @@ fn two_field_sets_built_in_different_orders_render_identically() {
             "orders",
             vec![
                 ctor("Info", Vec::new()),
-                ply_eval::Value::str("x"),
-                ply_eval::Value::map(entries.map(|(k, v)| {
+                ply_core::Value::str("x"),
+                ply_core::Value::map(entries.map(|(k, v)| {
                     (
-                        ply_eval::Value::str(k),
-                        ctor("FInt", vec![ply_eval::Value::Int(v)]),
+                        ply_core::Value::str(k),
+                        ctor("FInt", vec![ply_core::Value::Int(v)]),
                     )
                 })),
             ],
@@ -932,8 +932,8 @@ fn a_perform_the_front_end_could_not_have_produced_is_plys_fault() {
         Op::Event,
         "orders",
         vec![
-            ply_eval::Value::Int(3),
-            ply_eval::Value::str("x"),
+            ply_core::Value::Int(3),
+            ply_core::Value::str("x"),
             no_fields(),
         ],
     )

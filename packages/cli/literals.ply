@@ -1,0 +1,913 @@
+//! What a load enters before anything runs: its tagged literals' parsers, its `const` definitions
+//! and its statements. `tag"text"` is the call `tag::literal("text")`, and one with holes the call
+//! of `tag::compile` on the texts around them, and a load that checked has not yet run either: here
+//! each one the run's own modules hold is entered on a machine of its own, under a step budget, and
+//! what its parser answers is the literal's verdict. A verdict is a function of the parser and the
+//! texts, so it is kept under the hash of all the parser reaches and the texts, in the toolchain's
+//! cache. A `const` definition is entered the same way, handed nothing: what it answers is kept
+//! there too, as the text a unit holds a value by, under the hash of all the definition reaches,
+//! and every unit emitted after holds the value in place of the body. A statement a call runs is
+//! computed the same way and judged by `statements`.
+
+import compiler.syntax.exprs (TaggedPart)
+import compiler.front.facts (View, Frame, TaggedSite)
+import compiler.front.seam (Within, ConstSite, const_sites)
+import compiler.store.hash.forms (TheFn, reach)
+import compiler.store.hash.encoding (hex)
+import compiler.front.interface (sized)
+import compiler.syntax.lexer (utf8_len)
+import compiler.load (every_root, LoadedAnalysis)
+import compiler.syntax.parsing (Span, no_module, span_between)
+import compiler.check.resolve.tables (Diag, Label, error_at, error_with_labels, label_at)
+import compiler.unit (read_kept, write_kept, shipped, baked_key, compiler_roots, const_budget,
+                      const_room, emitter_identity, identity_of, keep_value, kept_value,
+                      stored_root)
+import diagnostic (Place, shown)
+import env (env)
+import machine (machine, Called, default_options, unconfigured)
+import program (Timed, front_of, program_view, runs_statements)
+import semantics
+import sources
+import statements
+import statements (Asking, Judgement, Unjudged, asking, judged, judgement_key, judgement_bin,
+                   misfits, schemas_refused)
+import std.bin
+import std.fs (fs)
+import std.hash (blake3)
+import std.list
+import std.random (entropy)
+import std.time (time)
+import std.value (Value, VBytes, VCtor, VInt, VList, VRecord, VStr, render, field_named)
+import units
+import units (emit)
+import std.path (below_root)
+
+/// The calls a literal's parser may make before the check gives up on it.
+pub fn step_budget() -> Int = 10000000
+
+/// What a parser said of its texts. `Rejected` is its own `Err`: which text, where in it in
+/// characters, and why. `Raised` is a parser that raised instead of answering, and `Spent` one the
+/// budget stopped. A `const` definition is `Accepted` once its value is kept, `RaisedAt` where its
+/// raise has a place in the program, and `Oversize`, with the bytes its value's text takes, where
+/// those are past `const_room`.
+pub type Verdict =
+  | Accepted
+  | Rejected({ part: Int, offset: Int, message: String })
+  | Raised(String)
+  | Spent
+  | Oversize(Int)
+  | RaisedAt({ message: String, module: Int, start: Int, end: Int })
+
+derive bin for Verdict
+
+/// A parser, by its program-wide name and the hash of all it reaches, and what to hand it: one
+/// text as it is, or the several around a literal's holes as a list. A `const` definition is asked
+/// the same way and handed nothing, so it has no parts.
+pub type Asked = { callee: Bytes, hash: Bytes, parts: List<Bytes> }
+
+/// What a command asks of its tagged literals' parsers, its `const` definitions and its statements.
+/// What answers is `settling`, which `main` runs every command under, or a handler of the asker's
+/// own. A verdict is a function of what is asked, so the effect is a deterministic one, whatever
+/// the answering keeps.
+pub effect literal {
+  /// In `asked`'s order; or what kept the definitions from being entered at all.
+  read verdicts(timed: Timed, frame: Frame, root: String, asked: List<Asked>) -> Result<List<Verdict>, List<Diag>>
+  /// Each statement of `asked` judged against the schema it is held to, in `asked`'s order; or what
+  /// kept the definitions from being entered at all.
+  read statements(timed: Timed, frame: Frame, root: String, asked: List<statements::Asked>) -> Result<List<Judgement>, List<Diag>>
+}
+
+// --- Asking -----------------------------------------------------------------------
+
+fn asked_of(site: TaggedSite) -> Asked =
+  { callee: site.callee, hash: site.hash, parts: site.parts.map(|part: TaggedPart| part.text) }
+
+fn distinct(sites: List<TaggedSite>) -> List<Asked> =
+  sites.fold([], |acc: List<Asked>, site: TaggedSite|
+    if acc.contains(asked_of(site)) { acc } else { acc.push(asked_of(site)) })
+
+fn verdict_for(asked: List<Asked>, verdicts: List<Verdict>, site: TaggedSite) -> Option<Verdict> =
+  range(0, asked.len()).fold(None, |found: Option<Verdict>, i: Int|
+    match found {
+      Some(_) -> found,
+      None -> if asked.at(i) == Some(asked_of(site)) { verdicts.at(i) } else { None },
+    })
+
+/// How many bytes of `src` spell the character at `i`: an escape is one character, and so is a
+/// brace, which a tagged literal's text writes twice.
+fn spelled_width(src: Bytes, i: Int, end: Int) -> Int / {abort.raise} =
+  if i + 1 >= end { utf8_len(src.at(i)) }
+  else if src.at(i) == 123 || src.at(i) == 125 { 2 }
+  else if src.at(i) != 92 { utf8_len(src.at(i)) }
+  else if src.at(i + 1) != 117 { 2 } else {
+    iterate(i + 2, end - i, |j: Int|
+      if j >= end { Stop(end - i) }
+      else if src.at(j) == 125 { Stop(j + 1 - i) }
+      else { Continue(j + 1) })
+  }
+
+/// Where character `offset` of a text of a tagged literal is written: `quoted` is the text with
+/// what opens and closes it, a quote or the brace of a hole, and the character past the last is
+/// what closes it. Nowhere for an offset the text does not have.
+pub fn spelled_at(src: Bytes, quoted: Span, offset: Int) -> Option<Span> / {abort.raise} = {
+  let end = quoted.end - 1;
+  if offset < 0 || quoted.start + 1 > end || quoted.end > src.len() { None } else {
+    iterate(
+      { i: quoted.start + 1, left: offset },
+      end - quoted.start + 1,
+      |s: { i: Int, left: Int }|
+        if s.i >= end { Stop(if s.left == 0 { Some(span_between(end, end + 1)) } else { None }) }
+        else {
+          let width = spelled_width(src, s.i, end);
+          if s.left == 0 { Stop(Some(span_between(s.i, s.i + width))) }
+          else { Continue({ i: s.i + width, left: s.left - 1 }) }
+        },
+    )
+  }
+}
+
+fn holed(site: TaggedSite) -> Bool = site.parts.len() > 1
+
+fn spelled(site: TaggedSite) -> Bytes =
+  Bytes::concat_all([b"`", site.tag, if holed(site) { b"::compile`" } else { b"::literal`" }])
+
+fn ran(site: TaggedSite) -> Bytes =
+  if holed(site) {
+    Bytes::concat_all([
+      b"the check ran `",
+      site.callee,
+      b"` on the texts around the holes, as every `",
+      site.tag,
+      b"\"..{h}..\"` here is `",
+      site.tag,
+      b"::fill` called on what `",
+      site.tag,
+      b"::compile([\"..\", \"..\"])` answers and on its holes",
+    ])
+  } else {
+    Bytes::concat_all([
+      b"the check ran `",
+      site.callee,
+      b"` on the text, as every `",
+      site.tag,
+      b"\"..\"` here is the call `",
+      site.tag,
+      b"::literal(\"..\")`",
+    ])
+  }
+
+/// The literal's string, quotes included.
+fn string_of(site: TaggedSite) -> Span =
+  match ((site.parts.at(0), site.parts.at(site.parts.len() - 1))) {
+    (Some(first), Some(last)) -> span_between(first.quoted.start, last.quoted.end),
+    _ -> site.span,
+  }
+
+/// Where a parser's refusal lands: the character it names in the text it names, the whole hole
+/// for the offset just past a text a hole follows, and the whole string for a place it has not.
+fn refused_at(src: Bytes, site: TaggedSite, part: Int, offset: Int) -> Span / {abort.raise} =
+  match site.parts.at(part) {
+    None -> string_of(site),
+    Some(text) -> match spelled_at(src, text.quoted, offset) {
+      None -> string_of(site),
+      Some(span) -> match site.parts.at(part + 1) {
+        Some(next) -> if span.start != text.quoted.end - 1 { span }
+        else { span_between(span.start, next.quoted.start + 1) },
+        None -> span,
+      },
+    },
+  }
+
+fn refusal(
+  places: List<Place>,
+  site: TaggedSite,
+  verdict: Verdict,
+) -> Option<Diag> / {abort.raise} =
+  match verdict {
+    Accepted -> None,
+    Oversize(_) -> None,
+    RaisedAt(_) -> None,
+    Rejected(why) -> {
+      let src = match places.at(site.module) { Some(place) -> place.text, None -> b"" };
+      Some(
+        error_at(
+          b"E0153",
+          site.module,
+          refused_at(src, site, why.part, why.offset),
+          spelled(site).concat(b" refuses this literal"),
+          Bytes::of_string(why.message),
+          [ran(site)],
+        ),
+      )
+    },
+    Raised(message) ->
+      Some(
+        error_at(
+          b"E0154",
+          site.module,
+          site.span,
+          Bytes::concat_all([
+            spelled(site),
+            b" raised on this literal: ",
+            Bytes::of_string(message),
+          ]),
+          b"its parser gave no answer",
+          [ran(site), b"a parser answers `Err` of a text it refuses, saying where and why"],
+        ),
+      ),
+    Spent ->
+      Some(
+        error_at(
+          b"E0154",
+          site.module,
+          site.span,
+          Bytes::concat_all([
+            spelled(site),
+            b" did not answer this literal within ",
+            Bytes::of_string(step_budget().to_string()),
+            b" calls",
+          ]),
+          b"its parser gave no answer",
+          [ran(site), b"that is the budget a check gives each literal"],
+        ),
+      ),
+  }
+
+fn asked_const(site: ConstSite) -> Asked = { callee: site.name, hash: site.hash, parts: [] }
+
+fn is_const(a: Asked) -> Bool = a.parts.len() == 0
+
+fn budget_of(a: Asked) -> Int = if is_const(a) { const_budget() } else { step_budget() }
+
+fn const_refused(
+  site: ConstSite,
+  code: Bytes,
+  what: Bytes,
+  also: List<Label>,
+  notes: List<Bytes>,
+) -> Diag =
+  error_with_labels(
+    code,
+    Bytes::concat_all([b"`", site.name, b"` is `const`, and ", what]),
+    [label_at(site.module, site.span, true, b"a build evaluates this and keeps its value")].concat(
+      also,
+    ),
+    notes,
+  )
+
+fn const_raised(site: ConstSite, message: String, also: List<Label>) -> Diag =
+  const_refused(
+    site,
+    b"E0157",
+    b"raised when the build evaluated it: ".concat(Bytes::of_string(message)),
+    also,
+    [
+      b"a build evaluates a `const fn` before anything runs and keeps what it answers, so its body has to answer: for every file it embeds, as that file reads now",
+    ],
+  )
+
+fn const_refusal(site: ConstSite, verdict: Verdict) -> Option<Diag> =
+  match verdict {
+    Accepted -> None,
+    Rejected(_) -> None,
+    Raised(message) -> Some(const_raised(site, message, [])),
+    RaisedAt(r) ->
+      Some(
+        const_raised(site, r.message, [
+          label_at(r.module, span_between(r.start, r.end), false, b"raised here"),
+        ]),
+      ),
+    Spent ->
+      Some(
+        const_refused(
+          site,
+          b"E0158",
+          Bytes::concat_all([
+            b"did not answer within ",
+            Bytes::of_string(const_budget().to_string()),
+            b" calls",
+          ]),
+          [],
+          [b"that is the budget a build gives each `const fn`"],
+        ),
+      ),
+    Oversize(n) ->
+      Some(
+        const_refused(
+          site,
+          b"E0158",
+          Bytes::concat_all([
+            b"its value takes ",
+            Bytes::of_string(n.to_string()),
+            b" bytes kept, past the ",
+            Bytes::of_string(const_room().to_string()),
+            b" a build keeps",
+          ]),
+          [],
+          [
+            b"a unit holds a `const fn`'s value whole: keep the table smaller, or build it when run",
+          ],
+        ),
+      ),
+  }
+
+/// What refuses a load before anything of it runs: each tagged literal of the run's own modules its
+/// parser does not accept, at the place in its text the parser names; each `const` definition the
+/// program holds that a build could not evaluate and keep; and what the check finds wrong with each
+/// statement the run's own modules run. Nothing at all, and nothing asked, where the program writes
+/// none of them.
+pub fn unsettled(
+  timed: Timed,
+  frame: Frame,
+  root: String,
+) -> List<Diag> / {literal.verdicts, literal.statements, abort.raise} =
+  literal_refusals(timed, frame, root).concat(statement_refusals(timed, frame, root))
+
+/// Only a program one of whose own modules runs a statement asks after any.
+fn statement_refusals(
+  timed: Timed,
+  frame: Frame,
+  root: String,
+) -> List<Diag> / {literal.statements, abort.raise} =
+  if !runs_statements(timed.program, frame) { [] } else {
+    let asks = asking(frame).filter(|a: Asking| a.site.module < timed.program.files.len());
+    let refused = schemas_refused(asks);
+    if asks.len() == 0 { refused } else {
+      match literal.statements(timed, frame, root, asks.map(|a: Asking| a.asked)) {
+        Err(diags) -> refused.concat(diags),
+        Ok(judgements) ->
+          range(0, asks.len()).fold(refused, |acc: List<Diag>, i: Int|
+            match judgements.at(i) { Some(j) -> acc.concat(misfits(asks.get(i), j)), None -> acc }),
+      }
+    }
+  }
+
+fn literal_refusals(
+  timed: Timed,
+  frame: Frame,
+  root: String,
+) -> List<Diag> / {literal.verdicts, abort.raise} = {
+  let sites = frame.tagged.filter(|site: TaggedSite| site.module < timed.program.files.len());
+  let consts = const_sites(frame.outlines, frame.hashes);
+  if sites.len() == 0 && consts.len() == 0 { [] } else {
+    let parsers = distinct(sites);
+    let asked = parsers.concat(consts.map(asked_const));
+    match literal.verdicts(timed, frame, root, asked) {
+      Err(diags) -> diags,
+      Ok(verdicts) -> {
+        let literals = sites.fold([], |acc: List<Diag>, site: TaggedSite|
+          match verdict_for(parsers, verdicts, site) {
+            None -> acc,
+            Some(verdict) -> match refusal(timed.program.places, site, verdict) {
+              Some(diag) -> acc.push(diag),
+              None -> acc,
+            },
+          });
+        range(0, consts.len()).fold(literals, |acc: List<Diag>, i: Int|
+          match verdicts.at(parsers.len() + i) {
+            None -> acc,
+            Some(verdict) -> match const_refusal(consts.get(i), verdict) {
+              Some(diag) -> acc.push(diag),
+              None -> acc,
+            },
+          })
+      },
+    }
+  }
+}
+
+// --- Answering --------------------------------------------------------------------
+
+fn verdict_of(called: Called) -> Verdict / {abort.raise} =
+  match called.answer {
+    Err(raised) -> {
+      let diag = shown(raised);
+      if diag.code == b"E0503" { Spent } else { Raised(String::of_bytes_lossy(diag.message)) }
+    },
+    Ok(value) -> match value {
+      VCtor(name, args) -> if name == "Ok" { Accepted } else {
+        match args.at(0) {
+          Some(VRecord(fields)) -> match ((
+              field_named(fields, "offset"),
+              field_named(fields, "message"),
+            )) {
+            (Some(VInt(offset)), Some(VStr(message))) ->
+              Rejected({
+                part: match field_named(fields, "part") { Some(VInt(part)) -> part, _ -> 0 },
+                offset: offset,
+                message: message,
+              }),
+            _ -> Raised("it answered " ++ render(value)),
+          },
+          _ -> Raised("it answered " ++ render(value)),
+        }
+      },
+      _ -> Raised("it answered " ++ render(value)),
+    },
+  }
+
+/// A `const` definition's answer, as its stored root gave it: the text of its value, kept only where
+/// a build has room for it.
+fn value_of(called: Called) -> Judged / {abort.raise} =
+  match called.answer {
+    Err(raised) -> {
+      let diag = shown(raised);
+      let message = String::of_bytes_lossy(diag.message);
+      let placed = diag.labels.filter(|l: Label| l.primary && l.module != no_module());
+      {
+        verdict: if diag.code == b"E0503" { Spent } else {
+          match placed.at(0) {
+            Some(l) -> RaisedAt({ message: message, module: l.module, start: l.start, end: l.end }),
+            None -> Raised(message),
+          }
+        },
+        value: None,
+      }
+    },
+    Ok(VBytes(text)) -> if text.len() > const_room() {
+      { verdict: Oversize(text.len()), value: None }
+    } else { { verdict: Accepted, value: Some(text) } },
+    Ok(value) -> { verdict: Raised("its stored root answered " ++ render(value)), value: None },
+  }
+
+fn handed(a: Asked) -> Value = {
+  let texts = a.parts.map(|text: Bytes| VStr(String::of_bytes_lossy(text)));
+  match texts { [text] -> text, _ -> VList(texts) }
+}
+
+/// What entering the definitions `names` enters of the program: all they reach.
+fn entering(frame: Frame, names: List<Bytes>) -> Within / {abort.raise} =
+  { owners: reach(frame.hashes, names.map(|n: Bytes| TheFn(n))).fns, tests: Map::new() }
+
+fn callees(asked: List<Asked>) -> List<Bytes> =
+  asked.fold([], |acc: List<Bytes>, a: Asked|
+    if acc.contains(a.callee) { acc } else { acc.push(a.callee) })
+
+/// What entering one definition said: its verdict, and for a `const` definition a build can keep,
+/// the text of its value.
+type Judged = { verdict: Verdict, value: Option<Bytes> }
+
+/// `asked` entered on a machine loaded for them alone: a unit of the definitions they reach, each
+/// call under `steps`. A parser is handed its texts; a `const` definition is entered through its
+/// stored root, which hands back its value as text.
+fn entered(
+  front: LoadedAnalysis,
+  frame: Frame,
+  root: String,
+  asked: List<Asked>,
+  steps: Int,
+) -> Result<List<Judged>, List<Diag>> / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], abort.raise} =
+  if asked.len() == 0 { Ok([]) } else {
+    let names = callees(asked);
+    let reached = reach(frame.hashes, names.map(|n: Bytes| TheFn(n))).fns;
+    let offered = every_root(front).filter(|n: Bytes| reached.contains(n)).concat(
+      asked.filter(is_const).map(|a: Asked| stored_root(a.callee)),
+    );
+    match units::library_over(emit.unit(front, offered)) {
+      Err(diags) -> Err(diags),
+      Ok(unit) -> {
+        machine.configure[literals]({ ..default_options(), steps: steps });
+        let answered = match machine.load[literals](root, front, unit) {
+          Err(refused) -> Err(refused.diags),
+          Ok(_) -> match machine.bound[literals](
+              String::of_bytes_lossy(names.get(0)),
+              unconfigured(),
+            ) {
+            Err(refused) -> Err(refused.diags),
+            Ok(_) ->
+              Ok(
+                asked.map(|a: Asked|
+                  if is_const(a) {
+                    value_of(
+                      machine.call[literals](String::of_bytes_lossy(stored_root(a.callee)), []),
+                    )
+                  } else {
+                    {
+                      verdict: verdict_of(
+                        machine.call[literals](String::of_bytes_lossy(a.callee), [handed(a)]),
+                      ),
+                      value: None,
+                    }
+                  }),
+              ),
+          },
+        };
+        machine.drop[literals]();
+        answered
+      },
+    }
+  }
+
+/// What a verdict is a function of: the toolchain that entered the definition, the budget, the
+/// definition by the hash of all it reaches, and the texts.
+fn verdict_key(toolchain: Bytes, a: Asked) -> Bytes / {abort.raise} =
+  hex(
+    blake3(
+      Bytes::concat_all([
+        sized(b"ply literal verdict 2"),
+        sized(hex(bin::shape_digest(verdict_bin()))),
+        sized(toolchain),
+        sized(Bytes::of_string(budget_of(a).to_string())),
+        sized(a.hash),
+        sized(Bytes::of_string(a.parts.len().to_string())),
+        Bytes::concat_all(a.parts.map(sized)),
+      ]),
+    ),
+  )
+
+/// What a verdict or a judgement is a function of on the toolchain's side: the runtime, the binary,
+/// what the program's hashes mean, and the code that analyses, emits and judges, by the hash of all
+/// it reaches. No shipped module is part of it: what a definition reaches of one is in its hash.
+fn judging(definitions: Bytes, runtime: Bytes, version: String) -> Bytes / {abort.raise} =
+  hex(
+    blake3(
+      Bytes::concat_all([
+        sized(b"ply literal toolchain 1"),
+        sized(runtime),
+        sized(Bytes::of_string(version)),
+        sized(Bytes::of_string(semantics::version())),
+        sized(identity_of(definitions, judging_roots())),
+      ]),
+    ),
+  )
+
+/// The definitions a verdict or a judgement is a function of besides what it is asked over.
+fn judging_roots() -> List<Bytes> = compiler_roots().push(b"literals.settling")
+
+/// `value` is the key a `const` definition's value is kept under, which a unit finds it by.
+type Sought = { asked: Asked, key: Bytes, value: Bytes, kept: Option<Verdict> }
+
+/// `body` with every verdict it asks for read from the toolchain's cache, and the definitions of the
+/// rest entered once and their verdicts kept there, a `const` definition's value beside its own:
+/// the parsers on one machine and the `const` definitions on another, each under its budget.
+pub fn settling<a | e>(
+  body: () -> a / {literal.verdicts, literal.statements | e},
+) -> a / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], shipped.runtime, shipped.definitions, env.bodies[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise | e} =
+  handle {
+    body()
+  } with {
+    literal.statements(timed, frame, root, asked) ->
+      judgements(
+        below_root(env.bodies[sys]()),
+        judging(shipped.definitions(), shipped.runtime().identity, env.binary_version[sys]()),
+        root,
+        timed,
+        frame,
+        asked,
+      ),
+    literal.verdicts(timed, frame, root, asked) -> {
+      let dir = below_root(env.bodies[sys]());
+      let runtime = shipped.runtime().identity;
+      let toolchain = judging(shipped.definitions(), runtime, env.binary_version[sys]());
+      let emitter = emitter_identity(shipped.definitions());
+      let sought = asked.map(|a: Asked| {
+        let key = verdict_key(toolchain, a);
+        let value = if is_const(a) { baked_key(runtime, emitter, a.hash) } else { b"" };
+        let verdict = match read_kept[abs](dir, key) {
+          None -> None,
+          Some(bytes) -> match bin::decode(bytes, verdict_bin()) {
+            Ok(v) -> Some(v),
+            Err(_) -> None,
+          },
+        };
+        {
+          asked: a,
+          key: key,
+          value: value,
+          // An accepted `const` definition stands only while its value is still kept.
+          kept: if is_const(a) && verdict == Some(Accepted) && kept_value[abs](dir, value) == None {
+            None
+          } else { verdict },
+        }
+      });
+      let open = sought.filter(|s: Sought| s.kept == None);
+      if open.len() == 0 { Ok(settled(sought, [])) } else {
+        // What is entered is the only verdict that reads the check's tables.
+        match program_view(timed.program) {
+          None -> Err(timed.program.diags),
+          Some(view) -> verdicts_entered(timed, view, root, dir, sought, open),
+        }
+      }
+    },
+  }
+
+/// The verdicts `sought` holds, `open` among them entered on machines loaded over `view`, and what
+/// they answered kept under `dir`.
+fn verdicts_entered(
+  timed: Timed,
+  view: View,
+  root: String,
+  dir: String,
+  sought: List<Sought>,
+  open: List<Sought>,
+) -> Result<List<Verdict>, List<Diag>> / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+  let front = front_of(
+    timed,
+    view,
+    Some(entering(view.frame, callees(open.map(|s: Sought| s.asked)))),
+  );
+  let parsers = open.filter(|s: Sought| !is_const(s.asked));
+  let consts = open.filter(|s: Sought| is_const(s.asked));
+  let over = |some: List<Sought>, steps: Int|
+    entered(front, view.frame, root, some.map(|s: Sought| s.asked), steps);
+  match over(parsers, step_budget()) {
+    Err(diags) -> Err(diags),
+    Ok(parsed) -> match over(consts, const_budget()) {
+      Err(diags) -> Err(diags),
+      Ok(evaluated) -> {
+        let judged = parsed.concat(evaluated);
+        let entries = parsers.concat(consts);
+        range(0, entries.len()).fold((), |_: Unit, i: Int|
+          match judged.at(i) {
+            None -> (),
+            Some(j) -> {
+              let s = entries.get(i);
+              match j.value { Some(text) -> keep_value[abs](dir, s.value, text), None -> () };
+              // A place is this load's, which an edit elsewhere moves under the same hash.
+              match j.verdict {
+                RaisedAt(_) -> (),
+                v -> write_kept[abs](dir, s.key, bin::encode(v, verdict_bin())),
+              }
+            },
+          });
+        Ok(
+          settled(
+            sought,
+            open.map(|s: Sought|
+              range(0, entries.len()).fold(Spent, |found: Verdict, i: Int|
+                if entries.get(i).key == s.key {
+                  match judged.at(i) { Some(j) -> j.verdict, None -> found }
+                } else { found })),
+          ),
+        )
+      },
+    },
+  }
+}
+
+/// A statement asked after, the key its judgement is kept under, and the judgement kept there.
+type Keyed = { asked: statements::Asked, key: Bytes, kept: Option<Judgement> }
+
+/// Each statement's judgement: the one kept for it, or the one the statements not kept were judged
+/// to, in their order.
+fn judgements(
+  dir: String,
+  toolchain: Bytes,
+  root: String,
+  timed: Timed,
+  frame: Frame,
+  asked: List<statements::Asked>,
+) -> Result<List<Judgement>, List<Diag>> / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+  let keyed = asked.map(|a: statements::Asked| {
+    let key = judgement_key(toolchain, step_budget(), a);
+    {
+      asked: a,
+      key: key,
+      kept: match read_kept[abs](dir, key) {
+        None -> None,
+        Some(bytes) -> match bin::decode(bytes, judgement_bin()) {
+          Ok(j) -> Some(j),
+          Err(_) -> None,
+        },
+      },
+    }
+  });
+  let open = keyed.filter(|k: Keyed| k.kept == None);
+  if open.len() == 0 { Ok(keyed.map(|k: Keyed| match k.kept { Some(j) -> j, None -> Unjudged })) }
+  else {
+    match match program_view(timed.program) {
+        None -> Err(timed.program.diags),
+        Some(view) ->
+          judged(
+            |within: Within| front_of(timed, view, Some(within)),
+            frame,
+            root,
+            step_budget(),
+            open.map(|k: Keyed| k.asked),
+          ),
+      } {
+      Err(diags) -> Err(diags),
+      Ok(found) -> {
+        range(0, open.len()).fold((), |_: Unit, i: Int|
+          match found.at(i) {
+            Some(j) -> write_kept[abs](dir, open.get(i).key, bin::encode(j, judgement_bin())),
+            None -> (),
+          });
+        Ok(
+          keyed.fold(
+            { out: [], next: 0 },
+            |acc: { out: List<Judgement>, next: Int }, k: Keyed|
+              match k.kept {
+                Some(j) -> { out: acc.out.push(j), next: acc.next },
+                None ->
+                  {
+                    out: acc.out.push(match found.at(acc.next) { Some(j) -> j, None -> Unjudged }),
+                    next: acc.next + 1,
+                  },
+              },
+          ).out,
+        )
+      },
+    }
+  }
+}
+
+/// Each verdict sought, in order: the one kept, or the next of `found`, which holds the rest's.
+fn settled(sought: List<Sought>, found: List<Verdict>) -> List<Verdict> =
+  sought.fold({ out: [], next: 0 }, |acc: { out: List<Verdict>, next: Int }, s: Sought|
+    match s.kept {
+      Some(v) -> { out: acc.out.push(v), next: acc.next },
+      None ->
+        {
+          out: match found.at(acc.next) { Some(v) -> acc.out.push(v), None -> acc.out },
+          next: acc.next + 1,
+        },
+    }).out
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_site(text: Bytes) -> TaggedSite =
+  {
+    module: 0,
+    span: span_between(0, 5 + text.len()),
+    tag: b"hex",
+    parts: [{ text: text, quoted: span_between(3, 5 + text.len()) }],
+    callee: b"hex.literal",
+    hash: b"h",
+  }
+
+test "a character of a literal's text is placed where its source spells it" {
+  let src = b"hex\"a\\n\\u{e9}\xc3\xa9z\"";
+  let quoted = span_between(3, src.len());
+  assert_eq(spelled_at(src, quoted, 0), Some(span_between(4, 5)));
+  assert_eq(spelled_at(src, quoted, 1), Some(span_between(5, 7)));
+  assert_eq(spelled_at(src, quoted, 2), Some(span_between(7, 13)));
+  assert_eq(spelled_at(src, quoted, 3), Some(span_between(13, 15)));
+  assert_eq(spelled_at(src, quoted, 4), Some(span_between(15, 16)));
+  // One past the text is its closing quote, where a text that ends too soon is refused.
+  assert_eq(spelled_at(src, quoted, 5), Some(span_between(16, 17)));
+  assert_eq(spelled_at(src, quoted, 6), None);
+  assert_eq(spelled_at(src, quoted, 0 - 1), None);
+  // A brace of the text is written twice, and is one character of it.
+  let braced = b"hex\"a{{}}z\"";
+  let all = span_between(3, braced.len());
+  assert_eq(spelled_at(braced, all, 1), Some(span_between(5, 7)));
+  assert_eq(spelled_at(braced, all, 2), Some(span_between(7, 9)));
+  assert_eq(spelled_at(braced, all, 3), Some(span_between(9, 10)))
+}
+
+test "a parser's answer is read as its verdict, and a spent budget is told from a raise" {
+  let answered = |v: Value| verdict_of({ answer: Ok(v), warnings: [] });
+  assert_eq(answered(VCtor("Ok", [VInt(1)])), Accepted);
+  assert_eq(
+    answered(
+      VCtor("Err", [
+        VRecord([{ name: "message", value: VStr("odd") }, { name: "offset", value: VInt(2) }]),
+      ]),
+    ),
+    Rejected({ part: 0, offset: 2, message: "odd" }),
+  );
+  assert_eq(
+    answered(
+      VCtor("Err", [
+        VRecord([
+          { name: "message", value: VStr("odd") },
+          { name: "offset", value: VInt(2) },
+          { name: "part", value: VInt(1) },
+        ]),
+      ]),
+    ),
+    Rejected({ part: 1, offset: 2, message: "odd" }),
+  );
+  assert_eq(answered(VInt(1)), Raised("it answered 1"))
+}
+
+test "a refused literal is placed inside its text, and one past it at the whole literal" {
+  let site = a_site(b"abz");
+  let places = [{ path: "main.ply", text: b"hex\"abz\"" }];
+  let labelled = |verdict: Verdict|
+    match refusal(places, site, verdict) {
+      Some(d) -> match d.labels.at(0) {
+        Some(l) -> Some({ code: d.code, start: l.start, end: l.end }),
+        None -> None,
+      },
+      None -> None,
+    };
+  assert_eq(labelled(Accepted), None);
+  assert_eq(
+    labelled(Rejected({ part: 0, offset: 2, message: "not a hex digit" })),
+    Some({ code: b"E0153", start: 6, end: 7 }),
+  );
+  assert_eq(
+    labelled(Rejected({ part: 0, offset: 40, message: "too short" })),
+    Some({ code: b"E0153", start: 3, end: 8 }),
+  );
+  assert_eq(labelled(Spent), Some({ code: b"E0154", start: 0, end: 8 }));
+  assert_eq(labelled(Raised("boom")), Some({ code: b"E0154", start: 0, end: 8 }))
+}
+
+test "a refusal of a literal with holes is placed in the text it names, or on the hole after it" {
+  let src = b"sh\"ab {x} cd{y}\"";
+  let site = {
+    module: 0,
+    span: span_between(0, src.len()),
+    tag: b"sh",
+    parts: [
+      { text: b"ab ", quoted: span_between(2, 7) },
+      { text: b" cd", quoted: span_between(8, 13) },
+      { text: b"", quoted: span_between(14, 16) },
+    ],
+    callee: b"sh.compile",
+    hash: b"h",
+  };
+  assert_eq(refused_at(src, site, 0, 1), span_between(4, 5));
+  assert_eq(refused_at(src, site, 1, 2), span_between(11, 12));
+  // Just past a text is the hole that follows it, braces and all, or the closing quote.
+  assert_eq(refused_at(src, site, 0, 3), span_between(6, 9));
+  assert_eq(refused_at(src, site, 1, 3), span_between(12, 15));
+  assert_eq(refused_at(src, site, 2, 0), span_between(15, 16));
+  // A text or a character the literal has not is the whole string.
+  assert_eq(refused_at(src, site, 3, 0), span_between(2, 16));
+  assert_eq(refused_at(src, site, 1, 9), span_between(2, 16));
+  assert_eq(handed(asked_of(site)), VList([VStr("ab "), VStr(" cd"), VStr("")]));
+  assert_eq(handed(asked_of(a_site(b"ab"))), VStr("ab"))
+}
+
+test "verdicts kept come back in the order they were sought, the rest from what was found" {
+  let a: Asked = { callee: b"m.literal", hash: b"h", parts: [b"a"] };
+  let sought = [
+    { asked: a, key: b"1", value: b"", kept: None },
+    { asked: a, key: b"2", value: b"", kept: Some(Accepted) },
+    { asked: a, key: b"3", value: b"", kept: None },
+  ];
+  assert_eq(settled(sought, [Spent, Raised("x")]), [Spent, Accepted, Raised("x")])
+}
+
+test "a `const` definition's answer is its value's text, kept only where a build has room" {
+  let answered = |v: Value| value_of({ answer: Ok(v), warnings: [] });
+  assert_eq(answered(VBytes(b"78")), { verdict: Accepted, value: Some(b"78") });
+  assert_eq(answered(VInt(1)).verdict, Raised("its stored root answered 1"));
+  let site = { module: 0, span: span_between(9, 14), name: b"m.table", hash: b"h" };
+  let refused = |verdict: Verdict|
+    match const_refusal(site, verdict) {
+      Some(d) -> match d.labels.at(0) {
+        Some(l) -> Some({ code: d.code, start: l.start, end: l.end }),
+        None -> None,
+      },
+      None -> None,
+    };
+  assert_eq(refused(Accepted), None);
+  assert_eq(refused(Raised("boom")), Some({ code: b"E0157", start: 9, end: 14 }));
+  let placed = const_refusal(site, RaisedAt({ message: "boom", module: 1, start: 3, end: 4 }));
+  assert_eq(
+    match placed { Some(d) -> d.labels.map(|l: Label| (l.module, l.start, l.primary)), None -> [] },
+    [(0, 9, true), (1, 3, false)],
+  );
+  assert_eq(refused(Spent), Some({ code: b"E0158", start: 9, end: 14 }));
+  assert_eq(refused(Oversize(const_room() + 1)), Some({ code: b"E0158", start: 9, end: 14 }))
+}
+
+test "a `const` definition is asked with no text, under its own budget" {
+  let a = asked_const({ module: 0, span: span_between(0, 1), name: b"m.table", hash: b"h" });
+  assert(is_const(a));
+  assert_eq(budget_of(a), const_budget());
+  assert_eq(budget_of({ ..a, parts: [b"x"] }), step_budget());
+  assert(verdict_key(b"t", a) != verdict_key(b"t", { ..a, hash: b"g" }))
+}
+
+test "a verdict is kept under the toolchain, the parser's hash and the text" {
+  let a: Asked = { callee: b"m.literal", hash: b"h", parts: [b"a"] };
+  let key = verdict_key(b"t", a);
+  assert_eq(verdict_key(b"t", { ..a, callee: b"n.literal" }), key);
+  assert(verdict_key(b"u", a) != key);
+  assert(verdict_key(b"t", { ..a, hash: b"g" }) != key);
+  assert(verdict_key(b"t", { ..a, parts: [b"b"] }) != key);
+  // The texts around a hole are not the one text they would join to.
+  assert(
+    verdict_key(b"t", { ..a, parts: [b"a", b"b"] }) != verdict_key(b"t", { ..a, parts: [b"ab"] }),
+  );
+  assert(
+    verdict_key(b"t", { ..a, parts: [b"a", b"b"] })
+      != verdict_key(b"t", { ..a, parts: [b"ab", b""] }),
+  )
+}
+
+test "the toolchain a verdict is kept under moves with the code that judges it, and with no shipped module" {
+  let held = |settling: Bytes, other: Bytes|
+    Bytes::concat_all(
+      judging_roots().push(b"std.result.unreached").map(|name: Bytes|
+        Bytes::concat_all([
+          name,
+          b" ",
+          if name == b"literals.settling" { settling }
+          else if name == b"std.result.unreached" { other }
+          else { b"aa" },
+          b"\n",
+        ])),
+    );
+  let toolchain = judging(held(b"s1", b"o1"), b"runtime", "0.1.0");
+  assert_eq(judging(held(b"s1", b"o2"), b"runtime", "0.1.0"), toolchain);
+  assert(judging(held(b"s2", b"o1"), b"runtime", "0.1.0") != toolchain);
+  assert(judging(held(b"s1", b"o1"), b"other runtime", "0.1.0") != toolchain);
+  assert(judging(held(b"s1", b"o1"), b"runtime", "0.2.0") != toolchain)
+}

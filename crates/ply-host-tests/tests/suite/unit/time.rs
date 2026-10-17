@@ -1,5 +1,5 @@
-use ply_eval::host::MachineId;
-use ply_eval::{
+use ply_core::host::MachineId;
+use ply_core::{
     Determinism, Diagnostic, EffectAtom, HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime,
     Linearity, Mode, Resource, Span, Symbol, Value, codes,
 };
@@ -9,7 +9,7 @@ use std::sync::Arc;
 struct Nothing;
 
 impl HostRuntime for Nothing {
-    fn watch(&self, _: &ply_eval::Pending) -> Result<(), Diagnostic> {
+    fn watch(&self, _: &ply_core::Pending) -> Result<(), Diagnostic> {
         Ok(())
     }
     fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
@@ -18,7 +18,7 @@ impl HostRuntime for Nothing {
     fn park(&self) -> Result<(), Diagnostic> {
         Ok(())
     }
-    fn block_on(&self, _: ply_eval::Pending) -> Result<Value, Diagnostic> {
+    fn block_on(&self, _: ply_core::Pending) -> Result<Value, Diagnostic> {
         Ok(Value::Unit)
     }
 }
@@ -90,7 +90,7 @@ fn the_simulator_answers_no_effect_this_module_declares() {
     let simple = EFFECT.rsplit('.').next().expect("a dotted effect name");
     assert_eq!(simple, "time");
     assert!(
-        !ply_eval::SEEDED_EFFECTS.contains(&simple),
+        !ply_core::SEEDED_EFFECTS.contains(&simple),
         "`{simple}` is answered by `simulate`, where this module's effect is the host's"
     );
     let time = Arc::new(TimeHost::new());

@@ -3317,10 +3317,10 @@ at the CA's certificate. A handshake the client cannot complete is `E0141`, and
 says so. `http://` is accepted only for a registry on this machine
 (`localhost`, `127.x.x.x`, `[::1]`), because a publish carries a token.
 
-The registry is a Ply program, `crates/ply-registry/ply`:
+The registry is a Ply program, `packages/registry`:
 
 ```
-$ ply run crates/ply-registry/ply --host --fs store=/srv/ply \
+$ ply run packages/registry --host --fs store=/srv/ply \
     --tls registry=cert.pem,key.pem --set tls=registry --set port=8443 \
     --config tokens.conf
 ```

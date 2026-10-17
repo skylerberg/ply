@@ -1,5 +1,5 @@
-use ply_eval::codes;
-use ply_eval::host::{Determinism, HostOp, Linearity, Pending};
+use ply_core::codes;
+use ply_core::host::{Determinism, HostOp, Linearity, Pending};
 use ply_host::{Host, registry};
 use std::collections::{BTreeMap, BTreeSet};
 

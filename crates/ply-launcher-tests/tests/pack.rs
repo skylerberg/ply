@@ -96,38 +96,6 @@ fn a_pack_lists_the_modules_and_the_data_below_a_root() {
     );
 }
 
-// CI's first bootstrap links the pack the last release's `ply bootstrap` writes with this runtime.
-#[test]
-fn a_pack_the_last_release_wrote_is_read_under_the_logical_roots() {
-    let pack = read(&binary(
-        b"",
-        &[
-            ("crates/ply-std/ply/option.ply", b"a"),
-            ("crates/ply-std/ply/oid/names.txt", b"c"),
-            ("crates/ply-std/plyx/other.ply", b"x"),
-            ("crates/ply-compiler/ply/front.ply", b"e"),
-            ("program/front", b"f"),
-        ],
-    ))
-    .expect("the pack reads")
-    .expect("the binary carries one");
-    assert_eq!(
-        pack.paths().collect::<Vec<_>>(),
-        [
-            "compiler/front.ply",
-            "crates/ply-std/plyx/other.ply",
-            "program/front",
-            "std/oid/names.txt",
-            "std/option.ply"
-        ]
-    );
-    assert_eq!(pack.bytes("std/option.ply"), Some(&b"a"[..]));
-    assert_eq!(
-        pack.digest_of("compiler/front.ply"),
-        Some(*blake3::hash(b"e").as_bytes())
-    );
-}
-
 #[test]
 fn an_answer_is_the_frame_a_range_of_the_answers_file_holds() {
     let one = framed(b"one record");

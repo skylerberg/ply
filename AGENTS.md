@@ -1,8 +1,8 @@
 # AGENTS.md
 
 Ply is a general-purpose programming language. Its compiler is written in Ply
-(`crates/ply-compiler/ply`), and `ply` is a native program: the CLI (`crates/ply-cli/ply`) compiled
-to C and linked with the runtime, a static library cargo builds (`crates/ply-native`). `ply`
+(`packages/compiler`), and `ply` is a native program: the CLI (`packages/cli`) compiled
+to C and linked with the runtime, a static library cargo builds (`crates/ply-runtime`). `ply`
 builds `ply`: `ply bootstrap` links a checkout's runtime library with what the checkout's builder
 makes of its CLI. `scripts/bootstrap.sh` is the rebuild after any edit: cargo, then `ply
 bootstrap` run by the `ply` in `target/`, or by the last release in a checkout with none.
@@ -45,28 +45,29 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 
 - Tests live in sibling `<crate>-tests` crates, so a `pub` change can break crates you didn't
   touch. Run `cargo fmt --all` before pushing; CI runs clippy with `-D warnings`.
-- The CLI's tests are the Ply package `crates/ply-cli-tests/ply`; `.github/ci-ply.sh run
+- The CLI's tests are the Ply package `tests/cli`; `.github/ci-ply.sh run
   cli-<module>` runs one module with the grants CI gives it.
 - CI is `.github/workflows/ci.yml`; `.github/ci-shards.sh` holds its gate tables and lists the Ply
   runs, each one `ply test` of a package, and the jobs that take them.
-- `ply bootstrap` builds the builder (`crates/ply-compiler/ply`'s `build.main`) with the `ply` that
+- `ply bootstrap` builds the builder (`packages/compiler`'s `build.main`) with the `ply` that
   runs it, and the builder builds the CLI. CI bootstraps twice: the latest release first, then the
   `ply` that made, which takes the builder and the shipped modules' answers the first kept unless
   the definitions that make them moved. The release parses the builder's modules, so the compiler,
   `std.prelude`, which every module imports, and the shipped modules the compiler imports (`grep
-  '^import std' crates/ply-compiler/ply/*.ply` and what those import) cannot use a language rule
-  the same pull request introduces; the rest of `crates/ply-std/ply` can. Likewise the release's bootstrap drives the pull request's builder and links
+  -rh '^import std' packages/compiler` and what those import) cannot use a language rule the same
+  pull request introduces; the rest of `packages/std` can. Likewise the release's bootstrap drives the pull request's builder and links
   its runtime, so the builder's arguments, the runtime's description and the pack's layout change
   only in a form the release still speaks.
-- A file below `crates/ply-std/ply` that is not a `.ply` is data a shipped module embeds by its
+- A file below `packages/std` that is not a `.ply` is data a shipped module embeds by its
   path from the module (`embed("oid/names.txt")` in `oid.ply`). It ships in every binary and a
   load reads it whenever it pulls the module, so a test's fixtures stay in
-  `crates/ply-std-tests/ply`.
-- `crates/ply-cli` is the CLI as a Ply program; it is not a cargo crate. CI publishes each main
-  `ply` to the rolling `main-latest` release, which `scripts/stage0.sh` downloads.
+  `tests/std`.
+- `packages/` holds the Ply packages and `crates/` the cargo packages; `ply.work` says which is
+  which part of `ply`, and CI and the scripts read it with `ply work`. CI publishes each main `ply`
+  to the rolling `main-latest` release, which `scripts/stage0.sh` downloads.
 - Rust tests test the Rust: none compiles Ply or reads the shipped modules. What a Ply program
   does, the runtime's internals included, is tested by Ply tests.
-- A `ply.lock` records a path dependency in this checkout (prove, sim, store, suite) by name and
+- A `ply.lock` records a path dependency in this checkout (proof, sim, store, testing) by name and
   version only, so editing one moves no lock. Adding or dropping a dependency or bumping a version
   does: run `ply resolve` on the lock's directory, as CI's lock gate does for every `ply.lock`.
 - `docs/GUIDE.md` is the user manual. A change to syntax, types, CLI commands, flags or exit

@@ -2,8 +2,8 @@
 
 use crate::pool::Bell;
 use crate::process::Children;
-use ply_eval::host::HostRegistry;
-use ply_eval::{
+use ply_core::host::HostRegistry;
+use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
     HostRuntime, Linearity, Span, Symbol, Value, codes,
 };

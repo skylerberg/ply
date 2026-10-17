@@ -1,0 +1,1671 @@
+//! Declarations to types: type expressions, effects, constructors and written signatures.
+
+import syntax.parsing (Span, Ident, QName, dummy_span, is_bare)
+import syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr,
+                           MWrite, ty_span, mode_text, is_raise, ident_names)
+import syntax.items (Item, IFn, IType, IEffect, FnDef, TypeDef, TDAlias, TDSum, VariantDef, OpDef,
+                     Constraint, Deriver, DOrd, DNumeric, DInteger, is_predicate, TDNominal,
+                     TDExtern)
+import syntax.exprs (Param)
+import check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord,
+                    Field, Scheme, atoms_covered, atoms_insert, row_empty, row_open, unit_type,
+                    fn_type, fields_sorted, field_get, ints_insert, mark_rigid_ty, mark_rigid_row,
+                    free_vars, env_bind_global, env_depth_of, label_type, applied_args,
+                    at_arguments, TyNominal)
+import check.resolve.tables (ParsedModule, Binding, TypeSpace, EffectSpace, qualify, default_binder,
+                             backticked)
+import expand.derive (same_deriver)
+import std.bytes
+import std.bytes (ascii_of_int)
+import std.option
+import std.string
+import check.lent (passed)
+import check.infer.checker (Location, DeclaredAlias, DeclaredExtern, DeclaredRecord, DeclaredSum,
+                            TypeDecl, RecordDecl, OpInfo, EffectInfo, Signature, Assumed,
+                            OpenRegion, Brand, HoldsOf, Tasks, RigidParam, MapKeySite, Checker,
+                            WithTy, WithVar, WithRow, WithName, WithTys, WithAtom, hold,
+                            is_region_effect, location_of, module_name, scope_of, report_error_at,
+                            report_error_at_and, supplied, new_ty, new_ty_var, new_row, new_row_var,
+                            resolve, is_prelude_effect, seed_atom, builtin_type_arity, add_ctor,
+                            ctor_of, add_effect, effect_of, channel_ops, mode_eq)
+import check.infer.names (global, unresolved_in_derived, exporter, simple_name_of)
+
+// --- Types from type expressions ----------------------------------------------------------
+
+fn type_param(checker: Checker, ident: Ident) -> { checker: Checker, ty: Type } =
+  match checker.ty_params.get(ident.name) {
+    Some(t) -> { checker: checker, ty: t },
+    None -> if checker.auto_ty_params {
+      let o: WithTy = new_ty(checker);
+      {
+        checker: { ..o.checker, ty_params: o.checker.ty_params.insert(ident.name, o.ty) },
+        ty: o.ty,
+      }
+    } else {
+      let o: WithTy = new_ty(
+        report_error_at(
+          checker,
+          b"E0102",
+          ident.span,
+          Bytes::concat_all([b"unknown type variable `", ident.name, b"`"]),
+          b"not declared",
+          [
+            Bytes::concat_all([
+              b"add `",
+              ident.name,
+              b"` to the generic list, e.g. `fn f<",
+              ident.name,
+              b">(..)`",
+            ]),
+          ],
+        ),
+      );
+      o
+    },
+  }
+
+pub fn conv_type(checker: Checker, ty: TypeExpr) -> { checker: Checker, ty: Type } / {abort.raise} =
+  conv_within(checker, ty, alias_room(checker))
+
+/// How many more aliases a conversion may expand inside one another: an alias already being
+/// expanded is refused, so each is a declared alias not yet on the stack.
+fn alias_room(checker: Checker) -> Int = checker.types.len() - checker.alias_stack.len()
+
+fn conv_within(
+  checker: Checker,
+  ty: TypeExpr,
+  room: Int,
+) -> { checker: Checker, ty: Type } / {abort.raise} =
+  match ty {
+    TVar(id) -> type_param(checker, id),
+    TUnit(_) -> { checker: checker, ty: unit_type() },
+    TBad(_) -> new_ty(checker),
+    TRecord(r) -> {
+      let fs = r.fields.fold(
+        { checker: checker, fs: [] },
+        |acc: { checker: Checker, fs: List<Field> }, f: { name: Ident, ty: TypeExpr }| {
+          let o: WithTy = conv_within(acc.checker, f.ty, room);
+          { checker: o.checker, fs: acc.fs.push({ name: f.name.name, ty: o.ty }) }
+        },
+      );
+      { checker: fs.checker, ty: TyRecord(fields_sorted(fs.fs)) }
+    },
+    TFn(f) -> {
+      let ps: WithTys = conv_all_within(checker, f.params, room);
+      let r: WithTy = conv_within(ps.checker, f.ret, room);
+      let eff = match f.effects {
+        Some(row) -> conv_row(r.checker, row),
+        None -> { checker: r.checker, row: row_empty() },
+      };
+      { checker: eff.checker, ty: fn_type(ps.tys, r.ty, eff.row) }
+    },
+    TCon(c) -> conv_con(checker, c.name, c.args, c.labels, c.rows, c.span, room),
+  }
+
+/// The label and row arguments a use of a declared type writes.
+type Over = { labels: List<Type>, rows: List<Row> }
+
+fn conv_over(
+  checker: Checker,
+  labels: List<Ident>,
+  rows: List<RowExpr>,
+) -> { checker: Checker, over: Over } / {abort.raise} = {
+  let converted = rows.fold(
+    { checker: checker, rows: [] },
+    |acc: { checker: Checker, rows: List<Row> }, row: RowExpr| {
+      let o = conv_row(acc.checker, row);
+      { checker: o.checker, rows: acc.rows.push(o.row) }
+    },
+  );
+  {
+    checker: converted.checker,
+    over: {
+      // A name a binder holds is that label parameter, as it is inside a row; anything else is a resource.
+      labels: labels.map(|label: Ident|
+        match checker.label_params.get(label.name) {
+          Some(v) -> TyVar(v),
+          None -> label_type(label.name),
+        }),
+      rows: converted.rows,
+    },
+  }
+}
+
+/// A declaration's own label and row binders, each a fresh variable, in place of whatever was in
+/// scope: a declared type is closed, so nothing in it names a parameter of the signature using it.
+fn bind_own(
+  checker: Checker,
+  decl: TypeDecl,
+) -> { checker: Checker, labels: List<Int>, rows: List<Int> } = {
+  let closed: Checker = { ..checker, label_params: Map::new(), row_params: Map::new() };
+  let labels = decl.labels.fold(
+    { checker: closed, vars: [] },
+    |acc: { checker: Checker, vars: List<Int> }, name: Bytes| {
+      let o: WithVar = new_ty_var(acc.checker);
+      {
+        checker: { ..o.checker, label_params: o.checker.label_params.insert(name, o.var) },
+        vars: acc.vars.push(o.var),
+      }
+    },
+  );
+  let rows = decl.rows.fold(
+    { checker: labels.checker, vars: [] },
+    |acc: { checker: Checker, vars: List<Int> }, name: Bytes| {
+      let o: WithVar = new_row_var(acc.checker);
+      {
+        checker: { ..o.checker, row_params: o.checker.row_params.insert(name, o.var) },
+        vars: acc.vars.push(o.var),
+      }
+    },
+  );
+  { checker: rows.checker, labels: labels.vars, rows: rows.vars }
+}
+
+fn conv_types(
+  checker: Checker,
+  tys: List<TypeExpr>,
+) -> { checker: Checker, tys: List<Type> } / {abort.raise} =
+  conv_all_within(checker, tys, alias_room(checker))
+
+fn conv_all_within(
+  checker: Checker,
+  tys: List<TypeExpr>,
+  room: Int,
+) -> { checker: Checker, tys: List<Type> } / {abort.raise} =
+  tys.fold(
+    { checker: checker, tys: [] },
+    |acc: { checker: Checker, tys: List<Type> }, ty: TypeExpr| {
+      let o: WithTy = conv_within(acc.checker, ty, room);
+      { checker: o.checker, tys: acc.tys.push(o.ty) }
+    },
+  )
+
+/// `what` loses its `s` when one was expected.
+fn arity_error(
+  checker: Checker,
+  span: Span,
+  name: Bytes,
+  expected: Int,
+  found: Int,
+  what: Bytes,
+  notes: List<Bytes>,
+) -> Checker / {abort.raise} = {
+  let w = if expected == 1 { what.slice(0, what.len() - 1) } else { what };
+  report_error_at(
+    checker,
+    b"E0202",
+    span,
+    Bytes::concat_all([
+      b"`",
+      name,
+      b"` takes ",
+      ascii_of_int(expected),
+      b" ",
+      w,
+      b", but ",
+      supplied(found),
+    ]),
+    Bytes::concat_all([b"expected ", ascii_of_int(expected), b", found ", ascii_of_int(found)]),
+    notes,
+  )
+}
+
+/// A use whose label or row arguments are not as many as the declaration binds, told of the first.
+fn over_refused(
+  checker: Checker,
+  span: Span,
+  name: Bytes,
+  labels: Int,
+  rows: Int,
+  over: Over,
+) -> Checker / {abort.raise} =
+  if over.labels.len() != labels {
+    arity_error(checker, span, name, labels, over.labels.len(), b"label arguments", [
+      b"a label argument is bracketed among the type arguments, where a binder writes `[l]`: `T<a, [conn]>`",
+    ])
+  } else {
+    arity_error(checker, span, name, rows, over.rows.len(), b"row arguments", [
+      b"a row argument follows `|`, where a binder writes its row parameter: `T<a | {}>` holds functions that perform nothing",
+    ])
+  }
+
+fn conv_con(
+  checker: Checker,
+  name: QName,
+  args: List<TypeExpr>,
+  labels: List<Ident>,
+  rows: List<RowExpr>,
+  span: Span,
+  room: Int,
+) -> { checker: Checker, ty: Type } / {abort.raise} =
+  if is_bare(name) && args.len() == 0 && labels.len() == 0 && rows.len() == 0
+      && checker.ty_params.contains(name.name.name) {
+    {
+      checker: checker,
+      ty: match checker.ty_params.get(name.name.name) { Some(t) -> t, None -> unit_type() },
+    }
+  } else {
+    let converted: WithTys = conv_all_within(checker, args, room);
+    let written = conv_over(converted.checker, labels, rows);
+    let c: Checker = written.checker;
+    let over: Over = written.over;
+    match if is_bare(name) { builtin_type_arity(name.name.name) } else { None } {
+      Some(arity) -> if converted.tys.len() != arity {
+        new_ty(
+          arity_error(c, span, name.name.name, arity, converted.tys.len(), b"type arguments", []),
+        )
+      } else if name.name.name == b"Hold" {
+        // A hold's type names its region's label, as its reads do.
+        if over.labels.len() != 1 || over.rows.len() != 0 {
+          new_ty(over_refused(c, span, name.name.name, 1, 0, over))
+        } else {
+          let label = match c.label_params.get(labels.get(0).name) {
+            Some(v) -> TyVar(v),
+            None -> label_type(region_named(c, hold(), labels.get(0).name)),
+          };
+          { checker: c, ty: TyCon({ name: name.name.name, args: [label, converted.tys.get(0)] }) }
+        }
+      } else if labels.len() > 0 || rows.len() > 0 {
+        new_ty(over_refused(c, span, name.name.name, 0, 0, over))
+      } else {
+        let built = TyCon({ name: name.name.name, args: converted.tys });
+        { checker: note_parts(c, span, own_parts(c.carrying, built, [])), ty: built }
+      },
+      None -> {
+        let g: WithName = global(c, TypeSpace, name);
+        match g.name {
+          None -> if is_bare(name) { new_ty(unknown_type(g.checker, name)) }
+          else { new_ty(g.checker) },
+          Some(qualified) -> match g.checker.types.get(qualified) {
+            None -> new_ty(g.checker),
+            Some(decl) -> if converted.tys.len() != decl.params.len() {
+              new_ty(
+                arity_error(
+                  g.checker,
+                  span,
+                  name.name.name,
+                  decl.params.len(),
+                  converted.tys.len(),
+                  b"type arguments",
+                  [],
+                ),
+              )
+            } else if over.labels.len() != decl.labels.len() || over.rows.len() != decl.rows.len() {
+              new_ty(
+                over_refused(
+                  g.checker,
+                  span,
+                  name.name.name,
+                  decl.labels.len(),
+                  decl.rows.len(),
+                  over,
+                ),
+              )
+            } else {
+              match decl.declared {
+                DeclaredSum -> {
+                  let built = TyCon({
+                    name: qualified,
+                    args: applied_args(converted.tys, over.labels, over.rows),
+                  });
+                  {
+                    checker: note_parts(g.checker, span, own_parts(g.checker.carrying, built, [])),
+                    ty: built,
+                  }
+                },
+                DeclaredExtern ->
+                  {
+                    checker: g.checker,
+                    ty: TyCon({
+                      name: qualified,
+                      args: applied_args(converted.tys, over.labels, over.rows),
+                    }),
+                  },
+                DeclaredRecord(body) -> {
+                  let o = declared_record(g.checker, name.name, qualified, decl, body, room);
+                  match o.record {
+                    None -> new_ty(o.checker),
+                    Some(r) -> {
+                      let built = at_arguments(
+                        r.ty,
+                        r.ty_vars,
+                        r.row_vars,
+                        applied_args(converted.tys, over.labels, over.rows),
+                      );
+                      {
+                        checker: note_parts(
+                          o.checker,
+                          span,
+                          own_parts(o.checker.carrying, built, []),
+                        ),
+                        ty: built,
+                      }
+                    },
+                  }
+                },
+                DeclaredAlias(alias) -> if g.checker.alias_stack.contains(qualified) {
+                  new_ty(
+                    report_error_at(
+                      g.checker,
+                      b"E0102",
+                      name.span,
+                      Bytes::concat_all([
+                        b"type alias `",
+                        name.name.name,
+                        b"` expands into itself",
+                      ]),
+                      b"cyclic alias",
+                      [b"break the cycle, or make this a `type` with variants"],
+                    ),
+                  )
+                } else if room <= 0 { panic("an alias expanded past the aliases there are") } else {
+                  let outermost = g.checker.alias_stack.len() == 0;
+                  let before = g.checker.map_keys.len();
+                  // A `Map` key's order is the using signature's to promise, so a refusal names the use.
+                  let placed = |sites: List<MapKeySite>|
+                    if outermost {
+                      relocated_keys(sites, before, g.checker.module, span, name.name.name)
+                    } else { sites };
+                  let memo = decl.params.len() == 0 && decl.labels.len() == 0
+                    && decl.rows.len() == 0;
+                  match if memo { g.checker.aliases.get(qualified) } else { None } {
+                    Some(m) -> {
+                      let assumed = assumed_for(g.checker, DOrd);
+                      let keys = m.keys.map(|s: MapKeySite|
+                        { ..s, scope: g.checker.scope, assumed: assumed });
+                      {
+                        checker: { ..g.checker, map_keys: placed(g.checker.map_keys.concat(keys)) },
+                        ty: m.t,
+                      }
+                    },
+                    None -> {
+                      let saved = g.checker.ty_params;
+                      let bound: Map<Bytes, Type> = range(0, decl.params.len()).fold(
+                        Map::new(),
+                        |m: Map<Bytes, Type>, i: Int|
+                          m.insert(decl.params.get(i), converted.tys.get(i)),
+                      );
+                      let own = bind_own(
+                        {
+                          ..g.checker,
+                          ty_params: bound,
+                          alias_stack: g.checker.alias_stack.push(qualified),
+                          module: decl.owner,
+                        },
+                        decl,
+                      );
+                      let body: WithTy = conv_within(own.checker, alias, room - 1);
+                      let o: WithTy = if own.labels.len() == 0 && own.rows.len() == 0 { body }
+                      else {
+                        {
+                          checker: body.checker,
+                          ty: at_arguments(
+                            body.ty,
+                            own.labels,
+                            own.rows,
+                            applied_args([], over.labels, over.rows),
+                          ),
+                        }
+                      };
+                      // Kept only when the expansion touched nothing but the keys it noted: a
+                      // fresh variable, a diagnostic or a refused atom belongs to the one use.
+                      let kept = memo && o.checker.fresh == g.checker.fresh
+                        && o.checker.diags.len() == g.checker.diags.len()
+                        && o.checker.refused_atoms.len() == g.checker.refused_atoms.len();
+                      {
+                        checker: {
+                          ..o.checker,
+                          ty_params: saved,
+                          row_params: g.checker.row_params,
+                          label_params: g.checker.label_params,
+                          alias_stack: o.checker.alias_stack.take(o.checker.alias_stack.len() - 1),
+                          module: g.checker.module,
+                          map_keys: placed(o.checker.map_keys),
+                          aliases: if kept {
+                            o.checker.aliases.insert(qualified, {
+                              t: o.ty,
+                              keys: from_index(o.checker.map_keys, before),
+                            })
+                          } else { o.checker.aliases },
+                        },
+                        ty: o.ty,
+                      }
+                    },
+                  }
+                },
+              }
+            },
+          },
+        }
+      },
+    }
+  }
+
+/// A `new` record over fresh variables for its parameters, or nothing where it holds itself. Its
+/// declaration is converted once, in its own module, so what it refuses it refuses once; `named` is
+/// the name that asked for it.
+fn declared_record(
+  checker: Checker,
+  named: Ident,
+  qualified: Bytes,
+  decl: TypeDecl,
+  body: TypeExpr,
+  room: Int,
+) -> { checker: Checker, record: Option<RecordDecl> } / {abort.raise} =
+  match checker.nominals.get(qualified) {
+    Some(r) -> { checker: checker, record: Some(r) },
+    None -> if checker.alias_stack.contains(qualified) {
+      {
+        checker: report_error_at(
+          checker,
+          b"E0214",
+          named.span,
+          Bytes::concat_all([b"`", simple_name_of(qualified), b"` holds itself"]),
+          b"this field's type reaches the record it is a field of",
+          [
+            b"what reads a `new` record's shape reads its fields whole, as it reads an alias's, so the declaration cannot reach itself",
+            b"a sum can hold itself: put the recursion in one, as `type T = | Leaf | Node(..)`",
+          ],
+        ),
+        record: None,
+      }
+    } else if room <= 0 { panic("a declaration expanded past the declarations there are") } else {
+      let vars: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> } = decl.params.fold(
+        { checker: checker, vars: [], params: Map::new() },
+        |acc: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> }, p: Bytes| {
+          let o: WithVar = new_ty_var(acc.checker);
+          {
+            checker: o.checker,
+            vars: acc.vars.push(o.var),
+            params: acc.params.insert(p, TyVar(o.var)),
+          }
+        },
+      );
+      let own = bind_own(
+        {
+          ..vars.checker,
+          ty_params: vars.params,
+          alias_stack: checker.alias_stack.push(qualified),
+          module: decl.owner,
+        },
+        decl,
+      );
+      let o: WithTy = conv_within(own.checker, body, room - 1);
+      let fields = match o.ty { TyRecord(fs) -> fs, _ -> [] };
+      let written = match body { TRecord(r) -> r.fields, _ -> [] };
+      // A row its functions perform is read off its fields wherever one escapes, so only what
+      // names no region of its own, a `Hold`, a `Task` or a `Chan`, is refused here.
+      let checked: Checker = written.fold(
+        o.checker,
+        |c: Checker, f: { name: Ident, ty: TypeExpr }|
+          match field_get(fields, f.name.name) {
+            Some(t) ->
+              reject_declared_brand(
+                c,
+                t,
+                ty_span(f.ty),
+                simple_name_of(qualified),
+                Bytes::concat_all([b"field `", f.name.name, b"`"]),
+              ),
+            None -> c,
+          },
+      );
+      let record = {
+        ty: TyNominal({
+          name: qualified,
+          args: applied_args(
+            vars.vars.map(|v: Int| TyVar(v)),
+            own.labels.map(|v: Int| TyVar(v)),
+            own.rows.map(row_open),
+          ),
+          fields: fields,
+        }),
+        ty_vars: vars.vars.concat(own.labels),
+        row_vars: own.rows,
+      };
+      {
+        checker: {
+          ..checked,
+          ty_params: checker.ty_params,
+          row_params: checker.row_params,
+          label_params: checker.label_params,
+          alias_stack: checker.alias_stack,
+          module: checker.module,
+          nominals: checked.nominals.insert(qualified, record),
+        },
+        record: Some(record),
+      }
+    },
+  }
+
+/// Each `new` record is declared here whether or not anything names it.
+pub fn collect_nominals(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
+  parsed.module.items.fold(checker, |c: Checker, item: Item|
+    match item {
+      IType(def) -> {
+        let qualified = qualify(parsed.name, def.name.name);
+        match c.types.get(qualified) {
+          Some(decl) -> match decl.declared {
+            DeclaredRecord(body) ->
+              declared_record(c, def.name, qualified, decl, body, alias_room(c)).checker,
+            _ -> c,
+          },
+          None -> c,
+        }
+      },
+      _ -> c,
+    })
+
+fn unknown_type(checker: Checker, qname: QName) -> Checker / {abort.raise} =
+  match checker.derived {
+    Some(_) -> unresolved_in_derived(checker, qname, b"type"),
+    None -> {
+      let n = qname.name.name;
+      let notes = [b"declare it with `type`, or check the spelling"];
+      let exported = if is_bare(qname) {
+        match exporter(checker, TypeSpace, n) {
+          Some(i) ->
+            notes.push(
+              Bytes::concat_all([
+                b"module `",
+                module_name(checker, i),
+                b"` exports it: `import ",
+                module_name(checker, i),
+                b" (",
+                n,
+                b")`",
+              ]),
+            ),
+          None -> notes,
+        }
+      } else { notes };
+      report_error_at(
+        checker,
+        b"E0102",
+        qname.span,
+        Bytes::concat_all([b"unknown type `", n, b"`"]),
+        b"not found",
+        exported,
+      )
+    },
+  }
+
+fn row_param(checker: Checker, ident: Ident) -> { checker: Checker, v: Option<Int> } =
+  match checker.row_params.get(ident.name) {
+    Some(v) -> { checker: checker, v: Some(v) },
+    None ->
+      {
+        checker: report_error_at(
+          checker,
+          b"E0301",
+          ident.span,
+          Bytes::concat_all([b"unknown effect variable `", ident.name, b"`"]),
+          b"not declared",
+          [
+            Bytes::concat_all([
+              b"declare it after `|` in the generic list of the `fn` or `type` that writes this row: `<| ",
+              ident.name,
+              b">`",
+            ]),
+          ],
+        ),
+        v: None,
+      },
+  }
+
+fn conv_row(checker: Checker, row: RowExpr) -> { checker: Checker, row: Row } / {abort.raise} = {
+  let o = conv_marked(checker, row);
+  { checker: refuse_marks(o.checker, row), row: o.r }
+}
+
+/// A row with the atoms it marks `bounded`.
+fn conv_marked(
+  checker: Checker,
+  row: RowExpr,
+) -> { checker: Checker, r: Row, bounded: List<Atom> } / {abort.raise} = {
+  let atoms = row.atoms.fold(
+    { checker: checker, atoms: [], bounded: [] },
+    |acc: { checker: Checker, atoms: List<Atom>, bounded: List<Atom> }, atom: AtomExpr| {
+      let o: WithAtom = conv_atom(acc.checker, atom);
+      match o.atom {
+        Some(x) ->
+          {
+            checker: o.checker,
+            atoms: atoms_insert(acc.atoms, x),
+            bounded: if atom.bounded { atoms_insert(acc.bounded, x) } else { acc.bounded },
+          },
+        None -> { ..acc, checker: o.checker },
+      }
+    },
+  );
+  let tail = match row.tail {
+    Some(t) -> row_param(atoms.checker, t),
+    None -> { checker: atoms.checker, v: None },
+  };
+  { checker: tail.checker, r: { atoms: atoms.atoms, tail: tail.v }, bounded: atoms.bounded }
+}
+
+/// `bounded` is a promise a definition makes of its own row; a function type's row makes none.
+fn refuse_marks(checker: Checker, row: RowExpr) -> Checker = {
+  let marked = row.atoms.fold(checker, |c: Checker, atom: AtomExpr|
+    if atom.bounded { refuse_mark(c, atom.span) } else { c });
+  if row.tail_bounded { refuse_mark(marked, row.span) } else { marked }
+}
+
+fn refuse_mark(checker: Checker, span: Span) -> Checker =
+  report_error_at(
+    checker,
+    b"E0466",
+    span,
+    b"`bounded` is a promise a definition makes of its own row",
+    b"this row belongs to a type, not to a definition",
+    [
+      b"write `bounded` in the row after a `fn` signature's `->`, where the body is checked against it",
+    ],
+  )
+
+fn refused(checker: Checker, s: Span) -> Bool =
+  checker.refused_atoms.fold(false, |acc: Bool, x: Location|
+    acc || (x.module == checker.module && x.span == s))
+
+fn refusing(checker: Checker, s: Span) -> Checker =
+  { ..checker, refused_atoms: checker.refused_atoms.push({ module: checker.module, span: s }) }
+
+/// `[*]` on an operation declared without a label names nothing: the atom is refused where it is
+/// written, and dropped so the row does not carry a label the operation has no room for.
+fn refuse_every(
+  checker: Checker,
+  span: Span,
+  eff: Bytes,
+  op: Bytes,
+  location: Location,
+) -> Checker = {
+  let reported: Checker = report_error_at_and(
+    checker,
+    b"E0304",
+    span,
+    Bytes::concat_all([b"`", eff, b".", op, b"` is not resource-parameterized"]),
+    b"`[*]` names no label",
+    location,
+    b"declared without `[r]`",
+    [],
+  );
+  refusing(reported, span)
+}
+
+pub fn conv_atom(
+  checker: Checker,
+  a: AtomExpr,
+) -> { checker: Checker, atom: Option<Atom> } / {abort.raise} =
+  if refused(checker, a.span) { { checker: checker, atom: None } } else {
+    let e: WithName = effect_name(checker, a.eff);
+    match e.name {
+      None -> { checker: refusing(e.checker, a.span), atom: None },
+      Some(eff) -> {
+        // `[*]` is every label, which no label variable can stand for.
+        let resource = if a.every { RAny } else {
+          match a.resource {
+            Some(r) -> match checker.label_params.get(r.name) {
+              Some(v) -> RVar(v),
+              None -> RNamed(region_named(checker, eff, r.name)),
+            },
+            None -> RSingleton,
+          }
+        };
+        let info = effect_of(e.checker, eff);
+        // `[*]` on an operation declared without a label names nothing, so the atom is refused
+        // where it is written and dropped: the row must not carry a label it has no room for.
+        let label_less: { checker: Checker, refused: Bool } = match a.op {
+          Some(op) -> match info {
+            Some(i) -> match op_named(i, op.name) {
+              Some(o) -> if a.every && !o.resource_param {
+                { checker: refuse_every(e.checker, a.span, eff, o.name, o.at), refused: true }
+              } else { { checker: e.checker, refused: false } },
+              None -> { checker: e.checker, refused: false },
+            },
+            None -> { checker: e.checker, refused: false },
+          },
+          None -> { checker: e.checker, refused: false },
+        };
+        let named_cx: Checker = label_less.checker;
+        // An operation atom takes the declared operation's mode; the parser wrote a placeholder.
+        let atom: Option<Atom> = if label_less.refused { None } else {
+          match a.op {
+            Some(op) -> match info {
+              Some(i) -> match op_named(i, op.name) {
+                Some(o) ->
+                  Some({ effect: eff, resource: resource, mode: o.mode, op: Some(o.name) }),
+                None -> None,
+              },
+              None -> None,
+            },
+            None -> {
+              // `diverges` names no operation: it is written bare and stands for itself.
+              let declares_mode = eff == b"diverges"
+                || (match info {
+                  Some(i) ->
+                    i.ops.fold(false, |acc: Bool, o: OpInfo| acc || mode_eq(o.mode, a.mode)),
+                  None -> true,
+                });
+              if declares_mode { Some({ effect: eff, resource: resource, mode: a.mode, op: None }) }
+              else { None }
+            },
+          }
+        };
+        match atom {
+          Some(_) -> { checker: named_cx, atom: atom },
+          None -> {
+            let known = match info {
+              Some(i) -> match a.op {
+                Some(_) -> known_modes(i).concat(known_moded_ops(i)),
+                None -> known_modes(i),
+              },
+              None -> [],
+            };
+            let help = if known.len() == 0 { [] } else {
+              [Bytes::concat_all([b"`", eff, b"` can perform: ", Bytes::join(known, b", ")])]
+            };
+            let (message, label) = match a.op {
+              Some(op) ->
+                (
+                  Bytes::concat_all([
+                    b"effect `",
+                    eff,
+                    b"` declares no operation `",
+                    op.name,
+                    b"`",
+                  ]),
+                  b"no such operation",
+                ),
+              None ->
+                (
+                  Bytes::concat_all([
+                    b"effect `",
+                    eff,
+                    b"` declares no `",
+                    mode_text(a.mode),
+                    b"` operation",
+                  ]),
+                  Bytes::concat_all([b"no `", mode_text(a.mode), b"` operation to perform"]),
+                ),
+            };
+            let reported: Checker = report_error_at(
+              named_cx,
+              b"E0104",
+              a.span,
+              message,
+              label,
+              help,
+            );
+            { checker: refusing(reported, a.span), atom: None }
+          },
+        }
+      },
+    }
+  }
+
+/// No mode atom stands for a raise, so each one is named.
+fn known_modes(info: EffectInfo) -> List<Bytes> =
+  info.ops.fold([], |acc: List<Bytes>, op_info: OpInfo| {
+    let k = Bytes::concat_all([
+      info.simple_name,
+      b".",
+      if is_raise(op_info.mode) { op_info.name } else { mode_text(op_info.mode) },
+    ]);
+    if acc.contains(k) { acc } else { acc.push(k) }
+  })
+
+fn known_moded_ops(info: EffectInfo) -> List<Bytes> =
+  known_ops({ ..info, ops: info.ops.filter(|op_info: OpInfo| !is_raise(op_info.mode)) })
+
+fn known_ops(info: EffectInfo) -> List<Bytes> =
+  info.ops.map(|op_info: OpInfo| Bytes::concat_all([info.simple_name, b".", op_info.name]))
+
+pub fn op_named(info: EffectInfo, name: Bytes) -> Option<OpInfo> =
+  info.ops.fold(None, |acc: Option<OpInfo>, op_info: OpInfo|
+    match acc { Some(_) -> acc, None -> if op_info.name == name { Some(op_info) } else { None } })
+
+pub fn effect_name(
+  checker: Checker,
+  qname: QName,
+) -> { checker: Checker, name: Option<Bytes> } / {abort.raise} =
+  if is_bare(qname) && is_region_effect(qname.name.name) {
+    { checker: checker, name: Some(qname.name.name) }
+  } else {
+    let g: WithName = global(checker, EffectSpace, qname);
+    match g.name {
+      Some(n) -> match effect_of(g.checker, n) {
+        Some(_) -> { checker: g.checker, name: Some(n) },
+        None -> { checker: g.checker, name: None },
+      },
+      None -> if is_bare(qname) && is_prelude_effect(qname.name.name) {
+        { checker: g.checker, name: Some(qname.name.name) }
+      } else if is_bare(qname) { { checker: unknown_effect(g.checker, qname), name: None } }
+      else { { checker: g.checker, name: None } },
+    }
+  }
+
+fn unknown_effect(checker: Checker, qname: QName) -> Checker / {abort.raise} = {
+  let n = qname.name.name;
+  let message = Bytes::concat_all([b"unknown effect `", n, b"`"]);
+  if is_bare(qname) && (match env_depth_of(checker.env, n) { Some(_) -> true, None -> false }) {
+    report_error_at(checker, b"E0103", qname.span, message, b"not declared", [
+      Bytes::concat_all([
+        b"`",
+        n,
+        b"` is a value in scope, so this looks like a field call rather than a perform: write `(",
+        n,
+        b".<field>)(..)` to call a function held in a record",
+      ]),
+      b"`a.b(c)` is an effect operation; parentheses make it a field access",
+    ])
+  } else {
+    let known = scope_of(checker).bound.effects.map(|binding: Binding| binding.name);
+    let first = if known.len() == 0 { b"declare it with `effect <name> { .. }`" }
+    else { b"effects in scope: ".concat(backticked(known, b", ")) };
+    let notes = match exporter(checker, EffectSpace, n) {
+      Some(i) ->
+        [
+          first,
+          Bytes::concat_all([
+            b"module `",
+            module_name(checker, i),
+            b"` declares it: `import ",
+            module_name(checker, i),
+            b"` and write `",
+            default_binder(module_name(checker, i)),
+            b"::",
+            n,
+            b"`",
+          ]),
+        ],
+      None -> [first],
+    };
+    report_error_at(checker, b"E0103", qname.span, message, b"not declared", notes)
+  }
+}
+
+// --- Declarations ------------------------------------------------------------------------
+
+pub fn duplicate(checker: Checker, name: Ident, prev: Location, what: Bytes) -> Checker =
+  report_error_at_and(
+    checker,
+    b"E0105",
+    name.span,
+    Bytes::concat_all([what, b" `", name.name, b"` is defined more than once"]),
+    b"redefined here",
+    prev,
+    b"first defined here",
+    [b"rename one of them"],
+  )
+
+fn record_type(checker: Checker, parsed: ParsedModule, def: TypeDef) -> Checker = {
+  let name = qualify(parsed.name, def.name.name);
+  match checker.types.get(name) {
+    Some(prev) -> duplicate(checker, def.name, { module: prev.owner, span: prev.span }, b"type"),
+    None -> match builtin_type_arity(def.name.name) {
+      Some(_) ->
+        report_error_at(
+          checker,
+          b"E0105",
+          def.name.span,
+          Bytes::concat_all([b"`", def.name.name, b"` is a builtin type"]),
+          b"cannot be redefined",
+          [b"choose a different name for this type"],
+        ),
+      None -> {
+        let declared = match def.body {
+          TDAlias(t) -> DeclaredAlias(t),
+          TDNominal(t) -> DeclaredRecord(t),
+          TDSum(_) -> DeclaredSum,
+          TDExtern -> DeclaredExtern,
+        };
+        {
+          ..checker,
+          types: checker.types.insert(name, {
+            params: ident_names(def.generics.types),
+            labels: ident_names(def.generics.labels),
+            rows: ident_names(def.generics.effects),
+            declared: declared,
+            opaque: def.opaque,
+            owner: checker.module,
+            span: def.span,
+          }),
+        }
+      },
+    },
+  }
+}
+
+pub fn collect_types(checker: Checker, parsed: ParsedModule) -> Checker =
+  parsed.module.items.fold(checker, |c: Checker, item: Item|
+    match item { IType(d) -> record_type(c, parsed, d), _ -> c })
+
+/// The first `Hold`, `Task` or `Chan` in `ty`: each is a key into the region that made it.
+fn region_brand(ty: Type) -> Option<Bytes> =
+  match ty {
+    TyCon(c) -> if c.name == b"Hold" || scheduler_handle(c.name) { Some(c.name) }
+    else { first_reason(c.args, region_brand) },
+    TyFn(f) -> match first_reason(f.params, region_brand) {
+      Some(b) -> Some(b),
+      None -> region_brand(f.ret),
+    },
+    TyRecord(fs) -> first_reason(fs, |f: Field| region_brand(f.ty)),
+    TyNominal(n) -> first_reason(n.fields, |f: Field| region_brand(f.ty)),
+    TyVar(_) -> None,
+  }
+
+fn reject_declared_brand(
+  checker: Checker,
+  ty: Type,
+  span: Span,
+  owner: Bytes,
+  what: Bytes,
+) -> Checker =
+  match region_brand(ty) {
+    None -> checker,
+    Some(brand) ->
+      report_error_at(
+        checker,
+        b"E0446",
+        span,
+        Bytes::concat_all([b"`", owner, b"`'s ", what, b" mentions a `", brand, b"`"]),
+        b"a declaration is outside every region there is",
+        [
+          Bytes::concat_all([
+            b"a declaration is fixed once for the whole program, so it cannot say which region a `",
+            brand,
+            b"` in it came from, and no later check could tell that the `",
+            brand,
+            b"` had outlived its region",
+          ]),
+          Bytes::concat_all([
+            b"take the `",
+            brand,
+            b"` as a type parameter instead, so it stays in the type argument, where the escape check can see it",
+          ]),
+        ],
+      ),
+  }
+
+/// What the row of a function in `ty` reaches of a region: a hold, or a task or a channel.
+fn region_reach(ty: Type) -> Option<Bytes> =
+  match ty {
+    TyVar(_) -> None,
+    TyCon(c) -> first_reason(c.args, region_reach),
+    TyRecord(fs) -> first_reason(fs, |f: Field| region_reach(f.ty)),
+    TyNominal(n) -> first_reason(n.fields, |f: Field| region_reach(f.ty)),
+    TyFn(f) -> if f.effects.atoms.fold(false, |b: Bool, atom: Atom| b || atom.effect == hold()) {
+      Some(b"`Hold`")
+    } else if row_brands(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
+      match first_reason(f.params, region_reach) { Some(b) -> Some(b), None -> region_reach(f.ret) }
+    },
+  }
+
+/// A sum type hides the rows of the functions it holds, so one that reaches a region would leave it
+/// unseen: only a row the type takes as an argument is where the escape checks look.
+fn reject_declared_reach(
+  checker: Checker,
+  ty: Type,
+  span: Span,
+  owner: Bytes,
+  what: Bytes,
+  notes: List<Bytes>,
+) -> Checker =
+  match region_reach(ty) {
+    None -> checker,
+    Some(reached) ->
+      report_error_at(
+        checker,
+        b"E0446",
+        span,
+        Bytes::concat_all([
+          b"`",
+          owner,
+          b"`'s ",
+          what,
+          b" holds a function whose row reaches a ",
+          reached,
+        ]),
+        b"a declaration is outside every region there is",
+        notes,
+      ),
+  }
+
+fn variant_reach() -> List<Bytes> =
+  [
+    b"a declared type hides the rows of the functions it holds, so no later check could tell that this one had outlived the region it reaches",
+    b"take the row as a row parameter instead, `type T<| e> = ..`, so it stays in the type argument, where the escape check can see it",
+  ]
+
+fn operation_reach() -> List<Bytes> =
+  [
+    b"an operation's handler may be installed anywhere, and may keep what it is handed in a variable that outlives the region the function reaches",
+    b"take the row as a row parameter of the operation, `write put<| e>(f: () -> Int / e) -> Unit`, which no clause can keep a function of",
+  ]
+
+pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
+  parsed.module.items.fold(checker, |c: Checker, item: Item|
+    match item {
+      IEffect(def) -> {
+        let name = qualify(parsed.name, def.name.name);
+        if is_region_effect(def.name.name) {
+          report_error_at(
+            c,
+            b"E0105",
+            def.name.span,
+            Bytes::concat_all([b"`", def.name.name, b"` is a builtin effect"]),
+            Bytes::concat_all([b"reserved for `with_", def.name.name, b"` regions"]),
+            [b"rename this effect"],
+          )
+        } else if is_prelude_effect(name) {
+          report_error_at(
+            c,
+            b"E0105",
+            def.name.span,
+            Bytes::concat_all([b"`", name, b"` is a prelude effect"]),
+            b"declared by the language",
+            [
+              b"the language declares `task`, `clock`, `random`, `sim` and `abort`; `simulate { .. }` handles the first three",
+              Bytes::concat_all([
+                b"rename this effect, or put it in a named module, where its program-wide name would be `<module>.",
+                def.name.name,
+                b"` and would shadow the prelude",
+              ]),
+            ],
+          )
+        } else {
+          match effect_of(c, name) {
+            Some(prev) -> duplicate(c, def.name, prev.at, b"effect"),
+            None -> {
+              let ops = def.ops.fold(
+                { checker: c, ops: [] },
+                |acc: { checker: Checker, ops: List<OpInfo> }, op: OpDef|
+                  if acc.ops.fold(false, |b: Bool, op_info: OpInfo|
+                      b || op_info.name == op.name.name) {
+                    let prev = acc.ops.fold(dummy_span(), |span: Span, op_info: OpInfo|
+                      if op_info.name == op.name.name { op_info.at.span } else { span });
+                    {
+                      checker: duplicate(
+                        acc.checker,
+                        op.name,
+                        { module: acc.checker.module, span: prev },
+                        b"operation",
+                      ),
+                      ops: acc.ops,
+                    }
+                  } else {
+                    let bound: Checker = bind_ty_params(
+                      { ..acc.checker, ty_params: Map::new() },
+                      op.ty_params,
+                    );
+                    // A `Map` key's order is each perform's to meet, as a call meets a signature's.
+                    let c1: Checker = {
+                      ..bound,
+                      assumed: bound.ty_params.fold(
+                        bound.assumed,
+                        |xs: List<Assumed>, k: Bytes, t: Type|
+                          match t { TyVar(v) -> assume(xs, DOrd, v), _ -> xs },
+                      ),
+                    };
+                    let ps: WithTys = conv_types(c1, op.params);
+                    // A raise answers nothing, so each perform of it has the type asked of it.
+                    let r: WithTy = if is_raise(op.mode) { new_ty(ps.checker) }
+                    else { conv_type(ps.checker, op.ret) };
+                    let c2: Checker = {
+                      ..r.checker,
+                      ty_params: Map::new(),
+                      assumed: acc.checker.assumed,
+                    };
+                    let c3: Checker = range(0, ps.tys.len()).fold(c2, |cc: Checker, i: Int| {
+                      let what = b"parameter ".concat(ascii_of_int(i + 1));
+                      let at = ty_span(op.params.get(i));
+                      reject_declared_reach(
+                        reject_declared_brand(cc, ps.tys.get(i), at, op.name.name, what),
+                        ps.tys.get(i),
+                        at,
+                        op.name.name,
+                        what,
+                        operation_reach(),
+                      )
+                    });
+                    let c4 = reject_declared_reach(
+                      reject_declared_brand(c3, r.ty, ty_span(op.ret), op.name.name, b"result"),
+                      r.ty,
+                      ty_span(op.ret),
+                      op.name.name,
+                      b"result",
+                      operation_reach(),
+                    );
+                    {
+                      checker: c4,
+                      ops: acc.ops.push({
+                        name: op.name.name,
+                        mode: op.mode,
+                        resource_param: op.resource_param,
+                        params: ps.tys,
+                        ret: r.ty,
+                        at: location_of(c4, op.span),
+                        scheme: None,
+                      }),
+                    }
+                  },
+              );
+              add_effect(ops.checker, {
+                name: name,
+                module: parsed.name,
+                simple_name: def.name.name,
+                nondet: def.is_nondet,
+                ops: ops.ops,
+                at: location_of(ops.checker, def.span),
+              })
+            },
+          }
+        }
+      },
+      _ -> c,
+    })
+
+pub fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
+  parsed.module.items.fold(checker, |c: Checker, item: Item|
+    match item {
+      IType(def) -> match def.body {
+        TDAlias(_) -> c,
+        TDNominal(_) -> c,
+        TDExtern -> c,
+        TDSum(variants) -> {
+          let type_name = qualify(parsed.name, def.name.name);
+          match c.types.get(type_name) {
+            None -> c,
+            Some(decl) -> {
+              let vars: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> } = decl.params.fold(
+                { checker: c, vars: [], params: Map::new() },
+                |acc: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> }, p: Bytes| {
+                  let o: WithVar = new_ty_var(acc.checker);
+                  {
+                    checker: o.checker,
+                    vars: acc.vars.push(o.var),
+                    params: acc.params.insert(p, TyVar(o.var)),
+                  }
+                },
+              );
+              let own = bind_own({ ..vars.checker, ty_params: vars.params }, decl);
+              let c1: Checker = own.checker;
+              let result = TyCon({
+                name: type_name,
+                args: applied_args(
+                  vars.vars.map(|v: Int| TyVar(v)),
+                  own.labels.map(|v: Int| TyVar(v)),
+                  own.rows.map(row_open),
+                ),
+              });
+              let walked: Checker = range(0, variants.len()).fold(c1, |cc: Checker, index: Int| {
+                let variant = variants.get(index);
+                let ctor = qualify(parsed.name, variant.name.name);
+                match ctor_of(cc, ctor) {
+                  Some(prev) -> duplicate(cc, variant.name, prev.at, b"constructor"),
+                  None -> {
+                    let fs: WithTys = conv_types(cc, variant.fields);
+                    let checked: Checker = range(0, fs.tys.len()).fold(
+                      fs.checker,
+                      |c3: Checker, i: Int|
+                        reject_declared_reach(
+                          reject_declared_brand(
+                            c3,
+                            fs.tys.get(i),
+                            ty_span(variant.fields.get(i)),
+                            variant.name.name,
+                            b"field ".concat(ascii_of_int(i + 1)),
+                          ),
+                          fs.tys.get(i),
+                          ty_span(variant.fields.get(i)),
+                          variant.name.name,
+                          b"field ".concat(ascii_of_int(i + 1)),
+                          variant_reach(),
+                        ),
+                    );
+                    let ty = if fs.tys.len() == 0 { result }
+                    else { fn_type(fs.tys, result, row_empty()) };
+                    let sc = {
+                      ty_vars: vars.vars,
+                      row_vars: own.rows,
+                      label_vars: own.labels,
+                      ty: ty,
+                    };
+                    add_ctor({ ..checked, env: env_bind_global(checked.env, ctor, sc) }, {
+                      name: ctor,
+                      module: parsed.name,
+                      simple_name: variant.name.name,
+                      type_name: type_name,
+                      index: index,
+                      arity: fs.tys.len(),
+                      fields: fs.tys,
+                      scheme: sc,
+                      at: location_of(checked, variant.span),
+                    })
+                  },
+                }
+              });
+              { ..walked, ty_params: Map::new(), row_params: Map::new(), label_params: Map::new() }
+            },
+          }
+        },
+      },
+      _ -> c,
+    })
+
+/// A function and a constructor of one name in one module.
+pub fn check_value_namespace(checker: Checker, parsed: ParsedModule) -> Checker = {
+  let walked = parsed.module.items.fold(
+    { checker: checker, seen: [] },
+    |acc: { checker: Checker, seen: List<{ name: Bytes, span: Span, is_fn: Bool }> }, item: Item| {
+      let declared = match item {
+        IFn(d) -> [{ name: d.name, is_fn: true }],
+        IType(d) -> match d.body {
+          TDSum(vs) -> vs.map(|variant: VariantDef| { name: variant.name, is_fn: false }),
+          TDAlias(_) -> [],
+          TDNominal(_) -> [],
+          TDExtern -> [],
+        },
+        _ -> [],
+      };
+      declared.fold(
+        acc,
+        |a: { checker: Checker, seen: List<{ name: Bytes, span: Span, is_fn: Bool }> }, x: { name: Ident, is_fn: Bool }| {
+          let prev = a.seen.fold(
+            None,
+            |p: Option<{ name: Bytes, span: Span, is_fn: Bool }>, s: { name: Bytes, span: Span, is_fn: Bool }|
+              match p { Some(_) -> p, None -> if s.name == x.name.name { Some(s) } else { None } },
+          );
+          match prev {
+            None ->
+              { ..a, seen: a.seen.push({ name: x.name.name, span: x.name.span, is_fn: x.is_fn }) },
+            Some(first) -> if first.is_fn == x.is_fn { a } else {
+              let later = if x.is_fn { b"function" } else { b"constructor" };
+              let earlier = if x.is_fn { b"constructor" } else { b"function" };
+              let where_ = if parsed.name.len() == 0 { b"" }
+              else { Bytes::concat_all([b" in module `", parsed.name, b"`"]) };
+              {
+                ..a,
+                checker: report_error_at_and(
+                  a.checker,
+                  b"E0105",
+                  x.name.span,
+                  Bytes::concat_all([b"`", x.name.name, b"` is defined twice", where_]),
+                  Bytes::concat_all([b"redefined here as a ", later]),
+                  { module: a.checker.module, span: first.span },
+                  Bytes::concat_all([b"first defined here as a ", earlier]),
+                  [
+                    Bytes::concat_all([
+                      b"functions and constructors share one namespace: nothing written `",
+                      x.name.name,
+                      b"` could say which of the two it means",
+                    ]),
+                    b"rename one of them",
+                  ],
+                ),
+              }
+            },
+          }
+        },
+      )
+    },
+  );
+  walked.checker
+}
+
+// --- Signatures ---------------------------------------------------------------------------
+
+pub fn constraints_in_force(
+  checker: Checker,
+  cs: List<Constraint>,
+) -> List<Assumed> / {abort.raise} =
+  cs.fold([], |acc: List<Assumed>, c: Constraint|
+    match checker.ty_params.get(c.param.name) {
+      Some(TyVar(v)) -> assume(acc, c.deriver, v),
+      _ -> acc,
+    })
+
+pub fn assume(xs: List<Assumed>, deriver: Deriver, v: Int) -> List<Assumed> / {abort.raise} = {
+  let hit = range(0, xs.len()).fold(None, |acc: Option<Int>, i: Int|
+    match acc {
+      Some(_) -> acc,
+      None -> if same_deriver(xs.get(i).deriver, deriver) { Some(i) } else { None },
+    });
+  match hit {
+    Some(i) -> {
+      let x = xs.get(i);
+      xs.set(i, { deriver: x.deriver, vars: ints_insert(x.vars, v) })
+    },
+    None -> xs.push({ deriver: deriver, vars: [v] }),
+  }
+}
+
+fn check_where(checker: Checker, def: FnDef) -> Checker / {abort.raise} =
+  def.constraints.fold(checker, |c: Checker, k: Constraint|
+    if c.ty_params.contains(k.param.name) { c } else {
+      let bound = def.generics.types.map(|ident: Ident| ident.name);
+      report_error_at(
+        c,
+        b"E0102",
+        k.param.span,
+        Bytes::concat_all([b"`", k.param.name, b"` is not a type parameter of this signature"]),
+        b"not bound by the generic list",
+        [
+          if bound.len() == 0 {
+            Bytes::concat_all([
+              b"`",
+              def.name.name,
+              b"` takes no type parameters, and a constraint on a concrete type is either already true or already an error",
+            ])
+          } else { b"this signature binds ".concat(backticked(bound, b", ")) },
+        ],
+      )
+    })
+
+/// A signature's type parameters: only these names are type variables in it, each rigid.
+fn bind_ty_params(checker: Checker, names: List<Ident>) -> Checker =
+  names.fold(checker, |c: Checker, ident: Ident| {
+    let o: WithVar = new_ty_var(c);
+    {
+      ..o.checker,
+      subst: mark_rigid_ty(o.checker.subst, o.var),
+      ty_params: o.checker.ty_params.insert(ident.name, TyVar(o.var)),
+    }
+  })
+
+/// A member of the group being walked as a call inside the group reads it: each call fills its own
+/// type, row and label parameters, as a call from outside does.
+pub fn member_scheme(checker: Checker, def: FnDef, sig: Signature) -> Scheme / {abort.raise} = {
+  let free = free_vars(checker.subst, sig.fn_ty, { tys: [], rows: [] });
+  {
+    ty_vars: def.generics.types.fold([], |vs: List<Int>, ident: Ident|
+      match sig.ty_params.get(ident.name) {
+        Some(TyVar(v)) -> if free.tys.contains(v) { vs.push(v) } else { vs },
+        _ -> vs,
+      }),
+    row_vars: def.generics.effects.fold([], |vs: List<Int>, ident: Ident|
+      match sig.row_params.get(ident.name) {
+        Some(v) -> if free.rows.contains(v) { vs.push(v) } else { vs },
+        None -> vs,
+      }),
+    label_vars: def.generics.labels.fold([], |vs: List<Int>, ident: Ident|
+      match sig.label_params.get(ident.name) { Some(v) -> vs.push(v), None -> vs }),
+    ty: sig.fn_ty,
+  }
+}
+
+/// A definition's signature as it is written, each of its type, row and label parameters rigid.
+pub fn written_signature(
+  outer: Checker,
+  def: FnDef,
+) -> { checker: Checker, sig: Signature } / {abort.raise} = {
+  let checker: Checker = {
+    ..outer,
+    scope: outer.scope + 1,
+    ty_params: Map::new(),
+    row_params: Map::new(),
+    label_params: Map::new(),
+  };
+  let tys: Checker = bind_ty_params(checker, def.generics.types);
+  let rows: Checker = def.generics.effects.fold(tys, |c: Checker, p: Ident| {
+    let o: WithVar = new_row_var(c);
+    {
+      ..o.checker,
+      subst: mark_rigid_row(o.checker.subst, o.var),
+      row_params: o.checker.row_params.insert(p.name, o.var),
+    }
+  });
+  // A label parameter is a type variable, rigid in the body, that the row's atoms name.
+  let labels: Checker = def.generics.labels.fold(rows, |c: Checker, p: Ident| {
+    let o: WithVar = new_ty_var(c);
+    {
+      ..o.checker,
+      subst: mark_rigid_ty(o.checker.subst, o.var),
+      label_params: o.checker.label_params.insert(p.name, o.var),
+    }
+  });
+  let assumed: Checker = witnessing(
+    { ..labels, assumed: constraints_in_force(labels, def.constraints) },
+    def.constraints,
+  );
+  let checked: Checker = check_where(assumed, def);
+  let params = def.params.fold(
+    { checker: checked, tys: [] },
+    |acc: { checker: Checker, tys: List<Type> }, p: Param|
+      match p.ty {
+        Some(t) -> {
+          let o: WithTy = conv_type(acc.checker, t);
+          { checker: hold_written(o.checker, t, o.ty, true), tys: acc.tys.push(o.ty) }
+        },
+        None -> {
+          let o: WithTy = new_ty(acc.checker);
+          { checker: o.checker, tys: acc.tys.push(o.ty) }
+        },
+      },
+  );
+  let ret: WithTy = match def.ret {
+    Some(t) -> {
+      let o: WithTy = conv_type(params.checker, t);
+      { checker: hold_written(o.checker, t, o.ty, false), ty: o.ty }
+    },
+    None -> new_ty(params.checker),
+  };
+  // A function's row is what its signature writes: with no `/`, the empty one.
+  let declared: { checker: Checker, r: Option<Row>, bounded: List<Atom> } = match def.effects {
+    Some(r) -> {
+      let o = conv_marked(ret.checker, r);
+      { checker: o.checker, r: Some(o.r), bounded: o.bounded }
+    },
+    None -> { checker: ret.checker, r: Some(row_empty()), bounded: [] },
+  };
+  let row: WithRow = match declared.r {
+    Some(r) -> { checker: declared.checker, row: r },
+    None -> new_row(declared.checker),
+  };
+  let c: Checker = row.checker;
+  {
+    checker: { ..c, ty_params: Map::new(), row_params: Map::new(), label_params: Map::new() },
+    sig: {
+      ty_params: c.ty_params,
+      row_params: c.row_params,
+      label_params: c.label_params,
+      fn_ty: fn_type(params.tys, ret.ty, row.row),
+      params: params.tys,
+      ret: ret.ty,
+      declared: declared.r,
+      published_row: row.row,
+      bounded: declared.bounded,
+      tail_bounded: match def.effects { Some(r) -> r.tail_bounded, None -> false },
+      scope: c.scope,
+    },
+  }
+}
+
+// --- What a place expects ----------------------------------------------------------------------
+
+/// Whether `ty` names a hold anywhere but as a parameter: its own, where `passed`, or one of a
+/// function type it holds.
+fn keeps_hold(ty: Type, passed: Bool) -> Bool =
+  match ty {
+    TyVar(_) -> false,
+    TyCon(c) ->
+      (c.name == b"Hold" && !passed)
+        || c.args.fold(false, |b: Bool, a: Type| b || keeps_hold(a, false)),
+    TyFn(f) ->
+      f.params.fold(false, |b: Bool, p: Type| b || keeps_hold(p, true)) || keeps_hold(f.ret, false),
+    TyRecord(fs) -> fs.fold(false, |b: Bool, f: Field| b || keeps_hold(f.ty, false)),
+    TyNominal(n) -> n.args.fold(false, |b: Bool, a: Type| b || keeps_hold(a, false)),
+  }
+
+/// A hold is passed down and never kept, so `Hold` is written only as a parameter's type.
+pub fn hold_written(
+  checker: Checker,
+  written: TypeExpr,
+  ty: Type,
+  passed: Bool,
+) -> Checker / {abort.raise} =
+  if !keeps_hold(resolve(checker, ty), passed) { checker } else {
+    report_error_at(
+      checker,
+      b"E0446",
+      ty_span(written),
+      b"a `Hold` is written where it would be kept",
+      b"a hold is passed down, never kept",
+      [
+        b"a hold is a parameter of a definition, a lambda or a function type: it is not answered, held in another value or bound by an annotation",
+        b"read it where it is passed, with `Hold::get`, and keep what the read answers",
+      ],
+    )
+  }
+
+// --- Effects ----------------------------------------------------------------------------------
+
+/// The open region of this name, when there is one.
+pub fn open_region_named(checker: Checker, name: Bytes) -> Option<OpenRegion> =
+  checker.open_regions.fold(None, |acc: Option<OpenRegion>, region: OpenRegion|
+    if region.name == name { Some(region) } else { acc })
+
+/// What `name` stands for where an atom of the effect `eff` or a hold's type writes it: an open
+/// region's own label for its hold, and for any other effect the resource of that name.
+fn region_named(checker: Checker, eff: Bytes, name: Bytes) -> Bytes =
+  if !is_region_effect(eff) { name }
+  else { match open_region_named(checker, name) { Some(region) -> region.label, None -> name } }
+
+// --- Tests and laws --------------------------------------------------------------------------------
+
+pub fn first_reason<a | e>(xs: List<a>, f: (a) -> Option<Bytes> / e) -> Option<Bytes> / e =
+  xs.fold(None, |acc: Option<Bytes>, x: a| match acc { Some(_) -> acc, None -> f(x) })
+
+// --- Derivability ------------------------------------------------------------------------------
+
+pub fn rigid_params(checker: Checker) -> List<RigidParam> =
+  checker.ty_params.fold([], |acc: List<RigidParam>, k: Bytes, ty: Type|
+    match ty { TyVar(v) -> acc.push({ name: k, var: v }), _ -> acc })
+
+/// `integer(a)` implies `numeric(a)`, so a numeric obligation also holds of an integer parameter.
+pub fn assumed_for(checker: Checker, deriver: Deriver) -> List<Int> / {abort.raise} =
+  checker.assumed.fold([], |acc: List<Int>, a: Assumed|
+    if same_deriver(a.deriver, deriver)
+        || (same_deriver(deriver, DNumeric) && same_deriver(a.deriver, DInteger)) {
+      a.vars.fold(acc, |b: List<Int>, v: Int| ints_insert(b, v))
+    } else { acc })
+
+/// A part of a type that must be ordered: a `Map`'s key, or an argument a declared type `carrier`
+/// keys a `Map` by, which holds wherever the type is written or built.
+pub type OrderedPart = { key: Type, carrier: Option<Type> }
+
+/// The parts `t` itself asks ordered, leaving those of the types it is built from: a `Map`'s key, or
+/// the arguments a declared type keys a `Map` by.
+pub fn own_parts(
+  carrying: Map<Bytes, List<Int>>,
+  t: Type,
+  out: List<OrderedPart>,
+) -> List<OrderedPart> / {abort.raise} = {
+  let carried = |name: Bytes, args: List<Type>|
+    if carrying.len() == 0 { out } else {
+      match carrying.get(name) {
+        None -> out,
+        Some(ps) ->
+          ps.fold(out, |acc: List<OrderedPart>, j: Int|
+            match args.at(j) { Some(a) -> acc.push({ key: a, carrier: Some(t) }), None -> acc }),
+      }
+    };
+  match t {
+    TyCon(c) -> if c.name == b"Map" && c.args.len() == 2 {
+      out.push({ key: c.args.get(0), carrier: None })
+    } else if builtin_type_arity(c.name) != None { out }
+    else { carried(c.name, c.args) },
+    TyNominal(n) -> carried(n.name, n.args),
+    _ -> out,
+  }
+}
+
+pub fn note_parts(
+  checker: Checker,
+  span: Span,
+  found: List<OrderedPart>,
+) -> Checker / {abort.raise} =
+  note_sites(
+    checker,
+    span,
+    found.map(|p: OrderedPart| { key: p.key, whole: p.key, carrier: p.carrier }),
+  )
+
+/// What a site judges, the key it names and the declared type that asks it, if no `Map` does.
+pub type Judged = { key: Type, whole: Type, carrier: Option<Type> }
+
+pub fn note_sites(checker: Checker, span: Span, found: List<Judged>) -> Checker / {abort.raise} =
+  if found.len() == 0 { checker } else {
+    let assumed = assumed_for(checker, DOrd);
+    let params = rigid_params(checker);
+    {
+      ..checker,
+      map_keys: checker.map_keys.concat(
+        found.map(|j: Judged|
+          {
+            module: checker.module,
+            span: span,
+            scope: checker.scope,
+            key: j.key,
+            whole: j.whole,
+            carrier: j.carrier,
+            assumed: assumed,
+            params: params,
+            via: b"",
+          }),
+      ),
+    }
+  }
+
+fn from_index(sites: List<MapKeySite>, from: Int) -> List<MapKeySite> / {abort.raise} =
+  range(from, sites.len()).fold([], |acc: List<MapKeySite>, i: Int| acc.push(sites.get(i)))
+
+/// The sites an alias expansion recorded from `from` on, moved to where the alias was named.
+fn relocated_keys(
+  sites: List<MapKeySite>,
+  from: Int,
+  module: Int,
+  span: Span,
+  alias: Bytes,
+) -> List<MapKeySite> / {abort.raise} =
+  range(from, sites.len()).fold(sites, |acc: List<MapKeySite>, i: Int| {
+    let s = acc.get(i);
+    acc.set(i, { ..s, module: module, span: span, via: alias })
+  })
+
+/// The type parameters a definition's `numeric` and `integer` constraints make witnesses of.
+pub fn witnessing(checker: Checker, cs: List<Constraint>) -> Checker =
+  cs.fold(checker, |c: Checker, k: Constraint|
+    if !is_predicate(k.deriver) { c } else {
+      match c.ty_params.get(k.param.name) {
+        Some(TyVar(v)) -> {
+          let integer = same_deriver(k.deriver, DInteger)
+            || (match c.witnessed.get(v) { Some(w) -> w.integer, None -> false });
+          { ..c, witnessed: c.witnessed.insert(v, { param: k.param.name, integer: integer }) }
+        },
+        _ -> c,
+      }
+    })
+
+// --- Comparisons, simulations and regions, once the module is solved ------------------------------
+
+/// A task and a channel are keys into the scheduler of the region that made them.
+pub fn scheduler_handle(name: Bytes) -> Bool = name == b"Task" || name == b"Chan"
+
+pub fn task_op(op: Bytes) -> Atom =
+  { effect: b"task", resource: RSingleton, mode: MWrite, op: Some(op) }
+
+/// A hold is reached by atoms naming its region; a task only by a join, an await or a cancel, a
+/// channel by a send, a receive, a close or a select, and either by a `simulate` around one.
+pub fn row_brands(row: Row, brand: Brand) -> Bool =
+  match brand {
+    HoldsOf(r) ->
+      row.atoms.fold(false, |b: Bool, atom: Atom|
+        b || (atom.effect == hold() && atom.resource == RNamed(r))),
+    Tasks ->
+      [b"join", b"await", b"cancel"].concat(channel_ops()).fold(
+        atoms_covered(row.atoms, seed_atom()),
+        |b: Bool, op: Bytes| b || atoms_covered(row.atoms, task_op(op)),
+      ),
+  }

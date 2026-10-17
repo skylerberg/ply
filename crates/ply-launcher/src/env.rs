@@ -6,8 +6,8 @@
 //!
 //! Colour is decided here and nowhere else: a program has no terminal to ask.
 
-use ply_eval::host::{HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity};
-use ply_eval::{Diagnostic, Value, codes};
+use ply_core::host::{HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity};
+use ply_core::{Diagnostic, Value, codes};
 use std::io::IsTerminal;
 use std::sync::Arc;
 
@@ -34,7 +34,7 @@ pub fn registrations(version: &str) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     OPERATIONS
         .into_iter()
         .map(|(op, path)| {
-            let op = ply_machine::hosts::privileged_op(EFFECT, op, Linearity::Repeatable, path);
+            let op = ply_privileged::hosts::privileged_op(EFFECT, op, Linearity::Repeatable, path);
             (op, Arc::clone(&handler))
         })
         .collect()
@@ -61,7 +61,7 @@ impl HostHandler for EnvHandler {
                         Some((name.into_string().ok()?, value.into_string().ok()?))
                     })
                     .map(|(name, value)| {
-                        ply_machine::payload::record(vec![
+                        ply_privileged::payload::record(vec![
                             ("name", Value::str(name)),
                             ("value", Value::str(value)),
                         ])
@@ -85,12 +85,12 @@ impl HostHandler for EnvHandler {
             },
             // Under the stage root, where `sweep` keeps them to the cache's budget.
             ("reused", []) => Value::str(
-                ply_codegen::c::stage::stage_dir(ply_codegen::c::sweep::REUSED)
+                ply_compiled::c::stage::stage_dir(ply_compiled::c::sweep::REUSED)
                     .display()
                     .to_string(),
             ),
             // Where the emitter's answers are kept between runs, under the toolchain's sweep.
-            ("bodies", []) => Value::str(ply_codegen::c::bodies_dir().display().to_string()),
+            ("bodies", []) => Value::str(ply_compiled::c::bodies_dir().display().to_string()),
             // The working directory the `cwd` root is bound to, as the program resolves paths.
             ("pwd", []) => Value::str(
                 std::env::current_dir()

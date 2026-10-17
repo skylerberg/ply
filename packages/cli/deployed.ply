@@ -1,0 +1,875 @@
+//! A program's artifact: the closure of one entry point, held three ways — its definitions by hash,
+//! printed back to source, and the runnable a machine loads with the unit's C, made from that source
+//! checked again — and opened by holding each against the others. `compiler.store.plyx` lays the container
+//! out; the runnable is `shipped.runnable`'s.
+
+import builder (Refusal)
+import units
+import units (emit)
+import compiler.front.rows (Dump, HashFrame, HDef, HashRow, BodyRow, DefRow, TypeRow, EffectRow)
+import compiler.front.published (shipped_dump)
+import compiler.store.hash.forms (Closed, HashOutput, by_name, held_by, walk)
+import compiler.store.hash.printed (Printed, Unprintable, print_bodies)
+import compiler.store.hash (body_key)
+import compiler.store.hash.encoding (hex)
+import compiler.load (SourceFile, held, LoadedAnalysis)
+import compiler.store.plyx (Header, Placed, Section, decode, digest_of, digest_text, domain)
+import compiler.store.segments (word_at)
+import compiler.check.resolve.tables (Diag, error_at)
+import compiler.unit (Helper, Runtime, compiler_roots, identity_of, shipped)
+import std.bytes (u32_le, ascii_of_int)
+import std.hash (blake3)
+import std.list
+import std.string
+import compiler.syntax.parsing (no_module, dummy_span, Span)
+
+/// One name the artifact holds and the hash of what it names, in hex.
+pub type Named = { name: String, hash: String }
+
+/// One definition and what it reaches, restricted to the artifact; only `--diff` asks for these.
+pub type Reach = { name: String, reaches: List<String> }
+
+pub type Made = {
+  entry: String,
+  entry_hash: String,
+  startup: List<String>,
+  head: Header,
+  sections: List<Section>,
+  definitions: Int,
+  names: List<Named>,
+  reaches: List<Reach>,
+}
+
+/// A library's unit: the head every container records, and its one section's payload.
+pub type Compiled = { head: Header, count: Int, payload: Bytes }
+
+/// What an artifact holds once every part of it agrees with every other: the runnable a machine
+/// loads, its unit's C (carried deflated), and what that machine holds it to, and what a report says
+/// of it.
+pub type Opened = {
+  entry: String,
+  entry_hash: Bytes,
+  digest: String,
+  definitions: Int,
+  names: List<{ name: String, hash: Bytes }>,
+  closure: List<{ path: String, text: Bytes }>,
+  runnable: Bytes,
+  unit: Bytes,
+}
+
+/// What a build asks of its artifacts: one made from the program, an earlier one read back, and a
+/// library's unit. `deploying` answers it with this module; a test answers it with what it reports.
+/// `hashes` is the hashing `front` was answered from: a closure is walked over its references.
+pub effect artifacts {
+  read made(front: LoadedAnalysis, hashes: HashOutput, entry: String, startup: List<String>, reaches: Bool) -> Result<Made, Refusal>
+  /// `None` when nothing could be read at `path`.
+  read previous(path: String, bytes: Option<Bytes>) -> Result<Previous, Refusal>
+  read unit(front: LoadedAnalysis, names: List<String>) -> Result<Compiled, Refusal>
+}
+
+pub type Previous = { digest: String, names: List<Named> }
+
+pub fn deploying<a | e>(
+  body: () -> a / {artifacts.made, artifacts.previous, artifacts.unit | e},
+) -> a / {abort.raise, emit.unit, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable | e} =
+  handle {
+    body()
+  } with {
+    artifacts.made(front, hashes, entry, startup, reaches) ->
+      made(front, hashes, entry, startup, reaches),
+    artifacts.previous(path, bytes) -> previous(path, bytes),
+    artifacts.unit(front, names) -> library_unit(front, names),
+  }
+
+// --- Small things -------------------------------------------------------------
+
+fn nowhere() -> Span = dummy_span()
+
+fn short(hash: Bytes) -> String / {abort.raise} = hash.hex_of().slice(0, 12)
+
+fn sealed_short(d: Bytes) -> String / {abort.raise} = digest_text(d).slice(0, 15)
+
+fn refusal(diags: List<Diag>) -> Refusal = { diags: diags, places: [] }
+
+fn internal(message: String, notes: List<Bytes>) -> Diag =
+  error_at(
+    b"E0505",
+    no_module(),
+    nowhere(),
+    Bytes::of_string(message),
+    b"this is Ply's fault, not the program's",
+    notes.push(b"nothing was built"),
+  )
+
+fn invalid(path: String, message: String, notes: List<Bytes>) -> Diag =
+  error_at(
+    b"E0443",
+    no_module(),
+    nowhere(),
+    Bytes::of_string(message),
+    Bytes::of_string("in `" ++ path ++ "`"),
+    notes.push(b"rebuild it with `ply build`, or transfer the file again"),
+  )
+
+fn version(path: String, message: String) -> Diag =
+  error_at(
+    b"E0444",
+    no_module(),
+    nowhere(),
+    Bytes::of_string(message),
+    Bytes::of_string("in `" ++ path ++ "`"),
+    [b"rebuild the artifact with this `ply`; re-transferring it will not help"],
+  )
+
+// --- What a container's head records ----------------------------------------------
+
+/// The compiler that built an artifact: one built by another reads its closure another way.
+pub fn frontend() -> Bytes / {shipped.definitions, abort.raise} =
+  blake3(identity_of(shipped.definitions(), compiler_roots()))
+
+fn helper_line(h: Helper) -> Bytes =
+  Bytes::concat_all([
+    h.name,
+    b" ",
+    ascii_of_int(h.args),
+    b" ",
+    if h.answers { b"true" } else { b"false" },
+    b"\n",
+  ])
+
+/// The runtime a unit was compiled against, as the helper table its C binds by position.
+pub fn runtime_of(r: Runtime) -> Bytes / {abort.raise} =
+  blake3(hex(blake3(Bytes::concat_all(r.helpers.map(helper_line)))))
+
+fn head_of(entry: Bytes) -> Header / {shipped.definitions, shipped.runtime, abort.raise} =
+  { frontend: frontend(), runtime: runtime_of(shipped.runtime()), entry: entry }
+
+// --- The closure ------------------------------------------------------------------
+
+fn hash_rows(d: Dump) -> Map<Bytes, HashRow> =
+  d.hashes.fold(Map::new(), |acc: Map<Bytes, HashRow>, f: HashFrame|
+    match f { HDef(r) -> acc.insert(r.name, r), _ -> acc })
+
+/// A hash as the answer spells it, in hex, as the bytes a body is keyed by.
+fn raw(h: Bytes) -> Bytes / {abort.raise} = Bytes::of_hex(String::of_bytes(h))
+
+/// The hashes a name is filed under: its definition's and its declaration's.
+fn hashes_of(r: HashRow) -> List<Bytes> / {abort.raise} =
+  [r.def, r.decl].fold([], |acc: List<Bytes>, h: Option<Bytes>|
+    match h { Some(x) -> acc.push(raw(x)), None -> acc })
+
+fn grouped(d: Dump) -> Map<Bytes, List<Bytes>> / {abort.raise} =
+  d.bodies.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, b: BodyRow|
+    if body_key(b.body) == None { acc } else {
+      acc.insert(b.name, List::push(match acc.get(b.name) { Some(l) -> l, None -> [] }, b.body))
+    })
+
+/// A name declared in two namespaces has two bodies, and the hash each is filed under tells them
+/// apart.
+fn filed(stored: List<Bytes>, hash: Bytes) -> Option<Bytes> / {abort.raise} =
+  match stored {
+    [only] -> Some(only),
+    many -> match many.filter(|b: Bytes| body_key(b) == Some(hash)) {
+      [b, ..] -> Some(b),
+      [] -> None,
+    },
+  }
+
+type Pair = { name: Bytes, hash: Bytes }
+
+/// The body the answer holds for each of `pairs`, keyed by the hash it is filed under.
+fn bodies_of(d: Dump, pairs: List<Pair>) -> Map<Bytes, Bytes> / {abort.raise} = {
+  let stored = grouped(d);
+  pairs.fold(Map::new(), |acc: Map<Bytes, Bytes>, pair: Pair|
+    match stored.get(pair.name) {
+      None -> acc,
+      Some(bodies) -> match filed(bodies, pair.hash) {
+        Some(b) -> acc.insert(pair.hash, b),
+        None -> acc,
+      },
+    })
+}
+
+/// Each definition and declaration a closure holds with the hash it is filed under, by name and
+/// then by hash.
+fn pairs_of(held: List<Closed>) -> List<Pair> =
+  held.fold(Map::new(), |acc: Map<Bytes, Pair>, x: Closed|
+    acc.insert(Bytes::concat_all([x.name, b"\x00", x.hash]), {
+      name: x.name,
+      hash: x.hash,
+    })).values(
+  )
+
+fn listed(names: List<Bytes>) -> Bytes =
+  range(0, names.len()).fold(b"", |acc: Bytes, i: Int|
+    match names.at(i) {
+      Some(n) -> if i == 0 { n } else { Bytes::concat_all([acc, b", ", n]) },
+      None -> acc,
+    })
+
+fn no_body(absent: List<Bytes>) -> Diag =
+  error_at(
+    b"E0443",
+    no_module(),
+    nowhere(),
+    Bytes::of_string(
+      absent.len().to_string() ++ " of the entry point's definitions have no stored body",
+    ),
+    b"the closure is incomplete",
+    [b"missing: ".concat(listed(absent.take(8)))],
+  )
+
+fn unhashed(name: Bytes) -> Diag =
+  error_at(
+    b"E0443",
+    no_module(),
+    nowhere(),
+    Bytes::concat_all([b"`", name, b"` has no definition hash, so nothing could be built from it"]),
+    b"this entry point was not hashed",
+    [],
+  )
+
+/// Each function's and each declaration's `pub`, by name: a function and an effect of one name each
+/// say their own.
+type Exports = { fns: Map<Bytes, Bool>, decls: Map<Bytes, Bool> }
+
+fn exports_of(d: Dump) -> Exports = {
+  let typed = d.types.fold(Map::new(), |acc: Map<Bytes, Bool>, r: TypeRow|
+    acc.insert(r.name, r.public));
+  {
+    fns: d.defs.fold(Map::new(), |acc: Map<Bytes, Bool>, r: DefRow| acc.insert(r.name, r.public)),
+    decls: d.effects.fold(typed, |acc: Map<Bytes, Bool>, r: EffectRow|
+      acc.insert(r.name, r.public)),
+  }
+}
+
+/// Whether the module that holds `x` exports it; a prelude effect is public.
+fn exported(e: Exports, x: Closed) -> Bool =
+  match Map::get(if x.decl { e.decls } else { e.fns }, x.name) {
+    Some(public) -> public,
+    None -> true,
+  }
+
+fn module_of(name: Bytes) -> Bytes / {abort.raise} = {
+  let parts = String::of_bytes(name).split(".");
+  Bytes::of_string(String::join(parts.take(parts.len() - 1), "."))
+}
+
+/// `a.b` is printed to `a/b.ply`.
+fn path_of(module: Bytes) -> String / {abort.raise} =
+  String::join(String::of_bytes(module).split("."), "/") ++ ".ply"
+
+/// The closure printed back, each reference under the name its definition names: two modules that
+/// declare one thing alike file one body, and only what a definition references says which it means.
+fn printed_files(
+  d: Dump,
+  held: List<Closed>,
+  bodies: Map<Bytes, Bytes>,
+) -> Result<List<SourceFile>, Diag> / {shipped.names, abort.raise} = {
+  let shipped_names = shipped.names().fold(Map::new(), |acc: Map<Bytes, Bool>, n: String|
+    acc.insert(Bytes::of_string(n), true));
+  let shipped_modules = held.fold(Map::new(), |acc: Map<Bytes, Bool>, x: Closed| {
+    let m = module_of(x.name);
+    if shipped_names.contains(m) { acc.insert(m, true) } else { acc }
+  }).keys(
+  );
+  let exports = exports_of(d);
+  match print_bodies(
+      bodies.values(),
+      held.fold(
+        Map::new(),
+        |acc: Map<Bytes, { name: Bytes, hash: Bytes, public: Bool }>, x: Closed|
+          acc.insert(Bytes::concat_all([x.name, b"\x00", x.hash]), {
+            name: x.name,
+            hash: x.hash,
+            public: exported(exports, x),
+          }),
+      ).values(
+      ),
+      [],
+      [],
+      shipped_modules,
+      false,
+      held.map(|x: Closed|
+        {
+          name: x.name,
+          hash: x.hash,
+          names: x.refs.fold([], |acc: List<Bytes>, i: Int|
+            match held.at(i) { Some(to) -> acc.push(to.name), None -> acc }),
+        }),
+    ) {
+    Unprintable(r) ->
+      Err(
+        internal(
+          "the closure could not be printed back to source: " ++ String::of_bytes_lossy(r.message),
+          r.notes,
+        ),
+      ),
+    Printed(modules) ->
+      Ok(
+        modules.map(|m: { module: Bytes, text: Bytes }|
+          { path: path_of(m.module), name: String::of_bytes(m.module), text: m.text }),
+      ),
+  }
+}
+
+fn files(rows: Map<Bytes, HashRow>, pair: Pair) -> Bool / {abort.raise} =
+  match rows.get(pair.name) {
+    Some(r) -> hashes_of(r).filter(|h: Bytes| h == pair.hash).len() > 0,
+    None -> false,
+  }
+
+/// A name the closure printed back and checked again does not file under the hash the program did,
+/// or stores under it another body: one a check of the printed text found other calls in.
+fn unfaithful(
+  pairs: List<Pair>,
+  bodies: Map<Bytes, Bytes>,
+  again: Dump,
+) -> Option<Bytes> / {abort.raise} = {
+  let now = hash_rows(again);
+  let rebuilt = bodies_of(again, pairs);
+  match pairs.filter(|pair: Pair|
+      !files(now, pair) || rebuilt.get(pair.hash) != bodies.get(pair.hash)) {
+    [pair, ..] -> Some(pair.name),
+    [] -> None,
+  }
+}
+
+fn names_of_pairs(pairs: List<Pair>) -> List<Bytes> =
+  pairs.fold(Map::new(), |acc: Map<Bytes, Bool>, pair: Pair| acc.insert(pair.name, true)).keys()
+
+/// Each definition and declaration a closure holds with the names it reaches of it, its own
+/// included, in name order, a declaration before the function of its name.
+fn reaches_of(held: List<Closed>) -> List<Reach> / {abort.raise} = {
+  let edges = held.map(|x: Closed| x.refs);
+  let name_at = |i: Int| match held.at(i) { Some(x) -> x.name, None -> b"" };
+  range(0, held.len()).fold(Map::new(), |acc: Map<Bytes, Reach>, i: Int|
+    match held.at(i) {
+      None -> acc,
+      Some(x) ->
+        acc.insert(Bytes::concat_all([x.name, b"\x00", if x.decl { b"0" } else { b"1" }]), {
+          name: String::of_bytes(x.name),
+          reaches: walk(edges, [i]).fold(Map::new(), |seen: Map<Bytes, Bool>, j: Int|
+            seen.insert(name_at(j), true)).keys(
+          ).map(
+            String::of_bytes,
+          ),
+        }),
+    }).values(
+  )
+}
+
+// --- The sections -----------------------------------------------------------------
+
+fn bodies_section(bodies: Map<Bytes, Bytes>) -> Section =
+  {
+    name: b"bodies",
+    count: bodies.keys().len(),
+    payload: Bytes::concat_all(
+      bodies.fold([], |acc: List<Bytes>, h: Bytes, b: Bytes|
+        acc.push(Bytes::concat_all([h, u32_le(b.len()), b]))),
+    ),
+  }
+
+/// Each record is where its name lies in the string section, the name's length and the hash; each
+/// name's text is written once, in record order.
+fn named_sections(pairs: List<Pair>) -> List<Section> = {
+  let laid = pairs.fold(
+    { strings: b"", placed: Map::new(), records: [] },
+    |acc: { strings: Bytes, placed: Map<Bytes, Int>, records: List<Bytes> }, pair: Pair| {
+      let known = acc.placed.get(pair.name);
+      let offset = match known { Some(o) -> o, None -> acc.strings.len() };
+      {
+        strings: match known { Some(_) -> acc.strings, None -> acc.strings.concat(pair.name) },
+        placed: acc.placed.insert(pair.name, offset),
+        records: acc.records.push(
+          Bytes::concat_all([u32_le(offset), u32_le(pair.name.len()), pair.hash]),
+        ),
+      }
+    },
+  );
+  [
+    { name: b"names", count: pairs.len(), payload: Bytes::concat_all(laid.records) },
+    { name: b"strings", count: laid.strings.len(), payload: laid.strings },
+  ]
+}
+
+fn closure_section(files: List<SourceFile>) -> Section =
+  {
+    name: b"closure",
+    count: files.len(),
+    payload: Bytes::concat_all(
+      files.map(|f: SourceFile| {
+        let path = Bytes::of_string(f.path);
+        Bytes::concat_all([u32_le(path.len()), path, u32_le(f.text.len()), f.text])
+      }),
+    ),
+  }
+
+// --- Making one -------------------------------------------------------------------
+
+/// The artifact of `entry`, with `startup` run before it: its closure, printed back to source and
+/// checked again, the unit emitted from that check, and the runnable made of both. The closure is
+/// what the functions `entry` and `startup` reach over `hashes`, a function apart from an effect or
+/// a type of its name: holding one holds nothing the other reaches.
+pub fn made(
+  front: LoadedAnalysis,
+  hashes: HashOutput,
+  entry: String,
+  startup: List<String>,
+  reaches: Bool,
+) -> Result<Made, Refusal> / {emit.unit, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable, abort.raise} = {
+  let defs = by_name(hashes.defs);
+  let roots = startup.push(entry).map(Bytes::of_string);
+  match roots.filter(|r: Bytes| !defs.contains(r)) {
+    [missing, ..] -> Err(refusal([unhashed(missing)])),
+    [] -> {
+      let closure = held_by(hashes, roots);
+      let pairs = pairs_of(closure);
+      let bodies = bodies_of(front.dump, pairs);
+      match pairs.filter(|pair: Pair| !bodies.contains(pair.hash)) {
+        [_, ..] ->
+          Err(
+            refusal([
+              no_body(names_of_pairs(pairs.filter(|pair: Pair| !bodies.contains(pair.hash)))),
+            ]),
+          ),
+        [] -> {
+          let names = closure.fold(Map::new(), |acc: Map<Bytes, Bool>, x: Closed|
+            if x.decl { acc } else { acc.insert(x.name, true) }).keys(
+          );
+          match printed_files(front.dump, closure, bodies) {
+            Err(d) -> Err(refusal([d])),
+            Ok(files) -> match held(files, front.inputs) {
+              Err(u) ->
+                Err(
+                  refusal([
+                    internal(
+                      "the closure printed back to source does not open as the program it was printed from",
+                      u.diags.take(1).map(|d: Diag| Bytes::concat_all([d.code, b": ", d.message])),
+                    ),
+                  ]),
+                ),
+              Ok(again) -> match unfaithful(pairs, bodies, again.dump) {
+                Some(n) ->
+                  Err(
+                    refusal([
+                      internal(
+                        "the closure printed back to source does not define `"
+                          ++ String::of_bytes(n)
+                          ++ "` as the program does",
+                        [],
+                      ),
+                    ]),
+                  ),
+                None -> {
+                  let defined = again.dump.defs.fold(
+                    Map::new(),
+                    |acc: Map<Bytes, Bool>, r: DefRow| acc.insert(r.name, true),
+                  );
+                  match units::text_of(
+                      emit.unit(again, names.filter(|n: Bytes| defined.contains(n))),
+                    ) {
+                    Err(diags) -> Err(refusal(diags)),
+                    Ok(unit) -> {
+                      let entry_hash = match defs.get(Bytes::of_string(entry)) {
+                        Some(h) -> h,
+                        None -> b"",
+                      };
+                      let runnable = shipped.runnable(entry, again.files, shipped_dump(again.dump));
+                      Ok({
+                        entry: entry,
+                        entry_hash: entry_hash.hex_of(),
+                        startup: startup,
+                        head: head_of(entry_hash),
+                        sections: append_all([
+                          [bodies_section(bodies)],
+                          named_sections(pairs),
+                          [
+                            closure_section(files),
+                            { name: b"runnable", count: 1, payload: runnable },
+                            { name: b"unit", count: 1, payload: unit.gzip() },
+                          ],
+                        ]),
+                        definitions: bodies.keys().len(),
+                        names: pairs.map(|pair: Pair|
+                          { name: String::of_bytes(pair.name), hash: pair.hash.hex_of() }),
+                        reaches: if reaches { reaches_of(closure) } else { [] },
+                      })
+                    },
+                  }
+                },
+              },
+            },
+          }
+        },
+      }
+    },
+  }
+}
+
+fn append_all<a>(parts: List<List<a>>) -> List<a> =
+  parts.fold([], |acc: List<a>, p: List<a>| p.fold(acc, |into: List<a>, x: a| into.push(x)))
+
+/// A library's unit: every definition `names` names, compiled with no entry, as a `.plyz` carries it.
+pub fn library_unit(
+  front: LoadedAnalysis,
+  names: List<String>,
+) -> Result<Compiled, Refusal> / {emit.unit, shipped.definitions, shipped.runtime, abort.raise} =
+  match units::text_of(emit.unit(front, names.map(Bytes::of_string))) {
+    Err(diags) -> Err(refusal(diags)),
+    Ok(unit) -> Ok({ head: head_of(b""), count: 1, payload: unit.gzip() }),
+  }
+
+// --- Opening one ------------------------------------------------------------------
+
+fn placed_named(sections: List<Placed>, name: Bytes) -> Option<Placed> =
+  match sections.filter(|p: Placed| p.name == name) { [p, ..] -> Some(p), [] -> None }
+
+/// `decode` has bounded every section by the file, so the slice is always there.
+pub fn payload(b: Bytes, p: Placed) -> Bytes =
+  match b.slice_at(p.at, p.len) { Some(x) -> x, None -> b"" }
+
+fn utf8(b: Bytes) -> Option<String> = {
+  let s = String::of_bytes_lossy(b);
+  if Bytes::of_string(s) == b { Some(s) } else { None }
+}
+
+type Bodies = { at: Int, by_hash: Map<Bytes, Bytes> }
+
+/// Each record is the hash, the body's length and the body, which must be the body that hash names.
+fn read_bodies(
+  path: String,
+  b: Bytes,
+  p: Placed,
+) -> Result<Map<Bytes, Bytes>, Diag> / {abort.raise} = {
+  let end = p.at + p.len;
+  let walked = range(0, p.count).fold(
+    Ok({ at: p.at, by_hash: Map::new() }),
+    |acc: Result<Bodies, Diag>, _i: Int|
+      match acc {
+        Err(_) -> acc,
+        Ok(s) -> if s.at + 36 > end { Err(runs_past(path, "definition", s.at)) } else {
+          let hash = match b.slice_at(s.at, 32) { Some(h) -> h, None -> b"" };
+          let n = word_at(b, s.at + 32);
+          if s.at + 36 + n > end { Err(runs_past(path, "definition", s.at)) } else {
+            let body = match b.slice_at(s.at + 36, n) { Some(x) -> x, None -> b"" };
+            if body_key(body) != Some(hash) {
+              Err(
+                invalid(
+                  path,
+                  "the definition filed under `" ++ short(hash) ++ "` at offset "
+                    ++ s.at.to_string()
+                    ++ " is not the definition that hash names",
+                  [
+                    b"a body is a function of its hash, so this is corruption rather than a difference of opinion",
+                  ],
+                ),
+              )
+            } else if s.by_hash.contains(hash) {
+              Err(invalid(path, "the artifact carries `" ++ short(hash) ++ "` twice", []))
+            } else { Ok({ at: s.at + 36 + n, by_hash: s.by_hash.insert(hash, body) }) }
+          }
+        },
+      },
+  );
+  match walked {
+    Err(d) -> Err(d),
+    Ok(s) -> if s.at != end {
+      Err(
+        invalid(
+          path,
+          "the definition section has " ++ Int::to_string(end - s.at) ++ " bytes nothing claims",
+          [],
+        ),
+      )
+    } else { Ok(s.by_hash) },
+  }
+}
+
+fn runs_past(path: String, what: String, at: Int) -> Diag =
+  invalid(
+    path,
+    "a " ++ what ++ " record at offset " ++ at.to_string() ++ " runs past its section",
+    [],
+  )
+
+type Name = { name: String, hash: Bytes }
+
+fn read_names(
+  path: String,
+  b: Bytes,
+  names: Option<Placed>,
+  strings: Option<Placed>,
+) -> Result<List<Name>, Diag> =
+  match names {
+    None -> Ok([]),
+    Some(p) -> if p.len != p.count * 40 {
+      Err(invalid(path, "the namespace section is the wrong size", []))
+    } else {
+      let text = match strings { Some(s) -> payload(b, s), None -> b"" };
+      range(0, p.count).fold(Ok([]), |acc: Result<List<Name>, Diag>, i: Int|
+        match acc {
+          Err(_) -> acc,
+          Ok(done) -> {
+            let at = p.at + i * 40;
+            match text.slice_at(word_at(b, at), word_at(b, at + 4)) {
+              None -> Err(invalid(path, "a name lies outside the string section", [])),
+              Some(raw) -> match utf8(raw) {
+                None -> Err(invalid(path, "a name is not valid UTF-8", [])),
+                Some(name) ->
+                  Ok(
+                    done.push({
+                      name: name,
+                      hash: match b.slice_at(at + 8, 32) { Some(h) -> h, None -> b"" },
+                    }),
+                  ),
+              },
+            }
+          },
+        })
+    },
+  }
+
+type File = { path: String, text: Bytes }
+
+type Files = { at: Int, out: List<File> }
+
+/// Each record is a module's path and its text, each after its length.
+fn read_closure(path: String, b: Bytes, closure: Option<Placed>) -> Result<List<File>, Diag> =
+  match closure {
+    None -> Ok([]),
+    Some(p) -> {
+      let end = p.at + p.len;
+      let walked = range(0, p.count).fold(
+        Ok({ at: p.at, out: [] }),
+        |acc: Result<Files, Diag>, _i: Int|
+          match acc {
+            Err(_) -> acc,
+            Ok(s) -> {
+              let path_len = word_at(b, s.at);
+              let text_at = s.at + 8 + path_len;
+              let text_len = word_at(b, s.at + 4 + path_len);
+              if s.at + 8 > end || text_at > end || text_at + text_len > end {
+                Err(runs_past(path, "closure", s.at))
+              } else {
+                match utf8(match b.slice_at(s.at + 4, path_len) { Some(x) -> x, None -> b"" }) {
+                  None -> Err(invalid(path, "a module path in the closure is not valid UTF-8", [])),
+                  Some(file) -> {
+                    let text = match b.slice_at(text_at, text_len) { Some(x) -> x, None -> b"" };
+                    match utf8(text) {
+                      None -> Err(invalid(path, "a module in the closure is not valid UTF-8", [])),
+                      Some(_) ->
+                        Ok({ at: text_at + text_len, out: s.out.push({ path: file, text: text }) }),
+                    }
+                  },
+                }
+              }
+            },
+          },
+      );
+      match walked {
+        Err(d) -> Err(d),
+        Ok(s) -> if s.at != end {
+          Err(
+            invalid(
+              path,
+              "the closure section has " ++ Int::to_string(end - s.at) ++ " bytes nothing claims",
+              [],
+            ),
+          )
+        } else { Ok(s.out) },
+      }
+    },
+  }
+
+fn noted(diag: Diag, note: Bytes) -> Diag =
+  if note.len() == 0 { diag }
+  else { { ..diag, notes_text: diag.notes_text.push(note), notes: diag.notes + 1 } }
+
+/// The artifact `b` read back from `path`, and refused unless every part of it is what was built.
+pub fn opened(
+  path: String,
+  b: Bytes,
+) -> Result<Opened, Diag> / {shipped.definitions, shipped.runtime, abort.raise} =
+  match decode(b) {
+    Err(r) -> {
+      let base = if r.stale { version(path, String::of_bytes_lossy(r.message)) }
+      else { invalid(path, String::of_bytes_lossy(r.message), []) };
+      Err(noted(base, r.note))
+    },
+    Ok(o) -> if o.frontend != frontend() {
+      Err(version(path, "the artifact was built by another compiler than this `ply` ships"))
+    } else if o.runtime != runtime_of(shipped.runtime()) {
+      Err(version(path, "the artifact was compiled for another runtime than this `ply` runs"))
+    } else {
+      match placed_named(o.sections, b"bodies") {
+        None -> Err(invalid(path, "the artifact carries no definitions", [])),
+        Some(at) -> match read_bodies(path, b, at) {
+          Err(d) -> Err(d),
+          Ok(bodies) -> match read_names(
+              path,
+              b,
+              placed_named(o.sections, b"names"),
+              placed_named(o.sections, b"strings"),
+            ) {
+            Err(d) -> Err(d),
+            Ok(names) -> match read_closure(path, b, placed_named(o.sections, b"closure")) {
+              Err(d) -> Err(d),
+              Ok(closure) -> match ((
+                  placed_named(o.sections, b"runnable"),
+                  placed_named(o.sections, b"unit"),
+                )) {
+                (None, _) -> Err(invalid(path, "the artifact carries no runnable", [])),
+                (_, None) -> Err(invalid(path, "the artifact carries no unit", [])),
+                (Some(r), Some(u)) -> match digest_of(domain(), b) {
+                  None -> Err(invalid(path, "the artifact is too short to carry a digest", [])),
+                  Some(computed) -> if computed != o.digest {
+                    Err(
+                      invalid(
+                        path,
+                        "the artifact's digest is " ++ sealed_short(o.digest)
+                          ++ " and its contents hash to "
+                          ++ sealed_short(computed),
+                        [
+                          b"the file was altered or truncated after it was built; transfer it again",
+                        ],
+                      ),
+                    )
+                  } else if !bodies.contains(o.entry) {
+                    Err(
+                      invalid(
+                        path,
+                        "the entry point `" ++ short(o.entry)
+                          ++ "` is not among the artifact's definitions",
+                        [],
+                      ),
+                    )
+                  } else {
+                    match names.filter(|n: Name| !bodies.contains(n.hash)) {
+                      [n, ..] ->
+                        Err(
+                          invalid(
+                            path,
+                            "the artifact names `" ++ n.name ++ "` and carries no body for it",
+                            [],
+                          ),
+                        ),
+                      [] -> match names.filter(|n: Name| n.hash == o.entry) {
+                        [] ->
+                          Err(
+                            invalid(
+                              path,
+                              "the artifact's namespace names no definition `" ++ short(o.entry)
+                                ++ "`",
+                              [],
+                            ),
+                          ),
+                        [e, ..] -> match payload(b, u).gunzip() {
+                          None -> Err(invalid(path, "the artifact's unit does not inflate", [])),
+                          Some(unit) ->
+                            Ok({
+                              entry: e.name,
+                              entry_hash: o.entry,
+                              digest: sealed_short(computed),
+                              definitions: bodies.keys().len(),
+                              names: names,
+                              closure: closure,
+                              runnable: payload(b, r),
+                              unit: unit,
+                            }),
+                        },
+                      },
+                    }
+                  },
+                },
+              },
+            },
+          },
+        },
+      }
+    },
+  }
+
+pub fn unreadable(path: String) -> Diag =
+  invalid(path, "could not read `" ++ path ++ "`", [b"name the `.plyx` file `ply build` wrote"])
+
+/// The artifact `--diff` measures against, as `opened` reads it.
+pub fn previous(
+  path: String,
+  bytes: Option<Bytes>,
+) -> Result<Previous, Refusal> / {shipped.definitions, shipped.runtime, abort.raise} =
+  match bytes {
+    None -> Err(refusal([unreadable(path)])),
+    Some(b) -> match opened(path, b) {
+      Err(d) -> Err(refusal([d])),
+      Ok(o) ->
+        Ok({
+          digest: o.digest,
+          names: o.names.map(|n: { name: String, hash: Bytes }|
+            { name: n.name, hash: n.hash.hex_of() }),
+        }),
+    },
+  }
+
+// --- Tests ------------------------------------------------------------------------
+
+fn held_as(name: Bytes, decl: Bool, hash: Bytes, refs: List<Int>) -> Closed =
+  { name: name, decl: decl, hash: hash, refs: refs }
+
+test "a name held as a function and as a declaration is filed under both hashes, by name and then by hash" {
+  let held = [
+    held_as(b"m.f", false, b"\x05", [1, 2]),
+    held_as(b"m.T", false, b"\x09", []),
+    held_as(b"m.T", true, b"\x02", []),
+  ];
+  assert_eq(pairs_of(held), [
+    { name: b"m.T", hash: b"\x02" },
+    { name: b"m.T", hash: b"\x09" },
+    { name: b"m.f", hash: b"\x05" },
+  ])
+}
+
+test "what a held definition reaches of its closure is read through what each references, a declaration apart from the function of its name" {
+  let held = [
+    held_as(b"m.main", false, b"\x01", [1]),
+    held_as(b"m.gz", true, b"\x02", []),
+    held_as(b"m.gz", false, b"\x03", [3]),
+    held_as(b"m.written", false, b"\x04", []),
+  ];
+  assert_eq(reaches_of(held), [
+    { name: "m.gz", reaches: ["m.gz"] },
+    { name: "m.gz", reaches: ["m.gz", "m.written"] },
+    { name: "m.main", reaches: ["m.gz", "m.main"] },
+    { name: "m.written", reaches: ["m.written"] },
+  ])
+}
+
+test "a function and an effect of one name each say whether their module exports them" {
+  let exports = { fns: Map::new().insert(b"m.gz", false), decls: Map::new().insert(b"m.gz", true) };
+  assert(exported(exports, held_as(b"m.gz", true, b"\x02", [])));
+  assert(!exported(exports, held_as(b"m.gz", false, b"\x03", [])));
+  assert(exported(exports, held_as(b"abort", true, b"\x07", [])))
+}
+
+test "the namespace writes each name's text once, where every record that names it points" {
+  let laid = named_sections([
+    { name: b"m.T", hash: Bytes::concat_all(range(0, 32).map(|_i: Int| b"\x01")) },
+    { name: b"m.T", hash: Bytes::concat_all(range(0, 32).map(|_i: Int| b"\x02")) },
+    { name: b"m.f", hash: Bytes::concat_all(range(0, 32).map(|_i: Int| b"\x03")) },
+  ]);
+  match laid {
+    [names, strings] -> {
+      assert_eq(strings.payload, b"m.Tm.f");
+      assert_eq(names.count, 3);
+      assert_eq(word_at(names.payload, 40), 0);
+      assert_eq(word_at(names.payload, 80), 3)
+    },
+    _ -> panic("two sections"),
+  }
+}
+
+test "a module is printed to the path its name spells" {
+  assert_eq(path_of(b"app.orders"), "app/orders.ply");
+  assert_eq(module_of(b"app.orders.total"), b"app.orders")
+}
