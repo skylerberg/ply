@@ -19,8 +19,10 @@ import emit.tir (Rep, Var, Arg, AVar, ABool, RInt, RBool, Inst, Decl, Assign, If
                  Containers)
 import emit.lower (lowered_fn)
 import emit.lower.base (context_of)
+import emit.lower.calling (known_body)
 import emit.lower.setting (Setting, Root, setting_in)
 import emit.print (printed_fn)
+import emit.own (owned)
 import emit.verify (verified)
 
 /// A program of one module `m`: its text, its analysis, and what the emitter would hand each of its
@@ -37,24 +39,31 @@ pub fn program_of(src: Bytes) -> Result<Program, Bytes> / {abort.raise} =
     },
   }
 
-/// Root `m.<name>` of `p` lowered to the form, or why it was not.
+/// Root `m.<name>` of `p` lowered to the form as a build lowers it, its body after `known_body`, or
+/// why it was not.
 pub fn formed(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.raise} =
   match p.roots.fold(None, |acc: Option<Root>, r: Root|
       if r.full == qualify(b"m", name) { Some(r) } else { acc }) {
     None -> Err({ by: Spine, why: b"no such definition" }),
     Some(r) -> match r.code {
       None -> Err({ by: Spine, why: b"a body that does not lower to Code" }),
-      Some(code) -> lowered_fn(context_of(p.setting, r, code), code),
+      Some(code) -> {
+        let body = known_body(r.full, r.params, code);
+        lowered_fn(context_of(p.setting, r, body), body)
+      },
     },
   }
 
-/// Root `m.<name>` of `p` lowered and checked, or why not: what a build prints.
+/// Root `m.<name>` of `p` lowered, its counts placed and checked, or why not: what a build prints.
 pub fn checked(p: Program, name: Bytes) -> Result<Fn, Bytes> / {abort.raise} =
   match formed(p, name) {
     Err(no) -> Err(no.why),
-    Ok(form) -> match verified(form) {
-      Some(why) -> Err(b"refused by the check: ".concat(why)),
-      None -> Ok(form),
+    Ok(form) -> {
+      let counted = owned(form);
+      match verified(counted) {
+        Some(why) -> Err(b"refused by the check: ".concat(why)),
+        None -> Ok(counted),
+      }
     },
   }
 
@@ -220,19 +229,23 @@ fn call_spelled(g: GenericCall) -> Bytes =
 
 /// `text` as a list of lines, read past what two printers may write differently for one
 /// computation:
+/// - a blank line is dropped;
 /// - `Word` is the `int64_t` it is defined as;
-/// - a temporary declared from another local or a literal (a field name's entry among them) and
-///   never assigned again is read as what it copies, unless what it copies is assigned after it;
-/// - a temporary declared from what calls nothing and never read again is dropped;
+/// - a temporary (or a part `t<n>_<k>` of one held as several C values) declared from another local
+///   or a literal (a field name's entry among them) and never assigned again is read as what it
+///   copies, unless what it copies is assigned after it;
+/// - a temporary or a part declared from what calls nothing and never read again is dropped;
 /// - lines after a restart's `goto` in its block are dropped;
-/// - the temporaries `t<n>`, the landings `land_<n>` and `ply_h<n>`, and any hole of a table no entry
-///   was spelled for are renumbered in the order they first appear, each kind apart.
+/// - the temporaries `t<n>` (a part with its temporary), the landings `land_<n>` and `ply_h<n>`, and
+///   any hole of a table no entry was spelled for are renumbered in the order they first appear,
+///   each kind apart.
 pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} = {
-  let lines = text.split(b"\n").map(|l: Bytes| renamed(l, Map::new().insert(b"Word", b"int64_t")));
+  let lines = text.split(b"\n").filter(|l: Bytes| trimmed(l) != b"").map(|l: Bytes|
+    renamed(l, Map::new().insert(b"Word", b"int64_t")));
   let writes = range(0, lines.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int|
     statements(trimmed(lines.get(i))).fold(m, |n: Map<Bytes, Int>, s: Bytes|
       match s.index_of(b" = ") {
-        Some(at) -> if temp_name(s.slice(0, at)) { n.insert(s.slice(0, at), i) } else { n },
+        Some(at) -> if temp_local(s.slice(0, at)) { n.insert(s.slice(0, at), i) } else { n },
         None -> n,
       }));
   let copies = range(0, lines.len()).fold(
@@ -268,34 +281,64 @@ pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} = {
   ).out;
   let mentions = live.fold(Map::new(), |m: Map<Bytes, Int>, l: Bytes|
     idents(l).fold(m, |n: Map<Bytes, Int>, w: Bytes|
-      if temp_name(w) { n.insert(w, match n.get(w) { Some(k) -> k + 1, None -> 1 }) } else { n }));
+      if temp_local(w) { n.insert(w, match n.get(w) { Some(k) -> k + 1, None -> 1 }) } else { n }));
   let used = live.filter(|l: Bytes|
     match unread_value(trimmed(l)) { Some(t) -> mentions.get(t) != Some(1), None -> true });
-  let numbering = used.fold(
-    { names: Map::new(), counts: Map::new() },
-    |m: { names: Map<Bytes, Bytes>, counts: Map<Bytes, Int> }, l: Bytes|
-      words(l).fold(
-        m,
-        |n: { names: Map<Bytes, Bytes>, counts: Map<Bytes, Int> }, w: { text: Bytes, ident: Bool }|
-          if n.names.contains(w.text) { n } else {
-            match numbered_kind(w) {
-              None -> n,
-              Some(k) -> {
-                let next = match n.counts.get(k.lead) { Some(c) -> c, None -> k.first };
-                {
-                  names: n.names.insert(
-                    w.text,
-                    Bytes::concat_all([k.lead, ascii_of_int(next), k.close]),
-                  ),
-                  counts: n.counts.insert(k.lead, next + 1),
-                }
-              },
+  let numbering = used.fold({ names: Map::new(), counts: Map::new() }, |m: Numbering, l: Bytes|
+    words(l).fold(m, |n: Numbering, w: { text: Bytes, ident: Bool }|
+      if n.names.contains(w.text) { n } else {
+        match temp_part(w.text) {
+          Some(part) -> {
+            let based = numbered(n, { text: part.base, ident: true });
+            {
+              ..based,
+              names: based.names.insert(
+                w.text,
+                Bytes::concat_all([
+                  match based.names.get(part.base) { Some(b) -> b, None -> part.base },
+                  b"_",
+                  part.k,
+                ]),
+              ),
             }
           },
-      ),
-  );
+          None -> numbered(n, w),
+        }
+      }));
   used.map(|l: Bytes| renamed(l, numbering.names))
 }
+
+/// What a renumbering has named so far, and the next number of each kind.
+type Numbering = { names: Map<Bytes, Bytes>, counts: Map<Bytes, Int> }
+
+/// `n` with word `w` named by the next number of its kind where it is numbered and not named yet.
+fn numbered(n: Numbering, w: { text: Bytes, ident: Bool }) -> Numbering / {abort.raise} =
+  if n.names.contains(w.text) { n } else {
+    match numbered_kind(w) {
+      None -> n,
+      Some(k) -> {
+        let next = match n.counts.get(k.lead) { Some(c) -> c, None -> k.first };
+        {
+          names: n.names.insert(w.text, Bytes::concat_all([k.lead, ascii_of_int(next), k.close])),
+          counts: n.counts.insert(k.lead, next + 1),
+        }
+      },
+    }
+  }
+
+/// A temporary or a part of one held as several C values (`t3_1`).
+fn temp_local(v: Bytes) -> Bool / {abort.raise} = temp_name(v) || temp_part(v) != None
+
+/// Part `k` of temporary `base`, where `v` names one (`t3_1`).
+fn temp_part(v: Bytes) -> Option<{ base: Bytes, k: Bytes }> / {abort.raise} =
+  match v.index_of(b"_") {
+    None -> None,
+    Some(u) -> {
+      let base = v.slice(0, u);
+      let k = v.slice(u + 1, v.len());
+      if temp_name(base) && all_digits(k) { Some({ base: base, k: k }) } else { None }
+    },
+  }
 
 /// How a word renumbered by first appearance is spelled around its number, and the number its kind
 /// starts at: a temporary from `t1`, the landings `land_0` and `ply_h0`, and a hole of a table no
@@ -320,7 +363,7 @@ fn numbered_kind(
 /// line where nothing reads `tN` changes nothing.
 fn unread_value(t: Bytes) -> Option<Bytes> / {abort.raise} =
   match declared(t) {
-    Some(d) -> if temp_name(d.name) && d.value.index_of(b"ctx") == None { Some(d.name) }
+    Some(d) -> if temp_local(d.name) && d.value.index_of(b"ctx") == None { Some(d.name) }
     else { None },
     None -> None,
   }
@@ -404,7 +447,7 @@ fn declared(t: Bytes) -> Option<{ name: Bytes, value: Bytes }> / {abort.raise} =
 /// `T tN = X;` where `X` is a local or a literal: the copy's name and what it copies.
 fn copy_of(t: Bytes) -> Option<{ name: Bytes, value: Bytes }> / {abort.raise} =
   match declared(t) {
-    Some(d) -> if temp_name(d.name) && atom(d.value) { Some(d) } else { None },
+    Some(d) -> if temp_local(d.name) && atom(d.value) { Some(d) } else { None },
     None -> None,
   }
 
@@ -421,6 +464,8 @@ fn c_type(t: Bytes) -> Bool =
     b"uint64_t",
     b"Word",
     b"PlyDec",
+    b"PlyMaybe",
+    b"PlyTagged",
   ].contains(
     t,
   )
@@ -428,7 +473,7 @@ fn c_type(t: Bytes) -> Bool =
 /// A local or a literal: a name of one identifier, or a constant spelled as the printers spell
 /// one, with nothing computed; a field name's hole is a constant the unit writes in.
 fn atom(v: Bytes) -> Bool / {abort.raise} =
-  local_name(v) || v == b"INT64_MIN"
+  local_ident(v) || v == b"INT64_MIN"
     || (v.starts_with(b"INT64_C(") && v.ends_with(b")") && v.index_of(b" ") == None)
     || (v.starts_with(b"ply_f64(INT64_C(") && v.ends_with(b"))") && v.index_of(b" ") == None)
     || (v.starts_with(b"((") && v.index_of(b")INT64_C(") != None && v.ends_with(b"))")
@@ -437,11 +482,7 @@ fn atom(v: Bytes) -> Bool / {abort.raise} =
     || v == b"1"
     || (v.starts_with(b"@@f") && v.ends_with(b"@@") && v.split(b"@@").len() == 3)
 
-fn local_name(v: Bytes) -> Bool / {abort.raise} = temp_name(v) || param_name(v)
-
 fn temp_name(v: Bytes) -> Bool / {abort.raise} = digits_after(v, 116)
-
-fn param_name(v: Bytes) -> Bool / {abort.raise} = digits_after(v, 112)
 
 /// Whether `v` is the byte `lead` and then one or more digits.
 fn digits_after(v: Bytes, lead: Int) -> Bool / {abort.raise} =
@@ -596,6 +637,14 @@ test "two printers' copies, dead stores after a restart, numbering and counts ar
     b"  t2 = 0;",
     b"  return t1;",
   ]);
+  // An `Option`'s word is a C value like any other, and a part of a value held as several is a
+  // local numbered with its temporary.
+  assert_eq(
+    normalised(
+      b"  PlyMaybe t3 = p0;\n  double t4_0 = ply_f64(p1);\n  double t4_1 = ply_f64(p2);\n  f(ctx, t4_1, t3);",
+    ),
+    [b"  double t1_1 = ply_f64(p2);", b"  f(ctx, t1_1, p0);"],
+  );
   // A word is the `int64_t` it is defined as; a field name's entry is a constant; landings are
   // numbered as temporaries are.
   assert_eq(

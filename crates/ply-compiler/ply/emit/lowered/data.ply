@@ -7,8 +7,8 @@ import std.bytes (ascii_of_int)
 import resolve (qualify)
 import emit (Head, Body, RootAnswer, Defined, symbol_of)
 import emit.pieces (spelled)
-import emit.compare (Program, program_of, formed, checked, answered_today, today_text, normalised,
-                     past_counts)
+import emit.compare (Program, program_of, formed, checked, answered_today, today_text, printed_text,
+                     normalised, past_counts)
 import emit.print (printed_fn)
 import emit.tir (Rep, RFloat, RWord, RMaybe, RFlat, RCases, Var, AVar, AInt, AZero, Val, Make,
                  MRecord, MCtor, Get, Pack, Gathered, PLeaf, PField, Inst, Let, Decl, Assign, If,
@@ -383,7 +383,7 @@ test "a record whose layout a type variable leaves open is made by value" {
   ])
 }
 
-test "a field read by name and an Option's constructor whose type nothing filed are declined by data" {
+test "a field read by name is declined by data, and an Option's constructor is typed where it is written" {
   let src = Bytes::concat_all([
     b"fn inner_of<a>(r: { inner: a }) -> a = r.inner\n",
     b"fn some(s: String) -> Option<String> = Some(s)\n",
@@ -394,7 +394,7 @@ test "a field read by name and an Option's constructor whose type nothing filed 
       assert_eq(
         [b"inner_of", b"some"].map(|n: Bytes|
           match formed(p, n) { Err(no) -> no.by == Data, Ok(_) -> false }),
-        [true, true],
+        [true, false],
       ),
   }
 }
@@ -409,9 +409,11 @@ test "every root of the corpus lowers or is declined by another family, and one 
   let declined = lowered_roots().fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
     match formed(p, n) { Ok(_) -> acc, Err(no) -> acc.push({ name: n, why: no.why }) });
   assert_eq(declined, []);
+  // The roots another family's construct stands in front of lower now that the family is merged,
+  // or that family declines them.
   assert_eq(
     others_roots().map(|r: { name: Bytes, by: Family }|
-      match formed(p, r.name) { Err(no) -> no.by == r.by, Ok(_) -> false }),
+      match formed(p, r.name) { Err(no) -> no.by == r.by, Ok(_) -> true }),
     others_roots().map(|_: { name: Bytes, by: Family }| true),
   );
   let refused = lowered_roots().fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
@@ -422,6 +424,13 @@ test "every root of the corpus lowers or is declined by another family, and one 
     });
   assert_eq(refused, [])
 }
+
+/// The C today's emitter wrote for root `m.<name>`, its holes as the unit's placeholders, which the
+/// print helpers' own holes are held to.
+fn today_raw(answers: List<RootAnswer>, name: Bytes) -> Bytes =
+  answers.fold(b"", |acc: Bytes, a: RootAnswer|
+    if a.name != qualify(b"m", name) { acc }
+    else { match a.answer { Body(b) -> b.text, _ -> acc } })
 
 /// The head today's emitter declared root `m.<name>` with.
 fn today_head(answers: List<RootAnswer>, name: Bytes) -> List<Head> =
@@ -435,7 +444,7 @@ test "a record, an Option and a Result of a record cross a root's head and entry
   let today = answered_today(p, roots);
   let checked_roots = roots.map(|n: Bytes| {
     let f = form_of(p, n);
-    let text = today_text(today, n);
+    let text = today_raw(today, n);
     let sym = symbol_of(qualify(b"m", n));
     let opened = range(0, f.conv.reps.len()).map(|i: Int| entry_opened(i, f.conv.reps.get(i)));
     let call = Bytes::concat_all([
@@ -474,59 +483,64 @@ test "a record, an Option and a Result of a record cross a root's head and entry
 
 /// Root `m.<name>`'s C as the form prints it, its counts aside, read past copies and numbering.
 fn form_text(p: Program, name: Bytes) -> List<Bytes> / {abort.raise} =
-  match formed(p, name) {
-    Ok(f) -> past_counts(normalised(spelled(printed_fn(f).pieces))),
-    Err(no) -> [no.why],
-  }
+  match formed(p, name) { Ok(f) -> normalised(past_counts(printed_text(f))), Err(no) -> [no.why] }
 
 /// Why root `m.<name>` of `p` prints otherwise than today's emitter writes it, each read off the two:
-/// today's refused, handed no constructor table; a flat record or a sum's cases crossing the root,
-/// which the print driver declares and enters as one C value; today's moves and reuse tokens
-/// (`x = 0;`, `Word tok<n>`), which `own` writes in the form.
+/// a flat record or a sum's cases crossing the root, which the print driver declares and enters as
+/// one C value; today's reuse tokens (`if (tok<n>) { .. }`), which `own` writes in the form.
 fn parted_by(p: Program, today: List<RootAnswer>, name: Bytes) -> List<Bytes> / {abort.raise} = {
-  let t = today_text(today, name);
   let f = form_of(p, name);
-  let lines = normalised(t).map(trimmed);
   [
-    { why: b"today's refused: no constructor table", holds: t == b"refused by today's emitter" },
     {
       why: b"a value of several C values crosses",
       holds: f.conv.reps.push(f.conv.answer).any(|r: Rep| c_types(r).len() > 1),
     },
-    {
-      why: b"today's moves and reuse tokens",
-      holds: lines.any(|l: Bytes| l.starts_with(b"Word tok") || moved(l)),
-    },
+    { why: b"today's reuse tokens", holds: today_raw(today, name).index_of(b"if (tok") != None },
   ].filter(|r: { why: Bytes, holds: Bool }| r.holds).map(|r: { why: Bytes, holds: Bool }| r.why)
-}
-
-/// Whether `l` is a move today's emitter writes: a local set to zero once its value is handed on.
-fn moved(l: Bytes) -> Bool / {abort.raise} =
-  l.ends_with(b" = 0;") && l.index_of(b" ") == Some(l.len() - 5) && l.index_of(b"(") == None
-
-fn trimmed(l: Bytes) -> Bytes / {abort.raise} = {
-  let from = range(0, l.len()).fold(l.len(), |at: Int, i: Int|
-    if at < l.len() || l.at(i) == 32 { at } else { i });
-  l.slice(from, l.len())
 }
 
 test "the corpus prints as today's emitter writes it, but where a reason it may not is named" {
   let p = program();
   let today = answered_today(p, lowered_roots());
-  let unexplained = lowered_roots().filter(|n: Bytes|
-    form_text(p, n) != past_counts(normalised(today_text(today, n)))
-      && parted_by(p, today, n) == []);
-  assert_eq(unexplained, []);
+  let unexplained = lowered_roots().fold(
+    [],
+    |acc: List<{ name: Bytes, form: List<Bytes>, today: List<Bytes> }>, n: Bytes| {
+      let form = form_text(p, n);
+      let old = normalised(past_counts(today_text(today, n)));
+      if form == old || parted_by(p, today, n) != [] { acc } else {
+        acc.push({
+          name: n,
+          form: form.filter(|l: Bytes| !old.contains(l)),
+          today: old.filter(|l: Bytes| !form.contains(l)),
+        })
+      }
+    },
+  );
+  assert(
+    unexplained == [],
+    Some(
+      String::of_bytes_lossy(
+        Bytes::join(
+          unexplained.map(|u: { name: Bytes, form: List<Bytes>, today: List<Bytes> }|
+            Bytes::concat_all([
+              b"== ",
+              u.name,
+              b"\n-- form\n",
+              Bytes::join(u.form, b"\n"),
+              b"\n-- today\n",
+              Bytes::join(u.today, b"\n"),
+            ])),
+          b"\n",
+        ),
+      ),
+    ),
+  );
   // Each reason stands for roots of its own: none is read into every root.
   let reasons = lowered_roots().map(|n: Bytes| parted_by(p, today, n));
   assert_eq(
-    [
-      b"today's refused: no constructor table",
-      b"a value of several C values crosses",
-      b"today's moves and reuse tokens",
-    ].map(|why: Bytes|
+    [b"a value of several C values crosses", b"today's reuse tokens"].map(|why: Bytes|
       reasons.any(|rs: List<Bytes>| rs.contains(why))
         && !reasons.all(|rs: List<Bytes>| rs.contains(why))),
-    [true, true, true],
+    [true, true],
   )
 }

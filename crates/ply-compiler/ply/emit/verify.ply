@@ -7,9 +7,10 @@
 import emit.tir (Rep, RWord, RInt, RBool, RFlat, RCases, RToken, Leaf, Var, Arg, AVar, AInt, ABool,
                  Val, Call, Apply, Make, Pack, Gathered, Native, Op, Get, Static, Prim, PLeaf,
                  PField, MRecord, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next,
-                 Done, Return, Restart, Enter, Fail, Handle, Inc, Dec, Reset, Free, Opened, Block,
-                 Fn, Rooted, Lambda, Closure, Handed, Given, Lent, Answered, Owns, ReadsOf, Lasts,
-                 no_links, counted, operands, answered, fails, used_as, rep_of_arg, var_of)
+                 Done, Return, Restart, Enter, Fail, NoArm, Handle, Inc, Dec, Reset, Free, Opened,
+                 Block, Fn, Rooted, Lambda, Closure, Handed, Given, Lent, Convention, Answered,
+                 Owns, ReadsOf, Lasts, no_links, counted, operands, answered, fails, used_as,
+                 rep_of_arg, var_of, parts_of)
 import emit.keys (Named, Root)
 import types (TyCon)
 import parsing (dummy_span)
@@ -34,37 +35,56 @@ type Walk = { h: Holding, fault: Option<Bytes>, live: Bool, missed: Option<Holdi
 
 /// What encloses a block: the loop its `Next` and `Done` belong to; what a `handle` around it
 /// holds across its body, which a failure inside it leaves to the handle's landing; whether a
-/// `Miss` leaves it for a match's next arm; and whether it is inside a `handle`'s body, which only
-/// its end and a failure leave.
-type Within = { looped: Option<Looped>, landing: Map<Int, Int>, arm: Bool, handled: Bool }
+/// `Miss` leaves it for a match's next arm; whether it is inside a `handle`'s body, which only
+/// its end and a failure leave; how a `Return` answers; and the member of a tail group whose arm it
+/// is in, which a `Restart` enters again.
+type Within = {
+  looped: Option<Looped>,
+  landing: Map<Int, Int>,
+  arm: Bool,
+  handled: Bool,
+  answer: Rep,
+  member: Option<Int>,
+}
 
 /// A loop's state and answer, and the counts it holds across its passes, which each `Next` and
 /// `Done` must leave held and nothing else.
 type Looped = { held: Map<Int, Int>, state: List<Var>, answer: Var }
 
 /// Why `f`, or a closure it makes, breaks a rule of the form, or nothing where both keep them all.
+/// A tail group's arm `i` starts holding member `i`'s parameters and answers as that member does.
 pub fn verified(f: Fn) -> Option<Bytes> = {
-  let start = range(0, f.params.len()).fold(
-    {
-      owned: Map::new(),
-      borrowed: Map::new(),
-      joins: Map::new(),
-      opened: Map::new(),
-      alias: Map::new(),
-    },
-    |h: Holding, i: Int|
-      match f.params.at(i) {
-        None -> h,
-        Some(p) -> if !counted(p.rep) { h } else if f.conv.params.at(i) == Some(Lent) {
-          { ..h, borrowed: h.borrowed.insert(p.id, 0 - 1) }
-        } else { { ..h, owned: h.owned.insert(p.id, 1) } },
-      },
-  );
-  let top = { looped: None, landing: Map::new(), arm: false, handled: false };
-  let w = walked(f, top, { h: start, fault: None, live: true, missed: None, done: false }, f.body);
-  let own = match w.fault {
-    Some(why) -> Some(why),
-    None -> if w.live { Some(b"a body that falls off its end without answering") } else { None },
+  let top = {
+    looped: None,
+    landing: Map::new(),
+    arm: false,
+    handled: false,
+    answer: f.conv.answer,
+    member: None,
+  };
+  let own = if f.members.len() == 0 { body_fault(f, top, holding_params(f.params, f.conv), f.body) }
+  else {
+    match f.body {
+      [Case(c)] ->
+        c.arms.fold(
+          body_fault(f, top, holding_params([], f.conv), c.rest),
+          |why: Option<Bytes>, a: { when: Int, body: Block }|
+            match why {
+              Some(_) -> why,
+              None -> match f.members.at(a.when) {
+                None -> Some(b"an arm of no member of the group"),
+                Some(m) ->
+                  body_fault(
+                    f,
+                    { ..top, answer: m.conv.answer, member: Some(a.when) },
+                    holding_params(m.params, m.conv),
+                    a.body,
+                  ),
+              },
+            },
+        ),
+      _ -> Some(b"a tail group whose body is no case on its member's place"),
+    }
   };
   f.lambdas.fold({ n: 0, why: own }, |s: { n: Int, why: Option<Bytes> }, l: Lambda|
     {
@@ -80,6 +100,52 @@ pub fn verified(f: Fn) -> Option<Bytes> = {
       },
     }).why
 }
+
+/// What a body holds at its start: a count of each counted parameter `conv` gives it, and each one it
+/// lends borrowed.
+fn holding_params(params: List<Var>, conv: Convention) -> Holding =
+  range(0, params.len()).fold(
+    {
+      owned: Map::new(),
+      borrowed: Map::new(),
+      joins: Map::new(),
+      opened: Map::new(),
+      alias: Map::new(),
+    },
+    |h: Holding, i: Int|
+      match params.at(i) {
+        None -> h,
+        Some(p) -> if !counted(p.rep) { h } else if conv.params.at(i) == Some(Lent) {
+          { ..h, borrowed: h.borrowed.insert(p.id, 0 - 1) }
+        } else { { ..h, owned: h.owned.insert(p.id, 1) } },
+      },
+  )
+
+/// Why body `b`, walked under `cx` from `start`, breaks a rule, or falls off its end.
+fn body_fault(f: Fn, cx: Within, start: Holding, b: Block) -> Option<Bytes> = {
+  let w = walked(f, cx, { h: start, fault: None, live: true, missed: None, done: false }, b);
+  match w.fault {
+    Some(why) -> Some(why),
+    None -> if w.live { Some(b"a body that falls off its end without answering") } else { None },
+  }
+}
+
+/// Whether `args` are held as member `member` of `f`'s group takes them; a root of its own's restart
+/// is not checked here.
+fn entered_as(f: Fn, member: Option<Int>, args: List<Arg>) -> Bool =
+  match member {
+    None -> true,
+    Some(i) -> match f.members.at(i) { Some(m) -> held_as_reps(args, m.conv.reps), None -> false },
+  }
+
+/// Whether `args` are held as `reps` say, one for one.
+fn held_as_reps(args: List<Arg>, reps: List<Rep>) -> Bool =
+  args.len() == reps.len()
+    && range(0, args.len()).all(|i: Int|
+      match args.at(i) {
+        Some(a) -> match reps.at(i) { Some(r) -> same_rep(a, r), None -> false },
+        None -> false,
+      })
 
 /// The one recursion: each instruction in turn, a branch's blocks walked from the state before it
 /// and joined after it.
@@ -227,15 +293,19 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             }
           },
         },
-        Return(a) -> if cx.handled { left(acc) } else if !same_rep(a, f.conv.answer) {
+        Return(a) -> if cx.handled { left(acc) } else if !same_rep(a, cx.answer) {
           { ..acc, fault: Some(b"an answer held otherwise than the root answers") }
         } else {
           ended(passed(acc, a), Map::new(), b"a count left held where the body answers: v")
         },
-        Restart(args) -> if cx.handled { left(acc) } else {
+        Restart(args) -> if cx.handled { left(acc) } else if !entered_as(f, cx.member, args) {
+          { ..acc, fault: Some(b"a group's member restarted with arguments held otherwise") }
+        } else {
           ended(args.fold(acc, passed), Map::new(), b"a count left held where the body restarts: v")
         },
-        Enter(e) -> if cx.handled { left(acc) } else {
+        Enter(e) -> if cx.handled { left(acc) } else if !entered_as(f, Some(e.member), e.args) {
+          { ..acc, fault: Some(b"a group's member entered with arguments held otherwise") }
+        } else {
           ended(
             e.args.fold(acc, passed),
             Map::new(),
@@ -271,7 +341,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             } else if x.site.detached != None { after } else {
               let body = walked(
                 f,
-                { looped: None, landing: across.owned, arm: false, handled: true },
+                { ..cx, looped: None, landing: across.owned, arm: false, handled: true },
                 {
                   ..h,
                   h: { ..across, joins: across.joins.insert(x.answer.id, false) },
@@ -429,17 +499,6 @@ fn word_read(w: Walk, y: Var, val: Val) -> Option<Walk> =
 /// Whether a value held as `r` is held only by this body: a flat value or a sum's parts, each a
 /// local of its own.
 fn held_here(r: Rep) -> Bool = match r { RFlat(_) -> true, RCases(_) -> true, _ -> false }
-
-/// The C values a value held as `r` is laid in, each as it is held: a flat value's leaves and then
-/// its word, a sum's index and then each case's leaves, anything else itself.
-pub fn parts_of(r: Rep) -> List<Rep> =
-  match r {
-    RFlat(leaves) -> leaves.map(|l: Leaf| l.rep).push(RWord),
-    RCases(c) ->
-      c.cases.fold([RInt], |acc: List<Rep>, x: { name: Bytes, leaves: List<Leaf> }|
-        acc.concat(x.leaves.map(|l: Leaf| l.rep))),
-    _ -> [r],
-  }
 
 /// What a use of `v` uses: an opened value's counted words, a word's alias that word, any other
 /// variable itself.
@@ -761,7 +820,7 @@ test "a match's next arm starts from what the arm before held where it missed" {
           [If({ cond: ABool(true), then: [Dec(q), Return(AVar(p))], otherwise: miss.push(Miss) })],
           [Return(AVar(q))],
         ],
-        rest: [Dec(q), Fail(b"no arm")],
+        rest: [Dec(q), Fail({ why: NoArm, at: dummy_span() })],
       }),
     ]);
   assert_eq(verified(arms([Dec(p)])), None);
@@ -863,11 +922,27 @@ test "a handle's body leaves to its landing what the handle holds across it" {
     Some(b"a handle whose landing releases other than what it holds across its body"),
   );
   assert_eq(
-    verified(handled([If({ cond: AVar(c), then: [Fail(b"no arm")], otherwise: [] })], [])),
+    verified(
+      handled(
+        [If({ cond: AVar(c), then: [Fail({ why: NoArm, at: dummy_span() })], otherwise: [] })],
+        [],
+      ),
+    ),
     None,
   );
   assert_eq(
-    verified(handled([If({ cond: AVar(c), then: [Dec(p), Fail(b"no arm")], otherwise: [] })], [])),
+    verified(
+      handled(
+        [
+          If({
+            cond: AVar(c),
+            then: [Dec(p), Fail({ why: NoArm, at: dummy_span() })],
+            otherwise: [],
+          }),
+        ],
+        [],
+      ),
+    ),
     Some(b"a count held otherwise than the handle around holds where the body fails: v0"),
   );
   assert_eq(

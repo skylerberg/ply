@@ -13,15 +13,17 @@ import emit.keys (Named, root_name)
 import emit.pieces (Piece, Text, merged, spelled)
 import emit.tir (Rep, RInt, RBool, RWord, Var, Arg, AVar, AInt, AZero, Val, Prim, Literal, Static,
                  Make, TInt, Get, Pack, Gathered, Call, Apply, Native, Op, OHandle, OContainer,
-                 OCalling, MClosure, MList, MArray, Inst, Let, Do, Decl, Assign, If, Case, Match,
-                 Miss, Loop, Next, Done, Return, Restart, Enter, Fail, Handle, Inc, Dec, Reset,
-                 Free, Opened, Block, Fn, Member, Rooted, Given, Lambda, Closure, Uses, NoArm,
-                 no_links, rep_of_arg, falls_through)
+                 OCalling, MClosure, MList, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss,
+                 Loop, Next, Done, Return, Restart, Enter, Fail, Handle, Inc, Dec, Reset, Free,
+                 Opened, Block, Fn, Member, Rooted, Given, Lambda, Closure, Uses, NoArm, no_links,
+                 rep_of_arg, falls_through)
 import emit.print.text (Under, Place, Printing, Printed, printing, line, text, named, name_of,
                         arg_text, assigned, label, check, zero, failing_return, site)
 import emit.print.counts (released, count_printed)
-import emit.print.made (c_type, c_types, as_word, word_as, made, got, packed, gathered, statics)
-import emit.print.fuel (fuel_head, tick_line)
+import emit.print.made (c_type, c_types, as_word, word_as, made, got, packed, gathered, statics,
+                        declared, set_parts, returned, head_types, head_params, entry_opened,
+                        entry_outs, entry_answered, grown_word)
+import emit.print.fuel (fuel_head, fuel_pieces, tick_line)
 import emit.print.prims (literal, prim)
 import emit.print.containers (contained, container_op)
 import emit.print.tested (case_opened, case_arm, case_arm_closed, case_rest, case_closed,
@@ -64,13 +66,20 @@ pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
 }
 
 /// A root of its own as its C function, named `name`, and its entry: the printing after it and its
-/// pieces.
+/// pieces. A growth of the stack hands each parameter on as its word, made first where it is held
+/// as several values.
 fn root_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
   let body = body_printed(name, f, printing(param_names(f)));
-  let words = range(0, f.params.len()).map(|i: Int|
-    as_word(b"p".concat(ascii_of_int(i)), f.params.get(i).rep));
+  let grown = range(0, f.conv.reps.len()).fold(
+    { pr: body, prep: [], words: [] },
+    |g: { pr: Printing, prep: List<Piece>, words: List<Bytes> }, i: Int| {
+      let w = grown_word(g.pr, i, f.conv.reps.get(i), failing_return(f.conv.answer));
+      { pr: w.pr, prep: g.prep.concat(w.prep), words: g.words.push(w.word) }
+    },
+  );
+  let entered = entry(name, f, grown.pr);
   {
-    pr: body,
+    pr: entered.pr,
     out: [
       Text(
         Bytes::concat_all([
@@ -79,13 +88,16 @@ fn root_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abo
           b"_entry(PlyCtx *ctx, const Word *args);\n",
           head(name, f),
           b" {\n",
-          fuel_head(name.concat(b"_entry"), words, f.conv.answer),
         ]),
       ),
     ].concat(
+      fuel_pieces(name.concat(b"_entry"), grown.prep, grown.words, f.conv.answer),
+    ).concat(
       body.out,
     ).push(
-      Text(Bytes::concat_all([b"}\n", entry(name, f)])),
+      Text(b"}\n"),
+    ).concat(
+      entered.out,
     ),
   }
 }
@@ -262,20 +274,8 @@ fn printed(u: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort.ra
         ),
       Do(d) ->
         value_printed({ ..p, at: d.at, leave: leave_of(u, acc, d.unwind) }, acc, None, d.val),
-      Decl(v) -> {
-        let n = named(acc, v);
-        line(
-          n.pr,
-          depth,
-          Bytes::concat_all([c_type(v.rep), b" ", n.name, b" = ", zero(v.rep), b";"]),
-        )
-      },
-      Assign(s) ->
-        line(
-          acc,
-          depth,
-          Bytes::concat_all([name_of(acc, s.var), b" = ", arg_text(acc, s.arg), b";"]),
-        ),
+      Decl(v) -> declared(acc, depth, v),
+      Assign(s) -> set_parts(acc, depth, s.var, s.arg),
       If(x) -> {
         let opened = line(acc, depth, Bytes::concat_all([b"if (", arg_text(acc, x.cond), b") {"]));
         let t = printed(u, opened, x.then, depth + 1);
@@ -338,18 +338,21 @@ fn printed(u: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort.ra
         None -> line(acc, depth, b"/* a loop's answer outside a loop */"),
       },
       // A member of a tail group answers at its own convention, through the group's word.
-      Return(a) ->
-        text(
-          acc,
-          Bytes::concat_all([
-            b"  ctx->fuel += 1;\n  return ",
-            match u.group {
-              Some(_) -> as_word(arg_text(acc, a), rep_of_arg(a)),
-              None -> arg_text(acc, a),
-            },
-            b";\n",
-          ]),
-        ),
+      Return(a) -> match u.group {
+        Some(_) ->
+          text(
+            acc,
+            Bytes::concat_all([
+              b"  ctx->fuel += 1;\n  return ",
+              as_word(arg_text(acc, a), rep_of_arg(a)),
+              b";\n",
+            ]),
+          ),
+        None -> {
+          let r = returned(acc, depth, a);
+          text(r.pr, Bytes::concat_all([b"  ctx->fuel += 1;\n  return ", r.value, b";\n"]))
+        },
+      },
       Restart(args) -> match u.group {
         Some(g) -> entered_member(p, acc, g.at, args),
         None -> restarted(p, acc, args),
@@ -390,7 +393,6 @@ fn value_printed(p: Place, pr: Printing, into: Option<Var>, val: Val) -> Printin
     Make(m) -> match m.made {
       MClosure(_) -> closure_made(p, pr, into, m),
       MList(_) -> contained(p, pr, into, m),
-      MArray(_) -> contained(p, pr, into, m),
       _ -> made(p, pr, into, m),
     },
     Get(g) -> got(p, pr, into, g),
@@ -428,82 +430,51 @@ fn native(
   if n.uses.fails { check(p, written) } else { written }
 }
 
-/// The C a root's function is declared with: its answer's and each parameter's C types.
+/// The C a root's function is declared with: what it returns, each parameter's values, and the
+/// pointers it writes its answer's other values through.
 fn head(name: Bytes, f: Fn) -> Bytes / {abort.raise} =
   Bytes::concat_all([
-    c_type(f.conv.answer),
+    head_types(f.conv.reps, f.conv.answer).answer,
     b" ",
     name,
     b"(PlyCtx *ctx",
-    Bytes::concat_all(
-      range(0, f.conv.reps.len()).map(|i: Int| {
-        let ts = c_types(f.conv.reps.get(i));
-        Bytes::concat_all(
-          range(0, ts.len()).map(|k: Int|
-            Bytes::concat_all([
-              b", ",
-              ts.get(k),
-              b" p",
-              ascii_of_int(i),
-              if ts.len() == 1 { b"" } else { b"_".concat(ascii_of_int(k)) },
-            ])),
-        )
-      }),
-    ),
+    Bytes::concat_all(head_params(f.conv.reps, f.conv.answer).map(|p: Bytes| b", ".concat(p))),
     b")",
   ])
 
-/// The entry the runtime and closures call a root by, words in and out.
-fn entry(name: Bytes, f: Fn) -> Bytes / {abort.raise} = {
-  let conv = f.conv;
-  let opened = range(0, conv.reps.len()).map(|i: Int| {
-    let arg = Bytes::concat_all([b"args[", ascii_of_int(i), b"]"]);
-    let r = conv.reps.get(i);
-    match r {
-      RWord -> { text: b"", arg: arg },
-      _ ->
-        {
-          text: Bytes::concat_all([
-            b"  ",
-            c_type(r),
-            b" a",
-            ascii_of_int(i),
-            b" = ",
-            word_as(arg, r),
-            b"; ply_dec(ctx, ",
-            arg,
-            b");\n",
-          ]),
-          arg: b"a".concat(ascii_of_int(i)),
-        },
-    }
-  });
+/// The entry the runtime and closures call a root by, words in and out: each word opened as its
+/// parameter is held, and the answer handed back as a word.
+fn entry(name: Bytes, f: Fn, pr: Printing) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
+  let opened = range(0, f.conv.reps.len()).map(|i: Int| entry_opened(i, f.conv.reps.get(i)));
   let call = Bytes::concat_all([
     name,
     b"(ctx",
-    Bytes::concat_all(opened.map(|o: { text: Bytes, arg: Bytes }| b", ".concat(o.arg))),
+    Bytes::concat_all(
+      opened.fold([], |acc: List<Bytes>, o: { text: Bytes, args: List<Bytes> }|
+        acc.concat(o.args)).concat(
+        entry_outs(f.conv.answer),
+      ).map(|a: Bytes| b", ".concat(a)),
+    ),
     b")",
   ]);
-  Bytes::concat_all([
-    b"Word ",
-    name,
-    b"_entry(PlyCtx *ctx, const Word *args) {\n",
-    Bytes::concat_all(opened.map(|o: { text: Bytes, arg: Bytes }| o.text)),
-    match conv.answer {
-      RWord -> Bytes::concat_all([b"  return ", call, b";\n"]),
-      r ->
+  let answered = entry_answered(pr, f.conv.answer, call);
+  {
+    pr: answered.pr,
+    out: [
+      Text(
         Bytes::concat_all([
-          b"  ",
-          c_type(r),
-          b" r = ",
-          call,
-          b";\n  if (ctx->failed) return 0;\n  return ",
-          as_word(b"r", r),
-          b";\n",
+          b"Word ",
+          name,
+          b"_entry(PlyCtx *ctx, const Word *args) {\n",
+          Bytes::concat_all(opened.map(|o: { text: Bytes, args: List<Bytes> }| o.text)),
         ]),
-    },
-    b"}\n",
-  ])
+      ),
+    ].concat(
+      answered.out,
+    ).push(
+      Text(b"}\n"),
+    ),
+  }
 }
 
 /// Whether `run` stands in `lines` as consecutive lines.
@@ -708,13 +679,14 @@ test "a tail group is one function switching on its member's place, each arm ope
       != None,
   );
   // A member answers at its own convention, made the group's word.
-  assert(
-    text.index_of(
-        Bytes::concat_all([b"  case 1: {\n    int64_t t2 = ", word_as(b"p0", RInt), b";\n"]),
-      )
-      != None,
-  );
-  assert(text.index_of(Bytes::concat_all([b"  return ", as_word(b"t2", RInt), b";\n"])) != None);
+  let opening = b"  case 1: {\n    int64_t ";
+  let arm = match text.index_of(opening) {
+    Some(i) -> text.slice(i + opening.len(), text.len()),
+    None -> b"",
+  };
+  let param = match arm.index_of(b" = ") { Some(e) -> arm.slice(0, e), None -> b"" };
+  assert(arm.starts_with(Bytes::concat_all([param, b" = ", word_as(b"p0", RInt), b";\n"])));
+  assert(arm.index_of(Bytes::concat_all([b"  return ", as_word(param, RInt), b";\n"])) != None);
   assert(text.index_of(Bytes::concat_all([g, b"(ctx, (int)args[0], args[1]);\n}\n"])) != None)
 }
 
@@ -744,7 +716,11 @@ test "a closure's function follows its root's entry, and its body numbers its te
   let printed = printed_fn(f);
   assert(
     spelled(printed.pieces).ends_with(
-      Bytes::concat_all([b"}\n", entry(name, f), spelled(lambda_text(f, 0, l, inner.out))]),
+      Bytes::concat_all([
+        b"}\n",
+        spelled(entry(name, f, printing(Map::new())).out),
+        spelled(lambda_text(f, 0, l, inner.out)),
+      ]),
     ),
   );
   // The code table holds the entries closures name, never their bodies.
