@@ -1,42 +1,128 @@
 //! Records and constructors made and read, values held otherwise, flat values gathered, static
-//! constants, and the C types a value of each representation is held in.
+//! constants, and the C a value of each representation is held in: its C types, the names of its C
+//! values, and how it crosses a root's head, its entry, a growth of the stack and a return. A value
+//! held as several C values is named by its first name: a flat record's leaves `<name>_<k>` and its
+//! word `<name>_w`, a sum's constructor's index `<name>` and its leaves `<name>_<k>`, as today's
+//! emitter names a record's or a sum's parameters.
 
 import std.bytes (ascii_of_int)
-import emit (KNum, ctype)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RToken, Var, Arg, Made,
-                 Path, rep_of_arg)
-import emit.print.text (Printing, Place, line, arg_text, assigned, kind)
+import parsing (span_between)
+import types (TyCon)
+import emit (Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, Zeroed, FieldTy, TyRec, TyOpen,
+             ctype, spelled_field)
+import emit.pieces (Piece, Text, Hole, ShapeOf, TagOf, spelled)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases,
+                 RSlice, Leaf, Var, Arg, AVar, AInt, AZero, Made, MRecord, MCtor, Path, PField,
+                 PNamed, PArg, PCapture, PLeaf, rep_of_arg)
+import emit.lower.held (Laid, laid_of, record_flags, tail_bits, in_place, fields_of, slot_kind,
+                        case_leaves_all, case_span, enumerated)
+import emit.print.text (Printing, Place, printing, line, pieces, pad, temp, named, name_of,
+                        arg_text, check, zero, int_lit)
 
-/// The C type a value held as `r` is declared and crosses a call in.
+/// The C type a value held as `r` is declared in where it is one C value, and otherwise the type of
+/// the first of its C values, which a root answering it returns.
 pub fn c_type(r: Rep) -> Bytes =
   match r {
-    RWord -> b"Word",
-    RToken(_) -> b"Word",
-    RMaybe -> b"PlyMaybe",
-    RTagged -> b"PlyTagged",
-    _ -> ctype(kind(r)),
+    RFlat(ls) -> match ls.at(0) { Some(l) -> one_type(l.rep), None -> b"Word" },
+    RCases(_) -> b"int64_t",
+    _ -> one_type(r),
   }
 
-/// The C values a value held as `r` crosses a call in, each its own parameter.
-pub fn c_types(r: Rep) -> List<Bytes> = [c_type(r)]
+/// The C types of the values a value held as `r` is held in and crosses a call in, one per C
+/// parameter: a flat record's leaves and then its word, a sum's constructor's index and then every
+/// case's leaves, a view's list and its offset.
+pub fn c_types(r: Rep) -> List<Bytes> =
+  match r {
+    RFlat(ls) -> ls.map(|l: Leaf| ctype(slot_kind(l.rep))).push(b"Word"),
+    RCases(_) -> [b"int64_t"].concat(case_leaves_all(r).map(|l: Leaf| one_type(l.rep))),
+    RSlice -> [b"Word", b"int64_t"],
+    _ -> [one_type(r)],
+  }
 
-/// A value held as `r`, named `e`, as the word a value of its type is.
+fn one_type(r: Rep) -> Bytes =
+  match r {
+    RInt -> ctype(KInt),
+    RBool -> ctype(KBool),
+    RNum(w) -> ctype(KNum(w)),
+    RFloat -> ctype(KFloat),
+    RDec -> ctype(KDec),
+    RMaybe -> b"PlyMaybe",
+    RTagged -> b"PlyTagged",
+    _ -> b"Word",
+  }
+
+/// The C names of the values a value named `name` held as `r` is held in, in `c_types`' order: the
+/// value's own name where it is one, and `<name>_<k>` for its `k`th where it is several, which
+/// `Get(PLeaf(k))` reads.
+pub fn parts_of(name: Bytes, r: Rep) -> List<Bytes> = {
+  let n = c_types(r).len();
+  if n == 1 { [name] } else { range(0, n).map(|k: Int| part(name, k)) }
+}
+
+fn part(name: Bytes, k: Int) -> Bytes = Bytes::concat_all([name, b"_", ascii_of_int(k)])
+
+/// What each of the C values a value held as `r` is held in stands at before anything is set.
+pub fn zeros(r: Rep) -> List<Bytes> =
+  match r {
+    RFlat(ls) -> ls.map(|l: Leaf| zero(l.rep)).push(b"0"),
+    RCases(_) -> [b"0"].concat(case_leaves_all(r).map(|l: Leaf| zero(l.rep))),
+    RSlice -> [b"0", b"0"],
+    _ -> [zero(r)],
+  }
+
+/// Operand `a` as the C expressions of each of its values.
+pub fn arg_parts(pr: Printing, a: Arg) -> List<Bytes> =
+  match a {
+    AVar(v) -> parts_of(name_of(pr, v), v.rep),
+    AZero(r) -> zeros(r),
+    _ -> [arg_text(pr, a)],
+  }
+
+/// A value held as `r`, named `e`, as the word a value of its type is: a scalar boxed, an `Option`'s
+/// or a `Result`'s word made the object it stands for, which takes the word's count.
 pub fn as_word(e: Bytes, r: Rep) -> Bytes =
   match r {
-    RInt -> Bytes::concat_all([b"(ply_fits_imm(", e, b") ? ply_imm(", e, b") : rt_box_int_p(ctx, ", e, b"))"]),
+    RInt ->
+      Bytes::concat_all([
+        b"(ply_fits_imm(",
+        e,
+        b") ? ply_imm(",
+        e,
+        b") : rt_box_int_p(ctx, ",
+        e,
+        b"))",
+      ]),
     RBool -> Bytes::concat_all([b"(", e, b" ? ply_true : ply_false)"]),
     RFloat -> Bytes::concat_all([b"rt_box_float_p(ctx, ply_f64_bits(", e, b"))"]),
     RDec -> Bytes::concat_all([b"rt_box_decimal_p(ctx, (", e, b").lo, (", e, b").hi)"]),
     RNum(w) -> if w.bits < 64 { Bytes::concat_all([b"ply_imm((int64_t)", e, b")"]) } else {
-      Bytes::concat_all([b"rt_box_fixed_p(ctx, (Word)(", e, b"), ", ascii_of_int(width_index(w.bits, w.signed)), b")"])
+      Bytes::concat_all([
+        b"rt_box_fixed_p(ctx, (Word)(",
+        e,
+        b"), ",
+        ascii_of_int(width_index(w.bits, w.signed)),
+        b")",
+      ])
     },
+    RMaybe -> Bytes::concat_all([b"rt_maybe_take_p(ctx, ", e, b")"]),
+    RTagged -> Bytes::concat_all([b"rt_tagged_take_p(ctx, ", e, b")"]),
     _ -> e,
   }
 
-/// The word `w` read as a value held as `r`.
+/// The word `w` read as a value held as `r`: a scalar read out of it, which leaves the word's count
+/// to its holder, or an `Option`'s or a `Result`'s object opened into its word, which takes it.
 pub fn word_as(w: Bytes, r: Rep) -> Bytes =
   match r {
-    RInt -> Bytes::concat_all([b"(ply_is_imm(", w, b") ? ply_imm_value(", w, b") : rt_unbox_int_p(ctx, ", w, b"))"]),
+    RInt ->
+      Bytes::concat_all([
+        b"(ply_is_imm(",
+        w,
+        b") ? ply_imm_value(",
+        w,
+        b") : rt_unbox_int_p(ctx, ",
+        w,
+        b"))",
+      ]),
     RBool -> Bytes::concat_all([b"(", w, b" == ply_true)"]),
     RFloat ->
       Bytes::concat_all([
@@ -52,6 +138,8 @@ pub fn word_as(w: Bytes, r: Rep) -> Bytes =
     RNum(n) -> if n.bits < 64 {
       Bytes::concat_all([b"(", ctype(KNum(n)), b")ply_imm_value(", w, b")"])
     } else { Bytes::concat_all([b"(", ctype(KNum(n)), b")ply_words(", w, b")[0]"]) },
+    RMaybe -> Bytes::concat_all([b"rt_maybe_open_p(ctx, ", w, b")"]),
+    RTagged -> Bytes::concat_all([b"rt_tagged_open_p(ctx, ", w, b")"]),
     _ -> w,
   }
 
@@ -62,28 +150,1585 @@ fn width_index(bits: Int, signed: Bool) -> Int =
       + (if bits == 8 { 0 } else if bits == 16 { 1 } else if bits == 32 { 2 } else { 3 })
   }
 
-/// A record, a constructor's object or a list made of `m.args`.
-pub fn made(p: Place, pr: Printing, into: Option<Var>, m: { made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> }) -> Printing =
-  line(pr, p.depth, b"/* a value made, which this printer does not write yet */")
+// What crosses a root's boundary: its head, its entry, a growth of its stack, its return.
 
-/// What `g.path` reads out of `g.of`.
-pub fn got(p: Place, pr: Printing, into: Option<Var>, g: { of: Var, path: Path }) -> Printing =
-  line(pr, p.depth, b"/* a read, which this printer does not write yet */")
+/// The C types a root whose parameters are held as `params` and which answers as `answer` is
+/// declared with: what it returns, then each parameter's values', then the pointers it writes its
+/// answer's other values through. The unit holds a call's head to its callee's by these.
+pub fn head_types(params: List<Rep>, answer: Rep) -> { answer: Bytes, params: List<Bytes> } =
+  {
+    answer: c_type(answer),
+    params: params.fold([], |acc: List<Bytes>, r: Rep| acc.concat(c_types(r))).concat(
+      out_types(answer),
+    ),
+  }
 
-/// `k.arg` held as `k.to`.
-pub fn packed(p: Place, pr: Printing, into: Option<Var>, k: { arg: Arg, to: Rep }) -> Printing =
+/// The C parameters of the head of a root whose parameters are held as `params` and which answers
+/// as `answer`: each parameter's values `p<i>`, `p<i>_<k>`, `p<i>_w`, then the pointers `o<k>`.
+pub fn head_params(params: List<Rep>, answer: Rep) -> List<Bytes> = {
+  let ins = range(0, params.len()).fold([], |acc: List<Bytes>, i: Int|
+    match params.at(i) {
+      Some(r) -> acc.concat(typed_names(c_types(r), parts_of(b"p".concat(ascii_of_int(i)), r))),
+      None -> acc,
+    });
+  let outs = out_types(answer);
+  ins.concat(typed_names(outs, range(1, outs.len() + 1).map(|k: Int| b"o".concat(ascii_of_int(k)))))
+}
+
+fn typed_names(ts: List<Bytes>, ns: List<Bytes>) -> List<Bytes> =
+  range(0, ts.len()).map(|k: Int| Bytes::concat_all([nth(ts, k), b" ", nth(ns, k)]))
+
+/// The pointers' C types a root answering as `r` writes the values of its answer past the first
+/// through: a flat record's other leaves and its word, a sum's every leaf.
+fn out_types(r: Rep) -> List<Bytes> =
+  match r {
+    RFlat(ls) -> ls.drop(1).map(|l: Leaf| one_type(l.rep).concat(b"*")).push(b"Word*"),
+    RCases(_) -> case_leaves_all(r).map(|l: Leaf| one_type(l.rep).concat(b"*")),
+    _ -> [],
+  }
+
+/// A root answering as `answer` returning `a`: each of its values past the first written through
+/// its pointer, and the C expression the first is returned as.
+pub fn returned(pr: Printing, depth: Int, a: Arg) -> { pr: Printing, value: Bytes } = {
+  let ps = arg_parts(pr, a);
+  {
+    pr: range(1, ps.len()).fold(pr, |q: Printing, k: Int|
+      line(q, depth, Bytes::concat_all([b"*o", ascii_of_int(k), b" = ", nth(ps, k), b";"]))),
+    value: nth(ps, 0),
+  }
+}
+
+/// `v` declared, each of its C values at what it stands at before anything is set into it.
+pub fn declared(pr: Printing, depth: Int, v: Var) -> Printing = {
+  let n = named(pr, v);
+  let ts = c_types(v.rep);
+  let ns = parts_of(n.name, v.rep);
+  let zs = zeros(v.rep);
+  range(0, ts.len()).fold(n.pr, |q: Printing, k: Int|
+    line(q, depth, Bytes::concat_all([nth(ts, k), b" ", nth(ns, k), b" = ", nth(zs, k), b";"])))
+}
+
+/// `v`, declared, set to `a` value by value.
+pub fn set_parts(pr: Printing, depth: Int, v: Var, a: Arg) -> Printing = {
+  let ns = parts_of(name_of(pr, v), v.rep);
+  let xs = arg_parts(pr, a);
+  range(0, ns.len()).fold(pr, |q: Printing, k: Int|
+    line(q, depth, Bytes::concat_all([nth(ns, k), b" = ", nth(xs, k), b";"])))
+}
+
+/// What a root's entry does with `args[i]`, a parameter held as `r`, before it calls the root: the
+/// C it runs, and the C expressions it hands the call. A scalar is read out and its word let go, an
+/// `Option`'s or a `Result`'s object opened, a sum held as its cases opened into them, and a flat
+/// record's leaves loaded, each counted one held once more, its word handed on with them.
+pub fn entry_opened(i: Int, r: Rep) -> { text: Bytes, args: List<Bytes> } = {
+  let arg = Bytes::concat_all([b"args[", ascii_of_int(i), b"]"]);
+  let local = b"a".concat(ascii_of_int(i));
+  match r {
+    RMaybe ->
+      {
+        text: Bytes::concat_all([b"  PlyMaybe ", local, b" = ", word_as(arg, r), b";\n"]),
+        args: [local],
+      },
+    RTagged ->
+      {
+        text: Bytes::concat_all([b"  PlyTagged ", local, b" = ", word_as(arg, r), b";\n"]),
+        args: [local],
+      },
+    RFlat(ls) -> {
+      let loads = leaf_loads(arg, fields_of(ls));
+      let locals = range(0, loads.len()).map(|k: Int| part(local, k));
+      {
+        text: Bytes::concat_all([
+          Bytes::concat_all(
+            range(0, loads.len()).map(|k: Int|
+              Bytes::concat_all([
+                b"  ",
+                ctype(slot_kind(nth_held(loads, k).rep)),
+                b" ",
+                nth(locals, k),
+                b" = ",
+                nth_held(loads, k).expr,
+                b";\n",
+              ])),
+          ),
+          b"  ",
+          counted_incs(
+            range(0, loads.len()).map(|k: Int|
+              { rep: nth_held(loads, k).rep, expr: nth(locals, k) }),
+          ),
+          b"\n",
+        ]),
+        args: locals.push(arg),
+      }
+    },
+    RCases(_) -> {
+      let leaves = case_leaves_all(r);
+      let names = range(0, leaves.len()).map(|k: Int| part(local, k));
+      let word = local.concat(b"_s");
+      {
+        text: Bytes::concat_all([
+          b"  ",
+          sum_type(r),
+          b" ",
+          word,
+          b" = ",
+          word_as(arg, sum_word(r)),
+          b"; int64_t ",
+          local,
+          b" = 0;",
+          Bytes::concat_all(
+            range(0, leaves.len()).map(|k: Int|
+              Bytes::concat_all([
+                b" ",
+                one_type(nth_leaf(leaves, k).rep),
+                b" ",
+                nth(names, k),
+                b" = ",
+                zero(nth_leaf(leaves, k).rep),
+                b";",
+              ])),
+          ),
+          b"\n  ",
+          sum_opening(r, word, local, names),
+          b"\n",
+        ]),
+        args: [local].concat(names),
+      }
+    },
+    RWord -> { text: b"", args: [arg] },
+    _ ->
+      {
+        text: Bytes::concat_all([
+          b"  ",
+          c_type(r),
+          b" ",
+          local,
+          b" = ",
+          word_as(arg, r),
+          b"; ply_dec(ctx, ",
+          arg,
+          b");\n",
+        ]),
+        args: [local],
+      },
+  }
+}
+
+/// What an entry hands a root answering as `r` to write its answer's values past the first into.
+pub fn entry_outs(r: Rep) -> List<Bytes> =
+  range(1, out_types(r).len() + 1).map(|k: Int| b"&r".concat(ascii_of_int(k)))
+
+/// The entry's C from its call `call` of the root on: how a root answering as `r` hands back its
+/// answer as a word, a flat record's made of its leaves and a sum's of its cases where no word was.
+pub fn entry_answered(pr: Printing, r: Rep, call: Bytes) -> { pr: Printing, out: List<Piece> } = {
+  let outs = range(1, out_types(r).len() + 1).map(|k: Int| b"r".concat(ascii_of_int(k)));
+  match r {
+    RWord -> { pr: pr, out: [Text(Bytes::concat_all([b"  return ", call, b";\n"]))] },
+    RFlat(ls) -> {
+      let fs = fields_of(ls);
+      let sh = shapes_of(pr, fs);
+      let vals = range(0, ls.len()).map(|k: Int|
+        { rep: nth_leaf(ls, k).rep, expr: b"r".concat(ascii_of_int(k)) });
+      {
+        pr: sh.pr,
+        out: [
+          Text(
+            Bytes::concat_all([
+              Bytes::concat_all(
+                range(0, outs.len()).map(|k: Int|
+                  Bytes::concat_all([
+                    b"  ",
+                    ctype(slot_kind(match ls.at(k + 1) { Some(l) -> l.rep, None -> RWord })),
+                    b" ",
+                    nth(outs, k),
+                    b";\n",
+                  ])),
+              ),
+              b"  ",
+              ctype(slot_kind(c_rep(r))),
+              b" r0 = ",
+              call,
+              b";\n  if (ctx->failed) return 0;\n  ",
+            ]),
+          ),
+        ].concat(
+          word_made(b"rw", nth(outs, outs.len() - 1), fs, sh.shapes, vals, b"return 0;"),
+        ).push(
+          Text(b"\n  return rw;\n"),
+        ),
+      }
+    },
+    RCases(_) -> {
+      let leaves = case_leaves_all(r);
+      let sh = case_shapes(pr, r);
+      let vals = range(0, leaves.len()).map(|k: Int|
+        { rep: nth_leaf(leaves, k).rep, expr: nth(outs, k) });
+      {
+        pr: sh.pr,
+        out: [
+          Text(
+            Bytes::concat_all([
+              Bytes::concat_all(
+                range(0, outs.len()).map(|k: Int|
+                  Bytes::concat_all([
+                    b"  ",
+                    one_type(nth_leaf(leaves, k).rep),
+                    b" ",
+                    nth(outs, k),
+                    b" = ",
+                    zero(nth_leaf(leaves, k).rep),
+                    b";\n",
+                  ])),
+              ),
+              b"  int64_t r0 = ",
+              call,
+              b";\n  if (ctx->failed) return 0;\n  ",
+            ]),
+          ),
+        ].concat(
+          sum_made(b"rw", r, b"r0", vals, sh.shapes, b"return 0;"),
+        ).push(
+          Text(Bytes::concat_all([b"\n  return ", as_word(b"rw", sum_word(r)), b";\n"])),
+        ),
+      }
+    },
+    _ ->
+      {
+        pr: pr,
+        out: [
+          Text(
+            Bytes::concat_all([
+              b"  ",
+              c_type(r),
+              b" r = ",
+              call,
+              b";\n  if (ctx->failed) return 0;\n  return ",
+              as_word(b"r", r),
+              b";\n",
+            ]),
+          ),
+        ],
+      },
+  }
+}
+
+/// The word a growth of the stack hands parameter `p<i>`, held as `r`, on as, and the C that makes
+/// it first, leaving by `fail` if that fails: a flat record's word made of its leaves, a sum's of
+/// its cases, any other value as `as_word` has it.
+pub fn grown_word(
+  pr: Printing,
+  i: Int,
+  r: Rep,
+  fail: Bytes,
+) -> { pr: Printing, prep: List<Piece>, word: Bytes } = {
+  let p = b"p".concat(ascii_of_int(i));
+  let g = b"ply_g".concat(ascii_of_int(i));
+  match r {
+    RFlat(ls) -> {
+      let fs = fields_of(ls);
+      let sh = shapes_of(pr, fs);
+      let vals = range(0, ls.len()).map(|k: Int| { rep: nth_leaf(ls, k).rep, expr: part(p, k) });
+      {
+        pr: sh.pr,
+        prep: word_made(g, part(p, ls.len()), fs, sh.shapes, vals, fail).push(Text(b" ")),
+        word: g,
+      }
+    },
+    RCases(_) -> {
+      let leaves = case_leaves_all(r);
+      let sh = case_shapes(pr, r);
+      let vals = range(0, leaves.len()).map(|k: Int|
+        { rep: nth_leaf(leaves, k).rep, expr: part(p, k + 1) });
+      {
+        pr: sh.pr,
+        prep: sum_made(g, r, part(p, 0), vals, sh.shapes, fail).push(Text(b" ")),
+        word: as_word(g, sum_word(r)),
+      }
+    },
+    _ -> { pr: pr, prep: [], word: as_word(p, r) },
+  }
+}
+
+/// The grown call's word `grown` handed back as a root answering as `r` hands back its answer:
+/// opened, read out and let go, or a flat record's leaves loaded, the first returned and the others
+/// written back with its word.
+pub fn grown_answered(grown: Bytes, r: Rep) -> Bytes = {
+  let fail = Bytes::concat_all([b"if (ctx->failed) return ", zero(r), b"; "]);
+  match r {
+    RWord -> Bytes::concat_all([b"return ", grown, b";"]),
+    RMaybe ->
+      Bytes::concat_all([
+        b"Word ply_back = ",
+        grown,
+        b"; if (ctx->failed) return 0; return ",
+        word_as(b"ply_back", r),
+        b";",
+      ]),
+    RTagged ->
+      Bytes::concat_all([
+        b"Word ply_back = ",
+        grown,
+        b"; if (ctx->failed) return 0; return ",
+        word_as(b"ply_back", r),
+        b";",
+      ]),
+    RFlat(ls) -> {
+      let loads = leaf_loads(b"ply_back", fields_of(ls));
+      let named_as = |j: Int| if j == 0 { b"ply_out" } else { b"*o".concat(ascii_of_int(j)) };
+      Bytes::concat_all([
+        b"Word ply_back = ",
+        grown,
+        b"; if (ctx->failed) return ",
+        zero(c_rep(r)),
+        b"; ",
+        ctype(slot_kind(c_rep(r))),
+        b" ply_out = ",
+        nth_held(loads, 0).expr,
+        b";",
+        Bytes::concat_all(
+          range(1, loads.len()).map(|j: Int|
+            Bytes::concat_all([b" *o", ascii_of_int(j), b" = ", nth_held(loads, j).expr, b";"])),
+        ),
+        b" ",
+        counted_incs(
+          range(0, loads.len()).map(|j: Int| { rep: nth_held(loads, j).rep, expr: named_as(j) }),
+        ),
+        b"*o",
+        ascii_of_int(loads.len()),
+        b" = ply_back; return ply_out;",
+      ])
+    },
+    RCases(_) -> {
+      let leaves = case_leaves_all(r);
+      let outs = range(1, leaves.len() + 1).map(|k: Int| b"*o".concat(ascii_of_int(k)));
+      Bytes::concat_all([
+        b"Word ply_back = ",
+        grown,
+        b"; if (ctx->failed) return 0; ",
+        sum_type(r),
+        b" ply_s = ",
+        word_as(b"ply_back", sum_word(r)),
+        b"; int64_t ply_t = 0;",
+        Bytes::concat_all(
+          range(0, outs.len()).map(|k: Int|
+            Bytes::concat_all([b" ", nth(outs, k), b" = ", zero(nth_leaf(leaves, k).rep), b";"])),
+        ),
+        b" ",
+        sum_opening(r, b"ply_s", b"ply_t", outs),
+        b" return ply_t;",
+      ])
+    },
+    _ ->
+      Bytes::concat_all([
+        b"Word ply_back = ",
+        grown,
+        b"; ",
+        fail,
+        c_type(r),
+        b" ply_out = ",
+        word_as(b"ply_back", r),
+        b"; ply_dec(ctx, ply_back); return ply_out;",
+      ]),
+  }
+}
+
+/// The representation whose zero a root answering as `r` fails with: its first C value's.
+fn c_rep(r: Rep) -> Rep =
+  match r {
+    RFlat(ls) -> match ls.at(0) { Some(l) -> l.rep, None -> RWord },
+    RCases(_) -> RInt,
+    _ -> r,
+  }
+
+// The values this family prints.
+
+/// A record of a layout its type leaves open or a constructor's object made of `m.args`, in the
+/// cells `m.reuse` names where it names some: a constructor holding each argument as a word, or as
+/// its declaration lays each out, a scalar as its bits, an `Option` as its payload's word and a flat
+/// record in place.
+pub fn made(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  m: { made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> },
+) -> Printing =
   match into {
-    None -> pr,
-    Some(v) -> match k.to {
-      RWord -> assigned(pr, p.depth, v, c_type(RWord), as_word(arg_text(pr, k.arg), rep_of_arg(k.arg))),
-      _ -> line(pr, p.depth, b"/* a value held otherwise, which this printer does not write yet */"),
+    None -> line(pr, p.depth, b"/* a value made that nothing holds */"),
+    Some(v) -> match m.made {
+      MRecord(r) -> by_value(p, pr, v, r.names, m.args),
+      MCtor(c) -> if m.args.len() == 0 { ctor_value(p, pr, v, c.name) }
+      else if m.args.any(|a: Arg| laid_rep(rep_of_arg(a))) {
+        ctor_laid(p, pr, v, c.name, m.args, m.reuse, m.kept)
+      } else { ctor_built(p, pr, v, c.name, m.args, m.reuse, m.kept) },
+      _ -> line(pr, p.depth, b"/* a list, an array or a closure, which other printers make */"),
     },
   }
 
-/// A flat value gathered from `parts`.
-pub fn gathered(p: Place, pr: Printing, into: Option<Var>, parts: List<Arg>) -> Printing =
-  line(pr, p.depth, b"/* a flat value, which this printer does not write yet */")
+/// Whether a constructor's object holds an argument held as `r` other than as its word.
+fn laid_rep(r: Rep) -> Bool =
+  match r {
+    RInt -> true,
+    RNum(_) -> true,
+    RFloat -> true,
+    RDec -> true,
+    RMaybe -> true,
+    RFlat(_) -> true,
+    _ -> false,
+  }
 
-/// The static constant `name`.
+/// A record of `names` holding the words `args`, which it takes, laid out by the runtime as the
+/// values they are.
+fn by_value(p: Place, pr: Printing, v: Var, names: List<Bytes>, args: List<Arg>) -> Printing = {
+  let sh = shape_at(pr, names);
+  let arr = temp(sh.pr);
+  let n = named(arr.pr, v);
+  let listed = line(
+    n.pr,
+    p.depth,
+    Bytes::concat_all([b"Word ", arr.name, b"[] = {", words_of(n.pr, args), b"};"]),
+  );
+  check(
+    p,
+    pieces(listed, [
+      Text(Bytes::concat_all([pad(p.depth), b"Word ", n.name, b" = rt_record_p(ctx, "])),
+      Hole(ShapeOf(sh.at)),
+      Text(
+        Bytes::concat_all([
+          b", (Word)(intptr_t)",
+          arr.name,
+          b", ",
+          ascii_of_int(args.len()),
+          b");\n",
+        ]),
+      ),
+    ]),
+  )
+}
+
+fn words_of(pr: Printing, args: List<Arg>) -> Bytes =
+  if args.len() == 0 { b"0" }
+  else { joined(args.map(|a: Arg| as_word(arg_text(pr, a), rep_of_arg(a))), b", ") }
+
+/// A constructor read as a value: a nullary one's singleton, or another a function of its arguments.
+fn ctor_value(p: Place, pr: Printing, v: Var, ctor: Bytes) -> Printing = {
+  let n = named(pr, v);
+  check(
+    p,
+    pieces(n.pr, [
+      Text(Bytes::concat_all([pad(p.depth), b"Word ", n.name, b" = rt_ctor_value_p(ctx, "])),
+      Hole(TagOf(ctor)),
+      Text(b");\n"),
+    ]),
+  )
+}
+
+/// A constructor holding each of `args` as its word, in the cells `reuse` names where they are some,
+/// which hold the words of the arguments `kept` already.
+fn ctor_built(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  ctor: Bytes,
+  args: List<Arg>,
+  reuse: Option<Var>,
+  kept: List<Int>,
+) -> Printing = {
+  let n = named(pr, v);
+  let ws = args.map(|a: Arg| as_word(arg_text(pr, a), rep_of_arg(a)));
+  let width = ascii_of_int(args.len());
+  let called = |q: Printing, depth: Int, decl: Bytes| {
+    let arr = temp(q);
+    pieces(
+      line(
+        arr.pr,
+        depth,
+        Bytes::concat_all([b"Word ", arr.name, b"[] = {", joined(ws, b", "), b"};"]),
+      ),
+      [
+        Text(Bytes::concat_all([pad(depth), decl, n.name, b" = rt_ctor_p(ctx, "])),
+        Hole(TagOf(ctor)),
+        Text(Bytes::concat_all([b", (Word)(intptr_t)", arr.name, b", ", width, b");\n"])),
+      ],
+    )
+  };
+  match reuse {
+    None -> check(p, called(n.pr, p.depth, b"Word ")),
+    Some(tok) -> {
+      let t = name_of(pr, tok);
+      let flat = joined(ws.map(|w: Bytes| Bytes::concat_all([b"ply_is_imm(", w, b")"])), b" && ");
+      let opened = line(
+        line(n.pr, p.depth, Bytes::concat_all([b"Word ", n.name, b" = 0;"])),
+        p.depth,
+        Bytes::concat_all([b"if (", t, b") {"]),
+      );
+      let headed = pieces(
+        line(opened, p.depth + 1, Bytes::concat_all([n.name, b" = ", t, b";"])),
+        [
+          Text(
+            Bytes::concat_all([
+              pad(p.depth + 1),
+              header(n.name, b"4", Bytes::concat_all([b"(", flat, b") ? 1 : 0"]), width),
+              b" ply_obj(",
+              n.name,
+              b")->layout = ",
+            ]),
+          ),
+          Hole(TagOf(ctor)),
+          Text(b";\n"),
+        ],
+      );
+      let stored = range(0, ws.len()).fold(headed, |q: Printing, k: Int|
+        if kept.contains(k) { q } else {
+          line(
+            q,
+            p.depth + 1,
+            Bytes::concat_all([
+              b"ply_words(",
+              n.name,
+              b")[",
+              ascii_of_int(k),
+              b"] = ",
+              nth(ws, k),
+              b";",
+            ]),
+          )
+        });
+      line(
+        check(
+          { ..p, depth: p.depth + 1 },
+          called(line(stored, p.depth, b"} else {"), p.depth + 1, b""),
+        ),
+        p.depth,
+        b"}",
+      )
+    },
+  }
+}
+
+fn header(name: Bytes, kind: Bytes, flags: Bytes, len: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"ply_obj(",
+    name,
+    b")->rc = 1; ply_obj(",
+    name,
+    b")->kind = ",
+    kind,
+    b"; ply_obj(",
+    name,
+    b")->flags = ",
+    flags,
+    b"; ply_obj(",
+    name,
+    b")->len = ",
+    len,
+    b";",
+  ])
+
+/// A constructor whose declaration lays its arguments out other than as their words: each held as
+/// a record's field of its representation holds it, a flat record in place; in the cells `reuse`
+/// names where they are some, which hold the arguments `kept` already.
+fn ctor_laid(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  ctor: Bytes,
+  args: List<Arg>,
+  reuse: Option<Var>,
+  kept: List<Int>,
+) -> Printing = {
+  let fs = range(0, args.len()).map(|i: Int|
+    slot_field(arg_name(i), match args.at(i) { Some(a) -> rep_of_arg(a), None -> RWord }));
+  let vals = args.fold([], |acc: List<Held>, a: Arg| {
+    let ps = arg_parts(pr, a);
+    match rep_of_arg(a) {
+      RFlat(ls) ->
+        acc.concat(
+          range(0, ps.len()).map(|k: Int|
+            { rep: match ls.at(k) { Some(l) -> l.rep, None -> RWord }, expr: nth(ps, k) }),
+        ),
+      r -> acc.push({ rep: r, expr: nth(ps, 0) }),
+    }
+  });
+  let sh = inner_shapes(pr, fs);
+  let n = named(sh.pr, v);
+  let l = laid_of(fs);
+  let flags = ascii_of_int(record_flags(fs, l));
+  let cells = |q: Printing, depth: Int, skip: List<Int>|
+    pieces(
+      q,
+      [Text(pad(depth))].concat(laid_cells(n.name, fs, vals, sh.shapes, skip)).push(Text(b"\n")),
+    );
+  let allocated = |q: Printing, depth: Int, decl: Bytes|
+    check(
+      { ..p, depth: depth },
+      pieces(q, [
+        Text(
+          Bytes::concat_all([
+            pad(depth),
+            decl,
+            n.name,
+            b" = rt_alloc_p(ctx, 4, ",
+            ascii_of_int(l.width),
+            b", ",
+          ]),
+        ),
+        Hole(TagOf(ctor)),
+        Text(Bytes::concat_all([b", ", flags, b");\n"])),
+      ]),
+    );
+  match reuse {
+    None -> cells(allocated(n.pr, p.depth, b"Word "), p.depth, []),
+    Some(tok) -> {
+      let t = name_of(pr, tok);
+      let opened = line(
+        line(n.pr, p.depth, Bytes::concat_all([b"Word ", n.name, b" = 0;"])),
+        p.depth,
+        Bytes::concat_all([
+          b"if (",
+          t,
+          if record_flags(fs, l) & 2 != 0 {
+            Bytes::concat_all([b" && (ply_obj(", t, b")->flags & PLY_MIXED)"])
+          } else { b"" },
+          b") {",
+        ]),
+      );
+      let headed = pieces(
+        line(opened, p.depth + 1, Bytes::concat_all([n.name, b" = ", t, b";"])),
+        [
+          Text(
+            Bytes::concat_all([
+              pad(p.depth + 1),
+              header(n.name, b"4", flags, ascii_of_int(l.width)),
+              b" ply_obj(",
+              n.name,
+              b")->layout = ",
+            ]),
+          ),
+          Hole(TagOf(ctor)),
+          Text(b";\n"),
+        ],
+      );
+      let made_else = allocated(
+        line(cells(headed, p.depth + 1, kept), p.depth, b"} else {"),
+        p.depth + 1,
+        b"",
+      );
+      line(cells(made_else, p.depth + 1, []), p.depth, b"}")
+    },
+  }
+}
+
+fn arg_name(i: Int) -> Bytes =
+  Bytes::concat_all([b"a", ascii_of_int(i / 100), ascii_of_int(i / 10 % 10), ascii_of_int(i % 10)])
+
+/// The field a record or a constructor holds a value held as `r` in.
+fn slot_field(name: Bytes, r: Rep) -> FieldTy =
+  match r {
+    RFlat(ls) -> { name: name, kind: KBoxed, ty: TyRec(fields_of(ls)) },
+    _ -> { name: name, kind: slot_kind(r), ty: TyOpen([]) },
+  }
+
+/// What `g.path` reads out of `g.of`, which the value read borrows: a flat value's leaf or word, a
+/// field or a constructor's argument at its offset in a word as the variable it goes into holds it,
+/// a record held in place there as its leaves and the address of its header, or the payload of a sum
+/// held as one word.
+pub fn got(p: Place, pr: Printing, into: Option<Var>, g: { of: Var, path: Path }) -> Printing =
+  match into {
+    None -> pr,
+    Some(v) -> {
+      let base = name_of(pr, g.of);
+      match g.path {
+        PLeaf(k) -> { declared_as(p, pr, v, [nth(parts_of(base, g.of.rep), k)]) },
+        PField(f) -> loaded(p, pr, v, base, f.at),
+        PArg(a) -> match g.of.rep {
+          RMaybe -> payload(p, pr, v, base),
+          RTagged ->
+            payload(p, pr, v, if a.ctor == b"Err" {
+              Bytes::concat_all([b"(", base, b" & ~(Word)7)"])
+            } else { base }),
+          _ -> loaded(p, pr, v, base, a.at),
+        },
+        PNamed(_) ->
+          line(pr, p.depth, b"/* a field read by name, which answers a count of its own */"),
+        PCapture(_) -> line(pr, p.depth, b"/* a capture, which a closure's printer reads */"),
+      }
+    },
+  }
+
+/// `v` read out of the payload's word `w` of a sum held as one word, which it borrows: the word, or
+/// a scalar it holds read out of it. Anything else a payload holds is its word's to open, which
+/// takes it, so it is bound as a word and handed on.
+fn payload(p: Place, pr: Printing, v: Var, w: Bytes) -> Printing =
+  match v.rep {
+    RWord -> declared_as(p, pr, v, [w]),
+    RInt -> declared_as(p, pr, v, [word_as(w, v.rep)]),
+    RBool -> declared_as(p, pr, v, [word_as(w, v.rep)]),
+    RNum(_) -> declared_as(p, pr, v, [word_as(w, v.rep)]),
+    RFloat -> declared_as(p, pr, v, [word_as(w, v.rep)]),
+    RDec -> declared_as(p, pr, v, [word_as(w, v.rep)]),
+    _ ->
+      line(
+        pr,
+        p.depth,
+        b"/* a payload read as other than a word or a scalar, which a Get never borrows */",
+      ),
+  }
+
+/// `v` declared holding `exprs`, one per C value.
+fn declared_as(p: Place, pr: Printing, v: Var, exprs: List<Bytes>) -> Printing = {
+  let n = named(pr, v);
+  let ts = c_types(v.rep);
+  let ns = parts_of(n.name, v.rep);
+  range(0, ns.len()).fold(n.pr, |q: Printing, k: Int|
+    line(
+      q,
+      p.depth,
+      Bytes::concat_all([nth(ts, k), b" ", nth(ns, k), b" = ", nth(exprs, k), b";"]),
+    ))
+}
+
+/// `v` loaded from word `at` of the object `base`, as `v` holds it: a flat record held in place there
+/// as its leaves and its header's address.
+fn loaded(p: Place, pr: Printing, v: Var, base: Bytes, at: Int) -> Printing =
+  match v.rep {
+    RFlat(ls) -> {
+      let h = Bytes::concat_all([
+        b"((Word)(intptr_t)(ply_words(",
+        base,
+        b") + ",
+        ascii_of_int(at),
+        b"))",
+      ]);
+      declared_as(p, pr, v, field_loads(h, fields_of(ls)).map(|x: Held| x.expr).push(h))
+    },
+    r -> declared_as(p, pr, v, [slot_load(base, at, r)]),
+  }
+
+/// The field held as `r` at word `at` of `base`.
+fn slot_load(base: Bytes, at: Int, r: Rep) -> Bytes = {
+  let word = Bytes::concat_all([b"ply_words(", base, b")[", ascii_of_int(at), b"]"]);
+  match r {
+    RInt -> Bytes::concat_all([b"(int64_t)(", word, b")"]),
+    RNum(w) -> Bytes::concat_all([b"(", ctype(KNum(w)), b")(", word, b")"]),
+    RFloat -> Bytes::concat_all([b"ply_f64(", word, b")"]),
+    RDec -> Bytes::concat_all([b"ply_dec_at(", base, b", ", ascii_of_int(at), b")"]),
+    RBool -> Bytes::concat_all([b"(", word, b" == ply_true)"]),
+    _ -> word,
+  }
+}
+
+/// `k.arg` held as `k.to`, which takes it: a scalar boxed or read out of its word, an `Option`'s or a
+/// `Result`'s word made its object or opened from it, a flat record's word made of its leaves or its
+/// leaves loaded from its word, a sum held as its cases made one word or opened into its cases.
+pub fn packed(p: Place, pr: Printing, into: Option<Var>, k: { arg: Arg, to: Rep }) -> Printing =
+  match into {
+    None -> line(pr, p.depth, b"/* a value held otherwise that nothing holds */"),
+    Some(v) -> {
+      let from = rep_of_arg(k.arg);
+      let e = arg_text(pr, k.arg);
+      let xs = arg_parts(pr, k.arg);
+      if from == k.to { declared_as(p, pr, v, xs) } else {
+        match k.to {
+          RWord -> match from {
+            RFlat(ls) -> {
+              let fs = fields_of(ls);
+              let sh = shapes_of(pr, fs);
+              let n = named(sh.pr, v);
+              let vals = range(0, ls.len()).map(|j: Int|
+                { rep: nth_leaf(ls, j).rep, expr: nth(xs, j) });
+              pieces(
+                n.pr,
+                [Text(pad(p.depth))].concat(
+                  word_made(n.name, nth(xs, ls.len()), fs, sh.shapes, vals, p.leave),
+                ).push(
+                  Text(b"\n"),
+                ),
+              )
+            },
+            RCases(_) -> if enumerated(from) { enum_object(p, pr, v, from, e) } else {
+              let leaves = case_leaves_all(from);
+              let sh = case_shapes(pr, from);
+              let t = temp(sh.pr);
+              let vals = range(0, leaves.len()).map(|j: Int|
+                { rep: nth_leaf(leaves, j).rep, expr: nth(xs, j + 1) });
+              declared_as(
+                p,
+                pieces(
+                  t.pr,
+                  [Text(pad(p.depth))].concat(
+                    sum_made(t.name, from, nth(xs, 0), vals, sh.shapes, p.leave),
+                  ).push(
+                    Text(b"\n"),
+                  ),
+                ),
+                v,
+                [as_word(t.name, sum_word(from))],
+              )
+            },
+            _ -> {
+              let boxed = declared_as(p, pr, v, [as_word(e, from)]);
+              if boxes(from) { check(p, boxed) } else { boxed }
+            },
+          },
+          RMaybe -> sum_word_of(p, pr, v, from, e, xs),
+          RTagged -> sum_word_of(p, pr, v, from, e, xs),
+          RFlat(ls) -> if from != RWord { mismatched(p, pr, from, k.to) } else {
+            let loads = leaf_loads(e, fields_of(ls));
+            let declared_leaves = declared_as(p, pr, v, loads.map(|x: Held| x.expr).push(e));
+            let ns = parts_of(name_of(declared_leaves, v), v.rep);
+            let incs = counted_incs(
+              range(0, loads.len()).map(|j: Int| { rep: nth_held(loads, j).rep, expr: nth(ns, j) }),
+            );
+            if incs == b"" { declared_leaves }
+            else { line(declared_leaves, p.depth, trimmed_end(incs)) }
+          },
+          RCases(_) -> if enumerated(k.to) {
+            if from == RWord { enum_index(p, pr, v, e) } else { mismatched(p, pr, from, k.to) }
+          } else {
+            let n = named(pr, v);
+            let ns = parts_of(n.name, k.to);
+            let word = match from { RWord -> n.name.concat(b"_s"), _ -> e };
+            let opened = match from {
+              RWord ->
+                line(
+                  n.pr,
+                  p.depth,
+                  Bytes::concat_all([
+                    sum_type(k.to),
+                    b" ",
+                    word,
+                    b" = ",
+                    word_as(e, sum_word(k.to)),
+                    b";",
+                  ]),
+                ),
+              _ -> n.pr,
+            };
+            let zeroed = range(0, ns.len()).fold(opened, |q: Printing, j: Int|
+              line(
+                q,
+                p.depth,
+                Bytes::concat_all([
+                  nth(c_types(k.to), j),
+                  b" ",
+                  nth(ns, j),
+                  b" = ",
+                  nth(zeros(k.to), j),
+                  b";",
+                ]),
+              ));
+            if from == RWord || from == sum_word(k.to) {
+              line(zeroed, p.depth, sum_opening(k.to, word, nth(ns, 0), ns.drop(1)))
+            } else { mismatched(p, pr, from, k.to) }
+          },
+          _ -> if from == RWord {
+            let n = named(pr, v);
+            line(
+              line(
+                n.pr,
+                p.depth,
+                Bytes::concat_all([c_type(k.to), b" ", n.name, b" = ", word_as(e, k.to), b";"]),
+              ),
+              p.depth,
+              Bytes::concat_all([b"ply_dec(ctx, ", e, b");"]),
+            )
+          } else { mismatched(p, pr, from, k.to) },
+        }
+      }
+    },
+  }
+
+/// `v`, a sum whose constructors take nothing held as `r`, as the object of its constructor `i`
+/// names: that constructor's singleton.
+fn enum_object(p: Place, pr: Printing, v: Var, r: Rep, i: Bytes) -> Printing = {
+  let names = case_names(r);
+  let n = named(pr, v);
+  let chosen = range(0, names.len()).fold([], |acc: List<Piece>, j: Int|
+    if j + 1 == names.len() { acc.push(Hole(TagOf(nth(names, j)))) } else {
+      acc.concat([
+        Text(Bytes::concat_all([b"(", i, b" == ", ascii_of_int(j), b" ? "])),
+        Hole(TagOf(nth(names, j))),
+        Text(b" : "),
+      ])
+    });
+  check(
+    p,
+    pieces(
+      n.pr,
+      [
+        Text(Bytes::concat_all([pad(p.depth), b"Word ", n.name, b" = rt_ctor_value_p(ctx, "])),
+      ].concat(
+        chosen,
+      ).push(
+        Text(
+          Bytes::concat_all([Bytes::concat_all(range(1, names.len()).map(|_: Int| b")")), b");\n"]),
+        ),
+      ),
+    ),
+  )
+}
+
+/// `v`, a sum whose constructors take nothing, as the index of the constructor whose object `w` is,
+/// which it takes.
+fn enum_index(p: Place, pr: Printing, v: Var, w: Bytes) -> Printing = {
+  let names = case_names(v.rep);
+  let n = named(pr, v);
+  let tested = range(0, names.len()).fold([], |acc: List<Piece>, j: Int|
+    if j + 1 == names.len() { acc.push(Text(ascii_of_int(j))) } else {
+      acc.concat([
+        Text(Bytes::concat_all([b"(ply_obj(", w, b")->layout == "])),
+        Hole(TagOf(nth(names, j))),
+        Text(Bytes::concat_all([b" ? ", ascii_of_int(j), b" : "])),
+      ])
+    });
+  line(
+    pieces(
+      n.pr,
+      [Text(Bytes::concat_all([pad(p.depth), b"int64_t ", n.name, b" = "]))].concat(tested).push(
+        Text(
+          Bytes::concat_all([Bytes::concat_all(range(1, names.len()).map(|_: Int| b")")), b";\n"]),
+        ),
+      ),
+    ),
+    p.depth,
+    Bytes::concat_all([b"ply_dec(ctx, ", w, b");"]),
+  )
+}
+
+fn case_names(r: Rep) -> List<Bytes> =
+  match r { RCases(c) -> c.cases.map(|x: { name: Bytes, leaves: List<Leaf> }| x.name), _ -> [] }
+
+/// Whether boxing a value held as `r` can fail: the runtime makes an object of it.
+fn boxes(r: Rep) -> Bool =
+  match r { RInt -> true, RFloat -> true, RDec -> true, RNum(w) -> w.bits >= 64, _ -> false }
+
+/// `v`, a sum held as one word, from `from`: its object opened, or its cases made that word.
+fn sum_word_of(p: Place, pr: Printing, v: Var, from: Rep, e: Bytes, xs: List<Bytes>) -> Printing =
+  match from {
+    RWord -> declared_as(p, pr, v, [word_as(e, v.rep)]),
+    RCases(_) -> if sum_word(from) != v.rep { mismatched(p, pr, from, v.rep) } else {
+      let leaves = case_leaves_all(from);
+      let sh = case_shapes(pr, from);
+      let n = named(sh.pr, v);
+      let vals = range(0, leaves.len()).map(|j: Int|
+        { rep: nth_leaf(leaves, j).rep, expr: nth(xs, j + 1) });
+      pieces(
+        n.pr,
+        [Text(pad(p.depth))].concat(
+          sum_made(n.name, from, nth(xs, 0), vals, sh.shapes, p.leave),
+        ).push(
+          Text(b"\n"),
+        ),
+      )
+    },
+    _ -> mismatched(p, pr, from, v.rep),
+  }
+
+fn mismatched(p: Place, pr: Printing, from: Rep, to: Rep) -> Printing =
+  line(
+    pr,
+    p.depth,
+    b"/* a value held as no type holds both as packed, which the form never writes */",
+  )
+
+/// `parts`, a sum's constructor's index first and then its case's leaves, gathered into `v`: a flat
+/// value value by value, an `Option` as its payload's word or zero, a `Result` as its `Ok`'s
+/// payload's word or its `Err`'s tagged `100`.
+pub fn gathered(p: Place, pr: Printing, into: Option<Var>, parts: List<Arg>) -> Printing =
+  match into {
+    None -> line(pr, p.depth, b"/* a flat value that nothing holds */"),
+    Some(v) -> {
+      let xs = parts.fold([], |acc: List<Bytes>, a: Arg| acc.concat(arg_parts(pr, a)));
+      match v.rep {
+        RMaybe ->
+          declared_as(p, pr, v, [if parts.at(0) == Some(AInt(1)) { nth(xs, 1) } else { b"0" }]),
+        RTagged ->
+          declared_as(p, pr, v, [
+            if parts.at(0) == Some(AInt(1)) {
+              Bytes::concat_all([b"((Word)(", nth(xs, 1), b") | 4)"])
+            } else { nth(xs, 1) },
+          ]),
+        _ -> declared_as(p, pr, v, xs),
+      }
+    },
+  }
+
+/// The static constant `name`, its object laid out by the unit, as its word.
 pub fn statics(p: Place, pr: Printing, into: Option<Var>, name: Bytes) -> Printing =
-  line(pr, p.depth, b"/* a static constant, which this printer does not write yet */")
+  match into {
+    None -> pr,
+    Some(v) -> declared_as(p, pr, v, [Bytes::concat_all([b"(Word)(intptr_t)&", name])]),
+  }
+
+// Records and sums as words: what today's emitter's `record_word_lines`, `sum_word_lines`,
+// `sum_opening` and `leaf_loads` write, read off representations.
+
+/// A value a printer writes out of: how it is held and the C naming it.
+type Held = { rep: Rep, expr: Bytes }
+
+/// C declaring `name` the word of the flat record of fields `fs` whose leaves are `vals` and whose
+/// word is `word`: that word where one was made, the leaves let go; otherwise one made of `shapes`'
+/// shape, the record's and then each held in place's, which takes the leaves' counts, leaving by
+/// `fail` if that fails. A record held in place made already is copied in.
+fn word_made(
+  name: Bytes,
+  word: Bytes,
+  fs: List<FieldTy>,
+  shapes: List<Int>,
+  vals: List<Held>,
+  fail: Bytes,
+) -> List<Piece> = {
+  let l = laid_of(fs);
+  [
+    Text(
+      Bytes::concat_all([
+        b"Word ",
+        name,
+        b" = ",
+        word,
+        b"; if (",
+        name,
+        b") { ",
+        let_go(vals),
+        b"} else { ",
+        name,
+        b" = rt_alloc_p(ctx, 3, ",
+        ascii_of_int(l.width),
+        b", ",
+      ]),
+    ),
+    Hole(ShapeOf(nth_int(shapes, 0))),
+    Text(
+      Bytes::concat_all([b", ", ascii_of_int(record_flags(fs, l)), b"); if (ctx->failed) ", fail]),
+    ),
+  ].concat(
+    laid_cells(name, fs, vals, shapes, []),
+  ).push(
+    Text(b" }"),
+  )
+}
+
+/// The cells of an object laid out as a record of `fs` named `name`, written from `vals`, its leaves
+/// in order: each field's word at its offset, a `Decimal`'s two, the bitmap of a mixed one, and each
+/// record held in place copied in where it was made and written in place where not.
+fn laid_cells(
+  name: Bytes,
+  fs: List<FieldTy>,
+  vals: List<Held>,
+  shapes: List<Int>,
+  skip: List<Int>,
+) -> List<Piece> = {
+  let l = laid_of(fs);
+  let flags = record_flags(fs, l);
+  let spread = range(0, fs.len()).fold(
+    { at: 0, words: [], inner: [] },
+    |acc: { at: Int, words: List<Bytes>, inner: List<{ field: Int, start: Int }> }, i: Int|
+      match in_place(nth_field(fs, i)) {
+        Some(inner) ->
+          {
+            at: acc.at + inner.len() + 1,
+            words: acc.words.push(b"0"),
+            inner: acc.inner.push({ field: i, start: acc.at }),
+          },
+        None ->
+          {
+            at: acc.at + 1,
+            words: acc.words.push(field_word(nth_held(vals, acc.at))),
+            inner: acc.inner,
+          },
+      },
+  );
+  [Text(written(name, 0, cells_of(fs, spread.words, l, flags, skip)))].concat(
+    range(0, spread.inner.len()).fold([], |acc: List<Piece>, j: Int| {
+      let x = match spread.inner.at(j) { Some(y) -> y, None -> { field: 0, start: 0 } };
+      let inner = match in_place(nth_field(fs, x.field)) { Some(ifs) -> ifs, None -> [] };
+      if skip.contains(x.field) { acc } else {
+        let il = laid_of(inner);
+        let at = nth_int(l.offsets, x.field);
+        let ivals = range(0, inner.len()).map(|k: Int| nth_held(vals, x.start + k));
+        let iw = nth_held(vals, x.start + inner.len()).expr;
+        acc.concat([
+          Text(
+            Bytes::concat_all([
+              b" if (",
+              iw,
+              b") { ",
+              let_go(ivals),
+              b"ply_embed(ctx, ",
+              name,
+              b", ",
+              ascii_of_int(at),
+              b", ",
+              iw,
+              b", ",
+              ascii_of_int(il.tail),
+              b"); } else { ply_embedded(",
+              name,
+              b", ",
+              ascii_of_int(at),
+              b", ",
+              ascii_of_int(record_flags(inner, il)),
+              b", ",
+              ascii_of_int(il.width),
+              b", ",
+            ]),
+          ),
+          Hole(ShapeOf(nth_int(shapes, j + 1))),
+          Text(
+            Bytes::concat_all([
+              b");",
+              written(
+                name,
+                at + 2,
+                cells_of(inner, ivals.map(field_word), il, record_flags(inner, il), []),
+              ),
+              b" }",
+            ]),
+          ),
+        ])
+      }
+    }),
+  )
+}
+
+fn written(name: Bytes, at: Int, cells: List<{ at: Int, expr: Bytes }>) -> Bytes =
+  Bytes::concat_all(
+    cells.map(|c: { at: Int, expr: Bytes }|
+      Bytes::concat_all([
+        b" ply_words(",
+        name,
+        b")[",
+        ascii_of_int(at + c.at),
+        b"] = ",
+        c.expr,
+        b";",
+      ])),
+  )
+
+/// The words an object laid out as a record of `fs` holds, but those of the records it holds in
+/// place: `words`, one per field, at its offset, a `Decimal`'s local as its two, and the bitmap
+/// after them where `flags` says it is mixed.
+fn cells_of(
+  fs: List<FieldTy>,
+  words: List<Bytes>,
+  l: Laid,
+  flags: Int,
+  skip: List<Int>,
+) -> List<{ at: Int, expr: Bytes }> =
+  range(0, fs.len()).fold([], |acc: List<{ at: Int, expr: Bytes }>, i: Int| {
+    let f = nth_field(fs, i);
+    let at = nth_int(l.offsets, i);
+    let expr = nth(words, i);
+    if in_place(f) != None || skip.contains(i) { acc } else if f.kind == KDec {
+      acc.concat([{ at: at, expr: expr.concat(b".lo") }, { at: at + 1, expr: expr.concat(b".hi") }])
+    } else { acc.push({ at: at, expr: expr }) }
+  }).concat(if flags & 2 != 0 {
+    let bits = tail_bits(l);
+    range(0, bits.len()).map(|t: Int| { at: l.width + t, expr: int_lit(nth_int(bits, t)) })
+  } else { [] })
+
+/// The word a record holds `v` in: a scalar's bits, a `Decimal`'s local (written as its two), an
+/// `Option`'s payload's word, a `Bool`'s word, or the word itself.
+fn field_word(v: Held) -> Bytes =
+  match v.rep {
+    RInt -> Bytes::concat_all([b"(Word)(", v.expr, b")"]),
+    RNum(_) -> Bytes::concat_all([b"(Word)(", v.expr, b")"]),
+    RFloat -> Bytes::concat_all([b"ply_f64_bits(", v.expr, b")"]),
+    RBool -> as_word(v.expr, RBool),
+    _ -> v.expr,
+  }
+
+/// Each field of the record of fields `fs` whose word is `word`, loaded at its place, a record held in
+/// place as the address of its header there.
+fn field_loads(word: Bytes, fs: List<FieldTy>) -> List<Held> = {
+  let l = laid_of(fs);
+  range(0, fs.len()).map(|i: Int| {
+    let f = nth_field(fs, i);
+    let at = nth_int(l.offsets, i);
+    match in_place(f) {
+      Some(_) ->
+        {
+          rep: RWord,
+          expr: Bytes::concat_all([
+            b"((Word)(intptr_t)(ply_words(",
+            word,
+            b") + ",
+            ascii_of_int(at),
+            b"))",
+          ]),
+        },
+      None -> { rep: slot_rep_of(f.kind), expr: slot_load(word, at, slot_rep_of(f.kind)) },
+    }
+  })
+}
+
+/// Each leaf of the record of fields `fs` whose word is `word`, loaded at its place: a record held in
+/// place as its own fields and then the address of its header there.
+fn leaf_loads(word: Bytes, fs: List<FieldTy>) -> List<Held> = {
+  let loads = field_loads(word, fs);
+  range(0, fs.len()).fold([], |acc: List<Held>, k: Int| {
+    let v = nth_held(loads, k);
+    match in_place(nth_field(fs, k)) {
+      Some(inner) -> acc.concat(field_loads(v.expr, inner)).push(v),
+      None -> acc.push(v),
+    }
+  })
+}
+
+fn slot_rep_of(k: Kind) -> Rep =
+  match k {
+    KInt -> RInt,
+    KBool -> RBool,
+    KNum(w) -> RNum(w),
+    KFloat -> RFloat,
+    KDec -> RDec,
+    KSum(Zeroed) -> RMaybe,
+    _ -> RWord,
+  }
+
+/// Whether a value held as `r` holds a count a word it was loaded from or made into holds too.
+fn counted_word(r: Rep) -> Bool =
+  match r { RWord -> true, RMaybe -> true, RTagged -> true, _ -> false }
+
+fn let_go(vals: List<Held>) -> Bytes =
+  Bytes::concat_all(
+    vals.filter(|v: Held| counted_word(v.rep)).map(|v: Held|
+      Bytes::concat_all([b"ply_dec(ctx, ", v.expr, b"); "])),
+  )
+
+fn counted_incs(vals: List<Held>) -> Bytes =
+  Bytes::concat_all(
+    vals.filter(|v: Held| counted_word(v.rep)).map(|v: Held|
+      Bytes::concat_all([b"ply_inc(", v.expr, b"); "])),
+  )
+
+/// The one word a sum held as its cases `r` is where it is made one: an `Option`'s or a `Result`'s.
+fn sum_word(r: Rep) -> Rep =
+  match r {
+    RCases(c) -> if enumerated(r) { RWord } else if c.tagged { RTagged } else { RMaybe },
+    _ -> r,
+  }
+
+fn sum_type(r: Rep) -> Bytes = one_type(sum_word(r))
+
+/// C declaring `name` the one word of the sum held as its cases `r` that is constructor `tag` of the
+/// values `vals`, each counted one's count taken: a record argument's word where it was made, one made
+/// of its shapes otherwise, leaving by `fail` if that fails.
+fn sum_made(
+  name: Bytes,
+  r: Rep,
+  tag: Bytes,
+  vals: List<Held>,
+  shapes: List<List<Int>>,
+  fail: Bytes,
+) -> List<Piece> = {
+  let cases = match r { RCases(c) -> c.cases, _ -> [] };
+  let tagged = sum_word(r) == RTagged;
+  range(0, cases.len()).fold(
+    [Text(Bytes::concat_all([b"Word ", name, b" = 0;"]))],
+    |acc: List<Piece>, i: Int| {
+      let span = case_span(r, i);
+      let n = span.leaves.len();
+      let err = tagged && (match cases.at(i) { Some(c) -> c.name == b"Err", None -> false });
+      if n == 0 { acc } else {
+        let made = Bytes::concat_all([name, b"_", ascii_of_int(i)]);
+        let held = if n == 1 {
+          { prep: [], word: as_word(nth_held(vals, span.at).expr, nth_held(vals, span.at).rep) }
+        } else {
+          {
+            prep: word_made(
+              made,
+              nth_held(vals, span.at + n - 1).expr,
+              fields_of(span.leaves.take(n - 1)),
+              match shapes.at(i) { Some(sh) -> sh, None -> [] },
+              range(0, n - 1).map(|k: Int| nth_held(vals, span.at + k)),
+              fail,
+            ),
+            word: made,
+          }
+        };
+        acc.push(
+          Text(Bytes::concat_all([b" if (", tag, b" == ", ascii_of_int(i), b") { "])),
+        ).concat(
+          held.prep,
+        ).push(
+          Text(
+            Bytes::concat_all([
+              b" ",
+              name,
+              b" = ",
+              if err { Bytes::concat_all([b"((Word)(", held.word, b") | 4)"]) } else { held.word },
+              b"; }",
+            ]),
+          ),
+        )
+      }
+    },
+  )
+}
+
+/// C setting `tag` to the index of the constructor the one word `w` of a sum held as its cases `r` is,
+/// and its leaves among `leaves` to its argument's, which take the word's count.
+fn sum_opening(r: Rep, w: Bytes, tag: Bytes, leaves: List<Bytes>) -> Bytes = {
+  let cases = match r { RCases(c) -> c.cases, _ -> [] };
+  let tagged = sum_word(r) == RTagged;
+  Bytes::concat_all([
+    tag,
+    b" = ",
+    if tagged { Bytes::concat_all([b"((", w, b" & 7) == 4);"]) }
+    else { Bytes::concat_all([b"(", w, b" != 0);"]) },
+    Bytes::concat_all(
+      range(0, cases.len()).map(|i: Int| {
+        let span = case_span(r, i);
+        let n = span.leaves.len();
+        let arg = if tagged && (match cases.at(i) { Some(c) -> c.name == b"Err", None -> false }) {
+          Bytes::concat_all([b"(", w, b" & ~(Word)7)"])
+        } else { w };
+        let body = if n == 0 { b"" } else if n == 1 {
+          match nth_leaf(span.leaves, 0).rep {
+            RWord -> Bytes::concat_all([nth(leaves, span.at), b" = ", arg, b";"]),
+            lr ->
+              Bytes::concat_all([
+                nth(leaves, span.at),
+                b" = ",
+                word_as(arg, lr),
+                b"; ply_dec(ctx, ",
+                arg,
+                b");",
+              ]),
+          }
+        } else {
+          let loads = leaf_loads(arg, fields_of(span.leaves.take(n - 1)));
+          Bytes::concat_all([
+            Bytes::concat_all(
+              range(0, loads.len()).map(|k: Int|
+                Bytes::concat_all([
+                  nth(leaves, span.at + k),
+                  b" = ",
+                  nth_held(loads, k).expr,
+                  b"; ",
+                ])),
+            ),
+            counted_incs(
+              range(0, loads.len()).map(|k: Int|
+                { rep: nth_held(loads, k).rep, expr: nth(leaves, span.at + k) }),
+            ),
+            nth(leaves, span.at + loads.len()),
+            b" = ",
+            arg,
+            b";",
+          ])
+        };
+        if body == b"" { b"" }
+        else { Bytes::concat_all([b" if (", tag, b" == ", ascii_of_int(i), b") { ", body, b" }"]) }
+      }),
+    ),
+  ])
+}
+
+// Shapes, interned in the printing's table as today's emitter interns them.
+
+/// The place of the shape of `names` among the printing's, added where it is not there yet: two
+/// shapes of the same names in any order are one.
+fn shape_at(pr: Printing, names: List<Bytes>) -> { pr: Printing, at: Int } =
+  match range(0, pr.shapes.len()).fold(None, |acc: Option<Int>, i: Int|
+      match pr.shapes.at(i) {
+        Some(sh) -> if sh.len() == names.len() && names.all(|x: Bytes| sh.contains(x)) { Some(i) }
+        else { acc },
+        None -> acc,
+      }) {
+    Some(i) -> { pr: pr, at: i },
+    None -> { pr: { ..pr, shapes: pr.shapes.push(names) }, at: pr.shapes.len() },
+  }
+
+/// The shape of a record of `fs`, each shape it holds in place first.
+fn shape_of_fields(pr: Printing, fs: List<FieldTy>) -> { pr: Printing, at: Int } = {
+  let nested = fs.fold(pr, |q: Printing, f: FieldTy|
+    match in_place(f) { Some(inner) -> shape_at(q, inner.map(spelled_field)).pr, None -> q });
+  shape_at(nested, fs.map(spelled_field))
+}
+
+/// The shape of a record of `fs` and then of each record it holds in place.
+fn shapes_of(pr: Printing, fs: List<FieldTy>) -> { pr: Printing, shapes: List<Int> } = {
+  let own = shape_of_fields(pr, fs);
+  fs.fold(
+    { pr: own.pr, shapes: [own.at] },
+    |acc: { pr: Printing, shapes: List<Int> }, f: FieldTy|
+      match in_place(f) {
+        Some(inner) -> {
+          let s = shape_at(acc.pr, inner.map(spelled_field));
+          { pr: s.pr, shapes: acc.shapes.push(s.at) }
+        },
+        None -> acc,
+      },
+  )
+}
+
+/// No shape of its own, which a constructor's object names by its tag, and then the shape of each
+/// record it holds in place.
+fn inner_shapes(pr: Printing, fs: List<FieldTy>) -> { pr: Printing, shapes: List<Int> } =
+  fs.fold({ pr: pr, shapes: [0] }, |acc: { pr: Printing, shapes: List<Int> }, f: FieldTy|
+    match in_place(f) {
+      Some(inner) -> {
+        let s = shape_at(acc.pr, inner.map(spelled_field));
+        { pr: s.pr, shapes: acc.shapes.push(s.at) }
+      },
+      None -> acc,
+    })
+
+/// Each case's shapes of a sum held as its cases `r`, as `shapes_of` lists them for a record
+/// argument, and none for any other.
+fn case_shapes(pr: Printing, r: Rep) -> { pr: Printing, shapes: List<List<Int>> } = {
+  let n = match r { RCases(c) -> c.cases.len(), _ -> 0 };
+  range(0, n).fold(
+    { pr: pr, shapes: [] },
+    |acc: { pr: Printing, shapes: List<List<Int>> }, i: Int| {
+      let span = case_span(r, i);
+      if span.leaves.len() < 2 { { ..acc, shapes: acc.shapes.push([]) } } else {
+        let s = shapes_of(acc.pr, fields_of(span.leaves.take(span.leaves.len() - 1)));
+        { pr: s.pr, shapes: acc.shapes.push(s.shapes) }
+      }
+    },
+  )
+}
+
+fn nth(xs: List<Bytes>, k: Int) -> Bytes = match xs.at(k) { Some(x) -> x, None -> b"0" }
+
+fn nth_int(xs: List<Int>, k: Int) -> Int = match xs.at(k) { Some(x) -> x, None -> 0 }
+
+fn nth_held(xs: List<Held>, k: Int) -> Held =
+  match xs.at(k) { Some(x) -> x, None -> { rep: RWord, expr: b"0" } }
+
+fn nth_leaf(xs: List<Leaf>, k: Int) -> Leaf =
+  match xs.at(k) { Some(x) -> x, None -> { name: b"", rep: RWord } }
+
+fn nth_field(fs: List<FieldTy>, k: Int) -> FieldTy =
+  match fs.at(k) { Some(f) -> f, None -> { name: b"", kind: KBoxed, ty: TyOpen([]) } }
+
+fn joined(xs: List<Bytes>, sep: Bytes) -> Bytes =
+  range(0, xs.len()).fold(b"", |acc: Bytes, i: Int|
+    Bytes::concat_all([acc, if i == 0 { b"" } else { sep }, nth(xs, i)]))
+
+fn trimmed_end(t: Bytes) -> Bytes =
+  if t.ends_with(b" ") { match t.slice_at(0, t.len() - 1) { Some(x) -> x, None -> t } } else { t }
+
+fn point() -> Rep = RFlat([{ name: b"x", rep: RFloat }, { name: b"y", rep: RFloat }])
+
+fn place() -> Place =
+  {
+    u: {
+      symbol: b"f",
+      base: 0,
+      answer: RWord,
+      site: None,
+      arm: None,
+      looping: None,
+      landing: None,
+    },
+    at: span_between(0, 0),
+    leave: b"return 0;",
+    depth: 0,
+  }
+
+fn local(id: Int, rep: Rep) -> Var = { id: id, ty: TyCon({ name: b"T", args: [] }), rep: rep }
+
+test "a small record crosses a call as its leaves and its word, and answers its first leaf" {
+  assert_eq(c_types(point()), [b"double", b"double", b"Word"]);
+  assert_eq(parts_of(b"p0", point()), [b"p0_0", b"p0_1", b"p0_2"]);
+  assert_eq(head_types([point(), point()], point()), {
+    answer: b"double",
+    params: [b"double", b"double", b"Word", b"double", b"double", b"Word", b"double*", b"Word*"],
+  });
+  assert_eq(head_params([RInt], point()), [b"int64_t p0", b"double* o1", b"Word* o2"]);
+  let sum = RCases({
+    tagged: true,
+    cases: [
+      { name: b"Ok", leaves: [{ name: b"", rep: RInt }] },
+      { name: b"Err", leaves: [{ name: b"why", rep: RWord }, { name: b"", rep: RWord }] },
+    ],
+  });
+  assert_eq(c_types(sum), [b"int64_t", b"int64_t", b"Word", b"Word"]);
+  assert_eq(parts_of(b"t4", sum), [b"t4_0", b"t4_1", b"t4_2", b"t4_3"]);
+  assert_eq([RMaybe, RTagged, RWord, RDec].map(c_type), [
+    b"PlyMaybe",
+    b"PlyTagged",
+    b"Word",
+    b"PlyDec",
+  ])
+}
+
+test "a flat record's word is made of its leaves where none was, and its leaves loaded from a word" {
+  let p = local(0, point());
+  let w = local(1, RWord);
+  let back = local(2, point());
+  let pr = { ..printing(Map::new().insert(0, b"p0")), temps: 4 };
+  let made_word = packed(place(), pr, Some(w), { arg: AVar(p), to: RWord });
+  let text = spelled(made_word.out);
+  assert(
+    text.index_of(
+        b"Word t5 = p0_2; if (t5) { } else { t5 = rt_alloc_p(ctx, 3, 2, @@s0@@, 5); if (ctx->failed) return 0;",
+      )
+      != None,
+  );
+  assert(
+    text.index_of(
+        b" ply_words(t5)[0] = ply_f64_bits(p0_0); ply_words(t5)[1] = ply_f64_bits(p0_1); }",
+      )
+      != None,
+  );
+  assert_eq(made_word.shapes, [[b"x!f", b"y!f"]]);
+  let opened = spelled(packed(place(), made_word, Some(back), { arg: AVar(w), to: point() }).out);
+  assert(
+    opened.index_of(
+        b"double t6_0 = ply_f64(ply_words(t5)[0]);\n  double t6_1 = ply_f64(ply_words(t5)[1]);\n  Word t6_2 = t5;",
+      )
+      != None,
+  )
+}
+
+test "a sum held as one word is gathered from its constructor's index and payload" {
+  let s = local(0, RWord);
+  let pr = printing(Map::new().insert(0, b"p0"));
+  let err = spelled(gathered(place(), pr, Some(local(1, RTagged)), [AInt(1), AVar(s)]).out);
+  assert_eq(err, b"  PlyTagged t1 = ((Word)(p0) | 4);\n");
+  let some = spelled(gathered(place(), pr, Some(local(1, RMaybe)), [AInt(1), AVar(s)]).out);
+  assert_eq(some, b"  PlyMaybe t1 = p0;\n");
+  let none = spelled(gathered(place(), pr, Some(local(1, RMaybe)), [AInt(0)]).out);
+  assert_eq(none, b"  PlyMaybe t1 = 0;\n");
+  // An `Option`'s payload read as a scalar is read out of its word.
+  let m = local(0, RMaybe);
+  let read = spelled(
+    got(place(), pr, Some(local(1, RInt)), { of: m, path: PArg({ ctor: b"Some", at: 0 }) }).out,
+  );
+  assert_eq(
+    read,
+    b"  int64_t t1 = (ply_is_imm(p0) ? ply_imm_value(p0) : rt_unbox_int_p(ctx, p0));\n",
+  )
+}
+
+test "a sum whose constructors take nothing is its index, and its constructor's singleton where it leaves" {
+  let ordering = RCases({
+    tagged: false,
+    cases: [
+      { name: b"Less", leaves: [] },
+      { name: b"Equal", leaves: [] },
+      { name: b"Greater", leaves: [] },
+    ],
+  });
+  let w = local(0, RWord);
+  let i = local(1, ordering);
+  let pr = printing(Map::new().insert(0, b"p0"));
+  let opened = packed(place(), pr, Some(i), { arg: AVar(w), to: ordering });
+  assert_eq(
+    spelled(opened.out),
+    b"  int64_t t1 = (ply_obj(p0)->layout == @@TLess@@ ? 0 : (ply_obj(p0)->layout == @@TEqual@@ ? 1 : 2));\n  ply_dec(ctx, p0);\n",
+  );
+  let made_back = packed(place(), opened, Some(local(2, RWord)), { arg: AVar(i), to: RWord });
+  assert(
+    spelled(made_back.out).index_of(
+        b"  Word t2 = rt_ctor_value_p(ctx, (t1 == 0 ? @@TLess@@ : (t1 == 1 ? @@TEqual@@ : @@TGreater@@)));\n  if (ctx->failed) return 0;\n",
+      )
+      != None,
+  );
+  assert_eq(c_types(ordering), [b"int64_t"])
+}
