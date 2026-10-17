@@ -5,16 +5,16 @@ import parsing (Span)
 import std.bytes (ascii_of_int)
 import emit (Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, Const, Expect, ctype)
 import emit.keys (RootKey)
-import emit.pieces (Piece, Text, Hole, SiteRoot)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, Var, Arg, AVar, AInt, ABool, AFloat, ANum,
-                 AChar, AZero)
+import emit.pieces (Piece, Text, Hole, SiteRoot, FieldName)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RFlat, Var, Arg, AVar, AInt, ABool, AFloat,
+                 ANum, AChar, AZero, Member, parts_of)
 
 /// What every line of one function's body is printed under: the C name of the root it belongs to,
 /// which the functions of the root's closures are named after (`<symbol>_lambda<nth>`), where its
 /// definition's text starts, how it answers, which root id its failure sites name, the arm of the
 /// `Match` being printed and the `Loop` around it, each by the label number that names its C
-/// labels, and inside a `Handle`'s body the C that goes to its landing, where a failure goes instead
-/// of leaving the function.
+/// labels, inside a `Handle`'s body the C that goes to its landing, where a failure goes instead
+/// of leaving the function, and inside a member's arm of a tail group's function, that group.
 pub type Under = {
   symbol: Bytes,
   base: Int,
@@ -23,7 +23,12 @@ pub type Under = {
   arm: Option<{ label: Int, at: Int }>,
   looping: Option<{ label: Int, state: List<Var>, answer: Var }>,
   landing: Option<Bytes>,
+  group: Option<Grouped>,
 }
+
+/// Inside the arm of member `at` of a tail group's function: the group's members, and how many
+/// words, `p0..`, the function takes after `which`, the widest member's parameters.
+pub type Grouped = { at: Int, members: List<Member>, width: Int }
 
 /// Where one instruction is printed: under `u`, for the source at `at`, indented `depth`, and going
 /// on a failure by `leave`, which releases what the failure path holds and then leaves the function,
@@ -164,11 +169,52 @@ pub fn kind(r: Rep) -> Kind =
     _ -> KBoxed,
   }
 
-/// What a variable held as `r` stands at before anything is set into it.
-pub fn zero(r: Rep) -> Bytes = match r { RDec -> b"(PlyDec){0, 0}", _ -> b"0" }
+/// What a variable held as `r` stands at before anything is set into it; for a value held as several
+/// C values, the first's.
+pub fn zero(r: Rep) -> Bytes =
+  match r {
+    RDec -> b"(PlyDec){0, 0}",
+    RFlat(ls) -> match ls.at(0) { Some(l) -> zero_one(l.rep), None -> b"0" },
+    _ -> b"0",
+  }
+
+fn zero_one(r: Rep) -> Bytes = match r { RDec -> b"(PlyDec){0, 0}", _ -> b"0" }
 
 /// Leaving a function answering as `r` on a failure, holding nothing.
 pub fn failing_return(r: Rep) -> Bytes = Bytes::concat_all([b"return ", zero(r), b";"])
+
+/// The C names of the values a value named `name` held as `r` is held in, in `parts_of`' order: its
+/// own name where it is one, and `<name>_<k>` for its `k`th where it is several.
+pub fn part_names(name: Bytes, r: Rep) -> List<Bytes> = {
+  let n = parts_of(r).len();
+  if n == 1 { [name] } else { range(0, n).map(|k: Int| part_name(name, k)) }
+}
+
+/// The C name of value `k` of a value named `name` held as several.
+pub fn part_name(name: Bytes, k: Int) -> Bytes = Bytes::concat_all([name, b"_", ascii_of_int(k)])
+
+/// The place of the record shape of `names` among the printing's shapes, added where it is not
+/// there yet: two shapes of the same names in any order are one, as the unit interns them.
+pub fn shape_at(pr: Printing, names: List<Bytes>) -> { pr: Printing, at: Int } =
+  match range(0, pr.shapes.len()).fold(None, |acc: Option<Int>, i: Int|
+      match acc {
+        Some(_) -> acc,
+        None -> match pr.shapes.at(i) {
+          Some(sh) -> if sh.len() == names.len() && names.all(|x: Bytes| sh.contains(x)) { Some(i) }
+          else { None },
+          None -> None,
+        },
+      }) {
+    Some(i) -> { pr: pr, at: i },
+    None -> { pr: { ..pr, shapes: pr.shapes.push(names) }, at: pr.shapes.len() },
+  }
+
+/// The hole of `name`'s entry in the field table, added to the printing's fields where it is not
+/// there yet.
+pub fn field_hole(pr: Printing, name: Bytes) -> { pr: Printing, piece: Piece } = {
+  let f = interned(pr.fields, name);
+  { pr: { ..pr, fields: f.xs }, piece: Hole(FieldName(f.at)) }
+}
 
 /// `INT64_C(-9223372036854775808)` negates an unsigned literal, which C cannot write as a constant.
 pub fn int_lit(n: Int) -> Bytes =

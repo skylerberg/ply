@@ -5,18 +5,20 @@
 import code (Code, CodeArm, Capture)
 import types (Type, named_type)
 import typing (unknown_type)
-import parsing (Span, span_key)
-import emit (EmitParam, Carrier, Need)
+import parsing (Span, span_key, dummy_span)
+import emit (EmitParam, Carrier, Need, builtin_helper)
 import emit.keys (RootKey, Named)
 import emit.tir (Rep, RInt, RBool, RNum, Var, Arg, AVar, AInt, ABool, AFloat, ANum, AChar, AZero,
-                 Val, Pack, Inst, Let, Do, Decl, Assign, If, Block, Lambda, Links, Declined, Family,
-                 rep_of_arg, falls_through)
+                 Val, Pack, Native, Inst, Let, Do, Decl, Assign, If, Block, Lambda, Links, Declined,
+                 Family, RWord, RMaybe, rep_of_arg, falls_through, counted)
 import emit.lower.setting (Setting, Root)
 import emit.lower.held (held_as)
 
 /// What a root's body is lowered under: the module's setting, the root's key and full name, where
 /// its definition's text starts, its parameters as the emitter holds them and their types, how its
-/// answer crosses a call and its type, the body itself, and where a call in tail position goes.
+/// answer crosses a call and its type, the body itself, where a call in tail position goes, and
+/// each parameter's place among them by its variable's id (`i` for `i` in a root of its own; a tail
+/// group's member's variables are numbered apart from the other members').
 pub type Context = {
   setting: Setting,
   key: RootKey,
@@ -28,6 +30,7 @@ pub type Context = {
   answer_ty: Type,
   body: Code,
   tails: Tails,
+  param_at: Map<Int, Int>,
 }
 
 /// Where a call in tail position goes without a call of its own: to the root's start where it calls
@@ -48,6 +51,7 @@ pub fn context_of(setting: Setting, r: Root, body: Code) -> Context =
     answer_ty: r.answer_ty,
     body: body,
     tails: Restarts,
+    param_at: range(0, r.params.len()).fold(Map::new(), |m: Map<Int, Int>, i: Int| m.insert(i, i)),
   }
 
 /// A body lowered so far: the next variable's number, what each slot holds, the block being
@@ -199,18 +203,53 @@ fn digits(n: Int) -> Bytes =
   else if n == 64 { b"64" }
   else { b"128" }
 
-/// `l`'s value held as `to`: a constant written as one of its kind, a variable held otherwise packed.
+/// `l`'s value held as `to`: an integer constant written as the width it is handed as, a zero of a
+/// representation holding no count as `to`'s where `to` holds none either (the zero of each is the
+/// number zero), and anything else packed, a sum's zero among them (an `Option`'s is `None`).
 pub fn handed(l: Lowered, to: Rep, at: Span) -> Lowered =
   if rep_of_arg(l.arg) == to { l } else {
+    let packed = bound_as(l.st, type_of(l.arg), to, Pack({ arg: l.arg, to: to }), at);
     match l.arg {
       AInt(n) -> match to {
         RNum(w) -> { st: l.st, arg: ANum({ width: w, bits: n }) },
-        _ -> bound_as(l.st, type_of(l.arg), to, Pack({ arg: l.arg, to: to }), at),
+        _ -> packed,
       },
-      AZero(_) -> { st: l.st, arg: AZero(to) },
-      _ -> bound_as(l.st, type_of(l.arg), to, Pack({ arg: l.arg, to: to }), at),
+      AZero(r) -> if !counted(r) && !counted(to) { { st: l.st, arg: AZero(to) } } else { packed },
+      _ -> packed,
     }
   }
+
+/// Builtin `name`'s runtime helper called on `args`, each handed over as a word the helper takes,
+/// its answer a word with a count of its own, held as a value of `ty` is.
+pub fn through_runtime(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  ty: Type,
+  at: Span,
+) -> Lowered / {abort.raise} = {
+  let words = as_words(st, args, at);
+  let answer = bound_as(
+    words.st,
+    ty,
+    RWord,
+    Native({
+      name: builtin_helper(name).concat(b"_p"),
+      args: words.args,
+      uses: { takes: args.map(|_: Arg| true), owned: true, fails: true, stops: false },
+    }),
+    at,
+  );
+  handed(answer, held_as(cx.setting, ty), at)
+}
+
+/// `args` each handed over as a word.
+pub fn as_words(st: Lowering, args: List<Arg>, at: Span) -> { st: Lowering, args: List<Arg> } =
+  args.fold({ st: st, args: [] }, |acc: { st: Lowering, args: List<Arg> }, a: Arg| {
+    let h = handed({ st: acc.st, arg: a }, RWord, at);
+    { st: h.st, args: acc.args.push(h.arg) }
+  })
 
 /// The type a join of `arms` holds: the first arm's that falls through holding a variable, then the
 /// first's that falls through, then the root's answer's.
@@ -266,4 +305,19 @@ pub fn short_circuit(cx: Context, l: Lowered, r: Lowered, both: Bool, at: Span) 
     },
     arg: AVar(j.var),
   }
+}
+
+test "a zero is handed as another representation's zero only where neither holds a count" {
+  let st = started([]);
+  let byte = RNum({ bits: 8, signed: false });
+  assert_eq(handed({ st: st, arg: AZero(RInt) }, byte, dummy_span()).arg, AZero(byte));
+  // `None` held as an `Option`'s word is no zero word: it is packed.
+  assert_eq(
+    match handed({ st: st, arg: AZero(RMaybe) }, RWord, dummy_span()).st.insts {
+      [Let(x)] -> Some(x.val),
+      _ -> None,
+    },
+    Some(Pack({ arg: AZero(RMaybe), to: RWord })),
+  );
+  assert_eq(handed({ st: st, arg: AZero(RWord) }, RInt, dummy_span()).st.insts.len(), 1)
 }

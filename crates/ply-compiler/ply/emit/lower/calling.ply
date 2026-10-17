@@ -19,10 +19,10 @@ import emit.keys (Named, At, KeyArg, KeyType, KeyLayout, Callee, Root, Generic, 
 import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, Var, Arg, AVar, AInt, AZero, Given,
                  Convention, Val, Prim, Make, Get, Pack, Native, Op, OCalling, MClosure, MCtor,
                  PCapture, TTag, TInt, Call, Apply, Inst, Let, Do, Decl, Assign, If, Case, Loop,
-                 Next, Done, Restart, Enter, Return, Fail, Block, Fn, Rooted, Member, Closure,
-                 Declined, Calling, no_links, falls_through, rep_of_arg)
+                 Next, Done, Restart, Enter, Return, Fail, NoArm, Block, Fn, Rooted, Member,
+                 Closure, Declined, Calling, no_links, falls_through, rep_of_arg)
 import emit.tir.calling (EntryValue, ConstantRead, BuiltinValue, Ticked)
-import emit.lower.setting (carrier_of)
+import emit.lower.setting (carrier_of, imported_target, qualified)
 import emit.lower.held (held_as, carried_as, arg_path)
 import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
                         ToInPlace, Frame, Opened, GroupMember, Restarts, Enters, Calls, refuse,
@@ -60,7 +60,7 @@ pub fn target(cx: Context, func: Code, args: List<Code>) -> Option<Target> / {ab
 /// A name no slot holds read as a value: a constructor, the unit's closure over a definition's
 /// entry, or a builtin's value.
 pub fn global(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered / {abort.raise} =
-  if is_ctor_name(name) { constructed(cx, st, name, [], at) } else {
+  if is_ctor_name(name) { constructed(cx, st, name, [], at, at) } else {
     match def_named(cx, name) {
       Some(d) -> {
         let n = named_ref(cx, st, d, at, []);
@@ -523,13 +523,13 @@ fn tested(cx: Context, b: Block, v: Arg, e: Ended) -> Pass =
               { when: 0, body: go.block.push(Next([go.arg, AVar(e.left)])) },
               { when: 1, body: stop.block.push(Done(stop.arg)) },
             ],
-            rest: [Fail(b"a step that answers no `Iter`")],
+            rest: [Fail({ why: NoArm, at: e.at })],
           }),
         ),
         next: stop.next,
       }
     },
-    _ -> { block: b.push(Fail(b"a step that answers no `Iter`")), next: e.next },
+    _ -> { block: b.push(Fail({ why: NoArm, at: e.at })), next: e.next },
   }
 
 /// The argument of constructor `ctor` the `Iter` `x` holds, read as `into` holds it.
@@ -592,7 +592,15 @@ pub fn lambda_opened(cx: Context, st: Lowering, frame: Frame, at: Span) -> Opene
         },
     );
     {
-      cx: { ..cx, tails: Calls, params: [], types: [], answer: s.answer, answer_ty: s.ret },
+      cx: {
+        ..cx,
+        tails: Calls,
+        params: [],
+        types: [],
+        answer: s.answer,
+        answer_ty: s.ret,
+        param_at: Map::new(),
+      },
       st: {
         ..caps,
         env: range(0, s.own).fold(caps.env, |m: Map<Int, Arg>, j: Int|
@@ -670,7 +678,12 @@ pub fn group_opened(members: List<GroupMember>) -> List<Opened> = {
       Some(m) -> {
         let own = match params.at(i) { Some(ps) -> ps, None -> [] };
         acc.push({
-          cx: { ..m.cx, tails: Enters(fulls) },
+          cx: {
+            ..m.cx,
+            tails: Enters(fulls),
+            param_at: range(0, own.len()).fold(Map::new(), |pa: Map<Int, Int>, j: Int|
+              match own.at(j) { Some(v) -> pa.insert(v.id, j), None -> pa }),
+          },
           st: {
             ..started([]),
             next: after,
@@ -727,7 +740,7 @@ pub fn grouped(members: List<GroupMember>, bodies: List<Lowered>) -> Result<Fn, 
               on: which,
               test: TInt(range(0, members.len())),
               arms: arms.arms,
-              rest: [Fail(b"a tail group's member out of range")],
+              rest: [Return(AZero(RWord))],
             }),
           ],
           lambdas: last.lambdas,
@@ -1146,15 +1159,18 @@ fn passed(
         Some(c) -> match c.node {
           NVar(v) -> if v.slot == None { acc } else {
             match args.at(i) {
-              Some(AVar(p)) -> if p.id < cx.params.len() && may_be_called(cx, p.id) {
-                {
-                  ..acc,
-                  links: {
-                    ..acc.links,
-                    passes: acc.links.passes.push({ param: p.id, callee: callee, at: i }),
-                  },
-                }
-              } else { acc },
+              Some(AVar(p)) -> match cx.param_at.get(p.id) {
+                Some(j) -> if may_be_called(cx, j) {
+                  {
+                    ..acc,
+                    links: {
+                      ..acc.links,
+                      passes: acc.links.passes.push({ param: j, callee: callee, at: i }),
+                    },
+                  }
+                } else { acc },
+                None -> acc,
+              },
               _ -> acc,
             }
           },
@@ -1167,9 +1183,11 @@ fn passed(
 /// `st` noting that the body calls parameter `f` is, where it is one of the root's.
 fn param_called(cx: Context, st: Lowering, f: Arg) -> Lowering =
   match f {
-    AVar(p) -> if cx.tails == Calls || p.id >= cx.params.len() || st.links.called.contains(p.id) {
-      st
-    } else { { ..st, links: { ..st.links, called: st.links.called.push(p.id) } } },
+    AVar(p) -> match cx.param_at.get(p.id) {
+      Some(j) -> if cx.tails == Calls || st.links.called.contains(j) { st }
+      else { { ..st, links: { ..st.links, called: st.links.called.push(j) } } },
+      None -> st,
+    },
     _ -> st,
   }
 
@@ -1623,43 +1641,6 @@ fn substituted_fully(ty: Type, args: List<Type>) -> Type =
         fields: x.fields.map(|f: Field| { ..f, ty: substituted_fully(f.ty, args) }),
       }),
   }
-
-fn imported_target(imports: List<Imported>, name: Bytes) -> Option<{ imp: Imported, name: Bytes }> =
-  match match qualified(name) {
-      Some(q) -> match module_import(imports, q.binder) {
-        Some(imp) -> Some({ imp: imp, name: q.name }),
-        None -> None,
-      },
-      None -> match from_import(imports, name) {
-        Some(imp) -> Some({ imp: imp, name: name }),
-        None -> None,
-      },
-    } {
-    Some(t) -> Some(t),
-    None -> match module_import(imports, prelude_binder()) {
-      Some(imp) -> if imp.defs.fold(false, |found: Bool, d: Def| found || d.name == name) {
-        Some({ imp: imp, name: name })
-      } else { None },
-      None -> None,
-    },
-  }
-
-fn qualified(name: Bytes) -> Option<{ binder: Bytes, name: Bytes }> =
-  range(0, name.len() - 1).fold(None, |acc: Option<{ binder: Bytes, name: Bytes }>, i: Int|
-    match acc {
-      Some(_) -> acc,
-      None -> if name.at(i) == 58 && name.at(i + 1) == 58 {
-        Some({ binder: name.slice(0, i), name: name.slice(i + 2, name.len()) })
-      } else { None },
-    })
-
-fn from_import(xs: List<Imported>, name: Bytes) -> Option<Imported> =
-  xs.fold(None, |acc: Option<Imported>, i: Imported|
-    if !i.whole && i.name == name { Some(i) } else { acc })
-
-fn module_import(xs: List<Imported>, binder: Bytes) -> Option<Imported> =
-  xs.fold(None, |acc: Option<Imported>, i: Imported|
-    if i.whole && i.name == binder { Some(i) } else { acc })
 
 fn is_ctor_name(name: Bytes) -> Bool / {abort.raise} =
   name.index_of(b"#") == None
