@@ -1,8 +1,8 @@
 //! A program's text lowered, checked and printed through the typed form as the emitter would hand
 //! it each root, and the C the form prints held to today's emitter's, read past what two printers
 //! may differ in without computing anything differently: a local copied from another local or a
-//! constant, the dead store after a restart's `goto`, how temporaries are numbered, and, where
-//! asked, the counts each takes and lets go.
+//! constant, the dead store after a restart's `goto`, how temporaries and the entries of the unit's
+//! tables are numbered, and, where asked, the counts each takes and lets go.
 
 import diagnostics (parse_all)
 import front (Analysed, Refused, Analysis, analyse, dump_of)
@@ -11,12 +11,12 @@ import resolve (Diag, qualify)
 import types (TyCon)
 import std.bytes (ascii_of_int)
 import emit (emit_roots_answer, ctor_layouts, ctor_sums, RootAnswer, Body, symbol_of)
-import emit.keys (Named)
 import emit.pieces (spelled)
 import emit.tir (Rep, Var, Arg, AVar, ABool, RInt, RBool, Inst, Decl, Assign, If, Return, Restart,
                  Fn, Declined, Family, Spine, Data, Calling, Matching, Handling, Scalars,
                  Containers)
 import emit.lower (lowered_fn)
+import emit.lower.base (context_of)
 import emit.lower.setting (Setting, Root, setting_in)
 import emit.print (printed_fn)
 import emit.verify (verified)
@@ -42,21 +42,7 @@ pub fn formed(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.raise} =
     None -> Err({ by: Spine, why: b"no such definition" }),
     Some(r) -> match r.code {
       None -> Err({ by: Spine, why: b"a body that does not lower to Code" }),
-      Some(code) ->
-        lowered_fn(
-          {
-            setting: p.setting,
-            key: Named(r.full),
-            full: r.full,
-            base: r.base,
-            params: r.params,
-            types: r.types,
-            answer: r.answer,
-            answer_ty: r.answer_ty,
-            body: code,
-          },
-          code,
-        ),
+      Some(code) -> lowered_fn(context_of(p.setting, r, code), code),
     },
   }
 
@@ -99,8 +85,10 @@ pub fn today_text(answers: List<RootAnswer>, name: Bytes) -> Bytes =
 
 /// `text` as a list of lines, read past what two printers may write differently for one
 /// computation: a local declared from another local or a literal and never assigned again is read
-/// as what it copies; lines after a restart's `goto` in its block are dropped; and the temporaries
-/// `t<n>` are renumbered in the order they first appear.
+/// as what it copies; lines after a restart's `goto` in its block are dropped; the temporaries
+/// `t<n>` are renumbered in the order they first appear; and so are the holes of each of the unit's
+/// tables (`@@c<n>@@`, `@@l<n>@@`, `@@b<n>@@`, `@@f<n>@@`, `@@s<n>@@`, `@@g<n>@@`), each table
+/// apart, since a printer fills a table in the order it prints. What a hole names is not compared.
 pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} = {
   let lines = text.split(b"\n");
   let assigned = lines.fold(Map::new(), |m: Map<Bytes, Int>, l: Bytes| {
@@ -142,8 +130,45 @@ pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} = {
     idents(l).fold(m, |n: Map<Bytes, Bytes>, w: Bytes|
       if temp_name(w) && !n.contains(w) { n.insert(w, b"t".concat(ascii_of_int(n.len() + 1))) }
       else { n }));
-  live.out.map(|l: Bytes| renamed(l, numbering))
+  let holes = live.out.fold(Map::new(), |m: Map<Bytes, Bytes>, l: Bytes| {
+    let ws = words(l);
+    range(0, ws.len()).fold(m, |n: Map<Bytes, Bytes>, i: Int|
+      match ws.at(i) {
+        Some(w) -> if !table_hole(ws, i) || n.contains(w.text) { n } else {
+          let table = w.text.slice(0, 1);
+          n.insert(
+            w.text,
+            table.concat(ascii_of_int(n.keys().filter(|k: Bytes| k.slice(0, 1) == table).len())),
+          )
+        },
+        None -> n,
+      })
+  });
+  live.out.map(|l: Bytes| renumbered(renamed(l, numbering), holes))
 }
+
+/// `l` with each table's hole `holes` holds written as what it holds.
+fn renumbered(l: Bytes, holes: Map<Bytes, Bytes>) -> Bytes / {abort.raise} = {
+  let ws = words(l);
+  Bytes::concat_all(
+    range(0, ws.len()).map(|i: Int| {
+      let w = ws.get(i);
+      if table_hole(ws, i) { match holes.get(w.text) { Some(n) -> n, None -> w.text } }
+      else { w.text }
+    }),
+  )
+}
+
+/// Whether word `i` of `ws` is a hole of one of the unit's tables: a table's letter and a number
+/// between `@@`s.
+fn table_hole(ws: List<{ text: Bytes, ident: Bool }>, i: Int) -> Bool / {abort.raise} =
+  i >= 2
+    && (match ws.at(i) {
+      Some(w) -> w.ident && [108, 99, 98, 102, 115, 103].any(|t: Int| digits_after(w.text, t)),
+      None -> false,
+    })
+    && [i - 2, i - 1, i + 1, i + 2].all(|k: Int|
+      match ws.at(k) { Some(x) -> x.text == b"@", None -> false })
 
 /// `lines` without a line that only takes or lets go of a count, for holding two printers whose
 /// counts differ by design to each other.
@@ -354,6 +379,24 @@ test "two printers' copies, dead stores after a restart, numbering and counts ar
     ]),
     [b"  Word t1 = f(ctx, p0);", b"  ply_dec(ctx, p0); return 0;"],
   )
+}
+
+test "each table's holes are numbered apart in the order they first appear" {
+  let form = Bytes::concat_all([
+    b"  Word t1 = rt_lit_p(ctx, @@c2@@);\n",
+    b"  Word t2 = rt_closure_p(ctx, @@l1@@, 1, (Word)(intptr_t)t1, 2);\n",
+    b"  Word t3 = rt_lit_p(ctx, @@c0@@);",
+  ]);
+  let today = Bytes::concat_all([
+    b"  Word t1 = rt_lit_p(ctx, @@c0@@);\n",
+    b"  Word t2 = rt_closure_p(ctx, @@l0@@, 1, (Word)(intptr_t)t1, 2);\n",
+    b"  Word t3 = rt_lit_p(ctx, @@c1@@);",
+  ]);
+  assert_eq(normalised(form), normalised(today));
+  // One entry read twice stays one, and holes that name no table stay as written.
+  assert_eq(normalised(b"  PLY_SITE(ctx, @@r@@, 3, 9); f(@@c3@@, @@c3@@, @@Tm.Box@@, @@b4@@);"), [
+    b"  PLY_SITE(ctx, @@r@@, 3, 9); f(@@c0@@, @@c0@@, @@Tm.Box@@, @@b0@@);",
+  ])
 }
 
 /// The body of root `m.<name>` of `src`'s form, or why it was not formed.
