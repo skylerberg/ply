@@ -4,13 +4,13 @@
 //! into it with a value held as the join is, and each operand is held as its operation takes it.
 //! A body that breaks one is refused, which fails a build.
 
-import emit.tir (Rep, RWord, RInt, RBool, RFlat, RCases, RToken, Leaf, Var, Arg, AVar, AInt, ABool,
-                 Val, Call, Apply, Make, Pack, Gathered, Native, Op, Get, Static, Prim, PLeaf,
-                 PField, MRecord, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next,
-                 Done, Return, Restart, Enter, Fail, NoArm, Handle, Inc, Dec, Reset, Free, Opened,
-                 Block, Fn, Rooted, Lambda, Closure, Handed, Given, Lent, Convention, Answered,
-                 Owns, ReadsOf, Lasts, no_links, counted, operands, answered, fails, used_as,
-                 rep_of_arg, var_of, parts_of)
+import emit.tir (Rep, RWord, RInt, RBool, RMaybe, RTagged, RFlat, RCases, RToken, Leaf, Var, Arg,
+                 AVar, AInt, ABool, Val, Call, Apply, Make, Pack, Gathered, Native, Op, Get, Static,
+                 Prim, PLeaf, PField, PArg, Made, MRecord, MCtor, MClosure, Inst, Let, Do, Decl,
+                 Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter, Fail,
+                 NoArm, Handle, Inc, Dec, Reset, Free, Opened, Block, Fn, Rooted, Lambda, Closure,
+                 Handed, Given, Lent, Convention, Answered, Owns, ReadsOf, Lasts, no_links, counted,
+                 operands, answered, fails, used_as, rep_of_arg, var_of, parts_of, Test, TTag)
 import emit.keys (Named, Root)
 import types (TyCon)
 import parsing (dummy_span)
@@ -18,14 +18,15 @@ import std.bytes (ascii_of_int)
 
 /// What a path holds: the counts of each owned variable, the variable each borrowed one was read out
 /// of (`-1` for a constant or a lent parameter, which outlast the body), each join declared on it
-/// and whether it was set, the words of each value opened, and the word each read of an opened
-/// value's counted leaf is.
+/// and whether it was set, the words of each value opened, the word each read of an opened
+/// value's counted leaf is, and the captures of each closure laid on this frame's stack.
 type Holding = {
   owned: Map<Int, Int>,
   borrowed: Map<Int, Int>,
   joins: Map<Int, Bool>,
   opened: Map<Int, List<Var>>,
   alias: Map<Int, Var>,
+  stacks: Map<Int, List<Var>>,
 }
 
 /// A walk so far: what the path holds, the first fault found, whether control reaches here, what
@@ -111,6 +112,7 @@ fn holding_params(params: List<Var>, conv: Convention) -> Holding =
       joins: Map::new(),
       opened: Map::new(),
       alias: Map::new(),
+      stacks: Map::new(),
     },
     |h: Holding, i: Int|
       match params.at(i) {
@@ -157,20 +159,52 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
           Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
           None -> match word_read(acc, l.var, l.val) {
             Some(w) -> w,
-            None -> match held_otherwise(l.var, l.val) {
-              Some(why) -> faulted(acc, why, l.var),
-              None ->
-                result(
-                  failing(cx, used(acc, operands(l.val)), l.val, l.unwind),
-                  l.var,
-                  answered(l.val),
+            None -> match escaping(acc.h, l.val) {
+              Some(c) ->
+                faulted(
+                  acc,
+                  b"a closure on this frame's stack handed beyond the call it is lent to: v",
+                  c,
                 ),
+              None -> match stacked_captures(l.val) {
+                Some(caps) -> {
+                  let read = failing(cx, caps.fold(acc, held), l.val, l.unwind);
+                  {
+                    ..read,
+                    h: {
+                      ..read.h,
+                      stacks: read.h.stacks.insert(
+                        l.var.id,
+                        caps.fold([], |vs: List<Var>, a: Arg|
+                          match var_of(a) {
+                            Some(v) -> if counted(v.rep) { vs.push(v) } else { vs },
+                            None -> vs,
+                          }),
+                      ),
+                    },
+                  }
+                },
+                None -> match held_otherwise(l.var, l.val) {
+                  Some(why) -> faulted(acc, why, l.var),
+                  None ->
+                    result(
+                      failing(cx, used(acc, operands(l.val)), l.val, l.unwind),
+                      l.var,
+                      answered(l.val),
+                    ),
+                },
+              },
             },
           },
         },
         Do(d) -> match token_in(read_args(d.val)) {
           Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
-          None -> if answers_count(d.val) {
+          None -> if escaping(acc.h, d.val) != None {
+            {
+              ..acc,
+              fault: Some(b"a closure on this frame's stack handed beyond the call it is lent to"),
+            }
+          } else if answers_count(d.val) {
             { ..acc, fault: Some(b"a value whose count nothing holds") }
           } else { failing(cx, used(acc, operands(d.val)), d.val, d.unwind) },
         },
@@ -197,7 +231,9 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
           let read = held(acc, x.cond);
           joined(read, walked(f, cx, read, x.then), walked(f, cx, read, x.otherwise))
         },
-        Case(c) -> {
+        Case(c) -> if !names_each(c.test, c.arms.map(|a: { when: Int, body: Block }| a.when)) {
+          faulted(acc, b"a case arm for a constructor its test does not name: v", c.on)
+        } else {
           let read = read_of(acc, c.on);
           c.arms.fold(walked(f, cx, read, c.rest), |j: Walk, a: { when: Int, body: Block }|
             joined(read, j, walked(f, cx, read, a.body)))
@@ -370,10 +406,8 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
         else {
           let read = read_of(acc, n.var);
           if read.fault != None { read } else {
-            {
-              ..read,
-              h: { ..read.h, owned: read.h.owned.insert(n.var.id, count(read.h, n.var) + n.n) },
-            }
+            resolved(read.h, n.var).fold(read, |x: Walk, t: Var|
+              { ..x, h: { ..x.h, owned: x.h.owned.insert(t.id, count(x.h, t) + n.n) } })
           }
         },
         Dec(v) -> if !counted(v.rep) {
@@ -452,7 +486,9 @@ fn taken(w: Walk, a: Arg) -> Walk = match a { AVar(v) -> consumed(w, v), _ -> w 
 fn passed(w: Walk, a: Arg) -> Walk =
   match a {
     AVar(v) -> if is_token(v) { faulted(w, b"a reuse token read as a value: v", v) }
-    else { consumed(w, v) },
+    else if w.h.stacks.contains(v.id) {
+      faulted(w, b"a closure on this frame's stack handed beyond the call it is lent to: v", v)
+    } else { consumed(w, v) },
     _ -> w,
   }
 
@@ -477,7 +513,15 @@ fn held(w: Walk, a: Arg) -> Walk = match a { AVar(v) -> read_of(w, v), _ -> w }
 fn word_read(w: Walk, y: Var, val: Val) -> Option<Walk> =
   match val {
     Get(g) -> match w.h.opened.get(g.of.id) {
-      None -> None,
+      None -> match payload_of(val, y) {
+        None -> None,
+        Some(x) -> {
+          let whole = match w.h.alias.get(x.id) { Some(t) -> t, None -> x };
+          let r = read_of(w, whole);
+          Some(if r.fault != None { r }
+          else { { ..r, h: { ..r.h, alias: r.h.alias.insert(y.id, whole) } } })
+        },
+      },
       Some(ws) ->
         Some(match g.path {
           PLeaf(k) -> match ws.at(k) {
@@ -496,6 +540,27 @@ fn word_read(w: Walk, y: Var, val: Val) -> Option<Walk> =
     _ -> None,
   }
 
+/// The sum `y` is the payload of where `val` reads it: a constructor's argument read out of an
+/// `Option` or a `Result` held as one word is that word, so it holds the sum's count.
+pub fn payload_of(val: Val, y: Var) -> Option<Var> =
+  match val {
+    Get(g) -> match g.path {
+      PArg(_) -> if sum_word(g.of.rep) && (y.rep == RWord || sum_word(y.rep)) { Some(g.of) }
+      else { None },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+fn sum_word(r: Rep) -> Bool = match r { RMaybe -> true, RTagged -> true, _ -> false }
+
+fn made_width(m: Made) -> Int = match m { MRecord(r) -> r.width, MCtor(c) -> c.width, _ -> 0 }
+
+/// Whether each arm's `when` is a constructor `tested` names, where it tests a tag: the arm then knows
+/// its subject holds that constructor, which decides whose cells it may reuse.
+fn names_each(tested: Test, whens: List<Int>) -> Bool =
+  match tested { TTag(names) -> whens.all(|w: Int| w >= 0 && w < names.len()), _ -> true }
+
 /// Whether a value held as `r` is held only by this body: a flat value or a sum's parts, each a
 /// local of its own.
 fn held_here(r: Rep) -> Bool = match r { RFlat(_) -> true, RCases(_) -> true, _ -> false }
@@ -503,16 +568,51 @@ fn held_here(r: Rep) -> Bool = match r { RFlat(_) -> true, RCases(_) -> true, _ 
 /// What a use of `v` uses: an opened value's counted words, a word's alias that word, any other
 /// variable itself.
 fn resolved(h: Holding, v: Var) -> List<Var> =
+  match h.stacks.get(v.id) {
+    Some(caps) -> caps.fold([], |acc: List<Var>, c: Var| acc.concat(word_of(h, c))),
+    None -> word_of(h, v),
+  }
+
+fn word_of(h: Holding, v: Var) -> List<Var> =
   match h.opened.get(v.id) {
     Some(ws) -> ws.filter(|x: Var| counted(x.rep)),
     None -> match h.alias.get(v.id) { Some(x) -> [x], None -> [v] },
   }
 
-/// One count of `v` consumed, of each word where it was opened.
-fn consumed(w: Walk, v: Var) -> Walk = resolved(w.h, v).fold(w, consumed_one)
+/// One count of `v` consumed, of each word where it was opened; a closure on this frame's stack
+/// holds no count, so handing it to a call only reads its captures.
+fn consumed(w: Walk, v: Var) -> Walk =
+  if w.h.stacks.contains(v.id) { read_of(w, v) } else { resolved(w.h, v).fold(w, consumed_one) }
 
-/// `v` read, each word where it was opened.
+/// `v` read, each word where it was opened, each capture where it is a closure on this frame's stack.
 fn read_of(w: Walk, v: Var) -> Walk = resolved(w.h, v).fold(w, read_one)
+
+/// A closure on this frame's stack `val` keeps beyond itself: one any value but a call takes.
+fn escaping(h: Holding, val: Val) -> Option<Var> =
+  match val {
+    Call(_) -> None,
+    Apply(_) -> None,
+    _ ->
+      operands(val).fold(None, |found: Option<Var>, o: { arg: Arg, takes: Bool }|
+        match found {
+          Some(_) -> found,
+          None -> match var_of(o.arg) {
+            Some(v) -> if o.takes && h.stacks.contains(v.id) { Some(v) } else { None },
+            None -> None,
+          },
+        }),
+  }
+
+/// What a `Make` laid on this frame's stack captures: a closure lent to the call it is made for,
+/// which holds no count of its captures and lives no longer than the frame.
+pub fn stacked_captures(val: Val) -> Option<List<Arg>> =
+  match val {
+    Make(m) -> match m.made {
+      MClosure(c) -> if c.stacked { Some(m.args) } else { None },
+      _ -> None,
+    },
+    _ -> None,
+  }
 
 /// One count of `v` consumed: it must hold one of its own.
 fn consumed_one(w: Walk, v: Var) -> Walk =
@@ -604,7 +704,9 @@ fn held_otherwise(v: Var, val: Val) -> Option<Bytes> =
     else { None },
     Make(m) -> match m.reuse {
       Some(t) -> if !is_token(t) { Some(b"a value made in cells no reset kept: v") }
-      else if m.kept.any(|k: Int| k < 0 || k >= m.args.len()) {
+      else if t.rep != RToken(made_width(m.made)) || made_width(m.made) == 0 {
+        Some(b"a value made in cells of another size: v")
+      } else if m.kept.any(|k: Int| k < 0 || k >= m.args.len()) {
         Some(b"a value made keeping a field it does not have: v")
       } else { None },
       None -> if m.kept.len() > 0 { Some(b"a value made afresh keeping fields: v") } else { None },
@@ -1022,6 +1124,18 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
   assert_eq(
     verified(root_of([r, v], [], RWord, [Dec(r), bind(n, made(None, [0]), []), Return(AVar(n))])),
     Some(b"a value made afresh keeping fields: v2"),
+  );
+  // Cells kept for a block of two words made into a block of one.
+  let wide = { ..token, rep: RToken(2) };
+  assert_eq(
+    verified(
+      root_of([r, v], [], RWord, [
+        Reset({ token: wide, of: r }),
+        bind(n, made(Some(wide), []), []),
+        Return(AVar(n)),
+      ]),
+    ),
+    Some(b"a value made in cells of another size: v2"),
   )
 }
 
@@ -1072,6 +1186,21 @@ test "an opened value is its parts, each word counted on its own and read only b
     verified(root_of([w0], [], RWord, [Opened({ of: w0, words: [w2] }), Return(AVar(w2))])),
     Some(b"a value opened that is not held only here: v1"),
   )
+}
+
+test "a case arm on a constructor is one its test names" {
+  let p = word(0);
+  let cased = |when: Int|
+    root_of([p], [], RWord, [
+      Case({
+        on: p,
+        test: TTag([b"A", b"B"]),
+        arms: [{ when: when, body: [Return(AVar(p))] }],
+        rest: [Return(AVar(p))],
+      }),
+    ]);
+  assert_eq(verified(cased(1)), None);
+  assert_eq(verified(cased(2)), Some(b"a case arm for a constructor its test does not name: v0"))
 }
 
 test "an operand is held as its operation takes it, and a counted answer is held by a variable" {

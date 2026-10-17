@@ -18,14 +18,14 @@ import types (Type, TyCon)
 import typing (unknown_type)
 import parsing (dummy_span)
 import emit.keys (Named, Root)
-import emit.tir (Rep, RWord, RInt, RBool, RFlat, RCases, RToken, Var, Arg, AVar, AInt, ABool, Val,
-                 Prim, Make, Get, Call, Apply, Native, Gathered, Path, PField, PArg, PLeaf, Made,
-                 MRecord, MCtor, MList, TInt, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss,
-                 Loop, Next, Done, Return, Restart, Enter, Fail, NoArm, Handle, Inc, Dec, Reset,
-                 Free, Opened, Block, Fn, Member, Convention, Rooted, Lambda, Closure, Given, Lent,
-                 Test, TTag, Owns, ReadsOf, Lasts, no_links, counted, operands, answered, fails,
-                 used_as, var_of, rep_of_arg, parts_of)
-import emit.verify (verified)
+import emit.tir (Rep, RWord, RInt, RBool, RMaybe, RFlat, RCases, RToken, Var, Arg, AVar, AInt,
+                 ABool, AZero, Val, Prim, Make, Get, Call, Apply, Native, Gathered, Path, PField,
+                 PArg, PLeaf, Made, MRecord, MCtor, MList, MClosure, TInt, Inst, Let, Do, Decl,
+                 Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter, Fail,
+                 NoArm, Handle, Inc, Dec, Reset, Free, Opened, Block, Fn, Member, Convention,
+                 Rooted, Lambda, Closure, Given, Lent, Test, TTag, Owns, ReadsOf, Lasts, no_links,
+                 counted, operands, answered, fails, used_as, var_of, rep_of_arg, parts_of)
+import emit.verify (verified, stacked_captures, payload_of)
 
 /// How a counted variable is held: a count of its own, or read out of variable `base` without one
 /// (`-1` where nothing the body lets go of holds it: a constant, a lent parameter).
@@ -36,7 +36,9 @@ type Held = | Own | ReadOf(Int)
 /// out of another was read out of directly, which hold a count made where they are bound (a `Let`
 /// of an owned answer, a given parameter), and the first free number. A flat value made or handed
 /// in so is `opened` into words where it is bound, each part a variable counted on its own, and a
-/// `Get` of one of its counted leaves is an `alias` of that word.
+/// `Get` of one of its counted leaves is an `alias` of that word, as a payload read out of a sum
+/// held as one word is of that sum. A closure laid on this frame's
+/// stack `stacks` its captures: it holds no count of them, so a use of it reads each.
 type Facts = {
   held: Map<Int, Held>,
   vars: Map<Int, Var>,
@@ -46,6 +48,7 @@ type Facts = {
   next: Int,
   opened: Map<Int, List<Var>>,
   alias: Map<Int, Var>,
+  stacks: Map<Int, List<Var>>,
 }
 
 /// The counted variables live at a point, by number: each is read, consumed or let go of on some
@@ -140,6 +143,7 @@ fn facts_of(f: Fn) -> Facts = {
     next: 0,
     opened: Map::new(),
     alias: Map::new(),
+    stacks: Map::new(),
   };
   let first = gathered(params_defined(f, empty), f.body);
   let words = first.made.fold(
@@ -164,21 +168,30 @@ fn facts_of(f: Fn) -> Facts = {
         None -> acc,
       },
   );
-  if words.opened.len() == 0 { first } else {
-    let alias = first.gets.fold(
-      Map::new(),
-      |m: Map<Int, Var>, id: Int, g: { of: Int, path: Path }|
-        match words.opened.get(g.of) {
-          Some(ws) -> match g.path {
-            PLeaf(k) -> match ws.at(k) {
-              Some(w) -> if counted(w.rep) { m.insert(id, w) } else { m },
+  let alias = first.gets.fold(
+    Map::new(),
+    |m: Map<Int, Var>, id: Int, g: { of: Int, path: Path }|
+      match words.opened.get(g.of) {
+        Some(ws) -> match g.path {
+          PLeaf(k) -> match ws.at(k) {
+            Some(w) -> if counted(w.rep) { m.insert(id, w) } else { m },
+            None -> m,
+          },
+          _ -> m,
+        },
+        None -> match first.vars.get(g.of) {
+          Some(x) -> match first.vars.get(id) {
+            Some(y) -> match payload_of(Get({ of: x, path: g.path }), y) {
+              Some(_) -> m.insert(id, match m.get(x.id) { Some(t) -> t, None -> x }),
               None -> m,
             },
-            _ -> m,
+            None -> m,
           },
           None -> m,
         },
-    );
+      },
+  );
+  if words.opened.len() == 0 && alias.len() == 0 { first } else {
     let second = gathered(
       params_defined(f, { ..empty, opened: words.opened, alias: alias }),
       f.body,
@@ -242,26 +255,41 @@ fn defined(fx: Facts, v: Var, h: Held) -> Facts =
 fn gathered(fx: Facts, b: Block) -> Facts =
   b.fold(fx, |acc: Facts, i: Inst|
     match i {
-      Let(l) -> {
-        let a = answered(l.val);
-        let d = if acc.alias.contains(l.var.id) {
-          { ..acc, vars: acc.vars.insert(l.var.id, l.var) }
-        } else {
-          defined(acc, l.var, match a {
-            Owns -> Own,
-            ReadsOf(x) -> ReadOf(base_of(acc, x)),
-            Lasts -> ReadOf(0 - 1),
-          })
-        };
-        let traced = match a {
-          Owns -> { ..d, made: d.made.insert(l.var.id, true) },
-          ReadsOf(x) -> { ..d, direct: d.direct.insert(l.var.id, x.id) },
-          Lasts -> d,
-        };
-        match l.val {
-          Get(g) -> { ..traced, gets: traced.gets.insert(l.var.id, { of: g.of.id, path: g.path }) },
-          _ -> traced,
-        }
+      Let(l) -> match stacked_captures(l.val) {
+        Some(caps) ->
+          {
+            ..defined(acc, l.var, ReadOf(0 - 1)),
+            stacks: acc.stacks.insert(
+              l.var.id,
+              caps.fold([], |vs: List<Var>, c: Arg|
+                match var_of(c) {
+                  Some(v) -> if counted(v.rep) { vs.push(v) } else { vs },
+                  None -> vs,
+                }),
+            ),
+          },
+        None -> {
+          let a = answered(l.val);
+          let d = if acc.alias.contains(l.var.id) {
+            { ..acc, vars: acc.vars.insert(l.var.id, l.var) }
+          } else {
+            defined(acc, l.var, match a {
+              Owns -> Own,
+              ReadsOf(x) -> ReadOf(base_of(acc, x)),
+              Lasts -> ReadOf(0 - 1),
+            })
+          };
+          let traced = match a {
+            Owns -> { ..d, made: d.made.insert(l.var.id, true) },
+            ReadsOf(x) -> { ..d, direct: d.direct.insert(l.var.id, x.id) },
+            Lasts -> d,
+          };
+          match l.val {
+            Get(g) ->
+              { ..traced, gets: traced.gets.insert(l.var.id, { of: g.of.id, path: g.path }) },
+            _ -> traced,
+          }
+        },
       },
       Decl(v) -> defined(acc, v, Own),
       If(x) -> gathered(gathered(acc, x.then), x.otherwise),
@@ -296,22 +324,37 @@ fn owns(fx: Facts, v: Var) -> Bool = counted(v.rep) && fx.held.get(v.id) == Some
 /// What a use of `v` is a use of: an opened value's counted words, a word's alias that word, any
 /// other variable itself.
 fn resolved(fx: Facts, v: Var) -> List<Var> =
+  match fx.stacks.get(v.id) {
+    Some(caps) -> caps.fold([], |acc: List<Var>, c: Var| acc.concat(word_of(fx, c))),
+    None -> word_of(fx, v),
+  }
+
+fn word_of(fx: Facts, v: Var) -> List<Var> =
   match fx.opened.get(v.id) {
     Some(ws) -> ws.filter(|w: Var| counted(w.rep)),
     None -> match fx.alias.get(v.id) { Some(w) -> [w], None -> [v] },
   }
 
-/// `ops` with each operand that is an opened value or an alias as the words it uses.
+/// `ops` with each operand that is an opened value or an alias as the words it uses, and a closure
+/// on this frame's stack as a read of each capture.
 fn expanded(fx: Facts, ops: List<Operand>) -> List<Operand> =
   ops.fold([], |acc: List<Operand>, o: Operand|
     match var_of(o.arg) {
-      Some(v) -> acc.concat(resolved(fx, v).map(|w: Var| { arg: AVar(w), takes: o.takes })),
+      Some(v) -> {
+        let takes = o.takes && !fx.stacks.contains(v.id);
+        acc.concat(resolved(fx, v).map(|w: Var| { arg: AVar(w), takes: takes }))
+      },
       None -> acc.push(o),
     })
 
-/// What `val` uses: its operands, but a `Get` of an opened value's leaf reads only that word.
+/// What `val` uses: its operands, but a `Get` of an opened value's leaf reads only that word, and a
+/// closure laid on this frame's stack only reads its captures.
 fn uses_of(fx: Facts, val: Val) -> List<Operand> =
   match val {
+    Make(_) -> match stacked_captures(val) {
+      Some(caps) -> caps.map(|c: Arg| { arg: c, takes: false }),
+      None -> operands(val),
+    },
     Get(g) -> match fx.opened.get(g.of.id) {
       Some(ws) -> match g.path {
         PLeaf(k) -> match ws.at(k) {
@@ -689,15 +732,17 @@ fn entered(
   { block: b.rev.reverse(), next: b.next, takers: b.takers }
 }
 
-/// `takers` with `inst` among them where it makes a record or a constructor afresh.
+/// `takers` with `inst` among them where it makes a record or a constructor afresh. One of no
+/// payload words is a singleton nothing allocates, so it takes no cells.
 fn taking(takers: List<Taker>, inst: Inst, at: Int) -> List<Taker> =
   match inst {
     Let(l) -> match l.val {
       Make(m) -> if m.reuse != None || l.var.rep != RWord { takers } else {
         match m.made {
-          MRecord(_) ->
-            takers.push({ at: at, route: [], ty: l.var.ty, made: m.made, args: m.args }),
-          MCtor(_) -> takers.push({ at: at, route: [], ty: l.var.ty, made: m.made, args: m.args }),
+          MRecord(r) -> if r.width == 0 { takers }
+          else { takers.push({ at: at, route: [], ty: l.var.ty, made: m.made, args: m.args }) },
+          MCtor(c) -> if c.width == 0 { takers }
+          else { takers.push({ at: at, route: [], ty: l.var.ty, made: m.made, args: m.args }) },
           _ -> takers,
         }
       },
@@ -976,6 +1021,91 @@ test "a function value applied is consumed by the call, so one applied again tak
       ],
       refused: None,
     },
+  )
+}
+
+test "a sum's payload held as its word is that word: read out and handed on, it takes no count" {
+  let o = {
+    id: 0,
+    ty: TyCon({ name: b"Option", args: [TyCon({ name: b"String", args: [] })] }),
+    rep: RMaybe,
+  };
+  let y = word(1);
+  let r = word(2);
+  let some = |arm: List<Inst>, rest: List<Inst>|
+    Case({
+      on: o,
+      test: TTag([b"None", b"Some"]),
+      arms: [{ when: 1, body: arm }],
+      rest: rest.push(Return(AZero(RWord))),
+    });
+  let arm = [
+    bind(y, Get({ of: o, path: PArg({ ctor: b"Some", at: 0 }) }), []),
+    bind(r, call_of([AVar(y)], []), []),
+    Return(AVar(r)),
+  ];
+  let f = root_of([o], [], RWord, [some(arm, [])]);
+  assert_eq(counted_body(f), { body: [some(arm, [Dec(o)])], refused: None });
+  // A count taken of the payload is one of the sum's, which letting go of the sum gives back.
+  assert_eq(
+    refused_with(f, [
+      some([arm.get(0), Inc({ var: y, n: 1 }), Dec(o), arm.get(1), arm.get(2)], [Dec(o)]),
+    ]),
+    None,
+  )
+}
+
+test "a constructor of no payload words takes no cells, so nothing is reset for it" {
+  let t = of_type(0, b"m.T");
+  let n = of_type(1, b"m.T");
+  let leaf = bind(
+    n,
+    Make({ made: MCtor({ name: b"Leaf", width: 0 }), args: [], reuse: None, kept: [] }),
+    [],
+  );
+  let cased = |arm: List<Inst>|
+    [
+      Case({
+        on: t,
+        test: TTag([b"Leaf", b"Node"]),
+        arms: [{ when: 0, body: arm.concat([leaf, Return(AVar(n))]) }],
+        rest: [Return(AVar(t))],
+      }),
+    ];
+  assert_eq(counted_body(root_of([t], [], RWord, cased([]))), {
+    body: cased([Dec(t)]),
+    refused: None,
+  })
+}
+
+test "a closure laid on this frame's stack reads its captures, which are let go of after the call" {
+  let cap = word(0);
+  let c = word(1);
+  let r = word(2);
+  let laid = |unwind: List<Var>|
+    bind(
+      c,
+      Make({
+        made: MClosure({ nth: 0, captures: 1, params: 1, stacked: true }),
+        args: [AVar(cap)],
+        reuse: None,
+        kept: [],
+      }),
+      unwind,
+    );
+  let f = root_of([cap], [], RWord, [
+    laid([]),
+    bind(r, call_of([AVar(c)], []), []),
+    Return(AVar(r)),
+  ]);
+  assert_eq(counted_body(f), {
+    body: [laid([cap]), bind(r, call_of([AVar(c)], []), [cap]), Dec(cap), Return(AVar(r))],
+    refused: None,
+  });
+  // Handed on whole, the closure would outlive the frame it lies on.
+  assert_eq(
+    refused_with(f, [laid([cap]), Return(AVar(c))]),
+    Some(b"a closure on this frame's stack handed beyond the call it is lent to: v1"),
   )
 }
 
