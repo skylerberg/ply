@@ -6,9 +6,9 @@ import patterns (LStr, LDec, LWide, LUnit)
 import emit (Exact)
 import emit.keys (Root, root_name)
 import emit.pieces (spelled)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, Var, Arg, AVar, AInt, ANum, AChar,
-                 Val, Prim, Literal, Get, Call, Native, Inst, Let, Do, If, Block, Fn, Scalars,
-                 counted)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RCases, Var, Arg, AVar, AInt,
+                 ANum, AChar, Val, Prim, Literal, Get, Call, Native, Inst, Let, Do, If, Block, Fn,
+                 Scalars, counted)
 import emit.print (printed_fn)
 import emit.compare (Program, program_of, formed, checked, printed_by_form, answered_today,
                      today_text, normalised, past_counts)
@@ -73,11 +73,11 @@ fn natives(p: Program, name: Bytes) -> Result<List<Bytes>, Bytes> / {abort.raise
 fn analysed(src: Bytes) -> Program / {abort.raise} =
   match program_of(src) { Ok(p) -> p, Err(why) -> panic(String::of_bytes(why)) }
 
-/// How many fields root `name` of `p` reads, or why it was not formed.
-fn reads(p: Program, name: Bytes) -> Result<Int, Bytes> / {abort.raise} =
+/// Whether root `name` of `p` reads a field, or why it was not formed.
+fn reads(p: Program, name: Bytes) -> Result<Bool, Bytes> / {abort.raise} =
   match formed(p, name) {
     Err(no) -> Err(no.why),
-    Ok(f) -> Ok(values(f.body).filter(|v: Val| match v { Get(_) -> true, _ -> false }).len()),
+    Ok(f) -> Ok(values(f.body).any(|v: Val| match v { Get(_) -> true, _ -> false })),
   }
 
 test "records of a known type are compared and ordered field by field, not by the runtime" {
@@ -85,15 +85,28 @@ test "records of a known type are compared and ordered field by field, not by th
     Bytes::concat_all([
       b"type P = { x: Int, name: String }\n",
       b"type Q = { p: P, k: Char }\n",
+      b"type R = { o: Option<Int>, n: Int }\n",
       b"fn same(a: P, b: P) -> Bool = a == b\n",
       b"fn apart(a: Q, b: Q) -> Bool = a != b\n",
       b"fn order(a: P, b: P) -> Ordering = compare(a, b)\n",
+      b"fn optional(a: R, b: R) -> Bool = a == b\n",
     ]),
   );
   // Fields in the checker's order, each compared only where those before it were equal.
   assert_eq(applied(p, b"same"), Ok([{ op: b"bytes_eq", on: RWord }, { op: b"eq", on: RInt }]));
-  assert_eq(reads(p, b"same"), Ok(4));
+  assert_eq(reads(p, b"same"), Ok(true));
   assert_eq(natives(p, b"same"), Ok([]));
+  // An `Option` a record holds is compared as its payload's word, then its payload.
+  assert_eq(
+    applied(p, b"optional"),
+    Ok([
+      { op: b"eq", on: RInt },
+      { op: b"none_in", on: RMaybe },
+      { op: b"eq", on: RMaybe },
+      { op: b"eq", on: RInt },
+    ]),
+  );
+  assert_eq(natives(p, b"optional"), Ok([]));
   // A record a record holds is compared field by field again.
   assert_eq(
     applied(p, b"apart"),
@@ -104,7 +117,7 @@ test "records of a known type are compared and ordered field by field, not by th
       { op: b"not", on: RBool },
     ]),
   );
-  assert_eq(reads(p, b"apart"), Ok(8));
+  assert_eq(natives(p, b"apart"), Ok([]));
   // The first field that orders them apart decides; the sign is made the `Ordering` once.
   assert_eq(
     applied(p, b"order"),
@@ -227,7 +240,7 @@ test "a Char is its own word, compared as C compares the words" {
   }
 }
 
-test "strings and byte strings are compared by their bytes, constructors of no argument by their headers" {
+test "strings and byte strings are compared by their bytes, constructors of no argument by their index" {
   let p = analysed(
     Bytes::concat_all([
       b"type Suit = | Hearts | Spades\n",
@@ -238,7 +251,30 @@ test "strings and byte strings are compared by their bytes, constructors of no a
   );
   assert_eq(applied(p, b"s"), Ok([{ op: b"bytes_eq", on: RWord }]));
   assert_eq(applied(p, b"bs"), Ok([{ op: b"bytes_ne", on: RWord }]));
-  assert_eq(applied(p, b"suit"), Ok([{ op: b"ctor_ne", on: RWord }]))
+  let suits = RCases({
+    tagged: false,
+    cases: [b"m.Hearts", b"m.Spades"].map(|n: Bytes| { name: n, leaves: [] }),
+  });
+  assert_eq(applied(p, b"suit"), Ok([{ op: b"ne", on: suits }]))
+}
+
+test "an Option is compared as its payload's word, then its payload as its type compares" {
+  let p = analysed(
+    Bytes::concat_all([
+      b"fn ints(a: Option<Int>, b: Option<Int>) -> Bool = a == b\n",
+      b"fn texts(a: Option<String>, b: Option<String>) -> Bool = a != b\n",
+      b"fn results(a: Result<Int, String>, b: Result<Int, String>) -> Bool = a == b\n",
+    ]),
+  );
+  let none = [{ op: b"none_in", on: RMaybe }, { op: b"eq", on: RMaybe }];
+  assert_eq(applied(p, b"ints"), Ok(none.push({ op: b"eq", on: RInt })));
+  assert_eq(
+    applied(p, b"texts"),
+    Ok(none.push({ op: b"bytes_eq", on: RWord }).push({ op: b"not", on: RBool })),
+  );
+  assert_eq([b"ints", b"texts"].map(|n: Bytes| natives(p, n)), [Ok([]), Ok([])]);
+  // A `Result` is compared by the root written for its type, handed its word.
+  assert_eq(roots_called(p, b"results"), Ok([b"m.equal#Result<Int,String>"]))
 }
 
 test "two values of a declared sum are compared and ordered through roots written for it" {
