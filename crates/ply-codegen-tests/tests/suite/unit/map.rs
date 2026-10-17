@@ -132,6 +132,45 @@ fn a_shared_insert_copies_one_path_and_leaves_the_original_whole() {
 }
 
 #[test]
+fn an_equal_key_keeps_the_key_the_map_holds_and_takes_the_value() {
+    let mut h = Heap::new();
+    let l = layouts();
+    let first = h.to_word(&l, &ply_eval::Value::str("k"));
+    let again = h.to_word(&l, &ply_eval::Value::str("k"));
+    assert_ne!(first, again);
+    let m = h.map_new();
+    let m = h.map_insert(&l, m, first, heap::imm(1));
+    let m = h.map_insert(&l, m, again, heap::imm(2));
+    assert_eq!(len(obj(m)), 1);
+    let (k, v) = at(obj(m), 0).unwrap();
+    assert_eq!((k, heap::as_int(v)), (first, Some(2)));
+    dec(m);
+    h.end();
+}
+
+#[test]
+fn a_taken_entry_comes_with_the_key_the_map_holds() {
+    let mut h = Heap::new();
+    let l = layouts();
+    let first = h.to_word(&l, &ply_eval::Value::str("k"));
+    let probe = h.to_word(&l, &ply_eval::Value::str("k"));
+    let m = h.map_new();
+    let m = h.map_insert(&l, m, first, heap::imm(1));
+    let (m, entry) = h.map_take_key(&l, m, probe);
+    assert_eq!(
+        entry.map(|(k, v)| (k, heap::as_int(v))),
+        Some((first, Some(1)))
+    );
+    assert_eq!(len(obj(m)), 0);
+    let (m, none) = h.map_take_key(&l, m, probe);
+    assert!(none.is_none());
+    dec(first);
+    dec(probe);
+    dec(m);
+    h.end();
+}
+
+#[test]
 fn removals_empty_leaves_and_collapse_the_root_and_a_dying_map_lets_its_nodes_go() {
     let mut h = Heap::new();
     let l = layouts();

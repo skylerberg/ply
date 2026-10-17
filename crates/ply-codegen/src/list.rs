@@ -350,6 +350,25 @@ pub fn get(o: *mut Obj, i: usize) -> Word {
     unsafe { word_at(node, p & MASK) }
 }
 
+/// The leaf of the trie that holds the list's items from `j * WIDTH` on, counted from the leaf its
+/// first item lies in, borrowed; zero past the last leaf, and for a list that is its tail.
+pub fn leaf_of(o: *mut Obj, j: i64) -> Word {
+    let r = root(o);
+    let held = tail_offset(o);
+    let first = start(o) / WIDTH;
+    if r == 0 || j < 0 || j as usize >= held / WIDTH - first {
+        return 0;
+    }
+    let p = (first + j as usize) * WIDTH;
+    let mut node = obj(r);
+    let mut shift = shift_for(held);
+    while shift > 0 {
+        node = obj(unsafe { word_at(node, (p >> shift) & MASK) });
+        shift -= BITS;
+    }
+    node as Word
+}
+
 /// Every element in order, borrowed.
 pub fn to_vec(o: *mut Obj) -> Vec<Word> {
     let mut out = Vec::with_capacity(len(o));

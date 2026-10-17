@@ -2865,8 +2865,7 @@ unsafe fn cmp_fields(
     }
 }
 
-/// Whether a word can be a native map's key: ordered in place and canonical. A `Decimal` is canonical
-/// at its least scale, so `1.50` is not and goes the way that makes it so.
+/// Whether a word can be a native map's key: one [`cmp_words`] orders in place.
 pub fn native_key(layouts: &Layouts, w: Word) -> bool {
     if is_imm(w) {
         return true;
@@ -2874,16 +2873,15 @@ pub fn native_key(layouts: &Layouts, w: Word) -> bool {
     let o = obj(w);
     unsafe {
         match (*o).kind {
-            KIND_UNIT | KIND_BOOL | KIND_INT | KIND_FIXED | KIND_STR | KIND_BYTES => true,
-            KIND_DECIMAL => least_scale(decimal_at(o, 0)),
+            KIND_UNIT | KIND_BOOL | KIND_INT | KIND_FIXED | KIND_DECIMAL | KIND_STR
+            | KIND_BYTES => true,
             KIND_BRIDGE => matches!(
                 bridged(o),
                 Value::Str(_) | Value::Bytes(_) | Value::Fixed(_)
             ),
             KIND_RECORD | KIND_CTOR | KIND_ARRAY if (*o).flags & RAW != 0 => {
                 layouts.parts(o).into_iter().all(|(at, slot)| match slot {
-                    Slot::Decimal => least_scale(decimal_at(o, at)),
-                    Slot::Int | Slot::Float | Slot::Wide(_) => true,
+                    Slot::Decimal | Slot::Int | Slot::Float | Slot::Wide(_) => true,
                     Slot::Maybe => {
                         let p = word_at(o, at);
                         p == 0 || native_key(layouts, p)
@@ -2905,9 +2903,4 @@ pub fn native_key(layouts: &Layouts, w: Word) -> bool {
             _ => false,
         }
     }
-}
-
-/// Whether `d` is written at its least scale, the one spelling a map keeps of its number.
-fn least_scale(d: ply_eval::Decimal) -> bool {
-    d.serialize() == d.normalize().serialize()
 }

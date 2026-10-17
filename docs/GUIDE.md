@@ -752,7 +752,8 @@ value past `Int` through its decimal text (`U128::of_string`).
 `String::of_bytes` raises on invalid UTF-8.
 
 A `Decimal` is a 96-bit mantissa and a scale, the count of digits after its
-point, from 0 to 28: `1.5m == 1.50m`, and they print as written. `Decimal::div`
+point, from 0 to 28: `1.5m == 1.50m`, and they print as written, as a `Map`
+keeps a key as it was first given (§4.3). `Decimal::div`
 and `Decimal::round` take the scale of their answer, and answer with exactly that
 many digits after the point, the exact value rounded once by the `Rounding`
 given; they raise where 96 bits do not hold the answer at that scale.
@@ -870,7 +871,11 @@ only that field's array. It is a value like an array, compared and ordered as
 the array of its records, built with `Columns::new` or `Columns::of_list`, and
 its element type is a record of at least one field (`E0224`). `Map<k, v>`
 is an immutable sorted map, written `#{k: v}` or built with `Map::new`,
-`Map::insert` or `Map::of_entries`. It iterates in `compare` order. Its key type
+`Map::insert` or `Map::of_entries`. It iterates in `compare` order, and a key
+`compare` finds equal to one the map holds is that key: an insert of it keeps
+the key the map holds and replaces its value, so `#{1.50m: "a"}.insert(1.5m,
+"b")` is `#{1.50m: "b"}`, and so for two values of a type whose `key` (§4.4)
+answers alike. Its key type
 must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Task`
 and `Chan` are refused (`E0206`). A signature that names a `Map`, or a type
 that carries an order (§4.2), anywhere in a parameter's type or its answer, is
@@ -1467,8 +1472,10 @@ is a program — and a loop that never ends fails with `E0503` when that budget 
 spent. `--steps N` sets it (`0` is no bound), and the count is the same on every
 machine, so the verdict is too (§8.4).
 `range` and the byte scanners do not nest calls, and neither do `List::map`, `List::filter` and
-`List::fold`, which `std.prelude` writes as tail calls (§12), each pass a step beside what the
-function they are handed takes. `iterate` is a loop with an early exit and a step budget:
+`List::fold`, which `std.prelude` writes as tail calls over the leaves of the list's trie and its
+tail (§12): each item takes a step of the walk, and `map`'s and `filter`'s the steps of their push,
+beside what the function they are handed takes. `iterate` is a loop with an early exit and a step
+budget:
 
 ```ply
 fn first_gap(xs: List<Int>) -> Int =
@@ -2788,17 +2795,30 @@ body, a named definition's, or the caller's own parameter's cost name, so
 steps grow with what it is given leaves the call unread.
 
 A `cost` bound is an obligation, `<owner> cost #<n>`, that `ply prove` reads
-off the body and never runs. A native is at most a step, and `List::map`, `List::filter` and
-`List::fold`, which `std.prelude` writes in Ply (§12), take a step per element. Those three,
-`Map::fold`, `iterate`, `Map::update`, `Bytes::position`
-and `metered` call a literal lambda or a named definition back as many times as
-an argument's size allows; a call of a definition costs its steps at the sizes
-of its arguments, and of one whose body another package keeps, its first `cost`
-bound read from above; a raise ends the call. A recursion is read when every
-call back takes a part of one list parameter that a list pattern took a head
-off, no path calls back twice, and every other parameter its steps grow with is
-handed on unchanged or as a part of itself: it takes that list's length in
-calls. The bound is read from below: the lengths of parameters (`List::len`,
+off the body and never runs. A native is at most a step, and a function `std.prelude` writes in
+Ply (§12) the steps its body takes: `List::at`, `List::push` and `List::set` at most a constant
+number, since a list's trie is no deeper than an `Int` has bits for, and a `Map` function of one
+key the steps of a walk down the map's tree. `Map::fold`, `iterate`, `Map::update`,
+`Bytes::position` and `metered` call a literal lambda or a named definition back as many times
+as an argument's size allows; a call of a definition costs its steps at the sizes of its
+arguments, and of one whose body another package keeps, its first `cost` bound read from above.
+So `List::map`, `List::filter` and `List::fold`, which `std.prelude` writes in Ply, cost what
+each states, `cost xs.len() * k`: a step per element beside each call of the function they are
+handed; and what `map` and `filter` answer is no longer than the list. A raise ends the call.
+A recursion is read when every call back takes a part of one list parameter that a list
+pattern took a head off, or hands on an `Int` parameter moved by a positive literal toward a limit
+the way to the call holds it short of, and the parameter that limit is of
+unchanged: a literal, from below or above, the length of a parameter, from
+below (`if i >= xs.len() { 0 } else { walk(xs, i + 1) }`, read through `!`, a
+`&&` that held and an `||` that did not), or the length of a list where
+`List::at` found an element at it (`match xs.at(i) { Some(x) -> walk(xs, i + 1),
+None -> 0 }`). No path calls back twice, and every other parameter its steps
+grow with is handed on unchanged or as a part of itself. It takes that list's
+length in calls, or as many as lie between the index and its limit, which grow
+with the `Int` itself unless `List::at` found an element at it, since it may
+start below zero; an `Int` literal's size is its magnitude, so a call starting
+at `0` grows with the limit alone. The
+bound is read from below: the lengths of parameters (`List::len`,
 `Map::len`, `String::len`, `Bytes::len`, `Array::len`, `Columns::len`), cost names,
 positive literals, `+`, `*`,
 and `ilog2` alone or beside sizes of the one length it is of. Steps within the
@@ -2841,7 +2861,11 @@ off the body with the reading of calls and recursion a `cost` bound has, except
 that a recursion whose paths that call back make nothing and call back last
 holds what its last call does, whatever it descends on. A call of a definition
 whose body another package keeps holds its first `space` bound, and only where
-each argument it is handed that is not a number is held alone. A clause on a
+each argument it is handed that is not a number is held alone; `List::map`,
+`List::filter` and `List::fold`, which state none, hold what the function they
+are handed holds once for each element, as `Map::fold`, `iterate`,
+`Map::update`, `Bytes::position` and `metered` do for each call they make, and
+`map` and `filter` a list as long as the one they walk. A clause on a
 definition that performs more than a raise is `E0463`. Anything else leaves the
 bound `unproved` (`E0474`), stopped at `unbounded` with why.
 
@@ -2942,8 +2966,15 @@ The functions every module calls without importing them. Each is declared in
 `std.prelude`, the module of the standard library every module reads without
 naming it, with a doc: an `extern fn` is a signature the runtime implements,
 with a row and a `where` like any other and no body, and a `pub fn` is written
-there in Ply (`List::map`, `List::filter`, `List::fold`), which a call reads by
-its signature as it reads an `extern fn`'s. A call of a native is a step; one
+there in Ply (`List::at`, `List::push`, `List::set`, `List::map`, `List::filter`,
+`List::fold`, and `Map`'s functions but `Map::new` and `Map::len`, over the map's
+tree), which a call reads by its signature and its clauses as it reads an
+`extern fn`'s, so `List::set`'s `requires` is read where it is called (§6.8). A
+body that compares (`==`, `!=`, `compare`, `compare_values`), digests (`digest`)
+or reflects (`reflect`, `shown`) a value references `List::at`, `List::push` and
+`Map::entries` as well, which the code written for a list or a map there calls,
+so its hash covers them and a load that reaches it reaches them. A call of a
+native is a step; one
 written in Ply takes the steps its body does, as any function. `std.prelude`
 imports nothing. A module the toolchain
 ships may declare one too, a builtin of its own that it calls, or that a module
