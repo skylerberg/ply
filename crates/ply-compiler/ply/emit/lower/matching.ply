@@ -10,12 +10,11 @@ import patterns (Lit, LInt, LFixed, LBool, LUnit)
 import parsing (Span, dummy_span, starts_upper)
 import types (Type, TyCon, Subst, subst_new, with_bindings, record_fields, field_get, named_type)
 import typing (unknown_type)
-import resolve (qualify)
-import emit (SumCtor, Imported)
+import emit (SumCtor)
 import emit.tir (Rep, RInt, RBool, RNum, RWord, Var, Arg, AVar, AInt, ABool, ANum, AZero, Uses, Get,
-                 Pack, Native, Decl, Assign, If, Case, Match, Miss, Fail, Block, Test, TTag, TInt,
-                 TRange, TLength, Matching, rep_of_arg)
-import emit.lower.setting (Setting)
+                 Pack, Native, Decl, Assign, If, Case, Match, Miss, Fail, NoArm, NoLet, Block, Test,
+                 TTag, TInt, TRange, TLength, Matching, rep_of_arg)
+import emit.lower.setting (Setting, ctor_named, ctor_sum)
 import emit.lower.held (held_as, field_path, arg_path)
 import emit.lower.base (Context, Lowering, Lowered, Armed, refuse, fresh, bound, bound_as, emitted,
                         opened, continued, join_type, set_join, type_of)
@@ -64,7 +63,7 @@ pub fn closed(
       st: {
         ..made.st,
         insts: before.insts.push(Decl(j.var)).push(
-          Match({ arms: made.blocks, rest: [Fail(no_arm())] }),
+          Match({ arms: made.blocks, rest: [Fail({ why: NoArm, at: at })] }),
         ),
       },
       arg: AVar(j.var),
@@ -78,7 +77,8 @@ pub fn let_bound(
   value: Lowered,
   pat: CodePattern,
   at: Span,
-) -> Lowering / {abort.raise} = pattern_bound(cx, value.st, value.arg, pat, [Fail(no_let())])
+) -> Lowering / {abort.raise} =
+  pattern_bound(cx, value.st, value.arg, pat, [Fail({ why: NoLet, at: at })])
 
 /// Which side of `lhs op rhs` is a constructor a comparison tests as a pattern: `Some(true)` the left,
 /// `Some(false)` the right, nothing where neither is or `op` is no equality.
@@ -106,13 +106,21 @@ fn last_segment(name: Bytes) -> Bytes / {abort.raise} = {
   name.slice(cut, name.len())
 }
 
+/// Which of the constructor side's arguments the driver lowers before `compared`, in order: where
+/// `ctor` applies a constructor, one flag for each of its arguments; none where it names one.
+pub fn compared_args(cx: Context, ctor: Code) -> List<Bool> =
+  match ctor.node { NApp(a) -> a.args.map(|_: Code| false), _ -> [] }
+
 /// `value op ctor`, `op` being `eq` or `ne`: a `Bool` joined from the tests `ctor` makes of the value
-/// as its pattern would. An argument computed by anything but a literal, a constructor or a variable
-/// is declined, since the comparison is handed only its value's side lowered.
+/// as its pattern would. `args` are the constructor's arguments `compared_args` named, lowered after
+/// the value where the constructor is on the right and before it where it is on the left, and
+/// nothing in the place of each it did not. An argument computed by anything but a literal, a
+/// constructor or a variable is declined.
 pub fn compared(
   cx: Context,
   value: Lowered,
   ctor: Code,
+  args: List<Option<Arg>>,
   op: Bytes,
   at: Span,
 ) -> Lowered / {abort.raise} = {
@@ -418,27 +426,16 @@ type CtorOf = { full: Bytes, names: List<Bytes>, index: Int, args: List<Type> }
 fn ctor_of(s: Setting, ty: Type, written: Bytes) -> Option<CtorOf> / {abort.raise} =
   match ctor_named(s, written) {
     None -> None,
-    Some(full) -> match s.ctors.sums.values().fold(
-        None,
-        |acc: Option<List<SumCtor>>, cs: List<SumCtor>|
-          match acc {
-            Some(_) -> acc,
-            None -> if cs.any(|c: SumCtor| c.name == full) { Some(cs) } else { None },
-          },
-      ) {
+    Some(full) -> match ctor_sum(s, full) {
       None -> None,
-      Some(cs) -> match range(0, cs.len()).fold(None, |acc: Option<Int>, i: Int|
-          match acc {
-            Some(_) -> acc,
-            None -> if cs.get(i).name == full { Some(i) } else { None },
-          }) {
+      Some(sum) -> match sum.ctors.at(sum.index) {
         None -> None,
-        Some(i) ->
+        Some(c) ->
           Some({
             full: full,
-            names: cs.map(|c: SumCtor| c.name),
-            index: i,
-            args: arg_types(cs.get(i), ty),
+            names: sum.ctors.map(|x: SumCtor| x.name),
+            index: sum.index,
+            args: arg_types(c, ty),
           }),
       },
     },
@@ -496,56 +493,3 @@ fn item_read(cx: Context, st: Lowering, v: Var, item: Type, at: Int) -> Lowered 
 /// A runtime read of a list's item or rest: borrows the list and its index, answers a count of its
 /// own, and fails where the list is shorter.
 fn list_read() -> Uses = { takes: [false, false], owned: true, fails: true, stops: false }
-
-/// What a `match` fails with where no arm matched, and what a `let` fails with where its pattern
-/// does not hold the value: the printer raises each as its own failure.
-fn no_arm() -> Bytes = b"match"
-
-fn no_let() -> Bytes = b"let"
-
-// A copy of the emitter's private constructor resolution (`emit.ply`'s `tag_of`, `ctor_index`,
-// `qualified`, `module_import`), listed in the hooks file.
-
-/// The name the program's constructor table gives the constructor written `name`: the module's
-/// own, one qualified by an import's binder, or one an import brought in bare.
-fn ctor_named(s: Setting, name: Bytes) -> Option<Bytes> / {abort.raise} = {
-  let part = qualified(name);
-  let written = match part { Some(q) -> q.name, None -> name };
-  let want = match part {
-    Some(q) -> match module_import(s.imports, q.binder) {
-      Some(imp) -> Bytes::concat_all([imp.module, b".", q.name]),
-      None -> Bytes::concat_all([b"std.", q.binder, b".", q.name]),
-    },
-    None -> qualify(s.module, name),
-  };
-  match table_name(s.ctors.names, want, name) {
-    Some(n) -> Some(n),
-    // Only an import that bound this name can be where it came from: two modules may declare a
-    // constructor of the same name.
-    None ->
-      s.imports.fold(None, |acc: Option<Bytes>, imp: Imported|
-        match acc {
-          Some(_) -> acc,
-          None -> if !imp.whole && imp.name == written {
-            table_name(s.ctors.names, Bytes::concat_all([imp.module, b".", written]), b"")
-          } else { None },
-        }),
-  }
-}
-
-fn table_name(names: List<Bytes>, want: Bytes, bare: Bytes) -> Option<Bytes> =
-  names.fold(None, |acc: Option<Bytes>, c: Bytes|
-    if c == want || (bare != b"" && c == bare) { Some(c) } else { acc })
-
-fn qualified(name: Bytes) -> Option<{ binder: Bytes, name: Bytes }> =
-  range(0, name.len() - 1).fold(None, |acc: Option<{ binder: Bytes, name: Bytes }>, i: Int|
-    match acc {
-      Some(_) -> acc,
-      None -> if name.at(i) == 58 && name.at(i + 1) == 58 {
-        Some({ binder: name.slice(0, i), name: name.slice(i + 2, name.len()) })
-      } else { None },
-    })
-
-fn module_import(xs: List<Imported>, binder: Bytes) -> Option<Imported> =
-  xs.fold(None, |acc: Option<Imported>, i: Imported|
-    if i.whole && i.name == binder { Some(i) } else { acc })

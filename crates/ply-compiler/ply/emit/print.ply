@@ -11,11 +11,12 @@ import std.bytes (ascii_of_int)
 import emit (symbol_of)
 import emit.keys (Named, root_name)
 import emit.pieces (Piece, Text, merged, spelled)
-import emit.tir (Rep, RInt, RBool, RWord, Var, Arg, AVar, AInt, Val, Prim, Literal, Static, Make,
-                 Get, Pack, Gathered, Call, Apply, Native, Op, OHandle, OContainer, OCalling,
-                 MClosure, MList, MArray, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop,
-                 Next, Done, Return, Restart, Enter, Fail, Handle, Inc, Dec, Reset, Free, Opened,
-                 Block, Fn, Rooted, Given, Lambda, Closure, Uses, no_links, falls_through)
+import emit.tir (Rep, RInt, RBool, RWord, Var, Arg, AVar, AInt, AZero, Val, Prim, Literal, Static,
+                 Make, TInt, Get, Pack, Gathered, Call, Apply, Native, Op, OHandle, OContainer,
+                 OCalling, MClosure, MList, MArray, Inst, Let, Do, Decl, Assign, If, Case, Match,
+                 Miss, Loop, Next, Done, Return, Restart, Enter, Fail, Handle, Inc, Dec, Reset,
+                 Free, Opened, Block, Fn, Member, Rooted, Given, Lambda, Closure, Uses, NoArm,
+                 no_links, rep_of_arg, falls_through)
 import emit.print.text (Under, Place, Printing, Printed, printing, line, text, named, name_of,
                         arg_text, assigned, label, check, zero, failing_return, site)
 import emit.print.counts (released, count_printed)
@@ -27,17 +28,17 @@ import emit.print.tested (case_opened, case_arm, case_arm_closed, case_rest, cas
                           match_opened, match_arm, match_arm_closed, match_rest, match_closed,
                           missed, failed)
 import emit.print.invoked (call, applied, closure_made, restarted, entered_member, loop_opened,
-                           loop_closed, next, done, calling_op, lambda_names, lambda_text)
+                           loop_closed, next, done, calling_op, lambda_names, lambda_text,
+                           group_wrapper)
 import emit.print.handled (handle_opened, handle_closed, landing_jump, effect_op)
 
-/// Root `f` as its C function and entry, then each of its closures' functions in `f.lambdas` order.
+/// Root `f` as its C function and entry, or a tail group as its group function, the group's entry
+/// and each member's wrapper; then each of its closures' functions in `f.lambdas` order.
 pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
   let name = symbol_of(root_name(f.key));
-  let body = body_printed(name, f, printing(param_names(f)));
-  let words = range(0, f.params.len()).map(|i: Int|
-    as_word(b"p".concat(ascii_of_int(i)), f.params.get(i).rep));
+  let own = if f.members.len() == 0 { root_printed(name, f) } else { group_printed(name, f) };
   let closures = range(0, f.lambdas.len()).fold(
-    { pr: body, out: [] },
+    { pr: own.pr, out: [] },
     |acc: { pr: Printing, out: List<Piece> }, k: Int|
       match f.lambdas.at(k) {
         Some(l) -> {
@@ -49,26 +50,7 @@ pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
   );
   let tables = closures.pr;
   {
-    pieces: merged(
-      [
-        Text(
-          Bytes::concat_all([
-            b"Word ",
-            name,
-            b"_entry(PlyCtx *ctx, const Word *args);\n",
-            head(name, f),
-            b" {\n",
-            fuel_head(name.concat(b"_entry"), words, f.conv.answer),
-          ]),
-        ),
-      ].concat(
-        body.out,
-      ).push(
-        Text(Bytes::concat_all([b"}\n", entry(name, f)])),
-      ).concat(
-        closures.out,
-      ),
-    ),
+    pieces: merged(own.out.concat(closures.out)),
     calls: tables.calls,
     consts: tables.consts,
     builtins: tables.builtins,
@@ -78,6 +60,127 @@ pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
     performs: tables.performs,
     handles: tables.handles,
     expects: tables.expects,
+  }
+}
+
+/// A root of its own as its C function, named `name`, and its entry: the printing after it and its
+/// pieces.
+fn root_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
+  let body = body_printed(name, f, printing(param_names(f)));
+  let words = range(0, f.params.len()).map(|i: Int|
+    as_word(b"p".concat(ascii_of_int(i)), f.params.get(i).rep));
+  {
+    pr: body,
+    out: [
+      Text(
+        Bytes::concat_all([
+          b"Word ",
+          name,
+          b"_entry(PlyCtx *ctx, const Word *args);\n",
+          head(name, f),
+          b" {\n",
+          fuel_head(name.concat(b"_entry"), words, f.conv.answer),
+        ]),
+      ),
+    ].concat(
+      body.out,
+    ).push(
+      Text(Bytes::concat_all([b"}\n", entry(name, f)])),
+    ),
+  }
+}
+
+/// A tail group, its first member named `name`, as its group function, which takes the member's
+/// place `which` and the widest member's parameters as words and switches on `which` to that
+/// member's arm, each arm opening its member's parameters from the words; then the group's entry,
+/// and each member's wrapper.
+fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
+  let g = name.concat(b"_group");
+  let width = f.members.fold(0, |w: Int, m: Member|
+    if m.params.len() > w { m.params.len() } else { w });
+  let words = range(0, width).map(|i: Int| b"p".concat(ascii_of_int(i)));
+  let u = {
+    symbol: name,
+    base: f.base,
+    answer: f.conv.answer,
+    site: None,
+    arm: None,
+    looping: None,
+    landing: None,
+    group: None,
+  };
+  let start = printing(match f.params.at(0) {
+    Some(which) -> Map::new().insert(which.id, b"which"),
+    None -> Map::new(),
+  });
+  let switched = match f.body {
+    [Case(c)] -> {
+      let arms = c.arms.fold(start, |pr: Printing, a: { when: Int, body: Block }|
+        match f.members.at(a.when) {
+          None -> line(pr, 0, b"/* an arm of no member of the group */"),
+          Some(m) -> {
+            let armed = {
+              ..u,
+              base: m.base,
+              site: Some(a.when),
+              group: Some({ at: a.when, members: f.members, width: width }),
+            };
+            let opened = range(0, m.params.len()).fold(
+              line(pr, 0, Bytes::concat_all([b"case ", ascii_of_int(a.when), b": {"])),
+              |q: Printing, j: Int| {
+                let v = m.params.get(j);
+                let word = b"p".concat(ascii_of_int(j));
+                if v.rep == RWord { { ..q, names: q.names.insert(v.id, word) } }
+                else { assigned(q, 1, v, c_type(v.rep), word_as(word, v.rep)) }
+              },
+            );
+            line(printed(armed, opened, a.body, 1), 0, b"}")
+          },
+        });
+      printed(u, line(arms, 0, b"}"), c.rest, 0)
+    },
+    _ -> line(start, 0, b"/* a group whose body is no case on its member's place */"),
+  };
+  let gentry = g.concat(b"_entry");
+  {
+    pr: switched,
+    out: [
+      Text(
+        Bytes::concat_all([
+          b"static Word ",
+          gentry,
+          b"(PlyCtx *ctx, const Word *args);\n",
+          b"static Word ",
+          g,
+          b"(PlyCtx *ctx, int which",
+          Bytes::concat_all(words.map(|w: Bytes| b", Word ".concat(w))),
+          b") {\n",
+          fuel_head(gentry, [b"which"].concat(words), f.conv.answer),
+          b"  ply_loop: ",
+          tick_line(failing_return(f.conv.answer)),
+          b"\n  switch (which) {\n",
+        ]),
+      ),
+    ].concat(
+      switched.out,
+    ).push(
+      Text(
+        Bytes::concat_all([
+          b"}\n",
+          b"static Word ",
+          gentry,
+          b"(PlyCtx *ctx, const Word *args) {\n  return ",
+          g,
+          b"(ctx, (int)args[0]",
+          Bytes::concat_all(
+            range(0, width).map(|i: Int|
+              Bytes::concat_all([b", args[", ascii_of_int(i + 1), b"]"])),
+          ),
+          b");\n}\n",
+          Bytes::concat_all(range(0, f.members.len()).map(|i: Int| group_wrapper(f, i))),
+        ]),
+      ),
+    ),
   }
 }
 
@@ -111,6 +214,7 @@ fn body_printed(symbol: Bytes, f: Fn, pr: Printing) -> Printing / {abort.raise} 
     arm: None,
     looping: None,
     landing: None,
+    group: None,
   };
   let looped = if restarts(f.body) {
     text(pr, Bytes::concat_all([b"  ply_loop: ", tick_line(failing_return(f.conv.answer)), b"\n"]))
@@ -209,7 +313,7 @@ fn printed(u: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort.ra
         Some(a) -> missed(p, acc, a.label, a.at),
         None -> line(acc, depth, b"/* a miss outside a match */"),
       },
-      Fail(why) -> failed(p, acc, why),
+      Fail(x) -> failed({ ..p, at: x.at }, acc, x.why),
       Loop(lp) -> {
         let l = label(acc);
         let looped = { ..u, looping: Some({ label: l.n, state: lp.state, answer: lp.answer }) };
@@ -233,9 +337,23 @@ fn printed(u: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort.ra
         Some(lp) -> done(p, acc, lp.label, lp.answer, a),
         None -> line(acc, depth, b"/* a loop's answer outside a loop */"),
       },
+      // A member of a tail group answers at its own convention, through the group's word.
       Return(a) ->
-        text(acc, Bytes::concat_all([b"  ctx->fuel += 1;\n  return ", arg_text(acc, a), b";\n"])),
-      Restart(args) -> restarted(p, acc, args),
+        text(
+          acc,
+          Bytes::concat_all([
+            b"  ctx->fuel += 1;\n  return ",
+            match u.group {
+              Some(_) -> as_word(arg_text(acc, a), rep_of_arg(a)),
+              None -> arg_text(acc, a),
+            },
+            b";\n",
+          ]),
+        ),
+      Restart(args) -> match u.group {
+        Some(g) -> entered_member(p, acc, g.at, args),
+        None -> restarted(p, acc, args),
+      },
       Enter(e) -> entered_member(p, acc, e.member, e.args),
       // A failure in the body goes to the landing, which leaves by `hp.leave` where no clause answers.
       Handle(h) -> {
@@ -461,82 +579,144 @@ test "a restart takes its arguments into temporaries before it sets the paramete
   )
 }
 
-test "a failure inside a handle's body goes to its landing, and the landing leaves the function" {
-  let int = TyCon({ name: b"Int", args: [] });
-  let n = { id: 0, ty: int, rep: RInt };
-  let t = { id: 1, ty: int, rep: RInt };
-  let answer = { id: 2, ty: int, rep: RInt };
-  let f = {
-    key: Named(b"m.guarded"),
-    kind: Rooted,
-    params: [n],
-    conv: { params: [Given], reps: [RInt], answer: RInt },
-    body: [
-      Handle({
-        body: [
-          Let({
-            var: t,
-            val: Prim({ op: b"add", on: RInt, args: [AVar(n), AInt(1)] }),
-            at: span_between(10, 15),
-            unwind: [],
-          }),
-          Assign({ var: answer, arg: AVar(t) }),
-        ],
-        args: [],
-        uses: { takes: [], owned: false, fails: false, stops: false },
-        site: { clauses: [], ret: None, detached: None },
-        answer: answer,
-        unwind: [],
-      }),
-      Return(AVar(answer)),
-    ],
-    lambdas: [],
-    base: 0,
-    members: [],
-    links: no_links(),
-  };
-  let text = spelled(printed_fn(f).pieces);
-  assert(text.index_of(b"{ rt_overflow_p(ctx, 0); goto ply_h0; }") != None);
-  assert(text.index_of(b"  ply_h0: ;\n  if (ctx->failed) return 0;\n") != None)
-}
+fn word_var(id: Int) -> Var = { id: id, ty: TyCon({ name: b"String", args: [] }), rep: RWord }
 
-/// The C of a root answering an `Int` whose body is a `handle` running `inside`.
-fn guarded(inside: Block) -> Bytes / {abort.raise} = {
-  let answer = { id: 0, ty: TyCon({ name: b"Int", args: [] }), rep: RInt };
+/// A `handle` with no clauses running `body`, holding nothing across it, its answer `answer`.
+fn handle_over(answer: Var, body: Block) -> Inst =
+  Handle({
+    body: body,
+    args: [],
+    uses: { takes: [], owned: false, fails: false, stops: false },
+    site: { clauses: [], ret: None, detached: None },
+    answer: answer,
+    unwind: [],
+  })
+
+/// The C of a root answering a word, whose body is `body` and then answers `answer`.
+fn answering(answer: Var, body: Block) -> Bytes / {abort.raise} =
   spelled(
     printed_fn({
       key: Named(b"m.guarded"),
       kind: Rooted,
       params: [],
-      conv: { params: [], reps: [], answer: RInt },
-      body: [
-        Handle({
-          body: inside,
-          args: [],
-          uses: { takes: [], owned: false, fails: false, stops: false },
-          site: { clauses: [], ret: None, detached: None },
-          answer: answer,
-          unwind: [],
-        }),
-        Return(AVar(answer)),
-      ],
+      conv: { params: [], reps: [], answer: RWord },
+      body: body.push(Return(AVar(answer))),
       lambdas: [],
       base: 0,
       members: [],
       links: no_links(),
     }).pieces,
   )
+
+/// A handle (label 1) inside another's body (label 0), its own body reading a word from a runtime
+/// function that fails where `fails` says.
+fn nested_handles(fails: Bool) -> Bytes / {abort.raise} = {
+  let outer = word_var(0);
+  let inner = word_var(1);
+  let t = word_var(2);
+  let probe = Let({
+    var: t,
+    val: Native({
+      name: b"rt_probe_p",
+      args: [],
+      uses: { takes: [], owned: true, fails: fails, stops: false },
+    }),
+    at: span_between(0, 0),
+    unwind: [],
+  });
+  answering(outer, [
+    handle_over(outer, [
+      handle_over(inner, [probe, Assign({ var: inner, arg: AVar(t) })]),
+      Assign({ var: outer, arg: AVar(inner) }),
+    ]),
+  ])
+}
+
+test "a failure inside a handle's body goes to its landing, and the landing leaves by the handle's leave" {
+  let failing = nested_handles(true);
+  let quiet = nested_handles(false);
+  assert_eq(occurrences(failing, landing_jump(1)), occurrences(quiet, landing_jump(1)) + 1);
+  assert_eq(occurrences(failing, b"return "), occurrences(quiet, b"return "));
+  // The inner handle's own leave is the outer one's landing, wherever its landing reads its answer.
+  let after = match failing.index_of(b"ply_h1:") {
+    Some(at) -> failing.slice(at, failing.len()),
+    None -> b"",
+  };
+  assert(match after.index_of(b"ply_h0:") {
+    Some(end) -> after.slice(0, end).index_of(landing_jump(0)) != None,
+    None -> false,
+  })
 }
 
 test "a fail inside a handle's body goes to its landing, never out of the function" {
-  let answer = { id: 0, ty: TyCon({ name: b"Int", args: [] }), rep: RInt };
-  let set = guarded([Assign({ var: answer, arg: AInt(1) })]);
-  let failing = guarded([Fail(b"no arm matched")]);
+  let answer = word_var(0);
+  let set = answering(answer, [handle_over(answer, [Assign({ var: answer, arg: AZero(RWord) })])]);
+  let failing = answering(answer, [
+    handle_over(answer, [Fail({ why: NoArm, at: span_between(0, 0) })]),
+  ]);
   assert_eq(occurrences(failing, landing_jump(0)), occurrences(set, landing_jump(0)) + 1);
   assert_eq(occurrences(failing, b"return "), occurrences(set, b"return "))
 }
 
 fn occurrences(t: Bytes, s: Bytes) -> Int / {abort.raise} = t.split(s).len() - 1
+
+test "a tail group is one function switching on its member's place, each arm opening its member's words" {
+  let int = TyCon({ name: b"Int", args: [] });
+  let which = { id: 0, ty: int, rep: RInt };
+  let n = { id: 1, ty: int, rep: RInt };
+  let m = { id: 2, ty: int, rep: RInt };
+  let conv = { params: [Given], reps: [RInt], answer: RInt };
+  let text = spelled(
+    printed_fn({
+      key: Named(b"m.even"),
+      kind: Rooted,
+      params: [which],
+      conv: { params: [Given], reps: [RInt], answer: RWord },
+      body: [
+        Case({
+          on: which,
+          test: TInt([0, 1]),
+          arms: [
+            { when: 0, body: [Enter({ member: 1, args: [AVar(n)] })] },
+            { when: 1, body: [Return(AVar(m))] },
+          ],
+          rest: [Return(AZero(RWord))],
+        }),
+      ],
+      lambdas: [],
+      base: 0,
+      members: [
+        { key: Named(b"m.even"), base: 0, params: [n], conv: conv },
+        { key: Named(b"m.odd"), base: 40, params: [m], conv: conv },
+      ],
+      links: no_links(),
+    }).pieces,
+  );
+  let g = symbol_of(b"m.even").concat(b"_group");
+  assert(
+    text.index_of(Bytes::concat_all([b"static Word ", g, b"(PlyCtx *ctx, int which, Word p0) {\n"]))
+      != None,
+  );
+  assert(
+    text.index_of(
+        Bytes::concat_all([
+          b"  switch (which) {\n  case 0: {\n    int64_t t1 = ",
+          word_as(b"p0", RInt),
+          b";\n",
+        ]),
+      )
+      != None,
+  );
+  // A member answers at its own convention, made the group's word.
+  assert(
+    text.index_of(
+        Bytes::concat_all([b"  case 1: {\n    int64_t t2 = ", word_as(b"p0", RInt), b";\n"]),
+      )
+      != None,
+  );
+  assert(text.index_of(Bytes::concat_all([b"  return ", as_word(b"t2", RInt), b";\n"])) != None);
+  assert(text.index_of(Bytes::concat_all([g, b"(ctx, (int)args[0], args[1]);\n}\n"])) != None)
+}
 
 test "a closure's function follows its root's entry, and its body numbers its temporaries afresh" {
   let int = TyCon({ name: b"Int", args: [] });

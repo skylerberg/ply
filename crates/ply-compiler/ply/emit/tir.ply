@@ -82,12 +82,13 @@ pub type Path =
   | PCapture(Int)
   | PLeaf(Int)
 
-/// What a `Case` tests its subject against.
+/// What a `Case` tests its subject against. An arm's `when` is an index into a `TTag`'s
+/// constructors or a `TInt`'s integers; a `TRange` holds one arm, `when` 0. Under `TLength` an arm's
+/// `when` k is a list of exactly k items, and of at least k where k is `at_least`.
 pub type Test =
   | TTag(List<Bytes>)
   | TInt(List<Int>)
   | TRange({ lo: Int, hi: Int })
-  | TLit(Lit)
   | TLength({ at_least: Int })
 
 /// An operation one family of the lowering writes and prints beyond the shared values. What it
@@ -104,10 +105,15 @@ pub type Val =
   | Static(Bytes)
   /// `kept` are the fields the cells `reuse` names already hold, which are not written again.
   | Make({ made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> })
+  /// What `path` reads out of `of`: borrowed from it, but by `PNamed`, which the runtime looks up by
+  /// name and answers with a count of its own, and which can fail.
   | Get({ of: Var, path: Path })
   /// `arg` held as `to`: a scalar boxed, a word opened, a flat value made its object.
   | Pack({ arg: Arg, to: Rep })
-  /// A flat value from its components in leaf order, a case's index first.
+  /// A value held as more than one part, from its parts in order: an `RFlat`'s leaves and then its
+  /// word, an `RCases`' case index and then each case's leaves (only the index where no case holds
+  /// any), an `RMaybe`'s or `RTagged`'s index and then its payload's word. A part that is itself an
+  /// `RFlat` stands for its leaves and its word.
   | Gathered({ parts: List<Arg> })
   | Call({ callee: Callee, args: List<Arg>, conv: Convention, stops: Bool })
   | Apply({ f: Arg, args: List<Arg>, conv: Convention, stops: Bool })
@@ -139,9 +145,11 @@ pub type Inst =
   | Return(Arg)
   /// A self tail call: the root's parameters take the arguments and the body starts again.
   | Restart(List<Arg>)
-  /// A tail call of member `member` of the root's group.
+  /// A tail call of member `member` of the root's group, its arguments held as that member's
+  /// convention says.
   | Enter({ member: Int, args: List<Arg> })
-  | Fail(Bytes)
+  /// The run fails as `why` says, its site the text at `at`.
+  | Fail({ why: Failure, at: Span })
   /// `body` run under the handlers `site` lays out over `args`, its answer or a clause's in `answer`.
   /// `unwind` are the owned values held across the body, which its landing releases where a failure
   /// inside it is answered by no clause; a failing instruction inside releases only what the body
@@ -156,6 +164,10 @@ pub type Inst =
   | Free({ of: Var, bytes: Arg })
   /// A block known to be held only here consumed, and its counted words bound as owned.
   | Opened({ of: Var, words: List<Var> })
+
+/// What a `Fail` fails with: no arm of a `match` matched, which fails the run, or a `let`'s pattern
+/// did not hold its value, which raises.
+pub type Failure = | NoArm | NoLet
 
 /// Whether a function is a root a program calls, counting its steps and testing for failure, or
 /// a plain one the emitter writes for a type (a drop, share, keep or copy root), which does
@@ -178,6 +190,12 @@ pub fn no_links() -> Links = { generics: [], needs: [], called: [], passes: [] }
 /// clauses, a `simulate`'s body), each `MClosure`'s `nth` its place among them; `base` is where its
 /// definition's text starts, which its failure sites count from; `members` are a tail group's roots
 /// in case order, and empty for a root of its own.
+///
+/// A tail group's `Fn` is keyed as its first member, takes one parameter, `which`, an `RInt`, and
+/// answers a word. Its body is one `Case` on `which` testing `TInt` of each member's place, arm `i`
+/// member `i`'s body, which reads `members[i].params` and answers a word by `Return`, and its rest a
+/// `Return` of a zero word. Inside arm `i` an `Enter` goes to a member's start with that member's
+/// arguments, and a `Restart` to member `i`'s.
 pub type Fn = {
   key: RootKey,
   kind: FnKind,
@@ -186,9 +204,13 @@ pub type Fn = {
   body: Block,
   lambdas: List<Lambda>,
   base: Int,
-  members: List<RootKey>,
+  members: List<Member>,
   links: Links,
 }
+
+/// A member of a tail group: its root, where its definition's text starts, its parameters at its own
+/// reps, and how its own entry and wrapper take them and answer.
+pub type Member = { key: RootKey, base: Int, params: List<Var>, conv: Convention }
 
 /// The body of a closure a root makes, numbered by its place among them, and the lambda's place in
 /// the root's text. The first `captures` of `body.params` are the words the closure captured, which
@@ -278,7 +300,7 @@ pub type Answered = | Owns | ReadsOf(Var) | Lasts
 
 pub fn answered(v: Val) -> Answered =
   match v {
-    Get(g) -> ReadsOf(g.of),
+    Get(g) -> match g.path { PNamed(_) -> Owns, _ -> ReadsOf(g.of) },
     Static(_) -> Lasts,
     Native(n) -> by_uses(n.args, n.uses),
     Op(o) -> by_uses(o.args, o.uses),
@@ -289,15 +311,15 @@ fn by_uses(args: List<Arg>, uses: Uses) -> Answered =
   if uses.owned { Owns } else { match args.at(0) { Some(AVar(x)) -> ReadsOf(x), _ -> Lasts } }
 
 /// Whether `v` can fail, so a test follows it and its `unwind` is released on the way out: a
-/// call, an allocation, a constant read from the pool, a checked operator, and what its `uses` say
-/// of a runtime function or a family's operation.
+/// call, an allocation, a constant read from the pool, a checked operator, a field read by name,
+/// and what its `uses` say of a runtime function or a family's operation.
 pub fn fails(v: Val) -> Bool =
   match v {
     Prim(p) -> checked(p.op, p.on),
     Literal(_) -> true,
     Static(_) -> false,
     Make(_) -> true,
-    Get(_) -> false,
+    Get(g) -> match g.path { PNamed(_) -> true, _ -> false },
     Pack(p) -> allocates(rep_of_arg(p.arg), p.to),
     Gathered(_) -> false,
     Call(_) -> true,
@@ -316,12 +338,14 @@ pub fn allocates(from: Rep, to: Rep) -> Bool =
 fn one_word(r: Rep) -> Bool = match r { RWord -> true, RMaybe -> true, RTagged -> true, _ -> false }
 
 /// Whether operator `op` over `on` is checked: an integer's arithmetic and shifts, which overflow
-/// or divide by zero, and a width's.
+/// or divide by zero, and a width's; an `Int` made a width it does not fit (`of_int`); a decimal's
+/// arithmetic.
 pub fn checked(op: Bytes, on: Rep) -> Bool =
   match on {
-    RInt -> arithmetic(op) || shift(op) || op == b"neg",
+    RInt -> arithmetic(op) || shift(op) || op == b"neg" || op == b"of_int",
     RNum(_) -> arithmetic(op) || shift(op) || op == b"neg",
     RFloat -> op == b"rem",
+    RDec -> arithmetic(op),
     _ -> false,
   }
 
@@ -395,6 +419,8 @@ test "each operation consumes or borrows each operand as its signature says" {
     true,
   ]);
   assert_eq(answered(Get({ of: s, path: PLeaf(0) })), ReadsOf(s));
+  // A field the runtime looks up by name is answered with a count of its own.
+  assert_eq(answered(Get({ of: s, path: PNamed(b"x") })), Owns);
   assert_eq(answered(call), Owns);
   assert_eq(answered(Native({ name: b"rt_len_p", args: [AVar(s)], uses: lent })), ReadsOf(s));
   assert_eq(answered(Op({ op: OHandle(Label(b"r")), args: [], uses: lent })), Lasts)
@@ -404,7 +430,13 @@ test "what can fail is what tests the runtime: a checked operator, a call, an al
   assert_eq(fails(Prim({ op: b"add", on: RInt, args: [AInt(1), AInt(2)] })), true);
   assert_eq(fails(Prim({ op: b"lt", on: RInt, args: [AInt(1), AInt(2)] })), false);
   assert_eq(fails(Prim({ op: b"add", on: RFloat, args: [AFloat(0), AFloat(0)] })), false);
+  assert_eq(fails(Prim({ op: b"add", on: RDec, args: [AZero(RDec), AZero(RDec)] })), true);
+  assert_eq(fails(Prim({ op: b"of_int", on: RInt, args: [AInt(300)] })), true);
   let w = { id: 2, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
+  assert_eq([PLeaf(0), PNamed(b"x")].map(|at: Path| fails(Get({ of: w, path: at }))), [
+    false,
+    true,
+  ]);
   let flat = { ..w, rep: RFlat([{ name: b"x", rep: RInt }]) };
   // Boxing and making a flat value's object allocate; holding a word as a sum's word does not.
   assert_eq(fails(Pack({ arg: AInt(7), to: RWord })), true);
