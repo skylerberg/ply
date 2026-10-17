@@ -12,13 +12,16 @@ import resolve (qualify)
 import layout (Intrinsic, intrinsics, layouts)
 import emit (emit_roots_answer, RootAnswer, Need, Layout)
 import emit.pieces (spelled)
-import emit.tir (Rep, RInt, RWord, RMaybe, RNum, Var, Arg, AVar, Val, Make, Made, MList, Call,
-                 Native, Op, OContainer, Operation, Pack, Uses, Inst, Let, Fn, Declined, Spine,
-                 Data, Containers, rep_of_arg)
+import code (NField)
+import emit.tir (Rep, RInt, RFloat, RWord, RMaybe, RNum, RFlat, Var, Arg, AVar, Val, Make, Made,
+                 MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst, Let, Fn,
+                 Declined, Spine, Data, Containers, rep_of_arg)
 import emit.tir.containers (Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew, ArraySet,
-                            ArrayOfList, ArrayGet, Bits, IntBits, FloatBits, DecimalBits)
+                            ArrayOfList, ArrayGet, ColumnField, Bits, IntBits, FloatBits,
+                            DecimalBits, Words, Payloads, Records)
 import emit.lower (lowered_fn)
-import emit.lower.base (context_of)
+import emit.lower.base (context_of, started)
+import emit.lower.containers (columned, column_read)
 import emit.lower.setting (Root, setting_in)
 import emit.print (printed_fn)
 import emit.compare (Program, program_of, formed, checked, today_text, printed_text, normalised,
@@ -229,6 +232,8 @@ test "an array is made, written and read as its elements' type lays it out" {
       b"fn read(a: Array<Int>, i: Int) -> Int / {abort.raise} = a.get(i)\n",
       b"fn words(a: Array<String>, i: Int) -> String / {abort.raise} = a.get(i)\n",
       b"fn records(n: Int, r: { x: Int, y: Int }) -> Array<{ x: Int, y: Int }> / {abort.raise} = Array::new(n, r)\n",
+      b"fn record(a: Array<{ x: Int, y: Int }>) -> Int / {abort.raise} = a.get(0).y\n",
+      b"fn options(a: Array<Option<String>>, x: Option<String>) -> Array<Option<String>> / {abort.raise} = a.set(0, x)\n",
     ]),
   );
   let op = |name: Bytes|
@@ -237,7 +242,36 @@ test "an array is made, written and read as its elements' type lays it out" {
         { op: o.op, answer: o.answer, takes: o.uses.takes },
     );
   let bits = |b: Bits, stride: Int, shape: Bytes|
-    { bits: Some(b), stride: stride, shape: [shape], counted: [] };
+    { held: Bits(b), stride: stride, shapes: [[shape]], counted: [] };
+  // A record is copied in place behind a header of its own, laid out by its own shape, which goes
+  // to the table before the element's.
+  let point = {
+    held: Records({ tail: 0 }),
+    stride: 4,
+    shapes: [[b"x!int", b"y!int"], [b"e!r(x!int,y!int)"]],
+    counted: [],
+  };
+  assert_eq(op(b"records"), [
+    { op: OContainer(ArrayNew(point)), answer: RWord, takes: [false, true] },
+  ]);
+  // An element read in place is the address of its header there, which the record's leaves are
+  // loaded from.
+  assert_eq(op(b"record"), [
+    { op: OContainer(ArrayGet(point)), answer: RWord, takes: [false, false] },
+  ]);
+  // An `Option` is its payload's word in place, every element's word counted.
+  assert_eq(op(b"options"), [
+    {
+      op: OContainer(ArraySet({ held: Payloads, stride: 1, shapes: [[b"e!m"]], counted: [0] })),
+      answer: RWord,
+      takes: [true, false, true],
+    },
+  ]);
+  assert_eq(
+    bound_in(p, b"options").fold([], |acc: List<Rep>, b: Bound|
+      match b.val { Op(o) -> acc.concat(o.args.map(rep_of_arg)), _ -> acc }),
+    [RWord, RInt, RMaybe],
+  );
   // A scalar is held as its bits in place, an element of any other type as its word.
   assert_eq(op(b"made"), [
     { op: OContainer(ArrayNew(bits(IntBits, 1, b"e!int"))), answer: RWord, takes: [false, true] },
@@ -257,14 +291,13 @@ test "an array is made, written and read as its elements' type lays it out" {
   ]);
   assert_eq(op(b"words"), [
     {
-      op: OContainer(ArrayGet({ bits: None, stride: 1, shape: [], counted: [] })),
+      op: OContainer(ArrayGet({ held: Words, stride: 1, shapes: [], counted: [] })),
       answer: RWord,
       takes: [false, false],
     },
   ]);
   // The element written is handed over as the array holds it, a scalar unboxed.
-  assert_eq(packs_in(bound_in(p, b"made")), []);
-  assert_eq(match formed(p, b"records") { Ok(_) -> None, Err(no) -> Some(no.by) }, Some(Containers))
+  assert_eq(packs_in(bound_in(p, b"made")), [])
 }
 
 test "an array of a type variable's elements is made by the runtime, its layout noted for a specialisation" {
@@ -304,7 +337,7 @@ test "a builtin where only its type arguments are filed, as in code written for 
     );
   assert_eq(op(b"count"), [OContainer(Length)]);
   assert_eq(op(b"read"), [
-    OContainer(ArrayGet({ bits: Some(IntBits), stride: 1, shape: [b"e!int"], counted: [] })),
+    OContainer(ArrayGet({ held: Bits(IntBits), stride: 1, shapes: [[b"e!int"]], counted: [] })),
   ]);
   assert_eq(op(b"glued"), [OContainer(Joined)]);
   // A call through the runtime answers a value of the type the checker filed, so it waits for one.
@@ -312,6 +345,92 @@ test "a builtin where only its type arguments are filed, as in code written for 
     match formed(q, b"measured") { Ok(_) -> None, Err(no) -> Some(no.by) },
     Some(Containers),
   )
+}
+
+test "a field of a Columns' record is read from its column, with no record made" {
+  let p = program_with(
+    Bytes::concat_all([
+      b"type P = { x: Float, label: String, at: { a: Int, b: Int } }\n",
+      b"fn x_at(ps: Columns<P>, i: Int) -> Float / {abort.raise} = ps.get(i).x\n",
+      b"fn label_at(ps: Columns<P>, i: Int) -> String / {abort.raise} = ps.get(i).label\n",
+      b"fn at_at(ps: Columns<P>, i: Int) -> Int / {abort.raise} = ps.get(i).at.b\n",
+      b"fn var_at<a>(ps: Columns<{ v: a }>, i: Int) -> a / {abort.raise} = ps.get(i).v\n",
+    ]),
+    [b"Columns::get"],
+  );
+  // The field read where the driver hands it over: the call's arguments, then the read.
+  let read = |name: Bytes|
+    match p.roots.find(|r: Root| r.full == qualify(b"m", name)) {
+      None -> [],
+      Some(r) -> match r.code {
+        None -> [],
+        Some(code) -> {
+          let cx = context_of(p.setting, r, code);
+          // The field read off the record `Columns::get` answers: the innermost of a chain of reads.
+          let base = match code.node {
+            NField(f) -> match f.base.node {
+              NField(g) -> Some({ base: g.base, name: g.field }),
+              _ -> Some({ base: f.base, name: f.field }),
+            },
+            _ -> None,
+          };
+          match base {
+            None -> [],
+            Some(b) -> match columned(cx, b.base, b.name) {
+              None -> [],
+              Some(codes) -> {
+                let ps = {
+                  id: 0,
+                  ty: match r.types.at(0) { Some(t) -> t, None -> unknown_type() },
+                  rep: RWord,
+                };
+                let i = { id: 1, ty: TyCon({ name: b"Int", args: [] }), rep: RInt };
+                let l = column_read(
+                  cx,
+                  started([ps, i]),
+                  [AVar(ps), AVar(i)],
+                  b.base,
+                  b.name,
+                  code.span,
+                );
+                l.st.insts.fold([], |acc: List<{ op: Operation, answer: Rep }>, x: Inst|
+                  match x {
+                    Let(v) -> match v.val {
+                      Op(o) -> acc.push({ op: o.op, answer: v.var.rep }),
+                      _ -> acc,
+                    },
+                    _ -> acc,
+                  })
+              },
+            },
+          }
+        },
+      },
+    };
+  // The record's fields in their order: `at`, `label`, `x`.
+  assert_eq(read(b"x_at"), [
+    {
+      op: OContainer(
+        ColumnField({
+          k: 2,
+          column: { held: Bits(FloatBits), stride: 1, shapes: [[b"x!f"]], counted: [] },
+        }),
+      ),
+      answer: RFloat,
+    },
+  ]);
+  assert_eq(read(b"label_at"), [
+    {
+      op: OContainer(
+        ColumnField({ k: 1, column: { held: Words, stride: 1, shapes: [], counted: [] } }),
+      ),
+      answer: RWord,
+    },
+  ]);
+  // A record held in place in a column is read as the address of its header there.
+  assert_eq(read(b"at_at").map(|o: { op: Operation, answer: Rep }| o.answer), [RWord]);
+  // Only a field of a record a type lays out has a column of its own.
+  assert_eq(read(b"var_at"), [])
 }
 
 /// Module `m` of the program of `sources`, run by a runtime implementing `natives`.
@@ -447,6 +566,11 @@ fn corpus() -> Bytes =
     b"fn decimals(xs: List<Decimal>) -> Array<Decimal> = Array::of_list(xs)\n",
     b"fn got(a: Array<Float>, i: Int) -> Float / {abort.raise} = a.get(i)\n",
     b"fn small(a: Array<U8>) -> U8 / {abort.raise} = a.get(2)\n",
+    b"fn points(n: Int, p: { x: Int, y: Int }) -> Array<{ x: Int, y: Int }> / {abort.raise} = Array::new(n, p)\n",
+    b"fn point_y(a: Array<{ x: Int, y: Int }>, i: Int) -> Int / {abort.raise} = a.get(i).y\n",
+    b"fn maybes(xs: List<Option<String>>) -> Array<Option<String>> = Array::of_list(xs)\n",
+    b"fn maybe_at(a: Array<Option<String>>, i: Int) -> Option<String> / {abort.raise} = a.get(i)\n",
+    b"fn put_maybe(a: Array<Option<Int>>, x: Option<Int>) -> Array<Option<Int>> / {abort.raise} = a.set(0, x)\n",
   ])
 
 fn corpus_names() -> List<Bytes> =
@@ -485,6 +609,11 @@ fn corpus_names() -> List<Bytes> =
     b"decimals",
     b"got",
     b"small",
+    b"points",
+    b"point_y",
+    b"maybes",
+    b"maybe_at",
+    b"put_maybe",
   ]
 
 /// What today's emitter answers for the roots `m.<name>` of `p` that `names` name, the runtime
@@ -519,18 +648,10 @@ test "the corpus lowers, and prints as today's emitter writes it but for counts"
       match formed(p, n) { Ok(_) -> acc, Err(no) -> acc.push({ name: n, declined: no }) }),
     [],
   );
-  // Until `own` writes counts and unwind sets, a root that only reads a word it holds leaves its
-  // count held, and a failure path holding a word releases nothing.
+  // Each root's counts, once `own` writes them, pass the check.
   assert_eq(
     corpus_names().fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
-      match checked(p, n) {
-        Ok(_) -> acc,
-        Err(why) -> if why.starts_with(b"refused by the check: a count left held")
-            || why
-            == b"refused by the check: a failure path that releases other than what it holds" {
-          acc
-        } else { acc.push({ name: n, why: why }) },
-      }),
+      match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) }),
     [],
   );
   let today = answered_with_natives(p, corpus_names());
@@ -542,28 +663,27 @@ test "the corpus lowers, and prints as today's emitter writes it but for counts"
       if form == old { acc } else { acc.push({ name: n, today: old, form: form }) }
     },
   );
-  let boxed_first = b"a scalar argument is boxed before the call stores its site, and today's after";
+  let items_boxed = b"each item boxed once every item is evaluated, a boxed number tested for failure";
+  let boxed_first = b"each operand boxed and tested before the call stores its site, where today boxes after the site without a test";
   let named = [
-    {
-      name: b"ints",
-      why: b"each item is boxed once every item is evaluated, and today's as each is",
-    },
-    {
-      name: b"floats",
-      why: b"each item is boxed once every item is evaluated, and today's as each is",
-    },
-    {
-      name: b"flags",
-      why: b"each item is boxed once every item is evaluated, and today's as each is",
-    },
-    { name: b"count", why: b"a length read stores no site, since it cannot fail" },
-    { name: b"size", why: b"a length read stores no site, since it cannot fail" },
+    { name: b"ints", why: items_boxed },
+    { name: b"floats", why: items_boxed },
+    { name: b"flags", why: items_boxed },
     { name: b"cut", why: boxed_first },
     { name: b"numbers", why: boxed_first },
-    { name: b"arity", why: b"a length read stores no site, since it cannot fail" },
     { name: b"text", why: boxed_first },
     { name: b"element", why: boxed_first },
     { name: b"reserved", why: boxed_first },
+    {
+      name: b"points",
+      why: b"the record made its object by `print.made`, which writes it otherwise",
+    },
+    { name: b"point_y", why: b"the record read off the element named by its parts" },
+    { name: b"maybe_at", why: b"an `Option` declared as `PlyMaybe`, the `Word` it is" },
+    {
+      name: b"put_maybe",
+      why: b"the element written as its payload's word; today's writes the `Option`'s object there",
+    },
   ];
   assert(
     differing.map(|d: { name: Bytes, today: List<Bytes>, form: List<Bytes> }| d.name)
@@ -678,19 +798,6 @@ fn in_place_calls() -> List<{ name: Bytes, src: Bytes }> =
     },
   ]
 
-/// The externs written in place that answer a record of what they wrote and what they took out.
-fn answering_records() -> List<Bytes> =
-  [
-    b"root_swap",
-    b"kid_swap",
-    b"spill",
-    b"pair_take",
-    b"leaf_cut",
-    b"branch_cut",
-    b"kid_out",
-    b"map_swap",
-  ]
-
 test "each extern written in place is an operation over the runtime's objects as the layouts lay them out" {
   let calls = in_place_calls();
   let probes = calls.fold(b"\n", |acc: Bytes, c: { name: Bytes, src: Bytes }|
@@ -715,8 +822,7 @@ test "each extern written in place is an operation over the runtime's objects as
             },
           }
         };
-        // Each probe writes its extern as one operation and calls nothing; one answering a record
-        // waits for records held as their fields.
+        // Each probe writes its extern as one operation and calls nothing.
         let written = |f: Fn|
           f.body.fold([], |acc: List<Val>, i: Inst|
             match i {
@@ -740,9 +846,7 @@ test "each extern written in place is an operation over the runtime's objects as
                   },
                   _ -> acc.push({ name: c.name, why: b"not one operation" }),
                 },
-                Err(no) -> if [Containers, Data].contains(no.by)
-                    && answering_records().contains(c.name) { acc }
-                else { acc.push({ name: c.name, why: no.why }) },
+                Err(no) -> acc.push({ name: c.name, why: no.why }),
               },
           ),
           [],
@@ -766,18 +870,47 @@ test "each extern written in place is an operation over the runtime's objects as
             has(b"leaf", node(laid.tree.leaf)),
             has(b"map_branch", node(laid.tree.branch)),
             has(b"tail_push", field(laid.list.room)),
+            has(b"spill", node(laid.trie.leaf)),
+            has(b"branch_cut", node(laid.tree.branch)),
+            has(b"leaf_cut", node(laid.tree.leaf)),
           ],
-          [true, true, true, true, true, true, true, true, true, true],
+          [true, true, true, true, true, true, true, true, true, true, true, true, true],
         );
         // A write makes what it writes held once where it is not, and counts an item's or a pair's.
         assert_eq(
           [
             has(b"tail_push", b"rt_list_writable_p(ctx, "),
             has(b"leaf_set", b"rt_node_writable_p(ctx, "),
+            has(b"map_swap", b"rt_map_writable_p(ctx, "),
             has(b"pair_set", b"rt_note_update_p(ctx, "),
             has(b"kid_put", b"rt_note_update_p(ctx, "),
           ],
-          [true, true, true, false],
+          [true, true, true, true, false],
+        );
+        // An extern answering a record answers it as its fields, no record made: its word stays none.
+        let fields = |name: Bytes|
+          match form(name) {
+            Ok(f) ->
+              f.body.fold([], |acc: List<Rep>, i: Inst|
+                match i {
+                  Let(l) -> match l.val { Op(_) -> acc.push(l.var.rep), _ -> acc },
+                  _ -> acc,
+                }),
+            Err(_) -> [],
+          };
+        assert_eq(fields(b"root_swap"), [
+          RFlat([{ name: b"list", rep: RWord }, { name: b"old", rep: RMaybe }]),
+        ]);
+        assert_eq(fields(b"pair_take"), [
+          RFlat([
+            { name: b"key", rep: RInt },
+            { name: b"node", rep: RWord },
+            { name: b"value", rep: RWord },
+          ]),
+        ]);
+        assert(
+          code(b"pair_take").index_of(b"_3 = 0;") != None,
+          Some(String::of_bytes_lossy(code(b"pair_take"))),
         );
         assert_eq(
           calls.filter(|c: { name: Bytes, src: Bytes }| has(c.name, b"builtin_")).map(
