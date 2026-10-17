@@ -15,14 +15,14 @@ import emit (Width, Ctors, SumCtor, Scalar, Exact, Whole, Cases, KSum, literal_b
 import emit.keys
 import emit.keys (RootKey, TypeOp, Root, Written, Order, Reflect, Shown, Digest, Contained)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RCases, Arg, AVar, AInt,
-                 ABool, AFloat, ANum, AChar, Val, Prim, Literal, Get, Gathered, Call, Native, Given,
+                 ABool, AFloat, ANum, AChar, Val, Prim, Literal, Get, Tag, Call, Native, Given, Let,
                  Decl, Assign, If, Scalars, rep_of_arg, comparison, arithmetic, shift)
-import emit.lower.setting (carrier_of)
+import emit.lower.setting (carrier_of, declared_at)
 import emit.lower.held (held_as, carried_as, arg_path)
 import emit.lower.base (Context, Lowering, Lowered, refuse, fresh, bound, bound_as, opened,
                         continued, type_of, handed, noted, set_join, joined, short_circuit,
                         through_runtime, as_words)
-import emit.lower.data (constructed, field)
+import emit.lower.data (constructed_as, field)
 
 /// A literal as the operand it is, or read from the pool into a variable of its type where no
 /// register holds it: a string, bytes, an embedded file, a `Decimal`, `()` and a width past 64 bits.
@@ -364,16 +364,24 @@ pub fn operated(
         bound(cx, x.st, named_type(b"Int"), Prim({ op: b"bits", on: RFloat, args: [x.arg] }), at)
       } else if wrapping(name) || saturating(name) || name.starts_with(b"checked_") {
         width_arithmetic(cx, st, name, args, at)
-      } else {
+      } else if name == b"?stated_witness" { witnessed(cx, st, a, at) } else {
         match of_int_width(name) {
-          Some(w) -> if w.bits > 64 { through_runtime(cx, st, name, args, width_type(w), at) }
-          else {
+          Some(w) -> if w.bits > 64 {
+            through_runtime(cx, st, name, args, answer_of(cx, name, type_of(a), width_type(w)), at)
+          } else {
             let x = handed({ st: st, arg: a }, RInt, at);
             bound(cx, x.st, width_type(w), Prim({ op: b"of_int", on: RInt, args: [x.arg] }), at)
           },
           None -> match int_of_width(name) {
             Some(w) -> if w.bits > 64 || (w.bits == 64 && !w.signed) {
-              through_runtime(cx, st, name, args, named_type(b"Int"), at)
+              through_runtime(
+                cx,
+                st,
+                name,
+                args,
+                answer_of(cx, name, type_of(a), named_type(b"Int")),
+                at,
+              )
             } else {
               let x = handed({ st: st, arg: a }, RNum(w), at);
               bound(
@@ -384,17 +392,47 @@ pub fn operated(
                 at,
               )
             },
-            None -> if name == b"?stated_witness" {
-              refuse(
-                st,
-                Scalars,
-                b"a stated witness, which names a constructor's tag no operand holds",
-              )
-            } else { refuse(st, Scalars, b"a builtin no scalar's: ".concat(name)) },
+            None -> refuse(st, Scalars, b"a builtin no scalar's: ".concat(name)),
           },
         }
       }
     },
+  }
+
+/// The type builtin `name` answers called on operands of type `ty`: its declared scheme at that
+/// type, or `known` where the setting declares no such builtin.
+fn answer_of(cx: Context, name: Bytes, ty: Type, known: Type) -> Type =
+  match declared_at(cx.setting, name, [ty]) { Some(t) -> t.ret, None -> known }
+
+/// The witness of a type that states its own arithmetic, which the elaboration names by one of the
+/// type's constructors written as a literal string: the runtime's first such witness past that
+/// constructor's tag. The literal is read as the name it spells, never from the pool.
+fn witnessed(cx: Context, st: Lowering, a: Arg, at: Span) -> Lowered =
+  match read_literal(st, a) {
+    None -> refuse(st, Scalars, b"a stated witness named by no literal"),
+    Some(s) -> if !cx.setting.ctors.names.contains(s.name) {
+      refuse(s.st, Scalars, b"a stated witness of a type no constructor names")
+    } else {
+      let tag = bound(cx, s.st, named_type(b"Int"), Tag(s.name), at);
+      bound(cx, tag.st, named_type(b"Int"), Prim({ op: b"witness", on: RInt, args: [tag.arg] }), at)
+    },
+  }
+
+/// The string `a` holds where the last instruction of `st` read it from the pool as a literal, and
+/// `st` without that read, which nothing else reads.
+fn read_literal(st: Lowering, a: Arg) -> Option<{ st: Lowering, name: Bytes }> =
+  match a {
+    AVar(v) -> match st.insts.at(st.insts.len() - 1) {
+      Some(Let(l)) -> if l.var.id != v.id { None } else {
+        match l.val {
+          Literal(LStr(n)) ->
+            Some({ st: { ..st, insts: st.insts.take(st.insts.len() - 1) }, name: n }),
+          _ -> None,
+        }
+      },
+      _ -> None,
+    },
+    _ -> None,
   }
 
 /// What an operator over two values of a type does, read off the type alone: C's own over a scalar
@@ -620,7 +658,7 @@ fn ordered(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let ty = match a { AInt(_) -> type_of(b), _ -> type_of(a) };
-  let order = named_type(b"Ordering");
+  let order = answer_of(cx, name, ty, named_type(b"Ordering"));
   match by_root(cx, st, ty, a, b, at) {
     Some(o) -> o,
     None -> {
@@ -723,9 +761,9 @@ fn sign_at(cx: Context, l: Lowered, r: Lowered, ty: Type, at: Span) -> Lowered /
 /// container and a record through a root; by the runtime's builtin at any other type.
 fn reflected(cx: Context, st: Lowering, name: Bytes, a: Arg, at: Span) -> Lowered / {abort.raise} = {
   let ty = type_of(a);
-  let value_type = named_type(b"std.value.Value");
+  let value_type = answer_of(cx, name, ty, named_type(b"std.value.Value"));
   let op = if name == b"shown" { Shown } else { Reflect };
-  let value = |ctor: Bytes| constructed(cx, st, ctor, [a], at, at);
+  let value = |ctor: Bytes| constructed_as(cx, st, ctor, [a], value_type, at);
   let runtime = || through_runtime(cx, needing(st, ty, true), name, [a], value_type, at);
   if !cx.setting.ctors.names.contains(b"std.value.VUnit") || has_vars(ty) { runtime() } else {
     match ty {
@@ -739,9 +777,10 @@ fn reflected(cx: Context, st: Lowering, name: Bytes, a: Arg, at: Span) -> Lowere
       else if c.name == b"Char" { value(b"std.value.VChar") }
       else if c.name == b"String" { value(b"std.value.VStr") }
       else if c.name == b"Bytes" { value(b"std.value.VBytes") }
-      else if c.name == b"Unit" { constructed(cx, st, b"std.value.VUnit", [], at, at) } else {
+      else if c.name == b"Unit" { constructed_as(cx, st, b"std.value.VUnit", [], value_type, at) }
+      else {
         match width_named(c.name) {
-          Some(w) -> if w.bits < 64 { width_reflected(cx, st, c.name, w, a, at) }
+          Some(w) -> if w.bits < 64 { width_reflected(cx, st, c.name, w, a, value_type, at) }
           else { runtime() },
           None -> runtime(),
         }
@@ -761,6 +800,7 @@ fn width_reflected(
   name: Bytes,
   w: Width,
   a: Arg,
+  value_type: Type,
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let int = named_type(b"Int");
@@ -776,7 +816,7 @@ fn width_reflected(
   };
   let wide = through_runtime(cx, bits.st, b"U128::of_int", [bits.arg], named_type(b"U128"), at);
   let spelled = literal(cx, wide.st, LStr(name), at);
-  constructed(cx, spelled.st, b"std.value.VFixed", [spelled.arg, wide.arg], at, at)
+  constructed_as(cx, spelled.st, b"std.value.VFixed", [spelled.arg, wide.arg], value_type, at)
 }
 
 /// `digest(a)`, or `?encoded(a)` where `hashed` is false: the encoding of a declared sum, a container
@@ -784,7 +824,7 @@ fn width_reflected(
 /// builtin.
 fn encoded(cx: Context, st: Lowering, hashed: Bool, a: Arg, at: Span) -> Lowered / {abort.raise} = {
   let ty = type_of(a);
-  let bytes = named_type(b"Bytes");
+  let bytes = answer_of(cx, if hashed { b"digest" } else { b"?encoded" }, ty, named_type(b"Bytes"));
   let rooted_by = match ty {
     TyCon(c) -> !has_vars(ty) && (written_sum(cx.setting.ctors, c) || walked_container(ty)),
     TyRecord(_) -> !has_vars(ty),
@@ -842,21 +882,21 @@ fn width_arithmetic(
   let b = match args.at(1) { Some(x) -> x, None -> AInt(0) };
   let ty = match a { AInt(_) -> type_of(b), _ -> type_of(a) };
   let checked = name.starts_with(b"checked_");
-  let answer = if checked { TyCon({ name: b"Option", args: [ty] }) } else { ty };
+  let answer = answer_of(cx, name, ty, if checked { TyCon({ name: b"Option", args: [ty] }) }
+  else { ty });
   match class_of(cx.setting.ctors, ty) {
     CWidth(w) -> if wrapping(name) {
       over(cx, { st: st, arg: a }, { st: st, arg: b }, name, RNum(w), ty, at)
-    } else if w.bits >= 64 || (checked && held_as(cx.setting, answer) != RMaybe) {
-      through_runtime(cx, st, name, args, answer, at)
-    } else if checked { checked_width(cx, st, name, a, b, w, ty, at) }
+    } else if w.bits >= 64 { through_runtime(cx, st, name, args, answer, at) }
+    else if checked { checked_width(cx, st, name, a, b, w, answer, at) }
     else { over(cx, { st: st, arg: a }, { st: st, arg: b }, name, RNum(w), ty, at) },
     _ -> through_runtime(cx, needing(st, ty, false), name, args, answer, at),
   }
 }
 
-/// A width's checked arithmetic below 64 bits: exact in 64 bits, `Some` of the answer where the
-/// width holds it and `None` where it does not. Only an unsigned 32-bit product needs the unsigned
-/// word, and it can only pass the greatest value.
+/// A width's checked arithmetic below 64 bits, answering an `Option` of type `option`: exact in 64
+/// bits, `Some` of the answer where the width holds it and `None` where it does not. Only an
+/// unsigned 32-bit product needs the unsigned word, and it can only pass the greatest value.
 fn checked_width(
   cx: Context,
   st: Lowering,
@@ -864,9 +904,10 @@ fn checked_width(
   a: Arg,
   b: Arg,
   w: Width,
-  ty: Type,
+  option: Type,
   at: Span,
 ) -> Lowered / {abort.raise} = {
+  let ty = width_type(w);
   let neg = name == b"checked_neg";
   let unsigned = !w.signed && name == b"checked_mul";
   let word = { bits: 64, signed: false };
@@ -902,20 +943,9 @@ fn checked_width(
     Prim({ op: b"narrow", on: rep_of_arg(exact.arg), args: [exact.arg] }),
     at,
   );
-  // An `Option` of a width is its payload's word: `Some` its index and the width's word, `None` its
-  // index alone.
-  let option = TyCon({ name: b"Option", args: [ty] });
-  let held = held_as(cx.setting, option);
-  let payload = handed(narrowed, RWord, at);
-  let some = bound_as(payload.st, option, held, Gathered({ parts: [AInt(1), payload.arg] }), at);
-  let none = bound_as(
-    continued(opened(fits.st), some.st),
-    option,
-    held,
-    Gathered({ parts: [AInt(0)] }),
-    at,
-  );
-  let j = fresh(continued(fits.st, none.st), option, held);
+  let some = constructed_as(cx, narrowed.st, b"Some", [narrowed.arg], option, at);
+  let none = constructed_as(cx, continued(opened(fits.st), some.st), b"None", [], option, at);
+  let j = fresh(continued(fits.st, none.st), option, held_as(cx.setting, option));
   let t = set_join(j.st, some, j.var, at);
   let e = set_join(t.st, none, j.var, at);
   {
