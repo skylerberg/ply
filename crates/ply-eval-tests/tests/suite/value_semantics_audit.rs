@@ -155,7 +155,7 @@ fn the_order_and_the_language_equality_part_at_a_nan_and_also_at_negative_zero()
 }
 
 #[test]
-fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
+fn two_decimals_that_are_one_map_key_build_one_entry_under_the_spelling_given_first() {
     let short = Value::Decimal(Decimal::try_from_i128_with_scale(15, 1).expect("1.5"));
     let long = Value::Decimal(Decimal::try_from_i128_with_scale(150, 2).expect("1.50"));
 
@@ -171,7 +171,7 @@ fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
         "two values that are one `Map` key keep two different scales"
     );
 
-    // One key, canonical, whichever spelling was written last.
+    // One key, held as it was first given; a later spelling of it takes the value.
     let short_then_long = Value::map([
         (short.clone(), Value::Int(1)),
         (long.clone(), Value::Int(2)),
@@ -190,9 +190,7 @@ fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
     );
     assert_eq!(
         format!("{long_then_short:?}"),
-        "Map([(Decimal(1.5), Int(2))])",
-        "two `==`-equal maps render as two different strings, so `Map::keys`, `Map::entries`, \
-         `Map::fold` and every derived encoding over them are functions of insertion history"
+        "Map([(Decimal(1.50), Int(2))])"
     );
 }
 
@@ -213,7 +211,7 @@ fn a_value_is_still_thirty_two_bytes_wide_and_an_optional_one_costs_nothing() {
 }
 
 #[test]
-fn canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it() {
+fn a_key_holding_a_credential_is_held_as_given_and_never_copied_out() {
     let (secret, payload) = credential("hunter2");
     let key = Value::Record(Arc::new(
         [
@@ -242,23 +240,23 @@ fn canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it() {
                 .get(&ply_eval::Symbol::new("d"))
                 .expect("the decimal field")
         ),
-        "Decimal(1.5)",
-        "the key was not canonicalized, so this test is not exercising the rebuild"
+        "Decimal(1.50)",
+        "the map rewrote the key it was given"
     );
     match fields.get(&ply_eval::Symbol::new("p")) {
         Some(Value::Secret(held)) => assert!(
             Arc::ptr_eq(held, &payload),
-            "canonicalization rebuilt a credential's payload instead of cloning the `Arc`"
+            "the map rebuilt a credential's payload instead of holding the `Arc` it was given"
         ),
         other => panic!("the credential stopped being a `Secret`: {other:?}"),
     }
     let copied = format!("{:?}", Plain::of(&m));
     assert!(
         copied.contains("Secret"),
-        "a canonicalized key lost its credential: {copied}"
+        "a key lost its credential: {copied}"
     );
     assert!(
         !copied.contains("hunter2"),
-        "a canonicalized key copied a credential out: {copied}"
+        "a key copied a credential out: {copied}"
     );
 }

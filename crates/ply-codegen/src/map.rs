@@ -412,7 +412,8 @@ impl Heap {
         copy
     }
 
-    /// `Map::insert`, replacing key and value when present. Takes all three.
+    /// `Map::insert`: a key [`heap::cmp_words`] finds equal to one the map holds keeps the key the
+    /// map holds and takes the value. Takes all three.
     pub fn map_insert(&mut self, layouts: &Layouts, m: Word, k: Word, v: Word) -> Word {
         let m = self.writable_map(m);
         let r = root(m);
@@ -534,12 +535,9 @@ impl Heap {
         let n = count(leaf);
         match leaf_find(layouts, leaf, k) {
             Ok(i) => {
-                unsafe {
-                    dec(leaf_key(leaf, i));
-                    dec(leaf_value(leaf, i));
-                    set_word(leaf, 2 * i, k);
-                    set_word(leaf, 2 * i + 1, v);
-                }
+                dec(k);
+                dec(leaf_value(leaf, i));
+                unsafe { set_word(leaf, 2 * i + 1, v) };
                 Inserted {
                     node: leaf as Word,
                     max: leaf_key(leaf, n - 1),
@@ -600,15 +598,27 @@ impl Heap {
 
     /// `Map::remove`. Takes the map, reads the key.
     pub fn map_remove(&mut self, layouts: &Layouts, m: Word, k: Word) -> Word {
-        if get(layouts, obj(m), k).is_none() {
-            return m;
-        }
-        let (m, entry) = self.map_take(layouts, m, Which::Key(k));
+        let (m, entry) = self.map_take_key(layouts, m, k);
         if let Some((key, value)) = entry {
             dec(key);
             dec(value);
         }
         m
+    }
+
+    /// The map without the entry of the key equal to `k`, and that entry, the key the map held
+    /// with it, each word the caller's; the map as it was and no entry where `k` is absent. Takes
+    /// the map, reads the key.
+    pub fn map_take_key(
+        &mut self,
+        layouts: &Layouts,
+        m: Word,
+        k: Word,
+    ) -> (Word, Option<(Word, Word)>) {
+        if get(layouts, obj(m), k).is_none() {
+            return (m, None);
+        }
+        self.map_take(layouts, m, Which::Key(k))
     }
 
     /// The map without its least entry, or its greatest, and that entry, each word the caller's;

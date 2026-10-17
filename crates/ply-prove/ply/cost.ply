@@ -4,20 +4,23 @@
 
 import compiler.diagnostics (parse_all)
 import compiler.front (Analysed, ClaimClause, Refused, analyse, claims_in)
-import compiler.items (SCost)
+import compiler.items (SCost, parse)
+import compiler.exprs (prelude_module)
 import compiler.resolve (Diag)
 import compiler.code (Code, Node, Borrowed, NLit, NVar, NUnary, NBinary, NApp, NKnown, NIf, NBlock,
                       NList, NRecord, NMatch, NPerform, NLabel, NLambda, NSimulate, NParallel,
                       NHandle, NField, NUpdate, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm,
                       CodePattern, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CodePatternField,
                       Capture)
-import compiler.infer (Builtin, builtins)
+import compiler.infer (Builtin, builtins, externs_of)
 import compiler.parsing (dummy_span)
+import compiler.semantics (Iterates, Mapped, Kept, Updated, iterates, prelude_iterates)
 import compiler.patterns (LInt)
 import compiler.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field)
 import context (Context, Def, claims_of, context, ctor, signature, is_recursive, reaches_key)
 import domain (Ty, Fn, Con)
 import std.list
+import std.prelude_source
 import std.result
 import world (world_of)
 
@@ -41,12 +44,25 @@ type Walked = {
   back: List<List<Of>>,
 }
 
-/// `Same(i)` is parameter `i` itself; `Part(i)`, a tail a list pattern took off it.
-pub type Of = | Same(Int) | Part(Int) | Other
+/// `Same(i)` is parameter `i` itself; `Part(i)`, a tail a list pattern took off it; `Toward`, an
+/// `Int` parameter moved by a positive literal toward the limit the path holds it short of.
+pub type Of = | Same(Int) | Part(Int) | Toward(Found) | Other
+
+/// The `Int` parameter at `index` held short of a limit on a path: below it where `rising`, else
+/// above it, and never at it where `strict`.
+pub type Found = { index: Int, limit: Limit, rising: Bool, strict: Bool }
+
+/// What holds an index short: the list parameter at which `List::at` found an element there, so
+/// the index is at least zero and below its length; the length of a parameter; or a literal.
+pub type Limit = | Held(Int) | Length(Int) | Literal(Int)
+
+/// How a recursion descends: on a tail of the list parameter a list pattern took a head off, or on
+/// an index it moves toward a limit it hands on unchanged.
+pub type Descent = | OnTail(Int) | OnIndex(Found)
 
 /// `own` is the definition whose calls back are counted rather than bounded; `known`, the steps of
 /// what it calls; `first_order`, whether each builtin calls nothing back; `empty`, a list parameter
-/// known empty.
+/// known empty; `found`, what holds an index short on the path; `missed`, a fact that fails.
 type Env = {
   cx: Context,
   slots: List<Slot>,
@@ -54,6 +70,8 @@ type Env = {
   known: Map<String, Result<Poly, String>>,
   first_order: Map<String, Bool>,
   empty: Option<Int>,
+  found: List<Found>,
+  missed: Option<Found>,
 }
 
 type Slot = { size: Option<Poly>, of: Of, fun: Option<Poly> }
@@ -268,7 +286,8 @@ pub fn steps(cx: Context, def: String) -> Result<Poly, String> / {abort.raise} =
     if ready.len() == 0 { Stop(known) } else {
       Continue(
         ready.fold(known, |k: Map<String, Result<Poly, String>>, n: String|
-          k.insert(n, steps_of(cx, first_order, n, k))),
+          k.insert(n, if by_entry(cx, n) { Err("`" ++ n ++ "` is read by its entry") }
+          else { steps_of(cx, first_order, n, k) })),
       )
     }
   });
@@ -309,13 +328,18 @@ pub fn holding_keyed(cx: Context, defs: List<String>) -> Option<String> =
       })
   }
 
-/// Each builtin by name, and whether it calls nothing it is handed back.
+/// Each native by the name a call reaches it by, and whether it calls nothing it is handed back: the
+/// prelude's builtins, and the natives of the types it declares, which the bodies it writes in Ply
+/// call by their program-wide names.
 pub fn first_order_builtins() -> Map<String, Bool> / {abort.raise} =
-  builtins().fold(Map::new(), |m: Map<String, Bool>, b: Builtin|
-    m.insert(String::of_bytes_lossy(b.name), match b.scheme.ty {
-      TyFn(f) -> !f.params.fold(false, |any: Bool, t: Type| any || calls_back(t)),
-      _ -> true,
-    }))
+  builtins().concat(externs_of(prelude_module(), parse(prelude_source::text()).node)).fold(
+    Map::new(),
+    |m: Map<String, Bool>, b: Builtin|
+      m.insert(String::of_bytes_lossy(b.name), match b.scheme.ty {
+        TyFn(f) -> !f.params.fold(false, |any: Bool, t: Type| any || calls_back(t)),
+        _ -> true,
+      }),
+  )
 
 /// Whether a value of `t` may be a function a builtin handed it calls.
 fn calls_back(t: Type) -> Bool =
@@ -329,7 +353,8 @@ fn calls_back(t: Type) -> Bool =
 
 pub fn callees(cx: Context, def: String) -> List<String> =
   match cx.claims.defs.get(def) {
-    Some(d) -> d.refs.filter(|n: String| cx.claims.defs.contains(n)),
+    Some(d) -> if by_entry(cx, def) { [] }
+    else { d.refs.filter(|n: String| cx.claims.defs.contains(n)) },
     None -> [],
   }
 
@@ -380,6 +405,8 @@ fn steps_of(
           known: known,
           first_order: first_order,
           empty: None,
+          found: [],
+          missed: None,
         };
         match walk(env, body) {
           Err(why) -> Err(why),
@@ -390,21 +417,26 @@ fn steps_of(
             match descent(def, w.calls, w.back, w.cost, "steps grow") {
               Err(why) -> Err(why),
               Ok(None) -> Ok(plus(constant(), w.cost)),
-              // A call enters with that list empty at most once, and it takes no arm that needs a
-              // head of it.
-              Ok(Some(p)) -> match walk(
-                  {
-                    ..env,
-                    empty: Some(p),
-                    slots: env.slots.set(p, { size: Some(zero()), of: Same(p), fun: None }),
-                  },
-                  body,
-                ) {
-                Err(why) -> Err(why),
-                Ok(e) -> match product(size_of(p), plus(constant(), w.cost)) {
-                  Ok(chain) -> Ok(plus(chain, plus(constant(), e.cost))),
+              // At most as many calls as the descent bounds enter with an element left to take or
+              // the index short of its limit, and at most one without, which takes no path that
+              // needs one.
+              Ok(Some(d)) -> {
+                let last = match d {
+                  OnTail(p) ->
+                    {
+                      ..env,
+                      empty: Some(p),
+                      slots: env.slots.set(p, { size: Some(zero()), of: Same(p), fun: None }),
+                    },
+                  OnIndex(f) -> { ..env, missed: Some(f) },
+                };
+                match walk(last, body) {
                   Err(why) -> Err(why),
-                },
+                  Ok(e) -> match product(descent_calls(d), plus(constant(), w.cost)) {
+                    Ok(chain) -> Ok(plus(chain, plus(constant(), e.cost))),
+                    Err(why) -> Err(why),
+                  },
+                }
               },
             }
           },
@@ -490,34 +522,78 @@ pub fn params_sized(cx: Context, def: String, params: Int) -> List<Bool> =
     None -> range(0, params).map(|_i: Int| false),
   }
 
-/// The list parameter a recursion is bounded by, where it calls back at all: every call back takes a
-/// strict part of it, calls back at most once on each path, and hands every other parameter what
-/// `grows` grows with on unchanged or a part. A call that calls back took a head off that list, so at
-/// most its length do, each spending at most what one body does.
+/// How a recursion descends, where it calls back at all: every call back takes a strict part of one
+/// list parameter, or hands an `Int` parameter on moved toward a limit the path held it short of,
+/// and any parameter that limit is of on unchanged; it calls back at most once on each path, and
+/// hands every other parameter what `grows` grows with on unchanged or a part. A call that calls
+/// back took a head off that list, or held its index short of the limit and moved it at least one
+/// closer, so at most `descent_calls` of them do, each spending at most what one body does.
 pub fn descent(
   def: String,
   calls: Int,
   back: List<List<Of>>,
   grows: Poly,
   what: String,
-) -> Result<Option<Int>, String> =
+) -> Result<Option<Descent>, String> =
   if calls > 1 { Err("`" ++ def ++ "` calls itself more than once on one path") }
   else if back.len() == 0 { Ok(None) } else {
     let first = match back.at(0) { Some(args) -> args, None -> [] };
-    let descending = range(0, first.len()).fold(None, |found: Option<Int>, i: Int|
+    let tail = range(0, first.len()).fold(None, |found: Option<Descent>, i: Int|
       match found {
         Some(_) -> found,
-        None -> if back.fold(true, |all: Bool, args: List<Of>|
-            all && (match args.at(i) { Some(Part(j)) -> j == i, _ -> false })) { Some(i) }
+        None -> if every_call(back, |args: List<Of>|
+            match args.at(i) { Some(Part(j)) -> j == i, _ -> false }) { Some(OnTail(i)) }
         else { None },
       });
-    match descending {
+    let index = match tail {
+      Some(_) -> tail,
       None ->
-        Err("`" ++ def ++ "` does not call itself on a part of one list parameter every time"),
-      Some(p) -> if !kept(grows, back) {
+        range(0, first.len()).fold(None, |found: Option<Descent>, i: Int|
+          match ((found, first.at(i))) {
+            (None, Some(Toward(f))) -> if f.index == i
+                && every_call(back, |args: List<Of>|
+                  args.at(i) == Some(Toward(f)) && limit_kept(f.limit, args)) { Some(OnIndex(f)) }
+            else { None },
+            _ -> found,
+          }),
+    };
+    match index {
+      None ->
+        Err(
+          "`" ++ def
+            ++ "` does not call itself on a part of one list parameter, or on an index moved toward a limit it holds it short of, every time",
+        ),
+      Some(d) -> if !kept(grows, back) {
         Err("`" ++ def ++ "` hands on a parameter its " ++ what ++ " with, changed")
-      } else { Ok(Some(p)) },
+      } else { Ok(Some(d)) },
     }
+  }
+
+fn every_call(back: List<List<Of>>, at: (List<Of>) -> Bool) -> Bool =
+  back.fold(true, |all: Bool, args: List<Of>| all && at(args))
+
+/// A call hands on unchanged the parameter `l` is of.
+fn limit_kept(l: Limit, args: List<Of>) -> Bool =
+  match l {
+    Held(p) -> args.at(p) == Some(Same(p)),
+    Length(p) -> args.at(p) == Some(Same(p)),
+    Literal(_) -> true,
+  }
+
+/// How many calls that call back a recursion descending as `d` makes, up to a constant: the length
+/// of the list it takes heads off, or how far its index lies from its limit, which an index
+/// `List::at` found an element at lies no farther than the list's length.
+pub fn descent_calls(d: Descent) -> Poly =
+  match d {
+    OnTail(p) -> size_of(p),
+    OnIndex(f) -> {
+      let far = match f.limit {
+        Held(p) -> size_of(p),
+        Length(p) -> plus(size_of(p), size_of(f.index)),
+        Literal(_) -> plus(constant(), size_of(f.index)),
+      };
+      if f.strict { far } else { plus(far, constant()) }
+    },
   }
 
 /// Every call back hands each parameter `p` grows with on unchanged or as a part of itself.
@@ -571,7 +647,7 @@ fn bind(env: Env, k: Int, s: Slot) -> Env / {abort.raise} = {
 
 fn walk(env: Env, c: Code) -> Result<Walked, String> / {abort.raise} =
   match c.node {
-    NLit(l) -> Ok(match l { LInt(_) -> sized(constant()), _ -> none() }),
+    NLit(l) -> Ok(match l { LInt(n) -> sized(literal_size(n)), _ -> none() }),
     NVar(v) ->
       Ok(match v.slot {
         Some(k) ->
@@ -592,17 +668,33 @@ fn walk(env: Env, c: Code) -> Result<Walked, String> / {abort.raise} =
       Err(why) -> Err(why),
       Ok(l) -> match walk(env, b.rhs) {
         Err(why) -> Err(why),
-        Ok(r) -> Ok({ ..then(l, r), size: arithmetic(b.op, l.size, r.size), of: Other, fun: None }),
+        Ok(r) ->
+          Ok({
+            ..then(l, r),
+            size: arithmetic(b.op, l.size, r.size),
+            of: toward(env.found, b.op, l.of, b.rhs, r.of, b.lhs),
+            fun: None,
+          }),
       },
     },
     NIf(i) -> match walk(env, i.cond) {
       Err(why) -> Err(why),
-      Ok(cond) -> match walk(env, i.then_branch) {
-        Err(why) -> Err(why),
-        Ok(t) -> match walk(env, i.else_branch) {
-          Err(why) -> Err(why),
-          Ok(e) -> Ok(then(cond, either(t, e))),
-        },
+      Ok(cond) -> {
+        let slots = |k: Int| slot_at(env, k).of;
+        let branch = |truth: Bool, c: Code| {
+          let holds = assumed(slots, i.cond, truth);
+          if possible(holds, env.missed) {
+            Some(walk({ ..env, found: env.found.concat(holds) }, c))
+          } else { None }
+        };
+        match ((branch(true, i.then_branch), branch(false, i.else_branch))) {
+          (Some(Err(why)), _) -> Err(why),
+          (_, Some(Err(why))) -> Err(why),
+          (Some(Ok(t)), Some(Ok(e))) -> Ok(then(cond, either(t, e))),
+          (Some(Ok(t)), None) -> Ok(then(cond, t)),
+          (None, Some(Ok(e))) -> Ok(then(cond, e)),
+          (None, None) -> Ok(cond),
+        }
       },
     },
     NBlock(b) -> block(env, b.stmts, b.tail),
@@ -624,7 +716,10 @@ fn walk(env: Env, c: Code) -> Result<Walked, String> / {abort.raise} =
     },
     NMatch(m) -> match walk(env, m.scrutinee) {
       Err(why) -> Err(why),
-      Ok(s) -> match arms(env, s, m.arms) { Err(why) -> Err(why), Ok(a) -> Ok(then(s, a)) },
+      Ok(s) -> match arms(env, s, found_by(|k: Int| slot_at(env, k).of, m.scrutinee), m.arms) {
+        Err(why) -> Err(why),
+        Ok(a) -> Ok(then(s, a)),
+      },
     },
     NApp(a) -> application(env, a.func, a.args),
     NKnown(_) -> panic("only the emitter writes a read as a known lambda"),
@@ -726,7 +821,7 @@ fn bound(env: Env, pat: CodePattern, of: Slot) -> Env / {abort.raise} =
             size: of.size,
             fun: None,
             of: if l.items.len() == 0 { of.of }
-            else { match of.of { Same(i) -> Part(i), Part(i) -> Part(i), Other -> Other } },
+            else { match of.of { Same(i) -> Part(i), Part(i) -> Part(i), _ -> Other } },
           }),
       }
     },
@@ -745,15 +840,149 @@ fn needs_head(env: Env, scrutinee: Walked, pat: CodePattern) -> Bool =
     _ -> false,
   }
 
-/// The arm taken, after its guard and every guard before it.
-fn arms(env: Env, scrutinee: Walked, xs: List<CodeArm>) -> Result<Walked, String> / {abort.raise} =
+/// Where `c` is `List::at` of a list parameter at an `Int` one, both as they were handed in.
+pub fn found_by(slots: (Int) -> Of, c: Code) -> Option<Found> =
+  match c.node {
+    NApp(a) -> match ((a.func.node, a.args)) {
+      (NVar(f), [xs, i]) -> if f.slot != None || String::of_bytes_lossy(f.name) != "List::at" {
+        None
+      } else {
+        match ((xs.node, i.node)) {
+          (NVar(x), NVar(n)) -> match ((x.slot, n.slot)) {
+            (Some(xk), Some(nk)) -> match ((slots(xk), slots(nk))) {
+              (Same(l), Same(j)) -> Some({ index: j, limit: Held(l), rising: true, strict: true }),
+              _ -> None,
+            },
+            _ -> None,
+          },
+          _ -> None,
+        }
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+/// A pattern only an answer of `Some` matches.
+pub fn takes_some(p: CodePattern) -> Bool = match p { PxCtor(c) -> c.name == b"Some", _ -> false }
+
+/// What `a op b` is, of `a` and `b`: an index held short of a limit, moved toward it by a positive
+/// literal, is `Toward` it. Where several hold it, the one a list's elements give, then a length,
+/// then a literal.
+pub fn toward(found: List<Found>, op: Bytes, a: Of, b: Code, b_of: Of, a_code: Code) -> Of = {
+  let moved = |x: Of, k: Code, rising: Bool|
+    match ((x, k.node)) {
+      (Same(j), NLit(LInt(n))) -> if n <= 0 { None } else {
+        found.fold(None, |best: Option<Found>, f: Found|
+          if f.index != j || f.rising != rising { best } else {
+            match best {
+              Some(g) -> if rank(f.limit) < rank(g.limit) { Some(f) } else { best },
+              None -> Some(f),
+            }
+          })
+      },
+      _ -> None,
+    };
+  let read = if op == b"add" {
+    match moved(a, b, true) { Some(f) -> Some(f), None -> moved(b_of, a_code, true) }
+  } else if op == b"sub" { moved(a, b, false) }
+  else { None };
+  match read { Some(f) -> Toward(f), None -> Other }
+}
+
+fn rank(l: Limit) -> Int = match l { Held(_) -> 0, Length(_) -> 1, Literal(_) -> 2 }
+
+/// What holds an index short of a limit where `c` evaluated to `truth`: a comparison of an `Int`
+/// parameter with a literal or a parameter's length, through `!`, a `&&` that held and an `||`
+/// that did not.
+pub fn assumed(slots: (Int) -> Of, c: Code, truth: Bool) -> List<Found> =
+  match c.node {
+    NUnary(u) -> if u.op == b"not" { assumed(slots, u.operand, !truth) } else { [] },
+    NBinary(b) -> if b.op == b"and" {
+      if truth { assumed(slots, b.lhs, true).concat(assumed(slots, b.rhs, true)) } else { [] }
+    } else if b.op == b"or" {
+      if truth { [] } else { assumed(slots, b.lhs, false).concat(assumed(slots, b.rhs, false)) }
+    } else {
+      // `!(a < b)` is `a >= b`, and `b > a` is `a < b`.
+      let op = if truth { b.op } else { negated(b.op) };
+      match compared(slots, b.lhs, op, b.rhs) {
+        Some(f) -> [f],
+        None -> match compared(slots, b.rhs, flipped(op), b.lhs) { Some(f) -> [f], None -> [] },
+      }
+    },
+    _ -> [],
+  }
+
+fn negated(op: Bytes) -> Bytes =
+  if op == b"lt" { b"ge" }
+  else if op == b"le" { b"gt" }
+  else if op == b"gt" { b"le" }
+  else if op == b"ge" { b"lt" }
+  else { b"" }
+
+fn flipped(op: Bytes) -> Bytes =
+  if op == b"lt" { b"gt" }
+  else if op == b"le" { b"ge" }
+  else if op == b"gt" { b"lt" }
+  else if op == b"ge" { b"le" }
+  else { b"" }
+
+/// `index op limit`, an `Int` parameter below a literal or a length, or above a literal.
+fn compared(slots: (Int) -> Of, index: Code, op: Bytes, limit: Code) -> Option<Found> =
+  match index.node {
+    NVar(v) -> match v.slot {
+      Some(k) -> match ((slots(k), limit_of(slots, limit))) {
+        (Same(j), Some(l)) -> if op == b"lt" || op == b"le" {
+          Some({ index: j, limit: l, rising: true, strict: op == b"lt" })
+        } else if (op == b"gt" || op == b"ge") && rank(l) == 2 {
+          Some({ index: j, limit: l, rising: false, strict: op == b"gt" })
+        } else { None },
+        _ -> None,
+      },
+      None -> None,
+    },
+    _ -> None,
+  }
+
+/// A literal, or the length of a parameter as it was handed in.
+fn limit_of(slots: (Int) -> Of, c: Code) -> Option<Limit> =
+  match c.node {
+    NLit(l) -> match l { LInt(n) -> Some(Literal(n)), _ -> None },
+    NApp(_) -> match length_of(c, 1 << 62) {
+      Some(k) -> match slots(k) { Same(p) -> Some(Length(p)), _ -> None },
+      None -> None,
+    },
+    _ -> None,
+  }
+
+/// Whether a path holding `holds` may be taken where `missed` fails.
+pub fn possible(holds: List<Found>, missed: Option<Found>) -> Bool =
+  match missed { Some(m) -> !holds.contains(m), None -> true }
+
+/// The size of an `Int` literal, its magnitude: none at zero.
+pub fn literal_size(n: Int) -> Poly = if n == 0 { zero() } else { constant() }
+
+/// The arm taken, after its guard and every guard before it. `at` is where the scrutinee is
+/// `List::at`: an arm only `Some` matches has found an element, and is not taken where it misses.
+fn arms(
+  env: Env,
+  scrutinee: Walked,
+  at: Option<Found>,
+  xs: List<CodeArm>,
+) -> Result<Walked, String> / {abort.raise} =
   match xs.fold(
       Ok({ guards: none(), taken: None }),
       |acc: Result<{ guards: Walked, taken: Option<Walked> }, String>, arm: CodeArm|
         match acc {
           Err(_) -> acc,
-          Ok(sofar) -> if needs_head(env, scrutinee, arm.pat) { acc } else {
-            let inside = bound(env, arm.pat, {
+          Ok(sofar) -> if needs_head(env, scrutinee, arm.pat)
+              || (at != None && at == env.missed && takes_some(arm.pat)) { acc } else {
+            let found = match at {
+              Some(f) -> if takes_some(arm.pat) { { ..env, found: env.found.push(f) } }
+              else { env },
+              None -> env,
+            };
+            let inside = bound(found, arm.pat, {
               size: scrutinee.size,
               of: scrutinee.of,
               fun: scrutinee.fun,
@@ -805,12 +1034,19 @@ fn application(env: Env, func: Code, args: List<Code>) -> Result<Walked, String>
               })
             } else if ctor(env.cx, name) != None {
               Ok({ ..given, size: None, of: Other, fun: None })
-            } else if env.cx.claims.defs.contains(name) {
+            } else if env.cx.claims.defs.contains(name) && !by_entry(env.cx, name) {
               match read(env, name) {
                 Err(why) -> Err(why),
                 Ok(p) -> match at_args(p, sizes, funs) {
                   Err(why) -> Err(why),
-                  Ok(q) -> Ok(add(given, plus(constant(), q))),
+                  Ok(q) ->
+                    Ok({
+                      ..add(given, plus(constant(), q)),
+                      size: match iterates(Bytes::of_string(name)) {
+                        Some(it) -> answer_size(it, sizes),
+                        None -> None,
+                      },
+                    }),
                 },
               }
             } else { builtin(env, name, args, given, sizes) }
@@ -863,8 +1099,8 @@ fn lambda_steps(
   walk(captured, body)
 }
 
-/// A builtin is one step; one that calls back calls its callback a number of times an argument's
-/// size bounds, each a step of its own and the callback's body.
+/// A builtin is one step; one that calls back calls its callback as many times as its entry says
+/// the sizes of its arguments allow, each a step of its own and the callback's body.
 fn builtin(
   env: Env,
   name: String,
@@ -874,34 +1110,69 @@ fn builtin(
 ) -> Result<Walked, String> / {abort.raise} = {
   let size_at = |i: Int| match sizes.at(i) { Some(s) -> s, None -> None };
   let one = { ..add(given, constant()), size: None, of: Other, fun: None };
-  let each = |times_of: Option<Poly>, callback: Int, arity: Int|
-    match match args.at(callback) {
+  match iterating_of(Bytes::of_string(name)) {
+    Some(it) -> match match args.at(it.callback) {
         None -> Err("a builtin called without its callback"),
-        Some(cb) -> callback_steps(env, cb, arity),
+        Some(cb) -> callback_steps(env, cb, it.params.len()),
       } {
       Err(why) -> Err(why),
-      Ok(body) -> match times_of {
+      Ok(body) -> match calls_made(it, sizes) {
         None -> Err("an iteration over a value whose size is not read"),
         Some(n) -> match product(n, plus(constant(), body)) {
-          Ok(p) -> Ok(add(one, p)),
+          Ok(p) -> Ok({ ..add(one, p), size: answer_size(it, sizes) }),
           Err(why) -> Err(why),
         },
       },
-    };
-  let sized_as = |r: Result<Walked, String>, size: Option<Poly>|
-    match r { Ok(w) -> Ok({ ..w, size: size }), Err(why) -> Err(why) };
-  if name == "List::map" || name == "List::filter" { sized_as(each(size_at(0), 1, 1), size_at(0)) }
-  else if name == "List::fold" { each(size_at(0), 2, 2) }
-  else if name == "Map::fold" { each(size_at(0), 2, 3) }
-  else if name == "iterate" { each(size_at(1), 2, 1) }
-  else if name == "Map::update" { sized_as(each(Some(constant()), 2, 1), size_at(0)) }
-  else if name == "metered" { each(Some(constant()), 0, 0) } else if name == "Bytes::position" {
-    each(
-      match ((size_at(0), size_at(1))) { (Some(b), Some(f)) -> Some(plus(b, f)), _ -> None },
-      2,
-      1,
-    )
-  } else if env.first_order.get(name) == None { Err("`" ++ name ++ "` has no body here to read") }
+    },
+    None -> first_order(env, name, one, size_at),
+  }
+}
+
+/// The entry of what a call names: a definition by its program-wide name, a builtin by its own.
+pub fn iterating_of(name: Bytes) -> Option<Iterates> =
+  match iterates(name) { Some(it) -> Some(it), None -> prelude_iterates(name) }
+
+/// Whether `def` is a definition its entry describes and no `cost` bound states, which a call reads
+/// by the entry, as a native's, and not by its body: a step, and beside it each call of the function
+/// it is handed. How many times and with what it calls that function is no assumption:
+/// `compiler.semantics` derives it from the body of each definition `std.prelude` writes in Ply,
+/// and its tests fail where the entry says otherwise. The body's own steps are not read, so a
+/// map fold's walk down to each next leaf goes unbilled.
+pub fn by_entry(cx: Context, def: String) -> Bool =
+  iterates(Bytes::of_string(def)) != None
+    && (match cx.claims.defs.get(def) {
+      Some(d) -> !d.spec.any(|c: ClaimClause| c.kind == SCost),
+      None -> false,
+    })
+
+/// How many calls of the function a call of `it`'s function makes, at the sizes of its arguments.
+pub fn calls_made(it: Iterates, sizes: List<Option<Poly>>) -> Option<Poly> =
+  it.over.fold(
+    Some(if it.over.len() == 0 { constant() } else { zero() }),
+    |acc: Option<Poly>, k: Int|
+      match ((acc, sizes.at(k))) { (Some(p), Some(Some(s))) -> Some(plus(p, s)), _ -> None },
+  )
+
+/// The size of what a call of `it`'s function answers, at the sizes of its arguments: a list as
+/// long as what it walks at most, or the argument it updates.
+pub fn answer_size(it: Iterates, sizes: List<Option<Poly>>) -> Option<Poly> = {
+  let at = |k: Int| match sizes.at(k) { Some(s) -> s, None -> None };
+  match it.answer {
+    Mapped -> match it.over.at(0) { Some(k) -> at(k), None -> None },
+    Kept -> match it.over.at(0) { Some(k) -> at(k), None -> None },
+    Updated(k) -> at(k),
+    _ -> None,
+  }
+}
+
+/// A builtin that calls nothing back, by name.
+fn first_order(
+  env: Env,
+  name: String,
+  one: Walked,
+  size_at: (Int) -> Option<Poly>,
+) -> Result<Walked, String> / {abort.raise} =
+  if env.first_order.get(name) == None { Err("`" ++ name ++ "` has no body here to read") }
   else if env.first_order.get(name) == Some(false) {
     Err("`" ++ name ++ "` calls back in a way the bound does not read")
   } else if is_length(name) || name == "List::set" || name == "Map::remove"
@@ -916,7 +1187,6 @@ fn builtin(
     })
   } else if name == "Map::new" { Ok({ ..one, size: Some(constant()) }) }
   else { Ok(one) }
-}
 
 /// The steps of one call of a callback taking `arity` arguments, each of a size not read.
 fn callback_steps(env: Env, cb: Code, arity: Int) -> Result<Poly, String> / {abort.raise} =
@@ -973,16 +1243,19 @@ pub fn cx_owning(
   }
 
 /// The steps of `m.<def>` against its first `cost` clause: `Ok(true)` where the clause is shown.
-fn shown(src: Bytes, def: String) -> Result<Bool, String> / {abort.raise} = {
-  let cx = cx_of(src);
-  match cx.claims.defs.get("m." ++ def) {
+fn shown(src: Bytes, def: String) -> Result<Bool, String> / {abort.raise} =
+  shown_in(cx_of(src), "m." ++ def)
+
+/// The steps of `name` in `cx` against its first `cost` clause.
+fn shown_in(cx: Context, name: String) -> Result<Bool, String> / {abort.raise} =
+  match cx.claims.defs.get(name) {
     None -> panic("a definition of the fixture"),
     Some(d) -> match d.spec.filter(|c: ClaimClause| c.kind == SCost) {
       [c, ..] -> match c.clause.code {
         None -> panic("a lowered bound"),
         Some(b) -> match stated(b, d.params, d.costed) {
           None -> Err("the bound is not read"),
-          Some(bound) -> match steps(cx, "m." ++ def) {
+          Some(bound) -> match steps(cx, name) {
             Err(why) -> Err(why),
             Ok(p) -> Ok(dominated(p, bound)),
           },
@@ -991,7 +1264,6 @@ fn shown(src: Bytes, def: String) -> Result<Bool, String> / {abort.raise} = {
       [] -> panic("a `cost` clause"),
     },
   }
-}
 
 fn fold_sum() -> Bytes = b"xs.fold(0, |a: Int, x: Int| a + x)"
 
@@ -1064,11 +1336,114 @@ test "a recursion that grows what its steps read, calls itself twice on a path, 
   assert_eq(shown(grown, "f"), Err("`m.f` hands on a parameter its steps grow with, changed"));
   let guarded = b"fn f(xs: List<Int>) -> Int cost xs.len() = match xs { [] -> 0, [x, ..rest] if f(rest) > x -> 1, [_, ..rest] -> f(rest) }";
   assert_eq(shown(guarded, "f"), Err("`m.f` calls itself more than once on one path"));
-  let same = b"fn f(xs: List<Int>, n: Int) -> Int cost xs.len() = if n <= 0 { 0 } else { f(xs, n - 1) }";
+  let same = b"fn f(xs: List<Int>, n: Int) -> Int / {diverges} = if n <= 0 { 0 } else { f(xs, n) }";
+  assert_eq(steps_in(same, "f"), Err(undescended("m.f")))
+}
+
+fn undescended(def: String) -> String =
+  "`" ++ def
+    ++ "` does not call itself on a part of one list parameter, or on an index moved toward a limit it holds it short of, every time"
+
+test "recursion past an index where `List::at` found an element is one call per element" {
+  let walk = |bound: Bytes, back: Bytes|
+    shown(
+      Bytes::concat_all([
+        b"fn walk(xs: List<Int>, i: Int, acc: Int) -> Int cost ",
+        bound,
+        b" = match xs.at(i) { Some(x) -> ",
+        back,
+        b", None -> acc }",
+      ]),
+      "walk",
+    );
+  assert_eq(walk(b"xs.len()", b"walk(xs, i + 1, acc + x)"), Ok(true));
+  assert_eq(walk(b"xs.len()", b"walk(xs, 2 + i, acc + x)"), Ok(true));
+  assert_eq(walk(b"1", b"walk(xs, i + 1, acc + x)"), Ok(false));
+  // An index that stays, steps back, or indexes a list the call changes bounds nothing.
+  let unbounded = |back: Bytes|
+    steps_in(
+      Bytes::concat_all([
+        b"fn walk(xs: List<Int>, i: Int, acc: Int) -> Int / {diverges} = match xs.at(i) { Some(x) -> ",
+        back,
+        b", None -> acc }",
+      ]),
+      "walk",
+    );
+  assert_eq(unbounded(b"walk(xs, i, acc + x)"), Err(undescended("m.walk")));
+  assert_eq(unbounded(b"walk(xs, i - 1, acc + x)"), Err(undescended("m.walk")));
+  assert_eq(unbounded(b"walk(xs.push(x), i + 1, acc)"), Err(undescended("m.walk")));
+}
+
+test "a recursion that moves an index toward a limit a guard holds it short of takes as many calls" {
+  let walk = b"fn walk(xs: List<Int>, i: Int) -> Int = if i >= xs.len() { 0 } else { 1 + walk(xs, i + 1) }\n";
+  let from = |call: Bytes|
+    shown(
+      Bytes::concat_all([walk, b"fn f(xs: List<Int>, i: Int) -> Int cost xs.len() = ", call]),
+      "f",
+    );
+  assert_eq(from(b"walk(xs, 0)"), Ok(true));
+  // Started anywhere, the index may lie below zero, farther from the length than the list is long.
+  assert_eq(from(b"walk(xs, i)"), Ok(false));
+  // A literal limit, from below and from above.
   assert_eq(
-    shown(same, "f"),
-    Err("`m.f` does not call itself on a part of one list parameter every time"),
+    shown(
+      b"fn up(i: Int) -> Int = if i >= 32 { 0 } else { up(i + 1) }\nfn f() -> Int cost 1 = up(0)",
+      "f",
+    ),
+    Ok(true),
+  );
+  let down = b"fn down(n: Int) -> Int = if n <= 0 { 0 } else { down(n - 5) }\n";
+  assert_eq(shown(down.concat(b"fn f() -> Int cost 1 = down(60)"), "f"), Ok(true));
+  assert_eq(
+    shown(down.concat(b"fn f(xs: List<Int>, n: Int) -> Int cost xs.len() = down(n)"), "f"),
+    Ok(false),
+  );
+  // An `||` that failed holds both: the length bounds the calls, and the last takes no step of `f`.
+  let both = b"fn each(xs: List<Int>, i: Int, f: (Int) -> Int cost k, acc: Int) -> Int = if i >= 32 || i >= xs.len() { acc } else { each(xs, i + 1, f, acc + f(i)) }\n";
+  assert_eq(
+    shown(
+      both.concat(
+        b"fn g(xs: List<Int>, f: (Int) -> Int cost k) -> Int cost xs.len() * k = each(xs, 0, f, 0)",
+      ),
+      "g",
+    ),
+    Ok(true),
   )
+}
+
+fn prelude_folds() -> Bytes =
+  b"fn f(xs: List<Int>) -> Int = xs.map(|x: Int| x + 1).filter(|x: Int| x > 1).fold(0, |a: Int, x: Int| a + x)\n"
+
+test "the prelude's `map`, `filter` and `fold` take the steps their `cost` bounds state" {
+  let cx = cx_of(prelude_folds());
+  assert_eq(
+    ["std.prelude.List::map", "std.prelude.List::filter", "std.prelude.List::fold"].map(
+      |n: String| shown_in(cx, n),
+    ),
+    [Ok(true), Ok(true), Ok(true)],
+  )
+}
+
+test "a call of the prelude's `map` costs what its bound states, and answers a list no longer" {
+  let costed = |bound: Bytes|
+    cx_owning(
+      [
+        {
+          name: b"m",
+          src: Bytes::concat_all([
+            b"fn f(xs: List<Int>, g: (Int) -> Int cost k) -> Int cost ",
+            bound,
+            b" = xs.map(g).filter(|x: Int| x > 1).fold(0, |a: Int, x: Int| a + x)\n",
+          ]),
+        },
+      ],
+      |m: Bytes| m == b"m",
+    );
+  // The prelude is the toolchain's, so a call reads its bound and not its body.
+  let cx = costed(b"xs.len() * k");
+  assert_eq(cx.claims.defs.get("std.prelude.List::map").map(|d: Def| d.body == None), Some(true));
+  assert_eq(shown_in(cx, "m.f"), Ok(true));
+  assert_eq(shown_in(costed(b"xs.len()"), "m.f"), Ok(false))
 }
 
 fn coded(n: Node) -> Code = { own: Borrowed, node: n, span: dummy_span() }
@@ -1176,7 +1551,7 @@ test "a function parameter's cost name stands for the steps of each call of it" 
   );
   assert_eq(
     shown(b"fn f(xs: List<Int>, g: (Int) -> Int) -> List<Int> cost xs.len() = xs.map(g)", "f"),
-    Err("a callback whose steps are not read"),
+    Err("a callee's steps grow with a function it is given whose steps are not read"),
   )
 }
 

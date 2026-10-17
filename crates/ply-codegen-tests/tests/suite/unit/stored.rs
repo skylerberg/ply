@@ -602,8 +602,8 @@ fn a_decimal_is_an_object_of_its_own_and_a_record_or_an_array_holds_its_two_word
     // Ordered as the numbers they are, whatever their scales.
     let same = h.to_word(&l, &decimal("19.99"));
     assert_eq!(cmp_words(&l, w, same), Ordering::Equal);
-    // A map keeps one spelling of a number: only the least scale is a key as it stands.
-    assert!(!native_key(&l, w));
+    // Either spelling is a key as it stands, the two one key.
+    assert!(native_key(&l, w));
     assert!(native_key(&l, same));
     let line = record(vec![("price", price.clone()), ("qty", Value::Int(3))]);
     let r = h.to_word(&l, &line);

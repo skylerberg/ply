@@ -40,18 +40,21 @@ impl Map {
         self.0.contains_key(k)
     }
 
-    /// Replaces an equal key's entry, key and value both.
+    /// A key equal to one the map holds keeps the key the map holds and takes the value.
     pub fn insert(&mut self, k: Value, v: Value) {
-        let entries = Arc::make_mut(&mut self.0);
-        entries.remove(&k);
-        entries.insert(k, v);
+        Arc::make_mut(&mut self.0).insert(k, v);
     }
 
     pub fn remove(&mut self, k: &Value) -> Option<Value> {
+        self.remove_entry(k).map(|(_, v)| v)
+    }
+
+    /// Removes the entry of the key equal to `k`, answering the key the map held and its value.
+    pub fn remove_entry(&mut self, k: &Value) -> Option<(Value, Value)> {
         if !self.0.contains_key(k) {
             return None;
         }
-        Arc::make_mut(&mut self.0).remove(k)
+        Arc::make_mut(&mut self.0).remove_entry(k)
     }
 
     /// The entries whose keys `bounds` admits, ascending; panics on bounds that cross, as
@@ -375,11 +378,11 @@ impl Value {
         Value::Map(Map::new())
     }
 
-    /// Later entries win, as in a fold of `Map::insert`.
+    /// As a fold of `Map::insert`: a later entry's value wins, under an earlier entry's key.
     pub fn map(entries: impl IntoIterator<Item = (Value, Value)>) -> Value {
         let mut m = Map::new();
         for (k, v) in entries {
-            insert_key(&mut m, k, v);
+            m.insert(k, v);
         }
         Value::Map(m)
     }
@@ -852,67 +855,6 @@ impl PartialEq for Value {
 }
 
 impl Eq for Value {}
-
-/// The one place a key enters a [`Map`] from Rust, so keys are always canonical.
-pub(crate) fn insert_key(m: &mut Map, k: Value, v: Value) {
-    m.insert(canonical_key(&k).unwrap_or(k), v);
-}
-
-/// The canonical member of `v`'s class under [`Value::cmp`], or `None` when `v` already is.
-pub(crate) fn canonical_key(v: &Value) -> Option<Value> {
-    if is_canonical(v) {
-        return None;
-    }
-    Some(canonicalize(v))
-}
-
-fn is_canonical(v: &Value) -> bool {
-    match v {
-        // Minimal scale is unique per numeric value, so it is canonical.
-        Value::Decimal(d) => d.serialize() == d.normalize().serialize(),
-        Value::List(items) => grow(|| items.iter().all(is_canonical)),
-        Value::Array(items) => grow(|| items.iter().all(is_canonical)),
-        Value::Map(entries) => grow(|| {
-            entries
-                .iter()
-                .all(|(k, val)| is_canonical(k) && is_canonical(val))
-        }),
-        Value::Record(fields) => grow(|| fields.values().all(is_canonical)),
-        // A keyed value is ordered by its key, which reads the value as it stands.
-        Value::Ctor { name, .. } if crate::instances::keyed(name) => true,
-        Value::Ctor { args, .. } => grow(|| args.iter().all(is_canonical)),
-        _ => true,
-    }
-}
-
-fn canonicalize(v: &Value) -> Value {
-    match v {
-        Value::Decimal(d) => Value::Decimal(d.normalize()),
-        Value::List(items) => grow(|| Value::list(items.iter().map(canonicalize).collect())),
-        Value::Array(items) => grow(|| Value::array(items.iter().map(canonicalize).collect())),
-        Value::Map(entries) => grow(|| {
-            let mut out = Map::new();
-            for (k, val) in entries.iter() {
-                insert_key(&mut out, canonicalize(k), canonicalize(val));
-            }
-            Value::Map(out)
-        }),
-        Value::Record(fields) => grow(|| {
-            Value::Record(Arc::new(
-                fields
-                    .iter()
-                    .map(|(name, val)| (name.clone(), canonicalize(val)))
-                    .collect(),
-            ))
-        }),
-        Value::Ctor { name, .. } if crate::instances::keyed(name) => v.clone(),
-        Value::Ctor { name, args } => grow(|| Value::Ctor {
-            name: name.clone(),
-            args: Arc::new(args.iter().map(canonicalize).collect()),
-        }),
-        other => other.clone(),
-    }
-}
 
 pub(crate) fn secret_has_no_order(v: &Value, what: &str, span: Span) -> Result<(), Diagnostic> {
     if !matches!(v, Value::Secret(_)) {

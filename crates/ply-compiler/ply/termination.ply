@@ -15,6 +15,8 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               tagged_parser, tagged_filler)
 import items (FnDef)
 import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, record_fields)
+import semantics (Iterates, Handed, Element, Threaded, Mapped, Kept, Folded, iterates,
+                  prelude_iterates)
 import std.bin
 import std.list
 import std.math (pow)
@@ -880,50 +882,88 @@ fn with_part(xs: Term, x: Term) -> Term =
     }
   }
 
-/// What `List::fold` answers when its lambda answers its accumulator or parts: the start joined with what
+/// What a call of a function its entry describes answers, where the lambda it is handed answers a
+/// part of what it walks, or the accumulator a fold threads through it.
+fn iterated_answer(
+  context: MemberContext,
+  scope: Scope,
+  it: Iterates,
+  args: List<Expr>,
+) -> Term / {abort.raise} =
+  match it.answer {
+    Mapped -> match handed_lambda(context, scope, it, args, UnknownTerm) {
+      Some(inside) -> match answered(context, inside.scope, inside.body) {
+        Some(t) -> parts_of([t]),
+        None -> UnknownTerm,
+      },
+      None -> UnknownTerm,
+    },
+    Kept -> match walked_arg(it, args) {
+      Some(xs) -> parts(term(context, scope, xs)),
+      None -> UnknownTerm,
+    },
+    Folded -> folded(context, scope, it, args),
+    _ -> UnknownTerm,
+  }
+
+/// The argument a function its entry describes walks the elements of.
+fn walked_arg(it: Iterates, args: List<Expr>) -> Option<Expr> =
+  match it.over.at(0) { Some(k) -> args.at(k), None -> None }
+
+/// The lambda a call hands as its entry's function, and the scope its body is read in: each
+/// parameter handed an element bound to one, and the one a fold threads to `threaded`.
+fn handed_lambda(
+  context: MemberContext,
+  scope: Scope,
+  it: Iterates,
+  args: List<Expr>,
+  threaded: Term,
+) -> Option<{ scope: Scope, body: Expr }> / {abort.raise} =
+  match args.at(it.callback) {
+    Some(ELambda(l)) -> if l.params.len() != it.params.len() { None } else {
+      let element = match walked_arg(it, args) {
+        Some(xs) -> element(context, scope, xs),
+        None -> UnknownTerm,
+      };
+      Some({
+        scope: range(0, l.params.len()).fold(scope, |s: Scope, j: Int|
+          bound(s, l.params.get(j).name.name, match it.params.get(j) {
+            Element -> element,
+            Threaded(_) -> threaded,
+            _ -> UnknownTerm,
+          })),
+        body: l.body,
+      })
+    },
+    _ -> None,
+  }
+
+/// What a fold answers where its lambda answers its accumulator or parts: the start joined with what
 /// a round answers, so long as a second round answers nothing the first did not.
 fn folded(
   context: MemberContext,
   scope: Scope,
-  xs: Expr,
-  init: Expr,
-  f: Expr,
+  it: Iterates,
+  args: List<Expr>,
 ) -> Term / {abort.raise} =
-  match f {
-    ELambda(l) -> match l.params {
-      [acc, x] -> {
+  match it.params.fold(None, |found: Option<Int>, h: Handed|
+      match h { Threaded(k) -> Some(k), _ -> found }) {
+    None -> UnknownTerm,
+    Some(k) -> match args.at(k) {
+      None -> UnknownTerm,
+      Some(init) -> {
         let round = |r: Term|
-          match answered(
-              context,
-              bound(bound(scope, acc.name.name, r), x.name.name, element(context, scope, xs)),
-              l.body,
-            ) {
-            Some(t) -> join(r, t),
-            None -> r,
+          match handed_lambda(context, scope, it, args, r) {
+            Some(inside) -> match answered(context, inside.scope, inside.body) {
+              Some(t) -> join(r, t),
+              None -> r,
+            },
+            None -> UnknownTerm,
           };
         let once = round(term(context, scope, init));
         if round(once) == once { once } else { UnknownTerm }
       },
-      _ -> UnknownTerm,
     },
-    _ -> UnknownTerm,
-  }
-
-/// What `List::map` answers when the lambda it is given answers a part of each element.
-fn mapped(context: MemberContext, scope: Scope, xs: Expr, f: Expr) -> Term / {abort.raise} =
-  match f {
-    ELambda(l) -> match l.params {
-      [p] -> match answered(
-          context,
-          bound(scope, p.name.name, element(context, scope, xs)),
-          l.body,
-        ) {
-        Some(t) -> parts_of([t]),
-        None -> UnknownTerm,
-      },
-      _ -> UnknownTerm,
-    },
-    _ -> UnknownTerm,
   }
 
 fn part_of(t: Term, p: Place) -> Bool =
@@ -1122,7 +1162,7 @@ fn applied_term(
           },
           _ -> UnknownTerm,
         }
-      } else if name == b"List::at" || name == b"Map::get" || name == b"List::filter" {
+      } else if name == b"List::at" || name == b"Map::get" {
         parts(term(context, scope, args.get(0)))
       } else if name == b"List::push" && args.len() == 2 {
         with_part(term(context, scope, args.get(0)), term(context, scope, args.get(1)))
@@ -1134,17 +1174,21 @@ fn applied_term(
         }
       } else if name == b"Array::set" && args.len() == 3 {
         same_length(term(context, scope, args.get(0)))
-      } else if name == b"List::map" && args.len() == 2 {
-        mapped(context, scope, args.get(0), args.get(1))
-      } else if name == b"List::fold" && args.len() == 3 {
-        folded(context, scope, args.get(0), args.get(1), args.get(2))
-      } else { UnknownTerm },
+      } else {
+        match prelude_iterates(name) {
+          Some(it) -> iterated_answer(context, scope, it, args),
+          None -> UnknownTerm,
+        }
+      },
       ConstructorCallee -> if args.len() == 1 { Wrapped(term(context, scope, args.get(0))) }
       else { parts_of(args.map(|x: Expr| term(context, scope, x))) },
-      DefinedCallee(n) -> match context.group.summary_of(n) {
-        Some(sum) ->
-          translated(context, sum.result, actuals(context, scope, sum.names, args, named)),
-        None -> UnknownTerm,
+      DefinedCallee(n) -> match iterates(n) {
+        Some(it) -> iterated_answer(context, scope, it, args),
+        None -> match context.group.summary_of(n) {
+          Some(sum) ->
+            translated(context, sum.result, actuals(context, scope, sum.names, args, named)),
+          None -> UnknownTerm,
+        },
       },
       GroupMember(t) -> match context.results.at(t) {
         Some(Some(r)) -> translated(context, r, arguments(context, scope, t, args, named)),
@@ -1987,13 +2031,17 @@ fn applied(
             facts: scope.facts,
             span: span,
           }),
-        BuiltinCallee(name) -> match element_callback(name) {
-          Some(shape) -> iterated(context, scope, acc, args, named, shape),
+        BuiltinCallee(name) -> match prelude_iterates(name) {
+          Some(it) -> iterated(context, scope, acc, args, named, it),
           None -> walk_args(acc),
         },
-        DefinedCallee(n) -> match context.group.summary_of(n) {
-          Some(sum) -> passed(context, scope, reached(acc, n, v.span), sum, args, named),
-          None -> walk_args(reached(acc, n, v.span)),
+        // An entry of a function `std.prelude` writes in Ply is held to its body by `semantics`.
+        DefinedCallee(n) -> match iterates(n) {
+          Some(it) -> iterated(context, scope, reached(acc, n, v.span), args, named, it),
+          None -> match context.group.summary_of(n) {
+            Some(sum) -> passed(context, scope, reached(acc, n, v.span), sum, args, named),
+            None -> walk_args(reached(acc, n, v.span)),
+          },
         },
         _ -> walk_args(acc),
       },
@@ -2129,36 +2177,25 @@ fn handed(
     _ -> walk(context, s, acc, x),
   }
 
-/// A builtin that calls its argument at `callback` once per element of its argument at `list`,
-/// handing parts of it in as the callback's parameters at `params`: a map's key and value both.
-type Iterates = { list: Int, callback: Int, params: List<Int>, arity: Int }
-
-fn element_callback(name: Bytes) -> Option<Iterates> =
-  if name == b"List::map" || name == b"List::filter" {
-    Some({ list: 0, callback: 1, params: [0], arity: 1 })
-  } else if name == b"List::fold" { Some({ list: 0, callback: 2, params: [1], arity: 2 }) }
-  else if name == b"Map::fold" { Some({ list: 0, callback: 2, params: [1, 2], arity: 3 }) }
-  else { None }
-
+/// A call of a function that calls the function it is handed as its entry says, handing an element
+/// of what it walks in as each `Element`.
 fn iterated(
   context: MemberContext,
   scope: Scope,
   acc: Seen,
   args: List<Expr>,
   named: List<NamedArg>,
-  shape: Iterates,
+  it: Iterates,
 ) -> Seen / {abort.raise} = {
   let others = named.fold(acc, |seen: Seen, n: NamedArg| walk(context, scope, seen, n.value));
-  let element = match args.at(shape.list) {
+  let element = match walked_arg(it, args) {
     Some(x) -> element(context, scope, x),
     None -> UnknownTerm,
   };
-  let call = range(0, shape.arity).map(|j: Int|
-    if shape.params.fold(false, |found: Bool, p: Int| found || p == j) { element }
-    else { UnknownTerm });
+  let call = it.params.map(|h: Handed| match h { Element -> element, _ -> UnknownTerm });
   range(0, args.len()).fold(others, |seen: Seen, i: Int| {
     let x = args.get(i);
-    if i != shape.callback { walk(context, scope, seen, x) }
+    if i != it.callback { walk(context, scope, seen, x) }
     else { handed(context, scope, seen, x, [call]) }
   })
 }

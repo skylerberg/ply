@@ -5,14 +5,14 @@
 
 import compiler.load (LoadedAnalysis)
 import units (emit)
-import compiler.front (no_rows, Analysed, DefInterface, FiledDef, Refused, View,
-                       analyse_pulling_std_with, dump_of, interfaces_of, rehash, view_of,
-                       ModuleSpan)
-import compiler.hash (Pin, Printed, Rehashed, TheItem, Unprintable, body_key, print_bodies, reach)
+import compiler.front (no_rows, Analysed, DefInterface, FiledDef, Pulled, Refused, Shipping, View,
+                       dump_of, interfaces_of, rehash, view_of, ModuleSpan)
+import compiler.hash (Pin, Printed, Rehashed, TheItem, Unprintable, body_key, no_fixing,
+                      print_bodies, reach)
 import compiler.infer (DefInfo, TestInfo)
 import compiler.resolve (Source)
 import diagnostic (Raised)
-import program (Program, sourced)
+import program (Program, front_end, sourced)
 import sim.plan (Seed)
 import sim.recording (Passed, Failed)
 import std.bytes
@@ -22,7 +22,7 @@ import suite.bisect
 import suite.conclude (PassRecord, Named)
 import suite.delta (Decl, DefKey, Facts, Row, Value, decl_key, value_key)
 import suite.facts (Baseline, Now, Node, Rehash, facts)
-import suite.mixture (Mixture, choose, hashes_of, mixture_of, printed_names)
+import suite.mixture (Era, Mixture, choose, hashes_of, mixture_of, printed_names)
 import tester (tester, ledger, unit_over)
 import std.list
 import std.option
@@ -51,15 +51,21 @@ pub type Bench = {
   code: Bytes,
   message: Bytes,
   seed: Seed,
+  shipped: Shipped,
 }
 
 /// One failure's facts, and the bench a mixture of it is tried on when one can be.
 pub type Diagnosed = { evident: Evident, bench: Option<Bench> }
 
+/// The shipped modules this run's load read, as it read them: a mixture reads the toolchain's
+/// definitions from these, never printing one, since no era of a definition there differs.
+pub type Shipped = { shipping: Shipping, reached: Bool }
+
 /// The program as diagnosis reads it, computed once per run however many tests failed.
 pub type Tree = {
   whole: View,
   sources: List<Source>,
+  shipped: Shipped,
   defs: Map<String, String>,
   decls: Map<String, String>,
   deps: Map<String, List<String>>,
@@ -119,13 +125,17 @@ fn at_of(l: { module: Int, span: Span }) -> Option<ModuleSpan> =
 
 /// Everything diagnosis reads of this run's program.
 pub fn program_of(program: Program, analysis: View) -> Tree / {abort.raise} =
-  tree_of(sourced(program, analysis.frame), analysis)
+  tree_of(sourced(program, analysis.frame), analysis, {
+    shipping: program.shipping,
+    reached: program.reached,
+  })
 
 /// The same over the modules as the front end took them.
-pub fn tree_of(sources: List<Source>, analysis: View) -> Tree / {abort.raise} =
+pub fn tree_of(sources: List<Source>, analysis: View, shipped: Shipped) -> Tree / {abort.raise} =
   {
     whole: analysis,
     sources: sources,
+    shipped: shipped,
     defs: by_name(analysis.frame.hashes.defs),
     decls: by_name(analysis.frame.hashes.decls),
     deps: analysis.frame.hashes.deps.fold(
@@ -272,6 +282,7 @@ pub fn diagnosed(
           code: failure.diag.code,
           message: failure.diag.message,
           seed: seed,
+          shipped: pr.shipped,
         })
       },
       None -> None,
@@ -300,15 +311,15 @@ pub fn trial(
       Err(why) -> unresolved(why),
       Ok(chosen) -> match Option::traverse(chosen.hashes, |h: String| b.bodies.get(h)) {
         None -> unresolved(MissingBody),
-        Some(xs) -> match printed_names(xs) {
+        Some(xs) -> match printed_names(xs, chosen.named) {
           None -> unresolved(MissingBody),
-          Some(names) -> match print_bodies(
+          Some(p) -> match print_bodies(
               xs,
-              names,
+              p.names,
               [b.test_body],
               chosen.relink.map(|r: { from: String, to: String }|
                 { from: Bytes::of_hex(r.from), to: Bytes::of_hex(r.to) }),
-              [],
+              p.shipped,
               true,
             ) {
             Unprintable(_) -> unresolved(MissingBody),
@@ -320,14 +331,28 @@ pub fn trial(
   }
 }
 
+/// `sources` checked as this run's load checked its program, each shipped module they import
+/// pulled as that load read it.
+fn checked_over(sources: List<Source>, shipped: Shipped) -> Pulled / {abort.raise} =
+  front_end(
+    sources,
+    shipped.shipping,
+    no_rows(),
+    { root: b"", manifest: None, supplied: [] },
+    [],
+    shipped.reached,
+    no_fixing(),
+  )
+
 fn ran(
   b: Bench,
   modules: List<{ module: Bytes, text: Bytes }>,
   filed: Option<String>,
 ) -> Tried / {tester.unit[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise} = {
   let sources = modules.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text });
-  // Every module imports `std.prelude`, which the load reads beside them.
-  let analysed = analyse_pulling_std_with(sources, [], no_rows());
+  let analysed = checked_over(sources, b.shipped);
+  let held = b.shipped.shipping.read.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
+    acc.insert(s.name, s.src));
   match analysed.out {
     Refused(_) -> unresolved(DoesNotCheck),
     Analysed(w) -> {
@@ -345,7 +370,8 @@ fn ran(
               analysed.pulled.map(|n: Bytes|
                 {
                   module: n,
-                  text: if n == prelude_module() { prelude_source::text() } else { b"" },
+                  text: if n == prelude_module() { prelude_source::text() }
+                  else { held.get(n).unwrap_or(b"") },
                 }),
             ).map(|m: { module: Bytes, text: Bytes }|
               {
@@ -387,10 +413,22 @@ fn ran(
 fn chain() -> String =
   "fn leaf(n: Int) -> Int = n + 1\nfn mid(n: Int) -> Int = leaf(n) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n"
 
-fn tree_of_source(src: String) -> Tree / {abort.raise} = {
+/// `src` loaded as a run loads its program, `shipped` standing in for the shipped modules but the
+/// prelude.
+fn tree_of_source(src: String, shipped: List<Source> = []) -> Tree / {abort.raise} = {
   let sources = [{ name: b"", src: Bytes::of_string(src) }];
-  match analyse_pulling_std_with(sources, [], no_rows()).out {
-    Analysed(w) -> tree_of(sources, view_of(w)),
+  let read: Shipped = {
+    shipping: { read: shipped, unread: [], data: [], asked: [], pulls: [] },
+    reached: true,
+  };
+  let loaded = checked_over(sources, read);
+  match loaded.out {
+    Analysed(w) ->
+      tree_of(
+        sources.concat(shipped.filter(|s: Source| loaded.pulled.contains(s.name))),
+        view_of(w),
+        read,
+      ),
     Refused(_) -> panic("the fixture checks"),
   }
 }
@@ -576,6 +614,44 @@ test "a mixture of the two eras prints and checks, and its answer is the trial's
       let red = tried(b, [value_key("leaf")], true);
       assert_eq(red.trial, a_failure());
       assert_eq(red.proved, None)
+    },
+  }
+}
+
+test "a mixture reads the prelude's definitions from the prelude rather than printing them" {
+  // `at`, `map` and `push` are the prelude's, written over what only the prelude can read.
+  let listed = |bump: Int|
+    "fn leaf(n: Int) -> Int = n + " ++ bump.to_string()
+      ++ "\nfn mid(xs: List<Int>) -> Int = match xs.map(|x: Int| leaf(x)).push(0).at(1) { Some(v) -> v, None -> 0 }\nfn top(n: Int) -> Int = mid([n, n + 1]) + 1\ntest \"listed\" { assert_eq(top(1), 4) }\n";
+  let d = diagnosed_over(tree_of_source(listed(1)), tree_of_source(listed(2)), "listed");
+  match d.bench {
+    None -> panic("every body is on hand, so a mixture can be built"),
+    Some(b) -> {
+      assert(b.mixture.eras.any(|e: Era| e.key == value_key("std.prelude.List::at")));
+      assert_eq(tried(b, [value_key("leaf")], false).trial, a_pass())
+    },
+  }
+}
+
+test "a mixture reads a shipped module's definitions from it, though they use what only it can" {
+  // `native_count` is std.counted's own, so `count` checks nowhere else.
+  let counted = {
+    name: b"std.counted",
+    src: b"extern fn native_count() -> Int\npub fn count(n: Int) -> Int = n + native_count() * 0\n",
+  };
+  let program = |bump: Int|
+    "import std.counted\nfn leaf(n: Int) -> Int = n + " ++ bump.to_string()
+      ++ "\nfn top(n: Int) -> Int = counted::count(leaf(n)) + 1\ntest \"counted\" { assert_eq(top(1), 3) }\n";
+  let d = diagnosed_over(
+    tree_of_source(program(1), [counted]),
+    tree_of_source(program(2), [counted]),
+    "counted",
+  );
+  match d.bench {
+    None -> panic("every body is on hand, so a mixture can be built"),
+    Some(b) -> {
+      assert(b.mixture.eras.any(|e: Era| e.key == value_key("std.counted.count")));
+      assert_eq(tried(b, [value_key("leaf")], false).trial, a_pass())
     },
   }
 }

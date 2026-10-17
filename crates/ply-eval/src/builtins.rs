@@ -76,6 +76,10 @@ builtins! { $
     ListAt = "List::at" (xs, i) -> Word;
     /// One element replaced, sharing the rest; raises where `List::at` answers `None`.
     ListSet = "List::set" (xs, i, v) -> Raising;
+    /// The leaf of a list's trie that holds its items `j * 32` on, counting from the leaf a `rest`
+    /// cut starts in, as compiled code holds an `Option`: the leaf's word with a count of the
+    /// caller's, or zero past the last.
+    ListLeafOf = "ListNode::leaf_of" (xs, j) -> Word;
     Map = "List::map" (xs, f) -> Word;
     Filter = "List::filter" (xs, f) -> Word;
     Fold = "List::fold" (xs, init, f) -> Word;
@@ -549,7 +553,8 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::HandlerInit
         | Builtin::HandlerVar
         | Builtin::HandlerSet
-        | Builtin::HoldNew => Err(answered_by_the_backend(b, span)),
+        | Builtin::HoldNew
+        | Builtin::ListLeafOf => Err(answered_by_the_backend(b, span)),
 
         Builtin::Range => {
             let lo = args[0].as_int(span, "`range`")?;
@@ -1902,7 +1907,7 @@ pub fn hold_released(span: Span, doing: &str) -> Diagnostic {
 }
 
 /// The C backend answers every builtin that calls back into the program or reaches what only it
-/// holds.
+/// holds, a list's trie nodes among them.
 #[cold]
 fn answered_by_the_backend(b: Builtin, span: Span) -> Diagnostic {
     Diagnostic::error(

@@ -148,6 +148,9 @@ pub type Index = {
   items: List<ModuleItems>,
   scopes: List<ScopeIndex>,
   effect_sketches: Map<Int, Bytes>,
+  /// The nodes of what the code the emitter writes for a container calls (`written_code`), which
+  /// a body that compares, digests or shows anything references.
+  written: List<Int>,
 }
 
 fn qualifier(qname: QName) -> Option<Bytes> =
@@ -365,6 +368,7 @@ pub fn build_index(
       sees: match resolved.sees.at(m) { Some(seen) -> seen, None -> [m] },
     }
   });
+  let prelude = range(0, mods.len()).filter(|m: Int| mods.get(m).name == prelude_module());
   let index: Index = {
     mods: mods,
     nodes: built.nodes,
@@ -374,6 +378,9 @@ pub fn build_index(
     items: built.items,
     scopes: scopes,
     effect_sketches: Map::new(),
+    written: prelude.fold([], |acc: List<Int>, m: Int|
+      written_code().calls.fold(acc, |a: List<Int>, n: Bytes|
+        match built.items.get(m).fns.get(n) { Some(v) -> a.push(v), None -> a })),
   };
   { index: { ..index, effect_sketches: sketch_effects(index) }, diags: built.diags }
 }
@@ -645,6 +652,10 @@ fn tag_e_with_hold() -> Int = 170
 fn tag_e_on_value() -> Int = 171
 
 fn tag_type_extern() -> Int = 173
+
+/// What follows every binary operator and every value the encoding names by its name alone: the
+/// references `written_block` writes, none where nothing calls for them.
+fn tag_written() -> Int = 174
 
 fn tag_e_simulate() -> Int = 65
 fn tag_e_tagged() -> Int = 66
@@ -1116,15 +1127,47 @@ fn value_ref(encoder: Encoder, qname: QName) -> Encoder / {abort.raise} = {
       },
       // A function of a language type that no module declares is the prelude's, under the one
       // name it has however it is written.
-      None -> match qualifier(qname) {
-        Some(of) -> if starts_upper(of)
-            && encoder.index.scopes.get(encoder.module).modules.get(of) == None {
-          free_ref(encoder, None, member_name(of, qname.name.name))
-        } else { free_ref(encoder, Some(of), qname.name.name) },
-        None -> free_ref(encoder, None, qname.name.name),
+      None -> {
+        let builtin = written_code().builtins.contains(qname.name.name);
+        match qualifier(qname) {
+          Some(of) -> if starts_upper(of)
+              && encoder.index.scopes.get(encoder.module).modules.get(of) == None {
+            written_block(free_ref(encoder, None, member_name(of, qname.name.name)), false)
+          } else { written_block(free_ref(encoder, Some(of), qname.name.name), builtin) },
+          None -> written_block(free_ref(encoder, None, qname.name.name), builtin),
+        }
       },
     },
   }
+}
+
+/// The code the emitter writes for a container a body compares, digests or shows, as `==` of two
+/// lists walks them with `List::at` and of two maps walks their entries with `Map::entries`: the
+/// operators a body writes it for, by name and as the lexer names their tokens, the builtins, and
+/// the functions of [`prelude_module`] it calls, by their names there. A body that writes one of
+/// those references each of these, so a load that reaches the body reaches them, and a check
+/// groups them with it where they reach it back.
+pub type WrittenCode = {
+  operators: List<Bytes>,
+  tokens: List<Bytes>,
+  builtins: List<Bytes>,
+  calls: List<Bytes>,
+}
+
+pub fn written_code() -> WrittenCode =
+  {
+    operators: [b"eq", b"ne"],
+    tokens: [b"eqeq", b"bangeq"],
+    builtins: [b"compare", b"compare_values", b"digest", b"reflect", b"shown"],
+    calls: [b"List::at", b"List::push", b"Map::entries"],
+  }
+
+/// `encoder` past a binary operator or a value named by its name alone, `at` where the emitter
+/// writes code for a container there (`written_code`): what that code calls, which the body
+/// references with it, under `tag_written`, and none of it elsewhere.
+fn written_block(encoder: Encoder, at: Bool) -> Encoder / {abort.raise} = {
+  let called = if at { encoder.index.written } else { [] };
+  called.fold(put_u32(put_tag(encoder, tag_written()), called.len()), node_ref)
 }
 
 fn type_ref(encoder: Encoder, qual: Option<Bytes>, name: Bytes) -> Encoder / {abort.raise} = {
@@ -1679,9 +1722,12 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
     ELit(l) -> lit(put_tag(encoder, tag_e_lit()), l.lit),
     EVar(v) -> value_ref(put_tag(encoder, tag_e_var()), v.name),
     EBinary(b) ->
-      expr(
-        expr(put_bytes(put_tag(encoder, tag_e_binary()), byte_of_int(binop_byte(b.op))), b.lhs),
-        b.rhs,
+      written_block(
+        expr(
+          expr(put_bytes(put_tag(encoder, tag_e_binary()), byte_of_int(binop_byte(b.op))), b.lhs),
+          b.rhs,
+        ),
+        written_code().operators.contains(b.op),
       ),
     EUnary(u) ->
       expr(put_bytes(put_tag(encoder, tag_e_unary()), byte_of_int(unop_byte(u.op))), u.operand),
@@ -4960,6 +5006,18 @@ fn read_count(decoder: Decoder) -> DecodedInt / {abort.raise} = {
   else { r }
 }
 
+/// Past what `written_block` wrote, which the text of a body does not say: each reference read as
+/// one and nothing looked up, so none is wanted where the body is printed.
+fn past_written(decoder: Decoder) -> Decoder / {abort.raise} = {
+  let n = read_count(expect(decoder, tag_written(), b"what a body references past its text"));
+  range(0, n.value).fold(n.decoder, |d: Decoder, _i: Int| {
+    let t = read_u8(d);
+    if t.value == tag_ref_hash() { read_bytes(t.decoder, 32).decoder }
+    else if t.value == tag_ref_index() { read_u32(t.decoder).decoder }
+    else { panic(String::of_bytes(b"a reference of tag ".concat(ascii_of_int(t.value)))) }
+  })
+}
+
 fn read_binders(decoder: Decoder) -> DecodedInt / {abort.raise} = {
   let r = read_u32(decoder);
   if r.value > 65535 { panic("a count of binders no definition declares") } else { r }
@@ -5235,9 +5293,10 @@ fn read_value(printer: BodyPrinter, decoder: Decoder) -> Decoded / {abort.raise}
     let l = read_u32(skip(decoder));
     if l.value >= decoder.values { panic("a local that is not in scope") }
     else { { decoder: l.decoder, text: local_name(l.value) } }
-  } else if peek(decoder) == tag_ctor() { read_ctor(printer, decoder) }
-  else if is_free(decoder) { read_free(decoder) }
-  else { qname(printer, read_ref(printer, decoder), None) }
+  } else if peek(decoder) == tag_ctor() { read_ctor(printer, decoder) } else if is_free(decoder) {
+    let name = read_free(decoder);
+    { decoder: past_written(name.decoder), text: name.text }
+  } else { qname(printer, read_ref(printer, decoder), None) }
 
 fn read_ctor(printer: BodyPrinter, decoder: Decoder) -> Decoded / {abort.raise} =
   if peek(decoder) == tag_ctor() {
@@ -5861,7 +5920,7 @@ fn print_expr(outer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.ra
       let l = print_operand(printer, op.decoder, depth);
       let r = print_operand(printer, l.decoder, depth);
       {
-        decoder: r.decoder,
+        decoder: past_written(r.decoder),
         text: Bytes::concat_all([l.text, b" ", binop_text(op.value), b" ", r.text]),
       }
     } else if t.value == tag_e_unary() {
@@ -7967,6 +8026,40 @@ test "printed bodies hash back to what they were stored under, under their own n
   assert_eq(shipped.map(|m: { module: Bytes, text: Bytes }| m.module), [b"app", b"right.util"])
 }
 
+test "a body that compares, digests or names a function of a type prints back and hashes alike" {
+  let out = hash_index(
+    indexed([
+      {
+        name: prelude_module(),
+        src: b"pub fn List::at<a>(xs: List<a>, i: Int) -> Option<a> = None\npub fn List::push<a>(xs: List<a>, x: a) -> List<a> = xs\n",
+      },
+      {
+        name: b"app",
+        src: b"pub fn same(a: List<Int>, b: List<Int>) -> Bool = a == b\npub fn hashed(a: List<Int>) -> Bytes = digest(a)\npub fn named(a: List<Int>) -> Bytes = List::digest(a)\npub fn both(a: Int) -> Bool = a != 0 && digest(a) == b\"\"\n",
+      },
+    ]),
+  );
+  let written = [
+    { name: b"std.prelude.List::at", decl: false },
+    { name: b"std.prelude.List::push", decl: false },
+  ];
+  assert_eq(
+    [b"app.same", b"app.hashed", b"app.named", b"app.both"].map(|n: Bytes| named_in(out, TheFn(n))),
+    [written, written, [], written],
+  );
+  let ms = printed_of(out, []);
+  let app = ms.filter(|m: { module: Bytes, text: Bytes }| m.module == b"app").get(0).text;
+  assert(
+    app.contains(b"_l0 == _l1") && app.contains(b"digest(_l0)")
+      && app.contains(b"List::digest(_l0)"),
+    Some(String::of_bytes_lossy(app)),
+  );
+  let again = hash_index(
+    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
 test "a body that calls on a value prints back importing each module whose function it may call" {
   let hashed = hash_index(
     indexed([
@@ -8673,6 +8766,54 @@ test "a definition's hash follows each function a call on a value may be, of the
   assert(said(b"1", b"1") != said(b"2", b"1"));
   // A module it does not import is none it can see.
   assert_eq(said(b"1", b"1"), said(b"1", b"2"))
+}
+
+test "a body that compares, digests or shows references what the code written for a container calls" {
+  // `full` compares, so it and `List::push` reference each other: a cycle hashed as any is.
+  let prelude = {
+    name: prelude_module(),
+    src: b"pub fn List::at<a>(xs: List<a>, i: Int) -> Option<a> = None\npub fn List::push<a>(xs: List<a>, x: a) -> List<a> = if full(1) { xs } else { xs }\nfn full(n: Int) -> Bool = n == 32\n",
+  };
+  let hashes = hash_index(
+    indexed([
+      prelude,
+      { name: b"std.value", src: b"pub extern fn shown<a>(x: a) -> Bool\n" },
+      {
+        name: b"m",
+        src: b"import std.value (shown)\npub fn same(a: Int, b: Int) -> Bool = a != b\npub fn hashed(a: Int) -> Bytes = digest(a)\npub fn told(a: Int) -> Bool = shown(a)\npub fn less(a: Int, b: Int) -> Bool = a < b\n",
+      },
+      {
+        name: b"n",
+        src: b"fn digest(a: Int) -> Bytes = b\"\"\npub fn own(a: Int) -> Bytes = digest(a)\n",
+      },
+    ]),
+  );
+  let written = [
+    { name: b"std.prelude.List::at", decl: false },
+    { name: b"std.prelude.List::push", decl: false },
+  ];
+  assert_eq([b"m.same", b"m.hashed", b"m.told"].map(|n: Bytes| named_in(hashes, TheFn(n))), [
+    written,
+    written,
+    written,
+  ]);
+  assert_eq(named_in(hashes, TheFn(b"m.less")), []);
+  // A definition of the builtin's name is what the name calls.
+  assert_eq(named_in(hashes, TheFn(b"n.own")), [{ name: b"n.digest", decl: false }]);
+  assert_eq(reached_functions(hashes, [TheFn(b"m.same")]).keys(), [
+    b"m.same",
+    b"std.prelude.List::at",
+    b"std.prelude.List::push",
+    b"std.prelude.full",
+  ]);
+  assert_eq(named_in(hashes, TheFn(b"std.prelude.full")), written);
+  assert_eq(
+    hashes.defs.filter(|d: { name: Bytes, hash: Bytes }|
+      (d.name == b"std.prelude.List::push" || d.name == b"std.prelude.full")
+        && d.hash.len() == 32).len(
+    ),
+    2,
+  )
 }
 
 // Pinned, so a framing change fails here rather than silently moving the digests a warm cache

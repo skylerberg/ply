@@ -2624,6 +2624,14 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let room = heap::imm_value(*n).clamp(0, crate::list::WIDTH as i64) as u32;
             Some(ctx.heap.alloc_list(room) as Word)
         }
+        (Builtin::ListLeafOf, [xs, j]) if heap::kind(*xs) == KIND_LIST && heap::is_imm(*j) => {
+            let leaf = list::leaf_of(obj(*xs), heap::imm_value(*j));
+            if leaf != 0 {
+                heap::inc(leaf);
+            }
+            heap::dec(*xs);
+            Some(leaf)
+        }
         (Builtin::HoldGet, [h]) => {
             let o = hold_object(*h)?;
             let held = unsafe { word_at(o, CLOSURE_CAPTURES) };
@@ -3367,19 +3375,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             if heap::kind(*a) == KIND_MAP && heap::kind(*bm) == KIND_MAP =>
         {
             let tables = Arc::clone(&ctx.tables);
-            // The smaller map's entries go into the larger, and `b`'s entry stands at a shared key.
-            if map::len(obj(*a)) < map::len(obj(*bm)) {
-                let mut m = *bm;
-                for (k, v) in map::to_vec(obj(*a)) {
-                    if map::get(&tables.layouts, obj(m), k).is_none() {
-                        heap::inc(k);
-                        heap::inc(v);
-                        m = ctx.heap.map_insert(&tables.layouts, m, k, v);
-                    }
-                }
-                heap::dec(*a);
-                return Some(m);
-            }
+            // `b`'s entries go into `a`, so a shared key is `a`'s and its value `b`'s.
             let o = obj(*bm);
             let mut m = *a;
             for (k, v) in map::to_vec(o) {
@@ -3615,22 +3611,20 @@ fn position(ctx: &mut Ctx, at: Option<usize>) -> Word {
 }
 
 /// `Map::update(m, k, f)`: the entry leaves the map while `f` runs, so a map held once lends `f` a
-/// value held once. Takes all three.
+/// value held once, and goes back under the key the map held. Takes all three.
 fn map_update(ctx: &mut Ctx, m: Word, k: Word, f: Word) -> Word {
-    let (rest, current) = if heap::kind(m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, k) {
+    let (rest, entry) = if heap::kind(m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, k) {
         let tables = Arc::clone(&ctx.tables);
-        match map::get(&tables.layouts, obj(m), k) {
-            Some(v) => {
-                heap::inc(v);
-                (ctx.heap.map_remove(&tables.layouts, m, k), Some(v))
-            }
-            None => (m, None),
-        }
+        ctx.heap.map_take_key(&tables.layouts, m, k)
     } else {
         let (map, key) = (ctx.value(m), ctx.value(k));
         heap::dec(m);
         match ply_eval::map::take(map, &key, ctx.site()) {
-            Ok((map, v)) => (ctx.word(&map), v.map(|v| ctx.word(&v))),
+            Ok((map, taken)) => {
+                let rest = ctx.word(&map);
+                let entry = taken.map(|(held, v)| (ctx.word(&held), ctx.word(&v)));
+                (rest, entry)
+            }
             Err(d) => {
                 heap::dec(k);
                 heap::dec(f);
@@ -3638,8 +3632,8 @@ fn map_update(ctx: &mut Ctx, m: Word, k: Word, f: Word) -> Word {
             }
         }
     };
-    let Some(current) = current else {
-        heap::dec(k);
+    heap::dec(k);
+    let Some((held, current)) = entry else {
         heap::dec(f);
         return rest;
     };
@@ -3647,10 +3641,10 @@ fn map_update(ctx: &mut Ctx, m: Word, k: Word, f: Word) -> Word {
     heap::dec(f);
     if ctx.failed != 0 {
         heap::dec(rest);
-        heap::dec(k);
+        heap::dec(held);
         return 0;
     }
-    builtin(ctx, Builtin::MapInsert, &[rest, k, updated])
+    builtin(ctx, Builtin::MapInsert, &[rest, held, updated])
 }
 
 /// `Bytes::position(b, from, p)`: the first index at or past `from` whose byte `p` accepts. Takes

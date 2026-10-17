@@ -37,11 +37,11 @@ fn key(k: &Value, what: &str, span: Span) -> Result<(), Diagnostic> {
 /// The only place a key enters a `Map`, so no builder can skip `key`.
 fn put(m: &mut Map, k: Value, v: Value, what: &str, span: Span) -> Result<(), Diagnostic> {
     key(&k, what, span)?;
-    crate::value::insert_key(m, k, v);
+    m.insert(k, v);
     Ok(())
 }
 
-/// Replaces an equal key's entry, key and value both.
+/// A key equal to one the map holds keeps the key the map holds and takes the value.
 pub(crate) fn insert(mut m: Value, k: Value, v: Value, span: Span) -> Result<Value, Diagnostic> {
     match &mut m {
         Value::Map(out) => put(out, k, v, "Map::insert", span)?,
@@ -57,11 +57,16 @@ pub(crate) fn insert(mut m: Value, k: Value, v: Value, span: Span) -> Result<Val
     Ok(m)
 }
 
-/// Removes `k`'s entry for `Map::update`, so a map held once lends its function the value held once.
-pub fn take(mut m: Value, k: &Value, span: Span) -> Result<(Value, Option<Value>), Diagnostic> {
+/// Removes `k`'s entry for `Map::update`, so a map held once lends its function the value held once,
+/// and answers the key the map held with it.
+pub fn take(
+    mut m: Value,
+    k: &Value,
+    span: Span,
+) -> Result<(Value, Option<(Value, Value)>), Diagnostic> {
     key(k, "Map::update", span)?;
     let taken = match &mut m {
-        Value::Map(out) => out.remove(k),
+        Value::Map(out) => out.remove_entry(k),
         other => {
             return Err(crate::value::type_error(
                 span,
