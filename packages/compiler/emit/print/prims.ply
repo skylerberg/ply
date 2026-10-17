@@ -1,0 +1,1174 @@
+//! Operators, conversions and constants printed: an integer's, a width's, a float's and a decimal's
+//! operators as C does them under the runtime's overflow and division tests, a character's, a
+//! string's and a constructor's words compared where they lie, an order made its `Ordering`, and
+//! constants read from the pool.
+
+import std.bytes (ascii_of_int)
+import std.math (pow)
+import syntax.patterns (Lit, LStr, LBytes, LEmbedded, LFixed, LWide, LFloat, LDec, LChar)
+import check.types (TyCon)
+import syntax.parsing (span_between)
+import emit.c (Width, KNum, ctype)
+import emit.answer (Const, ConstStr, ConstBytes, ConstEmbedded, ConstFixed, ConstWide, ConstFloat,
+                    ConstDecimal, ConstChar, ConstUnit)
+import emit.pieces (Text, Hole, Constant, TagOf, spelled)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RCases, Leaf, Var, Arg, AVar,
+                 AInt, ANum, rep_of_arg, arithmetic, comparison, shift)
+import emit.print.text (Printing, Place, printing, line, pad, temp, named, arg_text, assigned, site,
+                        check, int_lit)
+import emit.print.made (c_type)
+import emit.lower.scalars (width_named)
+
+/// A constant read from the pool into `into`, held as its representation says: a `Decimal` as its
+/// two words, the pool's word let go once they are read.
+pub fn literal(p: Place, pr: Printing, into: Option<Var>, l: Lit) -> Printing / {abort.raise} =
+  match into {
+    None -> pr,
+    Some(v) -> {
+      let read = |q: Printing, head: Bytes|
+        check(p, {
+          ..q,
+          consts: q.consts.push(const_of_lit(l)),
+          out: q.out.concat([
+            Text(Bytes::concat_all([pad(p.depth), head, b"rt_lit_p(ctx, "])),
+            Hole(Constant(q.consts.len())),
+            Text(b");\n"),
+          ]),
+        });
+      match v.rep {
+        RDec -> {
+          let w = temp(pr);
+          let n = named(read(w.pr, Bytes::concat_all([b"Word ", w.name, b" = "])), v);
+          line(
+            n.pr,
+            p.depth,
+            Bytes::concat_all([
+              b"PlyDec ",
+              n.name,
+              b" = ply_dec_of(",
+              w.name,
+              b"); ply_dec(ctx, ",
+              w.name,
+              b");",
+            ]),
+          )
+        },
+        _ -> {
+          let n = named(pr, v);
+          read(n.pr, Bytes::concat_all([c_type(v.rep), b" ", n.name, b" = "]))
+        },
+      }
+    },
+  }
+
+/// An operator over operands held as `x.on`, as C does it: an integer's sum or difference under an
+/// overflow test, its other arithmetic through the runtime but for a literal divisor, a width's
+/// arithmetic wide and narrowed back under the same test, a float's as C's own, a decimal's by the
+/// runtime over its two words, and words compared where they lie.
+pub fn prim(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  x: { op: Bytes, on: Rep, args: List<Arg> },
+) -> Printing / {abort.raise} =
+  match into {
+    None -> pr,
+    Some(v) -> {
+      let a = match x.args.at(0) { Some(y) -> arg_text(pr, y), None -> b"0" };
+      let b = match x.args.at(1) { Some(y) -> arg_text(pr, y), None -> b"0" };
+      let count = match x.args.at(1) { Some(y) -> int_text(pr, y), None -> b"0" };
+      if x.op == b"sign" { sign_printed(p, pr, v, x.on, a) } else if x.op == b"narrow" {
+        bound(p, pr, v, Bytes::concat_all([b"(", c_type(v.rep), b")", a]))
+      } else if x.op == b"within" {
+        let c = match x.args.at(2) { Some(y) -> arg_text(pr, y), None -> b"0" };
+        bound(
+          p,
+          pr,
+          v,
+          Bytes::concat_all([b"((", a, b") >= (", b, b") && (", a, b") <= (", c, b"))"]),
+        )
+      } else {
+        match x.on {
+          RInt -> int_printed(p, pr, v, x.op, a, b, count, literal_divisor(x.args.at(1))),
+          RBool -> bool_printed(p, pr, v, x.op, a, b),
+          RFloat -> float_printed(p, pr, v, x.op, a, b),
+          RDec -> dec_printed(p, pr, v, x.op, a, b),
+          RNum(w) -> width_printed(p, pr, v, x.op, w, a, b, count),
+          RWord -> word_printed(p, pr, v, x.op, a, b),
+          // An `Option` held as its payload's word, `None` zero; a sum held as its case's index.
+          RMaybe -> if x.op == b"none_in" {
+            bound(p, pr, v, Bytes::concat_all([b"((", a, b") == 0 || (", b, b") == 0)"]))
+          } else if x.op == b"eq" { bound(p, pr, v, infix(a, b"==", b)) }
+          else { unwritten(p, pr, x.op) },
+          RCases(_) -> if x.op == b"eq" || x.op == b"ne" {
+            bound(p, pr, v, infix(a, compare_c(x.op), b))
+          } else { unwritten(p, pr, x.op) },
+          _ -> unwritten(p, pr, x.op),
+        }
+      }
+    },
+  }
+
+/// `v` set to `e` in the C type its representation is held in.
+fn bound(p: Place, pr: Printing, v: Var, e: Bytes) -> Printing =
+  assigned(pr, p.depth, v, c_type(v.rep), e)
+
+fn infix(a: Bytes, c: Bytes, b: Bytes) -> Bytes =
+  Bytes::concat_all([b"(", a, b") ", c, b" (", b, b")"])
+
+fn unwritten(p: Place, pr: Printing, op: Bytes) -> Printing =
+  line(
+    pr,
+    p.depth,
+    Bytes::concat_all([b"/* an operator this printer does not write: ", op, b" */"]),
+  )
+
+fn int_printed(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  a: Bytes,
+  b: Bytes,
+  count: Bytes,
+  by_literal: Bool,
+) -> Printing / {abort.raise} =
+  if op == b"ne" { bound(p, pr, v, Bytes::concat_all([b"!((", a, b") == (", b, b"))"])) }
+  else if comparison(op) { bound(p, pr, v, infix(a, compare_c(op), b)) }
+  else if bitwise(op) { bound(p, pr, v, infix(a, bitop_c(op), b)) }
+  else if op == b"add" || op == b"sub" {
+    let n = named(site(p, pr), v);
+    line(
+      line(n.pr, p.depth, Bytes::concat_all([b"int64_t ", n.name, b";"])),
+      p.depth,
+      Bytes::concat_all([
+        b"if (ply_",
+        op,
+        b"_ov(",
+        a,
+        b", ",
+        b,
+        b", &",
+        n.name,
+        b")) { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    )
+  } else if (op == b"div" || op == b"rem") && by_literal {
+    bound(p, pr, v, Bytes::concat_all([b"(", a, if op == b"div" { b") / " } else { b") % " }, b]))
+  } else if arithmetic(op) {
+    check(
+      p,
+      bound(
+        p,
+        site(p, pr),
+        v,
+        Bytes::concat_all([
+          b"rt_arith_p(ctx, ",
+          ascii_of_int(arith_code(op)),
+          b", ",
+          a,
+          b", ",
+          b,
+          b")",
+        ]),
+      ),
+    )
+  } else if shift(op) { shifted(p, pr, v, op, None, a, count) } else if op == b"neg" {
+    let guarded = line(
+      site(p, pr),
+      p.depth,
+      Bytes::concat_all([
+        b"if (",
+        a,
+        b" == INT64_MIN) { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    bound(p, guarded, v, Bytes::concat_all([b"-(", a, b")"]))
+  } else if op == b"bitnot" { bound(p, pr, v, Bytes::concat_all([b"~(", a, b")"])) }
+  else if op == b"order" { bound(p, pr, v, signed_order(a, b)) }
+  else if op == b"ordering" { ordering(p, pr, v, a) }
+  else if op == b"to_float" { bound(p, pr, v, Bytes::concat_all([b"(double)(", a, b")"])) }
+  else if op == b"of_bits" { bound(p, pr, v, Bytes::concat_all([b"ply_f64(", a, b")"])) }
+  // The runtime numbers a type's stated witnesses from 13 past its constructor's tag.
+  else if op == b"witness" { bound(p, pr, v, Bytes::concat_all([b"(13 + ", a, b")"])) }
+  else if op == b"of_int" {
+    match v.rep {
+      RNum(w) -> {
+        let s = site(p, pr);
+        let refused = Bytes::concat_all([
+          b") { rt_not_that_width_p(ctx, ",
+          ascii_of_int(width_index(w)),
+          b", ",
+          a,
+          b"); ",
+          p.leave,
+          b" }",
+        ]);
+        let guarded = if w.bits == 64 && w.signed { s }
+        else if w.bits == 64 { line(s, p.depth, Bytes::concat_all([b"if (", a, b" < 0", refused])) }
+        else {
+          line(
+            s,
+            p.depth,
+            Bytes::concat_all([
+              b"if (",
+              a,
+              b" < ",
+              int_lit(width_min(w)),
+              b" || ",
+              a,
+              b" > ",
+              int_lit(width_max(w)),
+              refused,
+            ]),
+          )
+        };
+        bound(p, guarded, v, Bytes::concat_all([b"(", ctype(KNum(w)), b")", a]))
+      },
+      _ -> unwritten(p, pr, op),
+    }
+  } else { unwritten(p, pr, op) }
+
+fn bool_printed(p: Place, pr: Printing, v: Var, op: Bytes, a: Bytes, b: Bytes) -> Printing =
+  if op == b"not" { bound(p, pr, v, Bytes::concat_all([b"!(", a, b")"])) }
+  else if op == b"eq" || op == b"ne" {
+    bound(
+      p,
+      pr,
+      v,
+      Bytes::concat_all([if op == b"ne" { b"!((" } else { b"((" }, a, b") == (", b, b"))"]),
+    )
+  } else if op == b"order" { bound(p, pr, v, signed_order(a, b)) }
+  else { unwritten(p, pr, op) }
+
+fn float_printed(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  a: Bytes,
+  b: Bytes,
+) -> Printing / {abort.raise} =
+  if comparison(op) { bound(p, pr, v, infix(a, compare_c(op), b)) }
+  else if op == b"neg" { bound(p, pr, v, Bytes::concat_all([b"-(", a, b")"])) }
+  else if op == b"rem" {
+    bound(
+      p,
+      site(p, pr),
+      v,
+      Bytes::concat_all([
+        b"ply_f64(rt_float_rem_p(ctx, ply_f64_bits(",
+        a,
+        b"), ply_f64_bits(",
+        b,
+        b")))",
+      ]),
+    )
+  } else if arithmetic(op) { bound(p, site(p, pr), v, infix(a, float_c(op), b)) }
+  else if op == b"bits" {
+    // Every NaN reads as the one `float::bits` names.
+    let t = temp(pr);
+    let read = line(
+      t.pr,
+      p.depth,
+      Bytes::concat_all([b"int64_t ", t.name, b" = ply_f64_bits(", a, b");"]),
+    );
+    bound(
+      p,
+      read,
+      v,
+      Bytes::concat_all([
+        b"((((uint64_t)",
+        t.name,
+        b" & UINT64_C(0x7FF0000000000000)) == UINT64_C(0x7FF0000000000000) && ((uint64_t)",
+        t.name,
+        b" & UINT64_C(0x000FFFFFFFFFFFFF)) != 0) ? INT64_C(0x7FF8000000000000) : ",
+        t.name,
+        b")",
+      ]),
+    )
+  } else { unwritten(p, pr, op) }
+
+/// A `Decimal`'s operator by the runtime over each operand's two words, which allocates nothing:
+/// arithmetic writes its answer into the local it names, and an order is the sign of a comparison.
+fn dec_printed(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  a: Bytes,
+  b: Bytes,
+) -> Printing / {abort.raise} = {
+  let words = Bytes::concat_all([a, b".lo, ", a, b".hi, ", b, b".lo, ", b, b".hi"]);
+  if comparison(op) {
+    bound(
+      p,
+      pr,
+      v,
+      Bytes::concat_all([b"(rt_decimal_compare_p(ctx, ", words, b") ", compare_c(op), b" 0)"]),
+    )
+  } else if op == b"order" {
+    bound(p, pr, v, Bytes::concat_all([b"rt_decimal_compare_p(ctx, ", words, b")"]))
+  } else if arithmetic(op) {
+    let n = named(site(p, pr), v);
+    check(
+      p,
+      line(
+        n.pr,
+        p.depth,
+        Bytes::concat_all([
+          b"PlyDec ",
+          n.name,
+          b"; rt_decimal_binary_p(ctx, ",
+          ascii_of_int(binary_code(op)),
+          b", ",
+          words,
+          b", (Word)(intptr_t)&",
+          n.name,
+          b");",
+        ]),
+      ),
+    )
+  } else if op == b"neg" {
+    let n = named(pr, v);
+    line(
+      n.pr,
+      p.depth,
+      Bytes::concat_all([
+        b"PlyDec ",
+        n.name,
+        b"; rt_decimal_negate_p(ctx, ",
+        a,
+        b".lo, ",
+        a,
+        b".hi, (Word)(intptr_t)&",
+        n.name,
+        b");",
+      ]),
+    )
+  } else { unwritten(p, pr, op) }
+}
+
+/// Words compared where they lie: a character's as its scalar value, two strings' or byte
+/// strings' by their bytes, two values of a sum of no constructor's argument by the constructor
+/// each header names, and the sign of two characters' or strings' order.
+fn word_printed(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  a: Bytes,
+  b: Bytes,
+) -> Printing / {abort.raise} =
+  if comparison(op) { bound(p, pr, v, infix(a, compare_c(op), b)) }
+  else if op == b"untrue" { bound(p, pr, v, Bytes::concat_all([b"(", a, b" != ply_true)"])) }
+  else if op == b"bytes_eq" { bound(p, pr, v, bytes_equal(a, b)) }
+  else if op == b"bytes_ne" { bound(p, pr, v, b"!".concat(bytes_equal(a, b))) }
+  else if op == b"ctor_eq" || op == b"ctor_ne" {
+    bound(
+      p,
+      pr,
+      v,
+      Bytes::concat_all([
+        b"(ply_obj(",
+        a,
+        b")->layout ",
+        if op == b"ctor_ne" { b"!=" } else { b"==" },
+        b" ply_obj(",
+        b,
+        b")->layout)",
+      ]),
+    )
+  } else if op == b"order" { bound(p, pr, v, signed_order(a, b)) } else if op == b"bytes_order" {
+    let lx = temp(pr);
+    let ly = temp(
+      line(
+        lx.pr,
+        p.depth,
+        Bytes::concat_all([b"int64_t ", lx.name, b" = (int64_t)ply_obj(", a, b")->len;"]),
+      ),
+    );
+    let n = named(
+      line(
+        ly.pr,
+        p.depth,
+        Bytes::concat_all([b"int64_t ", ly.name, b" = (int64_t)ply_obj(", b, b")->len;"]),
+      ),
+      v,
+    );
+    let x = lx.name;
+    let y = ly.name;
+    line(
+      line(
+        n.pr,
+        p.depth,
+        Bytes::concat_all([
+          b"int64_t ",
+          n.name,
+          b" = (int64_t)memcmp(ply_bytes(",
+          a,
+          b"), ply_bytes(",
+          b,
+          b"), (size_t)(",
+          x,
+          b" < ",
+          y,
+          b" ? ",
+          x,
+          b" : ",
+          y,
+          b"));",
+        ]),
+      ),
+      p.depth,
+      Bytes::concat_all([
+        b"if (",
+        n.name,
+        b" == 0) ",
+        n.name,
+        b" = (",
+        x,
+        b" > ",
+        y,
+        b") - (",
+        x,
+        b" < ",
+        y,
+        b");",
+      ]),
+    )
+  } else { unwritten(p, pr, op) }
+
+/// An operator over a width held in its own C type: arithmetic below 64 bits done wide and narrowed
+/// back under an overflow test, at 64 bits a sum or difference tested as it is formed and the rest
+/// through the runtime; bit operators, shifts, comparisons, wrapping and saturating arithmetic and
+/// rotations in the width itself.
+fn width_printed(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  b: Bytes,
+  count: Bytes,
+) -> Printing / {abort.raise} = {
+  let t_c = ctype(KNum(w));
+  let narrowed = |q: Printing, wide: Bytes| {
+    let g = line(
+      q,
+      p.depth,
+      Bytes::concat_all([
+        b"if (",
+        wide,
+        b" < ",
+        int_lit(width_min(w)),
+        b" || ",
+        wide,
+        b" > ",
+        int_lit(width_max(w)),
+        b") { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    bound(p, g, v, Bytes::concat_all([b"(", t_c, b")", wide]))
+  };
+  if arithmetic(op) && w.bits < 64 {
+    let t = temp(site(p, pr));
+    if op == b"add" || op == b"sub" {
+      narrowed(
+        line(
+          t.pr,
+          p.depth,
+          Bytes::concat_all([
+            b"int64_t ",
+            t.name,
+            b" = (int64_t)(",
+            a,
+            if op == b"add" { b") + (int64_t)(" } else { b") - (int64_t)(" },
+            b,
+            b");",
+          ]),
+        ),
+        t.name,
+      )
+    } else {
+      narrowed(
+        check(
+          p,
+          line(
+            t.pr,
+            p.depth,
+            Bytes::concat_all([
+              b"int64_t ",
+              t.name,
+              b" = rt_arith_p(ctx, ",
+              ascii_of_int(arith_code(op)),
+              b", (int64_t)(",
+              a,
+              b"), (int64_t)(",
+              b,
+              b"));",
+            ]),
+          ),
+        ),
+        t.name,
+      )
+    }
+  } else if op == b"add" || op == b"sub" {
+    let n = named(site(p, pr), v);
+    let over = if w.signed {
+      Bytes::concat_all([
+        if op == b"add" { b"ply_add_ov(" } else { b"ply_sub_ov(" },
+        a,
+        b", ",
+        b,
+        b", &",
+        n.name,
+        b")",
+      ])
+    } else {
+      Bytes::concat_all([
+        b"(",
+        n.name,
+        b" = (uint64_t)(",
+        a,
+        if op == b"add" { b") + (uint64_t)(" } else { b") - (uint64_t)(" },
+        b,
+        b"), ",
+        if op == b"add" { Bytes::concat_all([n.name, b" < (uint64_t)(", a, b"))"]) }
+        else { Bytes::concat_all([b"(uint64_t)(", a, b") < (uint64_t)(", b, b"))"]) },
+      ])
+    };
+    line(
+      line(n.pr, p.depth, Bytes::concat_all([t_c, b" ", n.name, b";"])),
+      p.depth,
+      Bytes::concat_all([
+        b"if (",
+        over,
+        b") { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    )
+  } else if arithmetic(op) {
+    check(
+      p,
+      bound(
+        p,
+        site(p, pr),
+        v,
+        Bytes::concat_all([
+          b"(",
+          t_c,
+          b")rt_wide_binary_p(ctx, ",
+          ascii_of_int(binary_code(op)),
+          b", ",
+          ascii_of_int(width_index(w)),
+          b", (Word)(",
+          a,
+          b"), (Word)(",
+          b,
+          b"))",
+        ]),
+      ),
+    )
+  } else if bitwise(op) { bound(p, pr, v, infix(a, bitop_c(op), b)) }
+  else if shift(op) { shifted(p, pr, v, op, Some(w), a, count) }
+  else if op == b"bitnot" { bound(p, pr, v, Bytes::concat_all([b"(", t_c, b") ~(", a, b")"])) }
+  else if op == b"ne" { bound(p, pr, v, Bytes::concat_all([b"!((", a, b") == (", b, b"))"])) }
+  else if comparison(op) { bound(p, pr, v, infix(a, compare_c(op), b)) }
+  else if op == b"order" { bound(p, pr, v, signed_order(a, b)) }
+  else if op == b"neg" && w.bits < 64 {
+    let t = temp(site(p, pr));
+    narrowed(
+      line(t.pr, p.depth, Bytes::concat_all([b"int64_t ", t.name, b" = -(int64_t)(", a, b");"])),
+      t.name,
+    )
+  } else if op == b"neg" {
+    // Only the least value has no negation: the guard runs before the value exists.
+    let guarded = line(
+      site(p, pr),
+      p.depth,
+      Bytes::concat_all([
+        b"if (",
+        a,
+        b" == INT64_MIN) { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    bound(p, guarded, v, Bytes::concat_all([b"-(", a, b")"]))
+  } else if op == b"wrap_add" || op == b"wrap_sub" || op == b"wrap_mul" {
+    // Below 32 bits C would promote the operands to `int`, where a product can overflow.
+    let u = unsigned_c(w);
+    bound(
+      p,
+      site(p, pr),
+      v,
+      Bytes::concat_all([
+        b"(",
+        u,
+        b")((uint64_t)(",
+        u,
+        b")(",
+        a,
+        b") ",
+        if op == b"wrap_add" { b"+" } else if op == b"wrap_sub" { b"-" } else { b"*" },
+        b" (uint64_t)(",
+        u,
+        b")(",
+        b,
+        b"))",
+      ]),
+    )
+  } else if op == b"rotl" || op == b"rotr" { rotated(p, pr, v, op, w, a, count) }
+  else if op == b"saturating_add" || op == b"saturating_sub" || op == b"saturating_mul" {
+    saturated(p, pr, v, op, w, a, b)
+  } else if op == b"to_int" {
+    bound(p, site(p, pr), v, Bytes::concat_all([b"(int64_t)(", a, b")"]))
+  } else if op == b"exact_add" || op == b"exact_sub" || op == b"exact_mul" || op == b"exact_neg" {
+    // Exact in the 64 bits the answer is held in, which the width's operands cannot overflow.
+    let wide = |e: Bytes| Bytes::concat_all([b"(", c_type(v.rep), b")(", e, b")"]);
+    bound(p, site(p, pr), v, if op == b"exact_neg" { b"-".concat(wide(a)) } else {
+      Bytes::concat_all([
+        wide(a),
+        if op == b"exact_add" { b" + " } else if op == b"exact_sub" { b" - " } else { b" * " },
+        wide(b),
+      ])
+    })
+  } else { unwritten(p, pr, op) }
+}
+
+/// A rotation right by the count, or left as one right by the rest of the width.
+fn rotated(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  count: Bytes,
+) -> Printing / {abort.raise} = {
+  let u = unsigned_c(w);
+  let bits = ascii_of_int(w.bits);
+  let k = temp(site(p, pr));
+  let turned = line(
+    k.pr,
+    p.depth,
+    Bytes::concat_all([
+      b"int64_t ",
+      k.name,
+      b" = ((",
+      if op == b"rotl" { b"-" } else { b"" },
+      b"((",
+      count,
+      b") % ",
+      bits,
+      b")) % ",
+      bits,
+      b" + ",
+      bits,
+      b") % ",
+      bits,
+      b";",
+    ]),
+  );
+  bound(
+    p,
+    turned,
+    v,
+    Bytes::concat_all([
+      b"(",
+      u,
+      b")(",
+      k.name,
+      b" == 0 ? (",
+      u,
+      b")(",
+      a,
+      b") : ((",
+      u,
+      b")(",
+      a,
+      b") >> ",
+      k.name,
+      b") | ((",
+      u,
+      b")(",
+      a,
+      b") << (",
+      bits,
+      b" - ",
+      k.name,
+      b")))",
+    ]),
+  )
+}
+
+/// Exact in 64 bits, then held to the width's ends; only an unsigned 32-bit product needs the
+/// unsigned word, and it can only pass the greatest value.
+fn saturated(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  b: Bytes,
+) -> Printing / {abort.raise} = {
+  let unsigned = !w.signed && op == b"saturating_mul";
+  let wide = if unsigned { b"uint64_t" } else { b"int64_t" };
+  let r = temp(site(p, pr));
+  let exact = line(
+    r.pr,
+    p.depth,
+    Bytes::concat_all([
+      wide,
+      b" ",
+      r.name,
+      b" = (",
+      wide,
+      b")(",
+      a,
+      b")",
+      if op == b"saturating_add" { b" + " }
+      else if op == b"saturating_sub" { b" - " }
+      else { b" * " },
+      b"(",
+      wide,
+      b")(",
+      b,
+      b");",
+    ]),
+  );
+  let top = Bytes::concat_all([
+    r.name,
+    b" > ",
+    if unsigned { b"(uint64_t)" } else { b"" },
+    int_lit(width_max(w)),
+    b" ? ",
+    int_lit(width_max(w)),
+    b" : ",
+    r.name,
+  ]);
+  bound(
+    p,
+    exact,
+    v,
+    Bytes::concat_all([
+      b"(",
+      ctype(KNum(w)),
+      b")(",
+      if unsigned { top } else {
+        Bytes::concat_all([
+          r.name,
+          b" < ",
+          int_lit(width_min(w)),
+          b" ? ",
+          int_lit(width_min(w)),
+          b" : (",
+          top,
+          b")",
+        ])
+      },
+      b")",
+    ]),
+  )
+}
+
+/// A shift by a count tested against the width (64 for an `Int`), done unsigned where C would leave
+/// it undefined.
+fn shifted(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  width: Option<Width>,
+  a: Bytes,
+  count: Bytes,
+) -> Printing / {abort.raise} = {
+  let c = temp(site(p, pr));
+  let held = line(c.pr, p.depth, Bytes::concat_all([b"int64_t ", c.name, b" = ", count, b";"]));
+  let guarded = line(
+    held,
+    p.depth,
+    Bytes::concat_all([
+      b"if ((uint64_t)",
+      c.name,
+      b" >= (uint64_t)",
+      ascii_of_int(match width { Some(w) -> w.bits, None -> 64 }),
+      b") { rt_shift_count_p(ctx, ",
+      c.name,
+      b", ",
+      match width { Some(w) -> ascii_of_int(width_index(w)), None -> b"-1" },
+      b"); ",
+      p.leave,
+      b" }",
+    ]),
+  );
+  let n = c.name;
+  bound(p, guarded, v, match width {
+    Some(w) -> {
+      let u = unsigned_c(w);
+      if op == b"shl" { Bytes::concat_all([b"(", u, b")((", u, b")(", a, b") << ", n, b")"]) }
+      else if op == b"shr" && w.signed { Bytes::concat_all([b"(", a, b") >> ", n]) }
+      else { Bytes::concat_all([b"(", u, b")((", u, b")(", a, b") >> ", n, b")"]) }
+    },
+    None -> if op == b"shl" { Bytes::concat_all([b"(int64_t)((uint64_t)(", a, b") << ", n, b")"]) }
+    else if op == b"shr" { Bytes::concat_all([b"(", a, b") >> ", n]) }
+    else { Bytes::concat_all([b"(int64_t)((uint64_t)(", a, b") >> ", n, b")"]) },
+  })
+}
+
+/// The constructor of `Ordering` the sign `s` names: its case's index where the value is held as
+/// one, else its word, whose tags the unit fills.
+fn ordering(p: Place, pr: Printing, v: Var, s: Bytes) -> Printing = {
+  let n = named(pr, v);
+  match v.rep {
+    RCases(c) ->
+      line(
+        n.pr,
+        p.depth,
+        Bytes::concat_all([
+          c_type(v.rep),
+          b" ",
+          n.name,
+          b" = ",
+          s,
+          b" < 0 ? ",
+          case_at(c.cases, b"Less"),
+          b" : ",
+          s,
+          b" == 0 ? ",
+          case_at(c.cases, b"Equal"),
+          b" : ",
+          case_at(c.cases, b"Greater"),
+          b";",
+        ]),
+      ),
+    _ ->
+      {
+        ..n.pr,
+        out: n.pr.out.concat([
+          Text(
+            Bytes::concat_all([
+              pad(p.depth),
+              c_type(v.rep),
+              b" ",
+              n.name,
+              b" = rt_ctor_value_p(ctx, ",
+              s,
+              b" < 0 ? ",
+            ]),
+          ),
+          Hole(TagOf(b"Less")),
+          Text(Bytes::concat_all([b" : ", s, b" == 0 ? "])),
+          Hole(TagOf(b"Equal")),
+          Text(b" : "),
+          Hole(TagOf(b"Greater")),
+          Text(b");\n"),
+        ]),
+      },
+  }
+}
+
+/// The sign an `Ordering` held as `on` stands for: below, at or above zero as it is `Less`, `Equal`
+/// or `Greater`.
+fn sign_printed(p: Place, pr: Printing, v: Var, on: Rep, o: Bytes) -> Printing =
+  match on {
+    RCases(c) ->
+      bound(
+        p,
+        pr,
+        v,
+        Bytes::concat_all([
+          b"(",
+          o,
+          b" == ",
+          case_at(c.cases, b"Less"),
+          b" ? -1 : ",
+          o,
+          b" == ",
+          case_at(c.cases, b"Equal"),
+          b" ? 0 : 1)",
+        ]),
+      ),
+    _ -> {
+      let n = named(pr, v);
+      {
+        ..n.pr,
+        out: n.pr.out.concat([
+          Text(
+            Bytes::concat_all([
+              pad(p.depth),
+              c_type(v.rep),
+              b" ",
+              n.name,
+              b" = (ply_obj(",
+              o,
+              b")->layout == ",
+            ]),
+          ),
+          Hole(TagOf(b"Less")),
+          Text(Bytes::concat_all([b" ? -1 : ply_obj(", o, b")->layout == "])),
+          Hole(TagOf(b"Equal")),
+          Text(b" ? 0 : 1);\n"),
+        ]),
+      }
+    },
+  }
+
+/// The index of case `name` among `cases`, as C writes it.
+fn case_at(cases: List<{ name: Bytes, leaves: List<Leaf> }>, name: Bytes) -> Bytes =
+  ascii_of_int(
+    range(0, cases.len()).fold(0, |k: Int, i: Int|
+      match cases.at(i) { Some(x) -> if x.name == name { i } else { k }, None -> k }),
+  )
+
+/// Below zero, zero or above zero as `x` and `y`, C values of one ordered type, order.
+fn signed_order(x: Bytes, y: Bytes) -> Bytes =
+  Bytes::concat_all([b"(int64_t)((", x, b") > (", y, b")) - (int64_t)((", x, b") < (", y, b"))"])
+
+/// Whether the strings or byte strings `x` and `y` hold the same bytes, read where they lie.
+fn bytes_equal(x: Bytes, y: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"(",
+    x,
+    b" == ",
+    y,
+    b" || (ply_obj(",
+    x,
+    b")->len == ply_obj(",
+    y,
+    b")->len && memcmp(ply_bytes(",
+    x,
+    b"), ply_bytes(",
+    y,
+    b"), ply_obj(",
+    x,
+    b")->len) == 0))",
+  ])
+
+/// A shift's or rotation's count as an `Int`, whatever width holds it.
+fn int_text(pr: Printing, a: Arg) -> Bytes =
+  match rep_of_arg(a) {
+    RNum(_) -> Bytes::concat_all([b"(int64_t)(", arg_text(pr, a), b")"]),
+    _ -> arg_text(pr, a),
+  }
+
+/// Where a literal divides, C's own operator does it: any but zero and minus one.
+fn literal_divisor(d: Option<Arg>) -> Bool =
+  match d { Some(AInt(n)) -> n != 0 && n != 0 - 1, _ -> false }
+
+fn bitwise(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor"
+
+fn compare_c(op: Bytes) -> Bytes =
+  if op == b"lt" { b"<" }
+  else if op == b"le" { b"<=" }
+  else if op == b"gt" { b">" }
+  else if op == b"ge" { b">=" }
+  else if op == b"eq" { b"==" }
+  else { b"!=" }
+
+fn bitop_c(op: Bytes) -> Bytes =
+  if op == b"bitand" { b"&" } else if op == b"bitor" { b"|" } else { b"^" }
+
+fn float_c(op: Bytes) -> Bytes =
+  if op == b"add" { b"+" } else if op == b"sub" { b"-" } else if op == b"mul" { b"*" } else { b"/" }
+
+fn unsigned_c(w: Width) -> Bytes =
+  if w.bits == 8 { b"uint8_t" }
+  else if w.bits == 16 { b"uint16_t" }
+  else if w.bits == 32 { b"uint32_t" }
+  else { b"uint64_t" }
+
+/// `rt_overflow`'s numbering of the operation that overflowed.
+fn overflow_code(op: Bytes) -> Int =
+  if op == b"add" { 0 }
+  else if op == b"sub" { 1 }
+  else if op == b"neg" { 2 }
+  else if op == b"mul" { 3 }
+  else { 4 }
+
+/// `rt_arith`'s opcode numbering.
+fn arith_code(op: Bytes) -> Int = if op == b"mul" { 0 } else if op == b"div" { 1 } else { 2 }
+
+/// `rt_binary`'s operator numbering.
+fn binary_code(op: Bytes) -> Int =
+  if op == b"add" { 0 }
+  else if op == b"sub" { 1 }
+  else if op == b"mul" { 2 }
+  else if op == b"div" { 3 }
+  else { 4 }
+
+fn width_index(w: Width) -> Int =
+  if w.bits == 128 { if w.signed { 9 } else { 8 } } else {
+    (if w.signed { 4 } else { 0 })
+      + (if w.bits == 8 { 0 } else if w.bits == 16 { 1 } else if w.bits == 32 { 2 } else { 3 })
+  }
+
+fn width_min(w: Width) -> Int = if w.signed { 0 - pow(2, w.bits - 1) } else { 0 }
+
+fn width_max(w: Width) -> Int = if w.signed { pow(2, w.bits - 1) - 1 } else { pow(2, w.bits) - 1 }
+
+// A copy of the emitter's private reading of a literal as a constant of the unit's table
+// (`emit.const_of_lit`), listed in the hooks file.
+
+fn const_of_lit(l: Lit) -> Const / {abort.raise} =
+  match l {
+    LStr(x) -> ConstStr(x),
+    LBytes(x) -> ConstBytes(x),
+    LEmbedded(digest, _) -> ConstEmbedded(digest),
+    LFixed(name, bits) -> match width_named(name) {
+      Some(w) -> ConstFixed({ width: width_index(w), bits: bits }),
+      None -> ConstUnit,
+    },
+    LWide(name, high, low) -> match width_named(name) {
+      Some(w) -> ConstWide({ width: width_index(w), high: high, low: low }),
+      None -> ConstUnit,
+    },
+    LFloat(x) -> ConstFloat(unspaced(x)),
+    LDec(x) -> ConstDecimal(unspaced(x)),
+    LChar(v) -> ConstChar(v),
+    _ -> ConstUnit,
+  }
+
+fn unspaced(s: Bytes) -> Bytes / {abort.raise} =
+  Bytes::concat_all(
+    range(0, s.len()).map(|i: Int| if s.at(i) <= 32 { b"" } else { s.slice(i, i + 1) }),
+  )
+
+fn place() -> Place =
+  {
+    u: {
+      base: 0,
+      answer: RInt,
+      site: None,
+      arm: None,
+      looping: None,
+      landing: None,
+      group: None,
+      symbol: b"f",
+    },
+    at: span_between(0, 4),
+    leave: b"return 0;",
+    depth: 0,
+  }
+
+fn local(id: Int, ty: Bytes, rep: Rep) -> Var =
+  { id: id, ty: TyCon({ name: ty, args: [] }), rep: rep }
+
+/// `op` over `args` held as `on` printed into `v`, the parameters named as `names` says.
+fn printed_prim(
+  names: Map<Int, Bytes>,
+  v: Var,
+  op: Bytes,
+  on: Rep,
+  args: List<Arg>,
+) -> Bytes / {abort.raise} =
+  spelled(prim(place(), printing(names), Some(v), { op: op, on: on, args: args }).out)
+
+test "a width's sum is done wide and narrowed back, its literal in the width's own C type" {
+  let byte = { bits: 8, signed: false };
+  assert_eq(
+    printed_prim(Map::new().insert(0, b"p0"), local(1, b"U8", RNum(byte)), b"add", RNum(byte), [
+      AVar(local(0, b"U8", RNum(byte))),
+      ANum({ width: byte, bits: 1 }),
+    ]),
+    Bytes::concat_all([
+      b"  PLY_SITE(ctx, @@r@@, 0, 4);\n",
+      b"  int64_t t1 = (int64_t)(p0) + (int64_t)(((uint8_t)INT64_C(1)));\n",
+      b"  if (t1 < INT64_C(0) || t1 > INT64_C(255)) { rt_overflow_p(ctx, 0); return 0; }\n",
+      b"  uint8_t t2 = (uint8_t)t1;\n",
+    ]),
+  )
+}
+
+test "an order's sign is made the constructor of `Ordering` it names, whose tags the unit fills" {
+  let o = prim(
+    place(),
+    printing(Map::new().insert(0, b"p0")),
+    Some(local(1, b"Ordering", RWord)),
+    { op: b"ordering", on: RInt, args: [AVar(local(0, b"Int", RInt))] },
+  );
+  assert_eq([b"Less", b"Equal", b"Greater"].map(|n: Bytes| o.out.contains(Hole(TagOf(n)))), [
+    true,
+    true,
+    true,
+  ]);
+  assert_eq(
+    spelled(o.out),
+    b"  Word t1 = rt_ctor_value_p(ctx, p0 < 0 ? @@TLess@@ : p0 == 0 ? @@TEqual@@ : @@TGreater@@);\n",
+  );
+  // Held as its case's index, an order makes no object.
+  let index = RCases({
+    tagged: false,
+    cases: [b"Less", b"Equal", b"Greater"].map(|n: Bytes| { name: n, leaves: [] }),
+  });
+  assert_eq(
+    printed_prim(Map::new().insert(0, b"p0"), local(1, b"Ordering", index), b"ordering", RInt, [
+      AVar(local(0, b"Int", RInt)),
+    ]),
+    Bytes::concat_all([b"  ", c_type(index), b" t1 = p0 < 0 ? 0 : p0 == 0 ? 1 : 2;\n"]),
+  );
+  // And back: the sign an `Ordering` stands for, read off its constructor's tag or its index.
+  let sign = |rep: Rep|
+    printed_prim(Map::new().insert(0, b"p0"), local(1, b"Int", RInt), b"sign", rep, [
+      AVar(local(0, b"Ordering", rep)),
+    ]);
+  assert_eq(
+    sign(RWord),
+    b"  int64_t t1 = (ply_obj(p0)->layout == @@TLess@@ ? -1 : ply_obj(p0)->layout == @@TEqual@@ ? 0 : 1);\n",
+  );
+  assert_eq(sign(index), b"  int64_t t1 = (p0 == 0 ? -1 : p0 == 1 ? 0 : 1);\n")
+}
+
+test "a constant is read from the pool, a decimal's word let go once its two words are read" {
+  let pr = literal(place(), printing(Map::new()), Some(local(0, b"Decimal", RDec)), LDec(b"1.5"));
+  assert_eq(pr.consts, [ConstDecimal(b"1.5")]);
+  assert_eq(
+    spelled(pr.out),
+    Bytes::concat_all([
+      b"  Word t1 = rt_lit_p(ctx, @@c0@@);\n",
+      b"  if (ctx->failed) return 0;\n",
+      b"  PlyDec t2 = ply_dec_of(t1); ply_dec(ctx, t1);\n",
+    ]),
+  );
+  let text = literal(place(), pr, Some(local(1, b"String", RWord)), LStr(b"a"));
+  assert_eq(text.consts, [ConstDecimal(b"1.5"), ConstStr(b"a")]);
+  assert(
+    spelled(text.out).ends_with(
+      b"  Word t3 = rt_lit_p(ctx, @@c1@@);\n  if (ctx->failed) return 0;\n",
+    ),
+  )
+}
+
+test "two strings are equal where their bytes are, and two characters as C compares their words" {
+  let names = Map::new().insert(0, b"p0").insert(1, b"p1");
+  let s = |id: Int| AVar(local(id, b"String", RWord));
+  assert_eq(
+    printed_prim(names, local(2, b"Bool", RBool), b"bytes_ne", RWord, [s(0), s(1)]),
+    b"  int64_t t1 = !(p0 == p1 || (ply_obj(p0)->len == ply_obj(p1)->len && memcmp(ply_bytes(p0), ply_bytes(p1), ply_obj(p0)->len) == 0));\n",
+  );
+  let c = |id: Int| AVar(local(id, b"Char", RWord));
+  assert_eq(
+    printed_prim(names, local(2, b"Bool", RBool), b"le", RWord, [c(0), c(1)]),
+    b"  int64_t t1 = (p0) <= (p1);\n",
+  )
+}

@@ -1,0 +1,155 @@
+//! The ownership pass's instructions printed: counts taken and let go, cells kept for reuse and
+//! freed, a flat value opened into its parts, and what a failure path releases before it leaves.
+
+import std.bytes (ascii_of_int)
+import syntax.parsing (span_between)
+import check.types (TyCon)
+import emit.tir (Rep, RInt, RWord, RMaybe, RTagged, RFlat, RToken, Var, Inst, Inc, Dec, Reset, Free,
+                 Opened, AInt, counted, parts_of)
+import emit.pieces (spelled)
+import emit.print.text (Printing, Place, line, name_of, named, printing, part_names)
+
+/// The C a failure path runs to release `unwind` before it leaves: each count let go, and a reuse
+/// token's block, which holds nothing, freed.
+pub fn released(pr: Printing, unwind: List<Var>) -> Bytes =
+  Bytes::join(unwind.map(|v: Var| let_go(name_of(pr, v), v.rep)).filter(|t: Bytes| t != b""), b" ")
+
+/// `i`, one of `Inc`, `Dec`, `Reset`, `Free` and `Opened`. An opened value's words are its parts'
+/// C locals under their own variables, so opening one writes no C.
+pub fn count_printed(p: Place, pr: Printing, i: Inst) -> Printing =
+  match i {
+    Inc(n) -> {
+      let once = Bytes::join(
+        counted_parts(name_of(pr, n.var), n.var.rep).map(|c: Bytes|
+          Bytes::concat_all([b"ply_inc(", c, b");"])),
+        b" ",
+      );
+      line(pr, p.depth, Bytes::join(range(0, n.n).map(|_: Int| once), b" "))
+    },
+    Dec(v) -> line(pr, p.depth, let_go(name_of(pr, v), v.rep)),
+    Reset(r) -> {
+      let x = name_of(pr, r.of);
+      let t = named(pr, r.token);
+      line(
+        t.pr,
+        p.depth,
+        Bytes::concat_all([
+          b"Word ",
+          t.name,
+          b" = ply_reset_flat(",
+          x,
+          b"); if (!",
+          t.name,
+          b") ",
+          t.name,
+          b" = rt_reset_p(ctx, ",
+          x,
+          b");",
+        ]),
+      )
+    },
+    Free(r) -> line(pr, p.depth, let_go(name_of(pr, r.of), r.of.rep)),
+    Opened(o) -> {
+      let names = part_names(name_of(pr, o.of), o.of.rep);
+      {
+        ..pr,
+        names: range(0, o.words.len()).fold(pr.names, |m: Map<Int, Bytes>, k: Int|
+          match o.words.at(k) {
+            Some(w) -> match names.at(k) { Some(n) -> m.insert(w.id, n), None -> m },
+            None -> m,
+          }),
+      }
+    },
+    _ -> pr,
+  }
+
+/// The C that lets go of the value named `x` held as `r`: each count it holds let go. A reuse token
+/// is a block of one count whose fields were let go, so letting it go frees it.
+fn let_go(x: Bytes, r: Rep) -> Bytes =
+  Bytes::join(
+    counted_parts(x, r).map(|c: Bytes| Bytes::concat_all([b"ply_dec(ctx, ", c, b");"])),
+    b" ",
+  )
+
+/// The C names of the parts of a value named `x` held as `r` that hold a count.
+fn counted_parts(x: Bytes, r: Rep) -> List<Bytes> = {
+  let parts = parts_of(r);
+  let names = part_names(x, r);
+  range(0, parts.len()).fold([], |acc: List<Bytes>, k: Int|
+    match parts.at(k) {
+      Some(part) -> if counted(part) { match names.at(k) { Some(n) -> acc.push(n), None -> acc } }
+      else { acc },
+      None -> acc,
+    })
+}
+
+fn local(id: Int, rep: Rep) -> Var = { id: id, ty: TyCon({ name: b"T", args: [] }), rep: rep }
+
+fn place() -> Place =
+  {
+    u: {
+      symbol: b"m_f",
+      base: 0,
+      answer: RWord,
+      site: None,
+      arm: None,
+      looping: None,
+      landing: None,
+      group: None,
+    },
+    at: span_between(0, 0),
+    leave: b"return 0;",
+    depth: 0,
+  }
+
+fn printed(pr: Printing, i: Inst) -> Bytes / {abort.raise} =
+  spelled(count_printed(place(), pr, i).out)
+
+test "a count is taken or let go of each part of a value that holds one, as many times as it is taken" {
+  let x = local(0, RWord);
+  let flat = local(1, RFlat([{ name: b"a", rep: RInt }, { name: b"b", rep: RWord }]));
+  let k = local(2, RInt);
+  let pr = printing(Map::new().insert(0, b"p0").insert(1, b"t1").insert(2, b"t2"));
+  assert_eq(printed(pr, Inc({ var: x, n: 2 })), b"  ply_inc(p0); ply_inc(p0);\n");
+  assert_eq(printed(pr, Dec(x)), b"  ply_dec(ctx, p0);\n");
+  // A flat value's counted leaf and its word each hold a count; its scalar leaf holds none.
+  assert_eq(printed(pr, Dec(flat)), b"  ply_dec(ctx, t1_1); ply_dec(ctx, t1_2);\n");
+  assert_eq(
+    released(pr, [x, k, flat]),
+    b"ply_dec(ctx, p0); ply_dec(ctx, t1_1); ply_dec(ctx, t1_2);",
+  );
+  assert_eq(released(pr, [k]), b"");
+  assert_eq([RMaybe, RTagged, RToken(2)].map(|r: Rep| let_go(b"w", r)), [
+    b"ply_dec(ctx, w);",
+    b"ply_dec(ctx, w);",
+    b"ply_dec(ctx, w);",
+  ])
+}
+
+test "a reset keeps a block held only here as its token, and a token no make took is freed" {
+  let x = local(0, RWord);
+  let token = local(1, RToken(2));
+  let pr = printing(Map::new().insert(0, b"p0"));
+  let reset = count_printed(place(), pr, Reset({ token: token, of: x }));
+  assert_eq(name_of(reset, token), b"t1");
+  assert_eq(
+    printed(pr, Reset({ token: token, of: x })),
+    b"  Word t1 = ply_reset_flat(p0); if (!t1) t1 = rt_reset_p(ctx, p0);\n",
+  );
+  assert_eq(
+    printed({ ..reset, out: [] }, Free({ of: token, bytes: AInt(16) })),
+    b"  ply_dec(ctx, t1);\n",
+  );
+  assert_eq(released(reset, [x, token]), b"ply_dec(ctx, p0); ply_dec(ctx, t1);")
+}
+
+test "a flat value opened writes no C, and each word is the part it was" {
+  let flat = local(0, RFlat([{ name: b"a", rep: RWord }, { name: b"b", rep: RInt }]));
+  let words = [local(1, RWord), local(2, RInt), local(3, RWord)];
+  let pr = printing(Map::new().insert(0, b"p0"));
+  let opened = count_printed(place(), pr, Opened({ of: flat, words: words }));
+  assert_eq(opened.out, []);
+  assert_eq(words.map(|w: Var| name_of(opened, w)), [b"p0_0", b"p0_1", b"p0_2"]);
+  // Letting go of the first word and the record's word lets go of what the value held.
+  assert_eq(released(opened, [words.get(0), words.get(2)]), released(pr, [flat]))
+}

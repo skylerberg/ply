@@ -1,0 +1,434 @@
+//! `perform`, labels, `handle`, `parallel` and `simulate`. Each is an operation of the runtime's over
+//! words, naming effects program-wide; a `handle` is a block its body runs in, inline under the
+//! frame its clauses lay out, or detached on a stack of its own where a clause resumes off its tail.
+
+import emit.code (Code, CodeClause, CodeReturn, CodeStmt, CLet, CLetPat, CDo, CodeArm, CodeField,
+                  Borrowed, NApp, NVar, NIf, NBlock, NMatch, NUnary, NBinary, NField, NUpdate,
+                  NRecord, NList, NPerform, NParallel, NHandle, slots_read, all_read, pat_slots)
+import syntax.parsing (Span)
+import check.types (Type, TyFn, TyRecord, Scheme, Atom, RNamed, is_diverges, int_type,
+                    fields_sorted)
+import emit.typing (unknown_type)
+import check.resolve.tables (qualify)
+import expand.rewrite (named_program_wide)
+import check.infer.checker (prelude_effects, EffectInfo, OpInfo)
+import syntax.type_syntax (Mode, MRead, MWrite, MRaise, MBad, is_raise)
+import std.bytes (ascii_of_int)
+import emit.reps (Def)
+import emit.state (EffectName, OpMode)
+import emit.tir (RInt, RWord, Arg, AVar, Inst, Block, Op, OHandle, Assign, If, Case, Match, Miss,
+                 Loop, Next, Done, Return, Restart, Enter, Handle, Handling, falls_through)
+import emit.tir.handling (Perform, Label, Parallel, Simulate, Clause, Reached)
+import emit.lower.base (Context, Lowering, Lowered, Frame, ClauseMade, refuse, fresh, bound_as,
+                        emitted, continued, type_at, type_of, handed)
+import emit.lower.held (held_as)
+
+/// Operation `op` of `effect` performed on `resource` with `args`, at `label` where one is read:
+/// the label opened as the field-table entry it is, each argument handed over as a word, and what
+/// the handler answers, a word, held as the type the checker filed for the perform.
+pub fn performed(
+  cx: Context,
+  st: Lowering,
+  p: { effect: Bytes, op: Bytes, resource: Bytes },
+  label: Option<Arg>,
+  args: List<Arg>,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  match effect_named(cx, p.effect) {
+    None -> refuse(st, Handling, b"an effect the lowering does not resolve: ".concat(p.effect)),
+    Some(en) -> {
+      // The label is opened first, so an argument boxed after it fails holding no count of it.
+      let keyed = match label {
+        Some(l) -> {
+          let k = handed({ st: st, arg: l }, RInt, at);
+          { st: k.st, args: [k.arg] }
+        },
+        None -> { st: st, args: [] },
+      };
+      let words = args.fold(
+        { st: keyed.st, args: [] },
+        |acc: { st: Lowering, args: List<Arg> }, a: Arg| {
+          let w = handed({ st: acc.st, arg: a }, RWord, at);
+          { st: w.st, args: acc.args.push(w.arg) }
+        },
+      );
+      let mode = op_mode(en, p.op);
+      let ty = match type_at(cx, at) { Some(t) -> t, None -> unknown_type() };
+      let op = Op({
+        op: OHandle(
+          Perform({
+            effect: en.global,
+            op: p.op,
+            resource: if label == None { p.resource } else { b"" },
+            labelled: label != None,
+            mode: mode_code(mode),
+          }),
+        ),
+        args: keyed.args.concat(words.args),
+        uses: {
+          takes: keyed.args.map(|_: Arg| false).concat(words.args.map(|_: Arg| true)),
+          owned: true,
+          fails: true,
+          stops: !is_raise(mode),
+        },
+      });
+      handed(bound_as(words.st, ty, RWord, op, at), held_as(cx.setting, ty), at)
+    },
+  }
+
+/// The field-table entry of resource `name`, as a call's label argument.
+pub fn label(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered =
+  bound_as(
+    st,
+    int_type(),
+    RInt,
+    Op({
+      op: OHandle(Label(name)),
+      args: [],
+      uses: { takes: [], owned: false, fails: false, stops: false },
+    }),
+    at,
+  )
+
+/// How clause `clause`'s body is laid out as a function of its own: its parameters, then the call
+/// site's label where it binds one, then its continuation where it resumes.
+pub fn clause_frame(cx: Context, clause: CodeClause) -> Frame =
+  {
+    params: clause.params + (if clause.binds_label { 1 } else { 0 })
+      + (if clause.resume { 1 } else { 0 }),
+    size: clause.size,
+    captures: clause.captures,
+  }
+
+/// How a `handle`'s return clause is laid out as a function of its own: the value the body answered,
+/// then what it copies in.
+pub fn ret_frame(cx: Context, r: CodeReturn) -> Frame =
+  { params: 1, size: r.size, captures: r.captures }
+
+/// How a `handle`'s body is laid out as a function of its own where it runs detached, on a stack of
+/// its own: no parameters, each slot it reads that is bound around it copied in at its own number;
+/// nothing where it runs in place.
+pub fn body_frame(
+  cx: Context,
+  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+) -> Option<Frame> =
+  if !detaches(h.clauses) { None } else {
+    let inside = bound_in(h.body);
+    let reads = slots_read(h.body).fold([], |acc: List<Int>, r: Int|
+      if acc.contains(r) || inside.contains(r) { acc } else { acc.push(r) });
+    Some({
+      params: 0,
+      size: reads.concat(inside).fold(0, |m: Int, r: Int| if r + 1 > m { r + 1 } else { m }),
+      captures: reads.map(|r: Int| { src: r, dst: r, own: Borrowed }),
+    })
+  }
+
+/// The `handle` `h`, its body lowered to `body` (in a block of its own, or as a closure where
+/// `body_frame` says it runs detached), its clauses and return clause made: the frame its clauses lay
+/// out over their closures and the labels they key on, its body run under it, and what it answers,
+/// a word, held as the type it answers.
+pub fn handled(
+  cx: Context,
+  st: Lowering,
+  body: Lowered,
+  clauses: List<ClauseMade>,
+  ret: Option<Arg>,
+  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+  at: Span,
+) -> Lowered / {abort.raise} = {
+  let detached = detaches(h.clauses);
+  let inner = if detached { { outer: body.st, block: [], word: None } }
+  else if !falls_through(body.st.insts) {
+    { outer: continued(st, body.st), block: body.st.insts, word: None }
+  } else {
+    let w = handed(body, RWord, at);
+    { outer: continued(st, w.st), block: w.st.insts, word: Some(w.arg) }
+  };
+  let laid = range(0, h.clauses.len()).fold(
+    { st: inner.outer, args: [], takes: [], clauses: [], unknown: None },
+    |acc: Laid, i: Int|
+      match h.clauses.at(i) {
+        None -> acc,
+        Some(cl) -> match clauses.at(i) {
+          None -> acc,
+          Some(made) -> clause_laid(cx, acc, cl, made, at),
+        },
+      },
+  );
+  let tail = match ret {
+    Some(r) -> { args: laid.args.push(r), takes: laid.takes.push(true), at: Some(laid.args.len()) },
+    None -> { args: laid.args, takes: laid.takes, at: None },
+  };
+  let all = if detached {
+    { args: tail.args.push(body.arg), takes: tail.takes.push(true), at: Some(tail.args.len()) }
+  } else { { args: tail.args, takes: tail.takes, at: None } };
+  let ty = match ret {
+    Some(r) -> answer_of(type_of(r)),
+    None -> if detached { answer_of(type_of(body.arg)) } else { type_of(body.arg) },
+  };
+  let a = fresh(laid.st, ty, RWord);
+  match laid.unknown {
+    Some(name) -> refuse(a.st, Handling, b"an effect the lowering does not resolve: ".concat(name)),
+    None -> if escapes(inner.block, false, false) {
+      refuse(a.st, Handling, b"a handle body that leaves other than by its end")
+    } else {
+      let out = emitted(
+        a.st,
+        Handle({
+          body: match inner.word {
+            Some(w) -> inner.block.push(Assign({ var: a.var, arg: w })),
+            None -> inner.block,
+          },
+          args: all.args,
+          uses: { takes: all.takes, owned: true, fails: true, stops: false },
+          site: { clauses: laid.clauses, ret: tail.at, detached: all.at },
+          answer: a.var,
+          unwind: [],
+        }),
+      );
+      handed({ st: out, arg: AVar(a.var) }, held_as(cx.setting, ty), at)
+    },
+  }
+}
+
+/// A `parallel` block of the closures `branches`: the runtime runs them, at once where it may, and
+/// the block answers the tuple of their answers. Where the block is in its definition's own body,
+/// the runtime is told what the definition's row lets the branches reach.
+pub fn branched(
+  cx: Context,
+  st: Lowering,
+  branches: List<Arg>,
+  rooted: Bool,
+  at: Span,
+) -> Lowered / {abort.raise} = {
+  let words = branches.fold(
+    { st: st, args: [] },
+    |acc: { st: Lowering, args: List<Arg> }, b: Arg| {
+      let w = handed({ st: acc.st, arg: b }, RWord, at);
+      { st: w.st, args: acc.args.push(w.arg) }
+    },
+  );
+  let ty = TyRecord(
+    fields_sorted(
+      range(0, branches.len()).map(|i: Int|
+        {
+          name: b"_".concat(ascii_of_int(i)),
+          ty: match branches.at(i) { Some(b) -> answer_of(type_of(b)), None -> unknown_type() },
+        }),
+    ),
+  );
+  let op = Op({
+    op: OHandle(Parallel({ reach: if rooted { owner_reach(cx) } else { None } })),
+    args: words.args,
+    uses: { takes: words.args.map(|_: Arg| true), owned: true, fails: true, stops: true },
+  });
+  handed(bound_as(words.st, ty, RWord, op, at), held_as(cx.setting, ty), at)
+}
+
+/// A `simulate` of the nullary closure `body`, which answers what the body answers.
+pub fn simulated(cx: Context, st: Lowering, body: Arg, at: Span) -> Lowered / {abort.raise} = {
+  let w = handed({ st: st, arg: body }, RWord, at);
+  let ty = answer_of(type_of(body));
+  let op = Op({
+    op: OHandle(Simulate),
+    args: [w.arg],
+    uses: { takes: [true], owned: true, fails: true, stops: true },
+  });
+  handed(bound_as(w.st, ty, RWord, op, at), held_as(cx.setting, ty), at)
+}
+
+/// A `handle`'s clauses laid out so far: the state, the handle's operands and whether it takes each,
+/// the clauses, and the first effect no clause's name resolves to.
+type Laid = {
+  st: Lowering,
+  args: List<Arg>,
+  takes: List<Bool>,
+  clauses: List<Clause>,
+  unknown: Option<Bytes>,
+}
+
+/// Clause `cl`, made as `made`, laid out after `acc`: its closure, then the label it keys on.
+fn clause_laid(
+  cx: Context,
+  acc: Laid,
+  cl: CodeClause,
+  made: ClauseMade,
+  at: Span,
+) -> Laid / {abort.raise} =
+  match effect_named(cx, cl.effect) {
+    None -> { ..acc, unknown: match acc.unknown { Some(u) -> Some(u), None -> Some(cl.effect) } },
+    Some(en) -> {
+      let keyed = match made.label {
+        Some(l) -> {
+          let k = handed({ st: acc.st, arg: l }, RInt, at);
+          { st: k.st, args: [k.arg] }
+        },
+        None -> { st: acc.st, args: [] },
+      };
+      {
+        st: keyed.st,
+        args: acc.args.push(made.closure).concat(keyed.args),
+        takes: acc.takes.push(true).concat(keyed.args.map(|_: Arg| false)),
+        clauses: acc.clauses.push({
+          effect: en.global,
+          op: cl.op,
+          resource: if made.label == None { cl.resource } else { b"" },
+          mode: clause_mode(cx, cl),
+          binds_label: cl.binds_label,
+          handler: acc.args.len(),
+          label: if made.label == None { None } else { Some(acc.args.len() + 1) },
+        }),
+        unknown: acc.unknown,
+      }
+    },
+  }
+
+/// As the runtime numbers a clause: `3` answers a raise, `0` never resumes, `1` resumes in tail
+/// position only, `2` resumes anywhere.
+fn clause_mode(cx: Context, cl: CodeClause) -> Int / {abort.raise} =
+  if named_program_wide(cl.effect) != None
+      || (match effect_named(cx, cl.effect) {
+        Some(e) -> is_raise(op_mode(e, cl.op)),
+        None -> false,
+      }) { 3 }
+  else if !cl.resume { 0 }
+  else if resume_in_tail_only(cl) { 1 }
+  else { 2 }
+
+/// Whether a clause resumes off its tail, so its `handle`'s body runs on a stack of its own.
+fn detaches(clauses: List<CodeClause>) -> Bool =
+  clauses.any(|cl: CodeClause| cl.resume && !resume_in_tail_only(cl))
+
+/// Whether clause `cl` reads its continuation only to call it in tail position, once on each path.
+/// The continuation takes the slot after the parameters and the label the clause binds.
+fn resume_in_tail_only(cl: CodeClause) -> Bool = {
+  let k = cl.params + (if cl.binds_label { 1 } else { 0 });
+  slots_read(cl.body).fold(0, |n: Int, y: Int| if y == k { n + 1 } else { n })
+    == tail_calls_of(cl.body, k)
+}
+
+fn tail_calls_of(code: Code, k: Int) -> Int =
+  match code.node {
+    NApp(a) -> match a.func.node {
+      NVar(v) -> if v.slot == Some(k) && a.args.len() == 1 && !all_read(a.args).contains(k) { 1 }
+      else { 0 },
+      _ -> 0,
+    },
+    NIf(i) -> tail_calls_of(i.then_branch, k) + tail_calls_of(i.else_branch, k),
+    NBlock(b) -> match b.tail { Some(t) -> tail_calls_of(t, k), None -> 0 },
+    NMatch(m) -> m.arms.fold(0, |n: Int, a: CodeArm| n + tail_calls_of(a.body, k)),
+    _ -> 0,
+  }
+
+/// The slots `c` binds in the frame it runs in: its `let`s' and its patterns'. A lambda's, a
+/// clause's and a `simulate`'s body bind in frames of their own.
+fn bound_in(c: Code) -> List<Int> =
+  match c.node {
+    NBlock(b) ->
+      b.stmts.fold([], |acc: List<Int>, s: CodeStmt|
+        acc.concat(match s {
+          CLet(l) -> bound_in(l.value).push(l.slot),
+          CLetPat(l) -> bound_in(l.value).concat(pat_slots(l.pat)),
+          CDo(d) -> bound_in(d.code),
+        })).concat(match b.tail { Some(t) -> bound_in(t), None -> [] }),
+    NIf(i) -> bound_in(i.cond).concat(bound_in(i.then_branch)).concat(bound_in(i.else_branch)),
+    NMatch(m) ->
+      m.arms.fold(bound_in(m.scrutinee), |acc: List<Int>, a: CodeArm|
+        acc.concat(pat_slots(a.pat)).concat(match a.guard {
+          Some(g) -> bound_in(g),
+          None -> [],
+        }).concat(
+          bound_in(a.body),
+        )),
+    NUnary(u) -> bound_in(u.operand),
+    NBinary(x) -> bound_in(x.lhs).concat(bound_in(x.rhs)),
+    NApp(a) -> a.args.fold(bound_in(a.func), |acc: List<Int>, x: Code| acc.concat(bound_in(x))),
+    NList(l) -> l.items.fold([], |acc: List<Int>, x: Code| acc.concat(bound_in(x))),
+    NRecord(r) -> r.fields.fold([], |acc: List<Int>, f: CodeField| acc.concat(bound_in(f.value))),
+    NField(f) -> bound_in(f.base),
+    NUpdate(u) ->
+      u.sets.fold(bound_in(u.base), |acc: List<Int>, f: CodeField| acc.concat(bound_in(f.value))),
+    NPerform(p) -> p.args.fold([], |acc: List<Int>, x: Code| acc.concat(bound_in(x))),
+    NParallel(pr) -> pr.branches.fold([], |acc: List<Int>, x: Code| acc.concat(bound_in(x))),
+    NHandle(hd) -> bound_in(hd.body),
+    _ -> [],
+  }
+
+/// Whether control can leave `b` other than by its end or a failure: a `Return`, a restart or an
+/// entry into the group anywhere in it, or a `Miss`, `Next` or `Done` of a `Match` or `Loop` around
+/// it, which would leave a handle's frame installed.
+fn escapes(b: Block, matched: Bool, looped: Bool) -> Bool =
+  b.fold(false, |found: Bool, i: Inst|
+    found
+      || (match i {
+        Return(_) -> true,
+        Restart(_) -> true,
+        Enter(_) -> true,
+        Miss -> !matched,
+        Next(_) -> !looped,
+        Done(_) -> !looped,
+        If(x) -> escapes(x.then, matched, looped) || escapes(x.otherwise, matched, looped),
+        Case(c) ->
+          c.arms.fold(
+            escapes(c.rest, matched, looped),
+            |any: Bool, a: { when: Int, body: Block }| any || escapes(a.body, matched, looped),
+          ),
+        Match(m) ->
+          m.arms.fold(escapes(m.rest, matched, looped), |any: Bool, a: Block|
+            any || escapes(a, true, looped)),
+        Loop(l) -> escapes(l.body, matched, true),
+        Handle(hd) -> escapes(hd.body, false, false),
+        _ -> false,
+      }))
+
+/// What a function of type `t` answers.
+fn answer_of(t: Type) -> Type = match t { TyFn(f) -> f.ret, _ -> unknown_type() }
+
+/// The effect a body names `written`: one a `try` names program-wide, one the module's scope binds,
+/// or one of the prelude's, which are known program-wide by their bare names.
+fn effect_named(cx: Context, written: Bytes) -> Option<EffectName> / {abort.raise} =
+  match named_program_wide(written) {
+    Some(global) -> Some({ written: written, global: global, ops: [] }),
+    None -> match cx.setting.effects.fold(None, |acc: Option<EffectName>, e: EffectName|
+        if e.written == written { Some(e) } else { acc }) {
+      Some(e) -> Some(e),
+      None ->
+        prelude_effects().fold(None, |acc: Option<EffectName>, e: EffectInfo|
+          if e.name == written {
+            Some({
+              written: e.name,
+              global: e.name,
+              ops: e.ops.map(|o: OpInfo| { name: o.name, mode: o.mode }),
+            })
+          } else { acc }),
+    },
+  }
+
+/// An operation's declared mode: a read where its effect does not declare it.
+fn op_mode(e: EffectName, op: Bytes) -> Mode =
+  e.ops.fold(MRead, |acc: Mode, o: OpMode| if o.name == op { o.mode } else { acc })
+
+/// A mode as the runtime numbers it.
+fn mode_code(m: Mode) -> Int = match m { MRead -> 0, MWrite -> 1, MRaise -> 2, MBad -> 0 }
+
+/// Every operation the root's row says it may perform and does not answer, by program-wide names:
+/// what a `parallel` block in its own body may reach of the handlers its callers installed. Nothing
+/// where the row is left open or no definition's scheme speaks for the root.
+fn owner_reach(cx: Context) -> Option<List<Reached>> =
+  match cx.setting.here.fold(None, |found: Option<Scheme>, d: Def| {
+      let full = qualify(cx.setting.module, d.name);
+      if full == cx.full || cx.full.starts_with(full.concat(b"@")) { d.scheme } else { found }
+    }) {
+    None -> None,
+    Some(s) -> match s.ty {
+      TyFn(f) -> match f.effects.tail {
+        Some(_) -> None,
+        None ->
+          Some(
+            f.effects.atoms.filter(|a: Atom| !is_diverges(a)).map(|a: Atom|
+              { effect: a.effect, resource: match a.resource { RNamed(n) -> Some(n), _ -> None } }),
+          ),
+      },
+      _ -> None,
+    },
+  }

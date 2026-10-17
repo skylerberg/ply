@@ -1,0 +1,379 @@
+//! A root's `Code` lowered to the typed form. Each node is typed from its parts as it is lowered, so
+//! a type belongs to its node and not to its place in the text; each value is held as its type
+//! says. This module holds the one recursion over a body; each construct's family lowers it from its
+//! parts (`emit.lower.*`), and where a construct holds code, says what state each part is lowered
+//! in and assembles the construct from the parts lowered.
+
+import emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch,
+                  NPerform, NLabel, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, NKnown,
+                  CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm, CodeClause)
+import syntax.patterns (LUnit)
+import emit.typing (unknown_type)
+import emit.tir (Var, Arg, AZero, RWord, Return, Fn, Rooted, Declined, Spine, Calling,
+                 falls_through)
+import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
+                        ToInPlace, Armed, ClauseMade, GroupMember, Opened, started, refuse, opened,
+                        continued, joined, short_circuit, handed)
+import emit.lower.data (constructed, recorded, field, updated)
+import emit.lower.scalars (literal, constant, operand, unary, binary)
+import emit.lower.containers (builtin, listed, columned, column_read)
+import emit.lower.matching (arm_opened, closed, let_bound, compared_side, compared_args, compared)
+import emit.lower.calling (convention, target, global, known, called, applied, entered, left,
+                           lambda_opened, closure, group_opened, grouped)
+import emit.lower.handling (performed, label, clause_frame, ret_frame, body_frame, handled,
+                            branched, simulated)
+
+/// The root lowered, or why its body is outside what the lowering covers.
+pub fn lowered_fn(cx: Context, body: Code) -> Result<Fn, Declined> / {abort.raise} = {
+  let conv = convention(cx);
+  let params = range(0, conv.reps.len()).map(|i: Int|
+    {
+      id: i,
+      ty: match cx.types.at(i) { Some(t) -> t, None -> unknown_type() },
+      rep: conv.reps.get(i),
+    });
+  let out = lowered(cx, started(params), body, true);
+  let answered = if falls_through(out.st.insts) { handed(out, conv.answer, body.span) }
+  else { out };
+  match answered.st.refused {
+    Some(no) -> Err(no),
+    None ->
+      Ok({
+        key: cx.key,
+        kind: Rooted,
+        params: params,
+        conv: conv,
+        body: if falls_through(answered.st.insts) { answered.st.insts.push(Return(answered.arg)) }
+        else { answered.st.insts },
+        lambdas: answered.st.lambdas,
+        base: cx.base,
+        members: [],
+        links: answered.st.links,
+      }),
+  }
+}
+
+/// A tail group's members lowered as one root, or why the form does not cover it.
+pub fn lowered_group(members: List<GroupMember>) -> Result<Fn, Declined> / {abort.raise} = {
+  let starts = group_opened(members);
+  let bodies = range(0, members.len()).fold(
+    { after: None, out: [] },
+    |acc: { after: Option<Lowering>, out: List<Lowered> }, i: Int|
+      match members.at(i) {
+        None -> acc,
+        Some(m) -> match starts.at(i) {
+          None -> acc,
+          Some(o) -> {
+            let from = match acc.after { Some(a) -> continued(o.st, a), None -> o.st };
+            let b = lowered(o.cx, from, m.body, true);
+            { after: Some(b.st), out: acc.out.push(b) }
+          },
+        },
+      },
+  );
+  grouped(members, bodies.out)
+}
+
+/// The one recursion over a body: each node lowered after its parts, which are lowered here or in a
+/// fold over them, so the recursion descends through the node and nothing else.
+fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.raise} =
+  if st.refused != None { { st: st, arg: AZero(RWord) } } else {
+    match c.node {
+      NLit(l) -> literal(cx, st, l, c.span),
+      NVar(v) -> match v.slot {
+        Some(s) -> match st.env.get(s) {
+          Some(a) -> { st: st, arg: a },
+          None -> refuse(st, Spine, b"a slot nothing bound: ".concat(v.name)),
+        },
+        None -> global(cx, st, v.name, c.span),
+      },
+      NKnown(k) -> known(cx, st, k, c.span),
+      NUnary(u) -> unary(cx, lowered(cx, st, u.operand, false), u.op, c.span),
+      NBinary(b) -> if b.op == b"and" || b.op == b"or" {
+        let l = lowered(cx, st, b.lhs, false);
+        short_circuit(cx, l, lowered(cx, opened(l.st), b.rhs, tail), b.op == b"and", c.span)
+      } else {
+        match compared_side(cx, b.op, b.lhs, b.rhs) {
+          Some(true) -> {
+            let args = match b.lhs.node {
+              NApp(ca) -> {
+                let wanted = compared_args(cx, b.lhs);
+                ca.args.fold(
+                  { st: st, args: [], at: 0 },
+                  |acc: { st: Lowering, args: List<Option<Arg>>, at: Int }, x: Code|
+                    if wanted.at(acc.at) != Some(true) {
+                      { ..acc, args: acc.args.push(None), at: acc.at + 1 }
+                    } else {
+                      let o = lowered(cx, acc.st, x, false);
+                      { st: o.st, args: acc.args.push(Some(o.arg)), at: acc.at + 1 }
+                    },
+                )
+              },
+              _ -> { st: st, args: [], at: 0 },
+            };
+            compared(cx, lowered(cx, args.st, b.rhs, false), b.lhs, args.args, b.op, c.span)
+          },
+          Some(false) -> {
+            let v = lowered(cx, st, b.lhs, false);
+            let args = match b.rhs.node {
+              NApp(ca) -> {
+                let wanted = compared_args(cx, b.rhs);
+                ca.args.fold(
+                  { st: v.st, args: [], at: 0 },
+                  |acc: { st: Lowering, args: List<Option<Arg>>, at: Int }, x: Code|
+                    if wanted.at(acc.at) != Some(true) {
+                      { ..acc, args: acc.args.push(None), at: acc.at + 1 }
+                    } else {
+                      let o = lowered(cx, acc.st, x, false);
+                      { st: o.st, args: acc.args.push(Some(o.arg)), at: acc.at + 1 }
+                    },
+                )
+              },
+              _ -> { st: v.st, args: [], at: 0 },
+            };
+            compared(cx, { st: args.st, arg: v.arg }, b.rhs, args.args, b.op, c.span)
+          },
+          None -> match constant(cx, c) {
+            Some(a) -> { st: st, arg: a },
+            None -> {
+              let l = lowered(cx, st, b.lhs, false);
+              let r = match operand(cx, b.op, b.rhs) {
+                Some(a) -> { st: l.st, arg: a },
+                None -> lowered(cx, l.st, b.rhs, false),
+              };
+              binary(cx, l, r, b.op, c.span)
+            },
+          },
+        }
+      },
+      NBlock(bl) -> {
+        let after = bl.stmts.fold(st, |acc: Lowering, s: CodeStmt|
+          match s {
+            CLet(l) -> {
+              let v = lowered(cx, acc, l.value, false);
+              { ..v.st, env: v.st.env.insert(l.slot, v.arg) }
+            },
+            CLetPat(l) -> let_bound(cx, lowered(cx, acc, l.value, false), l.pat, l.span),
+            CDo(d) -> lowered(cx, acc, d.code, false).st,
+          });
+        match bl.tail {
+          Some(t) -> lowered(cx, after, t, tail),
+          None -> literal(cx, after, LUnit, c.span),
+        }
+      },
+      NIf(i) -> {
+        let cond = lowered(cx, st, i.cond, false);
+        let then = lowered(cx, opened(cond.st), i.then_branch, tail);
+        let otherwise = lowered(cx, continued(opened(cond.st), then.st), i.else_branch, tail);
+        joined(cx, cond, then, otherwise, c.span)
+      },
+      NApp(a) -> match target(cx, a.func, a.args) {
+        None -> refuse(st, Calling, b"a callee the lowering does not resolve"),
+        Some(ToInPlace(which)) -> {
+          let args = a.args.fold(
+            { st: st, args: [], at: 0 },
+            |acc: { st: Lowering, args: List<Option<Arg>>, at: Int }, x: Code|
+              if which == Some(acc.at) { { ..acc, args: acc.args.push(None), at: acc.at + 1 } }
+              else {
+                let o = lowered(cx, acc.st, x, false);
+                { st: o.st, args: acc.args.push(Some(o.arg)), at: acc.at + 1 }
+              },
+          );
+          let e = entered(cx, args.st, a.func, a.args, args.args, which, c.span);
+          let body = match which {
+            None -> match a.func.node {
+              NKnown(k) -> lowered(e.cx, e.st, k.lambda.body, false),
+              _ -> refuse(e.st, Calling, b"a body run in place that is no lambda"),
+            },
+            Some(n) ->
+              a.args.fold(
+                { at: 0, out: refuse(e.st, Calling, b"a step that is no lambda") },
+                |acc: { at: Int, out: Lowered }, x: Code|
+                  {
+                    at: acc.at + 1,
+                    out: if acc.at != n { acc.out } else {
+                      match x.node {
+                        NLambda(l) -> lowered(e.cx, e.st, l.body, false),
+                        _ -> acc.out,
+                      }
+                    },
+                  },
+              ).out,
+          };
+          left(cx, args.st, e, body, args.args, which, c.span)
+        },
+        Some(ToValue) -> {
+          let f = lowered(cx, st, a.func, false);
+          let args = a.args.fold(
+            { st: f.st, args: [] },
+            |acc: { st: Lowering, args: List<Arg> }, x: Code| {
+              let o = lowered(cx, acc.st, x, false);
+              { st: o.st, args: acc.args.push(o.arg) }
+            },
+          );
+          applied(cx, args.st, f.arg, args.args, tail, c.span)
+        },
+        Some(t) -> {
+          let args = a.args.fold(
+            { st: st, args: [] },
+            |acc: { st: Lowering, args: List<Arg> }, x: Code| {
+              let o = lowered(cx, acc.st, x, false);
+              { st: o.st, args: acc.args.push(o.arg) }
+            },
+          );
+          match t {
+            ToCtor(name) -> constructed(cx, args.st, name, args.args, a.func.span, c.span),
+            ToBuiltin(name) -> builtin(cx, args.st, name, args.args, a.func.span, c.span),
+            ToDef(full) -> called(cx, args.st, full, a.func, a.args, args.args, tail, c.span),
+            _ -> refuse(args.st, Spine, b"a target taken above"),
+          }
+        },
+      },
+      NList(l) -> {
+        let items = l.items.fold(
+          { st: st, args: [] },
+          |acc: { st: Lowering, args: List<Arg> }, x: Code| {
+            let o = lowered(cx, acc.st, x, false);
+            { st: o.st, args: acc.args.push(o.arg) }
+          },
+        );
+        listed(cx, items.st, items.args, c.span)
+      },
+      NRecord(r) -> {
+        let fs = r.fields.fold(
+          { st: st, fields: [] },
+          |acc: { st: Lowering, fields: List<{ name: Bytes, arg: Arg }> }, f: CodeField| {
+            let o = lowered(cx, acc.st, f.value, false);
+            { st: o.st, fields: acc.fields.push({ name: f.name, arg: o.arg }) }
+          },
+        );
+        recorded(cx, fs.st, fs.fields, c.span)
+      },
+      NField(f) -> if !columned(cx, f.base, f.field) {
+        field(cx, lowered(cx, st, f.base, false), f.field, c.span)
+      } else {
+        let args = match f.base.node {
+          NApp(ca) ->
+            ca.args.fold({ st: st, args: [] }, |acc: { st: Lowering, args: List<Arg> }, x: Code| {
+              let o = lowered(cx, acc.st, x, false);
+              { st: o.st, args: acc.args.push(o.arg) }
+            }),
+          _ -> { st: st, args: [] },
+        };
+        column_read(cx, args.st, args.args, f.base, f.field, c.span)
+      },
+      NUpdate(u) -> {
+        let b = lowered(cx, st, u.base, false);
+        let sets = u.sets.fold(
+          { st: b.st, fields: [] },
+          |acc: { st: Lowering, fields: List<{ name: Bytes, arg: Arg }> }, f: CodeField| {
+            let o = lowered(cx, acc.st, f.value, false);
+            { st: o.st, fields: acc.fields.push({ name: f.name, arg: o.arg }) }
+          },
+        );
+        updated(cx, sets.st, b.arg, u.copies, sets.fields, c.span)
+      },
+      NMatch(m) -> {
+        let s = lowered(cx, st, m.scrutinee, false);
+        let arms = m.arms.fold(
+          { after: s.st, out: [] },
+          |acc: { after: Lowering, out: List<Armed> }, arm: CodeArm| {
+            let o = arm_opened(cx, continued(opened(s.st), acc.after), s.arg, arm);
+            match arm.guard {
+              None -> {
+                let b = lowered(cx, o, arm.body, tail);
+                { after: b.st, out: acc.out.push({ arm: arm, guard: None, body: b }) }
+              },
+              Some(g) -> {
+                let gl = lowered(cx, o, g, false);
+                let b = lowered(cx, opened(gl.st), arm.body, tail);
+                { after: b.st, out: acc.out.push({ arm: arm, guard: Some(gl), body: b }) }
+              },
+            }
+          },
+        );
+        closed(cx, s.st, s.arg, arms.out, arms.after, tail, c.span)
+      },
+      NPerform(p) -> {
+        let lb = match p.label {
+          Some(lc) -> {
+            let o = lowered(cx, st, lc, false);
+            { st: o.st, arg: Some(o.arg) }
+          },
+          None -> { st: st, arg: None },
+        };
+        let args = p.args.fold(
+          { st: lb.st, args: [] },
+          |acc: { st: Lowering, args: List<Arg> }, x: Code| {
+            let o = lowered(cx, acc.st, x, false);
+            { st: o.st, args: acc.args.push(o.arg) }
+          },
+        );
+        performed(
+          cx,
+          args.st,
+          { effect: p.effect, op: p.op, resource: p.resource },
+          lb.arg,
+          args.args,
+          c.span,
+        )
+      },
+      NLabel(n) -> label(cx, st, n, c.span),
+      NLambda(l) -> {
+        let frame = { params: l.params, size: l.size, captures: l.captures };
+        let o = lambda_opened(cx, st, frame, l.at);
+        closure(cx, st, lowered(o.cx, o.st, l.body, true), frame, l.at)
+      },
+      NSimulate(x) -> {
+        let frame = { params: 0, size: x.size, captures: x.captures };
+        let o = lambda_opened(cx, st, frame, x.body.span);
+        let k = closure(cx, st, lowered(o.cx, o.st, x.body, true), frame, x.body.span);
+        simulated(cx, k.st, k.arg, c.span)
+      },
+      NParallel(pr) -> {
+        let bs = pr.branches.fold(
+          { st: st, args: [] },
+          |acc: { st: Lowering, args: List<Arg> }, x: Code| {
+            let o = lowered(cx, acc.st, x, false);
+            { st: o.st, args: acc.args.push(o.arg) }
+          },
+        );
+        branched(cx, bs.st, bs.args, pr.rooted, c.span)
+      },
+      NHandle(h) -> {
+        let clauses = h.clauses.fold(
+          { st: st, out: [] },
+          |acc: { st: Lowering, out: List<ClauseMade> }, cl: CodeClause| {
+            let lb = match cl.label {
+              Some(lc) -> {
+                let o = lowered(cx, acc.st, lc, false);
+                { st: o.st, arg: Some(o.arg) }
+              },
+              None -> { st: acc.st, arg: None },
+            };
+            let frame = clause_frame(cx, cl);
+            let o = lambda_opened(cx, lb.st, frame, cl.at);
+            let k = closure(cx, lb.st, lowered(o.cx, o.st, cl.body, true), frame, cl.at);
+            { st: k.st, out: acc.out.push({ label: lb.arg, closure: k.arg }) }
+          },
+        );
+        let ret = match h.ret {
+          Some(r) -> {
+            let frame = ret_frame(cx, r);
+            let o = lambda_opened(cx, clauses.st, frame, r.body.span);
+            let k = closure(cx, clauses.st, lowered(o.cx, o.st, r.body, true), frame, r.body.span);
+            { st: k.st, arg: Some(k.arg) }
+          },
+          None -> { st: clauses.st, arg: None },
+        };
+        let body = match body_frame(cx, h) {
+          Some(frame) -> {
+            let o = lambda_opened(cx, ret.st, frame, h.body.span);
+            closure(cx, ret.st, lowered(o.cx, o.st, h.body, true), frame, h.body.span)
+          },
+          None -> lowered(cx, opened(ret.st), h.body, false),
+        };
+        handled(cx, ret.st, body, clauses.out, ret.arg, h, c.span)
+      },
+    }
+  }

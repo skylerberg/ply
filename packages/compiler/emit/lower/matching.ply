@@ -1,0 +1,627 @@
+//! `match`, the patterns `let` binds, and a value compared with a constructor of its sum. A pattern
+//! is lowered to tests, each a `Case` (or an `If` on a `Bool`) whose failing branch leaves, and to
+//! reads of what it binds or tests further. A `match` arm's tests nest: each holds the rest of the
+//! arm where it passes and misses to the next arm where it does not, so whatever follows a
+//! constructor's test is lowered knowing the constructor.
+
+import emit.code (Code, CodeArm, CodePattern, CodePatternField, PxWild, PxVar, PxLit, PxRange,
+                  PxCtor, PxRecord, PxList, NVar, NApp, NLit)
+import syntax.patterns (Lit, LInt, LFixed, LBool, LUnit)
+import syntax.parsing (Span, dummy_span, starts_upper)
+import check.types (Type, TyCon, Subst, subst_new, with_bindings, named_type)
+import emit.typing (unknown_type)
+import emit.reps (SumCtor)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases,
+                 RSlice, Leaf, Var, Arg, AVar, AInt, ABool, ANum, AZero, Uses, Prim, Get, Gathered,
+                 Native, PArg, PLeaf, Decl, Assign, If, Case, Match, Miss, Fail, NoArm, NoLet,
+                 Block, Test, TTag, TInt, TRange, TLength, Matching, rep_of_arg)
+import emit.lower.setting (Setting, ctor_named, ctor_sum)
+import emit.lower.held (held_as, arg_path, arg_held, case_index, case_span)
+import emit.lower.base (Context, Lowering, Lowered, Armed, refuse, fresh, bound_as, emitted, opened,
+                        continued, join_type, set_join, type_of, handed)
+import emit.lower.data (field)
+import emit.lower.scalars (literal, binary)
+
+/// The state arm `arm` of a match on `subject` is lowered in: a block of its own after `st`, holding
+/// the pattern's tests, each missing to the next arm, and its binders in its environment. Its guard
+/// and body are lowered from it.
+pub fn arm_opened(
+  cx: Context,
+  st: Lowering,
+  subject: Arg,
+  arm: CodeArm,
+) -> Lowering / {abort.raise} = pattern_bound(cx, st, subject, arm.pat, [Miss])
+
+/// The match on `subject` written after `before`, of `arms` each lowered from `arm_opened`'s state,
+/// the last of them ending at `after`: a `Match` of the arms, each its tests nested around its guard
+/// and its body, which joins in a variable of the type the arms answer; where every arm misses, the
+/// match fails.
+pub fn closed(
+  cx: Context,
+  before: Lowering,
+  subject: Arg,
+  arms: List<Armed>,
+  after: Lowering,
+  tail: Bool,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  if continued(before, after).refused != None {
+    { st: continued(before, after), arg: AZero(RWord) }
+  } else {
+    let ty = join_type(cx, arms.map(|a: Armed| a.body));
+    let j = fresh(continued(before, after), ty, held_as(cx.setting, ty));
+    let made = arms.fold(
+      { st: j.st, blocks: [] },
+      |acc: { st: Lowering, blocks: List<Block> }, a: Armed| {
+        let set = set_join(acc.st, a.body, j.var, at);
+        let block = match a.guard {
+          None -> set.block,
+          Some(g) -> g.st.insts.push(If({ cond: g.arg, then: set.block, otherwise: [Miss] })),
+        };
+        { st: set.st, blocks: acc.blocks.push(nest(block, [Miss])) }
+      },
+    );
+    {
+      st: {
+        ..made.st,
+        insts: before.insts.push(Decl(j.var)).push(
+          Match({ arms: made.blocks, rest: [Fail({ why: NoArm, at: at })] }),
+        ),
+      },
+      arg: AVar(j.var),
+    }
+  }
+
+/// `let pat = value`: `value`'s state with the pattern's tests, each failing the `let` where it does
+/// not hold, and its binders in its environment.
+pub fn let_bound(
+  cx: Context,
+  value: Lowered,
+  pat: CodePattern,
+  at: Span,
+) -> Lowering / {abort.raise} =
+  pattern_bound(cx, value.st, value.arg, pat, [Fail({ why: NoLet, at: at })])
+
+/// Which side of `lhs op rhs` is a constructor a comparison tests as a pattern: `Some(true)` the left,
+/// `Some(false)` the right, nothing where neither is or `op` is no equality.
+pub fn compared_side(cx: Context, op: Bytes, lhs: Code, rhs: Code) -> Option<Bool> / {abort.raise} =
+  if op != b"eq" && op != b"ne" { None }
+  else if constructor(rhs) { Some(false) }
+  else if constructor(lhs) { Some(true) }
+  else { None }
+
+/// Whether `c` is a constructor, or one applied to arguments.
+fn constructor(c: Code) -> Bool / {abort.raise} =
+  match c.node {
+    NVar(v) -> v.slot == None && starts_upper(last_segment(v.name)),
+    NApp(a) -> match a.func.node {
+      NVar(v) -> v.slot == None && starts_upper(last_segment(v.name)),
+      _ -> false,
+    },
+    _ -> false,
+  }
+
+/// What follows the last `.` or `::` of `name`.
+fn last_segment(name: Bytes) -> Bytes / {abort.raise} = {
+  let cut = range(0, name.len()).fold(0, |acc: Int, i: Int|
+    if name.at(i) == 46 || name.at(i) == 58 { i + 1 } else { acc });
+  name.slice(cut, name.len())
+}
+
+/// Which of the constructor side's arguments the driver lowers before `compared`, in order: each but
+/// a literal or a constructor, which the comparison tests as its pattern would; none where `ctor`
+/// names a constructor of no arguments.
+pub fn compared_args(cx: Context, ctor: Code) -> List<Bool> / {abort.raise} =
+  match ctor.node {
+    NApp(a) -> a.args.map(|x: Code| match x.node { NLit(_) -> false, _ -> !constructor(x) }),
+    _ -> [],
+  }
+
+/// `value op ctor`, `op` being `eq` or `ne`: a `Bool` joined from the tests `ctor` makes of the value
+/// as its pattern would. `args` are the constructor's arguments `compared_args` named, lowered after
+/// the value where the constructor is on the right and before it where it is on the left, each
+/// compared by its type's equality, and nothing in the place of each it did not.
+pub fn compared(
+  cx: Context,
+  value: Lowered,
+  ctor: Code,
+  args: List<Option<Arg>>,
+  op: Bytes,
+  at: Span,
+) -> Lowered / {abort.raise} = {
+  let r = fresh(value.st, named_type(b"Bool"), RBool);
+  let differ = [Assign({ var: r.var, arg: ABool(op == b"ne") })];
+  let tested = value_tested(cx, { st: opened(r.st), arg: value.arg }, ctor, args, differ);
+  let same = emitted(tested, Assign({ var: r.var, arg: ABool(op == b"eq") }));
+  {
+    st: { ..same, insts: value.st.insts.push(Decl(r.var)).concat(nest(same.insts, differ)) },
+    arg: AVar(r.var),
+  }
+}
+
+/// `x`, one side of a comparison or an argument of a constructor there, tested against `read`, what
+/// the other side holds in its place: a literal as its pattern tests it, a constructor by its tag
+/// and then each of its arguments the same way, a variable by its type's equality. `given` holds
+/// what the driver lowered of `x`'s own arguments. A test that fails leaves by `differ`.
+fn value_tested(
+  cx: Context,
+  read: Lowered,
+  x: Code,
+  given: List<Option<Arg>>,
+  differ: Block,
+) -> Lowering / {abort.raise} =
+  match x.node {
+    NLit(l) -> literal_tested(cx, read.st, read.arg, l, differ),
+    NVar(v) -> match v.slot {
+      Some(s) -> match read.st.env.get(s) {
+        Some(a) -> equal_to(cx, read, a, differ),
+        None -> refuse(read.st, Matching, b"a comparison with a slot nothing bound").st,
+      },
+      None -> match ctor_of(cx.setting, type_of(read.arg), v.name) {
+        Some(k) -> tag_tested(read.st, read.arg, k, differ),
+        None ->
+          refuse(read.st, Matching, b"a comparison with a global's value: ".concat(v.name)).st,
+      },
+    },
+    NApp(a) -> match a.func.node {
+      NVar(f) -> if f.slot != None {
+        refuse(read.st, Matching, b"a constructor compared with a call's value").st
+      } else {
+        match ctor_of(cx.setting, type_of(read.arg), f.name) {
+          Some(k) ->
+            a.args.fold(
+              { st: tag_tested(read.st, read.arg, k, differ), at: 0 },
+              |acc: { st: Lowering, at: Int }, y: Code| {
+                let lying = arg_read(cx, acc.st, read.arg, k, acc.at);
+                {
+                  st: match given.at(acc.at) {
+                    Some(Some(g)) -> equal_to(cx, as_read(cx, lying, k, acc.at, false), g, differ),
+                    _ ->
+                      value_tested(
+                        cx,
+                        as_read(cx, lying, k, acc.at, constructor(y)),
+                        y,
+                        [],
+                        differ,
+                      ),
+                  },
+                  at: acc.at + 1,
+                }
+              },
+            ).st,
+          None -> refuse(read.st, Matching, b"a constructor compared with a call's value").st,
+        }
+      },
+      _ -> refuse(read.st, Matching, b"a constructor compared whose argument is computed").st,
+    },
+    _ -> refuse(read.st, Matching, b"a constructor compared whose argument is computed").st,
+  }
+
+/// `read == a` by their type's equality, tested in an `If` that leaves by `differ`.
+fn equal_to(cx: Context, read: Lowered, a: Arg, differ: Block) -> Lowering / {abort.raise} = {
+  let eq = binary(cx, read, { st: read.st, arg: a }, b"eq", dummy_span());
+  emitted(eq.st, If({ cond: eq.arg, then: [], otherwise: differ }))
+}
+
+/// The tests and reads of `pat` over `subject` written after `st`, each test leaving by `failing`
+/// where it does not hold, and the pattern's binders in the environment.
+fn pattern_bound(
+  cx: Context,
+  st: Lowering,
+  subject: Arg,
+  pat: CodePattern,
+  failing: Block,
+) -> Lowering / {abort.raise} =
+  if st.refused != None { st } else {
+    match pat {
+      PxWild -> st,
+      PxVar(v) -> match v.slot { Some(s) -> { ..st, env: st.env.insert(s, subject) }, None -> st },
+      PxLit(l) -> literal_tested(cx, st, subject, l, failing),
+      PxRange(r) -> range_tested(cx, st, subject, r.lo, r.hi, failing),
+      PxCtor(c) -> match ctor_of(cx.setting, type_of(subject), c.name) {
+        None -> refuse(st, Matching, b"a constructor of no declared sum: ".concat(c.name)).st,
+        Some(k) ->
+          c.args.fold(
+            { st: tag_tested(st, subject, k, failing), at: 0 },
+            |acc: { st: Lowering, at: Int }, sub: CodePattern|
+              match sub {
+                PxWild -> { ..acc, at: acc.at + 1 },
+                _ -> {
+                  let a = as_read(
+                    cx,
+                    arg_read(cx, acc.st, subject, k, acc.at),
+                    k,
+                    acc.at,
+                    match sub { PxCtor(_) -> true, _ -> false },
+                  );
+                  { st: pattern_bound(cx, a.st, a.arg, sub, failing), at: acc.at + 1 }
+                },
+              },
+          ).st,
+      },
+      PxRecord(r) ->
+        r.fields.fold(st, |acc: Lowering, f: CodePatternField|
+          match f.pat {
+            PxWild -> acc,
+            sub -> {
+              let a = field(cx, { st: acc, arg: subject }, f.name, dummy_span());
+              pattern_bound(cx, a.st, a.arg, sub, failing)
+            },
+          }),
+      PxList(l) -> match subject {
+        AVar(v) -> match listed_type(v) {
+          None -> refuse(st, Matching, b"a list pattern over a value held as no list").st,
+          Some(item) -> {
+            let n = l.items.len();
+            let tested = case_tested(
+              st,
+              subject,
+              TLength({ at_least: if l.rest == None { n + 1 } else { n } }),
+              n,
+              failing,
+            );
+            let seen = viewed(tested, v);
+            let items = l.items.fold(
+              { st: seen.st, at: 0 },
+              |acc: { st: Lowering, at: Int }, x: CodePattern|
+                match x {
+                  PxWild -> { ..acc, at: acc.at + 1 },
+                  _ -> {
+                    let a = item_read(cx, acc.st, seen.list, seen.from, item, acc.at);
+                    { st: pattern_bound(cx, a.st, a.arg, x, failing), at: acc.at + 1 }
+                  },
+                },
+            );
+            match l.rest {
+              None -> items.st,
+              Some(PxWild) -> items.st,
+              Some(r) -> {
+                let a = rest_read(items.st, v, seen.list, seen.from, n);
+                pattern_bound(cx, a.st, a.arg, r, failing)
+              },
+            }
+          },
+        },
+        _ -> refuse(st, Matching, b"a list pattern over a constant").st,
+      },
+    }
+  }
+
+/// A literal pattern's test: an integer's or a `Bool`'s in a `Case`, `()` none, and any other the
+/// equality its type has, in an `If`.
+fn literal_tested(
+  cx: Context,
+  st: Lowering,
+  subject: Arg,
+  l: Lit,
+  failing: Block,
+) -> Lowering / {abort.raise} =
+  match l {
+    LUnit -> st,
+    LBool(b) -> case_tested(st, subject, TInt([if b { 1 } else { 0 }]), 0, failing),
+    LInt(n) -> if integral(rep_of_arg(subject)) { case_tested(st, subject, TInt([n]), 0, failing) }
+    else { equal_tested(cx, st, subject, l, failing) },
+    LFixed(_, bits) -> if integral(rep_of_arg(subject)) {
+      case_tested(st, subject, TInt([bits]), 0, failing)
+    } else { equal_tested(cx, st, subject, l, failing) },
+    _ -> equal_tested(cx, st, subject, l, failing),
+  }
+
+/// `subject == l`, as `==` compares at the subject's type, tested in an `If`.
+fn equal_tested(
+  cx: Context,
+  st: Lowering,
+  subject: Arg,
+  l: Lit,
+  failing: Block,
+) -> Lowering / {abort.raise} = {
+  let k = literal(cx, st, l, dummy_span());
+  let eq = binary(cx, { st: k.st, arg: subject }, k, b"eq", dummy_span());
+  emitted(eq.st, If({ cond: eq.arg, then: [], otherwise: failing }))
+}
+
+/// A range pattern's test: an integer held in a register in a `Case`, a wider one by its order.
+fn range_tested(
+  cx: Context,
+  st: Lowering,
+  subject: Arg,
+  lo: Lit,
+  hi: Lit,
+  failing: Block,
+) -> Lowering / {abort.raise} =
+  match bounds(lo, hi) {
+    Some(b) -> if integral(rep_of_arg(subject)) { case_tested(st, subject, TRange(b), 0, failing) }
+    else { ordered_tested(cx, st, subject, lo, hi, failing) },
+    None -> ordered_tested(cx, st, subject, lo, hi, failing),
+  }
+
+/// `lo <= subject <= hi`, as the subject's type orders, each bound tested in an `If`.
+fn ordered_tested(
+  cx: Context,
+  st: Lowering,
+  subject: Arg,
+  lo: Lit,
+  hi: Lit,
+  failing: Block,
+) -> Lowering / {abort.raise} = {
+  let l = literal(cx, st, lo, dummy_span());
+  let above = binary(cx, { st: l.st, arg: subject }, l, b"ge", dummy_span());
+  let h = literal(
+    cx,
+    emitted(above.st, If({ cond: above.arg, then: [], otherwise: failing })),
+    hi,
+    dummy_span(),
+  );
+  let below = binary(cx, { st: h.st, arg: subject }, h, b"le", dummy_span());
+  emitted(below.st, If({ cond: below.arg, then: [], otherwise: failing }))
+}
+
+fn bounds(lo: Lit, hi: Lit) -> Option<{ lo: Int, hi: Int }> =
+  match lo {
+    LInt(a) -> match hi { LInt(b) -> Some({ lo: a, hi: b }), _ -> None },
+    LFixed(_, a) -> match hi { LFixed(_, b) -> Some({ lo: a, hi: b }), _ -> None },
+    _ -> None,
+  }
+
+/// Whether a value held as `r` is an integer C holds in a register: an `Int`, a `Bool`, a width.
+fn integral(r: Rep) -> Bool = match r { RInt -> true, RBool -> true, RNum(_) -> true, _ -> false }
+
+/// Constructor `k`'s test on `subject`.
+fn tag_tested(st: Lowering, subject: Arg, k: CtorOf, failing: Block) -> Lowering =
+  case_tested(st, subject, TTag(k.names), k.index, failing)
+
+/// `subject` tested to be the `when`th of what `t` lists, leaving by `failing` where it is not: a
+/// `Case` on a variable, and on a constant an `If` its test was decided for.
+fn case_tested(st: Lowering, subject: Arg, t: Test, when: Int, failing: Block) -> Lowering =
+  match subject {
+    AVar(v) ->
+      emitted(st, Case({ on: v, test: t, arms: [{ when: when, body: [] }], rest: failing })),
+    other -> emitted(st, If({ cond: ABool(holds(other, t, when)), then: [], otherwise: failing })),
+  }
+
+/// Whether the constant `a` is the `when`th of what `t` lists. A zero held where a sum is is `None`.
+fn holds(a: Arg, t: Test, when: Int) -> Bool =
+  match t {
+    TTag(names) -> match a { AZero(_) -> names.at(when) == Some(b"None"), _ -> false },
+    TInt(ns) -> match constant_int(a) { Some(n) -> ns.at(when) == Some(n), None -> false },
+    TRange(r) -> match constant_int(a) {
+      Some(n) -> if unsigned_word(a) { flipped(r.lo) <= flipped(n) && flipped(n) <= flipped(r.hi) }
+      else { r.lo <= n && n <= r.hi },
+      None -> false,
+    },
+    _ -> false,
+  }
+
+fn constant_int(a: Arg) -> Option<Int> =
+  match a {
+    AInt(n) -> Some(n),
+    ABool(b) -> Some(if b { 1 } else { 0 }),
+    ANum(x) -> Some(x.bits),
+    _ -> None,
+  }
+
+/// Whether `a` is a 64-bit unsigned width, whose bits order as unsigned.
+fn unsigned_word(a: Arg) -> Bool =
+  match a { ANum(x) -> !x.width.signed && x.width.bits == 64, _ -> false }
+
+/// `n` with its sign bit flipped, so unsigned bits order as signed ones do.
+fn flipped(n: Int) -> Int = n ^ 0 - 9223372036854775807 - 1
+
+/// `b` with each test's passing branch holding what follows it: a test that fails leaves before the
+/// rest runs, and the rest runs inside the test that passed, knowing what it tested. A test is a
+/// `Case` of one empty arm, or an `If` whose passing branch is empty, that leaves by `failing`.
+fn nest(b: Block, failing: Block) -> Block =
+  range(0, b.len()).fold([], |after: Block, k: Int|
+    match b.at(b.len() - 1 - k) {
+      None -> after,
+      Some(i) -> match i {
+        Case(c) -> if c.rest == failing && c.arms.len() == 1
+            && c.arms.all(|a: { when: Int, body: Block }| a.body.len() == 0) {
+          [Case({ ..c, arms: c.arms.map(|a: { when: Int, body: Block }| { ..a, body: after }) })]
+        } else { [i].concat(after) },
+        If(x) -> if x.then.len() == 0 && x.otherwise == failing { [If({ ..x, then: after })] }
+        else { [i].concat(after) },
+        _ -> [i].concat(after),
+      },
+    })
+
+/// A constructor resolved: its name in the program's table, its sum's constructors in their
+/// declared order, its place among them, and its arguments' types at the type it was tested at.
+type CtorOf = { full: Bytes, names: List<Bytes>, index: Int, args: List<Type> }
+
+/// Constructor `written` of a value of type `ty`, where a sum the program declares holds it.
+fn ctor_of(s: Setting, ty: Type, written: Bytes) -> Option<CtorOf> / {abort.raise} =
+  match ctor_named(s, written) {
+    None -> None,
+    Some(full) -> match ctor_sum(s, full) {
+      None -> None,
+      Some(sum) -> match sum.ctors.at(sum.index) {
+        None -> None,
+        Some(c) ->
+          Some({
+            full: full,
+            names: sum.ctors.map(|x: SumCtor| x.name),
+            index: sum.index,
+            args: arg_types(c, ty),
+          }),
+      },
+    },
+  }
+
+/// Constructor `c`'s arguments' types where it builds a value of `ty`: its declared ones, each of
+/// the sum's parameters written as `ty`'s argument in its place.
+fn arg_types(c: SumCtor, ty: Type) -> List<Type> / {abort.raise} =
+  match ty {
+    TyCon(t) -> if t.args.len() != c.params.len() { c.fields } else {
+      let s = range(0, c.params.len()).fold(subst_new(), |acc: Subst, i: Int|
+        if c.params.get(i) < 0 { acc }
+        else { { ..acc, ty: acc.ty.insert(c.params.get(i), t.args.get(i)) } });
+      c.fields.map(|f: Type| with_bindings(s, f))
+    },
+    _ -> c.fields,
+  }
+
+/// `lying`, argument `at` of constructor `k` read where it lies, as a pattern reads it: where it lies
+/// for a constructor's test, which reads any representation a sum is held as, and otherwise held as
+/// a value of its type is.
+fn as_read(cx: Context, lying: Lowered, k: CtorOf, at: Int, tag_only: Bool) -> Lowered =
+  if tag_only { lying } else { handed(lying, held_as(cx.setting, arg_type(k, at)), dummy_span()) }
+
+fn arg_type(k: CtorOf, at: Int) -> Type =
+  match k.args.at(at) { Some(t) -> t, None -> unknown_type() }
+
+/// Argument `at` of the constructor `k` that `subject` was tested to be, borrowed where it lies: a
+/// case's leaves where the sum is held as its cases, the payload's word or a scalar read out of it
+/// where it is held as one word, and its slot where it is an object.
+fn arg_read(
+  cx: Context,
+  st: Lowering,
+  subject: Arg,
+  k: CtorOf,
+  at: Int,
+) -> Lowered / {abort.raise} = {
+  let ty = arg_type(k, at);
+  let want = held_as(cx.setting, ty);
+  match subject {
+    AVar(v) -> match v.rep {
+      RCases(_) -> match case_index(v.rep, k.full) {
+        None -> refuse(st, Matching, b"a constructor its sum's cases do not hold: ".concat(k.full)),
+        Some(i) -> if at > 0 { refuse(st, Matching, b"a case of more than one argument") } else {
+          let span = case_span(v.rep, i);
+          let n = span.leaves.len();
+          let parts = range(0, n).fold(
+            { st: st, parts: [] },
+            |acc: { st: Lowering, parts: List<Arg> }, j: Int| {
+              let g = bound_as(
+                acc.st,
+                if n == 1 { ty } else { unknown_type() },
+                leaf_rep(span.leaves, j),
+                Get({ of: v, path: PLeaf(1 + span.at + j) }),
+                dummy_span(),
+              );
+              { st: g.st, parts: acc.parts.push(g.arg) }
+            },
+          );
+          match parts.parts.at(0) {
+            Some(a) -> if n == 1 { { st: parts.st, arg: a } } else {
+              bound_as(
+                parts.st,
+                ty,
+                RFlat(span.leaves.take(n - 1)),
+                Gathered({ parts: parts.parts }),
+                dummy_span(),
+              )
+            },
+            None -> refuse(parts.st, Matching, b"an argument of a case holding nothing"),
+          }
+        },
+      },
+      RMaybe -> payload_read(st, v, ty, want, k.full),
+      RTagged -> payload_read(st, v, ty, want, k.full),
+      _ ->
+        bound_as(
+          st,
+          ty,
+          arg_held(cx.setting, k.full, at),
+          Get({ of: v, path: arg_path(cx.setting, k.full, at) }),
+          dummy_span(),
+        ),
+    },
+    // A constant's tag test was decided, so this read is never reached.
+    _ -> { st: st, arg: AZero(want) },
+  }
+}
+
+/// The payload of a sum `v` holds as one word, of type `ty` held as `want`: a scalar read out of the
+/// word where it lies, anything else the word.
+fn payload_read(st: Lowering, v: Var, ty: Type, want: Rep, ctor: Bytes) -> Lowered = {
+  let read = match want {
+    RInt -> want,
+    RBool -> want,
+    RNum(_) -> want,
+    RFloat -> want,
+    RDec -> want,
+    _ -> RWord,
+  };
+  bound_as(st, ty, read, Get({ of: v, path: PArg({ ctor: ctor, at: 0 }) }), dummy_span())
+}
+
+fn leaf_rep(ls: List<Leaf>, k: Int) -> Rep = match ls.at(k) { Some(l) -> l.rep, None -> RWord }
+
+/// The type of what list `v` holds, where `v` is held as a list's word or as a view of one.
+fn listed_type(v: Var) -> Option<Type> =
+  if v.rep != RWord && v.rep != RSlice { None }
+  else { match v.ty { TyCon(t) -> if t.name == b"List" { t.args.at(0) } else { None }, _ -> None } }
+
+/// The list a list pattern reads `v`'s items from, and where its items start: `v` itself from its
+/// first, or a view's list from the view's offset, each borrowed from it.
+fn viewed(st: Lowering, v: Var) -> { st: Lowering, list: Arg, from: Option<Arg> } =
+  if v.rep != RSlice { { st: st, list: AVar(v), from: None } } else {
+    let list = bound_as(st, v.ty, RWord, Get({ of: v, path: PLeaf(0) }), dummy_span());
+    let from = bound_as(
+      list.st,
+      named_type(b"Int"),
+      RInt,
+      Get({ of: v, path: PLeaf(1) }),
+      dummy_span(),
+    );
+    { st: from.st, list: list.arg, from: Some(from.arg) }
+  }
+
+/// `from + at`, where the view starts and `at` items on: `at` alone for a list's word.
+fn item_index(st: Lowering, from: Option<Arg>, at: Int) -> Lowered =
+  match from {
+    None -> { st: st, arg: AInt(at) },
+    Some(f) -> if at == 0 { { st: st, arg: f } } else {
+      bound_as(
+        st,
+        named_type(b"Int"),
+        RInt,
+        Prim({ op: b"add", on: RInt, args: [f, AInt(at)] }),
+        dummy_span(),
+      )
+    },
+  }
+
+/// Item `at` of a list pattern's subject, which its length test admitted, held as a value of type
+/// `item` is: read with a count of its own from `list`, at `from` and `at` on.
+fn item_read(
+  cx: Context,
+  st: Lowering,
+  list: Arg,
+  from: Option<Arg>,
+  item: Type,
+  at: Int,
+) -> Lowered / {abort.raise} = {
+  let i = item_index(st, from, at);
+  let w = bound_as(
+    i.st,
+    item,
+    RWord,
+    Native({ name: b"rt_list_at_p", args: [list, i.arg], uses: list_read() }),
+    dummy_span(),
+  );
+  handed(w, held_as(cx.setting, item), dummy_span())
+}
+
+/// What a list pattern's subject `v` holds past its first `n` items: a view of the same list from
+/// `n` items on where `v` is a view, and otherwise the runtime's copy of them.
+fn rest_read(st: Lowering, v: Var, list: Arg, from: Option<Arg>, n: Int) -> Lowered =
+  match from {
+    Some(_) -> {
+      let i = item_index(st, from, n);
+      bound_as(i.st, v.ty, RSlice, Gathered({ parts: [list, i.arg] }), dummy_span())
+    },
+    None ->
+      bound_as(
+        st,
+        v.ty,
+        RWord,
+        Native({ name: b"rt_list_rest_p", args: [list, AInt(n)], uses: list_read() }),
+        dummy_span(),
+      ),
+  }
+
+/// A runtime read of a list's item or rest: borrows the list and its index, answers a count of its
+/// own, and fails where the list is shorter.
+fn list_read() -> Uses = { takes: [false, false], owned: true, fails: true, stops: false }
