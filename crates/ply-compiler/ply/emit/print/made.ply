@@ -10,14 +10,14 @@ import parsing (span_between)
 import types (TyCon)
 import emit (Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, Zeroed, FieldTy, TyRec, TyOpen,
              ctype, spelled_field)
-import emit.pieces (Piece, Text, Hole, ShapeOf, TagOf, spelled)
+import emit.pieces (Piece, Text, Hole, ShapeOf, TagOf, FieldName, spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases,
-                 RSlice, Leaf, Var, Arg, AVar, AInt, AZero, Made, MRecord, MCtor, Path, PField,
-                 PNamed, PArg, PCapture, PLeaf, rep_of_arg)
+                 RSlice, RToken, Leaf, Var, Arg, AVar, AInt, AZero, Made, MRecord, MCtor, Path,
+                 PField, PNamed, PArg, PCapture, PLeaf, rep_of_arg)
 import emit.lower.held (Laid, laid_of, record_flags, tail_bits, in_place, fields_of, slot_kind,
                         case_leaves_all, case_span, enumerated)
 import emit.print.text (Printing, Place, printing, line, pieces, pad, temp, named, name_of,
-                        arg_text, check, zero, int_lit)
+                        arg_text, check, zero, int_lit, interned)
 
 /// The C type a value held as `r` is declared in where it is one C value, and otherwise the type of
 /// the first of its C values, which a root answering it returns.
@@ -828,10 +828,11 @@ fn slot_field(name: Bytes, r: Rep) -> FieldTy =
     _ -> { name: name, kind: slot_kind(r), ty: TyOpen([]) },
   }
 
-/// What `g.path` reads out of `g.of`, which the value read borrows: a flat value's leaf or word, a
-/// field or a constructor's argument at its offset in a word as the variable it goes into holds it,
-/// a record held in place there as its leaves and the address of its header, or the payload of a sum
-/// held as one word.
+/// What `g.path` reads out of `g.of`, which the value read borrows: a value's `k`th C value, a field
+/// or a constructor's argument at its offset in a word as the variable it goes into holds it, a
+/// record held in place there as its leaves and the address of its header, or the payload of a sum
+/// held as one word. A field read by name is the runtime's, which answers its word with a count of
+/// its own.
 pub fn got(p: Place, pr: Printing, into: Option<Var>, g: { of: Var, path: Path }) -> Printing =
   match into {
     None -> pr,
@@ -848,8 +849,27 @@ pub fn got(p: Place, pr: Printing, into: Option<Var>, g: { of: Var, path: Path }
             } else { base }),
           _ -> loaded(p, pr, v, base, a.at),
         },
-        PNamed(_) ->
-          line(pr, p.depth, b"/* a field read by name, which answers a count of its own */"),
+        PNamed(name) -> {
+          let f = interned(pr.fields, name);
+          let n = named({ ..pr, fields: f.xs }, v);
+          check(
+            p,
+            pieces(n.pr, [
+              Text(
+                Bytes::concat_all([
+                  pad(p.depth),
+                  b"Word ",
+                  n.name,
+                  b" = rt_field_p(ctx, ",
+                  base,
+                  b", ",
+                ]),
+              ),
+              Hole(FieldName(f.at)),
+              Text(b", 0);\n"),
+            ]),
+          )
+        },
         PCapture(_) -> line(pr, p.depth, b"/* a capture, which a closure's printer reads */"),
       }
     },
@@ -1731,4 +1751,37 @@ test "a sum whose constructors take nothing is its index, and its constructor's 
       != None,
   );
   assert_eq(c_types(ordering), [b"int64_t"])
+}
+
+test "a constructor reuses the cells a token names, writing all but what they keep, and else allocates" {
+  let n = local(0, RInt);
+  let s = local(1, RWord);
+  let tok = local(2, RToken(2));
+  let pr = printing(Map::new().insert(0, b"p0").insert(1, b"p1").insert(2, b"p2"));
+  let m = {
+    made: MCtor({ name: b"m.Box", width: 2 }),
+    args: [AVar(n), AVar(s)],
+    reuse: Some(tok),
+    kept: [1],
+  };
+  let lines = spelled(made(place(), pr, Some(local(3, RWord)), m).out).split(b"\n");
+  // A mixed object takes only a token that was one, whose bitmap it has room for.
+  assert_eq(lines.take(3), [
+    b"  Word t1 = 0;",
+    b"  if (p2 && (ply_obj(p2)->flags & PLY_MIXED)) {",
+    b"    t1 = p2;",
+  ]);
+  // The token's cells hold the kept word already; the allocated object is written whole.
+  assert_eq(lines.filter(|l: Bytes| l.index_of(b"ply_words(t1)[1] = p1;") != None).len(), 1);
+  assert_eq(
+    lines.filter(|l: Bytes| l.index_of(b"ply_words(t1)[0] = (Word)(p0);") != None).len(),
+    2,
+  );
+  assert(lines.contains(b"    t1 = rt_alloc_p(ctx, 4, 2, @@Tm.Box@@, 6);"));
+  // Without a token the object is allocated and written.
+  let fresh = spelled(made(place(), pr, Some(local(3, RWord)), { ..m, reuse: None, kept: [] }).out);
+  assert_eq(
+    fresh,
+    b"  Word t1 = rt_alloc_p(ctx, 4, 2, @@Tm.Box@@, 6);\n  if (ctx->failed) return 0;\n   ply_words(t1)[0] = (Word)(p0); ply_words(t1)[1] = p1; ply_words(t1)[2] = INT64_C(2);\n",
+  )
 }
