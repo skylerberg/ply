@@ -12,7 +12,7 @@ import emit.compare (Program, program_of, formed, checked, answered_today, today
 import emit.print (printed_fn)
 import emit.tir (Rep, RFloat, RWord, RMaybe, RFlat, RCases, Var, AVar, AInt, AZero, Val, Make,
                  MRecord, MCtor, Get, Pack, Gathered, PLeaf, PField, Inst, Let, Decl, Assign, If,
-                 Case, Match, Block, Fn, Data, counted)
+                 Case, Match, Block, Fn, Family, Data, Calling, Leaf, counted)
 import emit.lower.held (enumerated)
 import emit.print.text (printing)
 import emit.print.made (c_types, head_types, entry_opened, entry_answered, grown_answered)
@@ -56,7 +56,27 @@ fn corpus() -> Bytes =
     b"fn pass(r: Result<Int, Bad>) -> Result<Int, Bad> = r\n",
     b"fn wrapped<a>(x: a) -> { inner: a } = { inner: x }\n",
     b"fn least(n: Int) -> Ordering = Less\n",
+    b"type In = { a: Int }\n",
+    b"type Out = { i: In, b: Int }\n",
+    b"type Coord = P\n",
+    b"opaque type Money = | Money(Int)\n",
+    b"opaque type Date = new { year: Int, month: Int }\n",
+    b"fn outer(o: Out) -> Out = o\n",
+    b"fn inner_a(o: Out) -> Int = o.i.a\n",
+    b"fn deep_pick(c: Bool, d: Bool, p: P, q: P, r: P) -> P = if c { p } else { if d { q } else { r } }\n",
+    b"fn reset(c: Bool, p: P) -> P = if c { p } else { { x: 0.0, y: 0.0 } }\n",
+    b"fn opt_join(c: Bool, o: Option<String>) -> Option<String> = if c { None } else { o }\n",
+    b"fn coord(c: Coord) -> Float = c.x\n",
+    b"fn money(n: Int) -> Money = Money(n)\n",
+    b"fn year_of(d: Date) -> Int = d.year\n",
+    b"fn walk(n: Int, p: P) -> P = if n <= 0 { p } else { walk(n - 1, { ..p, x: p.x + 1.0 }) }\n",
+    b"const fn origin() -> P = { x: 0.0, y: 0.0 }\n",
+    b"fn origin_x(n: Int) -> Float = origin().x\n",
   ])
+
+/// Roots of `corpus` holding a construct of another family's, each with the family that declines it.
+fn others_roots() -> List<{ name: Bytes, by: Family }> =
+  [{ name: b"walk", by: Calling }, { name: b"origin_x", by: Calling }]
 
 /// The roots of `corpus` this family lowers whole.
 fn lowered_roots() -> List<Bytes> =
@@ -88,6 +108,15 @@ fn lowered_roots() -> List<Bytes> =
     b"pass",
     b"wrapped",
     b"least",
+    b"outer",
+    b"inner_a",
+    b"deep_pick",
+    b"reset",
+    b"opt_join",
+    b"coord",
+    b"money",
+    b"year_of",
+    b"origin",
   ]
 
 fn program() -> Program / {abort.raise} =
@@ -224,6 +253,49 @@ test "a join of records is a variable of their type held as its leaves, each arm
   }
 }
 
+/// The variables `b` declares as joins, through the blocks it holds.
+fn joins(b: Block) -> List<Var> =
+  b.fold([], |acc: List<Var>, i: Inst|
+    match i {
+      Decl(v) -> acc.push(v),
+      If(x) -> acc.concat(joins(x.then)).concat(joins(x.otherwise)),
+      _ -> acc,
+    })
+
+test "a record joined however deep, from a parameter or a literal, and an Option joined with a word, hold as their type" {
+  let p = program();
+  // Nested joins of records each hold the record's leaves; no arm makes a record's word to join.
+  let deep = form_of(p, b"deep_pick");
+  assert_eq(joins(deep.body).map(|v: Var| v.rep), [floats([b"x", b"y"]), floats([b"x", b"y"])]);
+  assert_eq(vals(deep).filter(|v: Val| match v { Pack(_) -> true, _ -> false }), []);
+  // A literal arm is gathered into its leaves and set as they are.
+  let reset = form_of(p, b"reset");
+  assert_eq(joins(reset.body).map(|v: Var| v.rep), [floats([b"x", b"y"])]);
+  assert_eq(vals(reset).map(|v: Val| match v { Gathered(_) -> true, _ -> false }), [true]);
+  // `None` and an `Option` parameter join as its payload's word, no object made.
+  let opt = form_of(p, b"opt_join");
+  assert_eq(joins(opt.body).map(|v: Var| v.rep), [RMaybe]);
+  assert_eq(vals(opt).filter(|v: Val| match v { Pack(_) -> true, Make(_) -> true, _ -> false }), [])
+}
+
+test "a record holds an Option as its payload's word and a small record in place among its leaves" {
+  let p = program();
+  let held = form_of(p, b"held");
+  assert_eq(lets(held.body).map(|l: { var: Var, val: Val }| { rep: l.var.rep, val: l.val }), [
+    { rep: RMaybe, val: Get({ of: param(held, 0), path: PLeaf(0) }) },
+  ]);
+  // `Out` crosses as its own `b` and `In`'s leaf and word; `o.i.a` reads `In`'s leaf where it lies.
+  let o = form_of(p, b"inner_a");
+  match param(o, 0).rep {
+    RFlat(ls) -> assert_eq(ls.map(|l: Leaf| l.name), [b"b", b"i.a", b"i"]),
+    other -> assert_eq(other, RWord),
+  };
+  assert_eq(vals(o).filter(|v: Val| match v { Get(g) -> g.of == param(o, 0), _ -> false }), [
+    Get({ of: param(o, 0), path: PLeaf(1) }),
+    Get({ of: param(o, 0), path: PLeaf(2) }),
+  ])
+}
+
 test "a sum the code knows is gathered from its constructor's index, its other cases zero" {
   let p = program();
   let none = lets(form_of(p, b"nothing").body);
@@ -332,11 +404,16 @@ fn counts_nothing(f: Fn) -> Bool =
   f.params.all(|v: Var| !counted(v.rep))
     && lets(f.body).all(|l: { var: Var, val: Val }| !counted(l.var.rep))
 
-test "every root of the corpus lowers, and one that holds no count passes the check" {
+test "every root of the corpus lowers or is declined by another family, and one that holds no count passes the check" {
   let p = program();
   let declined = lowered_roots().fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
     match formed(p, n) { Ok(_) -> acc, Err(no) -> acc.push({ name: n, why: no.why }) });
   assert_eq(declined, []);
+  assert_eq(
+    others_roots().map(|r: { name: Bytes, by: Family }|
+      match formed(p, r.name) { Err(no) -> no.by == r.by, Ok(_) -> false }),
+    others_roots().map(|_: { name: Bytes, by: Family }| true),
+  );
   let refused = lowered_roots().fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
     match formed(p, n) {
       Ok(f) -> if !counts_nothing(f) { acc }
@@ -354,7 +431,7 @@ fn today_head(answers: List<RootAnswer>, name: Bytes) -> List<Head> =
 
 test "a record, an Option and a Result of a record cross a root's head and entry as today's emitter writes them" {
   let p = program();
-  let roots = [b"mid", b"keep", b"pass"];
+  let roots = [b"mid", b"keep", b"pass", b"outer"];
   let today = answered_today(p, roots);
   let checked_roots = roots.map(|n: Bytes| {
     let f = form_of(p, n);
