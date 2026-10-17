@@ -35,11 +35,12 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, Ro
               no_module_tables, module_shape_bin, tables_kept, tables_read, answered_program,
               answered_load, pulled_next, view_of, functions_of, tests_of, view_over, view_dump,
               faceted, dump_of, walked_facts_bin, squats, embedded_bin, read_outline, named_imports,
-              Outlined, OTest, OLaw, ShippedWants, shipped_wants_bin)
-import items (Module, Item, IType, ILaw, ImportDecl, INames, header, parse, parse_started,
-              import_decl_bin, homes_called, homes_declaring, is_written)
+              Outlined, OTest, OLaw, ShippedWants, shipped_wants_bin, checked_staged)
+import items (Module, Item, IType, ILaw, ImportDecl, INames, header, header_of, parse,
+              parse_started, import_decl_bin, homes_called, homes_declaring, is_written)
 import derive (dotted)
-import diagnostics (ParsedSource, parse_all, parse_at, parse_from, placed)
+import diagnostics (ParsedSource, parse_all, parse_at, parse_from, placed, with_prelude_source)
+import exprs (prelude_module)
 import interface (imported, blanked)
 import embed (EmbedAt, EmbedFile, EmbedBytes, BytesRead, EmbedWant, ItemWants, embed_file,
               embed_file_bin, embed_key, want_of_key, wants_by_item)
@@ -139,14 +140,21 @@ pub effect decode {
   read context(digest: Bytes) -> Option<Context>
   /// Holds `context` as what the answer under `digest` decodes to.
   write hold_context(digest: Bytes, context: Context) -> Unit
-  /// Holds `parse` as what the module `named` encodes the name of parses to, until it is taken.
-  write hold_parse(named: Bytes, parse: ModuleParse) -> Unit
-  /// What is held of the module `named` encodes the name of, which is then held no longer.
-  write take_parse(named: Bytes) -> Option<ModuleParse>
+  /// What a module's text read as, under [`text_key`], where a read of it this run holds it.
+  read text_read(key: Bytes) -> Option<TextRead>
+  /// Holds `read` as what the module's text `key` names reads as.
+  write hold_text_read(key: Bytes, read: TextRead) -> Unit
+  /// Holds what the module's text `key` names reads as no longer.
+  write release_text_read(key: Bytes) -> Unit
+  /// A shipped module's text as a module that imports it reads it, by the digest of the whole text.
+  read imported_text(digest: Bytes) -> Option<Bytes>
+  /// Holds `text` as what the shipped text under `digest` reads as to a module that imports it.
+  write hold_imported_text(digest: Bytes, text: Bytes) -> Unit
 }
 
-/// A module's text parsed: as it is written, and as a check reads it, its derives expanded.
-pub type ModuleParse = { raw: Module, given: ParsedSource }
+/// A module's text read: lexed, and parsed as it is written and as a check reads it, its derives
+/// expanded.
+pub type TextRead = { lexed: ParseStart, raw: Module, given: ParsedSource }
 
 /// What a query's body performs: it reads through `memo`, and holds what it decodes.
 pub effect set Answering = {memo.read, decode.read, decode.write}
@@ -164,7 +172,8 @@ pub fn decoding_once<a | e>(work: () -> a / {decode.read, decode.write | e}) -> 
   } with {
     var entries: Map<Bytes, List<Entry>> = Map::new(),
     var contexts: Map<Bytes, Context> = Map::new(),
-    var parses: Map<Bytes, ModuleParse> = Map::new(),
+    var reads: Map<Bytes, TextRead> = Map::new(),
+    var imports: Map<Bytes, Bytes> = Map::new(),
     decode.entries(query, digest) -> entries.get(query.concat(digest)),
     decode.hold_entries(query, digest, es) -> {
       entries = entries.insert(query.concat(digest), es);
@@ -173,32 +182,52 @@ pub fn decoding_once<a | e>(work: () -> a / {decode.read, decode.write | e}) -> 
     decode.hold_context(digest, c) -> {
       contexts = contexts.insert(digest, c);
     },
-    decode.hold_parse(named, p) -> {
-      parses = parses.insert(named, p);
+    decode.text_read(key) -> reads.get(key),
+    decode.hold_text_read(key, r) -> {
+      reads = reads.insert(key, r);
     },
-    decode.take_parse(named) -> {
-      let p = parses.get(named);
-      if p != None {
-        parses = parses.remove(named);
-      };
-      p
+    decode.release_text_read(key) -> {
+      reads = reads.remove(key);
+    },
+    decode.imported_text(digest) -> imports.get(digest),
+    decode.hold_imported_text(digest, t) -> {
+      imports = imports.insert(digest, t);
     },
   }
 
-/// `source`, its parse begun as `s`, parsed: as it is written, and as a check reads it.
-fn parsed(source: Source, s: ParseStart) -> ModuleParse / {abort.raise} = {
-  let read = parse_started(s);
-  { raw: read.node, given: parse_from(0, source, read) }
+/// What the text of the module `source` names is held under: the module's name, which its parse
+/// reads, beside the text's digest, so a read held is of the very text asked.
+fn text_key(source: Source) -> Bytes = Bytes::concat_all([source.name, b"\x00", blake3(source.src)])
+
+/// `source` read, once a run for every query of its module that reads it: a module's read, its check
+/// whole and its header read one text. It is held until the module's answer is put together, so a
+/// run holds the parse of few modules at once.
+fn read_once(source: Source) -> TextRead / {decode.read, decode.write, abort.raise} = {
+  let key = text_key(source);
+  match decode.text_read(key) {
+    Some(r) -> r,
+    None -> {
+      let lexed = start(source.src);
+      let parsed = parse_started(lexed);
+      let r = { lexed: lexed, raw: parsed.node, given: parse_from(0, source, parsed) };
+      decode.hold_text_read(key, r);
+      r
+    },
+  }
 }
 
-/// The parse of `source`, the text the module `named` names reads as: the one its read held, where
-/// that was of this text, else a parse of it. It is held no longer: a run checks a module whole
-/// once, and a parse is most of what a run would hold of a module.
-fn parse_taken(named: Named, source: Source) -> ModuleParse / {decode.write, abort.raise} =
-  match decode.take_parse(bin::encode(named, named_bin())) {
-    Some(p) -> if p.given.src == source.src { p } else { parsed(source, start(source.src)) },
-    None -> parsed(source, start(source.src)),
+/// `text`, a shipped module's, as a module that imports it reads it: made once a run.
+fn imported_once(text: Bytes) -> Bytes / {decode.read, decode.write, abort.raise} = {
+  let digest = blake3(text);
+  match decode.imported_text(digest) {
+    Some(t) -> t,
+    None -> {
+      let t = imported(text);
+      decode.hold_imported_text(digest, t);
+      t
+    },
   }
+}
 
 /// The context of the module `named` names, decoded once a run.
 fn context_once(named: Named) -> Context / {Answering, abort.raise} = {
@@ -370,27 +399,33 @@ fn placed_by(p: Option<Placing>) -> Placed =
     Some(x) -> if x.package == 0 { InRoot } else { InPackage(x.package, x.relative) },
   }
 
+/// The text of the module `asked` names as its queries read it, nothing where there is no such
+/// module: a shipped one as a module that imports it reads it, its tests and laws blanked, unless it
+/// is asked after with them.
+fn text_of(asked: Named) -> Option<Bytes> / {Answering, abort.raise} =
+  if asked.shipped {
+    match shipped_text(asked.module) {
+      Some(t) -> Some(if asked.tested { t } else { imported_once(t) }),
+      None -> None,
+    }
+  } else {
+    match placing_of(asked.module) {
+      Some(_) -> memo.world(text_kind(), asked.module),
+      None -> None,
+    }
+  }
+
 /// `module` as `asked` names it read, or nothing where there is no such module.
-fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, decode.write, abort.raise} = {
+fn module_read(asked: Named) -> Option<ModuleRead> / {Answering, abort.raise} = {
   let module = asked.module;
   let shipped = asked.shipped;
   let placing = if shipped { None } else { placing_of(module) };
-  // A shipped module is read as a module that imports it reads it, its tests and laws blanked, unless
-  // it is asked after with them.
-  let text = if shipped {
-    match shipped_text(module) {
-      Some(t) -> Some(if asked.tested { t } else { imported(t) }),
-      None -> None,
-    }
-  } else { match placing { Some(_) -> memo.world(text_kind(), module), None -> None } };
-  match text {
+  match text_of(asked) {
     None -> None,
     Some(src) -> {
       let source = { name: module, src: src };
-      let lexed = start(src);
-      let read = parsed(source, lexed);
-      // Held for the check of the module whole, which follows its read where it is checked whole.
-      decode.hold_parse(bin::encode(asked, named_bin()), read);
+      let read = read_once(source);
+      let lexed = read.lexed;
       let raw = read.raw;
       let given = read.given;
       let parsed = given.module;
@@ -404,6 +439,9 @@ fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, decode.write, a
       let homes = homes_called(module, lexed.input, || homes_declaring(shipped_text)).filter(
         |h: Bytes| shipped_there(h) && !imported_there.any(|t: Named| t.module == h),
       );
+      // What every module but the prelude imports past its text.
+      let prelude = if module == prelude_module() || !shipped_there(prelude_module()) { [] }
+      else { [prelude_module()] };
       let present = imported_there;
       // An import that names nothing is refused with the shipped modules there are.
       let unread = if present.len() == targets.len() { [] } else {
@@ -436,7 +474,7 @@ fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, decode.write, a
         raw: raw,
         parsed: parsed,
         names: targets.map(|t: Named| t.module),
-        present: present.map(|t: Named| t.module).concat(homes),
+        present: present.map(|t: Named| t.module).concat(homes).concat(prelude),
         placed: placed_by(placing),
         reading: {
           pkgs: pkgs,
@@ -688,7 +726,7 @@ fn resolved_imports(m: ModuleRead) -> List<Bytes> =
   )
 
 /// A module read for its owners, read as `Named` says.
-pub fn owners_answer(input: Bytes) -> Bytes / {memo.read, decode.write, abort.raise} = {
+pub fn owners_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
   let asked = decoded(input, named_bin(), "a module's name");
   let read = match module_read(asked) {
     None ->
@@ -819,7 +857,7 @@ pub fn owners_answer(input: Bytes) -> Bytes / {memo.read, decode.write, abort.ra
         // Its text, or its imports alone: one naming no module there is, or two binding one name.
         refusing: m.reading.given.fold(false, |b: Bool, g: ParsedSource|
             b || g.diags.fold(false, |c: Bool, d: Diag| c || d.severity == b"error"))
-          || m.present.len() < m.names.len()
+          || m.names.any(|n: Bytes| !m.present.contains(n))
           || colliding(m.raw.imports).len() > 0,
       }
     },
@@ -1336,7 +1374,7 @@ pub fn group_answer_of(input: Bytes) -> Bytes / {Answering, abort.raise} = {
             acc.concat(owner_facts(named, x).mentions)),
           imports_of(asked),
           // A unit's group stands on its members' walks, which take what the same check offered.
-          if alone { entire } else { beside(called_by(named, asked)) },
+          if alone { entire } else { beside(walked_calls(named, asked)) },
         );
         o
       },
@@ -1475,12 +1513,23 @@ fn imports_of(asked: GroupNamed) -> List<Imported> / {memo.read, abort.raise} =
     "a group's imports",
   )
 
-/// The owners of its module, itself left out, that the group `asked` calls: what its members'
-/// walks left.
-fn called_by(named: Named, asked: GroupNamed) -> List<Bytes> / {memo.read, abort.raise} =
-  asked.owners.fold([], |acc: List<Bytes>, o: Bytes|
-    calls_of(named, o).fold(acc, |a: List<Bytes>, c: Bytes|
-      if asked.owners.contains(c) || a.contains(c) { a } else { a.push(c) }))
+/// The owners of its module, itself left out, that the group `asked` calls, read off its members'
+/// walks themselves: a kept `calls` answer may stand for an earlier walk while marks settle.
+fn walked_calls(named: Named, asked: GroupNamed) -> List<Bytes> / {memo.read, abort.raise} =
+  called_in(asked, asked.owners.map(|o: Bytes| { owner: o, typed: walk_of(named, o) }))
+
+/// As `walked_calls`, of walks `walked` already read.
+fn called_in(
+  asked: GroupNamed,
+  walked: List<{ owner: Bytes, typed: owned::TypedAnswer }>,
+) -> List<Bytes> / {memo.read, abort.raise} =
+  walked.fold([], |acc: List<Bytes>, w: { owner: Bytes, typed: owned::TypedAnswer }|
+    called_owners(w.owner, owned::called_names(asked.module, w.typed), |n: Bytes|
+      declared_of(asked.module, asked.shipped, asked.tested, n)).fold(
+      acc,
+      |a: List<Bytes>, c: Bytes|
+        if asked.owners.contains(c) || a.contains(c) { a } else { a.push(c) },
+    ))
 
 /// How a group that calls `called` reads each other owner of its module: one it calls by what
 /// that owner's group settled, which its own settling reads, and any other by its signature.
@@ -1502,7 +1551,7 @@ fn group_settled(
       named,
       members,
       imports_of(asked),
-      beside(called_by(named, asked)),
+      beside(called_in(asked, walked)),
       |source: OwnerSource| Some(owned::handed_bodies(walked, source.items, source.offset)),
     );
     owned::settled_answer(cut_of(asked.module, c), walked, c.source.items)
@@ -2133,7 +2182,7 @@ fn offered_whole(
   if !whole_pays(missing.len(), groups.len()) { { refused: None, answers: Map::new() } } else {
     let facts = facts_of(read);
     let module = named.module;
-    let parse = parse_taken(named, { name: module, src: read.text });
+    let parse = read_once({ name: module, src: read.text });
     let checked = checked_whole(named, read, false, [parse.given]);
     match checked.pulled.out {
       Refused(ds) -> if !explaining { { refused: Some([]), answers: Map::new() } } else {
@@ -2310,7 +2359,8 @@ fn own_labels(d: Diag, at: Int) -> Diag =
 pub fn module_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
   let named = decoded(input, named_bin(), "a module's name");
   let read = owners_read(named);
-  bin::encode(
+  let source = { name: named.module, src: read.text };
+  let answer = bin::encode(
     if !read.found { absent(named.module) } else {
       let groups = groups_named(named, read);
       let offered = offered_whole(named, read, groups, true);
@@ -2362,7 +2412,7 @@ pub fn module_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
         // A module whose text or any group refuses says what a check of it whole says, which names
         // each error once and none another explains.
         let refused = if !read.refusing && a.refused.len() == 0 { header } else {
-          let checked = checked_whole(named, read, true, []);
+          let checked = checked_whole(named, read, true, [read_once(source).given]);
           let said = match checked.pulled.out {
             Refused(ds) -> ds.map(|d: Diag| own_labels(d, checked.at)),
             Analysed(_) -> [],
@@ -2384,7 +2434,10 @@ pub fn module_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
       }
     },
     module_answer_bin(),
-  )
+  );
+  // Its read, its check whole and its header have read its text.
+  decode.release_text_read(text_key(source));
+  answer
 }
 
 /// What `module`, read as `read`, answers refused for `refused`: nothing but why, what it imports
@@ -2408,24 +2461,11 @@ pub fn header_query() -> Bytes = b"header"
 /// A module's text up to the end of its last written import, each import that selects no name
 /// blanked at the offsets it had, read as `Named` says: empty for one that selects no name of
 /// another, which no check of its imports alone can refuse.
-pub fn header_text_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+pub fn header_text_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
   let asked = decoded(input, named_bin(), "a module's name");
-  // As the module is read: a shipped one an importer reads without its tests and laws, and the
-  // imports only they make.
-  let text = if asked.shipped {
-    match shipped_text(asked.module) {
-      Some(t) -> Some(if asked.tested { t } else { imported(t) }),
-      None -> None,
-    }
-  } else {
-    match placing_of(asked.module) {
-      Some(_) -> memo.world(text_kind(), asked.module),
-      None -> None,
-    }
-  };
-  match text {
+  match text_of(asked) {
     None -> b"",
-    Some(src) -> match header(src) {
+    Some(src) -> match header_read({ name: asked.module, src: src }) {
       None -> b"",
       Some(m) -> {
         let written = m.imports.filter(is_written);
@@ -2439,6 +2479,13 @@ pub fn header_text_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
     },
   }
 }
+
+/// What [`header`] makes of `source`'s text, off the tokens a read of it holds where one does.
+fn header_read(source: Source) -> Option<Module> / {decode.read, abort.raise} =
+  match decode.text_read(text_key(source)) {
+    Some(r) -> header_of(r.lexed.input, r.lexed.parser),
+    None -> header(source.src),
+  }
 
 fn max_of(xs: List<Int>) -> Int = xs.fold(0, |m: Int, x: Int| if x > m { x } else { m })
 
@@ -2765,7 +2812,7 @@ fn laws_referencing(lawful: Named) -> Map<Bytes, List<Bytes>> / {memo.read, abor
 /// off its whole text and off what its check and its hashing answered. A shipped module that writes
 /// a law is read with its tests for what its laws reference, which a module importing it never
 /// reads. A module there is none of documents nothing.
-pub fn documented_answer(input: Bytes) -> Bytes / {memo.read, decode.write, abort.raise} = {
+pub fn documented_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
   let asked = decoded(input, named_bin(), "a module's name");
   bin::encode(
     match module_read({ ..asked, tested: true }) {
@@ -3221,8 +3268,9 @@ fn shipped_listed() -> List<Bytes> / {memo_keep.read, abort.raise} =
 /// first and which checks the module for a load that holds none of its groups, the signing of each
 /// sign unit, the walk of each owner of a unit of several, what it calls and how each unit is cut
 /// into groups, each group's check and hashing, the module's answer and hashing put together, what
-/// a module of the standard library documents, and which of them declare each name. What one owner
-/// or one name answers is read off those.
+/// its imports alone refuse and the header text that reads, which a load over a pack it does not
+/// trust reads to vouch for the module's answer, what a module of the standard library documents,
+/// and which of them declare each name. What one owner or one name answers is read off those.
 pub fn shipped_queries() -> List<Bytes> =
   [
     owners_query(),
@@ -3234,6 +3282,8 @@ pub fn shipped_queries() -> List<Bytes> =
     group_query(),
     group_hash_query(),
     module_query(),
+    header_query(),
+    header_text_query(),
     hashes_query(),
     wants_query(),
     documented_query(),
@@ -3256,7 +3306,6 @@ pub fn unkept_queries() -> List<Bytes> =
     signed_query(),
     owner_entry_query(),
     shown_query(),
-    header_text_query(),
     exported_query(),
   ]
 
@@ -3627,7 +3676,7 @@ fn answered_under(
   let w = world_alone(sources);
   let done = over_decoding(
     held,
-    packs::no_pack,
+    prelude_frames,
     b"",
     |kind: Bytes, at: Bytes| looked_alone(w, kind, at),
     || asked_alone(qs, w),
@@ -3641,6 +3690,15 @@ fn answered_under(
   }
 }
 
+/// What a toolchain that ships nothing but `std.prelude` packs of it, cut once a process: a load of
+/// these tests reads the prelude's answers from it as a load reads every shipped module's from its
+/// toolchain's pack, held to their reads, so it checks the prelude only where its text differs.
+fn prelude_pack() -> Option<packs::Written> / {abort.raise} = pack_of(shipped_held([]))
+
+/// What a frame of [`prelude_pack`] holds.
+fn prelude_frames(path: String, offset: Int, len: Int) -> Option<Bytes> / {abort.raise} =
+  packs::frame_in(prelude_pack(), path, offset, len)
+
 /// The world a load of `sources` and nothing else reads.
 fn world_alone(sources: List<Source>) -> World / {abort.raise} =
   world_of(
@@ -3648,10 +3706,22 @@ fn world_alone(sources: List<Source>) -> World / {abort.raise} =
     [],
   )
 
-/// What `w` holds at a place, for a load that ships and embeds nothing.
-fn looked_alone(w: World, kind: Bytes, at: Bytes) -> Option<Bytes> / {abort.raise} = {
-  let none = |name: Bytes| None;
-  looked(w, none, none, || [], nothing_embedded, kind, at)
+/// What `w` holds at a place, for a load that ships nothing but `std.prelude` and embeds nothing.
+fn looked_alone(w: World, kind: Bytes, at: Bytes) -> Option<Bytes> / {abort.raise} =
+  looked_shipping(w, [], kind, at)
+
+/// What `w` holds at a place, for a load of a toolchain that ships `shipped` and `std.prelude`,
+/// which every module imports, and embeds nothing.
+fn looked_shipping(
+  w: World,
+  shipped: List<Source>,
+  kind: Bytes,
+  at: Bytes,
+) -> Option<Bytes> / {abort.raise} = {
+  let all = with_prelude_source(shipped);
+  let held = |name: Bytes|
+    match all.find(|s: Source| s.name == name) { Some(s) -> Some(s.src), None -> None };
+  looked(w, held, held, || all.map(|s: Source| s.name), nothing_embedded, kind, at)
 }
 
 /// Each module of `w` asked of `qs` over a run of its own, and hashed where none refuses.
@@ -3711,13 +3781,13 @@ fn answered_in(
     handle {
       memo_files::kept[abs](
         "s",
-        packs::no_pack,
+        prelude_frames,
         b"",
         |kind: Bytes, at: Bytes| {
           if raced.first() {
             memo_files::kept[abs](
               "s",
-              packs::no_pack,
+              prelude_frames,
               b"",
               |k: Bytes, a: Bytes| looked_alone(w, k, a),
               || decoding_once(|| asked_alone(qs, w).run),
@@ -3955,12 +4025,11 @@ fn inputs_over(
     { root: b"", manifest: None, files: sources.map(|s: Source| { module: s.name, text: s.src }) },
     [],
   );
-  let none = |name: Bytes| None;
   over_decoding(
     held,
-    packs::no_pack,
+    prelude_frames,
     b"",
-    |kind: Bytes, at: Bytes| looked(w, none, none, || [], nothing_embedded, kind, at),
+    |kind: Bytes, at: Bytes| looked_alone(w, kind, at),
     || {
       let qs = fresh_registry().insert(b"group inputs", {
         name: b"group inputs",
@@ -4247,6 +4316,28 @@ test "an answer through the store is the fresh one through every kind of edit a 
       step(b"a type renamed", s13),
       step(b"an effect renamed", s14),
       step(b"unchanged again", s14),
+    ]),
+    [],
+  )
+}
+
+test "a group whose member now calls another sibling settles through the store as fresh" {
+  let src = Bytes::concat_all([
+    b"pub fn even(n: Int) -> Bool = if n <= 0 { here() } else { odd(n - 1) }\n",
+    b"pub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\n",
+    b"fn here() -> Bool = true\n",
+    b"fn there() -> Bool = 1 > 0\n",
+    b"pub fn other(n: Int) -> Int = n + 1\n",
+  ]);
+  let s0 = [{ name: b"cycle", src: src }];
+  let s1 = edited(s0, b"cycle", b"{ here() }", b"{ there() }");
+  let s2 = edited(s1, b"cycle", b"{ false }", b"{ here() }");
+  assert_eq(
+    disagreements([
+      step(b"cold", s0),
+      step(b"a member calls another sibling", s1),
+      step(b"the other member calls the first's old one", s2),
+      step(b"back", s0),
     ]),
     [],
   )
@@ -5041,7 +5132,7 @@ type Load = {
 
 /// What each module of `sources`, and each of `shipped` they pull, answered through `held`.
 fn fixed_over(held: Held, sources: List<Source>, shipped: List<Source>) -> Load / {abort.raise} =
-  fixed_beside(held, None, sources, shipped)
+  fixed_beside(held, prelude_pack(), sources, shipped)
 
 /// [`fixed_over`] with `packed` below `held`, as a pack the load does not trust: it lists no shipped
 /// files the pack was made over.
@@ -5055,10 +5146,6 @@ fn fixed_beside(
     { root: b"", manifest: None, files: sources.map(|s: Source| { module: s.name, text: s.src }) },
     [],
   );
-  let texts = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
-    acc.insert(s.name, s.src));
-  let held_text = |name: Bytes| texts.get(name);
-  let names = shipped.map(|s: Source| s.name);
   handle {
     let done = over_decoding(
       held,
@@ -5068,8 +5155,7 @@ fn fixed_beside(
         found
       },
       b"",
-      |kind: Bytes, at: Bytes|
-        looked(w, held_text, held_text, || names, nothing_embedded, kind, at),
+      |kind: Bytes, at: Bytes| looked_shipping(w, shipped, kind, at),
       || {
         let qs = fresh_registry();
         let all = asked_all(qs, w.own, [], false, started(qs));
@@ -5128,14 +5214,17 @@ fn hashed_fixture() -> List<Source> =
 test "a program hashed from its modules' answers hashes as it does hashed whole, and warns alike" {
   [shop(), hashed_fixture()].fold((), |u: Unit, sources: List<Source>| {
     let fixed = fixed_over(nothing_held(), sources, []);
+    let whole = staged_pulling_std_with(sources, []);
+    // A whole read's hashing leaves each call on a value to its check, as the answers did not.
     match ((
-        staged_pulling_std_with(sources, []).hashed,
+        whole.hashed,
+        checked_staged(whole, no_rows()).out,
         staged_pulling_std_with(sources, [], fixed: fixed.fixing).hashed,
       )) {
-      (Ok(whole), Ok(taken)) -> {
-        assert_eq(taken.hashes, whole.hashes);
+      (Ok(read), Analysed(checked), Ok(taken)) -> {
+        assert_eq(taken.hashes, checked.hashes);
         assert_eq(taken.unused, []);
-        assert_eq(owned::told(fixed.warnings), owned::told(whole.unused))
+        assert_eq(owned::told(fixed.warnings), owned::told(read.unused))
       },
       _ -> panic("the fixture hashes"),
     }
@@ -5153,7 +5242,8 @@ test "a program's tables made from its modules' answers are the tables of its ch
           let answered = answered_program(
             fixed.answers.map(|a: Answered| facts_answered(a.answer)),
             fixed.fixing,
-            Map::new(),
+            with_prelude_source([]).fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
+              acc.insert(s.name, s.src)),
             true,
             true,
             w.warnings,
@@ -5226,10 +5316,11 @@ test "a program assembled from its modules' answers, a shipped module's among th
     { root: b"", manifest: None, files: f.user.map(|s: Source| { module: s.name, text: s.src }) },
     [],
   );
-  let texts = f.shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
+  let shipped = with_prelude_source(f.shipped);
+  let texts = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
   let held = |name: Bytes| texts.get(name);
-  let names = f.shipped.map(|s: Source| s.name);
+  let names = shipped.map(|s: Source| s.name);
   // As a program reads a shipped module, cut to its reach; and as a run over the standard library's
   // own tests reads it, whole and with its tests.
   [{ tested: false, reached: true }, { tested: true, reached: false }].fold(
@@ -5276,8 +5367,12 @@ test "a program assembled from its modules' answers, a shipped module's among th
             done.answers.fold(Map::new(), |acc: Map<Bytes, ModuleAnswer>, a: Answered|
               acc.insert(a.module, a.answer)),
           );
-          assert_eq(loaded.pulled, [b"std.shapes"]);
-          assert_eq(assembled.checked.tests.len(), if mode.tested { 2 } else { 1 });
+          assert_eq(loaded.pulled, [b"std.prelude", b"std.shapes"]);
+          // `std.prelude`'s own tests are read with the rest of the library's.
+          assert_eq(
+            assembled.checked.tests.filter(|t: TestInfo| t.module != prelude_module()).len(),
+            if mode.tested { 2 } else { 1 },
+          );
           assert_eq(loaded.frame.outlines, view.frame.outlines);
           assert_eq(assembled.checked.defs, view.checked.defs);
           assert_eq(assembled.checked.facts, view.checked.facts);
@@ -5310,7 +5405,8 @@ fn body_named(bodies: List<{ name: Bytes, body: Bytes }>, name: Bytes) -> Bytes 
   }
 
 test "a body that calls on a value stores what its check found, read whole or answered module by module" {
-  // Alone, and after a module it imports, which a check of it against its imports places first.
+  // Alone, after a module it imports, which a check of it against its imports places first, and
+  // on a function std.prelude writes, which the check finds by its bare name.
   [
     [
       {
@@ -5325,6 +5421,7 @@ test "a body that calls on a value stores what its check found, read whole or an
       },
       { name: b"m", src: b"import low\npub fn f(t: low::T) -> Int = t.scaled(plus: 3)\n" },
     ],
+    [{ name: b"m", src: b"pub fn f(xs: List<Int>) -> Int = xs.fold(0, |a: Int, x: Int| a + x)\n" }],
   ].fold((), |u: Unit, sources: List<Source>| {
     let answered = fixed_over(nothing_held(), sources, []).fixing.nodes.fold(
       b"",
@@ -5883,7 +5980,7 @@ test "where only what puts a module together is defined anew, its groups stand a
   );
   // Every query's hash names the run's stamp, so the store vouches for nothing to this one.
   let warm = answered_under(qs, cold.held, sources);
-  assert_eq([ran_of(warm.run, module_query()), ran_of(warm.run, group_query())], [2, 0]);
+  assert_eq([ran_of(warm.run, module_query()), ran_of(warm.run, group_query())], [3, 0]);
   assert(!checked_whole_in(warm.held, anew, b"app"));
   assert_eq(warm.answers, cold.answers)
 }
@@ -6039,25 +6136,21 @@ test "a definition added to a shipped module checks and hashes no module that im
   assert_eq(warm.fixing, fixed_over(nothing_held(), user, added).fixing)
 }
 
-/// What a toolchain that ships `shipped` answers of them, as the store its pack is cut from holds it.
+/// What a toolchain that ships `shipped` and `std.prelude` answers of them, as the store its pack
+/// is cut from holds it.
 fn shipped_held(shipped: List<Source>) -> Held / {abort.raise} = shipped_asked(shipped).held
 
 /// [`shipped_held`], beside each of `shipped` that refuses.
 fn shipped_asked(shipped: List<Source>) -> { held: Held, value: List<Answered> } / {abort.raise} = {
-  let texts = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
-    acc.insert(s.name, s.src));
-  let held_text = |name: Bytes| texts.get(name);
-  let names = shipped.map(|s: Source| s.name);
   let nowhere = world_of({ root: b"", manifest: None, files: [] }, []);
   over_decoding(
     nothing_held(),
     packs::no_pack,
     b"",
-    |kind: Bytes, at: Bytes|
-      looked(nowhere, held_text, held_text, || names, nothing_embedded, kind, at),
+    |kind: Bytes, at: Bytes| looked_shipping(nowhere, shipped, kind, at),
     || {
       let qs = fresh_registry();
-      shipped_all(qs, names, started(qs)).refused
+      shipped_all(qs, with_prelude_source(shipped).map(|s: Source| s.name), started(qs)).refused
     },
   )
 }

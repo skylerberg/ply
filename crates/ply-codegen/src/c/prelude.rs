@@ -271,6 +271,7 @@ helpers! {
     rt_constant(index) -> Word;
     rt_call(callee, args: *const Word, n) -> Word;
     rt_closure(index, arity, env: *const Word, n) -> Word;
+    rt_lambda_value(index, arity, desc) -> Word;
     rt_iterate(seed, budget, f) -> Raising;
     rt_iterate_bad(what, n);
     rt_shift_count(n, which);

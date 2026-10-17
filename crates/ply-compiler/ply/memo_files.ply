@@ -615,7 +615,10 @@ fn committed<[r]>(
         Named(m) -> {
           let from = segments::merging(m);
           if from < m.segments.len() - 1 {
-            merged[r](dir, m, from, segments::token_of(Some(run), m.generation, 1), Near(o.own));
+            // What the run kept stays whatever it weighs, and counts toward the room others may take.
+            let own = o.mine.fold(o.own, |acc: Map<Bytes, Bool>, _: Bytes, x: Mine|
+              acc.insert(x.query, true));
+            merged[r](dir, m, from, segments::token_of(Some(run), m.generation, 1), Near(own));
             ()
           };
           segments::swept[r](dir, shapes(), run, retired())
@@ -691,9 +694,9 @@ fn carried_over<[r]>(
 fn carry_bound() -> Int = 16777216
 
 /// Which queries' records a rewrite of a whole store keeps, each query by its name in the store:
-/// those of `Only` and no other; or those of `Near`, the queries of the run that writes, and of
-/// the others the most lately answered under, while their records and the longer answers those
-/// name hold no more than the run's own hold.
+/// those of `Only` and no other; or those of `Near`, the queries of the run that writes and of each
+/// record it kept, and of the others the most lately answered under, while their records and the
+/// longer answers those name hold no more than the run's own hold.
 type Keeping = | Only(Map<Bytes, Bool>) | Near(Map<Bytes, Bool>)
 
 /// A query other than the writing run's, what its records hold and when it was last answered under.
@@ -2117,6 +2120,40 @@ test "what a run answered again over a pack it does not trust is answered again 
   let moved = quoted_below(first.tree, pack, b"other files", b"forty");
   assert_eq(moved.value, { output: b"\"forty\"", ran: 2 });
   assert_eq(quoted_below(moved.tree, pack, b"other files", b"forty").value.ran, 0)
+}
+
+// The command's answer outweighs every other record, as `ply run`'s does over a pack below.
+test "a run keeps what it wrote through the merge its write makes, and a later run's merge may drop it" {
+  let queries = test_queries(b"");
+  let key = b"command".blake3();
+  let said = b"done ".repeat(40000);
+  let look = |_: Bytes, at: Bytes| Some(b"long ".repeat(1200).concat(at));
+  let session = |tree: fs::MemFs, work: () -> Option<Bytes> / {memo_keep.read, memo_keep.write, abort.raise}|
+    fs::on_mem[abs](tree, || kept[abs]("s", packs::no_pack, b"", look, work));
+  let held = |tree: fs::MemFs|
+    match fs::on_mem[abs](tree, || record_at[abs]("s", key)).value {
+      Some(_) -> true,
+      None -> false,
+    };
+  let loaded = fs::on_mem[abs](fs::mem_of([]), ||
+    kept[abs]("s", packs::no_pack, b"", look, ||
+      memo::asked_reads(answer(queries, started(queries), b"quoted", b"a").run)));
+  let filed = session(loaded.tree, || {
+    memo::recorded(queries, key, b"c1", loaded.value, said, []);
+    None
+  });
+  assert(held(filed.tree), Some("the run's own record outlives the merge its write made"));
+  assert_eq(
+    session(filed.tree, || memo::standing(queries, started(queries), key).output).value,
+    Some(said),
+  );
+  // A run that keeps less than the command weighs, and enough to merge the whole store again.
+  let later = session(filed.tree, || {
+    range(0, 10).fold(started(queries), |run: memo::Run, i: Int|
+      answer(queries, run, b"quoted", Bytes::of_string(i.to_string())).run);
+    None
+  });
+  assert(!held(later.tree), Some("another run's merge drops a record of a query not its own"))
 }
 
 test "taking back a command's answer asks the file system the same handful of things, however much is kept" {

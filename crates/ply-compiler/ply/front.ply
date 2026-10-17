@@ -12,7 +12,7 @@ import exprs (sees_homes, Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf,
               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
               EParallel, EBad, ETryBlock, Param, Stmt, SLet, SLetElse, SExpr, SAssign, HandlerVar,
               MatchArm, RecField, expr_span, ETagged, Tagged, Hole, TaggedPart, tagged_parts,
-              hidden_binder, tagged_part_bin)
+              hidden_binder, tagged_part_bin, prelude_module)
 import patterns (Lit, LInt, LStr, LBytes)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform,
              NLabel, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, NKnown, CodeField,
@@ -46,10 +46,12 @@ import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo,
               ctor_info_bin, instance_info_bin, numeric_info_bin, kept_facts_bin, prelude_tables)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
 import lent (Passed)
-import diagnostics (ParsedSource, headed_at, parse_all, parse_at, outside_every_module, placed)
+import diagnostics (ParsedSource, headed_at, parse_all, parse_at, outside_every_module, placed,
+                    with_prelude_source)
 import pkg (PackageSources, Supplied, Closure, Package, Pinned, Judged, closure, closed, empty,
             pins_of, first_segment)
 import resolve (PackageDeps, resolve_packaged, no_packages)
+import std.prelude_source
 import std.bin
 import std.hash (blake3)
 import std.pkg (Manifest)
@@ -61,7 +63,7 @@ import embed (EmbedAt, EmbedRead, EmbedFile, EmbedBytes, BytesRead, EmbedWant, I
               embed_want_bin, embed_read_bin, item_wants_bin, embed_key, embed_tables, embedded,
               rewritten, wants_of, wants_by_item, wants_in, want_of_key, embed_at_bin, embed_file)
 import items (parse, import_decl_bin, homes_called, homes_declaring, homes_for, called_names,
-              is_std, is_compiler, is_shipped, HomeNames)
+              is_std, is_compiler, is_shipped, is_written, HomeNames)
 import std.bytes (ascii_of_int)
 import lexer (is_ident_start, is_ident_continue)
 
@@ -204,7 +206,7 @@ fn outline_of(
         _ -> acc,
       }),
     declared: module_items(parsed),
-    imports: module_imports(parsed),
+    imports: imported_names(parsed.module.imports.filter(is_written)),
     schemas: schemas_declared(parsed),
     sets: sets,
     cuts: cuts,
@@ -631,8 +633,10 @@ pub fn module_items(parsed: ParsedModule) -> List<Bytes> =
     })
 
 /// The modules a module imports, each named once, in source order.
-pub fn module_imports(parsed: ParsedModule) -> List<Bytes> =
-  parsed.module.imports.fold([], |acc: List<Bytes>, decl: ImportDecl| {
+pub fn module_imports(parsed: ParsedModule) -> List<Bytes> = imported_names(parsed.module.imports)
+
+fn imported_names(imports: List<ImportDecl>) -> List<Bytes> =
+  imports.fold([], |acc: List<Bytes>, decl: ImportDecl| {
     let name = Bytes::join(decl.path.map(|x: Ident| x.name), b".");
     if acc.fold(false, |b: Bool, x: Bytes| b || x == name) { acc } else { acc.push(name) }
   })
@@ -1003,7 +1007,8 @@ fn cut_shape(s: ModuleShape, reached: Map<Bytes, Bool>) -> ModuleShape = {
             None -> { ..acc, names: acc.names.push(n) },
           },
       ).names,
-      cuts: o.cuts.filter(|c: Cut| !gone.contains(c.name)),
+      // A test or a law is left out with what it was cut by, as `cut_to` leaves it out.
+      cuts: o.cuts.filter(|c: Cut| c.braced && !gone.contains(c.name)),
     },
   }
 }
@@ -3323,8 +3328,15 @@ pub fn analyse_with(
   pkgs: PackageSources = { root: b"", manifest: None, supplied: [] },
 ) -> AnalysisOutcome / {abort.raise} = {
   let clo = closure(pkgs, parsed.map(|p: ParsedSource| p.name));
-  let all = clo.modules.fold(parsed, |acc: List<ParsedSource>, m: { pkg: Int, src: Source }|
+  let closed = clo.modules.fold(parsed, |acc: List<ParsedSource>, m: { pkg: Int, src: Source }|
     acc.push({ ..parse_at(acc.len(), m.src), src: m.src.src }));
+  // As a load reads a shipped module: without its tests and laws.
+  let all = if closed.any(|p: ParsedSource| p.name == prelude_module()) { closed } else {
+    let src = prelude_source::text();
+    closed.push(
+      untested({ ..parse_at(closed.len(), { name: prelude_module(), src: src }), src: src }),
+    )
+  };
   // The toolchain's own tree loads without its implicit self; this path has no shipped modules list
   // to check the coverage half of that against, and only the toolchain's listings use it.
   let toolchain = parsed.fold(true, |acc: Bool, p: ParsedSource| acc && is_std(p.name));
@@ -3337,6 +3349,23 @@ pub fn analyse_with(
 /// modules. The built-in packages: every package's implicit dependencies, pulled on demand like the
 /// shipped modules but owned as packages — the two the runtime pre-seeds.
 pub fn std_pkg() -> PackageDeps = { prefix: b"std", deps: [] }
+
+/// `sources` with `std.prelude` among them, which every module imports, and `module_packages` with
+/// its place where packages are given: `shipped`, one past the published table, as a pulled shipped
+/// module's.
+fn with_prelude_module(
+  sources: List<Source>,
+  pkgs: List<PackageDeps>,
+  module_packages: List<Int>,
+  shipped: Int,
+) -> { sources: List<Source>, module_packages: List<Int> } / {abort.raise} = {
+  let read = with_prelude_source(sources);
+  {
+    sources: read,
+    module_packages: if read.len() == sources.len() || pkgs.len() == 0 { module_packages }
+    else { module_packages.push(shipped) },
+  }
+}
 
 pub fn compiler_pkg() -> PackageDeps = { prefix: b"compiler", deps: [b"std"] }
 
@@ -3489,7 +3518,12 @@ fn hashed_closure(
                 r: x.r,
                 index: built.index,
                 hashes: hashed.hashes,
-                unused: hashed.unused,
+                // A dependency's unused definitions are its own package's to report.
+                unused: hashed.unused.filter(|diag: Diag|
+                  diag.labels.any(
+                    |l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
+                      l.primary && l.module < root_count,
+                  )),
                 uses: hashed.uses,
                 clo: clo,
                 packages: tables.pkgs,
@@ -3529,15 +3563,7 @@ fn checked_closure(h: Hashed, rows: Rows, walks: Walks) -> AnalysisOutcome / {ab
             else { acc }),
         )
       },
-      // A dependency's unused definitions are its own package's to report.
-      warnings: h.unused.filter(|diag: Diag|
-        diag.labels.fold(
-          false,
-          |b: Bool, l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
-            b || (l.primary && l.module < h.root_count),
-        )).map(
-        outside_every_module,
-      ),
+      warnings: h.unused.map(outside_every_module),
       uses: h.uses,
       manifest: h.clo.packages.get(0).manifest,
       packages: h.packages,
@@ -3607,8 +3633,57 @@ fn analyse_closure(
 ) -> AnalysisOutcome / {abort.raise} =
   match hashed_closure(parsed, clo, root_count, toolchain) {
     Err(diags) -> Refused(diags),
-    Ok(h) -> checked_closure(h, rows, Every),
+    Ok(h) -> match if parsed.take(root_count).any(|p: ParsedSource| p.name == prelude_module()) {
+        None
+      } else { prelude_cut(parsed, h) } {
+      None -> checked_closure(h, rows, Every),
+      Some(cut) -> match hashed_closure(cut, clo, root_count, toolchain) {
+        Err(diags) -> Refused(diags),
+        Ok(kept) -> checked_closure(kept, rows, Every),
+      },
+    },
   }
+
+/// `parsed` with `std.prelude`'s functions cut to those the rest of the load reaches; `None` where
+/// it keeps all of them. A program read whole reads the prelude, which it does not hold among its
+/// own modules, as a load reads a shipped module.
+fn prelude_cut(
+  parsed: List<ParsedSource>,
+  h: Hashed,
+) -> Option<List<ParsedSource>> / {abort.raise} = {
+  let own = |name: Bytes| module_of_root(name) == prelude_module();
+  let roots = h.hashes.defs.fold([], |acc: List<Which>, d: { name: Bytes, hash: Bytes }|
+    if own(d.name) { acc } else { acc.push(TheFn(d.name)) }).concat(
+    h.index.nodes.fold([], |acc: List<Which>, n: Node|
+      match n.body { NodeFn(_) -> acc, _ -> acc.push(TheDecl(n.name)) }),
+  ).concat(
+    h.index.tests.map(|t: TestNode| TheItem(t.key)),
+  ).concat(
+    h.index.laws.map(|l: LawNode| TheItem(l.key)),
+  );
+  let reach = reached_functions(h.hashes, roots);
+  let kept = |p: ParsedSource, item: Item|
+    match item { IFn(d) -> reach.contains(qualify(p.name, d.name.name)), _ -> true };
+  if !parsed.any(|p: ParsedSource|
+      p.name == prelude_module() && p.module.module.items.any(|item: Item| !kept(p, item))) { None }
+  else {
+    Some(
+      parsed.map(|p: ParsedSource|
+        if p.name != prelude_module() { p } else {
+          {
+            ..p,
+            module: {
+              ..p.module,
+              module: {
+                ..p.module.module,
+                items: p.module.module.items.filter(|item: Item| kept(p, item)),
+              },
+            },
+          }
+        }),
+    )
+  }
+}
 
 /// The answer as a program ships it: the tables the runtime binds the program's unit to and enters
 /// it by, and none of what only a compiler reads. The bodies, rows, keys and walk are the emitter's,
@@ -3788,9 +3863,10 @@ pub type Within = { owners: Map<Bytes, Bool>, tests: Map<Bytes, Bool> }
 /// witnesses a `numeric` or `integer` constraint has the elaboration pass ahead of them.
 pub type BuiltinRow = { name: Bytes, scheme: Scheme, params: List<Bytes>, witnesses: Int }
 
-/// Every builtin, in the prelude's order.
+/// Every builtin the runtime implements, in the prelude's order; one the prelude writes in Ply is a
+/// definition of its module.
 pub fn builtin_rows() -> List<BuiltinRow> / {abort.raise} =
-  builtins().map(|b: Builtin| row_of(b.name, b))
+  builtins().filter(|b: Builtin| !b.body).map(|b: Builtin| row_of(b.name, b))
 
 /// Every builtin the toolchain declares, under the name the runtime implements it by: the prelude's
 /// that every module calls, then each extern a native implements of `shipped`, the shipped modules'
@@ -4282,12 +4358,14 @@ fn claims_of_modules(
   })
 
 pub fn claims(
-  sources: List<Source>,
+  given: List<Source>,
   pkgs: List<PackageDeps> = [],
-  module_packages: List<Int> = [],
+  given_packages: List<Int> = [],
   shipped: Int = 0,
 ) -> List<Claim> / {abort.raise} = {
-  let mods = parse_all(sources).map(|parsed: ParsedSource| parsed.module);
+  let read = with_prelude_module(given, pkgs, given_packages, shipped);
+  let module_packages = read.module_packages;
+  let mods = parse_all(read.sources).map(|parsed: ParsedSource| parsed.module);
   // The published table ends with the built-in packages; the shipped modules sit one past them.
   let packaged = if pkgs.len() == 0 { no_packages(mods) } else {
     {
@@ -4310,10 +4388,12 @@ pub fn claims(
     ResolveSucceeded(x) -> match elaborated(x.r, x.mods) {
       None -> panic("a program the front end checked does not check"),
       Some(e) ->
+
+        // `std.prelude`, read beside modules that leave it out, claims nothing of theirs.
         claims_of_modules(
           updated_mods(x.mods, e.elaboration, x.r.signatures),
           x.r,
-          range(0, x.mods.len()),
+          range(0, given.len()),
           |m: Bytes| false,
           e.ends,
           e.stated,
@@ -4377,15 +4457,17 @@ fn rechecked(analysis: Analysis, wanted: List<Int>) -> Elaboration / {abort.rais
 /// modules as root ones — and the shipped modules sit one past the published table, as `claims` has
 /// it.
 pub fn rehash(
-  sources: List<Source>,
+  given: List<Source>,
   pins: List<Pin>,
   pkgs: List<PackageDeps> = [],
-  module_packages: List<Int> = [],
+  given_packages: List<Int> = [],
   shipped: Int = 0,
   embeds: List<EmbedAt> = [],
 ) -> Rehashed / {abort.raise} = {
+  let read = with_prelude_module(given, pkgs, given_packages, shipped);
+  let module_packages = read.module_packages;
   let tables = embed_tables(embeds);
-  let mods = parse_all(sources).map(|parsed: ParsedSource|
+  let mods = parse_all(read.sources).map(|parsed: ParsedSource|
     { ..parsed.module, module: rewritten(tables, parsed.name, parsed.module.module).module });
   let packaged = if pkgs.len() == 0 { no_packages(mods) } else {
     {
@@ -4939,7 +5021,7 @@ fn untested(p: ParsedSource) -> ParsedSource =
 /// `shipped` is each shipped module as the analysis reads it, cut where a program reads it so, `whole` the
 /// shipped modules as they stand and `data` the data files they embed. `room` is how many more
 /// rounds may pull: each pulls a shipped module not pulled before. `asked` are pulled whatever the
-/// modules import.
+/// modules import, and a module `given` holds a parse of is not parsed again.
 fn pulling(
   users: Int,
   shipped: Map<Bytes, Bytes>,
@@ -4952,6 +5034,7 @@ fn pulling(
   room: Int,
   asked: List<Bytes>,
   declared: List<HomeNames>,
+  given: List<ParsedSource>,
 ) -> Pull / {abort.raise} = {
   let early = x.parsed.fold([], |acc: List<Diag>, parsed: ParsedSource| acc.concat(parsed.diags));
   if early.len() > 0 { { ..x, diags: early } } else {
@@ -4968,7 +5051,14 @@ fn pulling(
         listed,
         tested,
         r.wanted.fold(x, |acc: Pull, name: Bytes, src: Bytes| {
-          let o = shipped_embedded(whole, told, data, acc.parsed.len(), { name: name, src: src });
+          let at = acc.parsed.len();
+          let o = shipped_embedded(
+            whole,
+            told,
+            data,
+            at,
+            parsed_at(given, at, { name: name, src: src }),
+          );
           {
             ..acc,
             parsed: acc.parsed.push(if tested { o.parsed } else { untested(o.parsed) }),
@@ -4984,10 +5074,24 @@ fn pulling(
             acc.concat(homes_called(name, start(src).input, || declared)))
         },
         declared,
+        given,
       )
     }
   }
 }
+
+/// `source` parsed at `index` among a load's modules, or the parse of it `given` holds where that
+/// refused nothing, so where it stands among them is in no label of it.
+fn parsed_at(
+  given: List<ParsedSource>,
+  index: Int,
+  source: Source,
+) -> ParsedSource / {abort.raise} =
+  match given.find(|g: ParsedSource|
+      g.name == source.name && g.src == source.src && g.diags.len() == 0) {
+    Some(g) -> g,
+    None -> parse_at(index, source),
+  }
 
 /// What `want` beside a shipped module names among what the shipped modules hold: a module's text
 /// or a data file, each by its name among them.
@@ -5055,18 +5159,19 @@ fn data_known(data: List<ShippedData>) -> List<EmbedFile> =
 fn data_held(data: List<EmbedFile>) -> Map<Bytes, EmbedFile> =
   data.fold(Map::new(), |acc: Map<Bytes, EmbedFile>, d: EmbedFile| acc.insert(d.name, d))
 
-/// A pulled module parsed, with what it embeds written out from the shipped modules: no driver reads
-/// beside a module that has no file. What it embeds is asked of its text as the shipped modules hold
-/// it: read cut it may have no body left to ask, and the emitter may still lower the whole of it.
+/// A pulled module, parsed at `index` as `parsed`, with what it embeds written out from the shipped
+/// modules: no driver reads beside a module that has no file. What it embeds is asked of its text as
+/// the shipped modules hold it: read cut it may have no body left to ask, and the emitter may still
+/// lower the whole of it.
 fn shipped_embedded(
   whole: Map<Bytes, Bytes>,
   told: Map<Bytes, Pulls>,
   data: Map<Bytes, EmbedFile>,
   index: Int,
-  source: Source,
+  parsed: ParsedSource,
 ) -> { parsed: ParsedSource, embeds: List<EmbedAt> } / {abort.raise} = {
+  let source = { name: parsed.name, src: parsed.src };
   let text = match whole.get(source.name) { Some(t) -> t, None -> source.src };
-  let parsed = parse_at(index, source);
   let read = if text == source.src { parsed } else { with_hidden(parsed, told.get(source.name)) };
   let p = { ..read, src: text };
   if !names_embed(text) { { parsed: p, embeds: [] } } else {
@@ -5103,7 +5208,7 @@ pub fn parse_shipped(
     acc.insert(s.name, s.src));
   let held = data_held(data_known(data));
   range(0, modules.len()).map(|i: Int|
-    shipped_embedded(whole, Map::new(), held, i, modules.get(i)).parsed)
+    shipped_embedded(whole, Map::new(), held, i, parse_at(i, modules.get(i))).parsed)
 }
 
 /// `analyse` over `user` and the modules of `shipped` it imports, with those named in the order they
@@ -5218,8 +5323,9 @@ pub fn staged_pulling_std_with(
   };
   let told = pulls.fold(Map::new(), |acc: Map<Bytes, Pulls>, m: ModulePulls|
     acc.insert(m.name, m.pulls));
-  let texts = shipped.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
-    acc.insert(s.name, s.src));
+  // Every module imports `std.prelude`, which a caller handing in no shipped module leaves out.
+  let held = if unread.contains(prelude_module()) { shipped } else { with_prelude_source(shipped) };
+  let texts = held.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source| acc.insert(s.name, s.src));
   let sources = user.concat(clo.modules.map(|m: { pkg: Int, src: Source }| m.src));
   // A home asked already is pulled whatever calls it, so no source is read for a call to it.
   let declared = homes_declaring(|h: Bytes| if asked.contains(h) { None } else { texts.get(h) });
@@ -5230,12 +5336,7 @@ pub fn staged_pulling_std_with(
   let read = range(0, sources.len()).fold(
     { parsed: [], cuts: [] },
     |acc: { parsed: List<ParsedSource>, cuts: List<StubCuts> }, i: Int| {
-      let s = sources.get(i);
-      let p = match given.find(|g: ParsedSource|
-          g.name == s.name && g.src == s.src && g.diags.len() == 0) {
-        Some(g) -> g,
-        None -> { ..parse_at(i, s), src: s.src },
-      };
+      let p = parsed_at(given, i, sources.get(i));
       if tested { { ..acc, parsed: acc.parsed.push(p) } } else {
         {
           parsed: acc.parsed.push(untested(p)),
@@ -5261,9 +5362,10 @@ pub fn staged_pulling_std_with(
   let assembled = written.parsed;
   // The toolchain's own tree loads without its implicit self: every root module under `std`
   // with the whole shipped set among them is the built-in package's sources.
-  let listed = shipped.map(|s: Source| s.name).concat(unread);
+  let named = shipped.map(|s: Source| s.name).concat(unread);
+  let listed = named.concat(held.drop(shipped.len()).map(|s: Source| s.name));
   let toolchain = if apart { user.fold(true, |acc: Bool, s: Source| acc && is_std(s.name)) }
-  else { toolchain_tree(user.map(|u: Source| u.name), listed) };
+  else { toolchain_tree(user.map(|u: Source| u.name), named) };
   let x = pulling(
     assembled.len(),
     texts,
@@ -5276,6 +5378,7 @@ pub fn staged_pulling_std_with(
     texts.len(),
     asking,
     declared,
+    given,
   );
   let hashed = |parsed: List<ParsedSource>|
     match hashed_closure(
@@ -6094,7 +6197,10 @@ test "a program's tables made from its modules' facts, each shipped module's cut
   let answered = answered_program(
     facts,
     fixing,
-    Map::new().insert(b"std.shapes", shipped.get(0).src),
+    Map::new().insert(b"std.shapes", shipped.get(0).src).insert(
+      prelude_module(),
+      prelude_source::text(),
+    ),
     true,
     true,
     cut.warnings,
@@ -6289,6 +6395,17 @@ test "a carry follows a width into lists, maps, records, sum types, functions an
       { root: b"m.plain", params: [CPlain, CPlain], answer: CSum([]) },
       { root: b"m.apply", params: [CFn([CPlain], CVar(0)), CPlain], answer: CVar(0) },
       { root: b"m.sent", params: [CList(CWidth(0))], answer: CPlain },
+      // `wrap` reaches the prelude's `map`, generic over what it carries.
+      {
+        root: b"std.prelude.mapped_from",
+        params: [CList(CVar(0)), CFn([CVar(0)], CVar(1)), CPlain, CList(CVar(1))],
+        answer: CList(CVar(1)),
+      },
+      {
+        root: b"std.prelude.List::map",
+        params: [CList(CVar(0)), CFn([CVar(0)], CVar(1))],
+        answer: CList(CVar(1)),
+      },
     ],
   );
   assert_eq(effect_named(d, b"m.probe").ops.map(|o: OpRow| o.carries), [
@@ -6394,25 +6511,35 @@ test "a program's answer holds its warnings, its order, its packages and its mod
       fixes: [],
     },
   ]);
-  assert_eq(d.order, [b"m"]);
+  // Every module imports `std.prelude`, a shipped module, which sits one past the packages.
+  assert_eq(d.order, [b"std.prelude", b"m"]);
   assert_eq(d.packages, [
     { prefix: b"", deps: [] },
     { prefix: b"std", deps: [] },
     { prefix: b"compiler", deps: [b"std"] },
   ]);
-  assert_eq(d.module_packages, [0]);
+  assert_eq(d.module_packages, [0, 3]);
   assert_eq(d.modules, [
     {
       name: b"m",
       index: 0,
       items: [b"m.log", b"m.Shape", b"m.Dot", b"m.Line", b"m.say"],
-      imports: [],
+      imports: [prelude_module()],
       sets: [],
       // `say`'s body and the whole test, which a stub of the module blanks.
       cuts: [
         { start: 115, end: 126, braced: true, name: b"m.say", test: false },
         { start: 127, end: 152, braced: false, name: b"", test: false },
       ],
+    },
+    // A shipped module's types are read whatever the program reaches.
+    {
+      name: prelude_module(),
+      index: 1,
+      items: [b"std.prelude.ListNode", b"std.prelude.MapNode"],
+      imports: [],
+      sets: [],
+      cuts: [],
     },
   ])
 }
@@ -6601,6 +6728,7 @@ test "a hash row carries the definition's hash, its own form and its references,
 test "the ordinals list every fn, test and law in source order" {
   assert_eq(dump_of(analyse(parse_all(program()))).ordinals, [
     { module: b"m", items: [b"fn m.say", b"test m.says"] },
+    { module: prelude_module(), items: [] },
   ])
 }
 
@@ -6633,6 +6761,7 @@ test "a definition's row holds its row aliases and each clause with its kind, in
   assert_eq(inc.literals, [b"int 0"]);
   assert_eq(d.ordinals, [
     { module: b"m", items: [b"fn m.say", b"fn m.inc requires,ensures", b"law m.inc grows"] },
+    { module: prelude_module(), items: [] },
   ])
 }
 
@@ -6697,7 +6826,12 @@ test "a type's row holds its arity and its visibility" {
   assert_eq(
     dump_of(analyse(parse_all(written()))).types.map(|t: TypeRow|
       { name: t.name, module: t.module, public: t.public, arity: t.arity }),
-    [{ name: b"m.Pair", module: b"m", public: true, arity: 2 }],
+    [
+      { name: b"m.Pair", module: b"m", public: true, arity: 2 },
+      // `std.prelude`'s own, which no other module names.
+      { name: b"std.prelude.ListNode", module: b"std.prelude", public: false, arity: 1 },
+      { name: b"std.prelude.MapNode", module: b"std.prelude", public: false, arity: 2 },
+    ],
   )
 }
 
@@ -6759,6 +6893,7 @@ test "a law's row holds its binders with their spans and types, and its hashes c
         atoms: [{ effect: b"m.log", resource: RSingleton, mode: MWrite, op: None }],
       },
     ],
+    [],
   ]);
   let law = match d.hashes.fold(None, |acc: Option<ItemHashRow>, h: HashFrame|
       match h { HLaw(r) -> Some(r), _ -> acc }) {
@@ -6915,7 +7050,9 @@ test "a program reads of a shipped module the functions it reaches and the names
   let cut = analyse_pulling_std_with(user, reached_fixture(), no_rows());
   assert_eq(def_names(cut), [b"m.f", b"std.r.imported", b"std.r.used", b"std.s.helper"]);
   let whole = analyse_pulling_std_with(user, reached_fixture(), no_rows(), reached: false);
-  assert_eq(def_names(whole), [
+  // `std.prelude` is read whole too, which every module imports.
+  assert(def_names(whole).contains(b"std.prelude.mapped_from"), None);
+  assert_eq(def_names(whole).filter(|n: Bytes| module_of_root(n) != prelude_module()), [
     b"m.f",
     b"std.r.imported",
     b"std.r.unused",
@@ -7107,7 +7244,7 @@ fn view_names(v: ShippedView) -> List<Bytes> =
 test "a load's view of a shipped module is its form and the functions the program reached" {
   let user = [{ name: b"m", src: b"import std.r (used, imported)\npub fn f() -> Int = used()\n" }];
   let viewed = analyse_pulling_std_with(user, reached_fixture(), no_rows()).viewed;
-  assert_eq(viewed.map(|v: ShippedView| v.module), [b"std.r", b"std.s"]);
+  assert_eq(viewed.map(|v: ShippedView| v.module), [prelude_module(), b"std.r", b"std.s"]);
   assert_eq(view_names(view_named(viewed, b"std.r")), [b"std.r.imported", b"std.r.used"]);
   assert_eq(view_names(view_named(viewed, b"std.s")), [b"std.s.helper"]);
   assert_eq(view_named(viewed, b"std.s").text, hex(blake3(reached_fixture().get(1).src)));
@@ -7138,6 +7275,51 @@ test "a load's view of a shipped module is its form and the functions the progra
   }
 }
 
+test "every load reads `std.prelude`, keeping the functions it writes in Ply that the load reaches" {
+  let viewed = |src: Bytes|
+    analyse_pulling_std_with([{ name: b"m", src: src }], [], no_rows()).viewed;
+  let mapping = viewed(b"pub fn f(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + 1)\n");
+  assert_eq(mapping.map(|v: ShippedView| v.module), [prelude_module()]);
+  assert_eq(view_names(view_named(mapping, prelude_module())), [
+    b"std.prelude.List::map",
+    b"std.prelude.mapped_from",
+  ]);
+  assert_eq(view_names(view_named(viewed(b"pub fn g() -> Int = 1\n"), prelude_module())), [])
+}
+
+test "the prelude's bodies call its externs and its own functions of a type by the names it declares" {
+  let src = Bytes::concat_all([
+    b"extern fn List::at<a>(xs: List<a>, i: Int) -> Option<a>\n",
+    b"extern fn List::len<a>(xs: List<a>) -> Int\n",
+    b"fn walked<a>(xs: List<a>, i: Int) -> Int = match xs.at(i) { Some(_) -> walked(xs, i + 1), None -> i }\n",
+    b"pub fn List::count<a>(xs: List<a>) -> Int = walked(xs, 0) + xs.len() + List::len(xs)\n",
+    b"pub fn List::twice<a>(xs: List<a>) -> Int = xs.count() + List::count(xs)\n",
+  ]);
+  match analyse(parse_all([{ name: prelude_module(), src: src }])) {
+    Refused(ds) -> panic(String::of_bytes_lossy(Bytes::join(ds.map(|d: Diag| d.message), b"; "))),
+    Analysed(w) ->
+      assert_eq(
+        w.checked.defs.map(|d: DefInfo| d.name).filter(|n: Bytes| n.index_of(b"::") != None),
+        [b"std.prelude.List::count", b"std.prelude.List::twice"],
+      ),
+  }
+}
+
+test "a function `std.prelude` writes in Ply is checked at the scheme its callers read" {
+  let src = b"pub fn g(xs: List<Int>) -> Int = xs.map(|x: Int| x + 1).filter(|x: Int| x > 2).fold(0, |a: Int, x: Int| a + x)\n";
+  match analyse(parse_all([{ name: b"m", src: src }])) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> {
+      let checked = w.checked.defs.fold(Map::new(), |acc: Map<Bytes, Scheme>, d: DefInfo|
+        acc.insert(d.name, d.scheme));
+      let bodied = builtins().filter(|b: Builtin| b.body);
+      assert(bodied.len() > 0, None);
+      bodied.fold((), |u: Unit, b: Builtin|
+        assert_eq(checked.get(qualify(prelude_module(), b.name)), Some(b.scheme)))
+    },
+  }
+}
+
 test "a function nothing reaches leaves a view's form alone and a type moves it" {
   let user = [{ name: b"m", src: b"import std.r (used)\npub fn f() -> Int = used()\n" }];
   let with_s = |text: Bytes|
@@ -7163,7 +7345,7 @@ test "the shipped modules a program imports follow it a round at a time, each ro
     [{ name: b"m", src: b"import std.b\nimport std.a\npub fn f() -> Int = 1" }],
     shipped_modules(),
   );
-  assert_eq(a.pulled, [b"std.a", b"std.b", b"std.c"]);
+  assert_eq(a.pulled, [b"std.a", b"std.b", b"std.prelude", b"std.c"]);
   assert_eq(a.dump.diags, []);
   assert(a.dump.order.len() > 0)
 }
@@ -7182,7 +7364,7 @@ test "an import of a module that does not ship is reported at the import, listin
       text: b"",
       message: b"no module named `std.e` ships with this compiler",
       notes_text: [
-        b"the stdlib holds: `std.a`, `std.b`, `std.c`, `std.d`",
+        b"the stdlib holds: `std.a`, `std.b`, `std.c`, `std.d`, `std.prelude`",
         b"`ply std` lists them with the digest this binary was built from",
       ],
       severity: b"error",
@@ -7262,15 +7444,24 @@ test "a load asked for a shipped module reads and pulls it, and what it imports,
       reached: false,
       asked: asked,
     );
-  assert_eq(pulling(p.shipping.asked).pulled, [b"std.a", b"std.b", b"std.d", b"std.c"]);
-  assert_eq(pulling([]).pulled, [b"std.b"])
+  assert_eq(pulling(p.shipping.asked).pulled, [
+    b"std.a",
+    b"std.b",
+    b"std.d",
+    b"std.prelude",
+    b"std.c",
+  ]);
+  assert_eq(pulling([]).pulled, [b"std.b", b"std.prelude"])
 }
 
 test "an asked module's tests are in a load that reads it whole, and in none that only imports another" {
   let user = [{ name: b"m", src: b"pub fn f() -> Int = 1\n" }];
+  // `std.prelude`, which every load pulls, is read whole with its tests wherever the load reads the
+  // library whole.
   let tests_of = |p: Pulled|
     match p.out {
-      Analysed(w) -> w.checked.tests.map(|t: TestInfo| t.key),
+      Analysed(w) ->
+        w.checked.tests.filter(|t: TestInfo| t.module != prelude_module()).map(|t: TestInfo| t.key),
       Refused(diags) -> diags.map(|d: Diag| d.message),
     };
   let asked = analyse_pulling_std_with(
@@ -7280,10 +7471,10 @@ test "an asked module's tests are in a load that reads it whole, and in none tha
     reached: false,
     asked: [b"std.r"],
   );
-  assert_eq(asked.pulled, [b"std.r", b"std.s"]);
+  assert_eq(asked.pulled, [prelude_module(), b"std.r", b"std.s"]);
   assert_eq(tests_of(asked), [b"std.r.r holds"]);
   let plain = analyse_pulling_std_with(user, reached_fixture(), no_rows(), reached: false);
-  assert_eq(plain.pulled, []);
+  assert_eq(plain.pulled, [prelude_module()]);
   assert_eq(tests_of(plain), [])
 }
 
@@ -7458,7 +7649,7 @@ test "a shipped compiler module is pulled in under the compiler's root" {
     [{ name: b"m", src: b"import compiler.a (first)\npub fn f() -> Int = first()" }],
     compiler_shipped(),
   );
-  assert_eq(a.pulled, [b"compiler.a", b"compiler.b"]);
+  assert_eq(a.pulled, [b"compiler.a", prelude_module(), b"compiler.b"]);
   assert_eq(a.dump.diags, []);
   assert_eq(a.dump.defs.filter(|row: DefRow| row.name == b"compiler.a.first").len(), 1)
 }
@@ -7484,7 +7675,7 @@ test "library modules read apart pull the compiler's modules they import, and wh
   let all = library_over_compiler();
   let own = all.filter(|s: Source| s.name == b"std.base" || s.name == b"std.reader");
   let pulled = analyse_shipped(own, all, []);
-  assert_eq(pulled.pulled, [b"compiler.a", b"compiler.b", b"std.deep"]);
+  assert_eq(pulled.pulled, [b"compiler.a", prelude_module(), b"compiler.b", b"std.deep"]);
   let d = dump_of(pulled.out);
   assert_eq(d.diags, []);
   assert_eq(d.defs.map(|row: DefRow| row.name), [
@@ -7495,7 +7686,7 @@ test "library modules read apart pull the compiler's modules they import, and wh
     b"std.deep.two",
   ]);
   assert_eq(d.packages, [{ prefix: b"", deps: [] }, { prefix: b"compiler", deps: [b"std"] }]);
-  assert_eq(d.module_packages, [0, 0, 1, 1, 2])
+  assert_eq(d.module_packages, [0, 0, 1, 2, 1, 2])
 }
 
 fn messages(d: Dump) -> List<Bytes> = d.diags.map(|diag: Diag| diag.message)
@@ -7516,13 +7707,13 @@ test "a shipped module importing outside the shipped ones is placed in that modu
   let a = pulled_answer([{ name: b"m", src: b"import std.x\npub fn f() -> Int = 1" }], [
     { name: b"std.x", src: b"import m\npub fn x() -> Int = 1" },
   ]);
-  assert_eq(a.pulled, [b"std.x"]);
+  assert_eq(a.pulled, [prelude_module(), b"std.x"]);
   let said = a.dump.diags.filter(|diag: Diag|
     diag.message == b"the shipped module `std.x` imports `m`, which this build does not ship");
   assert_eq(said.map(|diag: Diag| diag.labels), [
     [
       {
-        module: 1,
+        module: 2,
         start: 7,
         end: 8,
         primary: true,
@@ -7550,7 +7741,7 @@ fn def_named(d: Dump, name: Bytes) -> DefRow / {abort.raise} =
 
 test "the answer's rows hold each type and row as the checker's value" {
   let a = pulled_answer(answered(), shipped_modules());
-  assert_eq(a.pulled, [b"std.b"]);
+  assert_eq(a.pulled, [b"std.b", prelude_module()]);
   let same = def_named(a.dump, b"base.same");
   assert_eq(same.footprint, []);
   let write: Atom = { effect: b"base.log", resource: RSingleton, mode: MWrite, op: None };
@@ -7564,7 +7755,7 @@ test "the answer's rows hold each type and row as the checker's value" {
 test "a refused program's answer is its diagnostics, placed where it went wrong, with no rows" {
   let bad = [{ name: b"m", src: b"fn f() -> Int = \"x\"" }];
   let a = pulled_answer(bad, []);
-  assert_eq(a.pulled, []);
+  assert_eq(a.pulled, [prelude_module()]);
   assert_eq(a.dump.diags, [
     {
       code: b"E0201",
@@ -7959,7 +8150,9 @@ test "every body is filed under the hash it verifies as, a cycle's members inclu
 
 /// Hashed without being checked, so a program that no longer compiles still has hashes to compare.
 fn hash_of(sources: List<Source>, name: Bytes) -> Bytes / {abort.raise} =
-  match resolve_modules(parse_all(sources).map(|parsed: ParsedSource| parsed.module)) {
+  match resolve_modules(
+      parse_all(with_prelude_source(sources)).map(|parsed: ParsedSource| parsed.module),
+    ) {
     ResolveFailed(_) -> b"",
     ResolveSucceeded(x) -> match by_name(hash_index(build_index(x.mods, x.r).index).defs).get(
         name,
@@ -8025,8 +8218,8 @@ test "a project's manifest is checked ahead of the program and carried decoded" 
     Analysed(_) -> assert(false),
     Refused(ds) -> {
       assert_eq(ds.get(0).code, b"E0129");
-      // One module of program text, so the manifest's label points one past it.
-      assert_eq(ds.get(0).labels.get(0).module, 1)
+      // The program's module and `std.prelude`, so the manifest's label points past them.
+      assert_eq(ds.get(0).labels.get(0).module, 2)
     },
   };
   match analyse_with(parse_all(program()), no_rows()) {
@@ -8408,7 +8601,7 @@ test "a shipped module embeds what the shipped modules hold beside it, and other
   let over = |note: Bytes| pulled_answer(user, [embedding, { name: b"std.note", src: note }]);
   let one = over(b"one");
   assert_eq(one.dump.diags, []);
-  assert_eq(one.pulled, [b"std.deep.a"]);
+  assert_eq(one.pulled, [b"std.deep.a", prelude_module()]);
   assert_eq(one.dump.embeds, [
     { module: b"std.deep.a", key: b"file:../note.ply", read: Ok([embed_file(b"", b"one")]) },
   ]);
@@ -8420,10 +8613,13 @@ test "a shipped module read as its stub still answers what the shipped modules' 
     { name: b"std.a", src: b"pub fn text() -> Bytes = embed(\"note.ply\")" },
     { name: b"std.note", src: b"one" },
   ].fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source| acc.insert(s.name, s.src));
-  let stub = shipped_embedded(whole, Map::new(), Map::new(), 0, {
-    name: b"std.a",
-    src: b"pub fn text() -> Bytes = b\"\"",
-  });
+  let stub = shipped_embedded(
+    whole,
+    Map::new(),
+    Map::new(),
+    0,
+    parse_at(0, { name: b"std.a", src: b"pub fn text() -> Bytes = b\"\"" }),
+  );
   assert_eq(stub.embeds, [
     { module: b"std.a", key: b"file:note.ply", read: Ok([embed_file(b"", b"one")]) },
   ])
@@ -8549,29 +8745,32 @@ test "a data file the shipped modules do not hold, or a path that leaves them, i
       Analysed(_) -> [],
       Refused(ds) -> ds.map(|d: Diag| { code: d.code, modules: d.labels.map(|l: Label| l.module) }),
     };
-  assert_eq(placed_at(over_words(src, [])), [{ code: b"E0146", modules: [1] }]);
+  assert_eq(placed_at(over_words(src, [])), [{ code: b"E0146", modules: [2] }]);
   let leaving = analyse_pulling_std_with(
     user,
     [words_module(b"../list.txt")],
     no_rows(),
     data: [{ name: b"list.txt", bytes: b"x" }, { name: b"std/list.txt", bytes: b"x" }],
   );
-  assert_eq(placed_at(leaving), [{ code: b"E0146", modules: [1] }]);
+  assert_eq(placed_at(leaving), [{ code: b"E0146", modules: [2] }]);
   let directory = analyse_pulling_std_with(
     user,
     [{ name: b"std.words", src: b"pub fn count() -> Int = embed_dir(\"words\").len()\n" }],
     no_rows(),
     data: words_data(b"one\n"),
   );
-  assert_eq(placed_at(directory), [{ code: b"E0146", modules: [1] }])
+  assert_eq(placed_at(directory), [{ code: b"E0146", modules: [2] }])
 }
 
 test "a shipped module read as its stub still answers the data file its text embeds" {
   let whole = Map::new().insert(b"std.words", words_module(b"words/list.txt").src);
-  let stub = shipped_embedded(whole, Map::new(), data_held(data_known(words_data(b"one\n"))), 0, {
-    name: b"std.words",
-    src: b"pub fn list() -> Bytes = b\"\"",
-  });
+  let stub = shipped_embedded(
+    whole,
+    Map::new(),
+    data_held(data_known(words_data(b"one\n"))),
+    0,
+    parse_at(0, { name: b"std.words", src: b"pub fn list() -> Bytes = b\"\"" }),
+  );
   assert_eq(stub.embeds, [
     { module: b"std.words", key: b"file:words/list.txt", read: Ok([embed_file(b"", b"one\n")]) },
   ])
@@ -8583,10 +8782,13 @@ test "a shipped module read as its stub answers what its text's read kept that i
     imports: [],
     wants: wants_by_item(parse(words_module(b"words/list.txt").src).node),
   });
-  let stub = shipped_embedded(whole, told, data_held(data_known(words_data(b"one\n"))), 0, {
-    name: b"std.words",
-    src: b"pub fn list() -> Bytes = b\"\"",
-  });
+  let stub = shipped_embedded(
+    whole,
+    told,
+    data_held(data_known(words_data(b"one\n"))),
+    0,
+    parse_at(0, { name: b"std.words", src: b"pub fn list() -> Bytes = b\"\"" }),
+  );
   assert_eq(stub.embeds.map(|e: EmbedAt| e.key), [b"file:words/list.txt"])
 }
 
@@ -8630,7 +8832,7 @@ test "a body read whole prints each call on a value as a call of what its check 
               { name: d.name, hash: d.hash, public: true }),
             [],
             [],
-            [],
+            [prelude_module()],
             apart,
           ) {
           Printed(ms) ->

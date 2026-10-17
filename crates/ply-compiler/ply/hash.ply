@@ -1,7 +1,8 @@
 //! Content addressing: a definition's identity is its normalized structure, so a name is never part of it.
 //! A float literal hashes by its IEEE bit pattern.
 
-import parsing (Span, Ident, QName, is_bare, bare, starts_upper, span_bin, dummy_span, span_key)
+import parsing (Span, Ident, QName, is_bare, bare, starts_upper, span_bin, dummy_span, span_key,
+                prelude_binder)
 import std.bin
 import lexer (widths, wide_decimal, utf8_of)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
@@ -12,7 +13,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
               EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign, Param, MatchArm,
               HandleClause, ReturnClause, HandlerVar, RecField, ETagged, Tagged, Hole,
-              tagged_parser, tagged_filler, NamedArg, expr_span)
+              tagged_parser, tagged_filler, NamedArg, expr_span, prelude_module)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
               Constraint, Deriver, deriver_tag, deriver_text, derivers, constraint_kinds,
@@ -428,16 +429,23 @@ fn target(
       None -> match of_module(binder) {
         None -> match ((ns, scope.types.get(binder))) {
           (0, Some(of)) -> Some({ owner: of.owner, name: member_name(of.name, name) }),
-          // A language type's are its home module's, where this module can see it.
+          // A language type's are the prelude's where it writes one in Ply, as the checker binds
+          // them, and else its home module's, where this module can see it.
           (0, None) -> {
             let home = b"std.".concat(Bytes::of_string(String::of_bytes(binder).ascii_lower()));
-            scope.sees.fold(None, |found: Option<Target>, k: Int|
-              match found {
-                Some(_) -> found,
-                None -> if index.mods.get(k).name == home {
-                  Some({ owner: k, name: member_name(binder, name) })
-                } else { None },
-              })
+            let member = member_name(binder, name);
+            let seen = |wanted: (Int) -> Bool / {abort.raise}|
+              scope.sees.fold(None, |found: Option<Target>, k: Int|
+                match found {
+                  Some(_) -> found,
+                  None -> if wanted(k) { Some({ owner: k, name: member }) } else { None },
+                });
+            match seen(|k: Int|
+                index.mods.get(k).name == prelude_module()
+                  && index.items.get(k).fns.contains(member)) {
+              Some(t) -> Some(t),
+              None -> seen(|k: Int| index.mods.get(k).name == home),
+            }
           },
           _ -> None,
         },
@@ -1613,12 +1621,19 @@ fn on_value(encoder: Encoder, at: Span, name: Ident, names: Bool) -> Encoder / {
 /// Where a check files what it found of a call on a value: the call's module and span.
 pub fn site_key(module: Int, at: Span) -> Bytes = u32_le(module).concat(span_key(at))
 
-/// What a check found of each call on a value `sites` record, by `site_key`. A call of a function
-/// a record holds in a field calls none of a type's.
+/// What a check found of each call on a value `sites` record, by `site_key`, each function by its
+/// program-wide name, as a call's candidates name it. A call of a function a record holds in a
+/// field calls none of a type's.
 pub fn called_at(sites: List<MemberSite>) -> Map<Bytes, Called> =
   sites.fold(Map::new(), |acc: Map<Bytes, Called>, x: MemberSite|
-    if x.callee == b"" { acc }
-    else { acc.insert(site_key(x.module, x.span), { callee: x.callee, named: x.named }) })
+    if x.callee == b"" { acc } else {
+      acc.insert(site_key(x.module, x.span), {
+        // The check names a function the prelude binds by its bare name.
+        callee: if x.qualifier == prelude_binder() { qualify(prelude_module(), x.callee) }
+        else { x.callee },
+        named: x.named,
+      })
+    })
 
 /// `called`, what a check found of a call on a value, as a choice among `candidates`: none where
 /// it found nothing or calls a function none of them is.
