@@ -245,15 +245,19 @@ test "strings and byte strings are compared by their bytes, constructors of no a
       b"fn s(a: String, b: String) -> Bool = a == b\n",
       b"fn bs(a: Bytes, b: Bytes) -> Bool = a != b\n",
       b"fn suit(a: Suit, b: Suit) -> Bool = a != b\n",
+      b"fn picked(c: Bool) -> Bool = { let x = if c { Hearts } else { Spades }; let y = if c { Spades } else { Hearts }; x == y }\n",
     ]),
   );
   assert_eq(applied(p, b"s"), Ok([{ op: b"bytes_eq", on: RWord }]));
   assert_eq(applied(p, b"bs"), Ok([{ op: b"bytes_ne", on: RWord }]));
+  // Parameters cross as their constructors' objects, compared by the constructor each header names.
+  assert_eq(applied(p, b"suit"), Ok([{ op: b"ctor_ne", on: RWord }]));
+  // Values held in the body are their constructors' indices, compared as two numbers.
   let suits = RCases({
     tagged: false,
     cases: [b"m.Hearts", b"m.Spades"].map(|n: Bytes| { name: n, leaves: [] }),
   });
-  assert_eq(applied(p, b"suit"), Ok([{ op: b"ne", on: suits }]))
+  assert_eq(applied(p, b"picked"), Ok([{ op: b"eq", on: suits }]))
 }
 
 test "an Option is compared as its payload's word, then its payload as its type compares" {
@@ -285,8 +289,8 @@ test "two values of a declared sum are compared and ordered through roots writte
     ]),
   );
   assert_eq(roots_called(p, b"same"), Ok([b"m.Shape#eq"]));
-  // The root answers a `Bool`'s word, opened where it is read, and negated for `!=`.
-  assert_eq(applied(p, b"apart"), Ok([{ op: b"not", on: RBool }]));
+  // The root answers a `Bool`'s word, which `!=` reads as not `true`'s own.
+  assert_eq(applied(p, b"apart"), Ok([{ op: b"untrue", on: RWord }]));
   assert_eq(roots_called(p, b"order"), Ok([b"m.Shape#cmp"]));
   assert_eq(applied(p, b"order"), Ok([]))
 }
@@ -411,22 +415,64 @@ test "a constant the pool holds is read into a variable of its type, a register'
   }
 }
 
-test "what the runtime answers at a type, until containers' runtime call, the family declines" {
+test "what C does not write at a type is the runtime's builtin, an encoding written by a root hashed" {
   let p = analysed(
     Bytes::concat_all([
+      b"type P = { x: Int, name: String }\n",
       b"fn h(x: Int) -> Bytes = digest(x)\n",
+      b"fn hr(x: P) -> Bytes = digest(x)\n",
       b"fn sat(a: U64, b: U64) -> U64 = a +| b\n",
       b"fn wi(a: Int, b: Int) -> Int = a +% b\n",
+      b"fn big(a: U128) -> Option<U128> = checked_neg(a)\n",
+    ]),
+  );
+  assert_eq([b"h", b"hr", b"sat", b"wi", b"big"].map(|n: Bytes| natives(p, n)), [
+    Ok([b"builtin_digest_p"]),
+    Ok([b"builtin_bytes_blake3_p"]),
+    Ok([b"builtin_saturating_add_p"]),
+    Ok([b"builtin_wrap_add_p"]),
+    Ok([b"builtin_checked_neg_p"]),
+  ]);
+  assert_eq(
+    roots_called(p, b"hr").map(|rs: List<Bytes>| rs.map(|r: Bytes| r.starts_with(b"m.digest#"))),
+    Ok([true]),
+  )
+}
+
+test "a width's checked arithmetic is exact in 64 bits, its answer `Some` where the width holds it" {
+  let p = analysed(
+    Bytes::concat_all([
+      b"fn add(a: U8, b: U8) -> Option<U8> = checked_add(a, b)\n",
+      b"fn mul(a: U32, b: U32) -> Option<U32> = checked_mul(a, b)\n",
+      b"fn neg(a: I16) -> Option<I16> = checked_neg(a)\n",
     ]),
   );
   assert_eq(
-    [b"h", b"sat", b"wi"].map(|n: Bytes|
-      match formed(p, n) {
-        Ok(_) -> false,
-        Err(no) -> no.by == Scalars && no.why.index_of(b"through_runtime") != None,
-      }),
-    [true, true, true],
-  )
+    applied(p, b"add"),
+    Ok([
+      { op: b"exact_add", on: width(8, false) },
+      { op: b"within", on: RInt },
+      { op: b"narrow", on: RInt },
+    ]),
+  );
+  // Only an unsigned 32-bit product needs the unsigned word.
+  assert_eq(
+    applied(p, b"mul"),
+    Ok([
+      { op: b"exact_mul", on: width(32, false) },
+      { op: b"le", on: width(64, false) },
+      { op: b"narrow", on: width(64, false) },
+    ]),
+  );
+  assert_eq(
+    applied(p, b"neg"),
+    Ok([
+      { op: b"exact_neg", on: width(16, true) },
+      { op: b"within", on: RInt },
+      { op: b"narrow", on: RInt },
+    ]),
+  );
+  assert_eq([b"add", b"mul", b"neg"].map(|n: Bytes| natives(p, n)), [Ok([]), Ok([]), Ok([])])
 }
 
 fn corpus() -> Bytes =
@@ -483,6 +529,9 @@ fn corpus() -> Bytes =
     b"fn flags(a: Bool) -> Bool = !a\n",
     b"type Pt = { x: Int, y: Int }\n",
     b"fn points(a: Pt, b: Pt) -> Bool = a == b\n",
+    b"fn hashed(x: Int) -> Bytes = digest(x)\n",
+    b"fn checked8(a: U8, b: U8) -> Option<U8> = checked_add(a, b)\n",
+    b"fn wrapped64(a: Int, b: Int) -> Int = a *% b\n",
   ])
 
 fn corpus_names() -> List<Bytes> =
@@ -536,6 +585,9 @@ fn corpus_names() -> List<Bytes> =
     b"same",
     b"flags",
     b"points",
+    b"hashed",
+    b"checked8",
+    b"wrapped64",
   ]
 
 /// Whether `f` holds a count anywhere: a check of it waits on the ownership pass.
@@ -558,38 +610,47 @@ test "the scalar corpus lowers, and every root that holds no count passes the ch
 test "the scalar corpus prints as today's emitter writes it, but where a decision differs on purpose" {
   let p = analysed(corpus());
   let today = answered_today(p, corpus_names());
-  // Each root whose C differs from today's by design, and the decision it differs by.
+  // Each root whose C differs from today's by a decision, and the decision; every other root's C
+  // must equal today's.
   let apart = [
     {
       name: b"quotient",
       why: b"today's emitter computes the negated divisor it then writes as a literal",
     },
-    { name: b"joined", why: b"a runtime call that can fail stores its failure site first" },
+    { name: b"joined", why: sited() },
     { name: b"ordered", why: ordering() },
     { name: b"sorted", why: ordering() },
     { name: b"wordered", why: ordering() },
     { name: b"bordered", why: ordering() },
     { name: b"dordered", why: ordering() },
     { name: b"cordered", why: ordering() },
-    { name: b"big", why: b"the runtime's operator code is an operand, spelled as a C literal" },
-    { name: b"bigeq", why: b"a runtime call that can fail stores its failure site first" },
+    { name: b"big", why: b"the runtime's operator code is an `Int` operand, written `INT64_C(0)`" },
+    { name: b"bigeq", why: sited() },
     {
       name: b"dec",
       why: b"a decimal literal is read into its two words, and a root of no parameter boxes it back",
     },
-    {
-      name: b"suited",
-      why: b"constructors of no argument compared by their index, each opened from its object",
-    },
-    { name: b"cards", why: b"`!=` negates the `Bool` the root's word opens to" },
+    { name: b"cards", why: b"a root's call stores its failure site first" },
     {
       name: b"ranked",
-      why: b"the root's `Ordering` opened to its index, an object again where answered",
+      why: b"the root's `Ordering` opened to its index, an object again where the root answers it",
     },
-    { name: b"generic", why: b"a runtime call that can fail stores its failure site first" },
+    { name: b"generic", why: sited() },
     {
       name: b"points",
-      why: b"fields compared in nested branches rather than one flag, read as `data` prints a read",
+      why: b"fields compared in nested branches rather than into one flag, the parts named apart",
+    },
+    {
+      name: b"hashed",
+      why: b"today's harness hands its emitter no builtins, so it refuses the call",
+    },
+    {
+      name: b"checked8",
+      why: b"the `Option` is made as its payload's word, where today's makes an object and opens it",
+    },
+    {
+      name: b"wrapped64",
+      why: b"the failure site is stored after the operands are made words, right before the call",
     },
   ];
   let differing = corpus_names().fold(
@@ -623,7 +684,9 @@ test "the scalar corpus prints as today's emitter writes it, but where a decisio
 }
 
 fn ordering() -> Bytes =
-  b"an order makes its `Ordering`'s index, with no failure site; today's harness has no tags"
+  b"an order makes its `Ordering`'s index, no failure site before it, an object where answered"
+
+fn sited() -> Bytes = b"a runtime call that can fail stores its failure site first"
 
 /// A root's C as two printers are held to each other: past the counts each takes and lets go, then
 /// past copies and numbering.
