@@ -323,7 +323,7 @@ fn target_of(
   let name = dotted(d);
   if shipped {
     let sibling = b"compiler.".concat(name);
-    if module.starts_with(b"compiler.") && !has_dot(name) && shipped_there(sibling) {
+    if module.starts_with(b"compiler.") && shipped_there(sibling) {
       { module: sibling, shipped: true, tested: false }
     } else { { module: name, shipped: true, tested: false } }
   } else {
@@ -5126,6 +5126,15 @@ fn groups_ran(run: Run, name: Bytes) -> List<GroupNamed> / {abort.raise} =
 fn group_in(module: Bytes, owners: List<Bytes>) -> GroupNamed =
   { module: module, shipped: false, tested: false, owners: owners }
 
+/// Each module the run ran the body of the query `name` for, a module's check or its hashing, in
+/// name order: by name, so a run over a module no test wrote fails saying which.
+fn modules_ran(run: Run, name: Bytes) -> List<Bytes> / {abort.raise} =
+  sorted_bytes(ran_for(run, name).map(|b: Bytes| decoded(b, named_bin(), "a module's name").module))
+
+/// Whether `a` and `b` hold the same groups, in whatever order the run ran them.
+fn same_groups(a: List<GroupNamed>, b: List<GroupNamed>) -> Bool =
+  a.len() == b.len() && b.all(|g: GroupNamed| a.contains(g))
+
 /// What a load answered: each module's answer, what hashing fixed of each, the warnings its root
 /// modules answered, and what each read of a pack below it answered, in order.
 type Load = {
@@ -5460,7 +5469,7 @@ fn layered(lib: Bytes) -> List<Source> =
 test "a run over an unchanged program runs no query again" {
   let sources = layered(b"pub fn step(n: Int) -> Int = n + 1\n");
   let cold = answered_over(nothing_held(), sources);
-  assert_eq(ran_of(cold.run, module_query()), 3);
+  assert_eq(modules_ran(cold.run, module_query()), [b"app", b"aside", b"lib"]);
   assert_eq(ran_total(answered_over(cold.held, sources).run), 0)
 }
 
@@ -5471,7 +5480,7 @@ test "a body edit checks its own definition again and none that reads it" {
   let after = layered(b"pub fn step(n: Int) -> Int = n * 4\n");
   let warm = answered_over(answered_over(nothing_held(), before).held, after);
   assert_eq(groups_ran(warm.run, group_query()), [group_in(b"lib", [b"step"])]);
-  assert_eq(ran_of(warm.run, module_query()), 1);
+  assert_eq(modules_ran(warm.run, module_query()), [b"lib"]);
   assert_eq(said(warm.outcome), said(analyse(parse_all(after))))
 }
 
@@ -5722,7 +5731,7 @@ test "owners that only mention one another are a unit of groups: a body edited w
   let calling = lengths(b"xs.len() + 0", b"Stack(f).len()");
   let called = answered_over(warm.held, calling);
   assert_eq(owners_ran(called.run, typed_query()), [b"Queue::len"]);
-  assert_eq(ran_of(called.run, cycles_query()), 1);
+  assert_eq(groups_ran(called.run, cycles_query()).map(|g: GroupNamed| g.module), [b"lib"]);
   assert_eq(said(called.outcome), said(analyse(parse_all(calling))));
   // What the called group settles is its caller's to read: the caller is not walked again.
   let moved = lengths(b"0", b"Stack(f).len()");
@@ -5747,7 +5756,7 @@ test "a signature edit checks the definitions that read it again, and no other" 
     group_in(b"lib", [b"step"]),
     group_in(b"app", [b"go"]),
   ]);
-  assert_eq(ran_of(warm.run, module_query()), 2);
+  assert_eq(modules_ran(warm.run, module_query()), [b"app", b"lib"]);
   assert_eq(said(warm.outcome), said(analyse(parse_all(layered(widened)))))
 }
 
@@ -5965,9 +5974,13 @@ test "the groups a signature edit moves in one module are checked again, and no 
   let widened = spread(b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n");
   let warm = answered_over(cold.held, widened);
   let ran = groups_ran(warm.run, group_query());
-  assert_eq(ran.len(), 3);
-  assert(ran.contains(group_in(b"app", [b"go"])));
-  assert(ran.contains(group_in(b"app", [b"again"])));
+  assert(
+    same_groups(ran, [
+      group_in(b"lib", [b"step"]),
+      group_in(b"app", [b"go"]),
+      group_in(b"app", [b"again"]),
+    ]),
+  );
   assert_eq(said(warm.outcome), said(analyse(parse_all(widened))));
   assert_eq(tables_of(warm.answers), tables_of(answered_over(nothing_held(), widened).answers));
   assert_eq(warm.answers, answered_over(nothing_held(), widened).answers)
@@ -6030,7 +6043,9 @@ test "where only what puts a module together is defined anew, its groups stand a
   );
   // Every query's hash names the run's stamp, so the store vouches for nothing to this one.
   let warm = answered_under(qs, cold.held, sources);
-  assert_eq([ran_of(warm.run, module_query()), ran_of(warm.run, group_query())], [3, 0]);
+  assert(modules_ran(warm.run, module_query()).contains(b"app"));
+  assert(modules_ran(warm.run, module_query()).contains(b"lib"));
+  assert_eq(groups_ran(warm.run, group_query()), []);
   assert(!checked_whole_in(warm.held, anew, b"app"));
   assert_eq(warm.answers, cold.answers)
 }
@@ -6145,7 +6160,7 @@ test "a definition added is checked and hashed alone" {
   let warm = fixed_over(cold.held, added, []);
   assert_eq(groups_ran(warm.run, group_query()), [group_in(b"lib", [b"twice"])]);
   assert_eq(groups_ran(warm.run, group_hash_query()), [group_in(b"lib", [b"twice"])]);
-  assert_eq(ran_of(warm.run, hashes_query()), 1);
+  assert_eq(modules_ran(warm.run, hashes_query()), [b"lib"]);
   assert_eq(warm.fixing, fixed_over(nothing_held(), added, []).fixing)
 }
 
@@ -6158,7 +6173,7 @@ test "a body edit hashes the definitions that call it again, and no other" {
     group_in(b"lib", [b"step"]),
     group_in(b"app", [b"go"]),
   ]);
-  assert_eq(ran_of(warm.run, hashes_query()), 2);
+  assert_eq(modules_ran(warm.run, hashes_query()), [b"app", b"lib"]);
   assert_eq(warm.fixing, fixed_over(nothing_held(), edited, []).fixing)
 }
 
@@ -6181,8 +6196,8 @@ test "a definition added to a shipped module checks and hashes no module that im
   let cold = fixed_over(nothing_held(), user, shapes(b""));
   let added = shapes(b"pub fn spare() -> Int = 5\n");
   let warm = fixed_over(cold.held, user, added);
-  assert_eq(ran_of(warm.run, module_query()), 1);
-  assert_eq(ran_of(warm.run, hashes_query()), 1);
+  assert_eq(modules_ran(warm.run, module_query()), [b"std.shapes"]);
+  assert_eq(modules_ran(warm.run, hashes_query()), [b"std.shapes"]);
   assert_eq(warm.fixing, fixed_over(nothing_held(), user, added).fixing)
 }
 
@@ -6212,6 +6227,23 @@ test "answering the shipped modules names each one that refuses" {
   ]).value;
   assert_eq(refused.map(|x: Answered| x.module), [b"std.b"]);
   assert_eq(refused.map(|x: Answered| x.answer.refused.map(|d: Diag| d.code)), [[b"E0202"]])
+}
+
+test "a compiler module below the compiler's root imports a sibling below it by the sibling's dotted name" {
+  let shipped = [
+    { name: b"compiler.syntax.base", src: b"pub fn one() -> Int = 1\n" },
+    {
+      name: b"compiler.check.user",
+      src: b"import syntax.base (one)\n\npub fn two() -> Int = one() + one()\n",
+    },
+  ];
+  let refused = shipped_asked(shipped).value;
+  assert_eq(refused.map(|x: Answered| x.answer.refused.map(|d: Diag| d.code)), []);
+  let user = [
+    { name: b"main", src: b"import compiler.check.user (two)\npub fn main() -> Int = two()\n" },
+  ];
+  let f = fixed_over(nothing_held(), user, shipped);
+  assert_eq(f.answers.fold([], |acc: List<Diag>, a: Answered| acc.concat(a.answer.refused)), [])
 }
 
 /// The pack cut from `held`: what it holds of the queries a pack carries, over shipped files a
@@ -6357,15 +6389,15 @@ test "a load that refuses checks no module that imports a refused one, and no gr
     b"aside",
     b"lib",
   ]);
-  assert_eq(ran_of(cold.run, module_query()), 2);
-  assert_eq(ran_of(cold.run, group_query()), 0);
+  assert_eq(modules_ran(cold.run, module_query()), [b"aside", b"lib"]);
+  assert_eq(groups_ran(cold.run, group_query()), []);
   let mended = with_module(
     with_module(sources, b"lib", b"pub fn broken() -> Int = 3\n\npub fn fine() -> Int = 1\n"),
     b"aside",
     b"pub fn alone() -> Int = 4\n\npub fn other() -> Int = 2\n",
   );
   let warm = answered_over(cold.held, mended);
-  assert_eq(ran_of(warm.run, module_query()), 4);
+  assert_eq(modules_ran(warm.run, module_query()), [b"app", b"aside", b"lib", b"top"]);
   assert_eq(said(warm.outcome), said(answered_over(nothing_held(), mended).outcome))
 }
 

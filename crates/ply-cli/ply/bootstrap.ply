@@ -16,6 +16,7 @@ import program (Timed, front_of, timed_uncached_over, program_view)
 import queried
 import report (Answer, ok_code, compile_error, refused, reported)
 import sources (Project, shipped_names)
+import work
 import compiler.cc
 import compiler.cc (Toolchain, compilers, toolchain)
 import compiler.front (linked_of)
@@ -40,26 +41,38 @@ import std.process (process)
 import std.random (entropy)
 import std.time (time)
 import std.path (below_root, parent)
+import std.pkg (ToolchainParts, library_of)
 
-/// What a bootstrap is told: the checkout, the profile it compiles under, the runtime's library and
-/// where the `ply` it builds goes.
-pub type Options = { root: String, profile: String, library: String, out: String }
+/// What a bootstrap is told: the checkout and where its `ply.work` says its parts are, the profile
+/// it compiles under, the runtime's library and where the `ply` it builds goes.
+pub type Options = {
+  root: String,
+  toolchain: ToolchainParts,
+  profile: String,
+  library: String,
+  out: String,
+}
 
 /// `path` made absolute against the working directory `pwd`.
 fn absolute(pwd: String, path: String) -> String =
   if path.starts_with("/") { path } else if path == "." { pwd } else { pwd ++ "/" ++ path }
 
-fn options_of(flags: Flags) -> Options / {env.pwd[sys]} = {
+/// The checkout the line names, absolute.
+fn checkout_of(flags: Flags) -> String / {env.pwd[sys]} =
+  match flags.paths.at(0) { Some(r) -> r.absolute, None -> env.pwd[sys]() }
+
+fn options_of(flags: Flags, t: ToolchainParts) -> Options / {env.pwd[sys]} = {
   let pwd = env.pwd[sys]();
-  let root = match flags.paths.at(0) { Some(r) -> r.absolute, None -> pwd };
+  let root = checkout_of(flags);
   let profile = match flags.profile { Some("release") -> "release", _ -> "development" };
   let target = root ++ "/target/" ++ (if profile == "release" { "release" } else { "debug" });
   {
     root: root,
+    toolchain: t,
     profile: profile,
     library: match flags.runtime {
       Some(l) -> absolute(pwd, l),
-      None -> target ++ "/libply_native.a",
+      None -> target ++ "/" ++ library_of(t),
     },
     out: match flags.out { Some(o) -> absolute(pwd, o), None -> target ++ "/ply" },
   }
@@ -72,11 +85,6 @@ fn nowhere(message: String) -> Diag =
 fn level_of(profile: String) -> String = if profile == "release" { "-O2" } else { "-O0" }
 
 // --- The checkout's shipped modules ---------------------------------------------------
-
-/// Where a checkout keeps the standard library, the compiler and the builtins it declares.
-fn std_dir() -> String = "crates/ply-std/ply"
-
-fn compiler_dir() -> String = "crates/ply-compiler/ply"
 
 /// One file a shipped root holds, by the name it is read under there, and the path a pack keeps it
 /// under.
@@ -105,25 +113,29 @@ fn files_below(
         }),
   }
 
-/// The checkout's shipped modules and data, each as a shipped root names it and a pack keeps it:
-/// `std.hash.legacy.ply` for `hash/legacy.ply`, `std/<path>` for a data file, and
-/// `compiler.<stem>.ply` for a module of the compiler.
-fn shipping(root: String) -> List<Shipping> / {fs.read[abs], abort.raise} = {
-  let std_files = files_below(root, std_dir()).map(|f: { rel: String, bytes: Bytes }|
+/// The module a `.ply` file below a shipped root is, by its place there: `hash/legacy.ply` below
+/// the standard library is `std.hash.legacy`.
+fn module_at(prefix: String, rel: String) -> String / {abort.raise} =
+  prefix ++ "." ++ rel.slice(0, rel.len() - 4).replace("/", ".")
+
+/// The checkout's shipped modules and data, each as a shipped root names it and a pack keeps it,
+/// below the root the pack keeps the library's or the compiler's files under wherever the checkout
+/// keeps them: `std.hash.legacy.ply` for `hash/legacy.ply`, `std/<path>` for a data file, and
+/// `compiler.emit.roots.ply` for the compiler's `emit/roots.ply`. The compiler holds modules only.
+fn shipping(root: String, t: ToolchainParts) -> List<Shipping> / {fs.read[abs], abort.raise} = {
+  let std_files = files_below(root, t.std).map(|f: { rel: String, bytes: Bytes }| {
+    let path = native::std_root() ++ "/" ++ f.rel;
     if f.rel.ends_with(".ply") {
-      {
-        name: "std." ++ f.rel.slice(0, f.rel.len() - 4).replace("/", ".") ++ ".ply",
-        path: std_dir() ++ "/" ++ f.rel,
-        bytes: f.bytes,
-      }
-    } else { { name: "std/" ++ f.rel, path: std_dir() ++ "/" ++ f.rel, bytes: f.bytes } });
-  let compiler_files = files_below(root, compiler_dir()).fold(
+      { name: module_at("std", f.rel) ++ ".ply", path: path, bytes: f.bytes }
+    } else { { name: "std/" ++ f.rel, path: path, bytes: f.bytes } }
+  });
+  let compiler_files = files_below(root, t.compiler).fold(
     [],
     |acc: List<Shipping>, f: { rel: String, bytes: Bytes }|
-      if f.rel.ends_with(".ply") && !f.rel.contains("/") {
+      if f.rel.ends_with(".ply") {
         acc.push({
-          name: "compiler." ++ f.rel.slice(0, f.rel.len() - 4) ++ ".ply",
-          path: compiler_dir() ++ "/" ++ f.rel,
+          name: module_at("compiler", f.rel) ++ ".ply",
+          path: native::compiler_root() ++ "/" ++ f.rel,
           bytes: f.bytes,
         })
       } else { acc },
@@ -513,8 +525,8 @@ fn ply_built(
     ()
   };
   let ran = toolchain.ran(relative(builder), [
-    options.root ++ "/crates/ply-cli/ply",
-    "ply.main",
+    options.root ++ "/" ++ options.toolchain.cli,
+    options.toolchain.entry,
     front,
     manifest,
     memo,
@@ -774,23 +786,39 @@ pub fn run(
   flags: Flags,
 ) -> Answer / {Bootstraps, compilers.read[cc], env.pwd[sys], env.var[sys], shipped.definitions, env.bodies[sys], env.reused[sys], shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, abort.raise} = {
   let s = style_of(flags);
-  let options = options_of(flags);
-  let files = shipping(options.root);
-  let phases = env.var[sys]("PLY_C_PHASES") != None;
-  let built = match ((toolchain_for(options.profile), toolchain.scratch())) {
-    (Err(diags), _) -> Err(diags),
-    (_, None) -> failed("the toolchain's cache has no room to build in"),
-    (Ok(t), Some(work)) -> {
-      let result = bootstrapped(options, t, files, work, phases);
-      toolchain.cleared(work);
-      result
+  match work::toolchain(checkout_of(flags)) {
+    Err(unread) -> reported(s, "bootstrap", unread.diags, unread.places),
+    Ok(parts) -> {
+      let options = options_of(flags, parts);
+      let files = shipping(options.root, parts);
+      let phases = env.var[sys]("PLY_C_PHASES") != None;
+      let built = match ((toolchain_for(options.profile), toolchain.scratch())) {
+        (Err(diags), _) -> Err(diags),
+        (_, None) -> failed("the toolchain's cache has no room to build in"),
+        (Ok(t), Some(work)) -> {
+          let result = bootstrapped(options, t, files, work, phases);
+          toolchain.cleared(work);
+          result
+        },
+      };
+      match built {
+        Err(diags) -> reported(s, "bootstrap", diags, []),
+        Ok(b) -> wrote(options, b, phases),
+      }
     },
-  };
-  match built {
-    Err(diags) -> reported(s, "bootstrap", diags, []),
-    Ok(b) -> wrote(options, b, phases),
   }
 }
+
+fn placed_parts() -> ToolchainParts =
+  {
+    std: "lib/std",
+    std_tests: "tests/std",
+    compiler: "lib/compiler",
+    cli: "cli",
+    entry: "ply.main",
+    cli_tests: "tests/cli",
+    runtime: "ply-runtime",
+  }
 
 // A path outside the working directory is spelled under `abs` without its leading `/`.
 test "a checkout named outside the working directory is the path it names" {
@@ -803,13 +831,38 @@ test "a checkout named outside the working directory is the path it names" {
     machine: "/src/ply",
   };
   let options = handle {
-    options_of({ ..no_flags(), paths: [elsewhere] })
+    options_of({ ..no_flags(), paths: [elsewhere] }, placed_parts())
   } with {
     env.pwd[sys]() -> "/home/me",
   };
   assert_eq(options.root, "/src/ply");
-  assert_eq(options.library, "/src/ply/target/debug/libply_native.a");
+  assert_eq(options.library, "/src/ply/target/debug/libply_runtime.a");
   assert_eq(options.out, "/src/ply/target/debug/ply")
+}
+
+// The compiler's modules below its directory ship as its own do, so the compiler may keep a phase's
+// modules in a directory of their own.
+test "a checkout ships its library and compiler as the workspace places them, below the pack's roots" {
+  let tree = fs::mem_of([
+    { path: "repo/lib/std/a.ply", body: b"a" },
+    { path: "repo/lib/std/a/b.ply", body: b"b" },
+    { path: "repo/lib/std/a/words.txt", body: b"w" },
+    { path: "repo/lib/std/.ply-cache/kept", body: b"k" },
+    { path: "repo/lib/compiler/front.ply", body: b"f" },
+    { path: "repo/lib/compiler/emit/roots.ply", body: b"r" },
+    { path: "repo/lib/compiler/emit/notes.md", body: b"n" },
+  ]);
+  let files: List<Shipping> = fs::on_mem[abs](tree, || shipping("/repo", placed_parts())).value;
+  assert_eq(
+    files.map(|f: Shipping| f.name ++ " " ++ f.path ++ " " ++ String::of_bytes(f.bytes)).sort(),
+    [
+      "compiler.emit.roots.ply compiler/emit/roots.ply r",
+      "compiler.front.ply compiler/front.ply f",
+      "std.a.b.ply std/a/b.ply b",
+      "std.a.ply std/a.ply a",
+      "std/a/words.txt std/a/words.txt w",
+    ],
+  )
 }
 
 // The CI's first bootstrap writes below `target/stage1`, which no build made before it.

@@ -22,7 +22,7 @@ fn a_shipped_module_below_the_library_is_named_by_its_place() {
     let module = ModuleName::from_dotted("std.hash.legacy");
     assert_eq!(
         shipped_modules::source(&module).map(str::as_bytes),
-        Some(held("crates/ply-std/ply/hash/legacy.ply"))
+        Some(held("std/hash/legacy.ply"))
     );
     assert_eq!(
         shipped_modules::pseudo_path(&module),
@@ -36,10 +36,38 @@ fn a_shipped_module_below_the_library_is_named_by_its_place() {
     );
 }
 
+/// `compiler.emit.roots` is `emit/roots.ply` below the compiler, beside `compiler.front`.
+#[test]
+fn a_compiler_module_below_the_compiler_is_named_by_its_place() {
+    let names = shipped_modules::names();
+    assert!(names.iter().any(|n| n == "compiler.front"), "{names:?}");
+    assert!(
+        names.iter().any(|n| n == "compiler.emit.roots"),
+        "{names:?}"
+    );
+    let module = ModuleName::from_dotted("compiler.emit.roots");
+    assert_eq!(
+        shipped_modules::source(&module).map(str::as_bytes),
+        Some(held("compiler/emit/roots.ply"))
+    );
+    assert_eq!(
+        shipped_modules::pseudo_path(&module),
+        std::path::PathBuf::from("<compiler>/emit/roots.ply")
+    );
+    assert_eq!(
+        ply_machine::shipped::module_digest("compiler.emit.roots"),
+        Some(
+            blake3::hash(held("compiler/emit/roots.ply"))
+                .to_hex()
+                .to_string()
+        )
+    );
+}
+
 #[test]
 fn a_data_file_a_shipped_module_embeds_is_held_by_name_and_is_no_module() {
     let name = "std/oid/names.txt";
-    let bytes = held("crates/ply-std/ply/oid/names.txt");
+    let bytes = held("std/oid/names.txt");
     assert!(shipped_modules::data_names().iter().any(|n| n == name));
     assert_eq!(shipped_modules::data(name), Some(bytes));
     assert_eq!(

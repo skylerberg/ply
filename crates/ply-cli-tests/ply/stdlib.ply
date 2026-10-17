@@ -6,6 +6,7 @@ import harness (scratch, Ran, Source, project, program, write, in_memory, one, t
                 shown, Hermetic, Shipped, std_tree, std_data, module_in, StdModule, std_modules,
                 on_disk_shipping, on_disk_shipping_only, over_tree, spawned, assert_ok, codes,
                 with_prelude_shipped)
+import compiler.exprs (prelude_module)
 import compiler.front (shipped_data_wanted)
 import compiler.items (parse, Item, IFn, IType, IEffect, IEffectSet, ISchema, OpDef, is_pub)
 import compiler.lexer (lex, Identifier, Token, Punctuation, Keyword, EndOfInput)
@@ -187,8 +188,10 @@ test "a record with a `Uuid`'s field is no `Uuid`, and only `std.uuid` builds on
 
 test "a program importing nothing from std loads `std.prelude` alone, listed as any shipped module" {
   let answer = checked(app("fn f() -> Int = 1\n"));
-  assert_eq(items(at(answer, "modules")).map(|m: Json| str(at(m, "name"))), ["app", "std.prelude"]);
-  assert_eq(items(at(answer, "files")).map(str), ["app.ply", "<std>/prelude.ply"]);
+  let modules = items(at(answer, "modules"));
+  assert_eq(modules.map(|m: Json| str(at(m, "name"))), ["app", prelude()]);
+  assert_eq(items(at(answer, "files")).map(str), modules.map(|m: Json| str(at(m, "file"))));
+  assert(str(at(first(modules.drop(1)), "file")).starts_with("<std>/"), Some(shown(answer)));
   assert(
     items(at(answer, "definitions")).filter(|d: Json| str(at(d, "name")).starts_with("std.")).len()
       == 0,
@@ -197,10 +200,34 @@ test "a program importing nothing from std loads `std.prelude` alone, listed as 
   // What a call of `map` reaches of the prelude is its function written in Ply, read as a shipped
   // module's.
   let mapping = checked(app("pub fn f(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + 1)\n"));
-  assert(has_named(at(mapping, "definitions"), "std.prelude.List::map"), Some(shown(mapping)));
+  assert(has_named(at(mapping, "definitions"), prelude() ++ ".List::map"), Some(shown(mapping)));
   let listed = items(at(json_of(in_memory(app(""), ["std", "--json"])), "modules"));
-  assert(listed.any(|m: Json| str(at(m, "module")) == "std.prelude"), None)
+  assert(listed.any(|m: Json| str(at(m, "module")) == prelude()), None)
 }
+
+/// The module every module imports, as the compiler names it.
+fn prelude() -> String = String::of_bytes_lossy(prelude_module())
+
+/// The module each module of `sources` ships as, in name order.
+fn modules_of(sources: List<Source>) -> List<String> / {abort.raise} =
+  sources.filter(|s: Source| s.path.ends_with(".ply")).map(|s: Source|
+    s.path.slice(0, s.path.len() - 4)).sort(
+  )
+
+/// The modules a compiler that ships only `handed` ships beside them: those every module imports.
+fn beside(handed: List<Source>) -> List<String> / {abort.raise} = {
+  let own = modules_of(handed);
+  modules_of(with_prelude_shipped(handed)).filter(|m: String| !own.contains(m))
+}
+
+/// Whether `name` is a definition's, a test's or a claim's of one of `modules`.
+fn in_any(name: String, modules: List<String>) -> Bool =
+  modules.any(|m: String| name.starts_with(m ++ "."))
+
+/// How many times the texts of `sources` and `more` write any of `words`.
+fn written(sources: List<Source>, more: List<String>, words: List<String>) -> Int / {abort.raise} =
+  sources.map(|s: Source| s.text).concat(more).fold(0, |n: Int, text: String|
+    words.fold(n, |k: Int, word: String| k + text.split(word).len() - 1))
 
 test "a shipped module's definitions hash as a project's copy of them does" {
   scratch(|| {
@@ -375,12 +402,17 @@ test "a shipped module's tests are not a project's, and `--std` runs every shipp
     let listed = items(
       at(json_of(on_disk_shipping_only(["std", "--json"], two_shipped())), "modules"),
     );
-    assert_eq(listed.map(|m: Json| str(at(m, "module"))), ["std.idle", "std.kept", "std.prelude"]);
+    assert_eq(
+      listed.map(|m: Json| str(at(m, "module"))),
+      modules_of(with_prelude_shipped(two_shipped())),
+    );
     let shipped = listed.fold(0, |n: Int, m: Json| n + int(at(m, "tests")));
-    // `std.prelude`'s own tests are the toolchain's too, run beside the fixture's under `--std`.
+    // The tests of the modules every module imports are the toolchain's too, run beside the
+    // fixture's under `--std`.
     let prelude = listed.fold(0, |n: Int, m: Json|
-      if str(at(m, "module")) == "std.prelude" { n + int(at(m, "tests")) } else { n });
-    assert(shipped - prelude == 3, Some("the fixture ships three tests to hide"));
+      if beside(two_shipped()).contains(str(at(m, "module"))) { n + int(at(m, "tests")) }
+      else { n });
+    assert_eq(shipped - prelude, written(two_shipped(), [], ["\ntest \""]));
     program(keeping());
     let v = json_of(on_disk_shipping_only(["test", "--json"], two_shipped()));
     assert(int(path(v, ["selection", "total"])) == 1, Some(shown(v)));
@@ -394,8 +426,8 @@ test "a shipped module's tests are not a project's, and `--std` runs every shipp
     assert(int(path(all, ["selection", "selected"])) == shipped, Some(shown(all)));
     // Nothing imports `std.idle`: its tests are in the run, the one that reads its data file too.
     let keys = items(path(all, ["selection", "tests"])).map(|t: Json| str(at(t, "key")));
-    assert_eq(keys.filter(|k: String| k.starts_with("std.prelude.")).len(), prelude);
-    assert_eq(keys.filter(|k: String| !k.starts_with("std.prelude.")).sort(), [
+    assert_eq(keys.filter(|k: String| in_any(k, beside(two_shipped()))).len(), prelude);
+    assert_eq(keys.filter(|k: String| !in_any(k, beside(two_shipped()))).sort(), [
       "m.mine",
       "std.idle.the words are the file's",
       "std.idle.twice two is four",
@@ -575,23 +607,22 @@ test "a module beneath another ships under its place: listed in name order, docu
     let listed = items(
       at(json_of(on_disk_shipping_only(["std", "--json"], nested_shipped())), "modules"),
     );
-    assert_eq(listed.map(|m: Json| str(at(m, "module"))), [
-      "std.kept",
-      "std.kept.deep",
-      "std.prelude",
-    ]);
-    assert_eq(listed.map(|m: Json| items(at(m, "data")).map(|d: Json| str(at(d, "name")))), [
+    assert_eq(
+      listed.map(|m: Json| str(at(m, "module"))),
+      modules_of(with_prelude_shipped(nested_shipped())),
+    );
+    let handed = listed.filter(|m: Json| !beside(nested_shipped()).contains(str(at(m, "module"))));
+    assert_eq(handed.map(|m: Json| items(at(m, "data")).map(|d: Json| str(at(d, "name")))), [
       ["std/kept/list.txt"],
       ["std/kept/deep/words.txt"],
-      [],
     ]);
     let doc = on_disk_shipping_only(["doc", "std.kept.deep.two"], nested_shipped());
     assert(doc.code == 0 && said(doc).contains("One more than"), Some(said(doc)));
     let ran = json_of(on_disk_shipping_only(["test", "--std", "--json"], nested_shipped()));
     assert(int(at(ran, "exit_code")) == 0, Some(shown(ran)));
-    // `std.prelude`'s own tests run beside them.
+    // The tests of the modules every module imports run beside them.
     let keys = items(path(ran, ["selection", "tests"])).map(|t: Json| str(at(t, "key")));
-    assert_eq(keys.filter(|k: String| !k.starts_with("std.prelude.")).sort(), [
+    assert_eq(keys.filter(|k: String| !in_any(k, beside(nested_shipped()))).sort(), [
       "m.both",
       "std.kept.deep.two is two",
     ])
@@ -714,24 +745,16 @@ test "a shipped module's laws are not a project's, and `--std` proves every ship
     assert(owed(all, "std.idle") == 2, Some(shown(all)));
     // The coverage denominator is the project's definitions, not the stdlib's.
     assert(int(path(mine, ["coverage", "definitions"])) == 1, Some(shown(mine)));
-    // `--std` counts every shipped module's, the fixture's four and `std.prelude`'s, which no claim
-    // covers but `List::at`, `List::push` and `Map::entries`, which a claim that compares reaches,
-    // and `List::map`, `List::filter` and `List::fold`, whose own `cost` bounds are proved.
+    // `--std` counts every shipped module's: the fixture's four, of which no claim covers `words`,
+    // beside those of the modules every module imports, as a run over those alone counts them.
     let coverage = at(all, "coverage");
     let uncovered = items(at(coverage, "uncovered")).map(str);
-    let prelude = uncovered.filter(|n: String| n.starts_with("std.prelude.")).len();
-    let covered = [
-      "std.prelude.List::at",
-      "std.prelude.List::push",
-      "std.prelude.Map::entries",
-      "std.prelude.List::map",
-      "std.prelude.List::filter",
-      "std.prelude.List::fold",
-    ];
+    assert_eq(uncovered.filter(|n: String| !in_any(n, beside(two_shipped()))), ["std.idle.words"]);
+    program("");
+    let alone = json_of(on_disk_shipping_only(["prove", "--std", "--json"], []));
     assert(
-      prelude > 0 && !covered.any(|n: String| uncovered.contains(n))
-        && int(at(coverage, "definitions")) == 4 + prelude + covered.len(),
-      Some(shown(coverage)),
+      int(at(coverage, "definitions")) == 4 + int(path(alone, ["coverage", "definitions"])),
+      Some(shown(coverage) ++ "\n" ++ shown(at(alone, "coverage"))),
     )
   })
 }
@@ -805,20 +828,24 @@ fn holding_shipped() -> List<Source> =
 // what a whole one filed. Only a claim that is proved is filed, so every claim here is.
 test "a second whole `prove --std` answers every claim from the store, and a filtered one too" {
   scratch(|| {
-    program(
+    let mine =
       \\import std.kept
       \\
       \\pub fn size(xs: List<Int>) -> Int ensures result >= kept::one() - 1 = xs.len()
       \\
-    );
+    ;
+    program(mine);
     let first = json_of(on_disk_shipping_only(["prove", "--std", "--json"], holding_shipped()));
     let claims = int(path(first, ["summary", "obligations"]));
-    // The fixture's four, and the `cost` bounds `std.prelude` states, which `--std` proves too.
-    let prelude = items(at(first, "obligations")).filter(|o: Json|
-      str(at(o, "owner")).starts_with("std.prelude.")).len(
+    // The fixture's, and those the modules every module imports state, which `--std` proves too.
+    let imported = items(at(first, "obligations")).filter(|o: Json|
+      in_any(str(at(o, "owner")), beside(holding_shipped()))).len(
     );
+    let stated = |sources: List<Source>, more: List<String>|
+      written(sources, more, ["ensures ", "law \""]);
     assert(
-      prelude > 0 && claims == 4 + prelude && int(at(first, "cached")) == 0,
+      imported > 0 && claims == stated(holding_shipped(), [mine]) + imported
+        && int(at(first, "cached")) == 0,
       Some(shown(first)),
     );
     assert(int(path(first, ["summary", "proved"])) == claims, Some(shown(first)));
@@ -831,8 +858,9 @@ test "a second whole `prove --std` answers every claim from the store, and a fil
         holding_shipped(),
       ),
     );
+    let shared = stated(holding_shipped().filter(|s: Source| s.path == "std.counted.ply"), [mine]);
     assert(
-      int(path(share, ["summary", "obligations"])) == 3 && int(at(share, "cached")) == 3,
+      int(path(share, ["summary", "obligations"])) == shared && int(at(share, "cached")) == shared,
       Some(shown(share)),
     )
   })

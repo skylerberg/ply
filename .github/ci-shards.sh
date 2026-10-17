@@ -180,10 +180,10 @@ ACTIONS=(
   taiki-e/install-action
 )
 
-# The key the `ply` a run bootstrapped and the stage it left are kept under, and the source that says
-# what a bootstrap reads of a checkout (`toolchain_inputs`).
+# The key the `ply` a run bootstrapped and the stage it left are kept under, and the file that says
+# where a bootstrap reads a checkout's parts (`toolchain_inputs`).
 TOOLCHAIN_KEY=.github/actions/toolchain-key/action.yml
-TOOLCHAIN_BOOTSTRAP=crates/ply-cli/ply/bootstrap.ply
+TOOLCHAIN_WORKSPACE=ply.work
 
 # The path of the file a `package target test` triple names, for tests in `tests/`.
 test_source_file() {
@@ -668,11 +668,15 @@ lexical() {
   }'
 }
 
-# Each path of the repository a bootstrap reads Ply from, one a line: every path under `crates/` its
-# source names, and every package the manifest of one of those names by path, and theirs.
+# Each path of the repository a bootstrap reads Ply from, one a line: `ply.work`, the standard
+# library's, the compiler's and the program's trees it places, and every package the manifest of one
+# of those names by path, and theirs.
 toolchain_inputs() {
   local all prev dir rel
-  all=$(grep -oE '"/?crates/[^"]*"' "$root/$TOOLCHAIN_BOOTSTRAP" | tr -d '"' | sed 's|^/||' | LC_ALL=C sort -u)
+  all=$({
+    printf '%s\n' "$TOOLCHAIN_WORKSPACE"
+    sed -n -E 's/^[[:space:]]*(std|compiler|cli): "([^"]*)",?$/\2/p' "$root/$TOOLCHAIN_WORKSPACE"
+  } | LC_ALL=C sort -u)
   prev=
   while [[ $all != "$prev" ]]; do
     prev=$all
@@ -695,10 +699,11 @@ toolchain_inputs() {
 # input would stand for sources that moved, and one that hashed more would bootstrap for a change the
 # bootstrap never reads. An `embed` that leaves its tree is an input too, and must land in one.
 cmd_toolchain_inputs() {
-  local inputs keyed wanted path file rel target covered bad=0
+  local inputs trees keyed wanted path file rel target covered bad=0
   inputs=$(toolchain_inputs)
-  if [[ -z $inputs ]]; then
-    echo "FAIL: $TOOLCHAIN_BOOTSTRAP names no path under crates/, so the toolchain key is held to nothing" >&2
+  trees=$(grep -vxF -- "$TOOLCHAIN_WORKSPACE" <<< "$inputs" || true)
+  if [[ -z $trees ]]; then
+    echo "FAIL: $TOOLCHAIN_WORKSPACE places no part of the toolchain, so the toolchain key is held to nothing" >&2
     return 1
   fi
   keyed=$(grep -oh 'hashFiles([^)]*)' "$root/$TOOLCHAIN_KEY" | sed -e 's/.*hashFiles(//' -e 's/)$//' |

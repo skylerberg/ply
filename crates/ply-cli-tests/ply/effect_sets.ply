@@ -4,6 +4,10 @@
 
 import harness (scratch, program, in_memory, one, on_disk, said, stdout, json_of, at, nth, items,
                 str, int, shown, Hermetic, Shipped)
+import cli.report (count_of)
+import cli.signature (width, definition_lines, set_lines, provenance_lines, atom_texts)
+import compiler.types (Atom, Row, Scheme, RNamed, TyFn, named_type)
+import compiler.type_syntax (MRead, MWrite)
 import std.fs (MemFs)
 import std.json (Json, Null, Array, Str)
 import std.string
@@ -69,27 +73,74 @@ fn block(
   extra: List<String>,
 ) -> String / {Hermetic, Shipped, abort.raise, diverges} = module_block(types(one(source), extra))
 
-fn service_types() -> String =
-  \\   m m.ply
-  \\     effect store
-  \\       read all[r]() -> List<Int>
-  \\       write save[r](List<Int>) -> Unit
-  \\     table        : () -> List<Int>
-  \\     health       : () -> Int
-  \\     list_orders  : () -> Int
-  \\                    / {m.store.read[orders] bounded,
-  \\                       m.store.read[users] bounded}
-  \\     create_order : () -> Int
-  \\                    / {m.store.read[inventory] bounded,
-  \\                       m.store.read[orders] bounded,
-  \\                       m.store.write[orders] bounded,
-  \\                       m.store.read[users] bounded}
-  \\     audit        : () -> Int
-  \\                    / {m.store.read[audit] bounded,
-  \\                       m.store.write[audit] bounded}
+fn json_types(t: MemFs, extra: List<String>) -> Json / {Hermetic, Shipped, abort.raise, diverges} =
+  json_of(in_memory(t, extra.fold(["check", "--json"], List::push)))
+
+fn strings_at(j: Json, key: String) -> List<String> = items(at(j, key)).map(str)
+
+/// The definitions of module `m` a report lists, and none it reaches of a shipped module.
+fn own_definitions(report: Json) -> List<Json> =
+  items(at(report, "definitions")).filter(|d: Json| str(at(d, "name")).starts_with("m."))
+
+/// What module `m`'s block of the text must say that the `--json` report under the same flags says:
+/// each definition by name with its row's atoms and, under `--explain`, each set with its expansion
+/// and its uses, each alias a row was written as, what a row declares beyond what its body performs,
+/// and each place a body can raise. Where and how the text lays these out is `cli.signature`'s.
+fn said_of(report: Json) -> List<String> / {abort.raise} = {
+  let sets = items(at(nth(at(report, "modules"), 0), "effect_sets")).fold(
+    [],
+    |acc: List<String>, s: Json|
+      acc.concat([
+        "effect set " ++ str(at(s, "name")),
+        "used by " ++ count_of(int(at(s, "used_by")), "definition"),
+      ]).concat(
+        strings_at(s, "expansion"),
+      ),
+  );
+  own_definitions(report).fold(sets, |acc: List<String>, d: Json| {
+    let name = str(at(d, "name"));
+    let unperformed = strings_at(d, "declared_not_performed");
+    let undone = match unperformed {
+      [] -> [],
+      [atom, ..] -> ["declared, not performed: " ++ atom].concat(strings_at(d, "performed")),
+    };
+    acc.push(name.slice(2, name.len()) ++ " ").concat(strings_at(d, "atoms")).concat(
+      strings_at(d, "written_as").map(|alias: String| "{" ++ alias),
+    ).concat(
+      undone,
+    ).concat(
+      items(at(d, "raises")).map(|r: Json| "raises at " ++ str(at(r, "at"))),
+    )
+  })
+}
+
+/// `text` says everything `report` says, `said_of` names.
+fn carries(text: String, report: Json) -> Unit / {abort.raise} =
+  said_of(report).fold((), |u: Unit, fact: String|
+    assert(text.contains(fact), Some("`" ++ fact ++ "` is not in:\n" ++ text)))
 
 test "a service's per-endpoint footprints are legible in one command" {
-  assert_eq(block(service(), []), service_types())
+  let report = json_types(one(service()), []);
+  assert_eq(
+    own_definitions(report).map(|d: Json|
+      { name: str(at(d, "name")), atoms: strings_at(d, "atoms").sort() }),
+    [
+      { name: "m.table", atoms: [] },
+      { name: "m.health", atoms: [] },
+      { name: "m.list_orders", atoms: ["m.store.read[orders]", "m.store.read[users]"] },
+      {
+        name: "m.create_order",
+        atoms: [
+          "m.store.read[inventory]",
+          "m.store.read[orders]",
+          "m.store.read[users]",
+          "m.store.write[orders]",
+        ],
+      },
+      { name: "m.audit", atoms: ["m.store.read[audit]", "m.store.write[audit]"] },
+    ],
+  );
+  carries(block(service(), []), report)
 }
 
 test "the expansion is printed without a flag and the alias is not" {
@@ -102,58 +153,65 @@ test "the expansion is printed without a flag and the alias is not" {
   assert(text.contains("m.store.write[orders]"), Some(text))
 }
 
-// The width is fixed rather than the terminal's, because this output is diffed.
+// The width is fixed rather than the terminal's, because this output is diffed. The program's own
+// block, whose set table runs to the column, holds the command to the indent it lays out at.
 test "no signature line runs past the column it wraps at" {
-  [types(one(service()), []), types(one(service()), ["--explain"])].fold(
-    (),
-    |u: Unit, text: String|
-      text.split("\n").fold(u, |v: Unit, line: String|
-        assert(columns(line) <= 80, Some(columns(line).to_string() ++ " columns: " ++ line))),
-  )
+  [block(service(), []), block(service(), ["--explain"])].fold((), |u: Unit, text: String|
+    text.split("\n").fold(u, |v: Unit, line: String|
+      assert(columns(line) <= width(), Some(columns(line).to_string() ++ " columns: " ++ line))))
 }
 
-fn service_explained() -> String =
-  \\   m m.ply
-  \\     effect store
-  \\       read all[r]() -> List<Int>
-  \\       write save[r](List<Int>) -> Unit
-  \\
-  \\     effect set Reads
-  \\       = {m.store.read[orders], m.store.read[users]}
-  \\       used by 2 definitions
-  \\
-  \\     effect set Web
-  \\       = {m.store.read[inventory], m.store.read[orders], m.store.write[orders],
-  \\          m.store.read[users]}
-  \\       used by 1 definition
-  \\
-  \\     effect set Unused
-  \\       = {m.store.read[audit]}
-  \\       used by 0 definitions
-  \\
-  \\     table        : () -> List<Int>
-  \\     health       : () -> Int
-  \\     list_orders  : () -> Int
-  \\                    / {m.store.read[orders] bounded,
-  \\                       m.store.read[users] bounded}
-  \\       written as     / {Reads}
-  \\       body performs  {m.store.all[orders]}
-  \\       declared, not performed: m.store.read[users]
-  \\     create_order : () -> Int
-  \\                    / {m.store.read[inventory] bounded,
-  \\                       m.store.read[orders] bounded,
-  \\                       m.store.write[orders] bounded,
-  \\                       m.store.read[users] bounded}
-  \\       written as     / {Web}
-  \\       body performs  {m.store.all[inventory], m.store.all[orders],
-  \\                       m.store.save[orders]}
-  \\       declared, not performed: m.store.read[users]
-  \\     audit        : () -> Int
-  \\                    / {m.store.read[audit] bounded,
-  \\                       m.store.write[audit] bounded}
+/// Atom `i` of a row: a label of a few letters, or one wider than any line where `i` is 8 past a
+/// multiple of 9, so the rows hold atoms of many widths and some that no column fits.
+fn atom_at(i: Int) -> Atom =
+  {
+    effect: Bytes::of_string("e" ++ i.to_string()),
+    resource: RNamed(Bytes::of_string("r".repeat(if i % 9 == 8 { 90 } else { i * 7 % 23 + 1 }))),
+    mode: if i % 2 == 0 { MRead } else { MWrite },
+    op: None,
+  }
+
+fn scheme_of(row: Row) -> Scheme =
+  {
+    ty_vars: [],
+    row_vars: match row.tail { Some(v) -> [v], None -> [] },
+    label_vars: [],
+    ty: TyFn({ params: [named_type(b"Request")], ret: named_type(b"Response"), effects: row }),
+  }
+
+test "no line a row, a set or a provenance is laid out on runs past the column but one atom wider" {
+  let indent = 5;
+  let room = width() - indent;
+  range(1, 41).fold((), |u: Unit, n: Int| {
+    let atoms = range(0, n).map(atom_at);
+    let texts = atom_texts(atoms);
+    let laid = [
+      definition_lines(indent, 12, "create_order", scheme_of({ atoms: atoms, tail: None })),
+      definition_lines(indent, 12, "create_order", scheme_of({ atoms: atoms, tail: Some(3) })),
+      set_lines({ name: "Web", atoms: texts, used_by: n }, indent),
+      provenance_lines({ aliases: ["Web"], performed: Some(texts), unperformed: texts }, indent),
+    ].fold(
+      [],
+      List::concat,
+    );
+    laid.fold(u, |v: Unit, line: String| {
+      let held = texts.filter(|t: String| line.contains(t));
+      assert(
+        line.len() <= room || (held.len() == 1 && held.at_or(0, "").len() > room),
+        Some(line.len().to_string() ++ " columns, holding " ++ String::join(held, ", ")),
+      )
+    })
+  })
+}
 
 test "explain prints the set table, the alias and the difference it hides" {
-  assert_eq(block(service(), ["--explain"]), service_explained())
+  let report = json_types(one(service()), ["--explain"]);
+  assert_eq(
+    items(at(nth(at(report, "modules"), 0), "effect_sets")).map(|s: Json|
+      { name: str(at(s, "name")), used_by: int(at(s, "used_by")) }),
+    [{ name: "Reads", used_by: 2 }, { name: "Web", used_by: 1 }, { name: "Unused", used_by: 0 }],
+  );
+  carries(block(service(), ["--explain"]), report)
 }
 
 test "an included set counts the definitions that reach it" {
@@ -180,9 +238,6 @@ test "explain prints the same bytes on every run" {
     assert_eq(typed(), typed())
   })
 }
-
-fn json_types(t: MemFs, extra: List<String>) -> Json / {Hermetic, Shipped, abort.raise, diverges} =
-  json_of(in_memory(t, extra.fold(["check", "--json"], List::push)))
 
 test "the JSON report carries the provenance only under explain" {
   let plain = json_types(one(service()), []);
@@ -242,23 +297,12 @@ fn reads() -> String =
   \\pub fn wide(b: Bytes) -> Int / {abort.raise} = peek(b, 0)
   \\
 
-fn reads_explained() -> String =
-  \\   m m.ply
-  \\     peek      : (Bytes, Int) -> Int
-  \\     unguarded : (Bytes, Int) -> Int
-  \\                 / {abort.raise bounded}
-  \\       raises at m.ply:4:61: `Bytes::at` requires `0 <= i`, which nothing on the way shows
-  \\     shared    : (Int, Int) -> Int
-  \\                 / {abort.raise bounded}
-  \\       raises at m.ply:6:56: calls `m.unguarded`, whose row names the raise
-  \\       raises at m.ply:6:76: divides by a value nothing on the way shows is other than zero
-  \\     wide      : (Bytes) -> Int
-  \\                 / {abort.raise bounded}
-  \\       body performs  {}
-  \\       declared, not performed: abort.raise
-
 test "explain says where a body can raise and why, and which row names a raise no body makes" {
-  assert_eq(block(reads(), ["--explain"]), reads_explained())
+  let report = json_types(one(reads()), ["--explain"]);
+  let text = block(reads(), ["--explain"]);
+  carries(text, report);
+  assert(text.contains("`Bytes::at` requires `0 <= i`"), Some(text));
+  assert(text.contains("calls `m.unguarded`"), Some(text))
 }
 
 test "the JSON report files each raise with its place, its kind and the clause it misses" {

@@ -9,20 +9,22 @@ pub const JSON: &str = "pub type Json = | Null\n";
 
 /// The files this binary's pack holds, by their paths in it.
 pub const SHIPPED: &[(&str, &[u8])] = &[
-    ("crates/ply-std/ply/json.ply", JSON.as_bytes()),
+    ("std/json.ply", JSON.as_bytes()),
+    ("std/hash.ply", b"pub fn sha256(b: Bytes) -> Bytes = b\n"),
     (
-        "crates/ply-std/ply/hash.ply",
-        b"pub fn sha256(b: Bytes) -> Bytes = b\n",
-    ),
-    (
-        "crates/ply-std/ply/hash/legacy.ply",
+        "std/hash/legacy.ply",
         b"pub fn sha1(b: Bytes) -> Bytes = b\n",
     ),
     (
-        "crates/ply-std/ply/oid.ply",
+        "std/oid.ply",
         b"pub fn names() -> Bytes = embed(\"oid/names.txt\")\n",
     ),
-    ("crates/ply-std/ply/oid/names.txt", b"2.5.4.3 commonName\n"),
+    ("std/oid/names.txt", b"2.5.4.3 commonName\n"),
+    ("compiler/front.ply", b"pub fn one() -> Int = 1\n"),
+    (
+        "compiler/emit/roots.ply",
+        b"import front\npub fn two() -> Int = front::one() + 1\n",
+    ),
 ];
 
 /// `files` laid out as a pack: their bytes, the table ascending by path, the trailer.

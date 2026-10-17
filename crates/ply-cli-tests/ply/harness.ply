@@ -7,7 +7,7 @@
 
 import cli.ply (main)
 import cli.paths
-import cli.program (pkgs_of)
+import cli.program (pkgs_of, is_shipped)
 import cli.sources
 import cli.vcs
 import compiler.pkg
@@ -25,6 +25,7 @@ import cli.machine (machine, hermetic_machine, Options, unconfigured)
 import cli.replace (edit)
 import cli.surface (spec)
 import cli.tester (tester, hermetic_tester)
+import cli.work
 import compiler.cc
 import compiler.cc (compilers, toolchain)
 import std.bytes
@@ -45,7 +46,8 @@ import std.process (process, Var, Finished, Exited, Signalled, Captured, capture
                     Discard, Said, Signal, Kill, Terminate)
 import std.time (time)
 import std.value (Value, VCtor, VStr)
-import std.path (segments)
+import std.path (join, normalize, segments)
+import std.pkg (Dep, Manifest, Path, ToolchainParts, Workspace)
 import std.string
 import std.text (shell_join)
 
@@ -246,6 +248,38 @@ pub fn repo_file(path: String) -> String / {Repo, abort.raise} =
     None -> panic("the repository holds no `" ++ path ++ "`"),
   }
 
+/// What the repository's `ply.work` states: where each of its packages lies.
+pub fn workspace() -> Workspace / {Repo, abort.raise} =
+  match pkg::check_workspace(Bytes::of_string(repo_file(work::file()))).workspace {
+    Some(w) -> w,
+    None -> panic("the repository's `" ++ work::file() ++ "` checks"),
+  }
+
+/// Where the repository's `ply.work` places `ply`'s parts, each directory below the repository.
+pub fn parts() -> ToolchainParts / {Repo, abort.raise} =
+  match workspace().toolchain {
+    Some(t) -> t,
+    None -> panic("the repository's `" ++ work::file() ++ "` names the toolchain"),
+  }
+
+/// The `ply.pkg` of the repository's package at `dir`.
+fn manifest_at(dir: String) -> Manifest / {Repo, abort.raise} =
+  match pkg::check_source(Bytes::of_string(repo_file(dir ++ "/ply.pkg"))).manifest {
+    Some(m) -> m,
+    None -> panic("`" ++ dir ++ "/ply.pkg` checks"),
+  }
+
+/// The name the package at `dir`, below the repository, gives itself.
+pub fn package_name(dir: String) -> String / {Repo, abort.raise} = manifest_at(dir).name
+
+/// The directory below the repository of the package `ply.work` lists whose `ply.pkg` names it
+/// `name`.
+pub fn package_dir(name: String) -> String / {Repo, abort.raise} =
+  match workspace().packages.filter(|dir: String| package_name(dir) == name) {
+    [dir, ..] -> dir,
+    [] -> panic("`ply.work` lists no package named `" ++ name ++ "`"),
+  }
+
 /// The repository's examples, each file by its path below `examples/`.
 pub fn example_files() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../../examples")
 
@@ -330,19 +364,29 @@ pub fn warm_agrees(what: String) -> Json / {Reached, Hermetic, Shipped, abort.ra
   warm
 }
 
-/// How many modules a check took as the memo store kept them, and how many it checked again.
-pub type Seeding = { taken: Int, checked: Int }
+/// How many modules a check took as the memo store kept them, how many it checked again, and how
+/// many of the modules it loaded ship with the toolchain, which answers them.
+pub type Seeding = { taken: Int, checked: Int, shipped: Int }
 
 pub fn seeding() -> Seeding / {Reached, Shipped, abort.raise, diverges} = seeding_at(".")
 
 /// The same of the project at `dir`.
-pub fn seeding_at(dir: String) -> Seeding / {Reached, Shipped, abort.raise, diverges} =
-  items(
-    path(json_of(on_disk(["check", dir, "--json", "--explain"])), ["front_end", "queries"]),
-  ).fold({ taken: 0, checked: 0 }, |acc: Seeding, q: Json|
-    if str(at(q, "query")) == "module" {
-      { taken: int(at(q, "taken")), checked: int(at(q, "run")) }
-    } else { acc })
+pub fn seeding_at(dir: String) -> Seeding / {Reached, Shipped, abort.raise, diverges} = {
+  let report = json_of(on_disk(["check", dir, "--json", "--explain"]));
+  let shipped = items(at(report, "modules")).len() - own_modules(report).len();
+  items(path(report, ["front_end", "queries"])).fold(
+    { taken: 0, checked: 0, shipped: shipped },
+    |acc: Seeding, q: Json|
+      if str(at(q, "query")) == "module" {
+        { ..acc, taken: int(at(q, "taken")), checked: int(at(q, "run")) }
+      } else { acc },
+  )
+}
+
+/// The names of the modules a report lists that do not ship with the toolchain, in its order.
+pub fn own_modules(report: Json) -> List<String> =
+  items(at(report, "modules")).map(|m: Json| str(at(m, "name"))).filter(|name: String|
+    !is_shipped(name))
 
 /// A package as its manifest declares it: its prefix and the prefixes it depends on.
 pub type Package = { prefix: String, deps: List<String> }
@@ -375,13 +419,6 @@ pub fn manifest_closure(dir: String) -> Closure / {Reached, abort.raise, diverge
 }
 
 // --- The shipped modules -----------------------------------------------------
-
-/// Where the launcher's shipped modules come from: the modules this binary ships, as files.
-fn shipped_trees() -> List<{ prefix: String, dir: String }> =
-  [
-    { prefix: "std.", dir: "crates/ply-std/ply" },
-    { prefix: "compiler.", dir: "crates/ply-compiler/ply" },
-  ]
 
 /// The shipped modules as the launcher lays them out, one flat directory of `<dotted name>.ply`,
 /// with each module of `standing` this binary does not ship among them.
@@ -517,20 +554,26 @@ pub fn tree_digests() -> Bytes / {abort.raise} = {
 
 pub fn version() -> String / {Shipped} = shipped.version()
 
+/// The packages below the repository that the `ply.pkg` at `dir` names by a path.
+fn path_dependencies(dir: String) -> List<String> / {Repo, abort.raise} =
+  manifest_at(dir).dependencies.fold([], |acc: List<String>, d: Dep|
+    match d.source { Path(p) -> acc.push(normalize(join(dir, p))), _ -> acc })
+
 /// The packages the `ply` program run in this process is built from, beside the shipped modules it
-/// is handed.
-pub fn program_packages() -> List<String> =
-  [
-    "crates/ply-cli/ply",
-    "crates/ply-test/ply",
-    "crates/ply-sim/ply",
-    "crates/ply-store/ply",
-    "crates/ply-prove/ply",
-  ]
+/// is handed: the program's own and each its `ply.pkg` reaches by a path, below the repository.
+pub fn program_packages() -> List<String> / {Repo, abort.raise} =
+  iterate({ todo: [parts().cli], seen: [] }, 64, |s: { todo: List<String>, seen: List<String> }|
+    match s.todo {
+      [] -> Stop(s.seen),
+      [dir, ..rest] -> if s.seen.contains(dir) { Continue({ ..s, todo: rest }) }
+      else { Continue({ todo: rest.concat(path_dependencies(dir)), seen: s.seen.push(dir) }) },
+    })
 
 /// Every tree a `ply` binary ships: the shipped modules' and the program's.
-pub fn shipped_dirs() -> List<String> =
-  shipped_trees().map(|s: { prefix: String, dir: String }| s.dir).concat(program_packages())
+pub fn shipped_dirs() -> List<String> / {Repo, abort.raise} = {
+  let t = parts();
+  [t.std, t.compiler].concat(program_packages())
+}
 
 // --- In memory ---------------------------------------------------------------
 

@@ -20,6 +20,7 @@ of it next.
 
 | path | holds |
 | --- | --- |
+| `ply.work` | where each package below lies and which parts make `ply`: what `ply bootstrap` builds from and `ply work` prints |
 | `crates/ply-eval` | values, the evaluator, the scheduler and the simulator; spans, diagnostics and their codes; the program record the compiler answers with |
 | `crates/ply-codegen` | the C backend's runtime: loads a compiled unit, or the one an executable was linked with, and runs it |
 | `crates/ply-compiler` | the compiler written in Ply (`ply/`), with its builder (`build.main`) and the C compiling and linking it drives (`cc.ply`, `native.ply`) |

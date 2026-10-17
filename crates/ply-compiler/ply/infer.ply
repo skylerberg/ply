@@ -17031,73 +17031,133 @@ pub fn check_dumps(sources: List<Source>) -> Dumps / {abort.raise} = {
 
 // --- Tests ------------------------------------------------------------------
 
-test "a definition's scheme is generalized and its footprint inferred" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"pub fn id<a>(x: a) -> a = x\nfn two() -> Int = id(2)\neffect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)",
-    },
-  ]);
+test "the dump writes each definition, test, law, effect and constructor of a program in its fields" {
   assert_eq(
-    dump,
-    "K;1;F;m.id;<a>(a) -> a;;;;F;m.two;() -> Int;;;;F;m.say;(Bytes) -> Unit / {m.log.write};m.log.write;m.log.emit;;E;m.log;0;emit:write:0:Bytes:Unit;",
+    check_dump([
+      {
+        name: b"m",
+        src: b"effect log { write emit(Bytes) -> Unit }\ntype Box = | Box(Int)\nfn say<a>(x: a, b: Bytes) -> a / { log.write } where derivable(eq, a) = { log.emit(b); x }\ntest \"says\" { let _ = say(1, b\"x\"); () }\nlaw \"same\" forall (n: Int) where n > 0 { n == n }",
+      },
+    ]),
+    "K;1;F;m.say;<a>(a, Bytes) -> a / {m.log.write};m.log.write;m.log.emit;eq0;T;m.says;0;m.log.write;L;m.same;n:Int;1;;E;m.log;0;emit:write:0:Bytes:Unit;C;m.Box;m.Box;0;1;(Int) -> m.Box;",
   )
+}
+
+/// What `check_dump` checks of one module `m` holding `src`, which resolves.
+fn checked_m(src: Bytes) -> Checked / {abort.raise} =
+  match resolved_all([{ name: b"m", src: src }]) {
+    Err(refused) -> panic("`m` does not resolve: " ++ String::of_bytes_lossy(refused)),
+    Ok(x) -> check_program(x.r, x.mods),
+  }
+
+/// The checker of a check of `m` holding `src`, which checks.
+fn checker_m(src: Bytes) -> Checker / {abort.raise} = {
+  let out = checked_m(src);
+  assert(out.ok, Some(String::of_bytes_lossy(dump_outcome(out))));
+  out.checker
+}
+
+/// A definition as the dump writes its scheme, its footprint and what its body performs.
+type Defined = { scheme: Bytes, footprint: Bytes, performed: Bytes }
+
+fn info_of(checker: Checker, name: Bytes) -> DefInfo / {abort.raise} =
+  match checker.defs.filter(|d: DefInfo| d.name == name) {
+    [d, ..] -> d,
+    [] -> panic("no definition is named " ++ String::of_bytes_lossy(name)),
+  }
+
+fn defined(checker: Checker, name: Bytes) -> Defined / {abort.raise} = {
+  let d = info_of(checker, name);
+  {
+    scheme: scheme_text(d.scheme),
+    footprint: footprint_text(d.footprint),
+    performed: footprint_text(d.performed),
+  }
+}
+
+/// The scheme of the definition `name` in a check of `m` holding `src`.
+fn scheme_of(src: Bytes, name: Bytes) -> Bytes / {abort.raise} =
+  defined(checker_m(src), name).scheme
+
+/// Each diagnostic a check of `m` holding `src` raises: its code, then the source each of its labels
+/// covers, in the order it lists them.
+fn placed(src: Bytes) -> List<List<Bytes>> / {abort.raise} =
+  dedup_diags(checked_m(src).checker.diags).map(|diag: Diag|
+    [diag.code].concat(diag.labels.map(|label: Label| src.slice(label.start, label.end))))
+
+test "a definition's scheme is generalized and its footprint inferred" {
+  let c = checker_m(
+    b"pub fn id<a>(x: a) -> a = x\nfn two() -> Int = id(2)\neffect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)",
+  );
+  assert_eq(defined(c, b"m.id"), { scheme: b"<a>(a) -> a", footprint: b"", performed: b"" });
+  assert_eq(defined(c, b"m.two").scheme, b"() -> Int");
+  assert_eq(defined(c, b"m.say"), {
+    scheme: b"(Bytes) -> Unit / {m.log.write}",
+    footprint: b"m.log.write",
+    performed: b"m.log.emit",
+  })
 }
 
 test "a definition may be generic over a resource label, and a call fills it" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"effect net { write send[r](Bytes) -> Unit }\npub fn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\npub fn go(b: Bytes) -> Unit / {net.send[conn]} = relay[conn](b)",
-    },
-  ]);
-  assert_eq(
-    dump,
-    "K;1;F;m.relay;<[l]>(Bytes) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];<[l]>m.net.send[l];;"
-      ++ "F;m.go;(Bytes) -> Unit / {m.net.send[conn]};m.net.send[conn];m.net.send[conn];;"
-      ++ "E;m.net;0;send:write:1:Bytes:Unit;",
-  )
+  let c = checker_m(
+    b"effect net { write send[r](Bytes) -> Unit }\npub fn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\npub fn go(b: Bytes) -> Unit / {net.send[conn]} = relay[conn](b)",
+  );
+  assert_eq(defined(c, b"m.relay"), {
+    scheme: b"<[l]>(Bytes) -> Unit / {m.net.send[l]}",
+    footprint: b"<[l]>m.net.send[l]",
+    performed: b"<[l]>m.net.send[l]",
+  });
+  assert_eq(defined(c, b"m.go"), {
+    scheme: b"(Bytes) -> Unit / {m.net.send[conn]}",
+    footprint: b"m.net.send[conn]",
+    performed: b"m.net.send[conn]",
+  })
 }
 
 test "an argument's row fills a label the call does not write" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(f: () -> Unit / {net.send[l]}) -> Unit / {net.send[l]} = f()\nfn go(f: () -> Unit / {net.send[conn]}) -> Unit / {net.send[conn]} = relay(f)",
-    },
-  ]);
-  assert_eq(
-    dump,
-    "K;1;F;m.relay;<[l]>(() -> Unit / {m.net.send[l]}) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];<[l]>m.net.send[l];;"
-      ++ "F;m.go;(() -> Unit / {m.net.send[conn]}) -> Unit / {m.net.send[conn]};m.net.send[conn];m.net.send[conn];;"
-      ++ "E;m.net;0;send:write:1:Bytes:Unit;",
-  )
+  let c = checker_m(
+    b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(f: () -> Unit / {net.send[l]}) -> Unit / {net.send[l]} = f()\nfn go(f: () -> Unit / {net.send[conn]}) -> Unit / {net.send[conn]} = relay(f)",
+  );
+  assert_eq(defined(c, b"m.relay"), {
+    scheme: b"<[l]>(() -> Unit / {m.net.send[l]}) -> Unit / {m.net.send[l]}",
+    footprint: b"<[l]>m.net.send[l]",
+    performed: b"<[l]>m.net.send[l]",
+  });
+  assert_eq(defined(c, b"m.go"), {
+    scheme: b"(() -> Unit / {m.net.send[conn]}) -> Unit / {m.net.send[conn]}",
+    footprint: b"m.net.send[conn]",
+    performed: b"m.net.send[conn]",
+  })
 }
 
 test "a clause on a label parameter discharges what the generic body performs" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\nfn quiet<[l]>(b: Bytes) -> Unit = handle relay[l](b) with { net.send[l](x) -> () }",
-    },
-  ]);
-  assert_eq(
-    dump,
-    "K;1;F;m.relay;<[l]>(Bytes) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];<[l]>m.net.send[l];;"
-      ++ "F;m.quiet;<[l]>(Bytes) -> Unit;;;;"
-      ++ "E;m.net;0;send:write:1:Bytes:Unit;",
-  )
+  let c = checker_m(
+    b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\nfn quiet<[l]>(b: Bytes) -> Unit = handle relay[l](b) with { net.send[l](x) -> () }",
+  );
+  assert_eq(defined(c, b"m.relay").performed, b"<[l]>m.net.send[l]");
+  assert_eq(defined(c, b"m.quiet"), {
+    scheme: b"<[l]>(Bytes) -> Unit",
+    footprint: b"",
+    performed: b"",
+  })
 }
 
 test "an unknown name is told the name in scope a slip of the hand would make it" {
-  let noted = |call: Bytes|
-    check_dump([
-      { name: b"m", src: b"fn count(n: Int) -> Int = n\nfn go() -> Int = ".concat(call) },
-    ]);
-  assert(noted(b"cuont(2)").contains("!E0101:0:45:50:1:1;"));
-  assert(noted(b"counts(2)").contains("!E0101:0:45:51:1:1;"));
-  assert(noted(b"breadth(2)").contains("!E0101:0:45:52:1:0;"));
-  assert(noted(b"cnt(2)").contains("!E0101:0:45:48:1:0;"))
+  // Each diagnostic's code, the name it is placed at, and whether a note offers `count`.
+  let noted = |call: Bytes| {
+    let src = b"fn count(n: Int) -> Int = n\nfn go() -> Int = ".concat(call);
+    check_diags(src).map(|diag: Diag|
+      {
+        code: diag.code,
+        at: diag.labels.fold(b"", |at: Bytes, label: Label|
+          if label.primary { src.slice(label.start, label.end) } else { at }),
+        offered: diag.notes_text.any(|note: Bytes| note.index_of(b"count") != None),
+      })
+  };
+  assert_eq(noted(b"cuont(2)"), [{ code: b"E0101", at: b"cuont", offered: true }]);
+  assert_eq(noted(b"counts(2)"), [{ code: b"E0101", at: b"counts", offered: true }]);
+  assert_eq(noted(b"breadth(2)"), [{ code: b"E0101", at: b"breadth", offered: false }]);
+  assert_eq(noted(b"cnt(2)"), [{ code: b"E0101", at: b"cnt", offered: false }])
 }
 
 test "`[*]` on an operation that takes no resource is refused" {
@@ -17149,17 +17209,14 @@ test "a label a call cannot fill, a count that does not match, and a use as a va
 }
 
 test "two label parameters stay apart, and each names its own atom" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"effect net { write send[r](Bytes) -> Unit }\nfn pipe<[l, k]>(b: Bytes) -> Unit / {net.send[l], net.send[k]} = { net.send[l](b); net.send[k](b) }",
-    },
-  ]);
-  assert_eq(
-    dump,
-    "K;1;F;m.pipe;<[l], [m]>(Bytes) -> Unit / {m.net.send[l], m.net.send[m]};<[l],[m]>m.net.send[l],m.net.send[m];<[l],[m]>m.net.send[l],m.net.send[m];;"
-      ++ "E;m.net;0;send:write:1:Bytes:Unit;",
-  )
+  let c = checker_m(
+    b"effect net { write send[r](Bytes) -> Unit }\nfn pipe<[l, k]>(b: Bytes) -> Unit / {net.send[l], net.send[k]} = { net.send[l](b); net.send[k](b) }",
+  );
+  assert_eq(defined(c, b"m.pipe"), {
+    scheme: b"<[l], [m]>(Bytes) -> Unit / {m.net.send[l], m.net.send[m]}",
+    footprint: b"<[l],[m]>m.net.send[l],m.net.send[m]",
+    performed: b"<[l],[m]>m.net.send[l],m.net.send[m]",
+  })
 }
 
 test "a call inside a recursive group fills its callee's labels as any call does" {
@@ -17239,10 +17296,10 @@ test "two callbacks that perform different things fill one row variable with bot
     b"fn apart() -> (Unit, Unit) / {a.x, b.y} = parallel { both(|| a.x(), || a.x()), b.y() }",
   ]);
   assert_eq(check_codes(src), []);
-  let dump = check_dump([{ name: b"m", src: src }]);
-  assert(dump.contains("F;m.go;() -> Unit / {m.a.x, m.b.y};"));
-  assert(dump.contains("F;m.named;() -> Unit / {m.a.x};"));
-  assert(dump.contains("F;m.apart;() -> (Unit, Unit) / {m.a.x, m.b.y};"));
+  let c = checker_m(src);
+  assert_eq(defined(c, b"m.go").scheme, b"() -> Unit / {m.a.x, m.b.y}");
+  assert_eq(defined(c, b"m.named").scheme, b"() -> Unit / {m.a.x}");
+  assert_eq(defined(c, b"m.apart").scheme, b"() -> (Unit, Unit) / {m.a.x, m.b.y}");
   let clash = Bytes::concat_all([
     b"effect a { write x() -> Unit }\n",
     b"effect b { write y() -> Unit }\n",
@@ -17308,9 +17365,9 @@ test "a list, a branch, a return, an annotation and a value's fields take functi
     b"fn held() -> Option<() -> Unit / {a.x, a.z}> = Some(|| a.x())",
   ]);
   assert_eq(check_codes(src), []);
-  let dump = check_dump([{ name: b"m", src: src }]);
-  assert(dump.contains("F;m.listed;() -> Unit / {m.a.x, m.b.y};"));
-  assert(dump.contains("F;m.paired;() -> Unit / {m.a.x, m.b.y};"))
+  let c = checker_m(src);
+  assert_eq(defined(c, b"m.listed").scheme, b"() -> Unit / {m.a.x, m.b.y}");
+  assert_eq(defined(c, b"m.paired").scheme, b"() -> Unit / {m.a.x, m.b.y}")
 }
 
 test "a function's parameter and a declared type hold their rows exactly" {
@@ -17391,10 +17448,7 @@ test "a call inside a recursive group answers for its callee's constraints as an
 }
 
 test "a unit pattern covers its type" {
-  assert_eq(
-    check_dump([{ name: b"m", src: b"fn f(u: Unit) -> Int = match u { () -> 1 }" }]),
-    "K;1;F;m.f;(Unit) -> Int;;;;",
-  )
+  assert_eq(scheme_of(b"fn f(u: Unit) -> Int = match u { () -> 1 }", b"m.f"), b"(Unit) -> Int")
 }
 
 test "a numeric constraint is refused where no call could pass its type" {
@@ -17862,22 +17916,20 @@ test "a declared type is closed: a label in it is its own parameter or a resourc
       b") -> Int = 1",
     ]);
   // Under `relay`'s binder the alias still names the resource `l`, so the binder prints apart from it.
-  assert_eq(
-    check_dump([
-      { name: b"m", src: uses(b"type Sender = (Bytes) -> Unit / {net.send[l]}", b"Sender") },
-    ]),
-    "K;1;F;m.plain;((Bytes) -> Unit / {m.net.send[l]}) -> Int;;;;"
-      ++ "F;m.relay;<[m]>((Bytes) -> Unit / {m.net.send[l]}) -> Int;;;;"
-      ++ "E;m.net;0;send:write:1:Bytes:Unit;",
-  );
-  let own = check_dump([
-    {
-      name: b"m",
-      src: uses(b"type Sender<[k]> = (Bytes) -> Unit / {net.send[k]}", b"Sender<[l]>"),
-    },
-  ]);
-  assert(own.contains("F;m.plain;((Bytes) -> Unit / {m.net.send[l]}) -> Int;"));
-  assert(own.contains("F;m.relay;<[l]>((Bytes) -> Unit / {m.net.send[l]}) -> Int;"));
+  let alias = checker_m(uses(b"type Sender = (Bytes) -> Unit / {net.send[l]}", b"Sender"));
+  assert_eq(defined(alias, b"m.plain"), {
+    scheme: b"((Bytes) -> Unit / {m.net.send[l]}) -> Int",
+    footprint: b"",
+    performed: b"",
+  });
+  assert_eq(defined(alias, b"m.relay"), {
+    scheme: b"<[m]>((Bytes) -> Unit / {m.net.send[l]}) -> Int",
+    footprint: b"",
+    performed: b"",
+  });
+  let own = checker_m(uses(b"type Sender<[k]> = (Bytes) -> Unit / {net.send[k]}", b"Sender<[l]>"));
+  assert_eq(defined(own, b"m.plain").scheme, b"((Bytes) -> Unit / {m.net.send[l]}) -> Int");
+  assert_eq(defined(own, b"m.relay").scheme, b"<[l]>((Bytes) -> Unit / {m.net.send[l]}) -> Int");
   // A row variable has no resource to fall back on.
   assert_eq(check_codes(b"type Cb = () -> Unit / e\nfn run<| e>(c: Cb) -> Unit / e = c()"), [
     b"E0301",
@@ -17885,22 +17937,23 @@ test "a declared type is closed: a label in it is its own parameter or a resourc
 }
 
 test "a sum is printed with the labels and rows it is given, and its constructor binds them" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"effect net { write send[r](Bytes) -> Unit }\npub type Sink<a, [l] | e> = | Sink((a) -> Unit / {net.send[l] | e})\npub fn held<[l] | e>(s: Sink<Int, [l] | {net.send[conn] | e}>) -> Sink<Int, [l] | {net.send[conn] | e}> = s\npub fn kept(s: Sink<Int, [conn] | {}>) -> Sink<Int, [conn] | {}> = s",
-    },
-  ]);
-  assert(
-    dump.contains(
-      "F;m.held;<[l] | e>(m.Sink<Int, [l] | {m.net.send[conn] | e}>) -> m.Sink<Int, [l] | {m.net.send[conn] | e}>;;;;",
-    ),
+  let c = checker_m(
+    b"effect net { write send[r](Bytes) -> Unit }\npub type Sink<a, [l] | e> = | Sink((a) -> Unit / {net.send[l] | e})\npub fn held<[l] | e>(s: Sink<Int, [l] | {net.send[conn] | e}>) -> Sink<Int, [l] | {net.send[conn] | e}> = s\npub fn kept(s: Sink<Int, [conn] | {}>) -> Sink<Int, [conn] | {}> = s",
   );
-  assert(dump.contains("F;m.kept;(m.Sink<Int, [conn] | {}>) -> m.Sink<Int, [conn] | {}>;;;;"));
-  assert(
-    dump.contains(
-      "C;m.Sink;m.Sink;0;1;<a, [l] | e>((a) -> Unit / {m.net.send[l] | e}) -> m.Sink<a, [l] | e>;",
-    ),
+  assert_eq(defined(c, b"m.held"), {
+    scheme: b"<[l] | e>(m.Sink<Int, [l] | {m.net.send[conn] | e}>) -> m.Sink<Int, [l] | {m.net.send[conn] | e}>",
+    footprint: b"",
+    performed: b"",
+  });
+  assert_eq(defined(c, b"m.kept"), {
+    scheme: b"(m.Sink<Int, [conn] | {}>) -> m.Sink<Int, [conn] | {}>",
+    footprint: b"",
+    performed: b"",
+  });
+  assert_eq(
+    c.ctors.filter(|ctor: CtorInfo| ctor.name == b"m.Sink").map(|ctor: CtorInfo|
+      scheme_text(ctor.scheme)),
+    [b"<a, [l] | e>((a) -> Unit / {m.net.send[l] | e}) -> m.Sink<a, [l] | e>"],
   )
 }
 
@@ -19327,89 +19380,77 @@ test "a `const fn` answers a value a build can keep" {
 }
 
 test "a body that performs more than its signature permits is refused" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"effect log { write emit(Bytes) -> Unit }\nfn quiet() -> Unit / {} = log.emit(b\"x\")",
-    },
-  ]);
-  assert_eq(dump, "K;1;X;D;1;!E0302:0:67:81:2:1;=0:67:81:1;=0:62:64:0;")
+  assert_eq(
+    placed(b"effect log { write emit(Bytes) -> Unit }\nfn quiet() -> Unit / {} = log.emit(b\"x\")"),
+    [[b"E0302", b"log.emit(b\"x\")", b"{}"]],
+  )
 }
 
 test "a function that performs is refused where a pure one is expected" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"effect log { write emit(Bytes) -> Unit }\nfn noisy(x: Int) -> Int / { log.write } = { log.emit(b\"x\"); x }\nfn apply(f: (Int) -> Int) -> Int = f(1)\nfn go() -> Int = apply(noisy)",
-    },
-  ]);
-  assert_eq(dump, "K;1;X;D;1;!E0302:0:168:173:1:1;=0:168:173:1;")
+  assert_eq(
+    placed(
+      b"effect log { write emit(Bytes) -> Unit }\nfn noisy(x: Int) -> Int / { log.write } = { log.emit(b\"x\"); x }\nfn apply(f: (Int) -> Int) -> Int = f(1)\nfn go() -> Int = apply(noisy)",
+    ),
+    [[b"E0302", b"noisy"]],
+  )
 }
 
 test "an operator over a lambda parameter nothing types is refused" {
-  let dump = check_dump([{ name: b"m", src: b"fn f() -> Bool = { let g = |x| x + x; true }" }]);
-  assert_eq(dump, "K;1;X;D;1;!E0210:0:31:36:1:3;=0:31:36:1;")
+  assert_eq(placed(b"fn f() -> Bool = { let g = |x| x + x; true }"), [[b"E0210", b"x + x"]])
 }
 
 test "a test's footprint holds the row of what it calls and the operation it performs itself" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"effect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\ntest \"a test performs through a call\" { say(b\"x\") }\ntest \"a test performs directly\" { log.emit(b\"y\") }",
-    },
-  ]);
-  assert_eq(
-    dump,
-    "K;1;F;m.say;(Bytes) -> Unit / {m.log.write};m.log.write;m.log.emit;;"
-      ++ "T;m.a test performs through a call;0;m.log.write;T;m.a test performs directly;0;m.log.emit;"
-      ++ "E;m.log;0;emit:write:0:Bytes:Unit;",
-  )
+  let c = checker_m(
+    b"effect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\ntest \"a test performs through a call\" { say(b\"x\") }\ntest \"a test performs directly\" { log.emit(b\"y\") }",
+  );
+  assert_eq(c.tests.map(|t: TestInfo| [t.key, footprint_text(t.footprint)]), [
+    [b"m.a test performs through a call", b"m.log.write"],
+    [b"m.a test performs directly", b"m.log.emit"],
+  ])
 }
 
 test "a function parameter's types and row generalize" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"pub fn twice<a, b>(f: (a) -> b, x: a) -> b = f(x)\npub fn each<a | e>(f: (a) -> Unit / e, xs: List<a>) -> Unit / e = xs.fold((), |acc: Unit, x: a| f(x))",
-    },
-  ]);
-  assert_eq(
-    dump,
-    "K;1;F;m.twice;<a, b>((a) -> b, a) -> b;;;;F;m.each;<a | e>((a) -> Unit / e, List<a>) -> Unit / e;;;;",
-  )
+  let c = checker_m(
+    b"pub fn twice<a, b>(f: (a) -> b, x: a) -> b = f(x)\npub fn each<a | e>(f: (a) -> Unit / e, xs: List<a>) -> Unit / e = xs.fold((), |acc: Unit, x: a| f(x))",
+  );
+  assert_eq(defined(c, b"m.twice").scheme, b"<a, b>((a) -> b, a) -> b");
+  assert_eq(defined(c, b"m.each").scheme, b"<a | e>((a) -> Unit / e, List<a>) -> Unit / e")
 }
 
+/// The constraints a check publishes for the definition `name`, each its deriver and the type
+/// parameter it is on.
+fn published(c: Checker, name: Bytes) -> List<Bytes> / {abort.raise} =
+  info_of(c, name).constraints.map(|d: DefConstraint|
+    deriver_text(d.deriver).concat(ascii_of_int(d.param)))
+
 test "a derivable constraint is published on the type parameter it names" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"pub fn show<a>(x: a) -> Int where derivable(eq, a) = 1\npub fn keyed<k, v>(m: Map<k, v>) -> Int where derivable(ord, k) = m.len()\nfn used() -> Int = show(2) + keyed(Map::new())",
-    },
-  ]);
-  assert_eq(
-    dump,
-    "K;1;F;m.show;<a>(a) -> Int;;;eq0;F;m.keyed;<a, b>(Map<a, b>) -> Int;;;ord0;F;m.used;() -> Int;;;;",
+  let c = checker_m(
+    b"pub fn show<a>(x: a) -> Int where derivable(eq, a) = 1\npub fn keyed<k, v>(m: Map<k, v>) -> Int where derivable(ord, k) = m.len()\nfn used() -> Int = show(2) + keyed(Map::new())",
   );
+  assert_eq(published(c, b"m.show"), [b"eq0"]);
+  assert_eq(published(c, b"m.keyed"), [b"ord0"]);
+  assert_eq(published(c, b"m.used"), []);
   // Implied by the `Map` the signature names, it is published as though written.
   assert_eq(
-    check_dump([{ name: b"m", src: b"pub fn keyed<k, v>(m: Map<k, v>) -> Int = m.len()" }]),
-    "K;1;F;m.keyed;<a, b>(Map<a, b>) -> Int;;;ord0;",
+    published(checker_m(b"pub fn keyed<k, v>(m: Map<k, v>) -> Int = m.len()"), b"m.keyed"),
+    [b"ord0"],
   )
 }
 
 test "an atom a row writes twice is published once" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"effect log { write emit(Bytes) -> Unit }\neffect audit { write note(Bytes) -> Unit }\nfn twice() -> Unit / { log.write, log.write } = log.emit(b\"x\")\nfn both() -> Unit / { audit.write, log.write, audit.write } = { log.emit(b\"x\"); audit.note(b\"y\") }",
-    },
-  ]);
-  assert_eq(
-    dump,
-    "K;1;F;m.twice;() -> Unit / {m.log.write};m.log.write;m.log.emit;;"
-      ++ "F;m.both;() -> Unit / {m.audit.write, m.log.write};m.audit.write,m.log.write;m.audit.note,m.log.emit;;"
-      ++ "E;m.log;0;emit:write:0:Bytes:Unit;E;m.audit;0;note:write:0:Bytes:Unit;",
-  )
+  let c = checker_m(
+    b"effect log { write emit(Bytes) -> Unit }\neffect audit { write note(Bytes) -> Unit }\nfn twice() -> Unit / { log.write, log.write } = log.emit(b\"x\")\nfn both() -> Unit / { audit.write, log.write, audit.write } = { log.emit(b\"x\"); audit.note(b\"y\") }",
+  );
+  assert_eq(defined(c, b"m.twice"), {
+    scheme: b"() -> Unit / {m.log.write}",
+    footprint: b"m.log.write",
+    performed: b"m.log.emit",
+  });
+  assert_eq(defined(c, b"m.both"), {
+    scheme: b"() -> Unit / {m.audit.write, m.log.write}",
+    footprint: b"m.audit.write,m.log.write",
+    performed: b"m.audit.note,m.log.emit",
+  })
 }
 
 test "a program checked from its own published interfaces publishes the same thing" {
@@ -19425,23 +19466,21 @@ test "a program checked from its own published interfaces publishes the same thi
 }
 
 test "a spec clause that reaches an effect through a call is refused at the call" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"effect log { write emit(Bytes) -> Unit }\nfn noisy() -> Bool / { log.write } = { log.emit(b\"x\"); true }\nfn f(x: Int) -> Int requires noisy() = x",
-    },
-  ]);
-  assert_eq(dump, "K;1;X;D;1;!E0417:0:132:139:2:3;=0:132:139:1;=0:123:139:0;")
+  assert_eq(
+    placed(
+      b"effect log { write emit(Bytes) -> Unit }\nfn noisy() -> Bool / { log.write } = { log.emit(b\"x\"); true }\nfn f(x: Int) -> Int requires noisy() = x",
+    ),
+    [[b"E0417", b"noisy()", b"requires noisy()"]],
+  )
 }
 
 test "functions cannot be compared and a Float cannot key a Map, judged once the module is solved" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"fn keyed() -> Map<Float, Int> = Map::new()\nfn same(f: (Int) -> Int, g: (Int) -> Int) -> Bool = f == g",
-    },
-  ]);
-  assert_eq(dump, "K;1;X;D;2;!E0201:0:95:101:1:1;=0:95:101:1;!E0206:0:14:29:1:2;=0:14:29:1;")
+  assert_eq(
+    placed(
+      b"fn keyed() -> Map<Float, Int> = Map::new()\nfn same(f: (Int) -> Int, g: (Int) -> Int) -> Bool = f == g",
+    ),
+    [[b"E0201", b"f == g"], [b"E0206", b"Map<Float, Int>"]],
+  )
 }
 
 /// Each diagnostic as its code, its message and the source its primary label covers.
@@ -19684,13 +19723,8 @@ test "a handler around a spawn may answer from a hold the task cannot outlive, o
 }
 
 test "a call instantiating a constrained parameter with a function is refused at the call" {
-  let dump = check_dump([
-    {
-      name: b"m",
-      src: b"fn show<a>(x: a) -> String where derivable(json, a) = \"\"\nfn bad() -> String = show(|y: Int| y)",
-    },
-  ]);
-  assert_eq(dump, "K;1;X;D;1;!E0206:0:78:82:2:1;=0:78:82:1;=0:0:56:0;")
+  let src = b"fn show<a>(x: a) -> String where derivable(json, a) = \"\"\nfn bad() -> String = show(|y: Int| y)";
+  assert_eq(placed(src), [[b"E0206", b"show", src.slice(0, 56)]])
 }
 
 /// Each error a program raises, in the order the checker reports them.

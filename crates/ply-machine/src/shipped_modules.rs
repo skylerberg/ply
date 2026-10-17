@@ -28,8 +28,9 @@ pub fn is_shipped_name(name: &str) -> bool {
     ply_eval::host::is_std(name) || is_compiler(name)
 }
 
-/// Every shipped module's name: the standard library's, each file at or below its tree named by its
-/// place there (`hash/legacy.ply` is `std.hash.legacy`), then the compiler's. No text is read.
+/// Every shipped module's name: the standard library's, then the compiler's, each file at or below
+/// its tree named by its place there (`hash/legacy.ply` is `std.hash.legacy`, `emit/roots.ply`
+/// `compiler.emit.roots`). No text is read.
 pub fn names() -> Vec<String> {
     let pack = ply_pack::installed();
     let named = |root: &'static str, dir: &'static str, path: &str| {
@@ -39,7 +40,7 @@ pub fn names() -> Vec<String> {
     pack.modules_below(ply_pack::STD)
         .filter_map(|path| named(STD_ROOT, ply_pack::STD, path))
         .chain(
-            pack.files_in(ply_pack::COMPILER)
+            pack.modules_below(ply_pack::COMPILER)
                 .filter_map(|path| named(COMPILER_ROOT, ply_pack::COMPILER, path)),
         )
         .collect()

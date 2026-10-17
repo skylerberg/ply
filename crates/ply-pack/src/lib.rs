@@ -9,14 +9,33 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// The shipped modules: each `.ply` file at or below it is one, `hash/legacy.ply` being
-/// `std.hash.legacy`. Every other file at or below it is data those modules embed.
-pub const STD: &str = "crates/ply-std/ply";
+/// The standard library: each `.ply` file at or below it is a shipped module, `hash/legacy.ply`
+/// being `std.hash.legacy`. Every other file at or below it is data those modules embed.
+pub const STD: &str = "std";
 
 const MODULE: &str = ".ply";
 
-/// The compiler's own modules, shipped as `compiler.<stem>`.
-pub const COMPILER: &str = "crates/ply-compiler/ply";
+/// The compiler's own modules, `emit/roots.ply` being `compiler.emit.roots`.
+pub const COMPILER: &str = "compiler";
+
+/// Where the last release's `ply bootstrap` keeps the shipped files, read as [`STD`] and
+/// [`COMPILER`]: CI's first bootstrap links the pack that release writes with this runtime.
+const RELEASED_ROOTS: [(&str, &str); 2] = [
+    ("crates/ply-std/ply", STD),
+    ("crates/ply-compiler/ply", COMPILER),
+];
+
+/// `path` under the root this runtime reads it by.
+fn logical(path: String) -> String {
+    for (released, root) in RELEASED_ROOTS {
+        if let Some(rest) = path.strip_prefix(released)
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            return format!("{root}{rest}");
+        }
+    }
+    path
+}
 
 /// What every shipped module answers, as `ply std --answers` writes it: a file of zstd frames and
 /// its index, itself one frame.
@@ -61,15 +80,6 @@ impl Pack {
 
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|entry| entry.path.as_str())
-    }
-
-    /// The paths of the files directly in `dir`, ascending.
-    pub fn files_in<'a>(&'a self, dir: &str) -> impl Iterator<Item = &'a str> + 'a {
-        let prefix = format!("{dir}/");
-        self.paths().filter(move |path| {
-            path.strip_prefix(prefix.as_str())
-                .is_some_and(|name| !name.contains('/'))
-        })
     }
 
     /// The paths of the data files at or below `dir`, ascending: every file there that is no
@@ -200,6 +210,10 @@ fn read_table(table: &[u8], start: usize, end: usize) -> Result<Vec<Entry>, Stri
     if entries.windows(2).any(|pair| pair[0].path >= pair[1].path) {
         return Err("the pack's table is not in ascending order".to_string());
     }
+    for entry in &mut entries {
+        entry.path = logical(std::mem::take(&mut entry.path));
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
 }
 
