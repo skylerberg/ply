@@ -4,11 +4,12 @@
 //! to today's emitter's C.
 
 import std.bytes (ascii_of_int)
+import lexer (is_ident_continue)
 import resolve (qualify)
 import emit (Head, Body, RootAnswer, Defined, Need, Layout, symbol_of)
 import emit.pieces (spelled)
-import emit.compare (Program, program_of, formed, checked, answered_today, today_text, printed_text,
-                     normalised, past_counts)
+import emit.compare (Program, Hunk, program_of, formed, checked, answered_today, today_text,
+                     printed_text, normalised, past_counts, hunks)
 import emit.print (printed_fn)
 import emit.tir (Rep, RFloat, RWord, RMaybe, RFlat, RCases, Var, AVar, AInt, AZero, Val, Make,
                  MRecord, MCtor, Get, Pack, Gathered, PLeaf, PField, PNamed, Inst, Let, Decl,
@@ -516,93 +517,145 @@ test "a record, an Option and a Result of a record cross a root's head and entry
 fn form_text(p: Program, name: Bytes) -> List<Bytes> / {abort.raise} =
   match formed(p, name) { Ok(f) -> normalised(past_counts(printed_text(f))), Err(no) -> [no.why] }
 
-/// The roots of the corpus whose C differs from today's on purpose, each with the decision the form
-/// makes otherwise.
-fn differing() -> List<{ name: Bytes, why: Bytes }> = {
-  let reuse = b"today makes a record or a constructor in any let-go cell of its width it finds as it runs; the form reuses a cell only where own pairs a let-go value with the make";
-  let names = b"the same body, but normalised reads no multi-value part's name `x_k` against today's (`p0_w`, a sum's `p0`) and keeps today's write-only word locals";
+/// A decision the form makes otherwise than today's emitter, the roots of the corpus it stands for,
+/// and whether a run of lines the two differ in is that decision's.
+type Reason = { why: Bytes, roots: List<Bytes>, shows: (Hunk) -> Bool }
+
+/// The decisions the corpus's C differs from today's by on purpose.
+fn reasons() -> List<Reason> =
   [
-    b"point",
-    b"moved",
-    b"pick",
-    b"mid",
-    b"widened",
-    b"segment",
-    b"pt",
-    b"pair",
-    b"declare",
-    b"circle",
-    b"boxed",
-    b"outer",
-    b"deep_pick",
-    b"reset",
-    b"money",
-    b"origin",
-  ].map(|n: Bytes| { name: n, why: reuse }).concat(
-    [
-      b"sum",
-      b"end_x",
-      b"pt_x",
-      b"second",
-      b"kind_of",
-      b"held",
-      b"pass",
-      b"inner_a",
-      b"coord",
-      b"year_of",
-    ].map(|n: Bytes| { name: n, why: names }),
-  ).concat([
     {
-      name: b"relabelled",
-      why: b"today writes an update over a record it holds alone; the form gathers it, and own decides whether the base's cells are reused",
+      why: b"the form names a value's several C values `t<n>_<k>`, which normalised reads as no temporary, and joins and hands on a record's word itself where today copies it through locals of its own",
+      roots: [
+        b"pick",
+        b"end_x",
+        b"start",
+        b"pass",
+        b"outer",
+        b"deep_pick",
+        b"reset",
+        b"widened",
+        b"segment",
+        b"relabelled",
+      ],
+      shows: |h: Hunk| read_past(h.today) == read_past(h.form),
     },
     {
-      name: b"start",
+      why: b"the form makes a flat record's word where the record leaves, testing as it runs whether one was made; today makes it where it builds the record, which it knows made none",
+      roots: [b"widened", b"segment", b"relabelled", b"origin"],
+      shows: |h: Hunk|
+        h.form.any(|l: Bytes|
+          l.index_of(b"if (") != None && l.index_of(b"rt_alloc_p(ctx, 3,") != None),
+    },
+    {
+      why: b"today writes an update over a record it holds alone; the form gathers the record and own decides whether the base's cells are reused",
+      roots: [b"relabelled"],
+      shows: |h: Hunk| mentions(h.today, b"->rc == 1"),
+    },
+    {
       why: b"today moves a record held in place out of a holder it holds alone (`ply_take`); the form reads it in place",
+      roots: [b"start"],
+      shows: |h: Hunk| mentions(h.today, b"ply_take("),
     },
-  ])
+  ]
+
+/// Whether one of `lines` holds `text`.
+fn mentions(lines: List<Bytes>, text: Bytes) -> Bool =
+  lines.any(|l: Bytes| l.index_of(text) != None)
+
+/// `lines` read past their temporaries' and parts' names, and past a local declared zero or one local
+/// copied into another, which is all naming and bookkeeping.
+fn read_past(lines: List<Bytes>) -> List<Bytes> =
+  lines.map(nameless).filter(|l: Bytes| {
+    let t = trimmed(l);
+    t != b"_ = _;" && !(t.ends_with(b" _ = 0;") && t.index_of(b" ") == Some(t.len() - 7))
+  })
+
+/// `l` with every temporary `t<n>`, part of one `t<n>_<k>` and parameter's part `p<i>_<k>` read as
+/// `_`.
+fn nameless(l: Bytes) -> Bytes = {
+  let cut = range(0, l.len()).fold(
+    { out: [], from: 0 - 1 },
+    |acc: { out: List<Bytes>, from: Int }, i: Int|
+      if l.peek(i) >= 0 && is_ident_continue(l.peek(i)) {
+        if acc.from < 0 { { ..acc, from: i } } else { acc }
+      } else {
+        let flushed = if acc.from < 0 { acc.out }
+        else { acc.out.push(local_or(span(l, acc.from, i))) };
+        { out: flushed.push(span(l, i, i + 1)), from: 0 - 1 }
+      },
+  );
+  Bytes::concat_all(if cut.from < 0 { cut.out }
+  else { cut.out.push(local_or(span(l, cut.from, l.len()))) })
 }
 
-test "the corpus prints as today's emitter writes it, but where a root's decision differs on purpose" {
+/// `_` for a temporary, a part of one or a parameter's part, `w` for any other identifier.
+fn local_or(w: Bytes) -> Bytes =
+  if w.len() < 2 || (w.peek(0) != 116 && w.peek(0) != 112) { w } else {
+    let rest = span(w, 1, w.len());
+    let parted = match rest.index_of(b"_") {
+      Some(u) -> digits(span(rest, 0, u)) && digits(span(rest, u + 1, rest.len())),
+      None -> w.peek(0) == 116 && digits(rest),
+    };
+    if parted { b"_" } else { w }
+  }
+
+fn digits(d: Bytes) -> Bool =
+  d.len() > 0 && range(0, d.len()).all(|i: Int| d.peek(i) >= 48 && d.peek(i) <= 57)
+
+fn trimmed(l: Bytes) -> Bytes = {
+  let from = range(0, l.len()).fold(l.len(), |at: Int, i: Int|
+    if at < l.len() || l.peek(i) == 32 { at } else { i });
+  span(l, from, l.len())
+}
+
+/// `b`'s bytes from `from` up to `to`.
+fn span(b: Bytes, from: Int, to: Int) -> Bytes =
+  match b.slice_at(from, to - from) { Some(x) -> x, None -> b"" }
+
+test "the corpus prints as today's emitter writes it, but where a decision differs on purpose" {
   let p = program();
   let today = answered_today(p, lowered_roots());
-  let named = differing().map(|d: { name: Bytes, why: Bytes }| d.name);
-  let unexplained = lowered_roots().fold(
+  let parted = lowered_roots().map(|n: Bytes|
+    { name: n, hunks: hunks(normalised(past_counts(today_text(today, n))), form_text(p, n)) });
+  // Every run of lines a root differs in is the run of a decision named for that root.
+  let unexplained = parted.fold(
     [],
-    |acc: List<{ name: Bytes, form: List<Bytes>, today: List<Bytes> }>, n: Bytes| {
-      let form = form_text(p, n);
-      let old = normalised(past_counts(today_text(today, n)));
-      if form == old || named.contains(n) { acc } else {
-        acc.push({
-          name: n,
-          form: form.filter(|l: Bytes| !old.contains(l)),
-          today: old.filter(|l: Bytes| !form.contains(l)),
-        })
-      }
-    },
+    |acc: List<{ name: Bytes, hunk: Hunk }>, r: { name: Bytes, hunks: List<Hunk> }|
+      r.hunks.fold(acc, |a: List<{ name: Bytes, hunk: Hunk }>, h: Hunk|
+        if reasons().any(|why: Reason| {
+            let shows = why.shows;
+            why.roots.contains(r.name) && shows(h)
+          }) { a }
+        else { a.push({ name: r.name, hunk: h }) }),
   );
   assert(
     unexplained == [],
     Some(
       String::of_bytes_lossy(
         Bytes::join(
-          unexplained.map(|u: { name: Bytes, form: List<Bytes>, today: List<Bytes> }|
+          unexplained.map(|u: { name: Bytes, hunk: Hunk }|
             Bytes::concat_all([
               b"== ",
               u.name,
-              b"\n-- form\n",
-              Bytes::join(u.form, b"\n"),
               b"\n-- today\n",
-              Bytes::join(u.today, b"\n"),
+              Bytes::join(u.hunk.today, b"\n"),
+              b"\n-- form\n",
+              Bytes::join(u.hunk.form, b"\n"),
             ])),
           b"\n",
         ),
       ),
     ),
   );
-  // A root named as differing does differ: a name left behind once it prints as today's goes.
+  // Each decision shows in each root it is named for: a name left behind once a root prints as
+  // today's goes.
   assert_eq(
-    named.filter(|n: Bytes| form_text(p, n) == normalised(past_counts(today_text(today, n)))),
+    reasons().fold([], |acc: List<{ why: Bytes, root: Bytes }>, why: Reason|
+      why.roots.fold(acc, |a: List<{ why: Bytes, root: Bytes }>, n: Bytes|
+        if parted.any(|r: { name: Bytes, hunks: List<Hunk> }|
+            r.name == n && r.hunks.any(why.shows)) { a }
+        else { a.push({ why: why.why, root: n }) })),
     [],
   )
 }
