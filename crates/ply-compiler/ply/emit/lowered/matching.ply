@@ -1,0 +1,776 @@
+//! Family C's tests through `emit.compare`: what `match`, a `let` pattern and a comparison with a
+//! constructor lower to, read off the form of small programs; a corpus of them lowered, checked and
+//! printed; and its C held to today's emitter's.
+
+import types (Type, TyCon)
+import parsing (dummy_span)
+import emit.tir (RInt, RBool, RNum, RWord, RMaybe, RFloat, Var, AVar, AInt, ABool, Val, Prim, Get,
+                 Pack, Native, PArg, Inst, Let, Decl, Assign, If, Case, Match, Miss, Fail, Return,
+                 Block, Test, TTag, TInt, TRange, TLength, Fn, Declined, Matching, Spine, Scalars)
+import emit.compare (program_of, formed, answered_today, today_text, normalised)
+import emit.print (printed_fn)
+import emit.pieces (spelled)
+import emit.verify (verified)
+
+fn ty(name: Bytes, args: List<Type>) -> Type = TyCon({ name: name, args: args })
+
+fn int_var(id: Int) -> Var = { id: id, ty: ty(b"Int", []), rep: RInt }
+
+fn bool_var(id: Int) -> Var = { id: id, ty: ty(b"Bool", []), rep: RBool }
+
+fn maybe_int(id: Int) -> Var = { id: id, ty: ty(b"Option", [ty(b"Int", [])]), rep: RMaybe }
+
+/// The body of root `m.<name>` of `src`'s form, or why it was not formed.
+fn body_of(src: Bytes, name: Bytes) -> Result<Block, Bytes> / {abort.raise} =
+  match program_of(src) {
+    Err(why) -> Err(why),
+    Ok(p) -> match formed(p, name) { Ok(f) -> Ok(f.body), Err(no) -> Err(no.why) },
+  }
+
+/// The arms of the first `Match` of `body`.
+fn arms_of(body: Block) -> List<Block> =
+  body.fold([], |acc: List<Block>, i: Inst|
+    match i { Match(m) -> if acc == [] { m.arms } else { acc }, _ -> acc })
+
+/// Each `Case` an arm opens with: what it tests, and where its one arm is taken.
+fn opening(arm: Block) -> Option<{ test: Test, when: Int, body: Block }> =
+  match arm.at(0) {
+    Some(Case(c)) -> match c.arms.at(0) {
+      Some(a) -> Some({ test: c.test, when: a.when, body: a.body }),
+      None -> None,
+    },
+    _ -> None,
+  }
+
+/// What `i` reads with `Get`, where it is a `Let` of one.
+fn read_at(i: Inst) -> Option<{ of: Var, path: Bytes }> =
+  match i {
+    Let(l) -> match l.val {
+      Get(g) -> match g.path {
+        PArg(a) -> Some({ of: g.of, path: a.ctor }),
+        _ -> Some({ of: g.of, path: b"" }),
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+fn bind(v: Var, val: Val) -> Inst = Let({ var: v, val: val, at: dummy_span(), unwind: [] })
+
+/// Whether `run` stands in `lines` as consecutive lines.
+fn holds_run(lines: List<Bytes>, run: List<Bytes>) -> Bool =
+  range(0, lines.len()).any(|i: Int| lines.drop(i).take(run.len()) == run)
+
+/// Root `m.<name>` of `src` printed by the form, checked or not.
+fn printed_of(src: Bytes, name: Bytes) -> Result<Bytes, Bytes> / {abort.raise} =
+  match program_of(src) {
+    Err(why) -> Err(why),
+    Ok(p) -> match formed(p, name) {
+      Ok(f) -> Ok(spelled(printed_fn(f).pieces)),
+      Err(no) -> Err(no.why),
+    },
+  }
+
+test "integer literals and ranges are tested in a Case each, and an arm that does not hold misses to the next" {
+  let n = int_var(0);
+  let j = int_var(1);
+  let tested = |t: Test, then: Block|
+    Case({ on: n, test: t, arms: [{ when: 0, body: then }], rest: [Miss] });
+  assert_eq(
+    body_of(b"fn digit(n: Int) -> Int = match n { 0 -> 10, 1..=9 -> n, _ -> 99 }\n", b"digit"),
+    Ok([
+      Decl(j),
+      Match({
+        arms: [
+          [tested(TInt([0]), [Assign({ var: j, arg: AInt(10) })])],
+          [tested(TRange({ lo: 1, hi: 9 }), [Assign({ var: j, arg: AVar(n) })])],
+          [Assign({ var: j, arg: AInt(99) })],
+        ],
+        rest: [Fail(b"match")],
+      }),
+      Return(AVar(j)),
+    ]),
+  )
+}
+
+test "a Bool and a width are tested as the integers their registers hold, and a constant subject as it lowers" {
+  match body_of(b"fn flag(b: Bool) -> Int = match b { true -> 1, false -> 0 }\n", b"flag") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        arms_of(body).map(|a: Block|
+          opening(a).map(|o: { test: Test, when: Int, body: Block }| o.test)),
+        [Some(TInt([1])), Some(TInt([0]))],
+      ),
+  };
+  match body_of(
+      b"fn small(n: U8) -> Int = match n { 255u8 -> 1, 0u8..=9u8 -> 2, _ -> 0 }\n",
+      b"small",
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      assert_eq(
+        arms_of(body).map(|a: Block|
+          opening(a).map(|o: { test: Test, when: Int, body: Block }| o.test)),
+        [Some(TInt([255])), Some(TRange({ lo: 0, hi: 9 })), None],
+      );
+      assert_eq(
+        match arms_of(body).at(0) { Some([Case(c)]) -> Some(c.on.rep), _ -> None },
+        Some(RNum({ bits: 8, signed: false })),
+      )
+    },
+  };
+  // A subject the lowering knows is tested before any C runs: an `If` on the answer.
+  match body_of(b"fn seven() -> Int = match 7 { 8 -> 1, 7 -> 2, _ -> 0 }\n", b"seven") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        arms_of(body).map(|a: Block|
+          match a.at(0) {
+            Some(If(x)) -> Some({ cond: x.cond, otherwise: x.otherwise }),
+            _ -> None,
+          }),
+        [
+          Some({ cond: ABool(false), otherwise: [Miss] }),
+          Some({ cond: ABool(true), otherwise: [Miss] }),
+          None,
+        ],
+      ),
+  }
+}
+
+test "a guard is tested under its arm's pattern and misses to the next arm where it does not hold" {
+  let n = int_var(0);
+  let even = bool_var(1);
+  let j = int_var(2);
+  match body_of(
+      b"fn guarded(n: Int, even: Bool) -> Int = match n { 0..=9 if even -> 1, _ -> 0 }\n",
+      b"guarded",
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(arms_of(body), [
+        [
+          Case({
+            on: n,
+            test: TRange({ lo: 0, hi: 9 }),
+            arms: [
+              {
+                when: 0,
+                body: [
+                  If({
+                    cond: AVar(even),
+                    then: [Assign({ var: j, arg: AInt(1) })],
+                    otherwise: [Miss],
+                  }),
+                ],
+              },
+            ],
+            rest: [Miss],
+          }),
+        ],
+        [Assign({ var: j, arg: AInt(0) })],
+      ]),
+  };
+  // Each alternative of an or-pattern is an arm of its own.
+  match body_of(b"fn either(n: Int) -> Int = match n { 1 | 2 -> 1, _ -> 0 }\n", b"either") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        arms_of(body).map(|a: Block|
+          opening(a).map(|o: { test: Test, when: Int, body: Block }| o.test)),
+        [Some(TInt([1])), Some(TInt([2])), None],
+      ),
+  }
+}
+
+test "a constructor's test names its place among its sum's constructors, and its arguments are read where it held" {
+  let src = Bytes::concat_all([
+    b"type Shape = | Circle(Float) | Rect(Int, Int) | Dot\n",
+    b"fn area(s: Shape) -> Int = match s { Circle(_) -> 1, Rect(w, h) -> w * h, Dot -> 0 }\n",
+  ]);
+  match body_of(src, b"area") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      let opened = arms_of(body).map(opening);
+      let names = [b"m.Circle", b"m.Rect", b"m.Dot"];
+      assert_eq(
+        opened.map(|o: Option<{ test: Test, when: Int, body: Block }>|
+          match o { Some(x) -> Some({ test: x.test, when: x.when }), None -> None }),
+        [
+          Some({ test: TTag(names), when: 0 }),
+          Some({ test: TTag(names), when: 1 }),
+          Some({ test: TTag(names), when: 2 }),
+        ],
+      );
+      // `Circle(_)` reads nothing; `Rect(w, h)` reads both arguments of the subject it tested.
+      assert_eq(
+        opened.map(|o: Option<{ test: Test, when: Int, body: Block }>|
+          match o {
+            Some(x) ->
+              x.body.map(read_at).filter(|r: Option<{ of: Var, path: Bytes }>| r != None).len(),
+            None -> 0 - 1,
+          }),
+        [0, 2, 0],
+      );
+      let reads = match opened.at(1) { Some(Some(x)) -> x.body.take(2).map(read_at), _ -> [] };
+      assert_eq(
+        reads.map(|r: Option<{ of: Var, path: Bytes }>|
+          match r { Some(x) -> Some({ of: x.of.id, rep: x.of.rep, path: x.path }), None -> None }),
+        [
+          Some({ of: 0, rep: RWord, path: b"m.Rect" }),
+          Some({ of: 0, rep: RWord, path: b"m.Rect" }),
+        ],
+      )
+    },
+  }
+}
+
+test "an Option's constructors are tested on the word it is held as, its payload read where Some held" {
+  let o = maybe_int(0);
+  let x = int_var(1);
+  let j = int_var(2);
+  let some = |body: Block|
+    Case({ on: o, test: TTag([b"None", b"Some"]), arms: [{ when: 1, body: body }], rest: [Miss] });
+  let none = |body: Block|
+    Case({ on: o, test: TTag([b"None", b"Some"]), arms: [{ when: 0, body: body }], rest: [Miss] });
+  let src = b"fn payload(o: Option<Int>) -> Int = match o { Some(n) -> n, None -> 0 }\n";
+  match body_of(src, b"payload") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(arms_of(body), [
+        [
+          some([
+            bind(x, Get({ of: o, path: PArg({ ctor: b"Some", at: 0 }) })),
+            Assign({ var: j, arg: AVar(x) }),
+          ]),
+        ],
+        [none([Assign({ var: j, arg: AInt(0) })])],
+      ]),
+  };
+  match printed_of(src, b"payload") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) -> {
+      assert(text.index_of(b"  if ((p0) != 0) {\n") != None);
+      assert(text.index_of(b"  if ((p0) == 0) {\n") != None)
+    },
+  }
+}
+
+test "a Result held as a tagged word tests its tag, and a declared sum inside it its object's layout" {
+  let src = Bytes::concat_all([
+    b"type Tone = | Warm | Cool\n",
+    b"fn settled(r: Result<Int, Tone>) -> Int = match r { Ok(n) -> n, Err(Warm) -> 1, Err(Cool) -> 2 }\n",
+  ]);
+  match body_of(src, b"settled") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      let arms = arms_of(body);
+      assert_eq(
+        arms.map(|a: Block| opening(a).map(|o: { test: Test, when: Int, body: Block }| o.when)),
+        [Some(0), Some(1), Some(1)],
+      );
+      // The tone is read and tested only under the test that the result is an `Err`.
+      assert_eq(
+        match opening(arms.get(1)) {
+          Some(e) -> match e.body.at(1) {
+            Some(Case(c)) ->
+              Some({ test: c.test, when: c.arms.map(|a: { when: Int, body: Block }| a.when) }),
+            _ -> None,
+          },
+          None -> None,
+        },
+        Some({ test: TTag([b"m.Warm", b"m.Cool"]), when: [0] }),
+      )
+    },
+  };
+  match printed_of(src, b"settled") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) -> {
+      assert(text.index_of(b"  if (((p0) & 7) != 4) {\n") != None);
+      assert(text.index_of(b"  if (((p0) & 7) == 4) {\n") != None);
+      assert(text.index_of(b")->layout == @@Tm.Cool@@) {\n") != None)
+    },
+  }
+}
+
+test "a list pattern tests the list's length, then reads each item it tests or binds" {
+  let xs = { id: 0, ty: ty(b"List", [ty(b"Int", [])]), rep: RWord };
+  let src = b"fn leading(xs: List<Int>) -> Int = match xs { [] -> 0, [x] -> x, [x, _, ..] -> x }\n";
+  match body_of(src, b"leading") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      let opened = arms_of(body).map(opening);
+      assert_eq(
+        opened.map(|o: Option<{ test: Test, when: Int, body: Block }>|
+          match o { Some(x) -> Some({ test: x.test, when: x.when }), None -> None }),
+        [
+          Some({ test: TLength({ at_least: 1 }), when: 0 }),
+          Some({ test: TLength({ at_least: 2 }), when: 1 }),
+          Some({ test: TLength({ at_least: 2 }), when: 2 }),
+        ],
+      );
+      // The item is read as a word with a count of its own, then held as an `Int` is.
+      let item = { id: 1, ty: ty(b"Int", []), rep: RWord };
+      assert_eq(match opened.at(1) { Some(Some(x)) -> x.body.take(2), _ -> [] }, [
+        bind(
+          item,
+          Native({
+            name: b"rt_list_at_p",
+            args: [AVar(xs), AInt(0)],
+            uses: { takes: [false, false], owned: true, fails: true, stops: false },
+          }),
+        ),
+        bind(int_var(2), Pack({ arg: AVar(item), to: RInt })),
+      ])
+    },
+  };
+  match printed_of(src, b"leading") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) -> {
+      assert(text.index_of(b"  if ((int64_t)ply_obj(p0)->len == INT64_C(0)) {\n") != None);
+      assert(text.index_of(b"  if ((int64_t)ply_obj(p0)->len >= INT64_C(2)) {\n") != None)
+    },
+  }
+}
+
+test "a record or tuple pattern tests nothing and reads the fields it binds" {
+  match body_of(b"fn pair(p: (Int, Int)) -> Int = { let (a, b) = p; a * b }\n", b"pair") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      assert_eq(
+        body.filter(|i: Inst|
+          match i { Case(_) -> true, If(_) -> true, Match(_) -> true, _ -> false }),
+        [],
+      );
+      assert_eq(
+        body.take(2).map(|i: Inst| match read_at(i) { Some(r) -> r.of.id, None -> 0 - 1 }),
+        [0, 0],
+      )
+    },
+  };
+  match body_of(
+      b"fn total(p: { a: Int, b: Int }) -> Int = match p { { a, b } -> a + b }\n",
+      b"total",
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(arms_of(body).map(|a: Block| a.take(2).map(|i: Inst| read_at(i) != None)), [
+        [true, true],
+      ]),
+  }
+}
+
+test "a refutable let tests its pattern and fails the let where it does not hold" {
+  let o = maybe_int(0);
+  let n = int_var(1);
+  assert_eq(
+    body_of(
+      b"fn unwrap(o: Option<Int>) -> Int / {abort.raise} = { let Some(n) = o; n }\n",
+      b"unwrap",
+    ),
+    Ok([
+      Case({
+        on: o,
+        test: TTag([b"None", b"Some"]),
+        arms: [{ when: 1, body: [] }],
+        rest: [Fail(b"let")],
+      }),
+      bind(n, Get({ of: o, path: PArg({ ctor: b"Some", at: 0 }) })),
+      Return(AVar(n)),
+    ]),
+  )
+}
+
+test "a value compared with a constructor of its sum is a Bool joined from the constructor's test" {
+  let o = maybe_int(0);
+  let r = bool_var(1);
+  let set = |b: Bool| [Assign({ var: r, arg: ABool(b) })];
+  assert_eq(
+    body_of(b"fn unset(o: Option<Int>) -> Bool = o == None\n", b"unset"),
+    Ok([
+      Decl(r),
+      Case({
+        on: o,
+        test: TTag([b"None", b"Some"]),
+        arms: [{ when: 0, body: set(true) }],
+        rest: set(false),
+      }),
+      Return(AVar(r)),
+    ]),
+  );
+  // An argument is tested as its pattern would be, where the constructor held.
+  let n = int_var(2);
+  assert_eq(
+    body_of(b"fn not_three(o: Option<Int>) -> Bool = o != Some(3)\n", b"not_three"),
+    Ok([
+      Decl(r),
+      Case({
+        on: o,
+        test: TTag([b"None", b"Some"]),
+        arms: [
+          {
+            when: 1,
+            body: [
+              bind(n, Get({ of: o, path: PArg({ ctor: b"Some", at: 0 }) })),
+              Case({
+                on: n,
+                test: TInt([3]),
+                arms: [{ when: 0, body: set(false) }],
+                rest: set(true),
+              }),
+            ],
+          },
+        ],
+        rest: set(true),
+      }),
+      Return(AVar(r)),
+    ]),
+  );
+  // A constructor inside one is tested as its pattern would be, under the test that reads it.
+  let nested = Bytes::concat_all([
+    b"type Spec = | Zeroed | Tagged\n",
+    b"type Kind = | Plain | Sum(Spec)\n",
+    b"fn zeroed(k: Kind) -> Bool = k == Sum(Zeroed)\n",
+  ]);
+  match body_of(nested, b"zeroed") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        match body.at(1) {
+          Some(Case(c)) -> match c.arms.at(0) {
+            Some(a) -> match a.body.at(1) {
+              Some(Case(inner)) ->
+                Some({
+                  outer: { test: c.test, when: a.when, rest: c.rest },
+                  inner: {
+                    test: inner.test,
+                    when: inner.arms.map(|x: { when: Int, body: Block }| x.when),
+                    rest: inner.rest,
+                  },
+                }),
+              _ -> None,
+            },
+            None -> None,
+          },
+          _ -> None,
+        },
+        Some({
+          outer: {
+            test: TTag([b"m.Plain", b"m.Sum"]),
+            when: 1,
+            rest: [Assign({ var: bool_var(1), arg: ABool(false) })],
+          },
+          inner: {
+            test: TTag([b"m.Zeroed", b"m.Tagged"]),
+            when: [0],
+            rest: [Assign({ var: bool_var(1), arg: ABool(false) })],
+          },
+        }),
+      ),
+  };
+  // A variable's value is compared by its type's equality, with the constructor on either side.
+  match body_of(b"fn holds_n(o: Option<Int>, n: Int) -> Bool = Some(n) == o\n", b"holds_n") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        match body.at(1) {
+          Some(Case(c)) -> match c.arms.at(0) {
+            Some(a) ->
+              a.body.map(|i: Inst|
+                match i {
+                  Let(l) -> match l.val {
+                    Prim(p) -> Some(p.op),
+                    Get(_) -> Some(b"get"),
+                    _ -> None,
+                  },
+                  If(x) -> if x.otherwise
+                      == [
+                        Assign({
+                          var: { id: 2, ty: ty(b"Bool", []), rep: RBool },
+                          arg: ABool(false),
+                        }),
+                      ] { Some(b"if") }
+                  else { None },
+                  _ -> None,
+                }),
+            None -> [],
+          },
+          _ -> [],
+        },
+        [Some(b"get"), Some(b"eq"), Some(b"if")],
+      ),
+  }
+}
+
+test "a literal of any other type is tested by its type's equality" {
+  match body_of(b"fn half(f: Float) -> Int = match f { 0.5 -> 1, _ -> 0 }\n", b"half") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        match arms_of(body).at(0) {
+          Some([Let(l), If(x)]) -> match l.val {
+            Prim(p) ->
+              Some({ op: p.op, on: p.on, tested: x.cond == AVar(l.var), otherwise: x.otherwise }),
+            _ -> None,
+          },
+          _ -> None,
+        },
+        Some({ op: b"eq", on: RFloat, tested: true, otherwise: [Miss] }),
+      ),
+  };
+  // A string's equality is its own family's: lowered as an `If` on what it answers, or declined by it.
+  match program_of(b"fn word(s: String) -> Int = match s { \"one\" -> 1, _ -> 0 }\n") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match formed(p, b"word") {
+      Ok(f) ->
+        assert(match arms_of(f.body).at(0) {
+          Some(a) -> a.any(|i: Inst| match i { If(_) -> true, _ -> false }),
+          None -> false,
+        }),
+      Err(no) -> assert_eq(no.by, Scalars),
+    },
+  }
+}
+
+test "a match prints its arms as tests that go to the next arm's label where they do not hold" {
+  match printed_of(
+      b"fn digit(n: Int) -> Int = match n { 0 -> 10, 1..=9 -> n, _ -> 99 }\n",
+      b"digit",
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) ->
+      assert(
+        holds_run(text.split(b"\n"), [
+          b"  int64_t t1 = 0;",
+          b"  if ((p0) == INT64_C(0)) {",
+          b"    t1 = INT64_C(10);",
+          b"  } else {",
+          b"    goto ply_m0_1;",
+          b"  }",
+          b"  goto ply_m0_end;",
+          b"  ply_m0_1: ;",
+          b"  if ((p0) >= INT64_C(1) && (p0) <= INT64_C(9)) {",
+          b"    t1 = p0;",
+          b"  } else {",
+          b"    goto ply_m0_2;",
+          b"  }",
+          b"  goto ply_m0_end;",
+          b"  ply_m0_2: ;",
+          b"  t1 = INT64_C(99);",
+          b"  goto ply_m0_end;",
+          b"  ply_m0_3: ;",
+          b"  rt_no_match_p(ctx); return 0;",
+          b"  ply_m0_end: ;",
+          b"  ctx->fuel += 1;",
+          b"  return t1;",
+        ]),
+      ),
+  };
+  let area = b"type Shape = | Circle(Float) | Dot\nfn round(s: Shape) -> Bool = match s { Circle(_) -> true, Dot -> false }\n";
+  match printed_of(area, b"round") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) -> assert(text.index_of(b"  if (ply_obj(p0)->layout == @@Tm.Circle@@) {\n") != None),
+  };
+  match printed_of(b"fn small(n: U8) -> Int = match n { 255u8 -> 1, _ -> 0 }\n", b"small") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) -> assert(text.index_of(b"  if ((p0) == ((uint8_t)INT64_C(255))) {\n") != None),
+  };
+  match printed_of(
+      b"fn unwrap(o: Option<Int>) -> Int / {abort.raise} = { let Some(n) = o; n }\n",
+      b"unwrap",
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) ->
+      assert(
+        text.index_of(
+            b"  if ((p0) != 0) {\n  } else {\n    rt_let_no_match_p(ctx); return 0;\n  }\n",
+          )
+          != None,
+      ),
+  }
+}
+
+/// Fresh programs holding every construct the `matches` lang tests and the `let` patterns of the
+/// `records` and `tuples` ones use.
+fn corpus() -> Bytes =
+  Bytes::concat_all([
+    b"type Shape = | Circle(Float) | Rect(Int, Int) | Dot\n",
+    b"type Tone = | Warm | Cool\n",
+    b"fn digit(n: Int) -> Int = match n { 0 -> 10, 1..=9 -> n, _ -> 99 }\n",
+    b"fn flag(b: Bool) -> Int = match b { true -> 1, false -> 0 }\n",
+    b"fn unit_arm(u: Unit) -> Int = match u { () -> 1 }\n",
+    b"fn half(f: Float) -> Int = match f { 0.5 -> 1, _ -> 0 }\n",
+    b"fn small(n: U8) -> Int = match n { 255u8 -> 1, 0u8..=9u8 -> 2, _ -> 0 }\n",
+    b"fn high(n: U64) -> Int = match n { 0u64..=9u64 -> 1, 0x8000_0000_0000_0000u64..=0xFFFF_FFFF_FFFF_FFFFu64 -> 2, _ -> 0 }\n",
+    b"fn seven() -> Int = match 7 { 8 -> 1, 7 -> 2, _ -> 0 }\n",
+    b"fn guarded(n: Int, even: Bool) -> Int = match n { 0..=9 if even -> 1, 0..=99 -> 2, _ -> 0 }\n",
+    b"fn either(n: Int) -> Int = match n { 1 | 2 -> 1, _ -> 0 }\n",
+    b"fn area(s: Shape) -> Int = match s { Circle(_) -> 1, Rect(w, h) -> w * h, Dot -> 0 }\n",
+    b"fn warm(t: Tone) -> Bool = match t { Warm -> true, Cool -> false }\n",
+    b"fn payload(o: Option<Int>) -> Int = match o { Some(n) -> n, None -> 0 }\n",
+    b"fn few(o: Option<Int>) -> Int = match o { Some(1..=3) -> 1, Some(_) -> 2, None -> 3 }\n",
+    b"fn settled(r: Result<Int, Tone>) -> Int = match r { Ok(n) -> n, Err(Warm) -> 1, Err(Cool) -> 2 }\n",
+    b"fn leading(xs: List<Int>) -> Int = match xs { [] -> 0, [x] -> x, [x, y, ..] -> x + y }\n",
+    b"fn rest_of(xs: List<Int>) -> List<Int> = match xs { [_, ..rest] -> rest, _ -> xs }\n",
+    b"fn leads(xs: List<Int>) -> Int = match xs { [0..=9, ..] -> 1, _ -> 0 }\n",
+    b"fn total(p: { a: Int, b: Int }) -> Int = match p { { a, b } -> a + b }\n",
+    b"fn pair(p: (Int, Int)) -> Int = { let (a, b) = p; a * b }\n",
+    b"fn field_a(p: { a: Int, b: Int }) -> Int = { let { a, .. } = p; a }\n",
+    b"fn unwrap(o: Option<Int>) -> Int / {abort.raise} = { let Some(n) = o; n }\n",
+    b"fn unset(o: Option<Int>) -> Bool = o == None\n",
+    b"fn not_three(o: Option<Int>) -> Bool = o != Some(3)\n",
+    b"fn holds_n(o: Option<Int>, n: Int) -> Bool = Some(n) == o\n",
+    b"fn is_warm(t: Tone) -> Bool = t == Warm\n",
+    b"fn warm_err(r: Result<Int, Tone>) -> Bool = r != Err(Warm)\n",
+    b"fn word(s: String) -> Int = match s { \"one\" -> 1, _ -> 0 }\n",
+  ])
+
+fn corpus_names() -> List<Bytes> =
+  [
+    b"digit",
+    b"flag",
+    b"unit_arm",
+    b"half",
+    b"small",
+    b"high",
+    b"seven",
+    b"guarded",
+    b"either",
+    b"area",
+    b"warm",
+    b"payload",
+    b"few",
+    b"settled",
+    b"leading",
+    b"rest_of",
+    b"leads",
+    b"total",
+    b"pair",
+    b"field_a",
+    b"unwrap",
+    b"unset",
+    b"not_three",
+    b"holds_n",
+    b"is_warm",
+    b"warm_err",
+    b"word",
+  ]
+
+/// Whether `why` is a fault the check finds in a form no ownership pass has counted, or in an
+/// instruction it does not walk yet: both go once `own` runs in `compare.checked`.
+fn uncounted(why: Bytes) -> Bool =
+  why.starts_with(b"a count left held")
+    || why == b"a failure path that releases other than what it holds"
+    || why.index_of(b"does not walk yet") != None
+
+test "the corpus lowers but for what another family declines, and the check finds nothing in what it counts and walks" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let outcomes = corpus_names().map(|n: Bytes| { name: n, form: formed(p, n) });
+      assert_eq(
+        outcomes.fold(
+          [],
+          |acc: List<{ name: Bytes, why: Bytes }>, o: { name: Bytes, form: Result<Fn, Declined> }|
+            match o.form {
+              Err(no) -> if no.by == Matching || no.by == Spine {
+                acc.push({ name: o.name, why: no.why })
+              } else { acc },
+              Ok(f) -> match verified(f) {
+                Some(why) -> if uncounted(why) { acc }
+                else { acc.push({ name: o.name, why: why }) },
+                None -> acc,
+              },
+            },
+        ),
+        [],
+      );
+      // A string's equality is the scalars' family's; every other root lowers.
+      assert_eq(
+        outcomes.filter(|o: { name: Bytes, form: Result<Fn, Declined> }|
+          match o.form { Err(_) -> o.name != b"word", Ok(_) -> false }).map(
+          |o: { name: Bytes, form: Result<Fn, Declined> }| o.name,
+        ),
+        [],
+      )
+    },
+  }
+}
+
+/// Each corpus root whose C differs from today's emitter's on purpose, and why.
+fn differing() -> List<{ name: Bytes, why: Bytes }> = {
+  let chain = b"a Miss chain: arms are labels a failing test goes to, where today's emitter tests a flag";
+  let read = b"a read of a field or argument, which family A's printer writes";
+  let joined = b"a comparison joined from its constructor's test, where today's emitter writes one expression";
+  [
+    { name: b"digit", why: chain },
+    { name: b"flag", why: chain },
+    { name: b"unit_arm", why: chain },
+    { name: b"half", why: chain },
+    { name: b"small", why: chain },
+    { name: b"high", why: chain },
+    { name: b"seven", why: chain },
+    { name: b"guarded", why: chain },
+    { name: b"either", why: chain },
+    { name: b"area", why: chain },
+    { name: b"warm", why: chain },
+    { name: b"payload", why: chain },
+    { name: b"few", why: chain },
+    { name: b"settled", why: chain },
+    { name: b"leading", why: chain },
+    { name: b"rest_of", why: chain },
+    { name: b"leads", why: chain },
+    { name: b"total", why: chain },
+    { name: b"pair", why: read },
+    { name: b"field_a", why: read },
+    { name: b"unwrap", why: read },
+    { name: b"unset", why: joined },
+    { name: b"not_three", why: joined },
+    { name: b"holds_n", why: joined },
+    { name: b"is_warm", why: joined },
+    { name: b"warm_err", why: joined },
+    { name: b"word", why: chain },
+  ]
+}
+
+test "the corpus prints as today's emitter writes it, but for the roots that differ on purpose" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let today = answered_today(p, corpus_names());
+      let lowered = corpus_names().filter(|n: Bytes|
+        match formed(p, n) { Ok(_) -> true, Err(_) -> false });
+      let writes = |n: Bytes|
+        today_text(today, n).index_of(b"_entry(PlyCtx *ctx, const Word *args) {") != None;
+      let compared = lowered.filter(writes);
+      let differ = compared.filter(|n: Bytes| {
+        let form = match formed(p, n) {
+          Ok(f) -> normalised(spelled(printed_fn(f).pieces)),
+          Err(no) -> [no.why],
+        };
+        form != normalised(today_text(today, n))
+      });
+      assert_eq(
+        differ,
+        differing().map(|d: { name: Bytes, why: Bytes }| d.name).filter(|n: Bytes|
+          compared.contains(n)),
+      );
+      // `answered_today` hands today's emitter no constructor table, so it may refuse a root naming one.
+      let naming = [
+        b"area",
+        b"warm",
+        b"payload",
+        b"few",
+        b"settled",
+        b"unwrap",
+        b"unset",
+        b"not_three",
+        b"holds_n",
+        b"is_warm",
+        b"warm_err",
+      ];
+      assert_eq(lowered.filter(|n: Bytes| !writes(n) && !naming.contains(n)), [])
+    },
+  }
+}
