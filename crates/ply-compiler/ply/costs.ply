@@ -20,6 +20,7 @@ import front (Analysis, Rows, WalkedFacts, KnownDefRow, KnownTestRow, Analysed, 
               analyse, analyse_pulling_std, cuts_of, facts_read, rows_of, walked_facts)
 import hash (hex)
 import interface (stubbed)
+import semantics (Handed, Element, Threaded, Taken, Number, Unsaid, Folded, prelude_iterates)
 import diagnostics (ParsedSource, parse_all)
 import std.bin
 import std.hash (blake3)
@@ -534,7 +535,7 @@ fn app(
     _ -> walk(env, func, state).state,
   };
   let walked: Args = args.fold({ state: before, owners: [] }, |acc: Args, arg: Code| {
-    let w = match callback_owners(builtin, acc.owners.len(), n, acc.owners) {
+    let w = match callback_owners(builtin, acc.owners.len(), acc.owners) {
       Some(owners) -> callback(env, owners, arg, acc.state),
       None -> walk(env, arg, acc.state),
     };
@@ -598,10 +599,15 @@ fn result_owner(env: Env, builtin: Option<Bytes>, callee: Option<Int>, args: Lis
       blocked(CElement, b"`List::at` answers a clone the list still holds")
     } else if b == b"Array::at" || b == b"Array::get" {
       blocked(CElement, Bytes::concat_all([b"`", b, b"` answers a clone the array still holds"]))
-    } else if b == b"List::fold" {
-      unknown(CCall, b"`List::fold` answers whatever its callback answered")
     } else if b == b"bracket" { unknown(CCall, b"`bracket` answers whatever its body answered") }
-    else { FreshOwner },
+    else {
+      match prelude_iterates(b) {
+        Some(it) -> if it.answer == Folded {
+          unknown(CCall, Bytes::concat_all([b"`", b, b"` answers whatever its callback answered"]))
+        } else { FreshOwner },
+        None -> FreshOwner,
+      }
+    },
   }
 
 /// The builtins that answer entries the map goes on holding; a pop or a split hands over what the
@@ -612,27 +618,36 @@ fn reads_entries(b: Bytes) -> Bool =
     || b == b"Map::above"
     || b == b"Map::range"
 
+/// Who owns each parameter of the function a builtin is handed at `position`, as its entry says:
+/// `done` are the owners of the arguments before it.
 fn callback_owners(
   builtin: Option<Bytes>,
   position: Int,
-  arity: Int,
   done: List<Owner>,
 ) -> Option<List<Owner>> =
-  if position + 1 != arity { None } else {
-    match builtin {
+  match builtin {
+    None -> None,
+    Some(b) -> match prelude_iterates(b) {
       None -> None,
-      Some(b) -> if b == b"List::fold" {
-        Some([
-          match done.at(1) { Some(o) -> o, None -> unknown(CCall, b"the seed of this fold") },
-          element(),
-        ])
-      } else if b == b"List::map" || b == b"List::filter" { Some([element()]) }
-      else if b == b"Map::update" {
-        Some([
-          match done.at(0) { Some(o) -> o, None -> unknown(CMapEntry, b"the map being updated") },
-        ])
-      } else { None },
-    }
+      Some(it) -> if it.callback != position { None } else {
+        let given = |k: Int|
+          match done.at(k) {
+            Some(o) -> o,
+            None -> unknown(CCall, b"an argument the call is handed after its callback"),
+          };
+        Some(
+          it.params.map(|h: Handed|
+            match h {
+              Element -> element(),
+              Threaded(k) -> given(k),
+              Taken(k) -> given(k),
+              Number -> FreshOwner,
+              Unsaid ->
+                unknown(CClosure, b"a parameter of a closure whose caller this body does not name"),
+            }),
+        )
+      },
+    },
   }
 
 fn callback(
@@ -1956,6 +1971,27 @@ test "a `returns` clause is shown of its body, and one the body does not keep is
     (b"m.folded", b"fresh", b"`List::fold` answers whatever its callback answered"),
   ]);
   assert_eq(src.slice(r.unkept.get(0).start, r.unkept.get(0).end), b"ys")
+}
+
+test "a function a builtin calls back is handed what its entry says, and a fold answers what it answered" {
+  let src = Bytes::concat_all([
+    b"fn grown(xs: List<Int>) -> List<Int> = xs.fold([], |acc: List<Int>, x: Int| acc.push(x))\n",
+    b"fn each(xss: List<List<Int>>) -> List<List<Int>> = xss.map(|ys: List<Int>| ys.push(1))\n",
+    b"fn values(m: Map<Int, Int>) -> List<Int> returns fresh = m.fold([], |acc: List<Int>, k: Int, v: Int| acc.push(v))\n",
+  ]);
+  let r = reported([b"m"], [src]);
+  assert(r.ok);
+  let site_of = |name: Bytes| r.defs.filter(|d: Costed| d.name == name).get(0).sites.get(0);
+  // A fold's accumulator is its seed on the first call, made here.
+  assert_eq(site_of(b"grown").verdict, b"reuses");
+  let each = site_of(b"each");
+  assert_eq([each.verdict, each.reason], [
+    b"copies",
+    b"an element the list being walked still holds",
+  ]);
+  assert_eq(r.unkept.map(|u: Unkept| (u.name, u.answers)), [
+    (b"m.values", b"`Map::fold` answers whatever its callback answered"),
+  ])
 }
 
 test "another package's definition answers what its `returns` clause says, its body unread" {

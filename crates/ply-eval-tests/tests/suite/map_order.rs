@@ -289,77 +289,71 @@ fn the_order_is_total() {
 }
 
 #[test]
-fn an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way() {
+fn an_equal_key_keeps_the_key_the_map_holds_and_takes_the_value() {
     let m = map_of(vec![
         (dec("1.50"), Value::str("first")),
         (dec("1.5"), Value::str("second")),
     ]);
-    assert_eq!(keys(&m), vec!["Decimal(1.5)"]);
-    assert_eq!(shape(&m), "Map([(Decimal(1.5), Str(\"second\"))])");
-
+    assert_eq!(shape(&m), "Map([(Decimal(1.50), Str(\"second\"))])");
     let other = map_of(vec![
         (dec("1.5"), Value::str("first")),
         (dec("1.50"), Value::str("second")),
     ]);
-    assert_eq!(
-        keys(&other),
-        vec!["Decimal(1.5)"],
-        "the surviving key is still a function of which spelling was written last"
-    );
     assert_eq!(shape(&other), "Map([(Decimal(1.5), Str(\"second\"))])");
     assert!(
         eq(&m, &other),
         "two maps that hold one key and one value are not equal"
     );
-    assert_eq!(
-        shape(&m),
-        shape(&other),
-        "two `==`-equal maps render as two different strings, so `Map::keys`, `Map::entries`, \
-         `Map::fold` and every derived encoding over them are functions of insertion history"
-    );
 }
 
 #[test]
-fn a_decimal_anywhere_under_a_key_is_canonical() {
+fn an_update_takes_the_entry_with_the_key_the_map_holds() {
+    let m = map_of(vec![(dec("1.50"), Value::Int(1))]);
+    let (rest, taken) = ply_eval::map::take(m, &dec("1.5"), Span::DUMMY).expect("a map");
+    assert!(keys(&rest).is_empty());
+    let (held, v) = taken.expect("the entry");
+    assert_eq!((shape(&held), v), (shape(&dec("1.50")), Value::Int(1)));
+}
+
+#[test]
+fn a_decimal_anywhere_under_a_key_is_one_key_however_it_is_written() {
     let field = |d: &str| {
         Value::Record(std::sync::Arc::new(ply_eval::Fields::from_iter([(
             ply_eval::Symbol::new("price"),
             dec(d),
         )])))
     };
-    let cases: Vec<(Value, Value, &str)> = vec![
+    let cases: Vec<(Value, Value)> = vec![
         (
             Value::list(vec![dec("1.50")]),
             Value::list(vec![dec("1.5")]),
-            "List([Decimal(1.5)])",
         ),
-        (
-            field("1.50"),
-            field("1.5"),
-            "Record([(\"price\", Decimal(1.5))])",
-        ),
+        (field("1.50"), field("1.5")),
         (
             Value::ctor("Box", vec![dec("2.00")]),
             Value::ctor("Box", vec![dec("2")]),
-            "Ctor(\"Box\", [Decimal(2)])",
         ),
         (
             map_of(vec![(dec("1.50"), dec("3.10"))]),
             map_of(vec![(dec("1.5"), dec("3.1"))]),
-            "Map([(Decimal(1.5), Decimal(3.1))])",
         ),
     ];
-    for (written, canonical, rendered) in cases {
+    for (written, other) in cases {
         let a = map_of(vec![(written.clone(), Value::Int(1))]);
-        let b = map_of(vec![(canonical.clone(), Value::Int(1))]);
-        assert_eq!(keys(&a), vec![rendered.to_string()]);
-        assert_eq!(keys(&b), vec![rendered.to_string()]);
+        let b = map_of(vec![(other.clone(), Value::Int(1))]);
+        assert_eq!(keys(&a), vec![shape(&written)]);
+        assert_eq!(keys(&b), vec![shape(&other)]);
         assert!(
             eq(&a, &b),
             "{} and {} are not one map",
             shape(&written),
-            shape(&canonical)
+            shape(&other)
         );
+        let both = map_of(vec![
+            (written.clone(), Value::Int(1)),
+            (other, Value::Int(2)),
+        ]);
+        assert_eq!(keys(&both), vec![shape(&written)]);
     }
 }
 

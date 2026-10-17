@@ -29,20 +29,10 @@ extern fn List::len<a>(xs: List<a>) -> Int
 /// allocation holds, or below zero, takes what it can.
 extern fn List::with_capacity<a>(n: Int) -> List<a>
 
-/// A new list with `x` at the end.
-extern fn List::push<a>(xs: List<a>, x: a) -> List<a>
-
-/// `None` if `i` is negative or past the end.
-extern fn List::at<a>(xs: List<a>, i: Int) -> Option<a>
-
-/// Raises if `i` is out of range.
-extern fn List::set<a>(xs: List<a>, i: Int, v: a) -> List<a> / {abort.raise}
-  requires 0 <= i && i < List::len(xs)
-
 /// A node of a list's trie: a leaf of up to 32 items, or a branch of up to 32 children. A list
 /// holds its items in a trie but for its last few, up to 32, which its tail holds, and a `rest` cut
-/// shares the list's trie, dropping a prefix of it. The emitter writes each function of it in place
-/// over those objects, and checks no index: each is one the object holds.
+/// shares the list's trie, dropping a prefix of it. The emitter writes each function of it but
+/// `leaf_of` in place over those objects, and checks no index: each is one the object holds.
 extern type ListNode<a>
 
 /// How many items a `rest` dropped from the front of the list's trie.
@@ -106,6 +96,112 @@ extern fn ListNode::tail_start<a>(xs: List<a>, x: a) -> List<a>
 
 /// A branch with no child.
 extern fn ListNode::branch<a>() -> ListNode<a>
+
+/// The leaf that holds the list's items from the `j`-th 32 of its trie on, counting from the leaf
+/// its first item lies in, which a `rest` cut may have dropped items of; `None` past its last leaf,
+/// and for a list that is its tail. The runtime's native, which reads down from the root.
+extern fn ListNode::leaf_of<a>(xs: List<a>, j: Int) -> Option<ListNode<a>>
+
+fn shift_from(count: Int, shift: Int) -> Int =
+  if shift >= 60 || 32 << shift >= count { shift } else { shift_from(count, shift + 5) }
+
+/// How far the root of a trie of `count` items shifts an index: zero while the root is a leaf.
+fn trie_shift(count: Int) -> Int = shift_from(count, 0)
+
+/// `None` if `i` is negative or past the end.
+pub fn List::at<a>(xs: List<a>, i: Int) -> Option<a> =
+  if i < 0 || i >= List::len(xs) { None } else {
+    let start = ListNode::start(xs);
+    let p = start + i;
+    let held = start + List::len(xs) - ListNode::tail_len(xs);
+    if p >= held { Some(ListNode::tail_at(xs, p - held)) } else {
+      match ListNode::leaf_of(xs, (p >> 5) - (start >> 5)) {
+        Some(n) -> Some(ListNode::leaf_at(n, p & 31)),
+        None -> None,
+      }
+    }
+  }
+
+/// `leaf` under a branch of one child for each level down to where nodes `shift` apart hold leaves.
+fn trie_path<a>(leaf: ListNode<a>, shift: Int) -> ListNode<a> =
+  if shift <= 0 { leaf }
+  else { ListNode::kid_swap(ListNode::branch(), 0, Some(trie_path(leaf, shift - 5))).node }
+
+/// The node `n`, whose children lie `shift` apart, with the full `leaf` holding its items from
+/// `index` on.
+fn trie_inserted<a>(n: ListNode<a>, shift: Int, index: Int, leaf: ListNode<a>) -> ListNode<a> =
+  if shift <= 0 { n } else {
+    let k = index >> shift & 31;
+    if k < ListNode::len(n) {
+      let taken = ListNode::kid_swap(n, k, None);
+      match taken.old {
+        Some(child) ->
+          ListNode::kid_swap(
+            taken.node,
+            k,
+            Some(trie_inserted(child, shift - 5, index, leaf)),
+          ).node,
+        None -> taken.node,
+      }
+    } else { ListNode::kid_swap(n, k, Some(trie_path(leaf, shift - 5))).node }
+  }
+
+/// The root of a trie of `count` items, `root`, with the full `leaf` after them.
+fn trie_pushed<a>(root: Option<ListNode<a>>, count: Int, leaf: ListNode<a>) -> ListNode<a> =
+  match root {
+    None -> leaf,
+    Some(r) -> {
+      let shift = trie_shift(count);
+      if count == 32 << shift {
+        let up = ListNode::kid_swap(ListNode::branch(), 0, Some(r)).node;
+        ListNode::kid_swap(up, 1, Some(trie_path(leaf, shift))).node
+      } else { trie_inserted(r, shift, count, leaf) }
+    },
+  }
+
+/// A new list with `x` at the end: in place where the list is held once.
+pub fn List::push<a>(xs: List<a>, x: a) -> List<a> =
+  if ListNode::tail_len(xs) < 32 { ListNode::tail_push(xs, x) } else {
+    let held = ListNode::start(xs) + List::len(xs) - 32;
+    let spilt = ListNode::spill(xs);
+    let taken = ListNode::root_swap(spilt.list, None);
+    let root = trie_pushed(taken.old, held, spilt.leaf);
+    ListNode::tail_start(ListNode::root_swap(taken.list, Some(root)).list, x)
+  }
+
+/// The node `n`, whose children lie `shift` apart, with its item `p` replaced by `v`.
+fn trie_set<a>(n: ListNode<a>, shift: Int, p: Int, v: a) -> ListNode<a> =
+  if shift <= 0 { ListNode::leaf_set(n, p & 31, v) } else {
+    let k = p >> shift & 31;
+    let taken = ListNode::kid_swap(n, k, None);
+    match taken.old {
+      Some(child) -> ListNode::kid_swap(taken.node, k, Some(trie_set(child, shift - 5, p, v))).node,
+      None -> taken.node,
+    }
+  }
+
+/// In place where the list is held once; raises if `i` is out of range.
+pub fn List::set<a>(xs: List<a>, i: Int, v: a) -> List<a> / {abort.raise}
+  requires 0 <= i && i < List::len(xs)
+=
+  if i < 0 || i >= List::len(xs) {
+    panic(
+      "`List::set` index " ++ Int::to_string(i) ++ " is outside a value of "
+        ++ Int::to_string(List::len(xs))
+        ++ " elements",
+    )
+  } else {
+    let start = ListNode::start(xs);
+    let p = start + i;
+    let held = start + List::len(xs) - ListNode::tail_len(xs);
+    if p >= held { ListNode::tail_set(xs, p - held, v) } else {
+      let taken = ListNode::root_swap(xs, None);
+      match taken.old {
+        Some(r) -> ListNode::root_swap(taken.list, Some(trie_set(r, trie_shift(held), p, v))).list,
+        None -> taken.list,
+      }
+    }
+  }
 
 /// `n` of `x`; raises if `n` is negative or past `2^26`.
 extern fn Array::new<a>(n: Int, x: a) -> Array<a> / {abort.raise}
@@ -172,29 +268,125 @@ extern fn numeric_of_int<a>(n: Int) -> a / {abort.raise}
   where numeric(a)
   requires 0 <= n && n <= 127
 
-fn mapped_from<a, b | e>(xs: List<a>, f: (a) -> b / e, i: Int, out: List<b>) -> List<b> / e =
-  match xs.at(i) { Some(x) -> mapped_from(xs, f, i + 1, out.push(f(x))), None -> out }
+// Each walk is one loop over the positions of the list's items, a frame however deep a caller
+// nests it: the tail's past the trie's first `held` items, and before them each item of the leaf
+// `n` that held the item before, which a `rest` cut's `start` offsets, asking for the next leaf only
+// where an item opens one.
+
+fn mapped_from<a, b | e>(
+  xs: List<a>,
+  start: Int,
+  held: Int,
+  p: Int,
+  n: Option<ListNode<a>>,
+  f: (a) -> b / e cost k,
+  out: List<b>,
+) -> List<b> / e =
+  if p >= List::len(xs) { out } else if p >= held {
+    mapped_from(xs, start, held, p + 1, n, f, List::push(out, f(ListNode::tail_at(xs, p - held))))
+  } else {
+    let q = start + p;
+    let leaf = match n {
+      Some(_) -> if q & 31 == 0 { ListNode::leaf_of(xs, (q >> 5) - (start >> 5)) } else { n },
+      None -> ListNode::leaf_of(xs, (q >> 5) - (start >> 5)),
+    };
+    match leaf {
+      Some(m) ->
+        mapped_from(
+          xs,
+          start,
+          held,
+          p + 1,
+          leaf,
+          f,
+          List::push(out, f(ListNode::leaf_at(m, q & 31))),
+        ),
+      None -> out,
+    }
+  }
 
 /// `f` of each item, in order.
-pub fn List::map<a, b | e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e =
-  mapped_from(xs, f, 0, List::with_capacity(xs.len()))
+pub fn List::map<a, b | e>(xs: List<a>, f: (a) -> b / e cost k) -> List<b> / e
+  cost xs.len() * k
+=
+  mapped_from(
+    xs,
+    ListNode::start(xs),
+    List::len(xs) - ListNode::tail_len(xs),
+    0,
+    None,
+    f,
+    List::with_capacity(List::len(xs)),
+  )
 
-fn kept_from<a | e>(xs: List<a>, f: (a) -> Bool / e, i: Int, out: List<a>) -> List<a> / e =
-  match xs.at(i) {
-    Some(x) -> kept_from(xs, f, i + 1, if f(x) { out.push(x) } else { out }),
-    None -> out,
+fn kept_from<a | e>(
+  xs: List<a>,
+  start: Int,
+  held: Int,
+  p: Int,
+  n: Option<ListNode<a>>,
+  f: (a) -> Bool / e cost k,
+  out: List<a>,
+) -> List<a> / e =
+  if p >= List::len(xs) { out } else if p >= held {
+    let x = ListNode::tail_at(xs, p - held);
+    kept_from(xs, start, held, p + 1, n, f, if f(x) { List::push(out, x) } else { out })
+  } else {
+    let q = start + p;
+    let leaf = match n {
+      Some(_) -> if q & 31 == 0 { ListNode::leaf_of(xs, (q >> 5) - (start >> 5)) } else { n },
+      None -> ListNode::leaf_of(xs, (q >> 5) - (start >> 5)),
+    };
+    match leaf {
+      Some(m) -> {
+        let x = ListNode::leaf_at(m, q & 31);
+        kept_from(xs, start, held, p + 1, leaf, f, if f(x) { List::push(out, x) } else { out })
+      },
+      None -> out,
+    }
   }
 
 /// The items `f` keeps, in order.
-pub fn List::filter<a | e>(xs: List<a>, f: (a) -> Bool / e) -> List<a> / e =
-  kept_from(xs, f, 0, List::with_capacity(xs.len()))
+pub fn List::filter<a | e>(xs: List<a>, f: (a) -> Bool / e cost k) -> List<a> / e
+  cost xs.len() * k
+=
+  kept_from(
+    xs,
+    ListNode::start(xs),
+    List::len(xs) - ListNode::tail_len(xs),
+    0,
+    None,
+    f,
+    List::with_capacity(List::len(xs)),
+  )
 
-fn folded_from<a, b | e>(xs: List<a>, f: (b, a) -> b / e, i: Int, acc: b) -> b / e =
-  match xs.at(i) { Some(x) -> folded_from(xs, f, i + 1, f(acc, x)), None -> acc }
+fn folded_from<a, b | e>(
+  xs: List<a>,
+  start: Int,
+  held: Int,
+  p: Int,
+  n: Option<ListNode<a>>,
+  f: (b, a) -> b / e cost k,
+  acc: b,
+) -> b / e =
+  if p >= List::len(xs) { acc } else if p >= held {
+    folded_from(xs, start, held, p + 1, n, f, f(acc, ListNode::tail_at(xs, p - held)))
+  } else {
+    let q = start + p;
+    let leaf = match n {
+      Some(_) -> if q & 31 == 0 { ListNode::leaf_of(xs, (q >> 5) - (start >> 5)) } else { n },
+      None -> ListNode::leaf_of(xs, (q >> 5) - (start >> 5)),
+    };
+    match leaf {
+      Some(m) -> folded_from(xs, start, held, p + 1, leaf, f, f(acc, ListNode::leaf_at(m, q & 31))),
+      None -> acc,
+    }
+  }
 
 /// Left to right.
-pub fn List::fold<a, b | e>(xs: List<a>, init: b, f: (b, a) -> b / e) -> b / e =
-  folded_from(xs, f, 0, init)
+pub fn List::fold<a, b | e>(xs: List<a>, init: b, f: (b, a) -> b / e cost k) -> b / e
+  cost xs.len() * k
+= folded_from(xs, ListNode::start(xs), List::len(xs) - ListNode::tail_len(xs), 0, None, f, init)
 
 /// `step` answers `Continue(next)` or `Stop(result)`; the budget bounds the steps.
 extern fn iterate<a, b | e>(
@@ -539,87 +731,9 @@ extern fn compare_values<a>(x: a, y: a) -> Ordering
 /// The map with no entries.
 extern fn Map::new<a, b>() -> Map<a, b>
 
-/// Replaces.
-extern fn Map::insert<a, b>(m: Map<a, b>, key: a, value: b) -> Map<a, b>
-
-/// No-op if `key` is absent.
-extern fn Map::update<a, b | e>(m: Map<a, b>, key: a, f: (b) -> b / e) -> Map<a, b> / e
-
-/// The value under `key`.
-extern fn Map::get<a, b>(m: Map<a, b>, key: a) -> Option<b>
-
-/// Whether the map holds `key`.
-extern fn Map::contains<a, b>(m: Map<a, b>, key: a) -> Bool
-
-/// The map without `key`; the same map when it was absent.
-extern fn Map::remove<a, b>(m: Map<a, b>, key: a) -> Map<a, b>
-
 /// How many entries the map holds.
 extern fn Map::len<a, b>(m: Map<a, b>) -> Int
   ensures 0 <= result
-
-/// Ascending.
-extern fn Map::keys<a, b>(m: Map<a, b>) -> List<a>
-
-/// Key order.
-extern fn Map::values<a, b>(m: Map<a, b>) -> List<b>
-
-/// Key order.
-extern fn Map::entries<a, b>(m: Map<a, b>) -> List<{ key: a, value: b }>
-
-/// A later entry wins.
-extern fn Map::of_entries<a, b>(es: List<{ key: a, value: b }>) -> Map<a, b>
-
-/// `b` wins.
-extern fn Map::merge<a, b>(a: Map<a, b>, b: Map<a, b>) -> Map<a, b>
-
-/// Key order.
-extern fn Map::fold<a, b, c | e>(m: Map<a, b>, init: c, f: (c, a, b) -> c / e) -> c / e
-
-/// The entry with the least key; `None` for the empty map.
-extern fn Map::first<a, b>(m: Map<a, b>) -> Option<{ key: a, value: b }>
-
-/// The entry with the greatest key; `None` for the empty map.
-extern fn Map::last<a, b>(m: Map<a, b>) -> Option<{ key: a, value: b }>
-
-/// The entry with the greatest key at or below `key`.
-extern fn Map::floor<a, b>(m: Map<a, b>, key: a) -> Option<{ key: a, value: b }>
-
-/// The entry with the least key at or above `key`.
-extern fn Map::ceiling<a, b>(m: Map<a, b>, key: a) -> Option<{ key: a, value: b }>
-
-/// The entry with the greatest key below `key`.
-extern fn Map::below<a, b>(m: Map<a, b>, key: a) -> Option<{ key: a, value: b }>
-
-/// The entry with the least key above `key`.
-extern fn Map::above<a, b>(m: Map<a, b>, key: a) -> Option<{ key: a, value: b }>
-
-/// The entry with the least key and the map without it, in place when the caller holds the last
-/// reference; `None` for the empty map.
-extern fn Map::pop_first<a, b>(m: Map<a, b>) -> Option<{ key: a, value: b, rest: Map<a, b> }>
-
-/// The entry with the greatest key and the map without it, in place when the caller holds the last
-/// reference; `None` for the empty map.
-extern fn Map::pop_last<a, b>(m: Map<a, b>) -> Option<{ key: a, value: b, rest: Map<a, b> }>
-
-/// The first `limit` entries, in key order, whose keys lie from `lo` to `hi`. `None` is no bound on
-/// its side; a bound that is not inclusive leaves its own key out; bounds that cross admit nothing,
-/// and so does a `limit` below one.
-extern fn Map::range<a, b>(
-  m: Map<a, b>,
-  lo: Option<a>,
-  lo_inclusive: Bool,
-  hi: Option<a>,
-  hi_inclusive: Bool,
-  limit: Int,
-) -> List<{ key: a, value: b }>
-
-/// The map of the entries below `key`, the value at `key`, and the map of the entries above it,
-/// sharing what they can with `m`.
-extern fn Map::split<a, b>(
-  m: Map<a, b>,
-  key: a,
-) -> { below: Map<a, b>, at: Option<b>, above: Map<a, b> }
 
 /// A node of a map's tree: a leaf of up to 32 pairs in key order, or a branch of up to 32 children,
 /// each with the greatest key under it and how many entries lie there. Every leaf of a map lies at
@@ -728,6 +842,666 @@ extern fn MapNode::map_swap<k, v>(
   height: Int,
   len: Int,
 ) -> { map: Map<k, v>, old: Option<MapNode<k, v>> }
+
+/// Where `key` stands among a leaf's keys, found `step` pairs at a time and half as many each
+/// time: how many lie below it past the `at` already passed.
+fn leaf_place<k, v>(n: MapNode<k, v>, key: k, at: Int, step: Int) -> Int
+  where derivable(ord, k)
+=
+  if step <= 0 { at } else {
+    let probe = at + step;
+    if probe <= MapNode::count(n) && compare(MapNode::key(n, probe - 1), key) == Less {
+      leaf_place(n, key, probe, step / 2)
+    } else { leaf_place(n, key, at, step / 2) }
+  }
+
+/// The child of a branch that holds `key` or would: the first whose greatest key is not below it,
+/// else the last, found as `leaf_place` finds a pair.
+fn kid_place<k, v>(n: MapNode<k, v>, key: k, at: Int, step: Int) -> Int
+  where derivable(ord, k)
+=
+  if step <= 0 { at } else {
+    let probe = at + step;
+    if probe < MapNode::count(n) && compare(MapNode::kid_max(n, probe - 1), key) == Less {
+      kid_place(n, key, probe, step / 2)
+    } else { kid_place(n, key, at, step / 2) }
+  }
+
+/// Whether the leaf's pair `i` is there and its key is the one `compare` finds `key` equal to.
+fn leaf_holds<k, v>(n: MapNode<k, v>, i: Int, key: k) -> Bool
+  where derivable(ord, k)
+= i < MapNode::count(n) && compare(MapNode::key(n, i), key) == Equal
+
+/// The greatest key under `n`, whose leaves are `depth` branches down.
+fn node_max<k, v>(n: MapNode<k, v>, depth: Int) -> k =
+  if depth <= 0 { MapNode::key(n, MapNode::count(n) - 1) }
+  else { MapNode::kid_max(n, MapNode::count(n) - 1) }
+
+/// How many entries the branch's children before `end` hold, from child `i` on, past `total`.
+fn kid_sizes_before<k, v>(n: MapNode<k, v>, i: Int, end: Int, total: Int) -> Int =
+  if i >= 33 || i >= end { total }
+  else { kid_sizes_before(n, i + 1, end, total + MapNode::kid_size(n, i)) }
+
+/// How many entries lie under `n`, whose leaves are `depth` branches down.
+fn node_size<k, v>(n: MapNode<k, v>, depth: Int) -> Int =
+  if depth <= 0 { MapNode::count(n) } else { kid_sizes_before(n, 0, MapNode::count(n), 0) }
+
+/// The child of the branch `n` that its entry `rank` lies under, from child `i` on, `before`
+/// entries lying before child `i`.
+fn kid_of_rank<k, v>(n: MapNode<k, v>, rank: Int, i: Int, before: Int) -> Int =
+  if i >= 32 || i + 1 >= MapNode::count(n) || rank < before + MapNode::kid_size(n, i) { i }
+  else { kid_of_rank(n, rank, i + 1, before + MapNode::kid_size(n, i)) }
+
+/// The value under `key` in the tree `n`, whose leaves are `depth` branches down, found in one
+/// loop: while `step` is above zero, the place `leaf_place` or `kid_place` finds is sought past
+/// `at`; then the leaf's value at that place, or what the child at it holds.
+fn found_under<k, v>(n: MapNode<k, v>, key: k, depth: Int, at: Int, step: Int) -> Option<v>
+  where derivable(ord, k)
+=
+  if step > 0 {
+    let probe = at + step;
+    let past = if depth <= 0 {
+      probe <= MapNode::count(n) && compare(MapNode::key(n, probe - 1), key) == Less
+    } else { probe < MapNode::count(n) && compare(MapNode::kid_max(n, probe - 1), key) == Less };
+    found_under(n, key, depth, if past { probe } else { at }, step / 2)
+  } else if depth > 0 { found_under(MapNode::kid(n, at), key, depth - 1, 0, 32) }
+  else if at < MapNode::count(n) && compare(MapNode::key(n, at), key) == Equal {
+    Some(MapNode::value(n, at))
+  } else { None }
+
+/// Where `key` stands under `n`, whose leaves are `depth` branches down, as `map_rank` answers,
+/// `below` keys already counted below it.
+fn key_located<k, v>(n: MapNode<k, v>, key: k, depth: Int, below: Int) -> Int
+  where derivable(ord, k)
+=
+  if depth <= 0 {
+    let i = leaf_place(n, key, 0, 32);
+    2 * (below + i) + (if leaf_holds(n, i, key) { 1 } else { 0 })
+  } else {
+    let i = kid_place(n, key, 0, 32);
+    key_located(MapNode::kid(n, i), key, depth - 1, below + kid_sizes_before(n, 0, i, 0))
+  }
+
+/// Where `key` stands in the map's key order: twice how many keys lie below it, and one more where
+/// the map holds it.
+fn map_rank<k, v>(m: Map<k, v>, key: k) -> Int =
+  match MapNode::root(m) { None -> 0, Some(r) -> key_located(r, key, MapNode::height(m), 0) }
+
+/// The entry `rank` of the key order under `n`, whose leaves are `depth` branches down.
+fn node_entry_at<k, v>(n: MapNode<k, v>, depth: Int, rank: Int) -> { key: k, value: v } =
+  if depth <= 0 { { key: MapNode::key(n, rank), value: MapNode::value(n, rank) } } else {
+    let i = kid_of_rank(n, rank, 0, 0);
+    node_entry_at(MapNode::kid(n, i), depth - 1, rank - kid_sizes_before(n, 0, i, 0))
+  }
+
+/// The entry `rank` of the map's key order; `None` past either end.
+fn map_at<k, v>(m: Map<k, v>, rank: Int) -> Option<{ key: k, value: v }> =
+  if rank < 0 || rank >= Map::len(m) { None } else {
+    match MapNode::root(m) {
+      None -> None,
+      Some(r) -> Some(node_entry_at(r, MapNode::height(m), rank)),
+    }
+  }
+
+/// The leaf `n` with `value` under `key`, and the leaf split off past it where it was full: a
+/// key `compare` finds equal to one it holds keeps that key, and its value is replaced.
+fn leaf_put<k, v>(
+  n: MapNode<k, v>,
+  key: k,
+  value: v,
+) -> { added: Bool, node: MapNode<k, v>, right: Option<MapNode<k, v>> }
+  where derivable(ord, k)
+= {
+  let count = MapNode::count(n);
+  let i = leaf_place(n, key, 0, 32);
+  if leaf_holds(n, i, key) {
+    let kept = MapNode::key(n, i);
+    { added: false, node: MapNode::pair_set(n, i, kept, value), right: None }
+  } else if count < 32 { { added: true, node: MapNode::pair_put(n, i, key, value), right: None } }
+  else {
+    let halves = MapNode::leaf_cut(n, 16);
+    if i <= 16 {
+      {
+        added: true,
+        node: MapNode::pair_put(halves.left, i, key, value),
+        right: Some(halves.right),
+      }
+    } else {
+      {
+        added: true,
+        node: halves.left,
+        right: Some(MapNode::pair_put(halves.right, i - 16, key, value)),
+      }
+    }
+  }
+}
+
+/// The node `n`, whose leaves are `depth` branches down, with `value` under `key`, the node split
+/// off past it where it grew past what one holds, and whether it holds one entry more.
+fn node_put<k, v>(
+  n: MapNode<k, v>,
+  depth: Int,
+  key: k,
+  value: v,
+) -> { added: Bool, node: MapNode<k, v>, right: Option<MapNode<k, v>> }
+  where derivable(ord, k)
+=
+  if depth <= 0 { leaf_put(n, key, value) } else {
+    let i = kid_place(n, key, 0, 32);
+    let size = MapNode::kid_size(n, i);
+    let out = MapNode::kid_out(n, i);
+    let below = node_put(out.kid, depth - 1, key, value);
+    let grown = if below.added { size + 1 } else { size };
+    match below.right {
+      None -> {
+        let max = node_max(below.node, depth - 1);
+        {
+          added: below.added,
+          node: MapNode::kid_back(out.node, i, below.node, max, grown),
+          right: None,
+        }
+      },
+      Some(r) -> {
+        let moved = node_size(r, depth - 1);
+        let max = node_max(below.node, depth - 1);
+        let back = MapNode::kid_back(out.node, i, below.node, max, grown - moved);
+        let right_max = node_max(r, depth - 1);
+        let wide = MapNode::kid_put(back, i + 1, r, right_max, moved);
+        if MapNode::count(wide) <= 32 { { added: below.added, node: wide, right: None } } else {
+          let halves = MapNode::branch_cut(wide, MapNode::count(wide) / 2);
+          { added: below.added, node: halves.left, right: Some(halves.right) }
+        }
+      },
+    }
+  }
+
+/// The node `n`, whose leaves are `depth` branches down and one of which holds `key`, with `f` of
+/// that key's value in its place: the leaf holds neither while `f` runs.
+fn node_updated<k, v | e>(
+  n: MapNode<k, v>,
+  depth: Int,
+  key: k,
+  f: (v) -> v / e,
+) -> MapNode<k, v> / e
+  where derivable(ord, k)
+=
+  if depth <= 0 {
+    let i = leaf_place(n, key, 0, 32);
+    let taken = MapNode::pair_take(n, i);
+    MapNode::pair_put(taken.node, i, taken.key, f(taken.value))
+  } else {
+    let i = kid_place(n, key, 0, 32);
+    let size = MapNode::kid_size(n, i);
+    let out = MapNode::kid_out(n, i);
+    let kid = node_updated(out.kid, depth - 1, key, f);
+    let max = node_max(kid, depth - 1);
+    MapNode::kid_back(out.node, i, kid, max, size)
+  }
+
+/// The node `n`, whose leaves are `depth` branches down and one of which holds a key `compare`
+/// finds equal to `key`, with `key` in that key's place and its value as it was.
+fn node_rekeyed<k, v>(n: MapNode<k, v>, depth: Int, key: k) -> MapNode<k, v>
+  where derivable(ord, k)
+=
+  if depth <= 0 {
+    let i = leaf_place(n, key, 0, 32);
+    let taken = MapNode::pair_take(n, i);
+    MapNode::pair_put(taken.node, i, key, taken.value)
+  } else {
+    let i = kid_place(n, key, 0, 32);
+    let size = MapNode::kid_size(n, i);
+    let out = MapNode::kid_out(n, i);
+    let kid = node_rekeyed(out.kid, depth - 1, key);
+    let max = node_max(kid, depth - 1);
+    MapNode::kid_back(out.node, i, kid, max, size)
+  }
+
+/// The node `n`, whose leaves are `depth` branches down and one of which holds a key `compare`
+/// finds equal to `key`, without that entry; none where that emptied it.
+fn node_removed<k, v>(n: MapNode<k, v>, depth: Int, key: k) -> Option<MapNode<k, v>>
+  where derivable(ord, k)
+=
+  if depth <= 0 {
+    let i = leaf_place(n, key, 0, 32);
+    let rest = MapNode::pair_take(n, i).node;
+    if MapNode::count(rest) == 0 { None } else { Some(rest) }
+  } else {
+    let i = kid_place(n, key, 0, 32);
+    let size = MapNode::kid_size(n, i);
+    let out = MapNode::kid_out(n, i);
+    match node_removed(out.kid, depth - 1, key) {
+      None -> {
+        let dropped = MapNode::kid_drop(out.node, i);
+        if MapNode::count(dropped) == 0 { None } else { Some(dropped) }
+      },
+      Some(kid) -> {
+        let max = node_max(kid, depth - 1);
+        Some(MapNode::kid_back(out.node, i, kid, max, size - 1))
+      },
+    }
+  }
+
+/// The height of the tree a map holds the tree `n` of `height` by: a branch of one child is that
+/// child, one level lower.
+fn settled_height<k, v>(n: MapNode<k, v>, height: Int) -> Int =
+  if height <= 0 || MapNode::count(n) != 1 { height }
+  else { settled_height(MapNode::kid(n, 0), height - 1) }
+
+/// The root a map holds the tree `n` of `height` by, as `settled_height` reads it.
+fn settled_root<k, v>(n: MapNode<k, v>, height: Int) -> MapNode<k, v> =
+  if height <= 0 || MapNode::count(n) != 1 { n }
+  else { settled_root(MapNode::kid_out(n, 0).kid, height - 1) }
+
+/// The map with `root`, a tree of `height`, as its tree, settled, and `len` entries.
+fn map_rooted<k, v>(m: Map<k, v>, root: Option<MapNode<k, v>>, height: Int, len: Int) -> Map<k, v> =
+  match root {
+    None -> MapNode::map_swap(m, None, 0, len).map,
+    Some(n) -> {
+      let settled = settled_height(n, height);
+      MapNode::map_swap(m, Some(settled_root(n, height)), settled, len).map
+    },
+  }
+
+/// The map without the key `compare` finds equal to `key`, which it holds.
+fn map_removed<k, v>(m: Map<k, v>, key: k) -> Map<k, v>
+  where derivable(ord, k)
+= {
+  let height = MapNode::height(m);
+  let len = Map::len(m);
+  let taken = MapNode::map_swap(m, None, height, len);
+  match taken.old {
+    None -> taken.map,
+    Some(root) -> map_rooted(taken.map, node_removed(root, height, key), height, len - 1),
+  }
+}
+
+/// The map with `key`, which `compare` finds equal to a key the map holds, in that key's place.
+fn map_rekeyed<k, v>(m: Map<k, v>, key: k) -> Map<k, v> = {
+  let height = MapNode::height(m);
+  let len = Map::len(m);
+  let taken = MapNode::map_swap(m, None, height, len);
+  match taken.old {
+    None -> taken.map,
+    Some(root) ->
+      MapNode::map_swap(taken.map, Some(node_rekeyed(root, height, key)), height, len).map,
+  }
+}
+
+/// `out` and the first `left` entries under `n`, whose leaves are `depth` branches down, from its
+/// pair or child `i` on and past the first `skip` entries there.
+fn entries_gathered<k, v>(
+  n: MapNode<k, v>,
+  depth: Int,
+  i: Int,
+  skip: Int,
+  left: Int,
+  out: List<{ key: k, value: v }>,
+) -> List<{ key: k, value: v }> =
+  if left <= 0 || i >= 33 || i >= MapNode::count(n) { out } else if depth <= 0 {
+    if skip > 0 { entries_gathered(n, depth, i + 1, skip - 1, left, out) } else {
+      let entry = { key: MapNode::key(n, i), value: MapNode::value(n, i) };
+      entries_gathered(n, depth, i + 1, 0, left - 1, out.push(entry))
+    }
+  } else {
+    let size = MapNode::kid_size(n, i);
+    if skip >= size { entries_gathered(n, depth, i + 1, skip - size, left, out) } else {
+      let taking = min(size - skip, left);
+      let inside = entries_gathered(MapNode::kid(n, i), depth - 1, 0, skip, taking, out);
+      entries_gathered(n, depth, i + 1, 0, left - taking, inside)
+    }
+  }
+
+/// The first leaf under `n`, whose leaves are `depth` branches down.
+fn first_leaf<k, v>(n: MapNode<k, v>, depth: Int) -> MapNode<k, v> =
+  if depth <= 0 { n } else { first_leaf(MapNode::kid(n, 0), depth - 1) }
+
+/// How many of a branch's children hold no key above `key`, found as `leaf_place` finds a pair.
+fn kids_not_above<k, v>(n: MapNode<k, v>, key: k, at: Int, step: Int) -> Int
+  where derivable(ord, k)
+=
+  if step <= 0 { at } else {
+    let probe = at + step;
+    if probe <= MapNode::count(n) && compare(MapNode::kid_max(n, probe - 1), key) != Greater {
+      kids_not_above(n, key, probe, step / 2)
+    } else { kids_not_above(n, key, at, step / 2) }
+  }
+
+/// The leaf under `n`, whose leaves are `depth` branches down, holding the least key above `key`;
+/// none where no key lies above it.
+fn leaf_above<k, v>(n: MapNode<k, v>, depth: Int, key: k) -> Option<MapNode<k, v>>
+  where derivable(ord, k)
+=
+  if depth <= 0 { if compare(node_max(n, 0), key) == Greater { Some(n) } else { None } } else {
+    let i = kids_not_above(n, key, 0, 32);
+    if i >= MapNode::count(n) { None } else { leaf_above(MapNode::kid(n, i), depth - 1, key) }
+  }
+
+/// `f` over the map's entries in key order from the leaf `n`'s pair `i` on, `done` of them folded
+/// already: one loop, a frame however deep a caller nests it, which finds each next leaf down
+/// from the root.
+fn map_folded<k, v, c | e>(
+  m: Map<k, v>,
+  n: MapNode<k, v>,
+  i: Int,
+  done: Int,
+  acc: c,
+  f: (c, k, v) -> c / e,
+) -> c / e
+  where derivable(ord, k)
+=
+  if done >= Map::len(m) { acc } else if i < MapNode::count(n) {
+    map_folded(m, n, i + 1, done + 1, f(acc, MapNode::key(n, i), MapNode::value(n, i)), f)
+  } else {
+    let next = match MapNode::root(m) {
+      None -> None,
+      Some(r) -> leaf_above(r, MapNode::height(m), node_max(n, 0)),
+    };
+    match next {
+      None -> acc,
+      Some(leaf) ->
+        map_folded(m, leaf, 1, done + 1, f(acc, MapNode::key(leaf, 0), MapNode::value(leaf, 0)), f),
+    }
+  }
+
+/// The node of the entries before `index` under `n`, whose leaves are `depth` branches down, and
+/// the node of those from `index` on, each of that depth: what lies off the path to `index` is
+/// shared.
+fn node_cut<k, v>(
+  n: MapNode<k, v>,
+  depth: Int,
+  index: Int,
+) -> { left: MapNode<k, v>, right: MapNode<k, v> } =
+  if depth <= 0 { MapNode::leaf_cut(n, index) } else {
+    let i = kid_of_rank(n, index, 0, 0);
+    let before = kid_sizes_before(n, 0, i, 0);
+    if index == before { MapNode::branch_cut(n, i) } else {
+      let max = MapNode::kid_max(n, i);
+      let size = MapNode::kid_size(n, i);
+      let kept = index - before;
+      let out = MapNode::kid_out(n, i);
+      let halves = node_cut(out.kid, depth - 1, kept);
+      let left_max = node_max(halves.left, depth - 1);
+      let cut = MapNode::branch_cut(
+        MapNode::kid_back(out.node, i, halves.left, left_max, kept),
+        i + 1,
+      );
+      { left: cut.left, right: MapNode::kid_put(cut.right, 0, halves.right, max, size - kept) }
+    }
+  }
+
+/// The map of the first `index` entries and the map of the rest.
+fn map_cut<k, v>(m: Map<k, v>, index: Int) -> { lower: Map<k, v>, upper: Map<k, v> } = {
+  let len = Map::len(m);
+  if index <= 0 { { lower: Map::new(), upper: m } }
+  else if index >= len { { lower: m, upper: Map::new() } } else {
+    let height = MapNode::height(m);
+    let taken = MapNode::map_swap(m, None, height, len);
+    match taken.old {
+      None -> { lower: taken.map, upper: Map::new() },
+      Some(root) -> {
+        let halves = node_cut(root, height, index);
+        {
+          lower: map_rooted(taken.map, Some(halves.left), height, index),
+          upper: map_rooted(Map::new(), Some(halves.right), height, len - index),
+        }
+      },
+    }
+  }
+}
+
+/// Whether each key of `es` is above the one before it.
+fn entries_ascend<k, v>(es: List<{ key: k, value: v }>) -> Bool
+  where derivable(ord, k)
+=
+  es.fold(
+    { ascending: true, last: None },
+    |s: { ascending: Bool, last: Option<k> }, e: { key: k, value: v }|
+      {
+        ascending: s.ascending
+          && (match s.last { None -> true, Some(p) -> compare(p, e.key) == Less }),
+        last: Some(e.key),
+      },
+  ).ascending
+
+/// The leaves of 32 pairs each, the last of fewer, that the entries of `es` fill in order.
+fn leaves_packed<k, v>(es: List<{ key: k, value: v }>) -> List<MapNode<k, v>> = {
+  let filled = es.fold(
+    { leaf: MapNode::leaf(), out: [] },
+    |s: { leaf: MapNode<k, v>, out: List<MapNode<k, v>> }, e: { key: k, value: v }| {
+      let held = MapNode::count(s.leaf);
+      if held >= 32 {
+        { leaf: MapNode::pair_put(MapNode::leaf(), 0, e.key, e.value), out: s.out.push(s.leaf) }
+      } else { { leaf: MapNode::pair_put(s.leaf, held, e.key, e.value), out: s.out } }
+    },
+  );
+  if MapNode::count(filled.leaf) > 0 { filled.out.push(filled.leaf) } else { filled.out }
+}
+
+/// The branches of 32 children each, the last of fewer, that the nodes of `kids` fill in order,
+/// each child's leaves `depth` branches down.
+fn branches_packed<k, v>(kids: List<MapNode<k, v>>, depth: Int) -> List<MapNode<k, v>> = {
+  let filled = kids.fold(
+    { branch: MapNode::branch(), out: [] },
+    |s: { branch: MapNode<k, v>, out: List<MapNode<k, v>> }, kid: MapNode<k, v>| {
+      let max = node_max(kid, depth);
+      let size = node_size(kid, depth);
+      let held = MapNode::count(s.branch);
+      if held >= 32 {
+        {
+          branch: MapNode::kid_put(MapNode::branch(), 0, kid, max, size),
+          out: s.out.push(s.branch),
+        }
+      } else { { branch: MapNode::kid_put(s.branch, held, kid, max, size), out: s.out } }
+    },
+  );
+  if MapNode::count(filled.branch) > 0 { filled.out.push(filled.branch) } else { filled.out }
+}
+
+/// How many levels of branches stand over `count` nodes laid 32 to a branch, at most `left` more.
+fn levels_over(count: Int, left: Int) -> Int =
+  if left <= 0 || count <= 1 { 0 } else { 1 + levels_over((count + 31) / 32, left - 1) }
+
+/// The root over `nodes`, whose leaves are `depth` branches down, branches laid over them up to
+/// `height`.
+fn packed_root<k, v>(nodes: List<MapNode<k, v>>, depth: Int, height: Int) -> Option<MapNode<k, v>> =
+  if depth >= height { nodes.at(0) }
+  else { packed_root(branches_packed(nodes, depth), depth + 1, height) }
+
+/// The map of `es`, whose keys ascend, laid as the runtime lays sorted entries: full leaves in
+/// order, and full branches over them.
+fn packed<k, v>(es: List<{ key: k, value: v }>) -> Map<k, v> = {
+  let leaves = leaves_packed(es);
+  let height = levels_over(leaves.len(), 16);
+  MapNode::map_swap(Map::new(), packed_root(leaves, 0, height), height, es.len()).map
+}
+
+/// The map with `value` under `key`, in place where the map is held once. A key `compare` finds
+/// equal to one the map holds is that key: the map keeps the key it holds and takes the value.
+pub fn Map::insert<a, b>(m: Map<a, b>, key: a, value: b) -> Map<a, b> = {
+  let height = MapNode::height(m);
+  let len = Map::len(m);
+  let taken = MapNode::map_swap(m, None, height, len);
+  match taken.old {
+    None -> {
+      let leaf = MapNode::pair_put(MapNode::leaf(), 0, key, value);
+      MapNode::map_swap(taken.map, Some(leaf), 0, 1).map
+    },
+    Some(root) -> {
+      let put = node_put(root, height, key, value);
+      let grown = if put.added { len + 1 } else { len };
+      match put.right {
+        None -> MapNode::map_swap(taken.map, Some(put.node), height, grown).map,
+        Some(right) -> {
+          let left_max = node_max(put.node, height);
+          let left_size = node_size(put.node, height);
+          let right_max = node_max(right, height);
+          let right_size = node_size(right, height);
+          let first = MapNode::kid_put(MapNode::branch(), 0, put.node, left_max, left_size);
+          let up = MapNode::kid_put(first, 1, right, right_max, right_size);
+          MapNode::map_swap(taken.map, Some(up), height + 1, grown).map
+        },
+      }
+    },
+  }
+}
+
+/// The map with `f` of the value under `key` in its place, keeping the key it holds; the same map
+/// where `key` is absent. The map no longer holds the value while `f` runs, so where the map is
+/// held once `f` holds it once.
+pub fn Map::update<a, b | e>(m: Map<a, b>, key: a, f: (b) -> b / e) -> Map<a, b> / e =
+  if !Map::contains(m, key) { m } else {
+    let height = MapNode::height(m);
+    let len = Map::len(m);
+    let taken = MapNode::map_swap(m, None, height, len);
+    match taken.old {
+      None -> taken.map,
+      Some(root) ->
+        MapNode::map_swap(taken.map, Some(node_updated(root, height, key, f)), height, len).map,
+    }
+  }
+
+/// The value under the key `compare` finds equal to `key`.
+pub fn Map::get<a, b>(m: Map<a, b>, key: a) -> Option<b> =
+  match MapNode::root(m) { None -> None, Some(r) -> found_under(r, key, MapNode::height(m), 0, 32) }
+
+/// Whether the map holds a key `compare` finds equal to `key`.
+pub fn Map::contains<a, b>(m: Map<a, b>, key: a) -> Bool =
+  match Map::get(m, key) { Some(_) -> true, None -> false }
+
+/// The map without `key`; the same map where it is absent.
+pub fn Map::remove<a, b>(m: Map<a, b>, key: a) -> Map<a, b> =
+  if Map::contains(m, key) { map_removed(m, key) } else { m }
+
+/// `f` over the entries in ascending key order, from `init`.
+pub fn Map::fold<a, b, c | e>(m: Map<a, b>, init: c, f: (c, a, b) -> c / e) -> c / e =
+  match MapNode::root(m) {
+    None -> init,
+    Some(r) -> map_folded(m, first_leaf(r, MapNode::height(m)), 0, 0, init, f),
+  }
+
+/// Ascending.
+pub fn Map::keys<a, b>(m: Map<a, b>) -> List<a> =
+  Map::fold(m, List::with_capacity(Map::len(m)), |out: List<a>, k: a, _: b| out.push(k))
+
+/// In ascending key order.
+pub fn Map::values<a, b>(m: Map<a, b>) -> List<b> =
+  Map::fold(m, List::with_capacity(Map::len(m)), |out: List<b>, _: a, v: b| out.push(v))
+
+/// In ascending key order.
+pub fn Map::entries<a, b>(m: Map<a, b>) -> List<{ key: a, value: b }> = {
+  let len = Map::len(m);
+  match MapNode::root(m) {
+    None -> [],
+    Some(r) -> entries_gathered(r, MapNode::height(m), 0, 0, len, List::with_capacity(len)),
+  }
+}
+
+/// The map a fold of `Map::insert` over the entries builds: a later entry's value wins, under the
+/// key the first of those entries gave. Entries already in ascending key order, each key once, are
+/// laid in full leaves and branches.
+pub fn Map::of_entries<a, b>(es: List<{ key: a, value: b }>) -> Map<a, b> =
+  if entries_ascend(es) { packed(es) } else {
+    es.fold(Map::new(), |m: Map<a, b>, e: { key: a, value: b }| Map::insert(m, e.key, e.value))
+  }
+
+/// `a` with each entry of `b` inserted: `b`'s value wins at a key both hold, under `a`'s key. It
+/// walks the smaller map into the larger.
+pub fn Map::merge<a, b>(a: Map<a, b>, b: Map<a, b>) -> Map<a, b> =
+  if Map::len(b) <= Map::len(a) { Map::fold(b, a, |m: Map<a, b>, k: a, v: b| Map::insert(m, k, v)) }
+  else {
+    Map::fold(a, b, |m: Map<a, b>, k: a, v: b|
+      if Map::contains(m, k) { map_rekeyed(m, k) } else { Map::insert(m, k, v) })
+  }
+
+/// The entry with the least key; `None` for the empty map.
+pub fn Map::first<a, b>(m: Map<a, b>) -> Option<{ key: a, value: b }> = map_at(m, 0)
+
+/// The entry with the greatest key; `None` for the empty map.
+pub fn Map::last<a, b>(m: Map<a, b>) -> Option<{ key: a, value: b }> = map_at(m, Map::len(m) - 1)
+
+/// The entry with the greatest key at or below `key`.
+pub fn Map::floor<a, b>(m: Map<a, b>, key: a) -> Option<{ key: a, value: b }> = {
+  let at = map_rank(m, key);
+  map_at(m, if at % 2 == 1 { at / 2 } else { at / 2 - 1 })
+}
+
+/// The entry with the least key at or above `key`.
+pub fn Map::ceiling<a, b>(m: Map<a, b>, key: a) -> Option<{ key: a, value: b }> =
+  map_at(m, map_rank(m, key) / 2)
+
+/// The entry with the greatest key below `key`.
+pub fn Map::below<a, b>(m: Map<a, b>, key: a) -> Option<{ key: a, value: b }> =
+  map_at(m, map_rank(m, key) / 2 - 1)
+
+/// The entry with the least key above `key`.
+pub fn Map::above<a, b>(m: Map<a, b>, key: a) -> Option<{ key: a, value: b }> = {
+  let at = map_rank(m, key);
+  map_at(m, at / 2 + at % 2)
+}
+
+/// The entry with the least key and the map without it, in place where the map is held once;
+/// `None` for the empty map.
+pub fn Map::pop_first<a, b>(m: Map<a, b>) -> Option<{ key: a, value: b, rest: Map<a, b> }> =
+  match map_at(m, 0) {
+    None -> None,
+    Some(e) -> Some({ key: e.key, value: e.value, rest: map_removed(m, e.key) }),
+  }
+
+/// The entry with the greatest key and the map without it, in place where the map is held once;
+/// `None` for the empty map.
+pub fn Map::pop_last<a, b>(m: Map<a, b>) -> Option<{ key: a, value: b, rest: Map<a, b> }> =
+  match map_at(m, Map::len(m) - 1) {
+    None -> None,
+    Some(e) -> Some({ key: e.key, value: e.value, rest: map_removed(m, e.key) }),
+  }
+
+/// The first `limit` entries, in key order, whose keys lie from `lo` to `hi`. `None` is no bound on
+/// its side; a bound that is not inclusive leaves its own key out; bounds that cross admit nothing,
+/// and so does a `limit` below one.
+pub fn Map::range<a, b>(
+  m: Map<a, b>,
+  lo: Option<a>,
+  lo_inclusive: Bool,
+  hi: Option<a>,
+  hi_inclusive: Bool,
+  limit: Int,
+) -> List<{ key: a, value: b }> = {
+  let start = match lo {
+    None -> 0,
+    Some(l) -> {
+      let at = map_rank(m, l);
+      if lo_inclusive { at / 2 } else { at / 2 + at % 2 }
+    },
+  };
+  let end = match hi {
+    None -> Map::len(m),
+    Some(h) -> {
+      let at = map_rank(m, h);
+      if hi_inclusive { at / 2 + at % 2 } else { at / 2 }
+    },
+  };
+  let most = min(end - start, limit);
+  match MapNode::root(m) {
+    None -> [],
+    Some(r) -> if most <= 0 { [] }
+    else { entries_gathered(r, MapNode::height(m), 0, start, most, List::with_capacity(most)) },
+  }
+}
+
+/// The map of the entries below `key`, the value at `key`, and the map of the entries above it,
+/// in place where the map is held once and sharing what they can with it where it is not.
+pub fn Map::split<a, b>(
+  m: Map<a, b>,
+  key: a,
+) -> { below: Map<a, b>, at: Option<b>, above: Map<a, b> } = {
+  let at = map_rank(m, key);
+  let cut = map_cut(m, at / 2);
+  if at % 2 == 0 { { below: cut.lower, at: None, above: cut.upper } } else {
+    let upper = cut.upper;
+    let value = match map_at(upper, 0) { Some(e) -> Some(e.value), None -> None };
+    { below: cut.lower, at: value, above: map_removed(upper, key) }
+  }
+}
 
 /// `a / b` with exactly `scale` digits after the point: the exact quotient, rounded once, there,
 /// by `mode`. Raises on a zero divisor, on a `scale` outside `0..=28`, and on a quotient that
@@ -1429,5 +2203,50 @@ test "a leaf and a branch cut in two, and a child put or dropped, leave a map it
       root_cut(n, 3).len() + first_leaf_cut(n, 4).len() + n.len()
     }).live,
     0,
+  )
+}
+
+/// Whether each branch under `n`, whose leaves are `depth` branches down, states the greatest key
+/// and the count of each child as the child holds them, and no node is empty.
+fn tree_stated(n: MapNode<Int, String>, depth: Int) -> Bool =
+  if depth <= 0 { MapNode::count(n) > 0 } else {
+    MapNode::count(n) > 0
+      && range(0, MapNode::count(n)).fold(true, |ok: Bool, c: Int| {
+        let kid = MapNode::kid(n, c);
+        ok && MapNode::kid_size(n, c) == node_size(kid, depth - 1)
+          && MapNode::kid_max(n, c) == node_max(kid, depth - 1)
+          && tree_stated(kid, depth - 1)
+      })
+  }
+
+/// Whether the map's tree holds as many entries as the map says, each branch stating its children.
+fn map_stated(m: Map<Int, String>) -> Bool =
+  match MapNode::root(m) {
+    None -> m.len() == 0,
+    Some(r) -> node_size(r, MapNode::height(m)) == m.len() && tree_stated(r, MapNode::height(m)),
+  }
+
+test "a map std.prelude writes and one the runtime builds again are laid out alike, and each is read as the other" {
+  [0, 1, 32, 33, 700, 2000].fold((), |_u: Unit, n: Int| {
+    let m = evens(n);
+    let back = observe(m);
+    assert(map_stated(m), None);
+    assert(map_stated(back), None);
+    assert_eq(back, m);
+    assert_eq(
+      back.insert(1, "one").remove(0).update(2, |s: String| s ++ "!"),
+      m.insert(1, "one").remove(0).update(2, |s: String| s ++ "!"),
+    );
+    assert(map_stated(back.insert(1, "one").remove(0)), None)
+  });
+  let shrunk = range(0, 2000).fold(evens(2000), |m: Map<Int, String>, i: Int|
+    if i % 5 == 0 { m } else { m.remove(2 * i) });
+  assert_eq(shrunk.len(), 400);
+  assert(map_stated(shrunk), None);
+  assert(map_stated(observe(shrunk)), None);
+  let parts = evens(2000).split(1000);
+  assert(
+    [parts.below, parts.above].fold(true, |ok: Bool, p: Map<Int, String>| ok && map_stated(p)),
+    None,
   )
 }

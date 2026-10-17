@@ -5,7 +5,9 @@
 import std.bytes (u32_le)
 import std.hash (blake3)
 import compiler.hash (body_component)
+import compiler.items (is_shipped)
 import std.list
+import std.string
 import delta (DefKey, Value, Decl, decl_key, key_before, value_key, key_text)
 import bisect (DoesNotCheck, Unresolved)
 
@@ -55,9 +57,13 @@ pub fn hashes_of(m: Mixture) -> List<String> = {
   all.keys()
 }
 
-/// The hashes a mixture takes, ascending, and where every reference to either era of each
-/// definition now points.
-pub type Chosen = { hashes: List<String>, relink: List<{ from: String, to: String }> }
+/// The hashes a mixture takes, ascending, the definition each is taken as, and where every
+/// reference to either era of each definition now points.
+pub type Chosen = {
+  hashes: List<String>,
+  named: Map<String, String>,
+  relink: List<{ from: String, to: String }>,
+}
 
 fn flips(flipped: List<DefKey>, k: DefKey) -> Bool =
   flipped.fold(false, |found: Bool, f: DefKey| found || key_text(f) == key_text(k))
@@ -66,13 +72,12 @@ fn flips(flipped: List<DefKey>, k: DefKey) -> Bool =
 /// Two definitions whose eras share a hash but are taken at different ones cannot both be honoured,
 /// so that mixture does not check.
 pub fn choose(m: Mixture, flipped: List<DefKey>) -> Result<Chosen, Unresolved> = {
-  let start: Result<{ hashes: Map<String, Bool>, relink: Map<String, String> }, Unresolved> = Ok({
-    hashes: Map::new(),
-    relink: Map::new(),
-  });
+  let start: Result<{ hashes: Map<String, String>, relink: Map<String, String> }, Unresolved> = Ok(
+    { hashes: Map::new(), relink: Map::new() },
+  );
   let chosen = m.eras.fold(
     start,
-    |acc: Result<{ hashes: Map<String, Bool>, relink: Map<String, String> }, Unresolved>, e: Era|
+    |acc: Result<{ hashes: Map<String, String>, relink: Map<String, String> }, Unresolved>, e: Era|
       match acc {
         Err(why) -> Err(why),
         Ok(held) -> {
@@ -81,8 +86,8 @@ pub fn choose(m: Mixture, flipped: List<DefKey>) -> Result<Chosen, Unresolved> =
             None -> Ok(held),
             Some(to) ->
               [e.before, e.after].fold(
-                Ok({ hashes: held.hashes.insert(to, true), relink: held.relink }),
-                |r: Result<{ hashes: Map<String, Bool>, relink: Map<String, String> }, Unresolved>, from: Option<String>|
+                Ok({ hashes: held.hashes.insert(to, e.key.name), relink: held.relink }),
+                |r: Result<{ hashes: Map<String, String>, relink: Map<String, String> }, Unresolved>, from: Option<String>|
                   match ((r, from)) {
                     (Ok(x), Some(h)) -> match x.relink.get(h) {
                       Some(other) -> if other != to { Err(DoesNotCheck) } else { Ok(x) },
@@ -100,17 +105,34 @@ pub fn choose(m: Mixture, flipped: List<DefKey>) -> Result<Chosen, Unresolved> =
     Ok(x) ->
       Ok({
         hashes: x.hashes.keys(),
+        named: x.hashes,
         relink: x.relink.entries().map(|e: { key: String, value: String }|
           { from: e.key, to: e.value }),
       }),
   }
 }
 
+/// The names a mixture's bodies are printed under, and the shipped modules among them, which a
+/// printing reads rather than prints.
+pub type Printable = {
+  names: List<{ name: Bytes, hash: Bytes, public: Bool }>,
+  shipped: List<Bytes>,
+}
+
 /// The name each body's definitions are printed under, ascending by hash: neither era's names fit
-/// a mixture of both, so a definition is named by its component and its own hash.
+/// a mixture of both, so a definition is named by its component and its own hash. A body `taken`
+/// names as a shipped module's definition keeps that name: no bisection edits the toolchain's
+/// modules, so the mixture reads the definition from its module, where it may use what only that
+/// module can.
 pub fn printed_names(
   bodies: List<Bytes>,
-) -> Option<List<{ name: Bytes, hash: Bytes, public: Bool }>> / {abort.raise} = {
+  taken: Map<String, String>,
+) -> Option<Printable> / {abort.raise} = {
+  let own = |hash: String|
+    match taken.get(hash) {
+      Some(name) -> if is_shipped(module_of(name)) { Some(name) } else { None },
+      None -> None,
+    };
   let named = bodies.fold(Some(Map::new()), |acc: Option<Map<String, Bytes>>, body: Bytes|
     match acc {
       None -> None,
@@ -118,27 +140,39 @@ pub fn printed_names(
         None -> None,
         Some(c) ->
           Some(
-            c.members.fold(held, |into: Map<String, Bytes>, member: Bytes|
-              into.insert(
-                member.hex_of(),
-                Bytes::of_string(
-                  "m" ++ c.id.hex_of().slice(0, 16) ++ ".d" ++ member.hex_of().slice(0, 16),
-                ),
-              )),
+            c.members.fold(held, |into: Map<String, Bytes>, member: Bytes| {
+              let hash = member.hex_of();
+              into.insert(hash, match own(hash) {
+                Some(name) -> Bytes::of_string(name),
+                None ->
+                  Bytes::of_string("m" ++ c.id.hex_of().slice(0, 16) ++ ".d" ++ hash.slice(0, 16)),
+              })
+            }),
           ),
       },
     });
   match named {
     None -> None,
     Some(m) ->
-      Some(
-        m.fold(
+      Some({
+        names: m.fold(
           [],
           |acc: List<{ name: Bytes, hash: Bytes, public: Bool }>, hash: String, name: Bytes|
             acc.push({ name: name, hash: Bytes::of_hex(hash), public: true }),
         ),
-      ),
+        shipped: m.fold(Map::new(), |acc: Map<Bytes, Bool>, hash: String, name: Bytes| {
+          let module = module_of(String::of_bytes_lossy(name));
+          if is_shipped(module) { acc.insert(module, true) } else { acc }
+        }).keys(
+        ),
+      }),
   }
+}
+
+/// The module `name` is a definition of: all of it before its last `.`.
+fn module_of(name: String) -> Bytes / {abort.raise} = {
+  let parts = name.split(".");
+  Bytes::of_string(String::join(parts.take(parts.len() - 1), "."))
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -159,6 +193,11 @@ test "a mixture takes the flipped definitions from now and the rest from the bas
   match choose(three(), [value_key("m.b")]) {
     Ok(c) -> {
       assert_eq(c.hashes, ["a1", "b2", "c1"]);
+      assert_eq(c.named.entries(), [
+        { key: "a1", value: "m.a" },
+        { key: "b2", value: "m.b" },
+        { key: "c1", value: "m.c" },
+      ]);
       assert_eq(c.relink, [
         { from: "a1", to: "a1" },
         { from: "a2", to: "a1" },
@@ -194,12 +233,28 @@ test "the eras line up by name and namespace, whichever holds a definition" {
   assert_eq(hashes_of(m), ["n2", "o1", "t1", "t2"])
 }
 
-test "bytes no envelope holds name nothing" { assert_eq(printed_names([b""]), None) }
+test "bytes no envelope holds name nothing" { assert_eq(printed_names([b""], Map::new()), None) }
 
-test "a definition is printed under its component and its own hash" {
+test "a definition is printed under its component and its own hash, unless a shipped module's" {
   // A body alone in its component, with no choices of its calls on values.
   let solo = Bytes::concat_all([byte_of_int(0), u32_le(0), b"body"]);
   let id = blake3(b"body").hex_of();
-  let expected = Bytes::of_string("m" ++ id.slice(0, 16) ++ ".d" ++ id.slice(0, 16));
-  assert_eq(printed_names([solo]), Some([{ name: expected, hash: blake3(b"body"), public: true }]))
+  let apart = Bytes::of_string("m" ++ id.slice(0, 16) ++ ".d" ++ id.slice(0, 16));
+  let named = |taken: Map<String, String>| printed_names([solo], taken);
+  let under = |name: Bytes, shipped: List<Bytes>|
+    Some({ names: [{ name: name, hash: blake3(b"body"), public: true }], shipped: shipped });
+  assert_eq(named(Map::new()), under(apart, []));
+  assert_eq(named(Map::new().insert(id, "m.f")), under(apart, []));
+  assert_eq(
+    named(Map::new().insert(id, "std.prelude.List::at")),
+    under(b"std.prelude.List::at", [b"std.prelude"]),
+  );
+  assert_eq(
+    named(Map::new().insert(id, "std.sqlite.sqlite_functions")),
+    under(b"std.sqlite.sqlite_functions", [b"std.sqlite"]),
+  );
+  assert_eq(
+    named(Map::new().insert(id, "compiler.hash.reach")),
+    under(b"compiler.hash.reach", [b"compiler.hash"]),
+  )
 }

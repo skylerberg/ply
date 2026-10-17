@@ -26,8 +26,9 @@ import std.bin
 import std.hash (blake3)
 import report (Answer, ok_code, count_of, indent, refused, reuse_members, tally_members,
                warning_lines, with_front_end)
-import signature (SetLine, Provenance, counted_lines, effect_sets, provenance, provenance_lines,
-                  set_lines, atom_texts, raise_text, raise_kind)
+import signature (SetLine, Provenance, counted_lines, effect_sets, head_lines, provenance,
+                  provenance_lines, set_lines, atom_texts, raise_text, raise_kind)
+import signature
 import std.term (Style, bold, dim, green, plain)
 import compiler.costs (Report, Costing)
 import compiler.termination (Ends, Stated, Diverges, Site)
@@ -35,8 +36,8 @@ import compiler.front (View, Frame, Outline, functions_of, tests_of)
 import compiler.infer (DefInfo, TestInfo, EffectInfo, OpInfo, Location, dump_flag, Raise, Unshown,
                        Unguarded, Calls)
 import compiler.resolve (Diag, Label)
-import compiler.types (Atom, Type, printer_new, print_atom_list, scheme_text, row_text, type_text,
-                       atom_text)
+import compiler.types (Atom, Type, TyCon, printer_new, print_atom_list, scheme_text, row_text,
+                       type_text, atom_text, named_type)
 import compiler.type_syntax (Mode, MRead, MWrite, MBad, MRaise, is_raise)
 import std.fs (fs)
 import std.json (Json, Member, Str, Bool, Number, Array, Object, Null, object, parse_string,
@@ -47,7 +48,7 @@ import std.string
 import defs (scheme_of)
 import proof.obligation (plural)
 import compiler.interface (sized)
-import compiler.parsing (span_between)
+import compiler.parsing (dummy_span, span_between)
 
 /// `indent()` plus the two spaces that put a definition under its module heading.
 fn types_indent() -> Int = 5
@@ -173,14 +174,22 @@ fn cost_json(pass: Option<Costing>) -> Json =
 
 // --- `--types` ---------------------------------------------------------------------
 
-fn op_line(style: Style, o: OpInfo) -> String / {abort.raise} = {
-  let resource = if o.resource_param { "[r]" } else { "" };
-  indent() ++ "    " ++ dim(style, mode_text(o.mode)) ++ " " ++ String::of_bytes_lossy(o.name)
-    ++ resource
-    ++ "("
-    ++ String::join(o.params.map(|t: Type| String::of_bytes_lossy(type_text(t))), ", ")
+/// An operation's signature, its parameters wrapped as a definition's are.
+fn op_lines(style: Style, o: OpInfo) -> List<String> / {abort.raise} = {
+  let gutter = indent() ++ "    ";
+  let named = String::of_bytes_lossy(o.name) ++ (if o.resource_param { "[r]" } else { "" });
+  let bare = mode_text(o.mode) ++ " " ++ named;
+  let head = "(" ++ String::join(o.params.map(|t: Type| String::of_bytes_lossy(type_text(t))), ", ")
     ++ ")"
-    ++ (if is_raise(o.mode) { "" } else { " -> " ++ String::of_bytes_lossy(type_text(o.ret)) })
+    ++ (if is_raise(o.mode) { "" } else { " -> " ++ String::of_bytes_lossy(type_text(o.ret)) });
+  let lines = head_lines(signature::width() - gutter.len(), bare, head);
+  range(0, lines.len()).map(|i: Int| {
+    let l = lines.at_or(i, "");
+    // The mode is dimmed only once the line is laid out, so its escapes take no column.
+    if i == 0 {
+      gutter ++ dim(style, mode_text(o.mode)) ++ " " ++ named ++ l.slice(bare.len(), l.len())
+    } else { gutter ++ l }
+  })
 }
 
 fn effect_lines(
@@ -193,7 +202,7 @@ fn effect_lines(
     under() ++ dim(style, marker) ++ " "
       ++ bold(style, String::of_bytes_lossy(effect_info.simple_name)),
   );
-  effect_info.ops.fold(head, |acc: List<String>, o: OpInfo| acc.push(op_line(style, o)))
+  effect_info.ops.fold(head, |acc: List<String>, o: OpInfo| acc.concat(op_lines(style, o)))
 }
 
 fn set_block(lines: List<String>, v: SetLine) -> List<String> / {abort.raise} =
@@ -889,4 +898,31 @@ test "the cache reading says how many definitions were seeded and how many were 
 test "a test name is printed as the reference prints it, with the quotes escaped" {
   assert_eq(quoted("two is two"), "\"two is two\"");
   assert_eq(quoted("a \"quoted\" name"), "\"a \\\"quoted\\\" name\"")
+}
+
+test "an operation too wide for the column wraps between its parameters, as a definition does" {
+  let node = TyCon({ name: b"std.prelude.ListNode", args: [named_type(b"Int")] });
+  let op: OpInfo = {
+    name: b"stored_everywhere",
+    mode: MWrite,
+    resource_param: true,
+    params: [node, node, node],
+    ret: node,
+    at: { module: 0, span: dummy_span() },
+    scheme: None,
+  };
+  let hung = " ".repeat(34);
+  assert_eq(op_lines(plain(), op), [
+    "       write stored_everywhere[r](std.prelude.ListNode<Int>,",
+    hung ++ "std.prelude.ListNode<Int>,",
+    hung ++ "std.prelude.ListNode<Int>)",
+    hung ++ "-> std.prelude.ListNode<Int>",
+  ]);
+  assert_eq(op_lines(plain(), { ..op, params: [node] }), [
+    "       write stored_everywhere[r](std.prelude.ListNode<Int>)",
+    hung ++ "-> std.prelude.ListNode<Int>",
+  ]);
+  assert_eq(op_lines(plain(), { ..op, mode: MRaise, params: [] }), [
+    "       raise stored_everywhere[r]()",
+  ])
 }

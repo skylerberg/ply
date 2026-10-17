@@ -36,6 +36,7 @@ import std.graph
 import diagnostics (parse_all, with_prelude_source)
 import interface (stub_module)
 import lent (passed)
+import hash (written_code)
 import exprs (prelude_module, freed_by, Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda,
               EApp, EIf, EMatch, EBlock, ERecord, ERecordUpdate, ETry, ETryBlock, EField, EList,
               EPerform, EWithHold, HandleClause, HandlerVar, MatchArm, RecField, Stmt, SLet,
@@ -3287,9 +3288,12 @@ fn sum_owned(emitter: Emitter, value: CValue, spec: SumSpec) -> WithValue =
     { emitter: o.emitter, value: { ..o.value, kind: KSum(spec) } }
   }
 
+/// Whether owning the word `name` moves the count this body holds of it rather than taking another.
+fn spent_owning(emitter: Emitter, name: Bytes) -> Bool =
+  if emitter.release { spendable(emitter, name) } else { is_made(emitter, name) }
+
 fn owned_word(emitter: Emitter, value: CValue) -> WithValue = {
-  let spend = if emitter.release { spendable(emitter, value.expr) }
-  else { is_made(emitter, value.expr) };
+  let spend = spent_owning(emitter, value.expr);
   let from = if spend { spend_made(emitter, value.expr) } else { emitter };
   let w = match value.kind {
     KBoxed -> bind_word_of(materialise(from, value.expr, spends(emitter, value.expr)), value.expr),
@@ -3802,9 +3806,7 @@ fn held_maybe(emitter: Emitter, payload: Bytes, ty: Ty) -> WithValue = {
 /// `ListNode::leaf_of` is a native that answers so.
 fn lookup_helper(name: Bytes, n: Int) -> Option<Bytes> / {abort.raise} =
   if n != 2 { None }
-  else if name == b"List::at" { Some(b"rt_list_lookup_p") }
   else if name == b"Array::at" { Some(b"rt_array_lookup_p") }
-  else if name == b"Map::get" { Some(b"rt_map_lookup_p") }
   else if name == b"ListNode::leaf_of" { Some(builtin_helper(name).concat(b"_p")) }
   else { None }
 
@@ -3943,10 +3945,7 @@ fn constant_of(
 /// The import a name not this module's own reaches a definition through, and the definition's name
 /// there: a name a selective import binds, `binder::name` through a module's binder, or a function
 /// the prelude writes in Ply, which every module reaches by its name as written.
-fn imported_target(
-  imports: List<Imported>,
-  name: Bytes,
-) -> Option<{ imp: Imported, name: Bytes }> / {abort.raise} =
+fn imported_target(imports: List<Imported>, name: Bytes) -> Option<{ imp: Imported, name: Bytes }> =
   match match qualified(name) {
       Some(q) -> match module_import(imports, q.binder) {
         Some(imp) -> Some({ imp: imp, name: q.name }),
@@ -5211,17 +5210,51 @@ fn width_builtin(
         },
       },
     }
+  } else if name == b"?same" && args.len() == 2 {
+    // Whether two words are one object, which a written root orders as equal to itself.
+    match args.fold(
+        Some({ emitter: emitter, vals: [] }),
+        |acc: Option<{ emitter: Emitter, vals: List<CValue> }>, x: Code|
+          match acc {
+            None -> None,
+            Some(g) -> match expr(notail(g.emitter), x, params) {
+              None -> None,
+              Some(o) -> Some({ emitter: o.emitter, vals: g.vals.push(o.value) }),
+            },
+          },
+      ) {
+      None -> None,
+      Some(g) -> {
+        let l = word_of(g.emitter, nth_value(g.vals, 0));
+        let r = word_of(l.emitter, nth_value(g.vals, 1));
+        Some(bind(r.emitter, KBool, Bytes::concat_all([b"(", l.expr, b" == ", r.expr, b")"])))
+      },
+    }
   } else if (name == b"compare" || name == b"compare_values") && args.len() == 2
       && ordered_at(emitter, at) != None {
-    match args_evaled(emitter, args, params, 0, []) {
+    // As an operator's operands: the second is only read, so a record held back stays so.
+    match args.fold(
+        Some({ emitter: emitter, vals: [] }),
+        |acc: Option<{ emitter: Emitter, vals: List<CValue> }>, x: Code|
+          match acc {
+            None -> None,
+            Some(g) -> match expr(notail(g.emitter), x, params) {
+              None -> None,
+              Some(o) -> {
+                let s = if g.vals.len() == 0 { secure(o.emitter, o.value) } else { o };
+                Some({ emitter: s.emitter, vals: g.vals.push(s.value) })
+              },
+            },
+          },
+      ) {
       None -> None,
-      Some(e0) ->
+      Some(g) ->
         Some(
           compared_order(
-            site(e0.emitter, span),
+            site(g.emitter, span),
             ordered_at(emitter, at),
-            nth_value(e0.vals, 0),
-            nth_value(e0.vals, 1),
+            nth_value(g.vals, 0),
+            nth_value(g.vals, 1),
             span,
           ),
         ),
@@ -5365,6 +5398,71 @@ fn item_type(t: Option<Type>) -> Type =
 
 fn header_of(w: Bytes, field: Bytes) -> Bytes = Bytes::concat_all([b"ply_obj(", w, b")->", field])
 
+/// The word the item `op` reads lies in, of the object `w` at `index`: a list's item in its tail or
+/// a leaf, a map's key or value in a leaf, or the greatest key under a branch's child.
+fn item_slot(op: Intrinsic, w: Bytes, index: Bytes) -> Bytes = {
+  let laid = layouts();
+  match op {
+    OfList(TailAt) -> slot_of(w, past(laid.list.tail, index)),
+    OfMap(NodeKey) -> slot_of(w, Bytes::concat_all([b"2 * (", index, b")"])),
+    OfMap(NodeValue) -> slot_of(w, Bytes::concat_all([b"2 * (", index, b") + 1"])),
+    OfMap(KidMax) -> slot_of(w, past(laid.tree.keys, index)),
+    _ -> slot_of(w, past(0, index)),
+  }
+}
+
+/// Where `call`, an extern written in place that reads an item of an object, is compared beside
+/// `rest` with no count of the item taken: the item is a word, the object a local this read leaves
+/// held, which neither the read's index nor `rest` reads, so it holds the item for the whole
+/// comparison. The read, and the type of the item.
+fn lent_item_op(
+  emitter: Emitter,
+  call: { func: Code, args: List<Code> },
+  rest: List<Code>,
+) -> Option<{ op: Intrinsic, item: Type }> / {abort.raise} =
+  match call.func.node {
+    NVar(fv) -> match if fv.slot == None { in_place_at(emitter, fv.name) } else { None } {
+      None -> None,
+      Some(op) -> {
+        let reads = match op {
+          OfList(TailAt) -> true,
+          OfList(LeafAt) -> true,
+          OfMap(NodeKey) -> true,
+          OfMap(KidMax) -> true,
+          _ -> false,
+        };
+        let item = item_type(match emitter.typed.get(span_key(call.func.span)) {
+          Some(t) -> t.args.at(0),
+          None -> None,
+        });
+        let held = match call.args.at(0) {
+          Some(base) -> match base.node {
+            NVar(v) -> match v.slot {
+              Some(s) ->
+                base.own != Owned
+                  && rest.concat(call.args.drop(1)).all(|c: Code| !slots_read(c).contains(s)),
+              None -> false,
+            },
+            _ -> false,
+          },
+          None -> false,
+        };
+        if reads && held && kind_of(item).kind == KBoxed { Some({ op: op, item: item }) }
+        else { None }
+      },
+    },
+    _ -> None,
+  }
+
+/// The item `op` reads of the object and index `vals`, read where the object holds it: a word no
+/// count of this body holds, which `lent_item_op` allows.
+fn lent_item(emitter: Emitter, op: Intrinsic, vals: List<CValue>, item: Type) -> WithValue = {
+  let v = nth_value(vals, 0);
+  let w = bind_word_of(materialise(emitter, v.expr, false), v.expr);
+  let read = bind_word_of(w.emitter, item_slot(op, w.value.expr, as_int(nth_value(vals, 1))));
+  { emitter: read.emitter, value: { ..read.value, ty: kind_of(item).ty } }
+}
+
 fn slot_of(w: Bytes, at: Bytes) -> Bytes = Bytes::concat_all([b"ply_words(", w, b")[", at, b"]"])
 
 /// `at` words past the word `from`, as C reads it.
@@ -5442,20 +5540,38 @@ fn counted_writable(a: Bytes, writable: Bytes, copied: Bytes) -> Bytes =
     b"); }",
   ])
 
-/// What `read` makes of the word of the object a call takes first, which the call then lets go of
-/// as any call does: a count held past the read would make the next write copy what it writes.
+/// What `read` makes of the word of the object a call takes first. A word held elsewhere for the
+/// whole read is read where it is held; a count this body holds to spend is let go after the read, as
+/// any call lets go of what it takes, since a count held past the read would make the next write
+/// copy what it writes.
 fn read_from(
   emitter: Emitter,
   vals: List<CValue>,
   read: (Emitter, Bytes) -> WithValue,
 ) -> WithValue = {
-  let held = owned(emitter, nth_value(vals, 0));
-  let r = read(held.emitter, held.value.expr);
-  {
-    emitter: line(r.emitter, Bytes::concat_all([b"ply_dec(ctx, ", held.value.expr, b");"])),
-    value: r.value,
+  let v = nth_value(vals, 0);
+  if counted_only_to_read(emitter, v) {
+    let w = bind_word_of(materialise(emitter, v.expr, false), v.expr);
+    read(w.emitter, w.value.expr)
+  } else {
+    let held = owned(emitter, v);
+    let r = read(held.emitter, held.value.expr);
+    {
+      emitter: line(r.emitter, Bytes::concat_all([b"ply_dec(ctx, ", held.value.expr, b");"])),
+      value: r.value,
+    }
   }
 }
+
+/// Whether `owned` would take a count of `value` that a read let go of at once: a word neither this
+/// body's to spend nor a helper's answer.
+fn counted_only_to_read(emitter: Emitter, value: CValue) -> Bool =
+  match value.kind {
+    KBoxed ->
+      !spent_owning(emitter, value.expr)
+        && !(emitter.release && answers_owned(emitter, value.expr)),
+    _ -> false,
+  }
 
 /// An `Int` header field of the object a call takes first.
 fn header_read(emitter: Emitter, vals: List<CValue>, field: Bytes) -> WithValue =
@@ -5475,8 +5591,8 @@ fn list_node_op(em: Emitter, op: ListOp, vals: List<CValue>, item: Type) -> With
     ListRoot ->
       read(|e: Emitter, w: Bytes|
         word_held(e, slot_of(w, ascii_of_int(laid.root)), KSum(Zeroed), TyOpen([]))),
-    TailAt -> read(|e: Emitter, w: Bytes| item_read(e, slot_of(w, past(laid.tail, index)), item)),
-    LeafAt -> read(|e: Emitter, w: Bytes| item_read(e, slot_of(w, past(0, index)), item)),
+    TailAt -> read(|e: Emitter, w: Bytes| item_read(e, item_slot(OfList(op), w, index), item)),
+    LeafAt -> read(|e: Emitter, w: Bytes| item_read(e, item_slot(OfList(op), w, index), item)),
     KidAt ->
       read(|e: Emitter, w: Bytes| word_held(e, slot_of(w, past(0, index)), KBoxed, TyOpen([]))),
     NewBranch -> new_node(em, layouts().trie.branch),
@@ -5697,19 +5813,17 @@ fn map_node_op(em: Emitter, op: MapOp, vals: List<CValue>, key: Type, value: Typ
   let laid = layouts();
   let index = as_int(nth_value(vals, 1));
   let read = |r: (Emitter, Bytes) -> WithValue| read_from(em, vals, r);
-  let pair = |w: Bytes, of: Bytes| slot_of(w, Bytes::concat_all([b"2 * (", index, b")", of]));
   match op {
     MapRoot ->
       read(|e: Emitter, w: Bytes|
         word_held(e, slot_of(w, ascii_of_int(laid.map.root)), KSum(Zeroed), TyOpen([]))),
     MapHeight -> header_read(em, vals, laid.map.height),
     NodeCount -> header_read(em, vals, b"len"),
-    NodeKey -> read(|e: Emitter, w: Bytes| item_read(e, pair(w, b""), key)),
-    NodeValue -> read(|e: Emitter, w: Bytes| item_read(e, pair(w, b" + 1"), value)),
+    NodeKey -> read(|e: Emitter, w: Bytes| item_read(e, item_slot(OfMap(op), w, index), key)),
+    NodeValue -> read(|e: Emitter, w: Bytes| item_read(e, item_slot(OfMap(op), w, index), value)),
     NodeKid ->
       read(|e: Emitter, w: Bytes| word_held(e, slot_of(w, past(0, index)), KBoxed, TyOpen([]))),
-    KidMax ->
-      read(|e: Emitter, w: Bytes| item_read(e, slot_of(w, past(laid.tree.keys, index)), key)),
+    KidMax -> read(|e: Emitter, w: Bytes| item_read(e, item_slot(OfMap(op), w, index), key)),
     KidSize ->
       read(|e: Emitter, w: Bytes|
         bind(
@@ -6309,7 +6423,7 @@ fn inline_at(
         None -> None,
         // The bytes are read before the index and bound after: the index may read `b` at its last use and null it.
         Some(bv0) -> {
-          let bv = secure_across(bv0.emitter, bv0.value, i0, params);
+          let bv = secure_across(bv0.emitter, bv0.value, [i0], params);
           match expr(notail(bv.emitter), i0, params) {
             None -> None,
             // Over bytes of unfixed kind, `Bytes::u32_le` is the runtime's call.
@@ -6422,7 +6536,7 @@ fn inline_get(
         Some(av0) -> match av0.value.ty {
           TyArr(Some(element)) -> {
             // The array is read before the index and bound after, as `inline_at` reads its bytes.
-            let av = secure_across(av0.emitter, av0.value, i0, params);
+            let av = secure_across(av0.emitter, av0.value, [i0], params);
             match expr(notail(av.emitter), i0, params) {
               None -> None,
               Some(iv0) -> {
@@ -7072,27 +7186,6 @@ fn args_owned_at(
       Some(
         e.vals.fold(
           { emitter: site(e.emitter, span), names: [] },
-          |a: { emitter: Emitter, names: List<Bytes> }, value: CValue| {
-            let w = owned(a.emitter, value);
-            { emitter: w.emitter, names: a.names.push(w.value.expr) }
-          },
-        ),
-      ),
-  }
-
-fn args_owned(
-  emitter: Emitter,
-  codes: List<Code>,
-  params: List<EmitParam>,
-  i: Int,
-  acc: List<Bytes>,
-) -> Option<{ emitter: Emitter, names: List<Bytes> }> / {abort.raise} =
-  match args_evaled(emitter, codes, params, i, []) {
-    None -> None,
-    Some(e) ->
-      Some(
-        e.vals.fold(
-          { emitter: e.emitter, names: acc },
           |a: { emitter: Emitter, names: List<Bytes> }, value: CValue| {
             let w = owned(a.emitter, value);
             { emitter: w.emitter, names: a.names.push(w.value.expr) }
@@ -9579,6 +9672,65 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               },
             },
           }
+        } else if match sign_test(emitter, b.op, b.lhs, b.rhs) { Some(_) -> true, None -> false } {
+          match b.lhs.node {
+            // `compare`'s operands as `compare` reads them: the second is only read, and a first
+            // that is an item of an object held past the comparison is read where it lies.
+            NApp(a) -> match a.args.fold(
+                Some({ emitter: emitter, vals: [] }),
+                |acc: Option<{ emitter: Emitter, vals: List<CValue> }>, x: Code|
+                  match acc {
+                    None -> None,
+                    Some(g) -> match if g.vals.len() == 0 {
+                        match x.node {
+                          NApp(fa) -> lent_item_op(g.emitter, fa, a.args.drop(1)),
+                          _ -> None,
+                        }
+                      } else { None } {
+                      Some(li) -> match x.node {
+                        NApp(fa) -> match fa.args.fold(
+                            Some({ emitter: g.emitter, vals: [] }),
+                            |acc2: Option<{ emitter: Emitter, vals: List<CValue> }>, y: Code|
+                              match acc2 {
+                                None -> None,
+                                Some(h) -> match expr(notail(h.emitter), y, params) {
+                                  None -> None,
+                                  Some(o) ->
+                                    Some({ emitter: o.emitter, vals: h.vals.push(o.value) }),
+                                },
+                              },
+                          ) {
+                          None -> None,
+                          Some(h) -> {
+                            let r = lent_item(h.emitter, li.op, h.vals, li.item);
+                            Some({ emitter: r.emitter, vals: g.vals.push(r.value) })
+                          },
+                        },
+                        _ -> None,
+                      },
+                      None -> match expr(notail(g.emitter), x, params) {
+                        None -> None,
+                        Some(o) -> {
+                          let s = if g.vals.len() == 0 { secure(o.emitter, o.value) } else { o };
+                          Some({ emitter: s.emitter, vals: g.vals.push(s.value) })
+                        },
+                      },
+                    },
+                  },
+              ) {
+              None -> None,
+              Some(g) ->
+                sign_tested(
+                  site(g.emitter, b.lhs.span),
+                  b.op,
+                  b.lhs,
+                  b.rhs,
+                  nth_value(g.vals, 0),
+                  nth_value(g.vals, 1),
+                ),
+            },
+            _ -> None,
+          }
         } else if !is_arithmetic(b.op) && compare_op(b.op) == None && !is_bitop(b.op)
             && !is_shift(b.op) {
           Some(refused(emitter, b"an operator this port does not emit: ".concat(b.op)))
@@ -9613,16 +9765,19 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                 },
                 None -> match expr(notail(l.emitter), b.rhs, params) {
                   None -> None,
-                  Some(r) ->
-                    binary_rest(
-                      if is_arithmetic(b.op) || is_shift(b.op) { site(r.emitter, c.span) }
-                      else { r.emitter },
-                      b.op,
-                      l.value,
-                      r.value,
-                      t,
-                      c.span,
-                    ),
+                  Some(r) -> match by_literal(t, b.op, b.rhs) {
+                    Some(d) -> Some(quotient(r.emitter, b.op, l.value, d)),
+                    None ->
+                      binary_rest(
+                        if is_arithmetic(b.op) || is_shift(b.op) { site(r.emitter, c.span) }
+                        else { r.emitter },
+                        b.op,
+                        l.value,
+                        r.value,
+                        t,
+                        c.span,
+                      ),
+                  },
                 },
               },
             },
@@ -9925,7 +10080,23 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           } else if in_place_at(emitter, fv.name) != None {
             match in_place_at(emitter, fv.name) {
               None -> None,
-              Some(op) -> match args_evaled(emitter, a.args, params, 0, []) {
+              // Nothing runs between the arguments and the call that reads or takes them, so each
+              // is duplicated only where an argument after it can move it.
+              Some(op) -> match a.args.fold(
+                  Some({ emitter: emitter, vals: [] }),
+                  |acc: Option<{ emitter: Emitter, vals: List<CValue> }>, x: Code|
+                    match acc {
+                      None -> None,
+                      Some(w) -> match expr(notail(w.emitter), x, params) {
+                        None -> None,
+                        Some(o) -> {
+                          let later = a.args.drop(w.vals.len() + 1);
+                          let s = secure_across(o.emitter, o.value, later, params);
+                          Some({ emitter: s.emitter, vals: w.vals.push(s.value) })
+                        },
+                      },
+                    },
+                ) {
                 None -> None,
                 Some(w) ->
                   Some(
@@ -10000,16 +10171,12 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                             refused(emitter, b"a name this port cannot resolve: ".concat(fv.name)),
                           )
                         } else {
-                          match if fv.name == b"Map::fold" {
-                              args_owned(emitter, a.args, params, 0, [])
-                            } else {
-                              args_owned_at(
-                                builtin_needed(emitter, fv.name, a.func.span),
-                                a.args,
-                                params,
-                                c.span,
-                              )
-                            } {
+                          match args_owned_at(
+                              builtin_needed(emitter, fv.name, a.func.span),
+                              a.args,
+                              params,
+                              c.span,
+                            ) {
                             None -> None,
                             Some(w) -> {
                               let o = bind(
@@ -10165,7 +10332,10 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                 Some(sc) -> Some(if_sum_join(j, cv, t, e, sc)),
                 None -> {
                   // Asked with the later table, which holds what both arms built.
-                  let shape = shared_shape(e.emitter, t.value, e.value);
+                  let shape = match shared_shape(e.emitter, t.value, e.value) {
+                    Some(fs) -> Some(fs),
+                    None -> built_fields(emitter, c),
+                  };
                   match shape {
                     // Both arms built a record of one shape: the join carries one local per leaf and reassembles; the number taken above is spent, never declared.
                     Some(fields) -> {
@@ -11329,16 +11499,16 @@ fn secured(o: Option<WithValue>) -> Option<WithValue> =
 fn secure_across(
   emitter: Emitter,
   value: CValue,
-  later: Code,
+  later: List<Code>,
   params: List<EmitParam>,
 ) -> WithValue =
   if !emitter.release || !counted(value.kind) || spendable(emitter, value.expr) {
     { emitter: emitter, value: value }
   } else {
     let r = holder_root(emitter, value.expr);
-    let moved = slots_read(later).fold(false, |acc: Bool, s: Int|
-      acc
-        || (match local_of(emitter, params, s) {
+    let moved = later.any(|code: Code|
+      slots_read(code).any(|s: Int|
+        match local_of(emitter, params, s) {
           Some(c) -> is_made(emitter, c) && !is_pinned(emitter, c) && root_of(emitter, c) == r,
           None -> false,
         }));
@@ -11705,7 +11875,7 @@ fn match_join(
     },
     // A record held back: each arm hands its values and word to locals the record is held back
     // as after the match, never made to be joined.
-    None -> match matched_record(at, arms) {
+    None -> match built_fields(at, c) {
       Some(fields) -> {
         let ls = record_locals(emitter, fields, empty_inits(fields));
         {
@@ -11716,7 +11886,8 @@ fn match_join(
       None -> {
         let k = match answers_sum(at) {
           Some(spec) -> KSum(spec),
-          None -> if matched_option(at, arms, params) { KSum(Zeroed) } else { KBoxed },
+          None -> if matched_option(at, arms, params) { KSum(Zeroed) }
+          else { match answers_scalar(at) { Some(scalar) -> scalar, None -> KBoxed } },
         };
         let ans = fresh(emitter);
         {
@@ -11734,7 +11905,7 @@ fn joined_value(emitter: Emitter, sink: Sink) -> WithValue =
     ToRecord(r) -> held_record(emitter, r.fields, r.locals, r.word),
     ToValue(v) ->
       {
-        emitter: note_holder(emitter, v.name),
+        emitter: if counted(v.kind) { note_holder(emitter, v.name) } else { emitter },
         value: { kind: v.kind, expr: v.name, ty: TyOpen([]) },
       },
     ToLoop(_) -> { emitter: emitter, value: { kind: KBoxed, expr: b"ply_unit", ty: TyOpen([]) } },
@@ -11899,18 +12070,16 @@ fn sunk(emitter: Emitter, value: CValue, sink: Sink) -> Emitter =
         _ -> owned(emitter, value),
       };
       line(w.emitter, Bytes::concat_all([ans.name, b" = ", w.value.expr, b";"]))
-    } else { assigned_word(emitter, ans.name, value) },
+    } else if counted(ans.kind) { assigned_word(emitter, ans.name, value) } else {
+      drop_value(
+        line(emitter, Bytes::concat_all([ans.name, b" = ", as_kind(value, ans.kind), b";"])),
+        value,
+      )
+    },
     ToRecord(r) -> record_into(emitter, value, r.fields, r.locals, r.word),
     ToSum(t) -> sum_into(emitter, value, t.cases, t.tag, t.leaves),
     ToLoop(_) -> emitter,
   }
-
-/// The fields of the record a `match`'s arm builds, where one builds a record that crosses a call as
-/// its fields: its arms then join as an `if`'s do, each field's value and the record's word in a
-/// local of its own.
-fn matched_record(emitter: Emitter, arms: List<CodeArm>) -> Option<List<FieldTy>> =
-  arms.fold(None, |found: Option<List<FieldTy>>, a: CodeArm|
-    match found { Some(fs) -> Some(fs), None -> built_fields(emitter, a.body) })
 
 /// Whether an arm of a `match` answers an `Option` held as its payload's word: one it builds, or a
 /// variable bound outside the arm, or such a variable's field, held so already. The match then
@@ -11934,8 +12103,10 @@ fn answers_option(emitter: Emitter, code: Code, bound: List<Int>, params: List<E
       },
       _ -> false,
     },
+    // A slot the block binds is none the frame holds yet, though a lambda run in place numbers its
+    // slots from the same zero as the root's parameters.
     NBlock(b) -> match b.tail {
-      Some(t) -> answers_option(emitter, t, bound, params),
+      Some(t) -> answers_option(emitter, t, bound.concat(block_slots(b.stmts)), params),
       None -> false,
     },
     NIf(i) ->
@@ -11946,6 +12117,15 @@ fn answers_option(emitter: Emitter, code: Code, bound: List<Int>, params: List<E
         found || answers_option(emitter, a.body, bound.concat(pat_slots(a.pat)), params)),
     _ -> false,
   }
+
+/// The slots `stmts` bind.
+fn block_slots(stmts: List<CodeStmt>) -> List<Int> =
+  stmts.fold([], |acc: List<Int>, s: CodeStmt|
+    match s {
+      CLet(l) -> acc.push(l.slot),
+      CLetPat(l) -> acc.concat(pat_slots(l.pat)),
+      CDo(_) -> acc,
+    })
 
 /// Whether slot `s`, where no arm around rebinds it, holds an `Option` as its payload's word, or,
 /// with `field`, a record whose field `field` is held so.
@@ -11991,11 +12171,14 @@ fn names_option(emitter: Emitter, code: Code, name: Bytes) -> Bool =
     _ -> false,
   }
 
+/// The fields of the record `code` answers, where it crosses a call as its fields and some path of
+/// `code` holds it back: a record it builds, a local holding one back, or such a record an arm of an
+/// `if` or `match` in it answers. A join of `code`'s arms then holds the record as its fields, never
+/// made to be joined.
 fn built_fields(emitter: Emitter, code: Code) -> Option<List<FieldTy>> =
   match code.node {
     NRecord(_) -> carried_fields(emitter, code.span),
     NUpdate(_) -> carried_fields(emitter, code.span),
-    // A record a local holds back is handed on as its values too, never made to be joined.
     NVar(v) -> match v.slot {
       Some(s) -> match conv_of(emitter, s) {
         Some(cv) -> if deferred_of(emitter, cv.expr) == None { None } else {
@@ -12006,6 +12189,13 @@ fn built_fields(emitter: Emitter, code: Code) -> Option<List<FieldTy>> =
       None -> None,
     },
     NBlock(b) -> match b.tail { Some(t) -> built_fields(emitter, t), None -> None },
+    NIf(i) -> match built_fields(emitter, i.then_branch) {
+      Some(fs) -> Some(fs),
+      None -> built_fields(emitter, i.else_branch),
+    },
+    NMatch(m) ->
+      m.arms.fold(None, |found: Option<List<FieldTy>>, a: CodeArm|
+        match found { Some(fs) -> Some(fs), None -> built_fields(emitter, a.body) }),
     _ -> None,
   }
 
@@ -13032,8 +13222,10 @@ fn assigned(
       _ -> m,
     };
     let m1 = line(m0, Bytes::concat_all([join, b" = ", as_kind(value, k), b";"]));
-    if counted(k) { assign_owned(with_made(m1, arm_em.count_locals), join, value.expr) }
-    else { with_made(m1, arm_em.count_locals) }
+    // A scalar boxed to be joined is a word of the join's own.
+    if counted(k) && counted(value.kind) {
+      assign_owned(with_made(m1, arm_em.count_locals), join, value.expr)
+    } else { with_made(m1, arm_em.count_locals) }
   };
   let m3 = release_at(m2, ind + 1);
   {
@@ -13232,6 +13424,19 @@ fn join_kind(emitter: Emitter, a: Kind, b: Kind) -> Kind =
 fn answers_sum(emitter: Emitter) -> Option<SumSpec> =
   if emitter.tail { match emitter.answer { Whole(KSum(spec)) -> Some(spec), _ -> None } }
   else { None }
+
+/// The scalar the value at hand is held as, where it is the root's answer and the root hands back
+/// one: what a join there holds, never a word boxed to be joined.
+fn answers_scalar(emitter: Emitter) -> Option<Kind> =
+  if emitter.tail {
+    match emitter.answer {
+      Whole(KInt) -> Some(KInt),
+      Whole(KBool) -> Some(KBool),
+      Whole(KFloat) -> Some(KFloat),
+      Whole(KNum(w)) -> Some(KNum(w)),
+      _ -> None,
+    }
+  } else { None }
 
 fn is_bitop(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor"
 
@@ -13818,6 +14023,11 @@ fn container_code(
   };
   let here = if kind == b"Map" { container_defs(module, t).concat(container_defs(module, walked)) }
   else { container_defs(module, t) };
+  let entry_of_values = TyRecord([{ name: b"key", ty: value }, { name: b"value", ty: value }]);
+  // What a loop gathering one container's items pushes onto the list it answers.
+  let gathered_item = if op == b"digest_from" || op == b"digest_entries_from" { bytes_type() }
+  else if op == b"reflect_entries_from" || op == b"shown_entries_from" { entry_of_values }
+  else { value };
   let typed = [
     { k: 0, ty: filed_as(unknown_type(), args) },
     { k: 1, ty: filed_as(unknown_type(), args) },
@@ -13831,25 +14041,14 @@ fn container_code(
     { k: 15, ty: filed_as(unknown_type(), [item]) },
     { k: 16, ty: filed_as(unknown_type(), [field(b"key")]) },
     { k: 17, ty: filed_as(unknown_type(), [field(b"value")]) },
-    {
-      k: 18,
-      ty: filed_as(TyRecord([{ name: b"key", ty: value }, { name: b"value", ty: value }]), []),
-    },
-    {
-      k: 19,
-      ty: filed_as(
-        TyCon({
-          name: b"List",
-          args: [TyRecord([{ name: b"key", ty: value }, { name: b"value", ty: value }])],
-        }),
-        [],
-      ),
-    },
+    { k: 18, ty: filed_as(entry_of_values, []) },
+    { k: 19, ty: filed_as(TyCon({ name: b"List", args: [entry_of_values] }), []) },
     { k: 20, ty: filed_as(TyCon({ name: b"List", args: [bytes_type()] }), []) },
     { k: 21, ty: filed_as(unknown_type(), [int_type()]) },
     { k: 23, ty: filed_as(failure, []) },
     { k: 24, ty: filed_as(failure, []) },
     { k: 25, ty: filed_as(unknown_type(), [failure]) },
+    { k: 28, ty: filed_as(unknown_type(), [gathered_item]) },
   ].fold(Map::new(), |m: Map<Bytes, Typed>, x: { k: Int, ty: Typed }|
     m.insert(span_key(placed(x.k)), x.ty));
   let operands = Map::new().insert(span_key(placed(2)), b"Int").insert(
@@ -13925,7 +14124,7 @@ fn container_code(
   let part = |builtin_name: Bytes, c: Code, k: Int| call(builtin(builtin_name, k), [c]);
   let gathered = |name: Bytes, pushed: (Code) -> Code|
     match_at(a, 3, b"x", 3, 5, call(named(loop_named(name)), [a, pushed(b), next]), b);
-  let push = |list: Code, v: Code| call(named(b"List::push"), [list, v]);
+  let push = |list: Code, v: Code| call(builtin(b"List::push", 28), [list, v]);
   let entry = |builtin_name: Bytes|
     at(
       NRecord({
@@ -14049,7 +14248,9 @@ fn container_code(
       dummy_span(),
     )
   } else if op == b"ordered" {
-    call(named(loop_named(b"ordered_from")), [walked_of(a, 0), walked_of(b, 1), lit(LInt(0))])
+    itself_equal(
+      call(named(loop_named(b"ordered_from")), [walked_of(a, 0), walked_of(b, 1), lit(LInt(0))]),
+    )
   } else if op == b"equal_from" {
     match_at(
       a,
@@ -14842,20 +15043,41 @@ fn ordering_code(
   );
   {
     code: marked(
-      at(
-        NBlock({
-          stmts: [
-            CLet({ name: b"ra", slot: 2, value: ranked(var(b"a", 0)) }),
-            CLet({ name: b"rb", slot: 3, value: ranked(var(b"b", 1)) }),
-          ],
-          tail: Some(body),
-        }),
-        dummy_span(),
+      itself_equal(
+        at(
+          NBlock({
+            stmts: [
+              CLet({ name: b"ra", slot: 2, value: ranked(var(b"a", 0)) }),
+              CLet({ name: b"rb", slot: 3, value: ranked(var(b"b", 1)) }),
+            ],
+            tail: Some(body),
+          }),
+          dummy_span(),
+        ),
       ),
     ),
     operands: operands,
     typed: walked.typed,
   }
+}
+
+/// `order`, the body of a written root ordering its parameters `a` and `b`, answering `Equal` at
+/// once where the two are one object: an order is reflexive, so nothing of it need be walked.
+fn itself_equal(order: Code) -> Code = {
+  let at = |node: Node| { own: Borrowed, node: node, span: dummy_span() };
+  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
+  at(
+    NIf({
+      cond: at(
+        NApp({
+          func: at(NVar({ name: b"?same", slot: None })),
+          args: [var(b"a", 0), var(b"b", 1)],
+        }),
+      ),
+      then_branch: at(NVar({ name: b"Equal", slot: None })),
+      else_branch: order,
+    }),
+  )
 }
 
 /// What `reflect` or `shown` makes of a value of a type the program fixes, where the program holds
@@ -15702,6 +15924,95 @@ fn ordering_word(o: { emitter: Emitter, expr: Bytes }) -> WithValue / {abort.rai
   )
 }
 
+/// The C relation to zero of an order that `c`, a constructor of `Ordering`, names.
+fn ordering_relation(emitter: Emitter, c: Code) -> Option<Bytes> =
+  match c.node {
+    NVar(v) -> if v.slot != None { None } else {
+      match tag_of(emitter, v.name) {
+        None -> None,
+        Some(t) -> if Some(t) == tag_of(emitter, b"Less") { Some(b"<") }
+        else if Some(t) == tag_of(emitter, b"Equal") { Some(b"==") }
+        else if Some(t) == tag_of(emitter, b"Greater") { Some(b">") }
+        else { None },
+      }
+    },
+    _ -> None,
+  }
+
+/// The builtin a call of `func` reaches: a name nothing this module defines or imports a
+/// definition of.
+fn builtin_callee(emitter: Emitter, func: Code) -> Option<Bytes> / {abort.raise} =
+  match func.node {
+    NVar(fv) -> if fv.slot != None || is_ctor_name(fv.name) || in_place_at(emitter, fv.name) != None
+        || emitter.here.fold(false, |acc: Bool, h: Def| acc || h.name == fv.name) { None } else {
+      match imported_target(emitter.imports, fv.name) {
+        None -> Some(generated_builtin(fv.name)),
+        Some(t) -> match def_named(t.imp.defs, t.name) {
+          Some(_) -> None,
+          None -> if emitter.builtins.fold(false, |acc: Bool, b2: Bytes| acc || b2 == t.name) {
+            Some(generated_builtin(t.name))
+          } else { None },
+        },
+      }
+    },
+    _ -> None,
+  }
+
+/// Where `lhs == rhs`, or `!=`, tests `compare(x, y)` against a constructor of `Ordering` at a type
+/// C orders without a root's constructor: the C relation to zero the constructor is, and how the
+/// type orders.
+fn sign_test(
+  emitter: Emitter,
+  op: Bytes,
+  lhs: Code,
+  rhs: Code,
+) -> Option<{ rel: Bytes, t: Ordered }> / {abort.raise} =
+  if op != b"eq" && op != b"ne" { None } else {
+    match ordering_relation(emitter, rhs) {
+      None -> None,
+      Some(rel) -> match lhs.node {
+        NApp(a) -> if a.args.len() != 2 { None } else {
+          match builtin_callee(emitter, a.func) {
+            None -> None,
+            Some(name) -> if name != b"compare" && name != b"compare_values" { None } else {
+              match ordered_at(emitter, a.func.span) {
+                Some(OWalked(_)) -> None,
+                Some(t) -> Some({ rel: rel, t: t }),
+                None -> None,
+              }
+            },
+          }
+        },
+        _ -> None,
+      },
+    }
+  }
+
+/// `compare(a, b)` tested against a constructor of `Ordering` as `sign_test` reads `lhs op rhs`:
+/// the sign of their order, with no constructor made.
+fn sign_tested(
+  emitter: Emitter,
+  op: Bytes,
+  lhs: Code,
+  rhs: Code,
+  a: CValue,
+  b: CValue,
+) -> Option<WithValue> / {abort.raise} =
+  match sign_test(emitter, op, lhs, rhs) {
+    None -> None,
+    Some(s) -> {
+      let signed = |o: { emitter: Emitter, expr: Bytes }| {
+        let held = Bytes::concat_all([b"((", o.expr, b") ", s.rel, b" 0)"]);
+        bind(o.emitter, KBool, if op == b"ne" { Bytes::concat_all([b"!", held]) } else { held })
+      };
+      match s.t {
+        OFields(r) -> Some(signed(record_order(emitter, r.fields, r.names, a, b))),
+        ONamed(n) -> Some(signed(order_of(emitter, n, a, b))),
+        OWalked(_) -> None,
+      }
+    },
+  }
+
 /// Below zero, zero or above zero as `a` and `b`, values of the type `name` C orders, order: a sum
 /// a module declares as its root answers.
 fn order_of(
@@ -16096,6 +16407,30 @@ fn compare_op(op: Bytes) -> Option<Bytes> =
   else if op == b"ne" { Some(b"!=") }
   else { None }
 
+/// The literal an `Int` is divided by, or its remainder taken by, where that can neither raise nor
+/// overflow: anything but zero and minus one.
+fn by_literal(t: Operand, op: Bytes, rhs: Code) -> Option<Int> =
+  match t {
+    OInt -> if op != b"div" && op != b"rem" { None } else {
+      let d = match rhs.node {
+        NUnary(u) -> if u.op != b"neg" { None }
+        else { match lit_int(u.operand) { Some(v) -> checked_sub(0, v), None -> None } },
+        _ -> lit_int(rhs),
+      };
+      match d { Some(x) -> if x == 0 || x == 0 - 1 { None } else { Some(x) }, None -> None }
+    },
+    _ -> None,
+  }
+
+/// `l` divided by `d`, or its remainder by `d`, as `by_literal` allows: C's own operator, which
+/// truncates as the language does.
+fn quotient(emitter: Emitter, op: Bytes, l: CValue, d: Int) -> WithValue =
+  bind(
+    emitter,
+    KInt,
+    Bytes::concat_all([b"(", as_int(l), if op == b"div" { b") / " } else { b") % " }, int_lit(d)]),
+  )
+
 /// Addition and subtraction are overflow-checked in the C; the rest go through `rt_arith`, which raises on a zero divisor.
 fn arithmetic(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> WithValue =
   if is_add_or_sub(op) {
@@ -16478,14 +16813,14 @@ fn self_tail(
             },
           },
       );
+      // Nothing reads this value, so it joins as this body answers: a specialisation's answer is
+      // the settled kind its definition's generic one is not.
       let d = ret_of(emitter.here, name);
+      let generic = match d.kind { Some(k) -> k, None -> KBoxed };
+      let k = match emitter.answer { Whole(KBoxed) -> generic, Whole(own) -> own, _ -> generic };
       Some({
         emitter: line(assigned, b"goto ply_loop;"),
-        value: {
-          kind: match d.kind { Some(k) -> k, None -> KBoxed },
-          expr: zero_of(match d.kind { Some(k) -> k, None -> KBoxed }),
-          ty: d.ty,
-        },
+        value: { kind: k, expr: zero_of(k), ty: d.ty },
       })
     },
   }
@@ -18815,7 +19150,7 @@ test "a `parallel` block tells the runtime its definition's row only where that 
     b"m.pure",
     b"m.reads",
     b"m.handled",
-    prelude_loop(b"mapped_from", b"m.nested", 1),
+    prelude_loop(b"mapped_from", b"m.nested", 5),
     b"m.open",
   ];
   let answers = answers_of([b"m"], [src], [], names);
@@ -19011,9 +19346,9 @@ test "a lambda reads a field of its parameter or its capture where the record's 
   ]);
   // `map` and `fold` run their lambdas in the loops of `std.prelude` specialised for them.
   let loops = [
-    prelude_loop(b"mapped_from", b"m.mapped", 1),
-    prelude_loop(b"folded_from", b"m.folded", 1),
-    prelude_loop(b"mapped_from", b"m.captured", 1),
+    prelude_loop(b"mapped_from", b"m.mapped", 5),
+    prelude_loop(b"folded_from", b"m.folded", 5),
+    prelude_loop(b"mapped_from", b"m.captured", 5),
   ];
   let names = [b"m.mapped", b"m.folded", b"m.captured", b"m.stepped"].concat(loops);
   let answers = answers_of([b"m"], [src], [b"Stop", b"Continue"], names);
@@ -19441,17 +19776,12 @@ test "an Option is its payload's word in the code that knows it, and its object 
     false,
   ]);
   assert_eq(has(b"rt_equal_p"), [false, false, false, false, false, false, false, false, false]);
-  assert_eq(has(b"rt_list_lookup_p"), [
-    false,
-    true,
-    false,
-    false,
-    false,
-    false,
-    false,
-    true,
-    false,
-  ]);
+  // An item is read by `std.prelude`'s `List::at`, which answers it as its payload's word.
+  assert_eq(
+    out.map(|e: Emitted|
+      e.tables.generics.calls.any(|g: GenericCall| g.callee == b"std.prelude.List::at")),
+    [false, true, false, false, false, false, false, true, false],
+  );
   // It crosses a call as its payload's word, a C type of its own so a stale caller fails the build.
   let maybe = { answer: b"PlyMaybe", params: [b"Word"] };
   assert_eq(out.get(3).tables.symbols.map(|d: Defined| d.head), [maybe]);
@@ -20048,6 +20378,18 @@ test "a list, an array or a map is compared and digested by roots written for it
       c.index_of(b"Array::at") != None),
     [],
   );
+  // A list is read and gathered by `std.prelude`'s functions, which every load reaches.
+  let prelude_calls = roots.filter(|n: Bytes| n.index_of(b"#") != None).fold(
+    [],
+    |acc: List<Bytes>, n: Bytes|
+      body(n).tables.generics.calls.fold(acc, |a: List<Bytes>, g: GenericCall|
+        if module_of_root(g.callee) != prelude_module() || a.contains(g.callee) { a }
+        else { a.push(g.callee) }),
+  );
+  assert_eq(
+    prelude_calls.sort(),
+    written_code().calls.map(|n: Bytes| qualify(prelude_module(), n)),
+  );
   // Nothing is handed to the runtime to compare, and a walk is a loop.
   assert_eq(
     roots.filter(|n: Bytes|
@@ -20098,10 +20440,11 @@ test "a list's map, filter and fold are the prelude's functions, whose loops run
     b"effect tick { write tock() -> Unit }\n",
     b"fn handled(xs: List<Int>) -> List<Int> = xs.map(|x: Int| handle { tick.tock(); x } with { tick.tock() resume k -> k(()), return v -> v })\n",
   ]);
+  // Each walks the items of the list's leaves and then its tail in one loop.
   let loops = [
-    prelude_loop(b"mapped_from", b"m.bumped", 1),
-    prelude_loop(b"kept_from", b"m.kept", 1),
-    prelude_loop(b"folded_from", b"m.summed", 1),
+    prelude_loop(b"mapped_from", b"m.bumped", 5),
+    prelude_loop(b"kept_from", b"m.kept", 5),
+    prelude_loop(b"folded_from", b"m.summed", 5),
   ];
   let generic = [b"std.prelude.mapped_from", b"std.prelude.kept_from", b"std.prelude.folded_from"];
   let answers = answers_of(
@@ -20122,6 +20465,65 @@ test "a list's map, filter and fold are the prelude's functions, whose loops run
   let calling = |name: Bytes| calls_a_value(own_code(answered_body(answers, name).text));
   assert_eq(generic.map(calling), [true, true, true]);
   assert_eq(loops.map(calling), [false, false, false])
+}
+
+test "a map's value is read by `std.prelude`'s `Map::get` down its tree, its keys compared at their type" {
+  let src = b"fn priced(m: Map<Bytes, Int>, k: Bytes) -> Option<Int> = m.get(k)\n";
+  let at = |name: Bytes|
+    specialised(qualify(prelude_module(), name), [bytes_type(), unknown_type()]);
+  let read = [at(b"Map::get"), at(b"found_under")];
+  let answers = answers_of(
+    [b"m"],
+    [src],
+    [b"Some", b"None", b"Less", b"Equal", b"Greater"],
+    [b"m.priced"].concat(read),
+  );
+  assert_eq(
+    answered_body(answers, b"m.priced").tables.generics.calls.map(|g: GenericCall| g.callee),
+    [b"std.prelude.Map::get"],
+  );
+  // The tree is read where it lies and two keys compared as `Bytes` compares them: the runtime is
+  // asked for neither.
+  let code = |name: Bytes| own_code(answered_body(answers, name).text);
+  assert_eq(
+    read.filter(|n: Bytes|
+      code(n).index_of(b"rt_map_") != None || code(n).index_of(b"builtin_compare") != None),
+    [],
+  );
+  // An order tested against a constructor is its sign, and a step halved is C's own quotient: no
+  // walk makes an `Ordering` or asks the runtime to divide.
+  assert_eq(
+    read.filter(|n: Bytes|
+      code(n).index_of(b"rt_ctor_value_p") != None || code(n).index_of(b"rt_arith_p") != None),
+    [],
+  );
+  // A key the walk compares is read where its leaf holds it, which the walk holds throughout: no
+  // count of it is taken, only of the value it answers.
+  let walk = code(at(b"found_under")).split(b"\n");
+  assert_eq(
+    walk.filter(|l: Bytes|
+      l.index_of(b"[2 * (") != None && l.index_of(b") + 1]") == None
+        && l.index_of(b"ply_inc(") != None),
+    [],
+  );
+  assert(walk.any(|l: Bytes| l.index_of(b") + 1]; ply_inc(") != None), None);
+  assert(code(at(b"Map::get")).index_of(b")->layout") != None, None)
+}
+
+test "two maps are compared by a root that walks `std.prelude`'s `Map::entries`" {
+  let src = b"fn same(a: Map<Int, Bytes>, b: Map<Int, Bytes>) -> Bool = a == b\n";
+  let root = written_root(
+    b"m",
+    b"equal",
+    TyCon({ name: b"Map", args: [int_type(), bytes_type()] }),
+  );
+  let answers = answers_of([b"m"], [src], [b"Some", b"None"], [b"m.same", root]);
+  let body = answered_body(answers, root);
+  assert(
+    body.tables.generics.calls.any(|g: GenericCall| g.callee == b"std.prelude.Map::entries"),
+    None,
+  );
+  assert_eq(own_code(body.text).index_of(b"rt_equal_p"), None)
 }
 
 test "a lambda a call lends is laid out on the caller's stack with its entry, whoever the callee is" {
@@ -20151,15 +20553,15 @@ test "a lambda a call lends is laid out on the caller's stack with its entry, wh
 
 test "a lambda a `std.prelude` function hands on to a native is laid out with the entry it calls" {
   let src = Bytes::concat_all([
-    b"pub fn Map::bumped(m: Map<Int, Int>, k: Int, f: (Int) -> Int) -> Map<Int, Int> = m.update(k, f)\n",
-    b"pub fn raised(m: Map<Int, Int>, n: Int) -> Map<Int, Int> = Map::bumped(m, 1, |v: Int| v + n)\n",
+    b"pub fn guarded(f: (Int) -> Int) -> Int = bracket(|| 1, |_: Int| (), f)\n",
+    b"pub fn raised(n: Int) -> Int = guarded(|v: Int| v + n)\n",
   ]);
   let answers = answers_of([prelude_module()], [src], [], [
-    b"std.prelude.Map::bumped",
+    b"std.prelude.guarded",
     b"std.prelude.raised",
   ]);
   let code = |name: Bytes| own_code(answered_body(answers, name).text);
-  assert(code(b"std.prelude.Map::bumped").index_of(b"builtin_map_update_p(ctx") != None, None);
+  assert(code(b"std.prelude.guarded").index_of(b"builtin_bracket_p(ctx") != None, None);
   assert(code(b"std.prelude.raised").index_of(b"_lambda0_entry, ply_imm(") != None, None);
   assert(code(b"std.prelude.raised").index_of(b"rt_closure_p(") == None, None)
 }
@@ -20184,7 +20586,7 @@ test "a lambda inside a lambda another root runs is lent as its owner's" {
   let src = b"fn nested(xss: List<List<Int>>) -> List<List<Int>> = xss.map(|xs: List<Int>| xs.map(|x: Int| x + 1))\n";
   let ints = TyCon({ name: b"List", args: [int_type()] });
   let outer = specialised_with(b"std.prelude.mapped_from", [ints, ints], [
-    { param: 1, owner: b"m.nested", nth: 0 },
+    { param: 5, owner: b"m.nested", nth: 0 },
   ]);
   let answers = answers_of([b"m"], [src], [], [b"m.nested", outer]);
   let body = match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
@@ -20319,7 +20721,7 @@ test "a record holding a small record in place crosses a call as its leaves and 
   let out = emit_all_program(
     [{ name: b"m", src: src }],
     [b"Some", b"None"],
-    [b"Map::get", b"List::push", b"Map::insert", b"List::len"],
+    [b"List::push", b"List::len"],
     true,
   );
   let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
@@ -20364,10 +20766,81 @@ test "compare at a number, a character or a string orders in C and answers its c
   let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None]);
   // None is handed to the runtime: a list is ordered by the prelude's function at its items' type,
-  // and the rest answer the constructor the order names, a word no count holds.
+  // and the rest answer the constructor the order names, a word no count holds, or where the order
+  // is tested against a constructor, its sign.
   assert_eq(has(b"builtin_compare"), [false, false, false, false]);
-  assert_eq(has(b"rt_ctor_value_p(ctx, "), [true, true, true, false]);
+  assert_eq(has(b"rt_ctor_value_p(ctx, "), [false, true, true, false]);
   assert_eq(has(b"memcmp(ply_bytes("), [true, false, true, false])
+}
+
+test "a root written to order two values answers `Equal` at once for one object" {
+  let src = b"type T = | Leaf(Int) | Node(List<T>)\nfn order(a: T, b: T) -> Ordering = compare(a, b)\nfn listed(a: List<T>, b: List<T>) -> Ordering = compare(a, b)\n";
+  let lists = TyCon({ name: b"List", args: [TyCon({ name: b"m.T", args: [] })] });
+  let roots = [b"m.order", b"m.listed", b"m.T#cmp", written_root(b"m", b"ordered", lists)];
+  let answers = answers_of(
+    [b"m"],
+    [src],
+    [b"Less", b"Equal", b"Greater", b"Some", b"None", b"m.Leaf", b"m.Node"],
+    roots,
+  );
+  let code = |name: Bytes| own_code(answered_body(answers, name).text);
+  assert_eq(
+    [b"m.T#cmp", written_root(b"m", b"ordered", lists)].map(|n: Bytes|
+      code(n).index_of(b"(p0 == p1)") != None),
+    [true, true],
+  )
+}
+
+test "an order tested against a constructor is its sign wherever C orders the values" {
+  let src = Bytes::concat_all([
+    b"type V = { major: Int, tag: Bytes }\n",
+    b"type S = | Big(Int) | Small\n",
+    b"fn later(a: V, b: V) -> Bool = compare(a, b) != Greater\n",
+    b"fn same(a: Int, b: Int) -> Bool = compare(a, b) == Equal\n",
+    b"fn sum(a: S, b: S) -> Bool = compare(a, b) == Less\n",
+    b"fn listed(a: List<Int>, b: List<Int>) -> Bool = compare(a, b) == Less\n",
+  ]);
+  let out = emit_all_program(
+    [{ name: b"m", src: src }],
+    [b"Less", b"Equal", b"Greater", b"m.Big", b"m.Small"],
+    [b"compare"],
+    true,
+  );
+  assert_eq(out.map(|e: Emitted| e.why).filter(|w: Option<Bytes>| w != None), []);
+  let code = |name: Bytes|
+    match out.find(|e: Emitted| e.name == name) { Some(e) -> own_code(e.text), None -> b"" };
+  // A declared sum's root answers a constructor its order is read off, and a list's order is the
+  // prelude's, which answers one: no body makes one.
+  assert_eq(
+    [b"m.later", b"m.same", b"m.sum", b"m.listed"].filter(|n: Bytes|
+      code(n).index_of(b"rt_ctor_value_p(ctx, ") != None),
+    [],
+  );
+  assert_eq(
+    [b"m.later", b"m.same", b"m.sum"].map(|n: Bytes|
+      [b") > 0)", b") == 0)", b") < 0)"].filter(|r: Bytes| code(n).index_of(r) != None)),
+    [[b") > 0)"], [b") == 0)"], [b") < 0)"]],
+  )
+}
+
+test "an `Int` quotient or remainder by a literal is C's own operator, and by anything else the runtime's" {
+  let src = Bytes::concat_all([
+    b"fn half(n: Int) -> Int = n / 2\n",
+    b"fn rest(n: Int) -> Int = n % -7\n",
+    b"fn folded(n: Int) -> Int / {abort.raise} = n / (1 << 5)\n",
+    b"fn by(n: Int, d: Int) -> Int / {abort.raise} = n / d\n",
+    b"fn by_minus_one(n: Int) -> Int = n / -1\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
+  assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None, None]);
+  // Minus one is the runtime's, since the least `Int` over it overflows.
+  assert_eq(out.map(|e: Emitted| own_code(e.text).index_of(b"rt_arith_p(") != None), [
+    false,
+    false,
+    false,
+    true,
+    true,
+  ])
 }
 
 test "a `Decimal` is held in registers as its two words, and in a record or an array as them" {
@@ -21329,33 +21802,72 @@ test "a write that answers a record whose field the record holds in place hands 
   assert_eq(code.get(0).index_of(Bytes::concat_all([b"ply_dec(ctx, ", key, b")"])), None)
 }
 
-test "a list, an array or a map read matched as `Some` or `None` is answered in place by its lookup" {
-  let src = Bytes::concat_all([
-    b"fn listed(xs: List<Int>, i: Int) -> Int = match xs.at(i) { Some(v) -> v, None -> 0 }\n",
-    b"fn arrayed(xs: Array<Int>, i: Int) -> Int = match xs.at(i) { Some(v) -> v, None -> 0 }\n",
-    b"fn mapped(xs: Map<Int, Int>, k: Int) -> Int = match xs.get(k) { Some(v) -> v, None -> 0 }\n",
-  ]);
-  let out = emit_all_program(
-    [{ name: b"m", src: src }],
-    [b"Some", b"None"],
-    [b"List::at", b"Array::at", b"Map::get"],
-    true,
-  );
-  assert_eq(out.map(|e: Emitted| e.why), [None, None, None]);
+test "an array read matched as `Some` or `None` is answered in place by its lookup" {
+  let src = b"fn arrayed(xs: Array<Int>, i: Int) -> Int = match xs.at(i) { Some(v) -> v, None -> 0 }\n";
+  let out = emit_all_program([{ name: b"m", src: src }], [b"Some", b"None"], [b"Array::at"], true);
+  assert_eq(out.map(|e: Emitted| e.why), [None]);
   let calls = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
-  assert_eq(calls(b"rt_list_lookup_p"), [true, false, false]);
-  assert_eq(calls(b"rt_array_lookup_p"), [false, true, false]);
-  assert_eq(calls(b"rt_map_lookup_p"), [false, false, true]);
-  assert_eq(calls(b"rt_ctor_p"), [false, false, false])
+  assert_eq(calls(b"rt_array_lookup_p"), [true]);
+  assert_eq(calls(b"rt_ctor_p"), [false])
+}
+
+test "a list's item is read by `std.prelude`'s one `List::at`, from the tail in place or the leaf the runtime finds" {
+  let src = Bytes::concat_all([
+    b"fn third(xs: List<String>) -> Option<String> = xs.at(2)\n",
+    b"fn listed(xs: List<Int>, i: Int) -> Int = match xs.at(i) { Some(v) -> v, None -> 0 }\n",
+  ]);
+  let read = b"std.prelude.List::at";
+  let answers = answers_of([b"m"], [src], [b"Some", b"None"], [b"m.third", b"m.listed", read]);
+  let called = |name: Bytes|
+    answered_body(answers, name).tables.generics.calls.map(|g: GenericCall| g.callee);
+  assert_eq([called(b"m.third"), called(b"m.listed")], [[read], [read]]);
+  // It moves an item as a word, so it needs nothing of the item's type and no call settles on a
+  // specialisation of it.
+  assert_eq(answered_body(answers, read).tables.generics.needs, []);
+  let code = |name: Bytes| own_code(answered_body(answers, name).text);
+  assert_eq(
+    [b"m.listed", read].map(|n: Bytes|
+      code(n).index_of(b"rt_list_") == None && code(n).index_of(b"builtin_list_") == None),
+    [true, true],
+  );
+  assert(code(read).index_of(b")->flags") != None, None);
+  assert(code(read).index_of(b"builtin_listnode_leaf_of_p(") != None, None);
+  assert(code(read).index_of(b"ply_words(") != None, None)
+}
+
+test "a read of a list takes no count of a word held through it, and lets go of one it spends" {
+  let read = b"std.prelude.List::at";
+  let answers = answers_of(
+    [b"m"],
+    [b"fn second(xs: List<Int>) -> Option<Int> = xs.at(1)\n"],
+    [b"Some", b"None"],
+    [b"m.second", read],
+  );
+  let text = own_code(answered_body(answers, read).text);
+  let lines = text.split(b"\n");
+  let line_at = |i: Int| match lines.at(i) { Some(l) -> l, None -> b"" };
+  let reading = |marker: Bytes|
+    range(0, lines.len()).filter(|i: Int| line_at(i).index_of(marker) != None);
+  // `start` and `tail_len` read the parameter `List::at` reads again after them where it lies.
+  let headers = reading(b")->layout;").concat(reading(b")->flags;"));
+  assert(
+    headers.len() == 2
+      && headers.all(|i: Int|
+        line_at(i - 1).index_of(b" = p0;") != None && line_at(i + 1).index_of(b"ply_dec(") == None),
+    Some(String::of_bytes_lossy(text)),
+  );
+  // The tail's item is read at the list's last use, which spends it, so the list is let go after.
+  let items = reading(b" = ply_words(").filter(|i: Int| line_at(i).index_of(b")[1 + (") != None);
+  assert(
+    items.len() == 1 && items.all(|i: Int| line_at(i + 1).index_of(b"ply_dec(ctx, ") != None),
+    Some(String::of_bytes_lossy(text)),
+  )
 }
 
 // The native hands a leaf back as its word or zero, so a body that took its answer for an `Option`'s
 // object would read every leaf as `None`.
 test "`ListNode::leaf_of` answers a list's leaf as its payload's word, as the runtime's native does" {
-  let probe = Bytes::concat_all([
-    b"\nextern fn ListNode::leaf_of<a>(xs: List<a>, j: Int) -> Option<ListNode<a>>\n",
-    b"fn probe_leaf(xs: List<Int>) -> Int = match ListNode::leaf_of(xs, 0) { Some(n) -> ListNode::len(n), None -> 0 }\n",
-  ]);
+  let probe = b"\nfn probe_leaf(xs: List<Int>) -> Int = match ListNode::leaf_of(xs, 0) { Some(n) -> ListNode::len(n), None -> 0 }\n";
   let root = b"std.prelude.probe_leaf";
   let names = [b"std.prelude"];
   let srcs = [prelude_source::text().concat(probe)];
@@ -21408,8 +21920,7 @@ fn answers_of(
       b"Array::of_list",
       b"List::push",
       b"Map::len",
-      b"Map::entries",
-      b"Map::update",
+      b"bracket",
       b"Bytes::slice",
       b"range",
       b"reflect",
@@ -21741,7 +22252,9 @@ test "a body is lowered from what its row files of it, walked now or published f
   let seeded = analyse_with(parse_all(sited(b"")), walked.rows);
   match seeded {
     front::Refused(_) -> panic("the program checks"),
-    front::Analysed(w) -> assert_eq(w.checked.seeded.len(), 2),
+    // Beside the two it writes, what its comparison reaches of `std.prelude`.
+    front::Analysed(w) ->
+      assert_eq(w.checked.seeded.filter(|n: Bytes| module_of_root(n) != prelude_module()).len(), 2),
   };
   assert_eq(sited_answers(sited(b""), dump_of(seeded)), sited_answers(sited(b""), walked))
 }
@@ -21755,7 +22268,14 @@ test "a body published from its row is lowered where its definition moved to" {
   let seeded = seeded_with(after, before.rows);
   match seeded {
     front::Refused(_) -> panic("the program checks"),
-    front::Analysed(w) -> assert_eq(w.checked.seeded, [b"b.twice", b"a.moved"]),
+    // What the code written to compare a container calls is reached where `sited` compares.
+    front::Analysed(w) -> {
+      assert_eq(front::not_written(w.checked.seeded), [b"b.twice", b"a.moved"]);
+      assert_eq(
+        w.checked.seeded.filter(|n: Bytes| front::written_reach().contains(n)),
+        front::written_reach(),
+      )
+    },
   };
   assert_eq(
     sited_answers(after, dump_of(seeded)),
@@ -21832,8 +22352,8 @@ test "a buffer read out of a record this body holds alone reaches its append uns
     b"fn caught(s: S, n: Int) -> Int = range(0, n).fold(0, |acc: Int, _: Int| acc + s.out.len() + s.n)\n",
   ]);
   // `fold` runs each lambda in the loop of `std.prelude` the unit settles its call on.
-  let folding = b"std.prelude.folded_from@?,{n:Int,out:Bytes}|1=m.folded:0";
-  let catching = b"std.prelude.folded_from@?,Int|1=m.caught:0";
+  let folding = b"std.prelude.folded_from@?,{n:Int,out:Bytes}|5=m.folded:0";
+  let catching = b"std.prelude.folded_from@?,Int|5=m.caught:0";
   let names = [
     b"m.pattern",
     b"m.ctor",
@@ -21888,18 +22408,15 @@ test "a buffer read out of a record this body holds alone reaches its append uns
     }
   };
   assert(looped(b"m.iterated"), None);
-  // So does a fold's, its accumulator the loop's parameter `p3`: no pass makes a record, and its
-  // buffer reaches the append with no count taken on the way.
+  // So does a fold's, its accumulator the loop's parameter `p6`: no pass makes a record, and its
+  // buffer reaches the append with no count taken from where the pass reads it.
   let folded = own_code(text(folding));
   assert(
-    match ((folded.index_of(b"ply_loop:"), folded.index_of(b" = p3_1;\n"))) {
-      (Some(l), Some(f)) -> {
-        let rest = folded.slice(f, folded.len());
-        l < f && folded.slice(l, folded.len()).index_of(b"rt_alloc_p(") == None
-          && (match rest.index_of(b"rt_concat_p(") {
-            Some(c) -> rest.slice(0, c).index_of(b"ply_inc(") == None,
-            None -> false,
-          })
+    match ((folded.index_of(b"ply_loop:"), folded.index_of(b"rt_concat_p("))) {
+      (Some(l), Some(c)) -> {
+        let read = if l < c { folded.slice(l, c).split(b" = p6_1;\n") } else { [] };
+        read.len() > 1 && folded.slice(l, folded.len()).index_of(b"rt_alloc_p(") == None
+          && read.get(read.len() - 1).index_of(b"ply_inc(") == None
       },
       _ -> false,
     },
@@ -21909,6 +22426,17 @@ test "a buffer read out of a record this body holds alone reaches its append uns
   // A subject a guard reads again, and a record a loop reads on each pass, keep their fields.
   assert_eq([b"m.guarded", b"m.captured", catching].map(takes), [false, false, false]);
   assert(text(b"m.guarded").index_of(b"t1 = 0;") == None, None)
+}
+
+test "a record an arm holds back is joined as its fields however deep it lies, past arms that loop" {
+  let src = Bytes::concat_all([
+    b"type S = { out: Bytes, n: Int }\n",
+    b"fn walk(s: S, fuel: Int) -> S = if fuel <= 0 { s } else if fuel % 2 == 0 { walk({ out: s.out ++ b\"x\", n: s.n + 1 }, fuel - 1) } else { let k = fuel * 3; match k % 4 { 1 -> walk(s, fuel - 1), _ -> s } }\n",
+    b"fn hop(s: S, fuel: Int) -> S = if fuel <= 0 { s } else { match fuel % 3 { 0 -> hop({ out: s.out ++ b\"y\", n: s.n }, fuel - 1), _ -> if fuel > 8 { hop(s, fuel - 2) } else if fuel % 2 == 0 { hop(s, fuel - 1) } else { s } } }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
+  assert_eq(out.map(|e: Emitted| e.why), [None, None]);
+  assert_eq(out.map(|e: Emitted| own_code(e.text).index_of(b"rt_alloc_p(") == None), [true, true])
 }
 
 // A count taken again would not be a wrong answer but an object that cannot die.
@@ -22955,8 +23483,23 @@ fn emit_module(
           None -> acc,
         }),
   };
+  // What a container's roots call of `std.prelude` the load reaches wherever a body writes one.
+  let unreached = written_code().calls.filter(|n: Bytes|
+    match def_in(module, here, imports, n) { Some(_) -> false, None -> true });
   written.fold(walked.out, |out: List<Emitted>, r: { root: Bytes, op: Bytes, ty: Type }|
-    if container_ops().contains(r.op) || walked_container(r.ty) {
+    if (container_ops().contains(r.op) || walked_container(r.ty)) && unreached.len() > 0 {
+      out.push({
+        name: r.root,
+        text: b"",
+        tables: no_tables(),
+        why: Some(
+          b"a container's root calls what the load did not reach of `std.prelude`: ".concat(
+            Bytes::join(unreached, b", "),
+          ),
+        ),
+        handles: [],
+      })
+    } else if container_ops().contains(r.op) || walked_container(r.ty) {
       let e = container_code(module, r.op, r.ty);
       let word = |n: Bytes|
         {
@@ -24028,16 +24571,16 @@ test "a builtin is called through the helper named for it, and an import that ta
     [
       {
         name: b"m",
-        src: b"fn longer(xs: List<Int>) -> List<Int> = xs.push(1)\nfn head(b: Bytes) -> Bytes / {abort.raise} = b.slice(0, 1)\n",
+        src: b"fn letters(s: String) -> List<Char> = s.chars()\nfn head(b: Bytes) -> Bytes / {abort.raise} = b.slice(0, 1)\n",
       },
     ],
     [],
-    [b"List::push", b"Bytes::slice"],
+    [b"String::chars", b"Bytes::slice"],
     true,
   );
   assert_eq(own.map(|e: Emitted| e.why), [None, None]);
   let has = |text: Bytes| own.map(|e: Emitted| e.text.index_of(text) != None);
-  assert_eq(has(b"builtin_list_push_p(ctx, "), [true, false]);
+  assert_eq(has(b"builtin_string_chars_p(ctx, "), [true, false]);
   assert_eq(has(b"builtin_bytes_slice_p(ctx, "), [false, true]);
   assert_eq(builtin_helper(b"?numeric_binary"), b"builtin_elaborated_numeric_binary");
   assert_eq(builtin_helper(b"range"), b"builtin_range");

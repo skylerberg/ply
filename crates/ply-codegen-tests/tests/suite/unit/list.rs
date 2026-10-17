@@ -1,5 +1,5 @@
 use ply_codegen::heap::{self, Heap, KIND_DEAD, Word, dec, inc, kind, obj};
-use ply_codegen::list::{get, len, root, to_vec, unique_throughout};
+use ply_codegen::list::{get, kids, leaf_of, len, root, to_vec, unique_throughout};
 
 fn ints(n: usize) -> Vec<Word> {
     (0..n).map(|i| heap::imm(i as i64)).collect()
@@ -27,6 +27,38 @@ fn a_list_built_from_items_reads_back_across_the_tail_and_the_trie() {
             );
         }
     }
+    h.end();
+}
+
+#[test]
+fn a_list_s_leaves_are_read_in_order_from_the_one_its_first_item_lies_in() {
+    let mut h = Heap::new();
+    for n in [0, 31, 32, 33, 64, 1024, 1025, 1100, 33000] {
+        let w = h.list_from(&ints(n));
+        let o = obj(w);
+        let leaves = (0..).take_while(|j| leaf_of(o, *j) != 0).count();
+        // A list of more than 32 items made at once holds every whole 32 of them in its trie.
+        assert_eq!(leaves, if n > 32 { n / 32 } else { 0 }, "n = {n}");
+        for j in 0..leaves as i64 {
+            let leaf = kids(obj(leaf_of(o, j)));
+            assert_eq!(leaf.len(), 32);
+            assert_eq!(heap::as_int(leaf[0]), Some(j * 32), "n = {n}, j = {j}");
+        }
+        assert_eq!(leaf_of(o, -1), 0);
+        dec(w);
+    }
+    // A `rest` cut's first leaf is the one its first item lies in.
+    let xs = h.list_from(&ints(2000));
+    let ys = h.list_skip(xs, 1500);
+    let o = obj(ys);
+    assert_eq!(
+        heap::as_int(kids(obj(leaf_of(o, 0)))[1500 % 32]),
+        Some(1500)
+    );
+    assert_eq!(heap::as_int(kids(obj(leaf_of(o, 1)))[0]), Some(1504));
+    assert_eq!(leaf_of(o, (1984 - 1472) / 32), 0);
+    dec(ys);
+    dec(xs);
     h.end();
 }
 
