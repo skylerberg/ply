@@ -4,22 +4,49 @@
 //! place by `field.leaf` for that record's leaves and by the field's own name for that record's
 //! word, so a flat representation spells the layout it was flattened from.
 
-import types (Type, TyVar, TyCon, TyRecord, TyNominal, TyFn, Field)
+import types (Type, TyVar, TyCon, TyRecord, TyNominal, Field)
 import resolve (qualify)
 import std.bytes (ascii_of_int)
-import emit (Carrier, Whole, Fields, Cases, SumCases, SumCase, FieldTy, Kind, KBoxed, KInt, KBool,
-             KNum, KFloat, KDec, KSum, SumSpec, Zeroed, Tagged, TyRec, TyOpen, Imported, kind_of)
+import emit (Carrier, Whole, Fields, Cases, SumCase, SumCtor, FieldTy, Kind, KBoxed, KInt, KBool,
+             KNum, KFloat, KDec, KSum, Zeroed, Tagged, TyRec, TyOpen, Imported, kind_of)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases, Leaf,
                  Path, PField, PNamed, PArg)
-import emit.lower.setting (Setting)
+import emit.lower.setting (Setting, carrier_of)
 
 /// How a value of `ty` is held in a body: a record whose type lays it out as its leaves and then
-/// its word, whatever its size, unless it holds in place a record that holds one in place; anything
-/// else as it crosses a call between roots.
+/// its word, whatever its size, unless it holds in place a record that holds one in place; a sum
+/// each of whose constructors takes nothing as its constructor's index; anything else as it crosses
+/// a call between roots.
 pub fn held_as(s: Setting, ty: Type) -> Rep =
   match laid_fields(ty) {
     Some(fs) -> if flat(fs) { RFlat(leaves_of(fs)) } else { RWord },
-    None -> carried_as(carrier_of(ty)),
+    None -> match enumerated_by(s, ty) {
+      Some(names) ->
+        RCases({ tagged: false, cases: names.map(|n: Bytes| { name: n, leaves: [] }) }),
+      None -> carried_as(carrier_of(ty)),
+    },
+  }
+
+/// The constructors of `ty`, as the table names them, in their declared order, where it is a sum
+/// each of whose constructors takes nothing.
+fn enumerated_by(s: Setting, ty: Type) -> Option<List<Bytes>> =
+  match ty {
+    TyCon(c) -> match s.ctors.sums.get(c.name) {
+      Some(cs) -> if cs.len() > 0 && cs.all(|x: SumCtor| x.fields.len() == 0) {
+        Some(cs.map(|x: SumCtor| x.name))
+      } else { None },
+      None -> None,
+    },
+    _ -> None,
+  }
+
+/// Whether a sum held as `r` is held as its constructor's index alone, its constructors taking
+/// nothing: where it crosses a call it is its constructor's object.
+pub fn enumerated(r: Rep) -> Bool =
+  match r {
+    RCases(c) ->
+      !c.tagged && c.cases.all(|x: { name: Bytes, leaves: List<Leaf> }| x.leaves.len() == 0),
+    _ -> false,
   }
 
 /// How a value crossing a call as `c` is held: as the emitter carries it between roots, so a root
@@ -321,75 +348,6 @@ fn offset_of(fs: List<FieldTy>, name: Bytes) -> Option<Int> = {
     match fs.at(i) { Some(f) -> if f.name == name { l.offsets.at(i) } else { acc }, None -> acc })
 }
 
-// Copies of the emitter's carrier rules (`emit.ply`'s `carrier_of` and what it reads), which must
-// stay identical to today's while roots each writes call each other; the hooks file lists them.
-
-/// How a value declared at `t` crosses a call between roots.
-pub fn carrier_of(t: Type) -> Carrier = {
-  let k = kind_of(t);
-  let args = if is_option_type(t) || tagged_result(t) {
-    match t { TyCon(c) -> c.args.map(|a: Type| case_carrier(carrier_of(a))), _ -> [] }
-  } else { [] };
-  if is_option_type(t) {
-    sum_carrier(Zeroed, [{ name: b"None", arg: None }, { name: b"Some", arg: args.at(0) }])
-  } else if tagged_result(t) {
-    sum_carrier(Tagged, [{ name: b"Ok", arg: args.at(0) }, { name: b"Err", arg: args.at(1) }])
-  } else {
-    match k.ty {
-      TyRec(fs) -> if carried_record(fs) { Fields(fs) } else { Whole(KBoxed) },
-      _ -> match k.kind {
-        KFloat -> Whole(KFloat),
-        KDec -> Whole(KDec),
-        KInt -> Whole(KInt),
-        KBool -> Whole(KBool),
-        KNum(w) -> if w.bits <= 64 { Whole(KNum(w)) } else { Whole(KBoxed) },
-        _ -> Whole(KBoxed),
-      },
-    }
-  }
-}
-
-fn sum_carrier(spec: SumSpec, cases: List<SumCase>) -> Carrier =
-  if cases.any(|c: SumCase| match c.arg { Some(Fields(_)) -> true, _ -> false }) {
-    Cases({ spec: spec, cases: cases })
-  } else { Whole(KSum(spec)) }
-
-fn case_carrier(c: Carrier) -> Carrier =
-  match c { Whole(KSum(_)) -> Whole(KBoxed), Cases(_) -> Whole(KBoxed), other -> other }
-
-fn carried_record(fs: List<FieldTy>) -> Bool =
-  fs.len() > 0
-    && fs.all(|f: FieldTy| match in_place(f) { Some(inner) -> holdable(inner), None -> true })
-    && fs.fold(0, |n: Int, f: FieldTy|
-      n + (match in_place(f) { Some(inner) -> laid_of(inner).width, None -> raw_words(f.kind) }))
-    <= 4
-
-pub fn is_option_type(t: Type) -> Bool =
-  match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
-
-pub fn tagged_result(t: Type) -> Bool =
-  match t {
-    TyCon(c) ->
-      c.name == b"Result" && c.args.len() == 2
-        && (match c.args.at(1) { Some(e) -> always_object(e), None -> false }),
-    _ -> false,
-  }
-
-fn always_object(t: Type) -> Bool =
-  match t {
-    TyRecord(_) -> true,
-    TyNominal(_) -> true,
-    TyFn(_) -> true,
-    TyCon(c) ->
-      c.name.index_of(b".") != None || c.name == b"Result" || c.name == b"Bytes"
-        || c.name == b"String"
-        || c.name == b"List"
-        || c.name == b"Map"
-        || c.name == b"Array"
-        || c.name == b"Columns",
-    _ -> false,
-  }
-
 fn qualified(name: Bytes) -> Option<{ binder: Bytes, name: Bytes }> =
   match name.index_of(b"::") {
     Some(i) -> match name.slice_at(0, i) {
@@ -511,7 +469,35 @@ test "an Option or a Result of a small record is held as its constructor's index
     at: 0,
     leaves: [{ name: b"x", rep: RFloat }, { name: b"y", rep: RFloat }, { name: b"", rep: RWord }],
   });
-  assert_eq(case_index(RTagged, b"Err"), Some(1))
+  assert_eq(case_index(RTagged, b"Err"), Some(1));
+  assert_eq(enumerated(o), false)
+}
+
+test "a sum whose constructors take nothing is held as its constructor's index, crossing as its object" {
+  let ctor = |n: Bytes, i: Int| { name: n, index: i, fields: [], params: [] };
+  let sums = Map::new().insert(b"Ordering", [
+    ctor(b"Less", 0),
+    ctor(b"Equal", 1),
+    ctor(b"Greater", 2),
+  ]).insert(b"m.Shade", [ctor(b"m.Dark", 0), { ..ctor(b"m.Light", 1), fields: [named(b"Int")] }]);
+  let s = { ..setting(), ctors: { names: [], laid: Map::new(), keyed: [], sums: sums } };
+  let ordering = held_as(s, named(b"Ordering"));
+  assert_eq(
+    ordering,
+    RCases({
+      tagged: false,
+      cases: [
+        { name: b"Less", leaves: [] },
+        { name: b"Equal", leaves: [] },
+        { name: b"Greater", leaves: [] },
+      ],
+    }),
+  );
+  assert_eq(enumerated(ordering), true);
+  assert_eq(case_index(ordering, b"Greater"), Some(2));
+  assert_eq(carried_as(carrier_of(named(b"Ordering"))), RWord);
+  // A constructor taking an argument leaves the sum an object.
+  assert_eq(held_as(s, named(b"m.Shade")), RWord)
 }
 
 test "a field is read at the offset today's emitter lays it at, a record held in place header and all" {
