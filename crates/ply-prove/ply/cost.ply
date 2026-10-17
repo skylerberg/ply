@@ -4,7 +4,7 @@
 
 import compiler.diagnostics (parse_all)
 import compiler.front (Analysed, ClaimClause, Refused, analyse, claims_in)
-import compiler.items (SCost, parse)
+import compiler.items (SpecKind, SCost, SSpace, parse)
 import compiler.exprs (prelude_module)
 import compiler.resolve (Diag)
 import compiler.code (Code, Node, Borrowed, NLit, NVar, NUnary, NBinary, NApp, NKnown, NIf, NBlock,
@@ -82,9 +82,9 @@ pub fn constant() -> Poly = [Map::new()]
 
 pub fn size_of(i: Int) -> Poly = [Map::new().insert(i, 1)]
 
-/// The key of the steps one call of function parameter `i` takes: a call is at least a step, so
-/// unlike a size it is never zero.
-fn cost_key(i: Int) -> Int = 0 - i - 1
+/// The key of what one call of function parameter `i` takes: the steps, which a `cost` bound reads
+/// as at least one, or the space it holds, which a `space` bound reads as possibly none.
+pub fn name_key(i: Int) -> Int = 0 - i - 1
 
 fn param_of_key(k: Int) -> Int = if k < 0 { 0 - k - 1 } else { k }
 
@@ -120,15 +120,24 @@ fn power(p: Poly, k: Int) -> Result<Poly, String> =
     match acc { Ok(q) -> product(q, p), Err(_) -> acc })
 
 /// `m` is at most a constant times `n` at every size, zero included: nothing is raised higher in it,
-/// and every size in `n` is in it, so that one of them at zero takes `m` to zero with `n`.
-fn below(m: Mono, n: Mono) -> Bool =
+/// and every size in `n` is in it, so that one of them at zero takes `m` to zero with `n`; a name of
+/// a function's steps is never zero, where `positive`.
+fn below(m: Mono, n: Mono, positive: Bool) -> Bool =
   m.fold(true, |ok: Bool, k: Int, v: Int| ok && v <= (match n.get(k) { Some(w) -> w, None -> 0 }))
-    && n.fold(true, |ok: Bool, k: Int, _v: Int| ok && (k < 0 || m.contains(k)))
+    && n.fold(true, |ok: Bool, k: Int, _v: Int| ok && ((k < 0 && positive) || m.contains(k)))
 
-/// Every monomial of `steps` is below one of `bound`'s; a constant is below anything.
-pub fn dominated(steps: Poly, bound: Poly) -> Bool =
-  steps.fold(true, |ok: Bool, m: Mono|
-    ok && (m.keys().len() == 0 || bound.fold(false, |found: Bool, n: Mono| found || below(m, n))))
+/// Every monomial of `steps` is below one of `bound`'s, each cost name being at least a step; a
+/// constant is below anything.
+pub fn dominated(steps: Poly, bound: Poly) -> Bool = dominated_with(steps, bound, true)
+
+/// As `dominated`, where a space name may be none, as a function that makes nothing holds.
+pub fn dominated_space(held: Poly, bound: Poly) -> Bool = dominated_with(held, bound, false)
+
+fn dominated_with(p: Poly, bound: Poly, positive: Bool) -> Bool =
+  p.fold(true, |ok: Bool, m: Mono|
+    ok
+      && (m.keys().len() == 0
+      || bound.fold(false, |found: Bool, n: Mono| found || below(m, n, positive))))
 
 /// `p`, a bound over a callee's parameters, at the sizes its arguments have and the steps of a call of
 /// each function it is given.
@@ -159,20 +168,20 @@ pub fn at_args(
 // --- A bound's own reading ----------------------------------------------------------------------
 
 /// The bound a clause states, read from below: a reading that is at most a constant times it, plus a
-/// constant, at every size. It reads lengths, cost names, positive literals, sums, products and
-/// `ilog2`. An `Int` parameter is no size here, since it may be negative.
-pub fn stated(bound: Code, params: Int, costed: List<Int>) -> Option<Poly> =
-  match reading(bound, { params: params, costed: costed }) { Some(r) -> Some(r.poly), None -> None }
+/// constant, at every size. It reads lengths, the names of `named`'s parameters, positive literals,
+/// sums, products and `ilog2`. An `Int` parameter is no size here, since it may be negative.
+pub fn stated(bound: Code, params: Int, named: List<Int>) -> Option<Poly> =
+  match reading(bound, { params: params, named: named }) { Some(r) -> Some(r.poly), None -> None }
 
-/// What a bound's slots are: the parameters, then a cost name for each of `costed`.
-type Scope = { params: Int, costed: List<Int> }
+/// What a bound's slots are: the parameters, then a cost or space name for each of `named`.
+type Scope = { params: Int, named: List<Int> }
 
-/// The cost name a slot holds, as the key of its steps.
-fn cost_name(sc: Scope, c: Code) -> Option<Int> =
+/// The name a slot holds, as the key of what one call of its parameter takes.
+fn name_of(sc: Scope, c: Code) -> Option<Int> =
   match c.node {
     NVar(v) -> match v.slot {
       Some(k) -> if k < sc.params { None }
-      else { match sc.costed.at(k - sc.params) { Some(i) -> Some(cost_key(i)), None -> None } },
+      else { match sc.named.at(k - sc.params) { Some(i) -> Some(name_key(i)), None -> None } },
       None -> None,
     },
     _ -> None,
@@ -185,7 +194,7 @@ type Reading = { poly: Poly, exact: Bool }
 
 fn reading(bound: Code, sc: Scope) -> Option<Reading> =
   match bound.node {
-    NVar(_) -> match cost_name(sc, bound) {
+    NVar(_) -> match name_of(sc, bound) {
       Some(k) -> Some({ poly: [Map::new().insert(k, 1)], exact: true }),
       None -> None,
     },
@@ -286,7 +295,7 @@ pub fn steps(cx: Context, def: String) -> Result<Poly, String> / {abort.raise} =
     if ready.len() == 0 { Stop(known) } else {
       Continue(
         ready.fold(known, |k: Map<String, Result<Poly, String>>, n: String|
-          k.insert(n, if by_entry(cx, n) { Err("`" ++ n ++ "` is read by its entry") }
+          k.insert(n, if by_entry(cx, n, SCost) { Err("`" ++ n ++ "` is read by its entry") }
           else { steps_of(cx, first_order, n, k) })),
       )
     }
@@ -328,18 +337,18 @@ pub fn holding_keyed(cx: Context, defs: List<String>) -> Option<String> =
       })
   }
 
-/// Each native by the name a call reaches it by, and whether it calls nothing it is handed back: the
-/// prelude's builtins, and the natives of the types it declares, which the bodies it writes in Ply
-/// call by their program-wide names.
+/// Every native by the name a call reaches it by: the prelude's builtins, and the natives of the
+/// types it declares, which the bodies it writes in Ply call by their program-wide names.
+pub fn natives() -> List<Builtin> / {abort.raise} =
+  builtins().concat(externs_of(prelude_module(), parse(prelude_source::text()).node))
+
+/// Each native, and whether it calls nothing it is handed back.
 pub fn first_order_builtins() -> Map<String, Bool> / {abort.raise} =
-  builtins().concat(externs_of(prelude_module(), parse(prelude_source::text()).node)).fold(
-    Map::new(),
-    |m: Map<String, Bool>, b: Builtin|
-      m.insert(String::of_bytes_lossy(b.name), match b.scheme.ty {
-        TyFn(f) -> !f.params.fold(false, |any: Bool, t: Type| any || calls_back(t)),
-        _ -> true,
-      }),
-  )
+  natives().fold(Map::new(), |m: Map<String, Bool>, b: Builtin|
+    m.insert(String::of_bytes_lossy(b.name), match b.scheme.ty {
+      TyFn(f) -> !f.params.fold(false, |any: Bool, t: Type| any || calls_back(t)),
+      _ -> true,
+    }))
 
 /// Whether a value of `t` may be a function a builtin handed it calls.
 fn calls_back(t: Type) -> Bool =
@@ -351,9 +360,11 @@ fn calls_back(t: Type) -> Bool =
     TyNominal(n) -> n.fields.fold(false, |any: Bool, f: Field| any || calls_back(f.ty)),
   }
 
+/// What `def`'s body calls, unless no reader reads the body, the steps and the space of a call of it
+/// read alike by its entry.
 pub fn callees(cx: Context, def: String) -> List<String> =
   match cx.claims.defs.get(def) {
-    Some(d) -> if by_entry(cx, def) { [] }
+    Some(d) -> if by_entry(cx, def, SCost) && by_entry(cx, def, SSpace) { [] }
     else { d.refs.filter(|n: String| cx.claims.defs.contains(n)) },
     None -> [],
   }
@@ -398,7 +409,7 @@ fn steps_of(
             {
               size: if at_or(sized, i, false) { Some(size_of(i)) } else { None },
               of: Same(i),
-              fun: if d.costed.contains(i) { Some([Map::new().insert(cost_key(i), 1)]) }
+              fun: if d.costed.contains(i) { Some([Map::new().insert(name_key(i), 1)]) }
               else { None },
             }),
           own: def,
@@ -454,7 +465,7 @@ fn promised(def: String, d: Def) -> Result<Poly, String> =
         match found {
           Some(_) -> found,
           None -> match c.clause.code {
-            Some(b) -> ceiling(b, { params: d.params, costed: d.costed }),
+            Some(b) -> ceiling(b, { params: d.params, named: d.costed }),
             None -> None,
           },
         },
@@ -464,18 +475,20 @@ fn promised(def: String, d: Def) -> Result<Poly, String> =
       Err("`" ++ def ++ "` has no body here to read, and no `cost` bound to read as its steps"),
   }
 
-/// A bound over `params` parameters and no cost names, read from above as `ceiling` reads one.
-pub fn ceiling_of(c: Code, params: Int) -> Option<Poly> = ceiling(c, { params: params, costed: [] })
+/// A bound over `params` parameters and the names of `named`'s, read from above as `ceiling` reads
+/// one.
+pub fn ceiling_of(c: Code, params: Int, named: List<Int>) -> Option<Poly> =
+  ceiling(c, { params: params, named: named })
 
 /// A bound read from above: what is at least it, up to a constant factor and a constant, at every
 /// size. An `Int` parameter reads as its magnitude, a quotient or remainder as its left, `ilog2` as
-/// what it is of, and a cost name as the steps of a call of the function it is given.
+/// what it is of, and a cost or space name as what a call of the function it is given takes.
 fn ceiling(c: Code, sc: Scope) -> Option<Poly> =
   match c.node {
     NLit(l) -> match l { LInt(_) -> Some(constant()), _ -> None },
     NVar(v) -> match v.slot {
       Some(k) -> if k < sc.params { Some(size_of(k)) } else {
-        match cost_name(sc, c) { Some(key) -> Some([Map::new().insert(key, 1)]), None -> None }
+        match name_of(sc, c) { Some(key) -> Some([Map::new().insert(key, 1)]), None -> None }
       },
       None -> None,
     },
@@ -1034,7 +1047,7 @@ fn application(env: Env, func: Code, args: List<Code>) -> Result<Walked, String>
               })
             } else if ctor(env.cx, name) != None {
               Ok({ ..given, size: None, of: Other, fun: None })
-            } else if env.cx.claims.defs.contains(name) && !by_entry(env.cx, name) {
+            } else if env.cx.claims.defs.contains(name) && !by_entry(env.cx, name, SCost) {
               match read(env, name) {
                 Err(why) -> Err(why),
                 Ok(p) -> match at_args(p, sizes, funs) {
@@ -1132,16 +1145,16 @@ fn builtin(
 pub fn iterating_of(name: Bytes) -> Option<Iterates> =
   match iterates(name) { Some(it) -> Some(it), None -> prelude_iterates(name) }
 
-/// Whether `def` is a definition its entry describes and no `cost` bound states, which a call reads
-/// by the entry, as a native's, and not by its body: a step, and beside it each call of the function
-/// it is handed. How many times and with what it calls that function is no assumption:
-/// `compiler.semantics` derives it from the body of each definition `std.prelude` writes in Ply,
-/// and its tests fail where the entry says otherwise. The body's own steps are not read, so a
-/// map fold's walk down to each next leaf goes unbilled.
-pub fn by_entry(cx: Context, def: String) -> Bool =
+/// Whether `def` is a definition its entry describes and no bound of `kind` states, which a call
+/// reads by the entry, as a native's, and not by its body: for `cost` a step, and beside it each call
+/// of the function it is handed. How many times and with what it calls that function is no
+/// assumption: `compiler.semantics` derives it from the body of each definition `std.prelude` writes
+/// in Ply, and its tests fail where the entry says otherwise. The body's own steps are not read, so
+/// a map fold's walk down to each next leaf goes unbilled.
+pub fn by_entry(cx: Context, def: String, kind: SpecKind) -> Bool =
   iterates(Bytes::of_string(def)) != None
     && (match cx.claims.defs.get(def) {
-      Some(d) -> !d.spec.any(|c: ClaimClause| c.kind == SCost),
+      Some(d) -> !d.spec.any(|c: ClaimClause| c.kind == kind),
       None -> false,
     })
 
@@ -1531,6 +1544,15 @@ test "another package's definition costs what its `cost` bound says, read from a
 
 fn each_of() -> Bytes =
   b"fn each_of(xs: List<Int>, f: (Int) -> Int cost k) -> Int cost xs.len() * k = xs.fold(0, |a: Int, x: Int| a + f(x))\n"
+
+test "a recursion that hands its function parameter on changed takes what no cost name bounds" {
+  let f = b"fn copier(y: Int) -> Int = [y, y, y].len()\nfn f(xs: List<Int>, i: Int, g: (Int) -> Int cost k, acc: Int) -> Int cost xs.len() * k = if i >= xs.len() { acc } else { f(xs, i + 1, copier, acc + g(i)) }\n";
+  assert_eq(shown(f, "f"), Err("`m.f` hands on a parameter its steps grow with, changed"));
+  assert(
+    shown(f.concat(b"fn h(xs: List<Int>) -> Int cost 1 = f(xs, 0, |y: Int| y + 1, 0)\n"), "h")
+      != Ok(true),
+  )
+}
 
 test "a function parameter's cost name stands for the steps of each call of it" {
   assert_eq(shown(each_of(), "each_of"), Ok(true));

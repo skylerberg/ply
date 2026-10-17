@@ -236,6 +236,7 @@ module.exports = grammar({
       field('return_type', $._type),
       optional($.effect_row),
       optional($.cost_clause),
+      optional($.space_clause),
     )),
 
     tuple_type: $ => seq('(', $._type, ',', commaSep1($._type), ')'),

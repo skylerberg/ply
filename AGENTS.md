@@ -52,10 +52,10 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 - `ply bootstrap` builds the builder (`crates/ply-compiler/ply`'s `build.main`) with the `ply` that
   runs it, and the builder builds the CLI. CI bootstraps twice: the latest release first, then the
   `ply` that made, which takes the builder and the shipped modules' answers the first kept unless
-  the definitions that make them moved. So only the compiler and the shipped modules it imports (`grep '^import std'
-  crates/ply-compiler/ply/*.ply` and what those import) cannot use a language rule the same pull
-  request introduces. The rest of `crates/ply-std/ply` can, `prelude.ply` among them, which declares
-  the builtins: the compiler embeds its text and parses it itself. Likewise the release's bootstrap drives the pull request's builder and links
+  the definitions that make them moved. The release parses the builder's modules, so the compiler,
+  `std.prelude`, which every module imports, and the shipped modules the compiler imports (`grep
+  '^import std' crates/ply-compiler/ply/*.ply` and what those import) cannot use a language rule
+  the same pull request introduces; the rest of `crates/ply-std/ply` can. Likewise the release's bootstrap drives the pull request's builder and links
   its runtime, so the builder's arguments, the runtime's description and the pack's layout change
   only in a form the release still speaks.
 - A file below `crates/ply-std/ply` that is not a `.ply` is data a shipped module embeds by its
