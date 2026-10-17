@@ -1,0 +1,260 @@
+//! The containers family's lowering held to its decisions, and its corpus to today's emitter: list
+//! literals, builtins called through the runtime's helpers, and lengths, bytes and joins written in
+//! place.
+
+import types (Type, TyCon)
+import front (Analysed, dump_of, analyse_pulling_std_with, no_rows)
+import resolve (qualify)
+import emit (emit_roots_answer, ctor_layouts, ctor_sums, RootAnswer)
+import emit.pieces (spelled)
+import emit.tir (Rep, RInt, RWord, RMaybe, RNum, Var, Arg, AVar, Val, Make, Made, MList, Native, Op, OContainer,
+                 Operation, Pack, Uses, Inst, Let, Fn, Declined, Containers, rep_of_arg)
+import emit.tir.containers (Length, Elements, ByteAt, U32At, Joined)
+import emit.lower.setting (setting_in)
+import emit.print (printed_fn)
+import emit.compare (Program, program_of, formed, checked, today_text, normalised, past_counts)
+
+/// The natives of a runtime implementing every builtin this module's programs call through one.
+fn natives() -> List<Bytes> =
+  [
+    b"String::concat", b"String::len", b"String::starts_with", b"Bytes::slice", b"Bytes::concat_all",
+    b"Bytes::index_of", b"range", b"Map::new", b"Map::len", b"Array::to_list", b"Array::at", b"Int::to_string",
+    b"List::with_capacity",
+  ]
+
+/// `src` as module `m` of a program, run by a runtime implementing `natives`.
+fn program_with(src: Bytes, natives: List<Bytes>) -> Program / {abort.raise} =
+  match program_of(src) {
+    Ok(p) -> { ..p, setting: { ..p.setting, builtins: natives } },
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+  }
+
+fn program(src: Bytes) -> Program / {abort.raise} = program_with(src, natives())
+
+type Bound = { var: Var, val: Val }
+
+/// What root `m.<name>` of `p` binds in its body's own block, in order.
+fn bound_in(p: Program, name: Bytes) -> List<Bound> / {abort.raise} =
+  match formed(p, name) {
+    Ok(f) -> f.body.fold([], |acc: List<Bound>, i: Inst| match i { Let(l) -> acc.push({ var: l.var, val: l.val }), _ -> acc }),
+    Err(no) -> panic(String::of_bytes_lossy(Bytes::concat_all([name, b": ", no.why]))),
+  }
+
+fn made(bs: List<Bound>) -> List<{ made: Made, args: List<Arg> }> =
+  bs.fold([], |acc: List<{ made: Made, args: List<Arg> }>, b: Bound|
+    match b.val { Make(m) -> acc.push({ made: m.made, args: m.args }), _ -> acc })
+
+fn natives_in(bs: List<Bound>) -> List<{ name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }> =
+  bs.fold([], |acc: List<{ name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }>, b: Bound|
+    match b.val { Native(n) -> acc.push({ name: n.name, args: n.args, uses: n.uses, answer: b.var.rep }), _ -> acc })
+
+fn ops_in(bs: List<Bound>) -> List<{ op: Operation, args: List<Arg>, uses: Uses, answer: Rep }> =
+  bs.fold([], |acc: List<{ op: Operation, args: List<Arg>, uses: Uses, answer: Rep }>, b: Bound|
+    match b.val { Op(o) -> acc.push({ op: o.op, args: o.args, uses: o.uses, answer: b.var.rep }), _ -> acc })
+
+/// The representation each `Pack` holds its operand as.
+fn packs_in(bs: List<Bound>) -> List<Rep> =
+  bs.fold([], |acc: List<Rep>, b: Bound| match b.val { Pack(k) -> acc.push(k.to), _ -> acc })
+
+fn param(id: Int, ty: Bytes) -> Arg = AVar({ id: id, ty: TyCon({ name: ty, args: [] }), rep: RWord })
+
+test "a list literal is made of its items, each handed over as a word" {
+  let p = program(Bytes::concat_all([
+    b"fn pair(a: String, b: String) -> List<String> = [a, b]\n",
+    b"fn nums(a: Int) -> List<Int> = [a, 2]\n",
+    b"fn none() -> List<Int> = []\n",
+  ]));
+  assert_eq(made(bound_in(p, b"pair")), [{ made: MList(2), args: [param(0, b"String"), param(1, b"String")] }]);
+  assert_eq(packs_in(bound_in(p, b"nums")), [RWord, RWord]);
+  assert_eq(made(bound_in(p, b"nums")).map(|m: { made: Made, args: List<Arg> }| m.args.map(rep_of_arg)), [[RWord, RWord]]);
+  assert_eq(made(bound_in(p, b"none")), [{ made: MList(0), args: [] }]);
+  // The list's variable holds the list's type, an item's where the literal has one.
+  assert_eq(
+    bound_in(p, b"nums").fold([], |acc: List<Type>, b: Bound| match b.val { Make(_) -> acc.push(b.var.ty), _ -> acc }),
+    [TyCon({ name: b"List", args: [TyCon({ name: b"Int", args: [] })] })],
+  )
+}
+
+test "a builtin the runtime implements is called through its helper over words, its answer held as its type" {
+  let p = program(Bytes::concat_all([
+    b"fn joined(a: String, b: String) -> String = String::concat(a, b)\n",
+    b"fn size(s: String) -> Int = s.len()\n",
+    b"fn numbers(n: Int) -> List<Int> = range(0, n)\n",
+  ]));
+  let calls = natives_in(bound_in(p, b"joined"));
+  assert_eq(calls.map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name), [b"builtin_string_concat_p"]);
+  assert_eq(calls.map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.args), [[param(0, b"String"), param(1, b"String")]]);
+  assert_eq(
+    calls.map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.uses),
+    [{ takes: [true, true], owned: true, fails: true, stops: false }],
+  );
+  // A method is the builtin its type names, its word answer unboxed to the `Int` it holds.
+  assert_eq(natives_in(bound_in(p, b"size")).map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.answer), [RWord]);
+  assert_eq(natives_in(bound_in(p, b"size")).map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name), [b"builtin_string_len_p"]);
+  assert_eq(packs_in(bound_in(p, b"size")), [RInt]);
+  // Each scalar argument is boxed into the word the helper takes.
+  assert_eq(packs_in(bound_in(p, b"numbers")), [RWord, RWord]);
+  assert_eq(
+    natives_in(bound_in(p, b"numbers")).map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.args.map(rep_of_arg)),
+    [[RWord, RWord]],
+  )
+}
+
+test "a length and a byte are read in place, and only a read that can fall outside the object fails" {
+  let p = program(Bytes::concat_all([
+    b"fn count(xs: List<String>) -> Int = xs.len()\n",
+    b"fn size(b: Bytes) -> Int = b.len()\n",
+    b"fn arity(a: Array<String>) -> Int = a.len()\n",
+    b"fn byte(b: Bytes, i: Int) -> Int / {abort.raise} = b.at(i)\n",
+    b"fn word(b: Bytes, i: Int) -> U32 / {abort.raise} = b.u32_le(i)\n",
+  ]));
+  let read = |name: Bytes| {
+    let bs = bound_in(p, name);
+    assert_eq(natives_in(bs), []);
+    ops_in(bs).map(|o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| { op: o.op, fails: o.uses.fails, answer: o.answer })
+  };
+  assert_eq(read(b"count"), [{ op: OContainer(Length), fails: false, answer: RInt }]);
+  assert_eq(read(b"size"), [{ op: OContainer(Length), fails: false, answer: RInt }]);
+  assert_eq(read(b"arity"), [{ op: OContainer(Elements), fails: false, answer: RInt }]);
+  assert_eq(read(b"byte"), [{ op: OContainer(ByteAt), fails: true, answer: RInt }]);
+  assert_eq(read(b"word"), [{ op: OContainer(U32At), fails: true, answer: RNum({ bits: 32, signed: false }) }]);
+  // A read takes nothing it reads.
+  assert_eq(
+    ops_in(bound_in(p, b"byte")).map(|o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.uses.takes),
+    [[false, false]],
+  )
+}
+
+test "byte strings joined from a list made for the join make no list" {
+  let p = program(Bytes::concat_all([
+    b"fn glued(a: Bytes, b: Bytes) -> Bytes = Bytes::concat_all([a, b])\n",
+    b"fn all(bs: List<Bytes>) -> Bytes = Bytes::concat_all(bs)\n",
+    b"fn named(a: Bytes) -> Bytes = { let xs = [a]; Bytes::concat_all(xs) }\n",
+  ]));
+  let glued = bound_in(p, b"glued");
+  assert_eq(made(glued), []);
+  assert_eq(
+    ops_in(glued).map(|o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| { op: o.op, args: o.args }),
+    [{ op: OContainer(Joined), args: [param(0, b"Bytes"), param(1, b"Bytes")] }],
+  );
+  let name = |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name;
+  assert_eq(natives_in(bound_in(p, b"all")).map(name), [b"builtin_bytes_concat_all_p"]);
+  // A list a slot holds may be read again, so it is made and joined by the runtime.
+  assert_eq(made(bound_in(p, b"named")).len(), 1);
+  assert_eq(natives_in(bound_in(p, b"named")).map(name), [b"builtin_bytes_concat_all_p"])
+}
+
+test "a lookup answers an Option held as its payload's word, with no object made" {
+  let p = program(b"fn element(a: Array<String>, i: Int) -> Option<String> = a.at(i)\n");
+  assert_eq(
+    natives_in(bound_in(p, b"element")).map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| { name: c.name, answer: c.answer }),
+    [{ name: b"rt_array_lookup_p", answer: RMaybe }],
+  )
+}
+
+test "a builtin the runtime lacks is declined, and one written at a scalar's type goes on to scalars" {
+  let src = Bytes::concat_all([
+    b"fn size(s: String) -> Int = s.len()\n",
+    b"fn wrapped(a: U8, b: U8) -> U8 = wrap_add(a, b)\n",
+  ]);
+  let by = |p: Program, name: Bytes| match formed(p, name) { Ok(_) -> None, Err(no) -> Some(no.by) };
+  assert_eq(by(program_with(src, []), b"size"), Some(Containers));
+  assert_eq(by(program(src), b"size"), None);
+  assert(by(program(src), b"wrapped") != Some(Containers), None)
+}
+
+test "a shipped module's extern is called as the builtin of its own name" {
+  let user = b"import std.native (doubled)\nimport std.native as n\nfn f() -> Int = doubled(2) + n::doubled(3)\n";
+  let shipped = [{ name: b"std.native", src: b"pub extern fn doubled(x: Int) -> Int\n" }];
+  match analyse_pulling_std_with([{ name: b"m", src: user }], shipped, no_rows()).out {
+    Analysed(a) -> match setting_in(a, b"m") {
+      Ok(s) -> {
+        let p = { src: user, analysis: a, setting: { ..s.setting, builtins: [b"doubled"] }, roots: s.roots };
+        assert_eq(
+          natives_in(bound_in(p, b"f")).map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name),
+          [b"builtin_doubled_p", b"builtin_doubled_p"],
+        )
+      },
+      Err(why) -> panic(String::of_bytes_lossy(why)),
+    },
+    _ -> panic("the program does not check"),
+  }
+}
+
+/// Programs covering what the lang tests of lists, bytes, strings, arrays and maps lower through this
+/// family, each root using each counted value it holds once.
+fn corpus() -> Bytes =
+  Bytes::concat_all([
+    b"fn pair(a: String, b: String) -> List<String> = [a, b]\n",
+    b"fn ints(a: Int, b: Int) -> List<Int> = [a, b, a + b]\n",
+    b"fn floats(x: Float) -> List<Float> = [x, x * 2.0]\n",
+    b"fn flags(c: Bool) -> List<Bool> = [c, !c, true]\n",
+    b"fn empty() -> List<String> = []\n",
+    b"fn nested(a: String) -> List<List<String>> = [[a], []]\n",
+    b"fn count(xs: List<String>) -> Int = xs.len()\n",
+    b"fn size(b: Bytes) -> Int = b.len()\n",
+    b"fn byte(b: Bytes, i: Int) -> Int / {abort.raise} = b.at(i)\n",
+    b"fn third(b: Bytes) -> Int / {abort.raise} = b.at(3)\n",
+    b"fn word(b: Bytes, i: Int) -> U32 / {abort.raise} = b.u32_le(i)\n",
+    b"fn glued(a: Bytes, b: Bytes) -> Bytes = Bytes::concat_all([a, b])\n",
+    b"fn all(bs: List<Bytes>) -> Bytes = Bytes::concat_all(bs)\n",
+    b"fn cat(a: String, b: String) -> String = String::concat(a, b)\n",
+    b"fn cut(b: Bytes, i: Int) -> Bytes / {abort.raise} = b.slice(i, 4)\n",
+    b"fn measured(s: String) -> Int = s.len()\n",
+    b"fn starts(s: String, p: String) -> Bool = s.starts_with(p)\n",
+    b"fn found(h: Bytes, n: Bytes) -> Option<Int> = h.index_of(n)\n",
+    b"fn numbers(n: Int) -> List<Int> = range(0, n)\n",
+    b"fn fresh() -> Map<Int, String> = Map::new()\n",
+    b"fn keys(m: Map<Int, String>) -> Int = m.len()\n",
+    b"fn listed(a: Array<Int>) -> List<Int> = a.to_list()\n",
+    b"fn arity(a: Array<String>) -> Int = a.len()\n",
+    b"fn text(n: Int) -> String = n.to_string()\n",
+    b"fn element(a: Array<String>, i: Int) -> Option<String> = a.at(i)\n",
+    b"fn reserved(n: Int) -> List<String> = List::with_capacity(n)\n",
+  ])
+
+fn corpus_names() -> List<Bytes> =
+  [
+    b"pair", b"ints", b"floats", b"flags", b"empty", b"nested", b"count", b"size", b"byte", b"third", b"word",
+    b"glued", b"all", b"cat", b"cut", b"measured", b"starts", b"found", b"numbers", b"fresh", b"keys", b"listed",
+    b"arity", b"text", b"element", b"reserved",
+  ]
+
+/// What today's emitter answers for the roots `m.<name>` of `p` that `names` name, the runtime
+/// implementing the natives `p`'s setting names.
+fn answered_with_natives(p: Program, names: List<Bytes>) -> List<RootAnswer> / {abort.raise} = {
+  let d = dump_of(Analysed(p.analysis));
+  emit_roots_answer(
+    [b"m"],
+    [p.src],
+    { names: [], laid: ctor_layouts(d.ctors), keyed: [], sums: ctor_sums(d.ctors) },
+    p.setting.builtins,
+    names.map(|n: Bytes| qualify(b"m", n)),
+    [],
+    [],
+    d.embeds,
+    d.rows,
+    d.walked,
+  )
+}
+
+/// Root `m.<name>` of `p` as the form prints it before any check, or why it was not formed.
+fn form_text(p: Program, name: Bytes) -> Bytes / {abort.raise} =
+  match formed(p, name) { Ok(f) -> spelled(printed_fn(f).pieces), Err(no) -> no.why }
+
+test "the corpus lowers, and prints as today's emitter writes it but for counts" {
+  let p = program(corpus());
+  assert_eq(
+    corpus_names().fold([], |acc: List<{ name: Bytes, declined: Declined }>, n: Bytes|
+      match formed(p, n) { Ok(_) -> acc, Err(no) -> acc.push({ name: n, declined: no }) }),
+    [],
+  );
+  let today = answered_with_natives(p, corpus_names());
+  let read = |text: Bytes| past_counts(normalised(text));
+  let differing = corpus_names().fold([], |acc: List<{ name: Bytes, today: List<Bytes>, form: List<Bytes> }>, n: Bytes| {
+    let form = read(form_text(p, n));
+    let old = read(today_text(today, n));
+    if form == old { acc } else { acc.push({ name: n, today: old, form: form }) }
+  });
+  assert_eq(differing, [])
+}

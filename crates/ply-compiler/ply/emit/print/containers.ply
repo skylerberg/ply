@@ -1,13 +1,107 @@
 //! Lists and arrays made, and the operations on a container's cells, printed.
 
-import emit.tir (Var, Arg, Made, Uses)
-import emit.tir.containers (ContainerOp)
-import emit.print.text (Printing, Place, line)
+import std.bytes (ascii_of_int)
+import emit (builtin_helper)
+import emit.tir (Var, Arg, Made, MList, Uses, rep_of_arg)
+import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined)
+import emit.print.text (Printing, Place, line, temp, arg_text, assigned, site, check)
+import emit.print.made (c_type, as_word)
 
 /// A list or an array made of `m.args`.
-pub fn contained(p: Place, pr: Printing, into: Option<Var>, m: { made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> }) -> Printing =
-  line(pr, p.depth, b"/* a container made, which this printer does not write yet */")
+pub fn contained(p: Place, pr: Printing, into: Option<Var>, m: { made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> }) -> Printing / {abort.raise} =
+  match m.made {
+    MList(_) -> from_words(p, pr, into, b"rt_list_p", m.args),
+    _ -> line(pr, p.depth, b"/* an array made, which this printer does not write yet */"),
+  }
 
 /// Operation `op` on a container's cells over `args`.
-pub fn container_op(p: Place, pr: Printing, into: Option<Var>, op: ContainerOp, args: List<Arg>, uses: Uses) -> Printing =
-  line(pr, p.depth, b"/* a container's operation, which this printer does not write yet */")
+pub fn container_op(p: Place, pr: Printing, into: Option<Var>, op: ContainerOp, args: List<Arg>, uses: Uses) -> Printing / {abort.raise} = {
+  let object = match args.at(0) { Some(a) -> arg_text(pr, a), None -> b"0" };
+  let index = match args.at(1) { Some(a) -> arg_text(pr, a), None -> b"0" };
+  match into {
+    None -> line(pr, p.depth, b"/* a container's operation whose answer goes unread */"),
+    Some(v) -> match op {
+      Length -> assigned(pr, p.depth, v, c_type(v.rep), Bytes::concat_all([b"(int64_t)ply_obj(", object, b")->len"])),
+      Elements -> assigned(pr, p.depth, v, c_type(v.rep), Bytes::concat_all([b"ply_array_len(", object, b")"])),
+      ByteAt -> {
+        let tested = bounded(p, site(p, pr), b"Bytes::at", object, args, Bytes::concat_all([
+          b"(uint64_t)",
+          index,
+          b" >= (uint64_t)ply_obj(",
+          object,
+          b")->len",
+        ]));
+        assigned(tested, p.depth, v, c_type(v.rep), Bytes::concat_all([b"(int64_t)(ply_bytes(", object, b"))[", index, b"]"]))
+      },
+      U32At -> {
+        // Tested against the length less four: four added to a negative index could wrap into range.
+        let tested = bounded(p, site(p, pr), b"Bytes::u32_le", object, args, Bytes::concat_all([
+          b"(uint64_t)ply_obj(",
+          object,
+          b")->len < 4 || (uint64_t)",
+          index,
+          b" > (uint64_t)ply_obj(",
+          object,
+          b")->len - 4",
+        ]));
+        let w = temp(tested);
+        let loaded = line(w.pr, p.depth, Bytes::concat_all([
+          b"uint32_t ",
+          w.name,
+          b"; memcpy(&",
+          w.name,
+          b", ply_bytes(",
+          object,
+          b") + ",
+          index,
+          b", 4);",
+        ]));
+        assigned(loaded, p.depth, v, c_type(v.rep), Bytes::concat_all([b"ply_le32(", w.name, b")"]))
+      },
+      Joined -> from_words(p, pr, into, b"rt_bytes_join_p", args),
+      Laid(_) -> line(pr, p.depth, b"/* an extern written in place, which this printer does not write yet */"),
+    },
+  }
+}
+
+/// The runtime's `make` over `words`, which it takes, laid in an array of them: C has no empty
+/// initialiser, so an empty one still declares a word.
+fn from_words(p: Place, pr: Printing, into: Option<Var>, make: Bytes, words: List<Arg>) -> Printing / {abort.raise} = {
+  let arr = temp(pr);
+  let laid = line(arr.pr, p.depth, Bytes::concat_all([
+    b"Word ",
+    arr.name,
+    b"[] = {",
+    if words.len() == 0 { b"0" } else { Bytes::join(words.map(|a: Arg| arg_text(pr, a)), b", ") },
+    b"};",
+  ]));
+  let call = Bytes::concat_all([make, b"(ctx, (Word)(intptr_t)", arr.name, b", ", ascii_of_int(words.len()), b")"]);
+  check(p, match into {
+    Some(v) -> assigned(laid, p.depth, v, c_type(v.rep), call),
+    None -> line(laid, p.depth, call.concat(b";")),
+  })
+}
+
+/// Where `outside` holds, the runtime's own call of builtin `name` over the object and the index as
+/// a word raises what the read would, and the function leaves.
+fn bounded(p: Place, pr: Printing, name: Bytes, object: Bytes, args: List<Arg>, outside: Bytes) -> Printing / {abort.raise} = {
+  let index = match args.at(1) {
+    Some(a) -> as_word(arg_text(pr, a), rep_of_arg(a)),
+    None -> b"0",
+  };
+  line(pr, p.depth, Bytes::concat_all([
+    b"if (",
+    outside,
+    b") { ply_inc(",
+    object,
+    b"); ",
+    builtin_helper(name),
+    b"_p(ctx, ",
+    object,
+    b", ",
+    index,
+    b"); ",
+    p.leave,
+    b" }",
+  ]))
+}
