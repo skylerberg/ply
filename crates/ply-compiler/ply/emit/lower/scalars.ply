@@ -15,11 +15,13 @@ import emit (Width, Ctors, SumCtor, Scalar, Exact, Whole, Cases, KSum, literal_b
 import emit.keys
 import emit.keys (RootKey, TypeOp, Root, Written, Order, Reflect, Shown, Digest, Contained)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases,
-                 RSlice, RToken, Arg, AInt, ABool, AFloat, ANum, AChar, Val, Prim, Literal, Call,
-                 Native, Given, Scalars, rep_of_arg, comparison, arithmetic, shift)
+                 RSlice, RToken, Arg, AVar, AInt, ABool, AFloat, ANum, AChar, Val, Prim, Literal,
+                 Get, Call, Native, Given, Decl, Assign, If, Scalars, rep_of_arg, comparison,
+                 arithmetic, shift)
 import emit.lower.setting (carrier_of)
-import emit.lower.held (held_as, carried_as)
-import emit.lower.base (Context, Lowering, Lowered, refuse, bound, bound_as, type_of, handed, noted)
+import emit.lower.held (held_as, carried_as, field_path)
+import emit.lower.base (Context, Lowering, Lowered, refuse, fresh, bound, bound_as, opened,
+                        continued, type_of, handed, noted, set_join, short_circuit)
 import emit.lower.data (constructed)
 
 /// A literal as the operand it is, or read from the pool into a variable of its type where no
@@ -88,17 +90,36 @@ pub fn unary(cx: Context, o: Lowered, op: Bytes, at: Span) -> Lowered / {abort.r
 /// a comparison answers a `Bool`, any other operator a value of the operands' type.
 pub fn binary(cx: Context, l: Lowered, r: Lowered, op: Bytes, at: Span) -> Lowered / {abort.raise} = {
   let ty = match l.arg { AInt(_) -> type_of(r.arg), _ -> type_of(l.arg) };
-  let eq = op == b"eq" || op == b"ne";
   if op == b"concat" { by_runtime(cx, r.st, b"rt_concat_p", [], [l.arg, r.arg], ty, at) }
   else if !comparison(op) && !arithmetic(op) && !shift(op) && !bitwise(op) {
     refuse(r.st, Scalars, b"an operator: ".concat(op))
-  } else if apart(l.arg) || apart(r.arg) { refuse(r.st, Scalars, held_apart()) }
-  else if ty == unknown_type() {
+  } else if ty == unknown_type() {
     refuse(r.st, Scalars, b"an operator over operands of no known type: ".concat(op))
   } else {
-    let truth = named_type(b"Bool");
-    let answer = if comparison(op) { truth } else { ty };
     match class_of(cx.setting.ctors, ty) {
+      CRecord(fs) -> if op == b"eq" { fields_equal(cx, r.st, ty, fs, l.arg, r.arg, at) }
+      else if op == b"ne" { negation(cx, fields_equal(cx, r.st, ty, fs, l.arg, r.arg, at), at) }
+      else { lacking(r.st, op) },
+      c -> classed(cx, l, r, op, ty, c, at),
+    }
+  }
+}
+
+/// `l op r` over values of `ty` of class `c`, none a record compared field by field.
+fn classed(
+  cx: Context,
+  l: Lowered,
+  r: Lowered,
+  op: Bytes,
+  ty: Type,
+  c: Class,
+  at: Span,
+) -> Lowered = {
+  let eq = op == b"eq" || op == b"ne";
+  let truth = named_type(b"Bool");
+  let answer = if comparison(op) { truth } else { ty };
+  if apart(l.arg) || apart(r.arg) { refuse(r.st, Scalars, held_apart()) } else {
+    match c {
       CInt -> over(cx, l, r, op, RInt, answer, at),
       CWidth(w) -> over(cx, l, r, op, RNum(w), answer, at),
       CBool -> if eq { over(cx, l, r, op, RBool, truth, at) } else { lacking(r.st, op) },
@@ -138,9 +159,104 @@ pub fn binary(cx: Context, l: Lowered, r: Lowered, op: Bytes, at: Span) -> Lower
         )
       } else { words(cx, l, r, op, ty, at) },
       CWord(t) -> words(cx, l, r, op, t, at),
+      CRecord(_) -> lacking(r.st, op),
     }
   }
 }
+
+/// Whether `a` and `b`, records of type `ty` of fields `fs`, are equal: field by field in order, each
+/// compared only where those before it were equal and as its own type compares, a field of a record
+/// type field by field again.
+fn fields_equal(
+  cx: Context,
+  st: Lowering,
+  ty: Type,
+  fs: List<Field>,
+  a: Arg,
+  b: Arg,
+  at: Span,
+) -> Lowered =
+  fs.fold(
+    { out: { st: st, arg: ABool(true) }, first: true },
+    |acc: { out: Lowered, first: Bool }, f: Field| {
+      let x = field_read(cx, if acc.first { acc.out.st } else { opened(acc.out.st) }, ty, f, a, at);
+      let y = field_read(cx, x.st, ty, f, b, at);
+      let e = match f.ty {
+        TyRecord(gs) -> fields_equal(cx, y.st, f.ty, gs, x.arg, y.arg, at),
+        TyNominal(n) -> fields_equal(cx, y.st, f.ty, n.fields, x.arg, y.arg, at),
+        _ -> if is_option(f.ty) { refuse(y.st, Scalars, optional()) } else {
+          classed(
+            cx,
+            { st: y.st, arg: x.arg },
+            y,
+            b"eq",
+            f.ty,
+            class_of(cx.setting.ctors, f.ty),
+            at,
+          )
+        },
+      };
+      { out: if acc.first { e } else { short_circuit(cx, acc.out, e, true, at) }, first: false }
+    },
+  ).out
+
+/// The sign of `a` and `b`'s order, records of type `ty` of fields `fs`: by their fields in order,
+/// the first that orders them apart deciding, each read only where those before it were equal.
+fn fields_order(
+  cx: Context,
+  st: Lowering,
+  ty: Type,
+  fs: List<Field>,
+  a: Arg,
+  b: Arg,
+  at: Span,
+) -> Lowered =
+  fs.fold(
+    { out: { st: st, arg: AInt(0) }, first: true },
+    |acc: { out: Lowered, first: Bool }, f: Field| {
+      let x = field_read(cx, if acc.first { acc.out.st } else { opened(acc.out.st) }, ty, f, a, at);
+      let y = field_read(cx, x.st, ty, f, b, at);
+      let s = match f.ty {
+        TyRecord(gs) -> fields_order(cx, y.st, f.ty, gs, x.arg, y.arg, at),
+        TyNominal(n) -> fields_order(cx, y.st, f.ty, n.fields, x.arg, y.arg, at),
+        _ -> if is_option(f.ty) { refuse(y.st, Scalars, optional()) }
+        else { sign_at(cx, { st: y.st, arg: x.arg }, y, f.ty, at) },
+      };
+      { out: if acc.first { s } else { decided(cx, acc.out, s, at) }, first: false }
+    },
+  ).out
+
+/// Field `f` of `of`, a record of type `ty`, read where the record's layout puts it.
+fn field_read(cx: Context, st: Lowering, ty: Type, f: Field, of: Arg, at: Span) -> Lowered =
+  match of {
+    AVar(v) -> bound(cx, st, f.ty, Get({ of: v, path: field_path(cx.setting, ty, f.name) }), at),
+    _ -> refuse(st, Scalars, b"a field of a record no variable holds"),
+  }
+
+/// The sign `l` where it is not zero, else `r`, lowered in a block of its own after `l`'s state.
+fn decided(cx: Context, l: Lowered, r: Lowered, at: Span) -> Lowered = {
+  let j = fresh(continued(l.st, r.st), named_type(b"Int"), RInt);
+  let c = bound(
+    cx,
+    j.st,
+    named_type(b"Bool"),
+    Prim({ op: b"ne", on: RInt, args: [l.arg, AInt(0)] }),
+    at,
+  );
+  let right = set_join(c.st, r, j.var, at);
+  {
+    st: {
+      ..right.st,
+      insts: right.st.insts.push(Decl(j.var)).push(
+        If({ cond: c.arg, then: [Assign({ var: j.var, arg: l.arg })], otherwise: right.block }),
+      ),
+    },
+    arg: AVar(j.var),
+  }
+}
+
+fn optional() -> Bytes =
+  b"an `Option` a record holds, held as its payload's word, which waits on `held`"
 
 /// Builtin `name` over `args`, which `containers` hands on as one written in place at the type its
 /// operands hold: an order, a reflection, an encoding, an identity test, a width's wrapping,
@@ -235,10 +351,13 @@ type Class =
   | CNullary(Type)
   | CSum(Type)
   | CWalked(Type)
+  | CRecord(List<Field>)
   | CWord(Type)
 
 fn class_of(ctors: Ctors, ty: Type) -> Class =
   match ty {
+    TyRecord(fs) -> if fs.len() > 0 && !has_vars(ty) { CRecord(fs) } else { CWord(ty) },
+    TyNominal(x) -> if x.fields.len() > 0 && !has_vars(ty) { CRecord(x.fields) } else { CWord(ty) },
     TyCon(c) -> if c.args.len() > 0 {
       if walked_container(ty) || is_result(ty) { CWalked(ty) }
       else if generic_sum(ctors, ty) { CSum(ty) }
@@ -421,76 +540,78 @@ fn rooted(
 fn negation(cx: Context, b: Lowered, at: Span) -> Lowered =
   bound(cx, b.st, named_type(b"Bool"), Prim({ op: b"not", on: RBool, args: [b.arg] }), at)
 
-/// `compare(a, b)` at the type its operands hold: in C for a number, a character, a string, a
-/// `Bool` and `()`, the sign made its `Ordering`; through the root written for a declared sum, a
-/// container, an `Option` or a `Result` known throughout.
+/// `compare(a, b)` at the type its operands hold: through the root written for a declared sum, a
+/// container, an `Option` or a `Result` known throughout, which answers the `Ordering`; any other
+/// type C orders, a record field by field, by the sign of the order made its `Ordering`.
 fn ordered(cx: Context, st: Lowering, a: Arg, b: Arg, at: Span) -> Lowered = {
   let ty = match a { AInt(_) -> type_of(b), _ -> type_of(a) };
-  let l = { st: st, arg: a };
-  let r = { st: st, arg: b };
+  match by_root(cx, st, ty, a, b, at) {
+    Some(o) -> o,
+    None -> {
+      let s = match class_of(cx.setting.ctors, ty) {
+        CRecord(fs) -> fields_order(cx, st, ty, fs, a, b, at),
+        _ -> sign_at(cx, { st: st, arg: a }, { st: st, arg: b }, ty, at),
+      };
+      bound(
+        cx,
+        s.st,
+        named_type(b"Ordering"),
+        Prim({ op: b"ordering", on: RInt, args: [s.arg] }),
+        at,
+      )
+    },
+  }
+}
+
+/// The order of `a` and `b` where a root written for their type answers it: a sum a module declares,
+/// a container, an `Option` or a `Result` known throughout.
+fn by_root(cx: Context, st: Lowering, ty: Type, a: Arg, b: Arg, at: Span) -> Option<Lowered> = {
   let order = named_type(b"Ordering");
-  if apart(a) || apart(b) { refuse(st, Scalars, held_apart()) } else {
-    match class_of(cx.setting.ctors, ty) {
-      CInt -> signed(cx, l, r, b"order", RInt, at),
-      CBool -> signed(cx, l, r, b"order", RBool, at),
-      CChar -> signed(cx, l, r, b"order", RWord, at),
-      CWidth(w) -> signed(cx, l, r, b"order", RNum(w), at),
-      CDec -> signed(cx, l, r, b"order", RDec, at),
-      CText -> signed(cx, l, r, b"bytes_order", RWord, at),
-      CNullary(t) -> by_order_root(cx, st, t, a, b, at),
-      CSum(t) -> by_order_root(cx, st, t, a, b, at),
-      CWalked(t) ->
-        rooted(
-          cx,
-          st,
-          Written({ op: Contained(b"ordered"), ty: t, home: cx.setting.module }),
-          [a, b],
-          [RWord, RWord],
-          order,
-          RWord,
-          at,
-        ),
-      CWord(t) -> if t == named_type(b"Unit") {
-        bound(cx, st, order, Prim({ op: b"ordering", on: RInt, args: [AInt(0)] }), at)
-      } else if is_option(t) && !has_vars(t) {
-        rooted(
-          cx,
-          st,
-          Written({ op: Contained(b"ordered"), ty: t, home: cx.setting.module }),
-          [a, b],
-          [RWord, RWord],
-          order,
-          RWord,
-          at,
-        )
-      } else if record_type(t) {
-        refuse(st, Scalars, b"a record ordered field by field, which waits on `held`")
-      } else { by_runtime_only(st, b"compare") },
-      CFloat -> by_runtime_only(st, b"compare"),
+  let at_root = |op: TypeOp, t: Type|
+    Some(
+      rooted(
+        cx,
+        st,
+        Written({ op: op, ty: t, home: cx.setting.module }),
+        [a, b],
+        [RWord, RWord],
+        order,
+        RWord,
+        at,
+      ),
+    );
+  match class_of(cx.setting.ctors, ty) {
+    CNullary(t) -> if spelled_type(t).index_of(b".") != None { at_root(Order, t) } else { None },
+    CSum(t) -> if spelled_type(t).index_of(b".") != None { at_root(Order, t) } else { None },
+    CWalked(t) -> at_root(Contained(b"ordered"), t),
+    CWord(t) -> if is_option(t) && !has_vars(t) { at_root(Contained(b"ordered"), t) } else { None },
+    _ -> None,
+  }
+}
+
+/// The sign of `l` and `r`'s order, an `Int` below, at or above zero, at their type: in C for a
+/// number, a character, a string or byte string, a `Bool` and `()`, else through the root that
+/// answers its `Ordering`.
+fn sign_at(cx: Context, l: Lowered, r: Lowered, ty: Type, at: Span) -> Lowered = {
+  let int = named_type(b"Int");
+  if apart(l.arg) || apart(r.arg) { refuse(r.st, Scalars, held_apart()) } else {
+    match by_root(cx, r.st, ty, l.arg, r.arg, at) {
+      Some(o) ->
+        bound(cx, o.st, int, Prim({ op: b"sign", on: rep_of_arg(o.arg), args: [o.arg] }), at),
+      None -> match class_of(cx.setting.ctors, ty) {
+        CInt -> over(cx, l, r, b"order", RInt, int, at),
+        CBool -> over(cx, l, r, b"order", RBool, int, at),
+        CChar -> over(cx, l, r, b"order", RWord, int, at),
+        CWidth(w) -> over(cx, l, r, b"order", RNum(w), int, at),
+        CDec -> over(cx, l, r, b"order", RDec, int, at),
+        CText -> over(cx, l, r, b"bytes_order", RWord, int, at),
+        CWord(t) -> if t == named_type(b"Unit") { { st: r.st, arg: AInt(0) } }
+        else { by_runtime_only(r.st, b"compare") },
+        _ -> by_runtime_only(r.st, b"compare"),
+      },
     }
   }
 }
-
-/// The sign of `l` and `r`'s order as `op` over operands held as `on` writes it, made its `Ordering`.
-fn signed(cx: Context, l: Lowered, r: Lowered, op: Bytes, on: Rep, at: Span) -> Lowered = {
-  let o = over(cx, l, r, op, on, named_type(b"Int"), at);
-  bound(cx, o.st, named_type(b"Ordering"), Prim({ op: b"ordering", on: RInt, args: [o.arg] }), at)
-}
-
-/// The order of two values of a declared sum through its `T#cmp` root, where a module declares it.
-fn by_order_root(cx: Context, st: Lowering, t: Type, a: Arg, b: Arg, at: Span) -> Lowered =
-  if spelled_type(t).index_of(b".") == None { by_runtime_only(st, b"compare") } else {
-    rooted(
-      cx,
-      st,
-      Written({ op: Order, ty: t, home: cx.setting.module }),
-      [a, b],
-      [RWord, RWord],
-      named_type(b"Ordering"),
-      RWord,
-      at,
-    )
-  }
 
 /// `reflect(a)` or `shown(a)` at the type `a` holds, where the program holds `std.value`: a scalar
 /// as its constructor of the value, a declared sum, a container and a record through a root.
@@ -761,8 +882,6 @@ fn digits_of(w: Bytes) -> Bytes =
 
 fn is_option(t: Type) -> Bool =
   match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
-
-fn record_type(t: Type) -> Bool = match t { TyRecord(_) -> true, TyNominal(_) -> true, _ -> false }
 
 // Copies of the emitter's private readers of types (`emit.ply`), listed in the hooks file.
 

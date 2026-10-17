@@ -11,8 +11,8 @@ import parsing (span_between)
 import emit (Width, KNum, Const, ConstStr, ConstBytes, ConstEmbedded, ConstFixed, ConstWide,
              ConstFloat, ConstDecimal, ConstChar, ConstUnit, ctype)
 import emit.pieces (Text, Hole, Constant, TagOf, spelled)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RCases, Var, Arg, AVar, AInt, ANum,
-                 rep_of_arg, arithmetic, comparison, shift)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RCases, Leaf, Var, Arg, AVar, AInt,
+                 ANum, rep_of_arg, arithmetic, comparison, shift)
 import emit.print.text (Printing, Place, printing, line, pad, temp, named, arg_text, assigned, site,
                         check, int_lit)
 import emit.print.made (c_type)
@@ -76,14 +76,16 @@ pub fn prim(
       let a = match x.args.at(0) { Some(y) -> arg_text(pr, y), None -> b"0" };
       let b = match x.args.at(1) { Some(y) -> arg_text(pr, y), None -> b"0" };
       let count = match x.args.at(1) { Some(y) -> int_text(pr, y), None -> b"0" };
-      match x.on {
-        RInt -> int_printed(p, pr, v, x.op, a, b, count, literal_divisor(x.args.at(1))),
-        RBool -> bool_printed(p, pr, v, x.op, a, b),
-        RFloat -> float_printed(p, pr, v, x.op, a, b),
-        RDec -> dec_printed(p, pr, v, x.op, a, b),
-        RNum(w) -> width_printed(p, pr, v, x.op, w, a, b, count),
-        RWord -> word_printed(p, pr, v, x.op, a, b),
-        _ -> unwritten(p, pr, x.op),
+      if x.op == b"sign" { sign_printed(p, pr, v, x.on, a) } else {
+        match x.on {
+          RInt -> int_printed(p, pr, v, x.op, a, b, count, literal_divisor(x.args.at(1))),
+          RBool -> bool_printed(p, pr, v, x.op, a, b),
+          RFloat -> float_printed(p, pr, v, x.op, a, b),
+          RDec -> dec_printed(p, pr, v, x.op, a, b),
+          RNum(w) -> width_printed(p, pr, v, x.op, w, a, b, count),
+          RWord -> word_printed(p, pr, v, x.op, a, b),
+          _ -> unwritten(p, pr, x.op),
+        }
       }
     },
   }
@@ -807,12 +809,7 @@ fn shifted(
 fn ordering(p: Place, pr: Printing, v: Var, s: Bytes) -> Printing = {
   let n = named(pr, v);
   match v.rep {
-    RCases(c) -> {
-      let at = |name: Bytes|
-        ascii_of_int(
-          range(0, c.cases.len()).fold(0, |k: Int, i: Int|
-            match c.cases.at(i) { Some(x) -> if x.name == name { i } else { k }, None -> k }),
-        );
+    RCases(c) ->
       line(
         n.pr,
         p.depth,
@@ -823,17 +820,16 @@ fn ordering(p: Place, pr: Printing, v: Var, s: Bytes) -> Printing = {
           b" = ",
           s,
           b" < 0 ? ",
-          at(b"Less"),
+          case_at(c.cases, b"Less"),
           b" : ",
           s,
           b" == 0 ? ",
-          at(b"Equal"),
+          case_at(c.cases, b"Equal"),
           b" : ",
-          at(b"Greater"),
+          case_at(c.cases, b"Greater"),
           b";",
         ]),
-      )
-    },
+      ),
     _ ->
       {
         ..n.pr,
@@ -859,6 +855,59 @@ fn ordering(p: Place, pr: Printing, v: Var, s: Bytes) -> Printing = {
       },
   }
 }
+
+/// The sign an `Ordering` held as `on` stands for: below, at or above zero as it is `Less`, `Equal`
+/// or `Greater`.
+fn sign_printed(p: Place, pr: Printing, v: Var, on: Rep, o: Bytes) -> Printing =
+  match on {
+    RCases(c) ->
+      bound(
+        p,
+        pr,
+        v,
+        Bytes::concat_all([
+          b"(",
+          o,
+          b" == ",
+          case_at(c.cases, b"Less"),
+          b" ? -1 : ",
+          o,
+          b" == ",
+          case_at(c.cases, b"Equal"),
+          b" ? 0 : 1)",
+        ]),
+      ),
+    _ -> {
+      let n = named(pr, v);
+      {
+        ..n.pr,
+        out: n.pr.out.concat([
+          Text(
+            Bytes::concat_all([
+              pad(p.depth),
+              c_type(v.rep),
+              b" ",
+              n.name,
+              b" = (ply_obj(",
+              o,
+              b")->layout == ",
+            ]),
+          ),
+          Hole(TagOf(b"Less")),
+          Text(Bytes::concat_all([b" ? -1 : ply_obj(", o, b")->layout == "])),
+          Hole(TagOf(b"Equal")),
+          Text(b" ? 0 : 1);\n"),
+        ]),
+      }
+    },
+  }
+
+/// The index of case `name` among `cases`, as C writes it.
+fn case_at(cases: List<{ name: Bytes, leaves: List<Leaf> }>, name: Bytes) -> Bytes =
+  ascii_of_int(
+    range(0, cases.len()).fold(0, |k: Int, i: Int|
+      match cases.at(i) { Some(x) -> if x.name == name { i } else { k }, None -> k }),
+  )
 
 /// Below zero, zero or above zero as `x` and `y`, C values of one ordered type, order.
 fn signed_order(x: Bytes, y: Bytes) -> Bytes =
@@ -1036,7 +1085,17 @@ test "an order's sign is made the constructor of `Ordering` it names, whose tags
       AVar(local(0, b"Int", RInt)),
     ]),
     Bytes::concat_all([b"  ", c_type(index), b" t1 = p0 < 0 ? 0 : p0 == 0 ? 1 : 2;\n"]),
-  )
+  );
+  // And back: the sign an `Ordering` stands for, read off its constructor's tag or its index.
+  let sign = |rep: Rep|
+    printed_prim(Map::new().insert(0, b"p0"), local(1, b"Int", RInt), b"sign", rep, [
+      AVar(local(0, b"Ordering", rep)),
+    ]);
+  assert_eq(
+    sign(RWord),
+    b"  int64_t t1 = (ply_obj(p0)->layout == @@TLess@@ ? -1 : ply_obj(p0)->layout == @@TEqual@@ ? 0 : 1);\n",
+  );
+  assert_eq(sign(index), b"  int64_t t1 = (p0 == 0 ? -1 : p0 == 1 ? 0 : 1);\n")
 }
 
 test "a constant is read from the pool, a decimal's word let go once its two words are read" {

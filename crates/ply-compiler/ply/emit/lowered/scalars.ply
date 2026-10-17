@@ -7,7 +7,8 @@ import emit (Exact)
 import emit.keys (Root, root_name)
 import emit.pieces (spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, Var, Arg, AVar, AInt, ANum, AChar,
-                 Val, Prim, Literal, Call, Native, Inst, Let, Do, If, Block, Fn, Scalars, counted)
+                 Val, Prim, Literal, Get, Call, Native, Inst, Let, Do, If, Block, Fn, Scalars,
+                 counted)
 import emit.print (printed_fn)
 import emit.compare (Program, program_of, formed, checked, printed_by_form, answered_today,
                      today_text, normalised, past_counts)
@@ -71,6 +72,51 @@ fn natives(p: Program, name: Bytes) -> Result<List<Bytes>, Bytes> / {abort.raise
 
 fn analysed(src: Bytes) -> Program / {abort.raise} =
   match program_of(src) { Ok(p) -> p, Err(why) -> panic(String::of_bytes(why)) }
+
+/// How many fields root `name` of `p` reads, or why it was not formed.
+fn reads(p: Program, name: Bytes) -> Result<Int, Bytes> / {abort.raise} =
+  match formed(p, name) {
+    Err(no) -> Err(no.why),
+    Ok(f) -> Ok(values(f.body).filter(|v: Val| match v { Get(_) -> true, _ -> false }).len()),
+  }
+
+test "records of a known type are compared and ordered field by field, not by the runtime" {
+  let p = analysed(
+    Bytes::concat_all([
+      b"type P = { x: Int, name: String }\n",
+      b"type Q = { p: P, k: Char }\n",
+      b"fn same(a: P, b: P) -> Bool = a == b\n",
+      b"fn apart(a: Q, b: Q) -> Bool = a != b\n",
+      b"fn order(a: P, b: P) -> Ordering = compare(a, b)\n",
+    ]),
+  );
+  // Fields in the checker's order, each compared only where those before it were equal.
+  assert_eq(applied(p, b"same"), Ok([{ op: b"bytes_eq", on: RWord }, { op: b"eq", on: RInt }]));
+  assert_eq(reads(p, b"same"), Ok(4));
+  assert_eq(natives(p, b"same"), Ok([]));
+  // A record a record holds is compared field by field again.
+  assert_eq(
+    applied(p, b"apart"),
+    Ok([
+      { op: b"eq", on: RWord },
+      { op: b"bytes_eq", on: RWord },
+      { op: b"eq", on: RInt },
+      { op: b"not", on: RBool },
+    ]),
+  );
+  assert_eq(reads(p, b"apart"), Ok(8));
+  // The first field that orders them apart decides; the sign is made the `Ordering` once.
+  assert_eq(
+    applied(p, b"order"),
+    Ok([
+      { op: b"bytes_order", on: RWord },
+      { op: b"ne", on: RInt },
+      { op: b"order", on: RInt },
+      { op: b"ordering", on: RInt },
+    ]),
+  );
+  assert_eq(roots_called(p, b"order"), Ok([]))
+}
 
 fn width(bits: Int, signed: Bool) -> Rep = RNum({ bits: bits, signed: signed })
 
@@ -398,6 +444,8 @@ fn corpus() -> Bytes =
     b"fn generic<a>(x: a, y: a) -> Bool = x != y\n",
     b"fn same(a: Bool, b: Bool) -> Bool = a != b\n",
     b"fn flags(a: Bool) -> Bool = !a\n",
+    b"type Pt = { x: Int, y: Int }\n",
+    b"fn points(a: Pt, b: Pt) -> Bool = a == b\n",
   ])
 
 fn corpus_names() -> List<Bytes> =
@@ -450,6 +498,7 @@ fn corpus_names() -> List<Bytes> =
     b"generic",
     b"same",
     b"flags",
+    b"points",
   ]
 
 /// Whether `f` holds a count anywhere: a check of it waits on the ownership pass.
@@ -511,6 +560,10 @@ test "the scalar corpus prints as today's emitter writes it, but where a decisio
     },
     { name: b"cards", why: b"the root's `Bool` word opened, which `data` prints" },
     { name: b"generic", why: b"a runtime call that can fail stores its failure site first" },
+    {
+      name: b"points",
+      why: b"fields compared in nested branches rather than one flag, read as `data` prints a read",
+    },
   ];
   let differing = corpus_names().fold(
     [],
