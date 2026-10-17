@@ -1,14 +1,17 @@
 //! The typed form a root's body is lowered to before any C is written. Every value is a variable
 //! holding the checker's type, held as a representation decided from that type; every join is a
 //! variable of its own type; every count is an instruction, which the ownership pass alone writes.
+//! Blocks nest only in `If`, `Case`, `Match`, `Loop` and `Handle`.
 
 import types (Type, TyCon)
-import parsing (Span)
-import patterns (Lit)
-import emit (Width, kind_of, KInt, KBool, KNum, KFloat, KDec)
+import parsing (Span, dummy_span)
+import patterns (Lit, LUnit)
+import emit (Width, GenericCall, Need, Pass)
 import emit.keys (RootKey, Callee, Generic)
+import emit.tir.handling (HandleOp, HandleSite, Simulate, Label)
+import emit.tir.containers (ContainerOp)
 
-/// How a value is held. A function of the value's type (`rep_of`), but for `RSlice`, a view the
+/// How a value is held. A function of the value's type (`lower.held`), but for `RSlice`, a view the
 /// lowering chooses for a list walked by its rest in a loop, which is made a list where it leaves.
 /// `RFlat` is a record as its leaves and then its object's word, zero until one is made; `RCases` a
 /// sum as its constructor's index and each case's leaves.
@@ -52,16 +55,16 @@ pub type Handed = | Given | Lent
 /// How a root takes its parameters and hands back its answer.
 pub type Convention = { params: List<Handed>, reps: List<Rep>, answer: Rep }
 
-/// What a native or intrinsic does with each operand (`takes`), whether it answers a count of its
-/// own, whether it can fail, and whether it can stop for a handler that may resume it later.
+/// What an operation does with each operand (`takes`), whether it answers a count of its own,
+/// whether it can fail, and whether it can stop for a handler that may resume it later.
 pub type Uses = { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool }
 
-/// What a `Make` allocates.
+/// What a `Make` allocates. A `stacked` closure is lent and laid out on the caller's stack.
 pub type Made =
   | MRecord({ names: List<Bytes>, width: Int })
   | MCtor({ name: Bytes, width: Int })
   | MList(Int)
-  | MClosure({ nth: Int, captures: Int })
+  | MClosure({ nth: Int, captures: Int, stacked: Bool })
   | MArray({ stride: Int })
 
 /// Where a `Get` reads: a field by its word offset, or by name where the layout is unknown (a
@@ -81,21 +84,30 @@ pub type Test =
   | TLit(Lit)
   | TLength({ at_least: Int })
 
+/// An operation one family of the lowering writes and prints beyond the shared values. What it
+/// does with its operands is the `Op` value's `uses`, so nothing outside the family reads the
+/// payload.
+pub type Operation = | OHandle(HandleOp) | OContainer(ContainerOp)
+
 pub type Val =
   /// An operator of C over operands held as `on`, which decides what it means.
   | Prim({ op: Bytes, on: Rep, args: List<Arg> })
+  /// A constant from the pool, `()` among them.
   | Literal(Lit)
   /// A constant laid out as static data, by the name its content gives it.
   | Static(Bytes)
-  | Make({ made: Made, args: List<Arg>, reuse: Option<Var> })
+  /// `kept` are the fields the cells `reuse` names already hold, which are not written again.
+  | Make({ made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> })
   | Get({ of: Var, path: Path })
+  /// `arg` held as `to`: a scalar boxed, a word opened, a flat value made its object.
   | Pack({ arg: Arg, to: Rep })
+  /// A flat value from its components in leaf order, a case's index first.
+  | Gathered({ parts: List<Arg> })
   | Call({ callee: Callee, args: List<Arg>, conv: Convention, stops: Bool })
   | Apply({ f: Arg, args: List<Arg>, conv: Convention, stops: Bool })
+  /// A runtime function by its C name.
   | Native({ name: Bytes, args: List<Arg>, uses: Uses })
-  | Intrinsic({ op: Bytes, args: List<Arg>, uses: Uses })
-  | Perform({ effect: Bytes, op: Bytes, resource: Bytes, label: Option<Arg>, args: List<Arg> })
-  | Label(Bytes)
+  | Op({ op: Operation, args: List<Arg>, uses: Uses })
 
 pub type Block = List<Inst>
 
@@ -109,6 +121,10 @@ pub type Inst =
   | Set({ var: Var, arg: Arg })
   | If({ cond: Arg, then: Block, otherwise: Block })
   | Case({ on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block })
+  /// Arms tried in order, each leaving for the next by `Miss`, and `rest` where none is taken.
+  | Match({ arms: List<Block>, rest: Block })
+  /// The arm's tests failed: control goes to the next arm holding what it held entering this one.
+  | Miss
   /// A loop over `state`, rebound by each `Next` in `body`, left with an answer by `Done`.
   | Loop({ state: List<Var>, init: List<Arg>, body: Block, answer: Var })
   | Next(List<Arg>)
@@ -119,8 +135,8 @@ pub type Inst =
   /// A tail call of member `member` of the root's group.
   | Enter({ member: Int, args: List<Arg> })
   | Fail(Bytes)
-  | Handle({ body: Block, clauses: List<Clause>, ret: Option<Fn>, answer: Var })
-  | Parallel({ branches: List<Fn>, rooted: Bool, answer: Var })
+  /// `body` run under the handlers `site` lays out over `args`, its answer or a clause's in `answer`.
+  | Handle({ body: Block, args: List<Arg>, uses: Uses, site: HandleSite, answer: Var })
   // Written by the ownership pass alone.
   | Inc({ var: Var, n: Int })
   | Dec(Var)
@@ -131,18 +147,27 @@ pub type Inst =
   /// A block known to be held only here consumed, and its counted words bound as owned.
   | Opened({ of: Var, words: List<Var> })
 
-/// A handler clause: the operation it answers, how often its continuation may be resumed (`2` at
-/// most once, `4` again), and its body as a function of its own.
-pub type Clause = { effect: Bytes, op: Bytes, resumes: Int, body: Fn }
-
 /// Whether a function is a root a program calls, counting its steps and testing for failure, or
 /// a plain one the emitter writes for a type (a drop, share, keep or copy root), which does
 /// neither but still grows its stack.
 pub type FnKind = | Rooted | Plain
 
-/// One root's form. `lambdas` are the bodies of the closures it makes; `base` is where its
-/// definition's text starts, which its failure sites count from; `members` are a tail group's roots
-/// in case order, and empty for a root of its own.
+/// What a root tells the unit beyond its C: its calls of generic definitions, numbered as their
+/// `Generic(n)` callees are, what a specialisation would read of each type variable it took a slow
+/// path at, the parameters it calls as functions, and the parameters it hands on to calls.
+pub type Links = {
+  generics: List<GenericCall>,
+  needs: List<Need>,
+  called: List<Int>,
+  passes: List<Pass>,
+}
+
+pub fn no_links() -> Links = { generics: [], needs: [], called: [], passes: [] }
+
+/// One root's form. `lambdas` are the bodies of the closures it makes, in the order its owner's
+/// `Code` numbers them (`FnArg.nth`); `base` is where its definition's text starts, which its
+/// failure sites count from; `members` are a tail group's roots in case order, and empty for a root
+/// of its own.
 pub type Fn = {
   key: RootKey,
   kind: FnKind,
@@ -152,22 +177,17 @@ pub type Fn = {
   lambdas: List<Lambda>,
   base: Int,
   members: List<RootKey>,
+  links: Links,
 }
 
 /// The body of a closure a root makes, numbered by its place among them.
 pub type Lambda = | Closure(Fn)
 
-/// How a value of `ty` is held in a body. Scalars as themselves, a carried width in its own C
-/// type, anything else a word until the layouts say more.
-pub fn rep_of(ty: Type) -> Rep =
-  match kind_of(ty).kind {
-    KInt -> RInt,
-    KBool -> RBool,
-    KNum(w) -> RNum(w),
-    KFloat -> RFloat,
-    KDec -> RDec,
-    _ -> RWord,
-  }
+/// Which part of the lowering declined a body.
+pub type Family = | Spine | Data | Calling | Matching | Handling | Scalars | Containers
+
+/// A body the form does not cover yet, and why.
+pub type Declined = { by: Family, why: Bytes }
 
 /// Whether a value held as `r` holds a count: a word, an `Option`'s or `Result`'s, a view of a
 /// list, or a flat value with a counted leaf (its word always is one).
@@ -183,12 +203,25 @@ pub fn counted(r: Rep) -> Bool =
     _ -> false,
   }
 
+/// How operand `a` is held: a variable as its own representation says, a constant as C names it.
+pub fn rep_of_arg(a: Arg) -> Rep =
+  match a {
+    AVar(v) -> v.rep,
+    AInt(_) -> RInt,
+    ABool(_) -> RBool,
+    AFloat(_) -> RFloat,
+    ANum(n) -> RNum(n.width),
+    AChar(_) -> RWord,
+    AZero(r) -> r,
+  }
+
 /// The variable an operand is, if it is one.
 pub fn var_of(a: Arg) -> Option<Var> = match a { AVar(v) -> Some(v), _ -> None }
 
 /// Each operand of `v` and whether `v` consumes it, by the fixed signature each operation has: a
 /// call takes what its convention gives, borrows what it lends, and borrows the function it applies;
-/// an operator, a field read and a case's subject borrow; what allocates or answers takes.
+/// an operator and a field read borrow; what allocates or answers takes; a runtime function or a
+/// family's operation does as its `uses` say.
 pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
   match v {
     Prim(p) -> p.args.map(|a: Arg| { arg: a, takes: false }),
@@ -199,14 +232,11 @@ pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
     ),
     Get(g) -> [{ arg: AVar(g.of), takes: false }],
     Pack(p) -> [{ arg: p.arg, takes: true }],
+    Gathered(g) -> g.parts.map(|a: Arg| { arg: a, takes: true }),
     Call(c) -> handed(c.args, c.conv),
     Apply(c) -> [{ arg: c.f, takes: false }].concat(handed(c.args, c.conv)),
-    Native(n) -> taken(n.args, n.uses),
-    Intrinsic(n) -> taken(n.args, n.uses),
-    Perform(p) -> p.args.map(|a: Arg| { arg: a, takes: true }).concat(
-      match p.label { Some(l) -> [{ arg: l, takes: false }], None -> [] },
-    ),
-    Label(_) -> [],
+    Native(n) -> used_as(n.args, n.uses),
+    Op(o) -> used_as(o.args, o.uses),
   }
 
 fn handed(args: List<Arg>, conv: Convention) -> List<{ arg: Arg, takes: Bool }> =
@@ -216,7 +246,9 @@ fn handed(args: List<Arg>, conv: Convention) -> List<{ arg: Arg, takes: Bool }> 
       None -> acc,
     })
 
-fn taken(args: List<Arg>, uses: Uses) -> List<{ arg: Arg, takes: Bool }> =
+/// Each of `args` and whether `uses` takes it: what a runtime function, a family's operation or a
+/// `Handle` does with its operands.
+pub fn used_as(args: List<Arg>, uses: Uses) -> List<{ arg: Arg, takes: Bool }> =
   range(0, args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
     match args.at(i) {
       Some(a) -> acc.push({ arg: a, takes: uses.takes.at(i) == Some(true) }),
@@ -231,15 +263,17 @@ pub fn answered(v: Val) -> Answered =
   match v {
     Get(g) -> ReadsOf(g.of),
     Static(_) -> Lasts,
-    Native(n) -> if n.uses.owned { Owns }
-    else { match n.args.at(0) { Some(AVar(x)) -> ReadsOf(x), _ -> Lasts } },
-    Intrinsic(n) -> if n.uses.owned { Owns }
-    else { match n.args.at(0) { Some(AVar(x)) -> ReadsOf(x), _ -> Lasts } },
+    Native(n) -> by_uses(n.args, n.uses),
+    Op(o) -> by_uses(o.args, o.uses),
     _ -> Owns,
   }
 
+fn by_uses(args: List<Arg>, uses: Uses) -> Answered =
+  if uses.owned { Owns } else { match args.at(0) { Some(AVar(x)) -> ReadsOf(x), _ -> Lasts } }
+
 /// Whether `v` can fail, so a test follows it and its `unwind` is released on the way out: a
-/// call, a perform, an allocation, a constant read from the pool, a checked operator.
+/// call, an allocation, a constant read from the pool, a checked operator, and what its `uses` say
+/// of a runtime function or a family's operation.
 pub fn fails(v: Val) -> Bool =
   match v {
     Prim(p) -> checked(p.op, p.on),
@@ -247,14 +281,20 @@ pub fn fails(v: Val) -> Bool =
     Static(_) -> false,
     Make(_) -> true,
     Get(_) -> false,
-    Pack(p) -> counted(p.to),
+    Pack(p) -> allocates(rep_of_arg(p.arg), p.to),
+    Gathered(_) -> false,
     Call(_) -> true,
     Apply(_) -> true,
     Native(n) -> n.uses.fails,
-    Intrinsic(n) -> n.uses.fails,
-    Perform(_) -> true,
-    Label(_) -> false,
+    Op(o) -> o.uses.fails,
   }
+
+/// Whether holding a value held as `from` as `to` makes an object: a value holding no count boxed,
+/// or a flat value or a view made the object its word names.
+pub fn allocates(from: Rep, to: Rep) -> Bool =
+  one_word(to) && (!counted(from) || (match from { RFlat(_) -> true, RCases(_) -> true, RSlice -> true, _ -> false }))
+
+fn one_word(r: Rep) -> Bool = match r { RWord -> true, RMaybe -> true, RTagged -> true, _ -> false }
 
 /// Whether operator `op` over `on` is checked: an integer's arithmetic and shifts, which overflow
 /// or divide by zero, and a width's.
@@ -283,6 +323,7 @@ pub fn ends(i: Inst) -> Bool =
     Next(_) -> true,
     Done(_) -> true,
     Fail(_) -> true,
+    Miss -> true,
     _ -> false,
   }
 
@@ -290,28 +331,44 @@ pub fn ends(i: Inst) -> Bool =
 pub fn falls_through(b: Block) -> Bool =
   match b.at(b.len() - 1) { Some(last) -> !ends(last), None -> true }
 
-test "a value is held as its type says, and a word holds a count where a scalar holds none" {
-  let named = |n: Bytes| TyCon({ name: n, args: [] });
-  assert_eq(rep_of(named(b"Int")), RInt);
-  assert_eq(rep_of(named(b"Bool")), RBool);
-  assert_eq(rep_of(named(b"Float")), RFloat);
-  assert_eq(rep_of(named(b"U8")), RNum({ bits: 8, signed: false }));
-  assert_eq(rep_of(named(b"String")), RWord);
-  assert_eq([RInt, RBool, RFloat, RDec].map(counted), [false, false, false, false]);
-  assert_eq([RWord, RMaybe, RSlice, RFlat([])].map(counted), [true, true, true, true])
+test "a word, a sum's word, a view and a flat value hold a count where a scalar holds none" {
+  assert_eq([RInt, RBool, RFloat, RDec, RNum({ bits: 8, signed: false })].map(counted), [false, false, false, false, false]);
+  assert_eq([RWord, RMaybe, RTagged, RSlice, RFlat([])].map(counted), [true, true, true, true, true]);
+  assert_eq(counted(RCases({ tagged: false, cases: [{ name: b"None", leaves: [] }] })), false);
+  assert_eq(
+    counted(RCases({ tagged: false, cases: [{ name: b"Some", leaves: [{ name: b"0", rep: RWord }] }] })),
+    true,
+  )
 }
 
 test "each operation consumes or borrows each operand as its signature says" {
-  let int = TyCon({ name: b"Int", args: [] });
   let s = { id: 1, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
   let conv = { params: [Given, Lent], reps: [RWord, RWord], answer: RInt };
   let call = Call({ callee: Generic(0), args: [AVar(s), AVar(s)], conv: conv, stops: false });
-  assert_eq(operands(call).map(|o: { arg: Arg, takes: Bool }| o.takes), [true, false]);
-  assert_eq(operands(Get({ of: s, path: PLeaf(0) })).map(|o: { arg: Arg, takes: Bool }| o.takes), [false]);
+  let takes = |v: Val| operands(v).map(|o: { arg: Arg, takes: Bool }| o.takes);
+  assert_eq(takes(call), [true, false]);
+  assert_eq(takes(Get({ of: s, path: PLeaf(0) })), [false]);
+  assert_eq(takes(Gathered({ parts: [AVar(s), AInt(1)] })), [true, true]);
+  let lent = { takes: [false, true], owned: false, fails: true, stops: false };
+  assert_eq(takes(Op({ op: OHandle(Simulate), args: [AVar(s), AVar(s)], uses: lent })), [false, true]);
   assert_eq(answered(Get({ of: s, path: PLeaf(0) })), ReadsOf(s));
   assert_eq(answered(call), Owns);
+  assert_eq(answered(Native({ name: b"rt_len_p", args: [AVar(s)], uses: lent })), ReadsOf(s));
+  assert_eq(answered(Op({ op: OHandle(Label(b"r")), args: [], uses: lent })), Lasts)
+}
+
+test "what can fail is what tests the runtime: a checked operator, a call, an allocation" {
   assert_eq(fails(Prim({ op: b"add", on: RInt, args: [AInt(1), AInt(2)] })), true);
   assert_eq(fails(Prim({ op: b"lt", on: RInt, args: [AInt(1), AInt(2)] })), false);
   assert_eq(fails(Prim({ op: b"add", on: RFloat, args: [AFloat(0), AFloat(0)] })), false);
-  assert_eq(rep_of(int), RInt)
+  let w = { id: 2, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
+  let flat = { ..w, rep: RFlat([{ name: b"x", rep: RInt }]) };
+  // Boxing and making a flat value's object allocate; holding a word as a sum's word does not.
+  assert_eq(fails(Pack({ arg: AInt(7), to: RWord })), true);
+  assert_eq(fails(Pack({ arg: AVar(flat), to: RWord })), true);
+  assert_eq(fails(Pack({ arg: AVar(w), to: RMaybe })), false);
+  assert_eq(fails(Pack({ arg: AVar(w), to: RFlat([{ name: b"x", rep: RInt }]) })), false);
+  assert_eq(fails(Gathered({ parts: [AInt(1)] })), false);
+  assert_eq(ends(Miss), true);
+  assert_eq(falls_through([Do({ val: Literal(LUnit), at: dummy_span(), unwind: [] })]), true)
 }

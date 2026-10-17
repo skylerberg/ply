@@ -20,7 +20,9 @@ import std.bytes (ascii_of_int)
 import emit.keys (RootKey, Named, Root, definition_of)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, Var, Arg, AVar, AInt, ABool, AFloat, ANum,
                  AZero, Given, Convention, Val, Prim, Call, Inst, Let, Decl, Set, If, Return, Restart,
-                 Block, Fn, Rooted, rep_of, comparison, ends, falls_through)
+                 Block, Fn, Rooted, Declined, Family, Spine, Calling, Matching, Scalars, no_links,
+                 comparison, ends, falls_through)
+import emit.lower.held (held_as)
 
 /// What a root's body is lowered under: its module and key, where its definition's text starts,
 /// its parameters' and answer's types, the scheme of each definition it may call by full name, and
@@ -41,7 +43,7 @@ type Lowering = {
   next: Int,
   env: Map<Int, Arg>,
   insts: List<Inst>,
-  refused: Option<Bytes>,
+  refused: Option<Declined>,
   loops: Bool,
 }
 
@@ -49,12 +51,12 @@ type Lowering = {
 type Lowered = { st: Lowering, arg: Arg }
 
 /// The root lowered, or why its body is outside what the lowering covers.
-pub fn lowered_fn(cx: Context, body: Code) -> Result<Fn, Bytes> / {abort.raise} = {
+pub fn lowered_fn(cx: Context, body: Code) -> Result<Fn, Declined> / {abort.raise} = {
   let params = range(0, cx.params.len()).map(|i: Int|
-    { id: i, ty: cx.params.get(i), rep: rep_of(cx.params.get(i)) });
-  let answer = rep_of(cx.answer);
+    { id: i, ty: cx.params.get(i), rep: held_as(cx.params.get(i)) });
+  let answer = held_as(cx.answer);
   if !params.all(|p: Var| scalar(p.rep)) || !scalar(answer) {
-    Err(b"a parameter or answer held as a word")
+    Err({ by: Spine, why: b"a parameter or answer held as a word" })
   } else {
     let start = {
       next: params.len(),
@@ -78,6 +80,7 @@ pub fn lowered_fn(cx: Context, body: Code) -> Result<Fn, Bytes> / {abort.raise} 
           lambdas: [],
           base: cx.base,
           members: [],
+          links: no_links(),
         }),
     }
   }
@@ -96,9 +99,9 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
       NVar(v) -> match v.slot {
         Some(s) -> match st.env.get(s) {
           Some(a) -> { st: st, arg: a },
-          None -> refuse(st, b"a slot nothing bound: ".concat(v.name)),
+          None -> refuse(st, Spine, b"a slot nothing bound: ".concat(v.name)),
         },
-        None -> refuse(st, b"a global read as a value: ".concat(v.name)),
+        None -> refuse(st, Calling, b"a global read as a value: ".concat(v.name)),
       },
       NUnary(u) -> {
         let o = lowered(cx, st, u.operand, false);
@@ -126,12 +129,12 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
               let v = lowered(cx, acc, l.value, false);
               { ..v.st, env: v.st.env.insert(l.slot, v.arg) }
             },
-            CLetPat(_) -> refuse(acc, b"a pattern bound by `let`").st,
+            CLetPat(_) -> refuse(acc, Matching, b"a pattern bound by `let`").st,
             CDo(d) -> lowered(cx, acc, d.code, false).st,
           });
         match bl.tail {
           Some(t) -> lowered(cx, after, t, tail),
-          None -> refuse(after, b"a block answering the unit"),
+          None -> refuse(after, Spine, b"a block answering the unit"),
         }
       },
       NIf(i) -> {
@@ -141,7 +144,7 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
         joined(cx, cond, then, otherwise)
       },
       NApp(a) -> match a.func.node {
-        NVar(f) -> if f.slot != None { refuse(st, b"a call of a function value") } else {
+        NVar(f) -> if f.slot != None { refuse(st, Calling, b"a call of a function value") } else {
           let args = a.args.fold({ st: st, args: [] },
             |acc: { st: Lowering, args: List<Arg> }, x: Code| {
               let o = lowered(cx, acc.st, x, false);
@@ -149,14 +152,17 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
             });
           called(cx, args.st, qualify(cx.module, f.name), args.args, tail, c.span)
         },
-        _ -> refuse(st, b"a call of a computed function"),
+        _ -> refuse(st, Calling, b"a call of a computed function"),
       },
-      _ -> refuse(st, b"a node outside the scalar subset"),
+      _ -> refuse(st, Spine, b"a node outside the scalar subset"),
     }
   }
 
-fn refuse(st: Lowering, why: Bytes) -> Lowered =
-  { st: match st.refused { Some(_) -> st, None -> { ..st, refused: Some(why) } }, arg: AZero(RInt) }
+fn refuse(st: Lowering, by: Family, why: Bytes) -> Lowered =
+  {
+    st: match st.refused { Some(_) -> st, None -> { ..st, refused: Some({ by: by, why: why }) } },
+    arg: AZero(RInt),
+  }
 
 /// A literal as the operand it is: no variable holds one.
 fn literal(st: Lowering, l: Lit) -> Lowered / {abort.raise} =
@@ -166,15 +172,15 @@ fn literal(st: Lowering, l: Lit) -> Lowered / {abort.raise} =
     LFloat(x) -> { st: st, arg: AFloat(literal_bits(x)) },
     LFixed(name, bits) -> match width_named(name) {
       Some(w) -> if w.bits <= 64 { { st: st, arg: ANum({ width: w, bits: bits }) } }
-      else { refuse(st, b"a literal of a width wider than a register") },
-      None -> refuse(st, b"a literal of no known width"),
+      else { refuse(st, Scalars, b"a literal of a width wider than a register") },
+      None -> refuse(st, Scalars, b"a literal of no known width"),
     },
-    _ -> refuse(st, b"a literal held as a word"),
+    _ -> refuse(st, Scalars, b"a literal held as a word"),
   }
 
 /// `st` with `val` bound to a new variable of type `ty`, and that variable.
 fn bound(st: Lowering, ty: Type, val: Val, at: Span) -> Lowered = {
-  let v = { id: st.next, ty: ty, rep: rep_of(ty) };
+  let v = { id: st.next, ty: ty, rep: held_as(ty) };
   {
     st: { ..st, next: st.next + 1, insts: st.insts.push(Let({ var: v, val: val, at: at, unwind: [] })) },
     arg: AVar(v),
@@ -184,8 +190,8 @@ fn bound(st: Lowering, ty: Type, val: Val, at: Span) -> Lowered = {
 fn unary(o: Lowered, op: Bytes, at: Span) -> Lowered =
   if op == b"not" { bound(o.st, named_type(b"Bool"), Prim({ op: op, on: RBool, args: [o.arg] }), at) }
   else if op == b"neg" || op == b"bitnot" {
-    bound(o.st, type_of(o.arg), Prim({ op: op, on: rep_of(type_of(o.arg)), args: [o.arg] }), at)
-  } else { refuse(o.st, b"an operator outside the scalar subset: ".concat(op)) }
+    bound(o.st, type_of(o.arg), Prim({ op: op, on: held_as(type_of(o.arg)), args: [o.arg] }), at)
+  } else { refuse(o.st, Scalars, b"an operator outside the scalar subset: ".concat(op)) }
 
 /// `l op r`, read at the type of whichever operand says more than an `Int` literal does: a
 /// comparison answers a `Bool`, any other operator the operands' type.
@@ -193,7 +199,7 @@ fn binary(l: Arg, r: Lowered, op: Bytes, at: Span) -> Lowered = {
   let on = match l { AInt(_) -> type_of(r.arg), _ -> type_of(l) };
   bound(r.st, if comparison(op) { named_type(b"Bool") } else { on }, Prim({
     op: op,
-    on: rep_of(on),
+    on: held_as(on),
     args: [l, r.arg],
   }), at)
 }
@@ -284,7 +290,7 @@ fn joined(cx: Context, cond: Lowered, then: Lowered, otherwise: Lowered) -> Lowe
   let ty = if falls_through(then.st.insts) { type_of(then.arg) }
   else if falls_through(otherwise.st.insts) { type_of(otherwise.arg) }
   else { cx.answer };
-  let j = { id: otherwise.st.next, ty: ty, rep: rep_of(ty) };
+  let j = { id: otherwise.st.next, ty: ty, rep: held_as(ty) };
   let set = |arm: Lowered|
     if falls_through(arm.st.insts) { arm.st.insts.push(Set({ var: j, arg: arm.arg })) }
     else { arm.st.insts };
@@ -310,27 +316,27 @@ fn called(
   at: Span,
 ) -> Lowered =
   match cx.schemes.get(full) {
-    None -> refuse(st, b"a call of a name the module does not define: ".concat(full)),
-    Some(sc) -> if sc.ty_vars.len() > 0 { refuse(st, b"a call of a generic definition") } else {
+    None -> refuse(st, Calling, b"a call of a name the module does not define: ".concat(full)),
+    Some(sc) -> if sc.ty_vars.len() > 0 { refuse(st, Calling, b"a call of a generic definition") } else {
       match sc.ty {
-        TyFn(f) -> if f.params.len() != args.len() { refuse(st, b"a call that does not fill its parameters") }
-        else if !f.params.all(|t: Type| scalar(rep_of(t))) || !scalar(rep_of(f.ret)) {
-          refuse(st, b"a call of a definition taking or answering a word")
+        TyFn(f) -> if f.params.len() != args.len() { refuse(st, Calling, b"a call that does not fill its parameters") }
+        else if !f.params.all(|t: Type| scalar(held_as(t))) || !scalar(held_as(f.ret)) {
+          refuse(st, Calling, b"a call of a definition taking or answering a word")
         } else if tail && definition_of(cx.key) == Some(full) && args.len() == cx.params.len() {
-          { st: { ..st, loops: true, insts: st.insts.push(Restart(args)) }, arg: AZero(rep_of(f.ret)) }
+          { st: { ..st, loops: true, insts: st.insts.push(Restart(args)) }, arg: AZero(held_as(f.ret)) }
         } else {
           bound(st, f.ret, Call({
             callee: Root(Named(full)),
             args: args,
             conv: {
               params: f.params.map(|_: Type| Given),
-              reps: f.params.map(rep_of),
-              answer: rep_of(f.ret),
+              reps: f.params.map(held_as),
+              answer: held_as(f.ret),
             },
             stops: false,
           }), at)
         },
-        _ -> refuse(st, b"a call of a name that is no function"),
+        _ -> refuse(st, Calling, b"a call of a name that is no function"),
       }
     },
   }
@@ -378,8 +384,7 @@ fn form_of(src: Bytes, name: Bytes, sigs: List<{ name: Bytes, params: List<Bytes
     Some(d) -> match schemes.get(qualify(b"m", name)) {
       Some(sc) -> match sc.ty {
         TyFn(f) -> match lower_to_emit(d.params.map(|p: Param| p.name.name), [], Map::new(), d.body) {
-          Some(l) ->
-            lowered_fn(
+          Some(l) -> match lowered_fn(
               {
                 module: b"m",
                 key: Named(qualify(b"m", name)),
@@ -390,7 +395,10 @@ fn form_of(src: Bytes, name: Bytes, sigs: List<{ name: Bytes, params: List<Bytes
                 typed: Map::new(),
               },
               l.code,
-            ),
+            ) {
+            Ok(form) -> Ok(form),
+            Err(no) -> Err(no.why),
+          },
           None -> Err(b"not lowered"),
         },
         _ -> Err(b"no function"),
@@ -400,7 +408,7 @@ fn form_of(src: Bytes, name: Bytes, sigs: List<{ name: Bytes, params: List<Bytes
   }
 }
 
-fn local(id: Int, ty: Bytes) -> Var = { id: id, ty: named_type(ty), rep: rep_of(named_type(ty)) }
+fn local(id: Int, ty: Bytes) -> Var = { id: id, ty: named_type(ty), rep: held_as(named_type(ty)) }
 
 test "an if that answers a value joins in a variable of the type its arms answer" {
   let f = form_of(b"fn pick(c: Bool, a: Int, b: Int) -> Int = if c { a } else { b }\n", b"pick", [
