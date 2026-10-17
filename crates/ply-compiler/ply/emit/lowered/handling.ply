@@ -2,15 +2,16 @@
 //! hand-built inputs where another family's construct stands in front of them, its framing printed,
 //! and its corpus held to today's emitter.
 
-import code (Code, NHandle, NBlock, CodeClause, CodeReturn, Borrowed)
+import code (Code, NHandle, NBlock, NApp, NLambda, Lambda, Capture, CodeClause, CodeReturn,
+             Borrowed)
 import parsing (Span, span_between)
 import resolve (qualify)
 import types (Type, TyCon, TyRecord, fn_type, row_empty, fields_sorted)
 import emit.keys (Named)
 import emit.pieces (spelled)
 import emit.tir (Rep, RInt, RWord, Var, Arg, AVar, AInt, Prim, Pack, Make, MClosure, Op, OHandle,
-                 Uses, Inst, Let, Assign, Return, Handle, Fn, Rooted, Given, Declined, Handling,
-                 no_links)
+                 Uses, Inst, Let, Assign, Return, Handle, Fn, Rooted, Given, Family, Handling,
+                 Calling, Scalars, Containers, Matching, no_links)
 import emit.tir.handling (HandleOp, Perform, Label, Parallel, Simulate)
 import emit.lower.setting (Root)
 import emit.lower.base (Context, context_of, started, emitted, opened)
@@ -49,14 +50,20 @@ fn handle_at(
 ) -> Option<{ cx: Context, h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> } }> =
   match rooted(p, name) {
     None -> None,
-    Some(r) -> match r.code.node {
-      NHandle(h) -> Some({ cx: r.cx, h: h }),
-      NBlock(b) -> match b.tail {
-        Some(t) -> match t.node { NHandle(h) -> Some({ cx: r.cx, h: h }), _ -> None },
-        None -> None,
-      },
-      _ -> None,
+    Some(r) -> match handle_of(r.code) { Some(h) -> Some({ cx: r.cx, h: h }), None -> None },
+  }
+
+/// The `handle` `c` is, or ends in.
+fn handle_of(
+  c: Code,
+) -> Option<{ body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> }> =
+  match c.node {
+    NHandle(h) -> Some(h),
+    NBlock(b) -> match b.tail {
+      Some(t) -> match t.node { NHandle(h) -> Some(h), _ -> None },
+      None -> None,
     },
+    _ -> None,
   }
 
 /// The operations on effects `body` binds, each with the variable it binds.
@@ -722,8 +729,11 @@ fn corpus() -> Bytes =
   Bytes::concat_all([
     b"effect log {\n  write put(n: Int) -> Unit\n  write say(s: String) -> Unit\n  read ping() -> Unit\n}\n",
     b"effect ask {\n  read get() -> Int\n}\n",
-    b"effect net {\n  write send[s](payload: Int) -> Unit\n}\n",
     b"effect amb {\n  read flip() -> Bool\n}\n",
+    b"effect net {\n  write send[s](payload: Int) -> Unit\n}\n",
+    b"effect link {\n  write send[s](payload: Int) -> Int\n}\n",
+    b"effect meter {\n  read level() -> Int\n}\n",
+    b"effect tally {\n  write add(n: Int) -> Unit\n  read total() -> Int\n}\n",
     b"fn note(n: Int) -> Unit / {log.put} = log.put(n)\n",
     b"fn told(s: String) -> Unit / {log.say} = log.say(s)\n",
     b"fn pinged() -> Unit / {log.ping} = log.ping()\n",
@@ -732,21 +742,86 @@ fn corpus() -> Bytes =
     b"fn relay<[l]>(n: Int) -> Unit / {net.send[l]} = net.send[l](n)\n",
     b"fn driven(n: Int) -> Unit / {net.send[conn]} = relay[conn](n)\n",
     b"fn raised(m: String) -> Int / {abort.raise} = abort.raise(m)\n",
-    b"fn guarded(n: Int) -> Int = handle { ask.get() + n } with { ask.get() -> 1 }\n",
+    b"fn answered(n: Int) -> Int = handle { ask.get() + n } with { ask.get() -> n * 2 }\n",
+    b"fn keyed(x: Int) -> Int = handle { link.send[conn](x) } with { link.send[conn](p) -> p + 1 }\n",
+    b"fn forward<[l]>(x: Int) -> Int / {link.send[l]} = link.send[l](x)\n",
+    b"fn labelled(x: Int) -> Int = handle { forward[conn](x) } with { link.send[conn](p) -> p + 1 }\n",
+    b"fn every(x: Int) -> Int = handle { forward[conn](x) + forward[up](x) } with { link.send[*](p) -> p + 1 }\n",
+    b"fn caught(n: Int) -> Result<Int, String> = handle { if n > 0 { n } else { abort.raise(\"low\") } } with { abort.raise(m) -> Err(m), return v -> Ok(v) }\n",
+    b"fn nested() -> Int = handle { handle { ask.get() } with { abort.raise(m) -> 0 } } with { ask.get() -> 7 }\n",
+    b"fn tailed() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) }\n",
     b"fn both() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) }\n",
-    b"fn caught(m: String) -> Result<Int, String> = handle { raised(m) } with { abort.raise(e) -> Err(e), return v -> Ok(v) }\n",
+    b"fn tagged(x: Int) -> Int = handle { forward[conn](x) } with { link.send[*t](p) -> p + 1 }\n",
+    b"fn mapped(n: Int) -> Int = handle { ask.get() + n } with { ask.get() -> 1, return v -> v * 10 }\n",
+    b"fn counted() -> Int = handle { tally.add(1); tally.add(2); tally.total() } with { var n = 0, tally.add(k) -> { n = n + k; }, tally.total() -> n }\n",
     b"fn pair(n: Int) -> (Int, Int) = parallel { n + 1, n + 2 }\n",
+    b"fn reads() -> (Int, Int) / {meter.level} = parallel { meter.level(), meter.level() }\n",
+    b"fn summed(n: Int) -> Int = { let (a, b) = parallel { n + 1, n + 2 }; a + b }\n",
     b"fn ticked() -> Int / {abort.raise, sim.read} = simulate { 1 }\n",
+    b"fn clocked() -> Instant / {abort.raise, sim.read} = simulate { clock.now() }\n",
+    b"fn drawn() -> Int / {abort.raise, sim.read} = simulate { random.below(6) }\n",
+    b"fn spawned() -> Int / {abort.raise, sim.read} = simulate { let t = task.spawn(|| 1 + 2); task.join(t) }\n",
+    b"fn yielded() -> Int / {abort.raise, sim.read} = simulate { task.yield(); 1 }\n",
+    b"fn chan() -> Int / {abort.raise, sim.read} = simulate { let c = task.channel(1); task.send(c, 5); match task.recv(c) { Some(v) -> v, None -> 0 } }\n",
+    b"fn shut() -> Bool / {abort.raise, sim.read} = simulate { let c: Chan<Int> = task.channel(1); task.close(c); task.send(c, 1) }\n",
+    b"fn cancelled() -> Bool / {abort.raise, sim.read} = simulate { let t = task.spawn(|| 1); task.cancel(t) }\n",
+    b"fn awaited() -> Option<Int> / {abort.raise, sim.read} = simulate { let t = task.spawn(|| 1); task.await(t) }\n",
+    b"fn selected() -> Int / {abort.raise, sim.read} = simulate { let c = task.channel(1); task.send(c, 3); match task.select([(c, None)], false) { Some((i, _)) -> i, None -> 0 - 1 } }\n",
+    b"fn release(_: Int) -> Unit = ()\n",
+    b"fn held(n: Int) -> Int = with_hold[t](n, release) { c -> c.get() }\n",
+    b"fn bracketed(n: Int) -> Int = bracket(|| n, release, |x: Int| x + 1)\n",
   ])
 
-/// The corpus's roots the form lowers.
-fn lowers() -> List<Bytes> = [b"note", b"told", b"pinged", b"asked", b"sent", b"relay", b"raised"]
+/// The corpus's roots the form lowers and checks: every construct of the family, under the
+/// effects, `parallel`, region, task, channel, cancellation and select tests' shapes.
+fn lowers() -> List<Bytes> =
+  [
+    b"note",
+    b"told",
+    b"pinged",
+    b"asked",
+    b"sent",
+    b"relay",
+    b"driven",
+    b"raised",
+    b"answered",
+    b"keyed",
+    b"labelled",
+    b"every",
+    b"caught",
+    b"nested",
+    b"pair",
+    b"reads",
+    b"ticked",
+    b"clocked",
+    b"drawn",
+    b"spawned",
+    b"yielded",
+    b"chan",
+    b"shut",
+    b"cancelled",
+    b"awaited",
+    b"selected",
+  ]
 
-/// The corpus's roots another family's construct stands in front of: a call of a definition taking
-/// a word, and the closures of clauses, branches and a `simulate`'s body.
-fn others() -> List<Bytes> = [b"driven", b"guarded", b"both", b"caught", b"pair", b"ticked"]
+/// The corpus's roots a family declines, and which. A clause that binds its continuation or its
+/// call site's label, a return clause and a `parallel` branch make closures the checker files no
+/// type for until restructure PR 2 lands, so what they take or answer is of no known type: calling
+/// a continuation, or an operator over a value of one, is declined. A handler's variables are
+/// builtins the setting does not declare yet; so are a hold's region and `bracket`.
+fn declined() -> List<{ name: Bytes, by: Family }> =
+  [
+    { name: b"tailed", by: Calling },
+    { name: b"both", by: Calling },
+    { name: b"tagged", by: Scalars },
+    { name: b"mapped", by: Scalars },
+    { name: b"summed", by: Scalars },
+    { name: b"counted", by: Containers },
+    { name: b"held", by: Containers },
+    { name: b"bracketed", by: Containers },
+  ]
 
-test "the handling corpus lowers and checks, or is declined by the family whose construct stands in front" {
+test "the handling corpus lowers and checks, or is declined by the family named for it" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
@@ -755,17 +830,16 @@ test "the handling corpus lowers and checks, or is declined by the family whose 
           match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) }),
         [],
       );
-      // The roots another family's construct stands in front of lower and check now that the
-      // family is merged, or that family declines them.
       assert_eq(
-        others().fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
-          match formed(p, n) {
-            Ok(_) -> match checked(p, n) {
-              Ok(_) -> acc,
-              Err(why) -> acc.push({ name: n, why: why }),
+        declined().fold(
+          [],
+          |acc: List<{ name: Bytes, by: Option<Family>, why: Bytes }>, d: { name: Bytes, by: Family }|
+            match formed(p, d.name) {
+              Ok(_) -> acc.push({ name: d.name, by: None, why: b"lowered" }),
+              Err(no) -> if no.by == d.by { acc }
+              else { acc.push({ name: d.name, by: Some(no.by), why: no.why }) },
             },
-            Err(no) -> if no.by == Handling { acc.push({ name: n, why: no.why }) } else { acc },
-          }),
+        ),
         [],
       )
     },
@@ -773,30 +847,160 @@ test "the handling corpus lowers and checks, or is declined by the family whose 
 }
 
 test "the handling corpus prints as today's emitter writes it, where the form decides as it does" {
+  // Apart on purpose. `note` and `sent` test for a failure after boxing their argument, as the data
+  // family's `Pack` does and today's emitter does not. `asked`, `raised`, `spawned`, `drawn` and the
+  // like open the handler's word as the type the checker filed for the perform, and box it again
+  // where it crosses as a word; today's emitter hands the word through. `relay` opens its label
+  // parameter where the perform reads it, today's emitter where the body starts. A handle declares
+  // its answer where it pushes its frame, after its clauses' closures are made, where today's
+  // declares it first; its landing is `ply_h<n>`; its clauses' closures take the operation's types,
+  // where today's take words. `ticked` and `clocked` print as today's but for the closure's
+  // function, whose temporaries the reading of a whole text takes for the root's.
+  let same = [b"told", b"pinged"];
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
-      // Apart on purpose: `asked` and `raised` open the handler's word as the `Int` the checker filed
-      // for the perform where it is answered, and `relay` opens its label parameter where the
-      // perform reads it, where today's emitter opens each where it is first read; `told` hands its
-      // parameter on, where today's moves the parameter's count into a local it clears, and counts
-      // are `own`'s.
-      let same = [b"note", b"pinged", b"sent"];
       let today = answered_today(p, same);
       assert_eq(
-        same.fold([], |acc: List<{ name: Bytes, apart: List<Bytes> }>, n: Bytes| {
-          let form = match printed_by_form(p, n) {
-            Ok(t) -> normalised(past_counts(t)),
-            Err(why) -> [why],
-          };
-          let old = normalised(past_counts(today_text(today, n)));
-          let apart = form.filter(|l: Bytes| !old.contains(l)).concat(
-            old.filter(|l: Bytes| !form.contains(l)),
-          );
-          if apart == [] { acc } else { acc.push({ name: n, apart: apart }) }
-        }),
+        same.fold(
+          [],
+          |acc: List<{ name: Bytes, form: List<Bytes>, today: List<Bytes> }>, n: Bytes| {
+            let form = match printed_by_form(p, n) {
+              Ok(t) -> normalised(past_counts(t)),
+              Err(why) -> [why],
+            };
+            let old = normalised(past_counts(today_text(today, n)));
+            if form == old { acc } else { acc.push({ name: n, form: form, today: old }) }
+          },
+        ),
         [],
       )
+    },
+  }
+}
+
+/// How many times `s` stands in `t`.
+fn occurrences(t: Bytes, s: Bytes) -> Int / {abort.raise} = t.split(s).len() - 1
+
+fn landings() -> Bytes =
+  Bytes::concat_all([
+    b"effect ask {\n  read get() -> Int\n}\n",
+    b"fn halved(a: Int, b: Int) -> Int / {abort.raise} = a / b\n",
+    b"fn guarded(n: Int) -> Int = handle { ask.get() + halved(n, n) + (0 - n) * (n << 3) } with { abort.raise(m) -> 0, ask.get() -> 1 }\n",
+  ])
+
+test "a body that fails inside a handle leaves by the handle's landing, whatever failed" {
+  match program_of(landings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match printed_by_form(p, b"guarded") {
+      Err(why) -> assert_eq(why, b""),
+      Ok(t) -> match t.index_of(b"rt_handle_push_p(") {
+        None -> assert(false),
+        Some(from) -> match t.index_of(b"ply_h0: ;") {
+          None -> assert(false),
+          Some(to) -> {
+            let body = t.slice(from, to);
+            // The perform, the call and each checked operator go to the landing; nothing returns.
+            assert_eq(body.index_of(b"return"), None);
+            assert(occurrences(body, b"goto ply_h0;") >= 6)
+          },
+        },
+      },
+    },
+  }
+}
+
+fn rows() -> Bytes =
+  Bytes::concat_all([
+    b"effect meter {\n  read level() -> Int\n}\n",
+    b"fn pure(n: Int) -> (Int, Int) = parallel { n + 1, n + 2 }\n",
+    b"fn reads() -> (Int, Int) / {meter.level} = parallel { meter.level(), meter.level() }\n",
+    b"fn under() -> (Int, Int) = handle { parallel { meter.level(), meter.level() } } with { meter.level() -> 0 }\n",
+    b"fn open<| e>(g: () -> Int / e) -> (Int, Int) / e = parallel { g(), 1 }\n",
+  ])
+
+test "a parallel block tells the runtime its definition's row only where that row holds all its branches reach" {
+  match program_of(rows()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let calls = |helper: Bytes|
+        [b"pure", b"reads", b"under", b"open"].map(|n: Bytes|
+          match printed_by_form(p, n) {
+            Ok(t) -> Ok(t.index_of(helper) != None),
+            Err(why) -> Err(why),
+          });
+      // A block under a `handle`, or in a definition whose row is left open, is told nothing.
+      assert_eq(calls(b"rt_parallel_past_p(ctx, "), [Ok(true), Ok(true), Ok(false), Ok(false)]);
+      assert_eq(calls(b"rt_parallel_p(ctx, "), [Ok(false), Ok(false), Ok(true), Ok(true)])
+    },
+  }
+}
+
+fn records() -> Bytes =
+  Bytes::concat_all([
+    b"type P = { x: Int, y: Int }\n",
+    b"effect store {\n  read held() -> P\n  write keep(p: P) -> Int\n}\n",
+    b"fn summed() -> Int / {store.held} = { let p = store.held(); p.x + p.y }\n",
+    b"fn kept(start: P) -> Int = handle { store.keep(start) } with { store.keep(p) -> p.x + p.y }\n",
+  ])
+
+test "what an operation answers is read by its type, and a clause that takes a record waits on its closure" {
+  match program_of(records()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      match formed(p, b"summed") {
+        Err(no) -> assert_eq(no.why, b""),
+        Ok(f) -> match ops_in(f.body) {
+          [o] -> assert_eq(match o.var.ty { TyRecord(fs) -> fs.len(), _ -> 0 }, 2),
+          other -> assert_eq(other.len(), 1),
+        },
+      };
+      match printed_by_form(p, b"summed") {
+        Err(why) -> assert_eq(why, b""),
+        Ok(t) -> assert_eq(t.index_of(b"rt_field_p"), None),
+      };
+      // A closure taking a record as its fields is the calling family's to lay out.
+      assert_eq(match formed(p, b"kept") { Ok(_) -> None, Err(no) -> Some(no.by) }, Some(Calling))
+    },
+  }
+}
+
+fn steps() -> Bytes =
+  Bytes::concat_all([
+    b"effect ask {\n  read get() -> Int\n}\n",
+    b"fn stepped(k: Int, n: Int, pad: Int) -> Int / {abort.raise} = iterate(k, n + pad, |s: Int| handle { let y = ask.get(); if s + y >= n { Stop(s) } else { Continue(s + y) } } with { ask.get() resume r -> { let v = r(1); v } })\n",
+  ])
+
+/// The lambda a call hands as an argument in `c`, where `c` is one.
+fn lambda_handed(c: Code) -> Option<Lambda> =
+  match c.node {
+    NApp(a) ->
+      a.args.fold(None, |acc: Option<Lambda>, x: Code|
+        match acc { Some(_) -> acc, None -> match x.node { NLambda(l) -> Some(l), _ -> None } }),
+    NBlock(b) -> match b.tail { Some(t) -> lambda_handed(t), None -> None },
+    _ -> None,
+  }
+
+test "a step iterate runs in place copies into a detached handle's body only slots the step's frame holds" {
+  match program_of(steps()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match rooted(p, b"stepped") {
+      None -> assert(false),
+      Some(r) -> match lambda_handed(r.code) {
+        None -> assert(false),
+        Some(l) -> match handle_of(l.body) {
+          None -> assert(false),
+          Some(h) -> match body_frame(r.cx, h) {
+            None -> assert(false),
+            Some(f) -> {
+              let own = range(0, l.params).concat(l.captures.map(|c: Capture| c.dst));
+              // The step's parameter and the bound it captures; its own `let` is the body's.
+              assert_eq(f.captures.len(), 2);
+              assert(f.captures.all(|c: Capture| own.contains(c.src) && c.dst == c.src))
+            },
+          },
+        },
+      },
     },
   }
 }
