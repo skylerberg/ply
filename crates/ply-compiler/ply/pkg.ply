@@ -1,7 +1,7 @@
-//! The manifest: a `ply.pkg` file is one literal of std.pkg's Manifest, checked here so the
-//! driver and `ply resolve` read a value rather than a parse tree. The literal judgment is the
-//! one §3.1 states for parameter defaults: a literal, a constructor applied to literals, a
-//! record or a list.
+//! The files that are one literal of a std.pkg type: a `ply.pkg` is one of `Manifest` and a
+//! `ply.work` one of `Workspace`, each checked here so the driver, `ply resolve` and `ply bootstrap`
+//! read a value rather than a parse tree. The literal judgment is the one §3.1 states for parameter
+//! defaults: a literal, a constructor applied to literals, a record or a list.
 
 import parsing (Span, ParseDiag, error_at, dummy_span, starts_upper, parse_diag_bin)
 import items (Module, IFn, FnDef, item_span, parse)
@@ -11,115 +11,188 @@ import type_syntax (TCon, ty_span)
 import hash (hex, sort_bytes)
 import resolve (Source, source_bin)
 import embed (EmbedAt, EmbedFile)
-import std.json (Json, Null, Bool, Number, Str, Member, object, array, variant, error_to_string)
+import std.json (Json, Null, Bool, Number, Str, Member, JsonCodec, object, array, variant,
+                 error_to_string)
 import std.hash (blake3)
 import std.bin
-import std.pkg (Manifest, Version, Dep, Path, Git, Registry, manifest_json, prefix_of, manifest_bin)
+import std.pkg (Manifest, Version, Dep, Path, Git, Registry, Workspace, Suite, manifest_json,
+                workspace_json, prefix_of, manifest_bin)
 import std.list
 import std.graph
 import std.string
 import std.bytes
 
+/// One kind of file that is a single literal: what its diagnostics call it, the file's name, the
+/// one definition it holds and the std.pkg type that definition answers.
+type Shape = { noun: Bytes, file: Bytes, def: Bytes, ty: Bytes }
+
+fn manifest_shape() -> Shape =
+  { noun: b"manifest", file: b"ply.pkg", def: b"package", ty: b"Manifest" }
+
+fn workspace_shape() -> Shape =
+  { noun: b"workspace", file: b"ply.work", def: b"workspace", ty: b"Workspace" }
+
 pub type Checked = { manifest: Option<Manifest>, diags: List<ParseDiag> }
 
-pub fn check_source(src: Bytes) -> Checked / {abort.raise} = {
-  let r = parse(src);
-  if r.parser.diags.len() > 0 { { manifest: None, diags: r.parser.diags } } else { check(r.node) }
-}
-
-pub fn check(module: Module) -> Checked / {abort.raise} =
-  match module.items {
-    [one] -> match one {
-      IFn(d) -> if d.name.name == b"package" { check_fn(d) }
-      else { refused(shape(d.name.span, b"a manifest's one definition is named `package`")) },
-      _ -> refused(shape(item_span(one), b"a manifest holds a `fn package`, nothing else")),
+pub fn check_source(src: Bytes) -> Checked / {abort.raise} =
+  match literal_of(src, manifest_shape()) {
+    Err(diags) -> { manifest: None, diags: diags },
+    Ok(l) -> match decoded(l, manifest_shape(), manifest_json()) {
+      Err(diags) -> { manifest: None, diags: diags },
+      Ok(m) -> validate(m, l.at),
     },
-    [] -> refused(shape(dummy_span(), b"a manifest defines `package`; this file defines nothing")),
-    [_, two, ..rest] ->
-      refused(shape(item_span(two), b"a manifest defines `package` and nothing else")),
   }
 
-fn refused(diag: ParseDiag) -> Checked = { manifest: None, diags: [diag] }
+/// What a `ply.work` file's text states: its workspace, or the diagnostics that refuse it.
+pub type CheckedWorkspace = { workspace: Option<Workspace>, diags: List<ParseDiag> }
 
-fn shape(here: Span, message: Bytes) -> ParseDiag =
-  error_at(b"E0129", here, message, b"not the shape a manifest takes", [
-    b"a `ply.pkg` file is exactly `fn package() -> Manifest = ...`, with std.pkg's Manifest",
+/// A `ply.work` file's text checked as `ply.pkg`'s is (`E0129`–`E0131`), then held to naming each
+/// directory once, each relative to the file and inside its directory, to an entry that is a
+/// module's name and a definition's, and to a runtime that is a cargo package's name.
+pub fn check_workspace(src: Bytes) -> CheckedWorkspace / {abort.raise} =
+  match literal_of(src, workspace_shape()) {
+    Err(diags) -> { workspace: None, diags: diags },
+    Ok(l) -> match decoded(l, workspace_shape(), workspace_json()) {
+      Err(diags) -> { workspace: None, diags: diags },
+      Ok(w) -> {
+        let diags = workspace_diags(w, field_diag(l.at, workspace_shape()));
+        { workspace: if diags.len() == 0 { Some(w) } else { None }, diags: diags }
+      },
+    },
+  }
+
+/// A file's one literal as the json a derived codec reads, and where its body is.
+type Literal = { json: Json, at: Span }
+
+fn literal_of(src: Bytes, s: Shape) -> Result<Literal, List<ParseDiag>> / {abort.raise} = {
+  let r = parse(src);
+  if r.parser.diags.len() > 0 { Err(r.parser.diags) } else { literal_in(r.node, s) }
+}
+
+fn literal_in(module: Module, s: Shape) -> Result<Literal, List<ParseDiag>> / {abort.raise} =
+  match module.items {
+    [one] -> match one {
+      IFn(d) -> if d.name.name == s.def { literal_fn(d, s) } else {
+        Err([
+          shape(
+            d.name.span,
+            s,
+            said([b"a ", s.noun, b"'s one definition is named `", s.def, b"`"]),
+          ),
+        ])
+      },
+      _ ->
+        Err([
+          shape(
+            item_span(one),
+            s,
+            said([b"a ", s.noun, b" holds a `fn ", s.def, b"`, nothing else"]),
+          ),
+        ]),
+    },
+    [] ->
+      Err([
+        shape(
+          dummy_span(),
+          s,
+          said([b"a ", s.noun, b" defines `", s.def, b"`; this file defines nothing"]),
+        ),
+      ]),
+    [_, two, ..rest] ->
+      Err([
+        shape(
+          item_span(two),
+          s,
+          said([b"a ", s.noun, b" defines `", s.def, b"` and nothing else"]),
+        ),
+      ]),
+  }
+
+fn said(parts: List<Bytes>) -> Bytes = Bytes::concat_all(parts)
+
+fn shape(here: Span, s: Shape, message: Bytes) -> ParseDiag =
+  error_at(b"E0129", here, message, said([b"not the shape a ", s.noun, b" takes"]), [
+    said([
+      b"a `",
+      s.file,
+      b"` file is exactly `fn ",
+      s.def,
+      b"() -> ",
+      s.ty,
+      b" = ...`, with std.pkg's ",
+      s.ty,
+    ]),
   ])
 
 fn cat(xs: List<ParseDiag>, ys: List<ParseDiag>) -> List<ParseDiag> =
   ys.fold(xs, |acc: List<ParseDiag>, diag: ParseDiag| acc.push(diag))
 
-fn check_fn(def: FnDef) -> Checked / {abort.raise} = {
+fn literal_fn(def: FnDef, s: Shape) -> Result<Literal, List<ParseDiag>> / {abort.raise} = {
+  let returns = said([b"`", s.def, b"` returns std.pkg's `", s.ty, b"`"]);
+  let not_it = said([b"not the ", s.noun, b" type"]);
   let ret_diags = match def.ret {
     None ->
       [
         shape_msg(
           def.name.span,
-          b"`package` declares its return type, std.pkg's `Manifest`",
+          said([b"`", s.def, b"` declares its return type, std.pkg's `", s.ty, b"`"]),
           b"no return type written",
         ),
       ],
     Some(t) -> match t {
-      TCon(c) -> if c.name.name.name == b"Manifest" { [] } else {
-        [shape_msg(ty_span(t), b"`package` returns std.pkg's `Manifest`", b"not the manifest type")]
-      },
-      _ ->
-        [
-          shape_msg(
-            ty_span(t),
-            b"`package` returns std.pkg's `Manifest`",
-            b"not the manifest type",
-          ),
-        ],
+      TCon(c) -> if c.name.name.name == s.ty { [] }
+      else { [shape_msg(ty_span(t), returns, not_it)] },
+      _ -> [shape_msg(ty_span(t), returns, not_it)],
     },
   };
   let param_diags = if def.params.len() == 0 { [] } else {
     [
       shape_msg(
         def.name.span,
-        b"`package` takes no parameters",
-        b"a manifest is data; nothing is passed in",
+        said([b"`", s.def, b"` takes no parameters"]),
+        said([b"a ", s.noun, b" is data; nothing is passed in"]),
       ),
     ]
   };
   let diags = cat(ret_diags, param_diags);
-  if diags.len() > 0 { { manifest: None, diags: diags } } else { check_body(def) }
+  if diags.len() > 0 { Err(diags) } else {
+    match literal_json(def.body) {
+      Err(at) ->
+        Err([
+          error_at(
+            b"E0130",
+            at,
+            said([b"a ", s.noun, b" is a value, not something that runs"]),
+            said([b"not ", s.noun, b" data"]),
+            [b"a literal, a constructor applied to literals, a record or a list is fine"],
+          ),
+        ]),
+      Ok(j) -> Ok({ json: j, at: expr_span(def.body) }),
+    }
+  }
 }
 
 fn shape_msg(here: Span, message: Bytes, label: Bytes) -> ParseDiag =
   error_at(b"E0129", here, message, label, [])
 
-fn check_body(def: FnDef) -> Checked / {abort.raise} =
-  match literal_json(def.body) {
-    Err(s) ->
-      {
-        manifest: None,
-        diags: [
-          error_at(
-            b"E0130",
-            s,
-            b"a manifest is a value, not something that runs",
-            b"not manifest data",
-            [b"a literal, a constructor applied to literals, a record or a list is fine"],
-          ),
-        ],
-      },
-    Ok(j) -> match manifest_json().decode(j) {
-      Err(e) ->
-        {
-          manifest: None,
-          diags: [
-            error_at(
-              b"E0131",
-              expr_span(def.body),
-              Bytes::of_string(error_to_string(e)),
-              b"the manifest does not decode",
-              [],
-            ),
-          ],
-        },
-      Ok(m) -> validate(m, expr_span(def.body)),
-    },
+/// `l` read by `codec`, or the one diagnostic that says why it does not read.
+fn decoded<a>(
+  l: Literal,
+  s: Shape,
+  codec: JsonCodec<a>,
+) -> Result<a, List<ParseDiag>> / {abort.raise} =
+  match (codec.decode)(l.json) {
+    Err(e) ->
+      Err([
+        error_at(
+          b"E0131",
+          l.at,
+          Bytes::of_string(error_to_string(e)),
+          said([b"the ", s.noun, b" does not decode"]),
+          [],
+        ),
+      ]),
+    Ok(v) -> Ok(v),
   }
 
 /// `None` and `Some` encode the way the json derive encodes `Option`: null and the bare value.
@@ -173,7 +246,7 @@ fn fields_json(fields: List<RecField>, acc: List<Member>) -> Result<Json, Span> 
   }
 
 fn validate(manifest: Manifest, here: Span) -> Checked / {abort.raise} = {
-  let bad = field_diag(here);
+  let bad = field_diag(here, manifest_shape());
   let name_diags = if Bytes::of_string(manifest.name).len() == 0 {
     [bad(b"a manifest's `name` must not be empty")]
   } else if !is_dotted_path(manifest.name) {
@@ -193,8 +266,76 @@ fn validate(manifest: Manifest, here: Span) -> Checked / {abort.raise} = {
   }
 }
 
-fn field_diag(here: Span) -> (Bytes) -> ParseDiag =
-  |message: Bytes| error_at(b"E0131", here, message, b"not a field a manifest accepts", [])
+fn field_diag(here: Span, s: Shape) -> (Bytes) -> ParseDiag =
+  |message: Bytes|
+    error_at(b"E0131", here, message, said([b"not a field a ", s.noun, b" accepts"]), [])
+
+/// Every directory a workspace names, in the order it names them.
+fn directories(w: Workspace) -> List<String> = {
+  let own = w.packages.concat(w.suites.map(|s: Suite| s.dir)).concat(w.fixtures);
+  match w.toolchain {
+    None -> own,
+    Some(t) -> [t.std, t.std_tests, t.compiler, t.cli, t.cli_tests].concat(own),
+  }
+}
+
+/// Whether `dir` names a directory below the workspace's own: names joined by `/`, none of them
+/// empty, `.` or `..`.
+fn below(dir: String) -> Bool / {abort.raise} =
+  dir.len() > 0 && dir.split("/").all(|seg: String| seg != "" && seg != "." && seg != "..")
+
+/// A cargo package's name: a lower-case letter, then lower-case letters, digits, `-` and `_`.
+fn cargo_name(name: String) -> Bool / {abort.raise} = {
+  let bs = Bytes::of_string(name);
+  bs.len() > 0 && bs.at(0) >= 97 && bs.at(0) <= 122
+    && range(1, bs.len()).all(|i: Int| {
+      let b = bs.at(i);
+      (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 45 || b == 95
+    })
+}
+
+fn workspace_diags(w: Workspace, bad: (Bytes) -> ParseDiag) -> List<ParseDiag> / {abort.raise} = {
+  let dirs = directories(w);
+  let placed = dirs.fold([], |acc: List<ParseDiag>, dir: String|
+    if below(dir) { acc } else {
+      acc.push(
+        bad(
+          said([
+            b"`",
+            Bytes::of_string(dir),
+            b"` is no directory below the workspace's: names joined by `/`, none of them `.` or `..`",
+          ]),
+        ),
+      )
+    });
+  let once = range(0, dirs.len()).fold(placed, |acc: List<ParseDiag>, i: Int|
+    if !dirs.take(i).contains(dirs.get(i)) { acc } else {
+      acc.push(bad(said([b"the directory `", Bytes::of_string(dirs.get(i)), b"` is named twice"])))
+    });
+  match w.toolchain {
+    None -> once,
+    Some(t) -> {
+      let entered = if is_dotted_path(t.entry) && t.entry.contains(".") { once } else {
+        once.push(
+          bad(
+            said([
+              b"the entry `",
+              Bytes::of_string(t.entry),
+              b"` is not a module's name and a definition's, joined by a dot",
+            ]),
+          ),
+        )
+      };
+      if cargo_name(t.runtime) { entered } else {
+        entered.push(
+          bad(
+            said([b"the runtime `", Bytes::of_string(t.runtime), b"` is no cargo package's name"]),
+          ),
+        )
+      }
+    },
+  }
+}
 
 fn version_ok(v: Version) -> Bool = v.major >= 0 && v.minor >= 0 && v.patch >= 0
 
@@ -490,6 +631,82 @@ test "fields that fail validation are named" {
   let refused = check_source(escaping).diags.get(0);
   assert_eq(refused.code, b"E0131");
   assert(String::of_bytes_lossy(refused.message).contains("is not a package name"))
+}
+
+fn a_workspace(toolchain: String) -> Bytes =
+  Bytes::of_string(
+    "import std.pkg (Workspace)\nfn workspace() -> Workspace = {packages: [\"lib/store\"], suites: [{dir: \"examples\", proved: true}], fixtures: [\"tests/fixtures\"], toolchain: "
+      ++ toolchain
+      ++ "}",
+  )
+
+fn a_toolchain(entry: String, std: String) -> String =
+  "Some({std: \"" ++ std
+    ++ "\", std_tests: \"tests/std\", compiler: \"lib/compiler\", cli: \"cli\", entry: \""
+    ++ entry
+    ++ "\", cli_tests: \"tests/cli\", runtime: \"ply-runtime\"})"
+
+fn workspace_codes(src: Bytes) -> List<Bytes> / {abort.raise} =
+  check_workspace(src).diags.map(|d: ParseDiag| d.code)
+
+test "a well-formed workspace checks and decodes, with or without a toolchain" {
+  let got = check_workspace(a_workspace(a_toolchain("ply.main", "lib/std")));
+  assert_eq(got.diags, []);
+  match got.workspace {
+    None -> panic("the workspace checks"),
+    Some(w) -> {
+      assert_eq(w.packages, ["lib/store"]);
+      assert_eq(w.suites, [{ dir: "examples", proved: true }]);
+      match w.toolchain {
+        None -> panic("the toolchain is named"),
+        Some(t) -> {
+          assert_eq(t.std, "lib/std");
+          assert_eq(t.entry, "ply.main");
+          assert_eq(t.runtime, "ply-runtime")
+        },
+      }
+    },
+  };
+  assert_eq(check_workspace(a_workspace("None")).diags, [])
+}
+
+test "a workspace is refused as a manifest is, in its own words" {
+  let shaped = check_workspace(b"import std.pkg (Workspace)\nfn package() -> Workspace = 1").diags;
+  assert_eq(shaped.map(|d: ParseDiag| d.code), [b"E0129"]);
+  assert_eq(shaped.get(0).message, b"a workspace's one definition is named `workspace`");
+  assert_eq(
+    workspace_codes(
+      b"import std.pkg (Workspace)\nfn workspace() -> Workspace = { packages: list() }",
+    ),
+    [b"E0130"],
+  );
+  assert_eq(
+    workspace_codes(b"import std.pkg (Workspace)\nfn workspace() -> Workspace = { packages: [] }"),
+    [b"E0131"],
+  )
+}
+
+test "a workspace names each directory once, below its own, and an entry that is a definition" {
+  let twice = check_workspace(a_workspace(a_toolchain("ply.main", "lib/store"))).diags;
+  assert_eq(twice.map(|d: ParseDiag| d.code), [b"E0131"]);
+  assert(String::of_bytes_lossy(twice.get(0).message).contains("`lib/store` is named twice"));
+  ["/abs/std", "../std", "lib/./std", "lib//std", ""].fold((), |u: Unit, dir: String|
+    assert_eq(workspace_codes(a_workspace(a_toolchain("ply.main", dir))), [b"E0131"]));
+  assert_eq(workspace_codes(a_workspace(a_toolchain("main", "lib/std"))), [b"E0131"]);
+  assert_eq(
+    workspace_codes(
+      a_workspace(a_toolchain("ply.main", "lib/std").replace("ply-runtime", "Ply Runtime")),
+    ),
+    [b"E0131"],
+  )
+}
+
+test "a manifest is still refused in its own words" {
+  let d = check_source(b"fn other() -> Int = 1").diags.get(0);
+  assert_eq(d.message, b"a manifest's one definition is named `package`");
+  assert_eq(d.notes_text, [
+    b"a `ply.pkg` file is exactly `fn package() -> Manifest = ...`, with std.pkg's Manifest",
+  ])
 }
 
 test "a manifest with a syntax error reports the parse, not the shape" {

@@ -45,10 +45,7 @@ fn a_binary_reads_back_each_file_of_the_pack_after_its_code() {
     let pack = read(&binary(
         b"\x7fELF code",
         &[
-            (
-                "crates/ply-std/ply/option.ply",
-                b"pub type Option<a> = Some(a) | None",
-            ),
+            ("std/option.ply", b"pub type Option<a> = Some(a) | None"),
             ("program/front", b"front"),
         ],
     ))
@@ -56,48 +53,78 @@ fn a_binary_reads_back_each_file_of_the_pack_after_its_code() {
     .expect("the binary carries one");
     assert_eq!(pack.bytes("program/front"), Some(&b"front"[..]));
     assert_eq!(
-        pack.text("crates/ply-std/ply/option.ply"),
+        pack.text("std/option.ply"),
         Some("pub type Option<a> = Some(a) | None")
     );
-    assert_eq!(pack.bytes("crates/ply-std/ply/list.ply"), None);
+    assert_eq!(pack.bytes("std/list.ply"), None);
     assert_eq!(
         pack.digest_of("program/front"),
         Some(*blake3::hash(b"front").as_bytes())
     );
     assert_eq!(
         pack.paths().collect::<Vec<_>>(),
-        ["crates/ply-std/ply/option.ply", "program/front"]
+        ["program/front", "std/option.ply"]
     );
 }
 
 #[test]
-fn a_pack_lists_the_files_directly_in_a_directory_and_the_modules_and_data_below_it() {
+fn a_pack_lists_the_modules_and_the_data_below_a_root() {
     let pack = read(&binary(
         b"",
         &[
-            ("crates/ply-std/ply/option.ply", b"a"),
-            ("crates/ply-std/ply/hash/legacy.ply", b"b"),
-            ("crates/ply-std/ply/oid/names.txt", b"c"),
-            ("crates/ply-std/ply.txt", b"d"),
-            ("crates/ply-compiler/ply/front.ply", b"e"),
+            ("std/option.ply", b"a"),
+            ("std/hash/legacy.ply", b"b"),
+            ("std/oid/names.txt", b"c"),
+            ("stdlib.txt", b"d"),
+            ("compiler/front.ply", b"e"),
+            ("compiler/emit/roots.ply", b"f"),
         ],
     ))
     .expect("the pack reads")
     .expect("the binary carries one");
     assert_eq!(
-        pack.files_in(ply_pack::STD).collect::<Vec<_>>(),
-        ["crates/ply-std/ply/option.ply"]
-    );
-    assert_eq!(
         pack.modules_below(ply_pack::STD).collect::<Vec<_>>(),
-        [
-            "crates/ply-std/ply/hash/legacy.ply",
-            "crates/ply-std/ply/option.ply"
-        ]
+        ["std/hash/legacy.ply", "std/option.ply"]
     );
     assert_eq!(
         pack.data_below(ply_pack::STD).collect::<Vec<_>>(),
-        ["crates/ply-std/ply/oid/names.txt"]
+        ["std/oid/names.txt"]
+    );
+    assert_eq!(
+        pack.modules_below(ply_pack::COMPILER).collect::<Vec<_>>(),
+        ["compiler/emit/roots.ply", "compiler/front.ply"]
+    );
+}
+
+// CI's first bootstrap links the pack the last release's `ply bootstrap` writes with this runtime.
+#[test]
+fn a_pack_the_last_release_wrote_is_read_under_the_logical_roots() {
+    let pack = read(&binary(
+        b"",
+        &[
+            ("crates/ply-std/ply/option.ply", b"a"),
+            ("crates/ply-std/ply/oid/names.txt", b"c"),
+            ("crates/ply-std/plyx/other.ply", b"x"),
+            ("crates/ply-compiler/ply/front.ply", b"e"),
+            ("program/front", b"f"),
+        ],
+    ))
+    .expect("the pack reads")
+    .expect("the binary carries one");
+    assert_eq!(
+        pack.paths().collect::<Vec<_>>(),
+        [
+            "compiler/front.ply",
+            "crates/ply-std/plyx/other.ply",
+            "program/front",
+            "std/oid/names.txt",
+            "std/option.ply"
+        ]
+    );
+    assert_eq!(pack.bytes("std/option.ply"), Some(&b"a"[..]));
+    assert_eq!(
+        pack.digest_of("compiler/front.ply"),
+        Some(*blake3::hash(b"e").as_bytes())
     );
 }
 
@@ -153,32 +180,32 @@ fn a_digest_below_directories_moves_with_a_file_there_and_with_none_outside() {
             .digest_below(&[ply_pack::STD, ply_pack::COMPILER])
     };
     let base = below(&[
-        ("crates/ply-std/ply/option.ply", b"a"),
-        ("crates/ply-compiler/ply/infer.ply", b"p"),
+        ("std/option.ply", b"a"),
+        ("compiler/infer.ply", b"p"),
         ("program/front", b"f"),
     ]);
     let moved = |files: &[(&str, &[u8])]| below(files) != base;
     assert!(moved(&[
-        ("crates/ply-std/ply/option.ply", b"b"),
-        ("crates/ply-compiler/ply/infer.ply", b"p"),
+        ("std/option.ply", b"b"),
+        ("compiler/infer.ply", b"p"),
         ("program/front", b"f"),
     ]));
     assert!(moved(&[
-        ("crates/ply-std/ply/option.ply", b"a"),
-        ("crates/ply-std/ply/oid/names.txt", b"n"),
-        ("crates/ply-compiler/ply/infer.ply", b"p"),
+        ("std/option.ply", b"a"),
+        ("std/oid/names.txt", b"n"),
+        ("compiler/infer.ply", b"p"),
         ("program/front", b"f"),
     ]));
     assert!(moved(&[
-        ("crates/ply-std/ply/option.ply", b"a"),
-        ("crates/ply-compiler/ply/infer.ply", b"q"),
+        ("std/option.ply", b"a"),
+        ("compiler/infer.ply", b"q"),
         ("program/front", b"f"),
     ]));
     // The program, and a file whose path only starts as a root's does, are no part of it.
     assert!(!moved(&[
-        ("crates/ply-std/ply/option.ply", b"a"),
-        ("crates/ply-std/ply.txt", b"d"),
-        ("crates/ply-compiler/ply/infer.ply", b"p"),
+        ("std/option.ply", b"a"),
+        ("stdlib.txt", b"d"),
+        ("compiler/infer.ply", b"p"),
         ("program/front", b"another"),
     ]));
 }

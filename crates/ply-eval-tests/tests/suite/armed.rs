@@ -499,6 +499,40 @@ fn workspace_root() -> PathBuf {
         .expect("the workspace root is two directories above crates/ply-eval-tests")
 }
 
+/// Each string the field `field` of the record `ply.work`'s one literal holds: the one of
+/// `cli: "..."`, each of a list's for `packages: [...]`.
+fn workspace_strings(root: &Path, field: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(root.join("ply.work")).expect("the repository's ply.work");
+    let key = format!("{field}:");
+    let at = text
+        .match_indices(&key)
+        .map(|(at, _)| at)
+        .find(|&at| text[..at].ends_with(|c: char| c.is_whitespace() || c == '{' || c == ','))
+        .unwrap_or_else(|| panic!("ply.work names no `{field}`"));
+    let rest = text[at + key.len()..].trim_start();
+    let value = if rest.starts_with('[') {
+        &rest[..rest.find(']').expect("ply.work closes the list it opens")]
+    } else {
+        rest.split_once([',', '\n'])
+            .map_or(rest, |(value, _)| value)
+    };
+    value
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// The directories of the packages whose `.ply` sources are production the way `src/` is: the
+/// standard library, the compiler, the program and the packages `ply.work` lists, and no suite.
+fn production_dirs(root: &Path) -> Vec<String> {
+    ["std", "compiler", "cli", "packages"]
+        .into_iter()
+        .flat_map(|field| workspace_strings(root, field))
+        .collect()
+}
+
 /// Package names from `[workspace] members`, read out of the root manifest as text.
 fn workspace_members(root: &Path) -> Vec<String> {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("a workspace manifest");
@@ -682,8 +716,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Every `.ply` source of this checkout's packages, which is production the same way `src/` is; the
-/// `-tests` crates are not.
+/// Every `.ply` source of this checkout's production packages ([`production_dirs`]).
 fn ply_sources(root: &Path) -> Vec<Source> {
     fn ply_files(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("a readable source directory") {
@@ -696,13 +729,8 @@ fn ply_sources(root: &Path) -> Vec<Source> {
         }
     }
     let mut paths = Vec::new();
-    for entry in std::fs::read_dir(root.join("crates")).expect("a readable crates directory") {
-        let dir = entry.expect("a directory entry").path();
-        let name = dir.file_name().unwrap_or_default().to_string_lossy();
-        if name.ends_with("-tests") || !dir.join("ply").is_dir() {
-            continue;
-        }
-        ply_files(&dir.join("ply"), &mut paths);
+    for dir in production_dirs(root) {
+        ply_files(&root.join(dir), &mut paths);
     }
     paths.sort();
     paths
@@ -850,8 +878,15 @@ fn declared_codes(root: &Path) -> BTreeMap<String, (String, usize)> {
     out
 }
 
-/// The registry of codes: the table `ply explain` answers from, one `meaning_of("E0000", "...")` per code.
-const REGISTRY: &str = "crates/ply-cli/ply/explain.ply";
+/// The registry of codes, below the repository: the table `ply explain` answers from, one
+/// `meaning_of("E0000", "...")` per code, in the program's package.
+fn registry_file(root: &Path) -> String {
+    let cli = workspace_strings(root, "cli");
+    format!(
+        "{}/explain.ply",
+        cli.first().expect("ply.work names the program's package")
+    )
+}
 
 /// What every row of the registry opens with.
 const ROW: &[u8] = b"meaning_of(";
@@ -859,7 +894,8 @@ const ROW: &[u8] = b"meaning_of(";
 /// `(code, line)` for every row of the registry's `meanings()`, in the table's order. A row this
 /// cannot read fails the read rather than being skipped, so no code hides behind another shape.
 fn registry_rows(root: &Path) -> Vec<(String, usize)> {
-    let text = std::fs::read(root.join(REGISTRY)).expect("the registry is readable");
+    let file = registry_file(root);
+    let text = std::fs::read(root.join(&file)).expect("the registry is readable");
     let head = find_all(&text, b"pub fn meanings()")
         .into_iter()
         .next()
@@ -877,37 +913,37 @@ fn registry_rows(root: &Path) -> Vec<(String, usize)> {
             return rows;
         }
         if !text[i..].starts_with(ROW) {
-            unreadable_row(&text, i);
+            unreadable_row(&file, &text, i);
         }
         let row = i;
         let (code, after) = ply_string(&text, skip_ply_space(&text, i + ROW.len()))
-            .unwrap_or_else(|| unreadable_row(&text, i));
+            .unwrap_or_else(|| unreadable_row(&file, &text, i));
         i = skip_ply_space(&text, after);
         if text.get(i) != Some(&b',') {
-            unreadable_row(&text, i);
+            unreadable_row(&file, &text, i);
         }
         let (_, after) = ply_string(&text, skip_ply_space(&text, i + 1))
-            .unwrap_or_else(|| unreadable_row(&text, i));
+            .unwrap_or_else(|| unreadable_row(&file, &text, i));
         i = skip_ply_space(&text, after);
         if text.get(i) == Some(&b',') {
             i = skip_ply_space(&text, i + 1);
         }
         if text.get(i) != Some(&b')') {
-            unreadable_row(&text, i);
+            unreadable_row(&file, &text, i);
         }
         rows.push((code, line_of(&text, row)));
         i = skip_ply_space(&text, i + 1);
         match text.get(i) {
             Some(b',') => i += 1,
             Some(b']') => return rows,
-            _ => unreadable_row(&text, i),
+            _ => unreadable_row(&file, &text, i),
         }
     }
 }
 
-fn unreadable_row(text: &[u8], at: usize) -> ! {
+fn unreadable_row(file: &str, text: &[u8], at: usize) -> ! {
     panic!(
-        "{REGISTRY}:{}: `meanings()` holds something other than a `meaning_of(\"E0000\", \"meaning\")` \
+        "{file}:{}: `meanings()` holds something other than a `meaning_of(\"E0000\", \"meaning\")` \
          row, which the registry gates cannot read",
         line_of(text, at)
     )
@@ -1382,6 +1418,7 @@ fn every_code_declared_or_raised_has_one_row_in_the_registry() {
         raised.len(),
         registry.len()
     );
+    let explain = registry_file(&workspace_root());
 
     let mut named: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (name, (number, _)) in declared {
@@ -1412,7 +1449,7 @@ fn every_code_declared_or_raised_has_one_row_in_the_registry() {
         .collect();
     assert!(
         twice.is_empty(),
-        "{REGISTRY} explains a code twice: {twice:?}"
+        "{explain} explains a code twice: {twice:?}"
     );
 
     let wanted: BTreeSet<&str> = named
@@ -1424,7 +1461,7 @@ fn every_code_declared_or_raised_has_one_row_in_the_registry() {
     assert!(
         missing.is_empty(),
         "{} code(s) declared in ply_eval::codes or raised from a `.ply` source have no row in \
-         `meanings()` in {REGISTRY}, so `ply explain` cannot say what they mean: {missing:?}\n\n\
+         `meanings()` in {explain}, so `ply explain` cannot say what they mean: {missing:?}\n\n\
          Add a row m(\"E0000\", \"what it means\") — adding a row moves no existing number.",
         missing.len()
     );
@@ -1444,6 +1481,7 @@ fn the_registry_has_no_row_for_a_code_nothing_declares_or_raises() {
         "parsed {} registry rows — the parser is broken",
         registry.len()
     );
+    let explain = registry_file(&workspace_root());
     let malformed: Vec<&str> = registry
         .iter()
         .map(|(code, _)| code.as_str())
@@ -1451,7 +1489,7 @@ fn the_registry_has_no_row_for_a_code_nothing_declares_or_raises() {
         .collect();
     assert!(
         malformed.is_empty(),
-        "{REGISTRY} has rows whose code is not shaped E0000 or W0000: {malformed:?}"
+        "{explain} has rows whose code is not shaped E0000 or W0000: {malformed:?}"
     );
 
     let wanted: BTreeSet<&str> = declared
@@ -1462,7 +1500,7 @@ fn the_registry_has_no_row_for_a_code_nothing_declares_or_raises() {
     let stale: Vec<String> = registry
         .iter()
         .filter(|(code, _)| !wanted.contains(code.as_str()))
-        .map(|(code, line)| format!("{code} at {REGISTRY}:{line}"))
+        .map(|(code, line)| format!("{code} at {explain}:{line}"))
         .collect();
     assert!(
         stale.is_empty(),
