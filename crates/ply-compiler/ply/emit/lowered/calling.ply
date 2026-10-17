@@ -4,11 +4,12 @@
 import resolve (qualify)
 import emit.keys (Named, Root, Generic)
 import emit.tir (Rep, RInt, RWord, Var, Arg, AVar, Val, Call, Apply, Make, Get, Pack, Op, OCalling,
-                 MClosure, PCapture, Inst, Let, Do, If, Restart, Block, Fn, Closure, Declined,
-                 Family, Spine, Data, Calling, Matching, Handling, Scalars, Containers)
+                 MClosure, PCapture, TTag, Inst, Let, Do, If, Case, Loop, Next, Done, Restart,
+                 Enter, Block, Fn, Member, Closure, Declined, Family, Spine, Data, Calling,
+                 Matching, Handling, Scalars, Containers)
 import emit.tir.calling (EntryValue, ConstantRead, Ticked)
-import emit.lower (lowered_fn)
-import emit.lower.base (context_of)
+import emit.lower (lowered_fn, lowered_group)
+import emit.lower.base (GroupMember, context_of)
 import emit.lower.calling (known_body)
 import emit.verify (verified)
 import emit.print (printed_fn)
@@ -39,6 +40,8 @@ fn corpus() -> Bytes =
     b"fn apply_to<T>(f: (T) -> T, x: T) -> T = f(x)\n",
     b"fn lends(x: Int) -> Int = apply_to(|y: Int| y + x, x)\n",
     b"fn steps(n: Int) -> Int / {abort.raise} = iterate(0, n, |i: Int| if i >= 10 { Stop(i) } else { Continue(i + 1) })\n",
+    b"fn step_of(i: Int) -> Iter<Int, Int> = if i >= 10 { Stop(i) } else { Continue(i + 1) }\n",
+    b"fn stepped(n: Int, k: Int) -> Int / {abort.raise} = iterate(0, n, |i: Int| step_of(i + k))\n",
     b"fn even(n: Int) -> Bool / {diverges} = if n == 0 { true } else { odd(n - 1) }\n",
     b"fn odd(n: Int) -> Bool / {diverges} = if n == 0 { false } else { even(n - 1) }\n",
   ])
@@ -66,6 +69,8 @@ fn names() -> List<Bytes> =
     b"apply_to",
     b"lends",
     b"steps",
+    b"step_of",
+    b"stepped",
     b"even",
     b"odd",
   ]
@@ -359,20 +364,105 @@ test "a lambda a let binds and a call runs in place reads its captures off its c
   }
 }
 
+test "a step iterate runs is a loop over its state and budget, each pass going on or leaving as its Iter says" {
+  match form(b"stepped") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> match f.body.fold(None, |acc: Option<Inst>, i: Inst|
+        match i { Loop(_) -> Some(i), _ -> acc }) {
+      Some(Loop(l)) -> {
+        assert_eq(l.state.map(|v: Var| v.rep), [RInt, RInt]);
+        assert_eq(l.answer.rep, RInt);
+        // The pass ends testing the `Iter` the step answered: a `Continue` goes on, a `Stop` leaves.
+        match l.body.at(l.body.len() - 1) {
+          Some(Case(c)) -> {
+            assert_eq(c.test, TTag([b"Continue", b"Stop"]));
+            assert_eq(
+              c.arms.map(|a: { when: Int, body: Block }|
+                match a.body.at(a.body.len() - 1) {
+                  Some(Next(_)) -> 0,
+                  Some(Done(_)) -> 1,
+                  _ -> 2,
+                }),
+              [0, 1],
+            )
+          },
+          other -> assert_eq(other, None),
+        }
+      },
+      _ -> assert(false, Some("the step is no loop")),
+    },
+  }
+}
+
+/// The corpus's roots `names` lowered as one tail group, or why not.
+fn group_form(names: List<Bytes>) -> Result<Fn, Bytes> / {abort.raise} =
+  match program_of(corpus()) {
+    Err(why) -> Err(why),
+    Ok(p) -> {
+      let members = names.fold([], |acc: List<GroupMember>, n: Bytes|
+        match range(0, p.roots.len()).fold(None, |found: Option<GroupMember>, i: Int|
+            match p.roots.at(i) {
+              Some(r) -> if r.full != qualify(b"m", n) { found } else {
+                match r.code {
+                  Some(code) -> {
+                    let body = known_body(r.full, r.params, code);
+                    Some({ cx: context_of(p.setting, r, body), body: body })
+                  },
+                  None -> found,
+                }
+              },
+              None -> found,
+            }) {
+          Some(m) -> acc.push(m),
+          None -> acc,
+        });
+      match lowered_group(members) { Ok(f) -> Ok(f), Err(no) -> Err(no.why) }
+    },
+  }
+
+/// Every instruction `b` holds, its branches' and cases' too.
+fn insts_in(b: Block) -> List<Inst> =
+  b.fold([], |acc: List<Inst>, i: Inst|
+    match i {
+      If(x) -> acc.push(i).concat(insts_in(x.then)).concat(insts_in(x.otherwise)),
+      Case(c) ->
+        c.arms.fold(
+          acc.push(i).concat(insts_in(c.rest)),
+          |a: List<Inst>, arm: { when: Int, body: Block }| a.concat(insts_in(arm.body)),
+        ),
+      _ -> acc.push(i),
+    })
+
+test "a tail group is one root whose case runs each member, a tail call into another member entering it" {
+  match group_form([b"even", b"odd"]) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(f.members.map(|m: Member| m.key), [Named(b"m.even"), Named(b"m.odd")]);
+      assert_eq(f.members.map(|m: Member| m.params.map(|v: Var| v.rep)), [[RInt], [RInt]]);
+      assert_eq(
+        insts_in(f.body).fold([], |acc: List<Int>, i: Inst|
+          match i { Enter(e) -> acc.push(e.member), _ -> acc }),
+        [1, 0],
+      );
+      assert_eq(
+        insts_in(f.body).filter(|i: Inst| match i { Restart(_) -> true, _ -> false }).len(),
+        0,
+      )
+    },
+  }
+}
+
 test "every root of the calling corpus lowers and keeps the form's rules, or another family declines it" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
-      // Each root this family declines, and why.
-      let declined = [{ name: b"steps", why: b"a step run in place" }];
       // Until the ownership pass fills them, a root that holds a count across an operation that can
-      // fail names no release on its failure path, which the check refuses.
-      let unowned = [b"local"];
+      // fail names no release on its failure path, which the check refuses; and it walks no loop yet.
+      let unchecked = [b"local", b"stepped"];
       let failed = names().fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
         match lowered_as_built(p, n) {
-          Err(no) -> if no.by != Calling || declined.contains({ name: n, why: no.why }) { acc }
-          else { acc.push({ name: n, why: no.why }) },
-          Ok(f) -> if unowned.contains(n) { acc }
+          Err(no) -> if no.by != Calling { acc } else { acc.push({ name: n, why: no.why }) },
+          Ok(f) -> if unchecked.contains(n) { acc }
           else { match verified(f) { Some(why) -> acc.push({ name: n, why: why }), None -> acc } },
         });
       assert_eq(failed, [])
