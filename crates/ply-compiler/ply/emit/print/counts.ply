@@ -1,11 +1,12 @@
 //! The ownership pass's instructions printed: counts taken and let go, cells kept for reuse and
-//! freed, a block opened, and what a failure path releases before it leaves.
+//! freed, a flat value opened into its parts, and what a failure path releases before it leaves.
 
 import std.bytes (ascii_of_int)
 import parsing (span_between)
 import types (TyCon)
-import emit.tir (Rep, RInt, RWord, RMaybe, RTagged, RFlat, RCases, RToken, Leaf, Var, Inst, Inc,
-                 Dec, Reset, Free, Opened, AInt, counted)
+import emit.tir (Rep, RInt, RWord, RMaybe, RTagged, RFlat, RToken, Var, Inst, Inc, Dec, Reset, Free,
+                 Opened, AInt, counted)
+import emit.verify (parts_of)
 import emit.pieces (spelled)
 import emit.print.text (Printing, Place, line, name_of, named, printing)
 
@@ -14,13 +15,14 @@ import emit.print.text (Printing, Place, line, name_of, named, printing)
 pub fn released(pr: Printing, unwind: List<Var>) -> Bytes =
   Bytes::join(unwind.map(|v: Var| let_go(name_of(pr, v), v.rep)).filter(|t: Bytes| t != b""), b" ")
 
-/// `i`, one of `Inc`, `Dec`, `Reset`, `Free` and `Opened`.
+/// `i`, one of `Inc`, `Dec`, `Reset`, `Free` and `Opened`. An opened value's words are its parts'
+/// C locals under their own variables, so opening one writes no C.
 pub fn count_printed(p: Place, pr: Printing, i: Inst) -> Printing =
   match i {
     Inc(n) -> {
-      let x = name_of(pr, n.var);
       let once = Bytes::join(
-        counted_parts(x, n.var.rep).map(|c: Bytes| Bytes::concat_all([b"ply_inc(", c, b");"])),
+        counted_parts(name_of(pr, n.var), n.var.rep).map(|c: Bytes|
+          Bytes::concat_all([b"ply_inc(", c, b");"])),
         b" ",
       );
       line(pr, p.depth, Bytes::join(range(0, n.n).map(|_: Int| once), b" "))
@@ -48,7 +50,17 @@ pub fn count_printed(p: Place, pr: Printing, i: Inst) -> Printing =
       )
     },
     Free(r) -> line(pr, p.depth, let_go(name_of(pr, r.of), r.of.rep)),
-    Opened(_) -> line(pr, p.depth, b"/* a block opened, which nothing writes yet */"),
+    Opened(o) -> {
+      let names = part_names(name_of(pr, o.of), o.of.rep);
+      {
+        ..pr,
+        names: range(0, o.words.len()).fold(pr.names, |m: Map<Int, Bytes>, k: Int|
+          match o.words.at(k) {
+            Some(w) -> match names.at(k) { Some(n) -> m.insert(w.id, n), None -> m },
+            None -> m,
+          }),
+      }
+    },
     _ -> pr,
   }
 
@@ -60,26 +72,23 @@ fn let_go(x: Bytes, r: Rep) -> Bytes =
     b" ",
   )
 
-/// The C names of the parts of a value named `x` held as `r` that hold a count: a flat value's
-/// counted leaves and then its word, a sum's counted leaves, any other counted value itself.
-fn counted_parts(x: Bytes, r: Rep) -> List<Bytes> = {
-  let parts = parts_of(r);
-  if parts.len() == 1 { if counted(r) { [x] } else { [] } } else {
-    range(0, parts.len()).filter(|k: Int| parts.at(k) == Some(true)).map(|k: Int|
-      Bytes::concat_all([x, b"_", ascii_of_int(k)]))
-  }
+/// The C name of each part of a value named `x` held as `r`: `x` where it is one, else `x_k`.
+fn part_names(x: Bytes, r: Rep) -> List<Bytes> = {
+  let n = parts_of(r).len();
+  if n == 1 { [x] } else { range(0, n).map(|k: Int| Bytes::concat_all([x, b"_", ascii_of_int(k)])) }
 }
 
-/// Whether each C value a value held as `r` is laid in holds a count: a flat value's leaves and then
-/// its word, a sum's index and then each case's leaves, one for anything else.
-fn parts_of(r: Rep) -> List<Bool> =
-  match r {
-    RFlat(leaves) -> leaves.map(|l: Leaf| counted(l.rep)).push(true),
-    RCases(c) ->
-      c.cases.fold([false], |acc: List<Bool>, x: { name: Bytes, leaves: List<Leaf> }|
-        acc.concat(x.leaves.map(|l: Leaf| counted(l.rep)))),
-    _ -> [counted(r)],
-  }
+/// The C names of the parts of a value named `x` held as `r` that hold a count.
+fn counted_parts(x: Bytes, r: Rep) -> List<Bytes> = {
+  let parts = parts_of(r);
+  let names = part_names(x, r);
+  range(0, parts.len()).fold([], |acc: List<Bytes>, k: Int|
+    match parts.at(k) {
+      Some(part) -> if counted(part) { match names.at(k) { Some(n) -> acc.push(n), None -> acc } }
+      else { acc },
+      None -> acc,
+    })
+}
 
 fn local(id: Int, rep: Rep) -> Var = { id: id, ty: TyCon({ name: b"T", args: [] }), rep: rep }
 
@@ -125,6 +134,20 @@ test "a reset keeps a block held only here as its token, and a token no make too
     printed(pr, Reset({ token: token, of: x })),
     b"  Word t1 = ply_reset_flat(p0); if (!t1) t1 = rt_reset_p(ctx, p0);\n",
   );
-  assert_eq(printed({ ..reset, out: [] }, Free({ of: token, bytes: AInt(16) })), b"  ply_dec(ctx, t1);\n");
+  assert_eq(
+    printed({ ..reset, out: [] }, Free({ of: token, bytes: AInt(16) })),
+    b"  ply_dec(ctx, t1);\n",
+  );
   assert_eq(released(reset, [x, token]), b"ply_dec(ctx, p0); ply_dec(ctx, t1);")
+}
+
+test "a flat value opened writes no C, and each word is the part it was" {
+  let flat = local(0, RFlat([{ name: b"a", rep: RWord }, { name: b"b", rep: RInt }]));
+  let words = [local(1, RWord), local(2, RInt), local(3, RWord)];
+  let pr = printing(Map::new().insert(0, b"p0"));
+  let opened = count_printed(place(), pr, Opened({ of: flat, words: words }));
+  assert_eq(opened.out, []);
+  assert_eq(words.map(|w: Var| name_of(opened, w)), [b"p0_0", b"p0_1", b"p0_2"]);
+  // Letting go of the first word and the record's word lets go of what the value held.
+  assert_eq(released(opened, [words.get(0), words.get(2)]), released(pr, [flat]))
 }
