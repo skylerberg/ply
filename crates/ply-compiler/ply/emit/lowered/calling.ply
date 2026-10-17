@@ -3,9 +3,9 @@
 
 import resolve (qualify)
 import emit.keys (Named, Root, Generic)
-import emit.tir (Rep, RInt, RWord, Var, Arg, AVar, Val, Call, Apply, Make, Get, Pack, Op, OCalling,
-                 MClosure, PCapture, TTag, Inst, Let, Do, If, Case, Loop, Next, Done, Restart,
-                 Enter, Block, Fn, Member, Closure, Declined, Family, Spine, Data, Calling,
+import emit.tir (Rep, RInt, RWord, RFlat, Var, Arg, AVar, Val, Call, Apply, Make, Get, Pack, Op,
+                 OCalling, MClosure, PCapture, TTag, Inst, Let, Do, If, Case, Loop, Next, Done,
+                 Restart, Enter, Block, Fn, Member, Closure, Declined, Family, Spine, Data, Calling,
                  Matching, Handling, Scalars, Containers)
 import emit.tir.calling (EntryValue, ConstantRead, Ticked)
 import emit.lower (lowered_fn, lowered_group)
@@ -14,7 +14,9 @@ import emit.lower.calling (known_body)
 import emit.verify (verified)
 import emit.own (owned)
 import emit (symbol_of)
-import emit.compare (Program, program_of, answered_today, today_text, printed_text)
+import emit.compare (Program, program_of, answered_today, today_text, printed_text, normalised,
+                     past_counts)
+import std.bytes (ascii_of_int)
 
 fn corpus() -> Bytes =
   Bytes::concat_all([
@@ -43,6 +45,9 @@ fn corpus() -> Bytes =
     b"fn stepped(n: Int, k: Int) -> Int / {abort.raise} = iterate(0, n, |i: Int| step_of(i + k))\n",
     b"fn even(n: Int) -> Bool / {diverges} = if n == 0 { true } else { odd(n - 1) }\n",
     b"fn odd(n: Int) -> Bool / {diverges} = if n == 0 { false } else { even(n - 1) }\n",
+    b"fn pair(a: Int, b: Int) -> { x: Int, y: Int } = { x: a, y: b }\n",
+    b"fn swapped(p: { x: Int, y: Int }) -> { x: Int, y: Int } = pair(p.y, p.x)\n",
+    b"fn summed(a: Int) -> Int = { let p = swapped(pair(a, 1)); p.x + p.y }\n",
   ])
 
 fn names() -> List<Bytes> =
@@ -72,6 +77,9 @@ fn names() -> List<Bytes> =
     b"stepped",
     b"even",
     b"odd",
+    b"pair",
+    b"swapped",
+    b"summed",
   ]
 
 /// Root `m.<name>` of `p` lowered as a build lowers it: its body after `known_body`.
@@ -150,6 +158,28 @@ test "a call of a definition hands its arguments as the callee carries them" {
         vals_in(f.body).fold([], |acc: List<List<Rep>>, v: Val|
           match v { Call(c) -> acc.push(c.conv.reps.push(c.conv.answer)), _ -> acc }),
         [[RWord, RWord]],
+      ),
+  }
+}
+
+test "a small record crosses a call as its fields and its word, both ways" {
+  match form(b"summed") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) ->
+      assert_eq(
+        vals_in(f.body).fold([], |acc: List<{ reps: List<Rep>, answer: Rep }>, v: Val|
+          match v {
+            Call(c) -> if c.callee == Root(Named(b"m.swapped")) {
+              acc.push({ reps: c.conv.reps, answer: c.conv.answer })
+            } else { acc },
+            _ -> acc,
+          }),
+        [
+          {
+            reps: [RFlat([{ name: b"x", rep: RInt }, { name: b"y", rep: RInt }])],
+            answer: RFlat([{ name: b"x", rep: RInt }, { name: b"y", rep: RInt }]),
+          },
+        ],
       ),
   }
 }
@@ -367,7 +397,7 @@ test "a step's loop prints as a C for over its state, spending its budget before
   match form(b"stepped") {
     Err(why) -> assert_eq(why, b""),
     Ok(f) -> {
-      let lines = spelled(printed_fn(f).pieces).split(b"\n").map(|l: Bytes|
+      let lines = printed_text(f).split(b"\n").map(|l: Bytes|
         l.slice(
           range(0, l.len()).fold(l.len(), |at: Int, i: Int|
             if at < l.len() || l.at(i) == 32 { at } else { i }),
@@ -464,6 +494,119 @@ test "a tail group is one root whose case runs each member, a tail call into ano
       assert_eq(
         insts_in(f.body).filter(|i: Inst| match i { Restart(_) -> true, _ -> false }).len(),
         0,
+      )
+    },
+  }
+}
+
+/// A root's C cut into its C functions, each ending at its closing brace: each numbers its
+/// temporaries and names its locals apart, so each is read alone.
+fn by_function(text: Bytes) -> List<Bytes> / {abort.raise} = {
+  let cut = text.split(b"\n").fold(
+    { done: [], open: [] },
+    |acc: { done: List<Bytes>, open: List<Bytes> }, l: Bytes|
+      if l == b"}" { { done: acc.done.push(Bytes::join(acc.open.push(l), b"\n")), open: [] } }
+      else { { ..acc, open: acc.open.push(l) } },
+  );
+  if cut.open.len() == 0 { cut.done } else { cut.done.push(Bytes::join(cut.open, b"\n")) }
+}
+
+/// Where two readings of one root's C first differ: the line of each, by its place.
+fn first_difference(today: List<Bytes>, form: List<Bytes>) -> Bytes / {abort.raise} =
+  match range(0, if today.len() > form.len() { today.len() } else { form.len() }).fold(
+      None,
+      |acc: Option<Int>, i: Int|
+        match acc {
+          Some(_) -> acc,
+          None -> if today.at(i) == form.at(i) { None } else { Some(i) },
+        },
+    ) {
+    None -> b"",
+    Some(i) ->
+      Bytes::concat_all([
+        b"line ",
+        ascii_of_int(i),
+        b"\n  today: ",
+        match today.at(i) { Some(l) -> l, None -> b"(none)" },
+        b"\n  form:  ",
+        match form.at(i) { Some(l) -> l, None -> b"(none)" },
+        b"\n",
+      ]),
+  }
+
+test "the corpus's C reads as today's emitter's, but for the roots named with why" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let today = answered_today(p, names());
+      let read = |t: Bytes|
+        by_function(past_counts(t)).fold([], |acc: List<Bytes>, f: Bytes|
+          acc.concat(normalised(f)));
+      let compared = names().filter(|n: Bytes| n != b"even" && n != b"odd").fold(
+        [],
+        |acc: List<{ name: Bytes, at: Bytes }>, n: Bytes|
+          match lowered_as_built(p, n) {
+            Err(_) -> acc,
+            Ok(f) -> {
+              let at = first_difference(read(today_text(today, n)), read(printed_text(owned(f))));
+              if at == b"" { acc } else { acc.push({ name: n, at: at }) }
+            },
+          },
+      );
+      let grouped = match group_form([b"even", b"odd"]) {
+        Ok(g) -> first_difference(read(today_text(today, b"even")), read(printed_text(owned(g)))),
+        Err(why) -> why,
+      };
+      let differing = if grouped == b"" { compared }
+      else { compared.push({ name: b"even", at: grouped }) };
+      // Each root that differs on purpose, and why.
+      let boxed = b"a value boxed is tested for failure at once, where today's emitter leaves it to the next test";
+      let expected = [
+        { name: b"adder", why: boxed },
+        { name: b"nested", why: boxed },
+        // And: the body run in place prints at its caller's depth, where today's indents it.
+        { name: b"local", why: boxed },
+        { name: b"kept", why: boxed },
+        { name: b"lends", why: boxed },
+        {
+          name: b"steps",
+          why: b"the step is the form's `Loop`, its state and budget variables of the loop; today's fused loop holds them by hand",
+        },
+        {
+          name: b"step_of",
+          why: b"a constructor made and tested at once, where today's emitter holds it back",
+        },
+        {
+          name: b"stepped",
+          why: b"the step is the form's `Loop`, its state and budget variables of the loop",
+        },
+        {
+          name: b"pair",
+          why: b"a record answer is written back part by part, where today's emitter holds the record back in locals declared first",
+        },
+        {
+          name: b"swapped",
+          why: b"a record parameter's word is named `p<i>_<n>`, today's `p<i>_w`",
+        },
+        {
+          name: b"summed",
+          why: b"a record a call answers comes back through its parts' pointers, where today's emitter holds it back in locals declared first",
+        },
+        // The rest of a group's switch answers through a `Return`, and a member's answer is made its
+        // word in the return, where today's binds it first.
+        { name: b"even", why: b"a member's answer is made its word in the return" },
+      ];
+      assert(
+        differing.map(|d: { name: Bytes, at: Bytes }| d.name)
+          == expected.map(|e: { name: Bytes, why: Bytes }| e.name),
+        Some(
+          String::of_bytes(
+            Bytes::concat_all(
+              differing.map(|d: { name: Bytes, at: Bytes }|
+                Bytes::concat_all([b"=== ", d.name, b" ", d.at])),
+            ),
+          ),
+        ),
       )
     },
   }
