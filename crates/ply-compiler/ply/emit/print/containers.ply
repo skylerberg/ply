@@ -1,81 +1,452 @@
 //! Lists and arrays made, and the operations on a container's cells, printed.
 
 import std.bytes (ascii_of_int)
+import layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt, NodeLen, LeafAt,
+               KidAt, TailPush, TailSet, LeafSet, TailStart, NewBranch, MapRoot, NodeCount,
+               MapHeight, NodeKey, NodeValue, NodeKid, KidMax, KidSize, NewLeaf, NewMapBranch,
+               PairPut, PairSet, KidBack, KidPut, KidDrop, layouts)
 import emit (builtin_helper)
 import emit.tir (Var, Arg, Made, MList, Uses, rep_of_arg)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined)
-import emit.print.text (Printing, Place, line, temp, arg_text, assigned, site, check)
-import emit.print.made (c_type, as_word)
+import emit.print.text (Printing, Place, line, temp, name_of, arg_text, assigned, site, check)
+import emit.print.made (c_type, as_word, word_as)
 
 /// A list or an array made of `m.args`.
-pub fn contained(p: Place, pr: Printing, into: Option<Var>, m: { made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> }) -> Printing / {abort.raise} =
+pub fn contained(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  m: { made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> },
+) -> Printing / {abort.raise} =
   match m.made {
     MList(_) -> from_words(p, pr, into, b"rt_list_p", m.args),
     _ -> line(pr, p.depth, b"/* an array made, which this printer does not write yet */"),
   }
 
 /// Operation `op` on a container's cells over `args`.
-pub fn container_op(p: Place, pr: Printing, into: Option<Var>, op: ContainerOp, args: List<Arg>, uses: Uses) -> Printing / {abort.raise} = {
+pub fn container_op(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  op: ContainerOp,
+  args: List<Arg>,
+  uses: Uses,
+) -> Printing / {abort.raise} = {
   let object = match args.at(0) { Some(a) -> arg_text(pr, a), None -> b"0" };
   let index = match args.at(1) { Some(a) -> arg_text(pr, a), None -> b"0" };
   match into {
     None -> line(pr, p.depth, b"/* a container's operation whose answer goes unread */"),
     Some(v) -> match op {
-      Length -> assigned(pr, p.depth, v, c_type(v.rep), Bytes::concat_all([b"(int64_t)ply_obj(", object, b")->len"])),
-      Elements -> assigned(pr, p.depth, v, c_type(v.rep), Bytes::concat_all([b"ply_array_len(", object, b")"])),
+      Length ->
+        assigned(
+          pr,
+          p.depth,
+          v,
+          c_type(v.rep),
+          Bytes::concat_all([b"(int64_t)ply_obj(", object, b")->len"]),
+        ),
+      Elements ->
+        assigned(
+          pr,
+          p.depth,
+          v,
+          c_type(v.rep),
+          Bytes::concat_all([b"ply_array_len(", object, b")"]),
+        ),
       ByteAt -> {
-        let tested = bounded(p, site(p, pr), b"Bytes::at", object, args, Bytes::concat_all([
-          b"(uint64_t)",
-          index,
-          b" >= (uint64_t)ply_obj(",
+        let tested = bounded(
+          p,
+          site(p, pr),
+          b"Bytes::at",
           object,
-          b")->len",
-        ]));
-        assigned(tested, p.depth, v, c_type(v.rep), Bytes::concat_all([b"(int64_t)(ply_bytes(", object, b"))[", index, b"]"]))
+          args,
+          Bytes::concat_all([b"(uint64_t)", index, b" >= (uint64_t)ply_obj(", object, b")->len"]),
+        );
+        assigned(
+          tested,
+          p.depth,
+          v,
+          c_type(v.rep),
+          Bytes::concat_all([b"(int64_t)(ply_bytes(", object, b"))[", index, b"]"]),
+        )
       },
       U32At -> {
         // Tested against the length less four: four added to a negative index could wrap into range.
-        let tested = bounded(p, site(p, pr), b"Bytes::u32_le", object, args, Bytes::concat_all([
-          b"(uint64_t)ply_obj(",
+        let tested = bounded(
+          p,
+          site(p, pr),
+          b"Bytes::u32_le",
           object,
-          b")->len < 4 || (uint64_t)",
-          index,
-          b" > (uint64_t)ply_obj(",
-          object,
-          b")->len - 4",
-        ]));
+          args,
+          Bytes::concat_all([
+            b"(uint64_t)ply_obj(",
+            object,
+            b")->len < 4 || (uint64_t)",
+            index,
+            b" > (uint64_t)ply_obj(",
+            object,
+            b")->len - 4",
+          ]),
+        );
         let w = temp(tested);
-        let loaded = line(w.pr, p.depth, Bytes::concat_all([
-          b"uint32_t ",
-          w.name,
-          b"; memcpy(&",
-          w.name,
-          b", ply_bytes(",
-          object,
-          b") + ",
-          index,
-          b", 4);",
-        ]));
+        let loaded = line(
+          w.pr,
+          p.depth,
+          Bytes::concat_all([
+            b"uint32_t ",
+            w.name,
+            b"; memcpy(&",
+            w.name,
+            b", ply_bytes(",
+            object,
+            b") + ",
+            index,
+            b", 4);",
+          ]),
+        );
         assigned(loaded, p.depth, v, c_type(v.rep), Bytes::concat_all([b"ply_le32(", w.name, b")"]))
       },
       Joined -> from_words(p, pr, into, b"rt_bytes_join_p", args),
-      Laid(_) -> line(pr, p.depth, b"/* an extern written in place, which this printer does not write yet */"),
+      Laid(i) -> laid_printed(p, pr, v, i, args),
     },
   }
 }
 
+/// Extern `op` written over the objects `layouts` lays out, answering into `v`. A read answers
+/// what the object holds without a count of its own, an item as `v` holds it; a write takes the
+/// object into `v`, made writable where another holds it too, and answers it.
+fn laid_printed(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Intrinsic,
+  args: List<Arg>,
+) -> Printing / {abort.raise} = {
+  let laid = layouts();
+  let operand = |k: Int| match args.at(k) { Some(a) -> arg_text(pr, a), None -> b"0" };
+  let o = operand(0);
+  let i = operand(1);
+  let raw = |e: Bytes| assigned(pr, p.depth, v, c_type(v.rep), e);
+  let read = |slot: Bytes| raw(word_as(slot, v.rep));
+  let header = |w: Bytes, field: Bytes| Bytes::concat_all([b"ply_obj(", w, b")->", field]);
+  let header_int = |field: Bytes| raw(Bytes::concat_all([b"(int64_t)", header(o, field)]));
+  let made = |kind: Int|
+    assigned(
+      pr,
+      p.depth,
+      v,
+      c_type(v.rep),
+      Bytes::concat_all([b"rt_node_p(ctx, ", ascii_of_int(kind), b")"]),
+    );
+  let held = assigned(pr, p.depth, v, c_type(v.rep), o);
+  let a = name_of(held, v);
+  let at = |k: Bytes| slot_of(a, k);
+  let written = |text: Bytes| line(held, p.depth, text);
+  let node_writable = Bytes::concat_all([a, b" = rt_node_writable_p(ctx, ", a, b");"]);
+  let shared = Bytes::concat_all([b"if (", header(a, b"rc"), b" != 1) ", node_writable, b" "]);
+  let shifted = |from: Bytes, n: Bytes, by: Bytes|
+    Bytes::concat_all([
+      b"memmove(&",
+      at(Bytes::concat_all([from, b" + ", by])),
+      b", &",
+      at(from),
+      b", (size_t)(",
+      n,
+      b") * sizeof(Word)); ",
+    ]);
+  let list_writable = |room: Bytes|
+    Bytes::concat_all([a, b" = rt_list_writable_p(ctx, ", a, b", ", room, b");"]);
+  let tail = |k: Bytes| at(past(laid.list.tail, k));
+  // A map's index is parenthesised where it is written into a larger index.
+  let index = Bytes::concat_all([b"(", i, b")"]);
+  let keys = |k: Bytes| past(laid.tree.keys, k);
+  let sizes = |k: Bytes| past(laid.tree.sizes, k);
+  let after = |less: Bytes|
+    Bytes::concat_all([b"(int64_t)", header(a, b"len"), b" - ", index, less]);
+  let pairs_writable = counted_writable(
+    a,
+    node_writable,
+    Bytes::concat_all([b"2 * (int64_t)", header(a, b"len")]),
+  );
+  let replaced = |q: Printing, writable: Bytes, slot: Bytes, x: Bytes| {
+    let old = temp(q);
+    line(
+      old.pr,
+      p.depth,
+      Bytes::concat_all([
+        writable,
+        b" Word ",
+        old.name,
+        b" = ",
+        slot,
+        b"; ",
+        slot,
+        b" = ",
+        x,
+        b"; ply_dec(ctx, ",
+        old.name,
+        b");",
+      ]),
+    )
+  };
+  match op {
+    OfList(ListStart) -> header_int(laid.list.start),
+    OfList(TailLen) -> header_int(laid.list.tail_len),
+    OfList(NodeLen) -> header_int(b"len"),
+    OfList(ListRoot) -> read(slot_of(o, ascii_of_int(laid.list.root))),
+    OfList(TailAt) -> read(slot_of(o, past(laid.list.tail, i))),
+    OfList(LeafAt) -> read(slot_of(o, past(0, i))),
+    OfList(KidAt) -> read(slot_of(o, past(0, i))),
+    OfList(NewBranch) -> made(laid.trie.branch),
+    OfList(TailPush) -> {
+      let room = header(a, laid.list.room);
+      let grown = written(
+        Bytes::concat_all([
+          b"{ int in_place = ",
+          header(a, b"rc"),
+          b" == 1; int64_t n = ",
+          header(a, laid.list.tail_len),
+          b"; if (!in_place || n == ",
+          room,
+          b") ",
+          list_writable(Bytes::concat_all([b"n == ", room, b" ? 2 * ", room, b" : ", room])),
+          b" rt_note_update_p(ctx, in_place, in_place ? 0 : n); }",
+        ]),
+      );
+      line(
+        grown,
+        p.depth,
+        Bytes::concat_all([
+          tail(header(a, laid.list.tail_len)),
+          b" = ",
+          operand(1),
+          b"; ",
+          header(a, laid.list.tail_len),
+          b" += 1; ",
+          header(a, b"len"),
+          b" += 1;",
+        ]),
+      )
+    },
+    OfList(TailStart) ->
+      written(
+        Bytes::concat_all([
+          tail(b"0"),
+          b" = ",
+          operand(1),
+          b"; ",
+          header(a, laid.list.tail_len),
+          b" = 1; ",
+          header(a, b"len"),
+          b" += 1;",
+        ]),
+      ),
+    OfList(TailSet) ->
+      replaced(
+        held,
+        counted_writable(
+          a,
+          list_writable(header(a, laid.list.room)),
+          header(a, laid.list.tail_len),
+        ),
+        tail(i),
+        operand(2),
+      ),
+    OfList(LeafSet) ->
+      replaced(held, counted_writable(a, node_writable, header(a, b"len")), at(i), operand(2)),
+    OfMap(MapRoot) -> read(slot_of(o, ascii_of_int(laid.map.root))),
+    OfMap(MapHeight) -> header_int(laid.map.height),
+    OfMap(NodeCount) -> header_int(b"len"),
+    OfMap(NodeKey) -> read(slot_of(o, Bytes::concat_all([b"2 * (", i, b")"]))),
+    OfMap(NodeValue) -> read(slot_of(o, Bytes::concat_all([b"2 * (", i, b") + 1"]))),
+    OfMap(NodeKid) -> read(slot_of(o, past(0, i))),
+    OfMap(KidMax) -> read(slot_of(o, past(laid.tree.keys, i))),
+    OfMap(KidSize) ->
+      raw(Bytes::concat_all([b"ply_imm_value(", slot_of(o, past(laid.tree.sizes, i)), b")"])),
+    OfMap(NewLeaf) -> made(laid.tree.leaf),
+    OfMap(NewMapBranch) -> made(laid.tree.branch),
+    OfMap(PairPut) -> {
+      let pair = Bytes::concat_all([b"2 * ", index]);
+      written(
+        Bytes::concat_all([
+          pairs_writable,
+          b" ",
+          shifted(pair, Bytes::concat_all([b"2 * (", after(b""), b")"]), b"2"),
+          at(pair),
+          b" = ",
+          operand(2),
+          b"; ",
+          at(pair.concat(b" + 1")),
+          b" = ",
+          operand(3),
+          b"; ",
+          header(a, b"len"),
+          b" += 1;",
+        ]),
+      )
+    },
+    OfMap(PairSet) -> {
+      let pair = Bytes::concat_all([b"2 * ", index]);
+      let old_key = temp(held);
+      let old_value = temp(old_key.pr);
+      line(
+        old_value.pr,
+        p.depth,
+        Bytes::concat_all([
+          pairs_writable,
+          b" Word ",
+          old_key.name,
+          b" = ",
+          at(pair),
+          b"; Word ",
+          old_value.name,
+          b" = ",
+          at(pair.concat(b" + 1")),
+          b"; ",
+          at(pair),
+          b" = ",
+          operand(2),
+          b"; ",
+          at(pair.concat(b" + 1")),
+          b" = ",
+          operand(3),
+          b"; ply_dec(ctx, ",
+          old_key.name,
+          b"); ply_dec(ctx, ",
+          old_value.name,
+          b");",
+        ]),
+      )
+    },
+    OfMap(KidBack) -> {
+      let old_max = temp(held);
+      line(
+        old_max.pr,
+        p.depth,
+        Bytes::concat_all([
+          shared,
+          b"Word ",
+          old_max.name,
+          b" = ",
+          at(keys(index)),
+          b"; ",
+          at(keys(index)),
+          b" = ",
+          operand(3),
+          b"; ply_dec(ctx, ",
+          old_max.name,
+          b"); ",
+          at(index),
+          b" = ",
+          operand(2),
+          b"; ",
+          at(sizes(index)),
+          b" = ply_imm(",
+          operand(4),
+          b");",
+        ]),
+      )
+    },
+    OfMap(KidPut) -> {
+      let n = after(b"");
+      written(
+        Bytes::concat_all([
+          shared,
+          shifted(index, n, b"1"),
+          shifted(keys(index), n, b"1"),
+          shifted(sizes(index), n, b"1"),
+          at(index),
+          b" = ",
+          operand(2),
+          b"; ",
+          at(keys(index)),
+          b" = ",
+          operand(3),
+          b"; ",
+          at(sizes(index)),
+          b" = ply_imm(",
+          operand(4),
+          b"); ",
+          header(a, b"len"),
+          b" += 1;",
+        ]),
+      )
+    },
+    OfMap(KidDrop) -> {
+      let n = after(b" - 1");
+      let next = index.concat(b" + 1");
+      written(
+        Bytes::concat_all([
+          shared,
+          b"ply_dec(ctx, ",
+          at(index),
+          b"); ply_dec(ctx, ",
+          at(keys(index)),
+          b"); ",
+          shifted(next, n, b"-1"),
+          shifted(keys(next), n, b"-1"),
+          shifted(sizes(next), n, b"-1"),
+          header(a, b"len"),
+          b" -= 1;",
+        ]),
+      )
+    },
+    _ ->
+      line(
+        pr,
+        p.depth,
+        b"/* a write in place answering a record, which this printer does not write yet */",
+      ),
+  }
+}
+
+fn slot_of(w: Bytes, at: Bytes) -> Bytes = Bytes::concat_all([b"ply_words(", w, b")[", at, b"]"])
+
+/// `at` words past the word `from`, as C reads it.
+fn past(from: Int, at: Bytes) -> Bytes = Bytes::concat_all([ascii_of_int(from), b" + (", at, b")"])
+
+/// Written ahead of a write of an item of the object `a`: `a` held once, by `writable`, its contents
+/// copied where it was not, and the write counted as in place or of a copy of `copied` words.
+fn counted_writable(a: Bytes, writable: Bytes, copied: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"{ int in_place = ply_obj(",
+    a,
+    b")->rc == 1; if (!in_place) ",
+    writable,
+    b" rt_note_update_p(ctx, in_place, in_place ? 0 : ",
+    copied,
+    b"); }",
+  ])
+
 /// The runtime's `make` over `words`, which it takes, laid in an array of them: C has no empty
 /// initialiser, so an empty one still declares a word.
-fn from_words(p: Place, pr: Printing, into: Option<Var>, make: Bytes, words: List<Arg>) -> Printing / {abort.raise} = {
+fn from_words(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  make: Bytes,
+  words: List<Arg>,
+) -> Printing / {abort.raise} = {
   let arr = temp(pr);
-  let laid = line(arr.pr, p.depth, Bytes::concat_all([
-    b"Word ",
+  let laid = line(
+    arr.pr,
+    p.depth,
+    Bytes::concat_all([
+      b"Word ",
+      arr.name,
+      b"[] = {",
+      if words.len() == 0 { b"0" } else { Bytes::join(words.map(|a: Arg| arg_text(pr, a)), b", ") },
+      b"};",
+    ]),
+  );
+  let call = Bytes::concat_all([
+    make,
+    b"(ctx, (Word)(intptr_t)",
     arr.name,
-    b"[] = {",
-    if words.len() == 0 { b"0" } else { Bytes::join(words.map(|a: Arg| arg_text(pr, a)), b", ") },
-    b"};",
-  ]));
-  let call = Bytes::concat_all([make, b"(ctx, (Word)(intptr_t)", arr.name, b", ", ascii_of_int(words.len()), b")"]);
+    b", ",
+    ascii_of_int(words.len()),
+    b")",
+  ]);
   check(p, match into {
     Some(v) -> assigned(laid, p.depth, v, c_type(v.rep), call),
     None -> line(laid, p.depth, call.concat(b";")),
@@ -84,24 +455,32 @@ fn from_words(p: Place, pr: Printing, into: Option<Var>, make: Bytes, words: Lis
 
 /// Where `outside` holds, the runtime's own call of builtin `name` over the object and the index as
 /// a word raises what the read would, and the function leaves.
-fn bounded(p: Place, pr: Printing, name: Bytes, object: Bytes, args: List<Arg>, outside: Bytes) -> Printing / {abort.raise} = {
-  let index = match args.at(1) {
-    Some(a) -> as_word(arg_text(pr, a), rep_of_arg(a)),
-    None -> b"0",
-  };
-  line(pr, p.depth, Bytes::concat_all([
-    b"if (",
-    outside,
-    b") { ply_inc(",
-    object,
-    b"); ",
-    builtin_helper(name),
-    b"_p(ctx, ",
-    object,
-    b", ",
-    index,
-    b"); ",
-    p.leave,
-    b" }",
-  ]))
+fn bounded(
+  p: Place,
+  pr: Printing,
+  name: Bytes,
+  object: Bytes,
+  args: List<Arg>,
+  outside: Bytes,
+) -> Printing / {abort.raise} = {
+  let index = match args.at(1) { Some(a) -> as_word(arg_text(pr, a), rep_of_arg(a)), None -> b"0" };
+  line(
+    pr,
+    p.depth,
+    Bytes::concat_all([
+      b"if (",
+      outside,
+      b") { ply_inc(",
+      object,
+      b"); ",
+      builtin_helper(name),
+      b"_p(ctx, ",
+      object,
+      b", ",
+      index,
+      b"); ",
+      p.leave,
+      b" }",
+    ]),
+  )
 }
