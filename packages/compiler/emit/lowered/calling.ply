@@ -7,11 +7,11 @@ import check.types (Type, TyCon, int_type)
 import emit.keys (Named, Root, Generic)
 import emit.reps (typed_at, BoundLambda)
 import emit.typing (unknown_type)
-import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, Var, Arg, AVar, Val, Call, Apply, Make,
-                 Get, Pack, Prim, Native, Op, OCalling, MClosure, MCtor, PCapture, TTag, Inst, Let,
-                 Do, If, Case, Match, Loop, Next, Done, Restart, Enter, Return, Sited, Block, Fn,
-                 Member, Closure, Declined, Family, Spine, Data, Calling, Matching, Handling,
-                 Scalars, Containers, RNum, TInt, TRange, rep_of_arg)
+import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSlice, Var, Arg, AVar, AInt, Val, Call,
+                 Apply, Make, Get, Pack, Gathered, Prim, Native, Op, OCalling, MClosure, MCtor,
+                 PCapture, TTag, Inst, Let, Do, If, Case, Match, Loop, Next, Done, Restart, Enter,
+                 Return, Sited, Block, Fn, Member, Closure, Declined, Family, Spine, Data, Calling,
+                 Matching, Handling, Scalars, Containers, RNum, TInt, TRange, rep_of_arg)
 import emit.tir.calling (EntryValue, ConstantRead, Ticked)
 import emit.lower (lowered_fn, lowered_group)
 import emit.lower.base (GroupMember)
@@ -75,6 +75,14 @@ fn corpus() -> Bytes =
     b"fn guarded(whole: Bool) -> (Int) -> Int = |y: Int| match y { n if whole -> n, n -> 0 - n }\n",
     b"fn either(whole: Bool) -> (Int) -> Bool = |y: Int| whole && y > 0\n",
     b"fn picked(whole: Bool) -> (Int) -> Int = |y: Int| match whole { true -> y, false -> 0 - y }\n",
+    b"fn walked_to(xs: List<Int>, from: Int) -> Int / {abort.raise} = iterate(from, 100, |i: Int| match xs.at(i) { Some(x) -> if x > 0 { Continue(i + 1) } else { Stop(i) }, None -> Stop(i) })\n",
+    b"fn has(xs: List<Int>, x: Int) -> Bool = match xs { [] -> false, [y, ..rest] -> if y == x { true } else { has(rest, x) } }\n",
+    b"fn pair_sums(xs: List<Int>, acc: Int) -> Int = match xs { [a, b, ..rest] -> pair_sums(rest, acc + a * b), [a] -> acc + a, [] -> acc }\n",
+    b"fn lengths(xs: List<Int>, acc: List<Int>) -> List<Int> = match xs { [] -> acc, [_, ..rest] -> lengths(rest, acc.push(rest.len())) }\n",
+    b"fn again(xs: List<Int>, n: Int, acc: Int) -> Int = match xs { [] -> if n > 0 { again([7, 8], n - 1, acc) } else { acc }, [_, ..rest] -> again(rest, n, acc + 1) }\n",
+    b"fn tail_of(xs: List<Int>, n: Int) -> List<Int> = match xs { [] -> [], [y, ..rest] -> if y == n { rest } else { tail_of(rest, n) } }\n",
+    b"fn rest_lens(xs: List<Int>, n: Int) -> List<Int> = match xs { [] -> [], [y, ..rest] -> if y == n { [0].map(|_: Int| rest.len()) } else { rest_lens(rest, n) } }\n",
+    b"fn total(xs: List<Int>) -> Int = match xs { [] -> 0, [y, ..rest] -> y + total(rest) }\n",
   ])
 
 fn names() -> List<Bytes> =
@@ -129,6 +137,14 @@ fn names() -> List<Bytes> =
     b"guarded",
     b"either",
     b"picked",
+    b"walked_to",
+    b"has",
+    b"pair_sums",
+    b"lengths",
+    b"again",
+    b"tail_of",
+    b"rest_lens",
+    b"total",
   ]
 
 /// The corpus's tail groups, each by its members' names.
@@ -488,14 +504,12 @@ test "a step whose every arm makes its Continue or Stop goes on or leaves at onc
       assert_eq(made(f), 0)
     },
   };
-  // A `match` with a guard, as well as an `if`.
-  match form(b"count_down") {
-    Err(why) -> assert_eq(why, b""),
-    Ok(f) -> {
-      assert_eq(looped(f), 1);
-      assert_eq(made(f), 0)
-    },
-  }
+  // A `match` with a guard, as well as an `if`, and an `if` in a `match` arm.
+  [b"count_down", b"walked_to"].fold((), |_: Unit, name: Bytes|
+    match form(name) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(f) -> assert_eq([looped(f), made(f)], [1, 0]),
+    })
 }
 
 test "a step's loop prints as a C for over its state, spending its budget before each pass" {
@@ -920,6 +934,9 @@ fn insts_in(b: Block) -> List<Inst> =
           acc.push(i).concat(insts_in(c.rest)),
           |a: List<Inst>, arm: { when: Int, body: Block }| a.concat(insts_in(arm.body)),
         ),
+      Match(m) ->
+        m.arms.fold(acc.push(i).concat(insts_in(m.rest)), |a: List<Inst>, arm: Block|
+          a.concat(insts_in(arm))),
       _ -> acc.push(i),
     })
 
@@ -1012,6 +1029,68 @@ test "a specialisation, keyed by the name that spells it, restarts its own tail 
         );
         assert_eq(vals_in(f.body).filter(|v: Val| match v { Call(_) -> true, _ -> false }).len(), 0)
       },
+    },
+  }
+}
+
+/// The lists `b` makes of a rest it reads: the runtime's copies of a list's rest, and views made
+/// lists.
+fn rests_made(b: Block) -> Int =
+  vals_in(b).filter(|v: Val|
+    match v {
+      Native(n) -> n.name == b"rt_list_rest_p",
+      Pack(k) -> rep_of_arg(k.arg) == RSlice,
+      _ -> false,
+    }).len(
+  )
+
+test "a list a root walks down by restarting on its rest is a view of the list it was handed, which no step copies" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let walked = |name: Bytes|
+        match lowered_as_built(p, name) {
+          Err(no) -> Err(no.why),
+          Ok(f) ->
+            Ok({
+              held: f.params.map(|v: Var| v.rep).take(1),
+              taken: f.conv.reps.take(1),
+              restarts: insts_in(f.body).any(|i: Inst| match i { Restart(_) -> true, _ -> false }),
+              rests: rests_made(f.body),
+            }),
+        };
+      let viewed = |rests: Int|
+        Ok({ held: [RSlice], taken: [RWord], restarts: true, rests: rests });
+      // A rest read whole is made a list where it is read, and only there.
+      assert_eq([b"has", b"pair_sums", b"lengths", b"again", b"tail_of"].map(walked), [
+        viewed(0),
+        viewed(0),
+        viewed(1),
+        viewed(0),
+        viewed(1),
+      ]);
+      assert_eq(
+        match walked(b"rest_lens") { Ok(w) -> Ok(w.held), Err(why) -> Err(why) },
+        Ok([RSlice]),
+      );
+      // A walk that calls itself other than in tail position takes the list as it is.
+      assert_eq(walked(b"total"), Ok({ held: [RWord], taken: [RWord], restarts: false, rests: 1 }));
+      match lowered_as_built(p, b"again") {
+        Err(no) -> assert_eq(no.why, b""),
+        Ok(f) ->
+          assert(
+            vals_in(f.body).any(|v: Val|
+              match v { Gathered(g) -> g.parts.at(1) == Some(AInt(0)), _ -> false }),
+          ),
+      };
+      match lowered_as_built(p, b"has") {
+        Err(no) -> assert_eq(no.why, b""),
+        Ok(f) ->
+          assert(
+            printed_text(owned(f)).index_of(b"  Word p0_0 = p0; int64_t p0_1 = 0;\n  ply_loop: ")
+              != None,
+          ),
+      }
     },
   }
 }

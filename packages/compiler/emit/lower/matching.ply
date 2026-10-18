@@ -19,7 +19,7 @@ import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, R
 import emit.lower.setting (Setting, ctor_named, ctor_sum)
 import emit.lower.held (held_as, arg_path, arg_held, case_index, case_span)
 import emit.lower.base (Context, Lowering, Lowered, Armed, refuse, fresh, bound_as, emitted, opened,
-                        continued, join_type, set_join, type_of, handed)
+                        continued, join_type, set_join, type_of, handed, unviewed)
 import emit.lower.data (field)
 import emit.lower.scalars (literal, binary)
 import std.pace (paced)
@@ -88,8 +88,8 @@ pub fn let_bound(
 /// `Some(false)` the right, nothing where neither is or `op` is no equality.
 pub fn compared_side(cx: Context, op: Bytes, lhs: Code, rhs: Code) -> Option<Bool> / {abort.raise} =
   if op != b"eq" && op != b"ne" { None }
-  else if constructor(rhs) { Some(false) }
-  else if constructor(lhs) { Some(true) }
+  else if tested_as_built(cx, rhs) { Some(false) }
+  else if tested_as_built(cx, lhs) { Some(true) }
   else { None }
 
 /// Whether `c` is a constructor, or one applied to arguments.
@@ -103,6 +103,22 @@ fn constructor(c: Code) -> Bool / {abort.raise} =
     _ -> false,
   }
 
+/// Whether `c` is a constructor whose value compares as it was built, by its tag and arguments: not
+/// one of a type whose module states a `key`, whose values compare as their keys do.
+fn tested_as_built(cx: Context, c: Code) -> Bool / {abort.raise} =
+  constructor(c)
+    && (match c.node {
+      NVar(v) -> !keyed(cx, v.name),
+      NApp(a) -> match a.func.node { NVar(v) -> !keyed(cx, v.name), _ -> true },
+      _ -> true,
+    })
+
+fn keyed(cx: Context, written: Bytes) -> Bool =
+  match ctor_named(cx.setting, written) {
+    Some(n) -> cx.setting.ctors.keyed.contains(n),
+    None -> false,
+  }
+
 /// What follows the last `.` or `::` of `name`.
 fn last_segment(name: Bytes) -> Bytes / {abort.raise} = {
   let cut = range(0, name.len()).fold(0, |acc: Int, i: Int|
@@ -114,15 +130,15 @@ fn last_segment(name: Bytes) -> Bytes / {abort.raise} = {
 /// comparison cannot test as its pattern would, which it compares by its type's equality instead;
 /// none where `ctor` names a constructor of no arguments.
 pub fn compared_args(cx: Context, ctor: Code) -> List<Bool> / {abort.raise} =
-  match ctor.node { NApp(a) -> a.args.map(|x: Code| !pattern_like(x)), _ -> [] }
+  match ctor.node { NApp(a) -> a.args.map(|x: Code| !pattern_like(cx, x)), _ -> [] }
 
 /// Whether a comparison tests `x` as a pattern would, lowering nothing of it: a literal, a variable,
-/// or a constructor each of whose arguments it tests so.
-fn pattern_like(x: Code) -> Bool / {abort.raise} =
+/// or a constructor compared as it was built each of whose arguments it tests so.
+fn pattern_like(cx: Context, x: Code) -> Bool / {abort.raise} =
   match x.node {
     NLit(_) -> true,
-    NVar(v) -> v.slot != None || constructor(x),
-    NApp(a) -> constructor(x) && a.args.all(|y: Code| pattern_like(y)),
+    NVar(v) -> v.slot != None || tested_as_built(cx, x),
+    NApp(a) -> tested_as_built(cx, x) && a.args.all(|y: Code| pattern_like(cx, y)),
     _ -> false,
   }
 
@@ -163,7 +179,10 @@ fn value_tested(
     NLit(l) -> literal_tested(cx, read.st, read.arg, l, differ),
     NVar(v) -> match v.slot {
       Some(s) -> match read.st.env.get(s) {
-        Some(a) -> equal_to(cx, read, a, differ),
+        Some(a) -> {
+          let w = unviewed({ st: read.st, arg: a }, dummy_span());
+          equal_to(cx, { ..read, st: w.st }, w.arg, differ)
+        },
         None -> refuse(read.st, Matching, b"a comparison with a slot nothing bound").st,
       },
       None -> match ctor_of(cx.setting, type_of(read.arg), v.name) {

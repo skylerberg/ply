@@ -5,12 +5,12 @@
 //! as its operation takes it, and each branch tests a value held as a `Bool`.
 //! A body that breaks one is refused, which fails a build.
 
-import emit.tir (Rep, RWord, RInt, RBool, RNum, RMaybe, RTagged, RFlat, RCases, RToken, Leaf, Var,
-                 Arg, AVar, AInt, ABool, Val, Call, Apply, Make, Pack, Gathered, Native, Op, Get,
-                 Take, Static, Prim, Path, PLeaf, PField, PArg, PNamed, Made, MRecord, MCtor,
-                 MClosure, AZero, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next,
-                 Done, Return, Restart, Enter, Fail, NoArm, Handle, Sited, Inc, Dec, Reset, Free,
-                 Opened, Block, Fn, Rooted, Lambda, Closure, Handed, Given, Lent, Convention,
+import emit.tir (Rep, RWord, RInt, RBool, RNum, RMaybe, RTagged, RFlat, RCases, RSlice, RToken,
+                 Leaf, Var, Arg, AVar, AInt, ABool, Val, Call, Apply, Make, Pack, Gathered, Native,
+                 Op, Get, Take, Static, Prim, Path, PLeaf, PField, PArg, PNamed, Made, MRecord,
+                 MCtor, MClosure, AZero, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop,
+                 Next, Done, Return, Restart, Enter, Fail, NoArm, Handle, Sited, Inc, Dec, Reset,
+                 Free, Opened, Block, Fn, Rooted, Lambda, Closure, Handed, Given, Lent, Convention,
                  Answered, Owns, ReadsOf, Lasts, no_links, counted, operands, answered, fails,
                  used_as, rep_of_arg, var_of, parts_of, Test, TTag, TInt, TRange)
 import emit.keys (Named, Root)
@@ -77,8 +77,10 @@ pub fn verified(f: Fn) -> Option<Bytes> = {
     answer: f.conv.answer,
     member: None,
   };
-  let own = if f.members.len() == 0 { body_fault(f, top, holding_params(f.params, f.conv), f.body) }
-  else {
+  let own = if f.members.len() == 0 {
+    if !held_as_taken(f) { Some(b"a parameter held otherwise than its convention takes it") }
+    else { body_fault(f, top, holding_params(f.params, f.conv), f.body) }
+  } else {
     match f.body {
       [Case(c)] ->
         c.arms.fold(
@@ -150,13 +152,26 @@ fn body_fault(f: Fn, cx: Within, start: Holding, b: Block) -> Option<Bytes> = {
   }
 }
 
-/// Whether `args` are held as member `member` of `f`'s group takes them; a root of its own's restart
-/// is not checked here.
+/// Whether `args` are held as member `member` of `f`'s group takes them, or as a root of its own's
+/// body holds its parameters.
 fn entered_as(f: Fn, member: Option<Int>, args: List<Arg>) -> Bool =
   match member {
-    None -> true,
+    None -> held_as_reps(args, f.params.map(|p: Var| p.rep)),
     Some(i) -> match f.members.at(i) { Some(m) -> held_as_reps(args, m.conv.reps), None -> false },
   }
+
+/// Whether each of a root's parameters is held as its convention takes it, or as a view of the list
+/// whose word it takes.
+fn held_as_taken(f: Fn) -> Bool =
+  f.params.len() == f.conv.reps.len()
+    && range(0, f.params.len()).all(|i: Int|
+      match f.params.at(i) {
+        Some(p) -> match f.conv.reps.at(i) {
+          Some(r) -> p.rep == r || (p.rep == RSlice && r == RWord),
+          None -> false,
+        },
+        None -> false,
+      })
 
 /// How the parameters a `Restart` or an `Enter` hands its arguments to are taken: member
 /// `member`'s of `f`'s group, or `f`'s own.
@@ -426,7 +441,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
           ended(passed(acc, a), Map::new(), b"a count left held where the body answers: v")
         },
         Restart(args) -> if cx.handled { left(acc) } else if !entered_as(f, cx.member, args) {
-          { ..acc, fault: Some(b"a group's member restarted with arguments held otherwise") }
+          { ..acc, fault: Some(b"a restart's arguments held otherwise than its parameters") }
         } else {
           ended(
             handed_on(acc, args, handed_by(f, cx.member)),
@@ -1917,6 +1932,31 @@ test "an operand is held as its operation takes it, and a counted answer is held
   assert_eq(
     verified(root_of([p], [], RWord, [Dec(n), Return(AVar(p))])),
     Some(b"a count let go of a value that holds none: v1"),
+  )
+}
+
+test "a root holds a parameter as its convention takes it or as a view of the list it takes, and restarts on arguments held as its parameters are" {
+  let list = TyCon({ name: b"List", args: [TyCon({ name: b"Int", args: [] })] });
+  let view = { id: 0, ty: list, rep: RSlice };
+  let w = { id: 1, ty: list, rep: RWord };
+  let n = int(2);
+  let walk = |body: Block|
+    {
+      ..root_of([view, n], [], RInt, body),
+      conv: { params: [Given, Given], reps: [RWord, RInt], answer: RInt },
+    };
+  assert_eq(verified(walk([Dec(view), Return(AVar(n))])), None);
+  assert_eq(verified(walk([Restart([AVar(view), AVar(n)])])), None);
+  assert_eq(
+    verified(walk([bind(w, call_of([], []), [view]), Dec(view), Restart([AVar(w), AVar(n)])])),
+    Some(b"a restart's arguments held otherwise than its parameters"),
+  );
+  assert_eq(
+    verified({
+      ..root_of([n], [], RInt, [Return(AVar(n))]),
+      conv: { params: [Given], reps: [RWord], answer: RInt },
+    }),
+    Some(b"a parameter held otherwise than its convention takes it"),
   )
 }
 
