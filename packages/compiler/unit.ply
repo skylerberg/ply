@@ -38,6 +38,7 @@ import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
 import syntax.parsing (no_module)
+import syntax.exprs (prelude_module)
 
 // --- What crosses the seam ----------------------------------------------------
 
@@ -121,7 +122,7 @@ pub fn unbound(natives: List<Native>, declared: List<Extern>) -> List<Unbound> =
 
 /// The natives the compiler declares itself: each `extern fn` of the prelude, then each native the
 /// elaboration writes calls of.
-pub fn declared_natives() -> List<Extern> / {abort.raise} =
+fn declared_natives() -> List<Extern> / {abort.raise} =
   prelude_externs().concat(
     elaborated_natives().map(|n: Elaborated|
       { module: b"", name: n.name, words: n.words, raises: n.raises }),
@@ -158,9 +159,34 @@ fn helpers_named(text: Bytes, into: Map<Bytes, Bool>) -> Map<Bytes, Bool> / {abo
       },
     })
 
-/// What the natives whose helpers are `called` are declared to be: the compiler's own declaration
-/// of each it declares, and where one is of none of those, each `extern fn` a shipped module among
-/// `modules` declares, each module's text the one `text_of` finds.
+/// Every native a program over the shipped `modules`, each by its name and text, may call, each once
+/// as it is first declared: the compiler's own (`declared_natives`), then each `extern fn` of the
+/// prelude and of each of `modules`.
+pub fn program_natives(
+  modules: List<{ name: Bytes, text: Bytes }>,
+) -> List<Extern> / {abort.raise} = natives_beside(declared_natives(), modules)
+
+fn natives_beside(
+  own: List<Extern>,
+  modules: List<{ name: Bytes, text: Bytes }>,
+) -> List<Extern> / {abort.raise} =
+  [{ name: prelude_module(), text: prelude_source::text() }].concat(modules).fold(
+    {
+      seen: own.fold(Map::new(), |m: Map<Bytes, Bool>, e: Extern| m.insert(e.name, true)),
+      all: own,
+    },
+    |acc: { seen: Map<Bytes, Bool>, all: List<Extern> }, m: { name: Bytes, text: Bytes }|
+      externs_in(m.name, m.text).fold(
+        acc,
+        |a: { seen: Map<Bytes, Bool>, all: List<Extern> }, e: Extern|
+          if a.seen.contains(e.name) { a }
+          else { { seen: a.seen.insert(e.name, true), all: a.all.push(e) } },
+      ),
+  ).all
+
+/// What the natives whose helpers are `called` are declared to be, as `program_natives` declares
+/// them over the shipped `modules`, each module's text the one `text_of` finds; the modules are read
+/// only where the compiler does not declare every one itself.
 fn called_externs(
   called: Map<Bytes, Bool>,
   modules: List<ModuleRow>,
@@ -170,13 +196,15 @@ fn called_externs(
   let own = declared_natives();
   let rest = own.fold(called, |acc: Map<Bytes, Bool>, e: Extern|
     acc.remove(builtin_helper(e.name)));
-  own.filter(calls).concat(if rest.len() == 0 { [] } else {
-    modules.fold([], |acc: List<Extern>, m: ModuleRow|
-      match text_of(m) {
-        Some(text) -> acc.concat(externs_in(m.name, text).filter(calls)),
-        None -> acc,
-      })
-  })
+  if rest.len() == 0 { own.filter(calls) } else {
+    natives_beside(
+      own,
+      modules.fold([], |acc: List<{ name: Bytes, text: Bytes }>, m: ModuleRow|
+        match text_of(m) { Some(text) -> acc.push({ name: m.name, text: text }), None -> acc }),
+    ).filter(
+      calls,
+    )
+  }
 }
 
 fn native_said(words: Int, answers: Bool, raises: Bool) -> Bytes =
@@ -3298,11 +3326,7 @@ test "a unit is refused where the runtime does not implement a native it calls a
 
 test "a unit whose bodies write externs in place asks the runtime for no native of them" {
   // What the prelude declares that a native implements: its builtins, and `ListNode::leaf_of`.
-  let implemented = declared_natives().concat(
-    externs_in(b"std.prelude", prelude_source::text()),
-  ).map(
-    native_of,
-  );
+  let implemented = program_natives([]).map(native_of);
   let names = implemented.map(|n: Native| n.name);
   assert_eq(
     intrinsics().filter(|i: { name: Bytes, op: Intrinsic }|
