@@ -9,17 +9,16 @@ import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, Tail
                     KidSize, NewLeaf, NewMapBranch, PairPut, PairSet, PairTake, LeafCut, BranchCut,
                     KidOut, KidBack, KidPut, KidDrop, MapSwap, layouts)
 import emit.roots (builtin_helper)
-import emit.reps (laid_of)
 import emit.pieces (Text, Hole, ShapeOf, TagOf, spelled)
 import emit.tir (Rep, RInt, RNum, RFloat, RDec, RWord, RMaybe, RFlat, Leaf, Var, Arg, AVar, AInt,
-                 AZero, Made, MList, Uses, Containers, rep_of_arg, counted, var_said, made_said)
+                 AZero, Made, MList, Uses, rep_of_arg, counted)
 import emit.lower.held (fields_of)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew,
                             ArraySet, ArrayOfList, ArrayGet, ColumnField, Position, Element, Words,
                             Bits, Payloads, Records, IntBits, WidthBits, FloatBits, DecimalBits)
 import emit.print.text (Printing, Place, printing, line, pad, pieces, temp, named, name_of,
-                        arg_text, assigned, site, check, shape_at, zero, part_names, unprinted)
-import emit.print.made (c_type, c_types, as_word, word_as)
+                        arg_text, assigned, site, check, shape_at, zero, part_names)
+import emit.print.made (Held, c_type, c_types, as_word, word_as, leaf_loads)
 
 /// A list or an array made of `m.args`.
 pub fn contained(
@@ -30,7 +29,7 @@ pub fn contained(
 ) -> Printing / {abort.raise} =
   match m.made {
     MList(_) -> from_words(p, pr, into, b"rt_list_p", m.args),
-    other -> unprinted(Containers, b"a value made other than a list", made_said(other)),
+    _ -> line(pr, p.depth, b"/* an array made, which this printer does not write yet */"),
   }
 
 /// Operation `op` on a container's cells over `args`.
@@ -45,12 +44,7 @@ pub fn container_op(
   let object = operand(pr, args, 0);
   let index = operand(pr, args, 1);
   match into {
-    None ->
-      unprinted(
-        Containers,
-        b"a container's operation whose answer goes unread",
-        Bytes::concat_all([ascii_of_int(args.len()), b" operands"]),
-      ),
+    None -> line(pr, p.depth, b"/* a container's operation whose answer goes unread */"),
     Some(v) -> match op {
       Length ->
         assigned(
@@ -676,18 +670,14 @@ fn record_printed(
         |old: Bytes| [whole(b"map", a), whole(b"old", old)],
       )
     },
-    _ ->
-      unprinted(
-        Containers,
-        b"an extern answering no record, printed as one that does",
-        Bytes::concat_all([b"into ", var_said(v), b" of ", ascii_of_int(args.len()), b" operands"]),
-      ),
+    _ -> line(pr, d, b"/* an extern answering no record, printed as one that does */"),
   }
 }
 
 /// `v`, a record held as its fields, each set from the word `fields` names for it: an item read as
-/// the field holds it, its word let go where a scalar is read out of it, and a record held in place
-/// as its leaves loaded out of that word, which becomes its word; the record's own word none.
+/// the field holds it, its word let go where a scalar is read out of it; a record held in place as
+/// its leaves, loaded out of that word at any depth, each counted one held once more, and that word
+/// as its word; the record's own word none.
 fn fields_set(p: Place, pr: Printing, v: Var, fields: List<Answered>) -> Printing / {abort.raise} = {
   let n = named(pr, v);
   let ns = part_names(n.name, v.rep);
@@ -697,15 +687,12 @@ fn fields_set(p: Place, pr: Printing, v: Var, fields: List<Answered>) -> Printin
     match ls.at(k) {
       None -> q,
       Some(l) -> {
-        let value = match l.name.index_of(b".") {
-          Some(dot) -> match fields.find(|x: Answered| x.name == l.name.slice(0, dot)) {
-            Some(x) -> leaf_loaded(x.word, ls, l.name.slice(0, dot + 1), l, nth(ns, k)),
-            None -> b"0;",
-          },
-          None -> match fields.find(|x: Answered| x.name == l.name) {
-            Some(x) -> if !x.item { x.word.concat(b";") }
-            else if counted(l.rep) { word_as(x.word, l.rep).concat(b";") }
-            else { Bytes::concat_all([word_as(x.word, l.rep), b"; ply_dec(ctx, ", x.word, b");"]) },
+        let value = match fields.find(|x: Answered| x.name == l.name) {
+          Some(x) -> if !x.item { x.word.concat(b";") }
+          else if counted(l.rep) { word_as(x.word, l.rep).concat(b";") }
+          else { Bytes::concat_all([word_as(x.word, l.rep), b"; ply_dec(ctx, ", x.word, b");"]) },
+          None -> match fields.find(|x: Answered| l.name.starts_with(x.name.concat(b"."))) {
+            Some(x) -> in_place_leaf(ls, x, l, nth(ns, k)),
             None -> b"0;",
           },
         };
@@ -715,36 +702,26 @@ fn fields_set(p: Place, pr: Printing, v: Var, fields: List<Answered>) -> Printin
   line(set, p.depth, Bytes::concat_all([nth(ts, ls.len()), b" ", nth(ns, ls.len()), b" = 0;"]))
 }
 
-/// Leaf `l` of a record held in place, named `prefix` and the field's name among the leaves `ls`,
-/// loaded out of `word`, the record's word, into `local`: a scalar as its bits, anything else as its
-/// word, held once more.
-fn leaf_loaded(
-  word: Bytes,
-  ls: List<Leaf>,
-  prefix: Bytes,
-  l: Leaf,
-  local: Bytes,
-) -> Bytes / {abort.raise} = {
-  let inner = ls.filter(|y: Leaf| y.name.starts_with(prefix)).map(|y: Leaf|
-    { name: y.name.slice(prefix.len(), y.name.len()), rep: y.rep });
-  let fs = fields_of(inner);
-  let sub = l.name.slice(prefix.len(), l.name.len());
-  let off = match range(0, fs.len()).fold(None, |acc: Option<Int>, i: Int|
-      match fs.at(i) {
-        Some(f) -> if f.name == sub { laid_of(fs).offsets.at(i) } else { acc },
-        None -> acc,
-      }) {
-    Some(o) -> ascii_of_int(o),
-    None -> b"0",
-  };
-  let slot = Bytes::concat_all([b"ply_words(", word, b")[", off, b"]"]);
-  match l.rep {
-    RInt -> Bytes::concat_all([b"(int64_t)(", slot, b");"]),
-    RNum(_) -> Bytes::concat_all([b"(", c_type(l.rep), b")(", slot, b");"]),
-    RFloat -> Bytes::concat_all([b"ply_f64(", slot, b");"]),
-    RDec -> Bytes::concat_all([b"ply_dec_at(", word, b", ", off, b");"]),
-    r -> if counted(r) { Bytes::concat_all([slot, b"; ply_inc(", local, b");"]) }
-    else { word_as(slot, r).concat(b";") },
+/// Leaf `l`, among the leaves `ls`, of field `x`, a record held in place, set into `local`: the
+/// record's own word leaf `x.word`, and any other loaded out of it as `leaf_loads` lays the record's
+/// leaves out, a counted one held once more.
+fn in_place_leaf(ls: List<Leaf>, x: Answered, l: Leaf, local: Bytes) -> Bytes / {abort.raise} = {
+  let prefix = x.name.concat(b".");
+  if l.name == prefix { x.word.concat(b";") } else {
+    let own = ls.filter(|y: Leaf| y.name.starts_with(prefix) && y.name != prefix);
+    let loads = leaf_loads(
+      x.word,
+      fields_of(own.map(|y: Leaf| { name: y.name.slice(prefix.len(), y.name.len()), rep: y.rep })),
+    );
+    match range(0, own.len()).fold(None, |acc: Option<Held>, j: Int|
+        match own.at(j) {
+          Some(y) -> if y.name == l.name { loads.at(j) } else { acc },
+          None -> acc,
+        }) {
+      Some(h) -> if counted(h.rep) { Bytes::concat_all([h.expr, b"; ply_inc(", local, b");"]) }
+      else { h.expr.concat(b";") },
+      None -> b"0;",
+    }
   }
 }
 
