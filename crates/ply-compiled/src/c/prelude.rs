@@ -11,8 +11,8 @@ pub const PRELUDE: &str = r#"
 #include <stdint.h>
 /* tcc's arm64 linker writes every call as one branch, which reaches 128 MB and no further, and says
    nothing of one that falls short. `PLY_FAR` keeps each part's calls within it: another part's
-   function through the part's table, and these, which tcc calls for a struct's copy and a zeroing
-   too, through stubs it lays after all of the code. */
+   function through the part's table, and the C library's a unit calls (tcc calls the first three for
+   a struct's copy and a zeroing too) defined here, so no C library header is included. */
 #if defined(__TINYC__) && defined(__aarch64__)
 #  define PLY_FAR 1
 #endif
@@ -35,6 +35,12 @@ static void *memset(void *d, int c, size_t n) {
   unsigned char *a = d;
   while (n--) *a++ = (unsigned char)c;
   return d;
+}
+static int memcmp(const void *x, const void *y, size_t n) {
+  const unsigned char *a = x;
+  const unsigned char *b = y;
+  for (; n; n--, a++, b++) if (*a != *b) return *a < *b ? -1 : 1;
+  return 0;
 }
 #else
 #include <string.h>
