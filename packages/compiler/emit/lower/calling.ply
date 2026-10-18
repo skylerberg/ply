@@ -31,7 +31,8 @@ import emit.lower.held (held_as, carried_as, arg_path)
 import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
                         ToInPlace, Frame, Opened, GroupMember, Restarts, Enters, Calls, refuse,
                         fresh, bound_as, done, emitted, opened, nested, unnested, with_lambda,
-                        started, type_at, type_of, handed)
+                        started, type_at, type_of, handed, read_noted, read_note, capture_note,
+                        frame_entered)
 import emit.lower.data (constructed)
 
 /// How the root takes its parameters and hands back its answer: as the emitter carries them.
@@ -107,7 +108,7 @@ pub fn known(
   at: Span,
 ) -> Lowered =
   match st.env.get(k.slot) {
-    Some(a) -> { st: st, arg: a },
+    Some(a) -> { st: read_noted(cx, st, read_note(), k.slot, at), arg: a },
     None -> refuse(st, Calling, b"a known lambda's slot nothing bound: ".concat(k.name)),
   }
 
@@ -319,10 +320,11 @@ fn in_frame(
             },
           },
       );
+      let inner = { ..cx, answer_ty: lambda_answer(cx, k.lambda), frame: k.lambda.at };
       {
-        cx: { ..cx, answer_ty: lambda_answer(cx, k.lambda) },
+        cx: inner,
         st: {
-          ..caps.st,
+          ..frame_entered(inner, caps.st, at),
           env: range(0, lowered.len()).fold(caps.env, |m: Map<Int, Arg>, j: Int|
             match lowered.at(j) { Some(Some(a)) -> m.insert(j, a), _ -> m }),
         },
@@ -429,7 +431,7 @@ fn stepped_in(
         Some(Some(budget)) -> {
           let v = step_vars(cx, st, t.state, t.answer);
           let c = bound_as(
-            opened(v.st),
+            frame_entered({ ..cx, frame: l.at }, opened(v.st), at),
             bool_type(),
             RBool,
             Prim({ op: b"le", on: RInt, args: [AVar(v.left), AInt(0)] }),
@@ -479,7 +481,8 @@ fn stepped_in(
                 },
             ) {
             None -> { cx: cx, st: refuse(st, Calling, b"a step's capture nothing bound").st },
-            Some(env) -> { cx: { ..cx, answer_ty: t.answer }, st: { ..spent_one.st, env: env } },
+            Some(env) ->
+              { cx: { ..cx, answer_ty: t.answer, frame: l.at }, st: { ..spent_one.st, env: env } },
           }
         },
         _ -> { cx: cx, st: refuse(st, Calling, b"a step with no budget").st },
@@ -757,6 +760,7 @@ pub fn lambda_opened(cx: Context, st: Lowering, frame: Frame, at: Span) -> Opene
       answer: s.answer,
       answer_ty: s.ret,
       param_at: Map::new(),
+      frame: at,
     },
     st: {
       ..caps,
@@ -765,6 +769,21 @@ pub fn lambda_opened(cx: Context, st: Lowering, frame: Frame, at: Span) -> Opene
     },
   }
 }
+
+/// `st` noting, where `cx` observes, each slot the lambda written at `at` captures, where it does.
+fn captured(cx: Context, st: Lowering, captures: List<Capture>, at: Span) -> Lowering =
+  captures.fold(st, |s: Lowering, c: Capture| read_noted(cx, s, capture_note(), c.src, at))
+
+/// `st` noting, where `cx` observes, the slots a step at argument `which` of `args` reads of the
+/// caller's, as a closure's captures, before its loop.
+pub fn step_captured(cx: Context, st: Lowering, args: List<Code>, which: Option<Int>) -> Lowering =
+  match which {
+    None -> st,
+    Some(n) -> match args.at(n) {
+      Some(code) -> match code.node { NLambda(l) -> captured(cx, st, l.captures, l.at), _ -> st },
+      None -> st,
+    },
+  }
 
 /// The closure of the body lowered to `inner` from `lambda_opened`'s state, made after `outer` of
 /// the values it captures, each as its word.
@@ -800,7 +819,7 @@ pub fn closure(cx: Context, outer: Lowering, inner: Lowered, frame: Frame, at: S
     ),
   };
   let caps = frame.captures.fold(
-    { st: placed, args: [] },
+    { st: captured(cx, placed, frame.captures, at), args: [] },
     |acc: { st: Lowering, args: List<Arg> }, c: Capture|
       match acc.st.env.get(c.src) {
         Some(a) -> {

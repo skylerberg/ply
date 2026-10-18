@@ -3,26 +3,27 @@
 //! emitter hands the lowering what it holds for every root; `setting_in` builds the same from an
 //! analysed program, for lowering a program's text in tests.
 
-import std.bin
 import std.bytes
 import syntax.parsing (Ident, Span, span_key, span_between, prelude_binder)
 import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, type_at, int_type,
-                    bool_type, float_type, decimal_type, bytes_type, fn_type, row_empty)
+                    bool_type, float_type, decimal_type, bytes_type, fn_type, row_empty, unit_type)
 import emit.typing (Typed, filed_as, unknown_type)
-import syntax.items (Module, Item, IFn, IEffect, OpDef, FnDef, INames, IModule, IAlias)
-import syntax.exprs (Param, freed_by)
+import syntax.items (Module, Item, IFn, ITest, ILaw, IEffect, OpDef, FnDef, TestDef, LawDef, Binder,
+                     INames, IModule, IAlias, test_run)
+import syntax.exprs (Param, freed_by, case_at, case_identity)
 import check.resolve.tables (ParsedModule, Resolved, ModuleBinding, Binding, lookup, ValueSpace,
                              qualify)
 import check.resolve.scopes (of_module, of_binder)
 import check.infer (EmitFacts, expanded_mods)
-import check.infer.checker (TypedSite, LabelSite, MemberSite, Builtin, builtins)
+import check.infer.checker (TypedSite, LabelSite, MemberSite, Builtin, builtins, test_owner,
+                            law_root)
 import front.facts (Analysis)
-import front.seam (Analysed, WalkedFacts, walked_facts_bin)
-import front.rows (KnownDefRow, CtorRow, EmitterCtor)
-import front.published (dump_of, facts_read)
+import front.seam (WalkedFacts, ctors_read)
+import front.rows (Rows, KnownDefRow, CtorRow)
+import front.published (facts_read, rows_of, walked_facts)
 import emit.code (Code, lower_to_emit)
-import emit.reps (Def, Imported, Ctors, SumCtor, Carrier, Whole, Ty, TyOpen, ctor_layouts,
-                  ctor_sums, sig_of, def_entry, param_kinds, param_types, carriers_of)
+import emit.reps (Def, Imported, Ctors, SumCtor, Carrier, Whole, Ty, TyOpen, TyBytes, ctor_layouts,
+                  ctor_sums, sig_of, def_entry, param_kinds, param_types, carriers_of, typed_kind)
 import emit.state (EffectName, OpMode, EmitParam)
 import emit.c (Kind, KBoxed, KInt, KBool, KFloat, KDec, KSum, bytes_join_dots)
 
@@ -55,69 +56,151 @@ pub type Root = {
   code: Option<Code>,
 }
 
-/// Module `module` of the analysed program `a` as the emitter reads it, and each definition it
-/// writes as a root, or why the program's facts cannot be read.
+/// Module `module` of the analysed program `a` as the emitter reads it, and each definition, test
+/// and law it writes as a root, or why the program's facts cannot be read.
 pub fn setting_in(
   a: Analysis,
   module: Bytes,
-) -> Result<{ setting: Setting, roots: List<Root> }, Bytes> / {abort.raise} = {
-  let d = dump_of(Analysed(a));
-  match walked_read(d.walked) {
-    None -> Err(b"the analysis carries nothing its check read"),
-    Some(w) -> match facts_read(d.rows, w, None, a.mods) {
+) -> Result<{ setting: Setting, roots: List<Root> }, Bytes> / {abort.raise} =
+  match range(0, a.mods.len()).fold(None, |acc: Option<Int>, k: Int|
+      if a.mods.get(k).name == module { Some(k) } else { acc }) {
+    None -> Err(b"no such module"),
+    Some(i) -> match settings_in(
+        a,
+        rows_of(a),
+        walked_facts(a),
+        a.mods,
+        [i],
+        |_: Int, s: Setting, rs: List<ItemRoot>|
+          { setting: s, roots: rs.map(|r: ItemRoot| r.root) },
+      ) {
       Err(why) -> Err(why),
-      Ok(facts) -> {
-        let mods = expanded_mods(a.mods, facts.elaboration, a.r.signatures);
-        let pure = facts.pure.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes|
-          acc.insert(n, true));
-        let schemes = d.rows.defs.fold(Map::new(), |acc: Map<Bytes, Scheme>, row: KnownDefRow|
-          acc.insert(row.name, row.scheme));
-        let defs_of = |path: Bytes|
-          mods.fold([], |acc: List<Def>, m: ParsedModule|
-            if m.name == path { defs_in(m.name, m.module, pure, schemes) } else { acc });
-        match range(0, mods.len()).fold(None, |acc: Option<Int>, k: Int|
-            if mods.get(k).name == module { Some(k) } else { acc }) {
-          None -> Err(b"no such module"),
-          Some(i) -> {
-            let m = mods.get(i);
-            let here = defs_in(module, m.module, pure, schemes);
-            let sites = sites_in(facts.label_sites, i);
-            let setting = {
-              module: module,
+      Ok(found) -> match found.at(0) { Some(x) -> Ok(x), None -> Err(b"no such module") },
+    },
+  }
+
+/// A body a module writes, a definition's, a test's or a law's, and its root. A test over cases is
+/// its run's root, and a law its body's.
+pub type ItemRoot = { item: Item, root: Root }
+
+/// `each` of the modules at `wanted` among `mods`, which are `a`'s or what each was read from
+/// again, handed what the emitter reads of it and its bodies as roots; `rows` and `walked` are what
+/// `a`'s check read (`rows_of`, `walked_facts`), and the facts are read off them once.
+pub fn settings_in<b | e>(
+  a: Analysis,
+  rows: Rows,
+  walked: WalkedFacts,
+  mods: List<ParsedModule>,
+  wanted: List<Int>,
+  each: (Int, Setting, List<ItemRoot>) -> b / {abort.raise | e},
+) -> Result<List<b>, Bytes> / {abort.raise | e} =
+  match facts_read(rows, walked, None, mods) {
+    Err(why) -> Err(why),
+    Ok(facts) -> {
+      let expanded = expanded_mods(mods, facts.elaboration, a.r.signatures);
+      let pure = facts.pure.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
+      let schemes = rows.defs.fold(Map::new(), |acc: Map<Bytes, Scheme>, row: KnownDefRow|
+        acc.insert(row.name, row.scheme));
+      let by_name = expanded.fold(Map::new(), |acc: Map<Bytes, List<Def>>, m: ParsedModule|
+        acc.insert(m.name, defs_in(m.name, m.module, pure, schemes)));
+      let defs_of = |path: Bytes| match by_name.get(path) { Some(ds) -> ds, None -> [] };
+      let read = ctors_read(a.checked);
+      let ctors = {
+        names: read.rows.map(|c: CtorRow| c.name),
+        laid: ctor_layouts(read.rows),
+        keyed: read.keyed,
+        sums: ctor_sums(read.rows),
+      };
+      let declared = declared_schemes();
+      Ok(
+        wanted.filter(|i: Int| i < expanded.len()).map(|i: Int| {
+          let m = expanded.get(i);
+          let here = defs_of(m.name);
+          let sites = sites_in(facts.label_sites, i);
+          let typed = typed_in(facts, i);
+          each(
+            i,
+            {
+              module: m.name,
               here: here,
               imports: resolved_imports(
                 a.r,
                 i,
-                mods,
+                expanded,
                 m.module,
                 defs_of,
                 facts.elaboration.members.filter(|s: MemberSite| s.module == i),
               ),
-              ctors: {
-                names: d.ctors.map(|c: CtorRow| c.name),
-                laid: ctor_layouts(d.ctors),
-                keyed: d.emitter_ctors.filter(|c: EmitterCtor| c.key != None).map(
-                  |c: EmitterCtor| c.name,
-                ),
-                sums: ctor_sums(d.ctors),
-              },
+              ctors: ctors,
               builtins: [],
-              declared: declared_schemes(),
-              effects: effects_in(a.r, i, mods),
+              declared: declared,
+              effects: effects_in(a.r, i, expanded),
               release: false,
-              typed: typed_in(facts, i),
-            };
-            Ok({
-              setting: setting,
-              roots: m.module.items.fold([], |acc: List<Root>, item: Item|
-                match item {
-                  IFn(def) -> acc.push(root_of(module, schemes, sites, here, def)),
-                  _ -> acc,
-                }),
-            })
-          },
-        }
-      },
+              typed: typed,
+            },
+            m.module.items.fold([], |acc: List<ItemRoot>, item: Item|
+              match item {
+                IFn(def) ->
+                  acc.push({ item: item, root: root_of(m.name, schemes, sites, here, def) }),
+                ITest(t) -> acc.push({ item: item, root: test_root(m.name, sites, t) }),
+                ILaw(l) -> acc.push({ item: item, root: law_root_of(m.name, sites, typed, l) }),
+                _ -> acc,
+              }),
+          )
+        }),
+      )
+    },
+  }
+
+/// Test `t` of `module` as the root a build makes of it: its run, which over cases takes a case's
+/// place and identity.
+fn test_root(module: Bytes, sites: Map<Bytes, List<Bytes>>, t: TestDef) -> Root / {abort.raise} = {
+  let names = if t.cases == None { [] } else { [case_at(), case_identity()] };
+  let ps = params_carried(
+    names,
+    if t.cases == None { [] }
+    else { [Some({ kind: KInt, ty: TyOpen([]) }), Some({ kind: KBoxed, ty: TyBytes })] },
+    [],
+    [],
+  );
+  {
+    full: test_owner(module, t.name),
+    base: t.span.start,
+    params: ps,
+    types: ps.map(param_type),
+    answer: Whole(KBoxed),
+    answer_ty: unit_type(),
+    code: match lower_to_emit(names, [], sites, test_run(t), of_binder(module)) {
+      Some(l) -> Some(l.code),
+      None -> None,
+    },
+  }
+}
+
+/// Law `l` of `module` as the root a build makes of its body, its binders its parameters.
+fn law_root_of(
+  module: Bytes,
+  sites: Map<Bytes, List<Bytes>>,
+  typed: Map<Bytes, Typed>,
+  l: LawDef,
+) -> Root / {abort.raise} = {
+  let names = l.binders.map(|b: Binder| b.name.name);
+  let ps = params_carried(
+    names,
+    l.binders.map(|b: Binder| Some(typed_kind(typed, b.name.span))),
+    [],
+    [],
+  );
+  {
+    full: law_root(module, l.name, b"body"),
+    base: l.span.start,
+    params: ps,
+    types: ps.map(param_type),
+    answer: Whole(KBool),
+    answer_ty: bool_type(),
+    code: match lower_to_emit(names, [], sites, l.body, of_binder(module)) {
+      Some(c) -> Some(c.code),
+      None -> None,
     },
   }
 }
@@ -327,10 +410,6 @@ pub fn qualified(name: Bytes) -> Option<{ binder: Bytes, name: Bytes }> =
 
 // What follows reads a program as the emitter does, from copies of readers `emit` keeps to itself
 // or that the lowering takes over from the emitter's modules.
-
-fn walked_read(walked: Bytes) -> Option<WalkedFacts> / {abort.raise} =
-  if walked.len() == 0 { None }
-  else { match bin::decode(walked, walked_facts_bin()) { Ok(w) -> Some(w), Err(_) -> None } }
 
 fn sites_in(all: List<LabelSite>, module: Int) -> Map<Bytes, List<Bytes>> =
   all.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, site: LabelSite|
