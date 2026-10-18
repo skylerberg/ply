@@ -15,13 +15,14 @@ import emit.layout (Intrinsic, intrinsics, layouts)
 import emit.answer (Need, Layout)
 import emit.pieces (spelled)
 import emit.code (NField)
-import emit.tir (Rep, RInt, RFloat, RWord, RMaybe, RNum, RFlat, Var, Arg, AVar, Val, Make, Made,
-                 MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst, Let, Fn,
+import emit.tir (Rep, RInt, RBool, RFloat, RWord, RMaybe, RNum, RFlat, Var, Arg, AVar, Val, Make,
+                 Made, MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst, Let, Fn,
                  Declined, Spine, Data, Containers, rep_of_arg)
 import emit.tir.containers (Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew, ArraySet,
                             ArrayOfList, ArrayGet, ColumnField, Bits, IntBits, FloatBits,
                             DecimalBits, Words, Payloads, Records)
 import emit.lower (lowered_fn)
+import emit.own (owned)
 import emit.lower.base (context_of, started)
 import emit.lower.containers (columned, column_read)
 import emit.lower.setting (Root, setting_in)
@@ -462,6 +463,42 @@ test "a handler's variables, a hold's region and `bracket` are the runtime's, ea
   )
 }
 
+test "an operator at a type a witness stands for is the runtime's, a comparison answering a `Bool`" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn less<a>(x: a, y: a) -> Bool where numeric(a) = x < y\n",
+      b"fn sum<a>(x: a, y: a) -> a where numeric(a) = x + y\n",
+      b"fn negated<a>(x: a) -> a where numeric(a) = -x\n",
+      b"fn halved<a>(x: a) -> a where integer(a) = x >> 1\n",
+    ]),
+  );
+  let names = [b"less", b"sum", b"negated", b"halved"];
+  assert_eq(
+    names.fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
+      match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) }),
+    [],
+  );
+  assert_eq(
+    names.map(|n: Bytes|
+      natives_in(bound_in(p, n)).map(
+        |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
+      )),
+    [
+      [b"builtin_elaborated_numeric_binary_p"],
+      [b"builtin_elaborated_numeric_binary_p"],
+      [b"builtin_elaborated_numeric_unary_p"],
+      [b"builtin_elaborated_numeric_binary_p"],
+    ],
+  );
+  // The runtime's word is unboxed only where the operator compares.
+  assert_eq(names.map(|n: Bytes| packs_in(bound_in(p, n)).filter(|r: Rep| r == RBool).len()), [
+    1,
+    0,
+    0,
+    0,
+  ])
+}
+
 /// Module `m` of the program of `sources`, run by a runtime implementing `natives`.
 fn program_of_modules(
   sources: List<{ name: Bytes, src: Bytes }>,
@@ -815,6 +852,88 @@ fn in_place_calls() -> List<{ name: Bytes, src: Bytes }> =
     },
   ]
 
+/// For each probe of `in_place_calls`, C its printed body holds and C it must not: each slot read or
+/// written as what it holds. A root or a kid is an `Option`'s payload's word, which nothing opens,
+/// and which is made an object only where a probe answering an `Option` returns it; an item a word,
+/// read as the scalar it stands for; a size an immediate.
+fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }> = {
+  let reads = |name: Bytes, has: List<Bytes>| { name: name, has: has, lacks: [] };
+  let payload = |name: Bytes, has: List<Bytes>|
+    { name: name, has: has, lacks: [b"rt_maybe_open_p", b"rt_maybe_take_p"] };
+  let returned = |name: Bytes, has: List<Bytes>|
+    { name: name, has: has, lacks: [b"rt_maybe_open_p"] };
+  [
+    reads(b"start", [b" = (int64_t)ply_obj(p0)->layout;"]),
+    reads(b"tail_len", [b" = (int64_t)ply_obj(p0)->flags;"]),
+    returned(b"root", [b"PlyMaybe ", b" = ply_words(p0)[0];"]),
+    reads(b"tail_at", [b" = ply_words(p0)[1 + (INT64_C(1))];"]),
+    reads(b"len", [b" = (int64_t)ply_obj(p0)->len;"]),
+    reads(b"leaf_at", [
+      b" = (ply_is_imm(ply_words(p0)[0 + (INT64_C(3))]) ? ply_imm_value(ply_words(p0)[0 + (INT64_C(3))]) : rt_unbox_int_p(ctx, ply_words(p0)[0 + (INT64_C(3))]));",
+    ]),
+    reads(b"leaf_at_any", [b" = ply_words(p0)[0 + (INT64_C(3))];"]),
+    reads(b"leaf_at_on", [b" = ply_words(p0)[0 + (INT64_C(3))];"]),
+    reads(b"kid_at", [b" = ply_words(p0)[0 + (INT64_C(1))];"]),
+    reads(b"tail_push", [
+      b"rt_list_writable_p(ctx, ",
+      b")->flags)] = p1; ",
+      b")->flags += 1; ply_obj(",
+    ]),
+    reads(b"tail_set", [
+      b"rt_note_update_p(ctx, in_place, in_place ? 0 : ply_obj(",
+      b"[1 + (INT64_C(2))]; ply_words(",
+    ]),
+    reads(b"leaf_set", [b"rt_node_writable_p(ctx, ", b"[INT64_C(2)] = p1; ply_dec(ctx, "]),
+    returned(b"root_swap", [b"rt_list_writable_p(ctx, ", b")[0]; ply_words(", b")[0] = "]),
+    payload(b"kid_swap", [
+      b" = 0; if (INT64_C(0) < (int64_t)ply_obj(",
+      b")->len = (uint32_t)(INT64_C(0)) + 1; ",
+    ]),
+    reads(b"tail_start", [b"[1 + (0)] = ", b")->flags = 1; "]),
+    reads(b"spill", [b"rt_node_p(ctx, 11); memcpy(ply_words(", b"32 * sizeof(Word)); ply_obj("]),
+    reads(b"branch", [b"rt_node_p(ctx, 12)"]),
+    returned(b"map_root", [b"PlyMaybe ", b" = ply_words(p0)[0];"]),
+    reads(b"height", [b" = (int64_t)ply_obj(p0)->layout;"]),
+    reads(b"count", [b" = (int64_t)ply_obj(p0)->len;"]),
+    reads(b"key", [b" = (ply_is_imm(ply_words(p0)[2 * (INT64_C(1))]) ? "]),
+    reads(b"value", [b" = ply_words(p0)[2 * (INT64_C(1)) + 1];"]),
+    reads(b"kid", [b" = ply_words(p0)[0 + (INT64_C(1))];"]),
+    reads(b"kid_max", [b" = (ply_is_imm(ply_words(p0)[33 + (INT64_C(1))]) ? "]),
+    reads(b"kid_size", [b" = ply_imm_value(ply_words(p0)[66 + (INT64_C(1))]);"]),
+    reads(b"leaf", [b"rt_node_p(ctx, 13)"]),
+    reads(b"map_branch", [b"rt_node_p(ctx, 14)"]),
+    reads(b"pair_put", [
+      b"[2 * (INT64_C(1)) + 2], &ply_words(",
+      b"[2 * (INT64_C(1)) + 1] = p1; ",
+      b")->len += 1;",
+    ]),
+    reads(b"pair_set", [b"[2 * (INT64_C(1)) + 1] = p1; ply_dec(ctx, "]),
+    reads(b"pair_take", [
+      b"[2 * (INT64_C(1))]; Word ",
+      b"[2 * (INT64_C(1)) + 2 + -2], &ply_words(",
+      b")->len -= 1;",
+      b"; ply_dec(ctx, t",
+    ]),
+    reads(b"leaf_cut", [b"rt_node_p(ctx, 13); memcpy(&ply_words(", b"[0 + 2 * (INT64_C(16))]"]),
+    reads(b"branch_cut", [b"rt_node_p(ctx, 14); memcpy(&ply_words(", b"[33 + 1 * (INT64_C(16))]"]),
+    reads(b"kid_out", [b"[(INT64_C(1))] = 0;"]),
+    reads(b"kid_back", [b"[66 + ((INT64_C(1)))] = ply_imm(INT64_C(4));", b"[(INT64_C(1))] = p1; "]),
+    reads(b"kid_put", [b"[66 + ((INT64_C(1)))] = ply_imm(INT64_C(4)); ", b")->len += 1;"]),
+    reads(b"kid_drop", [
+      b"ply_dec(ctx, ply_words(",
+      b"[(INT64_C(1))]); ply_dec(ctx, ply_words(",
+      b")->len -= 1;",
+    ]),
+    payload(b"map_swap", [
+      b"rt_map_writable_p(ctx, ",
+      b")[0]; ply_words(",
+      b")->layout = (uint32_t)(INT64_C(1)); ",
+      b")->len = (uint32_t)(INT64_C(40));",
+    ]),
+    reads(b"key_take", [b"_0 = (int64_t)(ply_words("]),
+  ]
+}
+
 test "each extern written in place is an operation over the runtime's objects as the layouts lay them out" {
   let calls = in_place_calls();
   let probes = calls.fold(b"\n", |acc: Bytes, c: { name: Bytes, src: Bytes }|
@@ -949,6 +1068,31 @@ test "each extern written in place is an operation over the runtime's objects as
             |c: { name: Bytes, src: Bytes }| c.name,
           ),
           [],
+        );
+        let none_missed = |missed: List<Bytes>|
+          assert(missed.len() == 0, Some(String::of_bytes_lossy(Bytes::join(missed, b"\n"))));
+        // What each extern reads and writes, slot by slot, in the representation the slot holds.
+        none_missed(
+          laid_expected().fold(
+            [],
+            |acc: List<Bytes>, e: { name: Bytes, has: List<Bytes>, lacks: List<Bytes> }| {
+              let text = code(e.name);
+              if e.has.all(|t: Bytes| text.index_of(t) != None)
+                  && e.lacks.all(|t: Bytes| text.index_of(t) == None) { acc }
+              else { acc.push(Bytes::concat_all([e.name, b":\n", text])) }
+            },
+          ),
+        );
+        // A root is read without a count of its own, so answering it takes one.
+        none_missed(
+          [b"root", b"map_root"].fold([], |acc: List<Bytes>, name: Bytes| {
+            let text = match form(name) {
+              Ok(f) -> spelled(printed_fn(owned(f)).pieces),
+              Err(no) -> no.why,
+            };
+            if text.index_of(b"ply_inc(t1);") != None { acc }
+            else { acc.push(Bytes::concat_all([name, b":\n", text])) }
+          }),
         )
       },
       Err(why) -> panic(String::of_bytes_lossy(why)),
