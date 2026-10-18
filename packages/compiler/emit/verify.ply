@@ -17,17 +17,21 @@ import emit.reps (FieldTy, TyRec, kind_of, in_place)
 import check.types (Type, TyCon, TyRecord)
 import syntax.parsing (dummy_span)
 import std.bytes (ascii_of_int)
+import std.math (ilog2)
+import std.pace (paced)
 
 /// What a path holds: the counts of each owned variable, the variable each borrowed one was read out
 /// of (`-1` for a constant or a lent parameter, which outlast the body), each join declared on it
 /// and whether it was set, the words of each value opened, the word each read of an opened
 /// value's counted leaf is, the captures of each closure laid on this frame's stack, the fields
 /// taken out of each block, the block each reuse token holds the cells of, and where each field
-/// read was read.
+/// read was read. `unset` are the joins of `joins` not yet set, the only ones a branch can set
+/// differently on its paths.
 type Holding = {
   owned: Map<Int, Int>,
   borrowed: Map<Int, Int>,
   joins: Map<Int, Bool>,
+  unset: Map<Int, Bool>,
   opened: Map<Int, List<Var>>,
   alias: Map<Int, Var>,
   stacks: Map<Int, List<Var>>,
@@ -119,6 +123,7 @@ fn holding_params(params: List<Var>, conv: Convention) -> Holding =
       owned: Map::new(),
       borrowed: Map::new(),
       joins: Map::new(),
+      unset: Map::new(),
       opened: Map::new(),
       alias: Map::new(),
       stacks: Map::new(),
@@ -271,7 +276,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             { ..acc, fault: Some(b"a value whose count nothing holds") }
           } else { failing(cx, used(acc, operands(d.val)), d.val, d.unwind) },
         },
-        Decl(v) -> { ..acc, h: { ..acc.h, joins: acc.h.joins.insert(v.id, false) } },
+        Decl(v) -> { ..acc, h: declared(acc.h, v.id) },
         Assign(s) -> match acc.h.joins.get(s.var.id) {
           Some(false) -> if !same_rep(s.arg, s.var.rep) {
             faulted(acc, b"a join set from a value held otherwise: v", s.var)
@@ -282,6 +287,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
               h: {
                 ..consumed.h,
                 joins: consumed.h.joins.insert(s.var.id, true),
+                unset: consumed.h.unset.remove(s.var.id),
                 owned: if counted(s.var.rep) { consumed.h.owned.insert(s.var.id, 1) }
                 else { consumed.h.owned },
               },
@@ -334,8 +340,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
           None -> { ..acc, fault: Some(b"an arm's miss outside a match") },
           Some(entry) -> {
             let handed = {
-              ..acc.h,
-              joins: scoped(acc.h.joins, entry.joins),
+              ..scoped(acc.h, entry),
               taken: acc.h.taken.fold(
                 Map::new(),
                 |m: Map<Int, List<Path>>, id: Int, ps: List<Path>|
@@ -346,7 +351,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             match acc.missed {
               None -> { ..acc, missed: Some(handed), live: false },
               // A field taken before any miss is taken for the next arm.
-              Some(m) -> if m.owned == handed.owned && m.joins == handed.joins {
+              Some(m) -> if m.owned == handed.owned && m.unset == handed.unset {
                 {
                   ..acc,
                   missed: Some({ ..m, taken: taken_either(m.taken, handed.taken) }),
@@ -473,12 +478,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
               let body = walked(
                 f,
                 { ..cx, looped: None, landing: across.owned, arm: None, handled: true },
-                {
-                  ..h,
-                  h: { ..across, joins: across.joins.insert(x.answer.id, false) },
-                  missed: None,
-                  done: false,
-                },
+                { ..h, h: declared(across, x.answer.id), missed: None, done: false },
                 x.body,
               );
               if body.fault != None { { ..h, fault: body.fault } }
@@ -717,28 +717,24 @@ fn joined(before: Walk, a: Walk, b: Walk) -> Walk =
         };
         let both = match a.missed {
           Some(x) -> match b.missed {
-            Some(y) -> x.owned != y.owned || x.joins != y.joins,
+            // Both hold only the joins of one match's entry, so they differ only in which are unset.
+            Some(y) -> x.owned != y.owned || x.unset != y.unset,
             None -> false,
           },
           None -> false,
         };
         let done = a.done || b.done;
-        let outer = before.h.joins;
         if both { { ..a, fault: Some(b"the misses of an arm hold different counts") } }
         else if a.live && b.live {
+          let ours = scoped(a.h, before.h);
           if a.h.owned != b.h.owned {
             { ..a, fault: Some(b"the paths out of a branch hold different counts") }
-          } else if scoped(a.h.joins, outer) != scoped(b.h.joins, outer) {
+          } else if ours.unset != scoped(b.h, before.h).unset {
             { ..a, fault: Some(b"the paths out of a branch set different joins") }
           } else {
             {
               ..a,
-              h: {
-                ..a.h,
-                borrowed: before.h.borrowed,
-                joins: scoped(a.h.joins, outer),
-                taken: taken_either(a.h.taken, b.h.taken),
-              },
+              h: { ..ours, borrowed: before.h.borrowed, taken: taken_either(a.h.taken, b.h.taken) },
               missed: missed,
               done: done,
             }
@@ -746,14 +742,14 @@ fn joined(before: Walk, a: Walk, b: Walk) -> Walk =
         } else if a.live {
           {
             ..a,
-            h: { ..a.h, borrowed: before.h.borrowed, joins: scoped(a.h.joins, outer) },
+            h: { ..scoped(a.h, before.h), borrowed: before.h.borrowed },
             missed: missed,
             done: done,
           }
         } else if b.live {
           {
             ..b,
-            h: { ..b.h, borrowed: before.h.borrowed, joins: scoped(b.h.joins, outer) },
+            h: { ..scoped(b.h, before.h), borrowed: before.h.borrowed },
             missed: missed,
             done: done,
           }
@@ -762,10 +758,19 @@ fn joined(before: Walk, a: Walk, b: Walk) -> Walk =
     },
   }
 
-/// The joins of `joins` that `outer` declared, as `joins` holds them.
-fn scoped(joins: Map<Int, Bool>, outer: Map<Int, Bool>) -> Map<Int, Bool> =
-  joins.fold(Map::new(), |m: Map<Int, Bool>, id: Int, set: Bool|
-    if outer.contains(id) { m.insert(id, set) } else { m })
+/// `h`, a state on a path from `outer`, holding only the joins `outer` declared: those `outer` had
+/// set stay set, and of those it had not, the ones `h` set.
+fn scoped(h: Holding, outer: Holding) -> Holding =
+  outer.unset.fold(
+    { ..h, joins: outer.joins, unset: outer.unset },
+    |s: Holding, id: Int, _: Bool|
+      if h.unset.contains(id) { s }
+      else { { ..s, joins: s.joins.insert(id, true), unset: s.unset.remove(id) } },
+  )
+
+/// `h` with join `id` declared and not yet set.
+fn declared(h: Holding, id: Int) -> Holding =
+  { ..h, joins: h.joins.insert(id, false), unset: h.unset.insert(id, true) }
 
 /// Each operand used as the operation's signature says: consumed, or only read.
 fn used(w: Walk, ops: List<{ arg: Arg, takes: Bool }>) -> Walk =
@@ -1825,4 +1830,23 @@ test "an operand is held as its operation takes it, and a counted answer is held
     verified(root_of([p], [], RWord, [Dec(n), Return(AVar(p))])),
     Some(b"a count let go of a value that holds none: v1"),
   )
+}
+
+test "the joins of a body's branches are checked in one walk, however many it declares" {
+  let c = flag(0);
+  let branches = |n: Int|
+    range(0, n).fold([], |body: List<Inst>, i: Int| {
+      let j = int(i + 1);
+      body.push(Decl(j)).push(
+        If({
+          cond: AVar(c),
+          then: [Assign({ var: j, arg: AInt(1) })],
+          otherwise: [Assign({ var: j, arg: AInt(2) })],
+        }),
+      )
+    }).push(
+      Return(AInt(0)),
+    );
+  assert_eq(verified(root_of([c], [], RInt, branches(3))), None);
+  paced(|n: Int| n * (ilog2(n) + 1), |n: Int| verified(root_of([c], [], RInt, branches(n))))
 }

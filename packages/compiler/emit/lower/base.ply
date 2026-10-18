@@ -4,17 +4,17 @@
 
 import emit.code
 import emit.code (Code, CodeArm, Capture)
-import check.types (Type, named_type)
+import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, named_type)
 import emit.typing (unknown_type)
 import syntax.parsing (Span, span_key, dummy_span)
 import emit.reps (Carrier, EmitParam)
 import emit.answer (Need)
 import emit.roots (builtin_helper)
-import emit.keys (RootKey, Named)
+import emit.keys (RootKey)
 import emit.tir (Rep, RInt, RBool, RNum, Var, Arg, AVar, AInt, ABool, AFloat, ANum, AChar, AZero,
                  Val, Pack, Native, Inst, Let, Do, Decl, Assign, If, Block, Lambda, Links, Declined,
                  Family, RWord, RMaybe, rep_of_arg, falls_through, counted)
-import emit.lower.setting (Setting, Root)
+import emit.lower.setting (Setting)
 import emit.lower.held (held_as)
 
 /// What a root's body is lowered under: the module's setting, the root's key and full name, where
@@ -26,7 +26,9 @@ import emit.lower.held (held_as)
 /// what the lambda hands on is numbered. An `observing` lowering writes where each slot is read and
 /// each frame entered (`read_noted`, `frame_entered`), for `emit.moves` to read the form's moves
 /// off; nothing else lowers so. `frame` is the place of the lambda whose slots the body being
-/// lowered reads, or nowhere in the root's own.
+/// lowered reads, or nowhere in the root's own. `lends` is whether the root lends its own lambdas,
+/// as read under this setting, and `written` what it lends then: the lambdas its body writes and
+/// the definitions it hands as values, read once for the whole body.
 pub type Context = {
   setting: Setting,
   key: RootKey,
@@ -42,31 +44,14 @@ pub type Context = {
   lender: Option<{ owner: Bytes, written: List<code::Lambda> }>,
   observing: Bool,
   frame: Span,
+  lends: Bool,
+  written: List<code::Lambda>,
 }
 
 /// Where a call in tail position goes without a call of its own: to the root's start where it calls
 /// the root's own definition, to a member of the root's tail group (full names in case order), or
 /// nowhere, in a closure's body.
 pub type Tails = | Restarts | Enters(List<Bytes>) | Calls
-
-/// The context root `r` of `setting`, a definition of its own, lowers `body` under.
-pub fn context_of(setting: Setting, r: Root, body: Code) -> Context =
-  {
-    setting: setting,
-    key: Named(r.full),
-    full: r.full,
-    base: r.base,
-    params: r.params,
-    types: r.types,
-    answer: r.answer,
-    answer_ty: r.answer_ty,
-    body: body,
-    tails: Restarts,
-    param_at: range(0, r.params.len()).fold(Map::new(), |m: Map<Int, Int>, i: Int| m.insert(i, i)),
-    lender: None,
-    observing: false,
-    frame: dummy_span(),
-  }
 
 /// A body lowered so far: the next variable's number, what each slot holds, the block being
 /// written, the first refusal, the closures' bodies made so far, and what the root tells the unit.
@@ -263,6 +248,33 @@ pub fn handed(l: Lowered, to: Rep, at: Span) -> Lowered =
       AVar(v) -> match unpacked(l.st, v, to) { Some(back) -> back, None -> packed },
       _ -> packed,
     }
+  }
+
+/// `l`'s value at `t`, the type the checker gave it, where `l` holds a variable whose type leaves
+/// part of it unsaid and `t` says all of it: a lambda another root lent, run in place where its
+/// arguments and captures arrive as a type variable's words or a specialisation's erased ones, reads
+/// them at the types it was written for. The variable itself where `t` is held as it is, a word
+/// opened where it is held otherwise; `l` as it is for anything else.
+pub fn taken_as(cx: Context, l: Lowered, t: Type, at: Span) -> Lowered =
+  match l.arg {
+    AVar(v) -> if !unsaid(v.ty) || unsaid(t) { l } else {
+      let rep = held_as(cx.setting, t);
+      if rep == v.rep { { st: l.st, arg: AVar({ ..v, ty: t }) } }
+      else if v.rep == RWord { bound_as(l.st, t, rep, Pack({ arg: l.arg, to: rep }), at) }
+      else { l }
+    },
+    _ -> l,
+  }
+
+/// Whether `t` leaves part of a value's type unsaid: a type variable, or a word a specialisation
+/// erased to `_`, which says nothing more of it.
+pub fn unsaid(t: Type) -> Bool =
+  match t {
+    TyVar(_) -> true,
+    TyCon(c) -> c.name == b"_" || c.args.any(unsaid),
+    TyFn(f) -> f.params.push(f.ret).any(unsaid),
+    TyRecord(fs) -> fs.any(|f: Field| unsaid(f.ty)),
+    TyNominal(x) -> x.fields.any(|f: Field| unsaid(f.ty)),
   }
 
 /// `st` without its last instruction, where that makes `v` by holding a variable held as `to`

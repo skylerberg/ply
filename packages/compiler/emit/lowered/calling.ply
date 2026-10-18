@@ -5,14 +5,16 @@ import check.resolve.tables (qualify)
 import check.types (Type, TyCon, int_type)
 import emit.keys (Named, Root, Generic)
 import emit.reps (typed_at, BoundLambda)
+import emit.typing (unknown_type)
 import emit.tir (Rep, RInt, RWord, RFlat, RCases, Var, Arg, AVar, Val, Call, Apply, Make, Get, Pack,
-                 Op, OCalling, MClosure, MCtor, PCapture, TTag, Inst, Let, Do, If, Case, Match,
-                 Loop, Next, Done, Restart, Enter, Return, Sited, Block, Fn, Member, Closure,
-                 Declined, Family, Spine, Data, Calling, Matching, Handling, Scalars, Containers)
+                 Prim, Native, Op, OCalling, MClosure, MCtor, PCapture, TTag, Inst, Let, Do, If,
+                 Case, Match, Loop, Next, Done, Restart, Enter, Return, Sited, Block, Fn, Member,
+                 Closure, Declined, Family, Spine, Data, Calling, Matching, Handling, Scalars,
+                 Containers)
 import emit.tir.calling (EntryValue, ConstantRead, Ticked)
 import emit.lower (lowered_fn, lowered_group)
-import emit.lower.base (GroupMember, context_of)
-import emit.lower.calling (known_body, lambdas_of)
+import emit.lower.base (GroupMember)
+import emit.lower.calling (known_body, lambdas_of, context_of)
 import emit.answer (GenericCall)
 import emit.own (owned)
 import emit.roots (FnArg, symbol_of, specialised_with)
@@ -574,12 +576,15 @@ fn specialised_form(
     },
   }
 
-/// `apply_to` at the type named `ty` as the specialisation a build lowers where the corpus's root
-/// `lender` hands it the first lambda it writes, and the lender's base; or why not.
+/// Generic root `generic` of `p` at `args` as the specialisation a build lowers where root `lender`
+/// hands its parameter `param` the first lambda it writes, typed as a build types it, with its
+/// lender's whole body; and the lender's base; or why not.
 fn lent_run(
   p: Program,
   lender: Bytes,
-  ty: Bytes,
+  generic: Bytes,
+  args: List<Type>,
+  param: Int,
 ) -> Result<{ f: Fn, base: Int }, Bytes> / {abort.raise} =
   match match root_at(p, lender) { Some(i) -> p.roots.at(i), None -> None } {
     None -> Err(b"no such lender"),
@@ -605,10 +610,10 @@ fn lent_run(
             };
             match specialised_form(
                 p,
-                b"apply_to",
-                [TyCon({ name: ty, args: [] })],
-                [{ param: 0, owner: l.full, nth: 0 }],
-                [Some(bound)],
+                generic,
+                args,
+                [{ param: param, owner: l.full, nth: 0 }],
+                range(0, param + 1).map(|i: Int| if i == param { Some(bound) } else { None }),
               ) {
               Ok(f) -> Ok({ f: f, base: l.base }),
               Err(why) -> Err(why),
@@ -622,7 +627,13 @@ fn lent_run(
 test "another root's lambda a specialisation runs in place takes its lender's sites, and only there" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match lent_run(p, b"lends_word", b"String") {
+    Ok(p) -> match lent_run(
+        p,
+        b"lends_word",
+        b"apply_to",
+        [TyCon({ name: b"String", args: [] })],
+        0,
+      ) {
       Err(why) -> assert_eq(why, b""),
       Ok(run) -> {
         assert_eq(
@@ -648,7 +659,7 @@ test "another root's lambda a specialisation runs in place takes its lender's si
 test "a lent lambda's own lambdas are its lender's: one it binds runs in place, its closures take the lender's sites, one it hands on is lent by the lender" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match lent_run(p, b"lends_on", b"Int") {
+    Ok(p) -> match lent_run(p, b"lends_on", b"apply_to", [int_type()], 0) {
       Err(why) -> assert_eq(why, b""),
       Ok(run) -> {
         let lent = Sited(Some({ root: Named(b"m.lends_on"), base: run.base }));
@@ -665,6 +676,56 @@ test "a lent lambda's own lambdas are its lender's: one it binds runs in place, 
           [{ param: 0, owner: b"m.lends_on", nth: 1 }],
         ])
       },
+    },
+  }
+}
+
+/// The operators root `lender`'s lambda does over `Int`s where `fold_from` at `args` runs it in place,
+/// and how many it hands the runtime as words; or why it was not formed.
+fn folded_ops(
+  p: Program,
+  lender: Bytes,
+  args: List<Type>,
+) -> Result<{ c: List<Bytes>, runtime: Int }, Bytes> / {abort.raise} =
+  match lent_run(p, lender, b"fold_from", args, 3) {
+    Err(why) -> Err(why),
+    Ok(run) -> {
+      let vals = vals_in(run.f.body);
+      Ok({
+        c: vals.fold([], |acc: List<Bytes>, v: Val|
+          match v {
+            Prim(x) -> if x.on == RInt && x.op != b"ge" { acc.push(x.op) } else { acc },
+            _ -> acc,
+          }),
+        runtime: vals.filter(|v: Val|
+          match v { Native(n) -> n.name == b"rt_binary_p", _ -> false }).len(
+        ),
+      })
+    },
+  }
+
+test "a lent lambda run where its arguments and captures arrive as a type variable's or an erased word reads them at the types it was written for" {
+  let src = Bytes::concat_all([
+    b"fn fold_from<T, A>(xs: List<T>, i: Int, acc: A, f: (A, T) -> A) -> A =\n",
+    b"  match xs.at(i) { Some(x) -> fold_from(xs, i + 1, f(acc, x), f), None -> acc }\n",
+    b"fn bits(n: Int) -> Int =\n",
+    b"  fold_from(range(1, 7), 0, 0, |found: Int, b: Int| if 1 << b == n { b } else { found })\n",
+    b"fn digits(n: Int) -> Option<Int> =\n",
+    b"  fold_from(range(0, n), 0, Some(0), |so_far: Option<Int>, d: Int|\n",
+    b"    match so_far { Some(v) -> Some(v * 10 + d), None -> None })\n",
+  ]);
+  let erased = TyCon({ name: b"Option", args: [TyCon({ name: b"_", args: [] })] });
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      assert_eq(
+        folded_ops(p, b"bits", [unknown_type(), int_type()]),
+        Ok({ c: [b"add", b"shl", b"eq"], runtime: 0 }),
+      );
+      assert_eq(
+        folded_ops(p, b"digits", [unknown_type(), erased]),
+        Ok({ c: [b"add", b"mul", b"add"], runtime: 0 }),
+      )
     },
   }
 }
