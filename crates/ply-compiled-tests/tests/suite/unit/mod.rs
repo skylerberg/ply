@@ -6,10 +6,12 @@
 mod backend;
 mod blocks;
 mod c;
+mod emitted;
 mod heap;
 mod linked;
 mod list;
 mod map;
 mod parallel;
+mod rt;
 mod stack;
 mod stored;

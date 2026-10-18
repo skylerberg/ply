@@ -26,6 +26,12 @@ pub struct Ctx {
     /// The tick at which compiled code calls [`rt_tick`] back; `i64::MAX` when neither the budget
     /// nor the clock bounds this entry, so nothing calls back at all.
     pub next_tick: i64,
+    /// How deeply drop roots run nested: one at [`RELEASE_DEPTH`] puts its release off through
+    /// [`rt_release_later`], and the outermost drains what waits through [`rt_release_drain`].
+    /// Compiled code reads and writes it, so it stays among the fields before the runtime's own.
+    pub release_depth: i64,
+    /// How many releases wait in the context's buffer for the outermost drop root to drain them.
+    pub release_waiting: i64,
     /// The calls this entry may make; 0 is no bound.
     pub(super) step_budget: i64,
     /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
@@ -95,6 +101,8 @@ pub struct Ctx {
     pub(super) outer: (*mut Heap, *const i64),
     /// What that entry's unit answered of its types' keys, put back with them.
     pub(super) outer_instances: Option<ply_core::Instances>,
+    /// Releases a drop root at [`RELEASE_DEPTH`] put off: each word with the root that releases it.
+    pub(crate) release_later: Vec<(crate::emitted::Handed, crate::emitted::DropRoot)>,
 }
 
 impl Ctx {
@@ -109,6 +117,8 @@ impl Ctx {
             ticks: 0,
             charged: Cost::default(),
             next_tick: i64::MAX,
+            release_depth: 0,
+            release_waiting: 0,
             step_budget: 0,
             grown: 0,
             deadline: None,
@@ -148,6 +158,7 @@ impl Ctx {
             holds_made: 0,
             outer: (std::ptr::null_mut(), std::ptr::null()),
             outer_instances: None,
+            release_later: Vec::new(),
         }
     }
 
@@ -343,6 +354,9 @@ impl Ctx {
         self.unwind = None;
         self.aborting = None;
         self.resumed = None;
+        self.release_depth = 0;
+        self.release_waiting = 0;
+        self.release_later.clear();
         // Every path out of an entry calls `end`; this catches one that did not.
         if self.heap.allocated() != 0 {
             self.end();
@@ -403,6 +417,10 @@ impl Ctx {
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
+        debug_assert!(
+            self.release_later.is_empty() && self.release_depth == 0,
+            "an entry ended with a release still running or waiting"
+        );
         heap::poison::swap(self.outer.1);
         heap::swap_current(self.outer.0);
         ply_core::instances::swap(self.outer_instances.take());
@@ -417,7 +435,7 @@ impl Ctx {
                 self.grown
             );
             let by_kind = self.heap.allocated_by_kind();
-            let mut kinds: Vec<(usize, usize)> = (0..16).map(|k| (k, by_kind[k])).collect();
+            let mut kinds: Vec<(usize, usize)> = by_kind.into_iter().enumerate().collect();
             kinds.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
             for (kind, n) in kinds.into_iter().filter(|(_, n)| *n > 0) {
                 eprintln!("  allocated: kind {kind}: {n} objects");
@@ -436,6 +454,7 @@ impl Ctx {
                             .join(", ")
                     ),
                     heap::KIND_BYTES => format!("bytes under {key}"),
+                    heap::KIND_REFUSED => format!("emitted blocks of {key} bytes past the header"),
                     _ => format!("str under {key}"),
                 };
                 eprintln!("  allocated: {n} of {what}");

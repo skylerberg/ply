@@ -12,6 +12,7 @@ pub mod blocks;
 pub mod c;
 pub mod columns;
 pub mod detached;
+pub mod emitted;
 pub mod heap;
 pub mod host;
 pub mod laid;

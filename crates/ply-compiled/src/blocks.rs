@@ -78,6 +78,15 @@ pub fn block_of(class: usize) -> usize {
     (9 + k % 8) << (k / 8 + 4)
 }
 
+/// The bytes of the block [`Blocks::take`] hands out for `bytes`.
+pub fn taken_bytes(bytes: usize) -> usize {
+    if bytes > SMALL {
+        bytes
+    } else {
+        block_of(class_of(bytes))
+    }
+}
+
 unsafe fn page_of(block: *mut u8) -> *mut Page {
     let segment = (block.addr() & !(SEGMENT - 1)) as *mut Segment;
     unsafe { &raw mut (*segment).pages[(block.addr() & (SEGMENT - 1)) / PAGE] }
@@ -433,18 +442,25 @@ impl Blocks {
 
     /// Whether `address` is where a block this heap handed out begins.
     pub fn holds(&self, address: usize) -> bool {
+        self.bytes_at(address).is_some()
+    }
+
+    /// The bytes of the block at `address`, where one this heap handed out begins there.
+    pub fn bytes_at(&self, address: usize) -> Option<usize> {
         if !self.segments.contains(&(address & !(SEGMENT - 1))) {
-            return self.large.contains_key(&address);
+            return self.large.get(&address).copied();
         }
         unsafe {
             let page = page_of(address as *mut u8);
-            if (*page).block == 0 {
-                return false;
+            let block = (*page).block as usize;
+            if block == 0 {
+                return None;
             }
             let start = room(page).0.addr();
-            address >= start
+            (address >= start
                 && address < (*page).fresh.addr()
-                && (address - start).is_multiple_of((*page).block as usize)
+                && (address - start).is_multiple_of(block))
+            .then_some(block)
         }
     }
 
@@ -464,26 +480,28 @@ impl Blocks {
         }
     }
 
-    /// Every block handed out and not since emptied with its page, dead ones among them.
-    pub fn each(&self, mut f: impl FnMut(*mut u8)) {
+    /// Every block handed out and not since emptied with its page, dead ones among them, with its
+    /// bytes.
+    pub fn each(&self, mut f: impl FnMut(*mut u8, usize)) {
         unsafe {
             for &address in &self.segments {
                 let segment = address as *mut Segment;
                 for i in 0..PAGES {
                     let page = &raw mut (*segment).pages[i];
-                    if (*page).block == 0 {
+                    let bytes = (*page).block as usize;
+                    if bytes == 0 {
                         continue;
                     }
                     let mut block = room(page).0;
                     while block < (*page).fresh {
-                        f(block);
-                        block = block.add((*page).block as usize);
+                        f(block, bytes);
+                        block = block.add(bytes);
                     }
                 }
             }
         }
-        for &address in self.large.keys() {
-            f(address as *mut u8);
+        for (&address, &bytes) in &self.large {
+            f(address as *mut u8, bytes);
         }
     }
 

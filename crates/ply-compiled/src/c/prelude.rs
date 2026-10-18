@@ -1,6 +1,7 @@
 //! The C every emitted unit opens with. It mirrors `heap.rs` and `rt.rs`, and
 //! `the_prelude_agrees_with_the_layouts_it_mirrors` checks it against them.
 
+use crate::emitted::{Block, DropRoot, Handed};
 use crate::heap::Word;
 use crate::native::{Native, Raising};
 use crate::rt::Ctx;
@@ -318,6 +319,15 @@ helpers! {
     rt_node_writable(n) -> Word;
     rt_list_writable(xs, room) -> Word;
     rt_map_writable(m) -> Word;
+
+    rt_alloc_bytes(bytes) -> Block;
+    rt_alloc_kept(bytes) -> Block;
+    rt_free(o: Block, bytes);
+    rt_dec_shared_last(o: Block) -> Word;
+    rt_handle_free(h: Block);
+    rt_released_twice(o: Block);
+    rt_release_later(w: Handed, root: DropRoot);
+    rt_release_drain();
 }
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since
