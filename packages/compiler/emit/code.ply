@@ -702,7 +702,7 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
             node: NSimulate({
               size: inner.names.len(),
               captures: inner.captures,
-              body: mark(b.code, nothing_live(), moves_of(b.stack.moves, b.code)).code,
+              body: windowed(b.code, b.stack.moves),
               at: simulated_at(x.span),
             }),
           },
@@ -778,7 +778,7 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
                       resume: match c.resume { Some(_) -> true, None -> false },
                       size: f.names.len(),
                       captures: f.captures,
-                      body: mark(cb.code, nothing_live(), moves_of(cb.stack.moves, cb.code)).code,
+                      body: windowed(cb.code, cb.stack.moves),
                       at: c.span,
                     }),
                     stack: st_pop(cb.stack),
@@ -815,11 +815,7 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
                         ret: Some({
                           size: f.names.len(),
                           captures: f.captures,
-                          body: mark(
-                            rb.code,
-                            nothing_live(),
-                            moves_of(rb.stack.moves, rb.code),
-                          ).code,
+                          body: windowed(rb.code, rb.stack.moves),
                           at: r.span,
                         }),
                       }),
@@ -1164,7 +1160,7 @@ fn lam_of(params: List<Bytes>, b: Lowered, at: Span) -> Lowered = {
         params: params.len(),
         size: inner.names.len(),
         captures: inner.captures,
-        body: mark(b.code, nothing_live(), moves_of(b.stack.moves, b.code)).code,
+        body: windowed(b.code, b.stack.moves),
         at: at,
       }),
     },
@@ -2061,8 +2057,8 @@ fn fields_read(fs: List<CodeField>, before: List<Int>) -> List<Int> =
 
 pub type LowerOut = { dump: Bytes, lowered: Int, skipped: Int }
 
-/// One function body: slots resolved forwards, then ownership marked backwards. `labels` are the
-/// hidden parameters a label-generic definition takes after `params`.
+/// One function body, its slots resolved. `labels` are the hidden parameters a label-generic
+/// definition takes after `params`.
 pub fn lower_fn(
   params: List<Bytes>,
   labels: List<Bytes>,
@@ -2071,9 +2067,10 @@ pub fn lower_fn(
 ) -> Option<{ code: Code, size: Int }> / {abort.raise} =
   lowered(params, labels, sites, body, false, b"")
 
-/// `lower_fn`'s body as the code generator reads it, which hands a count on wherever the program
-/// no longer needs it: a call whose later argument reads a variable an earlier one passes binds
-/// its other arguments first, and a branch lets go first of what only another branch reads. A
+/// `lower_fn`'s body as today's code generator reads it, each read marked `Owned` at its slot's
+/// last read, which hands a count on wherever the program no longer needs it: a call whose later
+/// argument reads a variable an earlier one passes binds its other arguments first, and a branch
+/// lets go first of what only another branch reads. A
 /// call the checker wrote out through `own`, the binder of the module's own functions of types,
 /// is the call by name it is: one in tail position is a loop as any other of the module's is.
 pub fn lower_to_emit(
@@ -2109,13 +2106,13 @@ fn lowered(
       own: own,
     }) {
     None -> None,
-    Some(o) ->
-      Some({
-        code: mark(o.code, nothing_live(), moves_of(moves, o.code)).code,
-        size: st_top(o.stack).names.len(),
-      }),
+    Some(o) -> Some({ code: windowed(o.code, moves), size: st_top(o.stack).names.len() }),
   }
 }
+
+/// A window's body, marked where it is lowered for today's code generator, the marks' one reader.
+fn windowed(code: Code, moves: Bool) -> Code =
+  if !moves { code } else { mark(code, nothing_live(), moves_of(true, code)).code }
 
 pub fn lower_module(src: Bytes) -> LowerOut / {abort.raise} = dumped(src, false)
 
@@ -2155,6 +2152,8 @@ fn dumped(src: Bytes, moves: Bool) -> LowerOut / {abort.raise} = {
 
 pub fn lower_dump(src: Bytes) -> String / {abort.raise} = String::of_bytes(lower_module(src).dump)
 
+fn emitted_dump(src: Bytes) -> String / {abort.raise} = String::of_bytes(dumped(src, true).dump)
+
 /// A variable pattern is irrefutable: the parser makes every upper-case bare name in pattern position a constructor.
 pub fn irrefutable(pattern: CodePattern) -> Bool =
   match pattern { PxWild -> true, PxVar(_) -> true, _ -> false }
@@ -2171,30 +2170,34 @@ test "a name with no binder has no slot" {
   assert_eq(lower_dump(b"fn f() -> Int = g()\n"), "L;1;f:m.f:0:0;bapp(bvar(g,-));")
 }
 
-test "a parameter reads its slot and the last read owns it" {
+test "lowered to emit, a parameter reads its slot and the last read owns it" {
   assert_eq(
-    lower_dump(b"fn f(a: Int, b: Int) -> Int = a * b\n"),
+    emitted_dump(b"fn f(a: Int, b: Int) -> Int = a * b\n"),
     "L;1;f:m.f:2:2;bbin(mul,ovar(a,0),ovar(b,1));",
   )
 }
 
-test "a read with another after it borrows" {
+test "lowered to emit, a read with another after it borrows" {
   assert_eq(
-    lower_dump(b"fn f(x: Int) -> Int = x + x\n"),
+    emitted_dump(b"fn f(x: Int) -> Int = x + x\n"),
     "L;1;f:m.f:1:1;bbin(add,bvar(x,0),ovar(x,0));",
   )
 }
 
-test "both arms of an `if` see the same future" {
+test "lowered to emit, both arms of an `if` see the same future" {
   assert_eq(
-    lower_dump(b"fn f(n: Int) -> Int = if n > 0 { n } else { 0 - n }\n"),
+    emitted_dump(b"fn f(n: Int) -> Int = if n > 0 { n } else { 0 - n }\n"),
     "L;1;f:m.f:1:1;bif(bbin(gt,bvar(n,0),blit(i0)),bblock(ovar(n,0)),bblock(bbin(sub,blit(i0),ovar(n,0))));",
   )
 }
 
-test "a `let` takes the next slot and the binder dies at it" {
+test "a `let` takes the next slot and, lowered to emit, the binder dies at it" {
   assert_eq(
     lower_dump(b"fn f(a: Int) -> Int = { let b = a + 1; b }\n"),
+    "L;1;f:m.f:1:2;bblock(let(v:b:1,bbin(add,bvar(a,0),blit(i1))),bvar(b,1));",
+  );
+  assert_eq(
+    emitted_dump(b"fn f(a: Int) -> Int = { let b = a + 1; b }\n"),
     "L;1;f:m.f:1:2;bblock(let(v:b:1,bbin(add,ovar(a,0),blit(i1))),ovar(b,1));",
   )
 }
@@ -2202,32 +2205,30 @@ test "a `let` takes the next slot and the binder dies at it" {
 test "a match binds its arms into the window and each arm's binders leave at its end" {
   assert_eq(
     lower_dump(b"fn f(o: Option<Int>) -> Int = match o { Some(n) -> n, None -> 0 }\n"),
-    "L;1;f:m.f:1:2;bmatch(ovar(o,0),arm(c:Some(v:n:1,),-,ovar(n,1)),arm(c:None(),-,blit(i0)));",
+    "L;1;f:m.f:1:2;bmatch(bvar(o,0),arm(c:Some(v:n:1,),-,bvar(n,1)),arm(c:None(),-,blit(i0)));",
   )
 }
 
 test "a guard is lowered between its arm's pattern and body and reads the arm's binders" {
   assert_eq(
     lower_dump(b"fn f(n: Int) -> Int = match n { x if x > 0 -> x, _ -> n }\n"),
-    "L;1;f:m.f:1:2;bmatch(bvar(n,0),arm(v:x:1,bbin(gt,bvar(x,1),blit(i0)),ovar(x,1)),arm(_,-,ovar(n,0)));",
+    "L;1;f:m.f:1:2;bmatch(bvar(n,0),arm(v:x:1,bbin(gt,bvar(x,1),blit(i0)),bvar(x,1)),arm(_,-,bvar(n,0)));",
   )
 }
 
-test "a guard borrows what a later arm still reads, the matched variable included" {
+test "lowered to emit, a guard borrows what a later arm still reads, the matched variable included" {
   assert_eq(
-    lower_dump(b"fn f(n: Int, m: Int) -> Int = match n { x if x > m -> x, _ -> m }\n"),
-    "L;1;f:m.f:2:3;bmatch(bvar(n,0),arm(v:x:2,bbin(gt,bvar(x,2),bvar(m,1)),ovar(x,2)),arm(_,-,ovar(m,1)));",
+    emitted_dump(b"fn f(n: Int, m: Int) -> Int = match n { x if x > m -> x, _ -> m }\n"),
+    "L;1;f:m.f:2:3;bmatch(bvar(n,0),arm(v:x:2,bbin(gt,bvar(x,2),bvar(m,1)),bblock(do(ovar(m,1)),do(ovar(n,0)),ovar(x,2))),arm(_,-,bblock(do(ovar(n,0)),ovar(m,1))));",
   )
 }
 
 test "an or-pattern arm lowers to an arm per alternative, each binding its own slot" {
   assert_eq(
     lower_dump(b"fn f(p: (Int, Int)) -> Int = match p { (x, 0) | (0, x) -> x, _ -> 1 }\n"),
-    "L;1;f:m.f:1:3;bmatch(ovar(p,0),arm(r:(_0=v:x:1,_1=l:i0,),-,ovar(x,1)),arm(r:(_0=l:i0,_1=v:x:2,),-,ovar(x,2)),arm(_,-,blit(i1)));",
+    "L;1;f:m.f:1:3;bmatch(bvar(p,0),arm(r:(_0=v:x:1,_1=l:i0,),-,bvar(x,1)),arm(r:(_0=l:i0,_1=v:x:2,),-,bvar(x,2)),arm(_,-,blit(i1)));",
   )
 }
-
-fn emitted_dump(src: Bytes) -> String / {abort.raise} = String::of_bytes(dumped(src, true).dump)
 
 test "lowered to emit, a call whose later argument reads a variable an earlier one passes binds that argument first" {
   let src = b"fn f(xs: Array<Int>) -> Array<Int> = Array::set(xs, 0, Array::len(xs))\n";
@@ -2237,15 +2238,19 @@ test "lowered to emit, a call whose later argument reads a variable an earlier o
   );
   assert_eq(
     lower_dump(src),
-    "L;1;f:m.f:1:1;bapp(bvar(Array::set,-),bvar(xs,0),blit(i0),bapp(bvar(Array::len,-),ovar(xs,0)));",
+    "L;1;f:m.f:1:1;bapp(bvar(Array::set,-),bvar(xs,0),blit(i0),bapp(bvar(Array::len,-),bvar(xs,0)));",
   );
   assert_eq(
     emitted_dump(b"fn f(b: Bytes) -> Bytes = b ++ byte_of_int(Bytes::len(b))\n"),
     "L;1;f:m.f:1:2;bblock(let(v:#:1,bapp(bvar(byte_of_int,-),bapp(bvar(Bytes::len,-),bvar(b,0)))),bbin(concat,ovar(b,0),ovar(#,1)));",
   );
-  assert_eq(
-    emitted_dump(b"fn f(xs: List<Int>) -> List<Int> = List::map(xs, |x: Int| x + List::len(xs))\n"),
-    lower_dump(b"fn f(xs: List<Int>) -> List<Int> = List::map(xs, |x: Int| x + List::len(xs))\n"),
+  // A call taking a lambda is left as written.
+  assert(
+    !emitted_dump(
+      b"fn f(xs: List<Int>) -> List<Int> = List::map(xs, |x: Int| x + List::len(xs))\n",
+    ).contains(
+      "let(v:#",
+    ),
   )
 }
 
@@ -2261,7 +2266,7 @@ test "lowered to emit, a branch lets go first of what only another branch reads"
   );
   assert_eq(
     lower_dump(src),
-    "L;1;f:m.f:2:3;bblock(let(v:a:2,bfld(bvar(s,0),a)),bif(ovar(c,1),bblock(bapp(bvar(g,-),ovar(s,0))),bblock(bbin(add,bapp(bvar(Bytes::len,-),ovar(a,2)),bfld(ovar(s,0),b)))));",
+    "L;1;f:m.f:2:3;bblock(let(v:a:2,bfld(bvar(s,0),a)),bif(bvar(c,1),bblock(bapp(bvar(g,-),bvar(s,0))),bblock(bbin(add,bapp(bvar(Bytes::len,-),bvar(a,2)),bfld(bvar(s,0),b)))));",
   );
   assert_eq(
     emitted_dump(
@@ -2271,28 +2276,32 @@ test "lowered to emit, a branch lets go first of what only another branch reads"
   )
 }
 
-test "a field read before the record's other fields takes it, and one read again or before the whole record borrows it" {
+test "lowered to emit, a field read before the record's other fields takes it, and one read again or before the whole record borrows it" {
   assert_eq(
-    lower_dump(b"fn f(s: { a: Bytes, b: Int }) -> Int = Bytes::len(s.a) + s.b\n"),
+    emitted_dump(b"fn f(s: { a: Bytes, b: Int }) -> Int = Bytes::len(s.a) + s.b\n"),
     "L;1;f:m.f:1:1;bbin(add,bapp(bvar(Bytes::len,-),ofld(bvar(s,0),a)),bfld(ovar(s,0),b));",
   );
   assert_eq(
-    lower_dump(b"fn f(s: { a: Bytes, b: Int }) -> Int = Bytes::len(s.a) + Bytes::len(s.a)\n"),
+    emitted_dump(b"fn f(s: { a: Bytes, b: Int }) -> Int = Bytes::len(s.a) + Bytes::len(s.a)\n"),
     "L;1;f:m.f:1:1;bbin(add,bapp(bvar(Bytes::len,-),bfld(bvar(s,0),a)),bapp(bvar(Bytes::len,-),bfld(ovar(s,0),a)));",
   );
   assert_eq(
-    lower_dump(b"fn f(s: { a: Bytes, b: Int }) -> Int = Bytes::len(s.a) + g(s)\n"),
+    emitted_dump(b"fn f(s: { a: Bytes, b: Int }) -> Int = Bytes::len(s.a) + g(s)\n"),
     "L;1;f:m.f:1:1;bbin(add,bapp(bvar(Bytes::len,-),bfld(bvar(s,0),a)),bapp(bvar(g,-),ovar(s,0)));",
   )
 }
 
-test "an update's base is read through the fields it copies, so a field it sets is taken" {
+test "lowered to emit, an update's base is read through the fields it copies, so a field it sets is taken" {
   assert_eq(
-    lower_dump(b"fn f(s: { a: Bytes, b: Int }) -> { a: Bytes, b: Int } = { a: g(s.a), b: s.b }\n"),
+    emitted_dump(
+      b"fn f(s: { a: Bytes, b: Int }) -> { a: Bytes, b: Int } = { a: g(s.a), b: s.b }\n",
+    ),
     "L;1;f:m.f:1:1;bupd(ovar(s,0),c:b,s:a=bapp(bvar(g,-),ofld(bvar(s,0),a)));",
   );
   assert_eq(
-    lower_dump(b"fn f(s: { a: Bytes, b: Bytes }) -> { a: Bytes, b: Bytes } = { a: s.b, b: s.b }\n"),
+    emitted_dump(
+      b"fn f(s: { a: Bytes, b: Bytes }) -> { a: Bytes, b: Bytes } = { a: s.b, b: s.b }\n",
+    ),
     "L;1;f:m.f:1:1;bupd(ovar(s,0),c:b,s:a=bfld(bvar(s,0),b));",
   )
 }
@@ -2300,7 +2309,7 @@ test "an update's base is read through the fields it copies, so a field it sets 
 test "a `let ... else` lowers to a match over the rest of its block" {
   assert_eq(
     lower_dump(b"fn f(o: Option<Int>) -> Int = { let Some(v) = o else { 0 }; v + 1 }\n"),
-    "L;1;f:m.f:1:2;bblock(bmatch(ovar(o,0),arm(c:Some(v:v:1,),-,bblock(bbin(add,ovar(v,1),blit(i1)))),arm(_,-,bblock(blit(i0)))));",
+    "L;1;f:m.f:1:2;bblock(bmatch(bvar(o,0),arm(c:Some(v:v:1,),-,bblock(bbin(add,bvar(v,1),blit(i1)))),arm(_,-,bblock(blit(i0)))));",
   )
 }
 

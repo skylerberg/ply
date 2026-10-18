@@ -5,7 +5,14 @@ import compiler.emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NKnown, NIf,
                            NRecord, NMatch, NPerform, NLabel, NLambda, NSimulate, NParallel,
                            NHandle, NField, NUpdate, CodeStmt, CLet, CLetPat, CDo, CodeField,
                            CodeArm, CodeClause)
-import compiler.front.published (Claim, ClaimDef, ClaimSum, ClaimLaw, ClaimClause, Lowered)
+import compiler.emit.moves (Moves, root_moves)
+import compiler.emit.lower.setting (Setting, ItemRoot, settings_in)
+import compiler.unit (parsed_natives)
+import compiler.check.infer.definitions (Extern)
+import compiler.front.facts (Analysis)
+import compiler.front.published (Claim, ClaimDef, ClaimSum, ClaimLaw, ClaimClause, Lowered,
+                                 claims_in, named, rows_of, walked_facts)
+import compiler.syntax.items (IFn)
 import domain (Ty, Var, Fn, Record, Con, Decl, Variant)
 import sort (canonical, is_pure_fn)
 import world (Signature, World)
@@ -16,14 +23,12 @@ import std.graph
 /// call graph is made of. `ends`: the checker saw every call it makes of its own group descend;
 /// `stated`: it saw that only once the measures the group states are counted.
 /// `costed`: the parameters with a cost name, in the order a `cost` clause binds those after the
-/// parameters; `spaced`, those with a space name, as a `space` clause binds them. `moved`: the body as
-/// the emitter lowers it, which moves a value where its code does.
+/// parameters; `spaced`, those with a space name, as a `space` clause binds them.
 pub type Def = {
   params: Int,
   costed: List<Int>,
   spaced: List<Int>,
   body: Option<Code>,
-  moved: Option<Code>,
   spec: List<ClaimClause>,
   measure: Option<Code>,
   refs: List<String>,
@@ -33,7 +38,17 @@ pub type Def = {
 
 pub type Law = { guard: Option<Lowered>, body: Option<Code> }
 
-pub type Claims = { defs: Map<String, Def>, laws: Map<String, Law>, sums: Map<String, Int> }
+/// `read`: the program the claims were read from, where they were (`claims_read`).
+pub type Claims = {
+  defs: Map<String, Def>,
+  laws: Map<String, Law>,
+  sums: Map<String, Int>,
+  read: Option<{ analysis: Analysis, mods: List<Int> }>,
+}
+
+/// A body as the build lowers it, each global it reads named program-wide, and which of its reads
+/// hand their value on.
+pub type Moved = { body: Code, moves: Moves }
 
 /// A constructor beside the type it builds.
 pub type Ctor = { decl: Decl, variant: Variant }
@@ -59,32 +74,124 @@ pub type Context = {
   keyed_types: Map<String, Bool>,
 }
 
+/// The claims `cs` indexed, no body read as the build lowers it.
 pub fn claims_of(cs: List<Claim>) -> Claims =
-  cs.fold({ defs: Map::new(), laws: Map::new(), sums: Map::new() }, |acc: Claims, c: Claim|
-    match c {
-      ClaimDef(d) ->
-        {
-          ..acc,
-          defs: acc.defs.insert(String::of_bytes_lossy(d.name), {
-            params: d.params,
-            costed: d.costed,
-            spaced: d.spaced,
-            body: d.body,
-            moved: d.moved,
-            spec: d.spec,
-            measure: d.measure,
-            refs: match d.body { Some(b) -> refs_of(b, []), None -> [] },
-            ends: d.ends,
-            stated: d.stated,
-          }),
-        },
-      ClaimLaw(l) ->
-        {
-          ..acc,
-          laws: acc.laws.insert(String::of_bytes_lossy(l.key), { guard: l.guard, body: l.body }),
-        },
-      ClaimSum(s) -> { ..acc, sums: acc.sums.insert(String::of_bytes_lossy(s.name), s.variants) },
+  cs.fold(
+    { defs: Map::new(), laws: Map::new(), sums: Map::new(), read: None },
+    |acc: Claims, c: Claim|
+      match c {
+        ClaimDef(d) ->
+          {
+            ..acc,
+            defs: acc.defs.insert(String::of_bytes_lossy(d.name), {
+              params: d.params,
+              costed: d.costed,
+              spaced: d.spaced,
+              body: d.body,
+              spec: d.spec,
+              measure: d.measure,
+              refs: match d.body { Some(b) -> refs_of(b, []), None -> [] },
+              ends: d.ends,
+              stated: d.stated,
+            }),
+          },
+        ClaimLaw(l) ->
+          {
+            ..acc,
+            laws: acc.laws.insert(String::of_bytes_lossy(l.key), { guard: l.guard, body: l.body }),
+          },
+        ClaimSum(s) -> { ..acc, sums: acc.sums.insert(String::of_bytes_lossy(s.name), s.variants) },
+      },
+  )
+
+/// The claims of the modules at `mods` of `analysis`, a module not `owned` opaque, read so that a
+/// body's moves can be read off it as the build lowers it (`moved_of`).
+pub fn claims_read(
+  analysis: Analysis,
+  mods: List<Int>,
+  owned: (Bytes) -> Bool,
+) -> Claims / {abort.raise} =
+  { ..claims_of(claims_in(analysis, mods, owned)), read: Some({ analysis: analysis, mods: mods }) }
+
+/// Each of `names` the claims hold a body of, as the build lowers it, or why the typed form does
+/// not; none where the claims were not read off a program.
+pub fn moved_of(
+  claims: Claims,
+  names: List<String>,
+) -> Map<String, Result<Moved, String>> / {abort.raise} =
+  match claims.read {
+    None -> Map::new(),
+    Some(r) -> {
+      let wanted = names.fold(Map::new(), |acc: Map<String, Bool>, name: String|
+        match claims.defs.get(name) {
+          Some(d) -> if d.body == None { acc } else { acc.insert(name, true) },
+          None -> acc,
+        });
+      if wanted.len() == 0 { Map::new() } else { moved_in(r.analysis, r.mods, wanted) }
+    },
+  }
+
+fn moved_in(
+  analysis: Analysis,
+  mods: List<Int>,
+  wanted: Map<String, Bool>,
+) -> Map<String, Result<Moved, String>> / {abort.raise} = {
+  let writes = |i: Int| {
+    let prefix = analysis.mods.get(i).name.concat(b".");
+    wanted.fold(false, |any: Bool, name: String, _: Bool| {
+      let n = Bytes::of_string(name);
+      any || (n.starts_with(prefix) && n.slice(prefix.len(), n.len()).index_of(b".") == None)
     })
+  };
+  let natives = parsed_natives(analysis.mods).map(|e: Extern| e.name);
+  match settings_in(
+      analysis,
+      rows_of(analysis),
+      walked_facts(analysis),
+      analysis.mods,
+      mods.filter(writes),
+      |i: Int, setting: Setting, roots: List<ItemRoot>| {
+        let s = { ..setting, builtins: natives };
+        roots.fold([], |acc: List<{ name: String, moved: Result<Moved, String> }>, r: ItemRoot|
+          match r.item {
+            IFn(_) -> {
+              let name = String::of_bytes_lossy(r.root.full);
+              if !wanted.contains(name) { acc } else {
+                acc.push({
+                  name: name,
+                  moved: match r.root.code {
+                    None -> Err("`" ++ name ++ "` has a body the build does not lower"),
+                    Some(code) -> match root_moves(s, r.root, code) {
+                      Ok(m) -> Ok({ body: named(analysis.r, i, code), moves: m }),
+                      Err(no) ->
+                        Err(
+                          "`" ++ name ++ "` has a body the typed form does not lower: "
+                            ++ String::of_bytes_lossy(no.why),
+                        ),
+                    },
+                  },
+                })
+              }
+            },
+            _ -> acc,
+          })
+      },
+    ) {
+    Err(why) ->
+      wanted.fold(Map::new(), |acc: Map<String, Result<Moved, String>>, name: String, _: Bool|
+        acc.insert(name, Err("the program's facts are not read: " ++ String::of_bytes_lossy(why)))),
+    Ok(found) ->
+      found.fold(
+        Map::new(),
+        |acc: Map<String, Result<Moved, String>>, rows: List<{ name: String, moved: Result<Moved, String> }>|
+          rows.fold(
+            acc,
+            |a: Map<String, Result<Moved, String>>, row: { name: String, moved: Result<Moved, String> }|
+              a.insert(row.name, row.moved),
+          ),
+      ),
+  }
+}
 
 /// Every global a body names, even under an effect the prover treats as opaque.
 pub fn refs_of(c: Code, acc: List<String>) -> List<String> =
@@ -368,7 +475,6 @@ fn measure_defs(
                   costed: [],
                   spaced: [],
                   body: Some(m),
-                  moved: None,
                   spec: [],
                   measure: None,
                   refs: refs_of(m, []),

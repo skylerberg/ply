@@ -1,0 +1,159 @@
+//! Which reads of a root's body hand their value on, read off the body's typed form as the ownership
+//! pass lays it out. A body lowered observing (`lower.root_observed`) notes each read of a slot, each
+//! slot a closure captures, and each lambda's frame entered afresh, where the form does so; a read
+//! moves where no path the form lays out after it reads that slot again before its frame is entered
+//! afresh, as a loop's next pass, a branch's join and a match's next arm do. A field read moves
+//! where the ownership pass takes the field out of its block.
+
+import syntax.parsing (Span, span_key)
+import std.bytes (ascii_of_int)
+import emit.tir (Fn, Block, Inst, Let, Do, If, Case, Match, Miss, Loop, Next, Done, Return, Restart,
+                 Enter, Fail, Handle, Val, Native, Take, Get, AInt, Lambda, Closure, Declined)
+import emit.code (Code)
+import emit.lower (root_observed)
+import emit.lower.base (read_note, capture_note, enter_note)
+import emit.lower.setting (Setting, Root)
+import emit.own (owned)
+
+/// Each read noted, by its place, each capture, by the closure's place and the slot, and each field
+/// read, by its place: whether it moves. A place noted more than once (a body run in place at more
+/// than one call) moves only where every one of its reads does.
+pub type Moves = { reads: Map<Bytes, Bool>, captures: Map<Bytes, Bool>, taken: Map<Bytes, Bool> }
+
+pub fn no_moves() -> Moves = { reads: Map::new(), captures: Map::new(), taken: Map::new() }
+
+/// Whether the read of a slot written at `at` moves its value.
+pub fn read_moved(m: Moves, at: Span) -> Bool = m.reads.get(span_key(at)) == Some(true)
+
+/// Whether the closure written at `at` takes slot `src` of the frame it is made in, which nothing
+/// after it reads, rather than a copy of it.
+pub fn capture_moved(m: Moves, at: Span, src: Int) -> Bool =
+  m.captures.get(capture_key(at, src)) == Some(true)
+
+/// Whether the field read written at `at` takes the field out of its block.
+pub fn field_taken(m: Moves, at: Span) -> Bool = m.taken.get(span_key(at)) == Some(true)
+
+fn capture_key(at: Span, src: Int) -> Bytes =
+  Bytes::concat_all([span_key(at), b"#", ascii_of_int(src)])
+
+/// The moves of root `r` of `setting`, whose body lowers to `code`, as its owned form makes them;
+/// or why the form does not cover the body.
+pub fn root_moves(
+  setting: Setting,
+  r: Root,
+  code: Code,
+) -> Result<Moves, Declined> / {abort.raise} =
+  match root_observed(setting, r, code) { Err(no) -> Err(no), Ok(f) -> Ok(moves_of(owned(f))) }
+
+/// The moves of `f`, a root lowered observing and owned, and of each closure it makes.
+pub fn moves_of(f: Fn) -> Moves =
+  f.lambdas.fold(walked(f.body, no_moves()), |m: Moves, l: Lambda|
+    match l { Closure(c) -> moves_of_closure(c.body, m) })
+
+fn moves_of_closure(f: Fn, m: Moves) -> Moves =
+  f.lambdas.fold(walked(f.body, m), |acc: Moves, l: Lambda|
+    match l { Closure(c) -> moves_of_closure(c.body, acc) })
+
+/// The slots read on some path from a point, each by its frame and number.
+type Live = Map<Bytes, Bool>
+
+/// Where control goes other than on: a match arm's miss, a loop's next pass and its end.
+type Exits = { miss: Live, next: Live, done: Live }
+
+type Walked = { live: Live, moves: Moves }
+
+fn walked(b: Block, m: Moves) -> Moves = {
+  let none: Live = Map::new();
+  back(b, { live: none, moves: m }, { miss: none, next: none, done: none }).moves
+}
+
+fn union(a: Live, b: Live) -> Live = b.fold(a, |acc: Live, k: Bytes, _: Bool| acc.insert(k, true))
+
+fn noted(map: Map<Bytes, Bool>, key: Bytes, moved: Bool) -> Map<Bytes, Bool> =
+  map.insert(key, match map.get(key) { Some(was) -> was && moved, None -> moved })
+
+/// `b` walked from its end, `after` holding what is read after it.
+fn back(b: Block, after: Walked, ex: Exits) -> Walked =
+  b.fold_right(after, |i: Inst, w: Walked|
+    match i {
+      Do(d) -> note(d.val, d.at, w),
+      Let(l) -> {
+        let fields = match l.val {
+          Take(_) -> noted(w.moves.taken, span_key(l.at), true),
+          Get(_) -> noted(w.moves.taken, span_key(l.at), false),
+          _ -> w.moves.taken,
+        };
+        { ..w, moves: { ..w.moves, taken: fields } }
+      },
+      If(x) -> {
+        let t = back(x.then, w, ex);
+        let o = back(x.otherwise, { ..w, moves: t.moves }, ex);
+        { live: union(t.live, o.live), moves: o.moves }
+      },
+      Case(c) -> {
+        let rest = back(c.rest, w, ex);
+        c.arms.fold(rest, |acc: Walked, a: { when: Int, body: Block }| {
+          let arm = back(a.body, { ..w, moves: acc.moves }, ex);
+          { live: union(acc.live, arm.live), moves: arm.moves }
+        })
+      },
+      // An arm that misses goes on to the next, so each is walked after the ones below it.
+      Match(x) ->
+        x.arms.fold_right(back(x.rest, w, ex), |arm: Block, next: Walked|
+          back(arm, { ..w, moves: next.moves }, { ..ex, miss: next.live })),
+      Miss -> { ..w, live: ex.miss },
+      // A pass reads again what the next one does: the body is walked until what its start reads
+      // is what its passes do.
+      Loop(l) -> {
+        let inner = |head: Live, moves: Moves|
+          back(l.body, { live: Map::new(), moves: moves }, { ..ex, next: head, done: w.live });
+        let once = inner(Map::new(), w.moves);
+        let twice = inner(once.live, once.moves);
+        let thrice = inner(union(once.live, twice.live), twice.moves);
+        { live: union(twice.live, thrice.live), moves: thrice.moves }
+      },
+      Next(_) -> { ..w, live: ex.next },
+      Done(_) -> { ..w, live: ex.done },
+      Return(_) -> { ..w, live: Map::new() },
+      Restart(_) -> { ..w, live: Map::new() },
+      Enter(_) -> { ..w, live: Map::new() },
+      Fail(_) -> { ..w, live: Map::new() },
+      Handle(h) -> back(h.body, w, ex),
+      _ -> w,
+    })
+
+/// `w` before the instruction doing `v` at `at`: a read noted there moves where nothing after it
+/// reads its slot, and is read from there on; a frame entered there reads none of its slots before.
+fn note(v: Val, at: Span, w: Walked) -> Walked =
+  match v {
+    Native(n) -> match n.args {
+      [AInt(slot), AInt(start), AInt(end)] -> {
+        let key = frame_key(start, end).concat(ascii_of_int(slot));
+        let moved = !w.live.contains(key);
+        if n.name == read_note() {
+          {
+            live: w.live.insert(key, true),
+            moves: { ..w.moves, reads: noted(w.moves.reads, span_key(at), moved) },
+          }
+        } else if n.name == capture_note() {
+          {
+            live: w.live.insert(key, true),
+            moves: { ..w.moves, captures: noted(w.moves.captures, capture_key(at, slot), moved) },
+          }
+        } else { w }
+      },
+      [AInt(start), AInt(end)] -> if n.name != enter_note() { w } else {
+        let frame = frame_key(start, end);
+        {
+          ..w,
+          live: w.live.fold(Map::new(), |kept: Live, k: Bytes, _: Bool|
+            if k.starts_with(frame) { kept } else { kept.insert(k, true) }),
+        }
+      },
+      _ -> w,
+    },
+    _ -> w,
+  }
+
+fn frame_key(start: Int, end: Int) -> Bytes =
+  Bytes::concat_all([ascii_of_int(start), b":", ascii_of_int(end), b"/"])
