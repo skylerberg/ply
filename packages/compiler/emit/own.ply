@@ -25,8 +25,8 @@ import emit.tir (Rep, RWord, RInt, RBool, RMaybe, RTagged, RFlat, RCases, RToken
                  Path, PField, PArg, PLeaf, PNamed, Made, MRecord, MCtor, MList, MClosure, TInt,
                  Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next, Done, Return,
                  Restart, Enter, Fail, NoArm, Handle, Sited, Inc, Dec, Reset, Free, Opened, Block,
-                 Fn, Member, Convention, Rooted, Lambda, Closure, Handed, Given, Lent, Test, TTag,
-                 Owns, ReadsOf, Lasts, no_links, counted, operands, answered, fails, used_as,
+                 Fn, Member, Convention, Rooted, Lambda, Closure, Handed, Given, Lent, Owned, Test,
+                 TTag, Owns, ReadsOf, Lasts, no_links, counted, operands, answered, fails, used_as,
                  var_of, rep_of_arg, parts_of)
 import emit.verify (verified, stacked_captures, payload_of, field_path, held_in_place, stops_at)
 
@@ -75,8 +75,8 @@ type Exits = {
 
 /// A `Make` the cells of a value let go of above it could go to: its place in the block it is in,
 /// counted from that block's end; the branches on the way to that block, each by its place, so
-/// counted, and the arm taken; the type it makes, what it makes, and from what.
-type Taker = { at: Int, route: List<{ at: Int, arm: Int }>, ty: Type, made: Made, args: List<Arg> }
+/// counted, and the arm taken; the variable it binds, what it makes, and from what.
+type Taker = { at: Int, route: List<{ at: Int, arm: Int }>, to: Var, made: Made, args: List<Arg> }
 
 /// A block walked from its end back to a point: its instructions after the point, last first;
 /// what is live at the point; the first free variable number; and the `Make`s reached from the
@@ -902,22 +902,30 @@ fn entered(
   { block: b.rev.reverse(), next: b.next, takers: b.takers }
 }
 
-/// `takers` with `inst` among them where it makes a constructor's object afresh. One of no payload
-/// words is a singleton nothing allocates, and a record is made by value, so neither takes cells.
+/// `takers` with `inst` among them where it makes a constructor's object afresh.
 fn taking(takers: List<Taker>, inst: Inst, at: Int) -> List<Taker> =
   match inst {
     Let(l) -> match l.val {
-      Make(m) -> if m.reuse != None || l.var.rep != RWord { takers } else {
-        match m.made {
-          MCtor(c) -> if c.width == 0 { takers }
-          else { takers.push({ at: at, route: [], ty: l.var.ty, made: m.made, args: m.args }) },
-          _ -> takers,
-        }
-      },
+      Make(m) -> if m.reuse == None && takes_cells(l.var, m.made) {
+        takers.push({ at: at, route: [], to: l.var, made: m.made, args: m.args })
+      } else { takers },
       _ -> takers,
     },
     _ -> takers,
   }
+
+/// Whether a `Make` of `made` bound to `to` writes a block whose cells could be another's: a
+/// constructor's object of payload words. One of none is a singleton nothing allocates, and a record
+/// is made by value.
+fn takes_cells(to: Var, made: Made) -> Bool =
+  to.rep == RWord && (match made { MCtor(c) -> c.width != 0, _ -> false })
+
+/// Whether the cells of `v`, let go of where the case around knows it to hold constructor `known`,
+/// fit a `Make` of `made` bound to `to`: Lean's `reset`. `lend` gives every parameter it may hold
+/// of, so lending never costs a reuse.
+pub fn reuses(v: Var, known: Option<Bytes>, to: Var, made: Made) -> Bool =
+  takes_cells(to, made) && v.rep == RWord && v.ty == to.ty
+    && (match made { MCtor(c) -> known == Some(c.name), _ -> false })
 
 /// Where `t` is first reached in the block it was found from: its own place, or the branch it is in.
 fn first_at(t: Taker) -> Int = match t.route.at(0) { Some(s) -> s.at, None -> t.at }
@@ -960,11 +968,7 @@ fn token_of(id: Int, of: Var, made: Made) -> Var =
     rep: RToken(match made { MRecord(r) -> r.width, MCtor(c) -> c.width, _ -> 0 }),
   }
 
-/// Whether `t` may take the cells of `v`: a value of the same type held as its object, of the
-/// constructor the case around knows `v` to hold.
-fn fits(ex: Exits, v: Var, t: Taker) -> Bool =
-  v.rep == RWord && v.ty == t.ty
-    && (match t.made { MCtor(c) -> ex.known.get(v.id) == Some(c.name), _ -> false })
+fn fits(ex: Exits, v: Var, t: Taker) -> Bool = reuses(v, ex.known.get(v.id), t.to, t.made)
 
 fn stopping(i: Inst) -> Bool =
   match i { Let(l) -> stops_at(l.val), Do(d) -> stops_at(d.val), _ -> false }
@@ -1086,6 +1090,7 @@ fn root_of(params: List<Var>, lent: List<Int>, answer: Rep, body: Block) -> Fn =
       params: range(0, params.len()).map(|i: Int| if lent.contains(i) { Lent } else { Given }),
       reps: params.map(|p: Var| p.rep),
       answer: answer,
+      answered: Owned,
     },
     body: body,
     lambdas: [],
@@ -1103,6 +1108,7 @@ fn call_of(args: List<Arg>, lent: List<Int>) -> Val =
       params: range(0, args.len()).map(|i: Int| if lent.contains(i) { Lent } else { Given }),
       reps: args.map(rep_of_arg),
       answer: RWord,
+      answered: Owned,
     },
     stops: false,
   })
@@ -1167,7 +1173,7 @@ test "a function value applied is consumed by the call, so one applied again tak
     Apply({
       f: AVar(f),
       args: [AVar(arg)],
-      conv: { params: [Given], reps: [RWord], answer: RWord },
+      conv: { params: [Given], reps: [RWord], answer: RWord, answered: Owned },
       stops: false,
     });
   assert_eq(
