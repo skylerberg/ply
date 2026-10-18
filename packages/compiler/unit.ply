@@ -37,7 +37,9 @@ import std.fs (fs)
 import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
+import syntax.parsing
 import syntax.parsing (no_module)
+import syntax.items (homes_called, homes_declaring)
 import syntax.exprs (prelude_module)
 
 // --- What crosses the seam ----------------------------------------------------
@@ -1361,6 +1363,20 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program = {
 
 fn text_at(program: Program, index: Int) -> Option<Bytes> = program.sources.at(index)
 
+/// The home modules each of `modules` calls a function of a type of with no import, as the front
+/// end pulled them for it ([`homes_called`]): the checker names each such function through a binder
+/// of its home, which no import of the module reaches.
+fn homes_called_by(program: Program, modules: List<Bytes>) -> List<Bytes> / {abort.raise} = {
+  let texts = program.modules.fold(Map::new(), |acc: Map<Bytes, Bytes>, m: ModuleRow|
+    match text_at(program, m.index) { Some(t) -> acc.insert(m.name, t), None -> acc });
+  let declared = homes_declaring(|h: Bytes| texts.get(h));
+  modules.fold([], |acc: List<Bytes>, m: Bytes|
+    match texts.get(m) {
+      Some(t) -> acc.concat(homes_called(m, parsing::start(t).input, || declared)),
+      None -> acc,
+    })
+}
+
 /// `modules` and every module they import, directly or not: all the emitter reads to lower a body
 /// of one of them.
 fn imported(program: Program, modules: List<Bytes>) -> Map<Bytes, Bool> / {abort.raise} = {
@@ -1598,7 +1614,8 @@ fn repacked(
   })
 
 /// What the emitter answers for `missed`: entered once, over the modules those roots are in, the
-/// ones whose lambdas they run, and the ones those import.
+/// ones whose lambdas they run, the home modules those call functions of types of, and the ones
+/// all of those import.
 fn emitter_answers(
   runtime: Runtime,
   dump: Dump,
@@ -1612,7 +1629,7 @@ fn emitter_answers(
       acc.insert(module_of_root(n), true),
       |m: Map<Bytes, Bool>, f: FnArg| m.insert(module_of_root(f.owner), true),
     ));
-  let needed = imported(p, lowered.keys());
+  let needed = imported(p, lowered.keys().concat(homes_called_by(p, lowered.keys())));
   let placed = range(0, p.modules.len()).filter(|i: Int| needed.contains(p.modules.get(i).name));
   let names = placed.map(|i: Int| p.modules.get(i).name);
   // A module no wanted root is in is read for its declarations, its rows standing for its bodies.
@@ -3256,14 +3273,6 @@ fn held_over(
   natives: List<Native>,
 ) -> Result<Bytes, List<Diag>> / {abort.raise} = {
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
-  let texts = user.concat(shipped).fold(
-    Map::new(),
-    |acc: Map<Bytes, Bytes>, s: { name: Bytes, src: Bytes }| acc.insert(s.name, s.src),
-  );
-  let indexed = dump.modules.fold(Map::new(), |acc: Map<Int, Bytes>, m: ModuleRow|
-    acc.insert(m.index, match texts.get(m.name) { Some(t) -> t, None -> b"" }));
-  let sources = range(0, indexed.len()).map(|i: Int|
-    match indexed.get(i) { Some(t) -> t, None -> b"" });
   let every = dump.emitter_roots.map(|r: EmitterRoot| r.root);
   held(
     dump,
@@ -3271,7 +3280,7 @@ fn held_over(
     emitted(
       { ..a_runtime(b"r"), natives: natives },
       dump,
-      sources,
+      sources_placed(dump, user.concat(shipped)),
       Map::new(),
       every,
       b"",
@@ -3279,6 +3288,18 @@ fn held_over(
       |_: Bytes, _: Bytes| (),
     ),
   )
+}
+
+/// The texts of `modules`, and the prelude's where none of them is it, at the places `dump` gives
+/// them.
+fn sources_placed(dump: Dump, modules: List<{ name: Bytes, src: Bytes }>) -> List<Bytes> = {
+  let texts = modules.fold(
+    Map::new().insert(prelude_module(), prelude_source::text()),
+    |acc: Map<Bytes, Bytes>, s: { name: Bytes, src: Bytes }| acc.insert(s.name, s.src),
+  );
+  let indexed = dump.modules.fold(Map::new(), |acc: Map<Int, Bytes>, m: ModuleRow|
+    acc.insert(m.index, match texts.get(m.name) { Some(t) -> t, None -> b"" }));
+  range(0, indexed.len()).map(|i: Int| match indexed.get(i) { Some(t) -> t, None -> b"" })
 }
 
 fn refusal(r: Result<Bytes, List<Diag>>) -> List<Bytes> =
@@ -3362,6 +3383,23 @@ test "a unit is refused where the runtime implements a shipped module's `extern 
     b"`extern fn doubled` of `std.native` takes 1 word and cannot raise, and the runtime's native takes 2 words and cannot raise",
     natives_refused([]).notes_text.get(0),
   ])
+}
+
+test "a function of a type a module calls with no import is read from its home, which the emitter is handed" {
+  let user = [{ name: b"m", src: b"fn first(xs: List<Int>) -> Int / {abort.raise} = xs.get(0)\n" }];
+  let shipped = [
+    {
+      name: b"std.list",
+      src: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
+    },
+  ];
+  let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
+  let p = program_of(dump, sources_placed(dump, user.concat(shipped)));
+  assert_eq(
+    emitter_answers(a_runtime(b"r"), dump, p, [], [b"m.first"]).map(|r: RootAnswer|
+      match r.answer { Body(_) -> r.name, Refused(no) -> no.why }),
+    [b"m.first"],
+  )
 }
 
 test "a root the emitter refuses is asked again, and nothing of the refusal is kept" {
