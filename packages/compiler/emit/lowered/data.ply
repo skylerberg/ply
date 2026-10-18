@@ -10,7 +10,7 @@ import emit.compare (Program, program_of, formed, checked, printed_text, not_bui
 import emit.print (printed_fn)
 import emit.own (owned)
 import emit.tir (Rep, RFloat, RWord, RMaybe, RFlat, RCases, Var, AVar, AInt, AZero, Val, Make,
-                 MRecord, MCtor, Get, Pack, Gathered, PLeaf, PField, PNamed, Inst, Let, Decl,
+                 MRecord, MCtor, MLaid, Get, Pack, Gathered, PLeaf, PField, PNamed, Inst, Let, Decl,
                  Assign, If, Case, Match, Block, Fn, Family, Data, Calling, Leaf, counted,
                  rep_of_arg)
 import emit.lower.held (enumerated, held_as)
@@ -18,8 +18,8 @@ import emit.lower.base (Context, started)
 import emit.lower.calling (context_of)
 import emit.lower.data (updated)
 import emit.code (NLit)
-import emit.reps (Whole, no_ctors)
-import emit.c (KBoxed)
+import emit.reps (Whole, FieldTy, TyRec, TyOpen, no_ctors)
+import emit.c (KBoxed, KFloat, KInt)
 import emit.typing (unknown_type)
 import check.types (TyRecord, int_type)
 import syntax.patterns (LUnit)
@@ -315,19 +315,53 @@ test "an update reads its base's layout once, however wide the record" {
   };
   // The field set is the constant itself; each other is read off its leaf, then all are gathered.
   assert_eq(moved(3).st.insts.len(), 3);
+  // Past four words each other is loaded from its slot, then the record is made of them.
+  let wide = moved(6).st.insts;
+  assert_eq(wide.len(), 6);
+  assert_eq(
+    match wide.at(5) { Some(Let(l)) -> match l.val { Make(_) -> true, _ -> false }, _ -> false },
+    true,
+  );
   paced(|n: Int| n * (ilog2(n) + 1), |n: Int| moved(n).st.insts.len())
 }
 
-test "a record a root answers as its word is gathered and then made its word" {
+test "a record wider than four words is held as its word, and an update makes it once of its fields" {
   let f = form_of(program(), b"relabelled");
-  let made = lets(f.body).map(|l: { var: Var, val: Val }| l.var.rep);
-  // `Seg` is nine words: held as its seven leaves in the body, answered as its word.
-  assert_eq(made.at(made.len() - 1), Some(RWord));
-  match made.at(made.len() - 2) {
-    Some(RFlat(ls)) -> assert_eq(ls.len(), 7),
+  let s = param(f, 0);
+  assert_eq(s.rep, RWord);
+  // `Seg` is nine words: its points are read as their leaves and their headers' addresses, and the
+  // record made of them and the label set, as nothing packs a record held as its leaves.
+  let made = lets(f.body);
+  assert_eq(made.map(|l: { var: Var, val: Val }| l.var.rep), [
+    floats([b"x", b"y"]),
+    floats([b"x", b"y"]),
+    RWord,
+  ]);
+  assert_eq(made.map(|l: { var: Var, val: Val }| l.val).take(2), [
+    Get({ of: s, path: PField({ name: b"from", at: 0 }) }),
+    Get({ of: s, path: PField({ name: b"to", at: 5 }) }),
+  ]);
+  assert_eq(
+    vals(f).filter(|v: Val| match v { Pack(_) -> true, Gathered(_) -> true, _ -> false }),
+    [],
+  );
+  match vals(f).at(2) {
+    Some(Make(m)) -> assert_eq(m.made, MLaid({ ctor: None, fields: seg_fields() })),
     other -> assert_eq(other, None),
-  };
-  assert_eq(match vals(f).at(made.len() - 1) { Some(Pack(k)) -> k.to == RWord, _ -> false }, true)
+  }
+}
+
+/// `Seg`'s fields as it is laid out: each point in place, `label` a word between them.
+fn seg_fields() -> List<FieldTy> = {
+  let p = TyRec([
+    { name: b"x", kind: KFloat, ty: TyOpen([]) },
+    { name: b"y", kind: KFloat, ty: TyOpen([]) },
+  ]);
+  [
+    { name: b"from", kind: KBoxed, ty: p },
+    { name: b"label", kind: KBoxed, ty: TyOpen([]) },
+    { name: b"to", kind: KBoxed, ty: p },
+  ]
 }
 
 test "a join of records is a variable of their type held as its leaves, each arm setting it" {
@@ -422,7 +456,10 @@ test "a declared sum's constructor is made as its object, its arguments laid as 
   let boxed = form_of(p, b"boxed");
   assert_eq(vals(circle), [
     Make({
-      made: MCtor({ name: b"m.Circle", width: 1 }),
+      made: MLaid({
+        ctor: Some(b"m.Circle"),
+        fields: [{ name: b"a000", kind: KFloat, ty: TyOpen([]) }],
+      }),
       args: [AVar(param(circle, 0))],
       reuse: None,
       kept: [],
@@ -430,7 +467,13 @@ test "a declared sum's constructor is made as its object, its arguments laid as 
   ]);
   assert_eq(vals(boxed), [
     Make({
-      made: MCtor({ name: b"m.Box", width: 2 }),
+      made: MLaid({
+        ctor: Some(b"m.Box"),
+        fields: [
+          { name: b"a000", kind: KInt, ty: TyOpen([]) },
+          { name: b"a001", kind: KBoxed, ty: TyOpen([]) },
+        ],
+      }),
       args: [AVar(param(boxed, 0)), AVar(param(boxed, 1))],
       reuse: None,
       kept: [],
@@ -457,7 +500,7 @@ test "a record made its word holds its floats as their bits and its records in p
   let has = |text: Bytes|
     [b"widened", b"segment", b"relabelled"].map(|n: Bytes| own_code(p, n).index_of(text) != None);
   assert_eq(has(b"rt_box_float_p"), [false, false, false]);
-  assert_eq(has(b"] = ply_f64_bits("), [true, true, true]);
+  assert_eq(has(b" = ply_f64_bits("), [true, true, true]);
   // `from` takes a header's two words and its own two, `label` the fifth, `to` the four after, and
   // the bitmap after them names the fifth alone as counted.
   assert_eq(has(b"rt_alloc_p(ctx, 3, 9, @@s"), [false, true, true]);
@@ -628,47 +671,40 @@ test "a constructor's argument held in place is read through its header's addres
   holds_all(dx, [Bytes::concat_all([b" = ply_f64(ply_words(", dot, b")[0]);"])])
 }
 
-test "a constructor lays a record holding records in place out at every depth" {
+test "a constructor holds a wide record in place, copied in from its word, and a small one's points written there" {
   let p = nested();
-  // `Line`'s object: `Seg`'s header and nine words, `Seg`'s bitmap, and its own naming `label`.
+  // `Line`'s object: `Seg`'s header and nine words, `Seg`'s bitmap, and its own naming `label`. A
+  // `Seg` is held as its word, so it is copied in whole, its bitmap with it.
   let line = built(p, b"line");
   let t = set_to(line, b"rt_alloc_p(ctx, 4, 12, ");
-  let seg = set_to(line, b"p0;");
-  let seg_at = Bytes::concat_all([b"((Word)(intptr_t)(ply_words(", t, b") + 0))"]);
   holds_all(line, [
     Bytes::concat_all([b"ply_words(", t, b")[12] = INT64_C(64);"]),
-    // A `Seg` made already is copied in whole, its bitmap with it.
-    Bytes::concat_all([b"ply_embed(ctx, ", t, b", 0, ", seg, b", 1);"]),
-    // One that was not has its header written, `label` at word six and its bitmap at eleven, and each
-    // point's header in `Seg`'s words, counting back to `Seg`.
-    Bytes::concat_all([b"ply_embedded(", t, b", 0, 6, 9, "]),
-    Bytes::concat_all([b"ply_words(", t, b")[6] = ", seg.slice(0, seg.len() - 1), b"3;"]),
-    Bytes::concat_all([b"ply_words(", t, b")[11] = INT64_C(16);"]),
-    Bytes::concat_all([b"ply_embedded(", seg_at, b", 0, 5, 2, "]),
-    Bytes::concat_all([b"ply_embedded(", seg_at, b", 5, 5, 2, "]),
-    Bytes::concat_all([b"ply_words(", t, b")[4] = ply_f64_bits("]),
-    Bytes::concat_all([b"ply_words(", t, b")[10] = ply_f64_bits("]),
+    Bytes::concat_all([b"ply_embed(ctx, ", t, b", 0, p0, 1);"]),
   ]);
-  // A literal's points made already are copied into `Seg`'s words; ones that were not are written there.
+  assert_eq(line.index_of(b"ply_embedded("), None);
+  // A literal `Seg` is made once, `label` at word four, its bitmap at nine naming it, and each point
+  // made already copied into its words or written there as its leaves where not; then copied in.
   let literal = built(p, b"line_of");
+  let s = set_to(literal, b"rt_alloc_p(ctx, 3, 9, ");
   let lt = set_to(literal, b"rt_alloc_p(ctx, 4, 12, ");
-  let lseg = Bytes::concat_all([b"((Word)(intptr_t)(ply_words(", lt, b") + 0))"]);
   holds_all(literal, [
-    Bytes::concat_all([b"ply_embedded(", lt, b", 0, 6, 9, "]),
-    Bytes::concat_all([b"ply_embed(ctx, ", lseg, b", 0, "]),
-    Bytes::concat_all([b"ply_embed(ctx, ", lseg, b", 5, "]),
-    Bytes::concat_all([b"ply_words(", lt, b")[5] = ply_f64_bits("]),
-    Bytes::concat_all([b"ply_words(", lt, b")[9] = ply_f64_bits("]),
+    Bytes::concat_all([b"ply_words(", s, b")[9] = INT64_C(16);"]),
+    Bytes::concat_all([b"ply_embed(ctx, ", s, b", 0, "]),
+    Bytes::concat_all([b"ply_embed(ctx, ", s, b", 5, "]),
+    Bytes::concat_all([b"ply_embedded(", s, b", 0, 5, 2, "]),
+    Bytes::concat_all([b"ply_embedded(", s, b", 5, 5, 2, "]),
+    Bytes::concat_all([b"ply_words(", s, b")[2] = ply_f64_bits("]),
+    Bytes::concat_all([b"ply_words(", s, b")[8] = ply_f64_bits("]),
+    Bytes::concat_all([b"ply_embed(ctx, ", lt, b", 0, ", s, b", 1);"]),
   ])
 }
 
-test "a record held in place in one read out of a word loads its own records' leaves through their headers" {
+test "a wide record held in place is read as its header's address, and its small ones as their leaves" {
   let first = built(nested(), b"first_x");
   // `n` takes word zero, so `s`'s header is at word one, and `from`'s at word zero of `s`'s.
   let s = set_to(first, b"((Word)(intptr_t)(ply_words(p0) + 1));");
-  holds_all(first, [
-    Bytes::concat_all([b" = ply_f64(ply_words(((Word)(intptr_t)(ply_words(", s, b") + 0)))[0]);"]),
-  ])
+  let from = set_to(first, Bytes::concat_all([b"((Word)(intptr_t)(ply_words(", s, b") + 0));"]));
+  holds_all(first, [Bytes::concat_all([b" = ply_f64(ply_words(", from, b")[0]);"])])
 }
 
 test "a value's layout is read off its node's type where the value carries none" {
