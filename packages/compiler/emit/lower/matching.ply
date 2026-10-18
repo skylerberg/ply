@@ -14,7 +14,7 @@ import emit.reps (SumCtor)
 import emit.written (at_args)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases,
                  RSlice, Leaf, Var, Arg, AVar, AInt, ABool, ANum, AZero, Uses, Prim, Get, Gathered,
-                 Native, PArg, PLeaf, Decl, Assign, If, Case, Match, Miss, Fail, NoArm, NoLet,
+                 Native, PArg, PLeaf, Inst, Decl, Assign, If, Case, Match, Miss, Fail, NoArm, NoLet,
                  Block, Test, TTag, TInt, TRange, TLength, Matching, rep_of_arg)
 import emit.lower.setting (Setting, ctor_named, ctor_sum)
 import emit.lower.held (held_as, arg_path, arg_held, case_index, case_span)
@@ -22,6 +22,7 @@ import emit.lower.base (Context, Lowering, Lowered, Armed, refuse, fresh, bound_
                         continued, join_type, set_join, type_of, handed)
 import emit.lower.data (field)
 import emit.lower.scalars (literal, binary)
+import std.pace (paced)
 
 /// The state arm `arm` of a match on `subject` is lowered in: a block of its own after `st`, holding
 /// the pattern's tests, each missing to the next arm, and its binders in its environment. Its guard
@@ -419,19 +420,25 @@ fn flipped(n: Int) -> Int = n ^ 0 - 9223372036854775807 - 1
 /// rest runs, and the rest runs inside the test that passed, knowing what it tested. A test is a
 /// `Case` of one empty arm, or an `If` whose passing branch is empty, that leaves by `failing`.
 fn nest(b: Block, failing: Block) -> Block =
-  range(0, b.len()).fold([], |after: Block, k: Int|
-    match b.at(b.len() - 1 - k) {
-      None -> after,
-      Some(i) -> match i {
-        Case(c) -> if c.rest == failing && c.arms.len() == 1
-            && c.arms.all(|a: { when: Int, body: Block }| a.body.len() == 0) {
-          [Case({ ..c, arms: c.arms.map(|a: { when: Int, body: Block }| { ..a, body: after }) })]
-        } else { [i].concat(after) },
-        If(x) -> if x.then.len() == 0 && x.otherwise == failing { [If({ ..x, then: after })] }
-        else { [i].concat(after) },
-        _ -> [i].concat(after),
-      },
-    })
+
+  // What follows each point is held last first, so each instruction is added at the end.
+  b.fold_right([], |i: Inst, after: Block|
+    match i {
+      Case(c) -> if c.rest == failing && c.arms.len() == 1
+          && c.arms.all(|a: { when: Int, body: Block }| a.body.len() == 0) {
+        [
+          Case({
+            ..c,
+            arms: c.arms.map(|a: { when: Int, body: Block }| { ..a, body: after.reverse() }),
+          }),
+        ]
+      } else { after.push(i) },
+      If(x) -> if x.then.len() == 0 && x.otherwise == failing {
+        [If({ ..x, then: after.reverse() })]
+      } else { after.push(i) },
+      _ -> after.push(i),
+    }).reverse(
+  )
 
 /// A constructor resolved: its name in the program's table, its sum's constructors in their
 /// declared order, its place among them, and its arguments' types at the type it was tested at.
@@ -629,3 +636,12 @@ fn rest_read(st: Lowering, v: Var, list: Arg, from: Option<Arg>, n: Int) -> Lowe
 /// A runtime read of a list's item or rest: borrows the list and its index, answers a count of its
 /// own, and fails where the list is shorter.
 fn list_read() -> Uses = { takes: [false, false], owned: true, fails: true, stops: false }
+
+test "a test holds what follows it, nested in one walk of the arm however long it is" {
+  let v = { id: 0, ty: named_type(b"m.T"), rep: RWord };
+  let tested = |body: Block|
+    Case({ on: v, test: TTag([b"m.A", b"m.B"]), arms: [{ when: 0, body: body }], rest: [Miss] });
+  let decls = |n: Int| range(0, n).map(|i: Int| Decl({ ..v, id: i + 1 }));
+  assert_eq(nest([Decl(v), tested([])].concat(decls(2)), [Miss]), [Decl(v), tested(decls(2))]);
+  paced(|n: Int| n, |n: Int| nest([tested([])].concat(decls(n)), [Miss]))
+}
