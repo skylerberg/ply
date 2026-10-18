@@ -6,9 +6,9 @@ import emit.code (Code, NApp, NLambda, Lambda)
 import check.types (TyCon)
 import emit.keys (Named, At, KeyType, Root, Generic)
 import emit.tir (Rep, RInt, RWord, RFlat, Var, Arg, AVar, Val, Call, Apply, Make, Get, Pack, Op,
-                 OCalling, MClosure, PCapture, TTag, Inst, Let, Do, If, Case, Loop, Next, Done,
-                 Restart, Enter, Sited, Block, Fn, Member, Closure, Declined, Family, Spine, Data,
-                 Calling, Matching, Handling, Scalars, Containers)
+                 OCalling, MClosure, MCtor, PCapture, TTag, Inst, Let, Do, If, Case, Match, Loop,
+                 Next, Done, Restart, Enter, Sited, Block, Fn, Member, Closure, Declined, Family,
+                 Spine, Data, Calling, Matching, Handling, Scalars, Containers)
 import emit.tir.calling (EntryValue, ConstantRead, Ticked)
 import emit.lower (lowered_fn, lowered_group)
 import emit.lower.base (GroupMember, context_of)
@@ -42,6 +42,7 @@ fn corpus() -> Bytes =
     b"fn apply_to<T>(f: (T) -> T, x: T) -> T = f(x)\n",
     b"fn lends(x: Int) -> Int = apply_to(|y: Int| y + x, x)\n",
     b"fn steps(n: Int) -> Int / {abort.raise} = iterate(0, n, |i: Int| if i >= 10 { Stop(i) } else { Continue(i + 1) })\n",
+    b"fn count_down(n: Int) -> Int / {abort.raise} = iterate(n, 100, |k: Int| match k { m if m <= 0 -> Stop(m), m -> Continue(m - 1) })\n",
     b"fn step_of(i: Int) -> Iter<Int, Int> = if i >= 10 { Stop(i) } else { Continue(i + 1) }\n",
     b"fn stepped(n: Int, k: Int) -> Int / {abort.raise} = iterate(0, n, |i: Int| step_of(i + k))\n",
     b"fn even(n: Int) -> Bool / {diverges} = if n == 0 { true } else { odd(n - 1) }\n",
@@ -77,6 +78,7 @@ fn names() -> List<Bytes> =
     b"apply_to",
     b"lends",
     b"steps",
+    b"count_down",
     b"step_of",
     b"stepped",
     b"even",
@@ -116,13 +118,21 @@ fn form(name: Bytes) -> Result<Fn, Bytes> / {abort.raise} =
     Ok(p) -> match lowered_as_built(p, name) { Ok(f) -> Ok(f), Err(no) -> Err(no.why) },
   }
 
-/// Every value `b` binds or does, its branches' too, in order.
+/// Every value `b` binds or does, its branches', cases', arms' and loops' too, in order.
 fn vals_in(b: Block) -> List<Val> =
   b.fold([], |acc: List<Val>, i: Inst|
     match i {
       Let(l) -> acc.push(l.val),
       Do(d) -> acc.push(d.val),
       If(x) -> acc.concat(vals_in(x.then)).concat(vals_in(x.otherwise)),
+      Case(c) ->
+        c.arms.fold(acc, |a: List<Val>, arm: { when: Int, body: Block }|
+          a.concat(vals_in(arm.body))).concat(
+          vals_in(c.rest),
+        ),
+      Match(m) ->
+        m.arms.fold(acc, |a: List<Val>, arm: Block| a.concat(vals_in(arm))).concat(vals_in(m.rest)),
+      Loop(l) -> acc.concat(vals_in(l.body)),
       _ -> acc,
     })
 
@@ -421,6 +431,29 @@ test "a lambda a let binds and a call runs in place reads its captures off its c
   }
 }
 
+test "a step whose every arm makes its Continue or Stop goes on or leaves at once, making no object" {
+  let made = |f: Fn|
+    vals_in(f.body).filter(|v: Val|
+      match v { Make(m) -> match m.made { MCtor(_) -> true, _ -> false }, _ -> false }).len(
+    );
+  let looped = |f: Fn| f.body.filter(|i: Inst| match i { Loop(_) -> true, _ -> false }).len();
+  match form(b"steps") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(looped(f), 1);
+      assert_eq(made(f), 0)
+    },
+  };
+  // A `match` with a guard, as well as an `if`.
+  match form(b"count_down") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(looped(f), 1);
+      assert_eq(made(f), 0)
+    },
+  }
+}
+
 test "a step's loop prints as a C for over its state, spending its budget before each pass" {
   match form(b"stepped") {
     Err(why) -> assert_eq(why, b""),
@@ -655,6 +688,7 @@ test "the corpus's C reads as today's emitter's, but for the roots named with wh
         { name: b"local", why: released },
         { name: b"lends", why: released },
         { name: b"steps", why: budget },
+        { name: b"count_down", why: budget },
         {
           name: b"step_of",
           why: b"a constructor's object is made into a local of its own, where today's emitter declares the local first",

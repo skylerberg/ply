@@ -22,9 +22,9 @@ import emit.keys (Named, At, KeyArg, KeyType, KeyLayout, Callee, Root, Generic, 
                   definition_of)
 import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, Var, Arg, AVar, AInt, AZero, Given,
                  Convention, Val, Prim, Make, Get, Pack, Native, Op, OCalling, MClosure, MCtor,
-                 PCapture, TTag, TInt, Call, Apply, Inst, Let, Do, Decl, Assign, If, Case, Loop,
-                 Next, Done, Restart, Enter, Return, Fail, NoArm, Sited, Block, Fn, Rooted, Member,
-                 Closure, Declined, Calling, no_links, falls_through, rep_of_arg)
+                 PCapture, TTag, TInt, Call, Apply, Inst, Let, Do, Decl, Assign, If, Case, Match,
+                 Loop, Next, Done, Restart, Enter, Return, Fail, NoArm, Sited, Block, Fn, Rooted,
+                 Member, Closure, Declined, Calling, no_links, falls_through, rep_of_arg)
 import emit.tir.calling (EntryValue, ConstantRead, BuiltinValue, Ticked)
 import emit.lower.setting (carrier_of, imported_target, qualified)
 import emit.lower.held (held_as, carried_as, arg_path)
@@ -519,43 +519,98 @@ fn fused(b: Block, v: Arg, e: Ended) -> Option<Pass> =
   match v {
     AVar(x) -> match b.at(b.len() - 1) {
       Some(Let(l)) -> if l.var != x { None } else { ending(b.take(b.len() - 1), l.val, e) },
-      Some(If(i)) -> match b.at(b.len() - 2) {
-        Some(Decl(j)) -> if j != x { None } else {
-          match arm_ended(i.then, j, e) {
-            None -> None,
-            Some(t) -> match arm_ended(i.otherwise, j, { ..e, next: t.next }) {
-              None -> None,
-              Some(o) ->
-                Some({
-                  block: b.take(b.len() - 2).push(If({ ..i, then: t.block, otherwise: o.block })),
-                  next: o.next,
-                }),
-            },
-          }
-        },
-        _ -> None,
-      },
-      _ -> None,
+      _ -> if b.contains(Decl(x)) { rewritten(b.filter(|i: Inst| i != Decl(x)), x, e) }
+      else { None },
     },
     _ -> None,
   }
 
-/// An arm of a step's last `if`, which sets join `j`: one that leaves sets nothing and stays; one
-/// that sets `j` to a `Continue` or a `Stop` it makes goes on or leaves instead.
-fn arm_ended(b: Block, j: Var, e: Ended) -> Option<Pass> =
-  if !falls_through(b) { Some({ block: b, next: e.next }) } else {
-    match b.at(b.len() - 1) {
-      Some(Assign(a)) -> if a.var != j { None } else {
-        match a.arg {
-          AVar(x) -> match b.at(b.len() - 2) {
-            Some(Let(l)) -> if l.var != x { None } else { ending(b.take(b.len() - 2), l.val, e) },
-            _ -> None,
+/// `b`, a block of a step's pass whose `if`s, `case`s and `match`es join in `j`, with each path that
+/// sets `j` to a `Continue` or a `Stop` it makes going on or leaving instead; nothing where a path
+/// sets `j` otherwise.
+fn rewritten(b: Block, j: Var, e: Ended) -> Option<Pass> = {
+  let walked = b.fold(Some({ block: [], next: e.next }), |acc: Option<Pass>, i: Inst|
+    match acc {
+      None -> None,
+      Some(a) -> match i {
+        If(x) -> match rewritten(x.then, j, { ..e, next: a.next }) {
+          None -> None,
+          Some(t) -> match rewritten(x.otherwise, j, { ..e, next: t.next }) {
+            None -> None,
+            Some(o) ->
+              Some({
+                block: a.block.push(If({ ..x, then: t.block, otherwise: o.block })),
+                next: o.next,
+              }),
           },
-          _ -> None,
-        }
+        },
+        Case(c) -> {
+          let arms = c.arms.fold(
+            Some({ arms: [], next: a.next }),
+            |got: Option<{ arms: List<{ when: Int, body: Block }>, next: Int }>, arm: { when: Int, body: Block }|
+              match got {
+                None -> None,
+                Some(g) -> match rewritten(arm.body, j, { ..e, next: g.next }) {
+                  None -> None,
+                  Some(r) ->
+                    Some({ arms: g.arms.push({ when: arm.when, body: r.block }), next: r.next }),
+                },
+              },
+          );
+          match arms {
+            None -> None,
+            Some(g) -> match rewritten(c.rest, j, { ..e, next: g.next }) {
+              None -> None,
+              Some(r) ->
+                Some({
+                  block: a.block.push(Case({ ..c, arms: g.arms, rest: r.block })),
+                  next: r.next,
+                }),
+            },
+          }
+        },
+        Match(m) -> {
+          let arms = m.arms.fold(
+            Some({ arms: [], next: a.next }),
+            |got: Option<{ arms: List<Block>, next: Int }>, arm: Block|
+              match got {
+                None -> None,
+                Some(g) -> match rewritten(arm, j, { ..e, next: g.next }) {
+                  None -> None,
+                  Some(r) -> Some({ arms: g.arms.push(r.block), next: r.next }),
+                },
+              },
+          );
+          match arms {
+            None -> None,
+            Some(g) -> match rewritten(m.rest, j, { ..e, next: g.next }) {
+              None -> None,
+              Some(r) ->
+                Some({ block: a.block.push(Match({ arms: g.arms, rest: r.block })), next: r.next }),
+            },
+          }
+        },
+        _ -> Some({ block: a.block.push(i), next: a.next }),
       },
-      _ -> None,
-    }
+    });
+  match walked { None -> None, Some(w) -> settled(w, j, e) }
+}
+
+/// A block `w` of a step's pass, its nested blocks rewritten: where it ends setting join `j` to a
+/// `Continue` or a `Stop` it makes, going on or leaving instead; nothing where it sets `j` otherwise.
+fn settled(w: Pass, j: Var, e: Ended) -> Option<Pass> =
+  match w.block.at(w.block.len() - 1) {
+    Some(Assign(a)) -> if a.var != j { Some(w) } else {
+      match a.arg {
+        AVar(x) -> match w.block.at(w.block.len() - 2) {
+          Some(Let(l)) -> if l.var != x { None }
+          else { ending(w.block.take(w.block.len() - 2), l.val, { ..e, next: w.next }) },
+          _ -> None,
+        },
+        _ -> None,
+      }
+    },
+    _ -> Some(w),
   }
 
 /// `b` ended by the step's answer made as `val`: a `Continue`'s argument the next pass's state, a
