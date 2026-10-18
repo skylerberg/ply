@@ -13,9 +13,8 @@ import syntax.parsing (Span, span_key, starts_upper, prelude_binder)
 import check.resolve.tables (qualify)
 import check.infer.checker (is_test_owner)
 import std.bytes (ascii_of_int)
-import emit.reps (Def, Imported, Carrier, Whole, erased, has_vars, carrier_of, carriers_at,
-                  carried_vars, substituted_fully)
-import emit.state (EmitParam, BoundLambda)
+import emit.reps (Def, Imported, Carrier, Whole, EmitParam, BoundLambda, erased, has_vars,
+                  carrier_of, carriers_at, carried_vars, substituted_fully)
 import emit.c (KBoxed)
 import emit.roots (FnArg, specialisation_of, own_definition)
 import emit.keys (Named, Callee, Root, Generic, root_name)
@@ -974,7 +973,7 @@ pub fn known_body(full: Bytes, params: List<EmitParam>, body: Code) -> Code =
   )
 
 /// A definition the root names: its full name and how the emitter reads it.
-type Defined = { full: Bytes, def: Def }
+pub type Defined = { full: Bytes, def: Def }
 
 /// A call's callee as the root names it, and the type arguments it names it at.
 type Reference = { st: Lowering, callee: Callee, args: List<Type> }
@@ -1409,7 +1408,7 @@ fn fn_args(cx: Context, codes: List<Code>) -> List<FnArg> / {abort.raise} = {
         NKnown(k) -> if k.owner != owner || lends {
           acc.push({ param: j, owner: k.owner, nth: k.nth })
         } else { acc },
-        NVar(_) -> match named_arity(cx, c) {
+        NVar(_) -> match named_arity(cx.setting.module, cx.setting.here, cx.setting.imports, c) {
           Some(n) -> handed_as(j, named_lambda(c, n), acc),
           None -> acc,
         },
@@ -1441,14 +1440,22 @@ fn lends_lambdas(cx: Context) -> Bool / {abort.raise} = {
 /// What the root lends: the lambdas its body writes, then each definition it hands a definition as a
 /// value, as the lambda around a call of it.
 fn written_in(cx: Context) -> List<Lambda> / {abort.raise} =
-  lambdas_of(cx.body).concat(named_in(cx, cx.body))
+  lambdas_of(cx.body).concat(
+    named_in(cx.setting.module, cx.setting.here, cx.setting.imports, cx.body),
+  )
 
-/// How many arguments the definition `c` names as a value takes; none where `c` is not a
-/// definition named as a value, or takes a witness or a label a call would fill.
-fn named_arity(cx: Context, c: Code) -> Option<Int> / {abort.raise} =
+/// How many arguments the definition `c` names as a value takes, its name read in `module`, which
+/// defines `here` and imports `imports`; none where `c` is not a definition named as a value, or
+/// takes a witness or a label a call would fill.
+fn named_arity(
+  module: Bytes,
+  here: List<Def>,
+  imports: List<Imported>,
+  c: Code,
+) -> Option<Int> / {abort.raise} =
   match c.node {
     NVar(v) -> if v.slot != None { None } else {
-      match def_named(cx, v.name) {
+      match def_in(module, here, imports, v.name) {
         Some(d) -> match d.def.scheme {
           Some(sc) -> match sc.ty {
             TyFn(f) -> if d.def.witnesses == 0 && f.params.len() == d.def.arity {
@@ -1483,26 +1490,35 @@ fn named_lambda(c: Code, n: Int) -> Lambda = {
   }
 }
 
-/// Each definition `c` hands a definition as a value, as `named_lambda` reads it, in one fixed order.
-fn named_in(cx: Context, c: Code) -> List<Lambda> / {abort.raise} = {
-  let within = |codes: List<Code>|
-    codes.fold([], |acc: List<Lambda>, x: Code| acc.concat(named_in(cx, x)));
+/// Each definition `c` hands a definition as a value, as `named_lambda` reads it, in one fixed order,
+/// names read in `module`, which defines `here` and imports `imports`.
+pub fn named_in(
+  module: Bytes,
+  here: List<Def>,
+  imports: List<Imported>,
+  c: Code,
+) -> List<Lambda> / {abort.raise} = {
+  let go = |x: Code| named_in(module, here, imports, x);
+  let within = |codes: List<Code>| codes.fold([], |acc: List<Lambda>, x: Code| acc.concat(go(x)));
   match c.node {
     NApp(a) -> {
       let callee = match a.func.node {
-        NVar(v) -> v.slot == None && def_named(cx, v.name) != None,
+        NVar(v) -> v.slot == None && def_in(module, here, imports, v.name) != None,
         _ -> false,
       };
       let handed = if !callee { [] } else {
         a.args.fold([], |acc: List<Lambda>, x: Code|
-          match named_arity(cx, x) { Some(n) -> acc.push(named_lambda(x, n)), None -> acc })
+          match named_arity(module, here, imports, x) {
+            Some(n) -> acc.push(named_lambda(x, n)),
+            None -> acc,
+          })
       };
       handed.concat(within(a.args.push(a.func)))
     },
-    NLambda(l) -> named_in(cx, l.body),
-    NUnary(u) -> named_in(cx, u.operand),
+    NLambda(l) -> go(l.body),
+    NUnary(u) -> go(u.operand),
     NBinary(b) -> within([b.lhs, b.rhs]),
-    NField(f) -> named_in(cx, f.base),
+    NField(f) -> go(f.base),
     NIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
     NBlock(b) ->
       within(
@@ -1521,7 +1537,7 @@ fn named_in(cx: Context, c: Code) -> List<Lambda> / {abort.raise} = {
           List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
       ),
     NPerform(x) -> within(x.args),
-    NSimulate(x) -> named_in(cx, x.body),
+    NSimulate(x) -> go(x.body),
     NParallel(x) -> within(x.branches),
     NHandle(h) ->
       within(
@@ -1580,7 +1596,8 @@ fn position_in(ls: List<Lambda>, l: Lambda) -> Option<Int> =
   range(0, ls.len()).fold(None, |acc: Option<Int>, k: Int|
     match acc { Some(_) -> acc, None -> if ls.at(k) == Some(l) { Some(k) } else { None } })
 
-fn has_handle(c: Code) -> Bool = {
+/// Whether `c` holds a `handle` anywhere, a lambda's or a known lambda's body among it.
+pub fn has_handle(c: Code) -> Bool = {
   let within = |codes: List<Code>| codes.fold(false, |acc: Bool, x: Code| acc || has_handle(x));
   match c.node {
     NHandle(_) -> true,
@@ -1733,13 +1750,22 @@ fn extern_named(cx: Context, name: Bytes) -> Bytes / {abort.raise} =
     None -> name,
   }
 
-/// The definition `name` names in the root's module: its own first, then what an import reaches.
+/// The definition `name` names in the root's module.
 fn def_named(cx: Context, name: Bytes) -> Option<Defined> / {abort.raise} =
+  def_in(cx.setting.module, cx.setting.here, cx.setting.imports, name)
+
+/// The definition `name` names in `module`, which defines `here` and imports `imports`: the
+/// module's own first, then what an import reaches; none for a constructor's name.
+pub fn def_in(
+  module: Bytes,
+  here: List<Def>,
+  imports: List<Imported>,
+  name: Bytes,
+) -> Option<Defined> / {abort.raise} =
   if is_ctor_name(name) { None } else {
-    match cx.setting.here.fold(None, |acc: Option<Def>, d: Def|
-        if d.name == name { Some(d) } else { acc }) {
-      Some(d) -> Some({ full: qualify(cx.setting.module, name), def: d }),
-      None -> match imported_target(cx.setting.imports, name) {
+    match here.fold(None, |acc: Option<Def>, d: Def| if d.name == name { Some(d) } else { acc }) {
+      Some(d) -> Some({ full: qualify(module, name), def: d }),
+      None -> match imported_target(imports, name) {
         None -> None,
         Some(t) -> match t.imp.defs.fold(None, |acc: Option<Def>, d: Def|
             if d.name == t.name { Some(d) } else { acc }) {
@@ -1763,12 +1789,12 @@ fn reference_args(cx: Context, scheme: Option<Scheme>, at: Span) -> List<Type> =
     },
   }
 
-// Copies of the emitter's calls' and scope's readers, which the lowering takes over.
-
 fn same_fns(a: List<FnArg>, b: List<FnArg>) -> Bool =
   a.len() == b.len() && a.all(|f: FnArg| b.contains(f))
 
-fn is_ctor_name(name: Bytes) -> Bool / {abort.raise} =
+/// Whether `name` names a constructor: as written, `binder::Name`, or program-wide, as code the
+/// emitter writes names one, `m.Name`; a written root's name, which spells a type, does not.
+pub fn is_ctor_name(name: Bytes) -> Bool / {abort.raise} =
   name.index_of(b"#") == None
     && starts_upper(match qualified(name) {
       Some(q) -> q.name,

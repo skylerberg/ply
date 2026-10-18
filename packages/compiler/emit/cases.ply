@@ -21,7 +21,7 @@ import expand.embed (embed_file)
 import std.bytes (ascii_of_int)
 import std.prelude_source
 import emit.layout (layouts, intrinsics, Intrinsic)
-import emit.c (bytes_join, unsettled)
+import emit.c (bytes_join)
 import emit.roots (builtin_helper, reflection_root, written_root, specialised, specialised_with,
                    specialisation_of, symbol_of, entry_of)
 import emit.answer (ConstBytes, ConstEmbedded, Defined, Expect, word_head, GenericCall, Exact,
@@ -29,27 +29,22 @@ import emit.answer (ConstBytes, ConstEmbedded, Defined, Expect, word_head, Gener
                     RootAnswer)
 import emit.reps (SumCtor, no_ctors, ctor_sums, ctor_layouts)
 import emit.written (at_args)
-import emit (said, refused_rather_than_emitted, emit_program, operands_in, emit_roots_answer,
-             zip_sources)
+import emit (said, refused_rather_than_emitted, emit_program, emit_roots_answer, zip_sources)
 import front.seam
 
 // --- Specialisation ----------------------------------------------------------------------------
 
-test "a body that would overrun this thread's stack runs the same call on a stack of its own" {
+test "a body that would overrun this thread's stack makes room on the stack it runs on" {
   let out = emit_all_program([{ name: b"m", src: b"fn g(b: Bytes) -> Bytes = b\n" }], [], [], true);
   let text = match out.at(0) { Some(e) -> e.text, None -> b"" };
-  assert_eq(
+  assert(
     text.index_of(
-        Bytes::concat_all([
-          b"{ char probe; if ((uintptr_t)&probe < ctx->stack_floor) { Word ply_grown[1];",
-          b" ply_grown[0] = p0; return rt_grow_p(ctx, (Word)(intptr_t)&",
-          symbol_of(b"m.g"),
-          b"_entry, (Word)(intptr_t)ply_grown); } }",
-        ]),
+        b"{ char probe; if ((uintptr_t)&probe < ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }",
       )
       != None,
-    true,
   );
+  // No call is run again on a stack of its own.
+  assert_eq(text.index_of(b"rt_grow_p") != None, false);
   assert_eq(text.index_of(b"rt_no_stack_p") != None, false)
 }
 
@@ -94,7 +89,7 @@ test "a self call that takes no arguments restarts the body as well" {
   // A lone definition is no group, so the jump is the self path's, and a nullary body assigns nothing before it.
   let spin = match out.at(0) {
     Some(e) -> e,
-    None -> { name: b"", text: b"", tables: no_tables(), why: None, handles: [] },
+    None -> { name: b"", text: b"", tables: no_tables(), why: None },
   };
   assert_eq(spin.text.index_of(b"which = ") != None, false);
   assert_eq(spin.text.index_of(b"p0 = ") != None, false)
@@ -112,7 +107,7 @@ test "a tail call into a definition's own recursive group jumps instead of nesti
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None]);
   let group = match out.at(0) {
     Some(e) -> e,
-    None -> { name: b"", text: b"", tables: no_tables(), why: None, handles: [] },
+    None -> { name: b"", text: b"", tables: no_tables(), why: None },
   };
   assert_eq(group.tables.members, [b"m.even", b"m.odd"]);
   let scalars = { answer: b"int64_t", params: [b"int64_t"] };
@@ -199,7 +194,7 @@ fn handled_body(src: Bytes, release: Bool) -> Bytes / {abort.raise} = {
       Some(why) -> why,
       None -> match e.text.index_of(b"rt_handle_push_p") {
         None -> b"no handle was pushed",
-        Some(pushed) -> match e.text.index_of(b":;\n") {
+        Some(pushed) -> match e.text.index_of(b": ;\n") {
           None -> b"no handle lands",
           Some(landed) -> e.text.slice(pushed, landed),
         },
@@ -218,7 +213,7 @@ test "a body that fails inside a `handle` leaves through the handle's landing, w
   ]);
   let bodies = [false, true].map(|release: Bool| handled_body(src, release));
   let leaves = |raised: Bytes| bodies.map(|body: Bytes| body.index_of(raised) != None);
-  assert_eq(leaves(b"rt_let_no_match_p(ctx); goto land_"), [true, true]);
+  assert_eq(leaves(b"rt_let_no_match_p(ctx); goto ply_h"), [true, true]);
   assert_eq(leaves(b"rt_not_that_width_p(ctx, "), [true, true]);
   assert_eq(leaves(b"builtin_bytes_at_p(ctx, "), [true, true]);
   assert_eq(bodies.map(|body: Bytes| body.index_of(b"return")), [None, None])
@@ -267,8 +262,7 @@ test "a program that will not parse is refused, and the refusal carries the pars
 test "the emitter answers each root it was asked for, a body's tables as values" {
   let src = b"fn greet() -> Bytes = b\"hi\"\nfn twice(x: Int) -> Int = x + x\nfn guarded() -> Option<Instant> / {clock.read} = handle { Some(clock.now()) } with { clock.now() -> clock.now(), }\n";
   let wanted = [b"m.greet", b"m.twice", b"m.guarded"];
-  // No constructor is in the table, so the body that builds one is refused.
-  let answers = answers_of([b"m"], [src], [], wanted);
+  let answers = answers_of([b"m"], [src], [b"Some"], wanted);
   assert_eq(answers.map(|a: RootAnswer| a.name), wanted);
   match answers.get(0).answer {
     Body(b) -> {
@@ -280,12 +274,10 @@ test "the emitter answers each root it was asked for, a body's tables as values"
     },
     Refused(_) -> assert(false),
   };
+  // A body names the operations it handles.
   match answers.get(2).answer {
-    Refused(r) -> {
-      assert_eq(r.why, b"a constructor not in the table: Some");
-      assert_eq(r.handles, [b"clock#now"])
-    },
-    Body(_) -> assert(false),
+    Body(b) -> assert_eq(b.tables.handles, [b"clock#now"]),
+    Refused(_) -> assert(false),
   }
 }
 
@@ -375,10 +367,10 @@ test "a record holds every `Float` field as its bits, wherever the field stands"
     false,
     false,
   ]);
-  // `Point` holds bits alone, so it is flat wherever its word is made, here by the entries that
-  // hand one to the runtime; `weighed` holds a word it counts beside them, so it is mixed and the
-  // word after its fields says its first is the counted one. Both are raw.
-  assert_eq(has(b"@@, 5);"), [true, true, false, true, false, false]);
+  // `Point` holds bits alone, so it is flat wherever its word is made, here by the entries of the
+  // roots that answer one to the runtime; `weighed` holds a word it counts beside them, so it is
+  // mixed and the word after its fields says its first is the counted one. Both are raw.
+  assert_eq(has(b"@@, 5);"), [true, false, false, true, false, false]);
   assert_eq(has(b"@@, 6);"), [false, false, true, false, false, false]);
   assert_eq(has(b"[2] = INT64_C(1);"), [false, false, true, false, false, false]);
   // A record of a known type holds a `Float` as its bits wherever it was made, so a read is a load,
@@ -655,14 +647,13 @@ test "a record of a record type holds it in place, header and all" {
   // A read of a record held in place is the address of its header inside its holder.
   assert_eq(has(b"+ 5))"), [false, true, false, true, false, false]);
   assert_eq(has(b"rt_box_float_p"), [false, true, false, false, false, false]);
-  // `start` hands on the `from` it reads last from a record it holds: where it holds it alone, the
-  // words move out. `end_x` reads through `to` and moves nothing.
-  assert_eq(has(b"ply_take(ctx, "), [false, false, true, false, false, false]);
-  // An update of a record it holds alone writes over the fields it sets, `label` a word and `to` a
-  // record in place, and copies nothing.
-  assert_eq(has(b")->rc == 1) {"), [false, false, false, true, false, true]);
-  assert_eq(has(b"ply_dec(ctx, ply_words("), [false, false, false, true, false, false]);
-  assert_eq(has(b"ply_drop_embedded(ctx, "), [false, false, false, false, false, true]);
+  // `start` hands on the `from` it reads where its holder holds it, as that header's address and
+  // the fields it reads there: nothing is moved out of the holder.
+  assert_eq(has(b"ply_take(ctx, "), [false, false, false, false, false, false]);
+  assert_eq(has(b"(ply_words(p0) + 0))"), [false, false, true, true, false, true]);
+  // An update makes the record from the fields it keeps and those it sets, `label` a word and `to`
+  // a record in place copied into its holder.
+  assert_eq(has(b"rt_alloc_p(ctx, 3, 9, "), [true, false, false, true, false, true]);
   // A record holding one of a variable's type in place is laid out when it is made.
   assert_eq(has(b"rt_record_p"), [false, false, false, false, true, false])
 }
@@ -710,7 +701,7 @@ test "an array holds its records in place and its floats as their bits" {
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None]);
   // A point takes a header's two words and its own two: element `i` is the header `4 * i` words in.
   // A `Float`, an element or a point's field, is a load of its bits.
-  assert_eq(has(b" * 4); ply_inc("), [true, false, false, false]);
+  assert_eq(has(b" * 4);"), [true, false, false, false]);
   assert_eq(has(b"ply_f64(ply_words("), [true, true, false, false]);
   assert_eq(has(b"ply_array_len("), [true, true, true, false]);
   // An array of a variable's type is the runtime's to read.
@@ -752,7 +743,7 @@ test "a record rebuilt from another's fields is written into the constructor tha
   // The field copied out of the old record is a word this body holds, so the new record is held
   // back and its cells are written in the constructor: no record is made to be copied in.
   assert_eq(has(b"rt_alloc_p(ctx, 3, "), [false, false]);
-  assert_eq(has(b"ply_embed(ctx, "), [false, false])
+  assert_eq(has(b"ply_embedded(t"), [true, true])
 }
 
 test "what an operation answers and what a clause is handed are read by their types" {
@@ -1581,7 +1572,11 @@ test "a map's value is read by `std.prelude`'s `Map::get` down its tree, its key
         && l.index_of(b"ply_inc(") != None),
     [],
   );
-  assert(walk.any(|l: Bytes| l.index_of(b") + 1]; ply_inc(") != None), None);
+  assert(
+    range(0, walk.len() - 1).any(|i: Int|
+      walk.get(i).index_of(b") + 1];") != None && walk.get(i + 1).index_of(b"ply_inc(") != None),
+    None,
+  );
   assert(code(at(b"Map::get")).index_of(b")->layout") != None, None)
 }
 
@@ -1622,8 +1617,8 @@ test "a lambda a call lends is laid out on the caller's stack with its entry, wh
   assert_eq(has(b"o->flags = 16;"), [true, true, false, false, false]);
   assert_eq(has(b"rt_closure_p("), [false, false, true, true, false]);
   assert_eq(has(b"rt_lambda_value_p("), [false, false, false, false, true]);
-  // The caller lets go of the captures it laid out once the call is done.
-  assert_eq(has(b"ply_dec(ctx, ply_words("), [true, true, false, false, false])
+  // The caller lets go of the captures it laid out, its own `t1`, once the call is done.
+  assert_eq(has(b"\n  ply_dec(ctx, t1);\n"), [true, true, false, false, false])
 }
 
 test "a lambda a `std.prelude` function hands on to a native is laid out with the entry it calls" {
@@ -1735,13 +1730,14 @@ test "a constructor holds its arguments as its declaration types them" {
   // after them: five words, none counted, so flat and raw.
   assert_eq(has(b"rt_alloc_p(ctx, 4, 5, @@Tm.Circle@@, 5);"), [true, false, false, false, false]);
   assert_eq(has(b"ply_embedded("), [true, false, false, false, false]);
-  assert_eq(has(b"->len == 5)"), [false, true, true, true, false]);
-  // A match reads each argument where it is held: the radius a load of its bits, and the point
-  // the address of its header in the circle.
-  assert_eq(has(b")[4])"), [false, true, true, true, false]);
-  assert_eq(has(b") + 0))"), [false, true, true, true, false]);
-  // A test of the radius against a literal boxes it to compare it as `==` does.
-  assert_eq(has(b"rt_equal_p(ctx, "), [false, false, false, true, false]);
+  assert_eq(has(b"->layout == @@Tm.Circle@@"), [false, true, true, true, false]);
+  // A match reads each argument it binds or tests where it is held: the radius a load of its bits,
+  // and the point the address of its header in the circle.
+  assert_eq(has(b")[4])"), [false, true, false, true, false]);
+  assert_eq(has(b") + 0))"), [false, false, true, false, false]);
+  // A test of the radius against a literal compares the two doubles in C.
+  assert_eq(has(b"rt_equal_p(ctx, "), [false, false, false, false, false]);
+  assert_eq(has(b"(t2) == (ply_f64("), [false, false, false, true, false]);
   // A label holds its word, as a constructor of no raw or record argument does.
   assert_eq(has(b"rt_ctor_p"), [false, false, false, false, true])
 }
@@ -1776,14 +1772,15 @@ test "a record literal held in place is written there, with no record made first
   let out = emit_all_program([{ name: b"m", src: src }], [b"m.TyC", b"m.TyV"], [], true);
   let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None, None]);
+  let whole = |text: Bytes| out.map(|e: Emitted| e.text.index_of(text) != None);
   // The literal's fields are written in place under a header of their own wherever the holder is
-  // made, read out of other records as well, and a record held in place that was made already is
-  // copied in. A record answered as its leaves makes no object at all, and no record held in place
-  // is made on its own first.
-  assert_eq(has(b"ply_embedded("), [true, true, true, true, true]);
-  assert_eq(has(b"ply_embed(ctx, "), [false, true, true, false, true]);
+  // made, by the root or by the entry that hands one answered as its leaves to the runtime, and a
+  // record held in place that was made already is copied in. A record answered as its leaves makes
+  // no object in its own code, and no record held in place is made on its own first.
+  assert_eq(whole(b"ply_embedded("), [true, true, true, true, true]);
+  assert_eq(whole(b"ply_embed(ctx, "), [true, true, true, true, true]);
   assert_eq(has(b"rt_alloc_p("), [true, false, false, true, false]);
-  assert_eq(has(b"rt_alloc_p(ctx, 3, 2, "), [false, false, false, false, false])
+  assert_eq(whole(b"rt_alloc_p(ctx, 3, 2, "), [false, false, false, false, false])
 }
 
 test "a record holding a small record in place crosses a call as its leaves and each record's word" {
@@ -1861,7 +1858,7 @@ test "a root written to order two values answers `Equal` at once for one object"
   let code = |name: Bytes| own_code(answered_body(answers, name).text);
   assert_eq(
     [b"m.T#cmp", written_root(b"m", b"ordered", lists)].map(|n: Bytes|
-      code(n).index_of(b"(p0 == p1)") != None),
+      code(n).index_of(b"(p0) == (p1)") != None),
     [true, true],
   )
 }
@@ -1891,10 +1888,17 @@ test "an order tested against a constructor is its sign wherever C orders the va
       code(n).index_of(b"rt_ctor_value_p(ctx, ") != None),
     [],
   );
+  // Where C orders the values, their sign is read as the index of the constructor it stands for;
+  // each order is tested as that index against the constructor's.
+  assert_eq(
+    [b"m.later", b"m.same", b"m.sum"].map(|n: Bytes| code(n).index_of(b" < 0 ? 0 : ") != None),
+    [true, true, false],
+  );
   assert_eq(
     [b"m.later", b"m.same", b"m.sum"].map(|n: Bytes|
-      [b") > 0)", b") == 0)", b") < 0)"].filter(|r: Bytes| code(n).index_of(r) != None)),
-    [[b") > 0)"], [b") == 0)"], [b") < 0)"]],
+      [b"== INT64_C(2))", b"== INT64_C(1))", b"== INT64_C(0))"].filter(|r: Bytes|
+        code(n).index_of(r) != None)),
+    [[b"== INT64_C(2))"], [b"== INT64_C(1))"], [b"== INT64_C(0))"]],
   )
 }
 
@@ -1933,18 +1937,18 @@ test "a `Decimal` is held in registers as its two words, and in a record or an a
   let has = |text: Bytes| out.map(|e: Emitted| e.text.index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None, None, None, None]);
   // A line holds its price as two words and its count after them, each as its own bits: flat and
-  // raw, as a record of a price alone is. It crosses a call as its fields, which an entry handed its
-  // word loads and a stack's growth makes it of.
-  assert_eq(has(b".lo;"), [true, true, true, false, false, false, true]);
-  assert_eq(has(b"@@, 5);"), [true, true, true, false, false, false, true]);
+  // raw, as a record of a price alone is. It crosses a call as its fields, and is made a word where
+  // an entry hands it to the runtime.
+  assert_eq(has(b".lo;"), [true, false, false, false, false, false, true]);
+  assert_eq(has(b"@@, 5);"), [true, false, false, false, false, false, true]);
   // A branch's answer is declared as the struct it is before either arm assigns it.
   assert_eq(has(b" = (PlyDec){0, 0};"), [false, false, false, false, false, true, false]);
   // A price's second word is written after its first, in a line and in a record of a price
   // alone, which is held back until it is first a word.
-  assert_eq(has(b")[1] = "), [true, true, true, false, false, false, true]);
+  assert_eq(has(b")[1] = "), [true, false, false, false, false, false, true]);
   // A field read loads both words, an array's element is two words a step, and nothing is boxed:
   // a function takes and answers its decimals as their words.
-  assert_eq(has(b"ply_dec_at("), [true, true, true, false, true, false, false]);
+  assert_eq(has(b"ply_dec_at("), [false, true, true, false, true, false, false]);
   assert_eq(has(b") * 2)"), [false, false, false, false, true, false, false]);
   assert_eq(out.map(|e: Emitted| own_code(e.text).index_of(b"rt_box_decimal_p") != None), [
     false,
@@ -2021,17 +2025,6 @@ test "a record a pattern binds is read at the offsets its checked type gives" {
   assert_eq(out.map(|e: Emitted| e.why), [None]);
   // `p` holds a `Point`, so each field is a load at its place rather than a search by name.
   assert_eq(out.map(|e: Emitted| e.text.index_of(b"rt_field_p") != None), [false])
-}
-
-test "two operators on one span that the checker settled apart are left unsettled" {
-  let at = span_between(3, 9);
-  let sites = [
-    { module: 0, span: at, ty: b"Int", owner: b"m.f" },
-    { module: 0, span: at, ty: b"U8", owner: b"m.g" },
-    { module: 1, span: at, ty: b"U8", owner: b"n.f" },
-  ];
-  assert_eq(operands_in(sites, 0).get(span_key(at)), Some(unsettled()));
-  assert_eq(operands_in(sites, 1).get(span_key(at)), Some(b"U8"))
 }
 
 // --- the emitter's entry ----------------------------------------------------
@@ -2476,10 +2469,10 @@ test "a generic definition reached at a type held apart from a word is emitted a
   // At `Float` the witnessed `+` is C's own, and the parameter a `double`.
   assert(has(b"m.twice@Float", b"double "));
   assert(!has(b"m.twice@Float", b"numeric_binary"));
-  // A specialisation's call of itself stays in it, here as a loop.
+  // A specialisation's call of itself stays in it, here as a loop that calls no root.
   assert(has(b"m.down@Int", b"goto ply_loop;"));
   assert(!has(b"m.down@Int", b"numeric_binary"));
-  assert_eq(body(b"m.down@Int").tables.calls, [b"m.down@Int"])
+  assert_eq(body(b"m.down@Int").tables.calls, [])
 }
 
 test "a specialisation hands its recursion on to the definitions as they stand where it leaves them" {
@@ -2637,7 +2630,7 @@ test "a body is lowered from what its row files of it, walked now or published f
     Some(f) -> {
       assert_eq(f.updates.len(), 1);
       assert(f.refs.len() > 0);
-      assert(f.operands.len() > 0)
+      assert(f.typed.len() > 0)
     },
   };
   let seeded = analyse_with(parse_all(sited(b"")), walked.rows);
@@ -2847,8 +2840,8 @@ test "a scalar parameter arrives as itself and holds no count for a self tail ca
 }
 
 // At the body's tail nothing follows the update, so reading the accumulator twice does not keep it
-// from being rebuilt in place.
-test "an accumulator read more than once is still rebuilt in place at the body's tail" {
+// from being answered as its fields.
+test "an accumulator read more than once is still answered as its fields at the body's tail" {
   let src = Bytes::concat_all([
     b"type S = { i: Int, tag: Bytes }\n",
     b"fn narrow(s: S, x: Int) -> S = { ..s, i: x }\n",
@@ -2856,9 +2849,16 @@ test "an accumulator read more than once is still rebuilt in place at the body's
   ]);
   let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
   assert_eq(out.map(|e: Emitted| e.why), [None, None]);
-  let reuses = |e: Emitted|
-    e.text.index_of(b"rt_reset_p(") != None || e.text.index_of(b"->rc == 1") != None;
-  assert_eq(out.map(reuses), [true, true])
+  // The update makes no record: the root answers the fields it sets and keeps, and lets go of the
+  // word its accumulator came in as.
+  assert_eq(out.map(|e: Emitted| own_code(e.text).index_of(b"rt_alloc_p(") != None), [
+    false,
+    false,
+  ]);
+  assert_eq(out.map(|e: Emitted| own_code(e.text).index_of(b"ply_dec(ctx, p0_2);") != None), [
+    true,
+    true,
+  ])
 }
 
 test "a branch lets go as it opens of a parameter only another branch reads, and of a field read out before it" {
@@ -2880,16 +2880,16 @@ test "a branch lets go as it opens of a parameter only another branch reads, and
       None -> false,
       Some(a) -> match text(name).index_of(then) { None -> false, Some(b) -> a < b },
     };
-  assert(text(b"m.slot").index_of(b"} else {\n    ply_dec(ctx, p0); p0 = 0;") != None, None);
-  // A record that is an object gives the field up where it is its only holder; one that arrives
-  // as its fields lets go of the field's local.
+  assert(text(b"m.slot").index_of(b"} else {\n    ply_dec(ctx, p0);") != None, None);
+  // A record that arrives as its fields lets go of its word, which only the other branch reads, as
+  // the branch opens; one that is an object is let go once the branch has read its fields.
   assert(
-    before(b"m.wide_field", b"if (ply_obj(p0)->rc == 1) { Word ", b"rt_concat_p("),
-    Some(String::of_bytes_lossy(text(b"m.wide_field"))),
+    before(b"m.field", b"} else {\n    ply_dec(ctx, p0_2);", b"rt_concat_p("),
+    Some(String::of_bytes_lossy(text(b"m.field"))),
   );
   assert(
-    before(b"m.field", b"} else {\n    ply_dec(ctx, p0_1); p0_1 = 0;", b"rt_concat_p("),
-    Some(String::of_bytes_lossy(text(b"m.field"))),
+    before(b"m.wide_field", b"rt_concat_p(", b"\n    ply_dec(ctx, p0);\n"),
+    Some(String::of_bytes_lossy(text(b"m.wide_field"))),
   )
 }
 
@@ -2908,7 +2908,6 @@ fn emit_all_program(
         { names: ctors, laid: ctor_layouts(d.ctors), keyed: [], sums: ctor_sums(d.ctors) },
         builtins,
         release,
-        true,
         // The program's own roots; a prelude function is lowered where one of them calls it.
         Some(
           d.emitter_roots.fold(Map::new(), |m: Map<Bytes, Bool>, r: EmitterRoot|

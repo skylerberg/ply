@@ -7,9 +7,9 @@ import syntax.items (Module, IExtern, DOrd, DNumeric, deriver_text, Derived, par
 import syntax.exprs (prelude_module, try_places)
 import check.types (Atom, Type, TyVar, TyCon, TyFn, canonical_beside, TyRecord, Field, row_empty,
                     row_open, row_singleton, without_raises, int_type, bytes_type, list_type,
-                    iter_type, fn_type, spelled_type, shallow, written_label, label_of, atoms_text,
-                    scheme_text, type_text, TyNominal, TypeTable, held_type, table_of,
-                    tables_joined, type_table_bin)
+                    iter_type, fn_type, shallow, written_label, label_of, atoms_text, scheme_text,
+                    type_text, TyNominal, TypeTable, held_type, table_of, tables_joined,
+                    type_table_bin)
 import check.termination (Ends, Stated, Diverges, Site)
 import check.resolve.tables (ParsedModule, Source, Resolved, Diag, Label, Edit, Fix, with_fix,
                              insertion, qualify, error_at, Parameters)
@@ -140,12 +140,11 @@ pub fn published_pure(def_info: DefInfo) -> Bool =
   without_raises(def_info.footprint).len() == 0 && def_info.constraints.len() == 0
 
 /// What the emitter needs from the checker: the definitions published pure, for its constant table,
-/// the labels every call fills, the shape of every record update, and every operator's operand type.
+/// the labels every call fills, the shape of every record update, and the type of each typed site.
 pub type EmitFacts = {
   pure: List<Bytes>,
   label_sites: List<LabelSite>,
   elaboration: Elaboration,
-  operands: List<OperandSite>,
   typed: List<TypedSite>,
   types: TypeTable,
 }
@@ -194,6 +193,7 @@ pub type RootFacts = {
   updates: List<UpdateShape>,
   ops: List<WitnessOp>,
   refs: List<WitnessRef>,
+  /// Always empty: nothing files an operand site, and `emit.costs` alone still writes the field.
   operands: List<OperandSite>,
   tries: List<TrySite>,
   members: List<MemberSite>,
@@ -259,11 +259,7 @@ pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
     let f = owned(m, x.owner);
     m.insert(x.owner, { ..f, members: f.members.push(x) })
   });
-  let operated = facts.operands.fold(called, |m: Map<Bytes, RootFacts>, x: OperandSite| {
-    let f = owned(m, x.owner);
-    m.insert(x.owner, { ..f, operands: f.operands.push(x) })
-  });
-  let typed = facts.typed.fold(operated, |m: Map<Bytes, RootFacts>, x: TypedSite| {
+  let typed = facts.typed.fold(called, |m: Map<Bytes, RootFacts>, x: TypedSite| {
     let f = owned(m, x.owner);
     m.insert(x.owner, { ..f, typed: f.typed.push(x) })
   });
@@ -284,8 +280,7 @@ fn placed_facts(facts: RootFacts, module: Int, by: Int, owner: Bytes) -> RootFac
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
     refs: facts.refs.map(|x: WitnessRef|
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
-    operands: facts.operands.map(|x: OperandSite|
-      { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
+    operands: [],
     tries: facts.tries.map(|x: TrySite|
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
     members: facts.members.map(|x: MemberSite|
@@ -302,7 +297,6 @@ fn all_within(facts: RootFacts, at: Span) -> Bool =
     && facts.updates.fold(true, |b: Bool, x: UpdateShape| b && within(x.span, at))
     && facts.ops.fold(true, |b: Bool, x: WitnessOp| b && within(x.span, at))
     && facts.refs.fold(true, |b: Bool, x: WitnessRef| b && within(x.span, at))
-    && facts.operands.fold(true, |b: Bool, x: OperandSite| b && within(x.span, at))
     && facts.tries.fold(true, |b: Bool, x: TrySite| b && within(x.span, at))
     && facts.members.fold(true, |b: Bool, x: MemberSite| b && within(x.span, at))
     && facts.typed.fold(true, |b: Bool, x: TypedSite| b && within(x.span, at))
@@ -364,13 +358,6 @@ fn facts_of(all: Checker) -> EmitFacts / {abort.raise} = {
       if published_pure(def_info) { acc.push(def_info.name) } else { acc }),
     label_sites: checker.label_sites,
     elaboration: elaboration_in(checker),
-    operands: checker.operands.map(|o: OperandAt|
-      {
-        module: o.module,
-        span: o.span,
-        ty: operand_name(resolve(checker, o.ty), quantified_of(checker, o.owner)),
-        owner: o.owner,
-      }),
     typed: settled.sites,
     types: settled.types,
   }
@@ -485,32 +472,6 @@ fn renumbers(ty: Type) -> Bool =
       x.args.fold(false, |found: Bool, a: Type| found || renumbers(a))
         || x.fields.fold(false, |found: Bool, f: Field| found || renumbers(f.ty)),
   }
-
-/// A nullary type's name, any other but a function's spelled with each variable its owner's scheme
-/// quantifies as `'` and its number there, which a specialisation reads as the type it is at; empty
-/// for a function's type and a variable the scheme leaves free.
-fn operand_name(ty: Type, quantified: List<Int>) -> Bytes / {abort.raise} =
-  match ty {
-    TyCon(k) -> if k.args.len() == 0 { k.name } else { spelled_operand(ty, quantified) },
-    TyVar(_) -> {
-      let n = spelled_operand(ty, quantified);
-      if n == b"?" { b"" } else { n }
-    },
-    TyFn(_) -> b"",
-    _ -> spelled_operand(ty, quantified),
-  }
-
-fn spelled_operand(ty: Type, quantified: List<Int>) -> Bytes / {abort.raise} =
-  spelled_type(
-    numbered(
-      ty,
-      range(0, quantified.len()).fold(Map::new(), |m: Map<Int, Int>, i: Int|
-        m.insert(quantified.get(i), i)),
-    ),
-  )
-
-fn quantified_of(checker: Checker, owner: Bytes) -> List<Int> / {abort.raise} =
-  match def_of(checker, owner) { Some(d) -> d.scheme.ty_vars, None -> [] }
 
 /// The elaboration, and the definitions whose calls the checker saw end, which are the recursive
 /// ones a proof may unroll.

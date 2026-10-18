@@ -2,6 +2,8 @@
 
 import syntax.parsing (Ident, Span, span_key)
 import syntax.items (FnDef)
+import syntax.type_syntax (Mode)
+import emit.code (Lambda)
 import check.resolve.tables (qualify)
 import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, int_type)
 import emit.typing (Typed, unknown_type)
@@ -10,8 +12,8 @@ import std.list
 import check.lent (passed)
 import std.bytes (ascii_of_int)
 import emit.c (KBool, KBoxed, KDec, KFloat, KInt, KNum, KSum, Kind, SumSpec, Tagged, Zeroed, is_sum,
-               ctype, width_named, carried, in_imm, bytes_join, int_lit, push_front_bytes)
-import emit.roots (specialised, specialised_with, specialisation_of)
+               width_named, carried, in_imm, bytes_join)
+import emit.roots (specialised, specialised_with, specialisation_of, own_definition)
 
 /// `TyArr`: an array, with how it holds its elements where its element type says (as a record's field
 /// `e` of that type is held), and `None` where the type is a variable's.
@@ -110,6 +112,51 @@ pub type Def = {
   lent: List<Int>,
 }
 
+/// The definition of `defs` named `name`, the last where several are.
+pub fn def_named(defs: List<Def>, name: Bytes) -> Option<Def> =
+  defs.fold(None, |acc: Option<Def>, d: Def| if d.name == name { Some(d) } else { acc })
+
+/// An effect a module names, as it writes it and program-wide, with its operations.
+pub type EffectName = { written: Bytes, global: Bytes, ops: List<OpMode> }
+
+pub type OpMode = { name: Bytes, mode: Mode }
+
+/// A parameter as the body holds it, and its `carrier`: how it arrives, as a word the prologue
+/// opens to `kind`, as the value itself, or as a record's fields.
+pub type EmitParam = {
+  name: Bytes,
+  kind: Kind,
+  ty: Ty,
+  /// The type the definition's scheme gives it, none where no scheme speaks for it.
+  of: Option<Type>,
+  carrier: Carrier,
+  /// The caller's lambda this parameter is, which a call of it runs in place.
+  lambda: Option<BoundLambda>,
+}
+
+/// A caller's lambda a specialisation runs where it calls the parameter it was handed as: the
+/// lambda as its owner lowered it, and what the owner's body is lowered under.
+pub type BoundLambda = {
+  owner: Bytes,
+  nth: Int,
+  code: Lambda,
+  /// Whether it is a definition its owner named as a value, read as the lambda around a call of
+  /// it: run in place it counts no step but that call's.
+  named: Bool,
+  module: Bytes,
+  here: List<Def>,
+  imports: List<Imported>,
+  effects: List<EffectName>,
+  typed: Map<Bytes, Typed>,
+  base: Int,
+  /// Every lambda its owner lends, those within it among them, by their places.
+  written: List<Lambda>,
+}
+
+/// An owner's lambdas as `BoundLambda` reads its first: the rest are its `written`, and those past
+/// `lambdas` are definitions it names as values.
+pub type OwnerLambdas = { bound: BoundLambda, lambdas: Int }
+
 /// An imported name lowers like a builtin; only the import list tells them apart. `defs` is empty when the module is out of reach.
 /// `whole` binds the module itself, which only a qualified name reaches: a bare `min` is never a module `min`.
 pub type Imported = { name: Bytes, module: Bytes, defs: List<Def>, whole: Bool }
@@ -133,9 +180,6 @@ pub type SumCase = { name: Bytes, arg: Option<Carrier> }
 /// width, a `Float` or a `Decimal`. A width below 64 bits is held as the `Int` it stands for.
 pub fn raw_slot(kind: Kind) -> Bool =
   match kind { KInt -> true, KFloat -> true, KDec -> true, KNum(_) -> true, _ -> false }
-
-/// The kind a slot holding a value of `kind` as a word reads as: an `Option` its payload's word.
-pub fn word_kind(kind: Kind) -> Kind = if kind == KSum(Zeroed) { KSum(Zeroed) } else { KBoxed }
 
 /// The words a record holds a field of `kind` in: a `Decimal`'s two, and one for any other.
 pub fn raw_words(kind: Kind) -> Int = match kind { KDec -> 2, _ -> 1 }
@@ -222,24 +266,10 @@ fn leaves_uncounted(fs: List<FieldTy>) -> Bool =
         },
       }))
 
-pub fn has_tail(flags: Int) -> Bool = flags & 2 != 0
-
 /// Whether a record of `fs` is held back as its fields' values until its word is asked for: one of
 /// no record held in place.
 fn holdable(fs: List<FieldTy>) -> Bool =
   fs.len() > 0 && fs.fold(true, |ok: Bool, f: FieldTy| ok && in_place(f) == None)
-
-/// The bitmap after a mixed record's words: a bit set for each word it counts, 64 to a word.
-pub fn tail_bits(l: Laid) -> List<Bytes> =
-  range(0, l.tail).map(|t: Int|
-    int_lit(
-      l.counted.fold(0, |acc: Int, c: Int| if c / 64 == t { acc | 1 << c % 64 } else { acc }),
-    ))
-
-pub fn kinds_of(fs: List<FieldTy>) -> List<Kind> = fs.map(|f: FieldTy| f.kind)
-
-pub fn kind_at(kinds: List<Kind>, at: Int) -> Kind =
-  match kinds.at(at) { Some(k) -> k, None -> KBoxed }
 
 /// Whether `t` is a `Result` whose error is always an object, which compiled code holds as one word.
 pub fn tagged_result(t: Type) -> Bool =
@@ -275,31 +305,6 @@ fn is_option_type(t: Type) -> Bool =
 /// Field `k` of `fs`; one of no name past the end.
 pub fn nth_field(fs: List<FieldTy>, k: Int) -> FieldTy =
   match fs.at(k) { Some(f) -> f, None -> { name: b"", kind: KBoxed, ty: TyOpen([]) } }
-
-/// The words a record of `ty` holds, which is the reuse token its cells make.
-pub fn width_of(ty: Ty) -> Option<Int> =
-  match ty { TyRec(fs) -> Some(laid_of(fs).width), _ -> None }
-
-/// Where field `name` starts among a record's words: after the words of the fields that sort
-/// before it.
-pub fn field_at(ty: Ty, name: Bytes) -> Option<{ at: Int, kind: Kind, ty: Ty }> =
-  match ty {
-    TyRec(fs) -> {
-      let offsets = laid_of(fs).offsets;
-      range(0, fs.len()).fold(None, |acc: Option<{ at: Int, kind: Kind, ty: Ty }>, i: Int|
-        match fs.at(i) {
-          Some(field) -> if field.name == name {
-            Some({
-              at: match offsets.at(i) { Some(o) -> o, None -> i },
-              kind: field.kind,
-              ty: field.ty,
-            })
-          } else { acc },
-          None -> acc,
-        })
-    },
-    _ -> None,
-  }
 
 /// Whether two values of the type `name` compare as the constructors of a sum the program declares
 /// do: not an `Option` or a `Result`, which are held as words, not a type whose module states a
@@ -665,9 +670,6 @@ pub fn typed_at(typed: Map<Bytes, Typed>, args: List<Type>) -> Map<Bytes, Typed>
       args: t.args.map(|a: Type| substituted(a, args)),
     }))
 
-/// The C type a value carried as `k` crosses a call in.
-pub fn carried_type(k: Kind) -> Bytes = match k { KBoxed -> b"Word", _ -> ctype(k) }
-
 // --- the emitter's entry ----------------------------------------------------
 
 /// A definition as its callers read it, its answer as its scheme says.
@@ -746,6 +748,15 @@ pub fn carriers_at(
     },
   }
 
+/// How the root `full` of `module` hands back its answer: as its definition's `Def` says, and a word
+/// for any other root.
+pub fn carried_answer(module: Bytes, here: List<Def>, full: Bytes) -> Carrier / {abort.raise} = {
+  let own = own_definition(full);
+  let args = match specialisation_of(full) { Some(sp) -> sp.args, None -> [] };
+  here.fold(Whole(KBoxed), |acc: Carrier, d: Def|
+    if qualify(module, d.name) == own { carriers_at(d, args).answer } else { acc })
+}
+
 /// The variables of `scheme` a call at `args` carries raw: each standing bare as a parameter, or as
 /// the answer of a function taking any, at an argument whose word would be an allocation, an
 /// `Option` held as its payload's word among them. The unit settles such a call on the callee's
@@ -802,32 +813,6 @@ fn sum_carrier(spec: SumSpec, cases: List<SumCase>) -> Carrier =
 fn case_carrier(c: Carrier) -> Carrier =
   match c { Whole(KSum(_)) -> Whole(KBoxed), Cases(_) -> Whole(KBoxed), other -> other }
 
-/// The C values a sum carried as `c` crosses in past its constructor's index: each constructor's
-/// argument's in turn, a record's fields and then its word.
-pub fn sum_leaves(c: SumCases) -> List<FieldTy> =
-  c.cases.fold([], |acc: List<FieldTy>, sc: SumCase|
-    match sc.arg {
-      None -> acc,
-      Some(Fields(fs)) ->
-        acc.concat(record_leaves(fs).push({ name: b"", kind: KBoxed, ty: TyOpen([]) })),
-      Some(Whole(k)) -> acc.push({ name: b"", kind: k, ty: TyOpen([]) }),
-      Some(Cases(_)) -> acc.push({ name: b"", kind: KBoxed, ty: TyOpen([]) }),
-    })
-
-/// How many of a sum's C values past its index the argument `arg` takes.
-pub fn case_width(arg: Option<Carrier>) -> Int =
-  match arg { None -> 0, Some(Fields(fs)) -> record_leaves(fs).len() + 1, Some(_) -> 1 }
-
-/// Where among a sum's values past its index its `i`th constructor's argument starts.
-pub fn case_start(c: SumCases, i: Int) -> Int =
-  range(0, i).fold(0, |acc: Int, j: Int|
-    acc + case_width(match c.cases.at(j) { Some(sc) -> sc.arg, None -> None }))
-
-/// The index of constructor `name` among `c`'s.
-pub fn case_index(c: SumCases, name: Bytes) -> Option<Int> =
-  range(0, c.cases.len()).fold(None, |acc: Option<Int>, i: Int|
-    match c.cases.at(i) { Some(sc) -> if sc.name == name { Some(i) } else { acc }, None -> acc })
-
 /// A record that crosses a call as its leaves, each in a C value of its own, and then its word,
 /// zero where it was never made: one held back until its word is asked for, whose records in place
 /// hold none, of at most four words of values. A record made once crosses any number of calls as
@@ -840,58 +825,10 @@ pub fn carried_record(fs: List<FieldTy>) -> Bool =
       n + (match in_place(f) { Some(inner) -> laid_of(inner).width, None -> raw_words(f.kind) }))
     <= 4
 
-/// The C values a record of `fs` crosses a call in before its word: each field's, and for a record
-/// it holds in place, that record's fields and then its word.
-pub fn record_leaves(fs: List<FieldTy>) -> List<FieldTy> =
-  fs.fold([], |acc: List<FieldTy>, f: FieldTy|
-    match in_place(f) {
-      Some(inner) -> acc.concat(inner).push({ name: b"", kind: KBoxed, ty: TyOpen([]) }),
-      None -> acc.push(f),
-    })
-
-/// The C types `c` crosses a call in, one per C parameter.
-pub fn carried_types(c: Carrier) -> List<Bytes> =
-  match c {
-    Whole(k) -> [carried_type(k)],
-    Fields(fs) -> record_leaves(fs).map(|f: FieldTy| ctype(f.kind)).push(b"Word"),
-    Cases(sc) ->
-      push_front_bytes(b"int64_t", sum_leaves(sc).map(|f: FieldTy| carried_type(f.kind))),
-  }
-
 /// Whether a value carried as `c` crosses in C values of its own rather than as a word: a record's
 /// fields, or a scalar in its C type.
 pub fn raw_carrier(c: Carrier) -> Bool =
   match c { Fields(_) -> true, Cases(_) -> true, Whole(k) -> k != KBoxed && !is_sum(k) }
-
-/// The kind a root answering as `c` returns: the answer's, a record's first leaf's, or a sum's
-/// constructor's index.
-pub fn returned_kind(c: Carrier) -> Kind =
-  match c {
-    Whole(k) -> k,
-    Fields(fs) -> match record_leaves(fs).at(0) { Some(f) -> f.kind, None -> KBoxed },
-    Cases(_) -> KInt,
-  }
-
-/// What a record or sum answer writes through the pointers the caller hands: a record's leaves
-/// past its first, then its word, a word field of no name; a sum's values past its index.
-pub fn written_back(c: Carrier) -> List<FieldTy> =
-  match c {
-    Whole(_) -> [],
-    Fields(fs) -> {
-      let leaves = record_leaves(fs);
-      range(1, leaves.len()).map(|k: Int| nth_field(leaves, k)).push({
-        name: b"",
-        kind: KBoxed,
-        ty: TyOpen([]),
-      })
-    },
-    Cases(sc) -> sum_leaves(sc),
-  }
-
-pub fn field_param(i: Int, k: Int) -> Bytes =
-  Bytes::concat_all([b"p", ascii_of_int(i), b"_", ascii_of_int(k)])
-
-pub fn word_param(i: Int) -> Bytes = Bytes::concat_all([b"p", ascii_of_int(i), b"_w"])
 
 test "a specialisation's root spells its layouts and the lambdas it runs, and reads back as them" {
   let args = [
