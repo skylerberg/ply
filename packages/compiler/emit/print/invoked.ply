@@ -1,6 +1,7 @@
 //! Calls printed: a root's by its symbol, a function value's by its type or through the runtime, a
-//! self tail call as a restart, a tail call into the group, a loop's passes, closures made, the
-//! unit's closures and constants a body reads, and closures' bodies with their entries.
+//! self tail call as a restart, a tail call into the group and a member's answer through it, each
+//! member's wrapper, a loop's passes, closures made, the unit's closures and constants a body reads,
+//! and closures' bodies with their entries.
 
 import std.bytes (ascii_of_int)
 import emit.c (int_lit, tick_line)
@@ -15,8 +16,8 @@ import emit.tir.calling (CallingOp, EntryValue, ConstantRead, BuiltinValue, Tick
 import emit.lower.held (fields_of, slot_rep)
 import emit.print.text (Printing, Place, line, pad, temp, named, name_of, arg_text, site, check,
                         interned, zero, failing_return, part_names, assigned)
-import emit.print.made (c_type, c_types, zeros, as_word, word_as, arg_parts, head_types,
-                        head_params, entry_outs, entry_answered, parts_word, word_parts)
+import emit.print.made (c_type, c_types, zeros, word_as, arg_parts, head_types, head_params,
+                        entry_outs, entry_answered, parts_word, word_parts)
 import emit.print.fuel (fuel_head)
 
 /// A call of `c.callee` on `c.args`, its answer into `into`, its failure tested after it. The head
@@ -310,14 +311,10 @@ pub fn entered_member(
       let held = args.fold(
         { pr: pr, names: [] },
         |h: { pr: Printing, names: List<Bytes> }, a: Arg| {
-          let made = temp(h.pr);
-          let w = parts_word(made.pr, made.name, arg_parts(h.pr, a), rep_of_arg(a), p.leave);
+          let w = one_word(p, h.pr, a);
           let t = temp(w.pr);
-          let prepped = if w.prep.len() == 0 { t.pr } else {
-            { ..t.pr, out: t.pr.out.push(Text(pad(p.depth))).concat(w.prep).push(Text(b"\n")) }
-          };
           {
-            pr: line(prepped, p.depth, Bytes::concat_all([b"Word ", t.name, b" = ", w.word, b";"])),
+            pr: line(t.pr, p.depth, Bytes::concat_all([b"Word ", t.name, b" = ", w.word, b";"])),
             names: h.names.push(t.name),
           }
         },
@@ -341,6 +338,28 @@ pub fn entered_member(
       )
     },
   }
+
+/// A member of a tail group answering `a`, held as the member answers, through the word the group's
+/// function answers.
+pub fn member_returned(p: Place, pr: Printing, a: Arg) -> Printing = {
+  let w = one_word(p, pr, a);
+  line(
+    line(w.pr, p.depth, b"ctx->fuel += 1;"),
+    p.depth,
+    Bytes::concat_all([b"return ", w.word, b";"]),
+  )
+}
+
+/// `a` as one word: a value held as several made one first, leaving by `p.leave` where that fails.
+fn one_word(p: Place, pr: Printing, a: Arg) -> { pr: Printing, word: Bytes } = {
+  let made = temp(pr);
+  let w = parts_word(made.pr, made.name, arg_parts(pr, a), rep_of_arg(a), p.leave);
+  {
+    pr: if w.prep.len() == 0 { w.pr }
+    else { { ..w.pr, out: w.pr.out.push(Text(pad(p.depth))).concat(w.prep).push(Text(b"\n")) } },
+    word: w.word,
+  }
+}
 
 /// What opens a `Loop` numbered `label` over `state`, first `init`: each state variable declared
 /// holding its first value, the answer declared, and the loop's C `for`.
@@ -570,8 +589,9 @@ fn runtime_entry(
 }
 
 /// Member `i` of the tail group `f` as a root of its own: its head, which hands its parameters to
-/// the group's function as words and its answer back as its convention carries it, and its entry,
-/// printed after `pr`, whose tables the entry's shapes go on into.
+/// the group's function as words, a value held as several made one first, and its answer back as
+/// its convention carries it; then its entry. Printed after `pr`, whose tables the words' and the
+/// entry's shapes go on into.
 pub fn group_wrapper(
   f: Fn,
   i: Int,
@@ -581,65 +601,115 @@ pub fn group_wrapper(
     None -> { pr: pr, out: [] },
     Some(m) -> {
       let name = symbol_of(root_name(m.key));
+      let answer = m.conv.answer;
       let width = f.members.fold(0, |w: Int, x: Member|
         if x.conv.reps.len() > w { x.conv.reps.len() } else { w });
+      let words = range(0, m.conv.reps.len()).fold(
+        { pr: pr, prep: [], words: [] },
+        |acc: { pr: Printing, prep: List<Piece>, words: List<Bytes> }, j: Int| {
+          let r = m.conv.reps.get(j);
+          let w = parts_word(
+            acc.pr,
+            b"ply_g".concat(ascii_of_int(j)),
+            part_names(b"p".concat(ascii_of_int(j)), r),
+            r,
+            failing_return(answer),
+          );
+          {
+            pr: w.pr,
+            prep: if w.prep.len() == 0 { acc.prep }
+            else { acc.prep.push(Text(b"  ")).concat(w.prep).push(Text(b"\n")) },
+            words: acc.words.push(w.word),
+          }
+        },
+      );
       let call = Bytes::concat_all([
         symbol_of(root_name(f.key)),
         b"_group(ctx, ",
         ascii_of_int(i),
         Bytes::concat_all(
           range(0, width).map(|j: Int|
-            b", ".concat(match m.conv.reps.at(j) {
-              Some(r) -> word_of(b"p".concat(ascii_of_int(j)), r),
-              None -> b"0",
-            })),
+            b", ".concat(match words.words.at(j) { Some(w) -> w, None -> b"0" })),
         ),
         b")",
       ]);
-      let answer = m.conv.answer;
-      let entered = runtime_entry(pr, name, 0, 0, m.conv.reps, answer);
-      let wrapper = Bytes::concat_all([
-        c_type(answer),
-        b" ",
-        name,
-        b"(PlyCtx *ctx",
-        Bytes::concat_all(
-          range(0, m.conv.reps.len()).map(|j: Int|
-            Bytes::concat_all([b", ", c_type(m.conv.reps.get(j)), b" p", ascii_of_int(j)])),
+      let entered = runtime_entry(words.pr, name, 0, 0, m.conv.reps, answer);
+      {
+        pr: entered.pr,
+        out: [
+          Text(
+            Bytes::concat_all([
+              c_type(answer),
+              b" ",
+              name,
+              b"(PlyCtx *ctx",
+              Bytes::concat_all(head_params(m.conv.reps, answer).map(|h: Bytes| b", ".concat(h))),
+              b") {\n",
+            ]),
+          ),
+        ].concat(
+          words.prep,
+        ).concat(
+          group_answered(call, answer),
+        ).push(
+          Text(b"}\n"),
+        ).concat(
+          entered.out,
         ),
-        b") {\n",
-        match answer {
-          RWord -> Bytes::concat_all([b"  return ", call, b";\n"]),
-          RMaybe ->
-            Bytes::concat_all([
-              b"  Word r = ",
-              call,
-              b";\n  if (ctx->failed) return 0;\n  return rt_maybe_open_p(ctx, r);\n",
-            ]),
-          RTagged ->
-            Bytes::concat_all([
-              b"  Word r = ",
-              call,
-              b";\n  if (ctx->failed) return 0;\n  return rt_tagged_open_p(ctx, r);\n",
-            ]),
-          k ->
-            Bytes::concat_all([
-              b"  Word r = ",
-              call,
-              b";\n  if (ctx->failed) ",
-              failing_return(k),
-              b"\n  ",
-              c_type(k),
-              b" v = ",
-              word_as(b"r", k),
-              b";\n  ply_dec(ctx, r);\n  return v;\n",
-            ]),
-        },
-        b"}\n",
-      ]);
-      { pr: entered.pr, out: [Text(wrapper)].concat(entered.out) }
+      }
     },
   }
+
+/// How a member's wrapper hands back what the group's function `call` answers, a word, as the member
+/// answers `answer`: the word itself; an `Option`'s or a `Result`'s object opened; a scalar read out
+/// and the word let go; a value held as several opened into them, each past the first written
+/// through its pointer.
+fn group_answered(call: Bytes, answer: Rep) -> List<Piece> = {
+  let got = Bytes::concat_all([b"  Word r = ", call, b";\n  if (ctx->failed) "]);
+  match answer {
+    RWord -> [Text(Bytes::concat_all([b"  return ", call, b";\n"]))],
+    RMaybe ->
+      [Text(Bytes::concat_all([got, b"return 0;\n  return ", word_as(b"r", answer), b";\n"]))],
+    RTagged ->
+      [Text(Bytes::concat_all([got, b"return 0;\n  return ", word_as(b"r", answer), b";\n"]))],
+    RFlat(_) -> several_answered(got, answer),
+    RCases(_) -> several_answered(got, answer),
+    k ->
+      [
+        Text(
+          Bytes::concat_all([
+            got,
+            failing_return(k),
+            b"\n  ",
+            c_type(k),
+            b" v = ",
+            word_as(b"r", k),
+            b";\n  ply_dec(ctx, r);\n  return v;\n",
+          ]),
+        ),
+      ],
+  }
+}
+
+fn several_answered(got: Bytes, answer: Rep) -> List<Piece> = {
+  let vs = part_names(b"v", answer);
+  [Text(Bytes::concat_all([got, failing_return(answer), b"\n  "]))].concat(
+    word_parts(b"r", answer, vs),
+  ).push(
+    Text(
+      Bytes::concat_all([
+        b"\n",
+        Bytes::concat_all(
+          range(1, vs.len()).map(|k: Int|
+            Bytes::concat_all([b"  *o", ascii_of_int(k), b" = ", nth(vs, k), b";\n"])),
+        ),
+        b"  return ",
+        nth(vs, 0),
+        b";\n",
+      ]),
+    ),
+  )
+}
 
 /// The call of the closure `f` through its typed entry where its descriptor says convention `c`,
 /// and through the runtime, every value made a word, otherwise; the closure is let go of either way.
@@ -907,14 +977,6 @@ fn fields_spelled(fs: List<FieldTy>) -> Bytes =
     ),
     b"}",
   ])
-
-/// `e`, held as `r`, as the word a value of its type is: a sum's object made of its word.
-fn word_of(e: Bytes, r: Rep) -> Bytes =
-  match r {
-    RMaybe -> Bytes::concat_all([b"rt_maybe_take_p(ctx, ", e, b")"]),
-    RTagged -> Bytes::concat_all([b"rt_tagged_take_p(ctx, ", e, b")"]),
-    _ -> as_word(e, r),
-  }
 
 /// `pr` with `expr` written as a value held as `rep`, into `into` where the value is kept.
 fn valued(p: Place, pr: Printing, into: Option<Var>, rep: Rep, expr: List<Piece>) -> Printing =
