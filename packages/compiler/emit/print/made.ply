@@ -12,11 +12,10 @@ import emit.c (Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, Zeroed, ctyp
 import emit.reps (FieldTy, TyRec, TyOpen, Laid, spelled_field, laid_of, record_flags, nth_field)
 import emit.pieces (Piece, Text, Hole, ShapeOf, TagOf, spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases,
-                 RSlice, RToken, Leaf, Var, Arg, AVar, AInt, AZero, Made, MRecord, MCtor, Path,
-                 PField, PNamed, PArg, PCapture, PLeaf, Data, rep_of_arg, rep_said, var_said,
-                 made_said, parts_of, parts_count)
-import emit.lower.held (tail_bits, fields_of, leaves_of, slot_kind, case_leaves_all, case_span,
-                        enumerated)
+                 RSlice, RToken, Leaf, Var, Arg, AVar, AInt, AZero, Made, MRecord, MCtor, MLaid,
+                 Path, PField, PNamed, PArg, PCapture, PLeaf, PPlace, Data, rep_of_arg, rep_said,
+                 var_said, made_said, parts_of, parts_count)
+import emit.lower.held (tail_bits, fields_of, leaves_of, case_leaves_all, case_span, enumerated)
 import emit.print.text (Printing, Place, printing, line, pieces, pad, temp, named, name_of,
                         arg_text, check, zero, field_hole, part_names, part_name, part_named,
                         shape_at, slot, unprinted)
@@ -407,10 +406,9 @@ pub fn entry_answered(pr: Printing, r: Rep, call: Bytes) -> { pr: Printing, out:
 
 // The values this family prints.
 
-/// A record of a layout its type leaves open or a constructor's object made of `m.args`, in the
-/// cells `m.reuse` names where it names some: a constructor holding each argument as a word, or as
-/// its declaration lays each out, a scalar as its bits, an `Option` as its payload's word and a flat
-/// record in place.
+/// A record or a constructor's object made of `m.args`, in the cells `m.reuse` names where it names
+/// some: a record of a layout its type leaves open by value, a constructor holding each argument as
+/// a word, and an object laid out as `MLaid`'s fields say.
 pub fn made(
   p: Place,
   pr: Printing,
@@ -422,23 +420,10 @@ pub fn made(
     Some(v) -> match m.made {
       MRecord(r) -> by_value(p, pr, v, r.names, m.args),
       MCtor(c) -> if m.args.len() == 0 { ctor_value(p, pr, v, c.name) }
-      else if m.args.any(|a: Arg| laid_rep(rep_of_arg(a))) {
-        ctor_laid(p, pr, v, c.name, m.args, m.reuse, m.kept)
-      } else { ctor_built(p, pr, v, c.name, m.args, m.reuse, m.kept) },
+      else { ctor_built(p, pr, v, c.name, m.args, m.reuse, m.kept) },
+      MLaid(l) -> laid_made(p, pr, v, l.ctor, l.fields, m.args, m.reuse, m.kept),
       other -> unprinted(Data, b"a list or a closure, which other printers make", made_said(other)),
     },
-  }
-
-/// Whether a constructor's object holds an argument held as `r` other than as its word.
-fn laid_rep(r: Rep) -> Bool =
-  match r {
-    RInt -> true,
-    RNum(_) -> true,
-    RFloat -> true,
-    RDec -> true,
-    RMaybe -> true,
-    RFlat(_) -> true,
-    _ -> false,
   }
 
 /// A record of `names` holding the words `args`, which it takes, laid out by the runtime as the
@@ -564,20 +549,23 @@ fn header(name: Bytes, kind: Bytes, flags: Bytes, len: Bytes) -> Bytes =
     b";",
   ])
 
-/// A constructor whose declaration lays its arguments out other than as their words: each held as
-/// a record's field of its representation holds it, a flat record in place; in the cells `reuse`
-/// names where they are some, which hold the arguments `kept` already.
-fn ctor_laid(
+/// An object laid out as `fs` says, constructor `ctor`'s where it names one and a record's
+/// otherwise, of `args`, each held as its field is: a record held in place given as its leaves and
+/// its word, or as its word alone, which is copied in. In the cells `reuse` names where they are
+/// some, which hold the arguments `kept` already.
+fn laid_made(
   p: Place,
   pr: Printing,
   v: Var,
-  ctor: Bytes,
+  ctor: Option<Bytes>,
+  fs: List<FieldTy>,
   args: List<Arg>,
   reuse: Option<Var>,
   kept: List<Int>,
 ) -> Printing = {
-  let fs = range(0, args.len()).map(|i: Int|
-    slot_field(arg_name(i), match args.at(i) { Some(a) -> rep_of_arg(a), None -> RWord }));
+  let whole = range(0, fs.len()).filter(|i: Int|
+    (match nth_field(fs, i).ty { TyRec(_) -> true, _ -> false })
+      && (match args.at(i) { Some(a) -> parts_count(rep_of_arg(a)) == 1, None -> false }));
   // A float's or a width's bits are held in a word of their own first, as today's emitter holds
   // them before it makes the object.
   let given = args.fold({ pr: pr, vals: [] }, |acc: { pr: Printing, vals: List<Held> }, a: Arg| {
@@ -597,12 +585,18 @@ fn ctor_laid(
     }
   });
   let vals = given.vals;
-  let n = named(given.pr, v);
+  let own = match ctor {
+    Some(_) -> { pr: given.pr, at: 0 },
+    None -> shape_of_fields(given.pr, fs),
+  };
+  let kind = match ctor { Some(_) -> b"4", None -> b"3" };
+  let layout = match ctor { Some(c) -> Hole(TagOf(c)), None -> Hole(ShapeOf(own.at)) };
+  let n = named(own.pr, v);
   let l = laid_of(fs);
   let mixed = record_flags(fs, l) & 2 != 0;
   let flags = ascii_of_int(record_flags(fs, l));
   let cells = |q: Printing, depth: Int, skip: List<Int>|
-    laid_lines(q, depth, n.name, fs, vals, skip);
+    laid_lines(q, depth, n.name, fs, vals, skip, whole);
   let allocated = |q: Printing, depth: Int, decl: Bytes|
     pieces(q, [
       Text(
@@ -610,12 +604,14 @@ fn ctor_laid(
           pad(depth),
           decl,
           n.name,
-          b" = rt_alloc_p(ctx, 4, ",
+          b" = rt_alloc_p(ctx, ",
+          kind,
+          b", ",
           ascii_of_int(l.width),
           b", ",
         ]),
       ),
-      Hole(TagOf(ctor)),
+      layout,
       Text(Bytes::concat_all([b", ", flags, b");\n"])),
     ]);
   match reuse {
@@ -639,13 +635,13 @@ fn ctor_laid(
           Text(
             Bytes::concat_all([
               pad(p.depth + 1),
-              header(n.name, b"4", flags, ascii_of_int(l.width)),
+              header(n.name, kind, flags, ascii_of_int(l.width)),
               b" ply_obj(",
               n.name,
               b")->layout = ",
             ]),
           ),
-          Hole(TagOf(ctor)),
+          layout,
           Text(b";\n"),
         ],
       );
@@ -672,21 +668,11 @@ fn bits_held(
   }
 }
 
-fn arg_name(i: Int) -> Bytes =
-  Bytes::concat_all([b"a", ascii_of_int(i / 100), ascii_of_int(i / 10 % 10), ascii_of_int(i % 10)])
-
-/// The field a record or a constructor holds a value held as `r` in.
-fn slot_field(name: Bytes, r: Rep) -> FieldTy =
-  match r {
-    RFlat(ls) -> { name: name, kind: KBoxed, ty: TyRec(fields_of(ls)) },
-    _ -> { name: name, kind: slot_kind(r), ty: TyOpen([]) },
-  }
-
 /// What `g.path` reads out of `g.of`, which the value read borrows: a value's `k`th C value, a field
 /// or a constructor's argument at its offset in a word as the variable it goes into holds it, a
-/// record held in place there as its leaves and the address of its header, or the payload of a sum
-/// held as one word. A field read by name is the runtime's, which answers its word with a count of
-/// its own.
+/// record held in place there as its leaves and the address of its header or as that address alone,
+/// or the payload of a sum held as one word. A field read by name is the runtime's, which answers its
+/// word with a count of its own.
 pub fn got(
   p: Place,
   pr: Printing,
@@ -718,6 +704,7 @@ pub fn got(
                 } else { b }),
               _ -> loaded(p, pr, v, b, a.at),
             }),
+        PPlace(at) -> at_offset(|b: Bytes| declared_as(p, pr, v, [header_at(b, at)])),
         PNamed(name) -> by_name(p, pr, v, g.of, name),
         PCapture(k) ->
           unprinted(
@@ -831,15 +818,7 @@ fn loaded(p: Place, pr: Printing, v: Var, base: Bytes, at: Int) -> Printing =
       let addressed = line(
         n.pr,
         p.depth,
-        Bytes::concat_all([
-          b"Word ",
-          w,
-          b" = ((Word)(intptr_t)(ply_words(",
-          base,
-          b") + ",
-          ascii_of_int(at),
-          b"));",
-        ]),
+        Bytes::concat_all([b"Word ", w, b" = ", header_at(base, at), b";"]),
       );
       let loads = leaf_loads(w, fields_of(ls));
       range(0, loads.len()).fold(addressed, |q: Printing, k: Int|
@@ -858,6 +837,10 @@ fn loaded(p: Place, pr: Printing, v: Var, base: Bytes, at: Int) -> Printing =
     },
     r -> declared_as(p, pr, v, [slot_load(base, at, r)]),
   }
+
+/// The address of the header of the record held in place at word `at` of `base`: that record's word.
+fn header_at(base: Bytes, at: Int) -> Bytes =
+  Bytes::concat_all([b"((Word)(intptr_t)(ply_words(", base, b") + ", ascii_of_int(at), b"))"])
 
 /// The field held as `r` at word `at` of `base`.
 fn slot_load(base: Bytes, at: Int, r: Rep) -> Bytes = {
@@ -1368,7 +1351,7 @@ fn laid_cells(
   vals: List<Held>,
   skip: List<Int>,
 ) -> { pr: Printing, out: List<Piece> } = {
-  let parts = laid_parts(pr, name, name, 0, fs, vals, skip);
+  let parts = laid_parts(pr, name, name, 0, fs, vals, skip, []);
   {
     pr: parts.pr,
     out: [Text(written(name, 0, parts.cells))].concat(
@@ -1377,7 +1360,8 @@ fn laid_cells(
   }
 }
 
-/// `laid_cells` a line each, indented `depth`: each word, then each record held in place.
+/// `laid_cells` a line each, indented `depth`: each word, then each record held in place, those of the
+/// fields `whole` given as their words alone.
 fn laid_lines(
   pr: Printing,
   depth: Int,
@@ -1385,8 +1369,9 @@ fn laid_lines(
   fs: List<FieldTy>,
   vals: List<Held>,
   skip: List<Int>,
+  whole: List<Int>,
 ) -> Printing = {
-  let parts = laid_parts(pr, name, name, 0, fs, vals, skip);
+  let parts = laid_parts(pr, name, name, 0, fs, vals, skip, whole);
   let stored = parts.cells.fold(parts.pr, |q: Printing, c: { at: Int, expr: Bytes }|
     line(q, depth, Bytes::concat_all([slot(name, c.at), b" = ", c.expr, b";"])));
   parts.inners.fold(stored, |q: Printing, x: List<Piece>|
@@ -1397,7 +1382,8 @@ fn laid_lines(
 /// the object `name`, and whose words are those of the word `holder`: its own words at their offsets,
 /// but those of the fields `skip`; and for each record it holds in place, the C that copies it in
 /// where it was made, and where not writes its header, counting back to `holder`, and then its cells,
-/// its own records in place among them. The cells are each at its word of `name`.
+/// its own records in place among them. A record held in place by a field of `whole` is given as its
+/// word alone, one of `vals`, and copied in. The cells are each at its word of `name`.
 fn laid_parts(
   pr: Printing,
   name: Bytes,
@@ -1406,6 +1392,7 @@ fn laid_parts(
   fs: List<FieldTy>,
   vals: List<Held>,
   skip: List<Int>,
+  whole: List<Int>,
 ) -> { pr: Printing, cells: List<{ at: Int, expr: Bytes }>, inners: List<List<Piece>> } = {
   let l = laid_of(fs);
   let flags = record_flags(fs, l);
@@ -1414,19 +1401,19 @@ fn laid_parts(
     |acc: { pr: Printing, i: Int, leaf: Int, words: List<Bytes>, inners: List<List<Piece>> }, f: FieldTy|
       match f.ty {
         TyRec(inner) -> {
-          let n = leaves_of(inner).len();
+          let given_whole = whole.contains(acc.i);
+          let n = if given_whole { 0 } else { leaves_of(inner).len() };
           let off = nth_int(l.offsets, acc.i);
           let group = range(0, n + 1).map(|k: Int| nth_held(vals, acc.leaf + k));
-          let part = if skip.contains(acc.i) { { pr: acc.pr, out: [] } } else {
+          let part = if skip.contains(acc.i) { { pr: acc.pr, out: [] } } else if given_whole {
+            {
+              pr: acc.pr,
+              out: [Text(embedded(holder, off, nth_held(group, 0).expr, laid_of(inner)))],
+            }
+          } else {
             let sh = shape_of_fields(acc.pr, inner);
-            let here = Bytes::concat_all([
-              b"((Word)(intptr_t)(ply_words(",
-              holder,
-              b") + ",
-              ascii_of_int(off),
-              b"))",
-            ]);
-            let inside = laid_parts(sh.pr, name, here, at + off + 2, inner, group.take(n), []);
+            let here = header_at(holder, off);
+            let inside = laid_parts(sh.pr, name, here, at + off + 2, inner, group.take(n), [], []);
             {
               pr: inside.pr,
               out: in_place_text(
@@ -1489,15 +1476,8 @@ fn in_place_text(
         w,
         b") { ",
         let_go(vals.take(vals.len() - 1)),
-        b"ply_embed(ctx, ",
-        holder,
-        b", ",
-        ascii_of_int(off),
-        b", ",
-        w,
-        b", ",
-        ascii_of_int(l.tail),
-        b"); } else { ply_embedded(",
+        embedded(holder, off, w, l),
+        b" } else { ply_embedded(",
         holder,
         b", ",
         ascii_of_int(off),
@@ -1516,6 +1496,20 @@ fn in_place_text(
     Text(b" }"),
   )
 }
+
+/// The C copying the record of word `w`, laid out as `l`, in at word `off` of `holder`, taking `w`.
+fn embedded(holder: Bytes, off: Int, w: Bytes, l: Laid) -> Bytes =
+  Bytes::concat_all([
+    b"ply_embed(ctx, ",
+    holder,
+    b", ",
+    ascii_of_int(off),
+    b", ",
+    w,
+    b", ",
+    ascii_of_int(l.tail),
+    b");",
+  ])
 
 fn written(name: Bytes, at: Int, cells: List<{ at: Int, expr: Bytes }>) -> Bytes =
   Bytes::concat_all(
@@ -1567,13 +1561,7 @@ pub fn leaf_loads(word: Bytes, fs: List<FieldTy>) -> List<Held> = {
     {
       out: match f.ty {
         TyRec(inner) -> {
-          let h = Bytes::concat_all([
-            b"((Word)(intptr_t)(ply_words(",
-            word,
-            b") + ",
-            ascii_of_int(at),
-            b"))",
-          ]);
+          let h = header_at(word, at);
           acc.out.concat(leaf_loads(h, inner)).push({ rep: RWord, expr: h })
         },
         _ ->
@@ -1939,7 +1927,13 @@ test "a constructor reuses the cells a token names, writing all but what they ke
   let tok = local(2, RToken(2));
   let pr = printing(Map::new().insert(0, b"p0").insert(1, b"p1").insert(2, b"p2"));
   let m = {
-    made: MCtor({ name: b"m.Box", width: 2 }),
+    made: MLaid({
+      ctor: Some(b"m.Box"),
+      fields: [
+        { name: b"a000", kind: KInt, ty: TyOpen([]) },
+        { name: b"a001", kind: KBoxed, ty: TyOpen([]) },
+      ],
+    }),
     args: [AVar(n), AVar(s)],
     reuse: Some(tok),
     kept: [1],
@@ -1972,4 +1966,44 @@ test "a constructor reuses the cells a token names, writing all but what they ke
     fresh,
     b"  Word t1 = rt_alloc_p(ctx, 4, 2, @@Tm.Box@@, 6);\n  ply_words(t1)[0] = (Word)(p0);\n  ply_words(t1)[1] = p1;\n  ply_words(t1)[2] = INT64_C(2);\n",
   )
+}
+
+test "a record laid out as its type says is made of its fields, one it holds in place given as its word copied in" {
+  let wide = range(0, 5).map(|i: Int|
+    { name: b"f".concat(ascii_of_int(i)), kind: KInt, ty: TyOpen([]) });
+  let fs = [
+    { name: b"n", kind: KInt, ty: TyOpen([]) },
+    { name: b"w", kind: KBoxed, ty: TyRec(wide) },
+  ];
+  let pr = printing(Map::new().insert(0, b"p0").insert(1, b"p1").insert(2, b"p2"));
+  let m = {
+    made: MLaid({ ctor: None, fields: fs }),
+    args: [AVar(local(0, RInt)), AVar(local(1, RWord))],
+    reuse: None,
+    kept: [],
+  };
+  // `n` takes word zero and `w` its header's two and its five after: no word is counted.
+  assert_eq(
+    spelled(made(place(), pr, Some(local(3, RWord)), m).out),
+    b"  Word t1 = rt_alloc_p(ctx, 3, 8, @@s1@@, 5);\n  ply_words(t1)[0] = (Word)(p0);\n  ply_embed(ctx, t1, 1, p1, 0);\n",
+  );
+  // In the cells of a record of its type let go of, its header is written again and all it keeps
+  // is left where it lies.
+  let reused = spelled(
+    made(place(), pr, Some(local(3, RWord)), {
+      ..m,
+      reuse: Some(local(2, RToken(8))),
+      kept: [0],
+    }).out,
+  ).split(
+    b"\n",
+  );
+  assert_eq(reused.take(3), [b"  Word t1 = 0;", b"  if (p2) {", b"    t1 = p2;"]);
+  assert(
+    reused.contains(
+      b"    ply_obj(t1)->rc = 1; ply_obj(t1)->kind = 3; ply_obj(t1)->flags = 5; ply_obj(t1)->len = 8; ply_obj(t1)->layout = @@s1@@;",
+    ),
+  );
+  assert_eq(reused.filter(|l: Bytes| l.index_of(b"ply_words(t1)[0] = ") != None).len(), 1);
+  assert_eq(reused.filter(|l: Bytes| l.index_of(b"ply_embed(ctx, t1, 1, p1, 0);") != None).len(), 2)
 }

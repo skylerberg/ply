@@ -7,14 +7,14 @@
 
 import emit.tir (Rep, RWord, RInt, RBool, RNum, RMaybe, RTagged, RFlat, RCases, RToken, Leaf, Var,
                  Arg, AVar, AInt, ABool, Val, Call, Apply, Make, Pack, Gathered, Native, Op, Get,
-                 Take, Static, Prim, Path, PLeaf, PField, PArg, PNamed, Made, MRecord, MCtor,
+                 Take, Static, Prim, Path, PLeaf, PField, PArg, PNamed, Made, MRecord, MCtor, MLaid,
                  MClosure, MList, AZero, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop,
                  Next, Done, Return, Restart, Enter, Fail, NoArm, Handle, Sited, Inc, Dec, Reset,
                  Free, Opened, Block, Fn, Member, Rooted, Lambda, Closure, Handed, Given, Lent,
                  Convention, Answered, Owns, ReadsOf, Lasts, no_links, counted, operands, answered,
                  fails, used_as, rep_of_arg, var_of, parts_of, Test, TTag, TInt, TRange)
 import emit.keys (Named, Root)
-import emit.reps (FieldTy, TyRec, kind_of, in_place)
+import emit.reps (FieldTy, TyRec, kind_of, in_place, laid_of)
 import check.types (Type, TyCon, TyRecord)
 import syntax.parsing (dummy_span)
 import std.bytes (ascii_of_int)
@@ -710,25 +710,50 @@ fn taken_at(h: Holding, of: Var, p: Path) -> Bool =
   match h.taken.get(of.id) { Some(ps) -> ps.contains(p), None -> false }
 
 /// Whether each argument `made` keeps in the cells of block `of` is what those cells hold there: a
-/// read out of `of` at the place it would be written, which no take emptied.
-fn kept_held(h: Holding, made: Made, args: List<Arg>, kept: List<Int>, of: Int) -> Bool =
+/// read out of `of` at the place `kept_reads` says, which no take emptied.
+fn kept_held(h: Holding, made: Made, args: List<Arg>, kept: List<Int>, of: Int) -> Bool = {
+  let reads = kept_reads(made, args.len());
   kept.all(|k: Int|
     match args.at(k) {
       Some(AVar(a)) -> match h.read_at.get(a.id) {
         Some(r) ->
           r.of == of && !(match h.taken.get(of) { Some(ps) -> ps.contains(r.path), None -> false })
-            && (match made {
-              MCtor(c) -> match r.path { PArg(p) -> p.ctor == c.name && p.at == k, _ -> false },
-              _ -> false,
-            }),
+            && reads.at(k) == Some(Some(r.path)),
         None -> false,
       },
       _ -> false,
     })
+}
 
-/// Whether a `Make` of `made` is printed into the cells a reuse token names: a constructor's
-/// object. A record is made by value, which takes none.
-fn reuses_cells(made: Made) -> Bool = match made { MCtor(_) -> true, _ -> false }
+/// For each of the `n` arguments of `made`, the read that finds it where `made` writes it, so the
+/// cells of a block read so hold it already: a constructor's argument at its place, a laid out
+/// field at its offset; none for a record held in place, whose words a reset let go of.
+pub fn kept_reads(made: Made, n: Int) -> List<Option<Path>> =
+  match made {
+    MCtor(c) -> range(0, n).map(|i: Int| Some(PArg({ ctor: c.name, at: i }))),
+    MLaid(l) -> {
+      let offsets = laid_of(l.fields).offsets;
+      range(0, n).map(|i: Int|
+        match l.fields.at(i) {
+          Some(f) -> if in_place(f) != None { None } else {
+            match offsets.at(i) {
+              Some(o) -> match l.ctor {
+                Some(c) -> Some(PArg({ ctor: c, at: o })),
+                None -> Some(PField({ name: f.name, at: o })),
+              },
+              None -> None,
+            }
+          },
+          None -> None,
+        })
+    },
+    _ -> range(0, n).map(|_: Int| None),
+  }
+
+/// Whether a `Make` of `made` is printed into the cells a reuse token names: a constructor's object
+/// or a laid out record. A record the runtime lays out is made by value, which takes none.
+pub fn reuses_cells(made: Made) -> Bool =
+  match made { MCtor(_) -> true, MLaid(_) -> true, _ -> false }
 
 /// Whether `val` may stop for a handler that can resume it more than once.
 pub fn stops_at(val: Val) -> Bool =
@@ -960,7 +985,14 @@ pub fn payload_of(val: Val, y: Var) -> Option<Var> =
 
 fn sum_word(r: Rep) -> Bool = match r { RMaybe -> true, RTagged -> true, _ -> false }
 
-fn made_width(m: Made) -> Int = match m { MRecord(r) -> r.width, MCtor(c) -> c.width, _ -> 0 }
+/// The payload words of the block `m` allocates, where it is a record or a constructor's object.
+pub fn made_width(m: Made) -> Int =
+  match m {
+    MRecord(r) -> r.width,
+    MCtor(c) -> c.width,
+    MLaid(l) -> laid_of(l.fields).width,
+    _ -> 0,
+  }
 
 /// Whether each arm's `when` is a constructor `tested` names, where it tests a tag: the arm then knows
 /// its subject holds that constructor, which decides whose cells it may reuse.
