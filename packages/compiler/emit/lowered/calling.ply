@@ -2,12 +2,14 @@
 //! closures, function values, bodies run in place, steps and tail groups.
 
 import check.resolve.tables (qualify)
-import check.types (TyCon)
-import emit.keys (Named, At, KeyType, Root, Generic)
+import check.types (Type, TyCon, int_type)
+import emit.keys (Named, Root, Generic)
+import emit.reps (typed_at)
+import emit.state (BoundLambda)
 import emit.tir (Rep, RInt, RWord, RFlat, RCases, Var, Arg, AVar, Val, Call, Apply, Make, Get, Pack,
                  Op, OCalling, MClosure, MCtor, PCapture, TTag, Inst, Let, Do, If, Case, Match,
-                 Loop, Next, Done, Restart, Enter, Sited, Block, Fn, Member, Closure, Declined,
-                 Family, Spine, Data, Calling, Matching, Handling, Scalars, Containers)
+                 Loop, Next, Done, Restart, Enter, Return, Sited, Block, Fn, Member, Closure,
+                 Declined, Family, Spine, Data, Calling, Matching, Handling, Scalars, Containers)
 import emit.tir.calling (EntryValue, ConstantRead, Ticked)
 import emit.lower (lowered_fn, lowered_group)
 import emit.lower.base (GroupMember, context_of)
@@ -15,7 +17,7 @@ import emit.lower.calling (known_body, lambdas_of)
 import emit.answer (GenericCall)
 import emit.verify (verified)
 import emit.own (owned)
-import emit.roots (symbol_of)
+import emit.roots (FnArg, symbol_of, specialised_with)
 import emit.compare (Program, Hunk, program_of, answered_today, today_text, printed_text,
                      normalised, past_counts, hunks)
 
@@ -58,6 +60,17 @@ fn corpus() -> Bytes =
     b"fn seek(o: Option<{ x: Int, y: Int }>, n: Int) -> Option<{ x: Int, y: Int }> / {diverges} = if n == 0 { o } else { probe(o, n - 1) }\n",
     b"fn probe(o: Option<{ x: Int, y: Int }>, n: Int) -> Option<{ x: Int, y: Int }> / {diverges} = if n == 0 { o } else { seek(o, n - 2) }\n",
     b"fn lends_on(x: Int) -> Int = apply_to(|y: Int| { let g = |z: Int| z + x; g(y) + applied(|w: Int| w + y, y) }, x)\n",
+    b"fn raised_step(n: Int) -> Int / {abort.raise} = iterate(0, n, |i: Int| { let next = if i >= 10 { Stop(i) } else { Continue(i + 1) }; if i == 5 { abort.raise(\"five\") } else { () }; next })\n",
+    b"fn paired_step(n: Int) -> Int / {abort.raise} = iterate(pair(0, 1), n, |q: { x: Int, y: Int }| if q.x >= 10 { Stop(q.x + q.y) } else { Continue(pair(q.y, q.x + q.y)) })\n",
+    b"fn walk1(p: { x: Int, y: Int }, n: Int) -> { x: Int, y: Int } = if n <= 0 { p } else { walk1(pair(p.y, p.x), n - 1) }\n",
+    b"fn go<T>(x: T, n: Int) -> Int = if n <= 0 { 0 } else { go(x, n - 1) }\n",
+    b"effect amb {\n  read flip() -> Bool\n}\n",
+    b"effect gauge {\n  read level() -> Float\n}\n",
+    b"fn tailed() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) }\n",
+    b"fn gauged() -> Float = handle { gauge.level() + 1.0 } with { gauge.level() resume k -> k(1.5) }\n",
+    b"fn both() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) }\n",
+    b"fn ping(n: Int) -> Int / {diverges} = if n == 0 { 0 } else { pong(n - 1) }\n",
+    b"fn pong(n: Int) -> Int / {diverges} = if n == 0 { let f = |x: Int| x * n; f(2) } else { ping(n - 1) }\n",
   ])
 
 fn names() -> List<Bytes> =
@@ -99,10 +112,20 @@ fn names() -> List<Bytes> =
     b"seek",
     b"probe",
     b"lends_on",
+    b"raised_step",
+    b"paired_step",
+    b"walk1",
+    b"go",
+    b"tailed",
+    b"gauged",
+    b"both",
+    b"ping",
+    b"pong",
   ]
 
 /// The corpus's tail groups, each by its members' names.
-fn groups() -> List<List<Bytes>> = [[b"even", b"odd"], [b"walk", b"stride"], [b"seek", b"probe"]]
+fn groups() -> List<List<Bytes>> =
+  [[b"even", b"odd"], [b"walk", b"stride"], [b"seek", b"probe"], [b"ping", b"pong"]]
 
 /// Root `m.<name>` of `p` lowered as a build lowers it: its body after `known_body`.
 fn lowered_as_built(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.raise} =
@@ -523,6 +546,37 @@ fn root_at(p: Program, name: Bytes) -> Option<Int> =
       None -> acc,
     })
 
+/// The corpus's root `name` lowered as a build lowers its specialisation at `args` running `fns`,
+/// each parameter `lent` names running that lambda: keyed by the name that spells it, its body's
+/// types read at `args`; or why not.
+fn specialised_form(
+  p: Program,
+  name: Bytes,
+  args: List<Type>,
+  fns: List<FnArg>,
+  lent: List<Option<BoundLambda>>,
+) -> Result<Fn, Bytes> / {abort.raise} =
+  match match root_at(p, name) { Some(i) -> p.roots.at(i), None -> None } {
+    None -> Err(b"no such root"),
+    Some(r) -> match r.code {
+      None -> Err(b"a root of no code"),
+      Some(code) -> {
+        let full = specialised_with(r.full, args, fns);
+        let params = range(0, r.params.len()).map(|i: Int|
+          match lent.at(i) {
+            Some(Some(bl)) -> { ..r.params.get(i), lambda: Some(bl) },
+            _ -> r.params.get(i),
+          });
+        let body = known_body(full, params, code);
+        let setting = { ..p.setting, typed: typed_at(p.setting.typed, args) };
+        match lowered_fn(context_of(setting, { ..r, full: full, params: params }, body), body) {
+          Ok(f) -> Ok(f),
+          Err(no) -> Err(no.why),
+        }
+      },
+    },
+  }
+
 /// `apply_to` at the type named `ty` as the specialisation a build lowers where the corpus's root
 /// `lender` hands it the first lambda it writes, and the lender's base; or why not.
 fn lent_run(
@@ -538,47 +592,31 @@ fn lent_run(
         let written = lambdas_of(known_body(l.full, l.params, code));
         match written.at(0) {
           None -> Err(b"a lender that writes no lambda"),
-          Some(first) -> match match root_at(p, b"apply_to") {
-              Some(i) -> p.roots.at(i),
-              None -> None,
-            } {
-            None -> Err(b"no apply_to"),
-            Some(r) -> {
-              let bound = {
-                owner: l.full,
-                nth: 0,
-                code: first,
-                named: false,
-                module: b"m",
-                here: p.setting.here,
-                imports: p.setting.imports,
-                effects: p.setting.effects,
-                typed: p.setting.typed,
-                operands: Map::new(),
-                base: l.base,
-                written: written,
-              };
-              let params = range(0, r.params.len()).map(|i: Int| {
-                let q = r.params.get(i);
-                if i == 0 { { ..q, lambda: Some(bound) } } else { q }
-              });
-              let body = known_body(r.full, params, match r.code {
-                Some(c) -> c,
-                None -> first.body,
-              });
-              let cx = {
-                ..context_of(p.setting, { ..r, params: params }, body),
-                key: At({
-                  def: r.full,
-                  args: [KeyType(TyCon({ name: ty, args: [] }))],
-                  lent: [{ param: 0, owner: l.full, nth: 0 }],
-                }),
-              };
-              match lowered_fn(cx, body) {
-                Ok(f) -> Ok({ f: f, base: l.base }),
-                Err(no) -> Err(no.why),
-              }
-            },
+          Some(first) -> {
+            let bound = {
+              owner: l.full,
+              nth: 0,
+              code: first,
+              named: false,
+              module: b"m",
+              here: p.setting.here,
+              imports: p.setting.imports,
+              effects: p.setting.effects,
+              typed: p.setting.typed,
+              operands: Map::new(),
+              base: l.base,
+              written: written,
+            };
+            match specialised_form(
+                p,
+                b"apply_to",
+                [TyCon({ name: ty, args: [] })],
+                [{ param: 0, owner: l.full, nth: 0 }],
+                [Some(bound)],
+              ) {
+              Ok(f) -> Ok({ f: f, base: l.base }),
+              Err(why) -> Err(why),
+            }
           },
         }
       },
@@ -731,6 +769,233 @@ test "a tail group's members take and answer a record as its fields and a sum as
   }
 }
 
+test "a closure a later member of a tail group writes fails at that member's sites" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match group_form([b"ping", b"pong"]) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(f) -> {
+        let base = match match root_at(p, b"pong") { Some(i) -> p.roots.at(i), None -> None } {
+          Some(r) -> r.base,
+          None -> 0 - 1,
+        };
+        assert_eq(
+          range(0, f.lambdas.len()).map(|k: Int|
+            match closure_of(f, k) { Some(c) -> c.body.body.at(0), None -> None }),
+          [Some(Sited(Some({ root: Named(b"m.pong"), base: base })))],
+        )
+      },
+    },
+  }
+}
+
+test "a specialisation, keyed by the name that spells it, restarts its own tail calls" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match specialised_form(p, b"go", [int_type()], [], []) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(f) -> {
+        assert_eq(
+          insts_in(f.body).filter(|i: Inst| match i { Restart(_) -> true, _ -> false }).len(),
+          1,
+        );
+        assert_eq(vals_in(f.body).filter(|v: Val| match v { Call(_) -> true, _ -> false }).len(), 0)
+      },
+    },
+  }
+}
+
+/// The block of the first loop `b` runs.
+fn loop_in(b: Block) -> Option<Block> =
+  b.fold(None, |acc: Option<Block>, i: Inst|
+    match acc { Some(_) -> acc, None -> match i { Loop(l) -> Some(l.body), _ -> None } })
+
+test "a step whose join more of its pass follows runs the rest of the pass, then tests the `Iter` it answers" {
+  match form(b"raised_step") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> match loop_in(f.body) {
+      None -> assert(false, Some("no loop")),
+      Some(pass) -> {
+        assert(match pass.at(pass.len() - 1) {
+          Some(Case(c)) -> c.test == TTag([b"Continue", b"Stop"]),
+          _ -> false,
+        });
+        assert_eq(
+          vals_in(pass).filter(|v: Val|
+            match v { Make(m) -> match m.made { MCtor(_) -> true, _ -> false }, _ -> false }).len(
+          ),
+          2,
+        )
+      },
+    },
+  }
+}
+
+test "a restart and a loop over a record set its parameter or state value by value" {
+  match form(b"walk1") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      let text = printed_text(owned(f));
+      assert(text.index_of(b" p0_0 = ") != None);
+      assert(text.index_of(b" p0_2 = ") != None);
+      assert(text.index_of(b" p0 = ") == None)
+    },
+  };
+  match form(b"paired_step") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(
+        f.body.fold([], |acc: List<Bool>, i: Inst|
+          match i { Loop(l) -> acc.concat(l.state.map(|v: Var| parted(v.rep))), _ -> acc }),
+        [true, false],
+      );
+      assert_eq(undeclared(printed_text(owned(f))), [])
+    },
+  }
+}
+
+test "a continuation is a word the runtime calls with words, and a clause binding one answers the very word it hands back" {
+  let applied = |f: Fn| vals_in(f.body).filter(|v: Val| match v { Apply(_) -> true, _ -> false });
+  let clause_of = |f: Fn|
+    range(0, f.lambdas.len()).fold(None, |acc: Option<Fn>, k: Int|
+      match closure_of(f, k) {
+        Some(c) -> if applied(c.body).len() > 0 { Some(c.body) } else { acc },
+        None -> acc,
+      });
+  let conventions = |c: Fn|
+    applied(c).map(|v: Val| match v { Apply(a) -> a.conv.reps.push(a.conv.answer), _ -> [] });
+  let resumed = |c: Fn|
+    c.body.fold([], |acc: List<Var>, i: Inst|
+      match i { Let(l) -> match l.val { Apply(_) -> acc.push(l.var), _ -> acc }, _ -> acc });
+  let tail_only = |n: Bytes|
+    match form(n) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(f) -> match clause_of(f) {
+        None -> assert(false, Some("no clause calls its continuation")),
+        Some(c) -> {
+          assert_eq(c.conv.answer, RWord);
+          assert_eq(conventions(c), [[RWord, RWord]]);
+          assert_eq(resumed(c).map(|v: Var| c.body.contains(Return(AVar(v)))), [true]);
+          assert_eq(
+            vals_in(c.body).filter(|v: Val|
+              match v { Pack(k) -> resumed(c).any(|r: Var| k.arg == AVar(r)), _ -> false }).len(
+            ),
+            0,
+          )
+        },
+      },
+    };
+  tail_only(b"tailed");
+  tail_only(b"gauged");
+  match form(b"both") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> match clause_of(f) {
+      None -> assert(false, Some("no clause calls its continuation")),
+      Some(c) -> {
+        assert_eq(c.conv.answer, RWord);
+        assert_eq(conventions(c), [[RWord, RWord], [RWord, RWord]])
+      },
+    },
+  }
+}
+
+/// The C functions of `text`, each its lines from the head at column 0 that opens it to the `}`
+/// that closes it.
+fn functions_of(text: Bytes) -> List<List<Bytes>> / {abort.raise} =
+  text.split(b"\n").fold(
+    { done: [], open: None },
+    |acc: { done: List<List<Bytes>>, open: Option<List<Bytes>> }, l: Bytes|
+      match acc.open {
+        None -> if !l.starts_with(b" ") && l.ends_with(b"{") { { ..acc, open: Some([l]) } }
+        else { acc },
+        Some(o) -> if l == b"}" { { done: acc.done.push(o), open: None } }
+        else { { ..acc, open: Some(o.push(l)) } },
+      },
+  ).done
+
+/// The names a C function `text` holds sets, `name = …`, that the same function declares nowhere.
+fn undeclared(text: Bytes) -> List<Bytes> / {abort.raise} =
+  functions_of(text).fold([], |acc: List<Bytes>, f: List<Bytes>| {
+    let pieces = f.fold([], |s: List<Bytes>, l: Bytes| s.concat(statements_of(l)));
+    let declared = pieces.fold([], |d: List<Bytes>, s: Bytes|
+      match declared_name(s) { Some(n) -> d.push(n), None -> d });
+    pieces.fold(acc, |a: List<Bytes>, s: Bytes|
+      match set_name(s) {
+        Some(n) -> if declared.contains(n) || a.contains(n) { a } else { a.push(n) },
+        None -> a,
+      })
+  })
+
+/// A line of C cut at each `;`, `,`, parenthesis and brace, each piece without its leading spaces.
+fn statements_of(l: Bytes) -> List<Bytes> / {abort.raise} =
+  [b";", b",", b"(", b")", b"{", b"}"].fold([l], |ps: List<Bytes>, sep: Bytes|
+    ps.fold([], |out: List<Bytes>, x: Bytes| out.concat(x.split(sep)))).map(|s: Bytes| {
+    let from = range(0, s.len()).fold(s.len(), |at: Int, k: Int|
+      if at == s.len() && s.at(k) != 32 { k } else { at });
+    s.slice(from, s.len())
+  })
+
+/// The name a piece of C declares, `<type> name`.
+fn declared_name(s: Bytes) -> Option<Bytes> / {abort.raise} =
+  [b"Word", b"int64_t", b"int", b"double", b"bool", b"PlyMaybe", b"PlyTagged", b"PlyDec"].fold(
+    None,
+    |acc: Option<Bytes>, t: Bytes| {
+      let head = t.concat(b" ");
+      match acc {
+        Some(_) -> acc,
+        None -> if !s.starts_with(head) { None } else {
+          let rest = s.slice(head.len(), s.len());
+          let n = name_length(rest);
+          if n == 0 { None } else { Some(rest.slice(0, n)) }
+        },
+      }
+    },
+  )
+
+/// The name a piece of C sets, `name = …`.
+fn set_name(s: Bytes) -> Option<Bytes> / {abort.raise} = {
+  let n = name_length(s);
+  if n > 0 && s.slice(n, s.len()).starts_with(b" = ") { Some(s.slice(0, n)) } else { None }
+}
+
+/// How many of `s`'s first bytes spell a C name.
+fn name_length(s: Bytes) -> Int / {abort.raise} =
+  range(0, s.len()).fold({ n: 0, open: true }, |acc: { n: Int, open: Bool }, k: Int| {
+    let b = s.at(k);
+    if acc.open
+        && (b == 95 || (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)) {
+      { n: acc.n + 1, open: true }
+    } else { { ..acc, open: false } }
+  }).n
+
+test "every function the calling corpus prints sets only names it declares" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let roots = names().fold([], |acc: List<{ name: Bytes, names: List<Bytes> }>, n: Bytes|
+        match lowered_as_built(p, n) {
+          Err(_) -> acc,
+          Ok(f) -> {
+            let left = undeclared(printed_text(owned(f)));
+            if left.len() == 0 { acc } else { acc.push({ name: n, names: left }) }
+          },
+        });
+      assert_eq(
+        groups().fold(roots, |acc: List<{ name: Bytes, names: List<Bytes> }>, g: List<Bytes>|
+          match group_form(g) {
+            Err(_) -> acc,
+            Ok(f) -> {
+              let left = undeclared(printed_text(owned(f)));
+              if left.len() == 0 { acc }
+              else { acc.push({ name: match g.at(0) { Some(n) -> n, None -> b"" }, names: left }) }
+            },
+          }),
+        [],
+      )
+    },
+  }
+}
+
 /// Every run of lines two readings of one root's C differ in, spelled for a failure's message.
 fn differences(today: Bytes, form: Bytes) -> Bytes / {abort.raise} =
   Bytes::concat_all(
@@ -774,6 +1039,7 @@ test "the corpus's C reads as today's emitter's, but for the roots named with wh
       let released = b"a failure path releases what the path holds, where today's emitter leaves without";
       let parts = b"a record a call answers comes back into its parts' locals, where today's emitter holds its word in a local declared first";
       let budget = b"the step is the form's `Loop`: its budget a state variable counted down by a checked subtraction, where today's emitter counts the budget parameter down in place";
+      let resumed = b"a clause binding a continuation answers the word the continuation hands back, where today's emitter opens it as the clause's type";
       let opened_parts = b"a member's record or sum is opened into its parts where its arm starts and made a word again where it is answered or handed on, and its wrapper opens the answer into locals before writing them through its pointers, where today's emitter keeps the word and writes through the pointers as it opens it";
       let expected = [
         { name: b"adder", why: opened },
@@ -793,6 +1059,18 @@ test "the corpus's C reads as today's emitter's, but for the roots named with wh
         { name: b"applied_pair", why: parts },
         // And: its captured `Int`s are opened as in `adder`.
         { name: b"lends_on", why: released },
+        // And: the pass is not fused, so the `Iter` it answers is tested once the pass has run.
+        { name: b"raised_step", why: budget },
+        // And: the state is a record held as its parts.
+        { name: b"paired_step", why: budget },
+        {
+          name: b"walk1",
+          why: b"a record parameter is set value by value on a restart, its word among them, where today's emitter holds the word in a local",
+        },
+        { name: b"go", why: released },
+        { name: b"tailed", why: resumed },
+        { name: b"gauged", why: resumed },
+        { name: b"both", why: resumed },
         // And: the rest of the switch returns through `ctx->fuel += 1;`.
         {
           name: b"even",
@@ -801,6 +1079,10 @@ test "the corpus's C reads as today's emitter's, but for the roots named with wh
         // And: each member's entry opens a record or a sum parameter on one line, as in `pair_summer`.
         { name: b"walk", why: opened_parts },
         { name: b"seek", why: opened_parts },
+        {
+          name: b"ping",
+          why: b"a closure a later member writes is the group's, named and numbered among its closures and naming the member's sites by its id, where today's emitter names and numbers it as the member's",
+        },
       ];
       assert(
         differing.map(|d: { name: Bytes, at: Bytes }| d.name)
