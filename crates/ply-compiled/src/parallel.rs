@@ -88,6 +88,7 @@ impl Handed {
         let branch_was = BRANCH_OF.with(|of| of.replace(c.id.0));
         let heap_was = heap::swap_current(&mut c.heap);
         let site_was = heap::poison::swap(&raw const c.site_root);
+        let running_was = crate::rt::swap_running(ctx);
         let mine = c.instances();
         let instances_were = ply_core::instances::swap(mine);
         branch.answer = call_value(ctx, branch.closure, &[]);
@@ -95,6 +96,7 @@ impl Handed {
         // A reactor belongs to the thread that made it, and this branch is over.
         c.runtime = None;
         ply_core::instances::swap(instances_were);
+        crate::rt::swap_running(running_was);
         heap::poison::swap(site_was);
         heap::swap_current(heap_was);
         BRANCH_OF.with(|of| of.set(branch_was));

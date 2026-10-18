@@ -135,6 +135,50 @@ fn the_runtime_describes_each_native_under_the_fields_a_build_reads() {
     assert_eq!(names, reported);
 }
 
+/// Past what a released build reads, the description says what emitted code lays out against: each
+/// native's machine kinds, the context's fields compiled code reads, the descriptors it lays out,
+/// and how deeply drop roots nest.
+#[test]
+fn the_runtime_describes_what_emitted_code_lays_out_against() {
+    let described: serde_json::Value =
+        serde_json::from_str(&ply_privileged::shipped::runtime_json())
+            .expect("the description reads");
+    let native = |name: &str| {
+        described["natives"]
+            .as_array()
+            .expect("natives")
+            .iter()
+            .find(|n| n["name"] == name)
+            .unwrap_or_else(|| panic!("no native `{name}`"))
+            .clone()
+    };
+    let push = native("List::push");
+    assert_eq!(push["params"], serde_json::json!(["Word", "Word"]));
+    assert_eq!(push["answer"], "Word");
+    let out = native("?out_str");
+    assert_eq!(
+        (&out["params"], &out["answer"], &out["words"]),
+        (
+            &serde_json::json!(["Addr", "I64"]),
+            &serde_json::Value::Null,
+            &2.into()
+        )
+    );
+    let ctx = &described["ctx"];
+    assert_eq!((&ctx["failed"], &ctx["fuel"]), (&0.into(), &8.into()));
+    for field in ["next_tick", "release_depth", "release_waiting"] {
+        assert!(ctx[field].is_u64(), "no offset of `{field}`");
+    }
+    let descriptors = &described["descriptors"];
+    for (name, size) in [("PlyType", 56), ("PlyOp", 64), ("PlyFnDesc", 48)] {
+        assert_eq!(descriptors[name]["size"], size, "{name}");
+    }
+    assert_eq!(descriptors["PlyType"]["fields"]["lift"], 48);
+    assert_eq!(descriptors["PlyOp"]["fields"]["vars"], 56);
+    assert_eq!(descriptors["PlyFnDesc"]["fields"]["release"], 24);
+    assert_eq!(described["release_depth"], 32);
+}
+
 /// What a runtime's library describes itself as carries how it lays out a list's and a map's parts,
 /// under the fields `compiler.native.runtime_of` reads: each a number but the header fields, named.
 #[test]

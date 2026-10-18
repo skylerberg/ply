@@ -13,11 +13,17 @@ use std::sync::{Arc, Mutex};
 
 /// A context over a unit of no definitions, constants or types.
 pub fn context() -> Ctx {
+    naming(&[])
+}
+
+/// [`context`] over a unit whose field table holds `fields`, which name effects and operations by
+/// their places.
+pub fn naming(fields: &[&str]) -> Ctx {
     Ctx::new(Arc::new(Tables {
         consts: Vec::new(),
         const_words: Vec::new(),
         layouts: Layouts::new(Vec::new()),
-        fields: Vec::new(),
+        fields: fields.iter().map(ply_core::Symbol::new).collect(),
         builtins: Vec::new(),
         functions: Vec::new(),
         memo: Box::default(),

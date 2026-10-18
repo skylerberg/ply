@@ -3,8 +3,8 @@
 
 use crate::heap::{self, Word};
 use crate::rt::{
-    Args, Ctx, FAILED_ABORT, FAILED_UNWIND, FrameClause, HandlerFrame, StackCopy, call_value,
-    drop_frame, no_stack_to_take, release_vars, switch_keeping,
+    Ctx, FAILED_ABORT, FAILED_UNWIND, FrameClause, HandlerFrame, StackCopy, call_clause, call_fun,
+    drop_frame, no_stack_to_take, release_fun, release_vars, switch_keeping,
 };
 use crate::stack::{Stack, switch};
 use ply_core::{Diagnostic, Symbol, codes};
@@ -24,6 +24,8 @@ pub struct Detached {
     /// Owned here, not by the entry frame, which every restored snapshot would release again.
     body: Word,
     ret: Word,
+    /// Whether `body` and `ret` are closures emitted code made.
+    emitted: bool,
     starting: Option<Word>,
     state: State,
     captures: Vec<Capture>,
@@ -54,7 +56,11 @@ enum State {
 }
 
 enum Stopped {
-    Performed { closure: Word, args: Vec<Word> },
+    Performed {
+        closure: Word,
+        emitted: bool,
+        args: Vec<Word>,
+    },
     Finished(Word),
     Failed,
 }
@@ -62,12 +68,21 @@ enum Stopped {
 const ONE_SHOT: &str = "the `handle` this continuation was captured in has already ended";
 
 /// `rt_handle_detached`: runs the body on a fresh stack until it stops; answers the handle's value.
-pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, body: Word) -> Word {
+/// `ret` and `body` are closures emitted code made where `emitted`.
+pub(crate) unsafe fn open(
+    ctx: *mut Ctx,
+    clauses: Vec<FrameClause>,
+    ret: Word,
+    body: Word,
+    emitted: bool,
+) -> Word {
     let c = unsafe { &mut *ctx };
     let Some(stack) = Stack::take() else {
         clauses.into_iter().for_each(FrameClause::release);
-        heap::dec(ret);
-        heap::dec(body);
+        if ret != 0 {
+            release_fun(emitted, ret);
+        }
+        release_fun(emitted, body);
         return no_stack_to_take(c);
     };
     let id = c.detached.len();
@@ -91,6 +106,7 @@ pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, b
         answer: 0,
         body,
         ret,
+        emitted,
         starting: Some(body),
         state: State::Fresh,
         captures: Vec::new(),
@@ -181,7 +197,11 @@ pub(crate) unsafe fn resume(
     let d = &mut c.detached[id];
     c.current = d.resumer_current;
     match d.request.take() {
-        Some(Stopped::Performed { closure, mut args }) => {
+        Some(Stopped::Performed {
+            closure,
+            emitted,
+            mut args,
+        }) => {
             d.state = State::Suspended;
             let k = capture_stop(c, id);
             args.push(token(c, id, k));
@@ -189,10 +209,7 @@ pub(crate) unsafe fn resume(
             // from what the clause holds, whatever an earlier one did to the body's.
             let frames = c.detached[id].frames;
             let held = c.stacks[frames].list.first().and_then(|f| f.vars_copied());
-            let call = Args::of(c, args);
-            let r = Ctx::holding(ctx, held, || call_value(ctx, closure, call.words()));
-            call.release();
-            r
+            call_clause(ctx, closure, emitted, args, held)
         }
         Some(Stopped::Finished(v)) => {
             finish(c, id);
@@ -221,11 +238,11 @@ fn finish(c: &mut Ctx, id: usize) {
     if d.captures.iter().all(|k| k.bytes.is_none()) {
         d.stack = None;
         if d.body != 0 {
-            heap::dec(d.body);
+            release_fun(d.emitted, d.body);
             d.body = 0;
         }
         if d.ret != 0 {
-            heap::dec(d.ret);
+            release_fun(d.emitted, d.ret);
             d.ret = 0;
         }
     }
@@ -329,14 +346,18 @@ fn restore(c: &mut Ctx, id: usize, k: usize) -> bool {
 pub(crate) unsafe fn stop(
     ctx: *mut Ctx,
     id: usize,
-    closure: Word,
+    (closure, emitted): (Word, bool),
     args: Vec<Word>,
     owned: (Symbol, Symbol, Option<Symbol>),
 ) -> Word {
     drop(owned);
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
-    d.request = Some(Stopped::Performed { closure, args });
+    d.request = Some(Stopped::Performed {
+        closure,
+        emitted,
+        args,
+    });
     d.saved_current = c.current;
     let to = d.resumer_sp;
     let from = &mut d.sp as *mut usize;
@@ -361,7 +382,8 @@ extern "C" fn entry(arg: usize) {
         c.stack_floor = unsafe { own.expect("a detached body starts on its stack").enter() };
         (id, body)
     };
-    let mut r = call_value(ctx, body, &[]);
+    let emitted = unsafe { &*ctx }.detached[id].emitted;
+    let mut r = call_fun(ctx, emitted, body, &[]);
     let c = unsafe { &mut *ctx };
     let frames = c.detached[id].frames;
     let mut frame = c.stacks[frames].list.pop();
@@ -388,15 +410,21 @@ extern "C" fn entry(arg: usize) {
         && let Some(f) = frame.as_mut()
     {
         c.failed = 0;
-        let closure = f.take_clause(a.clause);
-        r = Ctx::holding(ctx, held.take(), || call_value(ctx, closure, &a.args));
-        heap::dec(closure);
+        let clause = f.take_clause(a.clause);
+        r = call_clause(
+            ctx,
+            clause.closure,
+            clause.emitted,
+            a.args.handed(),
+            held.take(),
+        );
+        clause.release();
         answered = true;
     }
     let c = unsafe { &mut *ctx };
     let ret = c.detached[id].ret;
     if c.failed == 0 && ret != 0 && !answered {
-        r = Ctx::holding(ctx, held.take(), || call_value(ctx, ret, &[r]));
+        r = Ctx::holding(ctx, held.take(), || call_fun(ctx, emitted, ret, &[r]));
     }
     if let Some((_, v)) = held {
         release_vars(v);
