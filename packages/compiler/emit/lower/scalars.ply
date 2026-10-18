@@ -3,22 +3,22 @@
 //! over a scalar a register holds, over a character's or a constructor's word and over a string's
 //! bytes, a root written for a declared sum or a container, and the runtime's over any other word.
 
-import emit.code (Code, NLit, NBinary, NUnary)
+import emit.code (Code, NLit, NUnary)
 import syntax.patterns (Lit, LInt, LBool, LFloat, LFixed, LWide, LChar, LStr, LBytes, LEmbedded,
                         LDec, LUnit, LBad)
-import check.types (Type, TyVar, TyCon, TyRecord, TyNominal, TyFn, Field, named_type, spelled_type)
+import check.types (Type, TyVar, TyCon, TyRecord, TyNominal, Field, named_type, spelled_type)
 import emit.typing (unknown_type)
 import syntax.parsing (Span)
-import std.bytes (ascii_of_int)
-import emit.c (Width, KSum)
-import emit.reps (Ctors, SumCtor, Whole, Cases, has_vars, type_vars)
+import emit.c (Width, KSum, width_named, lit_int)
+import emit.reps (Ctors, Whole, Cases, has_vars, type_vars, carrier_of, compared_by_ctors,
+                  nullary_sum, generic_sum, written_sum)
 import emit.answer (Scalar, Exact, literal_bits)
 import emit.keys
 import emit.keys (RootKey, TypeOp, Root, Written, Order, Reflect, Shown, Digest, Contained)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RCases, Arg, AVar, AInt,
                  ABool, AFloat, ANum, AChar, Val, Prim, Literal, Get, Tag, Call, Native, Given, Let,
                  Decl, Assign, If, Scalars, rep_of_arg, comparison, arithmetic, shift)
-import emit.lower.setting (carrier_of, declared_at)
+import emit.lower.setting (declared_at)
 import emit.lower.held (held_as, carried_as, arg_path)
 import emit.lower.base (Context, Lowering, Lowered, refuse, fresh, bound, bound_as, opened,
                         continued, type_of, handed, noted, set_join, joined, short_circuit,
@@ -54,7 +54,7 @@ fn fixed(cx: Context, st: Lowering, l: Lit, name: Bytes, bits: Int, at: Span) ->
 /// A node folded to a constant without lowering anything: two `Int` literals under an operator
 /// whose result is exact.
 pub fn constant(cx: Context, c: Code) -> Option<Arg> =
-  match folded(c) { Some(n) -> Some(AInt(n)), None -> None }
+  match lit_int(c) { Some(n) -> Some(AInt(n)), None -> None }
 
 /// The right operand of `op` taken as a constant where its node is one C's own operator takes: a
 /// negated literal divisor.
@@ -1036,61 +1036,6 @@ fn divisor(op: Bytes, rhs: Code) -> Option<Int> =
     }
   }
 
-/// Two `Int` literals under an operator, folded where the result is exact: `+`, `-` and `*` without
-/// overflow, the bit operators, and shifts by a count the word holds.
-fn folded(c: Code) -> Option<Int> =
-  match c.node {
-    NLit(l) -> match l { LInt(n) -> Some(n), _ -> None },
-    NBinary(b) -> match folded(b.lhs) {
-      None -> None,
-      Some(a) -> match folded(b.rhs) {
-        None -> None,
-        Some(x) -> if b.op == b"add" { exact_add(a, x) }
-        else if b.op == b"sub" { exact_sub(a, x) }
-        else if b.op == b"mul" { exact_mul(a, x) }
-        else if b.op == b"bitand" { Some(a & x) }
-        else if b.op == b"bitor" { Some(a | x) }
-        else if b.op == b"bitxor" { Some(a ^ x) }
-        else if b.op == b"shl" && x >= 0 && x < 64 { Some(a << x) }
-        else if b.op == b"shr" && x >= 0 && x < 64 { Some(a >> x) }
-        else if b.op == b"ushr" && x >= 0 && x < 64 { Some(a >>> x) }
-        else { None },
-      },
-    },
-    _ -> None,
-  }
-
-fn exact_add(a: Int, b: Int) -> Option<Int> = {
-  let s = wrap_add(a, b);
-  if a >= 0 == (b >= 0) && s >= 0 != (a >= 0) { None } else { Some(s) }
-}
-
-fn exact_sub(a: Int, b: Int) -> Option<Int> = {
-  let s = wrap_sub(a, b);
-  if a >= 0 != (b >= 0) && s >= 0 != (a >= 0) { None } else { Some(s) }
-}
-
-fn exact_mul(a: Int, b: Int) -> Option<Int> =
-  if a == 0 || b == 0 { Some(0) }
-  else if a == -1 { exact_sub(0, b) }
-  else if b == -1 { exact_sub(0, a) } else {
-    let p = wrap_mul(a, b);
-    if p / a == b && p % a == 0 { Some(p) } else { None }
-  }
-
-pub fn width_named(name: Bytes) -> Option<Width> =
-  if name == b"U8" { Some({ bits: 8, signed: false }) }
-  else if name == b"U16" { Some({ bits: 16, signed: false }) }
-  else if name == b"U32" { Some({ bits: 32, signed: false }) }
-  else if name == b"U64" { Some({ bits: 64, signed: false }) }
-  else if name == b"I8" { Some({ bits: 8, signed: true }) }
-  else if name == b"I16" { Some({ bits: 16, signed: true }) }
-  else if name == b"I32" { Some({ bits: 32, signed: true }) }
-  else if name == b"I64" { Some({ bits: 64, signed: true }) }
-  else if name == b"U128" { Some({ bits: 128, signed: false }) }
-  else if name == b"I128" { Some({ bits: 128, signed: true }) }
-  else { None }
-
 /// The type a width is.
 fn width_type(w: Width) -> Type =
   named_type(
@@ -1134,7 +1079,7 @@ fn digits_of(w: Bytes) -> Bytes =
 fn is_option(t: Type) -> Bool =
   match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
 
-// Copies of the emitter's private readers of types (`emit.ply`), listed in the hooks file.
+// Copies of readers of types the lowering takes over from the emitter's operators.
 
 fn walked_container(t: Type) -> Bool =
   !has_vars(t)
@@ -1145,131 +1090,3 @@ fn walked_container(t: Type) -> Bool =
 
 fn is_result(t: Type) -> Bool =
   !has_vars(t) && (match t { TyCon(c) -> c.name == b"Result" && c.args.len() == 2, _ -> false })
-
-/// Whether two values of the type `name` compare as the constructors of a sum the program declares
-/// do: not an `Option` or a `Result`, not a type whose module states a `key`, and, where no module
-/// declares it, one of no constructor's argument.
-fn compared_by_ctors(ctors: Ctors, name: Bytes) -> Bool =
-  name != b"Option" && name != b"Result"
-    && (match ctors.sums.get(name) {
-      Some(cs) ->
-        cs.len() > 0 && cs.fold(true, |ok: Bool, c: SumCtor| ok && !ctors.keyed.contains(c.name))
-          && (name.index_of(b".") != None || nullary_sum(cs)),
-      None -> false,
-    })
-
-fn nullary_sum(cs: List<SumCtor>) -> Bool =
-  cs.fold(true, |ok: Bool, c: SumCtor| ok && c.fields.len() == 0)
-
-/// Whether `t` is a sum a module declares generic, at arguments known throughout, whose roots at
-/// those arguments are finitely many.
-fn generic_sum(ctors: Ctors, t: Type) -> Bool =
-  !has_vars(t)
-    && (match t {
-      TyCon(c) ->
-        c.args.len() > 0 && c.name.index_of(b".") != None && compared_by_ctors(ctors, c.name)
-          && regular_sum(ctors, c.name),
-      _ -> false,
-    })
-
-/// Whether `reflect`, `shown` and `digest` of a value of the sum `c` names are written by a root.
-fn written_sum(ctors: Ctors, c: { name: Bytes, args: List<Type> }) -> Bool =
-  ctors.sums.contains(c.name) && (c.args.len() == 0 || regular_sum(ctors, c.name))
-
-/// Whether no chain of sums from one of `name`'s parameters back to one holds it at a grown type.
-fn regular_sum(ctors: Ctors, name: Bytes) -> Bool = {
-  let steps = sums_reached(ctors, name).fold([], |acc: List<ParamStep>, s: Bytes|
-    acc.concat(param_steps(ctors, s)));
-  let from = |p: Bytes| positions_reached(steps, p).push(p);
-  let own = steps.fold([], |acc: List<Bytes>, s: ParamStep|
-    if s.from.starts_with(name.concat(b"#")) && !acc.contains(s.from) { acc.push(s.from) }
-    else { acc });
-  steps.all(|s: ParamStep|
-    !s.grown || !own.any(|p: Bytes| from(s.to).contains(p) && from(p).contains(s.from)))
-}
-
-type ParamStep = { from: Bytes, to: Bytes, grown: Bool }
-
-fn sums_reached(ctors: Ctors, name: Bytes) -> List<Bytes> =
-  range(0, ctors.sums.len()).fold(
-    { seen: [name], at: 0 },
-    |s: { seen: List<Bytes>, at: Int }, _: Int|
-      match s.seen.at(s.at) {
-        None -> s,
-        Some(n) ->
-          {
-            seen: held_sums(ctors, n).fold(s.seen, |acc: List<Bytes>, o: Bytes|
-              if acc.contains(o) { acc } else { acc.push(o) }),
-            at: s.at + 1,
-          },
-      },
-  ).seen
-
-fn held_sums(ctors: Ctors, n: Bytes) -> List<Bytes> =
-  match ctors.sums.get(n) {
-    None -> [],
-    Some(cs) ->
-      cs.fold([], |acc: List<Bytes>, c: SumCtor|
-        c.fields.fold(acc, |a: List<Bytes>, f: Type|
-          a.concat(sums_in(ctors, f).map(|o: { name: Bytes, args: List<Type> }| o.name)))),
-  }
-
-fn param_steps(ctors: Ctors, s: Bytes) -> List<ParamStep> =
-  match ctors.sums.get(s) {
-    None -> [],
-    Some(cs) ->
-      cs.fold([], |acc: List<ParamStep>, c: SumCtor|
-        c.fields.fold(acc, |a: List<ParamStep>, f: Type|
-          sums_in(ctors, f).fold(a, |b: List<ParamStep>, o: { name: Bytes, args: List<Type> }|
-            range(0, o.args.len()).fold(b, |d: List<ParamStep>, j: Int|
-              range(0, c.params.len()).fold(d, |e: List<ParamStep>, i: Int|
-                match c.params.at(i) {
-                  None -> e,
-                  Some(p) -> match o.args.at(j) {
-                    None -> e,
-                    Some(arg) -> {
-                      let step = |grown: Bool|
-                        e.push({
-                          from: Bytes::concat_all([s, b"#", ascii_of_int(i)]),
-                          to: Bytes::concat_all([o.name, b"#", ascii_of_int(j)]),
-                          grown: grown,
-                        });
-                      if arg == TyVar(p) { step(false) }
-                      else if type_vars(arg).contains(p) { step(true) }
-                      else { e }
-                    },
-                  },
-                }))))),
-  }
-
-fn sums_in(ctors: Ctors, t: Type) -> List<{ name: Bytes, args: List<Type> }> =
-  match t {
-    TyVar(_) -> [],
-    TyCon(k) -> {
-      let inner = k.args.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, a: Type|
-        acc.concat(sums_in(ctors, a)));
-      if ctors.sums.contains(k.name) { inner.push({ name: k.name, args: k.args }) } else { inner }
-    },
-    TyFn(f) ->
-      f.params.fold(
-        sums_in(ctors, f.ret),
-        |acc: List<{ name: Bytes, args: List<Type> }>, a: Type| acc.concat(sums_in(ctors, a)),
-      ),
-    TyRecord(fs) ->
-      fs.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, f: Field|
-        acc.concat(sums_in(ctors, f.ty))),
-    TyNominal(x) ->
-      x.fields.fold(
-        x.args.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, a: Type|
-          acc.concat(sums_in(ctors, a))),
-        |acc: List<{ name: Bytes, args: List<Type> }>, f: Field| acc.concat(sums_in(ctors, f.ty)),
-      ),
-  }
-
-fn positions_reached(steps: List<ParamStep>, from: Bytes) -> List<Bytes> = {
-  let next = |n: Bytes| steps.filter(|s: ParamStep| s.from == n).map(|s: ParamStep| s.to);
-  range(0, steps.len()).fold(next(from), |seen: List<Bytes>, _: Int|
-    seen.fold(seen, |acc: List<Bytes>, n: Bytes|
-      next(n).fold(acc, |more: List<Bytes>, m: Bytes|
-        if more.contains(m) { more } else { more.push(m) })))
-}

@@ -7,14 +7,14 @@ import emit.code (Code, Node, Own, Borrowed, Owned, NVar, NKnown, NLambda, NApp,
                   NField, NIf, NBlock, NList, NRecord, NUpdate, NMatch, NPerform, NSimulate,
                   NParallel, NHandle, Lambda, Capture, CodeStmt, CLet, CLetPat, CDo, CodeField,
                   CodeArm, CodeClause)
-import check.types (Type, TyFn, TyVar, TyCon, TyRecord, TyNominal, Field, Scheme, spelled_type,
-                    int_type, bool_type)
+import check.types (Type, TyFn, TyVar, TyCon, Scheme, spelled_type, int_type, bool_type)
 import emit.typing (unknown_type)
 import syntax.parsing (Span, span_key, starts_upper, prelude_binder)
 import check.resolve.tables (qualify)
 import check.infer.checker (is_test_owner)
 import std.bytes (ascii_of_int)
-import emit.reps (Def, Imported, Carrier, Whole, erased, has_vars)
+import emit.reps (Def, Imported, Carrier, Whole, erased, has_vars, carrier_of, carriers_at,
+                  carried_vars, substituted_fully)
 import emit.state (EmitParam, BoundLambda)
 import emit.c (KBoxed)
 import emit.roots (FnArg)
@@ -26,7 +26,7 @@ import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, Var, Arg, AVar, AInt, A
                  Next, Done, Restart, Enter, Return, Fail, NoArm, Sited, Block, Fn, Rooted, Member,
                  Closure, Declined, Calling, no_links, falls_through, rep_of_arg)
 import emit.tir.calling (EntryValue, ConstantRead, BuiltinValue, Ticked)
-import emit.lower.setting (carrier_of, imported_target, qualified)
+import emit.lower.setting (imported_target, qualified)
 import emit.lower.held (held_as, carried_as, arg_path)
 import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
                         ToInPlace, Frame, Opened, GroupMember, Restarts, Enters, Calls, refuse,
@@ -216,22 +216,10 @@ pub fn entered(
                   typed: bl.typed,
                 },
                 base: bl.base,
+                lender: Some({ owner: bl.owner, written: bl.written }),
               },
           };
-          match lender {
-            Some(bl) -> if lambdas_of(k.lambda.body).len() > 0
-                || named_in(framed, k.lambda.body).len() > 0 {
-              {
-                cx: cx,
-                st: refuse(
-                  st,
-                  Calling,
-                  b"a lambda another root lent that hands on lambdas of its own",
-                ).st,
-              }
-            } else { in_frame(framed, st, f_of(st, k.slot), k, lowered, Some(bl), at) },
-            None -> in_frame(framed, st, f_of(st, k.slot), k, lowered, None, at),
-          }
+          in_frame(framed, st, f_of(st, k.slot), k, lowered, lender, at)
         },
       },
       _ -> { cx: cx, st: refuse(st, Calling, b"a body run in place that is no known lambda").st },
@@ -1304,12 +1292,18 @@ fn may_be_called(cx: Context, j: Int) -> Bool =
 fn fn_args(cx: Context, codes: List<Code>) -> List<FnArg> / {abort.raise} = {
   let owner = root_name(cx.key);
   let lends = lends_lambdas(cx);
+  // Code of a lambda another root lent is that root's, which lends each lambda within it.
+  let by = match cx.lender {
+    Some(b) -> Some(b),
+    None -> if lends { Some({ owner: owner, written: written_in(cx) }) } else { None },
+  };
   let handed_as = |j: Int, l: Lambda, acc: List<FnArg>|
-    if !lends || has_handle(l.body) { acc } else {
-      match position_in(written_in(cx), l) {
-        Some(nth) -> acc.push({ param: j, owner: owner, nth: nth }),
+    match if has_handle(l.body) { None } else { by } {
+      None -> acc,
+      Some(b) -> match position_in(b.written, l) {
+        Some(nth) -> acc.push({ param: j, owner: b.owner, nth: nth }),
         None -> acc,
-      }
+      },
     };
   range(0, codes.len()).fold([], |acc: List<FnArg>, j: Int|
     match codes.at(j) {
@@ -1676,70 +1670,10 @@ fn reference_args(cx: Context, scheme: Option<Scheme>, at: Span) -> List<Type> =
     },
   }
 
-// Copies of the emitter's private conventions and name resolution (`emit.ply`), listed in the
-// hooks file.
-
-/// How a root of `d` at type arguments `args` takes each parameter and answers.
-fn carriers_at(
-  d: Def,
-  args: List<Type>,
-) -> { params: List<Carrier>, answer: Carrier } / {abort.raise} =
-  match d.scheme {
-    None -> { params: d.carriers, answer: d.answer },
-    Some(sc) -> match sc.ty {
-      TyFn(f) -> {
-        let raw = carried_vars(sc, args, d.arity);
-        let at_var = |t: Type, otherwise: Carrier|
-          match t {
-            TyVar(j) -> if raw.contains(j) { carrier_of(erased(args.get(j))) } else { otherwise },
-            _ -> otherwise,
-          };
-        {
-          params: range(0, d.carriers.len()).map(|i: Int| {
-            let k = d.carriers.get(i);
-            if i < d.witnesses { k }
-            else { match f.params.at(i - d.witnesses) { Some(t) -> at_var(t, k), None -> k } }
-          }),
-          answer: at_var(f.ret, d.answer),
-        }
-      },
-      _ -> { params: d.carriers, answer: d.answer },
-    },
-  }
-
-/// The variables of `scheme` a call at `args` carries raw: each standing bare as a parameter, or as
-/// the answer of a function taking any, at an argument whose word would be an allocation.
-fn carried_vars(scheme: Scheme, args: List<Type>, arity: Int) -> List<Int> / {abort.raise} =
-  match scheme.ty {
-    TyFn(f) ->
-      range(0, args.len()).filter(|j: Int|
-        (f.params.contains(TyVar(j)) || (arity > 0 && f.ret == TyVar(j)))
-          && (match carrier_of(erased(args.get(j))) { Whole(k) -> k != KBoxed, _ -> true })),
-    _ -> [],
-  }
+// Copies of the emitter's calls' and scope's readers, which the lowering takes over.
 
 fn same_fns(a: List<FnArg>, b: List<FnArg>) -> Bool =
   a.len() == b.len() && a.all(|f: FnArg| b.contains(f))
-
-/// `ty` with each variable read as the type argument at its number.
-fn substituted_fully(ty: Type, args: List<Type>) -> Type =
-  match ty {
-    TyVar(v) -> match args.at(v) { Some(t) -> t, None -> ty },
-    TyCon(c) -> TyCon({ ..c, args: c.args.map(|a: Type| substituted_fully(a, args)) }),
-    TyFn(f) ->
-      TyFn({
-        ..f,
-        params: f.params.map(|p: Type| substituted_fully(p, args)),
-        ret: substituted_fully(f.ret, args),
-      }),
-    TyRecord(fs) -> TyRecord(fs.map(|f: Field| { ..f, ty: substituted_fully(f.ty, args) })),
-    TyNominal(x) ->
-      TyNominal({
-        ..x,
-        args: x.args.map(|a: Type| substituted_fully(a, args)),
-        fields: x.fields.map(|f: Field| { ..f, ty: substituted_fully(f.ty, args) }),
-      }),
-  }
 
 fn is_ctor_name(name: Bytes) -> Bool / {abort.raise} =
   name.index_of(b"#") == None

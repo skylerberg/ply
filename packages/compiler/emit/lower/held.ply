@@ -6,11 +6,12 @@
 
 import check.types (Type, TyVar, TyCon, TyRecord, TyNominal, Field)
 import std.bytes (ascii_of_int)
-import emit.reps (Carrier, Whole, Fields, Cases, SumCase, SumCtor, FieldTy, TyRec, TyOpen, kind_of)
+import emit.reps (Carrier, Whole, Fields, Cases, SumCase, SumCtor, FieldTy, TyRec, TyOpen, Laid,
+                  kind_of, carrier_of, laid_of, record_flags, in_place)
 import emit.c (Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, Zeroed, Tagged)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases, Leaf,
                  Path, PField, PNamed, PArg)
-import emit.lower.setting (Setting, carrier_of, ctor_named)
+import emit.lower.setting (Setting, ctor_named)
 
 /// How a value of `ty` is held in a body: a record whose type lays it out as its leaves and then
 /// its word, whatever its size, unless it holds in place a record that holds one in place; a sum
@@ -246,71 +247,10 @@ pub fn case_span(r: Rep, i: Int) -> { at: Int, leaves: List<Leaf> } =
     _ -> { at: 0, leaves: [] },
   }
 
-/// Where a record of `fs` holds each field, how many words it takes, the words of the bitmap a mixed
-/// one's tail takes after them, and which words it counts: a field takes a word (a `Decimal` two),
-/// and a record held in place its header's two, its own and its tail's.
-pub type Laid = { width: Int, tail: Int, offsets: List<Int>, counted: List<Int> }
-
-pub fn laid_of(fs: List<FieldTy>) -> Laid = {
-  let s = fs.fold(
-    { at: 0, offsets: [], counted: [] },
-    |acc: { at: Int, offsets: List<Int>, counted: List<Int> }, f: FieldTy|
-      match f.ty {
-        TyRec(inner) -> {
-          let l = laid_of(inner);
-          {
-            at: acc.at + 2 + l.width + l.tail,
-            offsets: acc.offsets.push(acc.at),
-            counted: acc.counted.concat(l.counted.map(|c: Int| acc.at + 2 + c)),
-          }
-        },
-        _ ->
-          {
-            at: acc.at + raw_words(f.kind),
-            offsets: acc.offsets.push(acc.at),
-            counted: if raw_slot(f.kind) { acc.counted } else { acc.counted.push(acc.at) },
-          },
-      },
-  );
-  let n = s.counted.len();
-  {
-    width: s.at,
-    tail: if n > 0 && n < s.at { (s.at + 63) / 64 } else { 0 },
-    offsets: s.offsets,
-    counted: s.counted,
-  }
-}
-
-/// A record's flags: flat (1) when none of its words holds a count, mixed (2) when its tail says
-/// which do, raw (4) when it holds a scalar's bits, an `Option`'s word or a record in place.
-pub fn record_flags(fs: List<FieldTy>, l: Laid) -> Int = {
-  let raw = if fs.any(|f: FieldTy|
-      raw_slot(f.kind) || f.kind == KSum(Zeroed) || in_place(f) != None) { 4 }
-  else { 0 };
-  if l.width > 0 && uncounted(fs) { 1 + raw } else if l.tail > 0 { 2 + raw } else { raw }
-}
-
-fn uncounted(fs: List<FieldTy>) -> Bool =
-  fs.all(|f: FieldTy| match f.ty { TyRec(inner) -> uncounted(inner), _ -> scalar_kind(f.kind) })
-
-fn scalar_kind(k: Kind) -> Bool =
-  match k { KInt -> true, KNum(_) -> true, KBool -> true, KFloat -> true, KDec -> true, _ -> false }
-
 /// The bitmap after a mixed record's words: a bit set for each word it counts, 64 to a word.
 pub fn tail_bits(l: Laid) -> List<Int> =
   range(0, l.tail).map(|t: Int|
     l.counted.fold(0, |acc: Int, c: Int| if c / 64 == t { acc | 1 << c % 64 } else { acc }))
-
-/// Whether a record holds a field of kind `k` as its own words rather than as a word.
-pub fn raw_slot(k: Kind) -> Bool =
-  match k { KInt -> true, KFloat -> true, KDec -> true, KNum(_) -> true, _ -> false }
-
-/// The words a record holds a field of kind `k` in.
-pub fn raw_words(k: Kind) -> Int = match k { KDec -> 2, _ -> 1 }
-
-/// The fields of the record field `f` holds in place.
-pub fn in_place(f: FieldTy) -> Option<List<FieldTy>> =
-  match f.ty { TyRec(fs) -> Some(fs), _ -> None }
 
 fn holdable(fs: List<FieldTy>) -> Bool = fs.len() > 0 && fs.all(|f: FieldTy| in_place(f) == None)
 

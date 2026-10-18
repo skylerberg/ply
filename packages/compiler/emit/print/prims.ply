@@ -4,20 +4,18 @@
 //! constants read from the pool.
 
 import std.bytes (ascii_of_int)
-import std.math (pow)
-import syntax.patterns (Lit, LStr, LBytes, LEmbedded, LFixed, LWide, LFloat, LDec, LChar)
+import syntax.patterns (Lit, LStr, LDec)
 import check.types (TyCon)
 import syntax.parsing (span_between)
-import emit.c (Width, KNum, ctype)
-import emit.answer (Const, ConstStr, ConstBytes, ConstEmbedded, ConstFixed, ConstWide, ConstFloat,
-                    ConstDecimal, ConstChar, ConstUnit)
+import emit.c (Width, KNum, ctype, int_lit, is_bitop, bitop_c, unsigned_ctype, width_index,
+               width_min, width_max)
+import emit.answer (ConstStr, ConstDecimal, const_of_lit)
 import emit.pieces (Text, Hole, Constant, TagOf, spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RCases, Leaf, Var, Arg, AVar,
                  AInt, ANum, rep_of_arg, arithmetic, comparison, shift)
 import emit.print.text (Printing, Place, printing, line, pad, temp, named, arg_text, assigned, site,
-                        check, int_lit)
+                        check)
 import emit.print.made (c_type)
-import emit.lower.scalars (width_named)
 
 /// A constant read from the pool into `into`, held as its representation says: a `Decimal` as its
 /// two words, the pool's word let go once they are read.
@@ -135,7 +133,7 @@ fn int_printed(
 ) -> Printing / {abort.raise} =
   if op == b"ne" { bound(p, pr, v, Bytes::concat_all([b"!((", a, b") == (", b, b"))"])) }
   else if comparison(op) { bound(p, pr, v, infix(a, compare_c(op), b)) }
-  else if bitwise(op) { bound(p, pr, v, infix(a, bitop_c(op), b)) }
+  else if is_bitop(op) { bound(p, pr, v, infix(a, bitop_c(op), b)) }
   else if op == b"add" || op == b"sub" {
     let n = named(site(p, pr), v);
     line(
@@ -586,7 +584,7 @@ fn width_printed(
         ]),
       ),
     )
-  } else if bitwise(op) { bound(p, pr, v, infix(a, bitop_c(op), b)) }
+  } else if is_bitop(op) { bound(p, pr, v, infix(a, bitop_c(op), b)) }
   else if shift(op) { shifted(p, pr, v, op, Some(w), a, count) }
   else if op == b"bitnot" { bound(p, pr, v, Bytes::concat_all([b"(", t_c, b") ~(", a, b")"])) }
   else if op == b"ne" { bound(p, pr, v, Bytes::concat_all([b"!((", a, b") == (", b, b"))"])) }
@@ -616,7 +614,7 @@ fn width_printed(
     bound(p, guarded, v, Bytes::concat_all([b"-(", a, b")"]))
   } else if op == b"wrap_add" || op == b"wrap_sub" || op == b"wrap_mul" {
     // Below 32 bits C would promote the operands to `int`, where a product can overflow.
-    let u = unsigned_c(w);
+    let u = unsigned_ctype(w);
     bound(
       p,
       site(p, pr),
@@ -665,7 +663,7 @@ fn rotated(
   a: Bytes,
   count: Bytes,
 ) -> Printing / {abort.raise} = {
-  let u = unsigned_c(w);
+  let u = unsigned_ctype(w);
   let bits = ascii_of_int(w.bits);
   let k = temp(site(p, pr));
   let turned = line(
@@ -825,7 +823,7 @@ fn shifted(
   let n = c.name;
   bound(p, guarded, v, match width {
     Some(w) -> {
-      let u = unsigned_c(w);
+      let u = unsigned_ctype(w);
       if op == b"shl" { Bytes::concat_all([b"(", u, b")((", u, b")(", a, b") << ", n, b")"]) }
       else if op == b"shr" && w.signed { Bytes::concat_all([b"(", a, b") >> ", n]) }
       else { Bytes::concat_all([b"(", u, b")((", u, b")(", a, b") >> ", n, b")"]) }
@@ -976,8 +974,6 @@ fn int_text(pr: Printing, a: Arg) -> Bytes =
 fn literal_divisor(d: Option<Arg>) -> Bool =
   match d { Some(AInt(n)) -> n != 0 && n != 0 - 1, _ -> false }
 
-fn bitwise(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor"
-
 fn compare_c(op: Bytes) -> Bytes =
   if op == b"lt" { b"<" }
   else if op == b"le" { b"<=" }
@@ -986,17 +982,8 @@ fn compare_c(op: Bytes) -> Bytes =
   else if op == b"eq" { b"==" }
   else { b"!=" }
 
-fn bitop_c(op: Bytes) -> Bytes =
-  if op == b"bitand" { b"&" } else if op == b"bitor" { b"|" } else { b"^" }
-
 fn float_c(op: Bytes) -> Bytes =
   if op == b"add" { b"+" } else if op == b"sub" { b"-" } else if op == b"mul" { b"*" } else { b"/" }
-
-fn unsigned_c(w: Width) -> Bytes =
-  if w.bits == 8 { b"uint8_t" }
-  else if w.bits == 16 { b"uint16_t" }
-  else if w.bits == 32 { b"uint32_t" }
-  else { b"uint64_t" }
 
 /// `rt_overflow`'s numbering of the operation that overflowed.
 fn overflow_code(op: Bytes) -> Int =
@@ -1016,43 +1003,6 @@ fn binary_code(op: Bytes) -> Int =
   else if op == b"mul" { 2 }
   else if op == b"div" { 3 }
   else { 4 }
-
-fn width_index(w: Width) -> Int =
-  if w.bits == 128 { if w.signed { 9 } else { 8 } } else {
-    (if w.signed { 4 } else { 0 })
-      + (if w.bits == 8 { 0 } else if w.bits == 16 { 1 } else if w.bits == 32 { 2 } else { 3 })
-  }
-
-fn width_min(w: Width) -> Int = if w.signed { 0 - pow(2, w.bits - 1) } else { 0 }
-
-fn width_max(w: Width) -> Int = if w.signed { pow(2, w.bits - 1) - 1 } else { pow(2, w.bits) - 1 }
-
-// A copy of the emitter's private reading of a literal as a constant of the unit's table
-// (`emit.const_of_lit`), listed in the hooks file.
-
-fn const_of_lit(l: Lit) -> Const / {abort.raise} =
-  match l {
-    LStr(x) -> ConstStr(x),
-    LBytes(x) -> ConstBytes(x),
-    LEmbedded(digest, _) -> ConstEmbedded(digest),
-    LFixed(name, bits) -> match width_named(name) {
-      Some(w) -> ConstFixed({ width: width_index(w), bits: bits }),
-      None -> ConstUnit,
-    },
-    LWide(name, high, low) -> match width_named(name) {
-      Some(w) -> ConstWide({ width: width_index(w), high: high, low: low }),
-      None -> ConstUnit,
-    },
-    LFloat(x) -> ConstFloat(unspaced(x)),
-    LDec(x) -> ConstDecimal(unspaced(x)),
-    LChar(v) -> ConstChar(v),
-    _ -> ConstUnit,
-  }
-
-fn unspaced(s: Bytes) -> Bytes / {abort.raise} =
-  Bytes::concat_all(
-    range(0, s.len()).map(|i: Int| if s.at(i) <= 32 { b"" } else { s.slice(i, i + 1) }),
-  )
 
 fn place() -> Place =
   {

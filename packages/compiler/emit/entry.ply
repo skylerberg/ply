@@ -4,18 +4,32 @@ import syntax.parsing (dummy_span)
 import emit.code (Code, NLit, NVar, NBinary, NIf, NBlock, NApp, NMatch, CodeArm, Borrowed,
                   lower_to_emit, slots_read)
 import check.resolve.scopes (of_binder)
-import check.types (Type)
-import emit.typing (Typed, node_types)
+import check.resolve.tables (qualify)
+import check.types (Type, TyFn, Scheme)
+import emit.typing (Typed, node_types, unknown_type)
 import std.list
 import syntax.exprs (Expr)
 import syntax.patterns (LInt, LBad)
 import std.bytes (ascii_of_int)
 import emit.c (KBool, KBoxed, KDec, KFloat, KInt, KNum, KSum, Kind, is_sum, sum_helper, ctype,
-               failing_return, bytes_join, tick_line)
-import emit.roots (symbol_of)
-import emit.answer (no_generics, Tables, no_tables, sorted_widths, Emitted)
+               failing_return, bytes_join, tick_line, sorted_names)
+import emit.roots (symbol_of, entry_of, own_definition, specialisation_of)
+import emit.answer (no_generics, Tables, no_tables, sorted_widths, Emitted, Head)
 import emit.reps (Ctors, Ty, TyList, TyOpen, Def, Imported, Carrier, Cases, Fields, Whole,
-                  nth_field, record_leaves, raw_carrier, returned_kind, field_param, word_param)
+                  nth_field, record_leaves, raw_carrier, returned_kind, field_param, word_param,
+                  substituted_fully)
+import emit.keys (root_name)
+import emit.pieces (spelled)
+import emit.tir
+import emit.tir (Fn)
+import emit.lower (root_lowered, group_lowered)
+import emit.lower.setting (Root, param_type)
+import emit.own (owned)
+import emit.verify (verified)
+import emit.print (printed_fn)
+import emit.print.text (Printed)
+import emit.print.made (head_types)
+import emit.declined (noted)
 import emit.state (CValue, Emitter, EffectName, EmitParam, WithValue, line, indent, outdent, fresh,
                    note_slice, charge, note_holder, note_bound, nth_value, tables_of)
 import emit.scope (is_ctor_name, written_in, walks_by_rest)
@@ -736,13 +750,19 @@ pub type Prepared = {
   code: Option<Code>,
 }
 
-/// A group's one body under its first member's name, or, when a member does not emit, each member on its own.
+/// What every root of a program is emitted with: the builtins the runtime implements, by name,
+/// the scheme the prelude declares each at, read once for the program, and whether the typed form
+/// lowers each root before today's emitter writes what it declines.
+pub type Emitting = { natives: List<Bytes>, declared: Map<Bytes, Scheme>, form: Bool }
+
+/// A group's one body under its first member's name, as the typed form lowers it and else as
+/// today's emitter writes it, or, when a member does not emit, each member on its own.
 pub fn group_emitted(
   module: Bytes,
   here: List<Def>,
   imports: List<Imported>,
   ctors: Ctors,
-  builtins: List<Bytes>,
+  emitting: Emitting,
   effects: List<EffectName>,
   release: Bool,
   operands: Map<Bytes, Bytes>,
@@ -755,30 +775,158 @@ pub fn group_emitted(
       None -> acc,
     });
   let first = match members.at(0) { Some(p) -> p.full, None -> b"" };
-  let whole = if ms.len() == members.len() {
-    emit_group_full(module, here, imports, ctors, builtins, ms, effects, release, operands, typed)
-  } else { None };
-  match whole {
-    Some(c) -> [{ name: first, text: c.text, tables: c.tables, why: None, handles: [] }],
-    None ->
-      members.map(|p: Prepared|
-        emitted_from(
+  let setting = {
+    module: module,
+    here: here,
+    imports: imports,
+    ctors: ctors,
+    builtins: emitting.natives,
+    declared: emitting.declared,
+    effects: effects,
+    release: release,
+    typed: typed,
+  };
+  let formed = if !emitting.form || ms.len() != members.len() { None } else {
+    Some(
+      group_lowered(
+        setting,
+        ms.map(|m: Member| { root: root_at(module, here, m.full, m.base, m.params), code: m.body }),
+      ),
+    )
+  };
+  match formed {
+    Some(Ok(f)) -> [form_emitted(first, f)],
+    _ -> {
+      let whole = if ms.len() == members.len() {
+        emit_group_full(
           module,
-          p.base,
           here,
           imports,
           ctors,
-          builtins,
+          emitting.natives,
+          ms,
           effects,
           release,
           operands,
           typed,
-          p.full,
-          p.ps,
-          p.known,
-          p.body,
-          p.code,
-        )),
+        )
+      } else { None };
+      match whole {
+        Some(c) -> {
+          let e = { name: first, text: c.text, tables: c.tables, why: None, handles: [] };
+          [match formed { Some(Err(no)) -> noted(e, first, no), _ -> e }]
+        },
+        None ->
+          members.map(|p: Prepared|
+            emitted_from(
+              module,
+              p.base,
+              here,
+              imports,
+              ctors,
+              emitting,
+              effects,
+              release,
+              operands,
+              typed,
+              p.full,
+              p.ps,
+              p.known,
+              p.body,
+              p.code,
+            )),
+      }
+    },
+  }
+}
+
+/// Root `full` of `module`, whose text starts at `base` and whose parameters are `ps`, as the typed
+/// form lowers it: each parameter of the type its scheme gives it, its answer carried as its
+/// definition's is and of the type its scheme answers.
+fn root_at(
+  module: Bytes,
+  here: List<Def>,
+  full: Bytes,
+  base: Int,
+  ps: List<EmitParam>,
+) -> Root / {abort.raise} =
+  {
+    full: full,
+    base: base,
+    params: ps,
+    types: ps.map(param_type),
+    answer: carried_answer(module, here, full),
+    answer_ty: answer_type(module, here, full),
+    code: None,
+  }
+
+/// What the root `full` of `module` answers: what its definition's scheme answers, at the root's
+/// type arguments where it is a specialisation; unknown for a root of no definition.
+fn answer_type(module: Bytes, here: List<Def>, full: Bytes) -> Type / {abort.raise} = {
+  let own = own_definition(full);
+  let args = match specialisation_of(full) { Some(sp) -> sp.args, None -> [] };
+  here.fold(unknown_type(), |acc: Type, d: Def|
+    if qualify(module, d.name) != own { acc } else {
+      match d.scheme {
+        Some(sc) -> match sc.ty { TyFn(f) -> substituted_fully(f.ret, args), _ -> acc },
+        None -> acc,
+      }
+    })
+}
+
+/// The root `full` the typed form lowered to `f`, its counts placed, checked, and printed as an
+/// answer's text and tables. A form the check refuses fails the build: it would run wrong.
+fn form_emitted(full: Bytes, f: Fn) -> Emitted / {abort.raise} = {
+  let counted = owned(f);
+  match verified(counted) {
+    Some(fault) ->
+      panic(
+        String::of_bytes_lossy(
+          Bytes::concat_all([b"the typed form of `", full, b"` fails its check: ", fault]),
+        ),
+      ),
+    None -> {
+      let pr = printed_fn(counted);
+      {
+        name: full,
+        text: spelled(pr.pieces),
+        tables: form_tables(counted, pr),
+        why: None,
+        handles: [],
+      }
+    },
+  }
+}
+
+/// What the root `f` printed as `pr` names of its unit, as today's emitter's tables hold it: a
+/// group's members by their case, and the head each root it holds is declared with.
+fn form_tables(f: Fn, pr: Printed) -> Tables / {abort.raise} = {
+  let held = if f.members.len() == 0 {
+    [{ name: root_name(f.key), head: head_types(f.conv.reps, f.conv.answer) }]
+  } else {
+    f.members.map(|m: tir::Member|
+      { name: root_name(m.key), head: head_types(m.conv.reps, m.conv.answer) })
+  };
+  {
+    consts: pr.consts,
+    builtins: pr.builtins,
+    fields: pr.fields,
+    shapes: pr.shapes.map(sorted_names),
+    lambdas: pr.lambdas.map(spelled),
+    calls: pr.calls.map(root_name),
+    generics: {
+      calls: f.links.generics,
+      needs: f.links.needs,
+      expects: pr.expects,
+      called: f.links.called,
+      passes: f.links.passes,
+    },
+    performs: pr.performs,
+    handles: pr.handles,
+    members: if f.members.len() == 0 { [] }
+    else { held.map(|h: { name: Bytes, head: Head }| h.name) },
+    symbols: held.map(|h: { name: Bytes, head: Head }|
+      { symbol: symbol_of(h.name), entry: entry_of(h.name), head: h.head }),
   }
 }
 
@@ -815,7 +963,7 @@ pub fn root_emitted(
   here: List<Def>,
   imports: List<Imported>,
   ctors: Ctors,
-  builtins: List<Bytes>,
+  emitting: Emitting,
   effects: List<EffectName>,
   release: Bool,
   operands: Map<Bytes, Bytes>,
@@ -833,7 +981,7 @@ pub fn root_emitted(
     here,
     imports,
     ctors,
-    builtins,
+    emitting,
     effects,
     release,
     operands,
@@ -850,7 +998,90 @@ pub fn root_emitted(
     } else { None },
   )
 
+/// One root's emission: as the typed form lowers it, else as today's emitter writes it.
 pub fn emitted_from(
+  module: Bytes,
+  base: Int,
+  here: List<Def>,
+  imports: List<Imported>,
+  ctors: Ctors,
+  emitting: Emitting,
+  effects: List<EffectName>,
+  release: Bool,
+  operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
+  full: Bytes,
+  ps: List<EmitParam>,
+  known: Bool,
+  body: Expr,
+  code: Option<Code>,
+) -> Emitted / {abort.raise} =
+  match match if emitting.form { code } else { None } {
+      None -> None,
+      Some(lowered) ->
+        Some(
+          root_lowered(
+            {
+              module: module,
+              here: here,
+              imports: imports,
+              ctors: ctors,
+              builtins: emitting.natives,
+              declared: emitting.declared,
+              effects: effects,
+              release: release,
+              typed: typed,
+            },
+            root_at(module, here, full, base, ps),
+            lowered,
+          ),
+        ),
+    } {
+    Some(Ok(f)) -> form_emitted(full, f),
+    Some(Err(no)) ->
+      noted(
+        emitted_today(
+          module,
+          base,
+          here,
+          imports,
+          ctors,
+          emitting.natives,
+          effects,
+          release,
+          operands,
+          typed,
+          full,
+          ps,
+          known,
+          body,
+          code,
+        ),
+        full,
+        no,
+      ),
+    None ->
+      emitted_today(
+        module,
+        base,
+        here,
+        imports,
+        ctors,
+        emitting.natives,
+        effects,
+        release,
+        operands,
+        typed,
+        full,
+        ps,
+        known,
+        body,
+        code,
+      ),
+  }
+
+/// One root's emission as today's emitter writes it.
+fn emitted_today(
   module: Bytes,
   base: Int,
   here: List<Def>,

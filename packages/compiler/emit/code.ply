@@ -7,7 +7,7 @@ import syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PLis
 import syntax.exprs (HandleClause, MatchArm, Param, Expr, ELit, EVar, EBinary, EUnary, EApp, EIf,
                      EBlock, EList, ERecord, EField, ELambda, EMatch, EPerform, EHandle, ESimulate,
                      EParallel, EBad, ERecordUpdate, ETry, Stmt, SLet, SLetElse, SExpr, SAssign,
-                     RecField, expr_span)
+                     RecField, expr_span, simulated_at, branch_at)
 import syntax.items (Module, Item, IFn, parse)
 import expand.rewrite (expand)
 import std.list
@@ -38,7 +38,8 @@ pub type Node =
   /// One label argument of a call: the field-table entry of a resource named here.
   | NLabel(Bytes)
   | NLambda(Lambda)
-  | NSimulate({ size: Int, captures: List<Capture>, body: Code })
+  /// `at` is where the checker files the type of the closure the body runs in.
+  | NSimulate({ size: Int, captures: List<Capture>, body: Code, at: Span })
   /// Each branch a nullary `NLambda`, which the run calls on whichever thread it chooses. `rooted`
   /// is whether the block is in its definition's own barrier, none of a lambda's, a clause's or a
   /// `simulate`'s between them, and in no `handle`'s body there: every operation its branches
@@ -91,11 +92,14 @@ pub type CodeClause = {
   size: Int,
   captures: List<Capture>,
   body: Code,
-  /// Where the clause is written, which the checker files its operation's type at.
+  /// Where the clause is written, which the checker files its closure's type at: the operation's
+  /// parameters, then the label and the continuation it binds.
   at: Span,
 }
 
-pub type CodeReturn = { size: Int, captures: List<Capture>, body: Code }
+/// A handler's `return` clause, a barrier of its own led by the value the body answered; `at` is
+/// where it is written, which the checker files its closure's type at.
+pub type CodeReturn = { size: Int, captures: List<Capture>, body: Code, at: Span }
 
 /// `CLet`'s slot is what the ownership pass drops when it walks backwards past the binder.
 pub type CodeStmt =
@@ -699,6 +703,7 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
               size: inner.names.len(),
               captures: inner.captures,
               body: mark(b.code, nothing_live(), moves_of(b.stack.moves, b.code)).code,
+              at: simulated_at(x.span),
             }),
           },
           stack: st_pop(b.stack),
@@ -711,7 +716,7 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
         |acc: Option<Seq>, b: Expr|
           match acc {
             None -> None,
-            Some(sq) -> match lower_lambda([], b, sq.stack, expr_span(b)) {
+            Some(sq) -> match lower_lambda([], b, sq.stack, branch_at(b)) {
               Some(o) -> Some({ codes: sq.codes.push(o.code), stack: o.stack }),
               None -> None,
             },
@@ -815,6 +820,7 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
                             nothing_live(),
                             moves_of(rb.stack.moves, rb.code),
                           ).code,
+                          at: r.span,
                         }),
                       }),
                     },
@@ -1778,11 +1784,7 @@ pub fn mark(c: Code, live: Live, mv: Moves) -> Marked =
     NSimulate(sm) -> {
       let w = mark_caps(sm.captures, live);
       {
-        code: {
-          own: Borrowed,
-          span: c.span,
-          node: NSimulate({ size: sm.size, captures: w.captures, body: sm.body }),
-        },
+        code: { own: Borrowed, span: c.span, node: NSimulate({ ..sm, captures: w.captures }) },
         live: w.live,
       }
     },

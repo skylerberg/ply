@@ -1039,6 +1039,69 @@ fn placed(src: Bytes) -> List<List<Bytes>> / {abort.raise} =
   dedup_diags(checked_m(src).checker.diags).map(|diag: Diag|
     [diag.code].concat(diag.labels.map(|label: Label| src.slice(label.start, label.end))))
 
+/// Each type the check behind `checker` filed at `at`, a function's written without its row.
+fn filed_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
+  checker.typed.filter(|t: TypedAt| t.span == at).map(|t: TypedAt| shown(resolve(checker, t.ty)))
+
+fn shown(t: Type) -> Bytes / {abort.raise} =
+  match t {
+    TyFn(f) ->
+      Bytes::concat_all([b"(", Bytes::join(f.params.map(shown), b", "), b") -> ", shown(f.ret)]),
+    other -> type_text(other),
+  }
+
+/// The place in `src` from where `from` first stands to where `to` first stands after it.
+fn placed_in(src: Bytes, from: Bytes, to: Bytes) -> Span / {abort.raise} =
+  match src.index_of(from) {
+    None -> span_between(0, 0),
+    Some(s) -> match src.slice(s, src.len()).index_of(to) {
+      Some(e) -> span_between(s, s + e),
+      None -> span_between(s, s),
+    },
+  }
+
+test "each closure a handle, a simulate and a parallel make is filed at a place of its own, and a handle's answer at the handle" {
+  let src = Bytes::concat_all([
+    b"effect amb {\n  read flip() -> Bool\n}\n",
+    b"effect link {\n  write send[s](payload: Int) -> Int\n}\n",
+    b"fn forward<[l]>(x: Int) -> Int / {link.send[l]} = link.send[l](x)\n",
+    b"fn both() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false), return v -> v * 10 }\n",
+    b"fn tagged(x: Int) -> Int = handle { forward[conn](x) } with { link.send[*t](p) -> p + 1 }\n",
+    b"fn summed(n: Int) -> Int = { let (a, b) = parallel { n + 1, n > 2 }; a }\n",
+    b"fn ticked() -> Int / {abort.raise, sim.read} = simulate { 1 }\n",
+  ]);
+  let checker = checker_m(src);
+  let at = |from: Bytes, to: Bytes| filed_at(checker, placed_in(src, from, to));
+  let keyword = |word: Bytes| {
+    let s = placed_in(src, word, b" {").start;
+    filed_at(checker, span_between(s, s + word.len()))
+  };
+  let branch = |text: Bytes| {
+    let s = placed_in(src, text, text).start;
+    filed_at(checker, span_between(s, s))
+  };
+  // A clause takes its operation's parameters, the label it binds and its continuation, and answers
+  // the handle's answer where it resumes, the operation's answer otherwise.
+  assert_eq(at(b"amb.flip() resume", b", return"), [b"((Bool) -> Int) -> Int"]);
+  assert_eq(at(b"link.send[*t]", b" }\n"), [b"(Int, String) -> Int"]);
+  assert_eq(at(b"return v", b" }\n"), [b"(Int) -> Int"]);
+  assert_eq(at(b"handle { if", b"\nfn tagged"), [b"Int"]);
+  assert_eq(keyword(b"handle"), [b"() -> Int"]);
+  assert_eq(keyword(b"simulate"), [b"() -> Int"]);
+  assert_eq(branch(b"n + 1"), [b"() -> Int"]);
+  assert_eq(branch(b"n > 2"), [b"() -> Bool"])
+}
+
+test "the constructor a `?` hands its failure on by is filed at the `?`, as a written one is" {
+  let src = Bytes::concat_all([
+    b"fn half(n: Int) -> Result<Int, String> = if n > 0 { Ok(n) } else { Err(\"no\") }\n",
+    b"fn quarter(n: Int) -> Result<Int, String> = { let h = half(n)?; half(h) }\n",
+  ]);
+  let checker = checker_m(src);
+  let q = placed_in(src, b"?", b"?").start;
+  assert_eq(filed_at(checker, span_between(q, q + 1)), [b"(String) -> Result<Int, String>"])
+}
+
 test "a definition's scheme is generalized and its footprint inferred" {
   let c = checker_m(
     b"pub fn id<a>(x: a) -> a = x\nfn two() -> Int = id(2)\neffect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)",

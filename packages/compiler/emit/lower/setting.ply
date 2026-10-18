@@ -7,7 +7,7 @@ import std.bin
 import std.bytes
 import syntax.parsing (Ident, Span, span_key, span_between, prelude_binder)
 import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, type_at, int_type,
-                    bytes_type, fn_type, row_empty)
+                    bool_type, float_type, decimal_type, bytes_type, fn_type, row_empty)
 import emit.typing (Typed, filed_as, unknown_type)
 import syntax.items (Module, Item, IFn, IEffect, OpDef, FnDef, INames, IModule, IAlias)
 import syntax.exprs (Param, freed_by)
@@ -20,12 +20,11 @@ import front.facts (Analysis)
 import front.seam (Analysed, WalkedFacts, walked_facts_bin)
 import front.rows (KnownDefRow, CtorRow, EmitterCtor)
 import front.published (dump_of, facts_read)
-import check.lent (passed)
 import emit.code (Code, lower_to_emit)
-import emit.reps (Def, Imported, Ctors, SumCtor, Carrier, Whole, Fields, Cases, SumCase, FieldTy,
-                  Ty, TyOpen, TyRec, kind_of, ctor_layouts, ctor_sums)
+import emit.reps (Def, Imported, Ctors, SumCtor, Carrier, Whole, Ty, TyOpen, ctor_layouts,
+                  ctor_sums, sig_of, def_entry, param_kinds, param_types, carriers_of)
 import emit.state (EffectName, OpMode, EmitParam)
-import emit.c (Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, SumSpec, Zeroed, Tagged, Width)
+import emit.c (Kind, KBoxed, KInt, KBool, KFloat, KDec, KSum, bytes_join_dots)
 
 /// What the emitter hands the lowering for every root of one module: `builtins` are those the
 /// runtime implements, and `declared` the scheme the prelude declares each builtin at, by the same
@@ -138,14 +137,17 @@ fn root_of(
   let kinds = param_kinds(def, sig).map(|k: { kind: Kind, ty: Ty }| Some(k)).concat(
     labels.map(|_: Bytes| Some({ kind: KInt, ty: TyOpen([]) })),
   );
-  let written = param_types(def, sig);
-  let ps = params_carried(names.concat(labels), kinds, carriers_of(def, sig).params, written);
+  let ps = params_carried(
+    names.concat(labels),
+    kinds,
+    carriers_of(def, sig).params,
+    param_types(def, sig),
+  );
   {
     full: full,
     base: def.span.start,
     params: ps,
-    types: range(0, ps.len()).map(|k: Int|
-      match written.at(k) { Some(Some(t)) -> t, Some(None) -> unknown_type(), None -> int_type() }),
+    types: ps.map(param_type),
     answer: here.fold(Whole(KBoxed), |acc: Carrier, h: Def|
       if h.name == def.name.name { h.answer } else { acc }),
     answer_ty: match sig { Some(s) -> s.ret, None -> unknown_type() },
@@ -155,6 +157,20 @@ fn root_of(
     },
   }
 }
+
+/// The type parameter `p` holds: the one its definition's scheme gives it, else the scalar the
+/// emitter holds it as (a label's place is an `Int`), else unknown.
+pub fn param_type(p: EmitParam) -> Type =
+  match p.of {
+    Some(t) -> t,
+    None -> match p.kind {
+      KInt -> int_type(),
+      KBool -> bool_type(),
+      KFloat -> float_type(),
+      KDec -> decimal_type(),
+      _ -> unknown_type(),
+    },
+  }
 
 /// The name the program's constructor table gives the constructor written `written`. One qualified
 /// by a binder (`binder::Name`) is the module the binder names; a bare one is the module's own, else
@@ -309,16 +325,8 @@ pub fn qualified(name: Bytes) -> Option<{ binder: Bytes, name: Bytes }> =
     },
   }
 
-// What follows copies the emitter's own readers of a program (`emit.ply`), which are private to it
-// until restructure PR 2 makes them `pub`; the hooks file lists each.
-
-type Sig = { params: List<Type>, ret: Type }
-
-fn sig_of(schemes: Map<Bytes, Scheme>, full: Bytes) -> Option<Sig> =
-  match schemes.get(full) {
-    Some(s) -> match s.ty { TyFn(f) -> Some({ params: f.params, ret: f.ret }), _ -> None },
-    None -> None,
-  }
+// What follows reads a program as the emitter does, from copies of readers `emit` keeps to itself
+// or that the lowering takes over from the emitter's modules.
 
 fn walked_read(walked: Bytes) -> Option<WalkedFacts> / {abort.raise} =
   if walked.len() == 0 { None }
@@ -363,44 +371,6 @@ fn defs_in(
   m.items.fold([], |acc: List<Def>, item: Item|
     match item { IFn(d) -> acc.push(def_entry(module, d, pure, schemes)), _ -> acc })
 
-fn def_entry(module: Bytes, d: FnDef, pure: Map<Bytes, Bool>, schemes: Map<Bytes, Scheme>) -> Def = {
-  let full = qualify(module, d.name.name);
-  let ret = match sig_of(schemes, full) { Some(s) -> Some(kind_of(s.ret)), None -> None };
-  let carried = carriers_of(d, sig_of(schemes, full));
-  {
-    name: d.name.name,
-    ret: match ret { Some(r) -> Some(r.kind), None -> None },
-    ret_ty: match ret { Some(r) -> r.ty, None -> TyOpen([]) },
-    pure: pure.contains(full),
-    arity: d.params.len() + d.generics.labels.len(),
-    scheme: schemes.get(full),
-    carriers: carried.params,
-    answer: carried.answer,
-    witnesses: carried.witnesses,
-    lent: range(0, d.params.len()).filter(|i: Int|
-      match d.params.at(i) { Some(p) -> passed(p).lent, None -> false }),
-  }
-}
-
-fn param_kinds(def: FnDef, sig: Option<Sig>) -> List<{ kind: Kind, ty: Ty }> = {
-  let given = match sig { Some(s) -> s.params, None -> [] };
-  let witnesses = def.params.len() - given.len();
-  range(0, def.params.len()).map(|i: Int|
-    if i < witnesses { { kind: KInt, ty: TyOpen([]) } } else {
-      match given.at(i - witnesses) {
-        Some(t) -> kind_of(t),
-        None -> { kind: KBoxed, ty: TyOpen([]) },
-      }
-    })
-}
-
-fn param_types(def: FnDef, sig: Option<Sig>) -> List<Option<Type>> = {
-  let given = match sig { Some(s) -> s.params, None -> [] };
-  let witnesses = def.params.len() - given.len();
-  range(0, def.params.len()).map(|i: Int|
-    if i < witnesses { Some(int_type()) } else { given.at(i - witnesses) })
-}
-
 fn params_carried(
   names: List<Bytes>,
   kinds: List<Option<{ kind: Kind, ty: Ty }>>,
@@ -419,102 +389,6 @@ fn params_carried(
       carrier: match carriers.at(i) { Some(c) -> c, None -> Whole(KBoxed) },
       lambda: None,
     })
-
-fn carriers_of(
-  d: FnDef,
-  sig: Option<Sig>,
-) -> { params: List<Carrier>, answer: Carrier, witnesses: Int } = {
-  let given = match sig { Some(s) -> s.params, None -> [] };
-  let witnesses = d.params.len() - given.len();
-  let written = range(0, d.params.len()).map(|i: Int|
-    if i < witnesses { Whole(KBoxed) }
-    else { match given.at(i - witnesses) { Some(t) -> carrier_of(t), None -> Whole(KBoxed) } });
-  {
-    params: d.generics.labels.fold(written, |acc: List<Carrier>, _: Ident| acc.push(Whole(KBoxed))),
-    answer: if d.params.len() + d.generics.labels.len() == 0 { Whole(KBoxed) }
-    else { match sig { Some(s) -> carrier_of(s.ret), None -> Whole(KBoxed) } },
-    witnesses: witnesses,
-  }
-}
-
-/// How a value of type `t` crosses a call: as today's emitter carries it, so a root the form writes
-/// and one today's emitter writes call each other alike.
-pub fn carrier_of(t: Type) -> Carrier = {
-  let k = kind_of(t);
-  let args = if is_option_type(t) || tagged_result(t) {
-    match t { TyCon(c) -> c.args.map(|a: Type| case_carrier(carrier_of(a))), _ -> [] }
-  } else { [] };
-  if is_option_type(t) {
-    sum_carrier(Zeroed, [{ name: b"None", arg: None }, { name: b"Some", arg: args.at(0) }])
-  } else if tagged_result(t) {
-    sum_carrier(Tagged, [{ name: b"Ok", arg: args.at(0) }, { name: b"Err", arg: args.at(1) }])
-  } else {
-    match k.ty {
-      TyRec(fs) -> if carried_record(fs) { Fields(fs) } else { Whole(KBoxed) },
-      _ -> match k.kind {
-        KFloat -> Whole(KFloat),
-        KDec -> Whole(KDec),
-        KInt -> Whole(KInt),
-        KBool -> Whole(KBool),
-        KNum(w) -> if w.bits <= 64 { Whole(KNum(w)) } else { Whole(KBoxed) },
-        _ -> Whole(KBoxed),
-      },
-    }
-  }
-}
-
-fn sum_carrier(spec: SumSpec, cases: List<SumCase>) -> Carrier =
-  if cases.fold(false, |any: Bool, c: SumCase|
-      any || (match c.arg { Some(Fields(_)) -> true, _ -> false })) {
-    Cases({ spec: spec, cases: cases })
-  } else { Whole(KSum(spec)) }
-
-fn case_carrier(c: Carrier) -> Carrier =
-  match c { Whole(KSum(_)) -> Whole(KBoxed), Cases(_) -> Whole(KBoxed), other -> other }
-
-fn carried_record(fs: List<FieldTy>) -> Bool =
-  fs.len() > 0
-    && fs.fold(true, |ok: Bool, f: FieldTy|
-      ok && (match in_place(f) { Some(inner) -> holdable(inner), None -> true }))
-    && fs.fold(0, |n: Int, f: FieldTy|
-      n + (match in_place(f) { Some(inner) -> plain_width(inner), None -> raw_words(f.kind) }))
-    <= 4
-
-fn in_place(f: FieldTy) -> Option<List<FieldTy>> = match f.ty { TyRec(fs) -> Some(fs), _ -> None }
-
-fn holdable(fs: List<FieldTy>) -> Bool =
-  fs.len() > 0 && fs.fold(true, |ok: Bool, f: FieldTy| ok && in_place(f) == None)
-
-/// The words a record of `fs`, none held in place, lays out: the emitter's `laid_of(fs).width`.
-fn plain_width(fs: List<FieldTy>) -> Int = fs.fold(0, |n: Int, f: FieldTy| n + raw_words(f.kind))
-
-fn raw_words(kind: Kind) -> Int = match kind { KDec -> 2, _ -> 1 }
-
-fn is_option_type(t: Type) -> Bool =
-  match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
-
-fn tagged_result(t: Type) -> Bool =
-  match t {
-    TyCon(c) ->
-      c.name == b"Result" && c.args.len() == 2
-        && (match c.args.at(1) { Some(e) -> always_object(e), None -> false }),
-    _ -> false,
-  }
-
-fn always_object(t: Type) -> Bool =
-  match t {
-    TyRecord(_) -> true,
-    TyNominal(_) -> true,
-    TyFn(_) -> true,
-    TyCon(c) ->
-      c.name.index_of(b".") != None || c.name == b"Result" || c.name == b"Bytes"
-        || c.name == b"String"
-        || c.name == b"List"
-        || c.name == b"Map"
-        || c.name == b"Array"
-        || c.name == b"Columns",
-    _ -> false,
-  }
 
 fn effects_in(resolved: Resolved, i: Int, mods: List<ParsedModule>) -> List<EffectName> =
   match resolved.scopes.at(i) {
@@ -561,7 +435,7 @@ fn resolved_imports(
     let im = x_module.imports.get(j);
     let full = match resolved.imports.get(index).at(j) {
       Some(t) -> mods.get(t).name,
-      None -> dotted(im.path.map(|i: Ident| i.name)),
+      None -> bytes_join_dots(im.path.map(|i: Ident| i.name)),
     };
     match im.kind {
       INames(ns) ->
@@ -616,14 +490,6 @@ fn resolved_imports(
 pub fn module_import(xs: List<Imported>, binder: Bytes) -> Option<Imported> =
   xs.fold(None, |acc: Option<Imported>, i: Imported|
     if i.whole && i.name == binder { Some(i) } else { acc })
-
-fn dotted(xs: List<Bytes>) -> Bytes =
-  range(0, xs.len()).fold(b"", |acc: Bytes, i: Int|
-    Bytes::concat_all([
-      acc,
-      if i == 0 { b"" } else { b"." },
-      match xs.at(i) { Some(x) -> x, None -> b"" },
-    ]))
 
 /// A setting of module `m` importing `imports`, whose program declares constructors `names`, the
 /// prelude's `Less` and `Equal` an `Ordering`'s.

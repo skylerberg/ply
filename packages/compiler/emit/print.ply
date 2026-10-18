@@ -8,22 +8,25 @@
 import syntax.parsing (Span, span_between)
 import check.types (TyCon)
 import std.bytes (ascii_of_int)
+import emit.c (tick_line)
 import emit.roots (symbol_of, root_id)
 import emit.keys (Named, root_name)
 import emit.pieces (Piece, Text, Hole, TagOf, InGroup, LentBy, merged, spelled)
-import emit.tir (Rep, RInt, RBool, RWord, Var, Arg, AVar, AInt, ABool, AZero, Val, Prim, Literal,
-                 Static, Make, TInt, Get, Take, Tag, Path, PField, PArg, PCapture, Pack, Gathered,
-                 Call, Apply, Native, Op, OHandle, OContainer, OCalling, MClosure, MList, Inst, Let,
-                 Do, Decl, Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter,
-                 Fail, Handle, Sited, Lender, Inc, Dec, Reset, Free, Opened, Block, Fn, Member,
-                 Rooted, Given, Lambda, Closure, Uses, NoArm, no_links, rep_of_arg, falls_through)
+import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, Var, Arg, AVar, AInt, ABool, AZero, Val,
+                 Prim, Literal, Static, Make, TInt, Get, Take, Tag, Path, PField, PArg, PCapture,
+                 Pack, Gathered, Call, Apply, Native, Op, OHandle, OContainer, OCalling, MClosure,
+                 MList, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next, Done,
+                 Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec, Reset, Free, Opened,
+                 Block, Fn, Member, Rooted, Given, Lambda, Closure, Uses, NoArm, no_links,
+                 rep_of_arg, falls_through)
 import emit.print.text (Under, Place, Printing, Printed, printing, line, text, pieces, pad, named,
-                        name_of, arg_text, assigned, label, check, zero, failing_return, site, slot)
+                        name_of, arg_text, assigned, label, check, zero, failing_return, site, slot,
+                        part_names)
 import emit.print.counts (released, count_printed)
-import emit.print.made (c_type, c_types, as_word, word_as, made, got, packed, gathered, statics,
-                        declared, set_parts, returned, head_types, head_params, entry_opened,
-                        entry_outs, entry_answered, grown_word)
-import emit.print.fuel (fuel_head, fuel_pieces, tick_line)
+import emit.print.made (c_type, c_types, as_word, word_as, word_parts, made, got, packed, gathered,
+                        statics, declared, set_parts, returned, head_types, head_params,
+                        entry_opened, entry_outs, entry_answered)
+import emit.print.fuel (fuel_head)
 import emit.print.prims (literal, prim)
 import emit.print.containers (contained, container_op)
 import emit.print.tested (case_opened, case_arm, case_arm_closed, case_rest, case_closed,
@@ -66,18 +69,10 @@ pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
 }
 
 /// A root of its own as its C function, named `name`, and its entry: the printing after it and its
-/// pieces. A growth of the stack hands each parameter on as its word, made first where it is held
-/// as several values.
+/// pieces.
 fn root_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
   let body = body_printed(name, f, printing(param_names(f)));
-  let grown = range(0, f.conv.reps.len()).fold(
-    { pr: body, prep: [], words: [] },
-    |g: { pr: Printing, prep: List<Piece>, words: List<Bytes> }, i: Int| {
-      let w = grown_word(g.pr, i, f.conv.reps.get(i), failing_return(f.conv.answer));
-      { pr: w.pr, prep: g.prep.concat(w.prep), words: g.words.push(w.word) }
-    },
-  );
-  let entered = entry(name, f, grown.pr);
+  let entered = entry(name, f, body);
   {
     pr: entered.pr,
     out: [
@@ -88,11 +83,10 @@ fn root_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abo
           b"_entry(PlyCtx *ctx, const Word *args);\n",
           head(name, f),
           b" {\n",
+          fuel_head(f.conv.answer),
         ]),
       ),
     ].concat(
-      fuel_pieces(name.concat(b"_entry"), grown.prep, grown.words, f.conv.answer),
-    ).concat(
       body.out,
     ).push(
       Text(b"}\n"),
@@ -142,8 +136,12 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
               |q: Printing, j: Int| {
                 let v = m.params.get(j);
                 let word = b"p".concat(ascii_of_int(j));
-                if v.rep == RWord { { ..q, names: q.names.insert(v.id, word) } }
-                else { assigned(q, 1, v, c_type(v.rep), word_as(word, v.rep)) }
+                match v.rep {
+                  RWord -> { ..q, names: q.names.insert(v.id, word) },
+                  RFlat(_) -> parted(q, v, word),
+                  RCases(_) -> parted(q, v, word),
+                  _ -> assigned(q, 1, v, c_type(v.rep), word_as(word, v.rep)),
+                }
               },
             );
             line(printed(armed, opened, a.body, 1), 0, b"}")
@@ -154,8 +152,15 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
     _ -> line(start, 0, b"/* a group whose body is no case on its member's place */"),
   };
   let gentry = g.concat(b"_entry");
+  let wrappers = range(0, f.members.len()).fold(
+    { pr: switched, out: [] },
+    |acc: { pr: Printing, out: List<Piece> }, i: Int| {
+      let w = group_wrapper(f, i, acc.pr);
+      { pr: w.pr, out: acc.out.concat(w.out) }
+    },
+  );
   {
-    pr: switched,
+    pr: wrappers.pr,
     out: [
       Text(
         Bytes::concat_all([
@@ -167,7 +172,7 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
           b"(PlyCtx *ctx, int which",
           Bytes::concat_all(words.map(|w: Bytes| b", Word ".concat(w))),
           b") {\n",
-          fuel_head(gentry, [b"which"].concat(words), f.conv.answer),
+          fuel_head(f.conv.answer),
           b"  ply_loop: ",
           tick_line(failing_return(f.conv.answer)),
           b"\n  switch (which) {\n",
@@ -189,11 +194,21 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
               Bytes::concat_all([b", args[", ascii_of_int(i + 1), b"]"])),
           ),
           b");\n}\n",
-          Bytes::concat_all(range(0, f.members.len()).map(|i: Int| group_wrapper(f, i))),
         ]),
       ),
+    ).concat(
+      wrappers.out,
     ),
   }
+}
+
+/// `v`, held as several values, bound in a group's arm from the word `word`, which it takes.
+fn parted(pr: Printing, v: Var, word: Bytes) -> Printing / {abort.raise} = {
+  let n = named(pr, v);
+  pieces(
+    n.pr,
+    [Text(pad(1))].concat(word_parts(word, v.rep, part_names(n.name, v.rep))).push(Text(b"\n")),
+  )
 }
 
 fn param_names(f: Fn) -> Map<Int, Bytes> / {abort.raise} =

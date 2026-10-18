@@ -12,7 +12,9 @@ import syntax.lexer (is_ident_continue)
 import check.resolve.tables (Diag, qualify)
 import check.types (TyCon)
 import std.bytes (ascii_of_int, hex_digit)
-import emit (emit_roots_answer)
+import emit (today_roots_answer)
+import unit (declared_natives)
+import check.infer.definitions (Extern)
 import emit.answer (RootAnswer, Body, Const, ConstStr, ConstBytes, ConstEmbedded, ConstFixed,
                     ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, GenericCall)
 import emit.roots (FnArg, symbol_of)
@@ -20,9 +22,7 @@ import emit.pieces (Piece, spelled)
 import emit.tir (Rep, Var, Arg, AVar, ABool, RInt, RBool, Inst, Decl, Assign, If, Return, Restart,
                  Fn, Declined, Family, Spine, Data, Calling, Matching, Handling, Scalars,
                  Containers)
-import emit.lower (lowered_fn)
-import emit.lower.base (context_of)
-import emit.lower.calling (known_body)
+import emit.lower (root_lowered)
 import emit.lower.setting (Setting, Root, setting_in)
 import emit.print (printed_fn)
 import emit.own (owned)
@@ -32,13 +32,20 @@ import emit.verify (verified)
 /// definitions.
 pub type Program = { src: Bytes, analysis: Analysis, setting: Setting, roots: List<Root> }
 
-/// `src` as module `m` of a program, or what refused it.
+/// `src` as module `m` of a program, or what refused it, run by a runtime that implements every
+/// native the compiler declares, as a build hands the emitter its runtime's.
 pub fn program_of(src: Bytes) -> Result<Program, Bytes> / {abort.raise} =
   match analyse(parse_all([{ name: b"m", src: src }])) {
     Refused(diags) -> Err(Bytes::join(diags.map(|d: Diag| d.message), b"\n")),
     Analysed(a) -> match setting_in(a, b"m") {
       Err(why) -> Err(why),
-      Ok(s) -> Ok({ src: src, analysis: a, setting: s.setting, roots: s.roots }),
+      Ok(s) ->
+        Ok({
+          src: src,
+          analysis: a,
+          setting: { ..s.setting, builtins: declared_natives().map(|e: Extern| e.name) },
+          roots: s.roots,
+        }),
     },
   }
 
@@ -50,10 +57,7 @@ pub fn formed(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.raise} =
     None -> Err({ by: Spine, why: b"no such definition" }),
     Some(r) -> match r.code {
       None -> Err({ by: Spine, why: b"a body that does not lower to Code" }),
-      Some(code) -> {
-        let body = known_body(r.full, r.params, code);
-        lowered_fn(context_of(p.setting, r, body), body)
-      },
+      Some(code) -> root_lowered(p.setting, r, code),
     },
   }
 
@@ -93,7 +97,7 @@ pub fn printed_text(f: Fn) -> Bytes / {abort.raise} = {
 /// program's constructors and the builtins its runtime implements as the form is.
 pub fn answered_today(p: Program, names: List<Bytes>) -> List<RootAnswer> / {abort.raise} = {
   let d = dump_of(Analysed(p.analysis));
-  emit_roots_answer(
+  today_roots_answer(
     [b"m"],
     [p.src],
     p.setting.ctors,
@@ -233,27 +237,32 @@ fn call_spelled(g: GenericCall) -> Bytes =
 /// `text` as a list of lines, read past what two printers may write differently for one
 /// computation, each C function on its own (a line at column 0 ending in `{` opens one, a `}` at
 /// column 0 closes it), so its temporaries and copies are its own:
-/// - a blank line is dropped;
+/// - a blank line is dropped, and so is a function's stack probe, which today's printer has re-enter
+///   the function on a stack of its own and the form's has make room on the stack it runs on;
 /// - `Word`, `PlyMaybe` and `PlyTagged` are the `int64_t` they are defined as, `INT64_C(n)` is `n`,
 ///   and a label's `name:;` is `name: ;`;
 /// - today's names for a record parameter's word, `p<i>_w`, and a sum parameter's index and leaves,
 ///   `p<i>` and `p<i>_<k>`, are the form's: the part after the record's leaves, and the sum's parts
 ///   from `p<i>_0` on;
-/// - a declaration of zero the next line assigns, not reading it, declares what is assigned;
+/// - a declaration of zero assigned once before anything reads it, and read only where that
+///   assignment's block goes on, declares at the assignment what is assigned;
 /// - a temporary (or a part `t<n>_<k>` of one held as several C values) declared from another local
-///   or a literal (a field name's or a tag's hole among them) and never assigned again is read as
-///   what it copies, unless what it copies is assigned after it;
+///   or a literal (a field name's or a tag's hole among them) and never written again, by an
+///   assignment or a compound one (`t1 -= 1`), is read as what it copies, unless what it copies is
+///   written after it;
 /// - lines after a restart's `goto` in its block are dropped;
 /// - a temporary nothing reads goes with each write of it that calls nothing, and then any
 ///   temporary only those writes read, so a chain of copies nothing reads goes whole;
-/// - the temporaries `t<n>` (a part with its temporary), the landings (today's `land_<n>` and the
-///   form's `ply_h<n>` alike), and any hole of a table no entry was spelled for are renumbered in
-///   the order they first appear, each kind apart.
+/// - the temporaries `t<n>` and their parts `t<n>_<k>`, each a temporary of its own, the landings
+///   (today's `land_<n>` and the form's `ply_h<n>` alike), and any hole of a table no entry was
+///   spelled for are renumbered in the order they first appear, each kind apart.
 pub fn normalised(text: Bytes) -> List<Bytes> / {abort.raise} =
-  functions(text.split(b"\n").filter(|l: Bytes| trimmed(l) != b"")).fold(
-    [],
-    |out: List<Bytes>, f: List<Bytes>| out.concat(function_read(f)),
-  )
+  functions(
+    text.split(b"\n").filter(|l: Bytes| {
+      let t = trimmed(l);
+      t != b"" && !t.starts_with(b"{ char probe;")
+    }),
+  ).fold([], |out: List<Bytes>, f: List<Bytes>| out.concat(function_read(f)))
 
 /// `lines` cut into C functions, each from the line at column 0 ending in `{` that opens it to the
 /// `}` at column 0 that closes it, and the runs of lines between them.
@@ -275,8 +284,8 @@ fn function_read(function: List<Bytes>) -> List<Bytes> / {abort.raise} = {
   let lines = assigned_once(today_parts(function.map(spelled_alike)));
   let writes = range(0, lines.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int|
     statements(trimmed(lines.get(i))).fold(m, |n: Map<Bytes, Int>, s: Bytes|
-      match s.index_of(b" = ") {
-        Some(at) -> if temp_local(s.slice(0, at)) { n.insert(s.slice(0, at), i) } else { n },
+      match written_local(s) {
+        Some(x) -> if temp_local(x) { n.insert(x, i) } else { n },
         None -> n,
       }));
   let copies = range(0, lines.len()).fold(
@@ -312,28 +321,25 @@ fn function_read(function: List<Bytes>) -> List<Bytes> / {abort.raise} = {
   ).out;
   let used = unread_dropped(live);
   let numbering = used.fold({ names: Map::new(), counts: Map::new() }, |m: Numbering, l: Bytes|
-    words(l).fold(m, |n: Numbering, w: { text: Bytes, ident: Bool }|
-      if n.names.contains(w.text) { n } else {
-        match temp_part(w.text) {
-          Some(part) -> {
-            let based = numbered(n, { text: part.base, ident: true });
-            {
-              ..based,
-              names: based.names.insert(
-                w.text,
-                Bytes::concat_all([
-                  match based.names.get(part.base) { Some(b) -> b, None -> part.base },
-                  b"_",
-                  part.k,
-                ]),
-              ),
-            }
-          },
-          None -> numbered(n, w),
-        }
-      }));
+    words(l).fold(m, numbered));
   used.map(|l: Bytes| renamed(l, numbering.names))
 }
+
+/// The local statement `s` writes, by an assignment (`t1 = e`) or a compound one (`t1 -= 1`).
+fn written_local(s: Bytes) -> Option<Bytes> / {abort.raise} =
+  match s.index_of(b" = ") {
+    Some(at) -> Some(s.slice(0, at)),
+    None -> match s.index_of(b" ") {
+      None -> None,
+      Some(sp) -> {
+        let rest = s.slice(sp + 1, s.len());
+        if [b"+=", b"-=", b"*=", b"/=", b"%=", b"&=", b"|=", b"^=", b"<<=", b">>="].any(
+            |op: Bytes| rest.starts_with(op.concat(b" ")),
+          ) { Some(s.slice(0, sp)) }
+        else { None }
+      },
+    },
+  }
 
 /// A run of lines two texts differ in: today's lines there and the form's, either of which may be
 /// none.
@@ -413,13 +419,13 @@ fn temp_part(v: Bytes) -> Option<{ base: Bytes, k: Bytes }> / {abort.raise} =
   }
 
 /// How a word renumbered by first appearance is spelled around its number, and the number its kind
-/// starts at: a temporary from `t1`, a landing (today's `land_<n>` and the form's `ply_h<n>`, one
-/// kind) from `ply_h0`, and a hole of a table no entry was spelled for from `@@c0@@`.
+/// starts at: a temporary or a part of one from `t1`, a landing (today's `land_<n>` and the form's
+/// `ply_h<n>`, one kind) from `ply_h0`, and a hole of a table no entry was spelled for from `@@c0@@`.
 fn numbered_kind(
   w: { text: Bytes, ident: Bool },
 ) -> Option<{ lead: Bytes, close: Bytes, first: Int }> / {abort.raise} =
   if w.ident {
-    if temp_name(w.text) { Some({ lead: b"t", close: b"", first: 1 }) }
+    if temp_local(w.text) { Some({ lead: b"t", close: b"", first: 1 }) }
     else if (w.text.starts_with(b"land_") && all_digits(w.text.slice(5, w.text.len())))
         || (w.text.starts_with(b"ply_h") && all_digits(w.text.slice(5, w.text.len()))) {
       Some({ lead: b"ply_h", close: b"", first: 0 })
@@ -517,42 +523,68 @@ fn local_part(w: Bytes) -> Option<{ base: Bytes, k: Bytes }> / {abort.raise} =
     },
   }
 
-/// `lines` with each declaration of zero that the next line, in the same block, assigns without
-/// reading it read as a declaration of what that line assigns.
-fn assigned_once(lines: List<Bytes>) -> List<Bytes> / {abort.raise} =
-  range(0, lines.len()).fold(
-    { out: [], skip: false },
-    |acc: { out: List<Bytes>, skip: Bool }, i: Int|
-      if acc.skip { { ..acc, skip: false } } else {
-        let l = lines.get(i);
-        let t = trimmed(l);
-        let set = match declared(t) {
-          Some(d) -> if d.value != b"0" || statements(t).len() != 1 { None } else {
-            match lines.at(i + 1) {
-              Some(n) -> if indent(n) != indent(l) { None } else {
-                match lone_assignment(trimmed(n)) {
-                  Some(s) -> if s.name != d.name || idents(s.value).contains(d.name) { None }
-                  else { Some(s.value) },
-                  None -> None,
-                }
-              },
-              None -> None,
-            }
+/// `lines` with each declaration of zero that one assignment sets before anything reads it, every
+/// later read being where that assignment's block goes on, read as a declaration of what is assigned
+/// where the assignment is.
+fn assigned_once(lines: List<Bytes>) -> List<Bytes> / {abort.raise} = {
+  // Each assignment read as a declaration, by its line, from the line declaring zero.
+  let moved = range(0, lines.len()).fold(Map::new(), |m: Map<Int, Int>, i: Int|
+    match set_once(lines, i) { Some(j) -> m.insert(j, i), None -> m });
+  let dropped = moved.values();
+  range(0, lines.len()).fold([], |out: List<Bytes>, k: Int|
+    if dropped.contains(k) { out } else {
+      let l = lines.get(k);
+      match moved.get(k) {
+        None -> out.push(l),
+        Some(i) -> match lone_assignment(trimmed(l)) {
+          None -> out.push(l),
+          Some(s) -> {
+            let t = trimmed(lines.get(i));
+            out.push(
+              Bytes::concat_all([l.slice(0, indent(l)), t.slice(0, t.len() - 2), s.value, b";"]),
+            )
           },
+        },
+      }
+    })
+}
+
+/// The line of the one assignment that sets the local line `i` declares zero, where nothing mentions
+/// it between them and every later mention reads it where the assignment's block goes on.
+fn set_once(lines: List<Bytes>, i: Int) -> Option<Int> / {abort.raise} = {
+  let t = trimmed(lines.get(i));
+  match declared(t) {
+    None -> None,
+    Some(d) -> if d.value != b"0" || statements(t).len() != 1 { None } else {
+      let mentions = range(i + 1, lines.len()).filter(|k: Int|
+        idents(lines.get(k)).contains(d.name));
+      match mentions.at(0) {
+        None -> None,
+        Some(j) -> match lone_assignment(trimmed(lines.get(j))) {
           None -> None,
-        };
-        match set {
-          Some(value) ->
-            {
-              out: acc.out.push(
-                Bytes::concat_all([l.slice(0, indent(l)), t.slice(0, t.len() - 2), value, b";"]),
-              ),
-              skip: true,
-            },
-          None -> { ..acc, out: acc.out.push(l) },
-        }
-      },
-  ).out
+          Some(s) -> if s.name != d.name || idents(s.value).contains(d.name) { None } else {
+            let depth = indent(lines.get(j));
+            if mentions.drop(1).all(|k: Int|
+                read_only(lines.get(k), d.name)
+                  && range(j + 1, k + 1).all(|x: Int| indent(lines.get(x)) >= depth)) { Some(j) }
+            else { None }
+          },
+        },
+      }
+    },
+  }
+}
+
+/// Whether line `l` reads local `x` and writes it nowhere: no assignment, compound or not, of it, and
+/// no address of it handed on.
+fn read_only(l: Bytes, x: Bytes) -> Bool / {abort.raise} =
+  l.index_of(b"&".concat(x)) == None
+    && statements(trimmed(l)).all(|s: Bytes| {
+      // A statement inside a block on the line starts after the brace that opens it.
+      let opened = range(0, s.len()).fold(0, |at: Int, k: Int|
+        if s.at(k) == 123 || s.at(k) == 125 { k + 1 } else { at });
+      written_local(trimmed(s.slice(opened, s.len()))) != Some(x)
+    })
 
 /// `x = E;`, one statement assigning a local: the local and what it is set to.
 fn lone_assignment(t: Bytes) -> Option<{ name: Bytes, value: Bytes }> / {abort.raise} =
@@ -911,6 +943,39 @@ test "the scalar subset prints as today's emitter writes it, but for copies and 
   }
 }
 
+test "every function the form prints makes room on the stack it runs on, and none grows a stack of its own" {
+  let src = Bytes::concat_all([
+    scalar_corpus(),
+    b"type P = { x: Float, y: Float }\n",
+    b"fn moved(p: P, d: Float) -> P = { x: p.x + d, y: p.y }\n",
+    b"fn adder(n: Int) -> (Int) -> Int = |x: Int| x + n\n",
+    b"fn even(n: Int) -> Bool = adder(n)(1) == 0\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let texts = scalar_names().concat([b"moved", b"adder", b"even"]).map(|n: Bytes|
+        match printed_by_form(p, n) { Ok(t) -> t, Err(why) -> n.concat(b": ").concat(why) });
+      let count = |t: Bytes, s: Bytes| t.split(s).len() - 1;
+      // Each function's prologue asks for room where it stands, once.
+      assert_eq(
+        texts.filter(|t: Bytes|
+          t.index_of(b"rt_grow_p") != None || count(t, b"ctx->fuel -= 1;") == 0
+            || count(t, b"rt_stack_more_p(ctx)") != count(t, b"ctx->fuel -= 1;")),
+        [],
+      );
+      assert(
+        texts.get(0).index_of(
+            b"  { char probe; if ((uintptr_t)&probe < ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n",
+          )
+          != None,
+      );
+      // A closure's function is a function of its own.
+      assert_eq(count(texts.get(scalar_names().len() + 1), b"rt_stack_more_p(ctx)"), 2)
+    },
+  }
+}
+
 test "two printers' copies, dead stores after a restart, numbering and counts are read past" {
   let a = b"  int64_t t4 = p0;\n  int64_t t7 = (t4) < (INT64_C(3));\n  if (t7) {\n    p0 = t4;\n    goto ply_loop;\n    t9 = 0;\n  }\n  return t7;";
   let b = b"  int64_t t1 = (p0) < (INT64_C(3));\n  if (t1) {\n    p0 = p0;\n    goto ply_loop;\n  }\n  return t1;";
@@ -935,13 +1000,31 @@ test "two printers' copies, dead stores after a restart, numbering and counts ar
     b"  return t1;",
   ]);
   // An `Option`'s word is a C value like any other, and a part of a value held as several is a
-  // local numbered with its temporary.
+  // temporary of its own.
   assert_eq(
     normalised(
       b"  PlyMaybe t3 = p0;\n  double t4_0 = ply_f64(p1);\n  double t4_1 = ply_f64(p2);\n  f(ctx, t4_1, t3);",
     ),
-    [b"  double t1_1 = ply_f64(p2);", b"  f(ctx, t1_1, p0);"],
+    [b"  double t1 = ply_f64(p2);", b"  f(ctx, t1, p0);"],
   );
+  // A local declared zero and set once is the value it was set to where nothing before reads it,
+  // and a compound assignment writes its local, so a copy of it is no copy.
+  assert_eq(
+    normalised(
+      b"  int64_t t1 = 0;\n  double t2_0 = f(ctx);\n  t1 = p0_3;\n  *o3 = t1;\n  return t2_0;",
+    ),
+    [b"  double t1 = f(ctx);", b"  *o3 = p0_3;", b"  return t1;"],
+  );
+  assert_eq(
+    normalised(b"  int64_t t1 = 0;\n  if (p0) {\n    t1 = p1;\n    f(ctx, t1);\n  }\n  return p2;"),
+    [b"  if (p0) {", b"    f(ctx, p1);", b"  }", b"  return p2;"],
+  );
+  assert_eq(normalised(b"  int64_t t5 = p0;\n  int64_t t6 = t5;\n  t5 -= 1;\n  return t6;"), [
+    b"  int64_t t1 = p0;",
+    b"  int64_t t2 = t1;",
+    b"  t1 -= 1;",
+    b"  return t2;",
+  ]);
   // A word is the `int64_t` it is defined as; a field name's entry is a constant; landings are
   // numbered as temporaries are.
   assert_eq(
