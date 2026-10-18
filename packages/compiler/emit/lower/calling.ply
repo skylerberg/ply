@@ -26,13 +26,38 @@ import emit.tir (Rep, RInt, RBool, RWord, Var, Arg, AVar, AInt, AZero, Given, Co
                  Enter, Return, Fail, NoArm, Sited, Block, Fn, Rooted, Member, Closure, Declined,
                  Calling, no_links, falls_through, rep_of_arg)
 import emit.tir.calling (EntryValue, ConstantRead, BuiltinValue, Ticked)
-import emit.lower.setting (imported_target, qualified)
+import emit.lower.setting (Setting, Root, imported_target, qualified)
 import emit.lower.held (held_as, carried_as, arg_path)
 import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
                         ToInPlace, Frame, Opened, GroupMember, Restarts, Enters, Calls, refuse,
                         fresh, bound_as, done, emitted, opened, nested, unnested, with_lambda,
                         started, type_at, type_of, handed, taken_as)
 import emit.lower.data (constructed)
+
+/// The context root `r` of `setting`, a definition of its own, lowers `body` under.
+pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.raise} =
+  lending({
+    setting: setting,
+    key: Named(r.full),
+    full: r.full,
+    base: r.base,
+    params: r.params,
+    types: r.types,
+    answer: r.answer,
+    answer_ty: r.answer_ty,
+    body: body,
+    tails: Restarts,
+    param_at: range(0, r.params.len()).fold(Map::new(), |m: Map<Int, Int>, i: Int| m.insert(i, i)),
+    lender: None,
+    lends: false,
+    written: [],
+  })
+
+/// `cx` with whether its root lends its lambdas read under its setting, and what it lends then.
+fn lending(cx: Context) -> Context / {abort.raise} = {
+  let lends = lends_lambdas(cx);
+  { ..cx, lends: lends, written: if lends && cx.lender == None { written_in(cx) } else { [] } }
+}
 
 /// How the root takes its parameters and hands back its answer: as the emitter carries them.
 pub fn convention(cx: Context) -> Convention =
@@ -234,7 +259,7 @@ pub fn entered(
           let framed = match lender {
             None -> cx,
             Some(bl) ->
-              {
+              lending({
                 ..cx,
                 setting: {
                   ..cx.setting,
@@ -246,7 +271,7 @@ pub fn entered(
                 },
                 base: bl.base,
                 lender: Some({ owner: bl.owner, written: bl.written }),
-              },
+              }),
           };
           in_frame(framed, st, f_of(st, k.slot), k, lowered, lender, at)
         },
@@ -776,7 +801,13 @@ pub fn lambda_opened(cx: Context, st: Lowering, frame: Frame, at: Span) -> Opene
 
 /// The closure of the body lowered to `inner` from `lambda_opened`'s state, made after `outer` of
 /// the values it captures, each as its word.
-pub fn closure(cx: Context, outer: Lowering, inner: Lowered, frame: Frame, at: Span) -> Lowered = {
+pub fn closure(
+  cx: Context,
+  outer: Lowering,
+  inner: Lowered,
+  frame: Frame,
+  at: Span,
+) -> Lowered / {abort.raise} = {
   let s = shaped(cx, outer.env, frame, at);
   let nth = outer.lambdas.len();
   let answered = if falls_through(inner.st.insts) { handed(inner, s.conv.answer, at) }
@@ -799,13 +830,10 @@ pub fn closure(cx: Context, outer: Lowering, inner: Lowered, frame: Frame, at: S
     links: no_links(),
   };
   let after = unnested(outer, answered.st);
+  // `lambda_opened` reserved place `nth` for this closure.
   let placed = {
     ..after,
-    lambdas: after.lambdas.take(nth).push(
-      Closure({ body: body, captures: s.captures, at: at }),
-    ).concat(
-      after.lambdas.drop(nth + 1),
-    ),
+    lambdas: after.lambdas.set(nth, Closure({ body: body, captures: s.captures, at: at })),
   };
   let caps = frame.captures.fold(
     { st: placed, args: [] },
@@ -1309,33 +1337,18 @@ fn answer_type(d: Def, args: List<Type>) -> Type =
 
 /// `st` with each lambda `codes` writes at a parameter the callee lends, and which captures
 /// something, laid out on this frame's stack.
-fn stacked(st: Lowering, lent: List<Int>, codes: List<Code>, args: List<Arg>) -> Lowering =
+fn stacked(
+  st: Lowering,
+  lent: List<Int>,
+  codes: List<Code>,
+  args: List<Arg>,
+) -> Lowering / {abort.raise} =
   lent.fold(st, |acc: Lowering, i: Int|
     match codes.at(i) {
       Some(c) -> match c.node {
         NLambda(l) -> if l.captures.len() == 0 { acc } else {
           match args.at(i) {
-            Some(AVar(v)) ->
-              {
-                ..acc,
-                insts: acc.insts.map(|x: Inst|
-                  match x {
-                    Let(b) -> if b.var != v { x } else {
-                      match b.val {
-                        Make(m) -> match m.made {
-                          MClosure(k) ->
-                            Let({
-                              ..b,
-                              val: Make({ ..m, made: MClosure({ ..k, stacked: true }) }),
-                            }),
-                          _ -> x,
-                        },
-                        _ -> x,
-                      }
-                    },
-                    _ -> x,
-                  }),
-              },
+            Some(AVar(v)) -> { ..acc, insts: laid_on_stack(acc.insts, v, acc.insts.len() - 1) },
             _ -> acc,
           }
         },
@@ -1343,6 +1356,25 @@ fn stacked(st: Lowering, lent: List<Int>, codes: List<Code>, args: List<Arg>) ->
       },
       None -> acc,
     })
+
+/// `b` with the closure `v` binds at place `i` or before laid out on this frame's stack. It was just
+/// made, so it is sought from the block's end.
+fn laid_on_stack(b: Block, v: Var, i: Int) -> Block / {abort.raise} =
+  if i < 0 { b } else {
+    match b.at(i) {
+      Some(Let(x)) -> if x.var != v { laid_on_stack(b, v, i - 1) } else {
+        match x.val {
+          Make(m) -> match m.made {
+            MClosure(k) ->
+              b.set(i, Let({ ..x, val: Make({ ..m, made: MClosure({ ..k, stacked: true }) }) })),
+            _ -> b,
+          },
+          _ -> b,
+        }
+      },
+      _ -> laid_on_stack(b, v, i - 1),
+    }
+  }
 
 /// `st` noting each parameter of the root that may hold a function and that the call of `callee`
 /// hands on as itself, by the argument it is.
@@ -1404,11 +1436,11 @@ fn may_be_called(cx: Context, j: Int) -> Bool =
 /// around a call of it.
 fn fn_args(cx: Context, codes: List<Code>) -> List<FnArg> / {abort.raise} = {
   let owner = root_name(cx.key);
-  let lends = lends_lambdas(cx);
+  let lends = cx.lends;
   // Code of a lambda another root lent is that root's, which lends each lambda within it.
   let by = match cx.lender {
     Some(b) -> Some(b),
-    None -> if lends { Some({ owner: owner, written: written_in(cx) }) } else { None },
+    None -> if lends { Some({ owner: owner, written: cx.written }) } else { None },
   };
   let handed_as = |j: Int, l: Lambda, acc: List<FnArg>|
     match if has_handle(l.body) { None } else { by } {

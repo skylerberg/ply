@@ -16,6 +16,8 @@
 //! before it.
 
 import std.bytes (ascii_of_int)
+import std.math (ilog2)
+import std.pace (paced)
 import check.types (Type, TyCon, TyRecord)
 import emit.typing (unknown_type)
 import syntax.parsing (dummy_span)
@@ -172,6 +174,16 @@ fn took(f: Fn) -> Fn = {
     |m: Map<Int, Int>, x: Member| given_bound(x.params, x.conv, m),
   );
   let s = sighted({ gets: [], whole: Map::new(), handed: Map::new(), bound: start }, f.body, 0 - 1);
+  let read = s.gets.fold(
+    Map::new(),
+    |m: Map<Int, Map<Path, Int>>, g: { var: Var, of: Var, path: Path, pass: Int }| {
+      let paths = match m.get(g.of.id) { Some(ps) -> ps, None -> Map::new() };
+      m.insert(
+        g.of.id,
+        paths.insert(g.path, match paths.get(g.path) { Some(n) -> n + 1, None -> 1 }),
+      )
+    },
+  );
   let taking = s.gets.fold(
     Map::new(),
     |m: Map<Int, Bool>, g: { var: Var, of: Var, path: Path, pass: Int }|
@@ -180,10 +192,9 @@ fn took(f: Fn) -> Fn = {
           && !held_in_place(g.of, g.path, g.var)
           && !s.whole.contains(g.of.id)
           && s.handed.contains(g.var.id)
-          && s.gets.count(|h: { var: Var, of: Var, path: Path, pass: Int }|
-            h.of.id == g.of.id && h.path == g.path)
-          == 1 { m.insert(g.var.id, true) }
-      else { m },
+          && (match read.get(g.of.id) { Some(ps) -> ps.get(g.path), None -> None }) == Some(1) {
+        m.insert(g.var.id, true)
+      } else { m },
   );
   if taking.len() == 0 { f } else { { ..f, body: retaken(f.body, taking) } }
 }
@@ -298,19 +309,26 @@ fn facts_of(f: Fn) -> Facts = {
     stacks: Map::new(),
   };
   let first = gathered(params_defined(f, empty), f.body);
+  let got = first.gets.fold(
+    Map::new(),
+    |m: Map<Int, List<Int>>, id: Int, g: { of: Int, path: Path }| read_by(m, g.of, id),
+  );
+  let borrowed = first.direct.fold(Map::new(), |m: Map<Int, List<Int>>, id: Int, from: Int|
+    read_by(m, from, id));
   let words = first.made.fold(
     { opened: Map::new(), next: first.next },
     |acc: { opened: Map<Int, List<Var>>, next: Int }, id: Int, _: Bool|
       match first.vars.get(id) {
-        Some(s) -> if !openable(first, s) { acc } else {
+        Some(s) -> if !openable(first, got, borrowed, s) { acc } else {
           let parts = parts_of(s.rep);
+          let typed = word_types(first, got, id);
           {
             opened: acc.opened.insert(
               id,
               range(0, parts.len()).map(|k: Int|
                 {
                   id: acc.next + k,
-                  ty: word_type(first, id, k),
+                  ty: match typed.get(k) { Some(t) -> t, None -> unknown_type() },
                   rep: match parts.at(k) { Some(r) -> r, None -> RInt },
                 }),
             ),
@@ -367,12 +385,24 @@ fn given_defined(params: List<Var>, conv: Convention, fx: Facts) -> Facts =
       else { { ..defined(acc, p, Own), made: acc.made.insert(p.id, true) } },
     })
 
-/// Whether `s`, a value holding a count made where it is bound, is flat and read out of only by
-/// `Get`s of its leaves, each held as that part is.
-fn openable(fx: Facts, s: Var) -> Bool =
-  match s.rep { RFlat(_) -> leaves_only(fx, s), RCases(_) -> leaves_only(fx, s), _ -> false }
+/// `by` with `id` among the variables read out of `of`, in ascending order where they are added so.
+fn read_by(by: Map<Int, List<Int>>, of: Int, id: Int) -> Map<Int, List<Int>> =
+  by.insert(of, match by.get(of) { Some(ids) -> ids.push(id), None -> [id] })
 
-fn leaves_only(fx: Facts, s: Var) -> Bool = {
+fn reads_of(by: Map<Int, List<Int>>, of: Int) -> List<Int> =
+  match by.get(of) { Some(ids) -> ids, None -> [] }
+
+/// Whether `s`, a value holding a count made where it is bound, is flat and read out of only by
+/// `Get`s of its leaves, each held as that part is. `got` and `borrowed` are the variables each
+/// `Get` and each borrowing read binds, by what they read out of.
+fn openable(fx: Facts, got: Map<Int, List<Int>>, borrowed: Map<Int, List<Int>>, s: Var) -> Bool =
+  match s.rep {
+    RFlat(_) -> leaves_only(fx, got, borrowed, s),
+    RCases(_) -> leaves_only(fx, got, borrowed, s),
+    _ -> false,
+  }
+
+fn leaves_only(fx: Facts, got: Map<Int, List<Int>>, borrowed: Map<Int, List<Int>>, s: Var) -> Bool = {
   let parts = parts_of(s.rep);
   let leaf = |id: Int|
     match fx.gets.get(id) {
@@ -386,16 +416,20 @@ fn leaves_only(fx: Facts, s: Var) -> Bool = {
     };
   // Every read out of `s`: those that borrow from it, and every `Get`, a read by name among them,
   // which answers a count of its own.
-  fx.direct.fold(true, |ok: Bool, id: Int, from: Int| ok && (from != s.id || leaf(id)))
-    && fx.gets.fold(true, |ok: Bool, id: Int, g: { of: Int, path: Path }|
-      ok && (g.of != s.id || leaf(id)))
+  reads_of(borrowed, s.id).all(leaf) && reads_of(got, s.id).all(leaf)
 }
 
-/// The type of word `k` of the value numbered `s`: what a `Get` of that leaf reads, else unknown.
-fn word_type(fx: Facts, s: Int, k: Int) -> Type =
-  fx.gets.fold(unknown_type(), |t: Type, id: Int, g: { of: Int, path: Path }|
-    if g.of == s && g.path == PLeaf(k) { match fx.vars.get(id) { Some(v) -> v.ty, None -> t } }
-    else { t })
+/// The type each word of the value numbered `s` is read as, by its place: what the last `Get` of
+/// that leaf reads. A word no `Get` reads is of unknown type.
+fn word_types(fx: Facts, got: Map<Int, List<Int>>, s: Int) -> Map<Int, Type> =
+  reads_of(got, s).fold(Map::new(), |m: Map<Int, Type>, id: Int|
+    match fx.gets.get(id) {
+      Some(g) -> match g.path {
+        PLeaf(k) -> match fx.vars.get(id) { Some(v) -> m.insert(k, v.ty), None -> m },
+        _ -> m,
+      },
+      None -> m,
+    })
 
 fn defined(fx: Facts, v: Var, h: Held) -> Facts =
   {
@@ -785,37 +819,59 @@ fn bound_in(m: Mentions, v: Var) -> Mentions = { ..m, bound: m.bound.insert(v.id
 /// instruction reads and nothing reads after dies after it; one it does not read, which only
 /// something consumed was read out of, dies before it.
 fn planned(fx: Facts, uses: List<Operand>, after: Live) -> Plan = {
-  let ops = expanded(fx, uses);
-  let touched = ops.fold([], |acc: List<Var>, o: Operand|
-    match var_of(o.arg) {
-      Some(v) -> if !counted(v.rep) { acc } else {
-        match base_var(fx, v) { Some(b) -> listed(listed(acc, v), b), None -> listed(acc, v) }
+  let t = expanded(fx, uses).fold(
+    { order: [], listed: Map::new(), taken: Map::new(), read: Map::new() },
+    |acc: Touched, o: Operand|
+      match var_of(o.arg) {
+        Some(v) -> {
+          let used = if o.takes {
+            { ..acc, taken: acc.taken.insert(v.id, consumed(acc, v.id) + 1) }
+          } else {
+            let b = base_of(fx, v);
+            {
+              ..acc,
+              read: if b >= 0 { acc.read.insert(v.id, true).insert(b, true) }
+              else { acc.read.insert(v.id, true) },
+            }
+          };
+          if !counted(v.rep) { used } else {
+            match base_var(fx, v) { Some(b) -> listed(listed(used, v), b), None -> listed(used, v) }
+          }
+        },
+        None -> acc,
       },
-      None -> acc,
-    });
-  touched.fold({ incs: [], before: [], after: [], live: after }, |p: Plan, t: Var| {
-    let taken = ops.count(|o: Operand| o.takes && is_var(o.arg, t.id));
-    let during = ops.any(|o: Operand| !o.takes && reads(fx, o.arg, t.id));
-    let live = after.contains(t.id);
-    let held = { ..p, live: p.live.insert(t.id, t) };
-    if !owns(fx, t) { counts_for(held, t, taken) } else if live || during {
-      counts_for({ ..held, after: if live { held.after } else { held.after.push(t) } }, t, taken)
-    } else if taken > 0 { counts_for(held, t, taken - 1) }
-    else { { ..held, before: held.before.push(t) } }
+  );
+  t.order.fold({ incs: [], before: [], after: [], live: after }, |p: Plan, x: Var| {
+    let taken = consumed(t, x.id);
+    let live = after.contains(x.id);
+    let held = { ..p, live: p.live.insert(x.id, x) };
+    if !owns(fx, x) { counts_for(held, x, taken) } else if live || t.read.contains(x.id) {
+      counts_for({ ..held, after: if live { held.after } else { held.after.push(x) } }, x, taken)
+    } else if taken > 0 { counts_for(held, x, taken - 1) }
+    else { { ..held, before: held.before.push(x) } }
   })
 }
 
-fn listed(vs: List<Var>, v: Var) -> List<Var> =
-  if vs.any(|x: Var| x.id == v.id) { vs } else { vs.push(v) }
+/// An instruction's operands read once: the counted variables they use, each first in the order
+/// they are named and followed by what it is read out of (`listed` holding the same as a set), how
+/// many times each operand is consumed, and which are read without being consumed, directly or
+/// through a value read out of them.
+type Touched = {
+  order: List<Var>,
+  listed: Map<Int, Bool>,
+  taken: Map<Int, Int>,
+  read: Map<Int, Bool>,
+}
+
+fn consumed(t: Touched, id: Int) -> Int = match t.taken.get(id) { Some(n) -> n, None -> 0 }
+
+/// `t` with `v` last in its order, unless it is there already.
+fn listed(t: Touched, v: Var) -> Touched =
+  if t.listed.contains(v.id) { t }
+  else { { ..t, order: t.order.push(v), listed: t.listed.insert(v.id, true) } }
 
 fn counts_for(p: Plan, v: Var, n: Int) -> Plan =
   if n > 0 { { ..p, incs: p.incs.push(Inc({ var: v, n: n })) } } else { p }
-
-fn is_var(a: Arg, id: Int) -> Bool = match a { AVar(v) -> v.id == id, _ -> false }
-
-/// Whether reading operand `a` reads variable `id`: it is that variable, or read out of it.
-fn reads(fx: Facts, a: Arg, id: Int) -> Bool =
-  match a { AVar(v) -> v.id == id || base_of(fx, v) == id, _ -> false }
 
 /// What the failure path of an instruction releases: the owned values live after it and those it
 /// reads that die after it, but what a `handle` around it holds across its body.
@@ -2081,4 +2137,85 @@ test "a handle inside another's body releases at its landing only what the outer
     refused_with(f, [outer([t, p], [p]), Dec(p), Return(AVar(a))]),
     Some(b"a handle whose landing releases other than what it holds across its body"),
   )
+}
+
+/// A body of `n` straight-line steps, each `step(i)`, answering `p`.
+fn steps(p: Var, n: Int, step: (Int) -> List<Inst>) -> Fn =
+  root_of(
+    [p],
+    [],
+    RWord,
+    range(0, n).fold([], |body: List<Inst>, i: Int| body.concat(step(i))).push(Return(AVar(p))),
+  )
+
+fn log_linear(n: Int) -> Int = n * (ilog2(n) + 1)
+
+test "the words of the flat values a body makes are read off in one walk, however many it makes" {
+  let p = word(0);
+  let made = |i: Int| {
+    let s = flat(3 * i + 1, [RWord, RWord]);
+    let y = word(3 * i + 2);
+    [
+      bind(s, Gathered({ parts: [AVar(p), AVar(p)] }), []),
+      leaf(y, s, 0),
+      bind(word(3 * i + 3), call_of([AVar(y)], [0]), []),
+    ]
+  };
+  assert_eq(facts_of(steps(p, 2, made)).opened.len(), 2);
+  paced(log_linear, |n: Int| facts_of(steps(p, n, made)).opened.len())
+}
+
+test "the words of a flat value are typed in one walk of its reads, however wide it is" {
+  let p = word(0);
+  let wide = |n: Int| {
+    let s = flat(1, range(0, n).map(|_: Int| RWord));
+    root_of(
+      [p],
+      [],
+      RWord,
+      [bind(s, Gathered({ parts: range(0, n + 1).map(|_: Int| AVar(p)) }), [])].concat(
+        range(0, n).map(|k: Int| leaf(word(k + 2), s, k)),
+      ).push(
+        Return(AVar(p)),
+      ),
+    )
+  };
+  assert_eq(
+    match facts_of(wide(2)).opened.get(1) { Some(ws) -> ws.map(|w: Var| w.ty), None -> [] },
+    [word(2).ty, word(3).ty, unknown_type()],
+  );
+  paced(log_linear, |n: Int| facts_of(wide(n)).opened.len())
+}
+
+test "an instruction's operands are counted in one walk, however many it names" {
+  let planned_over = |n: Int| {
+    let ps = range(0, n).map(|i: Int| word(i));
+    let ops = ps.map(|p: Var| { arg: AVar(p), takes: true }).concat(
+      ps.map(|p: Var| { arg: AVar(p), takes: false }),
+    );
+    planned(facts_of(root_of(ps, [], RWord, [])), ops, Map::new())
+  };
+  // Each is consumed and read, so it takes a count first and dies after the instruction.
+  assert_eq(planned_over(2).incs, [Inc({ var: word(0), n: 1 }), Inc({ var: word(1), n: 1 })]);
+  assert_eq(planned_over(2).after, [word(0), word(1)]);
+  paced(log_linear, |n: Int| planned_over(n).incs.len())
+}
+
+test "the fields a body takes out of its blocks are found in one walk, however many it reads" {
+  let p = word(0);
+  let read = |i: Int| {
+    let o = word(3 * i + 1);
+    let x = word(3 * i + 2);
+    [
+      bind(o, call_of([], []), []),
+      bind(x, Get({ of: o, path: PField({ name: b"f", at: 0 }) }), []),
+      bind(word(3 * i + 3), call_of([AVar(x)], []), []),
+    ]
+  };
+  let taken = |f: Fn|
+    f.body.filter(|i: Inst|
+      match i { Let(l) -> match l.val { Take(_) -> true, _ -> false }, _ -> false }).len(
+    );
+  assert_eq(taken(took(steps(p, 2, read))), 2);
+  paced(log_linear, |n: Int| taken(took(steps(p, n, read))))
 }
