@@ -2,6 +2,7 @@
 //! closures, function values, bodies run in place, steps and tail groups.
 
 import check.resolve.tables (qualify)
+import check.infer.checker (test_owner, law_root)
 import check.types (Type, TyCon, int_type)
 import emit.keys (Named, Root, Generic)
 import emit.reps (typed_at)
@@ -20,8 +21,8 @@ import emit.answer (GenericCall)
 import emit.verify (verified)
 import emit.own (owned)
 import emit.roots (FnArg, symbol_of, specialised_with)
-import emit.compare (Program, Hunk, program_of, answered_today, today_text, printed_text,
-                     normalised, past_counts, hunks)
+import emit.compare (Program, Hunk, program_of, answered_today, answered_by_form, today_text,
+                     printed_text, normalised, past_counts, hunks)
 
 fn corpus() -> Bytes =
   Bytes::concat_all([
@@ -732,6 +733,82 @@ test "a lent lambda run where its arguments and captures arrive as a type variab
       )
     },
   }
+}
+
+test "a closure a root writes calls a lambda the root was lent through its closure, as a function value" {
+  let src = Bytes::concat_all([
+    b"fn twice_each<T>(xs: List<T>, f: (T) -> T) -> List<T> = xs.map(|x: T| f(f(x)))\n",
+    b"fn bumped(xs: List<Int>) -> List<Int> = twice_each(xs, |n: Int| n + 1)\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match lent_run(p, b"bumped", b"twice_each", [int_type()], 1) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(run) ->
+        assert_eq(
+          range(0, run.f.lambdas.len()).map(|k: Int|
+            match closure_of(run.f, k) {
+              Some(c) ->
+                vals_in(c.body.body).filter(|v: Val| match v { Apply(_) -> true, _ -> false }).len(
+                ),
+              None -> 0,
+            }),
+          [2],
+        ),
+    },
+  }
+}
+
+/// `std.cases` as far as a test over cases, once expanded, calls it.
+fn cases_module() -> { name: Bytes, src: Bytes } =
+  {
+    name: b"std.cases",
+    src: Bytes::concat_all([
+      b"pub type Table<a> = List<a>\n",
+      b"pub type Listed = { label: String, identity: Bytes }\n",
+      b"pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / {abort.raise | e} =\n",
+      b"  table.map(|c: a| { label: label(c), identity: b\"\" })\n",
+      b"pub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a / {abort.raise} =\n",
+      b"  match table.at(at) { Some(c) -> c, None -> panic(\"no case\") }\n",
+    ]),
+  }
+
+/// Whether the form lowered root `root` of module `m` of text `src`, which imports `shipped`, or why
+/// not.
+fn formed_root(
+  src: Bytes,
+  shipped: List<{ name: Bytes, src: Bytes }>,
+  root: Bytes,
+) -> Result<Bool, Bytes> / {abort.raise} =
+  match answered_by_form(src, shipped, root) {
+    Err(why) -> Err(why),
+    Ok(text) -> if text.starts_with(b"/* ply-form-") {
+      Err(text.slice(0, match text.index_of(b"*/") { Some(e) -> e, None -> 0 }))
+    } else { Ok(true) },
+  }
+
+test "a test over cases reads its case at the case's type, which its generic callees' sites agree on" {
+  let src = Bytes::concat_all([
+    b"type Fixture = { name: String, unified: String }\n",
+    b"fn fixtures() -> List<Fixture> = [{ name: \"a\", unified: \"\" }]\n",
+    b"test \"each case's text is empty\" for f: Fixture in fixtures() { assert(f.unified == \"\") }\n",
+  ]);
+  assert_eq(
+    formed_root(src, [cases_module()], test_owner(b"m", b"each case's text is empty")),
+    Ok(true),
+  )
+}
+
+test "a law's binders are its roots' parameters at the types the checker gave them" {
+  let src = Bytes::concat_all([
+    b"type Few = | Zero | One | Two\n",
+    b"law \"two that differ differ\"\n  forall (a: Few, b: Few) where a != b {\n    a != b\n  }\n",
+  ]);
+  let root = |part: Bytes| law_root(b"m", b"two that differ differ", part);
+  assert_eq([root(b"guard"), root(b"body")].map(|r: Bytes| formed_root(src, [], r)), [
+    Ok(true),
+    Ok(true),
+  ])
 }
 
 /// The corpus's roots `names` lowered as one tail group, or why not.
