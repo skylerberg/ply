@@ -1,6 +1,6 @@
 //! The ownership pass and the check over forms the lowering writes from program text.
 
-import emit.tir (Inst, Block, Inc, Reset, If, Case, Match, Loop, Handle)
+import emit.tir (Inst, Block, Let, Make, Inc, Reset, If, Case, Match, Loop, Handle)
 import emit.compare (program_of, formed, checked, printed_by_form)
 import emit.own (owned)
 import emit.verify (verified)
@@ -204,5 +204,47 @@ test "a field read out of a payload read out of a parameter's field keeps the pa
           match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) }),
         [],
       ),
+  }
+}
+
+/// Buffers appended to through a record or a constructor this body holds alone, as `emit.cases`'
+/// buffer test writes them.
+fn buffers() -> Bytes =
+  Bytes::concat_all([
+    b"type S = { out: Bytes, n: Int }\n",
+    b"type W = { out: Bytes, n: Int, a: Int, b: Int, c: Int }\n",
+    b"type T = | T(Bytes, Int)\n",
+    b"fn ctor(t: T, fuel: Int) -> Bytes = match t { T(out, n) -> if n <= 0 || fuel <= 0 { out } else { ctor(T(out ++ b\"x\", n - 1), fuel - 1) } }\n",
+    b"fn iterated(n: Int) -> Bytes / {abort.raise} = iterate({ out: b\"\", n: n }, n + 1, |s: S| if s.n <= 0 { Stop(s.out) } else { Continue({ out: s.out ++ b\"x\", n: s.n - 1 }) })\n",
+    b"fn widened(n: Int) -> Bytes / {abort.raise} = iterate({ out: b\"\", n: n, a: 0, b: 0, c: 0 }, n + 1, |s: W| if s.n <= 0 { Stop(s.out) } else { Continue({ out: s.out ++ b\"x\", n: s.n - 1, a: s.a, b: s.b, c: s.c }) })\n",
+    b"fn guarded(t: T, k: Int) -> Bytes = match t { T(out, n) if n > k -> out ++ b\"y\", T(out, _) -> out }\n",
+  ])
+
+/// How often `b` takes a count, resets a block and makes one in a block it reset.
+fn reuse_of(b: Block) -> { incs: Int, resets: Int, reused: Int } = {
+  let all = insts(b);
+  {
+    incs: all.filter(|i: Inst| match i { Inc(_) -> true, _ -> false }).len(),
+    resets: all.filter(|i: Inst| match i { Reset(_) -> true, _ -> false }).len(),
+    reused: all.filter(|i: Inst|
+      match i { Let(l) -> match l.val { Make(m) -> m.reuse != None, _ -> false }, _ -> false }).len(
+    ),
+  }
+}
+
+test "a buffer appended to through a value held alone is handed on with no count taken, its cells reused" {
+  match program_of(buffers()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let counts = |n: Bytes|
+        match checked(p, n) { Ok(f) -> Ok(reuse_of(f.body)), Err(why) -> Err(why) };
+      // The node matched lends its cells to the one rebuilt past the short circuit, and its buffer is
+      // taken out of it.
+      assert_eq(counts(b"ctor"), Ok({ incs: 0, resets: 1, reused: 1 }));
+      // A loop's state opened at each pass moves its buffer on, however many fields ride with it.
+      assert_eq(counts(b"iterated"), Ok({ incs: 0, resets: 0, reused: 0 }));
+      assert_eq(counts(b"widened"), Ok({ incs: 0, resets: 0, reused: 0 }));
+      match checked(p, b"guarded") { Ok(_) -> (), Err(why) -> assert_eq(why, b"") }
+    },
   }
 }
