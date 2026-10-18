@@ -5,7 +5,8 @@
 
 import emit.code (Code, Node, NVar, NKnown, NLambda, NApp, NUnary, NBinary, NField, NIf, NBlock,
                   NList, NRecord, NUpdate, NMatch, NPerform, NSimulate, NParallel, NHandle, Lambda,
-                  Capture, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm, CodeClause)
+                  Capture, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm, CodeClause, PxList,
+                  PxVar)
 import check.types (Type, TyFn, TyVar, TyCon, Scheme, spelled_type, int_type, bool_type)
 import emit.typing (unknown_type)
 import syntax.parsing (Span, span_key, starts_upper, dummy_span, read_site)
@@ -18,11 +19,11 @@ import emit.c (KBoxed)
 import emit.roots (FnArg, specialisation_of, own_definition)
 import emit.keys (Named, Callee, Root, Generic, root_name)
 import emit.tir
-import emit.tir (Rep, RInt, RBool, RWord, Var, Arg, AVar, AInt, AZero, Given, Convention, Val, Prim,
-                 Make, Get, Pack, Native, Op, OCalling, MClosure, MCtor, PCapture, TTag, TInt, Call,
-                 Apply, Inst, Let, Do, Decl, Assign, If, Case, Match, Loop, Next, Done, Restart,
-                 Enter, Return, Fail, NoArm, Sited, Block, Fn, Rooted, Member, Closure, Declined,
-                 Calling, no_links, falls_through, rep_of_arg)
+import emit.tir (Rep, RInt, RBool, RWord, RSlice, Var, Arg, AVar, AInt, AZero, Given, Convention,
+                 Val, Prim, Make, Get, Pack, Native, Op, OCalling, MClosure, MCtor, PCapture, TTag,
+                 TInt, Call, Apply, Inst, Let, Do, Decl, Assign, If, Case, Match, Loop, Next, Done,
+                 Restart, Enter, Return, Fail, NoArm, Sited, Block, Fn, Rooted, Member, Closure,
+                 Declined, Calling, no_links, falls_through, rep_of_arg)
 import emit.tir.calling (EntryValue, ConstantRead, BuiltinValue, Ticked)
 import emit.lower.setting (Setting, Root, imported_target, qualified)
 import emit.lower.held (held_as, carried_as, arg_path)
@@ -35,8 +36,8 @@ import emit.lower.data (constructed)
 import emit.lower.containers (scalar_builtin)
 
 /// The context root `r` of `setting`, a definition of its own, lowers `body` under.
-pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.raise} =
-  lending({
+pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.raise} = {
+  let cx = lending({
     setting: setting,
     key: Named(r.full),
     full: r.full,
@@ -46,14 +47,16 @@ pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.rai
     answer: r.answer,
     answer_ty: r.answer_ty,
     body: body,
-    tails: Restarts,
+    tails: Restarts([]),
     param_at: range(0, r.params.len()).fold(Map::new(), |m: Map<Int, Int>, i: Int| m.insert(i, i)),
     lender: None,
     observing: false,
     frame: dummy_span(),
     lends: false,
     written: [],
-  })
+  });
+  { ..cx, tails: Restarts(walked_as(cx)) }
+}
 
 /// `cx` with whether its root lends its lambdas read under its setting, and what it lends then.
 fn lending(cx: Context) -> Context / {abort.raise} = {
@@ -67,6 +70,73 @@ pub fn convention(cx: Context) -> Convention =
     params: cx.params.map(|_: EmitParam| Given),
     reps: cx.params.map(|p: EmitParam| carried_as(p.carrier)),
     answer: carried_as(cx.answer),
+  }
+
+/// How the root's body holds its parameters, which a restart hands its arguments to.
+pub fn params_held(cx: Context) -> List<Rep> =
+  match cx.tails { Restarts(reps) -> reps, _ -> convention(cx).reps }
+
+/// How the root's body holds its parameters: as its convention takes them, but a list the body walks
+/// down by restarting on a rest of it, which it holds as a view of the list it was handed, so each
+/// step reads the same list further on and copies nothing.
+fn walked_as(cx: Context) -> List<Rep> / {abort.raise} = {
+  let reps = convention(cx).reps;
+  range(0, reps.len()).map(|i: Int|
+    match reps.at(i) {
+      Some(RWord) -> match cx.types.at(i) {
+        Some(TyCon(c)) -> if c.name == b"List" && walks(cx, cx.body, i) { RSlice } else { RWord },
+        _ -> RWord,
+      },
+      Some(r) -> r,
+      None -> RWord,
+    })
+}
+
+/// Whether `c`, in tail position, matches parameter `i` against a list pattern whose rest a self call
+/// in tail position in that arm hands back as its argument `i`.
+fn walks(cx: Context, c: Code, i: Int) -> Bool / {abort.raise} =
+  match c.node {
+    NIf(x) -> walks(cx, x.then_branch, i) || walks(cx, x.else_branch, i),
+    NBlock(b) -> match b.tail { Some(t) -> walks(cx, t, i), None -> false },
+    NBinary(b) -> (b.op == b"and" || b.op == b"or") && walks(cx, b.rhs, i),
+    NMatch(m) -> {
+      let on_param = match m.scrutinee.node { NVar(v) -> v.slot == Some(i), _ -> false };
+      m.arms.fold(false, |found: Bool, a: CodeArm|
+        found || walks(cx, a.body, i)
+          || (on_param
+          && (match a.pat {
+            PxList(l) -> match l.rest {
+              Some(PxVar(r)) -> match r.slot {
+                Some(s) -> hands_back(cx, a.body, i, s),
+                None -> false,
+              },
+              _ -> false,
+            },
+            _ -> false,
+          })))
+    },
+    _ -> false,
+  }
+
+/// Whether `c`, in tail position, calls the root's own definition with slot `r` as its argument `i`.
+fn hands_back(cx: Context, c: Code, i: Int, r: Int) -> Bool / {abort.raise} =
+  match c.node {
+    NApp(a) ->
+      a.args.len() == cx.params.len()
+        && (match a.args.at(i) {
+          Some(x) -> match x.node { NVar(v) -> v.slot == Some(r), _ -> false },
+          None -> false,
+        })
+        && (match target(cx, a.func, a.args) {
+          Some(ToDef(full)) -> own_definition(cx.full) == full,
+          _ -> false,
+        }),
+    NIf(x) -> hands_back(cx, x.then_branch, i, r) || hands_back(cx, x.else_branch, i, r),
+    NBlock(b) -> match b.tail { Some(t) -> hands_back(cx, t, i, r), None -> false },
+    NBinary(b) -> (b.op == b"and" || b.op == b"or") && hands_back(cx, b.rhs, i, r),
+    NMatch(m) ->
+      m.arms.fold(false, |found: Bool, a: CodeArm| found || hands_back(cx, a.body, i, r)),
+    _ -> false,
   }
 
 /// What the call of `func` on `args` calls: a lambda known to the slot it reads, run in place where
@@ -625,12 +695,23 @@ fn tail_fused(b: Block, j: Var, e: Ended) -> Option<Pass> = {
       match a.arg {
         AVar(x) -> match b.at(n - 2) {
           Some(Let(l)) -> if l.var != x { None } else { ending(b.take(n - 2), l.val, e) },
-          _ -> None,
+          // Set from a join of its own, as an `if` in a `match` arm sets it: that join's paths end.
+          Some(i) -> if !before.contains(Decl(x)) { None }
+          else { last_fused(b.take(n - 2).filter(|y: Inst| y != Decl(x)), i, x, e) },
+          None -> None,
         },
         _ -> None,
       }
     },
-    Some(If(x)) -> match tail_fused(x.then, j, e) {
+    Some(i) -> last_fused(before, i, j, e),
+    None -> None,
+  }
+}
+
+/// `before` followed by `last`, as `tail_fused` makes a block of them.
+fn last_fused(before: Block, last: Inst, j: Var, e: Ended) -> Option<Pass> =
+  match last {
+    If(x) -> match tail_fused(x.then, j, e) {
       None -> None,
       Some(t) -> match tail_fused(x.otherwise, j, { ..e, next: t.next }) {
         None -> None,
@@ -641,7 +722,7 @@ fn tail_fused(b: Block, j: Var, e: Ended) -> Option<Pass> = {
           }),
       },
     },
-    Some(Case(c)) -> {
+    Case(c) -> {
       let arms = c.arms.fold(
         Some({ arms: [], next: e.next }),
         |got: Option<{ arms: List<{ when: Int, body: Block }>, next: Int }>, arm: { when: Int, body: Block }|
@@ -663,7 +744,7 @@ fn tail_fused(b: Block, j: Var, e: Ended) -> Option<Pass> = {
         },
       }
     },
-    Some(Match(m)) -> {
+    Match(m) -> {
       let arms = m.arms.fold(
         Some({ arms: [], next: e.next }),
         |got: Option<{ arms: List<Block>, next: Int }>, arm: Block|
@@ -684,9 +765,11 @@ fn tail_fused(b: Block, j: Var, e: Ended) -> Option<Pass> = {
         },
       }
     },
-    _ -> if falls_through(b) { None } else { Some({ block: b, next: e.next }) },
+    _ -> {
+      let b = before.push(last);
+      if falls_through(b) { None } else { Some({ block: b, next: e.next }) }
+    },
   }
-}
 
 /// `b` ended by the step's answer made as `val`: a `Continue`'s argument the next pass's state, a
 /// `Stop`'s the loop's answer.
@@ -1217,7 +1300,7 @@ fn jumped(
   if cx.tails == Calls { None }
   else if own_definition(cx.full) == d.full && args.len() == cx.params.len()
       && owns(cx, d, ref, fn_args(cx, codes)) {
-    let h = handed_all(st, args, convention(cx).reps, at);
+    let h = handed_all(st, args, params_held(cx), at);
     Some({ st: emitted(h.st, Restart(h.args)), arg: AZero(held_as(cx.setting, cx.answer_ty)) })
   } else {
     match cx.tails {
