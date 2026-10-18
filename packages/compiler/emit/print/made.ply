@@ -14,7 +14,7 @@ import emit.pieces (Piece, Text, Hole, ShapeOf, TagOf, spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases,
                  RSlice, RToken, Leaf, Var, Arg, AVar, AInt, AZero, Made, MRecord, MCtor, Path,
                  PField, PNamed, PArg, PCapture, PLeaf, Data, rep_of_arg, rep_said, var_said,
-                 made_said)
+                 made_said, parts_of, parts_count)
 import emit.lower.held (tail_bits, fields_of, leaves_of, slot_kind, case_leaves_all, case_span,
                         enumerated)
 import emit.print.text (Printing, Place, printing, line, pieces, pad, temp, named, name_of,
@@ -697,38 +697,28 @@ pub fn got(
     None -> pr,
     Some(v) -> {
       let base = name_of(pr, g.of);
+      let at_offset = |read: (Bytes) -> Printing / {abort.raise}|
+        if parts_count(g.of.rep) != 1 {
+          unprinted(
+            Data,
+            b"a field read at its offset out of a value held as several C values",
+            var_said(g.of),
+          )
+        } else { read(base) };
       match g.path {
         PLeaf(k) -> { declared_as(p, pr, v, [part_named(base, g.of.rep, k)]) },
-        PField(f) -> loaded(p, pr, v, base, f.at),
-        PArg(a) -> match g.of.rep {
-          RMaybe -> payload(p, pr, v, base),
-          RTagged ->
-            payload(p, pr, v, if a.ctor == b"Err" {
-              Bytes::concat_all([b"(", base, b" & ~(Word)7)"])
-            } else { base }),
-          _ -> loaded(p, pr, v, base, a.at),
-        },
-        PNamed(name) -> {
-          let f = field_hole(pr, name);
-          let n = named(f.pr, v);
-          check(
-            p,
-            pieces(n.pr, [
-              Text(
-                Bytes::concat_all([
-                  pad(p.depth),
-                  b"Word ",
-                  n.name,
-                  b" = rt_field_p(ctx, ",
-                  base,
-                  b", ",
-                ]),
-              ),
-              f.piece,
-              Text(b", 0);\n"),
-            ]),
-          )
-        },
+        PField(f) -> at_offset(|b: Bytes| loaded(p, pr, v, b, f.at)),
+        PArg(a) ->
+          at_offset(|b: Bytes|
+            match g.of.rep {
+              RMaybe -> payload(p, pr, v, b),
+              RTagged ->
+                payload(p, pr, v, if a.ctor == b"Err" {
+                  Bytes::concat_all([b"(", b, b" & ~(Word)7)"])
+                } else { b }),
+              _ -> loaded(p, pr, v, b, a.at),
+            }),
+        PNamed(name) -> by_name(p, pr, v, g.of, name),
         PCapture(k) ->
           unprinted(
             Data,
@@ -738,6 +728,64 @@ pub fn got(
       }
     },
   }
+
+/// `v`, field `name` of `of` as the runtime reads it by name, with a count of its own, and opened as
+/// `v` holds it: out of `of`'s word, or where `of` is a record held as its leaves, out of a word made
+/// of them for the read, which is let go of after it.
+fn by_name(p: Place, pr: Printing, v: Var, of: Var, name: Bytes) -> Printing / {abort.raise} = {
+  let base = name_of(pr, of);
+  let read = match of.rep {
+    RFlat(_) -> {
+      let parts = part_names(base, of.rep);
+      let reps = parts_of(of.rep);
+      let held = range(0, parts.len()).map(|k: Int|
+        { rep: match reps.at(k) { Some(r) -> r, None -> RWord }, expr: nth(parts, k) });
+      let t = temp(pr);
+      // The word takes the leaves' counts, so each is held once more for it.
+      let w = parts_word(t.pr, t.name, parts, of.rep);
+      {
+        pr: pieces(
+          line(w.pr, p.depth, trimmed_end(counted_incs(held))),
+          [Text(pad(p.depth))].concat(w.prep).push(Text(b"\n")),
+        ),
+        word: w.word,
+        made: true,
+      }
+    },
+    r -> if parts_count(r) != 1 {
+      unprinted(Data, b"a field read by name out of a value held as several C values", var_said(of))
+    } else { { pr: pr, word: base, made: false } },
+  };
+  let f = field_hole(read.pr, name);
+  let into = if v.rep == RWord { named(f.pr, v) } else { temp(f.pr) };
+  let fetched = check(
+    p,
+    pieces(into.pr, [
+      Text(
+        Bytes::concat_all([
+          pad(p.depth),
+          b"Word ",
+          into.name,
+          b" = rt_field_p(ctx, ",
+          read.word,
+          b", ",
+        ]),
+      ),
+      f.piece,
+      Text(if read.made { Bytes::concat_all([b", 0); ply_dec(ctx, ", read.word, b");\n"]) }
+      else { b", 0);\n" }),
+    ]),
+  );
+  if v.rep == RWord { fetched } else {
+    let n = named(fetched, v);
+    pieces(
+      n.pr,
+      [Text(pad(p.depth))].concat(word_parts(into.name, v.rep, part_names(n.name, v.rep))).push(
+        Text(b"\n"),
+      ),
+    )
+  }
+}
 
 /// `v` read out of the payload's word `w` of a sum held as one word, which it borrows: the word, or
 /// a scalar it holds read out of it. Anything else a payload holds is its word's to open, which
@@ -1789,6 +1837,27 @@ test "a flat record's word is made of its leaves where none was, and its leaves 
       )
       != None,
   )
+}
+
+test "a field read by name out of a record held as its leaves is read out of a word made of them" {
+  let leaves = RFlat([{ name: b"n", rep: RInt }, { name: b"s", rep: RWord }]);
+  let pr = printing(Map::new().insert(0, b"p0"));
+  let read = |of: Var, into: Var|
+    spelled(got(place(), pr, Some(into), { of: of, path: PNamed(b"s") }).out);
+  let holds = |text: Bytes, runs: List<Bytes>|
+    assert(runs.all(|r: Bytes| text.index_of(r) != None), Some(String::of_bytes_lossy(text)));
+  // Each counted leaf and the word are held once more for the word the read lets go of.
+  holds(read(local(0, leaves), local(1, RWord)), [
+    b"  ply_inc(p0_1); ply_inc(p0_2);\n  Word t1 = p0_2; if (t1) { ply_dec(ctx, p0_1); } else { t1 = rt_alloc_p(",
+    b"\n  Word t2 = rt_field_p(ctx, t1, ",
+    b", 0); ply_dec(ctx, t1);\n  if (ctx->failed) return 0;\n",
+  ]);
+  // A value held as several C values is opened out of the word the read answers.
+  holds(read(local(0, RWord), local(1, leaves)), [
+    b"  Word t1 = rt_field_p(ctx, p0, ",
+    b", 0);\n  if (ctx->failed) return 0;\n  int64_t t2_0 = ",
+    b" Word t2_1 = ply_words(t1)[1]; ply_inc(t2_1); Word t2_2 = t1;\n",
+  ])
 }
 
 test "a sum held as one word is gathered from its constructor's index and payload" {
