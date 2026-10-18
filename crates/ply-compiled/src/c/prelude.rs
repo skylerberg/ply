@@ -1,9 +1,9 @@
 //! The C every emitted unit opens with. It mirrors `heap.rs` and `rt.rs`, and
 //! `the_prelude_agrees_with_the_layouts_it_mirrors` checks it against them.
 
-use crate::emitted::{Block, DropRoot, Handed};
+use crate::emitted::{Block, DropRoot, Handed, Handle, PlyOp, PlyType};
 use crate::heap::Word;
-use crate::native::{Native, Raising};
+use crate::native::{Addr, F64, I64, Native, Out, Raising, Signature};
 use crate::rt::Ctx;
 
 /// `rt_*` is declared, not defined: `ply_bind` supplies the addresses after `dlopen`, since a
@@ -206,11 +206,87 @@ impl Helper {
     fn of<F: Native>(name: &'static str, f: F) -> Helper {
         Helper {
             name,
-            args: F::SIGNATURE.words,
-            answers: F::SIGNATURE.answers,
+            args: F::SIGNATURE.words(),
+            answers: F::SIGNATURE.answers(),
             address: f.address(),
         }
     }
+}
+
+/// A native the compiler declares itself over machine data, under the name it declares and with
+/// its function's signature; bound as the helper [`builtin_helper_name`] names for it.
+pub struct MachineNative {
+    pub name: &'static str,
+    pub signature: Signature,
+    pub helper: Helper,
+}
+
+macro_rules! machine {
+    ($($name:literal => $f:ident($($t:ty),*) $(-> $r:ty)?;)*) => {
+        fn machine_table() -> Vec<MachineNative> {
+            vec![$({
+                let f: unsafe extern "C" fn(*mut Ctx $(, $t)*) $(-> $r)? = crate::rt::$f;
+                let helper = Box::leak(builtin_helper_name($name).into_boxed_str());
+                MachineNative {
+                    name: $name,
+                    signature: signature_of(f),
+                    helper: Helper::of(helper, f),
+                }
+            }),*]
+        }
+    };
+}
+
+fn signature_of<F: Native>(_: F) -> Signature {
+    F::SIGNATURE
+}
+
+machine! {
+    "?out_tag" => rt_out_tag(I64);
+    "?out_int" => rt_out_int(I64);
+    "?out_float" => rt_out_float(F64);
+    "?out_decimal" => rt_out_decimal(I64, I64);
+    "?out_fixed" => rt_out_fixed(I64, I64, I64);
+    "?out_char" => rt_out_char(I64);
+    "?out_str" => rt_out_str(Addr, I64);
+    "?out_bytes" => rt_out_bytes(Addr, I64);
+    "?out_count" => rt_out_count(I64, I64);
+    "?out_ctor" => rt_out_ctor(Addr, I64, I64);
+    "?out_name" => rt_out_name(Addr, I64);
+    "?out_handle" => rt_out_handle(Handle);
+    "?out_carried" => rt_out_carried(Handed, *const PlyType);
+    "?out_fun" => rt_out_fun(Addr, I64);
+    "?out_again" => rt_out_again(Handed) -> I64;
+    "?in_tag" => rt_in_tag() -> I64;
+    "?in_int" => rt_in_int() -> I64;
+    "?in_float" => rt_in_float() -> F64;
+    "?in_decimal" => rt_in_decimal(Out);
+    "?in_fixed" => rt_in_fixed(I64, Out);
+    "?in_char" => rt_in_char() -> I64;
+    "?in_str" => rt_in_str() -> I64;
+    "?in_bytes" => rt_in_bytes() -> I64;
+    "?in_count" => rt_in_count(I64) -> I64;
+    "?in_field" => rt_in_field(Addr, I64);
+    "?in_name_is" => rt_in_name_is(Addr, I64) -> I64;
+    "?in_handle" => rt_in_handle() -> Handle;
+    "?in_fun" => rt_in_fun(Out) -> I64;
+    "?lower_open" => rt_lower_open(I64);
+    "?lower_close" => rt_lower_close() -> I64;
+    "?lift_open" => rt_lift_open(Addr, I64);
+    "?lift_close" => rt_lift_close();
+    "?taken" => rt_taken(Addr, I64);
+    "?handler_typed" => rt_handler_typed(I64, Handed, *const PlyType);
+    "?handler_get" => rt_handler_get(I64) -> Handed;
+    "?handler_put" => rt_handler_put(I64, Handed);
+    "?cost_mark" => rt_cost_mark(Out);
+    "?cost_spent" => rt_cost_spent(Out);
+    "?performs_since" => rt_performs_since(I64);
+}
+
+/// The natives the compiler declares itself over machine data.
+pub fn machine_natives() -> &'static [MachineNative] {
+    static ALL: std::sync::OnceLock<Vec<MachineNative>> = std::sync::OnceLock::new();
+    ALL.get_or_init(machine_table)
 }
 
 /// A helper's parameter as its function takes it: a `Word` unless written otherwise.
@@ -328,6 +404,16 @@ helpers! {
     rt_released_twice(o: Block);
     rt_release_later(w: Handed, root: DropRoot);
     rt_release_drain();
+    rt_dispatch(op: *const PlyOp, resource: I64, mode: I64, args: *const Handed) -> Handed;
+    rt_handle_install(clauses: *const Word, n: I64, ret: Handed) -> I64;
+    rt_handle_install_detached(clauses: *const Word, n: I64, ret: Handed, body: Block) -> Handed;
+    rt_with_cleanup(
+        acquire: Block,
+        body: Block,
+        cleanup: Block,
+        held: *const PlyType,
+        answer: *const PlyType
+    ) -> Handed;
 }
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since
@@ -340,7 +426,8 @@ pub fn builtin_helper_name(builtin: &str) -> String {
     }
 }
 
-/// Every helper a unit may bind: the runtime's own, then one a builtin.
+/// Every helper a unit may bind: the runtime's own, then one a builtin, then one a native over
+/// machine data.
 pub fn helpers() -> &'static [Helper] {
     static ALL: std::sync::OnceLock<Vec<Helper>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
@@ -348,12 +435,13 @@ pub fn helpers() -> &'static [Helper] {
             let signature = crate::rt::signature(*b);
             Helper {
                 name: Box::leak(builtin_helper_name(b.name()).into_boxed_str()),
-                args: signature.words,
-                answers: signature.answers,
+                args: signature.words(),
+                answers: signature.answers(),
                 address: crate::rt::builtin_address(*b),
             }
         });
-        own().into_iter().chain(builtins).collect()
+        let machine = machine_natives().iter().map(|n| n.helper);
+        own().into_iter().chain(builtins).chain(machine).collect()
     })
 }
 

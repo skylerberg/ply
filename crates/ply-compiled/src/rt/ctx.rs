@@ -110,6 +110,33 @@ pub struct Ctx {
     /// Stops whose continuation's last holder let it go, by body and capture, for the next drain to
     /// drop: never inside the release that let it go.
     pub(crate) continuations_died: Vec<(usize, usize)>,
+    /// The crossings under way, the innermost last.
+    pub(crate) crossings: Vec<Crossing>,
+    /// The bytes a native answered, until compiled code copies them out with [`rt_taken`].
+    pub(crate) taken: Vec<u8>,
+    /// The context running on this thread when this one's entry began, put back when it ends.
+    pub(super) outer_running: *mut Ctx,
+}
+
+thread_local! {
+    /// The context whose entry runs on this thread, for what lets go of a carried value where no
+    /// context is at hand.
+    static RUNNING: std::cell::Cell<*mut Ctx> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// The context whose entry runs on this thread.
+pub(crate) fn running() -> *mut Ctx {
+    let c = RUNNING.with(std::cell::Cell::get);
+    debug_assert!(
+        !c.is_null(),
+        "a carried value was let go of outside an entry"
+    );
+    c
+}
+
+/// Makes `c` the context running on this thread, answering the one that was.
+pub(crate) fn swap_running(c: *mut Ctx) -> *mut Ctx {
+    RUNNING.with(|r| r.replace(c))
 }
 
 impl Ctx {
@@ -168,6 +195,9 @@ impl Ctx {
             outer_instances: None,
             release_later: Vec::new(),
             continuations_died: Vec::new(),
+            crossings: Vec::new(),
+            taken: Vec::new(),
+            outer_running: std::ptr::null_mut(),
         }
     }
 
@@ -367,6 +397,8 @@ impl Ctx {
         self.release_depth = 0;
         self.release_waiting = 0;
         self.release_later.clear();
+        self.crossings.clear();
+        self.taken.clear();
         // Every path out of an entry calls `end`; this catches one that did not.
         if self.heap.allocated() != 0 {
             self.end();
@@ -379,6 +411,7 @@ impl Ctx {
             heap::swap_current(&mut self.heap),
             heap::poison::swap(&raw const self.site_root),
         );
+        self.outer_running = swap_running(self);
         let mine = self.instances();
         self.outer_instances = ply_core::instances::swap(mine);
     }
@@ -435,8 +468,10 @@ impl Ctx {
         );
         heap::poison::swap(self.outer.1);
         heap::swap_current(self.outer.0);
+        swap_running(self.outer_running);
         ply_core::instances::swap(self.outer_instances.take());
         self.outer = (std::ptr::null_mut(), std::ptr::null());
+        self.outer_running = std::ptr::null_mut();
         self.last_entry = self.heap.allocated();
         if std::env::var("PLY_C_PHASES").is_ok() {
             eprintln!(
@@ -556,7 +591,7 @@ impl Ctx {
             return self.fail(d);
         };
         let message = self.word(&Value::str(message));
-        self.bind_raise(at, vec![message], d)
+        self.bind_raise(at, Raised::Words(vec![message]), d)
     }
 
     /// Sends a raise on its way to the clause at `at`, which is handed `args`; `d` is what the
@@ -564,7 +599,7 @@ impl Ctx {
     pub(super) fn bind_raise(
         &mut self,
         at: (usize, usize, usize),
-        args: Vec<Word>,
+        args: Raised,
         d: Diagnostic,
     ) -> i64 {
         let (stack, depth, clause) = at;
@@ -717,7 +752,11 @@ pub(super) fn error(message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(codes::RUNTIME_ERROR, message.into()).primary(Span::DUMMY, "in compiled code")
 }
 
+/// The `n` words at `ptr`, which may be null where `n` is 0.
 pub(super) fn args_of<'a>(ptr: *const i64, n: i64) -> &'a [Word] {
+    if n == 0 {
+        return &[];
+    }
     unsafe { std::slice::from_raw_parts(ptr, n as usize) }
 }
 

@@ -203,14 +203,23 @@ fn values(
     ))
 }
 
-/// Each builtin by its name in the prelude, with what the function compiled code calls it through
-/// takes and answers, as that function's type says.
+/// Each builtin by its name in the prelude, then each native the compiler declares over machine
+/// data, with what the function compiled code calls it through takes and answers, as that
+/// function's type says.
 fn natives() -> impl Iterator<Item = (&'static str, ply_compiled::native::Signature)> {
-    (ply_core::Builtin::all().iter()).map(|b| (b.name(), ply_compiled::rt::signature(*b)))
+    let builtins = ply_core::Builtin::all()
+        .iter()
+        .map(|b| (b.name(), ply_compiled::rt::signature(*b)));
+    let machine = ply_compiled::c::machine_natives()
+        .iter()
+        .map(|n| (n.name, n.signature));
+    builtins.chain(machine)
 }
 
 /// The runtime a unit is compiled against, as [`runtime`] answers it, written as JSON: what a build
-/// of a program for this runtime by another `ply` reads it from.
+/// of a program for this runtime by another `ply` reads it from. Past what [`runtime`] answers,
+/// each native's machine kinds, the offsets of the context's fields compiled code reads, the
+/// descriptors emitted code lays out, and how deeply drop roots nest before a release is put off.
 pub fn runtime_json() -> String {
     use ply_compiled::c;
     serde_json::json!({
@@ -223,17 +232,42 @@ pub fn runtime_json() -> String {
         "natives": natives()
             .map(|(name, s)| serde_json::json!({
                 "name": name,
-                "words": s.words,
-                "answers": s.answers,
+                "words": s.words(),
+                "answers": s.answers(),
                 "raises": s.raises,
+                "params": s.params.iter().map(|m| m.name()).collect::<Vec<_>>(),
+                "answer": s.answer.map(|m| m.name()),
             }))
             .collect::<Vec<_>>(),
         // The natives' names alone, which a `ply` that reads no `natives` emits a builder against.
         "builtins": natives().map(|(name, _)| name).collect::<Vec<_>>(),
         "layouts": layouts_json(),
+        "ctx": offsets(ply_compiled::laid::ctx_fields()),
+        "descriptors": serde_json::Value::Object(
+            ply_compiled::laid::descriptors()
+                .into_iter()
+                .map(|d| {
+                    let described = serde_json::json!({
+                        "size": d.size,
+                        "fields": offsets(d.fields),
+                    });
+                    (d.name.to_string(), described)
+                })
+                .collect(),
+        ),
+        "release_depth": ply_compiled::rt::RELEASE_DEPTH,
         "identity": c::runtime_identity(),
     })
     .to_string()
+}
+
+fn offsets(fields: Vec<(&'static str, usize)>) -> serde_json::Value {
+    serde_json::Value::Object(
+        fields
+            .into_iter()
+            .map(|(name, at)| (name.to_string(), serde_json::json!(at)))
+            .collect(),
+    )
 }
 
 fn layouts_json() -> serde_json::Value {
@@ -309,8 +343,8 @@ fn runtime() -> PlyValue {
                     .map(|(name, s)| {
                         record(vec![
                             ("name", PlyValue::bytes(name)),
-                            ("words", PlyValue::Int(s.words as i64)),
-                            ("answers", PlyValue::Bool(s.answers)),
+                            ("words", PlyValue::Int(s.words() as i64)),
+                            ("answers", PlyValue::Bool(s.answers())),
                             ("raises", PlyValue::Bool(s.raises)),
                         ])
                     })

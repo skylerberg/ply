@@ -325,14 +325,10 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
                 heap::dec(*w);
                 return Some(ctx.fail(no_handler_vars()));
             };
-            match &f.vars {
-                Some(v) => v.borrow_mut().set(at, *w),
-                None => {
-                    let mut vars = HandlerVars(Vec::new());
-                    vars.set(at, *w);
-                    f.vars = Some(shared(vars));
-                }
-            }
+            f.vars
+                .get_or_insert_with(|| shared(HandlerVars(Vec::new())))
+                .borrow_mut()
+                .set(at, Var::Word(*w));
             Some(heap::unit())
         }
         (Builtin::HandlerVar, [i]) => {
@@ -340,9 +336,7 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
             let Some((_, v)) = ctx.stacks[ctx.current].held.last() else {
                 return Some(ctx.fail(no_handler_vars()));
             };
-            let w = v.borrow().0.get(at).copied().unwrap_or(heap::unit());
-            heap::inc(w);
-            Some(w)
+            Some(v.borrow().get(at))
         }
         (Builtin::HandlerSet, [i, w]) => {
             let at = heap::imm_value(*i) as usize;
@@ -350,7 +344,7 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
                 heap::dec(*w);
                 return Some(ctx.fail(no_handler_vars()));
             };
-            v.borrow_mut().set(at, *w);
+            v.borrow_mut().set(at, Var::Word(*w));
             Some(heap::unit())
         }
         // Only compiled code can enter a closure, so these answer whatever they are given.
