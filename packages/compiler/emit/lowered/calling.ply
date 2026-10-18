@@ -7,11 +7,11 @@ import check.types (Type, TyCon, int_type)
 import emit.keys (Named, Root, Generic)
 import emit.reps (typed_at, BoundLambda)
 import emit.typing (unknown_type)
-import emit.tir (Rep, RInt, RWord, RFlat, RCases, Var, Arg, AVar, Val, Call, Apply, Make, Get, Pack,
-                 Prim, Native, Op, OCalling, MClosure, MCtor, PCapture, TTag, Inst, Let, Do, If,
-                 Case, Match, Loop, Next, Done, Restart, Enter, Return, Sited, Block, Fn, Member,
-                 Closure, Declined, Family, Spine, Data, Calling, Matching, Handling, Scalars,
-                 Containers)
+import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, Var, Arg, AVar, Val, Call, Apply, Make,
+                 Get, Pack, Prim, Native, Op, OCalling, MClosure, MCtor, PCapture, TTag, Inst, Let,
+                 Do, If, Case, Match, Loop, Next, Done, Restart, Enter, Return, Sited, Block, Fn,
+                 Member, Closure, Declined, Family, Spine, Data, Calling, Matching, Handling,
+                 Scalars, Containers, RNum, TInt, TRange, rep_of_arg)
 import emit.tir.calling (EntryValue, ConstantRead, Ticked)
 import emit.lower (lowered_fn, lowered_group)
 import emit.lower.base (GroupMember)
@@ -71,6 +71,10 @@ fn corpus() -> Bytes =
     b"fn both() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) }\n",
     b"fn ping(n: Int) -> Int / {diverges} = if n == 0 { 0 } else { pong(n - 1) }\n",
     b"fn pong(n: Int) -> Int / {diverges} = if n == 0 { let f = |x: Int| x * n; f(2) } else { ping(n - 1) }\n",
+    b"fn chooser(whole: Bool) -> (Int) -> Int = |y: Int| if whole { y } else { 0 - y }\n",
+    b"fn guarded(whole: Bool) -> (Int) -> Int = |y: Int| match y { n if whole -> n, n -> 0 - n }\n",
+    b"fn either(whole: Bool) -> (Int) -> Bool = |y: Int| whole && y > 0\n",
+    b"fn picked(whole: Bool) -> (Int) -> Int = |y: Int| match whole { true -> y, false -> 0 - y }\n",
   ])
 
 fn names() -> List<Bytes> =
@@ -121,6 +125,10 @@ fn names() -> List<Bytes> =
     b"both",
     b"ping",
     b"pong",
+    b"chooser",
+    b"guarded",
+    b"either",
+    b"picked",
   ]
 
 /// The corpus's tail groups, each by its members' names.
@@ -776,6 +784,57 @@ test "a closure a root writes calls a lambda the root was lent through its closu
         ),
     },
   }
+}
+
+/// How a value a branch or a number's `Case` tests is held: `branch` where an `If` tests it.
+type Tested = { held: Rep, branch: Bool }
+
+/// What each branch and each number's `Case` of `b` tests, its branches', cases', arms' and loops'
+/// too, in order.
+fn tested_in(b: Block) -> List<Tested> =
+  b.fold([], |acc: List<Tested>, i: Inst|
+    match i {
+      If(x) ->
+        acc.push({ held: rep_of_arg(x.cond), branch: true }).concat(tested_in(x.then)).concat(
+          tested_in(x.otherwise),
+        ),
+      Case(c) -> {
+        let here = match c.test {
+          TInt(_) -> acc.push({ held: c.on.rep, branch: false }),
+          TRange(_) -> acc.push({ held: c.on.rep, branch: false }),
+          _ -> acc,
+        };
+        c.arms.fold(here, |a: List<Tested>, arm: { when: Int, body: Block }|
+          a.concat(tested_in(arm.body))).concat(
+          tested_in(c.rest),
+        )
+      },
+      Match(m) ->
+        m.arms.fold(acc, |a: List<Tested>, arm: Block| a.concat(tested_in(arm))).concat(
+          tested_in(m.rest),
+        ),
+      Loop(l) -> acc.concat(tested_in(l.body)),
+      _ -> acc,
+    })
+
+/// Whether a test reads its value as it is not held: a branch a non-`Bool`, a number's test a word.
+fn misheld(t: Tested) -> Bool =
+  if t.branch { t.held != RBool }
+  else { match t.held { RInt -> false, RBool -> false, RNum(_) -> false, _ -> true } }
+
+test "a closure testing a Bool it captured tests the Bool, never the word its capture is" {
+  [b"chooser", b"guarded", b"either", b"picked"].fold((), |_: Unit, name: Bytes|
+    match form(name) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(f) -> match closure_of(f, 0) {
+        None -> assert_eq(name, b""),
+        Some(c) -> {
+          let tests = tested_in(c.body.body);
+          assert(tests.len() > 0);
+          assert_eq(tests.filter(misheld), [])
+        },
+      },
+    })
 }
 
 /// `std.cases` as far as a test over cases, once expanded, calls it.
