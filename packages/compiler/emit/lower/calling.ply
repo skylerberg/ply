@@ -17,9 +17,9 @@ import emit.reps (Def, Imported, Carrier, Whole, erased, has_vars, carrier_of, c
                   carried_vars, substituted_fully)
 import emit.state (EmitParam, BoundLambda)
 import emit.c (KBoxed)
-import emit.roots (FnArg)
-import emit.keys (Named, At, KeyArg, KeyType, KeyLayout, Callee, Root, Generic, root_name,
-                  definition_of)
+import emit.roots (FnArg, specialisation_of, own_definition)
+import emit.keys (Named, Callee, Root, Generic, root_name)
+import emit.tir
 import emit.tir (Rep, RInt, RBool, RWord, Var, Arg, AVar, AInt, AZero, Given, Convention, Val, Prim,
                  Make, Get, Pack, Native, Op, OCalling, MClosure, MCtor, PCapture, TTag, TInt, Call,
                  Apply, Inst, Let, Do, Decl, Assign, If, Case, Match, Loop, Next, Done, Restart,
@@ -139,7 +139,9 @@ pub fn called(
     },
   }
 
-/// A call of the function value `f` on `args`, through the convention a function of its type has.
+/// A call of the function value `f` on `args`, through the convention a function of its type has;
+/// a clause's continuation, or a value of no function type, through the runtime, every argument and
+/// the answer a word, the answer kept as the word it is, at the type a continuation answers.
 pub fn applied(
   cx: Context,
   st: Lowering,
@@ -172,7 +174,34 @@ pub fn applied(
         at,
       )
     },
-    _ -> refuse(st, Calling, b"a call of a value of no function type"),
+    _ -> {
+      let words = args.map(|_: Arg| RWord);
+      let h = handed_all(param_called(cx, st, f), args, words, at);
+      bound_as(
+        h.st,
+        resumed_answer(type_of(f)),
+        RWord,
+        Apply({
+          f: f,
+          args: h.args,
+          conv: { params: words.map(|_: Rep| Given), reps: words, answer: RWord },
+          stops: true,
+        }),
+        at,
+      )
+    },
+  }
+
+/// The type the form holds a clause's continuation at, which no program writes: a word the runtime
+/// calls, whose call answers `answer`.
+fn resumption(answer: Type) -> Type = TyCon({ name: b"_resume", args: [answer] })
+
+/// What a call of a value of type `t` answers where `t` is a continuation's; unknown otherwise.
+fn resumed_answer(t: Type) -> Type =
+  match t {
+    TyCon(c) -> if c.name != b"_resume" { unknown_type() }
+    else { match c.args.at(0) { Some(a) -> a, None -> unknown_type() } },
+    _ -> unknown_type(),
   }
 
 /// The state a body run in place of the call of `func` on `args` is lowered in. A known lambda's
@@ -501,106 +530,94 @@ type Ended = { state: Var, left: Var, answer: Var, next: Int, at: Span }
 /// A pass's block, `block`, and the next variable's number after it.
 type Pass = { block: Block, next: Int }
 
-/// A step's pass `b`, answering `v`, where each path that falls off it answers a `Continue` or a
-/// `Stop` it makes there: that path goes on to the next pass with what the `Continue` holds, or
-/// leaves with what the `Stop` holds, and nothing is made; nothing where a path answers otherwise.
+/// A step's pass `b`, answering `v`, where `v` is made last or joined by the `if`, `case` or
+/// `match` the pass ends in, and each path that falls off it answers a `Continue` or a `Stop` it
+/// makes there: that path goes on to the next pass with what the `Continue` holds, or leaves with
+/// what the `Stop` holds, and nothing is made; nothing where a path answers otherwise.
 fn fused(b: Block, v: Arg, e: Ended) -> Option<Pass> =
   match v {
     AVar(x) -> match b.at(b.len() - 1) {
       Some(Let(l)) -> if l.var != x { None } else { ending(b.take(b.len() - 1), l.val, e) },
-      _ -> if b.contains(Decl(x)) { rewritten(b.filter(|i: Inst| i != Decl(x)), x, e) }
+      _ -> if b.contains(Decl(x)) { tail_fused(b.filter(|i: Inst| i != Decl(x)), x, e) }
       else { None },
     },
     _ -> None,
   }
 
-/// `b`, a block of a step's pass whose `if`s, `case`s and `match`es join in `j`, with each path that
-/// sets `j` to a `Continue` or a `Stop` it makes going on or leaving instead; nothing where a path
-/// sets `j` otherwise.
-fn rewritten(b: Block, j: Var, e: Ended) -> Option<Pass> = {
-  let walked = b.fold(Some({ block: [], next: e.next }), |acc: Option<Pass>, i: Inst|
-    match acc {
-      None -> None,
-      Some(a) -> match i {
-        If(x) -> match rewritten(x.then, j, { ..e, next: a.next }) {
-          None -> None,
-          Some(t) -> match rewritten(x.otherwise, j, { ..e, next: t.next }) {
-            None -> None,
-            Some(o) ->
-              Some({
-                block: a.block.push(If({ ..x, then: t.block, otherwise: o.block })),
-                next: o.next,
-              }),
-          },
-        },
-        Case(c) -> {
-          let arms = c.arms.fold(
-            Some({ arms: [], next: a.next }),
-            |got: Option<{ arms: List<{ when: Int, body: Block }>, next: Int }>, arm: { when: Int, body: Block }|
-              match got {
-                None -> None,
-                Some(g) -> match rewritten(arm.body, j, { ..e, next: g.next }) {
-                  None -> None,
-                  Some(r) ->
-                    Some({ arms: g.arms.push({ when: arm.when, body: r.block }), next: r.next }),
-                },
-              },
-          );
-          match arms {
-            None -> None,
-            Some(g) -> match rewritten(c.rest, j, { ..e, next: g.next }) {
-              None -> None,
-              Some(r) ->
-                Some({
-                  block: a.block.push(Case({ ..c, arms: g.arms, rest: r.block })),
-                  next: r.next,
-                }),
-            },
-          }
-        },
-        Match(m) -> {
-          let arms = m.arms.fold(
-            Some({ arms: [], next: a.next }),
-            |got: Option<{ arms: List<Block>, next: Int }>, arm: Block|
-              match got {
-                None -> None,
-                Some(g) -> match rewritten(arm, j, { ..e, next: g.next }) {
-                  None -> None,
-                  Some(r) -> Some({ arms: g.arms.push(r.block), next: r.next }),
-                },
-              },
-          );
-          match arms {
-            None -> None,
-            Some(g) -> match rewritten(m.rest, j, { ..e, next: g.next }) {
-              None -> None,
-              Some(r) ->
-                Some({ block: a.block.push(Match({ arms: g.arms, rest: r.block })), next: r.next }),
-            },
-          }
-        },
-        _ -> Some({ block: a.block.push(i), next: a.next }),
-      },
-    });
-  match walked { None -> None, Some(w) -> settled(w, j, e) }
-}
-
-/// A block `w` of a step's pass, its nested blocks rewritten: where it ends setting join `j` to a
-/// `Continue` or a `Stop` it makes, going on or leaving instead; nothing where it sets `j` otherwise.
-fn settled(w: Pass, j: Var, e: Ended) -> Option<Pass> =
-  match w.block.at(w.block.len() - 1) {
-    Some(Assign(a)) -> if a.var != j { Some(w) } else {
+/// `b`, a block that ends where the pass does, with each path that ends setting join `j` to a
+/// `Continue` or a `Stop` it makes going on or leaving instead: where it ends in that setting, or in
+/// an `if`, `case` or `match` each of whose blocks is such a block. `b` as it is where nothing falls
+/// off it; nothing where a path falls off otherwise.
+fn tail_fused(b: Block, j: Var, e: Ended) -> Option<Pass> = {
+  let n = b.len();
+  let before = b.take(n - 1);
+  match b.at(n - 1) {
+    Some(Assign(a)) -> if a.var != j { None } else {
       match a.arg {
-        AVar(x) -> match w.block.at(w.block.len() - 2) {
-          Some(Let(l)) -> if l.var != x { None }
-          else { ending(w.block.take(w.block.len() - 2), l.val, { ..e, next: w.next }) },
+        AVar(x) -> match b.at(n - 2) {
+          Some(Let(l)) -> if l.var != x { None } else { ending(b.take(n - 2), l.val, e) },
           _ -> None,
         },
         _ -> None,
       }
     },
-    _ -> Some(w),
+    Some(If(x)) -> match tail_fused(x.then, j, e) {
+      None -> None,
+      Some(t) -> match tail_fused(x.otherwise, j, { ..e, next: t.next }) {
+        None -> None,
+        Some(o) ->
+          Some({
+            block: before.push(If({ ..x, then: t.block, otherwise: o.block })),
+            next: o.next,
+          }),
+      },
+    },
+    Some(Case(c)) -> {
+      let arms = c.arms.fold(
+        Some({ arms: [], next: e.next }),
+        |got: Option<{ arms: List<{ when: Int, body: Block }>, next: Int }>, arm: { when: Int, body: Block }|
+          match got {
+            None -> None,
+            Some(g) -> match tail_fused(arm.body, j, { ..e, next: g.next }) {
+              None -> None,
+              Some(r) ->
+                Some({ arms: g.arms.push({ when: arm.when, body: r.block }), next: r.next }),
+            },
+          },
+      );
+      match arms {
+        None -> None,
+        Some(g) -> match tail_fused(c.rest, j, { ..e, next: g.next }) {
+          None -> None,
+          Some(r) ->
+            Some({ block: before.push(Case({ ..c, arms: g.arms, rest: r.block })), next: r.next }),
+        },
+      }
+    },
+    Some(Match(m)) -> {
+      let arms = m.arms.fold(
+        Some({ arms: [], next: e.next }),
+        |got: Option<{ arms: List<Block>, next: Int }>, arm: Block|
+          match got {
+            None -> None,
+            Some(g) -> match tail_fused(arm, j, { ..e, next: g.next }) {
+              None -> None,
+              Some(r) -> Some({ arms: g.arms.push(r.block), next: r.next }),
+            },
+          },
+      );
+      match arms {
+        None -> None,
+        Some(g) -> match tail_fused(m.rest, j, { ..e, next: g.next }) {
+          None -> None,
+          Some(r) ->
+            Some({ block: before.push(Match({ arms: g.arms, rest: r.block })), next: r.next }),
+        },
+      }
+    },
+    _ -> if falls_through(b) { None } else { Some({ block: b, next: e.next }) },
   }
+}
 
 /// `b` ended by the step's answer made as `val`: a `Continue`'s argument the next pass's state, a
 /// `Stop`'s the loop's answer.
@@ -887,7 +904,20 @@ pub fn grouped(members: List<GroupMember>, bodies: List<Lowered>) -> Result<Fn, 
               rest: [Return(AZero(RWord))],
             }),
           ],
-          lambdas: last.lambdas,
+          // A closure a later member writes fails at that member's sites, the group's being the first's.
+          lambdas: members.drop(1).fold(last.lambdas, |ls: List<tir::Lambda>, m: GroupMember|
+            ls.map(|l: tir::Lambda|
+              match l {
+                Closure(c) -> if c.body.key != m.cx.key { l } else {
+                  Closure({
+                    ..c,
+                    body: {
+                      ..c.body,
+                      body: [Sited(Some({ root: m.cx.key, base: m.cx.base }))].concat(c.body.body),
+                    },
+                  })
+                },
+              })),
           base: first.cx.base,
           members: range(0, members.len()).fold([], |acc: List<Member>, i: Int|
             match members.at(i) {
@@ -971,11 +1001,17 @@ fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Shape = {
     },
     None -> None,
   };
+  // A continuation is a word the runtime calls, and a clause binding one answers the word it hands
+  // back, which for a tail-only clause is the resumed value `c.resumed` holds the count of.
+  let continued = |j: Int| frame.resumes && j == frame.params - 1;
   let carriers = match fty {
     Some(f) -> f.params.map(carrier_of),
     None -> range(0, frame.params).map(|_: Int| Whole(KBoxed)),
   };
-  let answer = match fty { Some(f) -> carrier_of(f.ret), None -> Whole(KBoxed) };
+  let answer = match fty {
+    Some(f) -> if frame.resumes { Whole(KBoxed) } else { carrier_of(f.ret) },
+    None -> Whole(KBoxed),
+  };
   let n = frame.captures.len();
   let caps = range(0, n).map(|i: Int|
     {
@@ -987,13 +1023,24 @@ fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Shape = {
       rep: RWord,
     });
   let own = range(0, frame.params).map(|j: Int|
-    {
-      id: n + j,
-      ty: match fty {
-        Some(f) -> match f.params.at(j) { Some(t) -> t, None -> unknown_type() },
-        None -> unknown_type(),
-      },
-      rep: match carriers.at(j) { Some(c) -> carried_as(c), None -> RWord },
+    if continued(j) {
+      {
+        id: n + j,
+        ty: resumption(match fty {
+          Some(f) -> match f.params.at(j) { Some(TyFn(k)) -> k.ret, _ -> unknown_type() },
+          None -> unknown_type(),
+        }),
+        rep: RWord,
+      }
+    } else {
+      {
+        id: n + j,
+        ty: match fty {
+          Some(f) -> match f.params.at(j) { Some(t) -> t, None -> unknown_type() },
+          None -> unknown_type(),
+        },
+        rep: match carriers.at(j) { Some(c) -> carried_as(c), None -> RWord },
+      }
     });
   let params = caps.concat(own);
   {
@@ -1072,7 +1119,7 @@ fn jumped(
   at: Span,
 ) -> Option<Lowered> / {abort.raise} =
   if cx.tails == Calls { None }
-  else if definition_of(cx.key) == Some(d.full) && args.len() == cx.params.len()
+  else if own_definition(cx.full) == d.full && args.len() == cx.params.len()
       && owns(cx, d, ref, fn_args(cx, codes)) {
     let h = handed_all(st, args, convention(cx).reps, at);
     Some({ st: emitted(h.st, Restart(h.args)), arg: AZero(held_as(cx.setting, cx.answer_ty)) })
@@ -1180,7 +1227,7 @@ fn named_ref(
   at: Span,
   fns: List<FnArg>,
 ) -> Reference / {abort.raise} =
-  if definition_of(cx.key) == Some(d.full) {
+  if own_definition(cx.full) == d.full {
     if owns(cx, d, at, fns) { { st: st, callee: Root(cx.key), args: key_types(cx) } }
     else { { st: st, callee: Root(Named(d.full)), args: [] } }
   } else {
@@ -1210,31 +1257,28 @@ fn named_ref(
   }
 
 /// Whether a reference at `at` of the root's own definition, handing `fns`, names the root itself:
-/// always for a definition as it stands; for one at type arguments, where it hands the same lambdas
-/// and its type arguments are the root's, or erase to them.
+/// always for a definition as it stands; for a specialisation, where it hands the same lambdas and
+/// its type arguments are the root's, or erase to them.
 fn owns(cx: Context, d: Defined, at: Span, fns: List<FnArg>) -> Bool / {abort.raise} =
-  match cx.key {
-    At(a) -> {
+  match specialisation_of(cx.full) {
+    Some(s) -> {
       let given = reference_args(cx, d.def.scheme, at);
-      let mine = key_types(cx);
-      same_fns(a.lent, fns) && given.len() == mine.len()
-        && range(0, mine.len()).all(|j: Int|
-          match mine.at(j) {
+      same_fns(s.fns, fns) && given.len() == s.args.len()
+        && range(0, s.args.len()).all(|j: Int|
+          match s.args.at(j) {
             Some(m) ->
               m == unknown_type()
                 || (match given.at(j) { Some(g) -> g == m || erased(g) == m, None -> false }),
             None -> false,
           })
     },
-    _ -> true,
+    None -> true,
   }
 
-/// The type arguments the root is lowered at; none for a definition as it stands.
-fn key_types(cx: Context) -> List<Type> =
-  match cx.key {
-    At(a) -> a.args.map(|k: KeyArg| match k { KeyType(t) -> t, KeyLayout(_) -> unknown_type() }),
-    _ -> [],
-  }
+/// The type arguments the root is lowered at, as its name spells them; none for a definition as it
+/// stands.
+fn key_types(cx: Context) -> List<Type> / {abort.raise} =
+  match specialisation_of(cx.full) { Some(s) -> s.args, None -> [] }
 
 /// The type a call of `d` at type arguments `args` answers.
 fn answer_type(d: Def, args: List<Type>) -> Type =
@@ -1382,16 +1426,15 @@ fn lends_lambdas(cx: Context) -> Bool / {abort.raise} = {
   let owner = root_name(cx.key);
   is_test_owner(owner)
     || (owner.index_of(b"#") == None
-    && (match cx.key {
-      At(a) ->
-        a.lent.len() == 0 && owner.index_of(b"|") == None
-          && key_types(cx).all(|t: Type| t != unknown_type() && !has_vars(t)),
-      Named(_) -> match cx.setting.here.fold(None, |acc: Option<Def>, d: Def|
+    && (match specialisation_of(owner) {
+      Some(s) ->
+        s.fns.len() == 0 && owner.index_of(b"|") == None
+          && s.args.all(|t: Type| t != unknown_type() && !has_vars(t)),
+      None -> match cx.setting.here.fold(None, |acc: Option<Def>, d: Def|
           if qualify(cx.setting.module, d.name) == owner { Some(d) } else { acc }) {
         Some(d) -> match d.scheme { Some(sc) -> sc.ty_vars.len() == 0, None -> true },
         None -> false,
       },
-      _ -> false,
     }))
 }
 
