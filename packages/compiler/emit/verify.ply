@@ -1,7 +1,8 @@
 //! The typed form checked before it is printed: every count a body holds is consumed exactly once on
 //! every path, a borrowed value is read only while what it was read out of is held, a value that
 //! can fail names exactly what its failure path releases, each join is set once on every path
-//! into it with a value held as the join is, and each operand is held as its operation takes it.
+//! into it with a value held as the join is and before anything reads it, and each operand is held
+//! as its operation takes it.
 //! A body that breaks one is refused, which fails a build.
 
 import emit.tir (Rep, RWord, RInt, RBool, RMaybe, RTagged, RFlat, RCases, RToken, Leaf, Var, Arg,
@@ -915,7 +916,9 @@ pub fn stacked_captures(val: Val) -> Option<List<Arg>> =
 
 /// One count of `v` consumed: it must hold one of its own.
 fn consumed_one(w: Walk, v: Var) -> Walk =
-  if w.fault != None || !counted(v.rep) { w } else {
+  if w.fault != None { w }
+  else if w.h.unset.contains(v.id) { unset_read(w, v) }
+  else if !counted(v.rep) { w } else {
     let n = count(w.h, v);
     if n > 0 {
       {
@@ -932,13 +935,18 @@ fn consumed_one(w: Walk, v: Var) -> Walk =
 
 /// `v` read: it must be held, or borrowed out of something still held.
 fn read_one(w: Walk, v: Var) -> Walk =
-  if w.fault != None || !counted(v.rep) || count(w.h, v) > 0 { w } else {
+  if w.fault != None { w }
+  else if w.h.unset.contains(v.id) { unset_read(w, v) }
+  else if !counted(v.rep) || count(w.h, v) > 0 { w } else {
     match w.h.borrowed.get(v.id) {
       Some(base) -> if base < 0 || w.h.owned.contains(base) || w.h.borrowed.contains(base) { w }
       else { faulted(w, b"a value read after what it was read out of was let go: v", v) },
       None -> faulted(w, b"a value read with no count left: v", v),
     }
   }
+
+/// A join read before this path set it, which the printer declares holding nothing.
+fn unset_read(w: Walk, v: Var) -> Walk = faulted(w, b"a join read before it is set: v", v)
 
 /// Where `val` can fail, what its failure path releases must be exactly what the path holds but
 /// what a `handle` around holds across its body.
@@ -1170,6 +1178,23 @@ test "the paths out of a branch hold the same counts and set the same joins" {
       ]),
     ),
     Some(b"the paths out of a branch set different joins"),
+  );
+  // A join is declared holding nothing, so no path reads it before setting it, though it holds no count.
+  let early = |read: Inst|
+    verified(
+      root_of([p], [], RInt, [
+        Dec(p),
+        Decl(j),
+        read,
+        Assign({ var: j, arg: AInt(1) }),
+        Return(AVar(j)),
+      ]),
+    );
+  assert_eq(early(Sited(None)), None);
+  assert_eq(early(Return(AVar(j))), Some(b"a join read before it is set: v2"));
+  assert_eq(
+    early(If({ cond: AVar(j), then: [], otherwise: [] })),
+    Some(b"a join read before it is set: v2"),
   )
 }
 
@@ -1380,17 +1405,27 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
     ),
     None,
   );
-  // Released on a failure path as it would be freed.
-  assert_eq(
+  // Released on a failure path as it would be freed; a make only allocates, which never fails, so
+  // it has no failure path to release anything on.
+  let w = word(6);
+  let failing = |val: Val, unwind: List<Var>|
     verified(
       root_of([r, v], [], RWord, [
         reset,
-        bind(n, made(None, []), [token]),
+        bind(w, val, unwind),
+        Dec(w),
         Free({ of: token, bytes: AInt(8) }),
+        bind(n, made(None, []), []),
         Return(AVar(n)),
       ]),
-    ),
-    None,
+    );
+  assert_eq(failing(call_of([], []), [v, token]), None);
+  assert_eq(
+    failing(Make({ made: MCtor({ name: b"Box", width: 0 }), args: [], reuse: None, kept: [] }), [
+      v,
+      token,
+    ]),
+    Some(b"a release on the failure path of a value that cannot fail"),
   );
   assert_eq(
     verified(
@@ -1787,7 +1822,7 @@ test "a field taken before any miss is taken for the next arm, a read by name is
       reuse: None,
       kept: [],
     }),
-    [p],
+    [],
   );
   assert_eq(
     verified(
