@@ -10,14 +10,14 @@ import emit.roots (symbol_of, root_id)
 import emit.keys (Callee, Root, Generic, root_name)
 import emit.pieces (Piece, Text, Hole, Symbol, LambdaEntry, BuiltinAt, placeholder)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases, Leaf,
-                 Var, Arg, Convention, Made, MClosure, Fn, Member, Lambda, Closure, Uses,
-                 rep_of_arg)
+                 Var, Arg, Convention, Made, MClosure, Fn, Member, Lambda, Closure, Uses, Calling,
+                 rep_of_arg, made_said)
 import emit.tir.calling (CallingOp, EntryValue, ConstantRead, BuiltinValue, Ticked)
 import emit.lower.held (fields_of, slot_rep)
 import emit.print.text (Printing, Place, line, pad, temp, named, name_of, arg_text, site, check,
-                        interned, zero, failing_return, part_names, assigned)
+                        interned, failing_return, part_names, assigned, unprinted)
 import emit.print.made (c_type, c_types, zeros, word_as, arg_parts, head_types, head_params,
-                        entry_outs, entry_answered, parts_word, word_parts)
+                        entry_outs, entry_answered, parts_word, word_parts, declared, set_parts)
 import emit.print.fuel (fuel_head)
 
 /// A call of `c.callee` on `c.args`, its answer into `into`, its failure tested after it. The head
@@ -211,7 +211,7 @@ pub fn closure_made(
         }
       }
     },
-    _ -> line(pr, p.depth, b"/* a value made that is no closure */"),
+    other -> unprinted(Calling, b"a value made that is no closure", made_said(other)),
   }
 
 /// Capture `i` of the closure `of`, read where it lies past the closure's code and its descriptor:
@@ -278,22 +278,49 @@ pub fn calling_op(
 
 /// A self tail call: its arguments into temporaries, then the parameters set from them, then the
 /// body again.
-pub fn restarted(p: Place, pr: Printing, args: List<Arg>) -> Printing / {abort.raise} = {
-  let held = args.fold({ pr: pr, names: [] }, |h: { pr: Printing, names: List<Bytes> }, a: Arg| {
-    let t = temp(h.pr);
-    {
-      pr: line(
-        t.pr,
-        p.depth,
-        Bytes::concat_all([c_type(rep_of_arg(a)), b" ", t.name, b" = ", arg_text(h.pr, a), b";"]),
-      ),
-      names: h.names.push(t.name),
-    }
-  });
-  let set = range(0, held.names.len()).fold(held.pr, |q: Printing, k: Int|
-    line(q, p.depth, Bytes::concat_all([b"p", ascii_of_int(k), b" = ", held.names.get(k), b";"])));
+pub fn restarted(p: Place, pr: Printing, args: List<Arg>) -> Printing = {
+  let held = held_parts(p, pr, args);
+  let set = range(0, args.len()).fold(held.pr, |q: Printing, k: Int|
+    match args.at(k) {
+      Some(a) ->
+        parts_set(
+          q,
+          p.depth,
+          part_names(b"p".concat(ascii_of_int(k)), rep_of_arg(a)),
+          match held.names.at(k) { Some(ns) -> ns, None -> [] },
+        ),
+      None -> q,
+    });
   line(set, p.depth, b"goto ply_loop;")
 }
+
+/// Each of `args` held in temporaries of its own, value by value, so none reads a value set after.
+fn held_parts(
+  p: Place,
+  pr: Printing,
+  args: List<Arg>,
+) -> { pr: Printing, names: List<List<Bytes>> } =
+  args.fold({ pr: pr, names: [] }, |h: { pr: Printing, names: List<List<Bytes>> }, a: Arg| {
+    let r = rep_of_arg(a);
+    let t = temp(h.pr);
+    let ns = part_names(t.name, r);
+    let ts = c_types(r);
+    let xs = arg_parts(h.pr, a);
+    {
+      pr: range(0, ns.len()).fold(t.pr, |q: Printing, k: Int|
+        line(
+          q,
+          p.depth,
+          Bytes::concat_all([nth(ts, k), b" ", nth(ns, k), b" = ", nth(xs, k), b";"]),
+        )),
+      names: h.names.push(ns),
+    }
+  })
+
+/// Each of the C values `into` set from its own among `from`.
+fn parts_set(pr: Printing, depth: Int, into: List<Bytes>, from: List<Bytes>) -> Printing =
+  range(0, into.len()).fold(pr, |q: Printing, k: Int|
+    line(q, depth, Bytes::concat_all([nth(into, k), b" = ", nth(from, k), b";"])))
 
 /// A tail call of member `member` of the group `p.u.group` names, `args` held as that member takes
 /// them: each made a word into a temporary first, so none reads a word already set, then the
@@ -305,7 +332,18 @@ pub fn entered_member(
   args: List<Arg>,
 ) -> Printing / {abort.raise} =
   match p.u.group {
-    None -> line(pr, p.depth, b"/* a tail call into a group outside a group's arm */"),
+    None ->
+      unprinted(
+        Calling,
+        b"a tail call into a group outside a group's arm",
+        Bytes::concat_all([
+          b"member ",
+          ascii_of_int(member),
+          b" of ",
+          ascii_of_int(args.len()),
+          b" values",
+        ]),
+      ),
     Some(g) -> {
       // Every word is made before any `p` is set: an argument may read one.
       let held = args.fold(
@@ -362,7 +400,7 @@ fn one_word(p: Place, pr: Printing, a: Arg) -> { pr: Printing, word: Bytes } = {
 }
 
 /// What opens a `Loop` numbered `label` over `state`, first `init`: each state variable declared
-/// holding its first value, the answer declared, and the loop's C `for`.
+/// holding its first value, value by value, the answer declared, and the loop's C `for`.
 pub fn loop_opened(
   p: Place,
   pr: Printing,
@@ -370,32 +408,24 @@ pub fn loop_opened(
   state: List<Var>,
   init: List<Arg>,
   answer: Var,
-) -> Printing / {abort.raise} = {
-  let held = range(0, state.len()).fold(pr, |q: Printing, i: Int| {
-    let n = named(q, state.get(i));
-    line(
-      n.pr,
-      p.depth,
-      Bytes::concat_all([
-        c_type(state.get(i).rep),
-        b" ",
-        n.name,
-        b" = ",
-        match init.at(i) { Some(a) -> arg_text(pr, a), None -> zero(state.get(i).rep) },
-        b";",
-      ]),
-    )
-  });
-  let a = named(held, answer);
-  line(
-    line(
-      a.pr,
-      p.depth,
-      Bytes::concat_all([c_type(answer.rep), b" ", a.name, b" = ", zero(answer.rep), b";"]),
-    ),
-    p.depth,
-    b"for (;;) {",
-  )
+) -> Printing = {
+  let held = range(0, state.len()).fold(pr, |q: Printing, i: Int|
+    match state.at(i) {
+      Some(v) -> {
+        let n = named(q, v);
+        let ns = part_names(n.name, v.rep);
+        let ts = c_types(v.rep);
+        let xs = match init.at(i) { Some(a) -> arg_parts(pr, a), None -> zeros(v.rep) };
+        range(0, ns.len()).fold(n.pr, |r: Printing, k: Int|
+          line(
+            r,
+            p.depth,
+            Bytes::concat_all([nth(ts, k), b" ", nth(ns, k), b" = ", nth(xs, k), b";"]),
+          ))
+      },
+      None -> q,
+    });
+  line(declared(held, p.depth, answer), p.depth, b"for (;;) {")
 }
 
 /// What closes `Loop` `label`.
@@ -404,40 +434,23 @@ pub fn loop_closed(p: Place, pr: Printing, label: Int, answer: Var) -> Printing 
 
 /// The loop's next pass with `state` rebound to `args`: each argument held first, so none reads a
 /// state variable already rebound.
-pub fn next(
-  p: Place,
-  pr: Printing,
-  label: Int,
-  state: List<Var>,
-  args: List<Arg>,
-) -> Printing / {abort.raise} = {
-  let held = args.fold({ pr: pr, names: [] }, |h: { pr: Printing, names: List<Bytes> }, a: Arg| {
-    let t = temp(h.pr);
-    {
-      pr: line(
-        t.pr,
-        p.depth,
-        Bytes::concat_all([c_type(rep_of_arg(a)), b" ", t.name, b" = ", arg_text(pr, a), b";"]),
-      ),
-      names: h.names.push(t.name),
-    }
-  });
+pub fn next(p: Place, pr: Printing, label: Int, state: List<Var>, args: List<Arg>) -> Printing = {
+  let held = held_parts(p, pr, args);
   let set = range(0, state.len()).fold(held.pr, |q: Printing, k: Int|
-    line(
-      q,
-      p.depth,
-      Bytes::concat_all([name_of(q, state.get(k)), b" = ", held.names.get(k), b";"]),
-    ));
+    match state.at(k) {
+      Some(v) ->
+        parts_set(q, p.depth, part_names(name_of(q, v), v.rep), match held.names.at(k) {
+          Some(ns) -> ns,
+          None -> [],
+        }),
+      None -> q,
+    });
   line(set, p.depth, b"continue;")
 }
 
-/// The loop left answering `arg` into `answer`.
+/// The loop left answering `arg` into `answer`, value by value.
 pub fn done(p: Place, pr: Printing, label: Int, answer: Var, arg: Arg) -> Printing =
-  line(
-    line(pr, p.depth, Bytes::concat_all([name_of(pr, answer), b" = ", arg_text(pr, arg), b";"])),
-    p.depth,
-    b"break;",
-  )
+  line(set_parts(pr, p.depth, answer, arg), p.depth, b"break;")
 
 /// The C names a closure body's parameters have: its captures `q<i>`, then its own `p<j>`.
 pub fn lambda_names(l: Lambda, nth: Int) -> Map<Int, Bytes> / {abort.raise} =
@@ -730,7 +743,7 @@ fn by_type(
   let arr = temp(r.pr);
   let word = temp(arr.pr);
   // The values of the answer past its first come back through pointers on the typed path.
-  let declared = line(
+  let zeroed = line(
     word.pr,
     p.depth,
     Bytes::join(
@@ -740,7 +753,7 @@ fn by_type(
     ),
   );
   let typed = line(
-    line(declared, p.depth, Bytes::concat_all([b"if (", called_typed(f, c), b") {"])),
+    line(zeroed, p.depth, Bytes::concat_all([b"if (", called_typed(f, c), b") {"])),
     p.depth + 1,
     Bytes::concat_all([
       nth(answered, 0),
