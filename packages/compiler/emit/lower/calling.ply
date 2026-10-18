@@ -3,27 +3,26 @@
 //! pure definition read once, a function value, a body run in place of the call, a closure made of a
 //! lambda's body, and a tail group's roots as one.
 
-import emit.code (Code, Node, Own, Borrowed, Owned, NVar, NKnown, NLambda, NApp, NUnary, NBinary,
-                  NField, NIf, NBlock, NList, NRecord, NUpdate, NMatch, NPerform, NSimulate,
-                  NParallel, NHandle, Lambda, Capture, CodeStmt, CLet, CLetPat, CDo, CodeField,
-                  CodeArm, CodeClause)
+import emit.code (Code, Node, NVar, NKnown, NLambda, NApp, NUnary, NBinary, NField, NIf, NBlock,
+                  NList, NRecord, NUpdate, NMatch, NPerform, NSimulate, NParallel, NHandle, Lambda,
+                  Capture, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm, CodeClause)
 import check.types (Type, TyFn, TyVar, TyCon, Scheme, spelled_type, int_type, bool_type)
 import emit.typing (unknown_type)
-import syntax.parsing (Span, span_key, starts_upper, prelude_binder)
+import syntax.parsing (Span, span_key, starts_upper, prelude_binder, read_site)
 import check.resolve.tables (qualify)
 import check.infer.checker (is_test_owner)
 import std.bytes (ascii_of_int)
 import emit.reps (Def, Imported, Carrier, Whole, EmitParam, BoundLambda, erased, has_vars,
-                  carrier_of, carriers_at, carried_vars, substituted_fully)
+                  carrier_of, carriers_at, carried_vars, substituted_fully, word_type)
 import emit.c (KBoxed)
 import emit.roots (FnArg, specialisation_of, own_definition)
 import emit.keys (Named, Callee, Root, Generic, root_name)
 import emit.tir
-import emit.tir (Rep, RInt, RBool, RWord, Var, Arg, AVar, AInt, AZero, Given, Convention, Val, Prim,
-                 Make, Get, Pack, Native, Op, OCalling, MClosure, MCtor, PCapture, TTag, TInt, Call,
-                 Apply, Inst, Let, Do, Decl, Assign, If, Case, Match, Loop, Next, Done, Restart,
-                 Enter, Return, Fail, NoArm, Sited, Block, Fn, Rooted, Member, Closure, Declined,
-                 Calling, no_links, falls_through, rep_of_arg)
+import emit.tir (Rep, RInt, RBool, RWord, RNum, RFloat, RDec, Var, Arg, AVar, AInt, AZero, Given,
+                 Convention, Val, Prim, Make, Get, Pack, Native, Op, OCalling, MClosure, MCtor,
+                 PCapture, TTag, TInt, Call, Apply, Inst, Let, Do, Decl, Assign, If, Case, Match,
+                 Loop, Next, Done, Restart, Enter, Return, Fail, NoArm, Sited, Block, Fn, Rooted,
+                 Member, Closure, Declined, Calling, no_links, falls_through, rep_of_arg)
 import emit.tir.calling (EntryValue, ConstantRead, BuiltinValue, Ticked)
 import emit.lower.setting (imported_target, qualified)
 import emit.lower.held (held_as, carried_as, arg_path)
@@ -33,6 +32,7 @@ import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, T
                         started, type_at, type_of, handed, read_noted, read_note, capture_note,
                         frame_entered)
 import emit.lower.data (constructed)
+import emit.lower.containers (scalar_builtin)
 
 /// How the root takes its parameters and hands back its answer: as the emitter carries them.
 pub fn convention(cx: Context) -> Convention =
@@ -96,6 +96,26 @@ pub fn global(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered / {ab
           None -> refuse(st, Calling, b"a builtin read as a value at no type: ".concat(name)),
         }
       } else { refuse(st, Calling, b"a global the lowering does not resolve: ".concat(name)) },
+    }
+  }
+
+/// The builtin a name no slot holds names, as a call of it reaches it, and its arity, where read as a
+/// value it is the lambda around a call of it: one the emitter writes per type, read at a function
+/// type the checker settled, which the runtime's value of it would read off untyped words.
+pub fn builtin_lambda(
+  cx: Context,
+  name: Bytes,
+  at: Span,
+) -> Option<{ name: Bytes, arity: Int }> / {abort.raise} =
+  if is_ctor_name(name) || def_named(cx, name) != None || !cx.setting.builtins.contains(name) {
+    None
+  } else {
+    let callee = extern_named(cx, name);
+    match type_at(cx, at) {
+      Some(TyFn(f)) -> if scalar_builtin(callee) && !untyped(f.ret)
+          && !f.params.any(|p: Type| untyped(p)) { Some({ name: callee, arity: f.params.len() }) }
+      else { None },
+      _ -> None,
     }
   }
 
@@ -308,9 +328,11 @@ fn in_frame(
           match k.lambda.captures.at(i) {
             None -> acc,
             Some(c) -> {
+              let made = capture_type(st, k.lambda.at, i);
               let read = bound_as(
                 acc.st,
-                capture_type(st, k.lambda.at, i),
+                if made != unknown_type() { made }
+                else { match read_type(cx, k.lambda.body, c.dst) { Some(t) -> t, None -> made } },
                 RWord,
                 Get({ of: closure, path: PCapture(i) }),
                 at,
@@ -320,14 +342,31 @@ fn in_frame(
           },
       );
       let inner = { ..cx, answer_ty: lambda_answer(cx, k.lambda), frame: k.lambda.at };
-      {
-        cx: inner,
-        st: {
-          ..frame_entered(inner, caps.st, at),
-          env: range(0, lowered.len()).fold(caps.env, |m: Map<Int, Arg>, j: Int|
-            match lowered.at(j) { Some(Some(a)) -> m.insert(j, a), _ -> m }),
-        },
-      }
+      let declared = match type_at(inner, k.lambda.at) { Some(TyFn(t)) -> t.params, _ -> [] };
+      let params = range(0, lowered.len()).fold(
+        { st: frame_entered(inner, caps.st, at), env: caps.env },
+        |acc: { st: Lowering, env: Map<Int, Arg> }, j: Int|
+          match lowered.at(j) {
+            Some(Some(a)) -> match declared.at(j) {
+              // A specialisation at erased or open type arguments hands a word of no type of its own.
+              Some(t) -> if untyped(type_of(a)) && !untyped(t) {
+                let rep = match held_as(cx.setting, t) {
+                  RInt -> RInt,
+                  RBool -> RBool,
+                  RNum(w) -> RNum(w),
+                  RFloat -> RFloat,
+                  RDec -> RDec,
+                  _ -> rep_of_arg(a),
+                };
+                let r = bound_as(acc.st, t, rep, Pack({ arg: a, to: rep }), at);
+                { st: r.st, env: acc.env.insert(j, r.arg) }
+              } else { { ..acc, env: acc.env.insert(j, a) } },
+              None -> { ..acc, env: acc.env.insert(j, a) },
+            },
+            _ -> acc,
+          },
+      );
+      { cx: inner, st: { ..params.st, env: params.env } }
     },
   }
 
@@ -1090,6 +1129,62 @@ fn placeholder(cx: Context) -> Fn =
     links: no_links(),
   }
 
+/// Whether `t` leaves a value's type open: a variable's, unknown, or the word an erased type
+/// argument is.
+fn untyped(t: Type) -> Bool = t == word_type() || has_vars(t)
+
+/// The type the checker filed at a read of `slot` in `c`, `c` in the barrier the slot is in, a read
+/// in a barrier `c` opens that copies the slot in among them; none where no read is typed.
+fn read_type(cx: Context, c: Code, slot: Int) -> Option<Type> = {
+  let any = |codes: List<Code>|
+    codes.fold(None, |acc: Option<Type>, x: Code|
+      match acc { Some(_) -> acc, None -> read_type(cx, x, slot) });
+  let copied = |caps: List<Capture>, body: Code|
+    caps.fold(None, |acc: Option<Type>, k: Capture|
+      match acc {
+        Some(_) -> acc,
+        None -> if k.src == slot { read_type(cx, body, k.dst) } else { None },
+      });
+  match c.node {
+    NVar(v) -> if v.slot == Some(slot) { type_at(cx, read_site(c.span)) } else { None },
+    NLambda(l) -> copied(l.captures, l.body),
+    NSimulate(x) -> copied(x.captures, x.body),
+    NUnary(u) -> read_type(cx, u.operand, slot),
+    NBinary(b) -> any([b.lhs, b.rhs]),
+    NField(f) -> read_type(cx, f.base, slot),
+    NApp(a) -> any(a.args.push(a.func)),
+    NIf(i) -> any([i.cond, i.then_branch, i.else_branch]),
+    NBlock(b) ->
+      any(
+        b.stmts.fold(
+          match b.tail { Some(t) -> [t], None -> [] },
+          |acc: List<Code>, stmt: CodeStmt|
+            acc.push(match stmt { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code }),
+        ),
+      ),
+    NList(l) -> any(l.items),
+    NRecord(r) -> any(r.fields.map(|f: CodeField| f.value)),
+    NUpdate(u) -> any(u.sets.map(|f: CodeField| f.value).push(u.base)),
+    NMatch(m) ->
+      any(
+        m.arms.fold([m.scrutinee], |acc: List<Code>, a: CodeArm|
+          List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
+      ),
+    NPerform(x) -> any(match x.label { Some(l) -> x.args.push(l), None -> x.args }),
+    NParallel(x) -> any(x.branches),
+    NHandle(h) -> match read_type(cx, h.body, slot) {
+      Some(t) -> Some(t),
+      None ->
+        h.clauses.fold(
+          match h.ret { Some(r) -> copied(r.captures, r.body), None -> None },
+          |acc: Option<Type>, cl: CodeClause|
+            match acc { Some(_) -> acc, None -> copied(cl.captures, cl.body) },
+        ),
+    },
+    _ -> None,
+  }
+}
+
 /// The type capture `i` of the closure written at `at` holds, as its body took it.
 fn capture_type(st: Lowering, at: Span, i: Int) -> Type =
   range(0, st.lambdas.len()).fold(unknown_type(), |acc: Type, k: Int|
@@ -1492,18 +1587,17 @@ fn named_arity(
 
 /// The lambda around a call of the definition `c` names, which takes `n` arguments.
 fn named_lambda(c: Code, n: Int) -> Lambda = {
-  let at = |own: Own, node: Node| { own: own, node: node, span: c.span };
+  let at = |node: Node| { node: node, span: c.span };
   {
     params: n,
     size: n,
     captures: [],
     at: c.span,
     body: at(
-      Borrowed,
       NApp({
-        func: { ..c, own: Borrowed },
+        func: c,
         args: range(0, n).map(|i: Int|
-          at(Owned, NVar({ name: b"p".concat(ascii_of_int(i)), slot: Some(i) }))),
+          at(NVar({ name: b"p".concat(ascii_of_int(i)), slot: Some(i) }))),
       }),
     ),
   }

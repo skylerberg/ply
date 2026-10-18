@@ -7,7 +7,7 @@ import check.infer.checker (test_owner)
 import check.types (Type, TyCon, TyRecord, int_type, bytes_type, string_type)
 import emit.typing (unknown_type)
 import front
-import front.rows (Rows, KnownDefRow, Dump, EmitterRoot)
+import front.rows (Rows, KnownDefRow, Dump, EmitterRoot, CtorRow)
 import front.published (analyse, analyse_with, no_rows, dump_of, module_of_root)
 import front (analyse_pulling_std_with)
 import std.list
@@ -27,7 +27,9 @@ import emit.roots (builtin_helper, reflection_root, written_root, specialised, s
 import emit.answer (ConstBytes, ConstEmbedded, Defined, Expect, word_head, GenericCall, Exact,
                     Layout, Scalar, no_generics, Tables, no_tables, Emitted, Body, Refused,
                     RootAnswer)
-import emit.reps (SumCtor, no_ctors, ctor_sums, ctor_layouts)
+import emit.reps (Ctors, SumCtor, no_ctors, ctor_sums, ctor_layouts)
+import unit (program_natives)
+import check.infer.definitions (Extern)
 import emit.written (at_args)
 import emit (said, refused_rather_than_emitted, emit_program, emit_roots_answer, zip_sources)
 import front.seam
@@ -403,24 +405,27 @@ test "a definition takes and answers a float as itself, and a call says the head
   ])
 }
 
-test "a lambda reads a field of its parameter or its capture where the record's type lays it" {
+test "a lambda run in another root reads its parameters and captures at their types, a field where the record's type lays it" {
   let src = Bytes::concat_all([
     b"type Fld = { name: Bytes, n: Int }\n",
     b"fn mapped(fs: List<Fld>) -> List<Int> = fs.map(|f: Fld| f.n)\n",
     b"fn folded(fs: List<Fld>) -> Int = fs.fold(0, |acc: Int, f: Fld| acc + f.n)\n",
     b"fn captured(f: Fld, xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + f.n)\n",
+    b"fn offset(k: Int, xs: List<Int>) -> List<Int> = xs.map(|x: Int| { let j = k - 1; x + j })\n",
     b"fn stepped(f: Fld) -> Int / {abort.raise} = iterate(f, 9, |t: Fld| if t.n > 3 { Stop(t.n) } else { Continue({ ..t, n: t.n + 1 }) })\n",
   ]);
-  // `map` and `fold` run their lambdas in the loops of `std.prelude` specialised for them.
+  // `map` and `fold` run their lambdas in the loops of `std.prelude` specialised for them, where an
+  // item and a capture arrive as words.
   let loops = [
     prelude_loop(b"mapped_from", b"m.mapped", 5),
     prelude_loop(b"folded_from", b"m.folded", 5),
     prelude_loop(b"mapped_from", b"m.captured", 5),
+    prelude_loop(b"mapped_from", b"m.offset", 5),
   ];
-  let names = [b"m.mapped", b"m.folded", b"m.captured", b"m.stepped"].concat(loops);
+  let names = [b"m.mapped", b"m.folded", b"m.captured", b"m.offset", b"m.stepped"].concat(loops);
   let answers = answers_of([b"m"], [src], [b"Stop", b"Continue"], names);
   let text = |name: Bytes| answered_body(answers, name).text;
-  assert_eq(loops.map(|n: Bytes| calls_a_value(own_code(text(n)))), [false, false, false]);
+  assert_eq(loops.map(|n: Bytes| calls_a_value(own_code(text(n)))), [false, false, false, false]);
   assert_eq(names.filter(|n: Bytes| text(n).index_of(b"rt_field_p") != None), [])
 }
 
@@ -2324,17 +2329,22 @@ test "a read of a list takes no count of a word held through it, and lets go of 
   let reading = |marker: Bytes|
     range(0, lines.len()).filter(|i: Int| line_at(i).index_of(marker) != None);
   // `start` and `tail_len` read the parameter `List::at` reads again after them where it lies.
-  let headers = reading(b")->layout;").concat(reading(b")->flags;"));
+  let headers = reading(b"ply_obj(p0)->layout;").concat(reading(b"ply_obj(p0)->flags;"));
   assert(
     headers.len() == 2
       && headers.all(|i: Int|
-        line_at(i - 1).index_of(b" = p0;") != None && line_at(i + 1).index_of(b"ply_dec(") == None),
+        line_at(i - 1).index_of(b"ply_inc(") == None
+          && line_at(i + 1).index_of(b"ply_dec(") == None),
     Some(String::of_bytes_lossy(text)),
   );
-  // The tail's item is read at the list's last use, which spends it, so the list is let go after.
-  let items = reading(b" = ply_words(").filter(|i: Int| line_at(i).index_of(b")[1 + (") != None);
+  // The tail's item is read at the list's last use, which spends it: the item takes the count the
+  // answer holds, and the list is let go next.
+  let items = reading(b" = ply_words(p0)[1 + (");
   assert(
-    items.len() == 1 && items.all(|i: Int| line_at(i + 1).index_of(b"ply_dec(ctx, ") != None),
+    items.len() == 1
+      && items.all(|i: Int|
+        line_at(i + 1).index_of(b"ply_inc(") != None
+          && line_at(i + 2).index_of(b"ply_dec(ctx, p0);") != None),
     Some(String::of_bytes_lossy(text)),
   )
 }
@@ -2382,26 +2392,8 @@ fn answers_of(
   emit_roots_answer(
     shipped.map(|s: Source| s.name).concat(names),
     shipped.map(|s: Source| s.src).concat(srcs),
-    { names: ctors, laid: ctor_layouts(d.ctors), keyed: [], sums: ctor_sums(d.ctors) },
-    [
-      b"?numeric_binary",
-      b"compare",
-      b"digest",
-      b"?encoded",
-      b"Bytes::concat_all",
-      b"Bytes::blake3",
-      b"Array::new",
-      b"Array::set",
-      b"Array::of_list",
-      b"List::push",
-      b"Map::len",
-      b"bracket",
-      b"Bytes::slice",
-      b"range",
-      b"reflect",
-      b"shown",
-      b"List::with_capacity",
-    ],
+    loaded_ctors(d, ctors),
+    loaded_natives(shipped.concat(zip_sources(names, srcs)), []),
     wanted,
     [],
     [],
@@ -2611,8 +2603,8 @@ fn sited_answers(sources: List<Source>, d: Dump) -> List<RootAnswer> / {abort.ra
   emit_roots_answer(
     sources.map(|s: Source| s.name),
     sources.map(|s: Source| s.src),
-    no_ctors(),
-    [],
+    loaded_ctors(d, []),
+    loaded_natives(sources, []),
     [b"a.moved", test_owner(b"a", b"moves"), b"b.twice"],
     [],
     [],
@@ -2744,7 +2736,7 @@ test "a buffer read out of a record this body holds alone reaches its append uns
       None -> false,
       Some(a) -> match text(name).index_of(then) { None -> false, Some(b) -> a < b },
     };
-  let takes = |name: Bytes| text(name).index_of(b"] = ply_unit; } else { ply_inc(") != None;
+  let takes = |name: Bytes| text(name).index_of(b"] = ply_unit; else ply_inc(") != None;
   // A record parameter that arrives as its fields gives its buffer's local up outright: nothing is
   // counted again between the branch's opening and the append.
   let moves = |name: Bytes| {
@@ -2893,6 +2885,25 @@ test "a branch lets go as it opens of a parameter only another branch reads, and
   )
 }
 
+/// The constructor table a load hands the emitter for the program `d` was read from: every
+/// constructor it declares, the prelude's among them, those `named` first.
+fn loaded_ctors(d: Dump, named: List<Bytes>) -> Ctors =
+  {
+    names: named.concat(d.ctors.map(|c: CtorRow| c.name).filter(|n: Bytes| !named.contains(n))),
+    laid: ctor_layouts(d.ctors),
+    keyed: [],
+    sums: ctor_sums(d.ctors),
+  }
+
+/// The natives a runtime implements for a program of `sources`, as a load hands the emitter them,
+/// those `named` first.
+fn loaded_natives(sources: List<Source>, named: List<Bytes>) -> List<Bytes> / {abort.raise} =
+  named.concat(
+    program_natives(sources.map(|m: Source| { name: m.name, text: m.src })).map(
+      |e: Extern| e.name,
+    ).filter(|n: Bytes| !named.contains(n)),
+  )
+
 fn emit_all_program(
   sources: List<Source>,
   ctors: List<Bytes>,
@@ -2905,8 +2916,8 @@ fn emit_all_program(
       let d = dump_of(seam::Analysed(w));
       emit_program(
         sources,
-        { names: ctors, laid: ctor_layouts(d.ctors), keyed: [], sums: ctor_sums(d.ctors) },
-        builtins,
+        loaded_ctors(d, ctors),
+        loaded_natives(sources, builtins),
         release,
         // The program's own roots; a prelude function is lowered where one of them calls it.
         Some(
