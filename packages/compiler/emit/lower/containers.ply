@@ -5,8 +5,8 @@
 
 import syntax.parsing (Span, span_key)
 import emit.code (Code, NApp, NVar)
-import check.types (Type, TyVar, TyCon, TyRecord, TyNominal, Field, named_type, int_type,
-                    bytes_type, list_type)
+import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, named_type, int_type,
+                    bytes_type, unit_type, list_type, option_type)
 import emit.typing (unknown_type)
 import check.resolve.tables (qualify)
 import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt, NodeLen, LeafAt,
@@ -21,10 +21,12 @@ import emit.roots (builtin_helper)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RFlat, Leaf, Var, Arg, AVar,
                  Make, MList, Native, Op, OContainer, Let, Containers)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew,
-                            ArraySet, ArrayOfList, ArrayGet, ColumnField, Element, Held, Words,
-                            Bits, Payloads, Records, IntBits, WidthBits, FloatBits, DecimalBits)
-import emit.lower.setting (imported_target, qualified, from_import, module_import, builtin_at)
-import emit.lower.held (held_as, laid_of, laid_fields, slot_rep, field_type)
+                            ArraySet, ArrayOfList, ArrayGet, ColumnField, Position, Element, Held,
+                            Words, Bits, Payloads, Records, IntBits, WidthBits, FloatBits,
+                            DecimalBits)
+import emit.lower.setting (imported_target, qualified, from_import, module_import, builtin_at,
+                           ctor_named)
+import emit.lower.held (held_as, laid_of, laid_fields, slot_rep, field_type, flat, leaves_of)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, noted, type_at,
                         type_of, through_runtime, as_words)
 import emit.lower.scalars (operated)
@@ -189,9 +191,7 @@ fn contained(
   } else if name == b"Bytes::concat_all" && args.len() == 1 { joined(cx, st, args, f, at) }
   else if is_callback(name) {
     refuse(st, Containers, b"a callback builtin outside its fused shape: ".concat(name))
-  } else if name == b"Bytes::position" && cx.setting.release {
-    refuse(st, Containers, b"a byte string's position found by a loop in the body")
-  } else {
+  } else if name == b"Bytes::position" && cx.setting.release { positioned(cx, st, args, at) } else {
     match laid_element(name, args, f) {
       Some(t) -> if has_vars(t) { called(cx, layout_needed(st, t), name, args, f, at) }
       else if name == b"Columns::get" { called(cx, st, name, args, f, at) }
@@ -212,7 +212,7 @@ fn called(
   if !cx.setting.builtins.contains(name) {
     refuse(st, Containers, b"a name the runtime implements no builtin of: ".concat(name))
   } else {
-    match f.ret {
+    match match f.ret { Some(r) -> Some(r), None -> elaborated_answer(cx, name, args, at) } {
       None ->
         refuse(
           st,
@@ -223,6 +223,23 @@ fn called(
       else { through_runtime(cx, st, name, args, ret, at) },
     }
   }
+
+/// What a native the elaboration writes calls of answers, which no declaration states: a handler's
+/// variable the type the checker filed for its read, where the read is written; installing or
+/// setting one `Unit`; a hold's region what its body answers; and a hold, and the value taken out
+/// of one, a word of no type the checker filed. Where nothing says more, the runtime's word.
+fn elaborated_answer(cx: Context, name: Bytes, args: List<Arg>, at: Span) -> Option<Type> = {
+  let word = |t: Option<Type>| match t { Some(x) -> Some(x), None -> Some(unknown_type()) };
+  if name == b"?handler_var" { word(type_at(cx, at)) }
+  else if name == b"?handler_init" || name == b"?handler_set" { Some(unit_type()) }
+  else if name == b"?hold_new" || name == b"?hold_take" { Some(unknown_type()) }
+  else if name == b"?hold_bracket" {
+    word(match args.at(2) {
+      Some(AVar(body)) -> match body.ty { TyFn(f) -> Some(f.ret), _ -> type_at(cx, at) },
+      _ -> type_at(cx, at),
+    })
+  } else { None }
+}
 
 /// `st` noting each type variable that leaves the layout of an element of type `t` unknown, which a
 /// specialisation would lay its elements out by.
@@ -411,19 +428,26 @@ fn laid(cx: Context, st: Lowering, op: Intrinsic, args: List<Arg>, ty: Type, at:
   }
 }
 
-/// The leaves a record of type `ty` an extern answers is held as, one per field in the record's
-/// order, each as a record holds a field of its type; nothing where a field is a record held in
-/// place or a width past a word, which a word cannot be read as.
-fn fields_held(ty: Type) -> Option<List<Leaf>> =
-  match ty {
-    TyRecord(fs) -> {
-      let ls = fs.map(|f: Field| { name: f.name, rep: slot_rep(element_field(f.name, f.ty).kind) });
-      if fs.any(|f: Field| match kind_of(f.ty).ty { TyRec(_) -> true, _ -> false })
-          || ls.any(|x: Leaf| match x.rep { RNum(w) -> w.bits > 64, _ -> false }) { None }
-      else { Some(ls) }
+/// The leaves a record of type `ty` an extern answers is held as: as its type holds it, a record it
+/// holds in place as that record's leaves and then its word; nothing where a record it holds in
+/// place holds one itself or a leaf is a width past a word, which a word cannot be read as.
+fn fields_held(ty: Type) -> Option<List<Leaf>> = {
+  let wide = |ls: List<Leaf>| ls.any(|x: Leaf| match x.rep { RNum(w) -> w.bits > 64, _ -> false });
+  match laid_fields(ty) {
+    Some(fs) -> if flat(fs) && !wide(leaves_of(fs)) { Some(leaves_of(fs)) } else { None },
+    // A record a type variable leaves open holds each field of that variable's type as a word.
+    None -> match ty {
+      TyRecord(fs) -> {
+        let ls = fs.map(|f: Field|
+          { name: f.name, rep: slot_rep(element_field(f.name, f.ty).kind) });
+        if fs.any(|f: Field| match kind_of(f.ty).ty { TyRec(_) -> true, _ -> false }) || wide(ls) {
+          None
+        } else { Some(ls) }
+      },
+      _ -> None,
     },
-    _ -> None,
   }
+}
 
 /// An item read out of an object as the scalar its type holds, or else as the word it is there.
 fn item_rep(cx: Context, ty: Type) -> Rep =
@@ -588,6 +612,40 @@ fn element_rep(e: Element) -> Rep =
 
 fn is_option(t: Type) -> Bool =
   match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
+
+/// `Bytes::position(b, from, f)` under release, written as a loop in the body rather than the
+/// runtime's call: `f` may stop for a handler its effects reach, and a native's frame cannot resume.
+/// It answers the index as an `Option`'s object, made of the program's own constructors.
+fn positioned(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered =
+  match ({ some: ctor_named(cx.setting, b"Some"), none: ctor_named(cx.setting, b"None") }) {
+    { some: Some(some), none: Some(none) } -> match args {
+      [b, from, f] -> {
+        let bw = handed({ st: st, arg: b }, RWord, at);
+        let fr = handed({ st: bw.st, arg: from }, RInt, at);
+        let fw = handed({ st: fr.st, arg: f }, RWord, at);
+        let ty = option_type(int_type());
+        let answered = bound_as(
+          fw.st,
+          ty,
+          RWord,
+          Op({
+            op: OContainer(Position({ some: some, none: none })),
+            args: [bw.arg, fr.arg, fw.arg],
+            uses: { takes: [true, false, true], owned: true, fails: true, stops: true },
+          }),
+          at,
+        );
+        handed(answered, held_as(cx.setting, ty), at)
+      },
+      _ -> refuse(st, Containers, b"a byte string's position on other operands than three"),
+    },
+    _ ->
+      refuse(
+        st,
+        Containers,
+        b"a byte string's position with no `Option` constructors to answer in",
+      ),
+  }
 
 /// A builtin that calls a function it is handed in a shape only a fused loop writes.
 fn is_callback(name: Bytes) -> Bool = name == b"iterate"

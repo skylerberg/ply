@@ -438,6 +438,67 @@ test "a field of a Columns' record is read from its column, with no record made"
   assert_eq(read(b"var_at"), [])
 }
 
+test "under release a byte string's position is a loop in the body, its predicate called through the runtime" {
+  let p = program_with(b"fn found(b: Bytes) -> Option<Int> = b.position(0, |c: Int| c == 32)\n", [
+    b"Bytes::position",
+  ]);
+  let released = { ..p, setting: { ..p.setting, release: true } };
+  assert_eq(
+    ops_in(bound_in(released, b"found")).map(
+      |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.uses,
+    ),
+    [{ takes: [true, false, true], owned: true, fails: true, stops: true }],
+  );
+  let text = form_text(released, b"found");
+  assert(
+    text.index_of(b"rt_call_p(ctx, ") != None && text.index_of(b"break;") != None,
+    Some(String::of_bytes_lossy(text)),
+  );
+  // Without release it is the runtime's call.
+  assert_eq(
+    natives_in(bound_in(p, b"found")).map(
+      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
+    ),
+    [b"builtin_bytes_position_p"],
+  )
+}
+
+test "a handler's variables, a hold's region and `bracket` are the runtime's, each answering its type" {
+  let p = program_with(
+    Bytes::concat_all([
+      b"effect tally {\n  write add(n: Int) -> Unit\n  read total() -> Int\n}\n",
+      b"fn counted() -> Int = handle { tally.add(1); tally.add(2); tally.total() } with { var n = 0, tally.add(k) -> { n = n + k; }, tally.total() -> n }\n",
+      b"fn release(_: Int) -> Unit = ()\n",
+      b"fn held(n: Int) -> Int = with_hold[t](n, release) { c -> c.get() }\n",
+      b"fn bracketed(n: Int) -> Int = bracket(|| n, release, |x: Int| x + 1)\n",
+    ]),
+    [
+      b"?handler_init",
+      b"?handler_var",
+      b"?handler_set",
+      b"?hold_new",
+      b"?hold_take",
+      b"?hold_bracket",
+      b"Hold::get",
+      b"bracket",
+    ],
+  );
+  assert_eq(
+    [b"counted", b"held", b"bracketed"].fold(
+      [],
+      |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
+        match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) },
+    ),
+    [],
+  );
+  assert_eq(
+    natives_in(bound_in(p, b"bracketed")).map(
+      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
+    ),
+    [b"builtin_bracket_p"],
+  )
+}
+
 /// Module `m` of the program of `sources`, run by a runtime implementing `natives`.
 fn program_of_modules(
   sources: List<{ name: Bytes, src: Bytes }>,
@@ -758,6 +819,10 @@ fn in_place_calls() -> List<{ name: Bytes, src: Bytes }> =
       src: b"(n: MapNode<Int, String>) -> String = MapNode::pair_take(n, 1).value",
     },
     {
+      name: b"key_take",
+      src: b"(n: MapNode<{ a: Int, b: Int }, Int>) -> { a: Int, b: Int } = MapNode::pair_take(n, 1).key",
+    },
+    {
       name: b"leaf_cut",
       src: b"(n: MapNode<Int, String>) -> MapNode<Int, String> = MapNode::leaf_cut(n, 16).right",
     },
@@ -900,6 +965,21 @@ test "each extern written in place is an operation over the runtime's objects as
         assert(
           code(b"pair_take").index_of(b"_3 = 0;") != None,
           Some(String::of_bytes_lossy(code(b"pair_take"))),
+        );
+        // A key held in place is its leaves, loaded out of the word the pair held, and that word,
+        // whose count the record takes.
+        assert_eq(fields(b"key_take"), [
+          RFlat([
+            { name: b"key.a", rep: RInt },
+            { name: b"key.b", rep: RInt },
+            { name: b"key", rep: RWord },
+            { name: b"node", rep: RWord },
+            { name: b"value", rep: RInt },
+          ]),
+        ]);
+        assert(
+          code(b"key_take").index_of(b"_0 = (int64_t)(ply_words(") != None,
+          Some(String::of_bytes_lossy(code(b"key_take"))),
         );
         assert_eq(
           calls.filter(|c: { name: Bytes, src: Bytes }| has(c.name, b"builtin_")).map(
