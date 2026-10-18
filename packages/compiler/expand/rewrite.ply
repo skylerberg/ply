@@ -11,7 +11,8 @@ import syntax.items (Module, Item, IFn, ILaw, ISchema, FnDef, Binder, SchemaDef,
                      parse, dump_module)
 import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, EApp, EBlock, ERecord, ERecordUpdate, ETry,
                      EField, EPerform, EHandle, ETryBlock, SLet, Param, NamedArg, RecField,
-                     expr_span, ETagged, Tagged, tagged_call, tagged_fill, slotted, slot_args)
+                     expr_span, ETagged, Tagged, tagged_call, tagged_fill, slotted, slot_args,
+                     try_places)
 import syntax.patterns (PVar, LUnit, LInt, LStr)
 import std.bytes (ascii_of_int)
 import expand.rewrite.shared (map_item, is_tagged, tagged_in, picked_in, is_try_block, rebound,
@@ -444,13 +445,13 @@ pub fn program_wide(name: Bytes) -> Bytes = b"?".concat(name)
 pub fn named_program_wide(written: Bytes) -> Option<Bytes> / {abort.raise} =
   if written.starts_with(b"?") { Some(written.slice(1, written.len())) } else { None }
 
-fn carried(binders: List<Ident>, span: Span) -> Expr =
+fn carried(binders: List<Ident>, span: Span, at: Span) -> Expr =
   match binders {
     [] -> ELit({ span: span, lit: LUnit }),
     [one] -> var_of(one),
     _ ->
       ERecord({
-        span: span,
+        span: at,
         fields: range(0, binders.len()).map(|i: Int|
           match binders.at(i) {
             Some(b) -> { name: positional(i, span), value: var_of(b) },
@@ -459,21 +460,18 @@ fn carried(binders: List<Ident>, span: Span) -> Expr =
       }),
   }
 
-fn answer(ctor: Bytes, value: Expr, span: Span) -> Expr =
-  EApp({
-    span: span,
-    func: var_of({ name: ctor, span: span }),
-    named: [],
-    args: [value],
-    labels: [],
-  })
+/// `ctor` applied to `value` at `span`, the constructor itself written at `at`.
+fn answer(ctor: Bytes, value: Expr, span: Span, at: Span) -> Expr =
+  EApp({ span: span, func: var_of({ name: ctor, span: at }), named: [], args: [value], labels: [] })
 
 /// A span the table does not hold belongs to a program that did not check; the lowering declines it.
+/// The parts the check typed for the `handle` stand at `try_places`, where it filed their types.
 fn expanded_try(answered: Map<Bytes, Answered>, expr: Expr) -> Expr =
   match expr {
     ETryBlock(t) -> match answered.get(span_key(t.span)) {
       None -> expr,
       Some(a) -> {
+        let at = try_places(t.span);
         let binders = range(0, a.arity).map(|i: Int|
           { name: b"?r".concat(ascii_of_int(i)), span: t.span });
         let returned = { name: b"?v", span: t.span };
@@ -482,8 +480,8 @@ fn expanded_try(answered: Map<Bytes, Answered>, expr: Expr) -> Expr =
           body: t.body,
           ret: Some({
             binder: returned,
-            body: answer(b"Ok", var_of(returned), t.span),
-            span: t.span,
+            body: answer(b"Ok", var_of(returned), t.span, at.ok),
+            span: at.ret,
           }),
           clauses: [
             {
@@ -493,8 +491,8 @@ fn expanded_try(answered: Map<Bytes, Answered>, expr: Expr) -> Expr =
               every_label: false,
               label_binder: None,
               resume: None,
-              body: answer(b"Err", carried(binders, t.span), t.span),
-              span: t.span,
+              body: answer(b"Err", carried(binders, t.span, at.carried), t.span, at.err),
+              span: at.clause,
               params: binders,
             },
           ],
