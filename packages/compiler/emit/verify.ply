@@ -345,9 +345,14 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             };
             match acc.missed {
               None -> { ..acc, missed: Some(handed), live: false },
-              Some(m) -> if m.owned == handed.owned && m.joins == handed.joins
-                  && m.taken == handed.taken { { ..acc, live: false } }
-              else { { ..acc, fault: Some(b"the misses of an arm hold different counts") } },
+              // A field taken before any miss is taken for the next arm.
+              Some(m) -> if m.owned == handed.owned && m.joins == handed.joins {
+                {
+                  ..acc,
+                  missed: Some({ ..m, taken: taken_either(m.taken, handed.taken) }),
+                  live: false,
+                }
+              } else { { ..acc, fault: Some(b"the misses of an arm hold different counts") } },
             }
           },
         },
@@ -703,10 +708,16 @@ fn joined(before: Walk, a: Walk, b: Walk) -> Walk =
     None -> match b.fault {
       Some(_) -> b,
       None -> {
-        let missed = match a.missed { Some(_) -> a.missed, None -> b.missed };
+        let missed = match a.missed {
+          Some(x) -> match b.missed {
+            Some(y) -> Some({ ..x, taken: taken_either(x.taken, y.taken) }),
+            None -> a.missed,
+          },
+          None -> b.missed,
+        };
         let both = match a.missed {
           Some(x) -> match b.missed {
-            Some(y) -> x.owned != y.owned || x.joins != y.joins || x.taken != y.taken,
+            Some(y) -> x.owned != y.owned || x.joins != y.joins,
             None -> false,
           },
           None -> false,
@@ -1702,22 +1713,31 @@ test "an arm's misses hand the next arm only the joins declared before the match
   )
 }
 
-test "an arm's misses agree on the fields taken, a read by name is held, and no handle is handed a stacked closure" {
+test "a field taken before any miss is taken for the next arm, a read by name is held, and no handle is handed a stacked closure" {
   let p = word(0);
   let c = flag(1);
   let x = word(2);
+  let y = word(5);
   let take = bind(x, Take({ of: p, path: PField({ name: b"f", at: 0 }) }), []);
-  assert_eq(
+  let next_reads = |name: Bytes, at: Int|
     verified(
       root_of([p, c], [], RWord, [
         Match({
-          arms: [[If({ cond: AVar(c), then: [take, Dec(x), Miss], otherwise: [Miss] })]],
+          arms: [
+            [If({ cond: AVar(c), then: [take, Dec(x), Miss], otherwise: [Miss] })],
+            [
+              bind(y, Get({ of: p, path: PField({ name: name, at: at }) }), []),
+              Inc({ var: y, n: 1 }),
+              Dec(p),
+              Return(AVar(y)),
+            ],
+          ],
           rest: [Dec(p), Return(AZero(RWord))],
         }),
       ]),
-    ),
-    Some(b"the misses of an arm hold different counts"),
-  );
+    );
+  assert_eq(next_reads(b"g", 1), None);
+  assert_eq(next_reads(b"f", 0), Some(b"a field read after it was taken out of its block: v5"));
   assert_eq(
     verified(
       root_of([p], [], RWord, [
