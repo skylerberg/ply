@@ -8,11 +8,11 @@
 import emit.tir (Rep, RWord, RInt, RBool, RNum, RMaybe, RTagged, RFlat, RCases, RToken, Leaf, Var,
                  Arg, AVar, AInt, ABool, Val, Call, Apply, Make, Pack, Gathered, Native, Op, Get,
                  Take, Static, Prim, Path, PLeaf, PField, PArg, PNamed, Made, MRecord, MCtor,
-                 MClosure, AZero, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next,
-                 Done, Return, Restart, Enter, Fail, NoArm, Handle, Sited, Inc, Dec, Reset, Free,
-                 Opened, Block, Fn, Rooted, Lambda, Closure, Handed, Given, Lent, Convention,
-                 Answered, Owns, ReadsOf, Lasts, no_links, counted, operands, answered, fails,
-                 used_as, rep_of_arg, var_of, parts_of, Test, TTag, TInt, TRange)
+                 MClosure, MList, AZero, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop,
+                 Next, Done, Return, Restart, Enter, Fail, NoArm, Handle, Sited, Inc, Dec, Reset,
+                 Free, Opened, Block, Fn, Member, Rooted, Lambda, Closure, Handed, Given, Lent,
+                 Convention, Answered, Owns, ReadsOf, Lasts, no_links, counted, operands, answered,
+                 fails, used_as, rep_of_arg, var_of, parts_of, Test, TTag, TInt, TRange)
 import emit.keys (Named, Root)
 import emit.reps (FieldTy, TyRec, kind_of, in_place)
 import check.types (Type, TyCon, TyRecord)
@@ -69,6 +69,108 @@ type Looped = { held: Map<Int, Int>, state: List<Var>, answer: Var }
 /// Why `f`, or a closure it makes, breaks a rule of the form, or nothing where both keep them all.
 /// A tail group's arm `i` starts holding member `i`'s parameters and answers as that member does.
 pub fn verified(f: Fn) -> Option<Bytes> = {
+  let bound = f.members.fold(
+    binding(f.params.fold(Map::new(), bound_as), f.body),
+    |m: Map<Int, Rep>, x: Member| x.params.fold(m, bound_as),
+  );
+  match used_otherwise(bound, f.body) {
+    Some(v) ->
+      Some(
+        Bytes::concat_all([
+          b"a variable used held otherwise than it was bound: v",
+          ascii_of_int(v.id),
+        ]),
+      ),
+    None -> body_verified(f),
+  }
+}
+
+/// `m` with `v` bound as it is held.
+fn bound_as(m: Map<Int, Rep>, v: Var) -> Map<Int, Rep> = m.insert(v.id, v.rep)
+
+/// `bound` with every variable `b` binds, as each is held where it is bound.
+fn binding(bound: Map<Int, Rep>, b: Block) -> Map<Int, Rep> =
+  b.fold(bound, |m: Map<Int, Rep>, i: Inst|
+    match i {
+      Let(l) -> bound_as(m, l.var),
+      Decl(v) -> bound_as(m, v),
+      If(x) -> binding(binding(m, x.then), x.otherwise),
+      Case(c) ->
+        c.arms.fold(binding(m, c.rest), |a: Map<Int, Rep>, arm: { when: Int, body: Block }|
+          binding(a, arm.body)),
+      Match(x) -> x.arms.fold(binding(m, x.rest), binding),
+      Loop(l) -> binding(bound_as(l.state.fold(m, bound_as), l.answer), l.body),
+      Handle(h) -> binding(bound_as(m, h.answer), h.body),
+      Reset(r) -> bound_as(m, r.token),
+      Opened(o) -> o.words.fold(m, bound_as),
+      _ -> m,
+    })
+
+/// The first variable `b` uses held otherwise than `bound` says it was bound.
+fn used_otherwise(bound: Map<Int, Rep>, b: Block) -> Option<Var> = {
+  let off = |vs: List<Var>|
+    vs.fold(None, |found: Option<Var>, v: Var|
+      match found {
+        Some(_) -> found,
+        None -> match bound.get(v.id) {
+          Some(r) -> if r != v.rep { Some(v) } else { None },
+          None -> None,
+        },
+      });
+  let of_args = |args: List<Arg>|
+    off(
+      args.fold([], |vs: List<Var>, a: Arg| match var_of(a) { Some(v) -> vs.push(v), None -> vs }),
+    );
+  b.fold(None, |found: Option<Var>, i: Inst|
+    match found {
+      Some(_) -> found,
+      None -> match i {
+        Let(l) -> of_args(operands(l.val).map(|o: { arg: Arg, takes: Bool }| o.arg)),
+        Do(d) -> of_args(operands(d.val).map(|o: { arg: Arg, takes: Bool }| o.arg)),
+        Assign(s) -> match off([s.var]) { Some(v) -> Some(v), None -> of_args([s.arg]) },
+        If(x) -> match of_args([x.cond]) {
+          Some(v) -> Some(v),
+          None -> match used_otherwise(bound, x.then) {
+            Some(v) -> Some(v),
+            None -> used_otherwise(bound, x.otherwise),
+          },
+        },
+        Case(c) -> match off([c.on]) {
+          Some(v) -> Some(v),
+          None ->
+            c.arms.fold(
+              used_otherwise(bound, c.rest),
+              |f: Option<Var>, arm: { when: Int, body: Block }|
+                match f { Some(_) -> f, None -> used_otherwise(bound, arm.body) },
+            ),
+        },
+        Match(x) ->
+          x.arms.fold(used_otherwise(bound, x.rest), |f: Option<Var>, arm: Block|
+            match f { Some(_) -> f, None -> used_otherwise(bound, arm) }),
+        Loop(l) -> match of_args(l.init) {
+          Some(v) -> Some(v),
+          None -> used_otherwise(bound, l.body),
+        },
+        Handle(h) -> match of_args(h.args) {
+          Some(v) -> Some(v),
+          None -> used_otherwise(bound, h.body),
+        },
+        Next(args) -> of_args(args),
+        Done(a) -> of_args([a]),
+        Return(a) -> of_args([a]),
+        Restart(args) -> of_args(args),
+        Enter(e) -> of_args(e.args),
+        Inc(n) -> off([n.var]),
+        Dec(v) -> off([v]),
+        Reset(r) -> off([r.of]),
+        Free(r) -> off([r.of]),
+        Opened(o) -> off([o.of]),
+        _ -> None,
+      },
+    })
+}
+
+fn body_verified(f: Fn) -> Option<Bytes> = {
   let top = {
     looped: None,
     landing: Map::new(),
@@ -1013,15 +1115,20 @@ fn held_otherwise(v: Var, val: Val) -> Option<Bytes> =
     } else { None },
     Pack(p) -> if p.to != v.rep { Some(b"a value packed otherwise than its variable holds it: v") }
     else { None },
-    Make(m) -> match m.reuse {
-      Some(t) -> if !is_token(t) { Some(b"a value made in cells no reset kept: v") }
-      else if !reuses_cells(m.made) { Some(b"a value made in cells its printer does not take: v") }
-      else if t.rep != RToken(made_width(m.made)) || made_width(m.made) == 0 {
-        Some(b"a value made in cells of another size: v")
-      } else if m.kept.any(|k: Int| k < 0 || k >= m.args.len()) {
-        Some(b"a value made keeping a field it does not have: v")
-      } else { None },
-      None -> if m.kept.len() > 0 { Some(b"a value made afresh keeping fields: v") } else { None },
+    // Whatever it makes, a `Make` answers the one word of an object.
+    Make(m) -> if v.rep != RWord { Some(b"a value made held otherwise than as its word: v") } else {
+      match m.reuse {
+        Some(t) -> if !is_token(t) { Some(b"a value made in cells no reset kept: v") }
+        else if !reuses_cells(m.made) {
+          Some(b"a value made in cells its printer does not take: v")
+        } else if t.rep != RToken(made_width(m.made)) || made_width(m.made) == 0 {
+          Some(b"a value made in cells of another size: v")
+        } else if m.kept.any(|k: Int| k < 0 || k >= m.args.len()) {
+          Some(b"a value made keeping a field it does not have: v")
+        } else { None },
+        None -> if m.kept.len() > 0 { Some(b"a value made afresh keeping fields: v") }
+        else { None },
+      }
     },
     _ -> None,
   }
@@ -1169,6 +1276,30 @@ test "a branch tests a Bool, and a case a number, held as one, never a word that
     ]);
   assert_eq(verified(cased(flag(0))), None);
   assert_eq(verified(cased(boxed)), Some(b"a case testing as a number a value held otherwise: v0"))
+}
+
+test "a variable is used held as it was bound, which its C names follow" {
+  let p = word(0);
+  let n = word(1);
+  let body = |answer: Var| [bind(n, call_of([AVar(p)], []), []), Return(AVar(answer))];
+  assert_eq(verified(root_of([p], [], RWord, body(n))), None);
+  // Held as a record's leaves, its uses would name C values no binding declared.
+  assert_eq(
+    verified(root_of([p], [], RWord, body({ ..n, rep: RFlat([{ name: b"a", rep: RWord }]) }))),
+    Some(b"a variable used held otherwise than it was bound: v1"),
+  );
+  // Whatever it makes, a make answers an object's one word.
+  let leaves = { ..n, rep: RFlat([{ name: b"a", rep: RWord }]) };
+  let listed = Make({ made: MList(1), args: [AVar(p)], reuse: None, kept: [] });
+  assert_eq(
+    verified(
+      root_of([p], [], RFlat([{ name: b"a", rep: RWord }]), [
+        bind(leaves, listed, []),
+        Return(AVar(leaves)),
+      ]),
+    ),
+    Some(b"a value made held otherwise than as its word: v1"),
+  )
 }
 
 test "the paths out of a branch hold the same counts and set the same joins" {
