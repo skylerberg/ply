@@ -44,9 +44,11 @@ impl Ctx {
 /// with each performed atom's count in `performs`, ordered by the atom.
 pub(super) fn metered(ctx: &mut Ctx, f: Word) -> Word {
     let before = ctx.cost();
+    crate::detached::drain(ctx);
     let held = ctx.heap.live();
     let performed = ctx.performed.len();
     let value = call_value(std::ptr::from_mut(ctx), f, &[]);
+    crate::detached::drain(ctx);
     let live = ctx.heap.live() as i64 - held as i64;
     heap::dec(f);
     if ctx.failed != 0 {

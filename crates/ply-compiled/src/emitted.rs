@@ -54,13 +54,62 @@ impl Block {
         unsafe { heap::last_of_shared(o) }
     }
 
-    /// Gives back a runtime handle whose last holder was the caller.
+    /// Gives back a runtime handle whose last holder was the caller. A continuation's stop is dropped
+    /// at the next drain of the entry's dead continuations.
     ///
     /// # Safety
-    /// The block is a live handle the runtime made: a bridge, a hold or a continuation; `heap` is
+    /// The block is a live handle the runtime made: a bridge, a hold or a continuation; `ctx` is
     /// the running entry's.
-    pub unsafe fn free_handle(self, heap: *mut Heap) {
-        unsafe { heap::free_handle(self.obj(), heap) }
+    pub unsafe fn free_handle(self, ctx: *mut Ctx) {
+        unsafe {
+            crate::detached::died(ctx, self.obj());
+            heap::free_handle(self.obj(), &raw mut (*ctx).heap);
+        }
+    }
+
+    /// One holder more, counted as emitted code's `ply_dup` counts one: an immortal block keeps its
+    /// count, and a shared one is counted atomically.
+    pub fn dup(&self) {
+        let o = self.obj();
+        let rc = unsafe { heap::count_of(o) };
+        if rc < SHARED {
+            unsafe { (*o).rc = rc + 1 };
+        } else if rc != IMMORTAL {
+            heap::inc_shared(self.0);
+        }
+    }
+
+    /// One holder fewer, counted as emitted code's `ply_last` counts one: whether the caller held
+    /// the last, the block then the caller's to release.
+    ///
+    /// # Safety
+    /// The block is live, and the caller holds a count of it.
+    pub unsafe fn last(&self) -> bool {
+        let o = self.obj();
+        match unsafe { heap::count_of(o) } {
+            IMMORTAL => false,
+            rc if rc >= SHARED => unsafe { heap::last_of_shared(o) },
+            rc if rc > 1 => {
+                unsafe { (*o).rc = rc - 1 };
+                false
+            }
+            rc => {
+                debug_assert_eq!(rc, 1, "{self:?} was let go of after it died");
+                true
+            }
+        }
+    }
+
+    /// Releases a function value whose last holder was the caller, through the release entry of
+    /// the descriptor its first word names.
+    ///
+    /// # Safety
+    /// The block is a closure emitted code laid out; `ctx` is the running entry's.
+    pub unsafe fn release_function(self, ctx: *mut Ctx) {
+        unsafe {
+            let desc = &**(self.0 as *const *const PlyFnDesc).byte_add(HEADER);
+            (desc.release)(ctx, Handed(self.0));
+        }
     }
 }
 
@@ -155,6 +204,25 @@ impl Carried {
 /// A drop root, as emitted code writes one: the release of a value whose last holder let it go,
 /// given the word that holder had.
 pub type DropRoot = unsafe extern "C" fn(*mut Ctx, Handed) -> Word;
+
+/// A function value's descriptor, static data emitted code lays out per lambda, which the first word
+/// past a closure block's header names. The runtime calls through `uniform` and releases through
+/// `release`; it reads none of the rest.
+#[repr(C)]
+pub struct PlyFnDesc {
+    /// Calls the function with the block and every argument as its word form.
+    pub uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word,
+    /// The entry at the function type's own convention, which only emitted code calls.
+    pub typed: *const (),
+    pub convention: Word,
+    /// Releases a block whose last holder let it go: its captures, then its memory.
+    pub release: DropRoot,
+    pub share: *const (),
+    pub keep: *const (),
+}
+
+// SAFETY: a descriptor is read-only data, which nothing writes once its unit is loaded.
+unsafe impl Sync for PlyFnDesc {}
 
 // SAFETY: each is passed as one machine word, as an `int64_t` is.
 unsafe impl Taken for Block {}

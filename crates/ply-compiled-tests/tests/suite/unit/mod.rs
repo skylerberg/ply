@@ -6,7 +6,9 @@
 mod backend;
 mod blocks;
 mod c;
+mod detached;
 mod emitted;
+mod frames;
 mod heap;
 mod linked;
 mod list;

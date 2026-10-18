@@ -42,7 +42,7 @@ pub unsafe extern "C" fn rt_dec_shared_last(_ctx: *mut Ctx, o: Block) -> Word {
 /// code, after letting go of what the runtime keeps for it. Emitted code lets go of what a hold
 /// holds first: this reads none of a hold's words.
 pub unsafe extern "C" fn rt_handle_free(ctx: *mut Ctx, h: Block) {
-    unsafe { h.free_handle(&raw mut (*ctx).heap) }
+    unsafe { h.free_handle(ctx) }
 }
 
 /// A checked build's trap: emitted code released a block whose last holder had let it go. Never

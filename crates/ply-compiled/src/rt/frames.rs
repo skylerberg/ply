@@ -281,8 +281,7 @@ impl StackCopy {
 }
 
 /// A call's arguments held in the calling runtime frame itself, so a snapshot of its stack copies
-/// them with it; past [`ARGS_INLINE`], a flat record nothing counts the words of, which the
-/// snapshot holds as it holds any word on the stack.
+/// them with it; past [`ARGS_INLINE`], a flat record nothing counts the words of.
 pub(crate) struct Args {
     pub(super) len: usize,
     pub(super) inline: [Word; ARGS_INLINE],
@@ -383,8 +382,9 @@ pub(crate) struct FrameClause {
     pub(super) resource: Option<Symbol>,
     pub(super) op: Symbol,
     pub(super) closure: Word,
-    /// 0: never resumes; 1: resumes in tail position; 2: elsewhere (only in a detached frame);
-    /// 3: answers a raise, once its `handle`'s body is abandoned.
+    /// 0: never resumes; 1: resumes in tail position; 3: answers a raise, once its `handle`'s body
+    /// is abandoned. Off the tail, only in a detached frame: 2 resumes at most once, 4 may resume
+    /// again.
     pub(super) resumes: u8,
     /// `[*t]`: the clause's first slot after the parameters is the label the call site named.
     pub(super) binds_label: bool,
@@ -404,6 +404,16 @@ impl FrameClause {
     /// `abort.raise` is a raise whatever its clause is marked: the runtime raises it itself.
     pub(super) fn raises(&self) -> bool {
         self.resumes == 3 || is_abort(self.effect.as_str(), self.op.as_str())
+    }
+
+    /// Resumes off the tail: its `handle`'s body runs detached, and a `perform` it answers stops it.
+    pub(super) fn off_tail(&self) -> bool {
+        matches!(self.resumes, 2 | 4)
+    }
+
+    /// May resume a stop more than once, so each is snapshotted.
+    pub(super) fn again(&self) -> bool {
+        self.resumes == 4
     }
 
     pub(super) fn answers_raise(&self, effect: &str, op: &str) -> bool {

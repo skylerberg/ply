@@ -225,12 +225,12 @@ pub unsafe extern "C" fn rt_perform(
                 .iter()
                 .find(|cl| cl.answers(&effect, &op, resource.as_ref()))
             {
-                if cl.resumes == 2 {
+                if cl.off_tail() {
                     let Some(id) = f.detached else {
                         inherited_off_tail = true;
                         break 'search;
                     };
-                    let closure = cl.closure;
+                    let (closure, again) = (cl.closure, cl.again());
                     let mut bound: Vec<Word> = args_of(args, n).to_vec();
                     if cl.binds_label
                         && let Some(label) = &resource
@@ -239,7 +239,14 @@ pub unsafe extern "C" fn rt_perform(
                     }
                     // Moved in: a local owning memory across the switch is freed once per restore.
                     return unsafe {
-                        crate::detached::stop(ctx, id, closure, bound, (effect, op, resource))
+                        crate::detached::stop(
+                            ctx,
+                            id,
+                            closure,
+                            bound,
+                            again,
+                            (effect, op, resource),
+                        )
                     };
                 }
                 found = Some((stack, i, cl.closure, cl.resumes != 0, cl.binds_label));

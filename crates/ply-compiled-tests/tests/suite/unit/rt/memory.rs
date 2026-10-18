@@ -56,8 +56,8 @@ fn free(ctx: &mut Ctx, w: Word, bytes: Word) {
 #[test]
 fn the_fields_a_drop_root_keeps_follow_those_every_unit_reads() {
     use std::mem::offset_of;
-    assert_eq!(offset_of!(Ctx, release_depth), 64);
-    assert_eq!(offset_of!(Ctx, release_waiting), 72);
+    assert_eq!(offset_of!(Ctx, release_depth), 72);
+    assert_eq!(offset_of!(Ctx, release_waiting), 80);
 }
 
 #[test]

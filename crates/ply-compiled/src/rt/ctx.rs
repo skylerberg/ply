@@ -26,6 +26,10 @@ pub struct Ctx {
     /// The tick at which compiled code calls [`rt_tick`] back; `i64::MAX` when neither the budget
     /// nor the clock bounds this entry, so nothing calls back at all.
     pub next_tick: i64,
+    /// The innermost frame record on the running stack's chain: [`crate::frames::base`] at the
+    /// bottom of a detached body's own stack, the one kind that records, and null on any other. A
+    /// switch saves it with the stack it leaves and puts back the other's.
+    pub frames: *mut crate::frames::PlyFrame,
     /// How deeply drop roots run nested: one at [`RELEASE_DEPTH`] puts its release off through
     /// [`rt_release_later`], and the outermost drains what waits through [`rt_release_drain`].
     /// Compiled code reads and writes it, so it stays among the fields before the runtime's own.
@@ -103,6 +107,9 @@ pub struct Ctx {
     pub(super) outer_instances: Option<ply_core::Instances>,
     /// Releases a drop root at [`RELEASE_DEPTH`] put off: each word with the root that releases it.
     pub(crate) release_later: Vec<(crate::emitted::Handed, crate::emitted::DropRoot)>,
+    /// Stops whose continuation's last holder let it go, by body and capture, for the next drain to
+    /// drop: never inside the release that let it go.
+    pub(crate) continuations_died: Vec<(usize, usize)>,
 }
 
 impl Ctx {
@@ -117,6 +124,7 @@ impl Ctx {
             ticks: 0,
             charged: Cost::default(),
             next_tick: i64::MAX,
+            frames: std::ptr::null_mut(),
             release_depth: 0,
             release_waiting: 0,
             step_budget: 0,
@@ -159,6 +167,7 @@ impl Ctx {
             outer: (std::ptr::null_mut(), std::ptr::null()),
             outer_instances: None,
             release_later: Vec::new(),
+            continuations_died: Vec::new(),
         }
     }
 
@@ -336,6 +345,7 @@ impl Ctx {
         });
         self.arm_tick();
         self.stack_floor = stack_floor();
+        self.frames = std::ptr::null_mut();
         self.site_root = -1;
         self.last_linear = None;
         self.diagnostic = None;
@@ -362,6 +372,7 @@ impl Ctx {
             self.end();
         }
         self.detached.clear();
+        self.continuations_died.clear();
         self.entry = ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         // Another unit's entry may be running further up this thread: it gets its own back at `end`.
         self.outer = (
@@ -417,6 +428,7 @@ impl Ctx {
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
+        crate::detached::teardown(self);
         debug_assert!(
             self.release_later.is_empty() && self.release_depth == 0,
             "an entry ended with a release still running or waiting"

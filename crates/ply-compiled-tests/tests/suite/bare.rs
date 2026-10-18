@@ -13,13 +13,19 @@ use std::sync::{Arc, Mutex};
 
 /// A context over a unit of no definitions, constants or types.
 pub fn context() -> Ctx {
+    context_of(&[], Vec::new())
+}
+
+/// A context over a unit whose bodies read `fields` and whose compiled functions are `functions`,
+/// by index.
+pub fn context_of(fields: &[&str], functions: Vec<usize>) -> Ctx {
     Ctx::new(Arc::new(Tables {
         consts: Vec::new(),
         const_words: Vec::new(),
         layouts: Layouts::new(Vec::new()),
-        fields: Vec::new(),
+        fields: fields.iter().map(ply_core::Symbol::new).collect(),
         builtins: Vec::new(),
-        functions: Vec::new(),
+        functions,
         memo: Box::default(),
         memo_costs: Box::default(),
         lambdas: Box::default(),
