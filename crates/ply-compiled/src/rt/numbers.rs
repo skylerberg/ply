@@ -64,7 +64,7 @@ pub unsafe extern "C" fn rt_float_rem(_ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     ply_core::float::bits(a % b) as i64
 }
 
-/// The operator codes compiled code hands [`rt_binary`]; `emit.ply`'s `binary_code` must match.
+/// The operator codes compiled code hands [`rt_binary`]; `emit/c.ply`'s `binary_code` must match.
 pub(super) const BINOPS: [BinOp; 18] = [
     BinOp::Add,
     BinOp::Sub,
@@ -365,7 +365,7 @@ pub unsafe extern "C" fn rt_let_no_match(ctx: *mut Ctx) {
     raise_error(ctx, d);
 }
 
-/// `what` is `emit.ply`'s `overflow_code`.
+/// `what` is `emit/c.ply`'s `overflow_code`.
 pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };
     let name = match what {
