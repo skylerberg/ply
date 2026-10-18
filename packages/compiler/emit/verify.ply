@@ -316,64 +316,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
   b.fold(w, |acc: Walk, i: Inst|
     if acc.fault != None || !acc.live { acc } else {
       match i {
-        Let(l) -> match token_across(acc.h, l.val) {
-          Some(t) -> { ..acc, fault: Some(across_stop(t)) },
-          None -> match field_fault(
-              acc.h,
-              match cx.looped { Some(lp) -> lp.held, None -> Map::new() },
-              l.var,
-              l.val,
-            ) {
-            Some(f) -> faulted(acc, f.why, f.v),
-            None ->
-              noted(
-                match token_in(read_args(l.val)) {
-                  Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
-                  None -> match word_read(acc, l.var, l.val) {
-                    Some(w) -> w,
-                    None -> match escaping(acc.h, l.val) {
-                      Some(c) ->
-                        faulted(
-                          acc,
-                          b"a closure on this frame's stack handed beyond the call it is lent to: v",
-                          c,
-                        ),
-                      None -> match stacked_captures(l.val) {
-                        Some(caps) -> {
-                          let read = failing(cx, used(acc, operands(l.val)), l.val, l.unwind);
-                          {
-                            ..read,
-                            h: {
-                              ..read.h,
-                              stacks: read.h.stacks.insert(
-                                l.var.id,
-                                caps.fold([], |vs: List<Var>, a: Arg|
-                                  match var_of(a) {
-                                    Some(v) -> if counted(v.rep) { vs.push(v) } else { vs },
-                                    None -> vs,
-                                  }),
-                              ),
-                            },
-                          }
-                        },
-                        None -> match held_otherwise(l.var, l.val) {
-                          Some(why) -> faulted(acc, why, l.var),
-                          None ->
-                            result(
-                              failing(cx, used(acc, operands(l.val)), l.val, l.unwind),
-                              l.var,
-                              answered(l.val),
-                            ),
-                        },
-                      },
-                    },
-                  },
-                },
-                l.var,
-                l.val,
-              ),
-          },
-        },
+        Let(l) -> let_walked(cx, acc, l.var, l.val, l.unwind),
         Do(d) -> match token_in(read_args(d.val)) {
           Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
           None -> if token_across(acc.h, d.val) != None {
@@ -566,57 +509,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             cx.landing,
             b"a count held otherwise than the handle around holds where the body fails: v",
           ),
-        Handle(x) -> match token_in(x.args) {
-          Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
-          None -> if taken_whole(acc.h, x.args) != None {
-            { ..acc, fault: Some(b"a block used whole after a field was taken out of it") }
-          } else if x.args.any(|a: Arg|
-              match var_of(a) { Some(v) -> acc.h.stacks.contains(v.id), None -> false }) {
-            {
-              ..acc,
-              fault: Some(
-                b"a closure on this frame's stack handed to a handle, whose clauses may keep it",
-              ),
-            }
-          } else {
-            let h = used(acc, used_as(x.args, x.uses));
-            let across = h.h;
-            let after = {
-              ..h,
-              h: {
-                ..across,
-                owned: if counted(x.answer.rep) { across.owned.insert(x.answer.id, 1) }
-                else { across.owned },
-              },
-            };
-            if h.fault != None { h } else if with_released(cx.landing, x.unwind) != across.owned {
-              {
-                ..h,
-                fault: Some(
-                  b"a handle whose landing releases other than what it holds across its body",
-                ),
-              }
-            } else if x.site.detached != None { after } else {
-              let body = walked(
-                f,
-                { ..cx, looped: None, landing: across.owned, arm: None, handled: true },
-                { ..h, h: declared(across, x.answer.id), missed: None, done: false },
-                x.body,
-              );
-              if body.fault != None { { ..h, fault: body.fault } }
-              else if !body.live { after } else if body.h.joins.get(x.answer.id) != Some(true) {
-                { ..h, fault: Some(b"a handle's body that ends without its answer") }
-              } else if body.h.owned != after.h.owned {
-                {
-                  ..h,
-                  fault: Some(
-                    b"a handle's body that ends holding other counts than the handle holds across it",
-                  ),
-                }
-              } else { after }
-            }
-          },
-        },
+        Handle(_) -> handle_walked(f, cx, acc, i),
         Inc(n) -> if !counted(n.var.rep) {
           faulted(acc, b"a count taken of a value that holds none: v", n.var)
         } else if is_token(n.var) { faulted(acc, b"a count taken of a reuse token: v", n.var) }
@@ -662,6 +555,114 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
         Sited(_) -> acc,
       }
     })
+
+/// `acc` past `y` bound to `val`, whose failure path releases `unwind`: its operands used as `val`
+/// takes them, and `y` held as `val` answers it.
+fn let_walked(cx: Within, acc: Walk, y: Var, val: Val, unwind: List<Var>) -> Walk =
+  match token_across(acc.h, val) {
+    Some(t) -> { ..acc, fault: Some(across_stop(t)) },
+    None -> match field_fault(
+        acc.h,
+        match cx.looped { Some(lp) -> lp.held, None -> Map::new() },
+        y,
+        val,
+      ) {
+      Some(f) -> faulted(acc, f.why, f.v),
+      None -> noted(bound_walked(cx, acc, y, val, unwind), y, val),
+    },
+  }
+
+/// `let_walked` past the fields `val` reads: a reuse token is never its operand, an opened value's
+/// leaf is its word, a closure on this frame's stack reads its captures, and anything else is held as
+/// it answers.
+fn bound_walked(cx: Within, acc: Walk, y: Var, val: Val, unwind: List<Var>) -> Walk =
+  match token_in(read_args(val)) {
+    Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
+    None -> match word_read(acc, y, val) {
+      Some(w) -> w,
+      None -> match escaping(acc.h, val) {
+        Some(c) ->
+          faulted(
+            acc,
+            b"a closure on this frame's stack handed beyond the call it is lent to: v",
+            c,
+          ),
+        None -> match stacked_captures(val) {
+          Some(caps) -> {
+            let read = failing(cx, used(acc, operands(val)), val, unwind);
+            let held = caps.fold([], |vs: List<Var>, a: Arg|
+              match var_of(a) {
+                Some(v) -> if counted(v.rep) { vs.push(v) } else { vs },
+                None -> vs,
+              });
+            { ..read, h: { ..read.h, stacks: read.h.stacks.insert(y.id, held) } }
+          },
+          None -> match held_otherwise(y, val) {
+            Some(why) -> faulted(acc, why, y),
+            None -> result(failing(cx, used(acc, operands(val)), val, unwind), y, answered(val)),
+          },
+        },
+      },
+    },
+  }
+
+/// `acc` past `handle`, `i`: its operands used, what its landing releases held across its body, and
+/// its body walked to end holding that and its answer.
+fn handle_walked(f: Fn, cx: Within, acc: Walk, i: Inst) -> Walk =
+  match i {
+    Handle(x) -> match token_in(x.args) {
+      Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
+      None -> if taken_whole(acc.h, x.args) != None {
+        { ..acc, fault: Some(b"a block used whole after a field was taken out of it") }
+      } else if x.args.any(|a: Arg|
+          match var_of(a) { Some(v) -> acc.h.stacks.contains(v.id), None -> false }) {
+        {
+          ..acc,
+          fault: Some(
+            b"a closure on this frame's stack handed to a handle, whose clauses may keep it",
+          ),
+        }
+      } else {
+        let h = used(acc, used_as(x.args, x.uses));
+        let across = h.h;
+        let after = {
+          ..h,
+          h: {
+            ..across,
+            owned: if counted(x.answer.rep) { across.owned.insert(x.answer.id, 1) }
+            else { across.owned },
+          },
+        };
+        if h.fault != None { h } else if with_released(cx.landing, x.unwind) != across.owned {
+          {
+            ..h,
+            fault: Some(
+              b"a handle whose landing releases other than what it holds across its body",
+            ),
+          }
+        } else if x.site.detached != None { after } else {
+          let body = walked(
+            f,
+            { ..cx, looped: None, landing: across.owned, arm: None, handled: true },
+            { ..h, h: declared(across, x.answer.id), missed: None, done: false },
+            x.body,
+          );
+          if body.fault != None { { ..h, fault: body.fault } }
+          else if !body.live { after } else if body.h.joins.get(x.answer.id) != Some(true) {
+            { ..h, fault: Some(b"a handle's body that ends without its answer") }
+          } else if body.h.owned != after.h.owned {
+            {
+              ..h,
+              fault: Some(
+                b"a handle's body that ends holding other counts than the handle holds across it",
+              ),
+            }
+          } else { after }
+        }
+      },
+    },
+    _ -> acc,
+  }
 
 /// Why `val`, bound to `y`, reads a block otherwise than the fields taken out of it allow: a field
 /// is taken only once, out of a block's word this body holds a count of and no loop around holds
