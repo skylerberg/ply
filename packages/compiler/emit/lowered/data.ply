@@ -11,6 +11,7 @@ import emit.pieces (spelled)
 import emit.compare (Program, Hunk, program_of, formed, checked, answered_today, today_text,
                      printed_text, normalised, past_counts, hunks)
 import emit.print (printed_fn)
+import emit.own (owned)
 import emit.tir (Rep, RFloat, RWord, RMaybe, RFlat, RCases, Var, AVar, AInt, AZero, Val, Make,
                  MRecord, MCtor, Get, Pack, Gathered, PLeaf, PField, PNamed, Inst, Let, Decl,
                  Assign, If, Case, Match, Block, Fn, Family, Data, Calling, Leaf, counted,
@@ -291,7 +292,7 @@ test "a record holds an Option as its payload's word and a small record in place
   // `Out` crosses as its own `b` and `In`'s leaf and word; `o.i.a` reads `In`'s leaf where it lies.
   let o = form_of(p, b"inner_a");
   match param(o, 0).rep {
-    RFlat(ls) -> assert_eq(ls.map(|l: Leaf| l.name), [b"b", b"i.a", b"i"]),
+    RFlat(ls) -> assert_eq(ls.map(|l: Leaf| l.name), [b"b", b"i.a", b"i."]),
     other -> assert_eq(other, RWord),
   };
   assert_eq(vals(o).filter(|v: Val| match v { Get(g) -> g.of == param(o, 0), _ -> false }), [
@@ -640,6 +641,92 @@ fn where_lowered(
     }
   })
 
+/// The local the first line of `text` setting one to C beginning `start` sets; empty where none does.
+fn set_to(text: Bytes, start: Bytes) -> Bytes / {abort.raise} = {
+  let marker = b" = ".concat(start);
+  match text.split(b"\n").filter(|l: Bytes| l.index_of(marker) != None).at(0) {
+    Some(l) -> {
+      let ws = l.slice(0, match l.index_of(marker) { Some(i) -> i, None -> 0 }).split(b" ");
+      match ws.at(ws.len() - 1) { Some(w) -> w, None -> b"" }
+    },
+    None -> b"",
+  }
+}
+
+/// Fails, naming what is missing and showing `text`, where the C `text` lacks any of `wants`.
+fn holds_all(text: Bytes, wants: List<Bytes>) -> Unit / {abort.raise} = {
+  let missing = wants.filter(|w: Bytes| text.index_of(w) == None);
+  assert(
+    missing == [],
+    Some(
+      String::of_bytes_lossy(Bytes::concat_all([Bytes::join(missing, b"\n"), b"\n-- in\n", text])),
+    ),
+  )
+}
+
+fn nested() -> Program / {abort.raise} =
+  ported(
+    Bytes::concat_all([
+      b"type P = { x: Float, y: Float }\n",
+      b"type Seg = { from: P, label: String, to: P }\n",
+      b"type Holder = { s: Seg, n: Int }\n",
+      b"type Shape = | Dot(P) | Line(Seg) | Empty\n",
+      b"fn dx(s: Shape) -> Float = match s { Dot(p) -> p.x, _ -> 0.0 }\n",
+      b"fn line(s: Seg) -> Shape = Line(s)\n",
+      b"fn line_of(a: P, b: P, l: String) -> Shape = Line({ from: a, label: l, to: b })\n",
+      b"fn first_x(h: Holder) -> Float = h.s.from.x\n",
+    ]),
+  )
+
+test "a constructor's argument held in place is read through its header's address" {
+  let dx = built(nested(), b"dx");
+  let dot = set_to(dx, b"((Word)(intptr_t)(ply_words(p0) + 0));");
+  holds_all(dx, [Bytes::concat_all([b" = ply_f64(ply_words(", dot, b")[0]);"])])
+}
+
+test "a constructor lays a record holding records in place out at every depth" {
+  let p = nested();
+  // `Line`'s object: `Seg`'s header and nine words, `Seg`'s bitmap, and its own naming `label`.
+  let line = built(p, b"line");
+  let t = set_to(line, b"rt_alloc_p(ctx, 4, 12, ");
+  let seg = set_to(line, b"p0;");
+  let seg_at = Bytes::concat_all([b"((Word)(intptr_t)(ply_words(", t, b") + 0))"]);
+  holds_all(line, [
+    Bytes::concat_all([b"ply_words(", t, b")[12] = INT64_C(64);"]),
+    // A `Seg` made already is copied in whole, its bitmap with it.
+    Bytes::concat_all([b"ply_embed(ctx, ", t, b", 0, ", seg, b", 1);"]),
+    // One that was not has its header written, `label` at word six and its bitmap at eleven, and each
+    // point's header in `Seg`'s words, counting back to `Seg`.
+    Bytes::concat_all([b"ply_embedded(", t, b", 0, 6, 9, "]),
+    Bytes::concat_all([b"ply_words(", t, b")[6] = ", seg.slice(0, seg.len() - 1), b"3;"]),
+    Bytes::concat_all([b"ply_words(", t, b")[11] = INT64_C(16);"]),
+    Bytes::concat_all([b"ply_embedded(", seg_at, b", 0, 5, 2, "]),
+    Bytes::concat_all([b"ply_embedded(", seg_at, b", 5, 5, 2, "]),
+    Bytes::concat_all([b"ply_words(", t, b")[4] = ply_f64_bits("]),
+    Bytes::concat_all([b"ply_words(", t, b")[10] = ply_f64_bits("]),
+  ]);
+  // A literal's points made already are copied into `Seg`'s words; ones that were not are written there.
+  let literal = built(p, b"line_of");
+  let lt = set_to(literal, b"rt_alloc_p(ctx, 4, 12, ");
+  let lseg = Bytes::concat_all([b"((Word)(intptr_t)(ply_words(", lt, b") + 0))"]);
+  holds_all(literal, [
+    Bytes::concat_all([b"ply_embedded(", lt, b", 0, 6, 9, "]),
+    Bytes::concat_all([b"ply_embed(ctx, ", lseg, b", 0, "]),
+    Bytes::concat_all([b"ply_embed(ctx, ", lseg, b", 5, "]),
+    Bytes::concat_all([b"ply_words(", lt, b")[5] = ply_f64_bits("]),
+    Bytes::concat_all([b"ply_words(", lt, b")[9] = ply_f64_bits("]),
+  ])
+}
+
+test "a record held in place in one read out of a word loads its own records' leaves through their headers" {
+  let first = built(nested(), b"first_x");
+  // `n` takes word zero, so `s`'s header is at word one, and `from`'s at word zero of `s`'s.
+  let s = set_to(first, b"((Word)(intptr_t)(ply_words(p0) + 1));");
+  holds_all(first, [
+    Bytes::concat_all([b" = ply_f64(ply_words(((Word)(intptr_t)(ply_words(", s, b") + 0)))[0]);"]),
+  ])
+}
+
 test "a value's layout is read off its node's type where the value carries none" {
   let p = ported(
     Bytes::concat_all([
@@ -795,4 +882,46 @@ test "a field of a Columns' record is loaded from its column, with no record mad
   assert_eq(where_lowered(p, roots, b")[1])) {", [true, false, false]), [true, false, false]);
   assert_eq(where_lowered(p, roots, b")[0])) {", [false, true, false]), [false, true, false]);
   assert_eq(where_lowered(p, roots, b"rt_columns_field_p(ctx, ", columned), columned)
+}
+
+test "a sum a generic root answers as its cases is held as its own cases through its one word" {
+  let p = ported(
+    Bytes::concat_all([
+      b"type Replay = { lines: List<String>, errs: List<String>, code: Int, json: String }\n",
+      b"type Bad = { at: Int, message: String }\n",
+      b"fn decoded<a>(x: a, n: Int) -> Result<a, Bad> = if n > 0 { Ok(x) } else { Err({ at: n, message: \"short\" }) }\n",
+      b"fn replayed(r: Replay, n: Int) -> Option<Int> = match decoded(r, n) { Err(_) -> None, Ok(x) -> Some(x.code) }\n",
+    ]),
+  );
+  // `decoded` answers `Ok`'s payload as a word; `replayed` holds it as `Replay`'s leaves, `code` the
+  // first of them, loaded out of that word once the cases are made it.
+  let text = built(p, b"replayed");
+  holds_all(text, [b" & 7) == 4);", b" = (int64_t)(ply_words("]);
+  assert_eq(text.index_of(b"/* a value held as no type"), None)
+}
+
+test "a record held in place that holds a count, read through a borrow, passes the check" {
+  let p = ported(
+    Bytes::concat_all([
+      b"type S = { start: Int, end: Int }\n",
+      b"type T = | TFn({ span: S, params: List<Int>, ret: Int }) | TNone\n",
+      b"type In = { xs: List<Int>, at: S }\n",
+      b"type R = { s: In, n: Int, m: Int, k: Int }\n",
+      b"fn arg_len(t: T) -> Int = match t { TFn(f) -> f.params.len(), TNone -> 0 }\n",
+      b"fn field_len(r: R) -> Int = r.s.xs.len()\n",
+      b"fn field_at(r: R) -> Int = r.s.at.end\n",
+      b"fn kept(r: R) -> In = r.s\n",
+    ]),
+  );
+  let roots = [b"arg_len", b"field_len", b"field_at", b"kept"];
+  let faults = roots.fold([], |acc: List<Bytes>, n: Bytes|
+    match formed(p, n) {
+      Err(no) -> acc.push(Bytes::concat_all([n, b" declined: ", no.why])),
+      Ok(f) -> match checked(p, n) {
+        Ok(_) -> acc,
+        Err(why) ->
+          acc.push(Bytes::concat_all([b"== ", n, b": ", why, b"\n", printed_text(owned(f))])),
+      },
+    });
+  assert(faults == [], Some(String::of_bytes_lossy(Bytes::join(faults, b"\n"))))
 }

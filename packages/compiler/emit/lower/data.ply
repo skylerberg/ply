@@ -8,14 +8,14 @@
 import syntax.parsing (Span)
 import check.types (Type, TyFn, TyRecord, TyNominal, Field)
 import emit.typing (unknown_type)
-import emit.reps (FieldTy, laid_vars, in_place, laid_of)
+import emit.reps (FieldTy, laid_vars, laid_of)
 import emit.c (sorted_names)
 import emit.answer (Layout)
 import emit.tir (Rep, RWord, RFlat, RCases, Leaf, Var, Arg, AVar, AInt, AZero, Make, MRecord, MCtor,
                  Get, Gathered, PLeaf, PField, PNamed, Data, rep_of_arg)
 import emit.lower.setting (ctor_named)
-import emit.lower.held (held_as, laid_fields, flat, leaves_of, leaf_span, field_type, field_path,
-                        slot_rep, ctor_fields, case_index, case_span)
+import emit.lower.held (held_as, laid_fields, flat, leaf_span, field_type, field_path, slot_held,
+                        ctor_fields, case_index, case_span)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, type_at, type_of,
                         noted)
 
@@ -133,9 +133,6 @@ fn made_object(
     match ctor_fields(cx.setting, ctor) {
       Some(fs) -> if fs.len() != args.len() {
         refuse(st, Data, b"a constructor applied to other than its arguments")
-      } else if !fs.all(|f: FieldTy|
-          match in_place(f) { Some(inner) -> flat(inner), None -> true }) {
-        refuse(st, Data, b"a constructor holding in place a record that holds one in place")
       } else {
         let held = handed_all(
           st,
@@ -143,7 +140,7 @@ fn made_object(
             match fs.at(k) {
               None -> acc,
               Some(f) -> match args.at(k) {
-                Some(a) -> acc.push({ arg: a, to: field_rep(f) }),
+                Some(a) -> acc.push({ arg: a, to: slot_held(f) }),
                 None -> acc,
               },
             }),
@@ -194,11 +191,6 @@ fn handed_all(
     },
   )
 
-/// How a record or a constructor's object holds a field laid out as `f`: a record it holds in place
-/// as that record's leaves and word, anything else as its slot holds it.
-fn field_rep(f: FieldTy) -> Rep =
-  match in_place(f) { Some(inner) -> RFlat(leaves_of(inner)), None -> slot_rep(f.kind) }
-
 /// A record literal of `fields`, each lowered in written order: gathered into its leaves where its
 /// type lays it out, or made by value where a type variable leaves the layout open.
 pub fn recorded(
@@ -218,14 +210,12 @@ pub fn recorded(
     fields.fold(None, |acc: Option<Arg>, f: { name: Bytes, arg: Arg }|
       if f.name == name { Some(f.arg) } else { acc });
   match laid_fields(ty) {
-    Some(fs) -> if fs.len() == 0 { by_value(st, ty, [], [], at) } else if !flat(fs) {
-      refuse(st, Data, b"a record holding in place a record that holds one in place")
-    } else {
+    Some(fs) -> if !flat(fs) { by_value(st, ty, [], [], at) } else {
       let given = fs.fold(
         { xs: [], missing: false },
         |acc: { xs: List<{ arg: Arg, to: Rep }>, missing: Bool }, f: FieldTy|
           match value(f.name) {
-            Some(a) -> { ..acc, xs: acc.xs.push({ arg: a, to: field_rep(f) }) },
+            Some(a) -> { ..acc, xs: acc.xs.push({ arg: a, to: slot_held(f) }) },
             None -> { ..acc, missing: true },
           },
       );
@@ -297,25 +287,15 @@ pub fn field(cx: Context, base: Lowered, name: Bytes, at: Span) -> Lowered =
         None -> match type_at(cx, at) { Some(t) -> t, None -> unknown_type() },
       };
       let want = held_as(cx.setting, fty);
-      let deep = match laid_fields(b.ty) {
-        Some(fs) ->
-          fs.any(|f: FieldTy|
-            f.name == name && (match in_place(f) { Some(inner) -> !flat(inner), None -> false })),
-        None -> false,
-      };
-      if deep {
-        refuse(base.st, Data, b"a record held in place that holds one in place: ".concat(name))
-      } else {
-        match read_of(cx, base.st, b, name, fty, at) {
-          None -> refuse(base.st, Data, b"a field its record does not hold: ".concat(name)),
-          Some(r) -> if r.parts.len() == 1 {
-            match r.parts.at(0) {
-              Some(one) -> if rep_of_arg(one) == want { { st: r.st, arg: one } }
-              else { handed({ st: r.st, arg: one }, want, at) },
-              None -> refuse(r.st, Data, b"a field read as nothing"),
-            }
-          } else { bound_as(r.st, fty, want, Gathered({ parts: r.parts }), at) },
-        }
+      match read_of(cx, base.st, b, name, fty, at) {
+        None -> refuse(base.st, Data, b"a field its record does not hold: ".concat(name)),
+        Some(r) -> if r.parts.len() == 1 {
+          match r.parts.at(0) {
+            Some(one) -> if rep_of_arg(one) == want { { st: r.st, arg: one } }
+            else { handed({ st: r.st, arg: one }, want, at) },
+            None -> refuse(r.st, Data, b"a field read as nothing"),
+          }
+        } else { bound_as(r.st, fty, want, Gathered({ parts: r.parts }), at) },
       }
     },
     _ -> refuse(base.st, Data, b"a field of a value that is no record: ".concat(name)),
@@ -363,11 +343,7 @@ fn read_of(
         None -> None,
         Some(f) -> match field_path(cx.setting, b.ty, name) {
           PField(p) -> {
-            let rep = match in_place(f) {
-              Some(inner) -> if flat(inner) { field_rep(f) } else { RWord },
-              None -> slot_rep(f.kind),
-            };
-            let g = bound_as(st, fty, rep, Get({ of: b, path: PField(p) }), at);
+            let g = bound_as(st, fty, slot_held(f), Get({ of: b, path: PField(p) }), at);
             Some({ st: g.st, parts: [g.arg] })
           },
           _ -> None,
@@ -413,9 +389,7 @@ pub fn updated(
           );
           by_value(given.st, ty, names, given.args, at)
         },
-        Some(fs) -> if !flat(fs) {
-          refuse(st, Data, b"a record holding in place a record that holds one in place")
-        } else {
+        Some(fs) -> if !flat(fs) { refuse(st, Data, b"an update of a record of no fields") } else {
           let set_of = |name: Bytes|
             sets.fold(None, |acc: Option<Arg>, f: { name: Bytes, arg: Arg }|
               if f.name == name { Some(f.arg) } else { acc });
@@ -424,7 +398,7 @@ pub fn updated(
             |acc: { st: Lowering, parts: List<Arg>, missing: Bool }, f: FieldTy|
               match set_of(f.name) {
                 Some(a) -> {
-                  let h = handed({ st: acc.st, arg: a }, field_rep(f), at);
+                  let h = handed({ st: acc.st, arg: a }, slot_held(f), at);
                   { ..acc, st: h.st, parts: acc.parts.push(h.arg) }
                 },
                 None -> if !copies.contains(f.name) { { ..acc, missing: true } } else {
