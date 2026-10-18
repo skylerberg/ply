@@ -39,14 +39,15 @@ type Holding = {
 type Walk = { h: Holding, fault: Option<Bytes>, live: Bool, missed: Option<Holding>, done: Bool }
 
 /// What encloses a block: the loop its `Next` and `Done` belong to; what a `handle` around it
-/// holds across its body, which a failure inside it leaves to the handle's landing; whether a
-/// `Miss` leaves it for a match's next arm; whether it is inside a `handle`'s body, which only
-/// its end and a failure leave; how a `Return` answers; and the member of a tail group whose arm it
-/// is in, which a `Restart` enters again.
+/// holds across its body, which a failure inside it leaves to the handle's landing; where a `Miss`
+/// leaves it for a match's next arm, the joins the match's entry declared, the only ones a miss
+/// hands that arm; whether it is inside a `handle`'s body, which only its end and a failure leave;
+/// how a `Return` answers; and the member of a tail group whose arm it is in, which a `Restart`
+/// enters again.
 type Within = {
   looped: Option<Looped>,
   landing: Map<Int, Int>,
-  arm: Bool,
+  arm: Option<Map<Int, Bool>>,
   handled: Bool,
   answer: Rep,
   member: Option<Int>,
@@ -62,7 +63,7 @@ pub fn verified(f: Fn) -> Option<Bytes> = {
   let top = {
     looped: None,
     landing: Map::new(),
-    arm: false,
+    arm: None,
     handled: false,
     answer: f.conv.answer,
     member: None,
@@ -268,7 +269,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
                   Some(h) -> {
                     let w = walked(
                       f,
-                      { ..cx, arm: true },
+                      { ..cx, arm: Some(acc.h.joins) },
                       { ..acc, h: entered(acc, h), missed: None },
                       a,
                     );
@@ -287,13 +288,17 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             }
           }
         },
-        Miss -> if !cx.arm { { ..acc, fault: Some(b"an arm's miss outside a match") } } else {
-          match acc.missed {
-            None -> { ..acc, missed: Some(acc.h), live: false },
-            Some(m) -> if m.owned == acc.h.owned && m.joins == acc.h.joins {
-              { ..acc, live: false }
-            } else { { ..acc, fault: Some(b"the misses of an arm hold different counts") } },
-          }
+        Miss -> match cx.arm {
+          None -> { ..acc, fault: Some(b"an arm's miss outside a match") },
+          Some(outer) -> {
+            let handed = { ..acc.h, joins: scoped(acc.h.joins, outer) };
+            match acc.missed {
+              None -> { ..acc, missed: Some(handed), live: false },
+              Some(m) -> if m.owned == handed.owned && m.joins == handed.joins {
+                { ..acc, live: false }
+              } else { { ..acc, fault: Some(b"the misses of an arm hold different counts") } },
+            }
+          },
         },
         Loop(l) -> if l.init.len() != l.state.len() || !same_reps(l.init, l.state) {
           { ..acc, fault: Some(b"a loop's state set from values held otherwise") }
@@ -306,7 +311,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             {
               ..cx,
               looped: Some({ held: fed.h.owned, state: l.state, answer: l.answer }),
-              arm: false,
+              arm: None,
             },
             { ..fed, h: start, missed: None, done: false },
             l.body,
@@ -399,7 +404,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             } else if x.site.detached != None { after } else {
               let body = walked(
                 f,
-                { ..cx, looped: None, landing: across.owned, arm: false, handled: true },
+                { ..cx, looped: None, landing: across.owned, arm: None, handled: true },
                 {
                   ..h,
                   h: { ..across, joins: across.joins.insert(x.answer.id, false) },
@@ -574,7 +579,9 @@ fn taken_either(a: Map<Int, List<Path>>, b: Map<Int, List<Path>>) -> Map<Int, Li
 fn entered(before: Walk, at: Holding) -> Holding = { ..at, borrowed: before.h.borrowed }
 
 /// Two paths out of a branch: where both go on they must hold the same counts and have set the
-/// same joins; a value borrowed inside one is gone after it. Their misses must agree.
+/// same joins of those declared before it; a value borrowed inside one is gone after it, as is a
+/// join declared inside one. Their misses, each holding only what the match's entry declared, must
+/// agree.
 fn joined(before: Walk, a: Walk, b: Walk) -> Walk =
   match a.fault {
     Some(_) -> a,
@@ -590,28 +597,49 @@ fn joined(before: Walk, a: Walk, b: Walk) -> Walk =
           None -> false,
         };
         let done = a.done || b.done;
+        let outer = before.h.joins;
         if both { { ..a, fault: Some(b"the misses of an arm hold different counts") } }
         else if a.live && b.live {
           if a.h.owned != b.h.owned {
             { ..a, fault: Some(b"the paths out of a branch hold different counts") }
-          } else if a.h.joins != b.h.joins {
+          } else if scoped(a.h.joins, outer) != scoped(b.h.joins, outer) {
             { ..a, fault: Some(b"the paths out of a branch set different joins") }
           } else {
             {
               ..a,
-              h: { ..a.h, borrowed: before.h.borrowed, taken: taken_either(a.h.taken, b.h.taken) },
+              h: {
+                ..a.h,
+                borrowed: before.h.borrowed,
+                joins: scoped(a.h.joins, outer),
+                taken: taken_either(a.h.taken, b.h.taken),
+              },
               missed: missed,
               done: done,
             }
           }
         } else if a.live {
-          { ..a, h: { ..a.h, borrowed: before.h.borrowed }, missed: missed, done: done }
+          {
+            ..a,
+            h: { ..a.h, borrowed: before.h.borrowed, joins: scoped(a.h.joins, outer) },
+            missed: missed,
+            done: done,
+          }
         } else if b.live {
-          { ..b, h: { ..b.h, borrowed: before.h.borrowed }, missed: missed, done: done }
+          {
+            ..b,
+            h: { ..b.h, borrowed: before.h.borrowed, joins: scoped(b.h.joins, outer) },
+            missed: missed,
+            done: done,
+          }
         } else { { ..a, live: false, missed: missed, done: done } }
       },
     },
   }
+
+/// The joins of `joins` that `outer` declared, as `joins` holds them.
+fn scoped(joins: Map<Int, Bool>, outer: Map<Int, Bool>) -> Map<Int, Bool> =
+  joins.fold(Map::new(), |m: Map<Int, Bool>, id: Int, set: Bool|
+    if outer.contains(id) { m.insert(id, set) } else { m })
 
 /// Each operand used as the operation's signature says: consumed, or only read.
 fn used(w: Walk, ops: List<{ arg: Arg, takes: Bool }>) -> Walk =
@@ -1367,6 +1395,140 @@ test "a field taken out of its block is never read again, nor the block used who
       ]),
     ),
     Some(b"a value whose count nothing holds"),
+  )
+}
+
+test "a join declared inside a branch is the branch's own, which the paths out of it do not compare" {
+  let c = flag(0);
+  let d = flag(1);
+  let outer = int(2);
+  let inner = int(3);
+  let o = word(4);
+  let set = |j: Var, n: Int| Assign({ var: j, arg: AInt(n) });
+  let chosen = [
+    Decl(inner),
+    If({ cond: AVar(d), then: [set(inner, 1)], otherwise: [set(inner, 2)] }),
+    Assign({ var: outer, arg: AVar(inner) }),
+  ];
+  // `if c { if d { 1 } else { 2 } } else { 3 }`, and `&&` around a join of its own alike.
+  assert_eq(
+    verified(
+      root_of([c, d], [], RInt, [
+        Decl(outer),
+        If({ cond: AVar(c), then: chosen, otherwise: [set(outer, 3)] }),
+        Return(AVar(outer)),
+      ]),
+    ),
+    None,
+  );
+  // The same in a case arm, and in a match arm with an arm after it.
+  assert_eq(
+    verified(
+      root_of([o, d], [], RInt, [
+        Decl(outer),
+        Case({
+          on: o,
+          test: TTag([b"A", b"B"]),
+          arms: [{ when: 0, body: chosen }],
+          rest: [set(outer, 3)],
+        }),
+        Dec(o),
+        Return(AVar(outer)),
+      ]),
+    ),
+    None,
+  );
+  assert_eq(
+    verified(
+      root_of([c, d], [], RInt, [
+        Decl(outer),
+        Match({
+          arms: [[If({ cond: AVar(c), then: chosen, otherwise: [Miss] })], [set(outer, 3)]],
+          rest: [Return(AInt(0))],
+        }),
+        Return(AVar(outer)),
+      ]),
+    ),
+    None,
+  );
+  // A join declared before the branch is still set on every path or on none.
+  assert_eq(
+    verified(
+      root_of([c, d], [], RInt, [
+        Decl(outer),
+        If({ cond: AVar(c), then: chosen, otherwise: [] }),
+        Return(AVar(outer)),
+      ]),
+    ),
+    Some(b"the paths out of a branch set different joins"),
+  )
+}
+
+test "an arm's misses hand the next arm only the joins declared before the match" {
+  let c = flag(0);
+  let d = flag(1);
+  let j = int(2);
+  let k = int(3);
+  // Misses on either side of the declaration of a join of the arm's own, as two refutable lets
+  // in a row lower.
+  assert_eq(
+    verified(
+      root_of([c, d], [], RInt, [
+        Match({
+          arms: [
+            [
+              If({ cond: AVar(c), then: [Miss], otherwise: [] }),
+              Decl(j),
+              Assign({ var: j, arg: AInt(1) }),
+              If({ cond: AVar(d), then: [Miss], otherwise: [Return(AVar(j))] }),
+            ],
+          ],
+          rest: [Return(AInt(0))],
+        }),
+      ]),
+    ),
+    None,
+  );
+  // Both paths of a branch missing, one after declaring a join of its own.
+  assert_eq(
+    verified(
+      root_of([c], [], RInt, [
+        Match({
+          arms: [
+            [
+              If({
+                cond: AVar(c),
+                then: [Miss],
+                otherwise: [Decl(k), Assign({ var: k, arg: AInt(2) }), Miss],
+              }),
+            ],
+          ],
+          rest: [Return(AInt(0))],
+        }),
+      ]),
+    ),
+    None,
+  );
+  // A join the match's entry declared, set at one miss and not at another, is still refused.
+  assert_eq(
+    verified(
+      root_of([c], [], RInt, [
+        Decl(j),
+        Match({
+          arms: [
+            [
+              If({
+                cond: AVar(c),
+                then: [Assign({ var: j, arg: AInt(1) }), Miss],
+                otherwise: [Miss],
+              }),
+            ],
+          ],
+          rest: [Return(AInt(0))],
+        }),
+      ]),
+    ),
+    Some(b"the misses of an arm hold different counts"),
   )
 }
 
