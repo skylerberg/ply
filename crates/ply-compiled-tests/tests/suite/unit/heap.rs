@@ -868,3 +868,54 @@ fn an_adopted_heap_keeps_its_objects_and_its_bridges() {
     leave();
     parent.end();
 }
+
+/// A block of two words, as emitted code's C allocates one.
+fn emitted(ctx: &mut ply_compiled::rt::Ctx) -> Word {
+    type Alloc = unsafe extern "C" fn(*mut ply_compiled::rt::Ctx, Word) -> Word;
+    unsafe { crate::bare::helper::<Alloc>("rt_alloc_bytes")(ctx, 16 + 8 * 2) }
+}
+
+#[test]
+fn a_block_emitted_code_laid_out_is_counted_under_a_kind_of_its_own() {
+    let mut ctx = crate::bare::context();
+    let w = emitted(&mut ctx);
+    assert_eq!(kind(w), KIND_REFUSED);
+    assert_eq!(ctx.heap.allocated_by_kind()[KIND_REFUSED as usize], 1);
+    assert_eq!(ctx.heap.live_by_kind(), vec![(KIND_REFUSED, 1, 16)]);
+}
+
+/// A walker named, over a word.
+type Walk<'a> = (&'static str, Box<dyn Fn(Word) + 'a>);
+
+#[test]
+fn every_walker_refuses_a_block_emitted_code_laid_out_by_its_own_name() {
+    let mut ctx = crate::bare::context();
+    let l = layouts();
+    let walks: Vec<Walk> = vec![
+        ("dismantle", Box::new(dec)),
+        ("share", Box::new(|w| _ = share(&[w]))),
+        ("Heap::read", Box::new(|w| _ = Heap::to_value(&l, w))),
+        ("Heap::copy", Box::new(|w| _ = Heap::persistent().adopt(w))),
+        ("mark_immortal", Box::new(mark_immortal)),
+        ("world_independent", Box::new(|w| _ = world_independent(w))),
+        ("native_key", Box::new(|w| _ = native_key(&l, w))),
+        ("cmp_words", Box::new(|w| _ = cmp_words(&l, w, imm(1)))),
+        ("Layouts::parts", Box::new(|w| _ = l.parts(obj(w)))),
+        (
+            "stored::text",
+            Box::new(|w| _ = ply_compiled::stored::text(&l, w)),
+        ),
+    ];
+    for (walker, walk) in walks {
+        let w = emitted(&mut ctx);
+        let refused =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| walk(w))).expect_err(walker);
+        let said = refused.downcast_ref::<String>().map_or("", String::as_str);
+        assert!(
+            said.contains(&format!(
+                "`{walker}` was handed a block emitted code laid out"
+            )),
+            "{walker}: {said}"
+        );
+    }
+}

@@ -17,8 +17,8 @@ pub use build::{Native, load_linked, load_opened};
 pub use exports::{Exports, Unserved};
 pub use load::{Library, cache_dir};
 pub use prelude::{
-    PRELUDE, RUNTIME_MARK, builtin_helper_name, helpers, pointer_name, runtime_header,
-    runtime_object,
+    MachineNative, PRELUDE, RUNTIME_MARK, builtin_helper_name, helpers, machine_natives,
+    pointer_name, runtime_header, runtime_object,
 };
 
 /// The runtime's sources, as `build.rs` digests them, less how C is compiled, kept, swept and

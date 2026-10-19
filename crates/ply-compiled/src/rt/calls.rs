@@ -44,9 +44,11 @@ impl Ctx {
 /// with each performed atom's count in `performs`, ordered by the atom.
 pub(super) fn metered(ctx: &mut Ctx, f: Word) -> Word {
     let before = ctx.cost();
+    crate::detached::drain(ctx);
     let held = ctx.heap.live();
     let performed = ctx.performed.len();
     let value = call_value(std::ptr::from_mut(ctx), f, &[]);
+    crate::detached::drain(ctx);
     let live = ctx.heap.live() as i64 - held as i64;
     heap::dec(f);
     if ctx.failed != 0 {
@@ -83,6 +85,55 @@ pub(super) fn metered(ctx: &mut Ctx, f: Word) -> Word {
             (Symbol::new("value"), value),
         ],
     )
+}
+
+/// What this entry has cost so far, written to `out` as five words: its calls, its allocations, the
+/// bytes they took, the objects live, and the atoms performed. [`rt_cost_spent`] reads it back.
+pub unsafe extern "C" fn rt_cost_mark(ctx: *mut Ctx, out: Out) {
+    let c = unsafe { &*ctx };
+    let cost = c.cost();
+    let mark = [
+        cost.steps,
+        cost.allocations,
+        cost.bytes,
+        c.heap.live() as i64,
+        c.performed.len() as i64,
+    ];
+    unsafe { std::ptr::copy_nonoverlapping(mark.as_ptr(), out.0, mark.len()) };
+}
+
+/// What this entry has spent since the mark at `mark`, written over its first four words: calls,
+/// allocations, bytes, and objects live since. Its fifth is left as the mark wrote it.
+pub unsafe extern "C" fn rt_cost_spent(ctx: *mut Ctx, mark: Out) {
+    let c = unsafe { &*ctx };
+    let cost = c.cost();
+    let now = [
+        cost.steps,
+        cost.allocations,
+        cost.bytes,
+        c.heap.live() as i64,
+    ];
+    for (i, n) in now.into_iter().enumerate() {
+        unsafe { *mark.0.add(i) = n - *mark.0.add(i) };
+    }
+}
+
+/// Begins a lifting of what this entry performed since its `from`th atom: a list holding, for each
+/// atom in its order, the atom's text and then how many times it was performed.
+pub unsafe extern "C" fn rt_performs_since(ctx: *mut Ctx, from: I64) {
+    let c = unsafe { &mut *ctx };
+    let from = usize::try_from(from.0).unwrap_or(0).min(c.performed.len());
+    let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for atom in &c.performed[from..] {
+        *counts.entry(atom.to_string()).or_insert(0) += 1;
+    }
+    let mut w = ply_core::codec::Writer::new();
+    w.count(ply_core::codec::tag::LIST, 2 * counts.len() as u64);
+    for (atom, count) in counts {
+        w.str(atom.as_bytes());
+        w.int(count);
+    }
+    c.lift_from(w.finish(), Vec::new());
 }
 
 /// The value of the pure nullary function at `index`, memoized when world-independent.

@@ -45,7 +45,19 @@ pub const KIND_FIXED: u8 = 18;
 pub const KIND_DECIMAL: u8 = 19;
 /// A `Columns`: an array per field of its records (`crate::columns`).
 pub const KIND_COLUMNS: u8 = 20;
+/// A block emitted code made and lays out itself (`crate::emitted`): the runtime reads its count at
+/// offset 0 and nothing else of it, and every walker of the runtime's own objects refuses it.
+pub const KIND_REFUSED: u8 = 21;
 pub const KIND_DEAD: u8 = 255;
+/// How many kinds [`Heap::allocated_by_kind`] tells apart: every `KIND_*` an object is made with.
+pub const KINDS: usize = 32;
+
+/// The walker `walker`, handed a block emitted code laid out, which no walker reads.
+#[cold]
+#[inline(never)]
+pub(crate) fn refused(walker: &str) -> ! {
+    panic!("`{walker}` was handed a block emitted code laid out, which the runtime does not walk")
+}
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
 pub const IMMORTAL: u32 = u32::MAX;
@@ -1057,6 +1069,7 @@ impl Layouts {
                         .map(|k| (k * stride, slot))
                         .collect()
                 }
+                KIND_REFUSED => refused("Layouts::parts"),
                 _ => Vec::new(),
             }
         }
@@ -1219,7 +1232,7 @@ pub struct Heap {
     /// Objects allocated since the last reset, the bytes they took, and the objects by kind.
     count: usize,
     bytes: usize,
-    by_kind: [usize; 16],
+    by_kind: [usize; KINDS],
     /// Under `PLY_HEAP_CENSUS`, allocations by kind and layout or power-of-two length.
     by_layout: HashMap<(u8, u32), usize>,
     /// Dead blocks not yet given back, oldest first, under `delay()`.
@@ -1272,14 +1285,13 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
             KIND_STR | KIND_BYTES if (*o).flags & VIEW != 0 => 16,
             KIND_STR | KIND_BYTES => (*o).layout as usize,
             KIND_BRIDGE => BRIDGE_BYTES,
+            KIND_REFUSED => refused("payload_bytes"),
             _ => usize::MAX,
         }
     }
 }
 
-/// Gives a dead object's block back. Only the heap that owns the block may: its bridge leaves the
-/// table first, so the bridge that takes the block next is not listed twice, and a bridge another
-/// heap owns stays listed there, dead, until that heap's end.
+/// A dead object's block, given back as [`give_back`] says.
 unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
     unsafe {
         let size = payload_bytes(o);
@@ -1288,7 +1300,15 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
         if size == usize::MAX {
             return;
         }
-        let object = Heap::object_size(size);
+        give_back(o, heap, Heap::object_size(size), bridge);
+    }
+}
+
+/// Gives back a dead block of `object` bytes. Only the heap that owns the block may: its bridge
+/// leaves the table first, so the bridge that takes the block next is not listed twice, and a
+/// bridge another heap owns stays listed there, dead, until that heap's end.
+unsafe fn give_back(o: *mut Obj, heap: *mut Heap, object: usize, bridge: bool) {
+    unsafe {
         if heap.is_null() || !(*heap).blocks.owns(o.cast(), object) {
             if !bridge {
                 blocks::hand_back(o.cast(), object);
@@ -1319,6 +1339,87 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
     }
 }
 
+/// Gives back a block whose last holder was emitted code, `payload` bytes past its header, without
+/// a walk: emitted code let go of what it held. Only a block of [`KIND_REFUSED`], or a scalar's box,
+/// which holds nothing counted, is freed so.
+pub(crate) unsafe fn free_sized(o: *mut Obj, heap: *mut Heap, payload: usize) {
+    unsafe {
+        let (kind, rc) = ((*o).kind, (*o).rc);
+        debug_assert!(kind != KIND_DEAD, "{o:p} was freed after it died");
+        debug_assert!(rc == 1 || rc == SHARED, "{o:p} was freed with holders left");
+        debug_assert!(
+            matches!(
+                kind,
+                KIND_REFUSED | KIND_INT | KIND_FLOAT | KIND_FIXED | KIND_DECIMAL
+            ),
+            "{o:p}, of kind {kind}, was freed by size, which lets go of nothing it holds"
+        );
+        let object = Heap::object_size(payload);
+        #[cfg(debug_assertions)]
+        sized_as(o, heap, object);
+        (*o).rc = 0;
+        (*o).kind = KIND_DEAD;
+        give_back(o, heap, object, false);
+    }
+}
+
+/// Panics where `o` was not allocated as `object` bytes, as far as its header or `heap`'s blocks
+/// say: a block of [`KIND_REFUSED`] tells its size class alone, which is all a free relies on.
+#[cfg(debug_assertions)]
+unsafe fn sized_as(o: *mut Obj, heap: *mut Heap, object: usize) {
+    unsafe {
+        if (*o).kind != KIND_REFUSED {
+            let had = Heap::object_size(payload_bytes(o));
+            assert_eq!(
+                had, object,
+                "{o:p}, an object of {had} bytes, was freed as {object}"
+            );
+        }
+        if let Some(had) = heap.as_ref().and_then(|h| h.blocks.bytes_at(o.addr())) {
+            assert_eq!(
+                had,
+                blocks::taken_bytes(object),
+                "{o:p} was freed as {object} bytes, and its block was taken as {had}"
+            );
+        }
+    }
+}
+
+/// Gives back a runtime handle whose last holder was emitted code, with what the runtime keeps for
+/// it, and without a walk: a bridge's value is dropped, and a hold's or a continuation's words are
+/// left unread, emitted code having let go of what a hold held.
+pub(crate) unsafe fn free_handle(o: *mut Obj, heap: *mut Heap) {
+    unsafe {
+        debug_assert!(((*o).rc == SHARED || (*o).rc == 1) && (*o).kind != KIND_DEAD);
+        match (*o).kind {
+            KIND_BRIDGE => std::ptr::drop_in_place(bridge_slot(o)),
+            KIND_CLOSURE
+                if crate::rt::hold_id(o as Word).is_some()
+                    || crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize) => {}
+            kind => {
+                panic!("`rt_handle_free` was handed an object of kind {kind}, which is no handle")
+            }
+        }
+        (*o).rc = 0;
+        recycle(o, heap);
+    }
+}
+
+/// The count of `o`, read as another thread may be changing it.
+pub(crate) unsafe fn count_of(o: *mut Obj) -> u32 {
+    count(o).load(Relaxed)
+}
+
+/// One holder fewer of a shared object whose count is its own: whether that was the last, its
+/// memory then the caller's to release.
+pub(crate) unsafe fn last_of_shared(o: *mut Obj) -> bool {
+    let last = count(o).fetch_sub(1, Release) == SHARED | 1;
+    if last {
+        std::sync::atomic::fence(Acquire);
+    }
+    last
+}
+
 impl Default for Heap {
     fn default() -> Heap {
         Heap::new()
@@ -1333,7 +1434,7 @@ impl Heap {
             persistent: false,
             count: 0,
             bytes: 0,
-            by_kind: [0; 16],
+            by_kind: [0; KINDS],
             by_layout: HashMap::new(),
             delayed: std::collections::VecDeque::new(),
             poison: poisoning(),
@@ -1364,16 +1465,21 @@ impl Heap {
         h
     }
 
-    /// Live objects by kind, with their count and payload bytes.
+    /// Live objects by kind, with their count and payload bytes: for a block emitted code laid out,
+    /// what its block holds past the header.
     pub fn live_by_kind(&self) -> Vec<(u8, usize, usize)> {
         let mut tally: std::collections::BTreeMap<u8, (usize, usize)> = Default::default();
-        self.blocks.each(|block| {
+        self.blocks.each(|block, bytes| {
             let o: *mut Obj = block.cast();
             let (kind, rc) = unsafe { ((*o).kind, (*o).rc) };
             if kind == KIND_DEAD || rc == 0 {
                 return;
             }
-            let size = unsafe { payload_bytes(o) };
+            let size = if kind == KIND_REFUSED {
+                bytes - HEADER
+            } else {
+                unsafe { payload_bytes(o) }
+            };
             let e = tally.entry(kind).or_insert((0, 0));
             e.0 += 1;
             // `usize::MAX` means unsized: count the header alone.
@@ -1404,7 +1510,7 @@ impl Heap {
     }
 
     /// Allocations by kind, indexed by the `KIND_*` constants.
-    pub fn allocated_by_kind(&self) -> [usize; 16] {
+    pub fn allocated_by_kind(&self) -> [usize; KINDS] {
         self.by_kind
     }
 
@@ -1478,12 +1584,13 @@ impl Heap {
         }
         self.count += 1;
         self.bytes += size;
-        self.by_kind[kind as usize & 15] += 1;
+        self.by_kind[kind as usize % KINDS] += 1;
         if self.census {
             let key = match kind {
                 KIND_CTOR | KIND_RECORD => Some(layout),
                 // Bytes arrive with `len` zero; the class is the capacity.
                 KIND_BYTES | KIND_STR => Some((payload_bytes as u32).next_power_of_two()),
+                KIND_REFUSED => Some(u32::try_from(payload_bytes).unwrap_or(u32::MAX)),
                 _ => None,
             };
             if let Some(key) = key {
@@ -1820,6 +1927,7 @@ impl Heap {
                         .collect();
                     self.map_from_sorted(&entries)
                 }
+                KIND_REFUSED => refused("Heap::copy"),
                 kind => {
                     let (len, layout, flags) = ((*o).len, (*o).layout, (*o).flags);
                     let c = self.alloc(kind, flags, len, layout);
@@ -1863,7 +1971,7 @@ impl Heap {
         self.blocks.reset();
         self.count = 0;
         self.bytes = 0;
-        self.by_kind = [0; 16];
+        self.by_kind = [0; KINDS];
         self.by_layout.clear();
         self.delayed.clear();
     }
@@ -2131,6 +2239,7 @@ impl Heap {
                     }
                     v
                 }
+                KIND_REFUSED => refused("Heap::read"),
                 other => panic!("a word of kind {other} was read after its object died"),
             }
         }
@@ -2237,8 +2346,7 @@ pub fn dec_shared(w: Word) {
         dec(h as Word);
         return;
     }
-    if count(o).fetch_sub(1, Release) == SHARED | 1 {
-        std::sync::atomic::fence(Acquire);
+    if unsafe { last_of_shared(o) } {
         let heap = CURRENT.with(|c| c.get());
         unsafe { release(o, heap) }
     }
@@ -2265,6 +2373,7 @@ pub fn share(words: &[Word]) -> bool {
                 KIND_CLOSURE => {
                     !crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize)
                 }
+                KIND_REFUSED => refused("share"),
                 _ => true,
             }
         };
@@ -2408,6 +2517,7 @@ unsafe fn child_ranges(o: *mut Obj) -> [(usize, usize); 2] {
             KIND_CLOSURE => [(CLOSURE_CAPTURES, (*o).len as usize), (0, 0)],
             // The value whose bytes it views.
             KIND_STR | KIND_BYTES if (*o).flags & VIEW != 0 => [(0, 1), (0, 0)],
+            KIND_REFUSED => refused("child_ranges"),
             _ => [(0, 0), (0, 0)],
         }
     }
@@ -2416,6 +2526,9 @@ unsafe fn child_ranges(o: *mut Obj) -> [(usize, usize); 2] {
 /// `o`, held once, dies: its children are released and its header marked dead.
 unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, heap: *mut Heap) {
     unsafe {
+        if (*o).kind == KIND_REFUSED {
+            refused("dismantle");
+        }
         // A shared object reaches here with its count's own bits spent.
         debug_assert!(((*o).rc == SHARED || (*o).rc == 1) && (*o).kind != KIND_DEAD);
         (*o).rc = 0;
@@ -2479,6 +2592,9 @@ pub fn mark_immortal(w: Word) {
             if (*o).rc == IMMORTAL {
                 continue;
             }
+            if (*o).kind == KIND_REFUSED {
+                refused("mark_immortal");
+            }
             (*o).rc = IMMORTAL;
             pending.extend(children(o));
         }
@@ -2511,6 +2627,7 @@ pub fn world_independent(w: Word) -> bool {
                         return false;
                     }
                 }
+                KIND_REFUSED => refused("world_independent"),
                 _ => pending.extend(children(o)),
             }
         }
@@ -2644,6 +2761,7 @@ fn rank(w: Word) -> u8 {
                 Value::Char(_) => 16,
                 Value::Array(_) => 17,
             },
+            KIND_REFUSED => refused("cmp_words"),
             other => panic!("a word of kind {other} was ordered after its object died"),
         }
     }
@@ -2900,6 +3018,7 @@ pub fn native_key(layouts: &Layouts, w: Word) -> bool {
                 });
                 fine
             }
+            KIND_REFUSED => refused("native_key"),
             _ => false,
         }
     }

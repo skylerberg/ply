@@ -186,6 +186,7 @@ extern "C" fn loop_entry(arg: usize) {
             .as_ref()
             .expect("a production loop runs on its own stack");
         c.stack_floor = unsafe { own.enter() };
+        c.frames = std::ptr::null_mut();
     }
     let r = unsafe { run(ctx) };
     let c = unsafe { &mut *ctx };
@@ -615,6 +616,7 @@ extern "C" fn task_entry(arg: usize) {
         let own = sim.slot(me).stack.as_ref();
         let floor = unsafe { own.expect("a task starts on its own stack").enter() };
         c.stack_floor = floor;
+        c.frames = std::ptr::null_mut();
         (closure, me)
     };
     let r = call_value(ctx, closure, &[]);

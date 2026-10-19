@@ -27,11 +27,41 @@ pub const FAILED_ABORT: i64 = 8;
 /// write.
 pub(super) const MODE_RAISE: i64 = 2;
 
+/// Calls a function value the runtime holds for a handler: through its descriptor where emitted
+/// code made it, else as the release's code lays it out. Takes the arguments.
+pub(crate) fn call_fun(ctx: *mut Ctx, emitted: bool, f: Word, args: &[Word]) -> Word {
+    if emitted {
+        unsafe { Block::of(f).call(ctx, args) }
+    } else {
+        call_value(ctx, f, args)
+    }
+}
+
+/// One holder more of a function value the runtime holds for a handler.
+pub(crate) fn dup_fun(emitted: bool, f: Word) {
+    if emitted {
+        Block::of(f).dup();
+    } else {
+        heap::inc(f);
+    }
+}
+
+/// One holder fewer of a function value the runtime holds for a handler.
+pub(crate) fn release_fun(emitted: bool, f: Word) {
+    if emitted {
+        unsafe { Block::of(f).let_go_function(running()) };
+    } else {
+        heap::dec(f);
+    }
+}
+
 /// An installed handler: pushed by a `handle` site, searched innermost-out by a `perform`.
 pub struct HandlerFrame {
     pub(super) clauses: Vec<FrameClause>,
     /// The `return` clause's closure, or zero.
     pub(super) ret: Word,
+    /// Whether `ret` is a closure emitted code made.
+    pub(super) emitted: bool,
     /// A `simulate` region's clause-less frame, answering `task`, `clock`, `random` and `sim`.
     pub(super) simulate: bool,
     /// For a `handle` resuming off the tail: the detached body whose own stack this frame bottoms.
@@ -50,23 +80,68 @@ pub struct HandlerFrame {
 /// see one set; a continuation's copy holds its own, so a resumption starts from them as they were
 /// where it was captured. Given back by [`release_vars`], never by a drop, which could come after
 /// the entry's heap is gone.
-pub(crate) struct HandlerVars(pub(super) Vec<Word>);
+pub(crate) struct HandlerVars(pub(super) Vec<Var>);
+
+/// One handler variable: a uniform word the release's code set, or a value emitted code set with
+/// its type.
+pub(crate) enum Var {
+    Word(Word),
+    Carried(Carried),
+}
+
+impl Var {
+    fn copied(&self) -> Var {
+        match self {
+            Var::Word(w) => {
+                heap::inc(*w);
+                Var::Word(*w)
+            }
+            Var::Carried(v) => Var::Carried(v.dup(running())),
+        }
+    }
+
+    fn release(self) {
+        match self {
+            Var::Word(w) => heap::dec(w),
+            Var::Carried(v) => v.release(running()),
+        }
+    }
+}
 
 impl HandlerVars {
     /// The same values, each held once more.
     pub(crate) fn copied(&self) -> HandlerVars {
-        for w in &self.0 {
-            heap::inc(*w);
-        }
-        HandlerVars(self.0.clone())
+        HandlerVars(self.0.iter().map(Var::copied).collect())
     }
 
-    /// Takes `w` as variable `i`, letting go of what it held.
-    pub(super) fn set(&mut self, i: usize, w: Word) {
+    /// Takes `v` as variable `i`, letting go of what it held.
+    pub(super) fn set(&mut self, i: usize, v: Var) {
         if self.0.len() <= i {
-            self.0.resize(i + 1, heap::unit());
+            self.0.resize_with(i + 1, || Var::Word(heap::unit()));
         }
-        heap::dec(std::mem::replace(&mut self.0[i], w));
+        std::mem::replace(&mut self.0[i], v).release();
+    }
+
+    /// Variable `i`, held once more for its reader: a uniform word, or a carried value's word.
+    pub(super) fn get(&self, i: usize) -> Word {
+        match self.0.get(i) {
+            Some(Var::Carried(v)) => v.dup(running()).handed().word(),
+            Some(Var::Word(w)) => {
+                heap::inc(*w);
+                *w
+            }
+            None => heap::unit(),
+        }
+    }
+
+    /// Takes `w` as variable `i`, of the type the variable was given at its `handle`.
+    pub(super) fn put(&mut self, i: usize, w: Handed) -> Result<(), &'static str> {
+        let Some(Var::Carried(old)) = self.0.get(i) else {
+            return Err("a handler's variable was set before its `handle` gave it a type");
+        };
+        let ty = old.ty();
+        self.set(i, Var::Carried(unsafe { Carried::new(w, ty) }));
+        Ok(())
     }
 }
 
@@ -79,23 +154,23 @@ pub(crate) fn shared(vars: HandlerVars) -> SharedVars {
 /// Lets go of one holder of `v`; the last gives back the values.
 pub(crate) fn release_vars(v: SharedVars) {
     if let Ok(only) = Rc::try_unwrap(v) {
-        for w in only.into_inner().0 {
-            heap::dec(w);
+        for var in only.into_inner().0 {
+            var.release();
         }
     }
 }
 
 impl HandlerFrame {
-    /// The closure of the clause a raise is bound for, taken out of the frame, which keeps the
-    /// rest.
-    pub(crate) fn take_clause(&mut self, at: usize) -> Word {
-        self.clauses.swap_remove(at).closure
+    /// The clause a raise is bound for, taken out of the frame, which keeps the rest.
+    pub(crate) fn take_clause(&mut self, at: usize) -> FrameClause {
+        self.clauses.swap_remove(at)
     }
 
     pub(super) fn simulate(fuel: i64) -> HandlerFrame {
         HandlerFrame {
             clauses: Vec::new(),
             ret: 0,
+            emitted: false,
             simulate: true,
             detached: None,
             fuel,
@@ -114,6 +189,7 @@ impl HandlerFrame {
         HandlerFrame {
             clauses,
             ret: 0,
+            emitted: false,
             simulate: false,
             detached: Some(id),
             fuel,
@@ -139,8 +215,8 @@ impl HandlerFrame {
         match &self.vars {
             Some(v) => {
                 let old = std::mem::replace(&mut *v.borrow_mut(), values.copied());
-                for w in old.0 {
-                    heap::dec(w);
+                for var in old.0 {
+                    var.release();
                 }
             }
             None => self.vars = Some(shared(values.copied())),
@@ -202,6 +278,8 @@ pub(crate) enum Kept {
     Landing(HandlerFrame),
     /// The raise a `bracket`'s release runs during.
     Raising(Aborting),
+    /// The arguments a clause emitted code made is called with, which it takes as it is entered.
+    Args(Vec<Word>),
 }
 
 impl Kept {
@@ -215,8 +293,38 @@ impl Kept {
             Kept::Raising(a) => {
                 a.into_failure();
             }
+            Kept::Args(_) => {}
         }
     }
+}
+
+/// `clause` of `emitted` code's making called with `args`, which it takes, while `held` are the
+/// clause's variables. A clause emitted code made reads its arguments from where a snapshot of this
+/// stack copies them, so a stop inside it that is resumed more than once frees them once a resume.
+pub(crate) fn call_clause(
+    ctx: *mut Ctx,
+    clause: Word,
+    emitted: bool,
+    args: Vec<Word>,
+    held: Option<(u64, SharedVars)>,
+) -> Word {
+    let c = unsafe { &mut *ctx };
+    if !emitted {
+        let args = Args::of(c, args);
+        let r = Ctx::holding(ctx, held, || call_value(ctx, clause, args.words()));
+        args.release();
+        return r;
+    }
+    let at = args.as_ptr();
+    let n = args.len();
+    let here = c.keep(Kept::Args(args));
+    let r = Ctx::holding(ctx, held, || {
+        call_fun(ctx, true, clause, unsafe {
+            std::slice::from_raw_parts(at, n)
+        })
+    });
+    unsafe { &mut *ctx }.kept_back(here).release();
+    r
 }
 
 /// A stack's frames, what its runtime frames keep and the variables its running clauses hold, as a
@@ -256,6 +364,7 @@ impl StackCopy {
                 ),
                 Kept::Landing(f) => Kept::Landing(frame(f)),
                 Kept::Raising(a) => Kept::Raising(a.copied()),
+                Kept::Args(words) => Kept::Args(words.clone()),
             })
             .collect();
         let held = held
@@ -281,8 +390,7 @@ impl StackCopy {
 }
 
 /// A call's arguments held in the calling runtime frame itself, so a snapshot of its stack copies
-/// them with it; past [`ARGS_INLINE`], a flat record nothing counts the words of, which the
-/// snapshot holds as it holds any word on the stack.
+/// them with it; past [`ARGS_INLINE`], a flat record nothing counts the words of.
 pub(crate) struct Args {
     pub(super) len: usize,
     pub(super) inline: [Word; ARGS_INLINE],
@@ -349,30 +457,67 @@ pub(crate) struct Aborting {
     pub(crate) depth: usize,
     pub(crate) clause: usize,
     /// Held for the clause, which takes them.
-    pub(crate) args: Vec<Word>,
+    pub(crate) args: Raised,
     pub(crate) diagnostic: Diagnostic,
+}
+
+/// What a raise carries: uniform words the release's code raised, or values emitted code raised
+/// with their types.
+pub(crate) enum Raised {
+    Words(Vec<Word>),
+    Carried(Vec<Carried>),
+}
+
+impl Raised {
+    fn copied(&self) -> Raised {
+        match self {
+            Raised::Words(ws) => {
+                for w in ws {
+                    heap::inc(*w);
+                }
+                Raised::Words(ws.clone())
+            }
+            Raised::Carried(vs) => {
+                let ctx = running();
+                Raised::Carried(vs.iter().map(|v| v.dup(ctx)).collect())
+            }
+        }
+    }
+
+    pub(crate) fn release(self) {
+        match self {
+            Raised::Words(ws) => ws.into_iter().for_each(heap::dec),
+            Raised::Carried(vs) => {
+                let ctx = running();
+                vs.into_iter().for_each(|v| v.release(ctx));
+            }
+        }
+    }
+
+    /// The words the clause the raise is bound for is called with, which it takes.
+    pub(crate) fn handed(self) -> Vec<Word> {
+        match self {
+            Raised::Words(ws) => ws,
+            Raised::Carried(vs) => vs.into_iter().map(|v| v.handed().word()).collect(),
+        }
+    }
 }
 
 impl Aborting {
     /// The same raise, what it carries held once more.
     pub(super) fn copied(&self) -> Aborting {
-        for w in &self.args {
-            heap::inc(*w);
-        }
         Aborting {
             stack: self.stack,
             depth: self.depth,
             clause: self.clause,
-            args: self.args.clone(),
+            args: self.args.copied(),
             diagnostic: self.diagnostic.clone(),
         }
     }
 
     /// The failure a raise no clause will now answer carries, with what it held let go.
     pub(crate) fn into_failure(self) -> Diagnostic {
-        for w in self.args {
-            heap::dec(w);
-        }
+        self.args.release();
         self.diagnostic
     }
 }
@@ -382,12 +527,15 @@ pub(crate) struct FrameClause {
     pub(super) effect: Symbol,
     pub(super) resource: Option<Symbol>,
     pub(super) op: Symbol,
-    pub(super) closure: Word,
-    /// 0: never resumes; 1: resumes in tail position; 2: elsewhere (only in a detached frame);
-    /// 3: answers a raise, once its `handle`'s body is abandoned.
+    pub(crate) closure: Word,
+    /// 0: never resumes; 1: resumes in tail position; 3: answers a raise, once its `handle`'s body
+    /// is abandoned. Off the tail, only in a detached frame: 2 resumes at most once, 4 may resume
+    /// again.
     pub(super) resumes: u8,
     /// `[*t]`: the clause's first slot after the parameters is the label the call site named.
     pub(super) binds_label: bool,
+    /// Whether `closure` is a closure emitted code made.
+    pub(crate) emitted: bool,
 }
 
 /// `abort.raise`, which the runtime itself raises for what fails on a value.
@@ -398,12 +546,22 @@ pub(super) fn is_abort(effect: &str, op: &str) -> bool {
 impl FrameClause {
     /// Lets go of the clause's closure.
     pub(crate) fn release(self) {
-        heap::dec(self.closure);
+        release_fun(self.emitted, self.closure);
     }
 
     /// `abort.raise` is a raise whatever its clause is marked: the runtime raises it itself.
     pub(super) fn raises(&self) -> bool {
         self.resumes == 3 || is_abort(self.effect.as_str(), self.op.as_str())
+    }
+
+    /// Resumes off the tail: its `handle`'s body runs detached, and a `perform` it answers stops it.
+    pub(super) fn off_tail(&self) -> bool {
+        matches!(self.resumes, 2 | 4)
+    }
+
+    /// May resume a stop more than once, so each is snapshotted.
+    pub(super) fn again(&self) -> bool {
+        self.resumes == 4
     }
 
     pub(super) fn answers_raise(&self, effect: &str, op: &str) -> bool {
@@ -456,10 +614,10 @@ impl HandlerFrame {
 /// `sharing_vars`, else copied.
 pub(super) fn copied_frame(f: &HandlerFrame, sharing_vars: bool) -> HandlerFrame {
     for cl in &f.clauses {
-        heap::inc(cl.closure);
+        dup_fun(cl.emitted, cl.closure);
     }
     if f.ret != 0 {
-        heap::inc(f.ret);
+        dup_fun(f.emitted, f.ret);
     }
     HandlerFrame {
         clauses: f
@@ -472,9 +630,11 @@ pub(super) fn copied_frame(f: &HandlerFrame, sharing_vars: bool) -> HandlerFrame
                 closure: cl.closure,
                 resumes: cl.resumes,
                 binds_label: cl.binds_label,
+                emitted: cl.emitted,
             })
             .collect(),
         ret: f.ret,
+        emitted: f.emitted,
         simulate: f.simulate,
         detached: f.detached,
         fuel: f.fuel,
@@ -504,9 +664,7 @@ pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
             // does not answer itself leaves for the region's own surroundings instead.
             let (raises, clauses): (Vec<FrameClause>, Vec<FrameClause>) =
                 f.clauses.into_iter().partition(FrameClause::raises);
-            for cl in raises {
-                heap::dec(cl.closure);
-            }
+            raises.into_iter().for_each(FrameClause::release);
             HandlerFrame {
                 clauses,
                 detached: None,
@@ -519,7 +677,7 @@ pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
 pub(crate) fn drop_frame(f: HandlerFrame) {
     f.clauses.into_iter().for_each(FrameClause::release);
     if f.ret != 0 {
-        heap::dec(f.ret);
+        release_fun(f.emitted, f.ret);
     }
     if let Some(v) = f.vars {
         release_vars(v);

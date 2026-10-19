@@ -26,6 +26,16 @@ pub struct Ctx {
     /// The tick at which compiled code calls [`rt_tick`] back; `i64::MAX` when neither the budget
     /// nor the clock bounds this entry, so nothing calls back at all.
     pub next_tick: i64,
+    /// The innermost frame record on the running stack's chain: [`crate::frames::base`] at the
+    /// bottom of a detached body's own stack, the one kind that records, and null on any other. A
+    /// switch saves it with the stack it leaves and puts back the other's.
+    pub frames: *mut crate::frames::PlyFrame,
+    /// How deeply drop roots run nested: one at [`RELEASE_DEPTH`] puts its release off through
+    /// [`rt_release_later`], and the outermost drains what waits through [`rt_release_drain`].
+    /// Compiled code reads and writes it, so it stays among the fields before the runtime's own.
+    pub release_depth: i64,
+    /// How many releases wait in the context's buffer for the outermost drop root to drain them.
+    pub release_waiting: i64,
     /// The calls this entry may make; 0 is no bound.
     pub(super) step_budget: i64,
     /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
@@ -95,6 +105,38 @@ pub struct Ctx {
     pub(super) outer: (*mut Heap, *const i64),
     /// What that entry's unit answered of its types' keys, put back with them.
     pub(super) outer_instances: Option<ply_core::Instances>,
+    /// Releases a drop root at [`RELEASE_DEPTH`] put off: each word with the root that releases it.
+    pub(crate) release_later: Vec<(crate::emitted::Handed, crate::emitted::DropRoot)>,
+    /// Stops whose continuation's last holder let it go, by body and capture, for the next drain to
+    /// drop: never inside the release that let it go.
+    pub(crate) continuations_died: Vec<(usize, usize)>,
+    /// The crossings under way, the innermost last.
+    pub(crate) crossings: Vec<Crossing>,
+    /// The bytes a native answered, until compiled code copies them out with [`rt_taken`].
+    pub(crate) taken: Vec<u8>,
+    /// The context running on this thread when this one's entry began, put back when it ends.
+    pub(super) outer_running: *mut Ctx,
+}
+
+thread_local! {
+    /// The context whose entry runs on this thread, for what lets go of a carried value where no
+    /// context is at hand.
+    static RUNNING: std::cell::Cell<*mut Ctx> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// The context whose entry runs on this thread.
+pub(crate) fn running() -> *mut Ctx {
+    let c = RUNNING.with(std::cell::Cell::get);
+    debug_assert!(
+        !c.is_null(),
+        "a carried value was let go of outside an entry"
+    );
+    c
+}
+
+/// Makes `c` the context running on this thread, answering the one that was.
+pub(crate) fn swap_running(c: *mut Ctx) -> *mut Ctx {
+    RUNNING.with(|r| r.replace(c))
 }
 
 impl Ctx {
@@ -109,6 +151,9 @@ impl Ctx {
             ticks: 0,
             charged: Cost::default(),
             next_tick: i64::MAX,
+            frames: std::ptr::null_mut(),
+            release_depth: 0,
+            release_waiting: 0,
             step_budget: 0,
             grown: 0,
             deadline: None,
@@ -148,6 +193,11 @@ impl Ctx {
             holds_made: 0,
             outer: (std::ptr::null_mut(), std::ptr::null()),
             outer_instances: None,
+            release_later: Vec::new(),
+            continuations_died: Vec::new(),
+            crossings: Vec::new(),
+            taken: Vec::new(),
+            outer_running: std::ptr::null_mut(),
         }
     }
 
@@ -325,6 +375,7 @@ impl Ctx {
         });
         self.arm_tick();
         self.stack_floor = stack_floor();
+        self.frames = std::ptr::null_mut();
         self.site_root = -1;
         self.last_linear = None;
         self.diagnostic = None;
@@ -343,17 +394,24 @@ impl Ctx {
         self.unwind = None;
         self.aborting = None;
         self.resumed = None;
+        self.release_depth = 0;
+        self.release_waiting = 0;
+        self.release_later.clear();
+        self.crossings.clear();
+        self.taken.clear();
         // Every path out of an entry calls `end`; this catches one that did not.
         if self.heap.allocated() != 0 {
             self.end();
         }
         self.detached.clear();
+        self.continuations_died.clear();
         self.entry = ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         // Another unit's entry may be running further up this thread: it gets its own back at `end`.
         self.outer = (
             heap::swap_current(&mut self.heap),
             heap::poison::swap(&raw const self.site_root),
         );
+        self.outer_running = swap_running(self);
         let mine = self.instances();
         self.outer_instances = ply_core::instances::swap(mine);
     }
@@ -403,10 +461,17 @@ impl Ctx {
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
+        crate::detached::teardown(self);
+        debug_assert!(
+            self.release_later.is_empty() && self.release_depth == 0,
+            "an entry ended with a release still running or waiting"
+        );
         heap::poison::swap(self.outer.1);
         heap::swap_current(self.outer.0);
+        swap_running(self.outer_running);
         ply_core::instances::swap(self.outer_instances.take());
         self.outer = (std::ptr::null_mut(), std::ptr::null());
+        self.outer_running = std::ptr::null_mut();
         self.last_entry = self.heap.allocated();
         if std::env::var("PLY_C_PHASES").is_ok() {
             eprintln!(
@@ -417,7 +482,7 @@ impl Ctx {
                 self.grown
             );
             let by_kind = self.heap.allocated_by_kind();
-            let mut kinds: Vec<(usize, usize)> = (0..16).map(|k| (k, by_kind[k])).collect();
+            let mut kinds: Vec<(usize, usize)> = by_kind.into_iter().enumerate().collect();
             kinds.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
             for (kind, n) in kinds.into_iter().filter(|(_, n)| *n > 0) {
                 eprintln!("  allocated: kind {kind}: {n} objects");
@@ -436,6 +501,7 @@ impl Ctx {
                             .join(", ")
                     ),
                     heap::KIND_BYTES => format!("bytes under {key}"),
+                    heap::KIND_REFUSED => format!("emitted blocks of {key} bytes past the header"),
                     _ => format!("str under {key}"),
                 };
                 eprintln!("  allocated: {n} of {what}");
@@ -525,7 +591,7 @@ impl Ctx {
             return self.fail(d);
         };
         let message = self.word(&Value::str(message));
-        self.bind_raise(at, vec![message], d)
+        self.bind_raise(at, Raised::Words(vec![message]), d)
     }
 
     /// Sends a raise on its way to the clause at `at`, which is handed `args`; `d` is what the
@@ -533,7 +599,7 @@ impl Ctx {
     pub(super) fn bind_raise(
         &mut self,
         at: (usize, usize, usize),
-        args: Vec<Word>,
+        args: Raised,
         d: Diagnostic,
     ) -> i64 {
         let (stack, depth, clause) = at;
@@ -686,7 +752,11 @@ pub(super) fn error(message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(codes::RUNTIME_ERROR, message.into()).primary(Span::DUMMY, "in compiled code")
 }
 
+/// The `n` words at `ptr`, which may be null where `n` is 0.
 pub(super) fn args_of<'a>(ptr: *const i64, n: i64) -> &'a [Word] {
+    if n == 0 {
+        return &[];
+    }
     unsafe { std::slice::from_raw_parts(ptr, n as usize) }
 }
 
