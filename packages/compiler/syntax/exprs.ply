@@ -14,7 +14,8 @@ import syntax.parsing (positional, Span, Ident, QName, Input, Parser, Parsed, Ea
                        token_pipepipe, token_question, token_star, keyword_let, keyword_if,
                        keyword_else, keyword_with, dump_node, dump_count, dump_presence, dump_word,
                        dump_list, dump_opt, dump_ident, dump_qname, dump_diags, with_no_pipe,
-                       advance_n, token_at, token_gt, token_lt, max_depth, span_bin, span_between)
+                       advance_n, token_at, token_gt, token_lt, max_depth, span_bin, span_between,
+                       span_generated)
 import syntax.lexer (TokenKind, Identifier, IntLiteral, FixedLiteral, WideLiteral, FloatLiteral,
                      DecimalLiteral, StringLiteral, LineString, BytesLiteral, InterpolatedHead,
                      InterpolatedMiddle, InterpolatedTail, CharLiteral, Keyword, Punctuation,
@@ -22,9 +23,9 @@ import syntax.lexer (TokenKind, Identifier, IntLiteral, FixedLiteral, WideLitera
 import std.bin
 import std.list (prepend)
 import syntax.type_syntax (TypeExpr, TCon, TFn, ty, ty_span, dump_ty, label_name)
-import syntax.patterns (Pattern, PVar, Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec,
-                        LChar, LUnit, pattern, pat_span, no_pattern, dump_pattern, dump_lit,
-                        src_over)
+import syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit,
+                        LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit,
+                        pattern, pat_span, no_pattern, dump_pattern, dump_lit, src_over)
 
 // --- The tree ---------------------------------------------------------------
 
@@ -95,12 +96,14 @@ pub type Slotted = {
 }
 
 /// `args` and then `named` put where a callee's parameters are, `names` each parameter's name and
-/// `defaults` what a call that leaves it out passes.
+/// `defaults` what a call that leaves it out passes. A default the call at `at` takes stands at a
+/// place of its own there (`placed_default`).
 pub fn slotted(
   names: List<Bytes>,
   defaults: List<Option<Expr>>,
   args: List<Expr>,
   named: List<NamedArg>,
+  at: Span,
 ) -> Slotted = {
   let index = |name: Bytes|
     range(0, names.len()).fold(None, |found: Option<Int>, i: Int|
@@ -134,7 +137,8 @@ pub fn slotted(
       if i < args.len() { { ..acc, slots: acc.slots.push(FromArg(i)) } } else {
         match ((by_name, defaults.at(i))) {
           (Some(j), _) -> { ..acc, slots: acc.slots.push(FromName(j)) },
-          (None, Some(Some(d))) -> { ..acc, slots: acc.slots.push(FromDefault(d)) },
+          (None, Some(Some(d))) ->
+            { ..acc, slots: acc.slots.push(FromDefault(placed_default(d, at, i))) },
           _ ->
             { ..acc, missing: acc.missing.push(match names.at(i) { Some(n) -> n, None -> b"" }) },
         }
@@ -151,6 +155,245 @@ pub fn slot_args(slots: List<Slot>, args: List<Expr>, named: List<NamedArg>) -> 
       FromName(j) -> match named.at(j) { Some(n) -> acc.push(n.value), None -> acc },
       FromDefault(d) -> acc.push(d),
     })
+
+/// `copied`, the default the call at `at` takes for its parameter `slot`, with every place in it at `at`,
+/// each node told apart by `gen` from the parameter and the node's place in a walk of the default:
+/// what a check files of one call's copy is that call's own, formatting the default moves none of
+/// them, and none is a `gen` a `derive` writes.
+fn placed_default(copied: Expr, at: Span, slot: Int) -> Expr =
+  placed_expr({ at: at, base: 1125899906842624 + slot * 1048576 }, copied, 0).e
+
+type Placing = { at: Span, base: Int }
+
+type PlacedExpr = { e: Expr, n: Int }
+
+type PlacedExprs = { es: List<Expr>, n: Int }
+
+type PlacedPat = { p: Pattern, n: Int }
+
+type PlacedPats = { ps: List<Pattern>, n: Int }
+
+fn place(pl: Placing, n: Int) -> Span = span_generated(pl.at, pl.base + n)
+
+fn ident_placed(i: Ident, s: Span) -> Ident = { name: i.name, span: s }
+
+fn qname_placed(q: QName, s: Span) -> QName =
+  {
+    module: match q.module { Some(m) -> Some(ident_placed(m, s)), None -> None },
+    name: ident_placed(q.name, s),
+    span: s,
+  }
+
+/// `e` placed as `placed_default` places a default, its walk starting at `n`; how far it got.
+fn placed_expr(pl: Placing, e: Expr, n: Int) -> PlacedExpr = {
+  let s = place(pl, n);
+  let each = |xs: List<Expr>, from: Int|
+    xs.fold({ es: [], n: from }, |acc: PlacedExprs, x: Expr| {
+      let o: PlacedExpr = placed_expr(pl, x, acc.n);
+      { es: acc.es.push(o.e), n: o.n }
+    });
+  let fields = |fs: List<RecField>, from: Int|
+    fs.fold({ fs: [], n: from }, |acc: { fs: List<RecField>, n: Int }, f: RecField| {
+      let v: PlacedExpr = placed_expr(pl, f.value, acc.n + 1);
+      { fs: acc.fs.push({ name: ident_placed(f.name, place(pl, acc.n)), value: v.e }), n: v.n }
+    });
+  let maybe = |x: Option<Expr>, from: Int|
+    match x {
+      Some(y) -> {
+        let o: PlacedExpr = placed_expr(pl, y, from);
+        { e: Some(o.e), n: o.n }
+      },
+      None -> { e: None, n: from },
+    };
+  match e {
+    ELit(l) -> { e: ELit({ span: s, lit: l.lit }), n: n + 1 },
+    EVar(v) -> { e: EVar({ span: s, name: qname_placed(v.name, s) }), n: n + 1 },
+    EBinary(b) -> {
+      let l: PlacedExpr = placed_expr(pl, b.lhs, n + 1);
+      let r: PlacedExpr = placed_expr(pl, b.rhs, l.n);
+      { e: EBinary({ span: s, op: b.op, lhs: l.e, rhs: r.e }), n: r.n }
+    },
+    EUnary(u) -> {
+      let o: PlacedExpr = placed_expr(pl, u.operand, n + 1);
+      { e: EUnary({ span: s, op: u.op, operand: o.e }), n: o.n }
+    },
+    ELambda(l) -> {
+      let ps = l.params.fold({ ps: [], n: n + 1 }, |acc: { ps: List<Param>, n: Int }, q: Param| {
+        let at = place(pl, acc.n);
+        { ps: acc.ps.push({ ..q, name: ident_placed(q.name, at), span: at }), n: acc.n + 1 }
+      });
+      let body: PlacedExpr = placed_expr(pl, l.body, ps.n);
+      { e: ELambda({ span: s, body: body.e, params: ps.ps, ret: l.ret }), n: body.n }
+    },
+    EApp(a) -> {
+      let f: PlacedExpr = placed_expr(pl, a.func, n + 1);
+      let xs: PlacedExprs = each(a.args, f.n);
+      let ns = a.named.fold(
+        { ns: [], n: xs.n },
+        |acc: { ns: List<NamedArg>, n: Int }, arg: NamedArg| {
+          let o: PlacedExpr = placed_expr(pl, arg.value, acc.n);
+          { ns: acc.ns.push({ name: ident_placed(arg.name, s), value: o.e, span: s }), n: o.n }
+        },
+      );
+      {
+        e: EApp({
+          span: s,
+          func: f.e,
+          named: ns.ns,
+          args: xs.es,
+          labels: a.labels.map(|i: Ident| ident_placed(i, s)),
+        }),
+        n: ns.n,
+      }
+    },
+    EIf(i) -> {
+      let c: PlacedExpr = placed_expr(pl, i.cond, n + 1);
+      let t: PlacedExpr = placed_expr(pl, i.then_branch, c.n);
+      let el: PlacedExpr = placed_expr(pl, i.else_branch, t.n);
+      { e: EIf({ span: s, cond: c.e, then_branch: t.e, else_branch: el.e }), n: el.n }
+    },
+    EMatch(m) -> {
+      let sc: PlacedExpr = placed_expr(pl, m.scrutinee, n + 1);
+      let arms = m.arms.fold(
+        { arms: [], n: sc.n },
+        |acc: { arms: List<MatchArm>, n: Int }, arm: MatchArm| {
+          let pt: PlacedPat = placed_pat(pl, arm.pat, acc.n + 1);
+          let g: { e: Option<Expr>, n: Int } = maybe(arm.guard, pt.n);
+          let b: PlacedExpr = placed_expr(pl, arm.body, g.n);
+          {
+            arms: acc.arms.push({ pat: pt.p, guard: g.e, body: b.e, span: place(pl, acc.n) }),
+            n: b.n,
+          }
+        },
+      );
+      { e: EMatch({ span: s, scrutinee: sc.e, arms: arms.arms }), n: arms.n }
+    },
+    EBlock(b) -> {
+      let st = b.stmts.fold(
+        { stmts: [], n: n + 1 },
+        |acc: { stmts: List<Stmt>, n: Int }, stmt: Stmt|
+          match stmt {
+            SLet(l) -> {
+              let pt: PlacedPat = placed_pat(pl, l.pat, acc.n + 1);
+              let v: PlacedExpr = placed_expr(pl, l.value, pt.n);
+              {
+                stmts: acc.stmts.push(
+                  SLet({ span: place(pl, acc.n), pat: pt.p, ty: l.ty, value: v.e }),
+                ),
+                n: v.n,
+              }
+            },
+            SLetElse(l) -> {
+              let pt: PlacedPat = placed_pat(pl, l.pat, acc.n + 1);
+              let v: PlacedExpr = placed_expr(pl, l.value, pt.n);
+              let fb: PlacedExpr = placed_expr(pl, l.fallback, v.n);
+              {
+                stmts: acc.stmts.push(
+                  SLetElse({
+                    span: place(pl, acc.n),
+                    pat: pt.p,
+                    ty: l.ty,
+                    value: v.e,
+                    fallback: fb.e,
+                  }),
+                ),
+                n: fb.n,
+              }
+            },
+            SExpr(x) -> {
+              let o: PlacedExpr = placed_expr(pl, x, acc.n);
+              { stmts: acc.stmts.push(SExpr(o.e)), n: o.n }
+            },
+            SAssign(x) -> {
+              let at = place(pl, acc.n);
+              let v: PlacedExpr = placed_expr(pl, x.value, acc.n + 1);
+              {
+                stmts: acc.stmts.push(
+                  SAssign({ span: at, name: ident_placed(x.name, at), value: v.e }),
+                ),
+                n: v.n,
+              }
+            },
+          },
+      );
+      let t: { e: Option<Expr>, n: Int } = maybe(b.tail, st.n);
+      { e: EBlock({ span: s, tail: t.e, stmts: st.stmts }), n: t.n }
+    },
+    ERecord(r) -> {
+      let fs: { fs: List<RecField>, n: Int } = fields(r.fields, n + 1);
+      { e: ERecord({ span: s, fields: fs.fs }), n: fs.n }
+    },
+    ERecordUpdate(r) -> {
+      let base: PlacedExpr = placed_expr(pl, r.base, n + 1);
+      let fs: { fs: List<RecField>, n: Int } = fields(r.fields, base.n);
+      { e: ERecordUpdate({ span: s, base: base.e, fields: fs.fs }), n: fs.n }
+    },
+    ETry(t) -> {
+      let o: PlacedExpr = placed_expr(pl, t.operand, n + 1);
+      { e: ETry({ span: s, operand: o.e }), n: o.n }
+    },
+    EField(f) -> {
+      let base: PlacedExpr = placed_expr(pl, f.base, n + 1);
+      {
+        e: EField({ span: s, base: base.e, field: ident_placed(f.field, place(pl, base.n)) }),
+        n: base.n + 1,
+      }
+    },
+    EList(l) -> {
+      let xs: PlacedExprs = each(l.items, n + 1);
+      { e: EList({ span: s, items: xs.es }), n: xs.n }
+    },
+    EBad(_) -> { e: EBad({ span: s }), n: n + 1 },
+    // No default holds a perform, a handle, a hold, a region, a tagged literal or a `try` block.
+    _ -> { e: e, n: n + 1 },
+  }
+}
+
+/// `p` placed as `placed_expr` places the expression it stands in.
+fn placed_pat(pl: Placing, p: Pattern, n: Int) -> PlacedPat = {
+  let s = place(pl, n);
+  let each = |ps: List<Pattern>, from: Int|
+    ps.fold({ ps: [], n: from }, |acc: PlacedPats, x: Pattern| {
+      let o: PlacedPat = placed_pat(pl, x, acc.n);
+      { ps: acc.ps.push(o.p), n: o.n }
+    });
+  match p {
+    PWild(_) -> { p: PWild({ span: s }), n: n + 1 },
+    PVar(v) -> { p: PVar({ span: s, name: ident_placed(v.name, s) }), n: n + 1 },
+    PLit(l) -> { p: PLit({ span: s, lit: l.lit }), n: n + 1 },
+    PRange(r) -> { p: PRange({ ..r, span: s }), n: n + 1 },
+    PCtor(c) -> {
+      let xs: PlacedPats = each(c.args, n + 1);
+      { p: PCtor({ span: s, name: qname_placed(c.name, s), args: xs.ps }), n: xs.n }
+    },
+    PRecord(r) -> {
+      let fs = r.fields.fold(
+        { fs: [], n: n + 1 },
+        |acc: { fs: List<{ name: Ident, pat: Pattern }>, n: Int }, f: { name: Ident, pat: Pattern }| {
+          let o: PlacedPat = placed_pat(pl, f.pat, acc.n + 1);
+          { fs: acc.fs.push({ name: ident_placed(f.name, place(pl, acc.n)), pat: o.p }), n: o.n }
+        },
+      );
+      { p: PRecord({ span: s, rest: r.rest, fields: fs.fs }), n: fs.n }
+    },
+    PList(l) -> {
+      let xs: PlacedPats = each(l.items, n + 1);
+      let rest: { p: Option<Pattern>, n: Int } = match l.rest {
+        Some(x) -> {
+          let o: PlacedPat = placed_pat(pl, x, xs.n);
+          { p: Some(o.p), n: o.n }
+        },
+        None -> { p: None, n: xs.n },
+      };
+      { p: PList({ span: s, rest: rest.p, items: xs.ps }), n: rest.n }
+    },
+    POr(o) -> {
+      let xs: PlacedPats = each(o.alts, n + 1);
+      { p: POr({ span: s, alts: xs.ps }), n: xs.n }
+    },
+    PBad(_) -> { p: PBad({ span: s }), n: n + 1 },
+  }
+}
 
 /// A parameter; only a `fn` parameter may carry a `default`, or name with `cost` the steps a call of
 /// it takes and with `space` the memory a call of it holds, which only that definition's `cost` and
@@ -228,6 +471,35 @@ pub fn expr_span(expr: Expr) -> Span =
     EBad(v) -> v.span,
     ETryBlock(v) -> v.span,
   }
+
+/// Where the closure a `simulate` written at `at` runs its body in is typed: its keyword, which no
+/// node written there takes.
+pub fn simulated_at(at: Span) -> Span = opening(at, 8)
+
+/// Where the closure a `handle` written at `at` runs its body in, where the body runs detached, is
+/// typed: its keyword.
+pub fn detached_at(at: Span) -> Span = opening(at, 6)
+
+/// Where the closure a `parallel` branch runs in is typed: the empty place the branch starts at.
+pub fn branch_at(branch: Expr) -> Span = opening(expr_span(branch), 0)
+
+/// Where the parts of the `handle` a `try` written at `at` stands for are typed, each a piece of its
+/// `try` keyword, which no node written there takes: the return clause's closure, the raise's
+/// clause's closure, the `Ok` and the `Err` it writes, and the record of the raise's arguments the
+/// `Err` holds where it takes several.
+pub type TryPlaces = { ret: Span, clause: Span, ok: Span, err: Span, carried: Span }
+
+pub fn try_places(at: Span) -> TryPlaces =
+  {
+    ret: opening(at, 3),
+    clause: opening(at, 2),
+    ok: opening(at, 1),
+    err: { ..at, start: at.start + 1, end: at.start + 3 },
+    carried: { ..at, start: at.start + 1, end: at.start + 2 },
+  }
+
+/// The first `width` bytes of what is written at `at`.
+fn opening(at: Span, width: Int) -> Span = { ..at, end: at.start + width }
 
 fn tag_fn(tag: Ident, name: Bytes) -> QName =
   { module: Some(tag), name: { name: name, span: tag.span }, span: tag.span }

@@ -6,11 +6,12 @@
 //! built after a `match` let go of a subject held once takes the subject's cells, as compiled code
 //! does.
 
-import compiler.emit.code (Code, Owned, NLit, NVar, NUnary, NBinary, NApp, NKnown, NIf, NBlock,
-                           NList, NRecord, NMatch, NPerform, NLabel, NLambda, NSimulate, NParallel,
+import compiler.emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NKnown, NIf, NBlock, NList,
+                           NRecord, NMatch, NPerform, NLabel, NLambda, NSimulate, NParallel,
                            NHandle, NField, NUpdate, CodeStmt, CLet, CLetPat, CDo, CodeField,
                            CodeArm, CodePattern, PxVar, PxCtor, PxRecord, PxList, CodePatternField,
                            Capture)
+import compiler.emit.moves (Moves, read_moved, capture_moved)
 import compiler.front.published (ClaimClause)
 import compiler.check.infer.checker (Builtin)
 import compiler.syntax.items (SSpace)
@@ -18,7 +19,7 @@ import compiler.syntax.patterns (Lit, LInt, LStr, LBytes, LEmbedded)
 import compiler.check.types (Type, TyCon, TyFn, TyRecord)
 import compiler.check.semantics (Iterates, Handed, Threaded, Taken, Number, Mapped, Kept, Folded,
                                  Updated, Unstated)
-import context (Context, Def, ctor, signature, is_recursive)
+import context (Context, Def, Moved, ctor, signature, is_recursive, moved_of)
 import cost (Poly, Of, Same, Part, Other, Found, OnTail, OnIndex, zero, constant, size_of, plus,
              product, at_args, ceiling_of, callees, reachable, params_sized, arithmetic,
              holding_keyed, descent, descent_calls, kept, is_length, dominated, stated, cx_owning,
@@ -68,14 +69,16 @@ type Spent = { space: Poly, holders: Holders }
 /// What a builtin answers: a number, an `Option` of one, or any other value.
 type Answer = | ANumber | AOptionNumber | AValue
 
-/// `own` is the definition being read, and `numbers` which of its parameters are numbers; `known`,
-/// what it calls; `answers`, what each builtin answers; `lambda`, whether the walk is inside a
-/// function value, whose code is read letting no subject go; `tail`, whether nothing in the frame
-/// follows the expression; `empty`, a list parameter known empty; `found`, where `List::at` answered
-/// `Some` on the path; `missed`, where it answers `None`.
+/// `own` is the definition being read, `moves` which of its body's reads hand their value on, and
+/// `numbers` which of its parameters are numbers; `known`, what it calls; `answers`, what each builtin
+/// answers; `lambda`, whether the walk is inside a function value, whose code is read letting no
+/// subject go; `tail`, whether nothing in the frame follows the expression; `empty`, a list parameter
+/// known empty; `found`, where `List::at` answered `Some` on the path; `missed`, where it answers
+/// `None`.
 type Env = {
   cx: Context,
   own: String,
+  moves: Moves,
   numbers: List<Bool>,
   known: Map<String, Known>,
   answers: Map<String, Answer>,
@@ -102,6 +105,7 @@ pub fn stated_space(bound: Code, params: Int, spaced: List<Int>) -> Option<Poly>
 pub fn space(cx: Context, def: String) -> Result<Poly, String> / {abort.raise} = {
   let answers = answers_of_builtins();
   let reach = reachable(cx, def);
+  let moved = moved_of(cx.claims, reach);
   let known = iterate(Map::new(), reach.len() + 1, |known: Map<String, Known>| {
     let ready = reach.filter(|n: String|
       !known.contains(n)
@@ -109,7 +113,7 @@ pub fn space(cx: Context, def: String) -> Result<Poly, String> / {abort.raise} =
     if ready.len() == 0 { Stop(known) } else {
       Continue(
         ready.fold(known, |k: Map<String, Known>, n: String|
-          k.insert(n, known_of(cx, answers, n, k))),
+          k.insert(n, known_of(cx, answers, moved, n, k))),
       )
     }
   });
@@ -135,9 +139,12 @@ fn spent_for(k: Known, once: Bool) -> Result<Spent, String> =
     }
   }
 
+/// What `def` holds, its body read as the build lowers it where `moved` holds it, else by its
+/// contract.
 fn known_of(
   cx: Context,
   answers: Map<String, Answer>,
+  moved: Map<String, Result<Moved, String>>,
   def: String,
   known: Map<String, Known>,
 ) -> Known / {abort.raise} =
@@ -146,7 +153,7 @@ fn known_of(
       let why = "`" ++ def ++ "` has no body here to read";
       { alone: Err(why), anyhow: Err(why) }
     },
-    Some(d) -> match d.moved {
+    Some(d) -> match moved.get(def) {
       None ->
         {
           alone: promised(def, d),
@@ -155,14 +162,15 @@ fn known_of(
               ++ "` is handed a value something else holds, and its `space` bound is for arguments held alone",
           ),
         },
-      Some(body) -> {
+      Some(Err(why)) -> { alone: Err(why), anyhow: Err(why) },
+      Some(Ok(m)) -> {
         let read = |many: List<Int>|
           held(
             cx,
             answers,
             def,
             d,
-            body,
+            m,
             known,
             many.fold(Map::new(), |m: Map<Int, Holders>, i: Int| m.insert(i, Many)),
           );
@@ -200,16 +208,18 @@ fn held(
   answers: Map<String, Answer>,
   def: String,
   d: Def,
-  body: Code,
+  moved: Moved,
   known: Map<String, Known>,
   entry: Map<Int, Holders>,
 ) -> Result<Spent, String> / {abort.raise} = {
+  let body = moved.body;
   let params = d.params;
   let sized = params_sized(cx, def, params);
   let numbers = numbers_of(cx, def, params);
   let env = {
     cx: cx,
     own: def,
+    moves: moved.moves,
     numbers: numbers,
     known: known,
     answers: answers,
@@ -410,7 +420,7 @@ fn walk(env: Env, st: State, c: Code) -> Result<Walked, String> / {abort.raise} 
       Ok(match v.slot {
         Some(k) -> {
           let s = slot_at(st, k);
-          let moved = c.own == Owned || s.number;
+          let moved = read_moved(env.moves, c.span) || s.number;
           {
             ..none(st),
             size: s.size,
@@ -509,7 +519,7 @@ fn walk(env: Env, st: State, c: Code) -> Result<Walked, String> / {abort.raise} 
     },
     NLambda(l) -> {
       let caught = l.captures.fold(st, |s: State, cap: Capture|
-        if cap.own == Owned { s } else { retain(s, Some(cap.src), Many) });
+        if capture_moved(env.moves, l.at, cap.src) { s } else { retain(s, Some(cap.src), Many) });
       let fun = match lambda_walk(
           env,
           st,
@@ -642,7 +652,7 @@ fn statement(env: Env, st: State, s: CodeStmt) -> Result<Walked, String> / {abor
 /// Whether compiled code lets a pattern's subject go once its binders hold its fields: where it is
 /// a local's last read, held once, outside a function value.
 fn let_go(env: Env, subject: Code, w: Walked) -> Bool =
-  !env.lambda && subject.own == Owned && !w.number && w.holders != Many
+  !env.lambda && read_moved(env.moves, subject.span) && !w.number && w.holders != Many
     && (match subject.node { NVar(v) -> v.slot != None, _ -> false })
 
 /// The cells a let-go subject leaves for the next constructor of its kind to take, where no other

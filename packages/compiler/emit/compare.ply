@@ -1,0 +1,489 @@
+//! A program's text lowered, checked and printed through the typed form as the emitter would hand
+//! it each root, the C spelled with each hole of the unit's tables as the entry it names.
+
+import front.diagnostics (parse_all)
+import front.seam (Analysed, Refused)
+import front.facts (Analysis)
+import front.published (analyse, dump_of, no_rows)
+import front (analyse_pulling_std_with)
+import front.rows (ModuleRow)
+import syntax.exprs (prelude_module)
+import std.prelude_source
+import check.resolve.tables (Diag, qualify)
+import check.types (TyCon)
+import std.bytes (ascii_of_int, hex_digit)
+import emit (emit_roots_answer)
+import unit (program_natives)
+import check.infer.definitions (Extern)
+import emit.answer (RootAnswer, Body, Const, ConstStr, ConstBytes, ConstEmbedded, ConstFixed,
+                    ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, GenericCall)
+import emit.roots (FnArg)
+import emit.pieces (Piece, spelled)
+import emit.tir (Rep, Var, Arg, AVar, ABool, RInt, RBool, Inst, Decl, Assign, If, Return, Restart,
+                 Fn, Declined, Family, Spine, Data, Calling, Matching, Handling, Scalars,
+                 Containers)
+import emit.lower (root_lowered)
+import emit.lower.setting (Setting, Root, setting_in)
+import emit.print (printed_fn)
+import emit.own (owned)
+import emit.verify (verified)
+
+/// A program of one module `m`: its text, its analysis, and what the emitter would hand each of its
+/// definitions.
+pub type Program = { src: Bytes, analysis: Analysis, setting: Setting, roots: List<Root> }
+
+/// `src` as module `m` of a program, or what refused it, run by a runtime that implements every
+/// native the compiler declares, as a build hands the emitter its runtime's.
+pub fn program_of(src: Bytes) -> Result<Program, Bytes> / {abort.raise} =
+  match analyse(parse_all([{ name: b"m", src: src }])) {
+    Refused(diags) -> Err(Bytes::join(diags.map(|d: Diag| d.message), b"\n")),
+    Analysed(a) -> match setting_in(a, b"m") {
+      Err(why) -> Err(why),
+      Ok(s) ->
+        Ok({
+          src: src,
+          analysis: a,
+          setting: { ..s.setting, builtins: program_natives([]).map(|e: Extern| e.name) },
+          roots: s.roots,
+        }),
+    },
+  }
+
+/// Root `m.<name>` of `p` lowered to the form as a build lowers it, its body after `known_body`, or
+/// why it was not.
+pub fn formed(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.raise} =
+  match p.roots.fold(None, |acc: Option<Root>, r: Root|
+      if r.full == qualify(b"m", name) { Some(r) } else { acc }) {
+    None -> Err({ by: Spine, why: b"no such definition" }),
+    Some(r) -> match r.code {
+      None -> Err({ by: Spine, why: b"a body that does not lower to Code" }),
+      Some(code) -> root_lowered(p.setting, r, code),
+    },
+  }
+
+/// Root `m.<name>` of `p` lowered, its counts placed and checked, or why not: what a build prints.
+pub fn checked(p: Program, name: Bytes) -> Result<Fn, Bytes> / {abort.raise} =
+  match formed(p, name) {
+    Err(no) -> Err(no.why),
+    Ok(form) -> {
+      let counted = owned(form);
+      match verified(counted) {
+        Some(why) -> Err(b"refused by the check: ".concat(why)),
+        None -> Ok(counted),
+      }
+    },
+  }
+
+/// Root `m.<name>` of `p` as the form prints it once it is checked, or why it was not printed.
+pub fn printed_by_form(p: Program, name: Bytes) -> Result<Bytes, Bytes> / {abort.raise} =
+  match checked(p, name) { Err(why) -> Err(why), Ok(form) -> Ok(printed_text(form)) }
+
+/// Why a build stops at the root lowered to `f`, where it does: the check refuses its form once its
+/// counts are placed, or a printer has no C for it.
+pub fn unbuilt(f: Fn) -> Option<Bytes> / {abort.raise} = {
+  let counted = owned(f);
+  match verified(counted) {
+    Some(why) -> Some(b"refused by the check: ".concat(why)),
+    None -> handle {
+      printed_fn(counted);
+      None
+    } with {
+      abort.raise(m) -> Some(Bytes::of_string(m)),
+    },
+  }
+}
+
+/// Each root `m.<name>` of `p` among `names` a build stops at, and why: the form declines it, or
+/// `unbuilt` says why.
+pub fn not_built(
+  p: Program,
+  names: List<Bytes>,
+) -> List<{ name: Bytes, why: Bytes }> / {abort.raise} =
+  names.fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
+    match formed(p, n) {
+      Err(no) -> acc.push({ name: n, why: no.why }),
+      Ok(f) -> match unbuilt(f) { Some(why) -> acc.push({ name: n, why: why }), None -> acc },
+    })
+
+/// Root `f`'s C as the form prints it, each hole of the unit's tables spelled as the entry it names
+/// (`@@c=str:one@@`).
+pub fn printed_text(f: Fn) -> Bytes / {abort.raise} = {
+  let pr = printed_fn(f);
+  let generics = f.links.generics.map(call_spelled);
+  resolved(spelled(pr.pieces), {
+    c: pr.consts.map(const_spelled),
+    b: pr.builtins,
+    f: pr.fields,
+    s: pr.shapes.map(|s: List<Bytes>| Bytes::join(s, b",")),
+    l: pr.lambdas.map(|ps: List<Piece>| entry_spelled(spelled(ps), generics)),
+    g: generics,
+  })
+}
+
+/// The C a build writes for root `root` of module `m`, whose text is `src`, in a program of the
+/// `shipped` modules it imports; or what refused the program, or the internal error that stops the
+/// build at the root. Reaches what `formed` does not: a test or a law.
+pub fn answered_by_form(
+  src: Bytes,
+  shipped: List<{ name: Bytes, src: Bytes }>,
+  root: Bytes,
+) -> Result<Bytes, Bytes> / {abort.raise} =
+  match analyse_pulling_std_with([{ name: b"m", src: src }], shipped, no_rows()).out {
+    Refused(diags) -> Err(Bytes::join(diags.map(|d: Diag| d.message), b"\n")),
+    Analysed(a) -> match setting_in(a, b"m") {
+      Err(why) -> Err(why),
+      Ok(s) -> {
+        let d = dump_of(Analysed(a));
+        let texts = shipped.fold(
+          Map::new().insert(b"m", src).insert(prelude_module(), prelude_source::text()),
+          |acc: Map<Bytes, Bytes>, x: { name: Bytes, src: Bytes }| acc.insert(x.name, x.src),
+        );
+        let order = d.modules.fold(Map::new(), |acc: Map<Int, Bytes>, row: ModuleRow|
+          acc.insert(row.index, row.name));
+        let names = range(0, order.len()).map(|i: Int|
+          match order.get(i) { Some(n) -> n, None -> b"" });
+        handle {
+          match emit_roots_answer(
+              names,
+              names.map(|n: Bytes| match texts.get(n) { Some(t) -> t, None -> b"" }),
+              s.setting.ctors,
+              program_natives([]).map(|e: Extern| e.name),
+              [root],
+              [],
+              [],
+              d.embeds,
+              d.rows,
+              d.walked,
+            ).fold(None, |acc: Option<RootAnswer>, r: RootAnswer|
+              if r.name == root { Some(r) } else { acc }) {
+            Some(r) -> match r.answer { Body(b) -> Ok(b.text), _ -> Err(b"refused") },
+            None -> Err(b"no such root"),
+          }
+        } with {
+          abort.raise(m) -> Err(Bytes::of_string(m)),
+        }
+      },
+    },
+  }
+
+/// What each hole of a root's tables names, spelled, by table and in the order its holes number it:
+/// constants, builtins, field names, shapes, the code table's entries and generic calls.
+type Entries = {
+  c: List<Bytes>,
+  b: List<Bytes>,
+  f: List<Bytes>,
+  s: List<Bytes>,
+  l: List<Bytes>,
+  g: List<Bytes>,
+}
+
+/// `text` with each hole of a table `e` holds an entry for written as `@@<table>=<entry>@@`.
+fn resolved(text: Bytes, e: Entries) -> Bytes / {abort.raise} = {
+  let cut = text.split(b"@@");
+  Bytes::concat_all(
+    range(0, cut.len()).map(|i: Int| {
+      let s = cut.get(i);
+      if i % 2 == 0 { s }
+      else if i == cut.len() - 1 { b"@@".concat(s) }
+      else { Bytes::concat_all([b"@@", hole_spelled(s, e), b"@@"]) }
+    }),
+  )
+}
+
+/// A hole's content, `c3`, as the entry it names, `c=str:one`, where its table holds one.
+fn hole_spelled(h: Bytes, e: Entries) -> Bytes / {abort.raise} =
+  if !numbered_hole(h) { h } else {
+    let table = h.slice(0, 1);
+    let entries = if table == b"c" { e.c }
+    else if table == b"b" { e.b }
+    else if table == b"f" { e.f }
+    else if table == b"s" { e.s }
+    else if table == b"l" { e.l }
+    else { e.g };
+    match h.slice(1, h.len()).int_of_ascii() {
+      Some(n) -> match entries.at(n) {
+        Some(x) -> Bytes::concat_all([table, b"=", escaped(x)]),
+        None -> h,
+      },
+      None -> h,
+    }
+  }
+
+/// Whether a hole's content is a table's letter and a number.
+fn numbered_hole(h: Bytes) -> Bool / {abort.raise} =
+  [108, 99, 98, 102, 115, 103].any(|t: Int| digits_after(h, t))
+
+/// A code table's entry, whose own holes name the body's generic calls, as those calls.
+fn entry_spelled(entry: Bytes, generics: List<Bytes>) -> Bytes / {abort.raise} =
+  resolved(entry, { c: [], b: [], f: [], s: [], l: [], g: generics })
+
+/// `b` with every byte that is not printable ASCII, and `@`, `\`, `;`, `{` and `}`, written `\xHH`,
+/// so a hole's entry holds no `@@`, no line break, and nothing a statement or a block is read by.
+fn escaped(b: Bytes) -> Bytes / {abort.raise} =
+  Bytes::concat_all(
+    range(0, b.len()).map(|i: Int| {
+      let x = b.at(i);
+      if x >= 32 && x <= 126 && x != 64 && x != 92 && x != 59 && x != 123 && x != 125 {
+        b.slice(i, i + 1)
+      } else { Bytes::concat_all([b"\\x", hex_digit(x / 16), hex_digit(x % 16)]) }
+    }),
+  )
+
+fn const_spelled(k: Const) -> Bytes =
+  match k {
+    ConstStr(s) -> b"str:".concat(s),
+    ConstBytes(s) -> b"bytes:".concat(s),
+    ConstEmbedded(d) -> b"embedded:".concat(d),
+    ConstFixed(x) ->
+      Bytes::concat_all([b"fixed:", ascii_of_int(x.width), b":", ascii_of_int(x.bits)]),
+    ConstWide(x) ->
+      Bytes::concat_all([
+        b"wide:",
+        ascii_of_int(x.width),
+        b":",
+        ascii_of_int(x.high),
+        b":",
+        ascii_of_int(x.low),
+      ]),
+    ConstFloat(t) -> b"float:".concat(t),
+    ConstDecimal(t) -> b"decimal:".concat(t),
+    ConstChar(c) -> b"char:".concat(ascii_of_int(c)),
+    ConstUnit -> b"unit",
+  }
+
+/// A generic call as its callee at its type arguments, the variables it hands over raw, and the
+/// lambdas it hands: `m.f<Int>[0]|1=m.g:0`.
+fn call_spelled(g: GenericCall) -> Bytes =
+  Bytes::concat_all([
+    g.callee,
+    b"<",
+    Bytes::join(g.args, b","),
+    b">",
+    if g.carried.len() == 0 { b"" }
+    else { Bytes::concat_all([b"[", Bytes::join(g.carried.map(ascii_of_int), b","), b"]"]) },
+    Bytes::concat_all(
+      g.fns.map(|x: FnArg|
+        Bytes::concat_all([b"|", ascii_of_int(x.param), b"=", x.owner, b":", ascii_of_int(x.nth)])),
+    ),
+  ])
+
+/// Whether `v` is the byte `lead` and then one or more digits.
+fn digits_after(v: Bytes, lead: Int) -> Bool / {abort.raise} =
+  v.len() > 1 && v.at(0) == lead && range(1, v.len()).all(|i: Int| v.at(i) >= 48 && v.at(i) <= 57)
+
+fn scalar_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"fn add(a: Int, b: Int) -> Int = a + b\n",
+    b"fn diff(a: Int, b: Int) -> Int = a - b * 3\n",
+    b"fn quot(a: Int, b: Int) -> Int / {abort.raise} = a / b + a % 7\n",
+    b"fn less(a: Int, b: Int) -> Bool = a < b\n",
+    b"fn apart(a: Int, b: Int) -> Bool = a != b\n",
+    b"fn negated(a: Int) -> Int = -a\n",
+    b"fn bits(a: Int, b: Int) -> Int = (a & b) | 5\n",
+    b"fn folded(a: Int) -> Int = a + (2 * 3 + 1)\n",
+    b"fn pick(c: Bool, a: Int, b: Int) -> Int = if c { a } else { b + 1 }\n",
+    b"fn square(x: Float) -> Float = x * x + 1.5\n",
+    b"fn fless(x: Float, y: Float) -> Bool = x < y\n",
+    b"fn fneg(x: Float) -> Float = -x\n",
+    b"fn twice(x: Int) -> Int = add(x, x)\n",
+    b"fn total(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { total(n - 1, acc + n) }\n",
+    b"fn bound(x: Int) -> Int = { let y = x * 2; let z = y + 3; z - x }\n",
+    b"fn flip(b: Bool) -> Bool = !b\n",
+    b"fn same(a: Bool, b: Bool) -> Bool = a == b\n",
+    b"fn wadd(a: U8, b: U8) -> U8 = a + b\n",
+    b"fn wless(a: U8, b: U8) -> Bool = a < b\n",
+    b"fn wmul(a: I32, b: I32) -> I32 = a * b\n",
+    b"fn wide(a: I64, b: I64) -> I64 = a + b\n",
+    b"fn uwide(a: U64, b: U64) -> U64 = a - b\n",
+    b"fn wand(a: U16, b: U16) -> U16 = a & b\n",
+  ])
+
+fn scalar_names() -> List<Bytes> =
+  [
+    b"add",
+    b"diff",
+    b"quot",
+    b"less",
+    b"apart",
+    b"negated",
+    b"bits",
+    b"folded",
+    b"pick",
+    b"square",
+    b"fless",
+    b"fneg",
+    b"twice",
+    b"total",
+    b"bound",
+    b"flip",
+    b"same",
+    b"wadd",
+    b"wless",
+    b"wmul",
+    b"wide",
+    b"uwide",
+    b"wand",
+  ]
+
+test "every function the form prints makes room on the stack it runs on, and none grows a stack of its own" {
+  let src = Bytes::concat_all([
+    scalar_corpus(),
+    b"type P = { x: Float, y: Float }\n",
+    b"fn moved(p: P, d: Float) -> P = { x: p.x + d, y: p.y }\n",
+    b"fn adder(n: Int) -> (Int) -> Int = |x: Int| x + n\n",
+    b"fn even(n: Int) -> Bool = adder(n)(1) == 0\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let texts = scalar_names().concat([b"moved", b"adder", b"even"]).map(|n: Bytes|
+        match printed_by_form(p, n) { Ok(t) -> t, Err(why) -> n.concat(b": ").concat(why) });
+      let count = |t: Bytes, s: Bytes| t.split(s).len() - 1;
+      // Each function's prologue asks for room where it stands, once.
+      assert_eq(
+        texts.filter(|t: Bytes|
+          t.index_of(b"rt_grow_p") != None || count(t, b"ctx->fuel -= 1;") == 0
+            || count(t, b"rt_stack_more_p(ctx)") != count(t, b"ctx->fuel -= 1;")),
+        [],
+      );
+      assert(
+        texts.get(0).index_of(
+            b"  { char probe; if ((uintptr_t)&probe < ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n",
+          )
+          != None,
+      );
+      // A closure's function is a function of its own.
+      assert_eq(count(texts.get(scalar_names().len() + 1), b"rt_stack_more_p(ctx)"), 2)
+    },
+  }
+}
+
+test "each table's hole is spelled as the entry it names, so the order a table is filled in does not show" {
+  let none: Entries = { c: [], b: [], f: [], s: [], l: [], g: [] };
+  let one = resolved(b"  Word t1 = rt_lit_p(ctx, @@c0@@);", { ..none, c: [b"str:one"] });
+  let two = resolved(b"  Word t1 = rt_lit_p(ctx, @@c1@@);", {
+    ..none,
+    c: [b"str:zero", b"str:one"],
+  });
+  assert_eq(one, two);
+  assert(resolved(b"  Word t1 = rt_lit_p(ctx, @@c0@@);", { ..none, c: [b"str:zero"] }) != one);
+  assert_eq(
+    resolved(b"  f(@@c1@@, @@f0@@, @@c9@@, @@r@@, @@Tm.Box@@);", {
+      ..none,
+      c: [b"str:one", b"str:a\nb"],
+      f: [b"name"],
+    }),
+    b"  f(@@c=str:a\\x0ab@@, @@f=name@@, @@c9@@, @@r@@, @@Tm.Box@@);",
+  );
+  // A code table's entry names a generic call by its own hole.
+  assert_eq(entry_spelled(b"@@g0@@_entry", [b"m.id<Int>"]), b"@@g=m.id<Int>@@_entry")
+}
+
+/// The body of root `m.<name>` of `src`'s form, or why it was not formed.
+fn body_of(src: Bytes, name: Bytes) -> Result<List<Inst>, Bytes> / {abort.raise} =
+  match program_of(src) {
+    Err(why) -> Err(why),
+    Ok(p) -> match formed(p, name) { Ok(f) -> Ok(f.body), Err(no) -> Err(no.why) },
+  }
+
+fn local(id: Int, ty: Bytes, rep: Rep) -> Var =
+  { id: id, ty: TyCon({ name: ty, args: [] }), rep: rep }
+
+test "an if that answers a value joins in a variable of the type its arms answer" {
+  let j = local(3, b"Int", RInt);
+  assert_eq(
+    body_of(b"fn pick(c: Bool, a: Int, b: Int) -> Int = if c { a } else { b }\n", b"pick"),
+    Ok([
+      Decl(j),
+      If({
+        cond: AVar(local(0, b"Bool", RBool)),
+        then: [Assign({ var: j, arg: AVar(local(1, b"Int", RInt)) })],
+        otherwise: [Assign({ var: j, arg: AVar(local(2, b"Int", RInt)) })],
+      }),
+      Return(AVar(j)),
+    ]),
+  )
+}
+
+test "a self call in tail position restarts the body, and a join's restarting arm sets nothing" {
+  match body_of(
+      b"fn total(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { total(n - 1, acc) }\n",
+      b"total",
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> match body.at(2) {
+      Some(If(i)) -> {
+        assert_eq(i.then.len(), 1);
+        assert_eq(
+          i.otherwise.at(i.otherwise.len() - 1),
+          Some(Restart([AVar(local(3, b"Int", RInt)), AVar(local(1, b"Int", RInt))])),
+        )
+      },
+      other -> assert_eq(other, None),
+    },
+  }
+}
+
+test "&& joins a Bool from its right operand where the left one does not decide" {
+  let j = local(2, b"Bool", RBool);
+  assert_eq(
+    body_of(b"fn both(a: Bool, b: Bool) -> Bool = a && b\n", b"both"),
+    Ok([
+      Decl(j),
+      If({
+        cond: AVar(local(0, b"Bool", RBool)),
+        then: [Assign({ var: j, arg: AVar(local(1, b"Bool", RBool)) })],
+        otherwise: [Assign({ var: j, arg: ABool(false) })],
+      }),
+      Return(AVar(j)),
+    ]),
+  )
+}
+
+test "each construct reaches the family that lowers it" {
+  let src = Bytes::concat_all([
+    b"type P = { a: Int, b: Int }\n",
+    b"effect amb {\n  read flip() -> Bool\n}\n",
+    b"fn text() -> String = \"a\"\n",
+    b"fn record(x: Int) -> P = { a: x, b: 2 }\n",
+    b"fn read(p: P) -> Int = p.a\n",
+    b"fn some(x: Int) -> Option<Int> = Some(x)\n",
+    b"fn listed(x: Int) -> List<Int> = [x]\n",
+    b"fn matched(x: Int) -> Int = match x { 0 -> 1, _ -> 2 }\n",
+    b"fn none(x: Option<Int>) -> Bool = x == None\n",
+    b"fn applied(f: (Int) -> Int) -> Int = f(1)\n",
+    b"fn lambda(x: Int) -> (Int) -> Int = |y: Int| y + x\n",
+    b"fn flipped() -> Bool / {amb.flip} = amb.flip()\n",
+    b"fn handled() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) }\n",
+  ]);
+  // Each root and the families whose constructs it holds: it lowers, or one of them declines it.
+  let expected = [
+    { name: b"text", by: [Scalars] },
+    { name: b"record", by: [Data] },
+    { name: b"read", by: [Data] },
+    { name: b"some", by: [Data] },
+    { name: b"listed", by: [Containers] },
+    { name: b"matched", by: [Matching] },
+    { name: b"none", by: [Matching] },
+    { name: b"applied", by: [Calling] },
+    { name: b"lambda", by: [Calling] },
+    { name: b"flipped", by: [Handling] },
+    { name: b"handled", by: [Handling, Calling] },
+  ];
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      assert_eq(
+        expected.fold(
+          [],
+          |acc: List<{ name: Bytes, declined: Declined }>, e: { name: Bytes, by: List<Family> }|
+            match formed(p, e.name) {
+              Ok(_) -> acc,
+              Err(no) -> if e.by.contains(no.by) { acc }
+              else { acc.push({ name: e.name, declined: no }) },
+            },
+        ),
+        [],
+      ),
+  }
+}

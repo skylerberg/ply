@@ -1,0 +1,165 @@
+//! A `Case`'s and a `Match`'s framing printed around the blocks the printer's driver prints: the
+//! tests, the labels an arm leaves to by `Miss`, and the failure where no arm matched.
+
+import std.bytes (ascii_of_int)
+import emit.c (int_lit)
+import emit.tir (Rep, RNum, RMaybe, RTagged, RCases, RSlice, Var, ANum, Test, TTag, TInt, TRange,
+                 TLength, Failure, NoArm, NoLet, Matching, var_said)
+import emit.pieces (Piece, Text, Hole, TagOf)
+import emit.lower.held (case_index)
+import emit.print.text (Printing, Place, line, text, pad, pieces, name_of, arg_text, site,
+                        part_names, unprinted)
+
+/// What opens a `Case` testing `on` against `t`: its arms are a chain of `if`s, its rest the last
+/// `else`.
+pub fn case_opened(p: Place, pr: Printing, on: Var, t: Test) -> Printing = text(pr, pad(p.depth))
+
+/// What opens the arm taken where `on` is the `when`th of what `t` lists.
+pub fn case_arm(p: Place, pr: Printing, on: Var, t: Test, when: Int) -> Printing / {abort.raise} =
+  pieces(pr, [Text(b"if (")].concat(tested(pr, on, t, when)).push(Text(b") {\n")))
+
+/// What closes an arm of a `Case`.
+pub fn case_arm_closed(p: Place, pr: Printing) -> Printing =
+  text(pr, pad(p.depth).concat(b"} else "))
+
+/// What opens the block taken where no arm of the `Case` is.
+pub fn case_rest(p: Place, pr: Printing, on: Var, t: Test) -> Printing = text(pr, b"{\n")
+
+/// What closes a `Case`.
+pub fn case_closed(p: Place, pr: Printing) -> Printing = line(pr, p.depth, b"}")
+
+/// Whether `on` is the `when`th of what `t` lists, as C. A constructor is tested by its name, so a
+/// sum reads as its own representation says: held as its cases its index is the constructor's
+/// place among them, as an `Option`'s word `None` is zero, as a `Result`'s `Err` is a word tagged
+/// `100`, and a sum's word is an object whose layout is its constructor's tag. A length's `when`
+/// below `at_least` is a list of exactly that many items, and `at_least` itself one of at least as
+/// many; a view's length is its list's past its offset.
+fn tested(pr: Printing, on: Var, t: Test, when: Int) -> List<Piece> / {abort.raise} = {
+  let x = name_of(pr, on);
+  let parts = part_names(x, on.rep);
+  let outside = |case: Bytes, of: Int|
+    unprinted(
+      Matching,
+      case,
+      Bytes::concat_all([
+        b"place ",
+        ascii_of_int(when),
+        b" of ",
+        ascii_of_int(of),
+        b", testing ",
+        var_said(on),
+      ]),
+    );
+  match t {
+    TTag(names) -> match names.at(when) {
+      None -> outside(b"a constructor's place outside its sum", names.len()),
+      Some(name) -> match on.rep {
+        RMaybe ->
+          [Text(Bytes::concat_all([b"(", x, if name == b"None" { b") == 0" } else { b") != 0" }]))],
+        RTagged ->
+          [
+            Text(
+              Bytes::concat_all([
+                b"((",
+                x,
+                if name == b"Err" { b") & 7) == 4" } else { b") & 7) != 4" },
+              ]),
+            ),
+          ],
+        RCases(_) -> match case_index(on.rep, name) {
+          Some(i) -> [Text(Bytes::concat_all([b"(", nth(parts, 0), b") == ", int_lit(i)]))],
+          None ->
+            unprinted(
+              Matching,
+              b"a constructor its sum's cases do not hold",
+              Bytes::concat_all([name, b", testing ", var_said(on)]),
+            ),
+        },
+        _ -> [Text(Bytes::concat_all([b"ply_obj(", x, b")->layout == "])), Hole(TagOf(name))],
+      },
+    },
+    TInt(ns) -> match ns.at(when) {
+      Some(n) -> [Text(Bytes::concat_all([b"(", x, b") == ", bound(pr, on.rep, n)]))],
+      None -> outside(b"an integer's place outside its test", ns.len()),
+    },
+    TRange(r) ->
+      [
+        Text(
+          Bytes::concat_all([
+            b"(",
+            x,
+            b") >= ",
+            bound(pr, on.rep, r.lo),
+            b" && (",
+            x,
+            b") <= ",
+            bound(pr, on.rep, r.hi),
+          ]),
+        ),
+      ],
+    TLength(l) ->
+      [
+        Text(
+          Bytes::concat_all([
+            if on.rep == RSlice {
+              Bytes::concat_all([
+                b"((int64_t)ply_obj(",
+                nth(parts, 0),
+                b")->len - ",
+                nth(parts, 1),
+                b")",
+              ])
+            } else { Bytes::concat_all([b"(int64_t)ply_obj(", x, b")->len"]) },
+            if when < l.at_least { b" == " } else { b" >= " },
+            int_lit(when),
+          ]),
+        ),
+      ],
+  }
+}
+
+fn nth(xs: List<Bytes>, k: Int) -> Bytes = match xs.at(k) { Some(x) -> x, None -> b"0" }
+
+/// The integer `n` as C writes one of a value held as `r`.
+fn bound(pr: Printing, r: Rep, n: Int) -> Bytes =
+  match r { RNum(w) -> arg_text(pr, ANum({ width: w, bits: n })), _ -> int_lit(n) }
+
+/// What opens a `Match` of `arms` arms, numbered `label`.
+pub fn match_opened(p: Place, pr: Printing, label: Int, arms: Int) -> Printing = pr
+
+/// What opens arm `i` of `Match` `label`: where the arm before it leaves to by `Miss`.
+pub fn match_arm(p: Place, pr: Printing, label: Int, i: Int) -> Printing =
+  if i == 0 { pr } else { line(pr, p.depth, Bytes::concat_all([arm_label(label, i), b": ;"])) }
+
+/// What closes arm `i` of `Match` `label` where control reaches its end: past the other arms.
+pub fn match_arm_closed(p: Place, pr: Printing, label: Int, i: Int) -> Printing =
+  line(pr, p.depth, Bytes::concat_all([b"goto ", end_label(label), b";"]))
+
+/// What opens the block a `Match` runs where every arm missed.
+pub fn match_rest(p: Place, pr: Printing, label: Int, arms: Int) -> Printing =
+  line(pr, p.depth, Bytes::concat_all([arm_label(label, arms), b": ;"]))
+
+/// What closes a `Match`.
+pub fn match_closed(p: Place, pr: Printing, label: Int) -> Printing =
+  line(pr, p.depth, Bytes::concat_all([end_label(label), b": ;"]))
+
+/// Arm `i` of `Match` `label` missing: on to the next arm.
+pub fn missed(p: Place, pr: Printing, label: Int, i: Int) -> Printing =
+  line(pr, p.depth, Bytes::concat_all([b"goto ", arm_label(label, i + 1), b";"]))
+
+/// The run failing as `why` says, its site `p.at` stored first, then leaving: a `let`'s pattern
+/// that did not hold its value raises, and a `match` no arm of which matched fails the run.
+pub fn failed(p: Place, pr: Printing, why: Failure) -> Printing =
+  line(
+    site(p, pr),
+    p.depth,
+    Bytes::concat_all([
+      match why { NoLet -> b"rt_let_no_match_p(ctx); ", NoArm -> b"rt_no_match_p(ctx); " },
+      p.leave,
+    ]),
+  )
+
+fn arm_label(label: Int, i: Int) -> Bytes =
+  Bytes::concat_all([b"ply_m", ascii_of_int(label), b"_", ascii_of_int(i)])
+
+fn end_label(label: Int) -> Bytes = Bytes::concat_all([b"ply_m", ascii_of_int(label), b"_end"])

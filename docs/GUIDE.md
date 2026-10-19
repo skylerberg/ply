@@ -1399,13 +1399,14 @@ There is no partial application.
 
 `{..base, deep: {..base.deep, a: 7}}` copies `base` with the written fields
 replaced, answering a record of the base's field names. The base is a variable,
-a field path, or one call (the call runs once); its fields come from the type
-the checker infers for it, wherever that type was declared — another module's
-`type` included. A base whose type nothing in the program determines is
-`E0116`, and so is one that is not a record. A field the base lacks is `E0117`.
-An update of a `new` record (§4.2) answers that record, so a field it writes
-keeps its declared type (`E0201`), and it builds one: outside the module of an
-`opaque` record it is `E0220` (§3.2).
+a field path, or one call (the call runs once). An update evaluates its base
+first, then its fields as written, left to right as arguments are. The base's
+fields come from the type the checker infers for it, wherever that type was
+declared — another module's `type` included. A base whose type nothing in the
+program determines is `E0116`, and so is one that is not a record. A field the
+base lacks is `E0117`. An update of a `new` record (§4.2) answers that record,
+so a field it writes keeps its declared type (`E0201`), and it builds one:
+outside the module of an `opaque` record it is `E0220` (§3.2).
 
 ### 5.6 Lists
 

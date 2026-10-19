@@ -12,7 +12,7 @@ import emit.answer (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, 
 import emit.roots (builtin_helper, symbol_of, entry_of, specialisation_of, own_definition, FnArg,
                    specialised, specialised_with, root_id, derived_of)
 import emit (emit_roots_answer)
-import emit.reps (ctor_layouts, spelled_field, laid_vars, has_vars, held_apart, ctor_sums,
+import emit.reps (ctor_layouts, spelled_field, laid_vars, has_vars, held_apart, ctor_sums, ctors_of,
                   type_vars, erased)
 import front.rows (Dump, EmitterRoot, EmitterCtor, CtorRow, KeyRow, ModuleRow, OrdinalRow)
 import front.published (Linked, analyse, no_rows, dump_of, module_of_root)
@@ -20,14 +20,15 @@ import front (analyse_pulling_std_with)
 import emit.typing (unknown_type)
 import front.diagnostics (parse_all)
 import check.infer (dump_flag)
-import check.infer.definitions (Extern, prelude_externs, externs_in)
+import check.infer.checker (law_root)
+import check.infer.definitions (Extern, prelude_externs, externs_in, module_externs)
 import expand.rewrite (Elaborated, elaborated_natives)
 import emit.layout (Intrinsic, Layouts, intrinsics, layouts)
 import std.prelude_source
 import front.interface (read_key, sized, stubbed)
 import expand.embed (EmbedAt, embed_file)
 import check.resolve.scopes (PackageDeps)
-import check.resolve.tables (Diag, Label, error_with_labels)
+import check.resolve.tables (Diag, Label, ParsedModule, error_with_labels)
 import std.bin
 import std.list
 import std.graph
@@ -37,7 +38,10 @@ import std.fs (fs)
 import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
+import syntax.parsing
 import syntax.parsing (no_module)
+import syntax.items (homes_called, homes_declaring)
+import syntax.exprs (prelude_module)
 
 // --- What crosses the seam ----------------------------------------------------
 
@@ -158,9 +162,36 @@ fn helpers_named(text: Bytes, into: Map<Bytes, Bool>) -> Map<Bytes, Bool> / {abo
       },
     })
 
-/// What the natives whose helpers are `called` are declared to be: the compiler's own declaration
-/// of each it declares, and where one is of none of those, each `extern fn` a shipped module among
-/// `modules` declares, each module's text the one `text_of` finds.
+/// Every native a program over the shipped `modules`, each by its name and text, may call, each once
+/// as it is first declared: the compiler's own (`declared_natives`), then each `extern fn` of the
+/// prelude and of each of `modules`.
+pub fn program_natives(
+  modules: List<{ name: Bytes, text: Bytes }>,
+) -> List<Extern> / {abort.raise} =
+  natives_beside(
+    declared_natives(),
+    modules.map(|m: { name: Bytes, text: Bytes }| externs_in(m.name, m.text)),
+  )
+
+/// `program_natives` of a program whose modules are parsed as `mods`.
+pub fn parsed_natives(mods: List<ParsedModule>) -> List<Extern> / {abort.raise} =
+  natives_beside(declared_natives(), mods.map(|m: ParsedModule| module_externs(m.name, m.module)))
+
+fn natives_beside(own: List<Extern>, modules: List<List<Extern>>) -> List<Extern> / {abort.raise} =
+  [externs_in(prelude_module(), prelude_source::text())].concat(modules).fold(
+    {
+      seen: own.fold(Map::new(), |m: Map<Bytes, Bool>, e: Extern| m.insert(e.name, true)),
+      all: own,
+    },
+    |acc: { seen: Map<Bytes, Bool>, all: List<Extern> }, es: List<Extern>|
+      es.fold(acc, |a: { seen: Map<Bytes, Bool>, all: List<Extern> }, e: Extern|
+        if a.seen.contains(e.name) { a }
+        else { { seen: a.seen.insert(e.name, true), all: a.all.push(e) } }),
+  ).all
+
+/// What the natives whose helpers are `called` are declared to be, as `program_natives` declares
+/// them over the shipped `modules`, each module's text the one `text_of` finds; the modules are read
+/// only where the compiler does not declare every one itself.
 fn called_externs(
   called: Map<Bytes, Bool>,
   modules: List<ModuleRow>,
@@ -170,13 +201,15 @@ fn called_externs(
   let own = declared_natives();
   let rest = own.fold(called, |acc: Map<Bytes, Bool>, e: Extern|
     acc.remove(builtin_helper(e.name)));
-  own.filter(calls).concat(if rest.len() == 0 { [] } else {
-    modules.fold([], |acc: List<Extern>, m: ModuleRow|
-      match text_of(m) {
-        Some(text) -> acc.concat(externs_in(m.name, text).filter(calls)),
-        None -> acc,
-      })
-  })
+  if rest.len() == 0 { own.filter(calls) } else {
+    natives_beside(
+      own,
+      modules.fold([], |acc: List<List<Extern>>, m: ModuleRow|
+        match text_of(m) { Some(text) -> acc.push(externs_in(m.name, text)), None -> acc }),
+    ).filter(
+      calls,
+    )
+  }
 }
 
 fn native_said(words: Int, answers: Bool, raises: Bool) -> Bytes =
@@ -1331,6 +1364,20 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program = {
 
 fn text_at(program: Program, index: Int) -> Option<Bytes> = program.sources.at(index)
 
+/// The home modules each of `modules` calls a function of a type of with no import, as the front
+/// end pulled them for it ([`homes_called`]): the checker names each such function through a binder
+/// of its home, which no import of the module reaches.
+fn homes_called_by(program: Program, modules: List<Bytes>) -> List<Bytes> / {abort.raise} = {
+  let texts = program.modules.fold(Map::new(), |acc: Map<Bytes, Bytes>, m: ModuleRow|
+    match text_at(program, m.index) { Some(t) -> acc.insert(m.name, t), None -> acc });
+  let declared = homes_declaring(|h: Bytes| texts.get(h));
+  modules.fold([], |acc: List<Bytes>, m: Bytes|
+    match texts.get(m) {
+      Some(t) -> acc.concat(homes_called(m, parsing::start(t).input, || declared)),
+      None -> acc,
+    })
+}
+
 /// `modules` and every module they import, directly or not: all the emitter reads to lower a body
 /// of one of them.
 fn imported(program: Program, modules: List<Bytes>) -> Map<Bytes, Bool> / {abort.raise} = {
@@ -1568,7 +1615,8 @@ fn repacked(
   })
 
 /// What the emitter answers for `missed`: entered once, over the modules those roots are in, the
-/// ones whose lambdas they run, and the ones those import.
+/// ones whose lambdas they run, the home modules those call functions of types of, and the ones
+/// all of those import.
 fn emitter_answers(
   runtime: Runtime,
   dump: Dump,
@@ -1582,7 +1630,7 @@ fn emitter_answers(
       acc.insert(module_of_root(n), true),
       |m: Map<Bytes, Bool>, f: FnArg| m.insert(module_of_root(f.owner), true),
     ));
-  let needed = imported(p, lowered.keys());
+  let needed = imported(p, lowered.keys().concat(homes_called_by(p, lowered.keys())));
   let placed = range(0, p.modules.len()).filter(|i: Int| needed.contains(p.modules.get(i).name));
   let names = placed.map(|i: Int| p.modules.get(i).name);
   // A module no wanted root is in is read for its declarations, its rows standing for its bodies.
@@ -1593,14 +1641,14 @@ fn emitter_answers(
   emit_roots_answer(
     names,
     placed.map(|i: Int| text_of(p.modules.get(i))),
-    {
-      names: ctors.map(|c: Ctor| c.name),
-      laid: ctor_layouts(dump.ctors),
+    ctors_of(
+      ctors.map(|c: Ctor| c.name),
+      ctor_layouts(dump.ctors),
       // Program-wide: a specialisation is emitted where its definition is, which may not import
       // the module stating a `key` for the type it is at.
-      keyed: dump.emitter_ctors.filter(|c: EmitterCtor| c.key != None).map(|c: EmitterCtor| c.name),
-      sums: ctor_sums(dump.ctors),
-    },
+      dump.emitter_ctors.filter(|c: EmitterCtor| c.key != None).map(|c: EmitterCtor| c.name),
+      ctor_sums(dump.ctors),
+    ),
     runtime.natives.map(|n: Native| n.name),
     missed,
     if dump.packages.len() == 0 { [{ prefix: b"", deps: [] }] } else { dump.packages },
@@ -2394,7 +2442,7 @@ test "a refused specialisation leaves its call to the generic body, whichever ro
     text: b"",
     tables: { ..no_tables(), generics: { ..no_generics(), called: [1] } },
   });
-  let refused = Refused({ why: b"a body the lowering does not reach", handles: [] });
+  let refused = Refused({ why: b"a body the lowering does not reach" });
   let mapping = specialised_with(b"std.prelude.List::map", [], lent(b"m.mapped"));
   let answers = Map::of_entries([
     { key: b"m.each", value: calls_one },
@@ -2996,7 +3044,7 @@ test "a kept body stands only where each callee it names still has the key it wa
 
 test "a pack is written again where it was missing or a root in it gained a body" {
   let mate = bucket_mate(b"m.a");
-  let refusal = Refused({ why: b"a body the lowering does not reach", handles: [] });
+  let refusal = Refused({ why: b"a body the lowering does not reach" });
   let buckets = bucketed([b"m.a", mate, b"m.b"]);
   let packs = Map::new().insert(bucket_of(b"m.a"), Map::new().insert(b"m.a", one_body(b"m.a", [])));
   let looked = Map::of_entries([
@@ -3226,14 +3274,6 @@ fn held_over(
   natives: List<Native>,
 ) -> Result<Bytes, List<Diag>> / {abort.raise} = {
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
-  let texts = user.concat(shipped).fold(
-    Map::new(),
-    |acc: Map<Bytes, Bytes>, s: { name: Bytes, src: Bytes }| acc.insert(s.name, s.src),
-  );
-  let indexed = dump.modules.fold(Map::new(), |acc: Map<Int, Bytes>, m: ModuleRow|
-    acc.insert(m.index, match texts.get(m.name) { Some(t) -> t, None -> b"" }));
-  let sources = range(0, indexed.len()).map(|i: Int|
-    match indexed.get(i) { Some(t) -> t, None -> b"" });
   let every = dump.emitter_roots.map(|r: EmitterRoot| r.root);
   held(
     dump,
@@ -3241,7 +3281,7 @@ fn held_over(
     emitted(
       { ..a_runtime(b"r"), natives: natives },
       dump,
-      sources,
+      sources_placed(dump, user.concat(shipped)),
       Map::new(),
       every,
       b"",
@@ -3249,6 +3289,18 @@ fn held_over(
       |_: Bytes, _: Bytes| (),
     ),
   )
+}
+
+/// The texts of `modules`, and the prelude's where none of them is it, at the places `dump` gives
+/// them.
+fn sources_placed(dump: Dump, modules: List<{ name: Bytes, src: Bytes }>) -> List<Bytes> = {
+  let texts = modules.fold(
+    Map::new().insert(prelude_module(), prelude_source::text()),
+    |acc: Map<Bytes, Bytes>, s: { name: Bytes, src: Bytes }| acc.insert(s.name, s.src),
+  );
+  let indexed = dump.modules.fold(Map::new(), |acc: Map<Int, Bytes>, m: ModuleRow|
+    acc.insert(m.index, match texts.get(m.name) { Some(t) -> t, None -> b"" }));
+  range(0, indexed.len()).map(|i: Int| match indexed.get(i) { Some(t) -> t, None -> b"" })
 }
 
 fn refusal(r: Result<Bytes, List<Diag>>) -> List<Bytes> =
@@ -3298,11 +3350,7 @@ test "a unit is refused where the runtime does not implement a native it calls a
 
 test "a unit whose bodies write externs in place asks the runtime for no native of them" {
   // What the prelude declares that a native implements: its builtins, and `ListNode::leaf_of`.
-  let implemented = declared_natives().concat(
-    externs_in(b"std.prelude", prelude_source::text()),
-  ).map(
-    native_of,
-  );
+  let implemented = program_natives([]).map(native_of);
   let names = implemented.map(|n: Native| n.name);
   assert_eq(
     intrinsics().filter(|i: { name: Bytes, op: Intrinsic }|
@@ -3336,6 +3384,40 @@ test "a unit is refused where the runtime implements a shipped module's `extern 
     b"`extern fn doubled` of `std.native` takes 1 word and cannot raise, and the runtime's native takes 2 words and cannot raise",
     natives_refused([]).notes_text.get(0),
   ])
+}
+
+test "a function of a type a module calls with no import is read from its home, which the emitter is handed" {
+  let user = [{ name: b"m", src: b"fn first(xs: List<Int>) -> Int / {abort.raise} = xs.get(0)\n" }];
+  let shipped = [
+    {
+      name: b"std.list",
+      src: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
+    },
+  ];
+  let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
+  let p = program_of(dump, sources_placed(dump, user.concat(shipped)));
+  assert_eq(
+    emitter_answers(a_runtime(b"r"), dump, p, [], [b"m.first"]).map(|r: RootAnswer|
+      match r.answer { Body(_) -> r.name, Refused(no) -> no.why }),
+    [b"m.first"],
+  )
+}
+
+test "a law's body over a sort it leaves uninterpreted is lowered as a generic body as it stands" {
+  let user = [
+    {
+      name: b"m",
+      src: b"fn pair<a>(x: a) -> a = x\n\nlaw \"identity is identity\"\n  forall (x: a) {\n    pair(x) == x\n  }\n",
+    },
+  ];
+  let dump = dump_of(analyse(parse_all(user)));
+  let p = program_of(dump, sources_placed(dump, user));
+  let root = law_root(b"m", b"identity is identity", b"body");
+  assert_eq(
+    emitter_answers(a_runtime(b"r"), dump, p, [], [root]).map(|r: RootAnswer|
+      match r.answer { Body(_) -> r.name, Refused(no) -> no.why }),
+    [root],
+  )
 }
 
 test "a root the emitter refuses is asked again, and nothing of the refusal is kept" {

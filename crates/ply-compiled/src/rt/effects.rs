@@ -386,7 +386,6 @@ pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
         c.seed.root,
         c.trail.drawn(),
         stack,
-        c.stack_floor,
         body,
     );
     c.sims.push(sim);

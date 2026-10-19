@@ -1,0 +1,579 @@
+//! The typed form a root's body is lowered to before any C is written. Every value is a variable
+//! holding the checker's type, held as a representation decided from that type; every join is a
+//! variable of its own type; every count is an instruction, which the ownership pass alone writes.
+//! Blocks nest only in `If`, `Case`, `Match`, `Loop` and `Handle`.
+
+import check.types (Type, TyCon)
+import std.bytes (ascii_of_int)
+import syntax.parsing (Span, dummy_span)
+import syntax.patterns (Lit, LUnit)
+import emit.c (Width)
+import emit.reps (FieldTy)
+import emit.answer (GenericCall, Need, Pass)
+import emit.keys (RootKey, Callee, Generic, Named)
+import emit.tir.handling (HandleOp, HandleSite, Simulate, Label)
+import emit.tir.containers (ContainerOp)
+import emit.tir.calling (CallingOp)
+
+/// How a value is held. A function of the value's type (`lower.held`), but for `RSlice`, a view the
+/// lowering chooses for a list walked by its rest in a loop, which is made a list where it leaves,
+/// and `RToken`, which the ownership pass alone writes. `RFlat` is a record as its leaves and then
+/// its object's word, zero until one is made; `RCases` a sum as its constructor's index and each
+/// case's leaves; `RToken(n)` the cells of a block of `n` payload words whose fields a `Reset` let
+/// go of, or zero: freed where it is let go, never released as a value.
+pub type Rep =
+  | RInt
+  | RBool
+  | RNum(Width)
+  | RFloat
+  | RDec
+  | RWord
+  | RMaybe
+  | RTagged
+  | RFlat(List<Leaf>)
+  | RCases(Cases)
+  | RSlice
+  | RToken(Int)
+
+/// A leaf of a flattened record or of a sum's case: never itself flat.
+pub type Leaf = { name: Bytes, rep: Rep }
+
+/// A sum's cases in declared order, and whether the sum is a `Result`'s tagged word where it is
+/// one word rather than an `Option`'s.
+pub type Cases = { tagged: Bool, cases: List<{ name: Bytes, leaves: List<Leaf> }> }
+
+/// A local of a root's body: its number, the checker's type at the root's type arguments, and how
+/// a value of that type is held.
+pub type Var = { id: Int, ty: Type, rep: Rep }
+
+/// An operand: a variable, or a constant C names directly.
+pub type Arg =
+  | AVar(Var)
+  | AInt(Int)
+  | ABool(Bool)
+  | AFloat(Int)
+  | ANum({ width: Width, bits: Int })
+  | AChar(Int)
+  | AZero(Rep)
+
+/// Whether a callee consumes what a parameter is handed or only reads it while the call runs.
+pub type Handed = | Given | Lent
+
+/// How a root takes its parameters and hands back its answer.
+pub type Convention = { params: List<Handed>, reps: List<Rep>, answer: Rep }
+
+/// What an operation does with each operand (`takes`), whether it answers a count of its own,
+/// whether it can fail, and whether it can stop for a handler that may resume it later.
+pub type Uses = { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool }
+
+/// What a `Make` allocates. `MRecord` is a record the runtime lays out by its names, as it does one
+/// whose layout a type variable leaves open; `MCtor` a constructor's object holding each argument as
+/// its word; `MLaid` an
+/// object laid out as `fields` says, a constructor's where `ctor` names one and a record's otherwise,
+/// each argument held as its field is and a record held in place given as its leaves or its word.
+/// `MClosure` is a closure over body `nth` of the root's lambdas, holding `captures` words and taking
+/// `params` arguments; a `stacked` one is lent and laid out on the caller's stack.
+pub type Made =
+  | MRecord({ names: List<Bytes>, width: Int })
+  | MCtor({ name: Bytes, width: Int })
+  | MLaid({ ctor: Option<Bytes>, fields: List<FieldTy> })
+  | MList(Int)
+  | MClosure({ nth: Int, captures: Int, params: Int, stacked: Bool })
+
+/// Where a `Get` reads: a field by its word offset, or by name where the layout is unknown (a
+/// need the specialisation answers), a case's argument, a closure's capture, a flat value's leaf, or
+/// the word of a record a block holds in place at a word offset: the address of its header there.
+pub type Path =
+  | PField({ name: Bytes, at: Int })
+  | PNamed(Bytes)
+  | PArg({ ctor: Bytes, at: Int })
+  | PCapture(Int)
+  | PLeaf(Int)
+  | PPlace(Int)
+
+/// What a `Case` tests its subject against. An arm's `when` is an index into a `TTag`'s
+/// constructors or a `TInt`'s integers; a `TRange` holds one arm, `when` 0. Under `TLength` an arm's
+/// `when` k is a list of exactly k items, and of at least k where k is `at_least`.
+pub type Test =
+  | TTag(List<Bytes>)
+  | TInt(List<Int>)
+  | TRange({ lo: Int, hi: Int })
+  | TLength({ at_least: Int })
+
+/// An operation one family of the lowering writes and prints beyond the shared values. What it
+/// does with its operands is the `Op` value's `uses`, so nothing outside the family reads the
+/// payload.
+pub type Operation = | OHandle(HandleOp) | OContainer(ContainerOp) | OCalling(CallingOp)
+
+pub type Val =
+  /// An operator of C over operands held as `on`, which decides what it means.
+  | Prim({ op: Bytes, on: Rep, args: List<Arg> })
+  /// A constant from the pool, `()` among them.
+  | Literal(Lit)
+  /// A constant laid out as static data, by the name its content gives it.
+  | Static(Bytes)
+  /// `kept` are the fields the cells `reuse` names already hold, which are not written again.
+  | Make({ made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> })
+  /// What `path` reads out of `of`: borrowed from it, but by `PNamed`, which the runtime looks up by
+  /// name and answers with a count of its own, and which can fail.
+  | Get({ of: Var, path: Path })
+  /// The field held as one word that `path` (a `PField` or a `PArg`) reads out of the block `of`
+  /// is held as a word, with a count of its own: where the block is held only here its slot is
+  /// emptied and the count moves to the reader, and otherwise the reader takes one more. Only the
+  /// ownership pass writes one, at a field's last read; the block it leaves may no longer hold the
+  /// field.
+  | Take({ of: Var, path: Path })
+  /// The tag of constructor `name`, as the program's constructor table names it: an `Int` the unit
+  /// writes in.
+  | Tag(Bytes)
+  /// `arg` held as `to`: a scalar boxed, a word opened, a flat value made its object.
+  | Pack({ arg: Arg, to: Rep })
+  /// A value held as more than one part, from its parts in order: an `RFlat`'s leaves and then its
+  /// word, an `RCases`' case index and then each case's leaves (only the index where no case holds
+  /// any), an `RMaybe`'s or `RTagged`'s index and then its payload's word. A part that is itself an
+  /// `RFlat` stands for its leaves and its word.
+  | Gathered({ parts: List<Arg> })
+  | Call({ callee: Callee, args: List<Arg>, conv: Convention, stops: Bool })
+  | Apply({ f: Arg, args: List<Arg>, conv: Convention, stops: Bool })
+  /// A runtime function by its C name.
+  | Native({ name: Bytes, args: List<Arg>, uses: Uses })
+  | Op({ op: Operation, args: List<Arg>, uses: Uses })
+
+pub type Block = List<Inst>
+
+pub type Inst =
+  /// `unwind` are the owned values live across `val` where it may fail, which the failure path
+  /// releases, and which a stop's frame record holds.
+  | Let({ var: Var, val: Val, at: Span, unwind: List<Var> })
+  | Do({ val: Val, at: Span, unwind: List<Var> })
+  /// A join's variable, which each path into the code after it sets once.
+  | Decl(Var)
+  | Assign({ var: Var, arg: Arg })
+  | If({ cond: Arg, then: Block, otherwise: Block })
+  | Case({ on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block })
+  /// Arms tried in order, each leaving for the next by `Miss`, and `rest` where none is taken.
+  | Match({ arms: List<Block>, rest: Block })
+  /// The arm's tests failed: control goes to the next arm, which starts holding what the path held
+  /// at this miss; every miss of one arm holds the same.
+  | Miss
+  /// A loop over `state`, rebound by each `Next` in `body`, left with an answer by `Done`.
+  | Loop({ state: List<Var>, init: List<Arg>, body: Block, answer: Var })
+  | Next(List<Arg>)
+  | Done(Arg)
+  | Return(Arg)
+  /// A self tail call: the root's parameters take the arguments and the body starts again.
+  | Restart(List<Arg>)
+  /// A tail call of member `member` of the root's group, its arguments held as that member's
+  /// convention says.
+  | Enter({ member: Int, args: List<Arg> })
+  /// The run fails as `why` says, its site the text at `at`.
+  | Fail({ why: Failure, at: Span })
+  /// `body` run under the handlers `site` lays out over `args`, its answer or a clause's in `answer`.
+  /// `unwind` are the owned values held across the body, which its landing releases where a failure
+  /// inside it is answered by no clause; a failing instruction inside releases only what the body
+  /// holds beyond them.
+  | Handle({ body: Block, args: List<Arg>, uses: Uses, site: HandleSite, answer: Var, unwind: List<Var> })
+  /// The failure sites of the instructions after it in its block, and of the blocks they hold, are
+  /// `Some` lender's: a lambda another root lent runs in place there. `None` ends the innermost such
+  /// run this block began. Writes no C, holds and reads nothing.
+  | Sited(Option<Lender>)
+  // Written by the ownership pass alone.
+  | Inc({ var: Var, n: Int })
+  | Dec(Var)
+  /// `of`'s cells kept as `token` where `of` was the only holder, for a later `Make` to take.
+  | Reset({ token: Var, of: Var })
+  /// A reuse token no `Make` took, its block freed.
+  | Free({ of: Var, bytes: Arg })
+  /// A block known to be held only here consumed, and its counted words bound as owned.
+  | Opened({ of: Var, words: List<Var> })
+
+/// What a `Fail` fails with: no arm of a `match` matched, which fails the run, or a `let`'s pattern
+/// did not hold its value, which raises.
+pub type Failure = | NoArm | NoLet
+
+/// The root that lent a lambda run in place: its key, which the lambda's failure sites name, and
+/// where its definition's text starts, which they count from.
+pub type Lender = { root: RootKey, base: Int }
+
+/// Whether a function is a root a program calls, counting its steps and testing for failure, or
+/// a plain one the emitter writes for a type (a drop, share, keep or copy root), which does
+/// neither but still grows its stack.
+pub type FnKind = | Rooted | Plain
+
+/// What a root tells the unit beyond its C: its calls of generic definitions, numbered as their
+/// `Generic(n)` callees are, what a specialisation would read of each type variable it took a slow
+/// path at, the parameters it calls as functions, and the parameters it hands on to calls.
+pub type Links = {
+  generics: List<GenericCall>,
+  needs: List<Need>,
+  called: List<Int>,
+  passes: List<Pass>,
+}
+
+pub fn no_links() -> Links = { generics: [], needs: [], called: [], passes: [] }
+
+/// One root's form. `params` are held as `conv` takes them, but a list a root of its own walks down
+/// by restarting on its rest, which it holds as a view of the list whose word `conv` takes; a
+/// `Restart` hands its arguments as `params` are held. `lambdas` are the bodies of the closures it
+/// makes (its lambdas, its handlers' clauses, a `simulate`'s body), each `MClosure`'s `nth` its place
+/// among them; `base` is where its definition's text starts, which its failure sites count from;
+/// `members` are a tail group's roots in case order, and empty for a root of its own.
+///
+/// A tail group's `Fn` is keyed as its first member, takes one parameter, `which`, an `RInt`, and
+/// answers a word. Its body is one `Case` on `which` testing `TInt` of each member's place, arm `i`
+/// member `i`'s body, which reads `members[i].params` and answers a word by `Return`, and its rest a
+/// `Return` of a zero word. Inside arm `i` an `Enter` goes to a member's start with that member's
+/// arguments, and a `Restart` to member `i`'s.
+pub type Fn = {
+  key: RootKey,
+  kind: FnKind,
+  params: List<Var>,
+  conv: Convention,
+  body: Block,
+  lambdas: List<Lambda>,
+  base: Int,
+  members: List<Member>,
+  links: Links,
+}
+
+/// A member of a tail group: its root, where its definition's text starts, its parameters at its own
+/// reps, and how its own entry and wrapper take them and answer.
+pub type Member = { key: RootKey, base: Int, params: List<Var>, conv: Convention }
+
+/// The body of a closure a root makes, numbered by its place among them, and the lambda's place in
+/// the root's text. The first `captures` of `body.params` are the words the closure captured, which
+/// its C function takes before its own parameters.
+pub type Lambda = | Closure({ body: Fn, captures: Int, at: Span })
+
+/// Which part of the lowering declined a body, or whose printer has no C for what it was handed.
+pub type Family = | Spine | Data | Calling | Matching | Handling | Scalars | Containers
+
+/// A body the form does not cover yet, and why.
+pub type Declined = { by: Family, why: Bytes }
+
+pub fn family_name(f: Family) -> Bytes =
+  match f {
+    Spine -> b"Spine",
+    Data -> b"Data",
+    Calling -> b"Calling",
+    Matching -> b"Matching",
+    Handling -> b"Handling",
+    Scalars -> b"Scalars",
+    Containers -> b"Containers",
+  }
+
+/// How a value held as `r` is held, as a fault names it.
+pub fn rep_said(r: Rep) -> Bytes =
+  match r {
+    RInt -> b"Int",
+    RBool -> b"Bool",
+    RNum(_) -> b"a number of a width",
+    RFloat -> b"Float",
+    RDec -> b"Decimal",
+    RWord -> b"a word",
+    RMaybe -> b"an Option's word",
+    RTagged -> b"a Result's word",
+    RFlat(ls) -> Bytes::concat_all([b"flat, ", ascii_of_int(ls.len()), b" leaves"]),
+    RCases(c) -> Bytes::concat_all([b"cases, ", ascii_of_int(c.cases.len()), b" of them"]),
+    RSlice -> b"a view",
+    RToken(n) -> Bytes::concat_all([b"a token of ", ascii_of_int(n), b" words"]),
+  }
+
+/// Variable `v` and how it is held, as a fault names it.
+pub fn var_said(v: Var) -> Bytes =
+  Bytes::concat_all([b"v", ascii_of_int(v.id), b" held as ", rep_said(v.rep)])
+
+/// What `m` makes, as a fault names it.
+pub fn made_said(m: Made) -> Bytes =
+  match m {
+    MRecord(r) -> Bytes::concat_all([b"a record of ", Bytes::join(r.names, b", ")]),
+    MCtor(c) -> Bytes::concat_all([b"constructor ", c.name]),
+    MLaid(l) -> match l.ctor {
+      Some(c) -> Bytes::concat_all([b"constructor ", c, b" laid out"]),
+      None ->
+        Bytes::concat_all([b"a record of ", ascii_of_int(l.fields.len()), b" fields laid out"]),
+    },
+    MList(n) -> Bytes::concat_all([b"a list of ", ascii_of_int(n)]),
+    MClosure(c) -> Bytes::concat_all([b"closure ", ascii_of_int(c.nth)]),
+  }
+
+/// Whether a value held as `r` holds a count: a word, an `Option`'s or `Result`'s, a view of a
+/// list, a reuse token, or a flat value with a counted leaf (its word always is one).
+pub fn counted(r: Rep) -> Bool =
+  match r {
+    RWord -> true,
+    RMaybe -> true,
+    RTagged -> true,
+    RSlice -> true,
+    RToken(_) -> true,
+    RFlat(_) -> true,
+    RCases(c) ->
+      c.cases.fold(false, |any: Bool, x: { name: Bytes, leaves: List<Leaf> }|
+        any || x.leaves.fold(false, |a: Bool, l: Leaf| a || counted(l.rep))),
+    _ -> false,
+  }
+
+/// The C values a value held as `r` is laid in, each as it is held: a flat value's leaves and then
+/// its word, a sum's index and then each case's leaves, a view's list and its offset, anything else
+/// itself.
+pub fn parts_of(r: Rep) -> List<Rep> =
+  match r {
+    RFlat(leaves) -> leaves.map(|l: Leaf| l.rep).push(RWord),
+    RCases(c) ->
+      c.cases.fold([RInt], |acc: List<Rep>, x: { name: Bytes, leaves: List<Leaf> }|
+        acc.concat(x.leaves.map(|l: Leaf| l.rep))),
+    RSlice -> [RWord, RInt],
+    _ -> [r],
+  }
+
+/// How many C values a value held as `r` is laid in: `parts_of(r)`'s length, without the list.
+pub fn parts_count(r: Rep) -> Int =
+  match r {
+    RFlat(leaves) -> leaves.len() + 1,
+    RCases(c) ->
+      c.cases.fold(1, |n: Int, x: { name: Bytes, leaves: List<Leaf> }| n + x.leaves.len()),
+    RSlice -> 2,
+    _ -> 1,
+  }
+
+/// How operand `a` is held: a variable as its own representation says, a constant as C names it.
+pub fn rep_of_arg(a: Arg) -> Rep =
+  match a {
+    AVar(v) -> v.rep,
+    AInt(_) -> RInt,
+    ABool(_) -> RBool,
+    AFloat(_) -> RFloat,
+    ANum(n) -> RNum(n.width),
+    AChar(_) -> RWord,
+    AZero(r) -> r,
+  }
+
+/// The variable an operand is, if it is one.
+pub fn var_of(a: Arg) -> Option<Var> = match a { AVar(v) -> Some(v), _ -> None }
+
+/// Each operand of `v` and whether `v` consumes it, by the fixed signature each operation has: a
+/// call takes what its convention gives and borrows what it lends, and takes the function it
+/// applies, which the runtime lets go of once the call is done; an operator and a field read
+/// borrow, as does holding a value as one that holds no count; what allocates or answers takes but
+/// a stacked closure, which reads its captures while its caller holds them; a runtime function or a
+/// family's operation does as its `uses` say.
+pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
+  match v {
+    Prim(p) -> p.args.map(|a: Arg| { arg: a, takes: false }),
+    Literal(_) -> [],
+    Static(_) -> [],
+    Make(m) -> {
+      let lent = match m.made { MClosure(c) -> if c.stacked { c.captures } else { 0 }, _ -> 0 };
+      range(0, m.args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
+        match m.args.at(i) {
+          Some(a) -> acc.push({ arg: a, takes: i >= lent }),
+          None -> acc,
+        }).concat(match m.reuse { Some(t) -> [{ arg: AVar(t), takes: true }], None -> [] })
+    },
+    Get(g) -> [{ arg: AVar(g.of), takes: false }],
+    Take(t) -> [{ arg: AVar(t.of), takes: false }],
+    Tag(_) -> [],
+    Pack(p) -> [{ arg: p.arg, takes: counted(p.to) }],
+    Gathered(g) -> g.parts.map(|a: Arg| { arg: a, takes: true }),
+    Call(c) -> handed(c.args, c.conv),
+    Apply(c) -> [{ arg: c.f, takes: true }].concat(handed(c.args, c.conv)),
+    Native(n) -> used_as(n.args, n.uses),
+    Op(o) -> used_as(o.args, o.uses),
+  }
+
+fn handed(args: List<Arg>, conv: Convention) -> List<{ arg: Arg, takes: Bool }> =
+  range(0, args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
+    match args.at(i) {
+      Some(a) -> acc.push({ arg: a, takes: conv.params.at(i) != Some(Lent) }),
+      None -> acc,
+    })
+
+/// Each of `args` and whether `uses` takes it: what a runtime function, a family's operation or a
+/// `Handle` does with its operands.
+pub fn used_as(args: List<Arg>, uses: Uses) -> List<{ arg: Arg, takes: Bool }> =
+  range(0, args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
+    match args.at(i) {
+      Some(a) -> acc.push({ arg: a, takes: uses.takes.at(i) == Some(true) }),
+      None -> acc,
+    })
+
+/// How what `v` answers is held: a count of its own, read out of the operand it names without
+/// one, or a constant no count is kept of.
+pub type Answered = | Owns | ReadsOf(Var) | Lasts
+
+pub fn answered(v: Val) -> Answered =
+  match v {
+    Get(g) -> match g.path { PNamed(_) -> Owns, _ -> ReadsOf(g.of) },
+    Static(_) -> Lasts,
+    Tag(_) -> Lasts,
+    Native(n) -> by_uses(n.args, n.uses),
+    Op(o) -> by_uses(o.args, o.uses),
+    _ -> Owns,
+  }
+
+fn by_uses(args: List<Arg>, uses: Uses) -> Answered =
+  if uses.owned { Owns } else { match args.at(0) { Some(AVar(x)) -> ReadsOf(x), _ -> Lasts } }
+
+/// Whether `v` can fail, so a test follows it and its `unwind` is released on the way out: a
+/// call, a constant read from the pool, a checked operator, a field read by name, and what its
+/// `uses` say of a runtime function or a family's operation. A value made or packed only allocates,
+/// which never fails: the heap aborts when it is exhausted.
+pub fn fails(v: Val) -> Bool =
+  match v {
+    Prim(p) -> checked(p.op, p.on),
+    Literal(_) -> true,
+    Static(_) -> false,
+    Make(_) -> false,
+    Get(g) -> match g.path { PNamed(_) -> true, _ -> false },
+    Take(_) -> false,
+    Tag(_) -> false,
+    Pack(_) -> false,
+    Gathered(_) -> false,
+    Call(_) -> true,
+    Apply(_) -> true,
+    Native(n) -> n.uses.fails,
+    Op(o) -> o.uses.fails,
+  }
+
+/// Whether operator `op` over `on` is checked: an integer's arithmetic and shifts, which overflow
+/// or divide by zero, and a width's; an `Int` made a width it does not fit (`of_int`); a decimal's
+/// arithmetic.
+pub fn checked(op: Bytes, on: Rep) -> Bool =
+  match on {
+    RInt -> arithmetic(op) || shift(op) || op == b"neg" || op == b"of_int",
+    RNum(_) -> arithmetic(op) || shift(op) || op == b"neg",
+    RFloat -> op == b"rem",
+    RDec -> arithmetic(op),
+    _ -> false,
+  }
+
+pub fn arithmetic(op: Bytes) -> Bool =
+  op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
+
+pub fn shift(op: Bytes) -> Bool = op == b"shl" || op == b"shr" || op == b"ushr"
+
+pub fn comparison(op: Bytes) -> Bool =
+  op == b"eq" || op == b"ne" || op == b"lt" || op == b"le" || op == b"gt" || op == b"ge"
+
+/// Whether control never passes `i` to what follows it in its block.
+pub fn ends(i: Inst) -> Bool =
+  match i {
+    Return(_) -> true,
+    Restart(_) -> true,
+    Enter(_) -> true,
+    Next(_) -> true,
+    Done(_) -> true,
+    Fail(_) -> true,
+    Miss -> true,
+    _ -> false,
+  }
+
+/// Whether control can leave `b` at its end: its last instruction but a `Sited` does not end.
+pub fn falls_through(b: Block) -> Bool =
+  b.fold(true, |falls: Bool, i: Inst| match i { Sited(_) -> falls, _ -> !ends(i) })
+
+test "a word, a sum's word, a view and a flat value hold a count where a scalar holds none" {
+  assert_eq([RInt, RBool, RFloat, RDec, RNum({ bits: 8, signed: false })].map(counted), [
+    false,
+    false,
+    false,
+    false,
+    false,
+  ]);
+  assert_eq([RWord, RMaybe, RTagged, RSlice, RToken(2), RFlat([])].map(counted), [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+  ]);
+  assert_eq(counted(RCases({ tagged: false, cases: [{ name: b"None", leaves: [] }] })), false);
+  assert_eq(
+    counted(
+      RCases({ tagged: false, cases: [{ name: b"Some", leaves: [{ name: b"0", rep: RWord }] }] }),
+    ),
+    true,
+  )
+}
+
+test "each operation consumes or borrows each operand as its signature says" {
+  let s = { id: 1, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
+  let conv = { params: [Given, Lent], reps: [RWord, RWord], answer: RInt };
+  let call = Call({ callee: Generic(0), args: [AVar(s), AVar(s)], conv: conv, stops: false });
+  let takes = |v: Val| operands(v).map(|o: { arg: Arg, takes: Bool }| o.takes);
+  assert_eq(takes(call), [true, false]);
+  // The function a call applies is let go of by the call, as what it gives is.
+  assert_eq(takes(Apply({ f: AVar(s), args: [AVar(s), AVar(s)], conv: conv, stops: false })), [
+    true,
+    true,
+    false,
+  ]);
+  assert_eq(takes(Get({ of: s, path: PLeaf(0) })), [false]);
+  assert_eq(takes(Gathered({ parts: [AVar(s), AInt(1)] })), [true, true]);
+  // A word read as a scalar is borrowed; a scalar boxed is taken.
+  assert_eq(takes(Pack({ arg: AVar(s), to: RInt })), [false]);
+  assert_eq(takes(Pack({ arg: AInt(1), to: RWord })), [true]);
+  // A stacked closure reads its captures, which its caller holds while it is lent.
+  let closure = |stacked: Bool|
+    Make({
+      made: MClosure({ nth: 0, captures: 2, params: 1, stacked: stacked }),
+      args: [AVar(s), AVar(s)],
+      reuse: None,
+      kept: [],
+    });
+  assert_eq(takes(closure(true)), [false, false]);
+  assert_eq(takes(closure(false)), [true, true]);
+  // A field taken leaves its block held, and answers a count of its own.
+  let taken = Take({ of: s, path: PField({ name: b"buf", at: 1 }) });
+  assert_eq(takes(taken), [false]);
+  assert_eq(answered(taken), Owns);
+  assert_eq(answered(Tag(b"m.Box")), Lasts);
+  let lent = { takes: [false, true], owned: false, fails: true, stops: false };
+  assert_eq(takes(Op({ op: OHandle(Simulate), args: [AVar(s), AVar(s)], uses: lent })), [
+    false,
+    true,
+  ]);
+  assert_eq(answered(Get({ of: s, path: PLeaf(0) })), ReadsOf(s));
+  // A field the runtime looks up by name is answered with a count of its own.
+  assert_eq(answered(Get({ of: s, path: PNamed(b"x") })), Owns);
+  assert_eq(answered(call), Owns);
+  assert_eq(answered(Native({ name: b"rt_len_p", args: [AVar(s)], uses: lent })), ReadsOf(s));
+  assert_eq(answered(Op({ op: OHandle(Label(b"r")), args: [], uses: lent })), Lasts)
+}
+
+test "what can fail is what tests the runtime: a checked operator, a call, never an allocation" {
+  assert_eq(fails(Prim({ op: b"add", on: RInt, args: [AInt(1), AInt(2)] })), true);
+  assert_eq(fails(Prim({ op: b"lt", on: RInt, args: [AInt(1), AInt(2)] })), false);
+  assert_eq(fails(Prim({ op: b"add", on: RFloat, args: [AFloat(0), AFloat(0)] })), false);
+  assert_eq(fails(Prim({ op: b"add", on: RDec, args: [AZero(RDec), AZero(RDec)] })), true);
+  assert_eq(fails(Prim({ op: b"of_int", on: RInt, args: [AInt(300)] })), true);
+  let w = { id: 2, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
+  assert_eq([PLeaf(0), PNamed(b"x")].map(|at: Path| fails(Get({ of: w, path: at }))), [
+    false,
+    true,
+  ]);
+  let flat = { ..w, rep: RFlat([{ name: b"x", rep: RInt }]) };
+  assert_eq(fails(Pack({ arg: AInt(7), to: RWord })), false);
+  assert_eq(fails(Pack({ arg: AVar(flat), to: RWord })), false);
+  assert_eq(
+    fails(
+      Make({ made: MCtor({ name: b"m.Box", width: 1 }), args: [AVar(w)], reuse: None, kept: [] }),
+    ),
+    false,
+  );
+  assert_eq(fails(Gathered({ parts: [AInt(1)] })), false);
+  assert_eq(fails(Take({ of: w, path: PField({ name: b"x", at: 0 }) })), false);
+  assert_eq(fails(Tag(b"m.Box")), false);
+  assert_eq(ends(Miss), true);
+  assert_eq(falls_through([Do({ val: Literal(LUnit), at: dummy_span(), unwind: [] })]), true)
+}
+
+test "a block ends where its last instruction but a site's change ends" {
+  let lent = Sited(Some({ root: Named(b"m.g"), base: 40 }));
+  let fail = Fail({ why: NoArm, at: dummy_span() });
+  assert_eq(falls_through([lent, fail, Sited(None)]), false);
+  assert_eq(falls_through([fail, Sited(None), Return(AInt(0)), lent]), false);
+  assert_eq(falls_through([lent, Sited(None)]), true);
+  assert_eq(falls_through([]), true)
+}

@@ -10,7 +10,8 @@ import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMat
                      EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, SAssign,
                      Param, NamedArg, MatchArm, HandleClause, ReturnClause, HandlerVar, RecField,
                      expr_span, is_arithmetic, is_ordered, ETagged, Tagged, Hole, tagged_parser,
-                     tagged_filler, call_operator, written_operator, Slot, FromName, FromDefault)
+                     tagged_filler, call_operator, written_operator, Slot, FromName, FromDefault,
+                     simulated_at, detached_at, branch_at, try_places)
 import syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit,
                         LInt, LFixed, LWide, pat_span, has_or)
 import check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord,
@@ -1143,7 +1144,11 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
     ELambda(l) -> {
       let outer = checker;
       let checker = barred(outer, b"a lambda");
-      let pushed: Checker = { ..checker, env: env_push(checker.env) };
+      let pushed: Checker = {
+        ..checker,
+        env: env_push(checker.env),
+        lambda_binds: checker.env.binds,
+      };
       let expected = match hinted(checker, hint) { Some(TyFn(f)) -> f.params, _ -> [] };
       let ps = l.params.fold(
         { checker: pushed, tys: [] },
@@ -1213,7 +1218,10 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       };
       let made: Inferred = {
         checker: note_typed(
-          leaving({ ..checked, env: env_pop(checked.env) }, checker.guards),
+          leaving(
+            { ..checked, env: env_pop(checked.env), lambda_binds: checker.lambda_binds },
+            checker.guards,
+          ),
           l.span,
           fn_type(ps.tys, body.ty, row_empty()),
           [],
@@ -1634,7 +1642,7 @@ fn infer_parallel(checker: Checker, span: Span, branches: List<Expr>) -> Inferre
       let o: Inferred = infer(acc.checker, b);
       let j: WithRow = join(o.checker, span, acc.row, o.row);
       {
-        checker: j.checker,
+        checker: note_typed(j.checker, branch_at(b), fn_type([], o.ty, row_empty()), []),
         fs: acc.fs.push({ name: b"_".concat(ascii_of_int(i)), ty: o.ty }),
         row: j.row,
         rows: acc.rows.push({ span: expr_span(b), row: o.row }),
@@ -1941,16 +1949,18 @@ pub fn settle_updates(checker: Checker) -> Checker / {abort.raise} = {
   })
 }
 
-/// `checker` with the type of a read of `name` at `span` filed where the name is a variable of the
-/// handler whose clause is walked: the read is written out as one of the runtime's, which no
-/// binding's layout describes.
+/// `checker` with the type of a read of `name` at `span` filed where no binding the emitter sees
+/// types it: a variable of the handler whose clause is walked, which the read is written out as one
+/// of the runtime's, or a capture of the innermost lambda, which a body another function lends that
+/// lambda to reads off its closure.
 fn held_read(checker: Checker, name: Bytes, span: Span, ty: Type) -> Checker =
-  if checker.assignable.vars.len() == 0 { checker } else {
+  if checker.assignable.vars.len() == 0 && checker.lambda_binds == 0 { checker } else {
     match env_local(checker.env, name) {
-      Some(l) -> if checker.assignable.vars.fold(
-          false,
-          |found: Bool, v: { stamp: Int, name: Bytes, ty: Type }| found || v.stamp == l.stamp,
-        ) { note_typed(checker, read_site(span), ty, []) }
+      Some(l) -> if l.stamp < checker.lambda_binds
+          || checker.assignable.vars.fold(
+            false,
+            |found: Bool, v: { stamp: Int, name: Bytes, ty: Type }| found || v.stamp == l.stamp,
+          ) { note_typed(checker, read_site(span), ty, []) }
       else { checker },
       None -> checker,
     }
@@ -4608,11 +4618,27 @@ fn infer_handle(
                     fixes: [],
                   })
                 } else { shape.checker };
-                // What a clause's parameters hold is its operation's, filed where the clause is.
-                // A clause's parameters bind after the handler's variables, so one of a variable's
-                // name is the parameter.
+                let raise = is_raise(hit.op.mode);
+                let whole = raise || (match clause.resume { Some(_) -> true, None -> false });
+                // A clause that resumes or answers a raise answers for the whole `handle`.
+                let result = match result_var.t { Some(t) -> t, None -> shape.ret };
+                let continuation = fn_type([shape.ret], result, match cont.v {
+                  Some(v) -> row_open(v),
+                  None -> row_empty(),
+                });
+                // The clause runs as a closure of its operation's parameters, then the label and
+                // the continuation it binds, filed where the clause is. Its parameters bind after
+                // the handler's variables, so one of a variable's name is the parameter.
+                let closed = fn_type(
+                  shape.params.concat(match clause.label_binder {
+                    Some(_) -> [string_type()],
+                    None -> [],
+                  }).concat(match clause.resume { Some(_) -> [continuation], None -> [] }),
+                  if whole { result } else { shape.ret },
+                  row_empty(),
+                );
                 let pushed: Checker = with_vars(
-                  note_typed(c0, clause.span, fn_type(shape.params, shape.ret, row_empty()), []),
+                  note_typed(c0, clause.span, closed, []),
                   made.vars,
                   None,
                 );
@@ -4635,7 +4661,6 @@ fn infer_handle(
                     { ..bound, env: env_bind(bound.env, t.name, monomorphic(string_type())) },
                   None -> bound,
                 };
-                let raise = is_raise(hit.op.mode);
                 let raised = Bytes::concat_all([
                   b"`",
                   as_written(with_label, hit.info.name),
@@ -4645,21 +4670,9 @@ fn infer_handle(
                 ]);
                 let with_resume: Checker = match clause.resume {
                   Some(k) -> {
-                    let result = match result_var.t {
-                      Some(t) -> t,
-                      None -> panic("a general clause is present"),
-                    };
-                    let row = match cont.v {
-                      Some(v) -> v,
-                      None -> panic("a general clause is present"),
-                    };
                     let bound_k: Checker = {
                       ..with_label,
-                      env: env_bind(
-                        with_label.env,
-                        k.name,
-                        monomorphic(fn_type([shape.ret], result, row_open(row))),
-                      ),
+                      env: env_bind(with_label.env, k.name, monomorphic(continuation)),
                     };
                     if !raise { bound_k } else {
                       report_error_at(
@@ -4674,7 +4687,6 @@ fn infer_handle(
                   },
                   None -> with_label,
                 };
-                let whole = raise || (match clause.resume { Some(_) -> true, None -> false });
                 let answer = if !whole { hint_of(shape.ret) }
                 else { match ret { Some(_) -> hint, None -> hint_after(hint, b.ty) } };
                 let ordered: Checker = {
@@ -4756,7 +4768,12 @@ fn infer_handle(
       };
       let o: Inferred = infer(bound, rc.body, hint);
       {
-        checker: { ..o.checker, env: env_pop(o.checker.env), assignable: around },
+        checker: note_typed(
+          { ..o.checker, env: env_pop(o.checker.env), assignable: around },
+          rc.span,
+          fn_type([b.ty], o.ty, row_empty()),
+          [],
+        ),
         ty: o.ty,
         row: o.row,
       }
@@ -4807,7 +4824,14 @@ fn infer_handle(
   };
   // What making the variables performs is the `handle`'s, outside its own clauses' reach.
   let j3: WithRow = join(solved, span, j2.row, made.row);
-  { checker: j3.checker, ty: returned.ty, row: j3.row }
+  // What the `handle` answers, and the closure its body runs in where a clause resumes off its tail.
+  let typed: Checker = note_typed(
+    note_typed(j3.checker, span, returned.ty, []),
+    detached_at(span),
+    fn_type([], b.ty, row_empty()),
+    [],
+  );
+  { checker: typed, ty: returned.ty, row: j3.row }
 }
 
 /// The raise a `try` names.
@@ -4986,20 +5010,37 @@ fn infer_try_block(
         op: Some(hit.op.name),
       };
       let c: Checker = chosen.checker;
+      let carried = carried_type(hit.op.params);
+      let result = TyCon({ name: b"Result", args: [b.ty, carried] });
+      // The `handle` the `try` is written out as, typed where its parts will stand.
+      let at = try_places(span);
+      let parts = [
+        { span: span, ty: result, args: [] },
+        { span: at.ret, ty: fn_type([b.ty], result, row_empty()), args: [] },
+        { span: at.clause, ty: fn_type(hit.op.params, result, row_empty()), args: [] },
+        { span: at.ok, ty: fn_type([b.ty], result, row_empty()), args: [b.ty, carried] },
+        { span: at.err, ty: fn_type([carried], result, row_empty()), args: [b.ty, carried] },
+      ].concat(if hit.op.params.len() > 1 { [{ span: at.carried, ty: carried, args: [] }] }
+      else { [] });
+      let typed: Checker = parts.fold(
+        c,
+        |acc: Checker, p: { span: Span, ty: Type, args: List<Type> }|
+          note_typed(acc, p.span, p.ty, p.args),
+      );
       let filed: Checker = {
-        ..c,
-        try_sites: c.try_sites.push({
-          module: c.module,
+        ..typed,
+        try_sites: typed.try_sites.push({
+          module: typed.module,
           span: span,
           effect: hit.info.name,
           op: hit.op.name,
           arity: hit.op.params.len(),
-          owner: c.walking,
+          owner: typed.walking,
         }),
       };
       {
         checker: discharge(filed, mark, body_mark, [atom]),
-        ty: TyCon({ name: b"Result", args: [b.ty, carried_type(hit.op.params)] }),
+        ty: result,
         row: { atoms: body_row.atoms.filter(|a: Atom| a != atom), tail: body_row.tail },
       }
     },
@@ -5451,7 +5492,12 @@ fn infer_simulate(
     }),
   };
   let seed = seed_atom();
-  let recorded: Checker = record_site(noted, seed, span, DirectPerform);
+  let recorded: Checker = record_site(
+    note_typed(noted, simulated_at(span), fn_type([], b.ty, row_empty()), []),
+    seed,
+    span,
+    DirectPerform,
+  );
   let j: WithRow = join(
     recorded,
     span,
