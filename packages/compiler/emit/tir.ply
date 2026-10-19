@@ -8,6 +8,7 @@ import std.bytes (ascii_of_int)
 import syntax.parsing (Span, dummy_span)
 import syntax.patterns (Lit, LUnit)
 import emit.c (Width)
+import emit.reps (FieldTy)
 import emit.answer (GenericCall, Need, Pass)
 import emit.keys (RootKey, Callee, Generic, Named)
 import emit.tir.handling (HandleOp, HandleSite, Simulate, Label)
@@ -71,23 +72,30 @@ pub type Convention = { params: List<Handed>, reps: List<Rep>, answer: Rep, answ
 /// whether it can fail, and whether it can stop for a handler that may resume it later.
 pub type Uses = { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool }
 
-/// What a `Make` allocates. `MClosure` is a closure over body `nth` of the root's lambdas, holding
-/// `captures` words and taking `params` arguments; a `stacked` one is lent and laid out on the
-/// caller's stack.
+/// What a `Make` allocates. `MRecord` is a record the runtime lays out by its names, as it does one
+/// whose layout a type variable leaves open; `MCtor` a constructor's object holding each argument as
+/// its word; `MLaid` an
+/// object laid out as `fields` says, a constructor's where `ctor` names one and a record's otherwise,
+/// each argument held as its field is and a record held in place given as its leaves or its word.
+/// `MClosure` is a closure over body `nth` of the root's lambdas, holding `captures` words and taking
+/// `params` arguments; a `stacked` one is lent and laid out on the caller's stack.
 pub type Made =
   | MRecord({ names: List<Bytes>, width: Int })
   | MCtor({ name: Bytes, width: Int })
+  | MLaid({ ctor: Option<Bytes>, fields: List<FieldTy> })
   | MList(Int)
   | MClosure({ nth: Int, captures: Int, params: Int, stacked: Bool })
 
 /// Where a `Get` reads: a field by its word offset, or by name where the layout is unknown (a
-/// need the specialisation answers), a case's argument, a closure's capture, a flat value's leaf.
+/// need the specialisation answers), a case's argument, a closure's capture, a flat value's leaf, or
+/// the word of a record a block holds in place at a word offset: the address of its header there.
 pub type Path =
   | PField({ name: Bytes, at: Int })
   | PNamed(Bytes)
   | PArg({ ctor: Bytes, at: Int })
   | PCapture(Int)
   | PLeaf(Int)
+  | PPlace(Int)
 
 /// What a `Case` tests its subject against. An arm's `when` is an index into a `TTag`'s
 /// constructors or a `TInt`'s integers; a `TRange` holds one arm, `when` 0. Under `TLength` an arm's
@@ -210,10 +218,12 @@ pub type Links = {
 
 pub fn no_links() -> Links = { generics: [], needs: [], called: [], passes: [] }
 
-/// One root's form. `lambdas` are the bodies of the closures it makes (its lambdas, its handlers'
-/// clauses, a `simulate`'s body), each `MClosure`'s `nth` its place among them; `base` is where its
-/// definition's text starts, which its failure sites count from; `members` are a tail group's roots
-/// in case order, and empty for a root of its own.
+/// One root's form. `params` are held as `conv` takes them, but a list a root of its own walks down
+/// by restarting on its rest, which it holds as a view of the list whose word `conv` takes; a
+/// `Restart` hands its arguments as `params` are held. `lambdas` are the bodies of the closures it
+/// makes (its lambdas, its handlers' clauses, a `simulate`'s body), each `MClosure`'s `nth` its place
+/// among them; `base` is where its definition's text starts, which its failure sites count from;
+/// `members` are a tail group's roots in case order, and empty for a root of its own.
 ///
 /// A tail group's `Fn` is keyed as its first member, takes one parameter, `which`, an `RInt`, and
 /// answers a word. Its body is one `Case` on `which` testing `TInt` of each member's place, arm `i`
@@ -284,6 +294,11 @@ pub fn made_said(m: Made) -> Bytes =
   match m {
     MRecord(r) -> Bytes::concat_all([b"a record of ", Bytes::join(r.names, b", ")]),
     MCtor(c) -> Bytes::concat_all([b"constructor ", c.name]),
+    MLaid(l) -> match l.ctor {
+      Some(c) -> Bytes::concat_all([b"constructor ", c, b" laid out"]),
+      None ->
+        Bytes::concat_all([b"a record of ", ascii_of_int(l.fields.len()), b" fields laid out"]),
+    },
     MList(n) -> Bytes::concat_all([b"a list of ", ascii_of_int(n)]),
     MClosure(c) -> Bytes::concat_all([b"closure ", ascii_of_int(c.nth)]),
   }
@@ -315,6 +330,16 @@ pub fn parts_of(r: Rep) -> List<Rep> =
         acc.concat(x.leaves.map(|l: Leaf| l.rep))),
     RSlice -> [RWord, RInt],
     _ -> [r],
+  }
+
+/// How many C values a value held as `r` is laid in: `parts_of(r)`'s length, without the list.
+pub fn parts_count(r: Rep) -> Int =
+  match r {
+    RFlat(leaves) -> leaves.len() + 1,
+    RCases(c) ->
+      c.cases.fold(1, |n: Int, x: { name: Bytes, leaves: List<Leaf> }| n + x.leaves.len()),
+    RSlice -> 2,
+    _ -> 1,
   }
 
 /// How operand `a` is held: a variable as its own representation says, a constant as C names it.
@@ -396,33 +421,25 @@ fn by_uses(args: List<Arg>, uses: Uses) -> Answered =
   if uses.owned { Owns } else { match args.at(0) { Some(AVar(x)) -> ReadsOf(x), _ -> Lasts } }
 
 /// Whether `v` can fail, so a test follows it and its `unwind` is released on the way out: a
-/// call, an allocation, a constant read from the pool, a checked operator, a field read by name,
-/// and what its `uses` say of a runtime function or a family's operation.
+/// call, a constant read from the pool, a checked operator, a field read by name, and what its
+/// `uses` say of a runtime function or a family's operation. A value made or packed only allocates,
+/// which never fails: the heap aborts when it is exhausted.
 pub fn fails(v: Val) -> Bool =
   match v {
     Prim(p) -> checked(p.op, p.on),
     Literal(_) -> true,
     Static(_) -> false,
-    Make(_) -> true,
+    Make(_) -> false,
     Get(g) -> match g.path { PNamed(_) -> true, _ -> false },
     Take(_) -> false,
     Tag(_) -> false,
-    Pack(p) -> allocates(rep_of_arg(p.arg), p.to),
+    Pack(_) -> false,
     Gathered(_) -> false,
     Call(_) -> true,
     Apply(_) -> true,
     Native(n) -> n.uses.fails,
     Op(o) -> o.uses.fails,
   }
-
-/// Whether holding a value held as `from` as `to` makes an object: a value holding no count boxed,
-/// or a flat value or a view made the object its word names.
-pub fn allocates(from: Rep, to: Rep) -> Bool =
-  one_word(to)
-    && (!counted(from)
-    || (match from { RFlat(_) -> true, RCases(_) -> true, RSlice -> true, _ -> false }))
-
-fn one_word(r: Rep) -> Bool = match r { RWord -> true, RMaybe -> true, RTagged -> true, _ -> false }
 
 /// Whether operator `op` over `on` is checked: an integer's arithmetic and shifts, which overflow
 /// or divide by zero, and a width's; an `Int` made a width it does not fit (`of_int`); a decimal's
@@ -531,7 +548,7 @@ test "each operation consumes or borrows each operand as its signature says" {
   assert_eq(answered(Op({ op: OHandle(Label(b"r")), args: [], uses: lent })), Lasts)
 }
 
-test "what can fail is what tests the runtime: a checked operator, a call, an allocation" {
+test "what can fail is what tests the runtime: a checked operator, a call, never an allocation" {
   assert_eq(fails(Prim({ op: b"add", on: RInt, args: [AInt(1), AInt(2)] })), true);
   assert_eq(fails(Prim({ op: b"lt", on: RInt, args: [AInt(1), AInt(2)] })), false);
   assert_eq(fails(Prim({ op: b"add", on: RFloat, args: [AFloat(0), AFloat(0)] })), false);
@@ -543,11 +560,14 @@ test "what can fail is what tests the runtime: a checked operator, a call, an al
     true,
   ]);
   let flat = { ..w, rep: RFlat([{ name: b"x", rep: RInt }]) };
-  // Boxing and making a flat value's object allocate; holding a word as a sum's word does not.
-  assert_eq(fails(Pack({ arg: AInt(7), to: RWord })), true);
-  assert_eq(fails(Pack({ arg: AVar(flat), to: RWord })), true);
-  assert_eq(fails(Pack({ arg: AVar(w), to: RMaybe })), false);
-  assert_eq(fails(Pack({ arg: AVar(w), to: RFlat([{ name: b"x", rep: RInt }]) })), false);
+  assert_eq(fails(Pack({ arg: AInt(7), to: RWord })), false);
+  assert_eq(fails(Pack({ arg: AVar(flat), to: RWord })), false);
+  assert_eq(
+    fails(
+      Make({ made: MCtor({ name: b"m.Box", width: 1 }), args: [AVar(w)], reuse: None, kept: [] }),
+    ),
+    false,
+  );
   assert_eq(fails(Gathered({ parts: [AInt(1)] })), false);
   assert_eq(fails(Take({ of: w, path: PField({ name: b"x", at: 0 }) })), false);
   assert_eq(fails(Tag(b"m.Box")), false);

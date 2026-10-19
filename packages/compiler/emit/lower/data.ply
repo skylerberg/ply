@@ -1,21 +1,23 @@
-//! Records, constructors, fields, updates and constants. A record of a type that lays it out is
-//! gathered from its fields and held as its leaves; one whose layout a type variable leaves open is
-//! made by value. A constructor of a sum the code knows as one word or as its cases is gathered from
-//! its index and its argument; any other is made as its object, its arguments as its declaration
-//! lays them out. A field is read where its record holds it, and an update gathers the fields it
-//! keeps from its base and the ones it sets.
+//! Records, constructors, fields, updates and constants. A record of a type that lays it out is held
+//! as `record_held` says: gathered from its fields where it is held as its leaves, and made as its
+//! object where it is held as its word; one whose layout a type variable leaves open is made by
+//! value. A constructor of a sum the code knows as one word or as its cases is gathered from its
+//! index and its argument; any other is made as its object, its arguments as its declaration lays
+//! them out. A field is read where its record holds it, and an update makes its record of the fields
+//! it keeps from its base and the ones it sets.
 
 import syntax.parsing (Span)
 import check.types (Type, TyFn, TyRecord, TyNominal, Field)
 import emit.typing (unknown_type)
-import emit.reps (FieldTy, laid_vars, laid_of)
+import emit.reps (FieldTy, TyRec, laid_vars, laid_of)
 import emit.c (sorted_names)
 import emit.answer (Layout)
 import emit.tir (Rep, RWord, RFlat, RCases, Leaf, Var, Arg, AVar, AInt, AZero, Make, MRecord, MCtor,
-                 Get, Gathered, PLeaf, PField, PNamed, Data, rep_of_arg)
+                 MLaid, Get, Gathered, PLeaf, PField, PNamed, Data, rep_of_arg)
 import emit.lower.setting (ctor_named)
-import emit.lower.held (held_as, laid_fields, flat, leaf_span, field_type, field_path, slot_held,
-                        ctor_fields, case_index, case_span)
+import emit.lower.held (held_as, record_held, laid_fields, leaves_of, leaf_span, leaf_spans,
+                        field_type, field_types, slot_held, placed, ctor_fields, case_index,
+                        case_span)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, type_at, type_of,
                         noted)
 
@@ -151,7 +153,7 @@ fn made_object(
           ty,
           RWord,
           Make({
-            made: MCtor({ name: ctor, width: laid_of(fs).width }),
+            made: MLaid({ ctor: Some(ctor), fields: fs }),
             args: held.args,
             reuse: None,
             kept: [],
@@ -191,7 +193,7 @@ fn handed_all(
     },
   )
 
-/// A record literal of `fields`, each lowered in written order: gathered into its leaves where its
+/// A record literal of `fields`, each lowered in written order: made as `record_made` says where its
 /// type lays it out, or made by value where a type variable leaves the layout open.
 pub fn recorded(
   cx: Context,
@@ -210,7 +212,7 @@ pub fn recorded(
     fields.fold(None, |acc: Option<Arg>, f: { name: Bytes, arg: Arg }|
       if f.name == name { Some(f.arg) } else { acc });
   match laid_fields(ty) {
-    Some(fs) -> if !flat(fs) { by_value(st, ty, [], [], at) } else {
+    Some(fs) -> if fs.len() == 0 { by_value(st, ty, [], [], at) } else {
       let given = fs.fold(
         { xs: [], missing: false },
         |acc: { xs: List<{ arg: Arg, to: Rep }>, missing: Bool }, f: FieldTy|
@@ -222,13 +224,7 @@ pub fn recorded(
       if given.missing { refuse(st, Data, b"a record literal missing a field its type holds") }
       else {
         let held = handed_all(st, given.xs, at);
-        bound_as(
-          held.st,
-          ty,
-          held_as(cx.setting, ty),
-          Gathered({ parts: held.args.push(AZero(RWord)) }),
-          at,
-        )
+        record_made(held.st, ty, fs, held.args, at)
       }
     },
     None -> {
@@ -241,6 +237,21 @@ pub fn recorded(
     },
   }
 }
+
+/// The record of type `ty` laid out as `fs` holding `args`, each its field's value held as its slot
+/// holds it: gathered into its leaves where it is held as them, and otherwise made as its object.
+fn record_made(st: Lowering, ty: Type, fs: List<FieldTy>, args: List<Arg>, at: Span) -> Lowered =
+  match record_held(fs) {
+    RFlat(ls) -> bound_as(st, ty, RFlat(ls), Gathered({ parts: args.push(AZero(RWord)) }), at),
+    r ->
+      bound_as(
+        st,
+        ty,
+        r,
+        Make({ made: MLaid({ ctor: None, fields: fs }), args: args, reuse: None, kept: [] }),
+        at,
+      ),
+  }
 
 /// `st` noting each type variable whose layout a record of `ty` is laid out by, which a
 /// specialisation at known types would lay out where the runtime does here.
@@ -287,7 +298,7 @@ pub fn field(cx: Context, base: Lowered, name: Bytes, at: Span) -> Lowered =
         None -> match type_at(cx, at) { Some(t) -> t, None -> unknown_type() },
       };
       let want = held_as(cx.setting, fty);
-      match read_of(cx, base.st, b, name, fty, at) {
+      match read_of(base.st, b, name, fty, at) {
         None -> refuse(base.st, Data, b"a field its record does not hold: ".concat(name)),
         Some(r) -> if r.parts.len() == 1 {
           match r.parts.at(0) {
@@ -306,7 +317,6 @@ pub fn field(cx: Context, base: Lowered, name: Bytes, at: Span) -> Lowered =
 /// a record held in place its leaves and its header as one flat value, each borrowed; or, where `b`'s
 /// type leaves the layout open, its word read by name, which holds a count of its own.
 fn read_of(
-  cx: Context,
   st: Lowering,
   b: Var,
   name: Bytes,
@@ -316,45 +326,127 @@ fn read_of(
   match b.rep {
     RFlat(ls) -> match leaf_span(ls, name) {
       None -> None,
-      Some(sp) ->
-        Some(
-          range(sp.at, sp.at + sp.n).fold(
-            { st: st, parts: [] },
-            |acc: { st: Lowering, parts: List<Arg> }, k: Int| {
-              let g = bound_as(
-                acc.st,
-                if sp.n == 1 { fty } else { unknown_type() },
-                leaf_rep(ls, k),
-                Get({ of: b, path: PLeaf(k) }),
-                at,
-              );
-              { st: g.st, parts: acc.parts.push(g.arg) }
-            },
-          ),
-        ),
+      Some(sp) -> Some(leaves_read(st, b, ls, sp, fty, at)),
     },
     _ -> match laid_fields(b.ty) {
-      None -> {
-        let g = bound_as(laid_needed(st, b.ty), fty, RWord, Get({ of: b, path: PNamed(name) }), at);
-        Some({ st: g.st, parts: [g.arg] })
-      },
-      Some(fs) -> match fs.fold(None, |acc: Option<FieldTy>, f: FieldTy|
-          if f.name == name { Some(f) } else { acc }) {
+      None -> read_in(st, b, Open, name, fty, at),
+      Some(fs) -> match range(0, fs.len()).fold(None, |found: Option<Int>, i: Int|
+          match fs.at(i) {
+            Some(f) -> if f.name == name { Some(i) } else { found },
+            None -> found,
+          }) {
         None -> None,
-        Some(f) -> match field_path(cx.setting, b.ty, name) {
-          PField(p) -> {
-            let g = bound_as(st, fty, slot_held(f), Get({ of: b, path: PField(p) }), at);
-            Some({ st: g.st, parts: [g.arg] })
-          },
-          _ -> None,
+        Some(i) -> match fs.at(i) {
+          Some(f) -> slot_read(st, b, f, laid_of(fs).offsets.at(i), fty, at),
+          None -> None,
         },
       },
     },
   }
 
-/// `{ ..base, sets }`, the fields `copies` read out of `base` as they stand: gathered from what it
-/// keeps of `base` and what it sets where its type lays it out, or made by value of the fields it
-/// keeps read by name and those it sets where a type variable leaves the layout open.
+/// Where the fields of a record lie, read once for every field read out of it: each field's span
+/// of a flat record's leaves; each field of a word whose type lays it out, and its offset; or
+/// nothing, where a type variable leaves the layout open.
+type Lay =
+  | Spans({ leaves: List<Leaf>, of: Map<Bytes, { at: Int, n: Int }> })
+  | Slots(Map<Bytes, { f: FieldTy, at: Option<Int> }>)
+  | Open
+
+fn lay_of(b: Var) -> Lay =
+  match b.rep {
+    RFlat(ls) -> Spans({ leaves: ls, of: leaf_spans(ls) }),
+    _ -> match laid_fields(b.ty) {
+      None -> Open,
+      Some(fs) -> {
+        let l = laid_of(fs);
+        Slots(
+          range(0, fs.len()).fold(
+            Map::new(),
+            |m: Map<Bytes, { f: FieldTy, at: Option<Int> }>, i: Int|
+              match fs.at(i) {
+                Some(f) -> m.insert(f.name, { f: f, at: l.offsets.at(i) }),
+                None -> m,
+              },
+          ),
+        )
+      },
+    },
+  }
+
+/// `read_of` where `lay` says how `b` lays its fields out.
+fn read_in(
+  st: Lowering,
+  b: Var,
+  lay: Lay,
+  name: Bytes,
+  fty: Type,
+  at: Span,
+) -> Option<{ st: Lowering, parts: List<Arg> }> =
+  match lay {
+    Spans(s) -> match s.of.get(name) {
+      None -> None,
+      Some(sp) -> Some(leaves_read(st, b, s.leaves, sp, fty, at)),
+    },
+    Slots(slots) -> match slots.get(name) {
+      None -> None,
+      Some(s) -> slot_read(st, b, s.f, s.at, fty, at),
+    },
+    Open -> {
+      let g = bound_as(laid_needed(st, b.ty), fty, RWord, Get({ of: b, path: PNamed(name) }), at);
+      Some({ st: g.st, parts: [g.arg] })
+    },
+  }
+
+/// Field `f` of the word `b`, read at `offset` as its slot holds it; nothing where the layout puts it
+/// at no offset.
+fn slot_read(
+  st: Lowering,
+  b: Var,
+  f: FieldTy,
+  offset: Option<Int>,
+  fty: Type,
+  at: Span,
+) -> Option<{ st: Lowering, parts: List<Arg> }> =
+  match offset {
+    Some(o) -> {
+      let g = bound_as(
+        st,
+        fty,
+        slot_held(f),
+        Get({ of: b, path: placed(f, o, PField({ name: f.name, at: o })) }),
+        at,
+      );
+      Some({ st: g.st, parts: [g.arg] })
+    },
+    None -> None,
+  }
+
+/// The leaves `sp` spans of the flat record `b` of leaves `ls`, each read as its part.
+fn leaves_read(
+  st: Lowering,
+  b: Var,
+  ls: List<Leaf>,
+  sp: { at: Int, n: Int },
+  fty: Type,
+  at: Span,
+) -> { st: Lowering, parts: List<Arg> } =
+  range(sp.at, sp.at + sp.n).fold(
+    { st: st, parts: [] },
+    |acc: { st: Lowering, parts: List<Arg> }, k: Int| {
+      let g = bound_as(
+        acc.st,
+        if sp.n == 1 { fty } else { unknown_type() },
+        leaf_rep(ls, k),
+        Get({ of: b, path: PLeaf(k) }),
+        at,
+      );
+      { st: g.st, parts: acc.parts.push(g.arg) }
+    },
+  )
+
+/// `{ ..base, sets }`, the fields `copies` read out of `base` as they stand: made as `record_made`
+/// says of what it keeps of `base` and what it sets where its type lays it out, or made by value of
+/// the fields it keeps read by name and those it sets where a type variable leaves the layout open.
 pub fn updated(
   cx: Context,
   st: Lowering,
@@ -389,48 +481,57 @@ pub fn updated(
           );
           by_value(given.st, ty, names, given.args, at)
         },
-        Some(fs) -> if !flat(fs) { refuse(st, Data, b"an update of a record of no fields") } else {
-          let set_of = |name: Bytes|
-            sets.fold(None, |acc: Option<Arg>, f: { name: Bytes, arg: Arg }|
-              if f.name == name { Some(f.arg) } else { acc });
+        Some(fs) -> if fs.len() == 0 { refuse(st, Data, b"an update of a record of no fields") }
+        else {
+          // Each field is looked up once in maps read once, however wide the record is.
+          let given = sets.fold(Map::new(), |m: Map<Bytes, Arg>, f: { name: Bytes, arg: Arg }|
+            m.insert(f.name, f.arg));
+          let kept = copies.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true));
+          let types = field_types(ty);
+          let lay = lay_of(b);
+          let flat = match record_held(fs) { RFlat(_) -> true, _ -> false };
           let parts = fs.fold(
             { st: st, parts: [], missing: false },
             |acc: { st: Lowering, parts: List<Arg>, missing: Bool }, f: FieldTy|
-              match set_of(f.name) {
+              match given.get(f.name) {
                 Some(a) -> {
                   let h = handed({ st: acc.st, arg: a }, slot_held(f), at);
                   { ..acc, st: h.st, parts: acc.parts.push(h.arg) }
                 },
-                None -> if !copies.contains(f.name) { { ..acc, missing: true } } else {
-                  match read_of(
-                      cx,
-                      acc.st,
-                      b,
-                      f.name,
-                      match field_type(ty, f.name) { Some(t) -> t, None -> unknown_type() },
-                      at,
-                    ) {
+                None -> if !kept.contains(f.name) { { ..acc, missing: true } } else {
+                  let fty = match types.get(f.name) { Some(t) -> t, None -> unknown_type() };
+                  match read_in(acc.st, b, lay, f.name, fty, at) {
                     None -> { ..acc, missing: true },
-                    Some(r) -> { ..acc, st: r.st, parts: acc.parts.concat(r.parts) },
+                    Some(r) -> if flat || r.parts.len() == 1 {
+                      { ..acc, st: r.st, parts: acc.parts.concat(r.parts) }
+                    } else {
+                      let one = gathered_held(r.st, f, fty, r.parts, at);
+                      { ..acc, st: one.st, parts: acc.parts.push(one.arg) }
+                    },
                   }
                 },
               },
           );
           if parts.missing {
             refuse(st, Data, b"an update of a field its base does not hold where its type lays it")
-          } else {
-            bound_as(
-              parts.st,
-              ty,
-              held_as(cx.setting, ty),
-              Gathered({ parts: parts.parts.push(AZero(RWord)) }),
-              at,
-            )
-          }
+          } else { record_made(parts.st, ty, fs, parts.parts, at) }
         },
       }
     },
     _ -> refuse(st, Data, b"an update of a value that is no record"),
+  }
+
+/// The leaves and word `parts` of the record field `f` holds in place, read out of a flat record, as
+/// one value held as its slot holds it.
+fn gathered_held(st: Lowering, f: FieldTy, fty: Type, parts: List<Arg>, at: Span) -> Lowered =
+  match f.ty {
+    TyRec(inner) ->
+      handed(
+        bound_as(st, fty, RFlat(leaves_of(inner)), Gathered({ parts: parts }), at),
+        slot_held(f),
+        at,
+      ),
+    _ -> refuse(st, Data, b"a field read as several parts that holds no record in place"),
   }
 
 fn sorted(fs: List<{ name: Bytes, ty: Type }>) -> List<{ name: Bytes, ty: Type }> =

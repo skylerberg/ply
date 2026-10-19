@@ -1,5 +1,10 @@
 //! The ownership pass's instructions printed: counts taken and let go, cells kept for reuse and
 //! freed, a flat value opened into its parts, and what a failure path releases before it leaves.
+//!
+//! A failure path releases what it holds through a chain of tails, Rust's drop elaboration on the
+//! unwind path: each tail lets go of one value and goes on to the next, the latest declared first,
+//! and each is printed once at the end of the C block its value was declared in, so failures whose
+//! releases end alike share their ends.
 
 import std.bytes (ascii_of_int)
 import syntax.parsing (span_between)
@@ -7,15 +12,99 @@ import check.types (TyCon)
 import emit.tir (Rep, RInt, RWord, RMaybe, RTagged, RFlat, RToken, Var, Inst, Inc, Dec, Reset, Free,
                  Opened, AInt, counted, parts_of)
 import emit.pieces (spelled)
-import emit.print.text (Printing, Place, line, name_of, named, printing, part_names)
+import emit.print.text (Printing, Place, line, name_of, named, printing, part_names, declared_at)
 
-/// The C a failure path runs to release `unwind` before it leaves: each count let go, and a reuse
-/// token's block, which holds nothing, freed.
-pub fn released(pr: Printing, unwind: List<Var>) -> Bytes =
-  Bytes::join(unwind.map(|v: Var| let_go(name_of(pr, v), v.rep)).filter(|t: Bytes| t != b""), b" ")
+/// The C a failure holding `unwind` runs: a jump to the chain of tails that lets go of each count it
+/// holds (a reuse token's block, which holds nothing, freed) and then goes by `root`, the tails it
+/// lacks added; `root` itself where it holds nothing.
+pub fn exit_of(pr: Printing, unwind: List<Var>, root: Bytes) -> { pr: Printing, leave: Bytes } =
+  by_declaration(pr, unwind.filter(|v: Var| counted(v.rep))).fold(
+    { pr: pr, leave: root },
+    |acc: { pr: Printing, leave: Bytes }, _: Int, vs: List<Var>|
+      vs.fold(acc, |a: { pr: Printing, leave: Bytes }, v: Var| tailed(a.pr, v, a.leave)),
+  )
+
+/// `vs` keyed by when each was declared, so a chain built from the first lets go of what an inner
+/// block declared before what the blocks around it did. A value held twice is listed twice.
+fn by_declaration(pr: Printing, vs: List<Var>) -> Map<Int, List<Var>> =
+  vs.fold(Map::new(), |m: Map<Int, List<Var>>, v: Var| {
+    let k = declared_at(pr, v).at * 4294967296 + v.id;
+    m.insert(k, match m.get(k) { Some(same) -> same.push(v), None -> [v] })
+  })
+
+/// The jump to the tail letting go of `v` and going on by `then`, added where there is none.
+fn tailed(pr: Printing, v: Var, then: Bytes) -> { pr: Printing, leave: Bytes } = {
+  let name = name_of(pr, v);
+  let key = Bytes::concat_all([name, b" ", then]);
+  let ts = pr.tails;
+  match ts.keyed.get(key) {
+    Some(k) -> { pr: pr, leave: tail_jump(k) },
+    None -> {
+      let k = ts.all.len();
+      let block = declared_at(pr, v).block;
+      {
+        pr: {
+          ..pr,
+          tails: {
+            all: ts.all.push({ name: name, rep: v.rep, then: then }),
+            keyed: ts.keyed.insert(key, k),
+            held: ts.held.insert(block, match ts.held.get(block) {
+              Some(ks) -> ks.push(k),
+              None -> [k],
+            }),
+          },
+        },
+        leave: tail_jump(k),
+      }
+    },
+  }
+}
+
+fn tail_jump(k: Int) -> Bytes = Bytes::concat_all([b"goto ply_u", ascii_of_int(k), b";"])
+
+/// `pr` inside a C block of its own, which what it names is declared in.
+pub fn block_opened(pr: Printing) -> Printing =
+  { ..pr, block: pr.blocks + 1, blocks: pr.blocks + 1 }
+
+/// `pr` at the end of the C block it is in, indented `depth`, then back in block `outer`: the tails
+/// of the values declared in the block printed there, the last added first so each falls into the
+/// next where it goes on to it, and out of the way of a block that `falls` off its end.
+pub fn block_closed(pr: Printing, outer: Int, depth: Int, falls: Bool) -> Printing = {
+  let here = match pr.tails.held.get(pr.block) { Some(ks) -> ks.reverse(), None -> [] };
+  let lines = range(0, here.len()).fold([], |acc: List<Bytes>, i: Int|
+    match here.at(i) {
+      None -> acc,
+      Some(k) -> match pr.tails.all.at(k) {
+        None -> acc,
+        Some(t) -> {
+          let falls_on = match here.at(i + 1) {
+            Some(next) -> tail_jump(next) == t.then,
+            None -> false,
+          };
+          acc.push(
+            Bytes::concat_all([
+              b"ply_u",
+              ascii_of_int(k),
+              b": ",
+              let_go(t.name, t.rep),
+              if falls_on { b"" } else { b" ".concat(t.then) },
+            ]),
+          )
+        },
+      },
+    });
+  let closed = if lines.len() == 0 { pr } else if falls {
+    line(
+      lines.fold(line(pr, depth, b"if (0) {"), |q: Printing, l: Bytes| line(q, depth + 1, l)),
+      depth,
+      b"}",
+    )
+  } else { lines.fold(pr, |q: Printing, l: Bytes| line(q, depth, l)) };
+  { ..closed, block: outer }
+}
 
 /// `i`, one of `Inc`, `Dec`, `Reset`, `Free` and `Opened`. An opened value's words are its parts'
-/// C locals under their own variables, so opening one writes no C.
+/// C locals under their own variables, declared with it, so opening one writes no C.
 pub fn count_printed(p: Place, pr: Printing, i: Inst) -> Printing =
   match i {
     Inc(n) -> {
@@ -51,14 +140,16 @@ pub fn count_printed(p: Place, pr: Printing, i: Inst) -> Printing =
     Free(r) -> line(pr, p.depth, let_go(name_of(pr, r.of), r.of.rep)),
     Opened(o) -> {
       let names = part_names(name_of(pr, o.of), o.of.rep);
-      {
-        ..pr,
-        names: range(0, o.words.len()).fold(pr.names, |m: Map<Int, Bytes>, k: Int|
-          match o.words.at(k) {
-            Some(w) -> match names.at(k) { Some(n) -> m.insert(w.id, n), None -> m },
-            None -> m,
-          }),
-      }
+      let at = declared_at(pr, o.of);
+      range(0, o.words.len()).fold(pr, |q: Printing, k: Int|
+        match o.words.at(k) {
+          Some(w) -> match names.at(k) {
+            Some(n) ->
+              { ..q, names: q.names.insert(w.id, n), declared: q.declared.insert(w.id, at) },
+            None -> q,
+          },
+          None -> q,
+        })
     },
     _ -> pr,
   }
@@ -105,6 +196,18 @@ fn place() -> Place =
 fn printed(pr: Printing, i: Inst) -> Bytes / {abort.raise} =
   spelled(count_printed(place(), pr, i).out)
 
+/// What a failure holding `unwind` runs after what `pr` named, in a function whose blocks are all
+/// closed: its jump, then the tails the function's end prints.
+fn unwound(pr: Printing, unwind: List<Var>) -> Bytes / {abort.raise} = {
+  let x = exit_of({ ..pr, out: [] }, unwind, b"return 0;");
+  Bytes::concat_all([x.leave, b"\n", spelled(block_closed(x.pr, 0, 0, false).out)])
+}
+
+fn lets_go(text: Bytes, name: Bytes) -> Bool =
+  text.index_of(Bytes::concat_all([b"ply_dec(ctx, ", name, b");"])) != None
+
+fn occurrences(t: Bytes, s: Bytes) -> Int / {abort.raise} = t.split(s).len() - 1
+
 test "a count is taken or let go of each part of a value that holds one, as many times as it is taken" {
   let x = local(0, RWord);
   let flat = local(1, RFlat([{ name: b"a", rep: RInt }, { name: b"b", rep: RWord }]));
@@ -115,10 +218,11 @@ test "a count is taken or let go of each part of a value that holds one, as many
   // A flat value's counted leaf and its word each hold a count; its scalar leaf holds none.
   assert_eq(printed(pr, Dec(flat)), b"  ply_dec(ctx, t1_1); ply_dec(ctx, t1_2);\n");
   assert_eq(
-    released(pr, [x, k, flat]),
-    b"ply_dec(ctx, p0); ply_dec(ctx, t1_1); ply_dec(ctx, t1_2);",
+    unwound(pr, [x, k, flat]),
+    b"goto ply_u1;\n  ply_u1: ply_dec(ctx, t1_1); ply_dec(ctx, t1_2);\n  ply_u0: ply_dec(ctx, p0); return 0;\n",
   );
-  assert_eq(released(pr, [k]), b"");
+  // A failure that holds no count leaves at once.
+  assert_eq(unwound(pr, [k]), b"return 0;\n");
   assert_eq([RMaybe, RTagged, RToken(2)].map(|r: Rep| let_go(b"w", r)), [
     b"ply_dec(ctx, w);",
     b"ply_dec(ctx, w);",
@@ -140,7 +244,11 @@ test "a reset keeps a block held only here as its token, and a token no make too
     printed({ ..reset, out: [] }, Free({ of: token, bytes: AInt(16) })),
     b"  ply_dec(ctx, t1);\n",
   );
-  assert_eq(released(reset, [x, token]), b"ply_dec(ctx, p0); ply_dec(ctx, t1);")
+  // A failure holding the token frees it before it lets go of what was declared before it.
+  assert_eq(
+    unwound(reset, [x, token]),
+    b"goto ply_u1;\n  ply_u1: ply_dec(ctx, t1);\n  ply_u0: ply_dec(ctx, p0); return 0;\n",
+  )
 }
 
 test "a flat value opened writes no C, and each word is the part it was" {
@@ -151,5 +259,56 @@ test "a flat value opened writes no C, and each word is the part it was" {
   assert_eq(opened.out, []);
   assert_eq(words.map(|w: Var| name_of(opened, w)), [b"p0_0", b"p0_1", b"p0_2"]);
   // Letting go of the first word and the record's word lets go of what the value held.
-  assert_eq(released(opened, [words.get(0), words.get(2)]), released(pr, [flat]))
+  let by_words = unwound(opened, [words.get(0), words.get(2)]);
+  let whole = unwound(pr, [flat]);
+  assert([b"p0_0", b"p0_2"].all(|n: Bytes| lets_go(by_words, n) && lets_go(whole, n)));
+  assert(!lets_go(by_words, b"p0_1") && !lets_go(whole, b"p0_1"))
+}
+
+test "failures whose releases end alike share that end, each release printed once" {
+  let a = local(0, RWord);
+  let b = local(1, RWord);
+  let c = local(2, RWord);
+  let declared = |pr: Printing, v: Var| named(pr, v).pr;
+  let pr = declared(declared(printing(Map::new().insert(0, b"p0")), b), c);
+  let first = exit_of(pr, [a, b], b"return 0;");
+  let second = exit_of(first.pr, [b, c, a], b"return 0;");
+  let third = exit_of(second.pr, [a, c], b"return 0;");
+  // The same holding takes the same path.
+  assert_eq(exit_of(third.pr, [b, a], b"return 0;").leave, first.leave);
+  assert_eq([first.leave, second.leave, third.leave], [
+    b"goto ply_u1;",
+    b"goto ply_u2;",
+    b"goto ply_u3;",
+  ]);
+  let tails = spelled(block_closed(third.pr, 0, 0, false).out);
+  assert_eq(
+    tails,
+    b"  ply_u3: ply_dec(ctx, t2); goto ply_u0;\n  ply_u2: ply_dec(ctx, t2);\n  ply_u1: ply_dec(ctx, t1);\n  ply_u0: ply_dec(ctx, p0); return 0;\n",
+  );
+  assert_eq(occurrences(tails, b"ply_dec(ctx, p0);"), 1);
+  assert_eq(occurrences(tails, b"ply_dec(ctx, t1);"), 1)
+}
+
+test "a tail stands at the end of the block its value was declared in, out of the way where the block goes on" {
+  let a = local(0, RWord);
+  let b = local(1, RWord);
+  let pr = printing(Map::new().insert(0, b"p0"));
+  let inner = named(block_opened(pr), b);
+  let x = exit_of(inner.pr, [a, b], b"goto ply_h0;");
+  assert_eq(x.leave, b"goto ply_u1;");
+  let closed = block_closed(x.pr, pr.block, 1, true);
+  assert_eq(
+    spelled(closed.out),
+    b"    if (0) {\n      ply_u1: ply_dec(ctx, t1); goto ply_u0;\n    }\n",
+  );
+  assert_eq(closed.block, pr.block);
+  // The parameter's release waits for the function's own block, which the inner one's jumps to.
+  assert_eq(
+    spelled(block_closed({ ..closed, out: [] }, 0, 0, false).out),
+    b"  ply_u0: ply_dec(ctx, p0); goto ply_h0;\n",
+  );
+  // A block no failure path released anything of ends as it was.
+  let quiet = block_opened(pr);
+  assert_eq(block_closed(quiet, 0, 1, true).out, [])
 }

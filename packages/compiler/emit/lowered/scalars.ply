@@ -1,5 +1,5 @@
 //! The scalar family's lowering read off programs: the decision each operator, literal and per-type
-//! operation takes, a corpus that lowers and checks, and its C held to today's emitter's.
+//! operation takes, and a corpus that lowers, checks and prints.
 
 import check.types (TyVar, TyCon)
 import syntax.patterns (LStr, LDec, LWide, LUnit)
@@ -7,9 +7,8 @@ import emit.answer (Exact)
 import emit.keys (Root, root_name)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RCases, Var, Arg, AVar, AInt,
                  ANum, AChar, Val, Prim, Literal, Get, Tag, Call, Native, Inst, Let, Do, If, Block,
-                 Fn, Scalars, counted)
-import emit.compare (Program, program_of, formed, checked, printed_by_form, printed_text,
-                     answered_today, today_text, normalised, past_counts)
+                 Scalars)
+import emit.compare (Program, program_of, formed, printed_by_form, not_built)
 
 /// Every value `b` binds or does, through the blocks its branches hold.
 fn values(b: Block) -> List<Val> =
@@ -162,6 +161,38 @@ test "an operator is read at the type its operands hold, a width's literal as it
   // No register holds 128 bits: the runtime's operator takes the words.
   assert_eq(applied(p, b"big"), Ok([]));
   assert_eq(natives(p, b"big"), Ok([b"rt_binary_p"]))
+}
+
+/// The codes root `name` of `p` hands `rt_binary_p`, in order, or why it was not formed.
+fn runtime_codes(p: Program, name: Bytes) -> Result<List<Int>, Bytes> / {abort.raise} =
+  match formed(p, name) {
+    Err(no) -> Err(no.why),
+    Ok(f) ->
+      Ok(
+        values(f.body).fold([], |acc: List<Int>, v: Val|
+          match v {
+            Native(n) -> if n.name != b"rt_binary_p" { acc }
+            else { match n.args.at(0) { Some(AInt(code)) -> acc.push(code), _ -> acc } },
+            _ -> acc,
+          }),
+      ),
+  }
+
+test "an operator the runtime does over two words is named by its place in the runtime's table" {
+  let p = analysed(
+    Bytes::concat_all([
+      b"fn ops(a: U128, b: U128, n: Int) -> U128 / {abort.raise} = {\n",
+      b"  let s = a + b;\n  let d = s - a;\n  let m = d * b;\n  let q = m / b;\n  let r = q % b;\n",
+      b"  let x = r & a;\n  let o = x | b;\n  let e = o ^ a;\n  let l = e << n;\n  let h = l >> n;\n",
+      b"  h >>> n\n}\n",
+      b"fn orders(a: I128, b: I128) -> Bool = {\n",
+      b"  let lt = a < b;\n  let le = a <= b;\n  let gt = a > b;\n  let ge = a >= b;\n",
+      b"  lt == le && gt == ge\n}\n",
+    ]),
+  );
+  // The runtime's `BINOPS`: `concat` at 11 lies between the orders and the bit operators.
+  assert_eq(runtime_codes(p, b"ops"), Ok([0, 1, 2, 3, 4, 12, 13, 14, 15, 16, 17]));
+  assert_eq(runtime_codes(p, b"orders"), Ok([7, 8, 9, 10]))
 }
 
 test "an Int quotient or remainder by a literal is C's own operator, and by anything else the runtime's" {
@@ -509,6 +540,20 @@ test "a stated witness is its constructor's tag, past the witnesses the runtime 
   }
 }
 
+test "a declared sum's negation is its witness's, which the runtime runs over the sum's word" {
+  let p = analysed(
+    Bytes::concat_all([
+      b"type Length = | Metres(Int) | Millimetres(Int)\n",
+      b"numeric for Length by { add: plus, sub: plus, mul: plus, neg: negated, of_int: metres }\n",
+      b"fn plus(a: Length, b: Length) -> Length = a\n",
+      b"fn negated(a: Length) -> Length = a\n",
+      b"fn metres(n: Int) -> Length = Metres(n)\n",
+      b"fn back(g: Length) -> Length = -g\n",
+    ]),
+  );
+  assert_eq(natives(p, b"back"), Ok([b"rt_negate_p"]))
+}
+
 /// The corpus as module `m` of a program.
 fn corpus_program() -> Program / {abort.raise} = analysed(corpus())
 
@@ -627,101 +672,6 @@ fn corpus_names() -> List<Bytes> =
     b"wrapped64",
   ]
 
-/// Whether `f` holds a count anywhere: a check of it waits on the ownership pass.
-fn holds_counts(f: Fn) -> Bool =
-  f.params.any(|v: Var| counted(v.rep)) || bound_in(f.body).any(|v: Var| counted(v.rep))
-
-test "the scalar corpus lowers, and every root that holds no count passes the check" {
-  let p = corpus_program();
-  assert_eq(
-    corpus_names().fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
-      match formed(p, n) {
-        Err(no) -> acc.push({ name: n, why: no.why }),
-        Ok(f) -> if holds_counts(f) { acc }
-        else { match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) } },
-      }),
-    [],
-  )
+test "the scalar corpus lowers, passes the check once its counts are placed, and prints" {
+  assert_eq(not_built(corpus_program(), corpus_names()), [])
 }
-
-test "the scalar corpus prints as today's emitter writes it, but where a decision differs on purpose" {
-  let p = corpus_program();
-  let today = answered_today(p, corpus_names());
-  // Each root whose C differs from today's by a decision, and the decision; every other root's C
-  // must equal today's.
-  let apart = [
-    {
-      name: b"quotient",
-      why: b"today's emitter computes the negated divisor it then writes as a literal",
-    },
-    { name: b"joined", why: sited() },
-    { name: b"ordered", why: ordering() },
-    { name: b"sorted", why: ordering() },
-    { name: b"wordered", why: ordering() },
-    { name: b"bordered", why: ordering() },
-    { name: b"dordered", why: ordering() },
-    { name: b"cordered", why: ordering() },
-    { name: b"bigeq", why: sited() },
-    {
-      name: b"dec",
-      why: b"a decimal literal is read into its two words, and a root of no parameter boxes it back",
-    },
-    { name: b"cards", why: b"a root's call stores its failure site first" },
-    { name: b"generic", why: sited() },
-    {
-      name: b"points",
-      why: b"fields compared in nested branches rather than into one flag, the parts named apart",
-    },
-    { name: b"hashed", why: boxed_first() },
-    {
-      name: b"checked8",
-      why: b"the `Option` is made as its payload's word, where today's makes an object and opens it",
-    },
-    { name: b"wrapped64", why: boxed_first() },
-  ];
-  let differing = corpus_names().fold(
-    [],
-    |acc: List<{ name: Bytes, form: List<List<Bytes>>, today: List<List<Bytes>> }>, n: Bytes|
-      match formed(p, n) {
-        Err(no) -> acc.push({ name: n, form: [cut(no.why)], today: [] }),
-        Ok(f) -> {
-          let form = read_c(printed_text(f));
-          let old = read_c(today_text(today, n));
-          if form == old { acc } else {
-            acc.push({
-              name: n,
-              form: form.filter(|l: Bytes| !old.contains(l)).map(cut),
-              today: old.filter(|l: Bytes| !form.contains(l)).map(cut),
-            })
-          }
-        },
-      },
-  );
-  let named = apart.map(|a: { name: Bytes, why: Bytes }| a.name);
-  assert_eq(
-    differing.filter(|d: { name: Bytes, form: List<List<Bytes>>, today: List<List<Bytes>> }|
-      !named.contains(d.name)),
-    [],
-  );
-  assert_eq(
-    differing.map(|d: { name: Bytes, form: List<List<Bytes>>, today: List<List<Bytes>> }| d.name),
-    named,
-  )
-}
-
-fn ordering() -> Bytes =
-  b"an order makes its `Ordering`'s index, no failure site before it, an object where answered"
-
-fn sited() -> Bytes = b"a runtime call that can fail stores its failure site first"
-
-fn boxed_first() -> Bytes =
-  b"the failure site is stored after the operands are made words, right before the call"
-
-/// A root's C as two printers are held to each other: past the counts each takes and lets go, then
-/// past copies and numbering.
-fn read_c(text: Bytes) -> List<Bytes> / {abort.raise} = normalised(past_counts(text))
-
-/// `l` in pieces short enough that a failed assertion shows each whole.
-fn cut(l: Bytes) -> List<Bytes> / {abort.raise} =
-  range(0, (l.len() + 29) / 30).map(|i: Int|
-    l.slice(i * 30, if i * 30 + 30 < l.len() { i * 30 + 30 } else { l.len() }))

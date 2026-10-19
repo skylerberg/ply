@@ -1,13 +1,12 @@
 //! Specialisation: definitions written at type arguments, and the needs that ask for them.
 
-import syntax.parsing (Ident, span_key)
-import emit.code (lower_to_emit)
+import syntax.parsing (Ident)
+import emit.code (lower_fn)
 import syntax.items (FnDef)
 import check.resolve.tables (qualify)
 import check.resolve.scopes (of_binder)
 import check.infer.checker (WitnessOp)
-import check.types (Type, TyVar, TyCon, TyFn, TyNominal, Scheme, type_spelled)
-import emit.typing (Typed)
+import check.types (Type, TyVar, TyCon, TyFn, TyNominal, Scheme)
 import std.list
 import syntax.exprs (Param, Expr)
 import syntax.type_syntax (TypeExpr, TVar, TCon, TFn)
@@ -16,12 +15,10 @@ import expand.rewrite (unwitnessed, witness_param)
 import emit.c (KInt, Kind)
 import emit.roots (specialised_with, specialisation_of, FnArg)
 import emit.answer (Need, Scalar, no_tables, Emitted)
-import emit.reps (Ctors, Ty, TyOpen, Def, Imported, Sig, sig_of, param_kinds, param_types,
-                  substituted, numeric_named, typed_at, carriers_of, carriers_at)
-import emit.written (operand_spelled)
-import emit.state (EffectName, EmitParam, BoundLambda)
-import emit.calls (def_named)
-import emit.entry (Emitting, params_carried, emitted_from)
+import emit.reps (Ty, TyOpen, EmitParam, BoundLambda, Sig, sig_of, param_kinds, param_types,
+                  substituted, numeric_named, typed_at, carriers_of, carriers_at, def_named)
+import emit.lower.setting (Setting, params_carried)
+import emit.entry (emitted_from)
 
 // --- Specialisation ----------------------------------------------------------------------------
 
@@ -89,15 +86,6 @@ pub fn specialisations_wanted(
 /// A definition at type arguments, running the lambdas `fns` lends in place.
 pub type Specialised = { args: List<Type>, fns: List<FnArg> }
 
-/// What a module's bodies are read under: its definitions, its imports, and the types and operands
-/// its check filed.
-pub type ModuleTables = {
-  here: List<Def>,
-  imports: List<Imported>,
-  typed: Map<Bytes, Typed>,
-  operands: Map<Bytes, Bytes>,
-}
-
 /// `e`, the body of generic `def`, noting the variables whose numeric witness it reads: a scalar
 /// argument does that arithmetic in C.
 pub fn witnessed_needs(
@@ -124,16 +112,14 @@ pub fn witnessed_needs(
 
 /// What a root of `def`, named `full`, at `args` reads its definition as: the body with each
 /// operator whose witness is a parameter held as one numeric type alone done as that type's own,
-/// the operand sites the checker filed at the definition's variables read at the types `args`
-/// give them, and the signature at `args`.
+/// and the signature at `args`.
 pub fn definition_at(
   full: Bytes,
   def: FnDef,
   args: List<Type>,
   schemes: Map<Bytes, Scheme>,
   ops: List<WitnessOp>,
-  operands: Map<Bytes, Bytes>,
-) -> { body: Expr, operands: Map<Bytes, Bytes>, sig: Option<Sig> } / {abort.raise} = {
+) -> { body: Expr, sig: Option<Sig> } / {abort.raise} = {
   let scheme = schemes.get(full);
   let numbering = match scheme { Some(sc) -> generics_numbered(def, sc), None -> Map::new() };
   // The type a witnessed parameter is at, where its argument is held as one numeric type alone.
@@ -144,22 +130,8 @@ pub fn definition_at(
     };
   let concrete = numbering.fold(Map::new(), |acc: Map<Bytes, Bool>, param: Bytes, _: Int|
     if numeric(param) == None { acc } else { acc.insert(witness_param(param), true) });
-  // An operand the checker filed at a variable of the definition is read as the type it is at.
-  let at_args = operands.fold(operands, |acc: Map<Bytes, Bytes>, k: Bytes, name: Bytes|
-    if name.index_of(b"'") == None { acc } else {
-      match type_spelled(name) {
-        Some(t) -> match operand_spelled(substituted(t, args)) {
-          Some(n) -> acc.insert(k, n),
-          None -> acc,
-        },
-        None -> acc,
-      }
-    });
   {
     body: map_expr(def.body, |e: Expr| unwitnessed(e, |w: Bytes| concrete.contains(w))),
-    operands: ops.fold(at_args, |acc: Map<Bytes, Bytes>, o: WitnessOp|
-      if o.owner != full { acc }
-      else { match numeric(o.param) { Some(n) -> acc.insert(span_key(o.span), n), None -> acc } }),
     sig: match sig_of(schemes, full) {
       Some(s) ->
         Some({
@@ -171,10 +143,10 @@ pub fn definition_at(
   }
 }
 
-/// `def` emitted at `args`: its parameters and sites read at them, and each operator whose witness
-/// is a parameter now held as one numeric type alone done as that type's own.
+/// `def` of the module `s` reads emitted at `args`: its parameters and sites read at them, and each
+/// operator whose witness is a parameter now held as one numeric type alone done as that type's own.
 pub fn specialised_emitted(
-  module: Bytes,
+  s: Setting,
   def: FnDef,
   args: List<Type>,
   fns: List<FnArg>,
@@ -182,19 +154,10 @@ pub fn specialised_emitted(
   schemes: Map<Bytes, Scheme>,
   ops: List<WitnessOp>,
   sites: Map<Bytes, List<Bytes>>,
-  here: List<Def>,
-  imports: List<Imported>,
-  ctors: Ctors,
-  emitting: Emitting,
-  effects: List<EffectName>,
-  release: Bool,
-  operands: Map<Bytes, Bytes>,
-  typed: Map<Bytes, Typed>,
 ) -> Emitted / {abort.raise} = {
-  let full = qualify(module, def.name.name);
-  let source = definition_at(full, def, args, schemes, ops, operands);
+  let full = qualify(s.module, def.name.name);
+  let source = definition_at(full, def, args, schemes, ops);
   let body = source.body;
-  let settled = source.operands;
   let sig = source.sig;
   let names = def.params.map(|param: Param| param.name.name);
   let kinds = param_kinds(def, sig).map(|k: { kind: Kind, ty: Ty }| Some(k));
@@ -206,7 +169,7 @@ pub fn specialised_emitted(
   let carried = params_carried(
     all_names,
     all_kinds,
-    match def_named(here, def.name.name) {
+    match def_named(s.here, def.name.name) {
       Some(d) -> carriers_at(d, args).params,
       None -> carriers_of(def, sig_of(schemes, full)).params,
     },
@@ -232,25 +195,15 @@ pub fn specialised_emitted(
         text: b"",
         tables: no_tables(),
         why: Some(b"a lambda this root runs in place of a call is not one its owner lowers"),
-        handles: [],
       },
     Some(ps) ->
       emitted_from(
-        module,
+        { ..s, typed: typed_at(s.typed, args) },
         def.span.start,
-        here,
-        imports,
-        ctors,
-        emitting,
-        effects,
-        release,
-        settled,
-        typed_at(typed, args),
         root,
         ps,
         true,
-        body,
-        match lower_to_emit(names, labels, sites, body, of_binder(module)) {
+        match lower_fn(names, labels, sites, body, of_binder(s.module)) {
           Some(l) -> Some(l.code),
           None -> None,
         },

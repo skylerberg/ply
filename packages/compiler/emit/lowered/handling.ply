@@ -1,9 +1,8 @@
 //! The handling family's decisions read off the form of programs' text, its parts lowered from
 //! hand-built inputs where another family's construct stands in front of them, its framing printed,
-//! and its corpus held to today's emitter.
+//! and a corpus that lowers, checks and prints.
 
-import emit.code (Code, NHandle, NBlock, NApp, NLambda, Lambda, Capture, CodeClause, CodeReturn,
-                  Borrowed)
+import emit.code (Code, NHandle, NBlock, NApp, NLambda, Lambda, Capture, CodeClause, CodeReturn)
 import syntax.parsing (Span, span_between)
 import check.resolve.tables (qualify)
 import check.types (Type, TyCon, TyRecord, fn_type, row_empty, fields_sorted)
@@ -11,14 +10,14 @@ import emit.keys (Named)
 import emit.pieces (spelled)
 import emit.tir (Rep, RInt, RWord, Var, Arg, AVar, AInt, Prim, Pack, Make, MClosure, Op, OHandle,
                  Uses, Inst, Let, Assign, Return, Handle, Fn, Rooted, Given, Owned, Handling, RFlat,
-                 Leaf, Get, Path, PLeaf, Closure, no_links)
+                 Leaf, Get, Path, PLeaf, Closure, Decl, no_links)
 import emit.tir.handling (HandleOp, Perform, Label, Parallel, Simulate)
 import emit.lower.setting (Root)
-import emit.lower.base (Context, context_of, started, emitted, opened)
+import emit.lower.base (Context, started, emitted, opened)
+import emit.lower.calling (context_of)
 import emit.lower.handling (label, clause_frame, body_frame, handled, branched, simulated)
 import emit.print (printed_fn)
-import emit.compare (Program, program_of, formed, checked, printed_by_form, answered_today,
-                     today_text, normalised, past_counts)
+import emit.compare (Program, program_of, formed, checked, printed_by_form, not_built)
 
 fn named(n: Bytes) -> Type = TyCon({ name: n, args: [] })
 
@@ -34,7 +33,7 @@ fn place() -> Span = span_between(3, 9)
 fn nowhere() -> Span = span_between(0, 0)
 
 /// The context root `m.<name>` of `p` is lowered in, and its body.
-fn rooted(p: Program, name: Bytes) -> Option<{ cx: Context, code: Code }> =
+fn rooted(p: Program, name: Bytes) -> Option<{ cx: Context, code: Code }> / {abort.raise} =
   p.roots.fold(None, |acc: Option<{ cx: Context, code: Code }>, r: Root|
     if r.full != qualify(b"m", name) { acc } else {
       match r.code {
@@ -47,7 +46,7 @@ fn rooted(p: Program, name: Bytes) -> Option<{ cx: Context, code: Code }> =
 fn handle_at(
   p: Program,
   name: Bytes,
-) -> Option<{ cx: Context, h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> } }> =
+) -> Option<{ cx: Context, h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> } }> / {abort.raise} =
   match rooted(p, name) {
     None -> None,
     Some(r) -> match handle_of(r.code) { Some(h) -> Some({ cx: r.cx, h: h }), None -> None },
@@ -217,6 +216,31 @@ fn handles() -> Bytes =
     b"fn once() -> Int = handle { asked() } with { db.query[*t](q) resume k -> k(q) }\n",
   ])
 
+test "a clause resuming in its tail joins its arms as the word it hands back, never opening what its continuation answers" {
+  // Called in the tail, the continuation answers what the runtime resumes with, no record.
+  let src = Bytes::concat_all([
+    b"effect ask {\n  read get(n: Int) -> Int\n}\n",
+    b"type R = { a: String, n: Int, m: Int }\n",
+    b"fn run(n: Int) -> R = handle { { a: \"x\", n: ask.get(n), m: 0 } } with { ask.get(q) resume k -> if q > 0 { k(q) } else { { a: \"y\", n: 0, m: 0 } } }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match formed(p, b"run") {
+      Err(no) -> assert_eq(no.why, b""),
+      Ok(f) ->
+        assert_eq(
+          match f.lambdas.at(0) {
+            Some(Closure(c)) ->
+              c.body.body.fold([], |a: List<Rep>, i: Inst|
+                match i { Decl(v) -> a.push(v.rep), _ -> a }),
+            None -> [],
+          },
+          [RWord],
+        ),
+    },
+  }
+}
+
 test "a handle runs its body in place under its clauses' frame and sets its answer as a word" {
   match program_of(handles()) {
     Err(why) -> assert_eq(why, b""),
@@ -329,7 +353,7 @@ test "a clause resuming off its tail runs the handle's body detached, copying in
       match frame_of(b"twice") {
         None -> assert(false),
         Some(f) -> {
-          assert_eq((f.params, f.captures), (0, [{ src: 0, dst: 0, own: Borrowed }]));
+          assert_eq((f.params, f.captures), (0, [{ src: 0, dst: 0 }]));
           assert(f.size >= 2)
         },
       };
@@ -680,7 +704,7 @@ test "a parallel block's answers are made its tuple in the order its fields' nam
   );
   assert(
     text.index_of(
-        b"  Word t2[] = {t1[0], t1[1], t1[10], t1[2], t1[3], t1[4], t1[5], t1[6], t1[7], t1[8], t1[9]};\n  Word t3 = rt_record_p(ctx, @@s0@@, (Word)(intptr_t)t2, 11);\n  if (ctx->failed) return 0;\n",
+        b"  Word t2[] = {t1[0], t1[1], t1[10], t1[2], t1[3], t1[4], t1[5], t1[6], t1[7], t1[8], t1[9]};\n  Word t3 = rt_record_p(ctx, @@s0@@, (Word)(intptr_t)t2, 11);\n",
       )
       != None,
   );
@@ -822,48 +846,10 @@ fn lowers() -> List<Bytes> =
     b"tried_far",
   ]
 
-test "every root of the handling corpus lowers and passes the check" {
+test "every root of the handling corpus lowers, passes the check and prints" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
-    Ok(p) ->
-      assert_eq(
-        lowers().fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
-          match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) }),
-        [],
-      ),
-  }
-}
-
-test "the handling corpus prints as today's emitter writes it, where the form decides as it does" {
-  // Apart on purpose. `note` and `sent` test for a failure after boxing their argument, as the data
-  // family's `Pack` does and today's emitter does not. `asked`, `raised`, `spawned`, `drawn` and the
-  // like open the handler's word as the type the checker filed for the perform, and box it again
-  // where it crosses as a word; today's emitter hands the word through. `relay` opens its label
-  // parameter where the perform reads it, today's emitter where the body starts. A handle declares
-  // its answer where it pushes its frame, after its clauses' closures are made, where today's
-  // declares it first; its landing is `ply_h<n>`; its clauses' closures take the operation's types,
-  // where today's take words. `ticked` and `clocked` print as today's but for the closure's
-  // function, whose temporaries the reading of a whole text takes for the root's.
-  let same = [b"told", b"pinged"];
-  match program_of(corpus()) {
-    Err(why) -> assert_eq(why, b""),
-    Ok(p) -> {
-      let today = answered_today(p, same);
-      assert_eq(
-        same.fold(
-          [],
-          |acc: List<{ name: Bytes, form: List<Bytes>, today: List<Bytes> }>, n: Bytes| {
-            let form = match printed_by_form(p, n) {
-              Ok(t) -> normalised(past_counts(t)),
-              Err(why) -> [why],
-            };
-            let old = normalised(past_counts(today_text(today, n)));
-            if form == old { acc } else { acc.push({ name: n, form: form, today: old }) }
-          },
-        ),
-        [],
-      )
-    },
+    Ok(p) -> assert_eq(not_built(p, lowers()), []),
   }
 }
 

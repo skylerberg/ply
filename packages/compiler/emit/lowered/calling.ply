@@ -2,24 +2,24 @@
 //! closures, function values, bodies run in place, steps and tail groups.
 
 import check.resolve.tables (qualify)
+import check.infer.checker (test_owner, law_root)
 import check.types (Type, TyCon, int_type)
 import emit.keys (Named, Root, Generic)
-import emit.reps (typed_at)
-import emit.state (BoundLambda)
-import emit.tir (Rep, RInt, RWord, RFlat, RCases, Var, Arg, AVar, Val, Call, Apply, Make, Get, Pack,
-                 Op, OCalling, MClosure, MCtor, PCapture, TTag, Inst, Let, Do, If, Case, Match,
-                 Loop, Next, Done, Restart, Enter, Return, Sited, Block, Fn, Member, Closure,
-                 Declined, Family, Spine, Data, Calling, Matching, Handling, Scalars, Containers)
+import emit.reps (typed_at, BoundLambda)
+import emit.typing (unknown_type)
+import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSlice, Var, Arg, AVar, AInt, Val, Call,
+                 Apply, Make, Get, Pack, Gathered, Prim, Native, Op, OCalling, MClosure, MCtor,
+                 PCapture, TTag, Inst, Let, Do, If, Case, Match, Loop, Next, Done, Restart, Enter,
+                 Return, Sited, Block, Fn, Member, Closure, Declined, Family, Spine, Data, Calling,
+                 Matching, Handling, Scalars, Containers, RNum, TInt, TRange, rep_of_arg)
 import emit.tir.calling (EntryValue, ConstantRead, Ticked)
 import emit.lower (lowered_fn, lowered_group)
-import emit.lower.base (GroupMember, context_of)
-import emit.lower.calling (known_body, lambdas_of)
+import emit.lower.base (GroupMember)
+import emit.lower.calling (known_body, lambdas_of, context_of)
 import emit.answer (GenericCall)
-import emit.verify (verified)
 import emit.own (owned)
 import emit.roots (FnArg, symbol_of, specialised_with)
-import emit.compare (Program, Hunk, program_of, answered_today, today_text, printed_text,
-                     normalised, past_counts, hunks)
+import emit.compare (Program, program_of, printed_text, unbuilt, answered_by_form)
 
 fn corpus() -> Bytes =
   Bytes::concat_all([
@@ -71,6 +71,18 @@ fn corpus() -> Bytes =
     b"fn both() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) }\n",
     b"fn ping(n: Int) -> Int / {diverges} = if n == 0 { 0 } else { pong(n - 1) }\n",
     b"fn pong(n: Int) -> Int / {diverges} = if n == 0 { let f = |x: Int| x * n; f(2) } else { ping(n - 1) }\n",
+    b"fn chooser(whole: Bool) -> (Int) -> Int = |y: Int| if whole { y } else { 0 - y }\n",
+    b"fn guarded(whole: Bool) -> (Int) -> Int = |y: Int| match y { n if whole -> n, n -> 0 - n }\n",
+    b"fn either(whole: Bool) -> (Int) -> Bool = |y: Int| whole && y > 0\n",
+    b"fn picked(whole: Bool) -> (Int) -> Int = |y: Int| match whole { true -> y, false -> 0 - y }\n",
+    b"fn walked_to(xs: List<Int>, from: Int) -> Int / {abort.raise} = iterate(from, 100, |i: Int| match xs.at(i) { Some(x) -> if x > 0 { Continue(i + 1) } else { Stop(i) }, None -> Stop(i) })\n",
+    b"fn has(xs: List<Int>, x: Int) -> Bool = match xs { [] -> false, [y, ..rest] -> if y == x { true } else { has(rest, x) } }\n",
+    b"fn pair_sums(xs: List<Int>, acc: Int) -> Int = match xs { [a, b, ..rest] -> pair_sums(rest, acc + a * b), [a] -> acc + a, [] -> acc }\n",
+    b"fn lengths(xs: List<Int>, acc: List<Int>) -> List<Int> = match xs { [] -> acc, [_, ..rest] -> lengths(rest, acc.push(rest.len())) }\n",
+    b"fn again(xs: List<Int>, n: Int, acc: Int) -> Int = match xs { [] -> if n > 0 { again([7, 8], n - 1, acc) } else { acc }, [_, ..rest] -> again(rest, n, acc + 1) }\n",
+    b"fn tail_of(xs: List<Int>, n: Int) -> List<Int> = match xs { [] -> [], [y, ..rest] -> if y == n { rest } else { tail_of(rest, n) } }\n",
+    b"fn rest_lens(xs: List<Int>, n: Int) -> List<Int> = match xs { [] -> [], [y, ..rest] -> if y == n { [0].map(|_: Int| rest.len()) } else { rest_lens(rest, n) } }\n",
+    b"fn total(xs: List<Int>) -> Int = match xs { [] -> 0, [y, ..rest] -> y + total(rest) }\n",
   ])
 
 fn names() -> List<Bytes> =
@@ -121,6 +133,18 @@ fn names() -> List<Bytes> =
     b"both",
     b"ping",
     b"pong",
+    b"chooser",
+    b"guarded",
+    b"either",
+    b"picked",
+    b"walked_to",
+    b"has",
+    b"pair_sums",
+    b"lengths",
+    b"again",
+    b"tail_of",
+    b"rest_lens",
+    b"total",
   ]
 
 /// The corpus's tail groups, each by its members' names.
@@ -348,6 +372,27 @@ test "a lambda is a closure of a function of its own taking its captures as word
   }
 }
 
+test "a closure called by its type through its last reference hands its captures over, as the runtime's call does" {
+  match form(b"adder") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      let text = printed_text(f);
+      // Counted once more, a capture a call appends to would be copied on every call.
+      assert(
+        text.index_of(b"_typed(PlyCtx *ctx, Word self") != None,
+        Some(String::of_bytes_lossy(text)),
+      );
+      assert(
+        text.index_of(
+            b"  int unique = ply_obj(self)->rc == 1;\n  Word c0 = ply_words(self)[2]; if (unique) ply_words(self)[2] = ply_unit; else ply_inc(c0);\n",
+          )
+          != None,
+        Some(String::of_bytes_lossy(text)),
+      )
+    },
+  }
+}
+
 test "a lambda a lambda writes is the root's next closure, numbered in the order they are written" {
   match form(b"nested") {
     Err(why) -> assert_eq(why, b""),
@@ -480,14 +525,12 @@ test "a step whose every arm makes its Continue or Stop goes on or leaves at onc
       assert_eq(made(f), 0)
     },
   };
-  // A `match` with a guard, as well as an `if`.
-  match form(b"count_down") {
-    Err(why) -> assert_eq(why, b""),
-    Ok(f) -> {
-      assert_eq(looped(f), 1);
-      assert_eq(made(f), 0)
-    },
-  }
+  // A `match` with a guard, as well as an `if`, and an `if` in a `match` arm.
+  [b"count_down", b"walked_to"].fold((), |_: Unit, name: Bytes|
+    match form(name) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(f) -> assert_eq([looped(f), made(f)], [1, 0]),
+    })
 }
 
 test "a step's loop prints as a C for over its state, spending its budget before each pass" {
@@ -577,12 +620,15 @@ fn specialised_form(
     },
   }
 
-/// `apply_to` at the type named `ty` as the specialisation a build lowers where the corpus's root
-/// `lender` hands it the first lambda it writes, and the lender's base; or why not.
+/// Generic root `generic` of `p` at `args` as the specialisation a build lowers where root `lender`
+/// hands its parameter `param` the first lambda it writes, typed as a build types it, with its
+/// lender's whole body; and the lender's base; or why not.
 fn lent_run(
   p: Program,
   lender: Bytes,
-  ty: Bytes,
+  generic: Bytes,
+  args: List<Type>,
+  param: Int,
 ) -> Result<{ f: Fn, base: Int }, Bytes> / {abort.raise} =
   match match root_at(p, lender) { Some(i) -> p.roots.at(i), None -> None } {
     None -> Err(b"no such lender"),
@@ -603,16 +649,15 @@ fn lent_run(
               imports: p.setting.imports,
               effects: p.setting.effects,
               typed: p.setting.typed,
-              operands: Map::new(),
               base: l.base,
               written: written,
             };
             match specialised_form(
                 p,
-                b"apply_to",
-                [TyCon({ name: ty, args: [] })],
-                [{ param: 0, owner: l.full, nth: 0 }],
-                [Some(bound)],
+                generic,
+                args,
+                [{ param: param, owner: l.full, nth: 0 }],
+                range(0, param + 1).map(|i: Int| if i == param { Some(bound) } else { None }),
               ) {
               Ok(f) -> Ok({ f: f, base: l.base }),
               Err(why) -> Err(why),
@@ -626,7 +671,13 @@ fn lent_run(
 test "another root's lambda a specialisation runs in place takes its lender's sites, and only there" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match lent_run(p, b"lends_word", b"String") {
+    Ok(p) -> match lent_run(
+        p,
+        b"lends_word",
+        b"apply_to",
+        [TyCon({ name: b"String", args: [] })],
+        0,
+      ) {
       Err(why) -> assert_eq(why, b""),
       Ok(run) -> {
         assert_eq(
@@ -652,7 +703,7 @@ test "another root's lambda a specialisation runs in place takes its lender's si
 test "a lent lambda's own lambdas are its lender's: one it binds runs in place, its closures take the lender's sites, one it hands on is lent by the lender" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match lent_run(p, b"lends_on", b"Int") {
+    Ok(p) -> match lent_run(p, b"lends_on", b"apply_to", [int_type()], 0) {
       Err(why) -> assert_eq(why, b""),
       Ok(run) -> {
         let lent = Sited(Some({ root: Named(b"m.lends_on"), base: run.base }));
@@ -670,6 +721,220 @@ test "a lent lambda's own lambdas are its lender's: one it binds runs in place, 
         ])
       },
     },
+  }
+}
+
+/// The operators root `lender`'s lambda does over `Int`s where `fold_from` at `args` runs it in place,
+/// and how many it hands the runtime as words; or why it was not formed.
+fn folded_ops(
+  p: Program,
+  lender: Bytes,
+  args: List<Type>,
+) -> Result<{ c: List<Bytes>, runtime: Int }, Bytes> / {abort.raise} =
+  match lent_run(p, lender, b"fold_from", args, 3) {
+    Err(why) -> Err(why),
+    Ok(run) -> {
+      let vals = vals_in(run.f.body);
+      Ok({
+        c: vals.fold([], |acc: List<Bytes>, v: Val|
+          match v {
+            Prim(x) -> if x.on == RInt && x.op != b"ge" { acc.push(x.op) } else { acc },
+            _ -> acc,
+          }),
+        runtime: vals.filter(|v: Val|
+          match v { Native(n) -> n.name == b"rt_binary_p", _ -> false }).len(
+        ),
+      })
+    },
+  }
+
+test "a lent lambda run where its arguments and captures arrive as a type variable's or an erased word reads them at the types it was written for" {
+  let src = Bytes::concat_all([
+    b"fn fold_from<T, A>(xs: List<T>, i: Int, acc: A, f: (A, T) -> A) -> A =\n",
+    b"  match xs.at(i) { Some(x) -> fold_from(xs, i + 1, f(acc, x), f), None -> acc }\n",
+    b"fn bits(n: Int) -> Int =\n",
+    b"  fold_from(range(1, 7), 0, 0, |found: Int, b: Int| if 1 << b == n { b } else { found })\n",
+    b"fn digits(n: Int) -> Option<Int> =\n",
+    b"  fold_from(range(0, n), 0, Some(0), |so_far: Option<Int>, d: Int|\n",
+    b"    match so_far { Some(v) -> Some(v * 10 + d), None -> None })\n",
+  ]);
+  let erased = TyCon({ name: b"Option", args: [TyCon({ name: b"_", args: [] })] });
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      assert_eq(
+        folded_ops(p, b"bits", [unknown_type(), int_type()]),
+        Ok({ c: [b"add", b"shl", b"eq"], runtime: 0 }),
+      );
+      assert_eq(
+        folded_ops(p, b"digits", [unknown_type(), erased]),
+        Ok({ c: [b"add", b"mul", b"add"], runtime: 0 }),
+      )
+    },
+  }
+}
+
+test "a fold's accumulator erased to `Option<_>`, its payload's word, is read as the `Option` of a record its lambda was written for, which is its cases" {
+  let src = Bytes::concat_all([
+    b"fn spans(n: Int) -> Option<{ at: Int, n: Int }> =\n",
+    b"  range(0, n).fold(None, |acc: Option<{ at: Int, n: Int }>, k: Int|\n",
+    b"    match acc { Some(a) -> Some({ at: a.at, n: a.n + 1 }), None -> Some({ at: k, n: 1 }) })\n",
+  ]);
+  match answered_by_form(src, [], b"std.prelude.folded_from@?,Option<_>|5=m.spans:0") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) -> assert_eq(text.index_of(b"rt_binary_p"), None),
+  }
+}
+
+test "a lent lambda's parameter is read at what its written type says, a type variable of its lender's read as a word" {
+  let src = Bytes::concat_all([
+    b"fn heaviest<a>(pairs: List<{ item: a, weight: Int }>) -> Int =\n",
+    b"  pairs.fold(0, |most: Int, p: { item: a, weight: Int }| if p.weight > most { p.weight } else { most })\n",
+  ]);
+  match answered_by_form(src, [], b"std.prelude.folded_from@?,Int|5=m.heaviest:0") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) -> assert_eq(text.index_of(b"rt_binary_p"), None),
+  }
+}
+
+test "a closure a root writes calls a lambda the root was lent through its closure, as a function value" {
+  let src = Bytes::concat_all([
+    b"fn twice_each<T>(xs: List<T>, f: (T) -> T) -> List<T> = xs.map(|x: T| f(f(x)))\n",
+    b"fn bumped(xs: List<Int>) -> List<Int> = twice_each(xs, |n: Int| n + 1)\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match lent_run(p, b"bumped", b"twice_each", [int_type()], 1) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(run) ->
+        assert_eq(
+          range(0, run.f.lambdas.len()).map(|k: Int|
+            match closure_of(run.f, k) {
+              Some(c) ->
+                vals_in(c.body.body).filter(|v: Val| match v { Apply(_) -> true, _ -> false }).len(
+                ),
+              None -> 0,
+            }),
+          [2],
+        ),
+    },
+  }
+}
+
+/// How a value a branch or a number's `Case` tests is held: `branch` where an `If` tests it.
+type Tested = { held: Rep, branch: Bool }
+
+/// What each branch and each number's `Case` of `b` tests, its branches', cases', arms' and loops'
+/// too, in order.
+fn tested_in(b: Block) -> List<Tested> =
+  b.fold([], |acc: List<Tested>, i: Inst|
+    match i {
+      If(x) ->
+        acc.push({ held: rep_of_arg(x.cond), branch: true }).concat(tested_in(x.then)).concat(
+          tested_in(x.otherwise),
+        ),
+      Case(c) -> {
+        let here = match c.test {
+          TInt(_) -> acc.push({ held: c.on.rep, branch: false }),
+          TRange(_) -> acc.push({ held: c.on.rep, branch: false }),
+          _ -> acc,
+        };
+        c.arms.fold(here, |a: List<Tested>, arm: { when: Int, body: Block }|
+          a.concat(tested_in(arm.body))).concat(
+          tested_in(c.rest),
+        )
+      },
+      Match(m) ->
+        m.arms.fold(acc, |a: List<Tested>, arm: Block| a.concat(tested_in(arm))).concat(
+          tested_in(m.rest),
+        ),
+      Loop(l) -> acc.concat(tested_in(l.body)),
+      _ -> acc,
+    })
+
+/// Whether a test reads its value as it is not held: a branch a non-`Bool`, a number's test a word.
+fn misheld(t: Tested) -> Bool =
+  if t.branch { t.held != RBool }
+  else { match t.held { RInt -> false, RBool -> false, RNum(_) -> false, _ -> true } }
+
+test "a closure testing a Bool it captured tests the Bool, never the word its capture is" {
+  [b"chooser", b"guarded", b"either", b"picked"].fold((), |_: Unit, name: Bytes|
+    match form(name) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(f) -> match closure_of(f, 0) {
+        None -> assert_eq(name, b""),
+        Some(c) -> {
+          let tests = tested_in(c.body.body);
+          assert(tests.len() > 0);
+          assert_eq(tests.filter(misheld), [])
+        },
+      },
+    })
+}
+
+/// `std.cases` as far as a test over cases, once expanded, calls it.
+fn cases_module() -> { name: Bytes, src: Bytes } =
+  {
+    name: b"std.cases",
+    src: Bytes::concat_all([
+      b"pub type Table<a> = List<a>\n",
+      b"pub type Listed = { label: String, identity: Bytes }\n",
+      b"pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / {abort.raise | e} =\n",
+      b"  table.map(|c: a| { label: label(c), identity: b\"\" })\n",
+      b"pub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a / {abort.raise} =\n",
+      b"  match table.at(at) { Some(c) -> c, None -> panic(\"no case\") }\n",
+    ]),
+  }
+
+/// Whether a build writes root `root` of module `m` of text `src`, which imports `shipped`, or why
+/// not.
+fn formed_root(
+  src: Bytes,
+  shipped: List<{ name: Bytes, src: Bytes }>,
+  root: Bytes,
+) -> Result<Bool, Bytes> / {abort.raise} =
+  match answered_by_form(src, shipped, root) { Err(why) -> Err(why), Ok(_) -> Ok(true) }
+
+test "a test over cases reads its case at the case's type, which its generic callees' sites agree on" {
+  let src = Bytes::concat_all([
+    b"type Fixture = { name: String, unified: String }\n",
+    b"fn fixtures() -> List<Fixture> = [{ name: \"a\", unified: \"\" }]\n",
+    b"test \"each case's text is empty\" for f: Fixture in fixtures() { assert(f.unified == \"\") }\n",
+  ]);
+  assert_eq(
+    formed_root(src, [cases_module()], test_owner(b"m", b"each case's text is empty")),
+    Ok(true),
+  )
+}
+
+test "a law's binders are its roots' parameters at the types the checker gave them" {
+  let src = Bytes::concat_all([
+    b"type Few = | Zero | One | Two\n",
+    b"law \"two that differ differ\"\n  forall (a: Few, b: Few) where a != b {\n    a != b\n  }\n",
+  ]);
+  let root = |part: Bytes| law_root(b"m", b"two that differ differ", part);
+  assert_eq([root(b"guard"), root(b"body")].map(|r: Bytes| formed_root(src, [], r)), [
+    Ok(true),
+    Ok(true),
+  ]);
+  // A binder of a type variable compares as a value of that variable does.
+  let poly = b"fn pair<a>(x: a) -> a = x\nlaw \"identity is identity\"\n  forall (x: a) {\n    pair(x) == x\n  }\n";
+  assert_eq(formed_root(poly, [], law_root(b"m", b"identity is identity", b"body")), Ok(true));
+  // Its sites the first a program files, as where it is all the program writes.
+  let alone = b"law \"a value is itself\"\n  forall (x: a, y: b) {\n    x == x && y == y\n  }\n";
+  let itself = law_root(b"m", b"a value is itself", b"body");
+  assert_eq(formed_root(alone, [], itself), Ok(true));
+  // And as the program's setting offers it.
+  match program_of(alone) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      assert_eq(
+        match lowered_as_built(p, itself.slice(2, itself.len())) {
+          Ok(_) -> b"",
+          Err(no) -> no.why,
+        },
+        b"",
+      ),
   }
 }
 
@@ -709,6 +974,9 @@ fn insts_in(b: Block) -> List<Inst> =
           acc.push(i).concat(insts_in(c.rest)),
           |a: List<Inst>, arm: { when: Int, body: Block }| a.concat(insts_in(arm.body)),
         ),
+      Match(m) ->
+        m.arms.fold(acc.push(i).concat(insts_in(m.rest)), |a: List<Inst>, arm: Block|
+          a.concat(insts_in(arm))),
       _ -> acc.push(i),
     })
 
@@ -801,6 +1069,68 @@ test "a specialisation, keyed by the name that spells it, restarts its own tail 
         );
         assert_eq(vals_in(f.body).filter(|v: Val| match v { Call(_) -> true, _ -> false }).len(), 0)
       },
+    },
+  }
+}
+
+/// The lists `b` makes of a rest it reads: the runtime's copies of a list's rest, and views made
+/// lists.
+fn rests_made(b: Block) -> Int =
+  vals_in(b).filter(|v: Val|
+    match v {
+      Native(n) -> n.name == b"rt_list_rest_p",
+      Pack(k) -> rep_of_arg(k.arg) == RSlice,
+      _ -> false,
+    }).len(
+  )
+
+test "a list a root walks down by restarting on its rest is a view of the list it was handed, which no step copies" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let walked = |name: Bytes|
+        match lowered_as_built(p, name) {
+          Err(no) -> Err(no.why),
+          Ok(f) ->
+            Ok({
+              held: f.params.map(|v: Var| v.rep).take(1),
+              taken: f.conv.reps.take(1),
+              restarts: insts_in(f.body).any(|i: Inst| match i { Restart(_) -> true, _ -> false }),
+              rests: rests_made(f.body),
+            }),
+        };
+      let viewed = |rests: Int|
+        Ok({ held: [RSlice], taken: [RWord], restarts: true, rests: rests });
+      // A rest read whole is made a list where it is read, and only there.
+      assert_eq([b"has", b"pair_sums", b"lengths", b"again", b"tail_of"].map(walked), [
+        viewed(0),
+        viewed(0),
+        viewed(1),
+        viewed(0),
+        viewed(1),
+      ]);
+      assert_eq(
+        match walked(b"rest_lens") { Ok(w) -> Ok(w.held), Err(why) -> Err(why) },
+        Ok([RSlice]),
+      );
+      // A walk that calls itself other than in tail position takes the list as it is.
+      assert_eq(walked(b"total"), Ok({ held: [RWord], taken: [RWord], restarts: false, rests: 1 }));
+      match lowered_as_built(p, b"again") {
+        Err(no) -> assert_eq(no.why, b""),
+        Ok(f) ->
+          assert(
+            vals_in(f.body).any(|v: Val|
+              match v { Gathered(g) -> g.parts.at(1) == Some(AInt(0)), _ -> false }),
+          ),
+      };
+      match lowered_as_built(p, b"has") {
+        Err(no) -> assert_eq(no.why, b""),
+        Ok(f) ->
+          assert(
+            printed_text(owned(f)).index_of(b"  Word p0_0 = p0; int64_t p0_1 = 0;\n  ply_loop: ")
+              != None,
+          ),
+      }
     },
   }
 }
@@ -996,121 +1326,14 @@ test "every function the calling corpus prints sets only names it declares" {
   }
 }
 
-/// Every run of lines two readings of one root's C differ in, spelled for a failure's message.
-fn differences(today: Bytes, form: Bytes) -> Bytes / {abort.raise} =
-  Bytes::concat_all(
-    hunks(normalised(past_counts(today)), normalised(past_counts(form))).map(|h: Hunk|
-      Bytes::concat_all([
-        Bytes::concat_all(h.today.map(|l: Bytes| Bytes::concat_all([b"\n  - ", l]))),
-        Bytes::concat_all(h.form.map(|l: Bytes| Bytes::concat_all([b"\n  + ", l]))),
-        b"\n  ..",
-      ])),
-  )
-
-test "the corpus's C reads as today's emitter's, but for the roots named with why" {
-  match program_of(corpus()) {
-    Err(why) -> assert_eq(why, b""),
-    Ok(p) -> {
-      let today = answered_today(p, names());
-      let compared = names().filter(|n: Bytes| !groups().any(|g: List<Bytes>| g.contains(n))).fold(
-        [],
-        |acc: List<{ name: Bytes, at: Bytes }>, n: Bytes|
-          match lowered_as_built(p, n) {
-            Err(_) -> acc,
-            Ok(f) -> {
-              let at = differences(today_text(today, n), printed_text(owned(f)));
-              if at == b"" { acc } else { acc.push({ name: n, at: at }) }
-            },
-          },
-      );
-      let differing = groups().fold(
-        compared,
-        |acc: List<{ name: Bytes, at: Bytes }>, g: List<Bytes>| {
-          let first = match g.at(0) { Some(n) -> n, None -> b"" };
-          let at = match group_form(g) {
-            Ok(f) -> differences(today_text(today, first), printed_text(owned(f))),
-            Err(why) -> why,
-          };
-          if at == b"" { acc } else { acc.push({ name: first, at: at }) }
-        },
-      );
-      // Each root that differs on purpose, and why.
-      let opened = b"a captured `Int` is opened into a local of its own before it is added, where today's emitter opens it inside the addition";
-      let released = b"a failure path releases what the path holds, where today's emitter leaves without";
-      let parts = b"a record a call answers comes back into its parts' locals, where today's emitter holds its word in a local declared first";
-      let budget = b"the step is the form's `Loop`: its budget a state variable counted down by a checked subtraction, where today's emitter counts the budget parameter down in place";
-      let resumed = b"a clause binding a continuation answers the word the continuation hands back, where today's emitter opens it as the clause's type";
-      let opened_parts = b"a member's record or sum is opened into its parts where its arm starts and made a word again where it is answered or handed on, and its wrapper opens the answer into locals before writing them through its pointers, where today's emitter keeps the word and writes through the pointers as it opens it";
-      let expected = [
-        { name: b"adder", why: opened },
-        { name: b"nested", why: opened },
-        // And: the body run in place prints at its caller's depth, where today's indents it.
-        { name: b"local", why: released },
-        { name: b"lends", why: released },
-        { name: b"steps", why: budget },
-        { name: b"count_down", why: budget },
-        // And: the `Iter` the step answers is tested by its tag and its argument read and opened.
-        { name: b"stepped", why: budget },
-        { name: b"lends_word", why: released },
-        {
-          name: b"pair_summer",
-          why: b"a closure's entry loads a record parameter's fields on one line and its word into a local of its own",
-        },
-        { name: b"applied_pair", why: parts },
-        // And: its captured `Int`s are opened as in `adder`.
-        { name: b"lends_on", why: released },
-        // And: the pass is not fused, so the `Iter` it answers is tested once the pass has run.
-        { name: b"raised_step", why: budget },
-        // And: the state is a record held as its parts.
-        { name: b"paired_step", why: budget },
-        {
-          name: b"walk1",
-          why: b"a record parameter is set value by value on a restart, its word among them, where today's emitter holds the word in a local",
-        },
-        { name: b"go", why: released },
-        { name: b"tailed", why: resumed },
-        { name: b"gauged", why: resumed },
-        { name: b"both", why: resumed },
-        // And: the rest of the switch returns through `ctx->fuel += 1;`.
-        {
-          name: b"even",
-          why: b"a member's answer is made its word in its return, where today's emitter binds it first",
-        },
-        // And: each member's entry opens a record or a sum parameter on one line, as in `pair_summer`.
-        { name: b"walk", why: opened_parts },
-        { name: b"seek", why: opened_parts },
-        {
-          name: b"ping",
-          why: b"a closure a later member writes is the group's, named and numbered among its closures and naming the member's sites by its id, where today's emitter names and numbers it as the member's",
-        },
-      ];
-      assert(
-        differing.map(|d: { name: Bytes, at: Bytes }| d.name)
-          == expected.map(|e: { name: Bytes, why: Bytes }| e.name),
-        Some(
-          String::of_bytes(
-            Bytes::concat_all(
-              differing.map(|d: { name: Bytes, at: Bytes }|
-                Bytes::concat_all([b"=== ", d.name, b" ", d.at])),
-            ),
-          ),
-        ),
-      )
-    },
-  }
-}
-
-test "every root and tail group of the calling corpus lowers and keeps the form's rules, or another family declines a root" {
+test "every root and tail group of the calling corpus lowers, keeps the form's rules and prints, or another family declines a root" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
       let failed = names().fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
         match lowered_as_built(p, n) {
           Err(no) -> if no.by != Calling { acc } else { acc.push({ name: n, why: no.why }) },
-          Ok(f) -> match verified(owned(f)) {
-            Some(why) -> acc.push({ name: n, why: why }),
-            None -> acc,
-          },
+          Ok(f) -> match unbuilt(f) { Some(why) -> acc.push({ name: n, why: why }), None -> acc },
         });
       let grouped = groups().fold(
         failed,
@@ -1118,7 +1341,7 @@ test "every root and tail group of the calling corpus lowers and keeps the form'
           let first = match g.at(0) { Some(n) -> n, None -> b"" };
           match group_form(g) {
             Err(why) -> acc.push({ name: first, why: why }),
-            Ok(f) -> match verified(owned(f)) {
+            Ok(f) -> match unbuilt(f) {
               Some(why) -> acc.push({ name: first, why: why }),
               None -> acc,
             },
@@ -1126,54 +1349,6 @@ test "every root and tail group of the calling corpus lowers and keeps the form'
         },
       );
       assert_eq(grouped, [])
-    },
-  }
-}
-
-/// The closures' functions of root `symbol`'s C `text`, each but for its body and its stack probe,
-/// which the form writes otherwise: its declaration, head and step checks, its entries and its
-/// descriptor.
-fn closures_framed(text: Bytes, symbol: Bytes) -> List<Bytes> / {abort.raise} = {
-  let lines = text.split(b"\n");
-  let first = Bytes::concat_all([b"Word ", symbol, b"_lambda"]);
-  match range(0, lines.len()).fold(None, |acc: Option<Int>, i: Int|
-      match acc {
-        Some(_) -> acc,
-        None -> if lines.get(i).starts_with(first) { Some(i) } else { None },
-      }) {
-    None -> [],
-    Some(s) ->
-      lines.drop(s).fold(
-        { inside: false, out: [] },
-        |acc: { inside: Bool, out: List<Bytes> }, l: Bytes|
-          if l == b"  ctx->fuel -= 1;" { { inside: true, out: acc.out.push(l) } }
-          else if l == b"}" { { inside: false, out: acc.out.push(l) } }
-          else if acc.inside || l.starts_with(b"  { char probe;") { acc }
-          else { { ..acc, out: acc.out.push(l) } },
-      ).out,
-  }
-}
-
-test "a closure's function, its entries and its descriptor print as today's emitter writes them" {
-  match program_of(corpus()) {
-    Err(why) -> assert_eq(why, b""),
-    Ok(p) -> {
-      let roots = [b"adder", b"doubler", b"nested", b"counter", b"local", b"lends"];
-      let today = answered_today(p, roots);
-      let differing = roots.fold(
-        [],
-        |acc: List<{ name: Bytes, today: List<Bytes>, form: List<Bytes> }>, n: Bytes| {
-          let symbol = symbol_of(qualify(b"m", n));
-          let old = closures_framed(today_text(today, n), symbol);
-          let form = match lowered_as_built(p, n) {
-            Ok(f) -> closures_framed(printed_text(f), symbol),
-            Err(no) -> [no.why],
-          };
-          if old.len() > 0 && form == old { acc }
-          else { acc.push({ name: n, today: old, form: form }) }
-        },
-      );
-      assert_eq(differing, [])
     },
   }
 }

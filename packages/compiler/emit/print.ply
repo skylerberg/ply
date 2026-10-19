@@ -10,21 +10,21 @@ import check.types (TyCon)
 import std.bytes (ascii_of_int)
 import emit.c (tick_line)
 import emit.roots (symbol_of, root_id)
-import emit.keys (Named, root_name)
+import emit.keys (Named, Root, root_name)
 import emit.pieces (Piece, Text, Hole, TagOf, InGroup, LentBy, merged, spelled)
-import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, Var, Arg, AVar, AInt, ABool, AZero, Val,
-                 Prim, Literal, Static, Make, TInt, Get, Take, Tag, Path, PField, PArg, PCapture,
-                 Pack, Gathered, Call, Apply, Native, Op, OHandle, OContainer, OCalling, MClosure,
-                 MList, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next, Done,
-                 Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec, Reset, Free, Opened,
-                 Block, Fn, Member, Rooted, Given, Owned, Lambda, Closure, Uses, NoArm, Spine,
-                 no_links, falls_through, var_said)
-import emit.print.text (Under, Place, Printing, Printed, printing, line, text, pieces, pad, named,
-                        name_of, arg_text, assigned, label, check, zero, failing_return, site, slot,
-                        part_names, unprinted)
-import emit.print.counts (released, count_printed)
+import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSlice, Var, Arg, AVar, AInt, ABool, AZero,
+                 Val, Prim, Literal, Static, Make, TInt, Get, Take, Tag, Path, PField, PArg,
+                 PCapture, Pack, Gathered, Call, Apply, Native, Op, OHandle, OContainer, OCalling,
+                 MClosure, MList, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next,
+                 Done, Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec, Reset, Free,
+                 Opened, Block, Fn, Member, Rooted, Given, Owned, Lambda, Closure, Uses, NoArm,
+                 Spine, no_links, falls_through, var_said)
+import emit.print.text (Under, Place, Printing, Printed, printing, function_body, line, text,
+                        pieces, pad, named, name_of, arg_text, assigned, label, check, zero,
+                        failing_return, site, slot, part_names, part_name, unprinted)
+import emit.print.counts (exit_of, block_opened, block_closed, count_printed)
 import emit.print.made (c_type, c_types, as_word, word_as, word_parts, made, got, packed, gathered,
-                        statics, declared, set_parts, returned, head_types, head_params,
+                        statics, join_declared, set_parts, returned, head_types, head_params,
                         entry_opened, entry_outs, entry_answered)
 import emit.print.fuel (fuel_head)
 import emit.print.prims (literal, prim)
@@ -143,7 +143,9 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
               group: Some({ at: a.when, members: f.members, width: width }),
             };
             let opened = range(0, m.params.len()).fold(
-              line(pr, 0, Bytes::concat_all([b"case ", ascii_of_int(a.when), b": {"])),
+              block_opened(
+                line(pr, 0, Bytes::concat_all([b"case ", ascii_of_int(a.when), b": {"])),
+              ),
               |q: Printing, j: Int| {
                 let v = m.params.get(j);
                 let word = b"p".concat(ascii_of_int(j));
@@ -155,10 +157,19 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
                 }
               },
             );
-            line(printed(armed, opened, a.body, 1), 0, b"}")
+            line(
+              block_closed(printed(armed, opened, a.body, 1), pr.block, 1, falls_through(a.body)),
+              0,
+              b"}",
+            )
           },
         });
-      printed(u, line(arms, 0, b"}"), c.rest, 0)
+      block_closed(
+        printed(u, line(arms, 0, b"}"), c.rest, 0),
+        start.block,
+        0,
+        falls_through(c.rest),
+      )
     },
     body ->
       unprinted(
@@ -232,22 +243,13 @@ fn param_names(f: Fn) -> Map<Int, Bytes> / {abort.raise} =
     m.insert(f.params.get(i).id, b"p".concat(ascii_of_int(i))))
 
 /// Closure body `nth` of the root named `symbol`, `l`, printed after what `pr` holds: the body of a C
-/// function of its own, so its temporaries and labels are numbered afresh, but the root's tables go
+/// function of its own, so its temporaries, labels and tails are its own, but the root's tables go
 /// on.
 fn closure_printed(symbol: Bytes, nth: Int, l: Lambda, pr: Printing) -> Printing / {abort.raise} =
-  match l {
-    Closure(c) ->
-      body_printed(symbol, c.body, {
-        ..pr,
-        out: [],
-        names: lambda_names(l, nth),
-        temps: 0,
-        labels: 0,
-      }),
-  }
+  match l { Closure(c) -> body_printed(symbol, c.body, function_body(pr, lambda_names(l, nth))) }
 
 /// `f`'s body, a body of the root named `symbol`, its restart label first where a self call
-/// restarts it.
+/// restarts it, and the tails of what it declares at its end.
 fn body_printed(symbol: Bytes, f: Fn, pr: Printing) -> Printing / {abort.raise} = {
   let u = {
     symbol: symbol,
@@ -259,11 +261,39 @@ fn body_printed(symbol: Bytes, f: Fn, pr: Printing) -> Printing / {abort.raise} 
     landing: None,
     group: None,
   };
+  let viewed = views_opened(f, pr);
   let looped = if restarts(f.body) {
-    text(pr, Bytes::concat_all([b"  ply_loop: ", tick_line(failing_return(f.conv.answer)), b"\n"]))
-  } else { pr };
-  printed(u, looped, f.body, 0)
+    text(
+      viewed,
+      Bytes::concat_all([b"  ply_loop: ", tick_line(failing_return(f.conv.answer)), b"\n"]),
+    )
+  } else { viewed };
+  block_closed(printed(u, looped, f.body, 0), pr.block, 0, falls_through(f.body))
 }
+
+/// Each parameter `f` holds as a view of the list whose word it takes, viewing the list from its
+/// first item.
+fn views_opened(f: Fn, pr: Printing) -> Printing =
+  range(0, f.params.len()).fold(pr, |q: Printing, i: Int|
+    match f.params.at(i) {
+      Some(v) -> if v.rep != RSlice || f.conv.reps.at(i) != Some(RWord) { q } else {
+        let word = name_of(q, v);
+        line(
+          q,
+          0,
+          Bytes::concat_all([
+            b"Word ",
+            part_name(word, 0),
+            b" = ",
+            word,
+            b"; int64_t ",
+            part_name(word, 1),
+            b" = 0;",
+          ]),
+        )
+      },
+      None -> q,
+    })
 
 /// Whether a self call restarts the body anywhere in `b`.
 fn restarts(b: Block) -> Bool =
@@ -283,12 +313,26 @@ fn restarts(b: Block) -> Bool =
         _ -> false,
       }))
 
-/// The C a failure runs where the path holds `unwind`: their releases, then the enclosing handle's
-/// landing, or else leaving the function.
-fn leave_of(u: Under, pr: Printing, unwind: List<Var>) -> Bytes = {
-  let releases = released(pr, unwind);
-  let out = match u.landing { Some(j) -> j, None -> failing_return(u.answer) };
-  if releases == b"" { out } else { Bytes::concat_all([b"{ ", releases, b" ", out, b" }"]) }
+/// Where a failure goes once it has released what it holds: the enclosing handle's landing, or else
+/// out of the function.
+fn root_of(u: Under) -> Bytes = match u.landing { Some(j) -> j, None -> failing_return(u.answer) }
+
+/// `val` printed into `into` at `p`, a failure in it releasing `unwind` on its way out. The tails it
+/// adds are kept only where the C it prints has a failure test, which goes by them.
+fn exiting(
+  p: Place,
+  pr: Printing,
+  unwind: List<Var>,
+  into: Option<Var>,
+  val: Val,
+) -> Printing / {abort.raise} = {
+  let x = exit_of(pr, unwind, root_of(p.u));
+  let after = value_printed({ ..p, leave: x.leave }, x.pr, into, val);
+  if x.pr.tails.all.len() == pr.tails.all.len()
+      || range(pr.out.len(), after.out.len()).any(|i: Int|
+        match after.out.at(i) { Some(Text(t)) -> t.index_of(x.leave) != None, _ -> false }) {
+    after
+  } else { { ..after, tails: pr.tails } }
 }
 
 /// A block printed so far: what is printed, what its next instruction is printed under, and what
@@ -307,28 +351,23 @@ fn resited(s: Sites, lent: Option<Lender>) -> Sites =
     },
   }
 
-/// The one recursion over a body: each instruction printed in turn, a block it holds within it.
+/// The one recursion over a body: each instruction printed in turn, a block it holds within it. A
+/// block C writes as a block of its own is opened as one and closed by the tails of what it declares.
 fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort.raise} =
   b.fold({ pr: pr, u: home, outer: [] }, |sites: Sites, i: Inst| {
     let u = sites.u;
     let acc = sites.pr;
-    let p = { u: u, at: span_between(0, 0), leave: leave_of(u, acc, []), depth: depth };
+    let p = { u: u, at: span_between(0, 0), leave: root_of(u), depth: depth };
+    let inner = depth + 1;
     match i {
       Sited(lent) -> resited(sites, lent),
       _ ->
         {
           ..sites,
           pr: match i {
-            Let(l) ->
-              value_printed(
-                { ..p, at: l.at, leave: leave_of(u, acc, l.unwind) },
-                acc,
-                Some(l.var),
-                l.val,
-              ),
-            Do(d) ->
-              value_printed({ ..p, at: d.at, leave: leave_of(u, acc, d.unwind) }, acc, None, d.val),
-            Decl(v) -> declared(acc, depth, v),
+            Let(l) -> exiting({ ..p, at: l.at }, acc, l.unwind, Some(l.var), l.val),
+            Do(d) -> exiting({ ..p, at: d.at }, acc, d.unwind, None, d.val),
+            Decl(v) -> join_declared(acc, depth, v),
             Assign(s) -> set_parts(acc, depth, s.var, s.arg),
             If(x) -> {
               let opened = line(
@@ -336,8 +375,18 @@ fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort
                 depth,
                 Bytes::concat_all([b"if (", arg_text(acc, x.cond), b") {"]),
               );
-              let t = printed(u, opened, x.then, depth + 1);
-              let e = printed(u, line(t, depth, b"} else {"), x.otherwise, depth + 1);
+              let t = block_closed(
+                printed(u, block_opened(opened), x.then, inner),
+                acc.block,
+                inner,
+                falls_through(x.then),
+              );
+              let e = block_closed(
+                printed(u, block_opened(line(t, depth, b"} else {")), x.otherwise, inner),
+                acc.block,
+                inner,
+                falls_through(x.otherwise),
+              );
               line(e, depth, b"}")
             },
             Case(c) -> {
@@ -346,10 +395,23 @@ fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort
                 |q: Printing, a: { when: Int, body: Block }|
                   case_arm_closed(
                     p,
-                    printed(u, case_arm(p, q, c.on, c.test, a.when), a.body, depth + 1),
+                    block_closed(
+                      printed(u, block_opened(case_arm(p, q, c.on, c.test, a.when)), a.body, inner),
+                      acc.block,
+                      inner,
+                      falls_through(a.body),
+                    ),
                   ),
               );
-              case_closed(p, printed(u, case_rest(p, arms, c.on, c.test), c.rest, depth + 1))
+              case_closed(
+                p,
+                block_closed(
+                  printed(u, block_opened(case_rest(p, arms, c.on, c.test)), c.rest, inner),
+                  acc.block,
+                  inner,
+                  falls_through(c.rest),
+                ),
+              )
             },
             Match(m) -> {
               let l = label(acc);
@@ -388,11 +450,16 @@ fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort
               };
               loop_closed(
                 p,
-                printed(
-                  looped,
-                  loop_opened(p, l.pr, l.n, lp.state, lp.init, lp.answer),
-                  lp.body,
-                  depth + 1,
+                block_closed(
+                  printed(
+                    looped,
+                    block_opened(loop_opened(p, l.pr, l.n, lp.state, lp.init, lp.answer)),
+                    lp.body,
+                    inner,
+                  ),
+                  acc.block,
+                  inner,
+                  falls_through(lp.body),
                 ),
                 l.n,
                 lp.answer,
@@ -427,16 +494,20 @@ fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort
             // A failure in the body goes to the landing, which leaves by `hp.leave` where no clause answers.
             Handle(h) -> {
               let l = label(acc);
-              let hp = { ..p, leave: leave_of(u, acc, h.unwind) };
+              let x = exit_of(l.pr, h.unwind, root_of(u));
+              let hp = { ..p, leave: x.leave };
               let inside = { ..u, landing: Some(landing_jump(l.n)) };
+              let opened = handle_opened(hp, x.pr, l.n, h.args, h.uses, h.site, h.answer);
               handle_closed(
                 hp,
-                printed(
-                  inside,
-                  handle_opened(hp, l.pr, l.n, h.args, h.uses, h.site, h.answer),
-                  h.body,
-                  depth + 1,
-                ),
+                if h.site.detached != None { printed(inside, opened, h.body, inner) } else {
+                  block_closed(
+                    printed(inside, block_opened(opened), h.body, inner),
+                    acc.block,
+                    inner,
+                    falls_through(h.body),
+                  )
+                },
                 l.n,
                 h.site,
                 h.answer,
@@ -484,7 +555,8 @@ fn value_printed(p: Place, pr: Printing, into: Option<Var>, val: Val) -> Printin
 
 /// The field held as one word at `t.path`'s offset in the block `t.of`, read with a count of its own:
 /// moved out of its slot, which is emptied, where the block is held only here, and counted once more
-/// where it is shared.
+/// where it is shared. A block held in place in another is held only here where the object counting
+/// for it is: its own header holds no count.
 fn taken(
   p: Place,
   pr: Printing,
@@ -507,9 +579,9 @@ fn taken(
           ),
           p.depth,
           Bytes::concat_all([
-            b"if (ply_obj(",
+            b"if (ply_counted_by(ply_obj(",
             block,
-            b")->rc == 1) ",
+            b"))->rc == 1) ",
             field,
             b" = ply_unit; else ply_inc(",
             n.name,
@@ -649,7 +721,7 @@ test "a restart takes its arguments into temporaries before it sets the paramete
       b"  ctx->fuel -= 1;",
       b"  ply_loop: if (++ctx->ticks >= ctx->next_tick) { rt_tick_p(ctx); if (ctx->failed) return 0; }",
       b"  int64_t t1 = (p0) == (INT64_C(0));",
-      b"  int64_t t2 = 0;",
+      b"  int64_t t2;",
       b"  if (t1) {",
       b"    t2 = p1;",
       b"  } else {",
@@ -839,10 +911,7 @@ test "a closure's function follows its root's entry, and its body numbers its te
   let f = { ..body, lambdas: [l] };
   let name = symbol_of(b"m.outer");
   let inner = closure_printed(name, 0, l, { ..printing(Map::new()), temps: 7, labels: 3 });
-  assert_eq(
-    spelled(inner.out),
-    b"  int64_t t1 = 0;\n  t1 = p0;\n  ctx->fuel += 1;\n  return t1;\n",
-  );
+  assert_eq(spelled(inner.out), b"  int64_t t1;\n  t1 = p0;\n  ctx->fuel += 1;\n  return t1;\n");
   let printed = printed_fn(f);
   assert(
     spelled(printed.pieces).ends_with(
@@ -926,7 +995,7 @@ test "a lent run's failure sites name its lender and count from its text, until 
   ])
 }
 
-test "a field taken moves out of a block held only here and is counted once more out of a shared one" {
+test "a field taken moves out of a block held only here, in place in another or not, and is counted once more out of a shared one" {
   let block = { id: 0, ty: TyCon({ name: b"m.Buf", args: [] }), rep: RWord };
   let field = word_var(1);
   let f = {
@@ -937,7 +1006,7 @@ test "a field taken moves out of a block held only here and is counted once more
   assert_eq(
     holds_run(lines, [
       b"  Word t1 = ply_words(p0)[1];",
-      b"  if (ply_obj(p0)->rc == 1) ply_words(p0)[1] = ply_unit; else ply_inc(t1);",
+      b"  if (ply_counted_by(ply_obj(p0))->rc == 1) ply_words(p0)[1] = ply_unit; else ply_inc(t1);",
     ]),
     true,
   )
@@ -953,4 +1022,153 @@ test "a constructor's tag is a hole the unit writes in" {
   );
   assert(pr.pieces.contains(Hole(TagOf(b"m.Box"))));
   assert(spelled(pr.pieces).index_of(b"  int64_t t1 = @@Tm.Box@@;\n") != None)
+}
+
+/// A call of `m.g` giving it `args`, answering a word.
+fn called(args: List<Arg>) -> Val =
+  Call({
+    callee: Root(Named(b"m.g")),
+    args: args,
+    conv: {
+      params: args.map(|_: Arg| Given),
+      reps: args.map(|_: Arg| RWord),
+      answer: RWord,
+      answered: Owned,
+    },
+    stops: false,
+  })
+
+/// `v` bound to `val`, whose failure releases `unwind`.
+fn holding(v: Var, val: Val, unwind: List<Var>) -> Inst =
+  Let({ var: v, val: val, at: span_between(0, 0), unwind: unwind })
+
+/// The C of a root taking `params`, each given, whose body is `body`, answering a word.
+fn word_root(params: List<Var>, body: Block) -> Bytes / {abort.raise} =
+  spelled(
+    printed_fn({
+      ..int_root(params, body),
+      conv: {
+        params: params.map(|_: Var| Given),
+        reps: params.map(|v: Var| v.rep),
+        answer: RWord,
+        answered: Owned,
+      },
+    }).pieces,
+  )
+
+test "each failure releases what it holds through tails that failures holding alike share" {
+  let s = word_var(0);
+  let a = word_var(1);
+  let b = word_var(2);
+  let c = word_var(3);
+  let lines = word_root([s], [
+    holding(a, called([]), [s]),
+    holding(b, called([]), [s, a]),
+    holding(c, called([AVar(a)]), [s, b]),
+    Return(AVar(c)),
+  ]).split(
+    b"\n",
+  );
+  assert_eq(lines.filter(|l: Bytes| l.starts_with(b"  if (ctx->failed) ")), [
+    b"  if (ctx->failed) goto ply_u0;",
+    b"  if (ctx->failed) goto ply_u1;",
+    b"  if (ctx->failed) goto ply_u2;",
+  ]);
+  // The latest declared is let go of first, and the parameter's release is the one every path ends by.
+  assert(
+    holds_run(lines, [
+      b"  return t3;",
+      b"  ply_u2: ply_dec(ctx, t2); goto ply_u0;",
+      b"  ply_u1: ply_dec(ctx, t1);",
+      b"  ply_u0: ply_dec(ctx, p0); return 0;",
+      b"}",
+    ]),
+  )
+}
+
+test "a tail stands in the block its value was declared in, and goes on to the tails of the blocks around it" {
+  let s = word_var(0);
+  let flag = { id: 1, ty: TyCon({ name: b"Bool", args: [] }), rep: RBool };
+  let j = word_var(2);
+  let a = word_var(3);
+  let b = word_var(4);
+  let lines = word_root([s, flag], [
+    Decl(j),
+    If({
+      cond: AVar(flag),
+      then: [
+        holding(a, called([]), [s]),
+        holding(b, called([]), [s, a]),
+        Assign({ var: j, arg: AVar(b) }),
+      ],
+      otherwise: [Assign({ var: j, arg: AVar(s) })],
+    }),
+    Return(AVar(j)),
+  ]).split(
+    b"\n",
+  );
+  // The arm goes on past its end, so its tails stand where only a failure reaches them.
+  assert(
+    holds_run(lines, [
+      b"    t1 = t3;",
+      b"    if (0) {",
+      b"      ply_u1: ply_dec(ctx, t2); goto ply_u0;",
+      b"    }",
+      b"  } else {",
+    ]),
+  );
+  assert(holds_run(lines, [b"  return t1;", b"  ply_u0: ply_dec(ctx, p0); return 0;", b"}"]))
+}
+
+test "a failure inside a handle's body releases what the body holds and goes to the landing, which releases what the handle holds" {
+  let s = word_var(0);
+  let answer = word_var(1);
+  let a = word_var(2);
+  let b = word_var(3);
+  let text = word_root([s], [
+    Handle({
+      body: [
+        holding(a, called([]), []),
+        holding(b, called([]), [a]),
+        Assign({ var: answer, arg: AVar(b) }),
+      ],
+      args: [],
+      uses: { takes: [], owned: false, fails: false, stops: false },
+      site: { clauses: [], ret: None, detached: None },
+      answer: answer,
+      unwind: [s],
+    }),
+    Return(AVar(answer)),
+  ]);
+  let landing = match text.index_of(b"ply_h0: ;") { Some(at) -> at, None -> 0 };
+  let body = text.slice(0, landing);
+  let after = text.slice(landing, text.len());
+  // The body's value is let go of on the way to the landing, and what the handle holds is not.
+  assert(body.index_of(b"if (ctx->failed) goto ply_h0;") != None);
+  assert(body.index_of(b": ply_dec(ctx, t4); goto ply_h0;") != None);
+  assert_eq(occurrences(body, b"ply_dec(ctx, p0);"), 0);
+  // The landing lets go of it where no clause answers the failure.
+  assert(after.index_of(b"if (ctx->failed) goto ply_u") != None);
+  assert(after.index_of(b": ply_dec(ctx, p0); return 0;") != None)
+}
+
+test "a value whose C tests for no failure adds no tail" {
+  let s = word_var(0);
+  let n = { id: 1, ty: TyCon({ name: b"Int", args: [] }), rep: RInt };
+  let half = { ..n, id: 2 };
+  let a = word_var(3);
+  let quiet = word_root([s, n], [
+    holding(half, Prim({ op: b"div", on: RInt, args: [AVar(n), AInt(2)] }), [s]),
+    Return(AVar(s)),
+  ]);
+  assert_eq(quiet.index_of(b"goto ply_u"), None);
+  assert_eq(quiet.index_of(b"ply_u0:"), None);
+  // A failure after it is the first to add one.
+  let then_called = word_root([s, n], [
+    holding(half, Prim({ op: b"div", on: RInt, args: [AVar(n), AInt(2)] }), [s]),
+    holding(a, called([]), [s]),
+    Return(AVar(a)),
+  ]);
+  assert(then_called.index_of(b"if (ctx->failed) goto ply_u0;") != None);
+  assert_eq(occurrences(then_called, b"ply_u0:"), 1)
 }

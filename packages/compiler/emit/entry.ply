@@ -1,742 +1,28 @@
-//! A root's C function: its prologue, its body and its group, from its lowered body.
+//! A root's C function: its body lowered to the typed form, its counts placed, checked and printed.
 
 import syntax.parsing (dummy_span)
-import emit.code (Code, NLit, NVar, NBinary, NIf, NBlock, NApp, NMatch, CodeArm, Borrowed,
-                  lower_to_emit, slots_read)
+import syntax.exprs (Expr)
+import syntax.patterns (Lit, LInt, LBad)
 import check.resolve.scopes (of_binder)
 import check.resolve.tables (qualify)
-import check.types (Type, TyFn, Scheme)
-import emit.typing (Typed, node_types, unknown_type)
-import std.list
-import syntax.exprs (Expr)
-import syntax.patterns (LInt, LBad)
-import std.bytes (ascii_of_int)
-import emit.c (KBool, KBoxed, KDec, KFloat, KInt, KNum, KSum, Kind, is_sum, sum_helper, ctype,
-               failing_return, bytes_join, tick_line, sorted_names)
+import check.types (Type, TyFn)
+import emit.code (Code, NLit, lower_fn)
+import emit.typing (unknown_type)
+import emit.c (Kind, sorted_names)
 import emit.roots (symbol_of, entry_of, own_definition, specialisation_of)
-import emit.answer (no_generics, Tables, no_tables, sorted_widths, Emitted, Head)
-import emit.reps (Ctors, Ty, TyList, TyOpen, Def, Imported, Carrier, Cases, Fields, Whole,
-                  nth_field, record_leaves, raw_carrier, returned_kind, field_param, word_param,
-                  substituted_fully)
+import emit.answer (Tables, no_tables, Emitted, Head, Defined)
+import emit.reps (Ty, Def, EmitParam, substituted_fully, carried_answer, no_ctors)
 import emit.keys (root_name)
 import emit.pieces (spelled)
 import emit.tir
-import emit.tir (Fn)
+import emit.tir (Fn, Declined, family_name)
 import emit.lower (root_lowered, group_lowered)
-import emit.lower.setting (Root, param_type)
+import emit.lower.setting (Setting, Root, param_type)
 import emit.own (owned)
 import emit.verify (verified)
 import emit.print (printed_fn)
 import emit.print.text (Printed)
 import emit.print.made (head_types)
-import emit.declined (vetted, noted)
-import emit.state (CValue, Emitter, EffectName, EmitParam, WithValue, line, indent, outdent, fresh,
-                   note_slice, charge, note_holder, note_bound, nth_value, tables_of)
-import emit.scope (is_ctor_name, written_in, walks_by_rest)
-import emit.values (as_num, remember, bind, sum_returned, answer_shapes, returned, held_record,
-                    bool_of_word, as_float, as_dec, as_kind, counted_incs, leaf_loads)
-import emit.calls (lent_of, known_body, toks_freed, toks_freeing, toks_mark)
-import emit.builtins (widths_closed)
-import emit.effects (ast_handles, walk_handles)
-import emit.frame (self_tail_leaf, sum_param, answered, answers_cases, head_text, grown_words,
-                   entry_from, carried_answer, head_of, fuel_head, group_args)
-import emit.expr (expr)
-
-// --- Externs written in place -----------------------------------------------------
-
-/// The prologue and the body; a body with a self call in tail position gets the label that call restarts at,
-/// where each pass counts one call of the entry's budget, since a restart is what a tail call became.
-fn emit_body(
-  start: Emitter,
-  params: List<EmitParam>,
-  body: Code,
-) -> Option<WithValue> / {abort.raise} = {
-  let prologued = prologue(start, params);
-  let loops = loops_to_self(prologued, body, params);
-  // A list parameter the loop walks down by its rest is read as its word and an offset.
-  let opened = if !loops { prologued } else {
-    range(0, params.len()).fold(prologued, |acc: Emitter, i: Int|
-      match params.at(i) {
-        Some(p) -> if p.carrier == Whole(KBoxed) && p.ty == TyList
-            && walks_by_rest(body, own_name(acc), i) { sliced_param(acc, i, p.ty) }
-        else { acc },
-        None -> acc,
-      })
-  };
-  let looped = line(
-    opened,
-    b"ply_loop: ".concat(tick_line(failing_return(returned_kind(opened.answer)))),
-  );
-  expr(if loops { looped } else { opened }, widths_closed(start, body), params)
-}
-
-/// The name this root's body calls itself by.
-fn own_name(emitter: Emitter) -> Bytes / {abort.raise} = {
-  let pre = if emitter.module.len() == 0 { b"" } else { emitter.module.concat(b".") };
-  let short = if emitter.owner.starts_with(pre) {
-    emitter.owner.slice(pre.len(), emitter.owner.len())
-  } else { emitter.owner };
-  let cut = range(0, short.len()).fold(short.len(), |acc: Int, k: Int|
-    if acc == short.len() && (short.at(k) == 64 || short.at(k) == 35) { k } else { acc });
-  short.slice(0, cut)
-}
-
-/// Parameter `i`, a list, read as its word `p<i>` from the offset `p<i>_from` on, which a self call
-/// handing back its rest moves.
-fn sliced_param(emitter: Emitter, i: Int, ty: Ty) -> Emitter = {
-  let from = Bytes::concat_all([b"p", ascii_of_int(i), b"_from"]);
-  let f = fresh(line(emitter, Bytes::concat_all([b"int64_t ", from, b" = 0;"])));
-  remember(note_slice(f.emitter, f.name, b"p".concat(ascii_of_int(i)), from), i, {
-    kind: KBoxed,
-    expr: f.name,
-    ty: ty,
-  })
-}
-
-/// Whether a body reaches a self call in tail position; the walk is the positions `tail` is kept into.
-fn loops_to_self(emitter: Emitter, code: Code, params: List<EmitParam>) -> Bool / {abort.raise} =
-  match code.node {
-    NApp(a) -> match a.func.node {
-      NVar(fv) ->
-        fv.slot == None && !is_ctor_name(fv.name)
-          && self_tail_leaf(emitter, fv.name, a.func.span, a.args, params),
-      _ -> false,
-    },
-    NBinary(b) -> (b.op == b"and" || b.op == b"or") && loops_to_self(emitter, b.rhs, params),
-    NIf(i) ->
-      loops_to_self(emitter, i.then_branch, params)
-        || loops_to_self(emitter, i.else_branch, params),
-    NBlock(b) -> match b.tail { Some(t) -> loops_to_self(emitter, t, params), None -> false },
-    NMatch(m) ->
-      m.arms.fold(false, |acc: Bool, a: CodeArm| acc || loops_to_self(emitter, a.body, params)),
-    _ -> false,
-  }
-
-/// Every parameter is opened at entry, in order, read or not: opening lazily writes the temporaries in a different order.
-fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter =
-  range(0, params.len()).fold(emitter, |acc: Emitter, i: Int|
-    match params.at(i) {
-      None -> acc,
-      Some(p) -> if raw_carrier(p.carrier) {
-        match p.carrier {
-          Fields(fs) -> {
-            let rl = record_leaves(fs);
-            let r = held_record(
-              acc,
-              fs,
-              range(0, rl.len()).map(|k: Int|
-                { kind: nth_field(rl, k).kind, expr: field_param(i, k), ty: nth_field(rl, k).ty }),
-              word_param(i),
-            );
-            remember(r.emitter, i, r.value)
-          },
-          Whole(k) -> remember(acc, i, { kind: k, expr: b"p".concat(ascii_of_int(i)), ty: p.ty }),
-          Cases(sc) -> {
-            let h = sum_param(acc, sc, i);
-            remember(h.emitter, i, { ..h.value, ty: p.ty })
-          },
-        }
-      } else {
-        let acc = note_bound(
-          note_holder(acc, b"p".concat(ascii_of_int(i))),
-          b"p".concat(ascii_of_int(i)),
-        );
-        match p.kind {
-          // A record arrives as its word and is never opened, but its reads are still charged, or the release rule sees nothing read it.
-          KBoxed -> charge(acc, i, b"p".concat(ascii_of_int(i))),
-          KSum(_) -> charge(acc, i, b"p".concat(ascii_of_int(i))),
-          KBool -> {
-            let o = bind(acc, KBool, bool_of_word(b"p".concat(ascii_of_int(i))));
-            remember(o.emitter, i, o.value)
-          },
-          KNum(w) -> {
-            let o = bind(
-              acc,
-              KNum(w),
-              as_num({ kind: KBoxed, expr: b"p".concat(ascii_of_int(i)), ty: TyOpen([]) }, w),
-            );
-            remember(o.emitter, i, o.value)
-          },
-          KFloat -> {
-            let o = bind(
-              acc,
-              KFloat,
-              as_float({ kind: KBoxed, expr: b"p".concat(ascii_of_int(i)), ty: TyOpen([]) }),
-            );
-            remember(o.emitter, i, o.value)
-          },
-          KDec -> {
-            let o = bind(
-              acc,
-              KDec,
-              as_dec({ kind: KBoxed, expr: b"p".concat(ascii_of_int(i)), ty: TyOpen([]) }),
-            );
-            remember(o.emitter, i, o.value)
-          },
-          _ -> {
-            let o = bind(
-              acc,
-              KInt,
-              Bytes::concat_all([
-                b"(ply_is_imm(p",
-                ascii_of_int(i),
-                b") ? ply_imm_value(p",
-                ascii_of_int(i),
-                b") : rt_unbox_int_p(ctx, p",
-                ascii_of_int(i),
-                b"))",
-              ]),
-            );
-            remember(o.emitter, i, o.value)
-          },
-        }
-      },
-    })
-
-// --- Specialisation ----------------------------------------------------------------------------
-
-pub fn emit_fn(
-  module: Bytes,
-  here: List<Def>,
-  imports: List<Imported>,
-  ctors: List<Bytes>,
-  builtins: List<Bytes>,
-  full: Bytes,
-  params: List<EmitParam>,
-  body: Code,
-) -> Option<Bytes> / {abort.raise} =
-  match emit_fn_full(
-      module,
-      0,
-      here,
-      imports,
-      { names: ctors, laid: Map::new(), keyed: [], sums: Map::new() },
-      builtins,
-      full,
-      params,
-      body,
-      [],
-      false,
-      Map::new(),
-      Map::new(),
-    ) {
-    None -> None,
-    Some(f) -> Some(f.text),
-  }
-
-/// One definition's C, with the tables it names. `full` is the definition's own name (`m.f`, or a
-/// root's `m.f#requires#0`), from which its C symbol is derived.
-pub fn emit_fn_full(
-  module: Bytes,
-  base: Int,
-  here: List<Def>,
-  imports: List<Imported>,
-  ctors: Ctors,
-  builtins: List<Bytes>,
-  full: Bytes,
-  params: List<EmitParam>,
-  body: Code,
-  effects: List<EffectName>,
-  release: Bool,
-  operands: Map<Bytes, Bytes>,
-  typed: Map<Bytes, Typed>,
-) -> Option<{ text: Bytes, tables: Tables }> / {abort.raise} = {
-  let name = symbol_of(full);
-  let answer = carried_answer(module, here, full);
-  let start = {
-    out: [],
-    temp_count: 0,
-    unboxed: [],
-    indent: 0,
-    reads: slots_read(body),
-    shapes: [],
-    built: [],
-    module: module,
-    base: base,
-    count_locals: [],
-    here: here,
-    imports: imports,
-    consts: [],
-    ctors: ctors,
-    lambda_bodies: b"",
-    lambdas: [],
-    owner: full,
-    builtins: builtins,
-    called_builtins: [],
-    fields: [],
-    released: [],
-    reuse_widths: [],
-    alias: [],
-    by_root: [],
-    tail: true,
-    calls: [],
-    generics: no_generics(),
-    refused: None,
-    deferred: [],
-    deferred_locals: [],
-    performs: [],
-    handles: [],
-    landing: None,
-    effects: effects,
-    release: release,
-    pinned: [],
-    bound: [],
-    group: [],
-    operands: operands,
-    typed: node_types(typed, params.map(|p: EmitParam| p.of), body),
-    answer: answer,
-    site_root: None,
-    lent: lent_of(params),
-    written: written_in(module, here, imports, body),
-    slices: [],
-    sums: [],
-    leaves: answers_cases(answer),
-    inlined: false,
-  };
-  match emit_body(start, params, body) {
-    None -> None,
-    Some(o0) -> if o0.emitter.refused != None { None } else {
-      let sig = Bytes::concat_all([
-        b"Word ",
-        name,
-        b"_entry(PlyCtx *ctx, const Word *args);\n",
-        head_text(name, params, answer),
-        b" {\n",
-      ]);
-      let grown = grown_words(o0.emitter, params, answer);
-      let head = fuel_head(name.concat(b"_entry"), grown.prep, grown.words, answer);
-      let w = answered(grown.emitter, o0.value, answer);
-      let shaped = answer_shapes(w.emitter, answer);
-      let o = { emitter: shaped.emitter, value: o0.value };
-      let epilogue = Bytes::concat_all([
-        toks_freed(o.emitter.reuse_widths),
-        b"  ctx->fuel += 1;\n  return ",
-        w.expr,
-        b";\n}\n",
-      ]);
-      let entry = entry_from(name, [], 0, params, answer, shaped.shapes);
-      // Token declarations go in front once the body has used them; they take no temporary, so nothing moves.
-      let toks = sorted_widths(o.emitter.reuse_widths).fold(b"", |acc: Bytes, w: Int|
-        Bytes::concat_all([acc, b"  Word tok", ascii_of_int(w), b" = 0;\n"]));
-      let decls = o.emitter.deferred_locals.fold(b"", |acc: Bytes, r: Bytes|
-        Bytes::concat_all([acc, b"  Word ", r, b" = 0;\n"]));
-      Some({
-        text: Bytes::concat_all([
-          sig,
-          head,
-          toks,
-          decls,
-          bytes_join(o.emitter.out, b""),
-          epilogue,
-          entry,
-          o.emitter.lambda_bodies,
-        ]),
-        tables: tables_of(o.emitter, full, [head_of(params, answer)]),
-      })
-    },
-  }
-}
-
-/// Why a body was refused, or nothing when it was emitted.
-pub fn emit_fn_why(
-  module: Bytes,
-  base: Int,
-  here: List<Def>,
-  imports: List<Imported>,
-  ctors: Ctors,
-  builtins: List<Bytes>,
-  full: Bytes,
-  params: List<EmitParam>,
-  body: Code,
-  effects: List<EffectName>,
-  release: Bool,
-  operands: Map<Bytes, Bytes>,
-  typed: Map<Bytes, Typed>,
-) -> Option<Bytes> / {abort.raise} = {
-  let answer = carried_answer(module, here, full);
-  let start = {
-    out: [],
-    temp_count: 0,
-    unboxed: [],
-    indent: 0,
-    reads: slots_read(body),
-    shapes: [],
-    built: [],
-    module: module,
-    base: base,
-    count_locals: [],
-    here: here,
-    imports: imports,
-    consts: [],
-    ctors: ctors,
-    lambda_bodies: b"",
-    lambdas: [],
-    owner: full,
-    builtins: builtins,
-    called_builtins: [],
-    fields: [],
-    released: [],
-    reuse_widths: [],
-    alias: [],
-    by_root: [],
-    tail: true,
-    calls: [],
-    generics: no_generics(),
-    refused: None,
-    deferred: [],
-    deferred_locals: [],
-    performs: [],
-    handles: [],
-    landing: None,
-    effects: effects,
-    release: release,
-    pinned: [],
-    bound: [],
-    group: [],
-    operands: operands,
-    typed: node_types(typed, params.map(|p: EmitParam| p.of), body),
-    answer: answer,
-    site_root: None,
-    lent: lent_of(params),
-    written: written_in(module, here, imports, body),
-    slices: [],
-    sums: [],
-    leaves: answers_cases(answer),
-    inlined: false,
-  };
-  match emit_body(start, params, body) {
-    None -> Some(b"refused without a reason"),
-    Some(o) -> o.emitter.refused,
-  }
-}
-
-/// One definition of a group: its full name, where its source starts, and its lowered body.
-pub type Member = { full: Bytes, base: Int, params: List<EmitParam>, body: Code }
-
-/// A tail-recursive group as one C function: `which` picks the member's case, the loop label sits before the switch, and
-/// each case opens its own parameters, so a jump to any member restarts through that member's prologue. Every member's
-/// own symbol is a wrapper passing its case, and the group's tables list the members its one body serves.
-pub fn emit_group_full(
-  module: Bytes,
-  here: List<Def>,
-  imports: List<Imported>,
-  ctors: Ctors,
-  builtins: List<Bytes>,
-  members: List<Member>,
-  effects: List<EffectName>,
-  release: Bool,
-  operands: Map<Bytes, Bytes>,
-  typed: Map<Bytes, Typed>,
-) -> Option<{ text: Bytes, tables: Tables }> / {abort.raise} = {
-  let names = members.map(|m: Member| m.full);
-  let first = match members.at(0) { Some(m) -> m.full, None -> b"" };
-  let gname = symbol_of(first).concat(b"_group");
-  let width = members.fold(0, |acc: Int, m: Member|
-    if m.params.len() > acc { m.params.len() } else { acc });
-  let start: Emitter = {
-    out: [],
-    temp_count: 0,
-    unboxed: [],
-    indent: 0,
-    reads: [],
-    shapes: [],
-    built: [],
-    module: module,
-    base: 0,
-    count_locals: [],
-    here: here,
-    imports: imports,
-    consts: [],
-    ctors: ctors,
-    lambda_bodies: b"",
-    lambdas: [],
-    owner: first,
-    builtins: builtins,
-    called_builtins: [],
-    fields: [],
-    released: [],
-    reuse_widths: [],
-    alias: [],
-    by_root: [],
-    tail: true,
-    calls: [],
-    generics: no_generics(),
-    refused: None,
-    deferred: [],
-    deferred_locals: [],
-    performs: [],
-    handles: [],
-    landing: None,
-    effects: effects,
-    release: release,
-    pinned: [],
-    bound: [],
-    group: names,
-    operands: operands,
-    typed: members.fold(typed, |acc: Map<Bytes, Typed>, m: Member|
-      node_types(acc, m.params.map(|p: EmitParam| p.of), m.body)),
-    answer: Whole(KBoxed),
-    site_root: None,
-    lent: [],
-    written: [],
-    slices: [],
-    sums: [],
-    leaves: false,
-    inlined: false,
-  };
-  match group_cases(start, members, 0) {
-    None -> None,
-    Some(emitter) -> if emitter.refused != None { None } else {
-      let gentry = gname.concat(b"_entry");
-      let sig = Bytes::concat_all([
-        b"static Word ",
-        gentry,
-        b"(PlyCtx *ctx, const Word *args);\n",
-        b"static Word ",
-        gname,
-        b"(PlyCtx *ctx, int which",
-        range(0, width).fold(b"", |acc: Bytes, i: Int|
-          Bytes::concat_all([acc, b", Word p", ascii_of_int(i)])),
-        b") {\n",
-      ]);
-      let toks = sorted_widths(emitter.reuse_widths).fold(b"", |acc: Bytes, w: Int|
-        Bytes::concat_all([acc, b"  Word tok", ascii_of_int(w), b" = 0;\n"]));
-      let decls = emitter.deferred_locals.fold(b"", |acc: Bytes, r: Bytes|
-        Bytes::concat_all([acc, b"  Word ", r, b" = 0;\n"]));
-      let entered = Bytes::concat_all([
-        b"static Word ",
-        gentry,
-        b"(PlyCtx *ctx, const Word *args) {\n  return ",
-        gname,
-        b"(ctx, (int)args[0]",
-        range(0, width).fold(b"", |acc: Bytes, i: Int|
-          Bytes::concat_all([acc, b", args[", ascii_of_int(i + 1), b"]"])),
-        b");\n}\n",
-      ]);
-      let wrappers = range(0, members.len()).fold(
-        { emitter: emitter, text: b"" },
-        |acc: { emitter: Emitter, text: Bytes }, i: Int|
-          match members.at(i) {
-            Some(m) -> {
-              let w = group_wrapper(
-                acc.emitter,
-                gname,
-                i,
-                m,
-                width,
-                carried_answer(module, here, m.full),
-              );
-              { emitter: w.emitter, text: acc.text.concat(w.text) }
-            },
-            None -> acc,
-          },
-      );
-      Some({
-        text: Bytes::concat_all([
-          sig,
-          fuel_head(gentry, b"", group_args(width), Whole(KBoxed)),
-          toks,
-          decls,
-          b"  ply_loop: ",
-          tick_line(failing_return(KBoxed)),
-          b"\n",
-          b"  switch (which) {\n",
-          bytes_join(
-            bytes_join(emitter.out, b"").split(toks_mark()),
-            toks_freeing(emitter.reuse_widths),
-          ),
-          b"  }\n  return 0;\n}\n",
-          entered,
-          wrappers.text,
-          emitter.lambda_bodies,
-        ]),
-        tables: tables_of(
-          wrappers.emitter,
-          first,
-          members.map(|m: Member| head_of(m.params, carried_answer(module, here, m.full))),
-        ),
-      })
-    },
-  }
-}
-
-/// Each member's case: its own window over the shared temporaries and tables, closed by its return.
-fn group_cases(emitter: Emitter, members: List<Member>, i: Int) -> Option<Emitter> / {abort.raise} =
-  if i >= members.len() { Some(emitter) } else {
-    match members.at(i) {
-      None -> None,
-      Some(m) -> {
-        let opened: Emitter = indent(
-          line(emitter, Bytes::concat_all([b"case ", ascii_of_int(i), b": {"])),
-        );
-        let entered: Emitter = {
-          ..opened,
-          unboxed: [],
-          reads: slots_read(m.body),
-          built: [],
-          count_locals: [],
-          released: [],
-          alias: [],
-          by_root: [],
-          deferred: [],
-          sums: [],
-          pinned: [],
-          bound: [],
-          tail: true,
-          landing: None,
-          owner: m.full,
-          base: m.base,
-        };
-        let words = m.params.map(|p: EmitParam|
-          { ..p, carrier: Whole(KBoxed), kind: if is_sum(p.kind) { KBoxed } else { p.kind } });
-        match expr(prologue(entered, words), widths_closed(entered, m.body), words) {
-          None -> None,
-          Some(o) -> {
-            let w = returned(o.emitter, o.value);
-            let closed = line(
-              w.emitter,
-              Bytes::concat_all([toks_mark(), b" ctx->fuel += 1; return ", w.expr, b";"]),
-            );
-            group_cases(line(outdent(closed), b"}"), members, i + 1)
-          },
-        }
-      },
-    }
-  }
-
-fn group_wrapper(
-  emitter: Emitter,
-  gname: Bytes,
-  which: Int,
-  member: Member,
-  width: Int,
-  answer: Carrier,
-) -> { emitter: Emitter, text: Bytes } / {abort.raise} = {
-  let name = symbol_of(member.full);
-  let grown = grown_words(emitter, member.params, answer);
-  let call = Bytes::concat_all([
-    gname,
-    b"(ctx, ",
-    ascii_of_int(which),
-    range(0, width).fold(b"", |acc: Bytes, i: Int|
-      acc.concat(match grown.words.at(i) { Some(w) -> b", ".concat(w), None -> b", 0" })),
-    b")",
-  ]);
-  let shaped = answer_shapes(grown.emitter, answer);
-  let k = returned_kind(answer);
-  // A record answer hands its word back with its fields; a scalar's word is let go.
-  let opened = |loads: List<CValue>, record: Bool|
-    Bytes::concat_all([
-      b"  Word r = ",
-      call,
-      b";\n  if (ctx->failed) ",
-      failing_return(k),
-      b"\n  ",
-      ctype(k),
-      b" v = ",
-      nth_value(loads, 0).expr,
-      b";\n",
-      range(1, loads.len()).fold(b"", |t: Bytes, j: Int|
-        Bytes::concat_all([t, b"  *o", ascii_of_int(j), b" = ", nth_value(loads, j).expr, b";\n"])),
-      b"  ",
-      counted_incs(
-        range(0, loads.len()).map(|j: Int|
-          {
-            ..nth_value(loads, j),
-            expr: if j == 0 { b"v" } else { b"*o".concat(ascii_of_int(j)) },
-          }),
-      ),
-      if record { Bytes::concat_all([b"*o", ascii_of_int(loads.len()), b" = r;"]) }
-      else { b"ply_dec(ctx, r);" },
-      b"\n  return v;\n",
-    ]);
-  {
-    emitter: shaped.emitter,
-    text: Bytes::concat_all([
-      head_text(name, member.params, answer),
-      b" {\n",
-      if grown.prep.len() == 0 { b"" } else { Bytes::concat_all([b"  ", grown.prep, b"\n"]) },
-      match answer {
-        Whole(KBoxed) -> Bytes::concat_all([b"  return ", call, b";\n"]),
-        Whole(KSum(spec)) ->
-          Bytes::concat_all([
-            b"  Word r = ",
-            call,
-            b";\n  if (ctx->failed) return 0;\n  return ",
-            sum_helper(spec, b"open"),
-            b"(ctx, r);\n",
-          ]),
-        Whole(_) ->
-          opened(
-            [
-              {
-                kind: k,
-                expr: as_kind({ kind: KBoxed, expr: b"r", ty: TyOpen([]) }, k),
-                ty: TyOpen([]),
-              },
-            ],
-            false,
-          ),
-        Fields(fs) -> opened(leaf_loads(b"r", fs), true),
-        Cases(sc) ->
-          Bytes::concat_all([
-            b"  Word r = ",
-            call,
-            b";\n  if (ctx->failed) return 0;\n  ",
-            sum_returned(sc, b"r"),
-            b"\n",
-          ]),
-      },
-      b"}\n",
-      entry_from(name, [], 0, member.params, answer, shaped.shapes),
-    ]),
-  }
-}
-
-test "a body that answers a literal" {
-  let f = symbol_of(b"m.f");
-  assert_eq(
-    match emit_fn(b"m", [], [], [], [], b"m.f", [], {
-        own: Borrowed,
-        span: dummy_span(),
-        node: NLit(LInt(7)),
-      }) {
-      Some(c) -> c,
-      None -> b"",
-    },
-    Bytes::concat_all([
-      b"Word ",
-      f,
-      b"_entry(PlyCtx *ctx, const Word *args);\n",
-      b"Word ",
-      f,
-      b"(PlyCtx *ctx) {\n  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { return rt_grow_p(ctx, (Word)(intptr_t)&",
-      f,
-      b"_entry, 0); } }\n  if (++ctx->ticks >= ctx->next_tick) { rt_tick_p(ctx); if (ctx->failed) return 0; }\n  ctx->fuel -= 1;\n  ctx->fuel += 1;\n  return (ply_fits_imm(INT64_C(7)) ? ply_imm(INT64_C(7)) : rt_box_int_p(ctx, INT64_C(7)));\n}\n",
-      b"Word ",
-      f,
-      b"_entry(PlyCtx *ctx, const Word *args) {\n  return ",
-      f,
-      b"(ctx);\n}\n",
-    ]),
-  )
-}
-
-test "a form this port does not reach is refused" {
-  assert_eq(
-    match emit_fn(b"m", [], [], [], [], b"m.f", [], {
-        own: Borrowed,
-        span: dummy_span(),
-        node: NLit(LBad),
-      }) {
-      Some(_) -> false,
-      None -> true,
-    },
-    true,
-  )
-}
-
-// --- the emitter's entry ----------------------------------------------------
 
 /// A definition lowered once, for grouping and for emission; `code` is `None` when it is not wanted or does not lower.
 pub type Prepared = {
@@ -746,120 +32,36 @@ pub type Prepared = {
   kinds: List<Option<{ kind: Kind, ty: Ty }>>,
   ps: List<EmitParam>,
   known: Bool,
-  body: Expr,
   code: Option<Code>,
 }
 
-/// What every root of a program is emitted with: the builtins the runtime implements, by name,
-/// the scheme the prelude declares each at, read once for the program, and whether the typed form
-/// lowers each root before today's emitter writes what it declines.
-pub type Emitting = { natives: List<Bytes>, declared: Map<Bytes, Scheme>, form: Bool }
-
-/// A group's one body under its first member's name, as the typed form lowers it and else as
-/// today's emitter writes it, or, when a member does not emit, each member on its own.
-pub fn group_emitted(
-  module: Bytes,
-  here: List<Def>,
-  imports: List<Imported>,
-  ctors: Ctors,
-  emitting: Emitting,
-  effects: List<EffectName>,
-  release: Bool,
-  operands: Map<Bytes, Bytes>,
-  typed: Map<Bytes, Typed>,
-  members: List<Prepared>,
-) -> List<Emitted> / {abort.raise} = {
-  let ms = members.fold([], |acc: List<Member>, p: Prepared|
+/// A group's one body under its first member's name, or, when a member does not lower to `Code`,
+/// each member on its own.
+pub fn group_emitted(s: Setting, members: List<Prepared>) -> List<Emitted> / {abort.raise} = {
+  let roots = members.fold([], |acc: List<{ root: Root, code: Code }>, p: Prepared|
     match p.code {
-      Some(c) -> acc.push({ full: p.full, base: p.base, params: p.ps, body: c }),
+      Some(c) -> acc.push({ root: root_at(s, p.full, p.base, p.ps), code: c }),
       None -> acc,
     });
-  let first = match members.at(0) { Some(p) -> p.full, None -> b"" };
-  let setting = {
-    module: module,
-    here: here,
-    imports: imports,
-    ctors: ctors,
-    builtins: emitting.natives,
-    declared: emitting.declared,
-    effects: effects,
-    release: release,
-    typed: typed,
-  };
-  let formed = if !emitting.form || ms.len() != members.len() { None } else {
-    Some(
-      vetted(
-        group_lowered(
-          setting,
-          ms.map(|m: Member|
-            { root: root_at(module, here, m.full, m.base, m.params), code: m.body }),
-        ),
-      ),
-    )
-  };
-  match formed {
-    Some(Ok(f)) -> [form_emitted(first, f)],
-    _ -> {
-      let whole = if ms.len() == members.len() {
-        emit_group_full(
-          module,
-          here,
-          imports,
-          ctors,
-          emitting.natives,
-          ms,
-          effects,
-          release,
-          operands,
-          typed,
-        )
-      } else { None };
-      match whole {
-        Some(c) -> {
-          let e = { name: first, text: c.text, tables: c.tables, why: None, handles: [] };
-          [match formed { Some(Err(no)) -> noted(e, first, no), _ -> e }]
-        },
-        None ->
-          members.map(|p: Prepared|
-            emitted_from(
-              module,
-              p.base,
-              here,
-              imports,
-              ctors,
-              emitting,
-              effects,
-              release,
-              operands,
-              typed,
-              p.full,
-              p.ps,
-              p.known,
-              p.body,
-              p.code,
-            )),
-      }
-    },
+  if roots.len() != members.len() {
+    members.map(|p: Prepared| emitted_from(s, p.base, p.full, p.ps, p.known, p.code))
+  } else {
+    let first = match members.at(0) { Some(p) -> p.full, None -> b"" };
+    [form_emitted(first, group_lowered(s, roots))]
   }
 }
 
-/// Root `full` of `module`, whose text starts at `base` and whose parameters are `ps`, as the typed
-/// form lowers it: each parameter of the type its scheme gives it, its answer carried as its
-/// definition's is and of the type its scheme answers.
-fn root_at(
-  module: Bytes,
-  here: List<Def>,
-  full: Bytes,
-  base: Int,
-  ps: List<EmitParam>,
-) -> Root / {abort.raise} =
+/// Root `full` of the setting's module, whose text starts at `base` and whose parameters are `ps`, as
+/// the typed form lowers it: each parameter of the type its scheme gives it, its answer carried as
+/// its definition's is and of the type its scheme answers.
+fn root_at(s: Setting, full: Bytes, base: Int, ps: List<EmitParam>) -> Root / {abort.raise} =
   {
     full: full,
     base: base,
     params: ps,
     types: ps.map(param_type),
-    answer: carried_answer(module, here, full),
-    answer_ty: answer_type(module, here, full),
+    answer: carried_answer(s.module, s.here, full),
+    answer_ty: answer_type(s.module, s.here, full),
     code: None,
   }
 
@@ -877,47 +79,35 @@ fn answer_type(module: Bytes, here: List<Def>, full: Bytes) -> Type / {abort.rai
     })
 }
 
-/// The root `full` the typed form lowered to `f`, its counts placed, checked, and printed as an
-/// answer's text and tables. A form the check refuses, or one a printer has no C for, fails the
-/// build naming the root: it would run wrong, or not compile.
-fn form_emitted(full: Bytes, f: Fn) -> Emitted / {abort.raise} = {
-  let counted = owned(f);
-  match verified(counted) {
-    Some(fault) ->
-      panic(
-        String::of_bytes_lossy(
-          Bytes::concat_all([b"the typed form of `", full, b"` fails its check: ", fault]),
-        ),
-      ),
-    None -> {
-      let pr = handle {
-        printed_fn(counted)
-      } with {
-        abort.raise(m) ->
-          panic(
-            String::of_bytes_lossy(
-              Bytes::concat_all([
-                b"the typed form of `",
-                full,
-                b"` does not print: ",
-                Bytes::of_string(m),
-              ]),
-            ),
-          ),
-      };
-      {
-        name: full,
-        text: spelled(pr.pieces),
-        tables: form_tables(counted, pr),
-        why: None,
-        handles: [],
+/// The root `full` as the typed form lowered it, its counts placed, checked, and printed as an
+/// answer's text and tables. A root the form declines, a form the check refuses and one a printer
+/// has no C for each fail the build naming the root: it would not compile, or would run wrong.
+fn form_emitted(full: Bytes, lowered: Result<Fn, Declined>) -> Emitted / {abort.raise} =
+  match lowered {
+    Err(no) ->
+      internal(full, Bytes::concat_all([b"is declined by ", family_name(no.by), b": ", no.why])),
+    Ok(f) -> {
+      let counted = owned(f);
+      match verified(counted) {
+        Some(fault) -> internal(full, b"fails its check: ".concat(fault)),
+        None -> {
+          let pr = handle {
+            printed_fn(counted)
+          } with {
+            abort.raise(m) -> internal(full, b"does not print: ".concat(Bytes::of_string(m))),
+          };
+          { name: full, text: spelled(pr.pieces), tables: form_tables(counted, pr), why: None }
+        },
       }
     },
   }
-}
 
-/// What the root `f` printed as `pr` names of its unit, as today's emitter's tables hold it: a
-/// group's members by their case, and the head each root it holds is declared with.
+/// The internal error that stops a build at root `full`'s typed form, which `what` says.
+fn internal<a>(full: Bytes, what: Bytes) -> a / {abort.raise} =
+  panic(String::of_bytes_lossy(Bytes::concat_all([b"the typed form of `", full, b"` ", what])))
+
+/// What the root `f` printed as `pr` names of its unit, as an answer's tables hold it: a group's
+/// members by their case, and the head each root it holds is declared with.
 fn form_tables(f: Fn, pr: Printed) -> Tables / {abort.raise} = {
   let held = if f.members.len() == 0 {
     [{ name: root_name(f.key), head: head_types(f.conv.reps, f.conv.answer) }]
@@ -948,44 +138,10 @@ fn form_tables(f: Fn, pr: Printed) -> Tables / {abort.raise} = {
   }
 }
 
-pub fn params_of(
-  names: List<Bytes>,
-  kinds: List<Option<{ kind: Kind, ty: Ty }>>,
-) -> List<EmitParam> = params_carried(names, kinds, [], [])
-
-/// `params_of` with each parameter arriving as `carriers` says, and as a word past its end, and of
-/// the type `types` gives it.
-pub fn params_carried(
-  names: List<Bytes>,
-  kinds: List<Option<{ kind: Kind, ty: Ty }>>,
-  carriers: List<Carrier>,
-  types: List<Option<Type>>,
-) -> List<EmitParam> =
-  range(0, names.len()).map(|i: Int|
-    {
-      name: match names.at(i) { Some(n) -> n, None -> b"" },
-      kind: match carriers.at(i) {
-        Some(Whole(KSum(spec))) -> KSum(spec),
-        _ -> match kinds.at(i) { Some(Some(p)) -> p.kind, _ -> KInt },
-      },
-      ty: match kinds.at(i) { Some(Some(p)) -> p.ty, _ -> TyOpen([]) },
-      of: match types.at(i) { Some(t) -> t, None -> None },
-      carrier: match carriers.at(i) { Some(c) -> c, None -> Whole(KBoxed) },
-      lambda: None,
-    })
-
-/// One root's emission, definition, test or proposition alike. An unlowered body's handled operations are read off its source, so the fixpoint still drops their performers.
+/// One root's emission, definition, test or proposition alike, from its source `body`.
 pub fn root_emitted(
-  module: Bytes,
+  s: Setting,
   base: Int,
-  here: List<Def>,
-  imports: List<Imported>,
-  ctors: Ctors,
-  emitting: Emitting,
-  effects: List<EffectName>,
-  release: Bool,
-  operands: Map<Bytes, Bytes>,
-  typed: Map<Bytes, Typed>,
   full: Bytes,
   names: List<Bytes>,
   ps: List<EmitParam>,
@@ -993,129 +149,21 @@ pub fn root_emitted(
   sites: Map<Bytes, List<Bytes>>,
   body: Expr,
 ) -> Emitted / {abort.raise} =
-  emitted_from(
-    module,
-    base,
-    here,
-    imports,
-    ctors,
-    emitting,
-    effects,
-    release,
-    operands,
-    typed,
-    full,
-    ps,
-    known,
-    body,
-    if known {
-      match lower_to_emit(names, [], sites, body, of_binder(module)) {
-        Some(l) -> Some(l.code),
-        None -> None,
-      }
-    } else { None },
-  )
-
-/// One root's emission: as the typed form lowers it, else as today's emitter writes it.
-pub fn emitted_from(
-  module: Bytes,
-  base: Int,
-  here: List<Def>,
-  imports: List<Imported>,
-  ctors: Ctors,
-  emitting: Emitting,
-  effects: List<EffectName>,
-  release: Bool,
-  operands: Map<Bytes, Bytes>,
-  typed: Map<Bytes, Typed>,
-  full: Bytes,
-  ps: List<EmitParam>,
-  known: Bool,
-  body: Expr,
-  code: Option<Code>,
-) -> Emitted / {abort.raise} =
-  match match if emitting.form { code } else { None } {
+  emitted_from(s, base, full, ps, known, if known {
+    match lower_fn(names, [], sites, body, of_binder(s.module)) {
+      Some(l) -> Some(l.code),
       None -> None,
-      Some(lowered) ->
-        Some(
-          vetted(
-            root_lowered(
-              {
-                module: module,
-                here: here,
-                imports: imports,
-                ctors: ctors,
-                builtins: emitting.natives,
-                declared: emitting.declared,
-                effects: effects,
-                release: release,
-                typed: typed,
-              },
-              root_at(module, here, full, base, ps),
-              lowered,
-            ),
-          ),
-        ),
-    } {
-    Some(Ok(f)) -> form_emitted(full, f),
-    Some(Err(no)) ->
-      noted(
-        emitted_today(
-          module,
-          base,
-          here,
-          imports,
-          ctors,
-          emitting.natives,
-          effects,
-          release,
-          operands,
-          typed,
-          full,
-          ps,
-          known,
-          body,
-          code,
-        ),
-        full,
-        no,
-      ),
-    None ->
-      emitted_today(
-        module,
-        base,
-        here,
-        imports,
-        ctors,
-        emitting.natives,
-        effects,
-        release,
-        operands,
-        typed,
-        full,
-        ps,
-        known,
-        body,
-        code,
-      ),
-  }
+    }
+  } else { None })
 
-/// One root's emission as today's emitter writes it.
-fn emitted_today(
-  module: Bytes,
+/// One root's emission as the typed form lowers it from `code`; refused where its body does not
+/// lower to `Code`, which `known` says is for a parameter of no written type.
+pub fn emitted_from(
+  s: Setting,
   base: Int,
-  here: List<Def>,
-  imports: List<Imported>,
-  ctors: Ctors,
-  builtins: List<Bytes>,
-  effects: List<EffectName>,
-  release: Bool,
-  operands: Map<Bytes, Bytes>,
-  typed: Map<Bytes, Typed>,
   full: Bytes,
   ps: List<EmitParam>,
   known: Bool,
-  body: Expr,
   code: Option<Code>,
 ) -> Emitted / {abort.raise} =
   match code {
@@ -1124,50 +172,47 @@ fn emitted_today(
         name: full,
         text: b"",
         tables: no_tables(),
-        handles: ast_handles(body, effects),
         why: Some(if known { b"a body the lowering does not reach" }
         else { b"a parameter with no written type" }),
       },
-    Some(lowered) -> {
-      let c = known_body(full, ps, lowered);
-      match emit_fn_full(
-          module,
-          base,
-          here,
-          imports,
-          ctors,
-          builtins,
-          full,
-          ps,
-          c,
-          effects,
-          release,
-          operands,
-          typed,
-        ) {
-        None ->
-          {
-            name: full,
-            text: b"",
-            tables: no_tables(),
-            handles: walk_handles(c, effects),
-            why: emit_fn_why(
-              module,
-              base,
-              here,
-              imports,
-              ctors,
-              builtins,
-              full,
-              ps,
-              c,
-              effects,
-              release,
-              operands,
-              typed,
-            ),
-          },
-        Some(o) -> { name: full, text: o.text, tables: o.tables, why: None, handles: [] },
-      }
-    },
+    Some(c) -> form_emitted(full, root_lowered(s, root_at(s, full, base, ps), c)),
   }
+
+fn bare_setting() -> Setting =
+  {
+    module: b"m",
+    here: [],
+    imports: [],
+    ctors: no_ctors(),
+    builtins: [],
+    declared: Map::new(),
+    effects: [],
+    release: false,
+    typed: Map::new(),
+  }
+
+fn literal_code(l: Lit) -> Code = { span: dummy_span(), node: NLit(l) }
+
+test "a body that answers a literal is printed whole: its head, its fuel test, its body and its entry" {
+  let e = emitted_from(bare_setting(), 0, b"m.f", [], true, Some(literal_code(LInt(7))));
+  let f = symbol_of(b"m.f");
+  assert_eq(e.why, None);
+  assert(e.text.index_of(Bytes::concat_all([b"Word ", f, b"(PlyCtx *ctx) {"])) != None);
+  assert(e.text.index_of(b"ctx->fuel -= 1;") != None);
+  assert(e.text.index_of(b"7") != None);
+  assert(
+    e.text.index_of(Bytes::concat_all([b"Word ", f, b"_entry(PlyCtx *ctx, const Word *args) {"]))
+      != None,
+  );
+  assert_eq(e.tables.symbols.map(|d: Defined| d.symbol), [f])
+}
+
+test "a root the typed form declines is an internal error naming the root and why" {
+  let said = handle {
+    emitted_from(bare_setting(), 0, b"m.f", [], true, Some(literal_code(LBad)));
+    b""
+  } with {
+    abort.raise(m) -> Bytes::of_string(m),
+  };
+  assert_eq(said, b"the typed form of `m.f` is declined by Scalars: a literal that does not read")
+}

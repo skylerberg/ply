@@ -2,18 +2,18 @@
 
 import syntax.parsing (Span, dummy_span, span_key)
 import emit.code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NField, NApp, NRecord,
-                  NMatch, CodePattern, PxWild, PxVar, PxCtor, CLet, CodeArm, Borrowed, marked)
+                  NMatch, CodePattern, PxWild, PxVar, PxCtor, CLet, CodeArm)
 import syntax.items (Item, IInstance, NKey)
 import check.resolve.tables (qualify)
 import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, int_type,
-                    bytes_type, spelled_type)
+                    bytes_type)
 import emit.typing (Typed, unknown_type, filed_as)
 import std.list
 import syntax.patterns (Lit, LInt, LBool, LStr, LBytes)
 import std.bytes (ascii_of_int)
-import emit.c (KBool, KBoxed, KInt)
+import emit.c (KBool, KBoxed, KInt, KSum, Kind, is_sum)
 import emit.roots (container_ops, written_root)
-import emit.reps (Ctors, SumCtor, TyOpen, Def, Whole)
+import emit.reps (Ctors, SumCtor, TyOpen, Def, Whole, Cases, Fields, carrier_of)
 
 // --- Externs written in place -----------------------------------------------------
 
@@ -47,8 +47,8 @@ pub fn container_defs(module: Bytes, t: Type) -> List<Def> / {abort.raise} =
   })
 
 /// The body of the root written for `op` of containers of type `t`, as lowered code over its
-/// parameters `a`, `b` and, for the loops, `i`, the operand and binder types it files, and the
-/// definitions its calls name. Two lists or arrays are equal where they have one length and each
+/// parameters `a`, `b` and, for the loops, `i`, the types it files, and the definitions its calls
+/// name. Two lists or arrays are equal where they have one length and each
 /// pair at an index is equal, and ordered by the first pair that is not equal, a shorter one first
 /// where the other begins with it; two maps as the lists of their entries in key order are. A
 /// container is reflected, shown or digested item by item at the items' type, a map entry by entry.
@@ -56,8 +56,8 @@ pub fn container_code(
   module: Bytes,
   op: Bytes,
   t: Type,
-) -> { code: Code, operands: Map<Bytes, Bytes>, typed: Map<Bytes, Typed>, here: List<Def> } / {abort.raise} = {
-  let at = |node: Node, span: Span| { own: Borrowed, node: node, span: span };
+) -> { code: Code, typed: Map<Bytes, Typed>, here: List<Def> } / {abort.raise} = {
+  let at = |node: Node, span: Span| { node: node, span: span };
   let placed = |k: Int| { start: 0, end: k, gen: 1 };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
   let named = |name: Bytes| at(NVar({ name: name, slot: None }), dummy_span());
@@ -129,30 +129,6 @@ pub fn container_code(
     { k: 28, ty: filed_as(unknown_type(), [gathered_item]) },
   ].fold(Map::new(), |m: Map<Bytes, Typed>, x: { k: Int, ty: Typed }|
     m.insert(span_key(placed(x.k)), x.ty));
-  let operands = Map::new().insert(span_key(placed(2)), b"Int").insert(
-    span_key(placed(7)),
-    compared_name(item),
-  ).insert(
-    span_key(placed(8)),
-    b"Int",
-  ).insert(
-    span_key(placed(10)),
-    b"Ordering",
-  ).insert(
-    span_key(placed(12)),
-    b"Int",
-  ).insert(
-    span_key(placed(22)),
-    b"Ordering",
-  ).insert(
-    span_key(placed(26)),
-    compared_name(failure),
-  ).insert(
-    span_key(placed(27)),
-    b"Int",
-  );
-  let operands = range(0, fields_of.len()).fold(operands, |m: Map<Bytes, Bytes>, k: Int|
-    m.insert(span_key(placed(40 + k)), compared_name(fields_of.get(k).ty)));
   let a = var(b"a", 0);
   let b = var(b"b", 1);
   let i = var(b"i", 2);
@@ -450,7 +426,7 @@ pub fn container_code(
       ]),
     ])
   };
-  { code: marked(body), operands: operands, typed: typed, here: here }
+  { code: body, typed: typed, here: here }
 }
 
 /// The name `root`, written in `module`, has there.
@@ -458,17 +434,15 @@ pub fn local_root(module: Bytes, root: Bytes) -> Bytes / {abort.raise} =
   if module.len() == 0 { root } else { root.slice(module.len() + 1, root.len()) }
 
 /// The body of `T#eq` for a sum of constructors `cs`, as lowered code over its two parameters, and the
-/// operand types and binder types it files: each constructor's arguments compared in turn where
-/// both are that constructor.
-pub fn equality_code(
-  cs: List<SumCtor>,
-) -> { code: Code, operands: Map<Bytes, Bytes>, typed: Map<Bytes, Typed> } = {
-  let at = |node: Node, span: Span| { own: Borrowed, node: node, span: span };
+/// binder types it files: each constructor's arguments compared in turn where both are that
+/// constructor.
+pub fn equality_code(cs: List<SumCtor>) -> { code: Code, typed: Map<Bytes, Typed> } = {
+  let at = |node: Node, span: Span| { node: node, span: span };
   let placed = |k: Int| { start: 0, end: k, gen: 1 };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
   let walked = range(0, cs.len()).fold(
-    { arms: [], operands: Map::new(), typed: Map::new(), next: 0 },
-    |acc: { arms: List<CodeArm>, operands: Map<Bytes, Bytes>, typed: Map<Bytes, Typed>, next: Int }, i: Int| {
+    { arms: [], typed: Map::new(), next: 0 },
+    |acc: { arms: List<CodeArm>, typed: Map<Bytes, Typed>, next: Int }, i: Int| {
       let c = match cs.at(i) {
         Some(x) -> x,
         None -> { name: b"", index: 0, fields: [], params: [] },
@@ -490,11 +464,6 @@ pub fn equality_code(
           span: placed(acc.next + 2 * k + j),
           ty: match c.fields.at(j) { Some(t) -> t, None -> unknown_type() },
         });
-      let operands = compares.fold(
-        acc.operands,
-        |m: Map<Bytes, Bytes>, x: { span: Span, ty: Type }|
-          m.insert(span_key(x.span), compared_name(x.ty)),
-      );
       let same = range(0, k).fold(at(NLit(LBool(true)), dummy_span()), |acc2: Code, j: Int| {
         let eq = at(
           NBinary({
@@ -526,26 +495,22 @@ pub fn equality_code(
           guard: None,
           body: inner,
         }),
-        operands: operands,
         typed: typed,
         next: acc.next + 3 * k,
       }
     },
   );
   {
-    code: marked(at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms }), dummy_span())),
-    operands: walked.operands,
+    code: at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms }), dummy_span()),
     typed: walked.typed,
   }
 }
 
 /// The body of `T#cmp` for a sum of constructors `cs`, as lowered code over its two parameters, and
-/// the operand types and binder and call types it files: as the evaluator orders two constructors'
-/// values, by the constructors' names and then by each argument in turn as its type orders.
-pub fn ordering_code(
-  cs: List<SumCtor>,
-) -> { code: Code, operands: Map<Bytes, Bytes>, typed: Map<Bytes, Typed> } = {
-  let at = |node: Node, span: Span| { own: Borrowed, node: node, span: span };
+/// the binder and call types it files: as the evaluator orders two constructors' values, by the
+/// constructors' names and then by each argument in turn as its type orders.
+pub fn ordering_code(cs: List<SumCtor>) -> { code: Code, typed: Map<Bytes, Typed> } = {
+  let at = |node: Node, span: Span| { node: node, span: span };
   let placed = |k: Int| { start: 0, end: k, gen: 1 };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
   let ctor = |name: Bytes| at(NVar({ name: name, slot: None }), dummy_span());
@@ -565,8 +530,8 @@ pub fn ordering_code(
       dummy_span(),
     );
   let walked = range(0, cs.len()).fold(
-    { arms: [], operands: Map::new(), typed: Map::new(), next: 2, slot: 4 },
-    |acc: { arms: List<CodeArm>, operands: Map<Bytes, Bytes>, typed: Map<Bytes, Typed>, next: Int, slot: Int }, i: Int| {
+    { arms: [], typed: Map::new(), next: 2, slot: 4 },
+    |acc: { arms: List<CodeArm>, typed: Map<Bytes, Typed>, next: Int, slot: Int }, i: Int| {
       let c = match cs.at(i) {
         Some(x) -> x,
         None -> { name: b"", index: 0, fields: [], params: [] },
@@ -583,8 +548,6 @@ pub fn ordering_code(
       let typed = range(0, 3 * k).fold(acc.typed, |m: Map<Bytes, Typed>, n: Int|
         m.insert(span_key(placed(acc.next + n)), if n < 2 * k { filed_as(ty(n % k), []) }
         else { filed_as(unknown_type(), [ty(n - 2 * k)]) }));
-      let operands = range(0, k).fold(acc.operands, |m: Map<Bytes, Bytes>, j: Int|
-        m.insert(span_key(placed(acc.next + 3 * k + j)), b"Ordering"));
       let compared = |j: Int|
         at(
           NApp({
@@ -643,16 +606,11 @@ pub fn ordering_code(
           guard: None,
           body: inner,
         }),
-        operands: operands,
         typed: typed,
         next: acc.next + 4 * k,
         slot: acc.slot + 3 * k,
       }
     },
-  );
-  let operands = walked.operands.insert(span_key(placed(0)), b"Int").insert(
-    span_key(placed(1)),
-    b"Int",
   );
   let body = at(
     NIf({
@@ -670,21 +628,18 @@ pub fn ordering_code(
     dummy_span(),
   );
   {
-    code: marked(
-      itself_equal(
-        at(
-          NBlock({
-            stmts: [
-              CLet({ name: b"ra", slot: 2, value: ranked(var(b"a", 0)) }),
-              CLet({ name: b"rb", slot: 3, value: ranked(var(b"b", 1)) }),
-            ],
-            tail: Some(body),
-          }),
-          dummy_span(),
-        ),
+    code: itself_equal(
+      at(
+        NBlock({
+          stmts: [
+            CLet({ name: b"ra", slot: 2, value: ranked(var(b"a", 0)) }),
+            CLet({ name: b"rb", slot: 3, value: ranked(var(b"b", 1)) }),
+          ],
+          tail: Some(body),
+        }),
+        dummy_span(),
       ),
     ),
-    operands: operands,
     typed: walked.typed,
   }
 }
@@ -692,7 +647,7 @@ pub fn ordering_code(
 /// `order`, the body of a written root ordering its parameters `a` and `b`, answering `Equal` at
 /// once where the two are one object: an order is reflexive, so nothing of it need be walked.
 fn itself_equal(order: Code) -> Code = {
-  let at = |node: Node| { own: Borrowed, node: node, span: dummy_span() };
+  let at = |node: Node| { node: node, span: dummy_span() };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
   at(
     NIf({
@@ -723,7 +678,7 @@ pub fn digest_code(
   items: List<Item>,
   ty: Type,
 ) -> { code: Code, typed: Map<Bytes, Typed> } / {abort.raise} = {
-  let at = |node: Node| { own: Borrowed, node: node, span: dummy_span() };
+  let at = |node: Node| { node: node, span: dummy_span() };
   let placed = |k: Int| { start: 0, end: k, gen: 1 };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
   let named = |name: Bytes| at(NVar({ name: name, slot: None }));
@@ -734,16 +689,13 @@ pub fn digest_code(
   // `x` encoded at its type: a call the emitter settles by what is filed at `k`.
   let part = |x: Code, k: Int|
     at(
-      NApp({
-        func: { own: Borrowed, node: NVar({ name: b"?encoded", slot: None }), span: placed(k) },
-        args: [x],
-      }),
+      NApp({ func: { node: NVar({ name: b"?encoded", slot: None }), span: placed(k) }, args: [x] }),
     );
   let parted = |m: Map<Bytes, Typed>, t: Type, k: Int|
     m.insert(span_key(placed(k)), filed_as(unknown_type(), [t]));
   let joined = |parts: List<Code>| call(named(b"?concat"), [at(NList({ items: parts }))]);
   // The runtime's encoding, of a type this root cannot write.
-  let read = { code: marked(part(var(b"a", 0), 1)), typed: Map::new() };
+  let read = { code: part(var(b"a", 0), 1), typed: Map::new() };
   let fields_of = match ty { TyRecord(fs) -> Some(fs), TyNominal(x) -> Some(x.fields), _ -> None };
   match fields_of {
     Some(fs) -> {
@@ -762,7 +714,7 @@ pub fn digest_code(
               },
           },
       );
-      { code: marked(joined(walked.parts)), typed: walked.typed }
+      { code: joined(walked.parts), typed: walked.typed }
     },
     None -> match ty {
       TyCon(c) -> match ctors.sums.get(c.name) {
@@ -783,9 +735,10 @@ pub fn digest_code(
               Some(s) -> match s.ty {
                 TyFn(fn_ty) -> if s.ty_vars.len() > 0 { read } else {
                   {
-                    code: marked(
-                      joined([written(byte_of_int(16)), part(call(named(f), [var(b"a", 0)]), 1)]),
-                    ),
+                    code: joined([
+                      written(byte_of_int(16)),
+                      part(call(named(f), [var(b"a", 0)]), 1),
+                    ]),
                     typed: parted(Map::new(), fn_ty.ret, 1),
                   }
                 },
@@ -841,7 +794,7 @@ pub fn digest_code(
                 },
               );
               {
-                code: marked(at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms }))),
+                code: at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms })),
                 typed: walked.typed,
               }
             },
@@ -876,6 +829,15 @@ pub fn at_args(ty: Type, params: List<Int>, args: List<Type>) -> Type =
       }),
   }
 
+/// The kind a root written from a type takes a value of `ty` at: the word it crosses a call as, an
+/// `Option` its payload's, a `Result` its tagged word, any other its object.
+pub fn reflected_kind(ty: Type) -> Kind =
+  match carrier_of(ty) {
+    Whole(k) -> if is_sum(k) { k } else { KBoxed },
+    Cases(sc) -> KSum(sc.spec),
+    Fields(_) -> KBoxed,
+  }
+
 /// The body of a root `reflection_root` names, over its parameter `a`, a value of `ty`, and the
 /// types it files: a record's fields in their names' order, and a declared sum's constructor's name
 /// and arguments, each part reflected at its own type. Under `shown`, a sum whose module states a
@@ -888,7 +850,7 @@ pub fn reflection_code(
   shown: Bool,
   ty: Type,
 ) -> { code: Code, typed: Map<Bytes, Typed> } = {
-  let at = |node: Node| { own: Borrowed, node: node, span: dummy_span() };
+  let at = |node: Node| { node: node, span: dummy_span() };
   let placed = |k: Int| { start: 0, end: k, gen: 1 };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
   let named = |name: Bytes| at(NVar({ name: name, slot: None }));
@@ -896,12 +858,7 @@ pub fn reflection_code(
   let builtin = if shown { b"?shown" } else { b"?reflect" };
   // `x`, of type `t`, reflected at its type: a call the emitter settles by what is filed at `k`.
   let part = |x: Code, k: Int|
-    at(
-      NApp({
-        func: { own: Borrowed, node: NVar({ name: builtin, slot: None }), span: placed(k) },
-        args: [x],
-      }),
-    );
+    at(NApp({ func: { node: NVar({ name: builtin, slot: None }), span: placed(k) }, args: [x] }));
   let parted = |m: Map<Bytes, Typed>, t: Type, k: Int|
     m.insert(span_key(placed(k)), filed_as(unknown_type(), [t]));
   let fields_of = match ty { TyRecord(fs) -> Some(fs), TyNominal(x) -> Some(x.fields), _ -> None };
@@ -919,7 +876,6 @@ pub fn reflection_code(
             Some(f) ->
               {
                 items: acc.items.push({
-                  own: Borrowed,
                   node: NRecord({
                     fields: [
                       { name: b"name", value: at(NLit(LStr(f.name))) },
@@ -939,13 +895,13 @@ pub fn reflection_code(
           },
       );
       {
-        code: marked(call(named(b"std.value.VRecord"), [at(NList({ items: walked.items }))])),
+        code: call(named(b"std.value.VRecord"), [at(NList({ items: walked.items }))]),
         typed: walked.typed,
       }
     },
     None -> match ty {
       TyCon(c) -> match ctors.sums.get(c.name) {
-        None -> { code: marked(part(var(b"a", 0), 1)), typed: Map::new() },
+        None -> { code: part(var(b"a", 0), 1), typed: Map::new() },
         Some(cs) -> {
           let stated = if !shown { None } else {
             items.fold(None, |acc: Option<Bytes>, item: Item|
@@ -963,10 +919,9 @@ pub fn reflection_code(
                 && (match h.scheme { Some(s) -> s.ty_vars.len() > 0, None -> false })));
           match stated {
             // What the runtime reads, it reads through the function at the type it is called at.
-            Some(f) -> if generic(f) { { code: marked(part(var(b"a", 0), 1)), typed: Map::new() } }
-            else {
+            Some(f) -> if generic(f) { { code: part(var(b"a", 0), 1), typed: Map::new() } } else {
               {
-                code: marked(call(named(b"std.value.VShown"), [call(named(f), [var(b"a", 0)])])),
+                code: call(named(b"std.value.VShown"), [call(named(f), [var(b"a", 0)])]),
                 typed: Map::new(),
               }
             },
@@ -1019,32 +974,14 @@ pub fn reflection_code(
                 },
               );
               {
-                code: marked(at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms }))),
+                code: at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms })),
                 typed: walked.typed,
               }
             },
           }
         },
       },
-      _ -> { code: marked(part(var(b"a", 0), 1)), typed: Map::new() },
+      _ -> { code: part(var(b"a", 0), 1), typed: Map::new() },
     },
   }
 }
-
-/// How the checker names a compared value's type to the emitter: a type of no arguments by its
-/// name, a function's as a word, and any other spelled.
-fn compared_name(t: Type) -> Bytes =
-  match t {
-    TyCon(c) -> if c.args.len() == 0 { c.name } else { spelled_type(t) },
-    TyFn(_) -> b"",
-    _ -> spelled_type(t),
-  }
-
-/// The operand name of `t`, a type a specialisation settled an operand's variables at, where
-/// it is known: `compared_name`, and a variable as the checker names one.
-pub fn operand_spelled(t: Type) -> Option<Bytes> =
-  match t {
-    TyVar(v) -> if v < 0 { None } else { Some(b"'".concat(ascii_of_int(v))) },
-    TyCon(c) -> if c.args.len() == 0 && c.name == b"_" { None } else { Some(compared_name(t)) },
-    _ -> Some(compared_name(t)),
-  }

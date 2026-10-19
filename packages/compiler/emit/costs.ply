@@ -1,35 +1,38 @@
-//! Whether an update copies, read off the lowering the emitter compiles so a move here is a move there.
+//! Whether an update copies, read off the body the emitter compiles, each read moving where its typed
+//! form moves it (`emit.moves`), so a move here is a move there.
 
-import syntax.parsing (Span, Ident, QName, dummy_span, span_bin, span_between)
+import syntax.parsing (Span, QName, dummy_span, span_bin, span_between)
 import emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch,
                   NPerform, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, NKnown, NLabel,
-                  CodeStmt, CLet, CLetPat, CDo, CodeArm, CodeField, CodeClause, Capture, Own, Owned,
-                  pat_slots, lower_to_emit)
-import syntax.items (Module, Derived, Item, IFn, ITest, ILaw, Binder, FnDef, ReturnsFresh,
-                     ReturnsParam, parse)
-import syntax.exprs (Param, Expr)
-import expand.rewrite (expand, witness_param)
+                  CodeStmt, CLet, CLetPat, CDo, CodeArm, CodeField, CodeClause, Capture, pat_slots)
+import emit.moves (Moves, no_moves, read_moved, capture_moved, field_taken, root_moves)
+import emit.lower.setting (Setting, ItemRoot, settings_in)
+import unit (parsed_natives)
+import check.infer.definitions (Extern)
+import syntax.items (Module, Derived, Item, IFn, ITest, ILaw, FnDef, ReturnsFresh, ReturnsParam)
+import syntax.exprs (Param, prelude_module)
+import expand.rewrite (witness_param)
 import expand.embed (EmbedAt, EmbedFile, embed_tables, rewritten)
-import expand.derive (expand_derives)
 import check.resolve.tables (ParsedModule, Resolved, ValueSpace, Source, qualify)
 import check.resolve (ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_packaged)
 import check.resolve.scopes (no_packages, find)
 import check.infer.checker (Builtin, builtins, test_owner, LabelSite, UpdateShape, WitnessOp,
-                            WitnessRef, WitnessOrder, OperandSite, TypedSite, TrySite, MemberSite)
-import check.infer (expanded_mods, RootFacts, no_root_facts, root_facts_bin, types_named)
+                            WitnessRef, WitnessOrder, TypedSite, TrySite, MemberSite)
+import check.infer (RootFacts, no_root_facts, root_facts_bin, types_named)
 import front.facts (Analysis, cuts_of)
 import front.rows (Rows, KnownDefRow, KnownTestRow, Cut)
 import front.seam (WalkedFacts, Analysed, Refused)
-import front.published (analyse, facts_read, rows_of, walked_facts)
+import front.published (analyse, rows_of, walked_facts)
 import front (analyse_pulling_std)
 import store.hash.encoding (hex)
 import front.interface (stubbed)
 import check.semantics (Handed, Element, Threaded, Taken, Number, Unsaid, Folded, prelude_iterates)
-import front.diagnostics (ParsedSource, parse_all)
+import front.diagnostics (ParsedSource, parse_all, parse_at)
 import std.bin
 import std.hash (blake3)
 import std.list
 import std.bytes (ascii_of_int)
+import std.prelude_source
 
 type Cause =
   | CReadAgain
@@ -144,8 +147,9 @@ type Def = {
 
 /// `def` is the index in `Program.defs`, or -1 for a test or a law, which has no caller. A body an
 /// earlier run walked is lowered only once a round finds none of its `kept` walks answering, and
-/// `lowered` says it has been: `code` and `span` (its item's) are the lowering's. `looked` is what
-/// its kept walks looked up.
+/// `lowered` says it has been: `code`, `span` (its item's), `moves` (which of its reads the typed
+/// form moves) and `unformed` (why the form does not cover it, where it does not) are the
+/// lowering's. `looked` is what its kept walks looked up.
 type Body = {
   kind: Bytes,
   module: Int,
@@ -156,6 +160,8 @@ type Body = {
   arity: Int,
   span: Span,
   code: Option<Code>,
+  moves: Moves,
+  unformed: Option<Bytes>,
   lowered: Bool,
   reuse: Option<Span>,
   looked: List<Looked>,
@@ -179,7 +185,9 @@ type Program = {
   bodies: List<Body>,
 }
 
-type Env = { prog: Program, module: Int, tables: Tables }
+/// What a body is walked in: the program, the body's module, the tables of this round, which reads
+/// of the body its typed form moves, and why the form does not cover it, where it does not.
+type Env = { prog: Program, module: Int, tables: Tables, moves: Moves, unformed: Option<Bytes> }
 
 type Parsed = { name: Bytes, module: Module, derived: List<Derived>, bad: Bool }
 
@@ -225,14 +233,15 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
   match c.node {
     NLit(_) -> fresh(state),
     NLabel(_) -> fresh(state),
-    NVar(v) -> var_owner(env, v.name, v.slot, c.own, state),
+    NVar(v) -> var_owner(env, v.name, v.slot, read_moved(env.moves, c.span), state),
     NUnary(u) -> fresh(walk(env, u.operand, state).state),
     NBinary(b) -> fresh(walk(env, b.rhs, walk(env, b.lhs, state).state).state),
-    NLambda(l) -> fresh(poison(barrier(env, l.params, [], l.body, state), l.captures, l.body)),
+    NLambda(l) ->
+      fresh(poison(env, barrier(env, l.params, [], l.body, state), l.captures, l.body, l.at)),
     // The branches' answers are fields of a tuple made here.
     NParallel(pr) -> fresh(pr.branches.fold(state, |s: CostState, b: Code| walk(env, b, s).state)),
     NApp(a) -> app(env, c.span, a.func, a.args, state),
-    NKnown(k) -> var_owner(env, k.name, Some(k.slot), c.own, state),
+    NKnown(k) -> var_owner(env, k.name, Some(k.slot), read_moved(env.moves, c.span), state),
     NIf(i) -> {
       let t = walk(env, i.then_branch, walk(env, i.cond, state).state);
       let e = walk(env, i.else_branch, t.state);
@@ -277,9 +286,13 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
           u.sets.fold(state, |acc: CostState, f: CodeField| walk(env, f.value, acc).state),
         ).state,
       ),
-    // A field read marked `Owned` takes the field from a record nothing after it reads it of.
+    // A field the form takes out of its record, which nothing after it reads it of, moves the record.
     NField(f) -> {
-      let b = walk(env, if c.own == Owned { { ..f.base, own: Owned } } else { f.base }, state);
+      let b = match f.base.node {
+        NVar(v) -> if field_taken(env.moves, c.span) { var_owner(env, v.name, v.slot, true, state) }
+        else { walk(env, f.base, state) },
+        _ -> walk(env, f.base, state),
+      };
       match b.owner {
         BlockedOwner(reason) ->
           {
@@ -308,8 +321,11 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
       },
     NHandle(h) -> {
       let caught = h.clauses.fold(state, |acc: CostState, cl: CodeClause|
-        poison(acc, cl.captures, cl.body));
-      let armed = match h.ret { Some(r) -> poison(caught, r.captures, r.body), None -> caught };
+        poison(env, acc, cl.captures, cl.body, cl.at));
+      let armed = match h.ret {
+        Some(r) -> poison(env, caught, r.captures, r.body, r.at),
+        None -> caught,
+      };
       let ran = walk(env, h.body, armed).state;
       let clauses = h.clauses.fold(ran, |acc: CostState, cl: CodeClause|
         barrier(env, cl.params + (if cl.resume { 1 } else { 0 }), [], cl.body, acc));
@@ -320,7 +336,7 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
     },
     NSimulate(x) ->
       {
-        state: barrier(env, 0, [], x.body, poison(state, x.captures, x.body)),
+        state: barrier(env, 0, [], x.body, poison(env, state, x.captures, x.body, x.at)),
         owner: unknown(CHandler, b"the value a `simulate` answered"),
       },
   }
@@ -360,10 +376,11 @@ fn barrier(
   with_chain(walk(env, body, inner).state, state.chain)
 }
 
-/// A cloning capture gives the binding a second owner; a moving one leaves it dead.
-fn poison(state: CostState, caps: List<Capture>, body: Code) -> CostState =
+/// A cloning capture gives the binding a second owner; a moving one, which the closure written at
+/// `at` takes as nothing after it reads it, leaves it dead.
+fn poison(env: Env, state: CostState, caps: List<Capture>, body: Code, at: Span) -> CostState =
   caps.fold(state, |acc: CostState, capture: Capture|
-    if capture.own == Owned { acc } else {
+    if capture_moved(env.moves, at, capture.src) { acc } else {
       match owner_of(acc, capture.src) {
         None -> acc,
         Some(BlockedOwner(_)) -> acc,
@@ -445,11 +462,12 @@ fn free(name: Bytes) -> Owner =
     ]),
   )
 
+/// The owner of what reading `name` answers; `moved` where the form hands the slot's value on there.
 fn var_owner(
   env: Env,
   name: Bytes,
   slot: Option<Int>,
-  own: Own,
+  moved: Bool,
   state: CostState,
 ) -> WithOwner / {abort.raise} =
   match slot {
@@ -457,15 +475,24 @@ fn var_owner(
       Some(o) ->
         {
           state: state,
-          owner: if own == Owned { o } else {
-            blocked(
-              CReadAgain,
-              Bytes::concat_all([
-                b"`",
-                name,
-                b"` is read again after this point, so this use clones it",
-              ]),
-            )
+          owner: match env.unformed {
+            Some(why) ->
+              unknown(
+                CProgram,
+                b"the typed form does not lower this body, so no read of it is known to move: ".concat(
+                  why,
+                ),
+              ),
+            None -> if moved { o } else {
+              blocked(
+                CReadAgain,
+                Bytes::concat_all([
+                  b"`",
+                  name,
+                  b"` is read again after this point, so this use clones it",
+                ]),
+              )
+            },
           },
         },
       None -> { state: state, owner: free(name) },
@@ -661,7 +688,8 @@ fn callback(
   state: CostState,
 ) -> WithOwner / {abort.raise} =
   match arg.node {
-    NLambda(l) -> fresh(poison(barrier(env, l.params, owners, l.body, state), l.captures, l.body)),
+    NLambda(l) ->
+      fresh(poison(env, barrier(env, l.params, owners, l.body, state), l.captures, l.body, l.at)),
     _ -> walk(env, arg, state),
   }
 
@@ -780,7 +808,7 @@ fn walk_body(env: Env, b: Body) -> Found / {abort.raise} =
     Some(c) -> {
       let chain = range(0, b.arity).map(|k: Int|
         { slot: k, owner: if b.def < 0 { FreshOwner } else { ParamOwner(k) } });
-      let w = walk(env, c, {
+      let w = walk({ ..env, moves: b.moves, unformed: b.unformed }, c, {
         chain: chain,
         sites: [],
         demands: [],
@@ -887,7 +915,19 @@ fn evaluate(p: Priced, run: Run, which: (Int) -> Bool, tables: Tables) -> Run / 
         match tried.get(i) {
           Walks -> {
             let b: Body = ready.prog.bodies.get(i);
-            acc.insert(i, walk_body({ prog: ready.prog, module: b.module, tables: tables }, b))
+            acc.insert(
+              i,
+              walk_body(
+                {
+                  prog: ready.prog,
+                  module: b.module,
+                  tables: tables,
+                  moves: no_moves(),
+                  unformed: None,
+                },
+                b,
+              ),
+            )
           },
           _ -> acc,
         });
@@ -937,7 +977,14 @@ fn relowered(p: Priced, run: Run, modules: List<Int>) -> Run / {abort.raise} =
                   panic("a module whose key stands lowered to other bodies than it kept")
                 } else {
                   {
-                    bodies: acc.bodies.push({ ..b, code: m.code, span: m.span, lowered: true }),
+                    bodies: acc.bodies.push({
+                      ..b,
+                      code: m.code,
+                      span: m.span,
+                      moves: m.moves,
+                      unformed: m.unformed,
+                      lowered: true,
+                    }),
                     seen: acc.seen.insert(b.module, k + 1),
                   }
                 },
@@ -1119,71 +1166,82 @@ fn quoted(s: Bytes) -> Bytes =
     b"\"",
   ])
 
-fn code_of(names: List<Bytes>, labels: List<Bytes>, body: Expr) -> Option<Code> / {abort.raise} =
-  match lower_to_emit(names, labels, Map::new(), body) { Some(l) -> Some(l.code), None -> None }
-
-/// Module `i`'s bodies, lowered, in item order.
-fn module_bodies(i: Int, m: ParsedModule, index: Map<Bytes, Int>) -> List<Body> / {abort.raise} =
-  m.module.items.fold([], |a: List<Body>, item: Item|
-    match item {
-      IFn(d) -> {
-        let labels = d.generics.labels.map(|ident: Ident| ident.name);
-        let names = d.params.map(|param: Param| param.name.name);
-        a.push({
-          kind: b"fn",
-          module: i,
-          module_name: m.name,
-          name: d.name.name,
-          label: Bytes::concat_all([m.name, b".", d.name.name]),
-          def: match index.get(qualify(m.name, d.name.name)) { Some(k) -> k, None -> 0 - 1 },
-          arity: names.len() + labels.len(),
-          span: d.span,
-          code: code_of(names, labels, d.body),
-          lowered: true,
-          reuse: d.reuse,
-          looked: [],
-          kept: [],
-        })
+/// Module `i`'s bodies in item order, each as the build lowers it and with the moves its typed form
+/// makes, `setting` the module's with the runtime's natives `natives`.
+fn module_bodies(
+  i: Int,
+  setting: Setting,
+  roots: List<ItemRoot>,
+  natives: List<Bytes>,
+  index: Map<Bytes, Int>,
+) -> List<Body> / {abort.raise} = {
+  let s = { ..setting, builtins: natives };
+  let m = setting.module;
+  roots.fold([], |a: List<Body>, ir: ItemRoot| {
+    let lowered = match ir.root.code {
+      None ->
+        { code: None, moves: no_moves(), unformed: Some(b"a body that does not lower to Code") },
+      Some(code) -> match root_moves(s, ir.root, code) {
+        Ok(mv) -> { code: Some(code), moves: mv, unformed: None },
+        Err(no) -> { code: Some(code), moves: no_moves(), unformed: Some(no.why) },
       },
-      // Over cases, the body is read as a function of its case.
-      ITest(t) -> {
-        let names = match t.cases { Some(c) -> [c.binder.name], None -> [] };
-        a.push({
-          kind: b"test",
-          module: i,
-          module_name: m.name,
-          name: t.name,
-          label: Bytes::concat_all([m.name, b": test ", quoted(t.name)]),
-          def: 0 - 1,
-          arity: names.len(),
-          span: t.span,
-          code: code_of(names, [], t.body),
-          lowered: true,
-          reuse: None,
-          looked: [],
-          kept: [],
-        })
-      },
-      ILaw(l) -> {
-        let names = l.binders.map(|binder: Binder| binder.name.name);
-        a.push({
-          kind: b"law",
-          module: i,
-          module_name: m.name,
-          name: l.name,
-          label: Bytes::concat_all([m.name, b": law ", quoted(l.name)]),
-          def: 0 - 1,
-          arity: names.len(),
-          span: l.span,
-          code: code_of(names, [], l.body),
-          lowered: true,
-          reuse: None,
-          looked: [],
-          kept: [],
-        })
-      },
+    };
+    let body = |kind: Bytes, name: Bytes, label: Bytes, def: Int, span: Span, reuse: Option<Span>|
+      {
+        kind: kind,
+        module: i,
+        module_name: m,
+        name: name,
+        label: label,
+        def: def,
+        arity: ir.root.params.len(),
+        span: span,
+        code: lowered.code,
+        moves: lowered.moves,
+        unformed: lowered.unformed,
+        lowered: true,
+        reuse: reuse,
+        looked: [],
+        kept: [],
+      };
+    match ir.item {
+      IFn(d) ->
+        a.push(
+          body(
+            b"fn",
+            d.name.name,
+            Bytes::concat_all([m, b".", d.name.name]),
+            match index.get(qualify(m, d.name.name)) { Some(k) -> k, None -> 0 - 1 },
+            d.span,
+            d.reuse,
+          ),
+        ),
+      ITest(t) ->
+        a.push(
+          body(
+            b"test",
+            t.name,
+            Bytes::concat_all([m, b": test ", quoted(t.name)]),
+            0 - 1,
+            t.span,
+            None,
+          ),
+        ),
+      ILaw(l) ->
+        a.push(
+          body(
+            b"law",
+            l.name,
+            Bytes::concat_all([m, b": law ", quoted(l.name)]),
+            0 - 1,
+            l.span,
+            None,
+          ),
+        ),
       _ -> a,
-    })
+    }
+  })
+}
 
 /// `witnesses` are the parameters the lowering passes ahead of the written ones.
 fn def_of_fn(
@@ -1332,15 +1390,13 @@ fn whole_of(p: Priced) -> Option<Whole> / {abort.raise} = {
   let tables = embed_tables(a.embeds);
   let parsed = range(0, a.mods.len()).map(|i: Int| {
     let name = a.mods.get(i).name;
-    let r = parse(match p.srcs.at(i) { Some(src) -> src, None -> b"" });
-    let x = expand(r.node, r.parser.diags);
-    let d = expand_derives(i, name, x.module);
-    let e = rewritten(tables, name, d.module);
+    let x = parse_at(i, { name: name, src: match p.srcs.at(i) { Some(src) -> src, None -> b"" } });
+    let e = rewritten(tables, name, x.module.module);
     {
       name: name,
       module: e.module,
-      derived: d.derived,
-      bad: d.diags.len() > 0 || e.diags.len() > 0,
+      derived: x.module.derived,
+      bad: x.diags.len() > 0 || e.diags.len() > 0,
     }
   });
   if parsed.fold(false, |acc: Bool, x: Parsed| acc || x.bad) { None } else {
@@ -1396,10 +1452,11 @@ fn lower(
     let missing = match taken { Some(_) -> false, None -> needs };
     if missing { None } else {
       let tables = embed_tables(a.embeds);
-      let read = wanted.fold(
+      let wants = wanted.fold(Map::new(), |m: Map<Int, Bool>, i: Int| m.insert(i, true));
+      let read = range(0, a.mods.len()).fold(
         { mods: [], bad: false },
         |acc: { mods: List<ParsedModule>, bad: Bool }, i: Int|
-          if cut(i) {
+          if !wants.contains(i) { { ..acc, mods: acc.mods.push(a.mods.get(i)) } } else if cut(i) {
             {
               ..acc,
               mods: acc.mods.push(match taken { Some(w) -> w.mods.get(i), None -> a.mods.get(i) }),
@@ -1411,16 +1468,19 @@ fn lower(
           },
       );
       if read.bad { None } else {
-        match facts_read(p.rows, p.walked, None, read.mods) {
+        let natives = parsed_natives(a.mods).map(|e: Extern| e.name);
+        // A module read cut binds what its bodies' expansions bind only in the whole resolution.
+        let resolved = match taken { Some(w) -> { ..a, r: w.r }, None -> a };
+        match settings_in(
+            resolved,
+            p.rows,
+            p.walked,
+            read.mods,
+            wanted,
+            |i: Int, s: Setting, roots: List<ItemRoot>| module_bodies(i, s, roots, natives, index),
+          ) {
           Err(_) -> None,
-          Ok(facts) -> {
-            let expanded = expanded_mods(read.mods, facts.elaboration, a.r.signatures);
-            Some({
-              bodies: range(0, wanted.len()).map(|k: Int|
-                module_bodies(wanted.get(k), expanded.get(k), index)),
-              whole: taken,
-            })
-          },
+          Ok(bodies) -> Some({ bodies: bodies, whole: taken }),
         }
       }
     }
@@ -1465,6 +1525,8 @@ fn held_body(prog: Program, i: Int, module_name: Bytes, k: KeptBody) -> Option<B
         arity: k.arity,
         span: dummy_span(),
         code: None,
+        moves: no_moves(),
+        unformed: None,
         lowered: false,
         reuse: k.reuse,
         looked: k.looked,
@@ -1826,9 +1888,7 @@ fn loose_by_module(w: WalkedFacts, mods: List<ParsedModule>) -> Map<Int, Bytes> 
     into(acc, x.module, |f: RootFacts| { ..f, ops: f.ops.push({ ..x, module: 0 }) }));
   let referenced = l.refs.fold(witnessed, |acc: Map<Int, RootFacts>, x: WitnessRef|
     into(acc, x.module, |f: RootFacts| { ..f, refs: f.refs.push({ ..x, module: 0 }) }));
-  let operated = l.operands.fold(referenced, |acc: Map<Int, RootFacts>, x: OperandSite|
-    into(acc, x.module, |f: RootFacts| { ..f, operands: f.operands.push({ ..x, module: 0 }) }));
-  let tried = l.tries.fold(operated, |acc: Map<Int, RootFacts>, x: TrySite|
+  let tried = l.tries.fold(referenced, |acc: Map<Int, RootFacts>, x: TrySite|
     into(acc, x.module, |f: RootFacts| { ..f, tries: f.tries.push({ ..x, module: 0 }) }));
   let called = l.members.fold(tried, |acc: Map<Int, RootFacts>, x: MemberSite|
     into(acc, x.module, |f: RootFacts| { ..f, members: f.members.push({ ..x, module: 0 }) }));
@@ -2060,8 +2120,10 @@ test "a run that takes what earlier runs walked answers as a run from nothing, a
 
 /// `user` checked with what it pulls of `shipped`, as a driver hands it to the cost checker.
 fn checked_pulling(user: List<Source>, shipped: List<Source>) -> Priced / {abort.raise} = {
-  let texts = user.concat(shipped).fold(Map::new(), |acc: Map<Bytes, Bytes>, x: Source|
-    acc.insert(x.name, x.src));
+  let texts = user.concat(shipped).fold(
+    Map::new().insert(prelude_module(), prelude_source::text()),
+    |acc: Map<Bytes, Bytes>, x: Source| acc.insert(x.name, x.src),
+  );
   match analyse_pulling_std(user, shipped).out {
     Refused(_) -> panic("the program checks"),
     Analysed(w) ->
@@ -2074,18 +2136,17 @@ fn checked_pulling(user: List<Source>, shipped: List<Source>) -> Priced / {abort
 
 /// The program as a load reads it once nothing module `name` reaches moved since the build that
 /// kept it: that module's functions' bodies blank, its tests standing, and resolved so, without
-/// what its bodies bind.
+/// what its bodies bind; every other module as the front end read it.
 fn as_stub(whole: Priced, name: Bytes) -> Priced / {abort.raise} = {
   let a = whole.analysis;
   let i = range(0, a.mods.len()).fold(0, |acc: Int, k: Int|
     if a.mods.get(k).name == name { k } else { acc });
   let cuts = cuts_of(a.mods.get(i)).filter(|c: Cut| c.name.len() > 0);
-  let read = range(0, a.mods.len()).map(|k: Int|
-    {
-      name: a.mods.get(k).name,
-      src: if k == i { stubbed(whole.srcs.get(k), cuts) } else { whole.srcs.get(k) },
-    });
-  match resolved_as(a, parse_all(read).map(|x: ParsedSource| x.module)) {
+  let stub = parse_at(i, { name: name, src: stubbed(whole.srcs.get(i), cuts) }).module;
+  match resolved_as(
+      a,
+      range(0, a.mods.len()).map(|k: Int| if k == i { stub } else { a.mods.get(k) }),
+    ) {
     ResolveFailed(_) -> panic("the stubbed program resolves"),
     ResolveSucceeded(x) ->
       {

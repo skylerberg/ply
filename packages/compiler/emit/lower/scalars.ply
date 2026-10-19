@@ -9,7 +9,7 @@ import syntax.patterns (Lit, LInt, LBool, LFloat, LFixed, LWide, LChar, LStr, LB
 import check.types (Type, TyVar, TyCon, TyRecord, TyNominal, Field, named_type, spelled_type)
 import emit.typing (unknown_type)
 import syntax.parsing (Span)
-import emit.c (Width, KSum, width_named, lit_int)
+import emit.c (Width, KSum, width_named, lit_int, is_bitop, binary_code)
 import emit.reps (Ctors, Whole, Cases, has_vars, type_vars, carrier_of, compared_by_ctors,
                   nullary_sum, generic_sum, written_sum)
 import emit.answer (Scalar, Exact, literal_bits)
@@ -62,7 +62,7 @@ pub fn operand(cx: Context, op: Bytes, rhs: Code) -> Option<Arg> =
   match divisor(op, rhs) { Some(d) -> Some(AInt(d)), None -> None }
 
 /// `op` over `o`: `!` over a `Bool`, `-` and `~` at the type `o` holds, C's own over a scalar a
-/// register holds and the runtime's over any other word.
+/// register holds and the runtime's over any other word, a declared sum's negation its witness's.
 pub fn unary(cx: Context, o: Lowered, op: Bytes, at: Span) -> Lowered / {abort.raise} =
   if op == b"not" {
     let b = handed(o, RBool, at);
@@ -82,6 +82,9 @@ pub fn unary(cx: Context, o: Lowered, op: Bytes, at: Span) -> Lowered / {abort.r
         CFloat -> if op == b"neg" { alone(cx, o, op, RFloat, ty, at) } else { lacking(o.st, op) },
         CDec -> if op == b"neg" { alone(cx, o, op, RDec, ty, at) } else { lacking(o.st, op) },
         CWord(t) -> by_runtime(cx, needing(o.st, t, false), helper, [], [o.arg], ty, at),
+        CSum(t) -> if op == b"neg" {
+          by_runtime(cx, needing(o.st, t, false), helper, [], [o.arg], ty, at)
+        } else { lacking(o.st, op) },
         _ -> lacking(o.st, op),
       }
     }
@@ -92,7 +95,7 @@ pub fn unary(cx: Context, o: Lowered, op: Bytes, at: Span) -> Lowered / {abort.r
 pub fn binary(cx: Context, l: Lowered, r: Lowered, op: Bytes, at: Span) -> Lowered / {abort.raise} = {
   let ty = match l.arg { AInt(_) -> type_of(r.arg), _ -> type_of(l.arg) };
   if op == b"concat" { by_runtime(cx, r.st, b"rt_concat_p", [], [l.arg, r.arg], ty, at) }
-  else if !comparison(op) && !arithmetic(op) && !shift(op) && !bitwise(op) {
+  else if !comparison(op) && !arithmetic(op) && !shift(op) && !is_bitop(op) {
     refuse(r.st, Scalars, b"an operator: ".concat(op))
   } else if ty == unknown_type() {
     refuse(r.st, Scalars, b"an operator over operands of no known type: ".concat(op))
@@ -249,7 +252,7 @@ fn maybes(a: Arg, b: Arg) -> Bool = rep_of_arg(a) == RMaybe && rep_of_arg(b) == 
 
 /// `l == r` over two `Option`s of type `t` held as their payloads' words: their words where either
 /// is `None`, which is zero, else their payloads, read where they lie, compared as their type
-/// compares; a record's payload by the runtime over its word.
+/// compares, a record's field by field.
 fn options_equal(cx: Context, l: Lowered, r: Lowered, t: Type, at: Span) -> Lowered = {
   let truth = named_type(b"Bool");
   let payload = match t {
@@ -268,10 +271,17 @@ fn options_equal(cx: Context, l: Lowered, r: Lowered, t: Type, at: Span) -> Lowe
   let y = payload_of(cx, x.st, r.arg, payload, at);
   let xs = { st: y.st, arg: x.arg };
   let payloads = match class_of(cx.setting.ctors, payload) {
-    CRecord(_) -> words(cx, xs, y, b"eq", payload, at),
+    CRecord(_) -> match t {
+      TyCon(c) -> match c.args {
+        [TyRecord(fs)] -> fields_equal(cx, y.st, payload, fs, x.arg, y.arg, at),
+        [TyNominal(n)] -> fields_equal(cx, y.st, payload, n.fields, x.arg, y.arg, at),
+        _ -> words(cx, xs, y, b"eq", payload, at),
+      },
+      _ -> words(cx, xs, y, b"eq", payload, at),
+    },
     c -> classed(cx, xs, y, b"eq", payload, c, at),
   };
-  joined(cx, none, same, payloads, at)
+  joined(cx, none, same, payloads, false, at)
 }
 
 /// The payload of `Some` that `of`, an `Option` held as its payload's word, holds, borrowed: a
@@ -411,7 +421,7 @@ fn answer_of(cx: Context, name: Bytes, ty: Type, known: Type) -> Type =
 fn witnessed(cx: Context, st: Lowering, a: Arg, at: Span) -> Lowered =
   match read_literal(st, a) {
     None -> refuse(st, Scalars, b"a stated witness named by no literal"),
-    Some(s) -> if !cx.setting.ctors.names.contains(s.name) {
+    Some(s) -> if !cx.setting.ctors.named.contains(s.name) {
       refuse(s.st, Scalars, b"a stated witness of a type no constructor names")
     } else {
       let tag = bound(cx, s.st, named_type(b"Int"), Tag(s.name), at);
@@ -766,7 +776,7 @@ fn reflected(cx: Context, st: Lowering, name: Bytes, a: Arg, at: Span) -> Lowere
   let op = if name == b"shown" { Shown } else { Reflect };
   let value = |ctor: Bytes| constructed_as(cx, st, ctor, [a], value_type, at);
   let runtime = || through_runtime(cx, needing(st, ty, true), name, [a], value_type, at);
-  if !cx.setting.ctors.names.contains(b"std.value.VUnit") || has_vars(ty) { runtime() } else {
+  if !cx.setting.ctors.named.contains(b"std.value.VUnit") || has_vars(ty) { runtime() } else {
     match ty {
       TyCon(c) -> if written_sum(cx.setting.ctors, c) || walked_container(ty) {
         written(cx, st, op, ty, a, at)
@@ -846,6 +856,25 @@ fn encoded(cx: Context, st: Lowering, hashed: Bool, a: Arg, at: Span) -> Lowered
     if hashed { through_runtime(cx, e.st, b"Bytes::blake3", [e.arg], bytes, at) } else { e }
   }
 }
+
+/// Builtin `name`, an encoding (`?encoded`) or a reflection (`reflect`, `shown`), of the one value of
+/// `args` by the runtime's builtin, whatever type the value holds.
+pub fn runtime_builtin(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  match args {
+    [a] -> {
+      let ty = type_of(a);
+      let answer = if name == b"?encoded" { named_type(b"Bytes") }
+      else { named_type(b"std.value.Value") };
+      through_runtime(cx, needing(st, ty, true), name, [a], answer_of(cx, name, ty, answer), at)
+    },
+    _ -> refuse(st, Scalars, b"a builtin called with other than its arguments: ".concat(name)),
+  }
 
 /// What the root written for `op` of a value of `ty` answers for `a`, which it takes held as the
 /// root is handed it: an `Option` as its payload's word, a `Result` as its tagged word where it is
@@ -980,8 +1009,6 @@ fn needing(st: Lowering, ty: Type, compares: Bool) -> Lowering =
     } else { st },
   }
 
-fn bitwise(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor"
-
 /// Whether `op`'s second operand is a count, an `Int` whatever the first is.
 fn counts(op: Bytes) -> Bool = shift(op) || op == b"rotl" || op == b"rotr"
 
@@ -997,26 +1024,6 @@ fn arity(name: Bytes) -> Int =
       || saturating(name)
       || (name.starts_with(b"checked_") && name != b"checked_neg") { 2 }
   else { 1 }
-
-/// `rt_binary`'s operator numbering, in the runtime table's order.
-fn binary_code(op: Bytes) -> Int =
-  if op == b"add" { 0 }
-  else if op == b"sub" { 1 }
-  else if op == b"mul" { 2 }
-  else if op == b"div" { 3 }
-  else if op == b"rem" { 4 }
-  else if op == b"eq" { 5 }
-  else if op == b"ne" { 6 }
-  else if op == b"lt" { 7 }
-  else if op == b"le" { 8 }
-  else if op == b"gt" { 9 }
-  else if op == b"ge" { 10 }
-  else if op == b"bitand" { 11 }
-  else if op == b"bitor" { 12 }
-  else if op == b"bitxor" { 13 }
-  else if op == b"shl" { 14 }
-  else if op == b"shr" { 15 }
-  else { 16 }
 
 /// The divisor an `Int` division or remainder takes as a literal where it is a negated one:
 /// C's own operator then divides by it.
@@ -1079,9 +1086,9 @@ fn digits_of(w: Bytes) -> Bytes =
 fn is_option(t: Type) -> Bool =
   match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
 
-// Copies of readers of types the lowering takes over from the emitter's operators.
-
-fn walked_container(t: Type) -> Bool =
+/// Whether `==` and `compare` of two values of `t` walk them through roots written for `t`: a
+/// `List`, an `Array` or a `Map` whose type is known throughout.
+pub fn walked_container(t: Type) -> Bool =
   !has_vars(t)
     && (match t {
       TyCon(c) -> c.name == b"List" || c.name == b"Array" || c.name == b"Map",

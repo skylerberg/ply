@@ -1,10 +1,11 @@
-//! The containers family's lowering held to its decisions, and its corpus to today's emitter: list
-//! literals, builtins called through the runtime's helpers, and lengths, bytes and joins written in
-//! place.
+//! The containers family's lowering held to its decisions: list literals, builtins called through
+//! the runtime's helpers, and lengths, bytes and joins written in place; and a corpus that lowers,
+//! checks and prints.
 
 import std.bytes (ascii_of_int)
 import std.prelude_source
-import check.types (Type, TyCon, TyFn)
+import check.types (Type, TyCon, TyFn, TyRecord)
+import syntax.parsing (span_between, span_key)
 import emit.typing (Typed, filed_as, unknown_type)
 import front.diagnostics (parse_all)
 import front.seam (Analysed)
@@ -14,25 +15,53 @@ import check.resolve.tables (qualify)
 import emit.layout (Intrinsic, intrinsics, layouts)
 import emit.answer (Need, Layout)
 import emit.pieces (spelled)
-import emit.code (NField)
+import emit.code (Code, NField)
 import emit.tir (Rep, RInt, RBool, RFloat, RWord, RMaybe, RNum, RFlat, Var, Arg, AVar, Val, Make,
                  Made, MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst, Let, Fn,
-                 Declined, Spine, Data, Containers, rep_of_arg)
+                 Spine, Data, Containers, rep_of_arg)
 import emit.tir.containers (Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew, ArraySet,
                             ArrayOfList, ArrayGet, ColumnField, Bits, IntBits, FloatBits,
                             DecimalBits, Words, Payloads, Records)
 import emit.lower (lowered_fn)
 import emit.own (owned)
-import emit.lower.base (context_of, started)
-import emit.lower.containers (columned, column_read)
+import emit.lower.base (started)
+import emit.lower.calling (context_of)
+import emit.lower.containers (columned, column_read, listed)
 import emit.lower.setting (Root, setting_in)
 import emit.print (printed_fn)
-import emit.compare (Program, Hunk, program_of, formed, checked, answered_today, today_text,
-                     printed_text, normalised, past_counts, hunks)
+import emit.compare (Program, program_of, formed, checked, printed_text, not_built)
 
 /// `src` as module `m` of a program.
 fn program(src: Bytes) -> Program / {abort.raise} =
   match program_of(src) { Ok(p) -> p, Err(why) -> panic(String::of_bytes_lossy(why)) }
+
+test "a list literal is held as its word, whatever type is filed at the span it shares with its items" {
+  // An `embed_dir` writes its list and each record in it at the call's one span.
+  let p = program(b"fn f(s: String) -> List<String> = [s]\n");
+  let item_ty = TyRecord([{ name: b"name", ty: TyCon({ name: b"String", args: [] }) }]);
+  let at = span_between(1000, 1010);
+  let listed_at = |r: Root, code: Code| {
+    let typed = p.setting.typed.insert(span_key(at), { ty: item_ty, args: [] });
+    let item = { id: 0, ty: item_ty, rep: RWord };
+    match listed(
+        context_of({ ..p.setting, typed: typed }, r, code),
+        started([item]),
+        [AVar(item)],
+        at,
+      ).arg {
+      AVar(v) ->
+        Some({ rep: v.rep, list: match v.ty { TyCon(c) -> c.name == b"List", _ -> false } }),
+      _ -> None,
+    }
+  };
+  assert_eq(
+    match p.roots.at(0) {
+      Some(r) -> match r.code { Some(code) -> listed_at(r, code), None -> None },
+      None -> None,
+    },
+    Some({ rep: RWord, list: true }),
+  )
+}
 
 type Bound = { var: Var, val: Val }
 
@@ -445,10 +474,11 @@ test "a handler's variables, a hold's region and `bracket` are the runtime's, ea
       b"fn release(_: Int) -> Unit = ()\n",
       b"fn held(n: Int) -> Int = with_hold[t](n, release) { c -> c.get() }\n",
       b"fn bracketed(n: Int) -> Int = bracket(|| n, release, |x: Int| x + 1)\n",
+      b"fn copied(n: Int) -> Bool = { let got = with_hold[t](n, release) { c -> with_hold[u](c.get(), release) { d -> d.get() } }; got >= 0 }\n",
     ]),
   );
   assert_eq(
-    [b"counted", b"held", b"bracketed"].fold(
+    [b"counted", b"held", b"bracketed", b"copied"].fold(
       [],
       |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
         match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) },
@@ -460,6 +490,12 @@ test "a handler's variables, a hold's region and `bracket` are the runtime's, ea
       |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
     ),
     [b"builtin_bracket_p"],
+  );
+  // A hold answers what its body answers, here an `Int` its comparison reads in a register.
+  assert(
+    !natives_in(bound_in(p, b"copied")).any(
+      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name == b"rt_binary_p",
+    ),
   )
 }
 
@@ -683,78 +719,12 @@ fn corpus_names() -> List<Bytes> =
     b"put_maybe",
   ]
 
-/// `text` read past counts, then as `normalised` reads it.
-fn read_past_counts(text: Bytes) -> List<Bytes> / {abort.raise} = normalised(past_counts(text))
-
 /// Root `m.<name>` of `p` as the form prints it before any check, or why it was not formed.
 fn form_text(p: Program, name: Bytes) -> Bytes / {abort.raise} =
   match formed(p, name) { Ok(f) -> printed_text(f), Err(no) -> no.why }
 
-test "the corpus lowers, and prints as today's emitter writes it but for counts" {
-  let p = program(corpus());
-  assert_eq(
-    corpus_names().fold([], |acc: List<{ name: Bytes, declined: Declined }>, n: Bytes|
-      match formed(p, n) { Ok(_) -> acc, Err(no) -> acc.push({ name: n, declined: no }) }),
-    [],
-  );
-  // Each root's counts, once `own` writes them, pass the check.
-  assert_eq(
-    corpus_names().fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
-      match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) }),
-    [],
-  );
-  let today = answered_today(p, corpus_names());
-  let differing = corpus_names().fold(
-    [],
-    |acc: List<{ name: Bytes, today: List<Bytes>, form: List<Bytes> }>, n: Bytes| {
-      let form = read_past_counts(form_text(p, n));
-      let old = read_past_counts(today_text(today, n));
-      if form == old { acc } else { acc.push({ name: n, today: old, form: form }) }
-    },
-  );
-  let items_boxed = b"each item boxed once every item is evaluated, a boxed number tested for failure";
-  let boxed_first = b"each operand boxed and tested before the call stores its site, where today boxes after the site without a test";
-  let named = [
-    { name: b"ints", why: items_boxed },
-    { name: b"floats", why: items_boxed },
-    { name: b"flags", why: items_boxed },
-    { name: b"cut", why: boxed_first },
-    { name: b"numbers", why: boxed_first },
-    { name: b"text", why: boxed_first },
-    { name: b"element", why: boxed_first },
-    { name: b"reserved", why: boxed_first },
-    {
-      name: b"points",
-      why: b"the record made its object by `print.made`, which writes it otherwise",
-    },
-    {
-      name: b"put_maybe",
-      why: b"the element written as its payload's word; today's writes the `Option`'s object there",
-    },
-  ];
-  assert(
-    differing.map(|d: { name: Bytes, today: List<Bytes>, form: List<Bytes> }| d.name)
-      == named.map(|n: { name: Bytes, why: Bytes }| n.name),
-    Some(
-      String::of_bytes_lossy(
-        Bytes::join(
-          differing.map(|d: { name: Bytes, today: List<Bytes>, form: List<Bytes> }|
-            Bytes::concat_all(
-              [b"== ", d.name].concat(
-                hunks(d.today, d.form).map(|h: Hunk|
-                  Bytes::concat_all([
-                    b"\n-- today\n",
-                    Bytes::join(h.today, b"\n"),
-                    b"\n-- form\n",
-                    Bytes::join(h.form, b"\n"),
-                  ])),
-              ),
-            )),
-          b"\n",
-        ),
-      ),
-    ),
-  )
+test "the corpus lowers, passes the check once its counts are placed, and prints" {
+  assert_eq(not_built(program(corpus()), corpus_names()), [])
 }
 
 /// A function of the prelude calling each extern written in place, as the prelude's own functions
