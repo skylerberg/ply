@@ -10,6 +10,11 @@ import emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, N
 import syntax.parsing (Span, read_site)
 import syntax.patterns (LUnit)
 import syntax.exprs (detached_at)
+import std.graph
+import check.resolve.tables (qualify)
+import emit.c (position_of)
+import emit.answer (sorted_widths)
+import emit.reps (Def)
 import emit.typing (unknown_type)
 import emit.tir (Var, Arg, AZero, RWord, RBool, RSlice, Return, Fn, Rooted, Declined, Spine,
                  Calling, falls_through, rep_of_arg)
@@ -24,7 +29,7 @@ import emit.lower.containers (builtin, listed, columned, column_read)
 import emit.lower.matching (arm_opened, closed, let_bound, compared_side, compared_args, compared)
 import emit.lower.calling (convention, params_held, target, global, builtin_lambda, known, called,
                            applied, entered, left, lambda_opened, closure, group_opened, grouped,
-                           known_body, step_captured, context_of)
+                           known_body, step_captured, context_of, is_ctor_name, has_handle)
 import emit.lower.handling (performed, label, clause_frame, ret_frame, body_frame, handled,
                             branched, simulated)
 
@@ -58,6 +63,52 @@ pub fn group_lowered(
       { cx: context_of(setting, m.root, body), body: body }
     }),
   )
+
+/// The roots among `roots`, definitions of `module` beside `here`, that a build lowers as tail groups:
+/// each tail-call cycle of two or more, its members by their places among `roots` in order. A call in
+/// tail position of one root from another is an edge, so a group is exactly what can run as one loop.
+/// A member holding a `handle` keeps the whole cycle out, and a root with no `Code` has no edges.
+pub fn tail_groups(
+  module: Bytes,
+  here: List<Def>,
+  roots: List<{ full: Bytes, code: Option<Code> }>,
+) -> List<List<Int>> / {abort.raise} = {
+  let fulls = roots.map(|r: { full: Bytes, code: Option<Code> }| r.full);
+  let adj = roots.map(|r: { full: Bytes, code: Option<Code> }|
+    match r.code {
+      None -> [],
+      Some(c) ->
+        tail_callees(here, c, []).fold([], |acc: List<Int>, nm: Bytes|
+          match position_of(fulls, qualify(module, nm)) {
+            None -> acc,
+            Some(i) -> if acc.contains(i) { acc } else { acc.push(i) },
+          }),
+    });
+  let loops = |i: Int|
+    match roots.at(i) {
+      Some(r) -> match r.code { Some(c) -> !has_handle(c), None -> false },
+      None -> false,
+    };
+  graph::components({ out: adj }).map(sorted_widths).filter(|c: List<Int>|
+    c.len() >= 2 && c.all(loops))
+}
+
+/// The definitions of `here` that `code` calls in tail position, by name, after `acc`.
+pub fn tail_callees(here: List<Def>, code: Code, acc: List<Bytes>) -> List<Bytes> / {abort.raise} =
+  match code.node {
+    NApp(a) -> match a.func.node {
+      NVar(fv) -> if fv.slot == None && !is_ctor_name(fv.name)
+          && here.any(|h: Def| h.name == fv.name && h.arity == a.args.len()) { acc.push(fv.name) }
+      else { acc },
+      _ -> acc,
+    },
+    NBinary(b) -> if b.op == b"and" || b.op == b"or" { tail_callees(here, b.rhs, acc) }
+    else { acc },
+    NIf(i) -> tail_callees(here, i.else_branch, tail_callees(here, i.then_branch, acc)),
+    NBlock(b) -> match b.tail { Some(t) -> tail_callees(here, t, acc), None -> acc },
+    NMatch(m) -> m.arms.fold(acc, |a: List<Bytes>, arm: CodeArm| tail_callees(here, arm.body, a)),
+    _ -> acc,
+  }
 
 /// The root lowered, or why its body is outside what the lowering covers.
 pub fn lowered_fn(cx: Context, body: Code) -> Result<Fn, Declined> / {abort.raise} = {
