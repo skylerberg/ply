@@ -22,7 +22,8 @@ import emit.pieces (Piece, Text, Hole, Symbol, spelled)
 import emit.release (Part, WordAt, ByCase, Counted, Object, CaseBox, SumWord, IntWord, Through,
                      RuntimeHandle, Opening, InBox, Holding, StrBlock, ListOf, NodeOf, MapOf,
                      PairsOf, ArrayOf, ColumnsOf, ScalarBox, FnBlock, HandleBlock, Held, held_parts,
-                     opening, stored_parts, held_root, case_root, boxed_alone, drop_of)
+                     opening, stored_parts, held_root, case_root, boxed_alone, drop_of, root_of,
+                     case_blocks)
 import emit.print.text (Printing, Place, line, name_of, named, printing, part_names, part_name,
                         declared_at, pad, slot, assigned, arg_text, unprinted)
 import emit.print.made (head_types)
@@ -862,6 +863,40 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
 /// Word `at`, a C expression, of the block `x`.
 fn slot_at(x: Bytes, at: Bytes) -> Bytes = Bytes::concat_all([b"ply_words(", x, b")[", at, b"]"])
 
+/// `Walked({ of, op })` into `into`, over the program's constructors `ctors`: a sum of one word
+/// through the block its case holds, anything else through the block its word names.
+pub fn walked_value(
+  p: Place,
+  pr: Printing,
+  ctors: Ctors,
+  into: Option<Var>,
+  of: Var,
+  op: TypeOp,
+) -> Printing / {abort.raise} =
+  match into {
+    None -> unprinted(Spine, b"a value walked that nothing holds", var_said(of)),
+    Some(n) -> {
+      let whole = |q: Printing|
+        walked(
+          q,
+          p.depth,
+          ctors,
+          n,
+          of,
+          op,
+          opening(ctors, of.ty, of.rep),
+          held_root(Drop, ctors, of.ty, of.rep),
+        );
+      match of.rep {
+        RSum(s) -> match boxed_alone(s.laid) {
+          Some(_) -> whole(pr),
+          None -> walked_sum(pr, p.depth, ctors, n, of, op, case_blocks(ctors, of.ty, s.laid)),
+        },
+        _ -> whole(pr),
+      }
+    },
+  }
+
 /// `Walked`: the block `of`, laid as `opening` says, walked as `op` does, its answer into `into`.
 /// `Copy` answers a copy of it, each counted word counted once more, and lets go of `of` at
 /// `dropped`; `Keep` answers it kept for good, a copy on the unit's persistent heap each counted word
@@ -1040,6 +1075,165 @@ pub fn walked(
     _ -> unprinted(Spine, b"a block walked by no walk", var_said(of)),
   }
 }
+
+/// `Walked` of a sum of one word, `of`: the block the case it holds holds, of those `blocks` lists,
+/// walked as `op` does, its answer into `into`. `Keep` answers the word kept, its tag kept with it,
+/// and `Share` 0 where a block it reaches may not cross; a case holding no block walks nothing.
+pub fn walked_sum(
+  pr: Printing,
+  depth: Int,
+  ctors: Ctors,
+  into: Var,
+  of: Var,
+  op: TypeOp,
+  blocks: List<{ case: Int, ty: Type, rep: Rep, opening: Opening }>,
+) -> Printing / {abort.raise} =
+  match of.rep {
+    RSum(s) -> {
+      let x = name_of(pr, of);
+      let n = named(pr, into);
+      let a = n.name;
+      let untagged = match s.laid.classes { [P] -> true, _ -> false };
+      let tag = if untagged { b"" }
+      else { Bytes::concat_all([b" | (", x, b" & ", ascii_of_int(tag_mask()), b")"]) };
+      let arms = blocks.fold(
+        { pr: n.pr, out: [] },
+        |acc: Said, b: { case: Int, ty: Type, rep: Rep, opening: Opening }| {
+          let body = case_walked(acc.pr, ctors, a, tag, op, b.ty, b.rep, b.opening);
+          {
+            pr: body.pr,
+            out: acc.out.push(
+              Text(
+                Bytes::concat_all([
+                  b"case ",
+                  ascii_of_int(b.case),
+                  b": { Word ply_b = ",
+                  if untagged { x } else {
+                    Bytes::concat_all([b"(", x, b" & ~(Word)", ascii_of_int(tag_mask()), b")"])
+                  },
+                  b"; ",
+                ]),
+              ),
+            ).concat(
+              body.out,
+            ).push(
+              Text(b" } break; "),
+            ),
+          }
+        },
+      );
+      stated(depth, {
+        pr: arms.pr,
+        out: [
+          Text(
+            Bytes::concat_all([
+              b"Word ",
+              a,
+              b" = ",
+              match op { Keep -> x, _ -> b"1" },
+              b"; switch (",
+              case_of(s.laid, [x]),
+              b") { ",
+            ]),
+          ),
+        ].concat(
+          arms.out,
+        ).push(
+          Text(b"}"),
+        ),
+      })
+    },
+    _ -> unprinted(Spine, b"a sum of one word walked that is no sum", var_said(of)),
+  }
+
+/// The block `ply_b` a sum's case holds, of type `ty` held as `rep` and laid as `o` says, walked as
+/// `op` does into `a`: a box in place, the object of a pointer laid in place through its type's root.
+fn case_walked(
+  pr: Printing,
+  ctors: Ctors,
+  a: Bytes,
+  tag: Bytes,
+  op: TypeOp,
+  ty: Type,
+  rep: Rep,
+  o: Opening,
+) -> Said / {abort.raise} =
+  match ((op, rep)) {
+    (Keep, RWord) -> {
+      let c = rooted_call(pr, root_of(Keep, ty), RWord, b"ply_b");
+      {
+        pr: c.pr,
+        out: [Text(Bytes::concat_all([a, b" = "]))].concat(c.out).push(
+          Text(Bytes::concat_all([tag, b";"])),
+        ),
+      }
+    },
+    (Share, RWord) -> {
+      let c = rooted_call(pr, root_of(Share, ty), RInt, b"ply_b");
+      {
+        pr: c.pr,
+        out: [Text(b"if (!")].concat(c.out).push(Text(Bytes::concat_all([b") ", a, b" = 0;"]))),
+      }
+    },
+    (Keep, _) -> {
+      let size = block_size(b"ply_b", o);
+      let slots = slots_walked(
+        pr,
+        ctors,
+        b"ply_k",
+        o,
+        |q: Printing, ps: List<Part>, ws: List<Bytes>| kept_parts(q, ps, ws),
+      );
+      {
+        pr: slots.pr,
+        out: [
+          Text(
+            Bytes::concat_all([
+              b"if (",
+              field(b"ply_b", b"rc"),
+              b" != UINT32_MAX) { Word ply_k = rt_alloc_kept_p(ctx, ",
+              size,
+              b"); ",
+              copied_block(b"ply_k", b"ply_b", size),
+              b" ",
+            ]),
+          ),
+        ].concat(
+          slots.out,
+        ).push(
+          Text(Bytes::concat_all([b" ", a, b" = ply_k", tag, b"; }"])),
+        ),
+      }
+    },
+    (Share, _) -> {
+      let slots = slots_walked(
+        pr,
+        ctors,
+        b"ply_b",
+        o,
+        |q: Printing, ps: List<Part>, ws: List<Bytes>| shared_parts(q, a, ps, ws),
+      );
+      {
+        pr: slots.pr,
+        out: [
+          Text(
+            Bytes::concat_all([
+              b"if (",
+              field(b"ply_b", b"rc"),
+              b" < UINT32_C(0x80000000)) { ",
+              field(b"ply_b", b"rc"),
+              b" |= UINT32_C(0x80000000); ",
+            ]),
+          ),
+        ].concat(
+          slots.out,
+        ).push(
+          Text(b" }"),
+        ),
+      }
+    },
+    _ -> unprinted(Spine, b"a sum of one word walked by no walk", op_name(op)),
+  }
 
 /// The bytes of the block `x`, laid as `o` says, its header among them, as a C expression.
 fn block_size(x: Bytes, o: Opening) -> Bytes =
@@ -1920,6 +2114,51 @@ test "a node copied is a fresh block of its header and words, each counted once 
     Bytes::concat_all([b"ply_rel(ctx, p0, ", root_spelled(node), b");\n"]),
   ].fold((), |_: Unit, part: Bytes| assert(copy.text.contains(part), None));
   assert_eq(copy.calls, [node])
+}
+
+test "a sum of one word walks the block its case holds, its tag kept with a kept word" {
+  let string = TyCon({ name: b"String", args: [] });
+  let tagged = RSum({
+    laid: {
+      classes: [S(1)],
+      cases: [
+        { test: WordIs({ at: 0, value: 0 }), payload: Nullary },
+        { test: LowBits({ at: 0, bits: 1, block_tag: None }), payload: Nullary },
+        { test: LowBits({ at: 0, bits: 2, block_tag: None }), payload: Nullary },
+      ],
+    },
+    cases: [b"m.N", b"m.B", b"m.S"],
+  });
+  let blocks = [
+    {
+      case: 1,
+      ty: TyCon({ name: b"m.T", args: [] }),
+      rep: RSum({ laid: { classes: [P], cases: [] }, cases: [b"m.B"] }),
+      opening: InBox({ parts: [{ at: 0, ty: string, rep: RWord }], words: 1 }),
+    },
+    { case: 2, ty: string, rep: RWord, opening: StrBlock({ viewed: dropping_of(b"String") }) },
+  ];
+  let pr = printing(Map::new().insert(0, b"p0"));
+  let walk = |op: TypeOp|
+    spelled(walked_sum(pr, 0, no_ctors(), local(1, RWord), local(0, tagged), op, blocks).out);
+  let kept = walk(Keep);
+  let keep = root_spelled(root_of(Keep, string));
+  [
+    b"Word t1 = p0; switch (",
+    b"case 1: { Word ply_b = (p0 & ~(Word)7); if (ply_obj(ply_b)->rc != UINT32_MAX) { Word ply_k = rt_alloc_kept_p(ctx, 24);",
+    b" t1 = ply_k | (p0 & 7); }",
+    Bytes::concat_all([
+      b"case 2: { Word ply_b = (p0 & ~(Word)7); t1 = ",
+      keep,
+      b"(ctx, ply_b) | (p0 & 7); } break; ",
+    ]),
+  ].fold((), |_: Unit, part: Bytes| assert(kept.contains(part), None));
+  let shared = walk(Share);
+  [
+    b"Word t1 = 1; switch (",
+    b"if (ply_obj(ply_b)->rc < UINT32_C(0x80000000)) { ply_obj(ply_b)->rc |= UINT32_C(0x80000000);",
+    Bytes::concat_all([b"if (!", root_spelled(root_of(Share, string)), b"(ctx, ply_b)) t1 = 0;"]),
+  ].fold((), |_: Unit, part: Bytes| assert(shared.contains(part), None))
 }
 
 test "a box shared marks it and shares each block it holds; kept, it is copied for good, each word kept" {
