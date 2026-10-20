@@ -11,6 +11,7 @@ import std.bytes (ascii_of_int)
 import emit.c (tick_line)
 import emit.roots (symbol_of, root_id)
 import emit.keys (Named, Root, root_name)
+import emit.reps (Ctors, no_ctors)
 import emit.pieces (Piece, Text, Hole, TagOf, InGroup, LentBy, merged, spelled)
 import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSlice, Var, Arg, AVar, AInt, ABool, AZero,
                  Val, Prim, Literal, Static, Make, TInt, Get, Take, Tag, Path, PField, PArg,
@@ -38,10 +39,12 @@ import emit.print.invoked (call, applied, closure_made, restarted, entered_membe
 import emit.print.handled (handle_opened, handle_closed, landing_jump, effect_op)
 
 /// Root `f` as its C function and entry, or a tail group as its group function, the group's entry
-/// and each member's wrapper; then each of its closures' functions in `f.lambdas` order.
-pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
+/// and each member's wrapper; then each of its closures' functions in `f.lambdas` order. `ctors` is
+/// the program's constructor table.
+pub fn printed_fn(f: Fn, ctors: Ctors) -> Printed / {abort.raise} = {
   let name = symbol_of(root_name(f.key));
-  let own = if f.members.len() == 0 { root_printed(name, f) } else { group_printed(name, f) };
+  let own = if f.members.len() == 0 { root_printed(name, f, ctors) }
+  else { group_printed(name, f, ctors) };
   let closures = range(0, f.lambdas.len()).fold(
     { pr: own.pr, out: [] },
     |acc: { pr: Printing, out: List<Piece> }, k: Int|
@@ -70,8 +73,12 @@ pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
 
 /// A root of its own as its C function, named `name`, and its entry: the printing after it and its
 /// pieces.
-fn root_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
-  let body = body_printed(name, f, printing(param_names(f)));
+fn root_printed(
+  name: Bytes,
+  f: Fn,
+  ctors: Ctors,
+) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
+  let body = body_printed(name, f, { ..printing(param_names(f)), ctors: ctors });
   let entered = entry(name, f, body);
   {
     pr: entered.pr,
@@ -100,7 +107,11 @@ fn root_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abo
 /// place `which` and the widest member's parameters as words and switches on `which` to that
 /// member's arm, each arm opening its member's parameters from the words; then the group's entry,
 /// and each member's wrapper.
-fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
+fn group_printed(
+  name: Bytes,
+  f: Fn,
+  ctors: Ctors,
+) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
   let g = name.concat(b"_group");
   let width = f.members.fold(0, |w: Int, m: Member|
     if m.params.len() > w { m.params.len() } else { w });
@@ -115,10 +126,10 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
     landing: None,
     group: None,
   };
-  let start = printing(match f.params.at(0) {
-    Some(which) -> Map::new().insert(which.id, b"which"),
-    None -> Map::new(),
-  });
+  let start = {
+    ..printing(match f.params.at(0) { Some(which) -> Map::new().insert(which.id, b"which"), None -> Map::new() }),
+    ctors: ctors,
+  };
   let switched = match f.body {
     [Case(c)] -> {
       let arms = c.arms.fold(start, |pr: Printing, a: { when: Int, body: Block }|
@@ -718,7 +729,7 @@ test "a restart takes its arguments into temporaries before it sets the paramete
     links: no_links(),
     statics: [],
   };
-  let lines = spelled(printed_fn(f).pieces).split(b"\n");
+  let lines = spelled(printed_fn(f, no_ctors()).pieces).split(b"\n");
   assert_eq(
     holds_run(lines, [
       b"  ctx->fuel -= 1;",
@@ -771,18 +782,21 @@ fn handle_over(answer: Var, body: Block) -> Inst =
 /// The C of a root answering a word, whose body is `body` and then answers `answer`.
 fn answering(answer: Var, body: Block) -> Bytes / {abort.raise} =
   spelled(
-    printed_fn({
-      key: Named(b"m.guarded"),
-      kind: Rooted,
-      params: [],
-      conv: { params: [], reps: [], answer: RWord, answered: Owned },
-      body: body.push(Return(AVar(answer))),
-      lambdas: [],
-      base: 0,
-      members: [],
-      links: no_links(),
-      statics: [],
-    }).pieces,
+    printed_fn(
+      {
+        key: Named(b"m.guarded"),
+        kind: Rooted,
+        params: [],
+        conv: { params: [], reps: [], answer: RWord, answered: Owned },
+        body: body.push(Return(AVar(answer))),
+        lambdas: [],
+        base: 0,
+        members: [],
+        links: no_links(),
+        statics: [],
+      },
+      no_ctors(),
+    ).pieces,
   )
 
 /// A handle (label 1) inside another's body (label 0), its own body reading a word from a runtime
@@ -844,31 +858,34 @@ test "a tail group is one function switching on its member's place, each arm ope
   let m = { id: 2, ty: int, rep: RInt };
   let conv = { params: [Given], reps: [RInt], answer: RInt, answered: Owned };
   let text = spelled(
-    printed_fn({
-      key: Named(b"m.even"),
-      kind: Rooted,
-      params: [which],
-      conv: { params: [Given], reps: [RInt], answer: RWord, answered: Owned },
-      body: [
-        Case({
-          on: which,
-          test: TInt([0, 1]),
-          arms: [
-            { when: 0, body: [Enter({ member: 1, args: [AVar(n)] })] },
-            { when: 1, body: [Return(AVar(m))] },
-          ],
-          rest: [Return(AZero(RWord))],
-        }),
-      ],
-      lambdas: [],
-      base: 0,
-      members: [
-        { key: Named(b"m.even"), base: 0, params: [n], conv: conv },
-        { key: Named(b"m.odd"), base: 40, params: [m], conv: conv },
-      ],
-      links: no_links(),
-      statics: [],
-    }).pieces,
+    printed_fn(
+      {
+        key: Named(b"m.even"),
+        kind: Rooted,
+        params: [which],
+        conv: { params: [Given], reps: [RInt], answer: RWord, answered: Owned },
+        body: [
+          Case({
+            on: which,
+            test: TInt([0, 1]),
+            arms: [
+              { when: 0, body: [Enter({ member: 1, args: [AVar(n)] })] },
+              { when: 1, body: [Return(AVar(m))] },
+            ],
+            rest: [Return(AZero(RWord))],
+          }),
+        ],
+        lambdas: [],
+        base: 0,
+        members: [
+          { key: Named(b"m.even"), base: 0, params: [n], conv: conv },
+          { key: Named(b"m.odd"), base: 40, params: [m], conv: conv },
+        ],
+        links: no_links(),
+        statics: [],
+      },
+      no_ctors(),
+    ).pieces,
   );
   let g = symbol_of(b"m.even").concat(b"_group");
   assert(
@@ -918,7 +935,7 @@ test "a closure's function follows its root's entry, and its body numbers its te
   let name = symbol_of(b"m.outer");
   let inner = closure_printed(name, 0, l, { ..printing(Map::new()), temps: 7, labels: 3 });
   assert_eq(spelled(inner.out), b"  int64_t t1;\n  t1 = p0;\n  ctx->fuel += 1;\n  return t1;\n");
-  let printed = printed_fn(f);
+  let printed = printed_fn(f, no_ctors());
   assert(
     spelled(printed.pieces).ends_with(
       Bytes::concat_all([
@@ -986,6 +1003,7 @@ test "a lent run's failure sites name its lender and count from its text, until 
         add(v(21), span_between(130, 135)),
         Return(AVar(v(22))),
       ]),
+      no_ctors(),
     ).pieces,
   );
   let sites = text.split(b"\n").filter(|l: Bytes| l.index_of(b"PLY_SITE(") != None).map(
@@ -1009,7 +1027,7 @@ test "a field taken moves out of a block held only here, in place in another or 
     ..int_root([block], [Let({ var: field, val: Take({ of: block, path: PField({ name: b"bytes", at: 1 }) }), at: span_between(0, 0), unwind: [] }), Return(AInt(0))]),
     conv: { params: [Given], reps: [RWord], answer: RWord, answered: Owned },
   };
-  let lines = spelled(printed_fn(f).pieces).split(b"\n");
+  let lines = spelled(printed_fn(f, no_ctors()).pieces).split(b"\n");
   assert_eq(
     holds_run(lines, [
       b"  Word t1 = ply_words(p0)[1];",
@@ -1026,6 +1044,7 @@ test "a constructor's tag is a hole the unit writes in" {
       Let({ var: k, val: Tag(b"m.Box"), at: span_between(0, 0), unwind: [] }),
       Return(AVar(k)),
     ]),
+    no_ctors(),
   );
   assert(pr.pieces.contains(Hole(TagOf(b"m.Box"))));
   assert(spelled(pr.pieces).index_of(b"  int64_t t1 = @@Tm.Box@@;\n") != None)
@@ -1052,15 +1071,18 @@ fn holding(v: Var, val: Val, unwind: List<Var>) -> Inst =
 /// The C of a root taking `params`, each given, whose body is `body`, answering a word.
 fn word_root(params: List<Var>, body: Block) -> Bytes / {abort.raise} =
   spelled(
-    printed_fn({
-      ..int_root(params, body),
-      conv: {
-        params: params.map(|_: Var| Given),
-        reps: params.map(|v: Var| v.rep),
-        answer: RWord,
-        answered: Owned,
+    printed_fn(
+      {
+        ..int_root(params, body),
+        conv: {
+          params: params.map(|_: Var| Given),
+          reps: params.map(|v: Var| v.rep),
+          answer: RWord,
+          answered: Owned,
+        },
       },
-    }).pieces,
+      no_ctors(),
+    ).pieces,
   )
 
 test "each failure releases what it holds through tails that failures holding alike share" {
