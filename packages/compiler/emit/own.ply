@@ -3,7 +3,8 @@
 //! that last reads it, before the one that last consumes something read out of it, or at the head
 //! of a branch that does not read it. A use that consumes a value still live after it takes an
 //! `Inc` first; a last use moves. A value read out of another keeps that one live until its own
-//! last read. A value let go of whose cells a later constructor of its type takes, in the arms of
+//! last read, but where the other's last use consumes it before then: the value read out of it then
+//! takes a count of its own where it is bound, so the other moves. A value let go of whose cells a later constructor of its type takes, in the arms of
 //! the branch that follows or after it, with no stop, loop or handle between, is reset into a token
 //! that one reuses, writing only the fields that changed; a way out of the body between frees it.
 //! A flat value made or handed in whole, a loop's state at each pass among them, is opened into its
@@ -19,8 +20,9 @@
 import std.bytes (ascii_of_int)
 import std.math (ilog2)
 import std.pace (paced)
-import check.types (Type, TyCon, TyRecord)
+import check.types (Type, TyCon, TyRecord, TyNominal, Field)
 import emit.c (KInt, KBoxed)
+import emit.layout (header_bytes)
 import emit.reps (TyOpen)
 import emit.typing (unknown_type)
 import syntax.parsing (dummy_span)
@@ -36,9 +38,10 @@ import emit.tir (Rep, RWord, RInt, RBool, RFloat, RMaybe, RTagged, RFlat, RCases
 import emit.verify (verified, stacked_captures, payload_of, field_path, held_in_place, stops_at,
                     reuses_cells, made_width, kept_reads)
 
-/// How a counted variable is held: a count of its own, or read out of variable `base` without one
-/// (`-1` where nothing the body lets go of holds it: a constant, a lent parameter).
-type Held = | Own | ReadOf(Int)
+/// How a counted variable is held: a count of its own, or read without one out of the owned
+/// variables `bases` names, each live while it is (none where nothing the body lets go of holds
+/// it: a constant, a lent parameter).
+type Held = | Own | ReadOf(List<Int>)
 
 /// What the pass knows of a root's variables before it places counts: how each counted one is
 /// held, each variable by number, what each `Get` read out of and where, what each variable read
@@ -47,17 +50,19 @@ type Held = | Own | ReadOf(Int)
 /// in so is `opened` into words where it is bound, each part a variable counted on its own, and a
 /// `Get` of one of its counted leaves is an `alias` of that word, as a payload read out of a sum
 /// held as one word is of that sum. A closure laid on this frame's
-/// stack `stacks` its captures: it holds no count of them, so a use of it reads each.
+/// stack `stacks` its captures: it holds no count of them, so a use of it reads each. A `promoted`
+/// value read out of another takes a count of its own where it is bound.
 type Facts = {
   held: Map<Int, Held>,
   vars: Map<Int, Var>,
   gets: Map<Int, { of: Int, path: Path }>,
-  direct: Map<Int, Int>,
+  direct: Map<Int, List<Int>>,
   made: Map<Int, Bool>,
   next: Int,
   opened: Map<Int, List<Var>>,
   alias: Map<Int, Var>,
   stacks: Map<Int, List<Var>>,
+  promoted: Map<Int, Bool>,
 }
 
 /// The counted variables live at a point, by number: each is read, consumed or let go of on some
@@ -361,28 +366,32 @@ fn facts_of(f: Fn) -> Facts = {
     opened: Map::new(),
     alias: Map::new(),
     stacks: Map::new(),
+    promoted: Map::new(),
   };
   let first = gathered(params_defined(f, empty), f.body);
   let got = first.gets.fold(
     Map::new(),
     |m: Map<Int, List<Int>>, id: Int, g: { of: Int, path: Path }| read_by(m, g.of, id),
   );
-  let borrowed = first.direct.fold(Map::new(), |m: Map<Int, List<Int>>, id: Int, from: Int|
-    read_by(m, from, id));
+  let borrowed = first.direct.fold(
+    Map::new(),
+    |m: Map<Int, List<Int>>, id: Int, from: List<Int>|
+      from.fold(m, |n: Map<Int, List<Int>>, x: Int| read_by(n, x, id)),
+  );
   let words = first.made.fold(
     { opened: Map::new(), next: first.next },
     |acc: { opened: Map<Int, List<Var>>, next: Int }, id: Int, _: Bool|
       match first.vars.get(id) {
         Some(s) -> if !openable(first, got, borrowed, s) { acc } else {
           let parts = parts_of(s.rep);
-          let typed = word_types(first, got, id);
+          let typed = parts_typed(s, word_types(first, got, id));
           {
             opened: acc.opened.insert(
               id,
               range(0, parts.len()).map(|k: Int|
                 {
                   id: acc.next + k,
-                  ty: match typed.get(k) { Some(t) -> t, None -> unknown_type() },
+                  ty: match typed.at(k) { Some(t) -> t, None -> unknown_type() },
                   rep: match parts.at(k) { Some(r) -> r, None -> RInt },
                 }),
             ),
@@ -415,13 +424,151 @@ fn facts_of(f: Fn) -> Facts = {
         },
       },
   );
-  if words.opened.len() == 0 && alias.len() == 0 { first } else {
+  let read = if words.opened.len() == 0 && alias.len() == 0 { first } else {
     // The words first, so what is read out of a word's alias is read out of the word.
     let start = words.opened.fold(
       params_defined(f, { ..empty, opened: words.opened, alias: alias }),
       |fx: Facts, _: Int, ws: List<Var>| ws.fold(fx, |x: Facts, w: Var| defined(x, w, Own)),
     );
     { ..gathered(start, f.body), next: words.next }
+  };
+  let raised = promoted(read, f.body);
+  {
+    ..read,
+    held: raised.fold(read.held, |h: Map<Int, Held>, id: Int, _: Bool| h.insert(id, Own)),
+    promoted: raised,
+  }
+}
+
+/// The borrowed variables used on a path past the last use of something they were read out of where
+/// that use consumes it: each takes a count of its own where it is bound, so the value it was read
+/// out of moves there rather than being held, and so copied, for it.
+fn promoted(fx: Facts, b: Block) -> Map<Int, Bool> =
+  raised(
+    fx,
+    seen(fx, { at: 0, last: Map::new(), taken: Map::new() }, b),
+    { at: 0, gone: Map::new(), up: Map::new() },
+    b,
+  ).up
+
+/// A body read in order, each instruction numbered as it is reached and a branch's blocks after
+/// it: where each variable is used last, and where it is consumed last.
+type Seen = { at: Int, last: Map<Int, Int>, taken: Map<Int, Int> }
+
+fn seen(fx: Facts, s: Seen, b: Block) -> Seen =
+  b.fold(s, |acc: Seen, i: Inst| {
+    let k = acc.at;
+    let here = { ..acc, at: k + 1 };
+    match i {
+      Let(l) -> used_at(fx, here, k, uses_of(fx, l.val)),
+      Do(d) -> used_at(fx, here, k, uses_of(fx, d.val)),
+      Assign(x) -> used_at(fx, here, k, all_taken([x.arg])),
+      If(x) ->
+        seen(
+          fx,
+          seen(fx, used_at(fx, here, k, [{ arg: x.cond, takes: false }]), x.then),
+          x.otherwise,
+        ),
+      Case(c) ->
+        seen(
+          fx,
+          c.arms.fold(
+            used_at(fx, here, k, [{ arg: AVar(c.on), takes: false }]),
+            |a: Seen, arm: { when: Int, body: Block }| seen(fx, a, arm.body),
+          ),
+          c.rest,
+        ),
+      Match(m) -> seen(fx, m.arms.fold(here, |a: Seen, arm: Block| seen(fx, a, arm)), m.rest),
+      Loop(l) -> seen(fx, used_at(fx, here, k, all_taken(l.init)), l.body),
+      Next(args) -> used_at(fx, here, k, all_taken(args)),
+      Done(a) -> used_at(fx, here, k, all_taken([a])),
+      Return(a) -> used_at(fx, here, k, all_taken([a])),
+      Restart(args) -> used_at(fx, here, k, all_taken(args)),
+      Enter(e) -> used_at(fx, here, k, all_taken(e.args)),
+      Handle(h) -> seen(fx, used_at(fx, here, k, used_as(h.args, h.uses)), h.body),
+      _ -> here,
+    }
+  })
+
+fn used_at(fx: Facts, s: Seen, k: Int, ops: List<Operand>) -> Seen =
+  expanded(fx, ops).fold(s, |acc: Seen, o: Operand|
+    match var_of(o.arg) {
+      Some(v) ->
+        {
+          ..acc,
+          last: acc.last.insert(v.id, k),
+          taken: if o.takes { acc.taken.insert(v.id, k) } else { acc.taken },
+        },
+      None -> acc,
+    })
+
+/// A body read in `seen`'s order, holding what each path has consumed at its last use (`gone`),
+/// and the borrowed variables used past such a use of something they were read out of (`up`).
+/// The paths through a branch's blocks each start from what was gone before it.
+type Raise = { at: Int, gone: Map<Int, Bool>, up: Map<Int, Bool> }
+
+fn raised(fx: Facts, s: Seen, r: Raise, b: Block) -> Raise =
+  b.fold(r, |acc: Raise, i: Inst| {
+    let k = acc.at;
+    let here = { ..acc, at: k + 1 };
+    match i {
+      Let(l) -> passed_at(fx, s, here, k, uses_of(fx, l.val)),
+      Do(d) -> passed_at(fx, s, here, k, uses_of(fx, d.val)),
+      Assign(x) -> passed_at(fx, s, here, k, all_taken([x.arg])),
+      If(x) ->
+        branches(fx, s, passed_at(fx, s, here, k, [{ arg: x.cond, takes: false }]), [
+          x.then,
+          x.otherwise,
+        ]),
+      Case(c) ->
+        branches(
+          fx,
+          s,
+          passed_at(fx, s, here, k, [{ arg: AVar(c.on), takes: false }]),
+          c.arms.map(|a: { when: Int, body: Block }| a.body).push(c.rest),
+        ),
+      Match(m) -> branches(fx, s, here, m.arms.push(m.rest)),
+      Loop(l) -> branches(fx, s, passed_at(fx, s, here, k, all_taken(l.init)), [l.body]),
+      Next(args) -> passed_at(fx, s, here, k, all_taken(args)),
+      Done(a) -> passed_at(fx, s, here, k, all_taken([a])),
+      Return(a) -> passed_at(fx, s, here, k, all_taken([a])),
+      Restart(args) -> passed_at(fx, s, here, k, all_taken(args)),
+      Enter(e) -> passed_at(fx, s, here, k, all_taken(e.args)),
+      Handle(h) -> branches(fx, s, passed_at(fx, s, here, k, used_as(h.args, h.uses)), [h.body]),
+      _ -> here,
+    }
+  })
+
+/// `blocks` read in order from `r`, each from what was gone at `r`, and what any of them made gone
+/// gone after them.
+fn branches(fx: Facts, s: Seen, r: Raise, blocks: List<Block>) -> Raise =
+  blocks.fold(r, |acc: Raise, b: Block| {
+    let w = raised(fx, s, { ..acc, gone: r.gone }, b);
+    { ..w, gone: Map::merge(acc.gone, w.gone) }
+  })
+
+/// `r` past instruction `k` using `ops`: each borrowed variable used there that was read out of
+/// something gone raised, then each value consumed there at its last use gone.
+fn passed_at(fx: Facts, s: Seen, r: Raise, k: Int, ops: List<Operand>) -> Raise = {
+  let used = expanded(fx, ops);
+  {
+    ..r,
+    up: used.fold(r.up, |u: Map<Int, Bool>, o: Operand|
+      match var_of(o.arg) {
+        Some(v) -> match fx.held.get(v.id) {
+          Some(ReadOf(bs)) -> if bs.any(|x: Int| r.gone.contains(x)) { u.insert(v.id, true) }
+          else { u },
+          _ -> u,
+        },
+        None -> u,
+      }),
+    gone: used.fold(r.gone, |g: Map<Int, Bool>, o: Operand|
+      match var_of(o.arg) {
+        Some(v) -> if o.takes && s.last.get(v.id) == Some(k) && s.taken.get(v.id) == Some(k) {
+          g.insert(v.id, true)
+        } else { g },
+        None -> g,
+      }),
   }
 }
 
@@ -435,7 +582,7 @@ fn given_defined(params: List<Var>, conv: Convention, fx: Facts) -> Facts =
   range(0, params.len()).fold(fx, |acc: Facts, i: Int|
     match params.at(i) {
       None -> acc,
-      Some(p) -> if conv.params.at(i) == Some(Lent) { defined(acc, p, ReadOf(0 - 1)) }
+      Some(p) -> if conv.params.at(i) == Some(Lent) { defined(acc, p, ReadOf([])) }
       else { { ..defined(acc, p, Own), made: acc.made.insert(p.id, true) } },
     })
 
@@ -473,8 +620,44 @@ fn leaves_only(fx: Facts, got: Map<Int, List<Int>>, borrowed: Map<Int, List<Int>
   reads_of(borrowed, s.id).all(leaf) && reads_of(got, s.id).all(leaf)
 }
 
+/// The type of each part of `s`, by its place: a record's leaf the type of the field its name
+/// leads to, through each record held in place, and its word the record's own type; a sum's index
+/// an `Int`; any other part what `read` says it is read as.
+fn parts_typed(s: Var, read: Map<Int, Type>) -> List<Type> = {
+  let parts = parts_of(s.rep);
+  let by_read = |k: Int| match read.get(k) { Some(t) -> t, None -> unknown_type() };
+  match s.rep {
+    RFlat(leaves) -> {
+      let typed = leaf_types(Map::new(), b"", s.ty);
+      range(0, leaves.len()).map(|k: Int|
+        match leaves.at(k) {
+          Some(l) -> match typed.get(l.name) { Some(t) -> t, None -> by_read(k) },
+          None -> by_read(k),
+        }).push(
+        s.ty,
+      )
+    },
+    RCases(_) ->
+      range(0, parts.len()).map(|k: Int|
+        if k == 0 { TyCon({ name: b"Int", args: [] }) } else { by_read(k) }),
+    _ -> range(0, parts.len()).map(by_read),
+  }
+}
+
+/// `m` with the type of each leaf a record of type `ty` may be held as, by its name after `prefix`:
+/// a field's by its name, and for a record held in place there, its word by `field.` and its own
+/// leaves by `field.leaf`.
+fn leaf_types(m: Map<Bytes, Type>, prefix: Bytes, ty: Type) -> Map<Bytes, Type> = {
+  let fs = match ty { TyRecord(fs) -> fs, TyNominal(x) -> x.fields, _ -> [] };
+  fs.fold(m, |acc: Map<Bytes, Type>, f: Field| {
+    let name = prefix.concat(f.name);
+    let inner = name.concat(b".");
+    leaf_types(acc.insert(name, f.ty).insert(inner, f.ty), inner, f.ty)
+  })
+}
+
 /// The type each word of the value numbered `s` is read as, by its place: what the last `Get` of
-/// that leaf reads. A word no `Get` reads is of unknown type.
+/// that leaf reads.
 fn word_types(fx: Facts, got: Map<Int, List<Int>>, s: Int) -> Map<Int, Type> =
   reads_of(got, s).fold(Map::new(), |m: Map<Int, Type>, id: Int|
     match fx.gets.get(id) {
@@ -501,7 +684,7 @@ fn gathered(fx: Facts, b: Block) -> Facts =
       Let(l) -> match stacked_captures(l.val) {
         Some(caps) ->
           {
-            ..defined(acc, l.var, ReadOf(0 - 1)),
+            ..defined(acc, l.var, ReadOf([])),
             stacks: acc.stacks.insert(
               l.var.id,
               caps.fold([], |vs: List<Var>, c: Arg|
@@ -518,19 +701,15 @@ fn gathered(fx: Facts, b: Block) -> Facts =
           } else {
             defined(acc, l.var, match a {
               Owns -> Own,
-              ReadsOf(xs) -> match xs.at(0) {
-                Some(x) -> ReadOf(base_of(acc, x)),
-                None -> ReadOf(0 - 1),
-              },
-              Lasts -> ReadOf(0 - 1),
+              ReadsOf(xs) ->
+                ReadOf(xs.fold([], |bs: List<Int>, x: Var| ints_joined(bs, base_of(acc, x)))),
+              Lasts -> ReadOf([]),
             })
           };
           let traced = match a {
             Owns -> { ..d, made: d.made.insert(l.var.id, true) },
-            ReadsOf(xs) -> match xs.at(0) {
-              Some(x) -> { ..d, direct: d.direct.insert(l.var.id, x.id) },
-              None -> d,
-            },
+            ReadsOf(xs) -> if xs.len() == 0 { d }
+            else { { ..d, direct: d.direct.insert(l.var.id, xs.map(|x: Var| x.id)) } },
             Lasts -> d,
           };
           match l.val {
@@ -563,14 +742,23 @@ fn gathered(fx: Facts, b: Block) -> Facts =
     })
 
 /// What `v` is read out of, as the body holds it: `v`'s own number where it holds a count, through
-/// the value an alias stands for, which may itself be read out of another.
-fn base_of(fx: Facts, v: Var) -> Int = {
+/// the value an alias stands for, which may itself be read out of others.
+fn base_of(fx: Facts, v: Var) -> List<Int> = {
   let x = match fx.alias.get(v.id) { Some(w) -> w, None -> v };
-  match fx.held.get(x.id) { Some(Own) -> x.id, Some(ReadOf(b)) -> b, None -> 0 - 1 }
+  match fx.held.get(x.id) { Some(Own) -> [x.id], Some(ReadOf(bs)) -> bs, None -> [] }
 }
 
-fn base_var(fx: Facts, v: Var) -> Option<Var> =
-  match fx.held.get(v.id) { Some(ReadOf(b)) -> fx.vars.get(b), _ -> None }
+/// The owned variables `v` was read out of, each live while it is.
+fn base_vars(fx: Facts, v: Var) -> List<Var> =
+  match fx.held.get(v.id) {
+    Some(ReadOf(bs)) ->
+      bs.fold([], |vs: List<Var>, b: Int|
+        match fx.vars.get(b) { Some(x) -> vs.push(x), None -> vs }),
+    _ -> [],
+  }
+
+fn ints_joined(a: List<Int>, b: List<Int>) -> List<Int> =
+  b.fold(a, |acc: List<Int>, x: Int| if acc.contains(x) { acc } else { acc.push(x) })
 
 fn owns(fx: Facts, v: Var) -> Bool = counted(v.rep) && fx.held.get(v.id) == Some(Own)
 
@@ -619,12 +807,8 @@ fn uses_of(fx: Facts, val: Val) -> List<Operand> =
 /// `live` with `v` live, and what `v` is read out of.
 fn alive(fx: Facts, live: Live, v: Var) -> Live =
   resolved(fx, v).fold(live, |l: Live, x: Var|
-    if !counted(x.rep) { l } else {
-      match base_var(fx, x) {
-        Some(b) -> l.insert(x.id, x).insert(b.id, b),
-        None -> l.insert(x.id, x),
-      }
-    })
+    if !counted(x.rep) { l }
+    else { base_vars(fx, x).fold(l.insert(x.id, x), |m: Live, b: Var| m.insert(b.id, b)) })
 
 fn arg_live(fx: Facts, live: Live, a: Arg) -> Live =
   match var_of(a) { Some(v) -> alive(fx, live, v), None -> live }
@@ -654,9 +838,15 @@ fn walked_back(fx: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Back =
               ws.filter(|w: Var| owns(fx, w) && !acc.live.contains(w.id)),
             ),
           None ->
-            placed(fx, ex, acc, p, made, [], if owns(fx, l.var) && !acc.live.contains(l.var.id) {
-              [l.var]
-            } else { [] }),
+            placed(
+              fx,
+              ex,
+              acc,
+              p,
+              made,
+              if fx.promoted.contains(l.var.id) { [Inc({ var: l.var, n: 1 })] } else { [] },
+              if owns(fx, l.var) && !acc.live.contains(l.var.id) { [l.var] } else { [] },
+            ),
         }
       },
       Do(d) -> {
@@ -896,16 +1086,13 @@ fn planned(fx: Facts, uses: List<Operand>, after: Live) -> Plan = {
           let used = if o.takes {
             { ..acc, taken: acc.taken.insert(v.id, consumed(acc, v.id) + 1) }
           } else {
-            let b = base_of(fx, v);
             {
               ..acc,
-              read: if b >= 0 { acc.read.insert(v.id, true).insert(b, true) }
-              else { acc.read.insert(v.id, true) },
+              read: base_of(fx, v).fold(acc.read.insert(v.id, true), |r: Map<Int, Bool>, b: Int|
+                r.insert(b, true)),
             }
           };
-          if !counted(v.rep) { used } else {
-            match base_var(fx, v) { Some(b) -> listed(listed(used, v), b), None -> listed(used, v) }
-          }
+          if !counted(v.rep) { used } else { base_vars(fx, v).fold(listed(used, v), listed) }
         },
         None -> acc,
       },
@@ -1045,19 +1232,44 @@ fn entered(
   { block: b.rev.reverse(), next: b.next, takers: b.takers }
 }
 
-/// `takers` with `inst` among them where it makes a constructor's object or a laid out record
-/// afresh. A constructor of no payload words is a singleton nothing allocates, and a record the
-/// runtime lays out is made by value, so neither takes cells.
+/// `takers` with `inst` among them where it takes cells.
 fn taking(takers: List<Taker>, inst: Inst, at: Int) -> List<Taker> =
   match inst {
     Let(l) -> match l.val {
-      Make(m) -> if m.reuse != None || l.var.rep != RWord || !reuses_cells(m.made)
-          || made_width(m.made) == 0 { takers }
-      else { takers.push({ at: at, route: [], ty: l.var.ty, made: m.made, args: m.args }) },
+      Make(m) -> if takes_cells(l.var, m.made, m.reuse) {
+        takers.push({ at: at, route: [], ty: l.var.ty, made: m.made, args: m.args })
+      } else { takers },
       _ -> takers,
     },
     _ -> takers,
   }
+
+/// Whether `v` bound to a `Make` of `made` reusing `reuse` takes the cells of a value let go of
+/// before it where they fit: it makes a constructor's object or a laid out record afresh. A
+/// constructor of no payload words is a singleton nothing allocates, and a record the runtime lays
+/// out is made by value, so neither takes cells.
+fn takes_cells(v: Var, made: Made, reuse: Option<Var>) -> Bool =
+  reuse == None && v.rep == RWord && reuses_cells(made) && made_width(made) > 0
+
+/// Whether the ownership pass may reset anything in `f`'s body, its tail group's arms among it: some
+/// `Make` there takes cells. Its closures' bodies are counted as roots of their own.
+pub fn may_reuse(f: Fn) -> Bool = reuses_within(f.body)
+
+fn reuses_within(b: Block) -> Bool =
+  b.fold(false, |any: Bool, i: Inst|
+    any
+      || (match i {
+        Let(l) -> match l.val { Make(m) -> takes_cells(l.var, m.made, m.reuse), _ -> false },
+        If(x) -> reuses_within(x.then) || reuses_within(x.otherwise),
+        Case(c) ->
+          c.arms.fold(reuses_within(c.rest), |a: Bool, arm: { when: Int, body: Block }|
+            a || reuses_within(arm.body)),
+        Match(m) ->
+          m.arms.fold(reuses_within(m.rest), |a: Bool, arm: Block| a || reuses_within(arm)),
+        Loop(l) -> reuses_within(l.body),
+        Handle(h) -> reuses_within(h.body),
+        _ -> false,
+      }))
 
 /// Where `t` is first reached in the block it was found from: its own place, or the branch it is in.
 fn first_at(t: Taker) -> Int = match t.route.at(0) { Some(s) -> s.at, None -> t.at }
@@ -1169,11 +1381,16 @@ fn arm_taking(
       Some(s) -> if s.arm == arm { acc.push({ ..t, route: t.route.drop(1) }) } else { acc },
       None -> acc,
     });
-  if inner.len() == 0 { [Free({ of: token, bytes: AInt(8 * words_of(token)) })].concat(block) }
+  if inner.len() == 0 { [freed(token)].concat(block) }
   else { taken_in(fx, block, inner, token, of) }
 }
 
-fn words_of(token: Var) -> Int = match token.rep { RToken(n) -> n, _ -> 0 }
+/// `token`'s cells given back: the whole block, its header among it.
+fn freed(token: Var) -> Inst =
+  Free({
+    of: token,
+    bytes: AInt(header_bytes() + 8 * (match token.rep { RToken(n) -> n, _ -> 0 })),
+  })
 
 fn taken_by(fx: Facts, i: Inst, token: Var, of: Var) -> Inst =
   match i {
@@ -1217,9 +1434,8 @@ fn carried(i: Inst, token: Var, matched: Bool) -> Inst =
 
 fn carried_in(b: Block, token: Var, matched: Bool) -> Block =
   b.fold([], |out: List<Inst>, i: Inst|
-    if leaves_with(i, matched) {
-      out.push(Free({ of: token, bytes: AInt(8 * words_of(token)) })).push(i)
-    } else { out.push(carried(i, token, matched)) })
+    if leaves_with(i, matched) { out.push(freed(token)).push(i) }
+    else { out.push(carried(i, token, matched)) })
 
 /// Whether `i` leaves where a carried token is held: the body or a loop's pass, or the match a miss
 /// leaves for the next arm of, where that match is not carried.
@@ -1627,6 +1843,44 @@ test "a value read out of another keeps that one live until its last read" {
   })
 }
 
+test "a value read out of another, used past the other's last use where that use consumes it, takes a count of its own where it is bound" {
+  let p = word(0);
+  let y = word(1);
+  let r = word(2);
+  let s = word(3);
+  let read = bind(y, Get({ of: p, path: PField({ name: b"f", at: 0 }) }), []);
+  let after = |lent: List<Int>|
+    root_of([p], [], RWord, [
+      read,
+      bind(r, call_of([AVar(p)], lent), []),
+      bind(s, call_of([AVar(r), AVar(y)], [1]), []),
+      Return(AVar(s)),
+    ]);
+  // The record moves into the first call; the field read out of it is counted where it is read.
+  assert_eq(counted_body(after([])), {
+    body: [
+      read,
+      Inc({ var: y, n: 1 }),
+      bind(r, call_of([AVar(p)], []), [y]),
+      bind(s, call_of([AVar(r), AVar(y)], [1]), [y]),
+      Dec(y),
+      Return(AVar(s)),
+    ],
+    refused: None,
+  });
+  // Only lent to the first call, the record is held until the field's last read.
+  assert_eq(counted_body(after([0])), {
+    body: [
+      read,
+      bind(r, call_of([AVar(p)], [0]), [p]),
+      bind(s, call_of([AVar(r), AVar(y)], [1]), [p]),
+      Dec(p),
+      Return(AVar(s)),
+    ],
+    refused: None,
+  })
+}
+
 test "a join is set from a value held as the join is, on every path" {
   let c = flag(0);
   let p = word(1);
@@ -1951,7 +2205,7 @@ test "a value let go of before a branch lends its cells to the arms that make on
       }),
     ];
   let f = root_of([r, c, v], [], RWord, boxed([read, branch(make(None, []), [])], []));
-  let free = Free({ of: token, bytes: AInt(16) });
+  let free = Free({ of: token, bytes: AInt(32) });
   // The arm that makes none frees the cells; the one that does writes only the field that changed.
   assert_eq(counted_body(f), {
     body: boxed([read, Reset({ token: token, of: r }), branch(make(Some(token), [0]), [free])], [
@@ -2025,7 +2279,7 @@ test "a value let go of before a branch lends its cells to a constructor after i
       ],
       [Dec(r)],
     );
-  let free = Free({ of: token, bytes: AInt(16) });
+  let free = Free({ of: token, bytes: AInt(32) });
   // The arm that leaves the body frees the cells first; the call that can fail releases them on its
   // failure path.
   assert_eq(counted_body(f), { body: counts([free], [v, token]), refused: None });
@@ -2152,18 +2406,26 @@ test "a handle holds across its body what the body reads, which its landing rele
   })
 }
 
+/// A record held flat whose fields `f0`, `f1`, .. are a `String` held as its word or, where `leaves`
+/// says `RInt`, an `Int`.
 fn flat(id: Int, leaves: List<Rep>) -> Var =
+  flat_of(id, leaves.map(|r: Rep| if r == RInt { int(0) } else { word(0) }))
+
+/// A record held flat whose fields `f0`, `f1`, .. are of the types of `fields` and held as they are.
+fn flat_of(id: Int, fields: List<Var>) -> Var = {
+  let named = |k: Int| b"f".concat(ascii_of_int(k));
   {
     id: id,
-    ty: TyCon({ name: b"m.S", args: [] }),
+    ty: TyRecord(
+      range(0, fields.len()).map(|k: Int|
+        { name: named(k), ty: match fields.at(k) { Some(v) -> v.ty, None -> int(0).ty } }),
+    ),
     rep: RFlat(
-      range(0, leaves.len()).map(|k: Int|
-        {
-          name: b"f".concat(ascii_of_int(k)),
-          rep: match leaves.at(k) { Some(r) -> r, None -> RInt },
-        }),
+      range(0, fields.len()).map(|k: Int|
+        { name: named(k), rep: match fields.at(k) { Some(v) -> v.rep, None -> RInt } }),
     ),
   }
+}
 
 fn int(id: Int) -> Var = { id: id, ty: TyCon({ name: b"Int", args: [] }), rep: RInt }
 
@@ -2176,7 +2438,7 @@ test "a flat parameter is opened into its parts, and a leaf consumed at its last
   let k = int(3);
   let r = word(4);
   let r2 = word(5);
-  let w2 = { id: 8, ty: unknown_type(), rep: RWord };
+  let w2 = { id: 8, ty: s.ty, rep: RWord };
   let words = [{ ..y, id: 6 }, { ..k, id: 7 }, w2];
   let branch = |otherwise: List<Inst>|
     If({
@@ -2214,13 +2476,13 @@ test "a flat value read by a field's name is not opened, as that read answers a 
 }
 
 test "a read out of an opened leaf keeps the leaf's word held until it is read" {
-  let s = flat(0, [RWord, RInt]);
   let x = of_type(1, b"m.Shape");
+  let s = flat_of(0, [x, int(0)]);
   let name = word(2);
   let r = word(3);
   let w0 = { ..x, id: 4 };
-  let w2 = { id: 6, ty: unknown_type(), rep: RWord };
-  let words = [w0, { id: 5, ty: unknown_type(), rep: RInt }, w2];
+  let w2 = { id: 6, ty: s.ty, rep: RWord };
+  let words = [w0, int(5), w2];
   let named = bind(name, Get({ of: x, path: PArg({ ctor: b"Circle", at: 0 }) }), []);
   let cased = |arm: List<Inst>, rest: List<Inst>|
     Case({
@@ -2274,9 +2536,9 @@ test "a flat value made in the body is opened where it is made, and a word nothi
     bind(r, call_of([AVar(y)], []), []),
     Return(AVar(r)),
   ]);
-  let w0 = { id: 5, ty: unknown_type(), rep: RWord };
+  let w0 = word(5);
   let w1 = { ..y, id: 6 };
-  let w2 = { id: 7, ty: unknown_type(), rep: RWord };
+  let w2 = { id: 7, ty: s.ty, rep: RWord };
   assert_eq(counted_body(f), {
     body: [
       made,
@@ -2321,8 +2583,8 @@ test "a loop's flat state is opened at the head of each pass, so a leaf consumed
   let z = word(5);
   let s2 = flat(6, [RWord, RInt]);
   let a = word(7);
-  let unknown = |id: Int, r: Rep| { id: id, ty: unknown_type(), rep: r };
-  let state = [{ ..y, id: 11 }, { ..k, id: 12 }, unknown(13, RWord)];
+  let box = |id: Int| { id: id, ty: s.ty, rep: RWord };
+  let state = [{ ..y, id: 11 }, { ..k, id: 12 }, box(13)];
   let looped = |head: List<Inst>, made: List<Inst>|
     Loop({
       state: [s],
@@ -2349,15 +2611,15 @@ test "a loop's flat state is opened at the head of each pass, so a leaf consumed
   let f = root_of([p], [], RWord, [looped([], []), Return(AVar(a))]);
   let opened = |head: List<Inst>|
     [
-      Opened({ of: p, words: [unknown(8, RWord), unknown(9, RInt), unknown(10, RWord)] }),
+      Opened({ of: p, words: [word(8), int(9), box(10)] }),
       looped([Opened({ of: s, words: state })].concat(head), [
-        Opened({ of: s2, words: [unknown(14, RWord), unknown(15, RInt), unknown(16, RWord)] }),
+        Opened({ of: s2, words: [word(14), int(15), box(16)] }),
       ]),
       Return(AVar(a)),
     ];
   // The buffer read out of the state is handed on with no count taken, and the record's word, read by
   // nothing, is let go of as the pass opens.
-  assert_eq(counted_body(f), { body: opened([Dec(unknown(13, RWord))]), refused: None });
+  assert_eq(counted_body(f), { body: opened([Dec(box(13))]), refused: None });
   assert_eq(
     refused_with(f, opened([])),
     Some(b"a count held otherwise than the loop holds where it is left: v13"),
@@ -2431,7 +2693,7 @@ test "the words of the flat values a body makes are read off in one walk, howeve
   paced(log_linear, |n: Int| facts_of(steps(p, n, made)).opened.len())
 }
 
-test "the words of a flat value are typed in one walk of its reads, however wide it is" {
+test "the words of a flat value are typed by its fields in one walk, however wide it is" {
   let p = word(0);
   let wide = |n: Int| {
     let s = flat(1, range(0, n).map(|_: Int| RWord));
@@ -2448,7 +2710,7 @@ test "the words of a flat value are typed in one walk of its reads, however wide
   };
   assert_eq(
     match facts_of(wide(2)).opened.get(1) { Some(ws) -> ws.map(|w: Var| w.ty), None -> [] },
-    [word(2).ty, word(3).ty, unknown_type()],
+    [word(2).ty, word(3).ty, flat(1, [RWord, RWord]).ty],
   );
   paced(log_linear, |n: Int| facts_of(wide(n)).opened.len())
 }
