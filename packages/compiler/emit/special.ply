@@ -1,20 +1,24 @@
 //! Specialisation: definitions written at type arguments, and the needs that ask for them.
 
-import syntax.parsing (Ident)
+import syntax.parsing (Ident, dummy_span)
 import emit.code (lower_fn)
 import syntax.items (FnDef)
 import check.resolve.tables (qualify)
 import check.resolve.scopes (of_binder)
 import check.infer.checker (WitnessOp)
-import check.types (Type, TyVar, TyCon, TyFn, TyNominal, Scheme)
+import check.types (Type, TyVar, TyCon, TyFn, TyNominal, Scheme, row_empty, int_type)
 import std.list
 import syntax.exprs (Param, Expr)
 import syntax.type_syntax (TypeExpr, TVar, TCon, TFn)
 import expand.rewrite.shared (map_expr)
 import expand.rewrite (unwitnessed, witness_param)
 import emit.c (KInt, Kind)
-import emit.keys (RootKey, At, FnArg, root_name, key_types, key_lent)
-import emit.answer (Need, Scalar)
+import emit.keys (RootKey, At, Named, FnArg, root_name, key_types, key_lent)
+import emit.answer (Need, Reads, Scalar, Layout, Exact)
+import emit.tir (Fn, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Inc, Dec, Reset, Opened,
+                 Return, Lambda, Closure, Var, Val, LastOf, RFlat, RToken, RWord, RInt, AInt,
+                 Rooted, Owned, counted, no_links)
+import emit.release (released_vars)
 import emit.reps (Ty, TyOpen, EmitParam, BoundLambda, Sig, sig_of, param_kinds, param_types,
                   substituted, numeric_named, filings_at, carriers_of, carriers_at, def_named)
 import emit.typing (Filings)
@@ -100,6 +104,53 @@ pub fn witnessed_needs(
       Unformed(_) -> r,
     },
   }
+
+/// `f`, its counts placed, noting among its needs `release_reads(f)`, so a specialisation settles
+/// every release on a type.
+pub fn release_needs(f: Fn) -> Fn = { ..f, links: { ..f.links, needs: fn_needs(f.links.needs, f) } }
+
+/// What `f`'s counts read of its type variables: each a count it lets go of reads exactly, since a
+/// value is let go of per type, and each a count it takes its layout alone. What its failure paths
+/// let go of and what its closures' bodies do count as its own. A body reading any is printed only
+/// at type arguments its callers settle.
+pub fn release_reads(f: Fn) -> List<Need> = fn_needs([], f)
+
+fn fn_needs(needs: List<Need>, f: Fn) -> List<Need> =
+  f.lambdas.fold(block_needs(needs, f.body), |acc: List<Need>, l: Lambda|
+    match l { Closure(c) -> fn_needs(acc, c.body) })
+
+fn block_needs(needs: List<Need>, b: Block) -> List<Need> =
+  b.fold(needs, |acc: List<Need>, i: Inst|
+    match i {
+      Let(l) -> unwound(value_needs(acc, l.val), l.unwind),
+      Do(d) -> unwound(value_needs(acc, d.val), d.unwind),
+      If(x) -> block_needs(block_needs(acc, x.then), x.otherwise),
+      Case(c) ->
+        c.arms.fold(block_needs(acc, c.rest), |a: List<Need>, arm: { when: Int, body: Block }|
+          block_needs(a, arm.body)),
+      Match(m) -> m.arms.fold(block_needs(acc, m.rest), block_needs),
+      Loop(l) -> block_needs(acc, l.body),
+      Handle(h) -> unwound(block_needs(acc, h.body), h.unwind),
+      Inc(n) -> reading(acc, n.var.ty, Layout),
+      Dec(v) -> reading(acc, v.ty, Exact),
+      Reset(r) -> reading(acc, r.of.ty, Exact),
+      Opened(o) -> match o.of.rep { RFlat(_) -> acc, _ -> reading(acc, o.of.ty, Exact) },
+      _ -> acc,
+    })
+
+fn value_needs(needs: List<Need>, val: Val) -> List<Need> =
+  match val { LastOf(v) -> reading(needs, v.ty, Exact), _ -> needs }
+
+/// `needs` with what letting go of each counted value of `unwind` reads; a reuse token, freed by its
+/// size, reads nothing.
+fn unwound(needs: List<Need>, unwind: List<Var>) -> List<Need> =
+  unwind.fold(needs, |acc: List<Need>, v: Var|
+    match v.rep { RToken(_) -> acc, r -> if counted(r) { reading(acc, v.ty, Exact) } else { acc } })
+
+/// `needs` with each variable a count of `ty` reads read as `reads`.
+fn reading(needs: List<Need>, ty: Type, reads: Reads) -> List<Need> =
+  released_vars(ty).fold(needs, |acc: List<Need>, v: Int|
+    if acc.contains({ var: v, reads: reads }) { acc } else { acc.push({ var: v, reads: reads }) })
 
 /// What a root of `def`, named `full`, at `args` reads its definition as: the body with each
 /// operator whose witness is a parameter held as one numeric type alone done as that type's own,
@@ -201,4 +252,50 @@ pub fn specialised_formed(
         match filed { Ok(f) -> Ok(filings_at(f, args)), Err(why) -> Err(why) },
       ),
   }
+}
+
+test "a body reads exactly each variable it lets go of a value of, and the layout of each it counts" {
+  let at = |name: Bytes, args: List<Type>| TyCon({ name: name, args: args });
+  let local = |id: Int, ty: Type| { id: id, ty: ty, rep: RWord };
+  let list = local(0, at(b"List", [TyVar(0)]));
+  let counted_once = local(1, TyVar(1));
+  let function = local(2, TyFn({ params: [TyVar(5)], ret: TyVar(6), effects: row_empty() }));
+  let task = local(3, at(b"Task", [TyVar(7)]));
+  let held = local(4, at(b"Hold", [TyVar(2)]));
+  let failing = local(5, TyVar(3));
+  let token = { id: 6, ty: TyVar(8), rep: RToken(2) };
+  let last = local(7, at(b"Hold", [TyVar(2)]));
+  let f = {
+    key: Named(b"m.f"),
+    kind: Rooted,
+    params: [],
+    conv: { params: [], reps: [], answer: RInt, answered: Owned },
+    body: [
+      Dec(list),
+      Inc({ var: counted_once, n: 1 }),
+      Dec(function),
+      Dec(task),
+      Let({ var: last, val: LastOf(held), at: dummy_span(), unwind: [failing, token] }),
+      Dec(list),
+      Return(AInt(0)),
+    ],
+    lambdas: [],
+    base: 0,
+    members: [],
+    links: { ..no_links(), needs: [{ var: 1, reads: Scalar }] },
+    statics: [],
+  };
+  assert_eq(release_needs(f).links.needs, [
+    { var: 1, reads: Scalar },
+    { var: 0, reads: Exact },
+    { var: 1, reads: Layout },
+    { var: 2, reads: Exact },
+    { var: 3, reads: Exact },
+  ]);
+  assert_eq(release_reads(f).len(), 4);
+  // A body counting only what its types settle reads none of its variables.
+  assert_eq(
+    release_reads({ ..f, body: [Dec(local(8, at(b"List", [int_type()]))), Return(AInt(0))] }),
+    [],
+  )
 }
