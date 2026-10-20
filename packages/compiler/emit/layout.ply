@@ -68,11 +68,241 @@ pub fn record_laid(fields: List<Laid>) -> Laid =
   )
 
 /// A sum of `cases`, in declared order, laid by the first encoding that applies: its one case's
-/// payload; an enum's index; a niche one case's payload leaves for the nullary ones; pointer tags
-/// where every case with data is one pointer; a niche a widest case leaves for the others; a tag
-/// word and the payloads overlaid after it. Every case inline but those `indirect` boxes, and the
-/// words of a case outside its payload zero. Until it is written, a sum of no words and no cases.
-pub fn sum_laid(cases: List<CaseArgs>) -> SumLaid = { classes: [], cases: [] }
+/// payload; an enum's index; pointer tags where two or more cases have data and each is one pointer
+/// (past the eighth, boxed behind tag 7 with the case's place in the box's first word); a niche the
+/// widest case with data (the first of the widest) leaves for the others, whose payloads lie in its
+/// words wholly before or after that word; a tag word and the payloads overlaid after it. Every case
+/// is inline but those `indirect` boxes, a case of no words is nullary, and the words of a case
+/// outside its payload are zero. A word every case laying it lays alike keeps its class, with 0
+/// added where a case leaves it zero; one cases lay differently is `U`.
+pub fn sum_laid(cases: List<CaseArgs>) -> SumLaid = {
+  let ps = cases.fold([], |acc: List<Placed>, c: CaseArgs|
+    acc.push({
+      case: acc.len(),
+      args: c.args,
+      boxed: c.indirect,
+      words: if c.indirect { 1 } else { words(c.args) },
+    }));
+  let data = ps.filter(|p: Placed| p.words > 0);
+  if ps.len() <= 1 { only(ps) } else if data.len() == 0 {
+    {
+      classes: [R({ lo: 0, hi: ps.len() - 1 })],
+      cases: ps.map(|p: Placed| { test: WordIs({ at: 0, value: p.case }), payload: Nullary }),
+    }
+  } else {
+    match tagged(ps, data) {
+      Some(s) -> s,
+      None -> match niched(ps, data) { Some(s) -> s, None -> tag_word(ps) },
+    }
+  }
+}
+
+/// A case as an encoding places it: its place among the sum's cases, its arguments laid as a record,
+/// whether they are boxed, and how many of the sum's words its payload takes (none for a case of no
+/// words, one for a box).
+type Placed = { case: Int, args: Laid, boxed: Bool, words: Int }
+
+/// The classes of the words a case's payload takes in the sum.
+fn laid_by(p: Placed) -> List<WordClass> = if p.boxed { [P] } else { classes(p.args) }
+
+/// A case's payload, from word `at` of the sum.
+fn payload_at(p: Placed, at: Int) -> Payload =
+  if p.boxed { Boxed({ at: at, stripped: false, skip: 0, laid: p.args }) }
+  else if p.words == 0 { Nullary }
+  else { Inline({ offset: at, laid: p.args, stripped: None }) }
+
+fn only(ps: List<Placed>) -> SumLaid =
+  match ps.at(0) {
+    None -> { classes: [], cases: [] },
+    Some(p) -> { classes: laid_by(p), cases: [{ test: Always, payload: payload_at(p, 0) }] },
+  }
+
+/// Pointer tags: each case with data one pointer, told apart by its low bits, the nullary cases the
+/// small values below every pointer.
+fn tagged(ps: List<Placed>, data: List<Placed>) -> Option<SumLaid> = {
+  let nullary = ps.len() - data.len();
+  let tags = 1 << tag_bits();
+  if data.len() < 2 || nullary > small_values() || !data.all(|p: Placed| laid_by(p) == [P]) { None }
+  else {
+    let laid = ps.fold(
+      { cases: [], data: 0, nullary: 0 },
+      |acc: { cases: List<CaseLaid>, data: Int, nullary: Int }, p: Placed|
+        if p.words == 0 {
+          {
+            ..acc,
+            cases: acc.cases.push({
+              test: WordIs({ at: 0, value: nullary_step() * acc.nullary }),
+              payload: Nullary,
+            }),
+            nullary: acc.nullary + 1,
+          }
+        } else {
+          let overflow = data.len() > tags && acc.data >= tags - 1;
+          let c = if overflow {
+            {
+              test: LowBits({ at: 0, bits: tags - 1, block_tag: Some(p.case) }),
+              payload: Boxed({ at: 0, stripped: true, skip: 1, laid: p.args }),
+            }
+          } else {
+            {
+              test: LowBits({ at: 0, bits: acc.data, block_tag: None }),
+              payload: if p.boxed { Boxed({ at: 0, stripped: true, skip: 0, laid: p.args }) }
+              else { Inline({ offset: 0, laid: p.args, stripped: Some(0) }) },
+            }
+          };
+          { ..acc, cases: acc.cases.push(c), data: acc.data + 1 }
+        },
+    );
+    Some({ classes: [S(nullary)], cases: laid.cases })
+  }
+}
+
+/// A niche: the widest case with data keeps its words, and every other case is a value its niche word
+/// never holds, its payload in the widest's words before or after that word.
+fn niched(ps: List<Placed>, data: List<Placed>) -> Option<SumLaid> =
+  match data.at(0) {
+    None -> None,
+    Some(first) ->
+      niched_by(ps, data.fold(first, |w: Placed, p: Placed| if p.words > w.words { p } else { w })),
+  }
+
+/// `niched` with `d` the case keeping its words.
+fn niched_by(ps: List<Placed>, d: Placed) -> Option<SumLaid> = {
+  let own = laid_by(d);
+  let others = ps.filter(|p: Placed| p.case != d.case);
+  let before = |at: Int, p: Placed| p.words <= at;
+  let fits = |at: Int, p: Placed| before(at, p) || p.words <= own.len() - at - 1;
+  let chosen = range(0, own.len()).find(|at: Int|
+    (match own.at(at) { Some(c) -> room(c), None -> 0 }) >= others.len()
+      && others.all(|p: Placed| fits(at, p)));
+  match chosen {
+    None -> None,
+    Some(at) -> {
+      let niche = match own.at(at) { Some(c) -> c, None -> U };
+      let offset = |p: Placed| if p.case == d.case || before(at, p) { 0 } else { at + 1 };
+      let values = range(0, others.len()).map(|j: Int| niche_value(niche, j));
+      let words = overlaid(own.len(), ps.map(|p: Placed| { at: offset(p), classes: laid_by(p) }));
+      Some({
+        classes: range(0, words.len()).map(|w: Int|
+          if w == at { taken(niche, others.len()) }
+          else { match words.at(w) { Some(c) -> c, None -> U } }),
+        cases: ps.fold(
+          { cases: [], other: 0 },
+          |acc: { cases: List<CaseLaid>, other: Int }, p: Placed|
+            if p.case == d.case {
+              {
+                ..acc,
+                cases: acc.cases.push({
+                  test: WordOutside({ at: at, values: values }),
+                  payload: payload_at(p, 0),
+                }),
+              }
+            } else {
+              {
+                cases: acc.cases.push({
+                  test: WordIs({ at: at, value: niche_value(niche, acc.other) }),
+                  payload: payload_at(p, offset(p)),
+                }),
+                other: acc.other + 1,
+              }
+            },
+        ).cases,
+      })
+    },
+  }
+}
+
+/// A tag word, the case's place, and every case's payload after it.
+fn tag_word(ps: List<Placed>) -> SumLaid = {
+  let n = ps.fold(0, |w: Int, p: Placed| if p.words > w { p.words } else { w });
+  {
+    classes: [R({ lo: 0, hi: ps.len() - 1 })].concat(
+      overlaid(n, ps.map(|p: Placed| { at: 0, classes: laid_by(p) })),
+    ),
+    cases: ps.map(|p: Placed|
+      { test: WordIs({ at: 0, value: p.case }), payload: payload_at(p, 1) }),
+  }
+}
+
+/// The class of each of `n` words cases lay as `laying` says, each from its word `at`: what the
+/// cases laying a word agree it holds, 0 among it where some case lays nothing there.
+fn overlaid(n: Int, laying: List<{ at: Int, classes: List<WordClass> }>) -> List<WordClass> =
+  range(0, n).map(|w: Int| {
+    let seen = laying.fold(
+      { class: None, zero: false },
+      |acc: { class: Option<WordClass>, zero: Bool }, l: { at: Int, classes: List<WordClass> }|
+        match l.classes.at(w - l.at) {
+          Some(c) -> { ..acc, class: Some(match acc.class { Some(a) -> joined(a, c), None -> c }) },
+          None -> { ..acc, zero: true },
+        },
+    );
+    match seen.class {
+      Some(c) -> if seen.zero { zeroed(c) } else { c },
+      None -> R({ lo: 0, hi: 0 }),
+    }
+  })
+
+/// The class of a word one case lays as `a` and another as `b`.
+fn joined(a: WordClass, b: WordClass) -> WordClass =
+  match a {
+    P -> match b { P -> P, S(n) -> S(n), _ -> U },
+    S(m) -> match b { P -> S(m), S(n) -> S(larger(m, n)), _ -> U },
+    C(m) -> match b { C(n) -> C(larger(m, n)), _ -> U },
+    R(x) -> match b { R(y) -> R({ lo: smaller(x.lo, y.lo), hi: larger(x.hi, y.hi) }), _ -> U },
+    U -> U,
+  }
+
+/// The class of a word laid as `c`, or 0 where a case lays nothing there.
+fn zeroed(c: WordClass) -> WordClass =
+  match c {
+    P -> S(1),
+    S(m) -> S(larger(m, 1)),
+    C(m) -> C(larger(m, 1)),
+    R(r) -> R({ lo: smaller(r.lo, 0), hi: larger(r.hi, 0) }),
+    U -> U,
+  }
+
+fn larger(a: Int, b: Int) -> Int = if a > b { a } else { b }
+
+fn smaller(a: Int, b: Int) -> Int = if a < b { a } else { b }
+
+/// How many of the small values below every pointer a one-word sum may take for its nullary cases.
+fn small_values() -> Int = pointer_floor() >> tag_bits()
+
+/// How many values a word of class `c` never holds, which a sum may take for its other cases.
+fn room(c: WordClass) -> Int =
+  match c {
+    P -> small_values(),
+    S(m) -> small_values() - m,
+    C(m) -> small_values() - m,
+    R(r) -> largest() - r.hi,
+    U -> 0,
+  }
+
+/// The `j`th value from the first a word of class `c` never holds.
+fn niche_value(c: WordClass, j: Int) -> Int =
+  match c {
+    P -> nullary_step() * j,
+    S(m) -> nullary_step() * (m + j),
+    C(m) -> nullary_step() * (m + j),
+    R(r) -> r.hi + 1 + j,
+    U -> 0,
+  }
+
+/// A word of class `c` that also holds the first `n` values it never held.
+fn taken(c: WordClass, n: Int) -> WordClass =
+  match c {
+    P -> S(n),
+    S(m) -> S(m + n),
+    C(m) -> C(m + n),
+    R(r) -> R({ lo: r.lo, hi: r.hi + n }),
+    U -> U,
+  }
+
+fn largest() -> Int = 9223372036854775807
+
+/// A word that may hold any value: an `Int`'s, a `Float`'s bits, a width's.
+pub fn raw() -> WordClass = R({ lo: 0 - largest() - 1, hi: largest() })
 
 /// How many words a value laid as `l` takes.
 pub fn words(l: Laid) -> Int = classes(l).len()
@@ -351,6 +581,235 @@ test "a record's fields lie one after another from its first word, each as wide 
   assert_eq(match r { LRecord(fs) -> fs.map(|f: FieldLaid| f.at), _ -> [] }, [0, 1, 3, 3]);
   assert_eq(counts(r), true);
   assert_eq(counts(record_laid([pair, LWords([C(0)])])), false)
+}
+
+fn of_args(args: List<Laid>) -> CaseArgs = { args: record_laid(args), indirect: false }
+
+fn recursive(args: List<Laid>) -> CaseArgs = { args: record_laid(args), indirect: true }
+
+fn tests_of(s: SumLaid) -> List<CaseTest> = s.cases.map(|c: CaseLaid| c.test)
+
+fn pointer() -> Laid = LWords([P])
+
+fn int() -> Laid = LWords([raw()])
+
+fn flag() -> Laid = LWords([R({ lo: 0, hi: 1 })])
+
+fn maybe(l: Laid) -> SumLaid = sum_laid([of_args([]), of_args([l])])
+
+test "an Option takes a niche of its payload for None where one has room, and a tag word where none has" {
+  assert_eq(maybe(pointer()), {
+    classes: [S(1)],
+    cases: [
+      { test: WordIs({ at: 0, value: 0 }), payload: Nullary },
+      {
+        test: WordOutside({ at: 0, values: [0] }),
+        payload: Inline({ offset: 0, laid: record_laid([pointer()]), stripped: None }),
+      },
+    ],
+  });
+  // Each Option around another takes the next value the inner one never holds.
+  let twice = maybe(LSum(maybe(pointer())));
+  assert_eq(twice.classes, [S(2)]);
+  assert_eq(tests_of(twice), [WordIs({ at: 0, value: 8 }), WordOutside({ at: 0, values: [8] })]);
+  let thrice = maybe(LSum(twice));
+  assert_eq(thrice.classes, [S(3)]);
+  assert_eq(tests_of(thrice), [WordIs({ at: 0, value: 16 }), WordOutside({ at: 0, values: [16] })]);
+  assert_eq(tests_of(maybe(flag())), [
+    WordIs({ at: 0, value: 2 }),
+    WordOutside({ at: 0, values: [2] }),
+  ]);
+  assert_eq(maybe(flag()).classes, [R({ lo: 0, hi: 2 })]);
+  // A record's niche is its first word with room: `{ at: Int, why: String }`'s `why`.
+  let dated = maybe(record_laid([int(), pointer()]));
+  assert_eq(dated.classes, [raw(), S(1)]);
+  assert_eq(tests_of(dated), [WordIs({ at: 1, value: 0 }), WordOutside({ at: 1, values: [0] })]);
+  // An `Int` or a `Float` leaves no value free: a tag word, the payload after it.
+  assert_eq(maybe(int()), {
+    classes: [R({ lo: 0, hi: 1 }), raw()],
+    cases: [
+      { test: WordIs({ at: 0, value: 0 }), payload: Nullary },
+      {
+        test: WordIs({ at: 0, value: 1 }),
+        payload: Inline({ offset: 1, laid: record_laid([int()]), stripped: None }),
+      },
+    ],
+  });
+  assert_eq([counts(LSum(maybe(pointer()))), counts(LSum(maybe(flag())))], [true, false])
+}
+
+test "a Result of two pointers tags its Err's pointer, and one of a zero-word Ok is a niche" {
+  let both = sum_laid([of_args([pointer()]), of_args([pointer()])]);
+  assert_eq(both.classes, [S(0)]);
+  assert_eq(tests_of(both), [
+    LowBits({ at: 0, bits: 0, block_tag: None }),
+    LowBits({ at: 0, bits: 1, block_tag: None }),
+  ]);
+  assert_eq(both.cases.map(|c: CaseLaid| c.payload), [
+    Inline({ offset: 0, laid: record_laid([pointer()]), stripped: Some(0) }),
+    Inline({ offset: 0, laid: record_laid([pointer()]), stripped: Some(0) }),
+  ]);
+  // `Ok(())` is a case of no words: nullary for its layout, so the error's pointer leaves it 0.
+  let unit = sum_laid([of_args([LWords([])]), of_args([pointer()])]);
+  assert_eq(unit.classes, [S(1)]);
+  assert_eq(tests_of(unit), [WordIs({ at: 0, value: 0 }), WordOutside({ at: 0, values: [0] })]);
+  assert_eq(unit.cases.map(|c: CaseLaid| c.payload == Nullary), [true, false]);
+  // An `Int` beside a pointer leaves no niche: a tag word, its one payload word each case's own.
+  let mixed = sum_laid([of_args([int()]), of_args([pointer()])]);
+  assert_eq(mixed.classes, [R({ lo: 0, hi: 1 }), U]);
+  assert_eq(tests_of(mixed), [WordIs({ at: 0, value: 0 }), WordIs({ at: 0, value: 1 })])
+}
+
+test "a sum of nullary cases is its case's place, and a single case is its payload" {
+  let ordering = sum_laid([of_args([]), of_args([]), of_args([])]);
+  assert_eq(ordering, {
+    classes: [R({ lo: 0, hi: 2 })],
+    cases: range(0, 3).map(|i: Int| { test: WordIs({ at: 0, value: i }), payload: Nullary }),
+  });
+  assert_eq(counts(LSum(ordering)), false);
+  // A case whose arguments take no words is nullary.
+  assert_eq(sum_laid([of_args([LWords([]), record_laid([])]), of_args([])]).classes, [
+    R({ lo: 0, hi: 1 }),
+  ]);
+  // One nullary case takes no words at all.
+  assert_eq(sum_laid([of_args([])]), { classes: [], cases: [{ test: Always, payload: Nullary }] });
+  assert_eq(words(LSum(sum_laid([of_args([])]))), 0);
+  assert_eq(sum_laid([of_args([int(), pointer()])]), {
+    classes: [raw(), P],
+    cases: [
+      {
+        test: Always,
+        payload: Inline({ offset: 0, laid: record_laid([int(), pointer()]), stripped: None }),
+      },
+    ],
+  });
+  // A case reaching its own sum in place is boxed, one pointer.
+  assert_eq(sum_laid([recursive([int(), pointer()])]), {
+    classes: [P],
+    cases: [
+      {
+        test: Always,
+        payload: Boxed({ at: 0, stripped: false, skip: 0, laid: record_laid([int(), pointer()]) }),
+      },
+    ],
+  })
+}
+
+test "a tree's boxed cases are tagged pointers, past the eighth behind tag 7 and their place in the box" {
+  let node = recursive([int(), pointer()]);
+  let tree = sum_laid([of_args([]), node, node, of_args([])]);
+  assert_eq(tree.classes, [S(2)]);
+  assert_eq(tests_of(tree), [
+    WordIs({ at: 0, value: 0 }),
+    LowBits({ at: 0, bits: 0, block_tag: None }),
+    LowBits({ at: 0, bits: 1, block_tag: None }),
+    WordIs({ at: 0, value: 8 }),
+  ]);
+  assert_eq(
+    match tree.cases.at(2) { Some(c) -> c.payload, None -> Nullary },
+    Boxed({ at: 0, stripped: true, skip: 0, laid: record_laid([int(), pointer()]) }),
+  );
+  // Nine cases with data, a nullary one among them: the eighth and ninth share tag 7, told apart by
+  // their place in the sum, which their box holds before their payload.
+  let nine = sum_laid(range(0, 10).map(|i: Int| if i == 4 { of_args([]) } else { node }));
+  assert_eq(nine.classes, [S(1)]);
+  assert_eq(tests_of(nine), [
+    LowBits({ at: 0, bits: 0, block_tag: None }),
+    LowBits({ at: 0, bits: 1, block_tag: None }),
+    LowBits({ at: 0, bits: 2, block_tag: None }),
+    LowBits({ at: 0, bits: 3, block_tag: None }),
+    WordIs({ at: 0, value: 0 }),
+    LowBits({ at: 0, bits: 4, block_tag: None }),
+    LowBits({ at: 0, bits: 5, block_tag: None }),
+    LowBits({ at: 0, bits: 6, block_tag: None }),
+    LowBits({ at: 0, bits: 7, block_tag: Some(8) }),
+    LowBits({ at: 0, bits: 7, block_tag: Some(9) }),
+  ]);
+  assert_eq(nine.cases.map(|c: CaseLaid| match c.payload { Boxed(b) -> b.skip, _ -> 0 - 1 }), [
+    0,
+    0,
+    0,
+    0,
+    0 - 1,
+    0,
+    0,
+    0,
+    1,
+    1,
+  ]);
+  // An inline pointer past the eighth is boxed behind its place too.
+  let inline = sum_laid(range(0, 9).map(|_: Int| of_args([pointer()])));
+  assert_eq(
+    match inline.cases.at(8) { Some(c) -> c.payload, None -> Nullary },
+    Boxed({ at: 0, stripped: true, skip: 1, laid: record_laid([pointer()]) }),
+  )
+}
+
+test "nullary cases take the 512 small values below every pointer, and a 513th takes a tag word" {
+  let nullary = |n: Int| range(0, n).map(|_: Int| of_args([]));
+  assert_eq(sum_laid(nullary(513)).classes, [R({ lo: 0, hi: 512 })]);
+  assert_eq(sum_laid(nullary(512).push(of_args([pointer()]))).classes, [S(512)]);
+  assert_eq(sum_laid(nullary(513).push(of_args([pointer()]))).classes, [
+    R({ lo: 0, hi: 513 }),
+    S(1),
+  ]);
+  let two = [of_args([pointer()]), of_args([pointer()])];
+  assert_eq(sum_laid(nullary(512).concat(two)).classes, [S(512)]);
+  assert_eq(sum_laid(nullary(513).concat(two)).classes, [R({ lo: 0, hi: 514 }), S(1)])
+}
+
+test "the widest case's niche holds the other cases where their payloads fit beside it" {
+  // `Kind`: five nullary cases, `KNum({ bits, signed })` and `KSum(SumSpec)`; the niche is `signed`.
+  let spec = LSum(sum_laid([of_args([]), of_args([])]));
+  let kind = sum_laid([
+    of_args([]),
+    of_args([]),
+    of_args([]),
+    of_args([record_laid([int(), flag()])]),
+    of_args([]),
+    of_args([]),
+    of_args([spec]),
+  ]);
+  assert_eq(kind.classes, [raw(), R({ lo: 0, hi: 7 })]);
+  assert_eq(tests_of(kind), [
+    WordIs({ at: 1, value: 2 }),
+    WordIs({ at: 1, value: 3 }),
+    WordIs({ at: 1, value: 4 }),
+    WordOutside({ at: 1, values: [2, 3, 4, 5, 6, 7] }),
+    WordIs({ at: 1, value: 5 }),
+    WordIs({ at: 1, value: 6 }),
+    WordIs({ at: 1, value: 7 }),
+  ]);
+  assert_eq(
+    match kind.cases.at(6) { Some(c) -> c.payload, None -> Nullary },
+    Inline({ offset: 0, laid: record_laid([spec]), stripped: None }),
+  );
+  // A payload that fits only after the niche word lies there, and a word only the widest lays may
+  // be 0 in the other cases.
+  let after = sum_laid([of_args([flag(), pointer(), pointer()]), of_args([pointer()])]);
+  assert_eq(after.classes, [R({ lo: 0, hi: 2 }), P, S(1)]);
+  assert_eq(tests_of(after), [WordOutside({ at: 0, values: [2] }), WordIs({ at: 0, value: 2 })]);
+  assert_eq(
+    match after.cases.at(1) { Some(c) -> c.payload, None -> Nullary },
+    Inline({ offset: 1, laid: record_laid([pointer()]), stripped: None }),
+  );
+  // A payload as wide as the widest fits on neither side of any niche word: a tag word.
+  let wide = sum_laid([of_args([flag(), pointer()]), of_args([pointer(), pointer()])]);
+  assert_eq(wide.classes, [R({ lo: 0, hi: 1 }), U, P]);
+  assert_eq(tests_of(wide), [WordIs({ at: 0, value: 0 }), WordIs({ at: 0, value: 1 })])
+}
+
+test "a word some case leaves zero never offers 0 to an enclosing sum's niche" {
+  // 512 nullary cases fill the niche word; the pointer after it is 0 in each, so an `Option` of
+  // this sum takes the next value there.
+  let full = sum_laid(
+    range(0, 512).map(|_: Int| of_args([])).push(of_args([pointer(), pointer()])),
+  );
+  assert_eq(full.classes, [S(512), S(1)]);
+  assert_eq(tests_of(maybe(LSum(full))), [
+    WordIs({ at: 1, value: 8 }),
+    WordOutside({ at: 1, values: [8] }),
+  ])
 }
 
 test "each machine struct's fields lie in order, each at a multiple of its size, within the struct" {
