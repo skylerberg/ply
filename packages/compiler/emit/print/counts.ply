@@ -1078,7 +1078,9 @@ pub fn walked(
 
 /// `Walked` of a sum of one word, `of`: the block the case it holds holds, of those `blocks` lists,
 /// walked as `op` does, its answer into `into`. `Keep` answers the word kept, its tag kept with it,
-/// and `Share` 0 where a block it reaches may not cross; a case holding no block walks nothing.
+/// and `Share` 0 where a block it reaches may not cross; a case holding no block walks nothing. A box
+/// holding a sum of `of`'s own type goes on to that sum in a loop, so a chain of them is walked
+/// without calls nesting; a kept chain is written into the box kept before it.
 pub fn walked_sum(
   pr: Printing,
   depth: Int,
@@ -1094,12 +1096,13 @@ pub fn walked_sum(
       let n = named(pr, into);
       let a = n.name;
       let untagged = match s.laid.classes { [P] -> true, _ -> false };
+      let held = if op == Keep { b"*ply_into" } else { a };
       let tag = if untagged { b"" }
-      else { Bytes::concat_all([b" | (", x, b" & ", ascii_of_int(tag_mask()), b")"]) };
+      else { Bytes::concat_all([b" | (ply_x & ", ascii_of_int(tag_mask()), b")"]) };
       let arms = blocks.fold(
         { pr: n.pr, out: [] },
         |acc: Said, b: { case: Int, ty: Type, rep: Rep, opening: Opening }| {
-          let body = case_walked(acc.pr, ctors, a, tag, op, b.ty, b.rep, b.opening);
+          let body = case_walked(acc.pr, ctors, held, tag, op, of, b.ty, b.rep, b.opening);
           {
             pr: body.pr,
             out: acc.out.push(
@@ -1108,9 +1111,8 @@ pub fn walked_sum(
                   b"case ",
                   ascii_of_int(b.case),
                   b": { Word ply_b = ",
-                  if untagged { x } else {
-                    Bytes::concat_all([b"(", x, b" & ~(Word)", ascii_of_int(tag_mask()), b")"])
-                  },
+                  if untagged { b"ply_x" }
+                  else { Bytes::concat_all([b"(ply_x & ~(Word)", ascii_of_int(tag_mask()), b")"]) },
                   b"; ",
                 ]),
               ),
@@ -1130,16 +1132,20 @@ pub fn walked_sum(
               b"Word ",
               a,
               b" = ",
-              match op { Keep -> x, _ -> b"1" },
-              b"; switch (",
-              case_of(s.laid, [x]),
+              if op == Keep { x } else { b"1" },
+              b"; ",
+              if op == Keep { Bytes::concat_all([b"Word *ply_into = &", a, b"; "]) } else { b"" },
+              b"Word ply_x = ",
+              x,
+              b"; for (;;) { Word ply_n = 0; switch (",
+              case_of(s.laid, [b"ply_x"]),
               b") { ",
             ]),
           ),
         ].concat(
           arms.out,
         ).push(
-          Text(b"}"),
+          Text(b"} if (!ply_n) break; ply_x = ply_n; }"),
         ),
       })
     },
@@ -1147,13 +1153,15 @@ pub fn walked_sum(
   }
 
 /// The block `ply_b` a sum's case holds, of type `ty` held as `rep` and laid as `o` says, walked as
-/// `op` does into `a`: a box in place, the object of a pointer laid in place through its type's root.
+/// `op` does, into `held`: the object of a pointer laid in place through its type's root, or a box
+/// in place, whose last part of `own`'s type the loop around goes on to as `ply_n`.
 fn case_walked(
   pr: Printing,
   ctors: Ctors,
-  a: Bytes,
+  held: Bytes,
   tag: Bytes,
   op: TypeOp,
+  own: Var,
   ty: Type,
   rep: Rep,
   o: Opening,
@@ -1163,7 +1171,7 @@ fn case_walked(
       let c = rooted_call(pr, root_of(Keep, ty), RWord, b"ply_b");
       {
         pr: c.pr,
-        out: [Text(Bytes::concat_all([a, b" = "]))].concat(c.out).push(
+        out: [Text(Bytes::concat_all([held, b" = "]))].concat(c.out).push(
           Text(Bytes::concat_all([tag, b";"])),
         ),
       }
@@ -1172,67 +1180,103 @@ fn case_walked(
       let c = rooted_call(pr, root_of(Share, ty), RInt, b"ply_b");
       {
         pr: c.pr,
-        out: [Text(b"if (!")].concat(c.out).push(Text(Bytes::concat_all([b") ", a, b" = 0;"]))),
+        out: [Text(b"if (!")].concat(c.out).push(Text(Bytes::concat_all([b") ", held, b" = 0;"]))),
       }
     },
-    (Keep, _) -> {
-      let size = block_size(b"ply_b", o);
-      let slots = slots_walked(
-        pr,
-        ctors,
-        b"ply_k",
-        o,
-        |q: Printing, ps: List<Part>, ws: List<Bytes>| kept_parts(q, ps, ws),
-      );
-      {
-        pr: slots.pr,
-        out: [
-          Text(
-            Bytes::concat_all([
-              b"if (",
-              field(b"ply_b", b"rc"),
-              b" != UINT32_MAX) { Word ply_k = rt_alloc_kept_p(ctx, ",
-              size,
-              b"); ",
-              copied_block(b"ply_k", b"ply_b", size),
-              b" ",
-            ]),
-          ),
-        ].concat(
-          slots.out,
-        ).push(
-          Text(Bytes::concat_all([b" ", a, b" = ply_k", tag, b"; }"])),
-        ),
+    _ -> {
+      let split = chained(o, own);
+      match op {
+        Keep -> {
+          let size = block_size(b"ply_b", o);
+          let slots = slots_walked(
+            pr,
+            ctors,
+            b"ply_k",
+            split.rest,
+            |q: Printing, ps: List<Part>, ws: List<Bytes>| kept_parts(q, ps, ws),
+          );
+          let on = match split.next {
+            Some(at) ->
+              Bytes::concat_all([b" ply_into = &", slot(b"ply_k", at), b"; ply_n = *ply_into;"]),
+            None -> b"",
+          };
+          {
+            pr: slots.pr,
+            out: [
+              Text(
+                Bytes::concat_all([
+                  b"if (",
+                  field(b"ply_b", b"rc"),
+                  b" != UINT32_MAX) { Word ply_k = rt_alloc_kept_p(ctx, ",
+                  size,
+                  b"); ",
+                  copied_block(b"ply_k", b"ply_b", size),
+                  b" ",
+                ]),
+              ),
+            ].concat(
+              slots.out,
+            ).push(
+              Text(Bytes::concat_all([b" ", held, b" = ply_k", tag, b";", on, b" }"])),
+            ),
+          }
+        },
+        Share -> {
+          let slots = slots_walked(
+            pr,
+            ctors,
+            b"ply_b",
+            split.rest,
+            |q: Printing, ps: List<Part>, ws: List<Bytes>| shared_parts(q, held, ps, ws),
+          );
+          let on = match split.next {
+            Some(at) -> Bytes::concat_all([b" ply_n = ", slot(b"ply_b", at), b";"]),
+            None -> b"",
+          };
+          {
+            pr: slots.pr,
+            out: [
+              Text(
+                Bytes::concat_all([
+                  b"if (",
+                  field(b"ply_b", b"rc"),
+                  b" < UINT32_C(0x80000000)) { ",
+                  field(b"ply_b", b"rc"),
+                  b" |= UINT32_C(0x80000000); ",
+                ]),
+              ),
+            ].concat(
+              slots.out,
+            ).push(
+              Text(Bytes::concat_all([on, b" }"])),
+            ),
+          }
+        },
+        _ -> unprinted(Spine, b"a sum of one word walked by no walk", op_name(op)),
       }
     },
-    (Share, _) -> {
-      let slots = slots_walked(
-        pr,
-        ctors,
-        b"ply_b",
-        o,
-        |q: Printing, ps: List<Part>, ws: List<Bytes>| shared_parts(q, a, ps, ws),
-      );
-      {
-        pr: slots.pr,
-        out: [
-          Text(
-            Bytes::concat_all([
-              b"if (",
-              field(b"ply_b", b"rc"),
-              b" < UINT32_C(0x80000000)) { ",
-              field(b"ply_b", b"rc"),
-              b" |= UINT32_C(0x80000000); ",
-            ]),
-          ),
-        ].concat(
-          slots.out,
-        ).push(
-          Text(b" }"),
-        ),
+  }
+
+/// A box opened as `o` without the last part held as `own` is, a sum of its own type, and the word
+/// that part lies at, which a walk goes on to in a loop.
+fn chained(o: Opening, own: Var) -> { rest: Opening, next: Option<Int> } =
+  match o {
+    InBox(b) -> {
+      let last = range(0, b.parts.len()).fold(None, |found: Option<Int>, i: Int|
+        match b.parts.at(i) {
+          Some(h) -> if h.ty == own.ty && h.rep == own.rep { Some(i) } else { found },
+          None -> found,
+        });
+      match last {
+        Some(i) ->
+          {
+            rest: InBox({ ..b, parts: b.parts.take(i).concat(b.parts.drop(i + 1)) }),
+            next: match b.parts.at(i) { Some(h) -> Some(h.at), None -> None },
+          },
+        None -> { rest: o, next: None },
       }
     },
-    _ -> unprinted(Spine, b"a sum of one word walked by no walk", op_name(op)),
+    _ -> { rest: o, next: None },
   }
 
 /// The bytes of the block `x`, laid as `o` says, its header among them, as a C expression.
@@ -2116,8 +2160,9 @@ test "a node copied is a fresh block of its header and words, each counted once 
   assert_eq(copy.calls, [node])
 }
 
-test "a sum of one word walks the block its case holds, its tag kept with a kept word" {
+test "a sum of one word walks the block its case holds, a chain of its own type in a loop" {
   let string = TyCon({ name: b"String", args: [] });
+  let own = TyCon({ name: b"T", args: [] });
   let tagged = RSum({
     laid: {
       classes: [S(1)],
@@ -2134,7 +2179,11 @@ test "a sum of one word walks the block its case holds, its tag kept with a kept
       case: 1,
       ty: TyCon({ name: b"m.T", args: [] }),
       rep: RSum({ laid: { classes: [P], cases: [] }, cases: [b"m.B"] }),
-      opening: InBox({ parts: [{ at: 0, ty: string, rep: RWord }], words: 1 }),
+      // Case 1's box holds a string, then the rest of the chain: a sum of the walked one's type.
+      opening: InBox({
+        parts: [{ at: 0, ty: string, rep: RWord }, { at: 1, ty: own, rep: tagged }],
+        words: 2,
+      }),
     },
     { case: 2, ty: string, rep: RWord, opening: StrBlock({ viewed: dropping_of(b"String") }) },
   ];
@@ -2142,23 +2191,27 @@ test "a sum of one word walks the block its case holds, its tag kept with a kept
   let walk = |op: TypeOp|
     spelled(walked_sum(pr, 0, no_ctors(), local(1, RWord), local(0, tagged), op, blocks).out);
   let kept = walk(Keep);
-  let keep = root_spelled(root_of(Keep, string));
   [
-    b"Word t1 = p0; switch (",
-    b"case 1: { Word ply_b = (p0 & ~(Word)7); if (ply_obj(ply_b)->rc != UINT32_MAX) { Word ply_k = rt_alloc_kept_p(ctx, 24);",
-    b" t1 = ply_k | (p0 & 7); }",
+    b"Word t1 = p0; Word *ply_into = &t1; Word ply_x = p0; for (;;) { Word ply_n = 0; switch (",
+    b"case 1: { Word ply_b = (ply_x & ~(Word)7); if (ply_obj(ply_b)->rc != UINT32_MAX) { Word ply_k = rt_alloc_kept_p(ctx, 32);",
+    b" *ply_into = ply_k | (ply_x & 7); ply_into = &ply_words(ply_k)[1]; ply_n = *ply_into; }",
     Bytes::concat_all([
-      b"case 2: { Word ply_b = (p0 & ~(Word)7); t1 = ",
-      keep,
-      b"(ctx, ply_b) | (p0 & 7); } break; ",
+      b"case 2: { Word ply_b = (ply_x & ~(Word)7); *ply_into = ",
+      root_spelled(root_of(Keep, string)),
+      b"(ctx, ply_b) | (ply_x & 7); } break; ",
     ]),
+    b"} if (!ply_n) break; ply_x = ply_n; }",
   ].fold((), |_: Unit, part: Bytes| assert(kept.contains(part), None));
   let shared = walk(Share);
   [
-    b"Word t1 = 1; switch (",
+    b"Word t1 = 1; Word ply_x = p0; for (;;) { Word ply_n = 0; switch (",
     b"if (ply_obj(ply_b)->rc < UINT32_C(0x80000000)) { ply_obj(ply_b)->rc |= UINT32_C(0x80000000);",
+    b" ply_n = ply_words(ply_b)[1]; }",
     Bytes::concat_all([b"if (!", root_spelled(root_of(Share, string)), b"(ctx, ply_b)) t1 = 0;"]),
-  ].fold((), |_: Unit, part: Bytes| assert(shared.contains(part), None))
+  ].fold((), |_: Unit, part: Bytes| assert(shared.contains(part), None));
+  // However long the chain, no walk calls its own root: the loop goes on to the rest.
+  assert(!kept.contains(root_spelled(root_of(Keep, own))), None);
+  assert(!shared.contains(root_spelled(root_of(Share, own))), None)
 }
 
 test "a box shared marks it and shares each block it holds; kept, it is copied for good, each word kept" {
