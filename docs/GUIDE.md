@@ -931,7 +931,12 @@ The leading `|` is optional. Constructors are values: `Circle(3)` is a call,
 A sum is nominal, as a `new` record is (§4.2): identical sums in two modules
 differ. A sum takes parameters as an alias does,
 `type Tree<a> = | Leaf | Node(Tree<a>, a, Tree<a>)`, and a use that fills them
-with other arguments is another type (§4.5).
+with other arguments is another type (§4.5). A sum holds itself, directly or
+through other sums, records and lists, only at its own parameters or at fixed
+types: `type Nest<a> = | Leaf(a) | Deeper(Nest<List<a>>)`, which holds itself at
+a type grown from `a`, is refused (`E0477`), since a value of it reaches a new
+type at each level and the code compiled for each would never end. Through a
+function type it may: `| Later((Later<List<a>>) -> Int)` holds no such value.
 
 A value is compared, ordered, digested and shown as its constructor and fields
 say, which is wrong for a type that can hold one thing two ways. The module that
@@ -3889,6 +3894,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0474` | obligation nothing proves |
 | `E0475` | a lent function parameter held past the call: answered, stored, performed, or passed where it may be held |
 | `E0476` | a native a unit calls that the runtime it is compiled against implements by none, by two, or otherwise than the compiler declares it |
+| `E0477` | a sum that holds itself, through a chain of sums, at a type grown from its own parameters |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |

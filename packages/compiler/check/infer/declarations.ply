@@ -27,7 +27,7 @@ import check.infer.checker (Location, DeclaredAlias, DeclaredExtern, DeclaredRec
                             is_region_effect, location_of, module_name, scope_of, report_error_at,
                             report_error_at_and, supplied, new_ty, new_ty_var, new_row, new_row_var,
                             resolve, is_prelude_effect, seed_atom, builtin_type_arity, add_ctor,
-                            ctor_of, add_effect, effect_of, channel_ops, mode_eq)
+                            ctor_of, add_effect, effect_of, channel_ops, mode_eq, CtorInfo)
 import check.infer.names (global, unresolved_in_derived, exporter, simple_name_of)
 
 // --- Types from type expressions ----------------------------------------------------------
@@ -1253,6 +1253,157 @@ pub fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort
       },
       _ -> c,
     })
+
+/// Each sum `parsed` declares that holds itself, through a chain of sums, at a type grown from its
+/// own parameters, as `Nest<a>` holding a `Nest<List<a>>` does, refused (`E0477`): the code a build
+/// writes for each type such a value reaches would never end. A function type holds nothing that
+/// code reaches, so a chain through one is no chain.
+pub fn refuse_irregular(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
+  let generic = parsed.module.items.fold([], |acc: List<TypeDef>, item: Item|
+    match item {
+      IType(def) -> match def.body {
+        TDSum(_) -> if def.generics.types.len() > 0 { acc.push(def) } else { acc },
+        _ -> acc,
+      },
+      _ -> acc,
+    });
+  if generic.len() == 0 { checker } else {
+    let sums = checker.ctors.fold(Map::new(), |m: Map<Bytes, List<SumCase>>, c: CtorInfo| {
+      let had = match m.get(c.type_name) { Some(cs) -> cs, None -> [] };
+      m.insert(c.type_name, had.push({ fields: c.fields, params: c.scheme.ty_vars }))
+    });
+    generic.fold(checker, |c: Checker, def: TypeDef|
+      if !grows_itself(sums, qualify(parsed.name, def.name.name)) { c } else {
+        report_error_at(
+          c,
+          b"E0477",
+          def.name.span,
+          Bytes::concat_all([
+            b"sum `",
+            def.name.name,
+            b"` holds itself at a type grown from its own parameters",
+          ]),
+          b"declared here",
+          [b"a sum may hold itself at its own parameters, or through a function"],
+        )
+      })
+  }
+}
+
+/// A constructor of a declared sum: its arguments' types, and the variable each of the sum's
+/// parameters is in them, in the parameters' order.
+type SumCase = { fields: List<Type>, params: List<Int> }
+
+/// A sum's parameter, `from`, in a constructor's argument as a sum's argument `to`, or inside it
+/// (`grown`); a position is the sum's name and the parameter's place.
+type ParamStep = { from: Bytes, to: Bytes, grown: Bool }
+
+/// Whether the sum `name` holds itself through a chain of sums from one of its parameters back to
+/// one, at a type grown from it on the way.
+fn grows_itself(sums: Map<Bytes, List<SumCase>>, name: Bytes) -> Bool = {
+  let steps = sums_reached(sums, name).fold([], |acc: List<ParamStep>, s: Bytes|
+    acc.concat(param_steps(sums, s)));
+  let from = |p: Bytes| positions_reached(steps, p).push(p);
+  let own = steps.fold([], |acc: List<Bytes>, s: ParamStep|
+    if s.from.starts_with(name.concat(b"#")) && !acc.contains(s.from) { acc.push(s.from) }
+    else { acc });
+  steps.any(|s: ParamStep|
+    s.grown && own.any(|p: Bytes| from(s.to).contains(p) && from(p).contains(s.from)))
+}
+
+/// Every declared sum `name`'s constructors hold, through chains of sums, `name` first.
+fn sums_reached(sums: Map<Bytes, List<SumCase>>, name: Bytes) -> List<Bytes> =
+  range(0, sums.len()).fold(
+    { seen: [name], at: 0 },
+    |s: { seen: List<Bytes>, at: Int }, _: Int|
+      match s.seen.at(s.at) {
+        None -> s,
+        Some(n) -> {
+          let held = match sums.get(n) {
+            None -> [],
+            Some(cs) ->
+              cs.fold([], |acc: List<Bytes>, c: SumCase|
+                c.fields.fold(acc, |a: List<Bytes>, f: Type|
+                  a.concat(sums_in(sums, f).map(|o: { name: Bytes, args: List<Type> }| o.name)))),
+          };
+          {
+            seen: held.fold(s.seen, |acc: List<Bytes>, o: Bytes|
+              if acc.contains(o) { acc } else { acc.push(o) }),
+            at: s.at + 1,
+          }
+        },
+      },
+  ).seen
+
+fn param_steps(sums: Map<Bytes, List<SumCase>>, s: Bytes) -> List<ParamStep> =
+  match sums.get(s) {
+    None -> [],
+    Some(cs) ->
+      cs.fold([], |acc: List<ParamStep>, c: SumCase|
+        c.fields.fold(acc, |a: List<ParamStep>, f: Type|
+          sums_in(sums, f).fold(a, |b: List<ParamStep>, o: { name: Bytes, args: List<Type> }|
+            range(0, o.args.len()).fold(b, |d: List<ParamStep>, j: Int|
+              range(0, c.params.len()).fold(d, |e: List<ParamStep>, i: Int|
+                match c.params.at(i) {
+                  None -> e,
+                  Some(p) -> match o.args.at(j) {
+                    None -> e,
+                    Some(arg) -> {
+                      let step = |grown: Bool|
+                        e.push({
+                          from: s.concat(b"#").concat(ascii_of_int(i)),
+                          to: o.name.concat(b"#").concat(ascii_of_int(j)),
+                          grown: grown,
+                        });
+                      if arg == TyVar(p) { step(false) }
+                      else if vars_of(arg).contains(p) { step(true) }
+                      else { e }
+                    },
+                  },
+                }))))),
+  }
+
+/// Each declared sum `t` names, at the arguments it names it at, those inside them included, but
+/// none inside a function type.
+fn sums_in(sums: Map<Bytes, List<SumCase>>, t: Type) -> List<{ name: Bytes, args: List<Type> }> =
+  match t {
+    TyVar(_) -> [],
+    TyFn(_) -> [],
+    TyCon(k) -> {
+      let inner = k.args.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, a: Type|
+        acc.concat(sums_in(sums, a)));
+      if sums.contains(k.name) { inner.push({ name: k.name, args: k.args }) } else { inner }
+    },
+    TyRecord(fs) ->
+      fs.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, f: Field|
+        acc.concat(sums_in(sums, f.ty))),
+    TyNominal(x) ->
+      x.fields.fold(
+        x.args.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, a: Type|
+          acc.concat(sums_in(sums, a))),
+        |acc: List<{ name: Bytes, args: List<Type> }>, f: Field| acc.concat(sums_in(sums, f.ty)),
+      ),
+  }
+
+/// The type variables `t` names outside function types.
+fn vars_of(t: Type) -> List<Int> =
+  match t {
+    TyVar(v) -> [v],
+    TyFn(_) -> [],
+    TyCon(k) -> k.args.fold([], |acc: List<Int>, a: Type| acc.concat(vars_of(a))),
+    TyRecord(fs) -> fs.fold([], |acc: List<Int>, f: Field| acc.concat(vars_of(f.ty))),
+    TyNominal(x) -> x.args.fold([], |acc: List<Int>, a: Type| acc.concat(vars_of(a))),
+  }
+
+/// Every position a chain of one or more steps leads to from `from`: no chain is longer than the
+/// steps.
+fn positions_reached(steps: List<ParamStep>, from: Bytes) -> List<Bytes> = {
+  let next = |n: Bytes| steps.filter(|s: ParamStep| s.from == n).map(|s: ParamStep| s.to);
+  range(0, steps.len()).fold(next(from), |seen: List<Bytes>, _: Int|
+    seen.fold(seen, |acc: List<Bytes>, n: Bytes|
+      next(n).fold(acc, |more: List<Bytes>, m: Bytes|
+        if more.contains(m) { more } else { more.push(m) })))
+}
 
 /// A function and a constructor of one name in one module.
 pub fn check_value_namespace(checker: Checker, parsed: ParsedModule) -> Checker = {
