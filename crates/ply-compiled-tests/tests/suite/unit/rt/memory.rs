@@ -244,6 +244,29 @@ fn a_hold_is_given_back_without_a_read_of_what_it_held() {
     );
 }
 
+/// `drop#Hold<a>` reads what a hold holds at the payload word the description reports, and empties
+/// it there before the hold is given back.
+#[test]
+fn a_hold_keeps_what_it_holds_at_the_word_the_runtime_describes() {
+    use ply_compiled::c::builtin_helper_name;
+    use ply_compiled::laid::{Fact, hold};
+    let mut ctx = context();
+    ctx.begin(1_000);
+    let held = alloc(&mut ctx, 16 + 8);
+    let made: Counted = helper(&builtin_helper_name("?hold_new"));
+    let h = unsafe { made(&mut ctx, held) };
+    let [("held", Fact::Number(at))] = hold()[..] else {
+        panic!("a hold is described by the one word it holds at");
+    };
+    assert_eq!(unsafe { word_at(obj(h), at) }, held);
+    unsafe { *(h as *mut Word).add(2 + at) = 0 };
+    free(&mut ctx, held, 16 + 8);
+    let free_handle: Given = helper("rt_handle_free");
+    unsafe { free_handle(&mut ctx, h) };
+    assert_eq!(ctx.heap.live(), 0);
+    ctx.end();
+}
+
 /// A checked build's `ply_last` finds a second release by the count alone: whatever gives a block
 /// back, and to whichever heap, leaves it counted 0 until the block is taken again.
 #[test]

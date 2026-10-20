@@ -288,6 +288,7 @@ machine! {
     "?cost_mark" => rt_cost_mark(Out);
     "?cost_spent" => rt_cost_spent(Out);
     "?performs_since" => rt_performs_since(I64);
+    "?in_carried" => rt_in_carried() -> Handed;
 }
 
 /// The natives the compiler declares itself over machine data.
