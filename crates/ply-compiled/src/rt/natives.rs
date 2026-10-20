@@ -86,6 +86,14 @@ pub(super) fn builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
 /// `b` over the values the words denote. Takes the arguments.
 pub(super) fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     let values = values_taken(ctx, args);
+    match called_over_values(ctx, b, values) {
+        Some(v) => ctx.word(&v),
+        None => 0,
+    }
+}
+
+/// `b` over `values`: its answer, or `None` where it raised, as it raises, or failed the context.
+pub(super) fn called_over_values(ctx: &mut Ctx, b: Builtin, values: Vec<Value>) -> Option<Value> {
     let site = ctx.site();
     let panicked = match (b, values.first()) {
         (Builtin::Panic, Some(Value::Str(s))) => Some(s.to_string()),
@@ -105,12 +113,16 @@ pub(super) fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> W
         _ => false,
     };
     match ply_core::builtins::call(b, values, site) {
-        Ok(v) => ctx.word(&v),
+        Ok(v) => Some(v),
         Err(d) if signature(b).raises || divides_by_zero => {
             let message = panicked.unwrap_or_else(|| raised_message(&d));
-            ctx.raise(d, message)
+            ctx.raise(d, message);
+            None
         }
-        Err(d) => ctx.fail(d),
+        Err(d) => {
+            ctx.fail(d);
+            None
+        }
     }
 }
 

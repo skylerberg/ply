@@ -520,6 +520,24 @@ fn a_unit_says_its_constants_slots_and_what_its_types_state() {
     );
 }
 
+/// A unit entered encoded names each root it is entered at on a line of its own after its tables,
+/// among lines a runtime that does not know them reads as nothing.
+#[test]
+fn a_unit_says_each_root_it_is_entered_at_after_its_tables() {
+    let tables = "helpers 0\nctors 0\nconstants 0\nmodules 0\nrefused 0\n\
+                  consts 0\nbuiltins 0\nfields 0\nshapes 0\n";
+    let said = format!("{tables}ints held raw\nentered m.main\nentered m.run\n");
+    let read = ply_compiled::c::Exports::decode(&said).expect("the table reads");
+    assert_eq!(read.entered, ["m.main", "m.run"]);
+    assert!(read.layout.raw_ints);
+    assert_eq!(read.encode(), said);
+    let unknown = format!("{tables}entered m.main\na line a later unit says\n");
+    let read = ply_compiled::c::Exports::decode(&unknown).expect("the table reads");
+    assert_eq!(read.entered, ["m.main"]);
+    let words = ply_compiled::c::Exports::decode(tables).expect("the table reads");
+    assert!(words.entered.is_empty());
+}
+
 /// `N` states its arithmetic: `add`, `sub` and `mul` take two words and `neg` and `of_int` one.
 fn numbered() -> Vec<units::Def> {
     vec![
