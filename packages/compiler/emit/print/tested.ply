@@ -3,10 +3,12 @@
 
 import std.bytes (ascii_of_int)
 import emit.c (int_lit)
-import emit.tir (Rep, RNum, RMaybe, RTagged, RCases, RSlice, Var, ANum, Test, TTag, TInt, TRange,
-                 TLength, Failure, NoArm, NoLet, Matching, var_said)
+import emit.tir (Rep, RNum, RMaybe, RTagged, RCases, RSlice, RSum, Var, ANum, Test, TTag, TInt,
+                 TRange, TLength, Failure, NoArm, NoLet, Matching, var_said)
 import emit.pieces (Piece, Text, Hole, TagOf)
 import emit.lower.held (case_index)
+import emit.layout (Laid, LWords, LSum, SumLaid, CaseArgs, Always, WordIs, WordOutside, LowBits, P,
+                    S, C, R, pointer_floor, nullary_step, sum_laid, record_laid, raw)
 import emit.print.text (Printing, Place, line, text, pad, pieces, name_of, arg_text, site,
                         part_names, unprinted)
 
@@ -66,6 +68,15 @@ fn tested(pr: Printing, on: Var, t: Test, when: Int) -> List<Piece> / {abort.rai
               ]),
             ),
           ],
+        RSum(s) -> match case_index(on.rep, name) {
+          Some(i) -> [Text(case_test(s.laid, parts, i))],
+          None ->
+            unprinted(
+              Matching,
+              b"a constructor its sum's cases do not hold",
+              Bytes::concat_all([name, b", testing ", var_said(on)]),
+            ),
+        },
         RCases(_) -> match case_index(on.rep, name) {
           Some(i) -> [Text(Bytes::concat_all([b"(", nth(parts, 0), b") == ", int_lit(i)]))],
           None ->
@@ -120,6 +131,100 @@ fn tested(pr: Printing, on: Var, t: Test, when: Int) -> List<Piece> / {abort.rai
 
 fn nth(xs: List<Bytes>, k: Int) -> Bytes = match xs.at(k) { Some(x) -> x, None -> b"0" }
 
+/// Whether a sum laid as `s`, whose words are the C values `ws`, holds case `i`, as C: its word
+/// holding the value the case is, a niche's widest case's word holding none of the others' values as
+/// that word's class tells, or a tagged pointer's low bits, past the eighth case its box's first word.
+pub fn case_test(s: SumLaid, ws: List<Bytes>, i: Int) -> Bytes =
+  match s.cases.at(i) {
+    None -> b"0",
+    Some(c) -> match c.test {
+      Always -> b"1",
+      WordIs(t) -> Bytes::concat_all([b"(", nth(ws, t.at), b") == ", int_lit(t.value)]),
+      WordOutside(t) -> {
+        let w = nth(ws, t.at);
+        let floor = int_lit(pointer_floor());
+        match s.classes.at(t.at) {
+          Some(S(m)) -> {
+            let held = m - t.values.len();
+            if held == 0 { Bytes::concat_all([b"(uint64_t)(", w, b") >= ", floor]) } else {
+              Bytes::concat_all([
+                b"((uint64_t)(",
+                w,
+                b") >= ",
+                floor,
+                b" || (",
+                w,
+                b") < ",
+                int_lit(nullary_step() * held),
+                b")",
+              ])
+            }
+          },
+          Some(C(m)) -> {
+            let held = m - t.values.len();
+            if held == 0 { Bytes::concat_all([b"(((", w, b") & 7) == 2)"]) } else {
+              Bytes::concat_all([
+                b"(((",
+                w,
+                b") & 7) == 2 || (",
+                w,
+                b") < ",
+                int_lit(nullary_step() * held),
+                b")",
+              ])
+            }
+          },
+          Some(R(r)) ->
+            Bytes::concat_all([
+              b"((",
+              w,
+              b") >= ",
+              int_lit(r.lo),
+              b" && (",
+              w,
+              b") <= ",
+              int_lit(r.hi - t.values.len()),
+              b")",
+            ]),
+          _ -> b"0",
+        }
+      },
+      LowBits(t) -> {
+        let w = nth(ws, t.at);
+        Bytes::concat_all([
+          b"((uint64_t)(",
+          w,
+          b") >= ",
+          int_lit(pointer_floor()),
+          b" && ((",
+          w,
+          b") & 7) == ",
+          int_lit(t.bits),
+          match t.block_tag {
+            None -> b")",
+            Some(tag) ->
+              Bytes::concat_all([
+                b" && ply_words((",
+                w,
+                b") & ~(Word)7)[0] == ",
+                int_lit(tag),
+                b")",
+              ]),
+          },
+        ])
+      },
+    },
+  }
+
+/// The case a sum laid as `s`, whose words are the C values `ws`, holds, as a C expression of its
+/// place among the sum's cases: each case's test in turn, the last untested.
+pub fn case_held(s: SumLaid, ws: List<Bytes>) -> Bytes =
+  range(0, s.cases.len()).fold(b"", |acc: Bytes, k: Int| {
+    let i = s.cases.len() - 1 - k;
+    if k == 0 { int_lit(i) }
+    else { Bytes::concat_all([b"(", case_test(s, ws, i), b" ? ", int_lit(i), b" : ", acc, b")"]) }
+  })
+
 /// The integer `n` as C writes one of a value held as `r`.
 fn bound(pr: Printing, r: Rep, n: Int) -> Bytes =
   match r { RNum(w) -> arg_text(pr, ANum({ width: w, bits: n })), _ -> int_lit(n) }
@@ -163,3 +268,45 @@ fn arm_label(label: Int, i: Int) -> Bytes =
   Bytes::concat_all([b"ply_m", ascii_of_int(label), b"_", ascii_of_int(i)])
 
 fn end_label(label: Int) -> Bytes = Bytes::concat_all([b"ply_m", ascii_of_int(label), b"_end"])
+
+fn case_of(args: List<Laid>) -> CaseArgs = { args: record_laid(args), indirect: false }
+
+fn maybe_of(l: Laid) -> SumLaid = sum_laid([case_of([]), case_of([l])])
+
+test "a sum's case is told by its word's value, a niche word's class, or a pointer's low bits" {
+  let x = [b"x"];
+  let pointer = LWords([P]);
+  assert_eq([0, 1].map(|i: Int| case_test(maybe_of(pointer), x, i)), [
+    b"(x) == INT64_C(0)",
+    b"(uint64_t)(x) >= INT64_C(4096)",
+  ]);
+  // The dataful case of a niche over a sum's word is a pointer or one of the values it held already.
+  assert_eq(
+    case_test(maybe_of(LSum(maybe_of(pointer))), x, 1),
+    b"((uint64_t)(x) >= INT64_C(4096) || (x) < INT64_C(8))",
+  );
+  assert_eq(
+    case_test(maybe_of(LWords([R({ lo: 0, hi: 1 })])), x, 1),
+    b"((x) >= INT64_C(0) && (x) <= INT64_C(1))",
+  );
+  assert_eq(case_test(maybe_of(LWords([C(0)])), x, 1), b"(((x) & 7) == 2)");
+  let tags = sum_laid(range(0, 9).map(|_: Int| { args: record_laid([pointer]), indirect: true }));
+  assert_eq(case_test(tags, x, 1), b"((uint64_t)(x) >= INT64_C(4096) && ((x) & 7) == INT64_C(1))");
+  assert_eq(
+    case_test(tags, x, 8),
+    b"((uint64_t)(x) >= INT64_C(4096) && ((x) & 7) == INT64_C(7) && ply_words((x) & ~(Word)7)[0] == INT64_C(8))",
+  );
+  // A tag word's case is its first word, whatever the payload words are named.
+  let tagged = maybe_of(LWords([raw()]));
+  assert_eq(case_test(tagged, [b"t_0", b"t_1", b"t_2"], 1), b"(t_0) == INT64_C(1)");
+  assert_eq(case_test(sum_laid([case_of([pointer])]), x, 0), b"1")
+}
+
+test "the case a sum holds is each case's test in turn, the last untested" {
+  let ordering = sum_laid([case_of([]), case_of([]), case_of([])]);
+  assert_eq(
+    case_held(ordering, [b"x"]),
+    b"((x) == INT64_C(0) ? INT64_C(0) : ((x) == INT64_C(1) ? INT64_C(1) : INT64_C(2)))",
+  );
+  assert_eq(case_held(sum_laid([case_of([LWords([P])])]), [b"x"]), b"INT64_C(0)")
+}

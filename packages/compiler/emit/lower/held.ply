@@ -10,7 +10,7 @@ import emit.reps (Carrier, Whole, Fields, Cases, SumCase, SumCtor, FieldTy, TyRe
                   kind_of, carrier_of, carried_record, laid_of, record_flags, ctors_of, no_ctors)
 import emit.c (Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, Zeroed, Tagged)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases, Leaf,
-                 Path, PField, PNamed, PArg, PPlace, RSum, RUnit, RSlice)
+                 Path, PField, PNamed, PArg, PPlace, RSum, RUnit, RSlice, parts_of)
 import emit.layout (LSum, LWords, P, Always, Inline, words, register_words)
 import emit.lower.setting (Setting, ctor_named)
 
@@ -285,38 +285,52 @@ pub fn passing(r: Rep) -> Passing =
 
 fn widely(r: Rep) -> Passing = if value_words(r) > register_words() { ByReference } else { InWords }
 
-/// How many words a value held as `r` takes, its box word not among them: a `Decimal` two, a value of
-/// no words none, a flat record its leaves', a sum held as its cases its index and every case's
-/// leaves, and a sum its laid words.
-pub fn value_words(r: Rep) -> Int =
+/// How each C value a value held as `r` is held in is held, in order: a flat record's leaves' values
+/// and then its box word, a sum held inside a record as its words alone; a sum held whole as its words
+/// and then, where it has more than one, its box word; a value of no words in none; a sum held as
+/// its cases and a view as their parts; any other value in itself.
+pub fn values_of(r: Rep) -> List<Rep> =
   match r {
-    RDec -> 2,
-    RUnit -> 0,
-    RSlice -> 2,
-    RFlat(ls) -> ls.fold(0, |n: Int, l: Leaf| n + value_words(l.rep)),
-    RCases(c) ->
-      c.cases.fold(1, |n: Int, x: { name: Bytes, leaves: List<Leaf> }|
-        x.leaves.fold(n, |m: Int, l: Leaf| m + value_words(l.rep))),
-    RSum(s) -> words(LSum(s.laid)),
-    _ -> 1,
+    RFlat(ls) -> ls.fold([], |acc: List<Rep>, l: Leaf| acc.concat(laid_values(l.rep))).push(RWord),
+    RSum(s) -> {
+      let n = words(LSum(s.laid));
+      sum_words(n).concat(if n > 1 { [RWord] } else { [] })
+    },
+    RUnit -> [],
+    RCases(_) -> parts_of(r),
+    RSlice -> parts_of(r),
+    _ -> [r],
   }
+
+/// The C values a leaf held as `r` takes inside its record: a sum's words with no box word of its own.
+fn laid_values(r: Rep) -> List<Rep> =
+  match r { RSum(s) -> sum_words(words(LSum(s.laid))), RUnit -> [], _ -> [r] }
+
+fn sum_words(n: Int) -> List<Rep> = range(0, n).map(|_: Int| RWord)
+
+/// How many words the C values held as `vs` take: a `Decimal`'s two, one for any other.
+pub fn words_held(vs: List<Rep>) -> Int =
+  vs.fold(0, |n: Int, v: Rep| n + (match v { RDec -> 2, _ -> 1 }))
+
+/// How many words a value held as `r` takes, its box word not among them.
+pub fn value_words(r: Rep) -> Int = words_held(unboxed(r))
+
+/// The C values of a value held as `r` but its box word: what a caller's buffer holds of a value
+/// crossing by reference.
+pub fn unboxed(r: Rep) -> List<Rep> = {
+  let vs = values_of(r);
+  if boxed(r) { vs.take(vs.len() - 1) } else { vs }
+}
+
+/// Whether a value held as `r` has a box word after its other C values: a flat record, and a sum
+/// of more than one word.
+pub fn boxed(r: Rep) -> Bool =
+  match r { RFlat(_) -> true, RSum(s) -> words(LSum(s.laid)) > 1, _ -> false }
 
 /// How many words a caller's buffer holds for an answer held as `r`, which the callee writes past
 /// the C value it returns: the words of its other values and then its box word, none for an answer
 /// of one C value.
-pub fn answer_buffer(r: Rep) -> Int =
-  match r {
-    RFlat(ls) -> ls.drop(1).fold(1, |n: Int, l: Leaf| n + value_words(l.rep)),
-    RCases(c) ->
-      c.cases.fold(0, |n: Int, x: { name: Bytes, leaves: List<Leaf> }|
-        x.leaves.fold(n, |m: Int, l: Leaf| m + value_words(l.rep))),
-    RSlice -> 1,
-    RSum(s) -> {
-      let n = words(LSum(s.laid));
-      if n <= 1 { 0 } else { n }
-    },
-    _ -> 0,
-  }
+pub fn answer_buffer(r: Rep) -> Int = words_held(values_of(r).drop(1))
 
 /// The leaves of every case of a sum held as `r` past its constructor's index, in order: each case's
 /// leaves where it is held as its cases, none otherwise.
