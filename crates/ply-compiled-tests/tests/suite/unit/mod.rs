@@ -12,6 +12,7 @@ mod frames;
 mod heap;
 mod linked;
 mod list;
+mod machine;
 mod map;
 mod parallel;
 mod rt;

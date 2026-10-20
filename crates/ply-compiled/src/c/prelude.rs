@@ -247,6 +247,17 @@ fn signature_of<F: Native>(_: F) -> Signature {
     F::SIGNATURE
 }
 
+/// The native the compiler declares as `name`, bound to `f` and taking and answering what `f`'s
+/// type says.
+pub(crate) fn machine_native<F: Native>(name: &'static str, f: F) -> MachineNative {
+    let helper = Box::leak(builtin_helper_name(name).into_boxed_str());
+    MachineNative {
+        name,
+        signature: F::SIGNATURE,
+        helper: Helper::of(helper, f),
+    }
+}
+
 machine! {
     "?out_tag" => rt_out_tag(I64);
     "?out_int" => rt_out_int(I64);
@@ -289,10 +300,15 @@ machine! {
     "?performs_since" => rt_performs_since(I64);
 }
 
-/// The natives the compiler declares itself over machine data.
+/// The natives the compiler declares itself over machine data: the crossings' and the rest of
+/// this table's, then strings' and byte strings' (`crate::machine`).
 pub fn machine_natives() -> &'static [MachineNative] {
     static ALL: std::sync::OnceLock<Vec<MachineNative>> = std::sync::OnceLock::new();
-    ALL.get_or_init(machine_table)
+    ALL.get_or_init(|| {
+        let mut all = machine_table();
+        all.extend(crate::machine::natives());
+        all
+    })
 }
 
 /// A helper's parameter as its function takes it: a `Word` unless written otherwise.
