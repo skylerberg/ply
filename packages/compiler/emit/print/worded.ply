@@ -1,0 +1,196 @@
+//! Values held otherwise: a sum's words made the one word a value of its type is where one word is
+//! required, and opened from that word, the counts moving between them by the sum's cases; any other
+//! value as `made.packed` holds it otherwise.
+
+import std.bytes (ascii_of_int)
+import syntax.parsing (span_between)
+import check.types (Type, TyCon, TyVar)
+import emit.c (int_lit)
+import emit.layout (SumLaid, LSum, words, header_bytes, sum_laid, record_laid, LWords, P, raw)
+import emit.reps (ctors_of)
+import emit.tir (Rep, RWord, RSum, Var, Arg, AVar, rep_of_arg)
+import emit.pieces (Text, spelled)
+import emit.print.text (Printing, Place, printing, named, pad, pieces, slot)
+import emit.print.made (packed, arg_parts)
+import emit.print.counts (released, duped)
+
+/// `k.arg` held as `k.to`, which takes it: a sum of one word is its word either way; a wider sum's
+/// word is its box, made of its words where it has none yet (its words' counts moving into the box)
+/// and otherwise the box it has (its words let go of); a wider sum opened from its box holds the box
+/// and its words read out of it, each counted once more. Any other value as `made.packed` says.
+pub fn worded(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  k: { arg: Arg, to: Rep },
+) -> Printing / {abort.raise} = {
+  let from = rep_of_arg(k.arg);
+  match into {
+    None -> packed(p, pr, into, k),
+    Some(v) -> match from {
+      RSum(s) -> if k.to == RWord { word_made(p, pr, v, s.laid, k.arg) }
+      else { packed(p, pr, into, k) },
+      _ -> match k.to {
+        RSum(s) -> if from == RWord { word_opened(p, pr, v, s.laid, k.arg) }
+        else { packed(p, pr, into, k) },
+        _ -> packed(p, pr, into, k),
+      },
+    },
+  }
+}
+
+/// `v`, a word, made of the sum `a` laid as `s`.
+fn word_made(p: Place, pr: Printing, v: Var, s: SumLaid, a: Arg) -> Printing / {abort.raise} = {
+  let n = words(LSum(s));
+  let xs = arg_parts(pr, a);
+  let nm = named(pr, v);
+  if n <= 1 {
+    pieces(nm.pr, [
+      Text(Bytes::concat_all([pad(p.depth), b"Word ", nm.name, b" = ", nth(xs, 0), b";\n"])),
+    ])
+  } else {
+    let ty = match a { AVar(x) -> x.ty, _ -> v.ty };
+    // The box takes the words' counts, so where the sum has one already they are let go of.
+    let gone = released(nm.pr, nm.pr.ctors, ty, rep_of_arg(a), xs.take(n).push(b"0"));
+    let stored = Bytes::join(
+      range(0, n).map(|k: Int| Bytes::concat_all([slot(nm.name, k), b" = ", nth(xs, k), b";"])),
+      b" ",
+    );
+    pieces(
+      gone.pr,
+      [
+        Text(
+          Bytes::concat_all([
+            pad(p.depth),
+            b"Word ",
+            nm.name,
+            b" = ",
+            nth(xs, n),
+            b"; if (",
+            nm.name,
+            b") { ",
+          ]),
+        ),
+      ].concat(
+        gone.out,
+      ).push(
+        Text(
+          Bytes::concat_all([
+            b" } else { ",
+            nm.name,
+            b" = rt_alloc_bytes_p(ctx, ",
+            int_lit(header_bytes() + 8 * n),
+            b"); ",
+            stored,
+            b" }\n",
+          ]),
+        ),
+      ),
+    )
+  }
+}
+
+/// `v`, a sum laid as `s`, opened from the word `a`, which it takes: its words read out of the box,
+/// each counted once more, and the box kept as its box word.
+fn word_opened(p: Place, pr: Printing, v: Var, s: SumLaid, a: Arg) -> Printing / {abort.raise} = {
+  let n = words(LSum(s));
+  let w = nth(arg_parts(pr, a), 0);
+  let nm = named(pr, v);
+  if n <= 1 {
+    pieces(nm.pr, [Text(Bytes::concat_all([pad(p.depth), b"Word ", nm.name, b" = ", w, b";\n"]))])
+  } else {
+    let ns = range(0, n + 1).map(|k: Int| Bytes::concat_all([nm.name, b"_", ascii_of_int(k)]));
+    let loads = Bytes::join(
+      range(0, n).map(|k: Int| Bytes::concat_all([b"Word ", nth(ns, k), b" = ", slot(w, k), b";"])),
+      b" ",
+    );
+    let dup = duped(nm.pr.ctors, v.ty, v.rep, ns.take(n).push(b"0"));
+    pieces(nm.pr, [
+      Text(
+        Bytes::concat_all([
+          pad(p.depth),
+          loads,
+          b" Word ",
+          nth(ns, n),
+          b" = ",
+          w,
+          b";",
+          if dup.len() == 0 { b"" } else { b" ".concat(dup) },
+          b"\n",
+        ]),
+      ),
+    ])
+  }
+}
+
+fn nth(xs: List<Bytes>, k: Int) -> Bytes = match xs.at(k) { Some(x) -> x, None -> b"0" }
+
+test "a sum of one word is its word, and a wider one opened from its box holds the box and its words" {
+  let int = TyCon({ name: b"Int", args: [] });
+  let maybe = |t: Type| TyCon({ name: b"Option", args: [t] });
+  let one = sum_laid([
+    { args: record_laid([]), indirect: false },
+    { args: record_laid([LWords([P])]), indirect: false },
+  ]);
+  let two = sum_laid([
+    { args: record_laid([]), indirect: false },
+    { args: record_laid([LWords([raw()])]), indirect: false },
+  ]);
+  let ctors = ctors_of(
+    [],
+    Map::new(),
+    [],
+    Map::new().insert(b"Option", [
+      { name: b"None", index: 0, fields: [], params: [0] },
+      { name: b"Some", index: 1, fields: [TyVar(0)], params: [0] },
+    ]),
+  );
+  let place = {
+    u: {
+      symbol: b"f",
+      base: 0,
+      answer: RWord,
+      site: None,
+      arm: None,
+      looping: None,
+      landing: None,
+      group: None,
+    },
+    at: span_between(0, 0),
+    leave: b"return 0;",
+    depth: 0,
+  };
+  let sum = |id: Int, t: Type, s: SumLaid|
+    { id: id, ty: maybe(t), rep: RSum({ laid: s, cases: [b"None", b"Some"] }) };
+  let word = |id: Int, t: Type| { id: id, ty: maybe(t), rep: RWord };
+  let pr = { ..printing(Map::new().insert(0, b"p0")), ctors: ctors };
+  let text = |q: Printing| spelled(q.out);
+  let string = TyCon({ name: b"String", args: [] });
+  assert_eq(
+    text(worded(place, pr, Some(word(1, string)), { arg: AVar(sum(0, string, one)), to: RWord })),
+    b"  Word t1 = p0;\n",
+  );
+  assert_eq(
+    text(
+      worded(place, pr, Some(sum(1, string, one)), {
+        arg: AVar(word(0, string)),
+        to: sum(1, string, one).rep,
+      }),
+    ),
+    b"  Word t1 = p0;\n",
+  );
+  // An `Option<Int>`'s words count nothing, so opening its box dups none of them.
+  let opened = text(
+    worded(place, pr, Some(sum(1, int, two)), {
+      arg: AVar(word(0, int)),
+      to: sum(1, int, two).rep,
+    }),
+  );
+  assert(
+    opened.starts_with(
+        b"  Word t1_0 = ply_words(p0)[0]; Word t1_1 = ply_words(p0)[1]; Word t1_2 = p0;",
+      )
+      && opened.index_of(b"ply_dup(t1_") == None,
+    Some(String::of_bytes_lossy(opened)),
+  )
+}
