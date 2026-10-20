@@ -9,16 +9,15 @@
 import std.bytes (ascii_of_int)
 import syntax.parsing (span_between)
 import check.types (Type, TyCon, TyRecord)
-import emit.c (int_lit)
 import emit.keys (RootKey, Root, Written, TypeOp, Drop, Share, Keep, Copy, root_name, op_name)
 import emit.roots (symbol_of)
-import emit.layout (SumLaid, CaseLaid, CaseTest, Always, WordIs, WordOutside, LowBits, Nullary,
-                    Inline, Boxed, LWords, P, R, S, U, LSum, words, pointer_floor, tag_bits,
-                    header_bytes, str_laid, layouts, columns_laid)
-import emit.reps (Ctors, no_ctors)
+import emit.layout (SumLaid, WordIs, LowBits, Nullary, Inline, Boxed, LWords, P, R, S, U, LSum,
+                    words, pointer_floor, tag_bits, header_bytes, str_laid, layouts, columns_laid,
+                    block_sizes)
+import emit.lower.held (values_of, unboxed)
 import emit.tir (Rep, RInt, RWord, RMaybe, RTagged, RFlat, RToken, RSum, Leaf, Var, Inst, Inc, Dec,
                  Reset, Free, Opened, AInt, AVar, Spine, RUnit, counted, parts_of, var_said)
-import emit.lower.held (values_of, unboxed)
+import emit.print.tested (case_held)
 import emit.pieces (Piece, Text, Hole, Symbol, spelled)
 import emit.release (Part, WordAt, ByCase, Counted, Object, CaseBox, SumWord, IntWord, Through,
                      RuntimeHandle, Opening, InBox, Holding, StrBlock, ListOf, NodeOf, MapOf,
@@ -194,26 +193,24 @@ fn counted_parts(x: Bytes, r: Rep) -> List<Bytes> = {
 /// C printed so far and the printing it leaves.
 pub type Said = { pr: Printing, out: List<Piece> }
 
-/// `i`, one of `Inc`, `Dec`, `Reset`, `Free` and `Opened`, printed by what its value's type lays out
-/// over the program's constructors `ctors`: what `count_printed` prints once records and sums are laid
-/// by their types.
-pub fn count_classed(p: Place, pr: Printing, ctors: Ctors, i: Inst) -> Printing / {abort.raise} =
+/// `i`, one of `Inc`, `Dec`, `Reset`, `Free` and `Opened`, printed by what its value's type lays out:
+/// what `count_printed` prints once records and sums are laid by their types.
+pub fn count_classed(p: Place, pr: Printing, i: Inst) -> Printing / {abort.raise} =
   match i {
     Inc(n) -> {
-      let once = duped(ctors, n.var.ty, n.var.rep, part_names(name_of(pr, n.var), n.var.rep));
+      let once = duped(pr, n.var.ty, n.var.rep, part_names(name_of(pr, n.var), n.var.rep));
       if once.len() == 0 { pr }
       else { line(pr, p.depth, Bytes::join(range(0, n.n).map(|_: Int| once), b" ")) }
     },
-    Dec(v) -> stated(p.depth, released(pr, ctors, v.ty, v.rep, part_names(name_of(pr, v), v.rep))),
+    Dec(v) -> stated(p.depth, released(pr, v.ty, v.rep, part_names(name_of(pr, v), v.rep))),
     Reset(r) ->
       reset_boxed(
         pr,
         p.depth,
-        ctors,
         r.token,
         r.of,
-        opening(ctors, r.of.ty, r.of.rep),
-        held_root(Drop, ctors, r.of.ty, r.of.rep),
+        opening(pr.ctors, r.of.ty, r.of.rep),
+        held_root(Drop, pr.ctors, r.of.ty, r.of.rep),
       ),
     Free(r) -> {
       let t = name_of(pr, r.of);
@@ -234,10 +231,10 @@ pub fn count_classed(p: Place, pr: Printing, ctors: Ctors, i: Inst) -> Printing 
     Opened(o) -> match o.of.rep {
       RFlat(_) -> count_printed(p, pr, i),
       RSum(s) -> match boxed_alone(s.laid) {
-        Some(_) -> opened_block(pr, p.depth, o.of, o.words, opening(ctors, o.of.ty, o.of.rep)),
+        Some(_) -> opened_block(pr, p.depth, o.of, o.words, opening(pr.ctors, o.of.ty, o.of.rep)),
         None -> opened_sum(pr, p.depth, o.of, o.words),
       },
-      _ -> opened_block(pr, p.depth, o.of, o.words, opening(ctors, o.of.ty, o.of.rep)),
+      _ -> opened_block(pr, p.depth, o.of, o.words, opening(pr.ctors, o.of.ty, o.of.rep)),
     },
     _ -> pr,
   }
@@ -267,16 +264,11 @@ fn per_part(r: Rep, values: List<Bytes>) -> List<List<Bytes>> =
   part_widths(r).fold({ at: 0, out: [] }, |acc: { at: Int, out: List<List<Bytes>> }, n: Int|
     { at: acc.at + n, out: acc.out.push(values.drop(acc.at).take(n)) }).out
 
-/// The C letting go of a value of `ty` held as `r` whose C values are `values`, in `values_of(r)`'s
-/// order: each counted word of each part, each drop root it names a hole noted among `pr`'s calls; a
-/// reuse token's block freed by its size.
-pub fn released(
-  pr: Printing,
-  ctors: Ctors,
-  ty: Type,
-  r: Rep,
-  values: List<Bytes>,
-) -> Said / {abort.raise} =
+/// The C letting go of a value of `ty` held as `r` whose C values are `values`, as `values_of(r)`
+/// lays them: each counted word of each part, each drop root it names a hole noted among `pr`'s
+/// calls; a reuse token's block freed by its size. A value spelled `0`, a word another holds now,
+/// is passed over.
+pub fn released(pr: Printing, ty: Type, r: Rep, values: List<Bytes>) -> Said / {abort.raise} =
   match r {
     RToken(n) -> {
       let t = nth(values, 0);
@@ -298,7 +290,7 @@ pub fn released(
       }
     },
     _ -> {
-      let each = held_parts(ctors, ty, r);
+      let each = held_parts(pr.ctors, ty, r);
       let vs = per_part(r, values);
       range(0, each.len()).fold({ pr: pr, out: [] }, |acc: Said, k: Int|
         match ((each.at(k), vs.at(k))) {
@@ -312,9 +304,9 @@ pub fn released(
   }
 
 /// The C counting once more a value of `ty` held as `r` whose C values are `values`, as
-/// `released` takes them: each counted word of each part.
-pub fn duped(ctors: Ctors, ty: Type, r: Rep, values: List<Bytes>) -> Bytes / {abort.raise} = {
-  let each = held_parts(ctors, ty, r);
+/// `released` takes them: each counted word of each part, but a value spelled `0`.
+pub fn duped(pr: Printing, ty: Type, r: Rep, values: List<Bytes>) -> Bytes / {abort.raise} = {
+  let each = held_parts(pr.ctors, ty, r);
   let vs = per_part(r, values);
   Bytes::join(
     range(0, each.len()).fold([], |acc: List<Bytes>, k: Int|
@@ -339,7 +331,8 @@ pub fn let_go_of(pr: Printing, parts: List<Part>, ws: List<Bytes>) -> Said / {ab
 
 fn part_let_go(pr: Printing, p: Part, ws: List<Bytes>) -> Said / {abort.raise} =
   match p {
-    WordAt(w) -> word_let_go(pr, word_of(ws, w.at, w.masked), w.how),
+    WordAt(w) -> if nth(ws, w.at) == b"0" { { pr: pr, out: [] } }
+    else { word_let_go(pr, word_of(ws, w.at, w.masked), w.how) },
     ByCase(c) -> {
       let sws = sum_ws(ws, c.at, c.sum);
       let arms = c.cases.fold(
@@ -360,7 +353,7 @@ fn part_let_go(pr: Printing, p: Part, ws: List<Bytes>) -> Said / {abort.raise} =
       );
       {
         pr: arms.pr,
-        out: [Text(Bytes::concat_all([b"switch (", case_of(c.sum, sws), b") { "]))].concat(
+        out: [Text(Bytes::concat_all([b"switch (", case_held(c.sum, sws), b") { "]))].concat(
           arms.out,
         ).push(
           Text(b"}"),
@@ -368,22 +361,6 @@ fn part_let_go(pr: Printing, p: Part, ws: List<Bytes>) -> Said / {abort.raise} =
       }
     },
   }
-
-/// The place of the case a sum laid as `s`, whose C words are `ws`, holds: each case tested in turn,
-/// the last untested.
-pub fn case_of(s: SumLaid, ws: List<Bytes>) -> Bytes = {
-  let n = s.cases.len();
-  range(0, n).fold(b"", |acc: Bytes, i: Int| {
-    let k = n - 1 - i;
-    if i == 0 { ascii_of_int(k) } else {
-      match s.cases.at(k) {
-        Some(c) ->
-          Bytes::concat_all([b"(", case_test(c.test, ws), b") ? ", ascii_of_int(k), b" : ", acc]),
-        None -> acc,
-      }
-    }
-  })
-}
 
 /// The C letting go of the word `x`, counted as `how` says.
 fn word_let_go(pr: Printing, x: Bytes, how: Counted) -> Said / {abort.raise} =
@@ -469,15 +446,16 @@ fn sum_ws(ws: List<Bytes>, at: Int, s: SumLaid) -> List<Bytes> =
 
 /// The C counting once more the counted `parts` of a value whose C words are `ws`.
 pub fn dup_of(parts: List<Part>, ws: List<Bytes>) -> Bytes =
-  Bytes::join(parts.map(|p: Part| part_dup(p, ws)), b" ")
+  Bytes::join(parts.map(|p: Part| part_dup(p, ws)).filter(|d: Bytes| d.len() > 0), b" ")
 
 fn part_dup(p: Part, ws: List<Bytes>) -> Bytes =
   match p {
-    WordAt(w) -> word_dup(word_of(ws, w.at, w.masked), w.how),
+    WordAt(w) -> if nth(ws, w.at) == b"0" { b"" }
+    else { word_dup(word_of(ws, w.at, w.masked), w.how) },
     ByCase(c) -> {
       let sws = sum_ws(ws, c.at, c.sum);
       Bytes::concat_all(
-        [Bytes::concat_all([b"switch (", case_of(c.sum, sws), b") { "])].concat(
+        [Bytes::concat_all([b"switch (", case_held(c.sum, sws), b") { "])].concat(
           c.cases.map(|k: { case: Int, parts: List<Part> }|
             Bytes::concat_all([
               b"case ",
@@ -512,44 +490,6 @@ fn word_dup(x: Bytes, how: Counted) -> Bytes =
     IntWord(_) ->
       Bytes::concat_all([b"if (!(", x, b" & ", ascii_of_int(tag_mask()), b")) ply_dup(", x, b");"]),
     _ -> Bytes::concat_all([b"ply_dup(", x, b");"]),
-  }
-
-/// The C test that a sum whose C words are `ws` holds the case `told` tells apart.
-pub fn case_test(told: CaseTest, ws: List<Bytes>) -> Bytes =
-  match told {
-    Always -> b"1",
-    WordIs(t) -> Bytes::concat_all([nth(ws, t.at), b" == ", int_lit(t.value)]),
-    WordOutside(t) -> if t.values.len() == 0 { b"1" } else {
-      Bytes::join(
-        t.values.map(|v: Int| Bytes::concat_all([nth(ws, t.at), b" != ", int_lit(v)])),
-        b" && ",
-      )
-    },
-    LowBits(t) -> {
-      let w = nth(ws, t.at);
-      Bytes::concat_all([
-        b"(uint64_t)",
-        w,
-        b" >= ",
-        ascii_of_int(pointer_floor()),
-        b" && (",
-        w,
-        b" & ",
-        ascii_of_int(tag_mask()),
-        b") == ",
-        ascii_of_int(t.bits),
-        match t.block_tag {
-          Some(g) ->
-            Bytes::concat_all([
-              b" && ",
-              slot(Bytes::concat_all([b"(", w, b" & ~(Word)", ascii_of_int(tag_mask()), b")"]), 0),
-              b" == ",
-              int_lit(g),
-            ]),
-          None -> b"",
-        },
-      ])
-    },
   }
 
 /// The C words a block named `x` holds a part held as `r` in from word `at`: a sum's words, and its
@@ -634,7 +574,7 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
           Text(
             Bytes::concat_all([
               b"if (",
-              field(x, b"flags"),
+              field(x, laid.flags),
               b" & ",
               ascii_of_int(laid.view),
               b") { Word ply_v = ",
@@ -654,7 +594,7 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
           Text(
             Bytes::concat_all([
               b" ",
-              freed(x, 2),
+              freed(x, laid.view_words),
               b" } else ply_free(ctx, ",
               x,
               b", ",
@@ -740,7 +680,7 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
               b", ",
               ascii_of_int(header_bytes()),
               b" + 8 * (int64_t)",
-              field(x, b"layout"),
+              field(x, block_sizes().node_room),
               b");",
             ]),
           ),
@@ -749,7 +689,7 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
     },
     MapOf(k) -> {
       let root = rooted(pr, k, b"ply_rel(ctx, ", slot(x, layouts().map.root));
-      { pr: root.pr, out: root.out.push(Text(b" ".concat(freed(x, 1)))) }
+      { pr: root.pr, out: root.out.push(Text(b" ".concat(freed(x, block_sizes().map_words)))) }
     },
     PairsOf(m) -> {
       let tree = layouts().tree;
@@ -783,7 +723,7 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
         ].concat(
           looped(field(x, b"len"), branch),
         ).push(
-          Text(Bytes::concat_all([b" ", freed(x, tree.sizes + tree.keys), b" } else { "])),
+          Text(Bytes::concat_all([b" ", freed(x, block_sizes().branch_words), b" } else { "])),
         ).concat(
           looped(field(x, b"len"), leaf),
         ).push(
@@ -794,7 +734,7 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
               b", ",
               ascii_of_int(header_bytes()),
               b" + 16 * (int64_t)",
-              field(x, b"layout"),
+              field(x, block_sizes().leaf_room),
               b"); }",
             ]),
           ),
@@ -845,12 +785,11 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
 /// Word `at`, a C expression, of the block `x`.
 fn slot_at(x: Bytes, at: Bytes) -> Bytes = Bytes::concat_all([b"ply_words(", x, b")[", at, b"]"])
 
-/// `Walked({ of, op })` into `into`, over the program's constructors `ctors`: a sum of one word
-/// through the block its case holds, anything else through the block its word names.
+/// `Walked({ of, op })` into `into`: a sum of one word through the block its case holds, anything
+/// else through the block its word names.
 pub fn walked_value(
   p: Place,
   pr: Printing,
-  ctors: Ctors,
   into: Option<Var>,
   of: Var,
   op: TypeOp,
@@ -862,17 +801,16 @@ pub fn walked_value(
         walked(
           q,
           p.depth,
-          ctors,
           n,
           of,
           op,
-          opening(ctors, of.ty, of.rep),
-          held_root(Drop, ctors, of.ty, of.rep),
+          opening(q.ctors, of.ty, of.rep),
+          held_root(Drop, q.ctors, of.ty, of.rep),
         );
       match of.rep {
         RSum(s) -> match boxed_alone(s.laid) {
           Some(_) -> whole(pr),
-          None -> walked_sum(pr, p.depth, ctors, n, of, op, case_blocks(ctors, of.ty, s.laid)),
+          None -> walked_sum(pr, p.depth, n, of, op, case_blocks(pr.ctors, of.ty, s.laid)),
         },
         _ -> whole(pr),
       }
@@ -888,7 +826,6 @@ pub fn walked_value(
 pub fn walked(
   pr: Printing,
   depth: Int,
-  ctors: Ctors,
   into: Var,
   of: Var,
   op: TypeOp,
@@ -927,7 +864,6 @@ pub fn walked(
         _ -> {
           let parts = slots_walked(
             n.pr,
-            ctors,
             x,
             opening,
             |q: Printing, ps: List<Part>, ws: List<Bytes>| shared_parts(q, a, ps, ws),
@@ -982,7 +918,6 @@ pub fn walked(
         let size = block_size(x, opening);
         let parts = slots_walked(
           n.pr,
-          ctors,
           a,
           opening,
           |q: Printing, ps: List<Part>, ws: List<Bytes>| kept_parts(q, ps, ws),
@@ -1025,7 +960,6 @@ pub fn walked(
         let size = block_size(x, opening);
         let duped_slots = slots_walked(
           n.pr,
-          ctors,
           a,
           opening,
           |q: Printing, ps: List<Part>, ws: List<Bytes>| {
@@ -1066,7 +1000,6 @@ pub fn walked(
 pub fn walked_sum(
   pr: Printing,
   depth: Int,
-  ctors: Ctors,
   into: Var,
   of: Var,
   op: TypeOp,
@@ -1084,7 +1017,7 @@ pub fn walked_sum(
       let arms = blocks.fold(
         { pr: n.pr, out: [] },
         |acc: Said, b: { case: Int, ty: Type, rep: Rep, opening: Opening }| {
-          let body = case_walked(acc.pr, ctors, held, tag, op, of, b.ty, b.rep, b.opening);
+          let body = case_walked(acc.pr, held, tag, op, of, b.ty, b.rep, b.opening);
           {
             pr: body.pr,
             out: acc.out.push(
@@ -1120,7 +1053,7 @@ pub fn walked_sum(
               b"Word ply_x = ",
               x,
               b"; for (;;) { Word ply_n = 0; switch (",
-              case_of(s.laid, [b"ply_x"]),
+              case_held(s.laid, [b"ply_x"]),
               b") { ",
             ]),
           ),
@@ -1139,7 +1072,6 @@ pub fn walked_sum(
 /// in place, whose last part of `own`'s type the loop around goes on to as `ply_n`.
 fn case_walked(
   pr: Printing,
-  ctors: Ctors,
   held: Bytes,
   tag: Bytes,
   op: TypeOp,
@@ -1172,7 +1104,6 @@ fn case_walked(
           let size = block_size(b"ply_b", o);
           let slots = slots_walked(
             pr,
-            ctors,
             b"ply_k",
             split.rest,
             |q: Printing, ps: List<Part>, ws: List<Bytes>| kept_parts(q, ps, ws),
@@ -1206,7 +1137,6 @@ fn case_walked(
         Share -> {
           let slots = slots_walked(
             pr,
-            ctors,
             b"ply_b",
             split.rest,
             |q: Printing, ps: List<Part>, ws: List<Bytes>| shared_parts(q, held, ps, ws),
@@ -1268,11 +1198,11 @@ fn block_size(x: Bytes, o: Opening) -> Bytes =
     StrBlock(_) ->
       Bytes::concat_all([
         b"(",
-        field(x, b"flags"),
+        field(x, str_laid().flags),
         b" & ",
         ascii_of_int(str_laid().view),
         b" ? ",
-        ascii_of_int(header_bytes() + 16),
+        ascii_of_int(header_bytes() + 8 * str_laid().view_words),
         b" : ",
         ascii_of_int(header_bytes()),
         b" + (((int64_t)",
@@ -1289,8 +1219,12 @@ fn block_size(x: Bytes, o: Opening) -> Bytes =
         b")",
       ]),
     NodeOf(_) ->
-      Bytes::concat_all([ascii_of_int(header_bytes()), b" + 8 * (int64_t)", field(x, b"layout")]),
-    MapOf(_) -> ascii_of_int(header_bytes() + 8),
+      Bytes::concat_all([
+        ascii_of_int(header_bytes()),
+        b" + 8 * (int64_t)",
+        field(x, block_sizes().node_room),
+      ]),
+    MapOf(_) -> ascii_of_int(header_bytes() + 8 * block_sizes().map_words),
     PairsOf(_) ->
       Bytes::concat_all([
         b"(",
@@ -1298,11 +1232,11 @@ fn block_size(x: Bytes, o: Opening) -> Bytes =
         b" == ",
         ascii_of_int(layouts().tree.branch),
         b" ? ",
-        ascii_of_int(header_bytes() + 8 * (layouts().tree.sizes + layouts().tree.keys)),
+        ascii_of_int(header_bytes() + 8 * block_sizes().branch_words),
         b" : ",
         ascii_of_int(header_bytes()),
         b" + 16 * (int64_t)",
-        field(x, b"layout"),
+        field(x, block_sizes().leaf_room),
         b")",
       ]),
     ArrayOf(a) ->
@@ -1343,7 +1277,6 @@ fn copied_block(c: Bytes, x: Bytes, size: Bytes) -> Bytes =
 /// value, a container's items and nodes, an array's elements, a `Columns`' columns.
 fn slots_walked(
   pr: Printing,
-  ctors: Ctors,
   b: Bytes,
   o: Opening,
   act: (Printing, List<Part>, List<Bytes>) -> Said / {abort.raise},
@@ -1358,9 +1291,10 @@ fn slots_walked(
     InBox(x) ->
       each(
         pr,
-        x.parts.map(|h: Held| { ps: stored_parts(ctors, h), ws: slots_of(b, h.at, h.rep, false) }),
+        x.parts.map(|h: Held|
+          { ps: stored_parts(pr.ctors, h), ws: slots_of(b, h.at, h.rep, false) }),
       ),
-    Holding(h) -> each(pr, [{ ps: stored_parts(ctors, h), ws: [slot(b, h.at)] }]),
+    Holding(h) -> each(pr, [{ ps: stored_parts(pr.ctors, h), ws: [slot(b, h.at)] }]),
     StrBlock(s) -> {
       let v = act(pr, node(s.viewed), [slot(b, str_laid().viewed)]);
       {
@@ -1369,7 +1303,7 @@ fn slots_walked(
           Text(
             Bytes::concat_all([
               b"if (",
-              field(b, b"flags"),
+              field(b, str_laid().flags),
               b" & ",
               ascii_of_int(str_laid().view),
               b") { ",
@@ -1617,7 +1551,7 @@ fn each_word(
         );
         {
           pr: arms.pr,
-          out: [Text(Bytes::concat_all([b"switch (", case_of(c.sum, sws), b") { "]))].concat(
+          out: [Text(Bytes::concat_all([b"switch (", case_held(c.sum, sws), b") { "]))].concat(
             arms.out,
           ).push(
             Text(b"}"),
@@ -1676,7 +1610,6 @@ pub fn opened_sum(pr: Printing, depth: Int, o: Var, ws: List<Var>) -> Printing /
 pub fn reset_boxed(
   pr: Printing,
   depth: Int,
-  ctors: Ctors,
   token: Var,
   of: Var,
   opening: Opening,
@@ -1687,7 +1620,7 @@ pub fn reset_boxed(
       let x = name_of(pr, of);
       let t = named(pr, token);
       let held = b.parts.fold({ pr: t.pr, out: [] }, |acc: Said, h: Held| {
-        let s = let_go_of(acc.pr, stored_parts(ctors, h), slots_of(x, h.at, h.rep, false));
+        let s = let_go_of(acc.pr, stored_parts(pr.ctors, h), slots_of(x, h.at, h.rep, false));
         { pr: s.pr, out: spaced(acc.out, s.out) }
       });
       let shared = rooted(held.pr, dropped, b"ply_rel(ctx, ", x);
@@ -1950,16 +1883,22 @@ test "a counted word is let go of at its type's drop root, a hole the root's cal
   assert_eq(
     let_go_said([word(0, RuntimeHandle)], [b"w"]).text,
     b"if (w && ply_last(ctx, w)) rt_handle_free_p(ctx, w);",
-  )
+  );
+  // A value spelled 0, a word another now holds, is neither let go of nor counted again.
+  let gone = let_go_said([word(0, Object(k)), word(1, SumWord(k))], [b"0", b"0"]);
+  assert_eq([gone.text, dup_of([word(0, Object(k)), word(1, Object(k))], [b"0", b"b"])], [
+    b"",
+    b"ply_dup(b);",
+  ]);
+  assert_eq(gone.calls, [])
 }
 
-test "a sum of several words is let go of by the case it holds, each case tested in turn" {
+test "a sum of several words is let go of by the case it holds, switching on its place" {
   let k = dropping_of(b"String");
   let parts = [
     ByCase({ at: 0, sum: tagged_laid(), cases: [{ case: 1, parts: [word(1, Object(k))] }] }),
   ];
-  let held = b"(t1_0 == INT64_C(0)) ? 0 : (t1_0 == INT64_C(1)) ? 1 : 2";
-  assert_eq(case_of(tagged_laid(), [b"t1_0", b"t1_1"]), held);
+  let held = case_held(tagged_laid(), [b"t1_0", b"t1_1"]);
   assert_eq(
     let_go_said(parts, [b"t1_0", b"t1_1", b"t1_2"]).text,
     Bytes::concat_all([
@@ -1986,10 +1925,6 @@ test "counting once more tests a sum's word past the floor and an Int's for its 
   assert_eq(
     dup_of([word(0, Object(k)), word(1, Through)], [b"a", b"b"]),
     b"ply_dup(a); ply_dup(b);",
-  );
-  assert_eq(
-    case_test(LowBits({ at: 0, bits: 7, block_tag: Some(9) }), [b"w"]),
-    b"(uint64_t)w >= 4096 && (w & 7) == 7 && ply_words((w & ~(Word)7))[0] == INT64_C(9)",
   )
 }
 
@@ -2050,7 +1985,6 @@ test "a reset keeps a box held only here as its token, its words let go of, and 
   let reset = reset_boxed(
     pr,
     0,
-    no_ctors(),
     local(1, RToken(2)),
     local(0, RWord),
     InBox({ parts: [{ at: 0, ty: TyCon({ name: b"String", args: [] }), rep: RWord }], words: 2 }),
@@ -2067,15 +2001,10 @@ test "a reset keeps a box held only here as its token, its words let go of, and 
     ]),
   );
   let token = local(1, RToken(2));
-  let freed = count_classed(
-    place(),
-    { ..reset, out: [] },
-    no_ctors(),
-    Free({ of: token, bytes: AInt(32) }),
-  );
+  let freed = count_classed(place(), { ..reset, out: [] }, Free({ of: token, bytes: AInt(32) }));
   assert_eq(spelled(freed.out), b"  if (t1) ply_free(ctx, t1, INT64_C(32));\n");
   assert_eq(
-    spelled(released(reset, no_ctors(), token.ty, token.rep, [b"t1"]).out),
+    spelled(released(reset, token.ty, token.rep, [b"t1"]).out),
     b"if (t1) ply_free(ctx, t1, 32);",
   )
 }
@@ -2083,15 +2012,16 @@ test "a reset keeps a box held only here as its token, its words let go of, and 
 test "a value's counts read its type's own layout and word form" {
   let string = TyCon({ name: b"String", args: [] });
   let pair = TyRecord([{ name: b"a", ty: string }, { name: b"b", ty: string }]);
-  let let_go = released(printing(Map::new()), no_ctors(), string, RWord, [b"t1"]);
+  let pr = printing(Map::new());
+  let let_go = released(pr, string, RWord, [b"t1"]);
   assert_eq(
     spelled(let_go.out),
     Bytes::concat_all([b"ply_rel(ctx, t1, ", root_spelled(dropping_of(b"String")), b");"]),
   );
   // A record's word form is its box; an `Int`'s an immediate or the runtime's box.
-  assert_eq(duped(no_ctors(), pair, RWord, [b"t2"]), b"ply_dup(t2);");
+  assert_eq(duped(pr, pair, RWord, [b"t2"]), b"ply_dup(t2);");
   assert_eq(
-    duped(no_ctors(), TyCon({ name: b"Int", args: [] }), RWord, [b"t3"]),
+    duped(pr, TyCon({ name: b"Int", args: [] }), RWord, [b"t3"]),
     b"if (!(t3 & 7)) ply_dup(t3);",
   );
   assert_eq(part_names(b"t4", RWord), [b"t4"])
@@ -2123,7 +2053,7 @@ fn walked_said(
   dropped: RootKey,
 ) -> { text: Bytes, calls: List<RootKey> } / {abort.raise} = {
   let pr = printing(Map::new().insert(0, b"p0"));
-  let w = walked(pr, 0, no_ctors(), local(1, RWord), local(0, RWord), op, o, dropped);
+  let w = walked(pr, 0, local(1, RWord), local(0, RWord), op, o, dropped);
   { text: spelled(w.out), calls: w.calls }
 }
 
@@ -2170,7 +2100,7 @@ test "a sum of one word walks the block its case holds, a chain of its own type 
   ];
   let pr = printing(Map::new().insert(0, b"p0"));
   let walk = |op: TypeOp|
-    spelled(walked_sum(pr, 0, no_ctors(), local(1, RWord), local(0, tagged), op, blocks).out);
+    spelled(walked_sum(pr, 0, local(1, RWord), local(0, tagged), op, blocks).out);
   let kept = walk(Keep);
   [
     b"Word t1 = p0; Word *ply_into = &t1; Word ply_x = p0; for (;;) { Word ply_n = 0; switch (",

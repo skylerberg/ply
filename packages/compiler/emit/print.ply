@@ -19,11 +19,11 @@ import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSlice, Var, Arg, AVar,
                  MClosure, MList, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next,
                  Done, Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec, Reset, Free,
                  Opened, Block, Fn, Member, Rooted, Given, Owned, Lambda, Closure, Uses, NoArm,
-                 Spine, Data, LastOf, Walked, no_links, falls_through, var_said)
+                 Spine, LastOf, Walked, no_links, falls_through, var_said)
 import emit.print.text (Under, Place, Printing, Printed, printing, function_body, line, text,
                         pieces, pad, named, name_of, arg_text, assigned, label, check, zero,
                         failing_return, site, slot, part_names, part_name, unprinted)
-import emit.print.counts (exit_of, block_opened, block_closed, count_printed)
+import emit.print.counts (exit_of, block_opened, block_closed, count_printed, walked_value)
 import emit.print.made (c_type, c_types, as_word, word_as, word_parts, made, got, packed, gathered,
                         statics, join_declared, set_parts, returned, head_types, head_params,
                         params_opened)
@@ -39,10 +39,11 @@ import emit.print.invoked (call, applied, closure_made, restarted, entered_membe
                            group_buffers, member_opened)
 import emit.lower.held (passing, ByReference)
 import emit.print.handled (handle_opened, handle_closed, landing_jump, effect_op)
+import emit.print.frames (site_linked, handle_linked, unlinked, record_declared, eaches_printed)
 
 /// Root `f` as its C function and entry, or a tail group as its group function, the group's entry
-/// and each member's wrapper; then each of its closures' functions in `f.lambdas` order. `ctors` is
-/// the program's constructor table.
+/// and each member's wrapper; then each of its closures' functions in `f.lambdas` order; the `each`
+/// functions their frame records name before them all. `ctors` is the program's constructor table.
 pub fn printed_fn(f: Fn, ctors: Ctors) -> Printed / {abort.raise} = {
   let name = symbol_of(root_name(f.key));
   let own = if f.members.len() == 0 { root_printed(name, f, ctors) }
@@ -60,7 +61,7 @@ pub fn printed_fn(f: Fn, ctors: Ctors) -> Printed / {abort.raise} = {
   );
   let tables = closures.pr;
   {
-    pieces: merged(own.out.concat(closures.out)),
+    pieces: merged(eaches_printed(name, tables).concat(own.out).concat(closures.out)),
     calls: tables.calls,
     consts: tables.consts,
     builtins: tables.builtins,
@@ -216,6 +217,7 @@ fn group_printed(
           b") {\n",
           fuel_head(f.conv.answer),
           Bytes::concat_all(group_buffers(f).map(|d: Bytes| Bytes::concat_all([b"  ", d, b"\n"]))),
+          record_declared(switched),
           b"  ply_loop: ",
           tick_line(failing_return(f.conv.answer)),
           b"\n  switch (which) {\n",
@@ -264,8 +266,9 @@ fn param_names(f: Fn) -> Map<Int, Bytes> / {abort.raise} =
 fn closure_printed(symbol: Bytes, nth: Int, l: Lambda, pr: Printing) -> Printing / {abort.raise} =
   match l { Closure(c) -> body_printed(symbol, c.body, function_body(pr, lambda_names(l, nth))) }
 
-/// `f`'s body, a body of the root named `symbol`, its restart label first where a self call
-/// restarts it, and the tails of what it declares at its end.
+/// `f`'s body, a body of the root named `symbol`: the frame record its sites link, its parameters
+/// opened, its restart label where a self call restarts it, and the tails of what it declares at
+/// its end.
 fn body_printed(symbol: Bytes, f: Fn, pr: Printing) -> Printing / {abort.raise} = {
   let u = {
     symbol: symbol,
@@ -288,7 +291,9 @@ fn body_printed(symbol: Bytes, f: Fn, pr: Printing) -> Printing / {abort.raise} 
       Bytes::concat_all([b"  ply_loop: ", tick_line(failing_return(f.conv.answer)), b"\n"]),
     )
   } else { viewed };
-  block_closed(printed(u, looped, f.body, 0), pr.block, 0, falls_through(f.body))
+  let done = block_closed(printed(u, looped, f.body, 0), pr.block, 0, falls_through(f.body));
+  let record = record_declared(done);
+  if record.len() == 0 { done } else { { ..done, out: [Text(record)].concat(done.out) } }
 }
 
 /// Each parameter `f` holds as a view of the list whose word it takes, viewing the list from its
@@ -337,8 +342,9 @@ fn restarts(b: Block) -> Bool =
 /// out of the function.
 fn root_of(u: Under) -> Bytes = match u.landing { Some(j) -> j, None -> failing_return(u.answer) }
 
-/// `val` printed into `into` at `p`, a failure in it releasing `unwind` on its way out. The tails it
-/// adds are kept only where the C it prints has a failure test, which goes by them.
+/// `val` printed into `into` at `p`, a failure in it releasing `unwind` on its way out, and where it
+/// may stop, a record of `unwind` linked around it. The tails it adds are kept only where the C it
+/// prints has a failure test, which goes by them.
 fn exiting(
   p: Place,
   pr: Printing,
@@ -347,7 +353,8 @@ fn exiting(
   val: Val,
 ) -> Printing / {abort.raise} = {
   let x = exit_of(pr, unwind, root_of(p.u));
-  let after = value_printed({ ..p, leave: x.leave }, x.pr, into, val);
+  let l = site_linked({ ..p, leave: x.leave }, x.pr, unwind, val);
+  let after = unlinked(value_printed({ ..p, leave: l.leave }, l.pr, into, val), p.depth, l);
   if x.pr.tails.all.len() == pr.tails.all.len()
       || range(pr.out.len(), after.out.len()).any(|i: Int|
         match after.out.at(i) { Some(Text(t)) -> t.index_of(x.leave) != None, _ -> false }) {
@@ -515,22 +522,27 @@ fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort
             Handle(h) -> {
               let l = label(acc);
               let x = exit_of(l.pr, h.unwind, root_of(u));
-              let hp = { ..p, leave: x.leave };
+              let f = handle_linked({ ..p, leave: x.leave }, x.pr, l.n, h.body, h.site, h.unwind);
+              let hp = { ..p, leave: f.leave };
               let inside = { ..u, landing: Some(landing_jump(l.n)) };
-              let opened = handle_opened(hp, x.pr, l.n, h.args, h.uses, h.site, h.answer);
-              handle_closed(
-                hp,
-                if h.site.detached != None { printed(inside, opened, h.body, inner) } else {
-                  block_closed(
-                    printed(inside, block_opened(opened), h.body, inner),
-                    acc.block,
-                    inner,
-                    falls_through(h.body),
-                  )
-                },
-                l.n,
-                h.site,
-                h.answer,
+              let opened = handle_opened(hp, f.pr, l.n, h.args, h.uses, h.site, h.answer);
+              unlinked(
+                handle_closed(
+                  hp,
+                  if h.site.detached != None { printed(inside, opened, h.body, inner) } else {
+                    block_closed(
+                      printed(inside, block_opened(opened), h.body, inner),
+                      acc.block,
+                      inner,
+                      falls_through(h.body),
+                    )
+                  },
+                  l.n,
+                  h.site,
+                  h.answer,
+                ),
+                depth,
+                f,
               )
             },
             Inc(_) -> count_printed(p, acc, i),
@@ -572,7 +584,7 @@ fn value_printed(p: Place, pr: Printing, into: Option<Var>, val: Val) -> Printin
       OCalling(x) -> calling_op(p, pr, into, x, o.args, o.uses),
     },
     LastOf(v) -> unprinted(Spine, b"a test of a value's last holder", var_said(v)),
-    Walked(w) -> unprinted(Data, b"a value walked to copy, share or keep", var_said(w.of)),
+    Walked(w) -> walked_value(p, pr, into, w.of, w.op),
   }
 
 /// The field held as one word at `t.path`'s offset in the block `t.of`, read with a count of its own:

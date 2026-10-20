@@ -13,11 +13,11 @@ import front.seam (Analysed, Refused)
 import unit (program_natives)
 import emit.code (Code)
 import emit.keys (root_name)
-import emit.lower (group_lowered)
+import emit.lower (root_lowered, group_lowered, tail_groups)
 import emit.lower.setting (Setting, Root, setting_in)
-import emit.lend (Handing, Lending, lendings_in, handings_of, handing_said)
+import emit.lend (Handing, Lending, lendings_of, handings_of, handing_said, reset_params)
 import emit.tir (Inst, Block, Fn, Member, Handed, Reset, If, Case, Match, Loop, Handle, Given, Lent)
-import emit.own (owned)
+import emit.own (owned, may_reuse)
 import emit.verify (verified)
 
 fn corpus() -> Bytes =
@@ -73,11 +73,41 @@ fn set_out(
       },
   }
 
+/// The forms of `roots` as a build lowers them: a tail group once, where its first member stands,
+/// and every other root alone; one that does not lower is left out.
+fn forms_in(s: Setting, roots: List<Root>) -> List<Fn> / {abort.raise} = {
+  let groups = tail_groups(
+    s.module,
+    s.here,
+    roots.map(|r: Root| { full: root_name(r.key), code: r.code }),
+  );
+  let group_at = groups.fold(Map::new(), |m: Map<Int, List<Int>>, g: List<Int>|
+    g.fold(m, |n: Map<Int, List<Int>>, i: Int| n.insert(i, g)));
+  range(0, roots.len()).fold([], |acc: List<Fn>, i: Int|
+    match group_at.get(i) {
+      Some(g) -> if g.at(0) != Some(i) { acc } else {
+        let members = g.fold([], |ms: List<{ root: Root, code: Code }>, j: Int|
+          match roots.at(j) {
+            Some(r) -> match r.code { Ok(c) -> ms.push({ root: r, code: c }), Err(_) -> ms },
+            None -> ms,
+          });
+        match group_lowered(s, members) { Ok(f) -> acc.push(f), Err(_) -> acc }
+      },
+      None -> match roots.at(i) {
+        Some(r) -> match r.code {
+          Ok(code) -> match root_lowered(s, r, code) { Ok(f) -> acc.push(f), Err(_) -> acc },
+          Err(_) -> acc,
+        },
+        None -> acc,
+      },
+    })
+}
+
 /// The definitions `names` names of module `module` of `a`, every one where it names none, as the
 /// inference reads them.
 fn read_in(a: Analysis, module: Bytes, names: List<Bytes>) -> List<Lending> / {abort.raise} = {
   let s = set_out(a, module, names);
-  lendings_in(s.setting, s.roots)
+  lendings_of(s.setting, forms_in(s.setting, s.roots))
 }
 
 /// The handing of each definition of module `module` of `src` that `names` names, settled with
@@ -140,14 +170,23 @@ test "lending costs no reuse: each body handed as inferred resets what it resets
   assert_eq(lost, []);
   // The reuse is there to be lost: a tree rebuilt from the node a match found. A record rebuilt
   // with one field changed is its leaves, which no block holds to reuse.
-  assert_eq(lendings.filter(|l: Lending| l.resets.len() > 0).map(|l: Lending| l.def), [b"m.mirror"])
+  assert_eq(lendings.filter(|l: Lending| reset_params(l).len() > 0).map(|l: Lending| l.def), [
+    b"m.mirror",
+  ]);
+  // Only a definition settled lending a counted parameter, whose body makes what takes cells, is
+  // counted for its resets; each of the rest gives every counted parameter or resets nothing.
+  assert_eq(
+    lendings.filter(|l: Lending| !may_reuse(l.whole)).filter(|l: Lending|
+      reset_params(l).len() > 0),
+    [],
+  )
 }
 
 test "a tail group lent as inferred passes the ownership check where a member hands another a value it made" {
   let a = analysed(corpus());
   let names = [b"m.hop", b"m.skip"];
   let s = set_out(a, b"m", names);
-  let handed = handings_of(lendings_in(s.setting, s.roots), Map::new());
+  let handed = handings_of(lendings_of(s.setting, forms_in(s.setting, s.roots)), Map::new());
   let members = s.roots.fold([], |acc: List<{ root: Root, code: Code }>, r: Root|
     match r.code { Ok(c) -> acc.push({ root: r, code: c }), Err(_) -> acc });
   let group = match group_lowered(s.setting, members) {
