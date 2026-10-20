@@ -10,14 +10,15 @@ import check.resolve.tables (ParsedModule, Source, Diag, qualify)
 import check.resolve (ResolveSucceeded, ResolveFailed, resolve_packaged)
 import check.resolve.scopes (PackageDeps, no_packages, of_binder)
 import expand.derive (expand_derives)
-import check.infer.checker (MemberSite, WitnessOp, test_owner, law_root, cases_root)
+import check.infer.checker (MemberSite, WitnessOp, test_owner, law_root, law_owner, cases_root)
 import check.infer (expanded_mods)
 import check.types (Type, TyCon, TyVar, Scheme, int_type, bytes_type, type_spelled)
-import emit.lower.setting (Setting, declared_schemes, walked_read, sites_in, typed_in, defs_in,
-                           resolved_imports, effects_in, params_carried, law_params)
+import emit.lower.setting (Setting, declared_schemes, walked_read, defs_in, resolved_imports,
+                           effects_in, params_carried, law_params, facts_by_item, filings_of,
+                           labels_of)
 import emit.lower.calling (known_body, lambdas_of, named_in, def_in, is_ctor_name, has_handle)
 import emit.lower.scalars (walked_container)
-import emit.typing (Typed)
+import emit.typing (Typed, Filings, no_filings)
 import front.rows (Rows, KnownDefRow)
 import front.published (facts_read, lowered_modules, lowers, wants)
 import std.list
@@ -34,7 +35,7 @@ import emit.roots (container_ops, equality_root, ordering_root, written_root_of,
 import emit.answer (no_tables, sorted_widths, Emitted, Body, Refused, RootAnswer)
 import emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, ModuleDefs, Whole, EmitParam,
                   BoundLambda, OwnerLambdas, kind_of, boxed, Sig, sig_of, param_kinds, param_types,
-                  typed_kind, typed_at, carriers_of)
+                  typed_kind, filings_at, carriers_of)
 import emit.written (container_code, equality_code, ordering_code, digest_code, at_args,
                      reflection_code, reflected_kind)
 import emit.entry (Prepared, group_emitted, root_emitted, emitted_from)
@@ -199,8 +200,11 @@ pub fn emit_program(
               let defs_of = |path: Bytes|
                 program.fold([], |acc: List<Def>, md: ModuleDefs|
                   if md.module == path { md.defs } else { acc });
-              // Each lowered module's definitions, imports and the types its check filed, which its
-              // roots and the lambdas its definitions lend are read under.
+              // What the check filed of each item's nodes, which its roots and the lambdas it lends
+              // are read under.
+              let owned = facts_by_item(facts);
+              let filed_of = |owner: Bytes| filings_of(owned, owner);
+              // Each lowered module's definitions and imports.
               let tables_of = |i: Int, m: ParsedModule|
                 {
                   here: defs_in(m.name, m.module, pure, schemes),
@@ -212,7 +216,6 @@ pub fn emit_program(
                     defs_of,
                     facts.elaboration.members.filter(|s: MemberSite| s.module == i),
                   ),
-                  typed: typed_in(facts, i),
                 };
               let tables = range(0, mods.len()).map(|i: Int|
                 match mods.at(i) {
@@ -234,15 +237,14 @@ pub fn emit_program(
                   if of.base.at(k) == 46 { k } else { acc });
                 let module = of.base.slice(0, if dot < 0 { 0 } else { dot });
                 let short = of.base.slice(dot + 1, of.base.len());
-                // The lambdas `code`, the owner's body in module `i`, writes, read under `typed`.
-                let lent = |i: Int, m: ParsedModule, code: Code, typed: Map<Bytes, Typed>, base: Int| {
+                // The lambdas `code`, the owner's body in module `i`, writes, read under `filed`.
+                let lent = |i: Int, m: ParsedModule, code: Code, filed: Result<Filings, Bytes>, base: Int| {
                   let tab = tables_at(i, m);
                   let emitted = known_body(owner, [], code);
                   let lambdas = lambdas_of(emitted);
                   let written = lambdas.concat(named_in(m.name, tab.here, tab.imports, emitted));
-                  match written.at(0) {
-                    None -> None,
-                    Some(first) ->
+                  match ((written.at(0), filed)) {
+                    (Some(first), Ok(f)) ->
                       Some({
                         lambdas: lambdas.len(),
                         bound: {
@@ -254,11 +256,12 @@ pub fn emit_program(
                           here: tab.here,
                           imports: tab.imports,
                           effects: effects_in(x.r, i, mods),
-                          typed: typed,
+                          filed: f,
                           base: base,
                           written: written,
                         },
                       }),
+                    _ -> None,
                   }
                 };
                 match range(0, mods.len()).fold(None, |acc: Option<Int>, k: Int|
@@ -285,15 +288,18 @@ pub fn emit_program(
                             },
                         ) {
                         None -> None,
-                        Some(t) -> match lower_fn(
-                            if t.cases != None { [case_at(), case_identity()] } else { [] },
-                            [],
-                            sites_in(facts.label_sites, i),
-                            test_run(t),
-                            of_binder(m.name),
-                          ) {
-                          None -> None,
-                          Some(l) -> lent(i, m, l.code, tables_at(i, m).typed, t.span.start),
+                        Some(t) -> {
+                          let filed = filed_of(owner);
+                          match lower_fn(
+                              if t.cases != None { [case_at(), case_identity()] } else { [] },
+                              [],
+                              labels_of(filed),
+                              test_run(t),
+                              of_binder(m.name),
+                            ) {
+                            None -> None,
+                            Some(l) -> lent(i, m, l.code, filed, t.span.start),
+                          }
                         },
                       },
                       Some(d) -> {
@@ -304,10 +310,11 @@ pub fn emit_program(
                           schemes,
                           facts.elaboration.ops.filter(|o: WitnessOp| o.module == i),
                         );
+                        let filed = filed_of(of.base);
                         match lower_fn(
                             d.params.map(|param: Param| param.name.name),
                             d.generics.labels.map(|ident: Ident| ident.name),
-                            sites_in(facts.label_sites, i),
+                            labels_of(filed),
                             source.body,
                             of_binder(m.name),
                           ) {
@@ -317,8 +324,11 @@ pub fn emit_program(
                               i,
                               m,
                               l.code,
-                              if of.args.len() == 0 { tables_at(i, m).typed }
-                              else { typed_at(tables_at(i, m).typed, of.args) },
+                              match filed {
+                                Ok(f) ->
+                                  Ok(if of.args.len() == 0 { f } else { filings_at(f, of.args) }),
+                                Err(why) -> Err(why),
+                              },
                               d.span.start,
                             ),
                         }
@@ -362,12 +372,11 @@ pub fn emit_program(
                         declared: declared,
                         effects: effects_in(x.r, i, mods),
                         release: release,
-                        typed: tab.typed,
                       },
                       schemes,
                       wanted,
                       specialised,
-                      sites_in(facts.label_sites, i),
+                      filed_of,
                       facts.elaboration.ops.filter(|o: WitnessOp| o.module == i),
                       lambda_at,
                     ).fold(acc, |a: List<Emitted>, e: Emitted| a.push(calling_instances(stated, e)))
@@ -472,41 +481,45 @@ fn calling_instances(stated: Map<Bytes, List<Bytes>>, e: Emitted) -> Emitted / {
 
 /// The roots `wanted` names of the module `s` reads, written in its order: its definitions, each
 /// definition's specialisations and clauses, its tests and laws, and the roots written for its types.
+/// `filed_of` is what the checker filed of each item's nodes, by the item's owner.
 fn emit_module(
   x_module: Module,
   s: Setting,
   schemes: Map<Bytes, Scheme>,
   wanted: Option<Map<Bytes, Bool>>,
   specialised: Map<Bytes, List<Specialised>>,
-  sites: Map<Bytes, List<Bytes>>,
+  filed_of: (Bytes) -> Result<Filings, Bytes> / {abort.raise},
   ops: List<WitnessOp>,
   lambda_at: (Bytes, Int) -> Option<BoundLambda> / {abort.raise},
 ) -> List<Emitted> / {abort.raise} = {
   let module = s.module;
   let here = s.here;
   let fns = x_module.items.fold([], |acc: List<Prepared>, item: Item|
-    match item { IFn(d) -> acc.push(prepare(module, schemes, wanted, sites, d)), _ -> acc });
+    match item { IFn(d) -> acc.push(prepare(module, schemes, wanted, filed_of, d)), _ -> acc });
   let groups = tail_groups(module, here, fns);
   let walked = x_module.items.fold({ out: [], fns: 0 }, |acc: Walk, item: Item|
     match item {
       IFn(d) -> {
         let p = match fns.at(acc.fns) {
           Some(q) -> q,
-          None -> prepare(module, schemes, wanted, sites, d),
+          None -> prepare(module, schemes, wanted, filed_of, d),
         };
         let specialisations = (match specialised.get(p.full) { Some(l) -> l, None -> [] }).fold(
           acc.out,
           |a: List<Emitted>, sp: Specialised|
             a.push(
               specialised_emitted(
-                { ..s, here: held_whole(here, tail_cycle(module, here, sites, x_module.items, d)) },
+                {
+                  ..s,
+                  here: held_whole(here, tail_cycle(module, here, filed_of, x_module.items, d)),
+                },
                 d,
                 sp.args,
                 sp.fns,
                 lambda_at,
                 schemes,
                 ops,
-                sites,
+                p.filed,
               ),
             ),
         );
@@ -514,7 +527,7 @@ fn emit_module(
           None -> if !wants(wanted, p.full) { specialisations } else {
             specialisations.push(
               witnessed_needs(
-                emitted_from(s, p.base, p.full, p.ps, p.known, p.code),
+                emitted_from(s, p.base, p.full, p.ps, p.known, p.code, p.filed),
                 d,
                 schemes.get(p.full),
                 ops,
@@ -537,13 +550,14 @@ fn emit_module(
           s,
           sig_of(schemes, qualify(module, d.name.name)),
           wanted,
-          sites,
+          p.filed,
         )
       },
       // A test is a root named by its label: nullary, or over cases entered with a case's place
       // and identity beside a nullary root that lists them.
       ITest(t) -> {
         let full = test_owner(module, t.name);
+        let filed = filed_of(full);
         let ps = if t.cases == None { [] } else {
           [
             {
@@ -572,7 +586,7 @@ fn emit_module(
             taken.map(|p: EmitParam| p.name),
             taken,
             true,
-            sites,
+            filed,
             body,
           );
         let run = if !wants(wanted, full) { acc.out }
@@ -586,22 +600,24 @@ fn emit_module(
       },
       // A law's guard and body are roots the judge enters with the binders' values.
       ILaw(d) -> {
+        let filed = filed_of(law_owner(module, d.name));
+        let typed = match filed { Ok(f) -> f.typed, Err(_) -> Map::new() };
         let names = d.binders.map(|binder: Binder| binder.name.name);
-        let kinds = d.binders.map(|binder: Binder| Some(typed_kind(s.typed, binder.name.span)));
-        let ps = law_params(s.typed, d.binders);
+        let kinds = d.binders.map(|binder: Binder| Some(typed_kind(typed, binder.span)));
+        let ps = law_params(filed, d.binders);
         let known = kinds.fold(true, |acc2: Bool, k: Option<{ kind: Kind, ty: Ty }>|
           acc2 && k != None);
         let part = |which: Bytes| law_root(module, d.name, which);
         let with_guard = match d.guard {
           None -> acc.out,
           Some(g) -> if !wants(wanted, part(b"guard")) { acc.out } else {
-            acc.out.push(root_emitted(s, d.span.start, part(b"guard"), names, ps, known, sites, g))
+            acc.out.push(root_emitted(s, d.span.start, part(b"guard"), names, ps, known, filed, g))
           },
         };
         {
           out: if !wants(wanted, part(b"body")) { with_guard } else {
             with_guard.push(
-              root_emitted(s, d.span.start, part(b"body"), names, ps, known, sites, d.body),
+              root_emitted(s, d.span.start, part(b"body"), names, ps, known, filed, d.body),
             )
           },
           fns: acc.fns,
@@ -677,12 +693,13 @@ fn emit_module(
                   ..a2,
                   out: a2.out.push(
                     emitted_from(
-                      { ..s, typed: filed_too(s.typed, e.typed) },
+                      s,
                       t.span.start,
                       d.root,
                       [word(b"a"), word(b"b")],
                       true,
                       Some(e.code),
+                      Ok({ ..no_filings(), typed: e.typed }),
                     ),
                   ),
                 }
@@ -739,7 +756,7 @@ fn emit_module(
       };
       out.push(
         emitted_from(
-          { ..s, here: here.concat(e.here), typed: filed_too(s.typed, e.typed) },
+          { ..s, here: here.concat(e.here) },
           0,
           r.root,
           if r.op.ends_with(b"_from") { [word(b"a"), word(b"b"), index] }
@@ -747,6 +764,7 @@ fn emit_module(
           else { [word(b"a")] },
           true,
           Some(e.code),
+          Ok({ ..no_filings(), typed: e.typed }),
         ),
       )
     } else {
@@ -756,7 +774,7 @@ fn emit_module(
       let word = reflected_kind(r.ty);
       out.push(
         emitted_from(
-          { ..s, typed: filed_too(s.typed, e.typed) },
+          s,
           0,
           r.root,
           [
@@ -771,14 +789,11 @@ fn emit_module(
           ],
           true,
           Some(e.code),
+          Ok({ ..no_filings(), typed: e.typed }),
         ),
       )
     })
 }
-
-/// `typed` with the sites code written for a type files, which that code alone reads.
-fn filed_too(typed: Map<Bytes, Typed>, written: Map<Bytes, Typed>) -> Map<Bytes, Typed> =
-  written.fold(typed, |m: Map<Bytes, Typed>, k: Bytes, v: Typed| m.insert(k, v))
 
 type Walk = { out: List<Emitted>, fns: Int }
 
@@ -787,7 +802,7 @@ fn prepare(
   module: Bytes,
   schemes: Map<Bytes, Scheme>,
   wanted: Option<Map<Bytes, Bool>>,
-  sites: Map<Bytes, List<Bytes>>,
+  filed_of: (Bytes) -> Result<Filings, Bytes> / {abort.raise},
   def: FnDef,
 ) -> Prepared / {abort.raise} = {
   let names = def.params.map(|param: Param| param.name.name);
@@ -800,6 +815,7 @@ fn prepare(
     acc.push(Some({ kind: KInt, ty: TyOpen([]) })));
   let known = kinds.fold(true, |acc: Bool, k: Option<{ kind: Kind, ty: Ty }>| acc && k != None);
   let full = qualify(module, def.name.name);
+  let filed = filed_of(full);
   {
     full: full,
     base: def.span.start,
@@ -813,11 +829,12 @@ fn prepare(
     ),
     known: known,
     code: if known && wants(wanted, full) {
-      match lower_fn(names, labels, sites, def.body, of_binder(module)) {
+      match lower_fn(names, labels, labels_of(filed), def.body, of_binder(module)) {
         Some(l) -> Some(l.code),
         None -> None,
       }
     } else { None },
+    filed: filed,
   }
 }
 
@@ -826,7 +843,7 @@ fn prepare(
 fn tail_cycle(
   module: Bytes,
   here: List<Def>,
-  sites: Map<Bytes, List<Bytes>>,
+  filed_of: (Bytes) -> Result<Filings, Bytes> / {abort.raise},
   items: List<Item>,
   def: FnDef,
 ) -> List<Bytes> / {abort.raise} = {
@@ -838,7 +855,7 @@ fn tail_cycle(
       Some(d) -> match lower_fn(
           d.params.map(|param: Param| param.name.name),
           d.generics.labels.map(|ident: Ident| ident.name),
-          sites,
+          labels_of(filed_of(qualify(module, name))),
           d.body,
           of_binder(module),
         ) {
@@ -937,7 +954,7 @@ fn clause_roots(
   s: Setting,
   sig: Option<Sig>,
   wanted: Option<Map<Bytes, Bool>>,
-  sites: Map<Bytes, List<Bytes>>,
+  filed: Result<Filings, Bytes>,
 ) -> Walk / {abort.raise} = {
   let known = kinds.fold(true, |acc2: Bool, k: Option<{ kind: Kind, ty: Ty }>| acc2 && k != None);
   let types = param_types(def, sig);
@@ -959,7 +976,7 @@ fn clause_roots(
                   names,
                   params_carried(names, kinds, [], types),
                   known,
-                  sites,
+                  filed,
                   c.expr,
                 ),
               )
@@ -985,7 +1002,7 @@ fn clause_roots(
                     rnames,
                     params_carried(rnames, rkinds, [], rtypes),
                     known,
-                    sites,
+                    filed,
                     c.expr,
                   ),
                 )

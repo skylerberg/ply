@@ -1,28 +1,34 @@
 //! Handler variables, rewritten into the state a handler threads.
 
 import std.list
-import syntax.parsing (Span, Ident, QName, bare, dummy_span, read_site)
+import syntax.parsing (Span, Ident, QName, bare, minted, made_at, role_hold_acquire_let,
+                       role_hold_acquire_binder, role_hold_acquire, role_hold_release_let,
+                       role_hold_release_binder, role_hold_release, role_hold_release_param,
+                       role_hold_release_call, role_hold_release_held, role_hold_bracket,
+                       role_hold_bracket_callee, role_hold_open, role_hold_new,
+                       role_hold_new_callee, role_hold_acquired, role_hold_acquire_read,
+                       role_hold_close, role_hold_close_param, role_hold_close_call,
+                       role_hold_release_read, role_hold_take, role_hold_take_callee,
+                       role_hold_take_held, role_hold_body, role_hold_body_param, role_vars_block,
+                       role_vars_body, role_var_let, role_var_binder, role_var_init,
+                       role_var_init_callee, role_var_init_index, role_var_first_read,
+                       role_var_callee, role_var_index, role_snapshot_block, role_snapshot_let,
+                       role_snapshot_binder)
 import syntax.items (Module, Item)
 import check.resolve.sets (pattern_binders)
 import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
                      ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
                      EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign, HandlerVar,
                      Param, NamedArg, MatchArm, HandleClause, RecField, expr_span, ETagged, Hole)
-import syntax.patterns (PVar, LInt)
+import syntax.patterns (LInt)
 import std.bytes (ascii_of_int)
-import expand.rewrite.shared (map_item, any_expr)
-import expand.rewrite.try_operator (var_of, var_pattern)
+import expand.rewrite.shared (map_item, any_expr, read_at, bound_at)
 
 // --- Witnesses -----------------------------------------------------------------------------
 
-pub fn hidden_call(span: Span, name: Bytes, args: List<Expr>) -> Expr =
-  EApp({
-    span: span,
-    func: EVar({ span: span, name: bare({ name: name, span: span }) }),
-    named: [],
-    args: args,
-    labels: [],
-  })
+/// The call at `span` of `name`, which no source can spell, its callee written at `callee`.
+pub fn hidden_call(span: Span, callee: Span, name: Bytes, args: List<Expr>) -> Expr =
+  EApp({ span: span, func: read_at(name, callee), named: [], args: args, labels: [] })
 
 // --- The hold --------------------------------------------------------------------------------
 
@@ -33,7 +39,7 @@ pub fn hidden_call(span: Span, name: Bytes, args: List<Expr>) -> Expr =
 
 fn unwritten_param(name: Bytes, span: Span) -> Param =
   {
-    name: { name: name, span: span },
+    name: { name: name, span: { ..span, site: 0 } },
     keep: false,
     ty: None,
     cost: None,
@@ -42,54 +48,69 @@ fn unwritten_param(name: Bytes, span: Span) -> Param =
     span: span,
   }
 
-fn applied_to(func: Expr, arg: Expr, span: Span) -> Expr =
-  EApp({ span: span, func: func, named: [], args: [arg], labels: [] })
-
 fn expanded_hold(expr: Expr) -> Expr =
   match expr {
     EWithHold(h) -> {
-      let held = { name: b"?held", span: h.span };
-      let acquire = { name: b"?acquire", span: h.span };
-      let release = { name: b"?release", span: h.span };
-      let thunk = |body: Expr| ELambda({ span: h.span, body: body, params: [], ret: None });
-      let over_held = |body: Expr|
-        ELambda({
-          span: h.span,
-          body: body,
-          params: [unwritten_param(held.name, h.span)],
-          ret: None,
-        });
-      let bound = |name: Ident, value: Expr|
-        SLet({ span: h.span, pat: var_pattern(name), ty: None, value: value });
-      let acquired = EApp({ span: h.span, func: var_of(acquire), named: [], args: [], labels: [] });
-      // The hold is a word of no type the checker filed, so its call sits at no place in the source.
-      let made = EApp({
-        span: dummy_span(),
-        func: EVar({ span: dummy_span(), name: bare({ name: b"?hold_new", span: dummy_span() }) }),
-        named: [],
-        args: [acquired],
-        labels: [],
-      });
-      let region = hidden_call(h.span, b"?hold_bracket", [
-        thunk(made),
-        over_held(
-          applied_to(var_of(release), hidden_call(h.span, b"?hold_take", [var_of(held)]), h.span),
-        ),
-        ELambda({
-          span: h.span,
-          body: h.body,
-          params: [unwritten_param(h.binder.name, h.binder.span)],
-          ret: None,
-        }),
+      let at = |role: Int| minted(h.span, role);
+      let lambda = |role: Int, params: List<Param>, body: Expr|
+        ELambda({ span: at(role), body: body, params: params, ret: None });
+      let call = |role: Int, func: Expr, args: List<Expr>|
+        EApp({ span: at(role), func: func, named: [], args: args, labels: [] });
+      let bound = |role: Int, binder: Int, name: Bytes, value: Expr|
+        SLet({ span: at(role), pat: bound_at(name, at(binder)), ty: None, value: value });
+      let made = call(role_hold_new(), read_at(b"?hold_new", at(role_hold_new_callee())), [
+        call(role_hold_acquired(), read_at(b"?acquire", at(role_hold_acquire_read())), []),
       ]);
+      let region = call(
+        role_hold_bracket(),
+        read_at(b"?hold_bracket", at(role_hold_bracket_callee())),
+        [
+          lambda(role_hold_open(), [], made),
+          lambda(
+            role_hold_close(),
+            [unwritten_param(b"?held", at(role_hold_close_param()))],
+            call(role_hold_close_call(), read_at(b"?release", at(role_hold_release_read())), [
+              call(role_hold_take(), read_at(b"?hold_take", at(role_hold_take_callee())), [
+                read_at(b"?held", at(role_hold_take_held())),
+              ]),
+            ]),
+          ),
+          lambda(
+            role_hold_body(),
+            [
+              unwritten_param(
+                h.binder.name,
+                made_at(h.binder.span, h.span, role_hold_body_param()),
+              ),
+            ],
+            h.body,
+          ),
+        ],
+      );
       // `acquire` and `release` are written outside the hold's binder, so they are bound outside
       // it: a name either shares with the binder is the one around the region.
       EBlock({
         span: h.span,
         tail: Some(region),
         stmts: [
-          bound(acquire, thunk(h.acquire)),
-          bound(release, over_held(applied_to(h.release, var_of(held), h.span))),
+          bound(
+            role_hold_acquire_let(),
+            role_hold_acquire_binder(),
+            b"?acquire",
+            lambda(role_hold_acquire(), [], h.acquire),
+          ),
+          bound(
+            role_hold_release_let(),
+            role_hold_release_binder(),
+            b"?release",
+            lambda(
+              role_hold_release(),
+              [unwritten_param(b"?held", at(role_hold_release_param()))],
+              call(role_hold_release_call(), h.release, [
+                read_at(b"?held", at(role_hold_release_held())),
+              ]),
+            ),
+          ),
         ],
       })
     },
@@ -113,46 +134,54 @@ pub fn expand_handler_vars(module: Module) -> Module =
 fn has_vars(expr: Expr) -> Bool = match expr { EHandle(h) -> h.vars.len() > 0, _ -> false }
 
 /// The variables a clause reads through the runtime: each by name, its place among its handler's,
-/// and its declared name's place in the source, where the checker filed its type.
+/// and where it is declared, where the checker filed its type.
 type Held = { vars: List<{ name: Bytes, at: Int, decl: Span }>, tag: Bytes }
 
 fn expanded_vars(expr: Expr) -> Expr =
   match expr {
     EHandle(h) -> if h.vars.len() == 0 { expr } else {
-      // Derived code gives all its nodes one place, told apart by `gen`.
-      let tag = Bytes::concat_all([ascii_of_int(h.span.start), b"g", ascii_of_int(h.span.gen)]);
+      let tag = ascii_of_int(h.span.site);
       let vs = h.vars.fold([], |acc: List<{ index: Int, value: HandlerVar }>, v: HandlerVar|
         acc.push({ index: acc.len(), value: v }));
       let first = |x: { index: Int, value: HandlerVar }|
-        { name: Bytes::concat_all([b"?hv", tag, b"_", ascii_of_int(x.index)]), span: x.value.span };
+        Bytes::concat_all([b"?hv", tag, b"_", ascii_of_int(x.index)]);
       let held = {
         vars: vs.map(|x: { index: Int, value: HandlerVar }|
-          { name: x.value.name.name, at: x.index, decl: x.value.name.span }),
+          { name: x.value.name.name, at: x.index, decl: x.value.span }),
         tag: tag,
       };
       // Each initializer reads the variables above it from where their first values are bound.
       let made = vs.map(|x: { index: Int, value: HandlerVar }|
         SLet({
-          span: x.value.span,
-          pat: var_pattern(first(x)),
+          span: minted(x.value.span, role_var_let()),
+          pat: bound_at(first(x), minted(x.value.span, role_var_binder())),
           ty: None,
           value: vs.take(x.index).fold(
             x.value.init,
             |e: Expr, above: { index: Int, value: HandlerVar }|
-              renamed_free(e, above.value.name.name, first(above).name).e,
+              renamed_free(e, above.value.name.name, first(above)).e,
           ),
         }));
       let installed = vs.map(|x: { index: Int, value: HandlerVar }| {
-        let at = x.value.span;
-        SExpr(hidden_call(at, b"?handler_init", [int_lit(x.index), var_of(first(x))]))
+        let at = |role: Int| minted(x.value.span, role);
+        SExpr(
+          hidden_call(at(role_var_init()), at(role_var_init_callee()), b"?handler_init", [
+            ELit({ span: at(role_var_init_index()), lit: LInt(x.index) }),
+            read_at(first(x), at(role_var_first_read())),
+          ]),
+        )
       });
       EBlock({
-        span: h.span,
+        span: minted(h.span, role_vars_block()),
         stmts: made,
         tail: Some(
           EHandle({
             ..h,
-            body: EBlock({ span: expr_span(h.body), tail: Some(h.body), stmts: installed }),
+            body: EBlock({
+              span: made_at(expr_span(h.body), h.span, role_vars_body()),
+              tail: Some(h.body),
+              stmts: installed,
+            }),
             clauses: h.clauses.map(|c: HandleClause|
               { ..c, body: in_clause(hidden_by(held, clause_binders(c)), c.body) }),
             ret: match h.ret {
@@ -168,9 +197,14 @@ fn expanded_vars(expr: Expr) -> Expr =
     _ -> expr,
   }
 
-/// A variable's place, at no place in the source: the node it shares a call's span with would
-/// otherwise make that span's type unknown.
-fn int_lit(i: Int) -> Expr = ELit({ span: dummy_span(), lit: LInt(i) })
+/// The runtime's call at `at` that handles the variable at place `i`, on `args` after the place.
+fn var_call(at: Span, name: Bytes, i: Int, args: List<Expr>) -> Expr =
+  hidden_call(
+    at,
+    minted(at, role_var_callee()),
+    name,
+    [ELit({ span: minted(at, role_var_index()), lit: LInt(i) })].concat(args),
+  )
 
 fn clause_binders(c: HandleClause) -> List<Bytes> = {
   let named = c.params.map(|p: Ident| p.name);
@@ -197,16 +231,9 @@ fn held_named(
     )
   }
 
-/// The read of variable `at` written at `span`, typed at its own site: its callee has none, so
-/// neither takes the type the checker filed for the read.
-fn read_of(span: Span, at: Int) -> Expr =
-  EApp({
-    span: read_site(span),
-    func: EVar({ span: dummy_span(), name: bare({ name: b"?handler_var", span: dummy_span() }) }),
-    named: [],
-    args: [int_lit(at)],
-    labels: [],
-  })
+/// The read of variable `at` at `span`, the site of the read it stands for or of the variable's
+/// declaration, where the checker filed the variable's type.
+fn read_of(span: Span, at: Int) -> Expr = var_call(span, b"?handler_var", at, [])
 
 fn snap_name(held: Held, at: Int) -> Bytes =
   Bytes::concat_all([b"?hs", held.tag, b"_", ascii_of_int(at)])
@@ -217,8 +244,7 @@ fn in_clause(held: Held, e: Expr) -> Expr =
   if held.vars.len() == 0 { e } else {
     let go = |x: Expr| in_clause(held, x);
     match e {
-      // At the name's span, where the checker filed the read, which a parenthesised one is not.
-      EVar(v) -> match held_named(held, v) { Some(x) -> read_of(v.name.span, x.at), None -> e },
+      EVar(v) -> match held_named(held, v) { Some(x) -> read_of(v.span, x.at), None -> e },
       ELambda(_) -> snapshot(held, e),
       EHandle(_) -> snapshot(held, e),
       ESimulate(_) -> snapshot(held, e),
@@ -254,10 +280,7 @@ fn in_clause(held: Held, e: Expr) -> Expr =
                     ..acc,
                     stmts: acc.stmts.push(
                       SExpr(
-                        hidden_call(a.span, b"?handler_set", [
-                          int_lit(x.at),
-                          in_clause(acc.held, a.value),
-                        ]),
+                        var_call(a.span, b"?handler_set", x.at, [in_clause(acc.held, a.value)]),
                       ),
                     ),
                   },
@@ -333,12 +356,13 @@ fn snapshot(held: Held, e: Expr) -> Expr = {
     },
   );
   if taken.used.len() == 0 { e } else {
+    let from = expr_span(e);
     EBlock({
-      span: expr_span(e),
+      span: minted(from, role_snapshot_block()),
       stmts: taken.used.map(|x: { name: Bytes, at: Int, decl: Span }|
         SLet({
-          span: x.decl,
-          pat: PVar({ span: x.decl, name: { name: snap_name(held, x.at), span: x.decl } }),
+          span: made_at(x.decl, from, role_snapshot_let(x.at)),
+          pat: bound_at(snap_name(held, x.at), made_at(x.decl, from, role_snapshot_binder(x.at))),
           ty: None,
           value: read_of(x.decl, x.at),
         })),

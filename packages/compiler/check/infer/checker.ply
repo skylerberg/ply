@@ -259,15 +259,16 @@ pub type RepeatedRow = { params: List<Int>, tail: Bool, over: Option<Span>, mayb
 pub type OwnCall = { callee: Bytes, span: Span }
 
 /// A use of a function of a type, or a call on a value, which the rewrite writes as later passes
-/// read it. A call on a value, `base.name(args)`, at `span` calls `qualifier::name` with the value
+/// read it. A call on a value, `base.name(args)`, at `site` calls `qualifier::name` with the value
 /// first, or the bare `name` where `qualifier` is empty; with no `name` either it calls the
-/// function the value holds in the field written. A name written `T::name` at `span` is
+/// function the value holds in the field written. A name written `T::name` at `site` is
 /// `qualifier::name`. `callee` is the function's qualified name, empty for a field's, and
 /// `reaches` the modules the defaults the call copies name. `named` is the place among the
 /// callee's parameters, the value's first, of each argument the call names, in the order written.
+/// Each site in this module and below is a node's of the item `owner` names.
 pub type MemberSite = {
   module: Int,
-  span: Span,
+  site: Int,
   qualifier: Bytes,
   name: Bytes,
   callee: Bytes,
@@ -291,13 +292,13 @@ pub type BitOp = { span: Span, what: Bytes, ty: Type, builtin: Bool }
 type Witnessed = { param: Bytes, integer: Bool }
 
 /// An operator over a witnessed parameter, which the elaboration rewrites to read the witness.
-pub type WitnessOp = { module: Int, span: Span, param: Bytes, owner: Bytes }
+pub type WitnessOp = { module: Int, site: Int, param: Bytes, owner: Bytes }
 
 /// `params` are the callee's type parameters the witnesses are for, so one constrained twice is
-/// passed once.
+/// passed once. `site` is the callee's.
 pub type WitnessRef = {
   module: Int,
-  span: Span,
+  site: Int,
   witnesses: List<NumericWitness>,
   params: List<Int>,
   owner: Bytes,
@@ -333,10 +334,10 @@ pub type UpdateSite = {
 }
 
 /// What the lowering needs: the field list of the record an update copies, in the record's own order.
-pub type UpdateShape = { module: Int, span: Span, names: List<Bytes>, owner: Bytes }
+pub type UpdateShape = { module: Int, site: Int, names: List<Bytes>, owner: Bytes }
 
 /// The raise a `try` answers, by its effect's program-wide name, and how many values it carries.
-pub type TrySite = { module: Int, span: Span, effect: Bytes, op: Bytes, arity: Int, owner: Bytes }
+pub type TrySite = { module: Int, site: Int, effect: Bytes, op: Bytes, arity: Int, owner: Bytes }
 
 pub type Signature = {
   ty_params: Map<Bytes, Type>,
@@ -370,7 +371,7 @@ pub type LabelApplication = {
 }
 
 /// What the emitter needs: the labels a call fills, in declaration order.
-pub type LabelSite = { module: Int, span: Span, labels: List<Bytes>, owner: Bytes }
+pub type LabelSite = { module: Int, site: Int, labels: List<Bytes>, owner: Bytes }
 
 /// The type an operator reads its operands at, from which a witness's operation is read.
 pub type OperandAt = { module: Int, span: Span, ty: Type, owner: Bytes }
@@ -384,7 +385,7 @@ pub type TypedAt = { module: Int, span: Span, ty: Type, args: List<Type>, owner:
 /// canonical form numbers it and every other variable `-1`, and no function type carrying a row.
 /// `ty` and `args` are keys of a `TypeTable` beside the sites: a body names a few types at many
 /// places, and one record type can be large.
-pub type TypedSite = { module: Int, span: Span, ty: Bytes, args: List<Bytes>, owner: Bytes }
+pub type TypedSite = { module: Int, site: Int, ty: Bytes, args: List<Bytes>, owner: Bytes }
 
 pub type Assumed = { deriver: Deriver, vars: List<Int> }
 
@@ -510,17 +511,26 @@ pub fn test_owner(module: Bytes, label: Bytes) -> Bytes / {abort.raise} =
   by_label(module, b"test", label)
 
 /// Whether `name` is one `test_owner` makes.
-pub fn is_test_owner(name: Bytes) -> Bool =
+pub fn is_test_owner(name: Bytes) -> Bool = by_label_of(name, b"test")
+
+/// Whether `name` is one `law_owner` makes.
+pub fn is_law_owner(name: Bytes) -> Bool = by_label_of(name, b"law")
+
+fn by_label_of(name: Bytes, kind: Bytes) -> Bool =
   match name.split(b"#") {
     [named, digest] ->
-      (named == b"test" || named.ends_with(b".test")) && digest.len() == 16
+      (named == kind || named.ends_with(b".".concat(kind))) && digest.len() == 16
         && digest.position(0, |c: Int| bytes::hex_value(c) < 0) == None,
     _ -> false,
   }
 
-/// The root of `part` (`guard` or `body`) of the law labelled `label`, named as a test's is.
+/// The name the sites of the law labelled `label` go by, which its roots read, named as a test's is.
+pub fn law_owner(module: Bytes, label: Bytes) -> Bytes / {abort.raise} =
+  by_label(module, b"law", label)
+
+/// The root of `part` (`guard` or `body`) of the law labelled `label`.
 pub fn law_root(module: Bytes, label: Bytes, part: Bytes) -> Bytes / {abort.raise} =
-  Bytes::concat_all([by_label(module, b"law", label), b".", part])
+  Bytes::concat_all([law_owner(module, label), b".", part])
 
 fn by_label(module: Bytes, kind: Bytes, label: Bytes) -> Bytes / {abort.raise} =
   qualify(
@@ -654,9 +664,12 @@ pub type Checker = {
   update_shapes: List<UpdateShape>,
   try_sites: List<TrySite>,
   member_sites: List<MemberSite>,
+  /// Each call on a value the walks wrote out as a call of a function, where it is written.
+  member_calls: List<OwnCall>,
   /// The defaults calls on values copied, each beside its parameter's type, not yet typed.
   copied_defaults: List<{ expr: Expr, ty: Type }>,
-  /// The builtin each call on a value of a language type calls, by the call's span.
+  /// The builtin each call on a value of a language type calls, by the body walking it and the
+  /// call's site.
   builtins_on: Map<Bytes, Bytes>,
   simulate_depth: Int,
   /// The scopes open around the innermost `simulate` body, and the locals of those it names.
@@ -877,8 +890,9 @@ pub type ModuleFns = {
   names: List<Bytes>,
   members: List<GroupDef>,
   bodies: List<Body>,
-  /// What each call on a value in the module calls, by the call's span.
-  written: Map<Bytes, MemberCallee>,
+  /// What each call on a value in each body of the module calls, by the body's owner and the call's
+  /// site.
+  written: Map<Bytes, Map<Int, MemberCallee>>,
 }
 
 /// The sites of a body an operator, a comparison, a `Map` or a constraint is read at.

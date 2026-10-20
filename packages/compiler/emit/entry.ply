@@ -7,7 +7,7 @@ import check.resolve.scopes (of_binder)
 import check.resolve.tables (qualify)
 import check.types (Type, TyFn)
 import emit.code (Code, NLit, lower_fn)
-import emit.typing (unknown_type)
+import emit.typing (Filings, no_filings, unknown_type)
 import emit.c (Kind, sorted_names)
 import emit.roots (symbol_of, entry_of, own_definition, specialisation_of)
 import emit.answer (Tables, no_tables, Emitted, Head, Defined)
@@ -17,14 +17,15 @@ import emit.pieces (spelled)
 import emit.tir
 import emit.tir (Fn, Declined, family_name)
 import emit.lower (root_lowered, group_lowered)
-import emit.lower.setting (Setting, Root, param_type)
+import emit.lower.setting (Setting, Root, param_type, labels_of)
 import emit.own (owned)
 import emit.verify (verified)
 import emit.print (printed_fn)
 import emit.print.text (Printed)
 import emit.print.made (head_types)
 
-/// A definition lowered once, for grouping and for emission; `code` is `None` when it is not wanted or does not lower.
+/// A definition lowered once, for grouping and for emission; `code` is `None` when it is not wanted
+/// or does not lower, and `filed` is what the checker filed of its nodes.
 pub type Prepared = {
   full: Bytes,
   base: Int,
@@ -33,6 +34,7 @@ pub type Prepared = {
   ps: List<EmitParam>,
   known: Bool,
   code: Option<Code>,
+  filed: Result<Filings, Bytes>,
 }
 
 /// A group's one body under its first member's name, or, when a member does not lower to `Code`,
@@ -40,21 +42,28 @@ pub type Prepared = {
 pub fn group_emitted(s: Setting, members: List<Prepared>) -> List<Emitted> / {abort.raise} = {
   let roots = members.fold([], |acc: List<{ root: Root, code: Code }>, p: Prepared|
     match p.code {
-      Some(c) -> acc.push({ root: root_at(s, p.full, p.base, p.ps), code: c }),
+      Some(c) -> acc.push({ root: root_at(s, p.full, p.base, p.ps, p.filed), code: c }),
       None -> acc,
     });
   if roots.len() != members.len() {
-    members.map(|p: Prepared| emitted_from(s, p.base, p.full, p.ps, p.known, p.code))
+    members.map(|p: Prepared| emitted_from(s, p.base, p.full, p.ps, p.known, p.code, p.filed))
   } else {
     let first = match members.at(0) { Some(p) -> p.full, None -> b"" };
     [form_emitted(first, group_lowered(s, roots))]
   }
 }
 
-/// Root `full` of the setting's module, whose text starts at `base` and whose parameters are `ps`, as
-/// the typed form lowers it: each parameter of the type its scheme gives it, its answer carried as
-/// its definition's is and of the type its scheme answers.
-fn root_at(s: Setting, full: Bytes, base: Int, ps: List<EmitParam>) -> Root / {abort.raise} =
+/// Root `full` of the setting's module, whose text starts at `base`, whose parameters are `ps` and
+/// whose item's nodes the checker filed `filed` of, as the typed form lowers it: each parameter of
+/// the type its scheme gives it, its answer carried as its definition's is and of the type its
+/// scheme answers.
+fn root_at(
+  s: Setting,
+  full: Bytes,
+  base: Int,
+  ps: List<EmitParam>,
+  filed: Result<Filings, Bytes>,
+) -> Root / {abort.raise} =
   {
     full: full,
     base: base,
@@ -63,6 +72,7 @@ fn root_at(s: Setting, full: Bytes, base: Int, ps: List<EmitParam>) -> Root / {a
     answer: carried_answer(s.module, s.here, full),
     answer_ty: answer_type(s.module, s.here, full),
     code: None,
+    filed: filed,
   }
 
 /// What the root `full` of `module` answers: what its definition's scheme answers, at the root's
@@ -138,7 +148,8 @@ fn form_tables(f: Fn, pr: Printed) -> Tables / {abort.raise} = {
   }
 }
 
-/// One root's emission, definition, test or proposition alike, from its source `body`.
+/// One root's emission, definition, test or proposition alike, from its source `body`, a body of
+/// the item whose nodes the checker filed `filed` of.
 pub fn root_emitted(
   s: Setting,
   base: Int,
@@ -146,15 +157,23 @@ pub fn root_emitted(
   names: List<Bytes>,
   ps: List<EmitParam>,
   known: Bool,
-  sites: Map<Bytes, List<Bytes>>,
+  filed: Result<Filings, Bytes>,
   body: Expr,
 ) -> Emitted / {abort.raise} =
-  emitted_from(s, base, full, ps, known, if known {
-    match lower_fn(names, [], sites, body, of_binder(s.module)) {
-      Some(l) -> Some(l.code),
-      None -> None,
-    }
-  } else { None })
+  emitted_from(
+    s,
+    base,
+    full,
+    ps,
+    known,
+    if known {
+      match lower_fn(names, [], labels_of(filed), body, of_binder(s.module)) {
+        Some(l) -> Some(l.code),
+        None -> None,
+      }
+    } else { None },
+    filed,
+  )
 
 /// One root's emission as the typed form lowers it from `code`; refused where its body does not
 /// lower to `Code`, which `known` says is for a parameter of no written type.
@@ -165,6 +184,7 @@ pub fn emitted_from(
   ps: List<EmitParam>,
   known: Bool,
   code: Option<Code>,
+  filed: Result<Filings, Bytes>,
 ) -> Emitted / {abort.raise} =
   match code {
     None ->
@@ -175,7 +195,7 @@ pub fn emitted_from(
         why: Some(if known { b"a body the lowering does not reach" }
         else { b"a parameter with no written type" }),
       },
-    Some(c) -> form_emitted(full, root_lowered(s, root_at(s, full, base, ps), c)),
+    Some(c) -> form_emitted(full, root_lowered(s, root_at(s, full, base, ps, filed), c)),
   }
 
 fn bare_setting() -> Setting =
@@ -188,13 +208,20 @@ fn bare_setting() -> Setting =
     declared: Map::new(),
     effects: [],
     release: false,
-    typed: Map::new(),
   }
 
 fn literal_code(l: Lit) -> Code = { span: dummy_span(), node: NLit(l) }
 
 test "a body that answers a literal is printed whole: its head, its fuel test, its body and its entry" {
-  let e = emitted_from(bare_setting(), 0, b"m.f", [], true, Some(literal_code(LInt(7))));
+  let e = emitted_from(
+    bare_setting(),
+    0,
+    b"m.f",
+    [],
+    true,
+    Some(literal_code(LInt(7))),
+    Ok(no_filings()),
+  );
   let f = symbol_of(b"m.f");
   assert_eq(e.why, None);
   assert(e.text.index_of(Bytes::concat_all([b"Word ", f, b"(PlyCtx *ctx) {"])) != None);
@@ -209,7 +236,7 @@ test "a body that answers a literal is printed whole: its head, its fuel test, i
 
 test "a root the typed form declines is an internal error naming the root and why" {
   let said = handle {
-    emitted_from(bare_setting(), 0, b"m.f", [], true, Some(literal_code(LBad)));
+    emitted_from(bare_setting(), 0, b"m.f", [], true, Some(literal_code(LBad)), Ok(no_filings()));
     b""
   } with {
     abort.raise(m) -> Bytes::of_string(m),
