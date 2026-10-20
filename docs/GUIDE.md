@@ -1655,6 +1655,41 @@ from a lambda, a region or an arm's guard leaves nothing to prove. A measure is
 pure, as a clause is (`E0417`), and part of the definition's hash, since it
 decides what the definition is read to do.
 
+### 5.11 Holes
+
+```ply
+pub fn reward_of(r: Rewards, p: Player) -> Float = ..
+
+pub fn search(g: Game, s: State) -> Move =
+  if over(s) { last(g) } else { ??? }
+```
+
+`???`, or `..` where a definition's body is not written yet, is a *hole*: the
+declaration's text is all there, and the value is not. A hole checks as any
+type and performs nothing — so one never widens a written row, and a signature
+that promises purity keeps it — and the program checks, builds and runs. Each
+hole is a warning, never an error (`W0613`), which reports:
+
+* the type the hole must answer, solved as far as the body settles it, or that
+  nothing constrains it;
+* the row it may perform: the written row of the definition it stands in, with
+  what the rest of the body already performs, or that no row is written and
+  what the filling performs is inferred;
+* the names in scope whose type unifies with the hole's — its locals first,
+  then the definitions the check knows, at most eight of them;
+* that a run reaching the hole raises `abort.raise`.
+
+A run that reaches a hole raises (`E0502`, `panic: unfilled hole`, naming the
+spot), so `ply test` fails each test that reaches one and passes each that
+does not, and a handler may answer the raise as any other (§6.8). A hole is a
+value of one spelling: `..` and `???` are the same node, print as written, and
+hash alike, so flipping between them moves no hash. `??` and `???` are not the
+same token: `x??` is a `try` of a `try` (§5.8), and maximal munch makes `x???`
+an `x` followed by a hole, which is an error after an expression. A skeleton
+of signatures with `..` bodies is a design the checker can judge: `ply check`
+lists every hole with what it must be and may do, none hidden past a cap on
+errors, which warnings do not share.
+
 ## 6. Effects and handlers
 
 ### 6.1 Declaring an effect
@@ -3866,6 +3901,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `W0609` | spans still open when their task or the entry point ended |
 | `W0611` | definition no `pub` item, `main`, test or law reaches; a leading `_` in its name keeps it quiet |
 | `W0612` | run abandoned at its wall clock; nothing recorded |
+| `W0613` | unfilled hole: `???` or `..`; the report names the type, the row and the candidates |
 
 ## 18. What Ply does not have
 

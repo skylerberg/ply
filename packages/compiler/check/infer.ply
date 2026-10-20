@@ -49,6 +49,7 @@ import check.infer.derivable (with_orders, check_map_keys, check_constraints)
 import check.infer.solved (check_derives, collect_stated, check_instances, attribute_generated,
                            check_comparisons, check_parallels, check_simulations, check_regions,
                            fresh_cx)
+import check.infer.holes (hole_reports)
 
 // --- `check_program` --------------------------------------------------------------------------------------
 
@@ -72,6 +73,8 @@ pub fn check_diagnostics(
 pub type CheckOutput = {
   ok: Bool,
   diags: List<Diag>,
+  /// The hole reports: warnings on a check that passes, which `diags` holds only on a refusal.
+  holes: List<Diag>,
   defs: List<DefInfo>,
   tests: List<TestInfo>,
   laws: List<LawInfo>,
@@ -101,6 +104,7 @@ pub fn check_front_with(
     checked: {
       ok: !failed,
       diags: if failed { dedup_diags(out.checker.diags) } else { [] },
+      holes: out.checker.diags.filter(|d: Diag| d.code == b"W0613"),
       defs: out.checker.defs.map(canonical_def),
       tests: out.checker.tests,
       laws: out.checker.laws,
@@ -753,7 +757,9 @@ pub fn check_program_with(
       }),
     ),
   );
-  { checker: solved, ok: !has_error(solved.diags) }
+  // The holes are reported last, when every substitution that settles one's type is made.
+  let holed: Checker = hole_reports(solved);
+  { checker: holed, ok: !has_error(holed.diags) }
 }
 
 // --- The dump -----------------------------------------------------------------------------------------------
@@ -6509,4 +6515,66 @@ test "a named argument is held as the parameter it names takes it, and a constru
   assert_eq(check_codes(b"fn f(g: (Int) -> Int) -> Option<(Int) -> Int> = Some(value: g)"), [
     b"E0123",
   ])
+}
+
+// --- Holes ------------------------------------------------------------------
+
+/// The `W0613`s a one-module program reports; a hole is a warning, not an error.
+fn hole_diags(src: Bytes) -> List<Diag> / {abort.raise} =
+  check_diags(src).filter(|d: Diag| d.code == b"W0613")
+
+test "a hole checks as the expected type and performs nothing, so a pure signature keeps its row" {
+  assert_eq(check_codes(b"pub fn f(x: Int) -> Int = ???"), [b"W0613"]);
+  assert_eq(check_codes(b"pub fn f(x: Int) -> Int = .."), [b"W0613"]);
+  let c = checker_m(b"pub fn f(x: Int) -> Int = ???");
+  assert_eq(defined(c, b"m.f"), { scheme: b"(Int) -> Int", footprint: b"", performed: b"" });
+  // A hole in a row the signature closes adds nothing to it, where `panic` would be E0302.
+  assert_eq(check_codes(b"pub fn f() -> Int / {} = ???"), [b"W0613"]);
+  assert_eq(check_codes(b"pub fn f() -> Int / {} = panic(\"todo\")"), [b"E0302"])
+}
+
+test "a hole reports its expected type, its row and the in-scope names of that type" {
+  let ds = hole_diags(b"fn base(x: Int) -> Int = x\npub fn f(x: Int) -> Int = { let y = x; ??? }");
+  assert_eq(ds.len(), 1);
+  let d = ds.get(0);
+  assert_eq(d.severity, b"warning");
+  assert_eq(d.labels.len(), 1);
+  assert_eq(d.labels.get(0).text, b"expected `Int`");
+  assert_eq(d.notes_text, [
+    b"no row is written where the hole stands; what the filling performs is inferred",
+    b"in scope of that type: `x: Int`, `y: Int`",
+    b"a run that reaches the hole raises `abort.raise`",
+  ])
+}
+
+test "a hole under a written row reports what it may perform" {
+  let src = b"effect net { write send(Bytes) -> Unit }\npub fn f(b: Bytes) -> Unit / { net.send, abort.raise } = { net.send(b); ??? }\n";
+  let ds = hole_diags(src);
+  assert_eq(ds.len(), 1);
+  assert_eq(
+    ds.get(0).notes_text.at(0),
+    Some(
+      b"the hole may perform `abort.raise`, `m.net.send`; the rest of the body already performs `m.net.send`",
+    ),
+  );
+  assert_eq(
+    hole_diags(b"pub fn f() -> Int / {} = ???").get(0).notes_text.at(0),
+    Some(b"the row written where the hole stands is empty: it may perform nothing"),
+  )
+}
+
+test "a hole nothing constrains says so, and names no candidates" {
+  let ds = hole_diags(b"pub fn f() -> Int = { let x = ???; 1 }");
+  assert_eq(ds.len(), 1);
+  let d = ds.get(0);
+  assert_eq(d.labels.get(0).text, b"its type is unconstrained here");
+  assert_eq(d.notes_text, [
+    b"no row is written where the hole stands; what the filling performs is inferred",
+    b"a run that reaches the hole raises `abort.raise`",
+  ])
+}
+
+test "a hole in a test or a law is reported as one" {
+  assert_eq(hole_diags(b"test \"t\" { assert_eq(???, 1) }").len(), 1);
+  assert_eq(hole_diags(b"law \"l\" forall (n: Int) { ??? }").len(), 1)
 }
