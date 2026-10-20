@@ -198,14 +198,19 @@ unsafe extern "C" fn closure_release(ctx: *mut Ctx, block: Handed) -> Word {
     0
 }
 
+/// The closures here cross to no other thread and outlive no entry.
+unsafe extern "C" fn stays_in_its_entry(_ctx: *mut Ctx, _block: Word) -> Word {
+    0
+}
+
 const fn desc(uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word) -> PlyFnDesc {
     PlyFnDesc {
         uniform,
-        typed: std::ptr::null(),
+        typed: None,
         convention: 0,
         release: closure_release,
-        share: std::ptr::null(),
-        keep: std::ptr::null(),
+        share: stays_in_its_entry,
+        keep: stays_in_its_entry,
     }
 }
 

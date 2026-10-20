@@ -218,8 +218,9 @@ fn natives() -> impl Iterator<Item = (&'static str, ply_compiled::native::Signat
 
 /// The runtime a unit is compiled against, as [`runtime`] answers it, written as JSON: what a build
 /// of a program for this runtime by another `ply` reads it from. Past what [`runtime`] answers,
-/// each native's machine kinds, the offsets of the context's fields compiled code reads, the
-/// descriptors emitted code lays out, and how deeply drop roots nest before a release is put off.
+/// each native's machine kinds, the context's fields compiled code reads and the structs emitted
+/// code lays out (each field in order with its offset and bytes), and how deeply drop roots nest
+/// before a release is put off.
 pub fn runtime_json() -> String {
     use ply_compiled::c;
     serde_json::json!({
@@ -242,32 +243,26 @@ pub fn runtime_json() -> String {
         // The natives' names alone, which a `ply` that reads no `natives` emits a builder against.
         "builtins": natives().map(|(name, _)| name).collect::<Vec<_>>(),
         "layouts": layouts_json(),
-        "ctx": offsets(ply_compiled::laid::ctx_fields()),
-        "descriptors": serde_json::Value::Object(
-            ply_compiled::laid::descriptors()
-                .into_iter()
-                .map(|d| {
-                    let described = serde_json::json!({
-                        "size": d.size,
-                        "fields": offsets(d.fields),
-                    });
-                    (d.name.to_string(), described)
-                })
-                .collect(),
-        ),
+        "ctx": fields_json(ply_compiled::laid::ctx_fields()),
+        "descriptors": ply_compiled::laid::descriptors()
+            .into_iter()
+            .map(|d| serde_json::json!({
+                "name": d.name,
+                "bytes": d.bytes,
+                "fields": fields_json(d.fields),
+            }))
+            .collect::<Vec<_>>(),
         "release_depth": ply_compiled::rt::RELEASE_DEPTH,
         "identity": c::runtime_identity(),
     })
     .to_string()
 }
 
-fn offsets(fields: Vec<(&'static str, usize)>) -> serde_json::Value {
-    serde_json::Value::Object(
-        fields
-            .into_iter()
-            .map(|(name, at)| (name.to_string(), serde_json::json!(at)))
-            .collect(),
-    )
+fn fields_json(fields: Vec<ply_compiled::laid::Field>) -> serde_json::Value {
+    fields
+        .into_iter()
+        .map(|f| serde_json::json!({ "name": f.name, "at": f.at, "bytes": f.bytes }))
+        .collect()
 }
 
 fn layouts_json() -> serde_json::Value {

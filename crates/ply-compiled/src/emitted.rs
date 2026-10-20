@@ -362,19 +362,25 @@ impl Carried {
 pub type DropRoot = unsafe extern "C" fn(*mut Ctx, Handed) -> Word;
 
 /// A function value's descriptor, static data emitted code lays out per lambda, which the first word
-/// past a closure block's header names. The runtime calls through `uniform` and releases through
-/// `release`; it reads none of the rest.
+/// past a closure block's header names. The runtime calls through `uniform`, releases through
+/// `release`, shares through `share` and keeps through `keep`; it never calls `typed`.
 #[repr(C)]
 pub struct PlyFnDesc {
     /// Calls the function with the block and every argument as its word form.
     pub uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word,
-    /// The entry at the function type's own convention, which only emitted code calls.
-    pub typed: *const (),
+    /// The entry at the function type's own convention, cast to it where emitted code calls it;
+    /// none for a function value the runtime made, which is applied through `uniform`.
+    pub typed: Option<unsafe extern "C" fn()>,
+    /// Which convention `typed` takes, which a checked build compares at a call.
     pub convention: Word,
     /// Releases a block whose last holder let it go: its captures, then its memory.
     pub release: DropRoot,
-    pub share: *const (),
-    pub keep: *const (),
+    /// Marks what the block holds shared, before a thread other than the one that made it may hold
+    /// it; 0, with nothing marked, where a capture cannot cross threads.
+    pub share: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
+    /// The block copied to outlive every entry, as a memoized constant does; 0 where a capture may
+    /// not outlive the entry that made it.
+    pub keep: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
 }
 
 // SAFETY: a descriptor is read-only data, which nothing writes once its unit is loaded.

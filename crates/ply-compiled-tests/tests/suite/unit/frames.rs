@@ -117,11 +117,11 @@ unsafe extern "C" fn closure_released(ctx: *mut Ctx, h: Handed) -> Word {
 
 static CLOSES_OVER_A_BOX: PlyFnDesc = PlyFnDesc {
     uniform: uncalled,
-    typed: std::ptr::null(),
+    typed: None,
     convention: 0,
     release: closure_released,
-    share: std::ptr::null(),
-    keep: std::ptr::null(),
+    share: unread,
+    keep: unread,
 };
 
 /// A closure told apart by `marker`, holding `capture`.

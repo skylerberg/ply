@@ -135,9 +135,28 @@ fn the_runtime_describes_each_native_under_the_fields_a_build_reads() {
     assert_eq!(names, reported);
 }
 
+/// A field's name, offset and bytes.
+type Field<'a> = (&'a str, u64, u64);
+
+/// Each field a description lists, in its order.
+fn described_fields(fields: &serde_json::Value) -> Vec<Field<'_>> {
+    fields
+        .as_array()
+        .expect("a list of fields")
+        .iter()
+        .map(|f| {
+            (
+                f["name"].as_str().expect("a field's name"),
+                f["at"].as_u64().expect("a field's offset"),
+                f["bytes"].as_u64().expect("a field's bytes"),
+            )
+        })
+        .collect()
+}
+
 /// Past what a released build reads, the description says what emitted code lays out against: each
-/// native's machine kinds, the context's fields compiled code reads, the descriptors it lays out,
-/// and how deeply drop roots nest.
+/// native's machine kinds, the context's fields compiled code reads, the structs it lays out, and
+/// how deeply drop roots nest.
 #[test]
 fn the_runtime_describes_what_emitted_code_lays_out_against() {
     let described: serde_json::Value =
@@ -164,28 +183,97 @@ fn the_runtime_describes_what_emitted_code_lays_out_against() {
             &2.into()
         )
     );
-    let ctx = &described["ctx"];
-    assert_eq!((&ctx["failed"], &ctx["fuel"]), (&0.into(), &8.into()));
+    let ctx = described_fields(&described["ctx"]);
+    let names: Vec<&str> = ctx.iter().map(|f| f.0).collect();
     assert_eq!(
-        (&ctx["frames"], &ctx["release_depth"]),
-        (&64.into(), &72.into())
+        names,
+        [
+            "failed",
+            "fuel",
+            "stack_floor",
+            "site_root",
+            "site_start",
+            "site_end",
+            "ticks",
+            "next_tick",
+            "frames",
+            "release_depth",
+            "release_waiting"
+        ],
+        "the release's eight, then those emitted code reads past them"
     );
-    for field in ["next_tick", "release_waiting"] {
-        assert!(ctx[field].is_u64(), "no offset of `{field}`");
+    for (i, (name, at, bytes)) in ctx.iter().enumerate() {
+        assert_eq!((*at, *bytes), (8 * i as u64, 8), "`{name}` is not word {i}");
     }
-    let descriptors = &described["descriptors"];
-    for (name, size) in [
-        ("PlyFrame", 16),
-        ("PlyType", 56),
-        ("PlyOp", 64),
-        ("PlyFnDesc", 48),
-    ] {
-        assert_eq!(descriptors[name]["size"], size, "{name}");
-    }
-    assert_eq!(descriptors["PlyType"]["fields"]["lift"], 48);
-    assert_eq!(descriptors["PlyOp"]["fields"]["vars"], 56);
-    assert_eq!(descriptors["PlyFnDesc"]["fields"]["release"], 24);
     assert_eq!(described["release_depth"], 32);
+}
+
+/// Each struct emitted code lays out and the runtime reads is described as
+/// `compiler.emit.layout.machine_structs` lists it: in its order, each field at its offset and of
+/// its bytes, which is what the head declares and the runtime's Rust reads.
+#[test]
+fn the_runtime_describes_the_structs_emitted_code_lays_out_as_the_compiler_states_them() {
+    let described: serde_json::Value =
+        serde_json::from_str(&ply_privileged::shipped::runtime_json())
+            .expect("the description reads");
+    let structs: Vec<(&str, u64, Vec<Field>)> = described["descriptors"]
+        .as_array()
+        .expect("a list of structs")
+        .iter()
+        .map(|s| {
+            (
+                s["name"].as_str().expect("a struct's name"),
+                s["bytes"].as_u64().expect("a struct's bytes"),
+                described_fields(&s["fields"]),
+            )
+        })
+        .collect();
+    let word = |name: &'static str, at: u64| (name, at, 8);
+    assert_eq!(
+        structs,
+        [
+            ("PlyFrame", 16, vec![word("prev", 0), word("each", 8)]),
+            (
+                "PlyType",
+                56,
+                vec![
+                    word("identity", 0),
+                    word("spelled", 8),
+                    ("spelled_len", 16, 4),
+                    word("inc", 24),
+                    word("dec", 32),
+                    word("lower", 40),
+                    word("lift", 48),
+                ]
+            ),
+            (
+                "PlyOp",
+                64,
+                vec![
+                    word("effect", 0),
+                    word("op", 8),
+                    word("answer", 16),
+                    word("own", 24),
+                    word("params_len", 32),
+                    word("params", 40),
+                    word("vars_len", 48),
+                    word("vars", 56),
+                ]
+            ),
+            (
+                "PlyFnDesc",
+                48,
+                vec![
+                    word("uniform", 0),
+                    word("typed", 8),
+                    word("convention", 16),
+                    word("release", 24),
+                    word("share", 32),
+                    word("keep", 40),
+                ]
+            ),
+        ]
+    );
 }
 
 /// What a runtime's library describes itself as carries how it lays out a list's and a map's parts,

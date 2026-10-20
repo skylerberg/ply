@@ -169,9 +169,9 @@ fn an_ended_entry_gives_back_what_it_held() {
     h.alloc_bytes(KIND_BYTES, 200 << 20);
     assert!(h.held() > 200 << 20);
     h.end();
-    assert_eq!(h.held(), 0);
-    let o = h.alloc(KIND_RECORD, 0, 1, 0);
-    assert!(h.is_object(o as Word), "an ended heap allocates afresh");
+    assert_eq!((h.held(), h.live()), (0, 0));
+    h.alloc(KIND_RECORD, 0, 1, 0);
+    assert_eq!(h.live(), 1, "an ended heap allocates afresh");
 }
 
 /// A block is its object's size rounded up by an eighth at most, and a page ends short of one more.
@@ -721,31 +721,6 @@ fn an_immortal_word_survives_the_end_of_every_entry_and_counts_nothing() {
     );
 }
 
-#[test]
-fn a_word_is_an_object_only_at_a_live_start() {
-    let mut heap = Heap::new();
-    enter(&mut heap);
-    let o = heap.alloc(KIND_RECORD, 0, 2, 0);
-    // Filled before the `dec`, as every caller of `alloc` must: until written, the words hold the last tenant's leftovers.
-    unsafe {
-        set_word(o, 0, imm(1));
-        set_word(o, 1, imm(2));
-    }
-    let w = o as Word;
-    assert!(heap.is_object(w));
-    assert!(
-        !heap.is_object(w + 8),
-        "an interior address is not an object"
-    );
-    assert!(!heap.is_object(imm(7)), "an immediate is not an object");
-    assert!(!heap.is_object(0));
-    dec(w);
-    assert!(!heap.is_object(w), "a released object is not one");
-    leave();
-    heap.end();
-    assert!(!heap.is_object(w), "nothing survives the entry");
-}
-
 /// What another thread may hold is marked once, all of it, and is never unique after.
 #[test]
 fn sharing_marks_everything_under_the_words_and_counts_it_apart() {
@@ -816,7 +791,11 @@ fn an_object_dying_under_another_heap_goes_back_to_its_own() {
     let other = inner.to_word(&l, &Value::ctor("Some", vec![Value::Int(2)]));
     assert_ne!(other, made, "a heap took a block of another's");
     leave();
-    assert!(inner.is_object(other) && !outer.is_object(other));
+    assert_eq!(
+        (inner.live(), outer.live()),
+        (1, 0),
+        "the object made under the inner heap is its own"
+    );
     inner.end();
     outer.end();
 }
@@ -853,8 +832,14 @@ fn an_adopted_heap_keeps_its_objects_and_its_bridges() {
     let mut branch = Heap::new();
     let made = branch.to_word(&l, &Value::list(vec![Value::Int(7), Value::str("x")]));
     let float = branch.bridge(Value::Float(2.5));
+    let (mine, theirs) = (parent.live(), branch.live());
     parent.adopt_heap(branch);
     let after = parent.to_word(&l, &Value::str("after"));
+    assert_eq!(
+        parent.live(),
+        mine + theirs + 1,
+        "the branch's objects are the parent's"
+    );
     assert_eq!(
         Heap::to_value(&l, made),
         Value::list(vec![Value::Int(7), Value::str("x")])
@@ -862,7 +847,6 @@ fn an_adopted_heap_keeps_its_objects_and_its_bridges() {
     assert_eq!(Heap::to_value(&l, float), Value::Float(2.5));
     assert_eq!(Heap::to_value(&l, before), Value::str("before"));
     assert_eq!(Heap::to_value(&l, after), Value::str("after"));
-    assert!(parent.is_object(made) && parent.is_object(after));
     enter(&mut parent);
     dec(float);
     leave();

@@ -158,11 +158,11 @@ struct ResumeBlock {
 
 static RESUME_DESC: PlyFnDesc = PlyFnDesc {
     uniform: resume_uniform,
-    typed: std::ptr::null(),
+    typed: None,
     convention: 0,
     release: never_released,
-    share: std::ptr::null(),
-    keep: std::ptr::null(),
+    share: resumes_here_only,
+    keep: resumes_here_only,
 };
 
 static RESUME: ResumeBlock = ResumeBlock {
@@ -185,6 +185,11 @@ unsafe extern "C" fn resume_uniform(ctx: *mut Ctx, _k: Word, args: *const Word) 
 
 unsafe extern "C" fn never_released(_ctx: *mut Ctx, _k: Handed) -> Word {
     unreachable!("an immortal block is never released")
+}
+
+/// A resumption is its perform's: it crosses to no other thread and outlives no entry.
+unsafe extern "C" fn resumes_here_only(_ctx: *mut Ctx, _k: Word) -> Word {
+    0
 }
 
 /// The `k` a tail-resuming clause emitted code made is handed.

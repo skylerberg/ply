@@ -10,79 +10,68 @@ use crate::rt::Ctx;
 use crate::{list, map};
 use std::mem::{offset_of, size_of};
 
-/// The fields of the context compiled code reads and writes itself, each with its offset.
-pub fn ctx_fields() -> Vec<(&'static str, usize)> {
-    vec![
-        ("failed", offset_of!(Ctx, failed)),
-        ("fuel", offset_of!(Ctx, fuel)),
-        ("stack_floor", offset_of!(Ctx, stack_floor)),
-        ("site_root", offset_of!(Ctx, site_root)),
-        ("site_start", offset_of!(Ctx, site_start)),
-        ("site_end", offset_of!(Ctx, site_end)),
-        ("ticks", offset_of!(Ctx, ticks)),
-        ("next_tick", offset_of!(Ctx, next_tick)),
-        ("frames", offset_of!(Ctx, frames)),
-        ("release_depth", offset_of!(Ctx, release_depth)),
-        ("release_waiting", offset_of!(Ctx, release_waiting)),
-    ]
+/// A field of a struct emitted code and the runtime both lay out: where it lies in the struct and
+/// how many bytes it takes, as `compiler.emit.layout`'s `MachineField` says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Field {
+    pub name: &'static str,
+    pub at: usize,
+    pub bytes: usize,
 }
 
-/// A struct emitted code lays out and the runtime reads: its size, and each field with its offset.
+/// The size of the field `field` borrows out of an `S`.
+fn field_bytes<S, F>(_field: fn(&S) -> &F) -> usize {
+    size_of::<F>()
+}
+
+/// Each named field of `$s`, in the order given, as the Rust type lays it out.
+macro_rules! fields {
+    ($s:ty: $($f:ident),* $(,)?) => {
+        vec![$(Field {
+            name: stringify!($f),
+            at: offset_of!($s, $f),
+            bytes: field_bytes::<$s, _>(|s| &s.$f),
+        }),*]
+    };
+}
+
+/// The fields of the context compiled code reads and writes itself, in the context's order.
+pub fn ctx_fields() -> Vec<Field> {
+    fields!(Ctx: failed, fuel, stack_floor, site_root, site_start, site_end, ticks, next_tick,
+        frames, release_depth, release_waiting)
+}
+
+/// A struct emitted code lays out and the runtime reads, as `compiler.emit.layout`'s
+/// `MachineStruct` says it: its size in bytes, and each of its fields in order.
 pub struct Described {
     pub name: &'static str,
-    pub size: usize,
-    pub fields: Vec<(&'static str, usize)>,
+    pub bytes: usize,
+    pub fields: Vec<Field>,
 }
 
-/// Each descriptor emitted code lays out, under the name `compiler.emit.layout` gives it.
+/// Each struct emitted code lays out and the runtime reads, in the order
+/// `compiler.emit.layout.machine_structs` lists them: each declared before one that points at it.
 pub fn descriptors() -> [Described; 4] {
     [
         Described {
             name: "PlyFrame",
-            size: size_of::<PlyFrame>(),
-            fields: vec![
-                ("prev", offset_of!(PlyFrame, prev)),
-                ("each", offset_of!(PlyFrame, each)),
-            ],
+            bytes: size_of::<PlyFrame>(),
+            fields: fields!(PlyFrame: prev, each),
         },
         Described {
             name: "PlyType",
-            size: size_of::<PlyType>(),
-            fields: vec![
-                ("identity", offset_of!(PlyType, identity)),
-                ("spelled", offset_of!(PlyType, spelled)),
-                ("spelled_len", offset_of!(PlyType, spelled_len)),
-                ("inc", offset_of!(PlyType, inc)),
-                ("dec", offset_of!(PlyType, dec)),
-                ("lower", offset_of!(PlyType, lower)),
-                ("lift", offset_of!(PlyType, lift)),
-            ],
+            bytes: size_of::<PlyType>(),
+            fields: fields!(PlyType: identity, spelled, spelled_len, inc, dec, lower, lift),
         },
         Described {
             name: "PlyOp",
-            size: size_of::<PlyOp>(),
-            fields: vec![
-                ("effect", offset_of!(PlyOp, effect)),
-                ("op", offset_of!(PlyOp, op)),
-                ("answer", offset_of!(PlyOp, answer)),
-                ("own", offset_of!(PlyOp, own)),
-                ("params_len", offset_of!(PlyOp, params_len)),
-                ("params", offset_of!(PlyOp, params)),
-                ("vars_len", offset_of!(PlyOp, vars_len)),
-                ("vars", offset_of!(PlyOp, vars)),
-            ],
+            bytes: size_of::<PlyOp>(),
+            fields: fields!(PlyOp: effect, op, answer, own, params_len, params, vars_len, vars),
         },
         Described {
             name: "PlyFnDesc",
-            size: size_of::<PlyFnDesc>(),
-            fields: vec![
-                ("uniform", offset_of!(PlyFnDesc, uniform)),
-                ("typed", offset_of!(PlyFnDesc, typed)),
-                ("convention", offset_of!(PlyFnDesc, convention)),
-                ("release", offset_of!(PlyFnDesc, release)),
-                ("share", offset_of!(PlyFnDesc, share)),
-                ("keep", offset_of!(PlyFnDesc, keep)),
-            ],
+            bytes: size_of::<PlyFnDesc>(),
+            fields: fields!(PlyFnDesc: uniform, typed, convention, release, share, keep),
         },
     ]
 }

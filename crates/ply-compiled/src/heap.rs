@@ -1600,31 +1600,6 @@ impl Heap {
         p
     }
 
-    /// Whether `w` is a live object this heap allocated in the running entry, or a record held in
-    /// place inside one.
-    pub fn is_object(&self, w: Word) -> bool {
-        if is_imm(w) || w == 0 || !(w as usize).is_multiple_of(8) {
-            return false;
-        }
-        let address = w as usize;
-        if !self.blocks.holds(address) {
-            if !self.blocks.within(address) {
-                return false;
-            }
-            let o = address as *const Obj;
-            let (rc, kind) = unsafe { ((*o).rc, (*o).kind) };
-            let back = 8 * (rc & !EMBEDDED) as usize;
-            return rc & EMBEDDED == EMBEDDED
-                && rc != IMMORTAL
-                && kind == KIND_RECORD
-                && back > 0
-                && back <= address
-                && self.is_object((address - back) as Word);
-        }
-        let o = w as *const Obj;
-        unsafe { (*o).kind != KIND_DEAD && (*o).rc != 0 }
-    }
-
     /// A fresh object with `len` payload words, left as a recycled block's last tenant wrote them:
     /// fill every word before anything can release it, or [`dec`] follows garbage.
     pub fn alloc(&mut self, kind: u8, flags: u8, len: u32, layout: u32) -> *mut Obj {

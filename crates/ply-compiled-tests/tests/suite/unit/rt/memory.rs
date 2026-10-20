@@ -188,6 +188,32 @@ fn a_hold_is_given_back_without_a_read_of_what_it_held() {
     );
 }
 
+/// A checked build's `ply_last` finds a second release by the count alone: whatever gives a block
+/// back, and to whichever heap, leaves it counted 0 until the block is taken again.
+#[test]
+fn a_block_given_back_is_counted_zero_until_it_is_taken_again() {
+    let (mut mine, mut other) = (context(), context());
+    let sized = alloc(&mut mine, 32);
+    let elsewhere = alloc(&mut mine, 32);
+    let bridge = mine.heap.bridge(Value::str("bridged"));
+    let dismantled = mine.heap.str("dismantled");
+    free(&mut mine, sized, 32);
+    free(&mut other, elsewhere, 32);
+    let free_handle: Given = helper("rt_handle_free");
+    unsafe { free_handle(&mut mine, bridge) };
+    ply_compiled::heap::enter(&mut mine.heap);
+    ply_compiled::heap::dec(dismantled);
+    ply_compiled::heap::leave();
+    for (w, given) in [
+        (sized, "freed by its size"),
+        (elsewhere, "freed under another context"),
+        (bridge, "a handle given back"),
+        (dismantled, "a runtime object let go"),
+    ] {
+        assert_eq!(count(w), 0, "a block {given}");
+    }
+}
+
 /// Derived, because a filter naming no test runs nothing and exits 0, which reads as a pass.
 fn own_test_name(leaf: &str) -> String {
     match module_path!().split_once("::") {

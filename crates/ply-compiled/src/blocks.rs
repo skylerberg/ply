@@ -464,22 +464,6 @@ impl Blocks {
         }
     }
 
-    /// Whether `address` lies inside a block this heap handed out, where it may begin something held
-    /// in place.
-    pub fn within(&self, address: usize) -> bool {
-        if !self.segments.contains(&(address & !(SEGMENT - 1))) {
-            return self
-                .large
-                .range(..=address)
-                .next_back()
-                .is_some_and(|(start, bytes)| address < start + bytes);
-        }
-        unsafe {
-            let page = page_of(address as *mut u8);
-            (*page).block != 0 && address >= room(page).0.addr() && address < (*page).fresh.addr()
-        }
-    }
-
     /// Every block handed out and not since emptied with its page, dead ones among them, with its
     /// bytes.
     pub fn each(&self, mut f: impl FnMut(*mut u8, usize)) {
