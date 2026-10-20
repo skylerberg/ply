@@ -24,9 +24,10 @@ import emit.tir (Rep, RWord, RInt, RBool, RMaybe, RTagged, RFlat, RCases, RSlice
                  Convention, TTag, Uses, ReadsOf, LastOf, Walked, no_links, counted, rep_of_arg,
                  used_as, operands, answered, var_of)
 import emit.tir.handling (Perform)
-import emit.verify (payload_of)
+import emit.verify (payload_of, allocates, re_held)
 import emit.own (owned, may_reuse)
 import emit.lower.setting
+import emit.lower.held (passing, ByReference)
 
 /// How a definition takes its parameters and hands back its answer, which every caller's code is
 /// written against: inferred from its body and its callees' handings, never written.
@@ -52,10 +53,19 @@ pub type Lending = { def: Bytes, f: Fn, group: List<Bytes>, lent: List<Int>, who
 pub fn taking_all(arity: Int) -> Handing =
   { params: range(0, arity).map(|_: Int| Given), answer: Owned }
 
-/// The definitions `forms` hold as the inference reads them: each form one of module `s`'s roots
-/// or tail groups as the build lowered it, which emission then counts and prints.
-pub fn lendings_of(s: setting::Setting, forms: List<Fn>) -> List<Lending> =
-  forms.fold([], |acc: List<Lending>, f: Fn| acc.concat(read_as(s, f)))
+/// The definitions `forms` hold as the inference reads them: each form a root or tail group as the
+/// build lowered it, which emission then counts and prints, and `declared` the parameters each
+/// definition lends by declaration, by its full name. A specialisation takes its definition's
+/// handing and a root written for a type its fixed one, so neither is read.
+pub fn lendings_of(declared: Map<Bytes, List<Int>>, forms: List<Fn>) -> List<Lending> =
+  forms.fold([], |acc: List<Lending>, f: Fn|
+    match f.key { Named(_) -> acc.concat(read_as(declared, f)), _ -> acc })
+
+/// The parameters, by place, each definition of module `s` lends by declaration (E0475), by its full
+/// name: what `lendings_of` reads for the module's definitions.
+pub fn declared_lent(s: setting::Setting) -> Map<Bytes, List<Int>> =
+  s.here.fold(Map::new(), |m: Map<Bytes, List<Int>>, d: Def|
+    if d.lent.len() == 0 { m } else { m.insert(qualify(s.module, d.name), d.lent) })
 
 /// Each of `group`'s definitions' handing in its order, and why: a fixpoint that starts every
 /// parameter lent but those reset for reuse and every answer borrowed of nothing, and moves each
@@ -171,14 +181,18 @@ pub fn handing_said(h: Handing) -> Bytes =
   ])
 
 /// `f` written against the handings `handed` holds by definition: a root's parameters and answer, or
-/// each tail group member's, as its definition's handing says, and each call's as its callee's. A
+/// each tail group member's, as its definition's handing says (a specialisation's as the one it
+/// specialises, a root written for a type's as `written_handing`), and each call's as its callee's. A
 /// closure's body takes and answers as its function type does, and its calls as their callees'.
 /// Raises where a handing's parameters are not the convention's, which no call can be written to.
 pub fn conventions(f: Fn, handed: Map<Bytes, Handing>) -> Fn / {abort.raise} = {
   let own = |k: RootKey, c: Convention|
     match key_def(k) {
       Some(d) -> match handed.get(d) { Some(h) -> conv_handed(c, h, d), None -> c },
-      None -> c,
+      None -> match k {
+        Written(x) -> conv_handed(c, written_handing(x.op, c.params.len()), root_name(k)),
+        _ -> c,
+      },
     };
   let called = calls_handed(f, handed);
   {
@@ -271,15 +285,14 @@ fn val_handed(generics: List<Bytes>, handed: Map<Bytes, Handing>, v: Val) -> Val
 
 /// The definitions `f` lowers as the inference reads them: `f` itself, or each member of the tail
 /// group it is, that member's arm of `f`'s body its body.
-fn read_as(s: setting::Setting, f: Fn) -> List<Lending> = {
+fn read_as(declared: Map<Bytes, List<Int>>, f: Fn) -> List<Lending> = {
   let lending = |g: Fn, group: List<Bytes>| {
     let full = root_name(g.key);
     {
       def: full,
       f: g,
       group: group,
-      lent: s.here.fold([], |acc: List<Int>, d: Def|
-        if qualify(s.module, d.name) == full { d.lent } else { acc }),
+      lent: match declared.get(full) { Some(ps) -> ps, None -> [] },
       whole: f,
     }
   };
@@ -488,6 +501,8 @@ fn round(
       Some(l) -> match cur.at(k) { Some(c) -> m.insert(l.def, c.handing), None -> m },
       None -> m,
     });
+  let reps = group.fold(Map::new(), |m: Map<Bytes, List<Rep>>, l: Lending|
+    m.insert(l.def, l.f.params.map(|p: Var| p.rep)));
   let found = range(0, group.len()).fold([], |acc: List<Found>, k: Int|
     match group.at(k) {
       Some(l) -> match cur.at(k) {
@@ -501,7 +516,12 @@ fn round(
             },
             l.f,
           );
-          acc.push({ lending: l, cur: c, walk: w, gone: gone_in(c.handing, look, w) })
+          acc.push({
+            lending: l,
+            cur: c,
+            walk: w,
+            gone: gone_in(c.handing, look, reps, l.f.params.map(|p: Var| p.rep), w),
+          })
         },
         None -> acc,
       },
@@ -537,7 +557,13 @@ fn member_walk(s: Sight, f: Fn) -> Walk =
 /// member's own: its parameter whose value is consumed whole, answered owned, set to an owned join
 /// or jumped with to a given place; and a parameter a jump hands, at a lent place, something the
 /// jumping member does not lend on, so nothing outlasts the jump to release it.
-fn gone_in(h: Handing, look: Map<Bytes, Handing>, w: Walk) -> Gone =
+fn gone_in(
+  h: Handing,
+  look: Map<Bytes, Handing>,
+  reps: Map<Bytes, List<Rep>>,
+  own: List<Rep>,
+  w: Walk,
+) -> Gone =
   w.uses.fold({ own: Map::new(), jumped: [] }, |g: Gone, u: Use|
     match u.does {
       Consumes(o) -> { ..g, own: wholes(g.own, o, u.at) },
@@ -546,8 +572,18 @@ fn gone_in(h: Handing, look: Map<Bytes, Handing>, w: Walk) -> Gone =
           Some(t) -> t.params.at(j.param) == Some(Lent),
           None -> false,
         };
+        // A lent record passed by reference is pointed at again by a jump, never written through:
+        // only a lent record passed by reference, or one laid inside such a one, outlasts it.
+        let pointed = match reps.get(j.to) {
+          Some(rs) -> match rs.at(j.param) { Some(r) -> passing(r) == ByReference, None -> false },
+          None -> false,
+        };
+        let pointable = j.of.bases.len() > 0
+          && j.of.bases.all(|k: Int, whole: Bool|
+            whole && (match own.at(k) { Some(r) -> passing(r) == ByReference, None -> false }));
         if !lent_there { { ..g, own: wholes(g.own, j.of, u.at) } }
-        else if j.of.fresh || j.of.bases.keys().any(|k: Int| h.params.at(k) == Some(Given)) {
+        else if j.of.fresh || j.of.bases.keys().any(|k: Int| h.params.at(k) == Some(Given))
+            || (pointed && !pointable) {
           { ..g, jumped: g.jumped.push({ to: j.to, param: j.param, at: u.at }) }
         } else { g }
       },
@@ -673,7 +709,11 @@ fn walked(s: Sight, w: Walk, b: Block) -> Walk =
       Do(d) -> valued(s, { ..acc, at: d.at }, d.val, None).walk,
       Decl(v) -> defined(acc, v, none()),
       Assign(x) -> {
-        let o = arg_origin(acc, x.arg);
+        // A constant set to a counted join is held as the join's count.
+        let o = match x.arg {
+          AVar(_) -> arg_origin(acc, x.arg),
+          _ -> if counted(rep_of_arg(x.arg)) { made() } else { none() },
+        };
         used(defined(acc, x.var, union(origin_of(acc, x.var), o)), Sets({ join: x.var.id, of: o }))
       },
       If(x) -> placed(walked(s, placed(walked(s, acc, x.then), acc.at), x.otherwise), acc.at),
@@ -763,8 +803,18 @@ fn valued(s: Sight, w: Walk, val: Val, bound: Option<Var>) -> { walk: Walk, orig
       { walk: consumed(w, p.arg), origin: made() }
     } else if counted(p.to) { { walk: w, origin: arg_origin(w, p.arg) } }
     else { { walk: w, origin: none() } },
-    Gathered(g) ->
-      { walk: w, origin: g.parts.fold(none(), |o: Origin, a: Arg| union(o, arg_origin(w, a))) },
+    // The ownership pass holds a value gathered from counted parts as a count of its own, but for
+    // a one-word sum gathered from one word, which holds that word again.
+    Gathered(g) -> {
+      let again = match bound { Some(y) -> re_held(y, val), None -> None };
+      {
+        walk: w,
+        origin: match again {
+          Some(x) -> origin_of(w, x),
+          None -> if g.parts.any(|a: Arg| counted(rep_of_arg(a))) { made() } else { none() },
+        },
+      }
+    },
     Call(c) -> {
       let h = handing_at(s.look, s.generics, c.callee, c.args.len());
       {
@@ -790,15 +840,6 @@ fn valued(s: Sight, w: Walk, val: Val, bound: Option<Var>) -> { walk: Walk, orig
     Walked(x) ->
       { walk: taken(w, operands(val)), origin: if x.op == Share { none() } else { made() } },
   }
-
-/// Whether holding a value held as `from` as `to` makes an object: a value holding no count boxed,
-/// or a flat value or a view made the object its word names.
-fn allocates(from: Rep, to: Rep) -> Bool =
-  one_word(to)
-    && (!counted(from)
-    || (match from { RFlat(_) -> true, RCases(_) -> true, RSlice -> true, _ -> false }))
-
-fn one_word(r: Rep) -> Bool = match r { RWord -> true, RMaybe -> true, RTagged -> true, _ -> false }
 
 /// What an operation that answers as `uses` says answers: a count of its own, or what it read out
 /// of its first operand.
@@ -1145,6 +1186,37 @@ test "a jump back to the start keeps a parameter lent while it hands on only wha
   ])
 }
 
+test "a record lent by reference stays lent across a jump only where the jump hands on a record lent so" {
+  let wide = RFlat(range(0, 5).map(|k: Int| { name: b"f".concat(ascii_of_int(k)), rep: RInt }));
+  let w = of_type(0, b"m.W", wide);
+  let v = of_type(1, b"m.W", wide);
+  let b = word(2);
+  let n = int(3);
+  let stop = flag(4);
+  let m = int(5);
+  let x = of_type(6, b"m.W", wide);
+  let go = |before: Block, args: List<Arg>|
+    alone([
+      def_of(b"go", [w, v, b, n], RInt, [
+        bind(stop, Prim({ op: b"le", on: RInt, args: [AVar(n), AInt(0)] })),
+        If({
+          cond: AVar(stop),
+          then: [Return(AInt(0))],
+          otherwise: before.concat([
+            bind(m, Prim({ op: b"sub", on: RInt, args: [AVar(n), AInt(1)] })),
+            Restart(args.concat([AVar(b), AVar(m)])),
+          ]),
+        }),
+      ]),
+    ]);
+  assert_eq(go([], [AVar(v), AVar(w)]), [{ params: [Lent, Lent, Lent, Lent], answer: Owned }]);
+  // Read through a block it is lent, the record lies in that block, not in storage its caller
+  // lent it, so the record it is jumped to is given; and a record given is handed on given.
+  let read = [bind(x, Get({ of: b, path: PField({ name: b"w", at: 0 }) }))];
+  assert_eq(go(read, [AVar(x), AVar(v)]), [{ params: [Given, Lent, Lent, Lent], answer: Owned }]);
+  assert_eq(go(read, [AVar(x), AVar(w)]), [{ params: [Given, Given, Lent, Lent], answer: Owned }])
+}
+
 test "a group that hands a parameter around lends it, and gives it once any member keeps it" {
   let s = word(0);
   let y = int(1);
@@ -1365,5 +1437,34 @@ test "a body is written against its own handing and each callee's, a callee noth
   } with {
     abort.raise(m) -> Bytes::of_string(m),
   };
-  assert_eq(said, b"a handing of 2 parameters for a convention of 1: m.look")
+  assert_eq(said, b"a handing of 2 parameters for a convention of 1: m.look");
+  // A specialisation is written as the definition it specialises, a root written for a type as its
+  // fixed handing.
+  let at = { ..f, key: At({ def: b"m.f", args: [], lent: [] }) };
+  assert_eq(conventions(at, handed).conv.params, [Lent]);
+  let for_type = |op: TypeOp|
+    conventions(
+      {
+        ..f,
+        key: Written({ op: op, ty: TyCon({ name: b"m.T", args: [] }), home: b"m", marks: [] }),
+      },
+      handed,
+    ).conv.params;
+  assert_eq([for_type(Equal), for_type(Drop)], [[Lent], [Given]])
+}
+
+test "only a definition's own form is read, each lending what its declaration lends" {
+  let s = word(0);
+  let f = def_of(b"f", [s], RWord, [Return(AVar(s))]).f;
+  let typed = TyCon({ name: b"m.T", args: [] });
+  let forms = [
+    f,
+    { ..f, key: At({ def: b"m.f", args: [], lent: [] }) },
+    { ..f, key: Written({ op: Equal, ty: typed, home: b"m", marks: [] }) },
+  ];
+  assert_eq(
+    lendings_of(Map::new().insert(b"m.f", [0]), forms).map(|l: Lending|
+      { def: l.def, lent: l.lent }),
+    [{ def: b"m.f", lent: [0] }],
+  )
 }
