@@ -1,0 +1,115 @@
+//! The plain roots written for the types a program declares, read off the layouts the layout module
+//! gives them.
+
+import check.types (Type, TyCon, TyRecord)
+import emit.compare (program_of)
+import emit.layout (LSum)
+import emit.reps
+import emit.reps (Ctors)
+import emit.release (Part, WordAt, ByCase, CaseBox, Object, laid_parts, drop_of, generated,
+                     case_dropped)
+import emit.keys (Named)
+import emit.tir (Fn, Var, Case, Opened, Let, If, Restart, Dec, Return, LastOf, AVar, RWord, RSum)
+
+fn corpus() -> Bytes =
+  Bytes::concat_all([
+    b"type Tree = | Leaf | Node(Tree, Int, Tree)\n",
+    b"type Expr = | Num(Int) | Add(Expr, Expr) | Neg(Expr) | Name(String)\n",
+    b"type Pair = { name: String, items: List<Int>, tree: Tree }\n",
+    b"fn uses(t: Tree, e: Expr, p: Pair) -> Int = 0\n",
+  ])
+
+fn declared(name: Bytes) -> Type = TyCon({ name: name, args: [] })
+
+/// The corpus's constructor table, as the emitter is handed it.
+fn corpus_ctors() -> Result<Ctors, Bytes> / {abort.raise} =
+  match program_of(corpus()) { Ok(p) -> Ok(p.setting.ctors), Err(why) -> Err(why) }
+
+test "a tree's drop root lets go of its left subtree and starts again on its right" {
+  let tree = declared(b"m.Tree");
+  match corpus_ctors() {
+    Err(why) -> assert_eq(why, b""),
+    Ok(ctors) -> match generated(ctors, drop_of(tree)) {
+      Err(no) -> assert_eq(no.why, b""),
+      Ok(f) -> match f.body {
+        [Case(c)] -> match c.arms {
+          [arm] -> match arm.body {
+            [Opened(_), Opened(open), Dec(left), Let(last), If(again), Return(_)] -> {
+              assert_eq(open.words.map(|w: Var| w.ty), [tree, tree]);
+              assert_eq(open.words.at(0), Some(left));
+              assert_eq(last.val, LastOf(open.words.get(1)));
+              assert_eq(again.then, [Restart([AVar(last.var)])])
+            },
+            other -> assert_eq(other.len(), 0),
+          },
+          arms -> assert_eq(arms.len(), 1),
+        },
+        body -> assert_eq(body.len(), 1),
+      },
+    },
+  }
+}
+
+test "a wide sum is let go of by its case, each boxed case at its own root, which holds its sums whole" {
+  let expr = declared(b"m.Expr");
+  match corpus_ctors() {
+    Err(why) -> assert_eq(why, b""),
+    Ok(ctors) -> match reps::laid(ctors, expr) {
+      LSum(s) -> {
+        match laid_parts(ctors, expr, LSum(s), 0) {
+          [ByCase(c)] ->
+            assert_eq(
+              c.cases.map(|k: { case: Int, parts: List<Part> }|
+                k.parts.map(|p: Part| match p { WordAt(w) -> Some(w.how), ByCase(_) -> None })),
+              [
+                [Some(CaseBox({ sum: expr, case: 1 }))],
+                [Some(CaseBox({ sum: expr, case: 2 }))],
+                [Some(Object(drop_of(declared(b"String"))))],
+              ],
+            ),
+          parts -> assert_eq(parts.len(), 1),
+        };
+        let add = case_dropped(
+          ctors,
+          Named(b"m.drop_add"),
+          expr,
+          1,
+          |t: Type| reps::laid(ctors, t),
+          |t: Type| reps::word_form(ctors, t),
+        );
+        match add.body {
+          [Opened(o), Dec(l), Dec(r), Return(_)] -> {
+            assert_eq(o.words, [l, r]);
+            assert_eq([l.ty, r.ty], [expr, expr]);
+            assert_eq(match l.rep { RSum(_) -> true, _ -> false }, true)
+          },
+          body -> assert_eq(body.len(), 4),
+        }
+      },
+      _ -> assert(false, None),
+    },
+  }
+}
+
+test "a record's box lets go of its pointers and of a sum it holds whole" {
+  let pair = TyRecord([
+    { name: b"items", ty: TyCon({ name: b"List", args: [declared(b"Int")] }) },
+    { name: b"name", ty: declared(b"String") },
+    { name: b"tree", ty: declared(b"m.Tree") },
+  ]);
+  match corpus_ctors() {
+    Err(why) -> assert_eq(why, b""),
+    Ok(ctors) -> match generated(ctors, drop_of(pair)) {
+      Err(no) -> assert_eq(no.why, b""),
+      Ok(f) -> match f.body {
+        [Opened(o), Dec(a), Dec(b), Dec(c), Return(_)] -> {
+          assert_eq(o.words, [a, b, c]);
+          assert_eq([a.rep, b.rep], [RWord, RWord]);
+          assert_eq(c.ty, declared(b"m.Tree"));
+          assert_eq(match c.rep { RSum(_) -> true, _ -> false }, true)
+        },
+        body -> assert_eq(body.len(), 5),
+      },
+    },
+  }
+}
