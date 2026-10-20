@@ -36,7 +36,8 @@ import emit.tir (Rep, RWord, RInt, RBool, RFloat, RMaybe, RTagged, RFlat, RCases
                  Lent, Owned, Test, TTag, Owns, ReadsOf, Lasts, no_links, counted, operands,
                  answered, fails, used_as, var_of, rep_of_arg, parts_of, ends)
 import emit.verify (verified, stacked_captures, payload_of, field_path, held_in_place, stops_at,
-                    reuses_cells, made_width, kept_reads)
+                    reuses_cells, made_width, kept_reads, holds_no_count)
+import emit.tir (Static)
 
 /// How a counted variable is held: a count of its own, or read without one out of the owned
 /// variables `bases` names, each live while it is (none where nothing the body lets go of holds
@@ -63,6 +64,7 @@ type Facts = {
   alias: Map<Int, Var>,
   stacks: Map<Int, List<Var>>,
   promoted: Map<Int, Bool>,
+  immortal: Map<Int, Bool>,
 }
 
 /// The counted variables live at a point, by number: each is read, consumed or let go of on some
@@ -367,6 +369,7 @@ fn facts_of(f: Fn) -> Facts = {
     alias: Map::new(),
     stacks: Map::new(),
     promoted: Map::new(),
+    immortal: Map::new(),
   };
   let first = gathered(params_defined(f, empty), f.body);
   let got = first.gets.fold(
@@ -676,6 +679,10 @@ fn defined(fx: Facts, v: Var, h: Held) -> Facts =
     next: if v.id >= fx.next { v.id + 1 } else { fx.next },
   }
 
+/// `v` bound to a value that holds no count (`verify.holds_no_count`): known, never counted.
+fn holding_none(fx: Facts, v: Var) -> Facts =
+  { ..defined(fx, v, Own), held: fx.held, immortal: fx.immortal.insert(v.id, true) }
+
 /// Every variable `b` defines, with how it is held: a `Let` as its value answers, a join, a loop's
 /// state and answer and a handle's answer owned; an alias of a word as nothing of its own.
 fn gathered(fx: Facts, b: Block) -> Facts =
@@ -694,7 +701,7 @@ fn gathered(fx: Facts, b: Block) -> Facts =
                 }),
             ),
           },
-        None -> {
+        None -> if holds_no_count(l.val, acc.immortal) { holding_none(acc, l.var) } else {
           let a = answered(l.val);
           let d = if acc.alias.contains(l.var.id) {
             { ..acc, vars: acc.vars.insert(l.var.id, l.var) }
@@ -1092,7 +1099,8 @@ fn planned(fx: Facts, uses: List<Operand>, after: Live) -> Plan = {
                 r.insert(b, true)),
             }
           };
-          if !counted(v.rep) { used } else { base_vars(fx, v).fold(listed(used, v), listed) }
+          if !counted(v.rep) || fx.immortal.contains(v.id) { used }
+          else { base_vars(fx, v).fold(listed(used, v), listed) }
         },
         None -> acc,
       },
@@ -1911,6 +1919,87 @@ test "a join is set from a value held as the join is, on every path" {
   assert_eq(
     refused_with(f, joined([bind(x, sum, []), Assign({ var: j, arg: AVar(x) })])),
     Some(b"a join set from a value held otherwise: v3"),
+  )
+}
+
+test "a value that holds no count, a static or a case gathered from constants, is given, returned, joined and stored with none" {
+  let c = flag(0);
+  let p = word(1);
+  let s = word(2);
+  let r = word(3);
+  let q = word(4);
+  let j = word(5);
+  let none = {
+    id: 6,
+    ty: TyCon({ name: b"Option", args: [TyCon({ name: b"String", args: [] })] }),
+    rep: RMaybe,
+  };
+  let lit = bind(s, Static(b"ply_k_0"), []);
+  let unchanged = |f: Fn| assert_eq(counted_body(f), { body: f.body, refused: None });
+  // Given to two calls, the second taking the first's answer too.
+  unchanged(
+    root_of([], [], RWord, [
+      lit,
+      bind(r, call_of([AVar(s)], []), []),
+      bind(q, call_of([AVar(s), AVar(r)], []), []),
+      Return(AVar(q)),
+    ]),
+  );
+  // Returned.
+  unchanged(root_of([], [], RWord, [lit, Return(AVar(s))]));
+  // Stored twice in what a body makes.
+  unchanged(
+    root_of([], [], RWord, [
+      lit,
+      bind(
+        q,
+        Make({
+          made: MRecord({ names: [b"a", b"b"], width: 2 }),
+          args: [AVar(s), AVar(s)],
+          reuse: None,
+          kept: [],
+        }),
+        [],
+      ),
+      Return(AVar(q)),
+    ]),
+  );
+  // A join set from it on one path and from a parameter on the other: the parameter alone is let
+  // go of where the path does not read it.
+  assert_eq(
+    counted_body(
+      root_of([c, p], [], RWord, [
+        lit,
+        Decl(j),
+        If({
+          cond: AVar(c),
+          then: [Assign({ var: j, arg: AVar(s) })],
+          otherwise: [Assign({ var: j, arg: AVar(p) })],
+        }),
+        Return(AVar(j)),
+      ]),
+    ),
+    {
+      body: [
+        lit,
+        Decl(j),
+        If({
+          cond: AVar(c),
+          then: [Dec(p), Assign({ var: j, arg: AVar(s) })],
+          otherwise: [Assign({ var: j, arg: AVar(p) })],
+        }),
+        Return(AVar(j)),
+      ],
+      refused: None,
+    },
+  );
+  // A `None` gathered from its constant word, given twice.
+  unchanged(
+    root_of([], [], RWord, [
+      bind(none, Gathered({ parts: [AInt(0)] }), []),
+      bind(r, call_of([AVar(none), AVar(none)], []), []),
+      Return(AVar(r)),
+    ]),
   )
 }
 

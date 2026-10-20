@@ -1,0 +1,311 @@
+//! Constants laid out as static data. After a root is lowered and before its counts are placed, the
+//! `folded` pass makes each constant its body binds a static object named by its content, which the
+//! unit lays out once for the program, or a C literal where a register holds the value; so a run
+//! decodes, allocates and counts nothing to read a constant.
+
+import syntax.patterns (Lit, LStr, LBytes, LEmbedded, LDec, LFixed, LWide, LUnit)
+import syntax.parsing (dummy_span)
+import check.types (TyCon)
+import emit.c (Width, width_named, width_index)
+import emit.keys (Named)
+import emit.tir (Fn, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Val, Literal, Static,
+                 Prim, AInt, ABool, AVar, RInt, RDec, RWord, Rep, Var, Return, Rooted, Owned,
+                 Lambda, Closure, no_links)
+import emit.tir.statics (StaticDef, StaticLaid, SBlock, SFile, WRaw, named, text_block, str_kind,
+                         bytes_kind, wide_kind)
+
+/// A value the build knows whole, as static data holds it: a string's or a byte string's bytes, an
+/// embedded file by its bytes' digest, a 128-bit width's value as its high and low 64 bits.
+pub type Datum =
+  | SStr(Bytes)
+  | SBytes(Bytes)
+  | SEmbedded(Bytes)
+  | SWide({ width: Width, high: Int, low: Int })
+
+/// How `s` is laid out as one static object.
+pub fn laid_of(s: Datum) -> StaticLaid =
+  match s {
+    SStr(b) -> SBlock(text_block(str_kind(), b)),
+    SBytes(b) -> SBlock(text_block(bytes_kind(), b)),
+    SEmbedded(digest) -> SFile(digest),
+    SWide(w) ->
+      SBlock({
+        head: [
+          { field: b"kind", value: wide_kind() },
+          { field: b"len", value: 2 },
+          { field: b"layout", value: width_index(w.width) },
+        ],
+        words: [WRaw(w.low), WRaw(w.high)],
+      }),
+  }
+
+/// The definitions `s` needs, each it addresses before it and itself last, which names it.
+pub fn statics_of(s: Datum) -> List<StaticDef> / {abort.raise} = [named(laid_of(s))]
+
+/// `f` with each constant its body and its closures' bodies bind laid out: a string, a byte string,
+/// an embedded file and a 128-bit width's value as the static object named by its content, listed
+/// among `f.statics` (a closure's among its own body's), each once and after those it addresses; a
+/// `Decimal` as its two words, which C writes in place. `()` stays the runtime's, as its word is.
+/// Folding a folded root changes nothing.
+pub fn folded(f: Fn) -> Fn / {abort.raise} = {
+  let b = folded_block(f.body, { defs: f.statics, seen: names_of(f.statics) });
+  {
+    ..f,
+    body: b.block,
+    lambdas: f.lambdas.map(|l: Lambda|
+      match l { Closure(c) -> Closure({ ..c, body: folded(c.body) }) }),
+    statics: b.held.defs,
+  }
+}
+
+/// The statics a body names so far, in order, and their names.
+type Held = { defs: List<StaticDef>, seen: Map<Bytes, Bool> }
+
+fn names_of(defs: List<StaticDef>) -> Map<Bytes, Bool> =
+  defs.fold(Map::new(), |m: Map<Bytes, Bool>, d: StaticDef| m.insert(d.name, true))
+
+/// `h` holding each of `defs` it does not hold already, in order.
+fn holding(h: Held, defs: List<StaticDef>) -> Held =
+  defs.fold(h, |acc: Held, d: StaticDef|
+    if acc.seen.contains(d.name) { acc }
+    else { { defs: acc.defs.push(d), seen: acc.seen.insert(d.name, true) } })
+
+/// Block `b` with each constant it binds, through the blocks its instructions hold, laid out, and
+/// the statics `held` and it name.
+fn folded_block(b: Block, held: Held) -> { block: Block, held: Held } / {abort.raise} =
+  b.fold({ block: [], held: held }, |acc: { block: Block, held: Held }, i: Inst| {
+    let x = match i {
+      Let(l) -> {
+        let v = folded_val(l.val, acc.held);
+        { inst: Let({ ..l, val: v.val }), held: v.held }
+      },
+      Do(d) -> {
+        let v = folded_val(d.val, acc.held);
+        { inst: Do({ ..d, val: v.val }), held: v.held }
+      },
+      If(x) -> {
+        let t = folded_block(x.then, acc.held);
+        let o = folded_block(x.otherwise, t.held);
+        { inst: If({ ..x, then: t.block, otherwise: o.block }), held: o.held }
+      },
+      Case(c) -> {
+        let arms = c.arms.fold(
+          { arms: [], held: acc.held },
+          |s: { arms: List<{ when: Int, body: Block }>, held: Held }, a: { when: Int, body: Block }| {
+            let y = folded_block(a.body, s.held);
+            { arms: s.arms.push({ when: a.when, body: y.block }), held: y.held }
+          },
+        );
+        let r = folded_block(c.rest, arms.held);
+        { inst: Case({ ..c, arms: arms.arms, rest: r.block }), held: r.held }
+      },
+      Match(m) -> {
+        let arms = m.arms.fold(
+          { arms: [], held: acc.held },
+          |s: { arms: List<Block>, held: Held }, a: Block| {
+            let y = folded_block(a, s.held);
+            { arms: s.arms.push(y.block), held: y.held }
+          },
+        );
+        let r = folded_block(m.rest, arms.held);
+        { inst: Match({ arms: arms.arms, rest: r.block }), held: r.held }
+      },
+      Loop(l) -> {
+        let y = folded_block(l.body, acc.held);
+        { inst: Loop({ ..l, body: y.block }), held: y.held }
+      },
+      Handle(h) -> {
+        let y = folded_block(h.body, acc.held);
+        { inst: Handle({ ..h, body: y.block }), held: y.held }
+      },
+      _ -> { inst: i, held: acc.held },
+    };
+    { block: acc.block.push(x.inst), held: x.held }
+  })
+
+/// `v` with the constant it is laid out, and the statics that names.
+fn folded_val(v: Val, held: Held) -> { val: Val, held: Held } / {abort.raise} =
+  match v {
+    Literal(l) -> match static_of_lit(l) {
+      Some(s) -> {
+        let defs = statics_of(s);
+        { val: Static(defs.get(defs.len() - 1).name), held: holding(held, defs) }
+      },
+      None -> match l {
+        LDec(text) -> {
+          let w = decimal_words(text);
+          { val: Prim({ op: b"decimal", on: RInt, args: [AInt(w.lo), AInt(w.hi)] }), held: held }
+        },
+        _ -> { val: v, held: held },
+      },
+    },
+    _ -> { val: v, held: held },
+  }
+
+/// The static object literal `l` is, where it is one: a string, a byte string, an embedded file, and
+/// a width wider than a register, whose literal holds its low 64 bits alone where the high ones only
+/// extend their sign.
+fn static_of_lit(l: Lit) -> Option<Datum> =
+  match l {
+    LStr(s) -> Some(SStr(s)),
+    LBytes(b) -> Some(SBytes(b)),
+    LEmbedded(digest, _) -> Some(SEmbedded(digest)),
+    LWide(name, high, low) -> wide_of(name, high, low),
+    LFixed(name, bits) -> wide_of(name, if bits < 0 { 0 - 1 } else { 0 }, bits),
+    _ -> None,
+  }
+
+fn wide_of(name: Bytes, high: Int, low: Int) -> Option<Datum> =
+  match width_named(name) {
+    Some(w) -> if w.bits > 64 { Some(SWide({ width: w, high: high, low: low })) } else { None },
+    None -> None,
+  }
+
+/// The two words a `Decimal` literal's text names, as the runtime lays a decimal out: its flags (its
+/// scale in bits 16 to 23, its sign in bit 31) with the low 32 bits of its mantissa above them, then
+/// the mantissa's middle and high 32 bits. The scale is as written, and a zero is never negative.
+/// Raises on a text that names no decimal.
+pub fn decimal_words(literal: Bytes) -> { lo: Int, hi: Int } / {abort.raise} =
+  match Decimal::of_string(String::of_bytes(decimal_text(literal))) {
+    None -> panic("a decimal literal that does not read"),
+    Some(d) -> {
+      let text = Bytes::of_string(d.to_string());
+      let negative = text.len() > 0 && text.at(0) == 45;
+      let body = if negative { text.slice(1, text.len()) } else { text };
+      let point = match body.index_of(b".") { Some(i) -> i, None -> body.len() };
+      let scale = if point < body.len() { body.len() - point - 1 } else { 0 };
+      let mantissa = range(0, body.len()).fold(0u128, |m: U128, i: Int|
+        if body.at(i) == 46 { m } else { m * 10u128 + U128::of_int(body.at(i) - 48) });
+      let part = |shift: Int| mantissa >>> shift & U128::of_int(4294967295);
+      let sign = if negative && mantissa != 0u128 { 1u128 << 31 } else { 0u128 };
+      {
+        lo: signed(U128::of_int(scale) << 16 | sign | part(0) << 32),
+        hi: signed(part(32) | part(64) << 32),
+      }
+    },
+  }
+
+/// A decimal literal's text as `Decimal::of_string` reads it: past its separators, any space after
+/// a pattern's `-`, and its `m`.
+fn decimal_text(literal: Bytes) -> Bytes =
+  Bytes::concat_all(
+    range(0, literal.len()).map(|i: Int| {
+      let b = literal.at(i);
+      if b <= 32 || b == 95 || b == 109 { b"" } else { literal.slice(i, i + 1) }
+    }),
+  )
+
+/// The `Int` whose 64 bits are `w`'s, which is below 2 to the 64th.
+fn signed(w: U128) -> Int / {abort.raise} =
+  if w >= 1u128 << 63 { Int::of_u128(w - (1u128 << 63)) + (0 - 9223372036854775807 - 1) }
+  else { Int::of_u128(w) }
+
+fn local(id: Int, ty: Bytes, rep: Rep) -> Var =
+  { id: id, ty: TyCon({ name: ty, args: [] }), rep: rep }
+
+fn bind(v: Var, val: Val) -> Inst = Let({ var: v, val: val, at: dummy_span(), unwind: [] })
+
+fn root(body: Block, lambdas: List<Lambda>) -> Fn =
+  {
+    key: Named(b"m.f"),
+    kind: Rooted,
+    params: [],
+    conv: { params: [], reps: [], answer: RWord, answered: Owned },
+    body: body,
+    lambdas: lambdas,
+    base: 0,
+    members: [],
+    links: no_links(),
+    statics: [],
+  }
+
+/// Every value `b` binds, through the blocks its branches hold.
+fn bound_values(b: Block) -> List<Val> =
+  b.fold([], |acc: List<Val>, i: Inst|
+    match i {
+      Let(l) -> acc.push(l.val),
+      If(x) -> acc.concat(bound_values(x.then)).concat(bound_values(x.otherwise)),
+      _ -> acc,
+    })
+
+fn name_of(d: Datum) -> Bytes / {abort.raise} = statics_of(d).get(0).name
+
+test "each constant a body binds is the static its content names, listed once, a closure's in its own body" {
+  let s = |id: Int| local(id, b"String", RWord);
+  let inner = root([bind(s(0), Literal(LStr(b"b"))), Return(AVar(s(0)))], []);
+  let f = folded(
+    root(
+      [
+        bind(s(1), Literal(LStr(b"a"))),
+        If({
+          cond: ABool(true),
+          then: [bind(s(2), Literal(LStr(b"a")))],
+          otherwise: [bind(local(3, b"Bytes", RWord), Literal(LBytes(b"a")))],
+        }),
+        bind(local(4, b"Bytes", RWord), Literal(LEmbedded(b"digest", 3))),
+        Return(AVar(s(1))),
+      ],
+      [Closure({ body: inner, captures: 0, at: dummy_span() })],
+    ),
+  );
+  let a = name_of(SStr(b"a"));
+  assert_eq(bound_values(f.body), [
+    Static(a),
+    Static(a),
+    Static(name_of(SBytes(b"a"))),
+    Static(name_of(SEmbedded(b"digest"))),
+  ]);
+  assert_eq(f.statics.map(|d: StaticDef| d.name), [
+    a,
+    name_of(SBytes(b"a")),
+    name_of(SEmbedded(b"digest")),
+  ]);
+  assert_eq(f.statics.get(2).laid, SFile(b"digest"));
+  match f.lambdas.get(0) {
+    Closure(c) -> {
+      assert_eq(bound_values(c.body.body), [Static(name_of(SStr(b"b")))]);
+      assert_eq(c.body.statics.map(|d: StaticDef| d.name), [name_of(SStr(b"b"))])
+    },
+  };
+  assert_eq(folded(f), f)
+}
+
+test "a decimal literal is its two words, its scale as written and a zero never negative" {
+  assert_eq(decimal_words(b"2.50m"), { lo: 2 << 16 | 250 << 32, hi: 0 });
+  assert_eq(decimal_words(b"2.5m"), { lo: 1 << 16 | 25 << 32, hi: 0 });
+  assert_eq(decimal_words(b"- 1.5m"), { lo: 1 << 16 | 1 << 31 | 15 << 32, hi: 0 });
+  assert_eq(decimal_words(b"-0.0m"), { lo: 1 << 16, hi: 0 });
+  // The greatest mantissa fills all 96 bits.
+  assert_eq(decimal_words(b"79_228_162_514_264_337_593_543_950_335m"), {
+    lo: 0 - 4294967296,
+    hi: 0 - 1,
+  });
+  let d = folded(root([bind(local(0, b"Decimal", RDec), Literal(LDec(b"1_000.5m")))], []));
+  assert_eq(bound_values(d.body), [
+    Prim({ op: b"decimal", on: RInt, args: [AInt(1 << 16 | 10005 << 32), AInt(0)] }),
+  ]);
+  assert_eq(d.statics, [])
+}
+
+test "a width wider than a register is the runtime's box of it: its place among widths, its low word, its high" {
+  let wide = { bits: 128, signed: true };
+  assert_eq(
+    laid_of(SWide({ width: wide, high: 0 - 1, low: 0 - 5 })),
+    SBlock({
+      head: [
+        { field: b"kind", value: wide_kind() },
+        { field: b"len", value: 2 },
+        { field: b"layout", value: width_index(wide) },
+      ],
+      words: [WRaw(0 - 5), WRaw(0 - 1)],
+    }),
+  );
+  // A literal holding only its low word extends its sign into the high one.
+  let f = folded(root([bind(local(0, b"I128", RWord), Literal(LFixed(b"I128", 0 - 5)))], []));
+  assert_eq(bound_values(f.body), [
+    Static(name_of(SWide({ width: wide, high: 0 - 1, low: 0 - 5 }))),
+  ]);
+  // `()` stays the runtime's word.
+  let u = folded(root([bind(local(0, b"Unit", RWord), Literal(LUnit))], []));
+  assert_eq(bound_values(u.body), [Literal(LUnit)])
+}
