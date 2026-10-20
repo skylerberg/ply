@@ -14,32 +14,26 @@ import emit.pieces (Piece, Text, Hole, ShapeOf, TagOf, spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases,
                  RSlice, RToken, Leaf, Var, Arg, AVar, AInt, AZero, Made, MRecord, MCtor, MLaid,
                  MBox, MCase, Path, PField, PNamed, PArg, PCapture, PLeaf, PPlace, PCase, PPayload,
-                 RUnit, Data, rep_of_arg, rep_said, var_said, made_said, parts_of, parts_count)
+                 RUnit, RSum, Data, rep_of_arg, rep_said, var_said, made_said, parts_of,
+                 parts_count)
+import emit.layout (SumLaid, LSum, Nullary, Inline, Boxed, WordIs, LowBits, words, header_bytes,
+                    CaseArgs, LWords, P, sum_laid, record_laid, raw)
+import emit.layout
 import emit.lower.held (tail_bits, fields_of, leaves_of, case_leaves_all, case_span, enumerated,
-                        passing, ByReference, InWords, answer_buffer, value_words)
+                        passing, ByReference, InWords, answer_buffer, values_of, unboxed, boxed,
+                        words_held)
 import emit.print.text (Printing, Place, printing, line, pieces, pad, temp, named, name_of,
                         arg_text, check, zero, field_hole, part_names, part_name, part_named,
                         shape_at, slot, unprinted)
 
-/// The C type a value held as `r` is declared in where it is one C value, and otherwise the type of
-/// the first of its C values, which a root answering it returns.
+/// The C type of the first C value a value held as `r` is held in, which a root answering it
+/// returns: `Word` for a value of none, which returns 0.
 pub fn c_type(r: Rep) -> Bytes =
-  match r {
-    RFlat(ls) -> match ls.at(0) { Some(l) -> one_type(l.rep), None -> b"Word" },
-    RCases(_) -> b"int64_t",
-    _ -> one_type(r),
-  }
+  match values_of(r).at(0) { Some(v) -> one_type(v), None -> b"Word" }
 
 /// The C types of the values a value held as `r` is held in and crosses a call in, one per C
-/// parameter: a flat record's leaves and then its word, a sum's constructor's index and then every
-/// case's leaves, a view's list and its offset.
-pub fn c_types(r: Rep) -> List<Bytes> =
-  match r {
-    RFlat(ls) -> ls.map(|l: Leaf| one_type(l.rep)).push(b"Word"),
-    RCases(_) -> [b"int64_t"].concat(case_leaves_all(r).map(|l: Leaf| one_type(l.rep))),
-    RSlice -> [b"Word", b"int64_t"],
-    _ -> [one_type(r)],
-  }
+/// parameter, as `values_of` says.
+pub fn c_types(r: Rep) -> List<Bytes> = values_of(r).map(one_type)
 
 fn one_type(r: Rep) -> Bytes =
   match r {
@@ -54,13 +48,7 @@ fn one_type(r: Rep) -> Bytes =
   }
 
 /// What each of the C values a value held as `r` is held in stands at before anything is set.
-pub fn zeros(r: Rep) -> List<Bytes> =
-  match r {
-    RFlat(ls) -> ls.map(|l: Leaf| zero(l.rep)).push(b"0"),
-    RCases(_) -> [b"0"].concat(case_leaves_all(r).map(|l: Leaf| zero(l.rep))),
-    RSlice -> [b"0", b"0"],
-    _ -> [zero(r)],
-  }
+pub fn zeros(r: Rep) -> List<Bytes> = values_of(r).map(zero)
 
 /// Operand `a` as the C expressions of each of its values.
 pub fn arg_parts(pr: Printing, a: Arg) -> List<Bytes> =
@@ -170,20 +158,12 @@ pub fn head_names(params: List<Rep>, answer: Rep) -> List<Bytes> =
       Some(r) -> {
         let name = b"p".concat(ascii_of_int(i));
         acc.concat(match passing(r) {
-          ByReference -> if boxed(r) { [name, part_name(name, buffer_parts(r).len())] }
-          else { [name] },
+          ByReference -> if boxed(r) { [name, part_name(name, unboxed(r).len())] } else { [name] },
           InWords -> part_names(name, r),
         })
       },
       None -> acc,
     }).concat(if answer_buffer(answer) > 0 { [b"o"] } else { [] })
-
-/// Whether a value held as `r` has a box word after its other C values.
-pub fn boxed(r: Rep) -> Bool = match r { RFlat(_) -> true, _ -> false }
-
-/// How each C value a value held as `r` lays in a caller's buffer is held: all but its box word.
-pub fn buffer_parts(r: Rep) -> List<Rep> =
-  match r { RFlat(ls) -> ls.map(|l: Leaf| l.rep), _ -> parts_of(r) }
 
 /// The statements opening each parameter of `names`, held as `reps`, that crosses by reference:
 /// each of its C values but its box word declared from the caller's copy of its words, taking the
@@ -195,7 +175,7 @@ pub fn params_opened(names: List<Bytes>, reps: List<Rep>) -> List<Bytes> =
         InWords -> acc,
         ByReference -> {
           let name = nth(names, i);
-          let held = buffer_parts(r);
+          let held = unboxed(r);
           let ns = part_names(name, r);
           let read = parts_read(name, held);
           acc.push(
@@ -234,30 +214,18 @@ pub fn words_laid(exprs: List<Bytes>, reps: List<Rep>) -> List<Bytes> =
 /// The C values, held as `reps`, that the buffer at `base` holds from its first word, as
 /// `words_laid` lays them.
 pub fn parts_read(base: Bytes, reps: List<Rep>) -> List<Bytes> =
-  reps.fold({ at: 0, out: [] }, |acc: { at: Int, out: List<Bytes> }, r: Rep| {
-    let word = |k: Int| Bytes::concat_all([base, b"[", ascii_of_int(acc.at + k), b"]"]);
-    {
-      at: acc.at + value_words(r),
-      out: acc.out.push(match r {
-        RFloat -> Bytes::concat_all([b"ply_f64(", word(0), b")"]),
-        RDec -> Bytes::concat_all([b"(PlyDec){", word(0), b", ", word(1), b"}"]),
-        RUnit -> b"0",
-        RWord -> word(0),
-        _ -> Bytes::concat_all([b"(", one_type(r), b")", word(0)]),
-      }),
-    }
-  }).out
+  values_read(|k: Int| Bytes::concat_all([base, b"[", ascii_of_int(k), b"]"]), reps)
 
 /// The C values of an answer held as `r`: `first`, the one its root returns, then those its root
 /// wrote into the buffer at `base`.
 pub fn answer_parts(first: Bytes, base: Bytes, r: Rep) -> List<Bytes> =
-  [first].concat(parts_read(base, parts_of(r).drop(1)))
+  [first].concat(parts_read(base, values_of(r).drop(1)))
 
 /// A root returning `a`: its values past the first written into the buffer `o` as words, and the C
 /// expression the first is returned as.
 pub fn returned(pr: Printing, depth: Int, a: Arg) -> { pr: Printing, value: Bytes } = {
   let ps = arg_parts(pr, a);
-  let ws = words_laid(ps.drop(1), parts_of(rep_of_arg(a)).drop(1));
+  let ws = words_laid(ps.drop(1), values_of(rep_of_arg(a)).drop(1));
   {
     pr: range(0, ws.len()).fold(pr, |q: Printing, k: Int|
       line(q, depth, Bytes::concat_all([b"o[", ascii_of_int(k), b"] = ", nth(ws, k), b";"]))),
@@ -305,7 +273,7 @@ pub fn entry_opened(i: Int, r: Rep) -> { text: List<Piece>, args: List<Bytes> } 
   match passing(r) {
     InWords -> { text: opened, args: values },
     ByReference -> {
-      let held = buffer_parts(r);
+      let held = unboxed(r);
       let laid = Bytes::concat_all([local, b"_r"]);
       {
         text: opened.push(
@@ -333,7 +301,7 @@ pub fn entry_outs(r: Rep) -> List<Bytes> = if answer_buffer(r) > 0 { [b"ro"] } e
 /// answer as a word, a flat record's made of its leaves and a sum's of its cases where no word was,
 /// each value past the first read out of the answer's buffer.
 pub fn entry_answered(pr: Printing, r: Rep, call: Bytes) -> { pr: Printing, out: List<Piece> } = {
-  let rest = parts_of(r).drop(1);
+  let rest = values_of(r).drop(1);
   let outs = range(1, rest.len() + 1).map(|k: Int| b"r".concat(ascii_of_int(k)));
   let read = parts_read(b"ro", rest);
   let called = |first: Bytes|
@@ -411,11 +379,90 @@ pub fn made(
       MCtor(c) -> if m.args.len() == 0 { ctor_value(p, pr, v, c.name) }
       else { ctor_built(p, pr, v, c.name, m.args, m.reuse, m.kept) },
       MLaid(l) -> laid_made(p, pr, v, l.ctor, l.fields, m.args, m.reuse, m.kept),
-      MBox(_) -> unprinted(Data, b"a box made", made_said(m.made)),
-      MCase(_) -> unprinted(Data, b"a boxed case made", made_said(m.made)),
+      MBox(b) -> box_made(p, pr, v, None, b.words, m.args, m.reuse, m.kept),
+      MCase(c) ->
+        box_made(
+          p,
+          pr,
+          v,
+          if c.skip > 0 { Some(c.case) } else { None },
+          c.skip + c.words,
+          m.args,
+          m.reuse,
+          m.kept,
+        ),
       other -> unprinted(Data, b"a list or a closure, which other printers make", made_said(other)),
     },
   }
+
+/// A block of `n` words holding `args`' words one after another, which it takes, after the case's
+/// place in its first word where `tag` gives one: in the cells `reuse` names where they are some,
+/// which hold the arguments `kept` already, and else allocated by its size.
+fn box_made(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  tag: Option<Int>,
+  n: Int,
+  args: List<Arg>,
+  reuse: Option<Var>,
+  kept: List<Int>,
+) -> Printing = {
+  let nm = named(pr, v);
+  let allocated = Bytes::concat_all([
+    nm.name,
+    b" = rt_alloc_bytes_p(ctx, ",
+    int_lit(header_bytes() + 8 * n),
+    b");",
+  ]);
+  let first = match tag { Some(_) -> 1, None -> 0 };
+  let tagged = match tag {
+    Some(c) -> [Bytes::concat_all([slot(nm.name, 0), b" = ", int_lit(c), b";"])],
+    None -> [],
+  };
+  let writes = |all: Bool|
+    Bytes::join(
+      tagged.concat(
+        range(0, args.len()).fold(
+          { at: first, out: [] },
+          |acc: { at: Int, out: List<Bytes> }, k: Int| {
+            let a = match args.at(k) { Some(x) -> x, None -> AZero(RWord) };
+            let held = unboxed(rep_of_arg(a));
+            let ws = words_laid(arg_parts(pr, a), held);
+            {
+              at: acc.at + words_held(held),
+              out: if !all && kept.contains(k) { acc.out } else {
+                acc.out.concat(
+                  range(0, ws.len()).map(|j: Int|
+                    Bytes::concat_all([slot(nm.name, acc.at + j), b" = ", nth(ws, j), b";"])),
+                )
+              },
+            }
+          },
+        ).out,
+      ),
+      b" ",
+    );
+  line(nm.pr, p.depth, match reuse {
+    None -> Bytes::concat_all([b"Word ", allocated, b" ", writes(true)]),
+    Some(tok) ->
+      Bytes::concat_all([
+        b"Word ",
+        nm.name,
+        b" = ",
+        name_of(pr, tok),
+        b"; if (",
+        nm.name,
+        b") { ",
+        writes(false),
+        b" } else { ",
+        allocated,
+        b" ",
+        writes(true),
+        b" }",
+      ]),
+  })
+}
 
 /// A record of `names` holding the words `args`, which it takes, laid out by the runtime as the
 /// values they are.
@@ -703,7 +750,16 @@ pub fn got(
             b"a capture, which a closure's printer reads",
             Bytes::concat_all([b"capture ", ascii_of_int(k), b" of ", var_said(g.of)]),
           ),
-        PCase(_) -> unprinted(Data, b"a case's payload read", var_said(g.of)),
+        PCase(c) -> match g.of.rep {
+          RSum(s) ->
+            declared_as(
+              p,
+              pr,
+              v,
+              case_read(s.laid, part_names(base, g.of.rep), c.case, c.at, v.rep),
+            ),
+          _ -> unprinted(Data, b"a case's payload read out of no sum", var_said(g.of)),
+        },
         PPayload -> unprinted(Data, b"a block's bytes read", var_said(g.of)),
       }
     },
@@ -1251,6 +1307,10 @@ pub fn gathered(
     Some(v) -> {
       let xs = parts.fold([], |acc: List<Bytes>, a: Arg| acc.concat(arg_parts(pr, a)));
       match v.rep {
+        RSum(s) -> match parts.at(0) {
+          Some(AInt(i)) -> declared_as(p, pr, v, case_laid(pr, s.laid, i, parts.drop(1))),
+          _ -> unprinted(Data, b"a sum gathered from no case's place", var_said(v)),
+        },
         RMaybe ->
           declared_as(p, pr, v, [if parts.at(0) == Some(AInt(1)) { nth(xs, 1) } else { b"0" }]),
         RTagged ->
@@ -1276,6 +1336,92 @@ pub fn gathered(
       }
     },
   }
+
+/// The C values of case `i` of a sum laid as `s` holding `payload`, its arguments in order: the
+/// value its test reads, the payload's words where the case lays them (a box's word where the case is
+/// boxed), the low bits of a tagged pointer set, every other word zero, then the box word, zero.
+fn case_laid(pr: Printing, s: SumLaid, i: Int, payload: List<Arg>) -> List<Bytes> = {
+  let n = words(LSum(s));
+  let blank = range(0, n).map(|_: Int| b"0");
+  let put = |ws: List<Bytes>, at: Int, e: Bytes|
+    range(0, ws.len()).map(|k: Int| if k == at { e } else { nth(ws, k) });
+  let laid = match s.cases.at(i) {
+    None -> blank,
+    Some(c) -> {
+      let tagged = |e: Bytes|
+        match c.test {
+          LowBits(t) -> if t.bits == 0 { e }
+          else { Bytes::concat_all([b"((Word)(", e, b") | ", int_lit(t.bits), b")"]) },
+          _ -> e,
+        };
+      let tested = match c.test { WordIs(t) -> put(blank, t.at, int_lit(t.value)), _ -> blank };
+      match c.payload {
+        Nullary -> tested,
+        Inline(l) -> {
+          let ws = payload.fold([], |acc: List<Bytes>, a: Arg|
+            acc.concat(words_laid(arg_parts(pr, a), unboxed(rep_of_arg(a)))));
+          range(0, n).map(|k: Int| {
+            let j = k - l.offset;
+            if j < 0 || j >= ws.len() { nth(tested, k) }
+            else if l.stripped == Some(k) { tagged(nth(ws, j)) }
+            else { nth(ws, j) }
+          })
+        },
+        Boxed(b) -> {
+          let w = match payload.at(0) { Some(a) -> nth(arg_parts(pr, a), 0), None -> b"0" };
+          put(tested, b.at, if b.stripped { tagged(w) } else { w })
+        },
+      }
+    },
+  };
+  if n > 1 { laid.push(b"0") } else { laid }
+}
+
+/// The C values of a value held as `r` whose words are `word(0)`, `word(1)`, ..: each read out of its
+/// words as `words_laid` lays them, and a box word zero, which such a read never holds.
+fn read_from(word: (Int) -> Bytes, r: Rep) -> List<Bytes> = {
+  let read = values_read(word, unboxed(r));
+  if boxed(r) { read.push(b"0") } else { read }
+}
+
+/// The C values, held as `vs`, whose words are `word(0)`, `word(1)`, .., as `words_laid` lays them.
+fn values_read(word: (Int) -> Bytes, vs: List<Rep>) -> List<Bytes> =
+  vs.fold({ at: 0, out: [] }, |acc: { at: Int, out: List<Bytes> }, h: Rep|
+    {
+      at: acc.at + words_held([h]),
+      out: acc.out.push(match h {
+        RFloat -> Bytes::concat_all([b"ply_f64(", word(acc.at), b")"]),
+        RDec -> Bytes::concat_all([b"(PlyDec){", word(acc.at), b", ", word(acc.at + 1), b"}"]),
+        RUnit -> b"0",
+        RWord -> word(acc.at),
+        _ -> Bytes::concat_all([b"(", one_type(h), b")", word(acc.at)]),
+      }),
+    }).out
+
+/// The C values of a value held as `r` read out of case `case` of the sum laid as `s` whose C values
+/// are `ws`, from word `at` of the case's payload: in the sum's own words, a tagged word's pointer
+/// masked, or in its box, past the box's tag words.
+fn case_read(s: SumLaid, ws: List<Bytes>, case: Int, at: Int, r: Rep) -> List<Bytes> = {
+  let masked = |w: Bytes| Bytes::concat_all([b"((", w, b") & ~(Word)7)"]);
+  match s.cases.at(case) {
+    Some(c) -> match c.payload {
+      Inline(l) ->
+        read_from(
+          |k: Int| {
+            let w = l.offset + at + k;
+            if l.stripped == Some(w) { masked(nth(ws, w)) } else { nth(ws, w) }
+          },
+          r,
+        ),
+      Boxed(b) -> {
+        let base = if b.stripped { masked(nth(ws, b.at)) } else { nth(ws, b.at) };
+        read_from(|k: Int| slot(base, b.skip + at + k), r)
+      },
+      Nullary -> read_from(|_: Int| b"0", r),
+    },
+    None -> read_from(|_: Int| b"0", r),
+  }
+}
 
 /// The static constant `name`, its object laid out by the unit, as its word.
 pub fn statics(p: Place, pr: Printing, into: Option<Var>, name: Bytes) -> Printing =
@@ -2051,4 +2197,88 @@ test "a record laid out as its type says is made of its fields, one it holds in 
   );
   assert_eq(reused.filter(|l: Bytes| l.index_of(b"ply_words(t1)[0] = ") != None).len(), 1);
   assert_eq(reused.filter(|l: Bytes| l.index_of(b"ply_embed(ctx, t1, 1, p1, 0);") != None).len(), 2)
+}
+
+fn sum_args(args: List<layout::Laid>) -> CaseArgs = { args: record_laid(args), indirect: false }
+
+fn pointer_laid() -> layout::Laid = LWords([P])
+
+test "a sum's case is gathered as its test's value, its payload where the case lays it, and zero elsewhere" {
+  let pr = printing(Map::new().insert(0, b"p0").insert(1, b"p1"));
+  let p = AVar(local(0, RWord));
+  let maybe = sum_laid([sum_args([]), sum_args([pointer_laid()])]);
+  assert_eq([case_laid(pr, maybe, 0, []), case_laid(pr, maybe, 1, [p])], [
+    [b"INT64_C(0)"],
+    [b"p0"],
+  ]);
+  // A tagged pointer's case sets its low bits.
+  let result = sum_laid([sum_args([pointer_laid()]), sum_args([pointer_laid()])]);
+  assert_eq(case_laid(pr, result, 1, [p]), [b"((Word)(p0) | INT64_C(1))"]);
+  // A tag word's case is its place, the payload after it, then the box word.
+  let tagged = sum_laid([sum_args([]), sum_args([LWords([raw()])])]);
+  assert_eq(case_laid(pr, tagged, 1, [AVar(local(1, RInt))]), [b"INT64_C(1)", b"(Word)(p1)", b"0"]);
+  assert_eq(case_laid(pr, tagged, 0, []), [b"INT64_C(0)", b"0", b"0"]);
+  // A boxed case past the eighth holds its box's word, tagged 7.
+  let nine = sum_laid(
+    range(0, 9).map(|_: Int| { args: record_laid([pointer_laid()]), indirect: true }),
+  );
+  assert_eq(case_laid(pr, nine, 8, [p]), [b"((Word)(p0) | INT64_C(7))"])
+}
+
+test "a case's payload is read where the case lays it: a word masked, after a tag word, or in a box" {
+  let result = sum_laid([sum_args([pointer_laid()]), sum_args([pointer_laid()])]);
+  assert_eq(case_read(result, [b"x"], 1, 0, RWord), [b"((x) & ~(Word)7)"]);
+  let tagged = sum_laid([sum_args([]), sum_args([LWords([raw()]), LWords([raw()])])]);
+  assert_eq(case_read(tagged, [b"x_0", b"x_1", b"x_2", b"x_3"], 1, 1, RInt), [b"(int64_t)x_2"]);
+  // A field of two words read whole is a projection of them, holding no box.
+  assert_eq(
+    case_read(
+      tagged,
+      [b"x_0", b"x_1", b"x_2", b"x_3"],
+      1,
+      0,
+      RFlat([{ name: b"a", rep: RInt }, { name: b"b", rep: RFloat }]),
+    ),
+    [b"(int64_t)x_1", b"ply_f64(x_2)", b"0"],
+  );
+  let nine = sum_laid(
+    range(0, 9).map(|_: Int| { args: record_laid([pointer_laid()]), indirect: true }),
+  );
+  assert_eq(case_read(nine, [b"x"], 8, 0, RWord), [b"ply_words(((x) & ~(Word)7))[1]"])
+}
+
+test "a box is allocated by its size and its words written, a boxed case's place first past the eighth" {
+  let pr = printing(Map::new().insert(0, b"p0").insert(1, b"p1"));
+  let m = {
+    made: MCase({ case: 8, skip: 1, words: 1 }),
+    args: [AVar(local(0, RWord))],
+    reuse: None,
+    kept: [],
+  };
+  assert_eq(
+    spelled(made(place(), pr, Some(local(2, RWord)), m).out),
+    b"  Word t1 = rt_alloc_bytes_p(ctx, INT64_C(32)); ply_words(t1)[0] = INT64_C(8); ply_words(t1)[1] = p0;\n",
+  );
+  // In a reused block, what it holds already is not written again.
+  let boxed_pair = {
+    made: MBox({ words: 2 }),
+    args: [AVar(local(0, RWord)), AVar(local(1, RInt))],
+    reuse: Some(local(3, RToken(2))),
+    kept: [0],
+  };
+  let text = spelled(
+    made(
+      place(),
+      { ..pr, names: pr.names.insert(3, b"p3") },
+      Some(local(2, RWord)),
+      boxed_pair,
+    ).out,
+  );
+  assert(
+    text.index_of(
+        b"Word t1 = p3; if (t1) { ply_words(t1)[1] = (Word)(p1); } else { t1 = rt_alloc_bytes_p(ctx, INT64_C(32)); ply_words(t1)[0] = p0; ply_words(t1)[1] = (Word)(p1); }",
+      )
+      != None,
+    Some(String::of_bytes_lossy(text)),
+  )
 }
