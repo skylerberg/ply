@@ -10,16 +10,15 @@ import emit.pieces (spelled)
 import emit.compare (Program, program_of, formed, checked, printed_text, not_built, printed_by_form)
 import emit.print (printed_fn)
 import emit.own (owned)
-import emit.tir (Rep, RFloat, RWord, RMaybe, RFlat, RCases, Var, AVar, AInt, AZero, Val, Make,
-                 MRecord, MCtor, MLaid, Get, Pack, Gathered, PLeaf, PNamed, Inst, Let, Decl, Assign,
-                 If, Case, Match, Block, Fn, Family, Data, Calling, Leaf, counted, rep_of_arg)
-import emit.lower.held (enumerated, held_as, passing, ByReference)
+import emit.tir (Rep, RFloat, RWord, RInt, RSum, RFlat, Var, AVar, AInt, AZero, Val, Make, MRecord,
+                 Get, Pack, Gathered, PLeaf, PNamed, Inst, Let, Decl, Assign, If, Case, Match,
+                 Block, Fn, Family, Data, Calling, Leaf, counted, rep_of_arg)
+import emit.lower.held (held_as, passing, ByReference, values_of)
 import emit.lower.base (Context, started)
 import emit.lower.calling (context_of)
 import emit.lower.data (updated)
 import emit.code (NLit)
-import emit.reps (TyOpen, no_ctors)
-import emit.c (KBoxed, KFloat, KInt)
+import emit.reps (no_ctors)
 import emit.typing (no_filings, unknown_type, filed_as)
 import check.types (TyRecord, int_type)
 import syntax.patterns (LUnit)
@@ -175,39 +174,24 @@ fn param(f: Fn, i: Int) -> Var / {abort.raise} = f.params.get(i)
 
 fn floats(names: List<Bytes>) -> Rep = RFlat(names.map(|n: Bytes| { name: n, rep: RFloat }))
 
-/// Whether every C value `rt_field_p` reads a field out of in `text` is declared there as one word,
-/// a local or a parameter.
-fn read_out_of_declared(text: Bytes) -> Bool / {abort.raise} =
-  text.split(b"rt_field_p(ctx, ").drop(1).all(|after: Bytes|
-    match after.index_of(b",") {
-      Some(e) -> {
-        let base = after.slice(0, e);
-        [b" = ", b";", b",", b")"].any(|end: Bytes|
-          text.index_of(Bytes::concat_all([b"Word ", base, end])) != None)
-      },
-      None -> false,
-    })
-
-test "a field read by name out of a record a generic call answers as its leaves is read out of their word" {
-  // `sample`'s answer crosses as its leaves, while `Found<a>` leaves its layout to `a`, so its field
-  // is read by name.
+test "a record or a sum a type variable lays out is lowered as a placeholder its callers' layouts settle" {
+  // `Sample<a>` and `Found<a>` lay `a` out, so each body needs the layout of its own `a`.
   let src = Bytes::concat_all([
     b"type Sample<a> = { value: Option<a>, record: List<Int>, discards: Int }\n",
     b"type Found<a> = { value: a, record: List<Int>, size: Int }\n",
     b"fn sample<a>(x: a, n: Int) -> Sample<a> = { value: Some(x), record: [n], discards: 0 }\n",
     b"fn direct<a>(x: a, n: Int) -> Found<a> = { let drew = sample(x, n); match drew.value { Some(v) -> { value: v, record: drew.record, size: n }, None -> { value: x, record: [], size: 0 } } }\n",
-    b"fn folded<a>(x: a, cases: Int) -> Option<Found<a>> = range(0, cases).fold(None, |acc: Option<Found<a>>, case: Int| match acc { Some(_) -> acc, None -> { let drew = sample(x, case); match drew.value { None -> acc, Some(v) -> Some({ value: v, record: drew.record, size: case }) } } })\n",
   ]);
   match program_of(src) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) ->
       assert_eq(
-        [b"direct", b"folded"].map(|n: Bytes|
-          match printed_by_form(p, n) {
-            Ok(t) -> Ok(t.index_of(b"rt_field_p(") != None && read_out_of_declared(t)),
-            Err(why) -> Err(why),
+        [b"sample", b"direct"].map(|n: Bytes|
+          match formed(p, n) {
+            Ok(f) -> f.links.needs.contains({ var: 0, reads: Layout }),
+            Err(_) -> false,
           }),
-        [Ok(true), Ok(true)],
+        [true, true],
       ),
   }
 }
@@ -244,18 +228,17 @@ test "a record wider than four words is held as its leaves, crossing a call by r
 
 test "a record held in place is read as its leaves among its holder's, and through to a field" {
   let p = program();
-  // `from` is the first three of `Seg`'s leaves: its two and its word.
+  // `from` is the first two of `Seg`'s leaves, a record in place having no word of its own.
   let s = form_of(p, b"start");
   let read = lets(s.body);
-  assert_eq(read.map(|l: { var: Var, val: Val }| l.val).take(3), [
+  assert_eq(read.map(|l: { var: Var, val: Val }| l.val).take(2), [
     Get({ of: param(s, 0), path: PLeaf(0) }),
     Get({ of: param(s, 0), path: PLeaf(1) }),
-    Get({ of: param(s, 0), path: PLeaf(2) }),
   ]);
-  assert_eq(read.map(|l: { var: Var, val: Val }| l.var.rep).drop(3), [floats([b"x", b"y"])]);
-  // `to.x` is the fifth, and nothing is read but leaves.
+  assert_eq(read.map(|l: { var: Var, val: Val }| l.var.rep).drop(2), [floats([b"x", b"y"])]);
+  // `to.x` is the fourth, and nothing is read but leaves.
   let e = form_of(p, b"end_x");
-  assert(vals(e).contains(Get({ of: param(e, 0), path: PLeaf(4) })), None);
+  assert(vals(e).contains(Get({ of: param(e, 0), path: PLeaf(3) })), None);
   assert_eq(
     vals(e).filter(|v: Val|
       match v { Get(g) -> match g.path { PLeaf(_) -> false, _ -> true }, _ -> false }),
@@ -335,7 +318,7 @@ test "an update reads its base's layout once, however wide the record" {
 test "a record wider than four words is held as its leaves, and an update gathers them with nothing made" {
   let f = form_of(program(), b"relabelled");
   let s = param(f, 0);
-  // `Seg` is its points' leaves and words and its label: seven words, crossing by reference.
+  // `Seg` is its points' leaves and its label: five words, crossing by reference.
   assert_eq(passing(s.rep), ByReference);
   assert_eq(vals(f).filter(|v: Val| match v { Make(_) -> true, Pack(_) -> true, _ -> false }), []);
   match vals(f).at(vals(f).len() - 1) { Some(Gathered(_)) -> (), other -> assert_eq(other, None) }
@@ -380,85 +363,60 @@ test "a record joined however deep, from a parameter or a literal, and an Option
   let reset = form_of(p, b"reset");
   assert_eq(joins(reset.body).map(|v: Var| v.rep), [floats([b"x", b"y"])]);
   assert_eq(vals(reset).map(|v: Val| match v { Gathered(_) -> true, _ -> false }), [true]);
-  // `None` and an `Option` parameter join as its payload's word, no object made.
+  // `None` and an `Option` parameter join as the `Option`'s one word, no box made.
   let opt = form_of(p, b"opt_join");
-  assert_eq(joins(opt.body).map(|v: Var| v.rep), [RMaybe]);
+  assert_eq(joins(opt.body).map(|v: Var| values_of(v.rep).len()), [1]);
   assert_eq(vals(opt).filter(|v: Val| match v { Pack(_) -> true, Make(_) -> true, _ -> false }), [])
 }
 
-test "a record holds an Option as its payload's word and a small record in place among its leaves" {
+test "a record holds an Option among its leaves as its words, and a record in place as its leaves" {
   let p = program();
   let held = form_of(p, b"held");
-  assert_eq(lets(held.body).map(|l: { var: Var, val: Val }| { rep: l.var.rep, val: l.val }), [
-    { rep: RMaybe, val: Get({ of: param(held, 0), path: PLeaf(0) }) },
-  ]);
-  // `Out` crosses as its own `b` and `In`'s leaf and word; `o.i.a` reads `In`'s leaf where it lies.
+  assert_eq(
+    lets(held.body).map(|l: { var: Var, val: Val }|
+      { sum: match l.var.rep { RSum(_) -> true, _ -> false }, val: l.val }),
+    [{ sum: true, val: Get({ of: param(held, 0), path: PLeaf(0) }) }],
+  );
+  // `Out` crosses as its own `b` and `In`'s leaf; `o.i.a` reads `In`'s leaf where it lies.
   let o = form_of(p, b"inner_a");
   match param(o, 0).rep {
-    RFlat(ls) -> assert_eq(ls.map(|l: Leaf| l.name), [b"b", b"i.a", b"i."]),
+    RFlat(ls) -> assert_eq(ls.map(|l: Leaf| l.name), [b"b", b"i.a"]),
     other -> assert_eq(other, RWord),
   };
   assert_eq(vals(o).filter(|v: Val| match v { Get(g) -> g.of == param(o, 0), _ -> false }), [
     Get({ of: param(o, 0), path: PLeaf(1) }),
-    Get({ of: param(o, 0), path: PLeaf(2) }),
   ])
 }
 
-test "a sum the code knows is gathered from its constructor's index, its other cases zero" {
+test "a sum is gathered from its case's place and its arguments, nothing for a case of no words" {
   let p = program();
   let none = lets(form_of(p, b"nothing").body);
-  assert_eq(none.map(|l: { var: Var, val: Val }| { rep: l.var.rep, val: l.val }), [
-    { rep: RMaybe, val: Gathered({ parts: [AInt(0)] }) },
-  ]);
-  // An `Option` of a small record is held as its cases: `None` is index zero, `Some`'s leaves zero.
-  let cases = lets(form_of(p, b"none_of").body);
-  assert_eq(cases.map(|l: { var: Var, val: Val }| l.val), [
-    Gathered({ parts: [AInt(0), AZero(RFloat), AZero(RFloat), AZero(RWord)] }),
-  ]);
+  assert_eq(none.map(|l: { var: Var, val: Val }| l.val), [Gathered({ parts: [AInt(0)] })]);
   assert_eq(
-    cases.map(|l: { var: Var, val: Val }| match l.var.rep { RCases(_) -> true, _ -> false }),
+    none.map(|l: { var: Var, val: Val }| match l.var.rep { RSum(_) -> true, _ -> false }),
     [true],
-  )
+  );
+  // An `Option` of a record is gathered alike: `None` holds no leaves.
+  assert_eq(lets(form_of(p, b"none_of").body).map(|l: { var: Var, val: Val }| l.val), [
+    Gathered({ parts: [AInt(0)] }),
+  ])
 }
 
-test "a sum whose constructors take nothing is held as its constructor's index, and answered as one" {
+test "a sum whose constructors take nothing is held as its one word, gathered from its case's place" {
   let made = lets(form_of(program(), b"least").body);
-  assert_eq(made.map(|l: { var: Var, val: Val }| enumerated(l.var.rep)), [true]);
+  assert_eq(made.map(|l: { var: Var, val: Val }| values_of(l.var.rep).len()), [1]);
   assert_eq(made.map(|l: { var: Var, val: Val }| l.val).take(1), [Gathered({ parts: [AInt(0)] })])
 }
 
-test "a declared sum's constructor is made as its object, its arguments laid as its declaration says" {
+test "a declared sum's constructor is gathered from its case's place and its arguments" {
   let p = program();
   let circle = form_of(p, b"circle");
   let boxed = form_of(p, b"boxed");
-  assert_eq(vals(circle), [
-    Make({
-      made: MLaid({
-        ctor: Some(b"m.Circle"),
-        fields: [{ name: b"a000", kind: KFloat, ty: TyOpen([]) }],
-      }),
-      args: [AVar(param(circle, 0))],
-      reuse: None,
-      kept: [],
-    }),
-  ]);
+  assert_eq(vals(circle), [Gathered({ parts: [AInt(0), AVar(param(circle, 0))] })]);
   assert_eq(vals(boxed), [
-    Make({
-      made: MLaid({
-        ctor: Some(b"m.Box"),
-        fields: [
-          { name: b"a000", kind: KInt, ty: TyOpen([]) },
-          { name: b"a001", kind: KBoxed, ty: TyOpen([]) },
-        ],
-      }),
-      args: [AVar(param(boxed, 0)), AVar(param(boxed, 1))],
-      reuse: None,
-      kept: [],
-    }),
+    Gathered({ parts: [AInt(1), AVar(param(boxed, 0)), AVar(param(boxed, 1))] }),
   ]);
-  assert_eq(vals(form_of(p, b"dot")), [
-    Make({ made: MCtor({ name: b"m.Dot", width: 0 }), args: [], reuse: None, kept: [] }),
-  ])
+  assert_eq(vals(form_of(p, b"dot")), [Gathered({ parts: [AInt(2)] })])
 }
 
 /// Root `m.<name>`'s C as the form prints it, but for its entry, which boxes what it carries raw.
@@ -472,21 +430,18 @@ fn own_code(p: Program, name: Bytes) -> Bytes / {abort.raise} = {
   t.slice(from, to)
 }
 
-test "a record made its word holds its floats as their bits and its records in place, header and all" {
+test "a record made its word is a box of its words, its floats as their bits" {
   let p = program();
   // Each record is made its word for the list holding it.
   let has = |text: Bytes|
     [b"wides", b"segments", b"relabelleds"].map(|n: Bytes| own_code(p, n).index_of(text) != None);
   assert_eq(has(b"rt_box_float_p"), [false, false, false]);
   assert_eq(has(b" = ply_f64_bits("), [true, true, true]);
-  // `from` takes a header's two words and its own two, `label` the fifth, `to` the four after, and
-  // the bitmap after them names the fifth alone as counted.
-  assert_eq(has(b"rt_alloc_p(ctx, 3, 9, @@s"), [false, true, true]);
-  assert_eq(has(b"@@, 6);"), [false, true, true]);
-  assert_eq(has(b"[9] = INT64_C(16);"), [false, true, true]);
-  // A point made already is copied in; one held as its leaves is written in place.
-  assert_eq(has(b"ply_embed(ctx, "), [false, true, true]);
-  assert_eq(has(b"ply_embedded("), [false, true, true])
+  assert_eq(has(b"rt_alloc_bytes_p(ctx, "), [true, true, true]);
+  // `Seg`'s box holds its points' words in place: five words, no header or bitmap of a point's.
+  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(56));"), [false, true, true]);
+  assert_eq(has(b"rt_alloc_p("), [false, false, false]);
+  assert_eq(has(b"ply_embed"), [false, false, false])
 }
 
 test "a record whose layout a type variable leaves open is made by value" {
@@ -606,29 +561,6 @@ fn where_lowered(
     }
   })
 
-/// The local the first line of `text` setting one to C beginning `start` sets; empty where none does.
-fn set_to(text: Bytes, start: Bytes) -> Bytes / {abort.raise} = {
-  let marker = b" = ".concat(start);
-  match text.split(b"\n").filter(|l: Bytes| l.index_of(marker) != None).at(0) {
-    Some(l) -> {
-      let ws = l.slice(0, match l.index_of(marker) { Some(i) -> i, None -> 0 }).split(b" ");
-      match ws.at(ws.len() - 1) { Some(w) -> w, None -> b"" }
-    },
-    None -> b"",
-  }
-}
-
-/// Fails, naming what is missing and showing `text`, where the C `text` lacks any of `wants`.
-fn holds_all(text: Bytes, wants: List<Bytes>) -> Unit / {abort.raise} = {
-  let missing = wants.filter(|w: Bytes| text.index_of(w) == None);
-  assert(
-    missing == [],
-    Some(
-      String::of_bytes_lossy(Bytes::concat_all([Bytes::join(missing, b"\n"), b"\n-- in\n", text])),
-    ),
-  )
-}
-
 fn nested() -> Program / {abort.raise} =
   ported(
     Bytes::concat_all([
@@ -643,35 +575,17 @@ fn nested() -> Program / {abort.raise} =
     ]),
   )
 
-test "a constructor's argument held in place is read through its header's address" {
+test "a case's record argument is read out of the sum's words where its case lays it" {
   let dx = built(nested(), b"dx");
-  let dot = set_to(dx, b"((Word)(intptr_t)(ply_words(p0) + 0));");
-  holds_all(dx, [Bytes::concat_all([b" = ply_f64(ply_words(", dot, b")[0]);"])])
+  assert_eq([dx.index_of(b"(ply_words("), dx.index_of(b"rt_field_p")], [None, None])
 }
 
-test "a constructor holds a wide record in place, copied in from its word where it was made, written there as its leaves where not" {
+test "a case holding a wide record holds its words inline, with nothing made" {
   let p = nested();
-  // `Line`'s object: `Seg`'s header and nine words, `Seg`'s bitmap, and its own naming `label`. A
-  // `Seg` arrives as its leaves and its word, `p0_7`: copied in whole where that word was made, its
-  // bitmap with it, and otherwise laid there, its bitmap at eleven naming `label`.
-  let line = built(p, b"line");
-  let t = set_to(line, b"rt_alloc_p(ctx, 4, 12, ");
-  holds_all(line, [
-    Bytes::concat_all([b"ply_words(", t, b")[12] = INT64_C(64);"]),
-    Bytes::concat_all([b"ply_embed(ctx, ", t, b", 0, p0_7, 1);"]),
-    Bytes::concat_all([b"ply_embedded(", t, b", 0, 6, 9, "]),
-    Bytes::concat_all([b"ply_words(", t, b")[11] = INT64_C(16);"]),
-  ]);
-  // A literal `Seg` is no object of its own: its leaves are written into `Line`'s, each point
-  // made already copied in and written there as its bits where not.
-  let literal = built(p, b"line_of");
-  let lt = set_to(literal, b"rt_alloc_p(ctx, 4, 12, ");
-  assert_eq(literal.index_of(b"rt_alloc_p(ctx, 3, 9, "), None);
-  holds_all(literal, [
-    Bytes::concat_all([b"ply_embedded(", lt, b", 0, 6, 9, "]),
-    Bytes::concat_all([b"ply_embed(ctx, ((Word)(intptr_t)(ply_words(", lt, b") + 0)), 0, "]),
-    Bytes::concat_all([b"ply_embed(ctx, ((Word)(intptr_t)(ply_words(", lt, b") + 0)), 5, "]),
-    b" = ply_f64_bits(",
+  let made = [b"line", b"line_of"].map(|n: Bytes| built(p, n));
+  assert_eq(made.map(|t: Bytes| [t.index_of(b"rt_alloc_bytes_p"), t.index_of(b"rt_alloc_p(")]), [
+    [None, None],
+    [None, None],
   ])
 }
 
@@ -712,7 +626,7 @@ test "a record rebuilt from a captured record's fields reads them where they lie
   assert_eq(holds(p, [b"rebuilt"], b"rt_field_p"), [false])
 }
 
-test "an Option is its payload's word in the code that knows it, and its object where it leaves" {
+test "an Option is the words its payload lays out, crossing a call and stored with no object made" {
   let p = ported(
     Bytes::concat_all([
       b"fn picked(c: Bool, s: String) -> Int = match if c { Some(s) } else { None } { Some(_) -> 1, None -> 0 }\n",
@@ -737,32 +651,20 @@ test "an Option is its payload's word in the code that knows it, and its object 
     b"guarded",
     b"asked",
   ];
-  // Built, matched, handed across a call, answered or compared, no object is made; one stored or
-  // nested is made the object it stands for.
-  assert_eq(holds(p, roots, b"rt_ctor_p"), roots.map(|_: Bytes| false));
-  assert_eq(holds(p, roots, b"rt_maybe_take_p"), [
-    false,
-    false,
-    true,
-    false,
-    true,
-    false,
-    false,
-    false,
-    false,
-  ]);
-  assert_eq(holds(p, roots, b"rt_maybe_box_p"), roots.map(|_: Bytes| false));
-  assert_eq(holds(p, roots, b"rt_equal_p"), roots.map(|_: Bytes| false));
-  // It crosses a call as its payload's word, a C type of its own so a stale caller fails the build.
+  let none = roots.map(|_: Bytes| false);
+  // Built, matched, handed across a call, answered, stored or compared, no object is made: an
+  // `Option` of a pointer, nested or not, is one word.
+  [b"rt_ctor_p", b"rt_maybe_", b"rt_equal_p", b"rt_alloc_bytes_p"].fold((), |_: Unit, t: Bytes|
+    assert_eq(holds(p, roots, t), none));
   let head = |n: Bytes| {
     let f = form_of(p, n);
     head_types(f.conv.reps, f.conv.answer)
   };
-  assert_eq(head(b"kept"), { answer: b"PlyMaybe", params: [b"Word"] });
-  assert_eq(head(b"either"), { answer: b"PlyMaybe", params: [b"int64_t", b"Word", b"PlyMaybe"] })
+  assert_eq(head(b"kept"), { answer: b"Word", params: [b"Word"] });
+  assert_eq(head(b"either"), { answer: b"Word", params: [b"int64_t", b"Word", b"Word"] })
 }
 
-test "a Result whose error is an object is one word in the code that knows it" {
+test "a Result is its case's words, its error's record laid inline" {
   let p = ported(
     Bytes::concat_all([
       b"type Bad = { why: Bytes, a: Int, b: Int, c: Int, d: Int }\n",
@@ -773,11 +675,10 @@ test "a Result whose error is an object is one word in the code that knows it" {
     ]),
   );
   let roots = [b"half", b"quarter", b"told", b"plain"];
-  // Built, answered, handed on by `?` and matched, no object is made; an error that may be an
-  // immediate leaves the `Result` an object.
-  assert_eq(holds(p, roots, b"rt_ctor_p"), [false, false, false, true]);
-  assert_eq(holds(p, roots, b"rt_tagged_"), [false, false, false, false]);
-  assert_eq(holds(p, roots, b") | 4)"), [true, true, false, false])
+  // Built, answered, handed on by `?` and matched, no object is made.
+  let none = [false, false, false, false];
+  [b"rt_ctor_p", b"rt_tagged_", b"rt_alloc_bytes_p"].fold((), |_: Unit, t: Bytes|
+    assert_eq(holds(p, roots, t), none))
 }
 
 test "a Result whose error is a small record crosses a call as its constructor and the record's fields" {
@@ -801,7 +702,7 @@ test "a Result whose error is a small record crosses a call as its constructor a
   assert_eq(where_lowered(p, roots, b"o[0] = ", [true, true, false]), [true, true, false])
 }
 
-test "a sum's constructors hold their arguments at the sum's arguments as their declaration lays them" {
+test "a sum's constructors hold their arguments at the sum's arguments, as their types lay them" {
   let p = ported(
     Bytes::concat_all([
       b"type Q<a, b> = | L(a) | R(b, a) | N\n",
@@ -809,17 +710,14 @@ test "a sum's constructors hold their arguments at the sum's arguments as their 
       b"fn l(n: Int) -> Q<Int, String> = L(n)\n",
     ]),
   );
-  // An argument of a parameter's type is a word whatever the sum is taken at.
-  let made = |n: Bytes|
-    vals(form_of(p, n)).filter(|v: Val| match v { Make(_) -> true, _ -> false });
-  assert_eq(made(b"r").map(|v: Val| match v { Make(m) -> m.args.map(rep_of_arg), _ -> [] }), [
-    [RWord, RWord],
-  ]);
+  let gathered = |n: Bytes|
+    vals(form_of(p, n)).filter(|v: Val| match v { Gathered(_) -> true, _ -> false });
+  // `R` at `Q<Int, String>` holds its `b` a string's word and its `a` an `Int`'s bits.
   assert_eq(
-    made(b"l").map(|v: Val| match v { Make(m) -> m.made, _ -> MCtor({ name: b"", width: 0 }) }),
-    [MCtor({ name: b"m.L", width: 1 })],
+    gathered(b"r").map(|v: Val| match v { Gathered(g) -> g.parts.map(rep_of_arg), _ -> [] }),
+    [[RInt, RWord, RInt]],
   );
-  assert_eq(holds(p, [b"l"], b"rt_box_int_p"), [true])
+  assert_eq(holds(p, [b"l"], b"rt_box_int_p"), [false])
 }
 
 test "a field of a Columns' record is loaded from its column, with no record made" {
@@ -840,7 +738,7 @@ test "a field of a Columns' record is loaded from its column, with no record mad
   assert_eq(where_lowered(p, roots, b"rt_columns_field_p(ctx, ", columned), columned)
 }
 
-test "a sum a generic root answers at a type its call carries raw crosses as its cases, the record's leaves among them" {
+test "a sum a generic root answers at a type its call carries raw crosses as its words, the record's among them" {
   let p = ported(
     Bytes::concat_all([
       b"type Replay = { lines: List<String>, errs: List<String>, code: Int, json: String }\n",
@@ -849,11 +747,10 @@ test "a sum a generic root answers at a type its call carries raw crosses as its
       b"fn replayed(r: Replay, n: Int) -> Option<Int> = match decoded(r, n) { Err(_) -> None, Ok(x) -> Some(x.code) }\n",
     ]),
   );
-  // `decoded` at `Replay` answers its cases' values past the index through the caller's buffer of
-  // eight words, `Replay`'s leaves and word, then `Bad`'s; nothing is loaded out of a word.
+  // `decoded` at `Replay` answers its words past the first through the caller's buffer; nothing is
+  // loaded out of a box.
   let text = built(p, b"replayed");
-  holds_all(text, [b"[8];\n"]);
-  assert_eq(text.index_of(b"(ply_words("), None)
+  assert_eq([text.index_of(b"(ply_words("), text.index_of(b"rt_alloc_bytes_p")], [None, None])
 }
 
 test "a record held in place that holds a count, read through a borrow, passes the check" {

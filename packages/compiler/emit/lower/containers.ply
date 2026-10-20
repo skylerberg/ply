@@ -13,12 +13,12 @@ import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, Tail
                     KidAt, TailPush, TailSet, LeafSet, RootSwap, KidSwap, TailStart, Spill,
                     NewBranch, MapRoot, NodeCount, MapHeight, NodeKey, NodeValue, NodeKid, KidMax,
                     KidSize, NewLeaf, NewMapBranch, PairPut, PairSet, PairTake, LeafCut, BranchCut,
-                    KidOut, KidBack, KidPut, KidDrop, MapSwap, intrinsic_named)
+                    KidOut, KidBack, KidPut, KidDrop, MapSwap, P, intrinsic_named)
 import emit.reps (Def, FieldTy, TyRec, kind_of, has_vars, laid_vars, spelled_field, laid_of)
-import emit.c (KInt, KFloat, KDec, KNum, KSum, Zeroed)
+import emit.c (KInt, KFloat, KDec, KNum)
 import emit.answer (Layout)
 import emit.roots (builtin_helper, generated_builtin)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RFlat, Leaf, Var, Arg, AVar,
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RSum, RFlat, Leaf, Var, Arg, AVar,
                  AInt, Make, MList, Native, Op, OContainer, Let, Containers)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew,
                             ArraySet, ArrayOfList, ArrayGet, ColumnField, Position, Element, Held,
@@ -26,7 +26,7 @@ import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, 
                             DecimalBits)
 import emit.lower.setting (imported_target, qualified, from_import, module_import, builtin_at,
                            ctor_named)
-import emit.lower.held (held_as, laid_fields, field_type, leaves_of)
+import emit.lower.held (held_as, field_type)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, noted, filed, unfiled,
                         type_of, through_runtime, as_words)
 import emit.lower.scalars (operated, runtime_builtin)
@@ -113,7 +113,7 @@ pub fn column_read(
         let object = handed({ st: st, arg: xs }, RWord, at);
         let index = handed({ st: object.st, arg: i }, RInt, at);
         let rep = match c.column.held {
-          Payloads -> RMaybe,
+          Payloads -> RWord,
           Records(_) -> RWord,
           _ -> item_rep(cx, c.ty),
         };
@@ -143,10 +143,10 @@ fn column_at(
 ) -> Option<{ k: Int, ty: Type, column: Element }> =
   match called_at(cx, b"Columns::get", callee).args.at(0) {
     None -> None,
-    Some(record) -> match laid_fields(record) {
+    Some(record) -> match laid_names(cx, record) {
       None -> None,
       Some(fs) -> match range(0, fs.len()).fold(None, |acc: Option<Int>, k: Int|
-          match fs.at(k) { Some(f) -> if f.name == name { Some(k) } else { acc }, None -> acc }) {
+          if fs.at(k) == Some(name) { Some(k) } else { acc }) {
         None -> None,
         Some(k) -> match field_type(record, name) {
           None -> None,
@@ -157,6 +157,18 @@ fn column_at(
         },
       },
     },
+  }
+
+/// The names of the fields of a record of type `ty` its type lays out, in its order; none where a
+/// type variable leaves its layout open or `ty` is no record.
+fn laid_names(cx: Context, ty: Type) -> Option<List<Bytes>> =
+  match held_as(cx.setting, ty) {
+    RFlat(_) -> match ty {
+      TyRecord(fs) -> Some(fs.map(|f: Field| f.name)),
+      TyNominal(x) -> Some(x.fields.map(|f: Field| f.name)),
+      _ -> None,
+    },
+    _ -> None,
   }
 
 /// A list literal of `items`, each a word the list takes, of the type the checker filed for it.
@@ -360,7 +372,7 @@ fn made_here(st: Lowering, v: Var) -> Option<List<Arg>> =
   }
 
 /// A builtin whose helper answers an element or `None` as an `Option` held as its payload's word,
-/// with no object made.
+/// with no object made: the `Option`'s own word, where its payload is one pointer.
 fn looked_up(
   cx: Context,
   st: Lowering,
@@ -368,22 +380,30 @@ fn looked_up(
   args: List<Arg>,
   ty: Type,
   at: Span,
-) -> Lowered / {abort.raise} = {
-  let words = as_words(st, args, at);
-  let answer = bound_as(
-    words.st,
-    ty,
-    RMaybe,
-    Native({
-      name: if name == b"Array::at" { b"rt_array_lookup_p" }
-      else { builtin_helper(name).concat(b"_p") },
-      args: words.args,
-      uses: { takes: args.map(|_: Arg| true), owned: true, fails: true, stops: false },
-    }),
-    at,
-  );
-  handed(answer, held_as(cx.setting, ty), at)
-}
+) -> Lowered / {abort.raise} =
+  if !pointer_option(cx, ty) {
+    refuse(st, Containers, b"an element looked up as an Option of other than one pointer")
+  } else {
+    let words = as_words(st, args, at);
+    let answer = bound_as(
+      words.st,
+      ty,
+      RWord,
+      Native({
+        name: if name == b"Array::at" { b"rt_array_lookup_p" }
+        else { builtin_helper(name).concat(b"_p") },
+        args: words.args,
+        uses: { takes: args.map(|_: Arg| true), owned: true, fails: true, stops: false },
+      }),
+      at,
+    );
+    handed(answer, held_as(cx.setting, ty), at)
+  }
+
+/// Whether `ty` is an `Option` held as one pointer or 0, as the runtime holds one as its
+/// payload's word: one of a payload that is one pointer.
+fn pointer_option(cx: Context, ty: Type) -> Bool =
+  match held_as(cx.setting, ty) { RSum(s) -> s.laid.classes == [P], _ -> false }
 
 /// What an extern written in place does with an operand: reads the object it reads, takes a word it
 /// writes or stores, takes an `Option` as its payload's word, or reads an index or a count.
@@ -404,12 +424,17 @@ fn laid(cx: Context, st: Lowering, op: Intrinsic, args: List<Arg>, ty: Type, at:
   let answer = match l.answer {
     Plain(r) -> Some(r),
     Item -> Some(item_rep(cx, ty)),
-    Fields -> match fields_held(ty) { Some(ls) -> Some(RFlat(ls)), None -> None },
+    Fields -> match fields_held(cx, ty) { Some(ls) -> Some(RFlat(ls)), None -> None },
   };
   match answer {
     None -> refuse(st, Containers, b"a write in place answering a record of a width past a word"),
     Some(rep) -> if l.operands.len() != args.len() {
       refuse(st, Containers, b"an extern written in place on other operands than it takes")
+    } else if (is_option(ty) && !pointer_option(cx, ty))
+        || range(0, args.len()).any(|i: Int|
+          l.operands.at(i) == Some(TakenMaybe)
+            && (match args.at(i) { Some(a) -> !pointer_option(cx, type_of(a)), None -> true })) {
+      refuse(st, Containers, b"an extern written in place over an Option of other than one pointer")
     } else {
       let handed_over = range(0, args.len()).fold(
         { st: st, args: [] },
@@ -421,7 +446,7 @@ fn laid(cx: Context, st: Lowering, op: Intrinsic, args: List<Arg>, ty: Type, at:
                 { st: acc.st, arg: a },
                 match l.operands.at(i) {
                   Some(Index) -> RInt,
-                  Some(TakenMaybe) -> RMaybe,
+                  Some(TakenMaybe) -> RWord,
                   _ -> RWord,
                 },
                 at,
@@ -451,17 +476,13 @@ fn laid(cx: Context, st: Lowering, op: Intrinsic, args: List<Arg>, ty: Type, at:
   }
 }
 
-/// The leaves a record of type `ty` an extern answers is held as: as its type holds it, a record it
-/// holds in place at any depth as that record's leaves and then its word; nothing where a leaf is a
-/// width past a word, which a word cannot be read as.
-fn fields_held(ty: Type) -> Option<List<Leaf>> = {
-  let ls = match laid_fields(ty) {
-    Some(fs) -> leaves_of(fs),
-    // A record a type variable leaves open holds each field of that variable's type as a word.
-    None -> match ty {
-      TyRecord(fs) -> leaves_of(fs.map(|f: Field| element_field(f.name, f.ty))),
-      _ -> [],
-    },
+/// The leaves a record of type `ty` an extern answers is held as: as its type holds it, and where a
+/// type variable leaves its layout open each field as its word; nothing where a leaf is a width past
+/// a word, which a word cannot be read as.
+fn fields_held(cx: Context, ty: Type) -> Option<List<Leaf>> = {
+  let ls = match held_as(cx.setting, ty) {
+    RFlat(x) -> x,
+    _ -> match ty { TyRecord(fs) -> fs.map(|f: Field| { name: f.name, rep: RWord }), _ -> [] },
   };
   if ls.len() == 0 || ls.any(|x: Leaf| match x.rep { RNum(w) -> w.bits > 64, _ -> false }) { None }
   else { Some(ls) }
@@ -490,7 +511,7 @@ fn laying(op: Intrinsic) -> Laying = {
     OfList(ListStart) -> read([Read], RInt),
     OfList(TailLen) -> read([Read], RInt),
     OfList(NodeLen) -> read([Read], RInt),
-    OfList(ListRoot) -> read([Read], RMaybe),
+    OfList(ListRoot) -> read([Read], RWord),
     OfList(TailAt) -> item,
     OfList(LeafAt) -> item,
     OfList(KidAt) -> read([Read, Index], RWord),
@@ -502,7 +523,7 @@ fn laying(op: Intrinsic) -> Laying = {
     OfList(RootSwap) -> record([Taken, TakenMaybe]),
     OfList(KidSwap) -> record([Taken, Index, TakenMaybe]),
     OfList(Spill) -> record([Taken]),
-    OfMap(MapRoot) -> read([Read], RMaybe),
+    OfMap(MapRoot) -> read([Read], RWord),
     OfMap(NodeCount) -> read([Read], RInt),
     OfMap(MapHeight) -> read([Read], RInt),
     OfMap(NodeKey) -> item,
@@ -592,13 +613,12 @@ fn laid_as(e: FieldTy) -> Option<Element> = {
   let in_place = |h: Held|
     Some({ held: h, stride: laid.width, shapes: shapes_of([e]), counted: laid.counted });
   match e.ty {
-    TyRec(inner) -> in_place(Records({ tail: laid_of(inner).tail })),
+    TyRec(_) -> Some({ held: Words, stride: 1, shapes: [], counted: [] }),
     _ -> match e.kind {
       KInt -> in_place(Bits(IntBits)),
       KFloat -> in_place(Bits(FloatBits)),
       KDec -> in_place(Bits(DecimalBits)),
       KNum(w) -> if w.bits > 64 { None } else { in_place(Bits(WidthBits(w))) },
-      KSum(Zeroed) -> in_place(Payloads),
       _ -> Some({ held: Words, stride: 1, shapes: [], counted: [] }),
     },
   }
@@ -614,7 +634,7 @@ fn shapes_of(fs: List<FieldTy>) -> List<List<Bytes>> =
 /// Field `name` of type `ty` as a record lays it out: an `Option` as its payload's word.
 fn element_field(name: Bytes, ty: Type) -> FieldTy = {
   let k = kind_of(ty);
-  { name: name, kind: if is_option(ty) { KSum(Zeroed) } else { k.kind }, ty: k.ty }
+  { name: name, kind: k.kind, ty: k.ty }
 }
 
 /// How a value an element laid out as `e` holds is held once read or before it is written.
@@ -624,7 +644,6 @@ fn element_rep(e: Element) -> Rep =
     Bits(WidthBits(w)) -> RNum(w),
     Bits(FloatBits) -> RFloat,
     Bits(DecimalBits) -> RDec,
-    Payloads -> RMaybe,
     _ -> RWord,
   }
 

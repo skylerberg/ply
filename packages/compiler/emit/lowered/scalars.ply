@@ -5,8 +5,8 @@ import check.types (TyVar, TyCon)
 import syntax.patterns (LStr, LDec, LWide, LUnit)
 import emit.answer (Exact)
 import emit.keys (Root, root_name)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RCases, Var, Arg, AVar, AInt,
-                 ANum, AChar, Val, Prim, Literal, Get, Tag, Call, Native, Inst, Let, Do, If, Block,
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RSum, Var, Arg, AVar, AInt, ANum,
+                 AChar, Val, Prim, Literal, Get, Tag, Call, Native, Inst, Let, Do, If, Block,
                  Scalars)
 import emit.compare (Program, program_of, formed, printed_by_form, not_built)
 
@@ -93,16 +93,9 @@ test "records of a known type are compared and ordered field by field, not by th
   assert_eq(applied(p, b"same"), Ok([{ op: b"bytes_eq", on: RWord }, { op: b"eq", on: RInt }]));
   assert_eq(reads(p, b"same"), Ok(true));
   assert_eq(natives(p, b"same"), Ok([]));
-  // An `Option` a record holds is compared as its payload's word, then its payload.
-  assert_eq(
-    applied(p, b"optional"),
-    Ok([
-      { op: b"eq", on: RInt },
-      { op: b"none_in", on: RMaybe },
-      { op: b"eq", on: RMaybe },
-      { op: b"eq", on: RInt },
-    ]),
-  );
+  // An `Option` a record holds is compared by the root written for its type.
+  assert_eq(applied(p, b"optional"), Ok([{ op: b"eq", on: RInt }]));
+  assert_eq(roots_called(p, b"optional"), Ok([b"m.equal#Option<Int>"]));
   assert_eq(natives(p, b"optional"), Ok([]));
   // A record a record holds is compared field by field again.
   assert_eq(
@@ -281,17 +274,19 @@ test "strings and byte strings are compared by their bytes, constructors of no a
   );
   assert_eq(applied(p, b"s"), Ok([{ op: b"bytes_eq", on: RWord }]));
   assert_eq(applied(p, b"bs"), Ok([{ op: b"bytes_ne", on: RWord }]));
-  // Parameters cross as their constructors' indices, as values held in the body are, compared as
-  // two numbers.
-  let suits = RCases({
-    tagged: false,
-    cases: [b"m.Hearts", b"m.Spades"].map(|n: Bytes| { name: n, leaves: [] }),
-  });
-  assert_eq(applied(p, b"suit"), Ok([{ op: b"ne", on: suits }]));
-  assert_eq(applied(p, b"picked"), Ok([{ op: b"eq", on: suits }]))
+  // Parameters cross as their one word, which is their case's place, compared as two numbers.
+  let ops = |name: Bytes|
+    match applied(p, name) {
+      Ok(xs) ->
+        xs.map(|x: { op: Bytes, on: Rep }|
+          { op: x.op, sum: match x.on { RSum(_) -> true, _ -> false } }),
+      Err(why) -> [{ op: why, sum: false }],
+    };
+  assert_eq(ops(b"suit"), [{ op: b"ne", sum: true }]);
+  assert_eq(ops(b"picked"), [{ op: b"eq", sum: true }])
 }
 
-test "an Option is compared as its payload's word, then its payload as its type compares" {
+test "an Option and a Result are compared by the roots written for their types" {
   let p = analysed(
     Bytes::concat_all([
       b"fn ints(a: Option<Int>, b: Option<Int>) -> Bool = a == b\n",
@@ -299,14 +294,9 @@ test "an Option is compared as its payload's word, then its payload as its type 
       b"fn results(a: Result<Int, String>, b: Result<Int, String>) -> Bool = a == b\n",
     ]),
   );
-  let none = [{ op: b"none_in", on: RMaybe }, { op: b"eq", on: RMaybe }];
-  assert_eq(applied(p, b"ints"), Ok(none.push({ op: b"eq", on: RInt })));
-  assert_eq(
-    applied(p, b"texts"),
-    Ok(none.push({ op: b"bytes_eq", on: RWord }).push({ op: b"not", on: RBool })),
-  );
+  assert_eq(roots_called(p, b"ints"), Ok([b"m.equal#Option<Int>"]));
+  assert_eq(roots_called(p, b"texts"), Ok([b"m.equal#Option<String>"]));
   assert_eq([b"ints", b"texts"].map(|n: Bytes| natives(p, n)), [Ok([]), Ok([])]);
-  // A `Result` is compared by the root written for its type.
   assert_eq(roots_called(p, b"results"), Ok([b"m.equal#Result<Int,String>"]))
 }
 
@@ -430,7 +420,8 @@ test "a constant the pool holds is read into a variable of its type, a register'
   assert_eq(read(b"text"), Ok(Some({ val: Literal(LStr(b"ply")), rep: RWord })));
   assert_eq(read(b"dec"), Ok(Some({ val: Literal(LDec(b"2.50m")), rep: RDec })));
   assert_eq(read(b"huge"), Ok(Some({ val: Literal(LWide(b"U128", 0, 7)), rep: RWord })));
-  assert_eq(read(b"unit"), Ok(Some({ val: Literal(LUnit), rep: RWord })));
+  // `()` is no value at all.
+  assert_eq(read(b"unit"), Ok(None));
   match formed(p, b"top") {
     Err(no) -> assert_eq(no.why, b""),
     Ok(f) ->

@@ -18,14 +18,15 @@ import emit.reps (Def, Imported, EmitParam, BoundLambda, erased, has_vars, carri
 import emit.keys (RootKey, FnArg, Named, At, Callee, Root, Generic, root_name, definition_of,
                   key_types, key_lent, unspecialised)
 import emit.tir
-import emit.tir (Rep, RInt, RBool, RWord, RSlice, Var, Arg, AVar, AInt, AZero, Given, Convention,
-                 Val, Prim, Make, Get, Pack, Native, Op, OCalling, MClosure, MCtor, PCapture, TTag,
-                 TInt, Call, Apply, Inst, Let, Do, Decl, Assign, If, Case, Match, Loop, Next, Done,
-                 Restart, Enter, Return, Fail, NoArm, Sited, Block, Fn, Rooted, Member, Closure,
-                 Declined, Calling, no_links, falls_through, rep_of_arg)
+import emit.tir (Rep, RInt, RBool, RWord, RSlice, RSum, RUnit, Var, Arg, AVar, AInt, AZero, Given,
+                 Convention, Val, Prim, Make, Get, Gathered, Pack, Native, Op, OCalling, MClosure,
+                 MCtor, PCapture, PCase, TTag, TInt, Call, Apply, Inst, Let, Do, Decl, Assign, If,
+                 Case, Match, Loop, Next, Done, Restart, Enter, Return, Fail, NoArm, Sited, Block,
+                 Fn, Rooted, Member, Closure, Declined, Calling, no_links, falls_through,
+                 rep_of_arg)
 import emit.tir.calling (EntryValue, ConstantRead, BuiltinValue, Ticked)
 import emit.lower.setting (Setting, Root, imported_target, qualified)
-import emit.lower.held (held_as, arg_path)
+import emit.lower.held (held_as, case_index, arg_word)
 import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
                         ToInPlace, Frame, Opened, GroupMember, Restarts, Enters, Calls, refuse,
                         fresh, bound_as, done, emitted, opened, nested, unnested, with_lambda,
@@ -771,7 +772,7 @@ type Pass = { block: Block, next: Int }
 fn fused(b: Block, v: Arg, e: Ended) -> Option<Pass> =
   match v {
     AVar(x) -> match b.at(b.len() - 1) {
-      Some(Let(l)) -> if l.var != x { None } else { ending(b.take(b.len() - 1), l.val, e) },
+      Some(Let(l)) -> if l.var != x { None } else { ending(b.take(b.len() - 1), l.var, l.val, e) },
       _ -> if b.contains(Decl(x)) { tail_fused(b.filter(|i: Inst| i != Decl(x)), x, e) }
       else { None },
     },
@@ -789,7 +790,7 @@ fn tail_fused(b: Block, j: Var, e: Ended) -> Option<Pass> = {
     Some(Assign(a)) -> if a.var != j { None } else {
       match a.arg {
         AVar(x) -> match b.at(n - 2) {
-          Some(Let(l)) -> if l.var != x { None } else { ending(b.take(n - 2), l.val, e) },
+          Some(Let(l)) -> if l.var != x { None } else { ending(b.take(n - 2), l.var, l.val, e) },
           // Set from a join of its own, as an `if` in a `match` arm sets it: that join's paths end.
           Some(i) -> if !before.contains(Decl(x)) { None }
           else { last_fused(b.take(n - 2).filter(|y: Inst| y != Decl(x)), i, x, e) },
@@ -868,8 +869,21 @@ fn last_fused(before: Block, last: Inst, j: Var, e: Ended) -> Option<Pass> =
 
 /// `b` ended by the step's answer made as `val`: a `Continue`'s argument the next pass's state, a
 /// `Stop`'s the loop's answer.
-fn ending(b: Block, val: Val, e: Ended) -> Option<Pass> =
+fn ending(b: Block, made: Var, val: Val, e: Ended) -> Option<Pass> =
   match val {
+    Gathered(g) -> match ((made.rep, g.parts)) {
+      (RSum(s), [AInt(i), a]) -> {
+        let u = unmade(b, a);
+        if s.cases.at(i) == Some(b"Continue") {
+          let h = held_into(u.arg, e.state, e);
+          Some({ block: u.block.concat(h.block).push(Next([h.arg, AVar(e.left)])), next: h.next })
+        } else if s.cases.at(i) == Some(b"Stop") {
+          let h = held_into(u.arg, e.answer, e);
+          Some({ block: u.block.concat(h.block).push(Done(h.arg)), next: h.next })
+        } else { None }
+      },
+      _ -> None,
+    },
     Make(m) -> match m.made {
       MCtor(c) -> match m.args {
         [a] -> {
@@ -944,31 +958,35 @@ fn tested(cx: Context, b: Block, v: Arg, e: Ended) -> Pass =
     _ -> { block: b.push(Fail({ why: NoArm, at: e.at })), next: e.next },
   }
 
-/// The argument of constructor `ctor` the `Iter` `x` holds, read as `into` holds it.
+/// The argument of constructor `ctor` the `Iter` `x` holds, read as `into` holds it: out of the
+/// case's payload where the sum's layout lays it, and as a word where a type variable leaves it open.
 fn read_out(
   cx: Context,
   x: Var,
   ctor: Bytes,
   into: Var,
   e: Ended,
-) -> { block: Block, arg: Arg, next: Int } = {
-  let r = { id: e.next, ty: into.ty, rep: RWord };
-  let h = held_into(AVar(r), into, { ..e, next: e.next + 1 });
-  {
-    block: [
-      Let({
-        var: r,
-        val: Get({ of: x, path: arg_path(cx.setting, ctor, 0) }),
-        at: e.at,
-        unwind: [],
-      }),
-    ].concat(
-      h.block,
-    ),
-    arg: h.arg,
-    next: h.next,
+) -> { block: Block, arg: Arg, next: Int } =
+  if into.rep == RUnit { { block: [], arg: AZero(RUnit), next: e.next } } else {
+    let i = match case_index(x.rep, ctor) { Some(k) -> k, None -> 0 };
+    let read = match x.rep {
+      RSum(s) ->
+        {
+          path: PCase({ case: i, at: match arg_word(s.laid, i, 0) { Some(w) -> w, None -> 0 } }),
+          rep: into.rep,
+        },
+      _ -> { path: PCase({ case: if ctor == b"Stop" { 1 } else { 0 }, at: 0 }), rep: RWord },
+    };
+    let r = { id: e.next, ty: into.ty, rep: read.rep };
+    let h = held_into(AVar(r), into, { ..e, next: e.next + 1 });
+    {
+      block: [Let({ var: r, val: Get({ of: x, path: read.path }), at: e.at, unwind: [] })].concat(
+        h.block,
+      ),
+      arg: h.arg,
+      next: h.next,
+    }
   }
-}
 
 /// What the runtime's report of a spent or bad budget does: reads its operands and fails.
 fn spent() -> { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool } =

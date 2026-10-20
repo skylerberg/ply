@@ -12,14 +12,14 @@ import emit.roots (builtin_helper)
 import emit.pieces (Text, Hole, ShapeOf, TagOf, spelled)
 import emit.tir (Rep, RInt, RNum, RFloat, RDec, RWord, RMaybe, RFlat, Leaf, Var, Arg, AVar, AInt,
                  AZero, Made, MList, Uses, Containers, rep_of_arg, counted, var_said, made_said)
-import emit.lower.held (fields_of)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew,
                             ArraySet, ArrayOfList, ArrayGet, ColumnField, Position, Taken, Element,
                             Words, Bits, Payloads, Records, IntBits, WidthBits, FloatBits,
                             DecimalBits)
 import emit.print.text (Printing, Place, printing, line, pad, pieces, temp, named, name_of,
                         arg_text, assigned, site, check, shape_at, zero, part_names, unprinted)
-import emit.print.made (Held, c_type, c_types, as_word, word_as, leaf_loads)
+import emit.lower.held (leaf_span, leaves_within, leaf_values, unboxed, boxed)
+import emit.print.made (c_type, c_types, as_word, word_as, word_parts)
 
 /// A list or an array made of `m.args`.
 pub fn contained(
@@ -687,54 +687,38 @@ fn record_printed(
 }
 
 /// `v`, a record held as its fields, each set from the word `fields` names for it: an item read as
-/// the field holds it, its word let go where a scalar is read out of it; a record held in place as
-/// its leaves, loaded out of that word at any depth, each counted one held once more, and that word
-/// as its word; the record's own word none.
+/// the field holds it, its word let go where a scalar is read out of it; a record or a sum wider than
+/// a word opened out of that word, its word form, which it takes; the record's own word none.
 fn fields_set(p: Place, pr: Printing, v: Var, fields: List<Answered>) -> Printing / {abort.raise} = {
   let n = named(pr, v);
   let ns = part_names(n.name, v.rep);
-  let ts = c_types(v.rep);
   let ls = match v.rep { RFlat(x) -> x, _ -> [] };
-  let set = range(0, ls.len()).fold(n.pr, |q: Printing, k: Int|
-    match ls.at(k) {
+  let set = fields.fold(n.pr, |q: Printing, x: Answered|
+    match leaf_span(ls, x.name) {
       None -> q,
-      Some(l) -> {
-        let value = match fields.find(|x: Answered| x.name == l.name) {
-          Some(x) -> if !x.item { x.word.concat(b";") }
-          else if counted(l.rep) { word_as(x.word, l.rep).concat(b";") }
-          else { Bytes::concat_all([word_as(x.word, l.rep), b"; ply_dec(ctx, ", x.word, b");"]) },
-          None -> match fields.find(|x: Answered| l.name.starts_with(x.name.concat(b"."))) {
-            Some(x) -> in_place_leaf(ls, x, l, nth(ns, k)),
-            None -> b"0;",
-          },
+      Some(sp) -> {
+        let one = match ls.at(sp.at) {
+          Some(l) -> if sp.n == 1 && l.name == x.name { Some(l.rep) } else { None },
+          None -> None,
         };
-        line(q, p.depth, Bytes::concat_all([nth(ts, k), b" ", nth(ns, k), b" = ", value]))
+        let r = match one { Some(lr) -> lr, None -> RFlat(leaves_within(ls, sp)) };
+        let first = leaf_values(ls, sp.at).at;
+        let mine = ns.drop(first).take(unboxed(r).len());
+        if boxed(r) {
+          let t = temp(q);
+          pieces(
+            t.pr,
+            [Text(pad(p.depth))].concat(word_parts(x.word, r, mine.push(t.name))).push(Text(b"\n")),
+          )
+        } else {
+          let value = if !x.item { x.word }
+          else if counted(r) { word_as(x.word, r) }
+          else { Bytes::concat_all([word_as(x.word, r), b"; ply_dec(ctx, ", x.word, b")"]) };
+          line(q, p.depth, Bytes::concat_all([c_type(r), b" ", nth(mine, 0), b" = ", value, b";"]))
+        }
       },
     });
-  line(set, p.depth, Bytes::concat_all([nth(ts, ls.len()), b" ", nth(ns, ls.len()), b" = 0;"]))
-}
-
-/// Leaf `l`, among the leaves `ls`, of field `x`, a record held in place, set into `local`: the
-/// record's own word leaf `x.word`, and any other loaded out of it as `leaf_loads` lays the record's
-/// leaves out, a counted one held once more.
-fn in_place_leaf(ls: List<Leaf>, x: Answered, l: Leaf, local: Bytes) -> Bytes / {abort.raise} = {
-  let prefix = x.name.concat(b".");
-  if l.name == prefix { x.word.concat(b";") } else {
-    let own = ls.filter(|y: Leaf| y.name.starts_with(prefix) && y.name != prefix);
-    let loads = leaf_loads(
-      x.word,
-      fields_of(own.map(|y: Leaf| { name: y.name.slice(prefix.len(), y.name.len()), rep: y.rep })),
-    );
-    match range(0, own.len()).fold(None, |acc: Option<Held>, j: Int|
-        match own.at(j) {
-          Some(y) -> if y.name == l.name { loads.at(j) } else { acc },
-          None -> acc,
-        }) {
-      Some(h) -> if counted(h.rep) { Bytes::concat_all([h.expr, b"; ply_inc(", local, b");"]) }
-      else { h.expr.concat(b";") },
-      None -> b"0;",
-    }
-  }
+  line(set, p.depth, Bytes::concat_all([b"Word ", nth(ns, ns.len() - 1), b" = 0;"]))
 }
 
 fn nth(xs: List<Bytes>, k: Int) -> Bytes = match xs.at(k) { Some(x) -> x, None -> b"" }

@@ -17,9 +17,9 @@ import emit.layout (Intrinsic, intrinsics, layouts)
 import emit.answer (Need, Layout)
 import emit.pieces (spelled)
 import emit.code (Code, NField)
-import emit.tir (Rep, RInt, RBool, RFloat, RWord, RMaybe, RNum, RFlat, Var, Arg, AVar, Val, Make,
-                 Made, MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst, Let, Fn,
-                 Spine, Data, Containers, rep_of_arg)
+import emit.tir (Rep, RInt, RBool, RFloat, RWord, RSum, RNum, RFlat, Leaf, Var, Arg, AVar, Val,
+                 Make, Made, MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst, Let,
+                 Fn, Spine, Data, Containers, rep_of_arg)
 import emit.tir.containers (Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew, ArraySet,
                             ArrayOfList, ArrayGet, ColumnField, Bits, IntBits, FloatBits,
                             DecimalBits, Words, Payloads, Records)
@@ -194,14 +194,14 @@ test "byte strings joined from a list made for the join make no list" {
   assert_eq(natives_in(bound_in(p, b"named")).map(name), [b"builtin_bytes_concat_all_p"])
 }
 
-test "a lookup answers an Option held as its payload's word, with no object made" {
+test "a lookup answers an Option of a pointer as its one word, with no object made" {
   let p = program(b"fn element(a: Array<String>, i: Int) -> Option<String> = a.at(i)\n");
   assert_eq(
     natives_in(bound_in(p, b"element")).map(
       |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }|
         { name: c.name, answer: c.answer },
     ),
-    [{ name: b"rt_array_lookup_p", answer: RMaybe }],
+    [{ name: b"rt_array_lookup_p", answer: RWord }],
   )
 }
 
@@ -225,34 +225,23 @@ test "an array is made, written and read as its elements' type lays it out" {
     );
   let bits = |b: Bits, stride: Int, shape: Bytes|
     { held: Bits(b), stride: stride, shapes: [[shape]], counted: [] };
-  // A record is copied in place behind a header of its own, laid out by its own shape, which goes
-  // to the table before the element's.
-  let point = {
-    held: Records({ tail: 0 }),
-    stride: 4,
-    shapes: [[b"x!int", b"y!int"], [b"e!r(x!int,y!int)"]],
-    counted: [],
-  };
+  // A record is held as its word form, a box of its words.
+  let point = { held: Words, stride: 1, shapes: [], counted: [] };
   assert_eq(op(b"records"), [
     { op: OContainer(ArrayNew(point)), answer: RWord, takes: [false, true] },
   ]);
-  // An element read in place is the address of its header there, which the record's leaves are
-  // loaded from.
+  // An element read is that word, which the record's leaves are opened out of.
   assert_eq(op(b"record"), [
     { op: OContainer(ArrayGet(point)), answer: RWord, takes: [false, false] },
   ]);
-  // An `Option` is its payload's word in place, every element's word counted.
+  // An `Option` is its word form, an `Option` of a pointer that pointer or 0.
   assert_eq(op(b"options"), [
-    {
-      op: OContainer(ArraySet({ held: Payloads, stride: 1, shapes: [[b"e!m"]], counted: [0] })),
-      answer: RWord,
-      takes: [true, false, true],
-    },
+    { op: OContainer(ArraySet(point)), answer: RWord, takes: [true, false, true] },
   ]);
   assert_eq(
     bound_in(p, b"options").fold([], |acc: List<Rep>, b: Bound|
       match b.val { Op(o) -> acc.concat(o.args.map(rep_of_arg)), _ -> acc }),
-    [RWord, RInt, RMaybe],
+    [RWord, RInt, RWord],
   );
   // A scalar is held as its bits in place, an element of any other type as its word.
   assert_eq(op(b"made"), [
@@ -1005,9 +994,16 @@ test "each extern written in place is an operation over the runtime's objects as
                 }),
             Err(_) -> [],
           };
-        assert_eq(fields(b"root_swap"), [
-          RFlat([{ name: b"list", rep: RWord }, { name: b"old", rep: RMaybe }]),
-        ]);
+        assert_eq(
+          fields(b"root_swap").map(|r: Rep|
+            match r {
+              RFlat(ls) ->
+                ls.map(|l: Leaf|
+                  { name: l.name, sum: match l.rep { RSum(_) -> true, _ -> false } }),
+              _ -> [],
+            }),
+          [[{ name: b"list", sum: false }, { name: b"old", sum: true }]],
+        );
         assert_eq(fields(b"pair_take"), [
           RFlat([
             { name: b"key", rep: RInt },
@@ -1019,23 +1015,20 @@ test "each extern written in place is an operation over the runtime's objects as
           code(b"pair_take").index_of(b"_3 = 0;") != None,
           Some(String::of_bytes_lossy(code(b"pair_take"))),
         );
-        // A key held in place is its leaves, loaded out of the word the pair held, and that word,
-        // whose count the record takes.
+        // A key held in place is its leaves, opened out of the word the pair held, whose count the
+        // record takes.
         assert_eq(fields(b"key_take"), [
           RFlat([
             { name: b"key.a", rep: RInt },
             { name: b"key.b", rep: RInt },
-            { name: b"key.", rep: RWord },
             { name: b"node", rep: RWord },
             { name: b"value", rep: RInt },
           ]),
         ]);
-        // A record a type variable leaves open still holds a record laid out in place as its leaves.
+        // A record a type variable leaves open holds each field as its word.
         assert_eq(fields(b"open_key_take"), [
           RFlat([
-            { name: b"key.a", rep: RInt },
-            { name: b"key.b", rep: RInt },
-            { name: b"key.", rep: RWord },
+            { name: b"key", rep: RWord },
             { name: b"node", rep: RWord },
             { name: b"value", rep: RWord },
           ]),
@@ -1044,9 +1037,7 @@ test "each extern written in place is an operation over the runtime's objects as
           RFlat([
             { name: b"key.a.x", rep: RInt },
             { name: b"key.a.y", rep: RWord },
-            { name: b"key.a.", rep: RWord },
             { name: b"key.b", rep: RInt },
-            { name: b"key.", rep: RWord },
             { name: b"node", rep: RWord },
             { name: b"value", rep: RInt },
           ]),
