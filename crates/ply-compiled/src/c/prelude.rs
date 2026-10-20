@@ -266,8 +266,9 @@ machine! {
     "?in_tag" => rt_in_tag() -> I64;
     "?in_int" => rt_in_int() -> I64;
     "?in_float" => rt_in_float() -> F64;
-    "?in_decimal" => rt_in_decimal(Out);
-    "?in_fixed" => rt_in_fixed(I64, Out);
+    "?in_decimal" => rt_in_decimal() -> I64;
+    "?in_fixed" => rt_in_fixed(I64) -> I64;
+    "?in_high" => rt_in_high() -> I64;
     "?in_char" => rt_in_char() -> I64;
     "?in_str" => rt_in_str() -> I64;
     "?in_bytes" => rt_in_bytes() -> I64;
@@ -420,6 +421,8 @@ helpers! {
         held: *const PlyType,
         answer: *const PlyType
     ) -> Handed;
+    rt_box_wide(lo: I64, hi: I64, t: I64) -> Word;
+    rt_builtin_encoded(index: I64);
 }
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since

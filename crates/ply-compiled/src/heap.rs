@@ -1340,8 +1340,9 @@ unsafe fn give_back(o: *mut Obj, heap: *mut Heap, object: usize, bridge: bool) {
 }
 
 /// Gives back a block whose last holder was emitted code, `payload` bytes past its header, without
-/// a walk: emitted code let go of what it held. Only a block of [`KIND_REFUSED`], or a scalar's box,
-/// which holds nothing counted, is freed so.
+/// a walk: emitted code let go of what it held. Freed so: a block of [`KIND_REFUSED`], a scalar's
+/// box, a string or bytes value, and a list's or a map's own object or node, which the runtime and
+/// emitted code both make.
 pub(crate) unsafe fn free_sized(o: *mut Obj, heap: *mut Heap, payload: usize) {
     unsafe {
         let (kind, rc) = ((*o).kind, (*o).rc);
@@ -1350,7 +1351,19 @@ pub(crate) unsafe fn free_sized(o: *mut Obj, heap: *mut Heap, payload: usize) {
         debug_assert!(
             matches!(
                 kind,
-                KIND_REFUSED | KIND_INT | KIND_FLOAT | KIND_FIXED | KIND_DECIMAL
+                KIND_REFUSED
+                    | KIND_INT
+                    | KIND_FLOAT
+                    | KIND_FIXED
+                    | KIND_DECIMAL
+                    | KIND_STR
+                    | KIND_BYTES
+                    | KIND_LIST
+                    | KIND_LEAF
+                    | KIND_BRANCH
+                    | KIND_MAP
+                    | KIND_MLEAF
+                    | KIND_MBRANCH
             ),
             "{o:p}, of kind {kind}, was freed by size, which lets go of nothing it holds"
         );
