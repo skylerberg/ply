@@ -11,7 +11,8 @@ import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSlice, Var, Arg, AVar,
                  Apply, Make, Get, Pack, Gathered, Prim, Native, Op, OCalling, MClosure, MCtor,
                  PCapture, TTag, Inst, Let, Do, If, Case, Match, Loop, Next, Done, Restart, Enter,
                  Return, Sited, Block, Fn, Member, Closure, Declined, Family, Spine, Data, Calling,
-                 Matching, Handling, Scalars, Containers, RNum, TInt, TRange, rep_of_arg)
+                 Matching, Handling, Scalars, Containers, RNum, TInt, TRange, Convention, Lambda,
+                 rep_of_arg)
 import emit.tir.calling (EntryValue, ConstantRead, Ticked)
 import emit.lower (lowered_fn, lowered_group)
 import emit.lower.base (GroupMember)
@@ -20,6 +21,8 @@ import emit.answer (GenericCall)
 import emit.own (owned)
 import emit.roots (symbol_of)
 import emit.compare (Program, program_of, printed_text, unbuilt, answered_by_form)
+import emit.lower.held (passing, ByReference, enumerated)
+import emit.print.made (head_types)
 
 fn corpus() -> Bytes =
   Bytes::concat_all([
@@ -83,6 +86,17 @@ fn corpus() -> Bytes =
     b"fn tail_of(xs: List<Int>, n: Int) -> List<Int> = match xs { [] -> [], [y, ..rest] -> if y == n { rest } else { tail_of(rest, n) } }\n",
     b"fn rest_lens(xs: List<Int>, n: Int) -> List<Int> = match xs { [] -> [], [y, ..rest] -> if y == n { [0].map(|_: Int| rest.len()) } else { rest_lens(rest, n) } }\n",
     b"fn total(xs: List<Int>) -> Int = match xs { [] -> 0, [y, ..rest] -> y + total(rest) }\n",
+    b"fn widen(n: Int) -> { a: Int, b: Int, c: Int, d: Int, e: Int } = { a: n, b: n + 1, c: n, d: n, e: n }\n",
+    b"fn wide_sum(w: { a: Int, b: Int, c: Int, d: Int, e: Int }) -> Int = w.a + w.e\n",
+    b"fn wide_twice(n: Int) -> Int = wide_sum(widen(n))\n",
+    b"fn wide_loop(w: { a: Int, b: Int, c: Int, d: Int, e: Int }, n: Int) -> Int = if n <= 0 { w.a } else { wide_loop({ ..w, a: w.a + 1 }, n - 1) }\n",
+    b"fn wide_even(w: { a: Int, b: Int, c: Int, d: Int, e: Int }, n: Int) -> Int / {diverges} = if n == 0 { w.a } else { wide_odd(w, n - 1) }\n",
+    b"fn wide_odd(w: { a: Int, b: Int, c: Int, d: Int, e: Int }, n: Int) -> Int / {diverges} = if n == 0 { w.b } else { wide_even(w, n - 1) }\n",
+    b"fn wide_reader() -> ({ a: Int, b: Int, c: Int, d: Int, e: Int }) -> Int = |w: { a: Int, b: Int, c: Int, d: Int, e: Int }| w.a + w.b\n",
+    b"fn wide_applied(f: ({ a: Int, b: Int, c: Int, d: Int, e: Int }) -> Int, n: Int) -> Int = f(widen(n))\n",
+    b"type Hue = | Red | Green | Blue\n",
+    b"fn hue_next(h: Hue) -> Hue = match h { Red -> Green, Green -> Blue, Blue -> Red }\n",
+    b"fn hue_twice(h: Hue) -> Hue = hue_next(hue_next(h))\n",
   ])
 
 fn names() -> List<Bytes> =
@@ -145,11 +159,27 @@ fn names() -> List<Bytes> =
     b"tail_of",
     b"rest_lens",
     b"total",
+    b"widen",
+    b"wide_sum",
+    b"wide_twice",
+    b"wide_loop",
+    b"wide_even",
+    b"wide_odd",
+    b"wide_reader",
+    b"wide_applied",
+    b"hue_next",
+    b"hue_twice",
   ]
 
 /// The corpus's tail groups, each by its members' names.
 fn groups() -> List<List<Bytes>> =
-  [[b"even", b"odd"], [b"walk", b"stride"], [b"seek", b"probe"], [b"ping", b"pong"]]
+  [
+    [b"even", b"odd"],
+    [b"walk", b"stride"],
+    [b"seek", b"probe"],
+    [b"ping", b"pong"],
+    [b"wide_even", b"wide_odd"],
+  ]
 
 /// Root `m.<name>` of `p` lowered as a build lowers it: its body after `known_body`.
 fn lowered_as_built(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.raise} =
@@ -1027,7 +1057,7 @@ test "a tail group's members take and answer a record as its fields and a sum as
       );
       let text = printed_text(owned(f));
       assert(text.index_of(symbol_of(b"m.walk").concat(b"_group(ctx, 0, ply_g0, ")) != None);
-      assert(text.index_of(b"  *o1 = v_1;\n  *o2 = v_2;\n  return v_0;\n") != None)
+      assert(text.index_of(b"  o[0] = (Word)(v_1);\n  o[1] = v_2;\n  return v_0;\n") != None)
     },
   };
   match group_form([b"seek", b"probe"]) {
@@ -1042,7 +1072,7 @@ test "a tail group's members take and answer a record as its fields and a sum as
         text.index_of(symbol_of(b"m.seek").concat(b"_group(ctx, 0, rt_maybe_take_p(ctx, ply_g0), "))
           != None,
       );
-      assert(text.index_of(b"  *o3 = v_3;\n  return v_0;\n") != None)
+      assert(text.index_of(b"  o[2] = v_3;\n  return v_0;\n") != None)
     },
   }
 }
@@ -1359,6 +1389,188 @@ test "every root and tail group of the calling corpus lowers, keeps the form's r
         },
       );
       assert_eq(grouped, [])
+    },
+  }
+}
+
+/// Each call of a root by its key in `f`'s body and its closures' bodies, with the convention it
+/// was written to.
+fn root_calls(f: Fn) -> List<{ callee: RootKey, conv: Convention }> =
+  f.lambdas.fold(
+    vals_in(f.body).fold([], |acc: List<{ callee: RootKey, conv: Convention }>, v: Val|
+      match v {
+        Call(c) -> match c.callee { Root(k) -> acc.push({ callee: k, conv: c.conv }), _ -> acc },
+        _ -> acc,
+      }),
+    |acc: List<{ callee: RootKey, conv: Convention }>, l: Lambda|
+      match l { Closure(c) -> acc.concat(root_calls(c.body)) },
+  )
+
+test "every call of a root the corpus defines is written to the head the root is declared with" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let heads = names().fold(
+        Map::new(),
+        |m: Map<Bytes, { answer: Bytes, params: List<Bytes> }>, n: Bytes|
+          match lowered_as_built(p, n) {
+            Ok(f) -> m.insert(qualify(b"m", n), head_types(f.conv.reps, f.conv.answer)),
+            Err(_) -> m,
+          },
+      );
+      assert_eq(
+        names().fold([], |acc: List<{ caller: Bytes, callee: Bytes }>, n: Bytes|
+          match lowered_as_built(p, n) {
+            Err(_) -> acc,
+            Ok(f) ->
+              root_calls(f).fold(
+                acc,
+                |a: List<{ caller: Bytes, callee: Bytes }>, c: { callee: RootKey, conv: Convention }|
+                  match heads.get(root_name(c.callee)) {
+                    Some(h) -> if h == head_types(c.conv.reps, c.conv.answer) { a }
+                    else { a.push({ caller: n, callee: root_name(c.callee) }) },
+                    None -> a,
+                  },
+              ),
+          }),
+        [],
+      )
+    },
+  }
+}
+
+/// Whether `r` holds a record of five `Int`s crossing a call by reference.
+fn wide(r: Rep) -> Bool =
+  match r { RFlat(ls) -> ls.len() == 5 && passing(r) == ByReference, _ -> false }
+
+test "a record wider than four words crosses a call by reference, its answer through the caller's buffer" {
+  match form(b"wide_twice") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(
+        root_calls(f).map(|c: { callee: RootKey, conv: Convention }|
+          c.conv.reps.map(wide).push(wide(c.conv.answer))),
+        [[false, true], [true, false]],
+      );
+      let text = printed_text(owned(f));
+      // `widen`'s answer past its first value comes back through a buffer of its four other words
+      // and its box word, and `wide_sum`'s argument is laid in a buffer of its five.
+      assert(text.index_of(b"[5];\n") != None, Some(String::of_bytes_lossy(text)));
+      assert(text.index_of(b"[] = {(Word)(") != None, Some(String::of_bytes_lossy(text)))
+    },
+  };
+  match form(b"wide_sum") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      let text = printed_text(owned(f));
+      assert(text.index_of(b"(PlyCtx *ctx, Word* p0, Word p0_5) {") != None, None);
+      assert(text.index_of(b"  int64_t p0_0 = (int64_t)p0[0];") != None, None);
+      // The runtime's entry lays the word's leaves in a buffer of its own and hands its address.
+      assert(text.index_of(b"Word a0_r[] = {(Word)(a0_0), ") != None, None)
+    },
+  };
+  match form(b"widen") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      let text = printed_text(owned(f));
+      assert(text.index_of(b"(PlyCtx *ctx, int64_t p0, Word* o) {") != None, None);
+      assert(text.index_of(b"o[3] = ") != None && text.index_of(b"o[4] = ") != None, None)
+    },
+  }
+}
+
+test "a restart sets a record crossing by reference value by value, its values opened from the caller's words once" {
+  match form(b"wide_loop") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert(restarts(f.body), None);
+      let text = printed_text(owned(f));
+      let said = Some(String::of_bytes_lossy(text));
+      match text.index_of(b"  int64_t p0_0 = (int64_t)p0[0];") {
+        Some(opened) -> match text.index_of(b"ply_loop:") {
+          Some(looped) -> assert(opened < looped, said),
+          None -> assert(false, said),
+        },
+        None -> assert(false, said),
+      };
+      assert(text.index_of(b"p0_0 = t") != None, Some(String::of_bytes_lossy(text)))
+    },
+  }
+}
+
+test "a closure and a function value take a record wider than four words by reference too" {
+  match form(b"wide_reader") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      let text = printed_text(owned(f));
+      assert(
+        text.index_of(b"_typed(PlyCtx *ctx, Word self, Word* p0, Word p0_5) {") != None,
+        Some(String::of_bytes_lossy(text)),
+      );
+      assert(text.index_of(b"(ctx, p0, p0_5);\n}") != None, Some(String::of_bytes_lossy(text)))
+    },
+  };
+  match form(b"wide_applied") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(
+        vals_in(f.body).fold([], |acc: List<Bool>, v: Val|
+          match v { Apply(a) -> acc.concat(a.conv.reps.map(wide)), _ -> acc }),
+        [true],
+      );
+      let text = printed_text(owned(f));
+      assert(
+        text.index_of(b"(PlyCtx *, Word, Word*, Word))") != None,
+        Some(String::of_bytes_lossy(text)),
+      )
+    },
+  }
+}
+
+test "a tail group's member takes a record by reference as the address of its words, a tail call laying them in the group's buffer" {
+  match group_form([b"wide_even", b"wide_odd"]) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      let text = printed_text(owned(f));
+      let has = |b: Bytes| text.index_of(b) != None;
+      assert(has(b"  Word ply_e0[6];\n"), Some(String::of_bytes_lossy(text)));
+      assert(has(b"p0 = (Word)(intptr_t)ply_e0;"), Some(String::of_bytes_lossy(text)));
+      assert(has(b" = (int64_t)((Word *)(intptr_t)p0)[0];"), Some(String::of_bytes_lossy(text)));
+      assert(
+        has(b"Word ply_g0[] = {p0[0], p0[1], p0[2], p0[3], p0[4], p0_5};"),
+        Some(String::of_bytes_lossy(text)),
+      );
+      assert(
+        has(symbol_of(b"m.wide_even").concat(b"_group(ctx, 0, (Word)(intptr_t)ply_g0, ")),
+        Some(String::of_bytes_lossy(text)),
+      )
+    },
+  }
+}
+
+test "a sum whose constructors take nothing crosses a call as its constructor's index, its entry reading it off the word" {
+  match form(b"hue_twice") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) ->
+      assert_eq(
+        root_calls(f).map(|c: { callee: RootKey, conv: Convention }|
+          c.conv.reps.push(c.conv.answer).map(enumerated)),
+        [[true, true], [true, true]],
+      ),
+  };
+  match form(b"hue_next") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      let text = printed_text(owned(f));
+      assert(
+        text.index_of(b"(ply_obj(args[0])->layout == ") != None,
+        Some(String::of_bytes_lossy(text)),
+      );
+      assert(text.index_of(b"return rt_ctor_value_p(ctx, ") == None, None);
+      assert(
+        text.index_of(b"Word rw = rt_ctor_value_p(ctx, ") != None,
+        Some(String::of_bytes_lossy(text)),
+      )
     },
   }
 }

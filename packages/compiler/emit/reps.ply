@@ -1,7 +1,7 @@
 //! How the emitter holds a value of a type: kinds, carriers, record and constructor layouts, each
 //! type's layout by `emit.layout`, its key and its word form, and erasure.
 
-import syntax.parsing (Ident, Span)
+import syntax.parsing (Span)
 import syntax.items (FnDef)
 import syntax.type_syntax (Mode)
 import emit.code (Lambda)
@@ -19,7 +19,7 @@ import check.lent (passed)
 import std.bytes (ascii_of_int)
 import emit.c (KBool, KBoxed, KDec, KFloat, KInt, KNum, KSum, Kind, SumSpec, Tagged, Zeroed, is_sum,
                width_named, carried, in_imm, bytes_join)
-import emit.keys (RootKey, Named, at_key, root_name, key_types, unspecialised)
+import emit.keys (RootKey, Named, at_key, root_name)
 
 /// `TyArr`: an array, with how it holds its elements where its element type says (as a record's field
 /// `e` of that type is held), and `None` where the type is a variable's.
@@ -324,10 +324,7 @@ pub type Def = {
   pure: Bool,
   arity: Int,
   scheme: Option<Scheme>,
-  /// How each parameter its function takes and its answer cross a call, as `carriers_of` says, and
-  /// how many witnesses come before the parameters its scheme writes.
-  carriers: List<Carrier>,
-  answer: Carrier,
+  /// How many witnesses come before the parameters its scheme writes, each an `Int`.
   witnesses: Int,
   /// The parameters, by place, whose functions a call lends: the callee only calls them and hands
   /// them on to parameters it lends in turn.
@@ -346,15 +343,13 @@ pub type EffectName = { written: Bytes, global: Bytes, ops: List<OpMode> }
 
 pub type OpMode = { name: Bytes, mode: Mode }
 
-/// A parameter as the body holds it, and its `carrier`: how it arrives, as a word the prologue
-/// opens to `kind`, as the value itself, or as a record's fields.
+/// A parameter as the body holds it.
 pub type EmitParam = {
   name: Bytes,
   kind: Kind,
   ty: Ty,
   /// The type the definition's scheme gives it, none where no scheme speaks for it.
   of: Option<Type>,
-  carrier: Carrier,
   /// The caller's lambda this parameter is, which a call of it runs in place.
   lambda: Option<BoundLambda>,
 }
@@ -1070,8 +1065,8 @@ pub fn def_entry(
   schemes: Map<Bytes, Scheme>,
 ) -> Def = {
   let full = qualify(module, d.name.name);
-  let ret = match sig_of(schemes, full) { Some(s) -> Some(kind_of(s.ret)), None -> None };
-  let carried = carriers_of(d, sig_of(schemes, full));
+  let sig = sig_of(schemes, full);
+  let ret = match sig { Some(s) -> Some(kind_of(s.ret)), None -> None };
   {
     name: d.name.name,
     ret: match ret { Some(r) -> Some(r.kind), None -> None },
@@ -1079,73 +1074,11 @@ pub fn def_entry(
     pure: pure.contains(full),
     arity: d.params.len() + d.generics.labels.len(),
     scheme: schemes.get(full),
-    carriers: carried.params,
-    answer: carried.answer,
-    witnesses: carried.witnesses,
+    witnesses: d.params.len() - (match sig { Some(s) -> s.params.len(), None -> 0 }),
     lent: range(0, d.params.len()).filter(|i: Int|
       match d.params.at(i) { Some(p) -> passed(p).lent, None -> false }),
     root: Named(full),
   }
-}
-
-/// How each parameter of `d`, witnesses first and labels last as its function takes them, and its
-/// answer cross a call between roots, from the types its scheme declares; a nullary root's answer
-/// is a word, as a constant's is.
-pub fn carriers_of(
-  d: FnDef,
-  sig: Option<Sig>,
-) -> { params: List<Carrier>, answer: Carrier, witnesses: Int } = {
-  let given = match sig { Some(s) -> s.params, None -> [] };
-  let witnesses = d.params.len() - given.len();
-  let written = range(0, d.params.len()).map(|i: Int|
-    if i < witnesses { Whole(KBoxed) }
-    else { match given.at(i - witnesses) { Some(t) -> carrier_of(t), None -> Whole(KBoxed) } });
-  {
-    params: d.generics.labels.fold(written, |acc: List<Carrier>, _: Ident| acc.push(Whole(KBoxed))),
-    answer: if d.params.len() + d.generics.labels.len() == 0 { Whole(KBoxed) }
-    else { match sig { Some(s) -> carrier_of(s.ret), None -> Whole(KBoxed) } },
-    witnesses: witnesses,
-  }
-}
-
-/// How a root of `d` at type arguments `args` takes each parameter and answers: as `carriers_of`
-/// says of the types it declares, and each variable `carried_vars` names as its argument crosses
-/// once `erased`, which is what names the root. Callers at their type arguments and the root at its
-/// own reach the same.
-pub fn carriers_at(
-  d: Def,
-  args: List<Type>,
-) -> { params: List<Carrier>, answer: Carrier } / {abort.raise} =
-  match d.scheme {
-    None -> { params: d.carriers, answer: d.answer },
-    Some(sc) -> match sc.ty {
-      TyFn(f) -> {
-        let raw = carried_vars(sc, args, d.arity);
-        let at_var = |t: Type, otherwise: Carrier|
-          match t {
-            TyVar(j) -> if raw.contains(j) { carrier_of(erased(args.get(j))) } else { otherwise },
-            _ -> otherwise,
-          };
-        {
-          params: range(0, d.carriers.len()).map(|i: Int| {
-            let k = d.carriers.get(i);
-            if i < d.witnesses { k }
-            else { match f.params.at(i - d.witnesses) { Some(t) -> at_var(t, k), None -> k } }
-          }),
-          answer: at_var(f.ret, d.answer),
-        }
-      },
-      _ -> { params: d.carriers, answer: d.answer },
-    },
-  }
-
-/// How root `k` hands back its answer: as the `Def` of `here` it runs says at the root's type
-/// arguments, and a word for any other root.
-pub fn carried_answer(here: List<Def>, k: RootKey) -> Carrier / {abort.raise} = {
-  let own = unspecialised(k);
-  let args = key_types(k);
-  here.fold(Whole(KBoxed), |acc: Carrier, d: Def|
-    if d.root == own { carriers_at(d, args).answer } else { acc })
 }
 
 /// The variables of `scheme` a call at `args` carries raw: each standing bare as a parameter, or as

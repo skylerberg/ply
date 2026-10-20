@@ -1,29 +1,28 @@
-//! How a value of a type is held in a body, how a value crossing a call between roots is held, and
-//! where a record's field or a constructor's argument lies, at the offsets today's emitter lays
-//! them out at. A record held as its leaves names each leaf by its field, and a record it holds in
+//! How a value of a type is held in a body and crosses a call between roots, and where a record's
+//! field or a constructor's argument lies, at the offsets today's emitter lays them out at. A record held as its leaves names each leaf by its field, and a record it holds in
 //! place by `field.leaf` for that record's leaves and `field.` for that record's word, so a flat
 //! representation spells the layout it was flattened from.
 
 import check.types (Type, TyVar, TyCon, TyRecord, TyNominal, Field)
 import std.bytes (ascii_of_int)
 import emit.reps (Carrier, Whole, Fields, Cases, SumCase, SumCtor, FieldTy, TyRec, TyOpen, Laid,
-                  kind_of, carrier_of, carried_record, laid_of, record_flags, ctors_of, no_ctors)
+                  kind_of, carrier_of, laid_of, record_flags, ctors_of, no_ctors)
 import emit.c (Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, Zeroed, Tagged)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases, Leaf,
                  Path, PField, PNamed, PArg, PPlace, RSum, RUnit, RSlice)
 import emit.layout (LSum, LWords, P, Always, Inline, words, register_words)
 import emit.lower.setting (Setting, ctor_named)
 
-/// How a value of `ty` is held in a body: a record of a field whose type lays it out as `record_held`
-/// says; a sum each of whose constructors takes nothing as its constructor's index; anything else as
-/// it crosses a call between roots.
+/// How a value of `ty` is held in a body, and so how it crosses a call: a record of a field whose
+/// type lays it out as `record_held` says; a sum each of whose constructors takes nothing as its
+/// constructor's index; anything else as its carrier says.
 pub fn held_as(s: Setting, ty: Type) -> Rep =
   match laid_fields(ty) {
     Some(fs) -> record_held(fs),
     None -> match enumerated_by(s, ty) {
       Some(names) ->
         RCases({ tagged: false, cases: names.map(|n: Bytes| { name: n, leaves: [] }) }),
-      None -> carried_as(carrier_of(ty)),
+      None -> carrier_held(carrier_of(ty)),
     },
   }
 
@@ -41,7 +40,7 @@ fn enumerated_by(s: Setting, ty: Type) -> Option<List<Bytes>> =
   }
 
 /// Whether a sum held as `r` is held as its constructor's index alone, its constructors taking
-/// nothing: where it crosses a call it is its constructor's object.
+/// nothing.
 pub fn enumerated(r: Rep) -> Bool =
   match r {
     RCases(c) ->
@@ -49,9 +48,9 @@ pub fn enumerated(r: Rep) -> Bool =
     _ -> false,
   }
 
-/// How a value crossing a call as `c` is held: as the emitter carries it between roots, so a root
-/// the form writes and one today's emitter writes call each other alike.
-pub fn carried_as(c: Carrier) -> Rep =
+/// How a value of a type `c` carries is held: a scalar as itself, a record's fields as its leaves,
+/// an `Option` or a `Result` as its word or its cases, anything else as its word.
+fn carrier_held(c: Carrier) -> Rep =
   match c {
     Whole(k) -> slot_rep(k),
     Fields(fs) -> RFlat(leaves_of(fs)),
@@ -104,10 +103,10 @@ pub fn laid_fields(ty: Type) -> Option<List<FieldTy>> =
   match kind_of(ty).ty { TyRec(fs) -> Some(fs), _ -> None }
 
 /// How a record of the fields `fs` is held, in a body, read out of the object holding it in place or
-/// handed to the object made to hold it: as its leaves and then its word where it crosses a call as
-/// them, and otherwise, as wide as it is, as its word.
+/// handed to the object made to hold it: as its leaves and then its word however wide, and a record
+/// of no fields as its word.
 pub fn record_held(fs: List<FieldTy>) -> Rep =
-  if carried_record(fs) { RFlat(leaves_of(fs)) } else { RWord }
+  if fs.len() == 0 { RWord } else { RFlat(leaves_of(fs)) }
 
 /// The leaves of a record of `fs` held flat, before its word: each field's, named by it; and for a
 /// record held in place, at any depth, that record's leaves, named `field.leaf`, and then its word,
@@ -397,21 +396,21 @@ test "a scalar is held as itself, a sum the code knows as one word, and anything
     held_as(s, TyCon({ name: b"Result", args: [named(b"Int"), named(b"Bytes")] })),
     RTagged,
   );
-  assert_eq(held_as(s, TyCon({ name: b"Result", args: [named(b"Int"), named(b"Int")] })), RWord);
-  assert_eq(carried_as(Whole(KSum(Zeroed))), RMaybe);
-  assert_eq(carried_as(Whole(KBoxed)), RWord)
+  assert_eq(held_as(s, TyCon({ name: b"Result", args: [named(b"Int"), named(b"Int")] })), RWord)
 }
 
-test "a record is held as its leaves where it crosses a call as them, and wider as its word" {
+test "a record is held as its leaves and its word however wide, and a record of no fields as its word" {
   let s = setting();
   let p = RFlat([{ name: b"x", rep: RFloat }, { name: b"y", rep: RFloat }]);
   assert_eq(held_as(s, point()), p);
-  assert_eq(carried_as(carrier_of(point())), p);
   let wide = record(
     range(0, 6).map(|i: Int| { name: b"f".concat(ascii_of_int(i)), ty: named(b"Int") }),
   );
-  assert_eq(held_as(s, wide), RWord);
-  assert_eq(carried_as(carrier_of(wide)), RWord);
+  assert_eq(
+    held_as(s, wide),
+    RFlat(range(0, 6).map(|i: Int| { name: b"f".concat(ascii_of_int(i)), rep: RInt })),
+  );
+  assert_eq(held_as(s, record([])), RWord);
   // A field of a variable's type leaves the layout open: the record is a word.
   assert_eq(held_as(s, record([{ name: b"inner", ty: TyVar(0) }])), RWord);
   // A narrow record holding one in place is its leaves and then that record's leaves and word,
@@ -426,17 +425,16 @@ test "a record is held as its leaves where it crosses a call as them, and wider 
       { name: b"p.", rep: RWord },
     ]),
   );
-  assert_eq(carried_as(carrier_of(pinned)), held_as(s, pinned));
   assert_eq(
     leaf_span(match held_as(s, pinned) { RFlat(ls) -> ls, _ -> [] }, b"p"),
     Some({ at: 1, n: 3 }),
   );
-  // Records held in place that take it past four words make a record a word, and so does one held
-  // in place that holds one of its own: no narrow record holds a wide one.
-  assert_eq(held_as(s, segment()), RWord);
+  // Records held in place at any depth are leaves too, each record's word after its own.
   let holder = record([{ name: b"n", ty: named(b"Int") }, { name: b"seg", ty: segment() }]);
-  assert_eq(held_as(s, holder), RWord);
-  assert_eq(held_as(s, record([{ name: b"q", ty: pinned }])), RWord);
+  assert_eq(
+    match held_as(s, holder) { RFlat(ls) -> ls.map(|l: Leaf| l.name), _ -> [] },
+    match laid_fields(holder) { Some(fs) -> leaves_of(fs).map(|l: Leaf| l.name), None -> [] },
+  );
   // Leaves spell the layout they were flattened from back, at any depth: an extern answers a record
   // as them.
   match laid_fields(pinned) {
@@ -463,7 +461,7 @@ test "a record is held as its leaves where it crosses a call as them, and wider 
   };
   // A record held in place holding no field keeps its place: its header and nothing else.
   let empty = record([{ name: b"e", ty: record([]) }, { name: b"n", ty: named(b"Int") }]);
-  assert_eq(held_as(s, empty), RWord);
+  assert_eq(held_as(s, empty), RFlat([{ name: b"e.", rep: RWord }, { name: b"n", rep: RInt }]));
   match laid_fields(empty) {
     Some(fs) -> assert_eq(laid_of(fields_of(leaves_of(fs))), laid_of(fs)),
     None -> assert(false),
@@ -493,7 +491,7 @@ test "an Option or a Result of a small record is held as its constructor's index
   assert_eq(enumerated(o), false)
 }
 
-test "a sum whose constructors take nothing is held as its constructor's index, crossing as its object" {
+test "a sum whose constructors take nothing is held as its constructor's index" {
   let ctor = |n: Bytes, i: Int| { name: n, index: i, fields: [], params: [] };
   let sums = Map::new().insert(b"Ordering", [
     ctor(b"Less", 0),
@@ -515,7 +513,6 @@ test "a sum whose constructors take nothing is held as its constructor's index, 
   );
   assert_eq(enumerated(ordering), true);
   assert_eq(case_index(ordering, b"Greater"), Some(2));
-  assert_eq(carried_as(carrier_of(named(b"Ordering"))), RWord);
   // A constructor taking an argument leaves the sum an object.
   assert_eq(held_as(s, named(b"m.Shade")), RWord)
 }
@@ -542,11 +539,14 @@ test "a field is read at the offset today's emitter lays it at, a record held in
     field_held(segment(), b"from"),
     RFlat([{ name: b"x", rep: RFloat }, { name: b"y", rep: RFloat }]),
   );
-  // A wide one is read as its word, which is that address.
+  // So is a wide one, and only one of no fields is read as its word, which is that address.
   let holder = record([{ name: b"n", ty: named(b"Int") }, { name: b"seg", ty: segment() }]);
-  assert_eq(field_held(holder, b"seg"), RWord);
-  assert_eq(field_path(s, holder, b"seg"), PPlace(1));
+  assert_eq(field_held(holder, b"seg"), held_as(s, segment()));
+  assert_eq(field_path(s, holder, b"seg"), PField({ name: b"seg", at: 1 }));
   assert_eq(field_path(s, holder, b"n"), PField({ name: b"n", at: 0 }));
+  let empty = record([{ name: b"e", ty: record([]) }, { name: b"n", ty: named(b"Int") }]);
+  assert_eq(field_held(empty, b"e"), RWord);
+  assert_eq(field_path(s, empty, b"e"), PPlace(0));
   assert_eq(field_path(s, record([{ name: b"inner", ty: TyVar(0) }]), b"inner"), PNamed(b"inner"));
   assert_eq(field_type(segment(), b"to"), Some(point()))
 }
@@ -575,8 +575,7 @@ test "a constructor's argument lies where its declaration lays it out" {
   assert_eq(arg_path(s, b"m.Box", 2), PArg({ ctor: b"m.Box", at: 3 }));
   assert_eq(arg_held(s, b"m.Box", 1), RDec);
   assert_eq(arg_held(s, b"m.Box", 2), RMaybe);
-  // An argument held in place is read as its leaves and its header's address there, and one wider
-  // than four words as its word, that address.
+  // An argument held in place is read as its leaves and its header's address there, however wide.
   assert_eq(arg_path(s, b"m.Box", 3), PArg({ ctor: b"m.Box", at: 4 }));
   assert_eq(
     arg_held(s, b"m.Box", 3),
@@ -593,8 +592,11 @@ test "a constructor's argument lies where its declaration lays it out" {
       Map::new(),
     ),
   };
-  assert_eq(arg_held(boxed, b"m.Big", 0), RWord);
-  assert_eq(arg_path(boxed, b"m.Big", 0), PPlace(0));
+  assert_eq(
+    arg_held(boxed, b"m.Big", 0),
+    RFlat(wide.map(|f: FieldTy| { name: f.name, rep: RInt })),
+  );
+  assert_eq(arg_path(boxed, b"m.Big", 0), PArg({ ctor: b"m.Big", at: 0 }));
   assert_eq(arg_path(s, b"Some", 0), PArg({ ctor: b"Some", at: 0 }))
 }
 

@@ -25,7 +25,7 @@ import emit.print.text (Under, Place, Printing, Printed, printing, function_body
 import emit.print.counts (exit_of, block_opened, block_closed, count_printed)
 import emit.print.made (c_type, c_types, as_word, word_as, word_parts, made, got, packed, gathered,
                         statics, join_declared, set_parts, returned, head_types, head_params,
-                        entry_opened, entry_outs, entry_answered)
+                        params_opened)
 import emit.print.fuel (fuel_head)
 import emit.print.prims (literal, prim)
 import emit.print.containers (contained, container_op)
@@ -34,7 +34,9 @@ import emit.print.tested (case_opened, case_arm, case_arm_closed, case_rest, cas
                           missed, failed)
 import emit.print.invoked (call, applied, closure_made, restarted, entered_member, loop_opened,
                            loop_closed, next, done, calling_op, lambda_names, lambda_text,
-                           group_wrapper, capture_got, member_returned)
+                           group_wrapper, capture_got, member_returned, runtime_entry,
+                           group_buffers, member_opened)
+import emit.lower.held (passing, ByReference)
 import emit.print.handled (handle_opened, handle_closed, landing_jump, effect_op)
 
 /// Root `f` as its C function and entry, or a tail group as its group function, the group's entry
@@ -72,7 +74,7 @@ pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
 /// pieces.
 fn root_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
   let body = body_printed(name, f, printing(param_names(f)));
-  let entered = entry(name, f, body);
+  let entered = runtime_entry(body, name, 0, 0, f.conv.reps, f.conv.answer);
   {
     pr: entered.pr,
     out: [
@@ -149,11 +151,13 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
               |q: Printing, j: Int| {
                 let v = m.params.get(j);
                 let word = b"p".concat(ascii_of_int(j));
-                match v.rep {
-                  RWord -> { ..q, names: q.names.insert(v.id, word) },
-                  RFlat(_) -> parted(q, v, word),
-                  RCases(_) -> parted(q, v, word),
-                  _ -> assigned(q, 1, v, c_type(v.rep), word_as(word, v.rep)),
+                if passing(v.rep) == ByReference { member_opened(q, 1, v, word) } else {
+                  match v.rep {
+                    RWord -> { ..q, names: q.names.insert(v.id, word) },
+                    RFlat(_) -> parted(q, v, word),
+                    RCases(_) -> parted(q, v, word),
+                    _ -> assigned(q, 1, v, c_type(v.rep), word_as(word, v.rep)),
+                  }
                 }
               },
             );
@@ -200,6 +204,7 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
           Bytes::concat_all(words.map(|w: Bytes| b", Word ".concat(w))),
           b") {\n",
           fuel_head(f.conv.answer),
+          Bytes::concat_all(group_buffers(f).map(|d: Bytes| Bytes::concat_all([b"  ", d, b"\n"]))),
           b"  ply_loop: ",
           tick_line(failing_return(f.conv.answer)),
           b"\n  switch (which) {\n",
@@ -261,7 +266,11 @@ fn body_printed(symbol: Bytes, f: Fn, pr: Printing) -> Printing / {abort.raise} 
     landing: None,
     group: None,
   };
-  let viewed = views_opened(f, pr);
+  let opened = params_opened(f.params.map(|v: Var| name_of(pr, v)), f.conv.reps).fold(
+    pr,
+    |q: Printing, l: Bytes| line(q, 0, l),
+  );
+  let viewed = views_opened(f, opened);
   let looped = if restarts(f.body) {
     text(
       viewed,
@@ -645,41 +654,6 @@ fn head(name: Bytes, f: Fn) -> Bytes =
     b")",
   ])
 
-/// The entry the runtime and closures call a root by, words in and out: each word opened as its
-/// parameter is held, and the answer handed back as a word.
-fn entry(name: Bytes, f: Fn, pr: Printing) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
-  let opened = range(0, f.conv.reps.len()).map(|i: Int| entry_opened(i, f.conv.reps.get(i)));
-  let call = Bytes::concat_all([
-    name,
-    b"(ctx",
-    Bytes::concat_all(
-      opened.fold([], |acc: List<Bytes>, o: { text: Bytes, args: List<Bytes> }|
-        acc.concat(o.args)).concat(
-        entry_outs(f.conv.answer),
-      ).map(|a: Bytes| b", ".concat(a)),
-    ),
-    b")",
-  ]);
-  let answered = entry_answered(pr, f.conv.answer, call);
-  {
-    pr: answered.pr,
-    out: [
-      Text(
-        Bytes::concat_all([
-          b"Word ",
-          name,
-          b"_entry(PlyCtx *ctx, const Word *args) {\n",
-          Bytes::concat_all(opened.map(|o: { text: Bytes, args: List<Bytes> }| o.text)),
-        ]),
-      ),
-    ].concat(
-      answered.out,
-    ).push(
-      Text(b"}\n"),
-    ),
-  }
-}
-
 /// Whether `run` stands in `lines` as consecutive lines.
 fn holds_run(lines: List<Bytes>, run: List<Bytes>) -> Bool =
   range(0, lines.len()).any(|i: Int| lines.drop(i).take(run.len()) == run)
@@ -922,7 +896,7 @@ test "a closure's function follows its root's entry, and its body numbers its te
     spelled(printed.pieces).ends_with(
       Bytes::concat_all([
         b"}\n",
-        spelled(entry(name, f, printing(Map::new())).out),
+        spelled(runtime_entry(printing(Map::new()), name, 0, 0, f.conv.reps, f.conv.answer).out),
         spelled(lambda_text(f, 0, l, inner).out),
       ]),
     ),
