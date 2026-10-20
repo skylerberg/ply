@@ -31,14 +31,14 @@ import std.bytes (ascii_of_int)
 import emit.c (KBoxed, KInt, Kind, position_of, bytes_join)
 import emit.roots (container_ops, equality_root, ordering_root, written_root_of)
 import emit.keys (RootKey, Named, At, FnArg, root_name, sited_as, key_types, key_lent)
-import emit.answer (no_tables, sorted_widths, Emitted, Body, Refused, RootAnswer)
+import emit.answer (sorted_widths, Emitted, Body, Refused, RootAnswer)
 import emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, ModuleDefs, Whole, EmitParam,
                   BoundLambda, OwnerLambdas, kind_of, boxed, Sig, sig_of, param_kinds, param_types,
                   typed_kind, typed_at, carriers_of)
 import emit.written (container_code, equality_code, ordering_code, digest_code, at_args,
                      reflection_code, reflected_kind)
-import emit.entry (Prepared, group_emitted, root_emitted, emitted_from)
-import emit.special (specialisations_wanted, witnessed_needs, definition_at, specialised_emitted)
+import emit.entry (Prepared, RootForm, Unformed, group_formed, root_formed, formed_from, emitted_of)
+import emit.special (specialisations_wanted, witnessed_needs, definition_at, specialised_formed)
 
 /// What an arm that refuses a program before lowering anything can say: the checker's own words, one
 /// per diagnostic. There is no renderer for a diagnostic on this side -- the driver's `explain` has
@@ -73,23 +73,25 @@ pub fn refused_rather_than_emitted(
   sources: List<Source>,
   wanted: Option<List<RootKey>>,
   why: Bytes,
-) -> List<Emitted> =
+) -> List<RootForm> =
   List::map(
     match wanted {
       Some(ks) -> wanted_names(ks).keys(),
       None -> sources.map(|source: Source| source.name).map(|n: Bytes| n),
     },
-    |n: Bytes| { name: n, text: b"", tables: no_tables(), why: Some(why) },
+    |n: Bytes| Unformed({ name: n, why: why }),
   )
 
 /// The names the roots `wanted` print as, each once.
 fn wanted_names(wanted: List<RootKey>) -> Map<Bytes, Bool> =
   wanted.fold(Map::new(), |m: Map<Bytes, Bool>, k: RootKey| m.insert(root_name(k), true))
 
-/// Resolved together first, so defaults are filled and derives expanded; a program that does not resolve emits nothing.
-/// Every root is resolved against, but only the roots `wanted` keys are emitted; `None` wants them
-/// all. `pkgs` and `placed` are the program's package tables, empty for one without packages:
-/// resolution then treats every module as one package's, which is what no packages means.
+/// What a program walk lowered, in its order: each root's form or refusal, and each constructor's
+/// stated functions, which a body naming the constructor's tag calls once it is printed.
+pub type Walked = { roots: List<RootForm>, stated: Map<Bytes, List<Bytes>> }
+
+/// The roots `roots` keys of the program `given` emitted: `lowered_program`'s forms, each counted,
+/// checked and printed.
 pub fn emit_program(
   given: List<Source>,
   ctors: Ctors,
@@ -101,10 +103,37 @@ pub fn emit_program(
   embeds: List<EmbedAt>,
   rows: Rows,
   walked: Bytes,
-) -> List<Emitted> / {abort.raise} = {
+) -> List<Emitted> / {abort.raise} =
+  emitted_program(
+    lowered_program(given, ctors, builtins, release, roots, pkgs, placed, embeds, rows, walked),
+  )
+
+/// Each root `w` holds, its counts placed, checked and printed, or its refusal; a form the typed
+/// form declined, or one that fails its check or does not print, stops the build there.
+pub fn emitted_program(w: Walked) -> List<Emitted> / {abort.raise} =
+  w.roots.map(|r: RootForm| calling_instances(w.stated, emitted_of(r)))
+
+/// Resolved together first, so defaults are filled and derives expanded; a program that does not resolve lowers nothing.
+/// Every root is resolved against, but only the roots `wanted` keys are lowered; `None` wants them
+/// all. `pkgs` and `placed` are the program's package tables, empty for one without packages:
+/// resolution then treats every module as one package's, which is what no packages means.
+pub fn lowered_program(
+  given: List<Source>,
+  ctors: Ctors,
+  builtins: List<Bytes>,
+  release: Bool,
+  roots: Option<List<RootKey>>,
+  pkgs: List<PackageDeps>,
+  placed: List<Int>,
+  embeds: List<EmbedAt>,
+  rows: Rows,
+  walked: Bytes,
+) -> Walked / {abort.raise} = {
   let wanted = match roots { Some(ks) -> Some(wanted_names(ks)), None -> None };
   // Every module imports `std.prelude`, which a caller may leave out; it is a shipped module.
   let sources = with_prelude_source(given);
+  let refused = |why: Bytes|
+    { roots: refused_rather_than_emitted(sources, roots, why), stated: Map::new() };
   let module_packages = if sources.len() == given.len() || pkgs.len() == 0 { placed }
   else { placed.push(pkgs.len()) };
   let tables = embed_tables(embeds);
@@ -130,7 +159,7 @@ pub fn emit_program(
       |acc: Option<Bytes>, p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool, why: Bytes }|
         match acc { Some(_) -> acc, None -> if p.bad { Some(p.why) } else { None } },
     ) {
-    Some(why) -> refused_rather_than_emitted(sources, roots, why),
+    Some(why) -> refused(why),
     None -> {
       let mods0: List<ParsedModule> = parsed.map(
         |p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool, why: Bytes }|
@@ -154,7 +183,7 @@ pub fn emit_program(
           packaged.compiler,
           packaged.shipped,
         ) {
-        ResolveFailed(diags) -> refused_rather_than_emitted(sources, roots, said(diags)),
+        ResolveFailed(diags) -> refused(said(diags)),
         ResolveSucceeded(x) -> {
           // A specialisation is lowered from its definition's facts, and the lambdas it runs from
           // their owners'.
@@ -177,7 +206,7 @@ pub fn emit_program(
                 ),
               Some(w) -> facts_read(rows, w, reading, x.mods),
             } {
-            Err(why) -> refused_rather_than_emitted(sources, roots, why),
+            Err(why) -> refused(why),
             Ok(facts) -> {
               let pure = facts.pure.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes|
                 acc.insert(n, true));
@@ -353,33 +382,38 @@ pub fn emit_program(
                   },
                 };
               let declared = declared_schemes();
-              range(0, mods.len()).fold([], |acc: List<Emitted>, i: Int|
-                match mods.at(i) {
-                  None -> acc,
-                  Some(m) -> if !lowers(lowered, m.name) { acc } else {
-                    let tab = tables_at(i, m);
-                    emit_module(
-                      m.module,
-                      {
-                        module: m.name,
-                        here: tab.here,
-                        imports: tab.imports,
-                        ctors: ctors,
-                        builtins: builtins,
-                        declared: declared,
-                        effects: effects_in(x.r, i, mods),
-                        release: release,
-                        typed: tab.typed,
-                      },
-                      schemes,
-                      wanted,
-                      specialised,
-                      sites_in(facts.label_sites, i),
-                      facts.elaboration.ops.filter(|o: WitnessOp| o.module == i),
-                      lambda_at,
-                    ).fold(acc, |a: List<Emitted>, e: Emitted| a.push(calling_instances(stated, e)))
-                  },
-                })
+              {
+                roots: range(0, mods.len()).fold([], |acc: List<RootForm>, i: Int|
+                  match mods.at(i) {
+                    None -> acc,
+                    Some(m) -> if !lowers(lowered, m.name) { acc } else {
+                      let tab = tables_at(i, m);
+                      acc.concat(
+                        module_formed(
+                          m.module,
+                          {
+                            module: m.name,
+                            here: tab.here,
+                            imports: tab.imports,
+                            ctors: ctors,
+                            builtins: builtins,
+                            declared: declared,
+                            effects: effects_in(x.r, i, mods),
+                            release: release,
+                            typed: tab.typed,
+                          },
+                          schemes,
+                          wanted,
+                          specialised,
+                          sites_in(facts.label_sites, i),
+                          facts.elaboration.ops.filter(|o: WitnessOp| o.module == i),
+                          lambda_at,
+                        ),
+                      )
+                    },
+                  }),
+                stated: stated,
+              }
             },
           }
         },
@@ -477,9 +511,9 @@ fn calling_instances(stated: Map<Bytes, List<Bytes>>, e: Emitted) -> Emitted / {
     }
   }
 
-/// The roots `wanted` names of the module `s` reads, written in its order: its definitions, each
+/// The roots `wanted` names of the module `s` reads, formed in its order: its definitions, each
 /// definition's specialisations and clauses, its tests and laws, and the roots written for its types.
-fn emit_module(
+fn module_formed(
   x_module: Module,
   s: Setting,
   schemes: Map<Bytes, Scheme>,
@@ -488,7 +522,7 @@ fn emit_module(
   sites: Map<Bytes, List<Bytes>>,
   ops: List<WitnessOp>,
   lambda_at: (RootKey, Int) -> Option<BoundLambda> / {abort.raise},
-) -> List<Emitted> / {abort.raise} = {
+) -> List<RootForm> / {abort.raise} = {
   let module = s.module;
   let here = s.here;
   let fns = x_module.items.fold([], |acc: List<Prepared>, item: Item|
@@ -503,9 +537,9 @@ fn emit_module(
         };
         let specialisations = (match specialised.get(p.full) { Some(l) -> l, None -> [] }).fold(
           acc.out,
-          |a: List<Emitted>, sp: RootKey|
+          |a: List<RootForm>, sp: RootKey|
             a.push(
-              specialised_emitted(
+              specialised_formed(
                 { ..s, here: held_whole(here, tail_cycle(module, here, sites, x_module.items, d)) },
                 d,
                 sp,
@@ -520,18 +554,17 @@ fn emit_module(
           None -> if !wants(wanted, p.full) { specialisations } else {
             specialisations.push(
               witnessed_needs(
-                emitted_from(s, p.base, Named(p.full), p.ps, p.known, p.code),
+                formed_from(s, p.base, Named(p.full), p.ps, p.known, p.code),
                 d,
                 schemes.get(p.full),
                 ops,
               ),
             )
           },
-          // The group is emitted where its first member stands; the others are its cases.
+          // The group is formed where its first member stands; the others are its cases.
           Some(g) -> if g.at(0) != Some(acc.fns) { specialisations } else {
-            group_emitted(s, g.map(|i: Int| match fns.at(i) { Some(q) -> q, None -> p })).fold(
-              specialisations,
-              |a: List<Emitted>, e: Emitted| a.push(e),
+            specialisations.concat(
+              group_formed(s, g.map(|i: Int| match fns.at(i) { Some(q) -> q, None -> p })),
             )
           },
         };
@@ -571,7 +604,7 @@ fn emit_module(
           ]
         };
         let rooted = |name: Bytes, taken: List<EmitParam>, body: Expr|
-          root_emitted(
+          root_formed(
             s,
             t.span.start,
             name,
@@ -601,13 +634,13 @@ fn emit_module(
         let with_guard = match d.guard {
           None -> acc.out,
           Some(g) -> if !wants(wanted, part(b"guard")) { acc.out } else {
-            acc.out.push(root_emitted(s, d.span.start, part(b"guard"), names, ps, known, sites, g))
+            acc.out.push(root_formed(s, d.span.start, part(b"guard"), names, ps, known, sites, g))
           },
         };
         {
           out: if !wants(wanted, part(b"body")) { with_guard } else {
             with_guard.push(
-              root_emitted(s, d.span.start, part(b"body"), names, ps, known, sites, d.body),
+              root_formed(s, d.span.start, part(b"body"), names, ps, known, sites, d.body),
             )
           },
           fns: acc.fns,
@@ -682,7 +715,7 @@ fn emit_module(
                 {
                   ..a2,
                   out: a2.out.push(
-                    emitted_from(
+                    formed_from(
                       { ..s, typed: filed_too(s.typed, e.typed) },
                       t.span.start,
                       Named(d.root),
@@ -712,18 +745,16 @@ fn emit_module(
   // What a container's roots call of `std.prelude` the load reaches wherever a body writes one.
   let unreached = written_code().calls.filter(|n: Bytes|
     match def_in(module, here, s.imports, n) { Some(_) -> false, None -> true });
-  written.fold(walked.out, |out: List<Emitted>, r: { root: Bytes, op: Bytes, ty: Type }|
+  written.fold(walked.out, |out: List<RootForm>, r: { root: Bytes, op: Bytes, ty: Type }|
     if (container_ops().contains(r.op) || walked_container(r.ty)) && unreached.len() > 0 {
-      out.push({
-        name: r.root,
-        text: b"",
-        tables: no_tables(),
-        why: Some(
-          b"a container's root calls what the load did not reach of `std.prelude`: ".concat(
+      out.push(
+        Unformed({
+          name: r.root,
+          why: b"a container's root calls what the load did not reach of `std.prelude`: ".concat(
             Bytes::join(unreached, b", "),
           ),
-        ),
-      })
+        }),
+      )
     } else if container_ops().contains(r.op) || walked_container(r.ty) {
       let e = container_code(module, r.op, r.ty);
       let word = |n: Bytes|
@@ -744,7 +775,7 @@ fn emit_module(
         lambda: None,
       };
       out.push(
-        emitted_from(
+        formed_from(
           { ..s, here: here.concat(e.here), typed: filed_too(s.typed, e.typed) },
           0,
           Named(r.root),
@@ -761,7 +792,7 @@ fn emit_module(
       let held = kind_of(r.ty);
       let word = reflected_kind(r.ty);
       out.push(
-        emitted_from(
+        formed_from(
           { ..s, typed: filed_too(s.typed, e.typed) },
           0,
           Named(r.root),
@@ -786,7 +817,7 @@ fn emit_module(
 fn filed_too(typed: Map<Bytes, Typed>, written: Map<Bytes, Typed>) -> Map<Bytes, Typed> =
   written.fold(typed, |m: Map<Bytes, Typed>, k: Bytes, v: Typed| m.insert(k, v))
 
-type Walk = { out: List<Emitted>, fns: Int }
+type Walk = { out: List<RootForm>, fns: Int }
 
 /// A label parameter is a hidden trailing `Int`: the caller passes the resource's field-table entry.
 fn prepare(
@@ -951,14 +982,14 @@ fn clause_roots(
     qualify(s.module, Bytes::concat_all([def.name.name, b"#", kind, b"#", ascii_of_int(k)]));
   let walked = def.spec.fold(
     { out: acc.out, requires: 0, ensures: 0 },
-    |w: { out: List<Emitted>, requires: Int, ensures: Int }, c: SpecClause|
+    |w: { out: List<RootForm>, requires: Int, ensures: Int }, c: SpecClause|
       match c.kind {
         SRequires -> {
           let full = clause(b"requires", w.requires);
           {
             out: if !wants(wanted, full) { w.out } else {
               w.out.push(
-                root_emitted(
+                root_formed(
                   s,
                   def.span.start,
                   full,
@@ -984,7 +1015,7 @@ fn clause_roots(
             {
               out: if !wants(wanted, full) { w.out } else {
                 w.out.push(
-                  root_emitted(
+                  root_formed(
                     s,
                     def.span.start,
                     full,
@@ -1026,7 +1057,35 @@ pub fn emit_roots_answer(
   rows: Rows,
   walked: Bytes,
 ) -> List<RootAnswer> / {abort.raise} =
-  emit_program(
+  roots_answered(
+    lowered_roots(
+      names,
+      srcs,
+      ctors,
+      builtins,
+      wanted,
+      pkgs,
+      module_packages,
+      embeds,
+      rows,
+      walked,
+    ),
+  )
+
+/// The roots `wanted` keys lowered as `emit_roots_answer` asks, before their counts are placed.
+pub fn lowered_roots(
+  names: List<Bytes>,
+  srcs: List<Bytes>,
+  ctors: Ctors,
+  builtins: List<Bytes>,
+  wanted: List<RootKey>,
+  pkgs: List<PackageDeps>,
+  module_packages: List<Int>,
+  embeds: List<EmbedAt>,
+  rows: Rows,
+  walked: Bytes,
+) -> Walked / {abort.raise} =
+  lowered_program(
     zip_sources(names, srcs),
     ctors,
     builtins,
@@ -1037,9 +1096,11 @@ pub fn emit_roots_answer(
     embeds,
     rows,
     walked,
-  ).map(
-    answer_of,
   )
+
+/// The answer of each root `w` holds, emitted as `emitted_program` emits it.
+pub fn roots_answered(w: Walked) -> List<RootAnswer> / {abort.raise} =
+  emitted_program(w).map(answer_of)
 
 fn answer_of(e: Emitted) -> RootAnswer =
   {

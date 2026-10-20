@@ -10,13 +10,15 @@ import std.bytes (ascii_of_int)
 /// A root. `Named` is one the front end names: a definition, a test, a law or a clause. `At` is a
 /// definition at type arguments, running in place the lambdas `lent` names where it calls the
 /// parameters they are handed as. `Written` is an operation written for a type, in the module that
-/// declares the type where its name is qualified, and otherwise in `home`, the module asking.
+/// declares the type where its name is qualified, and otherwise in `home`, the module asking; its
+/// `marks` are the places in `ty` (0 `ty` itself, then each argument's subtree in order) that stand
+/// for an operation's own type parameter, which a crossing hands over as a handle.
 /// `Entered` is the entry the runtime enters a named root through, its arguments and answer
 /// crossing as machine data.
 pub type RootKey =
   | Named(Bytes)
   | At({ def: Bytes, args: List<KeyArg>, lent: List<FnArg> })
-  | Written({ op: TypeOp, ty: Type, home: Bytes })
+  | Written({ op: TypeOp, ty: Type, home: Bytes, marks: List<Int> })
   | Entered(Bytes)
 
 /// A type argument a specialisation is keyed by: the type itself, where the body reads which type
@@ -29,7 +31,8 @@ pub type KeyArg = | KeyType(Type) | KeyLayout(Bytes)
 pub type FnArg = { param: Int, owner: RootKey, nth: Int }
 
 /// An operation written per type. `Equal` and `Order` compare two values of a declared sum;
-/// `Contained` is one of a container's walks (`equal`, `ordered`, their loops).
+/// `Contained` is one of a container's walks (`equal`, `ordered`, their loops); `Dup` and `Release`
+/// count a value of the type once more and once fewer.
 pub type TypeOp =
   | Equal
   | Order
@@ -43,6 +46,8 @@ pub type TypeOp =
   | Copy
   | Lower
   | Lift
+  | Dup
+  | Release
 
 /// A function a call reaches: a root by its key, or the `n`th generic call of the body making the
 /// call, which the unit settles on a root once every body's needs are known.
@@ -58,8 +63,9 @@ pub fn key_bytes(k: RootKey) -> Bytes / {abort.raise} = bin::encode(k, root_key_
 
 /// The name `k` prints as. A definition's own name; a specialisation's spells its type arguments and
 /// lent lambdas after an `@` (`m.f@Int,?|1=m.g:0`); a written root its operation and type after a
-/// `#` (`m.Shape#eq`, `m.equal#List<Int>`, `geo.reflect#geo.Shape`). Symbols and site ids are made
-/// from it, so it is the spelling roots had before they were keys.
+/// `#` (`m.Shape#eq`, `m.equal#List<Int>`, `geo.reflect#geo.Shape`), the type followed by its marks
+/// after a `^` where it has any (`m.lower#m.Box<Int>^1`). Symbols and site ids are made from it, so it
+/// is the spelling roots had before they were keys.
 pub fn root_name(k: RootKey) -> Bytes =
   match k {
     Named(n) -> n,
@@ -84,14 +90,15 @@ pub fn root_name(k: RootKey) -> Bytes =
             ])),
         ),
       ),
-    Written(w) -> match w.op {
-      Equal -> spelled_type(w.ty).concat(b"#eq"),
-      Order -> spelled_type(w.ty).concat(b"#cmp"),
-      _ ->
-        qualify(
-          type_module(w.ty, w.home),
-          Bytes::concat_all([op_name(w.op), b"#", spelled_type(w.ty)]),
-        ),
+    Written(w) -> {
+      let ty = if w.marks.len() == 0 { spelled_type(w.ty) } else {
+        Bytes::concat_all([spelled_type(w.ty), b"^", Bytes::join(w.marks.map(ascii_of_int), b",")])
+      };
+      match w.op {
+        Equal -> ty.concat(b"#eq"),
+        Order -> ty.concat(b"#cmp"),
+        _ -> qualify(type_module(w.ty, w.home), Bytes::concat_all([op_name(w.op), b"#", ty])),
+      }
     },
     Entered(n) -> n.concat(b"#entered"),
   }
@@ -111,6 +118,8 @@ fn op_name(op: TypeOp) -> Bytes =
     Copy -> b"copy",
     Lower -> b"lower",
     Lift -> b"lift",
+    Dup -> b"dup",
+    Release -> b"release",
   }
 
 /// The module a root's body is written in: its definition's, or where a written root says.
@@ -181,17 +190,29 @@ test "a key prints as the name roots were spelled with before they were keys" {
     b"m.f@|0=m.g@Int:2",
   );
   assert_eq(
-    root_name(Written({ op: Equal, ty: TyCon({ name: b"m.Shape", args: [] }), home: b"m" })),
+    root_name(
+      Written({ op: Equal, ty: TyCon({ name: b"m.Shape", args: [] }), home: b"m", marks: [] }),
+    ),
     b"m.Shape#eq",
   );
   assert_eq(
-    root_name(Written({ op: Contained(b"equal"), ty: list, home: b"m" })),
+    root_name(Written({ op: Contained(b"equal"), ty: list, home: b"m", marks: [] })),
     b"m.equal#List<Int>",
   );
-  assert_eq(root_name(Written({ op: Reflect, ty: list, home: b"m" })), b"m.reflect#List<Int>");
+  assert_eq(
+    root_name(Written({ op: Reflect, ty: list, home: b"m", marks: [] })),
+    b"m.reflect#List<Int>",
+  );
   // A type a module declares has its operations written in that module, whoever asks.
   assert_eq(
-    root_name(Written({ op: Reflect, ty: TyCon({ name: b"geo.Shape", args: [] }), home: b"app" })),
+    root_name(
+      Written({
+        op: Reflect,
+        ty: TyCon({ name: b"geo.Shape", args: [] }),
+        home: b"app",
+        marks: [],
+      }),
+    ),
     b"geo.reflect#geo.Shape",
   );
   assert_eq(root_name(Entered(b"m.main")), b"m.main#entered")
@@ -206,10 +227,15 @@ test "a root's module is read off its key, never off its name" {
     ),
     b"lib",
   );
-  assert_eq(module_of(Written({ op: Equal, ty: shape, home: b"app" })), b"geo");
-  assert_eq(module_of(Written({ op: Contained(b"equal"), ty: shape, home: b"app" })), b"geo");
+  assert_eq(module_of(Written({ op: Equal, ty: shape, home: b"app", marks: [] })), b"geo");
   assert_eq(
-    module_of(Written({ op: Shown, ty: TyCon({ name: b"List", args: [shape] }), home: b"app" })),
+    module_of(Written({ op: Contained(b"equal"), ty: shape, home: b"app", marks: [] })),
+    b"geo",
+  );
+  assert_eq(
+    module_of(
+      Written({ op: Shown, ty: TyCon({ name: b"List", args: [shape] }), home: b"app", marks: [] }),
+    ),
     b"app",
   )
 }
@@ -238,5 +264,20 @@ test "a specialisation's definition, types and lambdas are read off its key, an 
     [TyCon({ name: b"List", args: [int] })],
   ]);
   assert_eq(key_types(Named(b"lib.h")), []);
-  assert_eq(sited_as(Written({ op: Reflect, ty: int, home: b"m" })), b"m.reflect#Int")
+  assert_eq(sited_as(Written({ op: Reflect, ty: int, home: b"m", marks: [] })), b"m.reflect#Int")
+}
+
+test "a written root's marks follow its type in its name, so keys differing only in marks differ" {
+  let int = TyCon({ name: b"Int", args: [] });
+  let pair = TyCon({ name: b"m.Pair", args: [int, int] });
+  let written = |op: TypeOp, marks: List<Int>|
+    Written({ op: op, ty: pair, home: b"app", marks: marks });
+  assert_eq(root_name(written(Lower, [1, 2])), b"m.lower#m.Pair<Int,Int>^1,2");
+  assert_eq(root_name(written(Equal, [0])), b"m.Pair<Int,Int>^0#eq");
+  assert_eq(root_name(written(Lift, [])), b"m.lift#m.Pair<Int,Int>");
+  assert_eq(root_name(written(Lift, [1])) == root_name(written(Lift, [2])), false);
+  assert_eq([Dup, Release].map(|op: TypeOp| root_name(written(op, []))), [
+    b"m.dup#m.Pair<Int,Int>",
+    b"m.release#m.Pair<Int,Int>",
+  ])
 }

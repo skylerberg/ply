@@ -13,7 +13,9 @@ import emit.tir (Rep, RWord, RInt, RBool, RNum, RMaybe, RTagged, RFlat, RCases, 
                  Dec, Reset, Free, Opened, Block, Fn, Member, Rooted, Lambda, Closure, Handed,
                  Given, Lent, Owned, Convention, Answered, Owns, ReadsOf, Lasts, no_links, counted,
                  operands, answered, fails, used_as, rep_of_arg, var_of, parts_of, Test, TTag, TInt,
-                 TRange)
+                 TRange, RSum, RUnit, RAddr, LastOf, MBox, MCase, PCase, PPayload, OContainer)
+import emit.tir.containers (Taken)
+import emit.layout (P, Always, Inline, LWords)
 import emit.keys (Named, Root)
 import emit.reps (FieldTy, TyRec, kind_of, in_place, laid_of)
 import check.types (Type, TyCon, TyRecord)
@@ -69,22 +71,115 @@ type Looped = { held: Map<Int, Int>, state: List<Var>, answer: Var }
 
 /// Why `f`, or a closure it makes, breaks a rule of the form, or nothing where both keep them all.
 /// A tail group's arm `i` starts holding member `i`'s parameters and answers as that member does.
+/// What no rule covers yet is refused, the reason starting `not yet: `.
 pub fn verified(f: Fn) -> Option<Bytes> = {
   let bound = f.members.fold(
     binding(f.params.fold(Map::new(), bound_as), f.body),
     |m: Map<Int, Rep>, x: Member| x.params.fold(m, bound_as),
   );
-  match used_otherwise(bound, f.body) {
-    Some(v) ->
-      Some(
-        Bytes::concat_all([
-          b"a variable used held otherwise than it was bound: v",
-          ascii_of_int(v.id),
-        ]),
-      ),
-    None -> body_verified(f),
+  match not_yet(f) {
+    Some(what) -> Some(b"not yet: ".concat(what)),
+    None -> match used_otherwise(bound, f.body) {
+      Some(v) ->
+        Some(
+          Bytes::concat_all([
+            b"a variable used held otherwise than it was bound: v",
+            ascii_of_int(v.id),
+          ]),
+        ),
+      None -> body_verified(f),
+    },
   }
 }
+
+/// The first construct of `f`'s body, its parameters and answer among it, that no rule of this
+/// check covers yet: a value held as a sum's words, as no C value, or as an address into a block's
+/// bytes; a test of a value's last holder; a box or a boxed case made; a case's payload or a
+/// block's bytes read; the bytes a crossing answered taken. Each stream's rules drop their line.
+fn not_yet(f: Fn) -> Option<Bytes> = {
+  let held = f.members.fold(f.params, |vs: List<Var>, m: Member| vs.concat(m.params));
+  let answers = f.members.fold([f.conv.answer], |rs: List<Rep>, m: Member| rs.push(m.conv.answer));
+  held.fold(
+    answers.fold(not_yet_in(f.body), |found: Option<Bytes>, r: Rep|
+      or_else(found, match held_not_yet(r) {
+        Some(what) -> Some(what.concat(b": an answer")),
+        None -> None,
+      })),
+    |found: Option<Bytes>, v: Var| or_else(found, rep_not_yet(v)),
+  )
+}
+
+fn or_else(found: Option<Bytes>, next: Option<Bytes>) -> Option<Bytes> =
+  match found { Some(_) -> found, None -> next }
+
+fn not_yet_in(b: Block) -> Option<Bytes> =
+  b.fold(None, |found: Option<Bytes>, i: Inst|
+    match found {
+      Some(_) -> found,
+      None -> match i {
+        Let(l) -> or_else(rep_not_yet(l.var), val_not_yet(l.val)),
+        Do(d) -> val_not_yet(d.val),
+        Decl(v) -> rep_not_yet(v),
+        If(x) -> or_else(not_yet_in(x.then), not_yet_in(x.otherwise)),
+        Case(c) ->
+          c.arms.fold(not_yet_in(c.rest), |acc: Option<Bytes>, a: { when: Int, body: Block }|
+            or_else(acc, not_yet_in(a.body))),
+        Match(m) ->
+          m.arms.fold(not_yet_in(m.rest), |acc: Option<Bytes>, a: Block|
+            or_else(acc, not_yet_in(a))),
+        Loop(l) ->
+          l.state.fold(
+            or_else(rep_not_yet(l.answer), not_yet_in(l.body)),
+            |acc: Option<Bytes>, v: Var| or_else(acc, rep_not_yet(v)),
+          ),
+        Handle(h) -> or_else(rep_not_yet(h.answer), not_yet_in(h.body)),
+        Reset(r) -> rep_not_yet(r.token),
+        Opened(o) -> o.words.fold(None, |acc: Option<Bytes>, v: Var| or_else(acc, rep_not_yet(v))),
+        _ -> None,
+      },
+    })
+
+fn rep_not_yet(v: Var) -> Option<Bytes> =
+  match held_not_yet(v.rep) {
+    Some(what) -> Some(Bytes::concat_all([what, b": v", ascii_of_int(v.id)])),
+    None -> None,
+  }
+
+fn held_not_yet(r: Rep) -> Option<Bytes> =
+  match r {
+    RSum(_) -> Some(b"a value held as a sum's words"),
+    RUnit -> Some(b"a value held as no C value"),
+    RAddr -> Some(b"an address into a block's bytes"),
+    RFlat(ls) -> ls.fold(None, |acc: Option<Bytes>, l: Leaf| or_else(acc, held_not_yet(l.rep))),
+    RCases(c) ->
+      c.cases.fold(None, |acc: Option<Bytes>, x: { name: Bytes, leaves: List<Leaf> }|
+        x.leaves.fold(acc, |a: Option<Bytes>, l: Leaf| or_else(a, held_not_yet(l.rep)))),
+    _ -> None,
+  }
+
+fn val_not_yet(val: Val) -> Option<Bytes> =
+  match val {
+    LastOf(_) -> Some(b"a test of a value's last holder"),
+    Make(m) -> match m.made {
+      MBox(_) -> Some(b"a box made"),
+      MCase(_) -> Some(b"a boxed case made"),
+      _ -> None,
+    },
+    Get(g) -> path_not_yet(g.path),
+    Take(t) -> path_not_yet(t.path),
+    Op(o) -> match o.op {
+      OContainer(Taken) -> Some(b"the bytes a crossing answered taken"),
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+fn path_not_yet(p: Path) -> Option<Bytes> =
+  match p {
+    PCase(_) -> Some(b"a case's payload read"),
+    PPayload -> Some(b"a block's bytes read"),
+    _ -> None,
+  }
 
 /// `m` with `v` bound as it is held.
 fn bound_as(m: Map<Int, Rep>, v: Var) -> Map<Int, Rep> = m.insert(v.id, v.rep)
@@ -1123,12 +1218,13 @@ fn result(w: Walk, v: Var, a: Answered) -> Walk =
   if w.fault != None || !counted(v.rep) { w } else {
     match a {
       Owns -> { ..w, h: { ..w.h, owned: w.h.owned.insert(v.id, 1) } },
-      ReadsOf(read) -> {
+      ReadsOf([read]) -> {
         let x = match w.h.alias.get(read.id) { Some(word) -> word, None -> read };
         let base = if count(w.h, x) > 0 { x.id }
         else { match w.h.borrowed.get(x.id) { Some(b) -> b, None -> x.id } };
         { ..w, h: { ..w.h, borrowed: w.h.borrowed.insert(v.id, base) } }
       },
+      ReadsOf(_) -> faulted(w, b"not yet: a value read out of other than one value: v", v),
       Lasts -> { ..w, h: { ..w.h, borrowed: w.h.borrowed.insert(v.id, 0 - 1) } },
     }
   }
@@ -1249,6 +1345,7 @@ fn root_of(params: List<Var>, lent: List<Int>, answer: Rep, body: Block) -> Fn =
     base: 0,
     members: [],
     links: no_links(),
+    statics: [],
   }
 
 /// A call of `m.g` handing `args`, each given unless `lent` names it, answering a word.
@@ -2144,4 +2241,55 @@ test "the joins of a body's branches are checked in one walk, however many it de
     );
   assert_eq(verified(root_of([c], [], RInt, branches(3))), None);
   paced(|n: Int| n * (ilog2(n) + 1), |n: Int| verified(root_of([c], [], RInt, branches(n))))
+}
+
+test "a construct no rule covers yet is refused, naming what it is" {
+  let p = word(0);
+  let r = word(1);
+  let sum = RSum({
+    laid: {
+      classes: [P],
+      cases: [{ test: Always, payload: Inline({ offset: 0, laid: LWords([P]), stripped: None }) }],
+    },
+    cases: [b"m.Only"],
+  });
+  let refused = |f: Fn|
+    match verified(f) {
+      Some(why) -> if why.starts_with(b"not yet: ") { why.slice(9, why.len()) } else { b"" },
+      None -> b"",
+    };
+  let body = |b: Block| refused(root_of([p], [], RWord, b));
+  assert_eq(body([bind(r, LastOf(p), []), Return(AVar(r))]), b"a test of a value's last holder");
+  assert_eq(
+    body([
+      bind(
+        r,
+        Make({ made: MBox({ words: 2 }), args: [AVar(p), AInt(0)], reuse: None, kept: [] }),
+        [],
+      ),
+      Return(AVar(r)),
+    ]),
+    b"a box made",
+  );
+  assert_eq(
+    body([
+      bind(r, Get({ of: p, path: PCase({ case: 0, at: 0 }) }), []),
+      Inc({ var: r, n: 1 }),
+      Dec(p),
+      Return(AVar(r)),
+    ]),
+    b"a case's payload read",
+  );
+  assert_eq(
+    body([bind({ ..r, rep: sum }, Pack({ arg: AVar(p), to: sum }), []), Return(AVar(p))]),
+    b"a value held as a sum's words: v1",
+  );
+  assert_eq(
+    refused(root_of([{ ..p, rep: RUnit }], [], RInt, [Return(AInt(0))])),
+    b"a value held as no C value: v0",
+  );
+  assert_eq(
+    refused(root_of([], [], RAddr, [Return(AInt(0))])),
+    b"an address into a block's bytes: an answer",
+  )
 }

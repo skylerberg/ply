@@ -14,11 +14,11 @@ import expand.rewrite.shared (map_expr)
 import expand.rewrite (unwitnessed, witness_param)
 import emit.c (KInt, Kind)
 import emit.keys (RootKey, At, FnArg, root_name, key_types, key_lent)
-import emit.answer (Need, Scalar, no_tables, Emitted)
+import emit.answer (Need, Scalar)
 import emit.reps (Ty, TyOpen, EmitParam, BoundLambda, Sig, sig_of, param_kinds, param_types,
                   substituted, numeric_named, typed_at, carriers_of, carriers_at, def_named)
 import emit.lower.setting (Setting, params_carried)
-import emit.entry (emitted_from)
+import emit.entry (RootForm, Formed, Unformed, formed_from)
 
 // --- Specialisation ----------------------------------------------------------------------------
 
@@ -70,27 +70,33 @@ pub fn specialisations_wanted(wanted: List<RootKey>) -> Map<Bytes, List<RootKey>
       _ -> acc,
     })
 
-/// `e`, the body of generic `def`, noting the variables whose numeric witness it reads: a scalar
-/// argument does that arithmetic in C.
+/// `r`, the form of generic `def`, noting among its needs the variables whose numeric witness it
+/// reads: a scalar argument does that arithmetic in C.
 pub fn witnessed_needs(
-  e: Emitted,
+  r: RootForm,
   def: FnDef,
   scheme: Option<Scheme>,
   ops: List<WitnessOp>,
-) -> Emitted =
+) -> RootForm =
   match scheme {
-    None -> e,
-    Some(sc) -> {
-      let numbering = generics_numbered(def, sc);
-      let needs = ops.fold(e.tables.generics.needs, |acc: List<Need>, o: WitnessOp|
-        if o.owner != e.name { acc } else {
-          match numbering.get(o.param) {
-            Some(v) -> if acc.contains({ var: v, reads: Scalar }) { acc }
-            else { acc.push({ var: v, reads: Scalar }) },
-            None -> acc,
-          }
-        });
-      { ..e, tables: { ..e.tables, generics: { ..e.tables.generics, needs: needs } } }
+    None -> r,
+    Some(sc) -> match r {
+      Formed(x) -> match x.form {
+        Ok(f) -> {
+          let numbering = generics_numbered(def, sc);
+          let needs = ops.fold(f.links.needs, |acc: List<Need>, o: WitnessOp|
+            if o.owner != x.name { acc } else {
+              match numbering.get(o.param) {
+                Some(v) -> if acc.contains({ var: v, reads: Scalar }) { acc }
+                else { acc.push({ var: v, reads: Scalar }) },
+                None -> acc,
+              }
+            });
+          Formed({ ..x, form: Ok({ ..f, links: { ..f.links, needs: needs } }) })
+        },
+        Err(_) -> r,
+      },
+      Unformed(_) -> r,
     },
   }
 
@@ -127,10 +133,10 @@ pub fn definition_at(
   }
 }
 
-/// `def` of the module `s` reads emitted as root `root`, at its type arguments and running the
+/// `def` of the module `s` reads formed as root `root`, at its type arguments and running the
 /// lambdas it lends in place: its parameters and sites read at them, and each operator whose witness
 /// is a parameter now held as one numeric type alone done as that type's own.
-pub fn specialised_emitted(
+pub fn specialised_formed(
   s: Setting,
   def: FnDef,
   root: RootKey,
@@ -138,7 +144,7 @@ pub fn specialised_emitted(
   schemes: Map<Bytes, Scheme>,
   ops: List<WitnessOp>,
   sites: Map<Bytes, List<Bytes>>,
-) -> Emitted / {abort.raise} = {
+) -> RootForm / {abort.raise} = {
   let full = qualify(s.module, def.name.name);
   let args = key_types(root);
   let fns = key_lent(root);
@@ -175,14 +181,12 @@ pub fn specialised_emitted(
     });
   match lent {
     None ->
-      {
+      Unformed({
         name: root_name(root),
-        text: b"",
-        tables: no_tables(),
-        why: Some(b"a lambda this root runs in place of a call is not one its owner lowers"),
-      },
+        why: b"a lambda this root runs in place of a call is not one its owner lowers",
+      }),
     Some(ps) ->
-      emitted_from(
+      formed_from(
         { ..s, typed: typed_at(s.typed, args) },
         def.span.start,
         root,
