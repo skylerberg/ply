@@ -2,7 +2,7 @@
 
 import std.bytes (ascii_of_int)
 import syntax.parsing (span_between)
-import check.types (TyCon)
+import check.types (TyCon, TyFn)
 import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt, NodeLen, LeafAt,
                     KidAt, TailPush, TailSet, LeafSet, RootSwap, KidSwap, TailStart, Spill,
                     NewBranch, MapRoot, NodeCount, MapHeight, NodeKey, NodeValue, NodeKid, KidMax,
@@ -10,8 +10,9 @@ import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, Tail
                     KidOut, KidBack, KidPut, KidDrop, MapSwap, layouts)
 import emit.roots (builtin_helper)
 import emit.pieces (Text, Hole, ShapeOf, TagOf, spelled)
-import emit.tir (Rep, RInt, RNum, RFloat, RDec, RWord, RMaybe, RFlat, Leaf, Var, Arg, AVar, AInt,
-                 AZero, Made, MList, Uses, Containers, rep_of_arg, counted, var_said, made_said)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RFlat, Leaf, Var, Arg, AVar,
+                 AInt, AZero, Made, MList, Uses, Containers, Convention, rep_of_arg, counted,
+                 var_said, made_said)
 import emit.lower.held (fields_of)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew,
                             ArraySet, ArrayOfList, ArrayGet, ColumnField, Position, Taken, Element,
@@ -20,6 +21,7 @@ import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, 
 import emit.print.text (Printing, Place, printing, line, pad, pieces, temp, named, name_of,
                         arg_text, assigned, site, check, shape_at, zero, part_names, unprinted)
 import emit.print.made (Held, c_type, c_types, as_word, word_as, leaf_loads)
+import emit.print.invoked (typed_callee, convention_of)
 
 /// A list or an array made of `m.args`.
 pub fn contained(
@@ -1155,8 +1157,8 @@ fn array_get(
 
 /// `Bytes::position(b, from, f)` into `v` under release, as a loop in the body: the first index from
 /// `from` whose byte `f` holds of, as an `Option`'s object. Bytes of another kind or a start past
-/// their end are the runtime's call to refuse; `f` is called through the runtime, held once more for
-/// each call. Takes `b` and `f`, which a failure inside the loop lets go of.
+/// their end are the runtime's call to refuse; `f` is called by its type, lent to each call. Takes
+/// `b` and `f`, which a failure inside the loop lets go of.
 fn position_printed(
   p: Place,
   pr: Printing,
@@ -1214,8 +1216,8 @@ fn position_printed(
       b" += 1) {",
     ]),
   );
-  let arg = temp(opened);
-  let called = temp(arg.pr);
+  let conv = predicate_convention(pr, args);
+  let called = temp(opened);
   let inside = {
     ..p,
     depth: d + 1,
@@ -1230,41 +1232,25 @@ fn position_printed(
     ]),
   };
   let asked = line(
-    site(
-      inside,
-      line(
-        called.pr,
-        d + 1,
-        Bytes::concat_all([
-          b"Word ",
-          arg.name,
-          b"[] = { ply_imm((int64_t)(ply_bytes(",
-          b,
-          b"))[",
-          i.name,
-          b"]) }; ply_inc(",
-          f,
-          b");",
-        ]),
-      ),
-    ),
+    site(inside, called.pr),
     d + 1,
     Bytes::concat_all([
-      b"Word ",
+      c_type(conv.answer),
+      b" ",
       called.name,
-      b" = rt_call_p(ctx, ",
+      b" = ",
+      typed_callee(f, conv),
+      b"(ctx, ",
       f,
-      b", (Word)(intptr_t)",
-      arg.name,
-      b", 1);",
+      b", (int64_t)(ply_bytes(",
+      b,
+      b"))[",
+      i.name,
+      b"]);",
     ]),
   );
   let hit = pieces(
-    line(
-      check(inside, asked),
-      d + 1,
-      Bytes::concat_all([b"if ((", called.name, b" == ply_true)) {"]),
-    ),
+    line(check(inside, asked), d + 1, Bytes::concat_all([b"if (", called.name, b") {"])),
     [
       Text(
         Bytes::concat_all([
@@ -1287,6 +1273,27 @@ fn position_printed(
     Bytes::concat_all([b"ply_dec(ctx, ", b, b");"]),
   )
 }
+
+/// The convention `Bytes::position`'s predicate, its third operand, is called at by its type: an
+/// `Int` in and a `Bool` out, as the builtin's signature says.
+fn predicate_convention(pr: Printing, args: List<Arg>) -> Convention / {abort.raise} =
+  match args.at(2) {
+    Some(AVar(v)) -> match v.ty {
+      TyFn(t) -> {
+        let c = convention_of(pr.ctors, { params: t.params, ret: t.ret });
+        if c.reps == [RInt] && c.answer == RBool { c } else {
+          unprinted(
+            Containers,
+            b"a byte string's position whose predicate is held otherwise",
+            var_said(v),
+          )
+        }
+      },
+      _ -> unprinted(Containers, b"a byte string's position on no function", var_said(v)),
+    },
+    _ ->
+      unprinted(Containers, b"a byte string's position on no predicate", ascii_of_int(args.len())),
+  }
 
 /// Field `k` of record `i` of the `Columns` `xs` into `v`: element `i` of the array `xs` holds the
 /// field's column in, loaded as the column holds it with a count of its own taken, where `xs` is laid
