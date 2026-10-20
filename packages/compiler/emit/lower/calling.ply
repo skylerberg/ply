@@ -7,8 +7,7 @@ import emit.code (Code, Node, NVar, NKnown, NLambda, NApp, NUnary, NBinary, NFie
                   NList, NRecord, NUpdate, NMatch, NPerform, NSimulate, NParallel, NHandle, Lambda,
                   Capture, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm, CodeClause, PxList,
                   PxVar)
-import check.types (Type, TyFn, TyVar, TyCon, Scheme, spelled_type, int_type, bool_type, fn_type,
-                    row_open)
+import check.types (Type, TyFn, TyVar, TyCon, Scheme, spelled_type, int_type, bool_type)
 import emit.typing (Filings, no_filings, unknown_type)
 import syntax.parsing (Span, starts_upper, dummy_span)
 import check.resolve.tables (qualify)
@@ -31,7 +30,7 @@ import emit.lower.held (held_as, carried_as, arg_path)
 import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
                         ToInPlace, Frame, Opened, GroupMember, Restarts, Enters, Calls, refuse,
                         fresh, bound_as, done, emitted, opened, nested, unnested, with_lambda,
-                        started, filed, type_filed, type_of, handed, read_noted, read_note,
+                        started, filed, unfiled, read_taken, type_of, handed, read_noted, read_note,
                         capture_note, frame_entered, taken_as, unsaid)
 import emit.lower.data (constructed)
 import emit.lower.containers (scalar_builtin)
@@ -54,6 +53,7 @@ pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.rai
     lender: None,
     observing: false,
     frame: dummy_span(),
+    captured: [],
     lends: false,
     written: [],
   });
@@ -170,34 +170,37 @@ pub fn target(cx: Context, func: Code, args: List<Code>) -> Option<Target> / {ab
 pub fn global(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered / {abort.raise} =
   if is_ctor_name(name) { constructed(cx, st, name, [], at, at) } else {
     match def_named(cx, name) {
-      Some(d) -> {
-        let n = named_ref(cx, st, d, at, []);
-        bound_as(
-          n.st,
-          match type_filed(cx, at) {
-            Some(t) -> t,
-            None -> match d.def.scheme { Some(sc) -> sc.ty, None -> unknown_type() },
-          },
-          RWord,
-          Op({
-            op: OCalling(EntryValue({ callee: n.callee, arity: d.def.arity })),
-            args: [],
-            uses: answers(),
-          }),
-          at,
-        )
+      Some(d) -> match filed(cx, at) {
+        None -> unfiled(cx, st, b"a definition read as a value", at),
+        Some(t) -> {
+          let n = named_ref(cx, st, d, at, []);
+          bound_as(
+            n.st,
+            t.ty,
+            RWord,
+            Op({
+              op: OCalling(EntryValue({ callee: n.callee, arity: d.def.arity })),
+              args: [],
+              uses: answers(),
+            }),
+            at,
+          )
+        },
       },
       None -> if cx.setting.builtins.contains(name) {
-        match type_filed(cx, at) {
-          Some(t) ->
+        match filed(cx, at) {
+          None -> unfiled(cx, st, b"a builtin read as a value", at),
+          Some(t) -> if t.ty == unknown_type() {
+            refuse(st, Calling, b"a builtin read as a value at no type: ".concat(name))
+          } else {
             bound_as(
               st,
-              t,
+              t.ty,
               RWord,
               Op({ op: OCalling(BuiltinValue(name)), args: [], uses: answers() }),
               at,
-            ),
-          None -> refuse(st, Calling, b"a builtin read as a value at no type: ".concat(name)),
+            )
+          },
         }
       } else { refuse(st, Calling, b"a global the lowering does not resolve: ".concat(name)) },
     }
@@ -215,16 +218,19 @@ pub fn builtin_lambda(
     None
   } else {
     let callee = extern_named(cx, name);
-    match type_filed(cx, at) {
-      Some(TyFn(f)) -> if scalar_builtin(callee) && !unsaid(TyFn(f)) {
-        Some({ name: callee, arity: f.params.len() })
-      } else { None },
-      _ -> None,
+    match filed(cx, at) {
+      Some(t) -> match t.ty {
+        TyFn(f) -> if scalar_builtin(callee) && !unsaid(TyFn(f)) {
+          Some({ name: callee, arity: f.params.len() })
+        } else { None },
+        _ -> None,
+      },
+      None -> None,
     }
   }
 
-/// A read of a slot known to hold the closure of a lambda its owner wrote: the closure itself, at the
-/// type the checker filed for the read where it filed one.
+/// A read of a slot known to hold the closure of a lambda its owner wrote: the closure itself, read
+/// as `read_taken` reads a slot.
 pub fn known(
   cx: Context,
   st: Lowering,
@@ -232,13 +238,14 @@ pub fn known(
   at: Span,
 ) -> Lowered =
   match st.env.get(k.slot) {
-    Some(a) -> {
-      let noted = read_noted(cx, st, read_note(), k.slot, at);
-      match type_filed(cx, at) {
-        Some(t) -> taken_as(cx, { st: noted, arg: a }, t, at),
-        None -> { st: noted, arg: a },
-      }
-    },
+    Some(a) ->
+      read_taken(
+        cx,
+        { st: read_noted(cx, st, read_note(), k.slot, at), arg: a },
+        k.name,
+        k.slot,
+        at,
+      ),
     None -> refuse(st, Calling, b"a known lambda's slot nothing bound: ".concat(k.name)),
   }
 
@@ -420,10 +427,11 @@ fn in_frame(
   lender: Option<BoundLambda>,
   at: Span,
 ) -> Opened =
-  match f {
-    None ->
+  match ((f, filed_fn(cx, k.lambda.at, k.lambda.params))) {
+    (None, _) ->
       { cx: cx, st: refuse(st, Calling, b"a known lambda whose closure no variable holds").st },
-    Some(closure) -> {
+    (_, None) -> { cx: cx, st: unfiled(cx, st, b"a lambda run in place", k.lambda.at).st },
+    (Some(closure), Some(typed)) -> {
       let sited = match lender {
         Some(bl) -> emitted(st, Sited(Some({ root: Named(bl.owner), base: bl.base }))),
         None -> st,
@@ -450,14 +458,18 @@ fn in_frame(
             },
           },
       );
-      let inner = { ..cx, answer_ty: lambda_answer(cx, k.lambda), frame: k.lambda.at };
-      let declared = lambda_params(cx, k.lambda);
+      let inner = {
+        ..cx,
+        answer_ty: typed.ret,
+        frame: k.lambda.at,
+        captured: k.lambda.captures.map(|c: Capture| c.dst),
+      };
       let params = range(0, lowered.len()).fold(
         { st: frame_entered(inner, caps.st, at), env: caps.env },
         |acc: { st: Lowering, env: Map<Int, Arg> }, j: Int|
           match lowered.at(j) {
             Some(Some(a)) -> {
-              let p = match declared.at(j) {
+              let p = match typed.params.at(j) {
                 Some(t) -> taken_as(cx, { st: acc.st, arg: a }, t, at),
                 None -> { st: acc.st, arg: a },
               };
@@ -564,7 +576,8 @@ fn stepped_in(
 ) -> Opened =
   match code.node {
     NLambda(l) -> match step_typed(cx, l) {
-      None -> { cx: cx, st: refuse(st, Calling, b"a step at no `Iter` type").st },
+      None -> if filed(cx, l.at) == None { { cx: cx, st: unfiled(cx, st, b"a step", l.at).st } }
+      else { { cx: cx, st: refuse(st, Calling, b"a step at no `Iter` type").st } },
       Some(t) -> match lowered.at(1) {
         Some(Some(budget)) -> {
           let v = step_vars(cx, st, t.state, t.answer);
@@ -620,7 +633,15 @@ fn stepped_in(
             ) {
             None -> { cx: cx, st: refuse(st, Calling, b"a step's capture nothing bound").st },
             Some(env) ->
-              { cx: { ..cx, answer_ty: t.answer, frame: l.at }, st: { ..spent_one.st, env: env } },
+              {
+                cx: {
+                  ..cx,
+                  answer_ty: t.answer,
+                  frame: l.at,
+                  captured: l.captures.map(|cap: Capture| cap.dst),
+                },
+                st: { ..spent_one.st, env: env },
+              },
           }
         },
         _ -> { cx: cx, st: refuse(st, Calling, b"a step with no budget").st },
@@ -631,20 +652,30 @@ fn stepped_in(
 
 /// The types a step lambda's parameter and the loop's answer hold: `a` and `b` of its `(a) -> Iter<a, b>`.
 fn step_typed(cx: Context, l: Lambda) -> Option<{ state: Type, answer: Type }> =
-  match type_filed(cx, l.at) {
-    Some(t) -> match t {
-      TyFn(f) -> match f.ret {
-        TyCon(c) -> if c.name != b"Iter" || c.args.len() != 2 || f.params.len() != 1 { None } else {
-          match f.params.at(0) {
-            Some(a) -> match c.args.at(1) {
-              Some(b) -> Some({ state: a, answer: b }),
-              None -> None,
-            },
-            None -> None,
-          }
-        },
-        _ -> None,
+  match filed_fn(cx, l.at, 1) {
+    Some(f) -> match f.ret {
+      TyCon(c) -> if c.name != b"Iter" || c.args.len() != 2 { None } else {
+        match f.params.at(0) {
+          Some(a) -> match c.args.at(1) { Some(b) -> Some({ state: a, answer: b }), None -> None },
+          None -> None,
+        }
       },
+      _ -> None,
+    },
+    None -> None,
+  }
+
+/// The function type the checker filed for the lambda at `at`, of `arity` parameters: what each
+/// takes and what it answers; none where it filed none of that arity.
+fn filed_fn(
+  cx: Context,
+  at: Span,
+  arity: Int,
+) -> Option<{ ty: Type, params: List<Type>, ret: Type }> =
+  match filed(cx, at) {
+    Some(t) -> match t.ty {
+      TyFn(f) -> if f.params.len() == arity { Some({ ty: t.ty, params: f.params, ret: f.ret }) }
+      else { None },
       _ -> None,
     },
     None -> None,
@@ -885,41 +916,51 @@ fn spent() -> { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool } =
 /// the word the closure holds, opened where the body reads it as its type, and its own parameters,
 /// as the closure's function takes them. Its place among the root's closures is taken now, so a
 /// lambda it writes comes after it.
-pub fn lambda_opened(cx: Context, st: Lowering, frame: Frame, at: Span) -> Opened = {
-  let s = shaped(cx, st.env, frame, at);
-  let reserved = with_lambda(
-    st,
-    Closure({ body: placeholder(cx), captures: s.captures, at: at }),
-  ).st;
-  let caps = range(0, frame.captures.len()).fold(
-    nested(reserved, s.params, Map::new()),
-    |acc: Lowering, i: Int|
-      match frame.captures.at(i) {
-        None -> acc,
-        Some(c) -> match s.params.at(i) {
-          None -> acc,
-          Some(q) -> { ..acc, env: acc.env.insert(c.dst, AVar(q)) },
-        },
-      },
-  );
-  {
-    cx: {
-      ..cx,
-      tails: Calls,
-      params: [],
-      types: [],
-      answer: s.answer,
-      answer_ty: s.ret,
-      param_at: Map::new(),
-      frame: at,
+pub fn lambda_opened(cx: Context, st: Lowering, frame: Frame, at: Span) -> Opened =
+  match shaped(cx, st.env, frame, at) {
+    None -> {
+      let reserved = with_lambda(
+        st,
+        Closure({ body: placeholder(cx), captures: frame.captures.len(), at: at }),
+      ).st;
+      { cx: cx, st: unfiled(cx, reserved, b"a closure", at).st }
     },
-    st: {
-      ..caps,
-      env: range(0, s.own).fold(caps.env, |m: Map<Int, Arg>, j: Int|
-        match s.params.at(s.captures + j) { Some(p) -> m.insert(j, AVar(p)), None -> m }),
+    Some(s) -> {
+      let reserved = with_lambda(
+        st,
+        Closure({ body: placeholder(cx), captures: s.captures, at: at }),
+      ).st;
+      let caps = range(0, frame.captures.len()).fold(
+        nested(reserved, s.params, Map::new()),
+        |acc: Lowering, i: Int|
+          match frame.captures.at(i) {
+            None -> acc,
+            Some(c) -> match s.params.at(i) {
+              None -> acc,
+              Some(q) -> { ..acc, env: acc.env.insert(c.dst, AVar(q)) },
+            },
+          },
+      );
+      {
+        cx: {
+          ..cx,
+          tails: Calls,
+          params: [],
+          types: [],
+          answer: s.answer,
+          answer_ty: s.ret,
+          param_at: Map::new(),
+          frame: at,
+          captured: frame.captures.map(|c: Capture| c.dst),
+        },
+        st: {
+          ..caps,
+          env: range(0, s.own).fold(caps.env, |m: Map<Int, Arg>, j: Int|
+            match s.params.at(s.captures + j) { Some(p) -> m.insert(j, AVar(p)), None -> m }),
+        },
+      }
     },
   }
-}
 
 /// `st` noting, where `cx` observes, each slot the lambda written at `at` captures, where it does.
 fn captured(cx: Context, st: Lowering, captures: List<Capture>, at: Span) -> Lowering =
@@ -944,62 +985,66 @@ pub fn closure(
   inner: Lowered,
   frame: Frame,
   at: Span,
-) -> Lowered / {abort.raise} = {
-  let s = answered_as_body(shaped(cx, outer.env, frame, at), inner, frame);
-  let nth = outer.lambdas.len();
-  let answered = if falls_through(inner.st.insts) { handed(inner, s.conv.answer, at) }
-  else { inner };
-  let insts = if falls_through(answered.st.insts) { answered.st.insts.push(Return(answered.arg)) }
-  else { answered.st.insts };
-  let body = {
-    key: cx.key,
-    kind: Rooted,
-    params: s.params,
-    conv: s.conv,
-    // Written inside a lent lambda, its sites are the lender's, as the run it was written in.
-    body: match cx.lender {
-      Some(l) -> [Sited(Some({ root: Named(l.owner), base: cx.base }))].concat(insts),
-      None -> insts,
-    },
-    lambdas: [],
-    base: cx.base,
-    members: [],
-    links: no_links(),
-  };
-  let after = unnested(outer, answered.st);
-  // `lambda_opened` reserved place `nth` for this closure.
-  let placed = {
-    ..after,
-    lambdas: after.lambdas.set(nth, Closure({ body: body, captures: s.captures, at: at })),
-  };
-  let caps = frame.captures.fold(
-    { st: captured(cx, placed, frame.captures, at), args: [] },
-    |acc: { st: Lowering, args: List<Arg> }, c: Capture|
-      match acc.st.env.get(c.src) {
-        Some(a) -> {
-          let h = handed({ st: acc.st, arg: a }, RWord, at);
-          { st: h.st, args: acc.args.push(h.arg) }
+) -> Lowered / {abort.raise} =
+  match shaped(cx, outer.env, frame, at) {
+    None -> unfiled(cx, outer, b"a closure", at),
+    Some(s) -> {
+      let nth = outer.lambdas.len();
+      let answered = if falls_through(inner.st.insts) { handed(inner, s.conv.answer, at) }
+      else { inner };
+      let insts = if falls_through(answered.st.insts) {
+        answered.st.insts.push(Return(answered.arg))
+      } else { answered.st.insts };
+      let body = {
+        key: cx.key,
+        kind: Rooted,
+        params: s.params,
+        conv: s.conv,
+        // Written inside a lent lambda, its sites are the lender's, as the run it was written in.
+        body: match cx.lender {
+          Some(l) -> [Sited(Some({ root: Named(l.owner), base: cx.base }))].concat(insts),
+          None -> insts,
         },
-        None ->
-          {
-            st: refuse(acc.st, Calling, b"a capture nothing bound").st,
-            args: acc.args.push(AZero(RWord)),
+        lambdas: [],
+        base: cx.base,
+        members: [],
+        links: no_links(),
+      };
+      let after = unnested(outer, answered.st);
+      // `lambda_opened` reserved place `nth` for this closure.
+      let placed = {
+        ..after,
+        lambdas: after.lambdas.set(nth, Closure({ body: body, captures: s.captures, at: at })),
+      };
+      let caps = frame.captures.fold(
+        { st: captured(cx, placed, frame.captures, at), args: [] },
+        |acc: { st: Lowering, args: List<Arg> }, c: Capture|
+          match acc.st.env.get(c.src) {
+            Some(a) -> {
+              let h = handed({ st: acc.st, arg: a }, RWord, at);
+              { st: h.st, args: acc.args.push(h.arg) }
+            },
+            None ->
+              {
+                st: refuse(acc.st, Calling, b"a capture nothing bound").st,
+                args: acc.args.push(AZero(RWord)),
+              },
           },
-      },
-  );
-  bound_as(
-    caps.st,
-    s.ty,
-    RWord,
-    Make({
-      made: MClosure({ nth: nth, captures: s.captures, params: s.own, stacked: false }),
-      args: caps.args,
-      reuse: None,
-      kept: [],
-    }),
-    at,
-  )
-}
+      );
+      bound_as(
+        caps.st,
+        s.ty,
+        RWord,
+        Make({
+          made: MClosure({ nth: nth, captures: s.captures, params: s.own, stacked: false }),
+          args: caps.args,
+          reuse: None,
+          kept: [],
+        }),
+        at,
+      )
+    },
+  }
 
 /// The state each member of a tail group is lowered in.
 pub fn group_opened(members: List<GroupMember>) -> List<Opened> = {
@@ -1165,88 +1210,54 @@ type Shape = {
   own: Int,
 }
 
-fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Shape = {
-  let fty = match type_filed(cx, at) {
-    Some(t) -> match t {
-      TyFn(f) -> if f.params.len() == frame.params { Some({ ty: t, params: f.params, ret: f.ret }) }
-      else { None },
-      _ -> None,
-    },
+/// The shape of the closure laid out as `frame` at `at`, from the function type the checker filed
+/// there; none where it filed none of the frame's arity.
+fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Option<Shape> =
+  match filed_fn(cx, at, frame.params) {
     None -> None,
-  };
-  // A continuation is a word the runtime calls, and a clause binding one answers the word it hands
-  // back, which for a tail-only clause is the resumed value `c.resumed` holds the count of.
-  let continued = |j: Int| frame.resumes && j == frame.params - 1;
-  let carriers = match fty {
-    Some(f) -> f.params.map(carrier_of),
-    None -> range(0, frame.params).map(|_: Int| Whole(KBoxed)),
-  };
-  let answer = match fty {
-    Some(f) -> if frame.resumes { Whole(KBoxed) } else { carrier_of(f.ret) },
-    None -> Whole(KBoxed),
-  };
-  let n = frame.captures.len();
-  let caps = range(0, n).map(|i: Int|
-    {
-      id: i,
-      ty: match frame.captures.at(i) {
-        Some(c) -> match env.get(c.src) { Some(a) -> type_of(a), None -> unknown_type() },
-        None -> unknown_type(),
-      },
-      rep: RWord,
-    });
-  let own = range(0, frame.params).map(|j: Int|
-    if continued(j) {
-      {
-        id: n + j,
-        ty: resumption(match fty {
-          Some(f) -> match f.params.at(j) { Some(TyFn(k)) -> k.ret, _ -> unknown_type() },
-          None -> unknown_type(),
-        }),
-        rep: RWord,
-      }
-    } else {
-      {
-        id: n + j,
-        ty: match fty {
-          Some(f) -> match f.params.at(j) { Some(t) -> t, None -> unknown_type() },
-          None -> unknown_type(),
+    Some(f) -> {
+      // A continuation is a word the runtime calls, and a clause binding one answers the word it
+      // hands back, which for a tail-only clause is the resumed value `c.resumed` holds the count of.
+      let continued = |j: Int| frame.resumes && j == frame.params - 1;
+      let answer = if frame.resumes { Whole(KBoxed) } else { carrier_of(f.ret) };
+      let n = frame.captures.len();
+      let caps = range(0, n).map(|i: Int|
+        {
+          id: i,
+          ty: match frame.captures.at(i) {
+            Some(c) -> match env.get(c.src) { Some(a) -> type_of(a), None -> unknown_type() },
+            None -> unknown_type(),
+          },
+          rep: RWord,
+        });
+      let own = range(0, frame.params).map(|j: Int|
+        if continued(j) {
+          {
+            id: n + j,
+            ty: resumption(match f.params.at(j) { Some(TyFn(k)) -> k.ret, _ -> unknown_type() }),
+            rep: RWord,
+          }
+        } else {
+          match f.params.at(j) {
+            Some(t) -> { id: n + j, ty: t, rep: carried_as(carrier_of(t)) },
+            None -> { id: n + j, ty: unknown_type(), rep: RWord },
+          }
+        });
+      let params = caps.concat(own);
+      Some({
+        params: params,
+        conv: {
+          params: params.map(|_: Var| Given),
+          reps: params.map(|v: Var| v.rep),
+          answer: carried_as(answer),
         },
-        rep: match carriers.at(j) { Some(c) -> carried_as(c), None -> RWord },
-      }
-    });
-  let params = caps.concat(own);
-  {
-    params: params,
-    conv: {
-      params: params.map(|_: Var| Given),
-      reps: params.map(|v: Var| v.rep),
-      answer: carried_as(answer),
-    },
-    ty: match fty { Some(f) -> f.ty, None -> unknown_type() },
-    ret: match fty { Some(f) -> f.ret, None -> unknown_type() },
-    answer: answer,
-    captures: n,
-    own: frame.params,
-  }
-}
-
-/// `s`, the shape of a lambda the checker filed no type for (an expansion writes several at one
-/// place), answering as its body `inner` does: the closure a function of its parameters to what the
-/// body answers, which whatever calls it, a runtime builtin among them, reads its answer at.
-fn answered_as_body(s: Shape, inner: Lowered, frame: Frame) -> Shape =
-  if s.ty != unknown_type() || frame.resumes || !falls_through(inner.st.insts) { s } else {
-    let ret = type_of(inner.arg);
-    if ret == unknown_type() { s } else {
-      let answer = carrier_of(ret);
-      {
-        ..s,
-        conv: { ..s.conv, answer: carried_as(answer) },
-        ty: fn_type(s.params.drop(s.captures).map(|v: Var| v.ty), ret, row_open(0 - 1)),
-        ret: ret,
+        ty: f.ty,
+        ret: f.ret,
         answer: answer,
-      }
-    }
+        captures: n,
+        own: frame.params,
+      })
+    },
   }
 
 /// What a closure's place among the root's closures holds until its body is lowered.
@@ -1272,21 +1283,6 @@ fn capture_type(st: Lowering, at: Span, i: Int) -> Type =
       } else { acc },
       None -> acc,
     })
-
-/// The type a lambda's body answers, as the checker filed the lambda's.
-fn lambda_answer(cx: Context, l: Lambda) -> Type =
-  match type_filed(cx, l.at) {
-    Some(t) -> match t { TyFn(f) -> f.ret, _ -> cx.answer_ty },
-    None -> cx.answer_ty,
-  }
-
-/// The types a lambda's parameters take, as the checker filed the lambda's; none where it filed
-/// none of its arity.
-fn lambda_params(cx: Context, l: Lambda) -> List<Type> =
-  match type_filed(cx, l.at) {
-    Some(TyFn(f)) -> if f.params.len() == l.params { f.params } else { [] },
-    _ -> [],
-  }
 
 /// What a pure definition of no parameters answers, read from what the unit keeps of its one run.
 fn constant_read(cx: Context, st: Lowering, d: Defined, at: Span) -> Lowered = {
@@ -1319,7 +1315,10 @@ fn jumped(
 ) -> Option<Lowered> / {abort.raise} =
   if cx.tails == Calls { None }
   else if own_definition(cx.full) == d.full && args.len() == cx.params.len()
-      && owns(cx, d, ref, fn_args(cx, codes)) {
+      && (match reference_args(cx, d.def.scheme, ref) {
+        Some(given) -> owns(cx, given, fn_args(cx, codes)),
+        None -> false,
+      }) {
     let h = handed_all(st, args, params_held(cx), at);
     Some({ st: emitted(h.st, Restart(h.args)), arg: AZero(held_as(cx.setting, cx.answer_ty)) })
   } else {
@@ -1426,42 +1425,54 @@ fn named_ref(
   at: Span,
   fns: List<FnArg>,
 ) -> Reference / {abort.raise} =
-  if own_definition(cx.full) == d.full {
-    if owns(cx, d, at, fns) { { st: st, callee: Root(cx.key), args: key_types(cx) } }
-    else { { st: st, callee: Root(Named(d.full)), args: [] } }
-  } else {
-    let given = reference_args(cx, d.def.scheme, at);
-    if given.len() == 0 && fns.len() == 0 { { st: st, callee: Root(Named(d.full)), args: [] } }
-    else {
+  match reference_args(cx, d.def.scheme, at) {
+    None ->
       {
-        st: {
-          ..st,
-          links: {
-            ..st.links,
-            generics: st.links.generics.push({
-              callee: d.full,
-              args: given.map(spelled_type),
-              carried: match d.def.scheme {
-                Some(sc) -> carried_vars(sc, given, d.def.arity),
-                None -> [],
-              },
-              fns: fns,
-            }),
-          },
+        st: unfiled(cx, st, b"a generic definition's reference", at).st,
+        callee: Root(Named(d.full)),
+        args: [],
+      },
+    Some(given) -> if own_definition(cx.full) != d.full { referred(st, d, given, fns) }
+    else if owns(cx, given, fns) { { st: st, callee: Root(cx.key), args: key_types(cx) } }
+    else { { st: st, callee: Root(Named(d.full)), args: [] } },
+  }
+
+/// Definition `d` named at type arguments `given`, handing `fns`: as it stands where it is named at
+/// none and handed none, else the body's next generic call.
+fn referred(
+  st: Lowering,
+  d: Defined,
+  given: List<Type>,
+  fns: List<FnArg>,
+) -> Reference / {abort.raise} =
+  if given.len() == 0 && fns.len() == 0 { { st: st, callee: Root(Named(d.full)), args: [] } } else {
+    {
+      st: {
+        ..st,
+        links: {
+          ..st.links,
+          generics: st.links.generics.push({
+            callee: d.full,
+            args: given.map(spelled_type),
+            carried: match d.def.scheme {
+              Some(sc) -> carried_vars(sc, given, d.def.arity),
+              None -> [],
+            },
+            fns: fns,
+          }),
         },
-        callee: Generic(st.links.generics.len()),
-        args: given,
-      }
+      },
+      callee: Generic(st.links.generics.len()),
+      args: given,
     }
   }
 
-/// Whether a reference at `at` of the root's own definition, handing `fns`, names the root itself:
-/// always for a definition as it stands; for a specialisation, where it hands the same lambdas and
-/// its type arguments are the root's, or erase to them.
-fn owns(cx: Context, d: Defined, at: Span, fns: List<FnArg>) -> Bool / {abort.raise} =
+/// Whether a reference of the root's own definition at type arguments `given`, handing `fns`, names
+/// the root itself: always for a definition as it stands; for a specialisation, where it hands the
+/// same lambdas and its type arguments are the root's, or erase to them.
+fn owns(cx: Context, given: List<Type>, fns: List<FnArg>) -> Bool / {abort.raise} =
   match specialisation_of(cx.full) {
     Some(s) -> {
-      let given = reference_args(cx, d.def.scheme, at);
       same_fns(s.fns, fns) && given.len() == s.args.len()
         && range(0, s.args.len()).all(|j: Int|
           match s.args.at(j) {
@@ -1979,15 +1990,16 @@ pub fn def_in(
     }
   }
 
-/// The type arguments the checker gave a reference of a generic definition at `at`; none where it
-/// gave none or not one for each of the scheme's variables.
-fn reference_args(cx: Context, scheme: Option<Scheme>, at: Span) -> List<Type> =
+/// The type arguments the checker gave a reference at `at` of a definition of scheme `scheme`, none
+/// for one that takes none; `None` where it filed none, or not one for each of the scheme's
+/// variables.
+fn reference_args(cx: Context, scheme: Option<Scheme>, at: Span) -> Option<List<Type>> =
   match scheme {
-    None -> [],
-    Some(sc) -> if sc.ty_vars.len() == 0 { [] } else {
+    None -> Some([]),
+    Some(sc) -> if sc.ty_vars.len() == 0 { Some([]) } else {
       match filed(cx, at) {
-        Some(t) -> if t.args.len() == sc.ty_vars.len() { t.args } else { [] },
-        None -> [],
+        Some(t) -> if t.args.len() == sc.ty_vars.len() { Some(t.args) } else { None },
+        None -> None,
       }
     },
   }

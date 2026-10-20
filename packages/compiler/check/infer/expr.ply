@@ -1,7 +1,10 @@
 //! Expressions inferred: what a place expects, patterns and matches, effects and their handlers.
 
 import syntax.parsing (Span, Ident, QName, span_to, dummy_span, is_bare, qname_text, prelude_binder,
-                       made_at, role_member_on, role_member_callee)
+                       made_at, minted, role_member_on, role_member_callee, role_hold_acquire,
+                       role_hold_acquire_read, role_hold_release, role_hold_release_read,
+                       role_hold_open, role_hold_close, role_hold_body, role_tag_texts,
+                       role_tag_holes)
 import std.list (prepend)
 import syntax.type_syntax (TypeExpr, mode_text, is_raise)
 import syntax.items (DOrd, member_name, member_of, Opaque)
@@ -1148,11 +1151,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
     ELambda(l) -> {
       let outer = checker;
       let checker = barred(outer, b"a lambda");
-      let pushed: Checker = {
-        ..checker,
-        env: env_push(checker.env),
-        lambda_binds: checker.env.binds,
-      };
+      let pushed: Checker = { ..checker, env: env_push(checker.env) };
       let expected = match hinted(checker, hint) { Some(TyFn(f)) -> f.params, _ -> [] };
       let ps = l.params.fold(
         { checker: pushed, tys: [] },
@@ -1222,10 +1221,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       };
       let made: Inferred = {
         checker: note_typed(
-          leaving(
-            { ..checked, env: env_pop(checked.env), lambda_binds: checker.lambda_binds },
-            checker.guards,
-          ),
+          leaving({ ..checked, env: env_pop(checked.env) }, checker.guards),
           l.span,
           fn_type(ps.tys, body.ty, row_empty()),
           [],
@@ -1439,8 +1435,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       );
       let closed: Checker = close_tails(items.checker, items.tails);
       {
-        checker: if l.items.len() == 0 { note_typed(closed, l.span, list_type(items.ty), []) }
-        else { closed },
+        checker: note_typed(closed, l.span, list_type(items.ty), []),
         ty: list_type(items.ty),
         row: items.row,
       }
@@ -1643,7 +1638,14 @@ fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
     );
     let recorded: Checker = filled.row.atoms.fold(held.checker, |cc: Checker, atom: Atom|
       record_site(cc, atom, t.span, PerformVia(filled.name)));
-    let j: WithRow = join(recorded, t.span, held.row, filled.row);
+    // The lists of the texts and of the holes the literal is written out as calling its tag with.
+    let listed: Checker = note_typed(
+      note_typed(recorded, minted(t.span, role_tag_texts()), list_type(string_type()), []),
+      minted(t.span, role_tag_holes()),
+      list_type(hole.ty),
+      [],
+    );
+    let j: WithRow = join(listed, t.span, held.row, filled.row);
     { checker: j.checker, ty: answer.ty, row: j.row }
   }
 }
@@ -1966,12 +1968,15 @@ pub fn settle_updates(checker: Checker) -> Checker / {abort.raise} = {
 
 /// `checker` with the type of the read of `name` at `span` filed where no binding the emitter sees
 /// types it: a variable of the handler whose clause is walked, which the read is written out as one
-/// of the runtime's, or a capture of the innermost lambda, which a body another function lends that
-/// lambda to reads off its closure.
-fn held_read(checker: Checker, name: Bytes, span: Span, ty: Type) -> Checker =
-  if checker.assignable.vars.len() == 0 && checker.lambda_binds == 0 { checker } else {
+/// of the runtime's, or a capture of the innermost closure, which a body another function lends that
+/// closure to reads off it.
+fn held_read(checker: Checker, name: Bytes, span: Span, ty: Type) -> Checker / {abort.raise} =
+  if checker.assignable.vars.len() == 0 && checker.assignable.frame == 0 { checker } else {
     match env_local(checker.env, name) {
-      Some(l) -> if l.stamp < checker.lambda_binds
+      Some(l) -> if (match env_depth_of(checker.env, name) {
+            Some(d) -> d < checker.assignable.frame,
+            None -> false,
+          })
           || checker.assignable.vars.fold(
             false,
             |found: Bool, v: { stamp: Int, name: Bytes, ty: Type }| found || v.stamp == l.stamp,
@@ -4478,7 +4483,8 @@ fn made_vars(checker: Checker, vars: List<HandlerVar>) -> MadeVars / {abort.rais
 }
 
 /// `checker` with a handler's variables bound in a new scope, each its own type: what a clause or
-/// the `return` clause starts from. An assignment may give them new values unless `barred`.
+/// the `return` clause starts from, a closure of its own. An assignment may give them new values
+/// unless `barred`.
 fn with_vars(
   checker: Checker,
   vars: List<{ name: Ident, ty: Type }>,
@@ -4493,7 +4499,10 @@ fn with_vars(
         stamps: acc.stamps.push({ stamp: acc.checker.env.binds, name: v.name.name, ty: v.ty }),
       },
   );
-  { ..bound.checker, assignable: { vars: bound.stamps, barred: barred } }
+  {
+    ..bound.checker,
+    assignable: { vars: bound.stamps, barred: barred, frame: checker.env.scopes.len() },
+  }
 }
 
 fn infer_handle(
@@ -5380,7 +5389,7 @@ fn infer_with_hold(
         hint,
       );
       let j: WithRow = join(
-        { ..b.checker, env: env_pop(b.checker.env) },
+        hold_filed({ ..b.checker, env: env_pop(b.checker.env) }, span, a.ty, hold_ty, b.ty),
         span,
         entering.row,
         b.row,
@@ -5395,7 +5404,9 @@ fn infer_with_hold(
         body,
         hint,
       );
-      let closed: ClosedRegion = close_region({ ..b.checker, env: env_pop(b.checker.env) });
+      let closed: ClosedRegion = close_region(
+        hold_filed({ ..b.checker, env: env_pop(b.checker.env) }, span, a.ty, hold_ty, b.ty),
+      );
       let handled = [hold_atom(RNamed(label))];
       let discharged: Checker = discharge(
         closed.checker,
@@ -5424,6 +5435,26 @@ fn infer_with_hold(
       { checker: j.checker, ty: leaving_type(resolve(j.checker, b.ty), label), row: j.row }
     },
   }
+}
+
+/// `checker` with the closures the hold at `span` is written out as filed where they are written,
+/// and the reads of its acquire and release inside them: the acquire answering `held` and the release
+/// taking it, the open and the close over the hold's word, and the body taking the hold, of type
+/// `hold`, and answering `answer`.
+fn hold_filed(checker: Checker, span: Span, held: Type, hold: Type, answer: Type) -> Checker = {
+  let word: WithTy = new_ty(checker);
+  let acquire = fn_type([], held, row_empty());
+  let release = fn_type([held], unit_type(), row_empty());
+  [
+    { role: role_hold_acquire(), ty: acquire },
+    { role: role_hold_acquire_read(), ty: acquire },
+    { role: role_hold_release(), ty: release },
+    { role: role_hold_release_read(), ty: release },
+    { role: role_hold_open(), ty: fn_type([], word.ty, row_empty()) },
+    { role: role_hold_close(), ty: fn_type([word.ty], unit_type(), row_empty()) },
+    { role: role_hold_body(), ty: fn_type([hold], answer, row_empty()) },
+  ].fold(word.checker, |c: Checker, x: { role: Int, ty: Type }|
+    note_typed(c, minted(span, x.role), x.ty, []))
 }
 
 /// By the types at the open: a binding whose type mentions a task only inside the region holds none.

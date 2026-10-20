@@ -5,6 +5,7 @@
 
 import std.bin
 import std.bytes
+import std.bytes (ascii_of_int)
 import syntax.parsing (Ident, Span, span_between, prelude_binder)
 import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, int_type,
                     bool_type, float_type, decimal_type, bytes_type, fn_type, row_empty, unit_type)
@@ -17,7 +18,7 @@ import check.resolve.tables (ParsedModule, Resolved, ModuleBinding, Binding, loo
 import check.resolve.scopes (of_module, of_binder)
 import check.infer (EmitFacts, RootFacts, expanded_mods, no_root_facts, item_owner)
 import check.infer.checker (TypedSite, LabelSite, MemberSite, UpdateShape, TrySite, WitnessOp,
-                            WitnessRef, Builtin, builtins, test_owner, law_root)
+                            WitnessRef, Builtin, builtins, test_owner, law_root, law_owner)
 import front.facts (Analysis)
 import front.seam (WalkedFacts, walked_facts_bin, ctors_read)
 import front.rows (Rows, KnownDefRow, CtorRow)
@@ -44,8 +45,8 @@ pub type Setting = {
 
 /// A definition of the module as a root: its full name, where its text starts, its parameters as
 /// the emitter holds them (each label a trailing `Int`), the types its scheme gives them and its
-/// answer (unknown where none speaks), how its answer crosses a call, its body lowered to `Code`,
-/// where it lowers, and what the checker filed for its item's nodes, or why that cannot be read.
+/// answer (unknown where none speaks), how its answer crosses a call, its body lowered to `Code` or
+/// why not, and what the checker filed for its item's nodes, or why that cannot be read.
 pub type Root = {
   full: Bytes,
   base: Int,
@@ -53,7 +54,7 @@ pub type Root = {
   types: List<Type>,
   answer: Carrier,
   answer_ty: Type,
-  code: Option<Code>,
+  code: Result<Code, Bytes>,
   filed: Result<Filings, Bytes>,
 }
 
@@ -215,8 +216,8 @@ fn test_root(module: Bytes, filed: Result<Filings, Bytes>, t: TestDef) -> Root /
     answer: Whole(KBoxed),
     answer_ty: unit_type(),
     code: match lower_fn(names, [], labels_of(filed), test_run(t), of_binder(module)) {
-      Some(l) -> Some(l.code),
-      None -> None,
+      Ok(l) -> Ok(l.code),
+      Err(why) -> Err(why),
     },
     filed: filed,
   }
@@ -225,36 +226,66 @@ fn test_root(module: Bytes, filed: Result<Filings, Bytes>, t: TestDef) -> Root /
 /// Law `l` of `module` as the root a build makes of its body, its binders its parameters.
 fn law_root_of(module: Bytes, filed: Result<Filings, Bytes>, l: LawDef) -> Root / {abort.raise} = {
   let names = l.binders.map(|b: Binder| b.name.name);
-  let ps = law_params(filed, l.binders);
+  let ps = law_params(law_owner(module, l.name), filed, l.binders);
+  let taken = match ps { Ok(p) -> p, Err(_) -> [] };
   {
     full: law_root(module, l.name, b"body"),
     base: l.span.start,
-    params: ps,
-    types: ps.map(param_type),
+    params: taken,
+    types: taken.map(param_type),
     answer: Whole(KBool),
     answer_ty: bool_type(),
-    code: match lower_fn(names, [], labels_of(filed), l.body, of_binder(module)) {
-      Some(c) -> Some(c.code),
-      None -> None,
+    code: match ps {
+      Err(why) -> Err(why),
+      Ok(_) -> match lower_fn(names, [], labels_of(filed), l.body, of_binder(module)) {
+        Ok(c) -> Ok(c.code),
+        Err(why) -> Err(why),
+      },
     },
     filed: filed,
   }
 }
 
-/// A law's binders as its roots take them: each of the type the checker filed for it, held as a
-/// value of that type is, and a word of no known type where it filed none.
-pub fn law_params(filed: Result<Filings, Bytes>, binders: List<Binder>) -> List<EmitParam> = {
+/// The binders of law `owner` as its roots take them, each of the type the checker filed for it and
+/// held as a value of that type is; or why not, a binder it filed nothing for.
+pub fn law_params(
+  owner: Bytes,
+  filed: Result<Filings, Bytes>,
+  binders: List<Binder>,
+) -> Result<List<EmitParam>, Bytes> / {abort.raise} = {
   let typed = match filed { Ok(f) -> f.typed, Err(_) -> Map::new() };
-  params_carried(
-    binders.map(|b: Binder| b.name.name),
-    binders.map(|b: Binder| Some(typed_kind(typed, b.span))),
-    [],
-    binders.map(|b: Binder|
-      match typed.get(b.span.site) {
-        Some(t) -> if t.ty == unknown_type() { None } else { Some(t.ty) },
-        None -> None,
-      }),
-  )
+  match binders.fold(None, |acc: Option<Binder>, b: Binder|
+      match acc {
+        Some(_) -> acc,
+        None -> if typed.contains(b.span.site) { None } else { Some(b) },
+      }) {
+    Some(b) ->
+      Err(
+        Bytes::concat_all([
+          b"a law's binder the check filed nothing for: `",
+          owner,
+          b"` site ",
+          ascii_of_int(b.span.site),
+          b" at ",
+          ascii_of_int(b.span.start),
+          b":",
+          ascii_of_int(b.span.end),
+        ]),
+      ),
+    None ->
+      Ok(
+        params_carried(
+          binders.map(|b: Binder| b.name.name),
+          binders.map(|b: Binder| Some(typed_kind(typed, b.span))),
+          [],
+          binders.map(|b: Binder|
+            match typed.get(b.span.site) {
+              Some(t) -> if t.ty == unknown_type() { None } else { Some(t.ty) },
+              None -> None,
+            }),
+        ),
+      ),
+  }
 }
 
 /// Definition `def` of `module` as a root, as the emitter prepares one.
@@ -287,8 +318,8 @@ fn root_of(
       if h.name == def.name.name { h.answer } else { acc }),
     answer_ty: match sig { Some(s) -> s.ret, None -> unknown_type() },
     code: match lower_fn(names, labels, labels_of(filed), def.body, of_binder(module)) {
-      Some(l) -> Some(l.code),
-      None -> None,
+      Ok(l) -> Ok(l.code),
+      Err(why) -> Err(why),
     },
     filed: filed,
   }
