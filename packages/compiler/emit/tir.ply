@@ -11,16 +11,21 @@ import emit.c (Width)
 import emit.reps (FieldTy)
 import emit.answer (GenericCall, Need, Pass)
 import emit.keys (RootKey, Callee, Generic, Named)
+import emit.layout (SumLaid, LSum, LWords, P, R, WordIs, WordOutside, Nullary, Inline, counts)
 import emit.tir.handling (HandleOp, HandleSite, Simulate, Label)
 import emit.tir.containers (ContainerOp)
 import emit.tir.calling (CallingOp)
+import emit.tir.statics (StaticDef)
 
 /// How a value is held. A function of the value's type (`lower.held`), but for `RSlice`, a view the
 /// lowering chooses for a list walked by its rest in a loop, which is made a list where it leaves,
 /// and `RToken`, which the ownership pass alone writes. `RFlat` is a record as its leaves and then
 /// its object's word, zero until one is made; `RCases` a sum as its constructor's index and each
 /// case's leaves; `RToken(n)` the cells of a block of `n` payload words whose fields a `Reset` let
-/// go of, or zero: freed where it is let go, never released as a value.
+/// go of, or zero: freed where it is let go, never released as a value. `RSum` is a sum in the words
+/// `laid` lays it in, its cases its constructors as the table names them, in declared order; it is
+/// one part of the form, never opened into its words, and counted through the case it holds. `RUnit`
+/// is a value of no words; `RAddr` an address into a block's payload, borrowed from the block.
 pub type Rep =
   | RInt
   | RBool
@@ -34,6 +39,9 @@ pub type Rep =
   | RCases(Cases)
   | RSlice
   | RToken(Int)
+  | RSum({ laid: SumLaid, cases: List<Bytes> })
+  | RUnit
+  | RAddr
 
 /// A leaf of a flattened record or of a sum's case: never itself flat.
 pub type Leaf = { name: Bytes, rep: Rep }
@@ -78,17 +86,23 @@ pub type Uses = { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool }
 /// object laid out as `fields` says, a constructor's where `ctor` names one and a record's otherwise,
 /// each argument held as its field is and a record held in place given as its leaves or its word.
 /// `MClosure` is a closure over body `nth` of the root's lambdas, holding `captures` words and taking
-/// `params` arguments; a `stacked` one is lent and laid out on the caller's stack.
+/// `params` arguments; a `stacked` one is lent and laid out on the caller's stack. `MBox` is a box of
+/// a value laid by its type, `words` of payload; `MCase` a sum's case `case` (its place among the
+/// sum's cases) boxed, `skip` words of tag holding `case` and then `words` of payload.
 pub type Made =
   | MRecord({ names: List<Bytes>, width: Int })
   | MCtor({ name: Bytes, width: Int })
   | MLaid({ ctor: Option<Bytes>, fields: List<FieldTy> })
   | MList(Int)
   | MClosure({ nth: Int, captures: Int, params: Int, stacked: Bool })
+  | MBox({ words: Int })
+  | MCase({ case: Int, skip: Int, words: Int })
 
 /// Where a `Get` reads: a field by its word offset, or by name where the layout is unknown (a
 /// need the specialisation answers), a case's argument, a closure's capture, a flat value's leaf, or
 /// the word of a record a block holds in place at a word offset: the address of its header there.
+/// `PCase` is word `at` of an `RSum`'s case `case`'s payload, wherever its layout puts it; `PPayload`
+/// the address of the bytes a block holds, where its type lays them, held as an `RAddr`.
 pub type Path =
   | PField({ name: Bytes, at: Int })
   | PNamed(Bytes)
@@ -96,6 +110,8 @@ pub type Path =
   | PCapture(Int)
   | PLeaf(Int)
   | PPlace(Int)
+  | PCase({ case: Int, at: Int })
+  | PPayload
 
 /// What a `Case` tests its subject against. An arm's `when` is an index into a `TTag`'s
 /// constructors or a `TInt`'s integers; a `TRange` holds one arm, `when` 0. Under `TLength` an arm's
@@ -144,6 +160,8 @@ pub type Val =
   /// A runtime function by its C name.
   | Native({ name: Bytes, args: List<Arg>, uses: Uses })
   | Op({ op: Operation, args: List<Arg>, uses: Uses })
+  /// Takes the variable's count: answers it where that count was its last, and 0 otherwise.
+  | LastOf(Var)
 
 pub type Block = List<Inst>
 
@@ -223,7 +241,8 @@ pub fn no_links() -> Links = { generics: [], needs: [], called: [], passes: [] }
 /// `Restart` hands its arguments as `params` are held. `lambdas` are the bodies of the closures it
 /// makes (its lambdas, its handlers' clauses, a `simulate`'s body), each `MClosure`'s `nth` its place
 /// among them; `base` is where its definition's text starts, which its failure sites count from;
-/// `members` are a tail group's roots in case order, and empty for a root of its own.
+/// `members` are a tail group's roots in case order, and empty for a root of its own. `statics` are
+/// the static objects its body names, each after those it names; a lambda's body holds its own.
 ///
 /// A tail group's `Fn` is keyed as its first member, takes one parameter, `which`, an `RInt`, and
 /// answers a word. Its body is one `Case` on `which` testing `TInt` of each member's place, arm `i`
@@ -240,6 +259,7 @@ pub type Fn = {
   base: Int,
   members: List<Member>,
   links: Links,
+  statics: List<StaticDef>,
 }
 
 /// A member of a tail group: its root, where its definition's text starts, its parameters at its own
@@ -283,6 +303,9 @@ pub fn rep_said(r: Rep) -> Bytes =
     RCases(c) -> Bytes::concat_all([b"cases, ", ascii_of_int(c.cases.len()), b" of them"]),
     RSlice -> b"a view",
     RToken(n) -> Bytes::concat_all([b"a token of ", ascii_of_int(n), b" words"]),
+    RSum(s) -> Bytes::concat_all([b"a sum's words, ", ascii_of_int(s.cases.len()), b" cases"]),
+    RUnit -> b"no words",
+    RAddr -> b"an address into a block",
   }
 
 /// Variable `v` and how it is held, as a fault names it.
@@ -301,10 +324,13 @@ pub fn made_said(m: Made) -> Bytes =
     },
     MList(n) -> Bytes::concat_all([b"a list of ", ascii_of_int(n)]),
     MClosure(c) -> Bytes::concat_all([b"closure ", ascii_of_int(c.nth)]),
+    MBox(b) -> Bytes::concat_all([b"a box of ", ascii_of_int(b.words), b" words"]),
+    MCase(c) -> Bytes::concat_all([b"case ", ascii_of_int(c.case), b" boxed"]),
   }
 
 /// Whether a value held as `r` holds a count: a word, an `Option`'s or `Result`'s, a view of a
-/// list, a reuse token, or a flat value with a counted leaf (its word always is one).
+/// list, a reuse token, a flat value with a counted leaf (its word always is one), or a sum some
+/// case of which holds one.
 pub fn counted(r: Rep) -> Bool =
   match r {
     RWord -> true,
@@ -316,12 +342,13 @@ pub fn counted(r: Rep) -> Bool =
     RCases(c) ->
       c.cases.fold(false, |any: Bool, x: { name: Bytes, leaves: List<Leaf> }|
         any || x.leaves.fold(false, |a: Bool, l: Leaf| a || counted(l.rep))),
+    RSum(s) -> counts(LSum(s.laid)),
     _ -> false,
   }
 
-/// The C values a value held as `r` is laid in, each as it is held: a flat value's leaves and then
-/// its word, a sum's index and then each case's leaves, a view's list and its offset, anything else
-/// itself.
+/// The parts a value held as `r` is laid in, each as it is held: a flat value's leaves and then its
+/// word, a sum's index and then each case's leaves, a view's list and its offset, anything else
+/// itself (an `RSum` among them, which only a printer lays out as its words).
 pub fn parts_of(r: Rep) -> List<Rep> =
   match r {
     RFlat(leaves) -> leaves.map(|l: Leaf| l.rep).push(RWord),
@@ -332,7 +359,7 @@ pub fn parts_of(r: Rep) -> List<Rep> =
     _ -> [r],
   }
 
-/// How many C values a value held as `r` is laid in: `parts_of(r)`'s length, without the list.
+/// How many parts a value held as `r` is laid in: `parts_of(r)`'s length, without the list.
 pub fn parts_count(r: Rep) -> Int =
   match r {
     RFlat(leaves) -> leaves.len() + 1,
@@ -362,7 +389,7 @@ pub fn var_of(a: Arg) -> Option<Var> = match a { AVar(v) -> Some(v), _ -> None }
 /// applies, which the runtime lets go of once the call is done; an operator and a field read
 /// borrow, as does holding a value as one that holds no count; what allocates or answers takes but
 /// a stacked closure, which reads its captures while its caller holds them; a runtime function or a
-/// family's operation does as its `uses` say.
+/// family's operation does as its `uses` say; a test of a last holder takes what it tests.
 pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
   match v {
     Prim(p) -> p.args.map(|a: Arg| { arg: a, takes: false }),
@@ -385,6 +412,7 @@ pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
     Apply(c) -> [{ arg: c.f, takes: true }].concat(handed(c.args, c.conv)),
     Native(n) -> used_as(n.args, n.uses),
     Op(o) -> used_as(o.args, o.uses),
+    LastOf(x) -> [{ arg: AVar(x), takes: true }],
   }
 
 fn handed(args: List<Arg>, conv: Convention) -> List<{ arg: Arg, takes: Bool }> =
@@ -403,13 +431,13 @@ pub fn used_as(args: List<Arg>, uses: Uses) -> List<{ arg: Arg, takes: Bool }> =
       None -> acc,
     })
 
-/// How what `v` answers is held: a count of its own, read out of the operand it names without
-/// one, or a constant no count is kept of.
-pub type Answered = | Owns | ReadsOf(Var) | Lasts
+/// How what `v` answers is held: a count of its own, read without one out of the operands it names,
+/// valid while each is held, or a constant no count is kept of.
+pub type Answered = | Owns | ReadsOf(List<Var>) | Lasts
 
 pub fn answered(v: Val) -> Answered =
   match v {
-    Get(g) -> match g.path { PNamed(_) -> Owns, _ -> ReadsOf(g.of) },
+    Get(g) -> match g.path { PNamed(_) -> Owns, _ -> ReadsOf([g.of]) },
     Static(_) -> Lasts,
     Tag(_) -> Lasts,
     Native(n) -> by_uses(n.args, n.uses),
@@ -418,7 +446,7 @@ pub fn answered(v: Val) -> Answered =
   }
 
 fn by_uses(args: List<Arg>, uses: Uses) -> Answered =
-  if uses.owned { Owns } else { match args.at(0) { Some(AVar(x)) -> ReadsOf(x), _ -> Lasts } }
+  if uses.owned { Owns } else { match args.at(0) { Some(AVar(x)) -> ReadsOf([x]), _ -> Lasts } }
 
 /// Whether `v` can fail, so a test follows it and its `unwind` is released on the way out: a
 /// call, a constant read from the pool, a checked operator, a field read by name, and what its
@@ -439,6 +467,7 @@ pub fn fails(v: Val) -> Bool =
     Apply(_) -> true,
     Native(n) -> n.uses.fails,
     Op(o) -> o.uses.fails,
+    LastOf(_) -> false,
   }
 
 /// Whether operator `op` over `on` is checked: an integer's arithmetic and shifts, which overflow
@@ -540,11 +569,11 @@ test "each operation consumes or borrows each operand as its signature says" {
     false,
     true,
   ]);
-  assert_eq(answered(Get({ of: s, path: PLeaf(0) })), ReadsOf(s));
+  assert_eq(answered(Get({ of: s, path: PLeaf(0) })), ReadsOf([s]));
   // A field the runtime looks up by name is answered with a count of its own.
   assert_eq(answered(Get({ of: s, path: PNamed(b"x") })), Owns);
   assert_eq(answered(call), Owns);
-  assert_eq(answered(Native({ name: b"rt_len_p", args: [AVar(s)], uses: lent })), ReadsOf(s));
+  assert_eq(answered(Native({ name: b"rt_len_p", args: [AVar(s)], uses: lent })), ReadsOf([s]));
   assert_eq(answered(Op({ op: OHandle(Label(b"r")), args: [], uses: lent })), Lasts)
 }
 
@@ -582,4 +611,32 @@ test "a block ends where its last instruction but a site's change ends" {
   assert_eq(falls_through([fail, Sited(None), Return(AInt(0)), lent]), false);
   assert_eq(falls_through([lent, Sited(None)]), true);
   assert_eq(falls_through([]), true)
+}
+
+test "a sum is one part of the form, counted through its cases, and a last-holder test takes its operand" {
+  let none = { test: WordIs({ at: 0, value: 0 }), payload: Nullary };
+  let pointer = {
+    test: WordOutside({ at: 0, values: [0] }),
+    payload: Inline({ offset: 0, laid: LWords([P]), stripped: None }),
+  };
+  let maybe = RSum({ laid: { classes: [P], cases: [none, pointer] }, cases: [b"None", b"Some"] });
+  let flags = RSum({
+    laid: {
+      classes: [R({ lo: 0, hi: 1 })],
+      cases: [none, { test: WordIs({ at: 0, value: 1 }), payload: Nullary }],
+    },
+    cases: [b"Off", b"On"],
+  });
+  assert_eq([maybe, flags, RUnit, RAddr].map(counted), [true, false, false, false]);
+  // Opening a record yields its sum whole, never the sum's words.
+  assert_eq(parts_of(RFlat([{ name: b"o", rep: maybe }, { name: b"n", rep: RInt }])), [
+    maybe,
+    RInt,
+    RWord,
+  ]);
+  assert_eq([maybe, RUnit, RAddr].map(parts_count), [1, 1, 1]);
+  let s = { id: 1, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
+  assert_eq(operands(LastOf(s)).map(|o: { arg: Arg, takes: Bool }| o.takes), [true]);
+  assert_eq(answered(LastOf(s)), Owns);
+  assert_eq(fails(LastOf(s)), false)
 }

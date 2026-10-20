@@ -13,13 +13,13 @@ import syntax.type_syntax (TypeExpr, TVar, TCon, TFn)
 import expand.rewrite.shared (map_expr)
 import expand.rewrite (unwitnessed, witness_param)
 import emit.c (KInt, Kind)
-import emit.roots (specialised_with, specialisation_of, FnArg)
-import emit.answer (Need, Scalar, no_tables, Emitted)
+import emit.keys (RootKey, At, FnArg, root_name, key_types, key_lent)
+import emit.answer (Need, Scalar)
 import emit.reps (Ty, TyOpen, EmitParam, BoundLambda, Sig, sig_of, param_kinds, param_types,
                   substituted, numeric_named, filings_at, carriers_of, carriers_at, def_named)
 import emit.typing (Filings)
 import emit.lower.setting (Setting, params_carried, labels_of)
-import emit.entry (emitted_from)
+import emit.entry (RootForm, Formed, Unformed, formed_from)
 
 // --- Specialisation ----------------------------------------------------------------------------
 
@@ -63,51 +63,41 @@ fn pairwise(written: List<TypeExpr>, tys: List<Type>, acc: Map<Bytes, Int>) -> M
       })
   }
 
-/// The root names `wanted` holds of `full`'s specialisations, each with the layouts it is at.
-pub fn specialisations_wanted(
-  wanted: Option<Map<Bytes, Bool>>,
-) -> Map<Bytes, List<Specialised>> / {abort.raise} =
-  match wanted {
-    None -> Map::new(),
-    Some(w) ->
-      w.fold(Map::new(), |acc: Map<Bytes, List<Specialised>>, root: Bytes, _: Bool|
-        match specialisation_of(root) {
-          Some(s) ->
-            acc.insert(
-              s.base,
-              (match acc.get(s.base) { Some(l) -> l, None -> [] }).push({
-                args: s.args,
-                fns: s.fns,
-              }),
-            ),
-          None -> acc,
-        }),
-  }
+/// The specialisations `wanted` holds, by the definition each specialises.
+pub fn specialisations_wanted(wanted: List<RootKey>) -> Map<Bytes, List<RootKey>> =
+  wanted.fold(Map::new(), |acc: Map<Bytes, List<RootKey>>, k: RootKey|
+    match k {
+      At(a) -> acc.insert(a.def, (match acc.get(a.def) { Some(l) -> l, None -> [] }).push(k)),
+      _ -> acc,
+    })
 
-/// A definition at type arguments, running the lambdas `fns` lends in place.
-pub type Specialised = { args: List<Type>, fns: List<FnArg> }
-
-/// `e`, the body of generic `def`, noting the variables whose numeric witness it reads: a scalar
-/// argument does that arithmetic in C.
+/// `r`, the form of generic `def`, noting among its needs the variables whose numeric witness it
+/// reads: a scalar argument does that arithmetic in C.
 pub fn witnessed_needs(
-  e: Emitted,
+  r: RootForm,
   def: FnDef,
   scheme: Option<Scheme>,
   ops: List<WitnessOp>,
-) -> Emitted =
+) -> RootForm =
   match scheme {
-    None -> e,
-    Some(sc) -> {
-      let numbering = generics_numbered(def, sc);
-      let needs = ops.fold(e.tables.generics.needs, |acc: List<Need>, o: WitnessOp|
-        if o.owner != e.name { acc } else {
-          match numbering.get(o.param) {
-            Some(v) -> if acc.contains({ var: v, reads: Scalar }) { acc }
-            else { acc.push({ var: v, reads: Scalar }) },
-            None -> acc,
-          }
-        });
-      { ..e, tables: { ..e.tables, generics: { ..e.tables.generics, needs: needs } } }
+    None -> r,
+    Some(sc) -> match r {
+      Formed(x) -> match x.form {
+        Ok(f) -> {
+          let numbering = generics_numbered(def, sc);
+          let needs = ops.fold(f.links.needs, |acc: List<Need>, o: WitnessOp|
+            if o.owner != x.name { acc } else {
+              match numbering.get(o.param) {
+                Some(v) -> if acc.contains({ var: v, reads: Scalar }) { acc }
+                else { acc.push({ var: v, reads: Scalar }) },
+                None -> acc,
+              }
+            });
+          Formed({ ..x, form: Ok({ ..f, links: { ..f.links, needs: needs } }) })
+        },
+        Err(_) -> r,
+      },
+      Unformed(_) -> r,
     },
   }
 
@@ -144,20 +134,22 @@ pub fn definition_at(
   }
 }
 
-/// `def` of the module `s` reads emitted at `args`: its parameters and what the checker filed of its
-/// nodes, `filed`, read at them, and each operator whose witness is a parameter now held as one
-/// numeric type alone done as that type's own.
-pub fn specialised_emitted(
+/// `def` of the module `s` reads formed as root `root`, at its type arguments and running the
+/// lambdas it lends in place: its parameters and what the checker filed of its nodes, `filed`, read
+/// at them, and each operator whose witness is a parameter now held as one numeric type alone done
+/// as that type's own.
+pub fn specialised_formed(
   s: Setting,
   def: FnDef,
-  args: List<Type>,
-  fns: List<FnArg>,
-  lambda_at: (Bytes, Int) -> Option<BoundLambda> / {abort.raise},
+  root: RootKey,
+  lambda_at: (RootKey, Int) -> Option<BoundLambda> / {abort.raise},
   schemes: Map<Bytes, Scheme>,
   ops: List<WitnessOp>,
   filed: Result<Filings, Bytes>,
-) -> Emitted / {abort.raise} = {
+) -> RootForm / {abort.raise} = {
   let full = qualify(s.module, def.name.name);
+  let args = key_types(root);
+  let fns = key_lent(root);
   let source = definition_at(full, def, args, schemes, ops);
   let body = source.body;
   let sig = source.sig;
@@ -167,7 +159,6 @@ pub fn specialised_emitted(
   let all_names = labels.fold(names, |acc: List<Bytes>, n: Bytes| acc.push(n));
   let all_kinds = labels.fold(kinds, |acc: List<Option<{ kind: Kind, ty: Ty }>>, n: Bytes|
     acc.push(Some({ kind: KInt, ty: TyOpen([]) })));
-  let root = specialised_with(full, args, fns);
   let carried = params_carried(
     all_names,
     all_kinds,
@@ -192,14 +183,12 @@ pub fn specialised_emitted(
     });
   match lent {
     None ->
-      {
-        name: root,
-        text: b"",
-        tables: no_tables(),
-        why: Some(b"a lambda this root runs in place of a call is not one its owner lowers"),
-      },
+      Unformed({
+        name: root_name(root),
+        why: b"a lambda this root runs in place of a call is not one its owner lowers",
+      }),
     Some(ps) ->
-      emitted_from(
+      formed_from(
         s,
         def.span.start,
         root,

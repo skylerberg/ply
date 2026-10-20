@@ -1,6 +1,116 @@
-//! What the emitter writes in place over the objects the runtime lays out: where a list's and a
-//! map's parts lie, which the runtime's description reports too, and the externs it writes over
-//! them, which no native implements.
+//! Layout facts, with one home: what a word of a value may hold, how a type lays a value out in
+//! words (records and sums, `sum_laid`'s one algorithm for every sum), the constants those rest on,
+//! where the runtime's own objects keep their parts and the externs written in place over them, and
+//! the structs emitted code and the runtime both lay out. It imports nothing from the compiler: `record_laid` and `sum_laid` take layouts, not
+//! types.
+
+/// What a word of a laid value may hold. `P` is a counted pointer or 0: nonzero, 8-aligned and at or
+/// above `pointer_floor()` where nonzero, its low `tag_bits()` spare. `C(m)` is a `Char`'s immediate
+/// `c << 3 | 2`, or one of `m` nullary values `0, 8, ..` below it; uncounted. `R` is a raw scalar of
+/// the valid values `lo..=hi`; uncounted. `S(m)` is a one-word sum's word over pointers: `m` nullary
+/// values `0, 8, ..`, otherwise a pointer whose low bits say the case, counted where at or above the
+/// floor. `U` is a word cases of a sum lay different things in, counted as the case says.
+pub type WordClass = | P | C(Int) | R({ lo: Int, hi: Int }) | S(Int) | U
+
+/// How a type lays a value out wherever it holds one (a local's parts, a field, a sum's payload, a
+/// box, a capture, an array's element), as a function of the type alone. `LWords` are words that make
+/// the value whole: a scalar's (a `Decimal`'s two), a pointer's, none for `Unit`. `LRecord` is a
+/// record's fields in the checker's order (sorted by name), each at its first word, nothing between
+/// them; `LSum` a sum's words and how each case is told apart and laid.
+pub type Laid = | LWords(List<WordClass>) | LRecord(List<FieldLaid>) | LSum(SumLaid)
+
+/// A record's field: the word of the record it starts at, and how it is laid there.
+pub type FieldLaid = { at: Int, laid: Laid }
+
+/// A sum laid out: the class of each of its words, and its cases in declared order.
+pub type SumLaid = { classes: List<WordClass>, cases: List<CaseLaid> }
+
+/// One case of a sum: how a value is known to be this case, and where its payload lies.
+pub type CaseLaid = { test: CaseTest, payload: Payload }
+
+/// How a case is told apart. `Always`: the sum's only case. `WordIs`: word `at` holds `value`.
+/// `WordOutside`: the case whose payload holds a niche, word `at` holding none of the other cases'
+/// `values`, tested by that word's class. `LowBits`: word `at` is a pointer whose low bits are
+/// `bits`, and where `block_tag` says so, past the eighth case, the box's word 0 holds that tag.
+pub type CaseTest =
+  | Always
+  | WordIs({ at: Int, value: Int })
+  | WordOutside({ at: Int, values: List<Int> })
+  | LowBits({ at: Int, bits: Int, block_tag: Option<Int> })
+
+/// Where a case's arguments, laid as a record of them in order, lie. `Nullary`: no words (a case
+/// whose arguments are all of no words is nullary for layout). `Inline`: in the sum's own words from
+/// `offset`, the word `stripped` names, where one does, holding the case's tag in its low bits, read
+/// as `w & ~7`. `Boxed`: word `at` points at a box (masked where `stripped`), the case's payload
+/// after `skip` words of tag.
+pub type Payload =
+  | Nullary
+  | Inline({ offset: Int, laid: Laid, stripped: Option<Int> })
+  | Boxed({ at: Int, stripped: Bool, skip: Int, laid: Laid })
+
+/// A case as `sum_laid` takes it: its arguments laid as a record of them in order, and whether they
+/// reach the sum's own recursion group inline, which boxes the case.
+pub type CaseArgs = { args: Laid, indirect: Bool }
+
+/// How a value is one word where one word is required: a list's or a map's item, an argument or
+/// answer of a closure's uniform entry, a value the runtime carries. `Itself`: its one word (a
+/// pointer type's, a `Char`'s, a `Bool`'s 0 or 1, a one-word record's or sum's), 0 for a value of no
+/// words. `Immediate`: `v << 1 | 1`, and the runtime's box for an `Int` past 62 bits. `RuntimeBox`:
+/// its bits in the runtime's box (a `Float`'s, a `Decimal`'s, a 64-bit width's). `Box(words)`: a box
+/// of the value laid by its type.
+pub type WordForm = | Itself | Immediate | RuntimeBox | Box(Int)
+
+/// A record of `fields`, each laid as given, in that order from word 0, nothing between them.
+pub fn record_laid(fields: List<Laid>) -> Laid =
+  LRecord(
+    fields.fold({ at: 0, out: [] }, |acc: { at: Int, out: List<FieldLaid> }, f: Laid|
+      { at: acc.at + words(f), out: acc.out.push({ at: acc.at, laid: f }) }).out,
+  )
+
+/// A sum of `cases`, in declared order, laid by the first encoding that applies: its one case's
+/// payload; an enum's index; a niche one case's payload leaves for the nullary ones; pointer tags
+/// where every case with data is one pointer; a niche a widest case leaves for the others; a tag
+/// word and the payloads overlaid after it. Every case inline but those `indirect` boxes, and the
+/// words of a case outside its payload zero. Until it is written, a sum of no words and no cases.
+pub fn sum_laid(cases: List<CaseArgs>) -> SumLaid = { classes: [], cases: [] }
+
+/// How many words a value laid as `l` takes.
+pub fn words(l: Laid) -> Int = classes(l).len()
+
+/// The class of each word of a value laid as `l`, in order.
+pub fn classes(l: Laid) -> List<WordClass> =
+  match l {
+    LWords(cs) -> cs,
+    LRecord(fs) -> fs.fold([], |acc: List<WordClass>, f: FieldLaid| acc.concat(classes(f.laid))),
+    LSum(s) -> s.classes,
+  }
+
+/// Whether a value laid as `l` may hold a count: a pointer of its own, or a case whose payload
+/// does.
+pub fn counts(l: Laid) -> Bool =
+  match l {
+    LWords(cs) -> cs.any(|c: WordClass| match c { P -> true, S(_) -> true, U -> true, _ -> false }),
+    LRecord(fs) -> fs.any(|f: FieldLaid| counts(f.laid)),
+    LSum(s) ->
+      s.cases.any(|c: CaseLaid|
+        match c.payload { Nullary -> false, Inline(i) -> counts(i.laid), Boxed(_) -> true }),
+  }
+
+/// How many words a value may cross a call in before it crosses by reference to the caller's copy.
+pub fn register_words() -> Int = 4
+
+/// The least address a heap block or static object lies at: every smaller value is free to stand
+/// for a nullary case.
+pub fn pointer_floor() -> Int = 4096
+
+/// The low bits of a pointer no block's address sets, which a one-word sum's tag takes.
+pub fn tag_bits() -> Int = 3
+
+/// How far apart a one-word sum's nullary values are, so none has a tag bit set.
+pub fn nullary_step() -> Int = 8
+
+/// The bytes of a block's header, its count among them, before its payload.
+pub fn header_bytes() -> Int = 16
 
 /// A list's own object: the root of its trie at word `root`, zero for none, then the tail's items
 /// from word `tail`. Its header's `len` holds how many items the list has, and the fields named
@@ -130,3 +240,125 @@ fn intrinsic_map() -> Map<Bytes, Intrinsic> =
 /// What the emitter writes in place of a call of the extern whose program-wide name is `name`;
 /// `None` for any other.
 pub fn intrinsic_named(name: Bytes) -> Option<Intrinsic> = intrinsic_map().get(name)
+
+/// A string's or a byte string's own object: its header's `len` bytes from its payload's start, with
+/// room for as many as its header's field `room` holds. A view, whose header's `flags` hold `view`,
+/// holds the value it views at word `viewed` and where its bytes begin there at word `from`; a value
+/// counts its views in its header's field `views`.
+pub type StrLaid = { room: Bytes, view: Int, viewed: Int, from: Int, views: Bytes }
+
+/// Where the runtime's strings and byte strings keep their parts.
+pub fn str_laid() -> StrLaid = { room: b"layout", view: 8, viewed: 0, from: 1, views: b"aux" }
+
+/// A hold's object: the value it holds at word `held`, 0 once it has let go.
+pub type HoldLaid = { held: Int }
+
+/// Where the runtime's holds keep what they hold.
+pub fn hold_laid() -> HoldLaid = { held: 1 }
+
+/// A `Columns`' object: field `k`'s column, an `Array` of that field of every record, at word
+/// `first + k`, the fields in the checker's order.
+pub type ColumnsLaid = { first: Int }
+
+pub fn columns_laid() -> ColumnsLaid = { first: 0 }
+
+/// A struct emitted code lays out and the runtime reads, as the head declares it and the runtime's
+/// description reports it: its name, its size in bytes, and each field in order.
+pub type MachineStruct = { name: Bytes, bytes: Int, fields: List<MachineField> }
+
+/// A field of a machine struct: its name, the C the head declares it by, its byte offset and size.
+pub type MachineField = { name: Bytes, decl: Bytes, at: Int, bytes: Int }
+
+/// `PlyFrame`: a frame that may stop links one into the context's `frames` around the call, its
+/// slots after it, and `each` counts every slot once more (`d > 0`) or once fewer (`d < 0`).
+pub fn frame_struct() -> MachineStruct =
+  {
+    name: b"PlyFrame",
+    bytes: 16,
+    fields: [
+      { name: b"prev", decl: b"struct PlyFrame *prev", at: 0, bytes: 8 },
+      { name: b"each", decl: b"void (*each)(PlyCtx *, Word *, int64_t)", at: 8, bytes: 8 },
+    ],
+  }
+
+/// `PlyType`, a type's descriptor (`type#T`): its identity (the low 64 bits of the digest of its
+/// spelling), its spelling, and the entries the runtime counts and crosses a value of it through,
+/// each taking the value's word form.
+pub fn type_struct() -> MachineStruct =
+  {
+    name: b"PlyType",
+    bytes: 56,
+    fields: [
+      { name: b"identity", decl: b"uint64_t identity", at: 0, bytes: 8 },
+      { name: b"spelled", decl: b"const uint8_t *spelled", at: 8, bytes: 8 },
+      { name: b"spelled_len", decl: b"uint32_t spelled_len", at: 16, bytes: 4 },
+      { name: b"inc", decl: b"Word (*inc)(PlyCtx *, Word)", at: 24, bytes: 8 },
+      { name: b"dec", decl: b"Word (*dec)(PlyCtx *, Word)", at: 32, bytes: 8 },
+      { name: b"lower", decl: b"Word (*lower)(PlyCtx *, Word)", at: 40, bytes: 8 },
+      { name: b"lift", decl: b"Word (*lift)(PlyCtx *)", at: 48, bytes: 8 },
+    ],
+  }
+
+/// `PlyOp`, an operation at its perform's type arguments (`op#effect.op@T..`): the effect's and
+/// the operation's field-table entries, the answer's type, which parameters are the operation's own
+/// type parameter (bit `i` for parameter `i`), each parameter's type and the operation's own type
+/// parameters'.
+pub fn op_struct() -> MachineStruct =
+  {
+    name: b"PlyOp",
+    bytes: 64,
+    fields: [
+      { name: b"effect", decl: b"int64_t effect", at: 0, bytes: 8 },
+      { name: b"op", decl: b"int64_t op", at: 8, bytes: 8 },
+      { name: b"answer", decl: b"const PlyType *answer", at: 16, bytes: 8 },
+      { name: b"own", decl: b"uint64_t own", at: 24, bytes: 8 },
+      { name: b"params_len", decl: b"int64_t params_len", at: 32, bytes: 8 },
+      { name: b"params", decl: b"const PlyType *const *params", at: 40, bytes: 8 },
+      { name: b"vars_len", decl: b"int64_t vars_len", at: 48, bytes: 8 },
+      { name: b"vars", decl: b"const PlyType *const *vars", at: 56, bytes: 8 },
+    ],
+  }
+
+/// `PlyFnDesc`, a lambda's descriptor, which word 0 of its closure's block names: the uniform entry
+/// (the block and each argument as its word form, answering one); the entry at the function type's
+/// own convention, cast to it where emitted code calls it; that convention's identity, which a
+/// checked build compares; and the entries that release the block (its captures, then its memory),
+/// share it with another thread (answering 0 where a capture cannot cross) and keep it for good.
+pub fn fn_desc_struct() -> MachineStruct =
+  {
+    name: b"PlyFnDesc",
+    bytes: 48,
+    fields: [
+      { name: b"uniform", decl: b"Word (*uniform)(PlyCtx *, Word, const Word *)", at: 0, bytes: 8 },
+      { name: b"typed", decl: b"void (*typed)(void)", at: 8, bytes: 8 },
+      { name: b"convention", decl: b"Word convention", at: 16, bytes: 8 },
+      { name: b"release", decl: b"Word (*release)(PlyCtx *, Word)", at: 24, bytes: 8 },
+      { name: b"share", decl: b"Word (*share)(PlyCtx *, Word)", at: 32, bytes: 8 },
+      { name: b"keep", decl: b"Word (*keep)(PlyCtx *, Word)", at: 40, bytes: 8 },
+    ],
+  }
+
+/// Every machine struct, in the order the runtime's description lists them, each declared before a
+/// struct that points at it.
+pub fn machine_structs() -> List<MachineStruct> =
+  [frame_struct(), type_struct(), op_struct(), fn_desc_struct()]
+
+test "a record's fields lie one after another from its first word, each as wide as it is laid" {
+  let raw = R({ lo: 0, hi: 1 });
+  let pair = LWords([raw, raw]);
+  let r = record_laid([LWords([P]), pair, LWords([]), LWords([C(0)])]);
+  assert_eq(words(r), 4);
+  assert_eq(match r { LRecord(fs) -> fs.map(|f: FieldLaid| f.at), _ -> [] }, [0, 1, 3, 3]);
+  assert_eq(counts(r), true);
+  assert_eq(counts(record_laid([pair, LWords([C(0)])])), false)
+}
+
+test "each machine struct's fields lie in order, each at a multiple of its size, within the struct" {
+  machine_structs().fold((), |_: Unit, s: MachineStruct| {
+    let end = s.fields.fold(0, |at: Int, f: MachineField| {
+      assert(f.at >= at && f.at % f.bytes == 0 && f.decl.index_of(f.name) != None, None);
+      f.at + f.bytes
+    });
+    assert(end <= s.bytes && s.bytes % 8 == 0, None)
+  })
+}

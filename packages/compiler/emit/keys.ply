@@ -4,28 +4,35 @@
 import check.types (Type, TyCon, spelled_type, type_bin)
 import check.resolve.tables (qualify)
 import front.published (module_of_root)
-import emit.roots (FnArg, fn_arg_bin)
 import std.bin
 import std.bytes (ascii_of_int)
 
 /// A root. `Named` is one the front end names: a definition, a test, a law or a clause. `At` is a
 /// definition at type arguments, running in place the lambdas `lent` names where it calls the
 /// parameters they are handed as. `Written` is an operation written for a type, in the module that
-/// declares the type where its name is qualified, and otherwise in `home`, the module asking.
+/// declares the type where its name is qualified, and otherwise in `home`, the module asking; its
+/// `marks` are the places in `ty` (0 `ty` itself, then each argument's subtree in order) that stand
+/// for an operation's own type parameter, which a crossing hands over as a handle.
 /// `Entered` is the entry the runtime enters a named root through, its arguments and answer
 /// crossing as machine data.
 pub type RootKey =
   | Named(Bytes)
   | At({ def: Bytes, args: List<KeyArg>, lent: List<FnArg> })
-  | Written({ op: TypeOp, ty: Type, home: Bytes })
+  | Written({ op: TypeOp, ty: Type, home: Bytes, marks: List<Int> })
   | Entered(Bytes)
 
 /// A type argument a specialisation is keyed by: the type itself, where the body reads which type
 /// it is, or only the layout it is read at, as the layout module spells a layout's key.
 pub type KeyArg = | KeyType(Type) | KeyLayout(Bytes)
 
+/// A literal lambda handed as argument `param`: the `nth` its owner root lowers. Where the owner
+/// stands in its module is no part of it, so a body kept for a definition names the same lambda
+/// wherever the definition moves.
+pub type FnArg = { param: Int, owner: RootKey, nth: Int }
+
 /// An operation written per type. `Equal` and `Order` compare two values of a declared sum;
-/// `Contained` is one of a container's walks (`equal`, `ordered`, their loops).
+/// `Contained` is one of a container's walks (`equal`, `ordered`, their loops); `Dup` and `Release`
+/// count a value of the type once more and once fewer.
 pub type TypeOp =
   | Equal
   | Order
@@ -39,6 +46,8 @@ pub type TypeOp =
   | Copy
   | Lower
   | Lift
+  | Dup
+  | Release
 
 /// A function a call reaches: a root by its key, or the `n`th generic call of the body making the
 /// call, which the unit settles on a root once every body's needs are known.
@@ -46,6 +55,7 @@ pub type Callee = | Root(RootKey) | Generic(Int)
 
 derive bin for KeyArg
 derive bin for TypeOp
+derive bin for FnArg
 derive bin for RootKey
 
 /// The bytes a key is kept and looked up by: its encoding, which is only ever compared or decoded.
@@ -53,8 +63,9 @@ pub fn key_bytes(k: RootKey) -> Bytes / {abort.raise} = bin::encode(k, root_key_
 
 /// The name `k` prints as. A definition's own name; a specialisation's spells its type arguments and
 /// lent lambdas after an `@` (`m.f@Int,?|1=m.g:0`); a written root its operation and type after a
-/// `#` (`m.Shape#eq`, `m.equal#List<Int>`, `geo.reflect#geo.Shape`). Symbols and site ids are made
-/// from it, so it is the spelling roots had before they were keys.
+/// `#` (`m.Shape#eq`, `m.equal#List<Int>`, `geo.reflect#geo.Shape`), the type followed by its marks
+/// after a `^` where it has any (`m.lower#m.Box<Int>^1`). Symbols and site ids are made from it, so it
+/// is the spelling roots had before they were keys.
 pub fn root_name(k: RootKey) -> Bytes =
   match k {
     Named(n) -> n,
@@ -73,20 +84,21 @@ pub fn root_name(k: RootKey) -> Bytes =
               b"|",
               ascii_of_int(f.param),
               b"=",
-              f.owner,
+              root_name(f.owner),
               b":",
               ascii_of_int(f.nth),
             ])),
         ),
       ),
-    Written(w) -> match w.op {
-      Equal -> spelled_type(w.ty).concat(b"#eq"),
-      Order -> spelled_type(w.ty).concat(b"#cmp"),
-      _ ->
-        qualify(
-          type_module(w.ty, w.home),
-          Bytes::concat_all([op_name(w.op), b"#", spelled_type(w.ty)]),
-        ),
+    Written(w) -> {
+      let ty = if w.marks.len() == 0 { spelled_type(w.ty) } else {
+        Bytes::concat_all([spelled_type(w.ty), b"^", Bytes::join(w.marks.map(ascii_of_int), b",")])
+      };
+      match w.op {
+        Equal -> ty.concat(b"#eq"),
+        Order -> ty.concat(b"#cmp"),
+        _ -> qualify(type_module(w.ty, w.home), Bytes::concat_all([op_name(w.op), b"#", ty])),
+      }
     },
     Entered(n) -> n.concat(b"#entered"),
   }
@@ -106,6 +118,8 @@ fn op_name(op: TypeOp) -> Bytes =
     Copy -> b"copy",
     Lower -> b"lower",
     Lift -> b"lift",
+    Dup -> b"dup",
+    Release -> b"release",
   }
 
 /// The module a root's body is written in: its definition's, or where a written root says.
@@ -133,6 +147,29 @@ fn type_module(ty: Type, otherwise: Bytes) -> Bytes =
 pub fn definition_of(k: RootKey) -> Option<Bytes> =
   match k { Named(n) -> Some(n), At(a) -> Some(a.def), Written(_) -> None, Entered(n) -> Some(n) }
 
+/// The root whose text a root's failure sites count from, as the unit names it: its definition's,
+/// or a written root's own.
+pub fn sited_as(k: RootKey) -> Bytes = match definition_of(k) { Some(d) -> d, None -> root_name(k) }
+
+/// The type arguments a root is lowered at: a specialisation's, none for any other.
+pub fn key_types(k: RootKey) -> List<Type> / {abort.raise} =
+  match k {
+    At(a) ->
+      a.args.map(|x: KeyArg|
+        match x {
+          KeyType(t) -> t,
+          KeyLayout(s) -> panic(String::of_bytes_lossy(b"a root keyed by a layout: ".concat(s))),
+        }),
+    _ -> [],
+  }
+
+/// The lambdas a root runs in place of calls of the parameters they are handed as.
+pub fn key_lent(k: RootKey) -> List<FnArg> = match k { At(a) -> a.lent, _ -> [] }
+
+/// Definition `def` at the types `args`, running `lent` in place.
+pub fn at_key(def: Bytes, args: List<Type>, lent: List<FnArg>) -> RootKey =
+  At({ def: def, args: args.map(KeyType), lent: lent })
+
 test "a key prints as the name roots were spelled with before they were keys" {
   let int = TyCon({ name: b"Int", args: [] });
   let list = TyCon({ name: b"List", args: [int] });
@@ -142,23 +179,40 @@ test "a key prints as the name roots were spelled with before they were keys" {
       At({
         def: b"m.f",
         args: [KeyType(int), KeyType(TyCon({ name: b"_", args: [] }))],
-        lent: [{ param: 1, owner: b"m.g", nth: 0 }],
+        lent: [{ param: 1, owner: Named(b"m.g"), nth: 0 }],
       }),
     ),
     b"m.f@Int,_|1=m.g:0",
   );
+  // A lambda an owner at type arguments lends is spelled by that owner's own name.
   assert_eq(
-    root_name(Written({ op: Equal, ty: TyCon({ name: b"m.Shape", args: [] }), home: b"m" })),
+    root_name(at_key(b"m.f", [], [{ param: 0, owner: at_key(b"m.g", [int], []), nth: 2 }])),
+    b"m.f@|0=m.g@Int:2",
+  );
+  assert_eq(
+    root_name(
+      Written({ op: Equal, ty: TyCon({ name: b"m.Shape", args: [] }), home: b"m", marks: [] }),
+    ),
     b"m.Shape#eq",
   );
   assert_eq(
-    root_name(Written({ op: Contained(b"equal"), ty: list, home: b"m" })),
+    root_name(Written({ op: Contained(b"equal"), ty: list, home: b"m", marks: [] })),
     b"m.equal#List<Int>",
   );
-  assert_eq(root_name(Written({ op: Reflect, ty: list, home: b"m" })), b"m.reflect#List<Int>");
+  assert_eq(
+    root_name(Written({ op: Reflect, ty: list, home: b"m", marks: [] })),
+    b"m.reflect#List<Int>",
+  );
   // A type a module declares has its operations written in that module, whoever asks.
   assert_eq(
-    root_name(Written({ op: Reflect, ty: TyCon({ name: b"geo.Shape", args: [] }), home: b"app" })),
+    root_name(
+      Written({
+        op: Reflect,
+        ty: TyCon({ name: b"geo.Shape", args: [] }),
+        home: b"app",
+        marks: [],
+      }),
+    ),
     b"geo.reflect#geo.Shape",
   );
   assert_eq(root_name(Entered(b"m.main")), b"m.main#entered")
@@ -168,13 +222,20 @@ test "a root's module is read off its key, never off its name" {
   let shape = TyCon({ name: b"geo.Shape", args: [] });
   assert_eq(module_of(Named(b"app.cli.main")), b"app.cli");
   assert_eq(
-    module_of(At({ def: b"lib.h", args: [], lent: [{ param: 0, owner: b"app.g", nth: 1 }] })),
+    module_of(
+      At({ def: b"lib.h", args: [], lent: [{ param: 0, owner: Named(b"app.g"), nth: 1 }] }),
+    ),
     b"lib",
   );
-  assert_eq(module_of(Written({ op: Equal, ty: shape, home: b"app" })), b"geo");
-  assert_eq(module_of(Written({ op: Contained(b"equal"), ty: shape, home: b"app" })), b"geo");
+  assert_eq(module_of(Written({ op: Equal, ty: shape, home: b"app", marks: [] })), b"geo");
   assert_eq(
-    module_of(Written({ op: Shown, ty: TyCon({ name: b"List", args: [shape] }), home: b"app" })),
+    module_of(Written({ op: Contained(b"equal"), ty: shape, home: b"app", marks: [] })),
+    b"geo",
+  );
+  assert_eq(
+    module_of(
+      Written({ op: Shown, ty: TyCon({ name: b"List", args: [shape] }), home: b"app", marks: [] }),
+    ),
     b"app",
   )
 }
@@ -189,4 +250,34 @@ test "two keys are kept apart by their encoding, and one key always encodes alik
     match bin::decode(key_bytes(a), root_key_bin()) { Ok(k) -> Some(k), Err(_) -> None },
     Some(a),
   )
+}
+
+test "a specialisation's definition, types and lambdas are read off its key, an owner's among them" {
+  let int = TyCon({ name: b"Int", args: [] });
+  let owner = at_key(b"app.g", [TyCon({ name: b"List", args: [int] })], []);
+  let k = at_key(b"lib.h", [int], [{ param: 1, owner: owner, nth: 0 }]);
+  assert_eq(definition_of(k), Some(b"lib.h"));
+  assert_eq(sited_as(k), b"lib.h");
+  assert_eq(key_types(k), [int]);
+  assert_eq(key_lent(k).map(|f: FnArg| definition_of(f.owner)), [Some(b"app.g")]);
+  assert_eq(key_lent(k).map(|f: FnArg| key_types(f.owner)), [
+    [TyCon({ name: b"List", args: [int] })],
+  ]);
+  assert_eq(key_types(Named(b"lib.h")), []);
+  assert_eq(sited_as(Written({ op: Reflect, ty: int, home: b"m", marks: [] })), b"m.reflect#Int")
+}
+
+test "a written root's marks follow its type in its name, so keys differing only in marks differ" {
+  let int = TyCon({ name: b"Int", args: [] });
+  let pair = TyCon({ name: b"m.Pair", args: [int, int] });
+  let written = |op: TypeOp, marks: List<Int>|
+    Written({ op: op, ty: pair, home: b"app", marks: marks });
+  assert_eq(root_name(written(Lower, [1, 2])), b"m.lower#m.Pair<Int,Int>^1,2");
+  assert_eq(root_name(written(Equal, [0])), b"m.Pair<Int,Int>^0#eq");
+  assert_eq(root_name(written(Lift, [])), b"m.lift#m.Pair<Int,Int>");
+  assert_eq(root_name(written(Lift, [1])) == root_name(written(Lift, [2])), false);
+  assert_eq([Dup, Release].map(|op: TypeOp| root_name(written(op, []))), [
+    b"m.dup#m.Pair<Int,Int>",
+    b"m.release#m.Pair<Int,Int>",
+  ])
 }

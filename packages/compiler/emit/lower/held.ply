@@ -10,7 +10,8 @@ import emit.reps (Carrier, Whole, Fields, Cases, SumCase, SumCtor, FieldTy, TyRe
                   kind_of, carrier_of, carried_record, laid_of, record_flags, ctors_of, no_ctors)
 import emit.c (Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, Zeroed, Tagged)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases, Leaf,
-                 Path, PField, PNamed, PArg, PPlace)
+                 Path, PField, PNamed, PArg, PPlace, RSum, parts_count)
+import emit.layout (LSum, LWords, P, Always, Inline, words)
 import emit.lower.setting (Setting, ctor_named)
 
 /// How a value of `ty` is held in a body: a record of a field whose type lays it out as `record_held`
@@ -266,7 +267,32 @@ pub fn case_index(r: Rep, ctor: Bytes) -> Option<Int> =
     RCases(c) ->
       range(0, c.cases.len()).fold(None, |acc: Option<Int>, i: Int|
         match c.cases.at(i) { Some(x) -> if x.name == ctor { Some(i) } else { acc }, None -> acc }),
+    RSum(s) ->
+      range(0, s.cases.len()).fold(None, |acc: Option<Int>, i: Int|
+        if acc == None && s.cases.at(i) == Some(ctor) { Some(i) } else { acc }),
     _ -> None,
+  }
+
+/// How a value crosses a call: in its C values, or as the address of the caller's copy of it laid
+/// in place, the callee owning the counts in it.
+pub type Passing = | InWords | ByReference
+
+/// How a value held as `r` crosses a call, as a root's parameter or a closure's typed entry's: by
+/// reference where it is wider than `register_words()`. Until a printer passes by reference, every
+/// value crosses in its C values.
+pub fn passing(r: Rep) -> Passing = InWords
+
+/// How many words a caller's buffer holds for an answer held as `r`, which the callee writes past
+/// the one it returns: a wide value's other words and then its box word, none for one of one word.
+pub fn answer_buffer(r: Rep) -> Int =
+  match r {
+    RFlat(_) -> parts_count(r) - 1,
+    RCases(_) -> parts_count(r) - 1,
+    RSum(s) -> {
+      let n = words(LSum(s.laid));
+      if n <= 1 { 0 } else { n }
+    },
+    _ -> 0,
   }
 
 /// The leaves of every case of a sum held as `r` past its constructor's index, in order: each case's
@@ -547,4 +573,29 @@ test "a constructor's argument lies where its declaration lays it out" {
   assert_eq(arg_held(boxed, b"m.Big", 0), RWord);
   assert_eq(arg_path(boxed, b"m.Big", 0), PPlace(0));
   assert_eq(arg_path(s, b"Some", 0), PArg({ ctor: b"Some", at: 0 }))
+}
+
+test "an answer of one word needs no buffer, and a wider one its other words and its box word" {
+  let sum = |n: Int|
+    RSum({
+      laid: {
+        classes: range(0, n).map(|_: Int| P),
+        cases: [
+          {
+            test: Always,
+            payload: Inline({
+              offset: 0,
+              laid: LWords(range(0, n).map(|_: Int| P)),
+              stripped: None,
+            }),
+          },
+        ],
+      },
+      cases: [b"m.Only"],
+    });
+  assert_eq([RInt, RWord, sum(1)].map(answer_buffer), [0, 0, 0]);
+  assert_eq(answer_buffer(sum(3)), 3);
+  assert_eq(answer_buffer(RFlat([{ name: b"x", rep: RFloat }, { name: b"y", rep: RFloat }])), 2);
+  assert_eq(case_index(sum(1), b"m.Only"), Some(0));
+  assert_eq(case_index(sum(1), b"m.Other"), None)
 }
