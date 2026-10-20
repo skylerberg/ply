@@ -304,9 +304,9 @@ test "an operator is compiled at the type the checker settled, whatever holds it
   let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
   let has = |text: Bytes| out.map(|e: Emitted| e.text.index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None]);
-  // The runtime's operator reads its words untyped, and a builtin value is the runtime's too.
+  // The runtime's operator reads its words untyped; a builtin as a value is a lambda calling it.
   assert_eq(has(b"rt_binary_p"), [false, false, false]);
-  assert_eq(has(b"rt_builtin_value_p"), [false, false, false]);
+  assert_eq(has(b"_lambda0_value;"), [false, false, true]);
   assert_eq(has(b" > INT64_C(255)) { rt_overflow_p"), [true, false, false]);
   assert_eq(has(b"ply_add_ov("), [false, true, false]);
   assert_eq(has(b"(uint8_t)((uint64_t)(uint8_t)("), [false, false, true])
@@ -470,7 +470,7 @@ test "a lambda handed to a definition that calls it is run in place by the root 
   // The lambda runs in `each`'s loop: no call through the runtime, its product written there.
   match body(each) {
     Some(b) -> {
-      assert(own_code(b.text).index_of(b"rt_call_p") == None, None);
+      assert(!calls_a_value(own_code(b.text)), None);
       assert(own_code(b.text).index_of(b"ply_loop") != None, None)
     },
     None -> panic("no body for the specialisation"),
@@ -548,16 +548,16 @@ test "a function value a let binds to a lambda runs in place where it is called 
       None -> panic("no answer"),
     };
   // A call of the bound name, of another name bound to it, and of one a lambda captures.
-  assert(own_code(body(b"m.called").text).index_of(b"rt_call_p") == None, None);
-  assert(body(b"m.nested").text.index_of(b"rt_call_p") == None, None);
+  assert(!calls_a_value(own_code(body(b"m.called").text)), None);
+  assert(!calls_a_value(body(b"m.nested").text), None);
   // Handed on, it is the lambda its `let` wrote, which `walked` runs in its loop.
   assert_eq(body(b"m.handed").tables.generics.calls.map(|g: GenericCall| g.fns), [lent]);
-  assert(own_code(body(walked).text).index_of(b"rt_call_p") == None, None);
+  assert(!calls_a_value(own_code(body(walked).text)), None);
   assert(own_code(body(walked).text).index_of(b"ply_loop") != None, None);
   // A definition handed on by name is lent as the lambda around a call of it, which `walked`
   // makes directly, counting no step but the definition's own.
   assert_eq(body(b"m.halved").tables.generics.calls.map(|g: GenericCall| g.fns), [named]);
-  assert(own_code(body(halving).text).index_of(b"rt_call_p") == None, None);
+  assert(!calls_a_value(own_code(body(halving).text)), None);
   assert(own_code(body(halving).text).index_of(symbol_of(b"m.half")) != None, None);
   assert_eq(
     own_code(body(halving).text).split(b"ctx->ticks").len(),
@@ -589,7 +589,7 @@ test "a definition at type arguments that are all known lends its lambdas as a p
     };
   // `holds` at `Int` hands `some` its lambda, and `some` runs it in its loop.
   assert_eq(body(holds).tables.generics.calls.map(|g: GenericCall| g.fns), [lent]);
-  assert(own_code(body(some).text).index_of(b"rt_call_p") == None, None);
+  assert(!calls_a_value(own_code(body(some).text)), None);
   assert(own_code(body(some).text).index_of(b"rt_equal_p") == None, None);
   assert(own_code(body(some).text).index_of(b"ply_loop") != None, None);
   // Asked for alone, `some` still reads the lambda's operator at the type its owner is at.
@@ -1544,10 +1544,9 @@ fn answered_body(
     None -> panic(String::of_bytes_lossy(b"no answer for ".concat(name))),
   }
 
-/// Whether `code` calls a function value: through the runtime, or by the convention its
-/// descriptor names.
+/// Whether `code` calls a function value, through either entry its descriptor names.
 fn calls_a_value(code: Bytes) -> Bool =
-  code.index_of(b"rt_call_p(") != None || code.index_of(b")->flags & 16)") != None
+  code.index_of(b"->typed)(ctx") != None || code.index_of(b"->uniform(ctx") != None
 
 /// The root of `callee`, a `std.prelude` loop, that runs the lambda `owner` hands at `param`.
 fn prelude_loop(callee: Bytes, owner: Bytes, param: Int) -> RootKey =
@@ -1650,7 +1649,7 @@ test "two maps are compared by a root that walks `std.prelude`'s `Map::entries`"
   assert_eq(own_code(body.text).index_of(b"rt_equal_p"), None)
 }
 
-test "a lambda a call lends is laid out on the caller's stack with its entry, whoever the callee is" {
+test "a lambda a call lends is laid out on the caller's stack with its descriptor, whoever the callee is" {
   let src = Bytes::concat_all([
     b"fn apply(f: (Int) -> Int, x: Int) -> Int = f(x)\n",
     b"fn held(f: keep (Int) -> Int) -> List<(Int) -> Int> = [f]\n",
@@ -1665,17 +1664,18 @@ test "a lambda a call lends is laid out on the caller's stack with its entry, wh
   let answers = answers_of([b"m"], [src], [], names);
   let code = |name: Bytes| own_code(answered_body(answers, name).text);
   let has = |text: Bytes| names.map(|n: Bytes| code(n).index_of(text) != None);
-  // The object whole, header, entry and descriptor, which the callee may call however it settles;
-  // a lambda that captures nothing is the unit's one closure over it, made once.
-  assert_eq(has(b"_lambda0_entry, ply_imm((int64_t)(intptr_t)"), [true, true, false, false, false]);
-  assert_eq(has(b"o->flags = 16;"), [true, true, false, false, false]);
-  assert_eq(has(b"rt_closure_p("), [false, false, true, true, false]);
-  assert_eq(has(b"rt_lambda_value_p("), [false, false, false, false, true]);
+  // The block whole, its header counted by no one and its descriptor first, which the callee may
+  // call however it settles; one kept is a block of its own, and a lambda that captures nothing is
+  // the root's one block of it.
+  assert_eq(has(b"[] = {0, 0, (Word)(intptr_t)&"), [true, true, false, false, false]);
+  assert_eq(has(b"o->kind = PLY_KIND_REFUSED;"), [true, true, false, false, false]);
+  assert_eq(has(b" = rt_alloc_bytes_p(ctx, 32); ply_words("), [false, false, true, true, false]);
+  assert_eq(has(b"_lambda0_value;"), [false, false, false, false, true]);
   // The caller lets go of the captures it laid out, its own `t1`, once the call is done.
   assert_eq(has(b"\n  ply_dec(ctx, t1);\n"), [true, true, false, false, false])
 }
 
-test "a lambda a `std.prelude` function hands on to a native is laid out with the entry it calls" {
+test "a lambda a `std.prelude` function hands on to a native is laid out with the descriptor it calls" {
   let src = Bytes::concat_all([
     b"pub fn guarded(f: (Int) -> Int) -> Int = bracket(|| 1, |_: Int| (), f)\n",
     b"pub fn raised(n: Int) -> Int = guarded(|v: Int| v + n)\n",
@@ -1686,8 +1686,8 @@ test "a lambda a `std.prelude` function hands on to a native is laid out with th
   ]);
   let code = |name: Bytes| own_code(answered_body(answers, name).text);
   assert(code(b"std.prelude.guarded").index_of(b"builtin_bracket_p(ctx") != None, None);
-  assert(code(b"std.prelude.raised").index_of(b"_lambda0_entry, ply_imm(") != None, None);
-  assert(code(b"std.prelude.raised").index_of(b"rt_closure_p(") == None, None)
+  assert(code(b"std.prelude.raised").index_of(b"[] = {0, 0, (Word)(intptr_t)&") != None, None);
+  assert(code(b"std.prelude.raised").index_of(b"rt_alloc_bytes_p(") == None, None)
 }
 
 test "a lambda that captures nothing is one value made once, wherever it goes" {
@@ -1702,8 +1702,8 @@ test "a lambda that captures nothing is one value made once, wherever it goes" {
     [e, ..] -> own_code(e.text),
     [] -> b"",
   };
-  assert(text.index_of(b"rt_closure_p") == None, Some(String::of_bytes_lossy(text)));
-  assert_eq(text.split(b"rt_lambda_value_p(").len(), 3)
+  assert(text.index_of(b"_desc;") == None, Some(String::of_bytes_lossy(text)));
+  assert_eq(text.split(b"extern PlyFnBlock ").len(), 3)
 }
 
 test "a lambda inside a lambda another root runs is lent as its owner's" {
@@ -1724,7 +1724,7 @@ test "a lambda inside a lambda another root runs is lent as its owner's" {
     ]),
     None,
   );
-  assert(own_code(body.text).index_of(b"rt_call_p") == None, None)
+  assert(!calls_a_value(own_code(body.text)), None)
 }
 
 test "strings and byte strings are compared by their bytes where they lie" {
