@@ -4,11 +4,13 @@
 
 use super::frames::{boxed, count, dup, every_kind, freed, release_box};
 use crate::bare::{context_of, helper};
-use ply_compiled::emitted::Block;
+use ply_compiled::emitted::{Block, Handed, PlyFnDesc};
 use ply_compiled::frames::{PlyFrame, held_across};
-use ply_compiled::heap::{Word, imm, imm_value, inc};
-use ply_compiled::native::Answered;
-use ply_compiled::rt::{Ctx, rt_call, rt_closure, rt_handle_detached, rt_perform};
+use ply_compiled::heap::{KIND_REFUSED, Word, imm, imm_value, inc, kind};
+use ply_compiled::native::{Answered, I64};
+use ply_compiled::rt::{
+    Ctx, rt_call, rt_closure, rt_handle_detached, rt_handle_install_detached, rt_perform,
+};
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -37,6 +39,10 @@ thread_local! {
     static SEEN: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     /// Whether each clause ran on a stack whose chain was null.
     static CLAUSES_UNRECORDED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    /// What each continuation a clause emitted code made was handed says of itself: whether its
+    /// block is of the refused kind, whether its descriptor has no typed entry, and whether sharing
+    /// and keeping it answer 0.
+    static TOKENS: RefCell<Vec<(bool, bool, bool)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn seen(n: u32) {
@@ -280,6 +286,124 @@ fn an_entry_ending_with_a_body_suspended_gives_back_what_it_held_once() {
             assert!(taken(&SEEN).is_empty(), "a frame ran past the stop");
             assert_eq!(freed(), HELD, "resumes {resumes}");
             assert_eq!(text_holders(), 1);
+        }
+    }
+}
+
+type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
+type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
+
+/// A closure emitted code made over no captures: a block of its descriptor alone.
+const EMITTED: Word = 16 + 8;
+
+fn emitted_closure(ctx: *mut Ctx, desc: &'static PlyFnDesc) -> Word {
+    let w = unsafe { helper::<Alloc>("rt_alloc_bytes")(ctx, EMITTED) };
+    unsafe { *(w as *mut Word).add(2) = (&raw const *desc) as Word };
+    w
+}
+
+unsafe extern "C" fn emitted_released(ctx: *mut Ctx, h: Handed) -> Word {
+    let w = unsafe { std::mem::transmute::<Handed, Word>(h) };
+    unsafe { helper::<Free>("rt_free")(ctx, w, EMITTED) };
+    0
+}
+
+unsafe extern "C" fn stays_here(_ctx: *mut Ctx, _w: Word) -> Word {
+    0
+}
+
+unsafe extern "C" fn body_uniform(ctx: *mut Ctx, _block: Word, _args: *const Word) -> Word {
+    unsafe { body(ctx, std::ptr::null()) }
+}
+
+const fn emitted_desc(
+    uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word,
+) -> PlyFnDesc {
+    PlyFnDesc {
+        uniform,
+        typed: None,
+        convention: 0,
+        release: emitted_released,
+        share: stays_here,
+        keep: stays_here,
+    }
+}
+
+static BODY_EMITTED: PlyFnDesc = emitted_desc(body_uniform);
+static TWICE_EMITTED: PlyFnDesc = emitted_desc(twice_emitted);
+static NEVER_EMITTED: PlyFnDesc = emitted_desc(never_emitted);
+
+/// Notes what continuation `k` says of itself through its block and descriptor.
+unsafe fn token_seen(ctx: *mut Ctx, k: Word) {
+    let desc = unsafe { &**(k as *const *const PlyFnDesc).byte_add(16) };
+    let crosses = unsafe { (desc.share)(ctx, k) != 0 || (desc.keep)(ctx, k) != 0 };
+    let seen = (kind(k) == KIND_REFUSED, desc.typed.is_none(), !crosses);
+    TOKENS.with(|t| t.borrow_mut().push(seen));
+}
+
+/// `amb.flip() resume k -> k(true) * 10 + k(false)`, `k` applied and let go of as emitted code
+/// applies and lets go of a function value: through its descriptor.
+unsafe extern "C" fn twice_emitted(ctx: *mut Ctx, _block: Word, args: *const Word) -> Word {
+    unsafe {
+        token_seen(ctx, *args);
+        let k = Block::of(*args);
+        let first = k.call(ctx, &[imm(1)]);
+        let second = if (*ctx).failed == 0 {
+            k.call(ctx, &[imm(0)])
+        } else {
+            0
+        };
+        k.let_go_function(ctx);
+        if (*ctx).failed != 0 {
+            return 0;
+        }
+        imm(imm_value(first) * 10 + imm_value(second))
+    }
+}
+
+/// `amb.flip() resume k -> 42`, `k` let go of through its descriptor.
+unsafe extern "C" fn never_emitted(ctx: *mut Ctx, _block: Word, args: *const Word) -> Word {
+    unsafe {
+        token_seen(ctx, *args);
+        Block::of(*args).let_go_function(ctx);
+    }
+    imm(42)
+}
+
+/// [`handled`] with a body and a clause emitted code made.
+unsafe fn handled_emitted(ctx: *mut Ctx, clause: &'static PlyFnDesc, resumes: i64) -> Word {
+    let body = emitted_closure(ctx, &BODY_EMITTED);
+    let clause = emitted_closure(ctx, clause);
+    let row: [Word; 6] = [AMB, -1, FLIP, clause, resumes, 0];
+    let answer = unsafe {
+        rt_handle_install_detached(ctx, row.as_ptr(), I64(1), Handed::of(0), Block::of(body))
+    };
+    unsafe { std::mem::transmute::<Handed, Word>(answer) }
+}
+
+/// A clause emitted code made is handed a continuation it applies and lets go of through the
+/// runtime's static descriptor: a block of the refused kind, with no typed entry, crossing nowhere.
+/// Resumed twice, each run finds what the body held; let go of unresumed, the body is abandoned;
+/// either way everything comes back once.
+#[test]
+fn an_emitted_clause_resumes_and_lets_go_of_its_continuation_through_its_descriptor() {
+    let mut owned = unit();
+    let ctx = &raw mut owned;
+    for (clause, answer, seen) in [
+        (&TWICE_EMITTED, 12, vec![2; 10]),
+        (&NEVER_EMITTED, 42, vec![]),
+    ] {
+        unsafe {
+            (*ctx).begin(1_000);
+            let r = handled_emitted(ctx, clause, AGAIN);
+            assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
+            assert_eq!(imm_value(r), answer);
+            assert_eq!(taken(&SEEN), seen);
+            assert_eq!(taken(&TOKENS), [(true, true, true)]);
+            assert_eq!(freed(), HELD, "answer {answer}");
+            assert_eq!(text_holders(), 1);
+            assert_eq!((*ctx).heap.live(), 0, "answer {answer}");
+            (*ctx).end();
         }
     }
 }
