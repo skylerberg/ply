@@ -17,15 +17,16 @@ import emit.layout (SumLaid, CaseLaid, CaseTest, Always, WordIs, WordOutside, Lo
                     header_bytes, str_laid, layouts, columns_laid)
 import emit.reps (Ctors, no_ctors)
 import emit.tir (Rep, RInt, RWord, RMaybe, RTagged, RFlat, RToken, RSum, Leaf, Var, Inst, Inc, Dec,
-                 Reset, Free, Opened, AInt, AVar, Spine, counted, parts_of, var_said)
+                 Reset, Free, Opened, AInt, AVar, Spine, RUnit, counted, parts_of, var_said)
+import emit.lower.held (values_of, unboxed)
 import emit.pieces (Piece, Text, Hole, Symbol, spelled)
 import emit.release (Part, WordAt, ByCase, Counted, Object, CaseBox, SumWord, IntWord, Through,
                      RuntimeHandle, Opening, InBox, Holding, StrBlock, ListOf, NodeOf, MapOf,
                      PairsOf, ArrayOf, ColumnsOf, ScalarBox, FnBlock, HandleBlock, Held, held_parts,
                      opening, stored_parts, held_root, case_root, boxed_alone, drop_of, root_of,
                      case_blocks)
-import emit.print.text (Printing, Place, line, name_of, named, printing, part_names, part_name,
-                        declared_at, pad, slot, assigned, arg_text, unprinted)
+import emit.print.text (Printing, Place, line, name_of, named, printing, part_names, declared_at,
+                        pad, slot, assigned, arg_text, unprinted)
 import emit.print.made (head_types)
 
 /// The C a failure holding `unwind` runs: a jump to the chain of tails that lets go of each count it
@@ -176,13 +177,13 @@ fn let_go(x: Bytes, r: Rep) -> Bytes =
     b" ",
   )
 
-/// The C names of the parts of a value named `x` held as `r` that hold a count.
+/// The C names of the values of a value named `x` held as `r` that hold a count.
 fn counted_parts(x: Bytes, r: Rep) -> List<Bytes> = {
-  let parts = parts_of(r);
+  let values = values_of(r);
   let names = part_names(x, r);
-  range(0, parts.len()).fold([], |acc: List<Bytes>, k: Int|
-    match parts.at(k) {
-      Some(part) -> if counted(part) { match names.at(k) { Some(n) -> acc.push(n), None -> acc } }
+  range(0, values.len()).fold([], |acc: List<Bytes>, k: Int|
+    match values.at(k) {
+      Some(value) -> if counted(value) { match names.at(k) { Some(n) -> acc.push(n), None -> acc } }
       else { acc },
       None -> acc,
     })
@@ -199,11 +200,11 @@ pub type Said = { pr: Printing, out: List<Piece> }
 pub fn count_classed(p: Place, pr: Printing, ctors: Ctors, i: Inst) -> Printing / {abort.raise} =
   match i {
     Inc(n) -> {
-      let once = duped(ctors, n.var.ty, n.var.rep, var_values(name_of(pr, n.var), n.var.rep));
+      let once = duped(ctors, n.var.ty, n.var.rep, part_names(name_of(pr, n.var), n.var.rep));
       if once.len() == 0 { pr }
       else { line(pr, p.depth, Bytes::join(range(0, n.n).map(|_: Int| once), b" ")) }
     },
-    Dec(v) -> stated(p.depth, released(pr, ctors, v.ty, v.rep, var_values(name_of(pr, v), v.rep))),
+    Dec(v) -> stated(p.depth, released(pr, ctors, v.ty, v.rep, part_names(name_of(pr, v), v.rep))),
     Reset(r) ->
       reset_boxed(
         pr,
@@ -250,44 +251,25 @@ fn stated(depth: Int, s: Said) -> Printing =
 fn spaced(a: List<Piece>, b: List<Piece>) -> List<Piece> =
   if a.len() == 0 { b } else if b.len() == 0 { a } else { a.push(Text(b" ")).concat(b) }
 
-/// How many C values each part of a value held as `r` takes, in `parts_of(r)`'s order: a sum wider
-/// than a word its words and then its box word, but a flat record's sum leaf, which the record's box
-/// holds, its words alone.
+/// How many C values each part of a value held as `r` takes, in `parts_of(r)`'s order, as
+/// `values_of(r)` lays them: a sum its words and then, past one, its box word, a flat record's leaf
+/// its values without a box word of its own.
 fn part_widths(r: Rep) -> List<Int> =
   match r {
-    RSum(s) -> [sum_width(s.laid, true)],
-    RFlat(ls) ->
-      ls.map(|l: Leaf| match l.rep { RSum(s) -> sum_width(s.laid, false), _ -> 1 }).push(1),
+    RFlat(ls) -> ls.map(|l: Leaf| unboxed(l.rep).len()).push(1),
+    RSum(_) -> [values_of(r).len()],
+    RUnit -> [0],
     _ -> parts_of(r).map(|_: Rep| 1),
   }
 
-fn sum_width(s: SumLaid, boxed: Bool) -> Int = {
-  let n = words(LSum(s));
-  if n <= 1 { 1 } else if boxed { n + 1 } else { n }
-}
-
-/// The C values of a value named `name` held as `r`, as `part_widths` lays them: a part of one value
-/// its part's name, a wider one `<part>_<k>` for each.
-fn var_values(name: Bytes, r: Rep) -> List<Bytes> = {
-  let names = part_names(name, r);
-  let widths = part_widths(r);
-  range(0, widths.len()).fold([], |acc: List<Bytes>, k: Int|
-    match ((names.at(k), widths.at(k))) {
-      (Some(n), Some(w)) -> if w == 1 { acc.push(n) }
-      else { acc.concat(range(0, w).map(|j: Int| part_name(n, j))) },
-      _ -> acc,
-    })
-}
-
-/// `values`, a value's C values held as `r` in `part_widths`' order, as each part's.
+/// `values`, a value's C values held as `r` in `values_of(r)`'s order, as each part's.
 fn per_part(r: Rep, values: List<Bytes>) -> List<List<Bytes>> =
   part_widths(r).fold({ at: 0, out: [] }, |acc: { at: Int, out: List<List<Bytes>> }, n: Int|
     { at: acc.at + n, out: acc.out.push(values.drop(acc.at).take(n)) }).out
 
-/// The C letting go of a value of `ty` held as `r` whose C values are `values`, each part's in
-/// `parts_of(r)`'s order (a sum wider than a word its words, then its box word but inside a flat
-/// record): each counted word of each part, each drop root it names a hole noted among `pr`'s
-/// calls; a reuse token's block freed by its size.
+/// The C letting go of a value of `ty` held as `r` whose C values are `values`, in `values_of(r)`'s
+/// order: each counted word of each part, each drop root it names a hole noted among `pr`'s calls; a
+/// reuse token's block freed by its size.
 pub fn released(
   pr: Printing,
   ctors: Ctors,
@@ -598,7 +580,7 @@ pub fn opened_block(
         (Some(w), Some(h)) -> {
           let n = named(q, w);
           let from = slots_of(x, h.at, w.rep, true);
-          let into = var_values(n.name, w.rep);
+          let into = part_names(n.name, w.rep);
           line(
             n.pr,
             depth,
@@ -2029,14 +2011,13 @@ test "a box opened reads its counted words, a wide sum's with its box word 0, an
     b"  Word t1 = ply_words(p0)[0];\n  Word t2_0 = ply_words(p0)[2]; Word t2_1 = ply_words(p0)[3]; Word t2_2 = 0;\n  ply_free(ctx, p0, 48);\n",
   );
   assert_eq(name_of(opened, b), b"t2");
-  assert_eq(var_values(b"t2", s), [b"t2_0", b"t2_1", b"t2_2"]);
+  assert_eq(part_names(b"t2", s), [b"t2_0", b"t2_1", b"t2_2"]);
   // Inside a flat record a sum's words are its own, the record's box after the leaves.
-  assert_eq(var_values(b"t3", RFlat([{ name: b"a", rep: s }, { name: b"n", rep: RInt }])), [
-    b"t3_0_0",
-    b"t3_0_1",
-    b"t3_1",
-    b"t3_2",
-  ])
+  let flat = RFlat([{ name: b"a", rep: s }, { name: b"n", rep: RInt }]);
+  let names = part_names(b"t3", flat);
+  assert_eq(names, [b"t3_0", b"t3_1", b"t3_2", b"t3_3"]);
+  assert_eq(per_part(flat, names), [[b"t3_0", b"t3_1"], [b"t3_2"], [b"t3_3"]]);
+  assert_eq(per_part(s, part_names(b"t2", s)), [[b"t2_0", b"t2_1", b"t2_2"]])
 }
 
 test "a list opened lets go of its tail's items and its trie, and gives itself back by its room" {
@@ -2113,7 +2094,7 @@ test "a value's counts read its type's own layout and word form" {
     duped(no_ctors(), TyCon({ name: b"Int", args: [] }), RWord, [b"t3"]),
     b"if (!(t3 & 7)) ply_dup(t3);",
   );
-  assert_eq(var_values(b"t4", RWord), [b"t4"])
+  assert_eq(part_names(b"t4", RWord), [b"t4"])
 }
 
 test "a last holder's test takes the count and answers the value only where it was the last" {
