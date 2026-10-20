@@ -1,0 +1,401 @@
+//! Which node of its item each node is. Resolution numbers every node of a definition, a test or a
+//! law in one walk of it, so a check files what it found of a node under the item and the number,
+//! which an edit to another item, a cut of the module or a check of part of it never moves.
+
+import syntax.parsing (Span, Ident, site_digit, minted, minted_too_deep, role_try_return,
+                       role_detached, role_update_copy, role_member_default)
+import syntax.items (Module, Item, IFn, ITest, ILaw, ISchema, IExtern, FnDef, Binder, SpecClause,
+                     parse)
+import expand.rewrite.shared (picked_in)
+import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
+                     ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
+                     EParallel, ETagged, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign,
+                     Param, NamedArg, MatchArm, HandleClause, ReturnClause, HandlerVar, RecField,
+                     Hole, expr_span)
+import syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad)
+
+/// `m` with each of its items numbered.
+pub fn numbered_module(m: Module) -> Module / {abort.raise} = { ..m, items: m.items.map(numbered) }
+
+/// `item` with each node of it numbered from 1 in a walk of it: every expression, pattern,
+/// statement, arm, clause, `return` clause and handler variable, a law's binders, the texts of a
+/// tagged literal, and the two words a test over cases writes. A definition's parameters' defaults
+/// come first, then its body, its clauses and its measure; a test's cases, then its body; a law's
+/// binders, then its guard and its body. An identifier, a parameter and the item keep no number.
+/// Raises on an item of more nodes than a minted site leaves room for.
+pub fn numbered(item: Item) -> Item / {abort.raise} = {
+  let out: { item: Item, n: Int } = match item {
+    IFn(d) -> {
+      let f = numbered_fn(d, 1);
+      { item: IFn(f.d), n: f.n }
+    },
+    ITest(d) -> match d.cases {
+      None -> {
+        let b: Num = num_expr(d.body, 1);
+        { item: ITest({ ..d, body: b.e }), n: b.n }
+      },
+      Some(c) -> {
+        let table: Num = num_expr(c.table, 3);
+        let label: Num = num_expr(c.label, table.n);
+        let b: Num = num_expr(d.body, label.n);
+        {
+          item: ITest({
+            ..d,
+            cases: Some({
+              ..c,
+              for_span: at(c.for_span, 1),
+              in_span: at(c.in_span, 2),
+              table: table.e,
+              label: label.e,
+            }),
+            body: b.e,
+          }),
+          n: b.n,
+        }
+      },
+    },
+    ILaw(d) -> {
+      let bs = binders(d.binders, 1);
+      let g: { e: Option<Expr>, n: Int } = maybe(d.guard, bs.n);
+      let b: Num = num_expr(d.body, g.n);
+      { item: ILaw({ ..d, binders: bs.bs, guard: g.e, body: b.e }), n: b.n }
+    },
+    ISchema(d) -> {
+      let ps = binders(d.params, 1);
+      let bs = binders(d.binders, ps.n);
+      let g: { e: Option<Expr>, n: Int } = maybe(d.guard, bs.n);
+      let b: Num = num_expr(d.body, g.n);
+      { item: ISchema({ ..d, params: ps.bs, binders: bs.bs, guard: g.e, body: b.e }), n: b.n }
+    },
+    IExtern(d) -> {
+      let ps: Params = params(d.params, 1);
+      let sp = clauses(d.spec, ps.n);
+      { item: IExtern({ ..d, params: ps.ps, spec: sp.cs }), n: sp.n }
+    },
+    _ -> { item: item, n: 1 },
+  };
+  if out.n >= site_digit() { panic("an item of more nodes than its sites can number") }
+  else { out.item }
+}
+
+type Num = { e: Expr, n: Int }
+
+type Nums = { es: List<Expr>, n: Int }
+
+type NumPat = { p: Pattern, n: Int }
+
+type Params = { ps: List<Param>, n: Int }
+
+fn at(s: Span, n: Int) -> Span = { ..s, site: n }
+
+fn numbered_fn(d: FnDef, n: Int) -> { d: FnDef, n: Int } / {abort.raise} = {
+  let ps: Params = params(d.params, n);
+  let b: Num = num_expr(d.body, ps.n);
+  let sp = clauses(d.spec, b.n);
+  let m: { e: Option<Expr>, n: Int } = maybe(d.decreases, sp.n);
+  { d: { ..d, params: ps.ps, body: b.e, spec: sp.cs, decreases: m.e }, n: m.n }
+}
+
+fn params(ps: List<Param>, n: Int) -> Params / {abort.raise} =
+  ps.fold({ ps: [], n: n }, |acc: Params, p: Param| {
+    let d: { e: Option<Expr>, n: Int } = maybe(p.default, acc.n);
+    { ps: acc.ps.push({ ..p, default: d.e }), n: d.n }
+  })
+
+fn clauses(cs: List<SpecClause>, n: Int) -> { cs: List<SpecClause>, n: Int } / {abort.raise} =
+  cs.fold({ cs: [], n: n }, |acc: { cs: List<SpecClause>, n: Int }, c: SpecClause| {
+    let o: Num = num_expr(c.expr, acc.n);
+    { cs: acc.cs.push({ ..c, expr: o.e }), n: o.n }
+  })
+
+fn binders(bs: List<Binder>, n: Int) -> { bs: List<Binder>, n: Int } =
+  bs.fold({ bs: [], n: n }, |acc: { bs: List<Binder>, n: Int }, b: Binder|
+    { bs: acc.bs.push({ ..b, span: at(b.span, acc.n) }), n: acc.n + 1 })
+
+fn maybe(x: Option<Expr>, n: Int) -> { e: Option<Expr>, n: Int } / {abort.raise} =
+  match x {
+    Some(y) -> {
+      let o: Num = num_expr(y, n);
+      { e: Some(o.e), n: o.n }
+    },
+    None -> { e: None, n: n },
+  }
+
+/// `e` numbered from `n` on, and the number after its last node.
+fn num_expr(e: Expr, n: Int) -> Num / {abort.raise} = {
+  let each = |xs: List<Expr>, from: Int|
+    xs.fold({ es: [], n: from }, |acc: Nums, x: Expr| {
+      let o: Num = num_expr(x, acc.n);
+      { es: acc.es.push(o.e), n: o.n }
+    });
+  let opt = |x: Option<Expr>, from: Int|
+    match x {
+      Some(y) -> {
+        let o: Num = num_expr(y, from);
+        { e: Some(o.e), n: o.n }
+      },
+      None -> { e: None, n: from },
+    };
+  let fields = |fs: List<RecField>, from: Int|
+    fs.fold({ fs: [], n: from }, |acc: { fs: List<RecField>, n: Int }, f: RecField| {
+      let v: Num = num_expr(f.value, acc.n);
+      { fs: acc.fs.push({ ..f, value: v.e }), n: v.n }
+    });
+  match e {
+    ELit(l) -> { e: ELit({ ..l, span: at(l.span, n) }), n: n + 1 },
+    EVar(v) -> { e: EVar({ ..v, span: at(v.span, n) }), n: n + 1 },
+    EBad(b) -> { e: EBad({ span: at(b.span, n) }), n: n + 1 },
+    EBinary(b) -> {
+      let l: Num = num_expr(b.lhs, n + 1);
+      let r: Num = num_expr(b.rhs, l.n);
+      { e: EBinary({ ..b, span: at(b.span, n), lhs: l.e, rhs: r.e }), n: r.n }
+    },
+    EUnary(u) -> {
+      let o: Num = num_expr(u.operand, n + 1);
+      { e: EUnary({ ..u, span: at(u.span, n), operand: o.e }), n: o.n }
+    },
+    ELambda(l) -> {
+      let ps: Params = params(l.params, n + 1);
+      let b: Num = num_expr(l.body, ps.n);
+      { e: ELambda({ ..l, span: at(l.span, n), params: ps.ps, body: b.e }), n: b.n }
+    },
+    EApp(a) -> {
+      let f: Num = num_expr(a.func, n + 1);
+      let xs: Nums = each(a.args, f.n);
+      let ns = a.named.fold(
+        { ns: [], n: xs.n },
+        |acc: { ns: List<NamedArg>, n: Int }, arg: NamedArg| {
+          let o: Num = num_expr(arg.value, acc.n);
+          { ns: acc.ns.push({ ..arg, value: o.e }), n: o.n }
+        },
+      );
+      { e: EApp({ ..a, span: at(a.span, n), func: f.e, args: xs.es, named: ns.ns }), n: ns.n }
+    },
+    EIf(i) -> {
+      let c: Num = num_expr(i.cond, n + 1);
+      let t: Num = num_expr(i.then_branch, c.n);
+      let el: Num = num_expr(i.else_branch, t.n);
+      { e: EIf({ span: at(i.span, n), cond: c.e, then_branch: t.e, else_branch: el.e }), n: el.n }
+    },
+    EMatch(m) -> {
+      let sc: Num = num_expr(m.scrutinee, n + 1);
+      let arms = m.arms.fold(
+        { arms: [], n: sc.n },
+        |acc: { arms: List<MatchArm>, n: Int }, arm: MatchArm| {
+          let pt: NumPat = num_pat(arm.pat, acc.n + 1);
+          let g: { e: Option<Expr>, n: Int } = opt(arm.guard, pt.n);
+          let b: Num = num_expr(arm.body, g.n);
+          {
+            arms: acc.arms.push({ pat: pt.p, guard: g.e, body: b.e, span: at(arm.span, acc.n) }),
+            n: b.n,
+          }
+        },
+      );
+      { e: EMatch({ span: at(m.span, n), scrutinee: sc.e, arms: arms.arms }), n: arms.n }
+    },
+    EBlock(b) -> {
+      let st = b.stmts.fold(
+        { stmts: [], n: n + 1 },
+        |acc: { stmts: List<Stmt>, n: Int }, stmt: Stmt|
+          match stmt {
+            SLet(l) -> {
+              let pt: NumPat = num_pat(l.pat, acc.n + 1);
+              let v: Num = num_expr(l.value, pt.n);
+              {
+                stmts: acc.stmts.push(
+                  SLet({ ..l, span: at(l.span, acc.n), pat: pt.p, value: v.e }),
+                ),
+                n: v.n,
+              }
+            },
+            SLetElse(l) -> {
+              let pt: NumPat = num_pat(l.pat, acc.n + 1);
+              let v: Num = num_expr(l.value, pt.n);
+              let fb: Num = num_expr(l.fallback, v.n);
+              {
+                stmts: acc.stmts.push(
+                  SLetElse({ ..l, span: at(l.span, acc.n), pat: pt.p, value: v.e, fallback: fb.e }),
+                ),
+                n: fb.n,
+              }
+            },
+            SExpr(x) -> {
+              let o: Num = num_expr(x, acc.n);
+              { stmts: acc.stmts.push(SExpr(o.e)), n: o.n }
+            },
+            SAssign(x) -> {
+              let v: Num = num_expr(x.value, acc.n + 1);
+              {
+                stmts: acc.stmts.push(SAssign({ ..x, span: at(x.span, acc.n), value: v.e })),
+                n: v.n,
+              }
+            },
+          },
+      );
+      let t: { e: Option<Expr>, n: Int } = opt(b.tail, st.n);
+      { e: EBlock({ span: at(b.span, n), tail: t.e, stmts: st.stmts }), n: t.n }
+    },
+    ERecord(r) -> {
+      let fs: { fs: List<RecField>, n: Int } = fields(r.fields, n + 1);
+      { e: ERecord({ span: at(r.span, n), fields: fs.fs }), n: fs.n }
+    },
+    ERecordUpdate(r) -> {
+      let base: Num = num_expr(r.base, n + 1);
+      let fs: { fs: List<RecField>, n: Int } = fields(r.fields, base.n);
+      { e: ERecordUpdate({ span: at(r.span, n), base: base.e, fields: fs.fs }), n: fs.n }
+    },
+    ETry(t) -> {
+      let o: Num = num_expr(t.operand, n + 1);
+      { e: ETry({ span: at(t.span, n), operand: o.e }), n: o.n }
+    },
+    EField(f) -> {
+      let base: Num = num_expr(f.base, n + 1);
+      { e: EField({ ..f, span: at(f.span, n), base: base.e }), n: base.n }
+    },
+    EList(l) -> {
+      let xs: Nums = each(l.items, n + 1);
+      { e: EList({ span: at(l.span, n), items: xs.es }), n: xs.n }
+    },
+    EPerform(p) -> {
+      let xs: Nums = each(p.args, n + 1);
+      { e: EPerform({ ..p, span: at(p.span, n), args: xs.es }), n: xs.n }
+    },
+    EHandle(h) -> {
+      let vs = h.vars.fold(
+        { vs: [], n: n + 1 },
+        |acc: { vs: List<HandlerVar>, n: Int }, v: HandlerVar| {
+          let o: Num = num_expr(v.init, acc.n + 1);
+          { vs: acc.vs.push({ ..v, span: at(v.span, acc.n), init: o.e }), n: o.n }
+        },
+      );
+      let body: Num = num_expr(h.body, vs.n);
+      let cs = h.clauses.fold(
+        { cs: [], n: body.n },
+        |acc: { cs: List<HandleClause>, n: Int }, c: HandleClause| {
+          let o: Num = num_expr(c.body, acc.n + 1);
+          { cs: acc.cs.push({ ..c, span: at(c.span, acc.n), body: o.e }), n: o.n }
+        },
+      );
+      let ret: { r: Option<ReturnClause>, n: Int } = match h.ret {
+        Some(r) -> {
+          let o: Num = num_expr(r.body, cs.n + 1);
+          { r: Some({ ..r, span: at(r.span, cs.n), body: o.e }), n: o.n }
+        },
+        None -> { r: None, n: cs.n },
+      };
+      {
+        e: EHandle({ span: at(h.span, n), body: body.e, ret: ret.r, clauses: cs.cs, vars: vs.vs }),
+        n: ret.n,
+      }
+    },
+    EWithHold(w) -> {
+      let a: Num = num_expr(w.acquire, n + 1);
+      let r: Num = num_expr(w.release, a.n);
+      let b: Num = num_expr(w.body, r.n);
+      { e: EWithHold({ ..w, span: at(w.span, n), acquire: a.e, release: r.e, body: b.e }), n: b.n }
+    },
+    ESimulate(x) -> {
+      let b: Num = num_expr(x.body, n + 1);
+      { e: ESimulate({ span: at(x.span, n), body: b.e }), n: b.n }
+    },
+    EParallel(x) -> {
+      let xs: Nums = each(x.branches, n + 1);
+      { e: EParallel({ span: at(x.span, n), branches: xs.es }), n: xs.n }
+    },
+    ETryBlock(t) -> {
+      let b: Num = num_expr(t.body, n + 1);
+      { e: ETryBlock({ ..t, span: at(t.span, n), body: b.e }), n: b.n }
+    },
+    // Each text a tagged literal writes is a node its call is written with.
+    ETagged(t) -> {
+      let hs = t.holes.fold({ hs: [], n: n + 2 }, |acc: { hs: List<Hole>, n: Int }, h: Hole| {
+        let o: Num = num_expr(h.value, acc.n + 1);
+        { hs: acc.hs.push({ ..h, quoted: at(h.quoted, acc.n), value: o.e }), n: o.n }
+      });
+      {
+        e: ETagged({ ..t, span: at(t.span, n), quoted: at(t.quoted, n + 1), holes: hs.hs }),
+        n: hs.n,
+      }
+    },
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+/// The site of each expression of the item named `name` of `src`, numbered, in a walk of it.
+fn sites_of(src: Bytes, name: Bytes) -> List<Int> / {abort.raise} = {
+  let m = numbered_module(parse(src).node);
+  picked_in({ ..m, items: m.items.filter(|item: Item| item_named(item, name)) }, |_: Expr|
+    true).map(|e: Expr| expr_span(e).site)
+}
+
+fn item_named(item: Item, name: Bytes) -> Bool =
+  match item { IFn(d) -> d.name.name == name, ITest(t) -> t.name == name, _ -> false }
+
+test "an item's sites are its own: an edit to another item, or a cut of its module, moves none" {
+  let g = b"fn g(y: Int) -> Int = if y > 0 { y } else { 0 - y }\n";
+  let before = sites_of(Bytes::concat_all([b"fn f(x: Int) -> Int = x + 1\n", g]), b"g");
+  assert(before.len() > 4);
+  assert_eq(before.filter(|s: Int| s == 0), []);
+  assert_eq(before.unique().len(), before.len());
+  let edited = b"/// Doubled.\nfn f(x: Int) -> Int = { let z = x * 2; z + 1 }\ntest \"t\" { () }\n";
+  assert_eq(sites_of(edited.concat(g), b"g"), before);
+  assert_eq(sites_of(g, b"g"), before)
+}
+
+test "a minted site is no numbered one, nor one another node or role mints" {
+  let src = b"fn f(xs: List<Int>, d: Int = 3) -> Int = match xs { [x, ..] -> try { x + d }, [] -> d }\n";
+  let m = numbered_module(parse(src).node);
+  let spans = picked_in(m, |_: Expr| true).map(expr_span);
+  let numbered = spans.map(|s: Span| s.site);
+  let roles = [role_try_return(), role_detached(), role_update_copy(3), role_member_default(2) + 5];
+  let made = spans.flat_map(|s: Span| roles.map(|k: Int| minted(s, k).site));
+  assert_eq(made.filter(|s: Int| numbered.contains(s)), []);
+  assert_eq(made.unique().len(), made.len());
+  assert_eq(made.filter(minted_too_deep), [])
+}
+
+/// `p` numbered from `n` on, and the number after its last node.
+fn num_pat(p: Pattern, n: Int) -> NumPat = {
+  let each = |ps: List<Pattern>, from: Int|
+    ps.fold({ ps: [], n: from }, |acc: { ps: List<Pattern>, n: Int }, x: Pattern| {
+      let o: NumPat = num_pat(x, acc.n);
+      { ps: acc.ps.push(o.p), n: o.n }
+    });
+  match p {
+    PWild(w) -> { p: PWild({ span: at(w.span, n) }), n: n + 1 },
+    PVar(v) -> { p: PVar({ ..v, span: at(v.span, n) }), n: n + 1 },
+    PLit(l) -> { p: PLit({ ..l, span: at(l.span, n) }), n: n + 1 },
+    PRange(r) -> { p: PRange({ ..r, span: at(r.span, n) }), n: n + 1 },
+    PCtor(c) -> {
+      let xs: { ps: List<Pattern>, n: Int } = each(c.args, n + 1);
+      { p: PCtor({ ..c, span: at(c.span, n), args: xs.ps }), n: xs.n }
+    },
+    PRecord(r) -> {
+      let fs = r.fields.fold(
+        { fs: [], n: n + 1 },
+        |acc: { fs: List<{ name: Ident, pat: Pattern }>, n: Int }, f: { name: Ident, pat: Pattern }| {
+          let o: NumPat = num_pat(f.pat, acc.n);
+          { fs: acc.fs.push({ name: f.name, pat: o.p }), n: o.n }
+        },
+      );
+      { p: PRecord({ ..r, span: at(r.span, n), fields: fs.fs }), n: fs.n }
+    },
+    PList(l) -> {
+      let xs: { ps: List<Pattern>, n: Int } = each(l.items, n + 1);
+      let rest: { p: Option<Pattern>, n: Int } = match l.rest {
+        Some(x) -> {
+          let o: NumPat = num_pat(x, xs.n);
+          { p: Some(o.p), n: o.n }
+        },
+        None -> { p: None, n: xs.n },
+      };
+      { p: PList({ span: at(l.span, n), rest: rest.p, items: xs.ps }), n: rest.n }
+    },
+    POr(o) -> {
+      let xs: { ps: List<Pattern>, n: Int } = each(o.alts, n + 1);
+      { p: POr({ span: at(o.span, n), alts: xs.ps }), n: xs.n }
+    },
+    PBad(b) -> { p: PBad({ span: at(b.span, n) }), n: n + 1 },
+  }
+}

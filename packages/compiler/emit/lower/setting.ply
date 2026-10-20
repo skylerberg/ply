@@ -5,19 +5,19 @@
 
 import std.bin
 import std.bytes
-import syntax.parsing (Ident, Span, span_key, span_between, prelude_binder)
-import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, type_at, int_type,
+import syntax.parsing (Ident, Span, span_between, prelude_binder)
+import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, int_type,
                     bool_type, float_type, decimal_type, bytes_type, fn_type, row_empty, unit_type)
-import emit.typing (Typed, filed_as, unknown_type)
+import emit.typing (Typed, Filings, filings, no_filings, filed_as, unknown_type)
 import syntax.items (Module, Item, IFn, ITest, ILaw, IEffect, OpDef, FnDef, TestDef, LawDef, Binder,
                      INames, IModule, IAlias, test_run)
 import syntax.exprs (Param, freed_by, case_at, case_identity)
 import check.resolve.tables (ParsedModule, Resolved, ModuleBinding, Binding, lookup, ValueSpace,
                              qualify)
 import check.resolve.scopes (of_module, of_binder)
-import check.infer (EmitFacts, expanded_mods)
-import check.infer.checker (TypedSite, LabelSite, MemberSite, Builtin, builtins, test_owner,
-                            law_root)
+import check.infer (EmitFacts, RootFacts, expanded_mods, no_root_facts, item_owner)
+import check.infer.checker (TypedSite, LabelSite, MemberSite, UpdateShape, TrySite, WitnessOp,
+                            WitnessRef, Builtin, builtins, test_owner, law_root)
 import front.facts (Analysis)
 import front.seam (WalkedFacts, walked_facts_bin, ctors_read)
 import front.rows (Rows, KnownDefRow, CtorRow)
@@ -40,13 +40,12 @@ pub type Setting = {
   declared: Map<Bytes, Scheme>,
   effects: List<EffectName>,
   release: Bool,
-  typed: Map<Bytes, Typed>,
 }
 
 /// A definition of the module as a root: its full name, where its text starts, its parameters as
 /// the emitter holds them (each label a trailing `Int`), the types its scheme gives them and its
-/// answer (unknown where none speaks), how its answer crosses a call, and its body lowered to
-/// `Code`, where it lowers.
+/// answer (unknown where none speaks), how its answer crosses a call, its body lowered to `Code`,
+/// where it lowers, and what the checker filed for its item's nodes, or why that cannot be read.
 pub type Root = {
   full: Bytes,
   base: Int,
@@ -55,6 +54,7 @@ pub type Root = {
   answer: Carrier,
   answer_ty: Type,
   code: Option<Code>,
+  filed: Result<Filings, Bytes>,
 }
 
 /// Module `module` of the analysed program `a` as the emitter reads it, and each definition, test
@@ -113,12 +113,11 @@ pub fn settings_in<b | e>(
         ctor_sums(read.rows),
       );
       let declared = declared_schemes();
+      let owned = facts_by_item(facts);
       Ok(
         wanted.filter(|i: Int| i < expanded.len()).map(|i: Int| {
           let m = expanded.get(i);
           let here = defs_of(m.name);
-          let sites = sites_in(facts.label_sites, i);
-          let typed = typed_in(facts, i);
           each(
             i,
             {
@@ -137,25 +136,69 @@ pub fn settings_in<b | e>(
               declared: declared,
               effects: effects_in(a.r, i, expanded),
               release: false,
-              typed: typed,
             },
-            m.module.items.fold([], |acc: List<ItemRoot>, item: Item|
+            m.module.items.fold([], |acc: List<ItemRoot>, item: Item| {
+              let filed = filings_of(owned, item_owner(m.name, item));
               match item {
                 IFn(def) ->
-                  acc.push({ item: item, root: root_of(m.name, schemes, sites, here, def) }),
-                ITest(t) -> acc.push({ item: item, root: test_root(m.name, sites, t) }),
-                ILaw(l) -> acc.push({ item: item, root: law_root_of(m.name, sites, typed, l) }),
+                  acc.push({ item: item, root: root_of(m.name, schemes, filed, here, def) }),
+                ITest(t) -> acc.push({ item: item, root: test_root(m.name, filed, t) }),
+                ILaw(l) -> acc.push({ item: item, root: law_root_of(m.name, filed, l) }),
                 _ -> acc,
-              }),
+              }
+            }),
           )
         }),
       )
     },
   }
 
+/// What the checker filed of each item `facts` holds sites of, by the item's owner.
+pub fn facts_by_item(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
+  let into = |m: Map<Bytes, RootFacts>, owner: Bytes, add: (RootFacts) -> RootFacts|
+    m.insert(
+      owner,
+      add(match m.get(owner) { Some(f) -> f, None -> { ..no_root_facts(), types: facts.types } }),
+    );
+  let e = facts.elaboration;
+  let labelled = facts.label_sites.fold(Map::new(), |m: Map<Bytes, RootFacts>, x: LabelSite|
+    into(m, x.owner, |f: RootFacts| { ..f, label_sites: f.label_sites.push(x) }));
+  let updated = e.updates.fold(labelled, |m: Map<Bytes, RootFacts>, x: UpdateShape|
+    into(m, x.owner, |f: RootFacts| { ..f, updates: f.updates.push(x) }));
+  let witnessed = e.ops.fold(updated, |m: Map<Bytes, RootFacts>, x: WitnessOp|
+    into(m, x.owner, |f: RootFacts| { ..f, ops: f.ops.push(x) }));
+  let referenced = e.refs.fold(witnessed, |m: Map<Bytes, RootFacts>, x: WitnessRef|
+    into(m, x.owner, |f: RootFacts| { ..f, refs: f.refs.push(x) }));
+  let tried = e.tries.fold(referenced, |m: Map<Bytes, RootFacts>, x: TrySite|
+    into(m, x.owner, |f: RootFacts| { ..f, tries: f.tries.push(x) }));
+  let called = e.members.fold(tried, |m: Map<Bytes, RootFacts>, x: MemberSite|
+    into(m, x.owner, |f: RootFacts| { ..f, members: f.members.push(x) }));
+  facts.typed.fold(called, |m: Map<Bytes, RootFacts>, x: TypedSite|
+    into(m, x.owner, |f: RootFacts| { ..f, typed: f.typed.push(x) }))
+}
+
+/// What the checker filed for the nodes of the item `owner` names, by site, or why that cannot be
+/// read; nothing for an item it filed nothing of.
+pub fn filings_of(
+  owned: Map<Bytes, RootFacts>,
+  owner: Bytes,
+) -> Result<Filings, Bytes> / {abort.raise} =
+  match owned.get(owner) {
+    None -> Ok(no_filings()),
+    Some(f) -> match filings(f) {
+      Ok(x) -> Ok(x),
+      Err(why) ->
+        Err(Bytes::concat_all([b"what the check filed of `", owner, b"` reads two ways: ", why])),
+    },
+  }
+
+/// The labels each call the root's item writes fills, by the call's site, which `lower_fn` reads.
+pub fn labels_of(filed: Result<Filings, Bytes>) -> Map<Int, List<Bytes>> =
+  match filed { Ok(f) -> f.labels, Err(_) -> Map::new() }
+
 /// Test `t` of `module` as the root a build makes of it: its run, which over cases takes a case's
 /// place and identity.
-fn test_root(module: Bytes, sites: Map<Bytes, List<Bytes>>, t: TestDef) -> Root / {abort.raise} = {
+fn test_root(module: Bytes, filed: Result<Filings, Bytes>, t: TestDef) -> Root / {abort.raise} = {
   let names = if t.cases == None { [] } else { [case_at(), case_identity()] };
   let ps = params_carried(
     names,
@@ -171,22 +214,18 @@ fn test_root(module: Bytes, sites: Map<Bytes, List<Bytes>>, t: TestDef) -> Root 
     types: ps.map(param_type),
     answer: Whole(KBoxed),
     answer_ty: unit_type(),
-    code: match lower_fn(names, [], sites, test_run(t), of_binder(module)) {
+    code: match lower_fn(names, [], labels_of(filed), test_run(t), of_binder(module)) {
       Some(l) -> Some(l.code),
       None -> None,
     },
+    filed: filed,
   }
 }
 
 /// Law `l` of `module` as the root a build makes of its body, its binders its parameters.
-fn law_root_of(
-  module: Bytes,
-  sites: Map<Bytes, List<Bytes>>,
-  typed: Map<Bytes, Typed>,
-  l: LawDef,
-) -> Root / {abort.raise} = {
+fn law_root_of(module: Bytes, filed: Result<Filings, Bytes>, l: LawDef) -> Root / {abort.raise} = {
   let names = l.binders.map(|b: Binder| b.name.name);
-  let ps = law_params(typed, l.binders);
+  let ps = law_params(filed, l.binders);
   {
     full: law_root(module, l.name, b"body"),
     base: l.span.start,
@@ -194,32 +233,35 @@ fn law_root_of(
     types: ps.map(param_type),
     answer: Whole(KBool),
     answer_ty: bool_type(),
-    code: match lower_fn(names, [], sites, l.body, of_binder(module)) {
+    code: match lower_fn(names, [], labels_of(filed), l.body, of_binder(module)) {
       Some(c) -> Some(c.code),
       None -> None,
     },
+    filed: filed,
   }
 }
 
 /// A law's binders as its roots take them: each of the type the checker filed for it, held as a
 /// value of that type is, and a word of no known type where it filed none.
-pub fn law_params(typed: Map<Bytes, Typed>, binders: List<Binder>) -> List<EmitParam> =
+pub fn law_params(filed: Result<Filings, Bytes>, binders: List<Binder>) -> List<EmitParam> = {
+  let typed = match filed { Ok(f) -> f.typed, Err(_) -> Map::new() };
   params_carried(
     binders.map(|b: Binder| b.name.name),
-    binders.map(|b: Binder| Some(typed_kind(typed, b.name.span))),
+    binders.map(|b: Binder| Some(typed_kind(typed, b.span))),
     [],
     binders.map(|b: Binder|
-      match typed.get(span_key(b.name.span)) {
+      match typed.get(b.span.site) {
         Some(t) -> if t.ty == unknown_type() { None } else { Some(t.ty) },
         None -> None,
       }),
   )
+}
 
 /// Definition `def` of `module` as a root, as the emitter prepares one.
 fn root_of(
   module: Bytes,
   schemes: Map<Bytes, Scheme>,
-  sites: Map<Bytes, List<Bytes>>,
+  filed: Result<Filings, Bytes>,
   here: List<Def>,
   def: FnDef,
 ) -> Root / {abort.raise} = {
@@ -244,10 +286,11 @@ fn root_of(
     answer: here.fold(Whole(KBoxed), |acc: Carrier, h: Def|
       if h.name == def.name.name { h.answer } else { acc }),
     answer_ty: match sig { Some(s) -> s.ret, None -> unknown_type() },
-    code: match lower_fn(names, labels, sites, def.body, of_binder(module)) {
+    code: match lower_fn(names, labels, labels_of(filed), def.body, of_binder(module)) {
       Some(l) -> Some(l.code),
       None -> None,
     },
+    filed: filed,
   }
 }
 
@@ -322,11 +365,11 @@ pub fn declared_schemes() -> Map<Bytes, Scheme> / {abort.raise} =
 /// The types a call takes and answers.
 pub type CallTypes = { params: List<Type>, ret: Type }
 
-/// The types builtin `name` is called at where its name is written at `callee`: the function type
-/// the checker filed there, else its declared scheme at the type arguments filed there, which are
-/// all that code the emitter writes for a type files.
-pub fn builtin_at(s: Setting, name: Bytes, callee: Span) -> Option<CallTypes> =
-  match s.typed.get(span_key(callee)) {
+/// The types builtin `name` is called at where its name is written at `callee`, of which `filed`
+/// is what the checker filed: the function type filed there, else its declared scheme at the type
+/// arguments filed there, which are all that code the emitter writes for a type files.
+pub fn builtin_at(s: Setting, filed: Option<Typed>, name: Bytes) -> Option<CallTypes> =
+  match filed {
     None -> declared_at(s, name, []),
     Some(t) -> match t.ty {
       TyFn(f) -> Some({ params: f.params, ret: f.ret }),
@@ -422,45 +465,6 @@ pub fn qualified(name: Bytes) -> Option<{ binder: Bytes, name: Bytes }> =
 pub fn walked_read(walked: Bytes) -> Option<WalkedFacts> / {abort.raise} =
   if walked.len() == 0 { None }
   else { match bin::decode(walked, walked_facts_bin()) { Ok(w) -> Some(w), Err(_) -> None } }
-
-/// The labels each call in module `module` fills, keyed by the call's span, which the lowering reads.
-pub fn sites_in(all: List<LabelSite>, module: Int) -> Map<Bytes, List<Bytes>> =
-  all.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, site: LabelSite|
-    if site.module != module { acc } else { acc.insert(span_key(site.span), site.labels) })
-
-/// Each typed site in module `module`, by its span. A default argument is written in its own
-/// module's positions, and an expanded test names each of its two generic callees at its case's
-/// type's, so two sites can share a span: where they differ, neither type is read, and the type
-/// arguments only where both filled the same.
-pub fn typed_in(facts: EmitFacts, module: Int) -> Map<Bytes, Typed> =
-  facts.typed.fold(
-    { sites: Map::new(), read: Map::new() },
-    |acc: { sites: Map<Bytes, Typed>, read: Map<Bytes, Type> }, site: TypedSite|
-      if site.module != module { acc } else {
-        let own = type_at(facts.types, site.ty, acc.read);
-        let args = site.args.fold(
-          { tys: [], read: own.read },
-          |a: { tys: List<Type>, read: Map<Bytes, Type> }, k: Bytes| {
-            let t = type_at(facts.types, k, a.read);
-            { tys: a.tys.push(t.ty), read: t.read }
-          },
-        );
-        let key = span_key(site.span);
-        let here = filed_as(own.ty, args.tys);
-        {
-          sites: match acc.sites.get(key) {
-            None -> acc.sites.insert(key, here),
-            Some(t) -> if t == here { acc.sites } else {
-              acc.sites.insert(
-                key,
-                filed_as(unknown_type(), if t.args == here.args { here.args } else { [] }),
-              )
-            },
-          },
-          read: args.read,
-        }
-      },
-  ).sites
 
 /// The definitions module `module`, parsed as `m`, writes, each as calls read it.
 pub fn defs_in(
@@ -623,7 +627,6 @@ fn ctor_setting(imports: List<Imported>, names: List<Bytes>) -> Setting =
     declared: Map::new(),
     effects: [],
     release: false,
-    typed: Map::new(),
   }
 
 test "a builtin is typed by the checker's filing where it called it, else by its declared scheme at the filed type arguments" {
@@ -634,13 +637,11 @@ test "a builtin is typed by the checker's filing where it called it, else by its
   // A generic builtin at no type arguments, or a name the prelude declares nothing by, is untyped.
   assert_eq(declared_at(s, b"List::len", []), None);
   assert_eq(declared_at(s, b"m.nothing", []), None);
-  let at = span_between(3, 9);
-  let filed = |t: Typed| { ..s, typed: Map::new().insert(span_key(at), t) };
   // Code the emitter writes for a type files only the type arguments.
-  assert_eq(builtin_at(filed(filed_as(unknown_type(), [int_type()])), b"List::len", at), len);
+  assert_eq(builtin_at(s, Some(filed_as(unknown_type(), [int_type()])), b"List::len"), len);
   let checked = fn_type([bytes_type()], int_type(), row_empty());
   assert_eq(
-    builtin_at(filed(filed_as(checked, [int_type()])), b"List::len", at),
+    builtin_at(s, Some(filed_as(checked, [int_type()])), b"List::len"),
     Some({ params: [bytes_type()], ret: int_type() }),
   )
 }

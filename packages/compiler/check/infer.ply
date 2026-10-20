@@ -1,10 +1,13 @@
 //! The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
 
-import syntax.parsing (Span, span_key, span_between)
+import syntax.parsing (Span, span_between, site_digit)
 import std.bin
 import syntax.type_syntax (mode_text)
-import syntax.items (Module, IExtern, DOrd, DNumeric, deriver_text, Derived, parse)
-import syntax.exprs (prelude_module, try_places)
+import syntax.items (Module, Item, IFn, ITest, ILaw, IExtern, DOrd, DNumeric, deriver_text, Derived,
+                     parse)
+import syntax.exprs (Expr, prelude_module, try_places, detached_at, simulated_at, branch_at,
+                     expr_span)
+import expand.rewrite.shared (picked_in)
 import check.types (Atom, Type, TyVar, TyCon, TyFn, canonical_beside, TyRecord, Field, row_empty,
                     row_open, row_singleton, without_raises, int_type, bytes_type, list_type,
                     iter_type, fn_type, shallow, written_label, label_of, atoms_text, scheme_text,
@@ -15,9 +18,9 @@ import check.resolve.tables (ParsedModule, Source, Resolved, Diag, Label, Edit, 
                              insertion, qualify, error_at, Parameters)
 import check.resolve (resolve_modules, ResolveSucceeded, ResolveFailed, dump_diags, has_error)
 import check.resolve.defaults (Expanded)
-import expand.rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
-                       NumericWitness, ConcreteWitness, ParamWitness, expand_tagged,
-                       expand_member_calls)
+import expand.rewrite (expand, updated_item, witnessed_item, tried_item, Answered, NumericWitness,
+                       ConcreteWitness, ParamWitness, expand_tagged, member_called_item,
+                       MemberCallee)
 import expand.rewrite.handlers (expand_holds, expand_handler_vars)
 import expand.embed (rewritten)
 import emit.layout (Intrinsic, intrinsics)
@@ -33,8 +36,8 @@ import check.infer.checker (Location, OpInfo, EffectInfo, CtorInfo, DefConstrain
                             ZeroDivisor, Raise, TestInfo, LawBinder, LawInfo, MemberSite, WitnessOp,
                             WitnessRef, WitnessOrder, UpdateShape, TrySite, LabelApplication,
                             LabelSite, OperandAt, TypedAt, TypedSite, KnownDef, KnownTest,
-                            KeptFacts, test_owner, Known, no_known, Checker, WalkedBody, report,
-                            report_error_at, resolve, abort_atom, def_of, Builtin, declared,
+                            KeptFacts, test_owner, law_owner, Known, no_known, Checker, WalkedBody,
+                            report, report_error_at, resolve, abort_atom, def_of, Builtin, declared,
                             builtins, builtin_named, update_shape_bin, try_site_bin,
                             member_site_bin, label_site_bin, typed_site_bin, witness_op_bin,
                             witness_ref_bin, witness_order_bin)
@@ -44,7 +47,7 @@ import check.infer.declarations (collect_nominals, collect_types, collect_effect
 import check.infer.expr (settle_bit_ops, settle_concats, settle_columns, settle_updates)
 import check.infer.definitions (SignedModule, signed_fns, externs_of, externs_in, walked_fns,
                                 settle_numerics, check_tests, check_laws, check_schemas,
-                                check_specs, unlowered, members_in)
+                                check_specs, unlowered_of, members_in)
 import check.infer.derivable (with_orders, check_map_keys, check_constraints)
 import check.infer.solved (check_derives, collect_stated, check_instances, attribute_generated,
                            check_comparisons, check_parallels, check_simulations, check_regions,
@@ -178,7 +181,8 @@ fn elaboration_in(checker: Checker) -> Elaboration / {abort.raise} =
     ops: checker.operands.fold([], |acc: List<WitnessOp>, o: OperandAt|
       match resolve(checker, o.ty) {
         TyVar(v) -> match checker.witnessed.get(v) {
-          Some(w) -> acc.push({ module: o.module, span: o.span, param: w.param, owner: o.owner }),
+          Some(w) ->
+            acc.push({ module: o.module, site: o.span.site, param: w.param, owner: o.owner }),
           None -> acc,
         },
         _ -> acc,
@@ -268,81 +272,50 @@ pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
     m.insert(owner, { ..f, types: types_named(facts.types, f.typed) }))
 }
 
-fn moved_span(span: Span, by: Int) -> Span = { ..span, start: span.start + by, end: span.end + by }
-
-/// `facts` with every span moved by `by` and filed under `owner` in `module`.
-fn placed_facts(facts: RootFacts, module: Int, by: Int, owner: Bytes) -> RootFacts =
+/// `facts` filed under `owner` in `module`.
+fn owned_by(facts: RootFacts, module: Int, owner: Bytes) -> RootFacts =
   {
-    label_sites: facts.label_sites.map(|x: LabelSite|
-      { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
-    updates: facts.updates.map(|x: UpdateShape|
-      { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
-    ops: facts.ops.map(|x: WitnessOp|
-      { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
-    refs: facts.refs.map(|x: WitnessRef|
-      { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
-    tries: facts.tries.map(|x: TrySite|
-      { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
-    members: facts.members.map(|x: MemberSite|
-      { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
-    typed: facts.typed.map(|x: TypedSite|
-      { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
+    label_sites: facts.label_sites.map(|x: LabelSite| { ..x, module: module, owner: owner }),
+    updates: facts.updates.map(|x: UpdateShape| { ..x, module: module, owner: owner }),
+    ops: facts.ops.map(|x: WitnessOp| { ..x, module: module, owner: owner }),
+    refs: facts.refs.map(|x: WitnessRef| { ..x, module: module, owner: owner }),
+    tries: facts.tries.map(|x: TrySite| { ..x, module: module, owner: owner }),
+    members: facts.members.map(|x: MemberSite| { ..x, module: module, owner: owner }),
+    typed: facts.typed.map(|x: TypedSite| { ..x, module: module, owner: owner }),
     types: facts.types,
   }
 
-fn within(span: Span, at: Span) -> Bool = span.start >= at.start && span.end <= at.end
+/// The encoding `filed_facts` writes, its first byte; bytes of another are no facts.
+fn facts_encoding() -> Int = 2
 
-fn all_within(facts: RootFacts, at: Span) -> Bool =
-  facts.label_sites.fold(true, |b: Bool, x: LabelSite| b && within(x.span, at))
-    && facts.updates.fold(true, |b: Bool, x: UpdateShape| b && within(x.span, at))
-    && facts.ops.fold(true, |b: Bool, x: WitnessOp| b && within(x.span, at))
-    && facts.refs.fold(true, |b: Bool, x: WitnessRef| b && within(x.span, at))
-    && facts.tries.fold(true, |b: Bool, x: TrySite| b && within(x.span, at))
-    && facts.members.fold(true, |b: Bool, x: MemberSite| b && within(x.span, at))
-    && facts.typed.fold(true, |b: Bool, x: TypedSite| b && within(x.span, at))
+/// One body's sites as its row files them: each by its node's site in the body's item, which no
+/// edit elsewhere, cut of its module or check of part of it moves.
+pub fn filed_facts(facts: RootFacts) -> Bytes / {abort.raise} =
 
-/// One body's sites as its row files them, behind a byte that says how. Each span is counted from
-/// where the body's definition starts, so they hold wherever the definition moves to. A site
-/// outside the definition's own text is foreign: a default argument is written at its callee's
-/// positions and stands in the caller's body at those. A body that holds one is filed as it
-/// stands, and holds only while neither module's text moves.
-pub fn filed_facts(facts: RootFacts, at: Span) -> Bytes / {abort.raise} = {
   // A row names its types by key; the table they are read from goes with the rows, held once.
-  let keyed = { ..facts, types: Map::new() };
-  if all_within(keyed, at) {
-    b"\x00".concat(bin::encode(placed_facts(keyed, 0, 0 - at.start, b""), root_facts_bin()))
-  } else { b"\x01".concat(bin::encode(placed_facts(keyed, 0, 0, b""), root_facts_bin())) }
-}
+  byte_of_int(facts_encoding()).concat(
+    bin::encode(owned_by({ ..facts, types: Map::new() }, 0, b""), root_facts_bin()),
+  )
 
-/// Whether a row's facts are of a body that holds a foreign site, or are no facts at all.
-pub fn foreign_facts(filed: Bytes) -> Bool = filed.len() == 0 || filed.at(0) != 0
-
-/// A row's facts read back for the definition that now starts at `start` in `module`; none for
-/// bytes that are no facts.
-pub fn facts_at(
-  filed: Bytes,
-  module: Int,
-  start: Int,
-  owner: Bytes,
-) -> Option<RootFacts> / {abort.raise} =
-  if filed.len() == 0 { None } else {
+/// A row's facts read back for the body of `owner` in `module`; none for bytes that are no facts.
+pub fn facts_at(filed: Bytes, module: Int, owner: Bytes) -> Option<RootFacts> / {abort.raise} =
+  if filed.len() == 0 || filed.at(0) != facts_encoding() { None } else {
     match bin::decode(filed.slice(1, filed.len()), root_facts_bin()) {
-      Ok(f) -> Some(placed_facts(f, module, if filed.at(0) == 0 { start } else { 0 }, owner)),
+      Ok(f) -> Some(owned_by(f, module, owner)),
       Err(_) -> None,
     }
   }
 
-/// `checker` without the sites of a walk that is never lowered. A call on a value stays, among
-/// the sites no body owns: it says how the clause is written out, and a claim lowers the clause
-/// as written out.
-fn lowered_only(checker: Checker) -> Checker = {
-  let kept = |owner: Bytes| owner != unlowered();
+/// `checker` without the sites of a walk that is never lowered. A call on a value stays, its
+/// definition's: it says how the clause is written out, and a claim lowers the clause as written out.
+fn lowered_only(checker: Checker) -> Checker / {abort.raise} = {
+  let kept = |owner: Bytes| unlowered_of(owner) == None;
   {
     ..checker,
     label_sites: checker.label_sites.filter(|x: LabelSite| kept(x.owner)),
     try_sites: checker.try_sites.filter(|x: TrySite| kept(x.owner)),
     member_sites: checker.member_sites.map(|x: MemberSite|
-      if kept(x.owner) { x } else { { ..x, owner: b"" } }),
+      match unlowered_of(x.owner) { Some(o) -> { ..x, owner: o }, None -> x }),
     update_shapes: checker.update_shapes.filter(|x: UpdateShape| kept(x.owner)),
     operands: checker.operands.filter(|x: OperandAt| kept(x.owner)),
     witness_refs: checker.witness_refs.filter(|x: WitnessRef| kept(x.owner)),
@@ -350,38 +323,54 @@ fn lowered_only(checker: Checker) -> Checker = {
   }
 }
 
+/// What the checker filed for the emitter, each owner's sites together, owners in the order their
+/// bodies were first walked, so a check of part of a program files each owner's as a whole check does.
 fn facts_of(all: Checker) -> EmitFacts / {abort.raise} = {
   let checker = lowered_only(all);
   let settled = settled_sites(checker);
+  let e = elaboration_in(checker);
   {
     pure: checker.defs.fold([], |acc: List<Bytes>, def_info: DefInfo|
       if published_pure(def_info) { acc.push(def_info.name) } else { acc }),
-    label_sites: checker.label_sites,
-    elaboration: elaboration_in(checker),
-    typed: settled.sites,
+    label_sites: grouped(checker.label_sites, |x: LabelSite| x.owner),
+    elaboration: {
+      ..e,
+      updates: grouped(e.updates, |x: UpdateShape| x.owner),
+      ops: grouped(e.ops, |x: WitnessOp| x.owner),
+      refs: grouped(e.refs, |x: WitnessRef| x.owner),
+      tries: grouped(e.tries, |x: TrySite| x.owner),
+      members: grouped(e.members, |x: MemberSite| x.owner),
+    },
+    typed: grouped(settled.sites, |x: TypedSite| x.owner),
     types: settled.types,
   }
 }
 
+/// `xs` with each owner's together, owners in the order they first stand, each one's in its order.
+fn grouped<a>(xs: List<a>, owner: (a) -> Bytes) -> List<a> = {
+  let g = xs.fold(
+    { order: [], by: Map::new() },
+    |acc: { order: List<Bytes>, by: Map<Bytes, List<a>> }, x: a| {
+      let o = owner(x);
+      match acc.by.get(o) {
+        Some(ys) -> { ..acc, by: acc.by.insert(o, ys.push(x)) },
+        None -> { order: acc.order.push(o), by: acc.by.insert(o, [x]) },
+      }
+    },
+  );
+  g.order.map(|o: Bytes| match g.by.get(o) { Some(ys) -> ys, None -> [] }).flatten()
+}
+
 /// Each typed site resolved and read in its owner's numbering, beside the table of what they name.
-/// A body's are only those in its own text, where a default each of its calls takes stands too.
 fn settled_sites(checker: Checker) -> { sites: List<TypedSite>, types: TypeTable } / {abort.raise} = {
-  let tests = checker.tests.fold(Map::new(), |m: Map<Bytes, Location>, t: TestInfo|
-    m.insert(test_owner(t.module, t.name), t.at));
-  let in_own_text = |t: TypedAt|
-    match match def_of(checker, t.owner) { Some(d) -> Some(d.at), None -> tests.get(t.owner) } {
-      Some(at) ->
-        at.module == t.module && t.span.start >= at.span.start && t.span.end <= at.span.end,
-      None -> true,
-    };
   let sorts = law_sorts(checker);
   let numbering_of = |owner: Bytes|
     match def_of(checker, owner) {
       Some(d) -> by_place(d.scheme.ty_vars),
-      // A law's sites are filed under the empty owner, and its sorts are its own variables.
-      None -> if owner == b"" { sorts } else { Map::new() },
+      // A law's sorts are its own variables.
+      None -> match sorts.get(owner) { Some(s) -> s, None -> Map::new() },
     };
-  let settled = checker.typed.filter(in_own_text).fold(
+  let settled = checker.typed.fold(
     // The rows a body is published from name their types in the table handed in with them.
     {
       sites: [],
@@ -404,7 +393,7 @@ fn settled_sites(checker: Checker) -> { sites: List<TypedSite>, types: TypeTable
       {
         sites: acc.sites.push({
           module: t.module,
-          span: t.span,
+          site: t.span.site,
           ty: own.key,
           args: args.keys,
           owner: t.owner,
@@ -423,13 +412,13 @@ fn settled_sites(checker: Checker) -> { sites: List<TypedSite>, types: TypeTable
 fn by_place(vs: List<Int>) -> Map<Int, Int> / {abort.raise} =
   range(0, vs.len()).fold(Map::new(), |m: Map<Int, Int>, i: Int| m.insert(vs.get(i), i))
 
-/// The variables each law leaves uninterpreted, numbered as the root the front end offers of it
-/// numbers them: a law's root reads a value of one as a value of a variable.
-fn law_sorts(checker: Checker) -> Map<Int, Int> / {abort.raise} =
-  checker.laws.fold(Map::new(), |m: Map<Int, Int>, l: LawInfo|
-    by_place(vars_in(l.binders.map(|b: LawBinder| resolve(checker, b.ty)))).fold(
-      m,
-      |n: Map<Int, Int>, v: Int, i: Int| n.insert(v, i),
+/// The variables each law leaves uninterpreted, by the law's owner, numbered as the root the front
+/// end offers of it numbers them: a law's root reads a value of one as a value of a variable.
+fn law_sorts(checker: Checker) -> Map<Bytes, Map<Int, Int>> / {abort.raise} =
+  checker.laws.fold(Map::new(), |m: Map<Bytes, Map<Int, Int>>, l: LawInfo|
+    m.insert(
+      law_owner(l.module, l.name),
+      by_place(vars_in(l.binders.map(|b: LawBinder| resolve(checker, b.ty)))),
     ))
 
 /// Sites settled so far: each site, the table their types are held in, the key of each type a site
@@ -532,42 +521,101 @@ pub fn elaboration_with(
   if has_error(out.checker.diags) { None } else { Some(elaboration_of(out.checker)) }
 }
 
-/// One module's shapes, keyed by the update's span, as `expand_record_updates` reads them.
-fn shapes_in(all: List<UpdateShape>, module: Int) -> Map<Bytes, List<Bytes>> =
-  all.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, s: UpdateShape|
-    if s.module != module { acc } else { acc.insert(span_key(s.span), s.names) })
+/// What the check found of module `module`'s items that writing them out reads, each item's under
+/// its owner, by site.
+type Owned = {
+  members: Map<Bytes, Map<Int, MemberCallee>>,
+  shapes: Map<Bytes, Map<Int, List<Bytes>>>,
+  answered: Map<Bytes, Map<Int, Answered>>,
+  ops: Map<Bytes, Map<Int, Bytes>>,
+  refs: Map<Bytes, Map<Int, List<NumericWitness>>>,
+  orders: Map<Bytes, List<Bytes>>,
+}
 
-/// One module's `try` blocks, keyed by span, as `expand_try_blocks` reads them.
-fn answered_in(all: List<TrySite>, module: Int) -> Map<Bytes, Answered> =
-  all.fold(Map::new(), |acc: Map<Bytes, Answered>, s: TrySite|
-    if s.module != module { acc }
-    else { acc.insert(span_key(s.span), { effect: s.effect, op: s.op, arity: s.arity }) })
+/// `m` with `x` filed at `site` under `owner`.
+fn filed_under<v>(
+  m: Map<Bytes, Map<Int, v>>,
+  owner: Bytes,
+  site: Int,
+  x: v,
+) -> Map<Bytes, Map<Int, v>> = {
+  let sites = match m.get(owner) { Some(s) -> s, None -> Map::new() };
+  m.insert(owner, sites.insert(site, x))
+}
+
+fn of_owner<v>(m: Map<Bytes, Map<Int, v>>, owner: Bytes) -> Map<Int, v> =
+  match m.get(owner) { Some(s) -> s, None -> Map::new() }
+
+fn owned_in(
+  e: Elaboration,
+  module: Int,
+  signatures: Map<Bytes, Parameters>,
+) -> Owned / {abort.raise} =
+  {
+    members: members_in(e.members, module, signatures),
+    shapes: e.updates.fold(Map::new(), |acc: Map<Bytes, Map<Int, List<Bytes>>>, s: UpdateShape|
+      if s.module != module { acc } else { filed_under(acc, s.owner, s.site, s.names) }),
+    answered: e.tries.fold(Map::new(), |acc: Map<Bytes, Map<Int, Answered>>, s: TrySite|
+      if s.module != module { acc }
+      else { filed_under(acc, s.owner, s.site, { effect: s.effect, op: s.op, arity: s.arity }) }),
+    ops: e.ops.fold(Map::new(), |acc: Map<Bytes, Map<Int, Bytes>>, o: WitnessOp|
+      if o.module != module { acc } else { filed_under(acc, o.owner, o.site, o.param) }),
+    // A call's witnesses in its callee's scheme order, the order its witness parameters take.
+    refs: e.refs.fold(
+      Map::new(),
+      |acc: Map<Bytes, Map<Int, List<NumericWitness>>>, r: WitnessRef|
+        if r.module != module { acc } else {
+          let ranked = range(0, r.params.len()).fold([], |sorted: List<Int>, k: Int| {
+            let n = sorted.len();
+            let i = range(0, n).fold(n, |p: Int, j: Int|
+              if p < n { p }
+              else if r.params.get(k) < r.params.get(sorted.get(j)) { j }
+              else { p });
+            sorted.take(i).push(k).concat(sorted.drop(i))
+          });
+          filed_under(acc, r.owner, r.site, ranked.map(|k: Int| r.witnesses.get(k)))
+        },
+    ),
+    orders: e.orders.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, o: WitnessOrder|
+      if o.module != module { acc } else { acc.insert(o.name, o.params) }),
+  }
+
+/// The owner what a check finds of `item`'s nodes is filed under: a definition's own name, a test's
+/// and a law's as `test_owner` and `law_owner` name them; none for an item with no body.
+pub fn item_owner(module: Bytes, item: Item) -> Bytes / {abort.raise} =
+  match item {
+    IFn(d) -> qualify(module, d.name.name),
+    ITest(d) -> test_owner(module, d.name),
+    ILaw(d) -> law_owner(module, d.name),
+    _ -> b"",
+  }
 
 /// A module with every tagged literal written out as the call it runs as, every call on a value
 /// as the call of its type's function, every record update as the literal it stands for, and
-/// every `try` as its `handle`. The tagged literals go first: they need nothing of the checker,
-/// and what they become is forms the others already walk. A handler's variables go last, so what
-/// reads them is in the forms it is lowered in.
-fn written_out(
-  module: Module,
-  elaboration: Elaboration,
-  i: Int,
-  signatures: Map<Bytes, Parameters>,
-) -> Module =
-  expand_handler_vars(
-    expand_holds(
-      expand_try_blocks(
-        expand_record_updates(
-          expand_member_calls(
-            expand_tagged(module),
-            members_in(elaboration.members, i, signatures),
-          ),
-          shapes_in(elaboration.updates, i),
-        ),
-        answered_in(elaboration.tries, i),
-      ),
-    ),
-  )
+/// every `try` as its `handle`, each item by what was found of its own nodes. The tagged literals go
+/// first: they need nothing of the checker, and what they become is forms the others already walk.
+/// A handler's variables go last, so what reads them is in the forms it is lowered in. With
+/// `witnessed`, every `numeric` or `integer` parameter's witness is passed and read too.
+fn written_out(m: ParsedModule, o: Owned, witnessed: Bool) -> Module / {abort.raise} = {
+  let tagged = expand_tagged(m.module);
+  let items = tagged.items.map(|item: Item| {
+    let owner = item_owner(m.name, item);
+    tried_item(
+      updated_item(member_called_item(item, of_owner(o.members, owner)), of_owner(o.shapes, owner)),
+      of_owner(o.answered, owner),
+    )
+  });
+  let out = expand_handler_vars(expand_holds({ ..tagged, items: items }));
+  if !witnessed { out } else {
+    {
+      ..out,
+      items: out.items.map(|item: Item| {
+        let owner = item_owner(m.name, item);
+        witnessed_item(item, of_owner(o.ops, owner), of_owner(o.refs, owner), o.orders)
+      }),
+    }
+  }
+}
 
 /// The modules written out, and every `numeric` or `integer` parameter's witness passed and read:
 /// what the emitter lowers, and what only the checker knows. `signatures` are the resolver's of
@@ -581,12 +629,7 @@ pub fn expanded_mods(
     let m: ParsedModule = mods.get(i);
     {
       name: m.name,
-      module: expand_witnesses(
-        written_out(m.module, elaboration, i, signatures),
-        ops_in(elaboration.ops, i),
-        refs_in(elaboration.refs, i),
-        orders_in(elaboration.orders, i),
-      ),
+      module: written_out(m, owned_in(elaboration, i, signatures), true),
       derived: m.derived,
     }
   })
@@ -600,29 +643,12 @@ pub fn updated_mods(
 ) -> List<ParsedModule> / {abort.raise} =
   range(0, mods.len()).map(|i: Int| {
     let m: ParsedModule = mods.get(i);
-    { name: m.name, module: written_out(m.module, elaboration, i, signatures), derived: m.derived }
+    {
+      name: m.name,
+      module: written_out(m, owned_in(elaboration, i, signatures), false),
+      derived: m.derived,
+    }
   })
-
-fn ops_in(all: List<WitnessOp>, module: Int) -> Map<Bytes, Bytes> =
-  all.fold(Map::new(), |acc: Map<Bytes, Bytes>, o: WitnessOp|
-    if o.module != module { acc } else { acc.insert(span_key(o.span), o.param) })
-
-/// A call's witnesses in its callee's scheme order, the order its witness parameters take.
-fn refs_in(all: List<WitnessRef>, module: Int) -> Map<Bytes, List<NumericWitness>> / {abort.raise} =
-  all.fold(Map::new(), |acc: Map<Bytes, List<NumericWitness>>, r: WitnessRef|
-    if r.module != module { acc } else {
-      let ranked = range(0, r.params.len()).fold([], |sorted: List<Int>, k: Int| {
-        let n = sorted.len();
-        let i = range(0, n).fold(n, |p: Int, j: Int|
-          if p < n { p } else if r.params.get(k) < r.params.get(sorted.get(j)) { j } else { p });
-        sorted.take(i).push(k).concat(sorted.drop(i))
-      });
-      acc.insert(span_key(r.span), ranked.map(|k: Int| r.witnesses.get(k)))
-    })
-
-fn orders_in(all: List<WitnessOrder>, module: Int) -> Map<Bytes, List<Bytes>> =
-  all.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, o: WitnessOrder|
-    if o.module != module { acc } else { acc.insert(o.name, o.params) })
 
 /// Every use of a label-generic definition is a call, and every call fills its labels.
 fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
@@ -676,7 +702,7 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
           ..in_module,
           label_sites: in_module.label_sites.push({
             module: a.module,
-            span: a.span,
+            site: a.span.site,
             labels: names,
             owner: a.owner,
           }),
@@ -1022,9 +1048,25 @@ fn placed(src: Bytes) -> List<List<Bytes>> / {abort.raise} =
   dedup_diags(checked_m(src).checker.diags).map(|diag: Diag|
     [diag.code].concat(diag.labels.map(|label: Label| src.slice(label.start, label.end))))
 
-/// Each type the check behind `checker` filed at `at`, a function's written without its row.
+/// Each type the check behind `checker` filed at `at`, its site and place, a function's written
+/// without its row.
 fn filed_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
   checker.typed.filter(|t: TypedAt| t.span == at).map(|t: TypedAt| shown(resolve(checker, t.ty)))
+
+/// Each type the check behind `checker` filed for a node written from `at.start` to `at.end`, none
+/// made for another.
+fn written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
+  checker.typed.filter(|t: TypedAt|
+    t.span.start == at.start && t.span.end == at.end && t.span.site > 0
+      && t.span.site < site_digit()).map(|t: TypedAt| shown(resolve(checker, t.ty)))
+
+/// The expression of module 0 of the check behind `checker` written from `at.start` to `at.end`.
+fn written_node(checker: Checker, at: Span) -> Expr / {abort.raise} =
+  match picked_in(checker.modules.get(0).module, |e: Expr|
+      expr_span(e).start == at.start && expr_span(e).end == at.end) {
+    [e, ..] -> e,
+    [] -> panic("no node is written there"),
+  }
 
 fn shown(t: Type) -> Bytes / {abort.raise} =
   match t {
@@ -1054,14 +1096,11 @@ test "each closure a handle, a simulate and a parallel make is filed at a place 
     b"fn ticked() -> Int / {abort.raise, sim.read} = simulate { 1 }\n",
   ]);
   let checker = checker_m(src);
-  let at = |from: Bytes, to: Bytes| filed_at(checker, placed_in(src, from, to));
-  let keyword = |word: Bytes| {
-    let s = placed_in(src, word, b" {").start;
-    filed_at(checker, span_between(s, s + word.len()))
-  };
+  let at = |from: Bytes, to: Bytes| written_at(checker, placed_in(src, from, to));
+  let node = |from: Bytes, to: Bytes| expr_span(written_node(checker, placed_in(src, from, to)));
   let branch = |text: Bytes| {
     let s = placed_in(src, text, text).start;
-    filed_at(checker, span_between(s, s))
+    filed_at(checker, branch_at(written_node(checker, span_between(s, s + text.len()))))
   };
   // A clause takes its operation's parameters, the label it binds and its continuation, and answers
   // the handle's answer where it resumes, the operation's answer otherwise.
@@ -1069,8 +1108,8 @@ test "each closure a handle, a simulate and a parallel make is filed at a place 
   assert_eq(at(b"link.send[*t]", b" }\n"), [b"(Int, String) -> Int"]);
   assert_eq(at(b"return v", b" }\n"), [b"(Int) -> Int"]);
   assert_eq(at(b"handle { if", b"\nfn tagged"), [b"Int"]);
-  assert_eq(keyword(b"handle"), [b"() -> Int"]);
-  assert_eq(keyword(b"simulate"), [b"() -> Int"]);
+  assert_eq(filed_at(checker, detached_at(node(b"handle { if", b"\nfn tagged"))), [b"() -> Int"]);
+  assert_eq(filed_at(checker, simulated_at(node(b"simulate", b"\n"))), [b"() -> Int"]);
   assert_eq(branch(b"n + 1"), [b"() -> Int"]);
   assert_eq(branch(b"n > 2"), [b"() -> Bool"])
 }
@@ -1082,7 +1121,7 @@ test "the constructor a `?` hands its failure on by is filed at the `?`, as a wr
   ]);
   let checker = checker_m(src);
   let q = placed_in(src, b"?", b"?").start;
-  assert_eq(filed_at(checker, span_between(q, q + 1)), [b"(String) -> Result<Int, String>"])
+  assert_eq(written_at(checker, span_between(q, q + 1)), [b"(String) -> Result<Int, String>"])
 }
 
 test "the parts of the handle a try is written out as are filed where the rewrite puts them" {
@@ -1094,7 +1133,7 @@ test "the parts of the handle a try is written out as are filed where the rewrit
     b"fn found(key: String) -> Int = match try { lookup(key) } { Ok(n) -> n, Err(_) -> 0 }\n",
   ]);
   let checker = checker_m(src);
-  let one = placed_in(src, b"try { digit", b"\n");
+  let one = expr_span(written_node(checker, placed_in(src, b"try { digit", b"\n")));
   let at = try_places(one);
   let result = b"Result<Int, String>";
   assert_eq(filed_at(checker, one), [result]);
@@ -1104,7 +1143,9 @@ test "the parts of the handle a try is written out as are filed where the rewrit
   assert_eq(filed_at(checker, at.err), [b"(String) -> ".concat(result)]);
   assert_eq(filed_at(checker, at.carried), []);
   // A raise of several values is carried as the record of them, which has a place of its own.
-  let several = try_places(placed_in(src, b"try { lookup", b" }"));
+  let lookup = b"try { lookup(key) }";
+  let s = placed_in(src, lookup, lookup).start;
+  let several = try_places(expr_span(written_node(checker, span_between(s, s + lookup.len()))));
   assert_eq(filed_at(checker, several.carried).len(), 1);
   assert_eq(filed_at(checker, several.clause).len(), 1)
 }
@@ -1125,7 +1166,7 @@ test "a default a call takes is filed at a place of its own in the call, at the 
   let placed = |call: Bytes| {
     let s = placed_in(src, call, call).start;
     checker.typed.filter(|t: TypedAt|
-      t.span.start == s && t.span.end == s + call.len() && t.span.gen != 0).map(|t: TypedAt|
+      t.span.start == s && t.span.end == s + call.len() && t.span.site != 0).map(|t: TypedAt|
       shown(resolve(checker, t.ty)))
   };
   assert_eq(placed(b"greet(\"a\")"), [b"Option<String>"]);
@@ -1486,7 +1527,7 @@ test "a call inside a recursive group answers for its callee's constraints as an
       b"fn go() -> U8 = up(1u8, 3)",
     ]);
   let checker = checked_cx(cycle(b" where numeric(a)"));
-  let passed = refs_in(checker.witness_refs, 0).values();
+  let passed = passed_in(checker);
   assert_eq(passed.len(), 3);
   let passes = |w: NumericWitness|
     passed.fold(false, |b: Bool, ws: List<NumericWitness>| b || ws == [w]);
@@ -1543,7 +1584,7 @@ test "a definition's witnesses take its scheme's order, which its calls pass the
     { name: b"mixed", params: [b"a", b"b"] },
     { name: b"deep", params: [b"a"] },
   ]);
-  let passed = refs_in(checker.witness_refs, 0).values();
+  let passed = passed_in(checker);
   assert_eq(passed.len(), 2);
   assert(
     passed.fold(false, |b: Bool, ws: List<NumericWitness>|
@@ -1551,6 +1592,13 @@ test "a definition's witnesses take its scheme's order, which its calls pass the
   );
   assert(passed.fold(false, |b: Bool, ws: List<NumericWitness>| b || ws == [ParamWitness(b"a")]))
 }
+
+/// The witnesses each call of module 0 of the check behind `checker` passes, in the order it passes
+/// them.
+fn passed_in(checker: Checker) -> List<List<NumericWitness>> / {abort.raise} =
+  owned_in(elaboration_in(checker), 0, Map::new()).refs.values().flat_map(
+    |m: Map<Int, List<NumericWitness>>| m.values(),
+  )
 
 /// A one-module program as the checker leaves it.
 fn checked_cx(src: Bytes) -> Checker / {abort.raise} = {

@@ -1,6 +1,6 @@
 //! Definitions checked: groups settled, bodies, tests, laws and spec clauses.
 
-import syntax.parsing (Span, Ident, QName, dummy_span, span_key, is_bare, qname_text, starts_upper,
+import syntax.parsing (Span, Ident, QName, dummy_span, is_bare, qname_text, starts_upper,
                        prelude_binder, span_between)
 import std.graph
 import syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr,
@@ -50,16 +50,17 @@ import check.infer.checker (DeclaredAlias, DeclaredExtern, DeclaredRecord, Decla
                             RaiseNote, DirectPerform, OpaquePerform, PerformThroughArgs, PerformVia,
                             PerformSite, Maybe, Repeated, RepeatedRow, OwnCall, MemberSite, TagUse,
                             Numeric, GroupFill, Signature, RigidParam, MapKeySite, ConstraintSite,
-                            SpecEnv, GroupDef, KnownDef, test_owner, listing_ty, Every, Given, Only,
-                            HandedBody, Checker, Inferred, WithTy, WithTys, WithSig, Signed, Walk,
-                            Body, TagRefusal, Growth, NamedCallee, WalkedBody, ModuleFns,
-                            TypedSites, StatedFns, Reached, Count, Generalized, compare_values_name,
-                            result_name, location_of, scope_of, report, report_error_at,
-                            report_error_at_and, err_labels, backticked_text, plural, row_aliases,
-                            new_ty, resolve, resolve_row_in, with_unified, simulated_names,
-                            seed_atom, builtin_type_arity, effect_of, def_of, set_def, Builtin,
-                            prelude_imports, declared, builtins, refuse_externs, mode_eq, is_direct,
-                            builtin_bound, insert_constraint, dedup_constraints, Shapes, derivable)
+                            SpecEnv, GroupDef, KnownDef, test_owner, law_owner, listing_ty, Every,
+                            Given, Only, HandedBody, Checker, Inferred, WithTy, WithTys, WithSig,
+                            Signed, Walk, Body, TagRefusal, Growth, NamedCallee, WalkedBody,
+                            ModuleFns, TypedSites, StatedFns, Reached, Count, Generalized,
+                            compare_values_name, result_name, location_of, scope_of, report,
+                            report_error_at, report_error_at_and, err_labels, backticked_text,
+                            plural, row_aliases, new_ty, resolve, resolve_row_in, with_unified,
+                            simulated_names, seed_atom, builtin_type_arity, effect_of, def_of,
+                            set_def, Builtin, prelude_imports, declared, builtins, refuse_externs,
+                            mode_eq, is_direct, builtin_bound, insert_constraint, dedup_constraints,
+                            Shapes, derivable)
 import check.infer.names (Found, of_language_type, declared_value, written_binder, simple_name_of,
                           home_module)
 import check.infer.declarations (conv_type, conv_atom, op_named, duplicate, constraints_in_force,
@@ -947,11 +948,7 @@ fn walked_or_filed(
       let walked: Checker = { ..o.checker, derived: None, walking: b"" };
       // Typed, its operators and comparisons say which of the module's functions they call, as
       // its calls on values do.
-      let members = walked.member_sites.drop(checker.member_sites.len()).fold(
-        [],
-        |acc: List<OwnCall>, m: MemberSite|
-          if m.callee.len() == 0 { acc } else { acc.push({ callee: m.callee, span: m.span }) },
-      );
+      let members = walked.member_calls.drop(checker.member_calls.len());
       let calls = if stated.len() == 0 { members } else {
         members.concat(
           stated_calls(walked, stated, answers, {
@@ -1051,11 +1048,10 @@ fn walked_or_filed(
 /// `sites` being the calls on values the walk of that body wrote out.
 fn lent_refused(checker: Checker, def: FnDef, sites: List<MemberSite>) -> Checker / {abort.raise} =
   if !lent::lends(def) { checker } else {
-    let at = sites.fold(Map::new(), |m: Map<Bytes, Bytes>, x: MemberSite|
-      m.insert(span_key(x.span), x.callee));
+    let at = sites.fold(Map::new(), |m: Map<Int, Bytes>, x: MemberSite| m.insert(x.site, x.callee));
     lent::refusals(checker.module, def, {
       named: |q: QName| lent_target(checker, q),
-      member: |s: Span| at.get(span_key(s)),
+      member: |s: Span| at.get(s.site),
       takes: |n: Bytes| checker.takings.get(n),
     }).fold(
       checker,
@@ -1248,9 +1244,10 @@ fn settle_group(checker: Checker, m: ModuleFns, comp: List<Int>) -> Checker / {a
       }
     }
   };
-  let stated = bodies.fold(Map::new(), |acc: Map<Bytes, List<Callee>>, b: Body|
-    b.stated.fold(acc, |held: Map<Bytes, List<Callee>>, call: OwnCall| {
-      let key = span_key(call.span);
+  // What each member's body calls because a type states it, by the call's site in that body.
+  let stated = bodies.map(|b: Body|
+    b.stated.fold(Map::new(), |held: Map<Int, List<Callee>>, call: OwnCall| {
+      let key = call.span.site;
       held.insert(
         key,
         List::push(
@@ -1261,11 +1258,19 @@ fn settle_group(checker: Checker, m: ModuleFns, comp: List<Int>) -> Checker / {a
     }));
   let read: Verdict = if !walked { { endings: [], summaries: [] } } else {
     verdict({
-      defs: defs.map(|d: FnDef| with_member_calls(d, m.written)),
+      defs: range(0, defs.len()).map(|slot: Int|
+        with_member_calls(defs.get(slot), match m.written.get(qualified.get(slot)) {
+          Some(w) -> w,
+          None -> Map::new(),
+        })),
       names: qualified,
       params: bodies.map(|b: Body| b.params),
       resolve: named,
-      stated: |span: Span| match stated.get(span_key(span)) { Some(cs) -> cs, None -> [] },
+      stated: |slot: Int, span: Span|
+        match stated.at(slot) {
+          Some(s) -> match s.get(span.site) { Some(cs) -> cs, None -> [] },
+          None -> [],
+        },
       ending_of: |n: Bytes| match def_of(tagged, n) { Some(d) -> d.ending, None -> Ends },
       summary_of: |n: Bytes| tagged.summaries.get(n),
     })
@@ -3056,6 +3061,7 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     guards: guards::none(),
     raise_notes: [],
     auto_ty_params: true,
+    walking: law_owner(parsed.name, def.name),
   };
   let types: WithTys = def.binders.fold(
     { checker: checker, tys: [] },
@@ -3073,7 +3079,7 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
   let pushed: Checker = { ..rigid, env: env_push(rigid.env) };
   let bound: Checker = range(0, def.binders.len()).fold(pushed, |c: Checker, i: Int|
     {
-      ..note_typed(c, def.binders.get(i).name.span, types.tys.get(i), []),
+      ..note_typed(c, def.binders.get(i).span, types.tys.get(i), []),
       env: env_bind(c.env, def.binders.get(i).name.name, monomorphic(types.tys.get(i))),
     });
   let guarded: Checker = match def.guard {
@@ -3124,6 +3130,7 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     ..popped,
     ty_params: Map::new(),
     row_params: Map::new(),
+    walking: outer.walking,
     laws: popped.laws.push({
       name: def.name,
       module: parsed.name,
@@ -3614,8 +3621,11 @@ fn check_measure(
   expr: Expr,
   env: SpecEnv,
 ) -> Checker / {abort.raise} = {
-  let o: Inferred = infer_whole(spec_scope(checker, def, env), expr);
-  let popped: Checker = { ..o.checker, env: env_pop(o.checker.env) };
+  let o: Inferred = infer_whole(
+    { ..spec_scope(checker, def, env), walking: unlowered(env.name) },
+    expr,
+  );
+  let popped: Checker = { ..o.checker, env: env_pop(o.checker.env), walking: checker.walking };
   let c1: Checker = expect(
     popped,
     expr_span(expr),
@@ -3657,8 +3667,9 @@ fn check_clause(
     {
       ..with_result,
       spec_kind: Some(clause.kind),
-      walking: if clause.kind == SCost || clause.kind == SSpace { unlowered() }
-      else { with_result.walking },
+      // A clause's nodes are its definition's.
+      walking: if clause.kind == SCost || clause.kind == SSpace { unlowered(env.name) }
+      else { env.name },
     },
     clause.expr,
   );
@@ -3893,26 +3904,35 @@ pub fn is_key(kind: InstanceKind) -> Bool = match kind { NKey -> true, NShow -> 
 
 // --- `check_program` --------------------------------------------------------------------------------------
 
-/// The owner a `cost` clause's walk with its definition's header records under: the law the clause
-/// makes is walked again, and only that walk is lowered.
-pub fn unlowered() -> Bytes = b"#"
+/// The owner a walk of the definition `owner`'s `cost` or `space` clause, or its measure, records
+/// under: none of them is lowered, and a `cost` clause's law is walked again for that.
+pub fn unlowered(owner: Bytes) -> Bytes = owner.concat(b"#")
 
-/// One module's calls on values that call a function of the value's type, keyed by span, as
-/// `expand_member_calls` reads them, each with its callee's parameters out of `signatures`.
+/// The definition a walk `unlowered` names `walked` is of, where it is one.
+pub fn unlowered_of(walked: Bytes) -> Option<Bytes> =
+  if walked.ends_with(b"#") { walked.slice_at(0, walked.len() - 1) } else { None }
+
+/// One module's calls on values that call a function of the value's type, by the owner of the
+/// body each is in and its site, as `member_called_item` reads them, each with its callee's
+/// parameters out of `signatures`.
 pub fn members_in(
   all: List<MemberSite>,
   module: Int,
   signatures: Map<Bytes, Parameters>,
-) -> Map<Bytes, MemberCallee> =
-  all.fold(Map::new(), |acc: Map<Bytes, MemberCallee>, s: MemberSite|
+) -> Map<Bytes, Map<Int, MemberCallee>> =
+  all.fold(Map::new(), |acc: Map<Bytes, Map<Int, MemberCallee>>, s: MemberSite|
     if s.module != module { acc } else {
       let params = match signatures.get(s.callee) { Some(g) -> g.params, None -> [] };
-      acc.insert(span_key(s.span), {
-        qualifier: s.qualifier,
-        name: s.name,
-        names: params.map(|p: ParamInfo| p.name),
-        defaults: params.map(|p: ParamInfo| p.default),
-      })
+      let sites = match acc.get(s.owner) { Some(m) -> m, None -> Map::new() };
+      acc.insert(
+        s.owner,
+        sites.insert(s.site, {
+          qualifier: s.qualifier,
+          name: s.name,
+          names: params.map(|p: ParamInfo| p.name),
+          defaults: params.map(|p: ParamInfo| p.default),
+        }),
+      )
     })
 
 // --- How many times a body performs what its row names --------------------------------------

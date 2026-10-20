@@ -4,8 +4,14 @@
 
 import std.bin
 import std.list
-import syntax.parsing (Span, Ident, ParseDiag, span_to, bare, span_key, dump_diags, positional,
-                       starts_upper, span_between)
+import syntax.parsing (Span, Ident, ParseDiag, span_to, bare, dump_diags, positional, starts_upper,
+                       span_between, minted, made_at, role_update_read, role_update_copy,
+                       role_update_block, role_update_let, role_update_binder, role_member_on,
+                       role_member_field, role_member_callee, role_tag_read, role_tag_let,
+                       role_tag_binder, role_tag_ok, role_witness_callee, role_witness_code,
+                       role_witness, role_witness_passed, role_witness_stated_callee,
+                       role_witness_stated_name, role_try_arg, role_try_unit, role_try_value,
+                       role_try_ok_call, role_try_err_call)
 import syntax.type_syntax (TFn, MWrite, nullary)
 import syntax.items (Module, Item, IFn, ILaw, ISchema, FnDef, Binder, SchemaDef, schema_guard_name,
                      parse, dump_module)
@@ -13,62 +19,70 @@ import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, EApp, EBlock, ERecord, E
                      EField, EPerform, EHandle, ETryBlock, SLet, Param, NamedArg, RecField,
                      expr_span, ETagged, Tagged, tagged_call, tagged_fill, slotted, slot_args,
                      try_places)
-import syntax.patterns (PVar, LUnit, LInt, LStr)
+import syntax.patterns (LUnit, LInt, LStr)
 import std.bytes (ascii_of_int)
 import expand.rewrite.shared (map_item, is_tagged, tagged_in, picked_in, is_try_block, rebound,
-                              any_expr)
-import expand.rewrite.try_operator (var_of, var_pattern, ctor_pattern, expand_try)
+                              any_expr, read_at, bound_at)
+import expand.rewrite.try_operator (ctor_pattern, expand_try)
 import expand.rewrite.handlers (hidden_call, expand_handler_vars, expand_holds)
+import syntax.sites (numbered)
 
 // --- Record update -----------------------------------------------------------------------
 
-/// The literal an update stands for: the base's other fields, in the record's own order, then the
-/// written ones. A call or a perform is bound to a name first, so it runs once however many fields
-/// are copied.
+/// The literal an update stands for, at the update's site: the base's other fields, in the record's
+/// own order, then the written ones. A call or a perform is bound to a name first, so it runs once
+/// however many fields are copied, and each copy reads that one read of it.
 fn expand_update(span: Span, base: Expr, written: List<RecField>, names: List<Bytes>) -> Expr = {
   let base_span = expr_span(base);
-  let at = Some({ name: b"?u".concat(ascii_of_int(base_span.start)), span: base_span });
-  let bound: Option<Ident> = match base { EApp(_) -> at, EPerform(_) -> at, _ -> None };
-  let source = match bound { Some(b) -> EVar({ span: base_span, name: bare(b) }), None -> base };
+  let named = |n: Bytes| { name: n, span: { ..base_span, site: 0 } };
+  let held = b"?u".concat(ascii_of_int(span.site));
+  let bound = match base { EApp(_) -> true, EPerform(_) -> true, _ -> false };
+  let source = if bound { read_at(held, made_at(base_span, span, role_update_read())) }
+  else { base };
   let copies = names.filter(|n: Bytes|
     !written.fold(false, |seen: Bool, w: RecField| seen || w.name.name == n));
-  let copied = copies.map(|n: Bytes| {
-    let field = { name: n, span: base_span };
-    { name: field, value: EField({ span: base_span, base: source, field: field }) }
+  let copied = range(0, copies.len()).map(|i: Int| {
+    let field = named(copies.at_or(i, b""));
+    {
+      name: field,
+      value: EField({
+        span: made_at(base_span, span, role_update_copy(i)),
+        base: source,
+        field: field,
+      }),
+    }
   });
   let literal = ERecord({ span: span, fields: copied.concat(written) });
-  match bound {
-    Some(b) ->
-      EBlock({
-        span: span,
-        tail: Some(literal),
-        stmts: [
-          SLet({ span: base_span, pat: PVar({ span: base_span, name: b }), ty: None, value: base }),
-        ],
-      }),
-    None -> literal,
+  if !bound { literal } else {
+    EBlock({
+      span: minted(span, role_update_block()),
+      tail: Some(literal),
+      stmts: [
+        SLet({
+          span: made_at(base_span, span, role_update_let()),
+          pat: bound_at(held, made_at(base_span, span, role_update_binder())),
+          ty: None,
+          value: base,
+        }),
+      ],
+    })
   }
 }
 
-/// A span the table does not hold belongs to a program that did not check; the lowering declines it.
-fn expanded_update(sh: Map<Bytes, List<Bytes>>, expr: Expr) -> Expr =
+/// A site the table does not hold belongs to a program that did not check; the lowering declines it.
+fn expanded_update(sh: Map<Int, List<Bytes>>, expr: Expr) -> Expr =
   match expr {
-    ERecordUpdate(r) -> match sh.get(span_key(r.span)) {
+    ERecordUpdate(r) -> match sh.get(r.span.site) {
       None -> expr,
       Some(names) -> expand_update(r.span, r.base, r.fields, names),
     },
     _ -> expr,
   }
 
-/// Every update of a checked module replaced by the literal it stands for.
-pub fn expand_record_updates(module: Module, shapes: Map<Bytes, List<Bytes>>) -> Module =
-  if !has_update(module) { module } else {
-    {
-      ..module,
-      items: module.items.map(|item: Item|
-        map_item(item, |expr: Expr| expanded_update(shapes, expr))),
-    }
-  }
+/// Every update of a checked item replaced by the literal it stands for: `shapes` is the field
+/// list of each update's record, by the update's site.
+pub fn updated_item(item: Item, shapes: Map<Int, List<Bytes>>) -> Item =
+  if shapes.len() == 0 { item } else { map_item(item, |expr: Expr| expanded_update(shapes, expr)) }
 
 // --- Calls on values --------------------------------------------------------------------------
 
@@ -100,35 +114,38 @@ fn member_passed(
   }
 }
 
-fn member_var(m: MemberCallee, span: Span) -> Expr =
+/// The callee `m` written at `at`, a node whose names, identifiers, have no site.
+fn member_var(m: MemberCallee, at: Span) -> Expr = {
+  let named = { ..at, site: 0 };
   EVar({
-    span: span,
+    span: at,
     name: {
-      module: if m.qualifier.len() == 0 { None } else { Some({ name: m.qualifier, span: span }) },
-      name: { name: m.name, span: span },
-      span: span,
+      module: if m.qualifier.len() == 0 { None } else { Some({ name: m.qualifier, span: named }) },
+      name: { name: m.name, span: named },
+      span: named,
     },
   })
+}
 
-fn member_called(sites: Map<Bytes, MemberCallee>, expr: Expr) -> Expr =
+fn member_called(sites: Map<Int, MemberCallee>, expr: Expr) -> Expr =
   match expr {
     // A name written through its type. One the parser made (`?show::display` over a hole) can
     // stand at the span of the call it wraps.
     EVar(v) -> match v.name.module {
       None -> expr,
       Some(of) -> if !starts_upper(of.name) { expr } else {
-        match sites.get(span_key(v.name.span)) {
+        match sites.get(v.span.site) {
           Some(m) -> if m.name.len() == 0 { expr } else { member_var(m, v.span) },
           None -> expr,
         }
       },
     },
     EApp(a) -> match a.func {
-      EField(f) -> match sites.get(span_key(a.span)) {
+      EField(f) -> match sites.get(a.span.site) {
         Some(m) -> if m.name.len() == 0 { expr } else {
           EApp({
             span: a.span,
-            func: member_var(m, f.field.span),
+            func: member_var(m, f.span),
             named: [],
             args: member_passed(m, a.span, f.base, a.args, a.named),
             labels: a.labels,
@@ -138,15 +155,19 @@ fn member_called(sites: Map<Bytes, MemberCallee>, expr: Expr) -> Expr =
       },
       _ -> expr,
     },
-    EPerform(p) -> match sites.get(span_key(p.span)) {
+    EPerform(p) -> match sites.get(p.span.site) {
       Some(m) -> {
-        let on = EVar({ span: p.eff.span, name: p.eff });
+        let on = EVar({ span: made_at(p.eff.span, p.span, role_member_on()), name: p.eff });
         let labels = match p.resource { Some(r) -> [r], None -> [] };
         // With no name it is the call of what the binding holds in its field.
         if m.name.len() == 0 {
           EApp({
             span: p.span,
-            func: EField({ span: span_to(p.eff.span, p.op.span), base: on, field: p.op }),
+            func: EField({
+              span: made_at(span_to(p.eff.span, p.op.span), p.span, role_member_field()),
+              base: on,
+              field: p.op,
+            }),
             named: [],
             args: p.args,
             labels: labels,
@@ -154,7 +175,7 @@ fn member_called(sites: Map<Bytes, MemberCallee>, expr: Expr) -> Expr =
         } else {
           EApp({
             span: p.span,
-            func: member_var(m, p.op.span),
+            func: member_var(m, made_at(p.op.span, p.span, role_member_callee())),
             named: [],
             args: member_passed(m, p.span, on, p.args, []),
             labels: labels,
@@ -166,21 +187,16 @@ fn member_called(sites: Map<Bytes, MemberCallee>, expr: Expr) -> Expr =
     _ -> expr,
   }
 
-/// `def` with each call on a value in `sites`, by span, written as the call it is.
-pub fn with_member_calls(def: FnDef, sites: Map<Bytes, MemberCallee>) -> FnDef =
+/// `def` with each call on a value in `sites`, by site, written as the call it is.
+pub fn with_member_calls(def: FnDef, sites: Map<Int, MemberCallee>) -> FnDef =
   if sites.len() == 0 { def } else {
     match map_item(IFn(def), |expr: Expr| member_called(sites, expr)) { IFn(d) -> d, _ -> def }
   }
 
-/// `module` with each call on a value in `sites`, by span, written as the call of the function
-/// of the value's type it is.
-pub fn expand_member_calls(module: Module, sites: Map<Bytes, MemberCallee>) -> Module =
-  if sites.len() == 0 { module } else {
-    {
-      ..module,
-      items: module.items.map(|item: Item| map_item(item, |expr: Expr| member_called(sites, expr))),
-    }
-  }
+/// `item` with each call on a value in `sites`, by site, written as the call of the function of the
+/// value's type it is.
+pub fn member_called_item(item: Item, sites: Map<Int, MemberCallee>) -> Item =
+  if sites.len() == 0 { item } else { map_item(item, |expr: Expr| member_called(sites, expr)) }
 
 // --- Tagged literals -----------------------------------------------------------------------
 
@@ -190,14 +206,19 @@ pub fn expand_member_calls(module: Module, sites: Map<Bytes, MemberCallee>) -> M
 fn settled(expr: Expr) -> Expr =
   match expr {
     ETagged(t) -> {
-      let held = { name: b"?literal", span: t.span };
+      let held = b"?literal";
+      let read = read_at(held, minted(t.span, role_tag_read()));
       EBlock({
         span: t.span,
-        tail: Some(if t.holes.len() == 0 { var_of(held) } else { tagged_fill(t, var_of(held)) }),
+        tail: Some(if t.holes.len() == 0 { read } else { tagged_fill(t, read) }),
         stmts: [
           SLet({
-            span: t.span,
-            pat: ctor_pattern(b"Ok", [var_pattern(held)], t.span),
+            span: minted(t.span, role_tag_let()),
+            pat: ctor_pattern(
+              b"Ok",
+              [bound_at(held, minted(t.span, role_tag_binder()))],
+              minted(t.span, role_tag_ok()),
+            ),
             ty: None,
             value: tagged_call(t),
           }),
@@ -260,12 +281,14 @@ pub fn witness_code(name: Bytes) -> Int =
     None -> 10,
   }
 
-fn witness_expr(w: NumericWitness, span: Span) -> Expr =
+/// Witness `w` written at `span`; a stated one's call has its callee and the name it hands at
+/// `callee` and `name`.
+fn witness_expr(w: NumericWitness, span: Span, callee: Span, name: Span) -> Expr =
   match w {
     ConcreteWitness(n) -> ELit({ span: span, lit: LInt(witness_code(n)) }),
-    ParamWitness(p) -> EVar({ span: span, name: bare({ name: witness_param(p), span: span }) }),
+    ParamWitness(p) -> read_at(witness_param(p), span),
     StatedWitness(ctor) ->
-      hidden_call(span, stated_witness_name(), [ELit({ span: span, lit: LStr(ctor) })]),
+      hidden_call(span, callee, stated_witness_name(), [ELit({ span: name, lit: LStr(ctor) })]),
   }
 
 /// What the elaboration calls for the witness of a type that states its own arithmetic; the
@@ -355,36 +378,57 @@ pub fn elaborated_natives() -> List<Elaborated> =
     { name: b"?encoded", words: 1, raises: false },
   ]
 
-fn witnessed(ops: Map<Bytes, Bytes>, refs: Map<Bytes, List<NumericWitness>>, e: Expr) -> Expr =
+/// The operator at `at`, over the witness of parameter `p`, as the runtime's call `name` of `code`.
+fn witness_call(at: Span, name: Bytes, code: Int, p: Bytes, operands: List<Expr>) -> Expr = {
+  let made = |role: Int| minted(at, role);
+  hidden_call(
+    at,
+    made(role_witness_callee()),
+    name,
+    [
+      ELit({ span: made(role_witness_code()), lit: LInt(code) }),
+      witness_expr(ParamWitness(p), made(role_witness()), at, at),
+    ].concat(
+      operands,
+    ),
+  )
+}
+
+fn witnessed(ops: Map<Int, Bytes>, refs: Map<Int, List<NumericWitness>>, e: Expr) -> Expr =
   match e {
-    EBinary(b) -> match ops.get(span_key(b.span)) {
-      Some(p) -> if b.op == b"eq" || b.op == b"ne" { e } else {
-        hidden_call(b.span, b"?numeric_binary", [
-          ELit({ span: b.span, lit: LInt(numeric_op_code(b.op)) }),
-          witness_expr(ParamWitness(p), b.span),
-          b.lhs,
-          b.rhs,
-        ])
-      },
+    EBinary(b) -> match ops.get(b.span.site) {
+      Some(p) -> if b.op == b"eq" || b.op == b"ne" { e }
+      else { witness_call(b.span, b"?numeric_binary", numeric_op_code(b.op), p, [b.lhs, b.rhs]) },
       None -> e,
     },
-    EUnary(u) -> match ops.get(span_key(u.span)) {
+    EUnary(u) -> match ops.get(u.span.site) {
       Some(p) ->
-        hidden_call(u.span, b"?numeric_unary", [
-          ELit({ span: u.span, lit: LInt(if u.op == b"bitnot" { 1 } else { 0 }) }),
-          witness_expr(ParamWitness(p), u.span),
+        witness_call(u.span, b"?numeric_unary", if u.op == b"bitnot" { 1 } else { 0 }, p, [
           u.operand,
         ]),
       None -> e,
     },
     EApp(a) -> match a.func {
-      EVar(v) -> match refs.get(span_key(v.span)) {
+      EVar(v) -> match refs.get(v.span.site) {
         Some(ws) ->
           EApp({
             ..a,
-            args: a.args.fold(
-              ws.map(|w: NumericWitness| witness_expr(w, v.span)),
-              |acc: List<Expr>, x: Expr| acc.push(x),
+            args: ws.fold(
+              { out: [], i: 0 },
+              |acc: { out: List<Expr>, i: Int }, w: NumericWitness|
+                {
+                  out: acc.out.push(
+                    witness_expr(
+                      w,
+                      minted(v.span, role_witness_passed(acc.i)),
+                      minted(v.span, role_witness_stated_callee(acc.i)),
+                      minted(v.span, role_witness_stated_name(acc.i)),
+                    ),
+                  ),
+                  i: acc.i + 1,
+                },
+            ).out.concat(
+              a.args,
             ),
           }),
         None -> e,
@@ -419,20 +463,17 @@ fn witness_params(orders: Map<Bytes, List<Bytes>>, item: Item) -> Item =
     _ -> item,
   }
 
-/// `orders` holds each witnessed definition's parameters by simple name, as the checker ordered them.
-pub fn expand_witnesses(
-  module: Module,
-  ops: Map<Bytes, Bytes>,
-  refs: Map<Bytes, List<NumericWitness>>,
+/// `item` with each operator over a witness in `ops` and each call passing witnesses in `refs`, by
+/// site, written out; `orders` holds each witnessed definition's parameters by simple name, as the
+/// checker ordered them.
+pub fn witnessed_item(
+  item: Item,
+  ops: Map<Int, Bytes>,
+  refs: Map<Int, List<NumericWitness>>,
   orders: Map<Bytes, List<Bytes>>,
-) -> Module =
-  if ops.len() == 0 && refs.len() == 0 && orders.len() == 0 { module } else {
-    {
-      ..module,
-      items: module.items.map(|item: Item|
-        witness_params(orders, map_item(item, |expr: Expr| witnessed(ops, refs, expr)))),
-    }
-  }
+) -> Item =
+  if ops.len() == 0 && refs.len() == 0 && orders.len() == 0 { item }
+  else { witness_params(orders, map_item(item, |expr: Expr| witnessed(ops, refs, expr))) }
 
 // --- The try block ---------------------------------------------------------------------------
 
@@ -451,53 +492,66 @@ pub fn program_wide(name: Bytes) -> Bytes = b"?".concat(name)
 pub fn named_program_wide(written: Bytes) -> Option<Bytes> / {abort.raise} =
   if written.starts_with(b"?") { Some(written.slice(1, written.len())) } else { None }
 
-fn carried(binders: List<Ident>, span: Span, at: Span) -> Expr =
+/// What `Err` holds of the raise the `try` at `at` answers, which binds `binders`: nothing, the one
+/// value, or the record of them at `record`.
+fn carried(binders: List<Ident>, at: Span, record: Span) -> Expr = {
+  let read = |i: Int, b: Ident| read_at(b.name, minted(at, role_try_arg(i)));
   match binders {
-    [] -> ELit({ span: span, lit: LUnit }),
-    [one] -> var_of(one),
+    [] -> ELit({ span: minted(at, role_try_unit()), lit: LUnit }),
+    [one] -> read(0, one),
     _ ->
       ERecord({
-        span: at,
-        fields: range(0, binders.len()).map(|i: Int|
+        span: record,
+        fields: range(0, binders.len()).fold([], |acc: List<RecField>, i: Int|
           match binders.at(i) {
-            Some(b) -> { name: positional(i, span), value: var_of(b) },
-            None -> { name: positional(i, span), value: ELit({ span: span, lit: LUnit }) },
+            Some(b) -> acc.push({ name: positional(i, { ..at, site: 0 }), value: read(i, b) }),
+            None -> acc,
           }),
       }),
   }
+}
 
-/// `ctor` applied to `value` at `span`, the constructor itself written at `at`.
+/// `ctor`, written at `at`, called at `span` on `value`.
 fn answer(ctor: Bytes, value: Expr, span: Span, at: Span) -> Expr =
-  EApp({ span: span, func: var_of({ name: ctor, span: at }), named: [], args: [value], labels: [] })
+  EApp({ span: span, func: read_at(ctor, at), named: [], args: [value], labels: [] })
 
-/// A span the table does not hold belongs to a program that did not check; the lowering declines it.
-/// The parts the check typed for the `handle` stand at `try_places`, where it filed their types.
-fn expanded_try(answered: Map<Bytes, Answered>, expr: Expr) -> Expr =
+/// A site the table does not hold belongs to a program that did not check; the lowering declines it.
+/// The `handle` takes the `try`'s site; the parts the check typed for it stand at `try_places`.
+fn expanded_try(answered: Map<Int, Answered>, expr: Expr) -> Expr =
   match expr {
-    ETryBlock(t) -> match answered.get(span_key(t.span)) {
+    ETryBlock(t) -> match answered.get(t.span.site) {
       None -> expr,
       Some(a) -> {
         let at = try_places(t.span);
-        let binders = range(0, a.arity).map(|i: Int|
-          { name: b"?r".concat(ascii_of_int(i)), span: t.span });
-        let returned = { name: b"?v", span: t.span };
+        let named = |n: Bytes| { name: n, span: { ..t.span, site: 0 } };
+        let binders = range(0, a.arity).map(|i: Int| named(b"?r".concat(ascii_of_int(i))));
         EHandle({
           span: t.span,
           body: t.body,
           ret: Some({
-            binder: returned,
-            body: answer(b"Ok", var_of(returned), t.span, at.ok),
+            binder: named(b"?v"),
+            body: answer(
+              b"Ok",
+              read_at(b"?v", minted(t.span, role_try_value())),
+              minted(t.span, role_try_ok_call()),
+              at.ok,
+            ),
             span: at.ret,
           }),
           clauses: [
             {
-              eff: bare({ name: program_wide(a.effect), span: t.span }),
-              op: { name: a.op, span: t.span },
+              eff: bare(named(program_wide(a.effect))),
+              op: named(a.op),
               resource: None,
               every_label: false,
               label_binder: None,
               resume: None,
-              body: answer(b"Err", carried(binders, t.span, at.carried), t.span, at.err),
+              body: answer(
+                b"Err",
+                carried(binders, t.span, at.carried),
+                minted(t.span, role_try_err_call()),
+                at.err,
+              ),
               span: at.clause,
               params: binders,
             },
@@ -509,19 +563,12 @@ fn expanded_try(answered: Map<Bytes, Answered>, expr: Expr) -> Expr =
     _ -> expr,
   }
 
-/// Every `try` of a checked module replaced by the `handle` it stands for.
-pub fn expand_try_blocks(module: Module, answered: Map<Bytes, Answered>) -> Module =
-  if !any_expr(module, is_try_block) { module } else {
-    {
-      ..module,
-      items: module.items.map(|item: Item|
-        map_item(item, |expr: Expr| expanded_try(answered, expr))),
-    }
-  }
+/// Every `try` of a checked item replaced by the `handle` it stands for: `answered` is the raise
+/// each answers, by the `try`'s site.
+pub fn tried_item(item: Item, answered: Map<Int, Answered>) -> Item =
+  if answered.len() == 0 { item } else { map_item(item, |expr: Expr| expanded_try(answered, expr)) }
 
 // --- Running the rewrites --------------------------------------------------------------------
-
-fn has_update(module: Module) -> Bool = any_expr(module, is_update)
 
 fn is_update(expr: Expr) -> Bool = match expr { ERecordUpdate(_) -> true, _ -> false }
 
@@ -532,7 +579,7 @@ pub fn fn_has_update(def: FnDef) -> Bool =
 fn has_try(m: Module) -> Bool = any_expr(m, |expr: Expr| match expr { ETry(_) -> true, _ -> false })
 
 /// Only when the grammar met a `?` or a law schema. A record update needs the checker's answer for
-/// its base, so `expand_record_updates` runs later, over a checked program.
+/// its base, so `updated_item` runs later, over a checked program.
 pub fn expand(
   module: Module,
   diags: List<ParseDiag>,
@@ -704,13 +751,13 @@ test "a tagged literal's holes are read as a call's arguments are, and it runs a
 
 test "a `try` the checker read is written out as its `handle`, and one it did not is left" {
   let module = parse(b"fn f(n: Int) -> Int = try { g(n) }").node;
-  let written = |answered: Map<Bytes, Answered>|
-    String::of_bytes(dump_module(expand_try_blocks(module, answered)));
+  let item = numbered(module.items.get(0));
+  let site = picked_in({ ..module, items: [item] }, is_try_block).map(|e: Expr| expr_span(e).site);
+  let written = |answered: Map<Int, Answered>|
+    String::of_bytes(dump_module({ ..module, items: [tried_item(item, answered)] }));
   let left = written(Map::new());
   assert(left.contains("22:34:etrb;"));
-  let out = written(
-    Map::new().insert(span_key(span_between(22, 34)), { effect: b"m.p", op: b"bad", arity: 2 }),
-  );
+  let out = written(Map::new().insert(site.get(0), { effect: b"m.p", op: b"bad", arity: 2 }));
   assert(out.contains("22:34:ehnd;"));
   // The clause names its effect program-wide, as `?m.p`, and answers the tuple of what it binds.
   assert(out.contains("@3f6d2e70;"));
@@ -783,18 +830,23 @@ test "a tagged literal and a `try` in a schema or in what a law instantiates one
 test "each native the elaboration writes a call of is passed the words it is declared to take" {
   let declared = elaborated_natives().fold(Map::new(), |acc: Map<Bytes, Int>, n: Elaborated|
     acc.insert(n.name, n.words));
-  let numeric = parse(b"fn f<a>(x: a, y: a) -> a where numeric(a) = x + -y\n").node;
+  let parsed = parse(b"fn f<a>(x: a, y: a) -> a where numeric(a) = x + -y\n").node;
+  let numeric = { ..parsed, items: parsed.items.map(numbered) };
   let operators = picked_in(numeric, |e: Expr| true).fold(
     Map::new(),
-    |acc: Map<Bytes, Bytes>, e: Expr|
+    |acc: Map<Int, Bytes>, e: Expr|
       match e {
-        EBinary(b) -> acc.insert(span_key(b.span), b"a"),
-        EUnary(u) -> acc.insert(span_key(u.span), b"a"),
+        EBinary(b) -> acc.insert(b.span.site, b"a"),
+        EUnary(u) -> acc.insert(u.span.site, b"a"),
         _ -> acc,
       },
   );
   let written = [
-    expand_witnesses(numeric, operators, Map::new(), Map::new()),
+    {
+      ..numeric,
+      items: numeric.items.map(|item: Item|
+        witnessed_item(item, operators, Map::new(), Map::new())),
+    },
     expand_holds(parse(b"fn f() -> Int = with_hold[r](1, |x: Int| ()) { h -> h.get() }\n").node),
     expand_handler_vars(
       parse(

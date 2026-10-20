@@ -3,7 +3,10 @@
 //! and printed.
 
 import check.types (Type, TyCon, TyVar)
-import syntax.parsing (dummy_span, span_between)
+import syntax.parsing (Span, dummy_span)
+import syntax.exprs (Expr, EBlock, SLet, expr_span)
+import syntax.items (Item, IFn, parse)
+import syntax.sites (numbered)
 import emit.code (PxList, PxVar)
 import emit.keys (Named)
 import emit.tir (RInt, RBool, RNum, RWord, RMaybe, RFloat, RCases, RSlice, Var, AVar, AInt, ABool,
@@ -32,6 +35,15 @@ fn body_of(src: Bytes, name: Bytes) -> Result<Block, Bytes> / {abort.raise} =
     Err(why) -> Err(why),
     Ok(p) -> match formed(p, name) { Ok(f) -> Ok(f.body), Err(no) -> Err(no.why) },
   }
+
+/// Where the node `pick` finds in the body of definition `name` of `src` stands, its site as the
+/// check numbers it.
+fn placed_in(src: Bytes, name: Bytes, pick: (Expr) -> Span) -> Span / {abort.raise} =
+  parse(src).node.items.fold(dummy_span(), |acc: Span, item: Item|
+    match numbered(item) {
+      IFn(d) -> if d.name.name == name { pick(d.body) } else { acc },
+      _ -> acc,
+    })
 
 /// The arms of the first `Match` of `body`.
 fn arms_of(body: Block) -> List<Block> =
@@ -92,8 +104,11 @@ test "integer literals and ranges are tested in a Case each, and an arm that doe
   let j = int_var(1);
   let tested = |t: Test, then: Block|
     Case({ on: n, test: t, arms: [{ when: 0, body: then }], rest: [Miss] });
+  let src = b"fn digit(n: Int) -> Int = match n { 0 -> 10, 1..=9 -> n, _ -> 99 }\n";
+  let matched = placed_in(src, b"digit", expr_span);
+  assert_eq(matched.start == 26 && matched.end == 66, true);
   assert_eq(
-    body_of(b"fn digit(n: Int) -> Int = match n { 0 -> 10, 1..=9 -> n, _ -> 99 }\n", b"digit"),
+    body_of(src, b"digit"),
     Ok([
       Decl(j),
       Match({
@@ -102,8 +117,7 @@ test "integer literals and ranges are tested in a Case each, and an arm that doe
           [tested(TRange({ lo: 1, hi: 9 }), [Assign({ var: j, arg: AVar(n) })])],
           [Assign({ var: j, arg: AInt(99) })],
         ],
-        // The match is written from byte 26 to byte 66.
-        rest: [Fail({ why: NoArm, at: span_between(26, 66) })],
+        rest: [Fail({ why: NoArm, at: matched })],
       }),
       Return(AVar(j)),
     ]),
@@ -440,18 +454,22 @@ test "a record or tuple pattern tests nothing and reads the fields it binds" {
 test "a refutable let tests its pattern and fails the let where it does not hold" {
   let o = maybe_int(0);
   let n = int_var(1);
+  let src = b"fn unwrap(o: Option<Int>) -> Int / {abort.raise} = { let Some(n) = o; n }\n";
+  let bound = placed_in(src, b"unwrap", |e: Expr|
+    match e {
+      EBlock(b) -> match b.stmts.at(0) { Some(SLet(l)) -> l.span, _ -> dummy_span() },
+      _ -> dummy_span(),
+    });
+  // The `let` is written from byte 53 to byte 69, its `;` included.
+  assert_eq(bound.start == 53 && bound.end == 69, true);
   assert_eq(
-    body_of(
-      b"fn unwrap(o: Option<Int>) -> Int / {abort.raise} = { let Some(n) = o; n }\n",
-      b"unwrap",
-    ),
+    body_of(src, b"unwrap"),
     Ok([
       Case({
         on: o,
         test: TTag([b"None", b"Some"]),
         arms: [{ when: 1, body: [] }],
-        // The `let` is written from byte 53 to byte 69, its `;` included.
-        rest: [Fail({ why: NoLet, at: span_between(53, 69) })],
+        rest: [Fail({ why: NoLet, at: bound })],
       }),
       bind(n, Get({ of: o, path: PArg({ ctor: b"Some", at: 0 }) })),
       Return(AVar(n)),

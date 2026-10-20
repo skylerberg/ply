@@ -1,0 +1,187 @@
+//! Types by node: every node a body is lowered from stands at a site of its own in its item, what the
+//! checker filed of it is read there, and the shapes whose nodes once shared a place lower clean.
+
+import syntax.parsing (qname_text)
+import syntax.patterns (dump_lit)
+import syntax.items (Item, ITest, test_run, test_listing)
+import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
+                     ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
+                     EParallel, EBad, ETryBlock, ETagged, RecField, expr_span)
+import expand.rewrite.shared (picked_in)
+import check.resolve.tables (ParsedModule, Diag)
+import check.infer (expanded_mods, item_owner)
+import check.infer.checker (test_owner, cases_root, law_root)
+import front (analyse_pulling_std_with)
+import front.seam (Analysed, Refused)
+import front.published (facts_read, rows_of, walked_facts, no_rows)
+import front.facts (Analysis)
+import emit.compare (answered_by_form)
+
+/// What a node is apart from what it holds: its kind, and its name, operator or literal.
+fn head(e: Expr) -> Bytes / {abort.raise} =
+  match e {
+    ELit(l) -> b"literal ".concat(dump_lit(l.lit)),
+    EVar(v) -> b"read ".concat(qname_text(v.name)),
+    EBinary(b) -> b"binary ".concat(b.op),
+    EUnary(u) -> b"unary ".concat(u.op),
+    ELambda(_) -> b"lambda",
+    EApp(_) -> b"call",
+    EIf(_) -> b"if",
+    EMatch(_) -> b"match",
+    EBlock(_) -> b"block",
+    ERecord(r) -> b"record ".concat(Bytes::join(r.fields.map(|f: RecField| f.name.name), b",")),
+    ERecordUpdate(_) -> b"update",
+    ETry(_) -> b"?",
+    EField(f) -> b"field ".concat(f.field.name),
+    EList(_) -> b"list",
+    EPerform(p) -> b"perform ".concat(p.op.name),
+    EHandle(_) -> b"handle",
+    EWithHold(_) -> b"with_hold",
+    ESimulate(_) -> b"simulate",
+    EParallel(_) -> b"parallel",
+    EBad(_) -> b"bad",
+    ETryBlock(_) -> b"try",
+    ETagged(_) -> b"tagged",
+  }
+
+type Shared = { owner: Bytes, site: Int, heads: List<Bytes> }
+
+/// Each site of an item of module `m` of `a`, written out as the emitter lowers it, two nodes of
+/// different heads stand at, a test's run and listing taken together.
+fn shared_sites(a: Analysis) -> List<Shared> / {abort.raise} =
+  match facts_read(rows_of(a), walked_facts(a), None, a.mods) {
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Ok(facts) -> {
+      let mods = expanded_mods(a.mods, facts.elaboration, a.r.signatures);
+      let m = mods.fold(None, |acc: Option<ParsedModule>, x: ParsedModule|
+        if x.name == b"m" { Some(x) } else { acc });
+      match m {
+        None -> panic("no module m"),
+        Some(written) ->
+          written.module.items.fold([], |acc: List<Shared>, item: Item| {
+            let trees = match item {
+              ITest(t) -> match t.cases {
+                Some(c) ->
+                  [
+                    ITest({ ..t, cases: None, body: test_run(t) }),
+                    ITest({ ..t, cases: None, body: test_listing(c) }),
+                  ],
+                None -> [item],
+              },
+              _ -> [item],
+            };
+            let nodes = trees.flat_map(|x: Item|
+              picked_in({ ..written.module, items: [x] }, |_: Expr| true));
+            let by_site = nodes.fold(Map::new(), |held: Map<Int, List<Bytes>>, e: Expr| {
+              let s = expr_span(e).site;
+              held.insert(s, match held.get(s) {
+                Some(hs) -> hs.push_unique(head(e)),
+                None -> [head(e)],
+              })
+            });
+            by_site.fold(acc, |out: List<Shared>, s: Int, hs: List<Bytes>|
+              if hs.len() < 2 { out }
+              else { out.push({ owner: item_owner(b"m", item), site: s, heads: hs }) })
+          }),
+      }
+    },
+  }
+
+/// `std.cases` as far as a test over cases, once expanded, calls it.
+fn cases_module() -> { name: Bytes, src: Bytes } =
+  {
+    name: b"std.cases",
+    src: Bytes::concat_all([
+      b"pub type Table<a> = List<a>\n",
+      b"pub type Listed = { label: String, identity: Bytes }\n",
+      b"pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / {abort.raise | e} =\n",
+      b"  table.map(|c: a| { label: label(c), identity: b\"\" })\n",
+      b"pub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a / {abort.raise} =\n",
+      b"  match table.at(at) { Some(c) -> c, None -> panic(\"no case\") }\n",
+    ]),
+  }
+
+/// A tag whose literals hold holes: its check reads the texts, and `fill` the texts and the holes.
+fn tag_module() -> { name: Bytes, src: Bytes } =
+  {
+    name: b"std.tg",
+    src: Bytes::concat_all([
+      b"pub fn literal(text: String) -> Result<String, { message: String, offset: Int }> = Ok(text)\n",
+      b"pub fn compile(texts: List<String>) -> Result<List<String>, { message: String, offset: Int, part: Int }> = Ok(texts)\n",
+      b"pub fn fill(texts: List<String>, holes: List<Int>) -> Int = texts.len() + holes.len()\n",
+    ]),
+  }
+
+/// A module that writes every node the rewrites make once its items are numbered: a holed tagged
+/// literal, a call on a value copying a default, an update of a call's record, a `try`, a hold, a
+/// handler's variables read by what a clause hands on, a witness passed and read, and a test over
+/// cases.
+fn every_maker() -> Bytes =
+  Bytes::concat_all([
+    b"import std.tg\n",
+    b"type Box = | Box(Int)\n",
+    b"type P = { x: Int, y: Int }\n",
+    b"effect parse {\n  raise bad(why: String)\n}\n",
+    b"effect e {\n  write op(k: Int) -> Int\n}\n",
+    b"fn Box::size(b: Box, extra: Int = 2) -> Int = match b { Box(v) -> v + extra }\n",
+    b"fn mk() -> P = { x: 1, y: 2 }\n",
+    b"fn digit(b: Int) -> Int / {parse.bad} = if b < 10 { b } else { parse.bad(\"no\") }\n",
+    b"fn twice<a>(x: a) -> a where numeric(a) = x + x\n",
+    b"fn holed(n: Int) -> Int = tg\"a {n} b {n + 1}\"\n",
+    b"fn sized(b: Box) -> Int = b.size()\n",
+    b"fn moved() -> P = { ..mk(), x: 3 }\n",
+    b"fn tried(b: Int) -> Result<Int, String> = try { digit(b) }\n",
+    b"fn held() -> Int = with_hold[r](1, |x: Int| ()) { h -> 7 }\n",
+    b"fn counted() -> Int = handle { e.op(1) } with { var n = 0, e.op(k) -> { n = k; let f = |j: Int| j + n; f(1) }, return x -> x + n }\n",
+    b"fn doubled() -> Int = twice(3)\n",
+    b"test \"each case is positive\" for c: Int in [1, 2] { assert(c > 0) }\n",
+  ])
+
+fn analysed(src: Bytes) -> Analysis / {abort.raise} =
+  match analyse_pulling_std_with(
+      [{ name: b"m", src: src }],
+      [tag_module(), cases_module()],
+      no_rows(),
+    ).out {
+    Analysed(a) -> a,
+    Refused(ds) -> panic(String::of_bytes_lossy(Bytes::join(ds.map(|d: Diag| d.message), b"\n"))),
+  }
+
+test "no two nodes of an item share a site, whatever wrote them out" {
+  assert_eq(shared_sites(analysed(every_maker())), [])
+}
+
+/// Whether a build writes root `root` of module `m` of text `src`, or why not.
+fn built(src: Bytes, root: Bytes) -> Result<Bool, Bytes> / {abort.raise} =
+  match answered_by_form(src, [tag_module(), cases_module()], root) {
+    Err(why) -> Err(why),
+    Ok(_) -> Ok(true),
+  }
+
+test "a test over cases runs and lists, its two generic callees each at a site of its own" {
+  let src = b"type Pair = { a: Int, b: String }\ntest \"each pair holds\" for p: Pair in [{ a: 1, b: \"x\" }] { assert(p.a > 0) }\n";
+  let owner = test_owner(b"m", b"each pair holds");
+  assert_eq([owner, cases_root(owner)].map(|r: Bytes| built(src, r)), [Ok(true), Ok(true)])
+}
+
+test "a contract's clauses read the types filed for their definition's nodes" {
+  let src = b"fn inc(x: Int) -> Int\n  requires x > 0\n  ensures result > x\n= x + 1\n";
+  assert_eq([b"m.inc#requires#0", b"m.inc#ensures#0"].map(|r: Bytes| built(src, r)), [
+    Ok(true),
+    Ok(true),
+  ])
+}
+
+test "a law's guard and body read the law's own sites, each binder's type among them" {
+  let src = b"type Few = | One | Two\nlaw \"distinct\" forall (a: Few, b: Few) where a != b { a != b }\n";
+  let root = |part: Bytes| law_root(b"m", b"distinct", part);
+  assert_eq([root(b"guard"), root(b"body")].map(|r: Bytes| built(src, r)), [Ok(true), Ok(true)])
+}
+
+test "a holed tagged literal, an update of a call's record, a try, a hold and a handler's variables lower" {
+  let roots = [b"m.holed", b"m.moved", b"m.tried", b"m.counted", b"m.sized", b"m.held"];
+  assert_eq(
+    roots.map(|r: Bytes| { root: r, built: built(every_maker(), r) }),
+    roots.map(|r: Bytes| { root: r, built: Ok(true) }),
+  )
+}
