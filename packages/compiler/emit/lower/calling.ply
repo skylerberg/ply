@@ -7,8 +7,7 @@ import emit.code (Code, Node, NVar, NKnown, NLambda, NApp, NUnary, NBinary, NFie
                   NList, NRecord, NUpdate, NMatch, NPerform, NSimulate, NParallel, NHandle, Lambda,
                   Capture, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm, CodeClause, PxList,
                   PxVar)
-import check.types (Type, TyFn, TyVar, TyCon, Scheme, spelled_type, int_type, bool_type, fn_type,
-                    row_open)
+import check.types (Type, TyFn, TyVar, TyCon, Scheme, int_type, bool_type, fn_type, row_open)
 import emit.typing (unknown_type)
 import syntax.parsing (Span, span_key, starts_upper, dummy_span, read_site)
 import check.resolve.tables (qualify)
@@ -17,8 +16,8 @@ import std.bytes (ascii_of_int)
 import emit.reps (Def, Imported, Carrier, Whole, EmitParam, BoundLambda, erased, has_vars,
                   carrier_of, carriers_at, carried_vars, substituted_fully)
 import emit.c (KBoxed)
-import emit.roots (FnArg, specialisation_of, own_definition)
-import emit.keys (Named, Callee, Root, Generic, root_name)
+import emit.keys (RootKey, FnArg, Named, At, Callee, Root, Generic, root_name, definition_of,
+                  key_types, key_lent)
 import emit.tir
 import emit.tir (Rep, RInt, RBool, RWord, RSlice, Var, Arg, AVar, AInt, AZero, Given, Convention,
                  Val, Prim, Make, Get, Pack, Native, Op, OCalling, MClosure, MCtor, PCapture, TTag,
@@ -40,8 +39,8 @@ import emit.lower.containers (scalar_builtin)
 pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.raise} = {
   let cx = lending({
     setting: setting,
-    key: Named(r.full),
-    full: r.full,
+    key: r.key,
+    full: root_name(r.key),
     base: r.base,
     params: r.params,
     types: r.types,
@@ -130,7 +129,7 @@ fn hands_back(cx: Context, c: Code, i: Int, r: Int) -> Bool / {abort.raise} =
           None -> false,
         })
         && (match target(cx, a.func, a.args) {
-          Some(ToDef(full)) -> own_definition(cx.full) == full,
+          Some(ToDef(full)) -> definition_of(cx.key) == Some(full),
           _ -> false,
         }),
     NIf(x) -> hands_back(cx, x.then_branch, i, r) || hands_back(cx, x.else_branch, i, r),
@@ -400,13 +399,13 @@ pub fn entered(
 /// or, inside a lent lambda, its lender's; the lambda a parameter of this specialisation was handed
 /// by another root (`Some(Some(bl))`); or none where this root was not handed it.
 fn frame_of(cx: Context, owner: Bytes, nth: Int) -> Option<Option<BoundLambda>> =
-  if owner == (match cx.lender { Some(l) -> l.owner, None -> root_name(cx.key) }) { Some(None) }
+  if owner == root_name(match cx.lender { Some(l) -> l.owner, None -> cx.key }) { Some(None) }
   else {
     match cx.params.fold(None, |acc: Option<BoundLambda>, p: EmitParam|
         match acc {
           Some(_) -> acc,
           None -> match p.lambda {
-            Some(bl) -> if bl.owner == owner && bl.nth == nth { Some(bl) } else { None },
+            Some(bl) -> if root_name(bl.owner) == owner && bl.nth == nth { Some(bl) } else { None },
             None -> None,
           },
         }) {
@@ -435,7 +434,7 @@ fn in_frame(
       { cx: cx, st: refuse(st, Calling, b"a known lambda whose closure no variable holds").st },
     Some(closure) -> {
       let sited = match lender {
-        Some(bl) -> emitted(st, Sited(Some({ root: Named(bl.owner), base: bl.base }))),
+        Some(bl) -> emitted(st, Sited(Some({ root: bl.owner, base: bl.base }))),
         None -> st,
       };
       let counted = match lender {
@@ -968,7 +967,7 @@ pub fn closure(
     conv: s.conv,
     // Written inside a lent lambda, its sites are the lender's, as the run it was written in.
     body: match cx.lender {
-      Some(l) -> [Sited(Some({ root: Named(l.owner), base: cx.base }))].concat(insts),
+      Some(l) -> [Sited(Some({ root: l.owner, base: cx.base }))].concat(insts),
       None -> insts,
     },
     lambdas: [],
@@ -1149,7 +1148,7 @@ pub fn known_body(full: Bytes, params: List<EmitParam>, body: Code) -> Code =
     range(0, params.len()).fold([], |acc: List<KnownSlot>, i: Int|
       match match params.at(i) { Some(p) -> p.lambda, None -> None } {
         Some(bl) -> if has_handle(bl.code.body) { acc }
-        else { acc.push({ slot: i, owner: bl.owner, nth: bl.nth, code: bl.code }) },
+        else { acc.push({ slot: i, owner: root_name(bl.owner), nth: bl.nth, code: bl.code }) },
         None -> acc,
       }),
     full,
@@ -1329,7 +1328,7 @@ fn jumped(
   at: Span,
 ) -> Option<Lowered> / {abort.raise} =
   if cx.tails == Calls { None }
-  else if own_definition(cx.full) == d.full && args.len() == cx.params.len()
+  else if definition_of(cx.key) == Some(d.full) && args.len() == cx.params.len()
       && owns(cx, d, ref, fn_args(cx, codes)) {
     let h = handed_all(st, args, params_held(cx), at);
     Some({ st: emitted(h.st, Restart(h.args)), arg: AZero(held_as(cx.setting, cx.answer_ty)) })
@@ -1442,8 +1441,8 @@ fn named_ref(
   at: Span,
   fns: List<FnArg>,
 ) -> Reference / {abort.raise} =
-  if own_definition(cx.full) == d.full {
-    if owns(cx, d, at, fns) { { st: st, callee: Root(cx.key), args: key_types(cx) } }
+  if definition_of(cx.key) == Some(d.full) {
+    if owns(cx, d, at, fns) { { st: st, callee: Root(cx.key), args: key_types(cx.key) } }
     else { { st: st, callee: Root(Named(d.full)), args: [] } }
   } else {
     let given = reference_args(cx, d.def.scheme, at);
@@ -1456,7 +1455,7 @@ fn named_ref(
             ..st.links,
             generics: st.links.generics.push({
               callee: d.full,
-              args: given.map(spelled_type),
+              args: given,
               carried: match d.def.scheme {
                 Some(sc) -> carried_vars(sc, given, d.def.arity),
                 None -> [],
@@ -1475,25 +1474,21 @@ fn named_ref(
 /// always for a definition as it stands; for a specialisation, where it hands the same lambdas and
 /// its type arguments are the root's, or erase to them.
 fn owns(cx: Context, d: Defined, at: Span, fns: List<FnArg>) -> Bool / {abort.raise} =
-  match specialisation_of(cx.full) {
-    Some(s) -> {
+  match cx.key {
+    At(_) -> {
+      let own = key_types(cx.key);
       let given = reference_args(cx, d.def.scheme, at);
-      same_fns(s.fns, fns) && given.len() == s.args.len()
-        && range(0, s.args.len()).all(|j: Int|
-          match s.args.at(j) {
+      same_fns(key_lent(cx.key), fns) && given.len() == own.len()
+        && range(0, own.len()).all(|j: Int|
+          match own.at(j) {
             Some(m) ->
               m == unknown_type()
                 || (match given.at(j) { Some(g) -> g == m || erased(g) == m, None -> false }),
             None -> false,
           })
     },
-    None -> true,
+    _ -> true,
   }
-
-/// The type arguments the root is lowered at, as its name spells them; none for a definition as it
-/// stands.
-fn key_types(cx: Context) -> List<Type> / {abort.raise} =
-  match specialisation_of(cx.full) { Some(s) -> s.args, None -> [] }
 
 /// The type a call of `d` at type arguments `args` answers.
 fn answer_type(d: Def, args: List<Type>) -> Type =
@@ -1611,7 +1606,7 @@ fn fn_args(cx: Context, codes: List<Code>) -> List<FnArg> / {abort.raise} = {
   // Code of a lambda another root lent is that root's, which lends each lambda within it.
   let by = match cx.lender {
     Some(b) -> Some(b),
-    None -> if lends { Some({ owner: owner, written: cx.written }) } else { None },
+    None -> if lends { Some({ owner: cx.key, written: cx.written }) } else { None },
   };
   let handed_as = |j: Int, l: Lambda, acc: List<FnArg>|
     match if has_handle(l.body) { None } else { by } {
@@ -1626,7 +1621,7 @@ fn fn_args(cx: Context, codes: List<Code>) -> List<FnArg> / {abort.raise} = {
       Some(c) -> match c.node {
         NLambda(l) -> handed_as(j, l, acc),
         NKnown(k) -> if k.owner != owner || lends {
-          acc.push({ param: j, owner: k.owner, nth: k.nth })
+          acc.push({ param: j, owner: owner_named(cx, k.owner), nth: k.nth })
         } else { acc },
         NVar(_) -> match named_arity(cx.setting.module, cx.setting.here, cx.setting.imports, c) {
           Some(n) -> handed_as(j, named_lambda(c, n), acc),
@@ -1638,6 +1633,26 @@ fn fn_args(cx: Context, codes: List<Code>) -> List<FnArg> / {abort.raise} = {
     })
 }
 
+/// The key of the root named `name` whose lambda a slot of this body is known to hold: the root
+/// itself, the root that lent the lambda being lowered, or one whose lambda a parameter was handed.
+fn owner_named(cx: Context, name: Bytes) -> RootKey / {abort.raise} = {
+  let held = cx.params.fold(
+    [cx.key].concat(match cx.lender { Some(l) -> [l.owner], None -> [] }),
+    |acc: List<RootKey>, p: EmitParam|
+      match p.lambda { Some(bl) -> acc.push(bl.owner), None -> acc },
+  );
+  match held.fold(None, |found: Option<RootKey>, k: RootKey|
+      match found { Some(_) -> found, None -> if root_name(k) == name { Some(k) } else { None } }) {
+    Some(k) -> k,
+    None ->
+      panic(
+        String::of_bytes_lossy(
+          b"a lambda known from a root this body holds no lambda of: ".concat(name),
+        ),
+      ),
+  }
+}
+
 /// Whether a lambda of the root can be read again where another root runs it: the root is a test,
 /// a definition of no type variable as it stands, or one at type arguments that are all known and
 /// that runs no lambda of another root itself.
@@ -1645,11 +1660,10 @@ fn lends_lambdas(cx: Context) -> Bool / {abort.raise} = {
   let owner = root_name(cx.key);
   is_test_owner(owner)
     || (owner.index_of(b"#") == None
-    && (match specialisation_of(owner) {
-      Some(s) ->
-        s.fns.len() == 0 && owner.index_of(b"|") == None
-          && s.args.all(|t: Type| t != unknown_type() && !has_vars(t)),
-      None -> match cx.setting.here.fold(None, |acc: Option<Def>, d: Def|
+    && (match cx.key {
+      At(a) ->
+        a.lent.len() == 0 && key_types(cx.key).all(|t: Type| t != unknown_type() && !has_vars(t)),
+      _ -> match cx.setting.here.fold(None, |acc: Option<Def>, d: Def|
           if qualify(cx.setting.module, d.name) == owner { Some(d) } else { acc }) {
         Some(d) -> match d.scheme { Some(sc) -> sc.ty_vars.len() == 0, None -> true },
         None -> false,

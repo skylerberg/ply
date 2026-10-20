@@ -4,7 +4,7 @@
 import check.resolve.tables (qualify)
 import check.infer.checker (test_owner, law_root)
 import check.types (Type, TyCon, int_type)
-import emit.keys (Named, Root, Generic)
+import emit.keys (RootKey, FnArg, Named, Root, Generic, at_key, root_name)
 import emit.reps (typed_at, BoundLambda)
 import emit.typing (unknown_type)
 import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSlice, Var, Arg, AVar, AInt, Val, Call,
@@ -18,7 +18,7 @@ import emit.lower.base (GroupMember)
 import emit.lower.calling (known_body, lambdas_of, context_of)
 import emit.answer (GenericCall)
 import emit.own (owned)
-import emit.roots (FnArg, symbol_of, specialised_with)
+import emit.roots (symbol_of)
 import emit.compare (Program, program_of, printed_text, unbuilt, answered_by_form)
 
 fn corpus() -> Bytes =
@@ -155,7 +155,7 @@ fn groups() -> List<List<Bytes>> =
 fn lowered_as_built(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.raise} =
   match match range(0, p.roots.len()).fold(None, |acc: Option<Int>, i: Int|
         match p.roots.at(i) {
-          Some(r) -> if r.full == qualify(b"m", name) { Some(i) } else { acc },
+          Some(r) -> if r.key == Named(qualify(b"m", name)) { Some(i) } else { acc },
           None -> acc,
         }) {
       Some(i) -> p.roots.at(i),
@@ -165,7 +165,7 @@ fn lowered_as_built(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.ra
     Some(r) -> match r.code {
       None -> Err({ by: Spine, why: b"a body that does not lower to Code" }),
       Some(code) -> {
-        let body = known_body(r.full, r.params, code);
+        let body = known_body(root_name(r.key), r.params, code);
         lowered_fn(context_of(p.setting, r, body), body)
       },
     },
@@ -286,7 +286,9 @@ test "a call of a generic definition is the body's generic call at the reference
   match form(b"ident_int") {
     Err(why) -> assert_eq(why, b""),
     Ok(f) -> {
-      assert_eq(f.links.generics, [{ callee: b"m.ident", args: [b"Int"], carried: [0], fns: [] }]);
+      assert_eq(f.links.generics, [
+        { callee: b"m.ident", args: [int_type()], carried: [0], fns: [] },
+      ]);
       assert_eq(
         vals_in(f.body).fold([], |acc: List<List<Rep>>, v: Val|
           match v {
@@ -303,7 +305,7 @@ test "a call of a generic definition is the body's generic call at the reference
     Err(why) -> assert_eq(why, b""),
     Ok(f) ->
       assert_eq(f.links.generics, [
-        { callee: b"m.ident", args: [b"String"], carried: [], fns: [] },
+        { callee: b"m.ident", args: [TyCon({ name: b"String", args: [] })], carried: [], fns: [] },
       ]),
   }
 }
@@ -467,9 +469,9 @@ test "a lambda handed where its callee lends it lies on the caller's stack, and 
       assert_eq(f.links.generics, [
         {
           callee: b"m.apply_to",
-          args: [b"Int"],
+          args: [int_type()],
           carried: [0],
-          fns: [{ param: 0, owner: b"m.lends", nth: 0 }],
+          fns: [{ param: 0, owner: Named(b"m.lends"), nth: 0 }],
         },
       ]);
       assert_eq(
@@ -585,7 +587,7 @@ test "a step iterate runs is a loop over its state and budget, each pass going o
 fn root_at(p: Program, name: Bytes) -> Option<Int> =
   range(0, p.roots.len()).fold(None, |acc: Option<Int>, i: Int|
     match p.roots.at(i) {
-      Some(r) -> if r.full == qualify(b"m", name) { Some(i) } else { acc },
+      Some(r) -> if r.key == Named(qualify(b"m", name)) { Some(i) } else { acc },
       None -> acc,
     })
 
@@ -604,15 +606,15 @@ fn specialised_form(
     Some(r) -> match r.code {
       None -> Err(b"a root of no code"),
       Some(code) -> {
-        let full = specialised_with(r.full, args, fns);
+        let key = at_key(root_name(r.key), args, fns);
         let params = range(0, r.params.len()).map(|i: Int|
           match lent.at(i) {
             Some(Some(bl)) -> { ..r.params.get(i), lambda: Some(bl) },
             _ -> r.params.get(i),
           });
-        let body = known_body(full, params, code);
+        let body = known_body(root_name(key), params, code);
         let setting = { ..p.setting, typed: typed_at(p.setting.typed, args) };
-        match lowered_fn(context_of(setting, { ..r, full: full, params: params }, body), body) {
+        match lowered_fn(context_of(setting, { ..r, key: key, params: params }, body), body) {
           Ok(f) -> Ok(f),
           Err(no) -> Err(no.why),
         }
@@ -635,12 +637,12 @@ fn lent_run(
     Some(l) -> match l.code {
       None -> Err(b"a lender of no code"),
       Some(code) -> {
-        let written = lambdas_of(known_body(l.full, l.params, code));
+        let written = lambdas_of(known_body(root_name(l.key), l.params, code));
         match written.at(0) {
           None -> Err(b"a lender that writes no lambda"),
           Some(first) -> {
             let bound = {
-              owner: l.full,
+              owner: l.key,
               nth: 0,
               code: first,
               named: false,
@@ -656,7 +658,7 @@ fn lent_run(
                 p,
                 generic,
                 args,
-                [{ param: param, owner: l.full, nth: 0 }],
+                [{ param: param, owner: l.key, nth: 0 }],
                 range(0, param + 1).map(|i: Int| if i == param { Some(bound) } else { None }),
               ) {
               Ok(f) -> Ok({ f: f, base: l.base }),
@@ -717,7 +719,7 @@ test "a lent lambda's own lambdas are its lender's: one it binds runs in place, 
           0,
         );
         assert_eq(run.f.links.generics.map(|g: GenericCall| g.fns), [
-          [{ param: 0, owner: b"m.lends_on", nth: 1 }],
+          [{ param: 0, owner: Named(b"m.lends_on"), nth: 1 }],
         ])
       },
     },
@@ -780,7 +782,8 @@ test "a fold's accumulator erased to `Option<_>`, its payload's word, is read as
     b"  range(0, n).fold(None, |acc: Option<{ at: Int, n: Int }>, k: Int|\n",
     b"    match acc { Some(a) -> Some({ at: a.at, n: a.n + 1 }), None -> Some({ at: k, n: 1 }) })\n",
   ]);
-  match answered_by_form(src, [], b"std.prelude.folded_from@?,Option<_>|5=m.spans:0") {
+  let words = TyCon({ name: b"Option", args: [TyCon({ name: b"_", args: [] })] });
+  match answered_by_form(src, [], prelude_fold([unknown_type(), words], b"m.spans")) {
     Err(why) -> assert_eq(why, b""),
     Ok(text) -> assert_eq(text.index_of(b"rt_binary_p"), None),
   }
@@ -791,11 +794,15 @@ test "a lent lambda's parameter is read at what its written type says, a type va
     b"fn heaviest<a>(pairs: List<{ item: a, weight: Int }>) -> Int =\n",
     b"  pairs.fold(0, |most: Int, p: { item: a, weight: Int }| if p.weight > most { p.weight } else { most })\n",
   ]);
-  match answered_by_form(src, [], b"std.prelude.folded_from@?,Int|5=m.heaviest:0") {
+  match answered_by_form(src, [], prelude_fold([unknown_type(), int_type()], b"m.heaviest")) {
     Err(why) -> assert_eq(why, b""),
     Ok(text) -> assert_eq(text.index_of(b"rt_binary_p"), None),
   }
 }
+
+/// The prelude's fold loop at `args`, running the first lambda `lender` writes.
+fn prelude_fold(args: List<Type>, lender: Bytes) -> RootKey =
+  at_key(b"std.prelude.folded_from", args, [{ param: 5, owner: Named(lender), nth: 0 }])
 
 test "a closure a root writes calls a lambda the root was lent through its closure, as a function value" {
   let src = Bytes::concat_all([
@@ -893,7 +900,7 @@ fn formed_root(
   shipped: List<{ name: Bytes, src: Bytes }>,
   root: Bytes,
 ) -> Result<Bool, Bytes> / {abort.raise} =
-  match answered_by_form(src, shipped, root) { Err(why) -> Err(why), Ok(_) -> Ok(true) }
+  match answered_by_form(src, shipped, Named(root)) { Err(why) -> Err(why), Ok(_) -> Ok(true) }
 
 test "a test over cases reads its case at the case's type, which its generic callees' sites agree on" {
   let src = Bytes::concat_all([
@@ -946,10 +953,10 @@ fn group_form(names: List<Bytes>) -> Result<Fn, Bytes> / {abort.raise} =
       let members = names.fold([], |acc: List<GroupMember>, n: Bytes|
         match range(0, p.roots.len()).fold(None, |found: Option<GroupMember>, i: Int|
             match p.roots.at(i) {
-              Some(r) -> if r.full != qualify(b"m", n) { found } else {
+              Some(r) -> if r.key != Named(qualify(b"m", n)) { found } else {
                 match r.code {
                   Some(code) -> {
-                    let body = known_body(r.full, r.params, code);
+                    let body = known_body(root_name(r.key), r.params, code);
                     Some({ cx: context_of(p.setting, r, body), body: body })
                   },
                   None -> found,

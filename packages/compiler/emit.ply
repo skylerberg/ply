@@ -29,8 +29,8 @@ import expand.rewrite (expand)
 import expand.embed (EmbedAt, embed_tables, rewritten)
 import std.bytes (ascii_of_int)
 import emit.c (KBoxed, KInt, Kind, position_of, bytes_join)
-import emit.roots (container_ops, equality_root, ordering_root, written_root_of, specialisation_of,
-                   own_definition, FnArg)
+import emit.roots (container_ops, equality_root, ordering_root, written_root_of)
+import emit.keys (RootKey, Named, At, FnArg, root_name, sited_as, key_types, key_lent)
 import emit.answer (no_tables, sorted_widths, Emitted, Body, Refused, RootAnswer)
 import emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, ModuleDefs, Whole, EmitParam,
                   BoundLambda, OwnerLambdas, kind_of, boxed, Sig, sig_of, param_kinds, param_types,
@@ -38,8 +38,7 @@ import emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, ModuleDefs, Whole, E
 import emit.written (container_code, equality_code, ordering_code, digest_code, at_args,
                      reflection_code, reflected_kind)
 import emit.entry (Prepared, group_emitted, root_emitted, emitted_from)
-import emit.special (specialisations_wanted, Specialised, witnessed_needs, definition_at,
-                     specialised_emitted)
+import emit.special (specialisations_wanted, witnessed_needs, definition_at, specialised_emitted)
 
 /// What an arm that refuses a program before lowering anything can say: the checker's own words, one
 /// per diagnostic. There is no renderer for a diagnostic on this side -- the driver's `explain` has
@@ -72,33 +71,38 @@ fn said_p(diags: List<ParseDiag>) -> Bytes =
 /// instead: those are the names it has.
 pub fn refused_rather_than_emitted(
   sources: List<Source>,
-  wanted: Option<Map<Bytes, Bool>>,
+  wanted: Option<List<RootKey>>,
   why: Bytes,
 ) -> List<Emitted> =
   List::map(
     match wanted {
-      Some(m) -> m.keys(),
+      Some(ks) -> wanted_names(ks).keys(),
       None -> sources.map(|source: Source| source.name).map(|n: Bytes| n),
     },
     |n: Bytes| { name: n, text: b"", tables: no_tables(), why: Some(why) },
   )
 
+/// The names the roots `wanted` print as, each once.
+fn wanted_names(wanted: List<RootKey>) -> Map<Bytes, Bool> =
+  wanted.fold(Map::new(), |m: Map<Bytes, Bool>, k: RootKey| m.insert(root_name(k), true))
+
 /// Resolved together first, so defaults are filled and derives expanded; a program that does not resolve emits nothing.
-/// Every root is resolved against, but only those `wanted` names are emitted; `None` wants them all.
-/// `pkgs` and `placed` are the program's package tables, empty for one without packages:
+/// Every root is resolved against, but only the roots `wanted` keys are emitted; `None` wants them
+/// all. `pkgs` and `placed` are the program's package tables, empty for one without packages:
 /// resolution then treats every module as one package's, which is what no packages means.
 pub fn emit_program(
   given: List<Source>,
   ctors: Ctors,
   builtins: List<Bytes>,
   release: Bool,
-  wanted: Option<Map<Bytes, Bool>>,
+  roots: Option<List<RootKey>>,
   pkgs: List<PackageDeps>,
   placed: List<Int>,
   embeds: List<EmbedAt>,
   rows: Rows,
   walked: Bytes,
 ) -> List<Emitted> / {abort.raise} = {
+  let wanted = match roots { Some(ks) -> Some(wanted_names(ks)), None -> None };
   // Every module imports `std.prelude`, which a caller may leave out; it is a shipped module.
   let sources = with_prelude_source(given);
   let module_packages = if sources.len() == given.len() || pkgs.len() == 0 { placed }
@@ -126,7 +130,7 @@ pub fn emit_program(
       |acc: Option<Bytes>, p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool, why: Bytes }|
         match acc { Some(_) -> acc, None -> if p.bad { Some(p.why) } else { None } },
     ) {
-    Some(why) -> refused_rather_than_emitted(sources, wanted, why),
+    Some(why) -> refused_rather_than_emitted(sources, roots, why),
     None -> {
       let mods0: List<ParsedModule> = parsed.map(
         |p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool, why: Bytes }|
@@ -150,19 +154,18 @@ pub fn emit_program(
           packaged.compiler,
           packaged.shipped,
         ) {
-        ResolveFailed(diags) -> refused_rather_than_emitted(sources, wanted, said(diags)),
+        ResolveFailed(diags) -> refused_rather_than_emitted(sources, roots, said(diags)),
         ResolveSucceeded(x) -> {
           // A specialisation is lowered from its definition's facts, and the lambdas it runs from
           // their owners'.
-          let reading = match wanted {
+          let reading = match roots {
             None -> None,
-            Some(w) ->
+            Some(ks) ->
               Some(
-                w.fold(w, |acc: Map<Bytes, Bool>, root: Bytes, _: Bool|
-                  List::fold(
-                    match specialisation_of(root) { Some(s) -> s.fns, None -> [] },
-                    acc.insert(own_definition(root), true),
-                    |r: Map<Bytes, Bool>, f: FnArg| r.insert(own_definition(f.owner), true),
+                ks.fold(wanted_names(ks), |acc: Map<Bytes, Bool>, k: RootKey|
+                  key_lent(k).fold(
+                    acc.insert(sited_as(k), true),
+                    |r: Map<Bytes, Bool>, f: FnArg| r.insert(sited_as(f.owner), true),
                   )),
               ),
           };
@@ -174,7 +177,7 @@ pub fn emit_program(
                 ),
               Some(w) -> facts_read(rows, w, reading, x.mods),
             } {
-            Err(why) -> refused_rather_than_emitted(sources, wanted, why),
+            Err(why) -> refused_rather_than_emitted(sources, roots, why),
             Ok(facts) -> {
               let pure = facts.pure.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes|
                 acc.insert(n, true));
@@ -221,14 +224,14 @@ pub fn emit_program(
                 });
               let tables_at = |i: Int, m: ParsedModule|
                 match tables.at(i) { Some(Some(t)) -> t, _ -> tables_of(i, m) };
-              let specialised = specialisations_wanted(wanted);
+              let specialised = specialisations_wanted(match roots { Some(ks) -> ks, None -> [] });
               // What an owner lends: its lambdas, read where it lowers them, a definition as it stands
-              // or at the type arguments the owner's name gives; past the first `lambdas` it writes are
+              // or at the type arguments the owner's key gives; past the first `lambdas` it writes are
               // the definitions it names as values.
-              let owner_read = |owner: Bytes| {
-                let of = match specialisation_of(owner) {
-                  Some(s) -> { base: s.base, args: s.args, lends: s.fns.len() == 0 },
-                  None -> { base: owner, args: [], lends: true },
+              let owner_read = |owner: RootKey| {
+                let of = match owner {
+                  At(a) -> { base: a.def, args: key_types(owner), lends: a.lent.len() == 0 },
+                  _ -> { base: root_name(owner), args: [], lends: true },
                 };
                 let dot = range(0, of.base.len()).fold(0 - 1, |acc: Int, k: Int|
                   if of.base.at(k) == 46 { k } else { acc });
@@ -237,7 +240,7 @@ pub fn emit_program(
                 // The lambdas `code`, the owner's body in module `i`, writes, read under `typed`.
                 let lent = |i: Int, m: ParsedModule, code: Code, typed: Map<Bytes, Typed>, base: Int| {
                   let tab = tables_at(i, m);
-                  let emitted = known_body(owner, [], code);
+                  let emitted = known_body(root_name(owner), [], code);
                   let lambdas = lambdas_of(emitted);
                   let written = lambdas.concat(named_in(m.name, tab.here, tab.imports, emitted));
                   match written.at(0) {
@@ -279,7 +282,7 @@ pub fn emit_program(
                           None,
                           |acc: Option<TestDef>, item: Item|
                             match item {
-                              ITest(t) -> if test_owner(m.name, t.name) == owner { Some(t) }
+                              ITest(t) -> if Named(test_owner(m.name, t.name)) == owner { Some(t) }
                               else { acc },
                               _ -> acc,
                             },
@@ -330,14 +333,18 @@ pub fn emit_program(
               // Each owner a wanted specialisation runs a lambda of is read once, for all of them.
               let lent_by = specialised.fold(
                 Map::new(),
-                |acc: Map<Bytes, Option<OwnerLambdas>>, _: Bytes, sps: List<Specialised>|
-                  sps.fold(acc, |held: Map<Bytes, Option<OwnerLambdas>>, sp: Specialised|
-                    sp.fns.fold(held, |h: Map<Bytes, Option<OwnerLambdas>>, f: FnArg|
-                      if h.contains(f.owner) { h }
-                      else { h.insert(f.owner, owner_read(f.owner)) })),
+                |acc: Map<Bytes, Option<OwnerLambdas>>, _: Bytes, sps: List<RootKey>|
+                  sps.fold(acc, |held: Map<Bytes, Option<OwnerLambdas>>, sp: RootKey|
+                    key_lent(sp).fold(held, |h: Map<Bytes, Option<OwnerLambdas>>, f: FnArg| {
+                      let name = root_name(f.owner);
+                      if h.contains(name) { h } else { h.insert(name, owner_read(f.owner)) }
+                    })),
               );
-              let lambda_at = |owner: Bytes, nth: Int|
-                match match lent_by.get(owner) { Some(o) -> o, None -> owner_read(owner) } {
+              let lambda_at = |owner: RootKey, nth: Int|
+                match match lent_by.get(root_name(owner)) {
+                    Some(o) -> o,
+                    None -> owner_read(owner),
+                  } {
                   None -> None,
                   Some(o) -> match o.bound.written.at(nth) {
                     None -> None,
@@ -477,10 +484,10 @@ fn emit_module(
   s: Setting,
   schemes: Map<Bytes, Scheme>,
   wanted: Option<Map<Bytes, Bool>>,
-  specialised: Map<Bytes, List<Specialised>>,
+  specialised: Map<Bytes, List<RootKey>>,
   sites: Map<Bytes, List<Bytes>>,
   ops: List<WitnessOp>,
-  lambda_at: (Bytes, Int) -> Option<BoundLambda> / {abort.raise},
+  lambda_at: (RootKey, Int) -> Option<BoundLambda> / {abort.raise},
 ) -> List<Emitted> / {abort.raise} = {
   let module = s.module;
   let here = s.here;
@@ -496,13 +503,12 @@ fn emit_module(
         };
         let specialisations = (match specialised.get(p.full) { Some(l) -> l, None -> [] }).fold(
           acc.out,
-          |a: List<Emitted>, sp: Specialised|
+          |a: List<Emitted>, sp: RootKey|
             a.push(
               specialised_emitted(
                 { ..s, here: held_whole(here, tail_cycle(module, here, sites, x_module.items, d)) },
                 d,
-                sp.args,
-                sp.fns,
+                sp,
                 lambda_at,
                 schemes,
                 ops,
@@ -514,7 +520,7 @@ fn emit_module(
           None -> if !wants(wanted, p.full) { specialisations } else {
             specialisations.push(
               witnessed_needs(
-                emitted_from(s, p.base, p.full, p.ps, p.known, p.code),
+                emitted_from(s, p.base, Named(p.full), p.ps, p.known, p.code),
                 d,
                 schemes.get(p.full),
                 ops,
@@ -679,7 +685,7 @@ fn emit_module(
                     emitted_from(
                       { ..s, typed: filed_too(s.typed, e.typed) },
                       t.span.start,
-                      d.root,
+                      Named(d.root),
                       [word(b"a"), word(b"b")],
                       true,
                       Some(e.code),
@@ -741,7 +747,7 @@ fn emit_module(
         emitted_from(
           { ..s, here: here.concat(e.here), typed: filed_too(s.typed, e.typed) },
           0,
-          r.root,
+          Named(r.root),
           if r.op.ends_with(b"_from") { [word(b"a"), word(b"b"), index] }
           else if r.op == b"equal" || r.op == b"ordered" { [word(b"a"), word(b"b")] }
           else { [word(b"a")] },
@@ -758,7 +764,7 @@ fn emit_module(
         emitted_from(
           { ..s, typed: filed_too(s.typed, e.typed) },
           0,
-          r.root,
+          Named(r.root),
           [
             {
               name: b"a",
@@ -1003,7 +1009,7 @@ fn clause_roots(
   { out: walked.out, fns: acc.fns }
 }
 
-/// The roots `wanted` names, resolved against the whole program: one entry per root emitted or
+/// The roots `wanted` keys, resolved against the whole program: one entry per root emitted or
 /// refused, in its order, so the driver can drop what was refused. `embeds` is what the front end's
 /// answer says it embedded, `rows` what it published for every definition and test, which spare a
 /// walk of every module no wanted root is in, and `walked` what its check read of the modules it
@@ -1013,7 +1019,7 @@ pub fn emit_roots_answer(
   srcs: List<Bytes>,
   ctors: Ctors,
   builtins: List<Bytes>,
-  wanted: List<Bytes>,
+  wanted: List<RootKey>,
   pkgs: List<PackageDeps>,
   module_packages: List<Int>,
   embeds: List<EmbedAt>,
@@ -1025,7 +1031,7 @@ pub fn emit_roots_answer(
     ctors,
     builtins,
     true,
-    Some(wanted.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true))),
+    Some(wanted),
     pkgs,
     module_packages,
     embeds,

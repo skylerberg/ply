@@ -4,7 +4,6 @@
 import check.types (Type, TyCon, spelled_type, type_bin)
 import check.resolve.tables (qualify)
 import front.published (module_of_root)
-import emit.roots (FnArg, fn_arg_bin)
 import std.bin
 import std.bytes (ascii_of_int)
 
@@ -23,6 +22,11 @@ pub type RootKey =
 /// A type argument a specialisation is keyed by: the type itself, where the body reads which type
 /// it is, or only the layout it is read at, as the layout module spells a layout's key.
 pub type KeyArg = | KeyType(Type) | KeyLayout(Bytes)
+
+/// A literal lambda handed as argument `param`: the `nth` its owner root lowers. Where the owner
+/// stands in its module is no part of it, so a body kept for a definition names the same lambda
+/// wherever the definition moves.
+pub type FnArg = { param: Int, owner: RootKey, nth: Int }
 
 /// An operation written per type. `Equal` and `Order` compare two values of a declared sum;
 /// `Contained` is one of a container's walks (`equal`, `ordered`, their loops).
@@ -46,6 +50,7 @@ pub type Callee = | Root(RootKey) | Generic(Int)
 
 derive bin for KeyArg
 derive bin for TypeOp
+derive bin for FnArg
 derive bin for RootKey
 
 /// The bytes a key is kept and looked up by: its encoding, which is only ever compared or decoded.
@@ -73,7 +78,7 @@ pub fn root_name(k: RootKey) -> Bytes =
               b"|",
               ascii_of_int(f.param),
               b"=",
-              f.owner,
+              root_name(f.owner),
               b":",
               ascii_of_int(f.nth),
             ])),
@@ -133,6 +138,29 @@ fn type_module(ty: Type, otherwise: Bytes) -> Bytes =
 pub fn definition_of(k: RootKey) -> Option<Bytes> =
   match k { Named(n) -> Some(n), At(a) -> Some(a.def), Written(_) -> None, Entered(n) -> Some(n) }
 
+/// The root whose text a root's failure sites count from, as the unit names it: its definition's,
+/// or a written root's own.
+pub fn sited_as(k: RootKey) -> Bytes = match definition_of(k) { Some(d) -> d, None -> root_name(k) }
+
+/// The type arguments a root is lowered at: a specialisation's, none for any other.
+pub fn key_types(k: RootKey) -> List<Type> / {abort.raise} =
+  match k {
+    At(a) ->
+      a.args.map(|x: KeyArg|
+        match x {
+          KeyType(t) -> t,
+          KeyLayout(s) -> panic(String::of_bytes_lossy(b"a root keyed by a layout: ".concat(s))),
+        }),
+    _ -> [],
+  }
+
+/// The lambdas a root runs in place of calls of the parameters they are handed as.
+pub fn key_lent(k: RootKey) -> List<FnArg> = match k { At(a) -> a.lent, _ -> [] }
+
+/// Definition `def` at the types `args`, running `lent` in place.
+pub fn at_key(def: Bytes, args: List<Type>, lent: List<FnArg>) -> RootKey =
+  At({ def: def, args: args.map(KeyType), lent: lent })
+
 test "a key prints as the name roots were spelled with before they were keys" {
   let int = TyCon({ name: b"Int", args: [] });
   let list = TyCon({ name: b"List", args: [int] });
@@ -142,10 +170,15 @@ test "a key prints as the name roots were spelled with before they were keys" {
       At({
         def: b"m.f",
         args: [KeyType(int), KeyType(TyCon({ name: b"_", args: [] }))],
-        lent: [{ param: 1, owner: b"m.g", nth: 0 }],
+        lent: [{ param: 1, owner: Named(b"m.g"), nth: 0 }],
       }),
     ),
     b"m.f@Int,_|1=m.g:0",
+  );
+  // A lambda an owner at type arguments lends is spelled by that owner's own name.
+  assert_eq(
+    root_name(at_key(b"m.f", [], [{ param: 0, owner: at_key(b"m.g", [int], []), nth: 2 }])),
+    b"m.f@|0=m.g@Int:2",
   );
   assert_eq(
     root_name(Written({ op: Equal, ty: TyCon({ name: b"m.Shape", args: [] }), home: b"m" })),
@@ -168,7 +201,9 @@ test "a root's module is read off its key, never off its name" {
   let shape = TyCon({ name: b"geo.Shape", args: [] });
   assert_eq(module_of(Named(b"app.cli.main")), b"app.cli");
   assert_eq(
-    module_of(At({ def: b"lib.h", args: [], lent: [{ param: 0, owner: b"app.g", nth: 1 }] })),
+    module_of(
+      At({ def: b"lib.h", args: [], lent: [{ param: 0, owner: Named(b"app.g"), nth: 1 }] }),
+    ),
     b"lib",
   );
   assert_eq(module_of(Written({ op: Equal, ty: shape, home: b"app" })), b"geo");
@@ -189,4 +224,19 @@ test "two keys are kept apart by their encoding, and one key always encodes alik
     match bin::decode(key_bytes(a), root_key_bin()) { Ok(k) -> Some(k), Err(_) -> None },
     Some(a),
   )
+}
+
+test "a specialisation's definition, types and lambdas are read off its key, an owner's among them" {
+  let int = TyCon({ name: b"Int", args: [] });
+  let owner = at_key(b"app.g", [TyCon({ name: b"List", args: [int] })], []);
+  let k = at_key(b"lib.h", [int], [{ param: 1, owner: owner, nth: 0 }]);
+  assert_eq(definition_of(k), Some(b"lib.h"));
+  assert_eq(sited_as(k), b"lib.h");
+  assert_eq(key_types(k), [int]);
+  assert_eq(key_lent(k).map(|f: FnArg| definition_of(f.owner)), [Some(b"app.g")]);
+  assert_eq(key_lent(k).map(|f: FnArg| key_types(f.owner)), [
+    [TyCon({ name: b"List", args: [int] })],
+  ]);
+  assert_eq(key_types(Named(b"lib.h")), []);
+  assert_eq(sited_as(Written({ op: Reflect, ty: int, home: b"m" })), b"m.reflect#Int")
 }
