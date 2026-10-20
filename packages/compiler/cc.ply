@@ -65,6 +65,8 @@ pub type Toolchain = {
   support: List<String>,
   /// The optimisation flag.
   level: String,
+  /// Whether emitted code checks what it assumes (`PLY_CHECKED`), as a development build's does.
+  checked: Bool,
 }
 
 /// A unit's C cut at its marks: the head every part compiles after, then each part by its label.
@@ -115,8 +117,8 @@ pub fn split(text: Bytes) -> Parts / {abort.raise} = {
 fn key_of(t: Toolchain, flags: List<String>, pieces: List<Bytes>) -> String / {abort.raise} =
   blake3(
     Bytes::concat_all(
-      [t.identity, b"\x00", Bytes::of_string(t.level), b"\x00"].concat(
-        float_flags().concat(flags).map(|f: String| Bytes::of_string(f).concat(b"\x00")).concat(
+      [t.identity, b"\x00"].concat(
+        compile_flags(t).concat(flags).map(|f: String| Bytes::of_string(f).concat(b"\x00")).concat(
           pieces,
         ),
       ),
@@ -126,11 +128,16 @@ fn key_of(t: Toolchain, flags: List<String>, pieces: List<Bytes>) -> String / {a
 
 /// What every compile passes after its level, whatever the level asks for: each `Float` operation
 /// rounded once, as written, so none is fused with another or reordered.
-pub fn float_flags() -> List<String> = ["-ffp-contract=off", "-fno-fast-math"]
+fn float_flags() -> List<String> = ["-ffp-contract=off", "-fno-fast-math"]
 
-/// What `compiler` compiles with at `level`.
-pub fn toolchain_of(compiler: Compiler, level: String) -> Toolchain =
-  { identity: compiler.identity, support: compiler.support, level: level }
+/// What `t` passes every compile before the flags its asker adds: its level, `PLY_CHECKED` defined
+/// where it is checked, and [`float_flags`].
+pub fn compile_flags(t: Toolchain) -> List<String> =
+  [t.level].concat(if t.checked { ["-DPLY_CHECKED"] } else { [] }).concat(float_flags())
+
+/// What `compiler` compiles with at `level`, checked or not.
+pub fn toolchain_of(compiler: Compiler, level: String, checked: Bool) -> Toolchain =
+  { identity: compiler.identity, support: compiler.support, level: level, checked: checked }
 
 /// Each of `runs` run to its end, `toolchain.jobs()` at a time and each waited for in the order it
 /// started: nothing, or what the first refusal said. Every job started is waited for, so none
@@ -255,7 +262,7 @@ fn compiled<[c]>(
   let cache = toolchain.cache();
   let object = |k: Int| work ++ "/" ++ missing.get(k).to_string() ++ ".o";
   let runs = range(0, missing.len()).map(|k: Int|
-    t.support.concat([t.level].concat(float_flags()).concat(flags)).concat([
+    t.support.concat(compile_flags(t).concat(flags)).concat([
       "-c",
       "-o",
       cache ++ "/" ++ object(k),
@@ -480,10 +487,12 @@ pub fn stack_marked(library: Bytes) -> Bytes / {abort.raise} = {
 /// The flags every object of a library a program loads compiles with.
 pub fn library_flags() -> List<String> = ["-fPIC", "-fno-strict-aliasing"]
 
-/// `text`, a unit's C, compiled by the compiler labelled `c` at `level` with `flags` and linked into a
-/// library the cache keeps: its path, or why it was not built. `veneers` is [`shared`]'s.
+/// `text`, a unit's C, compiled by the compiler labelled `c` at `level`, checked or not, with `flags`
+/// and linked into a library the cache keeps: its path, or why it was not built. `veneers` is
+/// [`shared`]'s.
 pub fn library<[c]>(
   level: String,
+  checked: Bool,
   flags: List<String>,
   text: Bytes,
   veneers: Bool = true,
@@ -491,7 +500,7 @@ pub fn library<[c]>(
   match compilers.found[c]() {
     None -> Err(BuildFailed("no C compiler is installed to compile the unit with")),
     Some(compiler) -> {
-      let t = toolchain_of(compiler, level);
+      let t = toolchain_of(compiler, level, checked);
       let parts = split(text);
       let cache = toolchain.cache();
       let made = library_of(
@@ -532,7 +541,7 @@ pub fn executable<[c]>(
   if !toolchain.written(work ++ "/main.c", main) {
     Err("the program's `main` could not be written")
   } else {
-    match ran[c]([t.support.concat([t.level].concat(float_flags()).concat(["-c", "-o", o, c]))]) {
+    match ran[c]([t.support.concat(compile_flags(t).concat(["-c", "-o", o, c]))]) {
       Err(why) -> Err(why),
       Ok(_) -> match ran[c]([t.support.concat(["-o", out, o].concat(objects)).concat(libraries)]) {
         Err(why) -> Err(why),
@@ -587,13 +596,26 @@ test "a manifest reads back as the sources it was written from, and nothing else
 }
 
 test "an object's key moves with its compiler, its level, its flags and its C" {
-  let t = { identity: b"cc 1", support: [], level: "-O2" };
+  let t = { identity: b"cc 1", support: [], level: "-O2", checked: false };
   let base = key_of(t, ["-c"], [b"head", b"text"]);
   assert_eq(key_of(t, ["-c"], [b"head", b"text"]), base);
   assert(key_of({ ..t, identity: b"cc 2" }, ["-c"], [b"head", b"text"]) != base);
   assert(key_of({ ..t, level: "-O0" }, ["-c"], [b"head", b"text"]) != base);
   assert(key_of(t, ["-c", "-fvisibility=hidden"], [b"head", b"text"]) != base);
   assert(key_of(t, ["-c"], [b"head", b"text2"]) != base)
+}
+
+test "a checked toolchain compiles with `PLY_CHECKED` defined and keys its objects apart, and an unchecked one does not" {
+  let compiler = { path: "cc", identity: b"cc 1", support: [] };
+  let development = toolchain_of(compiler, "-O0", true);
+  let release = toolchain_of(compiler, "-O2", false);
+  assert(compile_flags(development).contains("-DPLY_CHECKED"), None);
+  assert(!compile_flags(release).contains("-DPLY_CHECKED"), None);
+  assert(
+    key_of(development, ["-c"], [b"text"])
+      != key_of({ ..development, checked: false }, ["-c"], [b"text"]),
+    None,
+  )
 }
 
 fn elf_of(machine: Int, headers: Bytes, count: Int) -> Bytes / {abort.raise} =
