@@ -9,9 +9,9 @@ import syntax.patterns (Lit, LInt, LBool, LFloat, LFixed, LWide, LChar, LStr, LB
 import check.types (Type, TyVar, TyCon, TyRecord, TyNominal, Field, named_type, spelled_type)
 import emit.typing (unknown_type)
 import syntax.parsing (Span)
-import emit.c (Width, KSum, width_named, lit_int, is_bitop, binary_code)
-import emit.reps (Ctors, Whole, Cases, has_vars, type_vars, carrier_of, compared_by_ctors,
-                  nullary_sum, generic_sum, written_sum)
+import emit.c (Width, width_named, lit_int, is_bitop, binary_code)
+import emit.reps (Ctors, has_vars, type_vars, compared_by_ctors, nullary_sum, generic_sum,
+                  written_sum)
 import emit.answer (Scalar, Exact, literal_bits)
 import emit.keys
 import emit.keys (RootKey, TypeOp, Root, Order, Reflect, Shown, Digest, Contained)
@@ -19,7 +19,7 @@ import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RCases, Ar
                  ABool, AFloat, ANum, AChar, Val, Prim, Literal, Get, Tag, Call, Native, Given,
                  Owned, Let, Decl, Assign, If, Scalars, rep_of_arg, comparison, arithmetic, shift)
 import emit.lower.setting (declared_at)
-import emit.lower.held (held_as, carried_as, arg_path)
+import emit.lower.held (held_as, arg_path)
 import emit.lower.base (Context, Lowering, Lowered, refuse, fresh, bound, bound_as, opened,
                         continued, type_of, handed, noted, set_join, joined, short_circuit,
                         through_runtime, as_words)
@@ -153,14 +153,14 @@ fn classed(
         }
       } else { words(cx, l, r, op, ty, at) },
       CSum(t) -> if eq {
+        // A bare `Equal` is `Ordering`'s, which the prelude declares.
         equal_by(
           cx,
           r.st,
           op,
-          // A bare `Equal` is `Ordering`'s, which the prelude declares.
           keys::written(keys::Equal, t, cx.setting.module),
+          t,
           [l.arg, r.arg],
-          RWord,
           at,
         )
       } else { words(cx, l, r, op, ty, at) },
@@ -170,8 +170,8 @@ fn classed(
           r.st,
           op,
           keys::written(Contained(b"equal"), t, cx.setting.module),
+          t,
           [l.arg, r.arg],
-          RBool,
           at,
         )
       } else { words(cx, l, r, op, ty, at) },
@@ -576,77 +576,52 @@ fn by_runtime(
   handed(w, held_as(cx.setting, ty), at)
 }
 
-/// `==`, or `!=`, through the root `key` names, which takes both operands' words and answers a
-/// `Bool` held as `answer`.
+/// `==`, or `!=`, through the root `key` names, which takes both operands as values of `ty` and
+/// answers their equality.
 fn equal_by(
   cx: Context,
   st: Lowering,
   op: Bytes,
   key: RootKey,
+  ty: Type,
   args: List<Arg>,
-  answer: Rep,
   at: Span,
 ) -> Lowered = {
-  let truth = named_type(b"Bool");
-  let w = root_called(cx, st, key, args, args.map(|_: Arg| RWord), truth, answer, at);
-  // A `Bool`'s word is `true`'s own or not: `!=` reads it so, never opening it to negate it.
-  if op == b"ne" && answer == RWord {
-    bound(cx, w.st, truth, Prim({ op: b"untrue", on: RWord, args: [w.arg] }), at)
-  } else {
-    let e = handed(w, RBool, at);
-    if op == b"ne" { negation(cx, e, at) } else { e }
-  }
+  let e = rooted(cx, st, key, args, ty, named_type(b"Bool"), at);
+  if op == b"ne" { negation(cx, e, at) } else { e }
 }
 
-/// The root `key` names called on `args`, each given as `reps` says, answering a value of `ty` held
-/// as its type says.
+/// The root `key` names, written for values of `ty`, called on `args`, each a value of `ty`, and
+/// answering a value of `answer`: each crossing as a body holds a value of its type, as the root
+/// takes its parameters and answers.
 fn rooted(
   cx: Context,
   st: Lowering,
   key: RootKey,
   args: List<Arg>,
-  reps: List<Rep>,
   ty: Type,
-  answer: Rep,
-  at: Span,
-) -> Lowered =
-  handed(root_called(cx, st, key, args, reps, ty, answer, at), held_as(cx.setting, ty), at)
-
-/// The root `key` names called on `args`, each given as `reps` says, its answer a value of `ty` held
-/// as the root hands it back, `answer`.
-fn root_called(
-  cx: Context,
-  st: Lowering,
-  key: RootKey,
-  args: List<Arg>,
-  reps: List<Rep>,
-  ty: Type,
-  answer: Rep,
+  answer: Type,
   at: Span,
 ) -> Lowered = {
-  let given = range(0, args.len()).fold(
-    { st: st, args: [] },
-    |acc: { st: Lowering, args: List<Arg> }, i: Int|
-      match args.at(i) {
-        None -> acc,
-        Some(x) -> {
-          let h = handed(
-            { st: acc.st, arg: x },
-            match reps.at(i) { Some(r) -> r, None -> RWord },
-            at,
-          );
-          { st: h.st, args: acc.args.push(h.arg) }
-        },
-      },
-  );
+  let rep = held_as(cx.setting, ty);
+  let held = held_as(cx.setting, answer);
+  let given = args.fold({ st: st, args: [] }, |acc: { st: Lowering, args: List<Arg> }, x: Arg| {
+    let h = handed({ st: acc.st, arg: x }, rep, at);
+    { st: h.st, args: acc.args.push(h.arg) }
+  });
   bound_as(
     given.st,
-    ty,
     answer,
+    held,
     Call({
       callee: Root(key),
       args: given.args,
-      conv: { params: given.args.map(|_: Arg| Given), reps: reps, answer: answer, answered: Owned },
+      conv: {
+        params: given.args.map(|_: Arg| Given),
+        reps: given.args.map(|_: Arg| rep),
+        answer: held,
+        answered: Owned,
+      },
       stops: false,
     }),
     at,
@@ -704,18 +679,7 @@ fn c_orders(c: Class, ty: Type) -> Bool =
 fn by_root(cx: Context, st: Lowering, ty: Type, a: Arg, b: Arg, at: Span) -> Option<Lowered> = {
   let order = named_type(b"Ordering");
   let at_root = |op: TypeOp, t: Type|
-    Some(
-      rooted(
-        cx,
-        st,
-        keys::written(op, t, cx.setting.module),
-        [a, b],
-        [RWord, RWord],
-        order,
-        RWord,
-        at,
-      ),
-    );
+    Some(rooted(cx, st, keys::written(op, t, cx.setting.module), [a, b], t, order, at));
   match class_of(cx.setting.ctors, ty) {
     CNullary(t) -> if spelled_type(t).index_of(b".") != None { at_root(Order, t) } else { None },
     CSum(t) -> if spelled_type(t).index_of(b".") != None { at_root(Order, t) } else { None },
@@ -876,27 +840,17 @@ pub fn runtime_builtin(
     _ -> refuse(st, Scalars, b"a builtin called with other than its arguments: ".concat(name)),
   }
 
-/// What the root written for `op` of a value of `ty` answers for `a`, which it takes held as the
-/// root is handed it: an `Option` as its payload's word, a `Result` as its tagged word where it is
-/// one, anything else as its word.
+/// What the root written for `op` of a value of `ty` answers for `a`.
 fn written(cx: Context, st: Lowering, op: TypeOp, ty: Type, a: Arg, at: Span) -> Lowered =
   rooted(
     cx,
     st,
     keys::written(op, ty, cx.setting.module),
     [a],
-    [taken_as(ty)],
+    ty,
     match op { Digest -> named_type(b"Bytes"), _ -> named_type(b"std.value.Value") },
-    RWord,
     at,
   )
-
-fn taken_as(ty: Type) -> Rep =
-  match carrier_of(ty) {
-    Whole(KSum(s)) -> carried_as(Whole(KSum(s))),
-    Cases(c) -> carried_as(Whole(KSum(c.spec))),
-    _ -> RWord,
-  }
 
 /// A width's wrapping, saturating or checked builtin at the type its operands hold, in C where a
 /// register holds the width, saturating and checked only below 64 bits, where the exact answer fits

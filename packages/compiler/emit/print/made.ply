@@ -14,8 +14,9 @@ import emit.pieces (Piece, Text, Hole, ShapeOf, TagOf, spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases,
                  RSlice, RToken, Leaf, Var, Arg, AVar, AInt, AZero, Made, MRecord, MCtor, MLaid,
                  MBox, MCase, Path, PField, PNamed, PArg, PCapture, PLeaf, PPlace, PCase, PPayload,
-                 Data, rep_of_arg, rep_said, var_said, made_said, parts_of, parts_count)
-import emit.lower.held (tail_bits, fields_of, leaves_of, case_leaves_all, case_span, enumerated)
+                 RUnit, Data, rep_of_arg, rep_said, var_said, made_said, parts_of, parts_count)
+import emit.lower.held (tail_bits, fields_of, leaves_of, case_leaves_all, case_span, enumerated,
+                        passing, ByReference, InWords, answer_buffer, value_words)
 import emit.print.text (Printing, Place, printing, line, pieces, pad, temp, named, name_of,
                         arg_text, check, zero, field_hole, part_names, part_name, part_named,
                         shape_at, slot, unprinted)
@@ -137,47 +138,129 @@ pub fn word_as(w: Bytes, r: Rep) -> Bytes =
 // What crosses a root's boundary: its head, its entry, its return.
 
 /// The C types a root whose parameters are held as `params` and which answers as `answer` is
-/// declared with: what it returns, then each parameter's values', then the pointers it writes its
-/// answer's other values through. The unit holds a call's head to its callee's by these.
+/// declared with: what it returns, then each parameter's values' (for one crossing by reference the
+/// address of the caller's copy of its words, then its box word), then the address of the buffer it
+/// writes its answer's other values into, where it has any. The unit holds a call's head to its
+/// callee's by these.
 pub fn head_types(params: List<Rep>, answer: Rep) -> { answer: Bytes, params: List<Bytes> } =
   {
     answer: c_type(answer),
-    params: params.fold([], |acc: List<Bytes>, r: Rep| acc.concat(c_types(r))).concat(
-      out_types(answer),
-    ),
+    params: params.fold([], |acc: List<Bytes>, r: Rep|
+      acc.concat(match passing(r) {
+        ByReference -> if boxed(r) { [b"Word*", b"Word"] } else { [b"Word*"] },
+        InWords -> c_types(r),
+      })).concat(if answer_buffer(answer) > 0 { [b"Word*"] } else { [] }),
   }
 
 /// The C parameters of the head of a root whose parameters are held as `params` and which answers
-/// as `answer`: each parameter's value `p<i>`, or its values `p<i>_<k>`, then the pointers `o<k>`.
+/// as `answer`: `head_names`, each declared at its type.
 pub fn head_params(params: List<Rep>, answer: Rep) -> List<Bytes> = {
-  let ins = range(0, params.len()).fold([], |acc: List<Bytes>, i: Int|
-    match params.at(i) {
-      Some(r) -> acc.concat(typed_names(c_types(r), part_names(b"p".concat(ascii_of_int(i)), r))),
-      None -> acc,
-    });
-  let outs = out_types(answer);
-  ins.concat(typed_names(outs, range(1, outs.len() + 1).map(|k: Int| b"o".concat(ascii_of_int(k)))))
+  let types = head_types(params, answer).params;
+  let names = head_names(params, answer);
+  range(0, types.len()).map(|k: Int| Bytes::concat_all([nth(types, k), b" ", nth(names, k)]))
 }
 
-fn typed_names(ts: List<Bytes>, ns: List<Bytes>) -> List<Bytes> =
-  range(0, ts.len()).map(|k: Int| Bytes::concat_all([nth(ts, k), b" ", nth(ns, k)]))
+/// The names of the C parameters of the head of a root whose parameters are held as `params` and
+/// which answers as `answer`: each parameter's value `p<i>`, or its values `p<i>_<k>` (for one
+/// crossing by reference `p<i>`, the address of its words, then its box word), then `o`, the
+/// answer's buffer.
+pub fn head_names(params: List<Rep>, answer: Rep) -> List<Bytes> =
+  range(0, params.len()).fold([], |acc: List<Bytes>, i: Int|
+    match params.at(i) {
+      Some(r) -> {
+        let name = b"p".concat(ascii_of_int(i));
+        acc.concat(match passing(r) {
+          ByReference -> if boxed(r) { [name, part_name(name, buffer_parts(r).len())] }
+          else { [name] },
+          InWords -> part_names(name, r),
+        })
+      },
+      None -> acc,
+    }).concat(if answer_buffer(answer) > 0 { [b"o"] } else { [] })
 
-/// The pointers' C types a root answering as `r` writes the values of its answer past the first
-/// through: a flat record's other leaves and its word, a sum's every leaf.
-fn out_types(r: Rep) -> List<Bytes> =
-  match r {
-    RFlat(ls) -> ls.drop(1).map(|l: Leaf| one_type(l.rep).concat(b"*")).push(b"Word*"),
-    RCases(_) -> case_leaves_all(r).map(|l: Leaf| one_type(l.rep).concat(b"*")),
-    _ -> [],
-  }
+/// Whether a value held as `r` has a box word after its other C values.
+pub fn boxed(r: Rep) -> Bool = match r { RFlat(_) -> true, _ -> false }
 
-/// A root answering as `answer` returning `a`: each of its values past the first written through
-/// its pointer, and the C expression the first is returned as.
+/// How each C value a value held as `r` lays in a caller's buffer is held: all but its box word.
+pub fn buffer_parts(r: Rep) -> List<Rep> =
+  match r { RFlat(ls) -> ls.map(|l: Leaf| l.rep), _ -> parts_of(r) }
+
+/// The statements opening each parameter of `names`, held as `reps`, that crosses by reference:
+/// each of its C values but its box word declared from the caller's copy of its words, taking the
+/// counts that copy held.
+pub fn params_opened(names: List<Bytes>, reps: List<Rep>) -> List<Bytes> =
+  range(0, reps.len()).fold([], |acc: List<Bytes>, i: Int|
+    match reps.at(i) {
+      Some(r) -> match passing(r) {
+        InWords -> acc,
+        ByReference -> {
+          let name = nth(names, i);
+          let held = buffer_parts(r);
+          let ns = part_names(name, r);
+          let read = parts_read(name, held);
+          acc.push(
+            Bytes::join(
+              range(0, held.len()).map(|k: Int|
+                Bytes::concat_all([
+                  one_type(match held.at(k) { Some(h) -> h, None -> RWord }),
+                  b" ",
+                  nth(ns, k),
+                  b" = ",
+                  nth(read, k),
+                  b";",
+                ])),
+              b" ",
+            ),
+          )
+        },
+      },
+      None -> acc,
+    })
+
+/// The words a buffer holds of the C values `exprs`, held as `reps`, in order: each value's bits, a
+/// `Decimal`'s two words, nothing of a value of no words.
+pub fn words_laid(exprs: List<Bytes>, reps: List<Rep>) -> List<Bytes> =
+  range(0, reps.len()).fold([], |acc: List<Bytes>, k: Int| {
+    let e = nth(exprs, k);
+    acc.concat(match reps.at(k) {
+      Some(RFloat) -> [Bytes::concat_all([b"ply_f64_bits(", e, b")"])],
+      Some(RDec) -> [Bytes::concat_all([b"(", e, b").lo"]), Bytes::concat_all([b"(", e, b").hi"])],
+      Some(RUnit) -> [],
+      Some(RWord) -> [e],
+      _ -> [Bytes::concat_all([b"(Word)(", e, b")"])],
+    })
+  })
+
+/// The C values, held as `reps`, that the buffer at `base` holds from its first word, as
+/// `words_laid` lays them.
+pub fn parts_read(base: Bytes, reps: List<Rep>) -> List<Bytes> =
+  reps.fold({ at: 0, out: [] }, |acc: { at: Int, out: List<Bytes> }, r: Rep| {
+    let word = |k: Int| Bytes::concat_all([base, b"[", ascii_of_int(acc.at + k), b"]"]);
+    {
+      at: acc.at + value_words(r),
+      out: acc.out.push(match r {
+        RFloat -> Bytes::concat_all([b"ply_f64(", word(0), b")"]),
+        RDec -> Bytes::concat_all([b"(PlyDec){", word(0), b", ", word(1), b"}"]),
+        RUnit -> b"0",
+        RWord -> word(0),
+        _ -> Bytes::concat_all([b"(", one_type(r), b")", word(0)]),
+      }),
+    }
+  }).out
+
+/// The C values of an answer held as `r`: `first`, the one its root returns, then those its root
+/// wrote into the buffer at `base`.
+pub fn answer_parts(first: Bytes, base: Bytes, r: Rep) -> List<Bytes> =
+  [first].concat(parts_read(base, parts_of(r).drop(1)))
+
+/// A root returning `a`: its values past the first written into the buffer `o` as words, and the C
+/// expression the first is returned as.
 pub fn returned(pr: Printing, depth: Int, a: Arg) -> { pr: Printing, value: Bytes } = {
   let ps = arg_parts(pr, a);
+  let ws = words_laid(ps.drop(1), parts_of(rep_of_arg(a)).drop(1));
   {
-    pr: range(1, ps.len()).fold(pr, |q: Printing, k: Int|
-      line(q, depth, Bytes::concat_all([b"*o", ascii_of_int(k), b" = ", nth(ps, k), b";"]))),
+    pr: range(0, ws.len()).fold(pr, |q: Printing, k: Int|
+      line(q, depth, Bytes::concat_all([b"o[", ascii_of_int(k), b"] = ", nth(ws, k), b";"]))),
     value: nth(ps, 0),
   }
 }
@@ -212,178 +295,84 @@ pub fn set_parts(pr: Printing, depth: Int, v: Var, a: Arg) -> Printing = {
 /// What a root's entry does with `args[i]`, a parameter held as `r`, before it calls the root: the
 /// C it runs, and the C expressions it hands the call. A scalar is read out and its word let go, an
 /// `Option`'s or a `Result`'s object opened, a sum held as its cases opened into them, and a flat
-/// record's leaves loaded, each counted one held once more, its word handed on with them.
-pub fn entry_opened(i: Int, r: Rep) -> { text: Bytes, args: List<Bytes> } = {
+/// record's leaves loaded, each counted one held once more, its word handed on with them; a value
+/// crossing by reference laid in a buffer of its words, whose address is handed on.
+pub fn entry_opened(i: Int, r: Rep) -> { text: List<Piece>, args: List<Bytes> } = {
   let arg = Bytes::concat_all([b"args[", ascii_of_int(i), b"]"]);
   let local = b"a".concat(ascii_of_int(i));
-  match r {
-    RMaybe ->
+  let values = part_names(local, r);
+  let opened = [Text(b"  ")].concat(word_parts(arg, r, values)).push(Text(b"\n"));
+  match passing(r) {
+    InWords -> { text: opened, args: values },
+    ByReference -> {
+      let held = buffer_parts(r);
+      let laid = Bytes::concat_all([local, b"_r"]);
       {
-        text: Bytes::concat_all([b"  PlyMaybe ", local, b" = ", word_as(arg, r), b";\n"]),
-        args: [local],
-      },
-    RTagged ->
-      {
-        text: Bytes::concat_all([b"  PlyTagged ", local, b" = ", word_as(arg, r), b";\n"]),
-        args: [local],
-      },
-    RFlat(ls) -> {
-      let loads = leaf_loads(arg, fields_of(ls));
-      let locals = range(0, loads.len()).map(|k: Int| part_name(local, k));
-      {
-        text: Bytes::concat_all([
-          Bytes::concat_all(
-            range(0, loads.len()).map(|k: Int|
-              Bytes::concat_all([
-                b"  ",
-                one_type(nth_held(loads, k).rep),
-                b" ",
-                nth(locals, k),
-                b" = ",
-                nth_held(loads, k).expr,
-                b";\n",
-              ])),
+        text: opened.push(
+          Text(
+            Bytes::concat_all([
+              b"  Word ",
+              laid,
+              b"[] = {",
+              Bytes::join(words_laid(values, held), b", "),
+              b"};\n",
+            ]),
           ),
-          b"  ",
-          counted_incs(
-            range(0, loads.len()).map(|k: Int|
-              { rep: nth_held(loads, k).rep, expr: nth(locals, k) }),
-          ),
-          b"\n",
-        ]),
-        args: locals.push(arg),
+        ),
+        args: [laid].concat(values.drop(held.len())),
       }
     },
-    RCases(_) -> {
-      let leaves = case_leaves_all(r);
-      let names = range(0, leaves.len()).map(|k: Int| part_name(local, k));
-      let word = local.concat(b"_s");
-      {
-        text: Bytes::concat_all([
-          b"  ",
-          sum_type(r),
-          b" ",
-          word,
-          b" = ",
-          word_as(arg, sum_word(r)),
-          b"; int64_t ",
-          local,
-          b" = 0;",
-          Bytes::concat_all(
-            range(0, leaves.len()).map(|k: Int|
-              Bytes::concat_all([
-                b" ",
-                one_type(nth_leaf(leaves, k).rep),
-                b" ",
-                nth(names, k),
-                b" = ",
-                zero(nth_leaf(leaves, k).rep),
-                b";",
-              ])),
-          ),
-          b"\n  ",
-          sum_opening(r, word, local, names),
-          b"\n",
-        ]),
-        args: [local].concat(names),
-      }
-    },
-    RWord -> { text: b"", args: [arg] },
-    _ ->
-      {
-        text: Bytes::concat_all([
-          b"  ",
-          c_type(r),
-          b" ",
-          local,
-          b" = ",
-          word_as(arg, r),
-          b"; ply_dec(ctx, ",
-          arg,
-          b");\n",
-        ]),
-        args: [local],
-      },
   }
 }
 
-/// What an entry hands a root answering as `r` to write its answer's values past the first into.
-pub fn entry_outs(r: Rep) -> List<Bytes> =
-  range(1, out_types(r).len() + 1).map(|k: Int| b"&r".concat(ascii_of_int(k)))
+/// What an entry hands a root answering as `r` to write its answer's values past the first into:
+/// its buffer, where it has one.
+pub fn entry_outs(r: Rep) -> List<Bytes> = if answer_buffer(r) > 0 { [b"ro"] } else { [] }
 
 /// The entry's C from its call `call` of the root on: how a root answering as `r` hands back its
-/// answer as a word, a flat record's made of its leaves and a sum's of its cases where no word was.
+/// answer as a word, a flat record's made of its leaves and a sum's of its cases where no word was,
+/// each value past the first read out of the answer's buffer.
 pub fn entry_answered(pr: Printing, r: Rep, call: Bytes) -> { pr: Printing, out: List<Piece> } = {
-  let outs = range(1, out_types(r).len() + 1).map(|k: Int| b"r".concat(ascii_of_int(k)));
+  let rest = parts_of(r).drop(1);
+  let outs = range(1, rest.len() + 1).map(|k: Int| b"r".concat(ascii_of_int(k)));
+  let read = parts_read(b"ro", rest);
+  let called = |first: Bytes|
+    Bytes::concat_all([
+      if answer_buffer(r) > 0 {
+        Bytes::concat_all([b"  Word ro[", ascii_of_int(answer_buffer(r)), b"];\n"])
+      } else { b"" },
+      b"  ",
+      first,
+      b" r0 = ",
+      call,
+      b";\n  if (ctx->failed) return 0;\n",
+      Bytes::concat_all(
+        range(0, rest.len()).map(|k: Int|
+          Bytes::concat_all([
+            b"  ",
+            one_type(match rest.at(k) { Some(x) -> x, None -> RWord }),
+            b" ",
+            nth(outs, k),
+            b" = ",
+            nth(read, k),
+            b";\n",
+          ])),
+      ),
+      b"  ",
+    ]);
+  let several = || {
+    let w = parts_word(pr, b"rw", [b"r0"].concat(outs), r);
+    {
+      pr: w.pr,
+      out: [Text(called(c_type(r)))].concat(w.prep).push(
+        Text(Bytes::concat_all([b"\n  return ", w.word, b";\n"])),
+      ),
+    }
+  };
   match r {
     RWord -> { pr: pr, out: [Text(Bytes::concat_all([b"  return ", call, b";\n"]))] },
-    RFlat(ls) -> {
-      let vals = range(0, ls.len()).map(|k: Int|
-        { rep: nth_leaf(ls, k).rep, expr: b"r".concat(ascii_of_int(k)) });
-      let made_word = word_made(pr, b"rw", nth(outs, outs.len() - 1), fields_of(ls), vals);
-      {
-        pr: made_word.pr,
-        out: [
-          Text(
-            Bytes::concat_all([
-              Bytes::concat_all(
-                range(0, outs.len()).map(|k: Int|
-                  Bytes::concat_all([
-                    b"  ",
-                    one_type(match ls.at(k + 1) { Some(l) -> l.rep, None -> RWord }),
-                    b" ",
-                    nth(outs, k),
-                    b";\n",
-                  ])),
-              ),
-              b"  ",
-              c_type(r),
-              b" r0 = ",
-              call,
-              b";\n  if (ctx->failed) return 0;\n  ",
-            ]),
-          ),
-        ].concat(
-          made_word.out,
-        ).push(
-          Text(b"\n  return rw;\n"),
-        ),
-      }
-    },
-    RCases(_) -> {
-      let leaves = case_leaves_all(r);
-      let vals = range(0, leaves.len()).map(|k: Int|
-        { rep: nth_leaf(leaves, k).rep, expr: nth(outs, k) });
-      let made_sum = sum_made(pr, b"rw", r, b"r0", vals);
-      {
-        pr: made_sum.pr,
-        out: [
-          Text(
-            Bytes::concat_all([
-              Bytes::concat_all(
-                range(0, outs.len()).map(|k: Int|
-                  Bytes::concat_all([
-                    b"  ",
-                    one_type(nth_leaf(leaves, k).rep),
-                    b" ",
-                    nth(outs, k),
-                    b" = ",
-                    zero(nth_leaf(leaves, k).rep),
-                    b";\n",
-                  ])),
-              ),
-              b"  int64_t r0 = ",
-              call,
-              b";\n  if (ctx->failed) return 0;\n  ",
-            ]),
-          ),
-        ].concat(
-          made_sum.out,
-        ).push(
-          Text(Bytes::concat_all([b"\n  return ", as_word(b"rw", sum_word(r)), b";\n"])),
-        ),
-      }
-    },
+    RFlat(_) -> several(),
+    RCases(_) -> several(),
     _ ->
       {
         pr: pr,
@@ -1784,9 +1773,9 @@ test "a small record crosses a call as its leaves and its word, and answers its 
   assert_eq(part_names(b"p0", point()), [b"p0_0", b"p0_1", b"p0_2"]);
   assert_eq(head_types([point(), point()], point()), {
     answer: b"double",
-    params: [b"double", b"double", b"Word", b"double", b"double", b"Word", b"double*", b"Word*"],
+    params: [b"double", b"double", b"Word", b"double", b"double", b"Word", b"Word*"],
   });
-  assert_eq(head_params([RInt], point()), [b"int64_t p0", b"double* o1", b"Word* o2"]);
+  assert_eq(head_params([RInt], point()), [b"int64_t p0", b"Word* o"]);
   let sum = RCases({
     tagged: true,
     cases: [
@@ -1802,6 +1791,58 @@ test "a small record crosses a call as its leaves and its word, and answers its 
     b"Word",
     b"PlyDec",
   ])
+}
+
+test "a record wider than four words crosses as the address of its words and its box word" {
+  let reps = [RFloat, RDec, RInt, RWord, RInt];
+  let wide = RFlat(reps.map(|r: Rep| { name: b"f", rep: r }));
+  assert_eq(head_types([wide], RInt), { answer: b"int64_t", params: [b"Word*", b"Word"] });
+  assert_eq(head_params([wide, RInt], RInt), [b"Word* p0", b"Word p0_5", b"int64_t p1"]);
+  // The callee opens the words into its own C values, which take their counts.
+  assert_eq(params_opened([b"p0", b"p1"], [wide, RInt]), [
+    b"double p0_0 = ply_f64(p0[0]); PlyDec p0_1 = (PlyDec){p0[1], p0[2]}; int64_t p0_2 = (int64_t)p0[3]; Word p0_3 = p0[4]; int64_t p0_4 = (int64_t)p0[5];",
+  ]);
+  let exprs = [b"e0", b"e1", b"e2", b"e3", b"e4"];
+  assert_eq(words_laid(exprs, reps), [
+    b"ply_f64_bits(e0)",
+    b"(e1).lo",
+    b"(e1).hi",
+    b"(Word)(e2)",
+    b"e3",
+    b"(Word)(e4)",
+  ]);
+  assert_eq(parts_read(b"b", reps).len(), reps.len());
+  // The runtime's entry lays the opened values in a buffer and hands its address and the word.
+  let entered = entry_opened(0, wide);
+  assert(
+    spelled(entered.text).index_of(b"Word a0_r[] = {ply_f64_bits(a0_0), (a0_1).lo, (a0_1).hi,")
+      != None,
+    None,
+  );
+  assert_eq(entered.args, [b"a0_r", b"a0_5"]);
+  assert_eq(entry_opened(1, point()).args.len(), 3)
+}
+
+test "an answer of several values returns its first and writes the rest and its box into one buffer" {
+  let pr = printing(Map::new().insert(0, b"p0"));
+  let r = returned(pr, 0, AVar(local(0, point())));
+  assert_eq(r.value, b"p0_0");
+  let text = spelled(r.pr.out);
+  assert(
+    text.index_of(b"o[0] = ply_f64_bits(p0_1);") != None && text.index_of(b"o[1] = p0_2;") != None,
+    None,
+  );
+  assert_eq(answer_parts(b"t", b"buf", point()), [b"t", b"ply_f64(buf[0])", b"buf[1]"]);
+  assert_eq(entry_outs(point()), [b"ro"]);
+  assert_eq(entry_outs(RInt), []);
+  let answered = spelled(entry_answered(pr, point(), b"f(ctx)").out);
+  assert(
+    answered.index_of(
+        b"Word ro[2];\n  double r0 = f(ctx);\n  if (ctx->failed) return 0;\n  double r1 = ply_f64(ro[0]);\n  Word r2 = ro[1];",
+      )
+      != None,
+    Some(String::of_bytes_lossy(answered)),
+  )
 }
 
 test "a flat record's word is made of its leaves where none was, and its leaves loaded from a word" {

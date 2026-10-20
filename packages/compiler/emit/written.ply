@@ -5,16 +5,17 @@ import emit.code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NField, N
                   NMatch, CodePattern, PxWild, PxVar, PxCtor, CLet, CodeArm)
 import syntax.items (Item, IInstance, NKey)
 import check.resolve.tables (qualify)
-import check.types (Type, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, int_type, bytes_type)
+import check.types (Type, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, int_type, bytes_type,
+                    bool_type, named_type, list_type, fn_type, monomorphic, row_empty)
 import emit.typing (Typed, unknown_type, filed_as)
 import std.list
 import syntax.patterns (Lit, LInt, LBool, LStr, LBytes)
 import std.bytes (ascii_of_int)
-import emit.c (KBool, KBoxed, KInt, KSum, Kind, is_sum)
+import emit.c (KBool, KBoxed)
 import emit.roots (container_ops)
 import emit.keys
 import emit.keys (TypeOp, Reflect, Shown, Digest, Contained, root_name, op_name)
-import emit.reps (Ctors, SumCtor, TyOpen, Def, Whole, Cases, Fields, carrier_of, at_args)
+import emit.reps (Ctors, SumCtor, TyOpen, Def, at_args)
 
 // --- Externs written in place -----------------------------------------------------
 
@@ -73,24 +74,37 @@ pub fn container_defs(module: Bytes, t: Type) -> List<Def> / {abort.raise} =
   [Reflect, Shown, Digest].concat(container_ops().map(Contained)).map(|written_op: TypeOp| {
     let op = op_name(written_op);
     let root = keys::written(written_op, t, module);
-    let arity = if op.ends_with(b"_from") { 3 }
-    else if op == b"equal" || op == b"ordered" { 2 }
-    else { 1 };
-    let answer = if op == b"equal" || op == b"equal_from" { KBool } else { KBoxed };
+    let typed = container_typed(op, t);
     {
       name: local_root(module, root_name(root)),
-      ret: Some(answer),
+      ret: Some(if typed.ret == bool_type() { KBool } else { KBoxed }),
       ret_ty: TyOpen([]),
       pure: true,
-      arity: arity,
-      scheme: None,
-      carriers: range(0, arity).map(|i: Int| Whole(if i == 2 { KInt } else { KBoxed })),
-      answer: Whole(answer),
+      arity: typed.params.len(),
+      scheme: Some(monomorphic(fn_type(typed.params, typed.ret, row_empty()))),
       witnesses: 0,
       lent: [],
       root: root,
     }
   })
+
+/// What container root `op` written for `t` takes and answers: two containers a comparison, and an
+/// index after them its loop; one container a reflection or digest, and the list it adds to and an
+/// index after it its loop, which answers that list.
+fn container_typed(op: Bytes, t: Type) -> { params: List<Type>, ret: Type } = {
+  let value = TyCon({ name: b"std.value.Value", args: [] });
+  let entries = list_type(TyRecord([{ name: b"key", ty: value }, { name: b"value", ty: value }]));
+  let gathered = |l: Type| { params: [t, l, int_type()], ret: l };
+  if op == b"equal" { { params: [t, t], ret: bool_type() } }
+  else if op == b"ordered" { { params: [t, t], ret: named_type(b"Ordering") } }
+  else if op == b"equal_from" { { params: [t, t, int_type()], ret: bool_type() } }
+  else if op == b"ordered_from" { { params: [t, t, int_type()], ret: named_type(b"Ordering") } }
+  else if op == b"reflect_from" || op == b"shown_from" { gathered(list_type(value)) }
+  else if op == b"digest_from" || op == b"digest_entries_from" { gathered(list_type(bytes_type())) }
+  else if op == b"reflect_entries_from" || op == b"shown_entries_from" { gathered(entries) }
+  else if op == b"digest" { { params: [t], ret: bytes_type() } }
+  else { { params: [t], ret: value } }
+}
 
 /// The body of the root written for `op` of containers of type `t`, as lowered code over its
 /// parameters `a`, `b` and, for the loops, `i`, the types it files, and the definitions its calls
@@ -851,15 +865,6 @@ pub fn digest_code(
   };
   { ..out, typed: said_typed(out.typed, [TyCon({ name: b"List", args: [bytes_type()] })]) }
 }
-
-/// The kind a root written from a type takes a value of `ty` at: the word it crosses a call as, an
-/// `Option` its payload's, a `Result` its tagged word, any other its object.
-pub fn reflected_kind(ty: Type) -> Kind =
-  match carrier_of(ty) {
-    Whole(k) -> if is_sum(k) { k } else { KBoxed },
-    Cases(sc) -> KSum(sc.spec),
-    Fields(_) -> KBoxed,
-  }
 
 /// The body of the root `Reflect` or `Shown` is written as for `ty`, over its parameter `a`, and the
 /// types it files: a record's fields in their names' order, and a declared sum's constructor's name

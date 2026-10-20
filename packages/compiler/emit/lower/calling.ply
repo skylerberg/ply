@@ -13,9 +13,8 @@ import syntax.parsing (Span, starts_upper, dummy_span)
 import check.resolve.tables (qualify)
 import check.infer.checker (is_test_owner)
 import std.bytes (ascii_of_int)
-import emit.reps (Def, Imported, Carrier, Whole, EmitParam, BoundLambda, erased, has_vars,
-                  carrier_of, carriers_at, carried_vars, substituted_fully)
-import emit.c (KBoxed)
+import emit.reps (Def, Imported, EmitParam, BoundLambda, erased, has_vars, carried_vars,
+                  substituted, substituted_fully)
 import emit.keys (RootKey, FnArg, Named, At, Callee, Root, Generic, root_name, definition_of,
                   key_types, key_lent, unspecialised)
 import emit.tir
@@ -26,7 +25,7 @@ import emit.tir (Rep, RInt, RBool, RWord, RSlice, Var, Arg, AVar, AInt, AZero, G
                  Declined, Calling, no_links, falls_through, rep_of_arg)
 import emit.tir.calling (EntryValue, ConstantRead, BuiltinValue, Ticked)
 import emit.lower.setting (Setting, Root, imported_target, qualified)
-import emit.lower.held (held_as, carried_as, arg_path)
+import emit.lower.held (held_as, arg_path)
 import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
                         ToInPlace, Frame, Opened, GroupMember, Restarts, Enters, Calls, refuse,
                         fresh, bound_as, done, emitted, opened, nested, unnested, with_lambda,
@@ -45,7 +44,7 @@ pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.rai
     base: r.base,
     params: r.params,
     types: r.types,
-    answer: r.answer,
+    answer: conventional(setting, crossing(setting.here, r.key, r.types, r.answer_ty)).answer,
     answer_ty: r.answer_ty,
     body: body,
     tails: Restarts([]),
@@ -71,17 +70,67 @@ fn lending(cx: Context) -> Context / {abort.raise} = {
   { ..cx, lends: lends, written: if lends && cx.lender == None { written_in(cx) } else { [] } }
 }
 
-/// How the root takes its parameters and hands back its answer: as the emitter carries them.
-pub fn convention(cx: Context) -> Convention =
+/// How the root takes its parameters and hands back its answer, as every call of it does.
+pub fn convention(cx: Context) -> Convention / {abort.raise} =
+  conventional(cx.setting, crossing(cx.setting.here, cx.key, cx.types, cx.answer_ty))
+
+/// The types a call of root `key` hands its arguments at and reads its answer at, which its
+/// convention holds them by: a definition's as `crossing_at` reads them at the root's type
+/// arguments, and any other root's own, its parameters' `types` and its `answer`.
+fn crossing(
+  here: List<Def>,
+  key: RootKey,
+  types: List<Type>,
+  answer: Type,
+) -> Crossing / {abort.raise} = {
+  let own = unspecialised(key);
+  match here.fold(None, |acc: Option<Crossing>, d: Def|
+      if d.root == own { crossing_at(d, key_types(key)) } else { acc }) {
+    Some(c) -> c,
+    None -> { params: types, answer: answer },
+  }
+}
+
+/// The types a root's parameters and answer cross a call at.
+type Crossing = { params: List<Type>, answer: Type }
+
+/// The types a call of `d` at type arguments `args` hands its arguments at and reads its answer at,
+/// which a root of it at `args` takes them at alike: its scheme's, each variable the call carries
+/// raw (`carried_vars`) read at its argument as `erased` lays it and every other left a variable, so
+/// a caller and the root the unit settles its call on read the same; each witness before them and
+/// each label after them an `Int`. None where no scheme speaks for `d`.
+fn crossing_at(d: Def, args: List<Type>) -> Option<Crossing> / {abort.raise} =
+  match d.scheme {
+    None -> None,
+    Some(sc) -> match sc.ty {
+      TyFn(f) -> {
+        let raw = carried_vars(sc, args, d.arity);
+        let at = range(0, args.len()).map(|j: Int|
+          if raw.contains(j) { erased(args.get(j)) } else { unknown_type() });
+        let ints = |n: Int| range(0, n).map(|_: Int| int_type());
+        Some({
+          params: ints(d.witnesses).concat(f.params.map(|t: Type| substituted(t, at))).concat(
+            ints(d.arity - d.witnesses - f.params.len()),
+          ),
+          answer: substituted(f.ret, at),
+        })
+      },
+      _ -> None,
+    },
+  }
+
+/// The convention of a root whose parameters and answer cross at `c`'s types: each as a body holds a
+/// value of its type, every parameter given and the answer owned.
+fn conventional(s: Setting, c: Crossing) -> Convention =
   {
-    params: cx.params.map(|_: EmitParam| Given),
-    reps: cx.params.map(|p: EmitParam| carried_as(p.carrier)),
-    answer: carried_as(cx.answer),
+    params: c.params.map(|_: Type| Given),
+    reps: c.params.map(|t: Type| held_as(s, t)),
+    answer: held_as(s, c.answer),
     answered: tir::Owned,
   }
 
 /// How the root's body holds its parameters, which a restart hands its arguments to.
-pub fn params_held(cx: Context) -> List<Rep> =
+pub fn params_held(cx: Context) -> List<Rep> / {abort.raise} =
   match cx.tails { Restarts(reps) -> reps, _ -> convention(cx).reps }
 
 /// How the root's body holds its parameters: as its convention takes them, but a list the body walks
@@ -298,28 +347,24 @@ pub fn applied(
     TyFn(t) -> if t.params.len() != args.len() {
       refuse(st, Calling, b"a function value called with another arity")
     } else {
-      let reps = t.params.map(|p: Type| carried_as(carrier_of(p)));
-      let answer = carried_as(carrier_of(t.ret));
+      let reps = t.params.map(|p: Type| held_as(cx.setting, p));
+      let answer = held_as(cx.setting, t.ret);
       let h = handed_all(param_called(cx, st, f), args, reps, at);
-      handed(
-        bound_as(
-          h.st,
-          t.ret,
-          answer,
-          Apply({
-            f: f,
-            args: h.args,
-            conv: {
-              params: reps.map(|_: Rep| Given),
-              reps: reps,
-              answer: answer,
-              answered: tir::Owned,
-            },
-            stops: stops_in(t.effects.atoms.len(), t.effects.tail != None),
-          }),
-          at,
-        ),
-        held_as(cx.setting, t.ret),
+      bound_as(
+        h.st,
+        t.ret,
+        answer,
+        Apply({
+          f: f,
+          args: h.args,
+          conv: {
+            params: reps.map(|_: Rep| Given),
+            reps: reps,
+            answer: answer,
+            answered: tir::Owned,
+          },
+          stops: stops_in(t.effects.atoms.len(), t.effects.tail != None),
+        }),
         at,
       )
     },
@@ -964,7 +1009,7 @@ pub fn lambda_opened(cx: Context, st: Lowering, frame: Frame, at: Span) -> Opene
           tails: Calls,
           params: [],
           types: [],
-          answer: s.answer,
+          answer: s.conv.answer,
           answer_ty: s.ret,
           param_at: Map::new(),
           frame: at,
@@ -1065,7 +1110,7 @@ pub fn closure(
   }
 
 /// The state each member of a tail group is lowered in.
-pub fn group_opened(members: List<GroupMember>) -> List<Opened> = {
+pub fn group_opened(members: List<GroupMember>) -> List<Opened> / {abort.raise} = {
   let fulls = members.map(|m: GroupMember| m.cx.full);
   let params = member_params(members);
   let after = params.fold(1, |n: Int, ps: List<Var>| n + ps.len());
@@ -1094,7 +1139,10 @@ pub fn group_opened(members: List<GroupMember>) -> List<Opened> = {
 
 /// The group's root from each member's body lowered from `group_opened`'s state: a case on which
 /// member runs, each arm a member's body answering as the member does.
-pub fn grouped(members: List<GroupMember>, bodies: List<Lowered>) -> Result<Fn, Declined> =
+pub fn grouped(
+  members: List<GroupMember>,
+  bodies: List<Lowered>,
+) -> Result<Fn, Declined> / {abort.raise} =
   match bodies.fold(None, |acc: Option<Declined>, b: Lowered|
       match acc { Some(_) -> acc, None -> b.st.refused }) {
     Some(no) -> Err(no),
@@ -1175,7 +1223,7 @@ pub fn grouped(members: List<GroupMember>, bodies: List<Lowered>) -> Result<Fn, 
 
 /// Each member's parameters, numbered apart from the group's `which` and from one another, and held
 /// as the member takes them.
-fn member_params(members: List<GroupMember>) -> List<List<Var>> =
+fn member_params(members: List<GroupMember>) -> List<List<Var>> / {abort.raise} =
   members.fold(
     { next: 1, out: [] },
     |acc: { next: Int, out: List<List<Var>> }, m: GroupMember| {
@@ -1217,17 +1265,9 @@ pub type Defined = { full: Bytes, def: Def }
 type Reference = { st: Lowering, callee: Callee, args: List<Type> }
 
 /// A closure's body as the lambda's type lays it out: its captures, each a word, then its own
-/// parameters as a function of its type carries them; how it answers; and the types of the closure
+/// parameters as a body holds values of their types; how it answers; and the types of the closure
 /// and of its answer.
-type Shape = {
-  params: List<Var>,
-  conv: Convention,
-  ty: Type,
-  ret: Type,
-  answer: Carrier,
-  captures: Int,
-  own: Int,
-}
+type Shape = { params: List<Var>, conv: Convention, ty: Type, ret: Type, captures: Int, own: Int }
 
 /// The shape of the closure laid out as `frame` at `at`, from the function type the checker filed
 /// there; none where it filed none of the frame's arity.
@@ -1238,7 +1278,7 @@ fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Option<Sha
       // A continuation is a word the runtime calls, and a clause binding one answers the word it
       // hands back, which for a tail-only clause is the resumed value `c.resumed` holds the count of.
       let continued = |j: Int| frame.resumes && j == frame.params - 1;
-      let answer = if frame.resumes { Whole(KBoxed) } else { carrier_of(f.ret) };
+      let answer = if frame.resumes { RWord } else { held_as(cx.setting, f.ret) };
       let n = frame.captures.len();
       let caps = range(0, n).map(|i: Int|
         {
@@ -1258,7 +1298,7 @@ fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Option<Sha
           }
         } else {
           match f.params.at(j) {
-            Some(t) -> { id: n + j, ty: t, rep: carried_as(carrier_of(t)) },
+            Some(t) -> { id: n + j, ty: t, rep: held_as(cx.setting, t) },
             None -> { id: n + j, ty: unknown_type(), rep: RWord },
           }
         });
@@ -1268,12 +1308,11 @@ fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Option<Sha
         conv: {
           params: params.map(|_: Var| Given),
           reps: params.map(|v: Var| v.rep),
-          answer: carried_as(answer),
+          answer: answer,
           answered: tir::Owned,
         },
         ty: f.ty,
         ret: f.ret,
-        answer: answer,
         captures: n,
         own: frame.params,
       })
@@ -1349,12 +1388,15 @@ fn jumped(
             Some(_) -> acc,
             None -> if fulls.at(i) == Some(d.full) { Some(i) } else { None },
           }) {
-        Some(i) -> {
-          let h = handed_all(st, args, d.def.carriers.map(carried_as), at);
-          Some({
-            st: emitted(h.st, Enter({ member: i, args: h.args })),
-            arg: AZero(held_as(cx.setting, cx.answer_ty)),
-          })
+        Some(i) -> match crossing_at(d.def, []) {
+          None -> Some(refuse(st, Calling, b"a tail group's member no scheme speaks for")),
+          Some(c) -> {
+            let h = handed_all(st, args, conventional(cx.setting, c).reps, at);
+            Some({
+              st: emitted(h.st, Enter({ member: i, args: h.args })),
+              arg: AZero(held_as(cx.setting, cx.answer_ty)),
+            })
+          },
         },
         None -> None,
       },
@@ -1374,43 +1416,41 @@ fn call(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let n = named_ref(cx, st, d, ref, fn_args(cx, codes));
-  let cs = carriers_at(d.def, n.args);
-  let reps = cs.params.map(carried_as);
-  let answer = carried_as(cs.answer);
-  let h = handed_all(
-    passed(cx, stacked(n.st, d.def.lent, codes, args), d.full, codes, args),
-    args,
-    reps,
-    at,
-  );
-  let ret = answer_type(d.def, n.args);
-  handed(
-    bound_as(
-      h.st,
-      ret,
-      answer,
-      Call({
-        callee: n.callee,
-        args: h.args,
-        conv: {
-          params: reps.map(|_: Rep| Given),
-          reps: reps,
-          answer: answer,
-          answered: tir::Owned,
-        },
-        stops: match d.def.scheme {
-          Some(sc) -> match sc.ty {
-            TyFn(f) -> stops_in(f.effects.atoms.len(), f.effects.tail != None),
-            _ -> true,
-          },
-          None -> true,
-        },
-      }),
-      at,
-    ),
-    held_as(cx.setting, ret),
-    at,
-  )
+  match crossing_at(d.def, n.args) {
+    None -> refuse(st, Calling, b"a call of a definition no scheme speaks for: ".concat(d.full)),
+    Some(c) -> {
+      let conv = conventional(cx.setting, c);
+      let h = handed_all(
+        passed(cx, stacked(n.st, d.def.lent, codes, args), d.full, codes, args),
+        args,
+        conv.reps,
+        at,
+      );
+      let ret = answer_type(d.def, n.args);
+      handed(
+        bound_as(
+          h.st,
+          ret,
+          conv.answer,
+          Call({
+            callee: n.callee,
+            args: h.args,
+            conv: conv,
+            stops: match d.def.scheme {
+              Some(sc) -> match sc.ty {
+                TyFn(f) -> stops_in(f.effects.atoms.len(), f.effects.tail != None),
+                _ -> true,
+              },
+              None -> true,
+            },
+          }),
+          at,
+        ),
+        held_as(cx.setting, ret),
+        at,
+      )
+    },
+  }
 }
 
 /// Whether a call of a function whose row names `atoms` operations, or is open, can stop for a
