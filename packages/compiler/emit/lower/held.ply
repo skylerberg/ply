@@ -10,8 +10,8 @@ import emit.reps (Carrier, Whole, Fields, Cases, SumCase, SumCtor, FieldTy, TyRe
                   kind_of, carrier_of, carried_record, laid_of, record_flags, ctors_of, no_ctors)
 import emit.c (Kind, KBoxed, KInt, KBool, KNum, KFloat, KDec, KSum, Zeroed, Tagged)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases, Leaf,
-                 Path, PField, PNamed, PArg, PPlace, RSum, parts_count)
-import emit.layout (LSum, LWords, P, Always, Inline, words)
+                 Path, PField, PNamed, PArg, PPlace, RSum, RUnit, RSlice)
+import emit.layout (LSum, LWords, P, Always, Inline, words, register_words)
 import emit.lower.setting (Setting, ctor_named)
 
 /// How a value of `ty` is held in a body: a record of a field whose type lays it out as `record_held`
@@ -277,17 +277,40 @@ pub fn case_index(r: Rep, ctor: Bytes) -> Option<Int> =
 /// in place, the callee owning the counts in it.
 pub type Passing = | InWords | ByReference
 
-/// How a value held as `r` crosses a call, as a root's parameter or a closure's typed entry's: by
-/// reference where it is wider than `register_words()`. Until a printer passes by reference, every
-/// value crosses in its C values.
-pub fn passing(r: Rep) -> Passing = InWords
+/// How a value held as `r` crosses a call, as a root's parameter or a closure's typed entry's: a
+/// record or a sum of more than `register_words()` words, its box word not among them, by reference,
+/// and any other value in its C values.
+pub fn passing(r: Rep) -> Passing =
+  match r { RFlat(_) -> widely(r), RCases(_) -> widely(r), RSum(_) -> widely(r), _ -> InWords }
+
+fn widely(r: Rep) -> Passing = if value_words(r) > register_words() { ByReference } else { InWords }
+
+/// How many words a value held as `r` takes, its box word not among them: a `Decimal` two, a value of
+/// no words none, a flat record its leaves', a sum held as its cases its index and every case's
+/// leaves, and a sum its laid words.
+pub fn value_words(r: Rep) -> Int =
+  match r {
+    RDec -> 2,
+    RUnit -> 0,
+    RSlice -> 2,
+    RFlat(ls) -> ls.fold(0, |n: Int, l: Leaf| n + value_words(l.rep)),
+    RCases(c) ->
+      c.cases.fold(1, |n: Int, x: { name: Bytes, leaves: List<Leaf> }|
+        x.leaves.fold(n, |m: Int, l: Leaf| m + value_words(l.rep))),
+    RSum(s) -> words(LSum(s.laid)),
+    _ -> 1,
+  }
 
 /// How many words a caller's buffer holds for an answer held as `r`, which the callee writes past
-/// the one it returns: a wide value's other words and then its box word, none for one of one word.
+/// the C value it returns: the words of its other values and then its box word, none for an answer
+/// of one C value.
 pub fn answer_buffer(r: Rep) -> Int =
   match r {
-    RFlat(_) -> parts_count(r) - 1,
-    RCases(_) -> parts_count(r) - 1,
+    RFlat(ls) -> ls.drop(1).fold(1, |n: Int, l: Leaf| n + value_words(l.rep)),
+    RCases(c) ->
+      c.cases.fold(0, |n: Int, x: { name: Bytes, leaves: List<Leaf> }|
+        x.leaves.fold(n, |m: Int, l: Leaf| m + value_words(l.rep))),
+    RSlice -> 1,
     RSum(s) -> {
       let n = words(LSum(s.laid));
       if n <= 1 { 0 } else { n }
@@ -596,6 +619,47 @@ test "an answer of one word needs no buffer, and a wider one its other words and
   assert_eq([RInt, RWord, sum(1)].map(answer_buffer), [0, 0, 0]);
   assert_eq(answer_buffer(sum(3)), 3);
   assert_eq(answer_buffer(RFlat([{ name: b"x", rep: RFloat }, { name: b"y", rep: RFloat }])), 2);
+  // A decimal past the first value takes two words of the buffer.
+  assert_eq(answer_buffer(RFlat([{ name: b"n", rep: RInt }, { name: b"d", rep: RDec }])), 3);
   assert_eq(case_index(sum(1), b"m.Only"), Some(0));
   assert_eq(case_index(sum(1), b"m.Other"), None)
+}
+
+test "a record or a sum wider than four words crosses by reference, its box word not counted" {
+  let flat = |reps: List<Rep>| RFlat(reps.map(|r: Rep| { name: b"f", rep: r }));
+  assert_eq(passing(flat([RInt, RInt, RInt, RInt])), InWords);
+  assert_eq(passing(flat([RInt, RInt, RInt, RInt, RInt])), ByReference);
+  // A decimal takes two words.
+  assert_eq(passing(flat([RInt, RInt, RDec])), InWords);
+  assert_eq(passing(flat([RInt, RInt, RInt, RDec])), ByReference);
+  let sum = |n: Int|
+    RSum({
+      laid: {
+        classes: range(0, n).map(|_: Int| P),
+        cases: [
+          {
+            test: Always,
+            payload: Inline({
+              offset: 0,
+              laid: LWords(range(0, n).map(|_: Int| P)),
+              stripped: None,
+            }),
+          },
+        ],
+      },
+      cases: [b"m.Only"],
+    });
+  assert_eq([sum(4), sum(5)].map(passing), [InWords, ByReference]);
+  // A sum held as its cases counts its index and every case's leaves.
+  let cases = RCases({
+    tagged: false,
+    cases: [
+      { name: b"A", leaves: [{ name: b"", rep: RInt }, { name: b"", rep: RInt }] },
+      { name: b"B", leaves: [{ name: b"", rep: RWord }, { name: b"", rep: RWord }] },
+    ],
+  });
+  assert_eq(value_words(cases), 5);
+  assert_eq(passing(cases), ByReference);
+  // A scalar is never handed by reference, however wide.
+  assert_eq([RDec, RWord, RInt].map(passing), [InWords, InWords, InWords])
 }
