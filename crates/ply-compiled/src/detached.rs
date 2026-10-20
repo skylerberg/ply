@@ -3,8 +3,9 @@
 //! resumed again (multi-shot); one a clause resumes at most once is not. When a continuation's last
 //! holder lets it go, its snapshot is dropped, and the body with it where it waits at that stop.
 
+use crate::emitted::{Block, Handed, PlyFnDesc};
 use crate::frames::{self, PlyFrame, Snapshot};
-use crate::heap::{self, CLOSURE_CAPTURES, CLOSURE_CODE, KIND_CLOSURE, Obj, Word, word_at};
+use crate::heap::{self, CLOSURE_CAPTURES, CLOSURE_CODE, HEADER, KIND_CLOSURE, Obj, Word, word_at};
 use crate::rt::{
     Ctx, FAILED_ABORT, FAILED_UNWIND, FrameClause, HandlerFrame, StackCopy, call_clause, call_fun,
     drop_frame, no_stack_to_take, release_fun, release_vars, switch_keeping,
@@ -213,7 +214,7 @@ pub(crate) unsafe fn resume(
             d.state = State::Suspended;
             let k = capture_stop(ctx, id, again);
             let c = unsafe { &mut *ctx };
-            args.push(token(c, id, k));
+            args.push(token(c, id, k, emitted));
             // The clause works on its own copy of the variables, so each resumption it makes starts
             // from what the clause holds, whatever an earlier one did to the body's.
             let frames = c.detached[id].frames;
@@ -459,14 +460,81 @@ pub(crate) fn is_continuation(code: usize) -> bool {
 }
 
 /// The `k` a clause off the tail is handed: a closure resuming the body from its capture, and the
-/// entry it was captured in.
-fn token(c: &mut Ctx, id: usize, capture: usize) -> Word {
-    let entry = c.entry as i64;
-    crate::rt::closure_of(
-        c,
-        rt_resume_detached_entry as *const () as usize,
-        &[((id << 32) | capture) as i64, entry],
-    )
+/// entry it was captured in. A clause emitted code made gets a block it calls and lets go of through
+/// [`TOKEN`]; any other, the runtime's closure over [`rt_resume_detached_entry`].
+fn token(c: &mut Ctx, id: usize, capture: usize, emitted: bool) -> Word {
+    let packed = ((id << 32) | capture) as Word;
+    let entry = c.entry as Word;
+    if !emitted {
+        return crate::rt::closure_of(
+            c,
+            rt_resume_detached_entry as *const () as usize,
+            &[packed, entry],
+        );
+    }
+    let block = Block::alloc(&mut c.heap, TOKEN_BYTES).word();
+    unsafe {
+        let words = (block as *mut Word).byte_add(HEADER);
+        words.write((&raw const TOKEN) as Word);
+        words.add(1).write(packed);
+        words.add(2).write(entry);
+    }
+    block
+}
+
+/// A continuation's block emitted code holds: its header, then [`TOKEN`], the body and capture it
+/// resumes packed in one word, and the entry that captured them.
+const TOKEN_BYTES: Word = (HEADER + 3 * size_of::<Word>()) as Word;
+
+/// The descriptor of a continuation emitted code holds: it is resumed through `uniform` and released
+/// through `release`, a native entry that queues its stop's drop; it has no typed entry, and crosses
+/// no thread and outlives no entry.
+static TOKEN: PlyFnDesc = PlyFnDesc {
+    uniform: token_resumed,
+    typed: None,
+    convention: 0,
+    release: token_released,
+    share: crosses_nowhere,
+    keep: crosses_nowhere,
+};
+
+/// The packed body and capture, and the entry, a continuation's block holds.
+///
+/// # Safety
+/// `k` is a live block [`token`] laid out.
+unsafe fn token_words(k: Word) -> (i64, i64) {
+    let words = unsafe { (k as *const Word).byte_add(HEADER) };
+    unsafe { (*words.add(1), *words.add(2)) }
+}
+
+unsafe extern "C" fn token_resumed(ctx: *mut Ctx, k: Word, args: *const Word) -> Word {
+    let (packed, entry) = unsafe { token_words(k) };
+    let (id, capture) = unpacked(packed);
+    let v = unsafe { *args };
+    let c = unsafe { &mut *ctx };
+    if !captured_here(c, entry, id, capture) {
+        return c.fail(err_stale_continuation());
+    }
+    unsafe { resume(ctx, id, Some(capture), Some(v)) }
+}
+
+/// The last holder let go of a continuation: its stop is dropped at the next drain, and its block
+/// given back.
+unsafe extern "C" fn token_released(ctx: *mut Ctx, k: Handed) -> Word {
+    let k = k.word();
+    let (packed, entry) = unsafe { token_words(k) };
+    let (id, capture) = unpacked(packed);
+    let c = unsafe { &mut *ctx };
+    if captured_here(c, entry, id, capture) {
+        c.continuations_died.push((id, capture));
+    }
+    unsafe { Block::of(k).free(&raw mut c.heap, TOKEN_BYTES) };
+    0
+}
+
+/// A continuation is its entry's: it crosses to no other thread and is kept past no entry.
+unsafe extern "C" fn crosses_nowhere(_ctx: *mut Ctx, _k: Word) -> Word {
+    0
 }
 
 /// The body and capture a token's packed word names.
