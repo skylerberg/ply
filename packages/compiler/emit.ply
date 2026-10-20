@@ -12,7 +12,7 @@ import check.resolve.scopes (PackageDeps, no_packages, of_binder)
 import expand.derive (expand_derives)
 import check.infer.checker (MemberSite, WitnessOp, test_owner, law_root, cases_root)
 import check.infer (expanded_mods)
-import check.types (Type, TyCon, TyVar, Scheme, int_type, bytes_type, type_spelled)
+import check.types (Type, TyCon, TyVar, Scheme, int_type, bytes_type)
 import emit.lower.setting (Setting, declared_schemes, walked_read, sites_in, typed_in, defs_in,
                            resolved_imports, effects_in, params_carried, law_params)
 import emit.lower.calling (known_body, lambdas_of, named_in, def_in, is_ctor_name, has_handle)
@@ -29,8 +29,10 @@ import expand.rewrite (expand)
 import expand.embed (EmbedAt, embed_tables, rewritten)
 import std.bytes (ascii_of_int)
 import emit.c (KBoxed, KInt, Kind, position_of, bytes_join)
-import emit.roots (container_ops, equality_root, ordering_root, written_root_of)
-import emit.keys (RootKey, Named, At, FnArg, root_name, sited_as, key_types, key_lent)
+import emit.roots (container_ops)
+import emit.keys
+import emit.keys (RootKey, Named, At, Written, FnArg, TypeOp, Order, Reflect, Shown, Digest,
+                  Contained, root_name, sited_as, key_types, key_lent, op_name, module_of)
 import emit.answer (sorted_widths, Emitted, Body, Refused, RootAnswer)
 import emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, ModuleDefs, Whole, EmitParam,
                   BoundLambda, OwnerLambdas, kind_of, boxed, Sig, sig_of, param_kinds, param_types,
@@ -85,6 +87,21 @@ pub fn refused_rather_than_emitted(
 /// The names the roots `wanted` print as, each once.
 fn wanted_names(wanted: List<RootKey>) -> Map<Bytes, Bool> =
   wanted.fold(Map::new(), |m: Map<Bytes, Bool>, k: RootKey| m.insert(root_name(k), true))
+
+/// The roots written for a type that `wanted` holds, each once and in the order of their names, with
+/// the module each is written in.
+fn written_wanted(
+  wanted: List<RootKey>,
+) -> List<{ key: RootKey, op: TypeOp, ty: Type, module: Bytes }> / {abort.raise} =
+  wanted.fold(
+    Map::new(),
+    |m: Map<Bytes, { key: RootKey, op: TypeOp, ty: Type, module: Bytes }>, k: RootKey|
+      match k {
+        Written(w) -> m.insert(root_name(k), { key: k, op: w.op, ty: w.ty, module: module_of(k) }),
+        _ -> m,
+      },
+  ).values(
+  )
 
 /// What a program walk lowered, in its order: each root's form or refusal, and each constructor's
 /// stated functions, which a body naming the constructor's tag calls once it is printed.
@@ -254,6 +271,7 @@ pub fn lowered_program(
               let tables_at = |i: Int, m: ParsedModule|
                 match tables.at(i) { Some(Some(t)) -> t, _ -> tables_of(i, m) };
               let specialised = specialisations_wanted(match roots { Some(ks) -> ks, None -> [] });
+              let written_roots = written_wanted(match roots { Some(ks) -> ks, None -> [] });
               // What an owner lends: its lambdas, read where it lowers them, a definition as it stands
               // or at the type arguments the owner's key gives; past the first `lambdas` it writes are
               // the definitions it names as values.
@@ -404,6 +422,11 @@ pub fn lowered_program(
                           },
                           schemes,
                           wanted,
+                          written_roots.filter(
+                            |w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }|
+                              w.module == m.name,
+                          ).map(|w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }|
+                            { key: w.key, op: w.op, ty: w.ty }),
                           specialised,
                           sites_in(facts.label_sites, i),
                           facts.elaboration.ops.filter(|o: WitnessOp| o.module == i),
@@ -499,12 +522,12 @@ fn calling_instances(stated: Map<Bytes, List<Bytes>>, e: Emitted) -> Emitted / {
           ..e,
           tables: {
             ..e.tables,
-            calls: tags_named(e.text).fold(e.tables.calls, |acc: List<Bytes>, tag: Bytes|
+            calls: tags_named(e.text).fold(e.tables.calls, |acc: List<RootKey>, tag: Bytes|
               match stated.get(tag) {
                 None -> acc,
                 Some(fs) ->
-                  fs.fold(acc, |calls: List<Bytes>, f: Bytes|
-                    if calls.contains(f) { calls } else { calls.push(f) }),
+                  fs.fold(acc, |calls: List<RootKey>, f: Bytes|
+                    if calls.contains(Named(f)) { calls } else { calls.push(Named(f)) }),
               }),
           },
         },
@@ -512,12 +535,14 @@ fn calling_instances(stated: Map<Bytes, List<Bytes>>, e: Emitted) -> Emitted / {
   }
 
 /// The roots `wanted` names of the module `s` reads, formed in its order: its definitions, each
-/// definition's specialisations and clauses, its tests and laws, and the roots written for its types.
+/// definition's specialisations and clauses, its tests and laws, and the roots written for its types
+/// that `written_roots` keys.
 fn module_formed(
   x_module: Module,
   s: Setting,
   schemes: Map<Bytes, Scheme>,
   wanted: Option<Map<Bytes, Bool>>,
+  written_roots: List<{ key: RootKey, op: TypeOp, ty: Type }>,
   specialised: Map<Bytes, List<RootKey>>,
   sites: Map<Bytes, List<Bytes>>,
   ops: List<WitnessOp>,
@@ -651,105 +676,82 @@ fn module_formed(
       // emission takes.
       IType(t) -> {
         let named = qualify(module, t.name.name);
-        let asked = |root: Bytes| match wanted { Some(w) -> w.contains(root), None -> false };
-        // At its own name, and at each list of arguments a body asked for one at.
-        let at_types = match wanted {
-          Some(w) ->
-            w.keys().fold(
-              [],
-              |acc2: List<{ root: Bytes, eq: Bool, args: List<Type> }>, n: Bytes|
-                if !n.starts_with(named.concat(b"<")) { acc2 } else {
-                  let eq = n.ends_with(b"#eq");
-                  if !eq && !n.ends_with(b"#cmp") { acc2 } else {
-                    match type_spelled(n.slice(0, n.len() - (if eq { 3 } else { 4 }))) {
-                      Some(TyCon(c)) -> acc2.push({ root: n, eq: eq, args: c.args }),
-                      _ -> acc2,
-                    }
-                  }
-                },
-            ),
-          None -> [],
-        };
+        // At its own name, or at the arguments a body asked for one at.
+        let asked = written_roots.fold(
+          [],
+          |acc2: List<{ key: RootKey, eq: Bool, args: List<Type> }>, w: { key: RootKey, op: TypeOp, ty: Type }|
+            match w.ty {
+              TyCon(c) -> if c.name != named { acc2 } else {
+                match w.op {
+                  keys::Equal -> acc2.push({ key: w.key, eq: true, args: c.args }),
+                  Order -> acc2.push({ key: w.key, eq: false, args: c.args }),
+                  _ -> acc2,
+                }
+              },
+              _ -> acc2,
+            },
+        );
         match s.ctors.sums.get(named) {
           None -> acc,
           Some(declared) ->
-            [
-              {
-                root: equality_root(named),
-                asked: asked(equality_root(named)),
-                eq: true,
-                args: [],
-              },
-              {
-                root: ordering_root(named),
-                asked: asked(ordering_root(named)),
-                eq: false,
-                args: [],
-              },
-            ].concat(
-              at_types.map(|x: { root: Bytes, eq: Bool, args: List<Type> }|
-                { root: x.root, asked: true, eq: x.eq, args: x.args }),
-            ).fold(acc, |a2: Walk, d: { root: Bytes, asked: Bool, eq: Bool, args: List<Type> }|
-              if !d.asked { a2 } else {
-                let cs = if d.args.len() == 0 { declared } else {
-                  declared.map(|c: SumCtor|
-                    { ..c, fields: c.fields.map(|f: Type| at_args(f, c.params, d.args)) })
-                };
-                let e = if d.eq { equality_code(cs) } else { ordering_code(cs) };
-                // At its own name a generic sum is at its own variables.
-                let compared = TyCon({
-                  name: named,
-                  args: if d.args.len() > 0 { d.args } else {
-                    match declared.at(0) { Some(c) -> c.params.map(|v: Int| TyVar(v)), None -> [] }
-                  },
-                });
-                let word = |n: Bytes|
-                  {
-                    name: n,
-                    kind: KBoxed,
-                    ty: TyOpen([]),
-                    of: Some(compared),
-                    carrier: Whole(KBoxed),
-                    lambda: None,
-                  };
+            asked.fold(acc, |a2: Walk, d: { key: RootKey, eq: Bool, args: List<Type> }| {
+              let cs = if d.args.len() == 0 { declared } else {
+                declared.map(|c: SumCtor|
+                  { ..c, fields: c.fields.map(|f: Type| at_args(f, c.params, d.args)) })
+              };
+              let e = if d.eq { equality_code(cs) } else { ordering_code(cs) };
+              // At its own name a generic sum is at its own variables.
+              let compared = TyCon({
+                name: named,
+                args: if d.args.len() > 0 { d.args } else {
+                  match declared.at(0) { Some(c) -> c.params.map(|v: Int| TyVar(v)), None -> [] }
+                },
+              });
+              let word = |n: Bytes|
                 {
-                  ..a2,
-                  out: a2.out.push(
-                    formed_from(
-                      { ..s, typed: filed_too(s.typed, e.typed) },
-                      t.span.start,
-                      Named(d.root),
-                      [word(b"a"), word(b"b")],
-                      true,
-                      Some(e.code),
-                    ),
+                  name: n,
+                  kind: KBoxed,
+                  ty: TyOpen([]),
+                  of: Some(compared),
+                  carrier: Whole(KBoxed),
+                  lambda: None,
+                };
+              {
+                ..a2,
+                out: a2.out.push(
+                  formed_from(
+                    { ..s, typed: filed_too(s.typed, e.typed) },
+                    t.span.start,
+                    d.key,
+                    [word(b"a"), word(b"b")],
+                    true,
+                    Some(e.code),
                   ),
-                }
-              }),
+                ),
+              }
+            }),
         }
       },
       _ -> acc,
     });
-  // A type some body reflects or digests is written for by a root, in this module where the body's
-  // call names it.
-  let written = match wanted {
-    None -> [],
-    Some(w) ->
-      w.keys().fold([], |acc: List<{ root: Bytes, op: Bytes, ty: Type }>, n: Bytes|
-        match written_root_of(n) {
-          Some(r) -> if r.module == module { acc.push({ root: n, op: r.op, ty: r.ty }) }
-          else { acc },
-          None -> acc,
-        }),
-  };
   // What a container's roots call of `std.prelude` the load reaches wherever a body writes one.
   let unreached = written_code().calls.filter(|n: Bytes|
     match def_in(module, here, s.imports, n) { Some(_) -> false, None -> true });
-  written.fold(walked.out, |out: List<RootForm>, r: { root: Bytes, op: Bytes, ty: Type }|
-    if (container_ops().contains(r.op) || walked_container(r.ty)) && unreached.len() > 0 {
+  // A type some body reflects, digests or walks as a container is written for by a root.
+  written_roots.fold(walked.out, |out: List<RootForm>, w: { key: RootKey, op: TypeOp, ty: Type }| {
+    let r = { key: w.key, op: op_name(w.op), ty: w.ty };
+    // A sum's comparisons are written where it is declared, above.
+    if match w.op {
+        Reflect -> false,
+        Shown -> false,
+        Digest -> false,
+        Contained(_) -> false,
+        _ -> true,
+      } { out }
+    else if (container_ops().contains(r.op) || walked_container(r.ty)) && unreached.len() > 0 {
       out.push(
         Unformed({
-          name: r.root,
+          name: root_name(r.key),
           why: b"a container's root calls what the load did not reach of `std.prelude`: ".concat(
             Bytes::join(unreached, b", "),
           ),
@@ -778,7 +780,7 @@ fn module_formed(
         formed_from(
           { ..s, here: here.concat(e.here), typed: filed_too(s.typed, e.typed) },
           0,
-          Named(r.root),
+          r.key,
           if r.op.ends_with(b"_from") { [word(b"a"), word(b"b"), index] }
           else if r.op == b"equal" || r.op == b"ordered" { [word(b"a"), word(b"b")] }
           else { [word(b"a")] },
@@ -795,7 +797,7 @@ fn module_formed(
         formed_from(
           { ..s, typed: filed_too(s.typed, e.typed) },
           0,
-          Named(r.root),
+          r.key,
           [
             {
               name: b"a",
@@ -810,7 +812,8 @@ fn module_formed(
           Some(e.code),
         ),
       )
-    })
+    }
+  })
 }
 
 /// `typed` with the sites code written for a type files, which that code alone reads.
