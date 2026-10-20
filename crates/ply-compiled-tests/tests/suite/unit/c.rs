@@ -488,7 +488,7 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
 #[test]
 fn a_unit_says_its_constants_slots_and_what_its_types_state() {
     let with = "helpers 0\nctors 0\nconstants 1\nm.table 4\nmodules 0\nrefused 0\n\
-                consts 0\nbuiltins 0\nfields 0\nshapes 0\n";
+                builtins 0\nfields 0\nshapes 0\n";
     let read = ply_compiled::c::Exports::decode(with).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
     assert!(read.instances.is_empty());
@@ -518,6 +518,22 @@ fn a_unit_says_its_constants_slots_and_what_its_types_state() {
     assert!(
         ply_compiled::c::Exports::decode(&format!("{with}instances 1\nm.N - - m.add\n")).is_none()
     );
+}
+
+/// A unit whose constants are its own static data writes no `consts` table, which reads as no
+/// constants; a unit that pools constants writes the table, which reads back as written.
+#[test]
+fn a_units_consts_table_reads_where_it_has_one_and_as_none_where_it_has_not() {
+    let without = "helpers 0\nctors 0\nconstants 0\nmodules 0\nrefused 0\n\
+                   builtins 0\nfields 0\nshapes 0\n";
+    let read = ply_compiled::c::Exports::decode(without).expect("a table with no consts reads");
+    assert!(read.consts.is_empty());
+    assert_eq!(read.encode(), without);
+    let with = "helpers 0\nctors 0\nconstants 0\nmodules 0\nrefused 0\n\
+                consts 2\ns 6869\nu\nbuiltins 0\nfields 0\nshapes 0\n";
+    let read = ply_compiled::c::Exports::decode(with).expect("a table with consts reads");
+    assert_eq!(read.consts.len(), 2);
+    assert_eq!(read.encode(), with);
 }
 
 /// `N` states its arithmetic: `add`, `sub` and `mul` take two words and `neg` and `of_int` one.
