@@ -10,7 +10,8 @@ import check.types (TyCon)
 import std.bytes (ascii_of_int)
 import emit.c (tick_line)
 import emit.roots (symbol_of, root_id)
-import emit.keys (Named, Root, root_name)
+import emit.keys
+import emit.keys (RootKey, Named, Root, Written, root_name)
 import emit.reps (Ctors, no_ctors)
 import emit.pieces (Piece, Text, Hole, TagOf, InGroup, LentBy, merged, spelled)
 import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSlice, Var, Arg, AVar, AInt, ABool, AZero,
@@ -18,15 +19,15 @@ import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSlice, Var, Arg, AVar,
                  PCapture, Pack, Gathered, Call, Apply, Native, Op, OHandle, OContainer, OCalling,
                  MClosure, MList, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next,
                  Done, Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec, Reset, Free,
-                 Opened, Block, Fn, Member, Rooted, Given, Owned, Lambda, Closure, Uses, NoArm,
-                 Spine, LastOf, Walked, no_links, falls_through, var_said)
+                 Opened, Block, Fn, Member, Rooted, Plain, Given, Owned, Lambda, Closure, Uses,
+                 NoArm, Spine, LastOf, Walked, no_links, falls_through, var_said)
 import emit.print.text (Under, Place, Printing, Printed, printing, function_body, line, text,
                         pieces, pad, named, name_of, arg_text, assigned, label, check, zero,
-                        failing_return, site, slot, part_names, part_name, unprinted)
-import emit.print.counts (exit_of, block_opened, block_closed, count_printed, walked_value)
-import emit.print.made (c_type, c_types, as_word, word_as, word_parts, made, got, packed, gathered,
-                        statics, join_declared, set_parts, returned, head_types, head_params,
-                        params_opened)
+                        failing_return, site, slot, part_names, part_name, unprinted, fuel_returned)
+import emit.print.counts (exit_of, block_opened, block_closed, count_printed, walked_value, last_of)
+import emit.print.made (c_type, c_types, as_word, word_as, word_parts, made, got, gathered, statics,
+                        join_declared, set_parts, returned, head_types, head_params, params_opened)
+import emit.print.worded (worded)
 import emit.print.fuel (fuel_head)
 import emit.print.prims (literal, prim)
 import emit.print.containers (contained, container_op)
@@ -83,6 +84,12 @@ fn root_printed(
 ) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
   let body = body_printed(name, f, { ..printing(param_names(f)), ctors: ctors });
   let entered = runtime_entry(body, name, 0, 0, f.conv.reps, f.conv.answer);
+  // A plain root counts no steps; a drop root nests only so deep, past which its block waits.
+  let opening = match f.kind {
+    Rooted -> fuel_head(f.conv.answer),
+    Plain -> if !dropping(f.key) { b"" }
+    else { Bytes::concat_all([b"  if (ply_drop_deep(ctx, p0, ", name, b")) return 0;\n"]) },
+  };
   {
     pr: entered.pr,
     out: [
@@ -93,7 +100,7 @@ fn root_printed(
           b"_entry(PlyCtx *ctx, const Word *args);\n",
           head(name, f),
           b" {\n",
-          fuel_head(f.conv.answer),
+          opening,
         ]),
       ),
     ].concat(
@@ -128,6 +135,7 @@ fn group_printed(
     looping: None,
     landing: None,
     group: None,
+    leaving: fuel_returned(),
   };
   let start = {
     ..printing(match f.params.at(0) { Some(which) -> Map::new().insert(which.id, b"which"), None -> Map::new() }),
@@ -256,6 +264,25 @@ fn parted(pr: Printing, v: Var, word: Bytes) -> Printing = {
   )
 }
 
+/// Whether root `k` is a drop root: of a type, or of the box of one of its sum's cases.
+fn dropping(k: RootKey) -> Bool =
+  match k {
+    Written(w) -> match w.op {
+      keys::Drop -> true,
+      keys::Cased(c) -> c.op == keys::Drop,
+      _ -> false,
+    },
+    _ -> false,
+  }
+
+/// The C `f`'s `Return` runs before it returns: a root's unit of fuel given back, a drop root's
+/// depth, nothing for another plain root.
+fn leaving_of(f: Fn) -> Bytes =
+  match f.kind {
+    Rooted -> fuel_returned(),
+    Plain -> if dropping(f.key) { b"ply_drop_done(ctx);" } else { b"" },
+  }
+
 fn param_names(f: Fn) -> Map<Int, Bytes> / {abort.raise} =
   range(0, f.params.len()).fold(Map::new(), |m: Map<Int, Bytes>, i: Int|
     m.insert(f.params.get(i).id, b"p".concat(ascii_of_int(i))))
@@ -279,17 +306,17 @@ fn body_printed(symbol: Bytes, f: Fn, pr: Printing) -> Printing / {abort.raise} 
     looping: None,
     landing: None,
     group: None,
+    leaving: leaving_of(f),
   };
   let opened = params_opened(f.params.map(|v: Var| name_of(pr, v)), f.conv.reps).fold(
     pr,
     |q: Printing, l: Bytes| line(q, 0, l),
   );
   let viewed = views_opened(f, opened);
+  // A plain root's restart counts no tick.
+  let ticked = match f.kind { Rooted -> tick_line(failing_return(f.conv.answer)), Plain -> b";" };
   let looped = if restarts(f.body) {
-    text(
-      viewed,
-      Bytes::concat_all([b"  ply_loop: ", tick_line(failing_return(f.conv.answer)), b"\n"]),
-    )
+    text(viewed, Bytes::concat_all([b"  ply_loop: ", ticked, b"\n"]))
   } else { viewed };
   let done = block_closed(printed(u, looped, f.body, 0), pr.block, 0, falls_through(f.body));
   let record = record_declared(done);
@@ -510,7 +537,9 @@ fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort
               Some(_) -> member_returned(p, acc, a),
               None -> {
                 let r = returned(acc, depth, a);
-                text(r.pr, Bytes::concat_all([b"  ctx->fuel += 1;\n  return ", r.value, b";\n"]))
+                let leaving = if u.leaving == b"" { b"" }
+                else { Bytes::concat_all([b"  ", u.leaving, b"\n"]) };
+                text(r.pr, Bytes::concat_all([leaving, b"  return ", r.value, b";\n"]))
               },
             },
             Restart(args) -> match u.group {
@@ -573,7 +602,7 @@ fn value_printed(p: Place, pr: Printing, into: Option<Var>, val: Val) -> Printin
     },
     Take(t) -> taken(p, pr, into, t),
     Tag(name) -> tagged(p, pr, into, name),
-    Pack(k) -> packed(p, pr, into, k),
+    Pack(k) -> worded(p, pr, into, k),
     Gathered(g) -> gathered(p, pr, into, g.parts),
     Call(c) -> call(p, pr, into, c),
     Apply(c) -> applied(p, pr, into, c),
@@ -583,7 +612,7 @@ fn value_printed(p: Place, pr: Printing, into: Option<Var>, val: Val) -> Printin
       OContainer(x) -> container_op(p, pr, into, x, o.args, o.uses),
       OCalling(x) -> calling_op(p, pr, into, x, o.args, o.uses),
     },
-    LastOf(v) -> unprinted(Spine, b"a test of a value's last holder", var_said(v)),
+    LastOf(v) -> last_of(p, pr, into, v),
     Walked(w) -> walked_value(p, pr, into, w.of, w.op),
   }
 
@@ -933,6 +962,55 @@ test "a closure's function follows its root's entry, and its body numbers its te
   );
   // The code table holds the entries closures name, never their bodies.
   assert_eq(printed.lambdas, [])
+}
+
+test "a plain root counts no fuel or ticks; a drop root nests through the release depth and leaves by it" {
+  let ty = TyCon({ name: b"m.T", args: [] });
+  let o = { id: 0, ty: ty, rep: RWord };
+  let plain = |op: keys::TypeOp|
+    {
+      key: Written({ op: op, ty: ty, home: b"m", marks: [] }),
+      kind: Plain,
+      params: [o],
+      conv: { params: [Given], reps: [RWord], answer: RWord, answered: Owned },
+      body: [If({ cond: AVar(o), then: [Restart([AVar(o)])], otherwise: [Return(AZero(RWord))] })],
+      lambdas: [],
+      base: 0,
+      members: [],
+      links: no_links(),
+      statics: [],
+    };
+  let text_of = |op: keys::TypeOp| {
+    let f = plain(op);
+    let all = spelled(printed_fn(f, no_ctors()).pieces);
+    // The root's own function, its entry after it aside.
+    let own = Bytes::concat_all([head(symbol_of(root_name(f.key)), f), b" {"]);
+    match all.index_of(own) {
+      Some(i) -> match all.index_of_from(b"\n}\n", i) { Some(j) -> all.slice(i, j), None -> b"" },
+      None -> b"",
+    }
+  };
+  let dropped = text_of(keys::Drop);
+  let shared = text_of(keys::Share);
+  [dropped, shared].fold((), |_: Unit, t: Bytes| {
+    assert(t.len() > 0, None);
+    assert_eq(t.index_of(b"fuel"), None);
+    assert_eq(t.index_of(b"ticks"), None);
+    assert(t.index_of(b"ply_loop: ;") != None, None)
+  });
+  let at = |s: Bytes| match dropped.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+  let deep = at(b"if (ply_drop_deep(ctx, p0, ");
+  assert(deep >= 0 && deep < at(b"ply_loop:"), None);
+  assert_eq(
+    occurrences(dropped, b"ply_drop_done(ctx);\n  return "),
+    occurrences(dropped, b"return 0;") - 1,
+  );
+  assert_eq(shared.index_of(b"ply_drop"), None);
+  // A drop root of a case's box enters and leaves the same way.
+  assert(
+    text_of(keys::Cased({ op: keys::Drop, case: 1 })).index_of(b"ply_drop_deep(") != None,
+    None,
+  )
 }
 
 /// A root of `params` answering an `Int`, its text starting at byte 100, whose body is `body`.

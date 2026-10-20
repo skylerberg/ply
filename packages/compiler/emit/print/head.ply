@@ -3,15 +3,48 @@
 //! and the runtime reads.
 
 import std.bytes (ascii_of_int)
-import emit.layout (MachineStruct, MachineField, machine_structs, pointer_floor, tag_bits)
+import emit.layout (MachineStruct, MachineField, machine_structs, pointer_floor, tag_bits, ctx_at,
+                    release_depth)
 import emit.print.frames (chain_defined)
 
 /// The helpers, the machine structs and the context's chain of frame records. `ply_last` answers
 /// whether the count it took was a block's last, so the caller drops it; a checked build
 /// (`PLY_CHECKED`) traps a block whose count is already 0, which is how a block given back is
-/// counted.
-pub fn head_part() -> Bytes =
-  Bytes::concat_all([b"\n", helpers(), b"\n", structs(), chain_defined()])
+/// counted. A drop root enters by `ply_drop_deep`, which puts its block off to the runtime where
+/// drop roots already nest `release_depth()` deep, and leaves by `ply_drop_done`, the outermost
+/// draining what was put off.
+pub fn head_part() -> Bytes / {abort.raise} =
+  Bytes::concat_all([b"\n", helpers(), b"\n", structs(), chain_defined(), drops()])
+
+/// The context's counters a drop root reads and writes, at their offsets past what the runtime's
+/// head declares of it, and the drop root's entry and exit.
+fn drops() -> Bytes / {abort.raise} = {
+  let counter = |name: Bytes|
+    Bytes::concat_all([b"(*(int64_t *)((char *)ctx + ", ascii_of_int(ctx_at(name)), b"))"]);
+  let depth = counter(b"release_depth");
+  Bytes::concat_all([
+    b"static inline int ply_drop_deep(PlyCtx *ctx, Word o, PlyDrop d) {\n",
+    Bytes::concat_all([
+      b"  if (",
+      depth,
+      b" >= ",
+      ascii_of_int(release_depth()),
+      b") { rt_release_later_p(ctx, o, (Word)(intptr_t)d); return 1; }\n",
+    ]),
+    Bytes::concat_all([b"  ", depth, b" += 1;\n"]),
+    b"  return 0;\n",
+    b"}\n",
+    b"static inline void ply_drop_done(PlyCtx *ctx) {\n",
+    Bytes::concat_all([
+      b"  if (--",
+      depth,
+      b" == 0 && ",
+      counter(b"release_waiting"),
+      b" != 0) rt_release_drain_p(ctx);\n",
+    ]),
+    b"}\n",
+  ])
+}
 
 fn helpers() -> Bytes = {
   let floor = ascii_of_int(pointer_floor());
@@ -97,6 +130,26 @@ test "a release takes the count, the last one dropping the block, and a checked 
   [b"ply_rel(", b"ply_rel_sum(", b"ply_rel_int(", b"ply_free("].fold((), |_: Unit, f: Bytes|
     assert(h.index_of(b"static inline void ".concat(f)) != None, Some(String::of_bytes_lossy(f))));
   assert(between(b"ply_rel_sum(", b"}").index_of(ascii_of_int(pointer_floor())) != None, None)
+}
+
+test "a drop root nests to the release depth, then puts its block off; the outermost drains what was put off" {
+  let h = head_part();
+  let body = |f: Bytes|
+    match h.index_of(f) {
+      Some(i) -> match h.index_of_from(b"\n}\n", i) { Some(j) -> h.slice(i, j), None -> b"" },
+      None -> b"",
+    };
+  let at = |name: Bytes| Bytes::concat_all([b"(char *)ctx + ", ascii_of_int(ctx_at(name)), b")"]);
+  let deep = body(b"static inline int ply_drop_deep(");
+  let done = body(b"static inline void ply_drop_done(");
+  assert(deep.index_of(at(b"release_depth")) != None, None);
+  assert(deep.index_of(Bytes::concat_all([b" >= ", ascii_of_int(release_depth())])) != None, None);
+  assert(deep.index_of(b"rt_release_later_p(") != None, None);
+  assert(done.index_of(at(b"release_depth")) != None, None);
+  assert(done.index_of(at(b"release_waiting")) != None, None);
+  assert(done.index_of(b"rt_release_drain_p(ctx)") != None, None);
+  // Both read the counters past the fields the runtime's head declares.
+  assert(ctx_at(b"release_depth") > ctx_at(b"next_tick"), None)
 }
 
 test "each machine struct is declared before one that points at it, its fields in order, its size checked" {
