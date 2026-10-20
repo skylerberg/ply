@@ -16,20 +16,22 @@ import check.resolve.tables (qualify)
 import emit.layout (Intrinsic, intrinsics, layouts)
 import emit.answer (Need, Layout)
 import emit.pieces (spelled)
+import emit.roots (symbol_of)
+import emit.release (root_of)
 import emit.code (Code, NField)
-import emit.tir (Rep, RInt, RBool, RFloat, RWord, RMaybe, RNum, RFlat, Var, Arg, AVar, Val, Make,
+import emit.tir (Rep, RInt, RBool, RFloat, RWord, RMaybe, RFlat, Var, Arg, AVar, AInt, Val, Make,
                  Made, MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst, Let, Fn,
                  Spine, Data, Containers, rep_of_arg)
-import emit.tir.containers (Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew, ArraySet,
-                            ArrayOfList, ArrayGet, ColumnField, Bits, IntBits, FloatBits,
+import emit.tir.containers (Laid, Length, Elements, Joined, ArrayNew, ArraySet, ArrayOfList,
+                            ArrayGet, ColumnField, ItemAt, Rest, Bits, IntBits, FloatBits,
                             DecimalBits, Words, Payloads, Records)
 import emit.lower (lowered_fn)
 import emit.own (owned)
-import emit.lower.base (started)
+import emit.lower.base (Context, Lowered, started)
 import emit.lower.calling (context_of)
-import emit.lower.containers (columned, column_read, listed)
+import emit.lower.containers (columned, column_read, listed, item_read, rest_read)
 import emit.lower.setting (Root, setting_in)
-import emit.keys (Named)
+import emit.keys (RootKey, Named, Written, Copy, root_name)
 import emit.print (printed_fn)
 import emit.compare (Program, program_of, formed, checked, printed_text, not_built)
 
@@ -98,6 +100,50 @@ test "a list literal is made of its items, each handed over as a word" {
   )
 }
 
+test "a list pattern's item is read where it lies, and its rest made a list of its own" {
+  let p = program(b"fn f(xs: List<String>) -> Int = 0\n");
+  let strings = con(b"List", [con(b"String", [])]);
+  let opened = |name: Bytes, ty: Type, act: (Context, Var) -> Lowered|
+    match p.roots.find(|r: Root| r.key == Named(qualify(b"m", name))) {
+      None -> panic("no such root"),
+      Some(r) -> match r.code {
+        Err(why) -> panic(String::of_bytes_lossy(why)),
+        Ok(code) -> {
+          let xs = { id: 0, ty: ty, rep: RWord };
+          act(context_of(p.setting, r, code), xs)
+        },
+      },
+    };
+  let bound = |l: Lowered|
+    l.st.insts.fold([], |acc: List<Bound>, i: Inst|
+      match i { Let(x) -> acc.push({ var: x.var, val: x.val }), _ -> acc });
+  let item = opened(b"f", strings, |cx: Context, xs: Var|
+    item_read(cx, started([xs]), AVar(xs), AInt(40), con(b"String", [])));
+  // Borrowed from the list, read as its word, and never failing: its length test admitted it.
+  assert_eq(ops_in(bound(item)), [
+    {
+      op: OContainer(ItemAt),
+      args: [AVar({ id: 0, ty: strings, rep: RWord }), AInt(40)],
+      uses: { takes: [false, false], owned: false, fails: false, stops: false },
+      answer: RWord,
+    },
+  ]);
+  let rest = opened(b"f", strings, |cx: Context, xs: Var|
+    rest_read(started([xs]), strings, AVar(xs), AInt(2)));
+  assert_eq(
+    ops_in(bound(rest)).map(|o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }|
+      { op: o.op, uses: o.uses }),
+    [
+      {
+        op: OContainer(Rest),
+        uses: { takes: [false, false], owned: true, fails: false, stops: false },
+      },
+    ],
+  );
+  // Neither goes through the runtime.
+  assert_eq(natives_in(bound(item).concat(bound(rest))), [])
+}
+
 test "a builtin the runtime implements is called through its helper over words, its answer held as its type" {
   let p = program(
     Bytes::concat_all([
@@ -140,36 +186,25 @@ test "a builtin the runtime implements is called through its helper over words, 
   )
 }
 
-test "a length and a byte are read in place, and only a read that can fall outside the object fails" {
+test "a length is read in place off its header, never failing and taking nothing" {
   let p = program(
     Bytes::concat_all([
       b"fn count(xs: List<String>) -> Int = xs.len()\n",
       b"fn size(b: Bytes) -> Int = b.len()\n",
       b"fn arity(a: Array<String>) -> Int = a.len()\n",
-      b"fn byte(b: Bytes, i: Int) -> Int / {abort.raise} = b.at(i)\n",
-      b"fn word(b: Bytes, i: Int) -> U32 / {abort.raise} = b.u32_le(i)\n",
     ]),
   );
   let read = |name: Bytes| {
     let bs = bound_in(p, name);
     assert_eq(natives_in(bs), []);
     ops_in(bs).map(|o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }|
-      { op: o.op, fails: o.uses.fails, answer: o.answer })
+      { op: o.op, takes: o.uses.takes, fails: o.uses.fails, answer: o.answer })
   };
-  assert_eq(read(b"count"), [{ op: OContainer(Length), fails: false, answer: RInt }]);
-  assert_eq(read(b"size"), [{ op: OContainer(Length), fails: false, answer: RInt }]);
-  assert_eq(read(b"arity"), [{ op: OContainer(Elements), fails: false, answer: RInt }]);
-  assert_eq(read(b"byte"), [{ op: OContainer(ByteAt), fails: true, answer: RInt }]);
-  assert_eq(read(b"word"), [
-    { op: OContainer(U32At), fails: true, answer: RNum({ bits: 32, signed: false }) },
-  ]);
-  // A read takes nothing it reads.
-  assert_eq(
-    ops_in(bound_in(p, b"byte")).map(
-      |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.uses.takes,
-    ),
-    [[false, false]],
-  )
+  assert_eq([read(b"count"), read(b"size"), read(b"arity")], [
+    [{ op: OContainer(Length), takes: [false], fails: false, answer: RInt }],
+    [{ op: OContainer(Length), takes: [false], fails: false, answer: RInt }],
+    [{ op: OContainer(Elements), takes: [false], fails: false, answer: RInt }],
+  ])
 }
 
 test "byte strings joined from a list made for the join make no list" {
@@ -729,6 +764,10 @@ fn in_place_calls() -> List<{ name: Bytes, src: Bytes }> =
       src: b"(n: ListNode<String>, x: String) -> ListNode<String> = ListNode::leaf_set(n, 2, x)",
     },
     {
+      name: b"leaf_set_any",
+      src: b"<a>(n: ListNode<a>, x: a) -> ListNode<a> = ListNode::leaf_set(n, 2, x)",
+    },
+    {
       name: b"root_swap",
       src: b"(xs: List<Int>, r: ListNode<Int>) -> Option<ListNode<Int>> = ListNode::root_swap(xs, Some(r)).old",
     },
@@ -809,11 +848,18 @@ fn in_place_calls() -> List<{ name: Bytes, src: Bytes }> =
     },
   ]
 
+fn con(name: Bytes, args: List<Type>) -> Type = TyCon({ name: name, args: args })
+
+/// The C a write prints copying a block of type `ty` where another holds it too: a call of the root
+/// written to copy it, as the unit names the root.
+fn copy_call(ty: Type) -> Bytes / {abort.raise} =
+  Bytes::concat_all([b" = ", symbol_of(root_name(root_of(Copy, ty))), b"(ctx, "])
+
 /// For each probe of `in_place_calls`, C its printed body holds and C it must not: each slot read or
 /// written as what it holds. A root or a kid is an `Option`'s payload's word, which nothing opens,
 /// and which is made an object only where a probe answering an `Option` returns it; an item a word,
 /// read as the scalar it stands for; a size an immediate.
-fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }> = {
+fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }> / {abort.raise} = {
   let reads = |name: Bytes, has: List<Bytes>| { name: name, has: has, lacks: [] };
   let payload = |name: Bytes, has: List<Bytes>|
     { name: name, has: has, lacks: [b"rt_maybe_open_p", b"rt_maybe_take_p"] };
@@ -832,7 +878,9 @@ fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }
     reads(b"leaf_at_on", [b" = ply_words(p0)[0 + (INT64_C(3))];"]),
     reads(b"kid_at", [b" = ply_words(p0)[0 + (INT64_C(1))];"]),
     reads(b"tail_push", [
-      b"rt_list_writable_p(ctx, ",
+      copy_call(con(b"List", [con(b"String", [])])),
+      b" = rt_list_room_p(ctx, 2 * n); ",
+      b"ply_free(ctx, ",
       b")->flags)] = p1; ",
       b")->flags += 1; ply_obj(",
     ]),
@@ -840,8 +888,15 @@ fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }
       b"rt_note_update_p(ctx, in_place, in_place ? 0 : ply_obj(",
       b"[1 + (INT64_C(2))]; ply_words(",
     ]),
-    reads(b"leaf_set", [b"rt_node_writable_p(ctx, ", b"[INT64_C(2)] = p1; ply_dec(ctx, "]),
-    returned(b"root_swap", [b"rt_list_writable_p(ctx, ", b")[0]; ply_words(", b")[0] = "]),
+    reads(b"leaf_set", [
+      copy_call(con(b"std.prelude.ListNode", [con(b"String", [])])),
+      b"[INT64_C(2)] = p1; ply_dec(ctx, ",
+    ]),
+    returned(b"root_swap", [
+      copy_call(con(b"List", [con(b"Int", [])])),
+      b")[0]; ply_words(",
+      b")[0] = ",
+    ]),
     payload(b"kid_swap", [
       b" = 0; if (INT64_C(0) < (int64_t)ply_obj(",
       b")->len = (uint32_t)(INT64_C(0)) + 1; ",
@@ -882,7 +937,7 @@ fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }
       b")->len -= 1;",
     ]),
     payload(b"map_swap", [
-      b"rt_map_writable_p(ctx, ",
+      copy_call(con(b"Map", [con(b"Int", []), con(b"String", [])])),
       b")[0]; ply_words(",
       b")->layout = (uint32_t)(INT64_C(1)); ",
       b")->len = (uint32_t)(INT64_C(40));",
@@ -983,17 +1038,38 @@ test "each extern written in place is an operation over the runtime's objects as
           ],
           [true, true, true, true, true, true, true, true, true, true, true, true, true],
         );
-        // A write makes what it writes held once where it is not, and counts an item's or a pair's.
+        // A write makes what it writes held once where it is not, by the root copying its type's
+        // block, which the root's calls name; and counts an item's or a pair's.
         assert_eq(
-          [
-            has(b"tail_push", b"rt_list_writable_p(ctx, "),
-            has(b"leaf_set", b"rt_node_writable_p(ctx, "),
-            has(b"map_swap", b"rt_map_writable_p(ctx, "),
-            has(b"pair_set", b"rt_note_update_p(ctx, "),
-            has(b"kid_put", b"rt_note_update_p(ctx, "),
-          ],
-          [true, true, true, true, false],
+          [has(b"pair_set", b"rt_note_update_p(ctx, "), has(b"kid_put", b"rt_note_update_p(ctx, ")],
+          [true, false],
         );
+        assert_eq(calls.filter(|c: { name: Bytes, src: Bytes }| has(c.name, b"_writable_p(")), []);
+        let copies = |name: Bytes|
+          match form(name) {
+            Ok(f) ->
+              printed_fn(f, s.setting.ctors).calls.filter(|k: RootKey|
+                match k { Written(w) -> w.op == Copy, _ -> false }),
+            Err(_) -> [],
+          };
+        assert_eq(
+          [b"leaf_set", b"kid_put", b"map_swap", b"branch_cut", b"tail_start", b"leaf_at"].map(
+            copies,
+          ),
+          [
+            [root_of(Copy, con(b"std.prelude.ListNode", [con(b"String", [])]))],
+            [root_of(Copy, con(b"std.prelude.MapNode", [con(b"Int", []), con(b"String", [])]))],
+            [root_of(Copy, con(b"Map", [con(b"Int", []), con(b"String", [])]))],
+            [root_of(Copy, con(b"std.prelude.MapNode", [con(b"Int", []), con(b"String", [])]))],
+            [],
+            [],
+          ],
+        );
+        // A write at a type variable notes it, so only a specialisation, which lays its items out,
+        // copies the block.
+        assert_eq(match form(b"leaf_set_any") { Ok(f) -> f.links.needs, Err(_) -> [] }, [
+          { var: 0, reads: Layout },
+        ]);
         // An extern answering a record answers it as its fields, no record made: its word stays none.
         let fields = |name: Bytes|
           match form(name) {

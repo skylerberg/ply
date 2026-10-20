@@ -1,0 +1,392 @@
+//! The C over a list's own block and its trie that list operations share: an item read where the
+//! trie or the tail holds it, a list's items from an index on as a list sharing its trie, and a list
+//! made of its items. Each block is laid as `layout.layouts` lays a list out, and what a copy counts
+//! once more is counted as `emit.release` says its type is.
+
+import std.bytes (ascii_of_int)
+import check.types (Type, spelled_type)
+import emit.layout (layouts)
+import emit.tir (RWord, Containers)
+import emit.release (ListOf, WordAt, Object, opening)
+import emit.print.counts (dup_of)
+import emit.print.text (Printing, temp, line, unprinted)
+
+/// `c`, C a statement or none, followed by a space where it is one.
+fn spaced(c: Bytes) -> Bytes = if c.len() == 0 { c } else { c.concat(b" ") }
+
+fn field(x: Bytes, f: Bytes) -> Bytes = Bytes::concat_all([b"ply_obj(", x, b")->", f])
+
+fn word(x: Bytes, k: Bytes) -> Bytes = Bytes::concat_all([b"ply_words(", x, b")[", k, b"]"])
+
+fn int_field(x: Bytes, f: Bytes) -> Bytes = Bytes::concat_all([b"(int64_t)", field(x, f)])
+
+/// How many bits of an item's place pick a child of one of a trie's nodes.
+fn trie_bits() -> Int =
+  range(0, 63).fold(0, |b: Int, k: Int| if 1 << k == layouts().trie.width { k } else { b })
+
+/// Where the list `xs`'s trie stops holding its items and its tail starts, from the trie's first
+/// place.
+fn tail_from(xs: Bytes) -> Bytes = {
+  let l = layouts().list;
+  Bytes::concat_all([
+    int_field(xs, l.start),
+    b" + ",
+    int_field(xs, b"len"),
+    b" - ",
+    int_field(xs, l.tail_len),
+  ])
+}
+
+/// Statements setting `into`, a `Word` declared already, to item `i`, a C expression within the list
+/// `xs`, borrowed: its tail's past the places its trie holds, and otherwise the leaf's the trie's
+/// levels lead to.
+pub fn item_read(pr: Printing, depth: Int, into: Bytes, xs: Bytes, i: Bytes) -> Printing = {
+  let l = layouts().list;
+  let width = layouts().trie.width;
+  let mask = ascii_of_int(width - 1);
+  let bits = ascii_of_int(trie_bits());
+  let p = temp(pr);
+  let h = temp(p.pr);
+  let n = temp(h.pr);
+  let s = temp(n.pr);
+  line(
+    s.pr,
+    depth,
+    Bytes::concat_all([
+      b"{ int64_t ",
+      p.name,
+      b" = ",
+      int_field(xs, l.start),
+      b" + (",
+      i,
+      b"); int64_t ",
+      h.name,
+      b" = ",
+      tail_from(xs),
+      b"; if (",
+      p.name,
+      b" >= ",
+      h.name,
+      b") ",
+      into,
+      b" = ",
+      word(xs, Bytes::concat_all([ascii_of_int(l.tail), b" + ", p.name, b" - ", h.name])),
+      b"; else { Word ",
+      n.name,
+      b" = ",
+      word(xs, ascii_of_int(l.root)),
+      b"; int64_t ",
+      s.name,
+      b" = 0; while ((INT64_C(",
+      ascii_of_int(width),
+      b") << ",
+      s.name,
+      b") < ",
+      h.name,
+      b") ",
+      s.name,
+      b" += ",
+      bits,
+      b"; for (; ",
+      s.name,
+      b" > 0; ",
+      s.name,
+      b" -= ",
+      bits,
+      b") ",
+      n.name,
+      b" = ",
+      word(n.name, Bytes::concat_all([b"(", p.name, b" >> ", s.name, b") & ", mask])),
+      b"; ",
+      into,
+      b" = ",
+      word(n.name, Bytes::concat_all([p.name, b" & ", mask])),
+      b"; } }",
+    ]),
+  )
+}
+
+/// Statements setting `into`, declared already, to the leaf of the list `xs`'s trie holding its items
+/// from the `j`-th leaf's worth on, `j` a C expression counted from the leaf its first item lies in,
+/// borrowed; zero past its last leaf, and for a list that is its tail.
+pub fn leaf_read(pr: Printing, depth: Int, into: Bytes, xs: Bytes, j: Bytes) -> Printing = {
+  let l = layouts().list;
+  let width = ascii_of_int(layouts().trie.width);
+  let mask = ascii_of_int(layouts().trie.width - 1);
+  let bits = ascii_of_int(trie_bits());
+  let h = temp(pr);
+  let first = temp(h.pr);
+  let n = temp(first.pr);
+  let p = temp(n.pr);
+  let s = temp(p.pr);
+  line(
+    s.pr,
+    depth,
+    Bytes::concat_all([
+      b"{ int64_t ",
+      h.name,
+      b" = ",
+      tail_from(xs),
+      b"; int64_t ",
+      first.name,
+      b" = ",
+      int_field(xs, l.start),
+      b" / ",
+      width,
+      b"; Word ",
+      n.name,
+      b" = ",
+      word(xs, ascii_of_int(l.root)),
+      b"; if (",
+      n.name,
+      b" == 0 || (",
+      j,
+      b") < 0 || (",
+      j,
+      b") >= ",
+      h.name,
+      b" / ",
+      width,
+      b" - ",
+      first.name,
+      b") ",
+      into,
+      b" = 0; else { int64_t ",
+      p.name,
+      b" = (",
+      first.name,
+      b" + (",
+      j,
+      b")) * ",
+      width,
+      b"; int64_t ",
+      s.name,
+      b" = 0; while ((INT64_C(",
+      width,
+      b") << ",
+      s.name,
+      b") < ",
+      h.name,
+      b") ",
+      s.name,
+      b" += ",
+      bits,
+      b"; for (; ",
+      s.name,
+      b" > 0; ",
+      s.name,
+      b" -= ",
+      bits,
+      b") ",
+      n.name,
+      b" = ",
+      word(n.name, Bytes::concat_all([b"(", p.name, b" >> ", s.name, b") & ", mask])),
+      b"; ",
+      into,
+      b" = ",
+      n.name,
+      b"; } }",
+    ]),
+  )
+}
+
+/// Statements setting `into`, a `Word` declared already, to the items of the list `xs`, of type `ty`,
+/// from `k`, a C expression no greater than its length, on: a list of its own that shares `xs`'s
+/// trie where the trie still holds some of them, its root and each item copied counted once more as
+/// their types count them.
+pub fn rest_made(
+  pr: Printing,
+  depth: Int,
+  into: Bytes,
+  xs: Bytes,
+  k: Bytes,
+  ty: Type,
+) -> Printing / {abort.raise} = {
+  let l = layouts().list;
+  let held = match opening(pr.ctors, ty, RWord) {
+    ListOf(o) -> o,
+    _ -> unprinted(Containers, b"a list's rest of what is no list", spelled_type(ty)),
+  };
+  let item_dup = |x: Bytes| dup_of(held.item, [x]);
+  let node_dup = |x: Bytes| dup_of([WordAt({ at: 0, masked: false, how: Object(held.node) })], [x]);
+  let f = temp(pr);
+  let h = temp(f.pr);
+  let m = temp(h.pr);
+  let j = temp(m.pr);
+  let w = temp(j.pr);
+  // `m` items copied from the tail's `from` on, each counted once more.
+  let copied = |from: Bytes|
+    Bytes::concat_all([
+      b"for (int64_t ",
+      j.name,
+      b" = 0; ",
+      j.name,
+      b" < ",
+      m.name,
+      b"; ",
+      j.name,
+      b"++) { Word ",
+      w.name,
+      b" = ",
+      word(xs, Bytes::concat_all([ascii_of_int(l.tail), b" + ", from, j.name])),
+      b"; ",
+      spaced(item_dup(w.name)),
+      word(into, Bytes::concat_all([ascii_of_int(l.tail), b" + ", j.name])),
+      b" = ",
+      w.name,
+      b"; } ",
+    ]);
+  line(
+    w.pr,
+    depth,
+    Bytes::concat_all([
+      b"{ int64_t ",
+      f.name,
+      b" = ",
+      int_field(xs, l.start),
+      b" + (",
+      k,
+      b"); int64_t ",
+      h.name,
+      b" = ",
+      tail_from(xs),
+      b"; int64_t ",
+      m.name,
+      b"; if (",
+      f.name,
+      b" >= ",
+      h.name,
+      b") { ",
+      m.name,
+      b" = ",
+      int_field(xs, b"len"),
+      b" - (",
+      k,
+      b"); ",
+      into,
+      b" = rt_list_room_p(ctx, ",
+      m.name,
+      b"); ",
+      copied(Bytes::concat_all([f.name, b" - ", h.name, b" + "])),
+      b"} else { ",
+      m.name,
+      b" = ",
+      int_field(xs, l.tail_len),
+      b"; ",
+      into,
+      b" = rt_list_room_p(ctx, ",
+      int_field(xs, l.room),
+      b"); ",
+      word(into, ascii_of_int(l.root)),
+      b" = ",
+      word(xs, ascii_of_int(l.root)),
+      b"; ",
+      spaced(node_dup(word(into, ascii_of_int(l.root)))),
+      copied(b""),
+      field(into, l.start),
+      b" = (uint32_t)",
+      f.name,
+      b"; } ",
+      field(into, l.tail_len),
+      b" = (uint8_t)",
+      m.name,
+      b"; ",
+      field(into, b"len"),
+      b" = (uint32_t)(",
+      int_field(xs, b"len"),
+      b" - (",
+      k,
+      b")); }",
+    ]),
+  )
+}
+
+/// Statements declaring `into` the list of `items`, C expressions each a word the list takes: a
+/// list that is its tail where they fit in one, and otherwise their leading whole leaves' worth in
+/// leaves under as many levels of branches as they need, as the runtime lays a list of them out,
+/// and the rest in its tail.
+pub fn list_made(
+  pr: Printing,
+  depth: Int,
+  into: Bytes,
+  items: List<Bytes>,
+) -> Printing / {abort.raise} = {
+  let l = layouts().list;
+  let width = layouts().trie.width;
+  let n = items.len();
+  let held = if n <= width { 0 } else { n / width * width };
+  // Each of `xs` set into the block `b` from its word `from` on.
+  let set = |b: Bytes, from: Int, xs: List<Bytes>|
+    Bytes::concat_all(
+      range(0, xs.len()).map(|k: Int|
+        Bytes::concat_all([
+          word(b, ascii_of_int(from + k)),
+          b" = ",
+          match xs.at(k) { Some(x) -> x, None -> b"0" },
+          b"; ",
+        ])),
+    );
+  // A node of `kind` holding `xs`, as a temporary of its own.
+  let node = |q: Printing, kind: Int, xs: List<Bytes>| {
+    let t = temp(q);
+    {
+      pr: line(
+        t.pr,
+        depth,
+        Bytes::concat_all([
+          b"Word ",
+          t.name,
+          b" = rt_node_p(ctx, ",
+          ascii_of_int(kind),
+          b"); ",
+          set(t.name, 0, xs),
+          field(t.name, b"len"),
+          b" = ",
+          ascii_of_int(xs.len()),
+          b";",
+        ]),
+      ),
+      name: t.name,
+    }
+  };
+  // Nodes of `kind`, each holding up to `width` of `xs` in order.
+  let grouped = |q: Printing, kind: Int, xs: List<Bytes>|
+    range(0, (xs.len() + width - 1) / width).fold(
+      { pr: q, names: [] },
+      |acc: { pr: Printing, names: List<Bytes> }, k: Int| {
+        let made = node(acc.pr, kind, xs.drop(k * width).take(width));
+        { pr: made.pr, names: acc.names.push(made.name) }
+      },
+    );
+  // The leaves under a level of branches at a time, until one node holds them all.
+  let raised = iterate(
+    grouped(pr, layouts().trie.leaf, items.take(held)),
+    n + 1,
+    |s: { pr: Printing, names: List<Bytes> }|
+      if s.names.len() <= 1 { Stop(s) }
+      else { Continue(grouped(s.pr, layouts().trie.branch, s.names)) },
+  );
+  let root = match raised.names { [r] -> r, _ -> b"0" };
+  line(
+    raised.pr,
+    depth,
+    Bytes::concat_all([
+      b"Word ",
+      into,
+      b" = rt_list_room_p(ctx, ",
+      ascii_of_int(if held == 0 { n } else { width }),
+      b"); ",
+      if held == 0 { b"" }
+      else { Bytes::concat_all([word(into, ascii_of_int(l.root)), b" = ", root, b"; "]) },
+      set(into, l.tail, items.drop(held)),
+      field(into, b"len"),
+      b" = ",
+      ascii_of_int(n),
+      b"; ",
+      field(into, l.tail_len),
+      b" = ",
+      ascii_of_int(n - held),
+      b";",
+    ]),
+  )
+}
