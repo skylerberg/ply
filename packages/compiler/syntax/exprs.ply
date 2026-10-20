@@ -57,6 +57,10 @@ pub type Expr =
   /// holes, the call of `tag::fill` on what `tag::compile` answered a check for the texts, and on
   /// the holes.
   | ETagged(Tagged)
+  /// `???`, or `..` where a definition's body is not written yet: an unfilled hole, which checks
+  /// as any type, reports what it must be, and raises `abort.raise` if a run reaches it. `text`
+  /// is the spelling written.
+  | EHole({ span: Span, text: Bytes })
   | EBad({ span: Span })
   /// `try { body }`: `Ok` of what the body answers, or `Err` of what one raise in it carried. With
   /// no `raise` written, the checker reads which one off the body's row.
@@ -344,6 +348,7 @@ fn placed_expr(pl: Placing, e: Expr, n: Int) -> PlacedExpr = {
       { e: EList({ span: s, items: xs.es }), n: xs.n }
     },
     EBad(_) -> { e: EBad({ span: s }), n: n + 1 },
+    EHole(h) -> { e: EHole({ span: s, text: h.text }), n: n + 1 },
     // No default holds a perform, a handle, a hold, a region, a tagged literal or a `try` block.
     _ -> { e: e, n: n + 1 },
   }
@@ -468,6 +473,7 @@ pub fn expr_span(expr: Expr) -> Span =
     ESimulate(v) -> v.span,
     EParallel(v) -> v.span,
     ETagged(v) -> v.span,
+    EHole(v) -> v.span,
     EBad(v) -> v.span,
     ETryBlock(v) -> v.span,
   }
@@ -573,6 +579,7 @@ fn set_span(expr: Expr, span: Span) -> Expr =
     ESimulate(v) -> ESimulate({ span: span, body: v.body }),
     EParallel(v) -> EParallel({ span: span, branches: v.branches }),
     ETagged(v) -> ETagged({ ..v, span: span }),
+    EHole(v) -> EHole({ span: span, text: v.text }),
     EBad(v) -> EBad({ span: span }),
     ETryBlock(v) -> ETryBlock({ ..v, span: span }),
   }
@@ -1070,6 +1077,12 @@ fn lit_expr(input: Input, parser: Parser, literal: Lit) -> Result<Parsed<Expr>, 
   Ok({ parser: a.parser, node: ELit({ span: a.node, lit: literal }) })
 }
 
+/// `???` or `..`: an unfilled hole the checker reports and a run raises on.
+fn hole_expr(input: Input, parser: Parser, text: Bytes) -> Result<Parsed<Expr>, Parser> = {
+  let a = advance(input, parser);
+  Ok({ parser: a.parser, node: EHole({ span: a.node, text: text }) })
+}
+
 fn primary_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
   let st = current_span(input, parser);
   match token_kind(input, parser) {
@@ -1099,6 +1112,8 @@ fn primary_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / 
       if at_record_literal(input, parser) { record_expr(input, parser) }
       else { block_expr(input, parser) }
     } else if s == b"pipe" || s == b"pipepipe" { lambda_expr(input, parser) }
+    else if s == b"hole" { hole_expr(input, parser, b"???") }
+    else if s == b"dotdot" { hole_expr(input, parser, b"..") }
     else { Err(error_here(input, parser, b"an expression")) },
     _ -> Err(error_here(input, parser, b"an expression")),
   }
@@ -2709,6 +2724,7 @@ pub fn dump_expr(expr: Expr) -> Bytes / {abort.raise} =
         dump_lit(LStr(v.text)),
         dump_list(v.holes, |h: Hole| dump_expr(h.value).concat(dump_lit(LStr(h.text)))),
       ]),
+    EHole(v) -> dump_node(v.span, b"ehole").concat(dump_lit(LStr(v.text))),
     EBad(v) -> dump_node(v.span, b"ebad"),
     ETryBlock(v) ->
       Bytes::concat_all([
@@ -2855,6 +2871,7 @@ pub fn node_count(expr: Expr) -> Int =
     ESimulate(v) -> 1 + node_count(v.body),
     EParallel(v) -> 1 + count_all(v.branches),
     ETagged(v) -> 1 + v.holes.fold(0, |n: Int, h: Hole| n + node_count(h.value)),
+    EHole(_) -> 1,
     EBad(v) -> 1,
     ETryBlock(v) -> 1 + node_count(v.body),
   }
@@ -2933,6 +2950,22 @@ test "the try operator is a node of its own and takes the `?` into its span" {
   assert_eq(dump_expr_of(b"x?"), "0:2:etry;0:1:evar;0:1:qname;?0;0:1:ident;@78;#0;");
   // `x??` nests left.
   assert_eq(dump_expr_of(b"x??"), "0:3:etry;0:2:etry;0:1:evar;0:1:qname;?0;0:1:ident;@78;#0;");
+}
+
+test "a hole is an expression, `???` or `..`, and three question marks are one, not three tries" {
+  assert_eq(dump_expr_of(b"???"), "0:3:ehole;%str;@3f3f3f;#0;");
+  assert_eq(dump_expr_of(b".."), "0:2:ehole;%str;@2e2e;#0;");
+  assert_eq(
+    dump_expr_of(b"f(???)"),
+    "0:6:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:5:ehole;%str;@3f3f3f;#0;#0;#0;",
+  );
+  // Maximal munch: `x???` is `x` then a hole, not `(x?)?` then `?`.
+  assert_eq(dump_expr_of(b"x???"), "#1;!E0001:1:4:1:0;=1:4:1;");
+  // `..` after `{` still opens a record update.
+  assert_eq(
+    dump_expr_of(b"{ ..r, x: 1 }"),
+    "0:13:erup;4:5:evar;4:5:qname;?0;4:5:ident;@72;#1;7:8:ident;@78;10:11:elit;%int;@31;#0;",
+  )
 }
 
 test "the try operator binds tighter than a unary and than any binary" {
