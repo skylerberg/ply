@@ -7,13 +7,14 @@
 //! it keeps from its base and the ones it sets.
 
 import syntax.parsing (Span)
-import check.types (Type, TyFn, TyRecord, TyNominal, Field)
+import check.types (Type, TyCon, TyFn, TyRecord, TyNominal, Field)
 import emit.typing (unknown_type)
-import emit.reps (FieldTy, TyRec, laid_vars, laid_of)
+import emit.reps (FieldTy, TyRec, laid_vars, laid_of, ctor_fields_at)
 import emit.c (sorted_names)
 import emit.answer (Layout)
-import emit.tir (Rep, RWord, RFlat, RCases, Leaf, Var, Arg, AVar, AInt, AZero, Make, MRecord, MCtor,
-                 MLaid, Get, Gathered, PLeaf, PField, PNamed, Data, rep_of_arg)
+import emit.layout (SumLaid, Boxed, words)
+import emit.tir (Rep, RWord, RFlat, RCases, RSum, Leaf, Var, Arg, AVar, AInt, AZero, Make, MRecord,
+                 MCtor, MLaid, MCase, Get, Gathered, PLeaf, PField, PNamed, Data, rep_of_arg)
 import emit.lower.setting (ctor_named)
 import emit.lower.held (held_as, record_held, laid_fields, leaves_of, leaf_span, leaf_spans,
                         field_type, field_types, slot_held, placed, ctor_fields, case_index,
@@ -68,7 +69,10 @@ pub fn constructed_as(
     Some(ctor) -> {
       let r = held_as(cx.setting, ty);
       match case_index(r, ctor) {
-        Some(i) -> sum_gathered(st, ty, r, i, args, at),
+        Some(i) -> match r {
+          RSum(s) -> case_gathered(cx, st, ty, s, i, args, at),
+          _ -> sum_gathered(st, ty, r, i, args, at),
+        },
         None -> made_object(cx, st, ty, ctor, args, at),
       }
     },
@@ -112,6 +116,65 @@ fn sum_gathered(st: Lowering, ty: Type, r: Rep, i: Int, args: List<Arg>, at: Spa
   }
 
 fn leaf_rep(ls: List<Leaf>, k: Int) -> Rep = match ls.at(k) { Some(l) -> l.rep, None -> RWord }
+
+/// Case `i` of `args` of a sum of type `ty` laid as `s`: its place and its arguments, each held as
+/// its type is, gathered into the sum's words; a boxed case's arguments made its box first.
+fn case_gathered(
+  cx: Context,
+  st: Lowering,
+  ty: Type,
+  s: { laid: SumLaid, cases: List<Bytes> },
+  i: Int,
+  args: List<Arg>,
+  at: Span,
+) -> Lowered = {
+  let types = match ty {
+    TyCon(c) -> match cx.setting.ctors.sums.get(c.name) {
+      Some(cs) -> match cs.at(i) { Some(k) -> ctor_fields_at(k, c.args), None -> [] },
+      None -> [],
+    },
+    _ -> [],
+  };
+  if types.len() != args.len() {
+    refuse(st, Data, b"a constructor applied to other than its arguments")
+  } else {
+    let held = handed_all(
+      st,
+      range(0, args.len()).fold([], |acc: List<{ arg: Arg, to: Rep }>, k: Int|
+        match args.at(k) {
+          Some(a) ->
+            acc.push({
+              arg: a,
+              to: held_as(cx.setting, match types.at(k) { Some(t) -> t, None -> unknown_type() }),
+            }),
+          None -> acc,
+        }),
+      at,
+    );
+    let r = RSum(s);
+    match s.laid.cases.at(i) {
+      Some(c) -> match c.payload {
+        Boxed(b) -> {
+          let boxed = bound_as(
+            held.st,
+            unknown_type(),
+            RWord,
+            Make({
+              made: MCase({ case: i, skip: b.skip, words: words(b.laid) }),
+              args: held.args,
+              reuse: None,
+              kept: [],
+            }),
+            at,
+          );
+          bound_as(boxed.st, ty, r, Gathered({ parts: [AInt(i), boxed.arg] }), at)
+        },
+        _ -> bound_as(held.st, ty, r, Gathered({ parts: [AInt(i)].concat(held.args) }), at),
+      },
+      None -> refuse(held.st, Data, b"a case its sum's layout does not hold"),
+    }
+  }
+}
 
 /// Constructor `ctor`'s object of `args`: a nullary one's singleton, or one laid out as its
 /// declaration says, each argument held as its field is, or holding each as its word.

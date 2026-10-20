@@ -797,39 +797,50 @@ pub fn typed_kind(typed: Map<Int, Typed>, at: Span) -> { kind: Kind, ty: Ty } =
 /// record's fields in the checker's order, a sum from its constructors in `ctors` by
 /// `layout.sum_laid`, a case holding the sum's own recursion group in place boxed, and any other type
 /// as a pointer. Inside such a box a sum of that group is laid as its words alone: its cases are read
-/// by its type wherever it is read. Raises for a type variable, where a settled type is owed.
+/// by its type wherever it is read. Raises where a type variable leaves the layout open, where a
+/// settled type is owed.
 pub fn laid(ctors: Ctors, ty: Type) -> layout::Laid / {abort.raise} =
+  match laid_known(ctors, ty) {
+    Some(l) -> l,
+    None ->
+      panic(
+        String::of_bytes_lossy(b"a layout a type variable leaves open: ".concat(spelled_type(ty))),
+      ),
+  }
+
+/// `laid`, or none where a type variable leaves the layout open.
+pub fn laid_known(ctors: Ctors, ty: Type) -> Option<layout::Laid> =
   laid_within(ctors, ty, [], nesting())
 
 /// How many parts deep `laid` and `layout_key` follow a type, through records and sums' cases: far
-/// deeper than any type a program declares nests.
+/// deeper than any type a program declares nests, so none past it is laid.
 fn nesting() -> Int = 256
 
-/// `laid`, with each sum `cut` names laid as its words alone, `depth` parts deep at most.
-fn laid_within(
-  ctors: Ctors,
-  ty: Type,
-  cut: List<Bytes>,
-  depth: Int,
-) -> layout::Laid / {abort.raise} =
-  if depth <= 0 {
-    panic(String::of_bytes_lossy(b"a layout nested too deep: ".concat(spelled_type(ty))))
-  } else {
+/// `laid_known`, with each sum `cut` names laid as its words alone, `depth` parts deep at most.
+fn laid_within(ctors: Ctors, ty: Type, cut: List<Bytes>, depth: Int) -> Option<layout::Laid> =
+  if depth <= 0 { None } else {
     match ty {
-      TyVar(_) ->
-        panic(String::of_bytes_lossy(b"no layout of a type variable: ".concat(spelled_type(ty)))),
-      TyFn(_) -> LWords([P]),
-      TyRecord(fs) -> record_laid(fs.map(|f: Field| laid_within(ctors, f.ty, cut, depth - 1))),
+      TyVar(_) -> None,
+      TyFn(_) -> Some(LWords([P])),
+      TyRecord(fs) ->
+        all_laid(fs.map(|f: Field| laid_within(ctors, f.ty, cut, depth - 1))).map(record_laid),
       TyNominal(x) ->
-        record_laid(x.fields.map(|f: Field| laid_within(ctors, f.ty, cut, depth - 1))),
+        all_laid(x.fields.map(|f: Field| laid_within(ctors, f.ty, cut, depth - 1))).map(
+          record_laid,
+        ),
       TyCon(c) -> match ctors.sums.get(c.name) {
         Some(cs) -> if cut.contains(c.name) {
-          LWords(classes(LSum(sum_within(ctors, c, cs, cut, false, depth - 1))))
-        } else { LSum(sum_within(ctors, c, cs, cut, true, depth - 1)) },
-        None -> LWords(classes_named(c.name)),
+          sum_within(ctors, c, cs, cut, false, depth - 1).map(|s: SumLaid| LWords(classes(LSum(s))))
+        } else { sum_within(ctors, c, cs, cut, true, depth - 1).map(LSum) },
+        None -> Some(LWords(classes_named(c.name))),
       },
     }
   }
+
+/// Each of `ls`, where every one is laid.
+fn all_laid(ls: List<Option<layout::Laid>>) -> Option<List<layout::Laid>> =
+  ls.fold(Some([]), |acc: Option<List<layout::Laid>>, l: Option<layout::Laid>|
+    match acc { Some(xs) -> match l { Some(x) -> Some(xs.push(x)), None -> None }, None -> None })
 
 /// The declared sum `c` of constructors `cs` laid, each case holding its recursion group in place
 /// boxed, with what its box holds laid where `open`.
@@ -840,7 +851,7 @@ fn sum_within(
   cut: List<Bytes>,
   open: Bool,
   depth: Int,
-) -> SumLaid / {abort.raise} = {
+) -> Option<SumLaid> = {
   let rec = ctors.recursive.get(c.name);
   let inside = match rec {
     Some(r) ->
@@ -848,21 +859,24 @@ fn sum_within(
         if acc.contains(g) { acc } else { acc.push(g) }),
     None -> cut,
   };
-  sum_laid(
-    cs.fold([], |acc: List<CaseArgs>, k: SumCtor| {
-      let boxed = match rec { Some(r) -> r.indirect.at(acc.len()) == Some(true), None -> false };
-      acc.push({
+  let cases = cs.fold(Some([]), |acc: Option<List<CaseArgs>>, k: SumCtor|
+    match acc {
+      None -> None,
+      Some(done) -> {
+        let boxed = match rec { Some(r) -> r.indirect.at(done.len()) == Some(true), None -> false };
         // A box takes one word whatever it holds, so a sum laid as its words alone lays none of it.
-        args: if boxed && !open { LWords([]) } else {
-          record_laid(
+        let args = if boxed && !open { Some(LWords([])) } else {
+          all_laid(
             ctor_fields_at(k, c.args).map(|t: Type|
               laid_within(ctors, t, if boxed { inside } else { cut }, depth)),
+          ).map(
+            record_laid,
           )
-        },
-        indirect: boxed,
-      })
-    }),
-  )
+        };
+        match args { Some(a) -> Some(done.push({ args: a, indirect: boxed })), None -> None }
+      },
+    });
+  cases.map(sum_laid)
 }
 
 /// The words a value of the type named `name`, which no declared sum is, is laid in: a scalar's, none
