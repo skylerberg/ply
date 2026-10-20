@@ -6,10 +6,13 @@ import syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PLis
                         LUnit, LBad, has_or, alternatives_of)
 import syntax.exprs (HandleClause, MatchArm, Param, Expr, ELit, EVar, EBinary, EUnary, EApp, EIf,
                      EBlock, EList, ERecord, EField, ELambda, EMatch, EPerform, EHandle, ESimulate,
-                     EParallel, EBad, EHole, ERecordUpdate, ETry, Stmt, SLet, SLetElse, SExpr,
-                     SAssign, RecField, expr_span, simulated_at, branch_at)
+                     EParallel, EBad, EHole, ERecordUpdate, ETry, EWithHold, ETryBlock, ETagged,
+                     Stmt, SLet, SLetElse, SExpr, SAssign, RecField, expr_span, simulated_at,
+                     branch_at)
 import syntax.items (Module, Item, IFn, parse)
 import expand.rewrite (expand)
+import expand.rewrite.shared (nodes_of)
+import syntax.sites (numbered)
 import std.list
 import std.bytes (hex_digit, ascii_of_int)
 import std.string
@@ -455,6 +458,9 @@ fn resolve(stack: Stack, name: Bytes) -> SlotLookup =
 /// The name a label parameter is bound under: no value can take it, so no binder shadows the label.
 fn label_binder(name: Bytes) -> Bytes = Bytes::concat_all([b"[", name, b"]"])
 
+/// Whether `name` is one `label_binder` binds a label parameter under.
+pub fn is_label_binder(name: Bytes) -> Bool = name.starts_with(b"[")
+
 /// A resource a label binder holds is read like any other name, captures threaded and all.
 fn label_code(stack: Stack, name: Bytes) -> Option<Lowered> =
   if !stack.labels.contains(name) { None } else {
@@ -842,18 +848,32 @@ fn as_update(
       },
   );
   if copies.bad { None } else {
-    // With no copied field, a record projected from inside a written field is the base whose cells are reused.
-    let base = if copies.names.len() == 1 { copies.names.at(0) } else {
-      fields.fold(None, |acc: Option<Bytes>, f: RecField|
-        match acc {
-          Some(_) -> acc,
-          None -> if copy_base(f, stack) != None { None }
-          else { projected_var(f.value, stack, []) },
-        })
+    // With no copied field, a record projected from inside a written field is the base whose cells
+    // are reused. The base is read where the first copy, or else that projection, reads it.
+    let base = match copies.names.at(0) {
+      Some(n) ->
+        Some({
+          name: n,
+          at: fields.fold(dummy_span(), |at: Span, f: RecField|
+            match f.value {
+              EField(x) -> if at == dummy_span() && copy_base(f, stack) == Some(n) {
+                expr_span(x.base)
+              } else { at },
+              _ -> at,
+            }),
+        }),
+      None ->
+        fields.fold(None, |acc: Option<Projected>, f: RecField|
+          match acc {
+            Some(_) -> acc,
+            None -> if copy_base(f, stack) != None { None }
+            else { projected_var(f.value, stack, []) },
+          }),
     };
     match base {
       None -> None,
-      Some(name) -> {
+      Some(read) -> {
+        let name = read.name;
         // Walked in field order, so each copy resolves the base, and each capture is numbered, where it stands.
         let walked = fields.fold(
           Some({ codes: [], stack: stack }),
@@ -885,17 +905,7 @@ fn as_update(
                 code: {
                   span: span,
                   node: NUpdate({
-                    // Read where the first copy reads it, so the base is typed as that read is.
-                    base: {
-                      span: fields.fold(dummy_span(), |at: Span, f: RecField|
-                        match f.value {
-                          EField(x) -> if at == dummy_span() && copy_base(f, stack) == Some(name) {
-                            expr_span(x.base)
-                          } else { at },
-                          _ -> at,
-                        }),
-                      node: NVar({ name: name, slot: Some(sl) }),
-                    },
+                    base: { span: read.at, node: NVar({ name: name, slot: Some(sl) }) },
                     copies: copied,
                     sets: range(0, sets.len()).map(|i: Int|
                       {
@@ -931,16 +941,20 @@ fn copy_base(field: RecField, stack: Stack) -> Option<Bytes> =
     _ -> None,
   }
 
+/// A variable a field is read out of, and the read of it.
+type Projected = { name: Bytes, at: Span }
+
 /// The first in-scope variable a field read projects from inside `e`; a name `e` binds itself is never the base.
-fn projected_var(e: Expr, stack: Stack, inner: List<Bytes>) -> Option<Bytes> = {
+fn projected_var(e: Expr, stack: Stack, inner: List<Bytes>) -> Option<Projected> = {
   let first = |exprs: List<Expr>|
-    exprs.fold(None, |acc: Option<Bytes>, x: Expr|
+    exprs.fold(None, |acc: Option<Projected>, x: Expr|
       match acc { Some(_) -> acc, None -> projected_var(x, stack, inner) });
   match e {
     EField(x) -> match x.base {
       EVar(v) -> if v.name.module == None && !inner.contains(v.name.name.name)
-          && st_depth(stack, v.name.name.name) != None { Some(v.name.name.name) }
-      else { projected_var(x.base, stack, inner) },
+          && st_depth(stack, v.name.name.name) != None {
+        Some({ name: v.name.name.name, at: v.span })
+      } else { projected_var(x.base, stack, inner) },
       _ -> projected_var(x.base, stack, inner),
     },
     EUnary(x) -> projected_var(x.operand, stack, inner),
@@ -954,7 +968,7 @@ fn projected_var(e: Expr, stack: Stack, inner: List<Bytes>) -> Option<Bytes> = {
     EBlock(x) -> {
       let walked = x.stmts.fold(
         { found: None, inner: inner },
-        |acc: { found: Option<Bytes>, inner: List<Bytes> }, stmt: Stmt|
+        |acc: { found: Option<Projected>, inner: List<Bytes> }, stmt: Stmt|
           match acc.found {
             Some(_) -> acc,
             None -> match stmt {
@@ -1413,47 +1427,109 @@ fn fields_read(fs: List<CodeField>, before: List<Int>) -> List<Int> =
 
 pub type LowerOut = { dump: Bytes, lowered: Int, skipped: Int }
 
-/// One function body, its slots resolved. `labels` are the hidden parameters a label-generic
-/// definition takes after `params`. A call the checker wrote out through `own`, the binder of the
-/// module's own functions of types, is the call by name it is: one in tail position is a loop as any
-/// other of the module's is.
+/// One function body, its slots resolved, or why not: two different nodes at one site, or a form
+/// the lowered code has no node for. `labels` are the hidden parameters a label-generic definition
+/// takes after `params`. A call the checker wrote out through `own`, the binder of the module's own
+/// functions of types, is the call by name it is: one in tail position is a loop as any other of the
+/// module's is.
 pub fn lower_fn(
   params: List<Bytes>,
   labels: List<Bytes>,
   sites: Map<Int, List<Bytes>>,
   body: Expr,
   own: Bytes = b"",
-) -> Option<{ code: Code, size: Int }> / {abort.raise} = {
-  let start = labels.fold(
-    params.fold(
-      { names: [], scope: [], captures: [], capture_names: [] },
-      |frame: Frame, p: Bytes| bind(frame, p),
-    ),
-    |frame: Frame, l: Bytes| bind(frame, label_binder(l)),
-  );
-  match lower_in(body, {
-      frames: [start],
-      labels: labels,
-      sites: sites,
-      handled: false,
-      own: own,
-    }) {
-    None -> None,
-    Some(o) -> Some({ code: o.code, size: st_top(o.stack).names.len() }),
+) -> Result<{ code: Code, size: Int }, Bytes> / {abort.raise} =
+  match shared_site(body) {
+    Some(why) -> Err(why),
+    None -> {
+      let start = labels.fold(
+        params.fold(
+          { names: [], scope: [], captures: [], capture_names: [] },
+          |frame: Frame, p: Bytes| bind(frame, p),
+        ),
+        |frame: Frame, l: Bytes| bind(frame, label_binder(l)),
+      );
+      match lower_in(body, {
+          frames: [start],
+          labels: labels,
+          sites: sites,
+          handled: false,
+          own: own,
+        }) {
+        None -> Err(b"a body that does not lower to Code"),
+        Some(o) -> Ok({ code: o.code, size: st_top(o.stack).names.len() }),
+      }
+    },
   }
-}
+
+/// What a node is apart from what it holds: its kind, and its name, operator or literal.
+pub fn head(e: Expr) -> Bytes / {abort.raise} =
+  match e {
+    ELit(l) -> b"literal ".concat(dump_lit(l.lit)),
+    EVar(v) -> b"read ".concat(qname_text(v.name)),
+    EBinary(b) -> b"binary ".concat(b.op),
+    EUnary(u) -> b"unary ".concat(u.op),
+    ELambda(_) -> b"lambda",
+    EApp(_) -> b"call",
+    EIf(_) -> b"if",
+    EMatch(_) -> b"match",
+    EBlock(_) -> b"block",
+    ERecord(r) -> b"record ".concat(Bytes::join(r.fields.map(|f: RecField| f.name.name), b",")),
+    ERecordUpdate(_) -> b"update",
+    ETry(_) -> b"?",
+    EField(f) -> b"field ".concat(f.field.name),
+    EList(_) -> b"list",
+    EPerform(p) -> b"perform ".concat(p.op.name),
+    EHandle(_) -> b"handle",
+    EWithHold(_) -> b"with_hold",
+    ESimulate(_) -> b"simulate",
+    EParallel(_) -> b"parallel",
+    EBad(_) -> b"bad",
+    EHole(_) -> b"hole",
+    ETryBlock(_) -> b"try",
+    ETagged(_) -> b"tagged",
+  }
+
+/// The first site of `body` two nodes of different heads stand at, named with both. One node read
+/// twice, as an update reads its base once per field it copies, stands there once.
+fn shared_site(body: Expr) -> Option<Bytes> / {abort.raise} =
+  nodes_of(body).fold(
+    { seen: Map::new(), why: None },
+    |acc: { seen: Map<Int, Expr>, why: Option<Bytes> }, e: Expr|
+      if acc.why != None { acc } else {
+        let s = expr_span(e).site;
+        match acc.seen.get(s) {
+          None -> { ..acc, seen: acc.seen.insert(s, e) },
+          Some(was) -> if head(was) == head(e) { acc } else {
+            {
+              ..acc,
+              why: Some(
+                Bytes::concat_all([
+                  b"two nodes at site ",
+                  ascii_of_int(s),
+                  b": ",
+                  head(was),
+                  b" and ",
+                  head(e),
+                ]),
+              ),
+            }
+          },
+        }
+      },
+  ).why
 
 pub fn lower_module(src: Bytes) -> LowerOut / {abort.raise} = {
   let r = parse(src);
   let x = expand(r.node, r.parser.diags);
   x.module.items.fold({ dump: b"L;1;", lowered: 0, skipped: 0 }, |acc: LowerOut, item: Item|
-    match item {
+    match numbered(item) {
       IFn(d) -> {
         let labels = d.generics.labels.map(|ident: Ident| ident.name);
         let names = d.params.map(|param: Param| param.name.name);
         match lower_fn(names, labels, Map::new(), d.body) {
-          None -> { dump: acc.dump, lowered: acc.lowered, skipped: acc.skipped + 1 },
-          Some(l) ->
+          Err(_) -> { dump: acc.dump, lowered: acc.lowered, skipped: acc.skipped + 1 },
+          Ok(l) ->
             {
               dump: Bytes::concat_all([
                 acc.dump,
