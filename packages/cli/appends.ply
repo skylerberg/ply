@@ -13,7 +13,8 @@ import compiler.store.hash.encoding (hex)
 import compiler.check.resolve.tables (Source, ParsedModule, Diag, error_at, error_at_and)
 import compiler.check.resolve.scopes (PackageDeps)
 import compiler.syntax.parsing (Span, no_module, dummy_span, span_between)
-import compiler.unit (identity_of, read_kept, shipped, write_kept)
+import compiler.unit (identity_of, shipped)
+import compiler.store.kept (Record, kept_records, with_kept)
 import diagnostic (Place, spot_of)
 import env (env)
 import program (Program, is_shipped, whole_of)
@@ -177,49 +178,52 @@ fn keyed_sources(a: Analysis, srcs: List<Bytes>) -> List<Bytes> / {abort.raise} 
 /// its modules' walks taken back as `costs` finds them still answering.
 pub fn pricing<a | e>(
   body: () -> a / {priced.report | e},
-) -> a / {abort.raise, shipped.definitions, env.bodies[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
-  handle {
-    body()
-  } with {
-    priced.report(p) -> {
-      let dir = below_root(env.bodies[sys]());
-      let identity = identity_of(shipped.definitions(), checker_roots());
-      let a = p.analysis;
-      let key = costs_key(
-        identity,
-        a.mods.map(|m: ParsedModule| m.name),
-        keyed_sources(a, p.srcs),
-        a.packages,
-        a.module_packages,
-        a.packages.len(),
-        a.embeds,
-      );
-      let kept = match read_kept[abs](dir, key) {
-        Some(bytes) -> match bin::decode(bytes, report_bin()) { Ok(r) -> Some(r), Err(_) -> None },
-        None -> None,
-      };
-      match kept {
-        Some(r) -> { report: r, kept: [], walked: 0, lowered: 0 },
-        None -> {
-          let keys = cost_keys(p, identity);
-          let c = costs(
-            p,
-            keys.map(|k: Bytes| if k.len() == 0 { None } else { read_kept[abs](dir, k) }),
-          );
-          range(0, keys.len()).fold((), |_: Unit, i: Int|
-            match c.kept.at(i) {
-              Some(Some(bytes)) -> match keys.at(i) {
-                Some(k) -> write_kept[abs](dir, k, bytes),
-                None -> (),
-              },
-              _ -> (),
-            });
-          write_kept[abs](dir, key, bin::encode(c.report, report_bin()));
-          { ..c, kept: [] }
-        },
-      }
-    },
-  }
+) -> a / {abort.raise, shipped.definitions, env.bodies[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} = {
+  let identity = identity_of(shipped.definitions(), checker_roots());
+  let store = below_root(env.bodies[sys]()) ++ "/costs-" ++ String::of_bytes(identity.slice(0, 16));
+  with_kept[abs, reports](store, ||
+    handle {
+      body()
+    } with {
+      priced.report(p) -> {
+        let a = p.analysis;
+        let key = costs_key(
+          identity,
+          a.mods.map(|m: ParsedModule| m.name),
+          keyed_sources(a, p.srcs),
+          a.packages,
+          a.module_packages,
+          a.packages.len(),
+          a.embeds,
+        );
+        let kept = match kept_records.get[reports](key) {
+          Some(bytes) -> match bin::decode(bytes, report_bin()) {
+            Ok(r) -> Some(r),
+            Err(_) -> None,
+          },
+          None -> None,
+        };
+        match kept {
+          Some(r) -> { report: r, kept: [], walked: 0, lowered: 0 },
+          None -> {
+            let keys = cost_keys(p, identity);
+            let c = costs(
+              p,
+              keys.map(|k: Bytes| if k.len() == 0 { None } else { kept_records.get[reports](k) }),
+            );
+            kept_records.put[reports](
+              range(0, keys.len()).fold([], |acc: List<Record>, i: Int|
+                match ((c.kept.at(i), keys.at(i))) {
+                  (Some(Some(bytes)), Some(k)) -> acc.push({ key: k, bytes: bytes }),
+                  _ -> acc,
+                }).push({ key: key, bytes: bin::encode(c.report, report_bin()) }),
+            );
+            { ..c, kept: [] }
+          },
+        }
+      },
+    })
+}
 
 /// Whether one of the run's own modules writes a `reuse fn` or a `returns` clause, so the promise
 /// check can be skipped.

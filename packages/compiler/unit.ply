@@ -20,7 +20,8 @@ import emit.roots (builtin_helper, symbol_of, entry_of, root_id)
 import emit.keys
 import emit.keys (RootKey, Named, At, Written, Entered, FnArg, KeyArg, KeyType, KeyLayout,
                   root_name, definition_of, sited_as, key_lent, key_types, at_key, module_of,
-                  modules_lowered)
+                  modules_lowered, key_bytes, root_key_bin)
+import store.kept (Record, kept_records, with_kept)
 import emit
 import emit (emit_roots_answer)
 import emit.reps (Ctors, laid_vars, has_vars, held_apart, ctor_sums, ctors_of, type_vars,
@@ -427,9 +428,9 @@ pub fn programs_kept() -> String = "programs"
 fn kept_path(dir: String, key: Bytes) -> String / {abort.raise} =
   if dir == "" || dir == "." { String::of_bytes(key) } else { dir ++ "/" ++ String::of_bytes(key) }
 
-/// An answer kept between runs under `dir`. A read is a use, which keeps it from the toolchain's
-/// sweep.
-pub fn read_kept<[r]>(
+/// A whole file kept between runs under `dir`, as a build keeps a program it built: a read is a use,
+/// which keeps it from the toolchain's sweep, which takes such a file on its own.
+pub fn file_kept<[r]>(
   dir: String,
   key: Bytes,
 ) -> Option<Bytes> / {fs.read[r], fs.write[r], time.now_ms, abort.raise} = {
@@ -443,9 +444,9 @@ pub fn read_kept<[r]>(
   }
 }
 
-/// Written beside itself and renamed into place, so a reader finds a whole answer or none. An answer
-/// that cannot be written is left unwritten.
-pub fn write_kept<[r]>(
+/// Written beside itself and renamed into place, so a reader finds a whole file or none. A file that
+/// cannot be written is left unwritten.
+pub fn keep_file<[r]>(
   dir: String,
   key: Bytes,
   bytes: Bytes,
@@ -1569,8 +1570,29 @@ fn definition_material(program: Program, name: Bytes) -> Option<Bytes> =
     },
   }
 
-fn kept_key(parts: List<Bytes>) -> Bytes / {abort.raise} =
-  hex(blake3(Bytes::concat_all(parts.map(|b: Bytes| b.concat(b"\x00")))))
+/// The store below `bodies` that keeps the answers `emitter` gives on `runtime`, and the values a
+/// build kept of `const` definitions beside them: one per such pair and format, so a store goes
+/// whole once no run uses it.
+pub fn answers_store(bodies: String, runtime: Runtime, emitter: Bytes) -> String / {abort.raise} = {
+  let id = blake3(
+    Bytes::concat_all(
+      [b"ply.unit.answer.4", hex(bin::shape_digest(kept_bin())), runtime.identity, emitter].map(
+        |b: Bytes| sized(b),
+      ),
+    ),
+  );
+  bodies ++ "/answers-" ++ id.slice(0, 16).hex_of()
+}
+
+/// What the kept answer of a root whose material is `m` is filed under.
+fn answer_key(m: Bytes) -> Bytes = b"answer\x00".concat(m)
+
+/// What the key whose digest is `d` is filed under: each kept once, and named by every kept answer
+/// whose body calls it.
+fn key_key(d: Bytes) -> Bytes = b"key\x00".concat(d)
+
+/// The digest a kept answer names the root `k` by.
+fn key_digest(k: RootKey) -> Bytes / {abort.raise} = blake3(key_bytes(k))
 
 /// A group's kept body stands only when every member is offered and each member's kept answer is
 /// that same group; otherwise the group is asked again, and the emitter groups what is wanted now.
@@ -1587,10 +1609,12 @@ fn standing(looked: Map<Bytes, Answer>, offered: Map<Bytes, Bool>) -> Map<Bytes,
       else { acc },
     })
 
-/// A kept body, and the key each root it calls had, in the order `callees_of` names them. A key reads
-/// its callees by hash and the C calls them by name, so two callees that hash alike under two names
-/// share a key and not a body; the names are read off the body, which spells each once.
-type Kept = { answer: Answer, callees: List<Option<Bytes>> }
+/// A kept body: its answer, which names none of the roots its body calls; the digest of each of
+/// those, in the order its body names them, each root kept once beside it (`key_key`); and the key
+/// each root it calls had, in the order `callees_of` names them. A key reads its callees by hash and
+/// the C calls them by name, so two callees that hash alike under two names share a key and not a
+/// body.
+type Kept = { answer: Answer, calls: List<Bytes>, callees: List<Option<Bytes>> }
 
 derive bin for Kept
 
@@ -1598,103 +1622,116 @@ derive bin for Kept
 fn callees_of(a: Answer) -> List<Bytes> =
   match a { Body(b) -> ordered(b.tables.calls.map(root_name)), Refused(_) -> [] }
 
-fn kept_of(keys: Map<Bytes, Bytes>, a: Answer) -> Kept =
-  { answer: a, callees: callees_of(a).map(|c: Bytes| keys.get(c)) }
+fn kept_of(keys: Map<Bytes, Bytes>, a: Answer) -> Kept / {abort.raise} =
+  match a {
+    Body(b) ->
+      {
+        answer: Body({ ..b, tables: { ..b.tables, calls: [] } }),
+        calls: b.tables.calls.map(key_digest),
+        callees: callees_of(a).map(|c: Bytes| keys.get(c)),
+      },
+    Refused(_) -> { answer: a, calls: [], callees: [] },
+  }
 
-/// Whether each root `k`'s body calls still has the key it had.
-fn holds(keys: Map<Bytes, Bytes>, k: Kept) -> Bool = {
-  let names = callees_of(k.answer);
-  names.len() == k.callees.len()
+/// Whether each root `a`'s body calls still has the key `callees` says it had.
+fn holds(keys: Map<Bytes, Bytes>, a: Answer, callees: List<Option<Bytes>>) -> Bool = {
+  let names = callees_of(a);
+  names.len() == callees.len()
     && range(0, names.len()).all(|i: Int|
-      match names.at(i) { Some(n) -> k.callees.at(i) == Some(keys.get(n)), None -> false })
+      match names.at(i) { Some(n) -> callees.at(i) == Some(keys.get(n)), None -> false })
 }
 
-fn decoded(keys: Map<Bytes, Bytes>, bytes: Option<Bytes>) -> Option<Answer> / {abort.raise} =
-  match bytes {
-    None -> None,
-    Some(b) -> match bin::decode(b, kept_bin()) {
-      Ok(k) -> if holds(keys, k) { Some(k.answer) } else { None },
-      Err(_) -> None,
-    },
-  }
-
-/// The bodies a bucket's roots had, kept as one answer so a run reads a file per bucket.
-type Packed = { name: Bytes, kept: Kept }
-type Pack = { rows: List<Packed> }
-
-derive bin for Packed
-derive bin for Pack
-
-/// A row whose callees moved is a root the pack holds no body for, which the emitter is asked again.
-fn unpacked(
+/// The answer `k` keeps, its calls named again by the keys `resolved` holds of their digests, where
+/// it still stands: none where a root it calls is kept no more or a callee's key moved.
+fn standing_kept(
   keys: Map<Bytes, Bytes>,
-  bytes: Option<Bytes>,
-) -> Option<Map<Bytes, Answer>> / {abort.raise} =
-  match bytes {
-    None -> None,
-    Some(b) -> match bin::decode(b, pack_bin()) {
-      Ok(p) ->
-        Some(
-          p.rows.fold(Map::new(), |acc: Map<Bytes, Answer>, r: Packed|
-            if holds(keys, r.kept) { acc.insert(r.name, r.kept.answer) } else { acc }),
-        ),
-      Err(_) -> None,
-    },
+  resolved: Map<Bytes, RootKey>,
+  k: Kept,
+) -> Option<Answer> =
+  if !k.calls.all(|d: Bytes| resolved.contains(d)) { None } else {
+    let a = match k.answer {
+      Body(b) ->
+        Body({
+          ..b,
+          tables: {
+            ..b.tables,
+            calls: k.calls.fold([], |acc: List<RootKey>, d: Bytes|
+              match resolved.get(d) { Some(r) -> acc.push(r), None -> acc }),
+          },
+        }),
+      Refused(_) -> k.answer,
+    };
+    if holds(keys, a, k.callees) { Some(a) } else { None }
   }
 
-/// Each bucket's roots, by name.
-fn bucketed(names: List<Bytes>) -> Map<Int, List<Bytes>> =
-  names.fold(Map::new(), |acc: Map<Int, List<Bytes>>, n: Bytes| {
-    let b = bucket_of(n);
-    acc.insert(b, List::push(match acc.get(b) { Some(xs) -> xs, None -> [] }, n))
-  })
-
-/// Each root's body as an earlier run kept it, `materials` naming what each is a function of: a
-/// bucket's pack, the bodies its roots had when it was written, before a root's own body. A refusal
-/// is never kept: what the emitter refuses may be the program's doing, which no material names.
-fn looked_up<| e>(
+/// The answers `materials` names a kept one of, each root by its material: each read back with the
+/// roots it calls, a key read once however many answers call it, and the digests of those keys,
+/// which the store holds.
+fn kept_answers<| e>(
+  keys: Map<Bytes, Bytes>,
   materials: Map<Bytes, Bytes>,
-  packs: Map<Int, Map<Bytes, Answer>>,
-  body: (Bytes) -> Option<Answer> / e,
-) -> Map<Bytes, Answer> / e =
-  materials.fold(Map::new(), |acc: Map<Bytes, Answer>, n: Bytes, m: Bytes| {
-    let found = match packs.get(bucket_of(n)) { Some(packed) -> packed.get(n), None -> body(m) };
-    match found { Some(a) -> acc.insert(n, a), None -> acc }
-  })
+  read: (Bytes) -> Option<Bytes> / e,
+) -> { answers: Map<Bytes, Answer>, known: Map<Bytes, Bool> } / {abort.raise | e} = {
+  let found = materials.fold(Map::new(), |acc: Map<Bytes, Kept>, n: Bytes, m: Bytes|
+    match read(answer_key(m)) {
+      Some(b) -> match bin::decode(b, kept_bin()) { Ok(k) -> acc.insert(n, k), Err(_) -> acc },
+      None -> acc,
+    });
+  let digests = found.fold(Map::new(), |acc: Map<Bytes, Bool>, _: Bytes, k: Kept|
+    k.calls.fold(acc, |a: Map<Bytes, Bool>, d: Bytes| a.insert(d, true)));
+  let resolved = digests.fold(Map::new(), |acc: Map<Bytes, RootKey>, d: Bytes, _: Bool|
+    match read(key_key(d)) {
+      Some(b) -> match bin::decode(b, root_key_bin()) { Ok(r) -> acc.insert(d, r), Err(_) -> acc },
+      None -> acc,
+    });
+  {
+    answers: found.fold(Map::new(), |acc: Map<Bytes, Answer>, n: Bytes, k: Kept|
+      match standing_kept(keys, resolved, k) { Some(a) -> acc.insert(n, a), None -> acc }),
+    known: resolved.fold(Map::new(), |acc: Map<Bytes, Bool>, d: Bytes, _: RootKey|
+      acc.insert(d, true)),
+  }
+}
 
-type Repack = { names: List<Bytes>, pack: Pack }
-
-/// The packs to write: each bucket's that was missing or in which a root gained a body now, holding
-/// every body its roots have.
-fn repacked(
+/// What keeps the bodies among `answers` each root of `materials` names: the body under its
+/// material, and each root it calls under its key's digest where neither `known` nor the store
+/// holds it yet; and `known` with those digests. A refusal is never kept: what the emitter refuses
+/// may be the program's doing, which no material names.
+fn answers_kept<| e>(
   keys: Map<Bytes, Bytes>,
-  buckets: Map<Int, List<Bytes>>,
-  packs: Map<Int, Map<Bytes, Answer>>,
-  looked: Map<Bytes, Answer>,
-  answered: Map<Bytes, Answer>,
-) -> List<Repack> =
-  buckets.fold([], |acc: List<Repack>, b: Int, names: List<Bytes>| {
-    let body_of = |n: Bytes|
-      match answered.get(n) {
-        Some(Body(x)) -> Some(Body(x)),
-        Some(Refused(_)) -> None,
-        None -> match looked.get(n) { Some(Body(x)) -> Some(Body(x)), _ -> None },
-      };
-    let gained = names.fold(false, |g: Bool, n: Bytes|
-      g || (match answered.get(n) { Some(Body(_)) -> true, _ -> false }));
-    if packs.contains(b) && !gained { acc } else {
-      acc.push({
-        names: names,
-        pack: {
-          rows: names.fold([], |rows: List<Packed>, n: Bytes|
-            match body_of(n) {
-              Some(a) -> rows.push({ name: n, kept: kept_of(keys, a) }),
-              None -> rows,
+  materials: Map<Bytes, Bytes>,
+  answers: Map<Bytes, Answer>,
+  known: Map<Bytes, Bool>,
+  read: (Bytes) -> Option<Bytes> / e,
+) -> { records: List<Record>, known: Map<Bytes, Bool> } / {abort.raise | e} =
+  answers.fold(
+    { records: [], known: known },
+    |acc: { records: List<Record>, known: Map<Bytes, Bool> }, n: Bytes, a: Answer|
+      match ((a, materials.get(n))) {
+        (Body(b), Some(m)) -> {
+          let called = b.tables.calls.fold(
+            acc,
+            |x: { records: List<Record>, known: Map<Bytes, Bool> }, k: RootKey| {
+              let d = key_digest(k);
+              if x.known.contains(d) { x }
+              else if read(key_key(d)) != None { { ..x, known: x.known.insert(d, true) } } else {
+                {
+                  records: x.records.push({ key: key_key(d), bytes: key_bytes(k) }),
+                  known: x.known.insert(d, true),
+                }
+              }
+            },
+          );
+          {
+            ..called,
+            records: called.records.push({
+              key: answer_key(m),
+              bytes: bin::encode(kept_of(keys, a), kept_bin()),
             }),
+          }
         },
-      })
-    }
-  })
+        _ -> acc,
+      },
+  )
 
 /// The program's constructors as the emitter reads them, the unit's table `ctors` laid out as the
 /// dump says, with each sum's cases and the constructors whose module states a `key`.
@@ -1873,8 +1910,9 @@ fn groups_whole(
 /// `published` the handings of the rest: round after round, each answer written against a handing the
 /// round before moved is asked for again with its group, until none is, so the answers are those
 /// one call over all of them makes. `room` is the rounds the unit has left; at none, the error
-/// names what still moved.
-fn answers_settled(
+/// names what still moved. Each call's answers are handed to `kept` as they come back, with the
+/// digests of the keys the store is known to hold, which it answers grown.
+fn answers_settled<| e>(
   runtime: Runtime,
   dump: Dump,
   p: Program,
@@ -1884,11 +1922,13 @@ fn answers_settled(
   ask: List<RootKey>,
   keys: Map<Bytes, RootKey>,
   room: Int,
-) -> Result<Map<Bytes, Answer>, Bytes> / {abort.raise} = {
+  kept: (Map<Bytes, Answer>, Map<Bytes, Bool>) -> Map<Bytes, Bool> / e,
+  known: Map<Bytes, Bool>,
+) -> Result<Map<Bytes, Answer>, Bytes> / {abort.raise | e} = {
   let settled = iterate(
-    { fresh: Map::new(), ask: ask, room: room },
+    { fresh: Map::new(), ask: ask, room: room, known: known },
     room + 1,
-    |s: { fresh: Map<Bytes, Answer>, ask: List<RootKey>, room: Int }|
+    |s: { fresh: Map<Bytes, Answer>, ask: List<RootKey>, room: Int, known: Map<Bytes, Bool> }|
       if s.ask.len() == 0 || s.room <= 0 { Stop(s) } else {
         let pieces = dealt(p, s.ask);
         let before = handings_held(handings_held(published, held), s.fresh);
@@ -1902,6 +1942,7 @@ fn answers_settled(
           ask: stale_of(all, handings_held(published, all)).map(|n: Bytes|
             match keys.get(n) { Some(k) -> k, None -> Named(n) }),
           room: s.room - 1,
+          known: kept(got, s.known),
         })
       },
   );
@@ -1928,37 +1969,11 @@ pub fn const_budget() -> Int = 100000000
 /// The bytes a `const` definition's value's encoding may take.
 pub fn const_room() -> Int = 16777216
 
-/// What a `const` definition's value is a function of, and so kept under: the runtime that
-/// evaluated it, the compiler whose code it ran and encoded it as, and what the front end keeps it
-/// under, which is the hash of all it reaches, the files it embeds among them, and the names of it.
-pub fn baked_key(runtime: Bytes, emitter: Bytes, hash: Bytes) -> Bytes / {abort.raise} =
-  hex(
-    blake3(
-      Bytes::concat_all([sized(b"ply baked value 2"), sized(runtime), sized(emitter), sized(hash)]),
-    ),
-  )
-
-/// A value kept under `dir`, whole. It is kept behind its own digest, so one a full disk cut short
-/// reads as none and is evaluated again.
-pub fn kept_value<[r]>(
-  dir: String,
-  key: Bytes,
-) -> Option<Bytes> / {fs.read[r], fs.write[r], time.now_ms, abort.raise} =
-  match read_kept[r](dir, key) {
-    None -> None,
-    Some(bytes) -> if bytes.len() < 32 { None } else {
-      let value = bytes.slice(32, bytes.len());
-      if blake3(value) == bytes.slice(0, 32) { Some(value) } else { None }
-    },
-  }
-
-/// `value` kept under `dir` as `kept_value` reads it back.
-pub fn keep_value<[r]>(
-  dir: String,
-  key: Bytes,
-  value: Bytes,
-) -> Unit / {fs.write[r], entropy.next, time.now_ms, abort.raise} =
-  write_kept[r](dir, key, blake3(value).concat(value))
+/// What a `const` definition's value is kept under in the store of answers of the emitter that
+/// encoded it on the runtime that evaluated it (`answers_store`): what the front end keeps the
+/// definition under, which is the hash of all it reaches, the files it embeds among them, and the
+/// names of it.
+pub fn baked_key(hash: Bytes) -> Bytes = b"value\x00".concat(hash)
 
 /// The root that answers the encoding of a `const` definition's value: what a build enters to keep
 /// it.
@@ -2010,9 +2025,9 @@ fn kept_body(ctors: Ctors, p: Program, b: Baked) -> Answer / {abort.raise} = {
 /// The unit over `every` root offered: each one's answer taken from what an earlier run kept where it
 /// stands, the emitter entered once for the rest, what it answered kept for the next run, and the
 /// unit produced over all of it. `inputs` holds the bytes of each file `dump` says the program
-/// embeds, by digest. `emitter` is what the emitter's answers are a function of on its
-/// side, which every kept answer is filed under. A root the emitter answers nothing for is refused.
-/// `Err` names the roots whose handings still moved when the rounds ran out.
+/// embeds, by digest. `read` reads a record of the store of answers `answers_store` names, and
+/// `keep` keeps a batch of them, each batch as the emitter answers it. A root the emitter answers
+/// nothing for is refused. `Err` names the roots whose handings still moved when the rounds ran out.
 /// A root `baked` names is held as that value in place of its body, which the emitter is not asked
 /// for. Each round is told to `phases` as it ends.
 pub fn emitted<| e>(
@@ -2021,9 +2036,8 @@ pub fn emitted<| e>(
   sources: List<Bytes>,
   inputs: Map<Bytes, Bytes>,
   every: List<Bytes>,
-  emitter: Bytes,
   read: (Bytes) -> Option<Bytes> / e,
-  write: (Bytes, Bytes) -> Unit / e,
+  keep: (List<Record>) -> Unit / e,
   baked: List<Baked> = [],
   phases: Option<{ now: () -> Int / e, told: (RoundTally) -> Unit / e }> = None,
 ) -> Result<Emission, Bytes> / {abort.raise | e} = {
@@ -2034,17 +2048,9 @@ pub fn emitted<| e>(
     if wanted.contains(b.name) { acc.insert(b.name, b) } else { acc });
   let entries = every.filter(|n: Bytes| entered_root(p, n)).map(Entered);
   let offered = every.filter(|n: Bytes| !values.contains(n)).map(Named).concat(entries);
-  // No constructor table: a body names each tag by its constructor, which its key's read
-  // declarations already cover, so one answer serves every program that holds the root.
-  let common = [
-    b"ply.unit.answer.3",
-    hex(bin::shape_digest(kept_bin())),
-    runtime.identity,
-    emitter,
-  ];
   let program = program_ctors(dump, ctors);
   match told_round(phases, 1, ||
-      answered_round(runtime, dump, p, ctors, common, offered, Map::new(), 64, read, write)) {
+      answered_round(runtime, dump, p, ctors, offered, Map::new(), 64, read, keep)) {
     Err(why) -> Err(why),
     Ok(first) -> match closed_rounds(
         runtime,
@@ -2052,9 +2058,8 @@ pub fn emitted<| e>(
         p,
         ctors,
         program,
-        common,
         read,
-        write,
+        keep,
         phases,
         first,
         64,
@@ -2178,38 +2183,21 @@ fn answered_round<| e>(
   dump: Dump,
   p: Program,
   ctors: List<Ctor>,
-  common: List<Bytes>,
   roots: List<RootKey>,
   published: Map<Bytes, Published>,
   room: Int,
   read: (Bytes) -> Option<Bytes> / e,
-  write: (Bytes, Bytes) -> Unit / e,
+  keep: (List<Record>) -> Unit / e,
 ) -> Result<Answered, Bytes> / {abort.raise | e} = {
   let keys = roots.fold(Map::new(), |acc: Map<Bytes, RootKey>, k: RootKey|
     acc.insert(root_name(k), k));
   let names = keys.keys();
   let asked = names.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
   let types = types_material(dump);
-  let body_key = |m: Bytes| kept_key(common.concat([b"body", m]));
   let materials = keys.fold(Map::new(), |acc: Map<Bytes, Bytes>, n: Bytes, k: RootKey|
     match root_material(p, types, k) { Some(m) -> acc.insert(n, m), None -> acc });
-  let buckets = bucketed(materials.keys());
-  let pack_key = |ns: List<Bytes>|
-    kept_key(
-      common.concat([b"pack", hex(bin::shape_digest(pack_bin()))]).concat(
-        ns.map(|n: Bytes| match materials.get(n) { Some(m) -> m, None -> b"" }),
-      ),
-    );
-  let packs = buckets.fold(
-    Map::new(),
-    |acc: Map<Int, Map<Bytes, Answer>>, b: Int, ns: List<Bytes>|
-      match unpacked(p.keys, read(pack_key(ns))) {
-        Some(found) -> acc.insert(b, found),
-        None -> acc,
-      },
-  );
-  let looked = looked_up(materials, packs, |m: Bytes| decoded(p.keys, read(body_key(m))));
-  let standing_now = standing(looked, asked);
+  let looked = kept_answers(p.keys, materials, read);
+  let standing_now = standing(looked.answers, asked);
   // A kept answer written against a handing that has moved since is asked for again, as is every
   // other one of a recursion group it leaves.
   let stale = stale_of(standing_now, handings_held(published, standing_now));
@@ -2218,8 +2206,27 @@ fn answered_round<| e>(
     names,
   );
   let missed = keys.values().filter(|k: RootKey| !kept.contains(root_name(k)));
-  let settled = if missed.len() == 0 { Ok(Map::new()) }
-  else { answers_settled(runtime, dump, p, ctors, kept, published, missed, keys, room) };
+  // Each call's answers are kept as they come back, so a run that dies keeps what it was answered.
+  let kept_now = |got: Map<Bytes, Answer>, known: Map<Bytes, Bool>| {
+    let r = answers_kept(p.keys, materials, got, known, read);
+    if r.records.len() > 0 { keep(r.records) };
+    r.known
+  };
+  let settled = if missed.len() == 0 { Ok(Map::new()) } else {
+    answers_settled(
+      runtime,
+      dump,
+      p,
+      ctors,
+      kept,
+      published,
+      missed,
+      keys,
+      room,
+      kept_now,
+      looked.known,
+    )
+  };
   match settled {
     Err(why) -> Err(why),
     Ok(fresh) -> {
@@ -2228,16 +2235,6 @@ fn answered_round<| e>(
       let answered = missed.fold(fresh, |acc: Map<Bytes, Answer>, k: RootKey|
         if acc.contains(root_name(k)) { acc }
         else { acc.insert(root_name(k), Refused({ why: unanswered_why() })) });
-      answered.fold((), |_: Unit, n: Bytes, a: Answer|
-        match materials.get(n) {
-          None -> (),
-          Some(m) -> match a {
-            Body(_) -> write(body_key(m), bin::encode(kept_of(p.keys, a), kept_bin())),
-            Refused(_) -> (),
-          },
-        });
-      repacked(p.keys, buckets, packs, looked, answered).fold((), |_: Unit, r: Repack|
-        write(pack_key(r.names), bin::encode(r.pack, pack_bin())));
       Ok({
         answers: answered.fold(kept, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
           acc.insert(n, a)),
@@ -2263,9 +2260,8 @@ fn closed_rounds<| e>(
   p: Program,
   ctors: List<Ctor>,
   program: Ctors,
-  common: List<Bytes>,
   read: (Bytes) -> Option<Bytes> / e,
-  write: (Bytes, Bytes) -> Unit / e,
+  keep: (List<Record>) -> Unit / e,
   phases: Option<{ now: () -> Int / e, told: (RoundTally) -> Unit / e }>,
   had: Answered,
   room: Int,
@@ -2317,7 +2313,7 @@ fn closed_rounds<| e>(
     )
   } else if asking.len() == 0 || room <= 0 { Ok(had) } else {
     match told_round(phases, 66 - room, ||
-        answered_round(runtime, dump, p, ctors, common, asking.values(), held, room, read, write)) {
+        answered_round(runtime, dump, p, ctors, asking.values(), held, room, read, keep)) {
       Err(why) -> Err(why),
       Ok(r) -> {
         let next = {
@@ -2329,7 +2325,7 @@ fn closed_rounds<| e>(
           asked: had.asked + r.asked,
           added: had.added.concat(more.values()),
         };
-        closed_rounds(runtime, dump, p, ctors, program, common, read, write, phases, next, room - 1)
+        closed_rounds(runtime, dump, p, ctors, program, read, keep, phases, next, room - 1)
       },
     }
   }
@@ -2698,20 +2694,6 @@ pub fn held(
     },
   }
 
-/// The unit over `offered`, held as `held` holds it. What is kept between runs is `read` and
-/// `write`'s, under keys that name `emitter`.
-pub fn compiled<| e>(
-  runtime: Runtime,
-  dump: Dump,
-  sources: List<Bytes>,
-  inputs: Map<Bytes, Bytes>,
-  offered: List<Bytes>,
-  emitter: Bytes,
-  read: (Bytes) -> Option<Bytes> / e,
-  write: (Bytes, Bytes) -> Unit / e,
-) -> Result<Bytes, List<Diag>> / {abort.raise | e} =
-  held(dump, offered, emitted(runtime, dump, sources, inputs, offered, emitter, read, write))
-
 // --- Tests ------------------------------------------------------------------
 
 fn some_definitions() -> Bytes =
@@ -2995,21 +2977,19 @@ test "a call of a generic tail loop at a type settles on the loop at it, whichev
       [source],
       Map::new(),
       [b"m.go", b"m.back"],
-      b"",
       |_: Bytes| None,
-      |_: Bytes, _: Bytes| (),
+      |_: List<Record>| (),
     ) {
     Err(why) -> panic(String::of_bytes_lossy(why)),
     Ok(e) -> {
       assert_eq(e.produced.dropped.map(|d: Dropped| d.function), []);
       // Each call reaches its loop at the type it settled, and neither reaches the loop as it
-      // stands; each loop enters each of its two members by a jump.
+      // stands.
       assert_eq(
         [b"m.ping@Float", b"m.pong@String", b"m.ping", b"m.pong"].filter(|n: Bytes|
           e.produced.taken.contains(n)),
         [b"m.ping@Float", b"m.pong@String"],
-      );
-      assert_eq(e.produced.text.split(b"goto ply_loop;").len() - 1, 4)
+      )
     },
   }
 }
@@ -3572,77 +3552,28 @@ test "two statics of one name holding different content stop the unit" {
   assert(said.starts_with(b"two statics of one name hold different content"), None)
 }
 
-/// A name in `name`'s bucket that is not `name`, for a test that wants two roots to share one.
-fn bucket_mate(name: Bytes) -> Bytes =
-  range(0, 4096).fold(b"", |found: Bytes, i: Int| {
-    let n = b"m.mate".concat(ascii_of_int(i));
-    if found == b"" && bucket_of(n) == bucket_of(name) { n } else { found }
-  })
-
-fn answered_by(answers: List<{ key: Bytes, value: Answer }>) -> (Bytes) -> Option<Answer> = {
-  let m = Map::of_entries(answers);
-  |k: Bytes| m.get(k)
-}
-
-test "a bucket's pack answers before a root's own body, and a root kept with neither is asked again" {
-  let mate = bucket_mate(b"m.a");
-  assert(bucket_of(b"m.b") != bucket_of(b"m.a") && bucket_of(b"m.c") != bucket_of(b"m.a"), None);
-  let packed = one_body(b"m.a", []);
-  let looked = looked_up(
-    Map::of_entries([
-      { key: b"m.a", value: b"ma" },
-      { key: b"m.b", value: b"mb" },
-      { key: b"m.c", value: b"mc" },
-      { key: mate, value: b"md" },
-    ]),
-    Map::new().insert(bucket_of(b"m.a"), Map::new().insert(b"m.a", packed)),
-    answered_by([
-      { key: b"ma", value: one_body(b"m.a", [b"m.old"]) },
-      { key: b"mb", value: one_body(b"m.b", []) },
-      { key: b"md", value: one_body(mate, []) },
-    ]),
-  );
-  assert_eq(looked.get(b"m.a"), Some(packed));
-  assert_eq(looked.get(b"m.b"), Some(one_body(b"m.b", [])));
-  assert_eq(looked.get(b"m.c"), None);
-  // A pack holds every body its bucket had, so a root it does not hold had none.
-  assert_eq(looked.get(mate), None)
-}
-
 test "a kept body stands only where each callee it names still has the key it was filed with" {
   let keys = Map::of_entries([{ key: b"m.b", value: b"kb" }]);
   let body = one_body(b"m.a", [b"m.b"]);
   let filed = kept_of(keys, body);
-  // Each callee is spelled once, by the body; the kept answer holds only its key.
+  // The body names each root it calls by its key's digest, which the store keeps once.
+  let resolved = match body {
+    Body(b) ->
+      b.tables.calls.fold(Map::new(), |m: Map<Bytes, RootKey>, k: RootKey|
+        m.insert(key_digest(k), k)),
+    Refused(_) -> Map::new(),
+  };
   assert_eq(filed.callees, [Some(b"kb")]);
-  assert(holds(keys, filed));
+  assert(filed.calls.len() == 1 && filed.calls.all(|d: Bytes| d.len() == 32), None);
+  assert_eq(standing_kept(keys, resolved, filed), Some(body));
   // Another tree's callee that hashes alike under another name: the C would call a name not here.
-  assert(!holds(Map::of_entries([{ key: b"m.c", value: b"kb" }]), filed));
-  assert(!holds(Map::of_entries([{ key: b"m.b", value: b"another" }]), filed));
-  assert_eq(decoded(keys, Some(bin::encode(filed, kept_bin()))), Some(body));
-  assert_eq(decoded(Map::new(), Some(bin::encode(filed, kept_bin()))), None);
-  let pack = bin::encode({ rows: [{ name: b"m.a", kept: filed }] }, pack_bin());
-  assert_eq(unpacked(keys, Some(pack)), Some(Map::new().insert(b"m.a", body)));
-  assert_eq(unpacked(Map::new(), Some(pack)), Some(Map::new()))
-}
-
-test "a pack is written again where it was missing or a root in it gained a body" {
-  let mate = bucket_mate(b"m.a");
-  let refusal = Refused({ why: b"a body the lowering does not reach" });
-  let buckets = bucketed([b"m.a", mate, b"m.b"]);
-  let packs = Map::new().insert(bucket_of(b"m.a"), Map::new().insert(b"m.a", one_body(b"m.a", [])));
-  let looked = Map::of_entries([
-    { key: b"m.a", value: one_body(b"m.a", []) },
-    { key: mate, value: refusal },
-    { key: b"m.b", value: one_body(b"m.b", []) },
-  ]);
-  let rows = |rs: List<Repack>| rs.map(|r: Repack| r.pack.rows.map(|p: Packed| p.name));
-  assert_eq(rows(repacked(Map::new(), buckets, packs, looked, Map::new())), [[b"m.b"]]);
-  let again = rows(
-    repacked(Map::new(), buckets, packs, looked, Map::new().insert(mate, one_body(mate, []))),
+  assert_eq(standing_kept(Map::of_entries([{ key: b"m.c", value: b"kb" }]), resolved, filed), None);
+  assert_eq(
+    standing_kept(Map::of_entries([{ key: b"m.b", value: b"another" }]), resolved, filed),
+    None,
   );
-  assert_eq(again.len(), 2);
-  assert(again.fold(false, |found: Bool, r: List<Bytes>| found || r == [b"m.a", mate]), None)
+  // A root it calls that the store keeps no more: the body is asked for again.
+  assert_eq(standing_kept(keys, Map::new(), filed), None)
 }
 
 fn three_modules() -> List<Bytes> =
@@ -3824,7 +3755,19 @@ test "the emitter answers roots dealt over calls as it answers them in one" {
   );
   // Dealt apart, a call of a definition another call emits is written against the handing that call
   // publishes, asked again until no handing moves.
-  match answers_settled(runtime, dump, p, [], Map::new(), Map::new(), missed, keys, 64) {
+  match answers_settled(
+      runtime,
+      dump,
+      p,
+      [],
+      Map::new(),
+      Map::new(),
+      missed,
+      keys,
+      64,
+      |_: Map<Bytes, Answer>, known: Map<Bytes, Bool>| known,
+      Map::new(),
+    ) {
     Err(why) -> panic(String::of_bytes_lossy(why)),
     Ok(dealt_apart) -> assert_eq(rows(dealt_apart), together),
   }
@@ -3944,9 +3887,8 @@ fn kept_unit(
           sources_placed(dump, modules),
           Map::new(),
           every,
-          b"",
           |_: Bytes| None,
-          |_: Bytes, _: Bytes| (),
+          |_: List<Record>| (),
           baked,
         ) {
         Ok(e) -> e,
@@ -3973,9 +3915,8 @@ test "no root is asked to give back a scalar's box, which its last count gives b
       [source],
       Map::new(),
       every,
-      b"",
       |_: Bytes| None,
-      |_: Bytes, _: Bytes| (),
+      |_: List<Record>| (),
       [],
     ) {
     Ok(e) -> e.produced,
@@ -4076,9 +4017,8 @@ fn held_over(
       sources_placed(dump, user.concat(shipped)),
       Map::new(),
       every,
-      b"",
       |_: Bytes| None,
-      |_: Bytes, _: Bytes| (),
+      |_: List<Record>| (),
     ),
   )
 }
@@ -4114,9 +4054,8 @@ test "a root the emitter answers nothing for is refused and listed, and the rest
           sources_placed(dump, user),
           Map::new(),
           every,
-          b"",
           |k: Bytes| body_store.get(k),
-          |k: Bytes, v: Bytes| body_store.put(k, v),
+          |rs: List<Record>| body_store.put(rs),
         ) {
         Ok(e) -> e,
         Err(why) -> panic(String::of_bytes_lossy(why)),
@@ -4147,19 +4086,20 @@ test "a unit tells each of its rounds to a build's phases as it ends, numbered f
   kept_bodies(|| {
     // A round is kept under its number, as a byte for each root it asked the emitter for.
     let told = |r: RoundTally|
-      body_store.put(
-        ascii_of_int(r.round),
-        Bytes::concat_all(range(0, r.asked).map(|_: Int| b"x")),
-      );
+      body_store.put([
+        {
+          key: ascii_of_int(r.round),
+          bytes: Bytes::concat_all(range(0, r.asked).map(|_: Int| b"x")),
+        },
+      ]);
     match emitted(
         a_runtime(b"r"),
         dump,
         sources_placed(dump, user),
         Map::new(),
         [b"m.one", b"m.two"],
-        b"",
         |_: Bytes| None,
-        |_: Bytes, _: Bytes| (),
+        |_: List<Record>| (),
         phases: Some({ now: || 0, told: told }),
       ) {
       Err(why) -> panic(String::of_bytes_lossy(why)),
@@ -4315,9 +4255,8 @@ test "a root the emitter refuses is asked again, and nothing of the refusal is k
           [source],
           Map::new(),
           [b"m.f"],
-          b"",
           |k: Bytes| body_store.get(k),
-          |k: Bytes, v: Bytes| body_store.put(k, v),
+          |rs: List<Record>| body_store.put(rs),
         ) {
         Ok(e) -> e,
         Err(why) -> panic(String::of_bytes_lossy(why)),
@@ -4342,28 +4281,31 @@ test "a unit asks the emitter for a root a kept body names, though the body's de
           [source],
           Map::new(),
           [b"m.each", b"m.total", b"m.scaled"],
-          b"",
           |k: Bytes| body_store.get(k),
-          |k: Bytes, v: Bytes| body_store.put(k, v),
+          |rs: List<Record>| body_store.put(rs),
         ) {
         Ok(e) -> e,
         Err(why) -> panic(String::of_bytes_lossy(why)),
       };
     assert_eq(unit(lending).produced.dropped, []);
-    // What the next run starts from: the body of `scaled`, and of no root it names.
+    // What the next run starts from: the body of `scaled`, and of no root it names, beside the keys
+    // of the roots it calls.
+    let answer = |k: Bytes| !k.starts_with(key_key(b""));
     body_store.replace(
       body_store.all().fold(Map::new(), |acc: Map<Bytes, Bytes>, k: Bytes, v: Bytes|
-        match bin::decode(v, kept_bin()) {
-          Ok(filed) -> match filed.answer {
-            Body(b) -> if b.tables.symbols.map(|d: Defined| d.symbol) == [symbol_of(b"m.scaled")] {
-              acc.insert(k, v)
-            } else { acc },
-            Refused(_) -> acc,
-          },
-          Err(_) -> acc,
+        if !answer(k) { acc.insert(k, v) } else {
+          match bin::decode(v, kept_bin()) {
+            Ok(filed) -> match filed.answer {
+              Body(b) -> if b.tables.symbols.map(|d: Defined| d.symbol)
+                  == [symbol_of(b"m.scaled")] { acc.insert(k, v) }
+              else { acc },
+              Refused(_) -> acc,
+            },
+            Err(_) -> acc,
+          }
         }),
     );
-    assert_eq(body_store.all().len(), 1);
+    assert_eq(body_store.all().keys().filter(answer).len(), 1);
     let moved = unit(
       b"// a comment, and a definition, above them\nfn aside() -> Int = 7\n".concat(lending),
     );
@@ -4375,7 +4317,7 @@ test "a unit asks the emitter for a root a kept body names, though the body's de
 /// The store a test's emissions keep bodies in.
 effect body_store {
   read get(k: Bytes) -> Option<Bytes>
-  write put(k: Bytes, v: Bytes) -> Unit
+  write put(records: List<Record>) -> Unit
   read all() -> Map<Bytes, Bytes>
   write replace(m: Map<Bytes, Bytes>) -> Unit
 }
@@ -4389,8 +4331,8 @@ fn kept_bodies<a | e>(
   } with {
     var store: Map<Bytes, Bytes> = Map::new(),
     body_store.get(k) -> store.get(k),
-    body_store.put(k, v) -> {
-      store = store.insert(k, v);
+    body_store.put(records) -> {
+      store = records.fold(store, |m: Map<Bytes, Bytes>, r: Record| m.insert(r.key, r.bytes));
     },
     body_store.all() -> store,
     body_store.replace(m) -> {
@@ -4398,39 +4340,118 @@ fn kept_bodies<a | e>(
     },
   }
 
-/// What reading `key` back answers over a directory `kept` whose file for it holds `bytes`.
-fn read_back(tree: fs::MemFs, key: Bytes, bytes: Bytes) -> Option<Bytes> / {abort.raise} =
-  fs::on_mem[abs](fs::mem_write(tree, "kept/" ++ String::of_bytes(key), bytes).fs, ||
-    handle { kept_value[abs]("kept", key) } with { time.now_ms() -> 0 }).value
-
-test "a kept value reads back whole, and one cut short or altered reads as none" {
-  let key = baked_key(b"runtime", b"emitter", b"hash");
-  let kept = fs::on_mem[abs](fs::mem_empty(), ||
-    handle {
-      keep_value[abs]("kept", key, b"78da01");
-      kept_value[abs]("kept", key)
-    } with {
-      entropy.next() -> 7,
-      time.now_ms() -> 0,
-    });
-  assert_eq(kept.value, Some(b"78da01"));
-  let whole = match fs::mem_read(kept.tree, "kept/" ++ String::of_bytes(key)) {
-    Some(bytes) -> bytes,
-    None -> panic("the value is kept under its key"),
-  };
-  assert_eq(read_back(kept.tree, key, whole), Some(b"78da01"));
-  assert_eq(read_back(kept.tree, key, whole.slice(0, whole.len() - 1)), None);
-  assert_eq(read_back(kept.tree, key, whole.concat(b"0")), None);
-  assert_eq(read_back(kept.tree, key, b""), None)
+/// The unit over every root of `user`, its answers kept in the store at `s`, told each round as
+/// `told` says.
+fn unit_kept<[r]>(
+  user: List<{ name: Bytes, src: Bytes }>,
+  told: keep (RoundTally) -> Unit / {abort.raise},
+) -> Emission / {fs.read[r], fs.write[r], abort.raise} = {
+  let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
+  with_kept[r, ans]("s", ||
+    match emitted(
+        a_runtime(b"r"),
+        dump,
+        sources_placed(dump, user),
+        Map::new(),
+        dump.emitter_roots.map(|x: EmitterRoot| x.root),
+        |k: Bytes| kept_records.get[ans](k),
+        |rs: List<Record>| kept_records.put[ans](rs),
+        phases: Some({ now: || 0, told: told }),
+      ) {
+      Ok(e) -> e,
+      Err(why) -> panic(String::of_bytes_lossy(why)),
+    })
 }
 
-test "a value is kept under the runtime, the compiler and the hash of all its definition reaches" {
-  let key = baked_key(b"runtime", b"emitter", b"hash");
-  assert_eq(key.len(), 64);
-  assert(baked_key(b"another", b"emitter", b"hash") != key);
-  assert(baked_key(b"runtime", b"another", b"hash") != key);
-  assert(baked_key(b"runtime", b"emitter", b"another") != key);
-  assert(baked_key(b"runtim", b"eemitter", b"hash") != key)
+fn kept_over(
+  tree: fs::MemFs,
+  user: List<{ name: Bytes, src: Bytes }>,
+) -> fs::Over<Emission> / {abort.raise} = fs::on_mem[abs](tree, || unit_kept[abs](user, unaided))
+
+/// Each file of the store at `s` and the bytes it takes.
+fn store_files(tree: fs::MemFs) -> List<{ name: String, size: Int }> / {abort.raise} =
+  match fs::mem_list(tree, "s") {
+    None -> [],
+    Some(names) ->
+      names.filter(|n: String| n.starts_with("seg-") || n.starts_with("manifest-")).map(
+        |n: String|
+          { name: n, size: match fs::mem_size(tree, "s/" ++ n) { Some(s) -> s, None -> 0 } },
+      ),
+  }
+
+fn store_bytes(tree: fs::MemFs) -> Int / {abort.raise} =
+  store_files(tree).fold(0, |n: Int, f: { name: String, size: Int }| n + f.size)
+
+fn unaided(_: RoundTally) -> Unit = ()
+
+fn kept_program() -> List<{ name: Bytes, src: Bytes }> =
+  [
+    {
+      name: b"m",
+      src: b"fn each(n: Int, f: (Int) -> Int, i: Int, acc: Int) -> Int = if i >= n { acc } else { each(n, f, i + 1, acc + f(i)) }\nfn total(n: Int, f: (Int) -> Int) -> Int = each(n, f, 0, 0)\nfn scaled(n: Int, k: Int) -> Int = total(n, |x: Int| x * k)\nfn pair<a>(x: a) -> List<a> = [x, x]\nfn twice(n: Int) -> Int = pair(n).len() + pair(\"s\").len()\n",
+    },
+  ]
+
+test "a run over a store an earlier run filled reads every answer back and writes nothing" {
+  let first = kept_over(fs::mem_of([]), kept_program());
+  assert(first.value.asked > 0 && first.value.produced.dropped == [], None);
+  let second = kept_over(first.tree, kept_program());
+  assert_eq(second.value.asked, 0);
+  assert_eq(second.value.produced.taken, first.value.produced.taken);
+  assert_eq(store_files(second.tree), store_files(first.tree))
+}
+
+test "a run that dies keeps the answers of every call the emitter finished" {
+  let whole = kept_over(fs::mem_of([]), kept_program());
+  let died = fs::on_mem[abs](fs::mem_of([]), ||
+    handle {
+      unit_kept[abs](kept_program(), |r: RoundTally|
+        if r.round == 1 { panic("the run dies as its first round ends") });
+      false
+    } with {
+      abort.raise(_) -> true,
+    });
+  assert(died.value, None);
+  let next = kept_over(died.tree, kept_program());
+  // The answers of its first round were kept as they came back; the next run asks for the rest.
+  assert(next.value.kept > 0 && next.value.asked < whole.value.asked, None);
+  assert_eq(next.value.produced.taken, whole.value.produced.taken)
+}
+
+test "a run keeps only what it was answered anew, however much the store holds" {
+  let first = kept_over(fs::mem_of([]), kept_program());
+  let grown = |more: Bytes| {
+    let user = kept_program().map(|m: { name: Bytes, src: Bytes }|
+      { ..m, src: m.src.concat(more) });
+    let next = kept_over(first.tree, user);
+    { asked: next.value.asked, wrote: store_bytes(next.tree) - store_bytes(first.tree) }
+  };
+  // A definition more is a root more and the keys it calls; nothing kept before is written again.
+  let one = grown(b"fn aside() -> Int = 7\n");
+  let three = grown(b"fn aside() -> Int = 7\nfn beside() -> Int = 8\nfn below() -> Int = 9\n");
+  assert(one.asked > 0 && three.asked > one.asked, None);
+  assert(one.wrote > 0 && one.wrote * 2 < store_bytes(first.tree), None);
+  assert(three.wrote <= one.wrote * three.asked / one.asked + 400, None)
+}
+
+test "a run passes over a store's segment it cannot read and asks for those roots again" {
+  let first = kept_over(fs::mem_of([]), kept_program());
+  let cut = store_files(first.tree).fold(
+    first.tree,
+    |t: fs::MemFs, f: { name: String, size: Int }|
+      if f.name.starts_with("seg-") { fs::mem_write(t, "s/" ++ f.name, b"").fs } else { t },
+  );
+  let again = kept_over(cut, kept_program());
+  assert_eq(again.value.asked, first.value.asked);
+  assert_eq(again.value.produced.taken, first.value.produced.taken)
+}
+
+test "answers and values are kept in a store of their runtime and emitter, a value under its hash" {
+  let at = |runtime: Bytes, emitter: Bytes| answers_store("b", a_runtime(runtime), emitter);
+  assert_eq(at(b"r", b"e"), at(b"r", b"e"));
+  assert(at(b"r", b"e") != at(b"r2", b"e"), None);
+  assert(at(b"r", b"e") != at(b"r", b"e2"), None);
+  assert(baked_key(b"hash") != baked_key(b"another"), None)
 }
 
 test "a unit takes what its callees let it, resolves its bodies and says what it holds" {
