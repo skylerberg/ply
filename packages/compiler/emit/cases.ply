@@ -224,8 +224,9 @@ test "a body that fails inside a `handle` leaves through the handle's landing, w
   let leaves = |raised: Bytes| bodies.map(|body: Bytes| body.index_of(raised) != None);
   assert_eq(leaves(b"rt_let_no_match_p(ctx); goto ply_h"), [true, true]);
   assert_eq(leaves(b"rt_not_that_width_p(ctx, "), [true, true]);
-  // A byte read past the end is the builtin's over its encoding, which raises.
-  assert_eq(leaves(b"rt_builtin_encoded_p(ctx, "), [true, true]);
+  // A byte read past the end raises as `Bytes::at` does, over the index and the length alone.
+  assert_eq(leaves(b"builtin_elaborated_refused_p(ctx, INT64_C(8), "), [true, true]);
+  assert_eq(bodies.map(|body: Bytes| body.index_of(b"rt_builtin_encoded_p")), [None, None]);
   assert_eq(bodies.map(|body: Bytes| body.index_of(b"return")), [None, None])
 }
 
@@ -787,7 +788,7 @@ test "an array holds a record's words in place and a float as its bits" {
   assert_eq(has(b"ply_f64((ply_words("), [true, true, false, false]);
   assert_eq(has(b"ply_array_len("), [true, true, true, false]);
   // An index past the end raises as `Array::get` does, the array never handed to the runtime.
-  assert_eq(has(b"builtin_elaborated_array_bad_p(ctx, 4, "), [true, true, false, false]);
+  assert_eq(has(b"builtin_elaborated_refused_p(ctx, 4, "), [true, true, false, false]);
   assert_eq(has(b"builtin_array_get"), [false, false, false, false]);
   // An array of a variable's type is read only where its callers settle the variable.
   assert_eq(out.get(3).text, b"")
@@ -1569,7 +1570,11 @@ test "a list, an array or a map is compared and digested by roots written for it
     [walk(b"equal_from", entries)],
     [walk(b"equal", ints)],
     [walk(b"ordered", ints)],
-    [walk(b"digest_from", ints)],
+    // A list's digest joins its items' encodings with `Bytes::concat_all`, written for a list of them.
+    [
+      walk(b"digest_from", ints),
+      walk(b"concat_all_from", TyCon({ name: b"List", args: [bytes_type()] })),
+    ],
     [],
     [tree],
     [walk(b"equal", trees)],
@@ -1615,6 +1620,58 @@ test "a list, an array or a map is compared and digested by roots written for it
     ].filter(|k: RootKey| own_code(body(k).text).index_of(b"goto ply_loop") == None),
     [],
   )
+}
+
+test "a string's builtin that is refused hands the runtime the words it was refused, and crosses nothing" {
+  let src = Bytes::concat_all([
+    b"fn at(b: Bytes, i: Int) -> Int / {abort.raise} = b.at(i)\n",
+    b"fn word(b: Bytes, i: Int) -> U32 / {abort.raise} = b.u32_le(i)\n",
+    b"fn cut(b: Bytes, i: Int, j: Int) -> Bytes / {abort.raise} = b.slice(i, j)\n",
+    b"fn chars(s: String, i: Int, j: Int) -> String / {abort.raise} = s.slice(i, j)\n",
+    b"fn byte(n: Int) -> Bytes / {abort.raise} = byte_of_int(n)\n",
+    b"fn from(b: Bytes, n: Bytes, i: Int) -> Option<Int> / {abort.raise} = b.index_of_from(n, i)\n",
+    b"fn seek(b: Bytes, n: Int) -> Option<Int> / {abort.raise} = b.index_of_byte(n)\n",
+    b"fn scan(b: Bytes, i: Int, n: Int) -> Int / {abort.raise} = b.scan(i, b\"a\", n)\n",
+    b"fn parts(s: String, t: String) -> List<String> / {abort.raise} = s.split(t)\n",
+    b"fn ints(lo: Int, hi: Int) -> List<Int> = range(lo, hi)\n",
+    b"fn find(s: String, t: String) -> Int / {abort.raise} = s.find(t)\n",
+    b"fn text(b: Bytes) -> String / {abort.raise} = String::of_bytes(b)\n",
+    b"fn told(c: Bool, m: String) -> Unit / {abort.raise} = assert(c, Some(m))\n",
+    b"fn untold(c: Bool) -> Unit / {abort.raise} = assert(c, None)\n",
+  ]);
+  // Each with the number of its refusal, and whether the refusal names text.
+  let refusals = [
+    { name: b"m.at", code: 8, text: false },
+    { name: b"m.word", code: 9, text: false },
+    { name: b"m.cut", code: 10, text: false },
+    { name: b"m.chars", code: 11, text: false },
+    { name: b"m.byte", code: 12, text: false },
+    { name: b"m.from", code: 14, text: false },
+    { name: b"m.seek", code: 13, text: false },
+    { name: b"m.scan", code: 15, text: false },
+    { name: b"m.parts", code: 19, text: false },
+    { name: b"m.ints", code: 17, text: false },
+    { name: b"m.find", code: 20, text: true },
+    { name: b"m.text", code: 21, text: true },
+    { name: b"m.told", code: 22, text: true },
+    { name: b"m.untold", code: 22, text: true },
+  ];
+  let names = refusals.map(|r: { name: Bytes, code: Int, text: Bool }| r.name);
+  let answers = answers_at([b"m"], [src], [b"Some", b"None"], names.map(|n: Bytes| Named(n)));
+  let crossings = [keys::Lower, keys::Lift];
+  let wrong = refusals.filter(|r: { name: Bytes, code: Int, text: Bool }| {
+    let b = answered_body(answers, r.name);
+    let native = if r.text { b"builtin_elaborated_refused_text_p(ctx, INT64_C(" }
+    else { b"builtin_elaborated_refused_p(ctx, INT64_C(" };
+    own_code(b.text).index_of(native.concat(ascii_of_int(r.code)).concat(b"), ")) == None
+      || own_code(b.text).index_of(b"rt_builtin_encoded_p") != None
+      || b.tables.calls.any(|c: RootKey|
+        match c { Written(w) -> crossings.contains(w.op), _ -> false })
+  });
+  assert_eq(wrong.map(|r: { name: Bytes, code: Int, text: Bool }| r.name), []);
+  // A message is handed as its text, read where `Some` holds it, and none as a count below 0.
+  let told = own_code(answered_body(answers, b"m.told").text);
+  assert(told.index_of(b"INT64_C(-1), ") != None, Some(String::of_bytes_lossy(told)))
 }
 
 /// The body `answers` holds for the root `name`.
@@ -2129,7 +2186,7 @@ test "a field of a `Columns`' record is loaded from its column, with no record m
   // does.
   assert_eq(has(b"rt_columns_field_p"), [false, false, false]);
   assert_eq(has(b"PLY_KIND_COLUMNS"), [false, false, false]);
-  assert_eq(has(b"builtin_elaborated_array_bad_p(ctx, 6, "), [true, true, true])
+  assert_eq(has(b"builtin_elaborated_refused_p(ctx, 6, "), [true, true, true])
 }
 
 test "a `Char` is its own word, compared as C compares the words" {
@@ -3132,11 +3189,12 @@ test "a byte string made for a list is handed to the list with no count taken ag
     true,
   );
   let text = match out { [e, ..] -> e.text, [] -> b"" };
-  // The byte is written into a block made for it, or past its range answered by the builtin over
-  // its encoding; either is the list's item as it is made.
+  // The byte is written into a block made for it, the list's item as it is made; past its range,
+  // `byte_of_int`'s refusal raises over the number alone.
   assert(
     text.index_of(b"rt_alloc_bytes_p(ctx, ") != None
-      && text.index_of(b"rt_builtin_encoded_p(ctx, ") != None
+      && text.index_of(b"builtin_elaborated_refused_p(ctx, INT64_C(12), ") != None
+      && text.index_of(b"rt_builtin_encoded_p") == None
       && text.index_of(b"rt_list_room_p") != None,
     Some(String::of_bytes_lossy(text)),
   );
@@ -3274,17 +3332,17 @@ test "a builtin is called through the helper named for it, and an import that ta
     [
       {
         name: b"m",
-        src: b"fn letters(s: String) -> List<Char> = s.chars()\nfn head(b: Bytes) -> Bytes / {abort.raise} = b.slice(0, 1)\n",
+        src: b"fn power(x: Float) -> Float = x.pow(2.0)\nfn angle(y: Float, x: Float) -> Float = y.atan2(x)\n",
       },
     ],
     [],
-    [b"String::chars", b"Bytes::slice"],
+    [b"Float::pow", b"Float::atan2"],
     true,
   );
   assert_eq(own.map(|e: Emitted| e.why), [None, None]);
   let has = |text: Bytes| own.map(|e: Emitted| e.text.index_of(text) != None);
-  assert_eq(has(b"builtin_string_chars_p(ctx, "), [true, false]);
-  assert_eq(has(b"builtin_bytes_slice_p(ctx, "), [false, true]);
+  assert_eq(has(b"builtin_float_pow_p(ctx, "), [true, false]);
+  assert_eq(has(b"builtin_float_atan2_p(ctx, "), [false, true]);
   assert_eq(builtin_helper(b"?numeric_binary"), b"builtin_elaborated_numeric_binary");
   assert_eq(builtin_helper(b"range"), b"builtin_range");
   let imported = emit_all_program(

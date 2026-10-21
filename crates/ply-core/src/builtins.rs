@@ -562,13 +562,8 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             if hi <= lo {
                 return Ok(Value::list(Vec::new()));
             }
-            let len = hi.saturating_sub(lo);
-            if len > MAX_RANGE_LEN {
-                return Err(Diagnostic::error(
-                    codes::RUNTIME_ERROR,
-                    format!("`range` of {len} elements exceeds the limit of {MAX_RANGE_LEN}"),
-                )
-                .primary(span, "this range is too large to materialize"));
+            if hi.saturating_sub(lo) > MAX_RANGE_LEN {
+                return Err(range_too_long(span, lo, hi));
             }
             Ok(Value::list((lo..hi).map(Value::Int).collect()))
         }
@@ -765,12 +760,7 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             let n = args[0].as_int(span, "`byte_of_int`")?;
             match u8::try_from(n) {
                 Ok(byte) => Ok(Value::bytes([byte])),
-                Err(_) => Err(Diagnostic::error(
-                    codes::RUNTIME_ERROR,
-                    format!("`byte_of_int` was given {n}"),
-                )
-                .primary(span, "a byte is 0 to 255")
-                .note("mask the value before the call if that is what you meant: `n & 0xFF`")),
+                Err(_) => Err(byte_of_int_refused(span, n)),
             }
         }
 
@@ -929,12 +919,7 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             let b = args[0].as_bytes(span, "`Bytes::split`")?;
             let sep = args[1].as_bytes(span, "`Bytes::split`")?;
             if sep.is_empty() {
-                return Err(Diagnostic::error(
-                    codes::RUNTIME_ERROR,
-                    "`Bytes::split` needs a separator, and this one is empty",
-                )
-                .primary(span, "an empty separator matches everywhere and nowhere")
-                .note("pass the bytes that actually separate the parts, as in `b\"\\r\\n\"`"));
+                return Err(empty_separator(span, Builtin::BytesSplit));
             }
             let mut out = Vec::new();
             let mut at = 0;
@@ -1184,12 +1169,7 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             let s = args[0].as_str(span, "`String::split`")?;
             let sep = args[1].as_str(span, "`String::split`")?;
             if sep.is_empty() {
-                return Err(Diagnostic::error(
-                    codes::RUNTIME_ERROR,
-                    "`String::split` needs a separator, and this one is empty",
-                )
-                .primary(span, "an empty separator matches everywhere and nowhere")
-                .note("pass the text that actually separates the parts, as in \"\\r\\n\""));
+                return Err(empty_separator(span, Builtin::StringSplit));
             }
             Ok(Value::list(s.split(sep).map(Value::str).collect()))
         }
@@ -1228,16 +1208,7 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             let needle = args[1].as_str(span, "`String::find`")?;
             match s.find(needle) {
                 Some(at) => Ok(Value::Int(s[..at].chars().count() as i64)),
-                None => Err(Diagnostic::error(
-                    codes::RUNTIME_ERROR,
-                    format!("`String::find` did not find {} in {}", slot(0), slot(1)),
-                )
-                .primary(span, "this substring does not occur")
-                .note("guard with `String::contains`, which answers the same question as a `Bool`")
-                .showing(vec![
-                    Plain::Str(needle.to_string()),
-                    Plain::Str(s.to_string()),
-                ])),
+                None => Err(not_found(span, s, needle)),
             }
         }
 
@@ -1747,26 +1718,87 @@ pub fn start_outside(from: i64, len: usize, span: Span, what: &str) -> Diagnosti
 /// A scan's byte budget, which bounds the work hostile input can cause.
 fn budget(v: &Value, span: Span, what: &str) -> Result<usize, Diagnostic> {
     let max = int_arg(v, span, what)?;
-    usize::try_from(max).map_err(|_| {
-        Diagnostic::error(
-            codes::RUNTIME_ERROR,
-            format!("`{what}` was given a negative budget of {max}"),
-        )
-        .primary(span, "a scan cannot examine a negative number of bytes")
-        .note("pass `0` to examine nothing, or `Bytes::len(b)` to leave it unbounded")
-    })
+    usize::try_from(max).map_err(|_| negative_budget(span, what, max))
+}
+
+/// `what`, a scan, given a budget `max` below 0.
+#[cold]
+pub fn negative_budget(span: Span, what: &str, max: i64) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`{what}` was given a negative budget of {max}"),
+    )
+    .primary(span, "a scan cannot examine a negative number of bytes")
+    .note("pass `0` to examine nothing, or `Bytes::len(b)` to leave it unbounded")
 }
 
 fn one_byte(v: &Value, span: Span, what: &str) -> Result<u8, Diagnostic> {
     let byte = int_arg(v, span, what)?;
-    u8::try_from(byte).map_err(|_| {
-        Diagnostic::error(
-            codes::RUNTIME_ERROR,
-            format!("`{what}` was given {byte}, which is not a byte"),
-        )
-        .primary(span, "a byte is `0` to `255`")
-        .note("`Bytes::at` answers in that range, and so does a byte literal's element")
-    })
+    u8::try_from(byte).map_err(|_| not_a_byte(span, what, byte))
+}
+
+/// `what` given `byte` to search for, which is no byte.
+#[cold]
+pub fn not_a_byte(span: Span, what: &str, byte: i64) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`{what}` was given {byte}, which is not a byte"),
+    )
+    .primary(span, "a byte is `0` to `255`")
+    .note("`Bytes::at` answers in that range, and so does a byte literal's element")
+}
+
+/// `byte_of_int` given `n`, which is no byte.
+#[cold]
+pub fn byte_of_int_refused(span: Span, n: i64) -> Diagnostic {
+    Diagnostic::error(codes::RUNTIME_ERROR, format!("`byte_of_int` was given {n}"))
+        .primary(span, "a byte is 0 to 255")
+        .note("mask the value before the call if that is what you meant: `n & 0xFF`")
+}
+
+/// `Bytes::split` or `String::split`, as `split` names it, given an empty separator.
+#[cold]
+pub fn empty_separator(span: Span, split: Builtin) -> Diagnostic {
+    let example = if split == Builtin::StringSplit {
+        "pass the text that actually separates the parts, as in \"\\r\\n\""
+    } else {
+        "pass the bytes that actually separate the parts, as in `b\"\\r\\n\"`"
+    };
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!(
+            "`{}` needs a separator, and this one is empty",
+            split.name()
+        ),
+    )
+    .primary(span, "an empty separator matches everywhere and nowhere")
+    .note(example)
+}
+
+/// `range(lo, hi)` holding more than the most items a range materializes.
+#[cold]
+pub fn range_too_long(span: Span, lo: i64, hi: i64) -> Diagnostic {
+    let len = hi.saturating_sub(lo);
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`range` of {len} elements exceeds the limit of {MAX_RANGE_LEN}"),
+    )
+    .primary(span, "this range is too large to materialize")
+}
+
+/// `String::find` not finding `needle` in `s`.
+#[cold]
+pub fn not_found(span: Span, s: &str, needle: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`String::find` did not find {} in {}", slot(0), slot(1)),
+    )
+    .primary(span, "this substring does not occur")
+    .note("guard with `String::contains`, which answers the same question as a `Bool`")
+    .showing(vec![
+        Plain::Str(needle.to_string()),
+        Plain::Str(s.to_string()),
+    ])
 }
 
 /// The half-open `[start, end)` of a slicing builtin, refused rather than clamped.
@@ -1781,16 +1813,30 @@ fn range_args(
     let start = int_arg(start, span, what)?;
     let end = int_arg(end, span, what)?;
     if start < 0 || end < start || !usize::try_from(end).is_ok_and(|e| e <= len) {
-        return Err(Diagnostic::error(
-            codes::RUNTIME_ERROR,
-            format!("`{what}` range {start}..{end} is outside a value of {len} {unit}"),
-        )
-        .primary(span, "this range does not fit")
-        .note(format!(
-            "a range must satisfy `0 <= start <= end <= {len}`; it is never clamped"
-        )));
+        return Err(range_outside(span, what, start, end, len, unit));
     }
     Ok((start as usize, end as usize))
+}
+
+/// `what`, a slicing builtin, given the range `start..end` of a value of `len` `unit`, which does not
+/// satisfy `0 <= start <= end <= len`.
+#[cold]
+pub fn range_outside(
+    span: Span,
+    what: &str,
+    start: i64,
+    end: i64,
+    len: usize,
+    unit: &str,
+) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`{what}` range {start}..{end} is outside a value of {len} {unit}"),
+    )
+    .primary(span, "this range does not fit")
+    .note(format!(
+        "a range must satisfy `0 <= start <= end <= {len}`; it is never clamped"
+    ))
 }
 
 /// The byte offset of the `n`-th character boundary.
@@ -1802,7 +1848,9 @@ fn char_offset(s: &str, n: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-fn not_utf8(span: Span, b: &[u8], e: &std::str::Utf8Error) -> Diagnostic {
+/// `String::of_bytes` given the bytes `b`, which `e` says are not UTF-8.
+#[cold]
+pub fn not_utf8(span: Span, b: &[u8], e: &std::str::Utf8Error) -> Diagnostic {
     let at = e.valid_up_to();
     let what = match e.error_len() {
         Some(n) => format!(

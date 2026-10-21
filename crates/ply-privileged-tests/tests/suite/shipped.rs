@@ -184,12 +184,20 @@ fn the_runtime_describes_what_emitted_code_lays_out_against() {
         )
     );
     // A native that answers nothing may still raise.
-    let bad = native("?array_bad");
+    let refused = native("?refused");
     assert_eq!(
-        (&bad["params"], &bad["answer"], &bad["raises"]),
+        (&refused["params"], &refused["answer"], &refused["raises"]),
         (
-            &serde_json::json!(["I64", "I64", "I64"]),
+            &serde_json::json!(["I64", "I64", "I64", "I64"]),
             &serde_json::Value::Null,
+            &true.into()
+        )
+    );
+    let text = native("?refused_text");
+    assert_eq!(
+        (&text["params"], &text["raises"]),
+        (
+            &serde_json::json!(["I64", "Addr", "I64", "Addr", "I64"]),
             &true.into()
         )
     );
