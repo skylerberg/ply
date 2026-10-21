@@ -17,9 +17,9 @@ import emit.keys
 import emit.keys (RootKey, Written, Drop, Dup, Copy, Share, Keep, written)
 import emit.tir (Var, Rep, RWord, RInt, RSum, RFlat, RSlice, RToken, Leaf, AVar, AZero, AInt, Block,
                  Inst, Let, Do, If, Case, Match, Loop, Handle, Return, Restart, Inc, Dec, Reset,
-                 Opened, Fn, Rooted, Plain, Handed, Given, Lent, Owned, TTag, Val, LastOf, Walked,
-                 Lambda, Closure, no_links, Declined, Spine, counted, parts_of, stops_at,
-                 handle_stops, Call)
+                 Opened, Fn, Rooted, Plain, Handed, Given, Lent, Owned, Borrowed, Convention,
+                 Member, TTag, Val, LastOf, Walked, Lambda, Closure, no_links, Declined, Spine,
+                 counted, parts_of, stops_at, handle_stops, Call)
 import emit.tir.handling (HandleSite)
 import emit.answer (Need, Reads, Scalar, Layout, Exact)
 import emit.print.counting (same_word_fn, no_word_fn, int_dup_fn, int_released_fn, box_dup_fn,
@@ -233,14 +233,34 @@ fn joined(a: List<Int>, b: List<Int>) -> List<Int> =
 
 /// `f`, its counts placed, noting among its needs `release_reads(f)`, so a specialisation settles
 /// every release on a type.
-pub fn release_needs(f: Fn) -> Fn = { ..f, links: { ..f.links, needs: fn_needs(f.links.needs, f) } }
+pub fn release_needs(f: Fn) -> Fn =
+  { ..f, links: { ..f.links, needs: fn_needs(entered(f.links.needs, f), f) } }
 
 /// What `f`'s counts read of its type variables: each a count it lets go of reads exactly, since a
 /// value is let go of per type, and each a count it takes its layout alone. What its failure paths
 /// let go of and what its closures' bodies do count as its own, and so does what a frame's record
-/// holds across a stop, which counts each value once more and lets it go. A body reading any is
-/// printed only at type arguments its callers settle.
-pub fn release_reads(f: Fn) -> List<Need> = fn_needs([], f)
+/// holds across a stop, which counts each value once more and lets it go, and what its entry counts:
+/// each parameter it lends, let go of once the call is done, and an answer it borrows, counted once
+/// more before it is handed back. A body reading any is printed only at type arguments its callers
+/// settle.
+pub fn release_reads(f: Fn) -> List<Need> = fn_needs(entered([], f), f)
+
+/// `needs` with what the entry of `f`, or of each member of its tail group, counts.
+fn entered(needs: List<Need>, f: Fn) -> List<Need> = {
+  let held = if f.members.len() == 0 { [{ params: f.params, conv: f.conv }] }
+  else { f.members.map(|m: Member| { params: m.params, conv: m.conv }) };
+  held.fold(needs, |acc: List<Need>, h: { params: List<Var>, conv: Convention }| {
+    let lent = range(0, h.params.len()).fold(acc, |a: List<Need>, k: Int|
+      match ((h.params.at(k), h.conv.params.at(k))) {
+        (Some(v), Some(Lent)) -> if counted(v.rep) { reading(a, v.ty, Exact) } else { a },
+        _ -> a,
+      });
+    match h.conv.answered {
+      Owned -> lent,
+      Borrowed(_) -> if counted(h.conv.answer) { reading(lent, f.answer_ty, Layout) } else { lent },
+    }
+  })
+}
 
 fn fn_needs(needs: List<Need>, f: Fn) -> List<Need> =
   f.lambdas.fold(block_needs(needs, f.body), |acc: List<Need>, l: Lambda|
@@ -1964,6 +1984,25 @@ test "a body reads exactly each variable it lets go of a value of, and the layou
   assert_eq(
     release_reads({ ..f, body: [Dec(local(8, at(b"List", [int_type()]))), Return(AInt(0))] }),
     [],
+  );
+  // Its entry lets go of what it lends once the call is done, and counts once more what it answers
+  // borrowed, though its body counts neither.
+  let x = local(9, TyVar(4));
+  let n = { id: 10, ty: TyVar(9), rep: RInt };
+  assert_eq(
+    release_reads({
+      ..f,
+      params: [x, n],
+      conv: {
+        params: [Lent, Lent],
+        reps: [RWord, RInt],
+        answer: RWord,
+        answered: Borrowed([{ param: 0, whole: true }]),
+      },
+      answer_ty: TyVar(4),
+      body: [Return(AVar(x))],
+    }),
+    [{ var: 4, reads: Exact }, { var: 4, reads: Layout }],
   )
 }
 

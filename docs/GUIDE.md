@@ -3919,6 +3919,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0475` | a lent function parameter held past the call: answered, stored, performed, or passed where it may be held |
 | `E0476` | a native a unit calls that the runtime it is compiled against implements by none, by two, or otherwise than the compiler declares it |
 | `E0477` | a sum that holds itself, through a chain of sums, at a type grown from its own parameters |
+| `E0478` | a unit whose code calls a definition lending or giving otherwise than the definition takes it |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |

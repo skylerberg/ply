@@ -6,7 +6,7 @@ import store.hash.encoding (hex)
 import check.types (Type, TyVar, TyFn, Scheme, type_text, type_spelled, digits, string_type)
 import emit.answer (Answer, Body, Refused, RootAnswer, Tables, Defined, Head, Expect, word_head,
                     no_generics, answer_bin, tables_bin, no_tables, GenericCall, Generics, Need,
-                    Pass, Reads, Scalar, Layout, Exact, settled_by_callers)
+                    Pass, Reads, Scalar, Layout, Exact, settled_by_callers, Published)
 import emit.tir.statics (StaticDef, SFile, StaticWord, WField, named, words_of)
 import emit.print.statics (static_c, static_extern, escaped, c_string)
 import emit.statics (known_of_value, kept_root)
@@ -266,6 +266,65 @@ fn unbound_line(u: Unbound) -> Bytes = {
   }
 }
 
+/// A body the unit took whose calls of `assumed.def` were written against `assumed`, where what that
+/// definition publishes once the rounds settle is `published`; none publishes nothing, which takes
+/// every argument and answers a count of its own.
+pub type Misassumed = { caller: Bytes, assumed: Published, published: Option<Published> }
+
+/// Whether a call written against `assumed` is written as the callee that publishes `now` takes it.
+fn agrees(assumed: Published, now: Option<Published>) -> Bool =
+  match now {
+    Some(h) -> h == assumed,
+    None -> !assumed.lent.any(|l: Bool| l) && assumed.borrowed == None,
+  }
+
+/// A handing as a diagnostic says it: each parameter lent or given, then how it answers.
+fn handing_said(h: Published) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"[",
+    Bytes::join(h.lent.map(|l: Bool| if l { b"lent" } else { b"given" }), b", "),
+    b"] ",
+    match h.borrowed {
+      None -> b"owned",
+      Some(from) ->
+        Bytes::concat_all([
+          b"borrowed(",
+          Bytes::join(
+            from.map(|x: { param: Int, whole: Bool }|
+              if x.whole { ascii_of_int(x.param) } else { ascii_of_int(x.param).concat(b" part") }),
+            b", ",
+          ),
+          b")",
+        ]),
+    },
+  ])
+
+/// The calls a unit holds written against a handing other than the one their callee publishes:
+/// refused, since a call lending what its callee takes as given, or the other way, counts a value
+/// wrongly with no C type to show it.
+fn handings_disagree(wrong: List<Misassumed>) -> Diag / {abort.raise} =
+  error_with_labels(
+    b"E0478",
+    Bytes::concat_all([
+      b"the emitter wrote ",
+      ascii_of_int(wrong.len()),
+      if wrong.len() == 1 { b" call against a handing its callee does not publish" }
+      else { b" calls against handings their callees do not publish" },
+    ]),
+    [],
+    wrong.map(|m: Misassumed|
+      Bytes::concat_all([
+        b"`",
+        m.caller,
+        b"` calls `",
+        m.assumed.def,
+        b"` written ",
+        handing_said(m.assumed),
+        b", where it publishes ",
+        match m.published { Some(h) -> handing_said(h), None -> b"none, so takes every argument" },
+      ])),
+  )
+
 /// The natives a unit calls that the runtime it is compiled against does not implement as they are
 /// declared: refused before a C compiler meets a call that disagrees with the helper it names.
 fn natives_refused(refused: List<Unbound>) -> Diag =
@@ -426,9 +485,15 @@ pub type Made = { bodies: List<UnitBody>, offered: List<Offered> }
 pub type Produced = { text: Bytes, taken: List<Bytes>, dropped: List<Dropped>, made: Made }
 
 /// A unit produced over answers an earlier run kept and answers the emitter gave now: how many of
-/// the offered roots each covered, and the natives the unit calls that the runtime does not
-/// implement as they are declared.
-pub type Emission = { produced: Produced, kept: Int, asked: Int, unbound: List<Unbound> }
+/// the offered roots each covered, the natives the unit calls that the runtime does not implement as
+/// they are declared, and its calls written against a handing other than their callee's.
+pub type Emission = {
+  produced: Produced,
+  kept: Int,
+  asked: Int,
+  unbound: List<Unbound>,
+  misassumed: List<Misassumed>,
+}
 
 /// Each root's answer, a group's one body answering for every member.
 pub fn answers_of(rows: List<RootAnswer>) -> Map<Bytes, Answer> =
@@ -1638,13 +1703,15 @@ fn program_ctors(dump: Dump, ctors: List<Ctor>) -> Ctors =
 
 /// What the emitter answers for `missed`: entered once, over the modules those roots are in, the
 /// ones whose lambdas they run, the home modules those call functions of types of, and the ones
-/// all of those import.
+/// all of those import. `published` are the handings the unit holds, which a call of a definition
+/// emitted apart is written against.
 fn emitter_answers(
   runtime: Runtime,
   dump: Dump,
   p: Program,
   ctors: List<Ctor>,
   missed: List<RootKey>,
+  published: List<Published>,
 ) -> List<RootAnswer> / {abort.raise} = {
   let lowered = missed.fold(Map::new(), |acc: Map<Bytes, Bool>, k: RootKey|
     key_lent(k).fold(acc.insert(module_of(k), true), |m: Map<Bytes, Bool>, f: FnArg|
@@ -1669,6 +1736,7 @@ fn emitter_answers(
     dump.embeds,
     dump.rows,
     dump.walked,
+    published,
   )
 }
 
@@ -1716,20 +1784,134 @@ fn answers_at_once(
   lo: Int,
   hi: Int,
   room: Int,
+  published: List<Published>,
 ) -> List<RootAnswer> / {abort.raise} =
   if hi - lo <= 1 {
     match pieces.at(lo) {
-      Some(roots) -> emitter_answers(runtime, dump, p, ctors, roots),
+      Some(roots) -> emitter_answers(runtime, dump, p, ctors, roots, published),
       None -> [],
     }
   } else if room <= 0 { panic("more halvings than a length has") } else {
     let mid = lo + (hi - lo) / 2;
     let halves = parallel {
-      answers_at_once(runtime, dump, p, ctors, pieces, lo, mid, room - 1),
-      answers_at_once(runtime, dump, p, ctors, pieces, mid, hi, room - 1),
+      answers_at_once(runtime, dump, p, ctors, pieces, lo, mid, room - 1, published),
+      answers_at_once(runtime, dump, p, ctors, pieces, mid, hi, room - 1, published),
     };
     halves._0.concat(halves._1)
   }
+
+/// Each definition's handing as the bodies of `answers` publish it, over `before`: what every
+/// caller's code is written against.
+fn handings_held(
+  before: Map<Bytes, Published>,
+  answers: Map<Bytes, Answer>,
+) -> Map<Bytes, Published> =
+  answers.fold(before, |acc: Map<Bytes, Published>, _: Bytes, a: Answer|
+    match a {
+      Body(b) ->
+        b.tables.handings.fold(acc, |m: Map<Bytes, Published>, h: Published| m.insert(h.def, h)),
+      Refused(_) -> acc,
+    })
+
+/// Whether `a` was written against a callee's handing other than the one `held` holds; a callee
+/// `held` holds nothing of yet is answered in a later round, which judges it then.
+fn written_stale(a: Answer, held: Map<Bytes, Published>) -> Bool =
+  match a {
+    Body(b) ->
+      b.tables.assumed.any(|x: Published|
+        match held.get(x.def) { Some(h) -> h != x, None -> false }),
+    Refused(_) -> false,
+  }
+
+/// Each call of a body among `taken` written against a handing other than the one its callee
+/// publishes in `answers`: what the rounds settled wrongly, which no unit ships.
+fn misassumed_in(answers: Map<Bytes, Answer>, taken: List<Bytes>) -> List<Misassumed> = {
+  let held = handings_held(Map::new(), answers);
+  taken.fold([], |acc: List<Misassumed>, n: Bytes|
+    match answers.get(n) {
+      Some(Body(b)) ->
+        b.tables.assumed.fold(acc, |a: List<Misassumed>, x: Published|
+          if agrees(x, held.get(x.def)) { a }
+          else { a.push({ caller: n, assumed: x, published: held.get(x.def) }) }),
+      _ -> acc,
+    })
+}
+
+/// The names among `answers` the emitter is asked for again: each written against a handing `held`
+/// no longer holds, and with it each definition of its recursion group, which settle together.
+fn stale_of(answers: Map<Bytes, Answer>, held: Map<Bytes, Published>) -> List<Bytes> =
+  answers.fold([], |acc: List<Bytes>, n: Bytes, a: Answer|
+    if !written_stale(a, held) { acc } else {
+      let group = match a { Body(b) -> b.tables.group, Refused(_) -> [] };
+      [n].concat(group).fold(acc, |xs: List<Bytes>, g: Bytes|
+        if xs.contains(g) { xs } else { xs.push(g) })
+    })
+
+/// `kept` without each answer whose recursion group holds a definition `kept` lacks, which is asked
+/// for again with the rest of its group.
+fn groups_whole(
+  kept: Map<Bytes, Answer>,
+  asked: List<Bytes>,
+) -> Map<Bytes, Answer> / {abort.raise} =
+  iterate(kept, kept.len() + 1, |k: Map<Bytes, Answer>| {
+    let split = k.fold([], |acc: List<Bytes>, n: Bytes, a: Answer|
+      match a {
+        Body(b) -> if b.tables.group.any(|g: Bytes| asked.contains(g) && !k.contains(g)) {
+          acc.push(n)
+        } else { acc },
+        Refused(_) -> acc,
+      });
+    if split.len() == 0 { Stop(k) }
+    else { Continue(split.fold(k, |m: Map<Bytes, Answer>, n: Bytes| m.remove(n))) }
+  })
+
+/// What the emitter answers for `ask`, dealt over calls, with `held` the answers in hand and
+/// `published` the handings of the rest: round after round, each answer written against a handing the
+/// round before moved is asked for again with its group, until none is, so the answers are those
+/// one call over all of them makes. `room` is the rounds the unit has left; at none, the error
+/// names what still moved.
+fn answers_settled(
+  runtime: Runtime,
+  dump: Dump,
+  p: Program,
+  ctors: List<Ctor>,
+  held: Map<Bytes, Answer>,
+  published: Map<Bytes, Published>,
+  ask: List<RootKey>,
+  keys: Map<Bytes, RootKey>,
+  room: Int,
+) -> Result<Map<Bytes, Answer>, Bytes> / {abort.raise} = {
+  let settled = iterate(
+    { fresh: Map::new(), ask: ask, room: room },
+    room + 1,
+    |s: { fresh: Map<Bytes, Answer>, ask: List<RootKey>, room: Int }|
+      if s.ask.len() == 0 || s.room <= 0 { Stop(s) } else {
+        let pieces = dealt(p, s.ask);
+        let before = handings_held(handings_held(published, held), s.fresh);
+        let got = answers_of(
+          answers_at_once(runtime, dump, p, ctors, pieces, 0, pieces.len(), 64, before.values()),
+        );
+        let fresh = got.fold(s.fresh, |m: Map<Bytes, Answer>, n: Bytes, a: Answer| m.insert(n, a));
+        let all = fresh.fold(held, |m: Map<Bytes, Answer>, n: Bytes, a: Answer| m.insert(n, a));
+        Continue({
+          fresh: fresh,
+          ask: stale_of(all, handings_held(published, all)).map(|n: Bytes|
+            match keys.get(n) { Some(k) -> k, None -> Named(n) }),
+          room: s.room - 1,
+        })
+      },
+  );
+  if settled.ask.len() > 0 {
+    Err(
+      Bytes::concat_all([
+        b"the handings the emitter wrote calls against still moved after ",
+        ascii_of_int(room),
+        b" rounds, for: ",
+        Bytes::join(settled.ask.map(root_name), b", "),
+      ]),
+    )
+  } else { Ok(settled.fresh) }
+}
 
 // --- Values a build kept ----------------------------------------------------------
 
@@ -1856,7 +2038,7 @@ pub fn emitted<| e>(
     emitter,
   ];
   let program = program_ctors(dump, ctors);
-  match answered_round(runtime, dump, p, ctors, common, offered, read, write) {
+  match answered_round(runtime, dump, p, ctors, common, offered, Map::new(), 64, read, write) {
     Err(why) -> Err(why),
     Ok(first) -> match closed_rounds(
         runtime,
@@ -1920,6 +2102,7 @@ pub fn emitted<| e>(
             called_externs(natives_called(produced.made), p.modules, |m: ModuleRow|
               text_at(p, m.index)),
           ),
+          misassumed: misassumed_in(all.answers, produced.taken),
         })
       },
     },
@@ -1928,7 +2111,7 @@ pub fn emitted<| e>(
 
 /// The answers to some roots by their names, the key of each by the same, and how many came from
 /// what an earlier run kept and how many were asked of the emitter: each kept answer read where it
-/// stands, the emitter entered once for the rest, and what it answered kept for the next run.
+/// stands, the emitter entered for the rest, and what it answered kept for the next run.
 type Answered = {
   answers: Map<Bytes, Answer>,
   keys: Map<Bytes, RootKey>,
@@ -1948,6 +2131,8 @@ fn answered_round<| e>(
   ctors: List<Ctor>,
   common: List<Bytes>,
   roots: List<RootKey>,
+  published: Map<Bytes, Published>,
+  room: Int,
   read: (Bytes) -> Option<Bytes> / e,
   write: (Bytes, Bytes) -> Unit / e,
 ) -> Result<Answered, Bytes> / {abort.raise | e} = {
@@ -1975,32 +2160,42 @@ fn answered_round<| e>(
       },
   );
   let looked = looked_up(materials, packs, |m: Bytes| decoded(p.keys, read(body_key(m))));
-  let kept = standing(looked, asked);
+  let standing_now = standing(looked, asked);
+  // A kept answer written against a handing that has moved since is asked for again, as is every
+  // other one of a recursion group it leaves.
+  let stale = stale_of(standing_now, handings_held(published, standing_now));
+  let kept = groups_whole(
+    stale.fold(standing_now, |m: Map<Bytes, Answer>, n: Bytes| m.remove(n)),
+    names,
+  );
   let missed = keys.values().filter(|k: RootKey| !kept.contains(root_name(k)));
-  let fresh = if missed.len() == 0 { [] } else {
-    let pieces = dealt(p, missed);
-    answers_at_once(runtime, dump, p, ctors, pieces, 0, pieces.len(), 64)
-  };
-  let answered = answers_of(fresh);
-  let unanswered = missed.map(root_name).filter(|n: Bytes| !answered.contains(n));
-  if unanswered.len() > 0 { Err(unanswered_said(unanswered, missed.len())) } else {
-    answered.fold((), |_: Unit, n: Bytes, a: Answer|
-      match materials.get(n) {
-        None -> (),
-        Some(m) -> match a {
-          Body(_) -> write(body_key(m), bin::encode(kept_of(p.keys, a), kept_bin())),
-          Refused(_) -> (),
-        },
-      });
-    repacked(p.keys, buckets, packs, looked, answered).fold((), |_: Unit, r: Repack|
-      write(pack_key(r.names), bin::encode(r.pack, pack_bin())));
-    Ok({
-      answers: answered.fold(kept, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer| acc.insert(n, a)),
-      keys: keys,
-      kept: kept.len(),
-      asked: missed.len(),
-      added: [],
-    })
+  let settled = if missed.len() == 0 { Ok(Map::new()) }
+  else { answers_settled(runtime, dump, p, ctors, kept, published, missed, keys, room) };
+  match settled {
+    Err(why) -> Err(why),
+    Ok(answered) -> {
+      let unanswered = missed.map(root_name).filter(|n: Bytes| !answered.contains(n));
+      if unanswered.len() > 0 { Err(unanswered_said(unanswered, missed.len())) } else {
+        answered.fold((), |_: Unit, n: Bytes, a: Answer|
+          match materials.get(n) {
+            None -> (),
+            Some(m) -> match a {
+              Body(_) -> write(body_key(m), bin::encode(kept_of(p.keys, a), kept_bin())),
+              Refused(_) -> (),
+            },
+          });
+        repacked(p.keys, buckets, packs, looked, answered).fold((), |_: Unit, r: Repack|
+          write(pack_key(r.names), bin::encode(r.pack, pack_bin())));
+        Ok({
+          answers: answered.fold(kept, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
+            acc.insert(n, a)),
+          keys: keys,
+          kept: kept.len(),
+          asked: missed.len(),
+          added: [],
+        })
+      }
+    },
   }
 }
 
@@ -2068,30 +2263,44 @@ fn closed_rounds<| e>(
         Refused(_) -> acc,
       })
   };
-  if more.len() == 0 || room <= 0 { Ok(had) } else {
-    match answered_round(runtime, dump, p, ctors, common, more.values(), read, write) {
+  // A body written against a handing a later round published otherwise is asked for again.
+  let held = handings_held(Map::new(), had.answers);
+  let again = stale_of(had.answers, held).fold(Map::new(), |m: Map<Bytes, RootKey>, n: Bytes|
+    m.insert(n, match had.keys.get(n) { Some(k) -> k, None -> Named(n) }));
+  let asking = more.fold(again, |m: Map<Bytes, RootKey>, n: Bytes, k: RootKey| m.insert(n, k));
+  if again.len() > 0 && room <= 0 {
+    Err(
+      Bytes::concat_all([
+        b"the handings the emitter wrote calls against still moved when the rounds ran out, for: ",
+        Bytes::join(again.keys(), b", "),
+      ]),
+    )
+  } else if asking.len() == 0 || room <= 0 { Ok(had) } else {
+    match answered_round(
+        runtime,
+        dump,
+        p,
+        ctors,
+        common,
+        asking.values(),
+        held,
+        room,
+        read,
+        write,
+      ) {
       Err(why) -> Err(why),
-      Ok(r) ->
-        closed_rounds(
-          runtime,
-          dump,
-          p,
-          ctors,
-          program,
-          common,
-          read,
-          write,
-          {
-            answers: r.answers.fold(had.answers, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
-              acc.insert(n, a)),
-            keys: r.keys.fold(had.keys, |acc: Map<Bytes, RootKey>, n: Bytes, k: RootKey|
-              acc.insert(n, k)),
-            kept: had.kept + r.kept,
-            asked: had.asked + r.asked,
-            added: had.added.concat(more.values()),
-          },
-          room - 1,
-        ),
+      Ok(r) -> {
+        let next = {
+          answers: r.answers.fold(had.answers, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
+            acc.insert(n, a)),
+          keys: r.keys.fold(had.keys, |acc: Map<Bytes, RootKey>, n: Bytes, k: RootKey|
+            acc.insert(n, k)),
+          kept: had.kept + r.kept,
+          asked: had.asked + r.asked,
+          added: had.added.concat(more.values()),
+        };
+        closed_rounds(runtime, dump, p, ctors, program, common, read, write, next, room - 1)
+      },
     }
   }
 }
@@ -2260,7 +2469,9 @@ fn settled_root(
 
 /// `answers` with every generic call settled over the program's constructors `ctors`: each
 /// placeholder of a body's C, and of the entries its closures name, written as the root its call
-/// settles on, and that root among the body's calls.
+/// settles on, and that root among the body's calls. A call whose specialisation the emitter
+/// refused reaches the body it specialises where the unit emits that body and the call hands it
+/// nothing raw; otherwise it keeps the specialisation, so its caller is dropped for that refusal.
 fn generics_settled(
   answers: Map<Bytes, Answer>,
   keys: Map<Bytes, RootKey>,
@@ -2269,6 +2480,12 @@ fn generics_settled(
 ) -> Map<Bytes, Answer> / {abort.raise} = {
   let needs = closed_needs(answers, keys);
   let called = closed_called(answers, keys);
+  let unemitted = settled_only(answers, keys, needs);
+  let emits = |k: RootKey|
+    match answers.get(root_name(k)) {
+      Some(Body(_)) -> !unemitted.contains(root_name(k)),
+      _ -> false,
+    };
   // A root keyed by a layout is the one the unit asked for under its name, whatever type this call
   // settles it at.
   let asked = |k: RootKey| match keys.get(root_name(k)) { Some(x) -> x, None -> k };
@@ -2284,16 +2501,12 @@ fn generics_settled(
             },
             None -> own,
           };
-          // A specialisation the emitter refused leaves the call to the generic body, which takes
-          // what the call hands it where it hands nothing raw.
           match answers.get(root_name(root)) {
             Some(Refused(_)) -> {
-              // Refused with lambdas run in place: the root without them, where it was answered.
+              // Refused with lambdas run in place: the root without them, where it is emitted.
               let plain = asked(settled_root({ ..g, fns: [] }, needs, called, ctors));
-              if g.fns.len() > 0 && root_name(plain) != root_name(root)
-                  && (match answers.get(root_name(plain)) { Some(Body(_)) -> true, _ -> false }) {
-                plain
-              } else if g.carried.len() == 0 { Named(g.callee) }
+              if g.fns.len() > 0 && root_name(plain) != root_name(root) && emits(plain) { plain }
+              else if g.carried.len() == 0 && emits(Named(g.callee)) { Named(g.callee) }
               else { root }
             },
             _ -> root,
@@ -2426,9 +2639,10 @@ fn unanswered(why: Bytes) -> Diag =
   )
 
 /// The unit's C as the runtime compiles it, or why there is none: an emitter that answered nothing
-/// at all, a native it calls that the runtime does not implement as declared, or a definition the program
-/// reaches that the emitter refused. A definition dropped only because a narrowed offer left its
-/// callee out is no refusal of the program's.
+/// at all, a native it calls that the runtime does not implement as declared, a call written against
+/// a handing its callee does not publish, or a definition the program reaches that the emitter
+/// refused. A definition dropped only because a narrowed offer left its callee out is no refusal of
+/// the program's.
 pub fn held(
   dump: Dump,
   offered: List<Bytes>,
@@ -2436,7 +2650,8 @@ pub fn held(
 ) -> Result<Bytes, List<Diag>> / {abort.raise} =
   match emission {
     Err(why) -> Err([unanswered(why)]),
-    Ok(e) -> if e.unbound.len() > 0 { Err([natives_refused(e.unbound)]) } else {
+    Ok(e) -> if e.unbound.len() > 0 { Err([natives_refused(e.unbound)]) }
+    else if e.misassumed.len() > 0 { Err([handings_disagree(e.misassumed)]) } else {
       let errors = fatal(offered, e.produced.dropped);
       if errors.len() == 0 { Ok(e.produced.text) } else { Err([refused_reach(dump, errors)]) }
     },
@@ -2600,6 +2815,32 @@ test "a refused specialisation leaves its call to the generic body, whichever ro
   assert_eq(calls(b"m.main"), [b"m.each"]);
   assert_eq(calls(root_name(mapping)), [b"std.prelude.mapped_from"]);
   assert_eq(calls(b"m.mapped"), [root_name(mapping)])
+}
+
+test "a caller of a refused specialisation of a body its callers settle is dropped for the specialisation's refusal" {
+  let lay = { callee: b"m.lay", args: [spelled(b"Float")], carried: [], fns: [] };
+  let spec = settled_root(
+    lay,
+    Map::of_entries([{ key: b"m.lay", value: [{ var: 0, reads: Layout }] }]),
+    Map::new(),
+    no_ctors(),
+  );
+  let why = b"the typed form of `m.lay@Float` fails its check";
+  let had = keyed([
+    { key: Named(b"m.lay"), value: generic_body([], [{ var: 0, reads: Layout }]) },
+    { key: spec, value: Refused({ why: why }) },
+    { key: Named(b"m.main"), value: generic_body([lay], []) },
+  ]);
+  let settled = generics_settled(had.answers, had.keys, Map::new(), no_ctors());
+  let held = settled_bodies(
+    settled,
+    had.keys,
+    settled_only(settled, had.keys, closed_needs(settled, had.keys)),
+  );
+  let s = settle(held, [b"m.main"], []);
+  assert_eq(s.dropped.map(|d: Dropped| d.construct), [
+    Bytes::concat_all([b"`", root_name(spec), b"`, refused: ", why]),
+  ])
 }
 
 test "a generic body needs what its callees need of what it hands them, through its own variables" {
@@ -3457,16 +3698,77 @@ test "a root written from a type is kept under its module's text and the program
   )
 }
 
+test "a call written against a handing its callee does not publish fails the build, naming both" {
+  let handing = |def: Bytes, lent: List<Bool>| { def: def, lent: lent, borrowed: None };
+  let body = |handings: List<Published>, assumed: List<Published>|
+    Body({ text: b"", tables: { ..no_tables(), handings: handings, assumed: assumed } });
+  // The callee publishes its parameter given; one caller was written lending it.
+  let answers = Map::of_entries([
+    { key: b"m.caller", value: body([], [handing(b"m.callee", [true])]) },
+    { key: b"m.callee", value: body([handing(b"m.callee", [false])], []) },
+    { key: b"m.fine", value: body([], [handing(b"m.callee", [false])]) },
+    { key: b"m.alone", value: body([], [handing(b"m.unpublished", [false])]) },
+  ]);
+  let wrong = misassumed_in(answers, answers.keys());
+  assert_eq(wrong.map(|m: Misassumed| m.caller), [b"m.caller"]);
+  let dump = dump_of(analyse(parse_all([{ name: b"m", src: b"fn one() -> Int = 1\n" }])));
+  let e = {
+    produced: { text: b"", taken: [], dropped: [], made: { bodies: [], offered: [] } },
+    kept: 0,
+    asked: 0,
+    unbound: [],
+    misassumed: wrong,
+  };
+  match held(dump, [], Ok(e)) {
+    Ok(_) -> assert(false, Some("a unit holding a call against the wrong handing was held")),
+    Err(diags) -> {
+      assert_eq(diags.map(|d: Diag| d.code), [b"E0478"]);
+      assert_eq(diags.get(0).notes_text, [
+        b"`m.caller` calls `m.callee` written [lent] owned, where it publishes [given] owned",
+      ])
+    },
+  }
+}
+
+test "a body written against a handing that moved is asked for again, with its recursion group" {
+  let handing = |def: Bytes, lent: List<Bool>| { def: def, lent: lent, borrowed: None };
+  let body = |handings: List<Published>, assumed: List<Published>, group: List<Bytes>|
+    Body({
+      text: b"",
+      tables: { ..no_tables(), handings: handings, assumed: assumed, group: group },
+    });
+  let answers = Map::of_entries([
+    {
+      key: b"m.f",
+      value: body([handing(b"m.f", [true])], [handing(b"m.h", [true])], [b"m.f", b"m.g"]),
+    },
+    { key: b"m.g", value: body([handing(b"m.g", [false])], [], [b"m.f", b"m.g"]) },
+    { key: b"m.h", value: body([handing(b"m.h", [false])], [], []) },
+    { key: b"m.k", value: body([], [handing(b"m.h", [false])], []) },
+    // A callee no answer publishes yet is judged once a later round answers it.
+    { key: b"m.n", value: body([], [handing(b"m.absent", [true])], []) },
+    { key: b"m.o", value: body([], [handing(b"m.absent", [false])], []) },
+  ]);
+  assert_eq(stale_of(answers, handings_held(Map::new(), answers)), [b"m.f", b"m.g"]);
+  // A kept member of a group another member of which is asked for again goes with it.
+  assert_eq(groups_whole(answers.remove(b"m.g"), answers.keys()).keys(), [
+    b"m.h",
+    b"m.k",
+    b"m.n",
+    b"m.o",
+  ])
+}
+
 test "the emitter answers roots dealt over calls as it answers them in one" {
   let dump = three_modules_dump();
   let p = program_of(dump, three_modules());
   let missed = dump.emitter_roots.map(|r: EmitterRoot| Named(r.root));
   let runtime = a_runtime(b"r");
-  let lists = dealt(p, missed);
-  let rows = |answers: List<RootAnswer>|
-    answers_of(answers).fold([], |acc: List<RootAnswer>, n: Bytes, a: Answer|
-      acc.push({ name: n, answer: a }));
-  let together = rows(emitter_answers(runtime, dump, p, [], missed));
+  let keys = missed.fold(Map::new(), |m: Map<Bytes, RootKey>, k: RootKey|
+    m.insert(root_name(k), k));
+  let rows = |answers: Map<Bytes, Answer>|
+    answers.fold([], |acc: List<RootAnswer>, n: Bytes, a: Answer| acc.push({ name: n, answer: a }));
+  let together = rows(answers_of(emitter_answers(runtime, dump, p, [], missed, [])));
   assert(
     together.fold(false, |found: Bool, r: RootAnswer|
       found
@@ -3476,7 +3778,12 @@ test "the emitter answers roots dealt over calls as it answers them in one" {
         })),
     None,
   );
-  assert_eq(rows(answers_at_once(runtime, dump, p, [], lists, 0, lists.len(), 64)), together)
+  // Dealt apart, a call of a definition another call emits is written against the handing that call
+  // publishes, asked again until no handing moves.
+  match answers_settled(runtime, dump, p, [], Map::new(), Map::new(), missed, keys, 64) {
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Ok(dealt_apart) -> assert_eq(rows(dealt_apart), together),
+  }
 }
 
 test "a unit holds a `const` definition as its kept value laid out as static data, its body asked for nothing" {
@@ -3878,7 +4185,7 @@ test "a function of a type a module calls with no import is read from its home, 
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
   let p = program_of(dump, sources_placed(dump, user.concat(shipped)));
   assert_eq(
-    emitter_answers(a_runtime(b"r"), dump, p, [], [Named(b"m.first")]).map(|r: RootAnswer|
+    emitter_answers(a_runtime(b"r"), dump, p, [], [Named(b"m.first")], []).map(|r: RootAnswer|
       match r.answer { Body(_) -> r.name, Refused(no) -> no.why }),
     [b"m.first"],
   )
@@ -3895,7 +4202,7 @@ test "a law's body over a sort it leaves uninterpreted is lowered as a generic b
   let p = program_of(dump, sources_placed(dump, user));
   let root = law_root(b"m", b"identity is identity", b"body");
   assert_eq(
-    emitter_answers(a_runtime(b"r"), dump, p, [], [Named(root)]).map(|r: RootAnswer|
+    emitter_answers(a_runtime(b"r"), dump, p, [], [Named(root)], []).map(|r: RootAnswer|
       match r.answer { Body(_) -> r.name, Refused(no) -> no.why }),
     [root],
   )
