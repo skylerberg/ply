@@ -30,7 +30,7 @@ import emit.answer (Defined, Expect, Head, word_head, GenericCall, Need, Exact, 
                     no_generics, Tables, no_tables, Emitted, Body, Refused, RootAnswer)
 import emit.statics (SBytes, SEmbedded, statics_of)
 import emit.reps (Ctors, SumCtor, no_ctors, ctors_of, ctor_sums, at_args, has_vars)
-import emit.compare (program_of)
+import emit.compare (program_of, formed)
 import emit.lower.setting (Root)
 import emit.typing (Typed)
 import unit (program_natives)
@@ -40,7 +40,8 @@ import emit (said, refused_rather_than_emitted, emit_program, emit_roots_answer,
 import emit.entry (RootForm, Formed, Unformed, emitted_of)
 import emit.print.counting (last_fn, rel_fn, rel_int_fn, free_fn, call_text, call_start,
                             takes_count, lets_count_go, lets_go_of, counts_any)
-import emit.tir (Plain, Block, Inst, Var, Let, If, Case, Match, Loop, Get, PCapture)
+import emit.tir (Plain, Block, Inst, Var, Let, If, Case, Match, Loop, Get, PCapture, Decl, Pack,
+                 AZero, Lambda, Closure)
 import front.seam
 
 // --- Specialisation ----------------------------------------------------------------------------
@@ -498,6 +499,52 @@ fn capture_reads(b: Block) -> List<Var> =
       Loop(l) -> acc.concat(capture_reads(l.body)),
       _ -> acc,
     })
+
+/// The joins `b` declares and the variables it packs a zero into, its blocks' too.
+fn zeros_held(b: Block) -> List<Var> =
+  b.fold([], |acc: List<Var>, i: Inst|
+    match i {
+      Decl(v) -> acc.push(v),
+      Let(l) -> match l.val {
+        Pack(p) -> match p.arg { AZero(_) -> acc.push(l.var), _ -> acc },
+        _ -> acc,
+      },
+      If(x) -> acc.concat(zeros_held(x.then)).concat(zeros_held(x.otherwise)),
+      Case(c) ->
+        c.arms.fold(
+          acc.concat(zeros_held(c.rest)),
+          |a: List<Var>, arm: { when: Int, body: Block }| a.concat(zeros_held(arm.body)),
+        ),
+      Match(m) ->
+        m.arms.fold(acc.concat(zeros_held(m.rest)), |a: List<Var>, arm: Block|
+          a.concat(zeros_held(arm))),
+      Loop(l) -> acc.concat(zeros_held(l.body)),
+      _ -> acc,
+    })
+
+test "a `()` an arm answers or a call is handed is a `Unit`, and so are its join and its box" {
+  let src = Bytes::concat_all([
+    b"fn same(b: Bool) -> Unit = if b { () } else { () }\n",
+    b"fn whole(xs: List<Int>, b: Bool) -> Int = { if b { xs.fold((), |_: Unit, x: Int| if x == 0 { () } else { () }); () }; 1 }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let held = |name: Bytes|
+        match formed(p, name) {
+          Ok(f) ->
+            zeros_held(f.body).concat(
+              f.lambdas.fold([], |acc: List<Var>, l: Lambda|
+                match l { Closure(c) -> acc.concat(zeros_held(c.body.body)) }),
+            ).map(|v: Var| v.ty),
+          Err(no) -> panic(String::of_bytes_lossy(no.why)),
+        };
+      let unit = TyCon({ name: b"Unit", args: [] });
+      assert_eq(held(b"same"), [unit]);
+      assert(held(b"whole").len() > 0 && held(b"whole").all(|t: Type| t == unit), None)
+    },
+  }
+}
 
 /// `scaled` hands a lambda to `total`, which hands it on to `each`, which calls it.
 fn lending() -> Bytes =
