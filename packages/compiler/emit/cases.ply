@@ -3521,6 +3521,67 @@ test "a branch lets go as it opens of a parameter only another branch reads, and
   assert(quiet(b"m.wide_field"), Some(String::of_bytes_lossy(text(b"m.wide_field"))))
 }
 
+// A value wider than the registers crosses by reference, where a call lending it and a root given it
+// would be written to two heads.
+test "a root written for a type is called at the head it is defined at, a value wider than the registers by reference" {
+  let src = Bytes::concat_all([
+    b"type Place = { param: Int, path: List<Bytes> }\n",
+    b"type Base = | PlaceBase(Place) | QuotientBase({ of: Base, by: Int }) | RemainderBase({ by: Base })\n",
+    b"type Linear = { base: Option<Base>, k: Int }\n",
+    b"type Term = | Exactly(Linear) | Below(Place) | RecordTerm({ base: Option<Term>, fields: List<Term> }) | NoParts | Wrapped(Term) | UnknownTerm\n",
+    b"type Wide = { a: Bytes, b: Int, c: Bytes, d: Int, e: Bytes }\n",
+    b"fn same(x: Wide, y: Wide) -> Bool = x == y\n",
+    b"fn hashed(x: Wide) -> Bytes = digest(x)\n",
+  ]);
+  let term = TyCon({ name: b"m.Term", args: [] });
+  let wide = TyCon({ name: b"m.Wide", args: [] });
+  let boxed = TyRecord([
+    { name: b"base", ty: TyCon({ name: b"Option", args: [term] }) },
+    { name: b"fields", ty: TyCon({ name: b"List", args: [term] }) },
+  ]);
+  let written = [in_m(keys::Lower, term), in_m(keys::Lower, boxed), in_m(Digest, wide)];
+  let answers = answers_at(
+    [b"m"],
+    [src],
+    [b"Some", b"None"],
+    written.concat([b"m.same", b"m.hashed"].map(Named)),
+  );
+  let tables = answers.map(|a: RootAnswer|
+    match a.answer {
+      Body(b) -> { name: a.name, tables: b.tables },
+      Refused(r) -> panic(String::of_bytes_lossy(Bytes::concat_all([a.name, b": ", r.why]))),
+    });
+  let defined = tables.fold(
+    Map::new(),
+    |m: Map<Bytes, { answer: Bytes, params: List<Bytes> }>, t: { name: Bytes, tables: Tables }|
+      t.tables.symbols.fold(
+        m,
+        |n: Map<Bytes, { answer: Bytes, params: List<Bytes> }>, d: Defined|
+          n.insert(d.symbol, d.head),
+      ),
+  );
+  let head = |k: RootKey| defined.get(symbol_of(root_name(k)));
+  assert_eq(written.filter(|k: RootKey| head(k) == None).map(root_name), []);
+  // The boxed case's record crosses by reference.
+  assert(
+    match head(in_m(keys::Lower, boxed)) {
+      Some(h) -> h.params.any(|p: Bytes| p.ends_with(b"Word*")),
+      None -> false,
+    },
+    None,
+  );
+  assert_eq(
+    tables.fold([], |acc: List<Bytes>, t: { name: Bytes, tables: Tables }|
+      t.tables.generics.expects.fold(acc, |x: List<Bytes>, e: Expect|
+        match defined.get(symbol_of(e.callee)) {
+          Some(h) -> if h == e.head { x }
+          else { x.push(Bytes::concat_all([t.name, b" -> ", e.callee])) },
+          None -> x,
+        })),
+    [],
+  )
+}
+
 /// The constructor table a load hands the emitter for the program `d` was read from: every
 /// constructor it declares, the prelude's among them, those `named` first.
 fn loaded_ctors(d: Dump, named: List<Bytes>) -> Ctors =
