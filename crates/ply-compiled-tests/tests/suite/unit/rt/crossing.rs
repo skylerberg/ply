@@ -206,6 +206,20 @@ fn the_natives_read_what_the_codec_writes() {
     unfailed(&mut ctx);
 }
 
+/// What a descriptor lifts a type that can hold a function by fails the entry, saying a function
+/// never crosses back.
+#[test]
+fn a_lifting_of_a_type_that_can_hold_a_function_fails_the_entry() {
+    let mut ctx = context();
+    ctx.begin(1_000);
+    let refused: unsafe extern "C" fn(*mut Ctx) = helper("rt_never_lifted");
+    unsafe { refused(&mut ctx) };
+    assert_ne!(ctx.failed, 0, "the lifting was not refused");
+    let why = format!("{:?}", ctx.take_failure());
+    assert!(why.contains("never back"), "{why}");
+    ctx.end();
+}
+
 /// Asserts the context did not fail, saying why where it did.
 pub fn unfailed(ctx: &mut Ctx) {
     let failed = ctx.failed;
