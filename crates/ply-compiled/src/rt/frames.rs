@@ -536,6 +536,10 @@ pub(crate) struct FrameClause {
     pub(super) binds_label: bool,
     /// Whether `closure` is a closure emitted code made.
     pub(crate) emitted: bool,
+    /// The `String` type an emitted clause's `handle` site handed where the clause binds its label
+    /// or answers `abort.raise`: what the runtime lifts the label, or a message it raises itself,
+    /// through.
+    pub(super) string: Option<&'static PlyType>,
 }
 
 /// `abort.raise`, which the runtime itself raises for what fails on a value.
@@ -631,6 +635,7 @@ pub(super) fn copied_frame(f: &HandlerFrame, sharing_vars: bool) -> HandlerFrame
                 resumes: cl.resumes,
                 binds_label: cl.binds_label,
                 emitted: cl.emitted,
+                string: cl.string,
             })
             .collect(),
         ret: f.ret,

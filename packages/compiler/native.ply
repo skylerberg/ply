@@ -3,11 +3,12 @@
 //! program compiles against, the answers they gave, and what the program's own front end answered
 //! of the definition it enters, which the runtime binds its code to.
 
-import std.bytes (u32_le, u64_le)
+import std.bytes (u32_le, u64_le, ascii_of_int)
 import std.hash (blake3)
 import std.json (Json, Object, Array, Str, Number, Bool, parse)
 import unit (Helper, Native, Runtime)
-import emit.layout (Layouts, ListLaid, TrieLaid, MapLaid, TreeLaid, layouts)
+import emit.layout (Layouts, ListLaid, TrieLaid, MapLaid, TreeLaid, MachineStruct, MachineField,
+                    HoldLaid, layouts, machine_structs, ctx_struct, release_depth, hold_laid)
 
 /// The `main` every native program has: the runtime entered with the descriptor its unit's C lays
 /// out.
@@ -138,10 +139,12 @@ fn layouts_at(j: Json) -> Option<Layouts> =
       _ -> None,
     })
 
-/// The runtime `json` describes, as a runtime's library describes itself; `None` for anything else.
-pub fn runtime_of(json: Bytes) -> Option<Runtime> / {abort.raise} =
+/// The runtime `json` describes, as a runtime's library describes itself; or why it is none this
+/// compiler holds a program's code to: not such a description, or one laying out what emitted code
+/// reads in place otherwise than this compiler does.
+pub fn runtime_of(json: Bytes) -> Result<Runtime, Bytes> / {abort.raise} =
   match parse(json) {
-    Err(_) -> None,
+    Err(_) -> Err(b"it is not JSON"),
     Ok(j) -> match ((
         text_at(j, "head"),
         text_at(j, "tail"),
@@ -149,27 +152,152 @@ pub fn runtime_of(json: Bytes) -> Option<Runtime> / {abort.raise} =
         natives_at(j),
         layouts_at(j),
       )) {
-      (Some(head), Some(tail), Some(identity), Some(natives), Some(layouts)) ->
-        Some({
-          head: Bytes::of_string(head),
-          tail: Bytes::of_string(tail),
-          helpers: list_at_key(j, "helpers").fold([], |acc: List<Helper>, h: Json|
-            match ((text_at(h, "name"), int_at(h, "args"))) {
-              (Some(name), Some(args)) ->
-                acc.push({
-                  name: Bytes::of_string(name),
-                  args: args,
-                  answers: flag_at(h, "answers"),
-                }),
-              _ -> acc,
-            }),
-          natives: natives,
-          layouts: layouts,
-          identity: Bytes::of_string(identity),
-        }),
-      _ -> None,
+      (Some(head), Some(tail), Some(identity), Some(natives), Some(layouts)) -> match laid_otherwise(
+          j,
+        ) {
+        Some(why) -> Err(why),
+        None ->
+          Ok({
+            head: Bytes::of_string(head),
+            tail: Bytes::of_string(tail),
+            helpers: list_at_key(j, "helpers").fold([], |acc: List<Helper>, h: Json|
+              match ((text_at(h, "name"), int_at(h, "args"))) {
+                (Some(name), Some(args)) ->
+                  acc.push({
+                    name: Bytes::of_string(name),
+                    args: args,
+                    answers: flag_at(h, "answers"),
+                  }),
+                _ -> acc,
+              }),
+            natives: natives,
+            layouts: layouts,
+            identity: Bytes::of_string(identity),
+          }),
+      },
+      _ -> Err(b"it lacks its head, tail, identity, natives or layouts, or one does not read"),
     },
   }
+
+/// A field of a struct as a description lists it.
+type Described = { name: Bytes, at: Int, bytes: Int }
+
+/// The fields `xs` lists, each as a description lists one; one that does not read as nothing's.
+fn described_fields(xs: List<Json>) -> List<Described> =
+  xs.map(|f: Json|
+    match ((text_at(f, "name"), int_at(f, "at"), int_at(f, "bytes"))) {
+      (Some(n), Some(at), Some(b)) -> { name: Bytes::of_string(n), at: at, bytes: b },
+      _ -> { name: b"", at: 0 - 1, bytes: 0 - 1 },
+    })
+
+/// `s`'s fields as this compiler lays them out.
+fn fields_laid(s: MachineStruct) -> List<Described> =
+  s.fields.map(|f: MachineField| { name: f.name, at: f.at, bytes: f.bytes })
+
+fn described_said(d: Described) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"`",
+    d.name,
+    b"` at ",
+    ascii_of_int(d.at),
+    b" of ",
+    ascii_of_int(d.bytes),
+    b" bytes",
+  ])
+
+/// The first field where the struct `what`, as a description lists it in `described`, and as this
+/// compiler lays it out in `laid`, part; `None` where they agree.
+fn first_unlike(
+  what: Bytes,
+  described: List<Described>,
+  laid: List<Described>,
+) -> Option<Bytes> / {abort.raise} =
+  range(0, if described.len() > laid.len() { described.len() } else { laid.len() }).fold(
+    None,
+    |found: Option<Bytes>, i: Int|
+      match found {
+        Some(_) -> found,
+        None -> if described.at(i) == laid.at(i) { None } else {
+          Some(
+            Bytes::concat_all([
+              what,
+              b"'s field ",
+              ascii_of_int(i),
+              b" is ",
+              match described.at(i) { Some(d) -> described_said(d), None -> b"missing" },
+              b" where this `ply` lays out ",
+              match laid.at(i) { Some(d) -> described_said(d), None -> b"none" },
+            ]),
+          )
+        },
+      },
+  )
+
+/// Where the runtime `j` describes lays out what emitted code reads in place otherwise than this
+/// compiler does: the context's fields, each struct emitted code lays out and the runtime reads, how
+/// deeply drop roots nest before a release is put off, and the word a hold keeps its value in. `None`
+/// where it agrees.
+fn laid_otherwise(j: Json) -> Option<Bytes> / {abort.raise} = {
+  let structs = list_at_key(j, "descriptors");
+  let depth = int_at(j, "release_depth");
+  match first_unlike(
+      b"the context",
+      described_fields(list_at_key(j, "ctx")),
+      fields_laid(ctx_struct()),
+    ) {
+    Some(why) -> Some(why),
+    None -> match range(0, machine_structs().len()).fold(None, |found: Option<Bytes>, i: Int|
+        match found {
+          Some(_) -> found,
+          None -> {
+            let s = machine_structs().get(i);
+            match structs.at(i) {
+              None -> Some(Bytes::concat_all([b"it describes no `", s.name, b"`"])),
+              Some(d) -> if text_at(d, "name") != Some(String::of_bytes_lossy(s.name)) {
+                Some(
+                  Bytes::concat_all([b"its struct ", ascii_of_int(i), b" is not `", s.name, b"`"]),
+                )
+              } else if int_at(d, "bytes") != Some(s.bytes) {
+                Some(
+                  Bytes::concat_all([b"`", s.name, b"` is not ", ascii_of_int(s.bytes), b" bytes"]),
+                )
+              } else {
+                first_unlike(
+                  Bytes::concat_all([b"`", s.name, b"`"]),
+                  described_fields(list_at_key(d, "fields")),
+                  fields_laid(s),
+                )
+              },
+            }
+          },
+        }) {
+      Some(why) -> Some(why),
+      None -> if depth != Some(release_depth()) {
+        Some(
+          Bytes::concat_all([
+            b"its drop roots nest ",
+            match depth { Some(n) -> ascii_of_int(n), None -> b"no number" },
+            b" deep, where this `ply`'s nest ",
+            ascii_of_int(release_depth()),
+          ]),
+        )
+      } else {
+        let held: Option<HoldLaid> = read_at(j, "hold", |h: Json|
+          match int_at(h, "held") { Some(n) -> Some({ held: n }), None -> None });
+        if held == Some(hold_laid()) { None } else {
+          Some(
+            Bytes::concat_all([
+              b"its holds keep their value at word ",
+              match held { Some(h) -> ascii_of_int(h.held), None -> b"none it says" },
+              b", where this `ply`'s read it at ",
+              ascii_of_int(hold_laid().held),
+            ]),
+          )
+        }
+      },
+    },
+  }
+}
 
 /// One file a pack carries, by the path it is read under.
 pub type Packed = { path: String, bytes: Bytes }
@@ -220,16 +348,92 @@ test "a pack lays its files out by path, then its table, then the lengths and th
   assert_eq(b.slice(b.len() - 24, b.len() - 16), u64_le(3 + table_len))
 }
 
+/// The members of a description that lay out what emitted code reads in place, as this compiler
+/// lays it out.
+fn machine_json() -> Bytes / {abort.raise} = {
+  let fields = |s: MachineStruct|
+    Bytes::concat_all([
+      b"[",
+      Bytes::join(
+        s.fields.map(|f: MachineField|
+          Bytes::concat_all([
+            b"{\"name\":\"",
+            f.name,
+            b"\",\"at\":",
+            ascii_of_int(f.at),
+            b",\"bytes\":",
+            ascii_of_int(f.bytes),
+            b"}",
+          ])),
+        b",",
+      ),
+      b"]",
+    ]);
+  Bytes::concat_all([
+    b"\"ctx\":",
+    fields(ctx_struct()),
+    b",\"descriptors\":[",
+    Bytes::join(
+      machine_structs().map(|s: MachineStruct|
+        Bytes::concat_all([
+          b"{\"name\":\"",
+          s.name,
+          b"\",\"bytes\":",
+          ascii_of_int(s.bytes),
+          b",\"fields\":",
+          fields(s),
+          b"}",
+        ])),
+      b",",
+    ),
+    b"],\"release_depth\":",
+    ascii_of_int(release_depth()),
+    b",\"hold\":{\"held\":",
+    ascii_of_int(hold_laid().held),
+    b"}",
+  ])
+}
+
+fn layouts_json() -> Bytes =
+  b"\"layouts\":{\"list\":{\"root\":0,\"tail\":1,\"start\":\"layout\",\"tail_len\":\"flags\",\"room\":\"aux\"},\"trie\":{\"leaf\":11,\"branch\":12,\"width\":32},\"map\":{\"root\":0,\"height\":\"layout\"},\"tree\":{\"leaf\":13,\"branch\":14,\"width\":32,\"keys\":33,\"sizes\":66}}"
+
+test "a runtime laying out the context, a struct it reads or its drop roots' depth otherwise is refused" {
+  let head = b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[],";
+  let natives = b"\"natives\":[{\"name\":\"panic\",\"words\":1,\"answers\":true,\"raises\":true}]";
+  let described = |machine: Bytes|
+    runtime_of(Bytes::concat_all([head, natives, b",", layouts_json(), b",", machine, b"}"]));
+  let why = |machine: Bytes| match described(machine) { Ok(_) -> b"", Err(w) -> w };
+  assert_eq(why(machine_json()), b"");
+  let moved = machine_json().replace(
+    b"\"name\":\"release_depth\",\"at\":72",
+    b"\"name\":\"release_depth\",\"at\":80",
+  );
+  assert(moved != machine_json(), None);
+  assert(why(moved).index_of(b"`release_depth` at 80") != None, None);
+  let wider = machine_json().replace(
+    b"\"name\":\"PlyFnDesc\",\"bytes\":48",
+    b"\"name\":\"PlyFnDesc\",\"bytes\":56",
+  );
+  assert(why(wider).index_of(b"`PlyFnDesc` is not 48 bytes") != None, None);
+  let deeper = machine_json().replace(b"\"release_depth\":32", b"\"release_depth\":64");
+  assert(why(deeper).index_of(b"nest 64 deep") != None, None);
+  let held = machine_json().replace(b"\"hold\":{\"held\":1}", b"\"hold\":{\"held\":2}");
+  assert(held != machine_json(), None);
+  assert(why(held).index_of(b"keep their value at word 2") != None, None);
+  // A description that says nothing of them is refused too: this `ply` cannot check its code against it.
+  assert(why(b"\"ctx\":[]").len() > 0, None)
+}
+
 test "a runtime reads back from the JSON its library describes itself with" {
-  let laid = b"\"layouts\":{\"list\":{\"root\":0,\"tail\":1,\"start\":\"layout\",\"tail_len\":\"flags\",\"room\":\"aux\"},\"trie\":{\"leaf\":11,\"branch\":12,\"width\":32},\"map\":{\"root\":0,\"height\":\"layout\"},\"tree\":{\"leaf\":13,\"branch\":14,\"width\":32,\"keys\":33,\"sizes\":66}}";
+  let laid = Bytes::concat_all([layouts_json(), b",", machine_json()]);
   let json = Bytes::concat_all([
     b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[{\"name\":\"h\",\"args\":2,\"answers\":true}],\"natives\":[{\"name\":\"List::len\",\"words\":1,\"answers\":true,\"raises\":false},{\"name\":\"panic\",\"words\":1,\"answers\":true,\"raises\":true}],",
     laid,
     b",\"builtins\":[\"List::len\",\"panic\"]}",
   ]);
   match runtime_of(json) {
-    None -> assert(false, Some("the description reads")),
-    Some(r) -> {
+    Err(why) -> assert(false, Some(String::of_bytes_lossy(why))),
+    Ok(r) -> {
       assert_eq(r.head, b"H");
       assert_eq(r.helpers, [{ name: b"h", args: 2, answers: true }]);
       assert_eq(r.natives, [
@@ -244,15 +448,16 @@ test "a runtime reads back from the JSON its library describes itself with" {
   // runtime this `ply` cannot hold a program's code to.
   let head = b"{\"head\":\"H\",\"tail\":\"T\",\"identity\":\"I\",\"helpers\":[],";
   let natives = b"\"natives\":[{\"name\":\"panic\",\"words\":1,\"answers\":true,\"raises\":true}]";
-  assert(runtime_of(Bytes::concat_all([head, natives, b",", laid, b"}"])) != None);
-  assert_eq(runtime_of(Bytes::concat_all([head, laid, b"}"])), None);
+  let reads = |j: Bytes| match runtime_of(j) { Ok(_) -> true, Err(_) -> false };
+  assert(reads(Bytes::concat_all([head, natives, b",", laid, b"}"])), None);
+  assert_eq(reads(Bytes::concat_all([head, laid, b"}"])), false);
   assert_eq(
-    runtime_of(Bytes::concat_all([head, b"\"natives\":[{\"name\":\"panic\"}],", laid, b"}"])),
-    None,
+    reads(Bytes::concat_all([head, b"\"natives\":[{\"name\":\"panic\"}],", laid, b"}"])),
+    false,
   );
-  assert_eq(runtime_of(Bytes::concat_all([head, natives, b"}"])), None);
+  assert_eq(reads(Bytes::concat_all([head, natives, b",", machine_json(), b"}"])), false);
   assert_eq(
-    runtime_of(
+    reads(
       Bytes::concat_all([
         head,
         natives,
@@ -261,6 +466,6 @@ test "a runtime reads back from the JSON its library describes itself with" {
         b"}",
       ]),
     ),
-    None,
+    false,
   )
 }

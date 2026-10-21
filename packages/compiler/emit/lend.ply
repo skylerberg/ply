@@ -12,15 +12,17 @@ import check.resolve.tables (qualify)
 import syntax.parsing (Span, dummy_span, span_between)
 import emit.keys (RootKey, Named, At, Written, Callee, Root, Generic, TypeOp, Equal, Order, Reflect,
                   Shown, Digest, Contained, Lower, Lift, Drop, Share, root_name)
-import emit.roots (container_ops)
+import emit.written (contained_reads)
 import emit.reps (Def)
 import emit.answer (GenericCall)
-import emit.tir (Rep, RWord, RInt, RBool, RMaybe, RTagged, RFlat, RCases, RSlice, Var, Arg, AVar,
-                 AInt, AZero, Val, Prim, Literal, Static, Make, Get, Take, Tag, Pack, Gathered,
-                 Call, Apply, Native, Op, OHandle, Made, MClosure, MCtor, MList, MRecord, PLeaf,
-                 PField, PArg, PCapture, PNamed, Inst, Let, Do, Decl, Assign, If, Case, Match, Loop,
-                 Next, Done, Return, Restart, Enter, Handle, Reset, Opened, Block, Fn, Member,
-                 Rooted, Lambda, Closure, Handed, Given, Lent, Returned, Owned, Borrowed,
+import emit.layout
+import emit.layout (Always, Inline, LWords)
+import emit.tir (Rep, RWord, RInt, RBool, RMaybe, RTagged, RFlat, RCases, RSlice, RSum, Var, Arg,
+                 AVar, AInt, AZero, Val, Prim, Literal, Static, Make, Get, Take, Tag, Pack,
+                 Gathered, Call, Apply, Native, Op, OHandle, Made, MClosure, MCtor, MList, MRecord,
+                 PLeaf, PField, PArg, PCapture, PNamed, Inst, Let, Do, Decl, Assign, If, Case,
+                 Match, Loop, Next, Done, Return, Restart, Enter, Handle, Reset, Opened, Block, Fn,
+                 Member, Rooted, Lambda, Closure, Handed, Given, Lent, Returned, Owned, Borrowed,
                  Convention, TTag, Uses, ReadsOf, LastOf, Walked, no_links, counted, rep_of_arg,
                  used_as, operands, answered, var_of)
 import emit.tir.handling (Perform)
@@ -442,7 +444,7 @@ type Use = { does: Does, at: Span }
 
 type Does =
   | Consumes(Origin)
-  | Jumps({ to: Bytes, param: Int, of: Origin })
+  | Jumps({ to: Bytes, param: Int, of: Origin, counts: Bool })
   | Answers(Origin)
   | Sets({ join: Int, of: Origin })
 
@@ -581,8 +583,9 @@ fn gone_in(
         let pointable = j.of.bases.len() > 0
           && j.of.bases.all(|k: Int, whole: Bool|
             whole && (match own.at(k) { Some(r) -> passing(r) == ByReference, None -> false }));
-        if !lent_there { { ..g, own: wholes(g.own, j.of, u.at) } }
-        else if j.of.fresh || j.of.bases.keys().any(|k: Int| h.params.at(k) == Some(Given))
+        if !lent_there { if j.counts { { ..g, own: wholes(g.own, j.of, u.at) } } else { g } }
+        else if (j.counts
+            && (j.of.fresh || j.of.bases.keys().any(|k: Int| h.params.at(k) == Some(Given))))
             || (pointed && !pointable) {
           { ..g, jumped: g.jumped.push({ to: j.to, param: j.param, at: u.at }) }
         } else { g }
@@ -678,12 +681,17 @@ fn origin_of(w: Walk, v: Var) -> Origin =
 
 fn arg_origin(w: Walk, a: Arg) -> Origin = match a { AVar(v) -> origin_of(w, v), _ -> none() }
 
+/// `w` with `v` of origin `o`, where `v` holds a count or is passed by reference: a record a jump
+/// points at again must lie where its caller lent it, whether or not it holds a count.
 fn defined(w: Walk, v: Var, o: Origin) -> Walk =
-  if counted(v.rep) { { ..w, origins: w.origins.insert(v.id, o) } } else { w }
+  if counted(v.rep) || passing(v.rep) == ByReference { { ..w, origins: w.origins.insert(v.id, o) } }
+  else { w }
 
 fn used(w: Walk, d: Does) -> Walk = { ..w, uses: w.uses.push({ does: d, at: w.at }) }
 
-fn consumed(w: Walk, a: Arg) -> Walk = used(w, Consumes(arg_origin(w, a)))
+/// `w` past consuming `a`, where it holds a count: a value holding none gives nothing up.
+fn consumed(w: Walk, a: Arg) -> Walk =
+  if counted(rep_of_arg(a)) { used(w, Consumes(arg_origin(w, a))) } else { w }
 
 fn taken(w: Walk, ops: List<{ arg: Arg, takes: Bool }>) -> Walk =
   ops.fold(w, |acc: Walk, o: { arg: Arg, takes: Bool }|
@@ -693,7 +701,8 @@ fn taken(w: Walk, ops: List<{ arg: Arg, takes: Bool }>) -> Walk =
 fn jumped(w: Walk, to: Bytes, args: List<Arg>) -> Walk =
   range(0, args.len()).fold(w, |a: Walk, k: Int|
     match args.at(k) {
-      Some(x) -> used(a, Jumps({ to: to, param: k, of: arg_origin(a, x) })),
+      Some(x) ->
+        used(a, Jumps({ to: to, param: k, of: arg_origin(a, x), counts: counted(rep_of_arg(x)) })),
       None -> a,
     })
 
@@ -714,7 +723,8 @@ fn walked(s: Sight, w: Walk, b: Block) -> Walk =
           AVar(_) -> arg_origin(acc, x.arg),
           _ -> if counted(rep_of_arg(x.arg)) { made() } else { none() },
         };
-        used(defined(acc, x.var, union(origin_of(acc, x.var), o)), Sets({ join: x.var.id, of: o }))
+        let set = defined(acc, x.var, union(origin_of(acc, x.var), o));
+        if counted(x.var.rep) { used(set, Sets({ join: x.var.id, of: o })) } else { set }
       },
       If(x) -> placed(walked(s, placed(walked(s, acc, x.then), acc.at), x.otherwise), acc.at),
       Case(c) ->
@@ -736,7 +746,8 @@ fn walked(s: Sight, w: Walk, b: Block) -> Walk =
       },
       Next(args) -> args.fold(acc, consumed),
       Done(a) -> consumed(acc, a),
-      Return(a) -> used(acc, Answers(arg_origin(acc, a))),
+      Return(a) -> if counted(rep_of_arg(a)) { used(acc, Answers(arg_origin(acc, a))) }
+      else { acc },
       Restart(args) -> jumped(acc, s.def, args),
       Enter(e) -> match s.group.at(e.member) {
         Some(to) -> jumped(acc, to, e.args),
@@ -871,7 +882,7 @@ pub fn written_handing(op: TypeOp, arity: Int) -> Handing = {
     Shown -> true,
     Digest -> true,
     Lower -> true,
-    Contained(c) -> container_ops().contains(c) || c == b"lower_items" || c == b"lower_entries",
+    Contained(c) -> contained_reads(c),
     _ -> false,
   };
   { params: range(0, arity).map(|_: Int| if reads { Lent } else { Given }), answer: Owned }
@@ -1191,34 +1202,62 @@ test "a jump back to the start keeps a parameter lent while it hands on only wha
 }
 
 test "a record lent by reference stays lent across a jump only where the jump hands on a record lent so" {
-  let wide = RFlat(range(0, 5).map(|k: Int| { name: b"f".concat(ascii_of_int(k)), rep: RInt }));
-  let w = of_type(0, b"m.W", wide);
-  let v = of_type(1, b"m.W", wide);
   let b = word(2);
   let n = int(3);
   let stop = flag(4);
   let m = int(5);
-  let x = of_type(6, b"m.W", wide);
-  let go = |before: Block, args: List<Arg>|
-    alone([
-      def_of(b"go", [w, v, b, n], RInt, [
-        bind(stop, Prim({ op: b"le", on: RInt, args: [AVar(n), AInt(0)] })),
-        If({
-          cond: AVar(stop),
-          then: [Return(AInt(0))],
-          otherwise: before.concat([
-            bind(m, Prim({ op: b"sub", on: RInt, args: [AVar(n), AInt(1)] })),
-            Restart(args.concat([AVar(b), AVar(m)])),
+  // Handed on swapped, read through a block it is lent, and read so with the other handed on.
+  let jumps = |wide: Rep| {
+    let w = of_type(0, b"m.W", wide);
+    let v = of_type(1, b"m.W", wide);
+    let x = of_type(6, b"m.W", wide);
+    let go = |before: Block, args: List<Arg>|
+      match alone([
+          def_of(b"go", [w, v, b, n], RInt, [
+            bind(stop, Prim({ op: b"le", on: RInt, args: [AVar(n), AInt(0)] })),
+            If({
+              cond: AVar(stop),
+              then: [Return(AInt(0))],
+              otherwise: before.concat([
+                bind(m, Prim({ op: b"sub", on: RInt, args: [AVar(n), AInt(1)] })),
+                Restart(args.concat([AVar(b), AVar(m)])),
+              ]),
+            }),
           ]),
-        }),
-      ]),
-    ]);
-  assert_eq(go([], [AVar(v), AVar(w)]), [{ params: [Lent, Lent, Lent, Lent], answer: Owned }]);
-  // Read through a block it is lent, the record lies in that block, not in storage its caller
-  // lent it, so the record it is jumped to is given; and a record given is handed on given.
-  let read = [bind(x, Get({ of: b, path: PField({ name: b"w", at: 0 }) }))];
-  assert_eq(go(read, [AVar(x), AVar(v)]), [{ params: [Given, Lent, Lent, Lent], answer: Owned }]);
-  assert_eq(go(read, [AVar(x), AVar(w)]), [{ params: [Given, Given, Lent, Lent], answer: Owned }])
+        ]).at(
+          0,
+        ) {
+        Some(h) -> h.params,
+        None -> [],
+      };
+    let read = [bind(x, Get({ of: b, path: PField({ name: b"w", at: 0 }) }))];
+    [go([], [AVar(v), AVar(w)]), go(read, [AVar(x), AVar(v)]), go(read, [AVar(x), AVar(w)])]
+  };
+  // Read through a block it is lent, a record lies in that block, not in storage its caller lent
+  // it, so the record it is jumped to is given; and one holding a count given is handed on given.
+  let counted_fields = range(0, 5).map(|k: Int|
+    { name: b"f".concat(ascii_of_int(k)), rep: if k == 0 { RWord } else { RInt } });
+  assert_eq(jumps(RFlat(counted_fields)), [
+    [Lent, Lent, Lent, Lent],
+    [Given, Lent, Lent, Lent],
+    [Given, Given, Lent, Lent],
+  ]);
+  // A record holding no count is pointed at all the same, but gives nothing up where it goes.
+  let scalars = range(0, 5).map(|_: Int| layout::raw());
+  let words = RSum({
+    laid: {
+      classes: scalars,
+      cases: [
+        { test: Always, payload: Inline({ offset: 0, laid: LWords(scalars), stripped: None }) },
+      ],
+    },
+    cases: [b"m.W"],
+  });
+  assert_eq(jumps(words), [
+    [Lent, Lent, Lent, Lent],
+    [Given, Lent, Lent, Lent],
+    [Given, Lent, Lent, Lent],
+  ])
 }
 
 test "a group that hands a parameter around lends it, and gives it once any member keeps it" {

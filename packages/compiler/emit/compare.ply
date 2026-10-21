@@ -16,8 +16,8 @@ import std.bytes (ascii_of_int, hex_digit)
 import emit (emit_roots_answer)
 import unit (program_natives)
 import check.infer.definitions (Extern)
-import emit.answer (RootAnswer, Body, Const, ConstStr, ConstBytes, ConstEmbedded, ConstFixed,
-                    ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, GenericCall)
+import emit.answer (RootAnswer, Body, GenericCall, settled_by_callers)
+import emit.entry (built_form)
 import emit.keys (RootKey, FnArg, Named, root_name)
 import emit.pieces (Piece, spelled)
 import emit.tir (Rep, Var, Arg, AVar, ABool, RInt, RBool, Inst, Decl, Assign, If, Return, Restart,
@@ -80,17 +80,20 @@ pub fn printed_by_form(p: Program, name: Bytes) -> Result<Bytes, Bytes> / {abort
   match checked(p, name) { Err(why) -> Err(why), Ok(form) -> Ok(printed_text(form)) }
 
 /// Why a build stops at the root lowered to `f`, where it does: the check refuses its form once its
-/// counts are placed, or a printer has no C for it.
+/// counts are placed, or a printer has no C for it. A form its callers settle stops none, since a
+/// build prints it only at their types.
 pub fn unbuilt(f: Fn) -> Option<Bytes> = {
-  let counted = owned(f);
-  match verified(counted) {
-    Some(why) -> Some(b"refused by the check: ".concat(why)),
-    None -> handle {
-      printed_fn(counted, no_ctors());
-      None
-    } with {
-      abort.raise(m) -> Some(Bytes::of_string(m)),
-    },
+  let counted = built_form(f);
+  if settled_by_callers(counted.links.needs) { None } else {
+    match verified(counted) {
+      Some(why) -> Some(b"refused by the check: ".concat(why)),
+      None -> handle {
+        printed_fn(counted, no_ctors());
+        None
+      } with {
+        abort.raise(m) -> Some(Bytes::of_string(m)),
+      },
+    }
   }
 }
 
@@ -107,12 +110,11 @@ pub fn not_built(
     })
 
 /// Root `f`'s C as the form prints it, each hole of the unit's tables spelled as the entry it names
-/// (`@@c=str:one@@`).
+/// (`@@f=name@@`).
 pub fn printed_text(f: Fn) -> Bytes / {abort.raise} = {
   let pr = printed_fn(f, no_ctors());
   let generics = f.links.generics.map(call_spelled);
   resolved(spelled(pr.pieces), {
-    c: pr.consts.map(const_spelled),
     b: pr.builtins,
     f: pr.fields,
     s: pr.shapes.map(|s: List<Bytes>| Bytes::join(s, b",")),
@@ -170,15 +172,8 @@ pub fn answered_by_form(
 }
 
 /// What each hole of a root's tables names, spelled, by table and in the order its holes number it:
-/// constants, builtins, field names, shapes, the code table's entries and generic calls.
-type Entries = {
-  c: List<Bytes>,
-  b: List<Bytes>,
-  f: List<Bytes>,
-  s: List<Bytes>,
-  l: List<Bytes>,
-  g: List<Bytes>,
-}
+/// builtins, field names, shapes, the code table's entries and generic calls.
+type Entries = { b: List<Bytes>, f: List<Bytes>, s: List<Bytes>, l: List<Bytes>, g: List<Bytes> }
 
 /// `text` with each hole of a table `e` holds an entry for written as `@@<table>=<entry>@@`.
 fn resolved(text: Bytes, e: Entries) -> Bytes / {abort.raise} = {
@@ -193,12 +188,11 @@ fn resolved(text: Bytes, e: Entries) -> Bytes / {abort.raise} = {
   )
 }
 
-/// A hole's content, `c3`, as the entry it names, `c=str:one`, where its table holds one.
+/// A hole's content, `f3`, as the entry it names, `f=name`, where its table holds one.
 fn hole_spelled(h: Bytes, e: Entries) -> Bytes / {abort.raise} =
   if !numbered_hole(h) { h } else {
     let table = h.slice(0, 1);
-    let entries = if table == b"c" { e.c }
-    else if table == b"b" { e.b }
+    let entries = if table == b"b" { e.b }
     else if table == b"f" { e.f }
     else if table == b"s" { e.s }
     else if table == b"l" { e.l }
@@ -214,11 +208,11 @@ fn hole_spelled(h: Bytes, e: Entries) -> Bytes / {abort.raise} =
 
 /// Whether a hole's content is a table's letter and a number.
 fn numbered_hole(h: Bytes) -> Bool / {abort.raise} =
-  [108, 99, 98, 102, 115, 103].any(|t: Int| digits_after(h, t))
+  [108, 98, 102, 115, 103].any(|t: Int| digits_after(h, t))
 
 /// A code table's entry, whose own holes name the body's generic calls, as those calls.
 fn entry_spelled(entry: Bytes, generics: List<Bytes>) -> Bytes / {abort.raise} =
-  resolved(entry, { c: [], b: [], f: [], s: [], l: [], g: generics })
+  resolved(entry, { b: [], f: [], s: [], l: [], g: generics })
 
 /// `b` with every byte that is not printable ASCII, and `@`, `\`, `;`, `{` and `}`, written `\xHH`,
 /// so a hole's entry holds no `@@`, no line break, and nothing a statement or a block is read by.
@@ -231,28 +225,6 @@ fn escaped(b: Bytes) -> Bytes / {abort.raise} =
       } else { Bytes::concat_all([b"\\x", hex_digit(x / 16), hex_digit(x % 16)]) }
     }),
   )
-
-fn const_spelled(k: Const) -> Bytes =
-  match k {
-    ConstStr(s) -> b"str:".concat(s),
-    ConstBytes(s) -> b"bytes:".concat(s),
-    ConstEmbedded(d) -> b"embedded:".concat(d),
-    ConstFixed(x) ->
-      Bytes::concat_all([b"fixed:", ascii_of_int(x.width), b":", ascii_of_int(x.bits)]),
-    ConstWide(x) ->
-      Bytes::concat_all([
-        b"wide:",
-        ascii_of_int(x.width),
-        b":",
-        ascii_of_int(x.high),
-        b":",
-        ascii_of_int(x.low),
-      ]),
-    ConstFloat(t) -> b"float:".concat(t),
-    ConstDecimal(t) -> b"decimal:".concat(t),
-    ConstChar(c) -> b"char:".concat(ascii_of_int(c)),
-    ConstUnit -> b"unit",
-  }
 
 /// A generic call as its callee at its type arguments, the variables it hands over raw, and the
 /// lambdas it hands: `m.f<Int>[0]|1=m.g:0`.
@@ -369,21 +341,18 @@ test "every function the form prints makes room on the stack it runs on, and non
 }
 
 test "each table's hole is spelled as the entry it names, so the order a table is filled in does not show" {
-  let none: Entries = { c: [], b: [], f: [], s: [], l: [], g: [] };
-  let one = resolved(b"  Word t1 = rt_lit_p(ctx, @@c0@@);", { ..none, c: [b"str:one"] });
-  let two = resolved(b"  Word t1 = rt_lit_p(ctx, @@c1@@);", {
-    ..none,
-    c: [b"str:zero", b"str:one"],
-  });
+  let none: Entries = { b: [], f: [], s: [], l: [], g: [] };
+  let one = resolved(b"  Word t1 = builtin_p(ctx, @@b0@@);", { ..none, b: [b"one"] });
+  let two = resolved(b"  Word t1 = builtin_p(ctx, @@b1@@);", { ..none, b: [b"zero", b"one"] });
   assert_eq(one, two);
-  assert(resolved(b"  Word t1 = rt_lit_p(ctx, @@c0@@);", { ..none, c: [b"str:zero"] }) != one);
+  assert(resolved(b"  Word t1 = builtin_p(ctx, @@b0@@);", { ..none, b: [b"zero"] }) != one);
   assert_eq(
-    resolved(b"  f(@@c1@@, @@f0@@, @@c9@@, @@r@@, @@Tm.Box@@);", {
+    resolved(b"  f(@@b1@@, @@f0@@, @@b9@@, @@r@@, @@Tm.Box@@);", {
       ..none,
-      c: [b"str:one", b"str:a\nb"],
+      b: [b"one", b"a\nb"],
       f: [b"name"],
     }),
-    b"  f(@@c=str:a\\x0ab@@, @@f=name@@, @@c9@@, @@r@@, @@Tm.Box@@);",
+    b"  f(@@b=a\\x0ab@@, @@f=name@@, @@b9@@, @@r@@, @@Tm.Box@@);",
   );
   // A code table's entry names a generic call by its own hole.
   assert_eq(entry_spelled(b"@@g0@@_entry", [b"m.id<Int>"]), b"@@g=m.id<Int>@@_entry")

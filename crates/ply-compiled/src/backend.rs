@@ -330,8 +330,6 @@ struct LastEntry {
 /// One worker's compiled bodies, offered to a `Machine` through `ply_core::Compiled`.
 pub struct Bodies {
     unit: Arc<Unit>,
-    /// Kept alive because every [`Entry`] below points into its executable pages.
-    _code: crate::c::Native,
     admitted: HashMap<Symbol, Admitted>,
     /// One context for every entry; the `RefCell` forbids nesting, since `Ctx::slots` has no pop.
     ctx: RefCell<crate::rt::Ctx>,
@@ -344,6 +342,9 @@ pub struct Bodies {
     encoded: bool,
     /// What an encoded unit's pure roots answered.
     kept: RefCell<Kept>,
+    /// Kept alive because every [`Entry`] above points into its executable pages. Last, so the
+    /// context and the memo, which may hold a word of its static data, go before it is unmapped.
+    _code: crate::c::Native,
 }
 
 /// What an encoded unit's pure roots answered, as values, each under its root and its arguments'
@@ -534,7 +535,7 @@ impl Bodies {
         let out = crate::rt::on_known_stack(entering, || unsafe {
             (admitted.entry)(entering, handles.as_ptr())
         });
-        let out = self.returned(&mut ctx, out);
+        let out = self.returned(&mut ctx, Some(out));
         if ctx.failed != 0 {
             return self.failure(&mut ctx, fuel);
         }
@@ -612,10 +613,10 @@ impl Bodies {
         let none: [i64; 0] = [];
         // SAFETY: `self._code` owns the entry's pages, `ctx` is uniquely borrowed, and an
         // `R#entered` takes no words.
-        let out = crate::rt::on_known_stack(entering, || unsafe {
+        crate::rt::on_known_stack(entering, || unsafe {
             (admitted.entry)(entering, none.as_ptr())
         });
-        self.returned(ctx, out);
+        self.returned(ctx, None);
         if ctx.failed != 0 {
             return self.failure(ctx, fuel);
         }
@@ -650,7 +651,13 @@ impl Bodies {
 
     /// What an entry that returned `out` leaves for the machine, kept for it to read: its
     /// production region's other tasks run to their ends first, which may answer another word.
-    fn returned(&self, ctx: &mut crate::rt::Ctx, mut out: crate::heap::Word) -> crate::heap::Word {
+    /// `out` is none for an entry that wrote its answer's encoding itself.
+    fn returned(
+        &self,
+        ctx: &mut crate::rt::Ctx,
+        out: Option<crate::heap::Word>,
+    ) -> crate::heap::Word {
+        let mut answer = out.unwrap_or(0);
         let production = ctx.sims.last().filter(|sim| sim.is_production());
         let held = ply_core::Held {
             bridges: ctx.heap.bridges() as u64,
@@ -659,7 +666,7 @@ impl Bodies {
             frame_tables: ctx.stack_slots() as u64,
         };
         if ctx.sims.last().is_some_and(|sim| sim.is_production()) {
-            out = unsafe { crate::simulate::finish_root(std::ptr::from_mut(ctx), out) };
+            answer = unsafe { crate::simulate::finish_root(std::ptr::from_mut(ctx), out) };
         }
         if let Some(rt) = ctx.runtime.clone() {
             let warned = rt.end_entry_point(ctx.id);
@@ -671,7 +678,7 @@ impl Bodies {
             record: ctx.record.take(),
             performed: std::mem::take(&mut ctx.performed),
         };
-        out
+        answer
     }
 
     /// How an entry that failed ends: what it raised, or a decline where it raised nothing.

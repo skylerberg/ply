@@ -18,7 +18,7 @@ import emit.reps (Def, Imported, EmitParam, BoundLambda, erased, has_vars, carri
 import emit.answer (Layout, Exact)
 import emit.release (released_vars)
 import emit.keys (RootKey, FnArg, Named, At, Callee, Root, Generic, root_name, definition_of,
-                  key_types, key_lent, unspecialised)
+                  key_types, key_lent, unspecialised, at_key)
 import emit.tir
 import emit.tir (Rep, RInt, RBool, RWord, RSlice, Var, Arg, AVar, AInt, AZero, Given, Lent,
                  Convention, Val, Prim, Make, Get, Pack, Native, Op, OCalling, MClosure, MCtor,
@@ -297,7 +297,7 @@ pub fn called(
       refuse(st, Calling, b"a call whose callee resolves elsewhere: ".concat(full))
     } else if args.len() != d.def.arity {
       refuse(st, Calling, b"a call that does not fill its parameters: ".concat(full))
-    } else if args.len() == 0 && d.def.pure { constant_read(cx, st, d, at) } else {
+    } else if args.len() == 0 && d.def.pure { constant_read(cx, st, d, func.span, at) } else {
       match if tail { jumped(cx, st, d, func.span, codes, args, at) } else { None } {
         Some(j) -> j,
         None -> call(cx, st, d, func.span, codes, args, at),
@@ -1152,7 +1152,7 @@ pub fn closure(
 
 /// The state each member of a tail group is lowered in.
 pub fn group_opened(members: List<GroupMember>) -> List<Opened> / {abort.raise} = {
-  let fulls = members.map(|m: GroupMember| m.cx.full);
+  let keys = members.map(|m: GroupMember| m.cx.key);
   let params = member_params(members);
   let after = params.fold(1, |n: Int, ps: List<Var>| n + ps.len());
   range(0, members.len()).fold([], |acc: List<Opened>, i: Int|
@@ -1163,7 +1163,7 @@ pub fn group_opened(members: List<GroupMember>) -> List<Opened> / {abort.raise} 
         acc.push({
           cx: {
             ..m.cx,
-            tails: Enters(fulls),
+            tails: Enters(keys),
             param_at: range(0, own.len()).fold(Map::new(), |pa: Map<Int, Int>, j: Int|
               match own.at(j) { Some(v) -> pa.insert(v.id, j), None -> pa }),
           },
@@ -1303,8 +1303,9 @@ pub fn known_body(full: Bytes, params: List<EmitParam>, body: Code) -> Code =
 /// A definition the root names: its full name and how the emitter reads it.
 pub type Defined = { full: Bytes, def: Def }
 
-/// A call's callee as the root names it, and the type arguments it names it at.
-type Reference = { st: Lowering, callee: Callee, args: List<Type> }
+/// A call's callee as the root names it, the type arguments it names it at (none for a definition as
+/// it stands), and `given`, those the check filed at the reference, in this body's variables.
+type Reference = { st: Lowering, callee: Callee, args: List<Type>, given: List<Type> }
 
 /// A closure's body as the lambda's type lays it out: its captures, each a word it reads out of the
 /// closure, lent, then its own parameters as a body holds values of their types, given; how it
@@ -1385,26 +1386,33 @@ fn capture_type(st: Lowering, at: Span, i: Int) -> Type =
       None -> acc,
     })
 
-/// What a pure definition of no parameters answers, read from what the unit keeps of its one run.
-fn constant_read(cx: Context, st: Lowering, d: Defined, at: Span) -> Lowered = {
-  let ret = answer_type(d.def, []);
-  handed(
-    bound_as(
-      st,
-      ret,
-      RWord,
-      Op({ op: OCalling(ConstantRead(Root(d.def.root))), args: [], uses: answers() }),
-      at,
-    ),
-    held_as(cx.setting, ret),
-    at,
-  )
-}
+/// What a pure definition of no parameters answers, read from what the unit keeps of its one run, of
+/// the type it answers at the type arguments the reference `ref` names it at.
+fn constant_read(cx: Context, st: Lowering, d: Defined, ref: Span, at: Span) -> Lowered =
+  match match reference_args(cx, d.def.scheme, ref) {
+      Some(given) -> answer_type(d.def, given),
+      None -> None,
+    } {
+    None -> unfiled(cx, st, b"a constant's type arguments: ".concat(d.full), ref),
+    Some(ret) ->
+      handed(
+        bound_as(
+          st,
+          ret,
+          RWord,
+          Op({ op: OCalling(ConstantRead(Root(d.def.root))), args: [], uses: answers() }),
+          at,
+        ),
+        held_as(cx.setting, ret),
+        at,
+      ),
+  }
 
 /// A call in tail position as a jump: a restart where it calls the root's own definition at the
 /// root's own type arguments, filling every parameter, a group member's included; an entry into
-/// another member of the root's tail group, handed as that member takes its parameters; nothing
-/// where the root cannot jump there.
+/// the member of the root's tail group the call reaches, its definition at the type arguments the
+/// reference names, handed as that member takes its parameters; nothing where the root cannot jump
+/// there.
 fn jumped(
   cx: Context,
   st: Lowering,
@@ -1424,12 +1432,24 @@ fn jumped(
     Some({ st: emitted(h.st, Restart(h.args)), arg: AZero(held_as(cx.setting, cx.answer_ty)) })
   } else {
     match cx.tails {
-      Enters(fulls) -> match range(0, fulls.len()).fold(None, |acc: Option<Int>, i: Int|
-          match acc {
-            Some(_) -> acc,
-            None -> if fulls.at(i) == Some(d.full) { Some(i) } else { None },
+      Enters(keys) -> match match reference_args(cx, d.def.scheme, ref) {
+          Some(given) -> {
+            let reached = instance_key(
+              d.full,
+              given.map(|t: Type| if has_vars(t) { unknown_type() } else { t }),
+            );
+            range(0, keys.len()).fold(None, |acc: Option<Int>, i: Int|
+              match acc {
+                Some(_) -> acc,
+                None -> if keys.at(i) == Some(reached) { Some(i) } else { None },
+              })
+          },
+          None -> None,
+        } {
+        Some(i) -> match crossing_at(d.def, match keys.at(i) {
+            Some(k) -> key_types(k),
+            None -> [],
           }) {
-        Some(i) -> match crossing_at(d.def, []) {
           None -> Some(refuse(st, Calling, b"a tail group's member no scheme speaks for")),
           Some(c) -> {
             let h = handed_all(st, args, conventional(cx.setting, c).reps, at);
@@ -1445,8 +1465,9 @@ fn jumped(
     }
   }
 
-/// A call of `d` through the convention it has at the call's type arguments, its answer held as its
-/// type is in a body.
+/// A call of `d` through the convention it has at the call's type arguments, its answer of the type
+/// `d` answers at the type arguments the reference names it at, in this body's own variables
+/// whatever convention the root it reaches answers by, held as that type is in a body.
 fn call(
   cx: Context,
   st: Lowering,
@@ -1457,9 +1478,12 @@ fn call(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let n = named_ref(cx, st, d, ref, fn_args(cx, codes));
-  match crossing_at(d.def, n.args) {
-    None -> refuse(st, Calling, b"a call of a definition no scheme speaks for: ".concat(d.full)),
-    Some(c) -> {
+  match ((crossing_at(d.def, n.args), answer_type(d.def, n.given))) {
+    (None, _) ->
+      refuse(st, Calling, b"a call of a definition no scheme speaks for: ".concat(d.full)),
+    (_, None) ->
+      unfiled(cx, st, b"a call's type arguments of a generic definition: ".concat(d.full), ref),
+    (Some(c), Some(ret)) -> {
       let conv = conventional(cx.setting, c);
       let h = handed_all(
         passed(cx, stacked(n.st, d.def.lent, codes, args), d.full, codes, args),
@@ -1467,7 +1491,6 @@ fn call(
         conv.reps,
         at,
       );
-      let ret = answer_type(d.def, n.args);
       handed(
         bound_as(
           h.st,
@@ -1490,6 +1513,19 @@ fn call(
     },
   }
 }
+
+/// The type `d` answers at the type arguments `given` a reference names it at, in the referring
+/// body's variables; none where `d` is generic and `given` does not fill each of its variables.
+fn answer_type(d: Def, given: List<Type>) -> Option<Type> =
+  match d.scheme {
+    Some(sc) -> match sc.ty {
+      TyFn(f) -> if sc.ty_vars.len() == 0 { Some(f.ret) }
+      else if given.len() == sc.ty_vars.len() { Some(substituted_fully(f.ret, given)) }
+      else { None },
+      other -> if sc.ty_vars.len() == 0 { Some(other) } else { None },
+    },
+    None -> None,
+  }
 
 /// Whether a call of a function of effect row `row` can stop for a handler that may resume it later:
 /// where the row is open or names an operation a run must be given.
@@ -1519,9 +1555,11 @@ fn handed_all(
   )
 
 /// How a reference at `at` names definition `d`: the root being lowered, where it calls its own
-/// definition at its own type arguments handing the lambdas it runs; the definition as it stands;
-/// or, where the checker gave a generic definition type arguments there or the call hands lambdas
-/// a specialisation would run, the body's next generic call, which the unit settles.
+/// definition at its own type arguments handing the lambdas it runs; else, where the reference
+/// names it at no type arguments and hands no lambdas, the definition as it stands; else the body's
+/// next generic call, which the unit settles. A specialisation's reference of its own definition at
+/// other type arguments is such a call: the definition as it stands may be one its callers settle,
+/// emitted only at their types.
 fn named_ref(
   cx: Context,
   st: Lowering,
@@ -1535,10 +1573,11 @@ fn named_ref(
         st: unfiled(cx, st, b"a generic definition's reference", at).st,
         callee: Root(d.def.root),
         args: [],
+        given: [],
       },
-    Some(given) -> if unspecialised(cx.key) != d.def.root { referred(st, d, given, fns) }
-    else if owns(cx, given, fns) { { st: st, callee: Root(cx.key), args: key_types(cx.key) } }
-    else { { st: st, callee: Root(d.def.root), args: [] } },
+    Some(given) -> if unspecialised(cx.key) == d.def.root && owns(cx, given, fns) {
+      { st: st, callee: Root(cx.key), args: key_types(cx.key), given: given }
+    } else { referred(st, d, given, fns) },
   }
 
 /// Definition `d` named at type arguments `given`, handing `fns`: as it stands where it is named at
@@ -1549,7 +1588,9 @@ fn referred(
   given: List<Type>,
   fns: List<FnArg>,
 ) -> Reference / {abort.raise} =
-  if given.len() == 0 && fns.len() == 0 { { st: st, callee: Root(d.def.root), args: [] } } else {
+  if given.len() == 0 && fns.len() == 0 {
+    { st: st, callee: Root(d.def.root), args: [], given: given }
+  } else {
     {
       st: {
         ..st,
@@ -1568,8 +1609,15 @@ fn referred(
       },
       callee: Generic(st.links.generics.len()),
       args: given,
+      given: given,
     }
   }
+
+/// The root a call of definition `full` at type arguments `args` reaches in a tail loop: the
+/// definition as it stands where each is open, as a body at its own variables names it, else the
+/// definition at them.
+pub fn instance_key(full: Bytes, args: List<Type>) -> RootKey =
+  if args.all(|t: Type| t == unknown_type()) { Named(full) } else { at_key(full, args, []) }
 
 /// Whether a reference of the root's own definition at type arguments `given`, handing `fns`, names
 /// the root itself: always for a definition as it stands; for a specialisation, where it hands the
@@ -1588,17 +1636,6 @@ fn owns(cx: Context, given: List<Type>, fns: List<FnArg>) -> Bool / {abort.raise
           })
     },
     _ -> true,
-  }
-
-/// The type a call of `d` at type arguments `args` answers.
-fn answer_type(d: Def, args: List<Type>) -> Type =
-  match d.scheme {
-    Some(sc) -> match sc.ty {
-      TyFn(f) -> if sc.ty_vars.len() == 0 || args.len() == 0 { f.ret }
-      else { substituted_fully(f.ret, args) },
-      _ -> unknown_type(),
-    },
-    None -> unknown_type(),
   }
 
 /// `st` with each lambda `codes` writes at a parameter the callee lends, and which captures

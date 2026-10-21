@@ -1,0 +1,580 @@
+//! Values crossing into the runtime and back: written as PLV1 a part at a time through the runtime's
+//! crossing natives (a lowering), read back the same way (a lifting), and what is built on them:
+//! `?encode`, `?decode`, `observe`, and an extern the runtime answers over its arguments' encoding.
+//! A crossing native takes and answers machine data only: an integer's raw bits, a `Float`'s bits,
+//! the address and length of a byte string's bytes, a runtime object's word.
+//!
+//! `lower#T` and `lift#T`, the roots written for each type that crosses, are `emit.written`'s; a
+//! part of one at another type, `?lower(x)` and `?lift()`, is a call of that type's root here.
+
+import std.list
+import syntax.parsing (Span)
+import syntax.patterns (LUnit)
+import check.types (Type, TyCon, TyVar, TyFn, TyRecord, TyNominal, Field, named_type, int_type,
+                    unit_type, bytes_type)
+import emit.typing (unknown_type)
+import emit.c (Width, width_named, width_index)
+import emit.roots (builtin_helper)
+import emit.keys
+import emit.keys (RootKey, Root, Lower, Lift)
+import emit.tir (Rep, RInt, RWord, RFloat, RNum, RAddr, Arg, AVar, AInt, Var, Val, Uses, Prim, Get,
+                 PField, PPayload, Pack, Call, Native, Op, OContainer, OHandle, Lent, Owned,
+                 Handling)
+import emit.tir.containers (Taken, Length)
+import emit.tir.handling (Encoded, Unsettled)
+import emit.lower.setting (builtin_at)
+import emit.lower.held (held_as)
+import emit.lower.base (Context, Lowering, Lowered, refuse, bound, bound_as, done, handed, type_of,
+                        filed, noted)
+import emit.reps (type_vars)
+import emit.answer (Exact)
+import emit.lower.scalars (literal)
+
+/// The externs a body calls over its arguments' encoding, which the runtime decodes, answers as it
+/// always has, and encodes the answer of: those whose signatures hold a record, a list or a sum.
+pub fn encoded_externs() -> List<Bytes> =
+  [b"assert_eq", b"sqlite_run", b"Secret::private_key", b"Secret::rsa_jwk"]
+
+/// Whether a call of builtin `name` is lowered here: a crossing native, a part of a crossing root,
+/// an encoding or a decoding, `observe`, or an extern called over its arguments' encoding.
+pub fn crossing_builtin(name: Bytes) -> Bool =
+  machine_named(name) != None || name == b"?lower" || name == b"?lift" || name == b"?encode"
+    || name == b"?decode"
+    || name == b"observe"
+    || encoded_externs().contains(name)
+
+/// Builtin `name`, one `crossing_builtin` holds, called on `args`; `callee` is where its name is
+/// written, which the type a generic one is called at is filed under.
+pub fn crossed(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  callee: Span,
+  at: Span,
+) -> Lowered / {abort.raise} = {
+  let at_type = called_at(cx, callee, args);
+  if name == b"?lower" {
+    match args {
+      [x] -> lowered_part(cx, st, x, at_type, at),
+      _ -> refuse(st, Handling, b"a part lowered other than alone"),
+    }
+  } else if name == b"?lift" { lifted_part(cx, st, at_type, at) } else if name == b"?encode" {
+    match args {
+      [x] -> encoded(cx, st, x, at_type, true, at),
+      _ -> refuse(st, Handling, b"an encoding of other than one value"),
+    }
+  } else if name == b"?decode" {
+    match args {
+      [b] -> decoded(cx, st, b, at_type, at),
+      _ -> refuse(st, Handling, b"a decoding of other than one byte string"),
+    }
+  } else if name == b"observe" || encoded_externs().contains(name) {
+    match builtin_at(cx.setting, filed(cx, callee), name) {
+      None -> refuse(st, Handling, b"an extern called over its encoding at no type: ".concat(name)),
+      Some(types) -> if !types.params.push(types.ret).all(settled) {
+        // A body generic over the types crosses only in the specialisations its callers settle.
+        bound(
+          cx,
+          types.params.push(types.ret).fold(st, |s: Lowering, t: Type|
+            type_vars(t).fold(s, |n: Lowering, v: Int| noted(n, { var: v, reads: Exact }))),
+          types.ret,
+          Op({
+            op: OHandle(Unsettled(name)),
+            args: args,
+            uses: { takes: args.map(|_: Arg| false), owned: true, fails: true, stops: false },
+          }),
+          at,
+        )
+      } else if name == b"observe" {
+        // The identity through the runtime's crossing, which no C compiler sees through.
+        match args {
+          [x] -> {
+            let e = encoded(cx, st, x, at_type, false, at);
+            decoded(cx, e.st, e.arg, at_type, at)
+          },
+          _ -> refuse(st, Handling, b"`observe` of other than one value"),
+        }
+      } else { by_encoding(cx, st, name, args, callee, at) },
+    }
+  } else {
+    match machine_named(name) {
+      Some(m) -> machine(cx, st, m, args, at_type, at),
+      None -> refuse(st, Handling, b"a crossing builtin this family does not lower: ".concat(name)),
+    }
+  }
+}
+
+/// The type a generic crossing builtin is called at, as filed where its name is written: its first
+/// type argument; else what its first operand holds.
+fn called_at(cx: Context, callee: Span, args: List<Arg>) -> Type =
+  match filed(cx, callee) {
+    Some(t) -> match t.args.at(0) {
+      Some(a) -> a,
+      None -> match args.at(0) { Some(x) -> type_of(x), None -> unknown_type() },
+    },
+    None -> match args.at(0) { Some(x) -> type_of(x), None -> unknown_type() },
+  }
+
+/// `x`, of type `ty`, written into the innermost lowering by the root written for its type, which
+/// reads it while the call runs.
+fn lowered_part(cx: Context, st: Lowering, x: Arg, ty: Type, at: Span) -> Lowered / {abort.raise} =
+  if !settled(ty) { refuse(st, Handling, b"a value lowered at a type left open") } else {
+    let rep = held_as(cx.setting, ty);
+    let h = handed({ st: st, arg: x }, rep, at);
+    let unit = held_as(cx.setting, unit_type());
+    bound_as(
+      h.st,
+      unit_type(),
+      unit,
+      Call({
+        callee: Root(keys::written(Lower, ty, cx.setting.module)),
+        args: [h.arg],
+        conv: { params: [Lent], reps: [rep], answer: unit, answered: Owned },
+        stops: false,
+      }),
+      at,
+    )
+  }
+
+/// A value of type `ty` read from the innermost lifting by the root written for its type.
+fn lifted_part(cx: Context, st: Lowering, ty: Type, at: Span) -> Lowered =
+  if !settled(ty) { refuse(st, Handling, b"a value lifted at a type left open") } else {
+    let rep = held_as(cx.setting, ty);
+    bound_as(
+      st,
+      ty,
+      rep,
+      Call({
+        callee: Root(keys::written(Lift, ty, cx.setting.module)),
+        args: [],
+        conv: { params: [], reps: [], answer: rep, answered: Owned },
+        stops: false,
+      }),
+      at,
+    )
+  }
+
+/// Whether `ty` names every part of a value of it: no type variable and no word erased to `_`.
+fn settled(ty: Type) -> Bool =
+  match ty {
+    TyCon(c) -> c.name != b"_" && c.args.all(settled),
+    TyVar(_) -> false,
+    TyFn(f) -> f.params.push(f.ret).all(settled),
+    TyRecord(fs) -> fs.all(|f: Field| settled(f.ty)),
+    TyNominal(x) -> x.fields.all(|f: Field| settled(f.ty)),
+  }
+
+/// `x`, of type `ty`, as the bytes of its encoding: a lowering of its own, `x` written into it, and
+/// the bytes it ends with copied out. `again` writes a value met a second time as `AGAIN`, which a
+/// kept value's reader expands and the runtime's crossing readers refuse.
+fn encoded(
+  cx: Context,
+  st: Lowering,
+  x: Arg,
+  ty: Type,
+  again: Bool,
+  at: Span,
+) -> Lowered / {abort.raise} = {
+  let opened = native_done(st, b"?lower_open", [AInt(if again { 1 } else { 0 })], false, at);
+  let written = lowered_part(cx, opened, x, ty, at);
+  let n = native_int(written.st, b"?lower_close", [], true, at);
+  taken_out(n.st, n.arg, bytes_type(), at)
+}
+
+/// The value of type `ty` the encoding `b` holds: a lifting of its own over `b`'s bytes, the value
+/// read from it, and the lifting ended, which every byte must have been read by.
+fn decoded(cx: Context, st: Lowering, b: Arg, ty: Type, at: Span) -> Lowered / {abort.raise} = {
+  let bytes = addressed(st, b, at);
+  let opened = native_done(bytes.st, b"?lift_open", [bytes.address, bytes.count], true, at);
+  let v = lifted_part(cx, opened, ty, at);
+  { st: native_done(v.st, b"?lift_close", [], true, at), arg: v.arg }
+}
+
+/// Extern `name` called over its arguments' encoding: each argument lowered at the type the extern
+/// takes it at into a list the runtime decodes and calls the extern on, which raises as the extern
+/// does, or opens a lifting of its answer's encoding, which the answer is read from. `callee` is
+/// where the extern's name is written, which the types it is called at are filed under.
+pub fn by_encoding(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  callee: Span,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  match builtin_at(cx.setting, filed(cx, callee), name) {
+    None -> refuse(st, Handling, b"an extern called over its encoding at no type: ".concat(name)),
+    Some(types) -> if types.params.len() != args.len() {
+      refuse(
+        st,
+        Handling,
+        b"an extern called over its encoding with other arguments: ".concat(name),
+      )
+    } else {
+      let opened = native_done(st, b"?lower_open", [AInt(0)], false, at);
+      let head = native_done(opened, b"?out_count", [AInt(9), AInt(args.len())], false, at);
+      let written = range(0, args.len()).fold(head, |s: Lowering, i: Int|
+        lowered_part(cx, s, args.get(i), types.params.get(i), at).st);
+      let called = done(
+        written,
+        Op({
+          op: OHandle(Encoded(name)),
+          args: [],
+          uses: { takes: [], owned: false, fails: true, stops: false },
+        }),
+        at,
+      );
+      let answer = lifted_part(cx, called, types.ret, at);
+      { st: native_done(answer.st, b"?lift_close", [], true, at), arg: answer.arg }
+    },
+  }
+
+// --- The crossing natives ------------------------------------------------------------------
+
+/// What a crossing native takes past the context, as written code calls it, and answers. `Bits` is
+/// an integer's raw bits; `Text` the address of a byte string's bytes and then their count, written
+/// code handing the byte string; `Object` a runtime object's word, lent.
+type Taking = | Bits | FloatBits | Text | Object
+
+/// What a crossing native answers: nothing, raw bits, a `Float`'s bits, how many bytes it left as
+/// the crossing's taken bytes, which are copied out into a value of the type the call is filed at,
+/// or a runtime object's word with a count of its own.
+type Answer = | Nothing | WithBits | WithFloat | WithBytes | WithObject
+
+/// A crossing native as written code calls it: its name, what it takes and answers, and whether a
+/// call of it can fail the run: a reading, which meets bytes that do not hold what it reads.
+type Machine = { name: Bytes, takes: List<Taking>, answer: Answer, fails: Bool }
+
+/// Every crossing native, as written code calls it. `?out_decimal`, `?out_fixed`, `?in_decimal`
+/// and `?in_fixed` are written code's over a value of their type, which `machine` lowers to the
+/// natives over its words.
+fn machines() -> List<Machine> =
+  [
+    { name: b"?out_tag", takes: [Bits], answer: Nothing, fails: false },
+    { name: b"?out_int", takes: [Bits], answer: Nothing, fails: false },
+    { name: b"?out_float", takes: [FloatBits], answer: Nothing, fails: false },
+    { name: b"?out_char", takes: [Bits], answer: Nothing, fails: true },
+    { name: b"?out_str", takes: [Text], answer: Nothing, fails: false },
+    { name: b"?out_bytes", takes: [Text], answer: Nothing, fails: false },
+    { name: b"?out_count", takes: [Bits, Bits], answer: Nothing, fails: false },
+    { name: b"?out_ctor", takes: [Text, Bits], answer: Nothing, fails: false },
+    { name: b"?out_name", takes: [Text], answer: Nothing, fails: false },
+    { name: b"?out_handle", takes: [Object], answer: Nothing, fails: false },
+    { name: b"?out_fun", takes: [Text], answer: Nothing, fails: false },
+    { name: b"?out_again", takes: [Object], answer: WithBits, fails: false },
+    { name: b"?in_tag", takes: [], answer: WithBits, fails: true },
+    { name: b"?in_int", takes: [], answer: WithBits, fails: true },
+    { name: b"?in_float", takes: [], answer: WithFloat, fails: true },
+    { name: b"?in_char", takes: [], answer: WithBits, fails: true },
+    { name: b"?in_str", takes: [], answer: WithBytes, fails: true },
+    { name: b"?in_bytes", takes: [], answer: WithBytes, fails: true },
+    { name: b"?in_count", takes: [Bits], answer: WithBits, fails: true },
+    { name: b"?in_field", takes: [Text], answer: Nothing, fails: true },
+    { name: b"?in_name_is", takes: [Text], answer: WithBits, fails: true },
+    { name: b"?in_handle", takes: [], answer: WithObject, fails: true },
+    { name: b"?lift_close", takes: [], answer: Nothing, fails: true },
+    { name: b"?out_decimal", takes: [], answer: Nothing, fails: false },
+    { name: b"?out_fixed", takes: [], answer: Nothing, fails: false },
+    { name: b"?in_decimal", takes: [], answer: Nothing, fails: true },
+    { name: b"?in_fixed", takes: [], answer: Nothing, fails: true },
+  ]
+
+fn machine_named(name: Bytes) -> Option<Machine> =
+  machines().fold(None, |acc: Option<Machine>, m: Machine|
+    if m.name == name { Some(m) } else { acc })
+
+/// Crossing native `m` called on `args` by written code, its answer of type `ty` where it answers a
+/// value of a type its call is filed at.
+fn machine(
+  cx: Context,
+  st: Lowering,
+  m: Machine,
+  args: List<Arg>,
+  ty: Type,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  if m.name == b"?out_decimal" { decimal_out(cx, st, args, at) }
+  else if m.name == b"?out_fixed" { fixed_out(cx, st, args, at) }
+  else if m.name == b"?in_decimal" { decimal_in(cx, st, ty, at) }
+  else if m.name == b"?in_fixed" { fixed_in(cx, st, ty, at) } else if args.len() != m.takes.len() {
+    refuse(st, Handling, b"a crossing native called with other operands: ".concat(m.name))
+  } else {
+    let given = range(0, args.len()).fold(
+      { st: st, args: [] },
+      |acc: { st: Lowering, args: List<Arg> }, i: Int|
+        match m.takes.get(i) {
+          Bits -> {
+            let h = handed({ st: acc.st, arg: args.get(i) }, RInt, at);
+            { st: h.st, args: acc.args.push(h.arg) }
+          },
+          FloatBits -> {
+            let f = handed({ st: acc.st, arg: args.get(i) }, RFloat, at);
+            let b = bound_as(
+              f.st,
+              int_type(),
+              RInt,
+              Prim({ op: b"bits", on: RFloat, args: [f.arg] }),
+              at,
+            );
+            { st: b.st, args: acc.args.push(b.arg) }
+          },
+          Text -> {
+            let a = addressed(acc.st, args.get(i), at);
+            { st: a.st, args: acc.args.push(a.address).push(a.count) }
+          },
+          Object -> {
+            let h = handed({ st: acc.st, arg: args.get(i) }, RWord, at);
+            { st: h.st, args: acc.args.push(h.arg) }
+          },
+        },
+    );
+    match m.answer {
+      Nothing -> unit_after(cx, native_done(given.st, m.name, given.args, m.fails, at), at),
+      WithBits -> native_int(given.st, m.name, given.args, m.fails, at),
+      WithFloat -> {
+        let b = native_int(given.st, m.name, given.args, m.fails, at);
+        bound_as(
+          b.st,
+          named_type(b"Float"),
+          RFloat,
+          Prim({ op: b"of_bits", on: RInt, args: [b.arg] }),
+          at,
+        )
+      },
+      WithBytes -> {
+        let n = native_int(given.st, m.name, given.args, m.fails, at);
+        taken_out(n.st, n.arg, ty, at)
+      },
+      WithObject -> {
+        let w = bound_as(
+          given.st,
+          ty,
+          RWord,
+          Native({
+            name: native_of(m.name),
+            args: given.args,
+            uses: answering(given.args, m.fails),
+          }),
+          at,
+        );
+        handed(w, held_as(cx.setting, ty), at)
+      },
+    }
+  }
+
+/// A `Decimal` written as the two words of its object, which it is boxed into for them.
+fn decimal_out(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / {abort.raise} =
+  match args {
+    [d] -> {
+      let ty = named_type(b"Decimal");
+      let boxed = handed({ st: st, arg: d }, RWord, at);
+      let w = word_var(boxed);
+      match w {
+        None -> refuse(boxed.st, Handling, b"a `Decimal` no variable holds"),
+        Some(v) -> {
+          let lo = bound_as(
+            boxed.st,
+            int_type(),
+            RInt,
+            Get({ of: v, path: PField({ name: b"lo", at: 0 }) }),
+            at,
+          );
+          let hi = bound_as(
+            lo.st,
+            int_type(),
+            RInt,
+            Get({ of: v, path: PField({ name: b"hi", at: 1 }) }),
+            at,
+          );
+          unit_after(cx, native_done(hi.st, b"?out_decimal", [lo.arg, hi.arg], false, at), at)
+        },
+      }
+    },
+    _ -> refuse(st, Handling, b"a `Decimal` written other than alone"),
+  }
+
+/// A width written as its place among the runtime's widths and its bits: up to 64 its own bits
+/// extended to a word as its sign says, past 64 the two words of its object.
+fn fixed_out(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / {abort.raise} =
+  match args {
+    [x] -> match width_of(type_of(x)) {
+      None -> refuse(st, Handling, b"a width written of no width's type"),
+      Some(w) -> if w.bits <= 64 {
+        let h = handed({ st: st, arg: x }, RNum(w), at);
+        let lo = bound_as(
+          h.st,
+          int_type(),
+          RInt,
+          Prim({ op: b"narrow", on: RNum(w), args: [h.arg] }),
+          at,
+        );
+        unit_after(
+          cx,
+          native_done(lo.st, b"?out_fixed", [AInt(width_index(w)), lo.arg, AInt(0)], false, at),
+          at,
+        )
+      } else {
+        let boxed = handed({ st: st, arg: x }, RWord, at);
+        match word_var(boxed) {
+          None -> refuse(boxed.st, Handling, b"a wide width no variable holds"),
+          Some(v) -> {
+            let lo = bound_as(
+              boxed.st,
+              int_type(),
+              RInt,
+              Get({ of: v, path: PField({ name: b"lo", at: 0 }) }),
+              at,
+            );
+            let hi = bound_as(
+              lo.st,
+              int_type(),
+              RInt,
+              Get({ of: v, path: PField({ name: b"hi", at: 1 }) }),
+              at,
+            );
+            unit_after(
+              cx,
+              native_done(hi.st, b"?out_fixed", [AInt(width_index(w)), lo.arg, hi.arg], false, at),
+              at,
+            )
+          },
+        }
+      },
+    },
+    _ -> refuse(st, Handling, b"a width written other than alone"),
+  }
+
+/// A `Decimal` read as its two words, the low one answered and the high one kept for `?in_high`,
+/// made the runtime's object of them and held as the type holds it.
+fn decimal_in(cx: Context, st: Lowering, ty: Type, at: Span) -> Lowered / {abort.raise} = {
+  let lo = native_int(st, b"?in_decimal", [], true, at);
+  let hi = native_int(lo.st, b"?in_high", [], false, at);
+  let w = bound_as(
+    hi.st,
+    named_type(b"Decimal"),
+    RWord,
+    Native({ name: b"rt_box_decimal_p", args: [lo.arg, hi.arg], uses: answering([], false) }),
+    at,
+  );
+  handed(w, held_as(cx.setting, named_type(b"Decimal")), at)
+}
+
+/// A width of type `ty` read as its place among the runtime's widths says: up to 64 bits its low
+/// word narrowed to it, past 64 its two words made the runtime's object.
+fn fixed_in(cx: Context, st: Lowering, ty: Type, at: Span) -> Lowered / {abort.raise} =
+  match width_of(ty) {
+    None -> refuse(st, Handling, b"a width read at no width's type"),
+    Some(w) -> {
+      let lo = native_int(st, b"?in_fixed", [AInt(width_index(w))], true, at);
+      if w.bits <= 64 {
+        bound_as(lo.st, ty, RNum(w), Prim({ op: b"narrow", on: RInt, args: [lo.arg] }), at)
+      } else {
+        let hi = native_int(lo.st, b"?in_high", [], false, at);
+        let o = bound_as(
+          hi.st,
+          ty,
+          RWord,
+          Native({
+            name: b"rt_box_wide_p",
+            args: [lo.arg, hi.arg, AInt(width_index(w))],
+            uses: answering([], false),
+          }),
+          at,
+        );
+        handed(o, held_as(cx.setting, ty), at)
+      }
+    },
+  }
+
+fn width_of(ty: Type) -> Option<Width> =
+  match ty { TyCon(c) -> if c.args.len() == 0 { width_named(c.name) } else { None }, _ -> None }
+
+fn word_var(l: Lowered) -> Option<Var> = match l.arg { AVar(v) -> Some(v), _ -> None }
+
+/// The address of the bytes the byte string or string `b` holds, borrowed from it, and how many.
+pub fn addressed(st: Lowering, b: Arg, at: Span) -> { st: Lowering, address: Arg, count: Arg } = {
+  let w = handed({ st: st, arg: b }, RWord, at);
+  match word_var(w) {
+    None ->
+      {
+        st: refuse(w.st, Handling, b"a byte string no variable holds").st,
+        address: AInt(0),
+        count: AInt(0),
+      },
+    Some(v) -> {
+      let a = bound_as(w.st, int_type(), RAddr, Get({ of: v, path: PPayload }), at);
+      let n = bound_as(
+        a.st,
+        int_type(),
+        RInt,
+        Op({
+          op: OContainer(Length),
+          args: [AVar(v)],
+          uses: { takes: [false], owned: false, fails: false, stops: false },
+        }),
+        at,
+      );
+      { st: n.st, address: a.arg, count: n.arg }
+    },
+  }
+}
+
+/// The `n` bytes the context's crossing holds copied out into a fresh value of type `ty`, a byte
+/// string or a string.
+pub fn taken_out(st: Lowering, n: Arg, ty: Type, at: Span) -> Lowered =
+  bound_as(
+    st,
+    ty,
+    RWord,
+    Op({
+      op: OContainer(Taken),
+      args: [n],
+      uses: { takes: [false], owned: true, fails: true, stops: false },
+    }),
+    at,
+  )
+
+/// The C helper crossing native `name` is called through.
+fn native_of(name: Bytes) -> Bytes / {abort.raise} = builtin_helper(name).concat(b"_p")
+
+fn answering(args: List<Arg>, fails: Bool) -> Uses =
+  { takes: args.map(|_: Arg| false), owned: true, fails: fails, stops: false }
+
+/// Crossing native `name` called on `args`, which it reads, for what it does.
+fn native_done(
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  fails: Bool,
+  at: Span,
+) -> Lowering / {abort.raise} =
+  done(
+    st,
+    Native({
+      name: native_of(name),
+      args: args,
+      uses: { takes: args.map(|_: Arg| false), owned: false, fails: fails, stops: false },
+    }),
+    at,
+  )
+
+/// Crossing native `name` called on `args`, which it reads, its answer raw bits.
+fn native_int(
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  fails: Bool,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  bound_as(
+    st,
+    int_type(),
+    RInt,
+    Native({ name: native_of(name), args: args, uses: answering(args, fails) }),
+    at,
+  )
+
+/// `()`, the value of what is done for its effect alone.
+fn unit_after(cx: Context, st: Lowering, at: Span) -> Lowered / {abort.raise} =
+  literal(cx, st, LUnit, at)

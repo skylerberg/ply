@@ -1,0 +1,520 @@
+//! The operations over the bytes of strings and byte strings printed, every block laid as
+//! `layout.str_laid` says: its bytes from its payload's start, its header's `len` of them, room for
+//! as many as its field `room` holds. Emitted code makes no view; it reads one as the layout lays it.
+
+import std.bytes (ascii_of_int)
+import syntax.parsing (span_between)
+import check.types (TyCon)
+import emit.layout (str_laid, header_bytes)
+import emit.roots (builtin_helper)
+import emit.pieces (spelled)
+import emit.tir (Rep, RInt, RBool, RNum, RWord, RAddr, Var, Arg, AVar, AInt, Containers, var_said)
+import emit.tir.strings (StringOp, Made, Copied, ByteSet, ByteRead, U32Read, Grown, Compared, Found,
+                         CharsIn, CharStart, Scanned)
+import emit.print.text (Printing, Place, printing, line, named, name_of, arg_text, assigned, check,
+                        unprinted)
+import emit.c (KInt, KNum, ctype)
+
+/// Operation `op` over `args`, answering into `into` where it answers.
+pub fn string_op(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  op: StringOp,
+  args: List<Arg>,
+) -> Printing / {abort.raise} = {
+  let a = |k: Int| match args.at(k) { Some(x) -> arg_text(pr, x), None -> b"0" };
+  match op {
+    Copied ->
+      line(
+        pr,
+        p.depth,
+        Bytes::concat_all([
+          b"memcpy(",
+          bytes_of(a(0)),
+          b" + ",
+          a(1),
+          b", ",
+          at_address(a(2)),
+          b" + ",
+          a(3),
+          b", (size_t)",
+          a(4),
+          b");",
+        ]),
+      ),
+    ByteSet ->
+      line(
+        pr,
+        p.depth,
+        Bytes::concat_all([bytes_of(a(0)), b"[", a(1), b"] = (unsigned char)", a(2), b";"]),
+      ),
+    _ -> match into {
+      None ->
+        unprinted(
+          Containers,
+          b"an operation over a string's bytes whose answer goes unread",
+          ascii_of_int(args.len()),
+        ),
+      Some(v) -> answered(p, pr, v, op, args.map(|x: Arg| arg_text(pr, x))),
+    },
+  }
+}
+
+fn answered(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: StringOp,
+  operands: List<Bytes>,
+) -> Printing / {abort.raise} = {
+  let a = |k: Int| match operands.at(k) { Some(x) -> x, None -> b"0" };
+  let d = p.depth;
+  let set = |e: Bytes| assigned(pr, d, v, c_type(v.rep), e);
+  // `v` declared at `start`, then set by the C `body` writes of its name.
+  let computed = |start: Bytes, body: (Bytes) -> Bytes| {
+    let declared = assigned(pr, d, v, c_type(v.rep), start);
+    line(declared, d, body(name_of(declared, v)))
+  };
+  match op {
+    Made -> {
+      let n = named(pr, v);
+      fresh(p, line(n.pr, d, Bytes::concat_all([b"Word ", n.name, b";"])), n.name, a(0), a(0))
+    },
+    Grown -> grown(p, pr, v, a(0), a(1), a(2)),
+    ByteRead -> set(Bytes::concat_all([b"(int64_t)", at_address(a(0)), b"[", a(1), b"]"])),
+    U32Read ->
+      computed(b"0", |x: Bytes|
+        Bytes::concat_all([
+          b"{ uint32_t sw; memcpy(&sw, ",
+          at_address(a(0)),
+          b" + ",
+          a(1),
+          b", 4); ",
+          x,
+          b" = ply_le32(sw); }",
+        ])),
+    Compared ->
+      set(
+        Bytes::concat_all([
+          b"memcmp(",
+          at_address(a(0)),
+          b" + ",
+          a(1),
+          b", ",
+          at_address(a(2)),
+          b" + ",
+          a(3),
+          b", (size_t)",
+          a(4),
+          b") == 0",
+        ]),
+      ),
+    Found ->
+      computed(b"-1", |x: Bytes|
+        Bytes::concat_all([
+          b"{ const unsigned char *sh = ",
+          at_address(a(0)),
+          b", *sd = ",
+          at_address(a(2)),
+          b"; int64_t sn = ",
+          a(3),
+          b"; for (int64_t si = ",
+          a(4),
+          b"; si + sn <= ",
+          a(1),
+          b"; si++) if (sn == 0 || (sh[si] == sd[0] && memcmp(sh + si, sd, (size_t)sn) == 0)) { ",
+          x,
+          b" = si; break; } }",
+        ])),
+    CharsIn ->
+      computed(b"0", |x: Bytes|
+        Bytes::concat_all([
+          b"{ const unsigned char *sh = ",
+          at_address(a(0)),
+          b"; for (int64_t si = 0; si < ",
+          a(1),
+          b"; si++) ",
+          x,
+          b" += (sh[si] & 0xC0) != 0x80; }",
+        ])),
+    CharStart ->
+      computed(b"-1", |x: Bytes|
+        Bytes::concat_all([
+          b"{ const unsigned char *sh = ",
+          at_address(a(0)),
+          b"; int64_t sk = ",
+          a(2),
+          b", sc = 0, si = 0; if (sk >= 0) { for (; si < ",
+          a(1),
+          b"; si++) if ((sh[si] & 0xC0) != 0x80) { if (sc == sk) break; sc++; } if (si < ",
+          a(1),
+          b" || sc == sk) ",
+          x,
+          b" = si; } }",
+        ])),
+    Scanned(s) ->
+      computed(b"0", |x: Bytes|
+        Bytes::concat_all([
+          b"{ const unsigned char *sh = ",
+          at_address(a(0)),
+          b", *sd = ",
+          at_address(a(3)),
+          b"; uint64_t set[4] = {0, 0, 0, 0}; for (int64_t si = 0; si < ",
+          a(4),
+          b"; si++) set[sd[si] >> 6] |= (uint64_t)1 << (sd[si] & 63); int64_t se = ",
+          a(1),
+          b" - ",
+          a(2),
+          b" < ",
+          a(5),
+          b" ? ",
+          a(1),
+          b" : ",
+          a(2),
+          b" + ",
+          a(5),
+          b"; ",
+          x,
+          b" = se; for (int64_t si = ",
+          a(2),
+          b"; si < se; si++) if ((int)((set[sh[si] >> 6] >> (sh[si] & 63)) & 1) == ",
+          if s.until { b"1" } else { b"0" },
+          b") { ",
+          x,
+          b" = si; break; } }",
+        ])),
+    _ -> unprinted(Containers, b"an operation that answers nothing, answering", var_said(v)),
+  }
+}
+
+/// `x` with `n` bytes from `src` appended, into `v`: in place where `x`'s one count was handed over
+/// and its room holds them, else a fresh block of twice the room needed, `x` let go of.
+fn grown(p: Place, pr: Printing, v: Var, x: Bytes, src: Bytes, n: Bytes) -> Printing = {
+  let declared = named(pr, v);
+  let o = declared.name;
+  let laid = str_laid();
+  let d = p.depth;
+  let opened = line(
+    declared.pr,
+    d,
+    Bytes::concat_all([
+      b"Word ",
+      o,
+      b"; { int64_t sl = (int64_t)",
+      field(x, b"len"),
+      b", sn = ",
+      n,
+      b"; if (ply_obj(",
+      x,
+      b")->rc == 1 && !(",
+      field(x, laid.flags),
+      b" & ",
+      ascii_of_int(laid.view),
+      b") && (int64_t)",
+      field(x, laid.room),
+      b" >= sl + sn) { memcpy(",
+      bytes_of(x),
+      b" + sl, ",
+      at_address(src),
+      b", (size_t)sn); ",
+      field(x, b"len"),
+      b" = (uint32_t)(sl + sn); ",
+      o,
+      b" = ",
+      x,
+      b"; } else {",
+    ]),
+  );
+  let made = fresh(
+    { ..p, depth: d + 1 },
+    opened,
+    o,
+    b"sl + sn",
+    b"(sl + sn < 8 ? 8 : sl + sn > 0x7fffffff ? sl + sn : 2 * (sl + sn))",
+  );
+  line(
+    made,
+    d,
+    Bytes::concat_all([
+      b"  memcpy(",
+      bytes_of(o),
+      b", ",
+      read_bytes(x),
+      b", (size_t)sl); memcpy(",
+      bytes_of(o),
+      b" + sl, ",
+      at_address(src),
+      b", (size_t)sn); if (ply_last(ctx, ",
+      x,
+      b")) ply_free(ctx, ",
+      x,
+      b", ",
+      block_bytes(x),
+      b"); } }",
+    ]),
+  )
+}
+
+/// `o`, declared already, set to a fresh block of `len` bytes with room for `room`.
+fn fresh(p: Place, pr: Printing, o: Bytes, len: Bytes, room: Bytes) -> Printing = {
+  let laid = str_laid();
+  line(
+    pr,
+    p.depth,
+    Bytes::concat_all([
+      b"{ int64_t sr = ",
+      room,
+      b"; ",
+      o,
+      b" = (Word)rt_alloc_bytes_p(ctx, ",
+      ascii_of_int(header_bytes()),
+      b" + ((sr + 7) & ~(int64_t)7)); ",
+      field(o, b"len"),
+      b" = (uint32_t)(",
+      len,
+      b"); ",
+      field(o, laid.room),
+      b" = (uint32_t)sr; }",
+    ]),
+  )
+}
+
+/// The bytes of the block `x` as its free reads their size, a view's or its room's, its header
+/// among them.
+fn block_bytes(x: Bytes) -> Bytes = {
+  let laid = str_laid();
+  Bytes::concat_all([
+    b"(",
+    field(x, laid.flags),
+    b" & ",
+    ascii_of_int(laid.view),
+    b" ? ",
+    ascii_of_int(header_bytes() + 8 * laid.view_words),
+    b" : ",
+    ascii_of_int(header_bytes()),
+    b" + (((int64_t)",
+    field(x, laid.room),
+    b" + 7) & ~(int64_t)7))",
+  ])
+}
+
+/// The bytes `n` taken bytes of the context's crossing are copied into, a fresh block, into `v`.
+pub fn taken_printed(p: Place, pr: Printing, v: Var, n: Arg) -> Printing / {abort.raise} = {
+  let count = arg_text(pr, n);
+  let declared = named(pr, v);
+  let o = declared.name;
+  let made = fresh(
+    p,
+    line(declared.pr, p.depth, Bytes::concat_all([b"Word ", o, b";"])),
+    o,
+    count,
+    count,
+  );
+  check(
+    p,
+    line(
+      made,
+      p.depth,
+      Bytes::concat_all([
+        builtin_helper(b"?taken"),
+        b"_p(ctx, (Word)(intptr_t)",
+        bytes_of(o),
+        b", ",
+        count,
+        b");",
+      ]),
+    ),
+  )
+}
+
+/// The address of the bytes the block `of` holds, into `v`: its own, or a view's where it views them.
+pub fn payload_printed(p: Place, pr: Printing, v: Var, of: Var) -> Printing =
+  assigned(pr, p.depth, v, c_type(v.rep), b"(Word)(intptr_t)".concat(read_bytes(name_of(pr, of))))
+
+/// The first byte of the block `x`, a view's where it views them, as an `unsigned char *`.
+fn read_bytes(x: Bytes) -> Bytes = {
+  let laid = str_laid();
+  Bytes::concat_all([
+    b"((",
+    field(x, laid.flags),
+    b" & ",
+    ascii_of_int(laid.view),
+    b") ? (unsigned char *)ply_words(ply_words(",
+    x,
+    b")[",
+    ascii_of_int(laid.viewed),
+    b"]) + ply_words(",
+    x,
+    b")[",
+    ascii_of_int(laid.from),
+    b"] : ",
+    bytes_of(x),
+    b")",
+  ])
+}
+
+/// The payload of the block `x`, which is no view, as an `unsigned char *`.
+fn bytes_of(x: Bytes) -> Bytes = Bytes::concat_all([b"((unsigned char *)ply_words(", x, b"))"])
+
+/// The address an `RAddr` holds, as an `unsigned char *`.
+fn at_address(a: Bytes) -> Bytes = Bytes::concat_all([b"((unsigned char *)(intptr_t)", a, b")"])
+
+fn field(x: Bytes, f: Bytes) -> Bytes = Bytes::concat_all([b"ply_obj(", x, b")->", f])
+
+/// The C type of what an operation here answers: an integer's, a width's, else a word, an address
+/// among them. `print.made` imports this module, so its `c_type` is not read here.
+fn c_type(r: Rep) -> Bytes =
+  match r { RInt -> ctype(KInt), RBool -> ctype(KInt), RNum(w) -> ctype(KNum(w)), _ -> b"Word" }
+
+/// Where an instruction of a root answering a word is printed, at the body's own depth.
+fn at_top() -> Place =
+  {
+    u: {
+      symbol: b"ply_m_1f_1",
+      base: 0,
+      answer: RWord,
+      site: None,
+      arm: None,
+      looping: None,
+      landing: None,
+      group: None,
+      leaving: b"ctx->fuel += 1;",
+    },
+    at: span_between(10, 20),
+    leave: b"return 0;",
+    depth: 0,
+  }
+
+fn local(id: Int, ty: Bytes, rep: Rep) -> Var =
+  { id: id, ty: TyCon({ name: ty, args: [] }), rep: rep }
+
+/// What `op` over `args` prints, its operands' variables named `p0`, `p1`, ...
+fn printed(op: StringOp, into: Option<Var>, args: List<Arg>) -> Bytes / {abort.raise} =
+  spelled(
+    string_op(
+      at_top(),
+      printing(
+        range(0, 6).fold(Map::new(), |m: Map<Int, Bytes>, i: Int|
+          m.insert(i, b"p".concat(ascii_of_int(i)))),
+      ),
+      into,
+      op,
+      args,
+    ).out,
+  )
+
+fn has(text: Bytes, part: Bytes) -> Bool = text.index_of(part) != None
+
+/// Where `part` first stands in `text`, or -1.
+fn place(text: Bytes, part: Bytes) -> Int =
+  match text.index_of(part) { Some(i) -> i, None -> 0 - 1 }
+
+test "a fresh block takes its header and its room rounded up to a word, and holds its length and room" {
+  let made = printed(Made, Some(local(9, b"String", RWord)), [AVar(local(0, b"Int", RInt))]);
+  let room = Bytes::concat_all([b"ply_obj(t1)->", str_laid().room, b" = (uint32_t)sr"]);
+  assert(has(made, b"Word t1;"), None);
+  assert(has(made, b"int64_t sr = p0;"), None);
+  assert(
+    has(
+      made,
+      Bytes::concat_all([b"rt_alloc_bytes_p(ctx, ", ascii_of_int(header_bytes()), b" + ((sr + 7)"]),
+    ),
+    None,
+  );
+  assert(has(made, b"ply_obj(t1)->len = (uint32_t)(p0)"), None);
+  assert(has(made, room), None)
+}
+
+test "a block grows in place only through its one count and its room, and is let go of by its size else" {
+  let grown = printed(Grown, Some(local(9, b"Bytes", RWord)), [
+    AVar(local(0, b"Bytes", RWord)),
+    AVar(local(1, b"Int", RAddr)),
+    AVar(local(2, b"Int", RInt)),
+  ]);
+  assert(has(grown, b"ply_obj(p0)->rc == 1"), None);
+  assert(has(grown, Bytes::concat_all([b"& ", ascii_of_int(str_laid().view), b")"])), None);
+  assert(has(grown, Bytes::concat_all([b"ply_obj(p0)->", str_laid().room, b" >= sl + sn"])), None);
+  // Out of place, the old bytes are copied before the block is let go of.
+  let copy = place(grown, b"(size_t)sl)");
+  let free = place(grown, b"if (ply_last(ctx, p0)) ply_free(ctx, p0, ");
+  assert(copy > 0 && free > copy, None)
+}
+
+test "what writes bytes answers nothing, and what reads them answers into its variable" {
+  let written = printed(Copied, None, [
+    AVar(local(0, b"Bytes", RWord)),
+    AInt(0),
+    AVar(local(2, b"Int", RAddr)),
+    AVar(local(3, b"Int", RInt)),
+    AVar(local(4, b"Int", RInt)),
+  ]);
+  assert(
+    has(
+      written,
+      b"memcpy(((unsigned char *)ply_words(p0)) + INT64_C(0), ((unsigned char *)(intptr_t)p2) + p3, (size_t)p4);",
+    ),
+    None,
+  );
+  let same = printed(Compared, Some(local(9, b"Bool", RBool)), [
+    AVar(local(0, b"Int", RAddr)),
+    AInt(0),
+    AVar(local(2, b"Int", RAddr)),
+    AInt(0),
+    AVar(local(4, b"Int", RInt)),
+  ]);
+  assert(has(same, b" t1 = memcmp("), None);
+  assert(has(same, b"(size_t)p4) == 0;"), None);
+  let found = printed(Found, Some(local(9, b"Int", RInt)), [
+    AVar(local(0, b"Int", RAddr)),
+    AVar(local(1, b"Int", RInt)),
+    AVar(local(2, b"Int", RAddr)),
+    AVar(local(3, b"Int", RInt)),
+    AInt(0),
+  ]);
+  assert(has(found, b"int64_t t1 = -1;"), None);
+  assert(has(found, b"t1 = si; break;"), None)
+}
+
+test "bytes a crossing answered are copied into a fresh block of as many, and the copy can fail" {
+  let pr = taken_printed(
+    at_top(),
+    printing(Map::new().insert(0, b"p0")),
+    local(9, b"String", RWord),
+    AVar(local(0, b"Int", RInt)),
+  );
+  let t = spelled(pr.out);
+  let made = place(t, b"rt_alloc_bytes_p");
+  let copied = place(
+    t,
+    b"builtin_elaborated_taken_p(ctx, (Word)(intptr_t)((unsigned char *)ply_words(t1)), p0);",
+  );
+  assert(made > 0 && copied > made, None);
+  assert(has(t, b"if (ctx->failed) return 0;"), None)
+}
+
+test "a byte is read as an Int, four as a U32 least significant first, and characters by their lead bytes" {
+  let address = AVar(local(0, b"Int", RAddr));
+  let at = AVar(local(1, b"Int", RInt));
+  let byte = printed(ByteRead, Some(local(9, b"Int", RInt)), [address, at]);
+  assert(has(byte, b"int64_t t1 = (int64_t)((unsigned char *)(intptr_t)p0)[p1];"), None);
+  let four = printed(U32Read, Some(local(9, b"U32", RNum({ bits: 32, signed: false }))), [
+    address,
+    at,
+  ]);
+  assert(has(four, b"uint32_t t1 = 0;"), None);
+  assert(
+    has(four, b"memcpy(&sw, ((unsigned char *)(intptr_t)p0) + p1, 4); t1 = ply_le32(sw);"),
+    None,
+  );
+  let chars = printed(CharsIn, Some(local(9, b"Int", RInt)), [address, at]);
+  assert(has(chars, b"t1 += (sh[si] & 0xC0) != 0x80;"), None);
+  // A character past the last but one answers -1; the one just past the last, the length.
+  let start = printed(CharStart, Some(local(9, b"Int", RInt)), [
+    address,
+    at,
+    AVar(local(2, b"Int", RInt)),
+  ]);
+  assert(has(start, b"int64_t t1 = -1;"), None);
+  assert(has(start, b"if (si < p1 || sc == sk) t1 = si;"), None)
+}

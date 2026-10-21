@@ -19,8 +19,6 @@ use std::sync::atomic::AtomicI64;
 
 /// A loaded C unit, with the surface `crate::backend::Bodies` asks a compiled unit for.
 pub struct Native {
-    /// Kept alive because every [`Entry`] and the descriptor below point into its pages.
-    _lib: Library,
     /// The definitions the unit holds, read where its C lays them out. The library they lie in
     /// is this unit's own, which is all that makes the lifetime true.
     unit: &'static Descriptor,
@@ -28,6 +26,9 @@ pub struct Native {
     /// Each root the unit is entered at through its `R#entered`, with that definition's entry.
     entered: HashMap<String, Entry>,
     tables: Arc<Tables>,
+    /// Kept alive because every [`Entry`], the descriptor and the unit's static data point into its
+    /// pages. Last, so it is unmapped after everything here that may hold a word of it.
+    _lib: Library,
 }
 
 fn entry_of(row: &TakenRow) -> Entry {

@@ -159,6 +159,50 @@ pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
     w
 }
 
+/// A read of the pure nullary definition at `index` in the unit's code table, which emitted code
+/// writes for a constant's read: its value's word form. The first read evaluates the definition and
+/// hands `keep`, the `keep#T` root of its type, the value, whose immortal copy the unit then keeps
+/// for good; each later read answers that copy, charged what evaluating it cost, so a read costs
+/// the same whether or not it was kept. A value `keep` answers 0 for, one that may not outlive its
+/// entry, is kept nowhere, and each read evaluates the definition again. Where the evaluation fails
+/// or raises, this answers 0 with the context as the evaluation left it, and keeps nothing.
+/// Contexts reading one definition at once, on `parallel` branches or other threads, may each
+/// evaluate it; the first copy kept is the one every later read answers.
+pub unsafe extern "C" fn rt_memo(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> Handed {
+    let tables = Arc::clone(&unsafe { &*ctx }.tables);
+    let c = unsafe { &mut *ctx };
+    let Some(&code) = usize::try_from(index.0)
+        .ok()
+        .and_then(|i| tables.functions.get(i))
+    else {
+        c.fail(err_crossing(&format!(
+            "definition {} of a code table of {}",
+            index.0,
+            tables.functions.len()
+        )));
+        return Handed::of(0);
+    };
+    let index = index.0 as usize;
+    if let Some(w) = tables.memoized(index) {
+        c.charged = c.charged.plus(tables.memo_cost(index));
+        return Handed::of(w);
+    }
+    let before = c.cost();
+    // SAFETY: as in `call_value`; a nullary function never reads the null argument pointer.
+    let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(code) };
+    let w = unsafe { f(ctx, std::ptr::null()) };
+    let c = unsafe { &mut *ctx };
+    if c.failed != 0 {
+        return Handed::of(0);
+    }
+    let cost = c.cost().minus(before);
+    let kept = unsafe { keep(ctx, w) };
+    if kept != 0 && unsafe { (*ctx).failed } == 0 {
+        tables.keep(index, kept, cost);
+    }
+    Handed::of(w)
+}
+
 /// The value a unit holds as `len` bytes of text at `text`: what a build kept of a `const`
 /// definition, read into the unit's own heap, so the entry that reads it is charged nothing.
 pub unsafe extern "C" fn rt_baked(ctx: *mut Ctx, text: i64, len: i64) -> i64 {
