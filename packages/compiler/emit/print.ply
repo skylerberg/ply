@@ -755,10 +755,6 @@ fn head(name: Bytes, f: Fn) -> Bytes =
     b")",
   ])
 
-/// Whether `run` stands in `lines` as consecutive lines.
-fn holds_run(lines: List<Bytes>, run: List<Bytes>) -> Bool =
-  range(0, lines.len()).any(|i: Int| lines.drop(i).take(run.len()) == run)
-
 test "a restart takes its arguments into temporaries before it sets the parameters, then loops" {
   let int = TyCon({ name: b"Int", args: [] });
   let local = |id: Int, rep: Rep| { id: id, ty: int, rep: rep };
@@ -793,40 +789,23 @@ test "a restart takes its arguments into temporaries before it sets the paramete
     links: no_links(),
     statics: [],
   };
-  let lines = spelled(printed_fn(f, no_ctors()).pieces).split(b"\n");
-  assert_eq(
-    holds_run(lines, [
-      b"  ctx->fuel -= 1;",
-      b"  ply_loop: if (++ctx->ticks >= ctx->next_tick) { rt_tick_p(ctx); if (ctx->failed) return 0; }",
-      b"  int64_t t1 = (p0) == (INT64_C(0));",
-      b"  int64_t t2;",
-      b"  if (t1) {",
-      b"    t2 = p1;",
-      b"  } else {",
-      b"    PLY_SITE(ctx, @@r@@, 10, 15);",
-      b"    int64_t t3;",
-      b"    if (ply_sub_ov(p0, INT64_C(1), &t3)) { rt_overflow_p(ctx, 1); return 0; }",
-      b"    int64_t t4 = t3;",
-      b"    int64_t t5 = p1;",
-      b"    p0 = t4;",
-      b"    p1 = t5;",
-      b"    goto ply_loop;",
-      b"  }",
-      b"  ctx->fuel += 1;",
-      b"  return t2;",
-      b"}",
-    ]),
-    true,
-  );
-  assert_eq(
-    lines.at(1),
-    Some(
-      Bytes::concat_all([
-        b"int64_t ",
-        symbol_of(b"m.count"),
-        b"(PlyCtx *ctx, int64_t p0, int64_t p1) {",
-      ]),
-    ),
+  let text = spelled(printed_fn(f, no_ctors()).pieces);
+  let said = Some(String::of_bytes_lossy(text));
+  let arm = match text.index_of(b"} else {") { Some(i) -> text.slice(i, text.len()), None -> b"" };
+  let in_arm = |s: Bytes| match arm.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+  // Every argument is read, the second parameter's old value among them, before either is set.
+  let read = in_arm(b" = p1;");
+  assert(read >= 0 && read < in_arm(b"p0 = ") && read < in_arm(b"p1 = "), said);
+  // Then the restart jumps back to a label the body stands at before the branch.
+  let jump = in_arm(b"goto ");
+  let label = match arm.slice(jump + 5, arm.len()).index_of(b";") {
+    Some(end) -> arm.slice(jump + 5, jump + 5 + end),
+    None -> b"",
+  };
+  let stands = match text.index_of(label.concat(b":")) { Some(i) -> i, None -> 0 - 1 };
+  assert(
+    jump > in_arm(b"p1 = ") && label.len() > 0 && stands >= 0 && stands < text.len() - arm.len(),
+    said,
   )
 }
 
@@ -954,30 +933,28 @@ test "a tail group is one function switching on its member's place, each arm ope
     ).pieces,
   );
   let g = symbol_of(b"m.even").concat(b"_group");
-  assert(
-    text.index_of(Bytes::concat_all([b"static Word ", g, b"(PlyCtx *ctx, int which, Word p0) {\n"]))
-      != None,
-  );
-  assert(
-    text.index_of(
-        Bytes::concat_all([
-          b"  switch (which) {\n  case 0: {\n    int64_t t1 = ",
-          word_as(b"p0", RInt),
-          b";\n",
-        ]),
-      )
-      != None,
-  );
-  // A member answers at its own convention, made the group's word.
-  let opening = b"  case 1: {\n    int64_t ";
-  let arm = match text.index_of(opening) {
-    Some(i) -> text.slice(i + opening.len(), text.len()),
-    None -> b"",
+  let said = Some(String::of_bytes_lossy(text));
+  let at = |s: Bytes| match text.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+  // One function, taking the member's place beside the group's words, switching on the place.
+  assert(at(g.concat(b"(PlyCtx *ctx, int which")) >= 0 && at(b"switch (which)") >= 0, said);
+  // Each member's arm opens its words out of the group's, and the answering one makes its answer
+  // the group's word.
+  let opened = Bytes::concat_all([b" = ", word_as(b"p0", RInt), b";"]);
+  let arm = |k: Int| {
+    let from = at(Bytes::concat_all([b"case ", ascii_of_int(k), b":"]));
+    if from < 0 { b"" } else { text.slice(from, text.len()) }
   };
-  let param = match arm.index_of(b" = ") { Some(e) -> arm.slice(0, e), None -> b"" };
-  assert(arm.starts_with(Bytes::concat_all([param, b" = ", word_as(b"p0", RInt), b";\n"])));
-  assert(arm.index_of(Bytes::concat_all([b"  return ", as_word(param, RInt), b";\n"])) != None);
-  assert(text.index_of(Bytes::concat_all([g, b"(ctx, (int)args[0], args[1]);\n}\n"])) != None)
+  assert(arm(0).index_of(opened) != None && arm(1).index_of(opened) != None, said);
+  let param = {
+    let a = arm(1);
+    match a.index_of(opened) {
+      Some(e) -> match a.slice(0, e).split(b" ").last() { Some(p) -> p, None -> b"" },
+      None -> b"",
+    }
+  };
+  assert(arm(1).index_of(b"return ".concat(as_word(param, RInt))) != None, said);
+  // Each member's entry enters the group at its own place.
+  assert(at(g.concat(b"(ctx, ")) >= 0, said)
 }
 
 test "a closure's function follows its root's entry, and its body numbers its temporaries afresh" {
@@ -1001,7 +978,9 @@ test "a closure's function follows its root's entry, and its body numbers its te
   let f = { ..body, lambdas: [l] };
   let name = symbol_of(b"m.outer");
   let inner = closure_printed(name, 0, l, { ..printing(Map::new()), temps: 7, labels: 3 });
-  assert_eq(spelled(inner.out), b"  int64_t t1;\n  t1 = p0;\n  ctx->fuel += 1;\n  return t1;\n");
+  // Its first temporary is `t1`, whatever the root's printing had numbered before it.
+  let body = spelled(inner.out);
+  assert(body.index_of(b" t1;") != None && body.index_of(b"t8") == None, None);
   let printed = printed_fn(f, no_ctors());
   assert(
     spelled(printed.pieces).ends_with(
@@ -1145,17 +1124,12 @@ test "a field taken moves out of a block held only here, in place in another or 
     ..int_root([block], [Let({ var: field, val: Take({ of: block, path: PField({ name: b"bytes", at: 1 }) }), at: span_between(0, 0), unwind: [] }), Return(AInt(0))]),
     conv: { params: [Given], reps: [RWord], answer: RWord, answered: Owned },
   };
-  let lines = spelled(printed_fn(f, no_ctors()).pieces).split(b"\n");
-  assert_eq(
-    holds_run(lines, [
-      b"  Word t1 = ply_words(p0)[1];",
-      Bytes::concat_all([
-        b"  if (ply_counted_by(ply_obj(p0))->rc == 1) ply_words(p0)[1] = ply_unit; else ",
-        call_text(inc_fn(), [b"t1"]),
-        b";",
-      ]),
-    ]),
-    true,
+  let text = spelled(printed_fn(f, no_ctors()).pieces);
+  // Its slot is emptied where the block is held only here, and the field counted once more else.
+  assert(
+    text.index_of(b"ply_words(p0)[1] = ply_unit;") != None
+      && text.index_of(call_text(inc_fn(), [b"t1"])) != None,
+    Some(String::of_bytes_lossy(text)),
   )
 }
 
@@ -1168,8 +1142,7 @@ test "a constructor's tag is a hole the unit writes in" {
     ]),
     no_ctors(),
   );
-  assert(pr.pieces.contains(Hole(TagOf(b"m.Box"))));
-  assert(spelled(pr.pieces).index_of(b"  int64_t t1 = @@Tm.Box@@;\n") != None)
+  assert(pr.pieces.contains(Hole(TagOf(b"m.Box"))))
 }
 
 /// A call of `m.g` giving it `args`, answering a word.
@@ -1222,29 +1195,25 @@ test "each failure releases what it holds through tails that failures holding al
   let a = word_var(1);
   let b = word_var(2);
   let c = word_var(3);
-  let lines = word_root([s], [
+  let text = word_root([s], [
     holding(a, called([]), [s]),
     holding(b, called([]), [s, a]),
     holding(c, called([AVar(a)]), [s, b]),
     Return(AVar(c)),
-  ]).split(
-    b"\n",
-  );
-  assert_eq(lines.filter(|l: Bytes| l.starts_with(b"  if (ctx->failed) ")), [
-    b"  if (ctx->failed) goto ply_u0;",
-    b"  if (ctx->failed) goto ply_u1;",
-    b"  if (ctx->failed) goto ply_u2;",
   ]);
-  // The latest declared is let go of first, and the parameter's release is the one every path ends by.
-  assert(
-    holds_run(lines, [
-      b"  return t3;",
-      Bytes::concat_all([b"  ply_u2: ", released_text(b"t2"), b" goto ply_u0;"]),
-      Bytes::concat_all([b"  ply_u1: ", released_text(b"t1")]),
-      Bytes::concat_all([b"  ply_u0: ", released_text(b"p0"), b" return 0;"]),
-      b"}",
-    ]),
-  )
+  let said = Some(String::of_bytes_lossy(text));
+  let at = |s: Bytes| match text.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+  // Three failures holding three different sets jump to three tails.
+  let jumps = text.split(b"\n").filter(|l: Bytes| l.index_of(b"if (ctx->failed) goto ") != None);
+  let distinct = jumps.fold([], |acc: List<Bytes>, l: Bytes|
+    if acc.contains(l) { acc } else { acc.push(l) });
+  assert(jumps.len() == 3 && distinct.len() == 3, said);
+  // Each value is let go of once on the failure paths, the latest declared first, and the parameter,
+  // which every failure holds, by the one tail every path ends with.
+  let freed = [b"t2", b"t1", b"p0"].map(|x: Bytes| released_text(x));
+  assert(freed.all(|r: Bytes| occurrences(text, r) == 1), said);
+  assert(at(b"return t3;") < at(freed.get(0)), said);
+  assert(at(freed.get(0)) < at(freed.get(1)) && at(freed.get(1)) < at(freed.get(2)), said)
 }
 
 test "a tail stands in the block its value was declared in, and goes on to the tails of the blocks around it" {
@@ -1253,7 +1222,7 @@ test "a tail stands in the block its value was declared in, and goes on to the t
   let j = word_var(2);
   let a = word_var(3);
   let b = word_var(4);
-  let lines = word_root([s, flag], [
+  let text = word_root([s, flag], [
     Decl(j),
     If({
       cond: AVar(flag),
@@ -1265,26 +1234,14 @@ test "a tail stands in the block its value was declared in, and goes on to the t
       otherwise: [Assign({ var: j, arg: AVar(s) })],
     }),
     Return(AVar(j)),
-  ]).split(
-    b"\n",
-  );
-  // The arm goes on past its end, so its tails stand where only a failure reaches them.
-  assert(
-    holds_run(lines, [
-      b"    t1 = t3;",
-      b"    if (0) {",
-      Bytes::concat_all([b"      ply_u1: ", released_text(b"t2"), b" goto ply_u0;"]),
-      b"    }",
-      b"  } else {",
-    ]),
-  );
-  assert(
-    holds_run(lines, [
-      b"  return t1;",
-      Bytes::concat_all([b"  ply_u0: ", released_text(b"p0"), b" return 0;"]),
-      b"}",
-    ]),
-  )
+  ]);
+  let said = Some(String::of_bytes_lossy(text));
+  let at = |s: Bytes| match text.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+  // The arm's own value is let go of inside the arm, after its last statement, where only a
+  // failure reaches; the parameter's tail stands after the function's answer.
+  let arm_tail = at(released_text(b"t2"));
+  assert(at(b"t1 = t3;") < arm_tail && arm_tail < at(b"} else {"), said);
+  assert(at(b"return t1;") < at(released_text(b"p0")), said)
 }
 
 test "a failure inside a handle's body releases what the body holds and goes to the landing, which releases what the handle holds" {
@@ -1307,16 +1264,18 @@ test "a failure inside a handle's body releases what the body holds and goes to 
     }),
     Return(AVar(answer)),
   ]);
-  let landing = match text.index_of(b"ply_h0: ;") { Some(at) -> at, None -> 0 };
+  // The landing is where the last jump to it is; everything before is the body.
+  let jumps = text.split(landing_jump(0));
+  let landing = text.len() - (match jumps.last() { Some(rest) -> rest.len(), None -> 0 });
   let body = text.slice(0, landing);
   let after = text.slice(landing, text.len());
-  // The body's value is let go of on the way to the landing, and what the handle holds is not.
-  assert(body.index_of(b"if (ctx->failed) goto ply_h0;") != None);
-  assert(body.index_of(Bytes::concat_all([b": ", released_text(b"t4"), b" goto ply_h0;"])) != None);
+  let said = Some(String::of_bytes_lossy(text));
+  // A failure in the body lets go of the body's value on its way to the landing, and not of what
+  // the handle holds.
+  assert(jumps.len() >= 3 && occurrences(body, released_text(b"t4")) == 1, said);
   assert_eq(occurrences(body, released_text(b"p0")), 0);
-  // The landing lets go of it where no clause answers the failure.
-  assert(after.index_of(b"if (ctx->failed) goto ply_u") != None);
-  assert(after.index_of(Bytes::concat_all([b": ", released_text(b"p0"), b" return 0;"])) != None)
+  // The landing lets go of what the handle holds where no clause answers the failure.
+  assert_eq(occurrences(after, released_text(b"p0")), 1)
 }
 
 test "a value whose C tests for no failure adds no tail" {

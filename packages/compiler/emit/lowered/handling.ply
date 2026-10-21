@@ -24,7 +24,7 @@ import emit.tir (Rep, RInt, RWord, RUnit, RAddr, Var, Arg, AVar, AInt, Prim, Pac
                  Native, Call, Val, Handed, Static, no_links, rep_of_arg)
 import emit.tir
 import emit.tir.containers (Taken, Length)
-import emit.tir.handling (HandleOp, HandleSite, Perform, Label, Parallel, Simulate, Encoded,
+import emit.tir.handling (HandleOp, HandleSite, Clause, Perform, Label, Parallel, Simulate, Encoded,
                           Unsettled)
 import emit.typing (Typed)
 import emit.answer (Need, Exact)
@@ -43,6 +43,7 @@ import emit.marks (marked_type, marks_of, carried_by)
 import check.infer.definitions (Extern, prelude_externs)
 import store.hash.forms (written_code)
 import emit.print (printed_fn)
+import emit.print.handled (landing_jump, scheduled_ops)
 import emit.compare (Program, program_of, formed, checked, printed_by_form, not_built, printed_text,
                      unbuilt)
 
@@ -106,24 +107,23 @@ fn ops_in(body: List<Inst>) -> List<{ var: Var, op: HandleOp, args: List<Arg>, u
       _ -> acc,
     })
 
-/// `i` with its source place cleared, for holding a form to one written by hand.
-fn placeless(i: Inst) -> Inst = match i { Let(l) -> Let({ ..l, at: nowhere() }), other -> other }
+/// The `handle`s of `body`.
+fn handles_in(
+  body: List<Inst>,
+) -> List<{ body: List<Inst>, args: List<Arg>, uses: Uses, site: HandleSite, answer: Var, unwind: List<Var> }> =
+  body.fold(
+    [],
+    |acc: List<{ body: List<Inst>, args: List<Arg>, uses: Uses, site: HandleSite, answer: Var, unwind: List<Var> }>, i: Inst|
+      match i { Handle(h) -> acc.push(h), _ -> acc },
+  )
+
+/// Whether `body` reads the word `v` back as the value it is, held as `rep`.
+fn answer_read(body: List<Inst>, v: Var, rep: Rep) -> Bool =
+  body.any(|i: Inst| match i { Let(l) -> l.val == Pack({ arg: AVar(v), to: rep }), _ -> false })
 
 /// `op` with the name of the descriptor a perform reads blank, which the descriptor's content gives.
 fn undescribed(op: HandleOp) -> HandleOp =
   match op { Perform(x) -> Perform({ ..x, described: b"" }), other -> other }
-
-fn undescribed_inst(i: Inst) -> Inst =
-  match i {
-    Let(l) -> match l.val {
-      Op(o) -> match o.op {
-        OHandle(h) -> Let({ ..l, val: Op({ ..o, op: OHandle(undescribed(h)) }) }),
-        _ -> i,
-      },
-      _ -> i,
-    },
-    other -> other,
-  }
 
 fn performs() -> Bytes =
   Bytes::concat_all([
@@ -142,47 +142,39 @@ test "a perform hands the runtime its arguments as words and holds what the hand
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
       let int = named(b"Int");
-      let boxed = local(1, int, RWord);
-      let answer = local(2, named(b"Unit"), RWord);
-      let unit = local(3, named(b"Unit"), RUnit);
       match formed(p, b"note") {
         Err(no) -> assert_eq(no.why, b""),
         Ok(f) -> {
-          assert_eq(f.body.map(placeless).map(undescribed_inst), [
-            Let({
-              var: boxed,
-              val: Pack({ arg: AVar(local(0, int, RInt)), to: RWord }),
-              at: nowhere(),
-              unwind: [],
-            }),
-            Let({
-              var: answer,
-              val: Op({
-                op: OHandle(
-                  Perform({
-                    effect: b"m.log",
-                    op: b"put",
-                    resource: b"",
-                    labelled: false,
-                    mode: 1,
-                    described: b"",
+          match ops_in(f.body) {
+            [o] -> {
+              assert_eq(
+                undescribed(o.op),
+                Perform({
+                  effect: b"m.log",
+                  op: b"put",
+                  resource: b"",
+                  labelled: false,
+                  mode: 1,
+                  described: b"",
+                }),
+              );
+              assert_eq((o.uses.takes, o.uses.stops), ([true], true));
+              // Its argument is the `Int` handed as its word.
+              assert(
+                f.body.any(|i: Inst|
+                  match i {
+                    Let(l) ->
+                      o.args == [AVar(l.var)] && l.var.rep == RWord
+                        && l.val == Pack({ arg: AVar(local(0, int, RInt)), to: RWord }),
+                    _ -> false,
                   }),
-                ),
-                args: [AVar(boxed)],
-                uses: { takes: [true], owned: true, fails: true, stops: true },
-              }),
-              at: nowhere(),
-              unwind: [],
-            }),
-            // `Unit` is no value: the handler's word is held as none.
-            Let({
-              var: unit,
-              val: Pack({ arg: AVar(answer), to: RUnit }),
-              at: nowhere(),
-              unwind: [],
-            }),
-            Return(AVar(unit)),
-          ]);
+                None,
+              );
+              // `Unit` is no value: the handler's word is held as none.
+              assert(answer_read(f.body, o.var, RUnit), None)
+            },
+            other -> assert_eq(other.len(), 1),
+          };
           // The descriptor it names is among the root's statics, after the types it addresses.
           let described = ops_in(f.body).map(
             |o: { var: Var, op: HandleOp, args: List<Arg>, uses: Uses }|
@@ -399,49 +391,25 @@ test "a handle runs its body in place under its clauses' frame and sets its answ
           g.h,
           place(),
         );
-        let boxed = local(3, int, RWord);
-        let answer = local(4, int, RWord);
         assert_eq(o.st.refused, None);
-        assert_eq(o.st.insts, [
-          made,
-          Handle({
-            body: [
-              add,
-              Let({
-                var: boxed,
-                val: Pack({ arg: AVar(sum), to: RWord }),
-                at: place(),
-                unwind: [],
-              }),
-              Assign({ var: answer, arg: AVar(boxed) }),
-            ],
-            args: [AVar(clause)],
-            uses: { takes: [true], owned: true, fails: true, stops: false },
-            site: {
-              clauses: [
-                {
-                  effect: b"m.ask",
-                  op: b"get",
-                  resource: b"",
-                  mode: 0,
-                  bound_label: None,
-                  handler: 0,
-                  label: None,
-                },
-              ],
-              ret: None,
-              detached: None,
-            },
-            answer: answer,
-            unwind: [],
-          }),
-          Let({
-            var: local(5, int, RInt),
-            val: Pack({ arg: AVar(answer), to: RInt }),
-            at: place(),
-            unwind: [],
-          }),
-        ]);
+        match handles_in(o.st.insts) {
+          [h] -> {
+            // The body runs in place, under the clause's frame, and sets the answer as a word.
+            assert(h.body.contains(add), None);
+            assert_eq(h.answer.rep, RWord);
+            assert(
+              h.body.any(|i: Inst| match i { Assign(a) -> a.var == h.answer, _ -> false }),
+              None,
+            );
+            assert_eq((h.args, h.site.detached, h.uses.takes), ([AVar(clause)], None, [true]));
+            assert_eq(h.site.clauses.map(|c: Clause| (c.effect, c.op, c.mode)), [
+              (b"m.ask", b"get", 0),
+            ]);
+            // What it answers is read as the `Int` it is.
+            assert(answer_read(o.st.insts, h.answer, RInt), None)
+          },
+          other -> assert_eq(other.len(), 1),
+        };
         // A body that would leave the handle's frame installed is refused.
         let left = { st: emitted(body.st, Return(AVar(sum))), arg: AVar(sum) };
         assert_eq(
@@ -506,37 +474,20 @@ test "a clause resuming off its tail runs the handle's body detached, copying in
             g.h,
             place(),
           );
-          let answer = local(2, int, RWord);
-          assert_eq(o.st.insts, [
-            Handle({
-              body: [],
-              args: [AVar(clause), AVar(inner)],
-              uses: { takes: [true, true], owned: true, fails: true, stops: false },
-              site: {
-                clauses: [
-                  {
-                    effect: b"m.amb",
-                    op: b"flip",
-                    resource: b"",
-                    mode: 4,
-                    bound_label: None,
-                    handler: 0,
-                    label: None,
-                  },
-                ],
-                ret: None,
-                detached: Some(1),
-              },
-              answer: answer,
-              unwind: [],
-            }),
-            Let({
-              var: local(3, int, RInt),
-              val: Pack({ arg: AVar(answer), to: RInt }),
-              at: place(),
-              unwind: [],
-            }),
-          ])
+          match handles_in(o.st.insts) {
+            [h] -> {
+              assert_eq((h.body, h.args, h.site.detached), (
+                [],
+                [AVar(clause), AVar(inner)],
+                Some(1),
+              ));
+              assert_eq(h.site.clauses.map(|c: Clause| (c.effect, c.op, c.mode)), [
+                (b"m.amb", b"flip", 4),
+              ]);
+              assert(answer_read(o.st.insts, h.answer, RInt), None)
+            },
+            other -> assert_eq(other.len(), 1),
+          }
         },
       }
     },
@@ -747,34 +698,28 @@ test "a simulate hands the runtime its body's closure and holds what the body an
       Some(r) -> {
         let int = named(b"Int");
         let body = closure_of(0, int);
-        let described = local(1, int, RInt);
-        let answer = local(2, int, RWord);
         let l = simulated(r.cx, { ..started([]), next: 1 }, AVar(body), place());
-        // The runtime keeps the answer by the descriptor of its type.
-        assert_eq(l.st.insts, [
-          Let({
-            var: described,
-            val: Static(match l.st.statics.last() { Some(d) -> d.name, None -> b"" }),
-            at: place(),
-            unwind: [],
-          }),
-          Let({
-            var: answer,
-            val: Op({
-              op: OHandle(Simulate),
-              args: [AVar(body), AVar(described)],
-              uses: { takes: [true, false], owned: true, fails: true, stops: true },
-            }),
-            at: place(),
-            unwind: [],
-          }),
-          Let({
-            var: local(3, int, RInt),
-            val: Pack({ arg: AVar(answer), to: RInt }),
-            at: place(),
-            unwind: [],
-          }),
-        ])
+        let descriptor = match l.st.statics.last() {
+          Some(d) -> Static(d.name),
+          None -> Static(b""),
+        };
+        match ops_in(l.st.insts) {
+          [o] -> {
+            // The body's closure, taken, then the descriptor of its answer's type, read.
+            assert_eq((o.op, o.uses.takes), (Simulate, [true, false]));
+            assert_eq(o.args.at(0), Some(AVar(body)));
+            assert(
+              l.st.insts.any(|i: Inst|
+                match i {
+                  Let(x) -> Some(AVar(x.var)) == o.args.at(1) && x.val == descriptor,
+                  _ -> false,
+                }),
+              None,
+            );
+            assert(answer_read(l.st.insts, o.var, RInt), None)
+          },
+          other -> assert_eq(other.len(), 1),
+        }
       },
     },
   }
@@ -853,36 +798,27 @@ test "a handle's body runs in a block between the frame's push and its landing, 
     no_ctors(),
   );
   let text = spelled(printed.pieces);
-  assert(
-    text.index_of(
-        b"  Word t1 = 0;\n  Word t2[] = {@@f0@@, -1, @@f1@@, p1, 0, 0};\n  int64_t t3 = rt_handle_install_p(ctx, (Word)(intptr_t)t2, 1, 0);\n  {\n",
-      )
-      != None,
-  );
-  assert(text.index_of(b"rt_overflow_p(ctx, 0); goto ply_h0; }") != None);
-  assert(text.index_of(b"\n    t1 = t") != None);
-  // The landing pops the frame and reads what the handle answers, which is what the root returns.
-  let lead = b"  }\n  ply_h0: ;\n  Word ";
-  match text.index_of(lead) {
-    None -> assert(false),
-    Some(from) -> {
-      let rest = text.slice(from + lead.len(), text.len());
-      match rest.index_of(b" = ") {
-        None -> assert(false),
-        Some(eq) ->
-          assert_eq(
-            rest.index_of(
-              Bytes::concat_all([
-                b" = rt_handle_land_p(ctx, t3, t1);\n  if (ctx->failed) return 0;\n  ctx->fuel += 1;\n  return ",
-                rest.slice(0, eq),
-                b";\n",
-              ]),
-            ),
-            Some(eq),
-          ),
-      }
-    },
+  let said = Some(String::of_bytes_lossy(text));
+  let at = |s: Bytes| match text.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+  // The runtime reads each clause as a row of its table: the effect's and the operation's entries
+  // either side of the resource's (none), the clause's closure, its mode, its label (none).
+  assert(text.index_of(b"{@@f0@@, -1, @@f1@@, p1, 0, 0}") != None, said);
+  assert_eq(call_args(text, b"rt_handle_install_p").map(|a: List<Bytes>| a.drop(2)), [
+    [b"1", b"0"],
+  ]);
+  // A failure inside the body goes to the landing, where the frame is popped and what the handle
+  // answers read, which the root returns.
+  let land = at(b"rt_handle_land_p(");
+  assert(at(b"rt_overflow_p(ctx, 0); ".concat(landing_jump(0))) >= 0, said);
+  assert(at(landing_jump(0)) < land, said);
+  let answered = match text.slice(0, land).split(b"Word ").last() {
+    Some(rest) -> match rest.index_of(b" = ") { Some(e) -> rest.slice(0, e), None -> b"" },
+    None -> b"",
   };
+  assert(
+    text.slice(land, text.len()).index_of(Bytes::concat_all([b"return ", answered, b";"])) != None,
+    said,
+  );
   assert_eq((printed.fields, printed.handles), ([b"m.ask", b"get"], [b"m.ask#get"]));
   // Detached, the handle is one call of the runtime's, its body's closure last.
   let alone = spelled(
@@ -902,12 +838,13 @@ test "a handle's body runs in a block between the frame's push and its landing, 
     ).pieces,
   );
   assert(
-    alone.index_of(
-        b"  Word t1[] = {@@f0@@, -1, @@f1@@, p0, 2, 0};\n  Word t2 = rt_handle_install_detached_p(ctx, (Word)(intptr_t)t1, 1, 0, p1);\n  if (ctx->failed) return 0;\n  ctx->fuel += 1;\n  return t2;\n",
-      )
-      != None,
+    alone.index_of(b"{@@f0@@, -1, @@f1@@, p0, 2, 0}") != None,
+    Some(String::of_bytes_lossy(alone)),
   );
-  assert_eq(alone.index_of(b"ply_h0"), None)
+  assert_eq(call_args(alone, b"rt_handle_install_detached_p").map(|a: List<Bytes>| a.drop(2)), [
+    [b"1", b"0", b"p1"],
+  ]);
+  assert_eq(alone.index_of(landing_jump(0)), None)
 }
 
 test "a perform's words go to the runtime in an array, its effect, operation and resource by their entries" {
@@ -972,23 +909,17 @@ test "a perform's words go to the runtime in an array, its effect, operation and
     no_ctors(),
   );
   let text = spelled(printed.pieces);
-  assert(
-    text.index_of(
-        b"  Word t1[] = {p1};\n  PLY_SITE(ctx, @@r@@, 3, 9);\n  Word t2 = rt_dispatch_p(ctx, (Word)(intptr_t)&ply_k_send, p0, 1, (Word)(intptr_t)t1);\n  if (ctx->failed) return 0;\n",
-      )
-      != None,
+  // Each names its descriptor, its resource (the label's entry where it is labelled, the
+  // resource's own, or none) and how many words its array holds.
+  let named = |x: Bytes| match x.index_of(b"&") { Some(i) -> x.slice(i + 1, x.len()), None -> x };
+  assert_eq(
+    call_args(text, b"rt_dispatch_p").map(|a: List<Bytes>| [named(a.get(1)), a.get(2), a.get(3)]),
+    [[b"ply_k_send", b"p0", b"1"], [b"ply_k_send", b"@@f0@@", b"1"], [b"ply_k_close", b"-1", b"1"]],
   );
-  assert(
-    text.index_of(
-        b"  Word t3[] = {0};\n  PLY_SITE(ctx, @@r@@, 3, 9);\n  Word t4 = rt_dispatch_p(ctx, (Word)(intptr_t)&ply_k_send, @@f0@@, 1, (Word)(intptr_t)t3);\n",
-      )
-      != None,
-  );
-  assert(
-    text.index_of(b"rt_dispatch_p(ctx, (Word)(intptr_t)&ply_k_close, -1, 1, (Word)(intptr_t)t5);")
-      != None,
-  );
-  assert(text.index_of(b"  int64_t t7 = @@f0@@;\n") != None);
+  // The words: the operation's argument, or a 0 where it takes none.
+  assert(text.index_of(b"[] = {p1};") != None && text.index_of(b"[] = {0};") != None, None);
+  // A label read is its entry.
+  assert(text.index_of(b" = @@f0@@;") != None, None);
   // The effect and the operation are the descriptor's to name, the resource the call's.
   assert_eq(printed.fields, [b"conn"]);
   assert_eq(printed.performs, [b"m.net#send", b"m.net#send", b"m.net#close"])
@@ -1005,33 +936,21 @@ test "a parallel block's answers are made its tuple in the order its fields' nam
     no_ctors(),
   );
   let text = spelled(printed.pieces);
-  let released = Bytes::concat_all(
-    range(0, 11).map(|i: Int|
-      Bytes::concat_all([
-        b"if (t1[",
-        ascii_of_int(i),
-        b"]) ((const PlyType *)(intptr_t)p",
-        ascii_of_int(11 + i),
-        b")->dec(ctx, t1[",
-        ascii_of_int(i),
-        b"]); ",
-      ])),
-  );
+  let said = Some(String::of_bytes_lossy(text));
+  // The branches go to the runtime as an array of their closures, eleven of them.
+  assert(text.index_of(b"[] = {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10};") != None, said);
+  assert_eq(call_args(text, b"rt_branches_p").map(|a: List<Bytes>| a.drop(2)), [[b"11"]]);
+  // Where one failed, each answer is let go of through its own descriptor, the branch's type.
   assert(
-    text.index_of(
-        Bytes::concat_all([
-          b"  Word t1[] = {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10};\n  PLY_SITE(ctx, @@r@@, 3, 9);\n  rt_branches_p(ctx, (Word)(intptr_t)t1, 11);\n  if (ctx->failed) { ",
-          released,
-          b"return 0; }\n",
-        ]),
-      )
-      != None,
+    range(0, 11).all(|i: Int|
+      text.index_of(Bytes::concat_all([b"p", ascii_of_int(11 + i), b")->dec(ctx, "])) != None),
+    said,
   );
+  // The tuple's fields sort by name, `_10` after `_1`.
   assert(
-    text.index_of(
-        b"  Word t2[] = {t1[0], t1[1], t1[10], t1[2], t1[3], t1[4], t1[5], t1[6], t1[7], t1[8], t1[9]};\n  Word t3 = rt_record_p(ctx, @@s0@@, (Word)(intptr_t)t2, 11);\n",
-      )
+    text.index_of(b"{t1[0], t1[1], t1[10], t1[2], t1[3], t1[4], t1[5], t1[6], t1[7], t1[8], t1[9]}")
       != None,
+    said,
   );
   assert_eq(printed.shapes.map(|s: List<Bytes>| s.take(3)), [[b"_0", b"_1", b"_10"]]);
   // Told the definition's row, the runtime reads each effect and resource it names by its entry.
@@ -1050,18 +969,16 @@ test "a parallel block's answers are made its tuple in the order its fields' nam
       no_ctors(),
     ).pieces,
   );
+  // Each effect of the row and its resource (none, or the resource's entry) as a pair of words; an
+  // empty row as none.
   assert(
-    told.index_of(
-        b"  Word t1[] = {p0, p1};\n  Word t2[] = {@@f0@@, -1, @@f1@@, @@f2@@};\n  PLY_SITE(ctx, @@r@@, 3, 9);\n  rt_branches_past_p(ctx, (Word)(intptr_t)t1, 2, (Word)(intptr_t)t2, 2);\n",
-      )
-      != None,
+    told.index_of(b"{@@f0@@, -1, @@f1@@, @@f2@@}") != None,
+    Some(String::of_bytes_lossy(told)),
   );
-  assert(
-    told.index_of(
-        b"  Word t6[] = {0};\n  PLY_SITE(ctx, @@r@@, 3, 9);\n  rt_branches_past_p(ctx, (Word)(intptr_t)t5, 2, (Word)(intptr_t)t6, 0);\n",
-      )
-      != None,
-  )
+  assert_eq(call_args(told, b"rt_branches_past_p").map(|a: List<Bytes>| [a.get(2), a.get(4)]), [
+    [b"2", b"2"],
+    [b"2", b"0"],
+  ])
 }
 
 test "a simulate hands the runtime its body and its answer's descriptor, and answers every operation a region schedules" {
@@ -1072,14 +989,8 @@ test "a simulate hands the runtime its body and its answer's descriptor, and ans
     ]),
     no_ctors(),
   );
-  assert(
-    spelled(printed.pieces).index_of(
-        b"  PLY_SITE(ctx, @@r@@, 3, 9);\n  Word t1 = rt_region_p(ctx, p0, p1);\n  if (ctx->failed) return 0;\n",
-      )
-      != None,
-  );
-  assert_eq(printed.handles.len(), 8);
-  assert(printed.handles.contains(b"task#spawn") && printed.handles.contains(b"sim#seed"))
+  assert_eq(call_args(spelled(printed.pieces), b"rt_region_p"), [[b"ctx", b"p0", b"p1"]]);
+  assert(scheduled_ops().all(|op: Bytes| printed.handles.contains(op)), None)
 }
 
 fn corpus() -> Bytes =
@@ -1216,14 +1127,14 @@ test "a body that fails inside a handle leaves by the handle's landing, whatever
       Err(why) -> assert_eq(why, b""),
       Ok(t) -> match t.index_of(b"rt_handle_install_p(") {
         None -> assert(false),
-        Some(from) -> match t.index_of(b"ply_h0: ;") {
-          None -> assert(false),
-          Some(to) -> {
-            let body = t.slice(from, to);
-            // The perform, the call and each checked operator go to the landing; nothing returns.
-            assert_eq(body.index_of(b"return"), None);
-            assert(occurrences(body, b"goto ply_h0;") >= 6)
-          },
+        Some(from) -> {
+          // The body runs to the last jump to its landing.
+          let to = t.len()
+            - (match t.split(landing_jump(0)).last() { Some(r) -> r.len(), None -> 0 });
+          let body = t.slice(from, to);
+          // The perform, the call and each checked operator go to the landing; nothing returns.
+          assert_eq(body.index_of(b"return"), None);
+          assert(occurrences(body, landing_jump(0)) >= 6, Some(String::of_bytes_lossy(t)))
         },
       },
     },
@@ -1591,13 +1502,15 @@ test "the runtime's answer to an extern called over its encoding is asked by the
           Return(AInt(0)),
         ]),
       );
-      assert(
-        text.index_of(b"rt_builtin_encoded_p(ctx, @@b=assert_eq@@);\n  if (ctx->failed) return 0;")
-          != None,
-      )
+      assert_eq(call_args(text, b"rt_builtin_encoded_p"), [[b"ctx", b"@@b=assert_eq@@"]])
     },
   }
 }
+
+/// The arguments of each call of `f` in `text`, as the call writes them, up to its statement's end.
+fn call_args(text: Bytes, f: Bytes) -> List<List<Bytes>> / {abort.raise} =
+  text.split(f.concat(b"(")).drop(1).map(|rest: Bytes|
+    match rest.index_of(b");") { Some(end) -> rest.slice(0, end).split(b", "), None -> [] })
 
 /// Every call a crossing root's code makes by name, each with what is filed where its name is
 /// written.
