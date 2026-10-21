@@ -2,23 +2,39 @@
 //! hand-built inputs where another family's construct stands in front of them, its framing printed,
 //! and a corpus that lowers, checks and prints.
 
-import emit.reps (no_ctors)
-import emit.code (Code, NHandle, NBlock, NApp, NLambda, Lambda, Capture, CodeClause, CodeReturn)
+import std.list
+import emit.reps (Ctors, Def, no_ctors)
+import emit.code (Code, NHandle, NBlock, NApp, NLambda, NVar, NLit, NIf, NMatch, NRecord, NField,
+                  NBinary, Lambda, Capture, CodeClause, CodeReturn, CodeArm, CodeStmt, CLet, CDo,
+                  CodeField)
 import syntax.parsing (Span, span_between)
+import syntax.patterns (LBytes)
 import check.resolve.tables (qualify)
-import check.types (Type, TyCon, TyRecord, fn_type, row_empty, fields_sorted)
-import emit.keys (Named)
+import check.types (Type, TyCon, TyVar, TyRecord, fn_type, row_empty, fields_sorted, list_type,
+                    int_type, bytes_type, unit_type, option_type)
+import emit.keys
+import emit.keys (RootKey, Named, Written, Lower, Lift, Contained, Root, root_name, op_name)
 import emit.pieces (spelled)
-import emit.tir (Rep, RInt, RWord, Var, Arg, AVar, AInt, Prim, Pack, Make, MClosure, Op, OHandle,
-                 Uses, Inst, Let, Assign, Return, Handle, Fn, Rooted, Given, Owned, Handling, RFlat,
-                 Leaf, Get, Path, PLeaf, Closure, Decl, no_links)
-import emit.tir.handling (HandleOp, Perform, Label, Parallel, Simulate)
+import emit.tir (Rep, RInt, RWord, RAddr, Var, Arg, AVar, AInt, Prim, Pack, Make, MClosure, Op,
+                 OHandle, OContainer, Uses, Inst, Let, Do, Assign, Return, Handle, Fn, Rooted,
+                 Given, Lent, Owned, Handling, RFlat, Leaf, Get, Path, PLeaf, PPayload, Closure,
+                 Decl, Native, Call, Val, Handed, no_links, rep_of_arg)
+import emit.tir.containers (Taken, Length)
+import emit.tir.handling (HandleOp, Perform, Label, Parallel, Simulate, Encoded, Unsettled)
+import emit.typing (Typed)
+import emit.answer (Need, Exact)
 import emit.lower.setting (Root)
-import emit.lower.base (Context, started, emitted, opened)
+import emit.lower.held (held_as)
+import emit.lower.base (Context, Lowering, started, emitted, opened)
 import emit.lower.calling (context_of)
 import emit.lower.handling (label, clause_frame, body_frame, handled, branched, simulated)
+import emit.lower.crossing (crossed, crossing_builtin, encoded_externs)
+import emit.written (WrittenRoot, crossing_root, container_code, container_defs, entered_code,
+                     contained_formed, contained_reads, sums_crossed, crosses)
+import check.infer.definitions (Extern, prelude_externs)
+import store.hash.forms (written_code)
 import emit.print (printed_fn)
-import emit.compare (Program, program_of, formed, checked, printed_by_form, not_built)
+import emit.compare (Program, program_of, formed, checked, printed_by_form, not_built, printed_text)
 
 fn named(n: Bytes) -> Type = TyCon({ name: n, args: [] })
 
@@ -1016,6 +1032,590 @@ test "a step iterate runs in place copies into a detached handle's body only slo
           },
         },
       },
+    },
+  }
+}
+
+// --- Crossings --------------------------------------------------------------------------------
+
+fn crossings() -> Bytes =
+  Bytes::concat_all([
+    b"pub type Shape = | Dot | Line(Int) | Box({ w: Int, h: Float })\n",
+    b"pub type Hook = | Hook((Int) -> Int)\n",
+    b"fn held(s: String, x: Float, n: Int) -> Int = n\n",
+    b"fn same(a: Int, b: Int) -> Unit / {abort.raise} = assert_eq(a, b)\n",
+    b"fn alike<t>(a: t, b: t) -> Unit / {abort.raise} = assert_eq(a, b)\n",
+  ])
+
+/// What each instruction of `body` calls or makes, by the crossing's part in it: a native or a
+/// root by its name, a family's operation by what it does.
+fn crossed_parts(body: List<Inst>) -> List<Bytes> / {abort.raise} =
+  body.fold([], |acc: List<Bytes>, i: Inst|
+    match i { Let(l) -> acc.concat(part_of(l.val)), Do(d) -> acc.concat(part_of(d.val)), _ -> acc })
+
+fn part_of(v: Val) -> List<Bytes> / {abort.raise} =
+  match v {
+    Native(n) -> [n.name],
+    Call(c) -> match c.callee { Root(k) -> [root_name(k)], _ -> [b"generic"] },
+    Get(g) -> if g.path == PPayload { [b"payload"] } else { [] },
+    Prim(p) -> [p.op],
+    Op(o) -> match o.op {
+      OContainer(Taken) -> [b"taken"],
+      OContainer(Length) -> [b"length"],
+      OHandle(Encoded(name)) -> [b"encoded ".concat(name)],
+      OHandle(Unsettled(name)) -> [b"unsettled ".concat(name)],
+      _ -> [b"op"],
+    },
+    _ -> [],
+  }
+
+/// The variables `cx`'s root takes, held as its types hold them, and the lowering they start.
+fn params_of(cx: Context) -> { vars: List<Var>, st: Lowering } / {abort.raise} = {
+  let vars = range(0, cx.types.len()).map(|i: Int|
+    { id: i, ty: cx.types.get(i), rep: held_as(cx.setting, cx.types.get(i)) });
+  { vars: vars, st: started(vars) }
+}
+
+/// The calls `body` makes, with what each hands its arguments as.
+fn calls_in(
+  body: List<Inst>,
+) -> List<{ callee: Bytes, args: List<Arg>, handed: List<Handed> }> / {abort.raise} =
+  body.fold([], |acc: List<{ callee: Bytes, args: List<Arg>, handed: List<Handed> }>, i: Inst|
+    match i {
+      Let(l) -> match l.val {
+        Call(c) -> match c.callee {
+          Root(k) -> acc.push({ callee: root_name(k), args: c.args, handed: c.conv.params }),
+          _ -> acc,
+        },
+        _ -> acc,
+      },
+      _ -> acc,
+    })
+
+test "an encoding opens a lowering, lends the value to its type's root, and copies out the bytes it ends with" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match rooted(p, b"held") {
+      None -> assert(false),
+      Some(r) -> {
+        let start = params_of(r.cx);
+        let s = start.vars.get(0);
+        let l = crossed(r.cx, start.st, b"?encode", [AVar(s)], nowhere(), place());
+        assert_eq(crossed_parts(l.st.insts), [
+          b"builtin_elaborated_lower_open_p",
+          b"m.lower#String",
+          b"builtin_elaborated_lower_close_p",
+          b"taken",
+        ]);
+        assert_eq(calls_in(l.st.insts), [
+          { callee: b"m.lower#String", args: [AVar(s)], handed: [Lent] },
+        ]);
+        assert_eq(match l.arg { AVar(v) -> v.ty, _ -> int_type() }, bytes_type());
+        // Decoding opens a lifting over the bytes' address and count and asks the type's root.
+        let back = crossed(r.cx, l.st, b"?decode", [l.arg], nowhere(), place());
+        assert_eq(crossed_parts(back.st.insts.drop(l.st.insts.len())), [
+          b"payload",
+          b"length",
+          b"builtin_elaborated_lift_open_p",
+          b"m.lift#Bytes",
+          b"builtin_elaborated_lift_close_p",
+        ])
+      },
+    },
+  }
+}
+
+test "a crossing native is handed machine words: a string as its bytes' address and count, a float as its bits" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match rooted(p, b"held") {
+      None -> assert(false),
+      Some(r) -> {
+        let start = params_of(r.cx);
+        let natives = |body: List<Inst>|
+          body.fold([], |acc: List<{ name: Bytes, reps: List<Rep> }>, i: Inst|
+            match i {
+              Do(d) -> match d.val {
+                Native(n) -> acc.push({ name: n.name, reps: n.args.map(rep_of_arg) }),
+                _ -> acc,
+              },
+              Let(x) -> match x.val {
+                Native(n) -> acc.push({ name: n.name, reps: n.args.map(rep_of_arg) }),
+                _ -> acc,
+              },
+              _ -> acc,
+            });
+        let text = crossed(
+          r.cx,
+          start.st,
+          b"?out_str",
+          [AVar(start.vars.get(0))],
+          nowhere(),
+          place(),
+        );
+        assert_eq(crossed_parts(text.st.insts).take(3), [
+          b"payload",
+          b"length",
+          b"builtin_elaborated_out_str_p",
+        ]);
+        assert_eq(natives(text.st.insts), [
+          { name: b"builtin_elaborated_out_str_p", reps: [RAddr, RInt] },
+        ]);
+        let float = crossed(
+          r.cx,
+          start.st,
+          b"?out_float",
+          [AVar(start.vars.get(1))],
+          nowhere(),
+          place(),
+        );
+        assert_eq(crossed_parts(float.st.insts).take(2), [
+          b"bits",
+          b"builtin_elaborated_out_float_p",
+        ]);
+        assert_eq(natives(float.st.insts), [
+          { name: b"builtin_elaborated_out_float_p", reps: [RInt] },
+        ]);
+        let int = crossed(
+          r.cx,
+          start.st,
+          b"?out_int",
+          [AVar(start.vars.get(2))],
+          nowhere(),
+          place(),
+        );
+        assert_eq(natives(int.st.insts), [{ name: b"builtin_elaborated_out_int_p", reps: [RInt] }])
+      },
+    },
+  }
+}
+
+test "an extern called over its encoding writes its arguments as a list, has the runtime answer it, and reads its answer" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match rooted(p, b"same") {
+      None -> assert(false),
+      Some(r) -> match r.code.node {
+        NApp(a) -> {
+          let start = params_of(r.cx);
+          let args = start.vars.map(AVar);
+          let l = crossed(r.cx, start.st, b"assert_eq", args, a.func.span, place());
+          assert_eq(l.st.refused, None);
+          assert_eq(crossed_parts(l.st.insts), [
+            b"builtin_elaborated_lower_open_p",
+            b"builtin_elaborated_out_count_p",
+            b"m.lower#Int",
+            b"m.lower#Int",
+            b"encoded assert_eq",
+            b"m.lift#Unit",
+            b"builtin_elaborated_lift_close_p",
+          ]);
+          assert_eq(
+            calls_in(l.st.insts).take(2).map(
+              |c: { callee: Bytes, args: List<Arg>, handed: List<Handed> }| c.args,
+            ),
+            [[args.get(0)], [args.get(1)]],
+          )
+        },
+        _ -> assert(false),
+      },
+    },
+  }
+}
+
+test "an extern called over its encoding at a type left open is the specialisations' to settle" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match rooted(p, b"alike") {
+      None -> assert(false),
+      Some(r) -> match r.code.node {
+        NApp(a) -> {
+          let start = params_of(r.cx);
+          let l = crossed(r.cx, start.st, b"assert_eq", start.vars.map(AVar), a.func.span, place());
+          assert_eq(l.st.refused, None);
+          assert_eq(crossed_parts(l.st.insts), [b"unsettled assert_eq"]);
+          assert(l.st.links.needs.any(|n: Need| n.reads == Exact));
+          // A form holding it that leaks past its specialisations fails where it is printed.
+          let said = handle {
+            printed_text(fn_of(b"alike", start.vars, l.st.insts.push(Return(AInt(0)))));
+            b""
+          } with {
+            abort.raise(m) -> Bytes::of_string(m),
+          };
+          assert(said.index_of(b"settled by its callers only") != None)
+        },
+        _ -> assert(false),
+      },
+    },
+  }
+}
+
+test "the runtime's answer to an extern called over its encoding is asked by the builtin's place in the unit's table" {
+  let text = printed_text(
+    fn_of(b"asks", [], [
+      Do({
+        val: Op({
+          op: OHandle(Encoded(b"assert_eq")),
+          args: [],
+          uses: { takes: [], owned: false, fails: true, stops: false },
+        }),
+        at: place(),
+        unwind: [],
+      }),
+      Return(AInt(0)),
+    ]),
+  );
+  assert(
+    text.index_of(b"rt_builtin_encoded_p(ctx, @@b=assert_eq@@);\n  if (ctx->failed) return 0;")
+      != None,
+  )
+}
+
+/// Every call a crossing root's code makes by name, each with what is filed where its name is
+/// written.
+fn named_calls(c: Code, typed: Map<Int, Typed>) -> List<{ name: Bytes, filed: Option<Typed> }> =
+  match c.node {
+    NApp(a) -> {
+      let inner = a.args.fold([], |acc: List<{ name: Bytes, filed: Option<Typed> }>, x: Code|
+        acc.concat(named_calls(x, typed)));
+      match a.func.node {
+        NVar(v) -> if v.slot == None {
+          [{ name: v.name, filed: typed.get(a.func.span.site) }].concat(inner)
+        } else { inner },
+        _ -> inner,
+      }
+    },
+    NBlock(b) ->
+      b.stmts.fold([], |acc: List<{ name: Bytes, filed: Option<Typed> }>, s: CodeStmt|
+        acc.concat(match s {
+          CLet(l) -> named_calls(l.value, typed),
+          CDo(d) -> named_calls(d.code, typed),
+          _ -> [],
+        })).concat(match b.tail { Some(t) -> named_calls(t, typed), None -> [] }),
+    NIf(x) ->
+      named_calls(x.cond, typed).concat(named_calls(x.then_branch, typed)).concat(
+        named_calls(x.else_branch, typed),
+      ),
+    NMatch(m) ->
+      m.arms.fold(
+        named_calls(m.scrutinee, typed),
+        |acc: List<{ name: Bytes, filed: Option<Typed> }>, arm: CodeArm|
+          acc.concat(named_calls(arm.body, typed)),
+      ),
+    NRecord(r) ->
+      r.fields.fold([], |acc: List<{ name: Bytes, filed: Option<Typed> }>, f: CodeField|
+        acc.concat(named_calls(f.value, typed))),
+    NField(f) -> named_calls(f.base, typed),
+    NBinary(b) -> named_calls(b.lhs, typed).concat(named_calls(b.rhs, typed)),
+    _ -> [],
+  }
+
+/// The byte strings `c` writes literally, in order: the names a crossing root writes.
+fn literal_bytes(c: Code) -> List<Bytes> =
+  match c.node {
+    NLit(l) -> match l { LBytes(b) -> [b], _ -> [] },
+    NApp(a) -> a.args.fold([], |acc: List<Bytes>, x: Code| acc.concat(literal_bytes(x))),
+    NBlock(b) ->
+      b.stmts.fold([], |acc: List<Bytes>, s: CodeStmt|
+        acc.concat(match s {
+          CLet(l) -> literal_bytes(l.value),
+          CDo(d) -> literal_bytes(d.code),
+          _ -> [],
+        })).concat(match b.tail { Some(t) -> literal_bytes(t), None -> [] }),
+    NIf(x) ->
+      literal_bytes(x.cond).concat(literal_bytes(x.then_branch)).concat(
+        literal_bytes(x.else_branch),
+      ),
+    NMatch(m) ->
+      m.arms.fold(literal_bytes(m.scrutinee), |acc: List<Bytes>, arm: CodeArm|
+        acc.concat(literal_bytes(arm.body))),
+    NRecord(r) ->
+      r.fields.fold([], |acc: List<Bytes>, f: CodeField| acc.concat(literal_bytes(f.value))),
+    NBinary(b) -> literal_bytes(b.lhs).concat(literal_bytes(b.rhs)),
+    _ -> [],
+  }
+
+/// The root `key` of module `m` is, written for a type under the constructors `ctors`: a crossing's
+/// or a container's.
+fn written_at(ctors: Ctors, key: RootKey) -> WrittenRoot / {abort.raise} =
+  match key {
+    Written(w) -> match w.op {
+      Lower -> crossing_root(b"m", ctors, key),
+      Lift -> crossing_root(b"m", ctors, key),
+      other -> container_code(b"m", ctors, op_name(other), w.ty),
+    },
+    _ -> crossing_root(b"m", ctors, key),
+  }
+
+/// Whether `k` is a root a crossing runs: a lowering, a lifting, or a loop of one.
+fn crossing_key(k: RootKey) -> Bool =
+  match k {
+    Written(w) -> match w.op {
+      Lower -> true,
+      Lift -> true,
+      Contained(c) -> c.starts_with(b"lower_") || c.starts_with(b"lift_"),
+      _ -> false,
+    },
+    _ -> false,
+  }
+
+/// Whether `name` is a constructor's: its last part opens with a capital.
+fn ctor_spelled(name: Bytes) -> Bool / {abort.raise} =
+  name.index_of(b"::") == None
+    && (match name.split(b".").last() {
+      Some(last) -> last.len() > 0 && last.at(0) >= 65 && last.at(0) <= 90,
+      None -> false,
+    })
+
+test "an entry reads its arguments from the runtime's lifting, ends it, and writes its root's answer into the runtime's lowering" {
+  let e = entered_code(
+    b"m",
+    b"m.held",
+    [named(b"String"), named(b"Float"), int_type()],
+    int_type(),
+  );
+  match e.code {
+    Err(why) -> assert_eq(why, b""),
+    Ok(code) -> {
+      assert_eq(
+        named_calls(code, e.typed).map(|c: { name: Bytes, filed: Option<Typed> }|
+          { name: c.name, at: match c.filed { Some(t) -> t.args, None -> [] } }),
+        [
+          { name: b"?in_count", at: [] },
+          { name: b"?lift", at: [named(b"String")] },
+          { name: b"?lift", at: [named(b"Float")] },
+          { name: b"?lift", at: [int_type()] },
+          { name: b"?lift_close", at: [] },
+          { name: b"?lower", at: [int_type()] },
+          { name: b"held", at: [] },
+        ],
+      );
+      assert_eq(e.params, []);
+      assert(e.here.any(|d: Def| d.name == b"held" && d.root == Named(b"m.held")))
+    },
+  }
+}
+
+test "a written root calls only crossing builtins, what it files a type for, and the roots it defines; of the prelude, what a load reaches" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let shape = TyCon({ name: b"m.Shape", args: [] });
+      let record = TyRecord(
+        fields_sorted([{ name: b"w", ty: int_type() }, { name: b"h", ty: named(b"Float") }]),
+      );
+      let map = TyCon({ name: b"Map", args: [named(b"String"), list_type(int_type())] });
+      let array = TyCon({ name: b"Array", args: [option_type(shape)] });
+      let types = [
+        int_type(),
+        named(b"Bool"),
+        unit_type(),
+        named(b"Float"),
+        named(b"Decimal"),
+        named(b"U8"),
+        named(b"I128"),
+        named(b"Char"),
+        named(b"String"),
+        bytes_type(),
+        shape,
+        record,
+        list_type(record),
+        map,
+        array,
+        option_type(named(b"String")),
+        TyCon({ name: b"Columns", args: [record] }),
+      ];
+      let asked = types.fold([], |acc: List<RootKey>, t: Type|
+        acc.concat([Lower, Lift].map(|op: keys::TypeOp| keys::written(op, t, b"m")))).concat(
+        [list_type(int_type()), array, map].fold([], |acc: List<RootKey>, t: Type|
+          acc.concat(container_defs(b"m", t).map(|d: Def| d.root))),
+      );
+      // The loops the roots call are roots of their own.
+      let roots = asked.fold([], |acc: List<{ key: RootKey, root: WrittenRoot }>, k: RootKey| {
+        let r = written_at(p.setting.ctors, k);
+        r.here.fold(
+          acc.push({ key: k, root: r }),
+          |a: List<{ key: RootKey, root: WrittenRoot }>, d: Def|
+            if d.root == k || a.any(|x: { key: RootKey, root: WrittenRoot }| x.key == d.root) { a }
+            else { a.push({ key: d.root, root: written_at(p.setting.ctors, d.root) }) },
+        )
+      });
+      let externs = prelude_externs().map(|e: Extern| e.name);
+      let faults = roots.fold([], |acc: List<Bytes>, r: { key: RootKey, root: WrittenRoot }|
+        match r.root.code {
+          Err(why) -> acc.push(Bytes::concat_all([root_name(r.key), b": ", why])),
+          Ok(code) ->
+            named_calls(code, r.root.typed).fold(
+              acc,
+              |a: List<Bytes>, call: { name: Bytes, filed: Option<Typed> }| {
+                let local = r.root.here.any(|d: Def| d.name == call.name);
+                // A part lowered or lifted is filed at its type; the emitter's other builtins are
+                // settled by their operands.
+                let generated = call.name.starts_with(b"?")
+                  && (!crossing_key(r.key) || crossing_builtin(call.name))
+                  && ((call.name != b"?lower" && call.name != b"?lift")
+                  || (match call.filed { Some(t) -> t.args.len() == 1, None -> false }));
+                let prelude = call.filed != None
+                  && (ctor_spelled(call.name) || externs.contains(call.name)
+                  || written_code().calls.concat(written_code().lifts).contains(call.name));
+                if local || generated || prelude { a }
+                else { a.push(Bytes::concat_all([root_name(r.key), b" calls ", call.name])) }
+              },
+            ),
+        });
+      assert_eq(faults, []);
+      // Every loop a written root calls is one `container_code` writes; a loop writing a
+      // container's items reads it, one reading them takes the container it adds to.
+      let loops = roots.fold([], |acc: List<Bytes>, r: { key: RootKey, root: WrittenRoot }|
+        match r.key {
+          Written(w) -> match w.op { Contained(c) -> acc.push(c), _ -> acc },
+          _ -> acc,
+        });
+      assert_eq(loops.filter(|c: Bytes| !contained_formed(c)), []);
+      assert(loops.contains(b"lower_entries") && loops.contains(b"lift_entries"));
+      assert_eq(
+        [b"lower_items", b"lower_entries", b"lift_items", b"lift_entries"].map(contained_reads),
+        [true, true, false, false],
+      );
+      // A body calling a builtin whose call writes crossing code references what that code calls.
+      assert_eq(
+        encoded_externs().push(b"observe").filter(|n: Bytes|
+          !written_code().builtins.contains(match n.split(b"::").last() {
+            Some(x) -> x,
+            None -> n,
+          })),
+        [],
+      );
+      // A record's fields are written in name order, each after its name; a sum's constructor is
+      // read back by its program-wide name, the last by elimination.
+      let written_names = |k: RootKey|
+        match written_at(p.setting.ctors, k).code {
+          Ok(code) -> literal_bytes(code),
+          Err(why) -> [why],
+        };
+      assert_eq(written_names(keys::written(Lower, record, b"m")), [b"h", b"w"]);
+      assert_eq(written_names(keys::written(Lift, shape, b"m")), [b"m.Dot", b"m.Line"])
+    },
+  }
+}
+
+/// Whether root `key` and every root its code reaches are written: the loops it defines, and the
+/// root of each type it lowers or lifts a part at.
+fn written_whole(ctors: Ctors, key: RootKey) -> Bool / {abort.raise} =
+  iterate({ todo: [key], seen: [] }, 512, |s: { todo: List<RootKey>, seen: List<RootKey> }|
+    match s.todo.at(0) {
+      None -> Stop(true),
+      Some(k) -> if s.seen.contains(k) { Continue({ todo: s.todo.drop(1), seen: s.seen }) } else {
+        let r = written_at(ctors, k);
+        match r.code {
+          Err(_) -> Stop(false),
+          Ok(code) -> {
+            let parts = named_calls(code, r.typed).fold(
+              [],
+              |acc: List<RootKey>, call: { name: Bytes, filed: Option<Typed> }|
+                match call.filed {
+                  Some(t) -> match t.args.at(0) {
+                    Some(ty) -> if call.name == b"?lower" {
+                      acc.push(keys::written(Lower, ty, b"m"))
+                    } else if call.name == b"?lift" { acc.push(keys::written(Lift, ty, b"m")) }
+                    else { acc },
+                    None -> acc,
+                  },
+                  None -> acc,
+                },
+            );
+            Continue({
+              todo: s.todo.drop(1).concat(parts).concat(r.here.map(|d: Def| d.root)),
+              seen: s.seen.push(k),
+            })
+          },
+        }
+      },
+    })
+
+test "a type crosses where its roots and those of every type it crosses at are written, and back where none of those types is a function" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let ctors = p.setting.ctors;
+      let held = sums_crossed(ctors.sums, |_: Bytes| true);
+      let shape = TyCon({ name: b"m.Shape", args: [] });
+      let hook = TyCon({ name: b"m.Hook", args: [] });
+      let callback = fn_type([int_type()], int_type(), row_empty());
+      let map = TyCon({ name: b"Map", args: [named(b"String"), list_type(shape)] });
+      let types = [
+        int_type(),
+        named(b"Decimal"),
+        named(b"U8"),
+        named(b"String"),
+        shape,
+        option_type(shape),
+        map,
+        TyCon({ name: b"Array", args: [bytes_type()] }),
+        TyRecord([{ name: b"f", ty: callback }]),
+        hook,
+        callback,
+        list_type(hook),
+        TyVar(0),
+        TyCon({ name: b"ListNode", args: [int_type()] }),
+      ];
+      let said = |back: Bool| types.map(|t: Type| crosses(held, t, back));
+      let written = |op: keys::TypeOp|
+        types.map(|t: Type| written_whole(ctors, keys::written(op, t, b"m")));
+      assert_eq(said(false), written(Lower));
+      assert_eq(said(true), written(Lift));
+      assert_eq(said(false), [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+      ]);
+      assert_eq(said(true), [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+      ]);
+      // A container crosses where the program holds what its loops call, and a map is read back
+      // where it holds what builds one.
+      let unbuilt = sums_crossed(ctors.sums, |n: Bytes| !written_code().lifts.contains(n));
+      assert_eq(
+        [
+          crosses(unbuilt, map, false),
+          crosses(unbuilt, map, true),
+          crosses(unbuilt, list_type(shape), true),
+        ],
+        [true, false, true],
+      );
+      let bare = sums_crossed(ctors.sums, |_: Bytes| false);
+      assert_eq(
+        [
+          crosses(bare, list_type(int_type()), false),
+          crosses(bare, shape, true),
+          crosses(bare, option_type(list_type(int_type())), false),
+        ],
+        [false, true, false],
+      )
     },
   }
 }

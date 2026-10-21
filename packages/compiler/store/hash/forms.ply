@@ -229,9 +229,12 @@ pub fn build_index(
     items: built.items,
     scopes: scopes,
     effect_sketches: Map::new(),
-    written: prelude.fold([], |acc: List<Int>, m: Int|
-      written_code().calls.fold(acc, |a: List<Int>, n: Bytes|
-        match built.items.get(m).fns.get(n) { Some(v) -> a.push(v), None -> a })),
+    written: prelude.fold(Map::new(), |acc: Map<Bytes, Int>, m: Int|
+      written_code().calls.concat(written_code().lifts).fold(
+        acc,
+        |a: Map<Bytes, Int>, n: Bytes|
+          match built.items.get(m).fns.get(n) { Some(v) -> a.insert(n, v), None -> a },
+      )),
   };
   { index: { ..index, effect_sketches: sketch_effects(index) }, diags: built.diags }
 }
@@ -472,46 +475,71 @@ fn value_ref(encoder: Encoder, qname: QName) -> Encoder / {abort.raise} = {
       // A function of a language type that no module declares is the prelude's, under the one
       // name it has however it is written.
       None -> {
-        let builtin = written_code().builtins.contains(qname.name.name);
+        let called = written_for(qname.name.name);
         match qualifier(qname) {
           Some(of) -> if starts_upper(of)
               && encoder.index.scopes.get(encoder.module).modules.get(of) == None {
-            written_block(free_ref(encoder, None, member_name(of, qname.name.name)), false)
-          } else { written_block(free_ref(encoder, Some(of), qname.name.name), builtin) },
-          None -> written_block(free_ref(encoder, None, qname.name.name), builtin),
+            written_block(free_ref(encoder, None, member_name(of, qname.name.name)), [])
+          } else { written_block(free_ref(encoder, Some(of), qname.name.name), called) },
+          None -> written_block(free_ref(encoder, None, qname.name.name), called),
         }
       },
     },
   }
 }
 
-/// The code the emitter writes for a container a body compares, digests or shows, as `==` of two
-/// lists walks them with `List::at` and of two maps walks their entries with `Map::entries`: the
-/// operators a body writes it for, by name and as the lexer names their tokens, the builtins, and
-/// the functions of [`prelude_module`] it calls, by their names there. A body that writes one of
-/// those references each of these, so a load that reaches the body reaches them, and a check
+/// The code the emitter writes for a container a body compares, digests, shows or hands the runtime,
+/// as `==` of two lists walks them with `List::at` and of two maps walks their entries with
+/// `Map::entries`: the operators a body writes it for, by name and as the lexer names their tokens,
+/// the builtins, and the functions of [`prelude_module`] it calls, by their names there. `lifting`
+/// are the builtins whose code reads a value of any type back from the runtime, which also calls
+/// `lifts`, as a map read back is built with `Map::insert`. A body that writes one of those
+/// references each of what its code calls, so a load that reaches the body reaches them, and a check
 /// groups them with it where they reach it back.
 pub type WrittenCode = {
   operators: List<Bytes>,
   tokens: List<Bytes>,
   builtins: List<Bytes>,
   calls: List<Bytes>,
+  lifting: List<Bytes>,
+  lifts: List<Bytes>,
 }
 
 pub fn written_code() -> WrittenCode =
   {
     operators: [b"eq", b"ne"],
     tokens: [b"eqeq", b"bangeq"],
-    builtins: [b"compare", b"compare_values", b"digest", b"reflect", b"shown"],
+    builtins: [
+      b"compare",
+      b"compare_values",
+      b"digest",
+      b"reflect",
+      b"shown",
+      b"assert_eq",
+      b"observe",
+      b"sqlite_run",
+      b"private_key",
+      b"rsa_jwk",
+    ],
     calls: [b"List::at", b"List::push", b"Map::entries"],
+    lifting: [b"observe"],
+    lifts: [b"Map::insert"],
   }
 
-/// `encoder` past a binary operator or a value named by its name alone, `at` where the emitter
-/// writes code for a container there (`written_code`): what that code calls, which the body
-/// references with it, under `tag_written`, and none of it elsewhere.
-fn written_block(encoder: Encoder, at: Bool) -> Encoder / {abort.raise} = {
-  let called = if at { encoder.index.written } else { [] };
-  called.fold(put_u32(put_tag(encoder, tag_written()), called.len()), node_ref)
+/// What the code the emitter writes where a body names `name` alone calls, by the functions'
+/// names in [`prelude_module`]: none where it writes none.
+pub fn written_for(name: Bytes) -> List<Bytes> =
+  if written_code().lifting.contains(name) { written_code().calls.concat(written_code().lifts) }
+  else if written_code().builtins.contains(name) { written_code().calls }
+  else { [] }
+
+/// `encoder` past a binary operator or a value named by its name alone, and `called`, what the code
+/// the emitter writes there (`written_code`) calls, which the body references with it under
+/// `tag_written`.
+fn written_block(encoder: Encoder, called: List<Bytes>) -> Encoder / {abort.raise} = {
+  let nodes = called.fold([], |acc: List<Int>, n: Bytes|
+    match encoder.index.written.get(n) { Some(v) -> acc.push(v), None -> acc });
+  nodes.fold(put_u32(put_tag(encoder, tag_written()), nodes.len()), node_ref)
 }
 
 fn type_ref(encoder: Encoder, qual: Option<Bytes>, name: Bytes) -> Encoder / {abort.raise} = {
@@ -1084,7 +1112,7 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
           expr(put_bytes(put_tag(encoder, tag_e_binary()), byte_of_int(binop_byte(b.op))), b.lhs),
           b.rhs,
         ),
-        written_code().operators.contains(b.op),
+        if written_code().operators.contains(b.op) { written_code().calls } else { [] },
       ),
     EUnary(u) ->
       expr(put_bytes(put_tag(encoder, tag_e_unary()), byte_of_int(unop_byte(u.op))), u.operand),
