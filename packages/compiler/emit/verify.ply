@@ -13,7 +13,7 @@ import emit.tir (Rep, RWord, RInt, RBool, RNum, RFlat, RSlice, RToken, Leaf, Var
                  Member, Rooted, Lambda, Closure, Handed, Given, Lent, Owned, Borrowed, Returned,
                  Convention, Answered, Owns, ReadsOf, Lasts, no_links, counted, operands, answered,
                  fails, used_as, rep_of_arg, var_of, parts_of, Test, TTag, TInt, TRange, RSum,
-                 RUnit, RAddr, LastOf, Walked, MBox, MCase, PCase, PPayload, OContainer, OStrings,
+                 RUnit, RAddr, LastOf, Walked, MCase, PCase, PPayload, OContainer, OStrings,
                  stops_at, Uses, string_uses)
 import emit.tir.containers (Taken)
 import emit.tir.strings (StringOp, StringArg, ReadsAt, Number, WritesBlock, OwnBlock, Copied, Grown,
@@ -34,9 +34,8 @@ import std.pace (paced)
 /// each borrowed one was read out of (none where it outlasts the body: a constant, or a lent
 /// parameter itself), the place of each parameter the body is lent, each join declared on it
 /// and whether it was set, the words of each value opened, the word each read of an opened
-/// value's counted leaf is, the captures of each closure laid on this frame's stack, the fields
-/// taken out of each block, the block each reuse token holds the cells of, and where each field
-/// read was read. `unset` are the joins of `joins` not yet set, the only ones a branch can set
+/// value's counted leaf is, the captures of each closure laid on this frame's stack, and the fields
+/// taken out of each block. `unset` are the joins of `joins` not yet set, the only ones a branch can set
 /// differently on its paths. `lasts` are the values a test of a last holder answered, which hold
 /// their count only where a branch on them finds them other than 0. `immortal` are the body's values
 /// that hold no count (`immortals`); `pending` the joins this path set from one of them which hold
@@ -51,8 +50,6 @@ type Holding = {
   alias: Map<Int, Var>,
   stacks: Map<Int, List<Var>>,
   taken: Map<Int, List<Path>>,
-  cells: Map<Int, Int>,
-  read_at: Map<Int, { of: Int, path: Path }>,
   lasts: Map<Int, Bool>,
   immortal: Map<Int, Bool>,
   pending: Map<Int, Bool>,
@@ -269,8 +266,6 @@ fn holding_params(params: List<Var>, conv: Convention, immortal: Map<Int, Bool>)
       alias: Map::new(),
       stacks: Map::new(),
       taken: Map::new(),
-      cells: Map::new(),
-      read_at: Map::new(),
       lasts: Map::new(),
       immortal: immortal,
       pending: Map::new(),
@@ -629,14 +624,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
           faulted(acc, b"cells kept as other than a reuse token: v", r.token)
         } else {
           let c = consumed(acc, r.of);
-          {
-            ..c,
-            h: {
-              ..c.h,
-              owned: c.h.owned.insert(r.token.id, 1),
-              cells: c.h.cells.insert(r.token.id, r.of.id),
-            },
-          }
+          { ..c, h: { ..c.h, owned: c.h.owned.insert(r.token.id, 1) } }
         },
         Free(r) -> if !is_token(r.of) {
           faulted(acc, b"a block freed that is no reuse token: v", r.of)
@@ -781,7 +769,7 @@ fn handle_walked(f: Fn, cx: Within, acc: Walk, i: Inst) -> Walk =
 /// Why `val`, bound to `y`, reads a block otherwise than the fields taken out of it allow: a field
 /// is taken only once, out of a block's word, or the box a sum's case holds, this body holds a count
 /// of and no loop around holds across its passes (`across`); once taken it is not read
-/// again or kept in the block's cells; and a block a field was taken out of is used only to read its
+/// again; and a block a field was taken out of is used only to read its
 /// other fields, test its constructor, or let it go.
 fn field_fault(
   h: Holding,
@@ -804,15 +792,6 @@ fn field_fault(
     Get(g) -> if taken_at(h, g.of, g.path) {
       Some({ why: b"a field read after it was taken out of its block: v", v: y })
     } else { None },
-    Make(m) -> match m.reuse {
-      Some(t) -> match h.cells.get(t.id) {
-        Some(of) -> if !kept_held(h, m.made, m.args, m.kept, of) {
-          Some({ why: b"a field kept in cells that do not hold it: v", v: y })
-        } else { whole_fault(h, read_args(val)) },
-        None -> whole_fault(h, read_args(val)),
-      },
-      None -> whole_fault(h, read_args(val)),
-    },
     _ -> whole_fault(h, read_args(val)),
   }
 
@@ -970,32 +949,9 @@ fn taken_whole(h: Holding, args: List<Arg>) -> Option<Var> =
 fn taken_at(h: Holding, of: Var, p: Path) -> Bool =
   match h.taken.get(of.id) { Some(ps) -> ps.contains(p), None -> false }
 
-/// Whether each argument `made` keeps in the cells of block `of` is what those cells hold there: a
-/// read out of `of` at the place `kept_reads` says, which no take emptied.
-fn kept_held(h: Holding, made: Made, args: List<Arg>, kept: List<Int>, of: Int) -> Bool = {
-  let reads = kept_reads(made, args.len());
-  kept.all(|k: Int|
-    match args.at(k) {
-      Some(AVar(a)) -> match h.read_at.get(a.id) {
-        Some(r) ->
-          r.of == of && !(match h.taken.get(of) { Some(ps) -> ps.contains(r.path), None -> false })
-            && reads.at(k) == Some(Some(r.path)),
-        None -> false,
-      },
-      _ -> false,
-    })
-}
-
-/// For each of the `n` arguments of `made`, the read that finds it where `made` writes it, so the
-/// cells of a block read so hold it already: a constructor's argument at its place, a laid out
-/// field at its offset; none for a record held in place, whose words a reset let go of.
-pub fn kept_reads(made: Made, n: Int) -> List<Option<Path>> =
-  match made { _ -> range(0, n).map(|_: Int| None) }
-
-/// Whether a `Make` of `made` is printed into the cells a reuse token names: a box or a boxed case. A
-/// record the runtime lays out is made by value, which takes none.
-pub fn reuses_cells(made: Made) -> Bool =
-  match made { MBox(_) -> true, MCase(_) -> true, _ -> false }
+/// Whether a `Make` of `made` is printed into the cells a reuse token names: a boxed case. A record
+/// the runtime lays out is made by value, which takes none.
+pub fn reuses_cells(made: Made) -> Bool = match made { MCase(_) -> true, _ -> false }
 
 /// Whether `p` reads a field at its offset in a block: what a `Take` may take.
 pub fn field_path(p: Path) -> Bool = match p { PField(_) -> true, PArg(_) -> true, _ -> false }
@@ -1027,8 +983,8 @@ pub fn held_in_place(of: Var, path: Path, reader: Var) -> Bool =
 
 fn laid_record(ty: Type) -> Bool = match kind_of(ty).ty { TyRec(_) -> true, _ -> false }
 
-/// `w` noting the field `val`, bound to `y`, takes out of its block or reads there, where the path
-/// holds.
+/// `w` noting the field `val`, bound to `y`, takes out of its block, or that `y` is a last holder's
+/// test, where the path holds.
 fn noted(w: Walk, y: Var, val: Val) -> Walk =
   if w.fault != None { w } else {
     match val {
@@ -1043,8 +999,6 @@ fn noted(w: Walk, y: Var, val: Val) -> Walk =
             }),
           },
         },
-      Get(g) ->
-        { ..w, h: { ..w.h, read_at: w.h.read_at.insert(y.id, { of: g.of.id, path: g.path }) } },
       LastOf(_) -> { ..w, h: { ..w.h, lasts: w.h.lasts.insert(y.id, true) } },
       _ -> w,
     }
@@ -1376,10 +1330,10 @@ fn sole_count(r: Rep, p: { case: Int, at: Int }) -> Bool =
 
 fn counted_class(c: WordClass) -> Bool = match c { P -> true, S(_) -> true, U -> true, _ -> false }
 
-/// The payload words of the block `m` allocates, where it is a record, a box, or a boxed case with
-/// the words of its tag.
+/// The payload words of the block `m` allocates, where it is a record, or a boxed case with the
+/// words of its tag.
 pub fn made_width(m: Made) -> Int =
-  match m { MRecord(r) -> r.width, MBox(b) -> b.words, MCase(c) -> c.skip + c.words, _ -> 0 }
+  match m { MRecord(r) -> r.width, MCase(c) -> c.skip + c.words, _ -> 0 }
 
 /// Whether each arm's `when` is a constructor `tested` names, where it tests a tag: the arm then knows
 /// its subject holds that constructor, which decides whose cells it may reuse.
@@ -1696,11 +1650,8 @@ fn held_otherwise(v: Var, val: Val) -> Option<Bytes> =
           Some(b"a value made in cells its printer does not take: v")
         } else if t.rep != RToken(made_width(m.made)) || made_width(m.made) == 0 {
           Some(b"a value made in cells of another size: v")
-        } else if m.kept.any(|k: Int| k < 0 || k >= m.args.len()) {
-          Some(b"a value made keeping a field it does not have: v")
         } else { None },
-        None -> if m.kept.len() > 0 { Some(b"a value made afresh keeping fields: v") }
-        else { None },
+        None -> None,
       }
     },
     _ -> None,
@@ -1889,7 +1840,7 @@ test "a variable is used held as it was bound, which its C names follow" {
   );
   // Whatever it makes, a make answers an object's one word.
   let leaves = { ..n, rep: RFlat([{ name: b"a", rep: RWord }]) };
-  let listed = Make({ made: MList(1), args: [AVar(p)], reuse: None, kept: [] });
+  let listed = Make({ made: MList(1), args: [AVar(p)], reuse: None });
   assert_eq(
     verified(
       root_of([p], [], RFlat([{ name: b"a", rep: RWord }]), [
@@ -2184,13 +2135,11 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
   let v = word(1);
   let n = word(2);
   let token = { ..word(3), rep: RToken(1) };
-  let made = |reuse: Option<Var>, kept: List<Int>|
-    Make({ made: MBox({ words: 1 }), args: [AVar(v)], reuse: reuse, kept: kept });
+  let made = |reuse: Option<Var>|
+    Make({ made: MCase({ case: 0, skip: 0, words: 1 }), args: [AVar(v)], reuse: reuse });
   let reset = Reset({ token: token, of: r });
   assert_eq(
-    verified(
-      root_of([r, v], [], RWord, [reset, bind(n, made(Some(token), []), []), Return(AVar(n))]),
-    ),
+    verified(root_of([r, v], [], RWord, [reset, bind(n, made(Some(token)), []), Return(AVar(n))])),
     None,
   );
   assert_eq(
@@ -2198,7 +2147,7 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
       root_of([r, v], [], RWord, [
         reset,
         Free({ of: token, bytes: AInt(8) }),
-        bind(n, made(None, []), []),
+        bind(n, made(None), []),
         Return(AVar(n)),
       ]),
     ),
@@ -2214,13 +2163,16 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
         bind(w, val, unwind),
         Dec(w),
         Free({ of: token, bytes: AInt(8) }),
-        bind(n, made(None, []), []),
+        bind(n, made(None), []),
         Return(AVar(n)),
       ]),
     );
   assert_eq(failing(call_of([], []), [v, token]), None);
   assert_eq(
-    failing(Make({ made: MBox({ words: 0 }), args: [], reuse: None, kept: [] }), [v, token]),
+    failing(Make({ made: MCase({ case: 0, skip: 0, words: 0 }), args: [], reuse: None }), [
+      v,
+      token,
+    ]),
     Some(b"a release on the way out of a value that neither fails nor stops"),
   );
   // A call that may stop but cannot fail leaves its frame record holding what the path holds, the
@@ -2238,7 +2190,7 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
   assert_eq(stopping([v]), Some(b"a failure path that releases other than what it holds"));
   assert_eq(
     verified(
-      root_of([r, v], [], RWord, [reset, Dec(token), bind(n, made(None, []), []), Return(AVar(n))]),
+      root_of([r, v], [], RWord, [reset, Dec(token), bind(n, made(None), []), Return(AVar(n))]),
     ),
     Some(b"a reuse token let go as a value: v3"),
   );
@@ -2257,19 +2209,15 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
     verified(
       root_of([r, v], [], RWord, [
         Reset({ token: { ..token, rep: RWord }, of: r }),
-        bind(n, made(None, []), []),
+        bind(n, made(None), []),
         Return(AVar(n)),
       ]),
     ),
     Some(b"cells kept as other than a reuse token: v3"),
   );
   assert_eq(
-    verified(root_of([r, v], [], RWord, [Dec(r), bind(n, made(Some(v), []), []), Return(AVar(n))])),
+    verified(root_of([r, v], [], RWord, [Dec(r), bind(n, made(Some(v)), []), Return(AVar(n))])),
     Some(b"a value made in cells no reset kept: v2"),
-  );
-  assert_eq(
-    verified(root_of([r, v], [], RWord, [Dec(r), bind(n, made(None, [0]), []), Return(AVar(n))])),
-    Some(b"a value made afresh keeping fields: v2"),
   );
   // Cells kept for a block of two words made into a block of one.
   let wide = { ..token, rep: RToken(2) };
@@ -2277,32 +2225,12 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
     verified(
       root_of([r, v], [], RWord, [
         Reset({ token: wide, of: r }),
-        bind(n, made(Some(wide), []), []),
+        bind(n, made(Some(wide)), []),
         Return(AVar(n)),
       ]),
     ),
     Some(b"a value made in cells of another size: v2"),
   );
-  // A field taken out of the cells leaves them empty there, whatever was read out of them before.
-  let x = word(4);
-  let y = word(5);
-  let field = PField({ name: b"a", at: 0 });
-  let emptied = |kept: List<Int>|
-    root_of([r], [], RWord, [
-      bind(x, Get({ of: r, path: field }), []),
-      Inc({ var: x, n: 1 }),
-      bind(y, Take({ of: r, path: field }), []),
-      reset,
-      Dec(y),
-      bind(
-        n,
-        Make({ made: MBox({ words: 1 }), args: [AVar(x)], reuse: Some(token), kept: kept }),
-        [],
-      ),
-      Return(AVar(n)),
-    ]);
-  assert_eq(verified(emptied([])), None);
-  assert_eq(verified(emptied([0])), Some(b"a field kept in cells that do not hold it: v2"));
   // A record is made by value, which takes no cells.
   assert_eq(
     verified(
@@ -2310,12 +2238,7 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
         reset,
         bind(
           n,
-          Make({
-            made: MRecord({ names: [b"a"], width: 1 }),
-            args: [AVar(v)],
-            reuse: Some(token),
-            kept: [],
-          }),
+          Make({ made: MRecord({ names: [b"a"], width: 1 }), args: [AVar(v)], reuse: Some(token) }),
           [],
         ),
         Return(AVar(n)),
@@ -2623,7 +2546,6 @@ test "a field taken before any miss is taken for the next arm, a read by name is
       made: MClosure({ nth: 0, captures: 1, params: 0, stacked: true }),
       args: [AVar(p)],
       reuse: None,
-      kept: [],
     }),
     [],
   );
@@ -2739,17 +2661,14 @@ test "the joins of a body's branches are checked in one walk, however many it de
   paced(|n: Int| n * (ilog2(n) + 1), |n: Int| verified(root_of([c], [], RInt, branches(n))))
 }
 
-test "a box made and a value held as no C value are checked as any other value" {
+test "a boxed case made and a value held as no C value are checked as any other value" {
   let p = word(0);
   let r = word(1);
+  let boxed = MCase({ case: 1, skip: 0, words: 2 });
   assert_eq(
     verified(
       root_of([p], [], RWord, [
-        bind(
-          r,
-          Make({ made: MBox({ words: 2 }), args: [AVar(p), AInt(0)], reuse: None, kept: [] }),
-          [],
-        ),
+        bind(r, Make({ made: boxed, args: [AVar(p), AInt(0)], reuse: None }), []),
         Return(AVar(r)),
       ]),
     ),
@@ -2783,7 +2702,7 @@ test "an address into a block's bytes is read out of a block's word, only while 
   let w = word(3);
   assert_eq(
     read([
-      bind(w, Make({ made: MList(1), args: [AVar(a)], reuse: None, kept: [] }), []),
+      bind(w, Make({ made: MList(1), args: [AVar(a)], reuse: None }), []),
       Dec(b),
       Dec(w),
       Return(AInt(0)),
@@ -3194,7 +3113,7 @@ test "a join set to borrowed values on every path is borrowed of each, and read 
   )
 }
 
-test "a box and a boxed case are made in the cells of a reuse token of as many words" {
+test "a boxed case is made in the cells of a reuse token of as many words, its tag's among them" {
   let b = word(0);
   let t = { ..word(1), rep: RToken(2) };
   let r = word(2);
@@ -3202,12 +3121,12 @@ test "a box and a boxed case are made in the cells of a reuse token of as many w
     verified(
       root_of([b], [], RWord, [
         Reset({ token: t, of: b }),
-        bind(r, Make({ made: m, args: [AInt(1), AInt(2)], reuse: Some(t), kept: [] }), []),
+        bind(r, Make({ made: m, args: [AInt(1), AInt(2)], reuse: Some(t) }), []),
         Return(AVar(r)),
       ]),
     );
-  assert_eq(made(MBox({ words: 2 })), None);
   assert_eq(made(MCase({ case: 1, skip: 0, words: 2 })), None);
+  assert_eq(made(MCase({ case: 1, skip: 1, words: 1 })), None);
   assert_eq(
     made(MCase({ case: 1, skip: 1, words: 2 })),
     Some(b"a value made in cells of another size: v2"),
