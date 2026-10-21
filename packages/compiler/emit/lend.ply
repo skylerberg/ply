@@ -211,7 +211,7 @@ pub fn conventions(f: Fn, handed: Map<Bytes, Handing>) -> Fn / {abort.raise} = {
         _ -> c,
       },
     };
-  let called = calls_handed(f, handed);
+  let called = calls_handed(f, generics_of(f), handed);
   {
     ..called,
     conv: if f.members.len() == 0 { own(f.key, f.conv) } else { f.conv },
@@ -255,14 +255,18 @@ fn conv_handed(c: Convention, h: Handing, what: Bytes) -> Convention / {abort.ra
     }
   }
 
-/// `f` with each call of its body and of its closures' bodies written against its callee's handing.
-fn calls_handed(f: Fn, handed: Map<Bytes, Handing>) -> Fn / {abort.raise} =
+/// `f` with each call of its body and of its closures' bodies written against its callee's handing,
+/// a generic call found among `generics`, the root's, which number its closures' calls too.
+fn calls_handed(f: Fn, generics: List<Bytes>, handed: Map<Bytes, Handing>) -> Fn / {abort.raise} =
   {
     ..f,
-    body: block_handed(f.links.generics.map(|g: GenericCall| g.callee), handed, f.body),
+    body: block_handed(generics, handed, f.body),
     lambdas: f.lambdas.map(|l: Lambda|
-      match l { Closure(c) -> Closure({ ..c, body: calls_handed(c.body, handed) }) }),
+      match l { Closure(c) -> Closure({ ..c, body: calls_handed(c.body, generics, handed) }) }),
   }
+
+/// The definitions the generic calls of `f`, a root, and of its closures name, by the calls' number.
+fn generics_of(f: Fn) -> List<Bytes> = f.links.generics.map(|g: GenericCall| g.callee)
 
 fn block_handed(
   generics: List<Bytes>,
@@ -972,9 +976,14 @@ fn vals_folded<s>(b: Block, acc: s, on: (s, Val) -> s) -> s =
     })
 
 /// The handing each definition `outside` names was written against by the calls of `f`'s body and
-/// of its closures' bodies, as `handed` holds it, each definition once, as an answer publishes it.
-fn assumed_in(f: Fn, handed: Map<Bytes, Handing>, outside: (Bytes) -> Bool) -> List<Published> = {
-  let generics = f.links.generics.map(|g: GenericCall| g.callee);
+/// of its closures' bodies, as `handed` holds it, each definition once, as an answer publishes it; a
+/// generic call found among `generics`, the root's.
+fn assumed_in(
+  f: Fn,
+  generics: List<Bytes>,
+  handed: Map<Bytes, Handing>,
+  outside: (Bytes) -> Bool,
+) -> List<Published> = {
   let added = |a: List<Published>, p: Published|
     if a.any(|x: Published| x.def == p.def) { a } else { a.push(p) };
   let own = vals_folded(f.body, [], |a: List<Published>, v: Val|
@@ -987,7 +996,7 @@ fn assumed_in(f: Fn, handed: Map<Bytes, Handing>, outside: (Bytes) -> Bool) -> L
       _ -> a,
     });
   f.lambdas.fold(own, |a: List<Published>, l: Lambda|
-    match l { Closure(c) -> assumed_in(c.body, handed, outside).fold(a, added) })
+    match l { Closure(c) -> assumed_in(c.body, generics, handed, outside).fold(a, added) })
 }
 
 /// `h`, the handing of definition `def`, as an answer publishes it.
@@ -1046,7 +1055,7 @@ pub fn lent_form(f: Fn, s: Settled) -> LentForm / {abort.raise} = {
     form: lent,
     handings: defs.fold([], |acc: List<Published>, d: Bytes|
       match s.handed.get(d) { Some(h) -> acc.push(published_of(d, h)), None -> acc }),
-    assumed: assumed_in(lent, s.handed, |d: Bytes| !group.contains(d)).fold(
+    assumed: assumed_in(lent, generics_of(lent), s.handed, |d: Bytes| !group.contains(d)).fold(
       specialised,
       |a: List<Published>, p: Published|
         if a.any(|x: Published| x.def == p.def) { a } else { a.push(p) },
@@ -1690,7 +1699,31 @@ test "a body is written against its own handing and each callee's, a callee noth
       },
       handed,
     ).conv.params;
-  assert_eq([for_type(Equal), for_type(Drop)], [[Lent], [Given]])
+  assert_eq([for_type(Equal), for_type(Drop)], [[Lent], [Given]]);
+  // A closure's generic call is numbered among its root's, which the closure's own links hold none of.
+  let generic = match call_of(b"look", [AVar(s)]) {
+    Call(c) -> Call({ ..c, callee: Generic(0) }),
+    other -> other,
+  };
+  let closure = {
+    ..f,
+    key: Named(b"m.f"),
+    body: [bind(r, generic), Return(AVar(r))],
+    links: no_links(),
+  };
+  let rooted = {
+    ..f,
+    lambdas: [Closure({ body: closure, captures: 0, at: dummy_span() })],
+    links: { ..no_links(), generics: [{ callee: b"m.look", args: [], carried: [], fns: [] }] },
+  };
+  match conventions(rooted, handed).lambdas {
+    [Closure(c)] ->
+      assert_eq(
+        calls_written(c.body.body).map(|x: Convention| { params: x.params, answer: x.answered }),
+        [read],
+      ),
+    _ -> assert(false, None),
+  }
 }
 
 test "only a definition's own form is read, each lending what its declaration lends" {
