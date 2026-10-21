@@ -470,6 +470,36 @@ pub fn fails(v: Val) -> Bool =
     Walked(_) -> false,
   }
 
+/// Whether `val` may stop for a handler that can resume it more than once.
+pub fn stops_at(val: Val) -> Bool =
+  match val {
+    Call(c) -> c.stops,
+    Apply(c) -> c.stops,
+    Native(n) -> n.uses.stops,
+    Op(o) -> o.uses.stops,
+    _ -> false,
+  }
+
+/// Whether an instruction of `b`, or of a block it holds, may stop.
+pub fn stops_in(b: Block) -> Bool =
+  b.any(|i: Inst|
+    match i {
+      Let(l) -> stops_at(l.val),
+      Do(d) -> stops_at(d.val),
+      If(x) -> stops_in(x.then) || stops_in(x.otherwise),
+      Case(c) -> stops_in(c.rest) || c.arms.any(|a: { when: Int, body: Block }| stops_in(a.body)),
+      Match(m) -> stops_in(m.rest) || m.arms.any(stops_in),
+      Loop(l) -> stops_in(l.body),
+      Handle(h) -> stops_in(h.body),
+      _ -> false,
+    })
+
+/// Whether anything may stop under a `handle` running `body` at `site`: a clause, its `return`
+/// clause, its body run detached, or a stop in its body. What it holds across its body is then held
+/// across a stop.
+pub fn handle_stops(body: Block, site: HandleSite) -> Bool =
+  site.clauses.len() > 0 || site.ret != None || site.detached != None || stops_in(body)
+
 /// Whether operator `op` over `on` is checked: an integer's arithmetic and shifts, which overflow
 /// or divide by zero, and a width's; an `Int` made a width it does not fit (`of_int`); a decimal's
 /// arithmetic.
@@ -597,6 +627,41 @@ test "what can fail is what tests the runtime: a checked operator, a call, never
   assert_eq(fails(Tag(b"m.Box")), false);
   assert_eq(ends(Miss), true);
   assert_eq(falls_through([Do({ val: Literal(LUnit), at: dummy_span(), unwind: [] })]), true)
+}
+
+test "a call stops where it says, a block where something it holds does, a handle where anything under it may" {
+  let call = |stops: Bool|
+    Call({
+      callee: Generic(0),
+      args: [],
+      conv: { params: [], reps: [], answer: RWord, answered: Owned },
+      stops: stops,
+    });
+  let calling = |stops: Bool| [Do({ val: call(stops), at: dummy_span(), unwind: [] })];
+  assert_eq([stops_at(call(true)), stops_at(call(false))], [true, false]);
+  assert_eq([stops_in(calling(true)), stops_in(calling(false))], [true, false]);
+  // A stop in a branch of the block counts.
+  assert_eq(stops_in([If({ cond: ABool(true), then: [], otherwise: calling(true) })]), true);
+  let quiet = { clauses: [], ret: None, detached: None };
+  let clause = {
+    effect: b"e",
+    op: b"op",
+    resource: b"",
+    mode: 1,
+    binds_label: false,
+    handler: 0,
+    label: None,
+  };
+  assert_eq(
+    [
+      handle_stops(calling(false), quiet),
+      handle_stops(calling(true), quiet),
+      handle_stops([], { ..quiet, ret: Some(0) }),
+      handle_stops([], { ..quiet, detached: Some(1) }),
+      handle_stops([], { ..quiet, clauses: [clause] }),
+    ],
+    [false, true, true, true, true],
+  )
 }
 
 test "a block ends where its last instruction but a site's change ends" {

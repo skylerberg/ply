@@ -19,7 +19,8 @@ import emit.tir (Var, Rep, RWord, RInt, RSum, RFlat, RSlice, RMaybe, RTagged, RC
                  AVar, AZero, AInt, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Return,
                  Restart, Inc, Dec, Reset, Opened, Fn, Rooted, Plain, Handed, Given, Lent, Owned,
                  TTag, Val, LastOf, Walked, Lambda, Closure, no_links, Declined, Spine, counted,
-                 parts_of)
+                 parts_of, stops_at, handle_stops, Call)
+import emit.tir.handling (HandleSite)
 import emit.answer (Need, Reads, Scalar, Layout, Exact)
 
 /// How one counted word is counted. `Object`: 0 or a block's start, given to the drop root it names
@@ -68,7 +69,8 @@ pub type Opening =
   /// A node of a map's tree: a branch's kids, let go of at `node`, and the greatest key under each,
   /// or a leaf's keys and values.
   | PairsOf({ node: RootKey, key: List<Part>, value: List<Part> })
-  /// An array: each element's parts, its elements `stride` words apart.
+  /// An array: each element's parts, its elements `stride` words apart, an element of no words
+  /// taking one.
   | ArrayOf({ element: List<Part>, stride: Int })
   /// A `Columns`: each field's column, an array let go of at its drop root.
   | ColumnsOf(List<RootKey>)
@@ -227,8 +229,9 @@ pub fn release_needs(f: Fn) -> Fn = { ..f, links: { ..f.links, needs: fn_needs(f
 
 /// What `f`'s counts read of its type variables: each a count it lets go of reads exactly, since a
 /// value is let go of per type, and each a count it takes its layout alone. What its failure paths
-/// let go of and what its closures' bodies do count as its own. A body reading any is printed only
-/// at type arguments its callers settle.
+/// let go of and what its closures' bodies do count as its own, and so does what a frame's record
+/// holds across a stop, which counts each value once more and lets it go. A body reading any is
+/// printed only at type arguments its callers settle.
 pub fn release_reads(f: Fn) -> List<Need> = fn_needs([], f)
 
 fn fn_needs(needs: List<Need>, f: Fn) -> List<Need> =
@@ -238,15 +241,16 @@ fn fn_needs(needs: List<Need>, f: Fn) -> List<Need> =
 fn block_needs(needs: List<Need>, b: Block) -> List<Need> =
   b.fold(needs, |acc: List<Need>, i: Inst|
     match i {
-      Let(l) -> unwound(value_needs(acc, l.val), l.unwind),
-      Do(d) -> unwound(value_needs(acc, d.val), d.unwind),
+      Let(l) -> across(unwound(value_needs(acc, l.val), l.unwind), stops_at(l.val), l.unwind),
+      Do(d) -> across(unwound(value_needs(acc, d.val), d.unwind), stops_at(d.val), d.unwind),
       If(x) -> block_needs(block_needs(acc, x.then), x.otherwise),
       Case(c) ->
         c.arms.fold(block_needs(acc, c.rest), |a: List<Need>, arm: { when: Int, body: Block }|
           block_needs(a, arm.body)),
       Match(m) -> m.arms.fold(block_needs(acc, m.rest), block_needs),
       Loop(l) -> block_needs(acc, l.body),
-      Handle(h) -> unwound(block_needs(acc, h.body), h.unwind),
+      Handle(h) ->
+        across(unwound(block_needs(acc, h.body), h.unwind), handle_stops(h.body, h.site), h.unwind),
       Inc(n) -> reading(acc, n.var.ty, Layout),
       Dec(v) -> reading(acc, v.ty, Exact),
       Reset(r) -> reading(acc, r.of.ty, Exact),
@@ -260,8 +264,17 @@ fn value_needs(needs: List<Need>, val: Val) -> List<Need> =
 /// `needs` with what letting go of each counted value of `unwind` reads; a reuse token, freed by its
 /// size, reads nothing.
 fn unwound(needs: List<Need>, unwind: List<Var>) -> List<Need> =
-  unwind.fold(needs, |acc: List<Need>, v: Var|
-    match v.rep { RToken(_) -> acc, r -> if counted(r) { reading(acc, v.ty, Exact) } else { acc } })
+  holding(unwind).fold(needs, |acc: List<Need>, v: Var| reading(acc, v.ty, Exact))
+
+/// `needs` with what a frame's record over `unwind` reads where it is held across a stop, as `stops`
+/// says: the count of each value `unwound` lets go of taken once more, by its layout.
+fn across(needs: List<Need>, stops: Bool, unwind: List<Var>) -> List<Need> =
+  if !stops { needs }
+  else { holding(unwind).fold(needs, |acc: List<Need>, v: Var| reading(acc, v.ty, Layout)) }
+
+/// The values of `unwind` that hold a count, but a reuse token, which is freed by its size.
+fn holding(unwind: List<Var>) -> List<Var> =
+  unwind.filter(|v: Var| match v.rep { RToken(_) -> false, r -> counted(r) })
 
 /// `needs` with each variable a count of `ty` reads read as `reads`.
 fn reading(needs: List<Need>, ty: Type, reads: Reads) -> List<Need> =
@@ -552,7 +565,7 @@ fn named_opening(
     PairsOf({ node: drop_of(ty), key: item(arg(0)), value: item(arg(1)) })
   } else if name == b"Array" {
     let l = laid_of(arg(0));
-    ArrayOf({ element: laid_parts(ctors, arg(0), l, 0), stride: words(l) })
+    ArrayOf({ element: laid_parts(ctors, arg(0), l, 0), stride: max(1, words(l)) })
   } else if name == b"Columns" {
     ColumnsOf(field_types(arg(0)).map(|t: Type| drop_of(TyCon({ name: b"Array", args: [t] }))))
   } else if name == b"Hold" { Holding({ at: hold_laid().held, ty: arg(0), rep: RWord }) }
@@ -1685,4 +1698,52 @@ test "a body reads exactly each variable it lets go of a value of, and the layou
     release_reads({ ..f, body: [Dec(local(8, at(b"List", [int_type()]))), Return(AInt(0))] }),
     [],
   )
+}
+
+test "a value held across what may stop is read by its layout too, as the frame's record counts it" {
+  let held = { id: 0, ty: TyVar(0), rep: RWord };
+  let token = { id: 1, ty: TyVar(1), rep: RToken(2) };
+  let kept = { id: 2, ty: TyVar(2), rep: RWord };
+  let answer = { id: 3, ty: int_type(), rep: RWord };
+  let call = |stops: Bool|
+    Call({
+      callee: keys::Root(keys::Named(b"m.g")),
+      args: [],
+      conv: { params: [], reps: [], answer: RWord, answered: Owned },
+      stops: stops,
+    });
+  let root = |body: Block|
+    {
+      key: keys::Named(b"m.f"),
+      kind: Rooted,
+      params: [],
+      conv: { params: [], reps: [], answer: RInt, answered: Owned },
+      body: body.push(Return(AInt(0))),
+      lambdas: [],
+      base: 0,
+      members: [],
+      links: no_links(),
+      statics: [],
+    };
+  let site = |stops: Bool| [Do({ val: call(stops), at: dummy_span(), unwind: [held, token] })];
+  assert_eq(release_reads(root(site(true))), [{ var: 0, reads: Exact }, { var: 0, reads: Layout }]);
+  assert_eq(release_reads(root(site(false))), [{ var: 0, reads: Exact }]);
+  let handled = |s: HandleSite, body: Block|
+    [
+      Handle({
+        body: body,
+        args: [],
+        uses: { takes: [], owned: false, fails: false, stops: false },
+        site: s,
+        answer: answer,
+        unwind: [kept, token],
+      }),
+    ];
+  let quiet = { clauses: [], ret: None, detached: None };
+  // A handle holds across a stop where its return clause may run, or its body may stop.
+  [handled({ ..quiet, ret: Some(0) }, []), handled(quiet, site(true))].fold(
+    (),
+    |_: Unit, b: Block| assert(release_reads(root(b)).contains({ var: 2, reads: Layout }), None),
+  );
+  assert_eq(release_reads(root(handled(quiet, []))), [{ var: 2, reads: Exact }])
 }
