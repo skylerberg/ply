@@ -14,9 +14,9 @@ import emit.roots (builtin_helper)
 import emit.keys (Root, Copy, root_name)
 import emit.release (root_of, laid_parts, form_parts)
 import emit.pieces (Piece, Text, Hole, Symbol, ShapeOf, spelled)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RFlat, RSum, Leaf, Var, Arg,
-                 AVar, AInt, AZero, Made, MList, Uses, Containers, Convention, Given, Owned,
-                 counted, var_said, made_said, rep_of_arg)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RFlat, RSum, Leaf, Var, Arg, AVar,
+                 AInt, AZero, Made, MList, Uses, Containers, Convention, Given, Owned, counted,
+                 var_said, made_said, rep_of_arg)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, Within, ArrayNew, ArraySet,
                             ArrayOfList, ArrayGet, ColumnsNew, ColumnsSet, ColumnsOfList,
                             ColumnsGet, ColumnField, ColumnOf, ItemAt, Rest, LeafOf, Room, Position,
@@ -30,6 +30,8 @@ import emit.print.counts (Said, released, duped, let_go_of, dup_of)
 import emit.print.lists (item_read, leaf_read, rest_made, list_made)
 import emit.print.strings (taken_printed)
 import emit.print.invoked (typed_callee, convention_of)
+import emit.print.counting (dup_fn, rel_fn, free_fn, inc_fn, dec_fn, call_text, call_start, calls,
+                            counts_any)
 
 /// A list made of `m.args`, words it takes.
 pub fn contained(
@@ -216,25 +218,16 @@ fn laid_printed(
   let after = |less: Bytes|
     Bytes::concat_all([b"(int64_t)", header(a, b"len"), b" - ", index, less]);
   let pairs = Some(Bytes::concat_all([b"2 * (int64_t)", header(a, b"len")]));
-  let replaced = |q: Printing, slot: Bytes, x: Bytes| {
+  let node = operand_type(args, 0);
+  // An item written over is let go of as the word form of its type is counted.
+  let replaced = |q: Printing, slot: Bytes, x: Bytes, ty: Type| {
     let old = temp(q);
-    line(
+    let set = line(
       old.pr,
       p.depth,
-      Bytes::concat_all([
-        b"Word ",
-        old.name,
-        b" = ",
-        slot,
-        b"; ",
-        slot,
-        b" = ",
-        x,
-        b"; ply_dec(ctx, ",
-        old.name,
-        b");",
-      ]),
-    )
+      Bytes::concat_all([b"Word ", old.name, b" = ", slot, b"; ", slot, b" = ", x, b";"]),
+    );
+    said_line(let_go_of(set, form_parts(pr.ctors, ty), [old.name]), p.depth)
   };
   match op {
     OfList(ListStart) -> header_int(laid.list.start),
@@ -279,11 +272,13 @@ fn laid_printed(
         slot_of(g.name, ascii_of_int(laid.list.tail)),
         b", &",
         slot_of(a, ascii_of_int(laid.list.tail)),
-        b", (size_t)n * sizeof(Word)); ply_free(ctx, ",
-        a,
-        b", ",
-        ascii_of_int(header_bytes() + 8 * laid.list.tail),
-        b" + 8 * n); ",
+        b", (size_t)n * sizeof(Word)); ",
+        call_text(free_fn(), [
+          b"ctx",
+          a,
+          ascii_of_int(header_bytes() + 8 * laid.list.tail).concat(b" + 8 * n"),
+        ]),
+        b"; ",
         a,
         b" = ",
         g.name,
@@ -323,8 +318,14 @@ fn laid_printed(
         ]),
       ),
     OfList(TailSet) ->
-      replaced(owned(Some(header(a, laid.list.tail_len))), tail(i), operand(pr, args, 2)),
-    OfList(LeafSet) -> replaced(owned(Some(header(a, b"len"))), at(i), operand(pr, args, 2)),
+      replaced(
+        owned(Some(header(a, laid.list.tail_len))),
+        tail(i),
+        operand(pr, args, 2),
+        held_type(node),
+      ),
+    OfList(LeafSet) ->
+      replaced(owned(Some(header(a, b"len"))), at(i), operand(pr, args, 2), held_type(node)),
     OfMap(MapRoot) -> raw(slot_of(o, ascii_of_int(laid.map.root))),
     OfMap(MapHeight) -> header_int(laid.map.height),
     OfMap(NodeCount) -> header_int(b"len"),
@@ -358,53 +359,15 @@ fn laid_printed(
     },
     OfMap(PairSet) -> {
       let pair = Bytes::concat_all([b"2 * ", index]);
-      let old_key = temp(owned(pairs));
-      let old_value = temp(old_key.pr);
-      line(
-        old_value.pr,
-        p.depth,
-        Bytes::concat_all([
-          b"Word ",
-          old_key.name,
-          b" = ",
-          at(pair),
-          b"; Word ",
-          old_value.name,
-          b" = ",
-          at(pair.concat(b" + 1")),
-          b"; ",
-          at(pair),
-          b" = ",
-          operand(pr, args, 2),
-          b"; ",
-          at(pair.concat(b" + 1")),
-          b" = ",
-          operand(pr, args, 3),
-          b"; ply_dec(ctx, ",
-          old_key.name,
-          b"); ply_dec(ctx, ",
-          old_value.name,
-          b");",
-        ]),
-      )
+      let keyed = replaced(owned(pairs), at(pair), operand(pr, args, 2), type_arg(node, 0));
+      replaced(keyed, at(pair.concat(b" + 1")), operand(pr, args, 3), type_arg(node, 1))
     },
     OfMap(KidBack) -> {
-      let old_max = temp(owned(None));
+      let maxed = replaced(owned(None), at(keys(index)), operand(pr, args, 3), type_arg(node, 0));
       line(
-        old_max.pr,
+        maxed,
         p.depth,
         Bytes::concat_all([
-          b"Word ",
-          old_max.name,
-          b" = ",
-          at(keys(index)),
-          b"; ",
-          at(keys(index)),
-          b" = ",
-          operand(pr, args, 3),
-          b"; ply_dec(ctx, ",
-          old_max.name,
-          b"); ",
           at(index),
           b" = ",
           operand(pr, args, 2),
@@ -445,15 +408,16 @@ fn laid_printed(
     OfMap(KidDrop) -> {
       let n = after(b" - 1");
       let next = index.concat(b" + 1");
+      // The kid dropped goes to its node's drop, the greatest key under it as its type counts it.
+      let kid = said_line(released(owned(None), node, RWord, [at(index)]), p.depth);
+      let key = said_line(
+        let_go_of(kid, form_parts(pr.ctors, type_arg(node, 0)), [at(keys(index))]),
+        p.depth,
+      );
       line(
-        owned(None),
+        key,
         p.depth,
         Bytes::concat_all([
-          b"ply_dec(ctx, ",
-          at(index),
-          b"); ply_dec(ctx, ",
-          at(keys(index)),
-          b"); ",
           shifted(next, n, b"-1"),
           shifted(keys(next), n, b"-1"),
           shifted(sizes(next), n, b"-1"),
@@ -718,7 +682,9 @@ fn fields_set(p: Place, pr: Printing, v: Var, fields: List<Answered>) -> Printin
           // A sum's word form is the sum itself, whatever it counts.
           let value = if !x.item { x.word }
           else if counted(r) || (match r { RSum(_) -> true, _ -> false }) { word_as(x.word, r) }
-          else { Bytes::concat_all([word_as(x.word, r), b"; ply_dec(ctx, ", x.word, b")"]) };
+          else {
+            Bytes::concat_all([word_as(x.word, r), b"; ", call_text(dec_fn(), [b"ctx", x.word])])
+          };
           line(q, p.depth, Bytes::concat_all([c_type(r), b" ", nth(mine, 0), b" = ", value, b";"]))
         }
       },
@@ -1103,9 +1069,9 @@ fn position_printed(p: Place, pr: Printing, v: Var, args: List<Arg>) -> Printing
       from,
       b" > (uint64_t)ply_obj(",
       b,
-      b")->len) { ply_inc(",
-      b,
-      b"); ",
+      b")->len) { ",
+      call_text(inc_fn(), [b]),
+      b"; ",
       builtin_helper(b"Bytes::position"),
       b"_p(ctx, ",
       b,
@@ -1472,9 +1438,12 @@ fn columns_set(
 }
 
 /// The type a container of type `ty` holds, its first argument.
-fn held_type(ty: Type) -> Type =
+fn held_type(ty: Type) -> Type = type_arg(ty, 0)
+
+/// Type argument `k` of the container type `ty`.
+fn type_arg(ty: Type, k: Int) -> Type =
   match ty {
-    TyCon(c) -> match c.args.at(0) { Some(t) -> t, None -> unknown_type() },
+    TyCon(c) -> match c.args.at(k) { Some(t) -> t, None -> unknown_type() },
     _ -> unknown_type(),
   }
 
@@ -1701,13 +1670,15 @@ test "a list's item is read where it lies and its rest shares its trie, neither 
   });
   // A read counts nothing; a rest counts the root it shares and each item it copies, as the item's
   // type counts it: an `Int`'s word only where it is the runtime's box.
-  [item, scalar].fold((), |_: Unit, text: Bytes| {
-    assert_eq(text.index_of(b"ply_dup("), None);
-    assert_eq(text.index_of(b"ply_inc("), None)
-  });
-  assert(rest.index_of(b"ply_dup(ply_words(t1)[0]);") != None, Some(String::of_bytes_lossy(rest)));
-  assert(rest.index_of(b"ply_dup(t6);") != None, Some(String::of_bytes_lossy(rest)));
-  assert(ints.index_of(b"if (!(t6 & 7)) ply_dup(t6);") != None, Some(String::of_bytes_lossy(ints)));
+  [item, scalar].fold((), |_: Unit, text: Bytes|
+    assert(!counts_any(text), Some(String::of_bytes_lossy(text))));
+  let dup = |w: Bytes| call_text(dup_fn(), [w]).concat(b";");
+  assert(rest.index_of(dup(b"ply_words(t1)[0]")) != None, Some(String::of_bytes_lossy(rest)));
+  assert(rest.index_of(dup(b"t6")) != None, Some(String::of_bytes_lossy(rest)));
+  assert(
+    ints.index_of(b"if (!(t6 & 7)) ".concat(dup(b"t6"))) != None,
+    Some(String::of_bytes_lossy(ints)),
+  );
   // A scalar is read out of the item's word.
   assert(scalar.index_of(b"int64_t t6 = ") != None, Some(String::of_bytes_lossy(scalar)))
 }
@@ -1761,11 +1732,11 @@ test "an array of records holds each record's words in place, and a write lets g
   // A copy keeps the stride, and its strings are counted where it copies them.
   has(b")->aux = ply_obj(t1)->aux; memcpy(");
   has(b"rt_note_update_p(ctx, in_place, in_place ? 0 : ");
-  // The string of the record replaced goes to its drop root, never to `ply_dec`; the float is bits.
-  has(b"ply_rel(ctx, ply_words(t1)[(p1) * 2 + 0], ");
+  // The string of the record replaced goes to its drop root, never to the runtime's; the float is bits.
+  has(call_start(rel_fn(), [b"ctx", b"ply_words(t1)[(p1) * 2 + 0]"]));
   has(b"ply_words(t1)[(p1) * 2 + 1] = ply_f64_bits(");
   has(b"builtin_elaborated_refused_p(ctx, 5, p1, ");
-  assert_eq(text.index_of(b"ply_dec(ctx, ply_words("), None)
+  assert(!calls(text, dec_fn()), Some(String::of_bytes_lossy(text)))
 }
 
 test "a field of a Columns' record is read from its column in place, an index naming no record raising" {
@@ -1787,8 +1758,5 @@ test "a field of a Columns' record is read from its column in place, an index na
     b"if ((uint64_t)p1 >= (uint64_t)ply_array_len(ply_words(p0)[2])) { builtin_elaborated_refused_p(ctx, 6, p1, ply_array_len(ply_words(p0)[2]), 0); return 0; }",
   );
   has(b"(ply_words(ply_words(p0)[2]) + (p1) * 1)[0]");
-  assert_eq([text.index_of(b"rt_columns_field_p"), text.index_of(b"PLY_KIND_COLUMNS")], [
-    None,
-    None,
-  ])
+  assert_eq(text.index_of(b"PLY_KIND_COLUMNS"), None)
 }

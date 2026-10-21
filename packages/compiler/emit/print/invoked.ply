@@ -7,16 +7,15 @@ import std.bytes (ascii_of_int)
 import syntax.parsing (span_between)
 import check.types (Type, TyCon, TyFn, TyVar, row_empty)
 import emit.c (int_lit, tick_line)
-import emit.reps (Ctors, FieldTy, in_place, word_type, resumption)
+import emit.reps (Ctors, word_type, resumption)
 import emit.roots (symbol_of, root_id)
 import emit.keys (Callee, Root, Generic, Named, Share, Keep, TypeOp, root_name)
 import emit.layout (header_bytes)
 import emit.pieces (Piece, Text, Hole, Symbol, LambdaEntry, placeholder, spelled)
 import emit.answer (Expect)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases, RSum,
-                 RUnit, Leaf, Var, Arg, AVar, Given, Lent, Owned, Borrowed, Convention, Made,
-                 MClosure, Fn, Member, Lambda, Closure, Uses, Calling, Return, Rooted, rep_of_arg,
-                 made_said, no_links)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RFlat, RSum, RUnit, Leaf, Var, Arg,
+                 AVar, Given, Lent, Owned, Borrowed, Convention, Made, MClosure, Fn, Member, Lambda,
+                 Closure, Uses, Calling, Return, Rooted, rep_of_arg, made_said, no_links)
 import emit.tir.calling (CallingOp, ConstantRead, Ticked)
 import emit.release (Held, Opening, InBox, stored_parts, drop_of)
 import emit.lower.held (passing, InWords, ByReference, answer_buffer, value_words, values_of,
@@ -30,6 +29,7 @@ import emit.print.made (c_type, c_types, zeros, word_as, arg_parts, head_types, 
                         entry_answered, entry_answer_values, parts_word, word_parts, declared,
                         set_parts, in_box)
 import emit.print.fuel (fuel_head)
+import emit.print.counting (last_fn, rel_int_fn, free_fn, dec_fn, call_text)
 
 /// A call of `c.callee` on `c.args`, its answer into `into`, its failure tested after it. The head
 /// the call was written to is noted for the unit to hold the callee's own to.
@@ -755,9 +755,9 @@ fn release_entry(
         ).push(
           Text(
             Bytes::concat_all([
-              b"  ply_free(ctx, self, ",
-              ascii_of_int(header_bytes() + 8 * b.words),
-              b");\n  return 0;\n}\n",
+              b"  ",
+              call_text(free_fn(), [b"ctx", b"self", ascii_of_int(header_bytes() + 8 * b.words)]),
+              b";\n  return 0;\n}\n",
             ]),
           ),
         ),
@@ -996,19 +996,13 @@ pub fn group_wrapper(
   }
 
 /// How a member's wrapper hands back what the group's function `call` answers, a word, as the member
-/// answers `answer`: the word itself; an `Option`'s or a `Result`'s object opened; a scalar read out
-/// and the word let go; a value held as several opened into them, each past the first written into
+/// answers `answer`: the word itself; a scalar read out and the word let go; a value held as several opened into them, each past the first written into
 /// the caller's buffer `o`.
 fn group_answered(call: Bytes, answer: Rep) -> List<Piece> = {
   let got = Bytes::concat_all([b"  Word r = ", call, b";\n  if (ctx->failed) "]);
   match answer {
     RWord -> [Text(Bytes::concat_all([b"  return ", call, b";\n"]))],
-    RMaybe ->
-      [Text(Bytes::concat_all([got, b"return 0;\n  return ", word_as(b"r", answer), b";\n"]))],
-    RTagged ->
-      [Text(Bytes::concat_all([got, b"return 0;\n  return ", word_as(b"r", answer), b";\n"]))],
     RFlat(_) -> several_answered(got, answer),
-    RCases(_) -> several_answered(got, answer),
     RSum(_) -> if in_box(answer) { several_answered(got, answer) }
     else { [Text(Bytes::concat_all([b"  return ", call, b";\n"]))] },
     RUnit -> [Text(Bytes::concat_all([b"  ", call, b";\n  return 0;\n"]))],
@@ -1022,7 +1016,9 @@ fn group_answered(call: Bytes, answer: Rep) -> List<Piece> = {
             c_type(k),
             b" v = ",
             word_as(b"r", k),
-            b";\n  ply_dec(ctx, r);\n  return v;\n",
+            b";\n  ",
+            call_text(dec_fn(), [b"ctx", b"r"]),
+            b";\n  return v;\n",
           ]),
         ),
       ],
@@ -1102,8 +1098,6 @@ fn one_spelled(r: Rep) -> Bytes =
     RBool -> b"b",
     RFloat -> b"f",
     RDec -> b"d",
-    RMaybe -> b"m",
-    RTagged -> b"t",
     RNum(w) -> Bytes::concat_all([if w.signed { b"s" } else { b"u" }, ascii_of_int(w.bits)]),
     RSum(_) -> Bytes::concat_all([b"s", ascii_of_int(value_words(r))]),
     RUnit -> b"n",
@@ -1356,11 +1350,21 @@ test "a closure's entries lend its captures out of its block, its release lets e
     ]),
   );
   has(Bytes::concat_all([b"(ctx, ply_words(self)[1], ply_words(self)[2], "]));
-  has(b"  ply_rel_int(ctx, ply_words(self)[1]);\n");
+  has(Bytes::concat_all([b"  ", call_text(rel_int_fn(), [b"ctx", b"ply_words(self)[1]"]), b";\n"]));
   has(
-    b"  if (ply_words(self)[2] && ply_last(ctx, ply_words(self)[2])) ((const PlyFnDesc *)(intptr_t)ply_words(ply_words(self)[2])[0])->release(ctx, ply_words(self)[2]);\n",
+    Bytes::concat_all([
+      b"  if (ply_words(self)[2] && ",
+      call_text(last_fn(), [b"ctx", b"ply_words(self)[2]"]),
+      b") ((const PlyFnDesc *)(intptr_t)ply_words(ply_words(self)[2])[0])->release(ctx, ply_words(self)[2]);\n",
+    ]),
   );
-  has(b"  ply_free(ctx, self, 40);\n  return 0;\n}\n");
+  has(
+    Bytes::concat_all([
+      b"  ",
+      call_text(free_fn(), [b"ctx", b"self", b"40"]),
+      b";\n  return 0;\n}\n",
+    ]),
+  );
   has(b"->share(ctx, ply_words(self)[2]))");
   has(
     Bytes::concat_all([
