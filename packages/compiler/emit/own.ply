@@ -4,9 +4,11 @@
 //! of a branch that does not read it. A use that consumes a value still live after it takes an
 //! `Inc` first; a last use moves. A value read out of another keeps that one live until its own
 //! last read, but where the other's last use consumes it before then: the value read out of it then
-//! takes a count of its own where it is bound, so the other moves. A value let go of whose cells a later constructor of its type takes, in the arms of
-//! the branch that follows or after it, with no stop, loop or handle between, is reset into a token
-//! that one reuses, writing only the fields that changed; a way out of the body between frees it.
+//! takes a count of its own where it is bound, so the other moves. A sum let go of where the case
+//! around knows it to hold a boxed case, whose box a later boxed case of as many words is made in,
+//! in the arms of the branch that follows or after it, with no stop, loop or handle between, is
+//! opened into that box, which is reset into a token the make takes; a way out of the body between
+//! frees it.
 //! A flat value made or handed in whole, a loop's state at each pass among them, is opened into its
 //! parts where it is bound, each part then counted on its own, so a leaf read out and consumed at
 //! its last use moves; a field handed on out of a block this body holds is taken out of it, so
@@ -21,29 +23,27 @@ import std.bytes (ascii_of_int)
 import std.math (ilog2)
 import std.pace (paced)
 import check.types (Type, TyCon, TyRecord)
-import emit.c (KInt, KBoxed)
 import emit.layout
 import emit.layout (WordClass, header_bytes, P, Always, WordIs, WordOutside, Nullary, Inline, Boxed,
                     LWords)
 import emit.lower.held (leaf_type)
 import emit.release (boxed_case_of)
-import emit.reps (TyOpen)
 import emit.typing (unknown_type)
 import syntax.parsing (dummy_span)
 import emit.keys (Named, Root)
 import emit.tir (Rep, RWord, RInt, RBool, RFloat, RMaybe, RTagged, RFlat, RCases, RToken, RSum,
                  MCase, Var, Arg, AVar, AInt, ABool, AFloat, AZero, Val, Prim, Make, Get, Take,
                  Pack, Call, Apply, Native, Gathered, Path, PField, PArg, PLeaf, PNamed, PCase,
-                 Made, MRecord, MCtor, MLaid, MList, MBox, MClosure, TLength, Inst, Let, Do, Decl,
-                 Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter, Fail,
-                 NoArm, Handle, Sited, Inc, Dec, Reset, Free, Opened, Block, Fn, Member, Convention,
-                 Rooted, Lambda, Closure, Handed, Given, Lent, Owned, Borrowed, Returned, Test,
-                 TTag, Owns, ReadsOf, Lasts, Static, Op, OStrings, RAddr, PPayload, no_links,
-                 counted, operands, fails, used_as, var_of, rep_of_arg, parts_of, ends, string_uses)
+                 Made, MRecord, MList, MBox, MClosure, TLength, Inst, Let, Do, Decl, Assign, If,
+                 Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter, Fail, NoArm, Handle,
+                 Sited, Inc, Dec, Reset, Free, Opened, Block, Fn, Member, Convention, Rooted,
+                 Lambda, Closure, Handed, Given, Lent, Owned, Borrowed, Returned, Test, TTag, Owns,
+                 ReadsOf, Lasts, Static, Op, OStrings, RAddr, PPayload, no_links, counted, operands,
+                 fails, used_as, var_of, rep_of_arg, parts_of, ends, string_uses)
 import emit.tir.strings (ByteRead)
 import emit.verify (verified, stacked_captures, payload_of, field_path, held_in_place, reuses_cells,
-                    made_width, kept_reads, re_held, leaves, answer_held, boxed_read, word_held,
-                    immortals, points_into)
+                    made_width, re_held, leaves, answer_held, boxed_read, word_held, immortals,
+                    points_into)
 
 /// How a counted variable is held: a count of its own, or read without one out of the owned
 /// variables `bases` names, each live while it is (none where nothing the body lets go of holds
@@ -95,10 +95,10 @@ type Exits = {
   answered: Returned,
 }
 
-/// A `Make` the cells of a value let go of above it could go to: its place in the block it is in,
+/// A `Make` the cells of a box let go of above it could go to: its place in the block it is in,
 /// counted from that block's end; the branches on the way to that block, each by its place, so
-/// counted, and the arm taken; the type it makes, what it makes, and from what.
-type Taker = { at: Int, route: List<{ at: Int, arm: Int }>, ty: Type, made: Made, args: List<Arg> }
+/// counted, and the arm taken; and what it makes.
+type Taker = { at: Int, route: List<{ at: Int, arm: Int }>, made: Made }
 
 /// A block walked from its end back to a point: its instructions after the point, last first;
 /// what is live at the point; the first free variable number; and the `Make`s reached from the
@@ -1008,7 +1008,6 @@ fn walked_back(fx: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Back =
           // A flat value opened where it is made: each word nothing reads is let go of at once.
           Some(ws) ->
             placed(
-              fx,
               ex,
               acc,
               p,
@@ -1018,7 +1017,6 @@ fn walked_back(fx: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Back =
             ),
           None ->
             placed(
-              fx,
               ex,
               acc,
               p,
@@ -1032,13 +1030,12 @@ fn walked_back(fx: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Back =
       Do(d) -> {
         let p = planned(fx, uses_of(fx, d.val), acc.live);
         let unwind = if leaves(d.val) { unwind_of(fx, ex, acc.live, p.after) } else { [] };
-        placed(fx, ex, acc, p, Do({ ..d, unwind: unwind }), [], [])
+        placed(ex, acc, p, Do({ ..d, unwind: unwind }), [], [])
       },
       Decl(v) -> { ..acc, rev: acc.rev.push(i), live: acc.live.remove(v.id) },
       Assign(s) -> {
         let dead = if owns(fx, s.var) && !acc.live.contains(s.var.id) { [s.var] } else { [] };
         placed(
-          fx,
           ex,
           acc,
           // A join held as what it is set to only reads it.
@@ -1128,7 +1125,6 @@ fn walked_back(fx: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Back =
         let p = planned(fx, l.init.map(|a: Arg| { arg: a, takes: true }), carried);
         let gone = inner.values().filter(|v: Var| owns(fx, v) && !acc.live.contains(v.id));
         placed(
-          fx,
           ex,
           { ..acc, next: e.next },
           { ..p, after: p.after.concat(gone) },
@@ -1150,7 +1146,6 @@ fn walked_back(fx: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Back =
         let gone = inner.values().filter(|v: Var| owns(fx, v) && !acc.live.contains(v.id));
         let unwind = across.values().filter(|v: Var| owns(fx, v) && !ex.landing.contains(v.id));
         placed(
-          fx,
           ex,
           { ..acc, next: e.next },
           { ..p, after: p.after.concat(gone) },
@@ -1331,16 +1326,8 @@ fn unwind_of(fx: Facts, ex: Exits, after: Live, dying: List<Var>) -> List<Var> =
 
 /// `inst` placed with the counts `p` says, `then` right after it, `dead` let go of after that, and
 /// `p.after` after those.
-fn placed(
-  fx: Facts,
-  ex: Exits,
-  acc: Back,
-  p: Plan,
-  inst: Inst,
-  then: List<Inst>,
-  dead: List<Var>,
-) -> Back = {
-  let tail = dead.concat(p.after).reverse().fold(acc, |b: Back, v: Var| dropped(fx, ex, b, v));
+fn placed(ex: Exits, acc: Back, p: Plan, inst: Inst, then: List<Inst>, dead: List<Var>) -> Back = {
+  let tail = dead.concat(p.after).reverse().fold(acc, |b: Back, v: Var| dropped(ex, b, v));
   let followed = then.reverse().fold(tail.rev, |r: List<Inst>, n: Inst| r.push(n));
   let put = {
     ..tail,
@@ -1349,7 +1336,7 @@ fn placed(
     // come more than once there, so the cells reach the taker only where none can.
     takers: if nests(inst) { [] } else { taking(tail.takers, inst, followed.len()) },
   };
-  let freed = p.before.reverse().fold(put, |b: Back, v: Var| dropped(fx, ex, b, v));
+  let freed = p.before.reverse().fold(put, |b: Back, v: Var| dropped(ex, b, v));
   {
     ..freed,
     rev: p.incs.reverse().fold(freed.rev, |r: List<Inst>, n: Inst| r.push(n)),
@@ -1375,7 +1362,7 @@ fn ended_back(
   inst: Inst,
   ops: List<Operand>,
   after: Live,
-) -> Back = placed(fx, ex, { ..acc, takers: [] }, planned(fx, ops, after), inst, [], [])
+) -> Back = placed(ex, { ..acc, takers: [] }, planned(fx, ops, after), inst, [], [])
 
 fn all_taken(args: List<Arg>) -> List<Operand> = args.map(|a: Arg| { arg: a, takes: true })
 
@@ -1423,7 +1410,7 @@ fn entered(
   held: Live,
 ) -> { block: Block, next: Int, takers: List<Taker> } = {
   let gone = held.values().filter(|v: Var| owns(fx, v) && !w.live.contains(v.id));
-  let b = gone.reverse().fold(w, |acc: Back, v: Var| dropped(fx, ex, acc, v));
+  let b = gone.reverse().fold(w, |acc: Back, v: Var| dropped(ex, acc, v));
   { block: b.rev.reverse(), next: b.next, takers: b.takers }
 }
 
@@ -1432,17 +1419,16 @@ fn taking(takers: List<Taker>, inst: Inst, at: Int) -> List<Taker> =
   match inst {
     Let(l) -> match l.val {
       Make(m) -> if takes_cells(l.var, m.made, m.reuse) {
-        takers.push({ at: at, route: [], ty: l.var.ty, made: m.made, args: m.args })
+        takers.push({ at: at, route: [], made: m.made })
       } else { takers },
       _ -> takers,
     },
     _ -> takers,
   }
 
-/// Whether `v` bound to a `Make` of `made` reusing `reuse` takes the cells of a value let go of
-/// before it where they fit: it makes a constructor's object or a laid out record afresh. A
-/// constructor of no payload words is a singleton nothing allocates, and a record the runtime lays
-/// out is made by value, so neither takes cells.
+/// Whether `v` bound to a `Make` of `made` reusing `reuse` takes the cells of a box let go of before
+/// it where they fit: it makes a block of words afresh. A record the runtime lays out is made by
+/// value, and takes none.
 fn takes_cells(v: Var, made: Made, reuse: Option<Var>) -> Bool =
   reuse == None && v.rep == RWord && reuses_cells(made) && made_width(made) > 0
 
@@ -1477,43 +1463,31 @@ fn nearest(takers: List<Taker>) -> Option<Int> =
       None -> Some(first_at(t)),
     })
 
-/// `v` let go of: reset into a token where `Make`s below take cells of its shape (the nearest, or
-/// in each arm of the nearest branch that makes one, the arms that make none freeing it), else
-/// released.
-fn dropped(fx: Facts, ex: Exits, b: Back, v: Var) -> Back = {
-  let boxed = boxed_known(ex, v);
-  let fitting = b.takers.filter(|t: Taker| fits(ex, v, boxed, t));
-  match nearest(fitting) {
-    None -> { ..b, rev: b.rev.push(Dec(v)) },
-    Some(at) -> {
-      let chosen = fitting.filter(|t: Taker| first_at(t) == at);
-      let made = match chosen.at(0) { Some(t) -> t.made, None -> MList(0) };
-      let rest = b.takers.filter(|x: Taker| !chosen.contains(x));
-      match boxed {
-        None -> {
-          let token = token_of(b.next, v, made);
-          {
-            ..b,
-            rev: taken_in(fx, b.rev.reverse(), chosen, token, v).reverse().push(
-              Reset({ token: token, of: v }),
-            ),
-            next: b.next + 1,
-            takers: rest,
-          }
-        },
-        // A sum known to hold a boxed case is opened into that box, whose cells are reset.
-        Some(r) -> {
+/// `v` let go of: where it is a sum known to hold a boxed case and `Make`s below take cells of that
+/// box's size (the nearest, or in each arm of the nearest branch that makes one, the arms that make
+/// none freeing it), opened into its box, which is reset into a token they take; else released.
+fn dropped(ex: Exits, b: Back, v: Var) -> Back = {
+  let released = { ..b, rev: b.rev.push(Dec(v)) };
+  match boxed_known(ex, v) {
+    None -> released,
+    Some(r) -> {
+      let fitting = b.takers.filter(|t: Taker| fits(r, t));
+      match nearest(fitting) {
+        None -> released,
+        Some(at) -> {
+          let chosen = fitting.filter(|t: Taker| first_at(t) == at);
+          let made = match chosen.at(0) { Some(t) -> t.made, None -> MList(0) };
           let box = { id: b.next, ty: v.ty, rep: r };
           let token = token_of(b.next + 1, box, made);
           {
             ..b,
-            rev: taken_in(fx, b.rev.reverse(), chosen, token, box).reverse().push(
+            rev: taken_in(b.rev.reverse(), chosen, token).reverse().push(
               Reset({ token: token, of: box }),
             ).push(
               Opened({ of: v, words: [box] }),
             ),
             next: b.next + 2,
-            takers: rest,
+            takers: b.takers.filter(|x: Taker| !chosen.contains(x)),
           }
         },
       }
@@ -1552,29 +1526,14 @@ fn box_words(r: Rep) -> Int =
 fn token_of(id: Int, of: Var, made: Made) -> Var =
   { id: id, ty: of.ty, rep: RToken(made_width(made)) }
 
-/// Whether `t` may take the cells of `v`: a value of the same type held as its object, of the
-/// constructor the case around knows `v` to hold, or a record or a box of a value, whose type lays
-/// it out one way; or, where `v` is a sum known to hold a boxed case held as `boxed`, a box of as
-/// many words.
-fn fits(ex: Exits, v: Var, boxed: Option<Rep>, t: Taker) -> Bool =
-  match boxed {
-    // A boxed case's cells fit any box of as many words.
-    Some(r) ->
-      (match t.made { MBox(_) -> true, MCase(_) -> true, _ -> false })
-        && made_width(t.made) == box_words(r),
-    None ->
-      v.rep == RWord && v.ty == t.ty
-        && (match t.made {
-          MCtor(c) -> ex.known.get(v.id) == Some(c.name),
-          MLaid(l) -> match l.ctor { Some(c) -> ex.known.get(v.id) == Some(c), None -> true },
-          MBox(_) -> true,
-          _ -> false,
-        }),
-  }
+/// Whether `t` may take the cells of a box held as `r`: a box of as many words.
+fn fits(r: Rep, t: Taker) -> Bool =
+  (match t.made { MBox(_) -> true, MCase(_) -> true, _ -> false })
+    && made_width(t.made) == box_words(r)
 
 /// `block` with the nearest of `takers` taking `token`, and every instruction before it that can
 /// fail releasing it. A taker's place counts from the block's end.
-fn taken_in(fx: Facts, block: Block, takers: List<Taker>, token: Var, of: Var) -> Block =
+fn taken_in(block: Block, takers: List<Taker>, token: Var) -> Block =
   match nearest(takers) {
     None -> block,
     Some(at) -> {
@@ -1583,7 +1542,7 @@ fn taken_in(fx: Facts, block: Block, takers: List<Taker>, token: Var, of: Var) -
       block.fold({ k: 0, out: [] }, |s: { k: Int, out: List<Inst> }, i: Inst|
         {
           k: s.k + 1,
-          out: s.out.push(if last - s.k == at { taking_at(fx, i, here, token, of) }
+          out: s.out.push(if last - s.k == at { taking_at(i, here, token) }
           else if last - s.k > at { held_across(i, token) }
           else { i }),
         }).out
@@ -1592,14 +1551,14 @@ fn taken_in(fx: Facts, block: Block, takers: List<Taker>, token: Var, of: Var) -
 
 /// `i` taking `token`: the `Make` it is, or in each arm of the branch it is, the nearest `Make`
 /// `takers` names there, an arm with none freeing it.
-fn taking_at(fx: Facts, i: Inst, takers: List<Taker>, token: Var, of: Var) -> Inst =
-  if takers.any(|t: Taker| t.route.len() == 0) { taken_by(fx, i, token, of) } else {
+fn taking_at(i: Inst, takers: List<Taker>, token: Var) -> Inst =
+  if takers.any(|t: Taker| t.route.len() == 0) { taken_by(i, token) } else {
     match i {
       If(x) ->
         If({
           ..x,
-          then: arm_taking(fx, x.then, 0, takers, token, of),
-          otherwise: arm_taking(fx, x.otherwise, 1, takers, token, of),
+          then: arm_taking(x.then, 0, takers, token),
+          otherwise: arm_taking(x.otherwise, 1, takers, token),
         }),
       Case(c) ->
         Case({
@@ -1607,33 +1566,22 @@ fn taking_at(fx: Facts, i: Inst, takers: List<Taker>, token: Var, of: Var) -> In
           arms: c.arms.fold(
             [],
             |arms: List<{ when: Int, body: Block }>, a: { when: Int, body: Block }|
-              arms.push({
-                when: a.when,
-                body: arm_taking(fx, a.body, arms.len(), takers, token, of),
-              }),
+              arms.push({ when: a.when, body: arm_taking(a.body, arms.len(), takers, token) }),
           ),
-          rest: arm_taking(fx, c.rest, c.arms.len(), takers, token, of),
+          rest: arm_taking(c.rest, c.arms.len(), takers, token),
         }),
       _ -> i,
     }
   }
 
 /// Arm `arm`'s block taking `token` where `takers` reach a `Make` in it, else freeing it first.
-fn arm_taking(
-  fx: Facts,
-  block: Block,
-  arm: Int,
-  takers: List<Taker>,
-  token: Var,
-  of: Var,
-) -> Block = {
+fn arm_taking(block: Block, arm: Int, takers: List<Taker>, token: Var) -> Block = {
   let inner = takers.fold([], |acc: List<Taker>, t: Taker|
     match t.route.at(0) {
       Some(s) -> if s.arm == arm { acc.push({ ..t, route: t.route.drop(1) }) } else { acc },
       None -> acc,
     });
-  if inner.len() == 0 { [freed(token)].concat(block) }
-  else { taken_in(fx, block, inner, token, of) }
+  if inner.len() == 0 { [freed(token)].concat(block) } else { taken_in(block, inner, token) }
 }
 
 /// `token`'s cells given back: the whole block, its header among it.
@@ -1643,11 +1591,10 @@ fn freed(token: Var) -> Inst =
     bytes: AInt(header_bytes() + 8 * (match token.rep { RToken(n) -> n, _ -> 0 })),
   })
 
-fn taken_by(fx: Facts, i: Inst, token: Var, of: Var) -> Inst =
+fn taken_by(i: Inst, token: Var) -> Inst =
   match i {
     Let(l) -> match l.val {
-      Make(m) ->
-        Let({ ..l, val: Make({ ..m, reuse: Some(token), kept: kept_of(fx, m.made, m.args, of) }) }),
+      Make(m) -> Let({ ..l, val: Make({ ..m, reuse: Some(token) }) }),
       _ -> i,
     },
     _ -> i,
@@ -1691,20 +1638,6 @@ fn carried_in(b: Block, token: Var, matched: Bool) -> Block =
 /// Whether `i` leaves where a carried token is held: the body or a loop's pass, or the match a miss
 /// leaves for the next arm of, where that match is not carried.
 fn leaves_with(i: Inst, matched: Bool) -> Bool = match i { Miss -> !matched, _ -> ends(i) }
-
-/// The fields a `Make` reusing `of`'s cells finds already there: each argument read out of `of` at
-/// the place the `Make` writes it.
-fn kept_of(fx: Facts, made: Made, args: List<Arg>, of: Var) -> List<Int> = {
-  let reads = kept_reads(made, args.len());
-  range(0, args.len()).filter(|i: Int|
-    match args.at(i) {
-      Some(AVar(a)) -> match fx.gets.get(a.id) {
-        Some(g) -> g.of == of.id && reads.at(i) == Some(Some(g.path)),
-        None -> false,
-      },
-      _ -> false,
-    })
-}
 
 fn of_type(id: Int, ty: Bytes) -> Var = { id: id, ty: TyCon({ name: ty, args: [] }), rep: RWord }
 
@@ -1856,29 +1789,6 @@ test "a sum's payload held as its word is that word: read out and handed on, it 
   )
 }
 
-test "a constructor of no payload words takes no cells, so nothing is reset for it" {
-  let t = of_type(0, b"m.T");
-  let n = of_type(1, b"m.T");
-  let leaf = bind(
-    n,
-    Make({ made: MCtor({ name: b"Leaf", width: 0 }), args: [], reuse: None, kept: [] }),
-    [],
-  );
-  let cased = |arm: List<Inst>|
-    [
-      Case({
-        on: t,
-        test: TTag([b"Leaf", b"Node"]),
-        arms: [{ when: 0, body: arm.concat([leaf, Return(AVar(n))]) }],
-        rest: [Return(AVar(t))],
-      }),
-    ];
-  assert_eq(counted_body(root_of([t], [], RWord, cased([]))), {
-    body: cased([Dec(t)]),
-    refused: None,
-  })
-}
-
 test "a closure laid on this frame's stack reads its captures, which are let go of after the call" {
   let cap = word(0);
   let c = word(1);
@@ -1890,7 +1800,6 @@ test "a closure laid on this frame's stack reads its captures, which are let go 
         made: MClosure({ nth: 0, captures: 1, params: 1, stacked: true }),
         args: [AVar(cap)],
         reuse: None,
-        kept: [],
       }),
       unwind,
     );
@@ -2113,29 +2022,49 @@ test "a value read out of another keeps that one live until its last read" {
   })
 }
 
-test "a value read out of a node, used past a constructor that could take the node's cells, takes a count of its own so the node is reused" {
-  let t = of_type(0, b"m.T");
+/// A list of `m.Nil`, the zero word, and `m.Cons`, a box of two words.
+fn boxed_list() -> Rep =
+  RSum({
+    laid: {
+      classes: [P],
+      cases: [
+        { test: WordIs({ at: 0, value: 0 }), payload: Nullary },
+        {
+          test: WordOutside({ at: 0, values: [0] }),
+          payload: Boxed({ at: 0, stripped: false, skip: 0, laid: LWords([P, P]) }),
+        },
+      ],
+    },
+    cases: [b"m.Nil", b"m.Cons"],
+  })
+
+/// The box an `m.Cons` of `boxed_list` is held in, numbered `id`.
+fn cons_box(id: Int) -> Var =
+  {
+    id: id,
+    ty: of_type(0, b"m.L").ty,
+    rep: match boxed_case_of(boxed_list(), 1) { Some(r) -> r, None -> RWord },
+  }
+
+test "a value read out of a node, used past the case made in the node's box, takes a count of its own so the box is reused" {
+  let t = { ..of_type(0, b"m.L"), rep: boxed_list() };
   let y = word(1);
-  let n = of_type(2, b"m.T");
+  let n = of_type(2, b"m.L");
   let r = word(3);
-  let token = { ..t, id: 4, rep: RToken(2) };
-  let read = bind(y, Get({ of: t, path: PArg({ ctor: b"Node", at: 1 }) }), []);
+  let box = cons_box(4);
+  let token = { id: 5, ty: t.ty, rep: RToken(2) };
+  let read = bind(y, Get({ of: t, path: PCase({ case: 1, at: 1 }) }), []);
   let made = |reuse: Option<Var>|
     bind(
       n,
-      Make({
-        made: MCtor({ name: b"Node", width: 2 }),
-        args: [AInt(1), AInt(2)],
-        reuse: reuse,
-        kept: [],
-      }),
+      Make({ made: MCase({ case: 1, skip: 0, words: 2 }), args: [AInt(1), AInt(2)], reuse: reuse }),
       [],
     );
   let on = |arm: List<Inst>, rest: List<Inst>|
     [
       Case({
         on: t,
-        test: TTag([b"Leaf", b"Node"]),
+        test: TTag([b"m.Nil", b"m.Cons"]),
         arms: [{ when: 1, body: arm }],
         rest: rest.push(Return(AZero(RWord))),
       }),
@@ -2151,7 +2080,8 @@ test "a value read out of a node, used past a constructor that could take the no
       [
         read,
         Inc({ var: y, n: 1 }),
-        Reset({ token: token, of: t }),
+        Opened({ of: t, words: [box] }),
+        Reset({ token: token, of: box }),
         made(Some(token)),
         bind(r, call_of([AVar(y)], [0]), [n, y]),
         Dec(r),
@@ -2331,7 +2261,6 @@ test "a value that holds no count, a static or a case gathered from constants, i
           made: MRecord({ names: [b"a", b"b"], width: 2 }),
           args: [AVar(s), AVar(s)],
           reuse: None,
-          kept: [],
         }),
         [],
       ),
@@ -2532,7 +2461,6 @@ test "a record is made by value, so one let go of lends its cells to none" {
       made: MRecord({ names: [b"a", b"b"], width: 2 }),
       args: [AVar(a), AVar(v)],
       reuse: reuse,
-      kept: [],
     });
   let f = root_of([r, v], [], RWord, [get, bind(n, make(None), []), Return(AVar(n))]);
   assert_eq(counted_body(f), {
@@ -2549,56 +2477,6 @@ test "a record is made by value, so one let go of lends its cells to none" {
     ]),
     Some(b"a value made in cells its printer does not take: v3"),
   )
-}
-
-test "a constructor takes the cells of one the case around it knows to hold the same constructor" {
-  let xs = of_type(0, b"m.L");
-  let v = word(1);
-  let t = of_type(2, b"m.L");
-  let n = of_type(3, b"m.L");
-  let token = { ..of_type(4, b"m.L"), rep: RToken(2) };
-  let tail = bind(t, Get({ of: xs, path: PArg({ ctor: b"Cons", at: 1 }) }), []);
-  let make = |reuse: Option<Var>, kept: List<Int>|
-    Make({
-      made: MCtor({ name: b"Cons", width: 2 }),
-      args: [AVar(v), AVar(t)],
-      reuse: reuse,
-      kept: kept,
-    });
-  let cased = |names: List<Bytes>, arm: List<Inst>|
-    [Case({ on: xs, test: TTag(names), arms: [{ when: 0, body: arm }], rest: [Return(AVar(xs))] })];
-  let f = |names: List<Bytes>|
-    root_of([xs, v], [], RWord, cased(names, [tail, bind(n, make(None, []), []), Return(AVar(n))]));
-  let counted_rest = |names: List<Bytes>, arm: List<Inst>|
-    [
-      Case({
-        on: xs,
-        test: TTag(names),
-        arms: [{ when: 0, body: arm }],
-        rest: [Dec(v), Return(AVar(xs))],
-      }),
-    ];
-  assert_eq(counted_body(f([b"Cons", b"Nil"])), {
-    body: counted_rest([b"Cons", b"Nil"], [
-      tail,
-      Inc({ var: t, n: 1 }),
-      Reset({ token: token, of: xs }),
-      bind(n, make(Some(token), [1]), []),
-      Return(AVar(n)),
-    ]),
-    refused: None,
-  });
-  // An arm that knows its subject holds another constructor lets its cells go.
-  assert_eq(counted_body(f([b"Nil", b"Cons"])), {
-    body: counted_rest([b"Nil", b"Cons"], [
-      tail,
-      Inc({ var: t, n: 1 }),
-      Dec(xs),
-      bind(n, make(None, []), []),
-      Return(AVar(n)),
-    ]),
-    refused: None,
-  })
 }
 
 test "a boxed case takes the cells of a sum let go of in an arm that knows it holds a box of as many words" {
@@ -2624,7 +2502,6 @@ test "a boxed case takes the cells of a sum let go of in an arm that knows it ho
         made: MCase({ case: 1, skip: 0, words: words }),
         args: [AInt(1), AInt(2)],
         reuse: reuse,
-        kept: [],
       }),
       [],
     );
@@ -2654,88 +2531,26 @@ test "a boxed case takes the cells of a sum let go of in an arm that knows it ho
   assert_eq(owned(f(3)).body, cased([Dec(t), made(3, None), Return(AVar(n))]))
 }
 
-test "a box of a value takes the cells of a value of its type let go of before it" {
-  let r = of_type(0, b"m.R");
-  let n = of_type(1, b"m.R");
-  let token = { ..r, id: 2, rep: RToken(2) };
-  let boxed = |reuse: Option<Var>|
-    bind(
-      n,
-      Make({ made: MBox({ words: 2 }), args: [AInt(1), AInt(2)], reuse: reuse, kept: [] }),
-      [],
-    );
-  assert_eq(owned(root_of([r], [], RWord, [boxed(None), Return(AVar(n))])).body, [
-    Reset({ token: token, of: r }),
-    boxed(Some(token)),
-    Return(AVar(n)),
-  ]);
-  // A box of another type lays its words otherwise.
-  assert_eq(owned(root_of([of_type(0, b"m.S")], [], RWord, [boxed(None), Return(AVar(n))])).body, [
-    Dec(of_type(0, b"m.S")),
-    boxed(None),
-    Return(AVar(n)),
-  ])
-}
-
-test "a record laid out as its type says takes the cells of one of its type let go of, keeping what lies where it is written" {
-  let int = TyCon({ name: b"Int", args: [] });
-  let ty = TyRecord([
-    { name: b"a", ty: int },
-    { name: b"b", ty: TyCon({ name: b"String", args: [] }) },
-  ]);
-  let fields = [
-    { name: b"a", kind: KInt, ty: TyOpen([]) },
-    { name: b"b", kind: KBoxed, ty: TyOpen([]) },
-  ];
-  let r = { id: 0, ty: ty, rep: RWord };
-  let s = word(1);
-  let a = { id: 2, ty: int, rep: RInt };
-  let n = { id: 3, ty: ty, rep: RWord };
-  let token = { id: 4, ty: ty, rep: RToken(2) };
-  let get = bind(a, Get({ of: r, path: PField({ name: b"a", at: 0 }) }), []);
-  let make = |reuse: Option<Var>, kept: List<Int>|
-    Make({
-      made: MLaid({ ctor: None, fields: fields }),
-      args: [AVar(a), AVar(s)],
-      reuse: reuse,
-      kept: kept,
-    });
-  let f = root_of([r, s], [], RWord, [get, bind(n, make(None, []), []), Return(AVar(n))]);
-  assert_eq(counted_body(f), {
-    body: [
-      get,
-      Reset({ token: token, of: r }),
-      bind(n, make(Some(token), [0]), []),
-      Return(AVar(n)),
-    ],
-    refused: None,
-  })
-}
-
 test "a token held across a call that can fail or stop is released on its way out" {
-  let r = of_type(0, b"m.T");
+  let r = { ..of_type(0, b"m.L"), rep: boxed_list() };
   let v = word(1);
   let a = word(2);
   let w = word(3);
-  let n = of_type(4, b"m.T");
-  let token = { ..of_type(5, b"m.T"), rep: RToken(2) };
-  let get = bind(a, Get({ of: r, path: PArg({ ctor: b"Box", at: 0 }) }), []);
-  let take = bind(a, Take({ of: r, path: PArg({ ctor: b"Box", at: 0 }) }), []);
+  let n = of_type(4, b"m.L");
+  let box = cons_box(5);
+  let token = { id: 6, ty: r.ty, rep: RToken(2) };
+  let get = bind(a, Get({ of: r, path: PCase({ case: 1, at: 0 }) }), []);
+  let take = bind(a, Take({ of: r, path: PCase({ case: 1, at: 0 }) }), []);
   let make = |reuse: Option<Var>|
-    Make({
-      made: MCtor({ name: b"Box", width: 2 }),
-      args: [AVar(w), AVar(v)],
-      reuse: reuse,
-      kept: [],
-    });
+    Make({ made: MCase({ case: 1, skip: 0, words: 2 }), args: [AVar(w), AVar(v)], reuse: reuse });
   let called = |stops: Bool|
     match call_of([AVar(a)], []) { Call(c) -> Call({ ..c, stops: stops }), other -> other };
-  let boxed = |arm: List<Inst>, rest: List<Inst>|
+  let consed = |arm: List<Inst>, rest: List<Inst>|
     [
       Case({
         on: r,
-        test: TTag([b"Box", b"Empty"]),
-        arms: [{ when: 0, body: arm }],
+        test: TTag([b"m.Nil", b"m.Cons"]),
+        arms: [{ when: 1, body: arm }],
         rest: rest.push(Return(AVar(v))),
       }),
     ];
@@ -2744,39 +2559,28 @@ test "a token held across a call that can fail or stop is released on its way ou
       [r, v],
       [],
       RWord,
-      boxed([get, bind(w, called(stops), []), bind(n, make(None), []), Return(AVar(n))], []),
+      consed([get, bind(w, called(stops), []), bind(n, make(None), []), Return(AVar(n))], []),
     );
-  let counts = |unwind: List<Var>|
-    boxed(
+  let counts = |stops: Bool, unwind: List<Var>|
+    consed(
       [
         take,
-        Reset({ token: token, of: r }),
-        bind(w, called(false), unwind),
+        Opened({ of: r, words: [box] }),
+        Reset({ token: token, of: box }),
+        bind(w, called(stops), unwind),
         bind(n, make(Some(token)), []),
         Return(AVar(n)),
       ],
       [Dec(r)],
     );
-  assert_eq(counted_body(f(false)), { body: counts([v, token]), refused: None });
+  assert_eq(counted_body(f(false)), { body: counts(false, [v, token]), refused: None });
   assert_eq(
-    refused_with(f(false), counts([v])),
+    refused_with(f(false), counts(false, [v])),
     Some(b"a failure path that releases other than what it holds"),
   );
   // Across a call that may stop the token is held as across one that fails: the frame record that
   // holds the path frees it where a resumption could come more than once, and the make allocates.
-  assert_eq(counted_body(f(true)), {
-    body: boxed(
-      [
-        take,
-        Reset({ token: token, of: r }),
-        bind(w, called(true), [v, token]),
-        bind(n, make(Some(token)), []),
-        Return(AVar(n)),
-      ],
-      [Dec(r)],
-    ),
-    refused: None,
-  })
+  assert_eq(counted_body(f(true)), { body: counts(true, [v, token]), refused: None })
 }
 
 test "a value that may stop but cannot fail names what the path holds, which its frame record holds" {
@@ -2855,23 +2659,17 @@ test "an arm lets go before a miss however deep of what it read with a count of 
   })
 }
 
-test "a value let go of before a branch lends its cells to the arms that make one of its type" {
-  let r = of_type(0, b"m.T");
+test "a sum let go of before a branch lends its box to the arms that make a case of its size" {
+  let r = { ..of_type(0, b"m.L"), rep: boxed_list() };
   let c = flag(1);
   let v = word(2);
-  let x = int(3);
-  let n = of_type(4, b"m.T");
-  let token = { ..of_type(5, b"m.T"), rep: RToken(2) };
-  let read = bind(x, Get({ of: r, path: PArg({ ctor: b"Box", at: 0 }) }), []);
-  let make = |reuse: Option<Var>, kept: List<Int>|
+  let n = of_type(3, b"m.L");
+  let box = cons_box(4);
+  let token = { id: 5, ty: r.ty, rep: RToken(2) };
+  let make = |reuse: Option<Var>|
     bind(
       n,
-      Make({
-        made: MCtor({ name: b"Box", width: 2 }),
-        args: [AVar(x), AVar(v)],
-        reuse: reuse,
-        kept: kept,
-      }),
+      Make({ made: MCase({ case: 1, skip: 0, words: 2 }), args: [AInt(1), AVar(v)], reuse: reuse }),
       [],
     );
   let branch = |then: Inst, otherwise: List<Inst>|
@@ -2880,71 +2678,53 @@ test "a value let go of before a branch lends its cells to the arms that make on
       then: [then, Return(AVar(n))],
       otherwise: otherwise.push(Return(AVar(v))),
     });
-  let boxed = |arm: List<Inst>, rest: List<Inst>|
+  let consed = |arm: List<Inst>, rest: List<Inst>|
     [
       Case({
         on: r,
-        test: TTag([b"Box", b"Empty"]),
-        arms: [{ when: 0, body: arm }],
+        test: TTag([b"m.Nil", b"m.Cons"]),
+        arms: [{ when: 1, body: arm }],
         rest: rest.push(Return(AVar(v))),
       }),
     ];
-  let f = root_of([r, c, v], [], RWord, boxed([read, branch(make(None, []), [])], []));
+  let f = root_of([r, c, v], [], RWord, consed([branch(make(None), [])], []));
   let free = Free({ of: token, bytes: AInt(32) });
-  // The arm that makes none frees the cells; the one that does writes only the field that changed.
-  assert_eq(counted_body(f), {
-    body: boxed([read, Reset({ token: token, of: r }), branch(make(Some(token), [0]), [free])], [
-      Dec(r),
-    ]),
-    refused: None,
-  });
-  assert_eq(
-    refused_with(
-      f,
-      boxed([read, Reset({ token: token, of: r }), branch(make(Some(token), [0]), [])], [Dec(r)]),
-    ),
-    Some(b"a count left held where the body answers: v5"),
-  );
-  // Kept where the new constructor writes something else there, the cells would keep the old field.
-  assert_eq(
-    refused_with(
-      f,
-      boxed([read, Reset({ token: token, of: r }), branch(make(Some(token), [1]), [free])], [
-        Dec(r),
-      ]),
-    ),
-    Some(b"a field kept in cells that do not hold it: v4"),
-  )
+  let counts = |otherwise: List<Inst>|
+    consed(
+      [
+        Opened({ of: r, words: [box] }),
+        Reset({ token: token, of: box }),
+        branch(make(Some(token)), otherwise),
+      ],
+      [Dec(r)],
+    );
+  // The arm that makes none frees the cells.
+  assert_eq(counted_body(f), { body: counts([free]), refused: None });
+  assert_eq(refused_with(f, counts([])), Some(b"a count left held where the body answers: v5"))
 }
 
-test "a value let go of before a branch lends its cells to a constructor after it, carried through the branch" {
-  let r = of_type(0, b"m.T");
+test "a sum let go of before a branch lends its box to a case made after it, carried through the branch" {
+  let r = { ..of_type(0, b"m.L"), rep: boxed_list() };
   let c = flag(1);
   let v = word(2);
-  let x = int(3);
-  let n = of_type(4, b"m.T");
-  let w = word(5);
-  let token = { ..of_type(6, b"m.T"), rep: RToken(2) };
-  let read = bind(x, Get({ of: r, path: PArg({ ctor: b"Box", at: 0 }) }), []);
-  let make = |reuse: Option<Var>, kept: List<Int>|
+  let n = of_type(3, b"m.L");
+  let w = word(4);
+  let box = cons_box(5);
+  let token = { id: 6, ty: r.ty, rep: RToken(2) };
+  let make = |reuse: Option<Var>|
     bind(
       n,
-      Make({
-        made: MCtor({ name: b"Box", width: 2 }),
-        args: [AVar(x), AVar(v)],
-        reuse: reuse,
-        kept: kept,
-      }),
+      Make({ made: MCase({ case: 1, skip: 0, words: 2 }), args: [AInt(1), AVar(v)], reuse: reuse }),
       [],
     );
   let branch = |then: List<Inst>, otherwise: List<Inst>|
     If({ cond: AVar(c), then: then.push(Return(AVar(v))), otherwise: otherwise });
-  let boxed = |arm: List<Inst>, rest: List<Inst>|
+  let consed = |arm: List<Inst>, rest: List<Inst>|
     [
       Case({
         on: r,
-        test: TTag([b"Box", b"Empty"]),
-        arms: [{ when: 0, body: arm.push(Return(AVar(n))) }],
+        test: TTag([b"m.Nil", b"m.Cons"]),
+        arms: [{ when: 1, body: arm.push(Return(AVar(n))) }],
         rest: rest.push(Return(AVar(v))),
       }),
     ];
@@ -2952,15 +2732,15 @@ test "a value let go of before a branch lends its cells to a constructor after i
     [r, c, v],
     [],
     RWord,
-    boxed([read, branch([], [bind(w, call_of([], []), [])]), make(None, [])], []),
+    consed([branch([], [bind(w, call_of([], []), [])]), make(None)], []),
   );
   let counts = |then: List<Inst>, unwind: List<Var>|
-    boxed(
+    consed(
       [
-        read,
-        Reset({ token: token, of: r }),
+        Opened({ of: r, words: [box] }),
+        Reset({ token: token, of: box }),
         branch(then, [bind(w, call_of([], []), unwind), Dec(w)]),
-        make(Some(token), [0]),
+        make(Some(token)),
       ],
       [Dec(r)],
     );

@@ -2,8 +2,8 @@
 
 import std.bytes (ascii_of_int)
 import std.pace (Measure, outgrown)
-import emit.tir (Inst, Block, Let, Do, Make, Inc, Reset, If, Case, Match, Loop, Handle, Fn, Val,
-                 Get, Op, OStrings, OContainer, PPayload, RInt, RAddr)
+import emit.tir (Inst, Block, Let, Do, Make, Inc, Reset, Free, If, Case, Match, Loop, Handle, Fn,
+                 Val, Get, Op, OStrings, OContainer, PPayload, RInt, RAddr)
 import emit.tir.containers (Taken)
 import emit.compare (program_of, formed, checked, printed_by_form)
 import emit.own (owned)
@@ -303,6 +303,52 @@ test "a buffer appended to through a value held alone is handed on with no count
       assert_eq(counts(b"iterated"), Ok({ incs: 0, resets: 0, reused: 0 }));
       assert_eq(counts(b"widened"), Ok({ incs: 0, resets: 0, reused: 0 }));
       match checked(p, b"guarded") { Ok(_) -> (), Err(why) -> assert_eq(why, b"") }
+    },
+  }
+}
+
+/// A search tree a body takes apart and remakes at its shape, in a call's arms and after a branch
+/// that leaves.
+fn trees() -> Bytes =
+  Bytes::concat_all([
+    b"type T = | Leaf | Node(T, Int, T)\n",
+    b"fn insert(t: T, k: Int) -> T = match t { Leaf -> Node(Leaf, k, Leaf), Node(l, x, r) -> if k < x { Node(insert(l, k), x, r) } else { Node(l, x, insert(r, k)) } }\n",
+    b"fn prune(t: T, k: Int) -> T = match t { Leaf -> Leaf, Node(l, x, r) -> if x == k { Leaf } else { Node(prune(l, k), x, prune(r, k)) } }\n",
+  ])
+
+test "a node a body takes apart and remakes at its shape is remade in its own box" {
+  match program_of(trees()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let counts = |n: Bytes|
+        match checked(p, n) {
+          Ok(f) -> {
+            let all = insts(f.body);
+            Ok({
+              resets: all.filter(|i: Inst| match i { Reset(_) -> true, _ -> false }).len(),
+              reused: all.filter(|i: Inst|
+                match i {
+                  Let(l) -> match l.val { Make(m) -> m.reuse != None, _ -> false },
+                  _ -> false,
+                }).len(
+              ),
+              freed: all.filter(|i: Inst| match i { Free(_) -> true, _ -> false }).len(),
+            })
+          },
+          Err(why) -> Err(why),
+        };
+      // The node's box is reset once, and each arm that remakes the node takes it.
+      assert_eq(counts(b"insert"), Ok({ resets: 1, reused: 2, freed: 0 }));
+      // The arm that answers a leaf makes none, and gives the cells back.
+      assert_eq(counts(b"prune"), Ok({ resets: 1, reused: 1, freed: 1 }));
+      match printed_by_form(p, b"insert") {
+        Err(why) -> assert_eq(why, b""),
+        Ok(t) ->
+          assert(
+            t.index_of(b"->rc == 1) { ") != None && t.index_of(b"; if (!t") != None,
+            Some(String::of_bytes_lossy(t)),
+          ),
+      }
     },
   }
 }
