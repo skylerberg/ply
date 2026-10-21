@@ -4,17 +4,18 @@
 import syntax.parsing (span_between)
 import check.types (TyCon)
 import emit.layout (LWords, P, sum_laid, record_laid, raw)
-import emit.tir (Rep, RWord, RFlat, RSum, RUnit, RSlice, Var, Arg, AVar, Data, rep_of_arg, rep_said)
+import emit.tir (Rep, RWord, RFlat, RSum, RUnit, RSlice, Var, Arg, AVar, Data, rep_of_arg, rep_said,
+                 in_box)
 import emit.pieces (Text, spelled)
 import emit.print.text (Printing, Place, printing, named, pad, pieces, line, arg_text, part_names,
                         unprinted)
-import emit.print.made (arg_parts, parts_word, word_parts, word_as, declared_as)
-import emit.print.counting (dup_fn, last_fn, free_fn, dec_fn, call_text)
+import emit.print.made (arg_parts, parts_word, word_parts, word_viewed, word_as, declared_as)
+import emit.print.counting (dec_fn, call_text)
 
 /// `k.arg` held as `k.to`: a scalar boxed, which takes it, or read out of its word, which borrows
-/// it; a record or a sum made its word form, as `made.parts_word` makes it, or opened out of it, as
-/// `made.word_parts` opens it, each taking it; a value of no words no value, or its word 0; a view of
-/// a list its list from the view's offset.
+/// it; a record or a sum made its word form, as `made.parts_word` makes it, which takes it, or read
+/// out of it in place, which borrows it; a value of no words no value, or its word 0; a view of a
+/// list its list from the view's offset.
 pub fn worded(
   p: Place,
   pr: Printing,
@@ -53,7 +54,8 @@ pub fn worded(
     },
   }
 
-/// `v`, a record or a sum, opened out of the word form `k.arg`, which it takes.
+/// `v`, a record or a sum, read out of the word form `k.arg`: a box of its words viewed in place,
+/// which takes nothing (`tir.unpacks`), and a sum of one word the word held again.
 fn opened(
   p: Place,
   pr: Printing,
@@ -63,11 +65,12 @@ fn opened(
 ) -> Printing / {abort.raise} =
   if from != RWord { mismatched(from, k.to) } else {
     let n = named(pr, v);
+    let word = arg_text(pr, k.arg);
+    let names = part_names(n.name, k.to);
     pieces(
       n.pr,
-      [Text(pad(p.depth))].concat(
-        word_parts(arg_text(pr, k.arg), k.to, part_names(n.name, k.to)),
-      ).push(
+      [Text(pad(p.depth))].concat(if in_box(k.to) { word_viewed(word, k.to, names) }
+      else { word_parts(word, k.to, names) }).push(
         Text(b"\n"),
       ),
     )
@@ -133,17 +136,7 @@ fn local(id: Int, rep: Rep) -> Var = { id: id, ty: TyCon({ name: b"T", args: [] 
 
 fn point() -> Rep = RFlat([{ name: b"x", rep: RWord }, { name: b"y", rep: RWord }])
 
-/// The C taking the box `w` of 32 bytes where it held the last count.
-fn freed_last(w: Bytes) -> Bytes =
-  Bytes::concat_all([
-    b"if (",
-    call_text(last_fn(), [b"ctx", w]),
-    b") ",
-    call_text(free_fn(), [b"ctx", w, b"INT64_C(32)"]),
-    b";",
-  ])
-
-test "a record's word form is a box made of its words, and a box opened is taken or its words counted again" {
+test "a record's word form is a box made of its words, and a box read back is viewed in place, taken nowhere" {
   let pr = { ..printing(Map::new().insert(0, b"p0")), temps: 4 };
   let made_word = worded(place(), pr, Some(local(1, RWord)), {
     arg: AVar(local(0, point())),
@@ -160,18 +153,7 @@ test "a record's word form is a box made of its words, and a box opened is taken
     }).out,
   );
   assert(
-    opened_back.index_of(
-        Bytes::concat_all([
-          b"Word t6_0 = ply_words(t5)[0]; Word t6_1 = ply_words(t5)[1]; ",
-          freed_last(b"t5"),
-          b" else { ",
-          call_text(dup_fn(), [b"t6_0"]),
-          b"; ",
-          call_text(dup_fn(), [b"t6_1"]),
-          b"; }\n",
-        ]),
-      )
-      != None,
+    opened_back.ends_with(b"  Word t6_0 = ply_words(t5)[0]; Word t6_1 = ply_words(t5)[1]; \n"),
     Some(String::of_bytes_lossy(opened_back)),
   )
 }
@@ -201,7 +183,7 @@ test "a sum of one word is its word either way, and a value of no words is its w
     ),
     b"  Word t1 = 0;\n",
   );
-  // A sum wider than a word opened out of its box: its words, and no count where none is counted.
+  // A sum wider than a word read out of its box: its words, viewed in place.
   let tagged = RSum({
     laid: sum_laid([
       { args: record_laid([]), indirect: false },
@@ -213,11 +195,7 @@ test "a sum of one word is its word either way, and a value of no words is its w
     spelled(
       worded(place(), pr, Some(local(1, tagged)), { arg: AVar(local(0, RWord)), to: tagged }).out,
     ),
-    Bytes::concat_all([
-      b"  Word t1_0 = ply_words(p0)[0]; Word t1_1 = ply_words(p0)[1]; ",
-      freed_last(b"p0"),
-      b"\n",
-    ]),
+    b"  Word t1_0 = ply_words(p0)[0]; Word t1_1 = ply_words(p0)[1]; \n",
   )
 }
 
