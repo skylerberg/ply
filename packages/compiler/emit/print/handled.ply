@@ -1,14 +1,17 @@
 //! A `handle`'s framing printed around the body the printer's driver prints, and the operations on
-//! effects: a perform, a label, a `parallel` block, a `simulate`. Each hands the runtime its operands
-//! in an array of words and names effects, operations and resources by their field-table entries.
+//! effects: a perform, a label, a `parallel` block, a `simulate`, and an extern the runtime answers
+//! over its arguments' encoding. Each hands the runtime its operands in an array of words and names
+//! effects, operations and resources by their field-table entries, and a builtin by its place in the
+//! unit's table of them.
 
 import std.bytes (ascii_of_int)
 import emit.c (rank_of, sorted_names)
-import emit.pieces (Piece, Text, Hole, ShapeOf)
-import emit.tir (Var, Arg, Uses)
-import emit.tir.handling (HandleOp, Perform, Label, Parallel, Simulate, Clause, HandleSite, Reached)
+import emit.pieces (Piece, Text, Hole, ShapeOf, BuiltinAt)
+import emit.tir (Var, Arg, Uses, Handling)
+import emit.tir.handling (HandleOp, Perform, Label, Parallel, Simulate, Encoded, Unsettled, Clause,
+                          HandleSite, Reached)
 import emit.print.text (Printing, Place, line, pad, temp, named, name_of, arg_text, assigned, site,
-                        check, shape_at, field_hole)
+                        check, shape_at, field_hole, interned, unprinted)
 import emit.print.made (c_type)
 
 /// What opens `Handle` `label` laying out `site` over `args`. In place: its answer declared, its
@@ -34,7 +37,7 @@ pub fn handle_opened(
           answer,
           c_type(answer.rep),
           Bytes::concat_all([
-            b"rt_handle_detached_p(ctx, (Word)(intptr_t)",
+            b"rt_handle_install_detached_p(ctx, (Word)(intptr_t)",
             t.name,
             b", ",
             ascii_of_int(site.clauses.len()),
@@ -62,7 +65,7 @@ pub fn handle_opened(
         Bytes::concat_all([
           b"int64_t ",
           d.name,
-          b" = rt_handle_push_p(ctx, (Word)(intptr_t)",
+          b" = rt_handle_install_p(ctx, (Word)(intptr_t)",
           t.name,
           b", ",
           ascii_of_int(site.clauses.len()),
@@ -126,7 +129,7 @@ pub fn effect_op(
   op: HandleOp,
   args: List<Arg>,
   uses: Uses,
-) -> Printing =
+) -> Printing / {abort.raise} =
   match op {
     Perform(x) -> performed(p, pr, into, x, args),
     Label(name) -> match into {
@@ -146,16 +149,37 @@ pub fn effect_op(
       check(
         p,
         answered(site(p, { ..pr, handles: pr.handles.concat(scheduled_ops()) }), p.depth, into, [
-          Text(Bytes::concat_all([b"rt_simulate_p(ctx, ", operand(pr, args, 0), b")"])),
+          Text(
+            Bytes::concat_all([
+              b"rt_region_p(ctx, ",
+              operand(pr, args, 0),
+              b", ",
+              operand(pr, args, 1),
+              b")",
+            ]),
+          ),
         ]),
       ),
+    Encoded(name) -> {
+      let b = interned(pr.builtins, name);
+      check(
+        p,
+        spliced(site(p, { ..pr, builtins: b.xs }), p.depth, [
+          Text(b"rt_builtin_encoded_p(ctx, "),
+          Hole(BuiltinAt(b.at)),
+          Text(b");"),
+        ]),
+      )
+    },
+    Unsettled(name) -> unprinted(Handling, b"a crossing settled by its callers only", name),
   }
 
 /// The key a handle's depth is named under among the printing's names, apart from every variable's.
 fn depth_key(label: Int) -> Int = 0 - 1 - label
 
 /// The table a `handle`'s clauses lay out: per clause its effect, its resource (or the label it keys
-/// on, or none), its operation, its closure, its mode and whether it binds the label.
+/// on, or none), its operation, its closure, its mode, and the descriptor of the bound label's type
+/// where it binds the label, 0 where it does not.
 fn table(
   p: Place,
   pr: Printing,
@@ -188,7 +212,7 @@ fn table(
               b", ",
               ascii_of_int(c.mode),
               b", ",
-              if c.binds_label { b"1" } else { b"0" },
+              match c.bound_label { Some(i) -> operand(pr, args, i), None -> b"0" },
             ]),
           ),
         ]),
@@ -210,12 +234,13 @@ fn table(
 fn returned(site: HandleSite, args: List<Arg>, pr: Printing) -> Bytes =
   match site.ret { Some(i) -> operand(pr, args, i), None -> b"0" }
 
-/// A perform: its words in an array, then the runtime's search for the handler of its operation.
+/// A perform: its words in an array, then the runtime's dispatch to the handler of the operation its
+/// `op#` describes, which reads the operation's types from it.
 fn performed(
   p: Place,
   pr: Printing,
   into: Option<Var>,
-  x: { effect: Bytes, op: Bytes, resource: Bytes, labelled: Bool, mode: Int },
+  x: { effect: Bytes, op: Bytes, resource: Bytes, labelled: Bool, mode: Int, described: Bytes },
   args: List<Arg>,
 ) -> Printing = {
   let words = if x.labelled { args.drop(1) } else { args };
@@ -235,37 +260,23 @@ fn performed(
     ..held,
     performs: held.performs.push(Bytes::concat_all([x.effect, b"#", x.op])),
   });
-  let ef = field_hole(sited, x.effect);
-  let op = field_hole(ef.pr, x.op);
-  let res = if x.labelled { { pr: op.pr, piece: Text(operand(pr, args, 0)) } }
-  else if x.resource == b"" { { pr: op.pr, piece: Text(b"-1") } }
-  else { field_hole(op.pr, x.resource) };
+  let res = if x.labelled { { pr: sited, piece: Text(operand(pr, args, 0)) } }
+  else if x.resource == b"" { { pr: sited, piece: Text(b"-1") } }
+  else { field_hole(sited, x.resource) };
   check(
     p,
     answered(res.pr, p.depth, into, [
-      Text(b"rt_perform_p(ctx, "),
-      ef.piece,
-      Text(b", "),
-      op.piece,
-      Text(b", "),
+      Text(Bytes::concat_all([b"rt_dispatch_p(ctx, (Word)(intptr_t)&", x.described, b", "])),
       res.piece,
-      Text(
-        Bytes::concat_all([
-          b", ",
-          ascii_of_int(x.mode),
-          b", (Word)(intptr_t)",
-          arr.name,
-          b", ",
-          ascii_of_int(words.len()),
-          b")",
-        ]),
-      ),
+      Text(Bytes::concat_all([b", ", ascii_of_int(x.mode), b", (Word)(intptr_t)", arr.name, b")"])),
     ]),
   )
 }
 
-/// A `parallel` block: the branches' closures in an array the runtime writes each one's answer
-/// over, then those answers made the tuple's object, its fields in the order their names sort.
+/// A `parallel` block: the branches' closures in an array the runtime takes them from and writes
+/// each one's answer over; where a branch failed, each slot an answer is in let go by the descriptor
+/// of its branch's type before the failure leaves; then those answers made the tuple's object, its
+/// fields in the order their names sort.
 fn ran(
   p: Place,
   pr: Printing,
@@ -273,7 +284,7 @@ fn ran(
   reach: Option<List<Reached>>,
   args: List<Arg>,
 ) -> Printing = {
-  let n = args.len();
+  let n = args.len() / 2;
   let arr = temp(pr);
   let held = line(
     arr.pr,
@@ -282,7 +293,7 @@ fn ran(
       b"Word ",
       arr.name,
       b"[] = {",
-      Bytes::join(args.map(|a: Arg| arg_text(pr, a)), b", "),
+      if n == 0 { b"0" } else { Bytes::join(args.take(n).map(|a: Arg| arg_text(pr, a)), b", ") },
       b"};",
     ]),
   );
@@ -292,7 +303,7 @@ fn ran(
         site(p, held),
         p.depth,
         Bytes::concat_all([
-          b"rt_parallel_p(ctx, (Word)(intptr_t)",
+          b"rt_branches_p(ctx, (Word)(intptr_t)",
           arr.name,
           b", ",
           ascii_of_int(n),
@@ -329,7 +340,7 @@ fn ran(
         site(p, listed),
         p.depth,
         Bytes::concat_all([
-          b"rt_parallel_past_p(ctx, (Word)(intptr_t)",
+          b"rt_branches_past_p(ctx, (Word)(intptr_t)",
           arr.name,
           b", ",
           ascii_of_int(n),
@@ -342,8 +353,33 @@ fn ran(
       )
     },
   };
+  // A slot is 0 where its branch failed or never ran, and holds the answer of one that ran.
+  let released = line(
+    run,
+    p.depth,
+    Bytes::concat_all(
+      [b"if (ctx->failed) { "].concat(
+        range(0, n).map(|i: Int| {
+          let slot = Bytes::concat_all([arr.name, b"[", ascii_of_int(i), b"]"]);
+          Bytes::concat_all([
+            b"if (",
+            slot,
+            b") ((const PlyType *)(intptr_t)",
+            operand(pr, args, n + i),
+            b")->dec(ctx, ",
+            slot,
+            b"); ",
+          ])
+        }),
+      ).push(
+        p.leave,
+      ).push(
+        b" }",
+      ),
+    ),
+  );
   let names = range(0, n).map(|i: Int| b"_".concat(ascii_of_int(i)));
-  let shaped = shape_at(check(p, run), sorted_names(names));
+  let shaped = shape_at(released, sorted_names(names));
   let rec = temp(shaped.pr);
   let laid = line(
     rec.pr,

@@ -6,7 +6,7 @@ import emit.code (Code, CodeClause, CodeReturn, CodeStmt, CLet, CLetPat, CDo, Co
                   NApp, NVar, NIf, NBlock, NMatch, NUnary, NBinary, NField, NUpdate, NRecord, NList,
                   NPerform, NParallel, NHandle, slots_read, all_read, pat_slots)
 import syntax.parsing (Span)
-import check.types (Type, TyFn, TyRecord, Scheme, Atom, RNamed, is_diverges, int_type,
+import check.types (Type, TyFn, TyRecord, Scheme, Atom, RNamed, is_diverges, int_type, string_type,
                     fields_sorted)
 import emit.typing (unknown_type)
 import check.resolve.tables (qualify)
@@ -17,7 +17,8 @@ import std.bytes (ascii_of_int)
 import emit.reps (Def, EffectName, OpMode)
 import emit.tir (RInt, RWord, Arg, AVar, Inst, Block, Op, OHandle, Assign, If, Case, Match, Miss,
                  Loop, Next, Done, Return, Restart, Enter, Handle, Handling, falls_through)
-import emit.tir.handling (Perform, Label, Parallel, Simulate, Clause, Reached)
+import emit.tir.handling (Perform, Label, Parallel, Simulate, Unsettled, Clause, Reached)
+import emit.lower.crossing (op_described, type_described)
 import emit.lower.base (Context, Lowering, Lowered, Frame, ClauseMade, refuse, fresh, bound_as,
                         emitted, continued, filed, unfiled, type_of, handed)
 import emit.lower.held (held_as)
@@ -52,29 +53,38 @@ pub fn performed(
           { st: w.st, args: acc.args.push(w.arg) }
         },
       );
-      let mode = op_mode(en, p.op);
+      let declared = op_declared(en, p.op);
+      let mode = declared.mode;
       match filed(cx, at) {
         None -> unfiled(cx, words.st, b"a perform", at),
         Some(t) -> {
-          let op = Op({
-            op: OHandle(
-              Perform({
-                effect: en.global,
-                op: p.op,
-                resource: if label == None { p.resource } else { b"" },
-                labelled: label != None,
-                mode: mode_code(mode),
+          let d = op_described(cx, words.st, en.global, declared, args.map(type_of), t.ty);
+          let uses = {
+            takes: keyed.args.map(|_: Arg| false).concat(words.args.map(|_: Arg| true)),
+            owned: true,
+            fails: true,
+            stops: !is_raise(mode),
+          };
+          let op = match d.name {
+            None ->
+              Op({ op: OHandle(Unsettled(p.op)), args: keyed.args.concat(words.args), uses: uses }),
+            Some(described) ->
+              Op({
+                op: OHandle(
+                  Perform({
+                    effect: en.global,
+                    op: p.op,
+                    resource: if label == None { p.resource } else { b"" },
+                    labelled: label != None,
+                    mode: mode_code(mode),
+                    described: described,
+                  }),
+                ),
+                args: keyed.args.concat(words.args),
+                uses: uses,
               }),
-            ),
-            args: keyed.args.concat(words.args),
-            uses: {
-              takes: keyed.args.map(|_: Arg| false).concat(words.args.map(|_: Arg| true)),
-              owned: true,
-              fails: true,
-              stops: !is_raise(mode),
-            },
-          });
-          handed(bound_as(words.st, t.ty, RWord, op, at), held_as(cx.setting, t.ty), at)
+          };
+          handed(bound_as(d.st, t.ty, RWord, op, at), held_as(cx.setting, t.ty), at)
         },
       }
     },
@@ -198,8 +208,9 @@ pub fn handled(
 }
 
 /// A `parallel` block of the closures `branches`: the runtime runs them, at once where it may, and
-/// the block answers the tuple of their answers. Where the block is in its definition's own body,
-/// the runtime is told what the definition's row lets the branches reach.
+/// the block answers the tuple of their answers. Each branch's answer is handed with the descriptor
+/// of its type, which lets it go where another branch failed. Where the block is in its definition's
+/// own body, the runtime is told what the definition's row lets the branches reach.
 pub fn branched(
   cx: Context,
   st: Lowering,
@@ -207,13 +218,21 @@ pub fn branched(
   rooted: Bool,
   at: Span,
 ) -> Lowered / {abort.raise} = {
-  let words = branches.fold(
+  let closures = branches.fold(
     { st: st, args: [] },
     |acc: { st: Lowering, args: List<Arg> }, b: Arg| {
       let w = handed({ st: acc.st, arg: b }, RWord, at);
       { st: w.st, args: acc.args.push(w.arg) }
     },
   );
+  let described = branches.fold(
+    { st: closures.st, args: [] },
+    |acc: { st: Lowering, args: List<Arg> }, b: Arg| {
+      let d = type_described(cx, acc.st, answer_of(type_of(b)), at);
+      { st: d.st, args: acc.args.push(d.arg) }
+    },
+  );
+  let words = { st: described.st, args: closures.args.concat(described.args) };
   let ty = TyRecord(
     fields_sorted(
       range(0, branches.len()).map(|i: Int|
@@ -226,21 +245,28 @@ pub fn branched(
   let op = Op({
     op: OHandle(Parallel({ reach: if rooted { owner_reach(cx) } else { None } })),
     args: words.args,
-    uses: { takes: words.args.map(|_: Arg| true), owned: true, fails: true, stops: true },
+    uses: {
+      takes: closures.args.map(|_: Arg| true).concat(described.args.map(|_: Arg| false)),
+      owned: true,
+      fails: true,
+      stops: true,
+    },
   });
   handed(bound_as(words.st, ty, RWord, op, at), held_as(cx.setting, ty), at)
 }
 
-/// A `simulate` of the nullary closure `body`, which answers what the body answers.
-pub fn simulated(cx: Context, st: Lowering, body: Arg, at: Span) -> Lowered = {
+/// A `simulate` of the nullary closure `body`, which answers what the body answers: the runtime
+/// takes the body and the descriptor of its answer's type, which it keeps the answer by.
+pub fn simulated(cx: Context, st: Lowering, body: Arg, at: Span) -> Lowered / {abort.raise} = {
   let w = handed({ st: st, arg: body }, RWord, at);
   let ty = answer_of(type_of(body));
+  let d = type_described(cx, w.st, ty, at);
   let op = Op({
     op: OHandle(Simulate),
-    args: [w.arg],
-    uses: { takes: [true], owned: true, fails: true, stops: true },
+    args: [w.arg, d.arg],
+    uses: { takes: [true, false], owned: true, fails: true, stops: true },
   });
-  handed(bound_as(w.st, ty, RWord, op, at), held_as(cx.setting, ty), at)
+  handed(bound_as(d.st, ty, RWord, op, at), held_as(cx.setting, ty), at)
 }
 
 /// A `handle`'s clauses laid out so far: the state, the handle's operands and whether it takes each,
@@ -253,7 +279,9 @@ type Laid = {
   unknown: Option<Bytes>,
 }
 
-/// Clause `cl`, made as `made`, laid out after `acc`: its closure, then the label it keys on.
+/// Clause `cl`, made as `made`, laid out after `acc`: its closure, then the label it keys on, then
+/// the descriptor of the bound label's type where it binds the call site's label, which the
+/// runtime hands it as a `String`.
 fn clause_laid(
   cx: Context,
   acc: Laid,
@@ -271,16 +299,21 @@ fn clause_laid(
         },
         None -> { st: acc.st, args: [] },
       };
+      let bound = if cl.binds_label {
+        let d = type_described(cx, keyed.st, string_type(), at);
+        { st: d.st, args: [d.arg] }
+      } else { { st: keyed.st, args: [] } };
+      let at_label = acc.args.len() + 1 + keyed.args.len();
       {
-        st: keyed.st,
-        args: acc.args.push(made.closure).concat(keyed.args),
-        takes: acc.takes.push(true).concat(keyed.args.map(|_: Arg| false)),
+        st: bound.st,
+        args: acc.args.push(made.closure).concat(keyed.args).concat(bound.args),
+        takes: acc.takes.push(true).concat(keyed.args.concat(bound.args).map(|_: Arg| false)),
         clauses: acc.clauses.push({
           effect: en.global,
           op: cl.op,
           resource: if made.label == None { cl.resource } else { b"" },
           mode: clause_mode(cx, cl),
-          binds_label: cl.binds_label,
+          bound_label: if cl.binds_label { Some(at_label) } else { None },
           handler: acc.args.len(),
           label: if made.label == None { None } else { Some(acc.args.len() + 1) },
         }),
@@ -404,15 +437,28 @@ fn effect_named(cx: Context, written: Bytes) -> Option<EffectName> / {abort.rais
             Some({
               written: e.name,
               global: e.name,
-              ops: e.ops.map(|o: OpInfo| { name: o.name, mode: o.mode }),
+              ops: e.ops.map(|o: OpInfo|
+                {
+                  name: o.name,
+                  mode: o.mode,
+                  params: o.params,
+                  ret: o.ret,
+                  own: match o.scheme { Some(s) -> s.ty_vars, None -> [] },
+                }),
             })
           } else { acc }),
     },
   }
 
+/// Operation `op` as effect `e` declares it: a read of no types it says where it does not declare it.
+fn op_declared(e: EffectName, op: Bytes) -> OpMode =
+  e.ops.fold(
+    { name: op, mode: MRead, params: [], ret: unknown_type(), own: [] },
+    |acc: OpMode, o: OpMode| if o.name == op { o } else { acc },
+  )
+
 /// An operation's declared mode: a read where its effect does not declare it.
-fn op_mode(e: EffectName, op: Bytes) -> Mode =
-  e.ops.fold(MRead, |acc: Mode, o: OpMode| if o.name == op { o.mode } else { acc })
+fn op_mode(e: EffectName, op: Bytes) -> Mode = op_declared(e, op).mode
 
 /// A mode as the runtime numbers it.
 fn mode_code(m: Mode) -> Int = match m { MRead -> 0, MWrite -> 1, MRaise -> 2, MBad -> 0 }

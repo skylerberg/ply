@@ -4,7 +4,7 @@
 //! block whose last count was taken, lets go of what the block holds and gives its memory back.
 
 import check.types (Type, TyCon, TyFn, TyVar, TyRecord, TyNominal, Field, record_fields, field_get,
-                    spelled_type, int_type, row_empty)
+                    spelled_type, int_type, unit_type, row_empty)
 import std.bytes (ascii_of_int)
 import syntax.parsing (dummy_span)
 import emit.layout (Laid, LWords, LRecord, LSum, FieldLaid, SumLaid, CaseLaid, Payload, Nullary,
@@ -19,7 +19,8 @@ import emit.tir (Var, Rep, RWord, RInt, RSum, RFlat, RSlice, RMaybe, RTagged, RC
                  AVar, AZero, AInt, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Return,
                  Restart, Inc, Dec, Reset, Opened, Fn, Rooted, Plain, Handed, Given, Lent, Owned,
                  TTag, Val, LastOf, Walked, Lambda, Closure, no_links, Declined, Spine, counted,
-                 parts_of)
+                 parts_of, stops_at, handle_stops, Call)
+import emit.tir.handling (HandleSite)
 import emit.answer (Need, Reads, Scalar, Layout, Exact)
 
 /// How one counted word is counted. `Object`: 0 or a block's start, given to the drop root it names
@@ -68,7 +69,8 @@ pub type Opening =
   /// A node of a map's tree: a branch's kids, let go of at `node`, and the greatest key under each,
   /// or a leaf's keys and values.
   | PairsOf({ node: RootKey, key: List<Part>, value: List<Part> })
-  /// An array: each element's parts, its elements `stride` words apart.
+  /// An array: each element's parts, its elements `stride` words apart, an element of no words
+  /// taking one.
   | ArrayOf({ element: List<Part>, stride: Int })
   /// A `Columns`: each field's column, an array let go of at its drop root.
   | ColumnsOf(List<RootKey>)
@@ -227,8 +229,9 @@ pub fn release_needs(f: Fn) -> Fn = { ..f, links: { ..f.links, needs: fn_needs(f
 
 /// What `f`'s counts read of its type variables: each a count it lets go of reads exactly, since a
 /// value is let go of per type, and each a count it takes its layout alone. What its failure paths
-/// let go of and what its closures' bodies do count as its own. A body reading any is printed only
-/// at type arguments its callers settle.
+/// let go of and what its closures' bodies do count as its own, and so does what a frame's record
+/// holds across a stop, which counts each value once more and lets it go. A body reading any is
+/// printed only at type arguments its callers settle.
 pub fn release_reads(f: Fn) -> List<Need> = fn_needs([], f)
 
 fn fn_needs(needs: List<Need>, f: Fn) -> List<Need> =
@@ -238,15 +241,16 @@ fn fn_needs(needs: List<Need>, f: Fn) -> List<Need> =
 fn block_needs(needs: List<Need>, b: Block) -> List<Need> =
   b.fold(needs, |acc: List<Need>, i: Inst|
     match i {
-      Let(l) -> unwound(value_needs(acc, l.val), l.unwind),
-      Do(d) -> unwound(value_needs(acc, d.val), d.unwind),
+      Let(l) -> across(unwound(value_needs(acc, l.val), l.unwind), stops_at(l.val), l.unwind),
+      Do(d) -> across(unwound(value_needs(acc, d.val), d.unwind), stops_at(d.val), d.unwind),
       If(x) -> block_needs(block_needs(acc, x.then), x.otherwise),
       Case(c) ->
         c.arms.fold(block_needs(acc, c.rest), |a: List<Need>, arm: { when: Int, body: Block }|
           block_needs(a, arm.body)),
       Match(m) -> m.arms.fold(block_needs(acc, m.rest), block_needs),
       Loop(l) -> block_needs(acc, l.body),
-      Handle(h) -> unwound(block_needs(acc, h.body), h.unwind),
+      Handle(h) ->
+        across(unwound(block_needs(acc, h.body), h.unwind), handle_stops(h.body, h.site), h.unwind),
       Inc(n) -> reading(acc, n.var.ty, Layout),
       Dec(v) -> reading(acc, v.ty, Exact),
       Reset(r) -> reading(acc, r.of.ty, Exact),
@@ -260,8 +264,17 @@ fn value_needs(needs: List<Need>, val: Val) -> List<Need> =
 /// `needs` with what letting go of each counted value of `unwind` reads; a reuse token, freed by its
 /// size, reads nothing.
 fn unwound(needs: List<Need>, unwind: List<Var>) -> List<Need> =
-  unwind.fold(needs, |acc: List<Need>, v: Var|
-    match v.rep { RToken(_) -> acc, r -> if counted(r) { reading(acc, v.ty, Exact) } else { acc } })
+  holding(unwind).fold(needs, |acc: List<Need>, v: Var| reading(acc, v.ty, Exact))
+
+/// `needs` with what a frame's record over `unwind` reads where it is held across a stop, as `stops`
+/// says: the count of each value `unwound` lets go of taken once more, by its layout.
+fn across(needs: List<Need>, stops: Bool, unwind: List<Var>) -> List<Need> =
+  if !stops { needs }
+  else { holding(unwind).fold(needs, |acc: List<Need>, v: Var| reading(acc, v.ty, Layout)) }
+
+/// The values of `unwind` that hold a count, but a reuse token, which is freed by its size.
+fn holding(unwind: List<Var>) -> List<Var> =
+  unwind.filter(|v: Var| match v.rep { RToken(_) -> false, r -> counted(r) })
 
 /// `needs` with each variable a count of `ty` reads read as `reads`.
 fn reading(needs: List<Need>, ty: Type, reads: Reads) -> List<Need> =
@@ -564,7 +577,7 @@ fn named_opening(
     PairsOf({ node: drop_of(ty), key: item(arg(0)), value: item(arg(1)) })
   } else if name == b"Array" {
     let l = laid_of(arg(0));
-    ArrayOf({ element: laid_parts(ctors, arg(0), l, 0), stride: words(l) })
+    ArrayOf({ element: laid_parts(ctors, arg(0), l, 0), stride: max(1, words(l)) })
   } else if name == b"Columns" {
     ColumnsOf(field_types(arg(0)).map(|t: Type| drop_of(TyCon({ name: b"Array", args: [t] }))))
   } else if name == b"Hold" { Holding({ at: hold_laid().held, ty: arg(0), rep: RWord }) }
@@ -590,6 +603,107 @@ fn in_box(
 ) -> Opening / {abort.raise} = {
   let l = laid_of(ty);
   InBox({ parts: held_in(ctors, ty, l, 0, laid_of), words: words(l) })
+}
+
+/// Whether a value in a block laid as `o` is never kept, so keeping it answers 0 before anything is
+/// copied and a keep that starts copying always finishes: the block is, or reaches through any word
+/// of any case of what it holds, a task, a channel or a secret, a hold, or a function value. A handle
+/// and a hold may not outlive the entry that made them, and whether a function value may is known
+/// only from the captures it holds, so a value reaching one is not kept. A function value's own
+/// block is kept by its descriptor, which reads its captures' types alike.
+pub fn never_kept(ctors: Ctors, o: Opening) -> Bool / {abort.raise} = {
+  let first = opening_reach(ctors, o);
+  first.found
+    || iterate(
+      { seen: Map::new(), todo: first.types },
+      1000000,
+      |s: { seen: Map<Bytes, Bool>, todo: List<Type> }|
+        match s.todo {
+          [] -> Stop(false),
+          [ty, ..rest] -> {
+            let key = spelled_type(ty);
+            if s.seen.contains(key) { Continue({ ..s, todo: rest }) } else {
+              let r = type_reach(ctors, ty);
+              if r.found { Stop(true) }
+              else { Continue({ seen: s.seen.insert(key, true), todo: rest.concat(r.types) }) }
+            }
+          },
+        },
+    )
+}
+
+/// What a value reaches of what is never kept, read off its own block or its type's: whether it
+/// holds one itself, and the types of the blocks and sums its words name, which may.
+type Reach = { found: Bool, types: List<Type> }
+
+fn reached(a: Reach, b: Reach) -> Reach =
+  { found: a.found || b.found, types: a.types.concat(b.types) }
+
+/// `Reach` of a block laid as `o`.
+fn opening_reach(ctors: Ctors, o: Opening) -> Reach / {abort.raise} = {
+  let none = { found: false, types: [] };
+  let root = |k: RootKey| match k { Written(w) -> { found: false, types: [w.ty] }, _ -> none };
+  match o {
+    HandleBlock -> { found: true, types: [] },
+    Holding(_) -> { found: true, types: [] },
+    InBox(b) ->
+      b.parts.fold(none, |acc: Reach, h: Held| reached(acc, parts_reach(stored_parts(ctors, h)))),
+    ListOf(l) -> parts_reach(l.item),
+    NodeOf(n) -> parts_reach(n.item),
+    MapOf(k) -> root(k),
+    PairsOf(m) -> reached(parts_reach(m.key), parts_reach(m.value)),
+    ArrayOf(a) -> parts_reach(a.element),
+    ColumnsOf(ks) -> ks.fold(none, |acc: Reach, k: RootKey| reached(acc, root(k))),
+    _ -> none,
+  }
+}
+
+/// `Reach` of `parts`, in every case a sum among them may hold: a runtime handle or a function value
+/// found, and each type a word is counted at.
+fn parts_reach(parts: List<Part>) -> Reach =
+  parts.fold({ found: false, types: [] }, |acc: Reach, p: Part|
+    reached(acc, match p {
+      WordAt(w) -> match w.how {
+        RuntimeHandle -> { found: true, types: [] },
+        Through -> { found: true, types: [] },
+        Object(k) -> match k {
+          Written(x) -> { found: false, types: [x.ty] },
+          _ -> { found: false, types: [] },
+        },
+        SumWord(k) -> match k {
+          Written(x) -> { found: false, types: [x.ty] },
+          _ -> { found: false, types: [] },
+        },
+        IntWord(_) -> { found: false, types: [] },
+        CaseBox(c) -> { found: false, types: [c.sum] },
+      },
+      ByCase(c) ->
+        c.cases.fold(
+          { found: false, types: [] },
+          |a: Reach, k: { case: Int, parts: List<Part> }| reached(a, parts_reach(k.parts)),
+        ),
+    }))
+
+/// `Reach` of a value of `ty`: a sum's by each of its cases, a boxed case's by its box; any other
+/// type's by the block of its word.
+fn type_reach(ctors: Ctors, ty: Type) -> Reach / {abort.raise} = {
+  let laid_of = |t: Type| reps::laid(ctors, t);
+  match laid_of(ty) {
+    LSum(s) -> {
+      let declared = cases_of(ctors, ty);
+      range(0, s.cases.len()).fold({ found: false, types: [] }, |acc: Reach, k: Int|
+        match s.cases.at(k) {
+          Some(c) ->
+            reached(acc, match c.payload {
+              Boxed(b) ->
+                opening_reach(ctors, case_box_opening(ctors, ty, args_at(declared, k), b, laid_of)),
+              p -> parts_reach(case_parts(ctors, ty, k, args_at(declared, k), p)),
+            }),
+          None -> acc,
+        })
+    },
+    _ -> opening_reach(ctors, opening(ctors, ty, RWord)),
+  }
 }
 
 /// The box a case of the sum `sum` of arguments `args` is boxed in as `b` says.
@@ -722,7 +836,8 @@ fn walked_param(
 
 /// `copy#T`, `share#T` or `keep#T`, keyed `k`, of `o`: its block walked as `op` does. A copy takes
 /// the block and answers its copy; a share borrows it and answers whether it may cross threads; a
-/// keep borrows it and answers it kept for good.
+/// keep borrows it and answers it kept for good, or 0, with nothing walked or copied, where its type
+/// is `never_kept`: it is or reaches a runtime handle, a hold or a function value.
 fn walking_root(k: RootKey, o: Var, op: keys::TypeOp) -> Fn = {
   let shares = op == Share;
   let c = {
@@ -744,12 +859,28 @@ fn plain(k: RootKey, param: Var, handed: Handed, body: List<Inst>) -> Fn =
     kind: Plain,
     params: [param],
     conv: { params: [handed], reps: [param.rep], answer: RWord, answered: Owned },
+    answer_ty: plain_answer(k),
     body: body,
     lambdas: [],
     base: 0,
     members: [],
     links: no_links(),
     statics: [],
+  }
+
+/// What the plain root keyed `k` answers: whether a share may cross, a dup's, copy's or keep's value,
+/// and nothing for a drop or a release.
+fn plain_answer(k: RootKey) -> Type =
+  match k {
+    Written(w) -> match w.op {
+      Share -> int_type(),
+      Dup -> w.ty,
+      Copy -> w.ty,
+      Keep -> w.ty,
+      keys::Cased(c) -> match c.op { Share -> int_type(), Keep -> w.ty, _ -> unit_type() },
+      _ -> unit_type(),
+    },
+    _ -> unit_type(),
   }
 
 fn answered_nothing() -> Inst = Return(AZero(RWord))
@@ -1574,6 +1705,7 @@ test "a body reads exactly each variable it lets go of a value of, and the layou
     kind: Rooted,
     params: [],
     conv: { params: [], reps: [], answer: RInt, answered: Owned },
+    answer_ty: int_type(),
     body: [
       Dec(list),
       Inc({ var: counted_once, n: 1 }),
@@ -1602,4 +1734,53 @@ test "a body reads exactly each variable it lets go of a value of, and the layou
     release_reads({ ..f, body: [Dec(local(8, at(b"List", [int_type()]))), Return(AInt(0))] }),
     [],
   )
+}
+
+test "a value held across what may stop is read by its layout too, as the frame's record counts it" {
+  let held = { id: 0, ty: TyVar(0), rep: RWord };
+  let token = { id: 1, ty: TyVar(1), rep: RToken(2) };
+  let kept = { id: 2, ty: TyVar(2), rep: RWord };
+  let answer = { id: 3, ty: int_type(), rep: RWord };
+  let call = |stops: Bool|
+    Call({
+      callee: keys::Root(keys::Named(b"m.g")),
+      args: [],
+      conv: { params: [], reps: [], answer: RWord, answered: Owned },
+      stops: stops,
+    });
+  let root = |body: Block|
+    {
+      key: keys::Named(b"m.f"),
+      kind: Rooted,
+      params: [],
+      conv: { params: [], reps: [], answer: RInt, answered: Owned },
+      answer_ty: int_type(),
+      body: body.push(Return(AInt(0))),
+      lambdas: [],
+      base: 0,
+      members: [],
+      links: no_links(),
+      statics: [],
+    };
+  let site = |stops: Bool| [Do({ val: call(stops), at: dummy_span(), unwind: [held, token] })];
+  assert_eq(release_reads(root(site(true))), [{ var: 0, reads: Exact }, { var: 0, reads: Layout }]);
+  assert_eq(release_reads(root(site(false))), [{ var: 0, reads: Exact }]);
+  let handled = |s: HandleSite, body: Block|
+    [
+      Handle({
+        body: body,
+        args: [],
+        uses: { takes: [], owned: false, fails: false, stops: false },
+        site: s,
+        answer: answer,
+        unwind: [kept, token],
+      }),
+    ];
+  let quiet = { clauses: [], ret: None, detached: None };
+  // A handle holds across a stop where its return clause may run, or its body may stop.
+  [handled({ ..quiet, ret: Some(0) }, []), handled(quiet, site(true))].fold(
+    (),
+    |_: Unit, b: Block| assert(release_reads(root(b)).contains({ var: 2, reads: Layout }), None),
+  );
+  assert_eq(release_reads(root(handled(quiet, []))), [{ var: 2, reads: Exact }])
 }

@@ -14,8 +14,10 @@ import emit.tir (Rep, RWord, RInt, RBool, RNum, RMaybe, RTagged, RFlat, RCases, 
                  Given, Lent, Owned, Borrowed, Returned, Convention, Answered, Owns, ReadsOf, Lasts,
                  no_links, counted, operands, answered, fails, used_as, rep_of_arg, var_of,
                  parts_of, Test, TTag, TInt, TRange, RSum, RUnit, RAddr, LastOf, Walked, MBox,
-                 MCase, PCase, PPayload, OContainer)
+                 MCase, PCase, PPayload, OContainer, OStrings, stops_at, Uses, string_uses)
 import emit.tir.containers (Taken)
+import emit.tir.strings (StringOp, StringArg, ReadsAt, Number, WritesBlock, OwnBlock, Copied, Grown,
+                         ByteRead, string_args, string_answer)
 import emit.layout
 import emit.layout (P, Always, WordIs, WordOutside, Inline, Boxed, Nullary, LWords)
 import emit.keys (Named, Root, TypeOp, Copy, Keep, Share)
@@ -35,7 +37,9 @@ import std.pace (paced)
 /// taken out of each block, the block each reuse token holds the cells of, and where each field
 /// read was read. `unset` are the joins of `joins` not yet set, the only ones a branch can set
 /// differently on its paths. `lasts` are the values a test of a last holder answered, which hold
-/// their count only where a branch on them finds them other than 0.
+/// their count only where a branch on them finds them other than 0. `immortal` are the body's values
+/// that hold no count (`immortals`); `pending` the joins this path set from one of them which hold
+/// one elsewhere, held as the other paths hold them where they meet (`settled`).
 type Holding = {
   owned: Map<Int, Int>,
   borrowed: Map<Int, List<Int>>,
@@ -50,6 +54,7 @@ type Holding = {
   read_at: Map<Int, { of: Int, path: Path }>,
   lasts: Map<Int, Bool>,
   immortal: Map<Int, Bool>,
+  pending: Map<Int, Bool>,
 }
 
 /// A walk so far: what the path holds, the first fault found, whether control reaches here, what
@@ -103,9 +108,8 @@ pub fn verified(f: Fn) -> Option<Bytes> = {
 }
 
 /// The first construct of `f`'s body, its parameters and answer among it, that no rule of this
-/// check covers yet: a value held as a sum's words, as no C value, or as an address into a block's
-/// bytes; a box or a boxed case made; a case's payload or a block's bytes read; the bytes a crossing
-/// answered taken. Each stream's rules drop their line.
+/// check covers yet: a value held as a sum's words or as no C value; a box or a boxed case made; a
+/// case's payload read. Each stream's rules drop their line.
 fn not_yet(f: Fn) -> Option<Bytes> = {
   let held = f.members.fold(f.params, |vs: List<Var>, m: Member| vs.concat(m.params));
   let answers = f.members.fold([f.conv.answer], |rs: List<Rep>, m: Member| rs.push(m.conv.answer));
@@ -159,7 +163,6 @@ fn held_not_yet(r: Rep) -> Option<Bytes> =
   match r {
     RSum(_) -> Some(b"a value held as a sum's words"),
     RUnit -> Some(b"a value held as no C value"),
-    RAddr -> Some(b"an address into a block's bytes"),
     RFlat(ls) -> ls.fold(None, |acc: Option<Bytes>, l: Leaf| or_else(acc, held_not_yet(l.rep))),
     RCases(c) ->
       c.cases.fold(None, |acc: Option<Bytes>, x: { name: Bytes, leaves: List<Leaf> }|
@@ -176,19 +179,11 @@ fn val_not_yet(val: Val) -> Option<Bytes> =
     },
     Get(g) -> path_not_yet(g.path),
     Take(t) -> path_not_yet(t.path),
-    Op(o) -> match o.op {
-      OContainer(Taken) -> Some(b"the bytes a crossing answered taken"),
-      _ -> None,
-    },
     _ -> None,
   }
 
 fn path_not_yet(p: Path) -> Option<Bytes> =
-  match p {
-    PCase(_) -> Some(b"a case's payload read"),
-    PPayload -> Some(b"a block's bytes read"),
-    _ -> None,
-  }
+  match p { PCase(_) -> Some(b"a case's payload read"), _ -> None }
 
 /// `m` with `v` bound as it is held.
 fn bound_as(m: Map<Int, Rep>, v: Var) -> Map<Int, Rep> = m.insert(v.id, v.rep)
@@ -287,18 +282,19 @@ fn body_verified(f: Fn) -> Option<Bytes> = {
     known: Map::new(),
   };
   let unlent = |ps: List<Var>, c: Convention| !borrows_lent(ps.map(|p: Var| p.rep), c);
+  let dead = immortals(f);
   let own = if f.members.len() == 0 {
     if !held_as_taken(f) { Some(b"a parameter held otherwise than its convention takes it") }
     else if unlent(f.params, f.conv) {
       Some(b"a root answering borrowed of other than a counted parameter it is lent")
-    } else { body_fault(f, top, holding_params(f.params, f.conv), f.body) }
+    } else { body_fault(f, top, holding_params(f.params, f.conv, dead), f.body) }
   } else if f.members.any(|m: Member| unlent(m.params, m.conv)) {
     Some(b"a root answering borrowed of other than a counted parameter it is lent")
   } else {
     match f.body {
       [Case(c)] ->
         c.arms.fold(
-          body_fault(f, top, holding_params([], f.conv), c.rest),
+          body_fault(f, top, holding_params([], f.conv, dead), c.rest),
           |why: Option<Bytes>, a: { when: Int, body: Block }|
             match why {
               Some(_) -> why,
@@ -313,7 +309,7 @@ fn body_verified(f: Fn) -> Option<Bytes> = {
                       answered: m.conv.answered,
                       member: Some(a.when),
                     },
-                    holding_params(m.params, m.conv),
+                    holding_params(m.params, m.conv, dead),
                     a.body,
                   ),
               },
@@ -339,7 +335,7 @@ fn body_verified(f: Fn) -> Option<Bytes> = {
 
 /// What a body holds at its start: a count of each counted parameter `conv` gives it, and each one it
 /// is lent borrowed, outlasting the body, by its place.
-fn holding_params(params: List<Var>, conv: Convention) -> Holding =
+fn holding_params(params: List<Var>, conv: Convention, immortal: Map<Int, Bool>) -> Holding =
   range(0, params.len()).fold(
     {
       owned: Map::new(),
@@ -354,7 +350,8 @@ fn holding_params(params: List<Var>, conv: Convention) -> Holding =
       cells: Map::new(),
       read_at: Map::new(),
       lasts: Map::new(),
-      immortal: Map::new(),
+      immortal: immortal,
+      pending: Map::new(),
     },
     |h: Holding, i: Int|
       match params.at(i) {
@@ -423,7 +420,7 @@ fn handed_on(w: Walk, args: List<Arg>, handed: List<Handed>) -> Walk =
 /// is lent, else the owned variables and lent parameters it was read out of.
 fn bases(h: Holding, v: Var) -> List<Int> =
   if count(h, v) > 0 || h.lent.contains(v.id) { [v.id] }
-  else if h.immortal.contains(v.id) { [] }
+  else if h.immortal.contains(v.id) || h.pending.contains(v.id) { [] }
   else { match h.borrowed.get(v.id) { Some(bs) -> bs, None -> [v.id] } }
 
 /// Whether `v`, counted, is held without a count of its own: borrowed, neither a reuse token nor a
@@ -464,7 +461,12 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             }
           } else if answers_count(d.val) {
             { ..acc, fault: Some(b"a value whose count nothing holds") }
-          } else { failing(cx, used(acc, operands(d.val)), d.val, d.unwind) },
+          } else {
+            match bytes_fault(acc.h, None, d.val) {
+              Some(f) -> faulted(acc, f.why, f.v),
+              None -> failing(cx, used(acc, operands(d.val)), d.val, d.unwind),
+            }
+          },
         },
         Decl(v) -> { ..acc, h: declared(acc.h, v.id) },
         Assign(s) -> match acc.h.joins.get(s.var.id) {
@@ -481,13 +483,19 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
                 },
               };
             match var_of(s.arg) {
-              // A value set without a count of its own makes the join borrowed of what it is.
-              Some(v) -> if borrowed_here(acc.h, v) {
+              // A join holding no count holds nothing it is set to; one holding a count elsewhere
+              // set from a value holding none is held as the other paths hold it where they meet.
+              Some(v) -> if acc.h.immortal.contains(s.var.id) { set(read_of(acc, v)) }
+              else if acc.h.immortal.contains(v.id) {
+                let x = set(read_of(acc, v));
+                { ..x, h: { ..x.h, pending: x.h.pending.insert(s.var.id, true) } }
+              } else if borrowed_here(acc.h, v) {
                 let read = read_of(acc, v);
                 let x = set(read);
                 { ..x, h: { ..x.h, borrowed: x.h.borrowed.insert(s.var.id, bases(read.h, v)) } }
               } else { owned_join(set(passed(acc, s.arg)), s.var) },
-              None -> owned_join(set(acc), s.var),
+              None -> if acc.h.immortal.contains(s.var.id) { set(acc) }
+              else { owned_join(set(acc), s.var) },
             }
           },
           Some(true) -> faulted(acc, b"a join set twice on one path: v", s.var),
@@ -729,7 +737,10 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
 /// `acc` past `y` bound to `val`, whose failure path releases `unwind`: its operands used as `val`
 /// takes them, and `y` held as `val` answers it.
 fn let_walked(cx: Within, acc: Walk, y: Var, val: Val, unwind: List<Var>) -> Walk =
-  match field_fault(acc.h, match cx.looped { Some(lp) -> lp.held, None -> Map::new() }, y, val) {
+  match or_else(
+      field_fault(acc.h, match cx.looped { Some(lp) -> lp.held, None -> Map::new() }, y, val),
+      bytes_fault(acc.h, Some(y), val),
+    ) {
     Some(f) -> faulted(acc, f.why, f.v),
     None -> noted(bound_walked(cx, acc, y, val, unwind), y, val),
   }
@@ -761,9 +772,8 @@ fn bound_walked(cx: Within, acc: Walk, y: Var, val: Val, unwind: List<Var>) -> W
           },
           None -> match held_otherwise(y, val) {
             Some(why) -> faulted(acc, why, y),
-            None -> if holds_no_count(val, acc.h.immortal) {
-              let walked = failing(cx, used(acc, operands(val)), val, unwind);
-              { ..walked, h: { ..walked.h, immortal: walked.h.immortal.insert(y.id, true) } }
+            None -> if acc.h.immortal.contains(y.id) {
+              failing(cx, used(acc, operands(val)), val, unwind)
             } else {
               match re_held(y, val) {
                 // A borrowed value held again is read, and what holds it borrowed of the same.
@@ -890,6 +900,137 @@ fn whole_fault(h: Holding, args: List<Arg>) -> Option<{ why: Bytes, v: Var }> =
     None -> None,
   }
 
+/// Why `val`, answering into `y` where it answers, reads or writes a block's bytes otherwise than its
+/// rule says: an address is read out of a block's word as an address; an operation over bytes is
+/// written with the `uses` `tir.string_uses` gives it, handed each operand as `string_args` says
+/// (a block as its word, an address as one, a number as a value holding no count), writes only into
+/// a block this body holds a count of, and answers as `string_answer` says; the bytes a crossing
+/// answered are taken as a block of their own, from a count.
+fn bytes_fault(h: Holding, y: Option<Var>, val: Val) -> Option<{ why: Bytes, v: Var }> =
+  match val {
+    Get(g) -> match g.path {
+      PPayload -> if g.of.rep != RWord {
+        Some({ why: b"a block's bytes read out of other than a block's word: v", v: g.of })
+      } else {
+        match y {
+          Some(a) -> if a.rep != RAddr {
+            Some({ why: b"a block's bytes read held otherwise than as an address: v", v: a })
+          } else { None },
+          None -> None,
+        }
+      },
+      _ -> None,
+    },
+    Op(o) -> {
+      let named = match y { Some(a) -> a, None -> first_var(o.args, unknown_var()) };
+      match o.op {
+        OStrings(op) -> string_fault(h, y, named, op, o.args, o.uses),
+        OContainer(Taken) -> if o.args.len() == 1 && o.args.all(|a: Arg| !counted(rep_of_arg(a)))
+            && o.uses.owned
+            && !o.uses.takes.any(|t: Bool| t)
+            && (match y { Some(a) -> a.rep == RWord, None -> false }) { None } else {
+          Some({
+            why: b"the bytes a crossing answered taken other than as a block of their own: v",
+            v: named,
+          })
+        },
+        _ -> None,
+      }
+    },
+    _ -> None,
+  }
+
+/// Why operation `op` over bytes, handed `args` with `uses` and answering into `y`, breaks its rule;
+/// a fault names `named`, or the operand it is about.
+fn string_fault(
+  h: Holding,
+  y: Option<Var>,
+  named: Var,
+  op: StringOp,
+  args: List<Arg>,
+  uses: Uses,
+) -> Option<{ why: Bytes, v: Var }> = {
+  let kinds = string_args(op);
+  if kinds.len() != args.len() {
+    Some({ why: b"an operation over bytes handed other than its operands: v", v: named })
+  } else if uses != string_uses(op) {
+    Some({
+      why: b"an operation over bytes taking or answering otherwise than its rule: v",
+      v: named,
+    })
+  } else {
+    let operand = range(0, args.len()).fold(
+      None,
+      |found: Option<{ why: Bytes, v: Var }>, k: Int|
+        match found {
+          Some(_) -> found,
+          None -> match ((kinds.at(k), args.at(k))) {
+            (Some(kind), Some(a)) -> operand_fault(h, kind, a, named),
+            _ -> None,
+          },
+        },
+    );
+    match operand {
+      Some(_) -> operand,
+      None -> {
+        let answer = match y { Some(a) -> a.rep, None -> RInt };
+        let held = match string_answer(op) {
+          OwnBlock -> y != None && answer == RWord,
+          _ -> !counted(answer),
+        };
+        if held { None } else {
+          Some({ why: b"an operation over bytes answering otherwise than its rule: v", v: named })
+        }
+      },
+    }
+  }
+}
+
+/// Why operand `a` is handed otherwise than `kind` says.
+fn operand_fault(
+  h: Holding,
+  kind: StringArg,
+  a: Arg,
+  named: Var,
+) -> Option<{ why: Bytes, v: Var }> =
+  match kind {
+    ReadsAt -> match a {
+      AVar(v) -> if points_into(v.rep) { None } else {
+        Some({ why: b"an operation over bytes reading through other than an address: v", v: v })
+      },
+      _ ->
+        Some({
+          why: b"an operation over bytes reading through other than an address: v",
+          v: named,
+        }),
+    },
+    Number -> if counted(rep_of_arg(a)) {
+      Some({ why: b"an operation over bytes handed a counted value as a number: v", v: named })
+    } else { None },
+    _ -> match a {
+      AVar(v) -> if v.rep != RWord {
+        Some({
+          why: b"an operation over bytes handed a block held otherwise than as its word: v",
+          v: v,
+        })
+      } else if kind == WritesBlock && count(h, v) == 0 {
+        Some({ why: b"a block written into that this body holds no count of: v", v: v })
+      } else { None },
+      _ -> Some({ why: b"an operation over bytes handed a block no variable holds: v", v: named }),
+    },
+  }
+
+/// The first variable among `args`, or `otherwise`.
+fn first_var(args: List<Arg>, otherwise: Var) -> Var =
+  match args.fold(None, |found: Option<Var>, a: Arg|
+      match found { Some(_) -> found, None -> var_of(a) }) {
+    Some(v) -> v,
+    None -> otherwise,
+  }
+
+/// A variable standing for none, which a fault about no variable names.
+fn unknown_var() -> Var = { id: 0 - 1, ty: TyCon({ name: b"_", args: [] }), rep: RInt }
+
 /// The first of `args` a field was taken out of.
 fn taken_whole(h: Holding, args: List<Arg>) -> Option<Var> =
   args.fold(None, |found: Option<Var>, a: Arg|
@@ -953,16 +1094,6 @@ pub fn kept_reads(made: Made, n: Int) -> List<Option<Path>> =
 /// takes none.
 pub fn reuses_cells(made: Made) -> Bool =
   match made { MCtor(_) -> true, MLaid(_) -> true, MBox(_) -> true, MCase(_) -> true, _ -> false }
-
-/// Whether `val` may stop for a handler that can resume it more than once.
-pub fn stops_at(val: Val) -> Bool =
-  match val {
-    Call(c) -> c.stops,
-    Apply(c) -> c.stops,
-    Native(n) -> n.uses.stops,
-    Op(o) -> o.uses.stops,
-    _ -> false,
-  }
 
 /// Whether `p` reads a field at its offset in a block: what a `Take` may take.
 pub fn field_path(p: Path) -> Bool = match p { PField(_) -> true, PArg(_) -> true, _ -> false }
@@ -1084,6 +1215,29 @@ fn borrowed_after(before: Holding, out: List<Holding>) -> Map<Int, List<Int>> =
         n.insert(id, ints_joined(match n.get(id) { Some(xs) -> xs, None -> [] }, bs))
       } else { n }))
 
+/// What path `x` holds where it meets path `y`: each join declared before them that `x` set to a
+/// value holding no count and `y` set otherwise held as `y` holds it, a count where `y` holds one,
+/// which `x`'s value lets go of as nothing, and else borrowed as `y` has it.
+fn settled(before: Holding, x: Holding, y: Holding) -> Holding =
+  x.pending.fold(x, |h: Holding, id: Int, _: Bool|
+    if !before.joins.contains(id) || before.pending.contains(id) || y.pending.contains(id) { h }
+    else {
+      {
+        ..h,
+        pending: h.pending.remove(id),
+        owned: match y.owned.get(id) { Some(n) -> h.owned.insert(id, n), None -> h.owned },
+      }
+    })
+
+/// What `h` holds, each join it holds pending (`settled`) counted as `expected` counts it: the
+/// count the root holds of it where the paths meet, which its value lets go of as nothing.
+fn pending_held(h: Holding, expected: Map<Int, Int>) -> Map<Int, Int> =
+  h.pending.fold(h.owned, |m: Map<Int, Int>, id: Int, _: Bool|
+    match expected.get(id) {
+      Some(n) -> if m.contains(id) { m } else { m.insert(id, n) },
+      None -> m,
+    })
+
 /// Two paths out of a branch: where both go on they must hold the same counts and have set the
 /// same joins of those declared before it; a value borrowed inside one is gone after it, as is a
 /// join declared inside one. Their misses, each holding only what the match's entry declared, must
@@ -1112,17 +1266,19 @@ fn joined(before: Walk, a: Walk, b: Walk) -> Walk =
         let done = a.done || b.done;
         if both { { ..a, fault: Some(b"the misses of an arm hold different counts") } }
         else if a.live && b.live {
-          let ours = scoped(a.h, before.h);
-          if a.h.owned != b.h.owned {
+          let ah = settled(before.h, a.h, b.h);
+          let bh = settled(before.h, b.h, a.h);
+          let ours = scoped(ah, before.h);
+          if ah.owned != bh.owned {
             { ..a, fault: Some(b"the paths out of a branch hold different counts") }
-          } else if ours.unset != scoped(b.h, before.h).unset {
+          } else if ours.unset != scoped(bh, before.h).unset {
             { ..a, fault: Some(b"the paths out of a branch set different joins") }
           } else {
             {
               ..a,
               h: {
                 ..ours,
-                borrowed: borrowed_after(before.h, [a.h, b.h]),
+                borrowed: borrowed_after(before.h, [ah, bh]),
                 taken: taken_either(a.h.taken, b.h.taken),
               },
               missed: missed,
@@ -1248,12 +1404,12 @@ pub fn answer_held(val: Val) -> Answered =
 
 /// The value `val`, bound to `y`, holds again as another with no object made, where it does: a word
 /// an `Option` or a `Result` is held as, packed from the value or gathered from its case and the
-/// value's word, which holds the value's count, or reads it where the value is borrowed.
+/// value's word, which holds the value's count, or reads it where the value is borrowed. A word
+/// opened into a wider value is no such: the opening takes the word.
 pub fn re_held(y: Var, val: Val) -> Option<Var> =
   match val {
     Pack(p) -> match var_of(p.arg) {
-      Some(x) -> if counted(p.to) && counted(x.rep) && !allocates(x.rep, p.to) { Some(x) }
-      else { None },
+      Some(x) -> if one_word(p.to) && one_word(x.rep) { Some(x) } else { None },
       None -> None,
     },
     Gathered(g) -> {
@@ -1341,19 +1497,103 @@ fn escaping(h: Holding, val: Val) -> Option<Var> =
         }),
   }
 
-/// Whether the value a `Let` binds to `val` holds no count, where the variables `immortal` holds
-/// hold none: a static object's word, whose count nothing writes, or a value gathered from constants
-/// and values holding none, as a nullary case is. Such a value is given, returned and stored with no
-/// count of its own and never let go of; `emit.own` places counts by this one rule as this check
-/// checks them.
-pub fn holds_no_count(val: Val, immortal: Map<Int, Bool>) -> Bool =
+/// Whether a value held as `r` holds no count but points into the block it was read out of, as an
+/// address into a block's bytes does: it is read only while that block is held, never handed on or
+/// counted. `emit.own` keeps the block live through it by this one rule as this check checks it.
+pub fn points_into(r: Rep) -> Bool = r == RAddr
+
+/// Whether the value `y` is bound to, `val`, holds no count, where the variables `immortal` holds
+/// hold none: a static object's word, whose count nothing writes, a value gathered from constants
+/// and values holding none, as a nullary case is, or such a value held again as another. Such a value
+/// is given, returned and stored with no count of its own and never let go of, and a join it is set
+/// to is read out of nothing for it; `emit.own` places counts by this one rule as this check checks
+/// them.
+pub fn holds_no_count(y: Var, val: Val, immortal: Map<Int, Bool>) -> Bool =
   match val {
     Static(_) -> true,
     Gathered(g) ->
       g.parts.all(|a: Arg|
         match a { AVar(v) -> !counted(v.rep) || immortal.contains(v.id), _ -> true }),
-    _ -> false,
+    _ -> match re_held(y, val) { Some(x) -> immortal.contains(x.id), None -> false },
   }
+
+/// The variables of `f`'s body, not its closures', that hold no count: each a `Let` binds to a value
+/// that holds none (`holds_no_count`) where those found so far hold none, and each join every value
+/// set to which is a constant or such a variable; found to a fixpoint, as a join may be set from a
+/// later binding or another join. `emit.own` places counts by this one set, and this check checks
+/// them by it; neither adds to it.
+pub fn immortals(f: Fn) -> Map<Int, Bool> = {
+  let sets = joins_set(Map::new(), f.body);
+  range(0, binders(f.body) + 1).fold(
+    { found: Map::new(), done: false },
+    |acc: { found: Map<Int, Bool>, done: Bool }, _: Int|
+      if acc.done { acc } else {
+        let lets = immortal_lets(acc.found, f.body);
+        let next = sets.fold(lets, |m: Map<Int, Bool>, j: Int, args: List<Arg>|
+          if args.all(|a: Arg|
+              match a { AVar(v) -> !counted(v.rep) || m.contains(v.id), _ -> true }) {
+            m.insert(j, true)
+          } else { m });
+        { found: next, done: next.len() == acc.found.len() }
+      },
+  ).found
+}
+
+/// `found` with each variable `b` binds, through the blocks it holds, to a value holding no count
+/// where those of `found` hold none.
+fn immortal_lets(found: Map<Int, Bool>, b: Block) -> Map<Int, Bool> =
+  b.fold(found, |m: Map<Int, Bool>, i: Inst|
+    match i {
+      Let(l) -> if holds_no_count(l.var, l.val, m) { m.insert(l.var.id, true) } else { m },
+      If(x) -> immortal_lets(immortal_lets(m, x.then), x.otherwise),
+      Case(c) ->
+        c.arms.fold(immortal_lets(m, c.rest), |n: Map<Int, Bool>, a: { when: Int, body: Block }|
+          immortal_lets(n, a.body)),
+      Match(x) ->
+        x.arms.fold(immortal_lets(m, x.rest), |n: Map<Int, Bool>, a: Block| immortal_lets(n, a)),
+      Loop(l) -> immortal_lets(m, l.body),
+      Handle(h) -> immortal_lets(m, h.body),
+      _ -> m,
+    })
+
+/// `m` with the values each join `b` declares is set to, by the join's number.
+fn joins_set(m: Map<Int, List<Arg>>, b: Block) -> Map<Int, List<Arg>> =
+  b.fold(m, |acc: Map<Int, List<Arg>>, i: Inst|
+    match i {
+      Decl(v) -> if acc.contains(v.id) { acc } else { acc.insert(v.id, []) },
+      Assign(x) -> match acc.get(x.var.id) {
+        Some(xs) -> acc.insert(x.var.id, xs.push(x.arg)),
+        None -> acc,
+      },
+      If(x) -> joins_set(joins_set(acc, x.then), x.otherwise),
+      Case(c) ->
+        c.arms.fold(
+          joins_set(acc, c.rest),
+          |n: Map<Int, List<Arg>>, a: { when: Int, body: Block }| joins_set(n, a.body),
+        ),
+      Match(x) ->
+        x.arms.fold(joins_set(acc, x.rest), |n: Map<Int, List<Arg>>, a: Block| joins_set(n, a)),
+      Loop(l) -> joins_set(acc, l.body),
+      Handle(h) -> joins_set(acc, h.body),
+      _ -> acc,
+    })
+
+/// How many variables `b` binds or declares, through the blocks it holds: what bounds how often a
+/// fixpoint over them can grow.
+fn binders(b: Block) -> Int =
+  b.fold(0, |n: Int, i: Inst|
+    n
+      + (match i {
+        Let(_) -> 1,
+        Decl(_) -> 1,
+        If(x) -> binders(x.then) + binders(x.otherwise),
+        Case(c) ->
+          c.arms.fold(binders(c.rest), |k: Int, a: { when: Int, body: Block }| k + binders(a.body)),
+        Match(x) -> x.arms.fold(binders(x.rest), |k: Int, a: Block| k + binders(a)),
+        Loop(l) -> binders(l.body),
+        Handle(h) -> binders(h.body),
+        _ -> 0,
+      }))
 
 /// What a `Make` laid on this frame's stack captures: a closure lent to the call it is made for,
 /// which holds no count of its captures and lives no longer than the frame.
@@ -1370,7 +1610,8 @@ pub fn stacked_captures(val: Val) -> Option<List<Arg>> =
 fn consumed_one(w: Walk, v: Var) -> Walk =
   if w.fault != None { w }
   else if w.h.unset.contains(v.id) { unset_read(w, v) }
-  else if !counted(v.rep) || w.h.immortal.contains(v.id) { w } else {
+  else if points_into(v.rep) { faulted(w, b"an address handed on beyond its block: v", v) }
+  else if !counted(v.rep) { w } else {
     let n = count(w.h, v);
     if n > 0 {
       {
@@ -1380,7 +1621,8 @@ fn consumed_one(w: Walk, v: Var) -> Walk =
           owned: if n == 1 { w.h.owned.remove(v.id) } else { w.h.owned.insert(v.id, n - 1) },
         },
       }
-    } else if w.h.borrowed.contains(v.id) {
+    } else if w.h.immortal.contains(v.id) || w.h.pending.contains(v.id) { w }
+    else if w.h.borrowed.contains(v.id) {
       faulted(w, b"a borrowed value consumed with no count of its own: v", v)
     } else { faulted(w, b"a value consumed with no count left: v", v) }
   }
@@ -1389,7 +1631,9 @@ fn consumed_one(w: Walk, v: Var) -> Walk =
 fn read_one(w: Walk, v: Var) -> Walk =
   if w.fault != None { w }
   else if w.h.unset.contains(v.id) { unset_read(w, v) }
-  else if !counted(v.rep) || w.h.immortal.contains(v.id) || count(w.h, v) > 0 { w } else {
+  else if (!counted(v.rep) && !points_into(v.rep)) || w.h.immortal.contains(v.id)
+      || w.h.pending.contains(v.id)
+      || count(w.h, v) > 0 { w } else {
     match w.h.borrowed.get(v.id) {
       Some(bs) -> if bs.all(|b: Int|
           w.h.lent.contains(b) || w.h.owned.contains(b) || w.h.borrowed.contains(b)) { w }
@@ -1409,8 +1653,11 @@ fn failing(cx: Within, w: Walk, val: Val, unwind: List<Var>) -> Walk =
     if unwind.len() > 0 && w.fault == None {
       { ..w, fault: Some(b"a release on the way out of a value that neither fails nor stops") }
     } else { w }
-  } else if with_released(cx.landing, unwind) == w.h.owned { w }
-  else { { ..w, fault: Some(b"a failure path that releases other than what it holds") } }
+  } else {
+    let released = with_released(cx.landing, unwind);
+    if released == pending_held(w.h, released) { w }
+    else { { ..w, fault: Some(b"a failure path that releases other than what it holds") } }
+  }
 
 /// Whether control may leave the body at `val` other than past it: it can fail, or stop for a
 /// handler, whose frame record holds what the path holds there.
@@ -1421,11 +1668,13 @@ fn with_released(landing: Map<Int, Int>, unwind: List<Var>) -> Map<Int, Int> =
   unwind.fold(landing, |m: Map<Int, Int>, v: Var|
     m.insert(v.id, match m.get(v.id) { Some(n) -> n + 1, None -> 1 }))
 
-/// The variable `v` a `Let` binds, holding what the operation answers.
+/// The variable `v` a `Let` binds, holding what the operation answers; an address is only ever
+/// read out of the block it points into.
 fn result(w: Walk, v: Var, a: Answered) -> Walk =
-  if w.fault != None || !counted(v.rep) { w } else {
+  if w.fault != None || (!counted(v.rep) && !points_into(v.rep)) { w } else {
     match a {
-      Owns -> { ..w, h: { ..w.h, owned: w.h.owned.insert(v.id, 1) } },
+      Owns -> if points_into(v.rep) { faulted(w, b"an address held as a count of its own: v", v) }
+      else { { ..w, h: { ..w.h, owned: w.h.owned.insert(v.id, 1) } } },
       ReadsOf(reads) ->
         {
           ..w,
@@ -1469,16 +1718,17 @@ fn lent_back(w: Walk, a: Arg, from: List<{ param: Int, whole: Bool }>) -> Walk =
   }
 
 /// Control leaves: what the path holds past it must be `kept`, and nothing else.
-fn ended(w: Walk, kept: Map<Int, Int>, why: Bytes) -> Walk =
+fn ended(w: Walk, kept: Map<Int, Int>, why: Bytes) -> Walk = {
+  let held = pending_held(w.h, kept);
   if w.fault != None { w }
-  else if w.h.owned == kept { { ..w, live: false } } else {
-    let odd = w.h.owned.keys().concat(kept.keys()).filter(|id: Int|
-      w.h.owned.get(id) != kept.get(id));
+  else if held == kept { { ..w, live: false } } else {
+    let odd = held.keys().concat(kept.keys()).filter(|id: Int| held.get(id) != kept.get(id));
     match odd.at(0) {
       Some(id) -> { ..w, fault: Some(why.concat(ascii_of_int(id))), live: false },
       None -> { ..w, live: false },
     }
   }
+}
 
 /// A body that leaves its root from inside a `handle`, whose frame would stay pushed.
 fn left(w: Walk) -> Walk = { ..w, fault: Some(b"a body that leaves its root from inside a handle") }
@@ -1609,6 +1859,7 @@ fn root_of(params: List<Var>, lent: List<Int>, answer: Rep, body: Block) -> Fn =
       answer: answer,
       answered: Owned,
     },
+    answer_ty: TyCon({ name: b"T", args: [] }),
     body: body,
     lambdas: [],
     base: 0,
@@ -1717,6 +1968,40 @@ test "a variable is used held as it was bound, which its C names follow" {
     ),
     Some(b"a value made held otherwise than as its word: v1"),
   )
+}
+
+test "the values holding no count are a static, what is gathered or held again of such values, and a join set only from them" {
+  let c = { id: 0, ty: TyCon({ name: b"Bool", args: [] }), rep: RBool };
+  let p = word(1);
+  let s = word(2);
+  let t = word(3);
+  let j = word(4);
+  let k = word(5);
+  let o = {
+    id: 6,
+    ty: TyCon({ name: b"Option", args: [TyCon({ name: b"String", args: [] })] }),
+    rep: RMaybe,
+  };
+  let branch = |join: Var, other: Arg|
+    If({
+      cond: AVar(c),
+      then: [Assign({ var: join, arg: AVar(s) })],
+      otherwise: [Assign({ var: join, arg: other })],
+    });
+  let f = root_of([c, p], [], RWord, [
+    bind(s, Static(b"k"), []),
+    bind(t, Static(b"l"), []),
+    Decl(j),
+    branch(j, AVar(t)),
+    Decl(k),
+    branch(k, AVar(p)),
+    // Gathered of the join set only from statics, which a later round finds once the join is found.
+    bind(o, Gathered({ parts: [AInt(1), AVar(j)] }), []),
+    Return(AVar(k)),
+  ]);
+  assert_eq(immortals(f).keys().sort(), [s.id, t.id, j.id, o.id].sort());
+  // `k` is set from a static on one path and a given parameter on the other: it holds a count.
+  assert_eq(immortals(f).contains(k.id), false)
 }
 
 test "the paths out of a branch hold the same counts and set the same joins" {
@@ -2576,10 +2861,140 @@ test "a construct no rule covers yet is refused, naming what it is" {
   assert_eq(
     refused(root_of([{ ..p, rep: RUnit }], [], RInt, [Return(AInt(0))])),
     b"a value held as no C value: v0",
+  )
+}
+
+/// `op` over bytes, handed `args`, written with the `uses` its rule gives it.
+fn bytes_op(op: StringOp, args: List<Arg>) -> Val =
+  Op({ op: OStrings(op), args: args, uses: string_uses(op) })
+
+fn address(id: Int) -> Var = { ..int(id), rep: RAddr }
+
+test "an address into a block's bytes is read out of a block's word, only while the block is held, and never handed on" {
+  let b = word(0);
+  let a = address(1);
+  let n = int(2);
+  let addressed = bind(a, Get({ of: b, path: PPayload }), []);
+  let byte = bind(n, bytes_op(ByteRead, [AVar(a), AInt(0)]), []);
+  let read = |body: Block| verified(root_of([b], [], RInt, [addressed].concat(body)));
+  assert_eq(read([byte, Dec(b), Return(AVar(n))]), None);
+  assert_eq(
+    read([Dec(b), byte, Return(AVar(n))]),
+    Some(b"a value read after what it was read out of was let go: v1"),
+  );
+  // Read out of a block the body is lent, it lives while the body does.
+  assert_eq(verified(root_of([b], [0], RInt, [addressed, byte, Return(AVar(n))])), None);
+  // An address holds no count to hand on: answered, stored or given to a call, it would outlive its
+  // block.
+  let w = word(3);
+  assert_eq(
+    read([
+      bind(w, Make({ made: MList(1), args: [AVar(a)], reuse: None, kept: [] }), []),
+      Dec(b),
+      Dec(w),
+      Return(AInt(0)),
+    ]),
+    Some(b"an address handed on beyond its block: v1"),
   );
   assert_eq(
-    refused(root_of([], [], RAddr, [Return(AInt(0))])),
-    b"an address into a block's bytes: an answer",
+    verified(root_of([b], [], RAddr, [addressed, Dec(b), Return(AVar(a))])),
+    Some(b"an address handed on beyond its block: v1"),
+  );
+  // Only a block's word has bytes to read, and they are read as an address.
+  assert_eq(
+    verified(
+      root_of([n], [], RInt, [bind(a, Get({ of: n, path: PPayload }), []), Return(AInt(0))]),
+    ),
+    Some(b"a block's bytes read out of other than a block's word: v2"),
+  );
+  assert_eq(
+    read([bind(n, Get({ of: b, path: PPayload }), []), Dec(b), Return(AVar(n))]),
+    Some(b"a block's bytes read held otherwise than as an address: v2"),
+  )
+}
+
+test "an operation over bytes is handed, takes and answers as its rule says, and writes only into a block held here" {
+  let b = word(0);
+  let a = address(1);
+  let n = int(2);
+  let fresh = word(3);
+  let grown = word(4);
+  let addressed = bind(a, Get({ of: b, path: PPayload }), []);
+  let copied = Do({
+    val: bytes_op(Copied, [AVar(fresh), AInt(0), AVar(a), AInt(0), AInt(4)]),
+    at: dummy_span(),
+    unwind: [],
+  });
+  let checked = |params: List<Var>, lent: List<Int>, answer: Rep, body: Block|
+    verified(root_of(params, lent, answer, body));
+  // A block held here is written from another's bytes and handed back; one grown is taken.
+  assert_eq(checked([b, fresh], [], RWord, [addressed, copied, Dec(b), Return(AVar(fresh))]), None);
+  assert_eq(
+    checked([b, grown], [], RWord, [
+      addressed,
+      bind(fresh, bytes_op(Grown, [AVar(grown), AVar(a), AInt(4)]), []),
+      Dec(b),
+      Return(AVar(fresh)),
+    ]),
+    None,
+  );
+  // Written into a block it is lent, the bytes would change under whoever lent it.
+  assert_eq(
+    checked([b, fresh], [1], RInt, [addressed, copied, Dec(b), Return(AInt(0))]),
+    Some(b"a block written into that this body holds no count of: v3"),
+  );
+  // Written with other `uses` than its rule, the counts it places would not be the rule's.
+  let taking = Op({
+    op: OStrings(ByteRead),
+    args: [AVar(a), AInt(0)],
+    uses: { ..string_uses(ByteRead), takes: [true, false] },
+  });
+  let reads = |val: Val|
+    checked([b], [], RInt, [addressed, bind(n, val, []), Dec(b), Return(AVar(n))]);
+  assert_eq(
+    reads(taking),
+    Some(b"an operation over bytes taking or answering otherwise than its rule: v2"),
+  );
+  // Each operand is held as its rule says: an address read through, a number holding no count.
+  assert_eq(
+    reads(bytes_op(ByteRead, [AVar(b), AInt(0)])),
+    Some(b"an operation over bytes reading through other than an address: v0"),
+  );
+  assert_eq(
+    reads(bytes_op(ByteRead, [AVar(a), AVar(b)])),
+    Some(b"an operation over bytes handed a counted value as a number: v2"),
+  );
+  assert_eq(
+    reads(bytes_op(ByteRead, [AVar(a)])),
+    Some(b"an operation over bytes handed other than its operands: v2"),
+  );
+  assert_eq(
+    checked([b, grown], [], RWord, [
+      addressed,
+      bind({ ..fresh, rep: RInt }, bytes_op(Grown, [AVar(grown), AVar(a), AInt(4)]), []),
+      Dec(b),
+      Return(AInt(0)),
+    ]),
+    Some(b"an operation over bytes answering otherwise than its rule: v3"),
+  )
+}
+
+test "the bytes a crossing answered are taken as a block of their own, from a count" {
+  let n = int(0);
+  let t = word(1);
+  let taken = |uses: Uses, into: Var|
+    verified(
+      root_of([n], [], RInt, [
+        bind(into, Op({ op: OContainer(Taken), args: [AVar(n)], uses: uses }), []),
+        Dec(into),
+        Return(AInt(0)),
+      ]),
+    );
+  let owned = { takes: [false], owned: true, fails: true, stops: false };
+  assert_eq(taken(owned, t), None);
+  assert_eq(
+    taken({ ..owned, owned: false }, t),
+    Some(b"the bytes a crossing answered taken other than as a block of their own: v1"),
   )
 }
 
@@ -2784,6 +3199,15 @@ test "an answer handed back borrowed holds no count and is read out of only the 
   assert_eq(
     gathered([AInt(1), AVar(q)]),
     Some(b"a borrowed answer read out of other than the parameters its root names: v3"),
+  );
+  // A word packed as an `Option`'s word is held again; one opened into a record's leaves is taken.
+  let flat = { ..word(4), rep: RFlat([{ name: b"s", rep: RWord }]) };
+  assert_eq(
+    [
+      re_held(o, Pack({ arg: AVar(p), to: RMaybe })),
+      re_held(flat, Pack({ arg: AVar(p), to: flat.rep })),
+    ],
+    [Some(p), None],
   );
   assert_eq(
     answering([0, 1], [0], [read(q), Return(AVar(y))]),

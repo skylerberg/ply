@@ -18,6 +18,7 @@ pub mod heap;
 pub mod host;
 pub mod laid;
 pub mod list;
+pub mod machine;
 pub mod map;
 pub mod native;
 mod parallel;

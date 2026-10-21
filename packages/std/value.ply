@@ -12,6 +12,7 @@
 
 import std.string
 import std.gen
+import std.list
 
 /// The value as a `Value`; a width below 64 bits the program does not fix reads as its `Int`.
 pub extern fn reflect<a>(x: a) -> Value
@@ -372,6 +373,394 @@ fn inserted(sorted: List<Entry>, e: Entry) -> List<Entry> = {
   }
 }
 
+// --- Encoding ---------------------------------------------------------------
+
+/// `v` as PLV1 writes it, the one format a value crosses into the runtime and is kept in: a value
+/// opens with its tag, a name is written in full once and then by number, and every number is a
+/// little-endian base-128 varint. `None` where `v` holds what the format writes only beside its
+/// bytes or not at all: a hold, a task, a channel, a credential, what a snapshot left out, or what
+/// a type's own `show` wrote.
+pub fn encode(v: Value) -> Option<Bytes> =
+  handle {
+    Some(Bytes::concat_all(written(v, { out: [b"PLV1"], names: Map::new() }).out))
+  } with {
+    abort.raise(_) -> None,
+  }
+
+/// The value the PLV1 bytes `b` hold, a value written again as `AGAIN` read as a copy of where it
+/// was first written. `None` where `b` holds no one whole value of the format, or a handle, which
+/// only a crossing keeps beside its bytes.
+pub fn decode(b: Bytes) -> Option<Value> =
+  handle {
+    if !b.starts_with(b"PLV1") { None } else {
+      // A level of nesting is at most three calls deep and takes a byte at least.
+      let read = read_value(b, { at: 4, names: [], opened: [] }, 3 * b.len() + 3);
+      if read.r.at == b.len() { Some(read.v) } else { None }
+    }
+  } with {
+    abort.raise(_) -> None,
+  }
+
+/// The pieces written so far, and each name written, by the number a later write of it is.
+type Writing = { out: List<Bytes>, names: Map<String, Int> }
+
+fn put(w: Writing, b: Bytes) -> Writing = { ..w, out: w.out.push(b) }
+
+fn written(v: Value, w: Writing) -> Writing / {abort.raise} =
+  match v {
+    VUnit -> put(w, byte_of_int(0)),
+    VBool(x) -> put(w, byte_of_int(if x { 2 } else { 1 })),
+    VInt(n) -> put(w, byte_of_int(3).concat(varint(zigzag(n)))),
+    VFloat(f) -> put(w, byte_of_int(4).concat(float_bytes(f))),
+    VDecimal(d) -> put(w, byte_of_int(5).concat(decimal_bytes(d))),
+    VFixed(ty, bits) -> put(w, byte_of_int(6).concat(fixed_bytes(ty, bits))),
+    VChar(c) -> put(w, byte_of_int(13).concat(varint(U128::of_int(Int::of_char(c))))),
+    VStr(s) -> put(w, byte_of_int(7).concat(blob(Bytes::of_string(s)))),
+    VBytes(b) -> put(w, byte_of_int(8).concat(blob(b))),
+    VList(items) -> all_written(items, put(w, counted(9, items.len()))),
+    VArray(items) -> all_written(items, put(w, counted(14, items.len()))),
+    VMap(entries) ->
+      entries.fold(put(w, counted(10, entries.len())), |acc: Writing, e: Entry|
+        written(e.value, written(e.key, acc))),
+    VRecord(fields) ->
+      fields.fold(put(w, counted(11, fields.len())), |acc: Writing, f: Field|
+        written(f.value, named(acc, f.name))),
+    VCtor(name, args) ->
+      all_written(
+        args,
+        put(named(put(w, byte_of_int(12)), name), varint(U128::of_int(args.len()))),
+      ),
+    VFn(f) -> fun_written(f, put(w, byte_of_int(16))),
+    VHold -> abort.raise("a hold, which crosses beside the bytes"),
+    VTask(_) -> abort.raise("a task, which crosses beside the bytes"),
+    VChan(_) -> abort.raise("a channel, which crosses beside the bytes"),
+    VSecret -> abort.raise("a credential, which crosses beside the bytes"),
+    VElided(_) -> abort.raise("what a snapshot left out"),
+    VShown(_) -> abort.raise("what a type's own `show` wrote"),
+  }
+
+fn all_written(items: List<Value>, w: Writing) -> Writing / {abort.raise} =
+  items.fold(w, |acc: Writing, x: Value| written(x, acc))
+
+/// A function's case and then its parts, as `Fun` holds them.
+fn fun_written(f: Fun, w: Writing) -> Writing / {abort.raise} =
+  match f {
+    FNamed(name) -> named(put(w, byte_of_int(0)), name),
+    FAnonymous -> put(w, byte_of_int(1)),
+    FConst(c) -> written(c.value, put(w, byte_of_int(2).concat(small(Int::of_u8(c.arity))))),
+    FProject(p) ->
+      put(
+        w,
+        Bytes::concat_all([byte_of_int(3), small(Int::of_u8(p.arity)), small(Int::of_u8(p.index))]),
+      ),
+    FTable(t) ->
+      written(
+        t.default,
+        t.entries.fold(
+          put(
+            w,
+            Bytes::concat_all([byte_of_int(4), small(Int::of_u8(t.arity)), small(t.entries.len())]),
+          ),
+          |acc: Writing, e: Entry| written(e.value, written(e.key, acc)),
+        ),
+      ),
+  }
+
+/// A name: its number where it was written before, else 0 and then the name in full.
+fn named(w: Writing, name: String) -> Writing / {abort.raise} =
+  match w.names.get(name) {
+    Some(n) -> put(w, small(n)),
+    None ->
+      {
+        out: w.out.push(small(0).concat(blob(Bytes::of_string(name)))),
+        names: w.names.insert(name, w.names.len() + 1),
+      },
+  }
+
+fn counted(tag: Int, n: Int) -> Bytes / {abort.raise} = byte_of_int(tag).concat(small(n))
+
+fn blob(b: Bytes) -> Bytes / {abort.raise} = small(b.len()).concat(b)
+
+fn small(n: Int) -> Bytes / {abort.raise} = varint(U128::of_int(n))
+
+/// `x`, below 2^64, seven bits a byte from the least significant, each but the last with its top
+/// bit set.
+fn varint(x: U128) -> Bytes / {abort.raise} =
+  Bytes::concat_all(
+    range(0, 10).fold(
+      { out: [], rest: x, done: false },
+      |s: { out: List<Bytes>, rest: U128, done: Bool }, _: Int|
+        if s.done { s } else {
+          let low = Int::of_u128(s.rest & 127u128);
+          let rest = s.rest >> 7;
+          if rest == 0u128 { { out: s.out.push(byte_of_int(low)), rest: rest, done: true } }
+          else { { out: s.out.push(byte_of_int(low + 128)), rest: rest, done: false } }
+        },
+    ).out,
+  )
+
+/// An `Int` as an unsigned number whose low bit is its sign: `-1` is 1, `1` is 2.
+fn zigzag(n: Int) -> U128 / {abort.raise} =
+  if n >= 0 { U128::of_int(n) << 1 } else { U128::of_int(0 - (n + 1)) << 1 | 1u128 }
+
+/// A `Float`'s bits, least significant byte first, every NaN written as the one the runtime's
+/// reader makes.
+fn float_bytes(f: Float) -> Bytes / {abort.raise} = {
+  let raw = bits_of_float(f);
+  let nan = raw >>> 52 & 2047 == 2047 && raw & 0xF_FFFF_FFFF_FFFF != 0;
+  let bits = if nan { 0x7FF8_0000_0000_0000 } else { raw };
+  Bytes::concat_all(range(0, 8).map(|i: Int| byte_of_int(bits >>> 8 * i & 255)))
+}
+
+/// A `Decimal` as `rust_decimal` serializes one: its scale and sign in a 32-bit word, then the
+/// 96 bits of its digits as an integer, each 32-bit word least significant byte first.
+fn decimal_bytes(d: Decimal) -> Bytes / {abort.raise} = {
+  let text = Decimal::to_string(d);
+  let negative = text.starts_with("-");
+  let words = text.chars().fold(
+    { lo: 0, mid: 0, hi: 0 },
+    |acc: { lo: Int, mid: Int, hi: Int }, c: Char|
+      if c < '0' || c > '9' { acc } else {
+        let lo = acc.lo * 10 + (Int::of_char(c) - 48);
+        let mid = acc.mid * 10 + (lo >> 32);
+        let hi = acc.hi * 10 + (mid >> 32);
+        { lo: lo & 0xFFFF_FFFF, mid: mid & 0xFFFF_FFFF, hi: hi & 0xFFFF_FFFF }
+      },
+  );
+  let flags = Decimal::scale(d) << 16 | (if negative { 1 << 31 } else { 0 });
+  Bytes::concat_all([flags, words.lo, words.mid, words.hi].map(le32))
+}
+
+/// The low 32 bits of `n`, least significant byte first.
+fn le32(n: Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all(range(0, 4).map(|i: Int| byte_of_int(n >> 8 * i & 255)))
+
+/// A width by its place among the runtime's widths, then its bits extended as its sign says: the
+/// low 64, and past 64 bits the high 64.
+fn fixed_bytes(ty: String, bits: U128) -> Bytes / {abort.raise} = {
+  let place = width_rank(ty);
+  if place >= 10 { abort.raise("no width is named " ++ ty) } else {
+    let width = width_of(ty);
+    let pattern = bits & mask(width);
+    let extended = if ty.starts_with("I") && width < 128 && pattern >> width - 1 == 1u128 {
+      pattern | ~0u128 << width
+    } else { pattern };
+    let low = varint(extended & mask(64));
+    byte_of_int(place).concat(if width == 128 { low.concat(varint(extended >> 64)) } else { low })
+  }
+}
+
+/// Where reading has reached, each name read so far in the order it was first written, and each
+/// string, bytes, list, array and map value in the order it opened, once it has closed.
+type Reading = { at: Int, names: List<String>, opened: List<Option<Value>> }
+
+type ReadValue = { v: Value, r: Reading }
+
+/// The value at `r` of `b`, read in at most `depth` nested calls.
+fn read_value(b: Bytes, r: Reading, depth: Int) -> ReadValue / {abort.raise} =
+  if depth <= 0 { abort.raise("a value nested deeper than its bytes") } else {
+    let t = b.at(r.at);
+    let past = { ..r, at: r.at + 1 };
+    if t == 7 || t == 8 || t == 9 || t == 10 || t == 14 {
+      let n = past.opened.len();
+      let body = read_body(b, t, { ..past, opened: past.opened.push(None) }, depth - 1);
+      { v: body.v, r: { ..body.r, opened: body.r.opened.set(n, Some(body.v)) } }
+    } else { read_body(b, t, past, depth - 1) }
+  }
+
+fn read_body(b: Bytes, t: Int, r: Reading, depth: Int) -> ReadValue / {abort.raise} =
+  if depth <= 0 { abort.raise("a value nested deeper than its bytes") }
+  else if t == 0 { { v: VUnit, r: r } }
+  else if t == 1 { { v: VBool(false), r: r } }
+  else if t == 2 { { v: VBool(true), r: r } } else if t == 3 {
+    let z = read_varint(b, r.at);
+    let half = Int::of_u128(z.u >> 1);
+    { v: VInt(if z.u & 1u128 == 1u128 { 0 - half - 1 } else { half }), r: { ..r, at: z.at } }
+  } else if t == 4 {
+    let low = Int::of_u32(b.u32_le(r.at));
+    let high = Int::of_u32(b.u32_le(r.at + 4));
+    let signed = if high >= 0x8000_0000 { high - 0x1_0000_0000 } else { high };
+    { v: VFloat(Float::of_bits(signed * 0x1_0000_0000 + low)), r: { ..r, at: r.at + 8 } }
+  } else if t == 5 { { v: VDecimal(decimal_at(b, r.at)), r: { ..r, at: r.at + 16 } } }
+  else if t == 6 {
+    let place = b.at(r.at);
+    let ty = match ["U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "U128", "I128"].at(
+        place,
+      ) {
+      Some(name) -> name,
+      None -> abort.raise("a width this format does not have"),
+    };
+    let low = read_varint(b, r.at + 1);
+    let high = if width_of(ty) == 128 { read_varint(b, low.at) } else { { u: 0u128, at: low.at } };
+    {
+      v: VFixed(ty, (high.u << 64 | low.u & mask(64)) & mask(width_of(ty))),
+      r: { ..r, at: high.at },
+    }
+  } else if t == 7 {
+    let s = read_blob(b, r.at);
+    { v: VStr(String::of_bytes(s.b)), r: { ..r, at: s.at } }
+  } else if t == 8 {
+    let s = read_blob(b, r.at);
+    { v: VBytes(s.b), r: { ..r, at: s.at } }
+  } else if t == 9 || t == 14 {
+    let n = read_count(b, r.at);
+    let items = read_values(b, n.n, { ..r, at: n.at }, depth - 1);
+    { v: if t == 9 { VList(items.vs) } else { VArray(items.vs) }, r: items.r }
+  } else if t == 10 {
+    let n = read_count(b, r.at);
+    let entries = read_entries(b, n.n, { ..r, at: n.at }, depth - 1);
+    { v: VMap(entries.es), r: entries.r }
+  } else if t == 11 {
+    let n = read_count(b, r.at);
+    let fields = range(0, n.n).fold(
+      { fs: [], r: { ..r, at: n.at } },
+      |acc: { fs: List<Field>, r: Reading }, _: Int| {
+        let name = read_name(b, acc.r);
+        let value = read_value(b, name.r, depth - 1);
+        { fs: acc.fs.push({ name: name.name, value: value.v }), r: value.r }
+      },
+    );
+    { v: VRecord(fields.fs), r: fields.r }
+  } else if t == 12 {
+    let name = read_name(b, r);
+    let n = read_count(b, name.r.at);
+    let args = read_values(b, n.n, { ..name.r, at: n.at }, depth - 1);
+    { v: VCtor(name.name, args.vs), r: args.r }
+  } else if t == 13 {
+    let c = read_varint(b, r.at);
+    match Char::of_int(Int::of_u128(c.u)) {
+      Some(ch) -> { v: VChar(ch), r: { ..r, at: c.at } },
+      None -> abort.raise("a character that is not a Unicode scalar value"),
+    }
+  } else if t == 16 { read_fun(b, r, depth - 1) } else if t == 17 {
+    let n = read_varint(b, r.at);
+    match r.opened.at(Int::of_u128(n.u)) {
+      Some(Some(v)) -> { v: v, r: { ..r, at: n.at } },
+      _ -> abort.raise("a value again before it was written whole"),
+    }
+  } else { abort.raise("a value tagged as this format has none, or a handle") }
+
+fn read_values(
+  b: Bytes,
+  n: Int,
+  r: Reading,
+  depth: Int,
+) -> { vs: List<Value>, r: Reading } / {abort.raise} =
+  if depth <= 0 { abort.raise("a value nested deeper than its bytes") } else {
+    range(0, n).fold({ vs: [], r: r }, |acc: { vs: List<Value>, r: Reading }, _: Int| {
+      let x = read_value(b, acc.r, depth - 1);
+      { vs: acc.vs.push(x.v), r: x.r }
+    })
+  }
+
+fn read_entries(
+  b: Bytes,
+  n: Int,
+  r: Reading,
+  depth: Int,
+) -> { es: List<Entry>, r: Reading } / {abort.raise} =
+  if depth <= 0 { abort.raise("a value nested deeper than its bytes") } else {
+    range(0, n).fold({ es: [], r: r }, |acc: { es: List<Entry>, r: Reading }, _: Int| {
+      let k = read_value(b, acc.r, depth - 1);
+      let v = read_value(b, k.r, depth - 1);
+      { es: acc.es.push({ key: k.v, value: v.v }), r: v.r }
+    })
+  }
+
+fn read_fun(b: Bytes, r: Reading, depth: Int) -> ReadValue / {abort.raise} =
+  if depth <= 0 { abort.raise("a value nested deeper than its bytes") } else {
+    let kind = b.at(r.at);
+    let past = { ..r, at: r.at + 1 };
+    if kind == 0 {
+      let name = read_name(b, past);
+      { v: VFn(FNamed(name.name)), r: name.r }
+    } else if kind == 1 { { v: VFn(FAnonymous), r: past } } else {
+      let arity = read_varint(b, past.at);
+      let a = U8::of_int(Int::of_u128(arity.u));
+      let after = { ..past, at: arity.at };
+      if kind == 2 {
+        let value = read_value(b, after, depth - 1);
+        { v: VFn(FConst({ arity: a, value: value.v })), r: value.r }
+      } else if kind == 3 {
+        let index = read_varint(b, after.at);
+        {
+          v: VFn(FProject({ arity: a, index: U8::of_int(Int::of_u128(index.u)) })),
+          r: { ..after, at: index.at },
+        }
+      } else if kind == 4 {
+        let n = read_count(b, after.at);
+        let entries = read_entries(b, n.n, { ..after, at: n.at }, depth - 1);
+        let default = read_value(b, entries.r, depth - 1);
+        { v: VFn(FTable({ arity: a, entries: entries.es, default: default.v })), r: default.r }
+      } else { abort.raise("a function of a case this format does not have") }
+    }
+  }
+
+/// A name: in full where its number is 0, which numbers it next, and otherwise the one so numbered.
+fn read_name(b: Bytes, r: Reading) -> { name: String, r: Reading } / {abort.raise} = {
+  let n = read_varint(b, r.at);
+  if n.u == 0u128 {
+    let s = read_blob(b, n.at);
+    let name = String::of_bytes(s.b);
+    { name: name, r: { ..r, at: s.at, names: r.names.push(name) } }
+  } else {
+    match r.names.at(Int::of_u128(n.u) - 1) {
+      Some(name) -> { name: name, r: { ..r, at: n.at } },
+      None -> abort.raise("a name read before it was written"),
+    }
+  }
+}
+
+fn read_blob(b: Bytes, at: Int) -> { b: Bytes, at: Int } / {abort.raise} = {
+  let n = read_count(b, at);
+  { b: b.slice(n.at, n.at + n.n), at: n.at + n.n }
+}
+
+/// A count no larger than the bytes left, so a corrupt one asks for nothing it cannot hold.
+fn read_count(b: Bytes, at: Int) -> { n: Int, at: Int } / {abort.raise} = {
+  let x = read_varint(b, at);
+  if x.u > U128::of_int(b.len() - x.at) { abort.raise("a count of more than the bytes left") }
+  else { { n: Int::of_u128(x.u), at: x.at } }
+}
+
+fn read_varint(b: Bytes, at: Int) -> { u: U128, at: Int } / {abort.raise} =
+  varint_from(b, at, 0, 0u128)
+
+fn varint_from(b: Bytes, at: Int, shift: Int, acc: U128) -> { u: U128, at: Int } / {abort.raise} =
+  if shift > 63 { abort.raise("a number longer than 64 bits") } else {
+    let byte = b.at(at);
+    let sum = acc | U128::of_int(byte & 127) << shift;
+    if byte < 128 { { u: sum, at: at + 1 } } else { varint_from(b, at + 1, shift + 7, sum) }
+  }
+
+/// The `Decimal` whose `rust_decimal` serialization is the 16 bytes of `b` from `at`.
+fn decimal_at(b: Bytes, at: Int) -> Decimal / {abort.raise} = {
+  let flags = Int::of_u32(b.u32_le(at));
+  let scale = flags >> 16 & 255;
+  let words = [at + 12, at + 8, at + 4].map(|i: Int| Int::of_u32(b.u32_le(i)));
+  // The 96-bit integer's decimal digits, least significant first, by long division by ten.
+  let digits = iterate({ words: words, out: [] }, 40, |s: { words: List<Int>, out: List<Char> }|
+    if s.words.all(|x: Int| x == 0) { Stop(s.out) } else {
+      let divided = s.words.fold({ q: [], r: 0 }, |acc: { q: List<Int>, r: Int }, x: Int| {
+        let cur = acc.r * 0x1_0000_0000 + x;
+        { q: acc.q.push(cur / 10), r: cur % 10 }
+      });
+      Continue({ words: divided.q, out: s.out.push(digit_char(divided.r)) })
+    });
+  let padded = range(digits.len(), scale + 1).fold(digits, |acc: List<Char>, _: Int| acc.push('0'));
+  let ordered = padded.reverse();
+  let whole = ordered.take(ordered.len() - scale);
+  let fraction = ordered.drop(ordered.len() - scale);
+  let text = (if flags >> 31 & 1 == 1 { "-" } else { "" }) ++ String::of_chars(whole)
+    ++ (if scale == 0 { "" } else { "." ++ String::of_chars(fraction) });
+  match Decimal::of_string(text) {
+    Some(d) -> d,
+    None -> abort.raise("a decimal this format cannot hold"),
+  }
+}
+
+fn digit_char(d: Int) -> Char = match "0123456789".chars().at(d) { Some(c) -> c, None -> '0' }
+
 // --- Text -------------------------------------------------------------------
 
 fn escaped(s: String) -> String = String::of_chars(escaped_chars(s.chars(), '"'))
@@ -642,5 +1031,93 @@ test "a map is in key order, and a later entry for a key replaces an earlier one
       { key: VInt(2), value: VStr("b") },
       { key: VInt(3), value: VStr("z") },
     ]),
+  )
+}
+
+test "a value is written as the runtime's codec writes it, byte for byte" {
+  let plv1 = |b: Bytes| b"PLV1".concat(b);
+  assert_eq(encode(VUnit), Some(plv1(b"\x00")));
+  assert_eq(encode(VInt(1)), Some(plv1(b"\x03\x02")));
+  assert_eq(encode(VInt(0 - 1)), Some(plv1(b"\x03\x01")));
+  assert_eq(encode(VInt(300)), Some(plv1(b"\x03\xd8\x04")));
+  assert_eq(encode(VFloat(1.0)), Some(plv1(b"\x04\x00\x00\x00\x00\x00\x00\xf0\x3f")));
+  assert_eq(encode(VStr(String::of_bytes(b"\xc3\xa9"))), Some(plv1(b"\x07\x02\xc3\xa9")));
+  assert_eq(encode(VChar('a')), Some(plv1(b"\x0d\x61")));
+  // A signed width's bits are written extended to a word, as its sign says.
+  assert_eq(
+    encode(VFixed("I8", 255u128)),
+    Some(plv1(b"\x06\x04\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01")),
+  );
+  assert_eq(encode(VFixed("U8", 255u128)), Some(plv1(b"\x06\x00\xff\x01")));
+  assert_eq(
+    encode(VDecimal(Decimal::of_int(15).div(Decimal::of_int(10), 1, Down))),
+    Some(plv1(b"\x05\x00\x00\x01\x00\x0f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")),
+  );
+  // A name is written in full once, then by its number.
+  let row = VRecord([{ name: "a", value: VInt(1) }]);
+  assert_eq(
+    encode(VList([row, row])),
+    Some(plv1(b"\x09\x02\x0b\x01\x00\x01a\x03\x02\x0b\x01\x01\x03\x02")),
+  );
+  assert_eq(encode(VCtor("Some", [VInt(1)])), Some(plv1(b"\x0c\x00\x04Some\x01\x03\x02")));
+  assert_eq(encode(VFn(FProject({ arity: 2u8, index: 1u8 }))), Some(plv1(b"\x10\x03\x02\x01")));
+  assert_eq([VHold, VTask(1), VChan(1), VSecret, VElided(0), VShown("x")].map(encode), [
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+  ])
+}
+
+test "decoding what encoding wrote writes it again alike" {
+  gen::check(values(), |v: Value|
+    match encode(v) {
+      Some(b) -> match decode(b) { Some(back) -> encode(back) == Some(b), None -> false },
+      None -> true,
+    })
+}
+
+test "a value read again is a copy of where it was first written, and only once it is whole" {
+  let plv1 = |b: Bytes| b"PLV1".concat(b);
+  assert_eq(decode(plv1(b"\x09\x02\x07\x01a\x11\x01")), Some(VList([VStr("a"), VStr("a")])));
+  assert_eq(decode(plv1(b"\x09\x01\x11\x00")), None);
+  assert_eq(decode(plv1(b"\x0f\x00")), None);
+  assert_eq(decode(plv1(b"\x00\x00")), None);
+  assert_eq(decode(b"PLW1\x00"), None);
+  assert_eq(decode(plv1(b"\x09\x7f")), None);
+  assert_eq(decode(plv1(b"\x0d\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x01")), None)
+}
+
+test "a decimal, a width and a float come back as they went" {
+  let decimals = [
+    Decimal::of_int(0),
+    Decimal::of_int(0 - 7).div(Decimal::of_int(1000), 3, Down),
+    Decimal::of_int(9223372036854775807).div(Decimal::of_int(100), 2, Down),
+  ];
+  assert_eq(
+    decimals.map(|d: Decimal| match encode(VDecimal(d)) { Some(b) -> decode(b), None -> None }),
+    decimals.map(|d: Decimal| Some(VDecimal(d))),
+  );
+  let widths = [
+    VFixed("I128", ~0u128),
+    VFixed("U128", ~0u128),
+    VFixed("I64", 9223372036854775808u128),
+    VFixed("U64", 18446744073709551615u128),
+    VFixed("I16", 32768u128),
+  ];
+  assert_eq(
+    widths.map(|v: Value| match encode(v) { Some(b) -> decode(b), None -> None }),
+    widths.map(|v: Value| Some(v)),
+  );
+  let floats = [Float::of_bits(0 - 9223372036854775807 - 1), 1.5, 0.0 - 2.5];
+  assert_eq(
+    floats.map(|f: Float|
+      match encode(VFloat(f)) {
+        Some(b) -> match decode(b) { Some(VFloat(g)) -> bits_of_float(g), _ -> 0 },
+        None -> 0,
+      }),
+    floats.map(bits_of_float),
   )
 }

@@ -6,7 +6,7 @@
 import check.types (Type, TyCon)
 import std.bytes (ascii_of_int)
 import syntax.parsing (Span, dummy_span)
-import syntax.patterns (Lit, LUnit)
+import syntax.patterns (Lit, LUnit, LStr)
 import emit.c (Width)
 import emit.reps (FieldTy)
 import emit.answer (GenericCall, Need, Pass)
@@ -16,6 +16,7 @@ import emit.tir.handling (HandleOp, HandleSite, Simulate, Label)
 import emit.tir.containers (ContainerOp)
 import emit.tir.calling (CallingOp)
 import emit.tir.statics (StaticDef)
+import emit.tir.strings (StringOp, StringArg, TakesBlock, OwnBlock, string_args, string_answer)
 
 /// How a value is held. A function of the value's type (`lower.held`), but for `RSlice`, a view the
 /// lowering chooses for a list walked by its rest in a loop, which is made a list where it leaves,
@@ -127,12 +128,17 @@ pub type Test =
 /// An operation one family of the lowering writes and prints beyond the shared values. What it
 /// does with its operands is the `Op` value's `uses`, so nothing outside the family reads the
 /// payload.
-pub type Operation = | OHandle(HandleOp) | OContainer(ContainerOp) | OCalling(CallingOp)
+pub type Operation =
+  | OHandle(HandleOp)
+  | OContainer(ContainerOp)
+  | OCalling(CallingOp)
+  | OStrings(StringOp)
 
 pub type Val =
   /// An operator of C over operands held as `on`, which decides what it means.
   | Prim({ op: Bytes, on: Rep, args: List<Arg> })
-  /// A constant from the pool, `()` among them.
+  /// A constant as written. `statics.folded` lays out each but `()` before counts are placed: as
+  /// static data, a decimal as its two words.
   | Literal(Lit)
   /// A constant laid out as static data, by the name its content gives it.
   | Static(Bytes)
@@ -249,17 +255,19 @@ pub fn no_links() -> Links = { generics: [], needs: [], called: [], passes: [] }
 /// among them; `base` is where its definition's text starts, which its failure sites count from;
 /// `members` are a tail group's roots in case order, and empty for a root of its own. `statics` are
 /// the static objects its body names, each after those it names; a lambda's body holds its own.
+/// `answer_ty` is the type of what `conv.answer` holds.
 ///
 /// A tail group's `Fn` is keyed as its first member, takes one parameter, `which`, an `RInt`, and
-/// answers a word. Its body is one `Case` on `which` testing `TInt` of each member's place, arm `i`
-/// member `i`'s body, which reads `members[i].params` and answers a word by `Return`, and its rest a
-/// `Return` of a zero word. Inside arm `i` an `Enter` goes to a member's start with that member's
-/// arguments, and a `Restart` to member `i`'s.
+/// answers a word, of the `answer_ty` every member answers. Its body is one `Case` on `which` testing
+/// `TInt` of each member's place, arm `i` member `i`'s body, which reads `members[i].params` and
+/// answers a word by `Return`, and its rest a `Return` of a zero word. Inside arm `i` an `Enter` goes
+/// to a member's start with that member's arguments, and a `Restart` to member `i`'s.
 pub type Fn = {
   key: RootKey,
   kind: FnKind,
   params: List<Var>,
   conv: Convention,
+  answer_ty: Type,
   body: Block,
   lambdas: List<Lambda>,
   base: Int,
@@ -420,6 +428,17 @@ fn handed(args: List<Arg>, conv: Convention) -> List<{ arg: Arg, takes: Bool }> 
       None -> acc,
     })
 
+/// The `uses` an operation over bytes is written with, as `strings.string_args` and
+/// `string_answer` say: it takes only the block it grows, answers a count of its own only where it
+/// answers a block, and neither fails nor stops.
+pub fn string_uses(op: StringOp) -> Uses =
+  {
+    takes: string_args(op).map(|a: StringArg| a == TakesBlock),
+    owned: string_answer(op) == OwnBlock,
+    fails: false,
+    stops: false,
+  }
+
 /// Each of `args` and whether `uses` takes it: what a runtime function, a family's operation or a
 /// `Handle` does with its operands.
 pub fn used_as(args: List<Arg>, uses: Uses) -> List<{ arg: Arg, takes: Bool }> =
@@ -449,13 +468,13 @@ fn by_uses(args: List<Arg>, uses: Uses) -> Answered =
   if uses.owned { Owns } else { match args.at(0) { Some(AVar(x)) -> ReadsOf([x]), _ -> Lasts } }
 
 /// Whether `v` can fail, so a test follows it and its `unwind` is released on the way out: a
-/// call, a constant read from the pool, a checked operator, a field read by name, and what its
-/// `uses` say of a runtime function or a family's operation. A value made or packed only allocates,
-/// which never fails: the heap aborts when it is exhausted.
+/// call, a checked operator, a field read by name, and what its `uses` say of a runtime function or
+/// a family's operation. A value made or packed only allocates, which never fails: the heap aborts
+/// when it is exhausted. A constant is laid out before the program runs.
 pub fn fails(v: Val) -> Bool =
   match v {
     Prim(p) -> checked(p.op, p.on),
-    Literal(_) -> true,
+    Literal(_) -> false,
     Static(_) -> false,
     Make(_) -> false,
     Get(g) -> match g.path { PNamed(_) -> true, _ -> false },
@@ -470,6 +489,36 @@ pub fn fails(v: Val) -> Bool =
     LastOf(_) -> false,
     Walked(_) -> false,
   }
+
+/// Whether `val` may stop for a handler that can resume it more than once.
+pub fn stops_at(val: Val) -> Bool =
+  match val {
+    Call(c) -> c.stops,
+    Apply(c) -> c.stops,
+    Native(n) -> n.uses.stops,
+    Op(o) -> o.uses.stops,
+    _ -> false,
+  }
+
+/// Whether an instruction of `b`, or of a block it holds, may stop.
+pub fn stops_in(b: Block) -> Bool =
+  b.any(|i: Inst|
+    match i {
+      Let(l) -> stops_at(l.val),
+      Do(d) -> stops_at(d.val),
+      If(x) -> stops_in(x.then) || stops_in(x.otherwise),
+      Case(c) -> stops_in(c.rest) || c.arms.any(|a: { when: Int, body: Block }| stops_in(a.body)),
+      Match(m) -> stops_in(m.rest) || m.arms.any(stops_in),
+      Loop(l) -> stops_in(l.body),
+      Handle(h) -> stops_in(h.body),
+      _ -> false,
+    })
+
+/// Whether anything may stop under a `handle` running `body` at `site`: a clause, its `return`
+/// clause, its body run detached, or a stop in its body. What it holds across its body is then held
+/// across a stop.
+pub fn handle_stops(body: Block, site: HandleSite) -> Bool =
+  site.clauses.len() > 0 || site.ret != None || site.detached != None || stops_in(body)
 
 /// Whether operator `op` over `on` is checked: an integer's arithmetic and shifts, which overflow
 /// or divide by zero, and a width's; an `Int` made a width it does not fit (`of_int`); a decimal's
@@ -578,7 +627,7 @@ test "each operation consumes or borrows each operand as its signature says" {
   assert_eq(answered(Op({ op: OHandle(Label(b"r")), args: [], uses: lent })), Lasts)
 }
 
-test "what can fail is what tests the runtime: a checked operator, a call, never an allocation" {
+test "what can fail is what tests the runtime: a checked operator, a call, never an allocation or a constant" {
   assert_eq(fails(Prim({ op: b"add", on: RInt, args: [AInt(1), AInt(2)] })), true);
   assert_eq(fails(Prim({ op: b"lt", on: RInt, args: [AInt(1), AInt(2)] })), false);
   assert_eq(fails(Prim({ op: b"add", on: RFloat, args: [AFloat(0), AFloat(0)] })), false);
@@ -601,8 +650,48 @@ test "what can fail is what tests the runtime: a checked operator, a call, never
   assert_eq(fails(Gathered({ parts: [AInt(1)] })), false);
   assert_eq(fails(Take({ of: w, path: PField({ name: b"x", at: 0 }) })), false);
   assert_eq(fails(Tag(b"m.Box")), false);
+  assert_eq([Literal(LUnit), Literal(LStr(b"a")), Static(b"ply_k_0")].map(fails), [
+    false,
+    false,
+    false,
+  ]);
   assert_eq(ends(Miss), true);
   assert_eq(falls_through([Do({ val: Literal(LUnit), at: dummy_span(), unwind: [] })]), true)
+}
+
+test "a call stops where it says, a block where something it holds does, a handle where anything under it may" {
+  let call = |stops: Bool|
+    Call({
+      callee: Generic(0),
+      args: [],
+      conv: { params: [], reps: [], answer: RWord, answered: Owned },
+      stops: stops,
+    });
+  let calling = |stops: Bool| [Do({ val: call(stops), at: dummy_span(), unwind: [] })];
+  assert_eq([stops_at(call(true)), stops_at(call(false))], [true, false]);
+  assert_eq([stops_in(calling(true)), stops_in(calling(false))], [true, false]);
+  // A stop in a branch of the block counts.
+  assert_eq(stops_in([If({ cond: ABool(true), then: [], otherwise: calling(true) })]), true);
+  let quiet = { clauses: [], ret: None, detached: None };
+  let clause = {
+    effect: b"e",
+    op: b"op",
+    resource: b"",
+    mode: 1,
+    bound_label: None,
+    handler: 0,
+    label: None,
+  };
+  assert_eq(
+    [
+      handle_stops(calling(false), quiet),
+      handle_stops(calling(true), quiet),
+      handle_stops([], { ..quiet, ret: Some(0) }),
+      handle_stops([], { ..quiet, detached: Some(1) }),
+      handle_stops([], { ..quiet, clauses: [clause] }),
+    ],
+    [false, true, true, true, true],
+  )
 }
 
 test "a block ends where its last instruction but a site's change ends" {
