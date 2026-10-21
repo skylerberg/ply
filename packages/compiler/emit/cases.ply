@@ -38,6 +38,8 @@ import check.infer.definitions (Extern)
 import emit (said, refused_rather_than_emitted, emit_program, emit_roots_answer, lowered_roots,
              zip_sources)
 import emit.entry (RootForm, Formed, Unformed, emitted_of)
+import emit.print.counting (last_fn, rel_fn, rel_int_fn, free_fn, call_text, call_start,
+                            takes_count, lets_count_go, lets_go_of)
 import emit.tir (Plain, Block, Inst, Var, Let, If, Case, Match, Loop, Get, PCapture)
 import front.seam
 
@@ -1452,7 +1454,7 @@ test "an array is made, written and listed into as the type of its elements lays
   assert_eq(has(b"->aux = 2;"), [true, false, false, false]);
   assert_eq(has(b"ply_embed"), [false, false, false, false]);
   // A record written over is let go of by its type: its byte string through the string's drop.
-  assert_eq(has(b"ply_rel(ctx, ply_words("), [false, true, false, false]);
+  assert_eq(has(call_start(rel_fn(), [b"ctx"]).concat(b"ply_words(")), [false, true, false, false]);
   // A list's items are read where its trie or its tail holds them, never through the runtime.
   assert_eq(has(b"rt_list_"), [false, false, false, false]);
   assert_eq(has(b"while ((INT64_C(32) << "), [false, false, true, false]);
@@ -1780,13 +1782,12 @@ test "a map's value is read by `std.prelude`'s `Map::get` down its tree, its key
   let walk = code(root_name(at(b"found_under"))).split(b"\n");
   assert_eq(
     walk.filter(|l: Bytes|
-      l.index_of(b"[2 * (") != None && l.index_of(b") + 1]") == None
-        && l.index_of(b"ply_dup(") != None),
+      l.index_of(b"[2 * (") != None && l.index_of(b") + 1]") == None && takes_count(l)),
     [],
   );
   assert(
     range(0, walk.len()).any(|i: Int|
-      walk.get(i).index_of(b"ply_dup(") != None
+      takes_count(walk.get(i))
         && range(i + 1, i + 4).any(|j: Int|
           match walk.at(j) { Some(l) -> l.index_of(b"return t") != None, None -> false })),
     Some(String::of_bytes_lossy(Bytes::join(walk, b"\n"))),
@@ -1829,7 +1830,13 @@ test "a lambda a call lends is laid out on the caller's stack with its descripto
   assert_eq(has(b" = rt_alloc_bytes_p(ctx, 32); ply_words("), [false, false, true, true, false]);
   assert_eq(has(b"_lambda0_value;"), [false, false, false, false, true]);
   // The caller lets go of the captures it laid out, its own `t1`, once the call is done.
-  assert_eq(has(b"\n  ply_rel_int(ctx, t1);"), [true, true, false, false, false])
+  assert_eq(has(Bytes::concat_all([b"\n  ", call_text(rel_int_fn(), [b"ctx", b"t1"]), b";"])), [
+    true,
+    true,
+    false,
+    false,
+    false,
+  ])
 }
 
 test "a lambda a `std.prelude` function hands on to a native is laid out with the descriptor it calls" {
@@ -2470,10 +2477,22 @@ test "a write that answers a record whose field the record holds in place hands 
   let code = names.map(|n: Bytes| own_code(answered_body(answers, n).text));
   assert_eq(code.filter(|c: Bytes| c.index_of(b" 0 = 0;") != None).len(), 0);
   assert_eq(code.filter(|c: Bytes| c.index_of(b"builtin_") != None).len(), 0);
-  // The first word loaded off the node is the key, whose count the answer hands back.
-  let loaded = code.get(0).split(b" = ply_words(").get(0).split(b" ");
+  // The first word loaded off the node is the key, whose count the answer takes over: nothing is
+  // counted again, and the key is let go of only by opening its box into the fields answered.
+  let text = code.get(0);
+  let loaded = text.split(b" = ply_words(").get(0).split(b" ");
   let key = loaded.get(loaded.len() - 1);
-  assert_eq(code.get(0).index_of(Bytes::concat_all([b"ply_dec(ctx, ", key, b")"])), None)
+  let opened = Bytes::concat_all([
+    b"if (",
+    call_text(last_fn(), [b"ctx", key]),
+    b") ",
+    call_start(free_fn(), [b"ctx", key]),
+  ]);
+  assert(
+    !takes_count(text) && text.index_of(opened) != None
+      && !lets_go_of(Bytes::join(text.split(opened), b""), key),
+    Some(String::of_bytes_lossy(text)),
+  )
 }
 
 test "an array read matched as `Some` or `None` tests its index and reads the element in place" {
@@ -2537,17 +2556,16 @@ test "a read of a list counts nothing it reads through it, but its answer once w
   );
   assert(
     headers.len() == 2
-      && headers.all(|i: Int|
-        line_at(i - 1).index_of(b"ply_dup(") == None
-          && line_at(i + 1).index_of(b"ply_rel(") == None),
+      && headers.all(|i: Int| !takes_count(line_at(i - 1)) && !lets_count_go(line_at(i + 1))),
     Some(String::of_bytes_lossy(text)),
   );
   // An item is read borrowed from the tail or a leaf; the answer read out of the list is counted once
   // more only where the list is let go of, by its type's drop.
-  let counted = reading(b"ply_dup(");
+  let counted = range(0, lines.len()).filter(|i: Int| takes_count(line_at(i)));
   assert(
     reading(b" = ply_words(p0)[1 + (").len() == 1 && counted.len() == 1
-      && counted.all(|i: Int| line_at(i + 1).index_of(b"ply_rel(ctx, p0, ") != None),
+      && counted.all(|i: Int|
+        line_at(i + 1).index_of(call_start(rel_fn(), [b"ctx", b"p0"])) != None),
     Some(String::of_bytes_lossy(text)),
   )
 }
@@ -3157,8 +3175,7 @@ test "a buffer read out of a record this body holds alone reaches its append uns
     names.filter(|n: Bytes| {
       let body = code(n);
       match body.index_of(b"rt_concat_p(") {
-        Some(c) ->
-          body.slice(0, c).index_of(b"ply_dup(") != None || body.index_of(b"rt_alloc") != None,
+        Some(c) -> takes_count(body.slice(0, c)) || body.index_of(b"rt_alloc") != None,
         None -> true,
       }
     }),
@@ -3198,7 +3215,7 @@ test "a byte string made for a list is handed to the list with no count taken ag
       && text.index_of(b"rt_list_room_p") != None,
     Some(String::of_bytes_lossy(text)),
   );
-  assert(text.index_of(b"ply_inc(") == None, Some(String::of_bytes_lossy(text)))
+  assert(!takes_count(text), Some(String::of_bytes_lossy(text)))
 }
 
 // The prologue unboxes an `Int`, a `Bool` or a fixed width into a local the loop reads instead, so the
@@ -3211,7 +3228,7 @@ test "a scalar parameter arrives as itself and holds no count for a self tail ca
   ]);
   let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None]);
-  assert_eq(out.map(|e: Emitted| e.text.split(b"ply_dec(ctx, p0)").len() - 1), [0, 0, 0])
+  assert_eq(out.map(|e: Emitted| lets_go_of(e.text, b"p0")), [false, false, false])
 }
 
 // At the body's tail nothing follows the update, so reading the accumulator twice does not keep it
@@ -3244,13 +3261,17 @@ test "a branch lets go as it opens of a parameter only another branch reads, and
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None, None]);
   let text = |name: Bytes|
     match out.filter(|e: Emitted| e.name == name) { [e, ..] -> e.text, [] -> b"" };
-  assert(text(b"m.slot").index_of(b"} else {\n    ply_rel(ctx, p0, ") != None, None);
+  assert(
+    text(b"m.slot").index_of(b"} else {\n    ".concat(call_start(rel_fn(), [b"ctx", b"p0"])))
+      != None,
+    None,
+  );
   // A record that arrives as its fields, by reference past four words or not, is exactly its
   // leaves: the branch that reads only its moved field has nothing of it to let go before its concat.
   let quiet = |name: Bytes| {
     let t = text(name);
     match ((t.index_of(b"} else {"), t.index_of(b"rt_concat_p("))) {
-      (Some(a), Some(b)) -> a < b && t.slice(a, b).index_of(b"ply_rel(") == None,
+      (Some(a), Some(b)) -> a < b && !lets_count_go(t.slice(a, b)),
       _ -> false,
     }
   };
