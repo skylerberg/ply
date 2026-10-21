@@ -1,6 +1,8 @@
 //! Closures, handlers, `perform`, `simulate` and `parallel`.
 
 use super::*;
+use crate::parallel::Branches;
+use crate::simulate::Body;
 
 /// A closure of compiled function `index` over `env`, its leading arguments. Takes the captures.
 pub unsafe extern "C" fn rt_closure(
@@ -101,22 +103,40 @@ unsafe fn pushed(ctx: *mut Ctx, clauses: *const Word, n: i64, ret: Word, emitted
 }
 
 /// A `handle` site's clause table: per clause the effect, resource (negative for none) and op
-/// as field-table indices, the closure, its `resumes`, and whether it binds the label.
+/// as field-table indices, the closure, its `resumes`, and whether it binds the label. Emitted
+/// code's sixth word is the `String` type where the clause binds its label or answers
+/// `abort.raise`, and 0 otherwise.
 pub(super) fn clauses_of(c: &Ctx, clauses: *const i64, n: i64, emitted: bool) -> Vec<FrameClause> {
     let words = args_of(clauses, n * 6);
     let name = |i: i64| c.tables.fields[i as usize].clone();
     words
         .chunks(6)
-        .map(|w| FrameClause {
-            effect: name(w[0]),
-            resource: (w[1] >= 0).then(|| name(w[1])),
-            op: name(w[2]),
-            closure: w[3],
-            resumes: w[4] as u8,
-            binds_label: w[5] != 0,
-            emitted,
+        .map(|w| {
+            let (effect, op) = (name(w[0]), name(w[2]));
+            let raise = emitted && is_abort(effect.as_str(), op.as_str());
+            FrameClause {
+                resource: (w[1] >= 0).then(|| name(w[1])),
+                closure: w[3],
+                resumes: w[4] as u8,
+                binds_label: w[5] != 0 && !raise,
+                emitted,
+                string: (emitted && w[5] != 0).then(|| unsafe { &*(w[5] as *const PlyType) }),
+                effect,
+                op,
+            }
         })
         .collect()
+}
+
+/// The label a clause written `[*t]` reads: a `String` the runtime makes for the release's code,
+/// lifted through the `String` type the `handle` site handed for emitted code; 0 with the context
+/// failed where it does not lift.
+fn label_word(ctx: *mut Ctx, string: Option<&'static PlyType>, label: &Symbol) -> Word {
+    let label = Value::Str(Arc::from(label.as_str()));
+    match string {
+        Some(ty) => lifted(ctx, &label, ty).map_or(0, Handed::word),
+        None => unsafe { &mut *ctx }.word(&label),
+    }
 }
 
 /// A `handle` whose clause resumes off the tail: `body`, a nullary closure, runs on its own stack.
@@ -347,7 +367,7 @@ unsafe fn performed(
                 }
                 if ply_core::sim::is_scheduled(effect.as_str(), op.as_str()) {
                     return unsafe {
-                        crate::simulate::perform(ctx, &effect, &op, args_of(args, n))
+                        crate::simulate::perform(ctx, &effect, &op, args_of(args, n), described)
                     };
                 }
                 continue;
@@ -367,7 +387,7 @@ unsafe fn performed(
                     if cl.binds_label
                         && let Some(label) = &resource
                     {
-                        bound.push(c.word(&Value::Str(Arc::from(label.as_str()))));
+                        bound.push(label_word(ctx, cl.string, label));
                     }
                     // Moved in: a local owning memory across the switch is freed once per restore.
                     return unsafe {
@@ -386,7 +406,7 @@ unsafe fn performed(
                     i,
                     (cl.closure, cl.emitted),
                     cl.resumes != 0,
-                    cl.binds_label,
+                    cl.binds_label.then_some(cl.string),
                 ));
                 break 'search;
             }
@@ -410,13 +430,15 @@ unsafe fn performed(
         );
         return c.fail(d);
     }
-    let Some((stack, depth, (closure, emitted), resumes, binds_label)) = found else {
+    let Some((stack, depth, (closure, emitted), resumes, label)) = found else {
         // Inside an open production region a `task` op is the scheduler's; outside, the host's.
         if effect.as_str() == "task"
             && ply_core::sim::TASK_OPS.contains(&op.as_str())
             && c.sims.last().is_some_and(|sim| sim.is_production())
         {
-            return unsafe { crate::simulate::perform(ctx, &effect, &op, args_of(args, n)) };
+            return unsafe {
+                crate::simulate::perform(ctx, &effect, &op, args_of(args, n), described)
+            };
         }
         let args = args_of(args, n);
         return match described {
@@ -428,8 +450,8 @@ unsafe fn performed(
     };
     let mut call_args: Vec<Word> = args_of(args, n).to_vec();
     // A clause written `[*t]` reads the label its call site named, before the continuation does.
-    if binds_label && let Some(label) = &resource {
-        call_args.push(c.word(&Value::Str(Arc::from(label.as_str()))));
+    if let (Some(string), Some(label)) = (label, &resource) {
+        call_args.push(label_word(ctx, string, label));
     }
     drop((effect, op, resource));
     // The clause runs outside its handler: that frame and all above it are hidden until it returns.
@@ -469,7 +491,7 @@ unsafe fn performed(
 
 /// The host's answer to an operation `described` describes, `args` its word forms, which this
 /// takes: each lowered through its parameter's type and let go through it, and the answer lifted
-/// through the operation's.
+/// through the operation's. One the production scheduler answers is handed it as it was performed.
 unsafe fn to_host(
     ctx: *mut Ctx,
     described: &PlyOp,
@@ -478,6 +500,9 @@ unsafe fn to_host(
     resource: Option<&Symbol>,
     args: &[Word],
 ) -> i64 {
+    if crate::host::production_scheduled(unsafe { &*ctx }, effect, op) {
+        return unsafe { crate::host::schedule(ctx, described, effect, op, resource, args) };
+    }
     let values = lowered_values(ctx, args, described.params());
     for (w, ty) in args.iter().zip(described.params()) {
         unsafe { Carried::new(Handed::of(*w), *ty) }.release(ctx);
@@ -572,9 +597,20 @@ pub(super) fn raise_from_perform(c: &mut Ctx, effect: &Symbol, op: &Symbol, args
 /// `simulate { body }`: runs the nullary `body` as a region's root task on this stack.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
+    unsafe { region(ctx, Body::Word(body)) }
+}
+
+/// [`rt_simulate`] of a `simulate` emitted code wrote: `body` is a closure block, which this takes,
+/// and `answer` the type of what it answers, through which the region holds its answer until it
+/// hands it back.
+pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, body: Block, answer: *const PlyType) -> Handed {
+    Handed::of(unsafe { region(ctx, Body::Block(body, &*answer)) })
+}
+
+unsafe fn region(ctx: *mut Ctx, body: Body) -> Word {
     let c = unsafe { &mut *ctx };
     if !c.sims.is_empty() {
-        heap::dec(body);
+        body.release(ctx);
         let outer = c.sims.last().map_or(Span::DUMMY, |sim| sim.site);
         let d = ply_core::err_nested_simulation(c.site(), outer);
         return c.fail(d);
@@ -604,7 +640,7 @@ pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
     }
     crate::simulate::end(c);
     c.record = Some(c.trail.record());
-    r
+    r.map_or(0, |answer| crate::simulate::word_of(c, answer))
 }
 
 /// The `handle` at `depth` is over: pops its frames, catches an unwind to it, applies `return`.
@@ -749,7 +785,8 @@ pub unsafe extern "C" fn rt_dec_shared(_ctx: *mut Ctx, w: i64) {
 /// `parallel { .. }`: the `n` nullary closures at `slots`, each answer written over its closure.
 pub unsafe extern "C" fn rt_parallel(ctx: *mut Ctx, slots: i64, n: i64) {
     let allowed = unsafe { &*ctx }.runs_branches_at_once(None);
-    unsafe { crate::parallel::run(ctx, slots as usize as *mut Word, n as usize, allowed) }
+    let slots = slots as usize as *mut Word;
+    unsafe { crate::parallel::run(ctx, slots, n as usize, allowed, Branches::Words) }
 }
 
 /// A `parallel` block whose site knows what its branches may perform: `reach` holds `count` pairs
@@ -761,6 +798,37 @@ pub unsafe extern "C" fn rt_parallel_past(
     reach: *const i64,
     count: i64,
 ) {
+    let allowed = unsafe { reaching(ctx, reach, count) };
+    let slots = slots as usize as *mut Word;
+    unsafe { crate::parallel::run(ctx, slots, n as usize, allowed, Branches::Words) }
+}
+
+/// [`rt_parallel`] of a `parallel` emitted code wrote: the `n` slots at `slots` hold closure blocks,
+/// which this takes, and each branch's answer is written over its closure uncounted. Where the
+/// block fails, a branch that failed or never ran leaves 0, and one that answered its answer, for
+/// emitted code to let go at its type.
+pub unsafe extern "C" fn rt_branches(ctx: *mut Ctx, slots: *const Handed, n: I64) {
+    let allowed = unsafe { &*ctx }.runs_branches_at_once(None);
+    let slots = slots.cast::<Word>().cast_mut();
+    unsafe { crate::parallel::run(ctx, slots, n.0 as usize, allowed, Branches::Blocks) }
+}
+
+/// [`rt_parallel_past`] of a `parallel` emitted code wrote, its slots as [`rt_branches`] takes them.
+pub unsafe extern "C" fn rt_branches_past(
+    ctx: *mut Ctx,
+    slots: *const Handed,
+    n: I64,
+    reach: *const Word,
+    count: I64,
+) {
+    let allowed = unsafe { reaching(ctx, reach, count.0) };
+    let slots = slots.cast::<Word>().cast_mut();
+    unsafe { crate::parallel::run(ctx, slots, n.0 as usize, allowed, Branches::Blocks) }
+}
+
+/// Whether a `parallel` block's branches may run at once, `reach` holding `count` pairs of
+/// field-table indices of what they may perform, an effect and its resource (negative for any).
+unsafe fn reaching(ctx: *mut Ctx, reach: *const i64, count: i64) -> bool {
     let reach: Vec<Reached> = {
         let c = unsafe { &*ctx };
         let name = |i: i64| c.tables.fields[i as usize].clone();
@@ -773,7 +841,5 @@ pub unsafe extern "C" fn rt_parallel_past(
             .collect()
     };
     // Decided and let go before a branch runs, which may stop a detached body on this stack.
-    let allowed = unsafe { &*ctx }.runs_branches_at_once(Some(&reach));
-    drop(reach);
-    unsafe { crate::parallel::run(ctx, slots as usize as *mut Word, n as usize, allowed) }
+    unsafe { &*ctx }.runs_branches_at_once(Some(&reach))
 }

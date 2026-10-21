@@ -253,6 +253,7 @@ pub fn runtime_json() -> String {
             }))
             .collect::<Vec<_>>(),
         "release_depth": ply_compiled::rt::RELEASE_DEPTH,
+        "hold": facts_json(ply_compiled::laid::hold()),
         "identity": c::runtime_identity(),
     })
     .to_string()
@@ -265,24 +266,23 @@ fn fields_json(fields: Vec<ply_compiled::laid::Field>) -> serde_json::Value {
         .collect()
 }
 
-fn layouts_json() -> serde_json::Value {
+fn facts_json(facts: Vec<(&'static str, ply_compiled::laid::Fact)>) -> serde_json::Value {
     use ply_compiled::laid::Fact;
+    let facts = facts.into_iter().map(|(name, fact)| {
+        let value = match fact {
+            Fact::Number(n) => serde_json::json!(n),
+            Fact::Field(field) => serde_json::json!(field),
+        };
+        (name.to_string(), value)
+    });
+    serde_json::Value::Object(facts.collect())
+}
+
+fn layouts_json() -> serde_json::Value {
     serde_json::Value::Object(
         ply_compiled::laid::layouts()
             .into_iter()
-            .map(|(object, facts)| {
-                let facts = facts.into_iter().map(|(name, fact)| {
-                    let value = match fact {
-                        Fact::Number(n) => serde_json::json!(n),
-                        Fact::Field(field) => serde_json::json!(field),
-                    };
-                    (name.to_string(), value)
-                });
-                (
-                    object.to_string(),
-                    serde_json::Value::Object(facts.collect()),
-                )
-            })
+            .map(|(object, facts)| (object.to_string(), facts_json(facts)))
             .collect(),
     )
 }

@@ -183,6 +183,16 @@ fn the_runtime_describes_what_emitted_code_lays_out_against() {
             &2.into()
         )
     );
+    // A native that answers nothing may still raise.
+    let bad = native("?array_bad");
+    assert_eq!(
+        (&bad["params"], &bad["answer"], &bad["raises"]),
+        (
+            &serde_json::json!(["I64", "I64", "I64"]),
+            &serde_json::Value::Null,
+            &true.into()
+        )
+    );
     let ctx = described_fields(&described["ctx"]);
     let names: Vec<&str> = ctx.iter().map(|f| f.0).collect();
     assert_eq!(
@@ -206,6 +216,17 @@ fn the_runtime_describes_what_emitted_code_lays_out_against() {
         assert_eq!((*at, *bytes), (8 * i as u64, 8), "`{name}` is not word {i}");
     }
     assert_eq!(described["release_depth"], 32);
+}
+
+/// `drop#Hold<a>` reads what a hold holds where the description says, as
+/// `compiler.emit.layout`'s `HoldLaid` names it; the release's `layouts` stay as they were.
+#[test]
+fn the_runtime_describes_where_a_hold_keeps_what_it_holds() {
+    let described: serde_json::Value =
+        serde_json::from_str(&ply_privileged::shipped::runtime_json())
+            .expect("the description reads");
+    assert_eq!(described["hold"], serde_json::json!({ "held": 1 }));
+    assert!(described["layouts"].get("hold").is_none());
 }
 
 /// Each struct emitted code lays out and the runtime reads is described as

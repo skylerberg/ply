@@ -7,7 +7,7 @@ use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Carried, Handed, PlyType};
 use ply_compiled::heap::{Heap, Word};
 use ply_compiled::native::Answered;
-use ply_compiled::rt::Ctx;
+use ply_compiled::rt::{Ctx, Lifted};
 use ply_core::codec::{decode, encode, tag};
 use ply_core::{Decimal, Fields, Fixed, INT_TYPES, IntTy, Symbol, Value};
 use std::sync::Arc;
@@ -543,6 +543,118 @@ fn a_function_the_program_wrote_crosses_by_name_and_a_generated_one_reads_whole(
     };
     unfailed(&mut ctx);
     assert_eq!((case, out), (ply_core::codec::fun::PROJECT as Word, [3, 2]));
+}
+
+/// A value of `m.Box`, a block of one word, counted at its offset 0 and freed by size.
+const BOX_BYTES: Word = 16 + 8;
+
+unsafe extern "C" fn box_inc(_ctx: *mut Ctx, w: Word) -> Word {
+    unsafe { *(w as *mut u32) += 1 };
+    0
+}
+
+unsafe extern "C" fn box_dec(ctx: *mut Ctx, w: Word) -> Word {
+    unsafe {
+        if *(w as *const u32) > 1 {
+            *(w as *mut u32) -= 1;
+        } else {
+            helper::<N2>("rt_free")(ctx, w, BOX_BYTES);
+        }
+    }
+    0
+}
+
+static BOX: PlyType = PlyType {
+    identity: 5,
+    spelled: b"m.Box".as_ptr(),
+    spelled_len: 5,
+    inc: box_inc,
+    dec: box_dec,
+    lower: unread,
+    lift: nothing,
+};
+
+/// A lifting of a list of `handles`, each a position beside the bytes, with a runtime object at
+/// position 0 and a box carried with its type at position 1; answers the box.
+fn lifting_beside(ctx: &mut Ctx, handles: &[u64]) -> Word {
+    let mut w = ply_core::codec::Writer::new();
+    w.count(tag::LIST, handles.len() as u64);
+    for at in handles {
+        w.handle(*at);
+    }
+    let b = unsafe { helper::<A1>("rt_alloc_bytes")(ctx, BOX_BYTES) };
+    let bridge = ctx.heap.bridge(Value::secret_text("hunter2"));
+    let carried = unsafe { Carried::new(Handed::of(b), &BOX) };
+    ctx.lift_from(
+        w.finish(),
+        vec![Lifted::Runtime(bridge), Lifted::Carried(carried)],
+    );
+    b
+}
+
+/// A value the runtime kept with its type is handed to compiled code with the count the lifting
+/// held; what compiled code leaves of the lifting is let go through its type when it ends.
+#[test]
+fn a_carried_value_lifted_moves_its_count_to_compiled_code_and_one_left_is_let_go() {
+    let mut ctx = context();
+    ctx.begin(1_000);
+    let c: *mut Ctx = &mut ctx;
+    let b = lifting_beside(&mut ctx, &[1]);
+    unsafe {
+        assert_eq!(native::<A1>("?in_count")(c, tag::LIST as Word), 1);
+        assert_eq!(native::<A0>("?in_carried")(c), b);
+        native::<N0>("?lift_close")(c);
+    }
+    unfailed(&mut ctx);
+    assert_eq!((ctx.heap.live(), unsafe { *(b as *const u32) }), (1, 1));
+    unsafe { box_dec(&mut ctx, b) };
+    assert_eq!(ctx.heap.live(), 0);
+    lifting_beside(&mut ctx, &[]);
+    unsafe {
+        assert_eq!(native::<A1>("?in_count")(c, tag::LIST as Word), 0);
+        native::<N0>("?lift_close")(c);
+    }
+    unfailed(&mut ctx);
+    assert_eq!(
+        ctx.heap.live(),
+        0,
+        "the box left beside the bytes was not let go"
+    );
+    assert_eq!(ctx.heap.bridges(), 0);
+    ctx.end();
+}
+
+/// A runtime object and a value kept with its type are read by their own natives alone; one read
+/// as the other is left beside the bytes, and let go with them.
+#[test]
+fn a_handle_read_as_the_other_kind_fails_the_crossing_and_is_let_go_with_it() {
+    for (at, read, said) in [
+        (
+            1,
+            "?in_handle",
+            "a value kept with its type, read as a runtime object",
+        ),
+        (
+            0,
+            "?in_carried",
+            "a runtime object, read as a value kept with its type",
+        ),
+    ] {
+        let mut ctx = context();
+        ctx.begin(1_000);
+        let c: *mut Ctx = &mut ctx;
+        lifting_beside(&mut ctx, &[at]);
+        unsafe {
+            native::<A1>("?in_count")(c, tag::LIST as Word);
+            assert_eq!(native::<A0>(read)(c), 0);
+            native::<N0>("?lift_close")(c);
+        }
+        let failure = ctx.take_failure().expect("the crossing failed").message;
+        assert!(failure.contains(said), "{failure}");
+        assert_eq!((ctx.heap.live(), ctx.heap.bridges()), (0, 0));
+        ctx.failed = 0;
+        ctx.end();
+    }
 }
 
 /// The taken bytes are copied out whole or not at all.

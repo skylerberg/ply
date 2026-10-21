@@ -6,17 +6,24 @@ import emit.compare (program_of)
 import emit.layout (LSum)
 import emit.reps
 import emit.reps (Ctors)
-import emit.release (Part, WordAt, ByCase, CaseBox, Object, laid_parts, drop_of, generated,
-                     case_dropped)
+import emit.release (Part, WordAt, ByCase, CaseBox, Object, InBox, laid_parts, drop_of, generated,
+                     case_dropped, never_kept)
 import emit.keys (Named)
-import emit.tir (Fn, Var, Case, Opened, Let, If, Restart, Dec, Return, LastOf, AVar, RWord, RSum)
+import emit.tir (Fn, Var, Case, Opened, Let, If, Restart, Dec, Return, LastOf, AVar, RWord, RSum,
+                 RInt, Rooted, Lent, Given, Owned, Closure, no_links)
+import emit.print.invoked (lambda_text)
+import emit.print.text (printing)
+import emit.pieces (spelled)
+import emit.roots (symbol_of)
+import syntax.parsing (span_between)
 
 fn corpus() -> Bytes =
   Bytes::concat_all([
     b"type Tree = | Leaf | Node(Tree, Int, Tree)\n",
     b"type Expr = | Num(Int) | Add(Expr, Expr) | Neg(Expr) | Name(String)\n",
     b"type Pair = { name: String, items: List<Int>, tree: Tree }\n",
-    b"fn uses(t: Tree, e: Expr, p: Pair) -> Int = 0\n",
+    b"type Job = | Run((Int) -> Int, Int) | Idle\n",
+    b"fn uses(t: Tree, e: Expr, p: Pair, j: Job) -> Int = 0\n",
   ])
 
 fn declared(name: Bytes) -> Type = TyCon({ name: name, args: [] })
@@ -112,4 +119,50 @@ test "a record's box lets go of its pointers and of a sum it holds whole" {
       },
     },
   }
+}
+
+test "a type reaching a function value through a case's box is never kept, and a type holding itself is asked once" {
+  match corpus_ctors() {
+    Err(why) -> assert_eq(why, b""),
+    Ok(ctors) -> {
+      let held = |ty: Type|
+        never_kept(ctors, InBox({ parts: [{ at: 0, ty: ty, rep: RWord }], words: 1 }));
+      let plan = TyRecord([
+        { name: b"job", ty: declared(b"m.Job") },
+        { name: b"name", ty: declared(b"String") },
+      ]);
+      assert_eq(held(declared(b"m.Tree")), false);
+      assert_eq(held(declared(b"m.Expr")), false);
+      assert_eq(held(declared(b"m.Job")), true);
+      assert_eq(held(plan), true)
+    },
+  }
+}
+
+test "a closure capturing a channel is kept as 0, its keep entry making no copy, and shares as before" {
+  let int = declared(b"Int");
+  let chan = TyCon({ name: b"Chan", args: [int] });
+  let body = {
+    key: Named(b"m.outer"),
+    kind: Rooted,
+    params: [{ id: 0, ty: chan, rep: RWord }, { id: 1, ty: int, rep: RInt }],
+    conv: { params: [Lent, Given], reps: [RWord, RInt], answer: RInt, answered: Owned },
+    body: [Return(AVar({ id: 1, ty: int, rep: RInt }))],
+    lambdas: [],
+    base: 0,
+    members: [],
+    links: no_links(),
+    statics: [],
+  };
+  let l = Closure({ body: body, captures: 1, at: span_between(0, 0) });
+  let text = spelled(lambda_text(body, 0, l, printing(Map::new())).out);
+  let name = symbol_of(b"m.outer").concat(b"_lambda0");
+  let has = |t: Bytes| assert(text.contains(t), Some(String::of_bytes_lossy(text)));
+  has(
+    Bytes::concat_all([
+      name,
+      b"_keep(PlyCtx *ctx, Word self) {\n  Word t1 = 0;\n  return t1;\n}\n",
+    ]),
+  );
+  has(b"if (ply_words(self)[1]) t1 = 0;")
 }
