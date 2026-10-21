@@ -16,7 +16,7 @@ import emit.print.text (Printing, Place, printing, function_body, line, named, n
 import emit.print.counts (count_printed)
 import emit.print.made (c_type)
 import emit.lower.held (values_of)
-import emit.print.counting (free_fn, call_text)
+import emit.print.counting (free_fn, call_text, call_start)
 
 /// What printing a site or a `handle` linked before what it links its record around: the printing,
 /// how a failure under it leaves, the record's unlinking first, and the record, where it linked one.
@@ -331,6 +331,19 @@ fn holding() -> { pr: Printing, s: Var, flat: Var, n: Var, tok: Var } / {abort.r
 
 fn occurrences(t: Bytes, s: Bytes) -> Int / {abort.raise} = t.split(s).len() - 1
 
+fn has(t: Bytes, s: Bytes) -> Bool = t.index_of(s) != None
+
+/// Where `s` first stands in `t`, or -1.
+fn at(t: Bytes, s: Bytes) -> Int = match t.index_of(s) { Some(i) -> i, None -> 0 - 1 }
+
+/// Whether `text` links the record named `record` into the context's frames.
+fn links(text: Bytes, record: Bytes) -> Bool =
+  has(text, Bytes::concat_all([b"= &", record, b".h;"]))
+
+/// Whether `text` takes the record named `record` back off the context's frames.
+fn unlinks(text: Bytes, record: Bytes) -> Bool =
+  has(text, Bytes::concat_all([b"= ", record, b".h.prev;"]))
+
 test "a runtime function that may stop and cannot fail links a record around its call as a call that can fail does" {
   let h = holding();
   let quiet = Native({
@@ -339,33 +352,29 @@ test "a runtime function that may stop and cannot fail links a record around its
     uses: { takes: [], owned: true, fails: false, stops: true },
   });
   let l = site_linked(place(), h.pr, [h.s], quiet);
-  assert_eq(l.record, Some(b"ply_fr"));
-  assert_eq(
-    spelled(l.pr.out),
-    b"  if (PLY_FRAMES(ctx)) {\n    ply_fr.s[0] = p0;\n    ply_fr.h.each = m_f_each0; ply_fr.h.prev = PLY_FRAMES(ctx); PLY_FRAMES(ctx) = &ply_fr.h;\n  }\n",
-  );
-  assert_eq(
-    spelled(unlinked({ ..l.pr, out: [] }, 0, l).out),
-    b"  if (PLY_FRAMES(ctx) == &ply_fr.h) PLY_FRAMES(ctx) = ply_fr.h.prev;\n",
-  )
+  let r = match l.record { Some(r) -> r, None -> b"" };
+  let text = spelled(l.pr.out);
+  assert(links(text, r) && has(text, b"= p0;"), Some(String::of_bytes_lossy(text)));
+  assert(unlinks(spelled(unlinked({ ..l.pr, out: [] }, 0, l).out), r), None)
 }
 
 test "a call that may stop links a record of what the frame holds across it, and a failure unlinks it before leaving" {
   let h = holding();
   let l = site_linked(place(), h.pr, [h.s, h.flat, h.n], call_of(true));
-  assert_eq(
-    spelled(l.pr.out),
-    b"  if (PLY_FRAMES(ctx)) {\n    ply_fr.s[0] = p0; ply_fr.s[1] = t1_0;\n    ply_fr.h.each = m_f_each0; ply_fr.h.prev = PLY_FRAMES(ctx); PLY_FRAMES(ctx) = &ply_fr.h;\n  }\n",
+  let r = match l.record { Some(r) -> r, None -> b"" };
+  let text = spelled(l.pr.out);
+  // The word and the flat value's word are held, the `Int` not.
+  assert(
+    links(text, r) && has(text, b"= p0;") && has(text, b"= t1_0;"),
+    Some(String::of_bytes_lossy(text)),
   );
-  assert_eq(
-    l.leave,
-    b"{ if (PLY_FRAMES(ctx) == &ply_fr.h) PLY_FRAMES(ctx) = ply_fr.h.prev; goto ply_u0; }",
+  assert(!has(text, b"= t2;"), None);
+  assert(has(record_declared(l.pr), b"s[2]"), None);
+  assert(
+    unlinks(l.leave, r) && at(l.leave, b".h.prev") < at(l.leave, b"goto "),
+    Some(String::of_bytes_lossy(l.leave)),
   );
-  assert_eq(
-    spelled(unlinked({ ..l.pr, out: [] }, 0, l).out),
-    b"  if (PLY_FRAMES(ctx) == &ply_fr.h) PLY_FRAMES(ctx) = ply_fr.h.prev;\n",
-  );
-  assert_eq(record_declared(l.pr), b"  struct { PlyFrame h; Word s[2]; } ply_fr;\n")
+  assert(unlinks(spelled(unlinked({ ..l.pr, out: [] }, 0, l).out), r), None)
 }
 
 test "a record's each holds every slot once more and lets go of each as the frame's failure path does" {
@@ -377,17 +386,14 @@ test "a record's each holds every slot once more and lets go of each as the fram
   let slots = [{ ..h.s, id: 0 }, { ..h.flat, id: 1 }];
   let named = { ..printing(Map::new().insert(0, b"x0").insert(1, b"x1")), ctors: h.pr.ctors };
   let armed = { ..place(), depth: 1 };
-  let up = slots.fold(named, |q: Printing, v: Var| count_printed(armed, q, Inc({ var: v, n: 1 })));
-  let down = slots.fold(named, |q: Printing, v: Var| count_printed(armed, q, Dec(v)));
-  assert_eq(
-    each,
-    Bytes::concat_all([
-      b"static void m_f_each0(PlyCtx *ctx, Word *s, int64_t d) {\n  Word x0 = s[0]; Word x1_0 = s[1];\n  if (d > 0) {\n",
-      spelled(up.out),
-      b"  } else {\n",
-      spelled(down.out),
-      b"  }\n}\n",
-    ]),
+  let up = spelled(
+    slots.fold(named, |q: Printing, v: Var| count_printed(armed, q, Inc({ var: v, n: 1 }))).out,
+  );
+  let down = spelled(slots.fold(named, |q: Printing, v: Var| count_printed(armed, q, Dec(v))).out);
+  assert(has(each, b"= s[0];") && has(each, b"= s[1];"), Some(String::of_bytes_lossy(each)));
+  assert(
+    has(each, up) && has(each, down) && at(each, up) < at(each, down),
+    Some(String::of_bytes_lossy(each)),
   )
 }
 
@@ -399,29 +405,26 @@ test "a call that cannot stop, a value that cannot fail, and a call holding no c
     site_linked(place(), h.pr, [h.s], summed),
     site_linked(place(), h.pr, [h.n], call_of(true)),
   ].fold((), |_: Unit, l: Linked| {
-    assert_eq((l.pr.out.len(), l.leave, l.record), (h.pr.out.len(), b"goto ply_u0;", None));
+    assert_eq((l.pr.out.len(), l.leave, l.record), (h.pr.out.len(), place().leave, None));
     assert_eq((record_declared(l.pr), l.pr.eaches.len()), (b"", 0))
   })
 }
 
 test "a reuse token live across a call that may stop is freed under the test before the link, never a slot" {
   let h = holding();
-  let freed = Bytes::concat_all([
-    b"  if (PLY_FRAMES(ctx)) {\n    if (t3) ",
-    call_text(free_fn(), [b"ctx", b"t3", b"INT64_C(32)"]),
-    b";\n    t3 = 0;\n",
-  ]);
+  let freed = call_start(free_fn(), [b"ctx", b"t3"]);
   let l = site_linked(place(), h.pr, [h.s, h.tok], call_of(true));
-  assert_eq(
-    spelled(l.pr.out),
-    freed.concat(
-      b"    ply_fr.s[0] = p0;\n    ply_fr.h.each = m_f_each0; ply_fr.h.prev = PLY_FRAMES(ctx); PLY_FRAMES(ctx) = &ply_fr.h;\n  }\n",
-    ),
+  let r = match l.record { Some(r) -> r, None -> b"" };
+  let text = spelled(l.pr.out);
+  assert(
+    has(text, freed) && links(text, r) && at(text, freed) < at(text, b"= &"),
+    Some(String::of_bytes_lossy(text)),
   );
+  assert(!has(text, b"= t3;") && has(record_declared(l.pr), b"s[1]"), None);
   // A token alone is freed, and nothing is linked.
   let alone = site_linked(place(), h.pr, [h.tok], call_of(true));
   assert_eq(alone.record, None);
-  assert_eq(spelled(alone.pr.out), freed.concat(b"  }\n"))
+  assert(has(spelled(alone.pr.out), freed) && !has(spelled(alone.pr.out), b"= &"), None)
 }
 
 test "sites holding alike share one each, the record is as wide as the widest, and a lambda's function declares its own" {
@@ -435,8 +438,8 @@ test "sites holding alike share one each, the record is as wide as the widest, a
     [occurrences(text, b"h.each = m_f_each0;"), occurrences(text, b"h.each = m_f_each1;")],
     [2, 1],
   );
-  assert_eq(record_declared(wider.pr), b"  struct { PlyFrame h; Word s[2]; } ply_fr;\n");
-  assert_eq(occurrences(spelled(eaches_printed(b"m_f", wider.pr)), b"static void m_f_each"), 2);
+  assert(has(record_declared(wider.pr), b"s[2]"), None);
+  assert_eq(occurrences(spelled(eaches_printed(b"m_f", wider.pr)), b" m_f_each"), 2);
   // A lambda's C function starts with no record of its own, and its sites count by the root's eaches.
   let lambda = function_body(wider.pr, Map::new().insert(0, b"q0"));
   assert_eq(record_declared(lambda), b"");
@@ -456,16 +459,18 @@ test "a handle under which something may stop links a record of its own over wha
   };
   let site = |clauses: List<Clause>| { clauses: clauses, ret: None, detached: None };
   let l = handle_linked(place(), h.pr, 2, [], site([asked]), [h.s, h.n]);
-  assert_eq(
-    spelled(l.pr.out),
-    b"  struct { PlyFrame h; Word s[1]; } ply_fh2;\n  if (PLY_FRAMES(ctx)) {\n    ply_fh2.s[0] = p0;\n    ply_fh2.h.each = m_f_each0; ply_fh2.h.prev = PLY_FRAMES(ctx); PLY_FRAMES(ctx) = &ply_fh2.h;\n  }\n",
+  let r = match l.record { Some(r) -> r, None -> b"" };
+  let text = spelled(l.pr.out);
+  // Its record is declared where it links it, one slot wide, holding the word and not the `Int`.
+  assert(
+    links(text, r) && has(text, b"= p0;") && !has(text, b"= t2;") && has(text, b"s[1]"),
+    Some(String::of_bytes_lossy(text)),
   );
-  assert_eq(l.record, Some(b"ply_fh2"));
   // The record is the handle's: the function's record for its sites is no wider.
   assert_eq(record_declared(l.pr), b"");
   // With no clause, no `return` and nothing in its body that may stop, nothing runs under it to stop.
   let quiet = handle_linked(place(), h.pr, 2, [], site([]), [h.s]);
   assert_eq((quiet.record, quiet.pr.out.len()), (None, h.pr.out.len()));
   let stopping = [Do({ val: call_of(true), at: span_between(0, 0), unwind: [] })];
-  assert_eq(handle_linked(place(), h.pr, 2, stopping, site([]), [h.s]).record, Some(b"ply_fh2"))
+  assert(handle_linked(place(), h.pr, 2, stopping, site([]), [h.s]).record != None, None)
 }

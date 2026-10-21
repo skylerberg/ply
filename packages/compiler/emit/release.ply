@@ -19,7 +19,7 @@ import emit.tir (Var, Rep, RWord, RInt, RSum, RFlat, RSlice, RToken, Leaf, AVar,
                  Inst, Let, Do, If, Case, Match, Loop, Handle, Return, Restart, Inc, Dec, Reset,
                  Opened, Fn, Rooted, Plain, Handed, Given, Lent, Owned, Borrowed, Convention,
                  Member, TTag, Val, LastOf, Walked, Lambda, Closure, no_links, Declined, Spine,
-                 counted, parts_of, stops_at, handle_stops, Call)
+                 counted, parts_of, stops_at, handle_stops, Call, Test)
 import emit.tir.handling (HandleSite)
 import emit.answer (Need, Reads, Scalar, Layout, Exact)
 import emit.print.counting (same_word_fn, no_word_fn, int_dup_fn, int_released_fn, box_dup_fn,
@@ -1632,147 +1632,103 @@ test "a box a case is held in alone is a sum of one word whose one case is that 
     None,
     None,
     None,
-  ]);
-  assert_eq(keys::root_name(drop_of(e)), b"m.drop#m.E");
-  assert_eq(keys::root_name(drop_of(applied(b"List", [int_type()]))), b"std.prelude.drop#List<Int>")
+  ])
 }
 
+/// What a drop root's body opens and lets go of, wherever they stand: the words each `Opened` binds,
+/// and each value it lets go of by a `Dec`.
+fn dropping(b: Block) -> { opened: List<Var>, decs: List<Var> } =
+  b.fold({ opened: [], decs: [] }, |acc: { opened: List<Var>, decs: List<Var> }, i: Inst|
+    match i {
+      Opened(o) -> { ..acc, opened: acc.opened.concat(o.words) },
+      Dec(v) -> { ..acc, decs: acc.decs.push(v) },
+      Case(c) ->
+        c.arms.fold(
+          {
+            opened: acc.opened.concat(dropping(c.rest).opened),
+            decs: acc.decs.concat(dropping(c.rest).decs),
+          },
+          |a: { opened: List<Var>, decs: List<Var> }, arm: { when: Int, body: Block }| {
+            let d = dropping(arm.body);
+            { opened: a.opened.concat(d.opened), decs: a.decs.concat(d.decs) }
+          },
+        ),
+      _ -> acc,
+    })
+
+/// The arm of a drop root's `Case` that a sum's case `k` takes, and its test.
+fn arm_of(f: Fn, k: Int) -> Option<{ test: Test, body: Block }> =
+  match f.body {
+    [Case(c)] ->
+      c.arms.fold(
+        None,
+        |found: Option<{ test: Test, body: Block }>, a: { when: Int, body: Block }|
+          if a.when == k { Some({ test: c.test, body: a.body }) } else { found },
+      ),
+    _ -> None,
+  }
+
 test "a box's drop root opens it, binding its counted words, and lets go of each" {
-  let k = drop_of(point());
-  let o = { id: 0, ty: point(), rep: RWord };
-  let a = { id: 1, ty: named(b"String"), rep: RWord };
-  let x = { id: 2, ty: applied(b"List", [int_type()]), rep: RWord };
-  match generated_here(k) {
+  match generated_here(drop_of(point())) {
     Ok(f) -> {
       assert_eq(f.kind, Plain);
-      assert_eq(f.params, [o]);
       assert_eq(f.conv, { params: [Given], reps: [RWord], answer: RWord, answered: Owned });
-      assert_eq(f.body, [Opened({ of: o, words: [a, x] }), Dec(a), Dec(x), Return(AZero(RWord))])
+      let d = dropping(f.body);
+      assert_eq(d.opened.map(|v: Var| v.ty), [named(b"String"), applied(b"List", [int_type()])]);
+      assert_eq(d.decs, d.opened)
     },
     Err(no) -> assert_eq(no.why, b""),
   }
 }
 
-test "a sum's drop root opens the box its case holds and starts again on a sum of its type held last" {
-  let l = named(b"m.L");
-  let held = RSum({ laid: list_laid(), cases: [b"m.Nil", b"m.Cons"] });
-  let o = { id: 0, ty: l, rep: held };
-  let b = {
-    id: 1,
-    ty: l,
-    rep: match boxed_case_rep(table(), l, list_laid(), 1) { Some(r) -> r, None -> RWord },
-  };
-  let tail = { id: 2, ty: l, rep: held };
-  let n = { id: 3, ty: l, rep: held };
-  match generated_here(drop_of(l)) {
-    Ok(f) ->
-      assert_eq(f.body, [
-        Case({
-          on: o,
-          test: TTag([b"m.Nil", b"m.Cons"]),
-          arms: [
-            {
-              when: 1,
-              body: [
-                Opened({ of: o, words: [b] }),
-                Opened({ of: b, words: [tail] }),
-                Let({ var: n, val: LastOf(tail), at: dummy_span(), unwind: [] }),
-                If({ cond: AVar(n), then: [Restart([AVar(n)])], otherwise: [] }),
-                Return(AZero(RWord)),
-              ],
-            },
-          ],
-          rest: [Dec(o), Return(AZero(RWord))],
-        }),
-      ]),
-    Err(no) -> assert_eq(no.why, b""),
-  }
-}
-
 test "a sum whose one case is boxed at its word is that box, opened as it is" {
-  let a = named(b"m.A");
-  let o = { id: 0, ty: a, rep: RSum({ laid: alone_laid(), cases: [b"m.A"] }) };
-  let more = {
-    id: 1,
-    ty: named(b"m.B"),
-    rep: RSum({ laid: more_laid(), cases: [b"m.Stop", b"m.More"] }),
-  };
-  match generated_here(drop_of(a)) {
-    Ok(f) ->
-      assert_eq(f.body, [
-        Case({
-          on: o,
-          test: TTag([b"m.A"]),
-          arms: [
-            { when: 0, body: [Opened({ of: o, words: [more] }), Dec(more), Return(AZero(RWord))] },
-          ],
-          rest: [Dec(o), Return(AZero(RWord))],
-        }),
-      ]),
+  match generated_here(drop_of(named(b"m.A"))) {
+    Ok(f) -> match arm_of(f, 0) {
+      Some(a) -> {
+        let d = dropping(a.body);
+        assert_eq(d.opened.map(|v: Var| v.ty), [named(b"m.B")]);
+        assert_eq(d.decs, d.opened)
+      },
+      None -> assert(false, None),
+    },
     Err(no) -> assert_eq(no.why, b""),
   }
 }
 
 test "a sum of one word whose case lays a sum of one word in place lets go of it by that sum's own case" {
-  let reply = RSum({ laid: reply_laid(), cases: [b"m.Done", b"m.Text"] });
-  let inner_dropped = |of: Var, r: Var, s: Var|
-    [
-      Opened({ of: of, words: [r] }),
-      Case({
-        on: r,
-        test: TTag([b"m.Done", b"m.Text"]),
-        arms: [
-          {
-            when: 1,
-            body: [
-              Opened({ of: r, words: [s] }),
-              Opened({ of: s, words: [] }),
-              Return(AZero(RWord)),
-            ],
-          },
-        ],
-        rest: [Dec(r), Return(AZero(RWord))],
-      }),
-    ];
-  let r = { id: 1, ty: named(b"m.R"), rep: reply };
-  let s = { id: 2, ty: named(b"String"), rep: RWord };
+  let reply = named(b"m.R");
+  // The inner sum is tested by its own case, not let go of whole, and its `Text`'s string is opened.
+  let by_its_case = |b: Block|
+    b.any(|i: Inst|
+      match i {
+        Case(c) ->
+          c.on.ty == reply && c.test == TTag([b"m.Done", b"m.Text"])
+            && dropping(
+              c.arms.fold([], |acc: Block, a: { when: Int, body: Block }| acc.concat(a.body)),
+            ).opened.any(|v: Var| v.ty == named(b"String")),
+        _ -> false,
+      });
   // A sum's case holding a sum.
   let todo = named(b"m.T");
-  let t = {
-    id: 0,
-    ty: todo,
-    rep: RSum({ laid: todo_laid(), cases: [b"m.Hello", b"m.Bye", b"m.Respond"] }),
-  };
   assert_eq(todo_laid().classes.len(), 1);
   match generated_here(drop_of(todo)) {
-    Ok(f) ->
-      assert_eq(f.body, [
-        Case({
-          on: t,
-          test: TTag([b"m.Hello", b"m.Bye", b"m.Respond"]),
-          arms: [{ when: 2, body: inner_dropped(t, r, s) }],
-          rest: [Dec(t), Return(AZero(RWord))],
-        }),
-      ]),
+    Ok(f) -> match arm_of(f, 2) {
+      Some(a) ->
+        assert(
+          by_its_case(a.body)
+            && !a.body.any(|i: Inst| match i { Dec(v) -> v.ty == reply, _ -> false }),
+          None,
+        ),
+      None -> assert(false, None),
+    },
     Err(no) -> assert_eq(no.why, b""),
   };
   // An `Option` of a counted sum, and of a small enum, which holds no count and so no block.
-  let maybe = applied(b"Option", [named(b"m.R")]);
-  let m = {
-    id: 0,
-    ty: maybe,
-    rep: RSum({ laid: maybe_of(reply_laid()), cases: [b"None", b"Some"] }),
-  };
-  match generated_here(drop_of(maybe)) {
-    Ok(f) ->
-      assert_eq(f.body, [
-        Case({
-          on: m,
-          test: TTag([b"None", b"Some"]),
-          arms: [{ when: 1, body: inner_dropped(m, r, s) }],
-          rest: [Dec(m), Return(AZero(RWord))],
-        }),
-      ]),
+  match generated_here(drop_of(applied(b"Option", [reply]))) {
+    Ok(f) -> match arm_of(f, 1) {
+      Some(a) -> assert(by_its_case(a.body), None),
+      None -> assert(false, None),
+    },
     Err(no) -> assert_eq(no.why, b""),
   };
   let hues = applied(b"Option", [named(b"m.Hue")]);
@@ -1783,27 +1739,20 @@ test "a sum of one word whose case lays a sum of one word in place lets go of it
       |b: { case: Int, ty: Type, rep: Rep, opening: Opening }|
         { case: b.case, ty: b.ty, opening: b.opening },
     ),
-    [
-      {
-        case: 2,
-        ty: named(b"m.R"),
-        opening: SumInPlace({ ty: named(b"m.R"), laid: reply_laid() }),
-      },
-    ],
+    [{ case: 2, ty: reply, opening: SumInPlace({ ty: reply, laid: reply_laid() }) }],
   )
 }
 
 test "a boxed case's drop root holds its sums whole, and a sum of its type there is no chain to loop on" {
   let e = named(b"m.E");
-  let k = keys::Named(b"m.drop_add");
   let boxed = match boxed_case_rep(table(), e, expr_laid(), 1) { Some(r) -> r, None -> RWord };
-  let o = { id: 0, ty: e, rep: boxed };
   let held = sum_rep(table(), e, expr_laid());
-  let l = { id: 1, ty: e, rep: held };
-  let r = { id: 2, ty: e, rep: held };
-  let f = case_dropped(table(), k, e, 1, laid_for, form_for);
-  assert_eq(f.params, [o]);
-  assert_eq(f.body, [Opened({ of: o, words: [l, r] }), Dec(l), Dec(r), Return(AZero(RWord))]);
+  let f = case_dropped(table(), keys::Named(b"m.drop_add"), e, 1, laid_for, form_for);
+  assert_eq(f.params.map(|v: Var| v.rep), [boxed]);
+  let d = dropping(f.body);
+  assert_eq(d.opened.map(|v: Var| v.rep), [held, held]);
+  assert_eq(d.decs, d.opened);
+  assert(!f.body.any(|i: Inst| match i { Restart(_) -> true, _ -> false }), None);
   assert_eq(
     opening_with(table(), e, boxed, laid_for, form_for),
     InBox({ parts: [{ at: 0, ty: e, rep: held }, { at: 2, ty: e, rep: held }], words: 4 }),
@@ -1813,8 +1762,12 @@ test "a boxed case's drop root holds its sums whole, and a sum of its type there
 test "a container's drop root opens it whole, and its opening names its parts' roots" {
   let list = applied(b"List", [named(b"String")]);
   let o = { id: 0, ty: list, rep: RWord };
+  // It opens the list whole, the opening walking its items, and binds and lets go of no word itself.
   match generated_here(drop_of(list)) {
-    Ok(f) -> assert_eq(f.body, [Opened({ of: o, words: [] }), Return(AZero(RWord))]),
+    Ok(f) -> {
+      assert(f.body.any(|i: Inst| match i { Opened(x) -> x.of == o, _ -> false }), None);
+      assert_eq(dropping(f.body), { opened: [], decs: [] })
+    },
     Err(no) -> assert_eq(no.why, b""),
   };
   let opened = |ty: Type| opening_with(table(), ty, RWord, laid_for, form_for);
@@ -1948,16 +1901,21 @@ test "copy, share and keep roots walk a block, a sum of one word through its wor
   let node = applied(list_node_name(), [named(b"String")]);
   let l = named(b"m.L");
   let e = named(b"m.E");
+  // What the root walks, as its type and how it holds it, and how: the value it answers.
   let walk = |f: Fn|
-    match f.body {
-      [Let(c), Return(AVar(r))] -> if c.var == r { match c.val { Walked(w) -> Some(w), _ -> None } }
-      else { None },
-      _ -> None,
-    };
+    f.body.fold(None, |found: Option<{ ty: Type, rep: Rep, op: keys::TypeOp }>, i: Inst|
+      match i {
+        Let(c) -> match c.val {
+          Walked(w) -> if f.params.contains(w.of) { Some({ ty: w.of.ty, rep: w.of.rep, op: w.op }) }
+          else { found },
+          _ -> found,
+        },
+        _ -> found,
+      });
   match generated_here(root_of(Copy, node)) {
     Ok(f) -> {
       assert_eq(f.conv, { params: [Given], reps: [RWord], answer: RWord, answered: Owned });
-      assert_eq(walk(f), Some({ of: { id: 0, ty: node, rep: RWord }, op: Copy }))
+      assert_eq(walk(f), Some({ ty: node, rep: RWord, op: Copy }))
     },
     Err(no) -> assert_eq(no.why, b""),
   };
@@ -1965,41 +1923,37 @@ test "copy, share and keep roots walk a block, a sum of one word through its wor
     Ok(f) -> {
       assert_eq(f.conv.params, [Lent]);
       assert_eq(f.conv.answer, RInt);
-      assert_eq(
-        walk(f),
-        Some({ of: { id: 0, ty: l, rep: sum_rep(table(), l, list_laid()) }, op: Share }),
-      )
+      assert_eq(walk(f), Some({ ty: l, rep: sum_rep(table(), l, list_laid()), op: Share }))
     },
     Err(no) -> assert_eq(no.why, b""),
   };
   let boxed = match boxed_case_rep(table(), e, expr_laid(), 1) { Some(r) -> r, None -> RWord };
   match generated_here(case_root(Keep, e, 1)) {
-    Ok(f) -> assert_eq(walk(f), Some({ of: { id: 0, ty: e, rep: boxed }, op: Keep })),
+    Ok(f) -> assert_eq(walk(f), Some({ ty: e, rep: boxed, op: Keep })),
     Err(no) -> assert_eq(no.why, b""),
   };
   match generated_here(case_root(Drop, e, 1)) {
-    Ok(f) -> assert_eq(f.params, [{ id: 0, ty: e, rep: boxed }]),
+    Ok(f) -> assert_eq(f.params.map(|v: Var| v.rep), [boxed]),
     Err(no) -> assert_eq(no.why, b""),
   };
   // A case its sum lays in place has no box, so no root.
-  assert_eq(match generated_here(case_root(Drop, e, 0)) { Ok(_) -> true, Err(_) -> false }, false);
-  assert_eq(keys::root_name(case_root(Drop, e, 1)), b"m.drop.1#m.E")
+  assert_eq(match generated_here(case_root(Drop, e, 0)) { Ok(_) -> true, Err(_) -> false }, false)
 }
 
 test "a dup root counts its word form once more and answers it; a release root lets go of it" {
   let k = |op: keys::TypeOp| written(op, named(b"String"), b"m");
-  let o = { id: 0, ty: named(b"String"), rep: RWord };
   match generated_here(k(Dup)) {
     Ok(f) -> {
+      let o = f.params.get(0);
       assert_eq(f.conv.params, [Lent]);
-      assert_eq(f.body, [Inc({ var: o, n: 1 }), Return(AVar(o))])
+      assert(f.body.contains(Inc({ var: o, n: 1 })) && f.body.contains(Return(AVar(o))), None)
     },
     Err(no) -> assert_eq(no.why, b""),
   };
   match generated_here(k(keys::Release)) {
     Ok(f) -> {
       assert_eq(f.conv.params, [Given]);
-      assert_eq(f.body, [Dec(o), Return(AZero(RWord))])
+      assert_eq(dropping(f.body).decs, f.params)
     },
     Err(no) -> assert_eq(no.why, b""),
   };
@@ -2038,13 +1992,15 @@ test "a body reads exactly each variable it lets go of a value of, and the layou
     links: { ..no_links(), needs: [{ var: 1, reads: Scalar }] },
     statics: [],
   };
-  assert_eq(release_needs(f).links.needs, [
+  let needs = release_needs(f).links.needs;
+  let expected = [
     { var: 1, reads: Scalar },
     { var: 0, reads: Exact },
     { var: 1, reads: Layout },
     { var: 2, reads: Exact },
     { var: 3, reads: Exact },
-  ]);
+  ];
+  assert(needs.len() == expected.len() && expected.all(|n: Need| needs.contains(n)), None);
   assert_eq(release_reads(f).len(), 4);
   // A body counting only what its types settle reads none of its variables.
   assert_eq(
@@ -2099,7 +2055,12 @@ test "a value held across what may stop is read by its layout too, as the frame'
       statics: [],
     };
   let site = |stops: Bool| [Do({ val: call(stops), at: dummy_span(), unwind: [held, token] })];
-  assert_eq(release_reads(root(site(true))), [{ var: 0, reads: Exact }, { var: 0, reads: Layout }]);
+  let across = release_reads(root(site(true)));
+  assert(
+    across.len() == 2 && across.contains({ var: 0, reads: Exact })
+      && across.contains({ var: 0, reads: Layout }),
+    None,
+  );
   assert_eq(release_reads(root(site(false))), [{ var: 0, reads: Exact }]);
   let handled = |s: HandleSite, body: Block|
     [

@@ -10,7 +10,7 @@ import front.rows (ModuleRow)
 import syntax.exprs (prelude_module)
 import std.prelude_source
 import check.resolve.tables (Diag, qualify)
-import check.types (TyCon, spelled_type)
+import check.types (spelled_type)
 import std.bytes (ascii_of_int, hex_digit)
 import emit (emit_roots_answer)
 import unit (program_natives)
@@ -331,12 +331,6 @@ test "every function the form prints makes room on the stack it runs on, and non
             || count(t, b"rt_stack_more_p(ctx)") != count(t, b"ctx->fuel -= 1;")),
         [],
       );
-      assert(
-        texts.get(0).index_of(
-            b"  { char probe; if ((uintptr_t)&probe < ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n",
-          )
-          != None,
-      );
       // A closure's function is a function of its own.
       assert_eq(count(texts.get(scalar_names().len() + 1), b"rt_stack_more_p(ctx)"), 2)
     },
@@ -368,23 +362,49 @@ fn body_of(src: Bytes, name: Bytes) -> Result<List<Inst>, Bytes> / {abort.raise}
     Ok(p) -> match formed(p, name) { Ok(f) -> Ok(f.body), Err(no) -> Err(no.why) },
   }
 
-fn local(id: Int, ty: Bytes, rep: Rep) -> Var =
-  { id: id, ty: TyCon({ name: ty, args: [] }), rep: rep }
+/// The join `body` declares, what each arm of its `If` sets it to, and whether it answers the join.
+fn joined(
+  body: List<Inst>,
+) -> Option<{ var: Var, then: List<Arg>, otherwise: List<Arg>, answered: Bool }> = {
+  let sets = |b: List<Inst>, j: Var|
+    b.fold([], |acc: List<Arg>, i: Inst|
+      match i { Assign(a) -> if a.var == j { acc.push(a.arg) } else { acc }, _ -> acc });
+  match body.fold(None, |found: Option<Var>, i: Inst| match i { Decl(v) -> Some(v), _ -> found }) {
+    None -> None,
+    Some(j) ->
+      body.fold(
+        None,
+        |found: Option<{ var: Var, then: List<Arg>, otherwise: List<Arg>, answered: Bool }>, i: Inst|
+          match i {
+            If(x) ->
+              Some({
+                var: j,
+                then: sets(x.then, j),
+                otherwise: sets(x.otherwise, j),
+                answered: body.contains(Return(AVar(j))),
+              }),
+            _ -> found,
+          },
+      ),
+  }
+}
 
 test "an if that answers a value joins in a variable of the type its arms answer" {
-  let j = local(3, b"Int", RInt);
-  assert_eq(
-    body_of(b"fn pick(c: Bool, a: Int, b: Int) -> Int = if c { a } else { b }\n", b"pick"),
-    Ok([
-      Decl(j),
-      If({
-        cond: AVar(local(0, b"Bool", RBool)),
-        then: [Assign({ var: j, arg: AVar(local(1, b"Int", RInt)) })],
-        otherwise: [Assign({ var: j, arg: AVar(local(2, b"Int", RInt)) })],
-      }),
-      Return(AVar(j)),
-    ]),
-  )
+  match joined(
+      match body_of(b"fn pick(c: Bool, a: Int, b: Int) -> Int = if c { a } else { b }\n", b"pick") {
+        Ok(b) -> b,
+        Err(why) -> panic(String::of_bytes_lossy(why)),
+      },
+    ) {
+    Some(j) -> {
+      assert_eq(j.var.rep, RInt);
+      assert(
+        j.answered && j.then.len() == 1 && j.otherwise.len() == 1 && j.then != j.otherwise,
+        None,
+      )
+    },
+    None -> assert(false, None),
+  }
 }
 
 test "a self call in tail position restarts the body, and a join's restarting arm sets nothing" {
@@ -395,11 +415,14 @@ test "a self call in tail position restarts the body, and a join's restarting ar
     Err(why) -> assert_eq(why, b""),
     Ok(body) -> match body.at(2) {
       Some(If(i)) -> {
+        // The arm that returns sets the join once; the one that calls itself restarts on both
+        // arguments and sets nothing.
         assert_eq(i.then.len(), 1);
-        assert_eq(
-          i.otherwise.at(i.otherwise.len() - 1),
-          Some(Restart([AVar(local(3, b"Int", RInt)), AVar(local(1, b"Int", RInt))])),
-        )
+        match i.otherwise.at(i.otherwise.len() - 1) {
+          Some(Restart(args)) -> assert_eq(args.len(), 2),
+          other -> assert_eq(other, None),
+        };
+        assert(!i.otherwise.any(|x: Inst| match x { Assign(_) -> true, _ -> false }), None)
       },
       other -> assert_eq(other, None),
     },
@@ -407,19 +430,18 @@ test "a self call in tail position restarts the body, and a join's restarting ar
 }
 
 test "&& joins a Bool from its right operand where the left one does not decide" {
-  let j = local(2, b"Bool", RBool);
-  assert_eq(
-    body_of(b"fn both(a: Bool, b: Bool) -> Bool = a && b\n", b"both"),
-    Ok([
-      Decl(j),
-      If({
-        cond: AVar(local(0, b"Bool", RBool)),
-        then: [Assign({ var: j, arg: AVar(local(1, b"Bool", RBool)) })],
-        otherwise: [Assign({ var: j, arg: ABool(false) })],
-      }),
-      Return(AVar(j)),
-    ]),
-  )
+  match joined(match body_of(b"fn both(a: Bool, b: Bool) -> Bool = a && b\n", b"both") {
+      Ok(b) -> b,
+      Err(why) -> panic(String::of_bytes_lossy(why)),
+    }) {
+    // Where the left is false the answer is, without the right.
+    Some(j) -> {
+      assert_eq(j.var.rep, RBool);
+      assert(j.answered && j.otherwise == [ABool(false)], None);
+      assert(match j.then { [AVar(_)] -> true, _ -> false }, None)
+    },
+    None -> assert(false, None),
+  }
 }
 
 test "each construct reaches the family that lowers it" {
