@@ -1,5 +1,5 @@
 use ply_compiled::c::sweep::{
-    ANSWERED, BEGUN, REUSED, STAMP, USED, claim, due, finished, sweep, sweep_stages, used,
+    ANSWERED, BEGUN, REUSED, STAMP, STORES, USED, claim, due, finished, sweep, sweep_stages, used,
 };
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -302,6 +302,46 @@ fn a_stage_used_lately_outlives_one_written_later() {
     sweep_stages(root.path(), 100, now);
     assert!(root.path().join("written-early").exists());
     assert!(!root.path().join("written-late").exists());
+}
+
+/// A store of kept records is its segments and manifest together, written over many runs and read
+/// by more: it goes whole, by when a run last used it, and never a segment of it alone.
+#[test]
+fn a_store_of_kept_records_goes_whole_by_its_last_use() {
+    let root = tempfile::tempdir().unwrap();
+    let now = SystemTime::now();
+    let store = |name: &str, written: Duration, used: Duration| {
+        let dir = root.path().join(STORES).join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in ["seg-1", "manifest-a"] {
+            std::fs::write(dir.join(file), vec![b'x'; 100]).unwrap();
+            set(&dir.join(file), now - written);
+        }
+        std::fs::write(dir.join(USED), b"").unwrap();
+        set(&dir.join(USED), now - used);
+        set(&dir, now - written);
+    };
+    // Both were written as long ago; a run read the second since, though it wrote nothing there.
+    store("idle", 9 * HOUR, 9 * HOUR);
+    store("read", 9 * HOUR, 2 * HOUR);
+    std::fs::create_dir_all(root.path().join("obj")).unwrap();
+    std::fs::write(root.path().join("obj/a.o"), vec![b'x'; 100]).unwrap();
+    set(&root.path().join("obj/a.o"), now - 5 * HOUR);
+    assert_eq!(sweep(root.path(), 300), 200);
+    assert!(!root.path().join(STORES).join("idle").exists());
+    assert!(root.path().join(STORES).join("read").join("seg-1").exists());
+    assert!(root.path().join("obj/a.o").exists());
+    // One a run used within the hour stays however far over budget the rest is.
+    set(&root.path().join(STORES).join("read").join(USED), now);
+    sweep(root.path(), 0);
+    assert!(
+        root.path()
+            .join(STORES)
+            .join("read")
+            .join("manifest-a")
+            .exists()
+    );
+    assert!(!root.path().join("obj/a.o").exists());
 }
 
 #[test]

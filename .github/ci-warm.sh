@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ci-warm.sh used MARK    the C cache and the stages cut to what the `ply`s since MARK used: a load
 #                         marks what it reads, so the rest is what earlier runs left that this one
-#                         did not read, and every job after would restore it for nothing.
+#                         did not read, and every job after would restore it for nothing. A stage
+#                         and a store of kept records go whole, by their `.used`.
 # ci-warm.sh pack TAR     the C cache and the stages as one file, for `handed` in this run's other
 #                         jobs and `shared` on another branch
 # ci-warm.sh shared NAME  the artifact NAME, which a run of these sources packed, laid over the C
@@ -13,6 +14,8 @@
 set -euo pipefail
 cache=${PLY_C_CACHE:-/tmp/ply-c-cache}
 stage=${PLY_C_STAGE:-/tmp/ply-c-stage}
+# The stores of kept records, each a directory `sweep` takes whole (its `STORES`).
+stores=$cache/bodies
 
 megabytes() { du -sm "$@" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }'; }
 
@@ -47,7 +50,14 @@ case "${1:-}" in
     mark=${2:?usage: ci-warm.sh used MARK}
     [ -f "$mark" ] || { echo "nothing is marked at $mark" >&2; exit 2; }
     before=$(megabytes "$cache" "$stage")
-    [ -d "$cache" ] && find "$cache" -type f ! -newer "$mark" -delete
+    # A store goes whole, kept where a run since the mark used it: its segments were written by
+    # earlier runs, and only its `.used` says this one read them.
+    for dir in "$stores"/*/; do
+      [ -d "$dir" ] || continue
+      [ "$dir.used" -nt "$mark" ] || rm -rf "$dir"
+    done
+    [ -d "$cache" ] && find "$cache" -path "$stores/*" -type d -prune -o -type f ! -newer "$mark" -print0 |
+      xargs -0 rm -f --
     if [ -d "$stage" ]; then
       for dir in "$stage"/*/; do
         [ -d "$dir" ] || continue

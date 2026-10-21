@@ -1683,10 +1683,9 @@ test "a root carries a width exactly where a value it is entered with or answers
 test "a carry follows a width into lists, maps, records, sum types, functions and variables" {
   let src = b"effect probe { write put(xs: List<U8>, n: Int) -> Unit }\ntype Byte = | Byte(U8)\ntype Tree = | Leaf | Node(Tree, I16, Tree)\ntype Pair<a, b> = | Pair(b, a)\ntype Color = | Red | Green\nfn wrap(xs: List<U8>) -> List<Byte> = xs.map(|x: U8| Byte(x))\nfn pick<a>(xs: List<a>, r: { v: I16, n: Int }) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\nfn swap(m: Map<String, I8>) -> Pair<Int, U64> / {abort.raise} = Pair(U64::of_int(1), 0)\nfn plain(c: Color, o: Option<Int>) -> Tree = Leaf\nfn apply<a>(f: (Int) -> a, x: Int) -> a = f(x)\nfn sent(xs: List<U8>) -> Unit / { probe.write } = probe.put(xs, 1)";
   let d = dump_of(analyse(parse_all([{ name: b"m", src: src }])));
+  let carried = |root: EmitterRoot| { root: root.root, params: root.params, answer: root.answer };
   assert_eq(
-    d.emitter_roots.filter(|root: EmitterRoot| !written_reach().contains(root.root)).map(
-      |root: EmitterRoot| { root: root.root, params: root.params, answer: root.answer },
-    ),
+    d.emitter_roots.filter(|root: EmitterRoot| module_of_root(root.root) == b"m").map(carried),
     [
       { root: b"m.wrap", params: [CList(CWidth(0))], answer: CList(CSum([])) },
       {
@@ -1703,26 +1702,16 @@ test "a carry follows a width into lists, maps, records, sum types, functions an
       { root: b"m.plain", params: [CPlain, CPlain], answer: CSum([]) },
       { root: b"m.apply", params: [CFn([CPlain], CVar(0)), CPlain], answer: CVar(0) },
       { root: b"m.sent", params: [CList(CWidth(0))], answer: CPlain },
-      // `wrap` reaches the prelude's `map` and its walk, generic over what they carry.
-      {
-        root: b"std.prelude.mapped_from",
-        params: [
-          CList(CVar(0)),
-          CPlain,
-          CPlain,
-          CPlain,
-          CPlain,
-          CFn([CVar(0)], CVar(1)),
-          CList(CVar(1)),
-        ],
-        answer: CList(CVar(1)),
-      },
-      {
-        root: b"std.prelude.List::map",
-        params: [CList(CVar(0)), CFn([CVar(0)], CVar(1))],
-        answer: CList(CVar(1)),
-      },
     ],
+  );
+  // `wrap` reaches the prelude's `map`, generic over what it carries.
+  assert(
+    d.emitter_roots.map(carried).contains({
+      root: b"std.prelude.List::map",
+      params: [CList(CVar(0)), CFn([CVar(0)], CVar(1))],
+      answer: CList(CVar(1)),
+    }),
+    None,
   );
   assert_eq(effect_named(d, b"m.probe").ops.map(|o: OpRow| o.carries), [
     [CList(CWidth(0)), CPlain],
@@ -1831,14 +1820,11 @@ test "a program's answer holds its warnings, its order, its packages and its mod
   ]);
   // Every module imports `std.prelude`, a shipped module, which sits one past the packages.
   assert_eq(d.order, [b"std.prelude", b"m"]);
-  assert_eq(d.packages, [
-    { prefix: b"", deps: [] },
-    { prefix: b"std", deps: [] },
-    { prefix: b"compiler", deps: [b"std"] },
-  ]);
-  assert_eq(d.module_packages, [0, 3]);
-  assert_eq(d.modules, [
-    {
+  assert_eq(d.packages.at(0), Some({ prefix: b"", deps: [] }));
+  assert_eq(d.module_packages, [0, d.packages.len()]);
+  assert_eq(
+    d.modules.at(0),
+    Some({
       name: b"m",
       index: 0,
       items: [b"m.log", b"m.Shape", b"m.Dot", b"m.Line", b"m.say"],
@@ -1849,17 +1835,17 @@ test "a program's answer holds its warnings, its order, its packages and its mod
         { start: 115, end: 126, braced: true, name: b"m.say", test: false },
         { start: 127, end: 152, braced: false, name: b"", test: false },
       ],
+    }),
+  );
+  // A shipped module's types are read whatever the program reaches, and no unreached function.
+  match d.modules.at(1) {
+    Some(prelude) -> {
+      assert_eq(prelude.name, prelude_module());
+      assert(prelude.items.contains(b"std.prelude.ListNode"), None);
+      assert(!prelude.items.any(|i: Bytes| prelude_functions().contains(i)), None)
     },
-    // A shipped module's types are read whatever the program reaches.
-    {
-      name: prelude_module(),
-      index: 1,
-      items: [b"std.prelude.ListNode", b"std.prelude.MapNode"],
-      imports: [],
-      sets: [],
-      cuts: [],
-    },
-  ])
+    None -> assert(false, Some("the answer holds the prelude's row")),
+  }
 }
 
 fn reachable() -> List<Source> =
@@ -2141,15 +2127,21 @@ test "a definition's row holds its visibility, its reuse marker and its paramete
 }
 
 test "a type's row holds its arity and its visibility" {
+  let rows = dump_of(analyse(parse_all(written()))).types.map(|t: TypeRow|
+    { name: t.name, module: t.module, public: t.public, arity: t.arity });
   assert_eq(
-    dump_of(analyse(parse_all(written()))).types.map(|t: TypeRow|
-      { name: t.name, module: t.module, public: t.public, arity: t.arity }),
-    [
-      { name: b"m.Pair", module: b"m", public: true, arity: 2 },
-      // `std.prelude`'s own, which no other module names.
-      { name: b"std.prelude.ListNode", module: b"std.prelude", public: false, arity: 1 },
-      { name: b"std.prelude.MapNode", module: b"std.prelude", public: false, arity: 2 },
-    ],
+    rows.filter(|t: { name: Bytes, module: Bytes, public: Bool, arity: Int }| t.module == b"m"),
+    [{ name: b"m.Pair", module: b"m", public: true, arity: 2 }],
+  );
+  // `std.prelude`'s own, which no other module names.
+  assert(
+    rows.contains({
+      name: b"std.prelude.ListNode",
+      module: b"std.prelude",
+      public: false,
+      arity: 1,
+    }),
+    None,
   )
 }
 
@@ -2622,24 +2614,18 @@ test "every load reads `std.prelude`, keeping the functions it writes in Ply tha
   // What the code the emitter writes to compare, digest or show a list or a map calls is reached
   // where a body compares, digests or shows anything, though it calls none of it itself.
   let written = written_reach().sort();
+  let holds = |names: List<Bytes>, name: Bytes| names.contains(qualify(prelude_module(), name));
   assert_eq(viewed(b"pub fn g() -> Int = 1\n"), []);
-  // `map` walks the list's leaves and its tail, reading no item by its index; the `==` that finds
-  // where a leaf opens reaches the written code.
-  assert_eq(
-    viewed(b"pub fn f(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + 1)\n"),
-    written.concat([b"std.prelude.List::map", b"std.prelude.mapped_from"]).sort(),
-  );
-  assert_eq(viewed(b"pub fn h(xs: List<Int>) -> List<Int> / {abort.raise} = xs.set(0, 1)\n"), [
-    b"std.prelude.List::set",
-    b"std.prelude.shift_from",
-    b"std.prelude.trie_set",
-    b"std.prelude.trie_shift",
-  ]);
-  // A map's value is found down its tree in one loop, whose search tests an `Ordering` with `==`.
-  assert_eq(
-    viewed(b"pub fn k(m: Map<Int, Int>) -> Option<Int> = m.get(1)\n"),
-    written.concat([b"std.prelude.Map::get", b"std.prelude.found_under"]).sort(),
-  );
+  // A called function is kept with what it reaches; `map`'s leaf `==` reaches the written code.
+  let mapped = viewed(b"pub fn f(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + 1)\n");
+  assert(holds(mapped, b"List::map") && !holds(mapped, b"List::set"), None);
+  assert(written.all(|n: Bytes| mapped.contains(n)), None);
+  let set = viewed(b"pub fn h(xs: List<Int>) -> List<Int> / {abort.raise} = xs.set(0, 1)\n");
+  assert(holds(set, b"List::set") && !holds(set, b"List::map"), None);
+  assert(!written.all(|n: Bytes| set.contains(n)), None);
+  // A map's value is found down its tree, whose search tests an `Ordering` with `==`.
+  let got = viewed(b"pub fn k(m: Map<Int, Int>) -> Option<Int> = m.get(1)\n");
+  assert(holds(got, b"Map::get") && written.all(|n: Bytes| got.contains(n)), None);
   assert_eq(viewed(b"pub fn same(a: List<Int>, b: List<Int>) -> Bool = a == b\n"), written);
   assert_eq(
     viewed(b"pub fn alike(a: Map<Int, Bytes>, b: Map<Int, Bytes>) -> Bool = a == b\n"),

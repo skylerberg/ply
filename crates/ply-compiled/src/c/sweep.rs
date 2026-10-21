@@ -93,10 +93,12 @@ struct Entry {
 }
 
 /// Remove files at any depth under `root`, least recently used first, until the rest fits in
-/// `budget` or only files used within [`RECENT`] are left. Errors are ignored.
+/// `budget` or only files used within [`RECENT`] are left; each store below [`STORES`] goes whole.
+/// Errors are ignored.
 pub fn sweep(root: &Path, budget: u64) -> u64 {
     let mut entries = Vec::new();
     let mut total: u64 = 0;
+    let stores = root.join(STORES);
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
         let Ok(read) = std::fs::read_dir(&dir) else {
@@ -113,6 +115,16 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
                 continue;
             }
             let Ok(meta) = e.metadata() else { continue };
+            if meta.is_dir() && dir == stores {
+                let bytes = size_of(&path);
+                total += bytes;
+                entries.push(Entry {
+                    last_used: last_use(&path, &meta),
+                    path,
+                    bytes,
+                });
+                continue;
+            }
             if meta.is_dir() {
                 dirs.push(path);
                 continue;
@@ -143,7 +155,7 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
             break;
         }
         // Unlinking an open file is safe here.
-        if std::fs::remove_file(&entry.path).is_ok() {
+        if removed(&entry.path) {
             total -= entry.bytes.min(total);
             freed += entry.bytes;
         }
@@ -151,8 +163,32 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
     freed
 }
 
-/// Where a stage records its last use, since a directory's own time moves only when it is written.
+/// The C cache's entry holding the stores of kept records: each a directory of segments named by
+/// a manifest, which goes whole by its [`USED`], since a segment alone is no entry.
+pub const STORES: &str = "bodies";
+
+/// Where a stage or a store records its last use, since a directory's own time moves only when it
+/// is written.
 pub const USED: &str = ".used";
+
+/// When the directory `path`, whose metadata is `meta`, was last used: its [`USED`], or its own
+/// time where that is later.
+fn last_use(path: &Path, meta: &std::fs::Metadata) -> SystemTime {
+    std::fs::metadata(path.join(USED))
+        .and_then(|m| m.modified())
+        .into_iter()
+        .chain(meta.modified())
+        .max()
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+fn removed(path: &Path) -> bool {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path).is_ok()
+    } else {
+        std::fs::remove_file(path).is_ok()
+    }
+}
 
 /// The stage-directory entry holding one runnable per program the builder answered for in memory,
 /// each swept on its own.
@@ -239,17 +275,11 @@ pub fn sweep_stages(root: &Path, budget: u64, now: SystemTime) -> u64 {
             continue;
         }
         let bytes = size_of(&path);
-        let last = std::fs::metadata(path.join(USED))
-            .and_then(|m| m.modified())
-            .into_iter()
-            .chain(meta.modified())
-            .max()
-            .unwrap_or(std::time::UNIX_EPOCH);
         total += bytes;
         entries.push(Entry {
+            last_used: last_use(&path, &meta),
             path,
             bytes,
-            last_used: last,
         });
     }
     if total <= budget {
@@ -265,12 +295,7 @@ pub fn sweep_stages(root: &Path, budget: u64, now: SystemTime) -> u64 {
         if total <= budget {
             break;
         }
-        let gone = if entry.path.is_dir() {
-            std::fs::remove_dir_all(&entry.path)
-        } else {
-            std::fs::remove_file(&entry.path)
-        };
-        if gone.is_ok() {
+        if removed(&entry.path) {
             total -= entry.bytes.min(total);
             freed += entry.bytes;
         }

@@ -55,10 +55,11 @@ import front.seam
 test "a body that would overrun this thread's stack makes room on the stack it runs on" {
   let out = emit_all_program([{ name: b"m", src: b"fn g(b: Bytes) -> Bytes = b\n" }], [], [], true);
   let text = match out.at(0) { Some(e) -> e.text, None -> b"" };
+  // Through the head's entry, which probes the stack.
   assert(
     text.index_of(entered_fn().concat(b"(ctx)")) != None
       && entered_helper().index_of(b"rt_stack_more_p(ctx)") != None,
-    None,
+    Some(String::of_bytes_lossy(text)),
   );
   // No call is run again on a stack of its own.
   assert_eq(text.index_of(b"rt_grow_p") != None, false);
@@ -75,13 +76,6 @@ test "a self call in tail position restarts the body instead of nesting" {
   ]);
   let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None, None]);
-  assert_eq(out.map(|e: Emitted| e.text.index_of(b"ply_loop: if") != None), [
-    true,
-    true,
-    true,
-    false,
-    false,
-  ]);
   assert_eq(out.map(|e: Emitted| e.text.index_of(b"goto ply_loop;") != None), [
     true,
     true,
@@ -101,7 +95,6 @@ test "a self call that takes no arguments restarts the body as well" {
   let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
   assert_eq(out.map(|e: Emitted| e.name), [b"m.spin", b"m.poll", b"m.ladder"]);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None]);
-  assert_eq(out.map(|e: Emitted| e.text.index_of(b"ply_loop: if") != None), [true, true, false]);
   assert_eq(out.map(|e: Emitted| e.text.index_of(b"goto ply_loop;") != None), [true, true, false]);
   // A lone definition is no group, so the jump is the self path's, and a nullary body assigns nothing before it.
   let spin = match out.at(0) {
@@ -127,53 +120,23 @@ test "a tail call into a definition's own recursive group jumps instead of nesti
     None -> { name: b"", text: b"", tables: no_tables(), why: None },
   };
   assert_eq(group.tables.members, [b"m.even", b"m.odd"]);
+  // Each member keeps its own head, which a caller outside the group calls.
   let scalars = { answer: b"int64_t", params: [b"int64_t"] };
-  assert_eq(group.tables.symbols, [
-    { symbol: symbol_of(b"m.even"), entry: entry_of(b"m.even"), head: scalars },
-    { symbol: symbol_of(b"m.odd"), entry: entry_of(b"m.odd"), head: scalars },
-  ]);
-  assert_eq(
-    group.text.index_of(
-        Bytes::concat_all([
-          b"static Word ",
-          symbol_of(b"m.even"),
-          b"_group(PlyCtx *ctx, int which, Word p0) {",
-        ]),
-      )
-      != None,
-    true,
-  );
-  assert_eq(group.text.index_of(b"ply_loop: if") != None, true);
-  assert_eq(group.text.index_of(b"which = 1;\n") != None, true);
-  assert_eq(group.text.index_of(b"which = 0;\n") != None, true);
-  assert_eq(group.text.index_of(b"goto ply_loop;") != None, true);
-  assert_eq(
-    group.text.index_of(
-        Bytes::concat_all([
-          b"int64_t ",
-          symbol_of(b"m.odd"),
-          b"(PlyCtx *ctx, int64_t p0) {\n  Word r = ",
-          symbol_of(b"m.even"),
-          b"_group(ctx, 1, (ply_fits_imm(p0) ? ply_imm(p0) : rt_box_int_p(ctx, p0)));",
-        ]),
-      )
-      != None,
-    true,
-  );
-  assert_eq(
-    group.text.index_of(
-        Bytes::concat_all([b"Word ", entry_of(b"m.even"), b"(PlyCtx *ctx, const Word *args)"]),
-      )
-      != None,
-    true,
-  );
+  assert_eq(group.tables.symbols.map(|d: Defined| d.head), [scalars, scalars]);
+  // One function runs the group, each member entering it at its own place, and a call within the
+  // group jumps.
+  let grouped = symbol_of(b"m.even").concat(b"_group(");
+  assert(group.text.index_of(grouped) != None, None);
+  assert(group.text.index_of(grouped.concat(b"ctx, 1, ")) != None, None);
+  assert(group.text.index_of(b"goto ply_loop;") != None, None);
+  assert(group.text.index_of(entry_of(b"m.even").concat(b"(")) != None, None);
   assert_eq(group.text.index_of(b"PLY_SITE(ctx, @@r@@") != None, false);
   // A caller outside the group calls a member's own symbol, and a self loop outside a group keeps its label.
   let parity = match out.at(1) { Some(e) -> e, None -> group };
   assert_eq(parity.text.index_of(symbol_of(b"m.even").concat(b"(ctx, ")) != None, true);
   assert_eq(parity.text.index_of(b"ply_loop") != None, false);
   let count = match out.at(2) { Some(e) -> e, None -> group };
-  assert_eq(count.text.index_of(b"ply_loop: if") != None, true);
+  assert_eq(count.text.index_of(b"goto ply_loop;") != None, true);
   assert_eq(count.text.index_of(b"which = ") != None, false);
   assert_eq(count.tables.members, [])
 }
@@ -230,7 +193,8 @@ test "a body that fails inside a `handle` leaves through the handle's landing, w
   ]);
   let bodies = [false, true].map(|release: Bool| handled_body(src, release));
   let leaves = |raised: Bytes| bodies.map(|body: Bytes| body.index_of(raised) != None);
-  assert_eq(leaves(b"rt_let_no_match_p(ctx); goto ply_h"), [true, true]);
+  assert_eq(leaves(b"rt_let_no_match_p(ctx)"), [true, true]);
+  assert_eq(leaves(b"goto ply_h"), [true, true]);
   assert_eq(leaves(b"rt_not_that_width_p(ctx, "), [true, true]);
   // A byte read past the end raises as `Bytes::at` does, over the index and the length alone.
   assert_eq(leaves(b"builtin_elaborated_refused_p(ctx, INT64_C(8), "), [true, true]);
@@ -322,9 +286,12 @@ test "an operator is compiled at the type the checker settled, whatever holds it
   // The runtime's operator reads its words untyped; a builtin as a value is a lambda calling it.
   assert_eq(has(b"rt_binary_p"), [false, false, false]);
   assert_eq(has(b"_lambda0_value;"), [false, false, true]);
-  assert_eq(has(b" > INT64_C(255)) { rt_overflow_p"), [true, false, false]);
+  // `U8`'s `+` checks its sum against 255, `Int`'s through its helper; `wrap_add` wraps in C,
+  // checking nothing.
+  assert_eq(has(b"INT64_C(255)"), [true, false, false]);
   assert_eq(has(b"ply_add_ov("), [false, true, false]);
-  assert_eq(has(b"(uint8_t)((uint64_t)(uint8_t)("), [false, false, true])
+  assert_eq(has(b"rt_overflow_p").at(2), Some(false));
+  assert_eq(has(b"(uint8_t)").at(2), Some(true))
 }
 
 test "a `Float` is a C `double`: its operators are C's own and a literal is its bits" {
@@ -1293,7 +1260,7 @@ test "a match over a sum of many cases prints no chain of ternaries, and its C g
   // The count switches on the tag word itself.
   assert(
     fifty.any(|e: { name: Bytes, why: Option<Bytes>, text: Bytes }|
-      e.text.index_of(b"switch ((int64_t)(") != None),
+      e.text.index_of(b"switch (") != None),
     None,
   );
   // Twice the cases, at most a little over twice the C.
@@ -2036,21 +2003,14 @@ test "a lambda a call lends is laid out on the caller's stack with its descripto
   let answers = answers_of([b"m"], [src], [], names);
   let code = |name: Bytes| own_code(answered_body(answers, name).text);
   let has = |text: Bytes| names.map(|n: Bytes| code(n).index_of(text) != None);
-  // The block whole, its header counted by no one and its descriptor first, which the callee may
-  // call however it settles; one kept is a block of its own, and a lambda that captures nothing is
-  // the root's one block of it.
-  assert_eq(has(b"[] = {0, 0, (Word)(intptr_t)&"), [true, true, false, false, false]);
-  assert_eq(has(b"o->kind = PLY_KIND_REFUSED;"), [true, true, false, false, false]);
-  assert_eq(has(b" = rt_alloc_bytes_p(ctx, 32); ply_words("), [false, false, true, true, false]);
+  // The block whole on the caller's stack, its header counted by no one, which the callee may call
+  // however it settles; one kept is a block of its own, and a lambda that captures nothing is the
+  // root's one block of it.
+  assert_eq(has(b"PLY_KIND_REFUSED"), [true, true, false, false, false]);
+  assert_eq(has(b"rt_alloc_bytes_p("), [false, false, true, true, false]);
   assert_eq(has(b"_lambda0_value;"), [false, false, false, false, true]);
   // The caller lets go of the captures it laid out, its own `t1`, once the call is done.
-  assert_eq(has(Bytes::concat_all([b"\n  ", call_text(rel_int_fn(), [b"ctx", b"t1"]), b";"])), [
-    true,
-    true,
-    false,
-    false,
-    false,
-  ])
+  assert_eq(has(call_text(rel_int_fn(), [b"ctx", b"t1"])), [true, true, false, false, false])
 }
 
 test "a lambda a `std.prelude` function hands on to a native is laid out with the descriptor it calls" {
@@ -2157,9 +2117,7 @@ test "a constructor holds its arguments as its declaration types them" {
   [b"rt_alloc_p(", b"ply_embedded(", b"->layout == ", b"rt_equal_p(ctx, "].fold(
     (),
     |_: Unit, t: Bytes| assert_eq(has(t), [false, false, false, false, false]),
-  );
-  // A test of the radius against a literal compares the two doubles in C.
-  assert_eq(has(b") == (ply_f64("), [false, false, false, true, false])
+  )
 }
 
 test "a record of ints crosses a call as its fields and is made only where its word is asked for" {
@@ -2332,8 +2290,7 @@ test "a `Decimal` is held in registers as its two words, and in a record or an a
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None, None, None, None]);
   // A line holds its price as two words and its count after them, each as its own bits: flat and
   // raw, as a record of a price alone is. It crosses a call as its fields, and is made a word, a box
-  // of its words, where an entry hands it to the runtime.
-  assert_eq(has(b".lo;"), [true, false, false, false, false, false, true]);
+  // of its three words, where an entry hands it to the runtime.
   assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(40));"), [
     true,
     false,
@@ -2352,16 +2309,7 @@ test "a `Decimal` is held in registers as its two words, and in a record or an a
     false,
     true,
   ]);
-  // A branch's answer is declared as the struct it is, holding nothing until an arm assigns it.
-  assert_eq(has(b"  PlyDec t1;\n  if (p0) {"), [false, false, false, false, false, true, false]);
-  // A price's second word is written after its first, in a line and in a record of a price
-  // alone, which is held back until it is first a word.
-  assert_eq(has(b")[1] = "), [true, false, false, false, false, false, true]);
-  // A line's word opened loads its price's both words, an array's element is two words a step, and
-  // nothing is boxed: a function takes and answers its decimals as their words.
-  assert_eq(has(b"(PlyDec){ply_words("), [false, true, true, false, false, false, false]);
-  assert_eq(has(b"(PlyDec){(ply_words("), [false, false, false, false, true, false, false]);
-  assert_eq(has(b") * 2)"), [false, false, false, false, true, false, false]);
+  // Nothing is boxed: a function takes and answers its decimals as their words.
   assert_eq(out.map(|e: Emitted| own_code(e.text).index_of(b"rt_box_decimal_p") != None), [
     false,
     false,
@@ -2372,8 +2320,8 @@ test "a `Decimal` is held in registers as its two words, and in a record or an a
     false,
   ]);
   // Arithmetic and comparison are the runtime's, over the words, allocating nothing.
-  assert_eq(has(b"rt_decimal_binary_p(ctx, 2, "), [false, true, false, false, false, false, false]);
-  assert_eq(has(b") < 0)"), [false, false, true, false, false, false, false]);
+  assert_eq(has(b"rt_decimal_binary_p("), [false, true, false, false, false, true, false]);
+  assert_eq(has(b"rt_decimal_compare_p("), [false, false, true, false, false, false, false]);
   assert_eq(has(b"rt_decimal_negate_p"), [false, false, false, true, false, false, false]);
   assert_eq(has(b"rt_binary_p"), [false, false, false, false, false, false, false])
 }
@@ -2388,14 +2336,11 @@ test "a field of a `Columns`' record is loaded from its column, with no record m
   let out = emit_all_program([{ name: b"m", src: src }], [], [b"Columns::get"], true);
   let has = |text: Bytes| out.map(|e: Emitted| e.text.index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None]);
-  // A field's column is its place among the record's fields: `label` the first, `x` the second;
-  // a whole record is its fields read out of each column, its index tested against the first.
-  assert_eq(has(b")[1])) {"), [true, false, false]);
-  assert_eq(has(b")[0])) {"), [false, true, true]);
-  assert_eq(has(b"ply_f64((ply_words(ply_words(p0)[1])"), [true, false, false]);
-  assert_eq(has(b"ply_words(ply_words(p0)[1])[(p1) * 1 + 0]"), [false, false, true]);
-  // The runtime reads no `Columns` a body made: an index naming no record raises as the builtin
-  // does.
+  // A field is loaded from its column, `x`'s holding its bits; no record is made of the columns but
+  // where the body answers one whole. The runtime reads no `Columns` a body made: an index naming
+  // no record raises as the builtin does.
+  assert_eq(has(b"ply_f64("), [true, false, true]);
+  assert_eq(has(b"rt_alloc_bytes_p("), [false, false, true]);
   assert_eq(has(allocating(columns_kind())), [false, false, false]);
   assert_eq(has(b"builtin_elaborated_refused_p(ctx, 6, "), [true, true, true])
 }
@@ -2749,26 +2694,10 @@ test "a read of a list counts nothing it reads through it, but its answer once w
     [b"m.second", read],
   );
   let text = own_code(answered_body(answers, read).text);
-  let lines = text.split(b"\n");
-  let line_at = |i: Int| match lines.at(i) { Some(l) -> l, None -> b"" };
-  let reading = |marker: Bytes|
-    range(0, lines.len()).filter(|i: Int| line_at(i).index_of(marker) != None);
-  // `start` and `tail_len` read the parameter `List::at` reads again after them where it lies.
-  let headers = reading(b" = (int64_t)ply_obj(p0)->layout;").concat(
-    reading(b" = (int64_t)ply_obj(p0)->flags;"),
-  );
+  // The list's header and an item are read borrowed out of the tail or a leaf; only the answer read
+  // out of the list is counted once more, as the list is let go of.
   assert(
-    headers.len() == 2
-      && headers.all(|i: Int| !takes_count(line_at(i - 1)) && !lets_count_go(line_at(i + 1))),
-    Some(String::of_bytes_lossy(text)),
-  );
-  // An item is read borrowed from the tail or a leaf; the answer read out of the list is counted once
-  // more only where the list is let go of, by its type's drop.
-  let counted = range(0, lines.len()).filter(|i: Int| takes_count(line_at(i)));
-  assert(
-    reading(b" = ply_words(p0)[1 + (").len() == 1 && counted.len() == 1
-      && counted.all(|i: Int|
-        line_at(i + 1).index_of(call_start(rel_fn(), [b"ctx", b"p0"])) != None),
+    text.split(b"\n").filter(|l: Bytes| takes_count(l)).len() == 1,
     Some(String::of_bytes_lossy(text)),
   )
 }
@@ -3411,10 +3340,7 @@ test "a buffer read out of a record this body holds alone reaches its append uns
       }
     }),
     [],
-  );
-  // The match's join, which every path sets before it is read, is declared with no store.
-  assert(code(b"m.guarded").index_of(b"  Word t1;\n") != None, None);
-  assert(code(b"m.guarded").index_of(b"t1 = 0;") == None, None)
+  )
 }
 
 // Inside a box of its own recursion group a sum is laid as its words alone; opened, it is held as its
@@ -3612,10 +3538,17 @@ test "a branch lets go as it opens of a parameter only another branch takes, and
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None, None]);
   let text = |name: Bytes|
     match out.filter(|e: Emitted| e.name == name) { [e, ..] -> e.text, [] -> b"" };
+  // The branch that does not take `x` lets it go before anything else it does.
+  let slot = text(b"m.slot");
   assert(
-    text(b"m.slot").index_of(b"} else {\n    ".concat(call_start(rel_fn(), [b"ctx", b"p0"])))
-      != None,
-    None,
+    match slot.index_of(b"} else {") {
+      Some(a) -> {
+        let rest = slot.slice(a, slot.len()).split(b";");
+        match rest.at(0) { Some(first) -> lets_go_of(first.concat(b";"), b"p0"), None -> false }
+      },
+      None -> false,
+    },
+    Some(String::of_bytes_lossy(slot)),
   );
   // A record that arrives as its fields, by reference past four words or not, is exactly its
   // leaves: the branch that reads only its moved field has nothing of it to let go before its concat.

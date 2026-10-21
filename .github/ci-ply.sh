@@ -21,14 +21,15 @@
 #       MODULE in one `ply test` with the suite's grants and ARGs such as `--shard K/N` or a case's
 #       `--filter` added
 #   ci-ply.sh mark                  the moment `keep` gathers from
-#   ci-ply.sh keep DIR              the bodies and the compiler's answers `ply` emitted or read
-#                                   since `mark`, into DIR for a later run: a body is keyed by its
-#                                   definition, the emitter and the runtime's sources, and an answer
-#                                   by the emitter and its question, so another tree reuses what
-#                                   still applies. Objects stay out: one compiles from its bodies in
-#                                   seconds. The stages are build-ply's to ship, and the packages'
-#                                   stores are carried apart.
-#   ci-ply.sh restore DIR           a kept DIR merged under what `ply` reads, keeping what is there
+#   ci-ply.sh keep DIR              each store of kept records `ply` used since `mark`, the emitter's
+#                                   answers among them, whole into DIR for a later run: an answer is
+#                                   keyed by its definition, the emitter and the runtime's sources,
+#                                   so another tree reuses what still applies. Objects stay out: one
+#                                   compiles from its bodies in seconds. The stages are build-ply's
+#                                   to ship, and the packages' stores are carried apart.
+#   ci-ply.sh restore DIR           a kept DIR laid under what `ply` reads: each store in it
+#                                   replaces the one in place, and any other file is kept where one
+#                                   is there
 #   ci-ply.sh compact               each package's store a run since `mark` opened compacted, and
 #                                   every other removed, before a job saves them: a store only
 #                                   grows, and the job's next run restores what it saves, which is
@@ -287,14 +288,21 @@ store_dirs() {
   done | LC_ALL=C sort -u
 }
 
-# The emitter's answers `ply` wrote or read since the mark, into DIR.
+# The stores of kept records, the emitter's answers among them, each a directory `sweep` takes whole
+# (its `STORES`).
+stores=ply-c-cache/bodies
+
+# Each store a run since the mark used, into DIR whole: its manifest and segments, without what a
+# run holds open in it.
 kept_answers() {
-  local dir=$1
+  local dir=$1 store
   rm -rf "$dir"
   mkdir -p "$dir"
-  [ -d "$caches/ply-c-cache/bodies" ] || return 0
-  (cd "$caches" && find ply-c-cache/bodies -type f -newer "$mark" ! -name '*.tmp' -print0 |
-    tar --null -T - -cf -) | tar -xf - -C "$dir"
+  for store in "$caches/$stores"/*/; do
+    [ -f "$store.used" ] && [ "$store.used" -nt "$mark" ] || continue
+    (cd "$caches" && tar --exclude='run*' --exclude=lock --exclude='*.tmp' -cf - \
+      "$stores/$(basename "$store")") | tar -xf - -C "$dir"
+  done
 }
 
 case "${1:-}" in
@@ -361,6 +369,11 @@ case "${1:-}" in
   restore)
     dir=${2:?a directory}
     [ -d "$dir" ] || exit 0
+    # A kept store replaces the one in place whole: it grew from it, and the segments of two
+    # manifests do not mix file by file.
+    for store in "$dir/$stores"/*/; do
+      [ -d "$store" ] && rm -rf "$caches/$stores/$(basename "$store")"
+    done
     tar -C "$dir" -cf - . | tar -C "$caches" --skip-old-files -xf -
     ;;
   compact)

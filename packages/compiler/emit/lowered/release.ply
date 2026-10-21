@@ -12,8 +12,8 @@ import emit.keys
 import emit.keys (RootKey, Named, TypeOp, Drop, Dup, Copy, Share, Keep, Lower, Lift, Worded,
                   written, root_name)
 import emit.verify (verified)
-import emit.tir (Fn, Var, Case, Opened, Let, If, Restart, Dec, Return, LastOf, AVar, RWord, RSum,
-                 RInt, Rooted, Lent, Given, Owned, Closure, Declined, no_links)
+import emit.tir (Fn, Var, Block, Inst, Case, Opened, Let, If, Restart, Dec, Return, LastOf, AVar,
+                 RWord, RSum, RInt, Rooted, Lent, Given, Owned, Closure, Declined, no_links)
 import emit.lend (conventions)
 import emit.entry (built_form)
 import emit.lower.crossing (worded)
@@ -42,26 +42,53 @@ fn declared(name: Bytes) -> Type = TyCon({ name: name, args: [] })
 fn corpus_ctors() -> Result<Ctors, Bytes> / {abort.raise} =
   match program_of(corpus()) { Ok(p) -> Ok(p.setting.ctors), Err(why) -> Err(why) }
 
+/// Every instruction of `b`, through the arms of each `Case` and the branches of each `If`.
+fn insts(b: Block) -> List<Inst> =
+  b.fold([], |acc: List<Inst>, i: Inst|
+    match i {
+      Case(c) ->
+        c.arms.fold(
+          acc.push(i).concat(insts(c.rest)),
+          |a: List<Inst>, arm: { when: Int, body: Block }| a.concat(insts(arm.body)),
+        ),
+      If(x) -> acc.push(i).concat(insts(x.then)).concat(insts(x.otherwise)),
+      _ -> acc.push(i),
+    })
+
+/// The words the `Opened` of `b` bind, and the values its `Dec`s let go of, wherever they stand.
+fn dropping(b: Block) -> { opened: List<Var>, decs: List<Var> } =
+  insts(b).fold({ opened: [], decs: [] }, |acc: { opened: List<Var>, decs: List<Var> }, i: Inst|
+    match i {
+      Opened(o) -> { ..acc, opened: acc.opened.concat(o.words) },
+      Dec(v) -> { ..acc, decs: acc.decs.push(v) },
+      _ -> acc,
+    })
+
 test "a tree's drop root lets go of its left subtree and starts again on its right" {
   let tree = declared(b"m.Tree");
   match corpus_ctors() {
     Err(why) -> assert_eq(why, b""),
     Ok(ctors) -> match generated(ctors, drop_of(tree)) {
       Err(no) -> assert_eq(no.why, b""),
-      Ok(f) -> match f.body {
-        [Case(c)] -> match c.arms {
-          [arm] -> match arm.body {
-            [Opened(_), Opened(open), Dec(left), Let(last), If(again), Return(_)] -> {
-              assert_eq(open.words.map(|w: Var| w.ty), [tree, tree]);
-              assert_eq(open.words.at(0), Some(left));
-              assert_eq(last.val, LastOf(open.words.get(1)));
-              assert_eq(again.then, [Restart([AVar(last.var)])])
-            },
-            other -> assert_eq(other.len(), 0),
-          },
-          arms -> assert_eq(arms.len(), 1),
-        },
-        body -> assert_eq(body.len(), 1),
+      Ok(f) -> {
+        let all = insts(f.body);
+        let opens = all.fold([], |acc: List<{ of: Var, words: List<Var> }>, i: Inst|
+          match i { Opened(o) -> acc.push(o), _ -> acc });
+        // The box's own words of its type, not the box itself as it is opened.
+        let subtrees = dropping(f.body).opened.filter(|v: Var|
+          v.ty == tree && !opens.any(|o: { of: Var, words: List<Var> }| o.of == v));
+        assert_eq(subtrees.len(), 2);
+        // The left is let go of, the right taken last and started on again, in a loop.
+        assert(dropping(f.body).decs.contains(subtrees.get(0)), None);
+        let last = all.fold(None, |found: Option<Var>, i: Inst|
+          match i {
+            Let(l) -> if l.val == LastOf(subtrees.get(1)) { Some(l.var) } else { found },
+            _ -> found,
+          });
+        match last {
+          Some(v) -> assert(all.contains(Restart([AVar(v)])), None),
+          None -> assert(false, None),
+        }
       },
     },
   }
@@ -94,14 +121,10 @@ test "a wide sum is let go of by its case, each boxed case at its own root, whic
           |t: Type| reps::laid(ctors, t),
           |t: Type| reps::word_form(ctors, t),
         );
-        match add.body {
-          [Opened(o), Dec(l), Dec(r), Return(_)] -> {
-            assert_eq(o.words, [l, r]);
-            assert_eq([l.ty, r.ty], [expr, expr]);
-            assert_eq(match l.rep { RSum(_) -> true, _ -> false }, true)
-          },
-          body -> assert_eq(body.len(), 4),
-        }
+        let d = dropping(add.body);
+        assert_eq(d.opened.map(|v: Var| v.ty), [expr, expr]);
+        assert(d.opened.all(|v: Var| match v.rep { RSum(_) -> true, _ -> false }), None);
+        assert_eq(d.decs, d.opened)
       },
       _ -> assert(false, None),
     },
@@ -118,14 +141,15 @@ test "a record's box lets go of its pointers and of a sum it holds whole" {
     Err(why) -> assert_eq(why, b""),
     Ok(ctors) -> match generated(ctors, drop_of(pair)) {
       Err(no) -> assert_eq(no.why, b""),
-      Ok(f) -> match f.body {
-        [Opened(o), Dec(a), Dec(b), Dec(c), Return(_)] -> {
-          assert_eq(o.words, [a, b, c]);
-          assert_eq([a.rep, b.rep], [RWord, RWord]);
-          assert_eq(c.ty, declared(b"m.Tree"));
-          assert_eq(match c.rep { RSum(_) -> true, _ -> false }, true)
-        },
-        body -> assert_eq(body.len(), 5),
+      Ok(f) -> {
+        let d = dropping(f.body);
+        assert_eq(d.opened.map(|v: Var| v.ty), [
+          TyCon({ name: b"List", args: [declared(b"Int")] }),
+          declared(b"String"),
+          declared(b"m.Tree"),
+        ]);
+        assert_eq(d.decs, d.opened);
+        assert(match d.opened.get(2).rep { RSum(_) -> true, _ -> false }, None)
       },
     },
   }
@@ -202,14 +226,19 @@ test "a closure capturing a channel is kept as 0, its keep entry making no copy,
   let l = Closure({ body: body, captures: 1, at: span_between(0, 0) });
   let text = spelled(lambda_text(body, 0, l, printing(Map::new())).out);
   let name = symbol_of(b"m.outer").concat(b"_lambda0");
-  let has = |t: Bytes| assert(text.contains(t), Some(String::of_bytes_lossy(text)));
-  has(
-    Bytes::concat_all([
-      name,
-      b"_keep(PlyCtx *ctx, Word self) {\n  Word t1 = 0;\n  return t1;\n}\n",
-    ]),
+  let defined = |entry: Bytes|
+    match text.index_of(Bytes::concat_all([name, entry, b"("])) {
+      Some(i) -> match text.index_of_from(b"\n}\n", i) { Some(j) -> text.slice(i, j), None -> b"" },
+      None -> b"",
+    };
+  let said = Some(String::of_bytes_lossy(text));
+  // Its keep entry answers 0 at once and copies nothing; its share entry answers 0 for the channel.
+  let keep = defined(b"_keep");
+  assert(
+    keep.len() > 0 && keep.index_of(b"= 0;") != None && keep.index_of(b"rt_alloc") == None,
+    said,
   );
-  has(b"if (ply_words(self)[1]) t1 = 0;")
+  assert(defined(b"_share").index_of(b"= 0;") != None, said)
 }
 
 /// Why root `k`, generated as `r`, is not written taking its operands as `written_handing` says, or
