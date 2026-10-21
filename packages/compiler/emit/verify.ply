@@ -14,8 +14,10 @@ import emit.tir (Rep, RWord, RInt, RBool, RNum, RMaybe, RTagged, RFlat, RCases, 
                  Given, Lent, Owned, Borrowed, Returned, Convention, Answered, Owns, ReadsOf, Lasts,
                  no_links, counted, operands, answered, fails, used_as, rep_of_arg, var_of,
                  parts_of, Test, TTag, TInt, TRange, RSum, RUnit, RAddr, LastOf, Walked, MBox,
-                 MCase, PCase, PPayload, OContainer, OStrings, stops_at)
+                 MCase, PCase, PPayload, OContainer, OStrings, stops_at, Uses, string_uses)
 import emit.tir.containers (Taken)
+import emit.tir.strings (StringOp, StringArg, ReadsAt, Number, WritesBlock, OwnBlock, Copied, Grown,
+                         ByteRead, string_args, string_answer)
 import emit.layout
 import emit.layout (P, Always, WordIs, WordOutside, Inline, Boxed, Nullary, LWords)
 import emit.keys (Named, Root, TypeOp, Copy, Keep, Share)
@@ -106,9 +108,8 @@ pub fn verified(f: Fn) -> Option<Bytes> = {
 }
 
 /// The first construct of `f`'s body, its parameters and answer among it, that no rule of this
-/// check covers yet: a value held as a sum's words, as no C value, or as an address into a block's
-/// bytes; a box or a boxed case made; a case's payload or a block's bytes read; the bytes a crossing
-/// answered taken. Each stream's rules drop their line.
+/// check covers yet: a value held as a sum's words or as no C value; a box or a boxed case made; a
+/// case's payload read. Each stream's rules drop their line.
 fn not_yet(f: Fn) -> Option<Bytes> = {
   let held = f.members.fold(f.params, |vs: List<Var>, m: Member| vs.concat(m.params));
   let answers = f.members.fold([f.conv.answer], |rs: List<Rep>, m: Member| rs.push(m.conv.answer));
@@ -162,7 +163,6 @@ fn held_not_yet(r: Rep) -> Option<Bytes> =
   match r {
     RSum(_) -> Some(b"a value held as a sum's words"),
     RUnit -> Some(b"a value held as no C value"),
-    RAddr -> Some(b"an address into a block's bytes"),
     RFlat(ls) -> ls.fold(None, |acc: Option<Bytes>, l: Leaf| or_else(acc, held_not_yet(l.rep))),
     RCases(c) ->
       c.cases.fold(None, |acc: Option<Bytes>, x: { name: Bytes, leaves: List<Leaf> }|
@@ -179,20 +179,11 @@ fn val_not_yet(val: Val) -> Option<Bytes> =
     },
     Get(g) -> path_not_yet(g.path),
     Take(t) -> path_not_yet(t.path),
-    Op(o) -> match o.op {
-      OContainer(Taken) -> Some(b"the bytes a crossing answered taken"),
-      OStrings(_) -> Some(b"an operation over a string's bytes"),
-      _ -> None,
-    },
     _ -> None,
   }
 
 fn path_not_yet(p: Path) -> Option<Bytes> =
-  match p {
-    PCase(_) -> Some(b"a case's payload read"),
-    PPayload -> Some(b"a block's bytes read"),
-    _ -> None,
-  }
+  match p { PCase(_) -> Some(b"a case's payload read"), _ -> None }
 
 /// `m` with `v` bound as it is held.
 fn bound_as(m: Map<Int, Rep>, v: Var) -> Map<Int, Rep> = m.insert(v.id, v.rep)
@@ -470,7 +461,12 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             }
           } else if answers_count(d.val) {
             { ..acc, fault: Some(b"a value whose count nothing holds") }
-          } else { failing(cx, used(acc, operands(d.val)), d.val, d.unwind) },
+          } else {
+            match bytes_fault(acc.h, None, d.val) {
+              Some(f) -> faulted(acc, f.why, f.v),
+              None -> failing(cx, used(acc, operands(d.val)), d.val, d.unwind),
+            }
+          },
         },
         Decl(v) -> { ..acc, h: declared(acc.h, v.id) },
         Assign(s) -> match acc.h.joins.get(s.var.id) {
@@ -741,7 +737,10 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
 /// `acc` past `y` bound to `val`, whose failure path releases `unwind`: its operands used as `val`
 /// takes them, and `y` held as `val` answers it.
 fn let_walked(cx: Within, acc: Walk, y: Var, val: Val, unwind: List<Var>) -> Walk =
-  match field_fault(acc.h, match cx.looped { Some(lp) -> lp.held, None -> Map::new() }, y, val) {
+  match or_else(
+      field_fault(acc.h, match cx.looped { Some(lp) -> lp.held, None -> Map::new() }, y, val),
+      bytes_fault(acc.h, Some(y), val),
+    ) {
     Some(f) -> faulted(acc, f.why, f.v),
     None -> noted(bound_walked(cx, acc, y, val, unwind), y, val),
   }
@@ -900,6 +899,137 @@ fn whole_fault(h: Holding, args: List<Arg>) -> Option<{ why: Bytes, v: Var }> =
     Some(v) -> Some({ why: b"a block used whole after a field was taken out of it: v", v: v }),
     None -> None,
   }
+
+/// Why `val`, answering into `y` where it answers, reads or writes a block's bytes otherwise than its
+/// rule says: an address is read out of a block's word as an address; an operation over bytes is
+/// written with the `uses` `tir.string_uses` gives it, handed each operand as `string_args` says
+/// (a block as its word, an address as one, a number as a value holding no count), writes only into
+/// a block this body holds a count of, and answers as `string_answer` says; the bytes a crossing
+/// answered are taken as a block of their own, from a count.
+fn bytes_fault(h: Holding, y: Option<Var>, val: Val) -> Option<{ why: Bytes, v: Var }> =
+  match val {
+    Get(g) -> match g.path {
+      PPayload -> if g.of.rep != RWord {
+        Some({ why: b"a block's bytes read out of other than a block's word: v", v: g.of })
+      } else {
+        match y {
+          Some(a) -> if a.rep != RAddr {
+            Some({ why: b"a block's bytes read held otherwise than as an address: v", v: a })
+          } else { None },
+          None -> None,
+        }
+      },
+      _ -> None,
+    },
+    Op(o) -> {
+      let named = match y { Some(a) -> a, None -> first_var(o.args, unknown_var()) };
+      match o.op {
+        OStrings(op) -> string_fault(h, y, named, op, o.args, o.uses),
+        OContainer(Taken) -> if o.args.len() == 1 && o.args.all(|a: Arg| !counted(rep_of_arg(a)))
+            && o.uses.owned
+            && !o.uses.takes.any(|t: Bool| t)
+            && (match y { Some(a) -> a.rep == RWord, None -> false }) { None } else {
+          Some({
+            why: b"the bytes a crossing answered taken other than as a block of their own: v",
+            v: named,
+          })
+        },
+        _ -> None,
+      }
+    },
+    _ -> None,
+  }
+
+/// Why operation `op` over bytes, handed `args` with `uses` and answering into `y`, breaks its rule;
+/// a fault names `named`, or the operand it is about.
+fn string_fault(
+  h: Holding,
+  y: Option<Var>,
+  named: Var,
+  op: StringOp,
+  args: List<Arg>,
+  uses: Uses,
+) -> Option<{ why: Bytes, v: Var }> = {
+  let kinds = string_args(op);
+  if kinds.len() != args.len() {
+    Some({ why: b"an operation over bytes handed other than its operands: v", v: named })
+  } else if uses != string_uses(op) {
+    Some({
+      why: b"an operation over bytes taking or answering otherwise than its rule: v",
+      v: named,
+    })
+  } else {
+    let operand = range(0, args.len()).fold(
+      None,
+      |found: Option<{ why: Bytes, v: Var }>, k: Int|
+        match found {
+          Some(_) -> found,
+          None -> match ((kinds.at(k), args.at(k))) {
+            (Some(kind), Some(a)) -> operand_fault(h, kind, a, named),
+            _ -> None,
+          },
+        },
+    );
+    match operand {
+      Some(_) -> operand,
+      None -> {
+        let answer = match y { Some(a) -> a.rep, None -> RInt };
+        let held = match string_answer(op) {
+          OwnBlock -> y != None && answer == RWord,
+          _ -> !counted(answer),
+        };
+        if held { None } else {
+          Some({ why: b"an operation over bytes answering otherwise than its rule: v", v: named })
+        }
+      },
+    }
+  }
+}
+
+/// Why operand `a` is handed otherwise than `kind` says.
+fn operand_fault(
+  h: Holding,
+  kind: StringArg,
+  a: Arg,
+  named: Var,
+) -> Option<{ why: Bytes, v: Var }> =
+  match kind {
+    ReadsAt -> match a {
+      AVar(v) -> if points_into(v.rep) { None } else {
+        Some({ why: b"an operation over bytes reading through other than an address: v", v: v })
+      },
+      _ ->
+        Some({
+          why: b"an operation over bytes reading through other than an address: v",
+          v: named,
+        }),
+    },
+    Number -> if counted(rep_of_arg(a)) {
+      Some({ why: b"an operation over bytes handed a counted value as a number: v", v: named })
+    } else { None },
+    _ -> match a {
+      AVar(v) -> if v.rep != RWord {
+        Some({
+          why: b"an operation over bytes handed a block held otherwise than as its word: v",
+          v: v,
+        })
+      } else if kind == WritesBlock && count(h, v) == 0 {
+        Some({ why: b"a block written into that this body holds no count of: v", v: v })
+      } else { None },
+      _ -> Some({ why: b"an operation over bytes handed a block no variable holds: v", v: named }),
+    },
+  }
+
+/// The first variable among `args`, or `otherwise`.
+fn first_var(args: List<Arg>, otherwise: Var) -> Var =
+  match args.fold(None, |found: Option<Var>, a: Arg|
+      match found { Some(_) -> found, None -> var_of(a) }) {
+    Some(v) -> v,
+    None -> otherwise,
+  }
+
+/// A variable standing for none, which a fault about no variable names.
+fn unknown_var() -> Var = { id: 0 - 1, ty: TyCon({ name: b"_", args: [] }), rep: RInt }
 
 /// The first of `args` a field was taken out of.
 fn taken_whole(h: Holding, args: List<Arg>) -> Option<Var> =
@@ -1367,6 +1497,11 @@ fn escaping(h: Holding, val: Val) -> Option<Var> =
         }),
   }
 
+/// Whether a value held as `r` holds no count but points into the block it was read out of, as an
+/// address into a block's bytes does: it is read only while that block is held, never handed on or
+/// counted. `emit.own` keeps the block live through it by this one rule as this check checks it.
+pub fn points_into(r: Rep) -> Bool = r == RAddr
+
 /// Whether the value `y` is bound to, `val`, holds no count, where the variables `immortal` holds
 /// hold none: a static object's word, whose count nothing writes, a value gathered from constants
 /// and values holding none, as a nullary case is, or such a value held again as another. Such a value
@@ -1475,6 +1610,7 @@ pub fn stacked_captures(val: Val) -> Option<List<Arg>> =
 fn consumed_one(w: Walk, v: Var) -> Walk =
   if w.fault != None { w }
   else if w.h.unset.contains(v.id) { unset_read(w, v) }
+  else if points_into(v.rep) { faulted(w, b"an address handed on beyond its block: v", v) }
   else if !counted(v.rep) { w } else {
     let n = count(w.h, v);
     if n > 0 {
@@ -1495,7 +1631,8 @@ fn consumed_one(w: Walk, v: Var) -> Walk =
 fn read_one(w: Walk, v: Var) -> Walk =
   if w.fault != None { w }
   else if w.h.unset.contains(v.id) { unset_read(w, v) }
-  else if !counted(v.rep) || w.h.immortal.contains(v.id) || w.h.pending.contains(v.id)
+  else if (!counted(v.rep) && !points_into(v.rep)) || w.h.immortal.contains(v.id)
+      || w.h.pending.contains(v.id)
       || count(w.h, v) > 0 { w } else {
     match w.h.borrowed.get(v.id) {
       Some(bs) -> if bs.all(|b: Int|
@@ -1531,11 +1668,13 @@ fn with_released(landing: Map<Int, Int>, unwind: List<Var>) -> Map<Int, Int> =
   unwind.fold(landing, |m: Map<Int, Int>, v: Var|
     m.insert(v.id, match m.get(v.id) { Some(n) -> n + 1, None -> 1 }))
 
-/// The variable `v` a `Let` binds, holding what the operation answers.
+/// The variable `v` a `Let` binds, holding what the operation answers; an address is only ever
+/// read out of the block it points into.
 fn result(w: Walk, v: Var, a: Answered) -> Walk =
-  if w.fault != None || !counted(v.rep) { w } else {
+  if w.fault != None || (!counted(v.rep) && !points_into(v.rep)) { w } else {
     match a {
-      Owns -> { ..w, h: { ..w.h, owned: w.h.owned.insert(v.id, 1) } },
+      Owns -> if points_into(v.rep) { faulted(w, b"an address held as a count of its own: v", v) }
+      else { { ..w, h: { ..w.h, owned: w.h.owned.insert(v.id, 1) } } },
       ReadsOf(reads) ->
         {
           ..w,
@@ -2721,10 +2860,140 @@ test "a construct no rule covers yet is refused, naming what it is" {
   assert_eq(
     refused(root_of([{ ..p, rep: RUnit }], [], RInt, [Return(AInt(0))])),
     b"a value held as no C value: v0",
+  )
+}
+
+/// `op` over bytes, handed `args`, written with the `uses` its rule gives it.
+fn bytes_op(op: StringOp, args: List<Arg>) -> Val =
+  Op({ op: OStrings(op), args: args, uses: string_uses(op) })
+
+fn address(id: Int) -> Var = { ..int(id), rep: RAddr }
+
+test "an address into a block's bytes is read out of a block's word, only while the block is held, and never handed on" {
+  let b = word(0);
+  let a = address(1);
+  let n = int(2);
+  let addressed = bind(a, Get({ of: b, path: PPayload }), []);
+  let byte = bind(n, bytes_op(ByteRead, [AVar(a), AInt(0)]), []);
+  let read = |body: Block| verified(root_of([b], [], RInt, [addressed].concat(body)));
+  assert_eq(read([byte, Dec(b), Return(AVar(n))]), None);
+  assert_eq(
+    read([Dec(b), byte, Return(AVar(n))]),
+    Some(b"a value read after what it was read out of was let go: v1"),
+  );
+  // Read out of a block the body is lent, it lives while the body does.
+  assert_eq(verified(root_of([b], [0], RInt, [addressed, byte, Return(AVar(n))])), None);
+  // An address holds no count to hand on: answered, stored or given to a call, it would outlive its
+  // block.
+  let w = word(3);
+  assert_eq(
+    read([
+      bind(w, Make({ made: MList(1), args: [AVar(a)], reuse: None, kept: [] }), []),
+      Dec(b),
+      Dec(w),
+      Return(AInt(0)),
+    ]),
+    Some(b"an address handed on beyond its block: v1"),
   );
   assert_eq(
-    refused(root_of([], [], RAddr, [Return(AInt(0))])),
-    b"an address into a block's bytes: an answer",
+    verified(root_of([b], [], RAddr, [addressed, Dec(b), Return(AVar(a))])),
+    Some(b"an address handed on beyond its block: v1"),
+  );
+  // Only a block's word has bytes to read, and they are read as an address.
+  assert_eq(
+    verified(
+      root_of([n], [], RInt, [bind(a, Get({ of: n, path: PPayload }), []), Return(AInt(0))]),
+    ),
+    Some(b"a block's bytes read out of other than a block's word: v2"),
+  );
+  assert_eq(
+    read([bind(n, Get({ of: b, path: PPayload }), []), Dec(b), Return(AVar(n))]),
+    Some(b"a block's bytes read held otherwise than as an address: v2"),
+  )
+}
+
+test "an operation over bytes is handed, takes and answers as its rule says, and writes only into a block held here" {
+  let b = word(0);
+  let a = address(1);
+  let n = int(2);
+  let fresh = word(3);
+  let grown = word(4);
+  let addressed = bind(a, Get({ of: b, path: PPayload }), []);
+  let copied = Do({
+    val: bytes_op(Copied, [AVar(fresh), AInt(0), AVar(a), AInt(0), AInt(4)]),
+    at: dummy_span(),
+    unwind: [],
+  });
+  let checked = |params: List<Var>, lent: List<Int>, answer: Rep, body: Block|
+    verified(root_of(params, lent, answer, body));
+  // A block held here is written from another's bytes and handed back; one grown is taken.
+  assert_eq(checked([b, fresh], [], RWord, [addressed, copied, Dec(b), Return(AVar(fresh))]), None);
+  assert_eq(
+    checked([b, grown], [], RWord, [
+      addressed,
+      bind(fresh, bytes_op(Grown, [AVar(grown), AVar(a), AInt(4)]), []),
+      Dec(b),
+      Return(AVar(fresh)),
+    ]),
+    None,
+  );
+  // Written into a block it is lent, the bytes would change under whoever lent it.
+  assert_eq(
+    checked([b, fresh], [1], RInt, [addressed, copied, Dec(b), Return(AInt(0))]),
+    Some(b"a block written into that this body holds no count of: v3"),
+  );
+  // Written with other `uses` than its rule, the counts it places would not be the rule's.
+  let taking = Op({
+    op: OStrings(ByteRead),
+    args: [AVar(a), AInt(0)],
+    uses: { ..string_uses(ByteRead), takes: [true, false] },
+  });
+  let reads = |val: Val|
+    checked([b], [], RInt, [addressed, bind(n, val, []), Dec(b), Return(AVar(n))]);
+  assert_eq(
+    reads(taking),
+    Some(b"an operation over bytes taking or answering otherwise than its rule: v2"),
+  );
+  // Each operand is held as its rule says: an address read through, a number holding no count.
+  assert_eq(
+    reads(bytes_op(ByteRead, [AVar(b), AInt(0)])),
+    Some(b"an operation over bytes reading through other than an address: v0"),
+  );
+  assert_eq(
+    reads(bytes_op(ByteRead, [AVar(a), AVar(b)])),
+    Some(b"an operation over bytes handed a counted value as a number: v2"),
+  );
+  assert_eq(
+    reads(bytes_op(ByteRead, [AVar(a)])),
+    Some(b"an operation over bytes handed other than its operands: v2"),
+  );
+  assert_eq(
+    checked([b, grown], [], RWord, [
+      addressed,
+      bind({ ..fresh, rep: RInt }, bytes_op(Grown, [AVar(grown), AVar(a), AInt(4)]), []),
+      Dec(b),
+      Return(AInt(0)),
+    ]),
+    Some(b"an operation over bytes answering otherwise than its rule: v3"),
+  )
+}
+
+test "the bytes a crossing answered are taken as a block of their own, from a count" {
+  let n = int(0);
+  let t = word(1);
+  let taken = |uses: Uses, into: Var|
+    verified(
+      root_of([n], [], RInt, [
+        bind(into, Op({ op: OContainer(Taken), args: [AVar(n)], uses: uses }), []),
+        Dec(into),
+        Return(AInt(0)),
+      ]),
+    );
+  let owned = { takes: [false], owned: true, fails: true, stops: false };
+  assert_eq(taken(owned, t), None);
+  assert_eq(
+    taken({ ..owned, owned: false }, t),
+    Some(b"the bytes a crossing answered taken other than as a block of their own: v1"),
   )
 }
 
