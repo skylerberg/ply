@@ -12,12 +12,15 @@ import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VS
                   VCtor, VList)
 import emit.c (Width, width_named, width_index)
 import emit.keys (Named)
-import emit.reps (Ctors, SumCtor, ctors_of, laid, word_form, ctor_fields_at)
+import emit.reps (Ctors, SumCtor, ctors_of, laid, word_form, ctor_fields_at, has_vars)
 import emit.layout (LSum, SumLaid, WordClass, CaseTest, WordIs, LowBits, Nullary, Inline, Boxed,
                     Itself, Immediate, RuntimeBox, Box, words)
 import emit.tir (Fn, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Val, Literal, Static,
-                 Prim, AInt, ABool, AVar, RInt, RDec, RWord, Rep, Var, Return, Rooted, Owned,
-                 Lambda, Closure, no_links)
+                 Prim, AInt, ABool, AVar, AFloat, AChar, ANum, AZero, Arg, Make, Made, MCase,
+                 Gathered, Pack, RInt, RDec, RWord, RSum, Rep, Var, Return, Rooted, Owned, Lambda,
+                 Closure, no_links, rep_of_arg)
+import emit.lower.held (values_of, words_held)
+import emit.print.made (in_box)
 import emit.tir.statics (StaticDef, StaticLaid, SBlock, SFile, WRaw, named, text_block, wide_kind)
 import emit.tir.statics (SPlain, WBytes, WAddress, StaticWord, int_kind, float_kind, decimal_kind)
 
@@ -136,47 +139,27 @@ fn mislaid<a>(ty: Type) -> a / {abort.raise} =
     ),
   )
 
-/// Case `case` of the sum laid as `s`, its arguments laid as `payload`: the payload where the case
-/// lays it, in its box behind the box's tag word where the case is boxed, the case's test written in
-/// its tag word or its pointer's low bits, and zero in every other word.
+/// Case `case` of the sum laid as `s`, its arguments laid as `payload`, as `sum_words` gathers the
+/// case: a boxed case's arguments in a static box after the case's place where the box holds one, the
+/// box's address its word.
 fn case_words(s: SumLaid, case: Int, payload: Laying) -> Laying / {abort.raise} =
   match s.cases.at(case) {
     None -> panic("a case its sum does not lay"),
-    Some(cl) -> {
-      let zeros = s.classes.map(|_: WordClass| WRaw(0));
-      let held = match cl.payload {
-        Nullary -> { words: zeros, defs: payload.defs },
-        Inline(i) -> { words: placed(zeros, i.offset, payload.words), defs: payload.defs },
-        Boxed(b) -> {
-          let boxed = named(
-            SBlock({
-              head: [],
-              words: (if b.skip == 1 { [WRaw(case)] } else { [] }).concat(payload.words),
-            }),
-          );
-          {
-            words: placed(zeros, b.at, [WAddress({ name: boxed.name, tag: 0 })]),
-            defs: payload.defs.push(boxed),
-          }
-        },
-      };
-      { words: tested(held.words, cl.test), defs: held.defs }
+    Some(cl) -> match cl.payload {
+      Boxed(b) -> {
+        let boxed = named(
+          SBlock({
+            head: [],
+            words: (if b.skip > 0 { [WRaw(case)] } else { [] }).concat(payload.words),
+          }),
+        );
+        {
+          words: sum_words(s, case, [[WAddress({ name: boxed.name, tag: 0 })]]),
+          defs: payload.defs.push(boxed),
+        }
+      },
+      _ -> { words: sum_words(s, case, [payload.words]), defs: payload.defs },
     },
-  }
-
-fn placed(ws: List<StaticWord>, at: Int, xs: List<StaticWord>) -> List<StaticWord> / {abort.raise} =
-  xs.fold({ at: at, out: ws }, |acc: { at: Int, out: List<StaticWord> }, x: StaticWord|
-    { at: acc.at + 1, out: acc.out.set(acc.at, x) }).out
-
-/// `ws` with a case's test written: its value in its tag word, its bits in its pointer's low bits.
-fn tested(ws: List<StaticWord>, t: CaseTest) -> List<StaticWord> / {abort.raise} =
-  match t {
-    WordIs(w) -> ws.set(w.at, WRaw(w.value)),
-    LowBits(b) -> match ws.at(b.at) {
-      Some(WAddress(a)) -> ws.set(b.at, WAddress({ ..a, tag: b.bits })),
-      _ -> panic("a case told by its pointer's low bits whose word holds no static's address"),
-    },
-    _ -> ws,
   }
 
 /// The one word `k`, a value of `ty`, is where one word is required (a container's item, an
@@ -318,9 +301,10 @@ fn fixed_known(w: Width, bits: U128) -> Known / {abort.raise} =
 /// an embedded file and a 128-bit width's value as the static object named by its content, listed
 /// among `f.statics` (a closure's among its own body's), each once and after those it addresses; a
 /// `Decimal` as its two words, which C writes in place. `()` stays the runtime's, as its word is.
-/// Folding a folded root changes nothing.
+/// A box made of words the build knows whole, a sum's boxed case or a value's word form, at a type
+/// no variable leaves open, is a static box too. Folding a folded root changes nothing.
 pub fn folded(f: Fn) -> Fn / {abort.raise} = {
-  let b = folded_block(f.body, { defs: f.statics, seen: names_of(f.statics) });
+  let b = folded_block(f.body, { defs: f.statics, seen: names_of(f.statics), known: Map::new() });
   {
     ..f,
     body: b.block,
@@ -330,8 +314,9 @@ pub fn folded(f: Fn) -> Fn / {abort.raise} = {
   }
 }
 
-/// The statics a body names so far, in order, and their names.
-type Held = { defs: List<StaticDef>, seen: Map<Bytes, Bool> }
+/// The statics a body names so far, in order, and their names; and the words, as a box lays them,
+/// of each variable bound so far to a value the build knows whole, by its number.
+type Held = { defs: List<StaticDef>, seen: Map<Bytes, Bool>, known: Map<Int, List<StaticWord>> }
 
 fn names_of(defs: List<StaticDef>) -> Map<Bytes, Bool> =
   defs.fold(Map::new(), |m: Map<Bytes, Bool>, d: StaticDef| m.insert(d.name, true))
@@ -340,7 +325,11 @@ fn names_of(defs: List<StaticDef>) -> Map<Bytes, Bool> =
 fn holding(h: Held, defs: List<StaticDef>) -> Held =
   defs.fold(h, |acc: Held, d: StaticDef|
     if acc.seen.contains(d.name) { acc }
-    else { { defs: acc.defs.push(d), seen: acc.seen.insert(d.name, true) } })
+    else { { ..acc, defs: acc.defs.push(d), seen: acc.seen.insert(d.name, true) } })
+
+/// `h` knowing `v` laid in `words`.
+fn knowing(h: Held, v: Var, words: List<StaticWord>) -> Held =
+  { ..h, known: h.known.insert(v.id, words) }
 
 /// Block `b` with each constant it binds, through the blocks its instructions hold, laid out, and
 /// the statics `held` and it name.
@@ -348,11 +337,11 @@ fn folded_block(b: Block, held: Held) -> { block: Block, held: Held } / {abort.r
   b.fold({ block: [], held: held }, |acc: { block: Block, held: Held }, i: Inst| {
     let x = match i {
       Let(l) -> {
-        let v = folded_val(l.val, acc.held);
+        let v = folded_val(Some(l.var), l.val, acc.held);
         { inst: Let({ ..l, val: v.val }), held: v.held }
       },
       Do(d) -> {
-        let v = folded_val(d.val, acc.held);
+        let v = folded_val(None, d.val, acc.held);
         { inst: Do({ ..d, val: v.val }), held: v.held }
       },
       If(x) -> {
@@ -395,9 +384,10 @@ fn folded_block(b: Block, held: Held) -> { block: Block, held: Held } / {abort.r
     { block: acc.block.push(x.inst), held: x.held }
   })
 
-/// `v` with the constant it is laid out, and the statics that names.
-fn folded_val(v: Val, held: Held) -> { val: Val, held: Held } / {abort.raise} =
-  match v {
+/// `v`, bound to `into` where a `Let` binds it, with the constant it is laid out, and the statics
+/// that names; what the build knows whole of `into` noted.
+fn folded_val(into: Option<Var>, v: Val, held: Held) -> { val: Val, held: Held } / {abort.raise} = {
+  let laid = match v {
     Literal(l) -> match static_of_lit(l) {
       Some(s) -> {
         let defs = statics_of(s);
@@ -412,6 +402,165 @@ fn folded_val(v: Val, held: Held) -> { val: Val, held: Held } / {abort.raise} =
       },
     },
     _ -> { val: v, held: held },
+  };
+  match into {
+    Some(y) -> if has_vars(y.ty) { laid } else { known_bound(y, laid.val, laid.held) },
+    None -> laid,
+  }
+}
+
+/// `held` knowing `y`, bound to `v`, as a box would lay it where the build knows `v` whole: a static's
+/// address, a decimal's two words, what a record or a sum is gathered from, laid as its words are; and
+/// `v` a static box where it makes a box of words the build knows, a sum's boxed case or a value's
+/// word form, as the printer lays it (`print.made.box_made`, `parts_word`).
+fn known_bound(y: Var, v: Val, held: Held) -> { val: Val, held: Held } / {abort.raise} = {
+  let same = { val: v, held: held };
+  match v {
+    Static(name) -> { val: v, held: knowing(held, y, [WAddress({ name: name, tag: 0 })]) },
+    Prim(p) -> match p.args {
+      [AInt(lo), AInt(hi)] -> if p.op == b"decimal" {
+        { val: v, held: knowing(held, y, [WRaw(lo), WRaw(hi)]) }
+      } else { same },
+      _ -> same,
+    },
+    Gathered(g) -> match each_known(g.parts, held) {
+      None -> same,
+      Some(parts) -> match y.rep {
+        RSum(s) -> match g.parts.at(0) {
+          Some(AInt(i)) -> { val: v, held: knowing(held, y, sum_words(s.laid, i, parts.drop(1))) },
+          _ -> same,
+        },
+        _ -> { val: v, held: knowing(held, y, joined_words(parts)) },
+      },
+    },
+    Make(m) -> match m.made {
+      MCase(c) -> match each_known(m.args, held) {
+        Some(parts) ->
+          boxed_static(
+            y,
+            (if c.skip > 0 { [WRaw(c.case)] } else { [] }).concat(joined_words(parts)),
+            c.skip + c.words,
+            held,
+          ),
+        None -> same,
+      },
+      _ -> same,
+    },
+    Pack(p) -> if p.to != RWord { same } else if in_box(rep_of_arg(p.arg)) {
+      match each_known([p.arg], held) {
+        Some(parts) -> {
+          let ws = joined_words(parts);
+          boxed_static(y, ws, ws.len(), held)
+        },
+        None -> same,
+      }
+    } else {
+      match p.arg {
+        AInt(n) -> if n >= 0 - (1 << 62) && n < 1 << 62 {
+          { val: v, held: knowing(held, y, [WRaw(n * 2 + 1)]) }
+        } else { same },
+        _ -> same,
+      }
+    },
+    _ -> same,
+  }
+}
+
+/// `y` bound to the static box of `ws`, which must be the `n` words the box the printer makes holds.
+fn boxed_static(
+  y: Var,
+  ws: List<StaticWord>,
+  n: Int,
+  held: Held,
+) -> { val: Val, held: Held } / {abort.raise} =
+  if ws.len() != n { panic("a box whose known words are not as many as it holds") } else {
+    let d = named(SBlock({ head: [], words: ws }));
+    {
+      val: Static(d.name),
+      held: knowing(holding(held, [d]), y, [WAddress({ name: d.name, tag: 0 })]),
+    }
+  }
+
+fn joined_words(parts: List<List<StaticWord>>) -> List<StaticWord> =
+  parts.fold([], |acc: List<StaticWord>, p: List<StaticWord>| acc.concat(p))
+
+/// The words each of `args` is laid in, as `print.made.words_laid` lays its C values; none unless the
+/// build knows every one whole.
+fn each_known(args: List<Arg>, held: Held) -> Option<List<List<StaticWord>>> =
+  args.fold(Some([]), |acc: Option<List<List<StaticWord>>>, a: Arg|
+    match acc {
+      None -> None,
+      Some(xs) -> match arg_known(a, held) { Some(ws) -> Some(xs.push(ws)), None -> None },
+    })
+
+/// The words `a` is laid in where the build knows it: an integer's, a bit pattern's, a character's
+/// immediate, zero for each word of a zero, and what `held` knows of a variable.
+fn arg_known(a: Arg, held: Held) -> Option<List<StaticWord>> =
+  match a {
+    AVar(v) -> held.known.get(v.id),
+    AInt(n) -> Some([WRaw(n)]),
+    ABool(b) -> Some([WRaw(if b { 1 } else { 0 })]),
+    AFloat(bits) -> Some([WRaw(bits)]),
+    AChar(c) -> Some([WRaw(c * 8 + 2)]),
+    ANum(n) -> Some([WRaw(register_bits(n.width, n.bits))]),
+    AZero(r) -> Some(range(0, words_held(values_of(r))).map(|_: Int| WRaw(0))),
+  }
+
+/// A width's `bits` as C holds them in a word cast to the width's type and back: below 64 bits,
+/// extended from the width's top bit where it is signed, else masked to the width.
+fn register_bits(w: Width, bits: Int) -> Int =
+  if w.bits >= 64 { bits } else {
+    let m = bits & (1 << w.bits) - 1;
+    if w.signed && m >= 1 << w.bits - 1 { m - (1 << w.bits) } else { m }
+  }
+
+/// The words of case `i` of a sum laid as `s`, its arguments laid in `payload`, as
+/// `print.made.case_laid` gathers them: the value its test reads, the payload's words where the case
+/// lays them (a box's word where it is boxed), the word that holds its tag in its low bits tagged,
+/// every other word zero.
+fn sum_words(
+  s: SumLaid,
+  i: Int,
+  payload: List<List<StaticWord>>,
+) -> List<StaticWord> / {abort.raise} = {
+  let n = words(LSum(s));
+  let blank = range(0, n).map(|_: Int| WRaw(0));
+  match s.cases.at(i) {
+    None -> panic("a case its sum does not lay"),
+    Some(c) -> {
+      let tagged = |w: StaticWord| match c.test { LowBits(t) -> with_tag(w, t.bits), _ -> w };
+      let tested = match c.test { WordIs(t) -> blank.set(t.at, WRaw(t.value)), _ -> blank };
+      match c.payload {
+        Nullary -> tested,
+        Inline(l) -> {
+          let ws = joined_words(payload);
+          range(0, n).map(|k: Int| {
+            let j = k - l.offset;
+            if j < 0 || j >= ws.len() { tested.get(k) }
+            else if l.stripped == Some(k) { tagged(ws.get(j)) }
+            else { ws.get(j) }
+          })
+        },
+        Boxed(b) -> {
+          let w = match payload.at(0) {
+            Some(p) -> match p.at(0) { Some(x) -> x, None -> WRaw(0) },
+            None -> WRaw(0),
+          };
+          tested.set(b.at, if b.stripped { tagged(w) } else { w })
+        },
+      }
+    },
+  }
+}
+
+/// `w` with a case's tag `bits` in its low bits.
+fn with_tag(w: StaticWord, bits: Int) -> StaticWord / {abort.raise} =
+  if bits == 0 { w } else {
+    match w {
+      WAddress(a) -> WAddress({ ..a, tag: a.tag | bits }),
+      WRaw(x) -> WRaw(x | bits),
+      _ -> panic("a case's tag on a word that is no address"),
+    }
   }
 
 /// The static object literal `l` is, where it is one: a string, a byte string, an embedded file, and
@@ -595,6 +744,56 @@ test "a width wider than a register is the runtime's box of it: its place among 
   // `()` stays the runtime's word.
   let u = folded(root([bind(local(0, b"Unit", RWord), Literal(LUnit))], []));
   assert_eq(bound_values(u.body), [Literal(LUnit)])
+}
+
+test "a box made of what the build knows whole is a static box, its case's place first where it skips one" {
+  let text = local(0, b"String", RWord);
+  let boxed = local(1, b"m.T", RWord);
+  let tagged = local(2, b"m.T", RWord);
+  let word = local(3, b"Int", RWord);
+  let made = |m: Made, args: List<Arg>| Make({ made: m, args: args, reuse: None, kept: [] });
+  let f = folded(
+    root(
+      [
+        bind(text, Literal(LStr(b"a"))),
+        bind(boxed, made(MCase({ case: 1, skip: 0, words: 3 }), [AInt(5), AVar(text), AChar(97)])),
+        bind(tagged, made(MCase({ case: 8, skip: 1, words: 2 }), [AFloat(7), AVar(boxed)])),
+        bind(word, Pack({ arg: AInt(9), to: RWord })),
+      ],
+      [],
+    ),
+  );
+  let a = name_of(SStr(b"a"));
+  let first = named(
+    SBlock({ head: [], words: [WRaw(5), WAddress({ name: a, tag: 0 }), WRaw(97 * 8 + 2)] }),
+  );
+  let second = named(
+    SBlock({ head: [], words: [WRaw(8), WRaw(7), WAddress({ name: first.name, tag: 0 })] }),
+  );
+  // Each box after the statics it addresses; an `Int`'s immediate stays the packing of it.
+  assert_eq(bound_values(f.body), [
+    Static(a),
+    Static(first.name),
+    Static(second.name),
+    Pack({ arg: AInt(9), to: RWord }),
+  ]);
+  assert_eq(f.statics.map(|d: StaticDef| d.name), [a, first.name, second.name]);
+  assert_eq(f.statics.get(2), second);
+  assert_eq(folded(f), f)
+}
+
+test "a box of what the build does not know, or at a type a variable leaves open, is made as it is" {
+  let param = local(0, b"String", RWord);
+  let boxed = local(1, b"m.T", RWord);
+  let open = { id: 2, ty: TyCon({ name: b"Option", args: [TyVar(0)] }), rep: RWord };
+  let made = |m: Made, args: List<Arg>| Make({ made: m, args: args, reuse: None, kept: [] });
+  let body = [
+    bind(boxed, made(MCase({ case: 1, skip: 0, words: 2 }), [AInt(5), AVar(param)])),
+    bind(open, made(MCase({ case: 1, skip: 0, words: 1 }), [AInt(5)])),
+  ];
+  let f = folded({ ..root(body, []), params: [param] });
+  assert_eq(f.body, body);
+  assert_eq(f.statics, [])
 }
 
 fn sum_case(name: Bytes, index: Int, fields: List<Type>, params: List<Int>) -> SumCtor =
