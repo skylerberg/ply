@@ -2006,8 +2006,8 @@ fn kept_body(ctors: Ctors, p: Program, b: Baked) -> Answer / {abort.raise} = {
 /// stands, the emitter entered once for the rest, what it answered kept for the next run, and the
 /// unit produced over all of it. `inputs` holds the bytes of each file `dump` says the program
 /// embeds, by digest. `emitter` is what the emitter's answers are a function of on its
-/// side, which every kept answer is filed under. `Err` says which roots the emitter answered nothing
-/// for, and why where it answered none.
+/// side, which every kept answer is filed under. A root the emitter answers nothing for is refused.
+/// `Err` names the roots whose handings still moved when the rounds ran out.
 /// A root `baked` names is held as that value in place of its body, which the emitter is not asked
 /// for.
 pub fn emitted<| e>(
@@ -2172,46 +2172,36 @@ fn answered_round<| e>(
   else { answers_settled(runtime, dump, p, ctors, kept, published, missed, keys, room) };
   match settled {
     Err(why) -> Err(why),
-    Ok(answered) -> {
-      let unanswered = missed.map(root_name).filter(|n: Bytes| !answered.contains(n));
-      if unanswered.len() > 0 { Err(unanswered_said(unanswered, missed.len())) } else {
-        answered.fold((), |_: Unit, n: Bytes, a: Answer|
-          match materials.get(n) {
-            None -> (),
-            Some(m) -> match a {
-              Body(_) -> write(body_key(m), bin::encode(kept_of(p.keys, a), kept_bin())),
-              Refused(_) -> (),
-            },
-          });
-        repacked(p.keys, buckets, packs, looked, answered).fold((), |_: Unit, r: Repack|
-          write(pack_key(r.names), bin::encode(r.pack, pack_bin())));
-        Ok({
-          answers: answered.fold(kept, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
-            acc.insert(n, a)),
-          keys: keys,
-          kept: kept.len(),
-          asked: missed.len(),
-          added: [],
-        })
-      }
+    Ok(fresh) -> {
+      // A root the emitter answered nothing for is refused as one it declined: it never hides what
+      // was answered of the rest.
+      let answered = missed.fold(fresh, |acc: Map<Bytes, Answer>, k: RootKey|
+        if acc.contains(root_name(k)) { acc }
+        else { acc.insert(root_name(k), Refused({ why: unanswered_why() })) });
+      answered.fold((), |_: Unit, n: Bytes, a: Answer|
+        match materials.get(n) {
+          None -> (),
+          Some(m) -> match a {
+            Body(_) -> write(body_key(m), bin::encode(kept_of(p.keys, a), kept_bin())),
+            Refused(_) -> (),
+          },
+        });
+      repacked(p.keys, buckets, packs, looked, answered).fold((), |_: Unit, r: Repack|
+        write(pack_key(r.names), bin::encode(r.pack, pack_bin())));
+      Ok({
+        answers: answered.fold(kept, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
+          acc.insert(n, a)),
+        keys: keys,
+        kept: kept.len(),
+        asked: missed.len(),
+        added: [],
+      })
     },
   }
 }
 
-/// Why a unit asking the emitter for `asked` roots has no body for each of `unanswered`, which a
-/// build would otherwise meet as a symbol nothing defines.
-fn unanswered_said(unanswered: List<Bytes>, asked: Int) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    b"it answered nothing for ",
-    ascii_of_int(unanswered.len()),
-    b" of the ",
-    ascii_of_int(asked),
-    b" root(s) it was asked for, so no body was emitted for them: ",
-    Bytes::join(unanswered.map(|n: Bytes| Bytes::concat_all([b"`", n, b"`"])), b", "),
-    if unanswered.len() == asked {
-      b"; a module it cannot parse, a package it cannot resolve, or a program its own check refuses"
-    } else { b"" },
-  ])
+/// Why a root is refused that the emitter was asked for and answered nothing for.
+fn unanswered_why() -> Bytes = b"the emitter answered nothing for it"
 
 /// `had` with each root its bodies reach answered too, round after round until none lacks one: a
 /// specialisation a body names, the generic body of each definition a body calls generically,
@@ -2627,7 +2617,7 @@ fn refused_reach(dump: Dump, dropped: List<Dropped>) -> Diag / {abort.raise} = {
   )
 }
 
-fn unanswered(why: Bytes) -> Diag =
+fn unsettled(why: Bytes) -> Diag =
   error_with_labels(
     b"E0450",
     b"the C backend could not be built: the Ply emitter failed over the program: ".concat(why),
@@ -2637,8 +2627,8 @@ fn unanswered(why: Bytes) -> Diag =
     ],
   )
 
-/// The unit's C as the runtime compiles it, or why there is none: an emitter that answered nothing
-/// at all, a native it calls that the runtime does not implement as declared, a call written against
+/// The unit's C as the runtime compiles it, or why there is none: rounds of the emitter's answers
+/// that did not settle, a native it calls that the runtime does not implement as declared, a call written against
 /// a handing its callee does not publish, or a definition the program reaches that the emitter
 /// refused. A definition dropped only because a narrowed offer left its callee out is no refusal of
 /// the program's.
@@ -2648,7 +2638,7 @@ pub fn held(
   emission: Result<Emission, Bytes>,
 ) -> Result<Bytes, List<Diag>> / {abort.raise} =
   match emission {
-    Err(why) -> Err([unanswered(why)]),
+    Err(why) -> Err([unsettled(why)]),
     Ok(e) -> if e.unbound.len() > 0 { Err([natives_refused(e.unbound)]) }
     else if e.misassumed.len() > 0 { Err([handings_disagree(e.misassumed)]) } else {
       let errors = fatal(offered, e.produced.dropped);
@@ -4056,30 +4046,44 @@ fn refusal(r: Result<Bytes, List<Diag>>) -> List<Bytes> =
     Err(diags) -> diags.fold([], |acc: List<Bytes>, d: Diag| acc.push(d.code).concat(d.notes_text)),
   }
 
-test "a unit the emitter answers only some of the roots it asks for names each one it lacks" {
+test "a root the emitter answers nothing for is refused and listed, and the rest are answered and kept" {
   let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
-  let asked = |every: List<Bytes>|
-    match emitted(
-        a_runtime(b"r"),
-        dump,
-        sources_placed(dump, user),
-        Map::new(),
-        every,
-        b"",
-        |_: Bytes| None,
-        |_: Bytes, _: Bytes| (),
-      ) {
-      Ok(_) -> b"",
-      Err(why) -> why,
-    };
-  assert_eq(asked([b"m.one", b"m.two"]), b"");
-  let partly = asked([b"m.one", b"m.absent", b"m.two"]);
-  assert(
-    partly.index_of(b"nothing for 1 of the ") != None && partly.index_of(b"`m.absent`") != None
-      && partly.index_of(b"`m.one`") == None,
-    Some(String::of_bytes_lossy(partly)),
-  )
+  let every = [b"m.one", b"m.absent", b"m.two"];
+  let runtime = { ..a_runtime(b"r"), natives: declared_natives().map(native_of) };
+  kept_bodies(|| {
+    let run = ||
+      match emitted(
+          runtime,
+          dump,
+          sources_placed(dump, user),
+          Map::new(),
+          every,
+          b"",
+          |k: Bytes| body_store.get(k),
+          |k: Bytes, v: Bytes| body_store.put(k, v),
+        ) {
+        Ok(e) -> e,
+        Err(why) -> panic(String::of_bytes_lossy(why)),
+      };
+    let first = run();
+    assert_eq([b"m.one", b"m.two"].filter(|n: Bytes| first.produced.taken.contains(n)), [
+      b"m.one",
+      b"m.two",
+    ]);
+    assert_eq(
+      first.produced.dropped.map(|d: Dropped| { function: d.function, construct: d.construct }),
+      [{ function: b"m.absent", construct: unanswered_why() }],
+    );
+    let said = refusal(held(dump, every, Ok(first)));
+    assert_eq(said.at(0), Some(b"E0448"));
+    assert(
+      said.any(|n: Bytes| n.index_of(b"`m.absent` (".concat(unanswered_why())) != None),
+      Some(String::of_bytes_lossy(Bytes::join(said, b"\n"))),
+    );
+    // What the emitter answered is kept: the next run asks it for the unanswered root alone.
+    assert_eq(run().asked, 1)
+  })
 }
 
 test "a unit is refused where the runtime does not implement a native it calls as declared, and not for one it never calls" {
