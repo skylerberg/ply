@@ -1155,7 +1155,15 @@ fn crossing_loop(
   match item_of(marked) {
     None -> None,
     Some(item) -> if op == b"lower_items" {
-      Some(rooted_at(module, key, [t, int_type()], unit_type(), items_lowered(module, key, item)))
+      Some(
+        rooted_at(
+          module,
+          key,
+          [t, int_type()],
+          unit_type(),
+          items_lowered(module, key, marked, item),
+        ),
+      )
     } else if op == b"lower_entries" {
       Some(rooted_at(module, key, [t, int_type()], unit_type(), entries_lowered(module, key, item)))
     } else if op == b"lift_items" {
@@ -1288,19 +1296,17 @@ fn lowering_code(
       }
     } else if (c.name == b"Array" || c.name == b"Columns") && c.args.len() == 1 {
       // A `Columns` crosses as the array of its records the runtime reads it as.
-      let listed = list_type(c.args.get(0));
       let n = call_at(w, c.name.concat(b"::len"), [a], args_at);
-      let as_list = call_at(n.w, c.name.concat(b"::to_list"), [a], args_at);
-      let items = marked_key(Contained(b"lower_items"), listed, module);
+      let items = marked_key(Contained(b"lower_items"), ty, module);
       {
         code: Ok(
           shared([
             native_call(b"?out_count", [int_code(tag_array()), n.code]),
-            call_of(module, items, [as_list.code, int_code(0)]),
+            call_of(module, items, [a, int_code(0)]),
           ]),
         ),
-        w: as_list.w,
-        here: [def_of(module, items, [plain(listed), int_type()], unit_type())],
+        w: n.w,
+        here: [def_of(module, items, [held, int_type()], unit_type())],
       }
     } else if c.name == b"Map" && c.args.len() == 2 {
       let entries = list_type(
@@ -1588,31 +1594,53 @@ fn record_lifted(
   }
 }
 
-/// `lower_items#List<T>` over its parameters `a` and `i`: each item of `a` from place `i` on
-/// written at the items' type, `item` with its carried places.
+/// `lower_items#C<T>` over its parameters `a` and `i`, `C` a list, an array or columns (the
+/// `container` with its carried places): each item of `a` from place `i` on written at the items'
+/// type, `item` with its carried places.
 fn items_lowered(
   module: Bytes,
   key: RootKey,
+  container: Type,
   item: Type,
 ) -> { code: Result<Code, Bytes>, w: Writing, here: List<Def> } / {abort.raise} = {
   let a = slot_code(b"a", 0);
   let i = slot_code(b"i", 1);
-  let at = call_at(writing(), b"List::at", [a, i], [plain(item)]);
-  let binder = filing(at.w, filed_as(plain(item), []));
-  let part = call_at(binder.w, b"?lower", [slot_code(b"x", 2)], [item]);
-  {
-    code: Ok(
-      some_or(
-        at.code,
-        b"x",
-        2,
-        binder.span,
-        sequence([part.code, call_of(module, key, [a, binary_of(b"add", i, int_code(1))])]),
-        unit_code(),
-      ),
-    ),
-    w: part.w,
-    here: [],
+  let next = call_of(module, key, [a, binary_of(b"add", i, int_code(1))]);
+  match container {
+    // An array's or columns' item is read in place below its length, no list made of it.
+    TyCon(c) -> if c.name == b"Array" || c.name == b"Columns" {
+      let n = call_at(writing(), c.name.concat(b"::len"), [a], [plain(item)]);
+      let got = call_at(n.w, c.name.concat(b"::get"), [a, i], [plain(item)]);
+      let part = call_at(got.w, b"?lower", [slot_code(b"x", 2)], [item]);
+      {
+        code: Ok(
+          bare(
+            NIf({
+              cond: binary_of(b"lt", i, n.code),
+              then_branch: bare(
+                NBlock({
+                  stmts: [CLet({ name: b"x", slot: 2, value: got.code })],
+                  tail: Some(sequence([part.code, next])),
+                }),
+              ),
+              else_branch: unit_code(),
+            }),
+          ),
+        ),
+        w: part.w,
+        here: [],
+      }
+    } else {
+      let at = call_at(writing(), b"List::at", [a, i], [plain(item)]);
+      let binder = filing(at.w, filed_as(plain(item), []));
+      let part = call_at(binder.w, b"?lower", [slot_code(b"x", 2)], [item]);
+      {
+        code: Ok(some_or(at.code, b"x", 2, binder.span, sequence([part.code, next]), unit_code())),
+        w: part.w,
+        here: [],
+      }
+    },
+    _ -> { code: Err(b"a loop over items of no container"), w: writing(), here: [] },
   }
 }
 
@@ -1704,10 +1732,12 @@ fn entries_lifted(
   }
 }
 
-/// What a loop over `ty` walks: a list's items, and for `lift_entries` a map's own type.
+/// What a loop over `ty` walks: a list's, an array's or columns' items, and for `lift_entries` a
+/// map's own type.
 fn item_of(ty: Type) -> Option<Type> =
   match ty {
-    TyCon(c) -> if c.name == b"List" && c.args.len() == 1 { c.args.at(0) }
+    TyCon(c) -> if (c.name == b"List" || c.name == b"Array" || c.name == b"Columns")
+        && c.args.len() == 1 { c.args.at(0) }
     else if c.name == b"Map" && c.args.len() == 2 { Some(ty) }
     else { None },
     _ -> None,
