@@ -18,23 +18,23 @@ import std.value (Value, VList, VInt, VRecord, VStr, VMap)
 import emit.statics (SStr, statics_of)
 import emit.roots (builtin_helper, symbol_of, entry_of, root_id)
 import emit.keys
-import emit.keys (RootKey, Named, At, Written, Entered, FnArg, KeyArg, KeyType, KeyLayout,
-                  root_name, definition_of, sited_as, key_lent, key_types, at_key, module_of,
-                  modules_lowered, key_bytes, root_key_bin)
+import emit.keys (RootKey, Named, At, Written, Test, Cases, Clause, Stored, Entered, Requires,
+                  Ensures, LawGuard, LawBody, FnArg, KeyArg, KeyType, KeyLayout, root_name,
+                  definition_of, sited_as, key_lent, key_types, at_key, module_of, modules_lowered,
+                  key_bytes, root_key_bin, test_key, law_key, entry_name)
 import store.kept (Record, kept_records, with_kept)
 import emit
 import emit (emit_roots_answer)
 import emit.reps (Ctors, laid_vars, has_vars, held_apart, ctor_sums, ctors_of, type_vars,
                   layout_key, no_ctors)
 import front.rows (Dump, EmitterRoot, EmitterCtor, CtorRow, KeyRow, ModuleRow, OrdinalRow,
-                   KnownDefRow)
+                   KnownDefRow, DefRow, SpecRow, TestRow, LawRow)
 import emit.written (CrossedSums, sums_crossed)
 import front.published (Linked, analyse, no_rows, dump_of)
 import front (analyse_pulling_std_with)
 import emit.typing (unknown_type)
 import front.diagnostics (parse_all)
 import check.infer (dump_flag)
-import check.infer.checker (law_root, is_test_owner, cases_root)
 import check.infer.definitions (Extern, prelude_externs, externs_in, module_externs)
 import expand.rewrite (Elaborated, elaborated_natives)
 import emit.layout (Intrinsic, Layouts, intrinsics, layouts)
@@ -55,7 +55,7 @@ import std.random (entropy)
 import std.time (time)
 import syntax.parsing
 import syntax.parsing (no_module)
-import syntax.items (homes_called, homes_declaring)
+import syntax.items (homes_called, homes_declaring, SRequires, SEnsures, spec_kind_text)
 import syntax.exprs (prelude_module)
 import emit.print.counting (int_released_fn, box_released_fn, same_word_fn)
 
@@ -656,14 +656,70 @@ pub fn fatal(offered: List<Bytes>, dropped: List<Dropped>) -> List<Dropped> / {a
   dropped.filter(|d: Dropped| !narrowed.contains(d.function))
 }
 
-/// Whether the runtime enters root `n` of `p`, so the unit takes its entry, `n#entered`: a stored
-/// root, a test's run or the listing of its cases, or a definition `emit.enterable` admits by its
-/// scheme. A law's roots and a root written for a definition (a clause, a requirement) have none.
-fn entered_root(p: Program, n: Bytes) -> Bool / {abort.raise} =
-  if stored_of(n) != None || is_test_owner(n) { true } else if n.ends_with(cases_root(b"")) {
-    is_test_owner(n.slice(0, n.len() - cases_root(b"").len()))
-  } else if n.index_of(b"#") != None { false }
-  else { match p.schemes.get(n) { Some(sc) -> emit::enterable(p.crossing, sc), None -> false } }
+/// Whether the runtime enters root `k` of `p`, so the unit takes its entry: a stored root, a test's
+/// run or the listing of its cases, or a definition `emit.enterable` admits by its scheme. A law's
+/// roots, a clause and a specialisation have none.
+fn entered_root(p: Program, k: RootKey) -> Bool =
+  match k {
+    Stored(_) -> true,
+    Test(_) -> true,
+    Cases(_) -> true,
+    Named(n) -> match p.schemes.get(n) {
+      Some(sc) -> emit::enterable(p.crossing, sc),
+      None -> false,
+    },
+    _ -> false,
+  }
+
+/// The roots a program's answer offers, in the order `Dump.emitter_roots` lists them, each keyed by
+/// what the front end's typed rows say it is, never by reading its name; and the name of each the
+/// rows key none of, which a unit refuses.
+pub type Offers = { keys: List<RootKey>, unkeyed: List<Bytes> }
+
+pub fn offered_roots(dump: Dump) -> Offers / {abort.raise} = {
+  let keyed = rows_keyed(dump);
+  dump.emitter_roots.fold({ keys: [], unkeyed: [] }, |acc: Offers, r: EmitterRoot|
+    match keyed.get(r.root) {
+      Some(k) -> { ..acc, keys: acc.keys.push(k) },
+      None -> { ..acc, unkeyed: acc.unkeyed.push(r.root) },
+    })
+}
+
+/// Each root `dump`'s typed rows say its program may offer, by the name it prints as: a definition
+/// and each `requires` and `ensures` clause it states, a test's run and the listing of its cases,
+/// and a law's guard and body. A test over no cases and a law of no guard key a root no answer
+/// offers.
+fn rows_keyed(dump: Dump) -> Map<Bytes, RootKey> / {abort.raise} = {
+  let keyed = |m: Map<Bytes, RootKey>, k: RootKey| m.insert(root_name(k), k);
+  let defined = dump.defs.fold(Map::new(), |m: Map<Bytes, RootKey>, d: DefRow|
+    d.spec.fold(
+      { m: keyed(m, Named(d.name)), requires: 0, ensures: 0 },
+      |acc: { m: Map<Bytes, RootKey>, requires: Int, ensures: Int }, s: SpecRow|
+        if s.kind == spec_kind_text(SRequires) {
+          {
+            ..acc,
+            m: keyed(acc.m, Clause({ def: Named(d.name), kind: Requires, n: acc.requires })),
+            requires: acc.requires + 1,
+          }
+        } else if s.kind == spec_kind_text(SEnsures) {
+          {
+            ..acc,
+            m: keyed(acc.m, Clause({ def: Named(d.name), kind: Ensures, n: acc.ensures })),
+            ensures: acc.ensures + 1,
+          }
+        } else { acc },
+    ).m);
+  let tested = dump.tests.fold(defined, |m: Map<Bytes, RootKey>, t: TestRow| {
+    let run = test_key(t.module, t.name);
+    keyed(keyed(m, run), Cases(run))
+  });
+  dump.laws.fold(tested, |m: Map<Bytes, RootKey>, l: LawRow|
+    keyed(keyed(m, law_key(l.module, l.name, LawGuard)), law_key(l.module, l.name, LawBody)))
+}
+
+/// Why a unit refuses a root its program's answer offers that no typed row keys.
+fn unkeyed_why(name: Bytes) -> Bytes =
+  Bytes::concat_all([b"the front end offered `", name, b"` with no typed row to key it by"])
 
 // --- The unit's tables ------------------------------------------------------------
 
@@ -1293,7 +1349,7 @@ pub fn produce(
     s.dropped,
     pools,
     stated,
-    offered.filter(|o: Offered| took.contains(root_name(Entered(o.name)))).map(|o: Offered| o.name),
+    offered.filter(|o: Offered| took.contains(entry_name(o.name))).map(|o: Offered| o.name),
   );
   let by_name = taken.fold(Map::new(), |acc: Map<Bytes, Taken>, t: Taken| acc.insert(t.name, t));
   {
@@ -1500,20 +1556,18 @@ fn root_material(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> / 
           },
       ),
     // An entry, and a stored root, is written from what its definition takes and answers.
-    Entered(n) -> match definition_material(program, match stored_of(n) {
-        Some(of) -> of,
-        None -> n,
-      }) {
+    Entered(e) -> match definition_material(
+        program,
+        root_name(match e { Stored(s) -> s, _ -> e }),
+      ) {
       Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
       None -> None,
     },
-    _ -> match stored_of(name) {
-      Some(of) -> match definition_material(program, of) {
-        Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
-        None -> None,
-      },
-      None -> definition_material(program, name),
+    Stored(s) -> match definition_material(program, root_name(s)) {
+      Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
+      None -> None,
     },
+    _ -> definition_material(program, name),
   }
 }
 
@@ -1975,14 +2029,9 @@ pub fn const_room() -> Int = 16777216
 /// names of it.
 pub fn baked_key(hash: Bytes) -> Bytes = b"value\x00".concat(hash)
 
-/// The root that answers the encoding of a `const` definition's value: what a build enters to keep
-/// it.
-pub fn stored_root(name: Bytes) -> Bytes = emit::stored_root(name)
-
-fn stored_of(root: Bytes) -> Option<Bytes> / {abort.raise} = {
-  let suffix = stored_root(b"");
-  if root.ends_with(suffix) { Some(root.slice(0, root.len() - suffix.len())) } else { None }
-}
+/// The name of the root that answers the encoding of the value of the `const` definition `name`,
+/// which a build enters to keep it.
+pub fn stored_root(name: Bytes) -> Bytes = root_name(Stored(Named(name)))
 
 /// A `const` definition as the value a build kept of it, laid out as static data: its body answers
 /// the value from there and calls nothing, so the unit need not hold what the body reaches, and a
@@ -2029,13 +2078,14 @@ fn kept_body(ctors: Ctors, p: Program, b: Baked) -> Answer / {abort.raise} = {
 /// `keep` keeps a batch of them, each batch as the emitter answers it. A root the emitter answers
 /// nothing for is refused. `Err` names the roots whose handings still moved when the rounds ran out.
 /// A root `baked` names is held as that value in place of its body, which the emitter is not asked
-/// for. Each round is told to `phases` as it ends.
+/// for. A root `dump` offers that no typed row keys (`offered_roots`) is refused, whatever `every`
+/// holds. Each round is told to `phases` as it ends.
 pub fn emitted<| e>(
   runtime: Runtime,
   dump: Dump,
   sources: List<Bytes>,
   inputs: Map<Bytes, Bytes>,
-  every: List<Bytes>,
+  every: List<RootKey>,
   read: (Bytes) -> Option<Bytes> / e,
   keep: (List<Record>) -> Unit / e,
   baked: List<Baked> = [],
@@ -2043,11 +2093,13 @@ pub fn emitted<| e>(
 ) -> Result<Emission, Bytes> / {abort.raise | e} = {
   let p = program_of(dump, sources);
   let ctors = dump.emitter_ctors.map(|c: EmitterCtor| { name: c.name, arity: c.arity });
-  let wanted = every.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
+  let wanted = every.fold(Map::new(), |acc: Map<Bytes, Bool>, k: RootKey|
+    acc.insert(root_name(k), true));
   let values = baked.fold(Map::new(), |acc: Map<Bytes, Baked>, b: Baked|
     if wanted.contains(b.name) { acc.insert(b.name, b) } else { acc });
-  let entries = every.filter(|n: Bytes| entered_root(p, n)).map(Entered);
-  let offered = every.filter(|n: Bytes| !values.contains(n)).map(Named).concat(entries);
+  let unkeyed = offered_roots(dump).unkeyed;
+  let entries = every.filter(|k: RootKey| entered_root(p, k)).map(Entered);
+  let offered = every.filter(|k: RootKey| !values.contains(root_name(k))).concat(entries);
   let program = program_ctors(dump, ctors);
   match told_round(phases, 1, ||
       answered_round(runtime, dump, p, ctors, offered, Map::new(), 64, read, keep)) {
@@ -2068,20 +2120,23 @@ pub fn emitted<| e>(
       Ok(all) -> {
         let shared = alike(all.answers, all.keys);
         let unemitted = settled_only(all.answers, all.keys, closed_needs(all.answers, all.keys));
-        let held = values.fold(
-          settled_bodies(
-            generics_settled(all.answers, all.keys, shared, program),
-            all.keys,
-            unemitted,
+        let held = unkeyed.fold(
+          values.fold(
+            settled_bodies(
+              generics_settled(all.answers, all.keys, shared, program),
+              all.keys,
+              unemitted,
+            ),
+            |acc: Map<Bytes, Answer>, n: Bytes, b: Baked| acc.insert(n, kept_body(program, p, b)),
           ),
-          |acc: Map<Bytes, Answer>, n: Bytes, b: Baked| acc.insert(n, kept_body(program, p, b)),
+          |acc: Map<Bytes, Answer>, n: Bytes| acc.insert(n, Refused({ why: unkeyed_why(n) })),
         );
         let produced = produce(
           runtime,
           ctors,
-          every.map(Named).concat(
-            all.added.filter(|k: RootKey| !shared.contains(root_name(k))),
-          ).filter(|k: RootKey| !unemitted.contains(root_name(k))).concat(
+          every.concat(all.added.filter(|k: RootKey| !shared.contains(root_name(k)))).filter(
+            |k: RootKey| !unemitted.contains(root_name(k)),
+          ).concat(
             entries,
           ).map(|k: RootKey|
             match k {
@@ -2097,7 +2152,9 @@ pub fn emitted<| e>(
                   },
                 None -> { name: root_name(k), arity: 0, constant: false, site: sited_as(k) },
               },
-            }),
+            }).concat(
+            unkeyed.map(|n: Bytes| { name: n, arity: 0, constant: false, site: n }),
+          ),
           p.modules.len(),
           held,
           inputs,
@@ -2682,14 +2739,14 @@ fn unsettled(why: Bytes) -> Diag =
 /// the program's.
 pub fn held(
   dump: Dump,
-  offered: List<Bytes>,
+  offered: List<RootKey>,
   emission: Result<Emission, Bytes>,
 ) -> Result<Bytes, List<Diag>> / {abort.raise} =
   match emission {
     Err(why) -> Err([unsettled(why)]),
     Ok(e) -> if e.unbound.len() > 0 { Err([natives_refused(e.unbound)]) }
     else if e.misassumed.len() > 0 { Err([handings_disagree(e.misassumed)]) } else {
-      let errors = fatal(offered, e.produced.dropped);
+      let errors = fatal(offered.map(root_name), e.produced.dropped);
       if errors.len() == 0 { Ok(e.produced.text) } else { Err([refused_reach(dump, errors)]) }
     },
   }
@@ -2976,7 +3033,7 @@ test "a call of a generic tail loop at a type settles on the loop at it, whichev
       dump,
       [source],
       Map::new(),
-      [b"m.go", b"m.back"],
+      [Named(b"m.go"), Named(b"m.back")],
       |_: Bytes| None,
       |_: List<Record>| (),
     ) {
@@ -3252,7 +3309,7 @@ test "a bucket's C reads the same whatever another bucket adds to the unit's tab
 }
 
 test "a root whose entry the unit takes is listed as entered, and one whose entry it dropped is not" {
-  let entry = |n: Bytes| root_name(Entered(n));
+  let entry = |n: Bytes| root_name(Entered(Named(n)));
   let p = produce(
     a_runtime(b"r"),
     [],
@@ -3603,7 +3660,7 @@ fn three_modules_dump() -> Dump / {abort.raise} = {
 test "roots are dealt a module at a time, each once, over no more lists than there are pieces" {
   let dump = three_modules_dump();
   let p = program_of(dump, three_modules());
-  let missed = dump.emitter_roots.map(|r: EmitterRoot| Named(r.root));
+  let missed = offered_roots(dump).keys;
   let lists = dealt(p, missed);
   assert_eq(lists.len(), pieces());
   assert_eq(
@@ -3737,7 +3794,7 @@ test "a body written against a handing that moved is asked for again, with its r
 test "the emitter answers roots dealt over calls as it answers them in one" {
   let dump = three_modules_dump();
   let p = program_of(dump, three_modules());
-  let missed = dump.emitter_roots.map(|r: EmitterRoot| Named(r.root));
+  let missed = offered_roots(dump).keys;
   let runtime = a_runtime(b"r");
   let keys = missed.fold(Map::new(), |m: Map<Bytes, RootKey>, k: RootKey|
     m.insert(root_name(k), k));
@@ -3802,7 +3859,7 @@ test "a unit holds a `const` definition as its kept value laid out as static dat
       ),
     },
   ];
-  let held = k.unit([b"m.table", b"m.row", b"m.names", b"m.first"], kept);
+  let held = k.unit([b"m.table", b"m.row", b"m.names", b"m.first"].map(Named), kept);
   let text = held.produced.text;
   let has = |b: Bytes| text.index_of(b) != None;
   // What a `const` body calls is no part of the unit, and no value is read back from text.
@@ -3830,7 +3887,7 @@ test "a unit holds a `const` definition as its kept value laid out as static dat
   assert(has(b"{ .rc = UINT32_MAX, .kind = 13, .len = 2, .layout = 32 }"), None);
   assert(has(b"{ .rc = UINT32_MAX, .kind = 8, .len = 2, .layout = 0 }"), None);
   // A value for a root the unit does not hold is no part of it.
-  let apart = k.unit([b"m.spread"], kept);
+  let apart = k.unit([Named(b"m.spread")], kept);
   assert_eq(apart.produced.text.index_of(symbol_of(b"m.table")), None)
 }
 
@@ -3838,7 +3895,7 @@ test "a kept value its definition's type does not hold stops the unit, naming th
   let k = kept_unit(b"const fn table() -> List<Int> = [1]\n");
   let stopped = handle {
     let wrong = match value::encode(VStr("x")) { Some(b) -> b, None -> b"" };
-    k.unit([b"m.table"], [{ name: b"m.table", bytes: wrong }]);
+    k.unit([Named(b"m.table")], [{ name: b"m.table", bytes: wrong }]);
     ""
   } with {
     abort.raise(m) -> m,
@@ -3850,7 +3907,8 @@ test "a `const` definition's stored root encodes what its body answers, calling 
   let k = kept_unit(
     b"const fn table() -> { n: Int, s: String } = { n: spread(3), s: \"x\" }\nfn spread(n: Int) -> Int = n + 1\n",
   );
-  let storing = k.unit([b"m.table", b"m.spread", stored_root(b"m.table")], []);
+  let stored = Stored(Named(b"m.table"));
+  let storing = k.unit([Named(b"m.table"), Named(b"m.spread"), stored], []);
   let text = storing.produced.text;
   assert(storing.produced.taken.contains(b"m.table#stored"), None);
   assert(storing.produced.taken.contains(b"m.table#stored#entered"), None);
@@ -3861,7 +3919,7 @@ test "a `const` definition's stored root encodes what its body answers, calling 
   assert_eq(text.index_of(b"rt_constant_p"), None);
   assert_eq(text.index_of(b"rt_stored_p"), None);
   // It needs the definition held.
-  let alone = k.unit([stored_root(b"m.table")], []);
+  let alone = k.unit([stored], []);
   assert_eq(alone.produced.dropped.map(|d: Dropped| d.function), [
     b"m.table#stored",
     b"m.table#stored#entered",
@@ -3873,14 +3931,14 @@ test "a `const` definition's stored root encodes what its body answers, calling 
 /// definitions it names.
 fn kept_unit(
   source: Bytes,
-) -> { unit: (List<Bytes>, List<Baked>) -> Emission / {abort.raise} } / {abort.raise} = {
+) -> { unit: (List<RootKey>, List<Baked>) -> Emission / {abort.raise} } / {abort.raise} = {
   let user = [{ name: b"m", src: source }];
   let shipped = [{ name: b"std.prelude", src: prelude_source::text() }];
   let modules = user.concat(shipped);
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
   let runtime = { ..a_runtime(b"r"), natives: program_natives([]).map(native_of) };
   {
-    unit: |every: List<Bytes>, baked: List<Baked>|
+    unit: |every: List<RootKey>, baked: List<Baked>|
       match emitted(
           runtime,
           dump,
@@ -3914,7 +3972,7 @@ test "no root is asked to give back a scalar's box, which its last count gives b
       dump,
       [source],
       Map::new(),
-      every,
+      every.map(Named),
       |_: Bytes| None,
       |_: List<Record>| (),
       [],
@@ -4007,7 +4065,7 @@ fn held_over(
   natives: List<Native>,
 ) -> Result<Bytes, List<Diag>> / {abort.raise} = {
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
-  let every = dump.emitter_roots.map(|r: EmitterRoot| r.root);
+  let every = offered_roots(dump).keys;
   held(
     dump,
     every,
@@ -4044,7 +4102,7 @@ fn refusal(r: Result<Bytes, List<Diag>>) -> List<Bytes> =
 test "a root the emitter answers nothing for is refused and listed, and the rest are answered and kept" {
   let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
-  let every = [b"m.one", b"m.absent", b"m.two"];
+  let every = [b"m.one", b"m.absent", b"m.two"].map(Named);
   let runtime = { ..a_runtime(b"r"), natives: declared_natives().map(native_of) };
   kept_bodies(|| {
     let run = ||
@@ -4080,6 +4138,81 @@ test "a root the emitter answers nothing for is refused and listed, and the rest
   })
 }
 
+test "each root a program offers is keyed by the row that says what it is, and prints as offered" {
+  let user = [
+    {
+      name: b"m",
+      src: Bytes::concat_all([
+        b"fn f(x: Int) -> Int requires x > 0 ensures result > 0 = x\n",
+        b"test \"t\" for n: Int in [1] { assert(n > 0) }\n",
+        b"law \"l\" forall (x: Int) where x > 0 { x + 1 > x }\n",
+      ]),
+    },
+  ];
+  // What a test over cases reads its table through.
+  let cases = {
+    name: b"std.cases",
+    src: Bytes::concat_all([
+      b"pub type Table<a> = List<a>\n",
+      b"pub type Listed = { label: String, identity: Bytes }\n",
+      b"pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / {abort.raise | e} = table.map(|c: a| { label: label(c), identity: b\"\" })\n",
+      b"pub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a / {abort.raise} = match table.at(at) { Some(c) -> c, None -> panic(\"no case\") }\n",
+    ]),
+  };
+  let dump = dump_of(analyse_pulling_std_with(user, [cases], no_rows()).out);
+  let offers = offered_roots(dump);
+  assert_eq(offers.unkeyed, []);
+  assert_eq(offers.keys.map(root_name), dump.emitter_roots.map(|r: EmitterRoot| r.root));
+  assert_eq(offers.keys.filter(|k: RootKey| module_of(k) == b"m"), [
+    Named(b"m.f"),
+    test_key(b"m", b"t"),
+    Clause({ def: Named(b"m.f"), kind: Requires, n: 0 }),
+    Clause({ def: Named(b"m.f"), kind: Ensures, n: 0 }),
+    Cases(test_key(b"m", b"t")),
+    law_key(b"m", b"l", LawGuard),
+    law_key(b"m", b"l", LawBody),
+  ]);
+  let p = program_of(dump, sources_placed(dump, user.concat([cases])));
+  assert_eq(
+    offers.keys.filter(|k: RootKey| module_of(k) == b"m").filter(|k: RootKey| entered_root(p, k)),
+    [Named(b"m.f"), test_key(b"m", b"t"), Cases(test_key(b"m", b"t"))],
+  )
+}
+
+test "a root the front end offers with no typed row to key it by is refused, and so is what calls it" {
+  let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
+  let whole = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
+  let dump = { ..whole, defs: whole.defs.filter(|d: DefRow| d.name != b"m.one") };
+  let offers = offered_roots(dump);
+  assert_eq(offers.unkeyed, [b"m.one"]);
+  let runtime = { ..a_runtime(b"r"), natives: declared_natives().map(native_of) };
+  match emitted(
+      runtime,
+      dump,
+      sources_placed(dump, user),
+      Map::new(),
+      offers.keys,
+      |_: Bytes| None,
+      |_: List<Record>| (),
+    ) {
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Ok(e) -> {
+      assert_eq(
+        e.produced.dropped.filter(|d: Dropped| d.function == b"m.one").map(|d: Dropped|
+          d.construct),
+        [unkeyed_why(b"m.one")],
+      );
+      assert(e.produced.dropped.any(|d: Dropped| d.function == b"m.two"), None);
+      let said = refusal(held(dump, offers.keys, Ok(e)));
+      assert_eq(said.at(0), Some(b"E0448"));
+      assert(
+        said.any(|n: Bytes| n.index_of(b"`m.two` (") != None),
+        Some(String::of_bytes_lossy(Bytes::join(said, b"\n"))),
+      )
+    },
+  }
+}
+
 test "a unit tells each of its rounds to a build's phases as it ends, numbered from one" {
   let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
@@ -4097,7 +4230,7 @@ test "a unit tells each of its rounds to a build's phases as it ends, numbered f
         dump,
         sources_placed(dump, user),
         Map::new(),
-        [b"m.one", b"m.two"],
+        [Named(b"m.one"), Named(b"m.two")],
         |_: Bytes| None,
         |_: List<Record>| (),
         phases: Some({ now: || 0, told: told }),
@@ -4233,11 +4366,11 @@ test "a law's body over a sort it leaves uninterpreted is lowered as a generic b
   ];
   let dump = dump_of(analyse(parse_all(user)));
   let p = program_of(dump, sources_placed(dump, user));
-  let root = law_root(b"m", b"identity is identity", b"body");
+  let root = law_key(b"m", b"identity is identity", LawBody);
   assert_eq(
-    emitter_answers(a_runtime(b"r"), dump, p, [], [Named(root)], []).map(|r: RootAnswer|
+    emitter_answers(a_runtime(b"r"), dump, p, [], [root], []).map(|r: RootAnswer|
       match r.answer { Body(_) -> r.name, Refused(no) -> no.why }),
-    [root],
+    [root_name(root)],
   )
 }
 
@@ -4254,7 +4387,7 @@ test "a root the emitter refuses is asked again, and nothing of the refusal is k
           dump,
           [source],
           Map::new(),
-          [b"m.f"],
+          [Named(b"m.f")],
           |k: Bytes| body_store.get(k),
           |rs: List<Record>| body_store.put(rs),
         ) {
@@ -4280,7 +4413,7 @@ test "a unit asks the emitter for a root a kept body names, though the body's de
           dump_of(analyse(parse_all([{ name: b"m", src: source }]))),
           [source],
           Map::new(),
-          [b"m.each", b"m.total", b"m.scaled"],
+          [b"m.each", b"m.total", b"m.scaled"].map(Named),
           |k: Bytes| body_store.get(k),
           |rs: List<Record>| body_store.put(rs),
         ) {
@@ -4353,7 +4486,7 @@ fn unit_kept<[r]>(
         dump,
         sources_placed(dump, user),
         Map::new(),
-        dump.emitter_roots.map(|x: EmitterRoot| x.root),
+        offered_roots(dump).keys,
         |k: Bytes| kept_records.get[ans](k),
         |rs: List<Record>| kept_records.put[ans](rs),
         phases: Some({ now: || 0, told: told }),
@@ -4618,7 +4751,7 @@ test "a read of a definition of no parameters keeps its value for good through i
       b"fn nothing() -> Option<Int> = none()\n",
     ]),
   );
-  let held = k.unit([b"m.flag", b"m.word", b"m.none", b"m.read", b"m.nothing"], []);
+  let held = k.unit([b"m.flag", b"m.word", b"m.none", b"m.read", b"m.nothing"].map(Named), []);
   let text = held.produced.text;
   let read_with = |keep: Bytes| text.index_of(Bytes::concat_all([b", ", keep, b")"])) != None;
   assert_eq(text.index_of(b"rt_constant_p"), None);

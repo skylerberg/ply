@@ -10,7 +10,8 @@ import emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, N
                   CodePatternField, Capture, PxCtor, PxRecord, PxList, lower_fn)
 import check.types (Scheme, TyFn, TyVar, scheme_text, int_type, unit_type, type_at, HeldType,
                     held_type_bin, types_held, types_of)
-import check.resolve.tables (Source, ParsedModule, Diag, Resolved, ValueSpace, qualify)
+import check.resolve.tables (Source, ParsedModule, Diag, Resolved, ValueSpace, qualify,
+                             module_of_name)
 import check.resolve (ResolveSucceeded, ResolveFailed)
 import check.resolve.scopes (find)
 import check.resolve.defaults (seeing_all)
@@ -24,8 +25,9 @@ import check.infer (CheckOutput, RootFacts, types_joined, facts_at, no_root_fact
                     Elaboration)
 import check.infer.checker (DefInfo, TestInfo, KeptFacts, Walks, Every, WitnessOrder, LabelSite,
                             TypedSite, TrySite, MemberSite, UpdateShape, WitnessOp, WitnessRef,
-                            test_owner, is_test_owner, cases_root, witnessed, Builtin, builtins)
+                            witnessed, Builtin, builtins)
 import check.infer.definitions (natives_of)
+import emit.keys (test_owner, test_key)
 import check.termination (Ends)
 import check.semantics (prelude_iterates)
 import check.lent (Passed)
@@ -102,26 +104,6 @@ pub type Wanted = { roots: Map<Bytes, Bool>, modules: Map<Bytes, Bool> }
 
 pub fn lowers(lowered: Option<Map<Bytes, Bool>>, module: Bytes) -> Bool =
   match lowered { None -> true, Some(m) -> m.contains(module) }
-
-/// A clause's, test's or law's root is its owner's name then `#`, a specialisation's its
-/// definition's then `@`, and a generic sum's comparison its type's then `<`; a module is a name
-/// less its last segment. A root written for a type does not spell its module so;
-/// `emit.keys.module_of` reads that from its key.
-pub fn module_of_root(root: Bytes) -> Bytes / {abort.raise} = {
-  let owner = owner_of_root(root);
-  let dot = range(0, owner.len()).fold(0 - 1, |acc: Int, i: Int|
-    if owner.at(i) == 46 { i } else { acc });
-  if dot < 0 { b"" } else { owner.slice(0, dot) }
-}
-
-/// The name a root is of: a definition's own, or that of the definition, test, law or type whose
-/// clause, specialisation or comparison it is.
-fn owner_of_root(root: Bytes) -> Bytes / {abort.raise} =
-  root.slice(
-    0,
-    [b"#", b"@", b"<"].fold(root.len(), |at: Int, mark: Bytes|
-      match root.index_of(mark) { Some(i) -> if i < at { i } else { at }, None -> at }),
-  )
 
 type Gathered = { facts: RootFacts, missing: Option<Bytes> }
 
@@ -200,15 +182,6 @@ pub fn facts_read(
   );
   let roots = match wanted { None -> None, Some(x) -> Some(x.roots) };
   let lowered = match wanted { None -> None, Some(x) -> Some(x.modules) };
-  // A definition's facts are its clauses' and its specialisations' too.
-  let defined = match roots {
-    None -> None,
-    Some(r) ->
-      Some(
-        r.fold(r, |acc: Map<Bytes, Bool>, root: Bytes, _: Bool|
-          acc.insert(owner_of_root(root), true)),
-      ),
-  };
   let read = range(0, mods.len()).fold({ facts: loose, missing: None }, |g: Gathered, i: Int| {
     let m = mods.get(i);
     if !lowers(lowered, m.name) { g } else {
@@ -216,13 +189,11 @@ pub fn facts_read(
         match item {
           IFn(d) -> {
             let owner = qualify(m.name, d.name.name);
-            if !wants(defined, owner) { acc } else { gathered(acc, owner, defs.get(owner), i) }
+            if !wants(roots, owner) { acc } else { gathered(acc, owner, defs.get(owner), i) }
           },
           ITest(d) -> {
             let owner = test_owner(m.name, d.name);
-            let listed = d.cases != None && wants(roots, cases_root(owner));
-            if !wants(roots, owner) && !listed { acc }
-            else { gathered(acc, owner, tests.get(owner), i) }
+            if !wants(roots, owner) { acc } else { gathered(acc, owner, tests.get(owner), i) }
           },
           _ -> acc,
         })
@@ -618,7 +589,7 @@ fn prelude_cut(
   parsed: List<ParsedSource>,
   h: Hashed,
 ) -> Option<List<ParsedSource>> / {abort.raise} = {
-  let own = |name: Bytes| module_of_root(name) == prelude_module();
+  let own = |name: Bytes| module_of_name(name) == prelude_module();
   let roots = h.hashes.defs.fold([], |acc: List<Which>, d: { name: Bytes, hash: Bytes }|
     if own(d.name) { acc } else { acc.push(TheFn(d.name)) }).concat(
     h.index.nodes.fold([], |acc: List<Which>, n: Node|
@@ -1490,15 +1461,16 @@ test "a test's root is named by its module and its label, in the program's test 
       ]),
     ),
   );
-  assert_eq(d.emitter_roots.map(|r: EmitterRoot| r.root).filter(is_test_owner), [
+  let tested = d.tests.map(|t: TestRow| test_owner(t.module, t.name));
+  assert_eq(d.emitter_roots.map(|r: EmitterRoot| r.root).filter(|r: Bytes| tested.contains(r)), [
     test_owner(b"a", b"first"),
     test_owner(b"a", b"second"),
     test_owner(b"b", b"third"),
   ]);
   assert_eq(range(0, 4).map(|i: Int| test_root_at(d, i)), [
-    Some(test_owner(b"a", b"first")),
-    Some(test_owner(b"a", b"second")),
-    Some(test_owner(b"b", b"third")),
+    Some(test_key(b"a", b"first")),
+    Some(test_key(b"a", b"second")),
+    Some(test_key(b"b", b"third")),
     None,
   ]);
   assert_eq(d.tests.map(|t: TestRow| Bytes::concat_all([t.module, b".", t.name])), [
@@ -1584,7 +1556,7 @@ test "a function `std.prelude` writes in Ply is checked at the scheme its caller
       // The prelude's loops read `List::at` answering `Some` as any module does, so each ends.
       assert_eq(
         w.checked.defs.filter(|d: DefInfo|
-          module_of_root(d.name) == prelude_module() && d.ending != Ends).map(|d: DefInfo| d.name),
+          module_of_name(d.name) == prelude_module() && d.ending != Ends).map(|d: DefInfo| d.name),
         [],
       )
     },

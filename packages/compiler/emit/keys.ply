@@ -1,25 +1,40 @@
-//! Roots by value. A root is keyed by what it is, a definition, a definition at type arguments, or
-//! an operation written for a type, and its name is printed from the key, never read back into one.
+//! Roots by value. A root is keyed by what it is: a definition, one at type arguments, an operation
+//! written for a type, a test, a law, a clause, a stored value or an entry. Its name is printed from
+//! the key, never read back into one.
 
 import check.types (Type, TyCon, spelled_type, type_bin)
-import check.resolve.tables (qualify)
-import front.published (module_of_root)
+import check.resolve.tables (qualify, module_of_name)
 import std.bin
 import std.bytes (ascii_of_int)
+import std.hash (blake3)
 
-/// A root. `Named` is one the front end names: a definition, a test, a law or a clause. `At` is a
-/// definition at type arguments, running in place the lambdas `lent` names where it calls the
-/// parameters they are handed as. `Written` is an operation written for a type, in the module that
-/// declares the type where its name is qualified, and otherwise in `home`, the module asking; its
-/// `marks` are the places in `ty` (0 `ty` itself, then each argument's subtree in order) that stand
-/// for an operation's own type parameter, which a crossing hands over as a handle.
-/// `Entered` is the entry the runtime enters a named root through, its arguments and answer
-/// crossing as machine data.
+/// A root. `Named` is a definition, by its qualified name. `At` is a definition at type arguments,
+/// running in place the lambdas `lent` names where it calls the parameters they are handed as.
+/// `Written` is an operation written for a type, in the module that declares the type where its name
+/// is qualified, and otherwise in `home`, the module asking; its `marks` are the places in `ty` (0
+/// `ty` itself, then each argument's subtree in order) that stand for an operation's own type
+/// parameter, which a crossing hands over as a handle. `Test` is a test's run and `Cases` the root
+/// listing a test's cases; `Law` is a law's guard or body. A test and a law are told apart in their
+/// module by `digest`, their label's as `label_digest` gives it. `Clause` is the `n`th clause of its
+/// kind that definition `def` states. `Stored` is the root a build enters to keep the value of a
+/// `const` definition. `Entered` is the entry the runtime enters a root through, its arguments and
+/// answer crossing as machine data.
 pub type RootKey =
   | Named(Bytes)
   | At({ def: Bytes, args: List<KeyArg>, lent: List<FnArg> })
   | Written({ op: TypeOp, ty: Type, home: Bytes, marks: List<Int> })
-  | Entered(Bytes)
+  | Test({ module: Bytes, digest: Bytes })
+  | Cases(RootKey)
+  | Law({ module: Bytes, digest: Bytes, part: LawPart })
+  | Clause({ def: RootKey, kind: ClauseKind, n: Int })
+  | Stored(RootKey)
+  | Entered(RootKey)
+
+/// A root of a law: its guard, or its body, the proposition the law states.
+pub type LawPart = | LawGuard | LawBody
+
+/// What a clause states of a definition: what it requires of a call, or ensures of what it answers.
+pub type ClauseKind = | Requires | Ensures
 
 /// A type argument a specialisation is keyed by: the type itself, where the body reads which type
 /// it is; or only the layout it is read at, `key` as `reps.layout_key` spells it, and `at` a type
@@ -63,6 +78,8 @@ pub type Callee = | Root(RootKey) | Generic(Int)
 derive bin for KeyArg
 derive bin for TypeOp
 derive bin for FnArg
+derive bin for LawPart
+derive bin for ClauseKind
 derive bin for RootKey
 
 /// The bytes a key is kept and looked up by: its encoding, which is only ever compared or decoded.
@@ -71,8 +88,11 @@ pub fn key_bytes(k: RootKey) -> Bytes / {abort.raise} = bin::encode(k, root_key_
 /// The name `k` prints as. A definition's own name; a specialisation's spells its type arguments and
 /// lent lambdas after an `@` (`m.f@Int,?|1=m.g:0`); a written root its operation and type after a
 /// `#` (`m.Shape#eq`, `m.equal#List<Int>`, `geo.reflect#geo.Shape`), the type followed by its marks
-/// after a `^` where it has any (`m.lower#m.Box<Int>^1`). Symbols and site ids are made from it, so it
-/// is the spelling roots had before they were keys.
+/// after a `^` where it has any (`m.lower#m.Box<Int>^1`). A test's is `m.test#` and its digest, its
+/// listing's that then `.cases`; a law's part is `m.law#`, its digest, a dot and the part; a clause
+/// follows its definition's name with `#`, its kind, `#` and its place (`m.f#requires#0`); a stored
+/// root and an entry follow their root's name with `#stored` and `#entered`. Symbols and site ids
+/// are made from it, so it is the spelling roots had before they were keys.
 pub fn root_name(k: RootKey) -> Bytes =
   match k {
     Named(n) -> n,
@@ -108,8 +128,51 @@ pub fn root_name(k: RootKey) -> Bytes =
         _ -> qualify(type_module(w.ty, w.home), Bytes::concat_all([op_name(w.op), b"#", ty])),
       }
     },
-    Entered(n) -> n.concat(b"#entered"),
+    Test(t) -> labelled(t.module, b"test", t.digest),
+    Cases(c) -> root_name(c).concat(b".cases"),
+    Law(l) -> Bytes::concat_all([labelled(l.module, b"law", l.digest), b".", part_word(l.part)]),
+    Clause(c) ->
+      Bytes::concat_all([
+        root_name(c.def),
+        b"#",
+        match c.kind { Requires -> b"requires", Ensures -> b"ensures" },
+        b"#",
+        ascii_of_int(c.n),
+      ]),
+    Stored(s) -> root_name(s).concat(b"#stored"),
+    Entered(e) -> entry_name(root_name(e)),
   }
+
+/// The name of the entry of the root named `root`, as `Entered` prints.
+pub fn entry_name(root: Bytes) -> Bytes = root.concat(b"#entered")
+
+/// The word a law's part is named by after its law's name.
+pub fn part_word(p: LawPart) -> Bytes = match p { LawGuard -> b"guard", LawBody -> b"body" }
+
+fn labelled(module: Bytes, kind: Bytes, digest: Bytes) -> Bytes =
+  qualify(module, Bytes::concat_all([kind, b"#", digest]))
+
+/// What a test or a law is told apart by in its module, whose tests (E0105) and laws share no label:
+/// the first eight bytes of its label's digest, in hex.
+pub fn label_digest(label: Bytes) -> Bytes / {abort.raise} =
+  Bytes::of_string(blake3(label).slice(0, 8).hex_of())
+
+/// The run of the test of `module` labelled `label`.
+pub fn test_key(module: Bytes, label: Bytes) -> RootKey / {abort.raise} =
+  Test({ module: module, digest: label_digest(label) })
+
+/// Part `part` of the law of `module` labelled `label`.
+pub fn law_key(module: Bytes, label: Bytes, part: LawPart) -> RootKey / {abort.raise} =
+  Law({ module: module, digest: label_digest(label), part: part })
+
+/// The name a test's sites go by, and what the checker files them under: its run's root's.
+pub fn test_owner(module: Bytes, label: Bytes) -> Bytes / {abort.raise} =
+  root_name(test_key(module, label))
+
+/// The name the sites of the law of `module` labelled `label` go by, which each of its roots' names
+/// follows with its part.
+pub fn law_owner(module: Bytes, label: Bytes) -> Bytes / {abort.raise} =
+  labelled(module, b"law", label_digest(label))
 
 /// The word an operation is written under in its root's name: a case's, its operation's and the
 /// case's place after a dot, which no other's holds.
@@ -133,13 +196,19 @@ pub fn op_name(op: TypeOp) -> Bytes =
     Worded(o) -> b"word_".concat(op_name(o)),
   }
 
-/// The module a root's body is written in: its definition's, or where a written root says.
-pub fn module_of(k: RootKey) -> Bytes / {abort.raise} =
+/// The module a root's body is written in: its definition's, test's or law's, or where a written
+/// root says.
+pub fn module_of(k: RootKey) -> Bytes =
   match k {
-    Named(n) -> module_of_root(n),
-    At(a) -> module_of_root(a.def),
+    Named(n) -> module_of_name(n),
+    At(a) -> module_of_name(a.def),
     Written(w) -> type_module(w.ty, w.home),
-    Entered(n) -> module_of_root(n),
+    Test(t) -> t.module,
+    Cases(c) -> module_of(c),
+    Law(l) -> l.module,
+    Clause(c) -> module_of(c.def),
+    Stored(s) -> module_of(s),
+    Entered(e) -> module_of(e),
   }
 
 /// The modules the roots `ks` are lowered in: each root's own, and that of each root whose lambdas
@@ -153,21 +222,21 @@ pub fn modules_lowered(ks: List<RootKey>) -> Map<Bytes, Bool> / {abort.raise} =
 fn type_module(ty: Type, otherwise: Bytes) -> Bytes =
   match ty {
     TyCon(c) -> {
-      let dot = range(0, c.name.len()).fold(0 - 1, |acc: Int, i: Int|
-        if c.name.peek(i) == 46 { i } else { acc });
-      if dot < 0 { otherwise }
-      else { match c.name.slice_at(0, dot) { Some(m) -> m, None -> otherwise } }
+      let m = module_of_name(c.name);
+      if m.len() == 0 { otherwise } else { m }
     },
     _ -> otherwise,
   }
 
-/// The definition a root runs: its own, or the one it specialises.
+/// The definition a root runs: its own, the one it specialises, or the one an entry enters; none
+/// for any other root.
 pub fn definition_of(k: RootKey) -> Option<Bytes> =
-  match k { Named(n) -> Some(n), At(a) -> Some(a.def), Written(_) -> None, Entered(n) -> Some(n) }
+  match k { Named(n) -> Some(n), At(a) -> Some(a.def), Entered(e) -> definition_of(e), _ -> None }
 
 /// The root whose text a root's failure sites count from, as the unit names it: its definition's,
-/// or a written root's own.
-pub fn sited_as(k: RootKey) -> Bytes = match definition_of(k) { Some(d) -> d, None -> root_name(k) }
+/// an entry's root's, or any other root's own.
+pub fn sited_as(k: RootKey) -> Bytes =
+  match k { Named(n) -> n, At(a) -> a.def, Entered(e) -> sited_as(e), _ -> root_name(k) }
 
 /// The type arguments a root is lowered at: a specialisation's, a layout's representative type for
 /// one keyed by a layout; none for any other root.
@@ -238,12 +307,69 @@ test "a key prints as the name roots were spelled with before they were keys" {
     ),
     b"geo.reflect#geo.Shape",
   );
-  assert_eq(root_name(Entered(b"m.main")), b"m.main#entered")
+  assert_eq(root_name(Entered(Named(b"m.main"))), b"m.main#entered");
+  let run = test_key(b"m", b"holds");
+  assert_eq(root_name(run), b"m.test#".concat(label_digest(b"holds")));
+  assert_eq(root_name(Cases(run)), root_name(run).concat(b".cases"));
+  assert_eq(
+    root_name(law_key(b"m", b"holds", LawBody)),
+    law_owner(b"m", b"holds").concat(b".body"),
+  );
+  assert_eq(root_name(Clause({ def: Named(b"m.f"), kind: Ensures, n: 1 })), b"m.f#ensures#1");
+  assert_eq(root_name(Entered(Stored(Named(b"m.t")))), b"m.t#stored#entered")
+}
+
+test "a test's and a law's roots are told apart by kind and label, and each prints apart" {
+  let keys = [
+    test_key(b"m", b"one"),
+    test_key(b"m", b"two"),
+    Cases(test_key(b"m", b"one")),
+    law_key(b"m", b"one", LawGuard),
+    law_key(b"m", b"one", LawBody),
+    Clause({ def: Named(b"m.f"), kind: Requires, n: 0 }),
+    Clause({ def: Named(b"m.f"), kind: Ensures, n: 0 }),
+    Stored(Named(b"m.f")),
+    Named(b"m.f"),
+  ];
+  assert_eq(label_digest(b"one").len(), 16);
+  assert_eq(
+    keys.map(root_name).fold([], |seen: List<Bytes>, n: Bytes|
+      if seen.contains(n) { seen } else { seen.push(n) }).len(
+    ),
+    keys.len(),
+  );
+  assert_eq(keys.map(definition_of), [
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some(b"m.f"),
+  ]);
+  assert_eq(definition_of(Entered(Named(b"m.f"))), Some(b"m.f"));
+  assert_eq(sited_as(Entered(test_key(b"m", b"one"))), test_owner(b"m", b"one"))
 }
 
 test "a root's module is read off its key, never off its name" {
   let shape = TyCon({ name: b"geo.Shape", args: [] });
   assert_eq(module_of(Named(b"app.cli.main")), b"app.cli");
+  assert_eq(
+    [
+      test_key(b"app.cli", b"a.b c"),
+      Cases(test_key(b"app.cli", b"x.y")),
+      law_key(b"app.cli", b"x.y", LawBody),
+      Clause({ def: Named(b"app.cli.main"), kind: Requires, n: 0 }),
+      Stored(Named(b"app.cli.table")),
+      Entered(test_key(b"app.cli", b"a.b c")),
+    ].map(
+      module_of,
+    ),
+    [b"app.cli", b"app.cli", b"app.cli", b"app.cli", b"app.cli", b"app.cli"],
+  );
+  assert_eq([module_of(test_key(b"", b"t")), module_of(Named(b"main"))], [b"", b""]);
   assert_eq(
     module_of(
       At({ def: b"lib.h", args: [], lent: [{ param: 0, owner: Named(b"app.g"), nth: 1 }] }),
