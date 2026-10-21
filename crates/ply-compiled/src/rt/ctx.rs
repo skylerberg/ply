@@ -60,6 +60,8 @@ pub struct Ctx {
     pub(crate) current: usize,
     /// Every atom a compiled `perform` performed since the entry began, for the machine's trace.
     pub performed: Vec<EffectAtom>,
+    /// The marks [`rt_cost_mark`] took that no [`rt_cost_spent`] has read back yet, the latest last.
+    pub(crate) cost_marks: Vec<CostMark>,
     /// The regions live in this entry, innermost last; the checker forbids nesting, so at most one.
     pub sims: Vec<crate::simulate::Simulation>,
     /// The detached bodies this entry has opened, named by index from their frames and tokens.
@@ -166,6 +168,7 @@ impl Ctx {
             free_stacks: Vec::new(),
             current: 0,
             performed: Vec::new(),
+            cost_marks: Vec::new(),
             sims: Vec::new(),
             detached: Vec::new(),
             starting_detached: None,
@@ -384,6 +387,7 @@ impl Ctx {
         self.free_stacks.clear();
         self.current = 0;
         self.performed.clear();
+        self.cost_marks.clear();
         self.sims.clear();
         self.starting_detached = None;
         self.trail = ply_core::region::Trail::new(self.seed.clone());
