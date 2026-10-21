@@ -25,6 +25,8 @@ pub struct Native {
     /// is this unit's own, which is all that makes the lifetime true.
     unit: &'static Descriptor,
     constants: HashMap<String, usize>,
+    /// Each root the unit is entered at through its `R#entered`, with that definition's entry.
+    entered: HashMap<String, Entry>,
     tables: Arc<Tables>,
 }
 
@@ -47,6 +49,23 @@ impl Native {
 
     pub fn arity(&self, name: &str) -> Option<usize> {
         self.unit.taking(name).map(TakenRow::arity)
+    }
+
+    /// Whether the unit is entered through its roots' `R#entered`, its arguments and answer
+    /// crossing encoded, rather than with words.
+    pub fn encoded(&self) -> bool {
+        !self.entered.is_empty()
+    }
+
+    /// The entry of `R#entered` for the root `name`, which takes no words.
+    pub fn entered(&self, name: &str) -> Option<Entry> {
+        self.entered.get(name).copied()
+    }
+
+    /// Whether the root `name` can be entered: any root of a unit entered with words, and of one
+    /// entered encoded each that has its `R#entered`.
+    pub fn enterable(&self, name: &str) -> bool {
+        !self.encoded() || self.entered.contains_key(name)
     }
 
     /// The memo index of a pure nullary root, if `name` is one.
@@ -131,7 +150,24 @@ fn finish(
         instances,
         numerics,
         layout,
+        entered,
     } = exports;
+    let entered = entered
+        .into_iter()
+        .map(|root| {
+            let through = format!("{root}#entered");
+            match unit.taking(&through) {
+                Some(row) if row.arity() == 0 => Ok((root, entry_of(row))),
+                Some(row) => bail!(
+                    "`{through}` takes {} words, where `{root}` is entered through it with none",
+                    row.arity()
+                ),
+                None => {
+                    bail!("`{root}` is entered through `{through}`, which the unit does not take")
+                }
+            }
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
     bind(unit, &helpers);
     let Some(held) = UnitTables::from_tables(ctors, consts, fields, builtins, &shapes, layout)
     else {
@@ -191,6 +227,7 @@ fn finish(
         _lib: lib,
         unit,
         constants: constants.into_iter().collect(),
+        entered,
         tables: Arc::new(tables),
     })
 }

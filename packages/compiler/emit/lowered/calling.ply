@@ -13,7 +13,7 @@ import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSlice, Var, Arg, AVar,
                  Return, Sited, Block, Fn, Member, Closure, Declined, Family, Spine, Data, Calling,
                  Matching, Handling, Scalars, Containers, RNum, TInt, TRange, Convention, Lambda,
                  rep_of_arg)
-import emit.tir.calling (EntryValue, ConstantRead, Ticked)
+import emit.tir.calling (ConstantRead, Ticked)
 import emit.lower (lowered_fn, lowered_group)
 import emit.lower.base (GroupMember)
 import emit.lower.calling (known_body, lambdas_of, context_of)
@@ -97,6 +97,7 @@ fn corpus() -> Bytes =
     b"type Hue = | Red | Green | Blue\n",
     b"fn hue_next(h: Hue) -> Hue = match h { Red -> Green, Green -> Blue, Blue -> Red }\n",
     b"fn hue_twice(h: Hue) -> Hue = hue_next(hue_next(h))\n",
+    b"fn some_of() -> (Int) -> Option<Int> = Some\n",
   ])
 
 fn names() -> List<Bytes> =
@@ -169,6 +170,7 @@ fn names() -> List<Bytes> =
     b"wide_applied",
     b"hue_next",
     b"hue_twice",
+    b"some_of",
   ]
 
 /// The corpus's tail groups, each by its members' names.
@@ -404,23 +406,44 @@ test "a lambda is a closure of a function of its own taking its captures as word
   }
 }
 
-test "a closure called by its type through its last reference hands its captures over, as the runtime's call does" {
+test "a closure is a block of its own, its descriptor first, whose entries lend its captures and whose release lets each go" {
   match form(b"adder") {
     Err(why) -> assert_eq(why, b""),
     Ok(f) -> {
       let text = printed_text(f);
-      // Counted once more, a capture a call appends to would be copied on every call.
-      assert(
-        text.index_of(b"_typed(PlyCtx *ctx, Word self") != None,
-        Some(String::of_bytes_lossy(text)),
+      let name = symbol_of(b"m.adder").concat(b"_lambda0");
+      let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
+      has(b" = rt_alloc_bytes_p(ctx, 32); ply_words(");
+      has(Bytes::concat_all([b")[0] = (Word)(intptr_t)&", name, b"_desc; ply_words("]));
+      // The captures are read where the block holds them, the block lent for the call.
+      has(
+        Bytes::concat_all([
+          b"_typed(PlyCtx *ctx, Word self, int64_t p0) {\n  return ",
+          name,
+          b"(ctx, ply_words(self)[1], p0);\n}\n",
+        ]),
       );
-      assert(
-        text.index_of(
-            b"  int unique = ply_obj(self)->rc == 1;\n  Word c0 = ply_words(self)[2]; if (unique) ply_words(self)[2] = ply_unit; else ply_inc(c0);\n",
-          )
-          != None,
-        Some(String::of_bytes_lossy(text)),
-      )
+      has(name.concat(b"_uniform(PlyCtx *ctx, Word self, const Word *args) {\n"));
+      // The captured `Int`'s word is let go of as an `Int`'s, then the block's three words given back.
+      has(
+        Bytes::concat_all([
+          name,
+          b"_release(PlyCtx *ctx, Word self) {\n  ply_rel_int(ctx, ply_words(self)[1], ",
+        ]),
+      );
+      has(b"  ply_free(ctx, self, 32);\n  return 0;\n}\n");
+      has(
+        Bytes::concat_all([
+          b"const PlyFnDesc ",
+          name,
+          b"_desc = { ",
+          name,
+          b"_uniform, (void (*)(void))",
+          name,
+          b"_typed, ",
+        ]),
+      );
+      assert(text.index_of(b"PlyFnBlock ") == None, Some(String::of_bytes_lossy(text)))
     },
   }
 }
@@ -449,19 +472,49 @@ test "a lambda a lambda writes is the root's next closure, numbered in the order
   }
 }
 
-test "a definition named as a value is the unit's closure over its entry, and a pure one of no parameters is read once" {
+test "a definition or a constructor named as a value is the closure of a lambda around it, and a pure definition of no parameters is read once" {
+  let made = |f: Fn|
+    vals_in(f.body).fold([], |acc: List<{ captures: Int, params: Int }>, v: Val|
+      match v {
+        Make(m) -> match m.made {
+          MClosure(c) -> acc.push({ captures: c.captures, params: c.params }),
+          _ -> acc,
+        },
+        _ -> acc,
+      });
   match form(b"named") {
     Err(why) -> assert_eq(why, b""),
-    Ok(f) ->
-      assert_eq(
-        vals_in(f.body).filter(|v: Val|
-          match v {
-            Op(o) -> o.op == OCalling(EntryValue({ callee: Root(Named(b"m.add")), arity: 2 })),
-            _ -> false,
-          }).len(
-        ),
-        1,
-      ),
+    Ok(f) -> {
+      assert_eq(made(f), [{ captures: 0, params: 2 }]);
+      match closure_of(f, 0) {
+        None -> assert(false, Some("named makes no closure")),
+        Some(c) -> {
+          assert_eq(c.body.conv.reps, [RInt, RInt]);
+          assert_eq(
+            vals_in(c.body.body).filter(|v: Val|
+              match v { Call(k) -> k.callee == Root(Named(b"m.add")), _ -> false }).len(
+            ),
+            1,
+          )
+        },
+      }
+    },
+  };
+  match form(b"some_of") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(made(f), [{ captures: 0, params: 1 }]);
+      match closure_of(f, 0) {
+        None -> assert(false, Some("some_of makes no closure")),
+        Some(c) ->
+          assert_eq(
+            vals_in(c.body.body).filter(|v: Val|
+              match v { Call(_) -> true, Apply(_) -> true, _ -> false }).len(
+            ),
+            0,
+          ),
+      }
+    },
   };
   match form(b"read_kept") {
     Err(why) -> assert_eq(why, b""),

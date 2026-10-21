@@ -2,10 +2,10 @@
 //! natives: written as the codec writes them, read back part by part, and crossings begun inside
 //! others leaving the outer as they found it.
 
-use crate::bare::{context, helper};
+use crate::bare::{context, context_calling, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Carried, Handed, PlyType};
-use ply_compiled::heap::Word;
+use ply_compiled::heap::{Heap, Word};
 use ply_compiled::native::Answered;
 use ply_compiled::rt::Ctx;
 use ply_core::codec::{decode, encode, tag};
@@ -19,6 +19,7 @@ type A1 = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type N2 = unsafe extern "C" fn(*mut Ctx, Word, Word);
 type A2 = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
 type N3 = unsafe extern "C" fn(*mut Ctx, Word, Word, Word);
+type A3 = unsafe extern "C" fn(*mut Ctx, Word, Word, Word) -> Word;
 
 /// The native the compiler declares as `name`, at `F`, as a unit binds it.
 fn native<F: Copy>(name: &str) -> F {
@@ -194,11 +195,11 @@ fn the_natives_read_what_the_codec_writes() {
         );
         native::<N2>("?in_field")(c, b"y".as_ptr() as Word, 1);
         assert_eq!(native::<A0>("?in_char")(c), 'é' as Word);
-        let mut words = [0 as Word; 2];
-        native::<N1>("?in_decimal")(c, words.as_mut_ptr() as Word);
-        assert_eq!((words[0], words[1]), decimal_words(d));
-        native::<N2>("?in_fixed")(c, width(IntTy::I16), words.as_mut_ptr() as Word);
-        assert_eq!(words, [-2, -1], "sign-extended to 128 bits");
+        let high: A0 = native("?in_high");
+        let lo = native::<A0>("?in_decimal")(c);
+        assert_eq!((lo, high(c)), decimal_words(d));
+        let lo = native::<A1>("?in_fixed")(c, width(IntTy::I16));
+        assert_eq!((lo, high(c)), (-2, -1), "sign-extended to 128 bits");
         assert_eq!(native::<A0>("?in_tag")(c), tag::FALSE as Word);
         native::<N0>("?lift_close")(c);
     }
@@ -243,6 +244,147 @@ fn bytes_that_do_not_read_as_the_type_fail_the_context() {
     assert!(said.contains("field `x` where `y` was read"), "{said}");
     let said = lift_and(b"not PLV1", |_| {});
     assert!(said.contains("not an encoded value"), "{said}");
+}
+
+/// The read that answers a width's or a `Decimal`'s low word keeps the word above it for one ask:
+/// a narrow width's as the width's sign extends it, a 128-bit width's its own.
+#[test]
+fn a_wide_values_high_word_is_kept_for_one_ask_after_its_low_word() {
+    let mut ctx = context();
+    let wide = (5u128 << 64) | 9;
+    let v = Value::list(vec![
+        Value::Fixed(Fixed::new(IntTy::U128, wide)),
+        Value::Fixed(Fixed::new(IntTy::I128, -3i128 as u128)),
+        Value::Fixed(Fixed::new(IntTy::U8, 255)),
+        Value::Fixed(Fixed::new(IntTy::U64, u128::from(u64::MAX))),
+    ]);
+    let bytes = encode(&v).unwrap();
+    let c: *mut Ctx = &mut ctx;
+    unsafe {
+        native::<N2>("?lift_open")(c, bytes.as_ptr() as Word, bytes.len() as Word);
+        assert_eq!(native::<A1>("?in_count")(c, tag::LIST as Word), 4);
+        let (fixed, high): (A1, A0) = (native("?in_fixed"), native("?in_high"));
+        assert_eq!((fixed(c, width(IntTy::U128)), high(c)), (9, 5));
+        assert_eq!((fixed(c, width(IntTy::I128)), high(c)), (-3, -1));
+        assert_eq!((fixed(c, width(IntTy::U8)), high(c)), (255, 0));
+        assert_eq!(
+            (fixed(c, width(IntTy::U64)), high(c)),
+            (-1, 0),
+            "zero-extended past its 64 bits"
+        );
+        native::<N0>("?lift_close")(c);
+    }
+    unfailed(&mut ctx);
+    let one = encode(&Value::Fixed(Fixed::new(IntTy::U128, wide))).unwrap();
+    let said = lift_and(&one, |c| unsafe {
+        native::<A1>("?in_fixed")(c, width(IntTy::U128));
+        native::<A0>("?in_high")(c);
+        native::<A0>("?in_high")(c);
+    });
+    assert!(said.contains("no wide value was read"), "{said}");
+}
+
+/// A 128-bit width read as its two words is made the runtime's object of that width.
+#[test]
+fn a_128_bit_widths_two_words_box_as_the_runtimes_object_of_it() {
+    let boxed: A3 = helper("rt_box_wide");
+    let mut ctx = context();
+    for (ty, bits) in [
+        (IntTy::U128, (5u128 << 64) | 9),
+        (IntTy::I128, -3i128 as u128),
+    ] {
+        let (lo, hi) = (bits as u64 as Word, (bits >> 64) as u64 as Word);
+        let w = unsafe { boxed(&mut ctx, lo, hi, width(ty)) };
+        assert_eq!(
+            Heap::to_value(&ctx.tables.layouts, w),
+            Value::Fixed(Fixed::new(ty, bits))
+        );
+    }
+    unfailed(&mut ctx);
+    unsafe { boxed(&mut ctx, 1, 0, width(IntTy::U64)) };
+    let said = ctx.take_failure().expect("a diagnostic").message;
+    assert!(said.contains("no 128-bit width"), "{said}");
+}
+
+/// `args` lowered as the list of a builtin's arguments, the builtin at `index` called over them.
+fn called_encoded(c: *mut Ctx, index: Word, args: impl FnOnce(*mut Ctx)) {
+    unsafe {
+        native::<N1>("?lower_open")(c, 0);
+        args(c);
+        helper::<N1>("rt_builtin_encoded")(c, index);
+    }
+}
+
+/// A builtin called over its arguments' encoding answers a lifting of its answer's, and what the
+/// bytes cannot hold crosses beside them both ways.
+#[test]
+fn a_builtin_called_encoded_answers_a_lifting_of_its_answer() {
+    let mut ctx = context_calling(&["Char::of_int", "Secret::is_empty", "Secret::of_string"]);
+    let c: *mut Ctx = &mut ctx;
+    unsafe {
+        called_encoded(c, 0, |c| {
+            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
+            native::<N1>("?out_int")(c, 'é' as Word);
+        });
+        assert_eq!(native::<A1>("?in_count")(c, tag::CTOR as Word), 1);
+        assert_eq!(
+            native::<A2>("?in_name_is")(c, b"Some".as_ptr() as Word, 4),
+            1
+        );
+        assert_eq!(native::<A0>("?in_char")(c), 'é' as Word);
+        native::<N0>("?lift_close")(c);
+        called_encoded(c, 2, |c| {
+            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
+            text(c, "?out_str", b"hunter2");
+        });
+        let secret = native::<A0>("?in_handle")(c);
+        native::<N0>("?lift_close")(c);
+        called_encoded(c, 1, |c| {
+            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
+            native::<N1>("?out_handle")(c, secret);
+        });
+        assert_eq!(native::<A0>("?in_tag")(c), tag::FALSE as Word);
+        native::<N0>("?lift_close")(c);
+    }
+    unfailed(&mut ctx);
+}
+
+/// A builtin that raises ends the lowering of its arguments and opens nothing, so the crossing it
+/// was called inside goes on where it was.
+#[test]
+fn a_builtin_called_encoded_that_raises_opens_nothing() {
+    let mut ctx = context_calling(&["Bytes::at"]);
+    let outer = lowered(&mut ctx, false, |c| unsafe {
+        native::<N2>("?out_count")(c, tag::LIST as Word, 2);
+        native::<N1>("?out_int")(c, 1);
+        called_encoded(c, 0, |c| {
+            native::<N2>("?out_count")(c, tag::LIST as Word, 2);
+            text(c, "?out_bytes", b"ab");
+            native::<N1>("?out_int")(c, 7);
+        });
+        native::<N1>("?out_int")(c, 2);
+    });
+    let said = ctx.take_failure().expect("the builtin raised").message;
+    assert!(said.contains("`Bytes::at` index 7"), "{said}");
+    assert_eq!(
+        decode(&outer).unwrap(),
+        Value::list(vec![Value::Int(1), Value::Int(2)])
+    );
+}
+
+/// A builtin is called over a lowering of its arguments and nothing else.
+#[test]
+fn a_builtin_called_encoded_with_no_lowering_or_outside_its_pool_fails_the_context() {
+    let mut ctx = context_calling(&["Char::of_int"]);
+    unsafe { helper::<N1>("rt_builtin_encoded")(&mut ctx, 0) };
+    let said = ctx.take_failure().expect("a diagnostic").message;
+    assert!(said.contains("no lowering open"), "{said}");
+    let mut ctx = context_calling(&["Char::of_int"]);
+    called_encoded(&mut ctx, 1, |c| unsafe {
+        native::<N2>("?out_count")(c, tag::LIST as Word, 0);
+    });
+    let said = ctx.take_failure().expect("a diagnostic").message;
+    assert!(said.contains("builtin 1 of a pool of 1"), "{said}");
 }
 
 /// A crossing begun inside another works on a frame of its own, and the outer one goes on where it

@@ -9,7 +9,7 @@ use ply_core::{
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -17,8 +17,9 @@ use std::sync::{Arc, Weak};
 /// The widest arity this boundary carries without allocating an argument array.
 const MAX_ARITY: usize = 16;
 
-/// One admitted definition: where its code is, how many arguments it takes, what may answer an
-/// entry instead of running it, and how its arguments and answer read.
+/// One admitted definition: what an entry calls (its own code, or in an encoded unit its
+/// `R#entered`), how many arguments it takes, what may answer an entry instead of running it, and
+/// how its arguments and answer read.
 struct Admitted {
     entry: Entry,
     arity: usize,
@@ -181,7 +182,11 @@ impl Unit {
             Code::Linked => source.row(name).is_some(),
             Code::Opened(_) => true,
         };
-        let members: BTreeSet<Symbol> = compiled.iter().filter(offered).map(Symbol::new).collect();
+        let members: BTreeSet<Symbol> = (compiled.iter())
+            .filter(offered)
+            .filter(|name| native.enterable(name))
+            .map(Symbol::new)
+            .collect();
         let unit = Unit {
             identity,
             source,
@@ -334,6 +339,42 @@ pub struct Bodies {
     declines: Cell<Declines>,
     /// `run` clears it first, so an entry no body ran for reports none of the one before it.
     last: RefCell<LastEntry>,
+    /// Whether the unit is entered through its roots' `R#entered`, its arguments and answers
+    /// crossing encoded.
+    encoded: bool,
+    /// What an encoded unit's pure roots answered.
+    kept: RefCell<Kept>,
+}
+
+/// What an encoded unit's pure roots answered, as values, each under its root and its arguments'
+/// encoding; and the identity of each answer and of its direct parts, by which an argument the
+/// memo answered is known.
+#[derive(Default)]
+struct Kept {
+    answers: HashMap<(Symbol, Vec<u8>), Value>,
+    calls: usize,
+    known: HashSet<crate::rt::Identity>,
+}
+
+impl Kept {
+    /// Whether every one of `args` is a value the memo answered, or a direct part of one.
+    fn knows_all(&self, args: &[Value]) -> bool {
+        args.iter()
+            .all(|v| crate::rt::identity(v).is_some_and(|id| self.known.contains(&id)))
+    }
+
+    /// Keeps `value` as the answer of `key`, a call over arguments the memo answered only while
+    /// fewer than [`crate::rt::CALL_MEMO_LIMIT`] are kept.
+    fn keep(&mut self, key: (Symbol, Vec<u8>), value: &Value, call: bool) {
+        if call {
+            if self.calls >= crate::rt::CALL_MEMO_LIMIT {
+                return;
+            }
+            self.calls += 1;
+        }
+        self.known.extend(crate::rt::identities(value));
+        self.answers.insert(key, value.clone());
+    }
 }
 
 impl Bodies {
@@ -345,14 +386,20 @@ impl Bodies {
             );
         }
         let mut admitted = HashMap::new();
+        let encoded = code.encoded();
         for name in &unit.members {
-            let Some(entry) = code.entry(name.as_str()) else {
-                bail!("`{name}` was admitted and not compiled");
+            let entry = if encoded {
+                code.entered(name.as_str())
+            } else {
+                code.entry(name.as_str())
+            };
+            let Some(entry) = entry else {
+                bail!("`{name}` was admitted and cannot be entered");
             };
             let Some(arity) = code.arity(name.as_str()) else {
                 bail!("`{name}` was compiled without an arity");
             };
-            if arity > MAX_ARITY {
+            if !encoded && arity > MAX_ARITY {
                 bail!(
                     "`{name}` takes {arity} arguments and this boundary carries {MAX_ARITY}; \
                      refusing the registration rather than leaving one name that declines \
@@ -392,6 +439,8 @@ impl Bodies {
             entered: Cell::new(0),
             declines: Cell::new(Declines::default()),
             last: RefCell::new(LastEntry::default()),
+            encoded,
+            kept: RefCell::default(),
         })
     }
 
@@ -440,6 +489,9 @@ impl Bodies {
             return self.decline(|d| d.reentered += 1);
         };
         let filled = admitted.entered_with(args, &self.unit.source.front.ctor_carries);
+        if self.encoded {
+            return self.run_encoded(name, admitted, &mut ctx, &filled, fuel);
+        }
 
         let tables = std::sync::Arc::clone(&ctx.tables);
         if let Memo::Constant(index) = admitted.memo
@@ -479,57 +531,12 @@ impl Bodies {
         let entering = &mut *ctx as *mut crate::rt::Ctx;
         // SAFETY: `self._code` owns the entry's pages, `ctx` is uniquely borrowed, and
         // `handles` is `MAX_ARITY` wide, which `Bodies::new` refused to exceed.
-        let mut out = crate::rt::on_known_stack(entering, || unsafe {
+        let out = crate::rt::on_known_stack(entering, || unsafe {
             (admitted.entry)(entering, handles.as_ptr())
         });
-        let production = ctx.sims.last().filter(|sim| sim.is_production());
-        let held = ply_core::Held {
-            bridges: ctx.heap.bridges() as u64,
-            scheduled: production.map_or(0, |sim| sim.scheduled() as u64),
-            task_stacks: production.map_or(0, |sim| sim.task_slots() as u64),
-            frame_tables: ctx.stack_slots() as u64,
-        };
-        if ctx.sims.last().is_some_and(|sim| sim.is_production()) {
-            out = unsafe { crate::simulate::finish_root(&mut *ctx as *mut crate::rt::Ctx, out) };
-        }
-        if let Some(rt) = ctx.runtime.clone() {
-            let warned = rt.end_entry_point(ctx.id);
-            ctx.teardown.extend(warned);
-        }
-        *self.last.borrow_mut() = LastEntry {
-            steps: u64::try_from(ctx.ticks).unwrap_or(0),
-            held,
-            record: ctx.record.take(),
-            performed: std::mem::take(&mut ctx.performed),
-        };
-
+        let out = self.returned(&mut ctx, out);
         if ctx.failed != 0 {
-            let raised = if ctx.failed == crate::rt::FAILED_OUT_OF_FUEL {
-                // The backend alone: no machine follows, so the budget is reported from here.
-                Some(
-                    ply_core::Diagnostic::error(
-                        ply_core::codes::RUNTIME_ERROR,
-                        format!("recursion limit of {fuel} nested calls exceeded"),
-                    )
-                    .primary(ctx.site(), "the call that overran it"),
-                )
-            } else {
-                ctx.take_failure().or_else(|| {
-                    (ctx.failed == crate::rt::FAILED_UNWIND).then(|| {
-                        ply_core::Diagnostic::error(
-                            ply_core::codes::RUNTIME_ERROR,
-                            "a `handle` clause unwound past the compiled fragment's entry",
-                        )
-                    })
-                })
-            };
-            ctx.end();
-            drop(ctx);
-            self.entered.set(self.entered.get() + 1);
-            return match raised {
-                Some(raised) => EntryOutcome::Raised(raised),
-                None => EntryOutcome::Declined,
-            };
+            return self.failure(&mut ctx, fuel);
         }
         debug_assert_eq!(
             ctx.fuel, calls,
@@ -559,19 +566,7 @@ impl Bodies {
         drop(ctx);
         // Covers every handle `escape` refuses; a closure or secret that holds none declines.
         if walked.handle {
-            let boundary = ply_core::Boundary::EntryAnswer {
-                name: name.as_str(),
-            };
-            let span = self
-                .unit
-                .source
-                .span_of(name.as_str())
-                .unwrap_or(ply_core::Span::DUMMY);
-            if let Err(refused) = ply_core::escape::check(&boundary, &value, span) {
-                self.entered.set(self.entered.get() + 1);
-                return EntryOutcome::Raised(refused);
-            }
-            return self.decline(|d| d.answer += 1);
+            return self.holding_a_handle(name, &value);
         }
         if walked.unread {
             return self.decline(|d| d.unread += 1);
@@ -582,6 +577,148 @@ impl Bodies {
         self.unit.counters.note_converted(inward, walked.read);
         self.entered.set(self.entered.get() + 1);
         EntryOutcome::Answered(value)
+    }
+
+    /// [`Bodies::run`] of an encoded unit: the arguments cross in as one encoded list, which the
+    /// root's `R#entered` reads before it calls the root and writes the answer's encoding, and the
+    /// memo keeps values under the arguments' encoding.
+    fn run_encoded(
+        &self,
+        name: &Symbol,
+        admitted: &Admitted,
+        ctx: &mut crate::rt::Ctx,
+        filled: &[Value],
+        fuel: usize,
+    ) -> EntryOutcome {
+        let (bytes, held) = crate::rt::encoded(&Value::list(filled.to_vec()));
+        // A call whose arguments are all answers of the memo, or their parts, is itself memoized.
+        let keeps = held.is_empty()
+            && match admitted.memo {
+                Memo::Never => false,
+                Memo::Constant(_) => true,
+                Memo::Calls => !filled.is_empty() && self.kept.borrow().knows_all(filled),
+            };
+        let key = keeps.then(|| (name.clone(), bytes.clone()));
+        if let Some(key) = &key
+            && let Some(value) = self.kept.borrow().answers.get(key)
+        {
+            self.entered.set(self.entered.get() + 1);
+            return EntryOutcome::Answered(value.clone());
+        }
+        let calls = i64::try_from(fuel).unwrap_or(i64::MAX);
+        ctx.begin(calls);
+        ctx.open_entry(bytes, held);
+        let entering = std::ptr::from_mut(ctx);
+        let none: [i64; 0] = [];
+        // SAFETY: `self._code` owns the entry's pages, `ctx` is uniquely borrowed, and an
+        // `R#entered` takes no words.
+        let out = crate::rt::on_known_stack(entering, || unsafe {
+            (admitted.entry)(entering, none.as_ptr())
+        });
+        self.returned(ctx, out);
+        if ctx.failed != 0 {
+            return self.failure(ctx, fuel);
+        }
+        debug_assert_eq!(
+            ctx.fuel, calls,
+            "`{name}` returned without every call it made given back, or with more"
+        );
+        let answer = crate::rt::close_entry(ctx);
+        ctx.end();
+        let value = match answer {
+            Ok(crate::rt::EntryAnswer::Read {
+                value,
+                holding: false,
+            }) => value,
+            Ok(crate::rt::EntryAnswer::Read {
+                value,
+                holding: true,
+            }) => return self.holding_a_handle(name, &value),
+            Ok(crate::rt::EntryAnswer::Function) => return self.decline(|d| d.answer += 1),
+            Err(why) => {
+                self.entered.set(self.entered.get() + 1);
+                return EntryOutcome::Raised(crate::rt::err_crossing(&why));
+            }
+        };
+        if let Some(key) = key {
+            let call = matches!(admitted.memo, Memo::Calls);
+            self.kept.borrow_mut().keep(key, &value, call);
+        }
+        self.entered.set(self.entered.get() + 1);
+        EntryOutcome::Answered(value)
+    }
+
+    /// What an entry that returned `out` leaves for the machine, kept for it to read: its
+    /// production region's other tasks run to their ends first, which may answer another word.
+    fn returned(&self, ctx: &mut crate::rt::Ctx, mut out: crate::heap::Word) -> crate::heap::Word {
+        let production = ctx.sims.last().filter(|sim| sim.is_production());
+        let held = ply_core::Held {
+            bridges: ctx.heap.bridges() as u64,
+            scheduled: production.map_or(0, |sim| sim.scheduled() as u64),
+            task_stacks: production.map_or(0, |sim| sim.task_slots() as u64),
+            frame_tables: ctx.stack_slots() as u64,
+        };
+        if ctx.sims.last().is_some_and(|sim| sim.is_production()) {
+            out = unsafe { crate::simulate::finish_root(std::ptr::from_mut(ctx), out) };
+        }
+        if let Some(rt) = ctx.runtime.clone() {
+            let warned = rt.end_entry_point(ctx.id);
+            ctx.teardown.extend(warned);
+        }
+        *self.last.borrow_mut() = LastEntry {
+            steps: u64::try_from(ctx.ticks).unwrap_or(0),
+            held,
+            record: ctx.record.take(),
+            performed: std::mem::take(&mut ctx.performed),
+        };
+        out
+    }
+
+    /// How an entry that failed ends: what it raised, or a decline where it raised nothing.
+    fn failure(&self, ctx: &mut crate::rt::Ctx, fuel: usize) -> EntryOutcome {
+        let raised = if ctx.failed == crate::rt::FAILED_OUT_OF_FUEL {
+            // The backend alone: no machine follows, so the budget is reported from here.
+            Some(
+                ply_core::Diagnostic::error(
+                    ply_core::codes::RUNTIME_ERROR,
+                    format!("recursion limit of {fuel} nested calls exceeded"),
+                )
+                .primary(ctx.site(), "the call that overran it"),
+            )
+        } else {
+            ctx.take_failure().or_else(|| {
+                (ctx.failed == crate::rt::FAILED_UNWIND).then(|| {
+                    ply_core::Diagnostic::error(
+                        ply_core::codes::RUNTIME_ERROR,
+                        "a `handle` clause unwound past the compiled fragment's entry",
+                    )
+                })
+            })
+        };
+        ctx.end();
+        self.entered.set(self.entered.get() + 1);
+        match raised {
+            Some(raised) => EntryOutcome::Raised(raised),
+            None => EntryOutcome::Declined,
+        }
+    }
+
+    /// An answer holding a handle: refused where the handle is bound to a region the entry closed,
+    /// else declined, since nothing outside the entry can hold it.
+    fn holding_a_handle(&self, name: &Symbol, value: &Value) -> EntryOutcome {
+        let boundary = ply_core::Boundary::EntryAnswer {
+            name: name.as_str(),
+        };
+        let span = self
+            .unit
+            .source
+            .span_of(name.as_str())
+            .unwrap_or(ply_core::Span::DUMMY);
+        if let Err(refused) = ply_core::escape::check(&boundary, value, span) {
+            self.entered.set(self.entered.get() + 1);
+            return EntryOutcome::Raised(refused);
+        }
+        self.decline(|d| d.answer += 1)
     }
 }
 

@@ -25,7 +25,7 @@ pub fn def(name: &'static str, arity: usize, body: &str) -> Def {
 
 /// The C function `name`'s body is written as.
 pub fn symbol(name: &str) -> String {
-    format!("ply_t_{}", name.replace('.', "_"))
+    format!("ply_t_{}", name.replace(['.', '#'], "_"))
 }
 
 /// One definition a unit holds: its Ply name, how many words it takes, and the C symbol of the
@@ -79,6 +79,7 @@ pub fn exports_of(defs: &[Def]) -> Laid {
             instances: Vec::new(),
             numerics: Vec::new(),
             layout: ply_compiled::heap::RecordLayout::CURRENT,
+            entered: Vec::new(),
         },
         lambdas: Vec::new(),
         taken: defs

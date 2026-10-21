@@ -7,32 +7,34 @@ import emit.code (Code, Node, NVar, NKnown, NLambda, NApp, NUnary, NBinary, NFie
                   NList, NRecord, NUpdate, NMatch, NPerform, NSimulate, NParallel, NHandle, Lambda,
                   Capture, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm, CodeClause, PxList,
                   PxVar)
-import check.types (Type, TyFn, TyVar, TyCon, Scheme, int_type, bool_type)
+import check.types (Type, TyFn, TyVar, TyCon, Scheme, Row, int_type, bool_type, run_needs)
 import emit.typing (Filings, no_filings, unknown_type)
 import syntax.parsing (Span, starts_upper, dummy_span)
 import check.resolve.tables (qualify)
 import check.infer.checker (is_test_owner)
 import std.bytes (ascii_of_int)
 import emit.reps (Def, Imported, EmitParam, BoundLambda, erased, has_vars, carried_vars,
-                  substituted, substituted_fully)
+                  substituted, substituted_fully, type_vars, resumption, resumed)
+import emit.answer (Layout, Exact)
+import emit.release (released_vars)
 import emit.keys (RootKey, FnArg, Named, At, Callee, Root, Generic, root_name, definition_of,
                   key_types, key_lent, unspecialised)
 import emit.tir
-import emit.tir (Rep, RInt, RBool, RWord, RSlice, Var, Arg, AVar, AInt, AZero, Given, Convention,
-                 Val, Prim, Make, Get, Pack, Native, Op, OCalling, MClosure, MCtor, PCapture, TTag,
-                 TInt, Call, Apply, Inst, Let, Do, Decl, Assign, If, Case, Match, Loop, Next, Done,
-                 Restart, Enter, Return, Fail, NoArm, Sited, Block, Fn, Rooted, Member, Closure,
-                 Declined, Calling, no_links, falls_through, rep_of_arg)
-import emit.tir.calling (EntryValue, ConstantRead, BuiltinValue, Ticked)
+import emit.tir (Rep, RInt, RBool, RWord, RSlice, Var, Arg, AVar, AInt, AZero, Given, Lent,
+                 Convention, Val, Prim, Make, Get, Pack, Native, Op, OCalling, MClosure, MCtor,
+                 PCapture, TTag, TInt, Call, Apply, Inst, Let, Do, Decl, Assign, If, Case, Match,
+                 Loop, Next, Done, Restart, Enter, Return, Fail, NoArm, Sited, Block, Fn, Rooted,
+                 Member, Closure, Declined, Calling, no_links, falls_through, rep_of_arg)
+import emit.tir.calling (ConstantRead, Ticked)
 import emit.lower.setting (Setting, Root, imported_target, qualified)
 import emit.lower.held (held_as, arg_path)
 import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
                         ToInPlace, Frame, Opened, GroupMember, Restarts, Enters, Calls, refuse,
                         fresh, bound_as, done, emitted, opened, nested, unnested, with_lambda,
                         started, filed, unfiled, read_taken, type_of, handed, read_noted, read_note,
-                        capture_note, frame_entered, taken_as, unsaid)
+                        capture_note, frame_entered, taken_as, noted)
 import emit.lower.data (constructed)
-import emit.lower.containers (scalar_builtin)
+import emit.lower.containers (builtin)
 
 /// The context root `r` of `setting`, a definition of its own, lowers `body` under.
 pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.raise} = {
@@ -220,68 +222,39 @@ pub fn target(cx: Context, func: Code, args: List<Code>) -> Option<Target> / {ab
     _ -> Some(ToValue),
   }
 
-/// A name no slot holds read as a value: a constructor, the unit's closure over a definition's
-/// entry, or a builtin's value.
+/// A name no slot holds read as a value: a constructor of no argument, the value itself; and a
+/// definition, a constructor or a builtin the checker filed a function type for, the closure of a
+/// lambda around a call of it, which the emitter writes at that type.
 pub fn global(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered / {abort.raise} =
-  if is_ctor_name(name) { constructed(cx, st, name, [], at, at) } else {
-    match def_named(cx, name) {
-      Some(d) -> match filed(cx, at) {
-        None -> unfiled(cx, st, b"a definition read as a value", at),
-        Some(t) -> {
-          let n = named_ref(cx, st, d, at, []);
-          bound_as(
-            n.st,
-            t.ty,
-            RWord,
-            Op({
-              op: OCalling(EntryValue({ callee: n.callee, arity: d.def.arity })),
-              args: [],
-              uses: answers(),
-            }),
-            at,
-          )
-        },
-      },
-      None -> if cx.setting.builtins.contains(name) {
-        match filed(cx, at) {
-          None -> unfiled(cx, st, b"a builtin read as a value", at),
-          Some(t) -> if t.ty == unknown_type() {
-            refuse(st, Calling, b"a builtin read as a value at no type: ".concat(name))
-          } else {
-            bound_as(
-              st,
-              t.ty,
-              RWord,
-              Op({ op: OCalling(BuiltinValue(name)), args: [], uses: answers() }),
-              at,
-            )
+  match filed(cx, at) {
+    None -> unfiled(cx, st, b"a name read as a value", at),
+    Some(t) -> match t.ty {
+      TyFn(f) -> {
+        let frame = { params: f.params.len(), size: f.params.len(), captures: [], resumes: false };
+        let o = lambda_opened(cx, st, frame, at);
+        let params = range(0, frame.params).fold([], |acc: List<Arg>, j: Int|
+          match o.st.env.get(j) { Some(a) -> acc.push(a), None -> acc });
+        let func = { node: NVar({ name: name, slot: None }), span: at };
+        closure(
+          cx,
+          st,
+          match target(o.cx, func, []) {
+            Some(ToCtor(c)) -> constructed(o.cx, o.st, c, params, at, at),
+            Some(ToDef(full)) -> called(o.cx, o.st, full, func, [], params, false, at),
+            Some(ToBuiltin(b)) -> if cx.setting.builtins.contains(b) {
+              builtin(o.cx, o.st, b, params, at, at)
+            } else {
+              refuse(o.st, Calling, b"a global the lowering does not resolve: ".concat(name))
+            },
+            _ -> refuse(o.st, Calling, b"a global the lowering does not resolve: ".concat(name)),
           },
-        }
-      } else { refuse(st, Calling, b"a global the lowering does not resolve: ".concat(name)) },
-    }
-  }
-
-/// The builtin a name no slot holds names, as a call of it reaches it, and its arity, where read as a
-/// value it is the lambda around a call of it: one the emitter writes per type, read at a function
-/// type the checker settled, which the runtime's value of it would read off untyped words.
-pub fn builtin_lambda(
-  cx: Context,
-  name: Bytes,
-  at: Span,
-) -> Option<{ name: Bytes, arity: Int }> / {abort.raise} =
-  if is_ctor_name(name) || def_named(cx, name) != None || !cx.setting.builtins.contains(name) {
-    None
-  } else {
-    let callee = extern_named(cx, name);
-    match filed(cx, at) {
-      Some(t) -> match t.ty {
-        TyFn(f) -> if scalar_builtin(callee) && !unsaid(TyFn(f)) {
-          Some({ name: callee, arity: f.params.len() })
-        } else { None },
-        _ -> None,
+          frame,
+          at,
+        )
       },
-      None -> None,
-    }
+      _ -> if is_ctor_name(name) { constructed(cx, st, name, [], at, at) }
+      else { refuse(st, Calling, b"a global read at no function type: ".concat(name)) },
+    },
   }
 
 /// A read of a slot known to hold the closure of a lambda its owner wrote: the closure itself, read
@@ -333,8 +306,9 @@ pub fn called(
   }
 
 /// A call of the function value `f` on `args`, through the convention a function of its type has;
-/// a clause's continuation, or a value of no function type, through the runtime, every argument and
-/// the answer a word, the answer kept as the word it is, at the type a continuation answers.
+/// a clause's continuation, or a value of no function type, through its descriptor's uniform entry,
+/// every argument and the answer a word, the answer kept as the word it is, at the type a
+/// continuation answers.
 pub fn applied(
   cx: Context,
   st: Lowering,
@@ -349,7 +323,7 @@ pub fn applied(
     } else {
       let reps = t.params.map(|p: Type| held_as(cx.setting, p));
       let answer = held_as(cx.setting, t.ret);
-      let h = handed_all(param_called(cx, st, f), args, reps, at);
+      let h = handed_all(param_called(cx, function_laid(st, TyFn(t)), f), args, reps, at);
       bound_as(
         h.st,
         t.ret,
@@ -363,7 +337,7 @@ pub fn applied(
             answer: answer,
             answered: tir::Owned,
           },
-          stops: stops_in(t.effects.atoms.len(), t.effects.tail != None),
+          stops: stops_in(t.effects),
         }),
         at,
       )
@@ -373,7 +347,7 @@ pub fn applied(
       let h = handed_all(param_called(cx, st, f), args, words, at);
       bound_as(
         h.st,
-        resumed_answer(type_of(f)),
+        match resumed(type_of(f)) { Some(a) -> a, None -> unknown_type() },
         RWord,
         Apply({
           f: f,
@@ -391,17 +365,18 @@ pub fn applied(
     },
   }
 
-/// The type the form holds a clause's continuation at, which no program writes: a word the runtime
-/// calls, whose call answers `answer`.
-fn resumption(answer: Type) -> Type = TyCon({ name: b"_resume", args: [answer] })
+/// `st` noting that a specialisation would lay out each type variable function type `t` names,
+/// where the body makes or applies a function value of it: the value's entry is typed at `t`, so the
+/// body is emitted only where each is settled.
+fn function_laid(st: Lowering, t: Type) -> Lowering =
+  type_vars(t).fold(st, |s: Lowering, v: Int| noted(s, { var: v, reads: Layout }))
 
-/// What a call of a value of type `t` answers where `t` is a continuation's; unknown otherwise.
-fn resumed_answer(t: Type) -> Type =
-  match t {
-    TyCon(c) -> if c.name != b"_resume" { unknown_type() }
-    else { match c.args.at(0) { Some(a) -> a, None -> unknown_type() } },
-    _ -> unknown_type(),
-  }
+/// `st` noting what the descriptor of a closure capturing `captures` reads of each type variable
+/// their types name, as a body letting go of a value of each type would: its release, share and keep
+/// entries walk each capture by its type.
+fn captures_released(st: Lowering, captures: List<Var>) -> Lowering =
+  captures.fold(st, |s: Lowering, v: Var|
+    released_vars(v.ty).fold(s, |q: Lowering, x: Int| noted(q, { var: x, reads: Exact })))
 
 /// The state a body run in place of the call of `func` on `args` is lowered in. A known lambda's
 /// frame: its parameters the arguments `lowered` holds, its captures read off its closure, a step
@@ -1095,7 +1070,7 @@ pub fn closure(
           },
       );
       bound_as(
-        caps.st,
+        function_laid(captures_released(caps.st, s.params.take(s.captures)), s.ty),
         s.ty,
         RWord,
         Make({
@@ -1264,9 +1239,9 @@ pub type Defined = { full: Bytes, def: Def }
 /// A call's callee as the root names it, and the type arguments it names it at.
 type Reference = { st: Lowering, callee: Callee, args: List<Type> }
 
-/// A closure's body as the lambda's type lays it out: its captures, each a word, then its own
-/// parameters as a body holds values of their types; how it answers; and the types of the closure
-/// and of its answer.
+/// A closure's body as the lambda's type lays it out: its captures, each a word it reads out of the
+/// closure, lent, then its own parameters as a body holds values of their types, given; how it
+/// answers; and the types of the closure and of its answer.
 type Shape = { params: List<Var>, conv: Convention, ty: Type, ret: Type, captures: Int, own: Int }
 
 /// The shape of the closure laid out as `frame` at `at`, from the function type the checker filed
@@ -1306,7 +1281,8 @@ fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Option<Sha
       Some({
         params: params,
         conv: {
-          params: params.map(|_: Var| Given),
+          // The body reads its captures out of the closure, which its caller holds while it runs.
+          params: range(0, params.len()).map(|i: Int| if i < n { Lent } else { Given }),
           reps: params.map(|v: Var| v.rep),
           answer: answer,
           answered: tir::Owned,
@@ -1437,10 +1413,7 @@ fn call(
             args: h.args,
             conv: conv,
             stops: match d.def.scheme {
-              Some(sc) -> match sc.ty {
-                TyFn(f) -> stops_in(f.effects.atoms.len(), f.effects.tail != None),
-                _ -> true,
-              },
+              Some(sc) -> match sc.ty { TyFn(f) -> stops_in(f.effects), _ -> true },
               None -> true,
             },
           }),
@@ -1453,9 +1426,9 @@ fn call(
   }
 }
 
-/// Whether a call of a function whose row names `atoms` operations, or is open, can stop for a
-/// handler that may resume it later.
-fn stops_in(atoms: Int, open: Bool) -> Bool = atoms > 0 || open
+/// Whether a call of a function of effect row `row` can stop for a handler that may resume it later:
+/// where the row is open or names an operation a run must be given.
+fn stops_in(row: Row) -> Bool = row.tail != None || run_needs(row.atoms).len() > 0
 
 /// Each of `args` held as `reps` says, in order.
 fn handed_all(

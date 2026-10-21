@@ -19,12 +19,23 @@ pub fn context() -> Ctx {
 /// A context over a unit whose bodies read `fields` and whose compiled functions are `functions`,
 /// by index.
 pub fn context_of(fields: &[&str], functions: Vec<usize>) -> Ctx {
+    context_over(fields, functions, &[])
+}
+
+/// A context over a unit whose pool of builtins holds those named `builtins`, in order.
+pub fn context_calling(builtins: &[&str]) -> Ctx {
+    context_over(&[], Vec::new(), builtins)
+}
+
+fn context_over(fields: &[&str], functions: Vec<usize>, builtins: &[&str]) -> Ctx {
     Ctx::new(Arc::new(Tables {
         consts: Vec::new(),
         const_words: Vec::new(),
         layouts: Layouts::new(Vec::new()),
         fields: fields.iter().map(ply_core::Symbol::new).collect(),
-        builtins: Vec::new(),
+        builtins: (builtins.iter())
+            .map(|b| ply_core::Builtin::from_name(b).unwrap_or_else(|| panic!("no builtin `{b}`")))
+            .collect(),
         functions,
         memo: Box::default(),
         memo_costs: Box::default(),
