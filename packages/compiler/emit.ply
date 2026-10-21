@@ -36,7 +36,9 @@ import emit.keys
 import emit.keys (RootKey, Named, At, Written, Entered, FnArg, TypeOp, Order, Reflect, Shown,
                   Digest, Lower, Lift, Contained, root_name, sited_as, key_types, key_lent, op_name,
                   module_of)
-import emit.answer (Emitted, Body, Refused, RootAnswer)
+import emit.answer (Emitted, Body, Refused, RootAnswer, Published)
+import emit.tir (Fn)
+import emit.lend (handings_of, lendings_of, declared_lent, handed_from, lent_form)
 import emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, ModuleDefs, EmitParam, BoundLambda,
                   OwnerLambdas, kind_of, boxed, Sig, sig_of, param_kinds, param_types, typed_kind,
                   filings_at, at_args)
@@ -111,9 +113,16 @@ fn written_wanted(
   )
 
 /// What a program walk lowered, in its order: each root's form or refusal, each constructor's
-/// stated functions, which a body naming the constructor's tag calls once it is printed, and the
-/// program's constructor table, which the printers read.
-pub type Walked = { roots: List<RootForm>, stated: Map<Bytes, List<Bytes>>, ctors: Ctors }
+/// stated functions, which a body naming the constructor's tag calls once it is printed, the
+/// program's constructor table, which the printers read, the parameters each definition lends by
+/// declaration (E0475), by its full name, and the handings the definitions lowered elsewhere publish.
+pub type Walked = {
+  roots: List<RootForm>,
+  stated: Map<Bytes, List<Bytes>>,
+  ctors: Ctors,
+  lent: Map<Bytes, List<Int>>,
+  published: List<Published>,
+}
 
 /// The roots `roots` keys of the program `given` emitted: `lowered_program`'s forms, each counted,
 /// checked and printed.
@@ -128,15 +137,48 @@ pub fn emit_program(
   embeds: List<EmbedAt>,
   rows: Rows,
   walked: Bytes,
+  published: List<Published> = [],
 ) -> List<Emitted> / {abort.raise} =
   emitted_program(
-    lowered_program(given, ctors, builtins, release, roots, pkgs, placed, embeds, rows, walked),
+    lowered_program(
+      given,
+      ctors,
+      builtins,
+      release,
+      roots,
+      pkgs,
+      placed,
+      embeds,
+      rows,
+      walked,
+      published,
+    ),
   )
 
-/// Each root `w` holds, its counts placed, checked and printed, or its refusal; a form the typed
-/// form declined, or one that fails its check or does not print, stops the build there.
-pub fn emitted_program(w: Walked) -> List<Emitted> / {abort.raise} =
-  w.roots.map(|r: RootForm| calling_instances(w.stated, emitted_of(r, w.ctors)))
+/// Each root `w` holds written against the handings the lending inference settles for the
+/// definitions it lowered (`w.published` standing for the rest), its counts placed, checked and
+/// printed, and its tables holding what lending settled of it; or its refusal. A form the typed form
+/// declined, or one that fails its check or does not print, stops the build there.
+pub fn emitted_program(w: Walked) -> List<Emitted> / {abort.raise} = {
+  let forms = w.roots.fold([], |acc: List<Fn>, r: RootForm|
+    match r { Formed(f) -> match f.form { Ok(x) -> acc.push(x), Err(_) -> acc }, _ -> acc });
+  let settled = handings_of(lendings_of(w.lent, forms), handed_from(w.published));
+  w.roots.map(|r: RootForm|
+    match r {
+      Formed(f) -> match f.form {
+        Ok(x) -> {
+          let l = lent_form(x, settled);
+          let e = calling_instances(
+            w.stated,
+            emitted_of(Formed({ ..f, form: Ok(l.form) }), w.ctors),
+          );
+          { ..e, tables: { ..e.tables, handings: l.handings, assumed: l.assumed, group: l.group } }
+        },
+        Err(_) -> calling_instances(w.stated, emitted_of(r, w.ctors)),
+      },
+      _ -> calling_instances(w.stated, emitted_of(r, w.ctors)),
+    })
+}
 
 /// Resolved together first, so defaults are filled and derives expanded; a program that does not resolve lowers nothing.
 /// Every root is resolved against, but only the roots `wanted` keys are lowered; `None` wants them
@@ -153,12 +195,19 @@ pub fn lowered_program(
   embeds: List<EmbedAt>,
   rows: Rows,
   walked: Bytes,
+  published: List<Published> = [],
 ) -> Walked / {abort.raise} = {
   let wanted = match roots { Some(ks) -> Some(wanted_names(ks)), None -> None };
   // Every module imports `std.prelude`, which a caller may leave out; it is a shipped module.
   let sources = with_prelude_source(given);
   let refused = |why: Bytes|
-    { roots: refused_rather_than_emitted(sources, roots, why), stated: Map::new(), ctors: ctors };
+    {
+      roots: refused_rather_than_emitted(sources, roots, why),
+      stated: Map::new(),
+      ctors: ctors,
+      lent: Map::new(),
+      published: published,
+    };
   let module_packages = if sources.len() == given.len() || pkgs.len() == 0 { placed }
   else { placed.push(pkgs.len()) };
   let tables = embed_tables(embeds);
@@ -451,6 +500,9 @@ pub fn lowered_program(
                       }),
                     stated: stated,
                     ctors: ctors,
+                    lent: program.fold(Map::new(), |m: Map<Bytes, List<Int>>, md: ModuleDefs|
+                      declared_lent(m, md.module, md.defs)),
+                    published: published,
                   }
                 },
               }
@@ -1153,8 +1205,9 @@ fn clause_roots(
 /// The roots `wanted` keys, resolved against the whole program: one entry per root emitted or
 /// refused, in its order, so the driver can drop what was refused. `embeds` is what the front end's
 /// answer says it embedded, `rows` what it published for every definition and test, which spare a
-/// walk of every module no wanted root is in, and `walked` what its check read of the modules it
-/// walked whole, which spares a walk of those too.
+/// walk of every module no wanted root is in, `walked` what its check read of the modules it walked
+/// whole, which spares a walk of those too, and `published` the handings of the definitions other
+/// answers hold, which the calls of these are written against.
 pub fn emit_roots_answer(
   names: List<Bytes>,
   srcs: List<Bytes>,
@@ -1166,6 +1219,7 @@ pub fn emit_roots_answer(
   embeds: List<EmbedAt>,
   rows: Rows,
   walked: Bytes,
+  published: List<Published> = [],
 ) -> List<RootAnswer> / {abort.raise} =
   roots_answered(
     lowered_roots(
@@ -1179,6 +1233,7 @@ pub fn emit_roots_answer(
       embeds,
       rows,
       walked,
+      published,
     ),
   )
 
@@ -1194,6 +1249,7 @@ pub fn lowered_roots(
   embeds: List<EmbedAt>,
   rows: Rows,
   walked: Bytes,
+  published: List<Published> = [],
 ) -> Walked / {abort.raise} =
   lowered_program(
     zip_sources(names, srcs),
@@ -1206,6 +1262,7 @@ pub fn lowered_roots(
     embeds,
     rows,
     walked,
+    published,
   )
 
 /// The answer of each root `w` holds, emitted as `emitted_program` emits it.

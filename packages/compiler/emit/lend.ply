@@ -11,10 +11,11 @@ import check.types (TyCon)
 import check.resolve.tables (qualify)
 import syntax.parsing (Span, dummy_span, span_between)
 import emit.keys (RootKey, Named, At, Written, Callee, Root, Generic, TypeOp, Equal, Order, Reflect,
-                  Shown, Digest, Contained, Lower, Lift, Drop, Share, root_name)
+                  Shown, Digest, Contained, Lower, Lift, Drop, Share, Keep, Dup, Cased, Worded,
+                  root_name)
 import emit.written (contained_reads)
 import emit.reps (Def)
-import emit.answer (GenericCall)
+import emit.answer (GenericCall, Published)
 import emit.layout
 import emit.layout (Always, Inline, LWords)
 import emit.tir (Rep, RWord, RInt, RBool, RFlat, RSlice, RSum, Var, Arg, AVar, AInt, AZero, Val,
@@ -28,7 +29,6 @@ import emit.tir (Rep, RWord, RInt, RBool, RFlat, RSlice, RSum, Var, Arg, AVar, A
 import emit.tir.handling (Perform)
 import emit.verify (payload_of, allocates, re_held)
 import emit.own (owned, may_reuse)
-import emit.lower.setting
 import emit.lower.held (passing, ByReference)
 
 /// How a definition takes its parameters and hands back its answer, which every caller's code is
@@ -63,11 +63,15 @@ pub fn lendings_of(declared: Map<Bytes, List<Int>>, forms: List<Fn>) -> List<Len
   forms.fold([], |acc: List<Lending>, f: Fn|
     match f.key { Named(_) -> acc.concat(read_as(declared, f)), _ -> acc })
 
-/// The parameters, by place, each definition of module `s` lends by declaration (E0475), by its full
-/// name: what `lendings_of` reads for the module's definitions.
-pub fn declared_lent(s: setting::Setting) -> Map<Bytes, List<Int>> =
-  s.here.fold(Map::new(), |m: Map<Bytes, List<Int>>, d: Def|
-    if d.lent.len() == 0 { m } else { m.insert(qualify(s.module, d.name), d.lent) })
+/// `into` with the parameters, by place, each of `here`, the definitions of `module`, lends by
+/// declaration (E0475), by its full name: what `lendings_of` reads for them.
+pub fn declared_lent(
+  into: Map<Bytes, List<Int>>,
+  module: Bytes,
+  here: List<Def>,
+) -> Map<Bytes, List<Int>> =
+  here.fold(into, |m: Map<Bytes, List<Int>>, d: Def|
+    if d.lent.len() == 0 { m } else { m.insert(qualify(module, d.name), d.lent) })
 
 /// Each of `group`'s definitions' handing in its order, and why: a fixpoint that starts every
 /// parameter lent but those reset for reuse and every answer borrowed of nothing, and moves each
@@ -135,28 +139,39 @@ fn lends_counted(l: Lending, h: Handing) -> Bool =
     (match l.f.params.at(k) { Some(p) -> counted(p.rep), None -> false })
       && h.params.at(k) == Some(Lent))
 
+/// What the lending inference settled: `published` with the handing of every definition it read, by
+/// full name, and the recursion group of their calls and jumps each was settled with.
+pub type Settled = { handed: Map<Bytes, Handing>, groups: Map<Bytes, List<Bytes>> }
+
 /// `published` with the handing of every definition `lendings` holds, each recursion group of their
 /// calls and jumps settled after every group it calls.
 pub fn handings_of(
   lendings: List<Lending>,
   published: Map<Bytes, Handing>,
-) -> Map<Bytes, Handing> / {abort.raise} = {
+) -> Settled / {abort.raise} = {
   let at = range(0, lendings.len()).fold(Map::new(), |m: Map<Bytes, Int>, k: Int|
     match lendings.at(k) { Some(l) -> m.insert(l.def, k), None -> m });
   let out = lendings.map(|l: Lending|
     called(l).fold([], |acc: List<Int>, d: Bytes|
       match at.get(d) { Some(k) -> acc.push(k), None -> acc }));
   let calls = graph::of(lendings.len(), |k: Int| match out.at(k) { Some(xs) -> xs, None -> [] });
-  graph::components(calls).fold(published, |done: Map<Bytes, Handing>, comp: List<Int>| {
-    let group = comp.fold([], |g: List<Lending>, k: Int|
-      match lendings.at(k) { Some(l) -> g.push(l), None -> g });
-    let hs = handings(group_handings(group, done));
-    range(0, group.len()).fold(done, |m: Map<Bytes, Handing>, k: Int|
-      match group.at(k) {
-        Some(l) -> match hs.at(k) { Some(h) -> m.insert(l.def, h), None -> m },
-        None -> m,
-      })
-  })
+  graph::components(calls).fold(
+    { handed: published, groups: Map::new() },
+    |done: Settled, comp: List<Int>| {
+      let group = comp.fold([], |g: List<Lending>, k: Int|
+        match lendings.at(k) { Some(l) -> g.push(l), None -> g });
+      let defs = group.map(|l: Lending| l.def);
+      let hs = handings(group_handings(group, done.handed));
+      range(0, group.len()).fold(done, |s: Settled, k: Int|
+        match group.at(k) {
+          Some(l) -> match hs.at(k) {
+            Some(h) -> { handed: s.handed.insert(l.def, h), groups: s.groups.insert(l.def, defs) },
+            None -> s,
+          },
+          None -> s,
+        })
+    },
+  )
 }
 
 /// A handing as text: each parameter `lent` or `given` in order, then how it answers, each
@@ -208,7 +223,8 @@ pub fn conventions(f: Fn, handed: Map<Bytes, Handing>) -> Fn / {abort.raise} = {
 fn key_def(k: RootKey) -> Option<Bytes> =
   match k { Named(n) -> Some(n), At(a) -> Some(a.def), _ -> None }
 
-/// `c` taking its parameters and answering as `h`, the handing of `what`.
+/// `c` taking its parameters and answering as `h`, the handing of `what`. An answer borrowed holds no
+/// count of what holds none where `c` holds it: a specialisation at a scalar answers it owned.
 fn conv_handed(c: Convention, h: Handing, what: Bytes) -> Convention / {abort.raise} =
   if h.params.len() != c.params.len() {
     panic(
@@ -223,7 +239,21 @@ fn conv_handed(c: Convention, h: Handing, what: Bytes) -> Convention / {abort.ra
         ]),
       ),
     )
-  } else { { ..c, params: h.params, answered: h.answer } }
+  } else {
+    {
+      ..c,
+      params: h.params,
+      answered: match h.answer {
+        Owned -> Owned,
+        Borrowed(from) -> if !counted(c.answer) { Owned } else {
+          Borrowed(
+            from.filter(|x: { param: Int, whole: Bool }|
+              match c.reps.at(x.param) { Some(r) -> counted(r), None -> false }),
+          )
+        },
+      },
+    }
+  }
 
 /// `f` with each call of its body and of its closures' bodies written against its callee's handing.
 fn calls_handed(f: Fn, handed: Map<Bytes, Handing>) -> Fn / {abort.raise} =
@@ -766,9 +796,9 @@ fn placed(w: Walk, at: Span) -> Walk = { ..w, at: at }
 
 /// What `val`, bound to `bound` where it binds one, holds and does with its operands. It consumes
 /// what `tir.operands` says it does, but for a call, which lends what its callee lends; a function
-/// applied, which the call reads while its caller holds it; and a value held again as another with
-/// no object made, which holds what its operand holds. A value read out of another holds that one's
-/// bases as read out of them, a part of a transparent value or a sum's payload as they are.
+/// applied, which the call reads while its caller holds it; and a word held again as another
+/// (`verify.re_held`), which holds what its operand holds. A value read out of another holds that
+/// one's bases as read out of them, a part of a transparent value or a sum's payload as they are.
 fn valued(s: Sight, w: Walk, val: Val, bound: Option<Var>) -> { walk: Walk, origin: Origin } =
   match val {
     Prim(_) -> { walk: w, origin: made() },
@@ -810,10 +840,12 @@ fn valued(s: Sight, w: Walk, val: Val, bound: Option<Var>) -> { walk: Walk, orig
         },
       },
     Take(t) -> { walk: w, origin: read_out(origin_of(w, t.of)) },
-    Pack(p) -> if allocates(rep_of_arg(p.arg), p.to) {
-      { walk: consumed(w, p.arg), origin: made() }
-    } else if counted(p.to) { { walk: w, origin: arg_origin(w, p.arg) } }
-    else { { walk: w, origin: none() } },
+    Pack(p) -> match match bound { Some(y) -> re_held(y, val), None -> None } {
+      Some(x) -> { walk: w, origin: origin_of(w, x) },
+      None -> if operands(val).any(|o: { arg: Arg, takes: Bool }| o.takes) {
+        { walk: consumed(w, p.arg), origin: made() }
+      } else { { walk: w, origin: none() } },
+    },
     // The ownership pass holds a value gathered from counted parts as a count of its own, but for
     // a one-word sum gathered from one word, which holds that word again.
     Gathered(g) -> {
@@ -870,23 +902,33 @@ fn handing_at(look: Map<Bytes, Handing>, generics: List<Bytes>, c: Callee, arity
     },
   }
 
-/// The handing of a root written for a type, `arity` operands: a comparison, a reflection, a
-/// printing, a digest, a lowering, a container's walk and a lowering's loop over a list's items or
-/// entries only read their operands and answer afresh; any other, a lifting's loop among them, takes
-/// them.
-pub fn written_handing(op: TypeOp, arity: Int) -> Handing = {
-  let reads = match op {
+/// The handing of a root written for a type, `arity` operands, as its generator writes it and the
+/// runtime calls it: a comparison, a reflection, a printing, a digest, a lowering, a container's walk
+/// (but for the list a gathering walk adds to) and a lowering's loop over a list's items or entries,
+/// a share, a keep and a count taken once more only read their operands and answer afresh, and so
+/// does the entry the runtime lowers a word form through, which it lends that word; a drop, a
+/// release, a copy, a lifting and a lifting's loop take them. A case's root hands as its operation
+/// does.
+pub fn written_handing(op: TypeOp, arity: Int) -> Handing =
+  { params: range(0, arity).map(|k: Int| if reads(op, k) { Lent } else { Given }), answer: Owned }
+
+/// Whether the root written for a type that does `op` only reads its operand `k`.
+fn reads(op: TypeOp, k: Int) -> Bool =
+  match op {
     Equal -> true,
     Order -> true,
     Reflect -> true,
     Shown -> true,
     Digest -> true,
     Lower -> true,
-    Contained(c) -> contained_reads(c),
+    Share -> true,
+    Keep -> true,
+    Dup -> true,
+    Contained(c) -> contained_reads(c, k),
+    Cased(c) -> reads(c.op, k),
+    Worded(w) -> reads(w, k),
     _ -> false,
-  };
-  { params: range(0, arity).map(|_: Int| if reads { Lent } else { Given }), answer: Owned }
-}
+  }
 
 /// The definition a call of `c` runs, by name: a definition, one at type arguments, or the one a
 /// generic call names, which `generics` holds by the call's number.
@@ -903,23 +945,108 @@ fn called(l: Lending) -> List<Bytes> =
   calls_in(l.f.links.generics.map(|g: GenericCall| g.callee), l.group, l.f.body)
 
 fn calls_in(generics: List<Bytes>, acc: List<Bytes>, b: Block) -> List<Bytes> =
-  b.fold(acc, |a: List<Bytes>, i: Inst|
+  vals_folded(b, acc, |a: List<Bytes>, v: Val| call_named(generics, a, v))
+
+/// `acc` folded by `on` over each value `b` and the blocks it holds bind or do.
+fn vals_folded<s>(b: Block, acc: s, on: (s, Val) -> s) -> s =
+  b.fold(acc, |a: s, i: Inst|
     match i {
-      Let(l) -> call_named(generics, a, l.val),
-      Do(d) -> call_named(generics, a, d.val),
-      If(x) -> calls_in(generics, calls_in(generics, a, x.then), x.otherwise),
+      Let(l) -> on(a, l.val),
+      Do(d) -> on(a, d.val),
+      If(x) -> vals_folded(x.otherwise, vals_folded(x.then, a, on), on),
       Case(c) ->
-        c.arms.fold(
-          calls_in(generics, a, c.rest),
-          |n: List<Bytes>, arm: { when: Int, body: Block }| calls_in(generics, n, arm.body),
-        ),
+        c.arms.fold(vals_folded(c.rest, a, on), |n: s, arm: { when: Int, body: Block }|
+          vals_folded(arm.body, n, on)),
       Match(m) ->
-        m.arms.fold(calls_in(generics, a, m.rest), |n: List<Bytes>, arm: Block|
-          calls_in(generics, n, arm)),
-      Loop(l) -> calls_in(generics, a, l.body),
-      Handle(h) -> calls_in(generics, a, h.body),
+        m.arms.fold(vals_folded(m.rest, a, on), |n: s, arm: Block| vals_folded(arm, n, on)),
+      Loop(l) -> vals_folded(l.body, a, on),
+      Handle(h) -> vals_folded(h.body, a, on),
       _ -> a,
     })
+
+/// The handing each definition `outside` names was written against by the calls of `f`'s body and
+/// of its closures' bodies, as `handed` holds it, each definition once, as an answer publishes it.
+fn assumed_in(f: Fn, handed: Map<Bytes, Handing>, outside: (Bytes) -> Bool) -> List<Published> = {
+  let generics = f.links.generics.map(|g: GenericCall| g.callee);
+  let added = |a: List<Published>, p: Published|
+    if a.any(|x: Published| x.def == p.def) { a } else { a.push(p) };
+  let own = vals_folded(f.body, [], |a: List<Published>, v: Val|
+    match v {
+      Call(c) -> match callee_def(generics, c.callee) {
+        Some(d) -> if !outside(d) { a }
+        else { added(a, published_of(d, handing_at(handed, generics, c.callee, c.args.len()))) },
+        None -> a,
+      },
+      _ -> a,
+    });
+  f.lambdas.fold(own, |a: List<Published>, l: Lambda|
+    match l { Closure(c) -> assumed_in(c.body, handed, outside).fold(a, added) })
+}
+
+/// `h`, the handing of definition `def`, as an answer publishes it.
+pub fn published_of(def: Bytes, h: Handing) -> Published =
+  {
+    def: def,
+    lent: h.params.map(|p: Handed| p == Lent),
+    borrowed: match h.answer { Owned -> None, Borrowed(from) -> Some(from) },
+  }
+
+/// The handings answers published as `ps`, by definition.
+pub fn handed_from(ps: List<Published>) -> Map<Bytes, Handing> =
+  ps.fold(Map::new(), |m: Map<Bytes, Handing>, p: Published|
+    m.insert(p.def, {
+      params: p.lent.map(|l: Bool| if l { Lent } else { Given }),
+      answer: match p.borrowed { None -> Owned, Some(from) -> Borrowed(from) },
+    }))
+
+/// A form of the build written against the handings the inference settled: the handings of the
+/// definitions it defines as its answer publishes them; those of the definitions outside its group
+/// it was written against, a specialisation's own definition's among them; and that group where it
+/// holds more than the form's own.
+pub type LentForm = {
+  form: Fn,
+  handings: List<Published>,
+  assumed: List<Published>,
+  group: List<Bytes>,
+}
+
+/// `f`, a form of the build, written against `s`: its own convention, each member's, and each of its
+/// calls' as their definitions' handings say (`conventions`).
+pub fn lent_form(f: Fn, s: Settled) -> LentForm / {abort.raise} = {
+  let lent = conventions(f, s.handed);
+  let own = if lent.members.len() == 0 { [{ key: lent.key, conv: lent.conv }] }
+  else { lent.members.map(|m: Member| { key: m.key, conv: m.conv }) };
+  let defs = own.fold([], |acc: List<Bytes>, o: { key: RootKey, conv: Convention }|
+    match o.key { Named(n) -> acc.push(n), _ -> acc });
+  let group = defs.fold(defs, |acc: List<Bytes>, d: Bytes|
+    match s.groups.get(d) {
+      Some(g) -> g.fold(acc, |a: List<Bytes>, x: Bytes| if a.contains(x) { a } else { a.push(x) }),
+      None -> acc,
+    });
+  // A specialisation takes as its definition hands, whichever form of the build settled that.
+  let specialised = own.fold([], |acc: List<Published>, o: { key: RootKey, conv: Convention }|
+    match o.key {
+      At(a) ->
+        acc.push(
+          published_of(a.def, match s.handed.get(a.def) {
+            Some(h) -> h,
+            None -> taking_all(o.conv.params.len()),
+          }),
+        ),
+      _ -> acc,
+    });
+  {
+    form: lent,
+    handings: defs.fold([], |acc: List<Published>, d: Bytes|
+      match s.handed.get(d) { Some(h) -> acc.push(published_of(d, h)), None -> acc }),
+    assumed: assumed_in(lent, s.handed, |d: Bytes| !group.contains(d)).fold(
+      specialised,
+      |a: List<Published>, p: Published|
+        if a.any(|x: Published| x.def == p.def) { a } else { a.push(p) },
+    ),
+    group: if group.len() > defs.len() { group } else { [] },
+  }
+}
 
 fn call_named(generics: List<Bytes>, a: List<Bytes>, v: Val) -> List<Bytes> =
   match v {
@@ -1350,7 +1477,7 @@ test "every recursion group is settled after the groups it calls" {
     bind(r, call_of(b"keeps", [AVar(s)])),
     Return(AVar(r)),
   ]);
-  let handed = handings_of([hands, keeps], Map::new());
+  let handed = handings_of([hands, keeps], Map::new()).handed;
   assert_eq(handed.get(b"m.hands"), Some({ params: [Given], answer: Owned }));
   assert_eq(handed.get(b"m.keeps"), Some({ params: [Given], answer: Owned }))
 }
@@ -1477,6 +1604,13 @@ test "a root written for a type lends what it reads, and a drop takes its operan
       Contained(b"lift_entries"),
     ].map(|op: TypeOp| written_handing(op, 2).params),
     [[Lent, Lent], [Given, Given], [Lent, Lent], [Lent, Lent], [Given, Given], [Given, Given]],
+  );
+  // A walk reads the containers it compares, and a gathering walk the one it walks, not the list it
+  // gathers onto, which it starts again with grown.
+  assert_eq(
+    [Contained(b"equal_from"), Contained(b"digest_from")].map(|op: TypeOp|
+      written_handing(op, 3).params),
+    [[Lent, Lent, Lent], [Lent, Given, Lent]],
   )
 }
 
@@ -1524,6 +1658,13 @@ test "a body is written against its own handing and each callee's, a callee noth
   // fixed handing.
   let at = { ..f, key: At({ def: b"m.f", args: [], lent: [] }) };
   assert_eq(conventions(at, handed).conv.params, [Lent]);
+  // Where a specialisation holds a scalar, what its definition answers borrowed of it is owned.
+  let borrowing = handed.insert(b"m.f", read);
+  let scalar = { ..at, params: [int(0)], conv: { ..at.conv, reps: [RInt], answer: RInt } };
+  assert_eq(
+    [conventions(at, borrowing).conv.answered, conventions(scalar, borrowing).conv.answered],
+    [read.answer, Owned],
+  );
   let for_type = |op: TypeOp|
     conventions(
       {

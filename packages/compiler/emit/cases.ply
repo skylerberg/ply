@@ -27,7 +27,7 @@ import emit.keys
 import emit.keys (RootKey, Named, Written, FnArg, TypeOp, Order, Reflect, Shown, Digest, Contained,
                   at_key, root_name)
 import emit.answer (Defined, Expect, Head, word_head, GenericCall, Need, Exact, Layout, Scalar,
-                    no_generics, Tables, no_tables, Emitted, Body, Refused, RootAnswer)
+                    no_generics, Tables, no_tables, Emitted, Body, Refused, RootAnswer, Published)
 import emit.statics (SBytes, SEmbedded, statics_of)
 import emit.reps (Ctors, SumCtor, no_ctors, ctors_of, ctor_sums, at_args, has_vars)
 import emit.compare (program_of, formed)
@@ -2701,6 +2701,7 @@ fn answers_at(
   ctors: List<Bytes>,
   wanted: List<RootKey>,
   shipped: List<Source> = [],
+  published: List<Published> = [],
 ) -> List<RootAnswer> / {abort.raise} = {
   let d = if shipped.len() == 0 { dump_of(analyse(parse_all(zip_sources(names, srcs)))) }
   else { dump_of(analyse_pulling_std_with(zip_sources(names, srcs), shipped, no_rows()).out) };
@@ -2715,6 +2716,7 @@ fn answers_at(
     d.embeds,
     d.rows,
     d.walked,
+    published,
   )
 }
 
@@ -2770,11 +2772,15 @@ test "a generic definition reached at a type held apart from a word is emitted a
   assert_eq(body(b"m.same").tables.generics.calls, [
     { callee: b"m.id", args: types_spelled([b"String"]), carried: [], fns: [] },
   ]);
-  // `twice` reads its witness, which a scalar argument does in C; `id` needs nothing of its argument
-  // and is printed as it stands.
+  // `twice` reads its witness, which a scalar argument does in C; `id` lends its argument and
+  // answers it borrowed, which its entry lets go of and counts again at its type, so its callers
+  // settle it.
   assert(body(b"m.twice").tables.generics.needs.contains({ var: 0, reads: Scalar }), None);
-  assert_eq(body(b"m.id").tables.generics.needs, []);
-  assert(body(b"m.id").text.len() > 0, None);
+  assert_eq(body(b"m.id").tables.generics.needs, [
+    { var: 0, reads: Exact },
+    { var: 0, reads: Layout },
+  ]);
+  assert_eq(body(b"m.id").text, b"");
   // At `Float` the witnessed `+` is C's own, and the parameter a `double`.
   assert(has(b"m.twice@Float", b"double "));
   assert(!has(b"m.twice@Float", b"numeric_binary"));
@@ -2865,17 +2871,22 @@ test "a tail loop runs at the types it is called at, each member at the argument
     { callee: b"m.spin", args: types_spelled([b"Float", b"Int"]), carried: [0, 1], fns: [] },
     { callee: b"m.ping", args: types_spelled([b"Float"]), carried: [0], fns: [] },
   ]);
-  // `spin` as it stands lets go of values of both its variables, so its callers settle it. Its call
-  // hands `y` on as `x`: at `Float, Int` it loops through itself at `Int, Float`, under the first.
+  // `spin` lends values of both its variables, which its entry lets go of, so its callers settle it.
+  // Its call hands `y` on as `x`: at `Float, Int` it loops through itself at `Int, Float`, under the
+  // first.
   assert_eq(body(b"m.spin").text, b"");
   assert_eq(body(b"m.spin@Float,Int").tables.members, [b"m.spin@Float,Int", b"m.spin@Int,Float"]);
   assert(loops(b"m.spin@Float,Int"));
   assert_eq(body(b"m.spin@Float,Int").tables.generics.calls, []);
-  // `ping` and `pong` as they stand are one loop its callers settle at each variable; asked for by
-  // `pong`, the loop at `Float` is formed under `ping`, and reads no variable.
+  // `ping` and `pong` as they stand are one loop its callers settle at each variable: each lends `x`
+  // and answers it borrowed, which its entry lets go of and counts again. Asked for by `pong`, the
+  // loop at `Float` is formed under `ping`, and reads no variable.
   assert_eq(body(b"m.ping").text, b"");
   assert_eq(body(b"m.ping").tables.members, [b"m.ping", b"m.pong"]);
-  assert_eq(body(b"m.ping").tables.generics.needs, [{ var: 0, reads: Exact }]);
+  assert_eq(body(b"m.ping").tables.generics.needs, [
+    { var: 0, reads: Exact },
+    { var: 0, reads: Layout },
+  ]);
   assert_eq(body(b"m.ping@Float").tables.members, [b"m.ping@Float", b"m.pong@Float"]);
   assert(loops(b"m.ping@Float"));
   assert_eq(
@@ -3398,13 +3409,13 @@ test "an accumulator read more than once is still answered as its fields at the 
     assert_eq(has(t), [false, false]))
 }
 
-test "a branch lets go as it opens of a parameter only another branch reads, and of nothing of a record whose field it read" {
+test "a branch lets go as it opens of a parameter only another branch takes, and of nothing of a record whose field it read" {
   let src = Bytes::concat_all([
     b"type S = { out: Bytes, n: Int }\n",
     b"type W = { out: Bytes, n: Int, a: Int, b: Int, c: Int }\n",
     b"fn whole(s: S) -> Int = s.n\n",
     b"fn wide(w: W) -> Int = w.n\n",
-    b"fn slot(x: Bytes, c: Bool) -> Int = if c { x.len() } else { 0 }\n",
+    b"fn slot(x: Bytes, c: Bool) -> Int = if c { Bytes::len(x ++ b\"y\") } else { 0 }\n",
     b"fn field(s: S) -> Int = { let out = s.out; if s.n < 0 { whole(s) } else { Bytes::len(out ++ b\"x\") + s.n } }\n",
     b"fn wide_field(w: W) -> Int = { let out = w.out; if w.n < 0 { wide(w) } else { Bytes::len(out ++ b\"x\") + w.n } }\n",
   ]);
@@ -3551,4 +3562,74 @@ test "a body that names a constructor calls no root for it, whatever key or show
   // the show its type states.
   [stating, plain].fold((), |_: Unit, src: Bytes|
     assert_eq(calls(src).map(|c: { name: Bytes, calls: List<Bytes> }| c.calls), [[], [], [], []]))
+}
+
+// --- Lending -----------------------------------------------------------------------------------
+
+fn lending_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"type T = | Leaf | Node(T, Int, T)\n",
+    b"fn weight(t: T) -> Int = match t { Leaf -> 0, Node(_, n, _) -> n }\n",
+    b"fn twice(t: T) -> Int = weight(t) + weight(t)\n",
+    b"fn grown(t: T) -> T = Node(t, 1, Leaf)\n",
+    b"fn both(t: T) -> T = if weight(t) > 0 { grown(t) } else { t }\n",
+  ])
+
+fn handed(def: Bytes, lent: List<Bool>) -> Published = { def: def, lent: lent, borrowed: None }
+
+test "a parameter a body only reads is lent: neither it nor a caller counts it for the call" {
+  let out = emit_all_program([{ name: b"m", src: lending_corpus() }], [], [], true);
+  assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None]);
+  let code = out.map(|e: Emitted| own_code(e.text));
+  // Given, `weight` would let go of its tree and `twice` count it once more for the first call.
+  // `both` takes its tree, lends it to `weight` with no count taken, and lets it go only where that
+  // call fails.
+  assert_eq(code.map(counts_any), [false, false, false, true]);
+  assert_eq(code.map(takes_count), [false, false, false, false]);
+  assert_eq(out.map(|e: Emitted| e.tables.handings), [
+    [handed(b"m.weight", [true])],
+    [handed(b"m.twice", [true])],
+    [handed(b"m.grown", [false])],
+    [handed(b"m.both", [false])],
+  ]);
+  assert_eq(out.map(|e: Emitted| e.tables.assumed), [
+    [],
+    [handed(b"m.weight", [true])],
+    [],
+    [handed(b"m.weight", [true]), handed(b"m.grown", [false])],
+  ])
+}
+
+test "a body is written against the handing another answer publishes for its callee, and says it assumed it" {
+  let twice = |published: List<Published>|
+    match answers_at([b"m"], [lending_corpus()], [], [Named(b"m.twice")], [], published) {
+      [a] -> match a.answer {
+        Body(b) ->
+          Some({
+            counted: takes_count(own_code(b.text)),
+            assumed: b.tables.assumed,
+            handings: b.tables.handings,
+          }),
+        Refused(_) -> None,
+      },
+      _ -> None,
+    };
+  // A callee no answer publishes takes all it is handed, so its caller counts the tree it hands on
+  // twice, and is given it.
+  assert_eq(
+    twice([]),
+    Some({
+      counted: true,
+      assumed: [handed(b"m.weight", [false])],
+      handings: [handed(b"m.twice", [false])],
+    }),
+  );
+  assert_eq(
+    twice([handed(b"m.weight", [true])]),
+    Some({
+      counted: false,
+      assumed: [handed(b"m.weight", [true])],
+      handings: [handed(b"m.twice", [true])],
+    }),
+  )
 }
