@@ -11,9 +11,9 @@ import check.types (TyCon)
 import emit.c (KNum, KInt, KBool, KFloat, KDec, ctype, width_index, int_lit)
 import emit.pieces (Piece, Text, Hole, ShapeOf, spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RFlat, RSlice, RToken, Var, Arg, AVar,
-                 AInt, AZero, Made, MRecord, MBox, MCase, Path, PField, PNamed, PArg, PCapture,
-                 PLeaf, PCase, PPayload, RUnit, RSum, Data, Convention, Given, Lent, Owned,
-                 rep_of_arg, rep_said, var_said, made_said)
+                 AInt, AZero, Made, MRecord, MCase, Path, PField, PNamed, PArg, PCapture, PLeaf,
+                 PCase, PPayload, RUnit, RSum, Data, Convention, Given, Lent, Owned, rep_of_arg,
+                 rep_said, var_said, made_said)
 import emit.layout (Laid, LWords, LRecord, LSum, SumLaid, P, S, U, Nullary, Inline, Boxed, WordIs,
                     LowBits, words, header_bytes, pointer_floor, tag_bits, CaseArgs, sum_laid,
                     record_laid, raw)
@@ -397,13 +397,12 @@ pub fn made(
   p: Place,
   pr: Printing,
   into: Option<Var>,
-  m: { made: Made, args: List<Arg>, reuse: Option<Var>, kept: List<Int> },
+  m: { made: Made, args: List<Arg>, reuse: Option<Var> },
 ) -> Printing / {abort.raise} =
   match into {
     None -> unprinted(Data, b"a value made that nothing holds", made_said(m.made)),
     Some(v) -> match m.made {
       MRecord(r) -> by_value(p, pr, v, r.names, m.args),
-      MBox(b) -> box_made(p, pr, v, None, b.words, m.args, m.reuse, m.kept),
       MCase(c) ->
         box_made(
           p,
@@ -413,7 +412,6 @@ pub fn made(
           c.skip + c.words,
           m.args,
           m.reuse,
-          m.kept,
         ),
       other -> unprinted(Data, b"a value no printer of this family makes", made_said(other)),
     },
@@ -421,7 +419,7 @@ pub fn made(
 
 /// A block of `n` words holding `args`' words one after another, which it takes, after the case's
 /// place in its first word where `tag` gives one: in the cells `reuse` names where they are some,
-/// which hold the arguments `kept` already, and else allocated by its size.
+/// and else allocated by its size.
 fn box_made(
   p: Place,
   pr: Printing,
@@ -430,7 +428,6 @@ fn box_made(
   n: Int,
   args: List<Arg>,
   reuse: Option<Var>,
-  kept: List<Int>,
 ) -> Printing = {
   let nm = named(pr, v);
   let allocated = Bytes::concat_all([
@@ -444,46 +441,40 @@ fn box_made(
     Some(c) -> [Bytes::concat_all([slot(nm.name, 0), b" = ", int_lit(c), b";"])],
     None -> [],
   };
-  let writes = |all: Bool|
-    Bytes::join(
-      tagged.concat(
-        range(0, args.len()).fold(
-          { at: first, out: [] },
-          |acc: { at: Int, out: List<Bytes> }, k: Int| {
-            let a = match args.at(k) { Some(x) -> x, None -> AZero(RWord) };
-            let held = values_of(rep_of_arg(a));
-            let ws = words_laid(arg_parts(pr, a), held);
-            {
-              at: acc.at + words_held(held),
-              out: if !all && kept.contains(k) { acc.out } else {
-                acc.out.concat(
-                  range(0, ws.len()).map(|j: Int|
-                    Bytes::concat_all([slot(nm.name, acc.at + j), b" = ", nth(ws, j), b";"])),
-                )
-              },
-            }
-          },
-        ).out,
-      ),
-      b" ",
-    );
+  let writes = Bytes::join(
+    tagged.concat(
+      range(0, args.len()).fold(
+        { at: first, out: [] },
+        |acc: { at: Int, out: List<Bytes> }, k: Int| {
+          let a = match args.at(k) { Some(x) -> x, None -> AZero(RWord) };
+          let held = values_of(rep_of_arg(a));
+          let ws = words_laid(arg_parts(pr, a), held);
+          {
+            at: acc.at + words_held(held),
+            out: acc.out.concat(
+              range(0, ws.len()).map(|j: Int|
+                Bytes::concat_all([slot(nm.name, acc.at + j), b" = ", nth(ws, j), b";"])),
+            ),
+          }
+        },
+      ).out,
+    ),
+    b" ",
+  );
   line(nm.pr, p.depth, match reuse {
-    None -> Bytes::concat_all([b"Word ", allocated, b" ", writes(true)]),
+    None -> Bytes::concat_all([b"Word ", allocated, b" ", writes]),
     Some(tok) ->
       Bytes::concat_all([
         b"Word ",
         nm.name,
         b" = ",
         name_of(pr, tok),
-        b"; if (",
+        b"; if (!",
         nm.name,
-        b") { ",
-        writes(false),
-        b" } else { ",
+        b") ",
         allocated,
         b" ",
-        writes(true),
-        b" }",
+        writes,
       ]),
   })
 }
@@ -1144,30 +1135,23 @@ test "a box is allocated by its size and its words written, a boxed case's place
     made: MCase({ case: 8, skip: 1, words: 1 }),
     args: [AVar(local(0, RWord))],
     reuse: None,
-    kept: [],
   };
   assert_eq(
     spelled(made(place(), pr, Some(local(2, RWord)), m).out),
     b"  Word t1 = rt_alloc_bytes_p(ctx, INT64_C(32)); ply_words(t1)[0] = INT64_C(8); ply_words(t1)[1] = p0;\n",
   );
-  // In a reused block, what it holds already is not written again.
-  let boxed_pair = {
-    made: MBox({ words: 2 }),
+  // In the cells a reset kept it is written as in a fresh block, which it is where the reset kept none.
+  let reused = {
+    made: MCase({ case: 1, skip: 0, words: 2 }),
     args: [AVar(local(0, RWord)), AVar(local(1, RInt))],
     reuse: Some(local(3, RToken(2))),
-    kept: [0],
   };
   let text = spelled(
-    made(
-      place(),
-      { ..pr, names: pr.names.insert(3, b"p3") },
-      Some(local(2, RWord)),
-      boxed_pair,
-    ).out,
+    made(place(), { ..pr, names: pr.names.insert(3, b"p3") }, Some(local(2, RWord)), reused).out,
   );
   assert(
     text.index_of(
-        b"Word t1 = p3; if (t1) { ply_words(t1)[1] = (Word)(p1); } else { t1 = rt_alloc_bytes_p(ctx, INT64_C(32)); ply_words(t1)[0] = p0; ply_words(t1)[1] = (Word)(p1); }",
+        b"Word t1 = p3; if (!t1) t1 = rt_alloc_bytes_p(ctx, INT64_C(32)); ply_words(t1)[0] = p0; ply_words(t1)[1] = (Word)(p1);",
       )
       != None,
     Some(String::of_bytes_lossy(text)),
