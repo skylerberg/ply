@@ -13,7 +13,7 @@ import syntax.parsing (Span, starts_upper, dummy_span)
 import check.resolve.tables (qualify)
 import check.infer.checker (is_test_owner)
 import std.bytes (ascii_of_int)
-import emit.reps (Def, Imported, EmitParam, BoundLambda, erased, has_vars, carried_vars,
+import emit.reps (Def, Imported, EmitParam, BoundLambda, erased, has_vars, carried_vars, word_type,
                   substituted, substituted_fully, type_vars, resumption, resumed)
 import emit.answer (Layout, Exact)
 import emit.release (released_vars)
@@ -242,7 +242,7 @@ pub fn global(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered / {ab
             Some(ToCtor(c)) -> constructed(o.cx, o.st, c, params, at, at),
             Some(ToDef(full)) -> called(o.cx, o.st, full, func, [], params, false, at),
             Some(ToBuiltin(b)) -> if cx.setting.builtins.contains(b) {
-              builtin(o.cx, o.st, b, params, at, at)
+              called_builtin(o.cx, o.st, b, params, at, at)
             } else {
               refuse(o.st, Calling, b"a global the lowering does not resolve: ".concat(name))
             },
@@ -486,7 +486,7 @@ fn in_frame(
             Some(c) -> {
               let read = bound_as(
                 acc.st,
-                capture_type(st, k.lambda.at, i),
+                captured_type(cx, st, k.lambda, i),
                 RWord,
                 Get({ of: closure, path: PCapture(i) }),
                 at,
@@ -618,43 +618,10 @@ fn stepped_in(
       Some(t) -> match lowered.at(1) {
         Some(Some(budget)) -> {
           let v = step_vars(cx, st, t.state, t.answer);
-          let c = bound_as(
+          let spent_one = pass_begun(
             frame_entered({ ..cx, frame: l.at }, opened(v.st), at),
-            bool_type(),
-            RBool,
-            Prim({ op: b"le", on: RInt, args: [AVar(v.left), AInt(0)] }),
-            at,
-          );
-          let k = fresh(c.st, bool_type(), RBool);
-          let guarded = emitted(
-            k.st,
-            If({
-              cond: c.arg,
-              then: [
-                Let({
-                  var: k.var,
-                  val: Prim({ op: b"ge", on: RInt, args: [budget, AInt(1)] }),
-                  at: at,
-                  unwind: [],
-                }),
-                Do({
-                  val: Native({
-                    name: b"rt_iterate_bad_p",
-                    args: [AVar(k.var), budget],
-                    uses: spent(),
-                  }),
-                  at: at,
-                  unwind: [],
-                }),
-              ],
-              otherwise: [],
-            }),
-          );
-          let spent_one = bound_as(
-            guarded,
-            int_type(),
-            RInt,
-            Prim({ op: b"sub", on: RInt, args: [AVar(v.left), AInt(1)] }),
+            v.left,
+            budget,
             at,
           );
           match l.captures.fold(
@@ -687,19 +654,117 @@ fn stepped_in(
     _ -> { cx: cx, st: refuse(st, Calling, b"a step that is no lambda").st },
   }
 
-/// The types a step lambda's parameter and the loop's answer hold: `a` and `b` of its `(a) -> Iter<a, b>`.
-fn step_typed(cx: Context, l: Lambda) -> Option<{ state: Type, answer: Type }> =
-  match filed_fn(cx, l.at, 1) {
-    Some(f) -> match f.ret {
-      TyCon(c) -> if c.name != b"Iter" || c.args.len() != 2 { None } else {
-        match f.params.at(0) {
-          Some(a) -> match c.args.at(1) { Some(b) -> Some({ state: a, answer: b }), None -> None },
-          None -> None,
+/// A step's pass begun in `st`: the loop's budget, `left` before this pass, checked against the
+/// `budget` it was handed, which raises once it is spent; then what this pass leaves the next.
+fn pass_begun(st: Lowering, left: Var, budget: Arg, at: Span) -> Lowered = {
+  let c = bound_as(
+    st,
+    bool_type(),
+    RBool,
+    Prim({ op: b"le", on: RInt, args: [AVar(left), AInt(0)] }),
+    at,
+  );
+  let k = fresh(c.st, bool_type(), RBool);
+  let guarded = emitted(
+    k.st,
+    If({
+      cond: c.arg,
+      then: [
+        Let({
+          var: k.var,
+          val: Prim({ op: b"ge", on: RInt, args: [budget, AInt(1)] }),
+          at: at,
+          unwind: [],
+        }),
+        Do({
+          val: Native({ name: b"rt_iterate_bad_p", args: [AVar(k.var), budget], uses: spent() }),
+          at: at,
+          unwind: [],
+        }),
+      ],
+      otherwise: [],
+    }),
+  );
+  bound_as(
+    guarded,
+    int_type(),
+    RInt,
+    Prim({ op: b"sub", on: RInt, args: [AVar(left), AInt(1)] }),
+    at,
+  )
+}
+
+/// `iterate(seed, budget, step)` on a step that is a function value: the loop the call of a step
+/// lambda runs in place, each pass applying the step to the state through its descriptor, the step
+/// lent, and going on with what a `Continue` holds or leaving with what a `Stop` holds.
+pub fn iterated(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / {abort.raise} =
+  match args {
+    [seed, budget, step] -> match match type_of(step) {
+        TyFn(f) -> iter_of(f.params, f.ret),
+        _ -> None,
+      } {
+      None -> refuse(st, Calling, b"a step at no `Iter` type"),
+      Some(t) -> {
+        let v = step_vars(cx, st, t.state, t.answer);
+        let begun = pass_begun(opened(v.st), v.left, budget, at);
+        let r = applied(cx, begun.st, step, [AVar(v.state)], false, at);
+        let left = match begun.arg { AVar(x) -> x, _ -> v.left };
+        let pass = tested(cx, r.st.insts, r.arg, {
+          state: v.state,
+          left: left,
+          answer: v.answer,
+          next: r.st.next,
+          at: at,
+        });
+        let seeded = handed(
+          { st: { ..r.st, insts: st.insts, next: pass.next }, arg: seed },
+          v.state.rep,
+          at,
+        );
+        {
+          st: emitted(
+            seeded.st,
+            Loop({
+              state: [v.state, v.left],
+              init: [seeded.arg, budget],
+              body: pass.block,
+              answer: v.answer,
+            }),
+          ),
+          arg: AVar(v.answer),
         }
       },
-      _ -> None,
     },
-    None -> None,
+    _ -> refuse(st, Calling, b"an `iterate` of other than a seed, a budget and a step"),
+  }
+
+/// A call of builtin `name` on `args`: `iterate` on a step that is a function value as `iterated`'s
+/// loop, and any other as the containers family lowers it.
+pub fn called_builtin(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  callee: Span,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  if name == b"iterate" { iterated(cx, st, args, at) }
+  else { builtin(cx, st, name, args, callee, at) }
+
+/// The types a step lambda's parameter and the loop's answer hold: `a` and `b` of its `(a) -> Iter<a, b>`.
+fn step_typed(cx: Context, l: Lambda) -> Option<{ state: Type, answer: Type }> =
+  match filed_fn(cx, l.at, 1) { Some(f) -> iter_of(f.params, f.ret), None -> None }
+
+/// `a` and `b` of a step's type `(a) -> Iter<a, b>`, its parameters `params` and answer `ret`.
+fn iter_of(params: List<Type>, ret: Type) -> Option<{ state: Type, answer: Type }> =
+  match ret {
+    TyCon(c) -> if c.name != b"Iter" || c.args.len() != 2 || params.len() != 1 { None } else {
+      match params.at(0) {
+        Some(a) -> match c.args.at(1) { Some(b) -> Some({ state: a, answer: b }), None -> None },
+        None -> None,
+      }
+    },
+    _ -> None,
   }
 
 /// The function type the checker filed for the lambda at `at`, of `arity` parameters: what each
@@ -1037,6 +1102,7 @@ pub fn closure(
         kind: Rooted,
         params: s.params,
         conv: s.conv,
+        answer_ty: if frame.resumes { word_type() } else { s.ret },
         // Written inside a lent lambda, its sites are the lender's, as the run it was written in.
         body: match cx.lender {
           Some(l) -> [Sited(Some({ root: l.owner, base: cx.base }))].concat(insts),
@@ -1155,6 +1221,7 @@ pub fn grouped(
           kind: Rooted,
           params: [which],
           conv: { params: [Given], reps: [RInt], answer: RWord, answered: tir::Owned },
+          answer_ty: first.cx.answer_ty,
           body: [
             Case({
               on: which,
@@ -1265,19 +1332,16 @@ fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Option<Sha
           },
           rep: RWord,
         });
-      let own = range(0, frame.params).map(|j: Int|
-        if continued(j) {
+      let own = f.params.fold([], |acc: List<Var>, t: Type| {
+        let j = acc.len();
+        acc.push(if continued(j) {
           {
             id: n + j,
-            ty: resumption(match f.params.at(j) { Some(TyFn(k)) -> k.ret, _ -> unknown_type() }),
+            ty: resumption(match t { TyFn(k) -> k.ret, _ -> unknown_type() }),
             rep: RWord,
           }
-        } else {
-          match f.params.at(j) {
-            Some(t) -> { id: n + j, ty: t, rep: held_as(cx.setting, t) },
-            None -> { id: n + j, ty: unknown_type(), rep: RWord },
-          }
-        });
+        } else { { id: n + j, ty: t, rep: held_as(cx.setting, t) } })
+      });
       let params = caps.concat(own);
       Some({
         params: params,
@@ -1303,6 +1367,7 @@ fn placeholder(cx: Context) -> Fn =
     kind: Rooted,
     params: [],
     conv: { params: [], reps: [], answer: RWord, answered: tir::Owned },
+    answer_ty: word_type(),
     body: [],
     lambdas: [],
     base: cx.base,
@@ -1320,6 +1385,74 @@ fn capture_type(st: Lowering, at: Span, i: Int) -> Type =
       } else { acc },
       None -> acc,
     })
+
+/// The type capture `i` of `l` holds: as this root's closure of `l` took it, or for a lambda another
+/// root made the closure of, as the checker filed a read of the capture in `l`'s body.
+fn captured_type(cx: Context, st: Lowering, l: Lambda, i: Int) -> Type = {
+  let own = capture_type(st, l.at, i);
+  if own != unknown_type() { own } else {
+    match match l.captures.at(i) { Some(c) -> slot_read_at(l.body, c.dst), None -> None } {
+      Some(at) -> match filed(cx, at) { Some(t) -> t.ty, None -> unknown_type() },
+      None -> unknown_type(),
+    }
+  }
+}
+
+/// Where `c` reads slot `slot` of its frame, or reads it in a barrier inside that copies it in.
+fn slot_read_at(c: Code, slot: Int) -> Option<Span> = {
+  let first = |codes: List<Code>|
+    codes.fold(None, |acc: Option<Span>, x: Code|
+      match acc { Some(_) -> acc, None -> slot_read_at(x, slot) });
+  // The slot a barrier copies `slot` into, where it copies it.
+  let into = |captures: List<Capture>|
+    captures.fold(None, |acc: Option<Int>, k: Capture|
+      match acc { Some(_) -> acc, None -> if k.src == slot { Some(k.dst) } else { None } });
+  match c.node {
+    NVar(v) -> if v.slot == Some(slot) { Some(c.span) } else { None },
+    NKnown(k) -> if k.slot == slot { Some(c.span) } else { None },
+    NUnary(u) -> slot_read_at(u.operand, slot),
+    NBinary(b) -> first([b.lhs, b.rhs]),
+    NApp(a) -> first(a.args.push(a.func)),
+    NIf(i) -> first([i.cond, i.then_branch, i.else_branch]),
+    NBlock(b) ->
+      first(
+        b.stmts.fold(
+          match b.tail { Some(t) -> [t], None -> [] },
+          |acc: List<Code>, stmt: CodeStmt|
+            acc.push(match stmt { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code }),
+        ),
+      ),
+    NList(l) -> first(l.items),
+    NRecord(r) -> first(r.fields.map(|f: CodeField| f.value)),
+    NUpdate(u) -> first(u.sets.map(|f: CodeField| f.value).push(u.base)),
+    NMatch(m) ->
+      first(
+        m.arms.fold([m.scrutinee], |acc: List<Code>, a: CodeArm|
+          List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
+      ),
+    NPerform(p) -> first(match p.label { Some(l) -> p.args.push(l), None -> p.args }),
+    NField(f) -> slot_read_at(f.base, slot),
+    NParallel(p) -> first(p.branches),
+    NLambda(l) -> match into(l.captures) { Some(d) -> slot_read_at(l.body, d), None -> None },
+    NSimulate(s) -> match into(s.captures) { Some(d) -> slot_read_at(s.body, d), None -> None },
+    NHandle(h) -> match slot_read_at(h.body, slot) {
+      Some(x) -> Some(x),
+      None ->
+        h.clauses.fold(
+          match h.ret {
+            Some(r) -> match into(r.captures) { Some(d) -> slot_read_at(r.body, d), None -> None },
+            None -> None,
+          },
+          |acc: Option<Span>, cl: CodeClause|
+            match acc {
+              Some(_) -> acc,
+              None -> match into(cl.captures) { Some(d) -> slot_read_at(cl.body, d), None -> None },
+            },
+        ),
+    },
+    _ -> None,
+  }
+}
 
 /// What a pure definition of no parameters answers, read from what the unit keeps of its one run, of
 /// the type it answers at the type arguments the reference `ref` names it at.
