@@ -13,19 +13,20 @@ import syntax.parsing (Span, starts_upper, dummy_span)
 import check.resolve.tables (qualify)
 import check.infer.checker (is_test_owner)
 import std.bytes (ascii_of_int)
-import emit.reps (Def, Imported, EmitParam, BoundLambda, erased, has_vars, carried_vars, word_type,
-                  substituted, substituted_fully, type_vars, resumption, resumed)
+import emit.reps (Def, Imported, EmitParam, BoundLambda, has_vars, word_type, substituted,
+                  substituted_fully, type_vars, resumption, resumed, layout_key, laid_known)
+import emit.layout (P, classes)
 import emit.answer (Layout, Exact)
 import emit.release (released_vars)
-import emit.keys (RootKey, FnArg, Named, At, Callee, Root, Generic, root_name, definition_of,
-                  key_types, key_lent, unspecialised, at_key)
+import emit.keys (RootKey, FnArg, Named, At, KeyType, KeyLayout, Callee, Root, Generic, root_name,
+                  definition_of, key_types, unspecialised, at_key)
 import emit.tir
 import emit.tir (Rep, RInt, RBool, RWord, RSlice, RSum, RUnit, Var, Arg, AVar, AInt, AZero, Given,
                  Lent, Convention, Val, Prim, Make, Get, Gathered, Pack, Native, Op, OCalling,
-                 MClosure, MCtor, PCapture, PCase, TTag, TInt, Call, Apply, Inst, Let, Do, Decl,
-                 Assign, If, Case, Match, Loop, Next, Done, Restart, Enter, Return, Fail, NoArm,
-                 Sited, Block, Fn, Rooted, Member, Closure, Declined, Calling, no_links,
-                 falls_through, rep_of_arg)
+                 MClosure, PCapture, PCase, TTag, TInt, Call, Apply, Inst, Let, Do, Decl, Assign,
+                 If, Case, Match, Loop, Next, Done, Restart, Enter, Return, Fail, NoArm, Sited,
+                 Block, Fn, Rooted, Member, Closure, Declined, Calling, no_links, falls_through,
+                 rep_of_arg)
 import emit.tir.calling (ConstantRead, Ticked)
 import emit.lower.setting (Setting, Root, imported_target, qualified)
 import emit.lower.held (held_as, case_index, arg_word, typed_convention)
@@ -36,6 +37,7 @@ import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, T
                         capture_note, frame_entered, taken_as, noted)
 import emit.lower.data (constructed)
 import emit.lower.containers (builtin)
+import emit.lower.crossing (metered)
 
 /// The context root `r` of `setting`, a definition of its own, lowers `body` under.
 pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.raise} = {
@@ -47,7 +49,7 @@ pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.rai
     base: r.base,
     params: r.params,
     types: r.types,
-    answer: conventional(setting, crossing(setting.here, r.key, r.types, r.answer_ty)).answer,
+    answer: conventional(setting, crossing(setting, r.key, r.types, r.answer_ty)).answer,
     answer_ty: r.answer_ty,
     body: body,
     tails: Restarts([]),
@@ -75,20 +77,15 @@ fn lending(cx: Context) -> Context / {abort.raise} = {
 
 /// How the root takes its parameters and hands back its answer, as every call of it does.
 pub fn convention(cx: Context) -> Convention / {abort.raise} =
-  conventional(cx.setting, crossing(cx.setting.here, cx.key, cx.types, cx.answer_ty))
+  conventional(cx.setting, crossing(cx.setting, cx.key, cx.types, cx.answer_ty))
 
 /// The types a call of root `key` hands its arguments at and reads its answer at, which its
 /// convention holds them by: a definition's as `crossing_at` reads them at the root's type
 /// arguments, and any other root's own, its parameters' `types` and its `answer`.
-fn crossing(
-  here: List<Def>,
-  key: RootKey,
-  types: List<Type>,
-  answer: Type,
-) -> Crossing / {abort.raise} = {
+fn crossing(s: Setting, key: RootKey, types: List<Type>, answer: Type) -> Crossing / {abort.raise} = {
   let own = unspecialised(key);
-  match here.fold(None, |acc: Option<Crossing>, d: Def|
-      if d.root == own { crossing_at(d, key_types(key)) } else { acc }) {
+  match s.here.fold(None, |acc: Option<Crossing>, d: Def|
+      if d.root == own { crossing_at(s, d, key_types(key)) } else { acc }) {
     Some(c) -> c,
     None -> { params: types, answer: answer },
   }
@@ -99,17 +96,20 @@ type Crossing = { params: List<Type>, answer: Type }
 
 /// The types a call of `d` at type arguments `args` hands its arguments at and reads its answer at,
 /// which a root of it at `args` takes them at alike: its scheme's, each variable the call carries
-/// raw (`carried_vars`) read at its argument as `erased` lays it and every other left a variable, so
-/// a caller and the root the unit settles its call on read the same; each witness before them and
-/// each label after them an `Int`. None where no scheme speaks for `d`.
-fn crossing_at(d: Def, args: List<Type>) -> Option<Crossing> / {abort.raise} =
+/// (`carried_at`) read at its argument and every other left a variable, so a caller and the root
+/// the unit settles its call on read the same; each witness before them and each label after them
+/// an `Int`. None where no scheme speaks for `d`.
+fn crossing_at(s: Setting, d: Def, args: List<Type>) -> Option<Crossing> / {abort.raise} =
   match d.scheme {
     None -> None,
     Some(sc) -> match sc.ty {
       TyFn(f) -> {
-        let raw = carried_vars(sc, args, d.arity);
+        let carried = carried_at(s, sc, args, d.arity);
         let at = range(0, args.len()).map(|j: Int|
-          if raw.contains(j) { erased(args.get(j)) } else { unknown_type() });
+          match args.at(j) {
+            Some(t) -> if carried.contains(j) { t } else { unknown_type() },
+            None -> unknown_type(),
+          });
         let ints = |n: Int| range(0, n).map(|_: Int| int_type());
         Some({
           params: ints(d.witnesses).concat(f.params.map(|t: Type| substituted(t, at))).concat(
@@ -120,6 +120,25 @@ fn crossing_at(d: Def, args: List<Type>) -> Option<Crossing> / {abort.raise} =
       },
       _ -> None,
     },
+  }
+
+/// The variables of `scheme` a call at `args` carries as its arguments are held: each standing bare
+/// as a parameter, or as the answer of a function taking any, at an argument naming no variable that
+/// a body holds other than as a plain word, neither a word nor laid as one pointer, which a generic
+/// body holds alike. The unit settles such a call on the callee's specialisation at each argument's
+/// layout.
+fn carried_at(s: Setting, scheme: Scheme, args: List<Type>, arity: Int) -> List<Int> =
+  match scheme.ty {
+    TyFn(f) ->
+      range(0, args.len()).filter(|j: Int|
+        (f.params.contains(TyVar(j)) || (arity > 0 && f.ret == TyVar(j)))
+          && (match args.at(j) {
+            Some(t) ->
+              !has_vars(t) && held_as(s, t) != RWord
+                && (match laid_known(s.ctors, t) { Some(l) -> classes(l) != [P], None -> false }),
+            None -> false,
+          })),
+    _ -> [],
   }
 
 /// The convention of a root whose parameters and answer cross at `c`'s types.
@@ -734,7 +753,8 @@ pub fn iterated(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered
   }
 
 /// A call of builtin `name` on `args`: `iterate` on a step that is a function value as `iterated`'s
-/// loop, and any other as the containers family lowers it.
+/// loop, `metered` as the crossings lower it around the call of its function, and any other as the
+/// containers family lowers it.
 pub fn called_builtin(
   cx: Context,
   st: Lowering,
@@ -743,8 +763,9 @@ pub fn called_builtin(
   callee: Span,
   at: Span,
 ) -> Lowered / {abort.raise} =
-  if name == b"iterate" { iterated(cx, st, args, at) }
-  else { builtin(cx, st, name, args, callee, at) }
+  if name == b"iterate" { iterated(cx, st, args, at) } else if name == b"metered" {
+    metered(cx, st, args, at, |s: Lowering, f: Arg| applied(cx, s, f, [], false, at))
+  } else { builtin(cx, st, name, args, callee, at) }
 
 /// The types a step lambda's parameter and the loop's answer hold: `a` and `b` of its `(a) -> Iter<a, b>`.
 fn step_typed(cx: Context, l: Lambda) -> Option<{ state: Type, answer: Type }> =
@@ -918,22 +939,6 @@ fn ending(b: Block, made: Var, val: Val, e: Ended) -> Option<Pass> =
       },
       _ -> None,
     },
-    Make(m) -> match m.made {
-      MCtor(c) -> match m.args {
-        [a] -> {
-          let u = unmade(b, a);
-          if names(c.name, b"Continue") {
-            let h = held_into(u.arg, e.state, e);
-            Some({ block: u.block.concat(h.block).push(Next([h.arg, AVar(e.left)])), next: h.next })
-          } else if names(c.name, b"Stop") {
-            let h = held_into(u.arg, e.answer, e);
-            Some({ block: u.block.concat(h.block).push(Done(h.arg)), next: h.next })
-          } else { None }
-        },
-        _ -> None,
-      },
-      _ -> None,
-    },
     _ -> None,
   }
 
@@ -952,9 +957,6 @@ fn unmade(b: Block, a: Arg) -> { block: Block, arg: Arg } =
     },
     _ -> { block: b, arg: a },
   }
-
-/// Whether constructor `name`, as the table names it, is the prelude's `ctor`.
-fn names(name: Bytes, ctor: Bytes) -> Bool = name == ctor || name.ends_with(b".".concat(ctor))
 
 /// `a` held as `into` is, by a `Pack` numbered `e.next` where it is held otherwise.
 fn held_into(a: Arg, into: Var, e: Ended) -> { block: Block, arg: Arg, next: Int } =
@@ -1526,7 +1528,7 @@ fn jumped(
           },
           None -> None,
         } {
-        Some(i) -> match crossing_at(d.def, match keys.at(i) {
+        Some(i) -> match crossing_at(cx.setting, d.def, match keys.at(i) {
             Some(k) -> key_types(k),
             None -> [],
           }) {
@@ -1558,7 +1560,7 @@ fn call(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let n = named_ref(cx, st, d, ref, fn_args(cx, codes));
-  match ((crossing_at(d.def, n.args), answer_type(d.def, n.given))) {
+  match ((crossing_at(cx.setting, d.def, n.args), answer_type(d.def, n.given))) {
     (None, _) ->
       refuse(st, Calling, b"a call of a definition no scheme speaks for: ".concat(d.full)),
     (_, None) ->
@@ -1657,17 +1659,18 @@ fn named_ref(
       },
     Some(given) -> if unspecialised(cx.key) == d.def.root && owns(cx, given, fns) {
       { st: st, callee: Root(cx.key), args: key_types(cx.key), given: given }
-    } else { referred(st, d, given, fns) },
+    } else { referred(cx.setting, st, d, given, fns) },
   }
 
 /// Definition `d` named at type arguments `given`, handing `fns`: as it stands where it is named at
 /// none and handed none, else the body's next generic call.
 fn referred(
+  s: Setting,
   st: Lowering,
   d: Defined,
   given: List<Type>,
   fns: List<FnArg>,
-) -> Reference / {abort.raise} =
+) -> Reference =
   if given.len() == 0 && fns.len() == 0 {
     { st: st, callee: Root(d.def.root), args: [], given: given }
   } else {
@@ -1680,7 +1683,7 @@ fn referred(
             callee: d.full,
             args: given,
             carried: match d.def.scheme {
-              Some(sc) -> carried_vars(sc, given, d.def.arity),
+              Some(sc) -> carried_at(s, sc, given, d.def.arity),
               None -> [],
             },
             fns: fns,
@@ -1701,20 +1704,18 @@ pub fn instance_key(full: Bytes, args: List<Type>) -> RootKey =
 
 /// Whether a reference of the root's own definition at type arguments `given`, handing `fns`, names
 /// the root itself: always for a definition as it stands; for a specialisation, where it hands the
-/// same lambdas and its type arguments are the root's, or erase to them.
+/// same lambdas and each type argument is the root's, or is laid out as the root's layout says.
 fn owns(cx: Context, given: List<Type>, fns: List<FnArg>) -> Bool / {abort.raise} =
   match cx.key {
-    At(_) -> {
-      let own = key_types(cx.key);
-      same_fns(key_lent(cx.key), fns) && given.len() == own.len()
-        && range(0, own.len()).all(|j: Int|
-          match own.at(j) {
-            Some(m) ->
-              m == unknown_type()
-                || (match given.at(j) { Some(g) -> g == m || erased(g) == m, None -> false }),
-            None -> false,
-          })
-    },
+    At(a) ->
+      same_fns(a.lent, fns) && given.len() == a.args.len()
+        && range(0, given.len()).all(|j: Int|
+          match ((a.args.at(j), given.at(j))) {
+            (Some(KeyType(m)), Some(g)) -> m == unknown_type() || g == m,
+            (Some(KeyLayout(l)), Some(g)) ->
+              g == l.at || (!has_vars(g) && layout_key(cx.setting.ctors, g) == l.key),
+            _ -> false,
+          }),
     _ -> true,
   }
 
