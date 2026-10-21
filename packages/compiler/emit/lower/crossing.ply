@@ -313,18 +313,30 @@ pub fn by_encoding(
       let head = native_done(opened, b"?out_count", [AInt(9), AInt(args.len())], false, at);
       let written = range(0, args.len()).fold(head, |s: Lowering, i: Int|
         lowered_part(cx, s, args.get(i), types.params.get(i), at).st);
-      let called = done(
-        written,
-        Op({
-          op: OHandle(Encoded(name)),
-          args: [],
-          uses: { takes: [], owned: false, fails: true, stops: false },
-        }),
-        at,
-      );
-      let answer = lifted_part(cx, called, types.ret, at);
-      { st: native_done(answer.st, b"?lift_close", [], true, at), arg: answer.arg }
+      let call = Op({
+        op: OHandle(Encoded(name)),
+        args: [],
+        uses: { takes: [], owned: false, fails: true, stops: false },
+      });
+      // One that never answers raises with nothing open: its answer is a word nothing reads.
+      if never_answers(cx, name) {
+        handed(bound_as(written, types.ret, RWord, call, at), held_as(cx.setting, types.ret), at)
+      } else {
+        let answer = lifted_part(cx, done(written, call, at), types.ret, at);
+        { st: native_done(answer.st, b"?lift_close", [], true, at), arg: answer.arg }
+      }
     },
+  }
+
+/// Whether extern `name`'s declared answer holds a type variable none of its parameters does, so no
+/// call of it answers: it only raises, as `panic` does.
+fn never_answers(cx: Context, name: Bytes) -> Bool =
+  match cx.setting.declared.get(name) {
+    Some(sc) -> match sc.ty {
+      TyFn(f) -> type_vars(f.ret).any(|v: Int| !f.params.any(|p: Type| type_vars(p).contains(v))),
+      _ -> false,
+    },
+    None -> false,
   }
 
 // --- The crossing natives ------------------------------------------------------------------
@@ -841,11 +853,15 @@ pub fn worded(ctors: Ctors, k: RootKey) -> Result<Fn, Declined> =
         });
       let opened = rep == RWord;
       match w.op {
-        Worded(Lower) ->
+        // The counts are the counting pass's to place. It answers the `()` the lowering answered,
+        // which the runtime lets go of unread.
+        Worded(Lower) -> {
+          let done = { id: 2, ty: unit_type(), rep: held_with(ctors, unit_type()) };
           Ok(
             entry_fn(
               k,
               unit_type(),
+              done.rep,
               [word],
               (if opened { [] } else {
                 [
@@ -858,25 +874,23 @@ pub fn worded(ctors: Ctors, k: RootKey) -> Result<Fn, Declined> =
                 ]
               }).concat([
                 Let({
-                  var: { id: 2, ty: unit_type(), rep: held_with(ctors, unit_type()) },
-                  val: call(
-                    Lower,
-                    [AVar(if opened { word } else { held })],
-                    held_with(ctors, unit_type()),
-                  ),
+                  var: done,
+                  val: call(Lower, [AVar(if opened { word } else { held })], done.rep),
                   at: dummy_span(),
                   unwind: [],
                 }),
-                Return(AZero(RWord)),
+                Return(AVar(done)),
               ]),
             ),
-          ),
+          )
+        },
         Worded(Lift) -> {
           let out = { id: 2, ty: w.ty, rep: RWord };
           Ok(
             entry_fn(
               k,
               w.ty,
+              RWord,
               [],
               [Let({ var: held, val: call(Lift, [], rep), at: dummy_span(), unwind: [] })].concat(
                 if opened { [Return(AVar(held))] } else {
@@ -900,9 +914,9 @@ pub fn worded(ctors: Ctors, k: RootKey) -> Result<Fn, Declined> =
     _ -> Err({ by: Handling, why: b"a word-form entry of no type" }),
   }
 
-/// Root `k`, taking `params` lent at their own reps, running `body` and answering a word of type
-/// `answer_ty`.
-fn entry_fn(k: RootKey, answer_ty: Type, params: List<Var>, body: List<Inst>) -> Fn =
+/// Root `k`, taking `params` lent at their own reps, running `body` and answering a value of type
+/// `answer_ty` held as `answer`, owned.
+fn entry_fn(k: RootKey, answer_ty: Type, answer: Rep, params: List<Var>, body: List<Inst>) -> Fn =
   {
     key: k,
     kind: Plain,
@@ -910,7 +924,7 @@ fn entry_fn(k: RootKey, answer_ty: Type, params: List<Var>, body: List<Inst>) ->
     conv: {
       params: params.map(|_: Var| Lent),
       reps: params.map(|v: Var| v.rep),
-      answer: RWord,
+      answer: answer,
       answered: Owned,
     },
     answer_ty: answer_ty,
