@@ -12,11 +12,11 @@ import emit.print.statics (static_c, static_extern)
 import emit.statics (SStr, statics_of)
 import emit.roots (builtin_helper, symbol_of, entry_of, root_id)
 import emit.keys
-import emit.keys (RootKey, Named, At, Written, FnArg, root_name, definition_of, sited_as, key_lent,
-                  at_key, module_of)
+import emit.keys (RootKey, Named, At, Written, FnArg, KeyArg, KeyType, KeyLayout, root_name,
+                  definition_of, sited_as, key_lent, key_types, at_key, module_of)
 import emit (emit_roots_answer)
-import emit.reps (ctor_layouts, spelled_field, laid_vars, has_vars, held_apart, ctor_sums, ctors_of,
-                  type_vars, erased)
+import emit.reps (Ctors, ctor_layouts, spelled_field, laid_vars, has_vars, held_apart, ctor_sums,
+                  ctors_of, type_vars, layout_key, no_ctors)
 import front.rows (Dump, EmitterRoot, EmitterCtor, CtorRow, KeyRow, ModuleRow, OrdinalRow)
 import front.published (Linked, analyse, no_rows, dump_of, module_of_root)
 import front (analyse_pulling_std_with)
@@ -1615,6 +1615,18 @@ fn repacked(
     }
   })
 
+/// The program's constructors as the emitter reads them, the unit's table `ctors` laid out as the
+/// dump says, with each sum's cases and the constructors whose module states a `key`.
+fn program_ctors(dump: Dump, ctors: List<Ctor>) -> Ctors =
+  ctors_of(
+    ctors.map(|c: Ctor| c.name),
+    ctor_layouts(dump.ctors),
+    // Program-wide: a specialisation is emitted where its definition is, which may not import
+    // the module stating a `key` for the type it is at.
+    dump.emitter_ctors.filter(|c: EmitterCtor| c.key != None).map(|c: EmitterCtor| c.name),
+    ctor_sums(dump.ctors),
+  )
+
 /// What the emitter answers for `missed`: entered once, over the modules those roots are in, the
 /// ones whose lambdas they run, the home modules those call functions of types of, and the ones
 /// all of those import.
@@ -1639,14 +1651,7 @@ fn emitter_answers(
   emit_roots_answer(
     names,
     placed.map(|i: Int| text_of(p.modules.get(i))),
-    ctors_of(
-      ctors.map(|c: Ctor| c.name),
-      ctor_layouts(dump.ctors),
-      // Program-wide: a specialisation is emitted where its definition is, which may not import
-      // the module stating a `key` for the type it is at.
-      dump.emitter_ctors.filter(|c: EmitterCtor| c.key != None).map(|c: EmitterCtor| c.name),
-      ctor_sums(dump.ctors),
-    ),
+    program_ctors(dump, ctors),
     runtime.natives.map(|n: Native| n.name),
     missed,
     if dump.packages.len() == 0 { [{ prefix: b"", deps: [] }] } else { dump.packages },
@@ -1881,15 +1886,31 @@ pub fn emitted<| e>(
     runtime.identity,
     emitter,
   ];
+  let program = program_ctors(dump, ctors);
   match answered_round(runtime, dump, p, ctors, common, offered, read, write) {
     Err(why) -> Err(why),
-    Ok(first) -> match closed_rounds(runtime, dump, p, ctors, common, read, write, first, 64) {
+    Ok(first) -> match closed_rounds(
+        runtime,
+        dump,
+        p,
+        ctors,
+        program,
+        common,
+        read,
+        write,
+        first,
+        64,
+      ) {
       Err(why) -> Err(why),
       Ok(all) -> {
         let shared = alike(all.answers, all.keys);
         let unemitted = settled_only(all.answers, all.keys, closed_needs(all.answers, all.keys));
         let held = values.fold(
-          settled_bodies(generics_settled(all.answers, all.keys, shared), all.keys, unemitted),
+          settled_bodies(
+            generics_settled(all.answers, all.keys, shared, program),
+            all.keys,
+            unemitted,
+          ),
           |acc: Map<Bytes, Answer>, n: Bytes, b: Baked| acc.insert(n, baked_body(b)),
         );
         let produced = produce(
@@ -2033,6 +2054,7 @@ fn closed_rounds<| e>(
   dump: Dump,
   p: Program,
   ctors: List<Ctor>,
+  program: Ctors,
   common: List<Bytes>,
   read: (Bytes) -> Option<Bytes> / e,
   write: (Bytes, Bytes) -> Unit / e,
@@ -2063,9 +2085,10 @@ fn closed_rounds<| e>(
       match a {
         Body(b) -> if unemitted.contains(n) { acc } else {
           b.tables.generics.calls.fold(acc, |m: Map<Bytes, RootKey>, g: GenericCall| {
-            let root = settled_root(g, needs, called);
+            let root = settled_root(g, needs, called, program);
             let name = root_name(root);
-            if had.answers.contains(name) { m } else { m.insert(name, root) }
+            // The first call in name order settling on a layout gives the root its type.
+            if had.answers.contains(name) || m.contains(name) { m } else { m.insert(name, root) }
           })
         },
         Refused(_) -> acc,
@@ -2080,6 +2103,7 @@ fn closed_rounds<| e>(
           dump,
           p,
           ctors,
+          program,
           common,
           read,
           write,
@@ -2230,47 +2254,55 @@ fn widened(
     })
 }
 
-/// The root a generic call settles on: each type argument the callee's code needs and the call
-/// knows, the type itself where the code reads which type it is, else its layout where the code
-/// needs that or the call carries it raw, a scalar where the code does that scalar's operators in C;
-/// every other argument left as the callee's generic body has it. A tail loop's member reads each
-/// variable exactly, so its loop runs at its callers' types.
+/// The root a generic call settles on over the program's constructors `ctors`: each type argument
+/// the callee's code needs and the call knows, keyed by the type itself where the code reads which
+/// type it is, and otherwise by its layout (where the code needs that, does a scalar's operators in
+/// C, or the call carries the argument raw), lowered at the call's own argument; every other
+/// argument left as the callee's generic body has it. Calls settling on one layout share a root's
+/// name. A tail loop's member reads each variable exactly, so its loop runs at its callers' types.
 fn settled_root(
   call: GenericCall,
   needs: Map<Bytes, List<Need>>,
   called: Map<Bytes, List<Int>>,
+  ctors: Ctors,
 ) -> RootKey / {abort.raise} = {
   let ns = match needs.get(call.callee) { Some(x) -> x, None -> [] };
+  let open = KeyType(unknown_type());
   let args = range(0, call.args.len()).map(|j: Int| {
     let arg = call.args.get(j);
-    if has_vars(arg) { unknown_type() }
-    else if ns.contains({ var: j, reads: Exact }) { arg }
-    else if call.carried.contains(j) || ns.contains({ var: j, reads: Layout }) { erased(arg) }
-    else if ns.contains({ var: j, reads: Scalar }) && held_apart(arg) { erased(arg) }
-    else { unknown_type() }
+    let laid = || KeyLayout({ key: layout_key(ctors, arg), at: arg });
+    if has_vars(arg) { open }
+    else if ns.contains({ var: j, reads: Exact }) { KeyType(arg) }
+    else if call.carried.contains(j) || ns.contains({ var: j, reads: Layout }) { laid() }
+    else if ns.contains({ var: j, reads: Scalar }) && held_apart(arg) { laid() }
+    else { open }
   });
   // A lambda is run in place only by a callee that calls the parameter it is handed as.
   let calls = match called.get(call.callee) { Some(cs) -> cs, None -> [] };
   let fns = call.fns.filter(|f: FnArg| calls.contains(f.param));
-  if fns.len() == 0 && args.fold(true, |none: Bool, a: Type| none && a == unknown_type()) {
-    Named(call.callee)
-  } else { at_key(call.callee, args, fns) }
+  if fns.len() == 0 && args.all(|a: KeyArg| a == open) { Named(call.callee) }
+  else { At({ def: call.callee, args: args, lent: fns }) }
 }
 
-/// `answers` with every generic call settled: each placeholder of a body's C, and of the entries its
-/// closures name, written as the root its call settles on, and that root among the body's calls.
+/// `answers` with every generic call settled over the program's constructors `ctors`: each
+/// placeholder of a body's C, and of the entries its closures name, written as the root its call
+/// settles on, and that root among the body's calls.
 fn generics_settled(
   answers: Map<Bytes, Answer>,
   keys: Map<Bytes, RootKey>,
   shared: Map<Bytes, Bytes>,
+  ctors: Ctors,
 ) -> Map<Bytes, Answer> / {abort.raise} = {
   let needs = closed_needs(answers, keys);
   let called = closed_called(answers, keys);
+  // A root keyed by a layout is the one the unit asked for under its name, whatever type this call
+  // settles it at.
+  let asked = |k: RootKey| match keys.get(root_name(k)) { Some(x) -> x, None -> k };
   answers.fold(Map::new(), |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
     acc.insert(n, match a {
       Body(b) -> if b.tables.generics.calls.len() == 0 { a } else {
         let settled = b.tables.generics.calls.map(|g: GenericCall| {
-          let own = settled_root(g, needs, called);
+          let own = asked(settled_root(g, needs, called, ctors));
           let root = match shared.get(root_name(own)) {
             Some(r) -> match keys.get(r) {
               Some(k) -> k,
@@ -2283,7 +2315,7 @@ fn generics_settled(
           match answers.get(root_name(root)) {
             Some(Refused(_)) -> {
               // Refused with lambdas run in place: the root without them, where it was answered.
-              let plain = settled_root({ ..g, fns: [] }, needs, called);
+              let plain = asked(settled_root({ ..g, fns: [] }, needs, called, ctors));
               if g.fns.len() > 0 && root_name(plain) != root_name(root)
                   && (match answers.get(root_name(plain)) { Some(Body(_)) -> true, _ -> false }) {
                 plain
@@ -2307,7 +2339,7 @@ fn generics_settled(
             },
             lambdas: b.tables.lambdas.map(|l: Bytes| placeholders_named(l, roots)),
             calls: settled.fold(b.tables.calls, |cs: List<RootKey>, r: RootKey|
-              if cs.contains(r) { cs } else { cs.push(r) }),
+              if cs.any(|c: RootKey| root_name(c) == root_name(r)) { cs } else { cs.push(r) }),
           },
         })
       },
@@ -2490,18 +2522,22 @@ test "a generic call settles on each argument its callee's code needs, and leave
     { key: b"m.add", value: [{ var: 0, reads: Scalar }] },
     { key: b"m.same", value: [{ var: 0, reads: Exact }] },
   ]);
-  let call = |callee: Bytes, arg: Bytes|
-    root_name(
-      settled_root(
-        { callee: callee, args: [spelled(arg)], carried: [], fns: [] },
-        needs,
-        Map::new(),
-      ),
+  let root = |callee: Bytes, arg: Bytes|
+    settled_root(
+      { callee: callee, args: [spelled(arg)], carried: [], fns: [] },
+      needs,
+      Map::new(),
+      no_ctors(),
     );
-  // A layout the code reads is kept, a known word among them; a type it reads is kept whole.
+  let call = |callee: Bytes, arg: Bytes| root_name(root(callee, arg));
+  // A layout the code reads is kept by its key, a record of one pointer laid as any pointer is; a
+  // type it reads is kept whole.
   assert_eq(call(b"m.lay", b"{x:Float}"), b"m.lay@{x:Float}");
   assert_eq(call(b"m.lay", b"_"), b"m.lay@_");
-  assert_eq(call(b"m.lay", b"{x:m.Shape}"), b"m.lay@{x:_}");
+  assert_eq(call(b"m.lay", b"{x:m.Shape}"), b"m.lay@_");
+  // Two types laid alike share the root's name, each lowered at its own type.
+  assert_eq(call(b"m.lay", b"{x:m.Date}"), call(b"m.lay", b"{x:m.Shape}"));
+  assert_eq(key_types(root(b"m.lay", b"{x:m.Date}")), [spelled(b"{x:m.Date}")]);
   assert_eq(call(b"m.same", b"List<m.Shape>"), b"m.same@List<m.Shape>");
   assert_eq(call(b"m.same", b"m.Date{day:Int}"), b"m.same@m.Date{day:Int}");
   // A scalar its operators read is kept; a record they do not read is not.
@@ -2538,6 +2574,7 @@ test "a lambda is run in place only by a callee that calls the parameter it is h
         },
         Map::new(),
         called,
+        no_ctors(),
       ),
     );
   assert_eq(call(b"m.each", 1), b"m.each@|1=m.main:0");
@@ -2579,7 +2616,7 @@ test "a refused specialisation leaves its call to the generic body, whichever ro
     { key: mapping, value: calling(b"std.prelude.mapped_from", b"m.mapped") },
     { key: at_key(b"std.prelude.mapped_from", [], lent(b"m.mapped")), value: refused },
   ]);
-  let settled = generics_settled(had.answers, had.keys, Map::new());
+  let settled = generics_settled(had.answers, had.keys, Map::new(), no_ctors());
   let calls = |name: Bytes|
     match settled.get(name) {
       Some(Body(b)) -> b.tables.calls.map(root_name),
