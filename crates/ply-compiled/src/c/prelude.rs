@@ -3,7 +3,7 @@
 
 use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
-use crate::native::{Addr, F64, I64, Native, Out, Raising, Signature};
+use crate::native::{Addr, F64, I64, Native, Out, Raises, Raising, Signature};
 use crate::rt::Ctx;
 
 /// `rt_*` is declared, not defined: `ply_bind` supplies the addresses after `dlopen`, since a
@@ -289,6 +289,7 @@ machine! {
     "?cost_spent" => rt_cost_spent(Out);
     "?performs_since" => rt_performs_since(I64);
     "?in_carried" => rt_in_carried() -> Handed;
+    "?array_bad" => rt_array_bad(I64, I64, I64) -> Raises;
 }
 
 /// The natives the compiler declares itself over machine data.

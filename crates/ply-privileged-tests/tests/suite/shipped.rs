@@ -183,6 +183,16 @@ fn the_runtime_describes_what_emitted_code_lays_out_against() {
             &2.into()
         )
     );
+    // A native that answers nothing may still raise.
+    let bad = native("?array_bad");
+    assert_eq!(
+        (&bad["params"], &bad["answer"], &bad["raises"]),
+        (
+            &serde_json::json!(["I64", "I64", "I64"]),
+            &serde_json::Value::Null,
+            &true.into()
+        )
+    );
     let ctx = described_fields(&described["ctx"]);
     let names: Vec<&str> = ctx.iter().map(|f| f.0).collect();
     assert_eq!(

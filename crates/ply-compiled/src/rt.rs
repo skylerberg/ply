@@ -10,7 +10,7 @@ use crate::heap::{
 };
 use crate::host::Served;
 use crate::map;
-use crate::native::{Answered, I64, Native, Out, Raising, Signature};
+use crate::native::{Answered, I64, Native, Out, Raises, Raising, Signature};
 use crate::stack::{Stack, switch};
 use crate::{array, columns, list};
 use ply_core::builtins::hold_released;

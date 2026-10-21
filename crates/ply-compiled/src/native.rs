@@ -86,6 +86,13 @@ impl Signature {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Raising(pub Word);
 
+/// What a native that answers nothing but may raise returns: nothing, the raise left in the context.
+/// Transparent over `()`, it is returned as `()` is, so the emitted C declares the native `void`;
+/// a native returning it allows `improper_ctypes_definitions`, which does not know that.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Raises(pub ());
+
 /// A raw 64-bit integer compiled code passes or is answered.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,9 +151,9 @@ unsafe impl Taken for Out {
 ///
 /// # Safety
 /// A type that answers is returned as the C calling convention returns one `int64_t`, which is what
-/// the emitted C declares a native that answers to return; one that does not is `()`.
+/// the emitted C declares a native that answers to return; one that does not is `()` or [`Raises`].
 pub unsafe trait Answered {
-    /// `None` for `()`.
+    /// `None` for `()` and [`Raises`].
     const MACHINE: Option<Machine>;
     const RAISES: bool;
     /// What the function answers when its work answered `w`.
@@ -172,6 +179,14 @@ unsafe impl Answered for Raising {
     const RAISES: bool = true;
     fn of(w: Word) -> Self {
         Raising(w)
+    }
+}
+
+unsafe impl Answered for Raises {
+    const MACHINE: Option<Machine> = None;
+    const RAISES: bool = true;
+    fn of(_: Word) -> Self {
+        Raises(())
     }
 }
 
