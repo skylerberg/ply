@@ -15,11 +15,11 @@ import syntax.parsing (Span, Ident, ParseDiag, span_to, bare, dump_diags, positi
 import syntax.type_syntax (TFn, MWrite, nullary)
 import syntax.items (Module, Item, IFn, ILaw, ISchema, FnDef, Binder, SchemaDef, schema_guard_name,
                      parse, dump_module)
-import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, EApp, EBlock, ERecord, ERecordUpdate, ETry,
-                     EField, EPerform, EHandle, ETryBlock, SLet, Param, NamedArg, RecField,
-                     expr_span, ETagged, Tagged, tagged_call, tagged_fill, slotted, slot_args,
-                     try_places)
-import syntax.patterns (LUnit, LInt, LStr)
+import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, EApp, EBlock, EMatch, MatchArm, ERecord,
+                     ERecordUpdate, ETry, EField, EPerform, EHandle, ETryBlock, SLet, Param,
+                     NamedArg, RecField, expr_span, ETagged, Tagged, tagged_call, tagged_fill,
+                     slotted, slot_args, try_places)
+import syntax.patterns (LUnit, LInt, LStr, Pattern, PCtor, PVar)
 import std.bytes (ascii_of_int)
 import expand.rewrite.shared (map_item, is_tagged, tagged_in, picked_in, is_try_block, rebound,
                               any_expr, read_at, bound_at)
@@ -762,25 +762,83 @@ pub fn dump_expanded(src: Bytes) -> String / {abort.raise} = {
 
 // --- Tests ------------------------------------------------------------------
 
+/// The body of `src`'s first function once expanded, and the codes the expansion said.
+fn expanded_fn(src: Bytes) -> { body: Expr, codes: List<Bytes> } / {abort.raise} = {
+  let r = parse(src);
+  let x = expand(r.node, r.parser.diags);
+  match x.module.items.at(0) {
+    Some(IFn(d)) -> { body: d.body, codes: x.diags.map(|d: ParseDiag| d.code) },
+    _ -> panic("the source's first item is a function"),
+  }
+}
+
+/// What a `match` tests: the constructor of each arm in order, its pattern's bound names, and its
+/// body; nothing for any other expression.
+fn arms_of(e: Expr) -> List<{ ctor: Bytes, binds: List<Bytes>, body: Expr }> =
+  match e {
+    EMatch(m) ->
+      m.arms.map(|a: MatchArm|
+        match a.pat {
+          PCtor(c) ->
+            {
+              ctor: c.name.name.name,
+              binds: c.args.fold([], |acc: List<Bytes>, p: Pattern|
+                match p { PVar(v) -> acc.push(v.name.name), _ -> acc }),
+              body: a.body,
+            },
+          _ -> { ctor: b"", binds: [], body: a.body },
+        }),
+    _ -> [],
+  }
+
+/// The constructor or function an application calls, by its bare name.
+fn called(e: Expr) -> Bytes =
+  match e { EApp(a) -> match a.func { EVar(v) -> v.name.name.name, _ -> b"" }, _ -> b"" }
+
 test "a `?` on a `let` splits the block at that statement, failure arm first" {
-  assert_eq(
-    dump_expanded(b"fn f(n: Int) -> Result<Int, Bytes> = { let x = g(n)?; Ok(x + 1) }"),
-    "#0;#1;0:65:fn;%priv;?0;?0;?0;3:4:ident;@66;%gen;#0;#0;#0;#1;5:11:prm;5:6:ident;@6e;?1;8:11:tcon;8:11:qname;?0;8:11:ident;@496e74;#0;?0;?1;16:34:tcon;16:22:qname;?0;16:22:ident;@526573756c74;#2;23:26:tcon;23:26:qname;?0;23:26:ident;@496e74;#0;28:33:tcon;28:33:qname;?0;28:33:ident;@4279746573;#0;?0;#0;#0;37:65:eblk;#0;?1;47:52:emat;47:51:eapp;47:48:evar;47:48:qname;?0;47:48:ident;@67;#1;49:50:evar;49:50:qname;?0;49:50:ident;@6e;#0;#0;#2;47:52:arm;47:52:pctr;47:52:qname;?0;47:52:ident;@457272;#1;47:52:pvar;47:52:ident;@3f30;?0;47:52:eapp;51:52:evar;51:52:qname;?0;51:52:ident;@457272;#1;47:52:evar;47:52:qname;?0;47:52:ident;@3f30;#0;#0;47:52:arm;47:52:pctr;47:52:qname;?0;47:52:ident;@4f6b;#1;43:44:pvar;43:44:ident;@78;?0;47:52:eblk;#0;?1;54:63:eapp;54:56:evar;54:56:qname;?0;54:56:ident;@4f6b;#1;57:62:ebin;%add;57:58:evar;57:58:qname;?0;57:58:ident;@78;61:62:elit;%int;@31;#0;#0;#0;",
-  )
+  let x = expanded_fn(b"fn f(n: Int) -> Result<Int, Bytes> = { let x = g(n)?; Ok(x + 1) }");
+  assert_eq(x.codes, []);
+  // The `Ok` arm binds the `let`'s name and runs the statements after it.
+  let tested = match x.body {
+    EBlock(b) -> if b.stmts.len() == 0 { b.tail } else { None },
+    _ -> None,
+  };
+  match tested {
+    Some(m) -> {
+      assert_eq(match m { EMatch(n) -> called(n.scrutinee), _ -> b"" }, b"g");
+      let arms = arms_of(m);
+      assert_eq(arms.map(|a: { ctor: Bytes, binds: List<Bytes>, body: Expr }| a.ctor), [
+        b"Err",
+        b"Ok",
+      ]);
+      assert_eq(called(arms.get(0).body), b"Err");
+      assert_eq(arms.get(1).binds, [b"x"]);
+      let rest = match arms.get(1).body {
+        EBlock(b) -> match b.tail { Some(t) -> t, None -> arms.get(1).body },
+        other -> other,
+      };
+      assert_eq(called(rest), b"Ok")
+    },
+    None -> assert(false, Some("the block is the match alone")),
+  }
 }
 
 test "a `?` inside a return-position expression lifts to its head, and an `Option` names `None`" {
-  assert_eq(
-    dump_expanded(b"fn f(n: Int) -> Option<Int> = Some(g(n)? + 1)"),
-    "#0;#1;0:45:fn;%priv;?0;?0;?0;3:4:ident;@66;%gen;#0;#0;#0;#1;5:11:prm;5:6:ident;@6e;?1;8:11:tcon;8:11:qname;?0;8:11:ident;@496e74;#0;?0;?1;16:27:tcon;16:22:qname;?0;16:22:ident;@4f7074696f6e;#1;23:26:tcon;23:26:qname;?0;23:26:ident;@496e74;#0;?0;#0;#0;35:40:emat;35:39:eapp;35:36:evar;35:36:qname;?0;35:36:ident;@67;#1;37:38:evar;37:38:qname;?0;37:38:ident;@6e;#0;#0;#2;35:40:arm;35:40:pctr;35:40:qname;?0;35:40:ident;@4e6f6e65;#0;?0;39:40:evar;39:40:qname;?0;39:40:ident;@4e6f6e65;35:40:arm;35:40:pctr;35:40:qname;?0;35:40:ident;@536f6d65;#1;35:40:pvar;35:40:ident;@3f30;?0;30:45:eapp;30:34:evar;30:34:qname;?0;30:34:ident;@536f6d65;#1;35:44:ebin;%add;35:40:evar;35:40:qname;?0;35:40:ident;@3f30;43:44:elit;%int;@31;#0;#0;#0;",
-  )
+  let x = expanded_fn(b"fn f(n: Int) -> Option<Int> = Some(g(n)? + 1)");
+  assert_eq(x.codes, []);
+  let arms = arms_of(x.body);
+  assert_eq(arms.map(|a: { ctor: Bytes, binds: List<Bytes>, body: Expr }| a.ctor), [
+    b"None",
+    b"Some",
+  ]);
+  assert_eq(match arms.get(0).body { EVar(v) -> v.name.name.name, _ -> b"" }, b"None");
+  assert_eq(called(arms.get(1).body), b"Some")
 }
 
 test "a `?` in a function with no written return type is refused and unwrapped" {
-  assert_eq(
-    dump_expanded(b"fn f(n: Int) = g(n)?"),
-    "#0;#1;0:20:fn;%priv;?0;?0;?0;3:4:ident;@66;%gen;#0;#0;#0;#1;5:11:prm;5:6:ident;@6e;?1;8:11:tcon;8:11:qname;?0;8:11:ident;@496e74;#0;?0;?0;?0;#0;#0;15:19:eapp;15:16:evar;15:16:qname;?0;15:16:ident;@67;#1;17:18:evar;17:18:qname;?0;17:18:ident;@6e;#0;#0;#1;!E0118:15:20:1:1;=15:20:1;",
-  )
+  let x = expanded_fn(b"fn f(n: Int) = g(n)?");
+  assert_eq(x.codes, [b"E0118"]);
+  assert_eq(called(x.body), b"g")
 }
 
 test "a `?` inside a `try` is refused, as one inside a `handle` is" {
