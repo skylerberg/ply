@@ -194,6 +194,21 @@ pub unsafe extern "C" fn rt_box_fixed(ctx: *mut Ctx, bits: i64, t: i64) -> i64 {
         .boxed_fixed(ply_core::Fixed::new(ty, bits as u64 as u128))
 }
 
+/// The object of a 128-bit width, the width at `t` in [`ply_core::INT_TYPES`], whose bits are `lo`
+/// and above it `hi`.
+pub unsafe extern "C" fn rt_box_wide(ctx: *mut Ctx, lo: I64, hi: I64, t: I64) -> Word {
+    let ctx = unsafe { &mut *ctx };
+    let ty = usize::try_from(t.0)
+        .ok()
+        .and_then(|i| ply_core::INT_TYPES.get(i).copied())
+        .filter(|ty| ty.bits() == 128);
+    let Some(ty) = ty else {
+        return ctx.fail(error(format!("width {} is no 128-bit width", t.0)));
+    };
+    let bits = (u128::from(hi.0 as u64) << 64) | u128::from(lo.0 as u64);
+    ctx.heap.boxed_fixed(ply_core::Fixed::new(ty, bits))
+}
+
 /// The `Decimal` two words of compiled code's `PlyDec` hold.
 pub(super) fn decimal_of(lo: i64, hi: i64) -> ply_core::Decimal {
     let mut bytes = [0u8; 16];

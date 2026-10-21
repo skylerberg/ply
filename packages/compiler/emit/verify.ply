@@ -50,6 +50,7 @@ type Holding = {
   cells: Map<Int, Int>,
   read_at: Map<Int, { of: Int, path: Path }>,
   lasts: Map<Int, Bool>,
+  immortal: Map<Int, Bool>,
 }
 
 /// A walk so far: what the path holds, the first fault found, whether control reaches here, what
@@ -342,6 +343,7 @@ fn holding_params(params: List<Var>, conv: Convention) -> Holding =
       cells: Map::new(),
       read_at: Map::new(),
       lasts: Map::new(),
+      immortal: Map::new(),
     },
     |h: Holding, i: Int|
       match params.at(i) {
@@ -410,6 +412,7 @@ fn handed_on(w: Walk, args: List<Arg>, handed: List<Handed>) -> Walk =
 /// is lent, else the owned variables and lent parameters it was read out of.
 fn bases(h: Holding, v: Var) -> List<Int> =
   if count(h, v) > 0 || h.lent.contains(v.id) { [v.id] }
+  else if h.immortal.contains(v.id) { [] }
   else { match h.borrowed.get(v.id) { Some(bs) -> bs, None -> [v.id] } }
 
 /// Whether `v`, counted, is held without a count of its own: borrowed, neither a reuse token nor a
@@ -667,7 +670,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             b"a count held otherwise than the handle around holds where the body fails: v",
           ),
         Handle(_) -> handle_walked(f, cx, acc, i),
-        Inc(n) -> if !counted(n.var.rep) {
+        Inc(n) -> if !counted(n.var.rep) || acc.h.immortal.contains(n.var.id) {
           faulted(acc, b"a count taken of a value that holds none: v", n.var)
         } else if is_token(n.var) { faulted(acc, b"a count taken of a reuse token: v", n.var) }
         else {
@@ -677,7 +680,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
               { ..x, h: { ..x.h, owned: x.h.owned.insert(t.id, count(x.h, t) + n.n) } })
           }
         },
-        Dec(v) -> if !counted(v.rep) {
+        Dec(v) -> if !counted(v.rep) || acc.h.immortal.contains(v.id) {
           faulted(acc, b"a count let go of a value that holds none: v", v)
         } else if is_token(v) { faulted(acc, b"a reuse token let go as a value: v", v) }
         else { consumed(acc, v) },
@@ -747,21 +750,26 @@ fn bound_walked(cx: Within, acc: Walk, y: Var, val: Val, unwind: List<Var>) -> W
           },
           None -> match held_otherwise(y, val) {
             Some(why) -> faulted(acc, why, y),
-            None -> match re_held(y, val) {
-              // A borrowed value held again is read, and what holds it borrowed of the same.
-              Some(x) -> if borrowed_here(acc.h, x) {
-                let read = failing(cx, read_of(acc, x), val, unwind);
-                if read.fault != None { read } else {
-                  {
-                    ..read,
-                    h: { ..read.h, borrowed: read.h.borrowed.insert(y.id, bases(read.h, x)) },
+            None -> if holds_no_count(val, acc.h.immortal) {
+              let walked = failing(cx, used(acc, operands(val)), val, unwind);
+              { ..walked, h: { ..walked.h, immortal: walked.h.immortal.insert(y.id, true) } }
+            } else {
+              match re_held(y, val) {
+                // A borrowed value held again is read, and what holds it borrowed of the same.
+                Some(x) -> if borrowed_here(acc.h, x) {
+                  let read = failing(cx, read_of(acc, x), val, unwind);
+                  if read.fault != None { read } else {
+                    {
+                      ..read,
+                      h: { ..read.h, borrowed: read.h.borrowed.insert(y.id, bases(read.h, x)) },
+                    }
                   }
-                }
-              } else {
-                result(failing(cx, used(acc, operands(val)), val, unwind), y, answer_held(val))
-              },
-              None ->
-                result(failing(cx, used(acc, operands(val)), val, unwind), y, answer_held(val)),
+                } else {
+                  result(failing(cx, used(acc, operands(val)), val, unwind), y, answer_held(val))
+                },
+                None ->
+                  result(failing(cx, used(acc, operands(val)), val, unwind), y, answer_held(val)),
+              }
             },
           },
         },
@@ -1367,6 +1375,20 @@ fn escaping(h: Holding, val: Val) -> Option<Var> =
         }),
   }
 
+/// Whether the value a `Let` binds to `val` holds no count, where the variables `immortal` holds
+/// hold none: a static object's word, whose count nothing writes, or a value gathered from constants
+/// and values holding none, as a nullary case is. Such a value is given, returned and stored with no
+/// count of its own and never let go of; `emit.own` places counts by this one rule as this check
+/// checks them.
+pub fn holds_no_count(val: Val, immortal: Map<Int, Bool>) -> Bool =
+  match val {
+    Static(_) -> true,
+    Gathered(g) ->
+      g.parts.all(|a: Arg|
+        match a { AVar(v) -> !counted(v.rep) || immortal.contains(v.id), _ -> true }),
+    _ -> false,
+  }
+
 /// What a `Make` laid on this frame's stack captures: a closure lent to the call it is made for,
 /// which holds no count of its captures and lives no longer than the frame.
 pub fn stacked_captures(val: Val) -> Option<List<Arg>> =
@@ -1382,7 +1404,7 @@ pub fn stacked_captures(val: Val) -> Option<List<Arg>> =
 fn consumed_one(w: Walk, v: Var) -> Walk =
   if w.fault != None { w }
   else if w.h.unset.contains(v.id) { unset_read(w, v) }
-  else if !counted(v.rep) { w } else {
+  else if !counted(v.rep) || w.h.immortal.contains(v.id) { w } else {
     let n = count(w.h, v);
     if n > 0 {
       {
@@ -1401,7 +1423,7 @@ fn consumed_one(w: Walk, v: Var) -> Walk =
 fn read_one(w: Walk, v: Var) -> Walk =
   if w.fault != None { w }
   else if w.h.unset.contains(v.id) { unset_read(w, v) }
-  else if !counted(v.rep) || count(w.h, v) > 0 { w } else {
+  else if !counted(v.rep) || w.h.immortal.contains(v.id) || count(w.h, v) > 0 { w } else {
     match w.h.borrowed.get(v.id) {
       Some(bs) -> if bs.all(|b: Int|
           w.h.lent.contains(b) || w.h.owned.contains(b) || w.h.borrowed.contains(b)) { w }
@@ -1750,11 +1772,18 @@ test "the paths out of a branch hold the same counts and set the same joins" {
         If({
           cond: ABool(true),
           then: [Return(AVar(p))],
-          otherwise: [Dec(p), bind(s, Static(b"k"), []), Inc({ var: s, n: 1 }), Return(AVar(s))],
+          otherwise: [Dec(p), bind(s, Static(b"k"), []), Return(AVar(s))],
         }),
       ]),
     ),
     None,
+  );
+  // A static holds no count: none is taken of it, however it is handed back.
+  assert_eq(
+    verified(
+      root_of([], [], RWord, [bind(s, Static(b"k"), []), Inc({ var: s, n: 1 }), Return(AVar(s))]),
+    ),
+    Some(b"a count taken of a value that holds none: v1"),
   );
   assert_eq(
     verified(

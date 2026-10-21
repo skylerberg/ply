@@ -28,11 +28,12 @@ import emit.lower.data (constructed, recorded, field, updated)
 import emit.lower.scalars (literal, constant, operand, unary, binary)
 import emit.lower.containers (builtin, listed, columned, column_read)
 import emit.lower.matching (arm_opened, closed, let_bound, compared_side, compared_args, compared)
-import emit.lower.calling (convention, params_held, target, global, builtin_lambda, known, called,
-                           applied, entered, left, lambda_opened, closure, group_opened, grouped,
-                           known_body, step_captured, context_of, is_ctor_name, has_handle)
+import emit.lower.calling (convention, params_held, target, global, known, called, applied, entered,
+                           left, lambda_opened, closure, group_opened, grouped, known_body,
+                           step_captured, context_of, is_ctor_name, has_handle)
 import emit.lower.handling (performed, label, clause_frame, ret_frame, body_frame, handled,
                             branched, simulated)
+import emit.statics (folded)
 
 /// Root `r` of `setting`, whose body lowers to `code`, lowered as a build lowers it: its body after
 /// `known_body`, so a slot known to hold a lambda reads as that lambda.
@@ -95,8 +96,8 @@ pub fn tail_groups(
     match r.code {
       Err(_) -> [],
       Ok(c) ->
-        tail_callees(here, c, []).fold([], |acc: List<Int>, nm: Bytes|
-          match position_of(fulls, qualify(module, nm)) {
+        tail_calls(here, c, []).fold([], |acc: List<Int>, t: TailCall|
+          match position_of(fulls, qualify(module, t.name)) {
             None -> acc,
             Some(i) -> if acc.contains(i) { acc } else { acc.push(i) },
           }),
@@ -110,20 +111,28 @@ pub fn tail_groups(
     c.len() >= 2 && c.all(loops))
 }
 
-/// The definitions of `here` that `code` calls in tail position, by name, after `acc`.
-pub fn tail_callees(here: List<Def>, code: Code, acc: List<Bytes>) -> List<Bytes> / {abort.raise} =
+/// A call in tail position of a definition of the module: its name as written, and where the
+/// reference to it stands, which the checker files the type arguments it names it at by.
+pub type TailCall = { name: Bytes, at: Span }
+
+/// The calls `code` makes in tail position of definitions of `here`, after `acc`.
+pub fn tail_calls(
+  here: List<Def>,
+  code: Code,
+  acc: List<TailCall>,
+) -> List<TailCall> / {abort.raise} =
   match code.node {
     NApp(a) -> match a.func.node {
       NVar(fv) -> if fv.slot == None && !is_ctor_name(fv.name)
-          && here.any(|h: Def| h.name == fv.name && h.arity == a.args.len()) { acc.push(fv.name) }
-      else { acc },
+          && here.any(|h: Def| h.name == fv.name && h.arity == a.args.len()) {
+        acc.push({ name: fv.name, at: a.func.span })
+      } else { acc },
       _ -> acc,
     },
-    NBinary(b) -> if b.op == b"and" || b.op == b"or" { tail_callees(here, b.rhs, acc) }
-    else { acc },
-    NIf(i) -> tail_callees(here, i.else_branch, tail_callees(here, i.then_branch, acc)),
-    NBlock(b) -> match b.tail { Some(t) -> tail_callees(here, t, acc), None -> acc },
-    NMatch(m) -> m.arms.fold(acc, |a: List<Bytes>, arm: CodeArm| tail_callees(here, arm.body, a)),
+    NBinary(b) -> if b.op == b"and" || b.op == b"or" { tail_calls(here, b.rhs, acc) } else { acc },
+    NIf(i) -> tail_calls(here, i.else_branch, tail_calls(here, i.then_branch, acc)),
+    NBlock(b) -> match b.tail { Some(t) -> tail_calls(here, t, acc), None -> acc },
+    NMatch(m) -> m.arms.fold(acc, |a: List<TailCall>, arm: CodeArm| tail_calls(here, arm.body, a)),
     _ -> acc,
   }
 
@@ -143,19 +152,21 @@ pub fn lowered_fn(cx: Context, body: Code) -> Result<Fn, Declined> / {abort.rais
   match answered.st.refused {
     Some(no) -> Err(no),
     None ->
-      Ok({
-        key: cx.key,
-        kind: Rooted,
-        params: params,
-        conv: conv,
-        body: if falls_through(answered.st.insts) { answered.st.insts.push(Return(answered.arg)) }
-        else { answered.st.insts },
-        lambdas: answered.st.lambdas,
-        base: cx.base,
-        members: [],
-        links: answered.st.links,
-        statics: [],
-      }),
+      Ok(
+        folded({
+          key: cx.key,
+          kind: Rooted,
+          params: params,
+          conv: conv,
+          body: if falls_through(answered.st.insts) { answered.st.insts.push(Return(answered.arg)) }
+          else { answered.st.insts },
+          lambdas: answered.st.lambdas,
+          base: cx.base,
+          members: [],
+          links: answered.st.links,
+          statics: answered.st.statics,
+        }),
+      ),
   }
 }
 
@@ -177,7 +188,10 @@ pub fn lowered_group(members: List<GroupMember>) -> Result<Fn, Declined> / {abor
         },
       },
   );
-  grouped(members, bodies.out)
+  match grouped(members, bodies.out) {
+    Ok(f) -> Ok(folded({ ..f, statics: match bodies.after { Some(a) -> a.statics, None -> [] } })),
+    Err(no) -> Err(no),
+  }
 }
 
 /// An operand that reads a slot where it stands: what the slot holds, noted read only once the
@@ -246,16 +260,7 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
             slot_taken(cx, read_noted(cx, st, read_note(), s, c.span), v.name, s, a, c.span),
           None -> refuse(st, Spine, b"a slot nothing bound: ".concat(v.name)),
         },
-        None -> match builtin_lambda(cx, v.name, c.span) {
-          None -> global(cx, st, v.name, c.span),
-          Some(b) -> {
-            let frame = { params: b.arity, size: b.arity, captures: [], resumes: false };
-            let o = lambda_opened(cx, st, frame, c.span);
-            let params = range(0, b.arity).fold([], |acc: List<Arg>, j: Int|
-              match o.st.env.get(j) { Some(a) -> acc.push(a), None -> acc });
-            closure(cx, st, builtin(o.cx, o.st, b.name, params, c.span, c.span), frame, c.span)
-          },
-        },
+        None -> global(cx, st, v.name, c.span),
       },
       NKnown(k) -> known(cx, st, k, c.span),
       NUnary(u) -> unary(cx, lowered(cx, st, u.operand, false), u.op, c.span),

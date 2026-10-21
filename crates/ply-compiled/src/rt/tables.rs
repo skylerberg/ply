@@ -89,7 +89,23 @@ pub(super) fn held_words<'v>(
         .collect()
 }
 
-pub(super) fn identity(v: &Value) -> Option<Identity> {
+/// The identities of `v` and of its direct parts, the first [`PARTS_LIMIT`] of them: what a body
+/// that takes a value apart may hand back in.
+pub(crate) fn identities(v: &Value) -> Vec<Identity> {
+    let parts: Box<dyn Iterator<Item = &Value>> = match v {
+        Value::Record(fields) => Box::new(fields.iter().map(|(_, part)| part)),
+        Value::Ctor { args, .. } => Box::new(args.iter()),
+        Value::List(items) if items.len() <= PARTS_LIMIT => Box::new(items.iter()),
+        Value::Array(items) if items.len() <= PARTS_LIMIT => Box::new(items.iter()),
+        _ => Box::new(std::iter::empty()),
+    };
+    identity(v)
+        .into_iter()
+        .chain(parts.take(PARTS_LIMIT).filter_map(identity))
+        .collect()
+}
+
+pub(crate) fn identity(v: &Value) -> Option<Identity> {
     Some(match v {
         Value::Record(fields) => Identity::Record(Arc::as_ptr(fields) as usize),
         Value::Str(s) => Identity::Str(Arc::as_ptr(s) as *const u8 as usize),

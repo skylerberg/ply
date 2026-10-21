@@ -25,6 +25,8 @@ pub(crate) struct Lowering {
     sharing: Option<Sharing>,
     /// The strings, bytes, lists, arrays and maps written so far, which `AGAIN` numbers.
     shareables: u64,
+    /// Whether a function the program wrote was written, which no reader outside its run can hold.
+    functions: bool,
 }
 
 enum Beside {
@@ -49,6 +51,7 @@ impl Lowering {
                 next: None,
             }),
             shareables: 0,
+            functions: false,
         }
     }
 
@@ -76,9 +79,17 @@ pub(crate) struct Lifting {
     beside: Vec<Option<Word>>,
     /// The name of the constructor read last.
     name: Option<Symbol>,
+    /// The high word of the `Decimal` or width read last, until [`rt_in_high`] takes it.
+    high: Option<i64>,
 }
 
 impl Lifting {
+    /// `bits`' low word, its high word kept for [`rt_in_high`].
+    fn keep_high(&mut self, bits: u128) -> i64 {
+        self.high = Some((bits >> 64) as u64 as i64);
+        bits as u64 as i64
+    }
+
     /// The runtime object at the position the next `HANDLE` names, taken.
     fn take(&mut self) -> Result<Word, String> {
         self.r.expect(tag::HANDLE)?;
@@ -95,7 +106,7 @@ impl Lifting {
 /// called a native outside the crossing it belongs to.
 #[cold]
 #[inline(never)]
-fn err_crossing(why: &str) -> Diagnostic {
+pub(crate) fn err_crossing(why: &str) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!("a value crossing between compiled code and the runtime: {why}"),
@@ -111,6 +122,16 @@ impl Ctx {
         }
         match self.crossings.last_mut() {
             Some(Crossing::Lowering(l)) => Ok(l),
+            _ => unreachable!("the innermost crossing is a lowering"),
+        }
+    }
+
+    /// Ends the innermost lowering, answering it whole; `None` with the context failed where the
+    /// innermost crossing is no lowering.
+    fn end_lowering(&mut self) -> Option<Lowering> {
+        self.lowering().ok()?;
+        match self.crossings.pop() {
+            Some(Crossing::Lowering(l)) => Some(l),
             _ => unreachable!("the innermost crossing is a lowering"),
         }
     }
@@ -283,6 +304,7 @@ pub unsafe extern "C" fn rt_out_carried(ctx: *mut Ctx, w: Handed, ty: *const Ply
 pub unsafe extern "C" fn rt_out_fun(ctx: *mut Ctx, name: Addr, len: I64) {
     let name = unsafe { lent(name, len) };
     unsafe { &mut *ctx }.write(|l| {
+        l.functions = true;
         if name.is_empty() {
             l.w.fun(fun::ANON);
         } else {
@@ -340,34 +362,38 @@ pub unsafe extern "C" fn rt_in_float(ctx: *mut Ctx) -> F64 {
     }))
 }
 
-/// A `Decimal`, written to `out` as its two words.
-pub unsafe extern "C" fn rt_in_decimal(ctx: *mut Ctx, out: Out) {
-    let d: [u8; 16] = unsafe { &mut *ctx }.read(|l| {
+/// A `Decimal`'s low word, the first eight bytes of `rust_decimal`'s serialization read
+/// little-endian; [`rt_in_high`] answers the other eight.
+pub unsafe extern "C" fn rt_in_decimal(ctx: *mut Ctx) -> I64 {
+    I64(unsafe { &mut *ctx }.read(|l| {
         l.r.expect(tag::DECIMAL)?;
-        l.r.array()
-    });
-    unsafe {
-        *out.0 = i64::from_le_bytes(d[..8].try_into().expect("eight bytes"));
-        *out.0.add(1) = i64::from_le_bytes(d[8..].try_into().expect("eight bytes"));
-    }
+        let d = u128::from_le_bytes(l.r.array()?);
+        Ok(l.keep_high(d))
+    }))
 }
 
-/// A fixed width, which must be the one at `width` among PLV1's, written to `out` as its bits
-/// sign- or zero-extended to 128: the low word, then the high.
-pub unsafe extern "C" fn rt_in_fixed(ctx: *mut Ctx, width: I64, out: Out) {
-    let bits: u128 = unsafe { &mut *ctx }.read(|l| {
+/// A fixed width, which must be the one at `width` among PLV1's: its low word, its bits sign- or
+/// zero-extended as the width's sign says; [`rt_in_high`] answers the word above it.
+pub unsafe extern "C" fn rt_in_fixed(ctx: *mut Ctx, width: I64) -> I64 {
+    I64(unsafe { &mut *ctx }.read(|l| {
         l.r.expect(tag::FIXED)?;
         let f = l.r.fixed()?;
         let at = ply_core::INT_TYPES.iter().position(|t| *t == f.ty);
         if at != usize::try_from(width.0).ok() {
             return Err(format!("a {:?} where width {} was read", f.ty, width.0));
         }
-        Ok(f.bits())
-    });
-    unsafe {
-        *out.0 = bits as u64 as i64;
-        *out.0.add(1) = (bits >> 64) as u64 as i64;
-    }
+        Ok(l.keep_high(f.bits()))
+    }))
+}
+
+/// The high word of the `Decimal` or width [`rt_in_decimal`] or [`rt_in_fixed`] read last, which
+/// is asked once.
+pub unsafe extern "C" fn rt_in_high(ctx: *mut Ctx) -> I64 {
+    I64(unsafe { &mut *ctx }.read(|l| {
+        l.high
+            .take()
+            .ok_or_else(|| "a high word asked where no wide value was read".into())
+    }))
 }
 
 /// A `Char`'s scalar value.
@@ -547,7 +573,14 @@ impl Ctx {
             r,
             beside: beside.into_iter().map(Some).collect(),
             name: None,
+            high: None,
         }));
+    }
+
+    /// Begins a lifting of `bytes`, each of `held` made a runtime object for the handle it is.
+    fn lift_holding(&mut self, bytes: Vec<u8>, held: Vec<Value>) {
+        let beside = held.into_iter().map(|v| self.heap.bridge(v)).collect();
+        self.lift_from(bytes, beside);
     }
 
     /// Ends the innermost lifting, letting go of what compiled code did not take of its handles;
@@ -589,6 +622,12 @@ pub(crate) fn lowered_value(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Resu
     let Some(Crossing::Lowering(l)) = c.crossings.pop() else {
         return Err("a lowering ended a crossing it did not begin".into());
     };
+    read_back(ctx, l)
+}
+
+/// A lowering's bytes read as a value, each handle as the value it stands for: a runtime object's
+/// own, a lent value lowered through its type.
+fn read_back(ctx: *mut Ctx, l: Lowering) -> Result<Value, String> {
     let bytes = l.w.finish();
     let beside = l.beside;
     codec::decode_with(&bytes, &mut |at| match usize::try_from(at)
@@ -601,20 +640,8 @@ pub(crate) fn lowered_value(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Resu
     })
 }
 
-/// The values `args` stand for, each lowered through its type.
-pub(crate) fn lowered_values(
-    ctx: *mut Ctx,
-    args: &[Word],
-    types: &[&'static PlyType],
-) -> Result<Vec<Value>, String> {
-    let v = lowered_value(ctx, |ctx| {
-        if let Ok(l) = unsafe { &mut *ctx }.lowering() {
-            l.w.count(tag::LIST, args.len() as u64);
-        }
-        for (w, ty) in args.iter().zip(types) {
-            unsafe { (ty.lower)(ctx, *w) };
-        }
-    })?;
+/// The items of the list of arguments `v` is.
+fn arguments(v: Value) -> Result<Vec<Value>, String> {
     match &v {
         Value::List(items) => Ok(items.iter().cloned().collect()),
         other => Err(format!(
@@ -624,25 +651,40 @@ pub(crate) fn lowered_values(
     }
 }
 
+/// The values `args` stand for, each lowered through its type.
+pub(crate) fn lowered_values(
+    ctx: *mut Ctx,
+    args: &[Word],
+    types: &[&'static PlyType],
+) -> Result<Vec<Value>, String> {
+    arguments(lowered_value(ctx, |ctx| {
+        if let Ok(l) = unsafe { &mut *ctx }.lowering() {
+            l.w.count(tag::LIST, args.len() as u64);
+        }
+        for (w, ty) in args.iter().zip(types) {
+            unsafe { (ty.lower)(ctx, *w) };
+        }
+    })?)
+}
+
+/// `v`'s bytes, and the values they cannot hold in the order their handles name them.
+pub(crate) fn encoded(v: &Value) -> (Vec<u8>, Vec<Value>) {
+    let mut held = Vec::new();
+    let bytes = codec::encode_with(v, &mut |x| {
+        held.push(x.clone());
+        Ok(held.len() as u64 - 1)
+    })
+    .expect("a value is written whole but for what is kept beside it");
+    (bytes, held)
+}
+
 /// `v` lifted through `ty`, each value the bytes cannot hold made a runtime object; `None` with the
 /// context failed where it does not cross.
 pub(crate) fn lifted(ctx: *mut Ctx, v: &Value, ty: &PlyType) -> Option<Handed> {
+    let (bytes, held) = encoded(v);
     let c = unsafe { &mut *ctx };
-    let mut beside = Vec::new();
-    let encoded = codec::encode_with(v, &mut |x| {
-        beside.push(c.heap.bridge(x.clone()));
-        Ok(beside.len() as u64 - 1)
-    });
-    let bytes = match encoded {
-        Ok(bytes) => bytes,
-        Err(why) => {
-            beside.into_iter().for_each(heap::dec);
-            c.fail(err_crossing(&why));
-            return None;
-        }
-    };
     let depth = c.crossings.len();
-    c.lift_from(bytes, beside);
+    c.lift_holding(bytes, held);
     let w = unsafe { (ty.lift)(ctx) };
     let c = unsafe { &mut *ctx };
     if c.crossings.len() != depth + 1 {
@@ -653,4 +695,87 @@ pub(crate) fn lifted(ctx: *mut Ctx, v: &Value, ty: &PlyType) -> Option<Handed> {
         c.fail(err_crossing(&why));
     }
     (c.failed == 0).then(|| <Handed as crate::native::Answered>::of(w))
+}
+
+/// Calls the unit's builtin at `index` in its pool over the arguments the innermost lowering holds,
+/// a list of them in order, and ends that lowering. Where the builtin answers, a lifting of its
+/// answer is open for compiled code to read and end, each value the bytes cannot hold a runtime
+/// object beside them; where it raises, as it raises, or fails, none is.
+pub unsafe extern "C" fn rt_builtin_encoded(ctx: *mut Ctx, index: I64) {
+    let c = unsafe { &mut *ctx };
+    let Some(l) = c.end_lowering() else {
+        return;
+    };
+    let Some(&b) = usize::try_from(index.0)
+        .ok()
+        .and_then(|i| c.tables.builtins.get(i))
+    else {
+        c.fail(err_crossing(&format!(
+            "builtin {} of a pool of {}",
+            index.0,
+            c.tables.builtins.len()
+        )));
+        return;
+    };
+    let args = read_back(ctx, l).and_then(arguments);
+    let c = unsafe { &mut *ctx };
+    let args = match args {
+        Ok(args) => args,
+        Err(why) => {
+            c.fail(err_crossing(&why));
+            return;
+        }
+    };
+    if let Some(answer) = called_over_values(c, b, args) {
+        let (bytes, held) = encoded(&answer);
+        c.lift_holding(bytes, held);
+    }
+}
+
+/// What an entry's `R#entered` wrote of its root's answer.
+pub(crate) enum EntryAnswer {
+    /// The answer, and whether it holds a value the bytes could not, each read as the value it
+    /// stands for.
+    Read { value: Value, holding: bool },
+    /// The answer holds a function the program wrote, which only its own run can hold.
+    Function,
+}
+
+impl Ctx {
+    /// Opens what an entry through `R#entered` runs between: a lowering for its answer, and over it
+    /// a lifting of `bytes`, the arguments' list, each of `held` made a runtime object for the
+    /// handle it is.
+    pub(crate) fn open_entry(&mut self, bytes: Vec<u8>, held: Vec<Value>) {
+        self.crossings
+            .push(Crossing::Lowering(Lowering::new(false)));
+        self.lift_holding(bytes, held);
+    }
+}
+
+/// Ends the lowering [`Ctx::open_entry`] opened and reads the answer in it; an error where the entry
+/// ended that lowering or left another crossing open.
+pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryAnswer, String> {
+    let c = unsafe { &mut *ctx };
+    let open = c.crossings.len();
+    if open != 1 {
+        c.crossings.clear();
+        return Err(match open {
+            0 => "the entry ended the lowering its answer was to be written into".into(),
+            _ => format!(
+                "the entry left {} crossings open past its answer's",
+                open - 1
+            ),
+        });
+    }
+    let Some(Crossing::Lowering(l)) = c.crossings.pop() else {
+        return Err("the entry ended the lowering its answer was to be written into".into());
+    };
+    if l.functions {
+        return Ok(EntryAnswer::Function);
+    }
+    let holding = !l.beside.is_empty();
+    Ok(EntryAnswer::Read {
+        value: read_back(ctx, l)?,
+        holding,
+    })
 }
