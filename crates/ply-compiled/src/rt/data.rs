@@ -474,6 +474,47 @@ pub(super) fn cancel_here(c: &mut Ctx) {
     c.failed = FAILED_CANCELLED;
 }
 
+/// An array's or a columns value's operation emitted code writes, refused its length or index:
+/// raised as the runtime's own operation raises it, for `abort.raise` to answer. `what` names the
+/// operation: 0 `Array::new`, 1 `Columns::new`, 2 `Array::of_list` and 3 `Columns::of_list`, given a
+/// length `n` outside `0` to [`MAX_ARRAY_LEN`](ply_core::builtins::MAX_ARRAY_LEN); 4 `Array::get`,
+/// 5 `Array::set`, 6 `Columns::get` and 7 `Columns::set`, given an index `n` outside the `len`
+/// elements there are. Any other `what` fails the entry as Ply's fault.
+#[allow(improper_ctypes_definitions)]
+pub unsafe extern "C" fn rt_array_bad(ctx: *mut Ctx, what: I64, n: I64, len: I64) -> Raises {
+    let c = unsafe { &mut *ctx };
+    let site = c.site();
+    let lengths = [
+        "Array::new",
+        "Columns::new",
+        "Array::of_list",
+        "Columns::of_list",
+    ];
+    let indexes = ["Array::get", "Array::set", "Columns::get", "Columns::set"];
+    let refused = match usize::try_from(what.0) {
+        Ok(at) if at < lengths.len() => ply_core::builtins::array_length(site, lengths[at], n.0),
+        Ok(at) if at < lengths.len() + indexes.len() => ply_core::builtins::out_of_range(
+            site,
+            indexes[at - lengths.len()],
+            n.0,
+            usize::try_from(len.0).unwrap_or(0),
+            "elements",
+        ),
+        _ => {
+            c.fail(
+                Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!("an array's operation numbered {}, which none is", what.0),
+                )
+                .note("this is Ply's fault, not the program's"),
+            );
+            return Raises(());
+        }
+    };
+    raise_error(c, refused);
+    Raises(())
+}
+
 /// A fused `iterate`'s failure: `what` 0 a budget under one, 1 the budget spent, 2 a bad step
 /// answer `n`, which it takes.
 pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {

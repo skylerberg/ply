@@ -1828,7 +1828,9 @@ pub fn array_length(span: Span, what: &str, n: i64) -> Diagnostic {
     .primary(span, "no array has this length")
 }
 
-fn out_of_range(span: Span, what: &str, index: i64, len: usize, unit: &str) -> Diagnostic {
+/// `what` was given `index` into a value of `len` `unit`, which has no such index.
+#[cold]
+pub fn out_of_range(span: Span, what: &str, index: i64, len: usize, unit: &str) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
         format!("`{what}` index {index} is outside a value of {len} {unit}"),

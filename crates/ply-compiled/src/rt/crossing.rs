@@ -29,7 +29,9 @@ pub(crate) struct Lowering {
     functions: bool,
 }
 
-enum Beside {
+/// What crosses beside a lowering's bytes, lent for as long as the crossing lasts: a runtime
+/// object, or a value compiled code lent with its type.
+pub(crate) enum Beside {
     Runtime(Word),
     Lent(Lent),
 }
@@ -72,11 +74,27 @@ impl Lowering {
     }
 }
 
-/// Bytes being read, and the runtime objects that cross beside them, each holding a count until
-/// compiled code takes it.
+/// What crosses beside a lifting's bytes, holding a count until compiled code takes it: a runtime
+/// object, or a value the runtime kept with its type.
+pub enum Lifted {
+    Runtime(Word),
+    Carried(Carried),
+}
+
+impl Lifted {
+    fn release(self, ctx: *mut Ctx) {
+        match self {
+            Lifted::Runtime(w) => heap::dec(w),
+            Lifted::Carried(v) => v.release(ctx),
+        }
+    }
+}
+
+/// Bytes being read, and what crosses beside them, each holding a count until compiled code takes
+/// it.
 pub(crate) struct Lifting {
     r: Reader<Vec<u8>>,
-    beside: Vec<Option<Word>>,
+    beside: Vec<Option<Lifted>>,
     /// The name of the constructor read last.
     name: Option<Symbol>,
     /// The high word of the `Decimal` or width read last, until [`rt_in_high`] takes it.
@@ -90,15 +108,25 @@ impl Lifting {
         bits as u64 as i64
     }
 
-    /// The runtime object at the position the next `HANDLE` names, taken.
-    fn take(&mut self) -> Result<Word, String> {
+    /// What the position the next `HANDLE` names holds, taken where it is a carried value as
+    /// `carried` says, and left where it is not.
+    fn take(&mut self, carried: bool) -> Result<Lifted, String> {
         self.r.expect(tag::HANDLE)?;
         let at = self.r.varint()?;
-        usize::try_from(at)
+        let slot = usize::try_from(at)
             .ok()
             .and_then(|at| self.beside.get_mut(at))
-            .and_then(Option::take)
-            .ok_or_else(|| format!("handle {at}, which is not kept or was taken"))
+            .ok_or_else(|| format!("handle {at}, which is not kept"))?;
+        match slot {
+            None => Err(format!("handle {at}, which was taken")),
+            Some(Lifted::Carried(_)) if !carried => Err(format!(
+                "handle {at}, a value kept with its type, read as a runtime object"
+            )),
+            Some(Lifted::Runtime(_)) if carried => Err(format!(
+                "handle {at}, a runtime object, read as a value kept with its type"
+            )),
+            Some(_) => Ok(slot.take().expect("the slot holds what it was matched as")),
+        }
     }
 }
 
@@ -469,7 +497,19 @@ pub unsafe extern "C" fn rt_in_name_is(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
 
 /// A runtime object, given with the count the lifting held of it.
 pub unsafe extern "C" fn rt_in_handle(ctx: *mut Ctx) -> Handle {
-    Handle::of(unsafe { &mut *ctx }.read(Lifting::take))
+    Handle::of(unsafe { &mut *ctx }.read(|l| match l.take(false)? {
+        Lifted::Runtime(w) => Ok(w),
+        Lifted::Carried(_) => unreachable!("a runtime object was taken"),
+    }))
+}
+
+/// A value the runtime kept with its type, such as a task's answer or a value a channel held, given
+/// with the count the lifting held of it.
+pub unsafe extern "C" fn rt_in_carried(ctx: *mut Ctx) -> Handed {
+    Handed::of(unsafe { &mut *ctx }.read(|l| match l.take(true)? {
+        Lifted::Carried(v) => Ok(v.handed().word()),
+        Lifted::Runtime(_) => unreachable!("a carried value was taken"),
+    }))
 }
 
 /// The head of a function the runtime made, which only a generated one is: its case among
@@ -558,13 +598,15 @@ pub unsafe extern "C" fn rt_taken(ctx: *mut Ctx, dst: Addr, n: I64) {
 }
 
 impl Ctx {
-    /// Begins a lifting of `bytes`, `beside` the handles they name; one that does not open fails the
-    /// context and lifts nothing, so the crossings still nest.
-    pub(crate) fn lift_from(&mut self, bytes: Vec<u8>, mut beside: Vec<Word>) {
+    /// Begins a lifting of `bytes`, `beside` the handles they name, whose counts it takes; one that
+    /// does not open fails the context, lets `beside` go and lifts nothing, so the crossings still
+    /// nest.
+    pub fn lift_from(&mut self, bytes: Vec<u8>, mut beside: Vec<Lifted>) {
         let r = match Reader::new(bytes) {
             Ok(r) => r,
             Err(why) => {
-                beside.drain(..).for_each(heap::dec);
+                let ctx: *mut Ctx = self;
+                beside.drain(..).for_each(|b| b.release(ctx));
                 self.fail(err_crossing(&why));
                 Reader::new(codec::FORMAT.to_vec()).expect("the format alone opens")
             }
@@ -579,7 +621,10 @@ impl Ctx {
 
     /// Begins a lifting of `bytes`, each of `held` made a runtime object for the handle it is.
     fn lift_holding(&mut self, bytes: Vec<u8>, held: Vec<Value>) {
-        let beside = held.into_iter().map(|v| self.heap.bridge(v)).collect();
+        let beside = held
+            .into_iter()
+            .map(|v| Lifted::Runtime(self.heap.bridge(v)))
+            .collect();
         self.lift_from(bytes, beside);
     }
 
@@ -589,14 +634,15 @@ impl Ctx {
         let Some(Crossing::Lifting(l)) = self.crossings.pop() else {
             unreachable!("the innermost crossing is a lifting");
         };
-        l.beside.into_iter().flatten().for_each(heap::dec);
+        let ctx: *mut Ctx = self;
+        l.beside.into_iter().flatten().for_each(|b| b.release(ctx));
         l.r.end()
     }
 }
 
 /// What a value of a runtime object reads as: a bridge's value. Nothing else the runtime lays out
 /// is read here.
-fn runtime_value(w: Word) -> Result<Value, String> {
+pub(crate) fn runtime_value(w: Word) -> Result<Value, String> {
     if heap::kind(w) != KIND_BRIDGE {
         return Err(format!(
             "an object of kind {} crossed as a handle",
@@ -609,6 +655,12 @@ fn runtime_value(w: Word) -> Result<Value, String> {
 /// What `write` writes into a lowering of its own, read back as a value, each handle as the value
 /// it stands for: a runtime object's own, a carried value lowered through its type.
 pub(crate) fn lowered_value(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Result<Value, String> {
+    let l = lowering(ctx, write)?;
+    read_back(ctx, l)
+}
+
+/// What `write` writes into a lowering of its own.
+fn lowering(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Result<Lowering, String> {
     let depth = unsafe { &*ctx }.crossings.len();
     unsafe { &mut *ctx }
         .crossings
@@ -622,7 +674,20 @@ pub(crate) fn lowered_value(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Resu
     let Some(Crossing::Lowering(l)) = c.crossings.pop() else {
         return Err("a lowering ended a crossing it did not begin".into());
     };
-    read_back(ctx, l)
+    Ok(l)
+}
+
+/// `w` lowered through `ty` into a lowering of its own: its bytes, and what stands at each handle
+/// they name, lent while `w` lives.
+pub(crate) fn lowering_of(
+    ctx: *mut Ctx,
+    w: Word,
+    ty: &'static PlyType,
+) -> Result<(Vec<u8>, Vec<Beside>), String> {
+    let l = lowering(ctx, |ctx| unsafe {
+        (ty.lower)(ctx, w);
+    })?;
+    Ok((l.w.finish(), l.beside))
 }
 
 /// A lowering's bytes read as a value, each handle as the value it stands for: a runtime object's
@@ -683,8 +748,24 @@ pub(crate) fn encoded(v: &Value) -> (Vec<u8>, Vec<Value>) {
 pub(crate) fn lifted(ctx: *mut Ctx, v: &Value, ty: &PlyType) -> Option<Handed> {
     let (bytes, held) = encoded(v);
     let c = unsafe { &mut *ctx };
+    let beside = held
+        .into_iter()
+        .map(|v| Lifted::Runtime(c.heap.bridge(v)))
+        .collect();
+    lifted_from(ctx, bytes, beside, ty)
+}
+
+/// `bytes` lifted through `ty`, `beside` the handles they name, whose counts it takes; `None` with
+/// the context failed where they do not cross.
+pub(crate) fn lifted_from(
+    ctx: *mut Ctx,
+    bytes: Vec<u8>,
+    beside: Vec<Lifted>,
+    ty: &PlyType,
+) -> Option<Handed> {
+    let c = unsafe { &mut *ctx };
     let depth = c.crossings.len();
-    c.lift_holding(bytes, held);
+    c.lift_from(bytes, beside);
     let w = unsafe { (ty.lift)(ctx) };
     let c = unsafe { &mut *ctx };
     if c.crossings.len() != depth + 1 {

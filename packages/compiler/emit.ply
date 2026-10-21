@@ -6,19 +6,19 @@ import emit.code (Code, lower_fn)
 import syntax.items (Module, Derived, Item, IFn, ITest, ILaw, IType, parse, with_prelude, Binder,
                      SpecClause, SRequires, SEnsures, SCost, SSpace, FnDef, test_run, test_listing,
                      IInstance, VariantDef, TDSum, INumeric, NumericOp, NKey, TestDef)
-import check.resolve.tables (ParsedModule, Source, Diag, qualify)
+import check.resolve.tables (ParsedModule, Source, Diag, Parameters, qualify)
 import check.resolve (ResolveSucceeded, ResolveFailed, resolve_packaged)
 import check.resolve.scopes (PackageDeps, no_packages, of_binder)
 import expand.derive (expand_derives)
 import check.infer.checker (MemberSite, WitnessOp, test_owner, law_root, law_owner, cases_root)
-import check.infer (expanded_mods)
+import check.infer (expanded_mods, expanded_mod)
+import front.seam (WalkedFacts)
 import check.types (Type, TyCon, TyVar, Scheme, int_type, bytes_type)
 import emit.lower.setting (Setting, declared_schemes, walked_read, defs_in, resolved_imports,
                            effects_in, params_carried, law_params, facts_by_item, filings_of,
                            labels_of)
 import emit.lower.calling (known_body, lambdas_of, named_in, def_in)
 import emit.lower.scalars (walked_container)
-import emit.lower (tail_groups, tail_callees)
 import emit.typing (Typed, Filings, no_filings)
 import front.rows (Rows, KnownDefRow)
 import front.published (facts_read, lowered_modules, lowers, wants)
@@ -39,10 +39,10 @@ import emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, ModuleDefs, EmitPara
                   OwnerLambdas, kind_of, boxed, Sig, sig_of, param_kinds, param_types, typed_kind,
                   filings_at, at_args)
 import emit.written (container_code, equality_code, ordering_code, digest_code, reflection_code)
-import emit.entry (Prepared, RootForm, Formed, Unformed, group_formed, root_formed, formed_from,
-                   emitted_of)
+import emit.entry (Prepared, RootForm, Formed, Unformed, root_formed, formed_from, emitted_of)
 import emit.release (generated)
-import emit.special (specialisations_wanted, witnessed_needs, definition_at, specialised_formed)
+import emit.special (specialisations_wanted, witnessed_needs, definition_at, specialised_formed,
+                     instance_group, instances_formed, tail_mates, tail_reached_defs)
 
 /// What an arm that refuses a program before lowering anything can say: the checker's own words, one
 /// per diagnostic. There is no renderer for a diagnostic on this side -- the driver's `explain` has
@@ -205,249 +205,249 @@ pub fn lowered_program(
         ) {
         ResolveFailed(diags) -> refused(said(diags)),
         ResolveSucceeded(x) -> {
-          // A specialisation is lowered from its definition's facts, and the lambdas it runs from
-          // their owners'.
-          let reading = match roots {
-            None -> None,
-            Some(ks) ->
-              Some(
-                ks.fold(wanted_names(ks), |acc: Map<Bytes, Bool>, k: RootKey|
-                  key_lent(k).fold(
-                    acc.insert(sited_as(k), true),
-                    |r: Map<Bytes, Bool>, f: FnArg| r.insert(sited_as(f.owner), true),
-                  )),
+          let schemes = rows.defs.fold(Map::new(), |acc: Map<Bytes, Scheme>, row: KnownDefRow|
+            acc.insert(row.name, row.scheme));
+          match walked_read(walked) {
+            None ->
+              refused(
+                b"the front end's answer carries nothing its check read, so nothing is lowered from it",
               ),
-          };
-          let lowered = lowered_modules(reading);
-          match match walked_read(walked) {
-              None ->
-                Err(
-                  b"the front end's answer carries nothing its check read, so nothing is lowered from it",
-                ),
-              Some(w) -> facts_read(rows, w, reading, x.mods),
-            } {
-            Err(why) -> refused(why),
-            Ok(facts) -> {
-              let pure = facts.pure.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes|
+            Some(w) -> {
+              let pure = w.pure.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes|
                 acc.insert(n, true));
-              // The checker has the shape of every update, so the literals they stand for are written in here.
-              let mods: List<ParsedModule> = expanded_mods(
-                x.mods,
-                facts.elaboration,
-                x.r.signatures,
-              );
-              let schemes = rows.defs.fold(
-                Map::new(),
-                |acc: Map<Bytes, Scheme>, row: KnownDefRow| acc.insert(row.name, row.scheme),
-              );
-              let program = mods.map(|m: ParsedModule|
-                { module: m.name, defs: defs_in(m.name, m.module, pure, schemes) });
-              let stated = stated_by_tag(mods);
-              let ctors = {
-                ..ctors,
-                keyed: keyed_tags(mods).fold(ctors.keyed, |acc: List<Bytes>, k: Bytes|
-                  if acc.contains(k) { acc } else { acc.push(k) }),
+              let reading = match roots {
+                None -> None,
+                Some(ks) -> Some(reading_of(rows, w, x.mods, x.r.signatures, pure, schemes, ks)),
               };
-              let defs_of = |path: Bytes|
-                program.fold([], |acc: List<Def>, md: ModuleDefs|
-                  if md.module == path { md.defs } else { acc });
-              // What the check filed of each item's nodes, which its roots and the lambdas it lends
-              // are read under.
-              let owned = facts_by_item(facts);
-              let filed_of = |owner: Bytes| filings_of(owned, owner);
-              // Each lowered module's definitions and imports.
-              let tables_of = |i: Int, m: ParsedModule|
-                {
-                  here: defs_in(m.name, m.module, pure, schemes),
-                  imports: resolved_imports(
-                    x.r,
-                    i,
-                    mods,
-                    m.module,
-                    defs_of,
-                    facts.elaboration.members.filter(|s: MemberSite| s.module == i),
-                  ),
-                };
-              let tables = range(0, mods.len()).map(|i: Int|
-                match mods.at(i) {
-                  Some(m) -> if lowers(lowered, m.name) { Some(tables_of(i, m)) } else { None },
-                  None -> None,
-                });
-              let tables_at = |i: Int, m: ParsedModule|
-                match tables.at(i) { Some(Some(t)) -> t, _ -> tables_of(i, m) };
-              let specialised = specialisations_wanted(match roots { Some(ks) -> ks, None -> [] });
-              let written_roots = written_wanted(match roots { Some(ks) -> ks, None -> [] });
-              // What an owner lends: its lambdas, read where it lowers them, a definition as it stands
-              // or at the type arguments the owner's key gives; past the first `lambdas` it writes are
-              // the definitions it names as values.
-              let owner_read = |owner: RootKey| {
-                let of = match owner {
-                  At(a) -> { base: a.def, args: key_types(owner), lends: a.lent.len() == 0 },
-                  _ -> { base: root_name(owner), args: [], lends: true },
-                };
-                let dot = range(0, of.base.len()).fold(0 - 1, |acc: Int, k: Int|
-                  if of.base.at(k) == 46 { k } else { acc });
-                let module = of.base.slice(0, if dot < 0 { 0 } else { dot });
-                let short = of.base.slice(dot + 1, of.base.len());
-                // The lambdas `code`, the owner's body in module `i`, writes, read under `filed`.
-                let lent = |i: Int, m: ParsedModule, code: Code, filed: Result<Filings, Bytes>, base: Int| {
-                  let tab = tables_at(i, m);
-                  let emitted = known_body(root_name(owner), [], code);
-                  let lambdas = lambdas_of(emitted);
-                  let written = lambdas.concat(named_in(m.name, tab.here, tab.imports, emitted));
-                  match ((written.at(0), filed)) {
-                    (Some(first), Ok(f)) ->
-                      Some({
-                        lambdas: lambdas.len(),
-                        bound: {
-                          owner: owner,
-                          nth: 0,
-                          code: first,
-                          named: false,
-                          module: m.name,
-                          here: tab.here,
-                          imports: tab.imports,
-                          effects: effects_in(x.r, i, mods),
-                          filed: f,
-                          base: base,
-                          written: written,
-                        },
-                      }),
-                    _ -> None,
-                  }
-                };
-                match range(0, mods.len()).fold(None, |acc: Option<Int>, k: Int|
-                    match acc {
-                      Some(_) -> acc,
-                      None -> if mods.get(k).name == module { Some(k) } else { None },
-                    }) {
-                  None -> None,
-                  Some(i) -> {
-                    let m = mods.get(i);
-                    match m.module.items.fold(None, |acc: Option<FnDef>, item: Item|
-                        match item {
-                          IFn(d) -> if d.name.name == short && of.lends { Some(d) } else { acc },
-                          _ -> acc,
+              let lowered = lowered_modules(reading);
+              match facts_read(rows, w, reading, x.mods) {
+                Err(why) -> refused(why),
+                Ok(facts) -> {
+                  // The checker has the shape of every update, so the literals they stand for are written in here.
+                  let mods: List<ParsedModule> = expanded_mods(
+                    x.mods,
+                    facts.elaboration,
+                    x.r.signatures,
+                  );
+                  let program = mods.map(|m: ParsedModule|
+                    { module: m.name, defs: defs_in(m.name, m.module, pure, schemes) });
+                  let stated = stated_by_tag(mods);
+                  let ctors = {
+                    ..ctors,
+                    keyed: keyed_tags(mods).fold(ctors.keyed, |acc: List<Bytes>, k: Bytes|
+                      if acc.contains(k) { acc } else { acc.push(k) }),
+                  };
+                  let defs_of = |path: Bytes|
+                    program.fold([], |acc: List<Def>, md: ModuleDefs|
+                      if md.module == path { md.defs } else { acc });
+                  // What the check filed of each item's nodes, which its roots and the lambdas it lends
+                  // are read under.
+                  let owned = facts_by_item(facts);
+                  let filed_of = |owner: Bytes| filings_of(owned, owner);
+                  // Each lowered module's definitions and imports.
+                  let tables_of = |i: Int, m: ParsedModule|
+                    {
+                      here: defs_in(m.name, m.module, pure, schemes),
+                      imports: resolved_imports(
+                        x.r,
+                        i,
+                        mods,
+                        m.module,
+                        defs_of,
+                        facts.elaboration.members.filter(|s: MemberSite| s.module == i),
+                      ),
+                    };
+                  let tables = range(0, mods.len()).map(|i: Int|
+                    match mods.at(i) {
+                      Some(m) -> if lowers(lowered, m.name) { Some(tables_of(i, m)) } else { None },
+                      None -> None,
+                    });
+                  let tables_at = |i: Int, m: ParsedModule|
+                    match tables.at(i) { Some(Some(t)) -> t, _ -> tables_of(i, m) };
+                  let specialised = specialisations_wanted(match roots {
+                    Some(ks) -> ks,
+                    None -> [],
+                  });
+                  let written_roots = written_wanted(match roots { Some(ks) -> ks, None -> [] });
+                  // What an owner lends: its lambdas, read where it lowers them, a definition as it stands
+                  // or at the type arguments the owner's key gives; past the first `lambdas` it writes are
+                  // the definitions it names as values.
+                  let owner_read = |owner: RootKey| {
+                    let of = match owner {
+                      At(a) -> { base: a.def, args: key_types(owner), lends: a.lent.len() == 0 },
+                      _ -> { base: root_name(owner), args: [], lends: true },
+                    };
+                    let dot = range(0, of.base.len()).fold(0 - 1, |acc: Int, k: Int|
+                      if of.base.at(k) == 46 { k } else { acc });
+                    let module = of.base.slice(0, if dot < 0 { 0 } else { dot });
+                    let short = of.base.slice(dot + 1, of.base.len());
+                    // The lambdas `code`, the owner's body in module `i`, writes, read under `filed`.
+                    let lent = |i: Int, m: ParsedModule, code: Code, filed: Result<Filings, Bytes>, base: Int| {
+                      let tab = tables_at(i, m);
+                      let emitted = known_body(root_name(owner), [], code);
+                      let lambdas = lambdas_of(emitted);
+                      let written = lambdas.concat(
+                        named_in(m.name, tab.here, tab.imports, emitted),
+                      );
+                      match ((written.at(0), filed)) {
+                        (Some(first), Ok(f)) ->
+                          Some({
+                            lambdas: lambdas.len(),
+                            bound: {
+                              owner: owner,
+                              nth: 0,
+                              code: first,
+                              named: false,
+                              module: m.name,
+                              here: tab.here,
+                              imports: tab.imports,
+                              effects: effects_in(x.r, i, mods),
+                              filed: f,
+                              base: base,
+                              written: written,
+                            },
+                          }),
+                        _ -> None,
+                      }
+                    };
+                    match range(0, mods.len()).fold(None, |acc: Option<Int>, k: Int|
+                        match acc {
+                          Some(_) -> acc,
+                          None -> if mods.get(k).name == module { Some(k) } else { None },
                         }) {
-                      // A test's lambdas, as its root lowers its run.
-                      None -> match m.module.items.fold(
-                          None,
-                          |acc: Option<TestDef>, item: Item|
+                      None -> None,
+                      Some(i) -> {
+                        let m = mods.get(i);
+                        match m.module.items.fold(None, |acc: Option<FnDef>, item: Item|
                             match item {
-                              ITest(t) -> if Named(test_owner(m.name, t.name)) == owner { Some(t) }
+                              IFn(d) -> if d.name.name == short && of.lends { Some(d) }
                               else { acc },
                               _ -> acc,
-                            },
-                        ) {
-                        None -> None,
-                        Some(t) -> {
-                          let filed = filed_of(root_name(owner));
-                          match lower_fn(
-                              if t.cases != None { [case_at(), case_identity()] } else { [] },
-                              [],
-                              labels_of(filed),
-                              test_run(t),
-                              of_binder(m.name),
+                            }) {
+                          // A test's lambdas, as its root lowers its run.
+                          None -> match m.module.items.fold(
+                              None,
+                              |acc: Option<TestDef>, item: Item|
+                                match item {
+                                  ITest(t) -> if Named(test_owner(m.name, t.name)) == owner {
+                                    Some(t)
+                                  } else { acc },
+                                  _ -> acc,
+                                },
                             ) {
-                            Err(_) -> None,
-                            Ok(l) -> lent(i, m, l.code, filed, t.span.start),
-                          }
-                        },
-                      },
-                      Some(d) -> {
-                        let source = definition_at(
-                          of.base,
-                          d,
-                          of.args,
-                          schemes,
-                          facts.elaboration.ops.filter(|o: WitnessOp| o.module == i),
-                        );
-                        let filed = filed_of(of.base);
-                        match lower_fn(
-                            d.params.map(|param: Param| param.name.name),
-                            d.generics.labels.map(|ident: Ident| ident.name),
-                            labels_of(filed),
-                            source.body,
-                            of_binder(m.name),
-                          ) {
-                          Err(_) -> None,
-                          Ok(l) ->
-                            lent(
-                              i,
-                              m,
-                              l.code,
-                              match filed {
-                                Ok(f) ->
-                                  Ok(if of.args.len() == 0 { f } else { filings_at(f, of.args) }),
-                                Err(why) -> Err(why),
-                              },
-                              d.span.start,
-                            ),
+                            None -> None,
+                            Some(t) -> {
+                              let filed = filed_of(root_name(owner));
+                              match lower_fn(
+                                  if t.cases != None { [case_at(), case_identity()] } else { [] },
+                                  [],
+                                  labels_of(filed),
+                                  test_run(t),
+                                  of_binder(m.name),
+                                ) {
+                                Err(_) -> None,
+                                Ok(l) -> lent(i, m, l.code, filed, t.span.start),
+                              }
+                            },
+                          },
+                          Some(d) -> {
+                            let source = definition_at(
+                              of.base,
+                              d,
+                              of.args,
+                              schemes,
+                              facts.elaboration.ops.filter(|o: WitnessOp| o.module == i),
+                            );
+                            let filed = filed_of(of.base);
+                            match lower_fn(
+                                d.params.map(|param: Param| param.name.name),
+                                d.generics.labels.map(|ident: Ident| ident.name),
+                                labels_of(filed),
+                                source.body,
+                                of_binder(m.name),
+                              ) {
+                              Err(_) -> None,
+                              Ok(l) ->
+                                lent(
+                                  i,
+                                  m,
+                                  l.code,
+                                  match filed {
+                                    Ok(f) ->
+                                      Ok(if of.args.len() == 0 { f }
+                                      else { filings_at(f, of.args) }),
+                                    Err(why) -> Err(why),
+                                  },
+                                  d.span.start,
+                                ),
+                            }
+                          },
                         }
                       },
                     }
-                  },
-                }
-              };
-              // Each owner a wanted specialisation runs a lambda of is read once, for all of them.
-              let lent_by = specialised.fold(
-                Map::new(),
-                |acc: Map<Bytes, Option<OwnerLambdas>>, _: Bytes, sps: List<RootKey>|
-                  sps.fold(acc, |held: Map<Bytes, Option<OwnerLambdas>>, sp: RootKey|
-                    key_lent(sp).fold(held, |h: Map<Bytes, Option<OwnerLambdas>>, f: FnArg| {
-                      let name = root_name(f.owner);
-                      if h.contains(name) { h } else { h.insert(name, owner_read(f.owner)) }
-                    })),
-              );
-              let lambda_at = |owner: RootKey, nth: Int|
-                match match lent_by.get(root_name(owner)) {
-                    Some(o) -> o,
-                    None -> owner_read(owner),
-                  } {
-                  None -> None,
-                  Some(o) -> match o.bound.written.at(nth) {
-                    None -> None,
-                    Some(code) ->
-                      Some({ ..o.bound, nth: nth, code: code, named: nth >= o.lambdas }),
-                  },
-                };
-              let declared = declared_schemes();
-              {
-                roots: range(0, mods.len()).fold([], |acc: List<RootForm>, i: Int|
-                  match mods.at(i) {
-                    None -> acc,
-                    Some(m) -> if !lowers(lowered, m.name) { acc } else {
-                      let tab = tables_at(i, m);
-                      acc.concat(
-                        module_formed(
-                          m.module,
-                          {
-                            module: m.name,
-                            here: tab.here,
-                            imports: tab.imports,
-                            ctors: ctors,
-                            builtins: builtins,
-                            declared: declared,
-                            effects: effects_in(x.r, i, mods),
-                            release: release,
-                          },
-                          schemes,
-                          wanted,
-                          written_roots.filter(
-                            |w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }|
-                              w.module == m.name,
-                          ).map(|w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }|
-                            { key: w.key, op: w.op, ty: w.ty }),
-                          specialised,
-                          filed_of,
-                          facts.elaboration.ops.filter(|o: WitnessOp| o.module == i),
-                          lambda_at,
-                        ),
-                      )
-                    },
-                  }),
-                stated: stated,
-                ctors: ctors,
+                  };
+                  // Each owner a wanted specialisation runs a lambda of is read once, for all of them.
+                  let lent_by = specialised.fold(
+                    Map::new(),
+                    |acc: Map<Bytes, Option<OwnerLambdas>>, _: Bytes, sps: List<RootKey>|
+                      sps.fold(acc, |held: Map<Bytes, Option<OwnerLambdas>>, sp: RootKey|
+                        key_lent(sp).fold(held, |h: Map<Bytes, Option<OwnerLambdas>>, f: FnArg| {
+                          let name = root_name(f.owner);
+                          if h.contains(name) { h } else { h.insert(name, owner_read(f.owner)) }
+                        })),
+                  );
+                  let lambda_at = |owner: RootKey, nth: Int|
+                    match match lent_by.get(root_name(owner)) {
+                        Some(o) -> o,
+                        None -> owner_read(owner),
+                      } {
+                      None -> None,
+                      Some(o) -> match o.bound.written.at(nth) {
+                        None -> None,
+                        Some(code) ->
+                          Some({ ..o.bound, nth: nth, code: code, named: nth >= o.lambdas }),
+                      },
+                    };
+                  let declared = declared_schemes();
+                  {
+                    roots: range(0, mods.len()).fold([], |acc: List<RootForm>, i: Int|
+                      match mods.at(i) {
+                        None -> acc,
+                        Some(m) -> if !lowers(lowered, m.name) { acc } else {
+                          let tab = tables_at(i, m);
+                          acc.concat(
+                            module_formed(
+                              m.module,
+                              {
+                                module: m.name,
+                                here: tab.here,
+                                imports: tab.imports,
+                                ctors: ctors,
+                                builtins: builtins,
+                                declared: declared,
+                                effects: effects_in(x.r, i, mods),
+                                release: release,
+                              },
+                              schemes,
+                              wanted,
+                              written_roots.filter(
+                                |w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }|
+                                  w.module == m.name,
+                              ).map(|w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }|
+                                { key: w.key, op: w.op, ty: w.ty }),
+                              specialised,
+                              filed_of,
+                              reading,
+                              facts.elaboration.ops.filter(|o: WitnessOp| o.module == i),
+                              lambda_at,
+                            ),
+                          )
+                        },
+                      }),
+                    stated: stated,
+                    ctors: ctors,
+                  }
+                },
               }
             },
           }
@@ -455,6 +455,104 @@ pub fn lowered_program(
       }
     },
   }
+}
+
+/// The roots and owners whose facts a walk for roots `ks` of `mods` reads: each root, the owner it
+/// is sited at and each owner of a lambda it runs in place, and for a specialisation each other
+/// definition that runs in one tail loop with its own, which the specialisation's loop takes in.
+fn reading_of(
+  rows: Rows,
+  w: WalkedFacts,
+  mods: List<ParsedModule>,
+  signatures: Map<Bytes, Parameters>,
+  pure: Map<Bytes, Bool>,
+  schemes: Map<Bytes, Scheme>,
+  ks: List<RootKey>,
+) -> Map<Bytes, Bool> / {abort.raise} = {
+  let sited = ks.fold(wanted_names(ks), |acc: Map<Bytes, Bool>, k: RootKey|
+    key_lent(k).fold(acc.insert(sited_as(k), true), |r: Map<Bytes, Bool>, f: FnArg|
+      r.insert(sited_as(f.owner), true)));
+  let specialised = ks.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, k: RootKey|
+    match k {
+      At(a) -> {
+        let m = module_of(k);
+        let had = match acc.get(m) { Some(ds) -> ds, None -> [] };
+        if had.contains(a.def) { acc } else { acc.insert(m, had.push(a.def)) }
+      },
+      _ -> acc,
+    });
+  range(0, mods.len()).fold(sited, |acc: Map<Bytes, Bool>, i: Int|
+    match specialised.get(mods.get(i).name) {
+      None -> acc,
+      Some(owners) ->
+        loop_mates(rows, w, mods, signatures, pure, schemes, i, owners).fold(
+          acc,
+          |r: Map<Bytes, Bool>, n: Bytes| r.insert(n, true),
+        ),
+    })
+}
+
+/// The definitions of module `i` of `mods` that run in one tail loop with one of `owners`. Each body
+/// is read written out with what the check filed of it, so a call written on a value is among its
+/// tail calls: the facts of each definition the owners' tail calls reach are read, until those calls
+/// reach no definition more.
+fn loop_mates(
+  rows: Rows,
+  w: WalkedFacts,
+  mods: List<ParsedModule>,
+  signatures: Map<Bytes, Parameters>,
+  pure: Map<Bytes, Bool>,
+  schemes: Map<Bytes, Scheme>,
+  i: Int,
+  owners: List<Bytes>,
+) -> List<Bytes> / {abort.raise} = {
+  let name = mods.get(i).name;
+  let walk = |read: Map<Bytes, Bool>|
+    match facts_read(rows, w, Some(read), mods) {
+      Err(_) -> None,
+      Ok(facts) -> {
+        let m = expanded_mod(mods, i, facts.elaboration, signatures);
+        let here = defs_in(name, m.module, pure, schemes);
+        let owned = facts_by_item(facts);
+        let defs = m.module.items.fold(Map::new(), |d: Map<Bytes, FnDef>, item: Item|
+          match item { IFn(f) -> d.insert(qualify(name, f.name.name), f), _ -> d });
+        let read_of = |full: Bytes|
+          match defs.get(full) {
+            None -> None,
+            Some(f) -> {
+              let filed = filings_of(owned, full);
+              Some({ code: written_code_of(name, f, filed), filed: filed })
+            },
+          };
+        Some({
+          reached: owners.fold(Map::new(), |r: Map<Bytes, Bool>, o: Bytes|
+            tail_reached_defs(name, here, read_of, o).fold(
+              r,
+              |s: Map<Bytes, Bool>, n: Bytes, _: Bool| s.insert(n, true),
+            )),
+          mates: owners.fold([], |ms: List<Bytes>, o: Bytes|
+            ms.concat(tail_mates(name, here, read_of, o))),
+        })
+      },
+    };
+  iterate(
+    { read: owners.fold(Map::new(), |r: Map<Bytes, Bool>, o: Bytes| r.insert(o, true)), mates: [] },
+    schemes.len() + 1,
+    |s: { read: Map<Bytes, Bool>, mates: List<Bytes> }|
+      match walk(s.read) {
+        None -> Stop(s),
+        Some(r) -> {
+          // A definition the check has no facts of, an extern's, has no body to reach further.
+          let more = r.reached.keys().filter(|n: Bytes| !s.read.contains(n) && schemes.contains(n));
+          if more.len() == 0 { Stop({ ..s, mates: r.mates }) } else {
+            Continue({
+              ..s,
+              read: more.fold(s.read, |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true)),
+            })
+          }
+        },
+      },
+  ).mates
 }
 
 /// Each constructor whose type's module states a `key`, which its values are compared by.
@@ -549,7 +647,7 @@ fn calling_instances(stated: Map<Bytes, List<Bytes>>, e: Emitted) -> Emitted / {
 /// The roots `wanted` names of the module `s` reads, formed in its order: its definitions, each
 /// definition's specialisations and clauses, its tests and laws, and the roots written for its types
 /// that `written_roots` keys. `filed_of` is what the checker filed of each item's nodes, by the
-/// item's owner.
+/// item's owner, read for the owners `reading` names.
 fn module_formed(
   x_module: Module,
   s: Setting,
@@ -558,6 +656,7 @@ fn module_formed(
   written_roots: List<{ key: RootKey, op: TypeOp, ty: Type }>,
   specialised: Map<Bytes, List<RootKey>>,
   filed_of: (Bytes) -> Result<Filings, Bytes> / {abort.raise},
+  reading: Option<Map<Bytes, Bool>>,
   ops: List<WitnessOp>,
   lambda_at: (RootKey, Int) -> Option<BoundLambda> / {abort.raise},
 ) -> List<RootForm> / {abort.raise} = {
@@ -565,8 +664,36 @@ fn module_formed(
   let here = s.here;
   let fns = x_module.items.fold([], |acc: List<Prepared>, item: Item|
     match item { IFn(d) -> acc.push(prepare(module, schemes, wanted, filed_of, d)), _ -> acc });
-  // Only wanted, lowered definitions have `Code`, so every member of a group is emitted.
-  let groups = tail_groups(module, here, fns.map(|p: Prepared| { full: p.full, code: p.code }));
+  let prepared = fns.fold(Map::new(), |m: Map<Bytes, Prepared>, p: Prepared| m.insert(p.full, p));
+  let defs = x_module.items.fold(Map::new(), |m: Map<Bytes, FnDef>, item: Item|
+    match item { IFn(d) -> m.insert(qualify(module, d.name.name), d), _ -> m });
+  let order = x_module.items.fold(Map::new(), |m: Map<Bytes, Int>, item: Item|
+    match item { IFn(d) -> m.insert(qualify(module, d.name.name), m.len()), _ -> m });
+  // A definition a walk of tail calls reaches, its body lowered as written: once already where a
+  // root of it is wanted. One whose facts were not read is no part of a loop formed here.
+  let read_of = |full: Bytes|
+    match if wants(reading, full) { defs.get(full) } else { None } {
+      None -> None,
+      Some(d) -> {
+        let filed = match prepared.get(full) { Some(p) -> p.filed, None -> filed_of(full) };
+        Some({
+          code: match prepared.get(full) {
+            Some(p) -> match p.code { Ok(c) -> Ok(c), Err(_) -> written_code_of(module, d, filed) },
+            None -> written_code_of(module, d, filed),
+          },
+          filed: filed,
+        })
+      },
+    };
+  // `out` with the loop root `key` runs in, formed once under its first member; none where `key`
+  // loops with no other root.
+  let looped = |out: List<RootForm>, key: RootKey|
+    match instance_group(s, order, read_of, key) {
+      Err(why) -> Some(out.push(Unformed({ name: root_name(key), why: why }))),
+      Ok(keys) -> if keys.len() < 2 { None }
+      else if out.any(|r: RootForm| form_name(r) == root_name(keys.get(0))) { Some(out) }
+      else { Some(out.concat(instances_formed(s, schemes, ops, defs, read_of, keys))) },
+    };
   let walked = x_module.items.fold({ out: [], fns: 0 }, |acc: Walk, item: Item|
     match item {
       IFn(d) -> {
@@ -577,38 +704,26 @@ fn module_formed(
         let specialisations = (match specialised.get(p.full) { Some(l) -> l, None -> [] }).fold(
           acc.out,
           |a: List<RootForm>, sp: RootKey|
-            a.push(
-              specialised_formed(
-                {
-                  ..s,
-                  here: held_whole(here, tail_cycle(module, here, filed_of, x_module.items, d)),
-                },
-                d,
-                sp,
-                lambda_at,
-                schemes,
-                ops,
-                p.filed,
-              ),
-            ),
+
+            // One running lambdas in place leaves the loop: its calls hand them on as values.
+            match if key_lent(sp).len() > 0 { None } else { looped(a, sp) } {
+              Some(out) -> out,
+              None -> a.push(specialised_formed(s, d, sp, lambda_at, schemes, ops, p.filed)),
+            },
         );
-        let out = match group_of(groups, acc.fns) {
-          None -> if !wants(wanted, p.full) { specialisations } else {
-            specialisations.push(
-              witnessed_needs(
-                formed_from(s, p.base, Named(p.full), p.ps, p.known, p.code, p.filed),
-                d,
-                schemes.get(p.full),
-                ops,
+        let out = if !wants(wanted, p.full) { specialisations } else {
+          match looped(specialisations, Named(p.full)) {
+            Some(o) -> o,
+            None ->
+              specialisations.push(
+                witnessed_needs(
+                  formed_from(s, p.base, Named(p.full), p.ps, p.known, p.code, p.filed),
+                  d,
+                  schemes.get(p.full),
+                  ops,
+                ),
               ),
-            )
-          },
-          // The group is formed where its first member stands; the others are its cases.
-          Some(g) -> if g.at(0) != Some(acc.fns) { specialisations } else {
-            specialisations.concat(
-              group_formed(s, g.map(|i: Int| match fns.at(i) { Some(q) -> q, None -> p })),
-            )
-          },
+          }
         };
         clause_roots(
           { out: out, fns: acc.fns + 1 },
@@ -855,66 +970,25 @@ fn prepare(
   }
 }
 
-/// The other definitions of the module whose tail calls lead from `def` round to it again, each
-/// lowered as far as the walk reaches, wanted or not: the members of the loop `def` runs in.
-fn tail_cycle(
+/// The code the body of `def`, of `module`, lowers to as written, of whose nodes the checker filed
+/// `filed`.
+fn written_code_of(
   module: Bytes,
-  here: List<Def>,
-  filed_of: (Bytes) -> Result<Filings, Bytes> / {abort.raise},
-  items: List<Item>,
   def: FnDef,
-) -> List<Bytes> / {abort.raise} = {
-  let fns = items.fold(Map::new(), |acc: Map<Bytes, FnDef>, item: Item|
-    match item { IFn(d) -> acc.insert(d.name.name, d), _ -> acc });
-  let callees = |name: Bytes|
-    match fns.get(name) {
-      None -> [],
-      Some(d) -> match lower_fn(
-          d.params.map(|param: Param| param.name.name),
-          d.generics.labels.map(|ident: Ident| ident.name),
-          labels_of(filed_of(qualify(module, name))),
-          d.body,
-          of_binder(module),
-        ) {
-        Ok(l) -> tail_callees(here, l.code, []),
-        Err(_) -> [],
-      },
-    };
-  let own = def.name.name;
-  let edges = iterate(
-    { edges: Map::new(), work: [own] },
-    1000000,
-    |s: { edges: Map<Bytes, List<Bytes>>, work: List<Bytes> }|
-      match s.work {
-        [] -> Stop(s),
-        [n, ..rest] -> if s.edges.contains(n) { Continue({ ..s, work: rest }) } else {
-          let out = callees(n);
-          Continue({ edges: s.edges.insert(n, out), work: rest.concat(out) })
-        },
-      },
-  ).edges;
-  let back = iterate(Map::new().insert(own, true), edges.len() + 1, |seen: Map<Bytes, Bool>| {
-    let more = edges.fold(seen, |acc: Map<Bytes, Bool>, n: Bytes, out: List<Bytes>|
-      if acc.contains(n) || !out.fold(false, |b: Bool, m: Bytes| b || acc.contains(m)) { acc }
-      else { acc.insert(n, true) });
-    if more.len() == seen.len() { Stop(seen) } else { Continue(more) }
-  });
-  back.keys().filter(|n: Bytes| n != own)
-}
-
-/// `here` with each definition named in `names` as a call reaches one that takes no type parameter:
-/// as it stands, at no specialisation, its scheme's types read as they are written.
-fn held_whole(here: List<Def>, names: List<Bytes>) -> List<Def> =
-  if names.len() == 0 { here } else {
-    here.map(|d: Def|
-      if !names.contains(d.name) { d } else {
-        { ..d, scheme: match d.scheme { Some(sc) -> Some({ ..sc, ty_vars: [] }), None -> None } }
-      })
+  filed: Result<Filings, Bytes>,
+) -> Result<Code, Bytes> / {abort.raise} =
+  match lower_fn(
+      def.params.map(|param: Param| param.name.name),
+      def.generics.labels.map(|ident: Ident| ident.name),
+      labels_of(filed),
+      def.body,
+      of_binder(module),
+    ) {
+    Ok(l) -> Ok(l.code),
+    Err(why) -> Err(why),
   }
 
-fn group_of(groups: List<List<Int>>, i: Int) -> Option<List<Int>> =
-  groups.fold(None, |acc: Option<List<Int>>, g: List<Int>|
-    if g.fold(false, |seen: Bool, j: Int| seen || j == i) { Some(g) } else { acc })
+fn form_name(r: RootForm) -> Bytes = match r { Formed(f) -> f.name, Unformed(u) -> u.name }
 
 /// `requires` and `ensures` clauses as roots: `<owner>#requires#<k>`, `<owner>#ensures#<k>`, each
 /// over the definition's parameters at the types its scheme gives them, and an `ensures` over

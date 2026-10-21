@@ -86,5 +86,5 @@ pub use span::{
 pub use trace::Trace;
 pub use value::{
     Closure, ClosureKind, Decimal, Difference, Fields, Fixed, FixedOp, Map, PathStep, Sealed,
-    Synth, Value, constant_time_eq, first_difference, values_equal,
+    Synth, Value, constant_time_eq, first_difference, type_error, values_equal,
 };

@@ -1,29 +1,27 @@
 //! Specialisation: definitions written at type arguments, and the needs that ask for them.
 
-import syntax.parsing (Ident, dummy_span)
-import emit.code (lower_fn)
+import syntax.parsing (Ident)
+import emit.code (Code, lower_fn)
 import syntax.items (FnDef)
 import check.resolve.tables (qualify)
 import check.resolve.scopes (of_binder)
 import check.infer.checker (WitnessOp)
-import check.types (Type, TyVar, TyCon, TyFn, TyNominal, Scheme, row_empty, int_type)
+import check.types (Type, TyVar, TyCon, TyFn, TyNominal, Scheme)
 import std.list
 import syntax.exprs (Param, Expr)
 import syntax.type_syntax (TypeExpr, TVar, TCon, TFn)
 import expand.rewrite.shared (map_expr)
 import expand.rewrite (unwitnessed, witness_param)
 import emit.c (KInt, Kind)
-import emit.keys (RootKey, At, Named, FnArg, root_name, key_types, key_lent)
-import emit.answer (Need, Reads, Scalar, Layout, Exact)
-import emit.tir (Fn, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Inc, Dec, Reset, Opened,
-                 Return, Lambda, Closure, Var, Val, LastOf, RFlat, RToken, RWord, RInt, AInt,
-                 Rooted, Owned, counted, no_links)
-import emit.release (released_vars)
-import emit.reps (Ty, TyOpen, EmitParam, BoundLambda, Sig, sig_of, param_kinds, param_types,
-                  substituted, numeric_named, filings_at)
-import emit.typing (Filings)
-import emit.lower.setting (Setting, params_carried, labels_of)
-import emit.entry (RootForm, Formed, Unformed, formed_from)
+import emit.keys (RootKey, Named, At, FnArg, root_name, key_types, key_lent, unspecialised)
+import emit.answer (Need, Scalar, Exact)
+import emit.reps (Ty, TyOpen, Def, EmitParam, BoundLambda, Sig, sig_of, param_kinds, param_types,
+                  substituted, numeric_named, filings_at, has_vars)
+import emit.typing (Filings, unknown_type)
+import emit.lower.setting (Setting, Root, params_carried, labels_of)
+import emit.lower (group_lowered, tail_calls, TailCall)
+import emit.lower.calling (has_handle, instance_key)
+import emit.entry (RootForm, Formed, Unformed, formed_from, root_at)
 
 // --- Specialisation ----------------------------------------------------------------------------
 
@@ -105,53 +103,6 @@ pub fn witnessed_needs(
     },
   }
 
-/// `f`, its counts placed, noting among its needs `release_reads(f)`, so a specialisation settles
-/// every release on a type.
-pub fn release_needs(f: Fn) -> Fn = { ..f, links: { ..f.links, needs: fn_needs(f.links.needs, f) } }
-
-/// What `f`'s counts read of its type variables: each a count it lets go of reads exactly, since a
-/// value is let go of per type, and each a count it takes its layout alone. What its failure paths
-/// let go of and what its closures' bodies do count as its own. A body reading any is printed only
-/// at type arguments its callers settle.
-pub fn release_reads(f: Fn) -> List<Need> = fn_needs([], f)
-
-fn fn_needs(needs: List<Need>, f: Fn) -> List<Need> =
-  f.lambdas.fold(block_needs(needs, f.body), |acc: List<Need>, l: Lambda|
-    match l { Closure(c) -> fn_needs(acc, c.body) })
-
-fn block_needs(needs: List<Need>, b: Block) -> List<Need> =
-  b.fold(needs, |acc: List<Need>, i: Inst|
-    match i {
-      Let(l) -> unwound(value_needs(acc, l.val), l.unwind),
-      Do(d) -> unwound(value_needs(acc, d.val), d.unwind),
-      If(x) -> block_needs(block_needs(acc, x.then), x.otherwise),
-      Case(c) ->
-        c.arms.fold(block_needs(acc, c.rest), |a: List<Need>, arm: { when: Int, body: Block }|
-          block_needs(a, arm.body)),
-      Match(m) -> m.arms.fold(block_needs(acc, m.rest), block_needs),
-      Loop(l) -> block_needs(acc, l.body),
-      Handle(h) -> unwound(block_needs(acc, h.body), h.unwind),
-      Inc(n) -> reading(acc, n.var.ty, Layout),
-      Dec(v) -> reading(acc, v.ty, Exact),
-      Reset(r) -> reading(acc, r.of.ty, Exact),
-      Opened(o) -> match o.of.rep { RFlat(_) -> acc, _ -> reading(acc, o.of.ty, Exact) },
-      _ -> acc,
-    })
-
-fn value_needs(needs: List<Need>, val: Val) -> List<Need> =
-  match val { LastOf(v) -> reading(needs, v.ty, Exact), _ -> needs }
-
-/// `needs` with what letting go of each counted value of `unwind` reads; a reuse token, freed by its
-/// size, reads nothing.
-fn unwound(needs: List<Need>, unwind: List<Var>) -> List<Need> =
-  unwind.fold(needs, |acc: List<Need>, v: Var|
-    match v.rep { RToken(_) -> acc, r -> if counted(r) { reading(acc, v.ty, Exact) } else { acc } })
-
-/// `needs` with each variable a count of `ty` reads read as `reads`.
-fn reading(needs: List<Need>, ty: Type, reads: Reads) -> List<Need> =
-  released_vars(ty).fold(needs, |acc: List<Need>, v: Int|
-    if acc.contains({ var: v, reads: reads }) { acc } else { acc.push({ var: v, reads: reads }) })
-
 /// What a root of `def`, named `full`, at `args` reads its definition as: the body with each
 /// operator whose witness is a parameter held as one numeric type alone done as that type's own,
 /// and the signature at `args`.
@@ -185,6 +136,21 @@ pub fn definition_at(
   }
 }
 
+/// The parameters of `def` at signature `sig` as a root of it holds them, each label a trailing
+/// `Int`, with the names of the written ones and of its labels.
+fn params_at(
+  def: FnDef,
+  sig: Option<Sig>,
+) -> { names: List<Bytes>, labels: List<Bytes>, ps: List<EmitParam> } = {
+  let names = def.params.map(|param: Param| param.name.name);
+  let kinds = param_kinds(def, sig).map(|k: { kind: Kind, ty: Ty }| Some(k));
+  let labels = def.generics.labels.map(|ident: Ident| ident.name);
+  let all_names = labels.fold(names, |acc: List<Bytes>, n: Bytes| acc.push(n));
+  let all_kinds = labels.fold(kinds, |acc: List<Option<{ kind: Kind, ty: Ty }>>, n: Bytes|
+    acc.push(Some({ kind: KInt, ty: TyOpen([]) })));
+  { names: names, labels: labels, ps: params_carried(all_names, all_kinds, param_types(def, sig)) }
+}
+
 /// `def` of the module `s` reads formed as root `root`, at its type arguments and running the
 /// lambdas it lends in place: its parameters and what the checker filed of its nodes, `filed`, read
 /// at them, and each operator whose witness is a parameter now held as one numeric type alone done
@@ -203,14 +169,10 @@ pub fn specialised_formed(
   let fns = key_lent(root);
   let source = definition_at(full, def, args, schemes, ops);
   let body = source.body;
-  let sig = source.sig;
-  let names = def.params.map(|param: Param| param.name.name);
-  let kinds = param_kinds(def, sig).map(|k: { kind: Kind, ty: Ty }| Some(k));
-  let labels = def.generics.labels.map(|ident: Ident| ident.name);
-  let all_names = labels.fold(names, |acc: List<Bytes>, n: Bytes| acc.push(n));
-  let all_kinds = labels.fold(kinds, |acc: List<Option<{ kind: Kind, ty: Ty }>>, n: Bytes|
-    acc.push(Some({ kind: KInt, ty: TyOpen([]) })));
-  let carried = params_carried(all_names, all_kinds, param_types(def, sig));
+  let held = params_at(def, source.sig);
+  let names = held.names;
+  let labels = held.labels;
+  let carried = held.ps;
   // Each lambda the root runs, read where its owner lowered it.
   let lent = fns.fold(Some(carried), |acc: Option<List<EmitParam>>, f: FnArg|
     match acc {
@@ -246,48 +208,289 @@ pub fn specialised_formed(
   }
 }
 
-test "a body reads exactly each variable it lets go of a value of, and the layout of each it counts" {
-  let at = |name: Bytes, args: List<Type>| TyCon({ name: name, args: args });
-  let local = |id: Int, ty: Type| { id: id, ty: ty, rep: RWord };
-  let list = local(0, at(b"List", [TyVar(0)]));
-  let counted_once = local(1, TyVar(1));
-  let function = local(2, TyFn({ params: [TyVar(5)], ret: TyVar(6), effects: row_empty() }));
-  let task = local(3, at(b"Task", [TyVar(7)]));
-  let held = local(4, at(b"Hold", [TyVar(2)]));
-  let failing = local(5, TyVar(3));
-  let token = { id: 6, ty: TyVar(8), rep: RToken(2) };
-  let last = local(7, at(b"Hold", [TyVar(2)]));
-  let f = {
-    key: Named(b"m.f"),
-    kind: Rooted,
-    params: [],
-    conv: { params: [], reps: [], answer: RInt, answered: Owned },
-    body: [
-      Dec(list),
-      Inc({ var: counted_once, n: 1 }),
-      Dec(function),
-      Dec(task),
-      Let({ var: last, val: LastOf(held), at: dummy_span(), unwind: [failing, token] }),
-      Dec(list),
-      Return(AInt(0)),
-    ],
-    lambdas: [],
-    base: 0,
-    members: [],
-    links: { ..no_links(), needs: [{ var: 1, reads: Scalar }] },
-    statics: [],
-  };
-  assert_eq(release_needs(f).links.needs, [
-    { var: 1, reads: Scalar },
-    { var: 0, reads: Exact },
-    { var: 1, reads: Layout },
-    { var: 2, reads: Exact },
-    { var: 3, reads: Exact },
-  ]);
-  assert_eq(release_reads(f).len(), 4);
-  // A body counting only what its types settle reads none of its variables.
-  assert_eq(
-    release_reads({ ..f, body: [Dec(local(8, at(b"List", [int_type()]))), Return(AInt(0))] }),
-    [],
-  )
+// --- Tail loops at type arguments --------------------------------------------------------------
+
+/// A definition of the module as a walk of tail calls reads it: the code its body lowers to as
+/// written out, and what the checker filed of its nodes.
+pub type AsWritten = { code: Result<Code, Bytes>, filed: Result<Filings, Bytes> }
+
+/// What a walk found of one root: the roots its tail calls reach, and each definition one names at
+/// a type grown from a variable of the root's own.
+type Reached = { key: RootKey, out: List<RootKey>, grown: List<Bytes> }
+
+/// The type arguments a call the checker filed at `filed` names its callee at, read where its caller
+/// is at `args`: each a type of no variable as it is, and each variable of the caller's at the
+/// caller's argument, open where that is; none where one is grown from a variable.
+fn instance_args(filed: List<Type>, args: List<Type>) -> Option<List<Type>> =
+  filed.fold(Some([]), |acc: Option<List<Type>>, t: Type|
+    match acc {
+      None -> None,
+      Some(at) -> if !has_vars(t) { Some(at.push(t)) } else {
+        match t {
+          TyVar(j) -> Some(at.push(match args.at(j) { Some(a) -> a, None -> unknown_type() })),
+          _ -> None,
+        }
+      },
+    })
+
+/// The roots `w`'s tail calls of definitions of the module reach, read where its root is at `args`.
+fn tail_reached(s: Setting, w: AsWritten, args: List<Type>) -> Reached / {abort.raise} =
+  match w.code {
+    Err(_) -> { key: Named(b""), out: [], grown: [] },
+    Ok(c) ->
+      tail_calls(s.here, c, []).fold(
+        { key: Named(b""), out: [], grown: [] },
+        |acc: Reached, t: TailCall| {
+          let callee = qualify(s.module, t.name);
+          let filed = match w.filed {
+            Ok(f) -> match f.typed.get(t.at.site) { Some(x) -> x.args, None -> [] },
+            Err(_) -> [],
+          };
+          match instance_args(filed, args) {
+            None -> if acc.grown.contains(callee) { acc }
+            else { { ..acc, grown: acc.grown.push(callee) } },
+            Some(at) -> {
+              let k = instance_key(callee, at);
+              if acc.out.contains(k) { acc } else { { ..acc, out: acc.out.push(k) } }
+            },
+          }
+        },
+      ),
+  }
+
+/// The definitions of `module`, beside `here`, that definition `from` reaches through calls in tail
+/// position, `from` among them, each body as `read_of` reads it.
+pub fn tail_reached_defs(
+  module: Bytes,
+  here: List<Def>,
+  read_of: (Bytes) -> Option<AsWritten> / {abort.raise},
+  from: Bytes,
+) -> Map<Bytes, Bool> / {abort.raise} =
+  iterate(
+    { seen: Map::new(), work: [from] },
+    1000000,
+    |r: { seen: Map<Bytes, Bool>, work: List<Bytes> }|
+      match r.work {
+        [] -> Stop(r),
+        [n, ..rest] -> if r.seen.contains(n) { Continue({ ..r, work: rest }) } else {
+          let next = match read_of(n) {
+            Some(w) -> match w.code {
+              Ok(c) -> tail_calls(here, c, []).map(|t: TailCall| qualify(module, t.name)),
+              Err(_) -> [],
+            },
+            None -> [],
+          };
+          Continue({ seen: r.seen.insert(n, true), work: rest.concat(next) })
+        },
+      },
+  ).seen
+
+/// The other definitions of `module`, beside `here`, that run in one tail loop with `owner`, each
+/// body as `read_of` reads it: each `owner`'s tail calls reach that reaches it again.
+pub fn tail_mates(
+  module: Bytes,
+  here: List<Def>,
+  read_of: (Bytes) -> Option<AsWritten> / {abort.raise},
+  owner: Bytes,
+) -> List<Bytes> / {abort.raise} =
+  tail_reached_defs(module, here, read_of, owner).keys().filter(|d: Bytes|
+    d != owner && tail_reached_defs(module, here, read_of, d).contains(owner))
+
+/// The roots that run as one loop with `key`: each root the tail calls reach, each call naming its
+/// callee at the type arguments the checker filed for it read at its caller's, that reaches `key`
+/// again. They are in the order their definitions stand in the module (`order`), then of their
+/// names, so a loop is formed alike, under one first member, whichever of its roots is asked for.
+/// `key` alone where no other root loops with it or a member holds a `handle`. An error where a call
+/// names a definition that reaches its caller again at a type grown from a variable of the caller's,
+/// which the check refuses and no loop can run.
+pub fn instance_group(
+  s: Setting,
+  order: Map<Bytes, Int>,
+  read_of: (Bytes) -> Option<AsWritten> / {abort.raise},
+  key: RootKey,
+) -> Result<List<RootKey>, Bytes> / {abort.raise} = {
+  let reached = iterate(
+    { pairs: Map::new(), work: [key] },
+    1000000,
+    |r: { pairs: Map<Bytes, Reached>, work: List<RootKey> }|
+      match r.work {
+        [] -> Stop(r),
+        [k, ..rest] -> if r.pairs.contains(root_name(k)) { Continue({ ..r, work: rest }) } else {
+          let t = match read_of(root_name(unspecialised(k))) {
+            Some(w) -> tail_reached(s, w, key_types(k)),
+            None -> { key: k, out: [], grown: [] },
+          };
+          Continue({
+            pairs: r.pairs.insert(root_name(k), { ..t, key: k }),
+            work: rest.concat(t.out),
+          })
+        },
+      },
+  ).pairs;
+  let hole = reached.fold(None, |acc: Option<Bytes>, _: Bytes, p: Reached|
+    match acc {
+      Some(_) -> acc,
+      None -> {
+        let caller = root_name(unspecialised(p.key));
+        match p.grown.fold(None, |g: Option<Bytes>, callee: Bytes|
+            if g == None && tail_reached_defs(s.module, s.here, read_of, callee).contains(caller) {
+              Some(callee)
+            } else { g }) {
+          None -> None,
+          Some(callee) ->
+            Some(
+              Bytes::concat_all([
+                b"`",
+                caller,
+                b"` calls `",
+                callee,
+                b"` in tail position at a type grown from a type parameter of its own, which reaches it again: the check's rule on a group's type parameters (E0308) let it through",
+              ]),
+            ),
+        }
+      },
+    });
+  match hole {
+    Some(why) -> Err(why),
+    None -> {
+      let back = iterate(
+        Map::new().insert(root_name(key), true),
+        reached.len() + 1,
+        |seen: Map<Bytes, Bool>| {
+          let more = reached.fold(seen, |acc: Map<Bytes, Bool>, n: Bytes, p: Reached|
+            if acc.contains(n) || !p.out.any(|k: RootKey| acc.contains(root_name(k))) { acc }
+            else { acc.insert(n, true) });
+          if more.len() == seen.len() { Stop(seen) } else { Continue(more) }
+        },
+      );
+      let members = reached.fold([], |acc: List<RootKey>, n: Bytes, p: Reached|
+        if back.contains(n) { acc.push(p.key) } else { acc });
+      let handles = members.any(|k: RootKey|
+        match read_of(root_name(unspecialised(k))) {
+          Some(w) -> match w.code { Ok(c) -> has_handle(c), Err(_) -> true },
+          None -> true,
+        });
+      if members.len() < 2 || handles { Ok([key]) } else { Ok(in_order(order, members)) }
+    },
+  }
 }
+
+/// `keys` in the order their definitions stand in the module, then of their names.
+fn in_order(order: Map<Bytes, Int>, keys: List<RootKey>) -> List<RootKey> / {abort.raise} = {
+  let place = |k: RootKey| match order.get(root_name(unspecialised(k))) { Some(i) -> i, None -> 0 };
+  let before = |a: RootKey, b: RootKey|
+    place(a) < place(b) || (place(a) == place(b) && compare(root_name(a), root_name(b)) == Less);
+  keys.fold([], |sorted: List<RootKey>, k: RootKey|
+    sorted.filter(|x: RootKey| before(x, k)).push(k).concat(
+      sorted.filter(|x: RootKey| !before(x, k)),
+    ))
+}
+
+/// Root `key` of a definition of the module as a member of a tail loop: the root the typed form
+/// lowers at its type arguments, and the code its body lowers to there.
+fn instance_root(
+  s: Setting,
+  schemes: Map<Bytes, Scheme>,
+  ops: List<WitnessOp>,
+  defs: Map<Bytes, FnDef>,
+  read_of: (Bytes) -> Option<AsWritten> / {abort.raise},
+  key: RootKey,
+) -> Result<{ root: Root, code: Code }, Bytes> / {abort.raise} = {
+  let full = root_name(unspecialised(key));
+  match match defs.get(full) {
+      Some(d) -> match read_of(full) { Some(w) -> Some({ def: d, w: w }), None -> None },
+      None -> None,
+    } {
+    None -> Err(b"a member of a tail loop that no definition of the module is: ".concat(full)),
+    Some(dw) -> {
+      let w = dw.w;
+      let def = dw.def;
+      let args = key_types(key);
+      let source = definition_at(full, def, args, schemes, ops);
+      let held = params_at(def, source.sig);
+      let code = if args.len() == 0 { w.code } else {
+        match lower_fn(
+            held.names,
+            held.labels,
+            labels_of(w.filed),
+            source.body,
+            of_binder(s.module),
+          ) {
+          Ok(l) -> Ok(l.code),
+          Err(why) -> Err(why),
+        }
+      };
+      match code {
+        Err(why) -> Err(why),
+        Ok(c) ->
+          Ok({
+            root: root_at(s, key, def.span.start, held.ps, match w.filed {
+              Ok(f) -> Ok(filings_at(f, args)),
+              Err(why) -> Err(why),
+            }),
+            code: c,
+          }),
+      }
+    },
+  }
+}
+
+/// The tail loop of `keys`, `instance_group`'s members in order, formed as one root under the first's
+/// name, each member at its type arguments, its definition among `defs`. A loop whose members leave
+/// a type variable open is settled by its callers at every one: its members number their variables
+/// apart, so its needs cannot say which of one member's its code reads. Where a member does not
+/// lower, each is refused why.
+pub fn instances_formed(
+  s: Setting,
+  schemes: Map<Bytes, Scheme>,
+  ops: List<WitnessOp>,
+  defs: Map<Bytes, FnDef>,
+  read_of: (Bytes) -> Option<AsWritten> / {abort.raise},
+  keys: List<RootKey>,
+) -> List<RootForm> / {abort.raise} = {
+  let roots = keys.fold(
+    Ok([]),
+    |acc: Result<List<{ root: Root, code: Code }>, Bytes>, k: RootKey|
+      match acc {
+        Err(_) -> acc,
+        Ok(rs) -> match instance_root(s, schemes, ops, defs, read_of, k) {
+          Ok(r) -> Ok(rs.push(r)),
+          Err(why) -> Err(why),
+        },
+      },
+  );
+  match roots {
+    Err(why) -> keys.map(|k: RootKey| Unformed({ name: root_name(k), why: why })),
+    Ok(rs) -> match group_lowered(s, rs) {
+      Err(no) -> keys.map(|k: RootKey| Formed({ name: root_name(k), form: Err(no) })),
+      Ok(f) -> {
+        let open = keys.fold(0, |most: Int, k: RootKey| {
+          let w = open_width(schemes, k);
+          if w > most { w } else { most }
+        });
+        [
+          Formed({
+            name: match keys.at(0) { Some(k) -> root_name(k), None -> b"" },
+            form: Ok({
+              ..f,
+              links: {
+                ..f.links,
+                needs: range(0, open).fold(f.links.needs, |ns: List<Need>, j: Int|
+                  if ns.contains({ var: j, reads: Exact }) { ns }
+                  else { ns.push({ var: j, reads: Exact }) }),
+              },
+            }),
+          }),
+        ]
+      },
+    },
+  }
+}
+
+/// How many type variables root `key` leaves open: each of a definition as it stands, none of a
+/// specialisation, which its callers settle whole.
+fn open_width(schemes: Map<Bytes, Scheme>, key: RootKey) -> Int =
+  match key {
+    Named(full) -> match schemes.get(full) { Some(sc) -> sc.ty_vars.len(), None -> 0 },
+    _ -> 0,
+  }

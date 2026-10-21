@@ -4,12 +4,12 @@ import syntax.parsing (dummy_span)
 import syntax.exprs (Expr)
 import syntax.patterns (Lit, LInt, LBad)
 import check.resolve.scopes (of_binder)
-import check.types (Type, TyFn, bool_type, bytes_type, named_type)
+import check.types (Type, TyFn, TyVar, bool_type, bytes_type, named_type)
 import emit.code (Code, NLit, lower_fn)
 import emit.typing (Filings, no_filings, unknown_type)
 import emit.c (Kind, sorted_names)
 import emit.roots (symbol_of, entry_of)
-import emit.answer (Tables, no_tables, Emitted, Head, Defined)
+import emit.answer (Tables, no_tables, Emitted, Head, Defined, Exact, settled_by_callers)
 import emit.reps (Ty, Def, EmitParam, Ctors, substituted_fully, no_ctors)
 import emit.keys
 import emit.keys (RootKey, Named, Written, Order, Reflect, Shown, Digest, root_name, key_types,
@@ -17,10 +17,11 @@ import emit.keys (RootKey, Named, Written, Order, Reflect, Shown, Digest, root_n
 import emit.pieces (spelled)
 import emit.tir
 import emit.tir (Fn, Declined, Lambda, Closure, family_name)
-import emit.tir.statics (StaticDef)
-import emit.lower (root_lowered, group_lowered)
+import emit.tir.statics (StaticDef, SStruct, WRaw, WEntry, named, entries_of)
+import emit.lower (root_lowered)
 import emit.lower.setting (Setting, Root, param_type, labels_of)
 import emit.own (owned)
+import emit.release (release_needs)
 import emit.verify (verified)
 import emit.print (printed_fn)
 import emit.print.text (Printed)
@@ -45,26 +46,10 @@ pub type RootForm =
   | Formed({ name: Bytes, form: Result<Fn, Declined> })
   | Unformed({ name: Bytes, why: Bytes })
 
-/// A group's one form under its first member's name, or, when a member does not lower to `Code`,
-/// each member on its own.
-pub fn group_formed(s: Setting, members: List<Prepared>) -> List<RootForm> / {abort.raise} = {
-  let roots = members.fold([], |acc: List<{ root: Root, code: Code }>, p: Prepared|
-    match p.code {
-      Ok(c) -> acc.push({ root: root_at(s, Named(p.full), p.base, p.ps, p.filed), code: c }),
-      Err(_) -> acc,
-    });
-  if roots.len() != members.len() {
-    members.map(|p: Prepared| formed_from(s, p.base, Named(p.full), p.ps, p.known, p.code, p.filed))
-  } else {
-    let first = match members.at(0) { Some(p) -> p.full, None -> b"" };
-    [Formed({ name: first, form: group_lowered(s, roots) })]
-  }
-}
-
 /// Root `key` of the setting's module, whose text starts at `base`, whose parameters are `ps` and
 /// whose item's nodes the checker filed `filed` of, as the typed form lowers it: each parameter of
 /// the type its scheme gives it, and its answer of the type its scheme answers.
-fn root_at(
+pub fn root_at(
   s: Setting,
   key: RootKey,
   base: Int,
@@ -119,9 +104,11 @@ pub fn emitted_of(r: RootForm, ctors: Ctors) -> Emitted / {abort.raise} =
     Unformed(u) -> { name: u.name, text: b"", tables: no_tables(), why: Some(u.why) },
   }
 
-/// The root `full` as the typed form lowered it, its counts placed, checked, and printed as an
-/// answer's text and tables. A root the form declines, a form the check refuses and one a printer
-/// has no C for each fail the build naming the root: it would not compile, or would run wrong.
+/// The root `full` as the typed form lowered it, its counts placed and what its releases read noted
+/// among its needs, checked, and printed as an answer's text and tables; or, where its needs read a
+/// type variable's layout or type, settled by its callers. A root the form declines, a form the
+/// check refuses and one a printer has no C for each fail the build naming the root: it would not
+/// compile, or would run wrong.
 fn form_emitted(
   full: Bytes,
   lowered: Result<Fn, Declined>,
@@ -131,21 +118,47 @@ fn form_emitted(
     Err(no) ->
       internal(full, Bytes::concat_all([b"is declined by ", family_name(no.by), b": ", no.why])),
     Ok(f) -> {
-      let counted = counts_placed(f);
-      match verified(counted) {
-        Some(fault) -> internal(full, b"fails its check: ".concat(fault)),
-        None -> handle {
-          let pr = printed_fn(counted, ctors);
-          { name: full, text: spelled(pr.pieces), tables: form_tables(counted, pr), why: None }
-        } with {
-          abort.raise(m) -> internal(full, b"does not print: ".concat(Bytes::of_string(m))),
-        },
+      let counted = built_form(f);
+      if settled_by_callers(counted.links.needs) { settled_emitted(full, counted) } else {
+        match verified(counted) {
+          Some(fault) -> internal(full, b"fails its check: ".concat(fault)),
+          None -> handle {
+            let pr = printed_fn(counted, ctors);
+            { name: full, text: spelled(pr.pieces), tables: form_tables(counted, pr), why: None }
+          } with {
+            abort.raise(m) -> internal(full, b"does not print: ".concat(Bytes::of_string(m))),
+          },
+        }
       }
     },
   }
 
+/// Root `full`, formed as `f`, which its callers settle: no C, and the tables the unit settles its
+/// calls and its callers' by.
+fn settled_emitted(full: Bytes, f: Fn) -> Emitted =
+  {
+    name: full,
+    text: b"",
+    tables: {
+      ..no_tables(),
+      generics: {
+        calls: f.links.generics,
+        needs: f.links.needs,
+        expects: [],
+        called: f.links.called,
+        passes: f.links.passes,
+      },
+      members: f.members.map(|m: tir::Member| root_name(m.key)),
+    },
+    why: None,
+  }
+
 /// `f` with its counts placed: a plain root's are placed as it is written.
 pub fn counts_placed(f: Fn) -> Fn = if f.kind == tir::Plain { f } else { owned(f) }
+
+/// `f` as a build checks and prints it: its counts placed, and what its releases read noted among its
+/// needs, which say whether its callers settle it.
+pub fn built_form(f: Fn) -> Fn = release_needs(counts_placed(f))
 
 /// The internal error that stops a build at root `full`'s typed form, which `what` says.
 fn internal(full: Bytes, what: Bytes) -> Emitted / {abort.raise} =
@@ -161,13 +174,16 @@ fn form_tables(f: Fn, pr: Printed) -> Tables / {abort.raise} = {
     f.members.map(|m: tir::Member|
       { name: root_name(m.key), head: head_types(m.conv.reps, m.conv.answer) })
   };
+  let statics = statics_named(f, []);
   {
-    consts: pr.consts,
     builtins: pr.builtins,
     fields: pr.fields,
     shapes: pr.shapes.map(sorted_names),
     lambdas: pr.lambdas.map(spelled),
-    calls: pr.calls,
+    // A root whose function a static holds is the body's to ask for, as a call's is.
+    calls: statics.fold(pr.calls, |acc: List<RootKey>, d: StaticDef|
+      entries_of(d).fold(acc, |a: List<RootKey>, k: RootKey|
+        if a.contains(k) { a } else { a.push(k) })),
     generics: {
       calls: f.links.generics,
       needs: f.links.needs,
@@ -181,7 +197,7 @@ fn form_tables(f: Fn, pr: Printed) -> Tables / {abort.raise} = {
     else { held.map(|h: { name: Bytes, head: Head }| h.name) },
     symbols: held.map(|h: { name: Bytes, head: Head }|
       { symbol: symbol_of(h.name), entry: entry_of(h.name), head: h.head }),
-    statics: statics_named(f, []),
+    statics: statics,
   }
 }
 
@@ -281,6 +297,36 @@ test "a body that answers a literal is printed whole: its head, its fuel test, i
   assert_eq(e.tables.symbols.map(|d: Defined| d.symbol), [f])
 }
 
+test "a root whose function a static holds is among the calls of the body naming the static" {
+  let dup = Named(b"m.dup#T");
+  let held = named(
+    SStruct({
+      of: b"PlyType",
+      fields: [WRaw(1), WRaw(0), WRaw(0), WEntry(dup), WRaw(0), WRaw(0), WRaw(0)],
+    }),
+  );
+  match formed_from(
+      bare_setting(),
+      0,
+      Named(b"m.f"),
+      [],
+      true,
+      Ok(literal_code(LInt(7))),
+      Ok(no_filings()),
+    ) {
+    Formed(r) -> match r.form {
+      Ok(f) -> {
+        let counted = { ..owned(f), statics: [held] };
+        let t = form_tables(counted, printed_fn(counted, no_ctors()));
+        assert_eq(t.calls, [dup]);
+        assert_eq(t.statics, [held])
+      },
+      Err(no) -> panic(String::of_bytes_lossy(no.why)),
+    },
+    Unformed(u) -> panic(String::of_bytes_lossy(u.why)),
+  }
+}
+
 test "a root the typed form declines is an internal error naming the root and why, once it is emitted" {
   let formed = formed_from(
     bare_setting(),
@@ -306,4 +352,32 @@ test "a root the typed form declines is an internal error naming the root and wh
     abort.raise(m) -> Bytes::of_string(m),
   };
   assert_eq(said, b"the typed form of `m.f` is declined by Scalars: a literal that does not read")
+}
+
+test "a form letting go of a value of its type variable is settled by its callers: no C, its needs in its tables" {
+  let p = { id: 0, ty: TyVar(0), rep: tir::RWord };
+  let f = {
+    key: Named(b"m.dropping"),
+    kind: tir::Rooted,
+    params: [p],
+    conv: { params: [tir::Given], reps: [tir::RWord], answer: tir::RInt, answered: tir::Owned },
+    body: [tir::Return(tir::AInt(0))],
+    lambdas: [],
+    base: 0,
+    members: [],
+    links: tir::no_links(),
+    statics: [],
+  };
+  let settled = form_emitted(b"m.dropping", Ok(f), no_ctors());
+  assert_eq(settled.why, None);
+  assert_eq(settled.text, b"");
+  assert_eq(settled.tables.generics.needs, [{ var: 0, reads: Exact }]);
+  assert_eq(settled.tables.symbols, []);
+  // The same body letting go of a value of a known type is printed.
+  let known = form_emitted(
+    b"m.dropping",
+    Ok({ ..f, params: [{ ..p, ty: bytes_type() }] }),
+    no_ctors(),
+  );
+  assert(known.text.len() > 0 && known.tables.generics.needs == [], None)
 }

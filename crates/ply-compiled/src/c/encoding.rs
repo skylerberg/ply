@@ -18,10 +18,14 @@ pub(super) fn encode_pools(
     fields: &[Symbol],
     shapes: &[Vec<Symbol>],
 ) -> String {
-    let mut out = format!("consts {}\n", consts.len());
-    for v in consts {
-        out.push_str(&encode_const(v));
-        out.push('\n');
+    // A unit whose constants are its own static data names none, and says nothing of them.
+    let mut out = String::new();
+    if !consts.is_empty() {
+        out.push_str(&format!("consts {}\n", consts.len()));
+        for v in consts {
+            out.push_str(&encode_const(v));
+            out.push('\n');
+        }
     }
     out.push_str(&format!("builtins {}\n", builtins.len()));
     for b in builtins {
@@ -59,10 +63,11 @@ fn encode_const(v: &Value) -> String {
     }
 }
 
-/// Inverse of [`encode_pools`]; leaves the cursor after them.
+/// Inverse of [`encode_pools`]; leaves the cursor after them. A text with no `consts` table pools
+/// no constants.
 pub(super) fn decode_pools(s: &str, at: &mut usize) -> Option<Pools> {
     let mut t = Pools::default();
-    let n = count(line(s, at)?, "consts")?;
+    let n = section(s, at, "consts")?;
     for _ in 0..n {
         let l = line(s, at)?;
         let (tag, rest) = l.split_at(1);

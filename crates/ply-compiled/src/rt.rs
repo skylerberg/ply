@@ -1,7 +1,7 @@
 //! The helpers compiled code calls into and the context an entry runs in. A helper that takes an
 //! argument owns it, one that reads leaves its count alone, and every answer is the caller's.
 
-use crate::emitted::{Block, Carried, Handed, PlyFnDesc, PlyOp, PlyType};
+use crate::emitted::{Block, Carried, Handed, KeepRoot, PlyFnDesc, PlyOp, PlyType};
 use crate::heap::{
     self, CLOSURE_CAPTURES, CLOSURE_CODE, CLOSURE_DESCRIBED, Heap, KIND_ARRAY, KIND_BRIDGE,
     KIND_BYTES, KIND_CLOSURE, KIND_COLUMNS, KIND_CTOR, KIND_LIST, KIND_MAP, KIND_MBRANCH,
@@ -10,7 +10,7 @@ use crate::heap::{
 };
 use crate::host::Served;
 use crate::map;
-use crate::native::{Answered, I64, Native, Out, Raising, Signature};
+use crate::native::{Answered, I64, Native, Out, Raises, Raising, Signature};
 use crate::stack::{Stack, switch};
 use crate::{array, columns, list};
 use ply_core::builtins::hold_released;

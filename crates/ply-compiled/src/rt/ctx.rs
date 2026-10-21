@@ -461,6 +461,8 @@ impl Ctx {
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
+        // A region left open lets go of the values its tasks passed while the entry's heap lives.
+        drop(std::mem::take(&mut self.sims));
         crate::detached::teardown(self);
         debug_assert!(
             self.release_later.is_empty() && self.release_depth == 0,
@@ -590,8 +592,27 @@ impl Ctx {
         let Some(at) = self.raise_handler("abort", "raise") else {
             return self.fail(d);
         };
-        let message = self.word(&Value::str(message));
-        self.bind_raise(at, Raised::Words(vec![message]), d)
+        let (stack, depth, clause) = at;
+        let clause = &self.stacks[stack].list[depth].clauses[clause];
+        let message = Value::str(message);
+        // An emitted clause takes the message as emitted code lays a `String`, lifted through the
+        // type its `handle` site handed.
+        let args = match (clause.emitted, clause.string) {
+            (false, _) => Raised::Words(vec![self.word(&message)]),
+            (true, Some(ty)) => {
+                let Some(w) = lifted(self, &message, ty) else {
+                    return 0;
+                };
+                Raised::Carried(vec![unsafe { Carried::new(w, ty) }])
+            }
+            (true, None) => {
+                return self.fail(
+                    error("an `abort.raise` clause emitted code installed has no `String` type")
+                        .note("this is Ply's fault, not the program's"),
+                );
+            }
+        };
+        self.bind_raise(at, args, d)
     }
 
     /// Sends a raise on its way to the clause at `at`, which is handed `args`; `d` is what the
