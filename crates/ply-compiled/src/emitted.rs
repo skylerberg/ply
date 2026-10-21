@@ -387,6 +387,12 @@ impl Carried {
 /// given the word that holder had.
 pub type DropRoot = unsafe extern "C" fn(*mut Ctx, Handed) -> Word;
 
+/// A keep root, `keep#T`, as emitted code writes one: given a value of its type, which it borrows,
+/// a copy of it on the unit's persistent heap, immortal, that outlives every entry (a value already
+/// immortal answered as itself); or 0 where the value may not outlive the entry that made it, as
+/// one holding a continuation, a hold, a task, a channel or a secret may not.
+pub type KeepRoot = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
+
 /// A function value's descriptor, static data emitted code lays out per lambda, which the first word
 /// past a closure block's header names. The runtime calls through `uniform`, releases through
 /// `release`, shares through `share` and keeps through `keep`; it never calls `typed`.
@@ -425,6 +431,9 @@ unsafe impl Taken for Handle {
 }
 unsafe impl Taken for DropRoot {
     const MACHINE: Machine = Machine::DropRoot;
+}
+unsafe impl Taken for KeepRoot {
+    const MACHINE: Machine = Machine::KeepRoot;
 }
 unsafe impl Taken for *const PlyType {
     const MACHINE: Machine = Machine::Type;

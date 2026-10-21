@@ -34,6 +34,8 @@ pub enum Machine {
     Op,
     /// A drop root's address.
     DropRoot,
+    /// A keep root's address.
+    KeepRoot,
 }
 
 impl Machine {
@@ -52,6 +54,7 @@ impl Machine {
             Machine::Type => "Type",
             Machine::Op => "Op",
             Machine::DropRoot => "DropRoot",
+            Machine::KeepRoot => "KeepRoot",
         }
     }
 }

@@ -1,7 +1,7 @@
 //! The C every emitted unit opens with. It mirrors `heap.rs` and `rt.rs`, and
 //! `the_prelude_agrees_with_the_layouts_it_mirrors` checks it against them.
 
-use crate::emitted::{Block, DropRoot, Handed, Handle, PlyOp, PlyType};
+use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
 use crate::native::{Addr, F64, I64, Native, Out, Raising, Signature};
 use crate::rt::Ctx;
@@ -427,6 +427,7 @@ helpers! {
     rt_region(body: Block, answer: *const PlyType) -> Handed;
     rt_branches(slots: *const Handed, n: I64);
     rt_branches_past(slots: *const Handed, n: I64, reach: *const Word, count: I64);
+    rt_memo(index: I64, keep: KeepRoot) -> Handed;
 }
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since

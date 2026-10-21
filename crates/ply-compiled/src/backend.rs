@@ -330,8 +330,6 @@ struct LastEntry {
 /// One worker's compiled bodies, offered to a `Machine` through `ply_core::Compiled`.
 pub struct Bodies {
     unit: Arc<Unit>,
-    /// Kept alive because every [`Entry`] below points into its executable pages.
-    _code: crate::c::Native,
     admitted: HashMap<Symbol, Admitted>,
     /// One context for every entry; the `RefCell` forbids nesting, since `Ctx::slots` has no pop.
     ctx: RefCell<crate::rt::Ctx>,
@@ -344,6 +342,9 @@ pub struct Bodies {
     encoded: bool,
     /// What an encoded unit's pure roots answered.
     kept: RefCell<Kept>,
+    /// Kept alive because every [`Entry`] above points into its executable pages. Last, so the
+    /// context and the memo, which may hold a word of its static data, go before it is unmapped.
+    _code: crate::c::Native,
 }
 
 /// What an encoded unit's pure roots answered, as values, each under its root and its arguments'

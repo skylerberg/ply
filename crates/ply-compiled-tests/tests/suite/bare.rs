@@ -38,10 +38,12 @@ pub fn context_over(fields: &[&str], functions: Vec<usize>, builtins: &[&str]) -
         builtins: (builtins.iter())
             .map(|b| ply_core::Builtin::from_name(b).unwrap_or_else(|| panic!("no builtin `{b}`")))
             .collect(),
+        memo: functions.iter().map(|_| AtomicI64::new(0)).collect(),
+        memo_costs: (functions.iter())
+            .map(|_| (AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)))
+            .collect(),
+        lambdas: functions.iter().map(|_| AtomicI64::new(0)).collect(),
         functions,
-        memo: Box::default(),
-        memo_costs: Box::default(),
-        lambdas: Box::default(),
         immortals: Mutex::new(Heap::persistent()),
         bytes: std::array::from_fn(|_| AtomicI64::new(0)),
         nullaries: Vec::new(),

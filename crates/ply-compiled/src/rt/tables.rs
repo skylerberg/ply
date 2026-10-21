@@ -143,6 +143,21 @@ impl Tables {
         self.memoize(index, w)
     }
 
+    /// Remembers `kept`, an immortal copy emitted code made, as pure nullary function `index`'s
+    /// answer, with what computing it cost, which every later read charges. The first kept stays;
+    /// one another thread keeps after it stays in the unit's persistent heap, unread.
+    pub fn keep(&self, index: usize, kept: Word, cost: Cost) {
+        let (Some((steps, allocations, bytes)), Some(slot)) =
+            (self.memo_costs.get(index), self.memo.get(index))
+        else {
+            return;
+        };
+        steps.store(cost.steps, Release);
+        allocations.store(cost.allocations, Release);
+        bytes.store(cost.bytes, Release);
+        let _ = slot.compare_exchange(0, kept, AcqRel, Acquire);
+    }
+
     /// What computing the memoized answer at `index` cost.
     pub fn memo_cost(&self, index: usize) -> Cost {
         match self.memo_costs.get(index) {
