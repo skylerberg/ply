@@ -1,68 +1,37 @@
 //! Operators, conversions and constants printed: an integer's, a width's, a float's and a decimal's
 //! operators as C does them under the runtime's overflow and division tests, a character's, a
-//! string's and a constructor's words compared where they lie, an order made its `Ordering`, and
-//! constants read from the pool.
+//! string's and a constructor's words compared where they lie, an order made its `Ordering`, and a
+//! decimal's constant from its words.
 
 import std.bytes (ascii_of_int)
-import syntax.patterns (Lit, LStr, LDec)
+import syntax.patterns (Lit, LUnit, LStr)
 import check.types (TyCon)
 import syntax.parsing (span_between)
 import emit.c (Width, KNum, ctype, int_lit, is_bitop, bitop_c, unsigned_ctype, width_index,
                width_min, width_max, binary_code, arith_code, overflow_code)
-import emit.answer (ConstStr, ConstDecimal, const_of_lit)
-import emit.pieces (Text, Hole, Constant, TagOf, spelled)
+import emit.pieces (Text, Hole, TagOf, spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RCases, Leaf, Var, Arg, AVar,
                  AInt, ANum, Scalars, rep_of_arg, arithmetic, comparison, shift)
 import emit.print.text (Printing, Place, printing, line, pad, temp, named, arg_text, assigned, site,
                         check, unprinted)
 import emit.print.made (c_type)
 
-/// A constant read from the pool into `into`, held as its representation says: a `Decimal` as its
-/// two words, the pool's word let go once they are read.
-pub fn literal(p: Place, pr: Printing, into: Option<Var>, l: Lit) -> Printing =
+/// `()` into `into`, the runtime's unit: the one literal `emit.statics.folded` leaves, which lays out
+/// every other as static data or writes it as a C literal. Raises on any other.
+pub fn literal(p: Place, pr: Printing, into: Option<Var>, l: Lit) -> Printing / {abort.raise} =
   match into {
     None -> pr,
-    Some(v) -> {
-      let read = |q: Printing, head: Bytes|
-        check(p, {
-          ..q,
-          consts: q.consts.push(const_of_lit(l)),
-          out: q.out.concat([
-            Text(Bytes::concat_all([pad(p.depth), head, b"rt_lit_p(ctx, "])),
-            Hole(Constant(q.consts.len())),
-            Text(b");\n"),
-          ]),
-        });
-      match v.rep {
-        RDec -> {
-          let w = temp(pr);
-          let n = named(read(w.pr, Bytes::concat_all([b"Word ", w.name, b" = "])), v);
-          line(
-            n.pr,
-            p.depth,
-            Bytes::concat_all([
-              b"PlyDec ",
-              n.name,
-              b" = ply_dec_of(",
-              w.name,
-              b"); ply_dec(ctx, ",
-              w.name,
-              b");",
-            ]),
-          )
-        },
-        _ -> {
-          let n = named(pr, v);
-          read(n.pr, Bytes::concat_all([c_type(v.rep), b" ", n.name, b" = "]))
-        },
-      }
+    Some(v) -> match l {
+      LUnit -> bound(p, pr, v, b"ply_unit"),
+      _ -> unprinted(Scalars, b"a literal the folded pass did not lay out", c_type(v.rep)),
     },
   }
 
 /// An operator over operands held as `x.on`, as C does it: an integer's sum or difference under an
 /// overflow test, its other arithmetic through the runtime but for a literal divisor, a width's
 /// arithmetic wide and narrowed back under the same test, a float's as C's own, a decimal's by the
-/// runtime over its two words, and words compared where they lie.
+/// runtime over its two words, and words compared where they lie. `decimal` makes the `Decimal`
+/// whose two words are its two `Int`s.
 pub fn prim(
   p: Place,
   pr: Printing,
@@ -85,6 +54,8 @@ pub fn prim(
           v,
           Bytes::concat_all([b"((", a, b") >= (", b, b") && (", a, b") <= (", c, b"))"]),
         )
+      } else if x.op == b"decimal" {
+        bound(p, pr, v, Bytes::concat_all([b"((PlyDec){ ", a, b", ", b, b" })"]))
       } else {
         match x.on {
           RInt -> int_printed(p, pr, v, x.op, a, b, count, literal_divisor(x.args.at(1))),
@@ -1066,24 +1037,20 @@ test "an order's sign is made the constructor of `Ordering` it names, whose tags
   assert_eq(sign(index), b"  int64_t t1 = (p0 == 0 ? -1 : p0 == 1 ? 0 : 1);\n")
 }
 
-test "a constant is read from the pool, a decimal's word let go once its two words are read" {
-  let pr = literal(place(), printing(Map::new()), Some(local(0, b"Decimal", RDec)), LDec(b"1.5"));
-  assert_eq(pr.consts, [ConstDecimal(b"1.5")]);
+test "a decimal's constant is its two words in place, `()` the runtime's, and no constant is read at run time" {
   assert_eq(
-    spelled(pr.out),
-    Bytes::concat_all([
-      b"  Word t1 = rt_lit_p(ctx, @@c0@@);\n",
-      b"  if (ctx->failed) return 0;\n",
-      b"  PlyDec t2 = ply_dec_of(t1); ply_dec(ctx, t1);\n",
-    ]),
+    printed_prim(Map::new(), local(0, b"Decimal", RDec), b"decimal", RInt, [AInt(65536), AInt(0)]),
+    b"  PlyDec t1 = ((PlyDec){ INT64_C(65536), INT64_C(0) });\n",
   );
-  let text = literal(place(), pr, Some(local(1, b"String", RWord)), LStr(b"a"));
-  assert_eq(text.consts, [ConstDecimal(b"1.5"), ConstStr(b"a")]);
-  assert(
-    spelled(text.out).ends_with(
-      b"  Word t3 = rt_lit_p(ctx, @@c1@@);\n  if (ctx->failed) return 0;\n",
-    ),
-  )
+  let unit = literal(place(), printing(Map::new()), Some(local(0, b"Unit", RWord)), LUnit);
+  assert_eq(spelled(unit.out), b"  Word t1 = ply_unit;\n");
+  let said = handle {
+    literal(place(), printing(Map::new()), Some(local(1, b"String", RWord)), LStr(b"a"));
+    b""
+  } with {
+    abort.raise(m) -> Bytes::of_string(m),
+  };
+  assert(said.starts_with(b"unprinted Scalars: a literal the folded pass did not lay out"), None)
 }
 
 test "two strings are equal where their bytes are, and two characters as C compares their words" {

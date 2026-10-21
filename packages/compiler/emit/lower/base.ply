@@ -19,6 +19,7 @@ import emit.tir (Rep, RInt, RBool, RNum, Var, Arg, AVar, AInt, ABool, AFloat, AN
                  rep_of_arg, falls_through, counted, operands, parts_of)
 import emit.lower.setting (Setting)
 import emit.lower.held (held_as)
+import emit.tir.statics (StaticDef, StaticLaid, SPlain, WAddress, WBytes, named)
 
 /// What a root's body is lowered under: the module's setting, the root's key and full name, where
 /// its definition's text starts, its parameters as the emitter holds them and their types, how its
@@ -66,13 +67,15 @@ pub type Context = {
 pub type Tails = | Restarts(List<Rep>) | Enters(List<Bytes>) | Calls
 
 /// A body lowered so far: the next variable's number, what each slot holds, the block being
-/// written, the first refusal, the closures' bodies made so far, and what the root tells the unit.
+/// written, the first refusal, the closures' bodies made so far, the static objects the root and its
+/// closures name so far, each after those it names, and what the root tells the unit.
 pub type Lowering = {
   next: Int,
   env: Map<Int, Arg>,
   insts: List<Inst>,
   refused: Option<Declined>,
   lambdas: List<Lambda>,
+  statics: List<StaticDef>,
   links: Links,
 }
 
@@ -115,6 +118,7 @@ pub fn started(params: List<Var>) -> Lowering =
     insts: [],
     refused: None,
     lambdas: [],
+    statics: [],
     links: { generics: [], needs: [], called: [], passes: [] },
   }
 
@@ -179,30 +183,55 @@ fn with_note(st: Lowering, note: Bytes, args: List<Arg>, at: Span) -> Lowering =
 pub fn opened(st: Lowering) -> Lowering = { ..st, insts: [] }
 
 /// `outer`, whose block and environment go on, after a block of its own lowered to `inner`: the
-/// variables, closures, links and refusal `inner` added.
+/// variables, closures, statics, links and refusal `inner` added.
 pub fn continued(outer: Lowering, inner: Lowering) -> Lowering =
   {
     ..outer,
     next: inner.next,
     refused: match outer.refused { Some(r) -> Some(r), None -> inner.refused },
     lambdas: inner.lambdas,
+    statics: inner.statics,
     links: inner.links,
   }
 
 /// The first state of a body lowered as a function of its own inside `st`'s: its variables numbered
-/// from its parameters, `env` its slots, the root's closures and links carried on.
+/// from its parameters, `env` its slots, the root's closures, statics and links carried on.
 pub fn nested(st: Lowering, params: List<Var>, env: Map<Int, Arg>) -> Lowering =
-  { ..started(params), env: env, refused: st.refused, lambdas: st.lambdas, links: st.links }
+  {
+    ..started(params),
+    env: env,
+    refused: st.refused,
+    lambdas: st.lambdas,
+    statics: st.statics,
+    links: st.links,
+  }
 
 /// `outer` after a function of its own lowered to `inner`: `outer`'s variables, block and
-/// environment, and the closures, links and refusal `inner` added.
+/// environment, and the closures, statics, links and refusal `inner` added.
 pub fn unnested(outer: Lowering, inner: Lowering) -> Lowering =
   {
     ..outer,
     refused: match outer.refused { Some(r) -> Some(r), None -> inner.refused },
     lambdas: inner.lambdas,
+    statics: inner.statics,
     links: inner.links,
   }
+
+/// `st` holding the static object laid as `laid`, named by its content as `emit.tir.statics.named`
+/// names it, once however often it is added; and that name, which `Val.Static` reads the object by.
+/// A static whose words address others is added after them, so the root lists each after those it
+/// names.
+pub fn static_added(
+  st: Lowering,
+  laid: StaticLaid,
+) -> { st: Lowering, name: Bytes } / {abort.raise} = {
+  let d = named(laid);
+  {
+    st: if st.statics.any(|x: StaticDef| x.name == d.name) { st }
+    else { { ..st, statics: st.statics.push(d) } },
+    name: d.name,
+  }
+}
 
 /// `l` added as the body of the next closure the root makes, and its place among them.
 pub fn with_lambda(st: Lowering, l: Lambda) -> { st: Lowering, nth: Int } =
@@ -620,4 +649,19 @@ test "a word just opened to its type and handed straight back as a word is the w
   // Held back as another representation than the word it came from, it is packed.
   let byte = RNum({ bits: 8, signed: false });
   assert_eq(handed(opened, byte, dummy_span()).st.insts.len(), 2)
+}
+
+test "a static is held once however often it is added, after the static it addresses, and a lambda's are the root's" {
+  let spelling = SPlain([WBytes(b"m.T")]);
+  let child = static_added(started([]), spelling);
+  let parent = static_added(child.st, SPlain([WAddress({ name: child.name, tag: 0 })]));
+  let again = static_added(parent.st, spelling);
+  assert_eq(again.name, child.name);
+  assert_eq(again.st.statics.map(|d: StaticDef| d.name), [child.name, parent.name]);
+  // One added while a lambda's body is lowered is the root's when the root goes on.
+  let inner = static_added(nested(child.st, [], Map::new()), SPlain([WBytes(b"m.U")]));
+  assert_eq(unnested(child.st, inner.st).statics.map(|d: StaticDef| d.name), [
+    child.name,
+    inner.name,
+  ])
 }

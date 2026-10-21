@@ -4,11 +4,12 @@
 
 import store.hash.encoding (hex)
 import check.types (Type, TyVar, type_text, type_spelled, digits)
-import emit.answer (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBytes,
-                    ConstEmbedded, ConstFixed, ConstWide, ConstFloat, ConstDecimal, ConstChar,
-                    ConstUnit, Defined, Head, Expect, word_head, no_generics, answer_bin,
-                    tables_bin, no_tables, without, literal_bits, GenericCall, Generics, Need, Pass,
-                    Reads, Scalar, Layout, Exact)
+import emit.answer (Answer, Body, Refused, RootAnswer, Tables, Defined, Head, Expect, word_head,
+                    no_generics, answer_bin, tables_bin, no_tables, GenericCall, Generics, Need,
+                    Pass, Reads, Scalar, Layout, Exact)
+import emit.tir.statics (StaticDef, SFile, StaticWord, WField, named, words_of)
+import emit.print.statics (static_c, static_extern)
+import emit.statics (SStr, statics_of)
 import emit.roots (builtin_helper, symbol_of, entry_of, root_id)
 import emit.keys
 import emit.keys (RootKey, Named, At, Written, FnArg, root_name, definition_of, sited_as, key_lent,
@@ -550,99 +551,11 @@ pub fn fatal(offered: List<Bytes>, dropped: List<Dropped>) -> List<Dropped> / {a
   dropped.filter(|d: Dropped| !narrowed.contains(d.function))
 }
 
-// --- Constants ------------------------------------------------------------------
-
-/// An `Int`'s 64 bits as sixteen hex digits, its sign bit included.
-fn hex16(n: Int) -> Bytes / {abort.raise} =
-  Bytes::concat_all(range(0, 16).map(|i: Int| hex_digit(n >>> 60 - 4 * i & 15)))
-
-/// `n`'s two's-complement pattern at 128 bits, as a cast to `u128` widens it.
-fn wide_of(n: Int) -> U128 = if n >= 0 { U128::of_int(n) } else { ~U128::of_int(0 - (n + 1)) }
-
-/// The low 64 bits of `n`, as an unsigned word.
-fn word_of(n: Int) -> U128 = wide_of(n) & wrap_sub(1u128 << 64, 1u128)
-
-fn width_bits(w: Int) -> Int =
-  if w == 0 || w == 4 { 8 }
-  else if w == 1 || w == 5 { 16 }
-  else if w == 2 || w == 6 { 32 }
-  else if w == 3 || w == 7 { 64 }
-  else { 128 }
-
-fn width_signed(w: Int) -> Bool = (w >= 4 && w <= 7) || w == 9
-
-/// Truncated to the width, then zero- or sign-extended: every fixed-width value is held so.
-fn normalized(w: Int, bits: U128) -> U128 = {
-  let n = width_bits(w);
-  if n == 128 { bits } else {
-    let low = bits & ~0u128 >>> 128 - n;
-    if width_signed(w) && low >>> n - 1 == 1u128 { low | ~0u128 << n } else { low }
-  }
-}
-
-fn fixed_line(w: Int, bits: U128) -> Bytes =
-  Bytes::concat_all([
-    b"f ",
-    ascii_of_int(w),
-    b" ",
-    Bytes::of_string(normalized(w, bits).to_string()),
-  ])
-
-fn trimmed_m(s: Bytes) -> Bytes / {abort.raise} =
-  iterate(s, s.len() + 1, |t: Bytes|
-    if t.len() > 0 && t.at(t.len() - 1) == 109 { Continue(t.slice(0, t.len() - 1)) }
-    else { Stop(t) })
-
-/// A decimal as its mantissa and scale, read off the text that keeps its scale.
-fn decimal_line(literal: Bytes) -> Bytes / {abort.raise} =
-  match Decimal::of_string(String::of_bytes(trimmed_m(without(literal, 95)))) {
-    None -> panic("the emitter wrote a decimal literal that does not read"),
-    Some(d) -> {
-      let text = Bytes::of_string(d.to_string());
-      let negative = text.len() > 0 && text.at(0) == 45;
-      let body = if negative { text.slice(1, text.len()) } else { text };
-      let point = match body.index_of(b".") { Some(i) -> i, None -> body.len() };
-      let digits = without(body, 46);
-      let lead = iterate(0, digits.len() + 1, |i: Int|
-        if i < digits.len() - 1 && digits.at(i) == 48 { Continue(i + 1) } else { Stop(i) });
-      let mantissa = digits.slice(lead, digits.len());
-      let signed = if negative && mantissa != b"0" { b"-".concat(mantissa) } else { mantissa };
-      Bytes::concat_all([
-        b"d ",
-        signed,
-        b" ",
-        ascii_of_int(if point < body.len() { body.len() - point - 1 } else { 0 }),
-      ])
-    },
-  }
-
-/// One pooled constant's line: its identity, which the pool sorts and deduplicates by, and what the
-/// runtime reads it back from. An embedded file's line is its bytes, out of `inputs` by digest.
-pub fn const_line(c: Const, inputs: Map<Bytes, Bytes>) -> Bytes / {abort.raise} =
-  match c {
-    ConstUnit -> b"u",
-    ConstStr(s) -> b"s ".concat(hex(s)),
-    ConstBytes(b) -> b"b ".concat(hex(b)),
-    ConstEmbedded(digest) -> match inputs.get(digest) {
-      Some(b) -> b"b ".concat(hex(b)),
-      None ->
-        panic(
-          "a unit holds an embedded file it was not handed the bytes of, which its driver reads for every embed it emits",
-        ),
-    },
-    ConstFixed(f) -> fixed_line(f.width, wide_of(f.bits)),
-    ConstWide(x) -> fixed_line(x.width, word_of(x.high) << 64 | word_of(x.low)),
-    ConstChar(v) -> b"c ".concat(ascii_of_int(v)),
-    ConstFloat(x) -> b"x ".concat(hex16(literal_bits(x))),
-    ConstDecimal(x) -> decimal_line(x),
-  }
-
 // --- The unit's tables ------------------------------------------------------------
 
 /// What a unit names that is not code, each table sorted by content and each entry once, so a
 /// position is a rank among what the unit holds and a body's C is a function of the unit's content.
 type Pools = {
-  consts: List<Bytes>,
   fields: List<Bytes>,
   builtins: List<Bytes>,
   shapes: List<List<Bytes>>,
@@ -651,10 +564,11 @@ type Pools = {
 
 fn entry_fields() -> List<Bytes> = [b"key", b"value"]
 
-/// `lines` is each unit body's constants as `const_line` writes them, in its table's order.
+/// The tables of `bodies`, whose static objects are `statics`, the field table holding the names
+/// those statics' words name beside the bodies' own.
 fn pools_of(
   bodies: List<UnitBody>,
-  lines: List<List<Bytes>>,
+  statics: List<StaticDef>,
   constant_entries: List<Bytes>,
 ) -> Pools / {abort.raise} = {
   let ts = bodies.map(|k: UnitBody| k.tables);
@@ -669,16 +583,46 @@ fn pools_of(
       }),
   );
   {
-    consts: ordered(lines.fold([], |acc: List<Bytes>, ls: List<Bytes>| acc.concat(ls))),
-    fields: ordered(all(|tables: Tables| tables.fields)),
+    fields: ordered(
+      all(|tables: Tables| tables.fields).concat(
+        statics.fold([], |acc: List<Bytes>, d: StaticDef| acc.concat(static_fields(d))),
+      ),
+    ),
     builtins: ordered(all(|tables: Tables| tables.builtins)),
     shapes: shapes.values(),
     lambdas: ordered(constant_entries.concat(all(|tables: Tables| tables.lambdas))),
   }
 }
 
+/// Every static the unit's bodies name, each once and after those it addresses: in the order the
+/// bodies list them, each body listing a static's children before it. Two statics of one name holding
+/// different content stop the build, since a name is its content's digest.
+fn statics_placed(bodies: List<UnitBody>) -> List<StaticDef> / {abort.raise} =
+  bodies.fold(
+    { out: [], seen: Map::new() },
+    |acc: { out: List<StaticDef>, seen: Map<Bytes, StaticDef> }, k: UnitBody|
+      k.tables.statics.fold(
+        acc,
+        |a: { out: List<StaticDef>, seen: Map<Bytes, StaticDef> }, d: StaticDef|
+          match a.seen.get(d.name) {
+            Some(e) -> if e == d { a } else {
+              panic(
+                String::of_bytes_lossy(
+                  b"two statics of one name hold different content: ".concat(d.name),
+                ),
+              )
+            },
+            None -> { out: a.out.push(d), seen: a.seen.insert(d.name, d) },
+          },
+      ),
+  ).out
+
+/// The field-table names a static's words name.
+fn static_fields(d: StaticDef) -> List<Bytes> =
+  words_of(d).fold([], |acc: List<Bytes>, w: StaticWord|
+    match w { WField(n) -> acc.push(n), _ -> acc })
+
 type Placed = {
-  consts: Map<Bytes, Int>,
   fields: Map<Bytes, Int>,
   builtins: Map<Bytes, Int>,
   shapes: Map<Bytes, Int>,
@@ -687,7 +631,6 @@ type Placed = {
 
 fn placed_of(p: Pools) -> Placed / {abort.raise} =
   {
-    consts: positions(p.consts),
     fields: positions(p.fields),
     builtins: positions(p.builtins),
     shapes: positions(p.shapes.map(shape_key)),
@@ -733,13 +676,12 @@ fn holes(text: Bytes) -> List<Hole> / {abort.raise} =
     })
 
 /// What a placeholder names in the unit's tables, its kind leading so a bucket's table sorts by
-/// kind; `None` for a root, written as its id. `lines` is the body's constants as the pool holds them.
-fn hole_key(h: Hole, tables: Tables, lines: List<Bytes>) -> Option<Bytes> / {abort.raise} =
+/// kind; `None` for a root, written as its id.
+fn hole_key(h: Hole, tables: Tables) -> Option<Bytes> / {abort.raise} =
   if h.kind == 84 { Some(b"T".concat(h.digits)) }
   else if h.kind == 114 { None } else {
     let i = digits(h.digits);
-    if h.kind == 99 { Some(b"c".concat(lines.get(i))) }
-    else if h.kind == 98 { Some(b"b".concat(tables.builtins.get(i))) }
+    if h.kind == 98 { Some(b"b".concat(tables.builtins.get(i))) }
     else if h.kind == 102 { Some(b"f".concat(tables.fields.get(i))) }
     else if h.kind == 115 { Some(b"s".concat(shape_key(ordered(tables.shapes.get(i))))) }
     else if h.kind == 108 { Some(b"l".concat(tables.lambdas.get(i))) }
@@ -751,7 +693,6 @@ fn unit_place(key: Bytes, p: Placed, tags: Map<Bytes, Int>) -> Int / {abort.rais
   let kind = key.at(0);
   let rest = key.slice(1, key.len());
   if kind == 84 { place(tags, rest) }
-  else if kind == 99 { place(p.consts, rest) }
   else if kind == 98 { place(p.builtins, rest) }
   else if kind == 102 { place(p.fields, rest) }
   else if kind == 115 { place(p.shapes, rest) }
@@ -838,7 +779,6 @@ fn exports_text(
     Bytes::concat_all(
       dropped.map(|d: Dropped| Bytes::concat_all([d.function, b"\n", d.construct, b"\n"])),
     ),
-    lines(b"consts", p.consts),
     lines(b"builtins", p.builtins),
     lines(b"fields", p.fields),
     lines(
@@ -993,6 +933,8 @@ type Placing = {
   reaches: List<Bytes>,
   /// The definitions its C defines: a group's members, or its own.
   defines: List<Bytes>,
+  /// The static objects its C names, which the unit's tail defines.
+  statics: List<Bytes>,
 }
 
 /// A body's placeholders and what each names, which its bucket's table is made of.
@@ -1065,16 +1007,18 @@ fn bucket_key(p: Placing) -> Bytes / {abort.raise} =
   Bytes::concat_all([hex_digit(p.bucket / 16), hex_digit(p.bucket % 16), b"\x00", p.name])
 
 /// The runtime's head and the emitter's part of it, which every part compiles after, then a marked
-/// bucket per class of names, which declares its table and the prototypes of what its bodies reach,
-/// then the runtime's definitions, what the unit says about itself and `tables`, what it lays out
-/// for its loader: one translation unit that the loader also compiles in parts, cut on the marks. A
-/// bucket declares its table and never defines it, so its C reads the same whatever positions the
-/// table holds, and calls what another defines as [`far_calls`] says.
+/// bucket per class of names, which declares its table, the static objects its bodies name and the
+/// prototypes of what they reach, then the runtime's definitions, `statics`, the static objects'
+/// definitions, what the unit says about itself and `tables`, what it lays out for its loader: one
+/// translation unit that the loader also compiles in parts, cut on the marks. A bucket declares its
+/// table and its statics and never defines them, so its C reads the same whatever the unit holds
+/// beside it, and calls what another defines as [`far_calls`] says.
 fn assembled(
   runtime: Runtime,
   bodies: List<Placing>,
   sizes: Map<Int, Int>,
   taken: Map<Bytes, Taken>,
+  statics: Bytes,
   exports: Bytes,
   tables: Bytes,
 ) -> Bytes / {abort.raise} = {
@@ -1115,6 +1059,11 @@ fn assembled(
             None -> b"",
           },
           Bytes::concat_all(
+            ordered(group.fold([], |acc: List<Bytes>, p: Placing| acc.concat(p.statics))).map(
+              static_extern,
+            ),
+          ),
+          Bytes::concat_all(
             ordered(group.fold([], |acc: List<Bytes>, p: Placing| acc.concat(p.reaches))).map(
               |name: Bytes|
                 match taken.get(name) { Some(t) -> prototype(t.symbol, t.head), None -> b"" },
@@ -1128,6 +1077,7 @@ fn assembled(
       }),
     ),
     runtime.tail,
+    statics,
     embedded(exports),
     tables,
   ])
@@ -1156,9 +1106,25 @@ pub fn produce(
     };
   let constants = s.taken.filter(|n: Bytes|
     match arity.get(n) { Some(o) -> o.constant, None -> false });
-  let lines = s.bodies.map(|k: UnitBody| k.tables.consts.map(|c: Const| const_line(c, inputs)));
-  let pools = pools_of(s.bodies, lines, constants.map(|n: Bytes| published(n).entry));
+  let statics = statics_placed(s.bodies);
+  let pools = pools_of(s.bodies, statics, constants.map(|n: Bytes| published(n).entry));
   let placed = placed_of(pools);
+  let laid_statics = Bytes::concat_all(
+    statics.map(|d: StaticDef|
+      static_c(
+        d,
+        |f: Bytes| place(placed.fields, f),
+        |k: RootKey| symbol_of(root_name(k)),
+        |digest: Bytes|
+          match inputs.get(digest) {
+            Some(b) -> b,
+            None ->
+              panic(
+                "a unit holds an embedded file it was not handed the bytes of, which its driver reads for every embed it emits",
+              ),
+          },
+      )),
+  );
   let tags = positions(ctors.map(|c: Ctor| c.name));
   let taken = s.taken.map(|n: Bytes| {
     let d = published(n);
@@ -1192,10 +1158,9 @@ pub fn produce(
         } else { () },
         None -> (),
       }));
-  let marked = range(0, s.bodies.len()).map(|i: Int| {
-    let k = s.bodies.get(i);
+  let marked = s.bodies.map(|k: UnitBody| {
     let hs = holes(k.text);
-    { body: k, holes: hs, keys: hs.map(|h: Hole| hole_key(h, k.tables, lines.get(i))) }
+    { body: k, holes: hs, keys: hs.map(|h: Hole| hole_key(h, k.tables)) }
   });
   // Each bucket's table: every key its bodies' placeholders name, once, in byte order.
   let keyed = marked.fold(Map::new(), |acc: Map<Int, Map<Bytes, Bool>>, m: Marked| {
@@ -1233,6 +1198,7 @@ pub fn produce(
       ),
       reaches: reaches_of(m.body.name, m.body.tables),
       defines: answered(m.body),
+      statics: m.body.tables.statics.map(|d: StaticDef| d.name),
     }
   });
   let rows = keyed.fold([], |acc: List<BucketRow>, b: Int, ks: Map<Bytes, Bool>|
@@ -1257,6 +1223,7 @@ pub fn produce(
       keyed.fold(Map::new(), |acc: Map<Int, Int>, b: Int, ks: Map<Bytes, Bool>|
         acc.insert(b, ks.len())),
       by_name,
+      laid_statics,
       exports,
       laid(by_name.values(), pools.lambdas, rows),
     ),
@@ -2635,46 +2602,6 @@ test "a program's key moves with the definition it enters, the runtime and the b
   assert(program_key(b"entry", a_runtime(b"rt"), a_builder(b"c4")) != key)
 }
 
-/// `c`'s line in a unit that embeds nothing.
-fn line(c: Const) -> Bytes / {abort.raise} = const_line(c, Map::new())
-
-test "a pooled constant's line is the one the runtime reads it back from" {
-  assert_eq(line(ConstUnit), b"u");
-  assert_eq(line(ConstStr(b"hi")), b"s 6869");
-  assert_eq(line(ConstBytes(b"\x00\xff")), b"b 00ff");
-  assert_eq(line(ConstChar(65)), b"c 65");
-  assert_eq(line(ConstFixed({ width: 0, bits: 255 })), b"f 0 255");
-  assert_eq(line(ConstFixed({ width: 4, bits: 127 })), b"f 4 127");
-  // An embedded file's line is its bytes, as a byte string's is.
-  let digest = b"\x00\xff".blake3();
-  assert_eq(
-    const_line(ConstEmbedded(digest), Map::new().insert(digest, b"\x00\xff")),
-    line(ConstBytes(b"\x00\xff")),
-  )
-}
-
-test "a fixed-width constant is held truncated to its width, a signed one sign-extended" {
-  assert_eq(
-    line(ConstFixed({ width: 4, bits: 0 - 1 })),
-    b"f 4 340282366920938463463374607431768211455",
-  );
-  assert_eq(line(ConstFixed({ width: 1, bits: 0 - 1 })), b"f 1 65535");
-  assert_eq(
-    line(ConstWide({ width: 8, high: 0 - 1, low: 0 - 1 })),
-    b"f 8 340282366920938463463374607431768211455",
-  );
-  assert_eq(line(ConstWide({ width: 9, high: 0, low: 5 })), b"f 9 5");
-  assert_eq(line(ConstWide({ width: 8, high: 1, low: 0 })), b"f 8 18446744073709551616")
-}
-
-test "a float is its bits and a decimal its mantissa and scale, as the literal reads" {
-  assert_eq(line(ConstFloat(b"1.5")), b"x 3ff8000000000000");
-  assert_eq(line(ConstFloat(b"-2_000.0")), b"x c09f400000000000");
-  assert_eq(line(ConstDecimal(b"1.50m")), b"d 150 2");
-  assert_eq(line(ConstDecimal(b"-0.05m")), b"d -5 2");
-  assert_eq(line(ConstDecimal(b"12m")), b"d 12 0")
-}
-
 test "a C string literal holds printable bytes as they are and the rest in octal" {
   assert_eq(escaped(b"a\"b\\c?\n\x01z"), b"a\\\"b\\\\c\\077\\012\\001z");
   assert_eq(literal_lines(b""), b"\"\\n\"\n");
@@ -2703,16 +2630,25 @@ test "a body dropped for a callee never offered is the offer's doing, and so is 
   ])
 }
 
-fn one_body(name: Bytes, calls: List<Bytes>) -> Answer =
+/// A body of root `name` calling `calls` and naming a static of its own.
+fn one_body(name: Bytes, calls: List<Bytes>) -> Answer / {abort.raise} = {
+  let own = statics_of(SStr(name));
   Body({
-    text: Bytes::concat_all([b"Word f_", name, b"(PlyCtx *ctx) { return @@c0@@ + @@r@@; }"]),
+    text: Bytes::concat_all([
+      b"Word f_",
+      name,
+      b"(PlyCtx *ctx) { return (Word)(intptr_t)&",
+      own.get(0).name,
+      b" + @@r@@; }",
+    ]),
     tables: {
       ..no_tables(),
-      consts: [ConstStr(name)],
+      statics: own,
       calls: calls.map(Named),
       symbols: [{ symbol: b"f_".concat(name), entry: b"e_".concat(name), head: word_head(0) }],
     },
   })
+}
 
 /// `a` publishing `head` as its definition's.
 fn headed(a: Answer, head: Head) -> Answer =
@@ -2726,7 +2662,7 @@ fn headed(a: Answer, head: Head) -> Answer =
   }
 
 /// `one_body` with other text, as an edit to its definition would make it.
-fn edited_body(name: Bytes) -> Answer =
+fn edited_body(name: Bytes) -> Answer / {abort.raise} =
   match one_body(name, []) {
     Body(b) -> Body({ ..b, text: b.text.concat(b"\n/* edited */") }),
     other -> other,
@@ -2877,7 +2813,7 @@ test "a bucket's C reads the same whatever another bucket adds to the unit's tab
   let beside = unit([b"m.f", other]);
   assert(bucket_part(alone, bucket_of(b"m.f")) != b"", None);
   assert_eq(bucket_part(beside, bucket_of(b"m.f")), bucket_part(alone, bucket_of(b"m.f")));
-  // What moved is the unit's own table: `other`'s constant sorts first, so `m.f`'s is the second.
+  // What moved is the rest of the unit: `other`'s bucket and the static its body names.
   assert(alone != beside, None)
 }
 
@@ -3072,28 +3008,90 @@ test "a call written to another head than the callee defines fails the unit" {
   }
 }
 
-test "a constant two bodies read is one entry of the pool" {
-  let reading = |name: Bytes|
-    match one_body(name, []) {
-      Body(b) -> Body({ ..b, tables: { ..b.tables, consts: [ConstStr(b"shared-constant")] } }),
-      other -> other,
-    };
-  let p = produce(
-    a_runtime(b"r"),
+/// The unit over `answers`, each root offered as a call, compiled against a runtime whose definitions
+/// are marked, so a test can tell the buckets from the tail.
+fn unit_of(
+  answers: List<{ key: Bytes, value: Answer }>,
+  inputs: Map<Bytes, Bytes>,
+) -> Produced / {abort.raise} =
+  produce(
+    { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* --- the runtime --- */\n" },
     [],
-    [
-      { name: b"m.one", arity: 0, constant: false, site: b"m.one" },
-      { name: b"m.two", arity: 0, constant: false, site: b"m.two" },
-    ],
+    answers.map(|a: { key: Bytes, value: Answer }|
+      { name: a.key, arity: 0, constant: false, site: a.key }),
     1,
-    Map::of_entries([
-      { key: b"m.one", value: reading(b"m.one") },
-      { key: b"m.two", value: reading(b"m.two") },
-    ]),
+    Map::of_entries(answers),
+    inputs,
+  )
+
+/// `a` naming `defs` beside its own statics.
+fn naming(a: Answer, defs: List<StaticDef>) -> Answer =
+  match a {
+    Body(b) -> Body({ ..b, tables: { ..b.tables, statics: b.tables.statics.concat(defs) } }),
+    other -> other,
+  }
+
+/// The part of unit `text` after the runtime's mark: the runtime's definitions and the unit's own.
+fn tail_of(text: Bytes) -> Bytes / {abort.raise} =
+  match text.index_of(b"/* --- the runtime --- */") {
+    Some(at) -> text.slice(at, text.len()),
+    None -> b"",
+  }
+
+test "a static two bodies name is defined once, in the tail, and declared by each bucket that names it" {
+  let shared = statics_of(SStr(b"shared-constant"));
+  let name = shared.get(0).name;
+  let one = b"m.one";
+  let two = bucket_apart(b"m.two", [one]);
+  let apart = bucket_apart(b"m.apart", [one, two]);
+  let p = unit_of(
+    [
+      { key: one, value: naming(one_body(one, []), shared) },
+      { key: two, value: naming(one_body(two, []), shared) },
+      { key: apart, value: one_body(apart, []) },
+    ],
     Map::new(),
   );
-  assert_eq(p.taken, [b"m.one", b"m.two"]);
-  assert_eq(p.text.split(line(ConstStr(b"shared-constant"))).len() - 1, 1)
+  let defined = Bytes::concat_all([b"const struct ", name, b" {"]);
+  assert_eq(p.text.split(defined).len() - 1, 1);
+  assert(tail_of(p.text).index_of(defined) != None, None);
+  let declares = |id: Int| bucket_part(p.text, id).index_of(static_extern(name)) != None;
+  assert_eq([one, two, apart].map(|n: Bytes| declares(bucket_of(n))), [true, true, false]);
+  // No pool: the unit says nothing of its constants to its loader.
+  assert(p.text.index_of(b"consts ") == None, None)
+}
+
+test "an embedded file is laid out once from the bytes the unit is handed, raw" {
+  let digest = b"\x00\xff".blake3();
+  let file = [named(SFile(digest))];
+  let p = unit_of(
+    [
+      { key: b"m.f", value: naming(one_body(b"m.f", []), file) },
+      { key: b"m.g", value: naming(one_body(b"m.g", []), file) },
+    ],
+    Map::new().insert(digest, b"\x00\xff"),
+  );
+  let laid = tail_of(p.text);
+  assert_eq(laid.split(b"\"\\000\\377\"").len() - 1, 1);
+  assert(laid.index_of(b".len = 2, .layout = 2") != None, None)
+}
+
+test "two statics of one name holding different content stop the unit" {
+  let a = statics_of(SStr(b"a")).get(0);
+  let forged = { name: a.name, laid: statics_of(SStr(b"b")).get(0).laid };
+  let said = handle {
+    unit_of(
+      [
+        { key: b"m.f", value: naming(one_body(b"m.f", []), [a]) },
+        { key: b"m.g", value: naming(one_body(b"m.g", []), [forged]) },
+      ],
+      Map::new(),
+    );
+    b""
+  } with {
+    abort.raise(m) -> Bytes::of_string(m),
+  };
+  assert(said.starts_with(b"two statics of one name hold different content"), None)
 }
 
 /// A name in `name`'s bucket that is not `name`, for a test that wants two roots to share one.
@@ -3699,19 +3697,27 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
   );
   assert_eq(p.taken, [b"m.f"]);
   assert_eq(p.dropped.map(|d: Dropped| d.function), [b"m.g"]);
+  let own = statics_of(SStr(b"m.f")).get(0).name;
   assert(
     p.text.index_of(
         Bytes::concat_all([
-          b"Word f_m.f(PlyCtx *ctx) { return ",
-          bucket_table(bucket_of(b"m.f")),
-          b"[0] + ",
+          b"Word f_m.f(PlyCtx *ctx) { return (Word)(intptr_t)&",
+          own,
+          b" + ",
+          ascii_of_int(root_id(b"m.f")),
+          b"; }",
         ]),
       )
       != None,
     None,
   );
   assert(p.text.index_of(b"Word f_m.f(PlyCtx*);\n") != None, None);
-  assert(p.text.index_of(b"/* tail */\n\n/* --- what this unit says about itself") != None, None);
+  // The tail defines the static the body names, then says what the unit holds.
+  assert(
+    p.text.index_of(Bytes::concat_all([b"/* tail */\nconst struct ", own, b" {"])) != None,
+    None,
+  );
+  assert(p.text.index_of(b"};\n\n/* --- what this unit says about itself") != None, None);
   // A constant says its row of the code table, and the loader takes that table and each
   // definition's entry by address.
   assert(p.text.index_of(b"\"constants 1\\n\"\n\"m.f 0\\n\"") != None, None);
