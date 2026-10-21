@@ -27,6 +27,8 @@ import emit.release (Part, WordAt, ByCase, Counted, Object, CaseBox, SumWord, In
 import emit.print.text (Printing, Place, line, name_of, named, printing, part_names, declared_at,
                         pad, slot, assigned, arg_text, unprinted)
 import emit.print.made (head_types)
+import emit.print.counting (dup_fn, last_fn, rel_fn, rel_sum_fn, rel_int_fn, free_fn,
+                            handle_free_fn, call_text, call_start)
 
 /// The C a failure holding `unwind` runs: a jump to the chain of tails that lets go of each count it
 /// holds (a reuse token's block, which holds nothing, freed) and then goes by `root`, the tails it
@@ -157,11 +159,9 @@ pub fn count_printed(p: Place, pr: Printing, i: Inst) -> Printing / {abort.raise
         Bytes::concat_all([
           b"if (",
           t,
-          b") ply_free(ctx, ",
-          t,
-          b", ",
-          arg_text(pr, r.bytes),
-          b");",
+          b") ",
+          call_text(free_fn(), [b"ctx", t, arg_text(pr, r.bytes)]),
+          b";",
         ]),
       )
     },
@@ -252,22 +252,7 @@ pub fn released(pr: Printing, ty: Type, r: Rep, values: List<Bytes>) -> Said / {
   match r {
     RToken(n) -> {
       let t = nth(values, 0);
-      {
-        pr: pr,
-        out: [
-          Text(
-            Bytes::concat_all([
-              b"if (",
-              t,
-              b") ply_free(ctx, ",
-              t,
-              b", ",
-              ascii_of_int(header_bytes() + 8 * n),
-              b");",
-            ]),
-          ),
-        ],
-      }
+      { pr: pr, out: [Text(Bytes::concat_all([b"if (", t, b") ", freed(t, n)]))] }
     },
     _ -> {
       let each = held_parts(pr.ctors, ty, r);
@@ -345,10 +330,10 @@ fn part_let_go(pr: Printing, p: Part, ws: List<Bytes>) -> Said / {abort.raise} =
 /// The C letting go of the word `x`, counted as `how` says.
 fn word_let_go(pr: Printing, x: Bytes, how: Counted) -> Said / {abort.raise} =
   match how {
-    Object(k) -> rooted(pr, k, b"ply_rel(ctx, ", x),
-    CaseBox(c) -> rooted(pr, case_root(Drop, c.sum, c.case), b"ply_rel(ctx, ", x),
-    SumWord(k) -> rooted(pr, k, b"ply_rel_sum(ctx, ", x),
-    IntWord(k) -> rooted(pr, k, b"ply_rel_int(ctx, ", x),
+    Object(k) -> rooted(pr, k, rel_fn(), x),
+    CaseBox(c) -> rooted(pr, case_root(Drop, c.sum, c.case), rel_fn(), x),
+    SumWord(k) -> rooted(pr, k, rel_sum_fn(), x),
+    IntWord(k) -> rooted(pr, k, rel_int_fn(), x),
     Through ->
       {
         pr: pr,
@@ -357,9 +342,9 @@ fn word_let_go(pr: Printing, x: Bytes, how: Counted) -> Said / {abort.raise} =
             Bytes::concat_all([
               b"if (",
               x,
-              b" && ply_last(ctx, ",
-              x,
-              b")) ",
+              b" && ",
+              call_text(last_fn(), [b"ctx", x]),
+              b") ",
               described(x),
               b"->release(ctx, ",
               x,
@@ -376,11 +361,11 @@ fn word_let_go(pr: Printing, x: Bytes, how: Counted) -> Said / {abort.raise} =
             Bytes::concat_all([
               b"if (",
               x,
-              b" && ply_last(ctx, ",
-              x,
-              b")) rt_handle_free_p(ctx, ",
-              x,
-              b");",
+              b" && ",
+              call_text(last_fn(), [b"ctx", x]),
+              b") ",
+              call_text(handle_free_fn(), [b"ctx", x]),
+              b";",
             ]),
           ),
         ],
@@ -391,11 +376,11 @@ fn word_let_go(pr: Printing, x: Bytes, how: Counted) -> Said / {abort.raise} =
 fn described(x: Bytes) -> Bytes =
   Bytes::concat_all([b"((const PlyFnDesc *)(intptr_t)", slot(x, 0), b")"])
 
-/// `call` of `x` and then drop root `k`, noted.
-fn rooted(pr: Printing, k: RootKey, call: Bytes, x: Bytes) -> Said =
+/// A call of `f` on `x` and then drop root `k`, noted.
+fn rooted(pr: Printing, k: RootKey, f: Bytes, x: Bytes) -> Said =
   {
     pr: noted(pr, k, RWord),
-    out: [Text(Bytes::concat_all([call, x, b", "])), Hole(Symbol(Root(k))), Text(b");")],
+    out: [Text(call_start(f, [b"ctx", x])), Hole(Symbol(Root(k))), Text(b");")],
   }
 
 /// `pr` noting that its body names root `k`, a plain root of one word answering as `answer`, and the
@@ -464,15 +449,21 @@ fn word_dup(x: Bytes, how: Counted) -> Bytes =
         x,
         b" >= ",
         ascii_of_int(pointer_floor()),
-        b") ply_dup(",
-        x,
-        b" & ~(Word)",
-        ascii_of_int(tag_mask()),
-        b");",
+        b") ",
+        call_text(dup_fn(), [Bytes::concat_all([x, b" & ~(Word)", ascii_of_int(tag_mask())])]),
+        b";",
       ]),
     IntWord(_) ->
-      Bytes::concat_all([b"if (!(", x, b" & ", ascii_of_int(tag_mask()), b")) ply_dup(", x, b");"]),
-    _ -> Bytes::concat_all([b"ply_dup(", x, b");"]),
+      Bytes::concat_all([
+        b"if (!(",
+        x,
+        b" & ",
+        ascii_of_int(tag_mask()),
+        b")) ",
+        call_text(dup_fn(), [x]),
+        b";",
+      ]),
+    _ -> call_text(dup_fn(), [x]).concat(b";"),
   }
 
 /// The C words a block named `x` holds a part held as `r` in from word `at`: a sum's words.
@@ -513,17 +504,20 @@ pub fn opened_block(
       });
   match opening {
     InBox(b) -> line(read(b.parts), depth, freed(x, b.words)),
-    Holding(h) -> line(read([h]), depth, Bytes::concat_all([b"rt_handle_free_p(ctx, ", x, b");"])),
+    Holding(h) -> line(read([h]), depth, call_text(handle_free_fn(), [b"ctx", x]).concat(b";")),
     ScalarBox(n) -> line(pr, depth, freed(x, n)),
     FnBlock -> line(pr, depth, Bytes::concat_all([described(x), b"->release(ctx, ", x, b");"])),
-    HandleBlock -> line(pr, depth, Bytes::concat_all([b"rt_handle_free_p(ctx, ", x, b");"])),
+    HandleBlock -> line(pr, depth, call_text(handle_free_fn(), [b"ctx", x]).concat(b";")),
     _ -> stated(depth, contents_let_go(pr, x, opening)),
   }
 }
 
-/// `ply_free` of the block `x` of `n` payload words.
-fn freed(x: Bytes, n: Int) -> Bytes =
-  Bytes::concat_all([b"ply_free(ctx, ", x, b", ", ascii_of_int(header_bytes() + 8 * n), b");"])
+/// The block `x` of `n` payload words given back.
+fn freed(x: Bytes, n: Int) -> Bytes = given_back(x, ascii_of_int(header_bytes() + 8 * n))
+
+/// The block `x` of `bytes`, a C expression, given back.
+fn given_back(x: Bytes, bytes: Bytes) -> Bytes =
+  call_text(free_fn(), [b"ctx", x, bytes]).concat(b";")
 
 /// A header field of the block `x`.
 fn field(x: Bytes, name: Bytes) -> Bytes = Bytes::concat_all([b"ply_obj(", x, b")->", name])
@@ -551,7 +545,7 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
   match opening {
     StrBlock(s) -> {
       let laid = str_laid();
-      let v = rooted(pr, s.viewed, b"ply_rel(ctx, ", b"ply_v");
+      let v = rooted(pr, s.viewed, rel_fn(), b"ply_v");
       {
         pr: v.pr,
         out: [
@@ -579,13 +573,15 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
             Bytes::concat_all([
               b" ",
               freed(x, laid.view_words),
-              b" } else ply_free(ctx, ",
-              x,
-              b", ",
-              ascii_of_int(header_bytes()),
-              b" + (int64_t)",
-              field(x, laid.room),
-              b");",
+              b" } else ",
+              given_back(
+                x,
+                Bytes::concat_all([
+                  ascii_of_int(header_bytes()),
+                  b" + (int64_t)",
+                  field(x, laid.room),
+                ]),
+              ),
             ]),
           ),
         ),
@@ -594,7 +590,7 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
     ListOf(l) -> {
       let laid = layouts().list;
       let items = let_go_of(pr, l.item, [b"ply_w"]);
-      let root = rooted(items.pr, l.node, b"ply_rel(ctx, ", slot(x, laid.root));
+      let root = rooted(items.pr, l.node, rel_fn(), slot(x, laid.root));
       let tail = if items.out.len() == 0 { [] } else {
         [
           Text(
@@ -617,15 +613,19 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
         ).push(
           Text(
             Bytes::concat_all([
-              b" ply_free(ctx, ",
-              x,
-              b", ",
-              ascii_of_int(header_bytes()),
-              b" + 8 * (",
-              ascii_of_int(laid.tail),
-              b" + (int64_t)",
-              field(x, laid.room),
-              b")); }",
+              b" ",
+              given_back(
+                x,
+                Bytes::concat_all([
+                  ascii_of_int(header_bytes()),
+                  b" + 8 * (",
+                  ascii_of_int(laid.tail),
+                  b" + (int64_t)",
+                  field(x, laid.room),
+                  b")",
+                ]),
+              ),
+              b" }",
             ]),
           ),
         ),
@@ -633,7 +633,7 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
     },
     NodeOf(n) -> {
       let trie = layouts().trie;
-      let kids = rooted(pr, n.node, b"ply_rel(ctx, ", slot_at(x, b"ply_i"));
+      let kids = rooted(pr, n.node, rel_fn(), slot_at(x, b"ply_i"));
       let items = let_go_of(kids.pr, n.item, [b"ply_w"]);
       let leaves = if items.out.len() == 0 { [] } else {
         [Text(Bytes::concat_all([b"Word ply_w = ", slot_at(x, b"ply_i"), b"; "]))].concat(items.out)
@@ -659,25 +659,27 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
         ).push(
           Text(
             Bytes::concat_all([
-              b" } ply_free(ctx, ",
-              x,
-              b", ",
-              ascii_of_int(header_bytes()),
-              b" + 8 * (int64_t)",
-              field(x, block_sizes().node_room),
-              b");",
+              b" } ",
+              given_back(
+                x,
+                Bytes::concat_all([
+                  ascii_of_int(header_bytes()),
+                  b" + 8 * (int64_t)",
+                  field(x, block_sizes().node_room),
+                ]),
+              ),
             ]),
           ),
         ),
       }
     },
     MapOf(k) -> {
-      let root = rooted(pr, k, b"ply_rel(ctx, ", slot(x, layouts().map.root));
+      let root = rooted(pr, k, rel_fn(), slot(x, layouts().map.root));
       { pr: root.pr, out: root.out.push(Text(b" ".concat(freed(x, block_sizes().map_words)))) }
     },
     PairsOf(m) -> {
       let tree = layouts().tree;
-      let kid = rooted(pr, m.node, b"ply_rel(ctx, ", slot_at(x, b"ply_i"));
+      let kid = rooted(pr, m.node, rel_fn(), slot_at(x, b"ply_i"));
       let max = let_go_of(kid.pr, m.key, [b"ply_k"]);
       let keys = let_go_of(max.pr, m.key, [b"ply_k"]);
       let values = let_go_of(keys.pr, m.value, [b"ply_v"]);
@@ -713,13 +715,16 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
         ).push(
           Text(
             Bytes::concat_all([
-              b" ply_free(ctx, ",
-              x,
-              b", ",
-              ascii_of_int(header_bytes()),
-              b" + 16 * (int64_t)",
-              field(x, block_sizes().leaf_room),
-              b"); }",
+              b" ",
+              given_back(
+                x,
+                Bytes::concat_all([
+                  ascii_of_int(header_bytes()),
+                  b" + 16 * (int64_t)",
+                  field(x, block_sizes().leaf_room),
+                ]),
+              ),
+              b" }",
             ]),
           ),
         ),
@@ -736,9 +741,7 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
         pr: each.pr,
         out: [Text(b"{ ")].concat(
           spaced(looped(elements(x, a.stride), each.out), [
-            Text(
-              Bytes::concat_all([b"ply_free(ctx, ", x, b", ", block_size(x, ArrayOf(a)), b");"]),
-            ),
+            Text(given_back(x, block_size(x, ArrayOf(a)))),
           ]),
         ).push(
           Text(b" }"),
@@ -750,7 +753,7 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
       let each = range(0, ks.len()).fold({ pr: pr, out: [] }, |acc: Said, i: Int|
         match ks.at(i) {
           Some(k) -> {
-            let c = rooted(acc.pr, k, b"ply_rel(ctx, ", slot(x, first + i));
+            let c = rooted(acc.pr, k, rel_fn(), slot(x, first + i));
             { pr: c.pr, out: spaced(acc.out, c.out) }
           },
           None -> acc,
@@ -947,7 +950,7 @@ pub fn walked(
             { pr: q, out: if d.len() == 0 { [] } else { [Text(d)] } }
           },
         );
-        let let_go = rooted(duped_slots.pr, dropped, b"ply_rel(ctx, ", x);
+        let let_go = rooted(duped_slots.pr, dropped, rel_fn(), x);
         stated(depth, {
           pr: let_go.pr,
           out: [
@@ -1601,7 +1604,7 @@ pub fn reset_boxed(
         let s = let_go_of(acc.pr, stored_parts(pr.ctors, h), slots_of(x, h.at, h.rep));
         { pr: s.pr, out: spaced(acc.out, s.out) }
       });
-      let shared = rooted(held.pr, dropped, b"ply_rel(ctx, ", x);
+      let shared = rooted(held.pr, dropped, rel_fn(), x);
       stated(depth, {
         pr: shared.pr,
         out: [
@@ -1645,13 +1648,13 @@ pub fn last_of(p: Place, pr: Printing, into: Option<Var>, v: Var) -> Printing / 
           x,
           b" >= ",
           ascii_of_int(pointer_floor()),
-          b" && ply_last(ctx, ",
-          x,
-          b" & ~(Word)",
-          ascii_of_int(tag_mask()),
-          b")",
+          b" && ",
+          call_text(last_fn(), [
+            b"ctx",
+            Bytes::concat_all([x, b" & ~(Word)", ascii_of_int(tag_mask())]),
+          ]),
         ])
-      } else { Bytes::concat_all([x, b" && ply_last(ctx, ", x, b")"]) };
+      } else { Bytes::concat_all([x, b" && ", call_text(last_fn(), [b"ctx", x])]) };
       assigned(pr, p.depth, n, b"Word", Bytes::concat_all([b"(", tested, b") ? ", x, b" : 0"]))
     },
   }
@@ -1687,7 +1690,10 @@ fn unwound(pr: Printing, unwind: List<Var>) -> Bytes / {abort.raise} = {
 }
 
 fn lets_go(text: Bytes, name: Bytes) -> Bool =
-  text.index_of(Bytes::concat_all([b"ply_rel(ctx, ", name, b", "])) != None
+  text.index_of(call_start(rel_fn(), [b"ctx", name])) != None
+
+/// The statement calling `f` on `args`.
+fn called(f: Bytes, args: List<Bytes>) -> Bytes = call_text(f, args).concat(b";")
 
 fn occurrences(t: Bytes, s: Bytes) -> Int / {abort.raise} = t.split(s).len() - 1
 
@@ -1712,19 +1718,21 @@ test "a count is taken or let go of each part of a value that holds one, as many
   let k = { id: 2, ty: int(), rep: RInt };
   let d = drop_spelled(string());
   let pr = printing(Map::new().insert(0, b"p0").insert(1, b"t1").insert(2, b"t2"));
-  assert_eq(printed(pr, Inc({ var: x, n: 2 })), b"  ply_dup(p0); ply_dup(p0);\n");
-  assert_eq(printed(pr, Dec(x)), Bytes::concat_all([b"  ply_rel(ctx, p0, ", d, b");\n"]));
+  let dup = called(dup_fn(), [b"p0"]);
+  let let_go = called(rel_fn(), [b"ctx", b"p0", d]);
+  assert_eq(printed(pr, Inc({ var: x, n: 2 })), Bytes::concat_all([b"  ", dup, b" ", dup, b"\n"]));
+  assert_eq(printed(pr, Dec(x)), Bytes::concat_all([b"  ", let_go, b"\n"]));
   // A flat value's counted leaf holds a count; its scalar leaf holds none.
-  let flat_let_go = Bytes::concat_all([b"ply_rel(ctx, t1_1, ", d, b");"]);
+  let flat_let_go = called(rel_fn(), [b"ctx", b"t1_1", d]);
   assert_eq(printed(pr, Dec(flat)), Bytes::concat_all([b"  ", flat_let_go, b"\n"]));
   assert_eq(
     unwound(pr, [x, k, flat]),
     Bytes::concat_all([
       b"goto ply_u1;\n  ply_u1: ",
       flat_let_go,
-      b"\n  ply_u0: ply_rel(ctx, p0, ",
-      d,
-      b"); return 0;\n",
+      b"\n  ply_u0: ",
+      let_go,
+      b" return 0;\n",
     ]),
   );
   // A failure that holds no count leaves at once.
@@ -1738,23 +1746,26 @@ test "a reset keeps a box held only here as its token, and a token no make took 
   let pr = printing(Map::new().insert(0, b"p0"));
   let reset = count_printed(place(), pr, Reset({ token: token, of: x }));
   assert_eq(name_of(reset, token), b"t1");
+  let let_go = called(rel_fn(), [b"ctx", b"p0", drop_spelled(rec)]);
   assert_eq(
     spelled(reset.out),
     Bytes::concat_all([
-      b"  Word t1 = 0; if (p0 && ply_obj(p0)->rc == 1) { ply_rel(ctx, ply_words(p0)[1], ",
-      drop_spelled(string()),
-      b"); t1 = p0; } else ply_rel(ctx, p0, ",
-      drop_spelled(rec),
-      b");\n",
+      b"  Word t1 = 0; if (p0 && ply_obj(p0)->rc == 1) { ",
+      called(rel_fn(), [b"ctx", b"ply_words(p0)[1]", drop_spelled(string())]),
+      b" t1 = p0; } else ",
+      let_go,
+      b"\n",
     ]),
   );
   // A failure holding the token frees it before it lets go of what was declared before it.
   assert_eq(
     unwound(reset, [x, token]),
     Bytes::concat_all([
-      b"goto ply_u1;\n  ply_u1: if (t1) ply_free(ctx, t1, 32);\n  ply_u0: ply_rel(ctx, p0, ",
-      drop_spelled(rec),
-      b"); return 0;\n",
+      b"goto ply_u1;\n  ply_u1: if (t1) ",
+      called(free_fn(), [b"ctx", b"t1", b"32"]),
+      b"\n  ply_u0: ",
+      let_go,
+      b" return 0;\n",
     ]),
   )
 }
@@ -1810,8 +1821,7 @@ test "failures whose releases end alike share that end, each release printed onc
   let a = text_local(0);
   let b = text_local(1);
   let c = text_local(2);
-  let rel = |n: Bytes|
-    Bytes::concat_all([b"ply_rel(ctx, ", n, b", ", drop_spelled(string()), b");"]);
+  let rel = |n: Bytes| called(rel_fn(), [b"ctx", n, drop_spelled(string())]);
   let declared = |pr: Printing, v: Var| named(pr, v).pr;
   let pr = declared(declared(printing(Map::new().insert(0, b"p0")), b), c);
   let first = exit_of(pr, [a, b], b"return 0;");
@@ -1858,16 +1868,16 @@ test "a tail stands at the end of the block its value was declared in, out of th
   assert_eq(
     spelled(closed.out),
     Bytes::concat_all([
-      b"    if (0) {\n      ply_u1: ply_rel(ctx, t1, ",
-      d,
-      b"); goto ply_u0;\n    }\n",
+      b"    if (0) {\n      ply_u1: ",
+      called(rel_fn(), [b"ctx", b"t1", d]),
+      b" goto ply_u0;\n    }\n",
     ]),
   );
   assert_eq(closed.block, pr.block);
   // The parameter's release waits for the function's own block, which the inner one's jumps to.
   assert_eq(
     spelled(block_closed({ ..closed, out: [] }, 0, 0, false).out),
-    Bytes::concat_all([b"  ply_u0: ply_rel(ctx, p0, ", d, b"); goto ply_h0;\n"]),
+    Bytes::concat_all([b"  ply_u0: ", called(rel_fn(), [b"ctx", b"p0", d]), b" goto ply_h0;\n"]),
   );
   // A block no failure path released anything of ends as it was.
   let quiet = block_opened(pr);
@@ -1910,7 +1920,7 @@ test "a counted word is let go of at its type's drop root, a hole the root's cal
   let k = dropping_of(b"String");
   let d = root_spelled(k);
   let one = let_go_said([word(0, Object(k))], [b"t1"]);
-  assert_eq(one.text, Bytes::concat_all([b"ply_rel(ctx, t1, ", d, b");"]));
+  assert_eq(one.text, called(rel_fn(), [b"ctx", b"t1", d]));
   assert_eq(one.calls, [k]);
   assert_eq(one.expects, 1);
   let twice = let_go_said([word(0, Object(k)), WordAt({ at: 1, masked: true, how: Object(k) })], [
@@ -1919,33 +1929,38 @@ test "a counted word is let go of at its type's drop root, a hole the root's cal
   ]);
   assert_eq(
     twice.text,
-    Bytes::concat_all([b"ply_rel(ctx, a, ", d, b"); ply_rel(ctx, (b & ~(Word)7), ", d, b");"]),
+    Bytes::concat_all([
+      called(rel_fn(), [b"ctx", b"a", d]),
+      b" ",
+      called(rel_fn(), [b"ctx", b"(b & ~(Word)7)", d]),
+    ]),
   );
   assert_eq([twice.calls.len(), twice.expects], [1, 1]);
   assert_eq(
     let_go_said([word(0, SumWord(k))], [b"w"]).text,
-    Bytes::concat_all([b"ply_rel_sum(ctx, w, ", d, b");"]),
+    called(rel_sum_fn(), [b"ctx", b"w", d]),
   );
   assert_eq(
     let_go_said([word(0, IntWord(k))], [b"w"]).text,
-    Bytes::concat_all([b"ply_rel_int(ctx, w, ", d, b");"]),
+    called(rel_int_fn(), [b"ctx", b"w", d]),
   );
   // A function value goes through its descriptor and a handle to the runtime, naming no root.
+  let last = Bytes::concat_all([b"if (w && ", call_text(last_fn(), [b"ctx", b"w"]), b") "]);
   let through = let_go_said([word(0, Through)], [b"w"]);
   assert_eq(
     through.text,
-    b"if (w && ply_last(ctx, w)) ((const PlyFnDesc *)(intptr_t)ply_words(w)[0])->release(ctx, w);",
+    last.concat(b"((const PlyFnDesc *)(intptr_t)ply_words(w)[0])->release(ctx, w);"),
   );
   assert_eq(through.calls, []);
   assert_eq(
     let_go_said([word(0, RuntimeHandle)], [b"w"]).text,
-    b"if (w && ply_last(ctx, w)) rt_handle_free_p(ctx, w);",
+    last.concat(called(handle_free_fn(), [b"ctx", b"w"])),
   );
   // A value spelled 0, a word another now holds, is neither let go of nor counted again.
   let gone = let_go_said([word(0, Object(k)), word(1, SumWord(k))], [b"0", b"0"]);
   assert_eq([gone.text, dup_of([word(0, Object(k)), word(1, Object(k))], [b"0", b"b"])], [
     b"",
-    b"ply_dup(b);",
+    called(dup_fn(), [b"b"]),
   ]);
   assert_eq(gone.calls, [])
 }
@@ -1961,14 +1976,20 @@ test "a sum of several words is let go of by the case it holds, switching on its
     Bytes::concat_all([
       b"switch (",
       held,
-      b") { case 1: ply_rel(ctx, t1_1, ",
-      root_spelled(k),
-      b"); break; }",
+      b") { case 1: ",
+      called(rel_fn(), [b"ctx", b"t1_1", root_spelled(k)]),
+      b" break; }",
     ]),
   );
   assert_eq(
     dup_of(parts, [b"t1_0", b"t1_1", b"t1_2"]),
-    Bytes::concat_all([b"switch (", held, b") { case 1: ply_dup(t1_1); break; }"]),
+    Bytes::concat_all([
+      b"switch (",
+      held,
+      b") { case 1: ",
+      called(dup_fn(), [b"t1_1"]),
+      b" break; }",
+    ]),
   )
 }
 
@@ -1976,12 +1997,15 @@ test "counting once more tests a sum's word past the floor and an Int's for its 
   let k = dropping_of(b"T");
   assert_eq(
     dup_of([word(0, SumWord(k))], [b"w"]),
-    b"if ((uint64_t)w >= 4096) ply_dup(w & ~(Word)7);",
+    b"if ((uint64_t)w >= 4096) ".concat(called(dup_fn(), [b"w & ~(Word)7"])),
   );
-  assert_eq(dup_of([word(0, IntWord(k))], [b"w"]), b"if (!(w & 7)) ply_dup(w);");
+  assert_eq(
+    dup_of([word(0, IntWord(k))], [b"w"]),
+    b"if (!(w & 7)) ".concat(called(dup_fn(), [b"w"])),
+  );
   assert_eq(
     dup_of([word(0, Object(k)), word(1, Through)], [b"a", b"b"]),
-    b"ply_dup(a); ply_dup(b);",
+    Bytes::concat_all([called(dup_fn(), [b"a"]), b" ", called(dup_fn(), [b"b"])]),
   )
 }
 
@@ -2000,7 +2024,11 @@ test "a box opened reads its counted words, a wide sum's every word, and gives t
   );
   assert_eq(
     spelled(opened.out),
-    b"  Word t1 = ply_words(p0)[0];\n  Word t2_0 = ply_words(p0)[2]; Word t2_1 = ply_words(p0)[3];\n  ply_free(ctx, p0, 48);\n",
+    Bytes::concat_all([
+      b"  Word t1 = ply_words(p0)[0];\n  Word t2_0 = ply_words(p0)[2]; Word t2_1 = ply_words(p0)[3];\n  ",
+      called(free_fn(), [b"ctx", b"p0", b"48"]),
+      b"\n",
+    ]),
   );
   assert_eq(name_of(opened, b), b"t2");
   assert_eq(part_names(b"t2", s), [b"t2_0", b"t2_1"]);
@@ -2025,11 +2053,13 @@ test "a list opened lets go of its tail's items and its trie, and gives itself b
   assert_eq(
     spelled(opened.out),
     Bytes::concat_all([
-      b"  { for (int64_t ply_i = 0; ply_i < ply_obj(p0)->flags; ply_i++) { Word ply_w = ply_words(p0)[1 + ply_i]; ply_rel(ctx, ply_w, ",
-      root_spelled(item),
-      b"); } ply_rel(ctx, ply_words(p0)[0], ",
-      root_spelled(node),
-      b"); ply_free(ctx, p0, 16 + 8 * (1 + (int64_t)ply_obj(p0)->aux)); }\n",
+      b"  { for (int64_t ply_i = 0; ply_i < ply_obj(p0)->flags; ply_i++) { Word ply_w = ply_words(p0)[1 + ply_i]; ",
+      called(rel_fn(), [b"ctx", b"ply_w", root_spelled(item)]),
+      b" } ",
+      called(rel_fn(), [b"ctx", b"ply_words(p0)[0]", root_spelled(node)]),
+      b" ",
+      called(free_fn(), [b"ctx", b"p0", b"16 + 8 * (1 + (int64_t)ply_obj(p0)->aux)"]),
+      b" }\n",
     ]),
   );
   assert_eq(opened.calls, [item, node])
@@ -2037,6 +2067,7 @@ test "a list opened lets go of its tail's items and its trie, and gives itself b
 
 test "an array let go of loops over its elements, its header's len counting their words, and gives back that many" {
   let item = dropping_of(b"String");
+  let given = called(free_fn(), [b"ctx", b"p0", b"16 + 8 * (int64_t)ply_obj(p0)->len"]);
   let opened = opened_block(
     printing(Map::new().insert(0, b"p0")),
     0,
@@ -2047,9 +2078,11 @@ test "an array let go of loops over its elements, its header's len counting thei
   assert_eq(
     spelled(opened.out),
     Bytes::concat_all([
-      b"  { for (int64_t ply_i = 0; ply_i < (int64_t)ply_obj(p0)->len / 2; ply_i++) { ply_rel(ctx, ply_words(p0)[ply_i * 2 + 1], ",
-      root_spelled(item),
-      b"); } ply_free(ctx, p0, 16 + 8 * (int64_t)ply_obj(p0)->len); }\n",
+      b"  { for (int64_t ply_i = 0; ply_i < (int64_t)ply_obj(p0)->len / 2; ply_i++) { ",
+      called(rel_fn(), [b"ctx", b"ply_words(p0)[ply_i * 2 + 1]", root_spelled(item)]),
+      b" } ",
+      given,
+      b" }\n",
     ]),
   );
   assert_eq(opened.calls, [item]);
@@ -2062,7 +2095,7 @@ test "an array let go of loops over its elements, its header's len counting thei
   assert_eq(units, ArrayOf({ element: [], stride: 1 }));
   assert_eq(
     spelled(opened_block(printing(Map::new().insert(0, b"p0")), 0, local(0, RWord), [], units).out),
-    b"  { ply_free(ctx, p0, 16 + 8 * (int64_t)ply_obj(p0)->len); }\n",
+    Bytes::concat_all([b"  { ", given, b" }\n"]),
   )
 }
 
@@ -2081,19 +2114,22 @@ test "a reset keeps a box held only here as its token, its words let go of, and 
   assert_eq(
     spelled(reset.out),
     Bytes::concat_all([
-      b"  Word t1 = 0; if (p0 && ply_obj(p0)->rc == 1) { ply_rel(ctx, ply_words(p0)[0], ",
-      root_spelled(item),
-      b"); t1 = p0; } else ply_rel(ctx, p0, ",
-      root_spelled(boxed),
-      b");\n",
+      b"  Word t1 = 0; if (p0 && ply_obj(p0)->rc == 1) { ",
+      called(rel_fn(), [b"ctx", b"ply_words(p0)[0]", root_spelled(item)]),
+      b" t1 = p0; } else ",
+      called(rel_fn(), [b"ctx", b"p0", root_spelled(boxed)]),
+      b"\n",
     ]),
   );
   let token = local(1, RToken(2));
   let freed = count_printed(place(), { ..reset, out: [] }, Free({ of: token, bytes: AInt(32) }));
-  assert_eq(spelled(freed.out), b"  if (t1) ply_free(ctx, t1, INT64_C(32));\n");
+  assert_eq(
+    spelled(freed.out),
+    Bytes::concat_all([b"  if (t1) ", called(free_fn(), [b"ctx", b"t1", b"INT64_C(32)"]), b"\n"]),
+  );
   assert_eq(
     spelled(released(reset, token.ty, token.rep, [b"t1"]).out),
-    b"if (t1) ply_free(ctx, t1, 32);",
+    b"if (t1) ".concat(called(free_fn(), [b"ctx", b"t1", b"32"])),
   )
 }
 
@@ -2104,13 +2140,13 @@ test "a value's counts read its type's own layout and word form" {
   let let_go = released(pr, string, RWord, [b"t1"]);
   assert_eq(
     spelled(let_go.out),
-    Bytes::concat_all([b"ply_rel(ctx, t1, ", root_spelled(dropping_of(b"String")), b");"]),
+    called(rel_fn(), [b"ctx", b"t1", root_spelled(dropping_of(b"String"))]),
   );
   // A record's word form is its box; an `Int`'s an immediate or the runtime's box.
-  assert_eq(duped(pr, pair, RWord, [b"t2"]), b"ply_dup(t2);");
+  assert_eq(duped(pr, pair, RWord, [b"t2"]), called(dup_fn(), [b"t2"]));
   assert_eq(
     duped(pr, TyCon({ name: b"Int", args: [] }), RWord, [b"t3"]),
-    b"if (!(t3 & 7)) ply_dup(t3);",
+    b"if (!(t3 & 7)) ".concat(called(dup_fn(), [b"t3"])),
   );
   assert_eq(part_names(b"t4", RWord), [b"t4"])
 }
@@ -2122,10 +2158,21 @@ test "a last holder's test takes the count and answers the value only where it w
   });
   let pr = printing(Map::new().insert(0, b"p0"));
   let at = |r: Rep| spelled(last_of(place(), pr, Some(local(1, RWord)), local(0, r)).out);
-  assert_eq(at(RWord), b"  Word t1 = (p0 && ply_last(ctx, p0)) ? p0 : 0;\n");
+  assert_eq(
+    at(RWord),
+    Bytes::concat_all([
+      b"  Word t1 = (p0 && ",
+      call_text(last_fn(), [b"ctx", b"p0"]),
+      b") ? p0 : 0;\n",
+    ]),
+  );
   assert_eq(
     at(one_word),
-    b"  Word t1 = ((uint64_t)p0 >= 4096 && ply_last(ctx, p0 & ~(Word)7)) ? p0 : 0;\n",
+    Bytes::concat_all([
+      b"  Word t1 = ((uint64_t)p0 >= 4096 && ",
+      call_text(last_fn(), [b"ctx", b"p0 & ~(Word)7"]),
+      b") ? p0 : 0;\n",
+    ]),
   );
   // Renamed as the block its case holds, a sum's word drops its tag.
   assert_eq(
@@ -2153,8 +2200,12 @@ test "a node copied is a fresh block of its header and words, each counted once 
     b"Word t1 = rt_alloc_bytes_p(ctx, 16 + 8 * (int64_t)ply_obj(p0)->layout);",
     b"ply_obj(t1)->kind = ply_obj(p0)->kind;",
     b"ply_words(t1)[ply_i] = ply_words(p0)[ply_i];",
-    b"if (ply_obj(t1)->kind == 12) { for (int64_t ply_i = 0; ply_i < ply_obj(t1)->len; ply_i++) { ply_dup(ply_words(t1)[ply_i]); } }",
-    Bytes::concat_all([b"ply_rel(ctx, p0, ", root_spelled(node), b");\n"]),
+    Bytes::concat_all([
+      b"if (ply_obj(t1)->kind == 12) { for (int64_t ply_i = 0; ply_i < ply_obj(t1)->len; ply_i++) { ",
+      called(dup_fn(), [b"ply_words(t1)[ply_i]"]),
+      b" } }",
+    ]),
+    called(rel_fn(), [b"ctx", b"p0", root_spelled(node)]).concat(b"\n"),
   ].fold((), |_: Unit, part: Bytes| assert(copy.text.contains(part), None));
   assert_eq(copy.calls, [node])
 }
