@@ -657,26 +657,12 @@ fn in_box(
 /// of any case of what it holds, a task, a channel or a secret, a hold, or a function value. A handle
 /// and a hold may not outlive the entry that made them, and whether a function value may is known
 /// only from the captures it holds, so a value reaching one is not kept. A function value's own
-/// block is kept by its descriptor, which reads its captures' types alike.
+/// block is kept by its descriptor, which reads its captures' types alike. Past the block's own words
+/// it reads what the program's sums hold off the constructor table (`reps.holds_unkept`), so a keep
+/// walks no type its value reaches.
 pub fn never_kept(ctors: Ctors, o: Opening) -> Bool / {abort.raise} = {
   let first = opening_reach(ctors, o);
-  first.found
-    || iterate(
-      { seen: Map::new(), todo: first.types },
-      1000000,
-      |s: { seen: Map<Bytes, Bool>, todo: List<Type> }|
-        match s.todo {
-          [] -> Stop(false),
-          [ty, ..rest] -> {
-            let key = spelled_type(ty);
-            if s.seen.contains(key) { Continue({ ..s, todo: rest }) } else {
-              let r = type_reach(ctors, ty);
-              if r.found { Stop(true) }
-              else { Continue({ seen: s.seen.insert(key, true), todo: rest.concat(r.types) }) }
-            }
-          },
-        },
-    )
+  first.found || first.types.any(|t: Type| reps::holds_unkept(ctors, t))
 }
 
 /// What a value reaches of what is never kept, read off its own block or its type's: whether it
@@ -732,28 +718,6 @@ fn parts_reach(parts: List<Part>) -> Reach =
           |a: Reach, k: { case: Int, parts: List<Part> }| reached(a, parts_reach(k.parts)),
         ),
     }))
-
-/// `Reach` of a value of `ty`: a sum's by each of its cases, a boxed case's by its box; any other
-/// type's by the block of its word.
-fn type_reach(ctors: Ctors, ty: Type) -> Reach / {abort.raise} = {
-  let laid_of = |t: Type| reps::laid(ctors, t);
-  match laid_of(ty) {
-    LSum(s) -> {
-      let declared = cases_of(ctors, ty);
-      range(0, s.cases.len()).fold({ found: false, types: [] }, |acc: Reach, k: Int|
-        match s.cases.at(k) {
-          Some(c) ->
-            reached(acc, match c.payload {
-              Boxed(b) ->
-                opening_reach(ctors, case_box_opening(ctors, ty, args_at(declared, k), b, laid_of)),
-              p -> parts_reach(case_parts(ctors, ty, k, args_at(declared, k), p)),
-            }),
-          None -> acc,
-        })
-    },
-    _ -> opening_reach(ctors, opening(ctors, ty, RWord)),
-  }
-}
 
 /// The box a case of the sum `sum` of arguments `args` is boxed in as `b` says.
 fn case_box_opening(
@@ -1257,6 +1221,108 @@ fn table() -> Ctors =
       { name: b"m.Blue", index: 1, fields: [], params: [] },
     ]),
   )
+
+/// `table()` with sums that reach what is never kept, or seem to: `m.Job = | Idle | Run(Task<Int>)`,
+/// the generic `m.Pair<a, b> = | Pair(a, List<b>)` and `m.Ghost<a> = | Ghost(Int)`, which holds no
+/// value of `a`, `m.Deep = | Deep(m.Pair<Int, m.Job>)`, `m.Loop = | End | Again(m.Loop, Hold<Int>)`
+/// and `m.Act = | Act({ run: (Int) -> Int })`.
+fn reaching() -> Ctors = {
+  let t = table();
+  let a = TyVar(0);
+  let b = TyVar(1);
+  ctors_of(
+    [],
+    [],
+    t.sums.insert(b"m.Job", [
+      { name: b"m.Idle", index: 0, fields: [], params: [] },
+      {
+        name: b"m.Run",
+        index: 1,
+        fields: [TyCon({ name: b"Task", args: [int_type()] })],
+        params: [],
+      },
+    ]).insert(b"m.Pair", [
+      {
+        name: b"m.Pair",
+        index: 0,
+        fields: [a, TyCon({ name: b"List", args: [b] })],
+        params: [0, 1],
+      },
+    ]).insert(b"m.Ghost", [
+      { name: b"m.Ghost", index: 0, fields: [int_type()], params: [0] },
+    ]).insert(b"m.Deep", [
+      {
+        name: b"m.Deep",
+        index: 0,
+        fields: [TyCon({ name: b"m.Pair", args: [int_type(), named(b"m.Job")] })],
+        params: [],
+      },
+    ]).insert(b"m.Loop", [
+      { name: b"m.End", index: 0, fields: [], params: [] },
+      {
+        name: b"m.Again",
+        index: 1,
+        fields: [named(b"m.Loop"), TyCon({ name: b"Hold", args: [int_type()] })],
+        params: [],
+      },
+    ]).insert(b"m.Act", [
+      {
+        name: b"m.Act",
+        index: 0,
+        fields: [
+          TyRecord([
+            {
+              name: b"run",
+              ty: TyFn({ params: [int_type()], ret: int_type(), effects: row_empty() }),
+            },
+          ]),
+        ],
+        params: [],
+      },
+    ]),
+  )
+}
+
+test "a block reaching a handle, a hold or a function value at any depth is never kept, and only such a block" {
+  let t = reaching();
+  let con = |name: Bytes, args: List<Type>| TyCon({ name: name, args: args });
+  let chan = con(b"Chan", [int_type()]);
+  let fun = TyFn({ params: [int_type()], ret: int_type(), effects: row_empty() });
+  let never = [
+    con(b"List", [chan]),
+    con(b"Map", [named(b"String"), fun]),
+    con(b"Array", [TyRecord([{ name: b"s", ty: named(b"Secret") }])]),
+    con(b"Columns", [TyRecord([{ name: b"f", ty: fun }, { name: b"n", ty: int_type() }])]),
+    con(b"Option", [con(b"Option", [con(b"Task", [int_type()])])]),
+    named(b"m.Job"),
+    con(b"m.Pair", [chan, named(b"String")]),
+    con(b"m.Pair", [int_type(), con(b"List", [chan])]),
+    named(b"m.Deep"),
+    named(b"m.Loop"),
+    named(b"m.Act"),
+    con(b"Hold", [int_type()]),
+    TyRecord([
+      { name: b"a", ty: named(b"m.E") },
+      { name: b"b", ty: con(b"List", [named(b"m.Job")]) },
+    ]),
+  ];
+  // A phantom parameter holds nothing, and a `Columns` only what its records' fields hold.
+  let kept = [
+    int_type(),
+    named(b"String"),
+    con(b"List", [int_type()]),
+    con(b"Columns", [TyRecord([{ name: b"n", ty: int_type() }])]),
+    con(b"Option", [named(b"String")]),
+    named(b"m.E"),
+    named(b"m.A"),
+    con(b"m.Pair", [int_type(), named(b"String")]),
+    con(b"m.Ghost", [chan]),
+  ];
+  let wrong = |tys: List<Type>, expected: Bool|
+    tys.filter(|ty: Type| never_kept(t, opening(t, ty, RWord)) != expected).map(spelled_type);
+  assert_eq(wrong(never, true), []);
+  assert_eq(wrong(kept, false), [])
+}
 
 /// `m.R = | Done | Text(String)`, laid as an `Option` of a pointer is.
 fn reply_laid() -> SumLaid = maybe_laid()

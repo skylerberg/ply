@@ -31,6 +31,8 @@ pub type Ctors = {
   sum_of: Map<Bytes, Bytes>,
   /// Each declared sum that may hold a value of its own recursion group in place, by name.
   recursive: Map<Bytes, Recursion>,
+  /// What each declared sum may hold at any depth that is never kept for good, by name.
+  unkept: Map<Bytes, Unkept>,
 }
 
 /// A constructor of a declared sum, by its program-wide name, its arguments' declared types, and the
@@ -43,6 +45,11 @@ pub type SumCtor = { name: Bytes, index: Int, fields: List<Type>, params: List<I
 /// its arguments hold one of the group in place, which boxes the case.
 pub type Recursion = { group: List<Bytes>, indirect: List<Bool> }
 
+/// What the values of a declared sum may hold, at any depth, that is never kept for good: a task, a
+/// channel or a secret, a hold, or a function value, wherever the sum is (`always`), or wherever one
+/// of its arguments, by its place among them (`params`), may.
+pub type Unkept = { always: Bool, params: List<Int> }
+
 /// The constructor table of `names`, `keyed` and `sums`, with what a lookup by name reads.
 pub fn ctors_of(names: List<Bytes>, keyed: List<Bytes>, sums: Map<Bytes, List<SumCtor>>) -> Ctors =
   {
@@ -54,6 +61,7 @@ pub fn ctors_of(names: List<Bytes>, keyed: List<Bytes>, sums: Map<Bytes, List<Su
       cs.fold(m, |k: Map<Bytes, Bytes>, c: SumCtor|
         if k.contains(c.name) { k } else { k.insert(c.name, sum) })),
     recursive: recursion_of(sums),
+    unkept: unkept_of(sums),
   }
 
 /// The types of constructor `c`'s arguments where its sum is at `args`.
@@ -81,6 +89,124 @@ pub fn at_args(ty: Type, params: List<Int>, args: List<Type>) -> Type =
         args: x.args.map(|a: Type| at_args(a, params, args)),
         fields: x.fields.map(|f: Field| { ..f, ty: at_args(f.ty, params, args) }),
       }),
+  }
+
+/// Whether a value of `ty` may hold, at any depth, what is never kept for good: a task, a channel or a
+/// secret, a hold, or a function value, a clause's continuation among them. A sum may where its
+/// constructors' arguments may, at its arguments; a record where a field may; a list, a map, an
+/// array, a list's or a map's node where what it holds may; a `Columns` where a field of its records
+/// may. A word no type settles holds nothing a keep reaches.
+pub fn holds_unkept(ctors: Ctors, ty: Type) -> Bool = unkept_in(ctors.unkept, ty).always
+
+/// What `ty` may hold that is never kept, read off what `unkept` says of the sums it names.
+fn unkept_in(unkept: Map<Bytes, Unkept>, ty: Type) -> Unheld =
+  match ty {
+    TyVar(v) -> { always: false, vars: [v] },
+    TyFn(_) -> { always: true, vars: [] },
+    TyRecord(fs) ->
+      fs.fold(no_unheld(), |a: Unheld, f: Field| unheld_joined(a, unkept_in(unkept, f.ty))),
+    TyNominal(x) ->
+      x.fields.fold(no_unheld(), |a: Unheld, f: Field| unheld_joined(a, unkept_in(unkept, f.ty))),
+    TyCon(c) -> if resumed(ty) != None || never_kept_name(c.name) { { always: true, vars: [] } }
+    // A `Columns` holds an array of each field of its records.
+    else if c.name == b"Columns" {
+      c.args.fold(no_unheld(), |acc: Unheld, r: Type|
+        match r {
+          TyRecord(_) -> unheld_joined(acc, unkept_in(unkept, r)),
+          TyNominal(_) -> unheld_joined(acc, unkept_in(unkept, r)),
+          _ -> acc,
+        })
+    } else {
+      match unkept.get(c.name) {
+        Some(u) -> if u.always { { always: true, vars: [] } } else {
+          c.args.fold({ at: 0, out: no_unheld() }, |acc: { at: Int, out: Unheld }, a: Type|
+            {
+              at: acc.at + 1,
+              out: if u.params.contains(acc.at) { unheld_joined(acc.out, unkept_in(unkept, a)) }
+              else { acc.out },
+            }).out
+        },
+        None ->
+          c.args.fold(no_unheld(), |acc: Unheld, a: Type| unheld_joined(acc, unkept_in(unkept, a))),
+      }
+    },
+  }
+
+/// What a type may hold that is never kept: at once (`always`), or where a value of a type variable
+/// it names (`vars`) may.
+type Unheld = { always: Bool, vars: List<Int> }
+
+fn no_unheld() -> Unheld = { always: false, vars: [] }
+
+fn unheld_joined(a: Unheld, b: Unheld) -> Unheld =
+  {
+    always: a.always || b.always,
+    vars: b.vars.fold(a.vars, |acc: List<Int>, v: Int|
+      if acc.contains(v) { acc } else { acc.push(v) }),
+  }
+
+/// Whether a value of the type named `name` is never kept for good, whatever it holds: a task, a
+/// channel or a secret, which may not outlive the entry that made it, or a hold.
+pub fn never_kept_name(name: Bytes) -> Bool = [b"Task", b"Chan", b"Secret", b"Hold"].contains(name)
+
+/// `Unkept` of each declared sum of `sums`, a fixed point: a sum is asked again whenever what a sum
+/// its constructors' arguments name says grows.
+fn unkept_of(sums: Map<Bytes, List<SumCtor>>) -> Map<Bytes, Unkept> = {
+  let start = sums.fold(Map::new(), |m: Map<Bytes, Unkept>, name: Bytes, _: List<SumCtor>|
+    m.insert(name, { always: false, params: [] }));
+  // Each sum whose constructors' arguments name a sum, by the sum they name.
+  let users = sums.fold(Map::new(), |m: Map<Bytes, List<Bytes>>, name: Bytes, cs: List<SumCtor>|
+    cs.fold(m, |a: Map<Bytes, List<Bytes>>, c: SumCtor|
+      c.fields.fold(a, |b: Map<Bytes, List<Bytes>>, f: Type|
+        type_names(f).fold(b, |u: Map<Bytes, List<Bytes>>, n: Bytes|
+          if !sums.contains(n) { u } else {
+            let had = match u.get(n) { Some(xs) -> xs, None -> [] };
+            if had.contains(name) { u } else { u.insert(n, had.push(name)) }
+          }))));
+  let summary = |known: Map<Bytes, Unkept>, cs: List<SumCtor>|
+    cs.fold({ always: false, params: [] }, |acc: Unkept, c: SumCtor| {
+      let r = c.fields.fold(no_unheld(), |a: Unheld, f: Type|
+        unheld_joined(a, unkept_in(known, f)));
+      {
+        always: acc.always || r.always,
+        params: range(0, c.params.len()).fold(acc.params, |ps: List<Int>, i: Int|
+          if !ps.contains(i)
+              && (match c.params.at(i) { Some(v) -> r.vars.contains(v), None -> false }) {
+            ps.push(i)
+          } else { ps }),
+      }
+    });
+  let users_of = |n: Bytes| match users.get(n) { Some(xs) -> xs, None -> [] };
+  // What a sum says only grows, `always` once and each parameter once, and each time it does each
+  // sum naming it is asked again: so many asks reach the fixed point.
+  let asks = sums.fold(1 + sums.len(), |b: Int, name: Bytes, cs: List<SumCtor>|
+    b + (2 + (match cs.at(0) { Some(c) -> c.params.len(), None -> 0 })) * users_of(name).len());
+  range(0, asks).fold(
+    { known: start, todo: sums.keys() },
+    |w: { known: Map<Bytes, Unkept>, todo: List<Bytes> }, _: Int|
+      match w.todo {
+        [] -> w,
+        [name, ..rest] -> match sums.get(name) {
+          None -> { ..w, todo: rest },
+          Some(cs) -> {
+            let next = summary(w.known, cs);
+            if w.known.get(name) == Some(next) { { ..w, todo: rest } }
+            else { { known: w.known.insert(name, next), todo: rest.concat(users_of(name)) } }
+          },
+        },
+      },
+  ).known
+}
+
+/// The name of each type `ty` names, through its arguments, fields and function types.
+fn type_names(ty: Type) -> List<Bytes> =
+  match ty {
+    TyVar(_) -> [],
+    TyCon(c) -> c.args.fold([c.name], |acc: List<Bytes>, a: Type| acc.concat(type_names(a))),
+    TyFn(f) ->
+      f.params.fold(type_names(f.ret), |acc: List<Bytes>, p: Type| acc.concat(type_names(p))),
+    TyRecord(fs) -> fs.fold([], |acc: List<Bytes>, f: Field| acc.concat(type_names(f.ty))),
+    TyNominal(x) -> x.fields.fold([], |acc: List<Bytes>, f: Field| acc.concat(type_names(f.ty))),
   }
 
 /// The recursion group of each declared sum of `sums` that has one.
