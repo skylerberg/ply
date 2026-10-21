@@ -19,6 +19,7 @@ import emit.keys (RootKey, Written, Named, TypeOp, Reflect, Shown, Digest, Conta
                   root_name, op_name)
 import emit.reps (Ctors, SumCtor, TyOpen, Def, EmitParam, at_args, kind_of)
 import emit.lower.strings (strings_root, strings_code)
+import emit.marks (marked_type, marked_key, plain)
 import store.hash.forms (written_code)
 
 // --- Externs written in place -----------------------------------------------------
@@ -110,7 +111,8 @@ fn walk_ops() -> List<Bytes> =
 fn crossing_loops() -> List<Bytes> =
   [b"lower_items", b"lower_entries", b"lift_items", b"lift_entries"]
 
-/// Whether `container_code` writes the root of `Contained(op)`.
+/// Whether the root of `Contained(op)` is written: a walk or a strings root `container_code` writes,
+/// or a crossing's loop `crossing_root` writes.
 pub fn contained_formed(op: Bytes) -> Bool =
   walk_ops().contains(op) || crossing_loops().contains(op) || strings_root(op)
 
@@ -169,33 +171,29 @@ pub type WrittenRoot = {
   here: List<Def>,
 }
 
-/// The root written for `op` of containers of type `t` in `module`, under the constructors `ctors`:
-/// a loop a crossing runs over a container's items, or a walk `walked_code` writes (a reflection,
-/// a showing or a digest of the container, or one `contained_formed` holds) over the container
-/// `a`, a second one `b` for a comparison, and an index `i` for a comparison's or a gathering's
-/// loop.
+/// The root written for walk `op` of containers of type `t` in `module`, under the constructors
+/// `ctors`: one `walked_code` writes (a reflection, a showing or a digest of the container, or one
+/// `walk_ops` holds) over the container `a`, a second one `b` for a comparison, and an index `i` for
+/// a comparison's or a gathering's loop. A strings root is `strings_code`'s, and a crossing's loops
+/// are `crossing_root`'s.
 pub fn container_code(
   module: Bytes,
   ctors: Ctors,
   op: Bytes,
   t: Type,
 ) -> WrittenRoot / {abort.raise} =
-  match if strings_root(op) { Some(strings_code(module, op, t)) }
-    else { crossing_loop(module, op, t) } {
-    Some(r) -> r,
-    None -> {
-      let e = walked_code(module, op, t);
-      let word = |n: Bytes| { name: n, kind: KBoxed, ty: kind_of(t).ty, of: Some(t), lambda: None };
-      let index = { name: b"i", kind: KInt, ty: TyOpen([]), of: Some(int_type()), lambda: None };
-      {
-        params: if op.ends_with(b"_from") { [word(b"a"), word(b"b"), index] }
-        else if op == b"equal" || op == b"ordered" { [word(b"a"), word(b"b")] }
-        else { [word(b"a")] },
-        code: Ok(e.code),
-        typed: e.typed,
-        here: e.here,
-      }
-    },
+  if strings_root(op) { strings_code(module, op, t) } else {
+    let e = walked_code(module, op, t);
+    let word = |n: Bytes| { name: n, kind: KBoxed, ty: kind_of(t).ty, of: Some(t), lambda: None };
+    let index = { name: b"i", kind: KInt, ty: TyOpen([]), of: Some(int_type()), lambda: None };
+    {
+      params: if op.ends_with(b"_from") { [word(b"a"), word(b"b"), index] }
+      else if op == b"equal" || op == b"ordered" { [word(b"a"), word(b"b")] }
+      else { [word(b"a")] },
+      code: Ok(e.code),
+      typed: e.typed,
+      here: e.here,
+    }
   }
 
 /// The body of the root written for `op` of containers of type `t`, as lowered code over its
@@ -1112,21 +1110,27 @@ pub fn reflection_code(
 
 // --- Crossings --------------------------------------------------------------------------------
 
+/// Whether root `op` of a type is one a crossing runs, which `crossing_root` writes: a lowering, a
+/// lifting, or a loop of one over a container's items.
+pub fn crossing_op(op: TypeOp) -> Bool =
+  match op { Lower -> true, Lift -> true, Contained(c) -> crossing_loops().contains(c), _ -> false }
+
 /// The root `key`, written in `module`, a crossing runs: `lower#T`, which writes the `T` it reads
-/// into the innermost lowering as PLV1 holds it and answers `()`, or `lift#T`, which reads a `T`
-/// from the innermost lifting and answers it as compiled code makes one.
+/// into the innermost lowering as PLV1 holds it and answers `()`; `lift#T`, which reads a `T` from
+/// the innermost lifting and answers it as compiled code makes one; or a loop of one over a
+/// container's items (`crossing_loop`). The places of `T` the key marks cross carried: a value the
+/// runtime keeps with its type, as `HANDLE`, rather than reads.
 pub fn crossing_root(module: Bytes, ctors: Ctors, key: RootKey) -> WrittenRoot / {abort.raise} =
   match key {
-    Written(w) -> if w.marks.len() > 0 {
-      rooted_at(module, key, [], unit_type(), {
-        code: Err(b"a crossing of an operation's own type parameter, which crosses as a handle"),
-        w: writing(),
-        here: [],
-      })
-    } else {
+    Written(w) -> {
+      let marked = marked_type(w.ty, w.marks);
       match w.op {
-        Lower -> rooted_at(module, key, [w.ty], unit_type(), lowering_code(module, ctors, w.ty)),
-        Lift -> rooted_at(module, key, [], w.ty, lifting_code(module, ctors, w.ty)),
+        Lower -> rooted_at(module, key, [w.ty], unit_type(), lowering_code(module, ctors, marked)),
+        Lift -> rooted_at(module, key, [], w.ty, lifting_code(module, ctors, marked)),
+        Contained(c) -> match crossing_loop(module, c, w.ty, marked) {
+          Some(r) -> r,
+          None -> unwritten(module, key, b"a root no crossing runs"),
+        },
         _ -> unwritten(module, key, b"a root no crossing runs"),
       }
     },
@@ -1137,25 +1141,27 @@ pub fn crossing_root(module: Bytes, ctors: Ctors, key: RootKey) -> WrittenRoot /
 fn unwritten(module: Bytes, key: RootKey, why: Bytes) -> WrittenRoot / {abort.raise} =
   rooted_at(module, key, [], unit_type(), { code: Err(why), w: writing(), here: [] })
 
-/// The loop `op` a crossing runs over the items of a container of type `t`, where `op` names one:
-/// `lower_items` and `lower_entries` over a list's items or a map's entries from an index,
-/// `lift_items` and `lift_entries` onto a list or a map so far for as many items as are left.
-fn crossing_loop(module: Bytes, op: Bytes, t: Type) -> Option<WrittenRoot> / {abort.raise} = {
-  let key = keys::written(Contained(op), t, module);
-  match item_of(t) {
+/// The loop `op` a crossing runs over the items of a container of type `t`, `marked` with its
+/// carried places, where `op` names one: `lower_items` and `lower_entries` over a list's items or a
+/// map's entries from an index, `lift_items` and `lift_entries` onto a list or a map so far for as
+/// many items as are left.
+fn crossing_loop(
+  module: Bytes,
+  op: Bytes,
+  t: Type,
+  marked: Type,
+) -> Option<WrittenRoot> / {abort.raise} = {
+  let key = marked_key(Contained(op), marked, module);
+  match item_of(marked) {
     None -> None,
     Some(item) -> if op == b"lower_items" {
-      Some(
-        rooted_at(module, key, [t, int_type()], unit_type(), items_lowered(module, key, t, item)),
-      )
+      Some(rooted_at(module, key, [t, int_type()], unit_type(), items_lowered(module, key, item)))
     } else if op == b"lower_entries" {
-      Some(
-        rooted_at(module, key, [t, int_type()], unit_type(), entries_lowered(module, key, t, item)),
-      )
+      Some(rooted_at(module, key, [t, int_type()], unit_type(), entries_lowered(module, key, item)))
     } else if op == b"lift_items" {
-      Some(rooted_at(module, key, [t, int_type()], t, items_lifted(module, key, t, item)))
+      Some(rooted_at(module, key, [t, int_type()], t, items_lifted(module, key, item)))
     } else if op == b"lift_entries" {
-      Some(rooted_at(module, key, [t, int_type()], t, entries_lifted(module, key, t)))
+      Some(rooted_at(module, key, [t, int_type()], t, entries_lifted(module, key, marked)))
     } else { None },
   }
 }
@@ -1238,8 +1244,13 @@ fn lowering_code(
         else_branch: unit_code(),
       }),
     );
+  let held = plain(ty);
+  let args_at = match held { TyCon(c) -> c.args, _ -> [] };
   match ty {
-    TyCon(c) -> if c.args.len() == 0 && c.name == b"Unit" {
+    TyCon(c) -> if c.name == b"^" && c.args.len() == 1 {
+      let carried = call_at(w, b"?out_carried", [a], [held]);
+      { code: Ok(carried.code), w: carried.w, here: [] }
+    } else if c.args.len() == 0 && c.name == b"Unit" {
       alone(native_call(b"?out_tag", [int_code(tag_unit())]))
     } else if c.args.len() == 0 && c.name == b"Bool" {
       alone(
@@ -1263,8 +1274,8 @@ fn lowering_code(
       alone(shared([native_call(b"?out_bytes", [a])]))
     } else if runtime_object(c.name) { alone(native_call(b"?out_handle", [a])) }
     else if c.name == b"List" && c.args.len() == 1 {
-      let n = call_at(w, b"List::len", [a], c.args);
-      let items = keys::written(Contained(b"lower_items"), ty, module);
+      let n = call_at(w, b"List::len", [a], args_at);
+      let items = marked_key(Contained(b"lower_items"), ty, module);
       {
         code: Ok(
           shared([
@@ -1273,14 +1284,14 @@ fn lowering_code(
           ]),
         ),
         w: n.w,
-        here: [def_of(module, items, [ty, int_type()], unit_type())],
+        here: [def_of(module, items, [held, int_type()], unit_type())],
       }
     } else if (c.name == b"Array" || c.name == b"Columns") && c.args.len() == 1 {
       // A `Columns` crosses as the array of its records the runtime reads it as.
       let listed = list_type(c.args.get(0));
-      let n = call_at(w, c.name.concat(b"::len"), [a], c.args);
-      let as_list = call_at(n.w, c.name.concat(b"::to_list"), [a], c.args);
-      let items = keys::written(Contained(b"lower_items"), listed, module);
+      let n = call_at(w, c.name.concat(b"::len"), [a], args_at);
+      let as_list = call_at(n.w, c.name.concat(b"::to_list"), [a], args_at);
+      let items = marked_key(Contained(b"lower_items"), listed, module);
       {
         code: Ok(
           shared([
@@ -1289,15 +1300,15 @@ fn lowering_code(
           ]),
         ),
         w: as_list.w,
-        here: [def_of(module, items, [listed, int_type()], unit_type())],
+        here: [def_of(module, items, [plain(listed), int_type()], unit_type())],
       }
     } else if c.name == b"Map" && c.args.len() == 2 {
       let entries = list_type(
         TyRecord([{ name: b"key", ty: c.args.get(0) }, { name: b"value", ty: c.args.get(1) }]),
       );
-      let n = call_at(w, b"Map::len", [a], c.args);
-      let listed = call_at(n.w, b"Map::entries", [a], c.args);
-      let each = keys::written(Contained(b"lower_entries"), entries, module);
+      let n = call_at(w, b"Map::len", [a], args_at);
+      let listed = call_at(n.w, b"Map::entries", [a], args_at);
+      let each = marked_key(Contained(b"lower_entries"), entries, module);
       {
         code: Ok(
           shared([
@@ -1306,7 +1317,7 @@ fn lowering_code(
           ]),
         ),
         w: listed.w,
-        here: [def_of(module, each, [entries, int_type()], unit_type())],
+        here: [def_of(module, each, [plain(entries), int_type()], unit_type())],
       }
     } else {
       match ctors.sums.get(c.name) {
@@ -1321,7 +1332,7 @@ fn lowering_code(
                 { pats: [], parts: [], w: acc.w },
                 |b: { pats: List<CodePattern>, parts: List<Code>, w: Writing }, j: Int| {
                   let name = b"x".concat(ascii_of_int(j));
-                  let binder = filing(b.w, filed_as(args.get(j), []));
+                  let binder = filing(b.w, filed_as(plain(args.get(j)), []));
                   let part = call_at(binder.w, b"?lower", [slot_code(name, acc.slot + j)], [
                     args.get(j),
                   ]);
@@ -1391,13 +1402,16 @@ fn lifting_code(
   ty: Type,
 ) -> { code: Result<Code, Bytes>, w: Writing, here: List<Def> } / {abort.raise} = {
   let w = writing();
+  let held = plain(ty);
+  let args_at = match held { TyCon(c) -> c.args, _ -> [] };
   let alone = |c: Code| { code: Ok(c), w: w, here: [] };
   let read_as = |name: Bytes| {
-    let r = call_at(w, name, [], [ty]);
+    let r = call_at(w, name, [], [held]);
     { code: Ok(r.code), w: r.w, here: [] }
   };
   match ty {
-    TyCon(c) -> if c.args.len() == 0 && c.name == b"Unit" {
+    TyCon(c) -> if c.name == b"^" && c.args.len() == 1 { read_as(b"?in_carried") }
+    else if c.args.len() == 0 && c.name == b"Unit" {
       alone(sequence([native_call(b"?in_tag", []), unit_code()]))
     } else if c.args.len() == 0 && c.name == b"Bool" {
       alone(binary_of(b"eq", native_call(b"?in_tag", []), int_code(tag_true())))
@@ -1439,8 +1453,8 @@ fn lifting_code(
     else if c.args.len() == 0 && c.name == b"Bytes" { read_as(b"?in_bytes") }
     else if runtime_object(c.name) { read_as(b"?in_handle") }
     else if c.name == b"List" && c.args.len() == 1 {
-      let empty = filing(w, filed_as(ty, []));
-      let items = keys::written(Contained(b"lift_items"), ty, module);
+      let empty = filing(w, filed_as(held, []));
+      let items = marked_key(Contained(b"lift_items"), ty, module);
       {
         code: Ok(
           call_of(module, items, [
@@ -1449,12 +1463,12 @@ fn lifting_code(
           ]),
         ),
         w: empty.w,
-        here: [def_of(module, items, [ty, int_type()], ty)],
+        here: [def_of(module, items, [held, int_type()], held)],
       }
     } else if (c.name == b"Array" || c.name == b"Columns") && c.args.len() == 1 {
       let listed = list_type(c.args.get(0));
-      let empty = filing(w, filed_as(listed, []));
-      let items = keys::written(Contained(b"lift_items"), listed, module);
+      let empty = filing(w, filed_as(plain(listed), []));
+      let items = marked_key(Contained(b"lift_items"), listed, module);
       let made = call_at(
         empty.w,
         c.name.concat(b"::of_list"),
@@ -1464,22 +1478,22 @@ fn lifting_code(
             native_call(b"?in_count", [int_code(tag_array())]),
           ]),
         ],
-        c.args,
+        args_at,
       );
       {
         code: Ok(made.code),
         w: made.w,
-        here: [def_of(module, items, [listed, int_type()], listed)],
+        here: [def_of(module, items, [plain(listed), int_type()], plain(listed))],
       }
     } else if c.name == b"Map" && c.args.len() == 2 {
-      let fresh = call_at(w, b"Map::new", [], c.args);
-      let each = keys::written(Contained(b"lift_entries"), ty, module);
+      let fresh = call_at(w, b"Map::new", [], args_at);
+      let each = marked_key(Contained(b"lift_entries"), ty, module);
       {
         code: Ok(
           call_of(module, each, [fresh.code, native_call(b"?in_count", [int_code(tag_map())])]),
         ),
         w: fresh.w,
-        here: [def_of(module, each, [ty, int_type()], ty)],
+        here: [def_of(module, each, [held, int_type()], held)],
       }
     } else {
       match ctors.sums.get(c.name) {
@@ -1497,7 +1511,7 @@ fn lifting_code(
                   { parts: b.parts.push(part.code), w: part.w }
                 },
               );
-              let ctor = filing(parts.w, filed_as(ty, []));
+              let ctor = filing(parts.w, filed_as(held, []));
               let named = { node: NVar({ name: sc.name, slot: None }), span: ctor.span };
               {
                 made: acc.made.push({
@@ -1534,8 +1548,8 @@ fn lifting_code(
         },
       }
     },
-    TyRecord(fs) -> record_lifted(ty, fs, w),
-    TyNominal(x) -> record_lifted(ty, x.fields, w),
+    TyRecord(fs) -> record_lifted(held, fs, w),
+    TyNominal(x) -> record_lifted(held, x.fields, w),
     TyFn(_) -> { code: Err(b"a function crossing back from the runtime"), w: w, here: [] },
     TyVar(_) -> { code: Err(b"a crossing at a type variable"), w: w, here: [] },
   }
@@ -1575,17 +1589,16 @@ fn record_lifted(
 }
 
 /// `lower_items#List<T>` over its parameters `a` and `i`: each item of `a` from place `i` on
-/// written at the items' type.
+/// written at the items' type, `item` with its carried places.
 fn items_lowered(
   module: Bytes,
   key: RootKey,
-  ty: Type,
   item: Type,
 ) -> { code: Result<Code, Bytes>, w: Writing, here: List<Def> } / {abort.raise} = {
   let a = slot_code(b"a", 0);
   let i = slot_code(b"i", 1);
-  let at = call_at(writing(), b"List::at", [a, i], [item]);
-  let binder = filing(at.w, filed_as(item, []));
+  let at = call_at(writing(), b"List::at", [a, i], [plain(item)]);
+  let binder = filing(at.w, filed_as(plain(item), []));
   let part = call_at(binder.w, b"?lower", [slot_code(b"x", 2)], [item]);
   {
     code: Ok(
@@ -1604,17 +1617,16 @@ fn items_lowered(
 }
 
 /// `lower_entries#List<{key, value}>` over its parameters `es` and `i`: each entry of `es` from
-/// place `i` on, its key and then its value, each at its own type.
+/// place `i` on, its key and then its value, each at its own type, `entry` with its carried places.
 fn entries_lowered(
   module: Bytes,
   key: RootKey,
-  ty: Type,
   entry: Type,
 ) -> { code: Result<Code, Bytes>, w: Writing, here: List<Def> } / {abort.raise} = {
   let es = slot_code(b"es", 0);
   let i = slot_code(b"i", 1);
-  let at = call_at(writing(), b"List::at", [es, i], [entry]);
-  let binder = filing(at.w, filed_as(entry, []));
+  let at = call_at(writing(), b"List::at", [es, i], [plain(entry)]);
+  let binder = filing(at.w, filed_as(plain(entry), []));
   let e = slot_code(b"e", 2);
   let k = call_at(binder.w, b"?lower", [bare(NField({ base: e, field: b"key" }))], [
     field_of(entry, b"key"),
@@ -1638,17 +1650,17 @@ fn entries_lowered(
   }
 }
 
-/// `lift_items#List<T>` over its parameters `acc` and `n`: `n` more items read onto `acc`.
+/// `lift_items#List<T>` over its parameters `acc` and `n`: `n` more items read onto `acc`, `item`
+/// with its carried places.
 fn items_lifted(
   module: Bytes,
   key: RootKey,
-  ty: Type,
   item: Type,
 ) -> { code: Result<Code, Bytes>, w: Writing, here: List<Def> } / {abort.raise} = {
   let acc = slot_code(b"acc", 0);
   let n = slot_code(b"n", 1);
   let x = call_at(writing(), b"?lift", [], [item]);
-  let pushed = call_at(x.w, b"List::push", [acc, x.code], [item]);
+  let pushed = call_at(x.w, b"List::push", [acc, x.code], [plain(item)]);
   {
     code: Ok(
       bare(
@@ -1665,7 +1677,7 @@ fn items_lifted(
 }
 
 /// `lift_entries#Map<K, V>` over its parameters `m` and `n`: `n` more entries read into `m`, each a
-/// key and then its value.
+/// key and then its value, `ty` with its carried places.
 fn entries_lifted(
   module: Bytes,
   key: RootKey,
@@ -1676,7 +1688,7 @@ fn entries_lifted(
   let n = slot_code(b"n", 1);
   let k = call_at(writing(), b"?lift", [], [args.get(0)]);
   let v = call_at(k.w, b"?lift", [], [args.get(1)]);
-  let inserted = call_at(v.w, b"Map::insert", [m, k.code, v.code], args);
+  let inserted = call_at(v.w, b"Map::insert", [m, k.code, v.code], args.map(plain));
   {
     code: Ok(
       bare(
