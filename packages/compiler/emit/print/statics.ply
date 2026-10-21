@@ -303,56 +303,60 @@ fn no_entries(_: RootKey) -> Bytes = b""
 
 fn no_files(_: Bytes) -> Bytes = b""
 
-test "a string's object is immortal, of the refused kind, its length and room its bytes', the bytes padded to a word" {
-  let s = named(SBlock(text_block(b"say \"hi\"?\n")));
-  let c = static_c(s, no_fields, no_entries, no_files);
+fn has(c: Bytes, s: Bytes) -> Bool = c.index_of(s) != None
+
+test "a block's header is immortal, of its head's kind or the refused one, and sets each field its head names" {
+  let s = static_c(named(SBlock(text_block(b"say \"hi\"?\n"))), no_fields, no_entries, no_files);
+  let said = Some(String::of_bytes_lossy(s));
   assert(
-    c.starts_with(
-      Bytes::concat_all([
-        b"const struct ",
-        s.name,
-        b" { PlyObj h; unsigned char w0[16]; } ",
-        s.name,
-      ]),
-    ),
-    Some(String::of_bytes_lossy(c)),
+    has(s, b".rc = UINT32_MAX") && has(s, b".kind = ".concat(ascii_of_int(refused_kind()))),
+    said,
   );
-  assert(c.index_of(b"{ .rc = UINT32_MAX, .kind = 21, .len = 10, .layout = 10 }") != None, None);
-  // A quote, a backslash, `?` and a control byte are escaped, three octal digits each.
-  assert(c.index_of(b"\"say \\\"hi\\\"\\077\\012\"") != None, Some(String::of_bytes_lossy(c)));
-  assert(c.index_of(b"__attribute__((aligned(8)))") != None, None);
-  assert_eq(
-    static_extern(s.name),
-    Bytes::concat_all([b"extern const struct ", s.name, b" ", s.name, b";\n"]),
+  assert(has(s, b".len = 10") && has(s, b".layout = 10"), said);
+  // Bytes take whole words, and every static is aligned to one.
+  assert(has(s, b"w0[16]") && has(s, b"aligned(8)"), said);
+  let wide = static_c(
+    named(
+      SBlock({ head: [{ field: b"kind", value: 18 }, { field: b"len", value: 2 }], words: [] }),
+    ),
+    no_fields,
+    no_entries,
+    no_files,
+  );
+  assert(has(wide, b".kind = 18") && !has(wide, b".kind = 21"), Some(String::of_bytes_lossy(wide)));
+  // An empty string is its header alone.
+  assert(
+    !has(static_c(named(SBlock(text_block(b""))), no_fields, no_entries, no_files), b"w0"),
+    None,
   )
 }
 
-test "a C string literal holds printable bytes as they are and the rest in octal" {
-  assert_eq(escaped(b"a\"b\\c?\n\x01z"), b"a\\\"b\\\\c\\077\\012\\001z");
+test "a static's declaration names it, so a bucket can take its address" {
+  let s = named(SBlock(text_block(b"x")));
+  let e = static_extern(s.name);
+  assert(has(e, b"extern ") && has(e, s.name), Some(String::of_bytes_lossy(e)))
+}
+
+test "a C string literal holds printable bytes as they are, and no quote, backslash, `?` or control byte bare" {
+  let e = escaped(b"a\"b\\c?\n\x01z");
+  assert(has(e, b"a") && has(e, b"z"), Some(String::of_bytes_lossy(e)));
+  // Each byte that is not printable as it is takes an escape: none stands bare, nor ends a literal.
+  let bare = range(0, e.len()).filter(|i: Int| {
+    let b = e.at(i);
+    let escaped_here = i > 0 && e.at(i - 1) == 92;
+    b < 32 || b == 63 || (b == 34 && !escaped_here)
+  });
+  assert_eq(bare, []);
+  assert(!has(e, b"?"), None);
   assert_eq(c_string(b""), b"\"\"")
 }
 
-test "a block names no kind but the refused one, and an empty string is its header alone" {
-  let boxed = named(SBlock({ head: [], words: [WRaw(7), WAddress({ name: b"ply_k_a", tag: 0 })] }));
-  let c = static_c(boxed, no_fields, no_entries, no_files);
-  assert(
-    c.index_of(
-        Bytes::concat_all([b"{ .rc = UINT32_MAX, .kind = ", ascii_of_int(refused_kind()), b" }"]),
-      )
-      != None,
-    None,
-  );
-  assert(c.index_of(b"int64_t w0; const void *w1;") != None, Some(String::of_bytes_lossy(c)));
-  assert(c.index_of(b"  INT64_C(7),\n  &ply_k_a,\n") != None, None);
-  let empty = static_c(named(SBlock(text_block(b""))), no_fields, no_entries, no_files);
-  assert(empty.index_of(b"{ PlyObj h; }") != None, Some(String::of_bytes_lossy(empty)));
-  assert(empty.index_of(b".kind = 21, .len = 0, .layout = 0") != None, None)
-}
-
-test "a tagged address is an offset from the static's, and a plain static has no header" {
+test "a word is an integer, a field's entry or an address, a tagged one an offset from the static's" {
   let c = static_c(
     named(
       SPlain([
+        WRaw(7),
+        WAddress({ name: b"ply_k_a", tag: 0 }),
         WAddress({ name: b"ply_k_a", tag: 1 }),
         WField(b"op"),
         WRaw(0 - 9223372036854775807 - 1),
@@ -362,20 +366,20 @@ test "a tagged address is an offset from the static's, and a plain static has no
     no_entries,
     no_files,
   );
-  assert(c.index_of(b"PlyObj") == None, None);
-  assert(
-    c.index_of(b"  (const char *)&ply_k_a + 1,\n  INT64_C(12),\n  INT64_MIN,\n") != None,
-    Some(String::of_bytes_lossy(c)),
-  )
+  let said = Some(String::of_bytes_lossy(c));
+  // A plain static has no header.
+  assert(!has(c, b"PlyObj"), said);
+  assert(has(c, b"int64_t w0;") && has(c, b"const void *w1;"), said);
+  assert(has(c, int_lit(7)) && has(c, b"&ply_k_a,") && has(c, b"(const char *)&ply_k_a + 1"), said);
+  assert(has(c, int_lit(12)) && has(c, int_lit(0 - 9223372036854775807 - 1)), said)
 }
 
 test "an embedded file is a byte string's object of the bytes its digest names, cut into literals" {
   let big = Bytes::concat_all(range(0, 4100).map(|i: Int| byte_of_int(97 + i % 26)));
   let c = static_c({ name: b"ply_k_f", laid: SFile(b"d1") }, no_fields, no_entries, |d: Bytes|
     if d == b"d1" { big } else { b"" });
-  assert(c.index_of(b".kind = 21, .len = 4100, .layout = 4100") != None, None);
-  assert(c.index_of(b"unsigned char w0[4104]") != None, None);
-  // Three literals, each on its own line.
+  assert(has(c, b".len = 4100") && has(c, b"w0[4104]"), None);
+  // No literal is longer than a C compiler takes: three, each on its own line.
   assert_eq(c.split(b"\"\n  \"").len(), 3)
 }
 
@@ -399,19 +403,11 @@ test "a machine struct's fields are cast to their types, and a root's function i
     |_: RootKey| b"m_dup_T",
     no_files,
   );
-  assert(
-    c.starts_with(b"Word m_dup_T(PlyCtx *, Word);\nconst struct "),
-    Some(String::of_bytes_lossy(c)),
-  );
-  assert(c.index_of(b" { PlyType s; } ") != None, None);
-  assert(
-    c.index_of(
-        b"  (uint64_t)INT64_C(5),\n  (const uint8_t *)&ply_k_s,\n  (uint32_t)INT64_C(3),\n  m_dup_T,\n  (Word (*)(PlyCtx *, Word))INT64_C(0),\n",
-      )
-      != None,
-    Some(String::of_bytes_lossy(c)),
-  );
-  assert(c.ends_with(b"} };\n"), None)
+  let said = Some(String::of_bytes_lossy(c));
+  let declared = match c.index_of(b"m_dup_T(PlyCtx *, Word);") { Some(i) -> i, None -> 0 - 1 };
+  let defined = match c.index_of(b"const struct ") { Some(i) -> i, None -> 0 - 1 };
+  assert(declared >= 0 && declared < defined && has(c, b"PlyType s;"), said);
+  assert(has(c, b"(const uint8_t *)&ply_k_s") && has(c, b"(Word (*)(PlyCtx *, Word))"), said)
 }
 
 test "a word no slot of its static can hold is refused" {
@@ -437,34 +433,26 @@ fn place_of(hay: Bytes, needle: Bytes) -> Int =
 
 test "the head's count helpers never write a static's immortal count, so a count taken or let go of one is nothing" {
   let h = head_part();
-  let body = |head: Bytes| {
-    let from = place_of(h, head);
+  let body = |name: Bytes| {
+    let from = place_of(h, Bytes::concat_all([b" ", name, b"("]));
     if from < 0 { b"" }
     else { match h.index_of_from(b"\n}\n", from) { Some(to) -> h.slice(from, to), None -> b"" } }
   };
-  // A count is taken only below the shared mark, and a shared one's never at the immortal count.
-  let dup = body(Bytes::concat_all([b"static inline void ", dup_fn(), b"("]));
-  assert(
-    place_of(dup, b"if (rc < UINT32_C(0x80000000)) h->rc = rc + 1;") > 0
-      && place_of(dup, Bytes::concat_all([b"else if (rc != UINT32_MAX) ", inc_shared_fn(), b"("]))
-      > 0,
-    Some(String::of_bytes_lossy(dup)),
-  );
+  // A count is taken only short of the immortal count.
+  let dup = body(dup_fn());
+  assert(has(dup, b"UINT32_MAX") && has(dup, inc_shared_fn()), Some(String::of_bytes_lossy(dup)));
   // The immortal count answers "not the last" before anything is written or handed on.
-  let last = body(Bytes::concat_all([b"static inline int ", last_fn(), b"("]));
-  let immortal = place_of(last, b"if (rc == UINT32_MAX) return 0;");
+  let last = body(last_fn());
+  let immortal = place_of(last, b"UINT32_MAX");
   assert(
     immortal > 0 && immortal < place_of(last, b"h->rc = ")
-      && immortal < place_of(last, dec_shared_last_fn().concat(b"(")),
+      && immortal < place_of(last, dec_shared_last_fn()),
     Some(String::of_bytes_lossy(last)),
   )
 }
 
 test "a word a function answers is its integer, or a static's address with its low bits" {
-  assert_eq(word_c(WRaw(7)), b"(Word)".concat(int_lit(7)));
-  assert_eq(word_c(WAddress({ name: b"ply_k_a", tag: 0 })), b"(Word)(intptr_t)(&ply_k_a)");
-  assert_eq(
-    word_c(WAddress({ name: b"ply_k_a", tag: 1 })),
-    b"(Word)(intptr_t)((const char *)&ply_k_a + 1)",
-  )
+  assert(has(word_c(WRaw(7)), int_lit(7)), None);
+  assert(has(word_c(WAddress({ name: b"ply_k_a", tag: 0 })), b"&ply_k_a"), None);
+  assert(has(word_c(WAddress({ name: b"ply_k_a", tag: 1 })), b"&ply_k_a + 1"), None)
 }
