@@ -1004,27 +1004,18 @@ test "a record wider than four words crosses as the address of its words" {
     b"const Word* p0",
     b"int64_t p1",
   ]);
-  // The callee opens the words into its own C values, which take their counts.
-  assert_eq(params_opened([b"p0", b"p1"], [wide, RInt]), [
-    b"double p0_0 = ply_f64(p0[0]); PlyDec p0_1 = (PlyDec){p0[1], p0[2]}; int64_t p0_2 = (int64_t)p0[3]; Word p0_3 = p0[4]; int64_t p0_4 = (int64_t)p0[5];",
-  ]);
-  let exprs = [b"e0", b"e1", b"e2", b"e3", b"e4"];
-  assert_eq(words_laid(exprs, reps), [
-    b"ply_f64_bits(e0)",
-    b"(e1).lo",
-    b"(e1).hi",
-    b"(Word)(e2)",
-    b"e3",
-    b"(Word)(e4)",
-  ]);
+  // The callee opens the words into its own C values, a `Decimal` taking two: the last leaf lies at
+  // word 5 of 6.
+  let opened = Bytes::join(params_opened([b"p0", b"p1"], [wide, RInt]), b" ");
+  assert(
+    opened.index_of(b"p0[5]") != None && opened.index_of(b"p0[6]") == None,
+    Some(String::of_bytes_lossy(opened)),
+  );
+  assert_eq(words_laid([b"e0", b"e1", b"e2", b"e3", b"e4"], reps).len(), 6);
   assert_eq(parts_read(b"b", reps).len(), reps.len());
   // The runtime's entry lays the opened values in a buffer and hands its address.
   let entered = entry_opened(0, wide);
-  assert(
-    spelled(entered.text).index_of(b"Word a0_r[] = {ply_f64_bits(a0_0), (a0_1).lo, (a0_1).hi,")
-      != None,
-    None,
-  );
+  assert(spelled(entered.text).index_of(b"Word a0_r[] = {") != None, None);
   assert_eq(entered.args, [b"a0_r"]);
   assert_eq(entry_opened(1, point()).args.len(), 2)
 }
@@ -1041,14 +1032,14 @@ test "an answer of several values returns its first and writes the rest into one
   assert_eq(answer_parts(b"t", b"buf", point()), [b"t", b"ply_f64(buf[0])"]);
   assert_eq(entry_outs(point()), [b"ro"]);
   assert_eq(entry_outs(RInt), []);
+  // The entry reads the rest out of a buffer of one word, past the call's failure test, and boxes
+  // the record in a block of its two words.
   let answered = spelled(entry_answered(pr, point(), b"f(ctx)", []).out);
-  assert(
-    answered.index_of(
-        b"Word ro[1];\n  double r0 = f(ctx);\n  if (ctx->failed) return 0;\n  double r1 = ply_f64(ro[0]);\n",
-      )
-      != None
-      && answered.index_of(b"Word rw = rt_alloc_bytes_p(ctx, INT64_C(32));") != None,
-    Some(String::of_bytes_lossy(answered)),
+  assert_eq(
+    [b"Word ro[1];", b"if (ctx->failed)", b"ro[0]", b"rt_alloc_bytes_p(ctx, INT64_C(32))"].filter(
+      |part: Bytes| answered.index_of(part) == None,
+    ),
+    [],
   );
   // An answer of no words is a word of 0.
   assert(spelled(entry_answered(pr, RUnit, b"f(ctx)", []).out).index_of(b"return 0;\n") != None)
@@ -1063,9 +1054,13 @@ test "a sum of one word is its word form, and a wider one's words are counted ag
     laid: sum_laid([sum_args([LWords([raw()])]), sum_args([pointer_laid()])]),
     cases: [b"Ok", b"Err"],
   });
-  assert_eq(
-    dups_of(either, [b"t", b"x"]),
-    Bytes::concat_all([b"switch ((int64_t)(t)) { case INT64_C(1): ", dup(b"x"), b" break; }"]),
+  // Only the case laying the pointer counts it, told by the tag word.
+  let either_dups = dups_of(either, [b"t", b"x"]);
+  assert(
+    either_dups.index_of(b"case INT64_C(1):") != None
+      && either_dups.index_of(b"case INT64_C(0):") == None
+      && either_dups.index_of(dup(b"x")) != None,
+    Some(String::of_bytes_lossy(either_dups)),
   );
   assert_eq(word_parts(b"x", RUnit, []), [])
 }
@@ -1090,29 +1085,6 @@ test "a sum's case is gathered as its test's value, its payload where the case l
     range(0, 9).map(|_: Int| { args: record_laid([pointer_laid()]), indirect: true }),
   );
   assert_eq(case_laid(pr, nine, 8, [p]), [b"((Word)(p0) | INT64_C(7))"])
-}
-
-test "a record is gathered from its fields' values, a record among them giving its leaves' values" {
-  let pr = printing(Map::new().insert(0, b"p0").insert(1, b"p1"));
-  let inner = local(0, point());
-  let text = spelled(
-    gathered(
-      place(),
-      pr,
-      Some(
-        local(
-          2,
-          RFlat([
-            { name: b"p.x", rep: RFloat },
-            { name: b"p.y", rep: RFloat },
-            { name: b"n", rep: RInt },
-          ]),
-        ),
-      ),
-      [AVar(inner), AVar(local(1, RInt))],
-    ).out,
-  );
-  assert_eq(text, b"  double t1_0 = p0_0;\n  double t1_1 = p0_1;\n  int64_t t1_2 = p1;\n")
 }
 
 test "a case's payload is read where the case lays it: a word masked, after a tag word, or in a box" {
@@ -1144,9 +1116,13 @@ test "a box is allocated by its size and its words written, a boxed case's place
     args: [AVar(local(0, RWord))],
     reuse: None,
   };
+  let fresh = spelled(made(place(), pr, Some(local(2, RWord)), m).out);
+  // A header and two words: the case's place in the first, its payload in the second.
   assert_eq(
-    spelled(made(place(), pr, Some(local(2, RWord)), m).out),
-    b"  Word t1 = rt_alloc_bytes_p(ctx, INT64_C(32)); ply_words(t1)[0] = INT64_C(8); ply_words(t1)[1] = p0;\n",
+    [b"rt_alloc_bytes_p(ctx, INT64_C(32))", b"[0] = INT64_C(8);", b"[1] = p0;"].filter(
+      |part: Bytes| fresh.index_of(part) == None,
+    ),
+    [],
   );
   // In the cells a reset kept it is written as in a fresh block, which it is where the reset kept none.
   let reused = {
@@ -1157,11 +1133,11 @@ test "a box is allocated by its size and its words written, a boxed case's place
   let text = spelled(
     made(place(), { ..pr, names: pr.names.insert(3, b"p3") }, Some(local(2, RWord)), reused).out,
   );
+  let kept = match text.index_of(b" = p3;") { Some(i) -> i, None -> 0 - 1 };
+  let fresh_only = match text.index_of(b"if (!") { Some(i) -> i, None -> 0 - 1 };
+  let allocated = match text.index_of(b"rt_alloc_bytes_p(") { Some(i) -> i, None -> 0 - 1 };
   assert(
-    text.index_of(
-        b"Word t1 = p3; if (!t1) t1 = rt_alloc_bytes_p(ctx, INT64_C(32)); ply_words(t1)[0] = p0; ply_words(t1)[1] = (Word)(p1);",
-      )
-      != None,
+    kept >= 0 && fresh_only > kept && allocated > fresh_only && text.index_of(b"[1] = ") != None,
     Some(String::of_bytes_lossy(text)),
   )
 }

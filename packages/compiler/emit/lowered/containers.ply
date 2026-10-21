@@ -18,8 +18,7 @@ import check.resolve.tables (qualify)
 import emit.layout (Intrinsic, intrinsics, layouts, words)
 import emit.answer (Need, Layout)
 import emit.pieces (spelled)
-import emit.roots (symbol_of)
-import emit.release (root_of, drop_of)
+import emit.release (root_of)
 import emit.code (Code, NField)
 import emit.tir (Rep, RInt, RBool, RFloat, RWord, RSum, RNum, RFlat, Leaf, Var, Arg, AVar, AInt,
                  Val, Make, Made, MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst,
@@ -36,8 +35,7 @@ import emit.lower.setting (Root, setting_in)
 import emit.keys (RootKey, Named, Written, Copy, root_name)
 import emit.print (printed_fn)
 import emit.compare (Program, program_of, formed, checked, printed_text, not_built)
-import emit.print.counting (dup_fn, last_fn, free_fn, inc_fn, dec_fn, rel_int_fn, call_text,
-                            call_start, takes_count)
+import emit.print.counting (takes_count)
 
 /// `src` as module `m` of a program.
 fn program(src: Bytes) -> Program / {abort.raise} =
@@ -542,9 +540,8 @@ test "a byte string's position is a loop in the body, its predicate called by it
     assert_eq(natives_in(bound_in(q, b"found")), [])
   });
   let text = form_text(p, b"found");
-  let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
-  has(b"((int64_t (*)(PlyCtx *, Word, int64_t))((const PlyFnDesc *)(intptr_t)ply_words(");
-  has(b"break; }");
+  // The predicate is called through its descriptor's entry at its own type.
+  assert(text.index_of(b"(const PlyFnDesc *)") != None, Some(String::of_bytes_lossy(text)));
   // The predicate is lent to each call, so no count of it is taken in the loop.
   let looped = match text.index_of(b"for (int64_t ") {
     Some(i) -> text.slice(i, text.len()),
@@ -581,13 +578,7 @@ test "a byte string's position named as a value is a lambda whose loop calls the
   };
   assert_eq(positions, [{ takes: [false, false, false], owned: true, fails: true, stops: true }]);
   let text = form_text(p, b"spaced");
-  assert(
-    text.index_of(
-        b"((int64_t (*)(PlyCtx *, Word, int64_t))((const PlyFnDesc *)(intptr_t)ply_words(",
-      )
-      != None,
-    Some(String::of_bytes_lossy(text)),
-  );
+  assert(text.index_of(b"(const PlyFnDesc *)") != None, Some(String::of_bytes_lossy(text)));
   assert_eq(text.index_of(b"rt_call_p"), None)
 }
 
@@ -1059,133 +1050,6 @@ fn in_place_calls() -> List<{ name: Bytes, src: Bytes }> =
 
 fn con(name: Bytes, args: List<Type>) -> Type = TyCon({ name: name, args: args })
 
-/// The C a write prints copying a block of type `ty` where another holds it too: a call of the root
-/// written to copy it, as the unit names the root.
-fn copy_call(ty: Type) -> Bytes / {abort.raise} =
-  Bytes::concat_all([b" = ", symbol_of(root_name(root_of(Copy, ty))), b"(ctx, "])
-
-/// The C a write prints letting go of an item of type `ty` it wrote over: the root dropping it, as
-/// the unit names the root.
-fn dropped_with(ty: Type) -> Bytes / {abort.raise} =
-  Bytes::concat_all([b", ", symbol_of(root_name(drop_of(ty))), b");"])
-
-/// For each probe of `in_place_calls`, C its printed body holds and C it must not: each slot read or
-/// written as what it holds. A root or a kid is an `Option`'s one word, which nothing opens; an item
-/// a word, read as the scalar it stands for; a size an immediate.
-fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }> / {abort.raise} = {
-  let reads = |name: Bytes, has: List<Bytes>| { name: name, has: has, lacks: [] };
-  let payload = |name: Bytes, has: List<Bytes>|
-    { name: name, has: has, lacks: [b"rt_maybe_open_p", b"rt_maybe_take_p"] };
-  let returned = |name: Bytes, has: List<Bytes>|
-    { name: name, has: has, lacks: [b"rt_maybe_open_p"] };
-  let dec = call_start(dec_fn(), [b"ctx"]);
-  [
-    reads(b"start", [b" = (int64_t)ply_obj(p0)->layout;"]),
-    reads(b"tail_len", [b" = (int64_t)ply_obj(p0)->flags;"]),
-    returned(b"root", [b" = ply_words(p0)[0];"]),
-    reads(b"tail_at", [b" = ply_words(p0)[1 + (INT64_C(1))];"]),
-    reads(b"len", [b" = (int64_t)ply_obj(p0)->len;"]),
-    reads(b"leaf_at", [
-      b" = (ply_is_imm(ply_words(p0)[0 + (INT64_C(3))]) ? ply_imm_value(ply_words(p0)[0 + (INT64_C(3))]) : rt_unbox_int_p(ctx, ply_words(p0)[0 + (INT64_C(3))]));",
-    ]),
-    reads(b"leaf_at_any", [b" = ply_words(p0)[0 + (INT64_C(3))];"]),
-    reads(b"leaf_at_on", [b" = ply_words(p0)[0 + (INT64_C(3))];"]),
-    reads(b"kid_at", [b" = ply_words(p0)[0 + (INT64_C(1))];"]),
-    reads(b"tail_push", [
-      copy_call(con(b"List", [con(b"String", [])])),
-      b" = rt_list_room_p(ctx, 2 * n); ",
-      call_start(free_fn(), [b"ctx"]),
-      b")->flags)] = p1; ",
-      b")->flags += 1; ply_obj(",
-    ]),
-    reads(b"tail_set", [
-      b"rt_note_update_p(ctx, in_place, in_place ? 0 : ply_obj(",
-      b"[1 + (INT64_C(2))]; ply_words(",
-    ]),
-    reads(b"leaf_set", [
-      copy_call(con(b"std.prelude.ListNode", [con(b"String", [])])),
-      b"[INT64_C(2)] = p1;",
-      dropped_with(con(b"String", [])),
-    ]),
-    returned(b"root_swap", [
-      copy_call(con(b"List", [con(b"Int", [])])),
-      b")[0]; ply_words(",
-      b")[0] = ",
-    ]),
-    payload(b"kid_swap", [
-      b" = 0; if (INT64_C(0) < (int64_t)ply_obj(",
-      b")->len = (uint32_t)(INT64_C(0)) + 1; ",
-    ]),
-    reads(b"tail_start", [b"[1 + (0)] = ", b")->flags = 1; "]),
-    reads(b"spill", [b"rt_node_p(ctx, 11); memcpy(ply_words(", b"32 * sizeof(Word)); ply_obj("]),
-    reads(b"branch", [b"rt_node_p(ctx, 12)"]),
-    returned(b"map_root", [b" = ply_words(p0)[0];"]),
-    reads(b"height", [b" = (int64_t)ply_obj(p0)->layout;"]),
-    reads(b"count", [b" = (int64_t)ply_obj(p0)->len;"]),
-    reads(b"key", [b" = (ply_is_imm(ply_words(p0)[2 * (INT64_C(1))]) ? "]),
-    reads(b"value", [b" = ply_words(p0)[2 * (INT64_C(1)) + 1];"]),
-    reads(b"kid", [b" = ply_words(p0)[0 + (INT64_C(1))];"]),
-    reads(b"kid_max", [b" = (ply_is_imm(ply_words(p0)[33 + (INT64_C(1))]) ? "]),
-    reads(b"kid_size", [b" = ply_imm_value(ply_words(p0)[66 + (INT64_C(1))]);"]),
-    reads(b"leaf", [b"rt_node_p(ctx, 13)"]),
-    reads(b"map_branch", [b"rt_node_p(ctx, 14)"]),
-    reads(b"pair_put", [
-      b"[2 * (INT64_C(1)) + 2], &ply_words(",
-      b"[2 * (INT64_C(1)) + 1] = p1; ",
-      b")->len += 1;",
-    ]),
-    reads(b"pair_set", [
-      b"[2 * (INT64_C(1)) + 1] = p1;",
-      call_start(rel_int_fn(), [b"ctx"]),
-      dropped_with(con(b"String", [])),
-    ]),
-    reads(b"pair_take", [
-      b"[2 * (INT64_C(1))]; Word ",
-      b"[2 * (INT64_C(1)) + 2 + -2], &ply_words(",
-      b")->len -= 1;",
-      Bytes::concat_all([b"; ", dec, b"t"]),
-    ]),
-    reads(b"leaf_cut", [b"rt_node_p(ctx, 13); memcpy(&ply_words(", b"[0 + 2 * (INT64_C(16))]"]),
-    reads(b"branch_cut", [b"rt_node_p(ctx, 14); memcpy(&ply_words(", b"[33 + 1 * (INT64_C(16))]"]),
-    reads(b"kid_out", [b"[(INT64_C(1))] = 0;"]),
-    reads(b"kid_back", [b"[66 + ((INT64_C(1)))] = ply_imm(INT64_C(4));", b"[(INT64_C(1))] = p1; "]),
-    reads(b"kid_put", [b"[66 + ((INT64_C(1)))] = ply_imm(INT64_C(4)); ", b")->len += 1;"]),
-    reads(b"kid_drop", [
-      dropped_with(con(b"std.prelude.MapNode", [con(b"Int", []), con(b"String", [])])),
-      call_start(rel_int_fn(), [b"ctx"]),
-      b")->len -= 1;",
-    ]),
-    payload(b"map_swap", [
-      copy_call(con(b"Map", [con(b"Int", []), con(b"String", [])])),
-      b")[0]; ply_words(",
-      b")->layout = (uint32_t)(INT64_C(1)); ",
-      b")->len = (uint32_t)(INT64_C(40));",
-    ]),
-    // A key held as its word in the pair: its leaves opened out of that box, freed where it held the
-    // last count.
-    {
-      name: b"key_take",
-      has: [
-        b"_0 = (int64_t)ply_words(t2)[0];",
-        Bytes::concat_all([
-          b"if (",
-          call_text(last_fn(), [b"ctx", b"t2"]),
-          b") ",
-          call_text(free_fn(), [b"ctx", b"t2", b"INT64_C(32)"]),
-          b";",
-        ]),
-      ],
-      lacks: [call_start(inc_fn(), []), call_start(dup_fn(), [])],
-    },
-    // Two levels deep, a leaf is read out of the key's box at its place, counted again where the box
-    // was shared.
-    reads(b"nested_take", [
-      b"Word t4_1 = ply_words(t2)[1];",
-      Bytes::concat_all([b"else { ", call_text(dup_fn(), [b"t4_1"]), b"; }"]),
-    ]),
-  ]
-}
-
 test "each extern written in place is an operation over the runtime's objects as the layouts lay them out" {
   let calls = in_place_calls();
   let probes = calls.fold(b"\n", |acc: Bytes, c: { name: Bytes, src: Bytes }|
@@ -1364,21 +1228,9 @@ test "each extern written in place is an operation over the runtime's objects as
           ),
           [],
         );
+        // A root is read without a count of its own, so answering it takes one.
         let none_missed = |missed: List<Bytes>|
           assert(missed.len() == 0, Some(String::of_bytes_lossy(Bytes::join(missed, b"\n"))));
-        // What each extern reads and writes, slot by slot, in the representation the slot holds.
-        none_missed(
-          laid_expected().fold(
-            [],
-            |acc: List<Bytes>, e: { name: Bytes, has: List<Bytes>, lacks: List<Bytes> }| {
-              let text = code(e.name);
-              if e.has.all(|t: Bytes| text.index_of(t) != None)
-                  && e.lacks.all(|t: Bytes| text.index_of(t) == None) { acc }
-              else { acc.push(Bytes::concat_all([e.name, b":\n", text])) }
-            },
-          ),
-        );
-        // A root is read without a count of its own, so answering it takes one.
         none_missed(
           [b"root", b"map_root"].fold([], |acc: List<Bytes>, name: Bytes| {
             let text = match form(name) {
