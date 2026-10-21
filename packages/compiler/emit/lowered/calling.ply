@@ -5,19 +5,20 @@ import check.resolve.tables (qualify)
 import check.infer.checker (test_owner, law_root)
 import check.types (Type, TyCon, int_type)
 import emit.keys (RootKey, FnArg, Named, Root, Generic, at_key, root_name)
-import emit.reps (filings_at, BoundLambda)
+import emit.reps (filings_at, BoundLambda, has_vars)
 import emit.typing (no_filings, unknown_type)
 import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSum, RSlice, Var, Arg, AVar, AInt, Val,
                  Call, Apply, Make, Get, Pack, Gathered, Prim, Native, Op, OCalling, MClosure,
                  MCtor, PCapture, TTag, Inst, Let, Do, If, Case, Match, Loop, Next, Done, Restart,
                  Enter, Return, Sited, Block, Fn, Member, Closure, Declined, Family, Spine, Data,
                  Calling, Matching, Handling, Scalars, Containers, RNum, TInt, TRange, Convention,
-                 Lambda, rep_of_arg)
+                 Lambda, Lent, rep_of_arg)
 import emit.tir.calling (ConstantRead, Ticked)
 import emit.lower (lowered_fn, lowered_group)
 import emit.lower.base (GroupMember)
 import emit.lower.calling (known_body, lambdas_of, context_of)
-import emit.answer (GenericCall)
+import emit.answer (GenericCall, settled_by_callers)
+import emit.entry (built_form)
 import emit.own (owned)
 import emit.roots (symbol_of)
 import emit.compare (Program, program_of, printed_text, unbuilt, answered_by_form)
@@ -98,6 +99,9 @@ fn corpus() -> Bytes =
     b"fn hue_next(h: Hue) -> Hue = match h { Red -> Green, Green -> Blue, Blue -> Red }\n",
     b"fn hue_twice(h: Hue) -> Hue = hue_next(hue_next(h))\n",
     b"fn some_of() -> (Int) -> Option<Int> = Some\n",
+    b"fn held(n: Int) -> Int = with_hold[file](n, |x: Int| ()) { h -> h.get() + 1 }\n",
+    b"fn iterate_named(n: Int) -> Int / {abort.raise} = iterate(n, 100, step_of)\n",
+    b"fn iterate_by(n: Int) -> Int / {abort.raise} = { let by = |f: (Int, Int, (Int) -> Iter<Int, Int>) -> Int / {abort.raise}| f(n, 1000, step_of); by(iterate) }\n",
   ])
 
 fn names() -> List<Bytes> =
@@ -171,6 +175,9 @@ fn names() -> List<Bytes> =
     b"hue_next",
     b"hue_twice",
     b"some_of",
+    b"held",
+    b"iterate_named",
+    b"iterate_by",
   ]
 
 /// The corpus's tail groups, each by its members' names.
@@ -229,6 +236,25 @@ fn vals_in(b: Block) -> List<Val> =
       Match(m) ->
         m.arms.fold(acc, |a: List<Val>, arm: Block| a.concat(vals_in(arm))).concat(vals_in(m.rest)),
       Loop(l) -> acc.concat(vals_in(l.body)),
+      _ -> acc,
+    })
+
+/// Every variable `b` binds, its branches', cases', arms' and loops' too, in order.
+fn bound_in(b: Block) -> List<Var> =
+  b.fold([], |acc: List<Var>, i: Inst|
+    match i {
+      Let(l) -> acc.push(l.var),
+      If(x) -> acc.concat(bound_in(x.then)).concat(bound_in(x.otherwise)),
+      Case(c) ->
+        c.arms.fold(acc, |a: List<Var>, arm: { when: Int, body: Block }|
+          a.concat(bound_in(arm.body))).concat(
+          bound_in(c.rest),
+        ),
+      Match(m) ->
+        m.arms.fold(acc, |a: List<Var>, arm: Block| a.concat(bound_in(arm))).concat(
+          bound_in(m.rest),
+        ),
+      Loop(l) -> acc.concat(bound_in(l.body)),
       _ -> acc,
     })
 
@@ -540,6 +566,33 @@ test "a definition or a constructor named as a value is the closure of a lambda 
   }
 }
 
+test "a hold's closures and what its builtins answer are typed by the hold, so nothing it binds is of no known type" {
+  match form(b"held") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      let open = |b: Fn| b.params.concat(bound_in(b.body)).filter(|v: Var| has_vars(v.ty));
+      assert_eq(open(f), []);
+      assert_eq(
+        f.lambdas.map(|l: Lambda| match l { Closure(c) -> open(c.body) }),
+        f.lambdas.map(|_: Lambda| []),
+      );
+      // The close takes the hold the body takes.
+      let holds = f.lambdas.fold([], |acc: List<Type>, l: Lambda|
+        match l {
+          Closure(c) -> match c.body.params.drop(c.captures) {
+            [p] -> match p.ty {
+              TyCon(t) -> if t.name == b"Hold" { acc.push(p.ty) } else { acc },
+              _ -> acc,
+            },
+            _ -> acc,
+          },
+        });
+      assert_eq(holds.len(), 2);
+      assert_eq(holds.at(0), holds.at(1))
+    },
+  }
+}
+
 test "a lambda handed where its callee lends it lies on the caller's stack, and the call is settled with it" {
   match form(b"lends") {
     Err(why) -> assert_eq(why, b""),
@@ -620,6 +673,37 @@ test "a step whose every arm makes its Continue or Stop goes on or leaves at onc
       Err(why) -> assert_eq(why, b""),
       Ok(f) -> assert_eq([looped(f), made(f)], [1, 0]),
     })
+}
+
+test "`iterate` on a step that is a function value loops in the body, applying the step through its descriptor each pass" {
+  // Each loop of `b` whose passes apply a function value.
+  let applying = |b: Block|
+    b.filter(|i: Inst|
+      match i {
+        Loop(l) -> vals_in(l.body).any(|v: Val| match v { Apply(_) -> true, _ -> false }),
+        _ -> false,
+      }).len(
+    );
+  // A named step, handed as a value.
+  match form(b"iterate_named") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      assert_eq(applying(f.body), 1);
+      assert(printed_text(corpus_program(), f).index_of(b"->typed)(ctx") != None, None)
+    },
+  };
+  // `iterate` itself handed as a value, and called.
+  match form(b"iterate_by") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) ->
+      assert_eq(
+        f.lambdas.map(|l: Lambda| match l { Closure(c) -> applying(c.body.body) }).fold(
+          0,
+          |n: Int, k: Int| n + k,
+        ),
+        1,
+      ),
+  }
 }
 
 test "a step's loop prints as a C for over its state, spending its budget before each pass" {
@@ -1400,6 +1484,12 @@ fn name_length(s: Bytes) -> Int =
   }).n
 
 test "every function the calling corpus prints sets only names it declares" {
+  // What a build prints of a form: nothing where its callers settle it.
+  let left_of = |f: Fn| {
+    let built = built_form(f);
+    if settled_by_callers(built.links.needs) { [] }
+    else { undeclared(printed_text(corpus_program(), built)) }
+  };
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
@@ -1407,7 +1497,7 @@ test "every function the calling corpus prints sets only names it declares" {
         match lowered_as_built(p, n) {
           Err(_) -> acc,
           Ok(f) -> {
-            let left = undeclared(printed_text(corpus_program(), owned(f)));
+            let left = left_of(f);
             if left.len() == 0 { acc } else { acc.push({ name: n, names: left }) }
           },
         });
@@ -1416,7 +1506,7 @@ test "every function the calling corpus prints sets only names it declares" {
           match group_form(g) {
             Err(_) -> acc,
             Ok(f) -> {
-              let left = undeclared(printed_text(corpus_program(), owned(f)));
+              let left = left_of(f);
               if left.len() == 0 { acc }
               else { acc.push({ name: match g.at(0) { Some(n) -> n, None -> b"" }, names: left }) }
             },
@@ -1478,7 +1568,7 @@ test "every call of a root the corpus defines is written to the head the root is
         Map::new(),
         |m: Map<Bytes, { answer: Bytes, params: List<Bytes> }>, n: Bytes|
           match lowered_as_built(p, n) {
-            Ok(f) -> m.insert(qualify(b"m", n), head_types(f.conv.reps, f.conv.answer)),
+            Ok(f) -> m.insert(qualify(b"m", n), head_types(f.conv)),
             Err(_) -> m,
           },
       );
@@ -1491,7 +1581,7 @@ test "every call of a root the corpus defines is written to the head the root is
                 acc,
                 |a: List<{ caller: Bytes, callee: Bytes }>, c: { callee: RootKey, conv: Convention }|
                   match heads.get(root_name(c.callee)) {
-                    Some(h) -> if h == head_types(c.conv.reps, c.conv.answer) { a }
+                    Some(h) -> if h == head_types(c.conv) { a }
                     else { a.push({ caller: n, callee: root_name(c.callee) }) },
                     None -> a,
                   },
@@ -1558,6 +1648,26 @@ test "a restart sets a record crossing by reference value by value, its values o
         None -> assert(false, said),
       };
       assert(text.index_of(b"p0_0 = t") != None, Some(String::of_bytes_lossy(text)))
+    },
+  }
+}
+
+test "a lent record wider than four words is read through a const pointer, and a restart sets its part locals, never the caller's words" {
+  match form(b"wide_loop") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(f) -> {
+      let text = printed_text(corpus_program(), {
+        ..f,
+        conv: { ..f.conv, params: f.conv.params.set(0, Lent) },
+      });
+      let said = Some(String::of_bytes_lossy(text));
+      assert(text.index_of(b"(PlyCtx *ctx, const Word* p0, int64_t p1)") != None, said);
+      assert(text.index_of(b"goto ply_loop;") != None, said);
+      let written = text.split(b"\n").filter(|l: Bytes| {
+        let at = l.index_of(b" = ");
+        match at { Some(i) -> l.slice(0, i).index_of(b"p0[") != None, None -> false }
+      });
+      assert_eq(written, [])
     },
   }
 }
