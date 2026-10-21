@@ -2486,7 +2486,9 @@ fn settled_root(
 
 /// `answers` with every generic call settled over the program's constructors `ctors`: each
 /// placeholder of a body's C, and of the entries its closures name, written as the root its call
-/// settles on, and that root among the body's calls.
+/// settles on, and that root among the body's calls. A call whose specialisation the emitter
+/// refused reaches the body it specialises where the unit emits that body and the call hands it
+/// nothing raw; otherwise it keeps the specialisation, so its caller is dropped for that refusal.
 fn generics_settled(
   answers: Map<Bytes, Answer>,
   keys: Map<Bytes, RootKey>,
@@ -2495,6 +2497,12 @@ fn generics_settled(
 ) -> Map<Bytes, Answer> / {abort.raise} = {
   let needs = closed_needs(answers, keys);
   let called = closed_called(answers, keys);
+  let unemitted = settled_only(answers, keys, needs);
+  let emits = |k: RootKey|
+    match answers.get(root_name(k)) {
+      Some(Body(_)) -> !unemitted.contains(root_name(k)),
+      _ -> false,
+    };
   // A root keyed by a layout is the one the unit asked for under its name, whatever type this call
   // settles it at.
   let asked = |k: RootKey| match keys.get(root_name(k)) { Some(x) -> x, None -> k };
@@ -2510,16 +2518,12 @@ fn generics_settled(
             },
             None -> own,
           };
-          // A specialisation the emitter refused leaves the call to the generic body, which takes
-          // what the call hands it where it hands nothing raw.
           match answers.get(root_name(root)) {
             Some(Refused(_)) -> {
-              // Refused with lambdas run in place: the root without them, where it was answered.
+              // Refused with lambdas run in place: the root without them, where it is emitted.
               let plain = asked(settled_root({ ..g, fns: [] }, needs, called, ctors));
-              if g.fns.len() > 0 && root_name(plain) != root_name(root)
-                  && (match answers.get(root_name(plain)) { Some(Body(_)) -> true, _ -> false }) {
-                plain
-              } else if g.carried.len() == 0 { Named(g.callee) }
+              if g.fns.len() > 0 && root_name(plain) != root_name(root) && emits(plain) { plain }
+              else if g.carried.len() == 0 && emits(Named(g.callee)) { Named(g.callee) }
               else { root }
             },
             _ -> root,
@@ -2828,6 +2832,32 @@ test "a refused specialisation leaves its call to the generic body, whichever ro
   assert_eq(calls(b"m.main"), [b"m.each"]);
   assert_eq(calls(root_name(mapping)), [b"std.prelude.mapped_from"]);
   assert_eq(calls(b"m.mapped"), [root_name(mapping)])
+}
+
+test "a caller of a refused specialisation of a body its callers settle is dropped for the specialisation's refusal" {
+  let lay = { callee: b"m.lay", args: [spelled(b"Float")], carried: [], fns: [] };
+  let spec = settled_root(
+    lay,
+    Map::of_entries([{ key: b"m.lay", value: [{ var: 0, reads: Layout }] }]),
+    Map::new(),
+    no_ctors(),
+  );
+  let why = b"the typed form of `m.lay@Float` fails its check";
+  let had = keyed([
+    { key: Named(b"m.lay"), value: generic_body([], [{ var: 0, reads: Layout }]) },
+    { key: spec, value: Refused({ why: why }) },
+    { key: Named(b"m.main"), value: generic_body([lay], []) },
+  ]);
+  let settled = generics_settled(had.answers, had.keys, Map::new(), no_ctors());
+  let held = settled_bodies(
+    settled,
+    had.keys,
+    settled_only(settled, had.keys, closed_needs(settled, had.keys)),
+  );
+  let s = settle(held, [b"m.main"], []);
+  assert_eq(s.dropped.map(|d: Dropped| d.construct), [
+    Bytes::concat_all([b"`", root_name(spec), b"`, refused: ", why]),
+  ])
 }
 
 test "a generic body needs what its callees need of what it hands them, through its own variables" {
