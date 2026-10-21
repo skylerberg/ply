@@ -8,7 +8,6 @@ import syntax.parsing (Span, dummy_span)
 import emit.code (Code, NApp, NVar)
 import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, int_type, bool_type,
                     bytes_type, unit_type, option_type)
-import emit.typing (unknown_type)
 import check.resolve.tables (qualify)
 import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt, NodeLen, LeafAt,
                     KidAt, TailPush, TailSet, LeafSet, RootSwap, KidSwap, TailStart, Spill,
@@ -33,7 +32,7 @@ import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, no
 import emit.lower.base
 import emit.lower.data (constructed_as)
 import emit.lower.scalars (operated, runtime_builtin)
-import emit.lower.crossing (crossing_builtin, crossed)
+import emit.lower.crossing (crossing_builtin, crossed, type_described)
 import emit.lower.strings
 import emit.lower.strings (string_builtin)
 
@@ -274,9 +273,8 @@ fn contained(
       _ -> refuse(st, Containers, b"an empty list made at no type the checker filed"),
     }
   } else if name == b"Bytes::concat_all" && args.len() == 1 { joined(cx, st, args, f, at) }
-  else if is_callback(name) {
-    refuse(st, Containers, b"a callback builtin outside its fused shape: ".concat(name))
-  } else if name == b"Bytes::position" { positioned(cx, st, args, at) } else {
+  else if name == b"Bytes::position" { positioned(cx, st, args, at) }
+  else if name == b"bracket" || name == b"?hold_bracket" { bracketed(cx, st, args, at) } else {
     match laid_element(name, args, f) {
       Some(t) -> if has_vars(t) { called(cx, layout_needed(st, t), name, args, f, at) }
       else if name == b"Columns::get" { called(cx, st, name, args, f, at) }
@@ -314,10 +312,8 @@ fn called(
 /// What a native the elaboration writes calls of answers, which no declaration states: an operator
 /// at a type a witness stands for its operands' type, but `<`, `<=`, `>` and `>=`, which the
 /// elaboration numbers 5 to 8, a `Bool`; a handler's variable the type the checker filed for its
-/// read, where the read is written; installing or setting one `Unit`; a hold's region what its body
-/// answers. Where nothing says more, the runtime's word.
-fn elaborated_answer(cx: Context, name: Bytes, args: List<Arg>, at: Span) -> Option<Type> = {
-  let word = |t: Option<Type>| match t { Some(x) -> Some(x), None -> Some(unknown_type()) };
+/// read, where the read is written; installing or setting one `Unit`.
+fn elaborated_answer(cx: Context, name: Bytes, args: List<Arg>, at: Span) -> Option<Type> =
   if name == b"?numeric_binary" {
     match args {
       [AInt(k), _, x, _] -> Some(if k >= 5 && k <= 8 { bool_type() } else { type_of(x) }),
@@ -326,13 +322,7 @@ fn elaborated_answer(cx: Context, name: Bytes, args: List<Arg>, at: Span) -> Opt
   } else if name == b"?numeric_unary" { match args { [_, _, x] -> Some(type_of(x)), _ -> None } }
   else if name == b"?handler_var" { match filed(cx, at) { Some(t) -> Some(t.ty), None -> None } }
   else if name == b"?handler_init" || name == b"?handler_set" { Some(unit_type()) }
-  else if name == b"?hold_bracket" {
-    word(match args.at(2) {
-      Some(AVar(body)) -> match body.ty { TyFn(f) -> Some(f.ret), _ -> None },
-      _ -> None,
-    })
-  } else { None }
-}
+  else { None }
 
 /// `st` noting each type variable that leaves the layout of an element of type `t` unknown, which a
 /// specialisation would lay its elements out by.
@@ -733,8 +723,40 @@ fn positioned(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered =
     _ -> refuse(st, Containers, b"a byte string's position on other operands than three"),
   }
 
-/// A builtin that calls a function it is handed in a shape only a fused loop writes.
-fn is_callback(name: Bytes) -> Bool = name == b"iterate"
+/// `bracket(acquire, release, body)`, or a hold's region, which is one: the runtime's
+/// `rt_with_cleanup`, which takes the three closures and counts what it holds across their calls
+/// by the types of what `acquire` and `body` answer.
+fn bracketed(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / {abort.raise} =
+  match args {
+    [acquire, release, body] -> match ((type_of(acquire), type_of(body))) {
+      (TyFn(a), TyFn(b)) -> {
+        let aw = handed({ st: st, arg: acquire }, RWord, at);
+        let bw = handed({ st: aw.st, arg: body }, RWord, at);
+        let rw = handed({ st: bw.st, arg: release }, RWord, at);
+        let held = type_described(cx, rw.st, a.ret, at);
+        let answer = type_described(cx, held.st, b.ret, at);
+        let ran = bound_as(
+          answer.st,
+          b.ret,
+          RWord,
+          Native({
+            name: b"rt_with_cleanup_p",
+            args: [aw.arg, bw.arg, rw.arg, held.arg, answer.arg],
+            uses: {
+              takes: [true, true, true, false, false],
+              owned: true,
+              fails: true,
+              stops: true,
+            },
+          }),
+          at,
+        );
+        handed(ran, held_as(cx.setting, b.ret), at)
+      },
+      _ -> refuse(st, Containers, b"a bracket over other than functions"),
+    },
+    _ -> refuse(st, Containers, b"a bracket on other operands than three"),
+  }
 
 /// The builtins `scalars` lowers: those the emitter writes at the type of a scalar it was called at,
 /// or per type (order, show, digest, reflection).

@@ -494,31 +494,101 @@ test "a byte string's position is a loop in the body, its predicate called by it
     assert_eq(text.index_of(t), None))
 }
 
-test "a handler's variables, a hold's region and `bracket` are the runtime's, each answering its type" {
+test "a byte string's position named as a value is a lambda whose loop calls the predicate it is handed by its type" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn space(c: Int) -> Bool = c == 32\n",
+      b"fn by(f: (Bytes, Int, (Int) -> Bool) -> Option<Int> / {abort.raise}, b: Bytes) -> Option<Int> / {abort.raise} = f(b, 0, space)\n",
+      b"fn spaced(b: Bytes) -> Option<Int> / {abort.raise} = by(Bytes::position, b)\n",
+    ]),
+  );
+  let positions = match checked(p, b"spaced") {
+    Ok(f) ->
+      f.lambdas.fold([], |acc: List<Uses>, l: Lambda|
+        match l {
+          Closure(c) ->
+            c.body.body.fold(acc, |us: List<Uses>, i: Inst|
+              match i {
+                Let(x) -> match x.val {
+                  Op(o) -> if o.op == OContainer(Position) { us.push(o.uses) } else { us },
+                  _ -> us,
+                },
+                _ -> us,
+              }),
+        }),
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+  };
+  assert_eq(positions, [{ takes: [false, false, false], owned: true, fails: true, stops: true }]);
+  let text = form_text(p, b"spaced");
+  assert(
+    text.index_of(
+        b"((int64_t (*)(PlyCtx *, Word, int64_t))((const PlyFnDesc *)(intptr_t)ply_words(",
+      )
+      != None,
+    Some(String::of_bytes_lossy(text)),
+  );
+  assert_eq(text.index_of(b"rt_call_p"), None)
+}
+
+/// What each `rt_with_cleanup` root `m.<name>` of `p` calls, in its body or a lambda's, takes and
+/// answers, once its counts are placed and checked.
+fn cleanups(p: Program, name: Bytes) -> List<Uses> / {abort.raise} =
+  match checked(p, name) {
+    Ok(f) ->
+      f.lambdas.fold([f.body], |acc: List<List<Inst>>, l: Lambda|
+        match l { Closure(c) -> acc.push(c.body.body) }).fold(
+        [],
+        |acc: List<Uses>, b: List<Inst>|
+          b.fold(acc, |us: List<Uses>, i: Inst|
+            match i {
+              Let(x) -> match x.val {
+                Native(n) -> if n.name == b"rt_with_cleanup_p" { us.push(n.uses) } else { us },
+                _ -> us,
+              },
+              _ -> us,
+            }),
+      ),
+    Err(why) -> panic(String::of_bytes_lossy(Bytes::concat_all([name, b": ", why]))),
+  }
+
+/// The closures are taken; the types of what is held and answered are only read.
+fn cleanup_uses() -> Uses =
+  { takes: [true, true, true, false, false], owned: true, fails: true, stops: true }
+
+test "`bracket`, named or passed as a value, is the runtime's `rt_with_cleanup`, taking its closures" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn release(_: Int) -> Unit = ()\n",
+      b"fn bracketed(n: Int) -> Int = bracket(|| n, release, |x: Int| x + 1)\n",
+      b"fn by(f: (() -> Int, (Int) -> Unit, (Int) -> Int) -> Int, n: Int) -> Int = f(|| n, release, |x: Int| x + 1)\n",
+      b"fn bracketed_by(n: Int) -> Int = by(bracket, n)\n",
+    ]),
+  );
+  assert_eq(cleanups(p, b"bracketed"), [cleanup_uses()]);
+  assert_eq(cleanups(p, b"bracketed_by"), [cleanup_uses()]);
+  [b"bracketed", b"bracketed_by"].fold((), |_: Unit, n: Bytes| {
+    let text = form_text(p, n);
+    assert(text.index_of(b"rt_with_cleanup_p(ctx, ") != None, Some(String::of_bytes_lossy(text)));
+    assert_eq(text.index_of(b"builtin_bracket_p"), None)
+  })
+}
+
+test "a handler's variables are the runtime's, a hold's region its `rt_with_cleanup`, each answering its type" {
   let p = program(
     Bytes::concat_all([
       b"effect tally {\n  write add(n: Int) -> Unit\n  read total() -> Int\n}\n",
       b"fn counted() -> Int = handle { tally.add(1); tally.add(2); tally.total() } with { var n = 0, tally.add(k) -> { n = n + k; }, tally.total() -> n }\n",
       b"fn release(_: Int) -> Unit = ()\n",
       b"fn held(n: Int) -> Int = with_hold[t](n, release) { c -> c.get() }\n",
-      b"fn bracketed(n: Int) -> Int = bracket(|| n, release, |x: Int| x + 1)\n",
       b"fn copied(n: Int) -> Bool = { let got = with_hold[t](n, release) { c -> with_hold[u](c.get(), release) { d -> d.get() } }; got >= 0 }\n",
     ]),
   );
   assert_eq(
-    [b"counted", b"held", b"bracketed", b"copied"].fold(
-      [],
-      |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
-        match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) },
-    ),
+    [b"counted", b"held", b"copied"].fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
+      match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) }),
     [],
   );
-  assert_eq(
-    natives_in(bound_in(p, b"bracketed")).map(
-      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
-    ),
-    [b"builtin_bracket_p"],
-  );
+  assert_eq(cleanups(p, b"held"), [cleanup_uses()]);
   // A hold answers what its body answers, here an `Int` its comparison reads in a register.
   assert(
     !natives_in(bound_in(p, b"copied")).any(
