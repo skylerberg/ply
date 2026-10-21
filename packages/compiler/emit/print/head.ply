@@ -11,6 +11,10 @@ import emit.print.counting (dup_fn, last_fn, rel_fn, rel_sum_fn, rel_int_fn, rel
                             release_drain_fn, released_twice_fn, box_released_fn, never_lifted_fn,
                             never_lifted_rt_fn, call_text, calls)
 import emit.release (immediate_heads, int_heads, box_heads, scalar_box_words)
+import emit.print.fuel (entered_helper, entered_fn)
+import emit.print.strings (payload_helper, payload_fn)
+import emit.print.lists (list_helpers, item_fn, leaf_fn)
+import emit.print.counts (walk_helpers, kept_block_fn, fresh_block_fn, marked_fn)
 
 /// The helpers, the machine structs, a function value's block (its header and its descriptor, its
 /// captures after them) and the context's chain of frame records. `ply_last` answers whether the
@@ -29,6 +33,32 @@ pub fn head_part() -> Bytes / {abort.raise} =
     b"\ntypedef struct { PlyObj h; const PlyFnDesc *desc; } PlyFnBlock;\n",
     chain_defined(),
     drops(),
+    shared_sequences(),
+  ])
+
+/// The sequences printers would otherwise write at each use, defined once: a function's entry, a
+/// string's bytes, a list's item and leaf, a block copied or kept or marked shared, and an object
+/// made writable.
+fn shared_sequences() -> Bytes =
+  Bytes::concat_all([
+    entered_helper(),
+    payload_helper(),
+    list_helpers(),
+    walk_helpers(),
+    writable_helper(),
+  ])
+
+/// The head's C function answering the object `a` held once, copied by `copy` where another holds
+/// it too, the write counted as in place or of a copy of `n` words.
+pub fn writable_fn() -> Bytes = b"ply_writable"
+
+/// `writable_fn`'s definition. `n` is read off the object before it is copied, which a copy holds
+/// alike.
+fn writable_helper() -> Bytes =
+  Bytes::concat_all([
+    b"static inline Word ",
+    writable_fn(),
+    b"(PlyCtx *ctx, Word a, PlyDrop copy, int64_t n) { int in_place = ply_obj(a)->rc == 1; if (!in_place) a = copy(ctx, a); rt_note_update_p(ctx, in_place, in_place ? 0 : n); return a; }\n",
   ])
 
 /// The context's counters a drop root reads and writes, at their offsets past what the runtime's
@@ -321,4 +351,38 @@ test "each machine struct is declared before one that points at it, its fields i
       None,
     )
   })
+}
+
+test "each sequence the printers share is defined once in the head, as a function a use calls" {
+  let h = head_part();
+  let shared = [
+    entered_fn(),
+    payload_fn(),
+    item_fn(),
+    leaf_fn(),
+    kept_block_fn(),
+    fresh_block_fn(),
+    marked_fn(),
+    writable_fn(),
+  ];
+  assert_eq(shared.filter(|f: Bytes| h.split(f.concat(b"(")).len() != 2), []);
+  let body = |f: Bytes|
+    match h.index_of(f.concat(b"(")) {
+      Some(i) -> match h.index_of_from(b"}\n", i) { Some(j) -> h.slice(i, j), None -> b"" },
+      None -> b"",
+    };
+  // A function's entry spends its fuel, makes room below the stack and counts a tick.
+  assert(
+    h.index_of(entered_helper()) != None
+      && [b"ctx->fuel", b"rt_stack_more_p(ctx)", b"rt_tick_p(ctx)"].all(|part: Bytes|
+        entered_helper().index_of(part) != None),
+    None,
+  );
+  // A block copied takes every header field but its count.
+  assert(
+    [b"->kind", b"->flags", b"->aux", b"->len", b"->layout"].all(|field: Bytes|
+        body(kept_block_fn()).index_of(field) != None)
+      && body(kept_block_fn()).index_of(b"->rc") == None,
+    None,
+  )
 }

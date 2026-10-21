@@ -860,19 +860,7 @@ pub fn walked(
           );
           {
             pr: parts.pr,
-            out: [
-              Text(
-                Bytes::concat_all([
-                  b"if (",
-                  x,
-                  b" && ",
-                  field(x, b"rc"),
-                  b" < UINT32_C(0x80000000)) { ",
-                  field(x, b"rc"),
-                  b" |= UINT32_C(0x80000000); ",
-                ]),
-              ),
-            ].concat(
+            out: [Text(Bytes::concat_all([b"if (", marked_fn(), b"(", x, b")) { "]))].concat(
               parts.out,
             ).push(
               Text(b" }"),
@@ -934,11 +922,9 @@ pub fn walked(
                   field(x, b"rc"),
                   b" != UINT32_MAX) { ",
                   a,
-                  b" = rt_alloc_kept_p(ctx, ",
-                  size,
-                  b"); ",
-                  copied_block(a, x, size),
-                  b" ",
+                  b" = ",
+                  call_text(kept_block_fn(), [b"ctx", x, size]),
+                  b"; ",
                 ]),
               ),
             ].concat(
@@ -973,11 +959,9 @@ pub fn walked(
               Bytes::concat_all([
                 b"Word ",
                 a,
-                b" = rt_alloc_bytes_p(ctx, ",
-                size,
-                b"); ",
-                copied_block(a, x, size),
-                b" ",
+                b" = ",
+                call_text(fresh_block_fn(), [b"ctx", x, size]),
+                b"; ",
               ]),
             ),
           ].concat(
@@ -1138,11 +1122,9 @@ fn case_walked(
                 Bytes::concat_all([
                   b"if (",
                   field(b"ply_b", b"rc"),
-                  b" != UINT32_MAX) { Word ply_k = rt_alloc_kept_p(ctx, ",
-                  size,
-                  b"); ",
-                  copied_block(b"ply_k", b"ply_b", size),
-                  b" ",
+                  b" != UINT32_MAX) { Word ply_k = ",
+                  call_text(kept_block_fn(), [b"ctx", b"ply_b", size]),
+                  b"; ",
                 ]),
               ),
             ].concat(
@@ -1165,17 +1147,7 @@ fn case_walked(
           };
           {
             pr: slots.pr,
-            out: [
-              Text(
-                Bytes::concat_all([
-                  b"if (",
-                  field(b"ply_b", b"rc"),
-                  b" < UINT32_C(0x80000000)) { ",
-                  field(b"ply_b", b"rc"),
-                  b" |= UINT32_C(0x80000000); ",
-                ]),
-              ),
-            ].concat(
+            out: [Text(Bytes::concat_all([b"if (", marked_fn(), b"(ply_b)) { "]))].concat(
               slots.out,
             ).push(
               Text(Bytes::concat_all([on, b" }"])),
@@ -1264,25 +1236,55 @@ fn block_size(x: Bytes, o: Opening) -> Bytes =
     _ -> ascii_of_int(header_bytes()),
   }
 
-/// The C copying into the fresh block `c` of `size` bytes the header fields and payload words of
-/// the block `x`, its count apart.
-fn copied_block(c: Bytes, x: Bytes, size: Bytes) -> Bytes =
+/// The head's C function answering a copy of the block `x` of `size` bytes, its header fields and
+/// payload words, kept for good: what a keep copies a block into.
+pub fn kept_block_fn() -> Bytes = b"ply_kept_block"
+
+/// The head's C function answering a fresh copy of the block `x` of `size` bytes, its header fields
+/// and payload words, held once: what a copy copies a block into.
+pub fn fresh_block_fn() -> Bytes = b"ply_fresh_block"
+
+/// The head's C function marking the block `x` shared where it is one held by this thread alone,
+/// answering whether it marked it.
+pub fn marked_fn() -> Bytes = b"ply_marked_shared"
+
+/// The definitions of `kept_block_fn`, `fresh_block_fn` and `marked_fn`. A copy takes each header
+/// field but the count, which its allocation sets.
+pub fn walk_helpers() -> Bytes = {
+  let copied = |made: Bytes|
+    Bytes::concat_all([
+      b"(PlyCtx *ctx, Word x, int64_t size) { Word c = ",
+      made,
+      b"(ctx, size); ",
+      Bytes::join(
+        [b"kind", b"flags", b"aux", b"len", b"layout"].map(|f: Bytes|
+          Bytes::concat_all([field(b"c", f), b" = ", field(b"x", f), b";"])),
+        b" ",
+      ),
+      b" for (int64_t i = 0; i < (size - ",
+      ascii_of_int(header_bytes()),
+      b") / 8; i++) ",
+      slot_at(b"c", b"i"),
+      b" = ",
+      slot_at(b"x", b"i"),
+      b"; return c; }\n",
+    ]);
   Bytes::concat_all([
-    Bytes::join(
-      [b"kind", b"flags", b"aux", b"len", b"layout"].map(|f: Bytes|
-        Bytes::concat_all([field(c, f), b" = ", field(x, f), b";"])),
-      b" ",
-    ),
-    b" for (int64_t ply_i = 0; ply_i < ((",
-    size,
-    b") - ",
-    ascii_of_int(header_bytes()),
-    b") / 8; ply_i++) ",
-    slot_at(c, b"ply_i"),
-    b" = ",
-    slot_at(x, b"ply_i"),
-    b";",
+    b"static inline Word ",
+    kept_block_fn(),
+    copied(b"rt_alloc_kept_p"),
+    b"static inline Word ",
+    fresh_block_fn(),
+    copied(b"rt_alloc_bytes_p"),
+    b"static inline int ",
+    marked_fn(),
+    b"(Word x) { if (!x || ",
+    field(b"x", b"rc"),
+    b" >= UINT32_C(0x80000000)) return 0; ",
+    field(b"x", b"rc"),
+    b" |= UINT32_C(0x80000000); return 1; }\n",
   ])
+}
 
 /// Each counted slot of the block `b`, laid as `o` says, handed to `act` with its counted parts and
 /// its words, as C expressions it may read and write: a box's parts, a hold's value, a view's viewed
@@ -2187,9 +2189,7 @@ test "a node copied is a fresh block of its header and words, each counted once 
   let node = drop_of(TyCon({ name: list_node_name(), args: [string()] }));
   let copy = walked_said(Copy, NodeOf({ node: node, item: [word(0, Object(item))] }), node);
   [
-    b"Word t1 = rt_alloc_bytes_p(ctx, 16 + 8 * (int64_t)ply_obj(p0)->layout);",
-    b"ply_obj(t1)->kind = ply_obj(p0)->kind;",
-    b"ply_words(t1)[ply_i] = ply_words(p0)[ply_i];",
+    call_text(fresh_block_fn(), [b"ctx", b"p0", b"16 + 8 * (int64_t)ply_obj(p0)->layout"]),
     Bytes::concat_all([
       b"if (ply_obj(t1)->kind == 12) { for (int64_t ply_i = 0; ply_i < ply_obj(t1)->len; ply_i++) { ",
       called(dup_fn(), [b"ply_words(t1)[ply_i]"]),
@@ -2233,7 +2233,10 @@ test "a sum of one word walks the block its case holds, a chain of its own type 
   let kept = walk(Keep);
   [
     b"Word t1 = p0; Word *ply_into = &t1; Word ply_x = p0; for (;;) { Word ply_n = 0; switch (",
-    b"case INT64_C(4097): { Word ply_b = (ply_x & ~(Word)7); if (ply_obj(ply_b)->rc != UINT32_MAX) { Word ply_k = rt_alloc_kept_p(ctx, 32);",
+    Bytes::concat_all([
+      b"case INT64_C(4097): { Word ply_b = (ply_x & ~(Word)7); if (ply_obj(ply_b)->rc != UINT32_MAX) { Word ply_k = ",
+      call_text(kept_block_fn(), [b"ctx", b"ply_b", b"32"]),
+    ]),
     b" *ply_into = ply_k | (ply_x & 7); ply_into = &ply_words(ply_k)[1]; ply_n = *ply_into; }",
     Bytes::concat_all([
       b"case INT64_C(4098): { Word ply_b = (ply_x & ~(Word)7); *ply_into = ",
@@ -2255,7 +2258,7 @@ test "a sum of one word walks the block its case holds, a chain of its own type 
   let shared = walk(Share);
   [
     b"Word t1 = 1; Word ply_x = p0; for (;;) { Word ply_n = 0; switch (",
-    b"if (ply_obj(ply_b)->rc < UINT32_C(0x80000000)) { ply_obj(ply_b)->rc |= UINT32_C(0x80000000);",
+    Bytes::concat_all([b"if (", marked_fn(), b"(ply_b)) {"]),
     b" ply_n = ply_words(ply_b)[1]; }",
     Bytes::concat_all([b"if (!", root_spelled(root_of(Share, string)), b"(ctx, ply_b)) t1 = 0;"]),
   ].fold((), |_: Unit, part: Bytes| assert(shared.contains(part), None));
@@ -2272,14 +2275,17 @@ test "a box shared marks it and shares each block it holds; kept, it is copied f
   let shared = walked_said(Share, boxed, dropping_of(b"m.R"));
   // Marked shared once, and its word shared through the word's own root.
   assert(
-    shared.text.contains(b"->rc |= UINT32_C(0x80000000)")
+    shared.text.contains(call_text(marked_fn(), [b"p0"]))
       && shared.text.contains(Bytes::concat_all([root_spelled(share), b"(ctx, ply_words(p0)[0])"])),
     Some(String::of_bytes_lossy(shared.text)),
   );
   assert_eq(shared.calls, [share]);
   let kept = walked_said(Keep, boxed, dropping_of(b"m.R"));
   [
-    b"Word t1 = p0; if (p0 && ply_obj(p0)->rc != UINT32_MAX) { t1 = rt_alloc_kept_p(ctx, 32);",
+    Bytes::concat_all([
+      b"Word t1 = p0; if (p0 && ply_obj(p0)->rc != UINT32_MAX) { t1 = ",
+      call_text(kept_block_fn(), [b"ctx", b"p0", b"32"]),
+    ]),
     Bytes::concat_all([
       b"if (ply_words(t1)[0]) ply_words(t1)[0] = ",
       root_spelled(keep),
@@ -2344,7 +2350,7 @@ test "what is or reaches a runtime handle, a hold or a function value is kept as
     closures,
   ].fold((), |_: Unit, o: Opening| {
     let kept = walked_said(Keep, o, dropped);
-    assert(kept.text.contains(b" = 0;") && !kept.text.contains(b"rt_alloc_kept_p"), None);
+    assert(kept.text.contains(b" = 0;") && !kept.text.contains(kept_block_fn()), None);
     assert_eq(kept.calls, [])
   });
   // A record of scalars and strings is kept as a copy, each string kept.
@@ -2353,12 +2359,12 @@ test "what is or reaches a runtime handle, a hold or a function value is kept as
     InBox({ parts: [{ at: 0, ty: int, rep: RWord }, { at: 1, ty: string, rep: RWord }], words: 2 }),
     dropped,
   );
-  assert(plain.text.contains(b"t1 = rt_alloc_kept_p(ctx, 32);"), None);
+  assert(plain.text.contains(call_text(kept_block_fn(), [b"ctx", b"p0", b"32"])), None);
   assert_eq(plain.calls, [root_of(Keep, int), root_of(Keep, string)]);
   // Shared, a channel still refuses to cross.
   assert(
     walked_said(Share, captured(chan), dropped).text.contains(
-      b"ply_obj(p0)->rc |= UINT32_C(0x80000000); if (ply_words(p0)[1]) t1 = 0; }",
+      Bytes::concat_all([call_text(marked_fn(), [b"p0"]), b") { if (ply_words(p0)[1]) t1 = 0; }"]),
     ),
     None,
   )
