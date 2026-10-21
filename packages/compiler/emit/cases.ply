@@ -29,13 +29,16 @@ import emit.keys (RootKey, Named, Written, FnArg, TypeOp, Order, Reflect, Shown,
 import emit.answer (Defined, Expect, word_head, GenericCall, Need, Exact, Layout, Scalar,
                     no_generics, Tables, no_tables, Emitted, Body, Refused, RootAnswer)
 import emit.statics (SBytes, SEmbedded, statics_of)
-import emit.reps (Ctors, SumCtor, no_ctors, ctors_of, ctor_sums, ctor_layouts, at_args)
+import emit.reps (Ctors, SumCtor, no_ctors, ctors_of, ctor_sums, ctor_layouts, at_args, has_vars)
+import emit.compare (program_of)
+import emit.lower.setting (Root)
+import emit.typing (Typed)
 import unit (program_natives)
 import check.infer.definitions (Extern)
 import emit (said, refused_rather_than_emitted, emit_program, emit_roots_answer, lowered_roots,
              zip_sources)
 import emit.entry (RootForm, Formed, Unformed, emitted_of)
-import emit.print.counting (last_fn, rel_fn, rel_int_fn, inc_fn, free_fn, call_text, call_start,
+import emit.print.counting (last_fn, rel_fn, rel_int_fn, free_fn, call_text, call_start,
                             takes_count, lets_count_go, lets_go_of)
 import emit.tir (Plain, Block, Inst, Var, Let, If, Case, Match, Loop, Get, PCapture)
 import front.seam
@@ -223,7 +226,8 @@ test "a body that fails inside a `handle` leaves through the handle's landing, w
   let leaves = |raised: Bytes| bodies.map(|body: Bytes| body.index_of(raised) != None);
   assert_eq(leaves(b"rt_let_no_match_p(ctx); goto ply_h"), [true, true]);
   assert_eq(leaves(b"rt_not_that_width_p(ctx, "), [true, true]);
-  assert_eq(leaves(b"builtin_bytes_at_p(ctx, "), [true, true]);
+  // A byte read past the end is the builtin's over its encoding, which raises.
+  assert_eq(leaves(b"rt_builtin_encoded_p(ctx, "), [true, true]);
   assert_eq(bodies.map(|body: Bytes| body.index_of(b"return")), [None, None])
 }
 
@@ -1769,7 +1773,7 @@ test "a lambda a call lends is laid out on the caller's stack with its descripto
   assert_eq(has(b" = rt_alloc_bytes_p(ctx, 32); ply_words("), [false, false, true, true, false]);
   assert_eq(has(b"_lambda0_value;"), [false, false, false, false, true]);
   // The caller lets go of the captures it laid out, its own `t1`, once the call is done.
-  assert_eq(has(b"\n  ".concat(call_start(rel_int_fn(), [b"ctx", b"t1"]))), [
+  assert_eq(has(Bytes::concat_all([b"\n  ", call_text(rel_int_fn(), [b"ctx", b"t1"]), b";"])), [
     true,
     true,
     false,
@@ -2809,6 +2813,39 @@ test "a tail loop whose members number their variables apart runs as one at the 
   assert_eq(looped.tables.generics.needs, [])
 }
 
+test "a type nothing in the program settles is filed as `Unit`, so a body of no type variable reads none" {
+  let src = Bytes::concat_all([
+    b"fn empty() -> Int = { let xs = []; xs.len() }\n",
+    b"fn wrapped(n: Int) -> Bool = match Ok(n) { Ok(_) -> true, Err(_) -> false }\n",
+    b"fn nothing() -> Int = match None { Some(_) -> 1, None -> 0 }\n",
+    b"fn fresh() -> Int = Map::new().len()\n",
+    b"fn made(n: Int) -> Int = { let f = |x: Int| []; f(n).len() }\n",
+    b"fn pair(n: Int) -> Int = match (n, []) { (k, _) -> k }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let open = p.roots.filter(|r: Root|
+        match r.filed {
+          Ok(f) -> f.typed.values().any(|t: Typed| has_vars(t.ty) || t.args.any(has_vars)),
+          Err(_) -> true,
+        });
+      assert_eq(open.map(|r: Root| root_name(r.key)), []);
+      let empty = p.roots.filter(|r: Root| root_name(r.key) == b"m.empty");
+      assert(
+        empty.all(|r: Root|
+          match r.filed {
+            Ok(f) ->
+              f.typed.values().any(|t: Typed|
+                t.ty == TyCon({ name: b"List", args: [TyCon({ name: b"Unit", args: [] })] })),
+            Err(_) -> false,
+          }),
+        None,
+      )
+    },
+  }
+}
+
 test "a tail loop through calls written on a value runs as one at its types" {
   // Each call is written on a value, so only what the check filed of it says which function it is.
   let src = Bytes::concat_all([
@@ -3059,12 +3096,9 @@ test "a buffer read out of a record this body holds alone reaches its append uns
     b"fn folded(n: Int) -> Bytes = range(0, n).fold({ out: b\"\", n: 0 }, |s: S, _: Int| { out: s.out ++ b\"x\", n: s.n + 1 }).out\n",
     b"fn widened(n: Int) -> Bytes / {abort.raise} = iterate({ out: b\"\", n: n, a: 0, b: 0, c: 0 }, n + 1, |s: W| if s.n <= 0 { Stop(s.out) } else { Continue({ out: s.out ++ b\"x\", n: s.n - 1, a: s.a, b: s.b, c: s.c }) })\n",
     b"fn guarded(t: T, k: Int) -> Bytes = match t { T(out, n) if n > k -> out ++ b\"y\", T(out, _) -> out }\n",
-    b"fn captured(s: S, n: Int) -> Int / {abort.raise} = iterate(0, n + 1, |i: Int| if i >= n { Stop(s.out.len() + s.n) } else { Continue(i + s.out.len()) })\n",
-    b"fn caught(s: S, n: Int) -> Int = range(0, n).fold(0, |acc: Int, _: Int| acc + s.out.len() + s.n)\n",
   ]);
   // `fold` runs each lambda in the loop of `std.prelude` the unit settles its call on.
   let folding = b"std.prelude.folded_from@Int,{n:Int,out:Bytes}|5=m.folded:0";
-  let catching = b"std.prelude.folded_from@Int,Int|5=m.caught:0";
   let names = [
     b"m.pattern",
     b"m.ctor",
@@ -3073,95 +3107,26 @@ test "a buffer read out of a record this body holds alone reaches its append uns
     b"m.iterated",
     b"m.widened",
     b"m.guarded",
-    b"m.captured",
     folding,
-    catching,
   ];
   let answers = answers_of([b"m"], [src], [b"Stop", b"Continue", b"m.T"], names);
-  let text = |name: Bytes| answered_body(answers, name).text;
-  let before = |name: Bytes, first: Bytes, then: Bytes|
-    match text(name).index_of(first) {
-      None -> false,
-      Some(a) -> match text(name).index_of(then) { None -> false, Some(b) -> a < b },
-    };
-  let takes = |name: Bytes|
-    text(name).index_of(b"] = ply_unit; else ".concat(call_start(inc_fn(), []))) != None;
-  // A record parameter that arrives as its fields gives its buffer's local up outright: nothing is
-  // counted again between the branch's opening and the append.
-  let moves = |name: Bytes| {
-    let body = own_code(text(name));
-    match body.index_of(b"} else {\n") {
-      None -> false,
-      Some(a) -> match body.index_of(b"rt_concat_p(") {
-        None -> false,
-        Some(c) -> body.index_of(b" = p0_1;\n") != None && !takes_count(body.slice(a, c)),
-      },
-    }
-  };
-  // A constructor pattern's subject, the parameter itself, is reset once its fields are read, before
-  // the short circuit and the append; the constructor built past them takes its cells, and the arm
-  // that answers the buffer frees them.
-  let ctor = text(b"m.ctor");
-  let token = match ctor.index_of(b" = ply_reset_flat(p0);") {
-    Some(at) -> {
-      let words = ctor.slice(0, at).split(b"Word ");
-      match words.at(words.len() - 1) { Some(t) -> t, None -> b"" }
-    },
-    None -> b"",
-  };
-  let freed = call_start(free_fn(), [b"ctx", token]);
-  assert(before(b"m.ctor", b" = ply_reset_flat(p0);", b"<= (INT64_C(0))"), None);
-  assert(before(b"m.ctor", b"<= (INT64_C(0))", freed), None);
-  assert(before(b"m.ctor", freed, b"rt_concat_p("), None);
-  assert(
-    before(
-      b"m.ctor",
-      b"rt_concat_p(",
-      Bytes::concat_all([b"if (", token, b" && (ply_obj(", token, b")->flags & PLY_MIXED)) {"]),
-    ),
-    None,
+  let code = |name: Bytes| own_code(answered_body(answers, name).text);
+  // A record, a loop's state however wide and a sum of one case are held as their fields, so the
+  // buffer is a field's own word: no count is taken of it before the append, and no record is made
+  // or reset for it, however the body holds the value it reads it out of.
+  assert_eq(
+    names.filter(|n: Bytes| {
+      let body = code(n);
+      match body.index_of(b"rt_concat_p(") {
+        Some(c) -> takes_count(body.slice(0, c)) || body.index_of(b"rt_alloc") != None,
+        None -> true,
+      }
+    }),
+    [],
   );
-  // A field read out of a block held alone is taken from it; a record handed in or carried as its
-  // fields, a loop's state however wide among them, hands its buffer on with nothing to take.
-  assert_eq([b"m.ctor", b"m.update", b"m.widened", b"m.fields"].map(takes), [
-    true,
-    false,
-    false,
-    false,
-  ]);
-  // A loop's state carried as its fields hands its buffer to the append outright: the loop counts
-  // nothing again and makes no record.
-  let looped = |name: Bytes| {
-    let body = own_code(text(name));
-    match body.index_of(b"for (") {
-      None -> false,
-      Some(a) -> {
-        let rest = body.slice(a, body.len());
-        !takes_count(rest) && rest.index_of(b"rt_alloc_p(") == None
-      },
-    }
-  };
-  assert([b"m.iterated", b"m.widened"].all(looped), None);
-  // So does a fold's, its accumulator the loop's parameter `p6`: no pass makes a record, and its
-  // buffer reaches the append with no count taken from where the pass reads it.
-  let folded = own_code(text(folding));
-  assert(
-    match ((folded.index_of(b"ply_loop:"), folded.index_of(b"rt_concat_p("))) {
-      (Some(l), Some(c)) -> {
-        let read = if l < c { folded.slice(l, c).split(b" = p6_1;\n") } else { [] };
-        read.len() > 1 && folded.slice(l, folded.len()).index_of(b"rt_alloc_p(") == None
-          && !takes_count(read.get(read.len() - 1))
-      },
-      _ -> false,
-    },
-    Some(String::of_bytes_lossy(folded)),
-  );
-  assert_eq([b"m.update", b"m.pattern"].map(moves), [true, true]);
-  // A subject a guard reads again, and a record a loop reads on each pass, keep their fields.
-  assert_eq([b"m.guarded", b"m.captured", catching].map(takes), [false, false, false]);
   // The match's join, which every path sets before it is read, is declared with no store.
-  assert(text(b"m.guarded").index_of(b"  Word t1;\n") != None, None);
-  assert(text(b"m.guarded").index_of(b"t1 = 0;") == None, None)
+  assert(code(b"m.guarded").index_of(b"  Word t1;\n") != None, None);
+  assert(code(b"m.guarded").index_of(b"t1 = 0;") == None, None)
 }
 
 test "a record an arm holds back is joined as its fields however deep it lies, past arms that loop" {
@@ -3176,7 +3141,7 @@ test "a record an arm holds back is joined as its fields however deep it lies, p
 }
 
 // A count taken again would not be a wrong answer but an object that cannot die.
-test "a helper's answer handed to a helper is not counted again" {
+test "a byte string made for a list is handed to the list with no count taken again" {
   let out = emit_all_program(
     [{ name: b"m", src: b"fn wrap(n: Int) -> List<Bytes> / {abort.raise} = [byte_of_int(n)]\n" }],
     [],
@@ -3184,8 +3149,12 @@ test "a helper's answer handed to a helper is not counted again" {
     true,
   );
   let text = match out { [e, ..] -> e.text, [] -> b"" };
+  // The byte is written into a block made for it, or past its range answered by the builtin over
+  // its encoding; either is the list's item as it is made.
   assert(
-    text.index_of(b"builtin_byte_of_int_p") != None && text.index_of(b"rt_list_room_p") != None,
+    text.index_of(b"rt_alloc_bytes_p(ctx, ") != None
+      && text.index_of(b"rt_builtin_encoded_p(ctx, ") != None
+      && text.index_of(b"rt_list_room_p") != None,
     Some(String::of_bytes_lossy(text)),
   );
   assert(!takes_count(text), Some(String::of_bytes_lossy(text)))

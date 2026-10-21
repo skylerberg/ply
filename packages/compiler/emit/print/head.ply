@@ -4,11 +4,12 @@
 
 import std.bytes (ascii_of_int)
 import emit.layout (MachineStruct, MachineField, machine_structs, pointer_floor, tag_bits, ctx_at,
-                    release_depth, refused_kind)
+                    release_depth, refused_kind, header_bytes)
 import emit.print.frames (chain_defined)
-import emit.print.counting (dup_fn, last_fn, rel_fn, rel_sum_fn, rel_int_fn, free_fn, inc_shared_fn,
-                            dec_shared_last_fn, free_block_fn, release_later_fn, release_drain_fn,
-                            released_twice_fn, call_text, calls)
+import emit.print.counting (dup_fn, last_fn, rel_fn, rel_sum_fn, rel_int_fn, rel_box_fn, free_fn,
+                            inc_shared_fn, dec_shared_last_fn, free_block_fn, release_later_fn,
+                            release_drain_fn, released_twice_fn, box_released_fn, call_text, calls)
+import emit.release (immediate_heads, int_heads, box_heads, scalar_box_words)
 
 /// The helpers, the machine structs, a function value's block (its header and its descriptor, its
 /// captures after them) and the context's chain of frame records. `ply_last` answers whether the
@@ -115,23 +116,65 @@ fn helpers() -> Bytes = {
     ]),
     b"}\n",
     b"static inline void ",
-    call_text(rel_int_fn(), [b"PlyCtx *ctx", b"Word w", b"PlyDrop d"]),
-    b" {\n",
-    Bytes::concat_all([
-      b"  if (w && !(w & ",
-      tags,
-      b")) ",
-      call_text(rel_fn(), [b"ctx", b"w", b"d"]),
-      b";\n",
-    ]),
-    b"}\n",
-    b"static inline void ",
     call_text(free_fn(), [b"PlyCtx *ctx", b"Word o", b"int64_t bytes"]),
     b" {\n",
     b"  ",
     call_text(free_block_fn(), [b"ctx", b"o", b"bytes"]),
     b";\n",
     b"}\n",
+    b"static inline void ",
+    call_text(rel_box_fn(), [b"PlyCtx *ctx", b"Word o", b"int64_t bytes"]),
+    b" {\n",
+    Bytes::concat_all([
+      b"  if (o && ",
+      call_text(last_fn(), [b"ctx", b"o"]),
+      b") ",
+      call_text(free_fn(), [b"ctx", b"o", b"bytes"]),
+      b";\n",
+    ]),
+    b"}\n",
+    b"static inline void ",
+    call_text(rel_int_fn(), [b"PlyCtx *ctx", b"Word w"]),
+    b" {\n",
+    Bytes::concat_all([
+      b"  if (!(w & ",
+      tags,
+      b")) ",
+      call_text(rel_box_fn(), [b"ctx", b"w", ascii_of_int(header_bytes() + 8)]),
+      b";\n",
+    ]),
+    b"}\n",
+    described_heads(tags),
+  ])
+}
+
+/// What a type's descriptor counts and lets go of a word form by, where that form holds no block a
+/// root lets go of (`release.word_form_heads`): an immediate's, an `Int`'s, a scalar's box of each
+/// size.
+fn described_heads(tags: Bytes) -> Bytes = {
+  let fn_of = |name: Bytes, body: Bytes|
+    Bytes::concat_all([b"static inline Word ", name, b"(PlyCtx *ctx, Word w) { ", body, b" }\n"]);
+  let immediate = immediate_heads();
+  let int = int_heads();
+  let dup = call_text(dup_fn(), [b"w"]);
+  Bytes::concat_all([
+    fn_of(immediate.dup, b"(void)ctx; return w;"),
+    fn_of(immediate.release, b"(void)ctx; (void)w; return 0;"),
+    fn_of(
+      int.dup,
+      Bytes::concat_all([b"(void)ctx; if (!(w & ", tags, b")) ", dup, b"; return w;"]),
+    ),
+    fn_of(int.release, call_text(rel_int_fn(), [b"ctx", b"w"]).concat(b"; return 0;")),
+    fn_of(box_heads(1).dup, Bytes::concat_all([b"(void)ctx; ", dup, b"; return w;"])),
+    Bytes::concat_all(
+      scalar_box_words().map(|n: Int|
+        fn_of(
+          box_heads(n).release,
+          call_text(rel_box_fn(), [b"ctx", b"w", ascii_of_int(header_bytes() + 8 * n)]).concat(
+            b"; return 0;",
+          ),
+        )),
+    ),
   ])
 }
 
@@ -172,15 +215,46 @@ test "a release takes the count, the last one dropping the block, and a checked 
   // A block given back is counted 0; its kind says nothing a count does not.
   assert_eq(checked.index_of(b"kind"), None);
   // Each release tests the count through `ply_last`, a sum's word only where it points at a block.
-  [rel_fn(), rel_sum_fn(), rel_int_fn(), free_fn()].fold((), |_: Unit, f: Bytes|
+  [rel_fn(), rel_sum_fn(), rel_int_fn(), rel_box_fn(), free_fn()].fold((), |_: Unit, f: Bytes|
     assert(
       h.index_of(Bytes::concat_all([b"static inline void ", f, b"("])) != None,
       Some(String::of_bytes_lossy(f)),
     ));
+  let defined = |f: Bytes| between(Bytes::concat_all([b" ", f, b"("]), b"}");
+  assert(defined(rel_sum_fn()).index_of(ascii_of_int(pointer_floor())) != None, None);
+  // A scalar's box holds nothing counted: its last count gives it back by its size, an `Int`'s
+  // where its word is no immediate.
   assert(
-    between(rel_sum_fn().concat(b"("), b"}").index_of(ascii_of_int(pointer_floor())) != None,
+    defined(rel_box_fn()).index_of(
+        Bytes::concat_all([
+          call_text(last_fn(), [b"ctx", b"o"]),
+          b") ",
+          call_text(free_fn(), [b"ctx", b"o", b"bytes"]),
+        ]),
+      )
+      != None,
     None,
-  )
+  );
+  assert(
+    defined(rel_int_fn()).index_of(
+        call_text(rel_box_fn(), [b"ctx", b"w", ascii_of_int(header_bytes() + 8)]),
+      )
+      != None,
+    None,
+  );
+  // A descriptor names these where a word form holds no block a root lets go of: each is defined at
+  // the type its field holds, a box's release for each size a scalar's box comes in.
+  let named = [immediate_heads(), int_heads()].concat(scalar_box_words().map(box_heads)).fold(
+    [],
+    |acc: List<Bytes>, h: { dup: Bytes, release: Bytes }| acc.push(h.dup).push(h.release),
+  );
+  assert_eq(
+    named.filter(|n: Bytes|
+      h.index_of(Bytes::concat_all([b"static inline Word ", n, b"(PlyCtx *ctx, Word w) {"]))
+        == None),
+    [],
+  );
+  assert(calls(defined(box_released_fn(2)), rel_box_fn()), None)
 }
 
 test "a drop root nests to the release depth, then puts its block off; the outermost drains what was put off" {
