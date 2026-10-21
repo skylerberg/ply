@@ -592,6 +592,107 @@ fn in_box(
   InBox({ parts: held_in(ctors, ty, l, 0, laid_of), words: words(l) })
 }
 
+/// Whether a value in a block laid as `o` is never kept, so keeping it answers 0 before anything is
+/// copied and a keep that starts copying always finishes: the block is, or reaches through any word
+/// of any case of what it holds, a task, a channel or a secret, a hold, or a function value. A handle
+/// and a hold may not outlive the entry that made them, and whether a function value may is known
+/// only from the captures it holds, so a value reaching one is not kept. A function value's own
+/// block is kept by its descriptor, which reads its captures' types alike.
+pub fn never_kept(ctors: Ctors, o: Opening) -> Bool / {abort.raise} = {
+  let first = opening_reach(ctors, o);
+  first.found
+    || iterate(
+      { seen: Map::new(), todo: first.types },
+      1000000,
+      |s: { seen: Map<Bytes, Bool>, todo: List<Type> }|
+        match s.todo {
+          [] -> Stop(false),
+          [ty, ..rest] -> {
+            let key = spelled_type(ty);
+            if s.seen.contains(key) { Continue({ ..s, todo: rest }) } else {
+              let r = type_reach(ctors, ty);
+              if r.found { Stop(true) }
+              else { Continue({ seen: s.seen.insert(key, true), todo: rest.concat(r.types) }) }
+            }
+          },
+        },
+    )
+}
+
+/// What a value reaches of what is never kept, read off its own block or its type's: whether it
+/// holds one itself, and the types of the blocks and sums its words name, which may.
+type Reach = { found: Bool, types: List<Type> }
+
+fn reached(a: Reach, b: Reach) -> Reach =
+  { found: a.found || b.found, types: a.types.concat(b.types) }
+
+/// `Reach` of a block laid as `o`.
+fn opening_reach(ctors: Ctors, o: Opening) -> Reach / {abort.raise} = {
+  let none = { found: false, types: [] };
+  let root = |k: RootKey| match k { Written(w) -> { found: false, types: [w.ty] }, _ -> none };
+  match o {
+    HandleBlock -> { found: true, types: [] },
+    Holding(_) -> { found: true, types: [] },
+    InBox(b) ->
+      b.parts.fold(none, |acc: Reach, h: Held| reached(acc, parts_reach(stored_parts(ctors, h)))),
+    ListOf(l) -> parts_reach(l.item),
+    NodeOf(n) -> parts_reach(n.item),
+    MapOf(k) -> root(k),
+    PairsOf(m) -> reached(parts_reach(m.key), parts_reach(m.value)),
+    ArrayOf(a) -> parts_reach(a.element),
+    ColumnsOf(ks) -> ks.fold(none, |acc: Reach, k: RootKey| reached(acc, root(k))),
+    _ -> none,
+  }
+}
+
+/// `Reach` of `parts`, in every case a sum among them may hold: a runtime handle or a function value
+/// found, and each type a word is counted at.
+fn parts_reach(parts: List<Part>) -> Reach =
+  parts.fold({ found: false, types: [] }, |acc: Reach, p: Part|
+    reached(acc, match p {
+      WordAt(w) -> match w.how {
+        RuntimeHandle -> { found: true, types: [] },
+        Through -> { found: true, types: [] },
+        Object(k) -> match k {
+          Written(x) -> { found: false, types: [x.ty] },
+          _ -> { found: false, types: [] },
+        },
+        SumWord(k) -> match k {
+          Written(x) -> { found: false, types: [x.ty] },
+          _ -> { found: false, types: [] },
+        },
+        IntWord(_) -> { found: false, types: [] },
+        CaseBox(c) -> { found: false, types: [c.sum] },
+      },
+      ByCase(c) ->
+        c.cases.fold(
+          { found: false, types: [] },
+          |a: Reach, k: { case: Int, parts: List<Part> }| reached(a, parts_reach(k.parts)),
+        ),
+    }))
+
+/// `Reach` of a value of `ty`: a sum's by each of its cases, a boxed case's by its box; any other
+/// type's by the block of its word.
+fn type_reach(ctors: Ctors, ty: Type) -> Reach / {abort.raise} = {
+  let laid_of = |t: Type| reps::laid(ctors, t);
+  match laid_of(ty) {
+    LSum(s) -> {
+      let declared = cases_of(ctors, ty);
+      range(0, s.cases.len()).fold({ found: false, types: [] }, |acc: Reach, k: Int|
+        match s.cases.at(k) {
+          Some(c) ->
+            reached(acc, match c.payload {
+              Boxed(b) ->
+                opening_reach(ctors, case_box_opening(ctors, ty, args_at(declared, k), b, laid_of)),
+              p -> parts_reach(case_parts(ctors, ty, k, args_at(declared, k), p)),
+            }),
+          None -> acc,
+        })
+    },
+    _ -> opening_reach(ctors, opening(ctors, ty, RWord)),
+  }
+}
+
 /// The box a case of the sum `sum` of arguments `args` is boxed in as `b` says.
 fn case_box_opening(
   ctors: Ctors,
@@ -722,7 +823,8 @@ fn walked_param(
 
 /// `copy#T`, `share#T` or `keep#T`, keyed `k`, of `o`: its block walked as `op` does. A copy takes
 /// the block and answers its copy; a share borrows it and answers whether it may cross threads; a
-/// keep borrows it and answers it kept for good.
+/// keep borrows it and answers it kept for good, or 0, with nothing walked or copied, where its type
+/// is `never_kept`: it is or reaches a runtime handle, a hold or a function value.
 fn walking_root(k: RootKey, o: Var, op: keys::TypeOp) -> Fn = {
   let shares = op == Share;
   let c = {
