@@ -62,7 +62,8 @@ import check.infer.names (value_key, Elsewise, Found, Unnamed, of_language_type,
                           module_declares, no_function_said, written_binder, simple_name_of)
 import check.infer.declarations (conv_type, op_named, effect_name, duplicate, assume, hold_written,
                                  open_region_named, rigid_params, assumed_for, OrderedPart,
-                                 own_parts, note_parts, Judged, note_sites, scheduler_handle)
+                                 own_parts, note_parts, Judged, note_sites, note_stated,
+                                 scheduler_handle)
 import check.infer.coverage (integer_of, CoveragePattern, check_exhaustive, coverage_pat, uncovered,
                              shown)
 
@@ -1815,7 +1816,7 @@ fn infer_nominal(
   // A key the declaration left to a parameter is judged here, as a constructor's is at its use.
   let keyed: Checker = if n.args.len() == 0 { whole }
   else { n.fields.fold(whole, |c: Checker, field: Field| note_map_keys(c, span, field.ty)) };
-  { checker: keyed, ty: TyNominal(n), row: walked.row }
+  { checker: note_stated_in(keyed, span, TyNominal(n)), ty: TyNominal(n), row: walked.row }
 }
 
 /// `{..b, f: e}` answers the base's own record type with the written fields replaced, and publishes the
@@ -5636,13 +5637,32 @@ fn note_map_keys(checker: Checker, span: Span, ty: Type) -> Checker / {abort.rai
 /// The parts of `ty`, a scheme its declaration was judged by instantiated at fresh variables, that
 /// what those variables stand for decides: each is judged for them alone, as the key it stands in.
 fn note_instance(checker: Checker, span: Span, ty: Type) -> Checker / {abort.raise} =
-  note_sites(
-    checker,
+  note_stated_in(
+    note_sites(
+      checker,
+      span,
+      ordered_parts(checker.carrying, ty, []).fold([], |acc: List<Judged>, p: OrderedPart|
+        ord_needs(p.key, checker.ordering).fold(acc, |b: List<Judged>, v: Int|
+          b.push({ key: TyVar(v), whole: p.key, carrier: p.carrier }))),
+    ),
     span,
-    ordered_parts(checker.carrying, ty, []).fold([], |acc: List<Judged>, p: OrderedPart|
-      ord_needs(p.key, checker.ordering).fold(acc, |b: List<Judged>, v: Int|
-        b.push({ key: TyVar(v), whole: p.key, carrier: p.carrier }))),
+    ty,
   )
+
+/// What a type mentioned in `ty` states of its arguments, recorded wherever one is: a reference
+/// instantiated at such a type builds one, and meets its `where` there.
+pub fn note_stated_in(checker: Checker, span: Span, ty: Type) -> Checker / {abort.raise} =
+  if checker.stated.len() == 0 { checker } else {
+    let within = |c: Checker, tys: List<Type>|
+      tys.fold(c, |cc: Checker, t: Type| note_stated_in(cc, span, t));
+    match ty {
+      TyCon(c) -> within(note_stated(checker, span, c.name, c.args), c.args),
+      TyNominal(n) -> within(note_stated(checker, span, n.name, n.args), n.args),
+      TyRecord(fs) -> within(checker, fs.map(|f: Field| f.ty)),
+      TyFn(f) -> within(checker, f.params.push(f.ret)),
+      TyVar(_) -> checker,
+    }
+  }
 
 /// A reference that instantiated a parameter its callee constrained, its type `ty`. An order on a
 /// parameter that a part of `ty` needs ordered is that part's to promise, read as `note_map_keys`
@@ -5680,6 +5700,7 @@ fn note_constraints(
             params: params,
             called: false,
             owner: checker.walking,
+            stated: None,
           })
         });
       { ..checker, constrained_uses: checker.constrained_uses.concat(sites) }

@@ -7,10 +7,10 @@ import syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowE
                            MRead, ty_span, is_raise)
 import syntax.items (Module, Item, IFn, IType, ITest, ILaw, ISchema, IEffectSet, IExtern,
                      is_shipped, is_builtin, FnDef, TestDef, Cases, LawDef, OfSchema, Binder,
-                     Constraint, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger, is_predicate,
-                     deriver_text, schema_of, SRequires, SEnsures, SCost, SSpace, SpecClause,
-                     Derived, parse, test_run, test_listing, IInstance, InstanceKind, NKey, NShow,
-                     INumeric, member_name, member_of, numeric_ops, numeric_by, is_pub)
+                     Constraint, Deriver, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger,
+                     is_predicate, deriver_text, schema_of, SRequires, SEnsures, SCost, SSpace,
+                     SpecClause, Derived, parse, test_run, test_listing, IInstance, InstanceKind,
+                     NKey, NShow, INumeric, member_name, member_of, numeric_ops, numeric_by, is_pub)
 import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
                      ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
                      EParallel, EBad, EHole, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign, Param,
@@ -60,7 +60,7 @@ import check.infer.checker (DeclaredAlias, DeclaredExtern, DeclaredRecord, Decla
                             simulated_names, seed_atom, builtin_type_arity, effect_of, def_of,
                             set_def, Builtin, prelude_imports, declared, builtins, refuse_externs,
                             mode_eq, is_direct, builtin_bound, insert_constraint, dedup_constraints,
-                            Shapes, derivable)
+                            Shapes, derivable, vars_of_type)
 import check.infer.names (Found, of_language_type, declared_value, written_binder, simple_name_of,
                           home_module)
 import check.infer.declarations (conv_type, conv_atom, op_named, duplicate, constraints_in_force,
@@ -3840,23 +3840,52 @@ fn carried(checker: Checker, defs: List<FnDef>) -> List<FnDef> / {abort.raise} =
   defs.map(|d: FnDef| if may_carry(d) { carried_by(checker, d) } else { d })
 
 fn carried_by(checker: Checker, def: FnDef) -> FnDef / {abort.raise} = {
+  let before = checker.constrained_uses.len();
   let s = written_signature(checker, def);
+  // A constrained type the signature names states its `where` of the arguments it is named at:
+  // the sites the conversion recorded say which parameters of `def`'s own each one is about.
+  let implied = range(before, s.checker.constrained_uses.len()).fold(
+    [],
+    |acc: List<{ deriver: Deriver, var: Int }>, i: Int| {
+      let site = s.checker.constrained_uses.get(i);
+      vars_of_type(site.ty).fold(acc, |b: List<{ deriver: Deriver, var: Int }>, v: Int|
+        if b.any(|x: { deriver: Deriver, var: Int }|
+            x.var == v && same_deriver(x.deriver, site.deriver)) { b }
+        else { b.push({ deriver: site.deriver, var: v }) })
+    },
+  );
   let needed = s.sig.params.push(s.sig.ret).fold([], |acc: List<Int>, t: Type|
     ints_union(acc, ordered_vars(checker, t)));
   def.generics.types.fold(def, |d: FnDef, g: Ident|
     match s.sig.ty_params.get(g.name) {
-      Some(TyVar(v)) -> if !needed.contains(v)
-          || d.constraints.any(|c: Constraint|
-            c.param.name == g.name && same_deriver(c.deriver, DOrd)) { d } else {
-        {
-          ..d,
-          constraints: d.constraints.push({
-            deriver: DOrd,
-            deriver_span: g.span,
-            param: g,
-            span: g.span,
-          }),
-        }
+      Some(TyVar(v)) -> {
+        let ordered: FnDef = if !needed.contains(v)
+            || d.constraints.any(|c: Constraint|
+              c.param.name == g.name && same_deriver(c.deriver, DOrd)) { d } else {
+          {
+            ..d,
+            constraints: d.constraints.push({
+              deriver: DOrd,
+              deriver_span: g.span,
+              param: g,
+              span: g.span,
+            }),
+          }
+        };
+        implied.fold(ordered, |dd: FnDef, x: { deriver: Deriver, var: Int }|
+          if x.var != v
+              || dd.constraints.any(|c: Constraint|
+                c.param.name == g.name && same_deriver(c.deriver, x.deriver)) { dd } else {
+            {
+              ..dd,
+              constraints: dd.constraints.push({
+                deriver: x.deriver,
+                deriver_span: g.span,
+                param: g,
+                span: g.span,
+              }),
+            }
+          })
       },
       _ -> d,
     })

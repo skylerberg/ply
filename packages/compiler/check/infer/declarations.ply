@@ -5,7 +5,7 @@ import syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowE
                            MWrite, ty_span, mode_text, is_raise, ident_names)
 import syntax.items (Item, IFn, IType, IEffect, FnDef, TypeDef, TDAlias, TDSum, VariantDef, OpDef,
                      Constraint, Deriver, DOrd, DNumeric, DInteger, is_predicate, TDNominal,
-                     TDExtern)
+                     TDExtern, constraint_written)
 import syntax.exprs (Param)
 import check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord,
                     Field, Scheme, atoms_covered, atoms_insert, row_empty, row_open, unit_type,
@@ -23,6 +23,7 @@ import check.lent (passed)
 import check.infer.checker (Location, DeclaredAlias, DeclaredExtern, DeclaredRecord, DeclaredSum,
                             TypeDecl, RecordDecl, OpInfo, EffectInfo, Signature, Assumed,
                             OpenRegion, Brand, HoldsOf, Tasks, RigidParam, MapKeySite, Checker,
+                            DefConstraint, ConstraintSite, insert_constraint, dedup_constraints,
                             WithTy, WithVar, WithRow, WithName, WithTys, WithAtom, hold,
                             is_region_effect, location_of, module_name, scope_of, report_error_at,
                             report_error_at_and, supplied, new_ty, new_ty_var, new_row, new_row_var,
@@ -309,13 +310,18 @@ fn conv_con(
                     args: applied_args(converted.tys, over.labels, over.rows),
                   });
                   {
-                    checker: note_parts(g.checker, span, own_parts(g.checker.carrying, built, [])),
+                    checker: note_stated(
+                      note_parts(g.checker, span, own_parts(g.checker.carrying, built, [])),
+                      span,
+                      qualified,
+                      converted.tys,
+                    ),
                     ty: built,
                   }
                 },
                 DeclaredExtern ->
                   {
-                    checker: g.checker,
+                    checker: note_stated(g.checker, span, qualified, converted.tys),
                     ty: TyCon({
                       name: qualified,
                       args: applied_args(converted.tys, over.labels, over.rows),
@@ -333,10 +339,11 @@ fn conv_con(
                         applied_args(converted.tys, over.labels, over.rows),
                       );
                       {
-                        checker: note_parts(
-                          o.checker,
+                        checker: note_stated(
+                          note_parts(o.checker, span, own_parts(o.checker.carrying, built, [])),
                           span,
-                          own_parts(o.checker.carrying, built, []),
+                          qualified,
+                          converted.tys,
                         ),
                         ty: built,
                       }
@@ -359,6 +366,14 @@ fn conv_con(
                     ),
                   )
                 } else if room <= 0 { panic("an alias expanded past the aliases there are") } else {
+                  // The alias's own `where` holds where it is named, and joins what the type being
+                  // collected carries: the expansion keeps no trace of the alias itself.
+                  let g1 = hint_stated(
+                    note_stated(g.checker, span, qualified, converted.tys),
+                    qualified,
+                    converted.tys,
+                  );
+                  let g: WithName = { ..g, checker: g1 };
                   let outermost = g.checker.alias_stack.len() == 0;
                   let before = g.checker.map_keys.len();
                   // A `Map` key's order is the using signature's to promise, so a refusal names the use.
@@ -487,6 +502,7 @@ fn declared_record(
           ty_params: vars.params,
           alias_stack: checker.alias_stack.push(qualified),
           module: decl.owner,
+          collecting: qualified,
         },
         decl,
       );
@@ -531,6 +547,7 @@ fn declared_record(
           label_params: checker.label_params,
           alias_stack: checker.alias_stack,
           module: checker.module,
+          collecting: checker.collecting,
           nominals: checked.nominals.insert(qualified, record),
         },
         record: Some(record),
@@ -899,7 +916,7 @@ pub fn duplicate(checker: Checker, name: Ident, prev: Location, what: Bytes) -> 
     [b"rename one of them"],
   )
 
-fn record_type(checker: Checker, parsed: ParsedModule, def: TypeDef) -> Checker = {
+fn record_type(checker: Checker, parsed: ParsedModule, def: TypeDef) -> Checker / {abort.raise} = {
   let name = qualify(parsed.name, def.name.name);
   match checker.types.get(name) {
     Some(prev) -> duplicate(checker, def.name, { module: prev.owner, span: prev.span }, b"type"),
@@ -920,24 +937,95 @@ fn record_type(checker: Checker, parsed: ParsedModule, def: TypeDef) -> Checker 
           TDSum(_) -> DeclaredSum,
           TDExtern -> DeclaredExtern,
         };
+        let s = stated_constraints(checker, def);
         {
-          ..checker,
-          types: checker.types.insert(name, {
+          ..s.checker,
+          types: s.checker.types.insert(name, {
             params: ident_names(def.generics.types),
             labels: ident_names(def.generics.labels),
             rows: ident_names(def.generics.effects),
+            constraints: dedup_constraints(s.constraints),
             declared: declared,
             opaque: def.opaque,
             owner: checker.module,
             span: def.span,
           }),
+          stated: if s.constraints.len() == 0 { s.checker.stated }
+          else { s.checker.stated.insert(name, dedup_constraints(s.constraints)) },
         }
       },
     },
   }
 }
 
-pub fn collect_types(checker: Checker, parsed: ParsedModule) -> Checker =
+/// A type's `where`, by the positions of the parameters it constrains. A constraint names one of
+/// the type's own type parameters, and is no predicate: a predicate's witness is an argument each
+/// call passes, and a type is written and built with no call to pass one.
+fn stated_constraints(
+  checker: Checker,
+  def: TypeDef,
+) -> { checker: Checker, constraints: List<DefConstraint> } / {abort.raise} =
+  def.constraints.fold(
+    { checker: checker, constraints: [] },
+    |acc: { checker: Checker, constraints: List<DefConstraint> }, c: Constraint| {
+      let position = match def.generics.types.find_index(|ident: Ident|
+          ident.name == c.param.name) {
+        Some(i) -> i,
+        None -> 0 - 1,
+      };
+      if position < 0 {
+        {
+          checker: report_error_at(
+            acc.checker,
+            b"E0102",
+            c.param.span,
+            Bytes::concat_all([b"`", c.param.name, b"` is not a type parameter of this type"]),
+            b"not bound by the generic list",
+            [
+              if def.generics.types.len() == 0 {
+                Bytes::concat_all([
+                  b"`",
+                  def.name.name,
+                  b"` takes no type parameters, and a constraint on a concrete type is either already true or already an error",
+                ])
+              } else {
+                b"this type binds ".concat(
+                  backticked(def.generics.types.map(|ident: Ident| ident.name), b", "),
+                )
+              },
+            ],
+          ),
+          constraints: acc.constraints,
+        }
+      } else if is_predicate(c.deriver) {
+        {
+          checker: report_error_at(
+            acc.checker,
+            b"E0102",
+            c.span,
+            Bytes::concat_all([
+              b"`",
+              constraint_written(c.deriver, c.param.name),
+              b"` is a constraint only a `fn` writes",
+            ]),
+            b"a predicate cannot state of a type",
+            [
+              b"a predicate's witness is an argument each call passes, and a type is written and built with no call to pass one",
+              b"the constraints a type takes are `derivable` of `json`, `eq`, `ord`, `bin`, `show` and `hash`",
+            ],
+          ),
+          constraints: acc.constraints,
+        }
+      } else {
+        {
+          checker: acc.checker,
+          constraints: insert_constraint(acc.constraints, { deriver: c.deriver, param: position }),
+        }
+      }
+    },
+  )
+
+pub fn collect_types(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
   parsed.module.items.fold(checker, |c: Checker, item: Item|
     match item { IType(d) -> record_type(c, parsed, d), _ -> c })
 
@@ -1190,7 +1278,7 @@ pub fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort
                 },
               );
               let own = bind_own({ ..vars.checker, ty_params: vars.params }, decl);
-              let c1: Checker = own.checker;
+              let c1: Checker = { ..own.checker, collecting: type_name };
               let result = TyCon({
                 name: type_name,
                 args: applied_args(
@@ -1246,7 +1334,13 @@ pub fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort
                   },
                 }
               });
-              { ..walked, ty_params: Map::new(), row_params: Map::new(), label_params: Map::new() }
+              {
+                ..walked,
+                ty_params: Map::new(),
+                row_params: Map::new(),
+                label_params: Map::new(),
+                collecting: c.collecting,
+              }
             },
           }
         },
@@ -1731,6 +1825,93 @@ pub fn own_parts(
     _ -> out,
   }
 }
+
+/// The constraints the type `name` states of its parameters, recorded of the arguments it is
+/// written or built at: each is judged once the module is solved, as a called definition's own is.
+pub fn note_stated(
+  checker: Checker,
+  span: Span,
+  name: Bytes,
+  args: List<Type>,
+) -> Checker / {abort.raise} =
+
+  // A declaration's own fields are judged in `with_orders`, whose table is read then: noting here
+  // would judge a carried constraint before it is known, and judge the declaration twice.
+  if checker.collecting != b"" { checker } else {
+    match checker.stated.get(name) {
+      None -> checker,
+      Some(cs) ->
+        cs.fold(checker, |c: Checker, dc: DefConstraint|
+          match args.at(dc.param) {
+            None -> c,
+            Some(ty) ->
+              note_stated_site(c, span, dc.deriver, ty, name, match c.types.get(name) {
+                Some(decl) ->
+                  decl.constraints.any(|w: DefConstraint|
+                    w.param == dc.param && same_deriver(w.deriver, dc.deriver)),
+                None -> false,
+              }),
+          }),
+    }
+  }
+
+/// One constraint the type `callee` states, or carries from what it holds, recorded of an argument
+/// it is written or built at: judged once the module is solved, as a called definition's own is.
+pub fn note_stated_site(
+  checker: Checker,
+  span: Span,
+  deriver: Deriver,
+  ty: Type,
+  callee: Bytes,
+  written: Bool,
+) -> Checker / {abort.raise} = {
+  let callee_at = match checker.types.get(callee) {
+    Some(decl) -> { module: decl.owner, span: decl.span },
+    None -> { module: checker.module, span: span },
+  };
+  {
+    ..checker,
+    constrained_uses: checker.constrained_uses.push({
+      module: checker.module,
+      span: span,
+      deriver: deriver,
+      param: 0,
+      ty: ty,
+      callee: callee,
+      callee_at: callee_at,
+      assumed: assumed_for(checker, deriver),
+      params: rigid_params(checker),
+      called: true,
+      owner: checker.walking,
+      stated: Some(written),
+    }),
+  }
+}
+
+/// A constrained alias expanded while a type's declaration is collected: the alias is gone from
+/// the field types the collection keeps, and the hint carries its `where` into what the type
+/// carries of its own parameters.
+fn hint_stated(checker: Checker, name: Bytes, args: List<Type>) -> Checker / {abort.raise} =
+  if checker.collecting == b"" { checker } else {
+    match checker.stated.get(name) {
+      None -> checker,
+      Some(cs) ->
+        cs.fold(checker, |c: Checker, dc: DefConstraint|
+          match args.at(dc.param) {
+            None -> c,
+            Some(ty) ->
+              {
+                ..c,
+                stated_hints: c.stated_hints.push({
+                  on: c.collecting,
+                  from: name,
+                  deriver: dc.deriver,
+                  ty: ty,
+                }),
+              },
+          }),
+    }
+  }
 
 pub fn note_parts(
   checker: Checker,

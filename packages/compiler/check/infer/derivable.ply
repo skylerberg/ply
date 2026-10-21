@@ -3,8 +3,8 @@
 import syntax.parsing (Span)
 import syntax.items (Item, IFn, FnDef, Deriver, DEq, DOrd, DShow, DHash, DNumeric, DInteger,
                      is_predicate, deriver_text, deriver_tag, IInstance)
-import check.types (Type, TyVar, TyCon, Field, ints_insert, ints_union, is_rigid_ty, type_text,
-                    printer_new, print_ty, TyNominal, arg_label, arg_row)
+import check.types (Type, TyVar, TyCon, TyRecord, TyFn, Field, ints_insert, ints_union, is_rigid_ty,
+                    type_text, printer_new, print_ty, TyNominal, arg_label, arg_row)
 import check.resolve.tables (Diag, Label, qualify, default_binder, error_at, label_at)
 import expand.rewrite (NumericWitness, ConcreteWitness, ParamWitness, StatedWitness)
 import expand.derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
@@ -14,12 +14,14 @@ import std.bytes
 import std.option
 import std.string
 import check.infer.checker (RecordDecl, OpInfo, EffectInfo, InstanceInfo, Assumed, RigidParam,
-                            MapKeySite, ConstraintSite, Checker, report, report_error_at,
-                            err_labels, what_of, resolve, Blocked, AlgebraicShape, Shapes,
-                            derivable, ord_needs, vars_of_type)
+                            MapKeySite, ConstraintSite, DefConstraint, StatedHint,
+                            insert_constraint, Checker, report, report_error_at, err_labels,
+                            what_of, resolve, Blocked, AlgebraicShape, Shapes, derivable, ord_needs,
+                            vars_of_type)
 import check.infer.names (simple_name_of)
-import check.infer.declarations (assume, written_signature, OrderedPart, note_parts)
-import check.infer.expr (is_int_name, op_free_vars, numeric_of, ordered_parts)
+import check.infer.declarations (assume, written_signature, OrderedPart, note_parts,
+                                 note_stated_site)
+import check.infer.expr (is_int_name, op_free_vars, numeric_of, ordered_parts, note_stated_in)
 import check.infer.definitions (algebraic_shapes, is_key)
 
 // --- Derivability ------------------------------------------------------------------------------
@@ -199,6 +201,21 @@ pub fn with_orders(checker: Checker) -> Checker / {abort.raise} = {
       _ -> acc,
     });
   let carrying = carrying_of(held.filter(|h: Holding| h.params.len() > 0), ordering);
+  // A type carries what its `where` states, and what a type its fields mention states of an
+  // argument a parameter of its own sits in, there or through the aliases the fields expanded.
+  let stated = stated_carrying(held, checker.stated, checker.stated_hints);
+  let declared: Checker = held.fold({ ..checker, stated: stated }, |c: Checker, h: Holding|
+    match c.types.get(h.name) {
+      None -> c,
+      Some(decl) -> {
+        let noted = h.fields.fold({ ..c, module: decl.owner }, |cc: Checker, f: Type|
+          note_stated_in(cc, decl.span, f));
+        let hinted = c.stated_hints.fold(noted, |cc: Checker, hint: StatedHint|
+          if hint.on != h.name { cc }
+          else { note_stated_site(cc, decl.span, hint.deriver, hint.ty, hint.from, true) });
+        { ..hinted, module: c.module }
+      },
+    });
   // The declarations and operations were read before the table was: a type they write that
   // carries an order is judged where they are written, beside the `Map`s judged then, and an alias
   // expanded then is expanded again.
@@ -207,7 +224,7 @@ pub fn with_orders(checker: Checker) -> Checker / {abort.raise} = {
       |p: OrderedPart| match p.carrier { Some(_) -> true, None -> false },
     );
   let typed = held.fold(
-    { ..checker, ordering: ordering, carrying: carrying, aliases: Map::new() },
+    { ..declared, ordering: ordering, carrying: carrying, aliases: Map::new() },
     |c: Checker, h: Holding|
       match c.types.get(h.name) {
         None -> c,
@@ -250,6 +267,77 @@ fn judged_at(
 /// A declared type as what its values hold: its parameters and the type of everything a value of it
 /// may hold.
 type Holding = { name: Bytes, params: List<Int>, fields: List<Type> }
+
+/// A constraint a type carries of one of its parameters, before the parameter's position names it.
+type StatedVar = { deriver: Deriver, var: Int }
+
+fn push_stated(xs: List<StatedVar>, deriver: Deriver, v: Int) -> List<StatedVar> =
+  if xs.any(|x: StatedVar| x.var == v && same_deriver(x.deriver, deriver)) { xs }
+  else { xs.push({ deriver: deriver, var: v }) }
+
+/// The constraints the types mentioned in `t` state of the variables their arguments hold.
+fn stated_vars(
+  table: Map<Bytes, List<DefConstraint>>,
+  t: Type,
+  out: List<StatedVar>,
+) -> List<StatedVar> / {abort.raise} = {
+  let carried = |name: Bytes, args: List<Type>|
+    match table.get(name) {
+      None -> out,
+      Some(cs) ->
+        cs.fold(out, |acc: List<StatedVar>, dc: DefConstraint|
+          match args.at(dc.param) {
+            None -> acc,
+            Some(a) ->
+              vars_of_type(a).fold(acc, |b: List<StatedVar>, v: Int| push_stated(b, dc.deriver, v)),
+          }),
+    };
+  let within = |tys: List<Type>, acc: List<StatedVar>|
+    tys.fold(acc, |a: List<StatedVar>, ty: Type| stated_vars(table, ty, a));
+  match t {
+    TyCon(c) -> within(c.args, carried(c.name, c.args)),
+    TyNominal(n) -> within(n.args, carried(n.name, n.args)),
+    TyRecord(fs) -> within(fs.map(|f: Field| f.ty), out),
+    TyFn(f) -> within(f.params.push(f.ret), out),
+    TyVar(_) -> out,
+  }
+}
+
+/// Each declared type's stated constraints: what its `where` writes, plus what a type its fields
+/// mention states of an argument a parameter of its own sits in — the least table that holds of
+/// itself, so a type that holds itself is read whole.
+fn stated_carrying(
+  held: List<Holding>,
+  seeds: Map<Bytes, List<DefConstraint>>,
+  hints: List<StatedHint>,
+) -> Map<Bytes, List<DefConstraint>> / {abort.raise} = {
+  let room = held.fold(2, |n: Int, h: Holding| n + h.params.len());
+  iterate(seeds, room, |table: Map<Bytes, List<DefConstraint>>| {
+    let next = held.fold(
+      { table: table, grew: false },
+      |acc: { table: Map<Bytes, List<DefConstraint>>, grew: Bool }, h: Holding| {
+        let needed = h.fields.fold([], |vs: List<StatedVar>, f: Type|
+          stated_vars(acc.table, f, vs));
+        let all = hints.fold(needed, |vs: List<StatedVar>, hint: StatedHint|
+          if hint.on != h.name { vs } else {
+            vars_of_type(hint.ty).fold(vs, |b: List<StatedVar>, v: Int|
+              push_stated(b, hint.deriver, v))
+          });
+        let had = match acc.table.get(h.name) { Some(xs) -> xs, None -> [] };
+        let added = all.fold(had, |cs: List<DefConstraint>, x: StatedVar|
+          match h.params.find_index(|p: Int| p == x.var) {
+            None -> cs,
+            Some(i) -> if cs.any(|c: DefConstraint|
+                c.param == i && same_deriver(c.deriver, x.deriver)) { cs }
+            else { insert_constraint(cs, { deriver: x.deriver, param: i }) },
+          });
+        if added.len() == had.len() { acc }
+        else { { table: acc.table.insert(h.name, added), grew: true } }
+      },
+    );
+    if next.grew { Continue(next.table) } else { Stop(next.table) }
+  })
+}
 
 /// The positions of the parameters each declared type needs ordered, because what it holds keys a
 /// `Map` by them, there or in a declared type it holds: the least table that holds of itself, so a
@@ -410,7 +498,12 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
                       Bytes::concat_all([
                         b"`",
                         callee,
-                        b"` declares the constraint on its signature",
+                        match site.stated {
+                          None -> b"` declares the constraint on its signature",
+                          Some(written) -> if written {
+                            b"` states the constraint on its declaration"
+                          } else { b"` carries the constraint from what it holds" },
+                        },
                       ]),
                     ),
                   ],
