@@ -8,25 +8,29 @@
 //! part of one at another type, `?lower(x)` and `?lift()`, is a call of that type's root here.
 
 import std.list
-import syntax.parsing (Span)
+import std.bytes
+import syntax.parsing (Span, dummy_span)
 import syntax.patterns (LUnit)
 import check.types (Type, TyCon, TyVar, TyFn, TyRecord, TyNominal, Field, named_type, int_type,
-                    unit_type, bytes_type)
+                    unit_type, bytes_type, spelled_type)
 import emit.typing (unknown_type)
 import emit.c (Width, width_named, width_index)
 import emit.roots (builtin_helper)
 import emit.keys
-import emit.keys (RootKey, Root, Lower, Lift)
-import emit.tir (Rep, RInt, RWord, RFloat, RNum, RAddr, Arg, AVar, AInt, Var, Val, Uses, Prim, Get,
-                 PField, PPayload, Pack, Call, Native, Op, OContainer, OHandle, Lent, Owned,
-                 Handling)
+import emit.keys (RootKey, Root, Written, TypeOp, Lower, Lift, Dup, Worded)
+import emit.tir (Rep, RInt, RWord, RFloat, RNum, RAddr, Arg, AVar, AInt, AZero, Var, Val, Uses,
+                 Prim, Get, PField, PPayload, Pack, Call, Native, Op, OContainer, OHandle, Lent,
+                 Owned, Handling, Static, Fn, Inst, Let, Do, Return, Plain, Declined, no_links,
+                 rep_of_arg)
 import emit.tir.containers (Taken, Length)
 import emit.tir.handling (Encoded, Unsettled)
+import emit.tir.statics (SPlain, SStruct, WRaw, WAddress, WEntry, WBytes, WField)
 import emit.lower.setting (builtin_at)
-import emit.lower.held (held_as)
+import emit.lower.held (held_as, held_with)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound, bound_as, done, handed, type_of,
-                        filed, noted)
-import emit.reps (type_vars)
+                        filed, unfiled, noted, static_added)
+import emit.reps (Ctors, OpMode, type_vars)
+import emit.marks (marks_of, marked_key, carried_by)
 import emit.answer (Exact)
 import emit.lower.scalars (literal)
 
@@ -40,6 +44,9 @@ pub fn encoded_externs() -> List<Bytes> =
 pub fn crossing_builtin(name: Bytes) -> Bool =
   machine_named(name) != None || name == b"?lower" || name == b"?lift" || name == b"?encode"
     || name == b"?decode"
+    || name == b"?out_carried"
+    || name == b"?in_carried"
+    || handler_builtin(name)
     || name == b"observe"
     || encoded_externs().contains(name)
 
@@ -59,7 +66,26 @@ pub fn crossed(
       [x] -> lowered_part(cx, st, x, at_type, at),
       _ -> refuse(st, Handling, b"a part lowered other than alone"),
     }
-  } else if name == b"?lift" { lifted_part(cx, st, at_type, at) } else if name == b"?encode" {
+  } else if name == b"?lift" { lifted_part(cx, st, at_type, at) } else if name == b"?out_carried" {
+    match args {
+      [x] -> {
+        let word = handed({ st: st, arg: x }, RWord, at);
+        let d = type_described(cx, word.st, at_type, at);
+        unit_after(cx, native_done(d.st, b"?out_carried", [word.arg, d.arg], false, at), at)
+      },
+      _ -> refuse(st, Handling, b"a carried value written other than alone"),
+    }
+  } else if name == b"?in_carried" {
+    let w = bound_as(
+      st,
+      at_type,
+      RWord,
+      Native({ name: native_of(name), args: [], uses: answering([], true) }),
+      at,
+    );
+    handed(w, held_as(cx.setting, at_type), at)
+  } else if handler_builtin(name) { handler_var(cx, st, name, args, at) }
+  else if name == b"?encode" {
     match args {
       [x] -> encoded(cx, st, x, at_type, true, at),
       _ -> refuse(st, Handling, b"an encoding of other than one value"),
@@ -105,6 +131,71 @@ pub fn crossed(
   }
 }
 
+/// Whether `name` is one of the elaboration's natives over a handler's variables, which the runtime
+/// holds each with its type: the first value installed, a variable read, a variable set.
+fn handler_builtin(name: Bytes) -> Bool =
+  name == b"?handler_init" || name == b"?handler_var" || name == b"?handler_set"
+
+/// Handler builtin `name` on `args`, the variable's place first: its first value given to the
+/// runtime with its type's descriptor; a read, held once more, as the type the check filed where it
+/// is written; a new value given, the one it held let go.
+fn handler_var(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  match args {
+    [i] -> if name != b"?handler_var" { refuse(st, Handling, b"a handler variable set to nothing") }
+    else {
+      match filed(cx, at) {
+        None -> unfiled(cx, st, b"a handler variable's read", at),
+        Some(t) -> {
+          let place = handed({ st: st, arg: i }, RInt, at);
+          let w = bound_as(
+            place.st,
+            t.ty,
+            RWord,
+            Native({
+              name: native_of(b"?handler_get"),
+              args: [place.arg],
+              uses: answering([place.arg], true),
+            }),
+            at,
+          );
+          handed(w, held_as(cx.setting, t.ty), at)
+        },
+      }
+    },
+    [i, x] -> {
+      let place = handed({ st: st, arg: i }, RInt, at);
+      let word = handed({ st: place.st, arg: x }, RWord, at);
+      let given = |s: Lowering, native: Bytes, operands: List<Arg>|
+        done(
+          s,
+          Native({
+            name: native_of(native),
+            args: operands,
+            uses: {
+              takes: operands.map(|a: Arg| a == word.arg),
+              owned: false,
+              fails: true,
+              stops: false,
+            },
+          }),
+          at,
+        );
+      if name == b"?handler_init" {
+        let d = type_described(cx, word.st, type_of(x), at);
+        unit_after(cx, given(d.st, b"?handler_typed", [place.arg, word.arg, d.arg]), at)
+      } else if name == b"?handler_set" {
+        unit_after(cx, given(word.st, b"?handler_put", [place.arg, word.arg]), at)
+      } else { refuse(word.st, Handling, b"a handler variable's read handed a value") }
+    },
+    _ -> refuse(st, Handling, b"a handler variable named by other than its place"),
+  }
+
 /// The type a generic crossing builtin is called at, as filed where its name is written: its first
 /// type argument; else what its first operand holds.
 fn called_at(cx: Context, callee: Span, args: List<Arg>) -> Type =
@@ -117,10 +208,12 @@ fn called_at(cx: Context, callee: Span, args: List<Arg>) -> Type =
   }
 
 /// `x`, of type `ty`, written into the innermost lowering by the root written for its type, which
-/// reads it while the call runs.
-fn lowered_part(cx: Context, st: Lowering, x: Arg, ty: Type, at: Span) -> Lowered / {abort.raise} =
-  if !settled(ty) { refuse(st, Handling, b"a value lowered at a type left open") } else {
-    let rep = held_as(cx.setting, ty);
+/// reads it while the call runs; the places of `ty` wrapped as carried, by the root that hands them
+/// over carried.
+fn lowered_part(cx: Context, st: Lowering, x: Arg, ty: Type, at: Span) -> Lowered / {abort.raise} = {
+  let held = marks_of(ty).ty;
+  if !settled(held) { refuse(st, Handling, b"a value lowered at a type left open") } else {
+    let rep = held_as(cx.setting, held);
     let h = handed({ st: st, arg: x }, rep, at);
     let unit = held_as(cx.setting, unit_type());
     bound_as(
@@ -128,7 +221,7 @@ fn lowered_part(cx: Context, st: Lowering, x: Arg, ty: Type, at: Span) -> Lowere
       unit_type(),
       unit,
       Call({
-        callee: Root(keys::written(Lower, ty, cx.setting.module)),
+        callee: Root(marked_key(Lower, ty, cx.setting.module)),
         args: [h.arg],
         conv: { params: [Lent], reps: [rep], answer: unit, answered: Owned },
         stops: false,
@@ -136,17 +229,20 @@ fn lowered_part(cx: Context, st: Lowering, x: Arg, ty: Type, at: Span) -> Lowere
       at,
     )
   }
+}
 
-/// A value of type `ty` read from the innermost lifting by the root written for its type.
-fn lifted_part(cx: Context, st: Lowering, ty: Type, at: Span) -> Lowered =
-  if !settled(ty) { refuse(st, Handling, b"a value lifted at a type left open") } else {
-    let rep = held_as(cx.setting, ty);
+/// A value of type `ty` read from the innermost lifting by the root written for its type; the places
+/// of `ty` wrapped as carried, by the root that takes them carried.
+fn lifted_part(cx: Context, st: Lowering, ty: Type, at: Span) -> Lowered / {abort.raise} = {
+  let held = marks_of(ty).ty;
+  if !settled(held) { refuse(st, Handling, b"a value lifted at a type left open") } else {
+    let rep = held_as(cx.setting, held);
     bound_as(
       st,
-      ty,
+      held,
       rep,
       Call({
-        callee: Root(keys::written(Lift, ty, cx.setting.module)),
+        callee: Root(marked_key(Lift, ty, cx.setting.module)),
         args: [],
         conv: { params: [], reps: [], answer: rep, answered: Owned },
         stops: false,
@@ -154,6 +250,7 @@ fn lifted_part(cx: Context, st: Lowering, ty: Type, at: Span) -> Lowered =
       at,
     )
   }
+}
 
 /// Whether `ty` names every part of a value of it: no type variable and no word erased to `_`.
 fn settled(ty: Type) -> Bool =
@@ -578,3 +675,245 @@ fn native_int(
 /// `()`, the value of what is done for its effect alone.
 fn unit_after(cx: Context, st: Lowering, at: Span) -> Lowered / {abort.raise} =
   literal(cx, st, LUnit, at)
+
+// --- Descriptors ---------------------------------------------------------------------------
+
+/// The address of `type#T`, the descriptor the runtime counts and crosses a value of type `t`
+/// through, bound as an uncounted word, its static added with the roots its words name. At a type a
+/// body generic over it leaves open, the specialisations its callers settle describe it.
+pub fn type_described(cx: Context, st: Lowering, t: Type, at: Span) -> Lowered / {abort.raise} =
+  if !settled(t) {
+    bound_as(
+      type_vars(t).fold(st, |s: Lowering, v: Int| noted(s, { var: v, reads: Exact })),
+      int_type(),
+      RInt,
+      Op({
+        op: OHandle(Unsettled(b"type#".concat(spelled_type(t)))),
+        args: [],
+        uses: { takes: [], owned: false, fails: false, stops: false },
+      }),
+      at,
+    )
+  } else {
+    let s = type_static(cx.setting.module, st, t, []);
+    bound_as(s.st, int_type(), RInt, Static(s.name), at)
+  }
+
+/// `st` holding `op#`, the descriptor of operation `op` of effect `eff` as a perform at argument types
+/// `params` answering `answer` meets it, and that static's name: the effect's and the operation's
+/// field-table entries; the answer's type, each place an own type parameter stands at taken carried;
+/// which parameters are one of those parameters whole, kept carried; each parameter's type, a place
+/// of one nested in it crossing carried; and the type each own type parameter stands for, in the
+/// order `op` declares them. `None` where a type is left open, the specialisations' to settle.
+pub fn op_described(
+  cx: Context,
+  st: Lowering,
+  eff: Bytes,
+  op: OpMode,
+  params: List<Type>,
+  answer: Type,
+) -> { st: Lowering, name: Option<Bytes> } / {abort.raise} =
+  if !params.push(answer).all(settled) {
+    {
+      st: params.push(answer).fold(st, |s: Lowering, t: Type|
+        type_vars(t).fold(s, |n: Lowering, v: Int| noted(n, { var: v, reads: Exact }))),
+      name: None,
+    }
+  } else {
+    let module = cx.setting.module;
+    let declared = |i: Int| match op.params.at(i) { Some(d) -> d, None -> unknown_type() };
+    let whole = |i: Int| match declared(i) { TyVar(v) -> op.own.contains(v), _ -> false };
+    let walked = range(0, params.len()).map(|i: Int|
+      carried_by(declared(i), params.get(i), op.own));
+    let ret = carried_by(op.ret, answer, op.own);
+    let bound = walked.fold(
+      [],
+      |acc: List<{ var: Int, ty: Type }>, x: { marked: Type, bound: List<{ var: Int, ty: Type }> }|
+        acc.concat(x.bound),
+    ).concat(
+      ret.bound,
+    );
+    let vars = op.own.map(|v: Int|
+      bound.fold(None, |found: Option<Type>, b: { var: Int, ty: Type }|
+        if found == None && b.var == v { Some(b.ty) } else { found }));
+    if vars.any(|t: Option<Type>| t == None) { { st: st, name: None } } else {
+      let typed = |s: Lowering, t: Type, marks: List<Int>| type_static(module, s, t, marks);
+      let answered = typed(st, answer, marks_of(ret.marked).marks);
+      let taken = range(0, params.len()).fold(
+        { st: answered.st, names: [] },
+        |acc: { st: Lowering, names: List<Bytes> }, i: Int| {
+          let d = typed(acc.st, params.get(i), if whole(i) { [] }
+          else { marks_of(walked.get(i).marked).marks });
+          { st: d.st, names: acc.names.push(d.name) }
+        },
+      );
+      let stood = vars.fold(
+        { st: taken.st, names: [] },
+        |acc: { st: Lowering, names: List<Bytes> }, t: Option<Type>|
+          match t {
+            Some(x) -> {
+              let d = typed(acc.st, x, []);
+              { st: d.st, names: acc.names.push(d.name) }
+            },
+            None -> acc,
+          },
+      );
+      let listed = |s: Lowering, names: List<Bytes>|
+        if names.len() == 0 { { st: s, word: WRaw(0) } } else {
+          let l = static_added(s, SPlain(names.map(|n: Bytes| WAddress({ name: n, tag: 0 }))));
+          { st: l.st, word: WAddress({ name: l.name, tag: 0 }) }
+        };
+      let ps = listed(stood.st, taken.names);
+      let vs = listed(ps.st, stood.names);
+      let d = static_added(
+        vs.st,
+        SStruct({
+          of: b"PlyOp",
+          fields: [
+            WField(eff),
+            WField(op.name),
+            WAddress({ name: answered.name, tag: 0 }),
+            WRaw(
+              range(0, params.len()).fold(0, |m: Int, i: Int|
+                if whole(i) { m + (1 << i) } else { m }),
+            ),
+            WRaw(params.len()),
+            ps.word,
+            WRaw(stood.names.len()),
+            vs.word,
+          ],
+        }),
+      );
+      { st: d.st, name: Some(d.name) }
+    }
+  }
+
+/// `st` holding `type#T` for `t` as module `module` asks for it, the places `marks` names crossing
+/// as carried: `t`'s identity and spelling, then the entries the runtime calls over a value's word
+/// form, `dup#T`, `release#T`, and the word-form lowering and lifting; and the static's name.
+fn type_static(
+  module: Bytes,
+  st: Lowering,
+  t: Type,
+  marks: List<Int>,
+) -> { st: Lowering, name: Bytes } / {abort.raise} = {
+  let spelled = spelled_type(t);
+  let text = static_added(st, SPlain([WBytes(spelled)]));
+  let marked = |op: TypeOp|
+    match keys::written(op, t, module) { Written(w) -> Written({ ..w, marks: marks }), k -> k };
+  static_added(
+    text.st,
+    SStruct({
+      of: b"PlyType",
+      fields: [
+        WRaw(match spelled.blake3().u64_at(0) { Some(n) -> n, None -> 0 }),
+        WAddress({ name: text.name, tag: 0 }),
+        WRaw(spelled.len()),
+        WEntry(keys::written(Dup, t, module)),
+        WEntry(keys::written(keys::Release, t, module)),
+        WEntry(marked(Worded(Lower))),
+        WEntry(marked(Worded(Lift))),
+      ],
+    }),
+  )
+}
+
+/// The entry `type#T` names for `k`, `Worded(Lower)` or `Worded(Lift)` of `T`: handed `T`'s word
+/// form, lent, the lowering of the value it is, answering nothing; or the lifting, answering the
+/// value's word form, owned.
+pub fn worded(ctors: Ctors, k: RootKey) -> Result<Fn, Declined> =
+  match k {
+    Written(w) -> {
+      let rep = held_with(ctors, w.ty);
+      let word = { id: 0, ty: w.ty, rep: RWord };
+      let held = { id: 1, ty: w.ty, rep: rep };
+      let call = |op: TypeOp, args: List<Arg>, answer: Rep|
+        Call({
+          callee: Root(Written({ ..w, op: op })),
+          args: args,
+          conv: {
+            params: args.map(|_: Arg| Lent),
+            reps: args.map(rep_of_arg),
+            answer: answer,
+            answered: Owned,
+          },
+          stops: false,
+        });
+      let opened = rep == RWord;
+      match w.op {
+        Worded(Lower) ->
+          Ok(
+            entry_fn(
+              k,
+              [word],
+              (if opened { [] } else {
+                [
+                  Let({
+                    var: held,
+                    val: Pack({ arg: AVar(word), to: rep }),
+                    at: dummy_span(),
+                    unwind: [],
+                  }),
+                ]
+              }).concat([
+                Let({
+                  var: { id: 2, ty: unit_type(), rep: held_with(ctors, unit_type()) },
+                  val: call(
+                    Lower,
+                    [AVar(if opened { word } else { held })],
+                    held_with(ctors, unit_type()),
+                  ),
+                  at: dummy_span(),
+                  unwind: [],
+                }),
+                Return(AZero(RWord)),
+              ]),
+            ),
+          ),
+        Worded(Lift) -> {
+          let out = { id: 2, ty: w.ty, rep: RWord };
+          Ok(
+            entry_fn(
+              k,
+              [],
+              [Let({ var: held, val: call(Lift, [], rep), at: dummy_span(), unwind: [] })].concat(
+                if opened { [Return(AVar(held))] } else {
+                  [
+                    Let({
+                      var: out,
+                      val: Pack({ arg: AVar(held), to: RWord }),
+                      at: dummy_span(),
+                      unwind: [],
+                    }),
+                    Return(AVar(out)),
+                  ]
+                },
+              ),
+            ),
+          )
+        },
+        _ -> Err({ by: Handling, why: b"a word-form entry of other than a lowering or a lifting" }),
+      }
+    },
+    _ -> Err({ by: Handling, why: b"a word-form entry of no type" }),
+  }
+
+/// Root `k`, taking `params` lent at their own reps, running `body` and answering a word.
+fn entry_fn(k: RootKey, params: List<Var>, body: List<Inst>) -> Fn =
+  {
+    key: k,
+    kind: Plain,
+    params: params,
+    conv: {
+      params: params.map(|_: Var| Lent),
+      reps: params.map(|v: Var| v.rep),
+      answer: RWord,
+      answered: Owned,
+    },
+    body: body,
+    lambdas: [],
+    base: 0,
+    members: [],
+    links: no_links(),
+    statics: [],
+  }
