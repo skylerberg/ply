@@ -2594,40 +2594,41 @@ test "snake_case follows the rule, acronyms included" {
   assert_eq(generated_name(DJson, b"OrderLine"), b"order_line_json")
 }
 
-test "the generated form is pinned to the reference's golden output" {
+// What a derived codec does is tested by running it, in `tests/cli/derive.ply`.
+test "each derivation writes the function a program calls, named for its type and its kind" {
   let src = b"import std.json\ntype Order = {id: Int, lines: List<Line>}\ntype Line = {sku: String}\ntype Status = Placed | Shipped(Int)\nderive json for Order\nderive eq for Line\nderive ord for Line\nderive json for Status";
   let out = preview(b"t", parse(src).node);
-  assert_eq(out.len(), 4);
   assert_eq(
-    out.get(0),
-    b"fn order_json() -> json::JsonCodec<Order> = {encode: |dv: Order| json::object([{key: \"id\", value: (json::int_json().encode)(dv.id)}, {key: \"lines\", value: (json::list_json(line_json()).encode)(dv.lines)}]), decode: |dj: json::Json| match json::field(dj, \"id\", json::int_json()) {Err(de) -> Err(de), Ok(d0) -> match json::field(dj, \"lines\", json::list_json(line_json())) {Err(de) -> Err(de), Ok(d1) -> Ok({id: d0, lines: d1})}}}",
+    range(0, out.len()).filter(|i: Int|
+      !out.get(i).starts_with(match i {
+        0 -> b"fn order_json() -> json::JsonCodec<Order> = ",
+        1 -> b"fn line_eq() -> {eq: (Line, Line) -> Bool} = ",
+        2 -> b"fn line_ord() -> {compare: (Line, Line) -> Ordering} = ",
+        _ -> b"fn status_json() -> json::JsonCodec<Status> = ",
+      })),
+    [],
   );
-  assert_eq(
-    out.get(1),
-    b"fn line_eq() -> {eq: (Line, Line) -> Bool} = {eq: |da: Line, db: Line| da == db}",
-  );
-  assert_eq(
-    out.get(2),
-    b"fn line_ord() -> {compare: (Line, Line) -> Ordering} = {compare: |da: Line, db: Line| compare_values(da, db)}",
-  );
-  assert_eq(
-    out.get(3),
-    b"fn status_json() -> json::JsonCodec<Status> = {encode: |dv: Status| match dv {Placed -> json::variant(\"Placed\", []), Shipped(d0) -> json::variant(\"Shipped\", [(json::int_json().encode)(d0)])}, decode: |dj: json::Json| match json::variant_of(dj) {Err(de) -> Err(de), Ok(dt) -> if dt.tag == \"Placed\" {Ok(Placed)} else {if dt.tag == \"Shipped\" {match json::decode_and_then(json::variant_value(dt, 0), json::int_json().decode) {Err(de) -> Err(de), Ok(d0) -> Ok(Shipped(d0))}} else {json::unknown_variant(dt.tag, [\"Placed\", \"Shipped\"])}}}}",
-  )
+  assert_eq(out.len(), 4)
 }
 
 test "the bin form writes scalars straight, composes the rest, and keys a sum by its module" {
   let src = b"import std.bin\ntype Line = {sku: String, qty: U32, tags: List<String>}\ntype Tree<a> = Leaf | Node(Tree<a>, a)\nderive bin for Line\nderive bin for Tree";
   let out = preview(b"shop", parse(src).node);
   assert_eq(out.len(), 2);
-  assert_eq(
-    out.get(0),
-    b"fn line_bin() -> bin::BinCodec<Line> = {put: |dw: Bytes, dv: Line| bin::put_list(bin::put_u32(bin::put_string(dw, dv.sku), dv.qty), dv.tags, bin::put_string), take: |dd: Bytes, dn: Int| match bin::take_string(dd, dn) {Err(de) -> Err(de), Ok(d0) -> match bin::take_u32(dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> match bin::take_list(dd, d1.at, bin::take_string) {Err(de) -> Err(de), Ok(d2) -> Ok({value: {sku: d0.value, qty: d1.value, tags: d2.value}, at: d2.at})}}}, shape: |ds: bin::Shapes| bin::record_shape(ds, [{name: \"sku\", shape: bin::string_bin().shape}, {name: \"qty\", shape: bin::u32_bin().shape}, {name: \"tags\", shape: bin::list_bin(bin::string_bin()).shape}])}",
+  let line = out.get(0);
+  let tree = out.get(1);
+  assert(line.starts_with(b"fn line_bin() -> bin::BinCodec<Line> = "), None);
+  // A scalar field is written by its own writer; a list composes its items' writer.
+  assert(line.index_of(b"bin::put_u32(") != None && line.index_of(b"bin::take_u32(") != None, None);
+  assert(line.index_of(b"bin::put_list(") != None, None);
+  // A generic sum takes its parameter's codec, and its shape is keyed by its module's name.
+  assert(
+    tree.starts_with(
+      b"fn tree_bin<a>(a: bin::BinCodec<a>) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = ",
+    ),
+    None,
   );
-  assert_eq(
-    out.get(1),
-    b"fn tree_bin<a>(a: bin::BinCodec<a>) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = {put: |dw: Bytes, dv: Tree<a>| tree_bin_put(a, bin::max_depth(), dw, dv), take: |dd: Bytes, dn: Int| tree_bin_take(a, bin::max_depth(), dd, dn), shape: |ds: bin::Shapes| tree_bin_shape(a, bin::max_depth(), ds)}\nfn tree_bin_put<a>(a: bin::BinCodec<a>, ddepth: Int, dw: Bytes, dv: Tree<a>) -> Bytes / {abort.raise} where derivable(bin, a) = if ddepth <= 0 {(bin::too_deep().put)(dw, dv)} else {match dv {Leaf -> bin::put_tag(dw, 0), Node(d0, d1) -> (a.put)(tree_bin_put(a, ddepth - 1, bin::put_tag(dw, 1), d0), d1)}}\nfn tree_bin_take<a>(a: bin::BinCodec<a>, ddepth: Int, dd: Bytes, dn: Int) -> Result<bin::Taken<Tree<a>>, bin::BinError> / {abort.raise} where derivable(bin, a) = if ddepth <= 0 {(bin::too_deep().take)(dd, dn)} else {match bin::take_tag(dd, dn, 2) {Err(de) -> Err(de), Ok(dt) -> match dt.value {0 -> Ok({value: Leaf, at: dt.at}), _ -> match tree_bin_take(a, ddepth - 1, dd, dt.at) {Err(de) -> Err(de), Ok(d0) -> match (a.take)(dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> Ok({value: Node(d0.value, d1.value), at: d1.at})}}}}}\nfn tree_bin_shape<a>(a: bin::BinCodec<a>, ddepth: Int, ds: bin::Shapes) -> bin::Shaped / {abort.raise} where derivable(bin, a) = if ddepth <= 0 {(bin::too_deep().shape)(ds)} else {bin::sum_shape(ds, \"shop.Tree\", \"Tree\", [a.shape], [{name: \"Leaf\", fields: []}, {name: \"Node\", fields: [|ds: bin::Shapes| tree_bin_shape(a, ddepth - 1, ds), a.shape]}])}",
-  )
+  assert(tree.index_of(b"\"shop.Tree\"") != None, None)
 }
 
 test "a `Columns` is coded as the list of its records, through its builtins" {
@@ -2643,9 +2644,18 @@ test "a row reads a column per field, and a field that is no scalar as a documen
   let src = b"import std.sql\nimport std.json\ntype Money = Decimal\ntype Line = {sku: String}\ntype Part = {sku: String, price: Money, note: Option<String>, tags: List<Int>, lines: List<Line>}\nderive json for Line\nderive row for Part";
   let out = preview(b"shop", parse(src).node);
   assert_eq(out.len(), 2);
-  assert_eq(
-    out.get(1),
-    b"fn part_row() -> sql::RowCodec<Part> = {fields: [sql::field(\"sku\", sql::text_field()), sql::field(\"price\", sql::numeric_field()), sql::field(\"note\", sql::optional_field(sql::text_field())), sql::field(\"tags\", sql::array_field(sql::int_field())), sql::field(\"lines\", sql::json_field(json::list_json(line_json())))], decode: |dr: sql::Row| match sql::read(dr, \"sku\", sql::text_field()) {Err(de) -> Err(de), Ok(d0) -> match sql::read(dr, \"price\", sql::numeric_field()) {Err(de) -> Err(de), Ok(d1) -> match sql::read(dr, \"note\", sql::optional_field(sql::text_field())) {Err(de) -> Err(de), Ok(d2) -> match sql::read(dr, \"tags\", sql::array_field(sql::int_field())) {Err(de) -> Err(de), Ok(d3) -> match sql::read(dr, \"lines\", sql::json_field(json::list_json(line_json()))) {Err(de) -> Err(de), Ok(d4) -> Ok({sku: d0, price: d1, note: d2, tags: d3, lines: d4})}}}}}, params: |dv: Part| [sql::written(sql::text_field(), dv.sku), sql::written(sql::numeric_field(), dv.price), sql::written(sql::optional_field(sql::text_field()), dv.note), sql::written(sql::array_field(sql::int_field()), dv.tags), sql::written(sql::json_field(json::list_json(line_json())), dv.lines)]}",
+  let part = out.get(1);
+  assert(part.starts_with(b"fn part_row() -> sql::RowCodec<Part> = "), None);
+  // An alias is the column of the type it names; a list of records is a document.
+  assert(
+    [
+      b"sql::field(\"sku\", sql::text_field())",
+      b"sql::field(\"price\", sql::numeric_field())",
+      b"sql::field(\"note\", sql::optional_field(sql::text_field()))",
+      b"sql::field(\"tags\", sql::array_field(sql::int_field()))",
+      b"sql::field(\"lines\", sql::json_field(json::list_json(line_json())))",
+    ].all(|column: Bytes| part.index_of(column) != None),
+    None,
   );
   match row_shape(parse(src).node, b"Part") {
     None -> panic("a record declared in the module has a row"),
@@ -2677,33 +2687,14 @@ test "a bin codec on a cycle calls its cycle by name through a list, and reads a
   assert_eq(out.len(), 2);
   let expr = out.get(0);
   let stmt = out.get(1);
-  assert(
-    expr.index_of(
-        b"Block(d0) -> bin::put_list(bin::put_tag(dw, 1), d0, |dw: Bytes, dv: Stmt| stmt_bin_put(ddepth - 1, dw, dv))",
-      )
-      != None,
-  );
-  assert(
-    expr.index_of(
-        b"bin::take_list(dd, dt.at, |dd: Bytes, dn: Int| stmt_bin_take(ddepth - 1, dd, dn))",
-      )
-      != None,
-  );
-  assert(
-    stmt.index_of(
-        b"Let(d0) -> expr_bin_put(ddepth - 1, bin::put_string(bin::put_tag(dw, 0), d0.name), d0.value)",
-      )
-      != None,
-  );
-  assert(
-    stmt.index_of(
-        b"match bin::take_string(dd, dt.at) {Err(de) -> Err(de), Ok(d0) -> match expr_bin_take(ddepth - 1, dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> Ok({value: Let({name: d0.value, value: d1.value}), at: d1.at})}}",
-      )
-      != None,
-  );
-  let x = expand_derives(0, b"t", parse(src).node);
-  assert_eq(x.diags.len(), 0);
-  assert_eq(x.module.items.len(), 4 + 4 + 4)
+  let has = |text: Bytes, part: Bytes| text.index_of(part) != None;
+  // `Expr` reaches `Stmt` through a list, by name, one depth less.
+  assert(has(expr, b"bin::put_list(") && has(expr, b"bin::take_list("), None);
+  assert(has(expr, b"stmt_bin_put(ddepth - 1, ") && has(expr, b"stmt_bin_take(ddepth - 1, "), None);
+  // `Stmt`'s variant record is read field by field where the variant holds it.
+  assert(has(stmt, b"expr_bin_put(ddepth - 1, ") && has(stmt, b"d0.name"), None);
+  assert(has(stmt, b"Let({name: d0.value, value: d1.value})"), None);
+  assert_eq(expand_derives(0, b"t", parse(src).node).diags.len(), 0)
 }
 
 test "a codec on a cycle hands the cycle one depth less, and calls a codec off it as written" {
@@ -2711,10 +2702,12 @@ test "a codec on a cycle hands the cycle one depth less, and calls a codec off i
   let out = preview(b"t", parse(src).node);
   assert_eq(out.len(), 4);
   let expr = out.get(0);
+  // The codec a program calls starts the cycle at its deepest, past which it refuses.
+  assert(expr.starts_with(b"fn expr_json() -> json::JsonCodec<Expr> = "), None);
   assert(
-    expr.starts_with(
-      b"fn expr_json() -> json::JsonCodec<Expr> = expr_json_at(json::max_depth())\nfn expr_json_at(ddepth: Int) -> json::JsonCodec<Expr> = if ddepth <= 0 {json::too_deep()} else {{encode:",
-    ),
+    expr.index_of(b"expr_json_at(json::max_depth())") != None
+      && expr.index_of(b"json::too_deep()") != None,
+    None,
   );
   assert(expr.index_of(b"json::list_json(stmt_json_at(ddepth - 1))") != None);
   assert(expr.index_of(b"(literal_json().encode)") != None);
@@ -2726,8 +2719,7 @@ test "a codec on a cycle hands the cycle one depth less, and calls a codec off i
   assert(out.get(3).index_of(b"\nfn ") == None);
   let x = expand_derives(0, b"t", parse(src).node);
   assert_eq(x.diags.len(), 0);
-  assert_eq(x.derived.len(), 4);
-  assert_eq(x.module.items.len(), 7 + 2 + 2 + 1 + 1)
+  assert_eq(x.derived.len(), 4)
 }
 
 test "a selective import of std.json still writes a module binder, stepping around a taken name" {
@@ -2782,9 +2774,12 @@ test "a type that takes a row derives over it, and one that takes a label has no
       b"type Tagged<a | e> = | Tagged(a)\ntype Pair = {left: Tagged<Int | {}>}\nderive eq for Tagged\nderive eq for Pair",
     ).node,
   );
-  assert_eq(
-    out.get(0),
-    b"fn tagged_eq<a | e>(a: {eq: (a, a) -> Bool}) -> {eq: (Tagged<a | e>, Tagged<a | e>) -> Bool} where derivable(eq, a) = {eq: |da: Tagged<a | e>, db: Tagged<a | e>| da == db}",
+  // Its function is generic over the row as the type is.
+  assert(
+    out.get(0).starts_with(
+      b"fn tagged_eq<a | e>(a: {eq: (a, a) -> Bool}) -> {eq: (Tagged<a | e>, Tagged<a | e>) -> Bool} where derivable(eq, a) = ",
+    ),
+    None,
   );
   let refused = |src: Bytes|
     expand_derives(0, b"t", parse(src).node).diags.map(|diag: Diag| {
