@@ -193,7 +193,7 @@ impl Ctx {
     }
 
     /// The crossing's bytes compiled code copies out, held until it does.
-    fn give(&mut self, bytes: Vec<u8>) -> I64 {
+    pub(crate) fn give(&mut self, bytes: Vec<u8>) -> I64 {
         self.taken = bytes;
         I64(self.taken.len() as i64)
     }
@@ -203,7 +203,7 @@ impl Ctx {
 ///
 /// # Safety
 /// `p` holds `n` bytes, or `n` is 0.
-unsafe fn lent<'a>(p: Addr, n: I64) -> &'a [u8] {
+pub(crate) unsafe fn lent<'a>(p: Addr, n: I64) -> &'a [u8] {
     if n.0 <= 0 {
         return &[];
     }

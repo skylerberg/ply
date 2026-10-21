@@ -10,7 +10,7 @@ use crate::c::{MachineNative, machine_native};
 use crate::emitted::Handle;
 use crate::heap::{KIND_BRIDGE, bridged, obj};
 use crate::native::{Addr, F64, I64};
-use crate::rt::Ctx;
+use crate::rt::{Ctx, lent};
 use ply_core::builtins::call;
 use ply_core::{Builtin, Decimal, Diagnostic, Fixed, IntTy, Span, Value, codes};
 
@@ -85,17 +85,6 @@ pub fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// The `n` bytes emitted code lends at `p`.
-///
-/// # Safety
-/// `p` holds `n` bytes, or `n` is 0.
-unsafe fn lent<'a>(p: Addr, n: I64) -> &'a [u8] {
-    if n.0 <= 0 {
-        return &[];
-    }
-    unsafe { std::slice::from_raw_parts(p.0, n.0 as usize) }
-}
-
 #[cold]
 #[inline(never)]
 fn err_machine(why: &str) -> Diagnostic {
@@ -108,12 +97,6 @@ fn err_machine(why: &str) -> Diagnostic {
 }
 
 impl Ctx {
-    /// `bytes` left as the taken bytes, and how many they are.
-    fn answered(&mut self, bytes: Vec<u8>) -> I64 {
-        self.taken = bytes;
-        I64(self.taken.len() as i64)
-    }
-
     /// What value builtin `b` answers over `args`; `None` with the context failed where it errs,
     /// which none of the builtins called here does over arguments of their types.
     fn builtin(&mut self, b: Builtin, args: Vec<Value>) -> Option<Value> {
@@ -140,8 +123,8 @@ impl Ctx {
     /// The bytes of the string or byte string builtin `b` answers over `args`, as taken bytes.
     fn taken_of(&mut self, b: Builtin, args: Vec<Value>) -> I64 {
         match &self.builtin(b, args) {
-            Some(Value::Str(s)) => self.answered(s.as_bytes().to_vec()),
-            Some(Value::Bytes(b)) => self.answered(b.to_vec()),
+            Some(Value::Str(s)) => self.give(s.as_bytes().to_vec()),
+            Some(Value::Bytes(b)) => self.give(b.to_vec()),
             Some(other) => {
                 self.fail(err_machine(&format!(
                     "{} answered where bytes were",
@@ -169,7 +152,7 @@ impl Ctx {
                 return I64(-1);
             }
         };
-        self.answered(words)
+        self.give(words)
     }
 }
 
@@ -183,7 +166,7 @@ pub unsafe extern "C" fn rt_utf8_valid(_: *mut Ctx, p: Addr, n: I64) -> I64 {
 /// The `n` bytes at `p` as UTF-8, each run that is not replaced by U+FFFD, as taken bytes.
 pub unsafe extern "C" fn rt_utf8_lossy(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     let text = String::from_utf8_lossy(unsafe { lent(p, n) }).into_owned();
-    unsafe { &mut *ctx }.answered(text.into_bytes())
+    unsafe { &mut *ctx }.give(text.into_bytes())
 }
 
 /// The string at `p` in lower case, as taken bytes.
@@ -306,7 +289,7 @@ pub unsafe extern "C" fn rt_taken_word(ctx: *mut Ctx, k: I64) -> I64 {
 /// The BLAKE3 digest of the `n` bytes at `p`, as taken bytes.
 pub unsafe extern "C" fn rt_blake3(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     let digest = blake3::hash(unsafe { lent(p, n) });
-    unsafe { &mut *ctx }.answered(digest.as_bytes().to_vec())
+    unsafe { &mut *ctx }.give(digest.as_bytes().to_vec())
 }
 
 /// `Bytes::gzip` of the `n` bytes at `p`, as taken bytes.
@@ -330,7 +313,7 @@ pub unsafe extern "C" fn rt_gunzip(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
         vec![Value::bytes(unsafe { lent(p, n) })],
     ) {
         Some(Value::Ctor { name, args }) if name.as_str() == "Some" => match args.first() {
-            Some(Value::Bytes(b)) => c.answered(b.to_vec()),
+            Some(Value::Bytes(b)) => c.give(b.to_vec()),
             _ => I64(-1),
         },
         _ => I64(-1),
