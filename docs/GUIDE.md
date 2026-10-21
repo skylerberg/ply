@@ -712,8 +712,8 @@ raise nothing. `pub const fn` publishes it; `const` goes with neither
 `ply check`, `ply run`, `ply test`, `ply prove` and `ply build` evaluate each
 `const fn` the program holds before they do anything else with the load (§16),
 under a budget of 100000000 calls. One that raises is `E0157`, saying what it
-raised and where; one that spends the budget, or whose value takes more than
-16777216 bytes kept, is `E0158`. Each is placed at the definition, and nothing
+raised and where; one that spends the budget, or whose value's encoding takes
+more than 16777216 bytes, is `E0158`. Each is placed at the definition, and nothing
 of the program runs. The value is kept in the toolchain's cache (§8.6) under the
 definition's hash, which covers its body, all it reaches and the bytes of every
 file it embeds (§3.4), and under the names of what it reaches, which a value
@@ -721,9 +721,10 @@ names its constructors by: an edit to any of those evaluates it again, and
 nothing else does but another `ply`.
 
 Every unit emitted after that holds the value as data in place of the body, a
-built artifact's among them (§15). A call of the definition reads the value,
-laid out by the run's first read of it, and enters nothing of the body:
-`metered` (§8.1) counts no step and no allocation for it. A program no build
+built artifact's among them (§15), laid out when the unit is built as a run lays
+out a value of its type. A call of the definition reads the value where it lies
+and enters nothing of the body: `metered` (§8.1) counts no step and no
+allocation for it. A program no build
 kept the values of, such as a mutant (§8.5) or the mixture a bisection runs
 (§8.4), evaluates the body in its place, once a run, as it does any definition
 that takes nothing; the value is the same either way, since the body is pure.

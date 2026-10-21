@@ -3,12 +3,17 @@
 //! and its helper table are the runtime's to say, and are handed in.
 
 import store.hash.encoding (hex)
-import check.types (Type, TyVar, Scheme, type_text, type_spelled, digits)
+import check.types (Type, TyVar, TyFn, Scheme, type_text, type_spelled, digits, string_type)
 import emit.answer (Answer, Body, Refused, RootAnswer, Tables, Defined, Head, Expect, word_head,
                     no_generics, answer_bin, tables_bin, no_tables, GenericCall, Generics, Need,
                     Pass, Reads, Scalar, Layout, Exact, settled_by_callers)
 import emit.tir.statics (StaticDef, SFile, StaticWord, WField, named, words_of)
 import emit.print.statics (static_c, static_extern, escaped, c_string)
+import emit.statics (known_of_value, kept_root)
+import emit.entry (Formed, emitted_of)
+import emit.release (root_of)
+import std.value
+import std.value (Value, VList, VInt, VRecord, VStr, VMap)
 import emit.statics (SStr, statics_of)
 import emit.roots (builtin_helper, symbol_of, entry_of, root_id)
 import emit.keys
@@ -49,7 +54,7 @@ import syntax.parsing
 import syntax.parsing (no_module)
 import syntax.items (homes_called, homes_declaring)
 import syntax.exprs (prelude_module)
-import emit.print.counting (int_released_fn, box_released_fn)
+import emit.print.counting (int_released_fn, box_released_fn, same_word_fn)
 
 // --- What crosses the seam ----------------------------------------------------
 
@@ -107,8 +112,8 @@ pub effect shipped {
   read front(linked: Linked) -> Bytes
   /// What each of `roots`, each a `stored_root` of a `const` definition, answers on the unit
   /// compiled over that front end's answer into the library `library`, each called alone with
-  /// nothing lent and under `steps` calls: the text its value is kept as, or none where it raised,
-  /// ran past its calls, or the unit holds no such root.
+  /// nothing lent and under `steps` calls: its value's encoding, or none where it raised, ran past
+  /// its calls, or the unit holds no such root.
   read values(files: List<{ path: String, name: String, text: Bytes }>, dump: Dump, library: String, roots: List<String>, steps: Int) -> List<Option<Bytes>>
 }
 
@@ -1423,7 +1428,7 @@ fn root_material(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> / 
             },
           },
       ),
-    // An entry is written from what its root takes and answers, which its definition decides.
+    // An entry, and a stored root, is written from what its definition takes and answers.
     Entered(n) -> match definition_material(program, match stored_of(n) {
         Some(of) -> of,
         None -> n,
@@ -1431,7 +1436,13 @@ fn root_material(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> / 
       Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
       None -> None,
     },
-    _ -> definition_material(program, name),
+    _ -> match stored_of(name) {
+      Some(of) -> match definition_material(program, of) {
+        Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
+        None -> None,
+      },
+      None -> definition_material(program, name),
+    },
   }
 }
 
@@ -1722,22 +1733,22 @@ fn answers_at_once(
 
 // --- Values a build kept ----------------------------------------------------------
 
-/// A `const` definition and the text a build kept its value as, which the runtime wrote and reads.
-pub type Baked = { name: Bytes, text: Bytes }
+/// A `const` definition and the encoding of its value a build kept, which its stored root wrote.
+pub type Baked = { name: Bytes, bytes: Bytes }
 
 /// The calls a `const` definition may make before a build gives up on it.
 pub fn const_budget() -> Int = 100000000
 
-/// The bytes of text a `const` definition's value may be kept as.
+/// The bytes a `const` definition's value's encoding may take.
 pub fn const_room() -> Int = 16777216
 
 /// What a `const` definition's value is a function of, and so kept under: the runtime that
-/// evaluated and wrote it, the compiler whose code it ran as, and what the front end keeps it
+/// evaluated it, the compiler whose code it ran and encoded it as, and what the front end keeps it
 /// under, which is the hash of all it reaches, the files it embeds among them, and the names of it.
 pub fn baked_key(runtime: Bytes, emitter: Bytes, hash: Bytes) -> Bytes / {abort.raise} =
   hex(
     blake3(
-      Bytes::concat_all([sized(b"ply baked value 1"), sized(runtime), sized(emitter), sized(hash)]),
+      Bytes::concat_all([sized(b"ply baked value 2"), sized(runtime), sized(emitter), sized(hash)]),
     ),
   )
 
@@ -1750,20 +1761,21 @@ pub fn kept_value<[r]>(
   match read_kept[r](dir, key) {
     None -> None,
     Some(bytes) -> if bytes.len() < 32 { None } else {
-      let text = bytes.slice(32, bytes.len());
-      if blake3(text) == bytes.slice(0, 32) { Some(text) } else { None }
+      let value = bytes.slice(32, bytes.len());
+      if blake3(value) == bytes.slice(0, 32) { Some(value) } else { None }
     },
   }
 
-/// `text` kept under `dir` as `kept_value` reads it back.
+/// `value` kept under `dir` as `kept_value` reads it back.
 pub fn keep_value<[r]>(
   dir: String,
   key: Bytes,
-  text: Bytes,
+  value: Bytes,
 ) -> Unit / {fs.write[r], entropy.next, time.now_ms, abort.raise} =
-  write_kept[r](dir, key, blake3(text).concat(text))
+  write_kept[r](dir, key, blake3(value).concat(value))
 
-/// The root that answers a `const` definition's value as that text: what a build enters to keep it.
+/// The root that answers the encoding of a `const` definition's value: what a build enters to keep
+/// it.
 pub fn stored_root(name: Bytes) -> Bytes = emit::stored_root(name)
 
 fn stored_of(root: Bytes) -> Option<Bytes> / {abort.raise} = {
@@ -1771,66 +1783,42 @@ fn stored_of(root: Bytes) -> Option<Bytes> / {abort.raise} = {
   if root.ends_with(suffix) { Some(root.slice(0, root.len() - suffix.len())) } else { None }
 }
 
-fn entered_by(symbol: Bytes, entry: Bytes) -> Bytes =
-  Bytes::concat_all([
-    b"Word ",
-    entry,
-    b"(PlyCtx *ctx, const Word *args) {\n  return ",
-    symbol,
-    b"(ctx);\n}",
-  ])
-
-/// A `const` definition as the value a build kept: its unit holds the text and reads it once, where
-/// the definition's own body would have run. It calls nothing, so the unit need not hold what the
-/// body reaches.
-fn baked_body(b: Baked) -> Answer / {abort.raise} = {
-  let symbol = symbol_of(b.name);
-  let entry = entry_of(b.name);
-  let held = symbol.concat(b"_baked");
-  Body({
-    text: Bytes::concat_all([
-      b"static const char ",
-      held,
-      b"[] =\n  ",
-      // Hex digits, so no byte of it reads as a placeholder.
-      c_string(b.text),
-      b";\nWord ",
-      entry,
-      b"(PlyCtx *ctx, const Word *args);\nWord ",
-      symbol,
-      b"(PlyCtx *ctx) {\n  return rt_baked_p(ctx, (Word)(intptr_t)",
-      held,
-      b", INT64_C(",
-      ascii_of_int(b.text.len()),
-      b"));\n}\n",
-      entered_by(symbol, entry),
-    ]),
-    tables: { ..no_tables(), symbols: [{ symbol: symbol, entry: entry, head: word_head(0) }] },
-  })
-}
-
-/// The body of `root`, the stored root of `of`: the definition read as any body reads a constant,
-/// and what it answers written as the text a unit holds a value by.
-fn stored_body(root: Bytes, of: Bytes) -> Answer / {abort.raise} = {
-  let symbol = symbol_of(root);
-  let entry = entry_of(root);
-  Body({
-    text: Bytes::concat_all([
-      b"Word ",
-      entry,
-      b"(PlyCtx *ctx, const Word *args);\nWord ",
-      symbol,
-      b"(PlyCtx *ctx) {\n  Word held = rt_constant_p(ctx, @@l0@@);\n",
-      b"  if (ctx->failed) return 0;\n  return rt_stored_p(ctx, held);\n}\n",
-      entered_by(symbol, entry),
-    ]),
-    tables: {
-      ..no_tables(),
-      lambdas: [entry_of(of)],
-      calls: [Named(of)],
-      symbols: [{ symbol: symbol, entry: entry, head: word_head(0) }],
+/// A `const` definition as the value a build kept of it, laid out as static data: its body answers
+/// the value from there and calls nothing, so the unit need not hold what the body reaches, and a
+/// read of it neither steps nor allocates. Stops the unit where the value does not lay out at the
+/// definition's type, which no value a build kept fails to.
+fn kept_body(ctors: Ctors, p: Program, b: Baked) -> Answer / {abort.raise} = {
+  let unlaid = |why: Bytes|
+    panic(
+      String::of_bytes_lossy(
+        Bytes::concat_all([
+          b"the value a build kept of `",
+          b.name,
+          b"` does not lay out at its type: ",
+          why,
+          b"; this is Ply's fault",
+        ]),
+      ),
+    );
+  match p.schemes.get(b.name) {
+    Some(sc) -> match sc.ty {
+      TyFn(f) -> match value::decode(b.bytes) {
+        Some(v) -> match known_of_value(ctors, f.ret, v) {
+          Ok(k) -> {
+            let e = emitted_of(
+              Formed({ name: b.name, form: Ok(kept_root(ctors, Named(b.name), f.ret, k)) }),
+              ctors,
+            );
+            Body({ text: e.text, tables: e.tables })
+          },
+          Err(why) -> unlaid(why),
+        },
+        None -> unlaid(b"its encoding does not decode"),
+      },
+      _ -> unlaid(b"its definition is no function"),
     },
-  })
+    None -> unlaid(b"no scheme types its definition"),
+  }
 }
 
 /// The unit over `every` root offered: each one's answer taken from what an earlier run kept where it
@@ -1839,8 +1827,8 @@ fn stored_body(root: Bytes, of: Bytes) -> Answer / {abort.raise} = {
 /// embeds, by digest. `emitter` is what the emitter's answers are a function of on its
 /// side, which every kept answer is filed under. `Err` says which roots the emitter answered nothing
 /// for, and why where it answered none.
-/// A root `baked` names is held as that value in place of its body, and a `stored_root` offered is
-/// made here: the emitter is asked for neither.
+/// A root `baked` names is held as that value in place of its body, which the emitter is not asked
+/// for.
 pub fn emitted<| e>(
   runtime: Runtime,
   dump: Dump,
@@ -1858,11 +1846,7 @@ pub fn emitted<| e>(
   let values = baked.fold(Map::new(), |acc: Map<Bytes, Baked>, b: Baked|
     if wanted.contains(b.name) { acc.insert(b.name, b) } else { acc });
   let entries = every.filter(|n: Bytes| entered_root(p, n)).map(Entered);
-  let offered = every.filter(|n: Bytes| !values.contains(n) && stored_of(n) == None).map(
-    Named,
-  ).concat(
-    entries,
-  );
+  let offered = every.filter(|n: Bytes| !values.contains(n)).map(Named).concat(entries);
   // No constructor table: a body names each tag by its constructor, which its key's read
   // declarations already cover, so one answer serves every program that holds the root.
   let common = [
@@ -1896,7 +1880,7 @@ pub fn emitted<| e>(
             all.keys,
             unemitted,
           ),
-          |acc: Map<Bytes, Answer>, n: Bytes, b: Baked| acc.insert(n, baked_body(b)),
+          |acc: Map<Bytes, Answer>, n: Bytes, b: Baked| acc.insert(n, kept_body(program, p, b)),
         );
         let produced = produce(
           runtime,
@@ -1921,8 +1905,7 @@ pub fn emitted<| e>(
               },
             }),
           p.modules.len(),
-          every.fold(held, |acc: Map<Bytes, Answer>, n: Bytes|
-            match stored_of(n) { Some(of) -> acc.insert(n, stored_body(n, of)), None -> acc }),
+          held,
           inputs,
           dump.emitter_ctors.fold([], |acc: List<Stated>, c: EmitterCtor|
             if c.key == None && c.show == None && c.numeric.len() == 0 { acc }
@@ -3496,72 +3479,129 @@ test "the emitter answers roots dealt over calls as it answers them in one" {
   assert_eq(rows(answers_at_once(runtime, dump, p, [], lists, 0, lists.len(), 64)), together)
 }
 
-test "a unit holds a `const` definition as the value a build kept, and makes its stored root" {
-  let source = b"const fn table() -> List<Int> = spread(3)\nfn spread(n: Int) -> List<Int> = [n, n + 1]\nfn first() -> Int = match table() { [x, ..] -> x, [] -> 0 }\n";
-  let dump = dump_of(analyse(parse_all([{ name: b"m", src: source }])));
-  assert_eq(dump.baked.map(|row: { name: Bytes, hash: Bytes }| row.name), [b"m.table"]);
-  let runtime = a_runtime(b"r");
-  let unit = |every: List<Bytes>, baked: List<Baked>|
-    match emitted(
-        runtime,
-        dump,
-        [source],
-        Map::new(),
-        every,
-        b"",
-        |_: Bytes| None,
-        |_: Bytes, _: Bytes| (),
-        baked,
-      ) {
-      Ok(e) -> e,
-      Err(why) -> panic(String::of_bytes_lossy(why)),
-    };
-  let held = unit([b"m.table", b"m.first"], [{ name: b"m.table", text: b"78da" }]);
-  // The value stands where the body would: nothing asks the emitter for it, or for what it calls.
-  // `first` is entered; `table` is not, since the program holds nothing written for a list. `first`
-  // lets go of the list it matched through the list's and its nodes' drop roots, and of an item's
-  // box by its size, through no root.
-  assert_eq(held.asked, 5);
-  assert_eq(held.produced.taken, [
-    b"m.first",
-    b"m.first#entered",
-    b"m.lower#Int",
-    b"m.table",
-    b"std.prelude.drop#List<Int>",
-    b"std.prelude.drop#std.prelude.ListNode<Int>",
+test "a unit holds a `const` definition as its kept value laid out as static data, its body asked for nothing" {
+  let source = Bytes::concat_all([
+    b"type Row = { name: String, items: List<Int> }\n",
+    b"const fn table() -> List<Int> = spread(3)\n",
+    b"const fn row() -> Row = { name: \"r\", items: spread(5) }\n",
+    b"const fn names() -> Map<String, Int> = #{\"a\": 1, \"b\": 2}\n",
+    b"fn spread(n: Int) -> List<Int> = [n, n + 1]\n",
+    b"fn first() -> Int = match table() { [x, ..] -> x, [] -> 0 }\n",
   ]);
-  assert(
-    held.produced.text.index_of(
-        Bytes::concat_all([
-          b"static const char ",
-          symbol_of(b"m.table"),
-          b"_baked[] =\n  \"78da\";",
+  let k = kept_unit(source);
+  let encoded = |v: Value| match value::encode(v) { Some(b) -> b, None -> panic("no encoding") };
+  let kept = [
+    { name: b"m.table", bytes: encoded(VList([VInt(3), VInt(4)])) },
+    {
+      name: b"m.row",
+      bytes: encoded(
+        VRecord([
+          { name: "items", value: VList([VInt(5), VInt(6)]) },
+          { name: "name", value: VStr("r") },
         ]),
-      )
-      != None,
+      ),
+    },
+    {
+      name: b"m.names",
+      bytes: encoded(
+        VMap([{ key: VStr("a"), value: VInt(1) }, { key: VStr("b"), value: VInt(2) }]),
+      ),
+    },
+  ];
+  let held = k.unit([b"m.table", b"m.row", b"m.names", b"m.first"], kept);
+  let text = held.produced.text;
+  let has = |b: Bytes| text.index_of(b) != None;
+  // What a `const` body calls is no part of the unit, and no value is read back from text.
+  assert(!held.produced.taken.contains(b"m.spread"), None);
+  assert(!has(b"rt_baked_p") && !has(b"rt_stored_p") && !has(b"rt_constant_p"), None);
+  // Each answers from its static data: its entry hands back the value's word, which a read of it
+  // neither steps through nor allocates; a record's is the static box of its words.
+  [b"m.table", b"m.row", b"m.names"].fold((), |_: Unit, n: Bytes|
+    assert(
+      has(
+        Bytes::concat_all([
+          b"Word ",
+          symbol_of(n),
+          b"_entry(PlyCtx *ctx, const Word *args) {\n  return (Word)(intptr_t)(&ply_k_",
+        ]),
+      ),
+      Some(String::of_bytes_lossy(n)),
+    ));
+  // The list and the map are laid out as the runtime lays them: a list's items in its tail, a
+  // map's pairs in a leaf.
+  assert(
+    has(b"{ .rc = UINT32_MAX, .kind = 5, .len = 2, .layout = 0, .flags = 2, .aux = 2 }"),
     None,
   );
-  assert(held.produced.text.index_of(b", INT64_C(4));") != None, None);
+  assert(has(b"{ .rc = UINT32_MAX, .kind = 13, .len = 2, .layout = 32 }"), None);
+  assert(has(b"{ .rc = UINT32_MAX, .kind = 8, .len = 2, .layout = 0 }"), None);
   // A value for a root the unit does not hold is no part of it.
-  let apart = unit([b"m.spread"], [{ name: b"m.table", text: b"78da" }]);
-  assert_eq(apart.produced.text.index_of(b"_baked"), None);
-  // The stored root reads the definition as any body reads a constant, and needs it held.
-  let storing = unit([b"m.table", b"m.spread", stored_root(b"m.table")], []);
-  assert_eq(storing.asked, 5);
-  assert_eq(storing.produced.taken, [
-    b"m.lower#Bytes",
-    b"m.spread",
-    b"m.table",
-    b"m.table#stored",
-    b"m.table#stored#entered",
-    b"std.prelude.drop#Bytes",
-  ]);
-  assert(storing.produced.text.index_of(b"rt_stored_p(ctx, held)") != None, None);
-  let alone = unit([stored_root(b"m.table")], []);
+  let apart = k.unit([b"m.spread"], kept);
+  assert_eq(apart.produced.text.index_of(symbol_of(b"m.table")), None)
+}
+
+test "a kept value its definition's type does not hold stops the unit, naming the definition" {
+  let k = kept_unit(b"const fn table() -> List<Int> = [1]\n");
+  let stopped = handle {
+    let wrong = match value::encode(VStr("x")) { Some(b) -> b, None -> b"" };
+    k.unit([b"m.table"], [{ name: b"m.table", bytes: wrong }]);
+    ""
+  } with {
+    abort.raise(m) -> m,
+  };
+  assert(stopped.index_of("`m.table`") != None, Some(stopped))
+}
+
+test "a `const` definition's stored root encodes what its body answers, calling the body itself" {
+  let k = kept_unit(
+    b"const fn table() -> { n: Int, s: String } = { n: spread(3), s: \"x\" }\nfn spread(n: Int) -> Int = n + 1\n",
+  );
+  let storing = k.unit([b"m.table", b"m.spread", stored_root(b"m.table")], []);
+  let text = storing.produced.text;
+  assert(storing.produced.taken.contains(b"m.table#stored"), None);
+  assert(storing.produced.taken.contains(b"m.table#stored#entered"), None);
+  // It writes the value's encoding, sharing what it meets again, from a call of the definition's
+  // own function rather than a constant's read of it.
+  assert(text.index_of(b"lower_open") != None, None);
+  assert(text.index_of(symbol_of(b"m.table").concat(b"(ctx")) != None, None);
+  assert_eq(text.index_of(b"rt_constant_p"), None);
+  assert_eq(text.index_of(b"rt_stored_p"), None);
+  // It needs the definition held.
+  let alone = k.unit([stored_root(b"m.table")], []);
   assert_eq(alone.produced.dropped.map(|d: Dropped| d.function), [
     b"m.table#stored",
     b"m.table#stored#entered",
   ])
+}
+
+/// The units over module `m` of `source` and the prelude, whose functions what crosses a value of
+/// a container is written over, each over the roots it is handed and the values kept of the `const`
+/// definitions it names.
+fn kept_unit(
+  source: Bytes,
+) -> { unit: (List<Bytes>, List<Baked>) -> Emission / {abort.raise} } / {abort.raise} = {
+  let user = [{ name: b"m", src: source }];
+  let shipped = [{ name: b"std.prelude", src: prelude_source::text() }];
+  let modules = user.concat(shipped);
+  let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
+  let runtime = { ..a_runtime(b"r"), natives: program_natives([]).map(native_of) };
+  {
+    unit: |every: List<Bytes>, baked: List<Baked>|
+      match emitted(
+          runtime,
+          dump,
+          sources_placed(dump, modules),
+          Map::new(),
+          every,
+          b"",
+          |_: Bytes| None,
+          |_: Bytes, _: Bytes| (),
+          baked,
+        ) {
+        Ok(e) -> e,
+        Err(why) -> panic(String::of_bytes_lossy(why)),
+      },
+  }
 }
 
 test "no root is asked to give back a scalar's box, which its last count gives back by its size" {
@@ -4145,4 +4185,26 @@ test "a root's code moves with the key a type it names states" {
   let other = program(one_body(b"m.area", []), [b"m.edge"]);
   assert(keyed.get(b"m.make") != edited.get(b"m.make"), None);
   assert(keyed.get(b"m.make") != other.get(b"m.make"), None)
+}
+
+test "a read of a definition of no parameters keeps its value for good through its type's keep root" {
+  let k = kept_unit(
+    Bytes::concat_all([
+      b"fn flag() -> Bool = 1 < 2\n",
+      b"fn word() -> String = \"a\" ++ \"b\"\n",
+      b"fn none<a>() -> Option<a> = None\n",
+      b"fn read() -> Int = if flag() { word().len() } else { 0 }\n",
+      b"fn nothing() -> Option<Int> = none()\n",
+    ]),
+  );
+  let held = k.unit([b"m.flag", b"m.word", b"m.none", b"m.read", b"m.nothing"], []);
+  let text = held.produced.text;
+  let read_with = |keep: Bytes| text.index_of(Bytes::concat_all([b", ", keep, b")"])) != None;
+  assert_eq(text.index_of(b"rt_constant_p"), None);
+  assert(text.index_of(b"rt_memo_p(ctx, ") != None, None);
+  // A word form that holds no block is kept as it is, and one that may by its type's root.
+  assert(read_with(same_word_fn()), None);
+  assert(read_with(symbol_of(root_name(root_of(keys::Keep, string_type())))), None);
+  // A generic definition is called at its caller's type arguments, which settle its body.
+  assert_eq(held.produced.dropped.map(|d: Dropped| d.function), [])
 }
