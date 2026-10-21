@@ -13,13 +13,14 @@ import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, Tail
                     KidAt, TailPush, TailSet, LeafSet, RootSwap, KidSwap, TailStart, Spill,
                     NewBranch, MapRoot, NodeCount, MapHeight, NodeKey, NodeValue, NodeKid, KidMax,
                     KidSize, NewLeaf, NewMapBranch, PairPut, PairSet, PairTake, LeafCut, BranchCut,
-                    KidOut, KidBack, KidPut, KidDrop, MapSwap, P, intrinsic_named)
+                    KidOut, KidBack, KidPut, KidDrop, MapSwap, P, S, CaseLaid, Inline, classes,
+                    intrinsic_named)
 import emit.reps (Def, FieldTy, TyRec, kind_of, has_vars, laid_vars, spelled_field, laid_of)
 import emit.c (KInt, KFloat, KDec, KNum)
 import emit.answer (Layout)
 import emit.roots (builtin_helper, generated_builtin)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RSum, RFlat, Leaf, Var, Arg, AVar,
-                 AInt, Make, MList, Native, Op, OContainer, Let, Containers)
+                 AInt, AZero, Make, MList, Native, Op, OContainer, Let, Prim, Containers)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew,
                             ArraySet, ArrayOfList, ArrayGet, ColumnField, Position, Element, Held,
                             Words, Bits, Payloads, Records, IntBits, WidthBits, FloatBits,
@@ -28,7 +29,9 @@ import emit.lower.setting (imported_target, qualified, from_import, module_impor
                            ctor_named)
 import emit.lower.held (held_as, field_type)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, noted, filed, unfiled,
-                        type_of, through_runtime, as_words)
+                        type_of, through_runtime, as_words, opened, continued)
+import emit.lower.base
+import emit.lower.data (constructed_as)
 import emit.lower.scalars (operated, runtime_builtin)
 
 /// Builtin `name` called on `args`; `callee` is where its name is written, which the checker files
@@ -372,7 +375,8 @@ fn made_here(st: Lowering, v: Var) -> Option<List<Arg>> =
   }
 
 /// A builtin whose helper answers an element or `None` as an `Option` held as its payload's word,
-/// with no object made: the `Option`'s own word, where its payload is one pointer.
+/// with no object made: an `Option` of a pointer that word itself; otherwise `None` where that word
+/// is 0, and `Some` of the element read out of it as its type holds it.
 fn looked_up(
   cx: Context,
   st: Lowering,
@@ -380,30 +384,49 @@ fn looked_up(
   args: List<Arg>,
   ty: Type,
   at: Span,
-) -> Lowered / {abort.raise} =
-  if !pointer_option(cx, ty) {
-    refuse(st, Containers, b"an element looked up as an Option of other than one pointer")
-  } else {
-    let words = as_words(st, args, at);
-    let answer = bound_as(
-      words.st,
-      ty,
-      RWord,
-      Native({
-        name: if name == b"Array::at" { b"rt_array_lookup_p" }
-        else { builtin_helper(name).concat(b"_p") },
-        args: words.args,
-        uses: { takes: args.map(|_: Arg| true), owned: true, fails: true, stops: false },
-      }),
-      at,
-    );
-    handed(answer, held_as(cx.setting, ty), at)
-  }
+) -> Lowered / {abort.raise} = {
+  let words = as_words(st, args, at);
+  let item = match ty {
+    TyCon(c) -> match c.args.at(0) { Some(t) -> t, None -> unknown_type() },
+    _ -> unknown_type(),
+  };
+  let native = Native({
+    name: if name == b"Array::at" { b"rt_array_lookup_p" }
+    else { builtin_helper(name).concat(b"_p") },
+    args: words.args,
+    uses: { takes: args.map(|_: Arg| true), owned: true, fails: true, stops: false },
+  });
+  if pointer_option(cx, ty) {
+    handed(bound_as(words.st, ty, RWord, native, at), held_as(cx.setting, ty), at)
+  } else { decoded(cx, bound_as(words.st, item, RWord, native, at), item, ty, at) }
+}
+
+/// The `Option` of type `ty` a helper answered as `found`, its element's word or 0: `None` where it
+/// is 0, and `Some` of the element of type `item` read out of it as its type holds it.
+fn decoded(cx: Context, found: Lowered, item: Type, ty: Type, at: Span) -> Lowered / {abort.raise} = {
+  let held = bound_as(
+    found.st,
+    bool_type(),
+    RBool,
+    Prim({ op: b"ne", on: RWord, args: [found.arg, AZero(RWord)] }),
+    at,
+  );
+  let element = handed({ st: opened(held.st), arg: found.arg }, held_as(cx.setting, item), at);
+  let some = constructed_as(cx, element.st, b"Some", [element.arg], ty, at);
+  let none = constructed_as(cx, opened(continued(held.st, some.st)), b"None", [], ty, at);
+  base::joined(cx, held, some, none, false, at)
+}
 
 /// Whether `ty` is an `Option` held as one pointer or 0, as the runtime holds one as its
-/// payload's word: one of a payload that is one pointer.
+/// payload's word: one word, `None` its one small value, `Some`'s payload one pointer.
 fn pointer_option(cx: Context, ty: Type) -> Bool =
-  match held_as(cx.setting, ty) { RSum(s) -> s.laid.classes == [P], _ -> false }
+  match held_as(cx.setting, ty) {
+    RSum(s) ->
+      s.laid.classes == [S(1)]
+        && s.laid.cases.any(|c: CaseLaid|
+          match c.payload { Inline(i) -> classes(i.laid) == [P], _ -> false }),
+    _ -> false,
+  }
 
 /// What an extern written in place does with an operand: reads the object it reads, takes a word it
 /// writes or stores, takes an `Option` as its payload's word, or reads an index or a count.
@@ -602,9 +625,8 @@ fn arrayed(cx: Context, st: Lowering, name: Bytes, args: List<Arg>, ty: Type, at
     },
   }
 
-/// How an array holds elements of type `ty`, as a record holds a field of that type: a record in
-/// place behind a header of its own, a scalar as its bits, an `Option` as its payload's word in
-/// place, and anything else as its word; nothing for a width past a word.
+/// How an array holds elements of type `ty`: a scalar as its bits, and anything else, a record or a
+/// sum among them, as its word; nothing for a width past a word.
 fn element_of(ty: Type) -> Option<Element> = laid_as(element_field(b"e", ty))
 
 /// How a holder of elements laid out as field `e` holds each.

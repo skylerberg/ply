@@ -2,7 +2,6 @@
 //! the runtime's helpers, and lengths, bytes and joins written in place; and a corpus that lowers,
 //! checks and prints.
 
-import emit.reps (no_ctors)
 import std.bytes (ascii_of_int)
 import std.prelude_source
 import check.types (Type, TyCon, TyFn, TyRecord)
@@ -689,7 +688,7 @@ fn corpus_names() -> List<Bytes> =
 
 /// Root `m.<name>` of `p` as the form prints it before any check, or why it was not formed.
 fn form_text(p: Program, name: Bytes) -> Bytes / {abort.raise} =
-  match formed(p, name) { Ok(f) -> printed_text(f), Err(no) -> no.why }
+  match formed(p, name) { Ok(f) -> printed_text(p, f), Err(no) -> no.why }
 
 test "the corpus lowers, passes the check once its counts are placed, and prints" {
   assert_eq(not_built(program(corpus()), corpus_names()), [])
@@ -799,9 +798,8 @@ fn in_place_calls() -> List<{ name: Bytes, src: Bytes }> =
   ]
 
 /// For each probe of `in_place_calls`, C its printed body holds and C it must not: each slot read or
-/// written as what it holds. A root or a kid is an `Option`'s payload's word, which nothing opens,
-/// and which is made an object only where a probe answering an `Option` returns it; an item a word,
-/// read as the scalar it stands for; a size an immediate.
+/// written as what it holds. A root or a kid is an `Option`'s one word, which nothing opens; an item
+/// a word, read as the scalar it stands for; a size an immediate.
 fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }> = {
   let reads = |name: Bytes, has: List<Bytes>| { name: name, has: has, lacks: [] };
   let payload = |name: Bytes, has: List<Bytes>|
@@ -811,7 +809,7 @@ fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }
   [
     reads(b"start", [b" = (int64_t)ply_obj(p0)->layout;"]),
     reads(b"tail_len", [b" = (int64_t)ply_obj(p0)->flags;"]),
-    returned(b"root", [b"PlyMaybe ", b" = ply_words(p0)[0];"]),
+    returned(b"root", [b" = ply_words(p0)[0];"]),
     reads(b"tail_at", [b" = ply_words(p0)[1 + (INT64_C(1))];"]),
     reads(b"len", [b" = (int64_t)ply_obj(p0)->len;"]),
     reads(b"leaf_at", [
@@ -838,7 +836,7 @@ fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }
     reads(b"tail_start", [b"[1 + (0)] = ", b")->flags = 1; "]),
     reads(b"spill", [b"rt_node_p(ctx, 11); memcpy(ply_words(", b"32 * sizeof(Word)); ply_obj("]),
     reads(b"branch", [b"rt_node_p(ctx, 12)"]),
-    returned(b"map_root", [b"PlyMaybe ", b" = ply_words(p0)[0];"]),
+    returned(b"map_root", [b" = ply_words(p0)[0];"]),
     reads(b"height", [b" = (int64_t)ply_obj(p0)->layout;"]),
     reads(b"count", [b" = (int64_t)ply_obj(p0)->len;"]),
     reads(b"key", [b" = (ply_is_imm(ply_words(p0)[2 * (INT64_C(1))]) ? "]),
@@ -876,18 +874,19 @@ fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }
       b")->layout = (uint32_t)(INT64_C(1)); ",
       b")->len = (uint32_t)(INT64_C(40));",
     ]),
-    // A key held in place: its leaves loaded out of the word the pair held, its word leaf that word.
+    // A key held as its word in the pair: its leaves opened out of that box, freed where it held the
+    // last count.
     {
       name: b"key_take",
-      has: [b"_0 = (int64_t)(ply_words(t2)[", b"_2 = t2;"],
+      has: [
+        b"_0 = (int64_t)ply_words(t2)[0];",
+        b"if (ply_last(ctx, t2)) ply_free(ctx, t2, INT64_C(32));",
+      ],
       lacks: [b"ply_inc("],
     },
-    // Two levels deep, a leaf is loaded out of its record's header where the key holds it.
-    reads(b"nested_take", [
-      b"_0 = (int64_t)(ply_words(((Word)(intptr_t)(ply_words(t2) + ",
-      b"ply_inc(t4_1);",
-      b"_4 = t2;",
-    ]),
+    // Two levels deep, a leaf is read out of the key's box at its place, counted again where the box
+    // was shared.
+    reads(b"nested_take", [b"Word t4_1 = ply_words(t2)[1];", b"else { ply_dup(t4_1); }"]),
   ]
 }
 
@@ -946,7 +945,7 @@ test "each extern written in place is an operation over the runtime's objects as
         );
         let code = |name: Bytes|
           match form(name) {
-            Ok(f) -> spelled(printed_fn(f, no_ctors()).pieces),
+            Ok(f) -> spelled(printed_fn(f, s.setting.ctors).pieces),
             Err(no) -> no.why,
           };
         let laid = layouts();
@@ -1011,10 +1010,6 @@ test "each extern written in place is an operation over the runtime's objects as
             { name: b"value", rep: RWord },
           ]),
         ]);
-        assert(
-          code(b"pair_take").index_of(b"_3 = 0;") != None,
-          Some(String::of_bytes_lossy(code(b"pair_take"))),
-        );
         // A key held in place is its leaves, opened out of the word the pair held, whose count the
         // record takes.
         assert_eq(fields(b"key_take"), [
@@ -1066,10 +1061,10 @@ test "each extern written in place is an operation over the runtime's objects as
         none_missed(
           [b"root", b"map_root"].fold([], |acc: List<Bytes>, name: Bytes| {
             let text = match form(name) {
-              Ok(f) -> spelled(printed_fn(owned(f), no_ctors()).pieces),
+              Ok(f) -> spelled(printed_fn(owned(f), s.setting.ctors).pieces),
               Err(no) -> no.why,
             };
-            if text.index_of(b"ply_inc(t1);") != None { acc }
+            if text.index_of(b"ply_dup(") != None { acc }
             else { acc.push(Bytes::concat_all([name, b":\n", text])) }
           }),
         )

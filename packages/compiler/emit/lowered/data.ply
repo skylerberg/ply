@@ -7,8 +7,8 @@ import emit.answer (Need, Layout)
 import emit.roots (symbol_of)
 import emit.keys (Named)
 import emit.pieces (spelled)
-import emit.compare (Program, program_of, formed, checked, printed_text, not_built, printed_by_form)
-import emit.print (printed_fn)
+import emit.compare (Program, program_of, formed, checked, printed_text, printed_in, not_built,
+                     printed_by_form)
 import emit.own (owned)
 import emit.tir (Rep, RFloat, RWord, RInt, RSum, RFlat, Var, AVar, AInt, AZero, Val, Make, MRecord,
                  Get, Pack, Gathered, PLeaf, PNamed, Inst, Let, Decl, Assign, If, Case, Match,
@@ -196,11 +196,55 @@ test "a record or a sum a type variable lays out is lowered as a placeholder its
   }
 }
 
+test "each leaf read out of a record held in place is read at its own type" {
+  let src = Bytes::concat_all([
+    b"type Inner = new { out: List<Int>, at: Int }\n",
+    b"type Outer = new { inner: Inner, n: Int }\n",
+    b"fn whole(o: Outer) -> Inner = o.inner\n",
+    b"fn opened(o: Outer) -> Int = { let { inner: i, n } = o; i.at + n }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      [b"whole", b"opened"].fold((), |_: Unit, n: Bytes|
+        assert_eq(
+          lets(form_of(p, n).body).filter(|l: { var: Var, val: Val }|
+            l.var.ty == unknown_type()).map(|l: { var: Var, val: Val }| l.var.id),
+          [],
+        )),
+  }
+}
+
+test "a case of a sum a type variable leaves open is gathered where every layout holds it inline, and boxed where one may not" {
+  // `Many` has nine cases with arguments: at a pointer's type its pointer tags run out and its last
+  // cases are boxed, so a case of it is made a box at the open type.
+  let many = Bytes::concat_all([
+    b"type Many<a> = | M1(a) | M2(a) | M3(a) | M4(a) | M5(a) | M6(a) | M7(a) | M8(a) | M9(a)\n",
+    b"fn ninth<a>(x: a) -> Many<a> = M9(x)\n",
+  ]);
+  match program_of(
+      Bytes::concat_all([
+        b"fn none<a>(x: a) -> Option<a> = None\nfn some<a>(x: a) -> Option<a> = Some(x)\n",
+        many,
+      ]),
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let none = form_of(p, b"none");
+      assert_eq(vals(none), [Gathered({ parts: [AInt(0)] })]);
+      assert_eq(lets(none.body).map(|l: { var: Var, val: Val }| l.var.rep), [RWord]);
+      let some = form_of(p, b"some");
+      assert_eq(vals(some), [Gathered({ parts: [AInt(1), AVar(param(some, 0))] })]);
+      assert(vals(form_of(p, b"ninth")).any(|v: Val| match v { Make(_) -> true, _ -> false }), None)
+    },
+  }
+}
+
 test "a record literal is gathered in its type's order and held as its leaves" {
   let f = form_of(program(), b"point");
   let made = lets(f.body);
   assert_eq(made.map(|l: { var: Var, val: Val }| l.val), [
-    Gathered({ parts: [AVar(param(f, 0)), AVar(param(f, 1)), AZero(RWord)] }),
+    Gathered({ parts: [AVar(param(f, 0)), AVar(param(f, 1))] }),
   ]);
   assert_eq(made.map(|l: { var: Var, val: Val }| l.var.rep), [floats([b"x", b"y"])]);
   assert_eq(f.conv.answer, floats([b"x", b"y"]))
@@ -253,7 +297,7 @@ test "an update gathers what it keeps from its base and what it sets" {
     Some(y) -> {
       assert_eq(y.val, Get({ of: param(f, 0), path: PLeaf(1) }));
       assert_eq(made.map(|l: { var: Var, val: Val }| l.val).drop(1), [
-        Gathered({ parts: [AVar(param(f, 1)), AVar(y.var), AZero(RWord)] }),
+        Gathered({ parts: [AVar(param(f, 1)), AVar(y.var)] }),
       ])
     },
     None -> assert(false),
@@ -421,7 +465,7 @@ test "a declared sum's constructor is gathered from its case's place and its arg
 
 /// Root `m.<name>`'s C as the form prints it, but for its entry, which boxes what it carries raw.
 fn own_code(p: Program, name: Bytes) -> Bytes / {abort.raise} = {
-  let t = spelled(printed_fn(form_of(p, name), no_ctors()).pieces);
+  let t = spelled(printed_in(p, form_of(p, name)).pieces);
   let from = match t.index_of(b"ctx->fuel -= 1;\n") { Some(i) -> i, None -> 0 };
   let to = match t.index_of(b"_entry(PlyCtx *ctx, const Word *args) {") {
     Some(i) -> i,
@@ -438,8 +482,9 @@ test "a record made its word is a box of its words, its floats as their bits" {
   assert_eq(has(b"rt_box_float_p"), [false, false, false]);
   assert_eq(has(b" = ply_f64_bits("), [true, true, true]);
   assert_eq(has(b"rt_alloc_bytes_p(ctx, "), [true, true, true]);
-  // `Seg`'s box holds its points' words in place: five words, no header or bitmap of a point's.
-  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(56));"), [false, true, true]);
+  // `Wide`'s box holds its five words, and `Seg`'s its points' words in place: five words, no
+  // header or bitmap of a point's.
+  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(56));"), [true, true, true]);
   assert_eq(has(b"rt_alloc_p("), [false, false, false]);
   assert_eq(has(b"ply_embed"), [false, false, false])
 }
@@ -522,7 +567,7 @@ fn ported(src: Bytes) -> Program / {abort.raise} =
 fn built(p: Program, name: Bytes) -> Bytes / {abort.raise} =
   match checked(p, name) {
     Ok(f) -> {
-      let t = printed_text(f);
+      let t = printed_text(p, f);
       let from = match t.index_of(b"ctx->fuel -= 1;\n") { Some(i) -> i, None -> 0 };
       let entry = Bytes::concat_all([
         symbol_of(qualify(b"m", name)),
@@ -773,8 +818,29 @@ test "a record held in place that holds a count, read through a borrow, passes t
       Ok(f) -> match checked(p, n) {
         Ok(_) -> acc,
         Err(why) ->
-          acc.push(Bytes::concat_all([b"== ", n, b": ", why, b"\n", printed_text(owned(f))])),
+          acc.push(Bytes::concat_all([b"== ", n, b": ", why, b"\n", printed_text(p, owned(f))])),
       },
     });
   assert(faults == [], Some(String::of_bytes_lossy(Bytes::join(faults, b"\n"))))
+}
+
+test "a record or a sum of scalars holds no count: nothing lets go of it or of what is read out of it" {
+  let src = Bytes::concat_all([
+    b"type P = { x: Int, y: Int }\n",
+    b"effect store { write keep(p: P) -> Unit }\n",
+    b"fn summed(p: P) -> Int = p.x + p.y\n",
+    b"fn inner(o: Option<P>) -> Int = match o { Some({ x, y }) -> x + y, None -> 0 }\n",
+    b"fn kept(start: P) -> Int = handle { store.keep(start) } with { var seen = 0, store.keep(p) -> { seen = p.x + p.y; }, return u -> seen }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      assert_eq(not_built(p, [b"summed", b"inner", b"kept"]), []);
+      let lets_go = |n: Bytes| {
+        let t = printed_text(p, owned(form_of(p, n)));
+        t.index_of(b"ply_rel(") != None || t.index_of(b"ply_dec(") != None
+      };
+      assert_eq([b"summed", b"inner"].map(lets_go), [false, false])
+    },
+  }
 }
