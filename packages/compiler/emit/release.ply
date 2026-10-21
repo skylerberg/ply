@@ -21,6 +21,7 @@ import emit.tir (Var, Rep, RWord, RInt, RSum, RFlat, RSlice, RToken, Leaf, AVar,
                  Member, TTag, Val, LastOf, Walked, Lambda, Closure, no_links, Declined, Spine,
                  counted, parts_of, stops_at, handle_stops, Call, Test)
 import emit.tir.handling (HandleSite)
+import emit.lower.held (held_with)
 import emit.answer (Need, Reads, Scalar, Layout, Exact)
 import emit.print.counting (same_word_fn, no_word_fn, int_dup_fn, int_released_fn, box_dup_fn,
                             box_released_fn)
@@ -821,6 +822,11 @@ pub fn generated_with(
       Drop -> Ok(dropped(ctors, k, w.ty, laid_of, form_of)),
       Dup -> Ok(duped(k, w.ty)),
       keys::Release -> Ok(released(k, w.ty)),
+      keys::Held(o) -> match o {
+        Dup -> Ok(held_duped(ctors, k, w.ty)),
+        keys::Release -> Ok(held_released(ctors, k, w.ty)),
+        _ -> Err({ by: Spine, why: b"a root over a held value that counts nothing" }),
+      },
       Copy -> Ok(walking_root(k, { id: 0, ty: w.ty, rep: RWord }, Copy)),
       Share -> Ok(walking_root(k, walked_param(ctors, w.ty, laid_of), Share)),
       Keep -> Ok(walking_root(k, walked_param(ctors, w.ty, laid_of), Keep)),
@@ -897,6 +903,7 @@ fn plain_answer(k: RootKey) -> Type =
       Copy -> w.ty,
       Keep -> w.ty,
       keys::Cased(c) -> match c.op { Share -> int_type(), Keep -> w.ty, _ -> unit_type() },
+      keys::Held(o) -> if o == Dup { w.ty } else { unit_type() },
       _ -> unit_type(),
     },
     _ -> unit_type(),
@@ -1179,6 +1186,41 @@ fn released(k: RootKey, ty: Type) -> Fn = {
   let o = { id: 0, ty: ty, rep: RWord };
   plain(k, o, Given, [Dec(o), answered_nothing()])
 }
+
+/// `held_dup#T`: counts a value of `T` held as a body holds it once more, each counted word of it,
+/// and answers it, so the count it took is its caller's.
+fn held_duped(ctors: Ctors, k: RootKey, ty: Type) -> Fn = {
+  let o = { id: 0, ty: ty, rep: held_with(ctors, ty) };
+  let f = plain(k, o, Lent, [Inc({ var: o, n: 1 }), Return(AVar(o))]);
+  { ..f, conv: { ..f.conv, answer: o.rep } }
+}
+
+/// `held_release#T`: lets go of a value of `T` held as a body holds it, each counted word of it.
+fn held_released(ctors: Ctors, k: RootKey, ty: Type) -> Fn = {
+  let o = { id: 0, ty: ty, rep: held_with(ctors, ty) };
+  plain(k, o, Given, [Dec(o), answered_nothing()])
+}
+
+/// The root that can count a value of `ty` held as `rep` once more (`op` `Dup`) or once fewer
+/// (`Release`) in one call, where counting it word by word takes more than one word's count: a
+/// case's switch or two words. None where `rep` is not how a body holds `ty`, so the root written for
+/// the type could not take it as it is, or where a variable leaves `ty`'s layout open.
+pub fn counted_through(
+  op: keys::TypeOp,
+  ctors: Ctors,
+  ty: Type,
+  rep: Rep,
+) -> Option<RootKey> / {abort.raise} = {
+  let several = match rep { RFlat(_) -> true, RSum(_) -> true, _ -> false };
+  if !several || reps::has_vars(ty) || held_with(ctors, ty) != rep { None }
+  else if held_parts(ctors, ty, rep).fold(0, |n: Int, ps: List<Part>| n + counts_in(ps)) < 2 {
+    None
+  } else { Some(root_of(keys::Held(op), ty)) }
+}
+
+/// How many words' counts the C counting `parts` holds, a case's switch as two.
+fn counts_in(parts: List<Part>) -> Int =
+  parts.fold(0, |n: Int, p: Part| n + (match p { WordAt(_) -> 1, ByCase(_) -> 2 }))
 
 fn named(n: Bytes) -> Type = TyCon({ name: n, args: [] })
 

@@ -2,7 +2,7 @@
 //! gives them.
 
 import check.types (Type, TyCon, TyRecord)
-import emit.compare (program_of)
+import emit.compare (program_of, printed_by_form)
 import emit.layout (LSum)
 import emit.reps
 import emit.reps (Ctors, SumCtor, ctors_of)
@@ -272,7 +272,10 @@ test "each root written for a type takes its operands as its handing says, and i
   match corpus_ctors() {
     Err(why) -> assert_eq(why, b""),
     Ok(ctors) -> {
-      let plain = over([Drop, Dup, keys::Release, Copy, Share, Keep], root_of).concat(
+      let plain = over(
+        [Drop, Dup, keys::Release, Copy, Share, Keep, keys::Held(Dup), keys::Held(keys::Release)],
+        root_of,
+      ).concat(
         [Drop, Share, Keep].fold([], |acc: List<RootKey>, op: TypeOp|
           acc.concat([case_root(op, expr, 1), case_root(op, expr, 2)])),
       );
@@ -285,6 +288,54 @@ test "each root written for a type takes its operands as its handing says, and i
         ),
         [],
       )
+    },
+  }
+}
+
+test "a sum of several counted words is let go of by one call of its type's root, which is checked and counts each word" {
+  // `Duo`'s case lies in place: its two pointers, counted by the case the sum holds.
+  let src = Bytes::concat_all([
+    b"type Duo = | Both(String, List<Int>) | Neither\n",
+    b"fn g(n: Int) -> Int / {abort.raise} = if n > 3 { panic(\"big\") } else { n }\n",
+    b"fn kept(d: Duo, n: Int) -> Duo / {abort.raise} = { let m = g(n); if m > 0 { d } else { d } }\n",
+    b"fn pick(d: Duo, b: Bool) -> Duo = if b { d } else { Neither }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let held = |op: TypeOp| root_of(keys::Held(op), declared(b"m.Duo"));
+      let call = |k: RootKey| symbol_of(root_text(root_name(k))).concat(b"(ctx, ");
+      let calls_in = |name: Bytes, k: RootKey|
+        match printed_by_form(p, name) {
+          Ok(t) -> t.split(call(k)).len() - 1,
+          Err(why) -> panic(String::of_bytes_lossy(why)),
+        };
+      // Where a branch is done with it, and on a failure's way out, the value is let go of by one
+      // call.
+      assert_eq(
+        [calls_in(b"pick", held(keys::Release)), calls_in(b"kept", held(keys::Release))],
+        [1, 1],
+      );
+      // Each root passes the check and counts each of the case's two counted words itself.
+      [keys::Release, Dup].fold((), |_: Unit, op: TypeOp|
+        match generated(p.setting.ctors, held(op)) {
+          Err(no) -> assert_eq(no.why, b""),
+          Ok(f) -> {
+            let built = built_form(f);
+            let c = spelled(printed_fn(built, p.setting.ctors).pieces);
+            // The function itself, not the entry the runtime calls it through.
+            let body = match c.index_of(b"_entry(PlyCtx *ctx, const Word *args) {") {
+              Some(at) -> c.slice(0, at),
+              None -> c,
+            };
+            let each = if op == Dup { b"ply_dup(" } else { b"ply_rel" };
+            assert(
+              verified(built) == None && body.split(each).len() - 1 == 2
+                && !body.contains(call(held(op))),
+              Some(String::of_bytes_lossy(c)),
+            )
+          },
+        })
     },
   }
 }
