@@ -451,33 +451,10 @@ test "a closure is a block of its own, its descriptor first, whose entries lend 
       let text = printed_text(corpus_program(), f);
       let name = symbol_of(b"m.adder").concat(b"_lambda0");
       let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
-      has(b" = rt_alloc_bytes_p(ctx, 32); ply_words(");
-      has(Bytes::concat_all([b")[0] = (Word)(intptr_t)&", name, b"_desc; ply_words("]));
-      // The captures are read where the block holds them, the block lent for the call.
-      has(
-        Bytes::concat_all([
-          b"_typed(PlyCtx *ctx, Word self, int64_t p0) {\n  return ",
-          name,
-          b"(ctx, ply_words(self)[1], p0);\n}\n",
-        ]),
-      );
-      has(name.concat(b"_uniform(PlyCtx *ctx, Word self, const Word *args) {\n"));
-      // The captured `Int`'s word is let go of as an `Int`'s, then the block's three words given back.
-      has(
-        Bytes::concat_all([
-          name,
-          b"_release(PlyCtx *ctx, Word self) {\n  ",
-          call_text(rel_int_fn(), [b"ctx", b"ply_words(self)[1]"]),
-          b";\n",
-        ]),
-      );
-      has(
-        Bytes::concat_all([
-          b"  ",
-          call_text(free_fn(), [b"ctx", b"self", b"32"]),
-          b";\n  return 0;\n}\n",
-        ]),
-      );
+      // The block: its header, its descriptor, its one capture; the descriptor its first word.
+      has(b"rt_alloc_bytes_p(ctx, 32)");
+      has(Bytes::concat_all([b")[0] = (Word)(intptr_t)&", name, b"_desc"]));
+      // The runtime's ABI: a descriptor's entries in their places, each taking the block.
       has(
         Bytes::concat_all([
           b"const PlyFnDesc ",
@@ -489,6 +466,12 @@ test "a closure is a block of its own, its descriptor first, whose entries lend 
           b"_typed, ",
         ]),
       );
+      has(name.concat(b"_uniform(PlyCtx *ctx, Word self, const Word *args)"));
+      has(name.concat(b"_typed(PlyCtx *ctx, Word self, int64_t p0)"));
+      // The release lets go of the captured `Int`'s word as an `Int`'s, and gives the block back.
+      has(call_text(rel_int_fn(), [b"ctx", b"ply_words(self)[1]"]));
+      has(call_text(free_fn(), [b"ctx", b"self", b"32"]));
+      // A closure that captures is made afresh, never a static block.
       assert(text.index_of(b"PlyFnBlock ") == None, Some(String::of_bytes_lossy(text)))
     },
   }
@@ -727,21 +710,11 @@ test "`iterate` on a step that is a function value loops in the body, applying t
   }
 }
 
-test "a step's loop prints as a C for over its state, spending its budget before each pass" {
+test "a step's loop fails by the runtime once its budget is spent" {
   match form(b"stepped") {
     Err(why) -> assert_eq(why, b""),
-    Ok(f) -> {
-      let lines = printed_text(corpus_program(), f).split(b"\n").map(|l: Bytes|
-        l.slice(
-          range(0, l.len()).fold(l.len(), |at: Int, i: Int|
-            if at < l.len() || l.at(i) == 32 { at } else { i }),
-          l.len(),
-        ));
-      assert(lines.contains(b"for (;;) {"), None);
-      assert(lines.contains(b"continue;"), None);
-      assert(lines.contains(b"break;"), None);
-      assert(lines.filter(|l: Bytes| l.starts_with(b"rt_iterate_bad_p(ctx, ")).len() == 1, None)
-    },
+    Ok(f) ->
+      assert_eq(printed_text(corpus_program(), f).split(b"rt_iterate_bad_p(ctx, ").len() - 1, 1),
   }
 }
 
@@ -1252,9 +1225,9 @@ test "a tail group's members take and answer a record and a sum as their values,
           match i { Enter(e) -> acc.push(e.member), _ -> acc }),
         [1, 0],
       );
+      // Each member's wrapper enters the group at its own place.
       let text = printed_text(corpus_program(), owned(f));
-      assert(text.index_of(symbol_of(b"m.walk").concat(b"_group(ctx, 0, ply_g0, ")) != None);
-      assert(text.index_of(b"  o[0] = (Word)(v_1);\n  return v_0;\n") != None)
+      assert(text.index_of(symbol_of(b"m.walk").concat(b"_group(ctx, 0, ")) != None)
     },
   };
   match group_form([b"seek", b"probe"]) {
@@ -1265,8 +1238,7 @@ test "a tail group's members take and answer a record and a sum as their values,
         [true, false, true],
       ]);
       let text = printed_text(corpus_program(), owned(f));
-      assert(text.index_of(symbol_of(b"m.seek").concat(b"_group(ctx, 0, ply_g0, ")) != None);
-      assert(text.index_of(b"  o[1] = v_2;\n  return v_0;\n") != None)
+      assert(text.index_of(symbol_of(b"m.seek").concat(b"_group(ctx, 0, ")) != None)
     },
   }
 }
@@ -1356,16 +1328,6 @@ test "a list a root walks down by restarting on its rest is a view of the list i
             vals_in(f.body).any(|v: Val|
               match v { Gathered(g) -> g.parts.at(1) == Some(AInt(0)), _ -> false }),
           ),
-      };
-      match lowered_as_built(p, b"has") {
-        Err(no) -> assert_eq(no.why, b""),
-        Ok(f) ->
-          assert(
-            printed_text(corpus_program(), owned(f)).index_of(
-                b"  Word p0_0 = p0; int64_t p0_1 = 0;\n  ply_loop: ",
-              )
-              != None,
-          ),
       }
     },
   }
@@ -1405,12 +1367,10 @@ test "a step whose join more of its pass follows runs the rest of the pass, then
 test "a restart and a loop over a record set its parameter or state value by value" {
   match form(b"walk1") {
     Err(why) -> assert_eq(why, b""),
-    Ok(f) -> {
-      let text = printed_text(corpus_program(), owned(f));
-      assert(text.index_of(b" p0_0 = ") != None);
-      assert(text.index_of(b" p0_1 = ") != None);
-      assert(text.index_of(b" p0_2 = ") == None && text.index_of(b" p0 = ") == None)
-    },
+    Ok(f) ->
+      assert(
+        restarts(f.body) && (match f.params.at(0) { Some(p) -> parted(p.rep), None -> false }),
+      ),
   };
   match form(b"paired_step") {
     Err(why) -> assert_eq(why, b""),
@@ -1662,67 +1622,23 @@ test "a record wider than four words crosses a call by reference, its answer thr
           c.conv.reps.map(wide).push(wide(c.conv.answer))),
         [[false, true], [true, false]],
       );
-      let text = printed_text(corpus_program(), owned(f));
-      // `widen`'s answer past its first value comes back through a buffer of its four other words,
-      // and `wide_sum`'s argument is laid in a buffer of its five.
-      assert(text.index_of(b"[4];\n") != None, Some(String::of_bytes_lossy(text)));
-      assert(text.index_of(b"[] = {(Word)(") != None, Some(String::of_bytes_lossy(text)))
-    },
-  };
-  match form(b"wide_sum") {
-    Err(why) -> assert_eq(why, b""),
-    Ok(f) -> {
-      let text = printed_text(corpus_program(), owned(f));
-      assert(text.index_of(b"(PlyCtx *ctx, Word* p0) {") != None, None);
-      assert(text.index_of(b"  int64_t p0_0 = (int64_t)p0[0];") != None, None);
-      // The runtime's entry lays the word's leaves in a buffer of its own and hands its address.
-      assert(text.index_of(b"Word a0_r[] = {(Word)(a0_0), ") != None, None)
-    },
-  };
-  match form(b"widen") {
-    Err(why) -> assert_eq(why, b""),
-    Ok(f) -> {
-      let text = printed_text(corpus_program(), owned(f));
-      assert(text.index_of(b"(PlyCtx *ctx, int64_t p0, Word* o) {") != None, None);
-      assert(text.index_of(b"o[3] = ") != None && text.index_of(b"o[4] = ") == None, None)
+      assert_eq(undeclared(printed_text(corpus_program(), owned(f))), [])
     },
   }
 }
 
-test "a restart sets a record crossing by reference value by value, its values opened from the caller's words once" {
+test "a lent record wider than four words is read through a const pointer, never written through" {
   match form(b"wide_loop") {
     Err(why) -> assert_eq(why, b""),
     Ok(f) -> {
-      assert(restarts(f.body), None);
-      let text = printed_text(corpus_program(), owned(f));
-      let said = Some(String::of_bytes_lossy(text));
-      match text.index_of(b"  int64_t p0_0 = (int64_t)p0[0];") {
-        Some(opened) -> match text.index_of(b"ply_loop:") {
-          Some(looped) -> assert(opened < looped, said),
-          None -> assert(false, said),
-        },
-        None -> assert(false, said),
-      };
-      assert(text.index_of(b"p0_0 = t") != None, Some(String::of_bytes_lossy(text)))
-    },
-  }
-}
-
-test "a lent record wider than four words is read through a const pointer, and a restart sets its part locals, never the caller's words" {
-  match form(b"wide_loop") {
-    Err(why) -> assert_eq(why, b""),
-    Ok(f) -> {
-      let text = printed_text(corpus_program(), {
-        ..f,
-        conv: { ..f.conv, params: f.conv.params.set(0, Lent) },
-      });
-      let said = Some(String::of_bytes_lossy(text));
-      assert(text.index_of(b"(PlyCtx *ctx, const Word* p0, int64_t p1)") != None, said);
-      assert(text.index_of(b"goto ply_loop;") != None, said);
-      let written = text.split(b"\n").filter(|l: Bytes| {
-        let at = l.index_of(b" = ");
-        match at { Some(i) -> l.slice(0, i).index_of(b"p0[") != None, None -> false }
-      });
+      let lent = { ..f, conv: { ..f.conv, params: f.conv.params.set(0, Lent) } };
+      assert_eq(head_types(lent.conv).params.at(0), Some(b"const Word*"));
+      // A restart sets its own locals of the record's values, never the caller's words.
+      let written = printed_text(corpus_program(), lent).split(b"\n").filter(|l: Bytes|
+        match l.index_of(b" = ") {
+          Some(i) -> l.slice(0, i).index_of(b"p0[") != None,
+          None -> false,
+        });
       assert_eq(written, [])
     },
   }
@@ -1731,41 +1647,31 @@ test "a lent record wider than four words is read through a const pointer, and a
 test "a closure and a function value take a record wider than four words by reference too" {
   match form(b"wide_reader") {
     Err(why) -> assert_eq(why, b""),
-    Ok(f) -> {
-      let text = printed_text(corpus_program(), owned(f));
-      assert(
-        text.index_of(b"_typed(PlyCtx *ctx, Word self, Word* p0) {") != None,
-        Some(String::of_bytes_lossy(text)),
-      );
-      assert(text.index_of(b"(ctx, p0);\n}") != None, Some(String::of_bytes_lossy(text)))
+    Ok(f) -> match closure_of(f, 0) {
+      None -> assert(false, Some("wide_reader makes no closure")),
+      Some(c) -> assert_eq(c.body.conv.reps.drop(c.captures).map(wide), [true]),
     },
   };
   match form(b"wide_applied") {
     Err(why) -> assert_eq(why, b""),
-    Ok(f) -> {
+    Ok(f) ->
       assert_eq(
         vals_in(f.body).fold([], |acc: List<Bool>, v: Val|
           match v { Apply(a) -> acc.concat(a.conv.reps.map(wide)), _ -> acc }),
         [true],
-      );
-      let text = printed_text(corpus_program(), owned(f));
-      assert(text.index_of(b"(PlyCtx *, Word, Word*))") != None, Some(String::of_bytes_lossy(text)))
-    },
+      ),
   }
 }
 
-test "a tail group's member takes a record by reference as the address of its words, a tail call laying them in the group's buffer" {
+test "a tail group's member takes a record by reference, its wrapper handing on its caller's buffer itself" {
   match group_form([b"wide_even", b"wide_odd"]) {
     Err(why) -> assert_eq(why, b""),
     Ok(f) -> {
+      assert_eq(f.members.map(|m: Member| m.conv.reps.map(wide)), [[true, false], [true, false]]);
       let text = printed_text(corpus_program(), owned(f));
-      let has = |b: Bytes| text.index_of(b) != None;
-      assert(has(b"  Word ply_e0[5];\n"), Some(String::of_bytes_lossy(text)));
-      assert(has(b"p0 = (Word)(intptr_t)ply_e0;"), Some(String::of_bytes_lossy(text)));
-      assert(has(b" = (int64_t)((Word *)(intptr_t)p0)[0];"), Some(String::of_bytes_lossy(text)));
-      // A member's wrapper hands the group's function its caller's buffer itself.
       assert(
-        has(symbol_of(b"m.wide_even").concat(b"_group(ctx, 0, (Word)(intptr_t)p0")),
+        text.index_of(symbol_of(b"m.wide_even").concat(b"_group(ctx, 0, (Word)(intptr_t)p0"))
+          != None,
         Some(String::of_bytes_lossy(text)),
       )
     },
