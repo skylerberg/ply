@@ -26,8 +26,9 @@ import emit.roots (builtin_helper, symbol_of, entry_of)
 import emit.keys
 import emit.keys (RootKey, Named, Written, FnArg, TypeOp, Order, Reflect, Shown, Digest, Contained,
                   at_key, root_name)
-import emit.answer (Defined, Expect, Head, word_head, GenericCall, Need, Exact, Layout, Scalar,
-                    no_generics, Tables, no_tables, Emitted, Body, Refused, RootAnswer, Published)
+import emit.answer (Defined, Expect, CallAt, GenericAt, expected_callee, Head, word_head,
+                    GenericCall, Need, Exact, Layout, Scalar, no_generics, Tables, no_tables,
+                    Emitted, Body, Refused, RootAnswer, Published)
 import emit.tir.statics (array_kind, columns_kind)
 import emit.print.containers (allocating)
 import emit.statics (SBytes, SEmbedded, statics_of)
@@ -344,6 +345,21 @@ test "a `Float` is a C `double`: its operators are C's own and a literal is its 
   assert_eq(has(b"rt_float_rem_p"), [false, false, true, false])
 }
 
+/// A head a body wrote a call to, its callee by name.
+type CallHead = { callee: Bytes, head: Head }
+
+/// Each head `t`'s body wrote a call to, its callee by name: a root as `t`'s calls name it, a
+/// generic call as its placeholder.
+fn expects_named(t: Tables) -> List<CallHead> =
+  t.generics.expects.map(|e: Expect|
+    {
+      callee: match e.callee {
+        GenericAt(n) -> Bytes::concat_all([b"@@g", ascii_of_int(n), b"@@"]),
+        CallAt(_) -> match expected_callee(t, e) { Some(c) -> c, None -> b"" },
+      },
+      head: e.head,
+    })
+
 /// A root's own code: what it runs past its fuel head and before its entry, leaving out the
 /// adapters that box what it carries raw for the runtime.
 fn own_code(text: Bytes) -> Bytes / {abort.raise} = {
@@ -408,10 +424,18 @@ test "a definition takes and answers a float as itself, and a call says the head
     None,
   );
   assert(own_code(out.get(1).text).index_of(b"rt_box_float_p") == None, None);
-  assert_eq(out.get(1).tables.generics.expects, [
+  assert_eq(expects_named(out.get(1).tables), [
     { callee: b"m.half", head: floats },
     { callee: b"m.half", head: floats },
   ]);
+  // Each callee is named once, among the calls, and each call by its place there.
+  assert_eq(
+    (
+      out.get(1).tables.calls.map(root_name),
+      out.get(1).tables.generics.expects.map(|e: Expect| e.callee),
+    ),
+    ([b"m.half"], [CallAt(0), CallAt(0)]),
+  );
   assert_eq(out.get(1).tables.symbols.map(|d: Defined| d.head), [floats]);
   // An `Int` crosses as itself too.
   assert_eq(out.get(2).tables.symbols.map(|d: Defined| d.head), [
@@ -756,7 +780,7 @@ test "a small record of floats crosses a call as its fields" {
   let mid = { answer: b"double", params: [b"double", b"double", b"double", b"double", b"Word*"] };
   assert_eq(out.map(|e: Emitted| e.why), [None, None]);
   assert_eq(out.get(0).tables.symbols.map(|d: Defined| d.head), [mid]);
-  assert_eq(out.get(1).tables.generics.expects, [{ callee: b"m.mid", head: mid }]);
+  assert_eq(expects_named(out.get(1).tables), [{ callee: b"m.mid", head: mid }]);
   // Neither body makes an object: `mid` answers fields and `twice` hands `p`'s along.
   assert_eq(out.map(|e: Emitted| own_code(e.text).index_of(b"rt_alloc_p") != None), [false, false])
 }
@@ -978,7 +1002,7 @@ test "an Option of a pointer is one word wherever it is held, and no object is m
   assert_eq(out.get(6).tables.symbols.map(|d: Defined| d.head), [
     { answer: b"Word", params: [b"int64_t", b"Word", b"Word"] },
   ]);
-  assert_eq(out.get(8).tables.generics.expects.filter(|e: Expect| e.callee == b"m.kept"), [
+  assert_eq(expects_named(out.get(8).tables).filter(|e: CallHead| e.callee == b"m.kept"), [
     { callee: b"m.kept", head: maybe },
   ])
 }
@@ -1043,7 +1067,7 @@ test "records of a known type are compared field by field, not by the runtime" {
   assert_eq(has(b"rt_decimal_compare_p"), [true, true, false, false]);
   assert_eq(
     out.map(|e: Emitted|
-      e.tables.generics.expects.any(|x: Expect| x.callee.index_of(b"equal#Option<") != None)
+      expects_named(e.tables).any(|x: CallHead| x.callee.index_of(b"equal#Option<") != None)
         || e.tables.calls.any(|k: RootKey| root_name(k).index_of(b"equal#Option<") != None)),
     [false, false, true, true],
   )
@@ -1503,10 +1527,10 @@ test "a value is reflected as its type says: a scalar as its constructor, a sum 
       None -> no_tables(),
     };
   assert(calls(b"m.maybe", maybe));
-  let expected = tables(b"m.maybe").generics.expects.filter(|x: Expect| x.callee == maybe);
+  let expected = expects_named(tables(b"m.maybe")).filter(|x: CallHead| x.callee == maybe);
   assert(expected.len() > 0, None);
   assert_eq(
-    expected.map(|x: Expect| x.head).at(0),
+    expected.map(|x: CallHead| x.head).at(0),
     tables(maybe).symbols.map(|d: Defined| d.head).at(0),
   );
   // A type whose module states `show` is shown as that function writes it.
@@ -3648,7 +3672,7 @@ test "a root written for a type is called at the head it is defined at, a value 
   // `hashed` calls the very digest root asked for, so its head is held to that root's below.
   let called = tables.fold([], |acc: List<Bytes>, t: { name: Bytes, tables: Tables }|
     if t.name != b"m.hashed" { acc }
-    else { acc.concat(t.tables.generics.expects.map(|e: Expect| e.callee)) });
+    else { acc.concat(expects_named(t.tables).map(|e: CallHead| e.callee)) });
   assert(called.contains(root_name(in_m(Digest, wide))), None);
   // The boxed case's record crosses by reference.
   assert(
@@ -3660,7 +3684,7 @@ test "a root written for a type is called at the head it is defined at, a value 
   );
   assert_eq(
     tables.fold([], |acc: List<Bytes>, t: { name: Bytes, tables: Tables }|
-      t.tables.generics.expects.fold(acc, |x: List<Bytes>, e: Expect|
+      expects_named(t.tables).fold(acc, |x: List<Bytes>, e: CallHead|
         match defined.get(symbol_of(e.callee)) {
           Some(h) -> if h == e.head { x }
           else { x.push(Bytes::concat_all([t.name, b" -> ", e.callee])) },

@@ -4,9 +4,10 @@
 
 import store.hash.encoding (hex)
 import check.types (Type, TyVar, TyFn, Scheme, type_text, type_spelled, digits, string_type)
-import emit.answer (Answer, Body, Refused, RootAnswer, Tables, Defined, Head, Expect, word_head,
-                    no_generics, answer_bin, tables_bin, no_tables, GenericCall, Generics, Need,
-                    Pass, Reads, Scalar, Layout, Exact, settled_by_callers, Published)
+import emit.answer (Answer, Body, Refused, RootAnswer, Tables, Defined, Head, Expect, CallAt,
+                    GenericAt, expected_callee, word_head, no_generics, answer_bin, tables_bin,
+                    no_tables, GenericCall, Generics, Need, Pass, Reads, Scalar, Layout, Exact,
+                    settled_by_callers, Published)
 import emit.tir.statics (StaticDef, SFile, StaticWord, WField, named, words_of)
 import emit.print.statics (static_c, static_extern, escaped, c_string)
 import emit.statics (known_of_value, kept_root)
@@ -1212,24 +1213,27 @@ pub fn produce(
   // Each call was written to the head its caller read; the callee's own must be that head.
   s.bodies.fold((), |_u: Unit, k: UnitBody|
     k.tables.generics.expects.fold((), |_v: Unit, e: Expect|
-      match s.symbols.get(e.callee) {
-        Some(d) -> if d.head != e.head {
-          panic(
-            String::of_bytes_lossy(
-              Bytes::concat_all([
-                b"`",
-                k.name,
-                b"` calls `",
-                e.callee,
-                b"` as ",
-                prototype(d.symbol, e.head),
-                b"which it defines as ",
-                prototype(d.symbol, d.head),
-              ]),
-            ),
-          )
-        } else { () },
+      match expected_callee(k.tables, e) {
         None -> (),
+        Some(callee) -> match s.symbols.get(callee) {
+          Some(d) -> if d.head != e.head {
+            panic(
+              String::of_bytes_lossy(
+                Bytes::concat_all([
+                  b"`",
+                  k.name,
+                  b"` calls `",
+                  callee,
+                  b"` as ",
+                  prototype(d.symbol, e.head),
+                  b"which it defines as ",
+                  prototype(d.symbol, d.head),
+                ]),
+              ),
+            )
+          } else { () },
+          None -> (),
+        },
       }));
   let marked = s.bodies.map(|k: UnitBody| {
     let hs = holes(k.text);
@@ -1583,32 +1587,33 @@ fn standing(looked: Map<Bytes, Answer>, offered: Map<Bytes, Bool>) -> Map<Bytes,
       else { acc },
     })
 
-/// A callee a kept body names, with the key it had. A key reads its callees by hash and the C calls
-/// them by name, so two callees that hash alike under two names share a key and not a body.
-type Callee = { name: Bytes, key: Option<Bytes> }
-type Kept = { answer: Answer, callees: List<Callee> }
+/// A kept body, and the key each root it calls had, in the order `callees_of` names them. A key reads
+/// its callees by hash and the C calls them by name, so two callees that hash alike under two names
+/// share a key and not a body; the names are read off the body, which spells each once.
+type Kept = { answer: Answer, callees: List<Option<Bytes>> }
 
-derive bin for Callee
 derive bin for Kept
 
-fn kept_of(keys: Map<Bytes, Bytes>, a: Answer) -> Kept =
-  {
-    answer: a,
-    callees: match a {
-      Body(b) ->
-        ordered(b.tables.calls.map(root_name)).map(|c: Bytes| { name: c, key: keys.get(c) }),
-      Refused(_) -> [],
-    },
-  }
+/// The roots `a` calls, by name, ascending, each once.
+fn callees_of(a: Answer) -> List<Bytes> =
+  match a { Body(b) -> ordered(b.tables.calls.map(root_name)), Refused(_) -> [] }
 
-fn holds(keys: Map<Bytes, Bytes>, callees: List<Callee>) -> Bool =
-  callees.fold(true, |ok: Bool, c: Callee| ok && keys.get(c.name) == c.key)
+fn kept_of(keys: Map<Bytes, Bytes>, a: Answer) -> Kept =
+  { answer: a, callees: callees_of(a).map(|c: Bytes| keys.get(c)) }
+
+/// Whether each root `k`'s body calls still has the key it had.
+fn holds(keys: Map<Bytes, Bytes>, k: Kept) -> Bool = {
+  let names = callees_of(k.answer);
+  names.len() == k.callees.len()
+    && range(0, names.len()).all(|i: Int|
+      match names.at(i) { Some(n) -> k.callees.at(i) == Some(keys.get(n)), None -> false })
+}
 
 fn decoded(keys: Map<Bytes, Bytes>, bytes: Option<Bytes>) -> Option<Answer> / {abort.raise} =
   match bytes {
     None -> None,
     Some(b) -> match bin::decode(b, kept_bin()) {
-      Ok(k) -> if holds(keys, k.callees) { Some(k.answer) } else { None },
+      Ok(k) -> if holds(keys, k) { Some(k.answer) } else { None },
       Err(_) -> None,
     },
   }
@@ -1631,7 +1636,7 @@ fn unpacked(
       Ok(p) ->
         Some(
           p.rows.fold(Map::new(), |acc: Map<Bytes, Answer>, r: Packed|
-            if holds(keys, r.kept.callees) { acc.insert(r.name, r.kept.answer) } else { acc }),
+            if holds(keys, r.kept) { acc.insert(r.name, r.kept.answer) } else { acc }),
         ),
       Err(_) -> None,
     },
@@ -2032,7 +2037,7 @@ pub fn emitted<| e>(
   // No constructor table: a body names each tag by its constructor, which its key's read
   // declarations already cover, so one answer serves every program that holds the root.
   let common = [
-    b"ply.unit.answer.2",
+    b"ply.unit.answer.3",
     hex(bin::shape_digest(kept_bin())),
     runtime.identity,
     emitter,
@@ -2538,6 +2543,18 @@ fn generics_settled(
           }
         });
         let roots = settled.map(root_name);
+        let calls = settled.fold(b.tables.calls, |cs: List<RootKey>, r: RootKey|
+          if cs.any(|c: RootKey| root_name(c) == root_name(r)) { cs } else { cs.push(r) });
+        // A generic call's head is held to the root it settles on, by that root's place in `calls`.
+        let placed = |name: Bytes|
+          range(0, calls.len()).fold(None, |found: Option<Int>, i: Int|
+            match found {
+              Some(_) -> found,
+              None -> match calls.at(i) {
+                Some(c) -> if root_name(c) == name { Some(i) } else { None },
+                None -> None,
+              },
+            });
         Body({
           text: placeholders_named(b.text, roots),
           tables: {
@@ -2545,13 +2562,16 @@ fn generics_settled(
             generics: {
               ..b.tables.generics,
               expects: b.tables.generics.expects.map(|e: Expect|
-                if e.callee.starts_with(b"@@g") {
-                  { ..e, callee: roots.get(digits(e.callee.slice(3, e.callee.len() - 2))) }
-                } else { e }),
+                match e.callee {
+                  GenericAt(n) -> match roots.at(n) {
+                    Some(r) -> match placed(r) { Some(i) -> { ..e, callee: CallAt(i) }, None -> e },
+                    None -> e,
+                  },
+                  CallAt(_) -> e,
+                }),
             },
             lambdas: b.tables.lambdas.map(|l: Bytes| placeholders_named(l, roots)),
-            calls: settled.fold(b.tables.calls, |cs: List<RootKey>, r: RootKey|
-              if cs.any(|c: RootKey| root_name(c) == root_name(r)) { cs } else { cs.push(r) }),
+            calls: calls,
           },
         })
       },
@@ -2591,10 +2611,6 @@ fn code_key(base: Bytes, n: Bytes, b: { text: Bytes, tables: Tables }) -> Bytes 
     lambdas: b.tables.lambdas.map(unnamed),
     symbols: b.tables.symbols.map(|d: Defined|
       { ..d, symbol: unnamed(d.symbol), entry: unnamed(d.entry) }),
-    generics: {
-      ..b.tables.generics,
-      expects: b.tables.generics.expects.map(|e: Expect| { ..e, callee: unnamed(e.callee) }),
-    },
   };
   blake3(
     Bytes::concat_all([base, b"\x00", unnamed(b.text), b"\x00", bin::encode(tables, tables_bin())]),
@@ -3432,7 +3448,8 @@ test "a call written to another head than the callee defines fails the unit" {
           ..b,
           tables: {
             ..b.tables,
-            generics: { ..no_generics(), expects: [{ callee: callee, head: head }] },
+            // The callee by its place among the caller's calls, which `one_body` gives it.
+            generics: { ..no_generics(), expects: [{ callee: CallAt(0), head: head }] },
           },
         }),
       other -> other,
@@ -3596,10 +3613,12 @@ test "a kept body stands only where each callee it names still has the key it wa
   let keys = Map::of_entries([{ key: b"m.b", value: b"kb" }]);
   let body = one_body(b"m.a", [b"m.b"]);
   let filed = kept_of(keys, body);
-  assert(holds(keys, filed.callees));
+  // Each callee is spelled once, by the body; the kept answer holds only its key.
+  assert_eq(filed.callees, [Some(b"kb")]);
+  assert(holds(keys, filed));
   // Another tree's callee that hashes alike under another name: the C would call a name not here.
-  assert(!holds(Map::of_entries([{ key: b"m.c", value: b"kb" }]), filed.callees));
-  assert(!holds(Map::of_entries([{ key: b"m.b", value: b"another" }]), filed.callees));
+  assert(!holds(Map::of_entries([{ key: b"m.c", value: b"kb" }]), filed));
+  assert(!holds(Map::of_entries([{ key: b"m.b", value: b"another" }]), filed));
   assert_eq(decoded(keys, Some(bin::encode(filed, kept_bin()))), Some(body));
   assert_eq(decoded(Map::new(), Some(bin::encode(filed, kept_bin()))), None);
   let pack = bin::encode({ rows: [{ name: b"m.a", kept: filed }] }, pack_bin());
