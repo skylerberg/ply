@@ -1403,46 +1403,51 @@ fn slot_read_at(c: Code, slot: Int) -> Option<Span> = {
   let first = |codes: List<Code>|
     codes.fold(None, |acc: Option<Span>, x: Code|
       match acc { Some(_) -> acc, None -> slot_read_at(x, slot) });
-  let copied = |captures: List<Capture>, body: Code|
-    captures.fold(None, |acc: Option<Span>, k: Capture|
-      match acc {
-        Some(_) -> acc,
-        None -> if k.src == slot { slot_read_at(body, k.dst) } else { None },
-      });
+  // The slot a barrier copies `slot` into, where it copies it.
+  let into = |captures: List<Capture>|
+    captures.fold(None, |acc: Option<Int>, k: Capture|
+      match acc { Some(_) -> acc, None -> if k.src == slot { Some(k.dst) } else { None } });
   match c.node {
     NVar(v) -> if v.slot == Some(slot) { Some(c.span) } else { None },
     NKnown(k) -> if k.slot == slot { Some(c.span) } else { None },
     NUnary(u) -> slot_read_at(u.operand, slot),
     NBinary(b) -> first([b.lhs, b.rhs]),
-    NApp(a) -> first([a.func].concat(a.args)),
+    NApp(a) -> first(a.args.push(a.func)),
     NIf(i) -> first([i.cond, i.then_branch, i.else_branch]),
     NBlock(b) ->
       first(
-        b.stmts.map(|s: CodeStmt|
-          match s { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code }).concat(
+        b.stmts.fold(
           match b.tail { Some(t) -> [t], None -> [] },
+          |acc: List<Code>, stmt: CodeStmt|
+            acc.push(match stmt { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code }),
         ),
       ),
     NList(l) -> first(l.items),
     NRecord(r) -> first(r.fields.map(|f: CodeField| f.value)),
-    NUpdate(u) -> first([u.base].concat(u.sets.map(|f: CodeField| f.value))),
+    NUpdate(u) -> first(u.sets.map(|f: CodeField| f.value).push(u.base)),
     NMatch(m) ->
       first(
         m.arms.fold([m.scrutinee], |acc: List<Code>, a: CodeArm|
-          match a.guard { Some(g) -> acc.push(g).push(a.body), None -> acc.push(a.body) }),
+          List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
       ),
-    NPerform(p) -> first((match p.label { Some(l) -> [l], None -> [] }).concat(p.args)),
+    NPerform(p) -> first(match p.label { Some(l) -> p.args.push(l), None -> p.args }),
     NField(f) -> slot_read_at(f.base, slot),
     NParallel(p) -> first(p.branches),
-    NLambda(l) -> copied(l.captures, l.body),
-    NSimulate(s) -> copied(s.captures, s.body),
+    NLambda(l) -> match into(l.captures) { Some(d) -> slot_read_at(l.body, d), None -> None },
+    NSimulate(s) -> match into(s.captures) { Some(d) -> slot_read_at(s.body, d), None -> None },
     NHandle(h) -> match slot_read_at(h.body, slot) {
       Some(x) -> Some(x),
       None ->
         h.clauses.fold(
-          match h.ret { Some(r) -> copied(r.captures, r.body), None -> None },
+          match h.ret {
+            Some(r) -> match into(r.captures) { Some(d) -> slot_read_at(r.body, d), None -> None },
+            None -> None,
+          },
           |acc: Option<Span>, cl: CodeClause|
-            match acc { Some(_) -> acc, None -> copied(cl.captures, cl.body) },
+            match acc {
+              Some(_) -> acc,
+              None -> match into(cl.captures) { Some(d) -> slot_read_at(cl.body, d), None -> None },
+            },
         ),
     },
     _ -> None,
