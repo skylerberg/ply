@@ -8,7 +8,7 @@ import emit.answer (Answer, Body, Refused, RootAnswer, Tables, Defined, Head, Ex
                     no_generics, answer_bin, tables_bin, no_tables, GenericCall, Generics, Need,
                     Pass, Reads, Scalar, Layout, Exact, settled_by_callers)
 import emit.tir.statics (StaticDef, SFile, StaticWord, WField, named, words_of)
-import emit.print.statics (static_c, static_extern)
+import emit.print.statics (static_c, static_extern, escaped, c_string)
 import emit.statics (SStr, statics_of)
 import emit.roots (builtin_helper, symbol_of, entry_of, root_id)
 import emit.keys
@@ -851,46 +851,9 @@ fn exports_text(
   ])
 }
 
-fn octal(b: Int) -> Bytes =
-  Bytes::concat_all([b"\\", ascii_of_int(b / 64), ascii_of_int(b / 8 % 8), ascii_of_int(b % 8)])
-
-/// The bytes a C string literal holds as they are: the printable ones but for the quote, the
-/// backslash and `?`, which could open a trigraph.
-fn plain() -> Bytes / {abort.raise} =
-  Bytes::concat_all(range(32, 127).filter(|b: Int| b != 34 && b != 63 && b != 92).map(byte_of_int))
-
-fn escaped(piece: Bytes) -> Bytes / {abort.raise} = {
-  let n = piece.len();
-  Bytes::concat_all(
-    iterate({ from: 0, out: [] }, n + 1, |s: { from: Int, out: List<Bytes> }|
-      if s.from >= n { Stop(s.out) } else {
-        let stop = piece.scan(s.from, plain(), n - s.from);
-        if stop > s.from { Continue({ from: stop, out: s.out.push(piece.slice(s.from, stop)) }) }
-        else {
-          let b = piece.at(s.from);
-          Continue({
-            from: s.from + 1,
-            out: s.out.push(if b == 34 { b"\\\"" } else if b == 92 { b"\\\\" } else { octal(b) }),
-          })
-        }
-      }),
-  )
-}
-
-/// Bytes per C string literal, so no literal exceeds what compilers accept.
-fn piece_len() -> Int = 2000
-
-fn literal_lines(line: Bytes) -> Bytes / {abort.raise} = {
-  let n = line.len();
-  let count = if n == 0 { 1 } else { (n + piece_len() - 1) / piece_len() };
-  Bytes::concat_all(
-    range(0, count).map(|i: Int| {
-      let piece = line.slice(i * piece_len(), if (i + 1) * piece_len() < n { (i + 1) * piece_len() }
-      else { n });
-      Bytes::concat_all([b"\"", escaped(piece), if i == count - 1 { b"\\n" } else { b"" }, b"\"\n"])
-    }),
-  )
-}
+/// `line` and the newline ending it as adjacent C string literals, the newline's last.
+fn literal_lines(line: Bytes) -> Bytes / {abort.raise} =
+  Bytes::concat_all([c_string(line), b" \"\\n\"\n"])
 
 /// The text's lines as `str::lines` reads them: a final newline ends the last line rather than
 /// opening another, and a carriage return before a newline is part of the ending.
@@ -1814,21 +1777,6 @@ fn stored_of(root: Bytes) -> Option<Bytes> / {abort.raise} = {
   if root.ends_with(suffix) { Some(root.slice(0, root.len() - suffix.len())) } else { None }
 }
 
-/// `text` as adjacent C string literals, none longer than a compiler accepts. It is hex digits, so
-/// no byte of it needs an escape or reads as a placeholder.
-fn quoted(text: Bytes) -> Bytes / {abort.raise} = {
-  let n = text.len();
-  let count = if n == 0 { 1 } else { (n + piece_len() - 1) / piece_len() };
-  Bytes::concat_all(
-    range(0, count).map(|i: Int|
-      Bytes::concat_all([
-        b"\"",
-        text.slice(i * piece_len(), min(n, (i + 1) * piece_len())),
-        b"\"\n",
-      ])),
-  )
-}
-
 fn entered_by(symbol: Bytes, entry: Bytes) -> Bytes =
   Bytes::concat_all([
     b"Word ",
@@ -1849,8 +1797,9 @@ fn baked_body(b: Baked) -> Answer / {abort.raise} = {
     text: Bytes::concat_all([
       b"static const char ",
       held,
-      b"[] =\n",
-      quoted(b.text),
+      b"[] =\n  ",
+      // Hex digits, so no byte of it reads as a placeholder.
+      c_string(b.text),
       b";\nWord ",
       entry,
       b"(PlyCtx *ctx, const Word *args);\nWord ",
@@ -2855,14 +2804,13 @@ test "a program's key moves with the definition it enters, the runtime and the b
   assert(program_key(b"entry", a_runtime(b"rt"), a_builder(b"c4")) != key)
 }
 
-test "a C string literal holds printable bytes as they are and the rest in octal" {
-  assert_eq(escaped(b"a\"b\\c?\n\x01z"), b"a\\\"b\\\\c\\077\\012\\001z");
-  assert_eq(literal_lines(b""), b"\"\\n\"\n");
+test "a line of what a unit says of itself is cut into literals a compiler takes, its newline last" {
+  assert_eq(literal_lines(b""), b"\"\" \"\\n\"\n");
   let long = Bytes::concat_all(range(0, 2001).map(|_: Int| b"x"));
   let pieces = literal_lines(long).split(b"\n");
   assert_eq(pieces.len(), 3);
   assert_eq(pieces.get(0).len(), 2002);
-  assert_eq(pieces.get(1), b"\"x\\n\"")
+  assert_eq(pieces.get(1), b"  \"x\" \"\\n\"")
 }
 
 test "lines are read as a final newline ends the last one" {
@@ -3590,7 +3538,7 @@ test "a unit holds a `const` definition as the value a build kept, and makes its
         Bytes::concat_all([
           b"static const char ",
           symbol_of(b"m.table"),
-          b"_baked[] =\n\"78da\"\n;",
+          b"_baked[] =\n  \"78da\";",
         ]),
       )
       != None,
@@ -3950,13 +3898,6 @@ fn kept_bodies<a | e>(
     },
   }
 
-test "a value's text is cut into literals no longer than a compiler takes" {
-  assert_eq(quoted(b"ab"), b"\"ab\"\n");
-  assert_eq(quoted(b""), b"\"\"\n");
-  let long = Bytes::concat_all(range(0, piece_len() + 1).map(|_: Int| b"0"));
-  assert_eq(quoted(long).split(b"\n").len(), 3)
-}
-
 /// What reading `key` back answers over a directory `kept` whose file for it holds `bytes`.
 fn read_back(tree: fs::MemFs, key: Bytes, bytes: Bytes) -> Option<Bytes> / {abort.raise} =
   fs::on_mem[abs](fs::mem_write(tree, "kept/" ++ String::of_bytes(key), bytes).fs, ||
@@ -4039,7 +3980,7 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
   assert(p.text.index_of(b"};\n\n/* --- what this unit says about itself") != None, None);
   // A constant says its row of the code table, and the loader takes that table and each
   // definition's entry by address.
-  assert(p.text.index_of(b"\"constants 1\\n\"\n\"m.f 0\\n\"") != None, None);
+  assert(p.text.index_of(b"\"constants 1\" \"\\n\"\n\"m.f 0\" \"\\n\"") != None, None);
   assert(p.text.index_of(b"\"taken ") == None && p.text.index_of(b"\"lambdas ") == None, None);
   assert(p.text.index_of(b"void *const ply_code[] = {\n  (void *)&e_m.f,\n  0 };\n") != None, None);
   assert(
@@ -4101,7 +4042,7 @@ test "a unit says which constructors are read through a function, and which func
     [{ ctor: b"m.Box", key: Some(b"m.area"), show: Some(b"m.text"), numeric: [] }],
   );
   assert_eq(p.taken, [b"m.area", b"m.make"]);
-  assert(p.text.index_of(b"\"instances 1\\n\"\n\"m.Box m.area !\\n\"") != None, None);
+  assert(p.text.index_of(b"\"instances 1\" \"\\n\"\n\"m.Box m.area !\" \"\\n\"") != None, None);
   // A body that names the constructor is not taken without the key its type states.
   let alone = produce(
     a_runtime(b"r"),
