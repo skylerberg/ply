@@ -38,12 +38,11 @@ import emit.tir (Rep, RWord, RInt, RBool, RFloat, RMaybe, RTagged, RFlat, RCases
                  Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter, Fail,
                  NoArm, Handle, Sited, Inc, Dec, Reset, Free, Opened, Block, Fn, Member, Convention,
                  Rooted, Lambda, Closure, Handed, Given, Lent, Owned, Borrowed, Returned, Test,
-                 TTag, Owns, ReadsOf, Lasts, no_links, counted, operands, fails, used_as, var_of,
-                 rep_of_arg, parts_of, ends)
+                 TTag, Owns, ReadsOf, Lasts, Static, no_links, counted, operands, fails, used_as,
+                 var_of, rep_of_arg, parts_of, ends)
 import emit.verify (verified, stacked_captures, payload_of, field_path, held_in_place, reuses_cells,
                     made_width, kept_reads, re_held, leaves, answer_held, boxed_read, word_held,
-                    holds_no_count)
-import emit.tir (Static)
+                    immortals)
 
 /// How a counted variable is held: a count of its own, or read without one out of the owned
 /// variables `bases` names, each live while it is (none where nothing the body lets go of holds
@@ -58,7 +57,8 @@ type Held = | Own | ReadOf(List<Int>)
 /// `Get` of one of its counted leaves is an `alias` of that word, as a payload read out of a sum
 /// held as one word is of that sum. A closure laid on this frame's
 /// stack `stacks` its captures: it holds no count of them, so a use of it reads each. A `promoted`
-/// value read out of another takes a count of its own where it is bound.
+/// value read out of another takes a count of its own where it is bound. The `immortal` values hold
+/// no count at all (`verify.immortals`, the set the check reads): none is taken or let go of them.
 type Facts = {
   held: Map<Int, Held>,
   vars: Map<Int, Var>,
@@ -380,7 +380,7 @@ fn facts_of(f: Fn) -> Facts = {
     alias: Map::new(),
     stacks: Map::new(),
     promoted: Map::new(),
-    immortal: Map::new(),
+    immortal: immortals(f),
   };
   let first = gathered(params_defined(f, empty), f.body);
   let got = first.gets.fold(
@@ -456,36 +456,87 @@ fn facts_of(f: Fn) -> Facts = {
 }
 
 /// `fx` with each join held as the values set to it are: read out of what each was read out of
-/// where every one is borrowed, and owned where any holds a count of its own or is a constant.
+/// where every one is borrowed of values that live where its paths meet, and owned where any holds
+/// a count of its own, is a constant, or is read out of a value bound inside a branch that sets it.
 fn joins_held(fx: Facts, b: Block) -> Facts = {
   let sets = assigned(Map::new(), b);
+  let bound = opened_levels(fx, levels(Map::new(), b, 0));
   sets.fold({ fx: fx, done: Map::new() }, |s: Joined, j: Int, _: List<Arg>|
-    join_held(s, sets, j, sets.len())).fx
+    join_held(s, sets, bound, j, sets.len())).fx
 }
 
 /// `joins_held` so far: the facts, and the joins decided.
 type Joined = { fx: Facts, done: Map<Int, Bool> }
 
+/// How many blocks deep each variable `b` binds is bound, by number, `b` being `level` deep: a
+/// join where it is declared, a loop's or a handle's answer where it stands, a loop's state in its
+/// body. A value read where a join is set was bound in a block around it, so one bound deeper than
+/// the join is declared is gone where the join's paths meet.
+fn levels(m: Map<Int, Int>, b: Block, level: Int) -> Map<Int, Int> =
+  b.fold(m, |acc: Map<Int, Int>, i: Inst|
+    match i {
+      Let(l) -> acc.insert(l.var.id, level),
+      Decl(v) -> acc.insert(v.id, level),
+      Reset(r) -> acc.insert(r.token.id, level),
+      Opened(o) -> o.words.fold(acc, |n: Map<Int, Int>, w: Var| n.insert(w.id, level)),
+      If(x) -> levels(levels(acc, x.then, level + 1), x.otherwise, level + 1),
+      Case(c) ->
+        c.arms.fold(
+          levels(acc, c.rest, level + 1),
+          |n: Map<Int, Int>, a: { when: Int, body: Block }| levels(n, a.body, level + 1),
+        ),
+      Match(x) ->
+        x.arms.fold(levels(acc, x.rest, level + 1), |n: Map<Int, Int>, a: Block|
+          levels(n, a, level + 1)),
+      Loop(l) ->
+        levels(
+          l.state.fold(acc.insert(l.answer.id, level), |n: Map<Int, Int>, s: Var|
+            n.insert(s.id, level + 1)),
+          l.body,
+          level + 1,
+        ),
+      Handle(h) -> levels(acc.insert(h.answer.id, level), h.body, level + 1),
+      _ -> acc,
+    })
+
+/// `bound` with each opened value's words bound where the value is; a parameter is bound at 0.
+fn opened_levels(fx: Facts, bound: Map<Int, Int>) -> Map<Int, Int> =
+  fx.opened.fold(bound, |m: Map<Int, Int>, id: Int, ws: List<Var>| {
+    let level = match bound.get(id) { Some(n) -> n, None -> 0 };
+    ws.fold(m, |n: Map<Int, Int>, w: Var| n.insert(w.id, level))
+  })
+
 /// `s` with join `j` decided, each join it is set from first; `depth` bounds how many joins deep a
 /// join is set from another, which their number does.
-fn join_held(s: Joined, sets: Map<Int, List<Arg>>, j: Int, depth: Int) -> Joined =
-  if depth <= 0 || s.done.contains(j) { s } else {
+fn join_held(
+  s: Joined,
+  sets: Map<Int, List<Arg>>,
+  bound: Map<Int, Int>,
+  j: Int,
+  depth: Int,
+) -> Joined =
+  if depth <= 0 || s.done.contains(j) || s.fx.immortal.contains(j) { s } else {
     match sets.get(j) {
       None -> s,
       Some(args) -> {
         let first = args.fold(s, |acc: Joined, a: Arg|
           match var_of(a) {
-            Some(v) -> if sets.contains(v.id) { join_held(acc, sets, v.id, depth - 1) }
+            Some(v) -> if sets.contains(v.id) { join_held(acc, sets, bound, v.id, depth - 1) }
             else { acc },
             None -> acc,
           });
+        let level = |id: Int| match bound.get(id) { Some(n) -> n, None -> 0 };
         let bases = args.fold(Some([]), |bs: Option<List<Int>>, a: Arg|
           match bs {
             None -> None,
             Some(xs) -> match var_of(a) {
-              Some(v) -> if !counted(v.rep) { bs } else {
+              Some(v) -> if !counted(v.rep) || first.fx.immortal.contains(v.id) { bs } else {
                 match first.fx.held.get(v.id) {
-                  Some(ReadOf(ys)) -> Some(ints_joined(xs, flattened(first.fx, ys))),
+                  Some(ReadOf(ys)) -> {
+                    let from = flattened(first.fx, ys);
+                    if from.any(|x: Int| level(x) > level(j)) { None }
+                    else { Some(ints_joined(xs, from)) }
+                  },
                   _ -> None,
                 }
               },
@@ -770,9 +821,8 @@ fn defined(fx: Facts, v: Var, h: Held) -> Facts =
     next: if v.id >= fx.next { v.id + 1 } else { fx.next },
   }
 
-/// `v` bound to a value that holds no count (`verify.holds_no_count`): known, never counted.
-fn holding_none(fx: Facts, v: Var) -> Facts =
-  { ..defined(fx, v, Own), held: fx.held, immortal: fx.immortal.insert(v.id, true) }
+/// `v`, one of the body's values that hold no count (`verify.immortals`): known, never counted.
+fn holding_none(fx: Facts, v: Var) -> Facts = { ..defined(fx, v, Own), held: fx.held }
 
 /// Every variable `b` defines, with how it is held: a `Let` as its value answers, a join, a loop's
 /// state and answer and a handle's answer owned; an alias of a word as nothing of its own.
@@ -792,7 +842,7 @@ fn gathered(fx: Facts, b: Block) -> Facts =
                 }),
             ),
           },
-        None -> if holds_no_count(l.val, acc.immortal) { holding_none(acc, l.var) } else {
+        None -> if acc.immortal.contains(l.var.id) { holding_none(acc, l.var) } else {
           // A borrowed value held again as another is read, and holds as that one does.
           let a = match re_held(l.var, l.val) {
             Some(x) -> match acc.held.get(x.id) {
@@ -824,7 +874,8 @@ fn gathered(fx: Facts, b: Block) -> Facts =
           }
         },
       },
-      Decl(v) -> defined(acc, v, Own),
+      Decl(v) -> if acc.immortal.contains(v.id) { holding_none(acc, v) }
+      else { defined(acc, v, Own) },
       If(x) -> gathered(gathered(acc, x.then), x.otherwise),
       Case(c) ->
         c.arms.fold(gathered(acc, c.rest), |a: Facts, arm: { when: Int, body: Block }|
@@ -2257,8 +2308,10 @@ test "a value that holds no count, a static or a case gathered from constants, i
       Return(AVar(q)),
     ]),
   );
-  // A join set from it on one path and from a parameter on the other: the parameter alone is let
-  // go of where the path does not read it.
+  // A join set from it on one path and from a given parameter on the other holds the parameter's
+  // count, and on the static's path it holds the static, which needs none; the parameter is let go of
+  // where the path does not read it. Set beside only borrowed values, the join is borrowed, read out
+  // of nothing for the static.
   assert_eq(
     counted_body(
       root_of([c, p], [], RWord, [
@@ -2286,6 +2339,17 @@ test "a value that holds no count, a static or a case gathered from constants, i
       refused: None,
     },
   );
+  let lent = root_of([c, p], [1], RWord, [
+    lit,
+    Decl(j),
+    If({
+      cond: AVar(c),
+      then: [Assign({ var: j, arg: AVar(s) })],
+      otherwise: [Assign({ var: j, arg: AVar(p) })],
+    }),
+    Return(AVar(j)),
+  ]);
+  unchanged({ ..lent, conv: { ..lent.conv, answered: Borrowed([{ param: 1, whole: true }]) } });
   // A `None` gathered from its constant word, given twice.
   unchanged(
     root_of([], [], RWord, [
@@ -2294,6 +2358,54 @@ test "a value that holds no count, a static or a case gathered from constants, i
       Return(AVar(r)),
     ]),
   )
+}
+
+test "a join set from a value read out of one bound inside its branch holds a count of its own" {
+  let c = flag(0);
+  let p = word(1);
+  let s = word(2);
+  let t = word(3);
+  let r = of_type(4, b"m.T");
+  let y = word(5);
+  let z = word(6);
+  let j = word(7);
+  let field = PField({ name: b"f", at: 0 });
+  // The field is read twice, so it is not taken out of `r`.
+  let read = [
+    bind(r, call_of([AVar(p)], [0]), []),
+    bind(y, Get({ of: r, path: field }), []),
+    bind(z, Get({ of: r, path: field }), []),
+  ];
+  let joined = |then: Block|
+    counted_body(
+      root_of([c, p], [1], RWord, [
+        Decl(j),
+        If({ cond: AVar(c), then: then, otherwise: read.push(Assign({ var: j, arg: AVar(y) })) }),
+        Return(AVar(j)),
+      ]),
+    );
+  let after = |then: Block|
+    [
+      Decl(j),
+      If({
+        cond: AVar(c),
+        then: then,
+        otherwise: read.concat([Inc({ var: y, n: 1 }), Dec(r), Assign({ var: j, arg: AVar(y) })]),
+      }),
+      Return(AVar(j)),
+    ];
+  // Beside a static or a read out of a lent parameter, either of which outlives the branch.
+  let lit = [bind(s, Static(b"ply_k_0"), []), Assign({ var: j, arg: AVar(s) })];
+  assert_eq(joined(lit), { body: after(lit), refused: None });
+  let lent = [bind(t, Get({ of: p, path: field }), []), Assign({ var: j, arg: AVar(t) })];
+  assert_eq(joined(lent), {
+    body: after([
+      bind(t, Get({ of: p, path: field }), []),
+      Inc({ var: t, n: 1 }),
+      Assign({ var: j, arg: AVar(t) }),
+    ]),
+    refused: None,
+  })
 }
 
 test "an answer handed back borrowed takes no count, and a join of borrowed values is borrowed of each" {

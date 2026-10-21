@@ -7,9 +7,9 @@ import std.bytes (ascii_of_int)
 import emit.c (int_lit)
 import emit.keys (RootKey, Named)
 import emit.layout (MachineStruct, MachineField, machine_structs)
+import emit.print.head (head_part)
 import emit.tir.statics (StaticDef, SBlock, SPlain, SStruct, SFile, StaticWord, WRaw, WAddress,
-                         WEntry, WBytes, WField, text_block, str_kind, bytes_kind, refused_kind,
-                         named)
+                         WEntry, WBytes, WField, text_block, refused_kind, named)
 
 /// The declaration of static `name` a bucket whose bodies name it writes, before their C takes its
 /// address.
@@ -36,7 +36,7 @@ pub fn static_c(
     SPlain(ws) -> laid_object(def.name, None, ws, field),
     SStruct(s) -> laid_struct(def.name, s.of, s.fields, field, entry),
     SFile(digest) -> {
-      let t = text_block(bytes_kind(), file(digest));
+      let t = text_block(file(digest));
       laid_object(def.name, Some(t.head), t.words, field)
     },
   }
@@ -287,8 +287,8 @@ fn no_entries(_: RootKey) -> Bytes = b""
 
 fn no_files(_: Bytes) -> Bytes = b""
 
-test "a string's object is immortal, of the string's kind, its length and room its bytes', the bytes padded to a word" {
-  let s = named(SBlock(text_block(str_kind(), b"say \"hi\"?\n")));
+test "a string's object is immortal, of the refused kind, its length and room its bytes', the bytes padded to a word" {
+  let s = named(SBlock(text_block(b"say \"hi\"?\n")));
   let c = static_c(s, no_fields, no_entries, no_files);
   assert(
     c.starts_with(
@@ -301,7 +301,7 @@ test "a string's object is immortal, of the string's kind, its length and room i
     ),
     Some(String::of_bytes_lossy(c)),
   );
-  assert(c.index_of(b"{ .rc = UINT32_MAX, .kind = 9, .len = 10, .layout = 10 }") != None, None);
+  assert(c.index_of(b"{ .rc = UINT32_MAX, .kind = 21, .len = 10, .layout = 10 }") != None, None);
   // A quote, a backslash, `?` and a control byte are escaped, three octal digits each.
   assert(c.index_of(b"\"say \\\"hi\\\"\\077\\012\"") != None, Some(String::of_bytes_lossy(c)));
   assert(c.index_of(b"__attribute__((aligned(8)))") != None, None);
@@ -323,14 +323,9 @@ test "a block names no kind but the refused one, and an empty string is its head
   );
   assert(c.index_of(b"int64_t w0; const void *w1;") != None, Some(String::of_bytes_lossy(c)));
   assert(c.index_of(b"  INT64_C(7),\n  &ply_k_a,\n") != None, None);
-  let empty = static_c(
-    named(SBlock(text_block(bytes_kind(), b""))),
-    no_fields,
-    no_entries,
-    no_files,
-  );
+  let empty = static_c(named(SBlock(text_block(b""))), no_fields, no_entries, no_files);
   assert(empty.index_of(b"{ PlyObj h; }") != None, Some(String::of_bytes_lossy(empty)));
-  assert(empty.index_of(b".kind = 10, .len = 0, .layout = 0") != None, None)
+  assert(empty.index_of(b".kind = 21, .len = 0, .layout = 0") != None, None)
 }
 
 test "a tagged address is an offset from the static's, and a plain static has no header" {
@@ -357,7 +352,7 @@ test "an embedded file is a byte string's object of the bytes its digest names, 
   let big = Bytes::concat_all(range(0, 4100).map(|i: Int| byte_of_int(97 + i % 26)));
   let c = static_c({ name: b"ply_k_f", laid: SFile(b"d1") }, no_fields, no_entries, |d: Bytes|
     if d == b"d1" { big } else { b"" });
-  assert(c.index_of(b".kind = 10, .len = 4100, .layout = 4100") != None, None);
+  assert(c.index_of(b".kind = 21, .len = 4100, .layout = 4100") != None, None);
   assert(c.index_of(b"unsigned char w0[4104]") != None, None);
   // Three literals, each on its own line.
   assert_eq(c.split(b"\"\n  \"").len(), 3)
@@ -413,4 +408,32 @@ test "a word no slot of its static can hold is refused" {
   assert(said(named(SStruct({ of: b"PlyType", fields: [WRaw(0)] }))).len() > 0, None);
   assert(said(named(SPlain([WEntry(Named(b"m.f"))]))).len() > 0, None);
   assert(said(named(SPlain([]))).len() > 0, None)
+}
+
+/// Where `needle` first stands in `hay`, or -1.
+fn place_of(hay: Bytes, needle: Bytes) -> Int =
+  match hay.index_of(needle) { Some(i) -> i, None -> 0 - 1 }
+
+test "the head's count helpers never write a static's immortal count, so a count taken or let go of one is nothing" {
+  let h = head_part();
+  let body = |head: Bytes| {
+    let from = place_of(h, head);
+    if from < 0 { b"" }
+    else { match h.index_of_from(b"\n}\n", from) { Some(to) -> h.slice(from, to), None -> b"" } }
+  };
+  // A count is taken only below the shared mark, and a shared one's never at the immortal count.
+  let dup = body(b"static inline void ply_dup(");
+  assert(
+    place_of(dup, b"if (rc < UINT32_C(0x80000000)) h->rc = rc + 1;") > 0
+      && place_of(dup, b"else if (rc != UINT32_MAX) rt_inc_shared_p(") > 0,
+    Some(String::of_bytes_lossy(dup)),
+  );
+  // The immortal count answers "not the last" before anything is written or handed on.
+  let last = body(b"static inline int ply_last(");
+  let immortal = place_of(last, b"if (rc == UINT32_MAX) return 0;");
+  assert(
+    immortal > 0 && immortal < place_of(last, b"h->rc = ")
+      && immortal < place_of(last, b"rt_dec_shared_last_p("),
+    Some(String::of_bytes_lossy(last)),
+  )
 }

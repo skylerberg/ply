@@ -15,20 +15,22 @@ import check.resolve.tables (qualify)
 import emit.layout (Intrinsic, intrinsics, layouts)
 import emit.answer (Need, Layout)
 import emit.pieces (spelled)
+import emit.roots (symbol_of)
+import emit.release (root_of)
 import emit.code (Code, NField)
-import emit.tir (Rep, RInt, RBool, RFloat, RWord, RSum, RNum, RFlat, Leaf, Var, Arg, AVar, Val,
-                 Make, Made, MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst, Let,
-                 Fn, Spine, Data, Containers, rep_of_arg)
-import emit.tir.containers (Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew, ArraySet,
-                            ArrayOfList, ArrayGet, ColumnField, Bits, IntBits, FloatBits,
+import emit.tir (Rep, RInt, RBool, RFloat, RWord, RSum, RNum, RFlat, Leaf, Var, Arg, AVar, AInt,
+                 Val, Make, Made, MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst,
+                 Let, Fn, Lambda, Closure, Spine, Data, Containers, rep_of_arg)
+import emit.tir.containers (Laid, Length, Elements, Joined, ArrayNew, ArraySet, ArrayOfList,
+                            ArrayGet, ColumnField, ItemAt, Rest, Position, Bits, IntBits, FloatBits,
                             DecimalBits, Words, Payloads, Records)
 import emit.lower (lowered_fn)
 import emit.own (owned)
-import emit.lower.base (started)
+import emit.lower.base (Context, Lowered, started)
 import emit.lower.calling (context_of)
-import emit.lower.containers (columned, column_read, listed)
+import emit.lower.containers (columned, column_read, listed, item_read, rest_read)
 import emit.lower.setting (Root, setting_in)
-import emit.keys (Named)
+import emit.keys (RootKey, Named, Written, Copy, root_name)
 import emit.print (printed_fn)
 import emit.compare (Program, program_of, formed, checked, printed_text, not_built)
 
@@ -97,6 +99,50 @@ test "a list literal is made of its items, each handed over as a word" {
   )
 }
 
+test "a list pattern's item is read where it lies, and its rest made a list of its own" {
+  let p = program(b"fn f(xs: List<String>) -> Int = 0\n");
+  let strings = con(b"List", [con(b"String", [])]);
+  let opened = |name: Bytes, ty: Type, act: (Context, Var) -> Lowered|
+    match p.roots.find(|r: Root| r.key == Named(qualify(b"m", name))) {
+      None -> panic("no such root"),
+      Some(r) -> match r.code {
+        Err(why) -> panic(String::of_bytes_lossy(why)),
+        Ok(code) -> {
+          let xs = { id: 0, ty: ty, rep: RWord };
+          act(context_of(p.setting, r, code), xs)
+        },
+      },
+    };
+  let bound = |l: Lowered|
+    l.st.insts.fold([], |acc: List<Bound>, i: Inst|
+      match i { Let(x) -> acc.push({ var: x.var, val: x.val }), _ -> acc });
+  let item = opened(b"f", strings, |cx: Context, xs: Var|
+    item_read(cx, started([xs]), AVar(xs), AInt(40), con(b"String", [])));
+  // Borrowed from the list, read as its word, and never failing: its length test admitted it.
+  assert_eq(ops_in(bound(item)), [
+    {
+      op: OContainer(ItemAt),
+      args: [AVar({ id: 0, ty: strings, rep: RWord }), AInt(40)],
+      uses: { takes: [false, false], owned: false, fails: false, stops: false },
+      answer: RWord,
+    },
+  ]);
+  let rest = opened(b"f", strings, |cx: Context, xs: Var|
+    rest_read(started([xs]), strings, AVar(xs), AInt(2)));
+  assert_eq(
+    ops_in(bound(rest)).map(|o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }|
+      { op: o.op, uses: o.uses }),
+    [
+      {
+        op: OContainer(Rest),
+        uses: { takes: [false, false], owned: true, fails: false, stops: false },
+      },
+    ],
+  );
+  // Neither goes through the runtime.
+  assert_eq(natives_in(bound(item).concat(bound(rest))), [])
+}
+
 test "a builtin the runtime implements is called through its helper over words, its answer held as its type" {
   let p = program(
     Bytes::concat_all([
@@ -139,36 +185,25 @@ test "a builtin the runtime implements is called through its helper over words, 
   )
 }
 
-test "a length and a byte are read in place, and only a read that can fall outside the object fails" {
+test "a length is read in place off its header, never failing and taking nothing" {
   let p = program(
     Bytes::concat_all([
       b"fn count(xs: List<String>) -> Int = xs.len()\n",
       b"fn size(b: Bytes) -> Int = b.len()\n",
       b"fn arity(a: Array<String>) -> Int = a.len()\n",
-      b"fn byte(b: Bytes, i: Int) -> Int / {abort.raise} = b.at(i)\n",
-      b"fn word(b: Bytes, i: Int) -> U32 / {abort.raise} = b.u32_le(i)\n",
     ]),
   );
   let read = |name: Bytes| {
     let bs = bound_in(p, name);
     assert_eq(natives_in(bs), []);
     ops_in(bs).map(|o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }|
-      { op: o.op, fails: o.uses.fails, answer: o.answer })
+      { op: o.op, takes: o.uses.takes, fails: o.uses.fails, answer: o.answer })
   };
-  assert_eq(read(b"count"), [{ op: OContainer(Length), fails: false, answer: RInt }]);
-  assert_eq(read(b"size"), [{ op: OContainer(Length), fails: false, answer: RInt }]);
-  assert_eq(read(b"arity"), [{ op: OContainer(Elements), fails: false, answer: RInt }]);
-  assert_eq(read(b"byte"), [{ op: OContainer(ByteAt), fails: true, answer: RInt }]);
-  assert_eq(read(b"word"), [
-    { op: OContainer(U32At), fails: true, answer: RNum({ bits: 32, signed: false }) },
-  ]);
-  // A read takes nothing it reads.
-  assert_eq(
-    ops_in(bound_in(p, b"byte")).map(
-      |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.uses.takes,
-    ),
-    [[false, false]],
-  )
+  assert_eq([read(b"count"), read(b"size"), read(b"arity")], [
+    [{ op: OContainer(Length), takes: [false], fails: false, answer: RInt }],
+    [{ op: OContainer(Length), takes: [false], fails: false, answer: RInt }],
+    [{ op: OContainer(Elements), takes: [false], fails: false, answer: RInt }],
+  ])
 }
 
 test "byte strings joined from a list made for the join make no list" {
@@ -410,26 +445,31 @@ test "a field of a Columns' record is read from its column, with no record made"
   assert_eq(read(b"var_at"), [])
 }
 
-test "under release a byte string's position is a loop in the body, its predicate called by its type and lent" {
+test "a byte string's position is a loop in the body, its predicate called by its type and lent, its Option made by the body" {
   let p = program(b"fn found(b: Bytes) -> Option<Int> = b.position(0, |c: Int| c == 32)\n");
-  let released = { ..p, setting: { ..p.setting, release: true } };
-  assert_eq(
-    ops_in(bound_in(released, b"found")).map(
-      |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.uses,
-    ),
-    [{ takes: [true, false, true], owned: true, fails: true, stops: true }],
-  );
-  let text = form_text(released, b"found");
-  assert(
-    text.index_of(
-        b"((int64_t (*)(PlyCtx *, Word, int64_t))((const PlyFnDesc *)(intptr_t)ply_words(",
-      )
-      != None
-      && text.index_of(b"break;") != None,
-    Some(String::of_bytes_lossy(text)),
-  );
+  // Under either profile: the loop reads the bytes and the predicate, answering an index.
+  [p, { ..p, setting: { ..p.setting, release: true } }].fold((), |_: Unit, q: Program| {
+    assert_eq(
+      ops_in(bound_in(q, b"found")).map(
+        |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }|
+          { op: o.op, uses: o.uses, answer: o.answer },
+      ),
+      [
+        {
+          op: OContainer(Position),
+          uses: { takes: [false, false, false], owned: true, fails: true, stops: true },
+          answer: RInt,
+        },
+      ],
+    );
+    assert_eq(natives_in(bound_in(q, b"found")), [])
+  });
+  let text = form_text(p, b"found");
+  let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
+  has(b"((int64_t (*)(PlyCtx *, Word, int64_t))((const PlyFnDesc *)(intptr_t)ply_words(");
+  has(b"break; }");
   // The predicate is lent to each call, so no count of it is taken in the loop.
-  let looped = match text.index_of(b"for (; ") {
+  let looped = match text.index_of(b"for (int64_t ") {
     Some(i) -> text.slice(i, text.len()),
     None -> b"",
   };
@@ -437,45 +477,148 @@ test "under release a byte string's position is a loop in the body, its predicat
     looped.len() > 0 && looped.index_of(b"ply_inc(") == None,
     Some(String::of_bytes_lossy(text)),
   );
-  // Without release it is the runtime's call.
-  assert_eq(
-    natives_in(bound_in(p, b"found")).map(
-      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
-    ),
-    [b"builtin_bytes_position_p"],
-  )
+  // The `Option` is the body's own, made where the index is found or not: never the runtime's.
+  [b"rt_nullary_p", b"rt_ctor_p", b"rt_call_p"].fold((), |_: Unit, t: Bytes|
+    assert_eq(text.index_of(t), None))
 }
 
-test "a handler's variables, a hold's region and `bracket` are the runtime's, each answering its type" {
+test "a byte string's position named as a value is a lambda whose loop calls the predicate it is handed by its type" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn space(c: Int) -> Bool = c == 32\n",
+      b"fn by(f: (Bytes, Int, (Int) -> Bool) -> Option<Int> / {abort.raise}, b: Bytes) -> Option<Int> / {abort.raise} = f(b, 0, space)\n",
+      b"fn spaced(b: Bytes) -> Option<Int> / {abort.raise} = by(Bytes::position, b)\n",
+    ]),
+  );
+  let positions = match checked(p, b"spaced") {
+    Ok(f) ->
+      f.lambdas.fold([], |acc: List<Uses>, l: Lambda|
+        match l {
+          Closure(c) ->
+            c.body.body.fold(acc, |us: List<Uses>, i: Inst|
+              match i {
+                Let(x) -> match x.val {
+                  Op(o) -> if o.op == OContainer(Position) { us.push(o.uses) } else { us },
+                  _ -> us,
+                },
+                _ -> us,
+              }),
+        }),
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+  };
+  assert_eq(positions, [{ takes: [false, false, false], owned: true, fails: true, stops: true }]);
+  let text = form_text(p, b"spaced");
+  assert(
+    text.index_of(
+        b"((int64_t (*)(PlyCtx *, Word, int64_t))((const PlyFnDesc *)(intptr_t)ply_words(",
+      )
+      != None,
+    Some(String::of_bytes_lossy(text)),
+  );
+  assert_eq(text.index_of(b"rt_call_p"), None)
+}
+
+/// What each `rt_with_cleanup` root `m.<name>` of `p` calls, in its body or a lambda's, takes and
+/// answers, once its counts are placed and checked.
+fn cleanups(p: Program, name: Bytes) -> List<Uses> / {abort.raise} =
+  match checked(p, name) {
+    Ok(f) ->
+      f.lambdas.fold([f.body], |acc: List<List<Inst>>, l: Lambda|
+        match l { Closure(c) -> acc.push(c.body.body) }).fold(
+        [],
+        |acc: List<Uses>, b: List<Inst>|
+          b.fold(acc, |us: List<Uses>, i: Inst|
+            match i {
+              Let(x) -> match x.val {
+                Native(n) -> if n.name == b"rt_with_cleanup_p" { us.push(n.uses) } else { us },
+                _ -> us,
+              },
+              _ -> us,
+            }),
+      ),
+    Err(why) -> panic(String::of_bytes_lossy(Bytes::concat_all([name, b": ", why]))),
+  }
+
+/// The closures are taken; the types of what is held and answered are only read.
+fn cleanup_uses() -> Uses =
+  { takes: [true, true, true, false, false], owned: true, fails: true, stops: true }
+
+test "`bracket`, named or passed as a value, is the runtime's `rt_with_cleanup`, taking its closures" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn release(_: Int) -> Unit = ()\n",
+      b"fn bracketed(n: Int) -> Int = bracket(|| n, release, |x: Int| x + 1)\n",
+      b"fn by(f: (() -> Int, (Int) -> Unit, (Int) -> Int) -> Int, n: Int) -> Int = f(|| n, release, |x: Int| x + 1)\n",
+      b"fn bracketed_by(n: Int) -> Int = by(bracket, n)\n",
+    ]),
+  );
+  assert_eq(cleanups(p, b"bracketed"), [cleanup_uses()]);
+  assert_eq(cleanups(p, b"bracketed_by"), [cleanup_uses()]);
+  [b"bracketed", b"bracketed_by"].fold((), |_: Unit, n: Bytes| {
+    let text = form_text(p, n);
+    assert(text.index_of(b"rt_with_cleanup_p(ctx, ") != None, Some(String::of_bytes_lossy(text)));
+    assert_eq(text.index_of(b"builtin_bracket_p"), None)
+  })
+}
+
+test "a handler's variables are the runtime's, a hold's region its `rt_with_cleanup`, each answering its type" {
   let p = program(
     Bytes::concat_all([
       b"effect tally {\n  write add(n: Int) -> Unit\n  read total() -> Int\n}\n",
       b"fn counted() -> Int = handle { tally.add(1); tally.add(2); tally.total() } with { var n = 0, tally.add(k) -> { n = n + k; }, tally.total() -> n }\n",
       b"fn release(_: Int) -> Unit = ()\n",
       b"fn held(n: Int) -> Int = with_hold[t](n, release) { c -> c.get() }\n",
-      b"fn bracketed(n: Int) -> Int = bracket(|| n, release, |x: Int| x + 1)\n",
       b"fn copied(n: Int) -> Bool = { let got = with_hold[t](n, release) { c -> with_hold[u](c.get(), release) { d -> d.get() } }; got >= 0 }\n",
     ]),
   );
   assert_eq(
-    [b"counted", b"held", b"bracketed", b"copied"].fold(
-      [],
-      |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
-        match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) },
-    ),
+    [b"counted", b"held", b"copied"].fold([], |acc: List<{ name: Bytes, why: Bytes }>, n: Bytes|
+      match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) }),
     [],
   );
-  assert_eq(
-    natives_in(bound_in(p, b"bracketed")).map(
-      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
-    ),
-    [b"builtin_bracket_p"],
-  );
+  assert_eq(cleanups(p, b"held"), [cleanup_uses()]);
   // A hold answers what its body answers, here an `Int` its comparison reads in a register.
   assert(
     !natives_in(bound_in(p, b"copied")).any(
       |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name == b"rt_binary_p",
     ),
+  );
+  // The hold made, the value taken out of it and a read of it are each of the type the region
+  // gives them, which the checker filed for its body and its release.
+  let hold_natives = |name: Bytes|
+    match formed(p, name) {
+      Ok(f) ->
+        f.lambdas.fold([], |acc: List<Bound>, l: Lambda|
+          match l {
+            Closure(c) ->
+              acc.concat(
+                c.body.body.fold([], |bs: List<Bound>, i: Inst|
+                  match i { Let(x) -> bs.push({ var: x.var, val: x.val }), _ -> bs }),
+              ),
+          }).filter(|b: Bound|
+          match b.val { Native(n) -> n.name.index_of(b"hold_") != None, _ -> false }),
+      Err(_) -> [],
+    };
+  let int = TyCon({ name: b"Int", args: [] });
+  let typed = hold_natives(b"held").map(|b: Bound|
+    match b.val {
+      Native(n) ->
+        {
+          name: n.name,
+          held: match b.var.ty { TyCon(c) -> c.args.at(c.args.len() - 1), _ -> None },
+          whole: b.var.ty,
+        },
+      _ -> { name: b"", held: None, whole: b.var.ty },
+    });
+  assert_eq(typed.map(|t: { name: Bytes, held: Option<Type>, whole: Type }| t.name), [
+    b"builtin_elaborated_hold_new_p",
+    b"builtin_elaborated_hold_take_p",
+    b"builtin_hold_get_p",
+  ]);
+  assert_eq(
+    typed.map(|t: { name: Bytes, held: Option<Type>, whole: Type }|
+      match t.held { Some(h) -> h, None -> t.whole }),
+    [int, int, int],
   )
 }
 
@@ -730,6 +873,10 @@ fn in_place_calls() -> List<{ name: Bytes, src: Bytes }> =
       src: b"(n: ListNode<String>, x: String) -> ListNode<String> = ListNode::leaf_set(n, 2, x)",
     },
     {
+      name: b"leaf_set_any",
+      src: b"<a>(n: ListNode<a>, x: a) -> ListNode<a> = ListNode::leaf_set(n, 2, x)",
+    },
+    {
       name: b"root_swap",
       src: b"(xs: List<Int>, r: ListNode<Int>) -> Option<ListNode<Int>> = ListNode::root_swap(xs, Some(r)).old",
     },
@@ -810,10 +957,17 @@ fn in_place_calls() -> List<{ name: Bytes, src: Bytes }> =
     },
   ]
 
+fn con(name: Bytes, args: List<Type>) -> Type = TyCon({ name: name, args: args })
+
+/// The C a write prints copying a block of type `ty` where another holds it too: a call of the root
+/// written to copy it, as the unit names the root.
+fn copy_call(ty: Type) -> Bytes / {abort.raise} =
+  Bytes::concat_all([b" = ", symbol_of(root_name(root_of(Copy, ty))), b"(ctx, "])
+
 /// For each probe of `in_place_calls`, C its printed body holds and C it must not: each slot read or
 /// written as what it holds. A root or a kid is an `Option`'s one word, which nothing opens; an item
 /// a word, read as the scalar it stands for; a size an immediate.
-fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }> = {
+fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }> / {abort.raise} = {
   let reads = |name: Bytes, has: List<Bytes>| { name: name, has: has, lacks: [] };
   let payload = |name: Bytes, has: List<Bytes>|
     { name: name, has: has, lacks: [b"rt_maybe_open_p", b"rt_maybe_take_p"] };
@@ -832,7 +986,9 @@ fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }
     reads(b"leaf_at_on", [b" = ply_words(p0)[0 + (INT64_C(3))];"]),
     reads(b"kid_at", [b" = ply_words(p0)[0 + (INT64_C(1))];"]),
     reads(b"tail_push", [
-      b"rt_list_writable_p(ctx, ",
+      copy_call(con(b"List", [con(b"String", [])])),
+      b" = rt_list_room_p(ctx, 2 * n); ",
+      b"ply_free(ctx, ",
       b")->flags)] = p1; ",
       b")->flags += 1; ply_obj(",
     ]),
@@ -840,8 +996,15 @@ fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }
       b"rt_note_update_p(ctx, in_place, in_place ? 0 : ply_obj(",
       b"[1 + (INT64_C(2))]; ply_words(",
     ]),
-    reads(b"leaf_set", [b"rt_node_writable_p(ctx, ", b"[INT64_C(2)] = p1; ply_dec(ctx, "]),
-    returned(b"root_swap", [b"rt_list_writable_p(ctx, ", b")[0]; ply_words(", b")[0] = "]),
+    reads(b"leaf_set", [
+      copy_call(con(b"std.prelude.ListNode", [con(b"String", [])])),
+      b"[INT64_C(2)] = p1; ply_dec(ctx, ",
+    ]),
+    returned(b"root_swap", [
+      copy_call(con(b"List", [con(b"Int", [])])),
+      b")[0]; ply_words(",
+      b")[0] = ",
+    ]),
     payload(b"kid_swap", [
       b" = 0; if (INT64_C(0) < (int64_t)ply_obj(",
       b")->len = (uint32_t)(INT64_C(0)) + 1; ",
@@ -882,7 +1045,7 @@ fn laid_expected() -> List<{ name: Bytes, has: List<Bytes>, lacks: List<Bytes> }
       b")->len -= 1;",
     ]),
     payload(b"map_swap", [
-      b"rt_map_writable_p(ctx, ",
+      copy_call(con(b"Map", [con(b"Int", []), con(b"String", [])])),
       b")[0]; ply_words(",
       b")->layout = (uint32_t)(INT64_C(1)); ",
       b")->len = (uint32_t)(INT64_C(40));",
@@ -984,17 +1147,38 @@ test "each extern written in place is an operation over the runtime's objects as
           ],
           [true, true, true, true, true, true, true, true, true, true, true, true, true],
         );
-        // A write makes what it writes held once where it is not, and counts an item's or a pair's.
+        // A write makes what it writes held once where it is not, by the root copying its type's
+        // block, which the root's calls name; and counts an item's or a pair's.
         assert_eq(
-          [
-            has(b"tail_push", b"rt_list_writable_p(ctx, "),
-            has(b"leaf_set", b"rt_node_writable_p(ctx, "),
-            has(b"map_swap", b"rt_map_writable_p(ctx, "),
-            has(b"pair_set", b"rt_note_update_p(ctx, "),
-            has(b"kid_put", b"rt_note_update_p(ctx, "),
-          ],
-          [true, true, true, true, false],
+          [has(b"pair_set", b"rt_note_update_p(ctx, "), has(b"kid_put", b"rt_note_update_p(ctx, ")],
+          [true, false],
         );
+        assert_eq(calls.filter(|c: { name: Bytes, src: Bytes }| has(c.name, b"_writable_p(")), []);
+        let copies = |name: Bytes|
+          match form(name) {
+            Ok(f) ->
+              printed_fn(f, s.setting.ctors).calls.filter(|k: RootKey|
+                match k { Written(w) -> w.op == Copy, _ -> false }),
+            Err(_) -> [],
+          };
+        assert_eq(
+          [b"leaf_set", b"kid_put", b"map_swap", b"branch_cut", b"tail_start", b"leaf_at"].map(
+            copies,
+          ),
+          [
+            [root_of(Copy, con(b"std.prelude.ListNode", [con(b"String", [])]))],
+            [root_of(Copy, con(b"std.prelude.MapNode", [con(b"Int", []), con(b"String", [])]))],
+            [root_of(Copy, con(b"Map", [con(b"Int", []), con(b"String", [])]))],
+            [root_of(Copy, con(b"std.prelude.MapNode", [con(b"Int", []), con(b"String", [])]))],
+            [],
+            [],
+          ],
+        );
+        // A write at a type variable notes it, so only a specialisation, which lays its items out,
+        // copies the block.
+        assert_eq(match form(b"leaf_set_any") { Ok(f) -> f.links.needs, Err(_) -> [] }, [
+          { var: 0, reads: Layout },
+        ]);
         // An extern answering a record answers it as its fields, no record made: its word stays none.
         let fields = |name: Bytes|
           match form(name) {

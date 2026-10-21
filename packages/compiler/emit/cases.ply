@@ -1391,7 +1391,9 @@ test "an array is made, written and listed into as the type of its elements lays
   // A record is held as its word form, a box of its words; an `Int` is its bits.
   assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(32));"), [true, true, false, false]);
   assert_eq(has(b"ply_embed"), [false, false, false, false]);
-  assert_eq(has(b"rt_list_at_p(ctx, "), [false, false, true, false]);
+  // A list's items are read where its trie or its tail holds them, never through the runtime.
+  assert_eq(has(b"rt_list_"), [false, false, false, false]);
+  assert_eq(has(b"while ((INT64_C(32) << "), [false, false, true, false]);
   // A write is counted in place or into a copy.
   assert_eq(has(b"rt_note_update_p(ctx, "), [false, true, false, false])
 }
@@ -1722,7 +1724,7 @@ test "a lambda a `std.prelude` function hands on to a native is laid out with th
     b"std.prelude.raised",
   ]);
   let code = |name: Bytes| own_code(answered_body(answers, name).text);
-  assert(code(b"std.prelude.guarded").index_of(b"builtin_bracket_p(ctx") != None, None);
+  assert(code(b"std.prelude.guarded").index_of(b"rt_with_cleanup_p(ctx") != None, None);
   assert(code(b"std.prelude.raised").index_of(b"[] = {0, 0, (Word)(intptr_t)&") != None, None);
   assert(code(b"std.prelude.raised").index_of(b"rt_alloc_bytes_p(") == None, None)
 }
@@ -2046,23 +2048,6 @@ test "a `Decimal` is held in registers as its two words, and in a record or an a
   assert_eq(has(b"rt_binary_p"), [false, false, false, false, false, false, false])
 }
 
-test "a byte is read through `ply_bytes`, which follows a view to the value it views" {
-  let src = Bytes::concat_all([
-    b"fn at(b: Bytes, i: Int) -> Int / {abort.raise} = b.at(i)\n",
-    b"fn word(b: Bytes, i: Int) -> U32 / {abort.raise} = b.u32_le(i)\n",
-  ]);
-  let out = emit_all_program(
-    [{ name: b"m", src: src }],
-    [],
-    [b"Bytes::at", b"Bytes::u32_le"],
-    true,
-  );
-  let has = |text: Bytes| out.map(|e: Emitted| e.text.index_of(text) != None);
-  assert_eq(out.map(|e: Emitted| e.why), [None, None]);
-  assert_eq(has(b"ply_bytes("), [true, true]);
-  assert_eq(has(b"(unsigned char *)ply_words("), [false, false])
-}
-
 test "a field of a `Columns`' record is loaded from its column, with no record made" {
   let src = Bytes::concat_all([
     b"type P = { label: String, x: Float }\n",
@@ -2322,17 +2307,29 @@ test "each extern written in place is written over the runtime's objects as the 
     ],
     [true, true, true, true, true, true, true, true, true, true, true, true, true],
   );
-  // A write takes what it writes held once, where it is not, and counts an item's or a pair's.
+  // A write takes what it writes held once, where it is not, by the root copying its type's block,
+  // and counts an item's or a pair's.
+  let ty = |name: Bytes, args: List<Type>| TyCon({ name: name, args: args });
+  let copy = |t: Type| keys::written(keys::Copy, t, b"std.prelude");
+  let copied = |name: Bytes, t: Type|
+    match answers.find(|a: RootAnswer| a.name == b"std.prelude.probe_".concat(name)) {
+      Some(a) -> match a.answer {
+        Body(b) -> b.tables.calls.contains(copy(t)) && has(name, symbol_of(root_name(copy(t)))),
+        Refused(_) -> false,
+      },
+      None -> false,
+    };
   assert_eq(
     [
-      has(b"tail_push", b"rt_list_writable_p(ctx, "),
-      has(b"leaf_set", b"rt_node_writable_p(ctx, "),
-      has(b"map_swap", b"rt_map_writable_p(ctx, "),
+      copied(b"tail_push", ty(b"List", [string_type()])),
+      copied(b"leaf_set", ty(b"std.prelude.ListNode", [string_type()])),
+      copied(b"map_swap", ty(b"Map", [int_type(), string_type()])),
       has(b"pair_set", b"rt_note_update_p(ctx, "),
       has(b"kid_put", b"rt_note_update_p(ctx, "),
     ],
     [true, true, true, true, false],
-  )
+  );
+  assert_eq(calls.filter(|c: { name: Bytes, src: Bytes }| has(c.name, b"_writable_p(")), [])
 }
 
 // A map keyed by a small record holds each key in place in a pair a write answers.
@@ -2366,7 +2363,7 @@ test "an array read matched as `Some` or `None` is answered in place by its look
   assert_eq(calls(b"rt_ctor_p"), [false])
 }
 
-test "a list's item is read by `std.prelude`'s one `List::at`, from the tail in place or the leaf the runtime finds" {
+test "a list's item is read by `std.prelude`'s one `List::at`, from the tail or the leaf its trie leads to, in place" {
   let src = Bytes::concat_all([
     b"fn third(xs: List<String>) -> Option<String> = xs.at(2)\n",
     b"fn listed(xs: List<Int>, i: Int) -> Int = match xs.at(i) { Some(v) -> v, None -> 0 }\n",
@@ -2392,11 +2389,14 @@ test "a list's item is read by `std.prelude`'s one `List::at`, from the tail in 
     [true, true],
   );
   assert(code(at_string).index_of(b")->flags") != None, None);
-  assert(code(at_string).index_of(b"builtin_listnode_leaf_of_p(") != None, None);
+  assert(
+    code(at_string).index_of(b"builtin_") == None,
+    Some(String::of_bytes_lossy(code(at_string))),
+  );
   assert(code(at_string).index_of(b"ply_words(") != None, None)
 }
 
-test "a read of a list takes no count of a word held through it, and lets go of one it spends" {
+test "a read of a list counts nothing it reads through it, but its answer once where it lets the list go" {
   let read = b"std.prelude.List::at@String";
   let answers = answers_of(
     [b"m"],
@@ -2410,7 +2410,9 @@ test "a read of a list takes no count of a word held through it, and lets go of 
   let reading = |marker: Bytes|
     range(0, lines.len()).filter(|i: Int| line_at(i).index_of(marker) != None);
   // `start` and `tail_len` read the parameter `List::at` reads again after them where it lies.
-  let headers = reading(b"ply_obj(p0)->layout;").concat(reading(b"ply_obj(p0)->flags;"));
+  let headers = reading(b" = (int64_t)ply_obj(p0)->layout;").concat(
+    reading(b" = (int64_t)ply_obj(p0)->flags;"),
+  );
   assert(
     headers.len() == 2
       && headers.all(|i: Int|
@@ -2418,21 +2420,19 @@ test "a read of a list takes no count of a word held through it, and lets go of 
           && line_at(i + 1).index_of(b"ply_dec(") == None),
     Some(String::of_bytes_lossy(text)),
   );
-  // The tail's item is read at the list's last use, which spends it: the `Some` holding the item
-  // again takes the count the answer holds, and the list is let go next.
-  let items = reading(b" = ply_words(p0)[1 + (");
+  // An item is read borrowed from the tail or a leaf; the answer read out of the list is counted once
+  // more only where the list is let go of.
+  let counted = reading(b"ply_inc(");
   assert(
-    items.len() == 1
-      && items.all(|i: Int|
-        line_at(i + 2).index_of(b"ply_inc(") != None
-          && line_at(i + 3).index_of(b"ply_dec(ctx, p0);") != None),
+    reading(b" = ply_words(p0)[1 + (").len() == 1 && counted.len() == 1
+      && counted.all(|i: Int| line_at(i + 1).index_of(b"ply_dec(ctx, p0);") != None),
     Some(String::of_bytes_lossy(text)),
   )
 }
 
-// The native hands a leaf back as its word or zero, so a body that took its answer for an `Option`'s
-// object would read every leaf as `None`.
-test "`ListNode::leaf_of` answers a list's leaf as its payload's word, as the runtime's native does" {
+// The leaf is its word or zero, so a body that took it for an `Option`'s object would read every leaf
+// as `None`.
+test "`ListNode::leaf_of` is read down the list's trie in place, its leaf its payload's word" {
   let probe = b"\nfn probe_leaf(xs: List<Int>) -> Int = match ListNode::leaf_of(xs, 0) { Some(n) -> ListNode::len(n), None -> 0 }\n";
   let root = b"std.prelude.probe_leaf";
   let names = [b"std.prelude"];
@@ -2454,7 +2454,7 @@ test "`ListNode::leaf_of` answers a list's leaf as its payload's word, as the ru
   let code = own_code(answered_body(answers, root).text);
   // An `Option` of a node is that word or 0, so the answer is the `Option` with nothing decoded.
   assert(
-    code.index_of(b" = builtin_listnode_leaf_of_p(ctx, ") != None
+    code.index_of(b"builtin_") == None && code.index_of(b"while ((INT64_C(32) << ") != None
       && code.index_of(b") != (0)") == None,
     Some(String::of_bytes_lossy(code)),
   )
@@ -3111,7 +3111,7 @@ test "a helper's answer handed to a helper is not counted again" {
   );
   let text = match out { [e, ..] -> e.text, [] -> b"" };
   assert(
-    text.index_of(b"builtin_byte_of_int_p") != None && text.index_of(b"rt_list_p") != None,
+    text.index_of(b"builtin_byte_of_int_p") != None && text.index_of(b"rt_list_room_p") != None,
     Some(String::of_bytes_lossy(text)),
   );
   assert(text.index_of(b"ply_inc(") == None, Some(String::of_bytes_lossy(text)))

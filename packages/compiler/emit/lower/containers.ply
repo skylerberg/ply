@@ -1,12 +1,13 @@
-//! Lists, maps, arrays, `Columns`, strings and bytes: their literals, builtins and intrinsics. Every
-//! builtin call comes here first: what the emitter writes for a scalar's type goes on to `scalars`,
-//! what reads or writes a container's cells is written in place, and the rest is called through the
-//! runtime's helper named for it.
+//! Lists, maps, arrays and `Columns`: their literals, builtins and intrinsics. Every builtin call
+//! comes here first: a crossing goes on to `crossing`, what `strings` writes over strings and bytes
+//! to it, what the emitter writes for a scalar's type to `scalars`; what reads or writes a
+//! container's cells is written in place, and the rest is called through the runtime's helper named
+//! for it.
 
-import syntax.parsing (Span)
+import syntax.parsing (Span, dummy_span)
 import emit.code (Code, NApp, NVar)
-import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, named_type, int_type,
-                    bool_type, bytes_type, unit_type, option_type)
+import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, int_type, bool_type,
+                    bytes_type, unit_type, option_type)
 import emit.typing (unknown_type)
 import check.resolve.tables (qualify)
 import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt, NodeLen, LeafAt,
@@ -19,20 +20,23 @@ import emit.reps (Def, FieldTy, TyRec, kind_of, has_vars, laid_vars, spelled_fie
 import emit.c (KInt, KFloat, KDec, KNum)
 import emit.answer (Layout)
 import emit.roots (builtin_helper, generated_builtin)
+import emit.release (released_vars)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RSum, RFlat, Leaf, Var, Arg, AVar,
                  AInt, AZero, Make, MList, Native, Op, OContainer, Let, Prim, Containers)
-import emit.tir.containers (ContainerOp, Laid, Length, Elements, ByteAt, U32At, Joined, ArrayNew,
-                            ArraySet, ArrayOfList, ArrayGet, ColumnField, Position, Element, Held,
-                            Words, Bits, Payloads, Records, IntBits, WidthBits, FloatBits,
-                            DecimalBits)
-import emit.lower.setting (imported_target, qualified, from_import, module_import, builtin_at,
-                           ctor_named)
+import emit.tir.containers (ContainerOp, Laid, Length, Elements, Joined, ArrayNew, ArraySet,
+                            ArrayOfList, ArrayGet, ColumnField, ItemAt, Rest, LeafOf, Room,
+                            Position, Element, Held, Words, Bits, Payloads, Records, IntBits,
+                            WidthBits, FloatBits, DecimalBits)
+import emit.lower.setting (imported_target, qualified, from_import, module_import, builtin_at)
 import emit.lower.held (held_as, field_type)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, noted, filed, unfiled,
                         type_of, through_runtime, as_words, opened, continued)
 import emit.lower.base
 import emit.lower.data (constructed_as)
 import emit.lower.scalars (operated, runtime_builtin)
+import emit.lower.crossing (crossing_builtin, crossed, type_described)
+import emit.lower.strings
+import emit.lower.strings (string_builtin)
 
 /// Builtin `name` called on `args`; `callee` is where its name is written, which the checker files
 /// the types it called the builtin at under. A native the elaboration writes calls of, its name
@@ -73,7 +77,9 @@ fn builtin_filed(
         // Written code files a part's type where a root of its own writes it; the rest only the
         // runtime can answer, the root that asks among them.
         runtime_builtin(cx, st, b, args, at)
-      } else if scalar_builtin(b) { operated(cx, st, b, args, at) }
+      } else if crossing_builtin(b) { crossed(cx, st, b, args, callee, at) }
+      else if string_builtin(b) { strings::lowered(cx, st, b, args, callee, at) }
+      else if scalar_builtin(b) { operated(cx, st, b, args, at) }
       else { contained(cx, st, b, args, called_at(cx, b, callee), at) },
     },
   }
@@ -190,6 +196,45 @@ pub fn listed(cx: Context, st: Lowering, items: List<Arg>, at: Span) -> Lowered 
     },
   }
 
+/// Item `i` of the list `xs`, which a length test admitted, as a value of `item` is held: borrowed
+/// from the list, a scalar read out of its word.
+pub fn item_read(cx: Context, st: Lowering, xs: Arg, i: Arg, item: Type) -> Lowered =
+  handed(
+    bound_as(
+      st,
+      item,
+      item_rep(cx, item),
+      Op({
+        op: OContainer(ItemAt),
+        args: [xs, i],
+        uses: { takes: [false, false], owned: false, fails: false, stops: false },
+      }),
+      dummy_span(),
+    ),
+    held_as(cx.setting, item),
+    dummy_span(),
+  )
+
+/// The items of the list `xs`, of type `ty`, from `k` on, which a length test admitted: a list of
+/// their own sharing `xs`'s trie, `xs` read, each item it copies counted as its type counts it.
+pub fn rest_read(st: Lowering, ty: Type, xs: Arg, k: Arg) -> Lowered =
+  bound_as(
+    layout_noted(st, ty),
+    ty,
+    RWord,
+    Op({
+      op: OContainer(Rest),
+      args: [xs, k],
+      uses: { takes: [false, false], owned: true, fails: false, stops: false },
+    }),
+    dummy_span(),
+  )
+
+/// `st` noting each type variable the counted words of a block of `ty` are laid by, which only a
+/// specialisation lays out.
+fn layout_noted(st: Lowering, ty: Type) -> Lowering =
+  released_vars(ty).fold(st, |acc: Lowering, v: Int| noted(acc, { var: v, reads: Layout }))
+
 /// What a call of a builtin answers, as the checker filed it where the name is written or as the
 /// builtin's declared scheme gives it at the type arguments filed there, and those type arguments.
 type Settled = { ret: Option<Type>, args: List<Type> }
@@ -217,14 +262,37 @@ fn contained(
     read_in_place(st, Length, args, int_type(), RInt, at)
   } else if name == b"Array::len" && args.len() == 1 {
     read_in_place(st, Elements, args, int_type(), RInt, at)
-  } else if name == b"Bytes::at" && args.len() == 2 {
-    read_in_place(st, ByteAt, args, int_type(), RInt, at)
-  } else if name == b"Bytes::u32_le" && args.len() == 2 {
-    read_in_place(st, U32At, args, named_type(b"U32"), RNum({ bits: 32, signed: false }), at)
+  } else if name == b"ListNode::leaf_of" && args.len() == 2 {
+    // The leaf's word or 0, which an `Option` of one pointer is.
+    match f.ret {
+      Some(ret) -> if pointer_option(cx, ret) {
+        handed(read_in_place(st, LeafOf, args, ret, RWord, at), held_as(cx.setting, ret), at)
+      } else {
+        refuse(st, Containers, b"a trie's leaf read as other than an Option of one pointer")
+      },
+      None -> refuse(st, Containers, b"a trie's leaf read at no type the checker filed"),
+    }
+  } else if name == b"List::with_capacity" && args.len() == 1 {
+    match ((f.ret, args)) {
+      (Some(ret), [n]) -> {
+        let count = handed({ st: st, arg: n }, RInt, at);
+        bound_as(
+          count.st,
+          ret,
+          RWord,
+          Op({
+            op: OContainer(Room),
+            args: [count.arg],
+            uses: { takes: [false], owned: true, fails: false, stops: false },
+          }),
+          at,
+        )
+      },
+      _ -> refuse(st, Containers, b"an empty list made at no type the checker filed"),
+    }
   } else if name == b"Bytes::concat_all" && args.len() == 1 { joined(cx, st, args, f, at) }
-  else if is_callback(name) {
-    refuse(st, Containers, b"a callback builtin outside its fused shape: ".concat(name))
-  } else if name == b"Bytes::position" && cx.setting.release { positioned(cx, st, args, at) } else {
+  else if name == b"Bytes::position" { positioned(cx, st, args, at) }
+  else if name == b"bracket" || name == b"?hold_bracket" { bracketed(cx, st, args, at) } else {
     match laid_element(name, args, f) {
       Some(t) -> if has_vars(t) { called(cx, layout_needed(st, t), name, args, f, at) }
       else if name == b"Columns::get" { called(cx, st, name, args, f, at) }
@@ -262,11 +330,8 @@ fn called(
 /// What a native the elaboration writes calls of answers, which no declaration states: an operator
 /// at a type a witness stands for its operands' type, but `<`, `<=`, `>` and `>=`, which the
 /// elaboration numbers 5 to 8, a `Bool`; a handler's variable the type the checker filed for its
-/// read, where the read is written; installing or setting one `Unit`; a hold's region what its body
-/// answers; and a hold, and the value taken out of one, a word of no type the checker filed. Where
-/// nothing says more, the runtime's word.
-fn elaborated_answer(cx: Context, name: Bytes, args: List<Arg>, at: Span) -> Option<Type> = {
-  let word = |t: Option<Type>| match t { Some(x) -> Some(x), None -> Some(unknown_type()) };
+/// read, where the read is written; installing or setting one `Unit`.
+fn elaborated_answer(cx: Context, name: Bytes, args: List<Arg>, at: Span) -> Option<Type> =
   if name == b"?numeric_binary" {
     match args {
       [AInt(k), _, x, _] -> Some(if k >= 5 && k <= 8 { bool_type() } else { type_of(x) }),
@@ -275,14 +340,7 @@ fn elaborated_answer(cx: Context, name: Bytes, args: List<Arg>, at: Span) -> Opt
   } else if name == b"?numeric_unary" { match args { [_, _, x] -> Some(type_of(x)), _ -> None } }
   else if name == b"?handler_var" { match filed(cx, at) { Some(t) -> Some(t.ty), None -> None } }
   else if name == b"?handler_init" || name == b"?handler_set" { Some(unit_type()) }
-  else if name == b"?hold_new" || name == b"?hold_take" { Some(unknown_type()) }
-  else if name == b"?hold_bracket" {
-    word(match args.at(2) {
-      Some(AVar(body)) -> match body.ty { TyFn(f) -> Some(f.ret), _ -> None },
-      _ -> None,
-    })
-  } else { None }
-}
+  else { None }
 
 /// `st` noting each type variable that leaves the layout of an element of type `t` unknown, which a
 /// specialisation would lay its elements out by.
@@ -299,8 +357,8 @@ fn open(t: Type) -> Bool =
     _ -> false,
   }
 
-/// An operation that reads `args`, written in place, its answer held as `rep`: the object first,
-/// as a word, and then each index as an `Int`.
+/// An operation that reads `args`, written in place and never failing, its answer held as `rep`: the
+/// object first, as a word, and then each index as an `Int`.
 fn read_in_place(
   st: Lowering,
   op: ContainerOp,
@@ -327,12 +385,7 @@ fn read_in_place(
     Op({
       op: OContainer(op),
       args: index.args,
-      uses: {
-        takes: index.args.map(|_: Arg| false),
-        owned: false,
-        fails: op == ByteAt || op == U32At,
-        stops: false,
-      },
+      uses: { takes: index.args.map(|_: Arg| false), owned: false, fails: false, stops: false },
     }),
     at,
   )
@@ -478,8 +531,15 @@ fn laid(cx: Context, st: Lowering, op: Intrinsic, args: List<Arg>, ty: Type, at:
             },
           },
       );
+      // A write copies the object it takes where another holds it too, by the root its type has.
+      let copies = l.operands.at(0) == Some(Taken) && op != OfList(TailStart);
       let answered = bound_as(
-        handed_over.st,
+        if copies {
+          match args.at(0) {
+            Some(a) -> layout_noted(handed_over.st, type_of(a)),
+            None -> handed_over.st,
+          }
+        } else { handed_over.st },
         ty,
         rep,
         Op({
@@ -569,7 +629,7 @@ fn laying(op: Intrinsic) -> Laying = {
   }
 }
 
-fn is_lookup(name: Bytes) -> Bool = name == b"Array::at" || name == b"ListNode::leaf_of"
+fn is_lookup(name: Bytes) -> Bool = name == b"Array::at"
 
 /// The type of the elements a call of `name` lays out or reads where they lie: an array's for
 /// `Array::new`, `set`, `of_list` and `get`, and a `Columns`' for `Columns::get`.
@@ -672,42 +732,75 @@ fn element_rep(e: Element) -> Rep =
 fn is_option(t: Type) -> Bool =
   match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
 
-/// `Bytes::position(b, from, f)` under release, written as a loop in the body rather than the
-/// runtime's call: `f` may stop for a handler its effects reach, and a native's frame cannot resume.
-/// It answers the index as an `Option`'s object, made of the program's own constructors.
+/// `Bytes::position(b, from, f)`, a loop in the body rather than the runtime's call, since `f` may
+/// stop for a handler its effects reach and a native's frame cannot resume: the first index found,
+/// `-1` where none is, made the `Option` it answers, `Some` of it or `None`. Reads `b` and `f`.
 fn positioned(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered =
-  match ({ some: ctor_named(cx.setting, b"Some"), none: ctor_named(cx.setting, b"None") }) {
-    { some: Some(some), none: Some(none) } -> match args {
-      [b, from, f] -> {
-        let bw = handed({ st: st, arg: b }, RWord, at);
-        let fr = handed({ st: bw.st, arg: from }, RInt, at);
-        let fw = handed({ st: fr.st, arg: f }, RWord, at);
-        let ty = option_type(int_type());
-        let answered = bound_as(
-          fw.st,
-          ty,
+  match args {
+    [b, from, f] -> {
+      let bw = handed({ st: st, arg: b }, RWord, at);
+      let fr = handed({ st: bw.st, arg: from }, RInt, at);
+      let fw = handed({ st: fr.st, arg: f }, RWord, at);
+      let ty = option_type(int_type());
+      let index = bound_as(
+        fw.st,
+        int_type(),
+        RInt,
+        Op({
+          op: OContainer(Position),
+          args: [bw.arg, fr.arg, fw.arg],
+          uses: { takes: [false, false, false], owned: true, fails: true, stops: true },
+        }),
+        at,
+      );
+      let found = bound_as(
+        index.st,
+        bool_type(),
+        RBool,
+        Prim({ op: b"ge", on: RInt, args: [index.arg, AInt(0)] }),
+        at,
+      );
+      let some = constructed_as(cx, opened(found.st), b"Some", [index.arg], ty, at);
+      let none = constructed_as(cx, opened(continued(found.st, some.st)), b"None", [], ty, at);
+      base::joined(cx, found, some, none, false, at)
+    },
+    _ -> refuse(st, Containers, b"a byte string's position on other operands than three"),
+  }
+
+/// `bracket(acquire, release, body)`, or a hold's region, which is one: the runtime's
+/// `rt_with_cleanup`, which takes the three closures and counts what it holds across their calls
+/// by the types of what `acquire` and `body` answer.
+fn bracketed(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / {abort.raise} =
+  match args {
+    [acquire, release, body] -> match ((type_of(acquire), type_of(body))) {
+      (TyFn(a), TyFn(b)) -> {
+        let aw = handed({ st: st, arg: acquire }, RWord, at);
+        let bw = handed({ st: aw.st, arg: body }, RWord, at);
+        let rw = handed({ st: bw.st, arg: release }, RWord, at);
+        let held = type_described(cx, rw.st, a.ret, at);
+        let answer = type_described(cx, held.st, b.ret, at);
+        let ran = bound_as(
+          answer.st,
+          b.ret,
           RWord,
-          Op({
-            op: OContainer(Position({ some: some, none: none })),
-            args: [bw.arg, fr.arg, fw.arg],
-            uses: { takes: [true, false, true], owned: true, fails: true, stops: true },
+          Native({
+            name: b"rt_with_cleanup_p",
+            args: [aw.arg, bw.arg, rw.arg, held.arg, answer.arg],
+            uses: {
+              takes: [true, true, true, false, false],
+              owned: true,
+              fails: true,
+              stops: true,
+            },
           }),
           at,
         );
-        handed(answered, held_as(cx.setting, ty), at)
+        handed(ran, held_as(cx.setting, b.ret), at)
       },
-      _ -> refuse(st, Containers, b"a byte string's position on other operands than three"),
+      _ -> refuse(st, Containers, b"a bracket over other than functions"),
     },
-    _ ->
-      refuse(
-        st,
-        Containers,
-        b"a byte string's position with no `Option` constructors to answer in",
-      ),
+    _ -> refuse(st, Containers, b"a bracket on other operands than three"),
   }
-
-/// A builtin that calls a function it is handed in a shape only a fused loop writes.
-fn is_callback(name: Bytes) -> Bool = name == b"iterate"
 
 /// The builtins `scalars` lowers: those the emitter writes at the type of a scalar it was called at,
 /// or per type (order, show, digest, reflection).
