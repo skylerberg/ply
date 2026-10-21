@@ -21,16 +21,17 @@ import emit.answer (Layout)
 import emit.roots (builtin_helper, generated_builtin)
 import emit.release (released_vars)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RFlat, Leaf, Var, Arg, AVar,
-                 AInt, Make, MList, Native, Op, OContainer, Let, Containers)
+                 AInt, Make, MList, Native, Op, OContainer, Let, Prim, Containers)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, Joined, ArrayNew, ArraySet,
                             ArrayOfList, ArrayGet, ColumnField, ItemAt, Rest, LeafOf, Room,
                             Position, Element, Held, Words, Bits, Payloads, Records, IntBits,
                             WidthBits, FloatBits, DecimalBits)
-import emit.lower.setting (imported_target, qualified, from_import, module_import, builtin_at,
-                           ctor_named)
+import emit.lower.setting (imported_target, qualified, from_import, module_import, builtin_at)
 import emit.lower.held (held_as, laid_fields, field_type, leaves_of)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, noted, filed, unfiled,
-                        type_of, through_runtime, as_words)
+                        type_of, through_runtime, as_words, opened, continued)
+import emit.lower.base
+import emit.lower.data (constructed_as)
 import emit.lower.scalars (operated, runtime_builtin)
 import emit.lower.crossing (crossing_builtin, crossed)
 import emit.lower.strings
@@ -275,7 +276,7 @@ fn contained(
   } else if name == b"Bytes::concat_all" && args.len() == 1 { joined(cx, st, args, f, at) }
   else if is_callback(name) {
     refuse(st, Containers, b"a callback builtin outside its fused shape: ".concat(name))
-  } else if name == b"Bytes::position" && cx.setting.release { positioned(cx, st, args, at) } else {
+  } else if name == b"Bytes::position" { positioned(cx, st, args, at) } else {
     match laid_element(name, args, f) {
       Some(t) -> if has_vars(t) { called(cx, layout_needed(st, t), name, args, f, at) }
       else if name == b"Columns::get" { called(cx, st, name, args, f, at) }
@@ -697,38 +698,39 @@ fn element_rep(e: Element) -> Rep =
 fn is_option(t: Type) -> Bool =
   match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
 
-/// `Bytes::position(b, from, f)` under release, written as a loop in the body rather than the
-/// runtime's call: `f` may stop for a handler its effects reach, and a native's frame cannot resume.
-/// It answers the index as an `Option`'s object, made of the program's own constructors.
+/// `Bytes::position(b, from, f)`, a loop in the body rather than the runtime's call, since `f` may
+/// stop for a handler its effects reach and a native's frame cannot resume: the first index found,
+/// `-1` where none is, made the `Option` it answers, `Some` of it or `None`. Reads `b` and `f`.
 fn positioned(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered =
-  match ({ some: ctor_named(cx.setting, b"Some"), none: ctor_named(cx.setting, b"None") }) {
-    { some: Some(some), none: Some(none) } -> match args {
-      [b, from, f] -> {
-        let bw = handed({ st: st, arg: b }, RWord, at);
-        let fr = handed({ st: bw.st, arg: from }, RInt, at);
-        let fw = handed({ st: fr.st, arg: f }, RWord, at);
-        let ty = option_type(int_type());
-        let answered = bound_as(
-          fw.st,
-          ty,
-          RWord,
-          Op({
-            op: OContainer(Position({ some: some, none: none })),
-            args: [bw.arg, fr.arg, fw.arg],
-            uses: { takes: [true, false, true], owned: true, fails: true, stops: true },
-          }),
-          at,
-        );
-        handed(answered, held_as(cx.setting, ty), at)
-      },
-      _ -> refuse(st, Containers, b"a byte string's position on other operands than three"),
+  match args {
+    [b, from, f] -> {
+      let bw = handed({ st: st, arg: b }, RWord, at);
+      let fr = handed({ st: bw.st, arg: from }, RInt, at);
+      let fw = handed({ st: fr.st, arg: f }, RWord, at);
+      let ty = option_type(int_type());
+      let index = bound_as(
+        fw.st,
+        int_type(),
+        RInt,
+        Op({
+          op: OContainer(Position),
+          args: [bw.arg, fr.arg, fw.arg],
+          uses: { takes: [false, false, false], owned: true, fails: true, stops: true },
+        }),
+        at,
+      );
+      let found = bound_as(
+        index.st,
+        bool_type(),
+        RBool,
+        Prim({ op: b"ge", on: RInt, args: [index.arg, AInt(0)] }),
+        at,
+      );
+      let some = constructed_as(cx, opened(found.st), b"Some", [index.arg], ty, at);
+      let none = constructed_as(cx, opened(continued(found.st, some.st)), b"None", [], ty, at);
+      base::joined(cx, found, some, none, false, at)
     },
-    _ ->
-      refuse(
-        st,
-        Containers,
-        b"a byte string's position with no `Option` constructors to answer in",
-      ),
+    _ -> refuse(st, Containers, b"a byte string's position on other operands than three"),
   }
 
 /// A builtin that calls a function it is handed in a shape only a fused loop writes.

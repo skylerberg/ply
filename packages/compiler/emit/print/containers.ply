@@ -12,9 +12,10 @@ import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, Tail
 import emit.roots (builtin_helper)
 import emit.keys (Root, Copy, root_name)
 import emit.release (root_of)
-import emit.pieces (Piece, Text, Hole, Symbol, ShapeOf, TagOf, spelled)
+import emit.pieces (Piece, Text, Hole, Symbol, ShapeOf, spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RFlat, Leaf, Var, Arg, AVar,
-                 AInt, AZero, Made, MList, Uses, Containers, Convention, counted, var_said, made_said)
+                 AInt, AZero, Made, MList, Uses, Containers, Convention, counted, var_said,
+                 made_said)
 import emit.lower.held (fields_of)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, Joined, ArrayNew, ArraySet,
                             ArrayOfList, ArrayGet, ColumnField, ItemAt, Rest, LeafOf, Room,
@@ -136,7 +137,7 @@ pub fn container_op(
           v.ty,
         )
       },
-      Position(c) -> position_printed(p, pr, v, c, args),
+      Position -> position_printed(p, pr, v, args),
       Taken -> match args.at(0) {
         Some(n) -> taken_printed(p, pr, v, n),
         None ->
@@ -1173,17 +1174,11 @@ fn array_get(
   })
 }
 
-/// `Bytes::position(b, from, f)` into `v` under release, as a loop in the body: the first index from
-/// `from` whose byte `f` holds of, as an `Option`'s object. Bytes of another kind or a start past
-/// their end are the runtime's call to refuse; `f` is called by its type, lent to each call. Takes
-/// `b` and `f`, which a failure inside the loop lets go of.
-fn position_printed(
-  p: Place,
-  pr: Printing,
-  v: Var,
-  ctors: { some: Bytes, none: Bytes },
-  args: List<Arg>,
-) -> Printing / {abort.raise} = {
+/// `Bytes::position(b, from, f)` into `v` as a loop in the body: the first index from `from` whose
+/// byte `f` holds of, `-1` where it holds of none. Bytes of another kind or a start past their end
+/// are the runtime's call to refuse, handed `b` once more and no function; `f` is called by its type,
+/// lent to each call. Reads `b` and `f`.
+fn position_printed(p: Place, pr: Printing, v: Var, args: List<Arg>) -> Printing / {abort.raise} = {
   let b = operand(pr, args, 0);
   let from = operand(pr, args, 1);
   let f = operand(pr, args, 2);
@@ -1200,32 +1195,31 @@ fn position_printed(
       from,
       b" > (uint64_t)ply_obj(",
       b,
-      b")->len) { ",
+      b")->len) { ply_inc(",
+      b,
+      b"); ",
       builtin_helper(b"Bytes::position"),
       b"_p(ctx, ",
       b,
       b", ",
       as_word(from, RInt),
-      b", ",
-      f,
-      b"); ",
+      b", 0); ",
       p.leave,
       b" }",
     ]),
   );
-  let n = named(guarded, v);
-  let none = pieces(n.pr, [
-    Text(Bytes::concat_all([pad(d), b"Word ", n.name, b" = rt_nullary_p(ctx, "])),
-    Hole(TagOf(ctors.none)),
-    Text(b");\n"),
-  ]);
-  let i = temp(none);
-  let counted = line(i.pr, d, Bytes::concat_all([b"int64_t ", i.name, b" = ", from, b";"]));
+  let found = assigned(guarded, d, v, c_type(v.rep), b"-1");
+  let n = name_of(found, v);
+  let i = temp(found);
   let opened = line(
-    counted,
+    i.pr,
     d,
     Bytes::concat_all([
-      b"for (; ",
+      b"for (int64_t ",
+      i.name,
+      b" = ",
+      from,
+      b"; ",
       i.name,
       b" < (int64_t)ply_obj(",
       b,
@@ -1236,19 +1230,7 @@ fn position_printed(
   );
   let conv = predicate_convention(pr, args);
   let called = temp(opened);
-  let inside = {
-    ..p,
-    depth: d + 1,
-    leave: Bytes::concat_all([
-      b"{ ply_dec(ctx, ",
-      f,
-      b"); ply_dec(ctx, ",
-      b,
-      b"); ",
-      p.leave,
-      b" }",
-    ]),
-  };
+  let inside = { ..p, depth: d + 1 };
   let asked = line(
     site(inside, called.pr),
     d + 1,
@@ -1267,29 +1249,12 @@ fn position_printed(
       b"]);",
     ]),
   );
-  let hit = pieces(
-    line(check(inside, asked), d + 1, Bytes::concat_all([b"if (", called.name, b") {"])),
-    [
-      Text(
-        Bytes::concat_all([
-          pad(d + 2),
-          b"Word w[] = { ply_imm(",
-          i.name,
-          b") }; ",
-          n.name,
-          b" = rt_ctor_p(ctx, ",
-        ]),
-      ),
-      Hole(TagOf(ctors.some)),
-      Text(b", (Word)(intptr_t)w, 1);\n"),
-    ],
+  let hit = line(
+    check(inside, asked),
+    d + 1,
+    Bytes::concat_all([b"if (", called.name, b") { ", n, b" = ", i.name, b"; break; }"]),
   );
-  let stopped = line(line(check({ ..inside, depth: d + 2 }, hit), d + 2, b"break;"), d + 1, b"}");
-  line(
-    line(line(stopped, d, b"}"), d, Bytes::concat_all([b"ply_dec(ctx, ", f, b");"])),
-    d,
-    Bytes::concat_all([b"ply_dec(ctx, ", b, b");"]),
-  )
+  line(hit, d, b"}")
 }
 
 /// The convention `Bytes::position`'s predicate, its third operand, is called at by its type: an

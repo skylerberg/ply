@@ -23,7 +23,7 @@ import emit.tir (Rep, RInt, RBool, RFloat, RWord, RMaybe, RFlat, Var, Arg, AVar,
                  Made, MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst, Let, Fn,
                  Lambda, Closure, Spine, Data, Containers, rep_of_arg)
 import emit.tir.containers (Laid, Length, Elements, Joined, ArrayNew, ArraySet, ArrayOfList,
-                            ArrayGet, ColumnField, ItemAt, Rest, Bits, IntBits, FloatBits,
+                            ArrayGet, ColumnField, ItemAt, Rest, Position, Bits, IntBits, FloatBits,
                             DecimalBits, Words, Payloads, Records)
 import emit.lower (lowered_fn)
 import emit.own (owned)
@@ -457,26 +457,31 @@ test "a field of a Columns' record is read from its column, with no record made"
   assert_eq(read(b"var_at"), [])
 }
 
-test "under release a byte string's position is a loop in the body, its predicate called by its type and lent" {
+test "a byte string's position is a loop in the body, its predicate called by its type and lent, its Option made by the body" {
   let p = program(b"fn found(b: Bytes) -> Option<Int> = b.position(0, |c: Int| c == 32)\n");
-  let released = { ..p, setting: { ..p.setting, release: true } };
-  assert_eq(
-    ops_in(bound_in(released, b"found")).map(
-      |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.uses,
-    ),
-    [{ takes: [true, false, true], owned: true, fails: true, stops: true }],
-  );
-  let text = form_text(released, b"found");
-  assert(
-    text.index_of(
-        b"((int64_t (*)(PlyCtx *, Word, int64_t))((const PlyFnDesc *)(intptr_t)ply_words(",
-      )
-      != None
-      && text.index_of(b"break;") != None,
-    Some(String::of_bytes_lossy(text)),
-  );
+  // Under either profile: the loop reads the bytes and the predicate, answering an index.
+  [p, { ..p, setting: { ..p.setting, release: true } }].fold((), |_: Unit, q: Program| {
+    assert_eq(
+      ops_in(bound_in(q, b"found")).map(
+        |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }|
+          { op: o.op, uses: o.uses, answer: o.answer },
+      ),
+      [
+        {
+          op: OContainer(Position),
+          uses: { takes: [false, false, false], owned: true, fails: true, stops: true },
+          answer: RInt,
+        },
+      ],
+    );
+    assert_eq(natives_in(bound_in(q, b"found")), [])
+  });
+  let text = form_text(p, b"found");
+  let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
+  has(b"((int64_t (*)(PlyCtx *, Word, int64_t))((const PlyFnDesc *)(intptr_t)ply_words(");
+  has(b"break; }");
   // The predicate is lent to each call, so no count of it is taken in the loop.
-  let looped = match text.index_of(b"for (; ") {
+  let looped = match text.index_of(b"for (int64_t ") {
     Some(i) -> text.slice(i, text.len()),
     None -> b"",
   };
@@ -484,13 +489,9 @@ test "under release a byte string's position is a loop in the body, its predicat
     looped.len() > 0 && looped.index_of(b"ply_inc(") == None,
     Some(String::of_bytes_lossy(text)),
   );
-  // Without release it is the runtime's call.
-  assert_eq(
-    natives_in(bound_in(p, b"found")).map(
-      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
-    ),
-    [b"builtin_bytes_position_p"],
-  )
+  // The `Option` is the body's own, made where the index is found or not: never the runtime's.
+  [b"rt_nullary_p", b"rt_ctor_p", b"rt_call_p"].fold((), |_: Unit, t: Bytes|
+    assert_eq(text.index_of(t), None))
 }
 
 test "a handler's variables, a hold's region and `bracket` are the runtime's, each answering its type" {
