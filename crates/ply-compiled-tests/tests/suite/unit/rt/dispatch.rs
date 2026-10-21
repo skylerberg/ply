@@ -437,49 +437,96 @@ fn the_return_clause_of_an_emitted_handle_is_called_through_its_descriptor_as_it
     ctx.end();
 }
 
-/// What a stretch of an entry cost, read as `metered` reads it: calls, allocations, bytes, live
-/// objects, and each atom performed with its count, in the atoms' order.
+/// The natives a stretch of an entry's cost is read with, as `metered` reads it.
+struct Costs {
+    mark: unsafe extern "C" fn(*mut Ctx) -> Word,
+    spent: unsafe extern "C" fn(*mut Ctx, Word, Word),
+    count: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
+    field: unsafe extern "C" fn(*mut Ctx, Word, Word),
+    int: unsafe extern "C" fn(*mut Ctx) -> Word,
+    text: unsafe extern "C" fn(*mut Ctx) -> Word,
+    taken: unsafe extern "C" fn(*mut Ctx, *mut u8, Word),
+    close: unsafe extern "C" fn(*mut Ctx),
+}
+
+fn costs() -> Costs {
+    let native = |name: &str| builtin_helper_name(name);
+    Costs {
+        mark: helper(&native("?cost_mark")),
+        spent: helper(&native("?cost_spent")),
+        count: helper(&native("?in_count")),
+        field: helper(&native("?in_field")),
+        int: helper(&native("?in_int")),
+        text: helper(&native("?in_str")),
+        taken: helper(&native("?taken")),
+        close: helper(&native("?lift_close")),
+    }
+}
+
+/// What a stretch of an entry cost, read back as `metered` reads it: a record of the calls it made,
+/// its allocations and their bytes, the objects live since, and each atom performed with how many
+/// times, in the atoms' order.
 #[test]
 fn what_an_entry_spent_since_a_mark_is_read_back_from_it() {
     let mut ctx = context();
     ctx.begin(1_000);
-    let mark: unsafe extern "C" fn(*mut Ctx, *mut Word) =
-        helper(&builtin_helper_name("?cost_mark"));
-    let spent: unsafe extern "C" fn(*mut Ctx, *mut Word) =
-        helper(&builtin_helper_name("?cost_spent"));
-    let mut m = [0 as Word; 5];
-    unsafe { mark(&mut ctx, m.as_mut_ptr()) };
+    let n = costs();
+    let c: *mut Ctx = &mut ctx;
+    let m = unsafe { (n.mark)(c) };
     let kept = boxed(&mut ctx, 1);
     let gone = boxed(&mut ctx, 2);
     unsafe { box_dec(&mut ctx, gone) };
     let atom = |op: &str| EffectAtom::operation("m", Resource::Singleton, Mode::Read, op);
     ctx.performed.extend([atom("b"), atom("a"), atom("b")]);
-    unsafe { spent(&mut ctx, m.as_mut_ptr()) };
-    assert_eq!(m[..4], [0, 2, 2 * BOX, 1]);
-    let since: unsafe extern "C" fn(*mut Ctx, Word) =
-        helper(&builtin_helper_name("?performs_since"));
-    let count: unsafe extern "C" fn(*mut Ctx, Word) -> Word =
-        helper(&builtin_helper_name("?in_count"));
-    let int: unsafe extern "C" fn(*mut Ctx) -> Word = helper(&builtin_helper_name("?in_int"));
-    let text: unsafe extern "C" fn(*mut Ctx) -> Word = helper(&builtin_helper_name("?in_str"));
-    let taken: unsafe extern "C" fn(*mut Ctx, *mut u8, Word) =
-        helper(&builtin_helper_name("?taken"));
-    let close: unsafe extern "C" fn(*mut Ctx) = helper(&builtin_helper_name("?lift_close"));
+    let field = |name: &str| unsafe { (n.field)(c, name.as_ptr() as Word, name.len() as Word) };
+    let int = |name: &str| {
+        field(name);
+        unsafe { (n.int)(c) }
+    };
     let mut read = Vec::new();
     unsafe {
-        since(&mut ctx, m[4]);
-        assert_eq!(count(&mut ctx, ply_core::codec::tag::LIST as Word), 4);
+        // The function the stretch ran is lent and only read past.
+        (n.spent)(c, m, kept);
+        assert_eq!((n.count)(c, ply_core::codec::tag::RECORD as Word), 5);
+        assert_eq!(
+            [int("allocations"), int("bytes"), int("live")],
+            [2, 2 * BOX, 1]
+        );
+        field("performs");
+        assert_eq!((n.count)(c, ply_core::codec::tag::LIST as Word), 2);
         for _ in 0..2 {
-            let n = text(&mut ctx);
-            let mut b = vec![0u8; n as usize];
-            taken(&mut ctx, b.as_mut_ptr(), n);
-            read.push((String::from_utf8(b).unwrap(), int(&mut ctx)));
+            assert_eq!((n.count)(c, ply_core::codec::tag::RECORD as Word), 2);
+            field("atom");
+            let len = (n.text)(c);
+            let mut b = vec![0u8; len as usize];
+            (n.taken)(c, b.as_mut_ptr(), len);
+            read.push((String::from_utf8(b).unwrap(), int("count")));
         }
-        close(&mut ctx);
+        assert_eq!(int("steps"), 0);
+        (n.close)(c);
     }
     super::crossing::unfailed(&mut ctx);
     let named = |op: &str| atom(op).to_string();
     assert_eq!(read, [(named("a"), 1), (named("b"), 2)]);
     unsafe { box_dec(&mut ctx, kept) };
+    ctx.end();
+}
+
+/// A mark read back drops the marks taken after it, so a stretch a failure left unread is never
+/// read; a mark the entry never took fails it.
+#[test]
+fn a_mark_read_back_drops_those_taken_after_it_and_one_never_taken_fails() {
+    let mut ctx = context();
+    ctx.begin(1_000);
+    let n = costs();
+    let c: *mut Ctx = &mut ctx;
+    let (outer, inner) = unsafe { ((n.mark)(c), (n.mark)(c)) };
+    unsafe { (n.spent)(c, outer, 0) };
+    assert_eq!(ctx.failed, 0, "the outer mark was not read back");
+    unsafe { (n.spent)(c, inner, 0) };
+    assert_ne!(
+        ctx.failed, 0,
+        "a mark dropped with the one before it was read back"
+    );
     ctx.end();
 }

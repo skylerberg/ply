@@ -296,9 +296,8 @@ machine! {
     "?handler_typed" => rt_handler_typed(I64, Handed, *const PlyType);
     "?handler_get" => rt_handler_get(I64) -> Handed;
     "?handler_put" => rt_handler_put(I64, Handed);
-    "?cost_mark" => rt_cost_mark(Out);
-    "?cost_spent" => rt_cost_spent(Out);
-    "?performs_since" => rt_performs_since(I64);
+    "?cost_mark" => rt_cost_mark() -> I64;
+    "?cost_spent" => rt_cost_spent(I64, I64);
     "?in_carried" => rt_in_carried() -> Handed;
     "?refused" => rt_refused(I64, I64, I64, I64) -> Raises;
 }

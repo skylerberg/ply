@@ -20,8 +20,8 @@ import emit.keys (RootKey, Named, Written, Lower, Lift, Dup, Worded, Contained, 
 import emit.pieces (spelled)
 import emit.tir (Rep, RInt, RWord, RUnit, RAddr, Var, Arg, AVar, AInt, Prim, Pack, Make, MClosure,
                  Op, OHandle, OContainer, Uses, Inst, Let, Do, Assign, Return, Handle, Fn, Rooted,
-                 Given, Lent, Owned, Handling, RFlat, Leaf, Get, Path, PLeaf, PPayload, Closure,
-                 Decl, Native, Call, Val, Handed, Static, no_links, rep_of_arg)
+                 Given, Owned, Handling, RFlat, Leaf, Get, Path, PLeaf, PPayload, Closure, Decl,
+                 Native, Call, Val, Handed, Static, no_links, rep_of_arg)
 import emit.tir
 import emit.tir.containers (Taken, Length)
 import emit.tir.handling (HandleOp, HandleSite, Perform, Label, Parallel, Simulate, Encoded,
@@ -34,7 +34,7 @@ import emit.lower.base (Context, Lowering, started, emitted, opened)
 import emit.lower.calling (context_of)
 import emit.lower.handling (label, clause_frame, body_frame, handled, branched, simulated)
 import emit.lower.crossing (crossed, crossing_builtin, encoded_externs, type_described, worded,
-                            op_described)
+                            op_described, counts_type)
 import emit.tir.statics (StaticDef, SStruct, WAddress, WRaw, WField, entries_of)
 import emit.written (WrittenRoot, crossing_root, container_code, container_defs, entered_code,
                      contained_formed, contained_reads, sums_crossed, crosses, crossing_op)
@@ -1180,6 +1180,24 @@ test "every root of the handling corpus lowers, passes the check and prints" {
   }
 }
 
+// The shapes `ply`'s own handlers and regions take: a store's variables of a map, a list, a flag, an
+// option and a record wider than the registers updated field by field, and a `parallel` of lists,
+// one whose branches perform a labelled operation among them.
+test "a handler's variables of every kind a store keeps, and a parallel block of lists, lower, pass the check and print" {
+  let src = Bytes::concat_all([
+    b"effect keep {\n  read head(key: Bytes) -> Option<Bytes>\n  write put(key: Bytes, v: Bytes) -> Unit\n}\n",
+    b"effect prover {\n  read judged[c](lane: List<Int>) -> List<Int>\n}\n",
+    b"fn lanes(xs: List<Int>, ys: List<Int>) -> List<Int> / {prover.judged[claims]} = { let h = parallel { prover.judged[claims](xs), prover.judged[claims](ys) }; h._1.fold(h._0, |out: List<Int>, x: Int| out.push(x)) }\n",
+    b"type Pulling = { stamp: Bytes, looked: Map<Bytes, Int>, trusted: Bool, packed: Map<Bytes, Bytes>, n: Int }\n",
+    b"fn kept(keys: List<Bytes>) -> List<Option<Bytes>> = handle { keep.put(b\"a\", b\"1\"); keys.map(|k: Bytes| keep.head(k)) } with { var store: Map<Bytes, Bytes> = Map::new(), var running: Pulling = { stamp: b\"\", looked: Map::new(), trusted: false, packed: Map::new(), n: 0 }, var files: List<String> = [], var begun = false, var last: Option<Bytes> = None, keep.head(key) -> { running = { ..running, n: running.n + 1, looked: running.looked.insert(key, running.n) }; last = Some(key); begun = true; store.get(key) }, keep.put(key, v) -> { store = store.insert(key, v); files = files.push(\"put\"); }, return r -> if begun && files.len() > 0 && last != None { r } else { [] } }\n",
+    b"fn halves(xs: List<List<Int>>) -> List<List<Int>> = { let h = parallel { xs.map(|x: List<Int>| x.push(1)), xs.map(|x: List<Int>| x.push(2)) }; h._1.fold(h._0, |out: List<List<Int>>, x: List<Int>| out.push(x)) }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> assert_eq(not_built(p, [b"kept", b"halves", b"lanes"]), []),
+  }
+}
+
 /// How many times `s` stands in `t`.
 fn occurrences(t: Bytes, s: Bytes) -> Int / {abort.raise} = t.split(s).len() - 1
 
@@ -1395,7 +1413,7 @@ fn calls_in(
     match i { Let(l) -> called(l.val), Do(d) -> called(d.val), _ -> acc }
   })
 
-test "an encoding opens a lowering, lends the value to its type's root, and copies out the bytes it ends with" {
+test "an encoding opens a lowering, hands the value to its type's root as the root takes it, and copies out the bytes it ends with" {
   match program_of(crossings()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> match rooted(p, b"held") {
@@ -1411,7 +1429,7 @@ test "an encoding opens a lowering, lends the value to its type's root, and copi
           b"taken",
         ]);
         assert_eq(calls_in(l.st.insts), [
-          { callee: b"m.lower#String", args: [AVar(s)], handed: [Lent] },
+          { callee: b"m.lower#String", args: [AVar(s)], handed: [Given] },
         ]);
         assert_eq(match l.arg { AVar(v) -> v.ty, _ -> int_type() }, bytes_type());
         // Decoding opens a lifting over the bytes' address and count and asks the type's root.
@@ -1993,15 +2011,13 @@ test "a type's word-form entries open the word for its lowering and box what its
             Ok(f) -> a.push(f),
             Err(no) -> panic(String::of_bytes_lossy(no.why)),
           }));
-      assert_eq(
-        entries.fold([], |acc: List<Bytes>, f: Fn|
-          match unbuilt(p, f) {
-            Some(why) -> acc.push(Bytes::concat_all([root_name(f.key), b": ", why])),
-            None -> acc,
-          }),
-        [],
-      );
-      // Each calls its type's own root, the lowering lent the value, and answers a word.
+      let refused = entries.fold([], |acc: List<Bytes>, f: Fn|
+        match unbuilt(p, f) {
+          Some(why) -> acc.push(Bytes::concat_all([root_name(f.key), b": ", why])),
+          None -> acc,
+        });
+      assert(refused == [], Some(String::of_bytes_lossy(Bytes::join(refused, b"\n"))));
+      // Each calls its type's own root, handing the value as the root takes it, and answers a word.
       assert_eq(
         entries.map(|f: Fn|
           calls_in(f.body).map(|c: { callee: Bytes, args: List<Arg>, handed: List<Handed> }|
@@ -2024,6 +2040,53 @@ test "a type's word-form entries open the word for its lowering and box what its
             match i { Let(l) -> match l.val { Pack(x) -> acc.push(x.to), _ -> acc }, _ -> acc })),
         [[RInt], [RWord]],
       )
+    },
+  }
+}
+
+test "a metered call marks the run's cost, calls its function, and lifts what it spent beside the answer" {
+  let src = b"fn spent(xs: List<Int>) -> Int = { let m = metered(|| xs.len()); m.live + m.value + m.performs.len() }\n";
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match checked(p, b"spent") {
+      Err(why) -> assert_eq(why, b""),
+      Ok(f) -> {
+        let first = |at: (Inst) -> Bool / {abort.raise}|
+          range(0, f.body.len()).fold(0 - 1, |acc: Int, i: Int|
+            if acc < 0 && at(f.body.get(i)) { i } else { acc });
+        let native = |part: Bytes|
+          first(|i: Inst|
+            match i {
+              Let(l) -> crossed_parts([i]).any(|n: Bytes| n.index_of(part) != None),
+              Do(_) -> crossed_parts([i]).any(|n: Bytes| n.index_of(part) != None),
+              _ -> false,
+            });
+        let applied = first(|i: Inst|
+          match i { Let(l) -> match l.val { tir::Apply(_) -> true, _ -> false }, _ -> false });
+        let function = match f.body.get(applied) {
+          Let(l) -> match l.val { tir::Apply(a) -> a.f, _ -> AInt(0) },
+          _ -> AInt(0),
+        };
+        let released = first(|i: Inst| match i { tir::Dec(v) -> AVar(v) == function, _ -> false });
+        let order = [
+          native(b"cost_mark"),
+          applied,
+          native(b"cost_spent"),
+          native(b"lift#"),
+          native(b"lift_close"),
+        ];
+        // The mark, the call, the reading and the lifting, in that order.
+        assert(
+          order.all(|i: Int| i >= 0) && order.sort() == order,
+          Some(String::of_bytes_lossy(printed_text(p, f))),
+        );
+        // The function is held until the counts are read, so its release is not among them.
+        assert(released > native(b"cost_spent"), Some(String::of_bytes_lossy(printed_text(p, f))));
+        // Nothing goes through the runtime's callback.
+        assert(printed_text(p, f).index_of(b"metered") == None, None);
+        // The counts cross back by the lifting written for their type.
+        assert(written_whole(p.setting.ctors, keys::written(Lift, counts_type(), b"m")), None)
+      },
     },
   }
 }

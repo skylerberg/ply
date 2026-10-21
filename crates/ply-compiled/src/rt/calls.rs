@@ -87,52 +87,75 @@ pub(super) fn metered(ctx: &mut Ctx, f: Word) -> Word {
     )
 }
 
-/// What this entry has cost so far, written to `out` as five words: its calls, its allocations, the
-/// bytes they took, the objects live, and the atoms performed. [`rt_cost_spent`] reads it back.
-pub unsafe extern "C" fn rt_cost_mark(ctx: *mut Ctx, out: Out) {
-    let c = unsafe { &*ctx };
-    let cost = c.cost();
-    let mark = [
-        cost.steps,
-        cost.allocations,
-        cost.bytes,
-        c.heap.live() as i64,
-        c.performed.len() as i64,
-    ];
-    unsafe { std::ptr::copy_nonoverlapping(mark.as_ptr(), out.0, mark.len()) };
+/// What an entry had cost when [`rt_cost_mark`] marked it: its cost, the objects live, and how many
+/// atoms it had performed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CostMark {
+    cost: Cost,
+    live: i64,
+    performed: usize,
 }
 
-/// What this entry has spent since the mark at `mark`, written over its first four words: calls,
-/// allocations, bytes, and objects live since. Its fifth is left as the mark wrote it.
-pub unsafe extern "C" fn rt_cost_spent(ctx: *mut Ctx, mark: Out) {
-    let c = unsafe { &*ctx };
-    let cost = c.cost();
-    let now = [
-        cost.steps,
-        cost.allocations,
-        cost.bytes,
-        c.heap.live() as i64,
-    ];
-    for (i, n) in now.into_iter().enumerate() {
-        unsafe { *mark.0.add(i) = n - *mark.0.add(i) };
-    }
-}
-
-/// Begins a lifting of what this entry performed since its `from`th atom: a list holding, for each
-/// atom in its order, the atom's text and then how many times it was performed.
-pub unsafe extern "C" fn rt_performs_since(ctx: *mut Ctx, from: I64) {
+/// Marks what this entry has cost so far, the stops nothing can resume any longer dropped first as
+/// `metered` drops them, and answers the mark, which [`rt_cost_spent`] reads back.
+pub unsafe extern "C" fn rt_cost_mark(ctx: *mut Ctx) -> I64 {
+    crate::detached::drain(ctx);
     let c = unsafe { &mut *ctx };
-    let from = usize::try_from(from.0).unwrap_or(0).min(c.performed.len());
+    let mark = CostMark {
+        cost: c.cost(),
+        live: c.heap.live() as i64,
+        performed: c.performed.len(),
+    };
+    c.cost_marks.push(mark);
+    I64(c.cost_marks.len() as i64 - 1)
+}
+
+/// Begins a lifting of what this entry spent since `mark`, the marks taken after it let go: the
+/// record `{allocations, bytes, live, performs, steps}` of the calls it made, what it allocated and
+/// the bytes that took, the objects live since, and each atom it performed with how many times, in
+/// the atoms' order. `f` is the word of the function the span ran, lent and never read as an
+/// object, only handed so the caller lets the function go after the counts. A mark this entry never
+/// took fails it.
+pub unsafe extern "C" fn rt_cost_spent(ctx: *mut Ctx, mark: I64, _f: I64) {
+    crate::detached::drain(ctx);
+    let c = unsafe { &mut *ctx };
+    let Some(m) = usize::try_from(mark.0)
+        .ok()
+        .and_then(|at| c.cost_marks.get(at).copied().map(|m| (at, m)))
+    else {
+        c.fail(super::crossing::err_crossing(&format!(
+            "a cost read back from mark {}, which this entry never took",
+            mark.0
+        )));
+        return;
+    };
+    let (at, m) = m;
+    c.cost_marks.truncate(at);
+    let spent = c.cost().minus(m.cost);
+    let live = c.heap.live() as i64 - m.live;
     let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-    for atom in &c.performed[from..] {
+    for atom in &c.performed[m.performed.min(c.performed.len())..] {
         *counts.entry(atom.to_string()).or_insert(0) += 1;
     }
     let mut w = ply_core::codec::Writer::new();
-    w.count(ply_core::codec::tag::LIST, 2 * counts.len() as u64);
+    w.count(ply_core::codec::tag::RECORD, 5);
+    w.name(b"allocations");
+    w.int(spent.allocations);
+    w.name(b"bytes");
+    w.int(spent.bytes);
+    w.name(b"live");
+    w.int(live);
+    w.name(b"performs");
+    w.count(ply_core::codec::tag::LIST, counts.len() as u64);
     for (atom, count) in counts {
+        w.count(ply_core::codec::tag::RECORD, 2);
+        w.name(b"atom");
         w.str(atom.as_bytes());
+        w.name(b"count");
         w.int(count);
     }
+    w.name(b"steps");
+    w.int(spent.steps);
     c.lift_from(w.finish(), Vec::new());
 }
 
