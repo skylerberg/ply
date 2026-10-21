@@ -1,6 +1,7 @@
 //! `where derivable(..)`: a constraint nothing can satisfy is refused at the boundary, one that can
 //! be is assumed inside the body, an inferred map key is checked like a written one, the constraint
-//! is in the hash and its spelling is not, and a derivation cannot be hijacked by the deriving module.
+//! is in the hash and its spelling is not, a type's own `where` holds wherever the type is written
+//! or built, and a derivation cannot be hijacked by the deriving module.
 
 import harness (scratch, in_memory, on_disk, one, program, said, stdout, json_of, at, items, str,
                 int, nth, path, shown, Hermetic, Reached, Shipped)
@@ -224,6 +225,153 @@ test "a derived JSON codec cannot be supplied by the deriving module" {
       Some("the deriving module supplied the leaf codecs its own derivation used: " ++ printed),
     )
   })
+}
+
+// --- A type's `where` ---------------------------------------------------------------------------
+
+// A type states a constraint on a parameter: a signature that names the type at a parameter of its
+// own writes no `where`, its body assumes the constraint, and its callers meet it.
+test "a type's where is assumed by a signature that names the type" {
+  let game = "pub type Game<a> where derivable(eq, a) = { same: (a, a) -> Bool }\n";
+  assert(
+    codes_of(game ++ "pub fn same<a>(g: Game<a>, x: a, y: a) -> Bool = x == y") == [],
+    Some(
+      "a signature naming the type was held to write its constraint (codes: "
+        ++ String::join(
+          codes_of(game ++ "pub fn same<a>(g: Game<a>, x: a, y: a) -> Bool = x == y"),
+          ", ",
+        )
+        ++ ")",
+    ),
+  );
+  // The constraint is viral no further than the type: a caller at a type that cannot meet it is
+  // refused where it calls, though the game's own module never named that type.
+  let answer = json_of(
+    in_memory(
+      one(
+        game ++ "pub fn same<a>(g: Game<a>, x: a, y: a) -> Bool = x == y\n"
+          ++ "fn go() -> Bool = same({ same: |f: (Int) -> Int, g: (Int) -> Int| true }, |a: Int| a, |b: Int| b)",
+      ),
+      ["check", "--json"],
+    ),
+  );
+  let d = nth(at(answer, "diagnostics"), 0);
+  assert(str(at(d, "code")) == "E0206", Some(shown(answer)));
+  assert(
+    str(path(nth(at(d, "labels"), 0), ["message"])).contains("requires `derivable(eq, ·)`"),
+    Some(shown(answer)),
+  );
+  // A signature may still write what the type implies; it adds nothing and is no error.
+  assert(
+    codes_of(
+        game ++ "pub fn same<a>(g: Game<a>, x: a, y: a) -> Bool where derivable(eq, a) = x == y",
+      )
+      == [],
+    Some("a written constraint the type implies was refused"),
+  );
+  // The constraint is in the hash of what names the type, and its spelling is not: a use rechecks
+  // when it moves.
+  let uses = "pub fn make<a>(s: keep (a, a) -> Bool) -> Game<a> = { same: s }\n";
+  assert(
+    hashes(game ++ uses) != hashes("pub type Game<a> = { same: (a, a) -> Bool }\n" ++ uses),
+    Some("adding a type's `where` moved no hash"),
+  );
+  assert(
+    hashes(game ++ uses)
+      == hashes(
+        "pub type Game<b> where derivable(eq, b) = { same: (b, b) -> Bool }\n"
+          ++ "pub fn make<b>(s: keep (b, b) -> Bool) -> Game<b> = { same: s }\n",
+      ),
+    Some("renaming the constrained type parameter moved a hash"),
+  )
+}
+
+// The monte carlo case: a game built at a choice type with no equality fails where it is built,
+// not where the search runs.
+test "a constrained alias is met wherever it is named" {
+  let sources = [
+    // Written in a signature at a concrete argument.
+    "pub type Game<a> where derivable(eq, a) = { same: (a, a) -> Bool }\n"
+      ++ "fn bad(g: Game<(Int) -> Int>) -> Int = 1",
+    // Carried into a caller through the return type alone.
+    "pub type Game<a> where derivable(eq, a) = { same: (a, a) -> Bool }\n"
+      ++ "pub fn perfect<a>(same: keep (a, a) -> Bool) -> Game<a> = { same: same }\n"
+      ++ "fn go() -> Game<(Int) -> Int> = perfect(|x: Int, y: Int| x == y)",
+  ];
+  sources.fold((), |u: Unit, source: String|
+    assert(
+      refuses_with(source, "E0206"),
+      Some("a constraint nothing can satisfy was accepted in:\n" ++ source),
+    ))
+}
+
+// A sum or a `new` record whose fields mention a constrained type at a parameter of its own
+// carries the constraint, as it carries a `Map` key's order: a signature naming it assumes the
+// constraint, and a build at a type that cannot meet it is refused.
+test "a declaration carries a field's stated constraint" {
+  let node = "pub type Game<a> where derivable(eq, a) = { same: (a, a) -> Bool }\n"
+    ++ "pub opaque type Node<a> = | Node(Game<a>, List<Node<a>>)\n";
+  assert(
+    codes_of(node ++ "pub fn find<a>(n: Node<a>, x: a, y: a) -> Bool = x == y") == [],
+    Some("a signature naming the carrying type was held to write the constraint"),
+  );
+  assert(
+    refuses_with(
+      node ++ "pub fn find<a>(n: Node<a>, x: a, y: a) -> Bool = x == y\n"
+        ++ "fn go() -> Bool = find(Node({ same: |f: (Int) -> Int, g: (Int) -> Int| true }, []), |a: Int| a, |b: Int| b)",
+      "E0206",
+    ),
+    Some("a node built at a function was accepted"),
+  );
+  // Through a `new` record the same way.
+  let boxed = "pub type Game<a> where derivable(eq, a) = { same: (a, a) -> Bool }\n"
+    ++ "pub type Boxed<a> = new { game: Game<a> }\n";
+  assert(
+    codes_of(boxed ++ "pub fn find<a>(b: Boxed<a>, x: a, y: a) -> Bool = x == y") == [],
+    Some("a signature naming the `new` record was held to write the constraint"),
+  );
+  // And a declaration that states the constraint itself reads its own fields with it assumed.
+  assert(
+    codes_of(
+        "pub opaque type Node<a> where derivable(eq, a) = | Node(List<Node<a>>, a)\n"
+          ++ "pub fn has<a>(n: Node<a>, x: a) -> Bool = match n { Node(_, here) -> here == x }",
+      )
+      == [],
+    Some("a recursive declaration's own constraint was not assumed"),
+  )
+}
+
+// A `key` function is called with the value alone, so it may need no more than the type carries:
+// what the type's `where` states is met wherever two are compared.
+test "a key function may need what the type states" {
+  let node = "pub opaque type Node<a> where derivable(eq, a) = | Node(a, List<Node<a>>)\n"
+    ++ "pub fn head<a>(n: Node<a>) -> a = match n { Node(x, _) -> x }\n";
+  assert(
+    codes_of(node ++ "key for Node by head\n") == [],
+    Some("a key needing what the type states was refused"),
+  );
+  assert(
+    refuses_with(
+      "pub opaque type Node<a> where derivable(eq, a) = | Node(a, List<Node<a>>)\n"
+        ++ "pub fn head<a>(n: Node<a>) -> a where derivable(ord, a) = match n { Node(x, _) -> x }\n"
+        ++ "key for Node by head\n",
+      "E0218",
+    ),
+    Some("a key needing an order the type does not state was accepted"),
+  )
+}
+
+// What a type's `where` writes is checked like a signature's: the parameter must be one of the
+// type's own, and no predicate can state of a type.
+test "a type's where names its own parameters and no predicate" {
+  assert(
+    refuses_with("type X<a> where derivable(eq, b) = a", "E0102"),
+    Some("a constraint on a name the type does not bind was accepted"),
+  );
+  assert(
+    refuses_with("type X<a> where numeric(a) = a", "E0102"),
+    Some("a predicate on a type was accepted"),
+  )
 }
 
 // It emits the `==` operator, a token rather than a name, so nothing in scope can stand in for it.

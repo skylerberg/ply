@@ -215,7 +215,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `derive`, `for`, `reuse`, `transparent`, `const` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn`, `transparent reuse fn` and `const fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
 | `key`, `show`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
-| `where`, `derivable` | after a signature's row, or after a law's binders |
+| `where`, `derivable` | after a signature's row, after a type's generic list, or after a law's binders |
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
 | `resume`, `return` | in a handler clause (§6.5, §6.6) |
@@ -1108,6 +1108,29 @@ parameter its signature's parameters or answer mention, and inside a recursive
 group only the definition itself holds the type, so a constrained parameter the
 signature never mentions, or a call from another member of the group, is
 `E0310` too. A spec clause assumes its definition's constraints.
+
+A `type` takes a `where` after its generic list too: a `derivable` constraint
+on one of its own type parameters (`E0102` otherwise; a predicate cannot state
+of a type — a witness is an argument a call passes, and a type is built with no
+call). Wherever the type is written or built, the argument in that parameter's
+place must admit the derivation, or the use is `E0206`:
+
+```ply
+pub type Game<s, a, c | e> where derivable(eq, a) = {
+  status: (s, c) -> Status,
+  choices: (s, c) -> List<a>,
+}
+
+pub fn find<a>(g: Game<Int, a, Int | {}>, x: a, y: a) -> Bool = x == y
+```
+
+`find` writes no `where`: a signature that names the type at a parameter of its
+own is held to the constraint, its body assumes it and its callers meet it, as
+one naming a `Map` is held to the key's order (§4.3). A `Game<S, (Int) -> Int,
+C>` cannot be built, so a game whose choices cannot be compared is refused
+where it is made, not where a search over it is called. A sum or a `new` record
+whose fields mention the type at a parameter of their own carries the
+constraint the same way, and an alias, transparent, is judged at each use.
 
 ### 4.6 Types the language declares
 
