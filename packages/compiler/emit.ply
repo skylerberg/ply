@@ -6,12 +6,13 @@ import emit.code (Code, lower_fn)
 import syntax.items (Module, Derived, Item, IFn, ITest, ILaw, IType, parse, with_prelude, Binder,
                      SpecClause, SRequires, SEnsures, SCost, SSpace, FnDef, test_run, test_listing,
                      IInstance, VariantDef, TDSum, INumeric, NumericOp, NKey, TestDef)
-import check.resolve.tables (ParsedModule, Source, Diag, qualify)
+import check.resolve.tables (ParsedModule, Source, Diag, Parameters, qualify)
 import check.resolve (ResolveSucceeded, ResolveFailed, resolve_packaged)
 import check.resolve.scopes (PackageDeps, no_packages, of_binder)
 import expand.derive (expand_derives)
 import check.infer.checker (MemberSite, WitnessOp, test_owner, law_root, law_owner, cases_root)
-import check.infer (expanded_mods)
+import check.infer (expanded_mods, expanded_mod)
+import front.seam (WalkedFacts)
 import check.types (Type, TyCon, TyVar, Scheme, int_type, bytes_type)
 import emit.lower.setting (Setting, declared_schemes, walked_read, defs_in, resolved_imports,
                            effects_in, params_carried, law_params, facts_by_item, filings_of,
@@ -41,7 +42,7 @@ import emit.written (container_code, equality_code, ordering_code, digest_code, 
 import emit.entry (Prepared, RootForm, Formed, Unformed, root_formed, formed_from, emitted_of)
 import emit.release (generated)
 import emit.special (specialisations_wanted, witnessed_needs, definition_at, specialised_formed,
-                     instance_group, instances_formed, tail_mates)
+                     instance_group, instances_formed, tail_mates, tail_reached_defs)
 
 /// What an arm that refuses a program before lowering anything can say: the checker's own words, one
 /// per diagnostic. There is no renderer for a diagnostic on this side -- the driver's `explain` has
@@ -216,7 +217,7 @@ pub fn lowered_program(
                 acc.insert(n, true));
               let reading = match roots {
                 None -> None,
-                Some(ks) -> Some(reading_of(x.mods, pure, schemes, ks)),
+                Some(ks) -> Some(reading_of(rows, w, x.mods, x.r.signatures, pure, schemes, ks)),
               };
               let lowered = lowered_modules(reading);
               match facts_read(rows, w, reading, x.mods) {
@@ -460,7 +461,10 @@ pub fn lowered_program(
 /// is sited at and each owner of a lambda it runs in place, and for a specialisation each other
 /// definition that runs in one tail loop with its own, which the specialisation's loop takes in.
 fn reading_of(
+  rows: Rows,
+  w: WalkedFacts,
   mods: List<ParsedModule>,
+  signatures: Map<Bytes, Parameters>,
   pure: Map<Bytes, Bool>,
   schemes: Map<Bytes, Scheme>,
   ks: List<RootKey>,
@@ -477,29 +481,78 @@ fn reading_of(
       },
       _ -> acc,
     });
-  mods.fold(sited, |acc: Map<Bytes, Bool>, m: ParsedModule|
-    match specialised.get(m.name) {
+  range(0, mods.len()).fold(sited, |acc: Map<Bytes, Bool>, i: Int|
+    match specialised.get(mods.get(i).name) {
       None -> acc,
-      Some(owners) -> {
-        let here = defs_in(m.name, m.module, pure, schemes);
+      Some(owners) ->
+        loop_mates(rows, w, mods, signatures, pure, schemes, i, owners).fold(
+          acc,
+          |r: Map<Bytes, Bool>, n: Bytes| r.insert(n, true),
+        ),
+    })
+}
+
+/// The definitions of module `i` of `mods` that run in one tail loop with one of `owners`. Each body
+/// is read written out with what the check filed of it, so a call written on a value is among its
+/// tail calls: the facts of each definition the owners' tail calls reach are read, until those calls
+/// reach no definition more.
+fn loop_mates(
+  rows: Rows,
+  w: WalkedFacts,
+  mods: List<ParsedModule>,
+  signatures: Map<Bytes, Parameters>,
+  pure: Map<Bytes, Bool>,
+  schemes: Map<Bytes, Scheme>,
+  i: Int,
+  owners: List<Bytes>,
+) -> List<Bytes> / {abort.raise} = {
+  let name = mods.get(i).name;
+  let walk = |read: Map<Bytes, Bool>|
+    match facts_read(rows, w, Some(read), mods) {
+      Err(_) -> None,
+      Ok(facts) -> {
+        let m = expanded_mod(mods, i, facts.elaboration, signatures);
+        let here = defs_in(name, m.module, pure, schemes);
+        let owned = facts_by_item(facts);
         let defs = m.module.items.fold(Map::new(), |d: Map<Bytes, FnDef>, item: Item|
-          match item { IFn(f) -> d.insert(qualify(m.name, f.name.name), f), _ -> d });
-        // Its facts are yet to be read, so a body is read for its calls alone.
+          match item { IFn(f) -> d.insert(qualify(name, f.name.name), f), _ -> d });
         let read_of = |full: Bytes|
           match defs.get(full) {
             None -> None,
-            Some(f) ->
-              Some({
-                def: f,
-                code: written_code_of(m.name, f, Ok(no_filings())),
-                filed: Ok(no_filings()),
-              }),
+            Some(f) -> {
+              let filed = filings_of(owned, full);
+              Some({ code: written_code_of(name, f, filed), filed: filed })
+            },
           };
-        owners.fold(acc, |r: Map<Bytes, Bool>, owner: Bytes|
-          tail_mates(m.name, here, read_of, owner).fold(r, |s: Map<Bytes, Bool>, n: Bytes|
-            s.insert(n, true)))
+        Some({
+          reached: owners.fold(Map::new(), |r: Map<Bytes, Bool>, o: Bytes|
+            tail_reached_defs(name, here, read_of, o).fold(
+              r,
+              |s: Map<Bytes, Bool>, n: Bytes, _: Bool| s.insert(n, true),
+            )),
+          mates: owners.fold([], |ms: List<Bytes>, o: Bytes|
+            ms.concat(tail_mates(name, here, read_of, o))),
+        })
       },
-    })
+    };
+  iterate(
+    { read: owners.fold(Map::new(), |r: Map<Bytes, Bool>, o: Bytes| r.insert(o, true)), mates: [] },
+    schemes.len() + 1,
+    |s: { read: Map<Bytes, Bool>, mates: List<Bytes> }|
+      match walk(s.read) {
+        None -> Stop(s),
+        Some(r) -> {
+          // A definition the check has no facts of, an extern's, has no body to reach further.
+          let more = r.reached.keys().filter(|n: Bytes| !s.read.contains(n) && schemes.contains(n));
+          if more.len() == 0 { Stop({ ..s, mates: r.mates }) } else {
+            Continue({
+              ..s,
+              read: more.fold(s.read, |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true)),
+            })
+          }
+        },
+      },
+  ).mates
 }
 
 /// Each constructor whose type's module states a `key`, which its values are compared by.
@@ -624,7 +677,6 @@ fn module_formed(
       Some(d) -> {
         let filed = match prepared.get(full) { Some(p) -> p.filed, None -> filed_of(full) };
         Some({
-          def: d,
           code: match prepared.get(full) {
             Some(p) -> match p.code { Ok(c) -> Ok(c), Err(_) -> written_code_of(module, d, filed) },
             None -> written_code_of(module, d, filed),
@@ -640,7 +692,7 @@ fn module_formed(
       Err(why) -> Some(out.push(Unformed({ name: root_name(key), why: why }))),
       Ok(keys) -> if keys.len() < 2 { None }
       else if out.any(|r: RootForm| form_name(r) == root_name(keys.get(0))) { Some(out) }
-      else { Some(out.concat(instances_formed(s, schemes, ops, read_of, keys))) },
+      else { Some(out.concat(instances_formed(s, schemes, ops, defs, read_of, keys))) },
     };
   let walked = x_module.items.fold({ out: [], fns: 0 }, |acc: Walk, item: Item|
     match item {
