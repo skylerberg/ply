@@ -49,6 +49,7 @@ import syntax.parsing
 import syntax.parsing (no_module)
 import syntax.items (homes_called, homes_declaring)
 import syntax.exprs (prelude_module)
+import emit.print.counting (int_released_fn, box_released_fn)
 
 // --- What crosses the seam ----------------------------------------------------
 
@@ -3517,9 +3518,18 @@ test "a unit holds a `const` definition as the value a build kept, and makes its
     };
   let held = unit([b"m.table", b"m.first"], [{ name: b"m.table", text: b"78da" }]);
   // The value stands where the body would: nothing asks the emitter for it, or for what it calls.
-  // `first` is entered; `table` is not, since the program holds nothing written for a list.
-  assert_eq(held.asked, 3);
-  assert_eq(held.produced.taken, [b"m.first", b"m.first#entered", b"m.lower#Int", b"m.table"]);
+  // `first` is entered; `table` is not, since the program holds nothing written for a list. `first`
+  // lets go of the list it matched through the list's and its nodes' drop roots, and of an item's
+  // box by its size, through no root.
+  assert_eq(held.asked, 5);
+  assert_eq(held.produced.taken, [
+    b"m.first",
+    b"m.first#entered",
+    b"m.lower#Int",
+    b"m.table",
+    b"std.prelude.drop#List<Int>",
+    b"std.prelude.drop#std.prelude.ListNode<Int>",
+  ]);
   assert(
     held.produced.text.index_of(
         Bytes::concat_all([
@@ -3537,13 +3547,14 @@ test "a unit holds a `const` definition as the value a build kept, and makes its
   assert_eq(apart.produced.text.index_of(b"_baked"), None);
   // The stored root reads the definition as any body reads a constant, and needs it held.
   let storing = unit([b"m.table", b"m.spread", stored_root(b"m.table")], []);
-  assert_eq(storing.asked, 4);
+  assert_eq(storing.asked, 5);
   assert_eq(storing.produced.taken, [
     b"m.lower#Bytes",
     b"m.spread",
     b"m.table",
     b"m.table#stored",
     b"m.table#stored#entered",
+    b"std.prelude.drop#Bytes",
   ]);
   assert(storing.produced.text.index_of(b"rt_stored_p(ctx, held)") != None, None);
   let alone = unit([stored_root(b"m.table")], []);
@@ -3551,6 +3562,54 @@ test "a unit holds a `const` definition as the value a build kept, and makes its
     b"m.table#stored",
     b"m.table#stored#entered",
   ])
+}
+
+test "no root is asked to give back a scalar's box, which its last count gives back by its size" {
+  let source = Bytes::concat_all([
+    b"effect e {\n  write op(k: Int) -> Float\n}\n",
+    b"fn ints(n: Int) -> Int = match [n, n + 1] { [x, ..] -> x, [] -> 0 }\n",
+    b"fn floats(x: Float) -> Float = match [x, x] { [y, ..] -> y, [] -> 0.0 }\n",
+    b"fn decimals(d: Decimal) -> Int = [d, d].len()\n",
+    b"fn wides(w: U128) -> Int = [w].len()\n",
+    b"fn held(w: U128) -> Int = [{ a: w, b: \"x\" }].len()\n",
+    b"fn performed(n: Int) -> Float / {e.op} = e.op(n)\n",
+  ]);
+  let dump = dump_of(analyse(parse_all([{ name: b"m", src: source }])));
+  let every = [b"m.ints", b"m.floats", b"m.decimals", b"m.wides", b"m.held", b"m.performed"];
+  let produced = match emitted(
+      a_runtime(b"r"),
+      dump,
+      [source],
+      Map::new(),
+      every,
+      b"",
+      |_: Bytes| None,
+      |_: Bytes, _: Bytes| (),
+      [],
+    ) {
+    Ok(e) -> e.produced,
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+  };
+  let drop_at = |ty: Bytes| b"std.prelude.drop#".concat(ty);
+  // Each list is let go of through its drop root, which lets go of its items as their types lay them.
+  assert_eq(
+    [b"List<Int>", b"List<Float>", b"List<Decimal>", b"List<U128>"].filter(|t: Bytes|
+      !produced.taken.contains(drop_at(t))),
+    [],
+  );
+  // A perform's descriptors of `Int` and `Float` count and let go of their word forms through the
+  // head's functions: no root of any scalar's type is asked, to drop, count or let go of it.
+  assert(
+    produced.text.index_of(int_released_fn()) != None
+      && produced.text.index_of(box_released_fn(1)) != None,
+    None,
+  );
+  assert_eq(
+    produced.taken.filter(|n: Bytes|
+      [b"Int", b"Float", b"Decimal", b"U128"].any(|t: Bytes|
+        [b"drop#", b"dup#", b"release#"].any(|op: Bytes| n.ends_with(op.concat(t))))),
+    [],
+  )
 }
 
 fn native_of(e: Extern) -> Native =

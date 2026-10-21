@@ -30,6 +30,8 @@ import emit.print.counts (Said, released, duped, let_go_of, dup_of)
 import emit.print.lists (item_read, leaf_read, rest_made, list_made)
 import emit.print.strings (taken_printed)
 import emit.print.invoked (typed_callee, convention_of)
+import emit.print.counting (dup_fn, rel_fn, free_fn, inc_fn, dec_fn, call_text, call_start, calls,
+                            counts_any)
 
 /// A list made of `m.args`, words it takes.
 pub fn contained(
@@ -270,11 +272,13 @@ fn laid_printed(
         slot_of(g.name, ascii_of_int(laid.list.tail)),
         b", &",
         slot_of(a, ascii_of_int(laid.list.tail)),
-        b", (size_t)n * sizeof(Word)); ply_free(ctx, ",
-        a,
-        b", ",
-        ascii_of_int(header_bytes() + 8 * laid.list.tail),
-        b" + 8 * n); ",
+        b", (size_t)n * sizeof(Word)); ",
+        call_text(free_fn(), [
+          b"ctx",
+          a,
+          ascii_of_int(header_bytes() + 8 * laid.list.tail).concat(b" + 8 * n"),
+        ]),
+        b"; ",
         a,
         b" = ",
         g.name,
@@ -678,7 +682,9 @@ fn fields_set(p: Place, pr: Printing, v: Var, fields: List<Answered>) -> Printin
           // A sum's word form is the sum itself, whatever it counts.
           let value = if !x.item { x.word }
           else if counted(r) || (match r { RSum(_) -> true, _ -> false }) { word_as(x.word, r) }
-          else { Bytes::concat_all([word_as(x.word, r), b"; ply_dec(ctx, ", x.word, b")"]) };
+          else {
+            Bytes::concat_all([word_as(x.word, r), b"; ", call_text(dec_fn(), [b"ctx", x.word])])
+          };
           line(q, p.depth, Bytes::concat_all([c_type(r), b" ", nth(mine, 0), b" = ", value, b";"]))
         }
       },
@@ -1063,9 +1069,9 @@ fn position_printed(p: Place, pr: Printing, v: Var, args: List<Arg>) -> Printing
       from,
       b" > (uint64_t)ply_obj(",
       b,
-      b")->len) { ply_inc(",
-      b,
-      b"); ",
+      b")->len) { ",
+      call_text(inc_fn(), [b]),
+      b"; ",
       builtin_helper(b"Bytes::position"),
       b"_p(ctx, ",
       b,
@@ -1529,17 +1535,17 @@ fn most(e: Element) -> Int / {abort.raise} = min(67108864, 4294967295 / e.stride
 fn most_of(es: List<Element>) -> Int / {abort.raise} =
   es.fold(67108864, |m: Int, e: Element| min(m, most(e)))
 
-/// The C raising as builtin `what` (as `?array_bad` numbers them) does over `n` and `len`.
+/// The C raising as builtin `what` (as `?refused` numbers them) does over `n` and `len`.
 fn refused(what: Int, n: Bytes, len: Bytes) -> Bytes / {abort.raise} =
   Bytes::concat_all([
-    builtin_helper(b"?array_bad"),
+    builtin_helper(b"?refused"),
     b"_p(ctx, ",
     ascii_of_int(what),
     b", ",
     n,
     b", ",
     len,
-    b");",
+    b", 0);",
   ])
 
 /// What `s` says printed as one line at `depth`; nothing where it says nothing.
@@ -1665,13 +1671,15 @@ test "a list's item is read where it lies and its rest shares its trie, neither 
   });
   // A read counts nothing; a rest counts the root it shares and each item it copies, as the item's
   // type counts it: an `Int`'s word only where it is the runtime's box.
-  [item, scalar].fold((), |_: Unit, text: Bytes| {
-    assert_eq(text.index_of(b"ply_dup("), None);
-    assert_eq(text.index_of(b"ply_inc("), None)
-  });
-  assert(rest.index_of(b"ply_dup(ply_words(t1)[0]);") != None, Some(String::of_bytes_lossy(rest)));
-  assert(rest.index_of(b"ply_dup(t6);") != None, Some(String::of_bytes_lossy(rest)));
-  assert(ints.index_of(b"if (!(t6 & 7)) ply_dup(t6);") != None, Some(String::of_bytes_lossy(ints)));
+  [item, scalar].fold((), |_: Unit, text: Bytes|
+    assert(!counts_any(text), Some(String::of_bytes_lossy(text))));
+  let dup = |w: Bytes| call_text(dup_fn(), [w]).concat(b";");
+  assert(rest.index_of(dup(b"ply_words(t1)[0]")) != None, Some(String::of_bytes_lossy(rest)));
+  assert(rest.index_of(dup(b"t6")) != None, Some(String::of_bytes_lossy(rest)));
+  assert(
+    ints.index_of(b"if (!(t6 & 7)) ".concat(dup(b"t6"))) != None,
+    Some(String::of_bytes_lossy(ints)),
+  );
   // A scalar is read out of the item's word.
   assert(scalar.index_of(b"int64_t t6 = ") != None, Some(String::of_bytes_lossy(scalar)))
 }
@@ -1693,7 +1701,7 @@ test "an array of `Int`s holds each as its bits a word apart, with no shape, and
   assert_eq(pr.shapes, []);
   has(b" = rt_alloc_p(ctx, 15, (p0) * 1, 0, PLY_FLAT);");
   has(b" * 1 + 0] = (Word)(INT64_C(7));");
-  has(b"builtin_elaborated_array_bad_p(ctx, 0, p0, 0);");
+  has(b"builtin_elaborated_refused_p(ctx, 0, p0, 0, 0);");
   assert_eq([text.index_of(b"builtin_array_"), text.index_of(b"->aux")], [None, None])
 }
 
@@ -1725,11 +1733,11 @@ test "an array of records holds each record's words in place, and a write lets g
   // A copy keeps the stride, and its strings are counted where it copies them.
   has(b")->aux = ply_obj(t1)->aux; memcpy(");
   has(b"rt_note_update_p(ctx, in_place, in_place ? 0 : ");
-  // The string of the record replaced goes to its drop root, never to `ply_dec`; the float is bits.
-  has(b"ply_rel(ctx, ply_words(t1)[(p1) * 2 + 0], ");
+  // The string of the record replaced goes to its drop root, never to the runtime's; the float is bits.
+  has(call_start(rel_fn(), [b"ctx", b"ply_words(t1)[(p1) * 2 + 0]"]));
   has(b"ply_words(t1)[(p1) * 2 + 1] = ply_f64_bits(");
-  has(b"builtin_elaborated_array_bad_p(ctx, 5, p1, ");
-  assert_eq(text.index_of(b"ply_dec(ctx, ply_words("), None)
+  has(b"builtin_elaborated_refused_p(ctx, 5, p1, ");
+  assert(!calls(text, dec_fn()), Some(String::of_bytes_lossy(text)))
 }
 
 test "a field of a Columns' record is read from its column in place, an index naming no record raising" {
@@ -1748,7 +1756,7 @@ test "a field of a Columns' record is read from its column in place, an index na
   let text = spelled(pr.out);
   let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
   has(
-    b"if ((uint64_t)p1 >= (uint64_t)ply_array_len(ply_words(p0)[2])) { builtin_elaborated_array_bad_p(ctx, 6, p1, ply_array_len(ply_words(p0)[2])); return 0; }",
+    b"if ((uint64_t)p1 >= (uint64_t)ply_array_len(ply_words(p0)[2])) { builtin_elaborated_refused_p(ctx, 6, p1, ply_array_len(ply_words(p0)[2]), 0); return 0; }",
   );
   has(b"(ply_words(ply_words(p0)[2]) + (p1) * 1)[0]");
   assert_eq(text.index_of(b"PLY_KIND_COLUMNS"), None)

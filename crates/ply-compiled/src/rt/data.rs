@@ -474,44 +474,114 @@ pub(super) fn cancel_here(c: &mut Ctx) {
     c.failed = FAILED_CANCELLED;
 }
 
-/// An array's or a columns value's operation emitted code writes, refused its length or index:
-/// raised as the runtime's own operation raises it, for `abort.raise` to answer. `what` names the
-/// operation: 0 `Array::new`, 1 `Columns::new`, 2 `Array::of_list` and 3 `Columns::of_list`, given a
-/// length `n` outside `0` to [`MAX_ARRAY_LEN`](ply_core::builtins::MAX_ARRAY_LEN); 4 `Array::get`,
-/// 5 `Array::set`, 6 `Columns::get` and 7 `Columns::set`, given an index `n` outside the `len`
-/// elements there are. Any other `what` fails the entry as Ply's fault.
+/// The builtins emitted code writes in place whose refusal of their operands it hands the runtime,
+/// each numbered by its place here: through [`rt_refused`] where the refusal names numbers, and
+/// through [`rt_refused_text`](crate::machine::rt_refused_text) where it names text.
+pub const REFUSED: [Builtin; 23] = [
+    Builtin::ArrayNew,
+    Builtin::ColumnsNew,
+    Builtin::ArrayOfList,
+    Builtin::ColumnsOfList,
+    Builtin::ArrayGet,
+    Builtin::ArraySet,
+    Builtin::ColumnsGet,
+    Builtin::ColumnsSet,
+    Builtin::BytesAt,
+    Builtin::BytesU32Le,
+    Builtin::BytesSlice,
+    Builtin::StringSlice,
+    Builtin::ByteOfInt,
+    Builtin::BytesIndexOfByte,
+    Builtin::BytesIndexOfFrom,
+    Builtin::BytesScan,
+    Builtin::BytesScanUntil,
+    Builtin::Range,
+    Builtin::BytesSplit,
+    Builtin::StringSplit,
+    Builtin::StringFind,
+    Builtin::StringOfBytes,
+    Builtin::Assert,
+];
+
+/// The builtin [`REFUSED`] numbers `what`.
+pub(crate) fn refused_builtin(what: I64) -> Option<Builtin> {
+    usize::try_from(what.0)
+        .ok()
+        .and_then(|at| REFUSED.get(at).copied())
+}
+
+/// Builtin `b`'s refusal `d`, left in the context as `b` leaves it over values: raised for
+/// `abort.raise` to answer where `b` raises, else failing the run.
+pub(crate) fn refuse(c: &mut Ctx, b: Builtin, d: Diagnostic) {
+    if signature(b).raises {
+        raise_error(c, d);
+    } else {
+        c.fail(d);
+    }
+}
+
+/// The entry failed as Ply's fault: emitted code handed a refusal `what` that names no builtin the
+/// native refuses.
+pub(crate) fn refused_unknown(c: &mut Ctx, what: I64) {
+    c.fail(
+        Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("a refused operation numbered {}, which none is", what.0),
+        )
+        .note("this is Ply's fault, not the program's"),
+    );
+}
+
+/// An operation emitted code writes in place, refused numbers among its operands: left in the
+/// context as [`refuse`] leaves the builtin's own refusal of them. `what` numbers the builtin as
+/// [`REFUSED`] does, and `a`, `b` and `c` are what its refusal names: `Array::new`, `Columns::new`,
+/// `Array::of_list` and `Columns::of_list` a length `a`; `Array::get`, `Array::set`,
+/// `Columns::get`, `Columns::set`, `Bytes::at` and `Bytes::u32_le` an index `a` into `b` elements or
+/// bytes; `Bytes::slice` and `String::slice` a range `a..b` of `c` bytes or characters;
+/// `byte_of_int` and `Bytes::index_of_byte` a byte `a`; `Bytes::index_of_from` a start `a` in `b`
+/// bytes, and `Bytes::scan` and `Bytes::scan_until` that and a budget `c`; `range` its ends `a` and
+/// `b`; `Bytes::split` and `String::split` nothing. Any other `what` fails the entry as Ply's fault.
 #[allow(improper_ctypes_definitions)]
-pub unsafe extern "C" fn rt_array_bad(ctx: *mut Ctx, what: I64, n: I64, len: I64) -> Raises {
-    let c = unsafe { &mut *ctx };
-    let site = c.site();
-    let lengths = [
-        "Array::new",
-        "Columns::new",
-        "Array::of_list",
-        "Columns::of_list",
-    ];
-    let indexes = ["Array::get", "Array::set", "Columns::get", "Columns::set"];
-    let refused = match usize::try_from(what.0) {
-        Ok(at) if at < lengths.len() => ply_core::builtins::array_length(site, lengths[at], n.0),
-        Ok(at) if at < lengths.len() + indexes.len() => ply_core::builtins::out_of_range(
-            site,
-            indexes[at - lengths.len()],
-            n.0,
-            usize::try_from(len.0).unwrap_or(0),
-            "elements",
-        ),
+pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c: I64) -> Raises {
+    use ply_core::builtins as said;
+    let cx = unsafe { &mut *ctx };
+    let site = cx.site();
+    let len = |n: I64| usize::try_from(n.0).unwrap_or(0);
+    let Some(builtin) = refused_builtin(what) else {
+        refused_unknown(cx, what);
+        return Raises(());
+    };
+    let name = builtin.name();
+    let refused = match builtin {
+        Builtin::ArrayNew | Builtin::ColumnsNew | Builtin::ArrayOfList | Builtin::ColumnsOfList => {
+            said::array_length(site, name, a.0)
+        }
+        Builtin::ArrayGet | Builtin::ArraySet | Builtin::ColumnsGet | Builtin::ColumnsSet => {
+            said::out_of_range(site, name, a.0, len(b), "elements")
+        }
+        Builtin::BytesAt => said::out_of_range(site, name, a.0, len(b), "bytes"),
+        // Told at the last index it would read, as the builtin tells it.
+        Builtin::BytesU32Le => said::out_of_range(site, name, a.0.wrapping_add(3), len(b), "bytes"),
+        Builtin::BytesSlice => said::range_outside(site, name, a.0, b.0, len(c), "bytes"),
+        Builtin::StringSlice => said::range_outside(site, name, a.0, b.0, len(c), "characters"),
+        Builtin::ByteOfInt => said::byte_of_int_refused(site, a.0),
+        Builtin::BytesIndexOfByte => said::not_a_byte(site, name, a.0),
+        Builtin::BytesIndexOfFrom => said::start_outside(a.0, len(b), site, name),
+        Builtin::BytesScan | Builtin::BytesScanUntil => {
+            if usize::try_from(a.0).is_ok_and(|from| from <= len(b)) {
+                said::negative_budget(site, name, c.0)
+            } else {
+                said::start_outside(a.0, len(b), site, name)
+            }
+        }
+        Builtin::Range => said::range_too_long(site, a.0, b.0),
+        Builtin::BytesSplit | Builtin::StringSplit => said::empty_separator(site, builtin),
         _ => {
-            c.fail(
-                Diagnostic::error(
-                    codes::INTERNAL_ERROR,
-                    format!("an array's operation numbered {}, which none is", what.0),
-                )
-                .note("this is Ply's fault, not the program's"),
-            );
+            refused_unknown(cx, what);
             return Raises(());
         }
     };
-    raise_error(c, refused);
+    refuse(cx, builtin, refused);
     Raises(())
 }
 

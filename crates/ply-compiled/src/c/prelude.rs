@@ -300,7 +300,7 @@ machine! {
     "?cost_spent" => rt_cost_spent(Out);
     "?performs_since" => rt_performs_since(I64);
     "?in_carried" => rt_in_carried() -> Handed;
-    "?array_bad" => rt_array_bad(I64, I64, I64) -> Raises;
+    "?refused" => rt_refused(I64, I64, I64, I64) -> Raises;
 }
 
 /// The natives the compiler declares itself over machine data: the crossings' and the rest of
