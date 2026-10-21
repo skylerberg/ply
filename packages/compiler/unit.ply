@@ -2009,7 +2009,7 @@ fn kept_body(ctors: Ctors, p: Program, b: Baked) -> Answer / {abort.raise} = {
 /// side, which every kept answer is filed under. A root the emitter answers nothing for is refused.
 /// `Err` names the roots whose handings still moved when the rounds ran out.
 /// A root `baked` names is held as that value in place of its body, which the emitter is not asked
-/// for.
+/// for. Each round is told to `phases` as it ends.
 pub fn emitted<| e>(
   runtime: Runtime,
   dump: Dump,
@@ -2020,6 +2020,7 @@ pub fn emitted<| e>(
   read: (Bytes) -> Option<Bytes> / e,
   write: (Bytes, Bytes) -> Unit / e,
   baked: List<Baked> = [],
+  phases: Option<{ now: () -> Int / e, told: (RoundTally) -> Unit / e }> = None,
 ) -> Result<Emission, Bytes> / {abort.raise | e} = {
   let p = program_of(dump, sources);
   let ctors = dump.emitter_ctors.map(|c: EmitterCtor| { name: c.name, arity: c.arity });
@@ -2037,7 +2038,8 @@ pub fn emitted<| e>(
     emitter,
   ];
   let program = program_ctors(dump, ctors);
-  match answered_round(runtime, dump, p, ctors, common, offered, Map::new(), 64, read, write) {
+  match told_round(phases, 1, ||
+      answered_round(runtime, dump, p, ctors, common, offered, Map::new(), 64, read, write)) {
     Err(why) -> Err(why),
     Ok(first) -> match closed_rounds(
         runtime,
@@ -2048,6 +2050,7 @@ pub fn emitted<| e>(
         common,
         read,
         write,
+        phases,
         first,
         64,
       ) {
@@ -2118,6 +2121,48 @@ type Answered = {
   asked: Int,
   added: List<RootKey>,
 }
+
+/// What one round of the unit's answers came to: the roots it took, those an earlier run kept, those
+/// it asked the emitter for, those refused, and the clock as it began and ended.
+pub type RoundTally = {
+  round: Int,
+  roots: Int,
+  kept: Int,
+  asked: Int,
+  refused: Int,
+  began: Int,
+  ended: Int,
+}
+
+/// `run`, round `n` of a unit's answers, told to `phases` as it ends: what a build that tells its
+/// phases hands the unit, its clock and what it does as a round ends.
+fn told_round<| e>(
+  phases: Option<{ now: () -> Int / e, told: (RoundTally) -> Unit / e }>,
+  n: Int,
+  run: () -> Result<Answered, Bytes> / {abort.raise | e},
+) -> Result<Answered, Bytes> / {abort.raise | e} =
+  match phases {
+    None -> run(),
+    Some(t) -> {
+      let began = t.now();
+      let r = run();
+      match r {
+        Ok(a) ->
+          t.told({
+            round: n,
+            roots: a.keys.len(),
+            kept: a.kept,
+            asked: a.asked,
+            refused: a.answers.fold(0, |c: Int, _: Bytes, x: Answer|
+              match x { Refused(_) -> c + 1, Body(_) -> c }),
+            began: began,
+            ended: t.now(),
+          }),
+        Err(_) -> (),
+      };
+      r
+    },
+  }
 
 /// The definition the root named `n` specialises, where `keys` holds it as a specialisation.
 fn specialising(keys: Map<Bytes, RootKey>, n: Bytes) -> Option<Bytes> =
@@ -2206,7 +2251,7 @@ fn unanswered_why() -> Bytes = b"the emitter answered nothing for it"
 /// `had` with each root its bodies reach answered too, round after round until none lacks one: a
 /// specialisation a body names, the generic body of each definition a body calls generically,
 /// whose needs settle those calls, and once every such body is in, the root each call of a body
-/// the unit emits settles on. `room` is the rounds left.
+/// the unit emits settles on. `room` is the rounds left, of 64 after the first.
 fn closed_rounds<| e>(
   runtime: Runtime,
   dump: Dump,
@@ -2216,6 +2261,7 @@ fn closed_rounds<| e>(
   common: List<Bytes>,
   read: (Bytes) -> Option<Bytes> / e,
   write: (Bytes, Bytes) -> Unit / e,
+  phases: Option<{ now: () -> Int / e, told: (RoundTally) -> Unit / e }>,
   had: Answered,
   room: Int,
 ) -> Result<Answered, Bytes> / {abort.raise | e} = {
@@ -2265,18 +2311,8 @@ fn closed_rounds<| e>(
       ]),
     )
   } else if asking.len() == 0 || room <= 0 { Ok(had) } else {
-    match answered_round(
-        runtime,
-        dump,
-        p,
-        ctors,
-        common,
-        asking.values(),
-        held,
-        room,
-        read,
-        write,
-      ) {
+    match told_round(phases, 66 - room, ||
+        answered_round(runtime, dump, p, ctors, common, asking.values(), held, room, read, write)) {
       Err(why) -> Err(why),
       Ok(r) -> {
         let next = {
@@ -2288,7 +2324,7 @@ fn closed_rounds<| e>(
           asked: had.asked + r.asked,
           added: had.added.concat(more.values()),
         };
-        closed_rounds(runtime, dump, p, ctors, program, common, read, write, next, room - 1)
+        closed_rounds(runtime, dump, p, ctors, program, common, read, write, phases, next, room - 1)
       },
     }
   }
@@ -4083,6 +4119,41 @@ test "a root the emitter answers nothing for is refused and listed, and the rest
     );
     // What the emitter answered is kept: the next run asks it for the unanswered root alone.
     assert_eq(run().asked, 1)
+  })
+}
+
+test "a unit tells each of its rounds to a build's phases as it ends, numbered from one" {
+  let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
+  let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
+  kept_bodies(|| {
+    // A round is kept under its number, as a byte for each root it asked the emitter for.
+    let told = |r: RoundTally|
+      body_store.put(
+        ascii_of_int(r.round),
+        Bytes::concat_all(range(0, r.asked).map(|_: Int| b"x")),
+      );
+    match emitted(
+        a_runtime(b"r"),
+        dump,
+        sources_placed(dump, user),
+        Map::new(),
+        [b"m.one", b"m.two"],
+        b"",
+        |_: Bytes| None,
+        |_: Bytes, _: Bytes| (),
+        phases: Some({ now: || 0, told: told }),
+      ) {
+      Err(why) -> panic(String::of_bytes_lossy(why)),
+      Ok(e) -> {
+        let rounds = body_store.all();
+        assert(
+          rounds.len() > 0
+            && range(1, rounds.len() + 1).all(|i: Int| rounds.contains(ascii_of_int(i))),
+          None,
+        );
+        assert_eq(rounds.values().fold(0, |n: Int, v: Bytes| n + v.len()), e.asked)
+      },
+    }
   })
 }
 
