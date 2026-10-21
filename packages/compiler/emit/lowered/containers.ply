@@ -2,6 +2,7 @@
 //! the runtime's helpers, and lengths, bytes and joins written in place; and a corpus that lowers,
 //! checks and prints.
 
+import emit.reps (laid)
 import std.bytes (ascii_of_int)
 import std.prelude_source
 import check.types (Type, TyCon, TyFn, TyRecord)
@@ -12,7 +13,7 @@ import front.seam (Analysed)
 import front.published (analyse, no_rows)
 import front (analyse_pulling_std_with)
 import check.resolve.tables (qualify)
-import emit.layout (Intrinsic, intrinsics, layouts)
+import emit.layout (Intrinsic, intrinsics, layouts, words)
 import emit.answer (Need, Layout)
 import emit.pieces (spelled)
 import emit.roots (symbol_of)
@@ -21,9 +22,9 @@ import emit.code (Code, NField)
 import emit.tir (Rep, RInt, RBool, RFloat, RWord, RSum, RNum, RFlat, Leaf, Var, Arg, AVar, AInt,
                  Val, Make, Made, MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst,
                  Let, Fn, Lambda, Closure, Spine, Data, Containers, rep_of_arg)
-import emit.tir.containers (Laid, Length, Elements, Joined, ArrayNew, ArraySet, ArrayOfList,
-                            ArrayGet, ColumnField, ItemAt, Rest, Position, Bits, IntBits, FloatBits,
-                            DecimalBits, Words, Payloads, Records)
+import emit.tir.containers (Laid, Length, Elements, Within, ArrayNew, ArraySet, ArrayOfList,
+                            ArrayGet, ColumnsNew, ColumnsSet, ColumnsOfList, ColumnsGet,
+                            ColumnField, ColumnOf, ItemAt, Rest, Position, Element)
 import emit.lower (lowered_fn)
 import emit.own (owned)
 import emit.lower.base (Context, Lowered, started)
@@ -146,43 +147,28 @@ test "a list pattern's item is read where it lies, and its rest made a list of i
 test "a builtin the runtime implements is called through its helper over words, its answer held as its type" {
   let p = program(
     Bytes::concat_all([
-      b"fn joined(a: String, b: String) -> String = String::concat(a, b)\n",
-      b"fn size(s: String) -> Int = s.len()\n",
-      b"fn numbers(n: Int) -> List<Int> = range(0, n)\n",
+      b"fn fresh() -> Map<Int, String> = Map::new()\n",
+      b"fn keys(m: Map<Int, String>) -> Int = m.len()\n",
     ]),
   );
-  let calls = natives_in(bound_in(p, b"joined"));
-  assert_eq(calls.map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name), [
-    b"builtin_string_concat_p",
-  ]);
-  assert_eq(calls.map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.args), [
-    [param(0, b"String"), param(1, b"String")],
-  ]);
-  assert_eq(calls.map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.uses), [
-    { takes: [true, true], owned: true, fails: true, stops: false },
-  ]);
-  // A method is the builtin its type names, its word answer unboxed to the `Int` it holds.
+  let name = |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name;
+  assert_eq(natives_in(bound_in(p, b"fresh")).map(name), [b"builtin_map_new_p"]);
+  // A method is the builtin its type names, taking its word, its word answer unboxed to the `Int`
+  // it holds.
+  let calls = natives_in(bound_in(p, b"keys"));
+  assert_eq(calls.map(name), [b"builtin_map_len_p"]);
   assert_eq(
-    natives_in(bound_in(p, b"size")).map(
-      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.answer,
-    ),
-    [RWord],
+    calls.map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }|
+      { args: c.args.map(rep_of_arg), uses: c.uses, answer: c.answer }),
+    [
+      {
+        args: [RWord],
+        uses: { takes: [true], owned: true, fails: true, stops: false },
+        answer: RWord,
+      },
+    ],
   );
-  assert_eq(
-    natives_in(bound_in(p, b"size")).map(
-      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
-    ),
-    [b"builtin_string_len_p"],
-  );
-  assert_eq(packs_in(bound_in(p, b"size")), [RInt]);
-  // Each scalar argument is boxed into the word the helper takes.
-  assert_eq(packs_in(bound_in(p, b"numbers")), [RWord, RWord]);
-  assert_eq(
-    natives_in(bound_in(p, b"numbers")).map(
-      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.args.map(rep_of_arg),
-    ),
-    [[RWord, RWord]],
-  )
+  assert_eq(packs_in(bound_in(p, b"keys")), [RInt])
 }
 
 test "a length is read in place off its header, never failing and taking nothing" {
@@ -206,40 +192,29 @@ test "a length is read in place off its header, never failing and taking nothing
   ])
 }
 
-test "byte strings joined from a list made for the join make no list" {
-  let p = program(
-    Bytes::concat_all([
-      b"fn glued(a: Bytes, b: Bytes) -> Bytes = Bytes::concat_all([a, b])\n",
-      b"fn all(bs: List<Bytes>) -> Bytes = Bytes::concat_all(bs)\n",
-      b"fn named(a: Bytes) -> Bytes = { let xs = [a]; Bytes::concat_all(xs) }\n",
-    ]),
-  );
-  let glued = bound_in(p, b"glued");
-  assert_eq(made(glued), []);
-  assert_eq(
-    ops_in(glued).map(|o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }|
-      { op: o.op, args: o.args }),
-    [{ op: OContainer(Joined), args: [param(0, b"Bytes"), param(1, b"Bytes")] }],
-  );
-  let name = |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name;
-  assert_eq(natives_in(bound_in(p, b"all")).map(name), [b"builtin_bytes_concat_all_p"]);
-  // A list a slot holds may be read again, so it is made and joined by the runtime.
-  assert_eq(made(bound_in(p, b"named")).len(), 1);
-  assert_eq(natives_in(bound_in(p, b"named")).map(name), [b"builtin_bytes_concat_all_p"])
+/// How an array of program `p` lays out an element of type `t`: as its type lays it, at least a
+/// word apart.
+fn element_in(p: Program, t: Type) -> Element / {abort.raise} = {
+  let l = laid(p.setting.ctors, t);
+  { laid: l, stride: max(1, words(l)) }
 }
 
-test "a lookup answers an Option of a pointer as its one word, with no object made" {
+test "an array's `at` tests its index and reads the element where it lies, its Option made by the body" {
   let p = program(b"fn element(a: Array<String>, i: Int) -> Option<String> = a.at(i)\n");
+  assert_eq(natives_in(bound_in(p, b"element")), []);
   assert_eq(
-    natives_in(bound_in(p, b"element")).map(
-      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }|
-        { name: c.name, answer: c.answer },
+    ops_in(bound_in(p, b"element")).map(
+      |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }|
+        { op: o.op, answer: o.answer },
     ),
-    [{ name: b"rt_array_lookup_p", answer: RWord }],
-  )
+    [{ op: OContainer(Within), answer: RBool }],
+  );
+  let text = form_text(p, b"element");
+  assert(text.index_of(b"(uint64_t)") != None, Some(String::of_bytes_lossy(text)));
+  assert_eq([text.index_of(b"rt_array_lookup_p"), text.index_of(b"rt_ctor_p")], [None, None])
 }
 
-test "an array is made, written and read as its elements' type lays it out" {
+test "an array is made, written and read as its elements' type lays out a value of it, in place" {
   let p = program(
     Bytes::concat_all([
       b"fn made(n: Int) -> Array<Int> / {abort.raise} = Array::new(n, 0)\n",
@@ -250,6 +225,7 @@ test "an array is made, written and read as its elements' type lays it out" {
       b"fn records(n: Int, r: { x: Int, y: Int }) -> Array<{ x: Int, y: Int }> / {abort.raise} = Array::new(n, r)\n",
       b"fn record(a: Array<{ x: Int, y: Int }>) -> Int / {abort.raise} = a.get(0).y\n",
       b"fn options(a: Array<Option<String>>, x: Option<String>) -> Array<Option<String>> / {abort.raise} = a.set(0, x)\n",
+      b"fn units(n: Int) -> Array<Unit> / {abort.raise} = Array::new(n, ())\n",
     ]),
   );
   let op = |name: Bytes|
@@ -257,52 +233,115 @@ test "an array is made, written and read as its elements' type lays it out" {
       |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }|
         { op: o.op, answer: o.answer, takes: o.uses.takes },
     );
-  let bits = |b: Bits, stride: Int, shape: Bytes|
-    { held: Bits(b), stride: stride, shapes: [[shape]], counted: [] };
-  // A record is held as its word form, a box of its words.
-  let point = { held: Words, stride: 1, shapes: [], counted: [] };
+  let int = con(b"Int", []);
+  let point = TyRecord([{ name: b"x", ty: int }, { name: b"y", ty: int }]);
+  // A record lies in the array's own words, its fields' words one after another, with no header.
   assert_eq(op(b"records"), [
-    { op: OContainer(ArrayNew(point)), answer: RWord, takes: [false, true] },
+    { op: OContainer(ArrayNew(element_in(p, point))), answer: RWord, takes: [false, true] },
   ]);
-  // An element read is that word, which the record's leaves are opened out of.
-  assert_eq(op(b"record"), [
-    { op: OContainer(ArrayGet(point)), answer: RWord, takes: [false, false] },
-  ]);
-  // An `Option` is its word form, an `Option` of a pointer that pointer or 0.
-  assert_eq(op(b"options"), [
-    { op: OContainer(ArraySet(point)), answer: RWord, takes: [true, false, true] },
-  ]);
-  assert_eq(
-    bound_in(p, b"options").fold([], |acc: List<Rep>, b: Bound|
-      match b.val { Op(o) -> acc.concat(o.args.map(rep_of_arg)), _ -> acc }),
-    [RWord, RInt, RWord],
+  assert_eq(element_in(p, point).stride, 2);
+  // An element read is the record's leaves, borrowed from where they lie.
+  assert(
+    op(b"record").any(|o: { op: Operation, answer: Rep, takes: List<Bool> }|
+      o.op == OContainer(ArrayGet(element_in(p, point)))
+        && (match o.answer { RFlat(_) -> true, _ -> false })),
+    None,
   );
-  // A scalar is held as its bits in place, an element of any other type as its word.
+  // An `Option` of a pointer is one word, `None` its zero.
+  let option = con(b"Option", [con(b"String", [])]);
+  assert_eq(op(b"options"), [
+    { op: OContainer(ArraySet(element_in(p, option))), answer: RWord, takes: [true, false, true] },
+  ]);
+  assert_eq(element_in(p, option).stride, 1);
   assert_eq(op(b"made"), [
-    { op: OContainer(ArrayNew(bits(IntBits, 1, b"e!int"))), answer: RWord, takes: [false, true] },
+    { op: OContainer(ArrayNew(element_in(p, int))), answer: RWord, takes: [false, true] },
   ]);
   assert_eq(op(b"written"), [
     {
-      op: OContainer(ArraySet(bits(FloatBits, 1, b"e!f"))),
+      op: OContainer(ArraySet(element_in(p, con(b"Float", [])))),
       answer: RWord,
       takes: [true, false, true],
     },
   ]);
   assert_eq(op(b"laid"), [
-    { op: OContainer(ArrayOfList(bits(DecimalBits, 2, b"e!d"))), answer: RWord, takes: [true] },
+    {
+      op: OContainer(ArrayOfList(element_in(p, con(b"Decimal", [])))),
+      answer: RWord,
+      takes: [true],
+    },
   ]);
+  assert_eq(element_in(p, con(b"Decimal", [])).stride, 2);
   assert_eq(op(b"read"), [
-    { op: OContainer(ArrayGet(bits(IntBits, 1, b"e!int"))), answer: RInt, takes: [false, false] },
+    { op: OContainer(ArrayGet(element_in(p, int))), answer: RInt, takes: [false, false] },
   ]);
   assert_eq(op(b"words"), [
     {
-      op: OContainer(ArrayGet({ held: Words, stride: 1, shapes: [], counted: [] })),
+      op: OContainer(ArrayGet(element_in(p, con(b"String", [])))),
       answer: RWord,
       takes: [false, false],
     },
   ]);
-  // The element written is handed over as the array holds it, a scalar unboxed.
-  assert_eq(packs_in(bound_in(p, b"made")), [])
+  // A value of no words still takes a word of the array.
+  assert_eq(element_in(p, con(b"Unit", [])).stride, 1);
+  // The element written is handed over as its type holds it: an `Int` is its bits, never a word.
+  assert_eq(packs_in(bound_in(p, b"made")), []);
+  // Nothing reaches the runtime's arrays, and every root passes the check once its counts are placed.
+  [
+    b"made",
+    b"written",
+    b"laid",
+    b"read",
+    b"words",
+    b"records",
+    b"record",
+    b"options",
+    b"units",
+  ].fold((), |_: Unit, n: Bytes| {
+    assert_eq(
+      natives_in(bound_in(p, n)).filter(
+        |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }|
+          c.name.index_of(b"array") != None,
+      ),
+      [],
+    );
+    match checked(p, n) {
+      Ok(_) -> (),
+      Err(why) -> panic(String::of_bytes_lossy(Bytes::concat_all([n, b": ", why]))),
+    }
+  })
+}
+
+test "a Columns is made, written, read, measured and searched one array per field, never by the runtime" {
+  let p = program(
+    Bytes::concat_all([
+      b"type P = { x: Float, label: String }\n",
+      b"fn made(n: Int, r: P) -> Columns<P> / {abort.raise} = Columns::new(n, r)\n",
+      b"fn listed(rs: List<P>) -> Columns<P> = Columns::of_list(rs)\n",
+      b"fn written(c: Columns<P>, r: P) -> Columns<P> / {abort.raise} = c.set(0, r)\n",
+      b"fn read(c: Columns<P>, i: Int) -> P / {abort.raise} = c.get(i)\n",
+      b"fn counted(c: Columns<P>) -> Int = c.len()\n",
+      b"fn found(c: Columns<P>, i: Int) -> Option<P> = c.at(i)\n",
+    ]),
+  );
+  let op = |name: Bytes|
+    ops_in(bound_in(p, name)).map(
+      |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.op,
+    );
+  // The fields in the record's order: `label`, then `x`.
+  let es = [element_in(p, con(b"String", [])), element_in(p, con(b"Float", []))];
+  assert_eq(op(b"made"), [OContainer(ColumnsNew(es))]);
+  assert_eq(op(b"listed"), [OContainer(ColumnsOfList(es))]);
+  assert_eq(op(b"written"), [OContainer(ColumnsSet(es))]);
+  assert_eq(op(b"read"), [OContainer(ColumnsGet(es))]);
+  assert_eq(op(b"counted"), [OContainer(ColumnOf(0)), OContainer(Elements)]);
+  assert_eq(op(b"found"), [OContainer(ColumnOf(0)), OContainer(Within)]);
+  [b"made", b"listed", b"written", b"read", b"counted", b"found"].fold((), |_: Unit, n: Bytes| {
+    assert_eq(natives_in(bound_in(p, n)), []);
+    match checked(p, n) {
+      Ok(_) -> (),
+      Err(why) -> panic(String::of_bytes_lossy(Bytes::concat_all([n, b": ", why]))),
+    }
+  })
 }
 
 test "an array of a type variable's elements is made by the runtime, its layout noted for a specialisation" {
@@ -326,8 +365,7 @@ test "a builtin where only its type arguments are filed, as in code written for 
     Bytes::concat_all([
       b"fn count(xs: List<Int>) -> Int = xs.len()\n",
       b"fn read(a: Array<Int>, i: Int) -> Int / {abort.raise} = a.get(i)\n",
-      b"fn glued(a: Bytes, b: Bytes) -> Bytes = Bytes::concat_all([a, b])\n",
-      b"fn measured(s: String) -> Int = s.len()\n",
+      b"fn keys(m: Map<Int, String>) -> Int = m.len()\n",
     ]),
   );
   let argued = |filed: Result<Filings, Bytes>|
@@ -346,18 +384,15 @@ test "a builtin where only its type arguments are filed, as in code written for 
       |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.op,
     );
   assert_eq(op(b"count"), [OContainer(Length)]);
-  assert_eq(op(b"read"), [
-    OContainer(ArrayGet({ held: Bits(IntBits), stride: 1, shapes: [[b"e!int"]], counted: [] })),
-  ]);
-  assert_eq(op(b"glued"), [OContainer(Joined)]);
+  assert_eq(op(b"read"), [OContainer(ArrayGet(element_in(q, con(b"Int", []))))]);
   // A call through the runtime answers a value of the type its declaration gives it there.
   assert_eq(
-    natives_in(bound_in(q, b"measured")).map(
+    natives_in(bound_in(q, b"keys")).map(
       |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
     ),
-    [b"builtin_string_len_p"],
+    [b"builtin_map_len_p"],
   );
-  assert_eq(packs_in(bound_in(q, b"measured")), [RInt])
+  assert_eq(packs_in(bound_in(q, b"keys")), [RInt])
 }
 
 test "a field of a Columns' record is read from its column, with no record made" {
@@ -422,25 +457,22 @@ test "a field of a Columns' record is read from its column, with no record made"
   // The record's fields in their order: `at`, `label`, `x`.
   assert_eq(read(b"x_at"), [
     {
-      op: OContainer(
-        ColumnField({
-          k: 2,
-          column: { held: Bits(FloatBits), stride: 1, shapes: [[b"x!f"]], counted: [] },
-        }),
-      ),
+      op: OContainer(ColumnField({ k: 2, column: element_in(p, con(b"Float", [])) })),
       answer: RFloat,
     },
   ]);
   assert_eq(read(b"label_at"), [
     {
-      op: OContainer(
-        ColumnField({ k: 1, column: { held: Words, stride: 1, shapes: [], counted: [] } }),
-      ),
+      op: OContainer(ColumnField({ k: 1, column: element_in(p, con(b"String", [])) })),
       answer: RWord,
     },
   ]);
-  // A record held in place in a column is read as the address of its header there.
-  assert_eq(read(b"at_at").map(|o: { op: Operation, answer: Rep }| o.answer), [RWord]);
+  // A record held in place in a column is read as its leaves, its words where they lie.
+  assert(
+    read(b"at_at").any(|o: { op: Operation, answer: Rep }|
+      match o.answer { RFlat(_) -> true, _ -> false }),
+    None,
+  );
   // Only a field of a record a type lays out has a column of its own.
   assert_eq(read(b"var_at"), [])
 }
@@ -718,14 +750,14 @@ test "a name no import takes is the builtin's, and an import that takes a builti
 
 test "a builtin the runtime lacks is declined, and one written at a scalar's type goes on to scalars" {
   let src = Bytes::concat_all([
-    b"fn size(s: String) -> Int = s.len()\n",
+    b"fn keys(m: Map<Int, String>) -> Int = m.len()\n",
     b"fn wrapped(a: U8, b: U8) -> U8 = wrap_add(a, b)\n",
   ]);
   let by = |p: Program, name: Bytes|
     match formed(p, name) { Ok(_) -> None, Err(no) -> Some(no.by) };
   let bare = program(src);
-  assert_eq(by({ ..bare, setting: { ..bare.setting, builtins: [] } }, b"size"), Some(Containers));
-  assert_eq(by(program(src), b"size"), None);
+  assert_eq(by({ ..bare, setting: { ..bare.setting, builtins: [] } }, b"keys"), Some(Containers));
+  assert_eq(by(program(src), b"keys"), None);
   assert(by(program(src), b"wrapped") != Some(Containers), None)
 }
 
@@ -797,6 +829,18 @@ fn corpus() -> Bytes =
     b"fn maybes(xs: List<Option<String>>) -> Array<Option<String>> = Array::of_list(xs)\n",
     b"fn maybe_at(a: Array<Option<String>>, i: Int) -> Option<String> / {abort.raise} = a.get(i)\n",
     b"fn put_maybe(a: Array<Option<Int>>, x: Option<Int>) -> Array<Option<Int>> / {abort.raise} = a.set(0, x)\n",
+    b"type Tagged = { name: String, n: Int }\n",
+    b"fn tags(n: Int, t: Tagged) -> Array<Tagged> / {abort.raise} = Array::new(n, t)\n",
+    b"fn retag(a: Array<Tagged>, t: Tagged) -> Array<Tagged> / {abort.raise} = a.set(1, t)\n",
+    b"fn tag_list(ts: List<Tagged>) -> Array<Tagged> = Array::of_list(ts)\n",
+    b"fn tag_at(a: Array<Tagged>, i: Int) -> Option<Tagged> = a.at(i)\n",
+    b"fn columns(ts: List<Tagged>) -> Columns<Tagged> = Columns::of_list(ts)\n",
+    b"fn column_new(n: Int, t: Tagged) -> Columns<Tagged> / {abort.raise} = Columns::new(n, t)\n",
+    b"fn column_set(c: Columns<Tagged>, t: Tagged) -> Columns<Tagged> / {abort.raise} = c.set(0, t)\n",
+    b"fn column_get(c: Columns<Tagged>, i: Int) -> Tagged / {abort.raise} = c.get(i)\n",
+    b"fn column_name(c: Columns<Tagged>, i: Int) -> String / {abort.raise} = c.get(i).name\n",
+    b"fn column_at(c: Columns<Tagged>, i: Int) -> Option<Tagged> = c.at(i)\n",
+    b"fn column_len(c: Columns<Tagged>) -> Int = c.len()\n",
   ])
 
 fn corpus_names() -> List<Bytes> =
@@ -840,6 +884,17 @@ fn corpus_names() -> List<Bytes> =
     b"maybes",
     b"maybe_at",
     b"put_maybe",
+    b"tags",
+    b"retag",
+    b"tag_list",
+    b"tag_at",
+    b"columns",
+    b"column_new",
+    b"column_set",
+    b"column_get",
+    b"column_name",
+    b"column_at",
+    b"column_len",
   ]
 
 /// Root `m.<name>` of `p` as the form prints it before any check, or why it was not formed.

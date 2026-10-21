@@ -766,7 +766,7 @@ test "a 64-bit width is held in a C register of its type, and in a record as its
   assert_eq(out.get(4).text, b"")
 }
 
-test "an array holds a record as its word and a float as its bits" {
+test "an array holds a record's words in place and a float as its bits" {
   let src = Bytes::concat_all([
     b"type Point = { x: Float, y: Float }\n",
     b"fn second_x(ps: Array<Point>) -> Float / {abort.raise} = ps.get(1).x\n",
@@ -777,13 +777,15 @@ test "an array holds a record as its word and a float as its bits" {
   let out = emit_all_program([{ name: b"m", src: src }], [], [b"Array::get", b"Array::len"], true);
   let has = |text: Bytes| out.map(|e: Emitted| e.text.index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None]);
-  // A point is its word, a box of its two words opened where it is read. A `Float`, an element or
-  // a point's field, is a load of its bits.
-  assert_eq(has(b", INT64_C(32));"), [true, false, false, false]);
-  assert_eq(has(b"ply_f64(ply_words("), [true, true, false, false]);
+  // A point is its two words where the array holds it, no box made; a `Float`, an element or a
+  // point's field, is a load of its bits there.
+  assert_eq(has(b", INT64_C(32));"), [false, false, false, false]);
+  assert_eq(has(b"ply_f64((ply_words("), [true, true, false, false]);
   assert_eq(has(b"ply_array_len("), [true, true, true, false]);
+  // An index past the end raises as `Array::get` does, the array never handed to the runtime.
+  assert_eq(has(b"builtin_elaborated_array_bad_p(ctx, 4, "), [true, true, false, false]);
+  assert_eq(has(b"builtin_array_get"), [false, false, false, false]);
   // An array of a variable's type is read only where its callers settle the variable.
-  assert_eq(has(b"builtin_array_get"), [true, true, false, false]);
   assert_eq(out.get(3).text, b"")
 }
 
@@ -1439,9 +1441,13 @@ test "an array is made, written and listed into as the type of its elements lays
   // Allocated as an array, a write's copy too, its elements written by the code that knows their
   // type.
   assert_eq(has(b"rt_alloc_p(ctx, 15, "), [true, true, true, true]);
-  // A record is held as its word form, a box of its words; an `Int` is its bits.
-  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(32));"), [true, true, false, false]);
+  // A record lies in the array as its two words, a stride the header's `aux` says, no box made; an
+  // `Int` is its bits.
+  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(32));"), [false, false, false, false]);
+  assert_eq(has(b"->aux = 2;"), [true, false, false, false]);
   assert_eq(has(b"ply_embed"), [false, false, false, false]);
+  // A record written over is let go of by its type: its byte string through the string's drop.
+  assert_eq(has(b"ply_rel(ctx, ply_words("), [false, true, false, false]);
   // A list's items are read where its trie or its tail holds them, never through the runtime.
   assert_eq(has(b"rt_list_"), [false, false, false, false]);
   assert_eq(has(b"while ((INT64_C(32) << "), [false, false, true, false]);
@@ -1714,12 +1720,12 @@ test "a map's value is read by `std.prelude`'s `Map::get` down its tree, its key
   assert_eq(
     walk.filter(|l: Bytes|
       l.index_of(b"[2 * (") != None && l.index_of(b") + 1]") == None
-        && l.index_of(b"ply_inc(") != None),
+        && l.index_of(b"ply_dup(") != None),
     [],
   );
   assert(
     range(0, walk.len()).any(|i: Int|
-      walk.get(i).index_of(b"ply_inc(") != None
+      walk.get(i).index_of(b"ply_dup(") != None
         && range(i + 1, i + 4).any(|j: Int|
           match walk.at(j) { Some(l) -> l.index_of(b"return t") != None, None -> false })),
     Some(String::of_bytes_lossy(Bytes::join(walk, b"\n"))),
@@ -2081,7 +2087,7 @@ test "a `Decimal` is held in registers as its two words, and in a record or an a
   // A line's word opened loads its price's both words, an array's element is two words a step, and
   // nothing is boxed: a function takes and answers its decimals as their words.
   assert_eq(has(b"(PlyDec){ply_words("), [false, true, true, false, false, false, false]);
-  assert_eq(has(b"ply_dec_at("), [false, false, false, false, true, false, false]);
+  assert_eq(has(b"(PlyDec){(ply_words("), [false, false, false, false, true, false, false]);
   assert_eq(has(b") * 2)"), [false, false, false, false, true, false, false]);
   assert_eq(out.map(|e: Emitted| own_code(e.text).index_of(b"rt_box_decimal_p") != None), [
     false,
@@ -2109,13 +2115,17 @@ test "a field of a `Columns`' record is loaded from its column, with no record m
   let out = emit_all_program([{ name: b"m", src: src }], [], [b"Columns::get"], true);
   let has = |text: Bytes| out.map(|e: Emitted| e.text.index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None]);
-  // A field's column is its place among the record's fields: `label` the first, `x` the second.
-  assert_eq(has(b"PLY_KIND_COLUMNS"), [true, true, false]);
+  // A field's column is its place among the record's fields: `label` the first, `x` the second;
+  // a whole record is its fields read out of each column, its index tested against the first.
   assert_eq(has(b")[1])) {"), [true, false, false]);
-  assert_eq(has(b")[0])) {"), [false, true, false]);
-  assert_eq(has(b"ply_f64(ply_words("), [true, false, false]);
-  // What is not a columnar value's in-range record the runtime reads.
-  assert_eq(has(b"rt_columns_field_p(ctx, "), [true, true, false])
+  assert_eq(has(b")[0])) {"), [false, true, true]);
+  assert_eq(has(b"ply_f64((ply_words(ply_words(p0)[1])"), [true, false, false]);
+  assert_eq(has(b"ply_words(ply_words(p0)[1])[(p1) * 1 + 0]"), [false, false, true]);
+  // The runtime reads no `Columns` a body made: an index naming no record raises as the builtin
+  // does.
+  assert_eq(has(b"rt_columns_field_p"), [false, false, false]);
+  assert_eq(has(b"PLY_KIND_COLUMNS"), [false, false, false]);
+  assert_eq(has(b"builtin_elaborated_array_bad_p(ctx, 6, "), [true, true, true])
 }
 
 test "a `Char` is its own word, compared as C compares the words" {
@@ -2405,13 +2415,13 @@ test "a write that answers a record whose field the record holds in place hands 
   assert_eq(code.get(0).index_of(Bytes::concat_all([b"ply_dec(ctx, ", key, b")"])), None)
 }
 
-test "an array read matched as `Some` or `None` is answered in place by its lookup" {
+test "an array read matched as `Some` or `None` tests its index and reads the element in place" {
   let src = b"fn arrayed(xs: Array<Int>, i: Int) -> Int = match xs.at(i) { Some(v) -> v, None -> 0 }\n";
   let out = emit_all_program([{ name: b"m", src: src }], [b"Some", b"None"], [b"Array::at"], true);
   assert_eq(out.map(|e: Emitted| e.why), [None]);
   let calls = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
-  assert_eq(calls(b"rt_array_lookup_p"), [true]);
-  assert_eq(calls(b"rt_ctor_p"), [false])
+  assert_eq(calls(b" < (uint64_t)ply_array_len(p0)"), [true]);
+  assert_eq([calls(b"rt_array_lookup_p"), calls(b"rt_ctor_p")], [[false], [false]])
 }
 
 test "a list's item is read by `std.prelude`'s one `List::at`, from the tail or the leaf its trie leads to, in place" {
@@ -2467,16 +2477,16 @@ test "a read of a list counts nothing it reads through it, but its answer once w
   assert(
     headers.len() == 2
       && headers.all(|i: Int|
-        line_at(i - 1).index_of(b"ply_inc(") == None
-          && line_at(i + 1).index_of(b"ply_dec(") == None),
+        line_at(i - 1).index_of(b"ply_dup(") == None
+          && line_at(i + 1).index_of(b"ply_rel(") == None),
     Some(String::of_bytes_lossy(text)),
   );
   // An item is read borrowed from the tail or a leaf; the answer read out of the list is counted once
-  // more only where the list is let go of.
-  let counted = reading(b"ply_inc(");
+  // more only where the list is let go of, by its type's drop.
+  let counted = reading(b"ply_dup(");
   assert(
     reading(b" = ply_words(p0)[1 + (").len() == 1 && counted.len() == 1
-      && counted.all(|i: Int| line_at(i + 1).index_of(b"ply_dec(ctx, p0);") != None),
+      && counted.all(|i: Int| line_at(i + 1).index_of(b"ply_rel(ctx, p0, ") != None),
     Some(String::of_bytes_lossy(text)),
   )
 }
