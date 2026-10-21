@@ -16,6 +16,7 @@ pub mod tables;
 pub use build::{Native, load_linked, load_opened};
 pub use exports::{Exports, Unserved};
 pub use load::{Library, cache_dir};
+pub(crate) use prelude::machine_native;
 pub use prelude::{
     MachineNative, PRELUDE, RUNTIME_MARK, builtin_helper_name, helpers, machine_natives,
     pointer_name, runtime_header, runtime_object,
