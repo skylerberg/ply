@@ -16,8 +16,10 @@ import check.infer (CheckOutput, RootFacts, facts_at, facts_by_owner, filed_fact
                     root_facts_bin, published_pure)
 import check.infer.checker (Location, DefInfo, SpecInfo, TestInfo, LawInfo, LawBinder, EffectInfo,
                             OpInfo, CtorInfo, Known, no_known, KnownDef, KnownTest, KeptFacts,
-                            WitnessOrder, TypedSite, test_owner, law_root, law_owner, cases_root,
-                            listing_ty, witness_order_bin, witnessed, InstanceInfo, NumericInfo)
+                            WitnessOrder, TypedSite, listing_ty, witness_order_bin, witnessed,
+                            InstanceInfo, NumericInfo)
+import emit.keys (RootKey, Named, Cases, Clause, Requires, Ensures, LawPart, LawGuard, LawBody,
+                  root_name, root_text, part_word, test_key, test_owner, law_key, law_owner)
 import front.pkg (Pinned)
 import check.resolve.scopes (PackageDeps)
 import std.bin
@@ -272,12 +274,13 @@ fn key_published(def_info: DefInfo) -> Bytes / {abort.raise} = {
   ])
 }
 
-fn key_clause_root(owner: Bytes, kind: Bytes, k: Int) -> Bytes =
-  Bytes::concat_all([owner, b"#", kind, b"#", ascii_of_int(k)])
+/// The `k`th clause of its kind, `requires` or `ensures`, that definition `def` states.
+fn clause_key(def: Bytes, kind: SpecKind, k: Int) -> RootKey =
+  Clause({ def: Named(def), kind: if kind == SRequires { Requires } else { Ensures }, n: k })
 
 /// The root the emitter answers the program's test `i` by.
-pub fn test_root_at(dump: Dump, i: Int) -> Option<Bytes> / {abort.raise} =
-  match dump.tests.at(i) { Some(t) -> Some(test_owner(t.module, t.name)), None -> None }
+pub fn test_root_at(dump: Dump, i: Int) -> Option<RootKey> / {abort.raise} =
+  match dump.tests.at(i) { Some(t) -> Some(test_key(t.module, t.name)), None -> None }
 
 /// A digest of what emitting the root hashed under `key` reads of the rest of the program: the
 /// signature of `owner` (the root, or a clause's definition), the signature of every definition it
@@ -332,7 +335,7 @@ fn key_fn(
             let sentence = match sents.at(i) { Some(s) -> s, None -> owner };
             {
               out: b.out.push({
-                root: key_clause_root(name, text, k),
+                root: root_text(root_name(clause_key(name, kind, k))),
                 key: Bytes::concat_all([
                   hex(sentence),
                   b"#",
@@ -398,10 +401,11 @@ pub fn root_keys(
           let name = qualify(o.name, t.name);
           if !tested(name) { a } else {
             let read = key_reads(published, deps, decls, name, None);
-            let root = test_owner(o.name, t.name);
-            let run = a.push({ root: root, key: b"test+".concat(read) });
-            if !t.cases { run }
-            else { run.push({ root: cases_root(root), key: b"cases+".concat(read) }) }
+            let root = test_key(o.name, t.name);
+            let run = a.push({ root: root_text(root_name(root)), key: b"test+".concat(read) });
+            if !t.cases { run } else {
+              run.push({ root: root_text(root_name(Cases(root))), key: b"cases+".concat(read) })
+            }
           }
         },
         OLaw(l) -> match within {
@@ -414,12 +418,12 @@ pub fn root_keys(
               Some(text) -> {
                 let read = key_reads(published, deps, decls, name, None);
                 List::fold(
-                  if guarded.get(name) == Some(true) { [b"guard", b"body"] } else { [b"body"] },
+                  if guarded.get(name) == Some(true) { [LawGuard, LawBody] } else { [LawBody] },
                   a,
-                  |b: List<KeyRow>, part: Bytes|
+                  |b: List<KeyRow>, part: LawPart|
                     b.push({
-                      root: law_root(o.name, l.name, part),
-                      key: Bytes::concat_all([hex(text), b"#", part, b"+", read]),
+                      root: root_text(root_name(law_key(o.name, l.name, part))),
+                      key: Bytes::concat_all([hex(text), b"#", part_word(part), b"+", read]),
                     }),
                 )
               },
@@ -614,13 +618,13 @@ fn var_number(vars: List<Int>, v: Int) -> Int / {abort.raise} =
 fn emit_signature(ty: Type) -> { params: List<Type>, ret: Type } =
   match ty { TyFn(f) -> { params: f.params, ret: f.ret }, other -> { params: [], ret: other } }
 
-/// Every root is built here, so what the seam reads of it comes from the types it carries. `vars`
-/// numbers the type variables those types share.
+/// Every root is built here, so what the seam reads of it comes from the types it carries, and its
+/// row is named as its key prints. `vars` numbers the type variables those types share.
 fn emit_root(
   cr: Carrier,
   vars: List<Int>,
   witnesses: List<Int>,
-  root: Bytes,
+  root: RootKey,
   params: List<Type>,
   answer: Type,
   labels: Int,
@@ -629,7 +633,7 @@ fn emit_root(
 ) -> EmitterRoot / {abort.raise} = {
   let taken = witnesses.map(|w: Int| int_type()).concat(params);
   {
-    root: root,
+    root: root_text(root_name(root)),
     arity: taken.len() + labels,
     pure: pure,
     at: place,
@@ -643,7 +647,7 @@ fn emit_proposition(
   cr: Carrier,
   vars: List<Int>,
   witnesses: List<Int>,
-  root: Bytes,
+  root: RootKey,
   params: List<Type>,
   place: ModuleSpan,
 ) -> EmitterRoot / {abort.raise} =
@@ -682,7 +686,7 @@ fn emitter_roots(
                 cr,
                 vars,
                 witnesses,
-                name,
+                Named(name),
                 sig.params,
                 sig.ret,
                 def.scheme.label_vars.len(),
@@ -694,13 +698,13 @@ fn emitter_roots(
                 |b: { rows: List<EmitterRoot>, requires: Int, ensures: Int }, kind: SpecKind| {
                   match kind {
                     SRequires -> {
-                      let root = key_clause_root(name, b"requires", b.requires);
+                      let root = clause_key(name, kind, b.requires);
                       let row = emit_proposition(cr, vars, witnesses, root, sig.params, place);
                       { rows: b.rows.push(row), requires: b.requires + 1, ensures: b.ensures }
                     },
                     // `ensures` also takes `result`.
                     SEnsures -> {
-                      let root = key_clause_root(name, b"ensures", b.ensures);
+                      let root = clause_key(name, kind, b.ensures);
                       let row = emit_proposition(
                         cr,
                         vars,
@@ -725,12 +729,12 @@ fn emitter_roots(
             Some(x) -> span_at(x.at.module, x.at.span),
             None -> no_module_span(),
           };
-          let root = test_owner(o.name, t.name);
+          let root = test_key(o.name, t.name);
           // Over cases it is entered with a case's place and identity; a second root lists them.
           let taken = if !t.cases { [] } else { [int_type(), bytes_type()] };
           let row = emit_root(cr, [], [], root, taken, unit_type(), 0, false, place);
           let listed = if !t.cases { a.specs } else {
-            a.specs.push(emit_root(cr, [], [], cases_root(root), [], listing_ty(), 0, false, place))
+            a.specs.push(emit_root(cr, [], [], Cases(root), [], listing_ty(), 0, false, place))
           };
           { ..a, tests: a.tests.push(row), specs: listed }
         },
@@ -747,9 +751,9 @@ fn emitter_roots(
               None -> no_module_span(),
             };
             let rows = List::map(
-              if guarded { [b"guard", b"body"] } else { [b"body"] },
-              |part: Bytes| {
-                emit_proposition(cr, vars, [], law_root(o.name, l.name, part), binders, place)
+              if guarded { [LawGuard, LawBody] } else { [LawBody] },
+              |part: LawPart| {
+                emit_proposition(cr, vars, [], law_key(o.name, l.name, part), binders, place)
               },
             );
             { ..a, specs: a.specs.concat(rows) }

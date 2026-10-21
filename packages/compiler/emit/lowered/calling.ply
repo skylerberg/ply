@@ -2,9 +2,9 @@
 //! closures, function values, bodies run in place, steps and tail groups.
 
 import check.resolve.tables (qualify)
-import check.infer.checker (test_owner, law_root)
 import check.types (Type, TyCon, int_type, bool_type)
-import emit.keys (RootKey, FnArg, Named, Root, Generic, at_key, root_name)
+import emit.keys (RootKey, FnArg, Named, Root, Generic, LawPart, LawGuard, LawBody, at_key,
+                  RootName, root_name, root_text, filed_as, test_key, law_key)
 import emit.reps (filings_at, BoundLambda, has_vars)
 import emit.typing (no_filings, unknown_type)
 import emit.tir (Rep, RInt, RBool, RWord, RFlat, RSum, RSlice, MCase, Var, Arg, AVar, AInt, Val,
@@ -198,13 +198,14 @@ fn groups() -> List<List<Bytes>> =
     [b"wide_even", b"wide_odd"],
   ]
 
-/// Root `m.<name>` of `p` lowered as a build lowers it: its body after `known_body`.
+/// Definition `m.<name>` of `p` lowered as a build lowers it.
 fn lowered_as_built(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.raise} =
+  key_lowered(p, Named(qualify(b"m", name)))
+
+/// Root `key` of `p` lowered as a build lowers it: its body after `known_body`.
+fn key_lowered(p: Program, key: RootKey) -> Result<Fn, Declined> / {abort.raise} =
   match match range(0, p.roots.len()).fold(None, |acc: Option<Int>, i: Int|
-        match p.roots.at(i) {
-          Some(r) -> if r.key == Named(qualify(b"m", name)) { Some(i) } else { acc },
-          None -> acc,
-        }) {
+        match p.roots.at(i) { Some(r) -> if r.key == key { Some(i) } else { acc }, None -> acc }) {
       Some(i) -> p.roots.at(i),
       None -> None,
     } {
@@ -212,7 +213,7 @@ fn lowered_as_built(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.ra
     Some(r) -> match r.code {
       Err(why) -> Err({ by: Spine, why: why }),
       Ok(code) -> {
-        let body = known_body(root_name(r.key), r.params, code);
+        let body = known_body(root_text(root_name(r.key)), r.params, code);
         lowered_fn(context_of(p.setting, r, body), body)
       },
     },
@@ -771,13 +772,13 @@ fn specialised_form(
     Some(r) -> match r.code {
       Err(why) -> Err(why),
       Ok(code) -> {
-        let key = at_key(root_name(r.key), args, fns);
+        let key = at_key(filed_as(r.key), args, fns);
         let params = range(0, r.params.len()).map(|i: Int|
           match lent.at(i) {
             Some(Some(bl)) -> { ..r.params.get(i), lambda: Some(bl) },
             _ -> r.params.get(i),
           });
-        let body = known_body(root_name(key), params, code);
+        let body = known_body(root_text(root_name(key)), params, code);
         let filed = match r.filed { Ok(f) -> Ok(filings_at(f, args)), Err(why) -> Err(why) };
         match lowered_fn(
             context_of(p.setting, { ..r, key: key, params: params, filed: filed }, body),
@@ -805,7 +806,7 @@ fn lent_run(
     Some(l) -> match l.code {
       Err(why) -> Err(why),
       Ok(code) -> {
-        let written = lambdas_of(known_body(root_name(l.key), l.params, code));
+        let written = lambdas_of(known_body(root_text(root_name(l.key)), l.params, code));
         match written.at(0) {
           None -> Err(b"a lender that writes no lambda"),
           Some(first) -> {
@@ -1101,9 +1102,9 @@ fn cases_module() -> { name: Bytes, src: Bytes } =
 fn formed_root(
   src: Bytes,
   shipped: List<{ name: Bytes, src: Bytes }>,
-  root: Bytes,
+  root: RootKey,
 ) -> Result<Bool, Bytes> / {abort.raise} =
-  match answered_by_form(src, shipped, Named(root)) { Err(why) -> Err(why), Ok(_) -> Ok(true) }
+  match answered_by_form(src, shipped, root) { Err(why) -> Err(why), Ok(_) -> Ok(true) }
 
 test "a test over cases reads its case at the case's type, which its generic callees' sites agree on" {
   let src = Bytes::concat_all([
@@ -1112,7 +1113,7 @@ test "a test over cases reads its case at the case's type, which its generic cal
     b"test \"each case's text is empty\" for f: Fixture in fixtures() { assert(f.unified == \"\") }\n",
   ]);
   assert_eq(
-    formed_root(src, [cases_module()], test_owner(b"m", b"each case's text is empty")),
+    formed_root(src, [cases_module()], test_key(b"m", b"each case's text is empty")),
     Ok(true),
   )
 }
@@ -1122,29 +1123,22 @@ test "a law's binders are its roots' parameters at the types the checker gave th
     b"type Few = | Zero | One | Two\n",
     b"law \"two that differ differ\"\n  forall (a: Few, b: Few) where a != b {\n    a != b\n  }\n",
   ]);
-  let root = |part: Bytes| law_root(b"m", b"two that differ differ", part);
-  assert_eq([root(b"guard"), root(b"body")].map(|r: Bytes| formed_root(src, [], r)), [
+  let root = |part: LawPart| law_key(b"m", b"two that differ differ", part);
+  assert_eq([root(LawGuard), root(LawBody)].map(|r: RootKey| formed_root(src, [], r)), [
     Ok(true),
     Ok(true),
   ]);
   // A binder of a type variable compares as a value of that variable does.
   let poly = b"fn pair<a>(x: a) -> a = x\nlaw \"identity is identity\"\n  forall (x: a) {\n    pair(x) == x\n  }\n";
-  assert_eq(formed_root(poly, [], law_root(b"m", b"identity is identity", b"body")), Ok(true));
+  assert_eq(formed_root(poly, [], law_key(b"m", b"identity is identity", LawBody)), Ok(true));
   // Its sites the first a program files, as where it is all the program writes.
   let alone = b"law \"a value is itself\"\n  forall (x: a, y: b) {\n    x == x && y == y\n  }\n";
-  let itself = law_root(b"m", b"a value is itself", b"body");
+  let itself = law_key(b"m", b"a value is itself", LawBody);
   assert_eq(formed_root(alone, [], itself), Ok(true));
   // And as the program's setting offers it.
   match program_of(alone) {
     Err(why) -> assert_eq(why, b""),
-    Ok(p) ->
-      assert_eq(
-        match lowered_as_built(p, itself.slice(2, itself.len())) {
-          Ok(_) -> b"",
-          Err(no) -> no.why,
-        },
-        b"",
-      ),
+    Ok(p) -> assert_eq(match key_lowered(p, itself) { Ok(_) -> b"", Err(no) -> no.why }, b""),
   }
 }
 
@@ -1159,7 +1153,7 @@ fn group_form(names: List<Bytes>) -> Result<Fn, Bytes> / {abort.raise} =
               Some(r) -> if r.key != Named(qualify(b"m", n)) { found } else {
                 match r.code {
                   Ok(code) -> {
-                    let body = known_body(root_name(r.key), r.params, code);
+                    let body = known_body(root_text(root_name(r.key)), r.params, code);
                     Some({ cx: context_of(p.setting, r, body), body: body })
                   },
                   Err(_) -> found,
@@ -1582,20 +1576,20 @@ test "every call of a root the corpus defines is written to the head the root is
     Ok(p) -> {
       let heads = names().fold(
         Map::new(),
-        |m: Map<Bytes, { answer: Bytes, params: List<Bytes> }>, n: Bytes|
+        |m: Map<RootName, { answer: Bytes, params: List<Bytes> }>, n: Bytes|
           match lowered_as_built(p, n) {
-            Ok(f) -> m.insert(qualify(b"m", n), head_types(f.conv)),
+            Ok(f) -> m.insert(root_name(Named(qualify(b"m", n))), head_types(f.conv)),
             Err(_) -> m,
           },
       );
       assert_eq(
-        names().fold([], |acc: List<{ caller: Bytes, callee: Bytes }>, n: Bytes|
+        names().fold([], |acc: List<{ caller: Bytes, callee: RootName }>, n: Bytes|
           match lowered_as_built(p, n) {
             Err(_) -> acc,
             Ok(f) ->
               root_calls(f).fold(
                 acc,
-                |a: List<{ caller: Bytes, callee: Bytes }>, c: { callee: RootKey, conv: Convention }|
+                |a: List<{ caller: Bytes, callee: RootName }>, c: { callee: RootKey, conv: Convention }|
                   match heads.get(root_name(c.callee)) {
                     Some(h) -> if h == head_types(c.conv) { a }
                     else { a.push({ caller: n, callee: root_name(c.callee) }) },

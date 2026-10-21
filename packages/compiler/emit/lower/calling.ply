@@ -9,17 +9,16 @@ import emit.code (Code, Node, NVar, NKnown, NLambda, NApp, NUnary, NBinary, NFie
                   PxVar)
 import check.types (Type, TyFn, TyVar, TyCon, Scheme, Row, int_type, bool_type, run_needs)
 import emit.typing (Filings, no_filings, unknown_type)
-import syntax.parsing (Span, starts_upper, dummy_span)
+import syntax.parsing (Span, dummy_span)
 import check.resolve.tables (qualify)
-import check.infer.checker (is_test_owner)
 import std.bytes (ascii_of_int)
 import emit.reps (Def, Imported, EmitParam, BoundLambda, has_vars, word_type, substituted,
                   substituted_fully, type_vars, resumption, resumed, layout_key, laid_known)
 import emit.layout (P, classes)
 import emit.answer (Layout, Exact)
 import emit.release (released_vars)
-import emit.keys (RootKey, FnArg, Named, At, KeyType, KeyLayout, Callee, Root, Generic, root_name,
-                  definition_of, key_types, unspecialised, at_key)
+import emit.keys (RootKey, FnArg, Named, At, Test, KeyType, KeyLayout, Callee, Root, Generic,
+                  root_name, root_text, definition_of, key_types, unspecialised, at_key)
 import emit.tir
 import emit.tir (Rep, RInt, RBool, RWord, RSlice, RSum, RUnit, Var, Arg, AVar, AInt, AZero, Given,
                  Lent, Convention, Val, Prim, Make, Get, Gathered, Pack, Native, Op, OCalling,
@@ -28,7 +27,7 @@ import emit.tir (Rep, RInt, RBool, RWord, RSlice, RSum, RUnit, Var, Arg, AVar, A
                  Block, Fn, Rooted, Member, Closure, Declined, Calling, no_links, falls_through,
                  rep_of_arg)
 import emit.tir.calling (ConstantRead, Ticked)
-import emit.lower.setting (Setting, Root, imported_target, qualified)
+import emit.lower.setting (Setting, Root, imported_target, ctor_named)
 import emit.lower.held (held_as, case_index, arg_word, typed_convention)
 import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
                         ToInPlace, Frame, Opened, GroupMember, Restarts, Enters, Calls, refuse,
@@ -45,7 +44,7 @@ pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.rai
     setting: setting,
     filed: match r.filed { Ok(f) -> f, Err(_) -> no_filings() },
     key: r.key,
-    full: root_name(r.key),
+    full: root_text(root_name(r.key)),
     base: r.base,
     params: r.params,
     types: r.types,
@@ -56,9 +55,12 @@ pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.rai
     param_at: range(0, r.params.len()).fold(Map::new(), |m: Map<Int, Int>, i: Int| m.insert(i, i)),
     lender: None,
     owners: r.params.fold(
-      Map::new().insert(root_name(r.key), r.key),
+      Map::new().insert(root_text(root_name(r.key)), r.key),
       |m: Map<Bytes, RootKey>, p: EmitParam|
-        match p.lambda { Some(bl) -> m.insert(root_name(bl.owner), bl.owner), None -> m },
+        match p.lambda {
+          Some(bl) -> m.insert(root_text(root_name(bl.owner)), bl.owner),
+          None -> m,
+        },
     ),
     observing: false,
     frame: dummy_span(),
@@ -225,7 +227,7 @@ pub fn target(cx: Context, func: Code, args: List<Code>) -> Option<Target> / {ab
     },
     NVar(f) -> match f.slot {
       Some(_) -> Some(ToValue),
-      None -> if is_ctor_name(f.name) { Some(ToCtor(f.name)) } else {
+      None -> if ctor_named(cx.setting, f.name) != None { Some(ToCtor(f.name)) } else {
         match def_named(cx, f.name) {
           Some(d) -> Some(ToDef(d.full)),
           None -> if f.name == b"iterate" && stepped(args) { Some(ToInPlace(Some(2))) }
@@ -266,7 +268,7 @@ pub fn global(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered / {ab
           at,
         )
       },
-      _ -> if is_ctor_name(name) { constructed(cx, st, name, [], at, at) }
+      _ -> if ctor_named(cx.setting, name) != None { constructed(cx, st, name, [], at, at) }
       else { refuse(st, Calling, b"a global read at no function type: ".concat(name)) },
     },
   }
@@ -436,7 +438,7 @@ pub fn entered(
                 filed: bl.filed,
                 base: bl.base,
                 lender: Some({ owner: bl.owner, written: bl.written }),
-                owners: cx.owners.insert(root_name(bl.owner), bl.owner),
+                owners: cx.owners.insert(root_text(root_name(bl.owner)), bl.owner),
               }),
           };
           in_frame(framed, st, f_of(st, k.slot), k, lowered, lender, at)
@@ -450,13 +452,15 @@ pub fn entered(
 /// or, inside a lent lambda, its lender's; the lambda a parameter of this specialisation was handed
 /// by another root (`Some(Some(bl))`); or none where this root was not handed it.
 fn frame_of(cx: Context, owner: Bytes, nth: Int) -> Option<Option<BoundLambda>> =
-  if owner == root_name(match cx.lender { Some(l) -> l.owner, None -> cx.key }) { Some(None) }
-  else {
+  if owner == root_text(root_name(match cx.lender { Some(l) -> l.owner, None -> cx.key })) {
+    Some(None)
+  } else {
     match cx.params.fold(None, |acc: Option<BoundLambda>, p: EmitParam|
         match acc {
           Some(_) -> acc,
           None -> match p.lambda {
-            Some(bl) -> if root_name(bl.owner) == owner && bl.nth == nth { Some(bl) } else { None },
+            Some(bl) -> if root_text(root_name(bl.owner)) == owner && bl.nth == nth { Some(bl) }
+            else { None },
             None -> None,
           },
         }) {
@@ -1307,8 +1311,9 @@ pub fn known_body(full: Bytes, params: List<EmitParam>, body: Code) -> Code =
     body,
     range(0, params.len()).fold([], |acc: List<KnownSlot>, i: Int|
       match match params.at(i) { Some(p) -> p.lambda, None -> None } {
-        Some(bl) -> if has_handle(bl.code.body) { acc }
-        else { acc.push({ slot: i, owner: root_name(bl.owner), nth: bl.nth, code: bl.code }) },
+        Some(bl) -> if has_handle(bl.code.body) { acc } else {
+          acc.push({ slot: i, owner: root_text(root_name(bl.owner)), nth: bl.nth, code: bl.code })
+        },
         None -> acc,
       }),
     full,
@@ -1823,7 +1828,7 @@ fn may_be_called(cx: Context, j: Int) -> Bool =
 /// slot, another root's wherever it is handed on, and a definition named as a value as the lambda
 /// around a call of it.
 fn fn_args(cx: Context, codes: List<Code>) -> List<FnArg> / {abort.raise} = {
-  let owner = root_name(cx.key);
+  let owner = root_text(root_name(cx.key));
   let lends = cx.lends;
   // Code of a lambda another root lent is that root's, which lends each lambda within it.
   let by = match cx.lender {
@@ -1870,20 +1875,18 @@ fn owner_named(cx: Context, name: Bytes) -> RootKey / {abort.raise} =
 /// Whether a lambda of the root can be read again where another root runs it: the root is a test,
 /// a definition of no type variable as it stands, or one at type arguments that are all known and
 /// that runs no lambda of another root itself.
-fn lends_lambdas(cx: Context) -> Bool / {abort.raise} = {
-  let owner = root_name(cx.key);
-  is_test_owner(owner)
-    || (owner.index_of(b"#") == None
-    && (match cx.key {
-      At(a) ->
-        a.lent.len() == 0 && key_types(cx.key).all(|t: Type| t != unknown_type() && !has_vars(t)),
-      _ -> match cx.setting.here.fold(None, |acc: Option<Def>, d: Def|
-          if qualify(cx.setting.module, d.name) == owner { Some(d) } else { acc }) {
-        Some(d) -> match d.scheme { Some(sc) -> sc.ty_vars.len() == 0, None -> true },
-        None -> false,
-      },
-    }))
-}
+fn lends_lambdas(cx: Context) -> Bool / {abort.raise} =
+  match cx.key {
+    Test(_) -> true,
+    At(a) ->
+      a.lent.len() == 0 && key_types(cx.key).all(|t: Type| t != unknown_type() && !has_vars(t)),
+    Named(n) -> match cx.setting.here.fold(None, |acc: Option<Def>, d: Def|
+        if qualify(cx.setting.module, d.name) == n { Some(d) } else { acc }) {
+      Some(d) -> match d.scheme { Some(sc) -> sc.ty_vars.len() == 0, None -> true },
+      None -> false,
+    },
+    _ -> false,
+  }
 
 /// What the root lends: the lambdas its body writes, then each definition it hands a definition as a
 /// value, as the lambda around a call of it.
@@ -2202,25 +2205,24 @@ fn def_named(cx: Context, name: Bytes) -> Option<Defined> / {abort.raise} =
   def_in(cx.setting.module, cx.setting.here, cx.setting.imports, name)
 
 /// The definition `name` names in `module`, which defines `here` and imports `imports`: the
-/// module's own first, then what an import reaches; none for a constructor's name.
+/// module's own first, then what an import reaches. A constructor's name names none, since a
+/// constructor and a definition share the names a module sees.
 pub fn def_in(
   module: Bytes,
   here: List<Def>,
   imports: List<Imported>,
   name: Bytes,
 ) -> Option<Defined> / {abort.raise} =
-  if is_ctor_name(name) { None } else {
-    match here.fold(None, |acc: Option<Def>, d: Def| if d.name == name { Some(d) } else { acc }) {
-      Some(d) -> Some({ full: qualify(module, name), def: d }),
-      None -> match imported_target(imports, name) {
+  match here.fold(None, |acc: Option<Def>, d: Def| if d.name == name { Some(d) } else { acc }) {
+    Some(d) -> Some({ full: qualify(module, name), def: d }),
+    None -> match imported_target(imports, name) {
+      None -> None,
+      Some(t) -> match t.imp.defs.fold(None, |acc: Option<Def>, d: Def|
+          if d.name == t.name { Some(d) } else { acc }) {
+        Some(d) -> Some({ full: qualify(t.imp.module, t.name), def: d }),
         None -> None,
-        Some(t) -> match t.imp.defs.fold(None, |acc: Option<Def>, d: Def|
-            if d.name == t.name { Some(d) } else { acc }) {
-          Some(d) -> Some({ full: qualify(t.imp.module, t.name), def: d }),
-          None -> None,
-        },
       },
-    }
+    },
   }
 
 /// The type arguments the checker gave a reference at `at` of a definition of scheme `scheme`, none
@@ -2239,16 +2241,3 @@ fn reference_args(cx: Context, scheme: Option<Scheme>, at: Span) -> Option<List<
 
 fn same_fns(a: List<FnArg>, b: List<FnArg>) -> Bool =
   a.len() == b.len() && a.all(|f: FnArg| b.contains(f))
-
-/// Whether `name` names a constructor: as written, `binder::Name`, or program-wide, as code the
-/// emitter writes names one, `m.Name`; a written root's name, which spells a type, does not.
-pub fn is_ctor_name(name: Bytes) -> Bool / {abort.raise} =
-  name.index_of(b"#") == None
-    && starts_upper(match qualified(name) {
-      Some(q) -> q.name,
-      None -> if name.index_of(b".") == None { name } else {
-        let dot = range(0, name.len()).fold(0, |acc: Int, i: Int|
-          if name.at(i) == 46 { i } else { acc });
-        name.slice(dot + 1, name.len())
-      },
-    })

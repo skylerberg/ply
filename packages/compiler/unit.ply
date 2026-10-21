@@ -18,23 +18,24 @@ import std.value (Value, VList, VInt, VRecord, VStr, VMap)
 import emit.statics (SStr, statics_of)
 import emit.roots (builtin_helper, symbol_of, entry_of, root_id)
 import emit.keys
-import emit.keys (RootKey, Named, At, Written, Entered, FnArg, KeyArg, KeyType, KeyLayout,
-                  root_name, definition_of, sited_as, key_lent, key_types, at_key, module_of,
-                  modules_lowered, key_bytes, root_key_bin)
+import emit.keys (RootKey, Named, At, Written, Test, Cases, Clause, Stored, Entered, Requires,
+                  Ensures, LawGuard, LawBody, FnArg, KeyArg, KeyType, KeyLayout, RootName,
+                  root_name, root_text, definition_of, sited_as, key_lent, key_types, at_key,
+                  module_of, modules_lowered, key_bytes, root_key_bin, test_key, law_key,
+                  entry_name)
 import store.kept (Record, kept_records, with_kept)
 import emit
 import emit (emit_roots_answer)
 import emit.reps (Ctors, laid_vars, has_vars, held_apart, ctor_sums, ctors_of, type_vars,
                   layout_key, no_ctors)
 import front.rows (Dump, EmitterRoot, EmitterCtor, CtorRow, KeyRow, ModuleRow, OrdinalRow,
-                   KnownDefRow)
+                   KnownDefRow, DefRow, SpecRow, TestRow, LawRow)
 import emit.written (CrossedSums, sums_crossed)
 import front.published (Linked, analyse, no_rows, dump_of)
 import front (analyse_pulling_std_with)
 import emit.typing (unknown_type)
 import front.diagnostics (parse_all)
 import check.infer (dump_flag)
-import check.infer.checker (law_root, is_test_owner, cases_root)
 import check.infer.definitions (Extern, prelude_externs, externs_in, module_externs)
 import expand.rewrite (Elaborated, elaborated_natives)
 import emit.layout (Intrinsic, Layouts, intrinsics, layouts)
@@ -55,7 +56,7 @@ import std.random (entropy)
 import std.time (time)
 import syntax.parsing
 import syntax.parsing (no_module)
-import syntax.items (homes_called, homes_declaring)
+import syntax.items (homes_called, homes_declaring, SRequires, SEnsures, spec_kind_text)
 import syntax.exprs (prelude_module)
 import emit.print.counting (int_released_fn, box_released_fn, same_word_fn)
 
@@ -465,7 +466,7 @@ pub fn keep_file<[r]>(
 /// A root a unit is offered: its arity, whether it is pure and takes nothing, which the unit gives a
 /// memo slot, and the root its failure sites name: its own name, or the definition it specialises,
 /// whose text they count from.
-pub type Offered = { name: Bytes, arity: Int, constant: Bool, site: Bytes }
+pub type Offered = { name: RootName, arity: Int, constant: Bool, site: RootName }
 
 /// A constructor of the unit's table and its arity. The runtime holds each argument of one it makes
 /// as its word, which no body reads in place.
@@ -477,7 +478,7 @@ pub type Stated = { ctor: Bytes, key: Option<Bytes>, show: Option<Bytes>, numeri
 
 /// What the fixpoint dropped and why: the emitter refused it or a root it calls, or it calls
 /// `missing`, which the unit does not take.
-pub type Dropped = { function: Bytes, construct: Bytes, missing: Option<Bytes> }
+pub type Dropped = { function: RootName, construct: Bytes, missing: Option<RootName> }
 
 /// What a unit's C was made of: its bodies, before the unit placed them, and its roots as they were
 /// offered, which decide how the unit places each.
@@ -485,7 +486,7 @@ pub type Made = { bodies: List<UnitBody>, offered: List<Offered> }
 
 /// A unit's C, the roots it takes, what it dropped, in the order it dropped them, and what it was
 /// made of.
-pub type Produced = { text: Bytes, taken: List<Bytes>, dropped: List<Dropped>, made: Made }
+pub type Produced = { text: Bytes, taken: List<RootName>, dropped: List<Dropped>, made: Made }
 
 /// A unit produced over answers an earlier run kept and answers the emitter gave now: how many of
 /// the offered roots each covered, the natives the unit calls that the runtime does not implement as
@@ -499,11 +500,12 @@ pub type Emission = {
 }
 
 /// Each root's answer, a group's one body answering for every member.
-pub fn answers_of(rows: List<RootAnswer>) -> Map<Bytes, Answer> =
-  rows.fold(Map::new(), |acc: Map<Bytes, Answer>, r: RootAnswer|
+pub fn answers_of(rows: List<RootAnswer>) -> Map<RootName, Answer> =
+  rows.fold(Map::new(), |acc: Map<RootName, Answer>, r: RootAnswer|
     match r.answer {
       Body(b) -> if b.tables.members.len() == 0 { acc.insert(r.name, r.answer) } else {
-        b.tables.members.fold(acc, |into: Map<Bytes, Answer>, m: Bytes| into.insert(m, r.answer))
+        b.tables.members.fold(acc, |into: Map<RootName, Answer>, m: RootName|
+          into.insert(m, r.answer))
       },
       Refused(_) -> acc.insert(r.name, r.answer),
     })
@@ -513,6 +515,10 @@ pub fn answers_of(rows: List<RootAnswer>) -> Map<Bytes, Answer> =
 /// Ascending by byte, each once.
 fn ordered(xs: List<Bytes>) -> List<Bytes> =
   xs.fold(Map::new(), |acc: Map<Bytes, Bool>, x: Bytes| acc.insert(x, true)).keys()
+
+/// Ascending, each once.
+fn names_ordered(xs: List<RootName>) -> List<RootName> =
+  xs.fold(Map::new(), |acc: Map<RootName, Bool>, x: RootName| acc.insert(x, true)).keys()
 
 /// A shape's names joined by a byte below every name's, so shapes sort as their name lists do.
 fn shape_key(names: List<Bytes>) -> Bytes / {abort.raise} =
@@ -536,38 +542,42 @@ fn positions(keys: List<Bytes>) -> Map<Bytes, Int> / {abort.raise} =
 // --- The fixpoint ---------------------------------------------------------------
 
 /// A body the unit holds once: a group's under its first member.
-pub type UnitBody = { name: Bytes, text: Bytes, tables: Tables }
+pub type UnitBody = { name: RootName, text: Bytes, tables: Tables }
 
-type Round = { bodies: List<UnitBody>, symbols: Map<Bytes, Defined>, out: List<Dropped> }
+type Round = { bodies: List<UnitBody>, symbols: Map<RootName, Defined>, out: List<Dropped> }
 
 type Settled = {
-  taken: List<Bytes>,
+  taken: List<RootName>,
   bodies: List<UnitBody>,
-  symbols: Map<Bytes, Defined>,
+  symbols: Map<RootName, Defined>,
   dropped: List<Dropped>,
 }
 
-fn refused_one(name: Bytes, why: Bytes) -> Dropped =
+fn refused_one(name: RootName, why: Bytes) -> Dropped =
   { function: name, construct: why, missing: None }
 
-fn lost(name: Bytes, callee: Bytes) -> Dropped =
+fn lost(name: RootName, callee: RootName) -> Dropped =
   {
     function: name,
-    construct: Bytes::concat_all([b"`", callee, b"`, which is not in this compiled unit"]),
+    construct: Bytes::concat_all([
+      b"`",
+      root_text(callee),
+      b"`, which is not in this compiled unit",
+    ]),
     missing: Some(callee),
   }
 
 /// `name` dropped for calling `callee`, which the unit refused for `why`: no offer could have taken
 /// the callee.
-fn refused_call(name: Bytes, callee: Bytes, why: Bytes) -> Dropped =
+fn refused_call(name: RootName, callee: RootName, why: Bytes) -> Dropped =
   {
     function: name,
-    construct: Bytes::concat_all([b"`", callee, b"`, refused: ", why]),
+    construct: Bytes::concat_all([b"`", root_text(callee), b"`, refused: ", why]),
     missing: None,
   }
 
 /// The C a body publishes for `name`: its place among the members, or the body's one definition.
-fn defines(name: Bytes, tables: Tables) -> Defined / {abort.raise} = {
+fn defines(name: RootName, tables: Tables) -> Defined / {abort.raise} = {
   let found = range(0, tables.members.len()).fold(0 - 1, |acc: Int, i: Int|
     if acc < 0 && tables.members.get(i) == name { i } else { acc });
   match tables.symbols.at(if found < 0 { 0 } else { found }) {
@@ -576,21 +586,21 @@ fn defines(name: Bytes, tables: Tables) -> Defined / {abort.raise} = {
   }
 }
 
-fn first_missing(calls: List<Bytes>, taken: Map<Bytes, Bool>) -> Option<Bytes> =
-  calls.fold(None, |acc: Option<Bytes>, c: Bytes|
+fn first_missing(calls: List<RootName>, taken: Map<RootName, Bool>) -> Option<RootName> =
+  calls.fold(None, |acc: Option<RootName>, c: RootName|
     match acc { Some(_) -> acc, None -> if taken.contains(c) { None } else { Some(c) } })
 
 /// Whether the body `name` is answered by is placed under `name`, of the roots `taken`: its own, or
 /// a group's under the first of its members taken, which need not be the group's first.
-fn heads_its_group(name: Bytes, tables: Tables, taken: Map<Bytes, Bool>) -> Bool =
-  match tables.members.filter(|m: Bytes| taken.contains(m)).at(0) {
+fn heads_its_group(name: RootName, tables: Tables, taken: Map<RootName, Bool>) -> Bool =
+  match tables.members.filter(|m: RootName| taken.contains(m)).at(0) {
     Some(first) -> first == name,
     None -> true,
   }
 
-fn round_over(answers: Map<Bytes, Answer>, taken: List<Bytes>) -> Round / {abort.raise} = {
-  let set = taken.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
-  taken.fold({ bodies: [], symbols: Map::new(), out: [] }, |r: Round, name: Bytes|
+fn round_over(answers: Map<RootName, Answer>, taken: List<RootName>) -> Round / {abort.raise} = {
+  let set = taken.fold(Map::new(), |acc: Map<RootName, Bool>, n: RootName| acc.insert(n, true));
+  taken.fold({ bodies: [], symbols: Map::new(), out: [] }, |r: Round, name: RootName|
     match answers.get(name) {
       None -> { ..r, out: r.out.push(refused_one(name, b"which the Ply emitter did not answer")) },
       Some(Refused(why)) -> { ..r, out: r.out.push(refused_one(name, why.why)) },
@@ -618,22 +628,22 @@ fn round_over(answers: Map<Bytes, Answer>, taken: List<Bytes>) -> Round / {abort
 /// Dropping a body can drop its callers, so rounds repeat until one drops nothing; what a round
 /// drops it took, so each round takes fewer, and the bodies taken bound the rounds.
 fn settle(
-  answers: Map<Bytes, Answer>,
-  taken: List<Bytes>,
+  answers: Map<RootName, Answer>,
+  taken: List<RootName>,
   dropped: List<Dropped>,
 ) -> Settled / {abort.raise} =
   iterate(
     { taken: taken, dropped: dropped },
     taken.len() + 1,
-    |s: { taken: List<Bytes>, dropped: List<Dropped> }| {
+    |s: { taken: List<RootName>, dropped: List<Dropped> }| {
       let r = round_over(answers, s.taken);
       if r.out.len() == 0 {
         Stop({ taken: s.taken, bodies: r.bodies, symbols: r.symbols, dropped: s.dropped })
       } else {
-        let gone = r.out.fold(Map::new(), |acc: Map<Bytes, Bool>, d: Dropped|
+        let gone = r.out.fold(Map::new(), |acc: Map<RootName, Bool>, d: Dropped|
           acc.insert(d.function, true));
         Continue({
-          taken: s.taken.filter(|n: Bytes| !gone.contains(n)),
+          taken: s.taken.filter(|n: RootName| !gone.contains(n)),
           dropped: s.dropped.concat(r.out),
         })
       }
@@ -643,27 +653,83 @@ fn settle(
 /// The dropped bodies that are errors, given what was `offered`. A body dropped because a callee was
 /// never offered is the offer's doing, as is anything that lost a callee to such a body; every other
 /// drop is a definition the program reaches and cannot run.
-pub fn fatal(offered: List<Bytes>, dropped: List<Dropped>) -> List<Dropped> / {abort.raise} = {
-  let asked = offered.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
-  let narrowed = iterate(Map::new(), dropped.len() + 1, |nar: Map<Bytes, Bool>| {
+pub fn fatal(offered: List<RootName>, dropped: List<Dropped>) -> List<Dropped> / {abort.raise} = {
+  let asked = offered.fold(Map::new(), |acc: Map<RootName, Bool>, n: RootName| acc.insert(n, true));
+  let narrowed = iterate(Map::new(), dropped.len() + 1, |nar: Map<RootName, Bool>| {
     let grew = dropped.filter(|d: Dropped|
       !nar.contains(d.function)
         && (match d.missing { None -> false, Some(m) -> !asked.contains(m) || nar.contains(m) }));
     if grew.len() == 0 { Stop(nar) } else {
-      Continue(grew.fold(nar, |acc: Map<Bytes, Bool>, d: Dropped| acc.insert(d.function, true)))
+      Continue(grew.fold(nar, |acc: Map<RootName, Bool>, d: Dropped| acc.insert(d.function, true)))
     }
   });
   dropped.filter(|d: Dropped| !narrowed.contains(d.function))
 }
 
-/// Whether the runtime enters root `n` of `p`, so the unit takes its entry, `n#entered`: a stored
-/// root, a test's run or the listing of its cases, or a definition `emit.enterable` admits by its
-/// scheme. A law's roots and a root written for a definition (a clause, a requirement) have none.
-fn entered_root(p: Program, n: Bytes) -> Bool / {abort.raise} =
-  if stored_of(n) != None || is_test_owner(n) { true } else if n.ends_with(cases_root(b"")) {
-    is_test_owner(n.slice(0, n.len() - cases_root(b"").len()))
-  } else if n.index_of(b"#") != None { false }
-  else { match p.schemes.get(n) { Some(sc) -> emit::enterable(p.crossing, sc), None -> false } }
+/// Whether the runtime enters root `k` of `p`, so the unit takes its entry: a stored root, a test's
+/// run or the listing of its cases, or a definition `emit.enterable` admits by its scheme. A law's
+/// roots, a clause and a specialisation have none.
+fn entered_root(p: Program, k: RootKey) -> Bool =
+  match k {
+    Stored(_) -> true,
+    Test(_) -> true,
+    Cases(_) -> true,
+    Named(n) -> match p.schemes.get(n) {
+      Some(sc) -> emit::enterable(p.crossing, sc),
+      None -> false,
+    },
+    _ -> false,
+  }
+
+/// The roots a program's answer offers, in the order `Dump.emitter_roots` lists them, each keyed by
+/// what the front end's typed rows say it is, never by reading its name; and the name of each the
+/// rows key none of, which a unit refuses.
+pub type Offers = { keys: List<RootKey>, unkeyed: List<Bytes> }
+
+pub fn offered_roots(dump: Dump) -> Offers / {abort.raise} = {
+  let keyed = rows_keyed(dump);
+  dump.emitter_roots.fold({ keys: [], unkeyed: [] }, |acc: Offers, r: EmitterRoot|
+    match keyed.get(r.root) {
+      Some(k) -> { ..acc, keys: acc.keys.push(k) },
+      None -> { ..acc, unkeyed: acc.unkeyed.push(r.root) },
+    })
+}
+
+/// Each root `dump`'s typed rows say its program may offer, by the name its rows spell it with: a
+/// definition and each `requires` and `ensures` clause it states, a test's run and the listing of
+/// its cases, and a law's guard and body. A test over no cases and a law of no guard key a root no
+/// answer offers. The one place a row the release reads meets a key.
+fn rows_keyed(dump: Dump) -> Map<Bytes, RootKey> / {abort.raise} = {
+  let keyed = |m: Map<Bytes, RootKey>, k: RootKey| m.insert(root_text(root_name(k)), k);
+  let defined = dump.defs.fold(Map::new(), |m: Map<Bytes, RootKey>, d: DefRow|
+    d.spec.fold(
+      { m: keyed(m, Named(d.name)), requires: 0, ensures: 0 },
+      |acc: { m: Map<Bytes, RootKey>, requires: Int, ensures: Int }, s: SpecRow|
+        if s.kind == spec_kind_text(SRequires) {
+          {
+            ..acc,
+            m: keyed(acc.m, Clause({ def: Named(d.name), kind: Requires, n: acc.requires })),
+            requires: acc.requires + 1,
+          }
+        } else if s.kind == spec_kind_text(SEnsures) {
+          {
+            ..acc,
+            m: keyed(acc.m, Clause({ def: Named(d.name), kind: Ensures, n: acc.ensures })),
+            ensures: acc.ensures + 1,
+          }
+        } else { acc },
+    ).m);
+  let tested = dump.tests.fold(defined, |m: Map<Bytes, RootKey>, t: TestRow| {
+    let run = test_key(t.module, t.name);
+    keyed(keyed(m, run), Cases(run))
+  });
+  dump.laws.fold(tested, |m: Map<Bytes, RootKey>, l: LawRow|
+    keyed(keyed(m, law_key(l.module, l.name, LawGuard)), law_key(l.module, l.name, LawBody)))
+}
+
+/// Why a unit refuses a root its program's answer offers that no typed row keys.
+fn unkeyed_why(name: Bytes) -> Bytes =
+  Bytes::concat_all([b"the front end offered `", name, b"` with no typed row to key it by"])
 
 // --- The unit's tables ------------------------------------------------------------
 
@@ -761,7 +827,7 @@ fn place(m: Map<Bytes, Int>, key: Bytes) -> Int / {abort.raise} =
 
 /// The bucket a body compiles in: the top bits of its root id, so it is a function of the name
 /// alone and an edit recompiles the one bucket holding the body.
-pub fn bucket_of(name: Bytes) -> Int = root_id(name) >>> 57
+fn bucket_of(name: RootName) -> Int = root_id(root_text(name)) >>> 57
 
 fn bucket_mark(id: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all([b"/* --- bucket ", hex_digit(id / 16), hex_digit(id % 16), b" --- */"])
@@ -824,7 +890,7 @@ fn resolved(
   hs: List<Hole>,
   keys: List<Option<Bytes>>,
   tables: Tables,
-  site: Bytes,
+  site: RootName,
   table: Bytes,
   local: Map<Bytes, Int>,
 ) -> Bytes / {abort.raise} = {
@@ -834,8 +900,12 @@ fn resolved(
       let h = hs.get(i);
       let value = match keys.get(i) {
         None ->
-          ascii_of_int(if h.digits.len() == 0 { root_id(site) }
-          else { root_id(tables.members.get(digits(h.digits))) }),
+          ascii_of_int(
+            root_id(
+              root_text(if h.digits.len() == 0 { site }
+              else { tables.members.get(digits(h.digits)) }),
+            ),
+          ),
         Some(k) -> Bytes::concat_all([table, b"[", ascii_of_int(place(local, k)), b"]"]),
       };
       { from: h.close + 2, out: s.out.push(text.slice(s.from, h.open)).push(value) }
@@ -846,7 +916,7 @@ fn resolved(
 
 // --- What the unit says about itself ---------------------------------------------
 
-type Taken = { name: Bytes, arity: Int, symbol: Bytes, entry: Bytes, head: Head }
+type Taken = { name: RootName, arity: Int, symbol: Bytes, entry: Bytes, head: Head }
 
 fn counted(label: Bytes, n: Int) -> Bytes = Bytes::concat_all([label, b" ", ascii_of_int(n), b"\n"])
 
@@ -869,13 +939,16 @@ fn exports_text(
   dropped: List<Dropped>,
   p: Pools,
   stated: List<Stated>,
-  entered: List<Bytes>,
+  entered: List<RootName>,
 ) -> Bytes / {abort.raise} = {
-  let held = taken.fold(Map::new(), |acc: Map<Bytes, Bool>, t: Taken| acc.insert(t.name, true));
+  let held = taken.fold(Map::new(), |acc: Map<RootName, Bool>, t: Taken| acc.insert(t.name, true));
   // `-` where the type states none, and `!` for a function the unit does not take, which a value
   // read through it there is refused by.
   let written = |f: Option<Bytes>|
-    match f { None -> b"-", Some(name) -> if held.contains(name) { name } else { b"!" } };
+    match f {
+      None -> b"-",
+      Some(name) -> if held.contains(root_name(Named(name))) { name } else { b"!" },
+    };
   Bytes::concat_all([
     lines(
       b"helpers",
@@ -887,7 +960,8 @@ fn exports_text(
     counted(b"modules", modules),
     counted(b"refused", dropped.len()),
     Bytes::concat_all(
-      dropped.map(|d: Dropped| Bytes::concat_all([d.function, b"\n", d.construct, b"\n"])),
+      dropped.map(|d: Dropped|
+        Bytes::concat_all([root_text(d.function), b"\n", d.construct, b"\n"])),
     ),
     lines(b"builtins", p.builtins),
     lines(b"fields", p.fields),
@@ -915,7 +989,9 @@ fn exports_text(
     b"bytes slices are views\n",
     b"options held as their payload's word\n",
     // The release's runtime reads these lines as nothing.
-    Bytes::concat_all(entered.map(|r: Bytes| Bytes::concat_all([b"entered ", r, b"\n"]))),
+    Bytes::concat_all(
+      entered.map(|r: RootName| Bytes::concat_all([b"entered ", root_text(r), b"\n"])),
+    ),
   ])
 }
 
@@ -982,7 +1058,7 @@ fn laid(
       taken.map(|t: Taken|
         Bytes::concat_all([
           b"  { \"",
-          escaped(t.name),
+          escaped(root_text(t.name)),
           b"\", (void *)&",
           t.entry,
           b", ",
@@ -1002,12 +1078,12 @@ fn laid(
 // --- Placing it -----------------------------------------------------------------
 
 type Placing = {
-  name: Bytes,
+  name: RootName,
   bucket: Int,
   text: Bytes,
-  reaches: List<Bytes>,
+  reaches: List<RootName>,
   /// The definitions its C defines: a group's members, or its own.
-  defines: List<Bytes>,
+  defines: List<RootName>,
   /// The static objects its C names, which the unit's tail defines.
   statics: List<Bytes>,
 }
@@ -1016,8 +1092,8 @@ type Placing = {
 type Marked = { body: UnitBody, holes: List<Hole>, keys: List<Option<Bytes>> }
 
 /// What a body's C names of the unit's definitions: its own, a group's every member, and its calls.
-fn reaches_of(name: Bytes, tables: Tables) -> List<Bytes> =
-  ordered(
+fn reaches_of(name: RootName, tables: Tables) -> List<RootName> =
+  names_ordered(
     tables.calls.map(root_name).concat(if tables.members.len() == 0 { [name] }
     else { tables.members }),
   )
@@ -1079,7 +1155,12 @@ fn far_ended(reached: List<Taken>) -> Bytes =
   }
 
 fn bucket_key(p: Placing) -> Bytes / {abort.raise} =
-  Bytes::concat_all([hex_digit(p.bucket / 16), hex_digit(p.bucket % 16), b"\x00", p.name])
+  Bytes::concat_all([
+    hex_digit(p.bucket / 16),
+    hex_digit(p.bucket % 16),
+    b"\x00",
+    root_text(p.name),
+  ])
 
 /// The runtime's head and the emitter's part of it, which every part compiles after, then a marked
 /// bucket per class of names, which declares its table, the static objects its bodies name and the
@@ -1092,7 +1173,7 @@ fn assembled(
   runtime: Runtime,
   bodies: List<Placing>,
   sizes: Map<Int, Int>,
-  taken: Map<Bytes, Taken>,
+  taken: Map<RootName, Taken>,
   statics: Bytes,
   exports: Bytes,
   tables: Bytes,
@@ -1105,11 +1186,11 @@ fn assembled(
     else { acc.push([p]) }
   });
   let reached_by = |group: List<Placing>| {
-    let here = group.fold(Map::new(), |acc: Map<Bytes, Bool>, p: Placing|
-      p.defines.fold(acc, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)));
-    ordered(group.fold([], |acc: List<Bytes>, p: Placing| acc.concat(p.reaches))).fold(
+    let here = group.fold(Map::new(), |acc: Map<RootName, Bool>, p: Placing|
+      p.defines.fold(acc, |a: Map<RootName, Bool>, n: RootName| a.insert(n, true)));
+    names_ordered(group.fold([], |acc: List<RootName>, p: Placing| acc.concat(p.reaches))).fold(
       [],
-      |acc: List<Taken>, name: Bytes|
+      |acc: List<Taken>, name: RootName|
         if here.contains(name) { acc }
         else { match taken.get(name) { Some(t) -> acc.push(t), None -> acc } },
     )
@@ -1139,10 +1220,10 @@ fn assembled(
             ),
           ),
           Bytes::concat_all(
-            ordered(group.fold([], |acc: List<Bytes>, p: Placing| acc.concat(p.reaches))).map(
-              |name: Bytes|
-                match taken.get(name) { Some(t) -> prototype(t.symbol, t.head), None -> b"" },
-            ),
+            names_ordered(
+              group.fold([], |acc: List<RootName>, p: Placing| acc.concat(p.reaches)),
+            ).map(|name: RootName|
+              match taken.get(name) { Some(t) -> prototype(t.symbol, t.head), None -> b"" }),
           ),
           far_calls(far_table(group.get(0).bucket), reached),
           b"\n",
@@ -1167,29 +1248,29 @@ pub fn produce(
   ctors: List<Ctor>,
   offered: List<Offered>,
   modules: Int,
-  answers: Map<Bytes, Answer>,
+  answers: Map<RootName, Answer>,
   inputs: Map<Bytes, Bytes>,
   stated: List<Stated> = [],
 ) -> Produced / {abort.raise} = {
-  let arity = offered.fold(Map::new(), |acc: Map<Bytes, Offered>, o: Offered|
+  let arity = offered.fold(Map::new(), |acc: Map<RootName, Offered>, o: Offered|
     acc.insert(o.name, o));
-  let s = settle(answers, ordered(offered.map(|o: Offered| o.name)), []);
-  let published = |n: Bytes|
+  let s = settle(answers, names_ordered(offered.map(|o: Offered| o.name)), []);
+  let published = |n: RootName|
     match s.symbols.get(n) {
       Some(d) -> d,
       None -> panic("every definition a unit takes emitted, and an emitted body publishes its C"),
     };
-  let constants = s.taken.filter(|n: Bytes|
+  let constants = s.taken.filter(|n: RootName|
     match arity.get(n) { Some(o) -> o.constant, None -> false });
   let statics = statics_placed(s.bodies);
-  let pools = pools_of(s.bodies, statics, constants.map(|n: Bytes| published(n).entry));
+  let pools = pools_of(s.bodies, statics, constants.map(|n: RootName| published(n).entry));
   let placed = placed_of(pools);
   let laid_statics = Bytes::concat_all(
     statics.map(|d: StaticDef|
       static_c(
         d,
         |f: Bytes| place(placed.fields, f),
-        |k: RootKey| symbol_of(root_name(k)),
+        |k: RootKey| symbol_of(root_text(root_name(k))),
         |digest: Bytes|
           match inputs.get(digest) {
             Some(b) -> b,
@@ -1201,7 +1282,7 @@ pub fn produce(
       )),
   );
   let tags = positions(ctors.map(|c: Ctor| c.name));
-  let taken = s.taken.map(|n: Bytes| {
+  let taken = s.taken.map(|n: RootName| {
     let d = published(n);
     {
       name: n,
@@ -1222,9 +1303,9 @@ pub fn produce(
               String::of_bytes_lossy(
                 Bytes::concat_all([
                   b"`",
-                  k.name,
+                  root_text(k.name),
                   b"` calls `",
-                  callee,
+                  root_text(callee),
                   b"` as ",
                   prototype(d.symbol, e.head),
                   b"which it defines as ",
@@ -1282,20 +1363,24 @@ pub fn produce(
   let rows = keyed.fold([], |acc: List<BucketRow>, b: Int, ks: Map<Bytes, Bool>|
     if ks.len() == 0 { acc }
     else { acc.push({ id: b, places: ks.keys().map(|k: Bytes| unit_place(k, placed, tags)) }) });
-  let took = s.taken.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
+  let took = s.taken.fold(Map::new(), |acc: Map<RootName, Bool>, n: RootName| acc.insert(n, true));
   let exports = exports_text(
     runtime.helpers,
     ctors,
     taken,
-    constants.map(|n: Bytes|
-      Bytes::concat_all([n, b" ", ascii_of_int(place(placed.lambdas, published(n).entry))])),
+    constants.map(|n: RootName|
+      Bytes::concat_all([
+        root_text(n),
+        b" ",
+        ascii_of_int(place(placed.lambdas, published(n).entry)),
+      ])),
     modules,
     s.dropped,
     pools,
     stated,
-    offered.filter(|o: Offered| took.contains(root_name(Entered(o.name)))).map(|o: Offered| o.name),
+    offered.filter(|o: Offered| took.contains(entry_name(o.name))).map(|o: Offered| o.name),
   );
-  let by_name = taken.fold(Map::new(), |acc: Map<Bytes, Taken>, t: Taken| acc.insert(t.name, t));
+  let by_name = taken.fold(Map::new(), |acc: Map<RootName, Taken>, t: Taken| acc.insert(t.name, t));
   {
     text: assembled(
       runtime,
@@ -1316,39 +1401,39 @@ pub fn produce(
 // --- What a root runs ----------------------------------------------------------
 
 /// The names a body answers for: a group's members, or its own.
-fn answered(body: UnitBody) -> List<Bytes> =
+fn answered(body: UnitBody) -> List<RootName> =
   if body.tables.members.len() == 0 { [body.name] } else { body.tables.members }
 
 /// How a body's roots were offered, which places them: a constant is held rather than called.
-fn offered_as(roots: Map<Bytes, Offered>, body: UnitBody) -> Bytes =
+fn offered_as(roots: Map<RootName, Offered>, body: UnitBody) -> Bytes =
   Bytes::concat_all(
-    answered(body).map(|name: Bytes|
+    answered(body).map(|name: RootName|
       match roots.get(name) {
         Some(o) ->
           Bytes::concat_all([
-            name,
+            root_text(name),
             b" ",
             ascii_of_int(o.arity),
             if o.constant { b" constant\n" } else { b"\n" },
           ]),
-        None -> name.concat(b" unoffered\n"),
+        None -> root_text(name).concat(b" unoffered\n"),
       }),
   )
 
 /// What each root of a unit runs, as one digest: its own body and every body it can call, whatever
 /// the calls' cycles. A body is digested as the unit keeps it, before placing, so a root that two
 /// compilers or two units made into the same code is named alike by both.
-pub fn codes(made: Made) -> Map<Bytes, Bytes> / {abort.raise} = {
+pub fn codes(made: Made) -> Map<RootName, Bytes> / {abort.raise} = {
   let bodies = made.bodies;
   let n = bodies.len();
-  let index = range(0, n).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
-    answered(bodies.get(i)).fold(acc, |m: Map<Bytes, Int>, name: Bytes| m.insert(name, i)));
-  let roots = made.offered.fold(Map::new(), |acc: Map<Bytes, Offered>, o: Offered|
+  let index = range(0, n).fold(Map::new(), |acc: Map<RootName, Int>, i: Int|
+    answered(bodies.get(i)).fold(acc, |m: Map<RootName, Int>, name: RootName| m.insert(name, i)));
+  let roots = made.offered.fold(Map::new(), |acc: Map<RootName, Offered>, o: Offered|
     acc.insert(o.name, o));
   let own = bodies.map(|b: UnitBody|
     blake3(
       Bytes::concat_all([
-        blake3(b.name),
+        blake3(root_text(b.name)),
         blake3(b.text),
         blake3(bin::encode(b.tables, tables_bin())),
         blake3(offered_as(roots, b)),
@@ -1370,9 +1455,10 @@ pub fn codes(made: Made) -> Map<Bytes, Bytes> / {abort.raise} = {
     );
     comp.fold(done, |m: Map<Int, Bytes>, i: Int| m.insert(i, digest))
   });
-  range(0, n).fold(Map::new(), |acc: Map<Bytes, Bytes>, i: Int| {
+  range(0, n).fold(Map::new(), |acc: Map<RootName, Bytes>, i: Int| {
     let code = blake3(own.get(i).concat(match reached.get(i) { Some(d) -> d, None -> b"" }));
-    answered(bodies.get(i)).fold(acc, |m: Map<Bytes, Bytes>, name: Bytes| m.insert(name, code))
+    answered(bodies.get(i)).fold(acc, |m: Map<RootName, Bytes>, name: RootName|
+      m.insert(name, code))
   })
 }
 
@@ -1381,8 +1467,8 @@ pub fn codes(made: Made) -> Map<Bytes, Bytes> / {abort.raise} = {
 /// What the front end's answer says the emitter works over: each root, the modules in program order,
 /// and what each module imports.
 type Program = {
-  roots: Map<Bytes, EmitterRoot>,
-  keys: Map<Bytes, Bytes>,
+  roots: Map<RootName, EmitterRoot>,
+  keys: Map<RootName, Bytes>,
   modules: List<ModuleRow>,
   imports: Map<Bytes, List<Bytes>>,
   sources: List<Bytes>,
@@ -1393,7 +1479,9 @@ type Program = {
   crossing: CrossedSums,
 }
 
-fn program_of(dump: Dump, sources: List<Bytes>) -> Program = {
+fn program_of(dump: Dump, sources: List<Bytes>) -> Program / {abort.raise} = {
+  let keyed = rows_keyed(dump);
+  let named = |row: Bytes| match keyed.get(row) { Some(k) -> Some(root_name(k)), None -> None };
   let by_name = dump.modules.fold(Map::new(), |acc: Map<Bytes, ModuleRow>, m: ModuleRow|
     acc.insert(m.name, m));
   let reads = dump.embeds.fold(Map::new(), |acc: Map<Int, List<Bytes>>, e: EmbedAt|
@@ -1412,9 +1500,13 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program = {
     acc.insert(row.name, row.scheme));
   let prelude = prelude_module().concat(b".");
   {
-    roots: dump.emitter_roots.fold(Map::new(), |acc: Map<Bytes, EmitterRoot>, root: EmitterRoot|
-      acc.insert(root.root, root)),
-    keys: dump.keys.fold(Map::new(), |acc: Map<Bytes, Bytes>, k: KeyRow| acc.insert(k.root, k.key)),
+    roots: dump.emitter_roots.fold(
+      Map::new(),
+      |acc: Map<RootName, EmitterRoot>, root: EmitterRoot|
+        match named(root.root) { Some(n) -> acc.insert(n, root), None -> acc },
+    ),
+    keys: dump.keys.fold(Map::new(), |acc: Map<RootName, Bytes>, k: KeyRow|
+      match named(k.root) { Some(n) -> acc.insert(n, k.key), None -> acc }),
     // The emitter walks modules in the front end's ordinal order, so this order is not ours to pick.
     modules: dump.ordinals.fold([], |acc: List<ModuleRow>, o: OrdinalRow|
       match by_name.get(o.module) { Some(m) -> acc.push(m), None -> acc }),
@@ -1471,7 +1563,7 @@ fn imported(program: Program, modules: List<Bytes>) -> Map<Bytes, Bool> / {abort
 /// module's text and the program's `types`, which together say how it is written. `None` for a root
 /// with no key or no place, which is asked again every time.
 fn root_material(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> / {abort.raise} = {
-  let name = root_name(k);
+  let name = root_text(root_name(k));
   match k {
     Written(_) -> {
       let home = module_of(k);
@@ -1486,7 +1578,7 @@ fn root_material(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> / 
     },
     At(a) ->
       a.lent.fold(
-        match definition_material(program, a.def) {
+        match definition_material(program, root_name(Named(a.def))) {
           Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
           None -> None,
         },
@@ -1500,20 +1592,18 @@ fn root_material(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> / 
           },
       ),
     // An entry, and a stored root, is written from what its definition takes and answers.
-    Entered(n) -> match definition_material(program, match stored_of(n) {
-        Some(of) -> of,
-        None -> n,
-      }) {
+    Entered(e) -> match definition_material(
+        program,
+        root_name(match e { Stored(s) -> s, _ -> e }),
+      ) {
       Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
       None -> None,
     },
-    _ -> match stored_of(name) {
-      Some(of) -> match definition_material(program, of) {
-        Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
-        None -> None,
-      },
-      None -> definition_material(program, name),
+    Stored(s) -> match definition_material(program, root_name(s)) {
+      Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
+      None -> None,
     },
+    _ -> definition_material(program, root_name(k)),
   }
 }
 
@@ -1546,7 +1636,7 @@ fn types_material(dump: Dump) -> Bytes / {abort.raise} =
     ),
   )
 
-fn definition_material(program: Program, name: Bytes) -> Option<Bytes> =
+fn definition_material(program: Program, name: RootName) -> Option<Bytes> =
   match program.keys.get(name) {
     None -> None,
     Some(key) -> match program.roots.get(name) {
@@ -1557,7 +1647,7 @@ fn definition_material(program: Program, name: Bytes) -> Option<Bytes> =
         else {
           Some(
             Bytes::concat_all([
-              name,
+              root_text(name),
               b"\x00",
               key,
               b"\x00",
@@ -1596,11 +1686,11 @@ fn key_digest(k: RootKey) -> Bytes / {abort.raise} = blake3(key_bytes(k))
 
 /// A group's kept body stands only when every member is offered and each member's kept answer is
 /// that same group; otherwise the group is asked again, and the emitter groups what is wanted now.
-fn standing(looked: Map<Bytes, Answer>, offered: Map<Bytes, Bool>) -> Map<Bytes, Answer> =
-  looked.fold(Map::new(), |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
+fn standing(looked: Map<RootName, Answer>, offered: Map<RootName, Bool>) -> Map<RootName, Answer> =
+  looked.fold(Map::new(), |acc: Map<RootName, Answer>, n: RootName, a: Answer|
     match a {
       Refused(_) -> acc,
-      Body(b) -> if b.tables.members.fold(true, |ok: Bool, m: Bytes|
+      Body(b) -> if b.tables.members.fold(true, |ok: Bool, m: RootName|
           ok && offered.contains(m)
             && (match looked.get(m) {
               Some(Body(other)) -> other.tables.members == b.tables.members,
@@ -1619,22 +1709,22 @@ type Kept = { answer: Answer, calls: List<Bytes>, callees: List<Option<Bytes>> }
 derive bin for Kept
 
 /// The roots `a` calls, by name, ascending, each once.
-fn callees_of(a: Answer) -> List<Bytes> =
-  match a { Body(b) -> ordered(b.tables.calls.map(root_name)), Refused(_) -> [] }
+fn callees_of(a: Answer) -> List<RootName> =
+  match a { Body(b) -> names_ordered(b.tables.calls.map(root_name)), Refused(_) -> [] }
 
-fn kept_of(keys: Map<Bytes, Bytes>, a: Answer) -> Kept / {abort.raise} =
+fn kept_of(keys: Map<RootName, Bytes>, a: Answer) -> Kept / {abort.raise} =
   match a {
     Body(b) ->
       {
         answer: Body({ ..b, tables: { ..b.tables, calls: [] } }),
         calls: b.tables.calls.map(key_digest),
-        callees: callees_of(a).map(|c: Bytes| keys.get(c)),
+        callees: callees_of(a).map(|c: RootName| keys.get(c)),
       },
     Refused(_) -> { answer: a, calls: [], callees: [] },
   }
 
 /// Whether each root `a`'s body calls still has the key `callees` says it had.
-fn holds(keys: Map<Bytes, Bytes>, a: Answer, callees: List<Option<Bytes>>) -> Bool = {
+fn holds(keys: Map<RootName, Bytes>, a: Answer, callees: List<Option<Bytes>>) -> Bool = {
   let names = callees_of(a);
   names.len() == callees.len()
     && range(0, names.len()).all(|i: Int|
@@ -1644,7 +1734,7 @@ fn holds(keys: Map<Bytes, Bytes>, a: Answer, callees: List<Option<Bytes>>) -> Bo
 /// The answer `k` keeps, its calls named again by the keys `resolved` holds of their digests, where
 /// it still stands: none where a root it calls is kept no more or a callee's key moved.
 fn standing_kept(
-  keys: Map<Bytes, Bytes>,
+  keys: Map<RootName, Bytes>,
   resolved: Map<Bytes, RootKey>,
   k: Kept,
 ) -> Option<Answer> =
@@ -1668,16 +1758,16 @@ fn standing_kept(
 /// roots it calls, a key read once however many answers call it, and the digests of those keys,
 /// which the store holds.
 fn kept_answers<| e>(
-  keys: Map<Bytes, Bytes>,
-  materials: Map<Bytes, Bytes>,
+  keys: Map<RootName, Bytes>,
+  materials: Map<RootName, Bytes>,
   read: (Bytes) -> Option<Bytes> / e,
-) -> { answers: Map<Bytes, Answer>, known: Map<Bytes, Bool> } / {abort.raise | e} = {
-  let found = materials.fold(Map::new(), |acc: Map<Bytes, Kept>, n: Bytes, m: Bytes|
+) -> { answers: Map<RootName, Answer>, known: Map<Bytes, Bool> } / {abort.raise | e} = {
+  let found = materials.fold(Map::new(), |acc: Map<RootName, Kept>, n: RootName, m: Bytes|
     match read(answer_key(m)) {
       Some(b) -> match bin::decode(b, kept_bin()) { Ok(k) -> acc.insert(n, k), Err(_) -> acc },
       None -> acc,
     });
-  let digests = found.fold(Map::new(), |acc: Map<Bytes, Bool>, _: Bytes, k: Kept|
+  let digests = found.fold(Map::new(), |acc: Map<Bytes, Bool>, _: RootName, k: Kept|
     k.calls.fold(acc, |a: Map<Bytes, Bool>, d: Bytes| a.insert(d, true)));
   let resolved = digests.fold(Map::new(), |acc: Map<Bytes, RootKey>, d: Bytes, _: Bool|
     match read(key_key(d)) {
@@ -1685,7 +1775,7 @@ fn kept_answers<| e>(
       None -> acc,
     });
   {
-    answers: found.fold(Map::new(), |acc: Map<Bytes, Answer>, n: Bytes, k: Kept|
+    answers: found.fold(Map::new(), |acc: Map<RootName, Answer>, n: RootName, k: Kept|
       match standing_kept(keys, resolved, k) { Some(a) -> acc.insert(n, a), None -> acc }),
     known: resolved.fold(Map::new(), |acc: Map<Bytes, Bool>, d: Bytes, _: RootKey|
       acc.insert(d, true)),
@@ -1697,15 +1787,15 @@ fn kept_answers<| e>(
 /// holds it yet; and `known` with those digests. A refusal is never kept: what the emitter refuses
 /// may be the program's doing, which no material names.
 fn answers_kept<| e>(
-  keys: Map<Bytes, Bytes>,
-  materials: Map<Bytes, Bytes>,
-  answers: Map<Bytes, Answer>,
+  keys: Map<RootName, Bytes>,
+  materials: Map<RootName, Bytes>,
+  answers: Map<RootName, Answer>,
   known: Map<Bytes, Bool>,
   read: (Bytes) -> Option<Bytes> / e,
 ) -> { records: List<Record>, known: Map<Bytes, Bool> } / {abort.raise | e} =
   answers.fold(
     { records: [], known: known },
-    |acc: { records: List<Record>, known: Map<Bytes, Bool> }, n: Bytes, a: Answer|
+    |acc: { records: List<Record>, known: Map<Bytes, Bool> }, n: RootName, a: Answer|
       match ((a, materials.get(n))) {
         (Body(b), Some(m)) -> {
           let called = b.tables.calls.fold(
@@ -1781,18 +1871,18 @@ fn emitter_answers(
   )
 }
 
-/// The calls the emitter's work is dealt over. Each repeats the front end's work over its modules'
-/// imports, so more of them lose more than they gain.
-fn pieces() -> Int = 2
+/// The calls a place's work is dealt over, run at once, about as many as the cores. Each repeats
+/// the front end's work over its modules' imports, so more of them lose more than they gain.
+fn pieces() -> Int = 8
 
 type Piece = { weight: Int, roots: List<RootKey> }
 
 /// `missed` as at most `pieces()` lists that lower about as much each: the longest module first onto
-/// the lightest list, and a module's roots together, since the emitter groups what one call wants.
-/// A specialisation that runs a lambda goes with its lender's module, which its call lowers too.
+/// the lightest list, and a module's roots together (`dealt_module`), since the emitter groups what
+/// one call wants.
 fn dealt(p: Program, missed: List<RootKey>) -> List<List<RootKey>> / {abort.raise} = {
   let by_module = missed.fold(Map::new(), |acc: Map<Bytes, List<RootKey>>, k: RootKey| {
-    let m = match key_lent(k).at(0) { Some(f) -> module_of(f.owner), None -> module_of(k) };
+    let m = dealt_module(k);
     acc.insert(m, List::push(match acc.get(m) { Some(xs) -> xs, None -> [] }, k))
   });
   let lengths = p.modules.fold(Map::new(), |acc: Map<Bytes, Int>, m: ModuleRow|
@@ -1845,9 +1935,9 @@ fn answers_at_once(
 /// caller's code is written against.
 fn handings_held(
   before: Map<Bytes, Published>,
-  answers: Map<Bytes, Answer>,
+  answers: Map<RootName, Answer>,
 ) -> Map<Bytes, Published> =
-  answers.fold(before, |acc: Map<Bytes, Published>, _: Bytes, a: Answer|
+  answers.fold(before, |acc: Map<Bytes, Published>, _: RootName, a: Answer|
     match a {
       Body(b) ->
         b.tables.handings.fold(acc, |m: Map<Bytes, Published>, h: Published| m.insert(h.def, h)),
@@ -1866,96 +1956,170 @@ fn written_stale(a: Answer, held: Map<Bytes, Published>) -> Bool =
 
 /// Each call of a body among `taken` written against a handing other than the one its callee
 /// publishes in `answers`: what the rounds settled wrongly, which no unit ships.
-fn misassumed_in(answers: Map<Bytes, Answer>, taken: List<Bytes>) -> List<Misassumed> = {
+fn misassumed_in(answers: Map<RootName, Answer>, taken: List<RootName>) -> List<Misassumed> = {
   let held = handings_held(Map::new(), answers);
-  taken.fold([], |acc: List<Misassumed>, n: Bytes|
+  taken.fold([], |acc: List<Misassumed>, n: RootName|
     match answers.get(n) {
       Some(Body(b)) ->
         b.tables.assumed.fold(acc, |a: List<Misassumed>, x: Published|
           if agrees(x, held.get(x.def)) { a }
-          else { a.push({ caller: n, assumed: x, published: held.get(x.def) }) }),
+          else { a.push({ caller: root_text(n), assumed: x, published: held.get(x.def) }) }),
       _ -> acc,
     })
 }
 
-/// The names among `answers` the emitter is asked for again: each written against a handing `held`
-/// no longer holds, and with it each definition of its recursion group, which settle together.
-fn stale_of(answers: Map<Bytes, Answer>, held: Map<Bytes, Published>) -> List<Bytes> =
-  answers.fold([], |acc: List<Bytes>, n: Bytes, a: Answer|
+/// The roots among `answers`, each by its key in `keys`, the emitter is asked for again: each
+/// written against a handing `held` no longer holds, and with it each definition of its recursion
+/// group, which settle together.
+fn stale_of(
+  answers: Map<RootName, Answer>,
+  held: Map<Bytes, Published>,
+  keys: Map<RootName, RootKey>,
+) -> List<RootKey> =
+  answers.fold([], |acc: List<RootKey>, n: RootName, a: Answer|
     if !written_stale(a, held) { acc } else {
-      let group = match a { Body(b) -> b.tables.group, Refused(_) -> [] };
-      [n].concat(group).fold(acc, |xs: List<Bytes>, g: Bytes|
+      let own = match keys.get(n) { Some(k) -> [k], None -> [] };
+      let group = match a { Body(b) -> b.tables.group.map(Named), Refused(_) -> [] };
+      own.concat(group).fold(acc, |xs: List<RootKey>, g: RootKey|
         if xs.contains(g) { xs } else { xs.push(g) })
     })
 
 /// `kept` without each answer whose recursion group holds a definition `kept` lacks, which is asked
 /// for again with the rest of its group.
 fn groups_whole(
-  kept: Map<Bytes, Answer>,
-  asked: List<Bytes>,
-) -> Map<Bytes, Answer> / {abort.raise} =
-  iterate(kept, kept.len() + 1, |k: Map<Bytes, Answer>| {
-    let split = k.fold([], |acc: List<Bytes>, n: Bytes, a: Answer|
+  kept: Map<RootName, Answer>,
+  asked: List<RootName>,
+) -> Map<RootName, Answer> / {abort.raise} =
+  iterate(kept, kept.len() + 1, |k: Map<RootName, Answer>| {
+    let split = k.fold([], |acc: List<RootName>, n: RootName, a: Answer|
       match a {
-        Body(b) -> if b.tables.group.any(|g: Bytes| asked.contains(g) && !k.contains(g)) {
-          acc.push(n)
-        } else { acc },
+        Body(b) -> if b.tables.group.any(|g: Bytes| {
+            let member = root_name(Named(g));
+            asked.contains(member) && !k.contains(member)
+          }) { acc.push(n) }
+        else { acc },
         Refused(_) -> acc,
       });
     if split.len() == 0 { Stop(k) }
-    else { Continue(split.fold(k, |m: Map<Bytes, Answer>, n: Bytes| m.remove(n))) }
+    else { Continue(split.fold(k, |m: Map<RootName, Answer>, n: RootName| m.remove(n))) }
   })
 
-/// What the emitter answers for `ask`, dealt over calls, with `held` the answers in hand and
-/// `published` the handings of the rest: round after round, each answer written against a handing the
-/// round before moved is asked for again with its group, until none is, so the answers are those
-/// one call over all of them makes. `room` is the rounds the unit has left; at none, the error
-/// names what still moved. Each call's answers are handed to `kept` as they come back, with the
-/// digests of the keys the store is known to hold, which it answers grown.
+/// Where each module's definitions settle their handings: past every module it imports or reads a
+/// type's functions from (its home), so each callee of a body outside the body's own module is
+/// answered at an earlier place. Imports form no cycle, so the places are found within a step a
+/// module.
+fn places_of(p: Program) -> Map<Bytes, Int> / {abort.raise} = {
+  let names = p.modules.map(|m: ModuleRow| m.name);
+  let texts = p.modules.fold(Map::new(), |acc: Map<Bytes, Bytes>, m: ModuleRow|
+    match text_at(p, m.index) { Some(t) -> acc.insert(m.name, t), None -> acc });
+  let declared = homes_declaring(|h: Bytes| texts.get(h));
+  let deps = names.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, m: Bytes| {
+    let homes = match texts.get(m) {
+      Some(t) -> homes_called(m, parsing::start(t).input, || declared),
+      None -> [],
+    };
+    acc.insert(
+      m,
+      (match p.imports.get(m) { Some(xs) -> xs, None -> [] }).concat(homes).filter(|d: Bytes|
+        d != m),
+    )
+  });
+  iterate(Map::new(), names.len() + 2, |at: Map<Bytes, Int>| {
+    let next = names.fold(Map::new(), |acc: Map<Bytes, Int>, m: Bytes|
+      acc.insert(
+        m,
+        (match deps.get(m) { Some(ds) -> ds, None -> [] }).fold(0, |n: Int, d: Bytes| {
+          let past = match at.get(d) { Some(l) -> l + 1, None -> 0 };
+          if past > n { past } else { n }
+        }),
+      ));
+    if next == at { Stop(next) } else { Continue(next) }
+  })
+}
+
+/// The module a root is lowered with: a specialisation that runs a lambda goes with its lender's
+/// module, which its call lowers too.
+fn dealt_module(k: RootKey) -> Bytes / {abort.raise} =
+  match key_lent(k).at(0) { Some(f) -> module_of(f.owner), None -> module_of(k) }
+
+/// How far `answers_settled` has come: the answers it has had, the kept answers still standing, how
+/// many roots it has asked the emitter for, the digests of keys the store is known to hold, and the
+/// roots of the place it is at not yet asked for.
+type Settling = {
+  fresh: Map<RootName, Answer>,
+  held: Map<RootName, Answer>,
+  asked: Int,
+  known: Map<Bytes, Bool>,
+  pending: List<RootKey>,
+}
+
+/// What the emitter answers for `ask`, and how many roots it was asked for, with `held` the answers
+/// in hand, each of a root `keys` holds, and `published` the handings of the rest. The roots are
+/// asked for place by place (`places_of`), a place's calls at once with the handings each earlier
+/// place published, so a body's every callee has its final handing before the body is written, and
+/// none is asked for twice. A kept answer of a place written against a handing that moved since is
+/// asked for again there, with its group. Each call's answers are handed to `kept` as they come
+/// back, with the digests of the keys the store is known to hold, which it answers grown.
 fn answers_settled<| e>(
   runtime: Runtime,
   dump: Dump,
   p: Program,
   ctors: List<Ctor>,
-  held: Map<Bytes, Answer>,
+  held: Map<RootName, Answer>,
   published: Map<Bytes, Published>,
   ask: List<RootKey>,
-  keys: Map<Bytes, RootKey>,
-  room: Int,
-  kept: (Map<Bytes, Answer>, Map<Bytes, Bool>) -> Map<Bytes, Bool> / e,
+  keys: Map<RootName, RootKey>,
+  kept: (Map<RootName, Answer>, Map<Bytes, Bool>) -> Map<Bytes, Bool> / e,
   known: Map<Bytes, Bool>,
-) -> Result<Map<Bytes, Answer>, Bytes> / {abort.raise | e} = {
-  let settled = iterate(
-    { fresh: Map::new(), ask: ask, room: room, known: known },
-    room + 1,
-    |s: { fresh: Map<Bytes, Answer>, ask: List<RootKey>, room: Int, known: Map<Bytes, Bool> }|
-      if s.ask.len() == 0 || s.room <= 0 { Stop(s) } else {
-        let pieces = dealt(p, s.ask);
-        let before = handings_held(handings_held(published, held), s.fresh);
-        let got = answers_of(
-          answers_at_once(runtime, dump, p, ctors, pieces, 0, pieces.len(), 64, before.values()),
-        );
-        let fresh = got.fold(s.fresh, |m: Map<Bytes, Answer>, n: Bytes, a: Answer| m.insert(n, a));
-        let all = fresh.fold(held, |m: Map<Bytes, Answer>, n: Bytes, a: Answer| m.insert(n, a));
-        Continue({
-          fresh: fresh,
-          ask: stale_of(all, handings_held(published, all)).map(|n: Bytes|
-            match keys.get(n) { Some(k) -> k, None -> Named(n) }),
-          room: s.room - 1,
-          known: kept(got, s.known),
-        })
-      },
+) -> { fresh: Map<RootName, Answer>, asked: Int } / {abort.raise | e} = {
+  let places = places_of(p);
+  let place = |k: RootKey| match places.get(dealt_module(k)) { Some(l) -> l, None -> 0 };
+  let held_at = |n: RootName| match keys.get(n) { Some(k) -> Some(place(k)), None -> None };
+  let last = held.keys().fold(
+    ask.fold(0, |m: Int, k: RootKey| if place(k) > m { place(k) } else { m }),
+    |m: Int, n: RootName| match held_at(n) { Some(l) -> if l > m { l } else { m }, None -> m },
   );
-  if settled.ask.len() > 0 {
-    Err(
-      Bytes::concat_all([
-        b"the handings the emitter wrote calls against still moved after ",
-        ascii_of_int(room),
-        b" rounds, for: ",
-        Bytes::join(settled.ask.map(root_name), b", "),
-      ]),
-    )
-  } else { Ok(settled.fresh) }
+  let settled = range(0, last + 1).fold(
+    { fresh: Map::new(), held: held, asked: 0, known: known, pending: [] },
+    |s: Settling, l: Int|
+      iterate(
+        { ..s, pending: ask.filter(|k: RootKey| place(k) == l) },
+        s.held.len() + 2,
+        |t: Settling| {
+          let before = handings_held(handings_held(published, t.held), t.fresh);
+          let here = t.held.fold(Map::new(), |m: Map<RootName, Answer>, n: RootName, a: Answer|
+            if held_at(n) == Some(l) { m.insert(n, a) } else { m });
+          let stale = stale_of(here, before, keys);
+          let asking = t.pending.concat(stale);
+          if asking.len() == 0 { Stop(t) } else {
+            let pieces = dealt(p, asking);
+            let got = answers_of(
+              answers_at_once(
+                runtime,
+                dump,
+                p,
+                ctors,
+                pieces,
+                0,
+                pieces.len(),
+                64,
+                before.values(),
+              ),
+            );
+            Continue({
+              fresh: got.fold(t.fresh, |m: Map<RootName, Answer>, n: RootName, a: Answer|
+                m.insert(n, a)),
+              held: stale.fold(t.held, |m: Map<RootName, Answer>, k: RootKey|
+                m.remove(root_name(k))),
+              asked: t.asked + asking.len(),
+              known: kept(got, t.known),
+              pending: [],
+            })
+          }
+        },
+      ),
+  );
+  { fresh: settled.fresh, asked: settled.asked }
 }
 
 // --- Values a build kept ----------------------------------------------------------
@@ -1975,14 +2139,9 @@ pub fn const_room() -> Int = 16777216
 /// names of it.
 pub fn baked_key(hash: Bytes) -> Bytes = b"value\x00".concat(hash)
 
-/// The root that answers the encoding of a `const` definition's value: what a build enters to keep
-/// it.
-pub fn stored_root(name: Bytes) -> Bytes = emit::stored_root(name)
-
-fn stored_of(root: Bytes) -> Option<Bytes> / {abort.raise} = {
-  let suffix = stored_root(b"");
-  if root.ends_with(suffix) { Some(root.slice(0, root.len() - suffix.len())) } else { None }
-}
+/// The name of the root that answers the encoding of the value of the `const` definition `name`,
+/// which a build enters to keep it.
+pub fn stored_root(name: Bytes) -> Bytes = root_text(root_name(Stored(Named(name))))
 
 /// A `const` definition as the value a build kept of it, laid out as static data: its body answers
 /// the value from there and calls nothing, so the unit need not hold what the body reaches, and a
@@ -2007,7 +2166,10 @@ fn kept_body(ctors: Ctors, p: Program, b: Baked) -> Answer / {abort.raise} = {
         Some(v) -> match known_of_value(ctors, f.ret, v) {
           Ok(k) -> {
             let e = emitted_of(
-              Formed({ name: b.name, form: Ok(kept_root(ctors, Named(b.name), f.ret, k)) }),
+              Formed({
+                name: root_name(Named(b.name)),
+                form: Ok(kept_root(ctors, Named(b.name), f.ret, k)),
+              }),
               ctors,
             );
             Body({ text: e.text, tables: e.tables })
@@ -2035,7 +2197,7 @@ pub fn emitted<| e>(
   dump: Dump,
   sources: List<Bytes>,
   inputs: Map<Bytes, Bytes>,
-  every: List<Bytes>,
+  every: List<RootKey>,
   read: (Bytes) -> Option<Bytes> / e,
   keep: (List<Record>) -> Unit / e,
   baked: List<Baked> = [],
@@ -2043,81 +2205,65 @@ pub fn emitted<| e>(
 ) -> Result<Emission, Bytes> / {abort.raise | e} = {
   let p = program_of(dump, sources);
   let ctors = dump.emitter_ctors.map(|c: EmitterCtor| { name: c.name, arity: c.arity });
-  let wanted = every.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
-  let values = baked.fold(Map::new(), |acc: Map<Bytes, Baked>, b: Baked|
-    if wanted.contains(b.name) { acc.insert(b.name, b) } else { acc });
-  let entries = every.filter(|n: Bytes| entered_root(p, n)).map(Entered);
-  let offered = every.filter(|n: Bytes| !values.contains(n)).map(Named).concat(entries);
+  let wanted = every.fold(Map::new(), |acc: Map<RootName, Bool>, k: RootKey|
+    acc.insert(root_name(k), true));
+  let values = baked.fold(Map::new(), |acc: Map<RootName, Baked>, b: Baked| {
+    let n = root_name(Named(b.name));
+    if wanted.contains(n) { acc.insert(n, b) } else { acc }
+  });
+  let entries = every.filter(|k: RootKey| entered_root(p, k)).map(Entered);
+  let offered = every.filter(|k: RootKey| !values.contains(root_name(k))).concat(entries);
   let program = program_ctors(dump, ctors);
-  match told_round(phases, 1, ||
-      answered_round(runtime, dump, p, ctors, offered, Map::new(), 64, read, keep)) {
-    Err(why) -> Err(why),
-    Ok(first) -> match closed_rounds(
-        runtime,
-        dump,
-        p,
-        ctors,
-        program,
-        read,
-        keep,
-        phases,
-        first,
-        64,
-      ) {
-      Err(why) -> Err(why),
-      Ok(all) -> {
-        let shared = alike(all.answers, all.keys);
-        let unemitted = settled_only(all.answers, all.keys, closed_needs(all.answers, all.keys));
-        let held = values.fold(
-          settled_bodies(
-            generics_settled(all.answers, all.keys, shared, program),
-            all.keys,
-            unemitted,
-          ),
-          |acc: Map<Bytes, Answer>, n: Bytes, b: Baked| acc.insert(n, kept_body(program, p, b)),
-        );
-        let produced = produce(
-          runtime,
-          ctors,
-          every.map(Named).concat(
-            all.added.filter(|k: RootKey| !shared.contains(root_name(k))),
-          ).filter(|k: RootKey| !unemitted.contains(root_name(k))).concat(
-            entries,
-          ).map(|k: RootKey|
-            match k {
-              // An entry takes no words: what it reads crosses through the runtime.
-              Entered(_) -> { name: root_name(k), arity: 0, constant: false, site: sited_as(k) },
-              _ -> match p.roots.get(sited_as(k)) {
-                Some(r) ->
-                  {
-                    name: root_name(k),
-                    arity: r.arity,
-                    constant: r.pure && r.arity == 0 && (match k { At(_) -> false, _ -> true }),
-                    site: sited_as(k),
-                  },
-                None -> { name: root_name(k), arity: 0, constant: false, site: sited_as(k) },
+  let first = told_round(phases, 1, ||
+    answered_round(runtime, dump, p, ctors, offered, Map::new(), read, keep));
+  let all = closed_rounds(runtime, dump, p, ctors, program, read, keep, phases, first, 64);
+  {
+    let shared = alike(all.answers, all.keys);
+    let unemitted = settled_only(all.answers, all.keys, closed_needs(all.answers, all.keys));
+    let held = values.fold(
+      settled_bodies(generics_settled(all.answers, all.keys, shared, program), all.keys, unemitted),
+      |acc: Map<RootName, Answer>, n: RootName, b: Baked| acc.insert(n, kept_body(program, p, b)),
+    );
+    let produced = produce(
+      runtime,
+      ctors,
+      every.concat(all.added.filter(|k: RootKey| !shared.contains(root_name(k)))).filter(
+        |k: RootKey| !unemitted.contains(root_name(k)),
+      ).concat(
+        entries,
+      ).map(|k: RootKey|
+        match k {
+          // An entry takes no words: what it reads crosses through the runtime.
+          Entered(_) -> { name: root_name(k), arity: 0, constant: false, site: sited_as(k) },
+          _ -> match p.roots.get(sited_as(k)) {
+            Some(r) ->
+              {
+                name: root_name(k),
+                arity: r.arity,
+                constant: r.pure && r.arity == 0 && (match k { At(_) -> false, _ -> true }),
+                site: sited_as(k),
               },
-            }),
-          p.modules.len(),
-          held,
-          inputs,
-          dump.emitter_ctors.fold([], |acc: List<Stated>, c: EmitterCtor|
-            if c.key == None && c.show == None && c.numeric.len() == 0 { acc }
-            else { acc.push({ ctor: c.name, key: c.key, show: c.show, numeric: c.numeric }) }),
-        );
-        Ok({
-          produced: produced,
-          kept: all.kept,
-          asked: all.asked,
-          unbound: unbound(
-            runtime.natives,
-            called_externs(natives_called(produced.made), p.modules, |m: ModuleRow|
-              text_at(p, m.index)),
-          ),
-          misassumed: misassumed_in(all.answers, produced.taken),
-        })
-      },
-    },
+            None -> { name: root_name(k), arity: 0, constant: false, site: sited_as(k) },
+          },
+        }),
+      p.modules.len(),
+      held,
+      inputs,
+      dump.emitter_ctors.fold([], |acc: List<Stated>, c: EmitterCtor|
+        if c.key == None && c.show == None && c.numeric.len() == 0 { acc }
+        else { acc.push({ ctor: c.name, key: c.key, show: c.show, numeric: c.numeric }) }),
+    );
+    Ok({
+      produced: produced,
+      kept: all.kept,
+      asked: all.asked,
+      unbound: unbound(
+        runtime.natives,
+        called_externs(natives_called(produced.made), p.modules, |m: ModuleRow|
+          text_at(p, m.index)),
+      ),
+      misassumed: misassumed_in(all.answers, produced.taken),
+    })
   }
 }
 
@@ -2125,8 +2271,8 @@ pub fn emitted<| e>(
 /// what an earlier run kept and how many were asked of the emitter: each kept answer read where it
 /// stands, the emitter entered for the rest, and what it answered kept for the next run.
 type Answered = {
-  answers: Map<Bytes, Answer>,
-  keys: Map<Bytes, RootKey>,
+  answers: Map<RootName, Answer>,
+  keys: Map<RootName, RootKey>,
   kept: Int,
   asked: Int,
   added: List<RootKey>,
@@ -2149,33 +2295,29 @@ pub type RoundTally = {
 fn told_round<| e>(
   phases: Option<{ now: () -> Int / e, told: (RoundTally) -> Unit / e }>,
   n: Int,
-  run: () -> Result<Answered, Bytes> / {abort.raise | e},
-) -> Result<Answered, Bytes> / {abort.raise | e} =
+  run: () -> Answered / {abort.raise | e},
+) -> Answered / {abort.raise | e} =
   match phases {
     None -> run(),
     Some(t) -> {
       let began = t.now();
-      let r = run();
-      match r {
-        Ok(a) ->
-          t.told({
-            round: n,
-            roots: a.keys.len(),
-            kept: a.kept,
-            asked: a.asked,
-            refused: a.answers.fold(0, |c: Int, _: Bytes, x: Answer|
-              match x { Refused(_) -> c + 1, Body(_) -> c }),
-            began: began,
-            ended: t.now(),
-          }),
-        Err(_) -> (),
-      };
-      r
+      let a = run();
+      t.told({
+        round: n,
+        roots: a.keys.len(),
+        kept: a.kept,
+        asked: a.asked,
+        refused: a.answers.fold(0, |c: Int, _: RootName, x: Answer|
+          match x { Refused(_) -> c + 1, Body(_) -> c }),
+        began: began,
+        ended: t.now(),
+      });
+      a
     },
   }
 
 /// The definition the root named `n` specialises, where `keys` holds it as a specialisation.
-fn specialising(keys: Map<Bytes, RootKey>, n: Bytes) -> Option<Bytes> =
+fn specialising(keys: Map<RootName, RootKey>, n: RootName) -> Option<Bytes> =
   match keys.get(n) { Some(At(a)) -> Some(a.def), _ -> None }
 
 fn answered_round<| e>(
@@ -2185,66 +2327,43 @@ fn answered_round<| e>(
   ctors: List<Ctor>,
   roots: List<RootKey>,
   published: Map<Bytes, Published>,
-  room: Int,
   read: (Bytes) -> Option<Bytes> / e,
   keep: (List<Record>) -> Unit / e,
-) -> Result<Answered, Bytes> / {abort.raise | e} = {
-  let keys = roots.fold(Map::new(), |acc: Map<Bytes, RootKey>, k: RootKey|
+) -> Answered / {abort.raise | e} = {
+  let keys = roots.fold(Map::new(), |acc: Map<RootName, RootKey>, k: RootKey|
     acc.insert(root_name(k), k));
   let names = keys.keys();
-  let asked = names.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
+  let asked = names.fold(Map::new(), |acc: Map<RootName, Bool>, n: RootName| acc.insert(n, true));
   let types = types_material(dump);
-  let materials = keys.fold(Map::new(), |acc: Map<Bytes, Bytes>, n: Bytes, k: RootKey|
+  let materials = keys.fold(Map::new(), |acc: Map<RootName, Bytes>, n: RootName, k: RootKey|
     match root_material(p, types, k) { Some(m) -> acc.insert(n, m), None -> acc });
   let looked = kept_answers(p.keys, materials, read);
   let standing_now = standing(looked.answers, asked);
   // A kept answer written against a handing that has moved since is asked for again, as is every
   // other one of a recursion group it leaves.
-  let stale = stale_of(standing_now, handings_held(published, standing_now));
+  let stale = stale_of(standing_now, handings_held(published, standing_now), keys);
   let kept = groups_whole(
-    stale.fold(standing_now, |m: Map<Bytes, Answer>, n: Bytes| m.remove(n)),
+    stale.fold(standing_now, |m: Map<RootName, Answer>, k: RootKey| m.remove(root_name(k))),
     names,
   );
   let missed = keys.values().filter(|k: RootKey| !kept.contains(root_name(k)));
   // Each call's answers are kept as they come back, so a run that dies keeps what it was answered.
-  let kept_now = |got: Map<Bytes, Answer>, known: Map<Bytes, Bool>| {
+  let kept_now = |got: Map<RootName, Answer>, known: Map<Bytes, Bool>| {
     let r = answers_kept(p.keys, materials, got, known, read);
     if r.records.len() > 0 { keep(r.records) };
     r.known
   };
-  let settled = if missed.len() == 0 { Ok(Map::new()) } else {
-    answers_settled(
-      runtime,
-      dump,
-      p,
-      ctors,
-      kept,
-      published,
-      missed,
-      keys,
-      room,
-      kept_now,
-      looked.known,
-    )
+  let settled = if missed.len() == 0 { { fresh: Map::new(), asked: 0 } } else {
+    answers_settled(runtime, dump, p, ctors, kept, published, missed, keys, kept_now, looked.known)
   };
-  match settled {
-    Err(why) -> Err(why),
-    Ok(fresh) -> {
-      // A root the emitter answered nothing for is refused as one it declined: it never hides what
-      // was answered of the rest.
-      let answered = missed.fold(fresh, |acc: Map<Bytes, Answer>, k: RootKey|
-        if acc.contains(root_name(k)) { acc }
-        else { acc.insert(root_name(k), Refused({ why: unanswered_why() })) });
-      Ok({
-        answers: answered.fold(kept, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
-          acc.insert(n, a)),
-        keys: keys,
-        kept: kept.len(),
-        asked: missed.len(),
-        added: [],
-      })
-    },
-  }
+  // A root the emitter answered nothing for is refused as one it declined: it never hides what was
+  // answered of the rest.
+  let answered = missed.fold(settled.fresh, |acc: Map<RootName, Answer>, k: RootKey|
+    if acc.contains(root_name(k)) { acc }
+    else { acc.insert(root_name(k), Refused({ why: unanswered_why() })) });
+  let all = answered.fold(kept, |acc: Map<RootName, Answer>, n: RootName, a: Answer|
+    acc.insert(n, a));
+  { answers: all, keys: keys, kept: all.len() - answered.len(), asked: settled.asked, added: [] }
 }
 
 /// Why a root is refused that the emitter was asked for and answered nothing for.
@@ -2253,7 +2372,10 @@ fn unanswered_why() -> Bytes = b"the emitter answered nothing for it"
 /// `had` with each root its bodies reach answered too, round after round until none lacks one: a
 /// specialisation a body names, the generic body of each definition a body calls generically,
 /// whose needs settle those calls, and once every such body is in, the root each call of a body
-/// the unit emits settles on. `room` is the rounds left, of 64 after the first.
+/// the unit emits settles on. `room` is the rounds left, of 64 after the first. A root a later round
+/// asks for takes or publishes no handing an earlier round's body was written against otherwise:
+/// specialisations and roots written for a type take theirs, and every definition is asked for
+/// first (`answers_settled`), so no round asks for a body again.
 fn closed_rounds<| e>(
   runtime: Runtime,
   dump: Dump,
@@ -2265,19 +2387,22 @@ fn closed_rounds<| e>(
   phases: Option<{ now: () -> Int / e, told: (RoundTally) -> Unit / e }>,
   had: Answered,
   room: Int,
-) -> Result<Answered, Bytes> / {abort.raise | e} = {
+) -> Answered / {abort.raise | e} = {
   // Of a body's calls only a root written for a type can be new: it calls a specialisation only as itself.
-  let named = had.answers.fold(Map::new(), |acc: Map<Bytes, RootKey>, _: Bytes, a: Answer|
+  let named = had.answers.fold(Map::new(), |acc: Map<RootName, RootKey>, _: RootName, a: Answer|
     match a {
       Body(b) -> {
-        let written_calls = b.tables.calls.fold(acc, |m: Map<Bytes, RootKey>, c: RootKey|
+        let written_calls = b.tables.calls.fold(acc, |m: Map<RootName, RootKey>, c: RootKey|
           match c {
             Written(_) -> if had.answers.contains(root_name(c)) { m }
             else { m.insert(root_name(c), c) },
             _ -> m,
           });
-        b.tables.generics.calls.fold(written_calls, |m: Map<Bytes, RootKey>, g: GenericCall|
-          if had.answers.contains(g.callee) { m } else { m.insert(g.callee, Named(g.callee)) })
+        b.tables.generics.calls.fold(written_calls, |m: Map<RootName, RootKey>, g: GenericCall| {
+          let callee = Named(g.callee);
+          if had.answers.contains(root_name(callee)) { m }
+          else { m.insert(root_name(callee), callee) }
+        })
       },
       Refused(_) -> acc,
     });
@@ -2286,10 +2411,10 @@ fn closed_rounds<| e>(
     let needs = closed_needs(had.answers, had.keys);
     let called = closed_called(had.answers, had.keys);
     let unemitted = settled_only(had.answers, had.keys, needs);
-    had.answers.fold(Map::new(), |acc: Map<Bytes, RootKey>, n: Bytes, a: Answer|
+    had.answers.fold(Map::new(), |acc: Map<RootName, RootKey>, n: RootName, a: Answer|
       match a {
         Body(b) -> if unemitted.contains(n) { acc } else {
-          b.tables.generics.calls.fold(acc, |m: Map<Bytes, RootKey>, g: GenericCall| {
+          b.tables.generics.calls.fold(acc, |m: Map<RootName, RootKey>, g: GenericCall| {
             let root = settled_root(g, needs, called, program);
             let name = root_name(root);
             // The first call in name order settling on a layout gives the root its type.
@@ -2299,35 +2424,28 @@ fn closed_rounds<| e>(
         Refused(_) -> acc,
       })
   };
-  // A body written against a handing a later round published otherwise is asked for again.
-  let held = handings_held(Map::new(), had.answers);
-  let again = stale_of(had.answers, held).fold(Map::new(), |m: Map<Bytes, RootKey>, n: Bytes|
-    m.insert(n, match had.keys.get(n) { Some(k) -> k, None -> Named(n) }));
-  let asking = more.fold(again, |m: Map<Bytes, RootKey>, n: Bytes, k: RootKey| m.insert(n, k));
-  if again.len() > 0 && room <= 0 {
-    Err(
-      Bytes::concat_all([
-        b"the handings the emitter wrote calls against still moved when the rounds ran out, for: ",
-        Bytes::join(again.keys(), b", "),
-      ]),
-    )
-  } else if asking.len() == 0 || room <= 0 { Ok(had) } else {
-    match told_round(phases, 66 - room, ||
-        answered_round(runtime, dump, p, ctors, asking.values(), held, room, read, keep)) {
-      Err(why) -> Err(why),
-      Ok(r) -> {
-        let next = {
-          answers: r.answers.fold(had.answers, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
-            acc.insert(n, a)),
-          keys: r.keys.fold(had.keys, |acc: Map<Bytes, RootKey>, n: Bytes, k: RootKey|
-            acc.insert(n, k)),
-          kept: had.kept + r.kept,
-          asked: had.asked + r.asked,
-          added: had.added.concat(more.values()),
-        };
-        closed_rounds(runtime, dump, p, ctors, program, read, keep, phases, next, room - 1)
-      },
-    }
+  if more.len() == 0 || room <= 0 { had } else {
+    let r = told_round(phases, 66 - room, ||
+      answered_round(
+        runtime,
+        dump,
+        p,
+        ctors,
+        more.values(),
+        handings_held(Map::new(), had.answers),
+        read,
+        keep,
+      ));
+    let next = {
+      answers: r.answers.fold(had.answers, |acc: Map<RootName, Answer>, n: RootName, a: Answer|
+        acc.insert(n, a)),
+      keys: r.keys.fold(had.keys, |acc: Map<RootName, RootKey>, n: RootName, k: RootKey|
+        acc.insert(n, k)),
+      kept: had.kept + r.kept,
+      asked: had.asked + r.asked,
+      added: had.added.concat(more.values()),
+    };
+    closed_rounds(runtime, dump, p, ctors, program, read, keep, phases, next, room - 1)
   }
 }
 
@@ -2338,22 +2456,25 @@ fn closed_rounds<| e>(
 /// variable that argument is laid out by, and its need of a scalar the caller's of the variable the
 /// argument is.
 fn closed_needs(
-  answers: Map<Bytes, Answer>,
-  keys: Map<Bytes, RootKey>,
-) -> Map<Bytes, List<Need>> / {abort.raise} = {
-  let generic = answers.fold(Map::new(), |acc: Map<Bytes, Generics>, n: Bytes, a: Answer|
+  answers: Map<RootName, Answer>,
+  keys: Map<RootName, RootKey>,
+) -> Map<RootName, List<Need>> / {abort.raise} = {
+  let generic = answers.fold(Map::new(), |acc: Map<RootName, Generics>, n: RootName, a: Answer|
     match a {
       Body(b) -> if specialising(keys, n) == None { acc.insert(n, b.tables.generics) } else { acc },
       Refused(_) -> acc,
     });
-  let start = generic.fold(Map::new(), |acc: Map<Bytes, List<Need>>, n: Bytes, g: Generics|
-    acc.insert(n, g.needs));
+  let start = generic.fold(
+    Map::new(),
+    |acc: Map<RootName, List<Need>>, n: RootName, g: Generics| acc.insert(n, g.needs),
+  );
   // Each round adds a need or stops, and a definition has two needs a variable at most.
-  let most = generic.fold(1, |acc: Int, _: Bytes, g: Generics|
+  let most = generic.fold(1, |acc: Int, _: RootName, g: Generics|
     acc + 2 * g.calls.fold(1, |n: Int, c: GenericCall| n + c.args.len()));
-  iterate(start, most, |needs: Map<Bytes, List<Need>>| {
-    let next = generic.fold(needs, |acc: Map<Bytes, List<Need>>, n: Bytes, g: Generics|
-      g.calls.fold(acc, |a: Map<Bytes, List<Need>>, call: GenericCall| widened(a, n, call, needs)));
+  iterate(start, most, |needs: Map<RootName, List<Need>>| {
+    let next = generic.fold(needs, |acc: Map<RootName, List<Need>>, n: RootName, g: Generics|
+      g.calls.fold(acc, |a: Map<RootName, List<Need>>, call: GenericCall|
+        widened(a, n, call, needs)));
     if next == needs { Stop(needs) } else { Continue(next) }
   })
 }
@@ -2362,11 +2483,11 @@ fn closed_needs(
 /// what it hands them (`needs`), read a type variable's layout or the type itself, which only the
 /// type arguments its callers settle say. Its calls are settled on its specialisations instead.
 fn settled_only(
-  answers: Map<Bytes, Answer>,
-  keys: Map<Bytes, RootKey>,
-  needs: Map<Bytes, List<Need>>,
-) -> Map<Bytes, Bool> =
-  answers.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes, a: Answer|
+  answers: Map<RootName, Answer>,
+  keys: Map<RootName, RootKey>,
+  needs: Map<RootName, List<Need>>,
+) -> Map<RootName, Bool> =
+  answers.fold(Map::new(), |acc: Map<RootName, Bool>, n: RootName, a: Answer|
     match a {
       Body(b) -> if specialising(keys, n) == None
           && (settled_by_callers(b.tables.generics.needs)
@@ -2384,11 +2505,11 @@ fn settled_why() -> Bytes =
 /// specialisation still reads a type variable's layout or type: such a specialisation was settled
 /// on type arguments that leave open what it reads, which no unit can emit.
 fn settled_bodies(
-  answers: Map<Bytes, Answer>,
-  keys: Map<Bytes, RootKey>,
-  unemitted: Map<Bytes, Bool>,
-) -> Map<Bytes, Answer> / {abort.raise} =
-  answers.fold(Map::new(), |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
+  answers: Map<RootName, Answer>,
+  keys: Map<RootName, RootKey>,
+  unemitted: Map<RootName, Bool>,
+) -> Map<RootName, Answer> / {abort.raise} =
+  answers.fold(Map::new(), |acc: Map<RootName, Answer>, n: RootName, a: Answer|
     if unemitted.contains(n) { acc.insert(n, Refused({ why: settled_why() })) } else {
       match a {
         Body(b) -> if specialising(keys, n) != None && settled_by_callers(b.tables.generics.needs) {
@@ -2396,7 +2517,7 @@ fn settled_bodies(
             String::of_bytes_lossy(
               Bytes::concat_all([
                 b"the specialisation `",
-                n,
+                root_text(n),
                 b"` its callers settled still reads a type variable's layout or type",
               ]),
             ),
@@ -2410,24 +2531,24 @@ fn settled_bodies(
 /// handed on as a parameter its callee calls is called. A tail group's members call none, since a
 /// specialisation of one would leave its group's loop.
 fn closed_called(
-  answers: Map<Bytes, Answer>,
-  keys: Map<Bytes, RootKey>,
-) -> Map<Bytes, List<Int>> / {abort.raise} = {
-  let bodies = answers.fold(Map::new(), |acc: Map<Bytes, Generics>, n: Bytes, a: Answer|
+  answers: Map<RootName, Answer>,
+  keys: Map<RootName, RootKey>,
+) -> Map<RootName, List<Int>> / {abort.raise} = {
+  let bodies = answers.fold(Map::new(), |acc: Map<RootName, Generics>, n: RootName, a: Answer|
     match a {
       Body(b) -> if specialising(keys, n) == None && b.tables.members.len() <= 1 {
         acc.insert(n, b.tables.generics)
       } else { acc },
       Refused(_) -> acc,
     });
-  let start = bodies.fold(Map::new(), |acc: Map<Bytes, List<Int>>, n: Bytes, g: Generics|
+  let start = bodies.fold(Map::new(), |acc: Map<RootName, List<Int>>, n: RootName, g: Generics|
     acc.insert(n, g.called));
   // Each round adds a parameter or stops, and a body has as many to add as it hands on.
-  let most = bodies.fold(1, |acc: Int, _: Bytes, g: Generics| acc + g.passes.len());
-  iterate(start, most, |called: Map<Bytes, List<Int>>| {
-    let next = bodies.fold(called, |acc: Map<Bytes, List<Int>>, n: Bytes, g: Generics|
-      g.passes.fold(acc, |a: Map<Bytes, List<Int>>, pass: Pass| {
-        let theirs = match called.get(pass.callee) { Some(cs) -> cs, None -> [] };
+  let most = bodies.fold(1, |acc: Int, _: RootName, g: Generics| acc + g.passes.len());
+  iterate(start, most, |called: Map<RootName, List<Int>>| {
+    let next = bodies.fold(called, |acc: Map<RootName, List<Int>>, n: RootName, g: Generics|
+      g.passes.fold(acc, |a: Map<RootName, List<Int>>, pass: Pass| {
+        let theirs = match called.get(root_name(Named(pass.callee))) { Some(cs) -> cs, None -> [] };
         let mine = match a.get(n) { Some(cs) -> cs, None -> [] };
         if theirs.contains(pass.at) && !mine.contains(pass.param) {
           a.insert(n, mine.push(pass.param))
@@ -2439,13 +2560,13 @@ fn closed_called(
 
 /// `needs` with caller `n`'s needs of what `call` hands its callee.
 fn widened(
-  acc: Map<Bytes, List<Need>>,
-  n: Bytes,
+  acc: Map<RootName, List<Need>>,
+  n: RootName,
   call: GenericCall,
-  needs: Map<Bytes, List<Need>>,
-) -> Map<Bytes, List<Need>> / {abort.raise} = {
-  let callee = match needs.get(call.callee) { Some(ns) -> ns, None -> [] };
-  callee.fold(acc, |a: Map<Bytes, List<Need>>, need: Need|
+  needs: Map<RootName, List<Need>>,
+) -> Map<RootName, List<Need>> / {abort.raise} = {
+  let callee = match needs.get(root_name(Named(call.callee))) { Some(ns) -> ns, None -> [] };
+  callee.fold(acc, |a: Map<RootName, List<Need>>, need: Need|
     match call.args.at(need.var) {
       None -> a,
       Some(arg) -> {
@@ -2454,7 +2575,7 @@ fn widened(
           Layout -> laid_vars(arg),
           Scalar -> match arg { TyVar(v) -> if v >= 0 { [v] } else { [] }, _ -> [] },
         };
-        vars.fold(a, |m: Map<Bytes, List<Need>>, v: Int| {
+        vars.fold(a, |m: Map<RootName, List<Need>>, v: Int| {
           let had = match m.get(n) { Some(ns) -> ns, None -> [] };
           let more = { var: v, reads: need.reads };
           if had.contains(more) { m } else { m.insert(n, had.push(more)) }
@@ -2471,11 +2592,12 @@ fn widened(
 /// name. A tail loop's member reads each variable exactly, so its loop runs at its callers' types.
 fn settled_root(
   call: GenericCall,
-  needs: Map<Bytes, List<Need>>,
-  called: Map<Bytes, List<Int>>,
+  needs: Map<RootName, List<Need>>,
+  called: Map<RootName, List<Int>>,
   ctors: Ctors,
 ) -> RootKey / {abort.raise} = {
-  let ns = match needs.get(call.callee) { Some(x) -> x, None -> [] };
+  let callee = root_name(Named(call.callee));
+  let ns = match needs.get(callee) { Some(x) -> x, None -> [] };
   let open = KeyType(unknown_type());
   let args = range(0, call.args.len()).map(|j: Int| {
     let arg = call.args.get(j);
@@ -2487,7 +2609,7 @@ fn settled_root(
     else { open }
   });
   // A lambda is run in place only by a callee that calls the parameter it is handed as.
-  let calls = match called.get(call.callee) { Some(cs) -> cs, None -> [] };
+  let calls = match called.get(callee) { Some(cs) -> cs, None -> [] };
   let fns = call.fns.filter(|f: FnArg| calls.contains(f.param));
   if fns.len() == 0 && args.all(|a: KeyArg| a == open) { Named(call.callee) }
   else { At({ def: call.callee, args: args, lent: fns }) }
@@ -2499,11 +2621,11 @@ fn settled_root(
 /// refused reaches the body it specialises where the unit emits that body and the call hands it
 /// nothing raw; otherwise it keeps the specialisation, so its caller is dropped for that refusal.
 fn generics_settled(
-  answers: Map<Bytes, Answer>,
-  keys: Map<Bytes, RootKey>,
-  shared: Map<Bytes, Bytes>,
+  answers: Map<RootName, Answer>,
+  keys: Map<RootName, RootKey>,
+  shared: Map<RootName, RootName>,
   ctors: Ctors,
-) -> Map<Bytes, Answer> / {abort.raise} = {
+) -> Map<RootName, Answer> / {abort.raise} = {
   let needs = closed_needs(answers, keys);
   let called = closed_called(answers, keys);
   let unemitted = settled_only(answers, keys, needs);
@@ -2515,7 +2637,7 @@ fn generics_settled(
   // A root keyed by a layout is the one the unit asked for under its name, whatever type this call
   // settles it at.
   let asked = |k: RootKey| match keys.get(root_name(k)) { Some(x) -> x, None -> k };
-  answers.fold(Map::new(), |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
+  answers.fold(Map::new(), |acc: Map<RootName, Answer>, n: RootName, a: Answer|
     acc.insert(n, match a {
       Body(b) -> if b.tables.generics.calls.len() == 0 { a } else {
         let settled = b.tables.generics.calls.map(|g: GenericCall| {
@@ -2523,7 +2645,10 @@ fn generics_settled(
           let root = match shared.get(root_name(own)) {
             Some(r) -> match keys.get(r) {
               Some(k) -> k,
-              None -> panic(String::of_bytes_lossy(b"a root answered with no key: ".concat(r))),
+              None ->
+                panic(
+                  String::of_bytes_lossy(b"a root answered with no key: ".concat(root_text(r))),
+                ),
             },
             None -> own,
           };
@@ -2542,7 +2667,7 @@ fn generics_settled(
         let calls = settled.fold(b.tables.calls, |cs: List<RootKey>, r: RootKey|
           if cs.any(|c: RootKey| root_name(c) == root_name(r)) { cs } else { cs.push(r) });
         // A generic call's head is held to the root it settles on, by that root's place in `calls`.
-        let placed = |name: Bytes|
+        let placed = |name: RootName|
           range(0, calls.len()).fold(None, |found: Option<Int>, i: Int|
             match found {
               Some(_) -> found,
@@ -2579,10 +2704,10 @@ fn generics_settled(
 /// those whose C, but for its own symbol, and tables are alike. One is compiled and every call of
 /// either reaches it.
 fn alike(
-  answers: Map<Bytes, Answer>,
-  keys: Map<Bytes, RootKey>,
-) -> Map<Bytes, Bytes> / {abort.raise} = {
-  let keyed = answers.fold(Map::new(), |acc: Map<Bytes, Bytes>, n: Bytes, a: Answer|
+  answers: Map<RootName, Answer>,
+  keys: Map<RootName, RootKey>,
+) -> Map<RootName, RootName> / {abort.raise} = {
+  let keyed = answers.fold(Map::new(), |acc: Map<RootName, Bytes>, n: RootName, a: Answer|
     match a {
       Body(b) -> match specialising(keys, n) {
         Some(base) -> acc.insert(n, code_key(base, n, b)),
@@ -2590,20 +2715,22 @@ fn alike(
       },
       Refused(_) -> acc,
     });
-  let first = keyed.fold(Map::new(), |acc: Map<Bytes, Bytes>, n: Bytes, k: Bytes|
+  let first = keyed.fold(Map::new(), |acc: Map<Bytes, RootName>, n: RootName, k: Bytes|
     if acc.contains(k) { acc } else { acc.insert(k, n) });
-  keyed.fold(Map::new(), |acc: Map<Bytes, Bytes>, n: Bytes, k: Bytes|
+  keyed.fold(Map::new(), |acc: Map<RootName, RootName>, n: RootName, k: Bytes|
     match first.get(k) { Some(m) -> if m == n { acc } else { acc.insert(n, m) }, None -> acc })
 }
 
 /// What the body of specialisation `n` of `base` is but for its name: its C and tables with its own
 /// symbol and root name taken out, digested.
-fn code_key(base: Bytes, n: Bytes, b: { text: Bytes, tables: Tables }) -> Bytes / {abort.raise} = {
-  let own = symbol_of(n);
-  let unnamed = |x: Bytes| Bytes::join(Bytes::join(x.split(own), b"@@own@@").split(n), b"@@root@@");
+fn code_key(base: Bytes, n: RootName, b: { text: Bytes, tables: Tables }) -> Bytes / {abort.raise} = {
+  let name = root_text(n);
+  let own = symbol_of(name);
+  let unnamed = |x: Bytes|
+    Bytes::join(Bytes::join(x.split(own), b"@@own@@").split(name), b"@@root@@");
   let tables = {
     ..b.tables,
-    calls: b.tables.calls.map(|c: RootKey| Named(unnamed(root_name(c)))),
+    calls: b.tables.calls.map(|c: RootKey| Named(unnamed(root_text(root_name(c))))),
     lambdas: b.tables.lambdas.map(unnamed),
     symbols: b.tables.symbols.map(|d: Defined|
       { ..d, symbol: unnamed(d.symbol), entry: unnamed(d.entry) }),
@@ -2614,19 +2741,24 @@ fn code_key(base: Bytes, n: Bytes, b: { text: Bytes, tables: Tables }) -> Bytes 
 }
 
 /// `text` with each `@@gN@@` written as the symbol of root `N`.
-fn placeholders_named(text: Bytes, roots: List<Bytes>) -> Bytes / {abort.raise} = {
+fn placeholders_named(text: Bytes, roots: List<RootName>) -> Bytes / {abort.raise} = {
   let walked = holes(text).filter(|h: Hole| h.kind == 103).fold(
     { from: 0, out: [] },
     |s: { from: Int, out: List<Bytes> }, h: Hole|
       {
         from: h.close + 2,
-        out: s.out.push(text.slice(s.from, h.open)).push(symbol_of(roots.get(digits(h.digits)))),
+        out: s.out.push(text.slice(s.from, h.open)).push(
+          symbol_of(root_text(roots.get(digits(h.digits)))),
+        ),
       },
   );
   Bytes::concat_all(walked.out.push(text.slice(walked.from, text.len())))
 }
 
 // --- What a program is told -------------------------------------------------------
+
+/// A root a build refuses, by the name its row spells it with, and why.
+type Refusal = { root: Bytes, why: Bytes }
 
 fn place_of(dump: Dump, name: Bytes) -> { module: Int, start: Int, end: Int } =
   dump.emitter_roots.fold(
@@ -2636,18 +2768,17 @@ fn place_of(dump: Dump, name: Bytes) -> { module: Int, start: Int, end: Int } =
       else { acc },
   )
 
-fn label_of(dump: Dump, d: Dropped, primary: Bool) -> Label = {
-  let at = place_of(dump, d.function);
-  { module: at.module, start: at.start, end: at.end, primary: primary, text: d.construct }
+fn label_of(dump: Dump, r: Refusal, primary: Bool) -> Label = {
+  let at = place_of(dump, r.root);
+  { module: at.module, start: at.start, end: at.end, primary: primary, text: r.why }
 }
 
-/// Definitions the program reaches that the emitter refused, in the order the fixpoint dropped them,
+/// Definitions the program reaches that the build refuses, in the order the fixpoint dropped them,
 /// so the first is a cause and the rest what that cause carried.
-fn refused_reach(dump: Dump, dropped: List<Dropped>) -> Diag / {abort.raise} = {
+fn refused_reach(dump: Dump, dropped: List<Refusal>) -> Diag / {abort.raise} = {
   let listed = dropped.fold(
     b"the emitter refused, in the order it dropped them:",
-    |acc: Bytes, d: Dropped|
-      Bytes::concat_all([acc, b"\n  `", d.function, b"` (", d.construct, b")"]),
+    |acc: Bytes, d: Refusal| Bytes::concat_all([acc, b"\n  `", d.root, b"` (", d.why, b")"]),
   );
   error_with_labels(
     b"E0448",
@@ -2676,20 +2807,25 @@ fn unsettled(why: Bytes) -> Diag =
   )
 
 /// The unit's C as the runtime compiles it, or why there is none: rounds of the emitter's answers
-/// that did not settle, a native it calls that the runtime does not implement as declared, a call written against
-/// a handing its callee does not publish, or a definition the program reaches that the emitter
-/// refused. A definition dropped only because a narrowed offer left its callee out is no refusal of
-/// the program's.
+/// that did not settle, a native it calls that the runtime does not implement as declared, a call
+/// written against a handing its callee does not publish, a root `dump` offers that no typed row
+/// keys (`offered_roots`), or a definition the program reaches that the emitter refused. A
+/// definition dropped only because a narrowed offer left its callee out is no refusal of the
+/// program's.
 pub fn held(
   dump: Dump,
-  offered: List<Bytes>,
+  offered: List<RootKey>,
   emission: Result<Emission, Bytes>,
 ) -> Result<Bytes, List<Diag>> / {abort.raise} =
   match emission {
     Err(why) -> Err([unsettled(why)]),
     Ok(e) -> if e.unbound.len() > 0 { Err([natives_refused(e.unbound)]) }
     else if e.misassumed.len() > 0 { Err([handings_disagree(e.misassumed)]) } else {
-      let errors = fatal(offered, e.produced.dropped);
+      let errors = offered_roots(dump).unkeyed.map(|n: Bytes|
+        { root: n, why: unkeyed_why(n) }).concat(
+        fatal(offered.map(root_name), e.produced.dropped).map(|d: Dropped|
+          { root: root_text(d.function), why: d.construct }),
+      );
       if errors.len() == 0 { Ok(e.produced.text) } else { Err([refused_reach(dump, errors)]) }
     },
   }
@@ -2718,18 +2854,39 @@ fn keyed(answers: List<{ key: RootKey, value: Answer }>) -> Answered =
   {
     answers: answers.fold(
       Map::new(),
-      |m: Map<Bytes, Answer>, x: { key: RootKey, value: Answer }|
+      |m: Map<RootName, Answer>, x: { key: RootKey, value: Answer }|
         m.insert(root_name(x.key), x.value),
     ),
-    keys: answers.fold(Map::new(), |m: Map<Bytes, RootKey>, x: { key: RootKey, value: Answer }|
-      m.insert(root_name(x.key), x.key)),
+    keys: answers.fold(
+      Map::new(),
+      |m: Map<RootName, RootKey>, x: { key: RootKey, value: Answer }|
+        m.insert(root_name(x.key), x.key),
+    ),
     kept: 0,
     asked: 0,
     added: [],
   }
 
+/// The name of the root of definition `n`.
+fn def_root(n: Bytes) -> RootName = root_name(Named(n))
+
+/// The name root `k` prints as.
+fn printed(k: RootKey) -> Bytes = root_text(root_name(k))
+
+/// Each of `entries` by the name of the root of the definition its key names.
+fn by_def<v>(entries: List<{ key: Bytes, value: v }>) -> Map<RootName, v> =
+  entries.fold(Map::new(), |m: Map<RootName, v>, x: { key: Bytes, value: v }|
+    m.insert(def_root(x.key), x.value))
+
+/// The bucket the body of definition `n` compiles in.
+fn def_bucket(n: Bytes) -> Int = bucket_of(def_root(n))
+
+/// Definition `n` offered as a call of `arity` words.
+fn offer(n: Bytes, arity: Int) -> Offered =
+  { name: def_root(n), arity: arity, constant: false, site: def_root(n) }
+
 test "a generic call settles on each argument its callee's code needs, and leaves the rest" {
-  let needs = Map::of_entries([
+  let needs = by_def([
     { key: b"m.lay", value: [{ var: 0, reads: Layout }] },
     { key: b"m.add", value: [{ var: 0, reads: Scalar }] },
     { key: b"m.same", value: [{ var: 0, reads: Exact }] },
@@ -2741,7 +2898,7 @@ test "a generic call settles on each argument its callee's code needs, and leave
       Map::new(),
       no_ctors(),
     );
-  let call = |callee: Bytes, arg: Bytes| root_name(root(callee, arg));
+  let call = |callee: Bytes, arg: Bytes| root_text(root_name(root(callee, arg)));
   // A layout the code reads is kept by its key, a record of one pointer laid as any pointer is; a
   // type it reads is kept whole.
   assert_eq(call(b"m.lay", b"{x:Float}"), b"m.lay@{x:Float}");
@@ -2767,16 +2924,16 @@ test "a lambda is run in place only by a callee that calls the parameter it is h
       text: b"",
       tables: { ..no_tables(), generics: { ..no_generics(), called: called, passes: passes } },
     });
-  let answers = Map::of_entries([
+  let answers = by_def([
     { key: b"m.each", value: body([1], []) },
     // `pass` hands its parameter on to `each`, which calls it; `keep` only holds it.
     { key: b"m.pass", value: body([], [{ param: 0, callee: b"m.each", at: 1 }]) },
     { key: b"m.keep", value: body([], []) },
   ]);
   let called = closed_called(answers, Map::new());
-  assert_eq(called.get(b"m.pass"), Some([0]));
+  assert_eq(called.get(def_root(b"m.pass")), Some([0]));
   let call = |callee: Bytes, param: Int|
-    root_name(
+    printed(
       settled_root(
         {
           callee: callee,
@@ -2829,22 +2986,19 @@ test "a refused specialisation leaves its call to the generic body, whichever ro
     { key: at_key(b"std.prelude.mapped_from", [], lent(b"m.mapped")), value: refused },
   ]);
   let settled = generics_settled(had.answers, had.keys, Map::new(), no_ctors());
-  let calls = |name: Bytes|
-    match settled.get(name) {
-      Some(Body(b)) -> b.tables.calls.map(root_name),
-      _ -> panic("no body"),
-    };
+  let calls = |k: RootKey|
+    match settled.get(root_name(k)) { Some(Body(b)) -> b.tables.calls, _ -> panic("no body") };
   // The lambda a caller lends carries its entry, so the generic body calls it as any closure.
-  assert_eq(calls(b"m.main"), [b"m.each"]);
-  assert_eq(calls(root_name(mapping)), [b"std.prelude.mapped_from"]);
-  assert_eq(calls(b"m.mapped"), [root_name(mapping)])
+  assert_eq(calls(Named(b"m.main")), [Named(b"m.each")]);
+  assert_eq(calls(mapping), [Named(b"std.prelude.mapped_from")]);
+  assert_eq(calls(Named(b"m.mapped")), [mapping])
 }
 
 test "a caller of a refused specialisation of a body its callers settle is dropped for the specialisation's refusal" {
   let lay = { callee: b"m.lay", args: [spelled(b"Float")], carried: [], fns: [] };
   let spec = settled_root(
     lay,
-    Map::of_entries([{ key: b"m.lay", value: [{ var: 0, reads: Layout }] }]),
+    by_def([{ key: b"m.lay", value: [{ var: 0, reads: Layout }] }]),
     Map::new(),
     no_ctors(),
   );
@@ -2860,14 +3014,14 @@ test "a caller of a refused specialisation of a body its callers settle is dropp
     had.keys,
     settled_only(settled, had.keys, closed_needs(settled, had.keys)),
   );
-  let s = settle(held, [b"m.main"], []);
+  let s = settle(held, [def_root(b"m.main")], []);
   assert_eq(s.dropped.map(|d: Dropped| d.construct), [
-    Bytes::concat_all([b"`", root_name(spec), b"`, refused: ", why]),
+    Bytes::concat_all([b"`", printed(spec), b"`, refused: ", why]),
   ])
 }
 
 test "a generic body needs what its callees need of what it hands them, through its own variables" {
-  let answers = Map::of_entries([
+  let answers = by_def([
     { key: b"m.add", value: generic_body([], [{ var: 0, reads: Scalar }]) },
     { key: b"m.lay", value: generic_body([], [{ var: 0, reads: Layout }]) },
     // `wrap` hands its variable to `add` bare and to `lay` inside a record.
@@ -2900,13 +3054,16 @@ test "a generic body needs what its callees need of what it hands them, through 
     },
   ]);
   let closed = closed_needs(answers, Map::new());
-  assert_eq(closed.get(b"m.wrap"), Some([{ var: 0, reads: Scalar }, { var: 1, reads: Layout }]));
-  assert_eq(closed.get(b"m.outer"), Some([{ var: 0, reads: Layout }]));
-  assert_eq(closed.get(b"m.each"), Some([{ var: 0, reads: Exact }]))
+  assert_eq(
+    closed.get(def_root(b"m.wrap")),
+    Some([{ var: 0, reads: Scalar }, { var: 1, reads: Layout }]),
+  );
+  assert_eq(closed.get(def_root(b"m.outer")), Some([{ var: 0, reads: Layout }]));
+  assert_eq(closed.get(def_root(b"m.each")), Some([{ var: 0, reads: Exact }]))
 }
 
 test "a generic body whose needs or its callees' read a variable's layout or type is settled by its callers" {
-  let answers = Map::of_entries([
+  let answers = by_def([
     { key: b"m.add", value: generic_body([], [{ var: 0, reads: Scalar }]) },
     { key: b"m.lay", value: generic_body([], [{ var: 0, reads: Layout }]) },
     { key: b"m.same", value: generic_body([], [{ var: 0, reads: Exact }]) },
@@ -2921,7 +3078,7 @@ test "a generic body whose needs or its callees' read a variable's layout or typ
     { key: b"m.main", value: generic_body([], []) },
   ]);
   let unemitted = settled_only(answers, Map::new(), closed_needs(answers, Map::new()));
-  assert_eq(unemitted.keys(), [b"m.each", b"m.lay", b"m.same"]);
+  assert_eq(unemitted.keys(), [b"m.each", b"m.lay", b"m.same"].map(def_root));
   // A specialisation is emitted at its type arguments, whatever its definition needs.
   let had = keyed([
     { key: at_key(b"m.same", [spelled(b"Int")], []), value: generic_body([], []) },
@@ -2929,7 +3086,8 @@ test "a generic body whose needs or its callees' read a variable's layout or typ
   ]);
   let kept = settled_bodies(had.answers, had.keys, settled_only(had.answers, had.keys, Map::new()));
   assert_eq(
-    kept.keys().map(|n: Bytes| match kept.get(n) { Some(Refused(_)) -> b"refused", _ -> b"body" }),
+    kept.keys().map(|n: RootName|
+      match kept.get(n) { Some(Refused(_)) -> b"refused", _ -> b"body" }),
     [b"refused", b"body"],
   );
   // One still reading a variable's type was settled on what leaves it open.
@@ -2950,14 +3108,14 @@ test "a generic body whose needs or its callees' read a variable's layout or typ
 
 test "a body calling one its callers settle, on no type arguments, is dropped as an error whatever was offered" {
   let calling = Body({ text: b"", tables: { ..no_tables(), calls: [Named(b"m.same")] } });
-  let answers = Map::of_entries([
+  let answers = by_def([
     { key: b"m.main", value: calling },
     { key: b"m.same", value: Refused({ why: settled_why() }) },
   ]);
-  let s = settle(answers, [b"m.main"], []);
+  let s = settle(answers, [def_root(b"m.main")], []);
   assert_eq(s.taken, []);
   assert_eq(s.dropped.map(|d: Dropped| { function: d.function, missing: d.missing }), [
-    { function: b"m.main", missing: None },
+    { function: def_root(b"m.main"), missing: None },
   ]);
   assert(s.dropped.all(|d: Dropped| d.construct.index_of(settled_why()) != None), None);
   assert_eq(fatal([], s.dropped).len(), 1)
@@ -2976,7 +3134,7 @@ test "a call of a generic tail loop at a type settles on the loop at it, whichev
       dump,
       [source],
       Map::new(),
-      [b"m.go", b"m.back"],
+      [Named(b"m.go"), Named(b"m.back")],
       |_: Bytes| None,
       |_: List<Record>| (),
     ) {
@@ -2987,7 +3145,7 @@ test "a call of a generic tail loop at a type settles on the loop at it, whichev
       // stands.
       assert_eq(
         [b"m.ping@Float", b"m.pong@String", b"m.ping", b"m.pong"].filter(|n: Bytes|
-          e.produced.taken.contains(n)),
+          e.produced.taken.map(root_text).contains(n)),
         [b"m.ping@Float", b"m.pong@String"],
       )
     },
@@ -3053,15 +3211,15 @@ test "lines are read as a final newline ends the last one" {
 
 test "a body dropped for a callee never offered is the offer's doing, and so is its fallout" {
   let dropped = [
-    { function: b"m.a", construct: b"why", missing: None },
-    { function: b"m.b", construct: b"lost", missing: Some(b"m.out") },
-    { function: b"m.c", construct: b"lost", missing: Some(b"m.b") },
-    { function: b"m.d", construct: b"lost", missing: Some(b"m.a") },
+    { function: def_root(b"m.a"), construct: b"why", missing: None },
+    { function: def_root(b"m.b"), construct: b"lost", missing: Some(def_root(b"m.out")) },
+    { function: def_root(b"m.c"), construct: b"lost", missing: Some(def_root(b"m.b")) },
+    { function: def_root(b"m.d"), construct: b"lost", missing: Some(def_root(b"m.a")) },
   ];
-  assert_eq(fatal([b"m.a", b"m.b", b"m.c", b"m.d"], dropped).map(|d: Dropped| d.function), [
-    b"m.a",
-    b"m.d",
-  ])
+  assert_eq(
+    fatal([b"m.a", b"m.b", b"m.c", b"m.d"].map(def_root), dropped).map(|d: Dropped| d.function),
+    [def_root(b"m.a"), def_root(b"m.d")],
+  )
 }
 
 /// A body of root `name` calling `calls` and naming a static of its own.
@@ -3102,7 +3260,8 @@ fn edited_body(name: Bytes) -> Answer / {abort.raise} =
     other -> other,
   }
 
-/// The codes of a unit over `answers`, offering `constants` as constants and the rest as calls.
+/// The codes of a unit over `answers`, offering `constants` as constants and the rest as calls, by
+/// the names of the definitions they are of.
 fn codes_over(
   answers: List<{ key: Bytes, value: Answer }>,
   offered: List<Bytes>,
@@ -3112,13 +3271,12 @@ fn codes_over(
     produce(
       a_runtime(b"r"),
       [],
-      offered.map(|n: Bytes|
-        { name: n, arity: 0, constant: constants.filter(|c: Bytes| c == n).len() > 0, site: n }),
+      offered.map(|n: Bytes| { ..offer(n, 0), constant: constants.contains(n) }),
       1,
-      Map::of_entries(answers),
+      by_def(answers),
       Map::new(),
     ).made,
-  )
+  ).fold(Map::new(), |m: Map<Bytes, Bytes>, n: RootName, code: Bytes| m.insert(root_text(n), code))
 
 test "a root's code moves with every body it can call, and with no other" {
   let program = |g: Answer|
@@ -3188,9 +3346,9 @@ test "a constructor's tag is its bucket's to read, at the position the unit's ow
     produce(
       runtime,
       ctors,
-      [{ name: b"m.f", arity: 0, constant: false, site: b"m.f" }],
+      [offer(b"m.f", 0)],
       1,
-      Map::new().insert(b"m.f", answer),
+      by_def([{ key: b"m.f", value: answer }]),
       Map::new(),
     ).text;
   let alone = unit([
@@ -3205,13 +3363,13 @@ test "a constructor's tag is its bucket's to read, at the position the unit's ow
     { name: b"m.Dot", arity: 0 },
     { name: b"m.Line", arity: 1 },
   ]);
-  let table = bucket_table(bucket_of(b"m.f"));
+  let table = bucket_table(def_bucket(b"m.f"));
   let body = Bytes::concat_all([b"{ return ", table, b"[1] + ", table, b"[0]; }"]);
   assert(alone.index_of(body) != None, None);
   assert(beside.index_of(body) != None, None);
   // The bucket declares the table, and the unit lays it out filled beside its descriptor.
   let declared = Bytes::concat_all([b"extern const uint32_t ", table, b"[];\n"]);
-  assert(bucket_part(alone, bucket_of(b"m.f")).index_of(declared) != None, None);
+  assert(bucket_part(alone, def_bucket(b"m.f")).index_of(declared) != None, None);
   let filled = |places: Bytes|
     Bytes::concat_all([b"const uint32_t ", table, b"[] = {", places, b" };\n"]);
   assert(alone.index_of(filled(b" 0, 2,")) != None, None);
@@ -3232,37 +3390,37 @@ test "a bucket's C reads the same whatever another bucket adds to the unit's tab
   let runtime = { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* --- the runtime --- */\n" };
   let other = range(0, 4096).fold(b"", |found: Bytes, i: Int| {
     let n = b"a.other".concat(ascii_of_int(i));
-    if found == b"" && bucket_of(n) != bucket_of(b"m.f") { n } else { found }
+    if found == b"" && def_bucket(n) != def_bucket(b"m.f") { n } else { found }
   });
   let unit = |names: List<Bytes>|
     produce(
       runtime,
       [{ name: b"None", arity: 0 }],
-      names.map(|n: Bytes| { name: n, arity: 0, constant: false, site: n }),
+      names.map(|n: Bytes| offer(n, 0)),
       1,
-      names.fold(Map::new(), |acc: Map<Bytes, Answer>, n: Bytes| acc.insert(n, one_body(n, []))),
+      by_def(names.map(|n: Bytes| { key: n, value: one_body(n, []) })),
       Map::new(),
     ).text;
   let alone = unit([b"m.f"]);
   let beside = unit([b"m.f", other]);
-  assert(bucket_part(alone, bucket_of(b"m.f")) != b"", None);
-  assert_eq(bucket_part(beside, bucket_of(b"m.f")), bucket_part(alone, bucket_of(b"m.f")));
+  assert(bucket_part(alone, def_bucket(b"m.f")) != b"", None);
+  assert_eq(bucket_part(beside, def_bucket(b"m.f")), bucket_part(alone, def_bucket(b"m.f")));
   // What moved is the rest of the unit: `other`'s bucket and the static its body names.
   assert(alone != beside, None)
 }
 
 test "a root whose entry the unit takes is listed as entered, and one whose entry it dropped is not" {
-  let entry = |n: Bytes| root_name(Entered(n));
+  let entry = |n: Bytes| root_name(Entered(Named(n)));
+  let offered = |n: RootName| { name: n, arity: 0, constant: false, site: n };
   let p = produce(
     a_runtime(b"r"),
     [],
-    [b"m.f", b"m.g", entry(b"m.f"), entry(b"m.g")].map(|n: Bytes|
-      { name: n, arity: 0, constant: false, site: n }),
+    [def_root(b"m.f"), def_root(b"m.g"), entry(b"m.f"), entry(b"m.g")].map(offered),
     1,
     Map::of_entries([
-      { key: b"m.f", value: one_body(b"m.f", []) },
-      { key: b"m.g", value: one_body(b"m.g", []) },
-      { key: entry(b"m.f"), value: one_body(entry(b"m.f"), [b"m.f"]) },
+      { key: def_root(b"m.f"), value: one_body(b"m.f", []) },
+      { key: def_root(b"m.g"), value: one_body(b"m.g", []) },
+      { key: entry(b"m.f"), value: one_body(root_text(entry(b"m.f")), [b"m.f"]) },
       { key: entry(b"m.g"), value: Refused({ why: b"no entry for it" }) },
     ]),
     Map::new(),
@@ -3271,16 +3429,18 @@ test "a root whose entry the unit takes is listed as entered, and one whose entr
   assert(p.text.index_of(b"entered m.f") != None, None);
   assert_eq(p.text.index_of(b"entered m.g"), None);
   // An entry the unit asked for and did not get fails the build, naming its root.
-  assert_eq(fatal([b"m.f", b"m.g"], p.dropped).map(|d: Dropped| d.function), [entry(b"m.g")])
+  assert_eq(fatal([def_root(b"m.f"), def_root(b"m.g")], p.dropped).map(|d: Dropped| d.function), [
+    entry(b"m.g"),
+  ])
 }
 
 test "every part of a unit compiles after the runtime's head and then the emitter's" {
   let p = produce(
     { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* tail */\n" },
     [],
-    [{ name: b"m.f", arity: 0, constant: false, site: b"m.f" }],
+    [offer(b"m.f", 0)],
     1,
-    Map::of_entries([{ key: b"m.f", value: one_body(b"m.f", []) }]),
+    by_def([{ key: b"m.f", value: one_body(b"m.f", []) }]),
     Map::new(),
   );
   let head = match p.text.index_of(b"/* --- bucket ") {
@@ -3294,7 +3454,7 @@ test "every part of a unit compiles after the runtime's head and then the emitte
 fn bucket_apart(prefix: Bytes, others: List<Bytes>) -> Bytes =
   range(0, 4096).fold(b"", |found: Bytes, i: Int| {
     let n = prefix.concat(ascii_of_int(i));
-    let free = others.fold(true, |ok: Bool, o: Bytes| ok && bucket_of(o) != bucket_of(n));
+    let free = others.fold(true, |ok: Bool, o: Bytes| ok && def_bucket(o) != def_bucket(n));
     if found == b"" && free { n } else { found }
   })
 
@@ -3307,13 +3467,9 @@ test "a bucket holds the bodies its names decide and declares what they reach, a
   let p = produce(
     { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* tail */\n" },
     [],
-    [
-      { name: caller, arity: 0, constant: false, site: caller },
-      { name: callee, arity: 2, constant: false, site: callee },
-      { name: apart, arity: 0, constant: false, site: apart },
-    ],
+    [offer(caller, 0), offer(callee, 2), offer(apart, 0)],
     1,
-    Map::of_entries([
+    by_def([
       { key: caller, value: one_body(caller, [callee]) },
       { key: callee, value: headed(one_body(callee, []), word_head(2)) },
       { key: apart, value: one_body(apart, []) },
@@ -3322,13 +3478,13 @@ test "a bucket holds the bodies its names decide and declares what they reach, a
   );
   let declares = |part: Bytes, name: Bytes, arity: Int|
     part.index_of(prototype(b"f_".concat(name), word_head(arity))) != None;
-  let calling = bucket_part(p.text, bucket_of(caller));
+  let calling = bucket_part(p.text, def_bucket(caller));
   assert(
     declares(calling, caller, 0) && declares(calling, callee, 2),
     Some(String::of_bytes_lossy(calling)),
   );
   assert(!declares(calling, apart, 0), Some(String::of_bytes_lossy(calling)));
-  let alone = bucket_part(p.text, bucket_of(apart));
+  let alone = bucket_part(p.text, def_bucket(apart));
   assert(
     !declares(alone, caller, 0) && !declares(alone, callee, 2),
     Some(String::of_bytes_lossy(alone)),
@@ -3340,7 +3496,7 @@ test "a bucket holds the bodies its names decide and declares what they reach, a
   [caller, callee, apart].fold((), |u: Unit, name: Bytes| {
     let defined = Bytes::concat_all([b"Word f_", name, b"(PlyCtx *ctx)"]);
     assert_eq(p.text.split(defined).len() - 1, 1);
-    assert_eq(bucket_part(p.text, bucket_of(name)).split(defined).len() - 1, 1);
+    assert_eq(bucket_part(p.text, def_bucket(name)).split(defined).len() - 1, 1);
     assert(head.index_of(b"f_".concat(name)) == None, None)
   })
 }
@@ -3351,20 +3507,17 @@ test "where the head defines `PLY_FAR` a bucket calls what another defines throu
   let p = produce(
     { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* tail */\n" },
     [],
-    [
-      { name: caller, arity: 0, constant: false, site: caller },
-      { name: callee, arity: 2, constant: false, site: callee },
-    ],
+    [offer(caller, 0), offer(callee, 2)],
     1,
-    Map::of_entries([
+    by_def([
       { key: caller, value: one_body(caller, [callee]) },
       { key: callee, value: headed(one_body(callee, []), word_head(2)) },
     ]),
     Map::new(),
   );
-  let calling = bucket_part(p.text, bucket_of(caller));
+  let calling = bucket_part(p.text, def_bucket(caller));
   let shown = Some(String::of_bytes_lossy(calling));
-  let table = far_table(bucket_of(caller));
+  let table = far_table(def_bucket(caller));
   let opened = calling.index_of(
     Bytes::concat_all([
       b"#ifdef PLY_FAR\nstatic void *const ",
@@ -3387,14 +3540,14 @@ test "where the head defines `PLY_FAR` a bucket calls what another defines throu
     _ -> assert(false, shown),
   };
   assert(calling.index_of(b"#define f_".concat(caller)) == None, shown);
-  assert(bucket_part(p.text, bucket_of(callee)).index_of(b"PLY_FAR") == None, None)
+  assert(bucket_part(p.text, def_bucket(callee)).index_of(b"PLY_FAR") == None, None)
 }
 
 // A call written to another head than its callee's is C two compilers disagree over silently, as
 // a `Word` and an `int64_t` are one type; the unit refuses it instead.
 test "specialisations alike but for their names are one root" {
   let body = |k: RootKey, other: Bytes| {
-    let name = root_name(k);
+    let name = printed(k);
     Body({
       text: Bytes::concat_all([
         b"Word ",
@@ -3415,7 +3568,12 @@ test "specialisations alike but for their names are one root" {
     { key: k, value: body(k, if arg == b"U8" { b"1" } else { b"0" }) }
   };
   let had = keyed([at(b"m.f", b"Int"), at(b"m.f", b"Bool"), at(b"m.f", b"U8"), at(b"m.g", b"Int")]);
-  assert_eq(alike(had.answers, had.keys).entries(), [{ key: b"m.f@Int", value: b"m.f@Bool" }])
+  assert_eq(alike(had.answers, had.keys).entries(), [
+    {
+      key: root_name(at_key(b"m.f", [spelled(b"Int")], [])),
+      value: root_name(at_key(b"m.f", [spelled(b"Bool")], [])),
+    },
+  ])
 }
 
 test "a call written to another head than the callee defines fails the unit" {
@@ -3439,12 +3597,9 @@ test "a call written to another head than the callee defines fails the unit" {
       produce(
         a_runtime(b"r"),
         [],
-        [
-          { name: caller, arity: 0, constant: false, site: caller },
-          { name: callee, arity: 1, constant: false, site: callee },
-        ],
+        [offer(caller, 0), offer(callee, 1)],
         1,
-        Map::of_entries([
+        by_def([
           { key: caller, value: expecting(head) },
           {
             key: callee,
@@ -3454,7 +3609,7 @@ test "a call written to another head than the callee defines fails the unit" {
         Map::new(),
       ).taken
     };
-  assert_eq(made({ answer: b"double", params: [b"double"] }), Ok([callee, caller]));
+  assert_eq(made({ answer: b"double", params: [b"double"] }), Ok([callee, caller].map(def_root)));
   match made(word_head(1)) {
     Ok(_) -> assert(false, Some("a call to another head was taken")),
     Err(why) ->
@@ -3475,10 +3630,9 @@ fn unit_of(
   produce(
     { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* --- the runtime --- */\n" },
     [],
-    answers.map(|a: { key: Bytes, value: Answer }|
-      { name: a.key, arity: 0, constant: false, site: a.key }),
+    answers.map(|a: { key: Bytes, value: Answer }| offer(a.key, 0)),
     1,
-    Map::of_entries(answers),
+    by_def(answers),
     inputs,
   )
 
@@ -3514,7 +3668,7 @@ test "a static two bodies name is defined once, in the tail, and declared by eac
   assert_eq(p.text.split(defined).len() - 1, 1);
   assert(tail_of(p.text).index_of(defined) != None, None);
   let declares = |id: Int| bucket_part(p.text, id).index_of(static_extern(name)) != None;
-  assert_eq([one, two, apart].map(|n: Bytes| declares(bucket_of(n))), [true, true, false]);
+  assert_eq([one, two, apart].map(|n: Bytes| declares(def_bucket(n))), [true, true, false]);
   // No pool: the unit says nothing of its constants to its loader.
   assert(p.text.index_of(b"consts ") == None, None)
 }
@@ -3553,7 +3707,7 @@ test "two statics of one name holding different content stop the unit" {
 }
 
 test "a kept body stands only where each callee it names still has the key it was filed with" {
-  let keys = Map::of_entries([{ key: b"m.b", value: b"kb" }]);
+  let keys = by_def([{ key: b"m.b", value: b"kb" }]);
   let body = one_body(b"m.a", [b"m.b"]);
   let filed = kept_of(keys, body);
   // The body names each root it calls by its key's digest, which the store keeps once.
@@ -3567,11 +3721,8 @@ test "a kept body stands only where each callee it names still has the key it wa
   assert(filed.calls.len() == 1 && filed.calls.all(|d: Bytes| d.len() == 32), None);
   assert_eq(standing_kept(keys, resolved, filed), Some(body));
   // Another tree's callee that hashes alike under another name: the C would call a name not here.
-  assert_eq(standing_kept(Map::of_entries([{ key: b"m.c", value: b"kb" }]), resolved, filed), None);
-  assert_eq(
-    standing_kept(Map::of_entries([{ key: b"m.b", value: b"another" }]), resolved, filed),
-    None,
-  );
+  assert_eq(standing_kept(by_def([{ key: b"m.c", value: b"kb" }]), resolved, filed), None);
+  assert_eq(standing_kept(by_def([{ key: b"m.b", value: b"another" }]), resolved, filed), None);
   // A root it calls that the store keeps no more: the body is asked for again.
   assert_eq(standing_kept(keys, Map::new(), filed), None)
 }
@@ -3603,14 +3754,15 @@ fn three_modules_dump() -> Dump / {abort.raise} = {
 test "roots are dealt a module at a time, each once, over no more lists than there are pieces" {
   let dump = three_modules_dump();
   let p = program_of(dump, three_modules());
-  let missed = dump.emitter_roots.map(|r: EmitterRoot| Named(r.root));
+  let missed = offered_roots(dump).keys;
   let lists = dealt(p, missed);
-  assert_eq(lists.len(), pieces());
+  // Fewer modules than pieces: a list a module.
+  assert_eq(lists.len(), ordered(missed.map(module_of)).len());
   assert_eq(
-    ordered(
-      lists.fold([], |acc: List<Bytes>, roots: List<RootKey>| acc.concat(roots.map(root_name))),
+    names_ordered(
+      lists.fold([], |acc: List<RootName>, roots: List<RootKey>| acc.concat(roots.map(root_name))),
     ),
-    ordered(missed.map(root_name)),
+    names_ordered(missed.map(root_name)),
   );
   assert_eq(lists.fold(0, |n: Int, roots: List<RootKey>| n + roots.len()), missed.len());
   let modules = |roots: List<RootKey>| ordered(roots.map(module_of));
@@ -3678,7 +3830,7 @@ test "a call written against a handing its callee does not publish fails the bui
   let body = |handings: List<Published>, assumed: List<Published>|
     Body({ text: b"", tables: { ..no_tables(), handings: handings, assumed: assumed } });
   // The callee publishes its parameter given; one caller was written lending it.
-  let answers = Map::of_entries([
+  let answers = by_def([
     { key: b"m.caller", value: body([], [handing(b"m.callee", [true])]) },
     { key: b"m.callee", value: body([handing(b"m.callee", [false])], []) },
     { key: b"m.fine", value: body([], [handing(b"m.callee", [false])]) },
@@ -3712,7 +3864,7 @@ test "a body written against a handing that moved is asked for again, with its r
       text: b"",
       tables: { ..no_tables(), handings: handings, assumed: assumed, group: group },
     });
-  let answers = Map::of_entries([
+  let entries = [
     {
       key: b"m.f",
       value: body([handing(b"m.f", [true])], [handing(b"m.h", [true])], [b"m.f", b"m.g"]),
@@ -3723,53 +3875,109 @@ test "a body written against a handing that moved is asked for again, with its r
     // A callee no answer publishes yet is judged once a later round answers it.
     { key: b"m.n", value: body([], [handing(b"m.absent", [true])], []) },
     { key: b"m.o", value: body([], [handing(b"m.absent", [false])], []) },
+  ];
+  let answers = by_def(entries);
+  let keys = by_def(
+    entries.map(|x: { key: Bytes, value: Answer }| { key: x.key, value: Named(x.key) }),
+  );
+  assert_eq(stale_of(answers, handings_held(Map::new(), answers), keys), [
+    Named(b"m.f"),
+    Named(b"m.g"),
   ]);
-  assert_eq(stale_of(answers, handings_held(Map::new(), answers)), [b"m.f", b"m.g"]);
   // A kept member of a group another member of which is asked for again goes with it.
-  assert_eq(groups_whole(answers.remove(b"m.g"), answers.keys()).keys(), [
-    b"m.h",
-    b"m.k",
-    b"m.n",
-    b"m.o",
-  ])
+  assert_eq(
+    groups_whole(answers.remove(def_root(b"m.g")), answers.keys()).keys(),
+    [b"m.h", b"m.k", b"m.n", b"m.o"].map(def_root),
+  )
 }
 
 test "the emitter answers roots dealt over calls as it answers them in one" {
   let dump = three_modules_dump();
   let p = program_of(dump, three_modules());
-  let missed = dump.emitter_roots.map(|r: EmitterRoot| Named(r.root));
+  let missed = offered_roots(dump).keys;
   let runtime = a_runtime(b"r");
-  let keys = missed.fold(Map::new(), |m: Map<Bytes, RootKey>, k: RootKey|
+  let keys = missed.fold(Map::new(), |m: Map<RootName, RootKey>, k: RootKey|
     m.insert(root_name(k), k));
-  let rows = |answers: Map<Bytes, Answer>|
-    answers.fold([], |acc: List<RootAnswer>, n: Bytes, a: Answer| acc.push({ name: n, answer: a }));
+  let rows = |answers: Map<RootName, Answer>|
+    answers.fold([], |acc: List<RootAnswer>, n: RootName, a: Answer|
+      acc.push({ name: n, answer: a }));
   let together = rows(answers_of(emitter_answers(runtime, dump, p, [], missed, [])));
   assert(
     together.fold(false, |found: Bool, r: RootAnswer|
       found
         || (match r.answer {
-          Body(b) -> b.tables.members == [b"c.even", b"c.odd"],
+          Body(b) -> b.tables.members == [b"c.even", b"c.odd"].map(def_root),
           Refused(_) -> false,
         })),
     None,
   );
-  // Dealt apart, a call of a definition another call emits is written against the handing that call
-  // publishes, asked again until no handing moves.
-  match answers_settled(
-      runtime,
+  // Dealt apart, place by place, a call of a definition another call emits is written against the
+  // handing that call published, and no root is asked for twice.
+  let dealt_apart = answers_settled(
+    runtime,
+    dump,
+    p,
+    [],
+    Map::new(),
+    Map::new(),
+    missed,
+    keys,
+    |_: Map<RootName, Answer>, known: Map<Bytes, Bool>| known,
+    Map::new(),
+  );
+  assert_eq(rows(dealt_apart.fresh), together);
+  assert_eq(dealt_apart.asked, missed.len());
+  // Each module past every module it imports.
+  let places = places_of(p);
+  assert(
+    p.imports.fold(true, |ok: Bool, m: Bytes, xs: List<Bytes>|
+      ok
+        && xs.all(|d: Bytes|
+          match ((places.get(m), places.get(d))) { (Some(a), Some(b)) -> a > b, _ -> true })),
+    None,
+  )
+}
+
+test "a cold unit asks the emitter for each root once, round by round" {
+  let dump = three_modules_dump();
+  let every = offered_roots(dump).keys;
+  // Each round asks for its roots once each: no handing moves under a body already written.
+  let paced = {
+    now: || 0,
+    told: |t: RoundTally|
+      if t.asked == t.roots - t.kept { () } else {
+        panic(
+          String::of_bytes_lossy(
+            Bytes::concat_all([
+              b"round ",
+              ascii_of_int(t.round),
+              b" asked ",
+              ascii_of_int(t.asked),
+              b" of ",
+              ascii_of_int(t.roots),
+            ]),
+          ),
+        )
+      },
+  };
+  let texts = three_modules();
+  let sources = sources_placed(
+    dump,
+    range(0, texts.len()).map(|i: Int| { name: [b"a", b"b", b"c"].get(i), src: texts.get(i) }),
+  );
+  match emitted(
+      a_runtime(b"r"),
       dump,
-      p,
+      sources,
+      Map::new(),
+      every,
+      |_: Bytes| None,
+      |_: List<Record>| (),
       [],
-      Map::new(),
-      Map::new(),
-      missed,
-      keys,
-      64,
-      |_: Map<Bytes, Answer>, known: Map<Bytes, Bool>| known,
-      Map::new(),
+      Some(paced),
     ) {
-    Err(why) -> panic(String::of_bytes_lossy(why)),
-    Ok(dealt_apart) -> assert_eq(rows(dealt_apart), together),
+    Ok(e) -> assert_eq((e.kept, e.misassumed), (0, [])),
+    Err(why) -> assert_eq(why, b""),
   }
 }
 
@@ -3802,11 +4010,11 @@ test "a unit holds a `const` definition as its kept value laid out as static dat
       ),
     },
   ];
-  let held = k.unit([b"m.table", b"m.row", b"m.names", b"m.first"], kept);
+  let held = k.unit([b"m.table", b"m.row", b"m.names", b"m.first"].map(Named), kept);
   let text = held.produced.text;
   let has = |b: Bytes| text.index_of(b) != None;
   // What a `const` body calls is no part of the unit, and no value is read back from text.
-  assert(!held.produced.taken.contains(b"m.spread"), None);
+  assert(!held.produced.taken.contains(def_root(b"m.spread")), None);
   assert(!has(b"rt_baked_p") && !has(b"rt_stored_p") && !has(b"rt_constant_p"), None);
   // Each answers from its static data: its entry hands back the value's word, which a read of it
   // neither steps through nor allocates; a record's is the static box of its words.
@@ -3830,7 +4038,7 @@ test "a unit holds a `const` definition as its kept value laid out as static dat
   assert(has(b"{ .rc = UINT32_MAX, .kind = 13, .len = 2, .layout = 32 }"), None);
   assert(has(b"{ .rc = UINT32_MAX, .kind = 8, .len = 2, .layout = 0 }"), None);
   // A value for a root the unit does not hold is no part of it.
-  let apart = k.unit([b"m.spread"], kept);
+  let apart = k.unit([Named(b"m.spread")], kept);
   assert_eq(apart.produced.text.index_of(symbol_of(b"m.table")), None)
 }
 
@@ -3838,7 +4046,7 @@ test "a kept value its definition's type does not hold stops the unit, naming th
   let k = kept_unit(b"const fn table() -> List<Int> = [1]\n");
   let stopped = handle {
     let wrong = match value::encode(VStr("x")) { Some(b) -> b, None -> b"" };
-    k.unit([b"m.table"], [{ name: b"m.table", bytes: wrong }]);
+    k.unit([Named(b"m.table")], [{ name: b"m.table", bytes: wrong }]);
     ""
   } with {
     abort.raise(m) -> m,
@@ -3850,10 +4058,11 @@ test "a `const` definition's stored root encodes what its body answers, calling 
   let k = kept_unit(
     b"const fn table() -> { n: Int, s: String } = { n: spread(3), s: \"x\" }\nfn spread(n: Int) -> Int = n + 1\n",
   );
-  let storing = k.unit([b"m.table", b"m.spread", stored_root(b"m.table")], []);
+  let stored = Stored(Named(b"m.table"));
+  let storing = k.unit([Named(b"m.table"), Named(b"m.spread"), stored], []);
   let text = storing.produced.text;
-  assert(storing.produced.taken.contains(b"m.table#stored"), None);
-  assert(storing.produced.taken.contains(b"m.table#stored#entered"), None);
+  assert(storing.produced.taken.contains(root_name(stored)), None);
+  assert(storing.produced.taken.contains(root_name(Entered(stored))), None);
   // It writes the value's encoding, sharing what it meets again, from a call of the definition's
   // own function rather than a constant's read of it.
   assert(text.index_of(b"lower_open") != None, None);
@@ -3861,11 +4070,13 @@ test "a `const` definition's stored root encodes what its body answers, calling 
   assert_eq(text.index_of(b"rt_constant_p"), None);
   assert_eq(text.index_of(b"rt_stored_p"), None);
   // It needs the definition held.
-  let alone = k.unit([stored_root(b"m.table")], []);
+  let alone = k.unit([stored], []);
   assert_eq(alone.produced.dropped.map(|d: Dropped| d.function), [
-    b"m.table#stored",
-    b"m.table#stored#entered",
-  ])
+    root_name(stored),
+    root_name(Entered(stored)),
+  ]);
+  // A stored root and its entry are named as they were before they were keys.
+  assert_eq([stored, Entered(stored)].map(printed), [b"m.table#stored", b"m.table#stored#entered"])
 }
 
 /// The units over module `m` of `source` and the prelude, whose functions what crosses a value of
@@ -3873,14 +4084,14 @@ test "a `const` definition's stored root encodes what its body answers, calling 
 /// definitions it names.
 fn kept_unit(
   source: Bytes,
-) -> { unit: (List<Bytes>, List<Baked>) -> Emission / {abort.raise} } / {abort.raise} = {
+) -> { unit: (List<RootKey>, List<Baked>) -> Emission / {abort.raise} } / {abort.raise} = {
   let user = [{ name: b"m", src: source }];
   let shipped = [{ name: b"std.prelude", src: prelude_source::text() }];
   let modules = user.concat(shipped);
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
   let runtime = { ..a_runtime(b"r"), natives: program_natives([]).map(native_of) };
   {
-    unit: |every: List<Bytes>, baked: List<Baked>|
+    unit: |every: List<RootKey>, baked: List<Baked>|
       match emitted(
           runtime,
           dump,
@@ -3914,7 +4125,7 @@ test "no root is asked to give back a scalar's box, which its last count gives b
       dump,
       [source],
       Map::new(),
-      every,
+      every.map(Named),
       |_: Bytes| None,
       |_: List<Record>| (),
       [],
@@ -3922,11 +4133,12 @@ test "no root is asked to give back a scalar's box, which its last count gives b
     Ok(e) -> e.produced,
     Err(why) -> panic(String::of_bytes_lossy(why)),
   };
+  let taken = produced.taken.map(root_text);
   let drop_at = |ty: Bytes| b"std.prelude.drop#".concat(ty);
   // Each list is let go of through its drop root, which lets go of its items as their types lay them.
   assert_eq(
     [b"List<Int>", b"List<Float>", b"List<Decimal>", b"List<U128>"].filter(|t: Bytes|
-      !produced.taken.contains(drop_at(t))),
+      !taken.contains(drop_at(t))),
     [],
   );
   // A perform's descriptors of `Int` and `Float` count and let go of their word forms through the
@@ -3937,7 +4149,7 @@ test "no root is asked to give back a scalar's box, which its last count gives b
     None,
   );
   assert_eq(
-    produced.taken.filter(|n: Bytes|
+    taken.filter(|n: Bytes|
       [b"Int", b"Float", b"Decimal", b"U128"].any(|t: Bytes|
         [b"drop#", b"dup#", b"release#"].any(|op: Bytes| n.ends_with(op.concat(t))))),
     [],
@@ -4007,7 +4219,7 @@ fn held_over(
   natives: List<Native>,
 ) -> Result<Bytes, List<Diag>> / {abort.raise} = {
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
-  let every = dump.emitter_roots.map(|r: EmitterRoot| r.root);
+  let every = offered_roots(dump).keys;
   held(
     dump,
     every,
@@ -4044,7 +4256,7 @@ fn refusal(r: Result<Bytes, List<Diag>>) -> List<Bytes> =
 test "a root the emitter answers nothing for is refused and listed, and the rest are answered and kept" {
   let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
-  let every = [b"m.one", b"m.absent", b"m.two"];
+  let every = [b"m.one", b"m.absent", b"m.two"].map(Named);
   let runtime = { ..a_runtime(b"r"), natives: declared_natives().map(native_of) };
   kept_bodies(|| {
     let run = ||
@@ -4061,13 +4273,11 @@ test "a root the emitter answers nothing for is refused and listed, and the rest
         Err(why) -> panic(String::of_bytes_lossy(why)),
       };
     let first = run();
-    assert_eq([b"m.one", b"m.two"].filter(|n: Bytes| first.produced.taken.contains(n)), [
-      b"m.one",
-      b"m.two",
-    ]);
+    let both = [b"m.one", b"m.two"].map(def_root);
+    assert_eq(both.filter(|n: RootName| first.produced.taken.contains(n)), both);
     assert_eq(
       first.produced.dropped.map(|d: Dropped| { function: d.function, construct: d.construct }),
-      [{ function: b"m.absent", construct: unanswered_why() }],
+      [{ function: def_root(b"m.absent"), construct: unanswered_why() }],
     );
     let said = refusal(held(dump, every, Ok(first)));
     assert_eq(said.at(0), Some(b"E0448"));
@@ -4078,6 +4288,82 @@ test "a root the emitter answers nothing for is refused and listed, and the rest
     // What the emitter answered is kept: the next run asks it for the unanswered root alone.
     assert_eq(run().asked, 1)
   })
+}
+
+test "each root a program offers is keyed by the row that says what it is, and prints as offered" {
+  let user = [
+    {
+      name: b"m",
+      src: Bytes::concat_all([
+        b"fn f(x: Int) -> Int requires x > 0 ensures result > 0 = x\n",
+        b"test \"t\" for n: Int in [1] { assert(n > 0) }\n",
+        b"law \"l\" forall (x: Int) where x > 0 { x + 1 > x }\n",
+      ]),
+    },
+  ];
+  // What a test over cases reads its table through.
+  let cases = {
+    name: b"std.cases",
+    src: Bytes::concat_all([
+      b"pub type Table<a> = List<a>\n",
+      b"pub type Listed = { label: String, identity: Bytes }\n",
+      b"pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / {abort.raise | e} = table.map(|c: a| { label: label(c), identity: b\"\" })\n",
+      b"pub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a / {abort.raise} = match table.at(at) { Some(c) -> c, None -> panic(\"no case\") }\n",
+    ]),
+  };
+  let dump = dump_of(analyse_pulling_std_with(user, [cases], no_rows()).out);
+  let offers = offered_roots(dump);
+  assert_eq(offers.unkeyed, []);
+  assert_eq(offers.keys.map(printed), dump.emitter_roots.map(|r: EmitterRoot| r.root));
+  assert_eq(offers.keys.filter(|k: RootKey| module_of(k) == b"m"), [
+    Named(b"m.f"),
+    test_key(b"m", b"t"),
+    Clause({ def: Named(b"m.f"), kind: Requires, n: 0 }),
+    Clause({ def: Named(b"m.f"), kind: Ensures, n: 0 }),
+    Cases(test_key(b"m", b"t")),
+    law_key(b"m", b"l", LawGuard),
+    law_key(b"m", b"l", LawBody),
+  ]);
+  let p = program_of(dump, sources_placed(dump, user.concat([cases])));
+  assert_eq(
+    offers.keys.filter(|k: RootKey| module_of(k) == b"m").filter(|k: RootKey| entered_root(p, k)),
+    [Named(b"m.f"), test_key(b"m", b"t"), Cases(test_key(b"m", b"t"))],
+  )
+}
+
+test "a root the front end offers with no typed row to key it by fails the build, and what calls it is dropped" {
+  let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
+  let whole = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
+  let dump = { ..whole, defs: whole.defs.filter(|d: DefRow| d.name != b"m.one") };
+  let offers = offered_roots(dump);
+  assert_eq(offers.unkeyed, [b"m.one"]);
+  let runtime = { ..a_runtime(b"r"), natives: declared_natives().map(native_of) };
+  match emitted(
+      runtime,
+      dump,
+      sources_placed(dump, user),
+      Map::new(),
+      offers.keys,
+      |_: Bytes| None,
+      |_: List<Record>| (),
+    ) {
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Ok(e) -> {
+      assert_eq(
+        e.produced.dropped.filter(|d: Dropped| d.function == def_root(b"m.two")).map(
+          |d: Dropped| d.missing,
+        ),
+        [Some(def_root(b"m.one"))],
+      );
+      let said = refusal(held(dump, offers.keys, Ok(e)));
+      assert_eq(said.at(0), Some(b"E0448"));
+      assert(
+        said.any(|n: Bytes|
+          n.index_of(Bytes::concat_all([b"`m.one` (", unkeyed_why(b"m.one"), b")"])) != None),
+        Some(String::of_bytes_lossy(Bytes::join(said, b"\n"))),
+      )
+    },
+  }
 }
 
 test "a unit tells each of its rounds to a build's phases as it ends, numbered from one" {
@@ -4097,7 +4383,7 @@ test "a unit tells each of its rounds to a build's phases as it ends, numbered f
         dump,
         sources_placed(dump, user),
         Map::new(),
-        [b"m.one", b"m.two"],
+        [Named(b"m.one"), Named(b"m.two")],
         |_: Bytes| None,
         |_: List<Record>| (),
         phases: Some({ now: || 0, told: told }),
@@ -4219,7 +4505,7 @@ test "a function of a type a module calls with no import is read from its home, 
   let p = program_of(dump, sources_placed(dump, user.concat(shipped)));
   assert_eq(
     emitter_answers(a_runtime(b"r"), dump, p, [], [Named(b"m.first")], []).map(|r: RootAnswer|
-      match r.answer { Body(_) -> r.name, Refused(no) -> no.why }),
+      match r.answer { Body(_) -> root_text(r.name), Refused(no) -> no.why }),
     [b"m.first"],
   )
 }
@@ -4233,11 +4519,11 @@ test "a law's body over a sort it leaves uninterpreted is lowered as a generic b
   ];
   let dump = dump_of(analyse(parse_all(user)));
   let p = program_of(dump, sources_placed(dump, user));
-  let root = law_root(b"m", b"identity is identity", b"body");
+  let root = law_key(b"m", b"identity is identity", LawBody);
   assert_eq(
-    emitter_answers(a_runtime(b"r"), dump, p, [], [Named(root)], []).map(|r: RootAnswer|
-      match r.answer { Body(_) -> r.name, Refused(no) -> no.why }),
-    [root],
+    emitter_answers(a_runtime(b"r"), dump, p, [], [root], []).map(|r: RootAnswer|
+      match r.answer { Body(_) -> root_text(r.name), Refused(no) -> no.why }),
+    [printed(root)],
   )
 }
 
@@ -4254,7 +4540,7 @@ test "a root the emitter refuses is asked again, and nothing of the refusal is k
           dump,
           [source],
           Map::new(),
-          [b"m.f"],
+          [Named(b"m.f")],
           |k: Bytes| body_store.get(k),
           |rs: List<Record>| body_store.put(rs),
         ) {
@@ -4262,11 +4548,12 @@ test "a root the emitter refuses is asked again, and nothing of the refusal is k
         Err(why) -> panic(String::of_bytes_lossy(why)),
       };
     // Its entry, written in its module, is refused with it.
+    let refused = [Named(b"m.f"), Entered(Named(b"m.f"))].map(root_name);
     let first = run();
-    assert_eq(first.produced.dropped.map(|d: Dropped| d.function), [b"m.f", b"m.f#entered"]);
+    assert_eq(first.produced.dropped.map(|d: Dropped| d.function), refused);
     let again = run();
     assert_eq(again.asked, 2);
-    assert_eq(again.produced.dropped.map(|d: Dropped| d.function), [b"m.f", b"m.f#entered"])
+    assert_eq(again.produced.dropped.map(|d: Dropped| d.function), refused)
   })
 }
 
@@ -4280,7 +4567,7 @@ test "a unit asks the emitter for a root a kept body names, though the body's de
           dump_of(analyse(parse_all([{ name: b"m", src: source }]))),
           [source],
           Map::new(),
-          [b"m.each", b"m.total", b"m.scaled"],
+          [b"m.each", b"m.total", b"m.scaled"].map(Named),
           |k: Bytes| body_store.get(k),
           |rs: List<Record>| body_store.put(rs),
         ) {
@@ -4353,7 +4640,7 @@ fn unit_kept<[r]>(
         dump,
         sources_placed(dump, user),
         Map::new(),
-        dump.emitter_roots.map(|x: EmitterRoot| x.root),
+        offered_roots(dump).keys,
         |k: Bytes| kept_records.get[ans](k),
         |rs: List<Record>| kept_records.put[ans](rs),
         phases: Some({ now: || 0, told: told }),
@@ -4461,23 +4748,20 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
     tail: b"/* tail */\n",
     helpers: [{ name: b"rt_a", args: 1, answers: true }],
   };
-  let answers = Map::new().insert(b"m.f", one_body(b"m.f", [])).insert(
-    b"m.g",
-    one_body(b"m.g", [b"m.gone"]),
-  );
+  let answers = by_def([
+    { key: b"m.f", value: one_body(b"m.f", []) },
+    { key: b"m.g", value: one_body(b"m.g", [b"m.gone"]) },
+  ]);
   let p = produce(
     runtime,
     [{ name: b"None", arity: 0 }],
-    [
-      { name: b"m.g", arity: 0, constant: false, site: b"m.g" },
-      { name: b"m.f", arity: 0, constant: true, site: b"m.f" },
-    ],
+    [offer(b"m.g", 0), { ..offer(b"m.f", 0), constant: true }],
     1,
     answers,
     Map::new(),
   );
-  assert_eq(p.taken, [b"m.f"]);
-  assert_eq(p.dropped.map(|d: Dropped| d.function), [b"m.g"]);
+  assert_eq(p.taken, [def_root(b"m.f")]);
+  assert_eq(p.dropped.map(|d: Dropped| d.function), [def_root(b"m.g")]);
   let own = statics_of(SStr(b"m.f")).get(0).name;
   assert(
     p.text.index_of(
@@ -4518,13 +4802,14 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
 }
 
 test "a unit lays its definitions out by name in byte order, each name as a C literal holds it" {
-  let names = [b"m.z", b"m.a#stored", b"m.B"];
+  let roots = [Named(b"m.z"), Stored(Named(b"m.a")), Named(b"m.B")];
   let p = produce(
     a_runtime(b"r"),
     [],
-    names.map(|n: Bytes| { name: n, arity: 2, constant: false, site: n }),
+    roots.map(|k: RootKey| { name: root_name(k), arity: 2, constant: false, site: root_name(k) }),
     1,
-    names.fold(Map::new(), |acc: Map<Bytes, Answer>, n: Bytes| acc.insert(n, one_body(n, []))),
+    roots.fold(Map::new(), |acc: Map<RootName, Answer>, k: RootKey|
+      acc.insert(root_name(k), one_body(printed(k), []))),
     Map::new(),
   );
   assert(
@@ -4535,7 +4820,11 @@ test "a unit lays its definitions out by name in byte order, each name as a C li
     Some(String::of_bytes_lossy(p.text)),
   );
   assert_eq(
-    laid([{ name: b"m.\"q\"", arity: 0, symbol: b"f", entry: b"e", head: word_head(0) }], [], []),
+    laid(
+      [{ name: def_root(b"m.\"q\""), arity: 0, symbol: b"f", entry: b"e", head: word_head(0) }],
+      [],
+      [],
+    ),
     Bytes::concat_all([
       b"\n/* --- what the loader takes by address --- */\nextern char e;\nvoid *const ply_code[] = {\n  0 };\n",
       b"struct ply_taken { const char *name; void *entry; unsigned long arity; };\n",
@@ -4550,39 +4839,36 @@ test "a unit says which constructors are read through a function, and which func
   let p = produce(
     { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* tail */\n" },
     [{ name: b"m.Box", arity: 2 }, { name: b"m.Dot", arity: 0 }],
-    [
-      { name: b"m.area", arity: 1, constant: false, site: b"m.area" },
-      { name: b"m.make", arity: 0, constant: false, site: b"m.make" },
-    ],
+    [offer(b"m.area", 1), offer(b"m.make", 0)],
     1,
-    Map::of_entries([
+    by_def([
       { key: b"m.area", value: one_body(b"m.area", [b"m.area"]) },
       { key: b"m.make", value: one_body(b"m.make", [b"m.area"]) },
     ]),
     Map::new(),
     [{ ctor: b"m.Box", key: Some(b"m.area"), show: Some(b"m.text"), numeric: [] }],
   );
-  assert_eq(p.taken, [b"m.area", b"m.make"]);
+  assert_eq(p.taken, [b"m.area", b"m.make"].map(def_root));
   assert(p.text.index_of(b"\"instances 1\" \"\\n\"\n\"m.Box m.area !\" \"\\n\"") != None, None);
   // A body that names the constructor is not taken without the key its type states.
   let alone = produce(
     a_runtime(b"r"),
     [{ name: b"m.Box", arity: 2 }],
-    [{ name: b"m.make", arity: 0, constant: false, site: b"m.make" }],
+    [offer(b"m.make", 0)],
     1,
-    Map::of_entries([{ key: b"m.make", value: one_body(b"m.make", [b"m.area"]) }]),
+    by_def([{ key: b"m.make", value: one_body(b"m.make", [b"m.area"]) }]),
     Map::new(),
     [{ ctor: b"m.Box", key: Some(b"m.area"), show: None, numeric: [] }],
   );
   assert_eq(alone.taken, []);
-  assert_eq(alone.dropped.map(|d: Dropped| d.missing), [Some(b"m.area")]);
+  assert_eq(alone.dropped.map(|d: Dropped| d.missing), [Some(def_root(b"m.area"))]);
   // A unit none of whose types states one says nothing of it.
   let plain = produce(
     a_runtime(b"r"),
     [],
-    [{ name: b"m.f", arity: 0, constant: false, site: b"m.f" }],
+    [offer(b"m.f", 0)],
     1,
-    Map::of_entries([{ key: b"m.f", value: one_body(b"m.f", []) }]),
+    by_def([{ key: b"m.f", value: one_body(b"m.f", []) }]),
     Map::new(),
   );
   assert(plain.text.index_of(b"instances") == None, None);
@@ -4618,14 +4904,14 @@ test "a read of a definition of no parameters keeps its value for good through i
       b"fn nothing() -> Option<Int> = none()\n",
     ]),
   );
-  let held = k.unit([b"m.flag", b"m.word", b"m.none", b"m.read", b"m.nothing"], []);
+  let held = k.unit([b"m.flag", b"m.word", b"m.none", b"m.read", b"m.nothing"].map(Named), []);
   let text = held.produced.text;
   let read_with = |keep: Bytes| text.index_of(Bytes::concat_all([b", ", keep, b")"])) != None;
   assert_eq(text.index_of(b"rt_constant_p"), None);
   assert(text.index_of(b"rt_memo_p(ctx, ") != None, None);
   // A word form that holds no block is kept as it is, and one that may by its type's root.
   assert(read_with(same_word_fn()), None);
-  assert(read_with(symbol_of(root_name(root_of(keys::Keep, string_type())))), None);
+  assert(read_with(symbol_of(printed(root_of(keys::Keep, string_type())))), None);
   // A generic definition is called at its caller's type arguments, which settle its body.
   assert_eq(held.produced.dropped.map(|d: Dropped| d.function), [])
 }
