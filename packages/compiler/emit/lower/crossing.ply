@@ -20,14 +20,14 @@ import emit.keys
 import emit.keys (RootKey, Root, Written, TypeOp, Lower, Lift, Dup, Worded)
 import emit.tir (Rep, RInt, RWord, RFloat, RNum, RAddr, Arg, AVar, AInt, AZero, Var, Val, Uses,
                  Prim, Get, PField, PPayload, Pack, Call, Native, Op, OContainer, OHandle, Lent,
-                 Owned, Handling, Static, Fn, Inst, Let, Do, Return, Plain, Declined, no_links,
-                 rep_of_arg)
+                 Owned, Handling, Static, Fn, Inst, Let, Do, Return, Inc, Plain, Declined, no_links,
+                 counted)
 import emit.tir.containers (Taken, Length)
 import emit.tir.handling (Encoded, Unsettled)
 import emit.tir.statics (SPlain, SStruct, WRaw, WAddress, WEntry, WBytes, WField, WHead)
 import emit.release (word_form_heads)
 import emit.lower.setting (builtin_at)
-import emit.lower.held (held_as, held_with)
+import emit.lower.held (held_as, held_with, typed_convention)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound, bound_as, done, handed, type_of,
                         filed, unfiled, noted, static_added)
 import emit.reps (Ctors, OpMode, type_vars)
@@ -214,17 +214,16 @@ fn called_at(cx: Context, callee: Span, args: List<Arg>) -> Type =
 fn lowered_part(cx: Context, st: Lowering, x: Arg, ty: Type, at: Span) -> Lowered / {abort.raise} = {
   let held = marks_of(ty).ty;
   if !settled(held) { refuse(st, Handling, b"a value lowered at a type left open") } else {
-    let rep = held_as(cx.setting, held);
-    let h = handed({ st: st, arg: x }, rep, at);
-    let unit = held_as(cx.setting, unit_type());
+    let conv = typed_convention(cx.setting.ctors, [held], unit_type());
+    let h = handed({ st: st, arg: x }, held_as(cx.setting, held), at);
     bound_as(
       h.st,
       unit_type(),
-      unit,
+      conv.answer,
       Call({
         callee: Root(marked_key(Lower, ty, cx.setting.module)),
         args: [h.arg],
-        conv: { params: [Lent], reps: [rep], answer: unit, answered: Owned },
+        conv: conv,
         stops: false,
       }),
       at,
@@ -237,15 +236,15 @@ fn lowered_part(cx: Context, st: Lowering, x: Arg, ty: Type, at: Span) -> Lowere
 fn lifted_part(cx: Context, st: Lowering, ty: Type, at: Span) -> Lowered / {abort.raise} = {
   let held = marks_of(ty).ty;
   if !settled(held) { refuse(st, Handling, b"a value lifted at a type left open") } else {
-    let rep = held_as(cx.setting, held);
+    let conv = typed_convention(cx.setting.ctors, [], held);
     bound_as(
       st,
       held,
-      rep,
+      conv.answer,
       Call({
         callee: Root(marked_key(Lift, ty, cx.setting.module)),
         args: [],
-        conv: { params: [], reps: [], answer: rep, answered: Owned },
+        conv: conv,
         stops: false,
       }),
       at,
@@ -848,22 +847,18 @@ pub fn worded(ctors: Ctors, k: RootKey) -> Result<Fn, Declined> =
       let rep = held_with(ctors, w.ty);
       let word = { id: 0, ty: w.ty, rep: RWord };
       let held = { id: 1, ty: w.ty, rep: rep };
-      let call = |op: TypeOp, args: List<Arg>, answer: Rep|
+      let call = |op: TypeOp, args: List<Arg>, answer: Type|
         Call({
           callee: Root(Written({ ..w, op: op })),
           args: args,
-          conv: {
-            params: args.map(|_: Arg| Lent),
-            reps: args.map(rep_of_arg),
-            answer: answer,
-            answered: Owned,
-          },
+          conv: typed_convention(ctors, args.map(|_: Arg| w.ty), answer),
           stops: false,
         });
       let opened = rep == RWord;
       match w.op {
-        // The counts are the counting pass's to place. It answers the `()` the lowering answered,
-        // which the runtime lets go of unread.
+        // A plain root counts as written: the lowering takes what it is handed, so the lent word
+        // takes a count of the entry's own first. It answers the `()` the lowering answered, which
+        // the runtime lets go of unread.
         Worded(Lower) -> {
           let done = { id: 2, ty: unit_type(), rep: held_with(ctors, unit_type()) };
           Ok(
@@ -872,19 +867,21 @@ pub fn worded(ctors: Ctors, k: RootKey) -> Result<Fn, Declined> =
               unit_type(),
               done.rep,
               [word],
-              (if opened { [] } else {
-                [
-                  Let({
-                    var: held,
-                    val: Pack({ arg: AVar(word), to: rep }),
-                    at: dummy_span(),
-                    unwind: [],
-                  }),
-                ]
-              }).concat([
+              (if counted(rep) { [Inc({ var: word, n: 1 })] } else { [] }).concat(
+                if opened { [] } else {
+                  [
+                    Let({
+                      var: held,
+                      val: Pack({ arg: AVar(word), to: rep }),
+                      at: dummy_span(),
+                      unwind: [],
+                    }),
+                  ]
+                },
+              ).concat([
                 Let({
                   var: done,
-                  val: call(Lower, [AVar(if opened { word } else { held })], done.rep),
+                  val: call(Lower, [AVar(if opened { word } else { held })], unit_type()),
                   at: dummy_span(),
                   unwind: [],
                 }),
@@ -901,7 +898,7 @@ pub fn worded(ctors: Ctors, k: RootKey) -> Result<Fn, Declined> =
               w.ty,
               RWord,
               [],
-              [Let({ var: held, val: call(Lift, [], rep), at: dummy_span(), unwind: [] })].concat(
+              [Let({ var: held, val: call(Lift, [], w.ty), at: dummy_span(), unwind: [] })].concat(
                 if opened { [Return(AVar(held))] } else {
                   [
                     Let({
