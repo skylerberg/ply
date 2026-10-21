@@ -2,7 +2,9 @@
 
 import std.bytes (ascii_of_int)
 import std.pace (Measure, outgrown)
-import emit.tir (Inst, Block, Let, Make, Inc, Reset, If, Case, Match, Loop, Handle)
+import emit.tir (Inst, Block, Let, Do, Make, Inc, Reset, If, Case, Match, Loop, Handle, Fn, Val,
+                 Get, Op, OStrings, OContainer, PPayload, RInt, RAddr)
+import emit.tir.containers (Taken)
 import emit.compare (program_of, formed, checked, printed_by_form)
 import emit.own (owned)
 import emit.verify (verified)
@@ -301,6 +303,101 @@ test "a buffer appended to through a value held alone is handed on with no count
       assert_eq(counts(b"iterated"), Ok({ incs: 0, resets: 0, reused: 0 }));
       assert_eq(counts(b"widened"), Ok({ incs: 0, resets: 0, reused: 0 }));
       match checked(p, b"guarded") { Ok(_) -> (), Err(why) -> assert_eq(why, b"") }
+    },
+  }
+}
+
+/// Programs whose bodies read the bytes of strings and byte strings: through an address each, by
+/// operations over bytes, and out of a crossing's buffer.
+fn bytes_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"fn first(b: Bytes, i: Int) -> Int / {abort.raise} = b.at(i)\n",
+    b"fn starts(a: String, b: String) -> Bool = a.starts_with(b)\n",
+    b"fn holds(a: String, b: String) -> Bool = a.contains(b)\n",
+    b"fn cut(b: Bytes, i: Int, j: Int) -> Bytes / {abort.raise} = b.slice(i, j)\n",
+    b"fn zipped(b: Bytes) -> Bytes = b.gzip()\n",
+  ])
+
+/// `b` with each value `broken` breaks broken, through the blocks it holds.
+fn broken_in(b: Block, broken: (Inst) -> Option<Inst>) -> Block =
+  b.map(|i: Inst|
+    match broken(i) {
+      Some(x) -> x,
+      None -> match i {
+        If(x) ->
+          If({ ..x, then: broken_in(x.then, broken), otherwise: broken_in(x.otherwise, broken) }),
+        Case(c) ->
+          Case({
+            ..c,
+            arms: c.arms.map(|a: { when: Int, body: Block }|
+              { when: a.when, body: broken_in(a.body, broken) }),
+            rest: broken_in(c.rest, broken),
+          }),
+        Match(m) ->
+          Match({
+            arms: m.arms.map(|a: Block| broken_in(a, broken)),
+            rest: broken_in(m.rest, broken),
+          }),
+        Loop(l) -> Loop({ ..l, body: broken_in(l.body, broken) }),
+        Handle(h) -> Handle({ ..h, body: broken_in(h.body, broken) }),
+        _ -> i,
+      },
+    })
+
+/// An operation over bytes or a crossing's taken bytes written to take nothing and answer no count of
+/// its own, against its rule; an address read as a number.
+fn misheld(i: Inst) -> Option<Inst> =
+  match i {
+    Let(l) -> match l.val {
+      Op(o) -> match o.op {
+        OStrings(_) ->
+          Some(
+            Let({
+              ..l,
+              val: Op({
+                ..o,
+                uses: { ..o.uses, takes: o.uses.takes.map(|t: Bool| !t), owned: !o.uses.owned },
+              }),
+            }),
+          ),
+        OContainer(Taken) -> Some(Let({ ..l, val: Op({ ..o, uses: { ..o.uses, owned: false } }) })),
+        _ -> None,
+      },
+      Get(g) -> if g.path == PPayload { Some(Let({ ..l, var: { ..l.var, rep: RInt } })) }
+      else { None },
+      _ -> None,
+    },
+    Do(d) -> match d.val {
+      Op(o) -> match o.op {
+        OStrings(_) ->
+          Some(Do({ ..d, val: Op({ ..o, uses: { ..o.uses, owned: !o.uses.owned } }) })),
+        _ -> None,
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+test "bytes read through an address, operated on and taken from a crossing pass the check, which refuses each held otherwise" {
+  match program_of(bytes_corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let names = [b"first", b"starts", b"holds", b"cut", b"zipped"];
+      let counted = names.fold([], |acc: List<{ name: Bytes, f: Fn }>, n: Bytes|
+        match checked(p, n) {
+          Ok(f) -> acc.push({ name: n, f: f }),
+          Err(why) -> panic(String::of_bytes_lossy(n.concat(b": ").concat(why))),
+        });
+      assert_eq(counted.len(), names.len());
+      // Each body holds such a read, and read so breaks its rule: a bytes operation's counts, a
+      // crossing's taken bytes, an address held as a number.
+      assert_eq(
+        counted.filter(|c: { name: Bytes, f: Fn }| {
+          let broken = broken_in(c.f.body, misheld);
+          broken == c.f.body || verified({ ..c.f, body: broken }) == None
+        }).map(|c: { name: Bytes, f: Fn }| c.name),
+        [],
+      )
     },
   }
 }

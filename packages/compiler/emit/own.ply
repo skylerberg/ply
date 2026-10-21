@@ -38,11 +38,12 @@ import emit.tir (Rep, RWord, RInt, RBool, RFloat, RMaybe, RTagged, RFlat, RCases
                  Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter, Fail,
                  NoArm, Handle, Sited, Inc, Dec, Reset, Free, Opened, Block, Fn, Member, Convention,
                  Rooted, Lambda, Closure, Handed, Given, Lent, Owned, Borrowed, Returned, Test,
-                 TTag, Owns, ReadsOf, Lasts, Static, no_links, counted, operands, fails, used_as,
-                 var_of, rep_of_arg, parts_of, ends)
+                 TTag, Owns, ReadsOf, Lasts, Static, Op, OStrings, RAddr, PPayload, no_links,
+                 counted, operands, fails, used_as, var_of, rep_of_arg, parts_of, ends, string_uses)
+import emit.tir.strings (ByteRead)
 import emit.verify (verified, stacked_captures, payload_of, field_path, held_in_place, reuses_cells,
                     made_width, kept_reads, re_held, leaves, answer_held, boxed_read, word_held,
-                    immortals)
+                    immortals, points_into)
 
 /// How a counted variable is held: a count of its own, or read without one out of the owned
 /// variables `bases` names, each live while it is (none where nothing the body lets go of holds
@@ -708,13 +709,16 @@ fn passed_at(fx: Facts, s: Seen, r: Raise, k: Int, ops: List<Operand>) -> Raise 
   let used = expanded(fx, ops);
   {
     ..r,
+    // An address takes no count of its own: its block stays live through it instead.
     up: used.fold(r.up, |u: Map<Int, Bool>, o: Operand|
       match var_of(o.arg) {
-        Some(v) -> match fx.held.get(v.id) {
-          Some(ReadOf(bs)) -> if flattened(fx, bs).any(|x: Int| r.gone.contains(x)) {
-            u.insert(v.id, true)
-          } else { u },
-          _ -> u,
+        Some(v) -> if points_into(v.rep) { u } else {
+          match fx.held.get(v.id) {
+            Some(ReadOf(bs)) -> if flattened(fx, bs).any(|x: Int| r.gone.contains(x)) {
+              u.insert(v.id, true)
+            } else { u },
+            _ -> u,
+          }
         },
         None -> u,
       }),
@@ -816,7 +820,7 @@ fn word_types(fx: Facts, got: Map<Int, List<Int>>, s: Int) -> Map<Int, Type> =
 fn defined(fx: Facts, v: Var, h: Held) -> Facts =
   {
     ..fx,
-    held: if counted(v.rep) { fx.held.insert(v.id, h) } else { fx.held },
+    held: if counted(v.rep) || points_into(v.rep) { fx.held.insert(v.id, h) } else { fx.held },
     vars: fx.vars.insert(v.id, v),
     next: if v.id >= fx.next { v.id + 1 } else { fx.next },
   }
@@ -966,10 +970,11 @@ fn uses_of(fx: Facts, val: Val) -> List<Operand> =
     _ -> operands(val),
   }
 
-/// `live` with `v` live, and what `v` is read out of.
+/// `live` with `v` live, and what `v` is read out of; an address only keeps its block live.
 fn alive(fx: Facts, live: Live, v: Var) -> Live =
   resolved(fx, v).fold(live, |l: Live, x: Var|
-    if !counted(x.rep) { l }
+    if points_into(x.rep) { base_vars(fx, x).fold(l, |m: Live, b: Var| m.insert(b.id, b)) }
+    else if !counted(x.rep) { l }
     else { base_vars(fx, x).fold(l.insert(x.id, x), |m: Live, b: Var| m.insert(b.id, b)) })
 
 fn arg_live(fx: Facts, live: Live, a: Arg) -> Live =
@@ -1280,7 +1285,8 @@ fn planned(fx: Facts, uses: List<Operand>, after: Live) -> Plan = {
                 r.insert(b, true)),
             }
           };
-          if !counted(v.rep) || fx.immortal.contains(v.id) { used }
+          if points_into(v.rep) { base_vars(fx, v).fold(used, listed) }
+          else if !counted(v.rep) || fx.immortal.contains(v.id) { used }
           else { base_vars(fx, v).fold(listed(used, v), listed) }
         },
         None -> acc,
@@ -2046,6 +2052,29 @@ test "a value read out of a value read out of another keeps the first one live" 
     refused_with(f, reads.concat([Dec(p), bind(r, call_of([AVar(z)], [0]), []), Return(AVar(r))])),
     Some(b"a value read after what it was read out of was let go: v2"),
   )
+}
+
+test "an address into a block's bytes keeps the block held until it is read through, and takes no count" {
+  let b = word(0);
+  let a = { ..int(1), rep: RAddr };
+  let n = int(2);
+  let r = word(3);
+  let addressed = bind(a, Get({ of: b, path: PPayload }), []);
+  let byte = bind(
+    n,
+    Op({ op: OStrings(ByteRead), args: [AVar(a), AInt(0)], uses: string_uses(ByteRead) }),
+    [],
+  );
+  assert_eq(counted_body(root_of([b], [], RInt, [addressed, byte, Return(AVar(n))])), {
+    body: [addressed, byte, Dec(b), Return(AVar(n))],
+    refused: None,
+  });
+  // Handed on before it is read through, the block is counted once more to outlive the read.
+  let handed = counted_body(
+    root_of([b], [], RInt, [addressed, bind(r, call_of([AVar(b)], []), []), byte, Return(AVar(n))]),
+  );
+  assert_eq(handed.refused, None);
+  assert_eq([Inc({ var: b, n: 1 }), Dec(b)].map(|i: Inst| handed.body.contains(i)), [true, true])
 }
 
 test "a value read out of another keeps that one live until its last read" {
