@@ -3,7 +3,7 @@
 //! and its helper table are the runtime's to say, and are handed in.
 
 import store.hash.encoding (hex)
-import check.types (Type, TyVar, type_text, type_spelled, digits)
+import check.types (Type, TyVar, Scheme, type_text, type_spelled, digits)
 import emit.answer (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBytes,
                     ConstEmbedded, ConstFixed, ConstWide, ConstFloat, ConstDecimal, ConstChar,
                     ConstUnit, Defined, Head, Expect, word_head, no_generics, answer_bin,
@@ -11,18 +11,21 @@ import emit.answer (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, 
                     Reads, Scalar, Layout, Exact)
 import emit.roots (builtin_helper, symbol_of, entry_of, root_id)
 import emit.keys
-import emit.keys (RootKey, Named, At, Written, FnArg, root_name, definition_of, sited_as, key_lent,
-                  at_key, module_of)
+import emit.keys (RootKey, Named, At, Written, Entered, FnArg, root_name, definition_of, sited_as,
+                  key_lent, at_key, module_of)
+import emit
 import emit (emit_roots_answer)
 import emit.reps (ctor_layouts, spelled_field, laid_vars, has_vars, held_apart, ctor_sums, ctors_of,
                   type_vars, erased)
-import front.rows (Dump, EmitterRoot, EmitterCtor, CtorRow, KeyRow, ModuleRow, OrdinalRow)
+import front.rows (Dump, EmitterRoot, EmitterCtor, CtorRow, KeyRow, ModuleRow, OrdinalRow,
+                   KnownDefRow)
+import emit.written (CrossedSums, sums_crossed)
 import front.published (Linked, analyse, no_rows, dump_of, module_of_root)
 import front (analyse_pulling_std_with)
 import emit.typing (unknown_type)
 import front.diagnostics (parse_all)
 import check.infer (dump_flag)
-import check.infer.checker (law_root)
+import check.infer.checker (law_root, is_test_owner, cases_root)
 import check.infer.definitions (Extern, prelude_externs, externs_in, module_externs)
 import expand.rewrite (Elaborated, elaborated_natives)
 import emit.layout (Intrinsic, Layouts, intrinsics, layouts)
@@ -112,15 +115,17 @@ pub effect shipped {
 /// or raises otherwise.
 pub type Unbound = { declared: Extern, found: List<Native> }
 
-/// Each of `declared` that `natives` does not implement, in `declared`'s order.
+/// Each of `declared` that `natives` does not implement, in `declared`'s order: every native answers
+/// but a crossing native the compiler declares answering nothing.
 pub fn unbound(natives: List<Native>, declared: List<Extern>) -> List<Unbound> = {
   let by_name = natives.fold(Map::new(), |acc: Map<Bytes, List<Native>>, n: Native|
     acc.insert(n.name, List::push(match acc.get(n.name) { Some(ns) -> ns, None -> [] }, n)));
   declared.fold([], |acc: List<Unbound>, d: Extern| {
     let found = match by_name.get(d.name) { Some(ns) -> ns, None -> [] };
     match found {
-      [n] -> if n.words == d.words && n.answers && n.raises == d.raises { acc }
-      else { acc.push({ declared: d, found: found }) },
+      [n] -> if n.words == d.words && n.answers == declared_answers(d) && n.raises == d.raises {
+        acc
+      } else { acc.push({ declared: d, found: found }) },
       _ -> acc.push({ declared: d, found: found }),
     }
   })
@@ -215,6 +220,11 @@ fn called_externs(
   }
 }
 
+/// Whether the native `d` declares answers a word: all but a crossing native the compiler declares
+/// answering nothing.
+pub fn declared_answers(d: Extern) -> Bool =
+  d.module != b"" || !elaborated_natives().any(|n: Elaborated| n.name == d.name && !n.answers)
+
 fn native_said(words: Int, answers: Bool, raises: Bool) -> Bytes =
   Bytes::concat_all([
     b"takes ",
@@ -235,7 +245,7 @@ fn unbound_line(u: Unbound) -> Bytes = {
       Bytes::concat_all([
         named,
         b" ",
-        native_said(d.words, true, d.raises),
+        native_said(d.words, declared_answers(d), d.raises),
         b", and the runtime's native ",
         native_said(n.words, n.answers, n.raises),
       ]),
@@ -550,6 +560,15 @@ pub fn fatal(offered: List<Bytes>, dropped: List<Dropped>) -> List<Dropped> / {a
   dropped.filter(|d: Dropped| !narrowed.contains(d.function))
 }
 
+/// Whether the runtime enters root `n` of `p`, so the unit takes its entry, `n#entered`: a stored
+/// root, a test's run or the listing of its cases, or a definition `emit.enterable` admits by its
+/// scheme. A law's roots and a root written for a definition (a clause, a requirement) have none.
+fn entered_root(p: Program, n: Bytes) -> Bool / {abort.raise} =
+  if stored_of(n) != None || is_test_owner(n) { true } else if n.ends_with(cases_root(b"")) {
+    is_test_owner(n.slice(0, n.len() - cases_root(b"").len()))
+  } else if n.index_of(b"#") != None { false }
+  else { match p.schemes.get(n) { Some(sc) -> emit::enterable(p.crossing, sc), None -> false } }
+
 // --- Constants ------------------------------------------------------------------
 
 /// An `Int`'s 64 bits as sixteen hex digits, its sign bit included.
@@ -802,8 +821,9 @@ fn lines(label: Bytes, xs: List<Bytes>) -> Bytes =
 type BucketRow = { id: Int, places: List<Int> }
 
 /// What a unit says about itself for its loader to read: the helpers it binds, its constructors,
-/// each constant with its row of the code table, and the pools its positions index. What the loader
-/// takes by address, `laid` lays out instead.
+/// each constant with its row of the code table, the pools its positions index, and each root the
+/// runtime enters through its entry, `R#entered`, which it takes. What the loader takes by address,
+/// `laid` lays out instead.
 fn exports_text(
   helpers: List<Helper>,
   ctors: List<Ctor>,
@@ -813,6 +833,7 @@ fn exports_text(
   dropped: List<Dropped>,
   p: Pools,
   stated: List<Stated>,
+  entered: List<Bytes>,
 ) -> Bytes / {abort.raise} = {
   let held = taken.fold(Map::new(), |acc: Map<Bytes, Bool>, t: Taken| acc.insert(t.name, true));
   // `-` where the type states none, and `!` for a function the unit does not take, which a value
@@ -864,6 +885,8 @@ fn exports_text(
     b"decimals held raw\n",
     b"bytes slices are views\n",
     b"options held as their payload's word\n",
+    // The release's runtime reads these lines as nothing.
+    Bytes::concat_all(entered.map(|r: Bytes| Bytes::concat_all([b"entered ", r, b"\n"]))),
   ])
 }
 
@@ -1238,6 +1261,7 @@ pub fn produce(
   let rows = keyed.fold([], |acc: List<BucketRow>, b: Int, ks: Map<Bytes, Bool>|
     if ks.len() == 0 { acc }
     else { acc.push({ id: b, places: ks.keys().map(|k: Bytes| unit_place(k, placed, tags)) }) });
+  let took = s.taken.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
   let exports = exports_text(
     runtime.helpers,
     ctors,
@@ -1248,6 +1272,7 @@ pub fn produce(
     s.dropped,
     pools,
     stated,
+    offered.filter(|o: Offered| took.contains(root_name(Entered(o.name)))).map(|o: Offered| o.name),
   );
   let by_name = taken.fold(Map::new(), |acc: Map<Bytes, Taken>, t: Taken| acc.insert(t.name, t));
   {
@@ -1341,6 +1366,9 @@ type Program = {
   sources: List<Bytes>,
   /// A digest of what each module embeds, by its index: the emitter writes each call out as its bytes.
   embeds: Map<Int, Bytes>,
+  /// Each definition's scheme, as the emitter types it.
+  schemes: Map<Bytes, Scheme>,
+  crossing: CrossedSums,
 }
 
 fn program_of(dump: Dump, sources: List<Bytes>) -> Program = {
@@ -1358,6 +1386,9 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program = {
           ),
         ),
     });
+  let schemes = dump.rows.defs.fold(Map::new(), |acc: Map<Bytes, Scheme>, row: KnownDefRow|
+    acc.insert(row.name, row.scheme));
+  let prelude = prelude_module().concat(b".");
   {
     roots: dump.emitter_roots.fold(Map::new(), |acc: Map<Bytes, EmitterRoot>, root: EmitterRoot|
       acc.insert(root.root, root)),
@@ -1370,6 +1401,8 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program = {
     sources: sources,
     embeds: reads.fold(Map::new(), |acc: Map<Int, Bytes>, i: Int, parts: List<Bytes>|
       acc.insert(i, blake3(Bytes::concat_all(ordered(parts))))),
+    schemes: schemes,
+    crossing: sums_crossed(ctor_sums(dump.ctors), |n: Bytes| schemes.contains(prelude.concat(n))),
   }
 }
 
@@ -1444,6 +1477,14 @@ fn root_material(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> / 
             },
           },
       ),
+    // An entry is written from what its root takes and answers, which its definition decides.
+    Entered(n) -> match definition_material(program, match stored_of(n) {
+        Some(of) -> of,
+        None -> n,
+      }) {
+      Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
+      None -> None,
+    },
     _ -> definition_material(program, name),
   }
 }
@@ -1773,10 +1814,12 @@ pub fn keep_value<[r]>(
   write_kept[r](dir, key, blake3(text).concat(text))
 
 /// The root that answers a `const` definition's value as that text: what a build enters to keep it.
-pub fn stored_root(name: Bytes) -> Bytes = name.concat(b"#stored")
+pub fn stored_root(name: Bytes) -> Bytes = emit::stored_root(name)
 
-fn stored_of(root: Bytes) -> Option<Bytes> / {abort.raise} =
-  if root.ends_with(b"#stored") { Some(root.slice(0, root.len() - 7)) } else { None }
+fn stored_of(root: Bytes) -> Option<Bytes> / {abort.raise} = {
+  let suffix = stored_root(b"");
+  if root.ends_with(suffix) { Some(root.slice(0, root.len() - suffix.len())) } else { None }
+}
 
 /// `text` as adjacent C string literals, none longer than a compiler accepts. It is hex digits, so
 /// no byte of it needs an escape or reads as a placeholder.
@@ -1883,7 +1926,12 @@ pub fn emitted<| e>(
   let wanted = every.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
   let values = baked.fold(Map::new(), |acc: Map<Bytes, Baked>, b: Baked|
     if wanted.contains(b.name) { acc.insert(b.name, b) } else { acc });
-  let offered = every.filter(|n: Bytes| !values.contains(n) && stored_of(n) == None).map(Named);
+  let entries = every.filter(|n: Bytes| entered_root(p, n)).map(Entered);
+  let offered = every.filter(|n: Bytes| !values.contains(n) && stored_of(n) == None).map(
+    Named,
+  ).concat(
+    entries,
+  );
   // No constructor table: a body names each tag by its constructor, which its key's read
   // declarations already cover, so one answer serves every program that holds the root.
   let common = [
@@ -1907,16 +1955,22 @@ pub fn emitted<| e>(
           ctors,
           every.map(Named).concat(
             all.added.filter(|k: RootKey| !shared.contains(root_name(k))),
+          ).concat(
+            entries,
           ).map(|k: RootKey|
-            match p.roots.get(sited_as(k)) {
-              Some(r) ->
-                {
-                  name: root_name(k),
-                  arity: r.arity,
-                  constant: r.pure && r.arity == 0 && (match k { At(_) -> false, _ -> true }),
-                  site: sited_as(k),
-                },
-              None -> { name: root_name(k), arity: 0, constant: false, site: sited_as(k) },
+            match k {
+              // An entry takes no words: what it reads crosses through the runtime.
+              Entered(_) -> { name: root_name(k), arity: 0, constant: false, site: sited_as(k) },
+              _ -> match p.roots.get(sited_as(k)) {
+                Some(r) ->
+                  {
+                    name: root_name(k),
+                    arity: r.arity,
+                    constant: r.pure && r.arity == 0 && (match k { At(_) -> false, _ -> true }),
+                    site: sited_as(k),
+                  },
+                None -> { name: root_name(k), arity: 0, constant: false, site: sited_as(k) },
+              },
             }),
           p.modules.len(),
           every.fold(held, |acc: Map<Bytes, Answer>, n: Bytes|
@@ -2881,6 +2935,29 @@ test "a bucket's C reads the same whatever another bucket adds to the unit's tab
   assert(alone != beside, None)
 }
 
+test "a root whose entry the unit takes is listed as entered, and one whose entry it dropped is not" {
+  let entry = |n: Bytes| root_name(Entered(n));
+  let p = produce(
+    a_runtime(b"r"),
+    [],
+    [b"m.f", b"m.g", entry(b"m.f"), entry(b"m.g")].map(|n: Bytes|
+      { name: n, arity: 0, constant: false, site: n }),
+    1,
+    Map::of_entries([
+      { key: b"m.f", value: one_body(b"m.f", []) },
+      { key: b"m.g", value: one_body(b"m.g", []) },
+      { key: entry(b"m.f"), value: one_body(entry(b"m.f"), [b"m.f"]) },
+      { key: entry(b"m.g"), value: Refused({ why: b"no entry for it" }) },
+    ]),
+    Map::new(),
+  );
+  assert(p.taken.contains(entry(b"m.f")), None);
+  assert(p.text.index_of(b"entered m.f") != None, None);
+  assert_eq(p.text.index_of(b"entered m.g"), None);
+  // An entry the unit asked for and did not get fails the build, naming its root.
+  assert_eq(fatal([b"m.f", b"m.g"], p.dropped).map(|d: Dropped| d.function), [entry(b"m.g")])
+}
+
 test "every part of a unit compiles after the runtime's head and then the emitter's" {
   let p = produce(
     { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* tail */\n" },
@@ -3308,8 +3385,9 @@ test "a unit holds a `const` definition as the value a build kept, and makes its
     };
   let held = unit([b"m.table", b"m.first"], [{ name: b"m.table", text: b"78da" }]);
   // The value stands where the body would: nothing asks the emitter for it, or for what it calls.
-  assert_eq(held.asked, 1);
-  assert_eq(held.produced.taken, [b"m.first", b"m.table"]);
+  // `first` is entered; `table` is not, since the program holds nothing written for a list.
+  assert_eq(held.asked, 3);
+  assert_eq(held.produced.taken, [b"m.first", b"m.first#entered", b"m.lower#Int", b"m.table"]);
   assert(
     held.produced.text.index_of(
         Bytes::concat_all([
@@ -3327,15 +3405,24 @@ test "a unit holds a `const` definition as the value a build kept, and makes its
   assert_eq(apart.produced.text.index_of(b"_baked"), None);
   // The stored root reads the definition as any body reads a constant, and needs it held.
   let storing = unit([b"m.table", b"m.spread", stored_root(b"m.table")], []);
-  assert_eq(storing.asked, 2);
-  assert_eq(storing.produced.taken, [b"m.spread", b"m.table", b"m.table#stored"]);
+  assert_eq(storing.asked, 4);
+  assert_eq(storing.produced.taken, [
+    b"m.lower#Bytes",
+    b"m.spread",
+    b"m.table",
+    b"m.table#stored",
+    b"m.table#stored#entered",
+  ]);
   assert(storing.produced.text.index_of(b"rt_stored_p(ctx, held)") != None, None);
   let alone = unit([stored_root(b"m.table")], []);
-  assert_eq(alone.produced.dropped.map(|d: Dropped| d.function), [b"m.table#stored"])
+  assert_eq(alone.produced.dropped.map(|d: Dropped| d.function), [
+    b"m.table#stored",
+    b"m.table#stored#entered",
+  ])
 }
 
 fn native_of(e: Extern) -> Native =
-  { name: e.name, words: e.words, answers: true, raises: e.raises }
+  { name: e.name, words: e.words, answers: declared_answers(e), raises: e.raises }
 
 test "an `extern fn` no native implements, two do, or one does otherwise, is unbound" {
   let declared = |name: Bytes, words: Int, raises: Bool|
@@ -3380,7 +3467,13 @@ test "an `extern fn` no native implements, two do, or one does otherwise, is unb
   assert_eq(
     unbound([], [{ module: b"", name: b"?hold_take", words: 1, raises: false }]).map(unbound_line),
     [b"the compiler's `?hold_take`: no native of the runtime implements it"],
-  )
+  );
+  // A crossing native the compiler declares answering nothing is bound by one that answers nothing.
+  let crossing = { module: b"", name: b"?out_int", words: 1, raises: false };
+  assert_eq(unbound([native(b"?out_int", 1, false, false)], [crossing]), []);
+  assert_eq(unbound([native(b"?out_int", 1, true, false)], [crossing]).map(unbound_line), [
+    b"the compiler's `?out_int` takes 1 word, answers nothing and cannot raise, and the runtime's native takes 1 word and cannot raise",
+  ])
 }
 
 /// The unit of a program of `user` modules and the `shipped` ones they import, held against a
@@ -3558,11 +3651,12 @@ test "a root the emitter refuses is asked again, and nothing of the refusal is k
         Ok(e) -> e,
         Err(why) -> panic(String::of_bytes_lossy(why)),
       };
+    // Its entry, written in its module, is refused with it.
     let first = run();
-    assert_eq(first.produced.dropped.map(|d: Dropped| d.function), [b"m.f"]);
+    assert_eq(first.produced.dropped.map(|d: Dropped| d.function), [b"m.f", b"m.f#entered"]);
     let again = run();
-    assert_eq(again.asked, 1);
-    assert_eq(again.produced.dropped.map(|d: Dropped| d.function), [b"m.f"])
+    assert_eq(again.asked, 2);
+    assert_eq(again.produced.dropped.map(|d: Dropped| d.function), [b"m.f", b"m.f#entered"])
   })
 }
 

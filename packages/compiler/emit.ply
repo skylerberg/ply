@@ -10,12 +10,14 @@ import check.resolve.tables (ParsedModule, Source, Diag, qualify)
 import check.resolve (ResolveSucceeded, ResolveFailed, resolve_packaged)
 import check.resolve.scopes (PackageDeps, no_packages, of_binder)
 import expand.derive (expand_derives)
-import check.infer.checker (MemberSite, WitnessOp, test_owner, law_root, law_owner, cases_root)
+import check.infer.checker (MemberSite, WitnessOp, test_owner, law_root, law_owner, cases_root,
+                            listing_ty)
 import check.infer (expanded_mods)
-import check.types (Type, TyCon, TyVar, Scheme, int_type, bytes_type)
+import check.types (Type, TyCon, TyVar, TyFn, Scheme, int_type, bytes_type, unit_type, fn_type,
+                    monomorphic, row_empty)
 import emit.lower.setting (Setting, declared_schemes, walked_read, defs_in, resolved_imports,
                            effects_in, params_carried, law_params, facts_by_item, filings_of,
-                           labels_of)
+                           labels_of, param_type)
 import emit.lower.calling (known_body, lambdas_of, named_in, def_in)
 import emit.lower.scalars (walked_container)
 import emit.lower (tail_groups, tail_callees)
@@ -30,15 +32,17 @@ import expand.rewrite (expand)
 import expand.embed (EmbedAt, embed_tables, rewritten)
 import std.bytes (ascii_of_int)
 import emit.c (KBoxed, KInt, Kind, bytes_join)
-import emit.roots (container_ops)
 import emit.keys
-import emit.keys (RootKey, Named, At, Written, FnArg, TypeOp, Order, Reflect, Shown, Digest,
-                  Contained, root_name, sited_as, key_types, key_lent, op_name, module_of)
+import emit.keys (RootKey, Named, At, Written, Entered, FnArg, TypeOp, Order, Reflect, Shown,
+                  Digest, Lower, Lift, Contained, root_name, sited_as, key_types, key_lent, op_name,
+                  module_of)
 import emit.answer (Emitted, Body, Refused, RootAnswer)
 import emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, ModuleDefs, EmitParam, BoundLambda,
                   OwnerLambdas, kind_of, boxed, Sig, sig_of, param_kinds, param_types, typed_kind,
                   filings_at, at_args)
-import emit.written (container_code, equality_code, ordering_code, digest_code, reflection_code)
+import emit.written (WrittenRoot, CrossedSums, container_code, contained_formed, crossing_root,
+                     entered_code, crosses, equality_code, ordering_code, digest_code,
+                     reflection_code)
 import emit.entry (Prepared, RootForm, Unformed, group_formed, root_formed, formed_from, emitted_of)
 import emit.special (specialisations_wanted, witnessed_needs, definition_at, specialised_formed)
 
@@ -609,7 +613,16 @@ fn module_formed(
           },
         };
         clause_roots(
-          { out: out, fns: acc.fns + 1 },
+          {
+            out: entering(
+              s,
+              wanted,
+              stored_root(p.full),
+              Some(monomorphic(fn_type([], bytes_type(), row_empty()))),
+              entering(s, wanted, p.full, schemes.get(p.full), out),
+            ),
+            fns: acc.fns + 1,
+          },
           d,
           p.names,
           p.kinds,
@@ -647,12 +660,25 @@ fn module_formed(
             filed,
             body,
           );
-        let run = if !wants(wanted, full) { acc.out }
-        else { acc.out.push(rooted(full, ps, test_run(t))) };
+        let run = entering(
+          s,
+          wanted,
+          full,
+          Some(monomorphic(fn_type(ps.map(param_type), unit_type(), row_empty()))),
+          if !wants(wanted, full) { acc.out } else { acc.out.push(rooted(full, ps, test_run(t))) },
+        );
         let out = match t.cases {
           None -> run,
-          Some(c) -> if !wants(wanted, cases_root(full)) { run }
-          else { run.push(rooted(cases_root(full), [], test_listing(c))) },
+          Some(c) -> {
+            entering(
+              s,
+              wanted,
+              cases_root(full),
+              Some(monomorphic(fn_type([], listing_ty(), row_empty()))),
+              if !wants(wanted, cases_root(full)) { run }
+              else { run.push(rooted(cases_root(full), [], test_listing(c))) },
+            )
+          },
         };
         { out: out, fns: acc.fns }
       },
@@ -741,45 +767,41 @@ fn module_formed(
   // What a container's roots call of `std.prelude` the load reaches wherever a body writes one.
   let unreached = written_code().calls.filter(|n: Bytes|
     match def_in(module, here, s.imports, n) { Some(_) -> false, None -> true });
-  // A type some body reflects, digests or walks as a container is written for by a root.
+  let unreachable = |key: RootKey|
+    Unformed({
+      name: root_name(key),
+      why: b"a container's root calls what the load did not reach of `std.prelude`: ".concat(
+        Bytes::join(unreached, b", "),
+      ),
+    });
+  let written_formed = |key: RootKey, e: WrittenRoot|
+    formed_from(
+      { ..s, here: here.concat(e.here) },
+      0,
+      key,
+      e.params,
+      true,
+      e.code,
+      Ok({ ..no_filings(), typed: e.typed }),
+    );
+  // A type some body reflects, digests, walks as a container or hands the runtime is written for by
+  // a root.
   written_roots.fold(walked.out, |out: List<RootForm>, w: { key: RootKey, op: TypeOp, ty: Type }| {
     let r = { key: w.key, op: op_name(w.op), ty: w.ty };
+    let reflective = match w.op { Reflect -> true, Shown -> true, Digest -> true, _ -> false };
+    let contained = match w.op {
+      Contained(c) -> contained_formed(c),
+      _ -> reflective && walked_container(r.ty),
+    };
+    if w.op == Lower || w.op == Lift {
+      out.push(if walked_container(r.ty) && unreached.len() > 0 { unreachable(r.key) }
+      else { written_formed(r.key, crossing_root(module, s.ctors, r.key)) })
+    } else if contained {
+      out.push(if unreached.len() > 0 { unreachable(r.key) }
+      else { written_formed(r.key, container_code(module, s.ctors, r.op, r.ty)) })
+    }
     // A sum's comparisons are written where it is declared, above.
-    if match w.op {
-        Reflect -> false,
-        Shown -> false,
-        Digest -> false,
-        Contained(_) -> false,
-        _ -> true,
-      } { out }
-    else if (container_ops().contains(r.op) || walked_container(r.ty)) && unreached.len() > 0 {
-      out.push(
-        Unformed({
-          name: root_name(r.key),
-          why: b"a container's root calls what the load did not reach of `std.prelude`: ".concat(
-            Bytes::join(unreached, b", "),
-          ),
-        }),
-      )
-    } else if container_ops().contains(r.op) || walked_container(r.ty) {
-      let e = container_code(module, r.op, r.ty);
-      let word = |n: Bytes|
-        { name: n, kind: KBoxed, ty: kind_of(r.ty).ty, of: Some(r.ty), lambda: None };
-      let index = { name: b"i", kind: KInt, ty: TyOpen([]), of: Some(int_type()), lambda: None };
-      out.push(
-        formed_from(
-          { ..s, here: here.concat(e.here) },
-          0,
-          r.key,
-          if r.op.ends_with(b"_from") { [word(b"a"), word(b"b"), index] }
-          else if r.op == b"equal" || r.op == b"ordered" { [word(b"a"), word(b"b")] }
-          else { [word(b"a")] },
-          true,
-          Ok(e.code),
-          Ok({ ..no_filings(), typed: e.typed }),
-        ),
-      )
-    } else {
+    else if !reflective { out } else {
       let e = if r.op == b"digest" { digest_code(module, s.ctors, here, x_module.items, r.ty) }
       else { reflection_code(module, s.ctors, here, x_module.items, r.op == b"shown", r.ty) };
       let held = kind_of(r.ty);
@@ -799,6 +821,56 @@ fn module_formed(
 }
 
 type Walk = { out: List<RootForm>, fns: Int }
+
+/// The root a `const` definition's value is kept by, which the unit writes and the runtime enters
+/// to read the value.
+pub fn stored_root(name: Bytes) -> Bytes = name.concat(b"#stored")
+
+/// Whether a root typed by `sc` can be entered: a function over no type or label variable, each of
+/// whose parameters a lifting reads and whose answer a lowering writes.
+pub fn enterable(c: CrossedSums, sc: Scheme) -> Bool =
+  sc.ty_vars.len() == 0 && sc.label_vars.len() == 0
+    && (match sc.ty {
+      TyFn(f) -> f.params.all(|t: Type| crosses(c, t, true)) && crosses(c, f.ret, false),
+      _ -> false,
+    })
+
+/// `out` and, where `wanted` holds it, the entry the runtime enters root `full` through, `full`
+/// typed by `scheme`: one over a monomorphic function's parameters and answer, and refused for any
+/// other.
+fn entering(
+  s: Setting,
+  wanted: Option<Map<Bytes, Bool>>,
+  full: Bytes,
+  scheme: Option<Scheme>,
+  out: List<RootForm>,
+) -> List<RootForm> / {abort.raise} = {
+  let key = Entered(full);
+  if !wants(wanted, root_name(key)) { out } else {
+    match scheme {
+      // An entry over a type variable declines where its crossing reaches the variable.
+      Some(sc) -> match sc.ty {
+        TyFn(f) -> {
+          let e = entered_code(s.module, full, f.params, f.ret);
+          out.push(
+            formed_from(
+              { ..s, here: s.here.concat(e.here) },
+              0,
+              key,
+              e.params,
+              true,
+              e.code,
+              Ok({ ..no_filings(), typed: e.typed }),
+            ),
+          )
+        },
+        _ -> out.push(Unformed({ name: root_name(key), why: b"an entry of no function" })),
+      },
+      None ->
+        out.push(Unformed({ name: root_name(key), why: b"an entry of a root no scheme types" })),
+    }
+  }
+}
 
 /// A label parameter is a hidden trailing `Int`: the caller passes the resource's field-table entry.
 fn prepare(
