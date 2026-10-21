@@ -7,7 +7,7 @@ import std.bytes (ascii_of_int)
 import syntax.parsing (span_between)
 import check.types (TyCon)
 import emit.pieces (Piece, Text, merged, spelled)
-import emit.layout (header_bytes)
+import emit.layout (header_bytes, ctx_at)
 import emit.keys (Root, Named)
 import emit.tir (Rep, RInt, RWord, RFlat, RToken, RSum, Var, Val, Call, Prim, Block, Inst, Let, Do,
                  If, Case, Match, Loop, Handle, Inc, Dec, Free, AInt, AVar, Owned, Handling,
@@ -17,23 +17,21 @@ import emit.verify (stops_at)
 import emit.print.text (Printing, Place, Tail, printing, function_body, line, named, name_of,
                         part_names, unprinted)
 import emit.print.counts (count_printed, exit_of)
+import emit.lower.held (values_of)
 import emit.print.made (c_type)
 
 /// What printing a site or a `handle` linked before what it links its record around: the printing,
 /// how a failure under it leaves, the record's unlinking first, and the record, where it linked one.
 pub type Linked = { pr: Printing, leave: Bytes, record: Option<Bytes> }
 
-/// The C the head defines the context's chain of records by: its `frames` field, ninth, after the
-/// eight fields the runtime's own head declares.
-pub fn chain_defined() -> Bytes =
+/// The C the head defines the context's chain of records by: its `frames` field, past the fields the
+/// runtime's own head declares.
+pub fn chain_defined() -> Bytes / {abort.raise} =
   Bytes::concat_all([
     b"#define PLY_FRAMES(c) (*(PlyFrame **)((char *)(c) + ",
-    ascii_of_int(chain_at()),
+    ascii_of_int(ctx_at(b"frames")),
     b"))\n",
   ])
-
-/// The byte offset of the context's `frames` field, as the runtime describes its context.
-fn chain_at() -> Int = 64
 
 fn chain() -> Bytes = b"PLY_FRAMES(ctx)"
 
@@ -139,17 +137,16 @@ fn slots_of(pr: Printing, unwind: List<Var>) -> Slots / {abort.raise} = {
 
 fn token(r: Rep) -> Bool = match r { RToken(_) -> true, _ -> false }
 
-/// Which of the values a value held as `v.rep` is laid in hold a count, by place.
-fn counted_places(v: Var) -> List<Int> / {abort.raise} = {
-  let parts = parts_of(v.rep);
-  range(0, parts.len()).filter(|k: Int|
-    match parts.at(k) {
-      Some(RSum(_)) ->
-        unprinted(Handling, b"a sum held across a stop, whose words its layout names", var_said(v)),
-      Some(r) -> counted(r),
-      None -> false,
-    })
-}
+/// Which of the C values a value held as `v.rep` is held in hold a count, by their place among
+/// `values_of`'.
+fn counted_places(v: Var) -> List<Int> / {abort.raise} =
+  if parts_of(v.rep).any(|r: Rep| match r { RSum(_) -> true, _ -> false }) {
+    unprinted(Handling, b"a sum held across a stop, whose words its layout names", var_said(v))
+  } else {
+    let values = values_of(v.rep);
+    range(0, values.len()).filter(|k: Int|
+      match values.at(k) { Some(r) -> counted(r), None -> false })
+  }
 
 /// The C names of the values of `v`, named `name`, that hold a count, in order.
 fn counted_values(name: Bytes, v: Var) -> List<Bytes> / {abort.raise} = {
@@ -234,7 +231,7 @@ fn each_named(
     |acc: { at: Int, names: Map<Int, Bytes>, loads: List<Bytes>, vars: List<Var> }, i: Int| {
       let v = { ..held.get(i), id: i };
       let x = b"x".concat(ascii_of_int(i));
-      let parts = parts_of(v.rep);
+      let parts = values_of(v.rep);
       let names = part_names(x, v.rep);
       let places = counted_places(v);
       {
@@ -315,6 +312,7 @@ fn place() -> Place =
       looping: None,
       landing: None,
       group: None,
+      leaving: b"ctx->fuel += 1;",
     },
     at: span_between(0, 0),
     leave: b"goto ply_u0;",

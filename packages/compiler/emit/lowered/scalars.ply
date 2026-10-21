@@ -10,6 +10,9 @@ import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RCases, Va
                  Scalars)
 import emit.compare (Program, program_of, formed, printed_by_form, not_built)
 
+import emit.tir (Static)
+import emit.statics (Datum, SStr, SWide, statics_of)
+
 /// Every value `b` binds or does, through the blocks its branches hold.
 fn values(b: Block) -> List<Val> =
   b.fold([], |acc: List<Val>, i: Inst|
@@ -224,12 +227,12 @@ test "an Int quotient or remainder by a literal is C's own operator, and by anyt
   }
 }
 
-test "a Decimal is held in registers as its two words, a literal one read from the pool into them" {
+test "a Decimal is held in registers as its two words, a literal one written as them" {
   let p = analysed(
     b"fn d(a: Decimal, b: Decimal) -> Decimal = a * b - a\nfn dl(a: Decimal) -> Bool = a < 1.5m\n",
   );
   assert_eq(applied(p, b"d"), Ok([{ op: b"mul", on: RDec }, { op: b"sub", on: RDec }]));
-  assert_eq(applied(p, b"dl"), Ok([{ op: b"lt", on: RDec }]));
+  assert_eq(applied(p, b"dl"), Ok([{ op: b"decimal", on: RInt }, { op: b"lt", on: RDec }]));
   match formed(p, b"dl") {
     Err(no) -> assert_eq(no.why, b""),
     Ok(f) -> assert_eq(bound_in(f.body).map(|v: Var| v.rep), [RDec, RBool]),
@@ -248,7 +251,7 @@ test "a Decimal is held in registers as its two words, a literal one read from t
     Err(why) -> assert_eq(why, b""),
     Ok(text) ->
       assert(
-        text.index_of(b"ply_dec_of(") != None
+        text.index_of(b"= ((PlyDec){ INT64_C(") != None
           && text.index_of(b"rt_decimal_compare_p(ctx, p0.lo, p0.hi, ") != None,
       ),
   }
@@ -410,7 +413,7 @@ test "a value of a type variable is compared by the runtime, which notes the typ
   }
 }
 
-test "a constant the pool holds is read into a variable of its type, a register's written as itself" {
+test "a constant is a static object, a decimal its two words, and a register's written as itself" {
   let p = analysed(
     Bytes::concat_all([
       b"fn text() -> String = \"ply\"\n",
@@ -427,9 +430,27 @@ test "a constant the pool holds is read into a variable of its type, a register'
       Ok(f) ->
         Ok(match f.body.at(0) { Some(Let(l)) -> Some({ val: l.val, rep: l.var.rep }), _ -> None }),
     };
-  assert_eq(read(b"text"), Ok(Some({ val: Literal(LStr(b"ply")), rep: RWord })));
-  assert_eq(read(b"dec"), Ok(Some({ val: Literal(LDec(b"2.50m")), rep: RDec })));
-  assert_eq(read(b"huge"), Ok(Some({ val: Literal(LWide(b"U128", 0, 7)), rep: RWord })));
+  let named = |s: Datum| Static(statics_of(s).get(0).name);
+  assert_eq(read(b"text"), Ok(Some({ val: named(SStr(b"ply")), rep: RWord })));
+  // 2.50 is 250 at scale 2: the scale in the flags' bits 16 to 23, the mantissa from bit 32.
+  assert_eq(
+    read(b"dec"),
+    Ok(
+      Some({
+        val: Prim({ op: b"decimal", on: RInt, args: [AInt(2 << 16 | 250 << 32), AInt(0)] }),
+        rep: RDec,
+      }),
+    ),
+  );
+  assert_eq(
+    read(b"huge"),
+    Ok(
+      Some({
+        val: named(SWide({ width: { bits: 128, signed: false }, high: 0, low: 7 })),
+        rep: RWord,
+      }),
+    ),
+  );
   assert_eq(read(b"unit"), Ok(Some({ val: Literal(LUnit), rep: RWord })));
   match formed(p, b"top") {
     Err(no) -> assert_eq(no.why, b""),
@@ -438,11 +459,10 @@ test "a constant the pool holds is read into a variable of its type, a register'
   };
   match printed_by_form(p, b"text") {
     Err(why) -> assert_eq(why, b""),
-    Ok(t) ->
-      assert(
-        t.index_of(b"Word t1 = rt_lit_p(ctx, @@c=str:ply@@);\n  if (ctx->failed) return 0;")
-          != None,
-      ),
+    Ok(t) -> {
+      let address = Bytes::concat_all([b"(Word)(intptr_t)&", statics_of(SStr(b"ply")).get(0).name]);
+      assert(t.index_of(address) != None && t.index_of(b"rt_lit_p") == None, None)
+    },
   }
 }
 

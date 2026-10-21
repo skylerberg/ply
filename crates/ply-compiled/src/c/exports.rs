@@ -76,6 +76,8 @@ pub struct Exports {
     /// How the unit's C reads an `Int`, a `Decimal`, a bytes slice and an `Option`, as its
     /// [`RAW_INTS`], [`RAW_DECIMALS`], [`BYTES_VIEWS`] and [`OPTION_WORDS`] lines say.
     pub layout: RecordLayout,
+    /// Each root the unit is entered at through its `R#entered`, as its [`ENTERED`] lines say.
+    pub entered: Vec<String>,
 }
 
 /// A line after a unit's tables, where its C reads an `Int`, or a width below 64 bits, that a record,
@@ -94,6 +96,13 @@ pub const BYTES_VIEWS: &str = "bytes slices are views";
 /// A line after a unit's tables, where its C reads an `Option` a record, an array or a constructor
 /// holds as its payload's word, zero for `None`; a unit without it reads the `Option`'s word.
 pub const OPTION_WORDS: &str = "options held as their payload's word";
+
+/// What opens a line after a unit's tables naming a root `R` the unit is entered at through the
+/// definition `R#entered` it takes, which takes no words: the runtime opens a lowering for the
+/// answer and over it a lifting of the arguments' list, and `R#entered` reads them, calls `R` and
+/// writes its answer. A unit with no such line is entered with its arguments as words and its
+/// answer read by its layout.
+pub const ENTERED: &str = "entered ";
 
 impl Exports {
     /// The address of each helper the unit binds, in its order; a unit recording one this runtime
@@ -187,6 +196,9 @@ impl Exports {
         if self.layout.option_words {
             out.push_str(&format!("{OPTION_WORDS}\n"));
         }
+        for root in &self.entered {
+            out.push_str(&format!("{ENTERED}{root}\n"));
+        }
         out
     }
 
@@ -257,13 +269,18 @@ impl Exports {
             bytes_views: false,
             option_words: false,
         };
+        let mut entered = Vec::new();
         while at < s.len() {
             match line(s, &mut at)? {
                 RAW_INTS => layout.raw_ints = true,
                 RAW_DECIMALS => layout.raw_decimals = true,
                 BYTES_VIEWS => layout.bytes_views = true,
                 OPTION_WORDS => layout.option_words = true,
-                _ => {}
+                other => {
+                    if let Some(root) = other.strip_prefix(ENTERED) {
+                        entered.push(root.to_string());
+                    }
+                }
             }
         }
         Some(Exports {
@@ -279,6 +296,7 @@ impl Exports {
             instances,
             numerics,
             layout,
+            entered,
         })
     }
 
