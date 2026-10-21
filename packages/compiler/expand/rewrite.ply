@@ -360,23 +360,71 @@ pub fn unwitnessed(e: Expr, concrete: (Bytes) -> Bool) -> Expr =
     _ -> e,
   }
 
-/// A native the compiler writes calls of where no source can: the words each call passes, and
-/// whether a failure of it raises rather than ending the run.
-pub type Elaborated = { name: Bytes, words: Int, raises: Bool }
+/// A native the compiler writes calls of where no source can: the words each call passes, whether
+/// it answers one, and whether a failure of it raises rather than ending the run.
+pub type Elaborated = { name: Bytes, words: Int, answers: Bool, raises: Bool }
 
-/// Every native the elaboration writes calls of, and `?encoded`, which the emitter writes.
-pub fn elaborated_natives() -> List<Elaborated> =
+/// Every native the compiler writes calls of: the elaboration's, then the emitter's.
+pub fn elaborated_natives() -> List<Elaborated> = elaboration_natives().concat(emitter_natives())
+
+/// The natives the elaboration writes calls of.
+fn elaboration_natives() -> List<Elaborated> =
   [
-    { name: b"?numeric_binary", words: 4, raises: false },
-    { name: b"?numeric_unary", words: 3, raises: false },
-    { name: b"?hold_take", words: 1, raises: false },
-    { name: b"?hold_bracket", words: 3, raises: false },
-    { name: b"?hold_new", words: 1, raises: false },
-    { name: b"?handler_init", words: 2, raises: false },
-    { name: b"?handler_var", words: 1, raises: false },
-    { name: b"?handler_set", words: 2, raises: false },
-    { name: b"?encoded", words: 1, raises: false },
+    { name: b"?numeric_binary", words: 4, answers: true, raises: false },
+    { name: b"?numeric_unary", words: 3, answers: true, raises: false },
+    { name: b"?hold_take", words: 1, answers: true, raises: false },
+    { name: b"?hold_bracket", words: 3, answers: true, raises: false },
+    { name: b"?hold_new", words: 1, answers: true, raises: false },
+    { name: b"?handler_init", words: 2, answers: true, raises: false },
+    { name: b"?handler_var", words: 1, answers: true, raises: false },
+    { name: b"?handler_set", words: 2, answers: true, raises: false },
   ]
+
+/// The natives the emitter writes calls of: the runtime's encoding of a value, and the crossing
+/// natives, which take and answer machine words only, raw. A crossing is written a part at a time
+/// into the innermost lowering (`?out_*`) and read a part at a time from the innermost lifting
+/// (`?in_*`); `?in_decimal` and `?in_fixed` answer a value's low word and keep its high word for
+/// `?in_high`; a native that answers bytes leaves them as the crossing's taken bytes and answers
+/// their count, and `?taken` copies them out.
+fn emitter_natives() -> List<Elaborated> =
+  [{ name: b"?encoded", words: 1, answers: true, raises: false }].concat(
+    [
+      { name: b"?out_tag", words: 1, answers: false },
+      { name: b"?out_int", words: 1, answers: false },
+      { name: b"?out_float", words: 1, answers: false },
+      { name: b"?out_decimal", words: 2, answers: false },
+      { name: b"?out_fixed", words: 3, answers: false },
+      { name: b"?out_char", words: 1, answers: false },
+      { name: b"?out_str", words: 2, answers: false },
+      { name: b"?out_bytes", words: 2, answers: false },
+      { name: b"?out_count", words: 2, answers: false },
+      { name: b"?out_ctor", words: 3, answers: false },
+      { name: b"?out_name", words: 2, answers: false },
+      { name: b"?out_handle", words: 1, answers: false },
+      { name: b"?out_carried", words: 2, answers: false },
+      { name: b"?out_fun", words: 2, answers: false },
+      { name: b"?out_again", words: 1, answers: true },
+      { name: b"?in_tag", words: 0, answers: true },
+      { name: b"?in_int", words: 0, answers: true },
+      { name: b"?in_float", words: 0, answers: true },
+      { name: b"?in_decimal", words: 0, answers: true },
+      { name: b"?in_fixed", words: 1, answers: true },
+      { name: b"?in_high", words: 0, answers: true },
+      { name: b"?in_char", words: 0, answers: true },
+      { name: b"?in_str", words: 0, answers: true },
+      { name: b"?in_bytes", words: 0, answers: true },
+      { name: b"?in_count", words: 1, answers: true },
+      { name: b"?in_field", words: 2, answers: false },
+      { name: b"?in_name_is", words: 2, answers: true },
+      { name: b"?in_handle", words: 0, answers: true },
+      { name: b"?lower_open", words: 1, answers: false },
+      { name: b"?lower_close", words: 0, answers: true },
+      { name: b"?lift_open", words: 2, answers: false },
+      { name: b"?lift_close", words: 0, answers: false },
+      { name: b"?taken", words: 2, answers: false },
+    ].map(|n: { name: Bytes, words: Int, answers: Bool }|
+      { name: n.name, words: n.words, answers: n.answers, raises: false }),
+  )
 
 /// The operator at `at`, over the witness of parameter `p`, as the runtime's call `name` of `code`.
 fn witness_call(at: Span, name: Bytes, code: Int, p: Bytes, operands: List<Expr>) -> Expr = {
@@ -828,7 +876,7 @@ test "a tagged literal and a `try` in a schema or in what a law instantiates one
 }
 
 test "each native the elaboration writes a call of is passed the words it is declared to take" {
-  let declared = elaborated_natives().fold(Map::new(), |acc: Map<Bytes, Int>, n: Elaborated|
+  let declared = elaboration_natives().fold(Map::new(), |acc: Map<Bytes, Int>, n: Elaborated|
     acc.insert(n.name, n.words));
   let parsed = parse(b"fn f<a>(x: a, y: a) -> a where numeric(a) = x + -y\n").node;
   let numeric = { ..parsed, items: parsed.items.map(numbered) };
@@ -868,8 +916,14 @@ test "each native the elaboration writes a call of is passed the words it is dec
     written.filter(|c: { name: Bytes, args: Int }| declared.get(c.name) != Some(c.args)),
     [],
   );
-  // Each but the one the emitter writes is written here.
   let names = written.fold(Map::new(), |acc: Map<Bytes, Bool>, c: { name: Bytes, args: Int }|
     acc.insert(c.name, true));
-  assert_eq(names.keys(), declared.remove(b"?encoded").keys())
+  assert_eq(names.keys(), declared.keys());
+  // The emitter's natives are its own: none is one the elaboration writes, and none is named twice.
+  let all = elaborated_natives().map(|n: Elaborated| n.name);
+  assert_eq(emitter_natives().filter(|n: Elaborated| declared.contains(n.name)), []);
+  assert_eq(
+    all.fold([], |seen: List<Bytes>, n: Bytes| if seen.contains(n) { seen } else { seen.push(n) }),
+    all,
+  )
 }
