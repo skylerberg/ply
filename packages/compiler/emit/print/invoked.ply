@@ -13,22 +13,22 @@ import emit.keys (Callee, Root, Generic, Named, Share, Keep, TypeOp, root_name)
 import emit.layout (header_bytes)
 import emit.pieces (Piece, Text, Hole, Symbol, LambdaEntry, placeholder, spelled)
 import emit.answer (Expect)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases, Leaf,
-                 Var, Arg, AVar, Given, Lent, Owned, Borrowed, Convention, Made, MClosure, Fn,
-                 Member, Lambda, Closure, Uses, Calling, Return, Rooted, rep_of_arg, made_said,
-                 no_links)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases, RSum,
+                 RUnit, Leaf, Var, Arg, AVar, Given, Lent, Owned, Borrowed, Convention, Made,
+                 MClosure, Fn, Member, Lambda, Closure, Uses, Calling, Return, Rooted, rep_of_arg,
+                 made_said, no_links)
 import emit.tir.calling (CallingOp, ConstantRead, Ticked)
 import emit.release (Held, Opening, InBox, stored_parts, drop_of)
-import emit.lower.held (fields_of, slot_rep, passing, InWords, ByReference, answer_buffer,
-                        value_words, boxed, unboxed, values_of, held_with)
+import emit.lower.held (passing, InWords, ByReference, answer_buffer, value_words, values_of,
+                        held_with)
 import emit.print.text (Printing, Place, printing, function_body, line, pad, temp, named, name_of,
-                        arg_text, site, slot, check, failing_return, part_names, part_name,
-                        assigned, unprinted)
+                        arg_text, site, slot, check, failing_return, part_names, assigned,
+                        unprinted)
 import emit.print.counts (let_go_of, walked, released, duped)
 import emit.print.made (c_type, c_types, zeros, word_as, arg_parts, head_types, head_params,
                         head_names, words_laid, parts_read, answer_parts, entry_opened, entry_outs,
                         entry_answered, entry_answer_values, parts_word, word_parts, declared,
-                        set_parts)
+                        set_parts, in_box)
 import emit.print.fuel (fuel_head)
 
 /// A call of `c.callee` on `c.args`, its answer into `into`, its failure tested after it. The head
@@ -93,7 +93,8 @@ fn invoked(
         Bytes::concat_all([
           pad(p.depth),
           match into {
-            Some(_) -> Bytes::concat_all([c_type(answer), b" ", nth(answered, 0), b" = "]),
+            Some(_) -> if answered.len() == 0 { b"" }
+            else { Bytes::concat_all([c_type(answer), b" ", nth(answered, 0), b" = "]) },
             None -> b"",
           },
         ]),
@@ -112,7 +113,7 @@ fn invoked(
 
 /// `args`, held as `reps` say, as the C arguments a call hands them as: each crossing in its C
 /// values as them, and each crossing by reference laid first into a buffer of its own words, handed
-/// as the buffer's address and then its box word where it has one.
+/// as the buffer's address.
 fn handed_as(
   pr: Printing,
   depth: Int,
@@ -128,7 +129,6 @@ fn handed_as(
       match passing(r) {
         InWords -> { ..acc, args: acc.args.concat(parts) },
         ByReference -> {
-          let held = unboxed(r);
           let t = temp(acc.pr);
           {
             pr: line(
@@ -138,11 +138,11 @@ fn handed_as(
                 b"Word ",
                 t.name,
                 b"[] = {",
-                Bytes::join(words_laid(parts, held), b", "),
+                Bytes::join(words_laid(parts, values_of(r)), b", "),
                 b"};",
               ]),
             ),
-            args: acc.args.push(t.name).concat(parts.drop(held.len())),
+            args: acc.args.push(t.name),
           }
         },
       }
@@ -508,8 +508,7 @@ fn entered_buffer(k: Int) -> Bytes = b"ply_e".concat(ascii_of_int(k))
 fn address_word(b: Bytes) -> Bytes = b"(Word)(intptr_t)".concat(b)
 
 /// The buffers tail group `f`'s function declares before its loop: one for each place a member
-/// takes a parameter by reference at, as many words as the widest such parameter there takes with
-/// its box word.
+/// takes a parameter by reference at, as many words as the widest such parameter there takes.
 pub fn group_buffers(f: Fn) -> List<Bytes> = {
   let width = f.members.fold(0, |w: Int, m: Member|
     if m.params.len() > w { m.params.len() } else { w });
@@ -517,7 +516,7 @@ pub fn group_buffers(f: Fn) -> List<Bytes> = {
     let n = f.members.fold(0, |most: Int, m: Member|
       match m.params.at(k) {
         Some(v) -> if passing(v.rep) == InWords { most } else {
-          let words = value_words(v.rep) + (if boxed(v.rep) { 1 } else { 0 });
+          let words = value_words(v.rep);
           if words > most { words } else { most }
         },
         None -> most,
@@ -529,7 +528,7 @@ pub fn group_buffers(f: Fn) -> List<Bytes> = {
 }
 
 /// `v`, a member's parameter of a tail group crossing by reference, bound in the member's arm from
-/// the word `word` of the group's function, the address of its words and its box word after them.
+/// the word `word` of the group's function, the address of its words.
 pub fn member_opened(pr: Printing, depth: Int, v: Var, word: Bytes) -> Printing = {
   let n = named(pr, v);
   let ts = c_types(v.rep);
@@ -949,33 +948,9 @@ pub fn group_wrapper(
                 words: acc.words.push(w.word),
               }
             },
-            // The caller's buffer of the value's words, with its box word after them where it has
-            // one, as the group's function reads a member's parameter crossing by reference.
-            ByReference -> if !boxed(r) { { ..acc, words: acc.words.push(address_word(param)) } }
-            else {
-              let n = value_words(r);
-              {
-                ..acc,
-                prep: acc.prep.push(
-                  Text(
-                    Bytes::concat_all([
-                      b"  Word ",
-                      made,
-                      b"[] = {",
-                      Bytes::join(
-                        range(0, n).map(|k: Int|
-                          Bytes::concat_all([param, b"[", ascii_of_int(k), b"]"])).push(
-                          part_name(param, unboxed(r).len()),
-                        ),
-                        b", ",
-                      ),
-                      b"};\n",
-                    ]),
-                  ),
-                ),
-                words: acc.words.push(address_word(made)),
-              }
-            },
+            // The caller's buffer of the value's words, as the group's function reads a member's
+            // parameter crossing by reference.
+            ByReference -> { ..acc, words: acc.words.push(address_word(param)) },
           }
         },
       );
@@ -1034,6 +1009,9 @@ fn group_answered(call: Bytes, answer: Rep) -> List<Piece> = {
       [Text(Bytes::concat_all([got, b"return 0;\n  return ", word_as(b"r", answer), b";\n"]))],
     RFlat(_) -> several_answered(got, answer),
     RCases(_) -> several_answered(got, answer),
+    RSum(_) -> if in_box(answer) { several_answered(got, answer) }
+    else { [Text(Bytes::concat_all([b"  return ", call, b";\n"]))] },
+    RUnit -> [Text(Bytes::concat_all([b"  ", call, b";\n  return 0;\n"]))],
     k ->
       [
         Text(
@@ -1105,39 +1083,19 @@ fn entry_type(c: Convention) -> Bytes = {
 fn convention_id(params: List<Rep>, answer: Rep) -> Bytes =
   int_lit(root_id(Bytes::join(params.push(answer).map(rep_spelled), b",")))
 
-/// How a convention spells a value crossing as `r`, as the emitter spells its carrier: a scalar by
-/// its kind, a record by its fields (one it holds in place by that record's), a sum held as its
-/// cases by each constructor and its argument.
+/// How a convention spells a value crossing as `r`: a scalar by its kind, a record by its leaves.
 fn rep_spelled(r: Rep) -> Bytes =
   match r {
-    RFlat(ls) -> fields_spelled(fields_of(ls)),
-    RCases(c) ->
+    RFlat(ls) ->
       Bytes::concat_all([
-        if c.tagged { b"t" } else { b"m" },
-        b"<",
-        Bytes::join(
-          c.cases.map(|x: { name: Bytes, leaves: List<Leaf> }|
-            if x.leaves.len() == 0 { x.name } else if x.leaves.len() == 1 {
-              Bytes::concat_all([
-                x.name,
-                b":",
-                match x.leaves.at(0) { Some(l) -> one_spelled(l.rep), None -> b"w" },
-              ])
-            } else {
-              Bytes::concat_all([
-                x.name,
-                b":",
-                fields_spelled(fields_of(x.leaves.take(x.leaves.len() - 1))),
-              ])
-            }),
-          b"|",
-        ),
-        b">",
+        b"{",
+        Bytes::join(ls.map(|l: Leaf| Bytes::concat_all([l.name, b":", one_spelled(l.rep)])), b","),
+        b"}",
       ]),
     _ -> one_spelled(r),
   }
 
-/// How a convention spells a value crossing as one value held as `r`.
+/// How a convention spells a value crossing as one value held as `r`, a sum by its words.
 fn one_spelled(r: Rep) -> Bytes =
   match r {
     RInt -> b"i",
@@ -1147,35 +1105,10 @@ fn one_spelled(r: Rep) -> Bytes =
     RMaybe -> b"m",
     RTagged -> b"t",
     RNum(w) -> Bytes::concat_all([if w.signed { b"s" } else { b"u" }, ascii_of_int(w.bits)]),
+    RSum(_) -> Bytes::concat_all([b"s", ascii_of_int(value_words(r))]),
+    RUnit -> b"n",
     _ -> b"w",
   }
-
-fn fields_spelled(fs: List<FieldTy>) -> Bytes =
-  Bytes::concat_all([
-    b"{",
-    Bytes::join(
-      fs.map(|f: FieldTy|
-        Bytes::concat_all([
-          f.name,
-          b":",
-          match in_place(f) {
-            Some(inner) ->
-              Bytes::concat_all([
-                b"{",
-                Bytes::join(
-                  inner.map(|g: FieldTy|
-                    Bytes::concat_all([g.name, b":", one_spelled(slot_rep(g.kind))])),
-                  b",",
-                ),
-                b"}",
-              ]),
-            None -> one_spelled(slot_rep(f.kind)),
-          },
-        ])),
-      b",",
-    ),
-    b"}",
-  ])
 
 /// `pr` with `expr` written as a value held as `rep`, into `into` where the value is kept.
 fn valued(p: Place, pr: Printing, into: Option<Var>, rep: Rep, expr: List<Piece>) -> Printing =
@@ -1233,7 +1166,7 @@ fn place() -> Place =
     depth: 0,
   }
 
-test "a call lays a record wider than four words in a buffer it hands with the box word, and reads a wide answer out of one it hands last" {
+test "a call lays a record wider than four words in a buffer it hands, and reads a wide answer out of one it hands last" {
   let wide = RFlat(range(0, 5).map(|i: Int| { name: b"f".concat(ascii_of_int(i)), rep: RInt }));
   let local = |id: Int| { id: id, ty: TyCon({ name: b"T", args: [] }), rep: wide };
   let conv = { params: [Given], reps: [wide], answer: wide, answered: Owned };
@@ -1248,16 +1181,15 @@ test "a call lays a record wider than four words in a buffer it hands with the b
     spelled(pr.out),
     Bytes::concat_all([
       b"  Word t1[] = {(Word)(w_0), (Word)(w_1), (Word)(w_2), (Word)(w_3), (Word)(w_4)};\n",
-      b"  Word t3[5];\n",
+      b"  Word t3[4];\n",
       b"  int64_t t2_0 = ",
       symbol_of(b"m.g"),
-      b"(ctx, t1, w_5, t3);\n",
+      b"(ctx, t1, t3);\n",
       b"  if (ctx->failed) return 0;\n",
       b"  int64_t t2_1 = (int64_t)t3[0];\n",
       b"  int64_t t2_2 = (int64_t)t3[1];\n",
       b"  int64_t t2_3 = (int64_t)t3[2];\n",
       b"  int64_t t2_4 = (int64_t)t3[3];\n",
-      b"  Word t2_5 = t3[4];\n",
     ]),
   );
   // The head the call was written to is the one a root of this convention is declared with.

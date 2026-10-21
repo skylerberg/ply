@@ -10,15 +10,15 @@ import syntax.items (Item, IFn, parse)
 import syntax.sites (numbered)
 import emit.code (PxList, PxVar)
 import emit.keys (Named)
-import emit.tir (RInt, RBool, RNum, RWord, RMaybe, RFloat, RCases, RSlice, Var, AVar, AInt, ABool,
-                 Val, Prim, Get, Pack, Gathered, Native, PArg, PLeaf, Inst, Let, Decl, Assign, If,
-                 Case, Match, Miss, Fail, NoArm, NoLet, Return, Block, Test, TTag, TInt, TRange,
-                 TLength, Rooted, Given, Owned, Family, Matching, Spine, Scalars, Data, Calling,
-                 Handling, Containers, no_links)
+import emit.tir (Rep, RInt, RBool, RNum, RWord, RFloat, RSum, RSlice, Var, AVar, AInt, ABool, Val,
+                 Prim, Get, Pack, Gathered, Native, PCase, PLeaf, Inst, Let, Decl, Assign, If, Case,
+                 Match, Miss, Fail, NoArm, NoLet, Return, Block, Test, TTag, TInt, TRange, TLength,
+                 Rooted, Given, Owned, Family, Matching, Spine, Scalars, Data, Calling, Handling,
+                 Containers, no_links)
 import emit.lower.base (started)
 import emit.lower.calling (context_of)
 import emit.lower.matching (arm_opened)
-import emit.compare (Program, program_of, formed, unbuilt)
+import emit.compare (Program, program_of, formed, unbuilt, printed_in)
 import emit.print (printed_fn)
 import emit.pieces (spelled)
 
@@ -28,7 +28,17 @@ fn int_var(id: Int) -> Var = { id: id, ty: ty(b"Int", []), rep: RInt }
 
 fn bool_var(id: Int) -> Var = { id: id, ty: ty(b"Bool", []), rep: RBool }
 
-fn maybe_int(id: Int) -> Var = { id: id, ty: ty(b"Option", [ty(b"Int", [])]), rep: RMaybe }
+/// Parameter `i` of root `m.<name>` of `src`'s form, held as the form holds it.
+fn param_of(src: Bytes, name: Bytes, i: Int) -> Var / {abort.raise} =
+  match program_of(src) {
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Ok(p) -> match formed(p, name) {
+      Ok(f) -> f.params.get(i),
+      Err(no) -> panic(String::of_bytes_lossy(no.why)),
+    },
+  }
+
+fn is_sum(r: Rep) -> Bool = match r { RSum(_) -> true, _ -> false }
 
 /// The body of root `m.<name>` of `src`'s form, or why it was not formed.
 fn body_of(src: Bytes, name: Bytes) -> Result<Block, Bytes> / {abort.raise} =
@@ -61,13 +71,13 @@ fn opening(arm: Block) -> Option<{ test: Test, when: Int, body: Block }> =
     _ -> None,
   }
 
-/// What `i` reads with `Get`, where it is a `Let` of one.
-fn read_at(i: Inst) -> Option<{ of: Var, path: Bytes }> =
+/// What `i` reads with `Get`, where it is a `Let` of one: the case whose payload it reads, or -1.
+fn read_at(i: Inst) -> Option<{ of: Var, case: Int }> =
   match i {
     Let(l) -> match l.val {
       Get(g) -> match g.path {
-        PArg(a) -> Some({ of: g.of, path: a.ctor }),
-        _ -> Some({ of: g.of, path: b"" }),
+        PCase(c) -> Some({ of: g.of, case: c.case }),
+        _ -> Some({ of: g.of, case: 0 - 1 }),
       },
       _ -> None,
     },
@@ -95,7 +105,7 @@ fn printed_of(src: Bytes, name: Bytes) -> Result<Bytes, Bytes> / {abort.raise} =
   match program_of(src) {
     Err(why) -> Err(why),
     Ok(p) -> match formed(p, name) {
-      Ok(f) -> Ok(spelled(printed_fn(f, no_ctors()).pieces)),
+      Ok(f) -> Ok(spelled(printed_in(p, f).pieces)),
       Err(no) -> Err(no.why),
     },
   }
@@ -240,19 +250,19 @@ test "a constructor's test names its place among its sum's constructors, and its
         opened.map(|o: Option<{ test: Test, when: Int, body: Block }>|
           match o {
             Some(x) ->
-              x.body.map(read_at).filter(|r: Option<{ of: Var, path: Bytes }>| r != None).len(),
+              x.body.map(read_at).filter(|r: Option<{ of: Var, case: Int }>| r != None).len(),
             None -> 0 - 1,
           }),
         [0, 2, 0],
       );
       let reads = match opened.at(1) { Some(Some(x)) -> x.body.take(2).map(read_at), _ -> [] };
       assert_eq(
-        reads.map(|r: Option<{ of: Var, path: Bytes }>|
-          match r { Some(x) -> Some({ of: x.of.id, rep: x.of.rep, path: x.path }), None -> None }),
-        [
-          Some({ of: 0, rep: RWord, path: b"m.Rect" }),
-          Some({ of: 0, rep: RWord, path: b"m.Rect" }),
-        ],
+        reads.map(|r: Option<{ of: Var, case: Int }>|
+          match r {
+            Some(x) -> Some({ of: x.of.id, sum: is_sum(x.of.rep), case: x.case }),
+            None -> None,
+          }),
+        [Some({ of: 0, sum: true, case: 1 }), Some({ of: 0, sum: true, case: 1 })],
       )
     },
   }
@@ -279,38 +289,45 @@ test "a constructor's arguments are read at its subject's type arguments, a gene
   assert_eq(read(b"first"), [Ok(TyVar(1)), Err(b"")])
 }
 
-test "an Option's constructors are tested on the word it is held as, its payload read where Some held" {
-  let o = maybe_int(0);
+test "an Option's constructors are tested on its words as its layout lays them, its payload read where Some laid it" {
+  let src = b"fn payload(o: Option<Int>) -> Int = match o { Some(n) -> n, None -> 0 }\n";
+  let o = param_of(src, b"payload", 0);
   let x = int_var(1);
   let j = int_var(2);
   let some = |body: Block|
     Case({ on: o, test: TTag([b"None", b"Some"]), arms: [{ when: 1, body: body }], rest: [Miss] });
   let none = |body: Block|
     Case({ on: o, test: TTag([b"None", b"Some"]), arms: [{ when: 0, body: body }], rest: [Miss] });
-  let src = b"fn payload(o: Option<Int>) -> Int = match o { Some(n) -> n, None -> 0 }\n";
   match body_of(src, b"payload") {
     Err(why) -> assert_eq(why, b""),
     Ok(body) ->
       assert_eq(arms_of(body), [
         [
           some([
-            bind(x, Get({ of: o, path: PArg({ ctor: b"Some", at: 0 }) })),
+            bind(x, Get({ of: o, path: PCase({ case: 1, at: 0 }) })),
             Assign({ var: j, arg: AVar(x) }),
           ]),
         ],
         [none([Assign({ var: j, arg: AInt(0) })])],
       ]),
   };
+  // A tag word and the payload after it.
   match printed_of(src, b"payload") {
     Err(why) -> assert_eq(why, b""),
     Ok(text) -> {
-      assert(text.index_of(b"  if ((p0) != 0) {\n") != None);
-      assert(text.index_of(b"  if ((p0) == 0) {\n") != None)
+      assert(
+        text.index_of(b"  if ((p0_0) == INT64_C(1)) {\n") != None,
+        Some(String::of_bytes_lossy(text)),
+      );
+      assert(
+        text.index_of(b"  if ((p0_0) == INT64_C(0)) {\n") != None,
+        Some(String::of_bytes_lossy(text)),
+      )
     },
   }
 }
 
-test "a Result held as a tagged word tests its tag, and a constructor inside it is tested where it lies" {
+test "a Result tests its case, and a constructor inside its payload is tested where the payload lays it" {
   let src = Bytes::concat_all([
     b"type Tone = | Warm | Cool\n",
     b"fn settled(r: Result<Int, Tone>) -> Int = match r { Ok(n) -> n, Err(Warm) -> 1, Err(Cool) -> 2 }\n",
@@ -323,8 +340,8 @@ test "a Result held as a tagged word tests its tag, and a constructor inside it 
         arms.map(|a: Block| opening(a).map(|o: { test: Test, when: Int, body: Block }| o.when)),
         [Some(0), Some(1), Some(1)],
       );
-      // The tone is read as the payload's word, which is its object, and tested there only under
-      // the test that the result is an `Err`.
+      // The tone is read out of the payload, a sum of its own, and tested there only under the test
+      // that the result is an `Err`.
       assert_eq(
         match opening(arms.get(1)) {
           Some(e) -> match first_case(e.body) {
@@ -332,27 +349,29 @@ test "a Result held as a tagged word tests its tag, and a constructor inside it 
               Some({
                 test: c.test,
                 when: c.arms.map(|a: { when: Int, body: Block }| a.when),
-                on: c.on.rep,
+                on: is_sum(c.on.rep),
               }),
             None -> None,
           },
           None -> None,
         },
-        Some({ test: TTag([b"m.Warm", b"m.Cool"]), when: [0], on: RWord }),
+        Some({ test: TTag([b"m.Warm", b"m.Cool"]), when: [0], on: true }),
       )
     },
   };
   match printed_of(src, b"settled") {
     Err(why) -> assert_eq(why, b""),
     Ok(text) -> {
-      assert(text.index_of(b"  if (((p0) & 7) != 4) {\n") != None);
-      assert(text.index_of(b"  if (((p0) & 7) == 4) {\n") != None);
-      assert(text.index_of(b")->layout == @@Tm.Cool@@) {\n") != None)
+      assert(
+        text.index_of(b"  if ((p0_0) == INT64_C(1)) {\n") != None,
+        Some(String::of_bytes_lossy(text)),
+      );
+      assert(text.index_of(b"rt_ctor_value_p(") == None && text.index_of(b"->layout") == None, None)
     },
   }
 }
 
-test "a sum held as its cases is tested by its constructor's index" {
+test "a sum of constructors taking nothing is tested by its word's value" {
   let src = Bytes::concat_all([
     b"type Tone = | Warm | Cool\n",
     b"fn chosen(c: Bool) -> Int = { let t = if c { Warm } else { Cool }; match t { Warm -> 1, Cool -> 2 } }\n",
@@ -364,8 +383,7 @@ test "a sum held as its cases is tested by its constructor's index" {
       assert_eq(
         arms_of(body).map(|a: Block|
           match a.at(0) {
-            Some(Case(c)) ->
-              Some({ test: c.test, cased: match c.on.rep { RCases(_) -> true, _ -> false } }),
+            Some(Case(c)) -> Some({ test: c.test, cased: is_sum(c.on.rep) }),
             _ -> None,
           }),
         [
@@ -374,7 +392,7 @@ test "a sum held as its cases is tested by its constructor's index" {
         ],
       ),
   };
-  // An index alone is the value's one C value; beside its cases' leaves it is the first of them.
+  // An enum's one word is its case's place; an `Option` of a record's tag word is the first of its.
   assert_eq(
     [
       { name: b"chosen", seen: b") == INT64_C(1)) {\n" },
@@ -453,9 +471,9 @@ test "a record or tuple pattern tests nothing and reads the fields it binds" {
 }
 
 test "a refutable let tests its pattern and fails the let where it does not hold" {
-  let o = maybe_int(0);
-  let n = int_var(1);
   let src = b"fn unwrap(o: Option<Int>) -> Int / {abort.raise} = { let Some(n) = o; n }\n";
+  let o = param_of(src, b"unwrap", 0);
+  let n = int_var(1);
   let bound = placed_in(src, b"unwrap", |e: Expr|
     match e {
       EBlock(b) -> match b.stmts.at(0) { Some(SLet(l)) -> l.span, _ -> dummy_span() },
@@ -472,14 +490,14 @@ test "a refutable let tests its pattern and fails the let where it does not hold
         arms: [{ when: 1, body: [] }],
         rest: [Fail({ why: NoLet, at: bound })],
       }),
-      bind(n, Get({ of: o, path: PArg({ ctor: b"Some", at: 0 }) })),
+      bind(n, Get({ of: o, path: PCase({ case: 1, at: 0 }) })),
       Return(AVar(n)),
     ]),
   )
 }
 
 test "a value compared with a constructor of its sum is a Bool joined from the constructor's test" {
-  let o = maybe_int(0);
+  let o = param_of(b"fn unset(o: Option<Int>) -> Bool = o == None\n", b"unset", 0);
   let r = bool_var(1);
   let set = |b: Bool| [Assign({ var: r, arg: ABool(b) })];
   assert_eq(
@@ -508,7 +526,7 @@ test "a value compared with a constructor of its sum is a Bool joined from the c
           {
             when: 1,
             body: [
-              bind(n, Get({ of: o, path: PArg({ ctor: b"Some", at: 0 }) })),
+              bind(n, Get({ of: o, path: PCase({ case: 1, at: 0 }) })),
               Case({
                 on: n,
                 test: TInt([3]),
@@ -821,7 +839,11 @@ test "a match prints its arms as tests that go to the next arm's label where the
   let area = b"type Shape = | Circle(Float) | Dot\nfn round(s: Shape) -> Bool = match s { Circle(_) -> true, Dot -> false }\n";
   match printed_of(area, b"round") {
     Err(why) -> assert_eq(why, b""),
-    Ok(text) -> assert(text.index_of(b"  if (ply_obj(p0)->layout == @@Tm.Circle@@) {\n") != None),
+    Ok(text) ->
+      assert(
+        text.index_of(b"  if ((p0_0) == INT64_C(0)) {\n") != None,
+        Some(String::of_bytes_lossy(text)),
+      ),
   };
   match printed_of(b"fn small(n: U8) -> Int = match n { 255u8 -> 1, _ -> 0 }\n", b"small") {
     Err(why) -> assert_eq(why, b""),
@@ -835,7 +857,7 @@ test "a match prints its arms as tests that go to the next arm's label where the
     Ok(text) ->
       assert(
         text.index_of(
-            b"  if ((p0) != 0) {\n  } else {\n    PLY_SITE(ctx, @@r@@, 53, 69);\n    rt_let_no_match_p(ctx); return 0;\n  }\n",
+            b"  if ((p0_0) == INT64_C(1)) {\n  } else {\n    PLY_SITE(ctx, @@r@@, 53, 69);\n    rt_let_no_match_p(ctx); return 0;\n  }\n",
           )
           != None,
       ),
@@ -1387,7 +1409,7 @@ type Outcome = { name: Bytes, by: Option<Family>, refused: Option<Bytes>, why: B
 
 fn outcome(p: Program, r: Root) -> Outcome / {abort.raise} =
   match formed(p, r.name) {
-    Ok(f) -> { name: r.name, by: None, refused: unbuilt(f), why: b"" },
+    Ok(f) -> { name: r.name, by: None, refused: unbuilt(p, f), why: b"" },
     Err(no) -> { name: r.name, by: Some(no.by), refused: None, why: no.why },
   }
 

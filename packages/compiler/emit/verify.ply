@@ -19,7 +19,8 @@ import emit.tir.containers (Taken)
 import emit.tir.strings (StringOp, StringArg, ReadsAt, Number, WritesBlock, OwnBlock, Copied, Grown,
                          ByteRead, string_args, string_answer)
 import emit.layout
-import emit.layout (P, Always, WordIs, WordOutside, Inline, Boxed, Nullary, LWords)
+import emit.layout (WordClass, P, S, U, LSum, Always, WordIs, WordOutside, Inline, Boxed, Nullary,
+                    LWords)
 import emit.keys (Named, Root, TypeOp, Copy, Keep, Share)
 import emit.release (boxed_alone)
 import emit.reps (FieldTy, TyRec, kind_of, in_place, laid_of)
@@ -86,104 +87,25 @@ type Looped = { held: Map<Int, Int>, state: List<Var>, answer: Var }
 
 /// Why `f`, or a closure it makes, breaks a rule of the form, or nothing where both keep them all.
 /// A tail group's arm `i` starts holding member `i`'s parameters and answers as that member does.
-/// What no rule covers yet is refused, the reason starting `not yet: `.
 pub fn verified(f: Fn) -> Option<Bytes> = {
   let bound = f.members.fold(
     binding(f.params.fold(Map::new(), bound_as), f.body),
     |m: Map<Int, Rep>, x: Member| x.params.fold(m, bound_as),
   );
-  match not_yet(f) {
-    Some(what) -> Some(b"not yet: ".concat(what)),
-    None -> match used_otherwise(bound, f.body) {
-      Some(v) ->
-        Some(
-          Bytes::concat_all([
-            b"a variable used held otherwise than it was bound: v",
-            ascii_of_int(v.id),
-          ]),
-        ),
-      None -> body_verified(f),
-    },
+  match used_otherwise(bound, f.body) {
+    Some(v) ->
+      Some(
+        Bytes::concat_all([
+          b"a variable used held otherwise than it was bound: v",
+          ascii_of_int(v.id),
+        ]),
+      ),
+    None -> body_verified(f),
   }
-}
-
-/// The first construct of `f`'s body, its parameters and answer among it, that no rule of this
-/// check covers yet: a value held as a sum's words or as no C value; a box or a boxed case made; a
-/// case's payload read. Each stream's rules drop their line.
-fn not_yet(f: Fn) -> Option<Bytes> = {
-  let held = f.members.fold(f.params, |vs: List<Var>, m: Member| vs.concat(m.params));
-  let answers = f.members.fold([f.conv.answer], |rs: List<Rep>, m: Member| rs.push(m.conv.answer));
-  held.fold(
-    answers.fold(not_yet_in(f.body), |found: Option<Bytes>, r: Rep|
-      or_else(found, match held_not_yet(r) {
-        Some(what) -> Some(what.concat(b": an answer")),
-        None -> None,
-      })),
-    |found: Option<Bytes>, v: Var| or_else(found, rep_not_yet(v)),
-  )
 }
 
 fn or_else<a>(found: Option<a>, next: Option<a>) -> Option<a> =
   match found { Some(_) -> found, None -> next }
-
-fn not_yet_in(b: Block) -> Option<Bytes> =
-  b.fold(None, |found: Option<Bytes>, i: Inst|
-    match found {
-      Some(_) -> found,
-      None -> match i {
-        Let(l) -> or_else(rep_not_yet(l.var), val_not_yet(l.val)),
-        Do(d) -> val_not_yet(d.val),
-        Decl(v) -> rep_not_yet(v),
-        If(x) -> or_else(not_yet_in(x.then), not_yet_in(x.otherwise)),
-        Case(c) ->
-          c.arms.fold(not_yet_in(c.rest), |acc: Option<Bytes>, a: { when: Int, body: Block }|
-            or_else(acc, not_yet_in(a.body))),
-        Match(m) ->
-          m.arms.fold(not_yet_in(m.rest), |acc: Option<Bytes>, a: Block|
-            or_else(acc, not_yet_in(a))),
-        Loop(l) ->
-          l.state.fold(
-            or_else(rep_not_yet(l.answer), not_yet_in(l.body)),
-            |acc: Option<Bytes>, v: Var| or_else(acc, rep_not_yet(v)),
-          ),
-        Handle(h) -> or_else(rep_not_yet(h.answer), not_yet_in(h.body)),
-        Reset(r) -> rep_not_yet(r.token),
-        Opened(o) -> o.words.fold(None, |acc: Option<Bytes>, v: Var| or_else(acc, rep_not_yet(v))),
-        _ -> None,
-      },
-    })
-
-fn rep_not_yet(v: Var) -> Option<Bytes> =
-  match held_not_yet(v.rep) {
-    Some(what) -> Some(Bytes::concat_all([what, b": v", ascii_of_int(v.id)])),
-    None -> None,
-  }
-
-fn held_not_yet(r: Rep) -> Option<Bytes> =
-  match r {
-    RSum(_) -> Some(b"a value held as a sum's words"),
-    RUnit -> Some(b"a value held as no C value"),
-    RFlat(ls) -> ls.fold(None, |acc: Option<Bytes>, l: Leaf| or_else(acc, held_not_yet(l.rep))),
-    RCases(c) ->
-      c.cases.fold(None, |acc: Option<Bytes>, x: { name: Bytes, leaves: List<Leaf> }|
-        x.leaves.fold(acc, |a: Option<Bytes>, l: Leaf| or_else(a, held_not_yet(l.rep)))),
-    _ -> None,
-  }
-
-fn val_not_yet(val: Val) -> Option<Bytes> =
-  match val {
-    Make(m) -> match m.made {
-      MBox(_) -> Some(b"a box made"),
-      MCase(_) -> Some(b"a boxed case made"),
-      _ -> None,
-    },
-    Get(g) -> path_not_yet(g.path),
-    Take(t) -> path_not_yet(t.path),
-    _ -> None,
-  }
-
-fn path_not_yet(p: Path) -> Option<Bytes> =
-  match p { PCase(_) -> Some(b"a case's payload read"), _ -> None }
 
 /// `m` with `v` bound as it is held.
 fn bound_as(m: Map<Int, Rep>, v: Var) -> Map<Int, Rep> = m.insert(v.id, v.rep)
@@ -857,8 +779,8 @@ fn handle_walked(f: Fn, cx: Within, acc: Walk, i: Inst) -> Walk =
   }
 
 /// Why `val`, bound to `y`, reads a block otherwise than the fields taken out of it allow: a field
-/// is taken only once, out of a block's word this body holds a count of and no loop around holds
-/// across its passes (`across`); once taken it is not read
+/// is taken only once, out of a block's word, or the box a sum's case holds, this body holds a count
+/// of and no loop around holds across its passes (`across`); once taken it is not read
 /// again or kept in the block's cells; and a block a field was taken out of is used only to read its
 /// other fields, test its constructor, or let it go.
 fn field_fault(
@@ -868,7 +790,7 @@ fn field_fault(
   val: Val,
 ) -> Option<{ why: Bytes, v: Var }> =
   match val {
-    Take(t) -> if t.of.rep != RWord || !field_path(t.path) {
+    Take(t) -> if !((t.of.rep == RWord && field_path(t.path)) || boxed_read(t.of.rep, t.path)) {
       Some({ why: b"a field taken out of other than a block's word: v", v: t.of })
     } else if held_in_place(t.of, t.path, y) {
       Some({ why: b"a field taken that its block holds in place: v", v: y })
@@ -1097,6 +1019,17 @@ pub fn reuses_cells(made: Made) -> Bool =
 
 /// Whether `p` reads a field at its offset in a block: what a `Take` may take.
 pub fn field_path(p: Path) -> Bool = match p { PField(_) -> true, PArg(_) -> true, _ -> false }
+
+/// Whether `path` reads a word out of the box a case of a sum held as `r` holds its payload in: a
+/// field of that box, which a `Take` may move out of it.
+pub fn boxed_read(r: Rep, path: Path) -> Bool =
+  match ((r, path)) {
+    (RSum(s), PCase(p)) -> match s.laid.cases.at(p.case) {
+      Some(c) -> match c.payload { Boxed(_) -> true, _ -> false },
+      None -> false,
+    },
+    _ -> false,
+  }
 
 /// Whether the field `path` reads out of `of` into `reader` is a record `of` holds in place: its
 /// header and words are the block's own, with no count of their own to take. A field of a record
@@ -1386,13 +1319,24 @@ fn word_read(w: Walk, y: Var, val: Val) -> Option<Walk> =
   }
 
 /// Whether holding a value held as `from` as `to` makes an object: a value holding no count boxed,
-/// or a flat value or a view made the object its word names.
+/// or a flat value, a sum of more than one word or a view made the object its word names.
 pub fn allocates(from: Rep, to: Rep) -> Bool =
   one_word(to)
     && (!counted(from)
-    || (match from { RFlat(_) -> true, RCases(_) -> true, RSlice -> true, _ -> false }))
+    || (match from {
+      RFlat(_) -> true,
+      RCases(_) -> true,
+      RSlice -> true,
+      RSum(_) -> !word_held(from),
+      _ -> false,
+    }))
 
 fn one_word(r: Rep) -> Bool = match r { RWord -> true, RMaybe -> true, RTagged -> true, _ -> false }
+
+/// Whether a value held as `r` is one counted word: a pointer, an `Option`'s or a `Result`'s word,
+/// or a sum laid in one word.
+pub fn word_held(r: Rep) -> Bool =
+  match r { RSum(s) -> layout::words(LSum(s.laid)) == 1 && counted(r), _ -> one_word(r) }
 
 /// What `val` answers, as `tir.answered` says, but for a value gathered from no counted part: words
 /// holding no count, which last as a static does.
@@ -1402,21 +1346,22 @@ pub fn answer_held(val: Val) -> Answered =
     _ -> answered(val),
   }
 
-/// The value `val`, bound to `y`, holds again as another with no object made, where it does: a word
-/// an `Option` or a `Result` is held as, packed from the value or gathered from its case and the
-/// value's word, which holds the value's count, or reads it where the value is borrowed. A word
-/// opened into a wider value is no such: the opening takes the word.
+/// The value `val`, bound to `y`, holds again as another with no object made, where it does: one
+/// counted word held as another (a pointer as an `Option`'s word, a sum laid in one word as its word
+/// form), or a sum of one word gathered from its case and one counted word, which holds the value's
+/// count, or reads it where the value is borrowed. A word opened into a wider value is no such: the
+/// opening takes the word.
 pub fn re_held(y: Var, val: Val) -> Option<Var> =
   match val {
     Pack(p) -> match var_of(p.arg) {
-      Some(x) -> if one_word(p.to) && one_word(x.rep) { Some(x) } else { None },
+      Some(x) -> if word_held(p.to) && word_held(x.rep) { Some(x) } else { None },
       None -> None,
     },
     Gathered(g) -> {
       let held = g.parts.filter(|a: Arg| counted(rep_of_arg(a)));
-      if !one_word(y.rep) || held.len() != 1 { None } else {
+      if !word_held(y.rep) || held.len() != 1 { None } else {
         match held.at(0) {
-          Some(AVar(x)) -> if one_word(x.rep) { Some(x) } else { None },
+          Some(AVar(x)) -> if word_held(x.rep) { Some(x) } else { None },
           _ -> None,
         }
       }
@@ -1425,18 +1370,40 @@ pub fn re_held(y: Var, val: Val) -> Option<Var> =
   }
 
 /// The sum `y` is the payload of where `val` reads it: a constructor's argument read out of an
-/// `Option` or a `Result` held as one word is that word, so it holds the sum's count.
+/// `Option` or a `Result` held as one word is that word, and a case's word read out of a sum whose
+/// case lays it as its one counted word is that word's count; so either holds the sum's count.
 pub fn payload_of(val: Val, y: Var) -> Option<Var> =
   match val {
     Get(g) -> match g.path {
       PArg(_) -> if sum_word(g.of.rep) && (y.rep == RWord || sum_word(y.rep)) { Some(g.of) }
       else { None },
+      PCase(p) -> if word_held(y.rep) && sole_count(g.of.rep, p) { Some(g.of) } else { None },
       _ -> None,
     },
     _ -> None,
   }
 
 fn sum_word(r: Rep) -> Bool = match r { RMaybe -> true, RTagged -> true, _ -> false }
+
+/// Whether word `p.at` of case `p.case`'s payload, of a sum held as `r`, is the one counted word the
+/// case lays in the sum's own words, so the sum's count is that word's.
+fn sole_count(r: Rep, p: { case: Int, at: Int }) -> Bool =
+  match r {
+    RSum(s) -> match s.laid.cases.at(p.case) {
+      Some(c) -> match c.payload {
+        Inline(i) -> {
+          let cs = layout::classes(i.laid);
+          (match cs.at(p.at) { Some(k) -> counted_class(k), None -> false })
+            && cs.filter(counted_class).len() == 1
+        },
+        _ -> false,
+      },
+      None -> false,
+    },
+    _ -> false,
+  }
+
+fn counted_class(c: WordClass) -> Bool = match c { P -> true, S(_) -> true, U -> true, _ -> false }
 
 /// The payload words of the block `m` allocates, where it is a record, a constructor's object, a
 /// box, or a boxed case with the words of its tag.
@@ -2413,10 +2380,10 @@ test "an opened value is its parts, each word counted on its own and read only b
   let w2 = word(3);
   let y = word(4);
   let r = word(5);
-  let opened = Opened({ of: s, words: [w0, w1, w2] });
+  let opened = Opened({ of: s, words: [w0, w1] });
   let leaf = bind(y, Get({ of: s, path: PLeaf(0) }), []);
   let called = [bind(r, call_of([AVar(y)], []), []), Return(AVar(r))];
-  assert_eq(verified(root_of([s], [], RWord, [opened, Dec(w2), leaf].concat(called))), None);
+  assert_eq(verified(root_of([s], [], RWord, [opened, leaf].concat(called))), None);
   // A use of the whole value after it is opened uses each counted word.
   assert_eq(
     verified(
@@ -2425,7 +2392,7 @@ test "an opened value is its parts, each word counted on its own and read only b
     None,
   );
   assert_eq(
-    verified(root_of([s], [], RWord, [opened, Dec(w0), Dec(w2), leaf].concat(called))),
+    verified(root_of([s], [], RWord, [opened, Dec(w0), leaf].concat(called))),
     Some(b"a value read with no count left: v1"),
   );
   assert_eq(
@@ -2434,9 +2401,7 @@ test "an opened value is its parts, each word counted on its own and read only b
         [s],
         [],
         RWord,
-        [opened, Dec(w2), bind(y, Get({ of: s, path: PField({ name: b"a", at: 0 }) }), [])].concat(
-          called,
-        ),
+        [opened, bind(y, Get({ of: s, path: PField({ name: b"a", at: 0 }) }), [])].concat(called),
       ),
     ),
     Some(b"an opened value read other than by its words: v4"),
@@ -2818,50 +2783,23 @@ test "the joins of a body's branches are checked in one walk, however many it de
   paced(|n: Int| n * (ilog2(n) + 1), |n: Int| verified(root_of([c], [], RInt, branches(n))))
 }
 
-test "a construct no rule covers yet is refused, naming what it is" {
+test "a box made and a value held as no C value are checked as any other value" {
   let p = word(0);
   let r = word(1);
-  let sum = RSum({
-    laid: {
-      classes: [P],
-      cases: [{ test: Always, payload: Inline({ offset: 0, laid: LWords([P]), stripped: None }) }],
-    },
-    cases: [b"m.Only"],
-  });
-  let refused = |f: Fn|
-    match verified(f) {
-      Some(why) -> if why.starts_with(b"not yet: ") { why.slice(9, why.len()) } else { b"" },
-      None -> b"",
-    };
-  let body = |b: Block| refused(root_of([p], [], RWord, b));
   assert_eq(
-    body([
-      bind(
-        r,
-        Make({ made: MBox({ words: 2 }), args: [AVar(p), AInt(0)], reuse: None, kept: [] }),
-        [],
-      ),
-      Return(AVar(r)),
-    ]),
-    b"a box made",
+    verified(
+      root_of([p], [], RWord, [
+        bind(
+          r,
+          Make({ made: MBox({ words: 2 }), args: [AVar(p), AInt(0)], reuse: None, kept: [] }),
+          [],
+        ),
+        Return(AVar(r)),
+      ]),
+    ),
+    None,
   );
-  assert_eq(
-    body([
-      bind(r, Get({ of: p, path: PCase({ case: 0, at: 0 }) }), []),
-      Inc({ var: r, n: 1 }),
-      Dec(p),
-      Return(AVar(r)),
-    ]),
-    b"a case's payload read",
-  );
-  assert_eq(
-    body([bind({ ..r, rep: sum }, Pack({ arg: AVar(p), to: sum }), []), Return(AVar(p))]),
-    b"a value held as a sum's words: v1",
-  );
-  assert_eq(
-    refused(root_of([{ ..p, rep: RUnit }], [], RInt, [Return(AInt(0))])),
-    b"a value held as no C value: v0",
-  )
+  assert_eq(verified(root_of([{ ..p, rep: RUnit }], [], RInt, [Return(AInt(0))])), None)
 }
 
 /// `op` over bytes, handed `args`, written with the `uses` its rule gives it.
@@ -3096,21 +3034,20 @@ test "a sum is opened as the box its one case is boxed in, or as its one word in
       }),
     ]);
   let arm = |inside: Block| on([b"None", b"Some"], inside);
-  // Checked below the rules that refuse a sum until its counts are printed.
-  assert_eq(body_verified(arm([Opened({ of: o, words: [s] }), Dec(s), Return(AInt(0))])), None);
+  assert_eq(verified(arm([Opened({ of: o, words: [s] }), Dec(s), Return(AInt(0))])), None);
   assert_eq(
-    body_verified(root_of([o], [], RInt, [Opened({ of: o, words: [s] }), Dec(s), Return(AInt(0))])),
+    verified(root_of([o], [], RInt, [Opened({ of: o, words: [s] }), Dec(s), Return(AInt(0))])),
     Some(b"a value opened that is not held only here: v0"),
   );
   let n = { ..word(3), rep: boxed };
   assert_eq(
-    body_verified(
+    verified(
       root_of([n], [], RInt, [Opened({ of: n, words: [s, y] }), Dec(s), Dec(y), Return(AInt(0))]),
     ),
     None,
   );
   let read = |p: { case: Int, at: Int }|
-    body_verified(
+    verified(
       arm([
         bind(y, Get({ of: o, path: PCase(p) }), []),
         Inc({ var: y, n: 1 }),
@@ -3123,12 +3060,12 @@ test "a sum is opened as the box its one case is boxed in, or as its one word in
   assert_eq(read({ case: 1, at: 1 }), Some(b"a case's payload read past what the case lays: v2"));
   assert_eq(read({ case: 0, at: 0 }), Some(b"a case's payload read past what the case lays: v2"));
   assert_eq(
-    body_verified(on([b"Some", b"None"], [Dec(o), Return(AInt(0))])),
+    verified(on([b"Some", b"None"], [Dec(o), Return(AInt(0))])),
     Some(b"a case on a sum testing other constructors than the sum's: v0"),
   );
   let gathered = { ..word(4), rep: maybe };
   let gather = |parts: List<Arg>|
-    body_verified(
+    verified(
       root_of([s], [], RInt, [
         bind(gathered, Gathered({ parts: parts }), []),
         Dec(gathered),
@@ -3138,6 +3075,42 @@ test "a sum is opened as the box its one case is boxed in, or as its one word in
   assert_eq(gather([AInt(1), AVar(s)]), None);
   assert_eq(gather([AInt(2), AVar(s)]), Some(b"a sum gathered as a case it does not have: v4"));
   assert_eq(gather([AVar(s)]), Some(b"a sum gathered from other than its case's place: v4"))
+}
+
+test "a word read out of a sum whose case lays it as its one counted word holds the sum's count" {
+  let laid = |classes: List<WordClass>|
+    RSum({
+      laid: {
+        classes: classes,
+        cases: [
+          { test: Always, payload: Inline({ offset: 0, laid: LWords(classes), stripped: None }) },
+        ],
+      },
+      cases: [b"m.T"],
+    });
+  let y = word(1);
+  let handed = |classes: List<WordClass>| {
+    let t = { ..word(0), rep: laid(classes) };
+    verified(
+      root_of([t], [], RWord, [
+        bind(y, Get({ of: t, path: PCase({ case: 0, at: 0 }) }), []),
+        Return(AVar(y)),
+      ]),
+    )
+  };
+  assert_eq(handed([P, layout::raw()]), None);
+  assert_eq(handed([P, P]), Some(b"a borrowed value consumed with no count of its own: v1"));
+  // A word packed as a sum of one word is held again; a word opened into a wider sum is taken.
+  let word_sum = { ..word(2), rep: laid([P]) };
+  let wide = { ..word(3), rep: laid([P, P]) };
+  assert_eq(
+    [
+      re_held(word_sum, Pack({ arg: AVar(y), to: word_sum.rep })),
+      re_held(wide, Pack({ arg: AVar(y), to: wide.rep })),
+    ],
+    [Some(y), None],
+  );
+  assert_eq(allocates(wide.rep, RWord), true)
 }
 
 test "an answer borrowed is read out of counted operands the call lends, and a root's out of counted parameters it is lent" {
@@ -3266,7 +3239,7 @@ test "a box and a boxed case are made in the cells of a reuse token of as many w
   let t = { ..word(1), rep: RToken(2) };
   let r = word(2);
   let made = |m: Made|
-    body_verified(
+    verified(
       root_of([b], [], RWord, [
         Reset({ token: t, of: b }),
         bind(r, Make({ made: m, args: [AInt(1), AInt(2)], reuse: Some(t), kept: [] }), []),

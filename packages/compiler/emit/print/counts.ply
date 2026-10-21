@@ -14,10 +14,9 @@ import emit.roots (symbol_of)
 import emit.layout (SumLaid, WordIs, LowBits, Nullary, Inline, Boxed, LWords, P, R, S, U, LSum,
                     words, pointer_floor, tag_bits, header_bytes, str_laid, layouts, columns_laid,
                     block_sizes)
-import emit.lower.held (values_of, unboxed)
-import emit.tir (Rep, RInt, RWord, RMaybe, RTagged, RFlat, RToken, RSum, Leaf, Var, Inst, Inc, Dec,
-                 Reset, Free, Opened, AInt, AVar, Spine, RUnit, Given, Owned, counted, parts_of,
-                 var_said)
+import emit.lower.held (values_of, leaf_values)
+import emit.tir (Rep, RInt, RWord, RFlat, RToken, RSum, Leaf, Var, Inst, Inc, Dec, Reset, Free,
+                 Opened, AInt, AVar, Spine, RUnit, Given, Owned, counted, parts_of, var_said)
 import emit.print.tested (case_held)
 import emit.pieces (Piece, Text, Hole, Symbol, spelled)
 import emit.release (Part, WordAt, ByCase, Counted, Object, CaseBox, SumWord, IntWord, Through,
@@ -83,110 +82,48 @@ pub fn block_opened(pr: Printing) -> Printing =
 
 /// `pr` at the end of the C block it is in, indented `depth`, then back in block `outer`: the tails
 /// of the values declared in the block printed there, the last added first so each falls into the
-/// next where it goes on to it, and out of the way of a block that `falls` off its end.
-pub fn block_closed(pr: Printing, outer: Int, depth: Int, falls: Bool) -> Printing = {
+/// next where it goes on to it, and out of the way of a block that `falls` off its end. Each tail
+/// lets go of its value by what the value's type lays out.
+pub fn block_closed(pr: Printing, outer: Int, depth: Int, falls: Bool) -> Printing / {abort.raise} = {
   let here = match pr.tails.held.get(pr.block) { Some(ks) -> ks.reverse(), None -> [] };
-  let lines = range(0, here.len()).fold([], |acc: List<Bytes>, i: Int|
-    match here.at(i) {
-      None -> acc,
-      Some(k) -> match pr.tails.all.at(k) {
+  let lines = range(0, here.len()).fold(
+    { pr: pr, out: [] },
+    |acc: { pr: Printing, out: List<List<Piece>> }, i: Int|
+      match here.at(i) {
         None -> acc,
-        Some(t) -> {
-          let falls_on = match here.at(i + 1) {
-            Some(next) -> tail_jump(next) == t.then,
-            None -> false,
-          };
-          acc.push(
-            Bytes::concat_all([
-              b"ply_u",
-              ascii_of_int(k),
-              b": ",
-              let_go(t.name, t.rep),
-              if falls_on { b"" } else { b" ".concat(t.then) },
-            ]),
-          )
+        Some(k) -> match acc.pr.tails.all.at(k) {
+          None -> acc,
+          Some(t) -> {
+            let falls_on = match here.at(i + 1) {
+              Some(next) -> tail_jump(next) == t.then,
+              None -> false,
+            };
+            let let_go = released(acc.pr, t.ty, t.rep, part_names(t.name, t.rep));
+            {
+              pr: let_go.pr,
+              out: acc.out.push(
+                [Text(Bytes::concat_all([b"ply_u", ascii_of_int(k), b": "]))].concat(
+                  if let_go.out.len() == 0 { [Text(b";")] } else { let_go.out },
+                ).push(
+                  Text(if falls_on { b"" } else { b" ".concat(t.then) }),
+                ),
+              ),
+            }
+          },
         },
       },
-    });
-  let closed = if lines.len() == 0 { pr } else if falls {
+  );
+  let tailed_line = |q: Printing, at: Int, ps: List<Piece>|
+    { ..q, out: q.out.push(Text(pad(at))).concat(ps).push(Text(b"\n")) };
+  let closed = if lines.out.len() == 0 { lines.pr } else if falls {
     line(
-      lines.fold(line(pr, depth, b"if (0) {"), |q: Printing, l: Bytes| line(q, depth + 1, l)),
+      lines.out.fold(line(lines.pr, depth, b"if (0) {"), |q: Printing, ps: List<Piece>|
+        tailed_line(q, depth + 1, ps)),
       depth,
       b"}",
     )
-  } else { lines.fold(pr, |q: Printing, l: Bytes| line(q, depth, l)) };
+  } else { lines.out.fold(lines.pr, |q: Printing, ps: List<Piece>| tailed_line(q, depth, ps)) };
   { ..closed, block: outer }
-}
-
-/// `i`, one of `Inc`, `Dec`, `Reset`, `Free` and `Opened`. An opened value's words are its parts'
-/// C locals under their own variables, declared with it, so opening one writes no C.
-pub fn count_printed(p: Place, pr: Printing, i: Inst) -> Printing =
-  match i {
-    Inc(n) -> {
-      let once = Bytes::join(
-        counted_parts(name_of(pr, n.var), n.var.rep).map(|c: Bytes|
-          Bytes::concat_all([b"ply_inc(", c, b");"])),
-        b" ",
-      );
-      line(pr, p.depth, Bytes::join(range(0, n.n).map(|_: Int| once), b" "))
-    },
-    Dec(v) -> line(pr, p.depth, let_go(name_of(pr, v), v.rep)),
-    Reset(r) -> {
-      let x = name_of(pr, r.of);
-      let t = named(pr, r.token);
-      line(
-        t.pr,
-        p.depth,
-        Bytes::concat_all([
-          b"Word ",
-          t.name,
-          b" = ply_reset_flat(",
-          x,
-          b"); if (!",
-          t.name,
-          b") ",
-          t.name,
-          b" = rt_reset_p(ctx, ",
-          x,
-          b");",
-        ]),
-      )
-    },
-    Free(r) -> line(pr, p.depth, let_go(name_of(pr, r.of), r.of.rep)),
-    Opened(o) -> {
-      let names = part_names(name_of(pr, o.of), o.of.rep);
-      let at = declared_at(pr, o.of);
-      range(0, o.words.len()).fold(pr, |q: Printing, k: Int|
-        match o.words.at(k) {
-          Some(w) -> match names.at(k) {
-            Some(n) ->
-              { ..q, names: q.names.insert(w.id, n), declared: q.declared.insert(w.id, at) },
-            None -> q,
-          },
-          None -> q,
-        })
-    },
-    _ -> pr,
-  }
-
-/// The C that lets go of the value named `x` held as `r`: each count it holds let go. A reuse token
-/// is a block of one count whose fields were let go, so letting it go frees it.
-fn let_go(x: Bytes, r: Rep) -> Bytes =
-  Bytes::join(
-    counted_parts(x, r).map(|c: Bytes| Bytes::concat_all([b"ply_dec(ctx, ", c, b");"])),
-    b" ",
-  )
-
-/// The C names of the values of a value named `x` held as `r` that hold a count.
-fn counted_parts(x: Bytes, r: Rep) -> List<Bytes> = {
-  let values = values_of(r);
-  let names = part_names(x, r);
-  range(0, values.len()).fold([], |acc: List<Bytes>, k: Int|
-    match values.at(k) {
-      Some(value) -> if counted(value) { match names.at(k) { Some(n) -> acc.push(n), None -> acc } }
-      else { acc },
-      None -> acc,
-    })
 }
 
 // --- Counts by what a type lays out -------------------------------------------------------------
@@ -194,9 +131,8 @@ fn counted_parts(x: Bytes, r: Rep) -> List<Bytes> = {
 /// C printed so far and the printing it leaves.
 pub type Said = { pr: Printing, out: List<Piece> }
 
-/// `i`, one of `Inc`, `Dec`, `Reset`, `Free` and `Opened`, printed by what its value's type lays out:
-/// what `count_printed` prints once records and sums are laid by their types.
-pub fn count_classed(p: Place, pr: Printing, i: Inst) -> Printing / {abort.raise} =
+/// `i`, one of `Inc`, `Dec`, `Reset`, `Free` and `Opened`, printed by what its value's type lays out.
+pub fn count_printed(p: Place, pr: Printing, i: Inst) -> Printing / {abort.raise} =
   match i {
     Inc(n) -> {
       let once = duped(pr, n.var.ty, n.var.rep, part_names(name_of(pr, n.var), n.var.rep));
@@ -230,7 +166,7 @@ pub fn count_classed(p: Place, pr: Printing, i: Inst) -> Printing / {abort.raise
       )
     },
     Opened(o) -> match o.of.rep {
-      RFlat(_) -> count_printed(p, pr, i),
+      RFlat(ls) -> flat_opened(pr, p.depth, o.of, ls, o.words),
       RSum(s) -> match boxed_alone(s.laid) {
         Some(_) -> opened_block(pr, p.depth, o.of, o.words, opening(pr.ctors, o.of.ty, o.of.rep)),
         None -> opened_sum(pr, p.depth, o.of, o.words),
@@ -239,6 +175,50 @@ pub fn count_classed(p: Place, pr: Printing, i: Inst) -> Printing / {abort.raise
     },
     _ -> pr,
   }
+
+/// A flat value `of` of leaves `ls` opened into `words`, one per leaf: a leaf's word named as the
+/// record's value it was and declared where `of` was, so it writes no C; a sum leaf's word declared
+/// afresh as a copy of its run of the record's values, the counts they held now its; a leaf of no
+/// words needs nothing.
+fn flat_opened(pr: Printing, depth: Int, of: Var, ls: List<Leaf>, words: List<Var>) -> Printing = {
+  let values = part_names(name_of(pr, of), of.rep);
+  let at = declared_at(pr, of);
+  let renamed = |q: Printing, w: Var, k: Int|
+    match values.at(k) {
+      Some(n) -> { ..q, names: q.names.insert(w.id, n), declared: q.declared.insert(w.id, at) },
+      None -> q,
+    };
+  range(0, words.len()).fold(pr, |q: Printing, k: Int|
+    match ((words.at(k), ls.at(k))) {
+      (Some(w), Some(l)) -> {
+        let run = leaf_values(ls, k);
+        match l.rep {
+          RUnit -> q,
+          RSum(_) -> {
+            let n = named(q, w);
+            let into = part_names(n.name, w.rep);
+            line(
+              n.pr,
+              depth,
+              Bytes::join(
+                range(0, into.len()).map(|j: Int|
+                  Bytes::concat_all([
+                    b"Word ",
+                    nth(into, j),
+                    b" = ",
+                    nth(values, run.at + j),
+                    b";",
+                  ])),
+                b" ",
+              ),
+            )
+          },
+          _ -> renamed(q, w, run.at),
+        }
+      },
+      _ -> q,
+    })
+}
 
 /// `s`'s C as one line indented `depth`, where it says anything.
 fn stated(depth: Int, s: Said) -> Printing =
@@ -250,11 +230,10 @@ fn spaced(a: List<Piece>, b: List<Piece>) -> List<Piece> =
   if a.len() == 0 { b } else if b.len() == 0 { a } else { a.push(Text(b" ")).concat(b) }
 
 /// How many C values each part of a value held as `r` takes, in `parts_of(r)`'s order, as
-/// `values_of(r)` lays them: a sum its words and then, past one, its box word, a flat record's leaf
-/// its values without a box word of its own.
+/// `values_of(r)` lays them: a sum its words, a flat record's leaf its values.
 fn part_widths(r: Rep) -> List<Int> =
   match r {
-    RFlat(ls) -> ls.map(|l: Leaf| unboxed(l.rep).len()).push(1),
+    RFlat(ls) -> ls.map(|l: Leaf| values_of(l.rep).len()),
     RSum(_) -> [values_of(r).len()],
     RUnit -> [0],
     _ -> parts_of(r).map(|_: Rep| 1),
@@ -496,15 +475,10 @@ fn word_dup(x: Bytes, how: Counted) -> Bytes =
     _ -> Bytes::concat_all([b"ply_dup(", x, b");"]),
   }
 
-/// The C words a block named `x` holds a part held as `r` in from word `at`: a sum's words, and its
-/// box word as 0 where a body holds it wider than a word and `boxed`.
-fn slots_of(x: Bytes, at: Int, r: Rep, boxed: Bool) -> List<Bytes> =
+/// The C words a block named `x` holds a part held as `r` in from word `at`: a sum's words.
+fn slots_of(x: Bytes, at: Int, r: Rep) -> List<Bytes> =
   match r {
-    RSum(s) -> {
-      let n = words(LSum(s.laid));
-      let own = range(at, at + n).map(|k: Int| slot(x, k));
-      if boxed && n > 1 { own.push(b"0") } else { own }
-    },
+    RSum(s) -> range(at, at + words(LSum(s.laid))).map(|k: Int| slot(x, k)),
     _ -> [slot(x, at)],
   }
 
@@ -523,7 +497,7 @@ pub fn opened_block(
       match ((ws.at(i), held.at(i))) {
         (Some(w), Some(h)) -> {
           let n = named(q, w);
-          let from = slots_of(x, h.at, w.rep, true);
+          let from = slots_of(x, h.at, w.rep);
           let into = part_names(n.name, w.rep);
           line(
             n.pr,
@@ -1311,8 +1285,7 @@ fn slots_walked(
     InBox(x) ->
       each(
         pr,
-        x.parts.map(|h: Held|
-          { ps: stored_parts(pr.ctors, h), ws: slots_of(b, h.at, h.rep, false) }),
+        x.parts.map(|h: Held| { ps: stored_parts(pr.ctors, h), ws: slots_of(b, h.at, h.rep) }),
       ),
     Holding(h) -> each(pr, [{ ps: stored_parts(pr.ctors, h), ws: [slot(b, h.at)] }]),
     StrBlock(s) -> {
@@ -1587,8 +1560,9 @@ fn retargeted(k: RootKey, op: TypeOp) -> RootKey / {abort.raise} =
     _ -> unprinted(Spine, b"a root of no type walked", root_name(k)),
   }
 
-/// A call of root `k`, answering as `answer`, on `w`, as an expression, noted.
-fn rooted_call(pr: Printing, k: RootKey, answer: Rep, w: Bytes) -> Said =
+/// A call of root `k` on `w` as an expression, answering as `answer`: the root's name a hole, noted
+/// among `pr`'s calls with the head it is called at.
+pub fn rooted_call(pr: Printing, k: RootKey, answer: Rep, w: Bytes) -> Said =
   {
     pr: noted(pr, k, answer),
     out: [Hole(Symbol(Root(k))), Text(Bytes::concat_all([b"(ctx, ", w, b")"]))],
@@ -1624,7 +1598,7 @@ pub fn reset_boxed(
       let x = name_of(pr, of);
       let t = named(pr, token);
       let held = b.parts.fold({ pr: t.pr, out: [] }, |acc: Said, h: Held| {
-        let s = let_go_of(acc.pr, stored_parts(pr.ctors, h), slots_of(x, h.at, h.rep, false));
+        let s = let_go_of(acc.pr, stored_parts(pr.ctors, h), slots_of(x, h.at, h.rep));
         { pr: s.pr, out: spaced(acc.out, s.out) }
       });
       let shared = rooted(held.pr, dropped, b"ply_rel(ctx, ", x);
@@ -1713,71 +1687,131 @@ fn unwound(pr: Printing, unwind: List<Var>) -> Bytes / {abort.raise} = {
 }
 
 fn lets_go(text: Bytes, name: Bytes) -> Bool =
-  text.index_of(Bytes::concat_all([b"ply_dec(ctx, ", name, b");"])) != None
+  text.index_of(Bytes::concat_all([b"ply_rel(ctx, ", name, b", "])) != None
 
 fn occurrences(t: Bytes, s: Bytes) -> Int / {abort.raise} = t.split(s).len() - 1
 
+fn string() -> Type = TyCon({ name: b"String", args: [] })
+
+fn int() -> Type = TyCon({ name: b"Int", args: [] })
+
+/// A local of type `String`, held as its word.
+fn text_local(id: Int) -> Var = { id: id, ty: string(), rep: RWord }
+
+/// What a drop root's name prints as where a body lets go of a value of `ty`.
+fn drop_spelled(ty: Type) -> Bytes / {abort.raise} = root_spelled(drop_of(ty))
+
 test "a count is taken or let go of each part of a value that holds one, as many times as it is taken" {
-  let x = local(0, RWord);
-  let flat = local(1, RFlat([{ name: b"a", rep: RInt }, { name: b"b", rep: RWord }]));
-  let k = local(2, RInt);
+  let rec = TyRecord([{ name: b"a", ty: int() }, { name: b"b", ty: string() }]);
+  let x = text_local(0);
+  let flat = {
+    id: 1,
+    ty: rec,
+    rep: RFlat([{ name: b"a", rep: RInt }, { name: b"b", rep: RWord }]),
+  };
+  let k = { id: 2, ty: int(), rep: RInt };
+  let d = drop_spelled(string());
   let pr = printing(Map::new().insert(0, b"p0").insert(1, b"t1").insert(2, b"t2"));
-  assert_eq(printed(pr, Inc({ var: x, n: 2 })), b"  ply_inc(p0); ply_inc(p0);\n");
-  assert_eq(printed(pr, Dec(x)), b"  ply_dec(ctx, p0);\n");
-  // A flat value's counted leaf and its word each hold a count; its scalar leaf holds none.
-  assert_eq(printed(pr, Dec(flat)), b"  ply_dec(ctx, t1_1); ply_dec(ctx, t1_2);\n");
+  assert_eq(printed(pr, Inc({ var: x, n: 2 })), b"  ply_dup(p0); ply_dup(p0);\n");
+  assert_eq(printed(pr, Dec(x)), Bytes::concat_all([b"  ply_rel(ctx, p0, ", d, b");\n"]));
+  // A flat value's counted leaf holds a count; its scalar leaf holds none.
+  let flat_let_go = Bytes::concat_all([b"ply_rel(ctx, t1_1, ", d, b");"]);
+  assert_eq(printed(pr, Dec(flat)), Bytes::concat_all([b"  ", flat_let_go, b"\n"]));
   assert_eq(
     unwound(pr, [x, k, flat]),
-    b"goto ply_u1;\n  ply_u1: ply_dec(ctx, t1_1); ply_dec(ctx, t1_2);\n  ply_u0: ply_dec(ctx, p0); return 0;\n",
+    Bytes::concat_all([
+      b"goto ply_u1;\n  ply_u1: ",
+      flat_let_go,
+      b"\n  ply_u0: ply_rel(ctx, p0, ",
+      d,
+      b"); return 0;\n",
+    ]),
   );
   // A failure that holds no count leaves at once.
-  assert_eq(unwound(pr, [k]), b"return 0;\n");
-  assert_eq([RMaybe, RTagged, RToken(2)].map(|r: Rep| let_go(b"w", r)), [
-    b"ply_dec(ctx, w);",
-    b"ply_dec(ctx, w);",
-    b"ply_dec(ctx, w);",
-  ])
+  assert_eq(unwound(pr, [k]), b"return 0;\n")
 }
 
-test "a reset keeps a block held only here as its token, and a token no make took is freed" {
-  let x = local(0, RWord);
-  let token = local(1, RToken(2));
+test "a reset keeps a box held only here as its token, and a token no make took is freed by its size" {
+  let rec = TyRecord([{ name: b"a", ty: int() }, { name: b"b", ty: string() }]);
+  let x = { id: 0, ty: rec, rep: RWord };
+  let token = { id: 1, ty: rec, rep: RToken(2) };
   let pr = printing(Map::new().insert(0, b"p0"));
   let reset = count_printed(place(), pr, Reset({ token: token, of: x }));
   assert_eq(name_of(reset, token), b"t1");
   assert_eq(
-    printed(pr, Reset({ token: token, of: x })),
-    b"  Word t1 = ply_reset_flat(p0); if (!t1) t1 = rt_reset_p(ctx, p0);\n",
-  );
-  assert_eq(
-    printed({ ..reset, out: [] }, Free({ of: token, bytes: AInt(16) })),
-    b"  ply_dec(ctx, t1);\n",
+    spelled(reset.out),
+    Bytes::concat_all([
+      b"  Word t1 = 0; if (p0 && ply_obj(p0)->rc == 1) { ply_rel(ctx, ply_words(p0)[1], ",
+      drop_spelled(string()),
+      b"); t1 = p0; } else ply_rel(ctx, p0, ",
+      drop_spelled(rec),
+      b");\n",
+    ]),
   );
   // A failure holding the token frees it before it lets go of what was declared before it.
   assert_eq(
     unwound(reset, [x, token]),
-    b"goto ply_u1;\n  ply_u1: ply_dec(ctx, t1);\n  ply_u0: ply_dec(ctx, p0); return 0;\n",
+    Bytes::concat_all([
+      b"goto ply_u1;\n  ply_u1: if (t1) ply_free(ctx, t1, 32);\n  ply_u0: ply_rel(ctx, p0, ",
+      drop_spelled(rec),
+      b"); return 0;\n",
+    ]),
   )
 }
 
 test "a flat value opened writes no C, and each word is the part it was" {
-  let flat = local(0, RFlat([{ name: b"a", rep: RWord }, { name: b"b", rep: RInt }]));
-  let words = [local(1, RWord), local(2, RInt), local(3, RWord)];
+  let rec = TyRecord([{ name: b"a", ty: string() }, { name: b"b", ty: int() }]);
+  let flat = {
+    id: 0,
+    ty: rec,
+    rep: RFlat([{ name: b"a", rep: RWord }, { name: b"b", rep: RInt }]),
+  };
+  let words = [text_local(1), { id: 2, ty: int(), rep: RInt }];
   let pr = printing(Map::new().insert(0, b"p0"));
   let opened = count_printed(place(), pr, Opened({ of: flat, words: words }));
   assert_eq(opened.out, []);
-  assert_eq(words.map(|w: Var| name_of(opened, w)), [b"p0_0", b"p0_1", b"p0_2"]);
-  // Letting go of the first word and the record's word lets go of what the value held.
-  let by_words = unwound(opened, [words.get(0), words.get(2)]);
+  assert_eq(words.map(|w: Var| name_of(opened, w)), [b"p0_0", b"p0_1"]);
+  // Letting go of the first word lets go of what the value held.
+  let by_words = unwound(opened, [words.get(0)]);
   let whole = unwound(pr, [flat]);
-  assert([b"p0_0", b"p0_2"].all(|n: Bytes| lets_go(by_words, n) && lets_go(whole, n)));
+  assert(lets_go(by_words, b"p0_0") && lets_go(whole, b"p0_0"));
   assert(!lets_go(by_words, b"p0_1") && !lets_go(whole, b"p0_1"))
 }
 
+test "a flat value's sum leaf opened is a copy of its run of the record's words" {
+  let sum = TyCon({ name: b"m.T", args: [] });
+  let s = RSum({ laid: tagged_laid(), cases: [b"m.N", b"m.S", b"m.E"] });
+  let rec = TyRecord([
+    { name: b"a", ty: sum },
+    { name: b"u", ty: TyRecord([]) },
+    { name: b"n", ty: int() },
+  ]);
+  let flat = {
+    id: 0,
+    ty: rec,
+    rep: RFlat([{ name: b"a", rep: s }, { name: b"u", rep: RUnit }, { name: b"n", rep: RInt }]),
+  };
+  let words = [
+    { id: 1, ty: sum, rep: s },
+    { id: 2, ty: TyRecord([]), rep: RUnit },
+    { id: 3, ty: int(), rep: RInt },
+  ];
+  let opened = count_printed(
+    place(),
+    printing(Map::new().insert(0, b"p0")),
+    Opened({ of: flat, words: words }),
+  );
+  assert_eq(spelled(opened.out), b"  Word t1_0 = p0_0; Word t1_1 = p0_1;\n");
+  assert_eq(part_names(name_of(opened, words.get(0)), s), [b"t1_0", b"t1_1"]);
+  assert_eq(name_of(opened, words.get(2)), b"p0_2")
+}
+
 test "failures whose releases end alike share that end, each release printed once" {
-  let a = local(0, RWord);
-  let b = local(1, RWord);
-  let c = local(2, RWord);
+  let a = text_local(0);
+  let b = text_local(1);
+  let c = text_local(2);
+  let rel = |n: Bytes|
+    Bytes::concat_all([b"ply_rel(ctx, ", n, b", ", drop_spelled(string()), b");"]);
   let declared = |pr: Printing, v: Var| named(pr, v).pr;
   let pr = declared(declared(printing(Map::new().insert(0, b"p0")), b), c);
   let first = exit_of(pr, [a, b], b"return 0;");
@@ -1790,18 +1824,32 @@ test "failures whose releases end alike share that end, each release printed onc
     b"goto ply_u2;",
     b"goto ply_u3;",
   ]);
-  let tails = spelled(block_closed(third.pr, 0, 0, false).out);
+  let closed = block_closed(third.pr, 0, 0, false);
+  let tails = spelled(closed.out);
   assert_eq(
     tails,
-    b"  ply_u3: ply_dec(ctx, t2); goto ply_u0;\n  ply_u2: ply_dec(ctx, t2);\n  ply_u1: ply_dec(ctx, t1);\n  ply_u0: ply_dec(ctx, p0); return 0;\n",
+    Bytes::concat_all([
+      b"  ply_u3: ",
+      rel(b"t2"),
+      b" goto ply_u0;\n  ply_u2: ",
+      rel(b"t2"),
+      b"\n  ply_u1: ",
+      rel(b"t1"),
+      b"\n  ply_u0: ",
+      rel(b"p0"),
+      b" return 0;\n",
+    ]),
   );
-  assert_eq(occurrences(tails, b"ply_dec(ctx, p0);"), 1);
-  assert_eq(occurrences(tails, b"ply_dec(ctx, t1);"), 1)
+  assert_eq(occurrences(tails, rel(b"p0")), 1);
+  assert_eq(occurrences(tails, rel(b"t1")), 1);
+  // The tails' drop root is noted once among the root's calls.
+  assert_eq(closed.calls, [drop_of(string())])
 }
 
 test "a tail stands at the end of the block its value was declared in, out of the way where the block goes on" {
-  let a = local(0, RWord);
-  let b = local(1, RWord);
+  let a = text_local(0);
+  let b = text_local(1);
+  let d = drop_spelled(string());
   let pr = printing(Map::new().insert(0, b"p0"));
   let inner = named(block_opened(pr), b);
   let x = exit_of(inner.pr, [a, b], b"goto ply_h0;");
@@ -1809,13 +1857,17 @@ test "a tail stands at the end of the block its value was declared in, out of th
   let closed = block_closed(x.pr, pr.block, 1, true);
   assert_eq(
     spelled(closed.out),
-    b"    if (0) {\n      ply_u1: ply_dec(ctx, t1); goto ply_u0;\n    }\n",
+    Bytes::concat_all([
+      b"    if (0) {\n      ply_u1: ply_rel(ctx, t1, ",
+      d,
+      b"); goto ply_u0;\n    }\n",
+    ]),
   );
   assert_eq(closed.block, pr.block);
   // The parameter's release waits for the function's own block, which the inner one's jumps to.
   assert_eq(
     spelled(block_closed({ ..closed, out: [] }, 0, 0, false).out),
-    b"  ply_u0: ply_dec(ctx, p0); goto ply_h0;\n",
+    Bytes::concat_all([b"  ply_u0: ply_rel(ctx, p0, ", d, b"); goto ply_h0;\n"]),
   );
   // A block no failure path released anything of ends as it was.
   let quiet = block_opened(pr);
@@ -1933,7 +1985,7 @@ test "counting once more tests a sum's word past the floor and an Int's for its 
   )
 }
 
-test "a box opened reads its counted words, a wide sum's with its box word 0, and gives the box back" {
+test "a box opened reads its counted words, a wide sum's every word, and gives the box back" {
   let s = RSum({ laid: tagged_laid(), cases: [b"m.N", b"m.S", b"m.E"] });
   let o = local(0, RWord);
   let a = local(1, RWord);
@@ -1948,23 +2000,21 @@ test "a box opened reads its counted words, a wide sum's with its box word 0, an
   );
   assert_eq(
     spelled(opened.out),
-    b"  Word t1 = ply_words(p0)[0];\n  Word t2_0 = ply_words(p0)[2]; Word t2_1 = ply_words(p0)[3]; Word t2_2 = 0;\n  ply_free(ctx, p0, 48);\n",
+    b"  Word t1 = ply_words(p0)[0];\n  Word t2_0 = ply_words(p0)[2]; Word t2_1 = ply_words(p0)[3];\n  ply_free(ctx, p0, 48);\n",
   );
   assert_eq(name_of(opened, b), b"t2");
-  assert_eq(part_names(b"t2", s), [b"t2_0", b"t2_1", b"t2_2"]);
-  // Inside a flat record a sum's words are its own, the record's box after the leaves.
+  assert_eq(part_names(b"t2", s), [b"t2_0", b"t2_1"]);
+  // Inside a flat record a sum's words are its own.
   let flat = RFlat([{ name: b"a", rep: s }, { name: b"n", rep: RInt }]);
   let names = part_names(b"t3", flat);
-  assert_eq(names, [b"t3_0", b"t3_1", b"t3_2", b"t3_3"]);
-  assert_eq(per_part(flat, names), [[b"t3_0", b"t3_1"], [b"t3_2"], [b"t3_3"]]);
-  assert_eq(per_part(s, part_names(b"t2", s)), [[b"t2_0", b"t2_1", b"t2_2"]])
+  assert_eq(names, [b"t3_0", b"t3_1", b"t3_2"]);
+  assert_eq(per_part(flat, names), [[b"t3_0", b"t3_1"], [b"t3_2"]]);
+  assert_eq(per_part(s, part_names(b"t2", s)), [[b"t2_0", b"t2_1"]])
 }
 
 test "a list opened lets go of its tail's items and its trie, and gives itself back by its room" {
   let item = dropping_of(b"String");
-  let node = drop_of(
-    TyCon({ name: list_node_name(), args: [TyCon({ name: b"String", args: [] })] }),
-  );
+  let node = drop_of(TyCon({ name: list_node_name(), args: [string()] }));
   let opened = opened_block(
     printing(Map::new().insert(0, b"p0")),
     0,
@@ -2039,7 +2089,7 @@ test "a reset keeps a box held only here as its token, its words let go of, and 
     ]),
   );
   let token = local(1, RToken(2));
-  let freed = count_classed(place(), { ..reset, out: [] }, Free({ of: token, bytes: AInt(32) }));
+  let freed = count_printed(place(), { ..reset, out: [] }, Free({ of: token, bytes: AInt(32) }));
   assert_eq(spelled(freed.out), b"  if (t1) ply_free(ctx, t1, INT64_C(32));\n");
   assert_eq(
     spelled(released(reset, token.ty, token.rep, [b"t1"]).out),
@@ -2097,9 +2147,7 @@ fn walked_said(
 
 test "a node copied is a fresh block of its header and words, each counted once more, the original let go" {
   let item = dropping_of(b"String");
-  let node = drop_of(
-    TyCon({ name: list_node_name(), args: [TyCon({ name: b"String", args: [] })] }),
-  );
+  let node = drop_of(TyCon({ name: list_node_name(), args: [string()] }));
   let copy = walked_said(Copy, NodeOf({ node: node, item: [word(0, Object(item))] }), node);
   [
     b"Word t1 = rt_alloc_bytes_p(ctx, 16 + 8 * (int64_t)ply_obj(p0)->layout);",

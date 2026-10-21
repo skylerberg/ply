@@ -13,13 +13,15 @@ import emit.roots (symbol_of, root_id)
 import emit.keys
 import emit.keys (RootKey, Named, Root, Written, root_name)
 import emit.reps (Ctors, no_ctors)
-import emit.pieces (Piece, Text, Hole, TagOf, InGroup, LentBy, merged, spelled)
-import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSlice, Var, Arg, AVar, AInt, ABool, AZero,
-                 Val, Prim, Literal, Static, Make, TInt, Get, Take, Tag, Path, PField, PArg,
-                 PCapture, Pack, Gathered, Call, Apply, Native, Op, OHandle, OContainer, OCalling,
-                 OStrings, MClosure, MList, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss,
-                 Loop, Next, Done, Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec,
-                 Reset, Free, Opened, Block, Fn, Member, Rooted, Plain, Given, Owned, Lambda,
+import emit.layout (Boxed, tag_bits)
+import emit.pieces (Piece, Text, Hole, Symbol, TagOf, InGroup, LentBy, merged, spelled)
+import emit.release (drop_of)
+import emit.tir (Rep, RInt, RBool, RWord, RFlat, RSum, RUnit, RSlice, Var, Arg, AVar, AInt, ABool,
+                 AZero, Val, Prim, Literal, Static, Make, TInt, Get, Take, Tag, Path, PField, PArg,
+                 PCapture, PCase, Pack, Gathered, Call, Apply, Native, Op, OHandle, OContainer,
+                 OCalling, OStrings, MClosure, MList, Inst, Let, Do, Decl, Assign, If, Case, Match,
+                 Miss, Loop, Next, Done, Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc,
+                 Dec, Reset, Free, Opened, Block, Fn, Member, Rooted, Plain, Given, Owned, Lambda,
                  Closure, Uses, NoArm, Spine, LastOf, Walked, no_links, falls_through, var_said)
 import emit.print.text (Under, Place, Printing, Printed, printing, function_body, line, text,
                         pieces, pad, named, name_of, arg_text, assigned, label, check, zero,
@@ -175,7 +177,8 @@ fn group_printed(
                   match v.rep {
                     RWord -> { ..q, names: q.names.insert(v.id, word) },
                     RFlat(_) -> parted(q, v, word),
-                    RCases(_) -> parted(q, v, word),
+                    RSum(_) -> parted(q, v, word),
+                    RUnit -> q,
                     _ -> assigned(q, 1, v, c_type(v.rep), word_as(word, v.rep)),
                   }
                 }
@@ -617,10 +620,10 @@ fn value_printed(p: Place, pr: Printing, into: Option<Var>, val: Val) -> Printin
     Walked(w) -> walked_value(p, pr, into, w.of, w.op),
   }
 
-/// The field held as one word at `t.path`'s offset in the block `t.of`, read with a count of its own:
-/// moved out of its slot, which is emptied, where the block is held only here, and counted once more
-/// where it is shared. A block held in place in another is held only here where the object counting
-/// for it is: its own header holds no count.
+/// The field held as one word at `t.path`'s offset in the block `t.of`, or in the box the case of the
+/// sum `t.of` holds, read with a count of its own: moved out of its slot, which is emptied, where the
+/// block is held only here, and counted once more where it is shared. A block held in place in
+/// another is held only here where the object counting for it is: its own header holds no count.
 fn taken(
   p: Place,
   pr: Printing,
@@ -629,36 +632,73 @@ fn taken(
 ) -> Printing / {abort.raise} =
   match into {
     None -> unprinted(Spine, b"a field taken that nothing holds", var_said(t.of)),
-    Some(v) -> match if t.of.rep != RWord { None } else { offset_of(t.path) } {
-      None -> unprinted(Spine, b"a field taken other than out of a block's word", var_said(t.of)),
+    Some(v) -> match field_of(name_of(pr, t.of), t.of.rep, t.path) {
+      None ->
+        unprinted(
+          Spine,
+          b"a field taken other than out of a block's word or a case's box",
+          var_said(t.of),
+        ),
       Some(at) -> {
-        let block = name_of(pr, t.of);
-        let field = slot(block, at);
         let n = named(pr, v);
-        line(
-          line(
-            n.pr,
-            p.depth,
-            Bytes::concat_all([c_type(v.rep), b" ", n.name, b" = ", field, b";"]),
-          ),
+        let read = line(
+          n.pr,
           p.depth,
-          Bytes::concat_all([
-            b"if (ply_counted_by(ply_obj(",
-            block,
-            b"))->rc == 1) ",
-            field,
-            b" = ply_unit; else ply_inc(",
-            n.name,
-            b");",
-          ]),
-        )
+          Bytes::concat_all([c_type(v.rep), b" ", n.name, b" = ", at.field, b";"]),
+        );
+        let held = Bytes::concat_all([
+          b"if (ply_counted_by(ply_obj(",
+          at.block,
+          b"))->rc == 1) ",
+          at.field,
+          b" = ply_unit; else",
+        ]);
+        // A word that is a sum is counted through its case, which its class says.
+        if v.rep == RWord {
+          line(read, p.depth, Bytes::concat_all([held, b" ply_inc(", n.name, b");"]))
+        } else {
+          line(
+            count_printed(
+              { ..p, depth: p.depth + 1 },
+              line(read, p.depth, held.concat(b" {")),
+              Inc({ var: v, n: 1 }),
+            ),
+            p.depth,
+            b"}",
+          )
+        }
       },
     },
   }
 
-/// The word offset `path` reads at, where it reads at one.
-fn offset_of(path: Path) -> Option<Int> =
-  match path { PField(f) -> Some(f.at), PArg(a) -> Some(a.at), _ -> None }
+/// The block a field `path` reads lies in, out of a value named `name` held as `r`, and the field:
+/// a block's word at its offset, or the box a sum's case holds, after its tag, its word masked where
+/// the case's tag is in its low bits.
+fn field_of(name: Bytes, r: Rep, path: Path) -> Option<{ block: Bytes, field: Bytes }> =
+  match ((r, path)) {
+    (RWord, PField(f)) -> Some({ block: name, field: slot(name, f.at) }),
+    (RWord, PArg(a)) -> Some({ block: name, field: slot(name, a.at) }),
+    (RSum(s), PCase(c)) -> match s.laid.cases.at(c.case) {
+      Some(x) -> match x.payload {
+        Boxed(b) -> {
+          let word = match part_names(name, r).at(b.at) { Some(w) -> w, None -> name };
+          let block = if b.stripped {
+            Bytes::concat_all([
+              b"((",
+              word,
+              b") & ~(Word)",
+              ascii_of_int((1 << tag_bits()) - 1),
+              b")",
+            ])
+          } else { word };
+          Some({ block: block, field: slot(block, b.skip + c.at) })
+        },
+        _ -> None,
+      },
+      None -> None,
+    },
+    _ -> None,
+  }
 
 /// The tag of constructor `name`, which the unit writes in.
 fn tagged(p: Place, pr: Printing, into: Option<Var>, name: Bytes) -> Printing =
@@ -1156,6 +1196,16 @@ fn word_root(params: List<Var>, body: Block) -> Bytes / {abort.raise} =
     ).pieces,
   )
 
+/// What letting go of a `String` named `name` prints: a call of its type's drop root, a hole.
+fn released_text(name: Bytes) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"ply_rel(ctx, ",
+    name,
+    b", ",
+    spelled([Hole(Symbol(Root(drop_of(TyCon({ name: b"String", args: [] })))))]),
+    b");",
+  ])
+
 test "each failure releases what it holds through tails that failures holding alike share" {
   let s = word_var(0);
   let a = word_var(1);
@@ -1178,9 +1228,9 @@ test "each failure releases what it holds through tails that failures holding al
   assert(
     holds_run(lines, [
       b"  return t3;",
-      b"  ply_u2: ply_dec(ctx, t2); goto ply_u0;",
-      b"  ply_u1: ply_dec(ctx, t1);",
-      b"  ply_u0: ply_dec(ctx, p0); return 0;",
+      Bytes::concat_all([b"  ply_u2: ", released_text(b"t2"), b" goto ply_u0;"]),
+      Bytes::concat_all([b"  ply_u1: ", released_text(b"t1")]),
+      Bytes::concat_all([b"  ply_u0: ", released_text(b"p0"), b" return 0;"]),
       b"}",
     ]),
   )
@@ -1212,12 +1262,18 @@ test "a tail stands in the block its value was declared in, and goes on to the t
     holds_run(lines, [
       b"    t1 = t3;",
       b"    if (0) {",
-      b"      ply_u1: ply_dec(ctx, t2); goto ply_u0;",
+      Bytes::concat_all([b"      ply_u1: ", released_text(b"t2"), b" goto ply_u0;"]),
       b"    }",
       b"  } else {",
     ]),
   );
-  assert(holds_run(lines, [b"  return t1;", b"  ply_u0: ply_dec(ctx, p0); return 0;", b"}"]))
+  assert(
+    holds_run(lines, [
+      b"  return t1;",
+      Bytes::concat_all([b"  ply_u0: ", released_text(b"p0"), b" return 0;"]),
+      b"}",
+    ]),
+  )
 }
 
 test "a failure inside a handle's body releases what the body holds and goes to the landing, which releases what the handle holds" {
@@ -1245,11 +1301,11 @@ test "a failure inside a handle's body releases what the body holds and goes to 
   let after = text.slice(landing, text.len());
   // The body's value is let go of on the way to the landing, and what the handle holds is not.
   assert(body.index_of(b"if (ctx->failed) goto ply_h0;") != None);
-  assert(body.index_of(b": ply_dec(ctx, t4); goto ply_h0;") != None);
-  assert_eq(occurrences(body, b"ply_dec(ctx, p0);"), 0);
+  assert(body.index_of(Bytes::concat_all([b": ", released_text(b"t4"), b" goto ply_h0;"])) != None);
+  assert_eq(occurrences(body, released_text(b"p0")), 0);
   // The landing lets go of it where no clause answers the failure.
   assert(after.index_of(b"if (ctx->failed) goto ply_u") != None);
-  assert(after.index_of(b": ply_dec(ctx, p0); return 0;") != None)
+  assert(after.index_of(Bytes::concat_all([b": ", released_text(b"p0"), b" return 0;"])) != None)
 }
 
 test "a value whose C tests for no failure adds no tail" {
