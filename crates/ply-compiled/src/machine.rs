@@ -2,16 +2,17 @@
 //! runtime through: each takes the bytes it reads as an address and a count, borrowed for the call,
 //! and answers raw integers, a `Float`'s bits, a runtime object, or bytes left as the context's
 //! taken bytes, which emitted code copies out into a block of its own. None reads or makes a string,
-//! a byte string or a list, and none raises: a native whose builtin can fail answers a value that
-//! says so, and emitted code calls the builtin over its arguments' encoding, which raises as it
-//! always has. What each answers is what the value builtin of the same name answers.
+//! a byte string or a list. A native whose builtin can fail answers a value that says so, and
+//! emitted code hands the refusal to [`rt_refused`](crate::rt::rt_refused), or to
+//! [`rt_refused_text`] where it names text. What each answers is what the value builtin of the same
+//! name answers.
 
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::Handle;
 use crate::heap::{KIND_BRIDGE, bridged, obj};
-use crate::native::{Addr, F64, I64};
-use crate::rt::{Ctx, lent};
-use ply_core::builtins::call;
+use crate::native::{Addr, F64, I64, Raises};
+use crate::rt::{Ctx, lent, refuse, refused_builtin, refused_unknown};
+use ply_core::builtins::{assert_failure, call, not_found, not_utf8};
 use ply_core::{Builtin, Decimal, Diagnostic, Fixed, IntTy, Span, Value, codes};
 
 /// Every native here, under the name the compiler declares it by.
@@ -81,6 +82,10 @@ pub fn natives() -> Vec<MachineNative> {
         machine_native(
             "?secret_verify",
             rt_secret_verify as unsafe extern "C" fn(_, _, _, _) -> _,
+        ),
+        machine_native(
+            "?refused_text",
+            rt_refused_text as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
     ]
 }
@@ -356,6 +361,65 @@ pub unsafe extern "C" fn rt_secret_verify(ctx: *mut Ctx, stored: Handle, p: Addr
         Some(Value::Bool(b)) => I64(i64::from(b)),
         _ => I64(0),
     }
+}
+
+/// [`rt_refused`](crate::rt::rt_refused) for a builtin whose refusal names text, `what` numbered as
+/// [`REFUSED`](crate::rt::REFUSED) numbers it: `String::find`, which did not find the `m` bytes at
+/// `q` among the `n` at `p`; `String::of_bytes`, given the `n` bytes at `p`, which are not UTF-8;
+/// `assert`, whose message is the string of `n` bytes at `p`, or none where `n` is below 0. Any other
+/// `what` fails the entry as Ply's fault.
+#[allow(improper_ctypes_definitions)]
+pub unsafe extern "C" fn rt_refused_text(
+    ctx: *mut Ctx,
+    what: I64,
+    p: Addr,
+    n: I64,
+    q: Addr,
+    m: I64,
+) -> Raises {
+    let c = unsafe { &mut *ctx };
+    let site = c.site();
+    let Some(builtin) = refused_builtin(what) else {
+        refused_unknown(c, what);
+        return Raises(());
+    };
+    let refused = match builtin {
+        Builtin::StringFind => {
+            let (Some(s), Some(needle)) =
+                (c.text(unsafe { lent(p, n) }), c.text(unsafe { lent(q, m) }))
+            else {
+                return Raises(());
+            };
+            not_found(site, s, needle)
+        }
+        Builtin::StringOfBytes => {
+            let bytes = unsafe { lent(p, n) };
+            match std::str::from_utf8(bytes) {
+                Err(e) => not_utf8(site, bytes, &e),
+                Ok(_) => {
+                    c.fail(err_machine("bytes refused as not UTF-8 that are"));
+                    return Raises(());
+                }
+            }
+        }
+        Builtin::Assert => {
+            let message = if n.0 < 0 {
+                Value::ctor("None", Vec::new())
+            } else {
+                match c.text(unsafe { lent(p, n) }) {
+                    Some(s) => Value::ctor("Some", vec![Value::str(s)]),
+                    None => return Raises(()),
+                }
+            };
+            assert_failure(&message, site)
+        }
+        _ => {
+            refused_unknown(c, what);
+            return Raises(());
+        }
+    };
+    refuse(c, builtin, refused);
+    Raises(())
 }
 
 fn decimal_of(lo: I64, hi: I64) -> Decimal {
