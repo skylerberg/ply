@@ -11,16 +11,15 @@ import syntax.parsing (Span, dummy_span, starts_upper)
 import check.types (Type, TyCon, named_type)
 import emit.typing (unknown_type)
 import emit.reps (SumCtor, at_args)
-import emit.layout (Laid, LRecord, SumLaid, Inline, Boxed, Nullary)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RTagged, RFlat, RCases,
-                 RSlice, RSum, Leaf, Var, Arg, AVar, AInt, ABool, ANum, AZero, Uses, Prim, Get,
-                 Gathered, Native, PArg, PCase, PLeaf, Inst, Decl, Assign, If, Case, Match, Miss,
-                 Fail, NoArm, NoLet, Block, Test, TTag, TInt, TRange, TLength, Matching, rep_of_arg)
+import emit.tir (Rep, RInt, RBool, RNum, RWord, RSlice, RSum, RUnit, Var, Arg, AVar, AInt, ABool,
+                 ANum, AZero, Uses, Prim, Get, Gathered, Native, PCase, PLeaf, Inst, Decl, Assign,
+                 If, Case, Match, Miss, Fail, NoArm, NoLet, Block, Test, TTag, TInt, TRange,
+                 TLength, Matching, rep_of_arg)
 import emit.lower.setting (Setting, ctor_named, ctor_sum)
-import emit.lower.held (held_as, arg_path, arg_held, case_index, case_span)
+import emit.lower.held (held_as, case_index, arg_word)
 import emit.lower.base (Context, Lowering, Lowered, Armed, refuse, fresh, bound_as, emitted, opened,
                         continued, join_type, join_held, set_join, type_of, handed, unviewed)
-import emit.lower.data (field)
+import emit.lower.data (field, open_needed)
 import emit.lower.scalars (literal, binary)
 import std.pace (paced)
 
@@ -186,7 +185,7 @@ fn value_tested(
         None -> refuse(read.st, Matching, b"a comparison with a slot nothing bound").st,
       },
       None -> match ctor_of(cx.setting, type_of(read.arg), v.name) {
-        Some(k) -> tag_tested(read.st, read.arg, k, differ),
+        Some(k) -> tag_tested(cx, read.st, read.arg, k, differ),
         None ->
           refuse(read.st, Matching, b"a comparison with a global's value: ".concat(v.name)).st,
       },
@@ -198,7 +197,7 @@ fn value_tested(
         match ctor_of(cx.setting, type_of(read.arg), f.name) {
           Some(k) ->
             a.args.fold(
-              { st: tag_tested(read.st, read.arg, k, differ), at: 0 },
+              { st: tag_tested(cx, read.st, read.arg, k, differ), at: 0 },
               |acc: { st: Lowering, at: Int }, y: Code| {
                 let lying = arg_read(cx, acc.st, read.arg, k, acc.at);
                 {
@@ -250,7 +249,7 @@ fn pattern_bound(
         None -> refuse(st, Matching, b"a constructor of no declared sum: ".concat(c.name)).st,
         Some(k) ->
           c.args.fold(
-            { st: tag_tested(st, subject, k, failing), at: 0 },
+            { st: tag_tested(cx, st, subject, k, failing), at: 0 },
             |acc: { st: Lowering, at: Int }, sub: CodePattern|
               match sub {
                 PxWild -> { ..acc, at: acc.at + 1 },
@@ -397,9 +396,15 @@ fn bounds(lo: Lit, hi: Lit) -> Option<{ lo: Int, hi: Int }> =
 /// Whether a value held as `r` is an integer C holds in a register: an `Int`, a `Bool`, a width.
 fn integral(r: Rep) -> Bool = match r { RInt -> true, RBool -> true, RNum(_) -> true, _ -> false }
 
-/// Constructor `k`'s test on `subject`.
-fn tag_tested(st: Lowering, subject: Arg, k: CtorOf, failing: Block) -> Lowering =
-  case_tested(st, subject, TTag(k.names), k.index, failing)
+/// Constructor `k`'s test on `subject`: none of a sum of no words, which has one case; of a sum a
+/// type variable leaves the layout of open, a placeholder whose layout its callers settle.
+fn tag_tested(cx: Context, st: Lowering, subject: Arg, k: CtorOf, failing: Block) -> Lowering =
+  match rep_of_arg(subject) {
+    RUnit -> st,
+    RWord ->
+      case_tested(open_needed(cx, st, type_of(subject)), subject, TTag(k.names), k.index, failing),
+    _ -> case_tested(st, subject, TTag(k.names), k.index, failing),
+  }
 
 /// `subject` tested to be the `when`th of what `t` lists, leaving by `failing` where it is not: a
 /// `Case` on a variable, and on a constant an `If` its test was decided for.
@@ -503,99 +508,44 @@ fn as_read(cx: Context, lying: Lowered, k: CtorOf, at: Int, tag_only: Bool) -> L
 fn arg_type(k: CtorOf, at: Int) -> Type =
   match k.args.at(at) { Some(t) -> t, None -> unknown_type() }
 
-/// Argument `at` of the constructor `k` that `subject` was tested to be, borrowed where it lies: a
-/// case's leaves where the sum is held as its cases, the payload's word or a scalar read out of it
-/// where it is held as one word, and its slot where it is an object.
+/// Argument `at` of the constructor `k` that `subject` was tested to be, borrowed where it lies, as
+/// its type holds it: no value of no words; read out of the case's payload of a sum laid out; and of
+/// a sum whose layout a type variable leaves open as a word, a placeholder whose layout its callers
+/// settle.
 fn arg_read(cx: Context, st: Lowering, subject: Arg, k: CtorOf, at: Int) -> Lowered = {
   let ty = arg_type(k, at);
   let want = held_as(cx.setting, ty);
-  match subject {
-    AVar(v) -> match v.rep {
-      RCases(_) -> match case_index(v.rep, k.full) {
-        None -> refuse(st, Matching, b"a constructor its sum's cases do not hold: ".concat(k.full)),
-        Some(i) -> if at > 0 { refuse(st, Matching, b"a case of more than one argument") } else {
-          let span = case_span(v.rep, i);
-          let n = span.leaves.len();
-          let parts = range(0, n).fold(
-            { st: st, parts: [] },
-            |acc: { st: Lowering, parts: List<Arg> }, j: Int| {
-              let g = bound_as(
-                acc.st,
-                if n == 1 { ty } else { unknown_type() },
-                leaf_rep(span.leaves, j),
-                Get({ of: v, path: PLeaf(1 + span.at + j) }),
-                dummy_span(),
-              );
-              { st: g.st, parts: acc.parts.push(g.arg) }
-            },
-          );
-          match parts.parts.at(0) {
-            Some(a) -> if n == 1 { { st: parts.st, arg: a } } else {
-              bound_as(
-                parts.st,
-                ty,
-                RFlat(span.leaves.take(n - 1)),
-                Gathered({ parts: parts.parts }),
-                dummy_span(),
-              )
-            },
-            None -> refuse(parts.st, Matching, b"an argument of a case holding nothing"),
-          }
+  if want == RUnit { { st: st, arg: AZero(RUnit) } } else {
+    match subject {
+      AVar(v) -> match v.rep {
+        RSum(s) -> match case_index(v.rep, k.full) {
+          None ->
+            refuse(st, Matching, b"a constructor its sum's cases do not hold: ".concat(k.full)),
+          Some(i) -> match arg_word(s.laid, i, at) {
+            None -> refuse(st, Matching, b"an argument its case's layout does not hold"),
+            Some(w) ->
+              bound_as(st, ty, want, Get({ of: v, path: PCase({ case: i, at: w }) }), dummy_span()),
+          },
         },
+        RWord ->
+          handed(
+            bound_as(
+              open_needed(cx, st, v.ty),
+              ty,
+              RWord,
+              Get({ of: v, path: PCase({ case: k.index, at: at }) }),
+              dummy_span(),
+            ),
+            want,
+            dummy_span(),
+          ),
+        _ -> refuse(st, Matching, b"a constructor's argument read out of no sum: ".concat(k.full)),
       },
-      RSum(s) -> match case_index(v.rep, k.full) {
-        None -> refuse(st, Matching, b"a constructor its sum's cases do not hold: ".concat(k.full)),
-        Some(i) -> match arg_word(s.laid, i, at) {
-          None -> refuse(st, Matching, b"an argument its case's layout does not hold"),
-          Some(w) ->
-            bound_as(st, ty, want, Get({ of: v, path: PCase({ case: i, at: w }) }), dummy_span()),
-        },
-      },
-      RMaybe -> payload_read(st, v, ty, want, k.full),
-      RTagged -> payload_read(st, v, ty, want, k.full),
-      _ ->
-        bound_as(
-          st,
-          ty,
-          arg_held(cx.setting, k.full, at),
-          Get({ of: v, path: arg_path(cx.setting, k.full, at) }),
-          dummy_span(),
-        ),
-    },
-    // A constant's tag test was decided, so this read is never reached.
-    _ -> { st: st, arg: AZero(want) },
+      // A constant's tag test was decided, so this read is never reached.
+      _ -> { st: st, arg: AZero(want) },
+    }
   }
 }
-
-/// The word of case `i`'s payload, in a sum laid as `s`, that argument `at` starts at: where the
-/// case's arguments, laid as a record of them, lay it.
-fn arg_word(s: SumLaid, i: Int, at: Int) -> Option<Int> = {
-  let fields = |l: Laid| match l { LRecord(fs) -> fs, _ -> [] };
-  match s.cases.at(i) {
-    Some(c) -> match c.payload {
-      Inline(p) -> match fields(p.laid).at(at) { Some(f) -> Some(f.at), None -> None },
-      Boxed(b) -> match fields(b.laid).at(at) { Some(f) -> Some(f.at), None -> None },
-      Nullary -> None,
-    },
-    None -> None,
-  }
-}
-
-/// The payload of a sum `v` holds as one word, of type `ty` held as `want`: a scalar read out of the
-/// word where it lies, anything else the word.
-fn payload_read(st: Lowering, v: Var, ty: Type, want: Rep, ctor: Bytes) -> Lowered = {
-  let read = match want {
-    RInt -> want,
-    RBool -> want,
-    RNum(_) -> want,
-    RFloat -> want,
-    RDec -> want,
-    _ -> RWord,
-  };
-  bound_as(st, ty, read, Get({ of: v, path: PArg({ ctor: ctor, at: 0 }) }), dummy_span())
-}
-
-fn leaf_rep(ls: List<Leaf>, k: Int) -> Rep = match ls.at(k) { Some(l) -> l.rep, None -> RWord }
 
 /// The type of what list `v` holds, where `v` is held as a list's word or as a view of one.
 fn listed_type(v: Var) -> Option<Type> =
