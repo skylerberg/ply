@@ -5,15 +5,22 @@
 
 import syntax.patterns (Lit, LStr, LBytes, LEmbedded, LDec, LFixed, LWide, LUnit)
 import syntax.parsing (dummy_span)
-import check.types (TyCon)
+import check.types (Type, TyCon, TyVar, TyRecord, TyNominal, Field, spelled_type, named_type,
+                    int_type, string_type)
+import std.value
+import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VStr, VBytes, VRecord,
+                  VCtor, VList)
 import emit.c (Width, width_named, width_index)
 import emit.keys (Named)
+import emit.reps (Ctors, SumCtor, ctors_of, laid, word_form, ctor_fields_at)
+import emit.layout (LSum, SumLaid, WordClass, CaseTest, WordIs, LowBits, Nullary, Inline, Boxed,
+                    Itself, Immediate, RuntimeBox, Box, words)
 import emit.tir (Fn, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Val, Literal, Static,
                  Prim, AInt, ABool, AVar, RInt, RDec, RWord, Rep, Var, Return, Rooted, Owned,
                  Lambda, Closure, no_links)
 import emit.tir.statics (StaticDef, StaticLaid, SBlock, SFile, WRaw, named, text_block, str_kind,
                          bytes_kind, wide_kind)
-import emit.tir.statics (SPlain, WBytes, WAddress)
+import emit.tir.statics (SPlain, WBytes, WAddress, StaticWord, int_kind, float_kind, decimal_kind)
 
 /// A value the build knows whole, as static data holds it: a string's or a byte string's bytes, an
 /// embedded file by its bytes' digest, a 128-bit width's value as its high and low 64 bits.
@@ -42,6 +49,271 @@ pub fn laid_of(s: Datum) -> StaticLaid =
 
 /// The definitions `s` needs, each it addresses before it and itself last, which names it.
 pub fn statics_of(s: Datum) -> List<StaticDef> / {abort.raise} = [named(laid_of(s))]
+
+/// A value the build knows whole, as its type lays it in place: a word held raw (an `Int`'s, a
+/// `Float`'s bits, a `Bool`'s 0 or 1, a narrower width's bits extended as a register holds them, a
+/// `Char`'s immediate), a `Decimal`'s two words, a record's fields in its type's order, a sum's case
+/// by its place among the sum's cases with that case's arguments in order, or the address of a
+/// static object.
+pub type Known =
+  | KnownWord(Int)
+  | KnownDecimal({ lo: Int, hi: Int })
+  | KnownRecord(List<Known>)
+  | KnownCase({ case: Int, args: List<Known> })
+  | KnownObject(Datum)
+
+/// Words of static data, and the statics they address, each after those it addresses.
+pub type Laying = { words: List<StaticWord>, defs: List<StaticDef> }
+
+/// The words `k`, a value of `ty`, takes where `ty` lays it in place (`emit.reps.laid`), and the
+/// statics they address, a boxed case's box among them. Each part is laid by its own type, so a sum
+/// of a boxed case's recursion group is laid by its cases, however the box lays it. Raises on a value
+/// its type lays in other words, or a case its type has not.
+pub fn laid_at(ctors: Ctors, ty: Type, k: Known) -> Laying / {abort.raise} = {
+  let l = match k {
+    KnownWord(n) -> { words: [WRaw(n)], defs: [] },
+    KnownDecimal(d) -> { words: [WRaw(d.lo), WRaw(d.hi)], defs: [] },
+    KnownObject(d) -> {
+      let defs = statics_of(d);
+      { words: [WAddress({ name: defs.get(defs.len() - 1).name, tag: 0 })], defs: defs }
+    },
+    KnownRecord(ks) -> {
+      let types = record_types(ty);
+      if types.len() != ks.len() { mislaid(ty) } else {
+        ks.fold({ at: 0, out: no_laying() }, |acc: { at: Int, out: Laying }, x: Known|
+          { at: acc.at + 1, out: joined(acc.out, laid_at(ctors, types.get(acc.at), x)) }).out
+      }
+    },
+    KnownCase(c) -> match ty {
+      TyCon(t) -> match laid(ctors, ty) {
+        LSum(s) -> match ctors.sums.get(t.name) {
+          Some(cs) -> match cs.at(c.case) {
+            Some(sc) -> {
+              let types = ctor_fields_at(sc, t.args);
+              if types.len() != c.args.len() { mislaid(ty) } else {
+                case_words(
+                  s,
+                  c.case,
+                  c.args.fold(
+                    { at: 0, out: no_laying() },
+                    |acc: { at: Int, out: Laying }, x: Known|
+                      {
+                        at: acc.at + 1,
+                        out: joined(acc.out, laid_at(ctors, types.get(acc.at), x)),
+                      },
+                  ).out,
+                )
+              }
+            },
+            None -> mislaid(ty),
+          },
+          None -> mislaid(ty),
+        },
+        _ -> mislaid(ty),
+      },
+      _ -> mislaid(ty),
+    },
+  };
+  if l.words.len() != words(laid(ctors, ty)) { mislaid(ty) } else { l }
+}
+
+fn no_laying() -> Laying = { words: [], defs: [] }
+
+fn joined(a: Laying, b: Laying) -> Laying =
+  { words: a.words.concat(b.words), defs: a.defs.concat(b.defs) }
+
+/// The types of a record's fields in its type's order; none for another type.
+fn record_types(ty: Type) -> List<Type> =
+  match ty {
+    TyRecord(fs) -> fs.map(|f: Field| f.ty),
+    TyNominal(n) -> n.fields.map(|f: Field| f.ty),
+    _ -> [],
+  }
+
+fn mislaid<a>(ty: Type) -> a / {abort.raise} =
+  panic(
+    String::of_bytes_lossy(
+      b"a known value its type lays in other words: ".concat(spelled_type(ty)),
+    ),
+  )
+
+/// Case `case` of the sum laid as `s`, its arguments laid as `payload`: the payload where the case
+/// lays it, in its box behind the box's tag word where the case is boxed, the case's test written in
+/// its tag word or its pointer's low bits, and zero in every other word.
+fn case_words(s: SumLaid, case: Int, payload: Laying) -> Laying / {abort.raise} =
+  match s.cases.at(case) {
+    None -> panic("a case its sum does not lay"),
+    Some(cl) -> {
+      let zeros = s.classes.map(|_: WordClass| WRaw(0));
+      let held = match cl.payload {
+        Nullary -> { words: zeros, defs: payload.defs },
+        Inline(i) -> { words: placed(zeros, i.offset, payload.words), defs: payload.defs },
+        Boxed(b) -> {
+          let boxed = named(
+            SBlock({
+              head: [],
+              words: (if b.skip == 1 { [WRaw(case)] } else { [] }).concat(payload.words),
+            }),
+          );
+          {
+            words: placed(zeros, b.at, [WAddress({ name: boxed.name, tag: 0 })]),
+            defs: payload.defs.push(boxed),
+          }
+        },
+      };
+      { words: tested(held.words, cl.test), defs: held.defs }
+    },
+  }
+
+fn placed(ws: List<StaticWord>, at: Int, xs: List<StaticWord>) -> List<StaticWord> / {abort.raise} =
+  xs.fold({ at: at, out: ws }, |acc: { at: Int, out: List<StaticWord> }, x: StaticWord|
+    { at: acc.at + 1, out: acc.out.set(acc.at, x) }).out
+
+/// `ws` with a case's test written: its value in its tag word, its bits in its pointer's low bits.
+fn tested(ws: List<StaticWord>, t: CaseTest) -> List<StaticWord> / {abort.raise} =
+  match t {
+    WordIs(w) -> ws.set(w.at, WRaw(w.value)),
+    LowBits(b) -> match ws.at(b.at) {
+      Some(WAddress(a)) -> ws.set(b.at, WAddress({ ..a, tag: b.bits })),
+      _ -> panic("a case told by its pointer's low bits whose word holds no static's address"),
+    },
+    _ -> ws,
+  }
+
+/// The one word `k`, a value of `ty`, is where one word is required (a container's item, an
+/// argument of a closure's uniform entry), as `emit.reps.word_form` says: its own, an immediate, the
+/// runtime's box of it, or a box of its words; and the statics that word addresses.
+pub fn word_at(
+  ctors: Ctors,
+  ty: Type,
+  k: Known,
+) -> { word: StaticWord, defs: List<StaticDef> } / {abort.raise} = {
+  let l = laid_at(ctors, ty, k);
+  let boxed = |head: List<{ field: Bytes, value: Int }>| {
+    let b = named(SBlock({ head: head, words: l.words }));
+    { word: WAddress({ name: b.name, tag: 0 }), defs: l.defs.push(b) }
+  };
+  match word_form(ctors, ty) {
+    Itself -> { word: match l.words.at(0) { Some(w) -> w, None -> WRaw(0) }, defs: l.defs },
+    Immediate -> match k {
+      KnownWord(n) -> if n >= 0 - (1 << 62) && n < 1 << 62 { { word: WRaw(n * 2 + 1), defs: [] } }
+      else { boxed([{ field: b"kind", value: int_kind() }, { field: b"len", value: 1 }]) },
+      _ -> mislaid(ty),
+    },
+    RuntimeBox -> boxed(runtime_head(ty)),
+    Box(_) -> boxed([]),
+  }
+}
+
+/// The header of the runtime's box of a value of `ty`: a `Float`'s, a `Decimal`'s, a 64-bit width's.
+fn runtime_head(ty: Type) -> List<{ field: Bytes, value: Int }> / {abort.raise} =
+  match ty {
+    TyCon(c) -> if c.name == b"Float" {
+      [{ field: b"kind", value: float_kind() }, { field: b"len", value: 1 }]
+    } else if c.name == b"Decimal" {
+      [{ field: b"kind", value: decimal_kind() }, { field: b"len", value: 2 }]
+    } else {
+      match width_named(c.name) {
+        Some(w) ->
+          [
+            { field: b"kind", value: wide_kind() },
+            { field: b"len", value: 1 },
+            { field: b"layout", value: width_index(w) },
+          ],
+        None -> mislaid(ty),
+      }
+    },
+    _ -> mislaid(ty),
+  }
+
+/// `v`, a value of `ty` as `std.value` holds one, as the build knows it to lay it out; or why it
+/// cannot: a list, a map or an array, laid at run time, or a function, a handle or a value that
+/// leaves something out, which no build can know.
+pub fn known_of_value(ctors: Ctors, ty: Type, v: Value) -> Result<Known, Bytes> / {abort.raise} =
+  match v {
+    VUnit -> Ok(KnownRecord([])),
+    VBool(b) -> Ok(KnownWord(if b { 1 } else { 0 })),
+    VInt(n) -> Ok(KnownWord(n)),
+    VFloat(x) -> Ok(KnownWord(bits_of_float(x))),
+    VDecimal(d) -> Ok(KnownDecimal(decimal_words(Bytes::of_string(d.to_string())))),
+    VChar(c) -> Ok(KnownWord(Int::of_char(c) * 8 + 2)),
+    VStr(s) -> Ok(KnownObject(SStr(Bytes::of_string(s)))),
+    VBytes(b) -> Ok(KnownObject(SBytes(b))),
+    VFixed(name, bits) -> match width_named(Bytes::of_string(name)) {
+      Some(w) -> Ok(fixed_known(w, bits)),
+      None -> Err(b"a width of no known name"),
+    },
+    VRecord(fs) -> {
+      let types = record_types(ty);
+      if types.len() != fs.len() { Err(b"a record of other fields than its type's") } else {
+        let known = fs.fold(
+          { at: 0, out: Ok([]) },
+          |acc: { at: Int, out: Result<List<Known>, Bytes> }, f: value::Field|
+            {
+              at: acc.at + 1,
+              out: match acc.out {
+                Err(why) -> Err(why),
+                Ok(ks) -> match known_of_value(ctors, types.get(acc.at), f.value) {
+                  Ok(k) -> Ok(ks.push(k)),
+                  Err(why) -> Err(why),
+                },
+              },
+            },
+        );
+        match known.out { Ok(ks) -> Ok(KnownRecord(ks)), Err(why) -> Err(why) }
+      }
+    },
+    VCtor(name, args) -> match ty {
+      TyCon(t) -> match ctors.sums.get(t.name) {
+        Some(cs) -> match range(0, cs.len()).find(|i: Int|
+            cs.get(i).name == Bytes::of_string(name)) {
+          Some(i) -> {
+            let types = ctor_fields_at(cs.get(i), t.args);
+            if types.len() != args.len() { Err(b"a constructor of other arguments than its sum's") }
+            else {
+              let known = args.fold(
+                { at: 0, out: Ok([]) },
+                |acc: { at: Int, out: Result<List<Known>, Bytes> }, a: Value|
+                  {
+                    at: acc.at + 1,
+                    out: match acc.out {
+                      Err(why) -> Err(why),
+                      Ok(ks) -> match known_of_value(ctors, types.get(acc.at), a) {
+                        Ok(k) -> Ok(ks.push(k)),
+                        Err(why) -> Err(why),
+                      },
+                    },
+                  },
+              );
+              match known.out {
+                Ok(ks) -> Ok(KnownCase({ case: i, args: ks })),
+                Err(why) -> Err(why),
+              }
+            }
+          },
+          None -> Err(b"a constructor its sum does not declare"),
+        },
+        None -> Err(b"a constructor of no declared sum"),
+      },
+      _ -> Err(b"a constructor of no declared sum"),
+    },
+    _ -> Err(b"a value laid at run time or no build can know"),
+  }
+
+/// The bits a width's value `bits` (nothing above the width) is held as: its register's word, sign-
+/// or zero-extended, below 128 bits; its runtime box's two words at 128.
+fn fixed_known(w: Width, bits: U128) -> Known / {abort.raise} =
+  if w.bits == 128 {
+    KnownObject(
+      SWide({
+        width: w,
+        high: signed(bits >>> 64),
+        low: signed(bits & wrap_sub(1u128 << 64, 1u128)),
+      }),
+    )
+  } else if w.signed && bits >= 1u128 << w.bits - 1 {
+    KnownWord(0 - Int::of_u128((1u128 << w.bits) - bits))
+  } else { KnownWord(signed(bits)) }
 
 /// `f` with each constant its body and its closures' bodies bind laid out: a string, a byte string,
 /// an embedded file and a 128-bit width's value as the static object named by its content, listed
@@ -325,4 +597,174 @@ test "a width wider than a register is the runtime's box of it: its place among 
   // `()` stays the runtime's word.
   let u = folded(root([bind(local(0, b"Unit", RWord), Literal(LUnit))], []));
   assert_eq(bound_values(u.body), [Literal(LUnit)])
+}
+
+fn sum_case(name: Bytes, index: Int, fields: List<Type>, params: List<Int>) -> SumCtor =
+  { name: name, index: index, fields: fields, params: params }
+
+/// A table of the prelude's `Option` and `Result` and a list of `Int`s that holds itself in place.
+fn sample_ctors() -> Ctors =
+  ctors_of(
+    [],
+    Map::new(),
+    [],
+    Map::new().insert(b"Option", [
+      sum_case(b"None", 0, [], [0]),
+      sum_case(b"Some", 1, [TyVar(0)], [0]),
+    ]).insert(b"Result", [
+      sum_case(b"Ok", 0, [TyVar(0)], [0, 1]),
+      sum_case(b"Err", 1, [TyVar(1)], [0, 1]),
+    ]).insert(b"m.Ints", [
+      sum_case(b"m.More", 0, [int_type(), named_type(b"m.Ints")], []),
+      sum_case(b"m.Done", 1, [], []),
+    ]),
+  )
+
+fn of(name: Bytes, args: List<Type>) -> Type = TyCon({ name: name, args: args })
+
+fn pair() -> Type = TyRecord([{ name: b"a", ty: int_type() }, { name: b"b", ty: string_type() }])
+
+fn address_of(d: Datum) -> StaticWord / {abort.raise} = WAddress({ name: name_of(d), tag: 0 })
+
+test "a record, an Option and a Result are laid in place as their types lay them" {
+  let t = sample_ctors();
+  let lay = |ty: Type, k: Known| laid_at(t, ty, k);
+  let x = KnownObject(SStr(b"x"));
+  assert_eq(lay(pair(), KnownRecord([KnownWord(5), x])), {
+    words: [WRaw(5), address_of(SStr(b"x"))],
+    defs: statics_of(SStr(b"x")),
+  });
+  // An `Option` of a pointer takes its niche: `None` is 0, `Some` its pointer.
+  let maybe = of(b"Option", [string_type()]);
+  assert_eq(lay(maybe, KnownCase({ case: 1, args: [x] })).words, [address_of(SStr(b"x"))]);
+  assert_eq(lay(maybe, KnownCase({ case: 0, args: [] })).words, [WRaw(0)]);
+  // A `Result` of two pointers tags its `Err`'s.
+  let result = of(b"Result", [string_type(), string_type()]);
+  assert_eq(lay(result, KnownCase({ case: 1, args: [KnownObject(SStr(b"e"))] })).words, [
+    WAddress({ name: name_of(SStr(b"e")), tag: 1 }),
+  ]);
+  // An `Option` of an `Int` leaves no value free: a tag word, then its payload.
+  let count = of(b"Option", [int_type()]);
+  assert_eq(lay(count, KnownCase({ case: 1, args: [KnownWord(5)] })).words, [WRaw(1), WRaw(5)]);
+  assert_eq(lay(count, KnownCase({ case: 0, args: [] })).words, [WRaw(0), WRaw(0)]);
+  // A value its type lays in other words is refused.
+  assert_eq(
+    handle { lay(pair(), KnownWord(5)).words.len() } with { abort.raise(_) -> 0 - 1 },
+    0 - 1,
+  )
+}
+
+test "a boxed case is a static box after the statics its payload addresses, its sum's word that box" {
+  let t = sample_ctors();
+  let ints = named_type(b"m.Ints");
+  let done = KnownCase({ case: 1, args: [] });
+  let inner = laid_at(t, ints, KnownCase({ case: 0, args: [KnownWord(2), done] }));
+  let outer = laid_at(
+    t,
+    ints,
+    KnownCase({
+      case: 0,
+      args: [KnownWord(1), KnownCase({ case: 0, args: [KnownWord(2), done] })],
+    }),
+  );
+  assert_eq(inner.defs.map(|d: StaticDef| d.laid), [
+    SBlock({ head: [], words: [WRaw(2), WRaw(0)] }),
+  ]);
+  assert_eq(outer.defs.map(|d: StaticDef| d.laid), [
+    SBlock({ head: [], words: [WRaw(2), WRaw(0)] }),
+    SBlock({ head: [], words: [WRaw(1), inner.words.get(0)] }),
+  ]);
+  assert_eq(outer.words, [WAddress({ name: outer.defs.get(1).name, tag: 0 })]);
+  assert_eq(laid_at(t, ints, done), { words: [WRaw(0)], defs: [] })
+}
+
+test "a value is its word form where one word is required" {
+  let t = sample_ctors();
+  let word = |ty: Type, k: Known| word_at(t, ty, k);
+  assert_eq(word(int_type(), KnownWord(5)), { word: WRaw(11), defs: [] });
+  assert_eq(word(named_type(b"Bool"), KnownWord(1)), { word: WRaw(1), defs: [] });
+  assert_eq(word(string_type(), KnownObject(SStr(b"x"))).word, address_of(SStr(b"x")));
+  let boxed = |ty: Type, k: Known| {
+    let w = word(ty, k);
+    match w.defs.at(w.defs.len() - 1) {
+      Some(d) -> if w.word == WAddress({ name: d.name, tag: 0 }) { Some(d.laid) } else { None },
+      None -> None,
+    }
+  };
+  // Past 62 bits an `Int` is the runtime's box of it, as a `Float`, a `Decimal` and a 64-bit width are.
+  assert_eq(
+    boxed(int_type(), KnownWord(1 << 62)),
+    Some(
+      SBlock({
+        head: [{ field: b"kind", value: int_kind() }, { field: b"len", value: 1 }],
+        words: [WRaw(1 << 62)],
+      }),
+    ),
+  );
+  assert_eq(
+    boxed(named_type(b"Float"), KnownWord(7)),
+    Some(
+      SBlock({
+        head: [{ field: b"kind", value: float_kind() }, { field: b"len", value: 1 }],
+        words: [WRaw(7)],
+      }),
+    ),
+  );
+  assert_eq(
+    boxed(named_type(b"Decimal"), KnownDecimal({ lo: 1, hi: 2 })),
+    Some(
+      SBlock({
+        head: [{ field: b"kind", value: decimal_kind() }, { field: b"len", value: 2 }],
+        words: [WRaw(1), WRaw(2)],
+      }),
+    ),
+  );
+  assert_eq(
+    boxed(named_type(b"U64"), KnownWord(0 - 1)),
+    Some(
+      SBlock({
+        head: [
+          { field: b"kind", value: wide_kind() },
+          { field: b"len", value: 1 },
+          { field: b"layout", value: 3 },
+        ],
+        words: [WRaw(0 - 1)],
+      }),
+    ),
+  );
+  // A record of two words is a box of its words, of the refused kind.
+  assert_eq(
+    boxed(pair(), KnownRecord([KnownWord(5), KnownObject(SStr(b"x"))])),
+    Some(SBlock({ head: [], words: [WRaw(5), address_of(SStr(b"x"))] })),
+  )
+}
+
+test "a value std.value holds is known as its type lays it, and one laid at run time is not" {
+  let t = sample_ctors();
+  let know = |ty: Type, v: Value| known_of_value(t, ty, v);
+  assert_eq(
+    know(pair(), VRecord([{ name: "a", value: VInt(5) }, { name: "b", value: VStr("x") }])),
+    Ok(KnownRecord([KnownWord(5), KnownObject(SStr(b"x"))])),
+  );
+  assert_eq(
+    know(of(b"Option", [string_type()]), VCtor("Some", [VStr("x")])),
+    Ok(KnownCase({ case: 1, args: [KnownObject(SStr(b"x"))] })),
+  );
+  // A width is held as its register holds it: a signed one sign-extended, 64 bits as the word's.
+  assert_eq(know(named_type(b"I8"), VFixed("I8", 255u128)), Ok(KnownWord(0 - 1)));
+  assert_eq(know(named_type(b"U8"), VFixed("U8", 255u128)), Ok(KnownWord(255)));
+  assert_eq(
+    know(named_type(b"U64"), VFixed("U64", wrap_sub(1u128 << 64, 1u128))),
+    Ok(KnownWord(0 - 1)),
+  );
+  assert_eq(
+    know(named_type(b"I128"), VFixed("I128", wrap_sub(0u128, 5u128))),
+    Ok(KnownObject(SWide({ width: { bits: 128, signed: true }, high: 0 - 1, low: 0 - 5 }))),
+  );
+  assert_eq(know(named_type(b"Char"), VChar('a')), Ok(KnownWord(97 * 8 + 2)));
+  assert_eq(
+    know(named_type(b"Decimal"), VDecimal(Decimal::of_int(3))),
+    Ok(KnownDecimal(decimal_words(b"3m"))),
+  );
+  assert(match know(of(b"List", [int_type()]), VList([])) { Err(_) -> true, Ok(_) -> false }, None)
 }
