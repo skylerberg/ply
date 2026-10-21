@@ -96,6 +96,62 @@ fn a_box_the_runtime_made_of_a_scalars_bits_is_freed_at_its_size() {
     assert_eq!(ctx.heap.live(), 0);
 }
 
+/// A list's or a map's own object and nodes, and a string or bytes value, are made by the runtime and
+/// by emitted code alike, and emitted code frees each at the size the layout facts give it.
+#[test]
+fn a_list_or_map_node_and_a_string_the_runtime_made_are_freed_at_their_sizes() {
+    use ply_compiled::heap::{
+        KIND_BRANCH, KIND_BYTES, KIND_LEAF, KIND_MAP, KIND_MBRANCH, KIND_MLEAF, KIND_STR,
+    };
+    use ply_compiled::{list, map};
+    let mut ctx = context();
+    let node: Counted = helper("rt_node");
+    let room = 4;
+    let text = "a string longer than a word";
+    let bytes = b"\x00bytes longer than a word";
+    let made = [
+        (
+            ctx.heap.alloc_list(room as u32) as Word,
+            16 + 8 * (list::TAIL + room),
+        ),
+        (
+            unsafe { node(&mut ctx, KIND_LEAF.into()) },
+            16 + 8 * list::WIDTH,
+        ),
+        (
+            unsafe { node(&mut ctx, KIND_BRANCH.into()) },
+            16 + 8 * list::WIDTH,
+        ),
+        (ctx.heap.map_new(), 16 + 8),
+        (
+            unsafe { node(&mut ctx, KIND_MLEAF.into()) },
+            16 + 16 * map::WIDTH,
+        ),
+        (
+            unsafe { node(&mut ctx, KIND_MBRANCH.into()) },
+            16 + map::BRANCH_BYTES,
+        ),
+        (ctx.heap.str(text), 16 + text.len()),
+        (ctx.heap.bytes(bytes), 16 + bytes.len()),
+    ];
+    let kinds = [
+        KIND_LIST,
+        KIND_LEAF,
+        KIND_BRANCH,
+        KIND_MAP,
+        KIND_MLEAF,
+        KIND_MBRANCH,
+        KIND_STR,
+        KIND_BYTES,
+    ];
+    for ((w, size), k) in made.into_iter().zip(kinds) {
+        assert_eq!(kind(w), k);
+        free(&mut ctx, w, size as Word);
+        assert_eq!(kind(w), KIND_DEAD, "a node of kind {k}");
+    }
+    assert_eq!(ctx.heap.live(), 0);
+}
+
 /// A debug build knows each block's size class, which is all a free relies on.
 #[test]
 fn a_block_freed_at_another_size_than_it_was_allocated_at_is_refused() {
