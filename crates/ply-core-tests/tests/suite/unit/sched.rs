@@ -7,12 +7,30 @@ use ply_core::{
     Diagnostic, EffectAtom, Mode, Resource, SimId, SourceId, Span, Symbol, TaskHandle, Value, codes,
 };
 
-type Sched = Scheduler<usize, Value>;
-type Choice = Turn<usize, Value>;
+type Sched = Scheduler<usize, Value, Value>;
+type Choice = Turn<usize, Value, Value>;
 
 /// No scheduler decision looks inside a continuation, so a bare id stands in for a suspended task.
 fn suspended() -> usize {
     0
+}
+
+/// What a task hears, as the release's code reads it: an answer the scheduler gives itself or a
+/// task's answer as it is, and `Some`, `None` and a select's pair around what a task passed.
+fn as_heard(reply: &Reply<Value>) -> Value {
+    let some = |v: Value| Value::ctor("Some", vec![v]);
+    let none = || Value::ctor("None", Vec::new());
+    match reply {
+        Reply::Value(v) | Reply::Item(v) => v.clone(),
+        Reply::Maybe(m) => m.clone().map_or_else(none, some),
+        Reply::Chosen(None) => none(),
+        Reply::Chosen(Some((at, got))) => some(Value::Record(std::sync::Arc::new(
+            ply_core::Fields::from_unsorted(vec![
+                (Symbol::new("_0"), Value::Int(*at as i64)),
+                (Symbol::new("_1"), got.clone().map_or_else(none, some)),
+            ]),
+        ))),
+    }
 }
 
 /// What a task does, in the order it does it.
@@ -186,7 +204,7 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                 if let Resumption::Resume { value, .. } = &resumption
                     && asked[at]
                 {
-                    heard.push((task.0, value.clone()));
+                    heard.push((task.0, as_heard(value)));
                     asked[at] = false;
                 }
                 // One step: act until something suspends this task.
@@ -338,6 +356,70 @@ fn a_region_with_no_tasks_delivers_its_bodys_value() {
     let run = run(&program, Seed::at(1, Vec::new())).expect("no reason to block");
     assert_eq!(run.marks, vec![(0, "only")]);
     assert_eq!(run.choices, vec![0], "the body's own step is a step");
+}
+
+type Counted = Scheduler<usize, Value, std::rc::Rc<()>>;
+
+/// The root's turn, which must be the next.
+fn roots(
+    turn: Result<Turn<usize, Value, std::rc::Rc<()>>, Diagnostic>,
+) -> Resumption<usize, Value, std::rc::Rc<()>> {
+    match turn {
+        Ok(Turn::Run { task, resumption }) if task == ROOT => resumption,
+        _ => panic!("the root runs next"),
+    }
+}
+
+/// What the scheduler holds of a value its tasks pass is that value's: each task that hears one is
+/// handed it or a copy, and what the scheduler still holds when the region ends, a channel's values
+/// never received among them, is let go with it.
+#[test]
+fn the_scheduler_hands_on_what_its_tasks_pass_and_lets_go_of_the_rest_with_the_region() {
+    let passed = std::rc::Rc::new(());
+    let copies = || std::rc::Rc::strong_count(&passed);
+    let mut sched: Counted = Scheduler::new(SimId(0), Span::DUMMY);
+    let (mut clock, mut trail) = (Clock::new(), Trail::new(Seed::at(0, Vec::new())));
+    roots(sched.next(&mut clock, &mut trail));
+    sched.channel(suspended(), 2).expect("the root is running");
+    let Resumption::Resume {
+        value: Reply::Value(Value::Chan(chan)),
+        ..
+    } = roots(sched.next(&mut clock, &mut trail))
+    else {
+        panic!("the root hears its channel");
+    };
+    for _ in 0..2 {
+        sched
+            .send(suspended(), &chan, passed.clone(), Span::DUMMY)
+            .expect("the root is running");
+        roots(sched.next(&mut clock, &mut trail));
+    }
+    assert_eq!(copies(), 3, "each value sent waits in the channel");
+    sched
+        .recv(suspended(), &chan, Span::DUMMY)
+        .expect("the root is running");
+    let received = roots(sched.next(&mut clock, &mut trail));
+    assert!(matches!(
+        &received,
+        Resumption::Resume {
+            value: Reply::Maybe(Some(_)),
+            ..
+        }
+    ));
+    drop(received);
+    assert_eq!(copies(), 2, "the receiver was handed the value itself");
+    sched.finish(passed.clone()).expect("the root is running");
+    let Ok(Turn::Complete(answer)) = sched.next(&mut clock, &mut trail) else {
+        panic!("the region completes with its root");
+    };
+    assert_eq!(
+        copies(),
+        4,
+        "the region answers a copy of what its root did"
+    );
+    drop(answer);
+    drop(sched);
+    assert_eq!(copies(), 1, "the region kept a value past its end");
 }
 
 #[test]
@@ -1627,7 +1709,7 @@ fn a_lazily_opened_region_roots_on_the_control_that_opened_it() {
     };
     assert_eq!(task, ROOT);
     assert!(
-        matches!(&resumption, Resumption::Resume { value: Value::Task(handle), .. } if handle.id() == id),
+        matches!(&resumption, Resumption::Resume { value: Reply::Value(Value::Task(handle)), .. } if handle.id() == id),
         "a lazily-opened root resumes with the answer, never evaluates a body it does not have"
     );
 
@@ -1790,7 +1872,7 @@ fn a_region_that_is_not_stopping_still_deadlocks() {
 
 /// Finishes each task the region hands out until it hands out the root, and answers how the root
 /// resumes.
-fn until_root(sched: &mut Sched, rt: &dyn HostRuntime) -> Resumption<usize, Value> {
+fn until_root(sched: &mut Sched, rt: &dyn HostRuntime) -> Resumption<usize, Value, Value> {
     loop {
         let Turn::Run { task, resumption } = sched.next_host(rt).expect("a task is enabled") else {
             panic!("the region ended while its root was still running");
@@ -1830,7 +1912,7 @@ fn a_production_region_keeps_only_the_tasks_that_can_still_run_or_be_joined() {
         let Resumption::Resume { value, .. } = until_root(&mut sched, &Idle) else {
             panic!("the root resumes from its join");
         };
-        assert_eq!(value, Value::Int(target.0 as i64));
+        assert_eq!(value, Reply::Item(Value::Int(target.0 as i64)));
         assert_eq!(
             sched.tasks(),
             1,
@@ -1869,7 +1951,7 @@ fn a_production_region_selects_as_a_seeded_one_does() {
     root_step(&mut sched, &Idle);
     sched.channel(suspended(), 0).expect("the root is running");
     let Resumption::Resume {
-        value: Value::Chan(meet),
+        value: Reply::Value(Value::Chan(meet)),
         ..
     } = until_root(&mut sched, &Idle)
     else {
@@ -1881,7 +1963,7 @@ fn a_production_region_selects_as_a_seeded_one_does() {
     let Resumption::Resume { value, .. } = until_root(&mut sched, &Idle) else {
         panic!("the root resumes from a select that does not wait");
     };
-    assert_eq!(selected(&value), Some(None));
+    assert_eq!(value, Reply::Chosen(None));
 
     // The root waits to send, and the receive of the task it spawned is what wakes it.
     let receiver = sched.spawn(Value::Unit, Span::DUMMY);
@@ -1915,8 +1997,12 @@ fn a_production_region_selects_as_a_seeded_one_does() {
             .expect("the task is running");
     }
     heard.sort_by_key(|(root, _)| *root);
-    assert_eq!(heard[0].1, some_int(5), "the receiver takes what was sent");
-    assert_eq!(selected(&heard[1].1), Some(Some((0, Some(5)))));
+    assert_eq!(
+        heard[0].1,
+        Reply::Maybe(Some(Value::Int(5))),
+        "the receiver takes what was sent"
+    );
+    assert_eq!(heard[1].1, Reply::Chosen(Some((0, Some(Value::Int(5))))));
 }
 
 /// A task cancelled before its join and one cancelled under it fail the join alike: as a raise in
@@ -1937,7 +2023,7 @@ fn joining_a_task_already_cancelled_resumes_the_joiner_with_a_raise() {
     let Resumption::Resume { value, .. } = until_root(&mut sched, &Idle) else {
         panic!("the root resumes from its cancel");
     };
-    assert_eq!(value, Value::Bool(true));
+    assert_eq!(value, Reply::Value(Value::Bool(true)));
     sched
         .join(suspended(), &target, Span::DUMMY)
         .expect("a join of a cancelled task is the joiner's to answer");
@@ -1979,7 +2065,7 @@ fn a_kept_handle_keeps_its_finished_task_joinable_and_every_join_answers() {
             };
             assert_eq!(
                 value,
-                Value::Int(handle.id().0 as i64),
+                Reply::Item(Value::Int(handle.id().0 as i64)),
                 "join {join} of {}",
                 handle.id()
             );
@@ -2160,7 +2246,7 @@ fn each_parked_task_wakes_with_what_its_own_token_resolved_to() {
                 task,
                 resumption: Resumption::Resume { value, .. },
             } => {
-                woke.insert(task, value);
+                woke.insert(task, as_heard(&value));
                 sched.finish(Value::Unit).expect("the task is running");
             }
             Turn::Run { task, .. } => panic!("{task} ran without its token resolving"),
@@ -2249,7 +2335,7 @@ fn sleeps(sched: &mut Sched, nanos: i64, rt: &dyn HostRuntime) {
         .expect("the task is running");
 }
 
-fn next_task(sched: &mut Sched, rt: &dyn HostRuntime) -> (TaskId, Resumption<usize, Value>) {
+fn next_task(sched: &mut Sched, rt: &dyn HostRuntime) -> (TaskId, Resumption<usize, Value, Value>) {
     match sched.next_host(rt) {
         Ok(Turn::Run { task, resumption }) => (task, resumption),
         Ok(Turn::Complete(_)) => panic!("the region ended with a task still to run"),
@@ -2278,7 +2364,7 @@ fn a_sleeping_production_task_is_parked_alone_and_the_others_run() {
         matches!(
             resumption,
             Resumption::Resume {
-                value: Value::Unit,
+                value: Reply::Value(Value::Unit),
                 ..
             }
         ),
@@ -2394,7 +2480,13 @@ fn a_cancel_inside_a_release_leaves_a_production_sleeper_asleep_until_its_deadli
     let (task, resumption) = next_task(&mut sched, &rt);
     assert_eq!(task, ROOT);
     assert!(
-        matches!(&resumption, Resumption::Resume { value, .. } if *value == Value::ctor("None", Vec::new())),
+        matches!(
+            &resumption,
+            Resumption::Resume {
+                value: Reply::Maybe(None),
+                ..
+            }
+        ),
         "an await of a cancelled task hears `None`"
     );
 }

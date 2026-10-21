@@ -236,6 +236,9 @@ pub(super) fn hold_new(c: &mut Ctx, held: Word) -> Word {
     hold_word(&mut c.heap, held, c.holds_made)
 }
 
+/// The payload word a hold keeps what it holds in, which emitted code reads and empties itself.
+pub const HOLD_HELD: usize = CLOSURE_CAPTURES;
+
 /// A hold, as a closure no call enters: what it holds in its first capture, the null word once it
 /// has let go, so a second release or a read after is refused; and `id`, its number in the entry,
 /// in its second, which names it to the scheduler. A continuation resumed twice shares it.
@@ -243,7 +246,7 @@ pub(crate) fn hold_word(heap: &mut Heap, held: Word, id: u64) -> Word {
     let o = heap.alloc(KIND_CLOSURE, 0, (2 + CLOSURE_CAPTURES) as u32, 0);
     unsafe {
         set_word(o, CLOSURE_CODE, rt_hold_entry as *const () as usize as Word);
-        set_word(o, CLOSURE_CAPTURES, held);
+        set_word(o, HOLD_HELD, held);
         set_word(o, CLOSURE_CAPTURES + 1, heap::imm(id as i64));
     }
     o as Word
@@ -305,7 +308,7 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
         }
         (Builtin::HoldGet, [h]) => {
             let o = hold_object(*h)?;
-            let held = unsafe { word_at(o, CLOSURE_CAPTURES) };
+            let held = unsafe { word_at(o, HOLD_HELD) };
             let answer = if held == 0 {
                 let site = ctx.site();
                 ctx.fail(hold_released(site, "read"))
@@ -318,12 +321,12 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
         }
         (Builtin::HoldTake, [h]) => {
             let o = hold_object(*h)?;
-            let held = unsafe { word_at(o, CLOSURE_CAPTURES) };
+            let held = unsafe { word_at(o, HOLD_HELD) };
             let answer = if held == 0 {
                 let site = ctx.site();
                 ctx.fail(hold_released(site, "let go"))
             } else {
-                unsafe { set_word(o, CLOSURE_CAPTURES, 0) };
+                unsafe { set_word(o, HOLD_HELD, 0) };
                 held
             };
             heap::dec(*h);

@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-type Sched = Scheduler<usize, Value>;
+type Sched = Scheduler<usize, Value, Value>;
 
 /// No scheduler decision looks inside a continuation, so a bare id stands in for a task.
 fn suspended() -> usize {

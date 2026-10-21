@@ -84,6 +84,12 @@ pub enum Fact {
     Field(&'static str),
 }
 
+/// Where a hold keeps what it holds, as `compiler.emit.layout`'s `HoldLaid` names it: the payload
+/// word `held`, 0 once the hold has let go.
+pub fn hold() -> Vec<(&'static str, Fact)> {
+    vec![("held", Fact::Number(crate::rt::HOLD_HELD))]
+}
+
 /// Each object the emitter writes code over in place, with its facts, under the names
 /// `compiler.emit.layout`'s `Layouts` gives them.
 pub fn layouts() -> [(&'static str, Vec<(&'static str, Fact)>); 4] {

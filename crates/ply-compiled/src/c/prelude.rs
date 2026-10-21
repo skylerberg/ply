@@ -1,9 +1,9 @@
 //! The C every emitted unit opens with. It mirrors `heap.rs` and `rt.rs`, and
 //! `the_prelude_agrees_with_the_layouts_it_mirrors` checks it against them.
 
-use crate::emitted::{Block, DropRoot, Handed, Handle, PlyOp, PlyType};
+use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
-use crate::native::{Addr, F64, I64, Native, Out, Raising, Signature};
+use crate::native::{Addr, F64, I64, Native, Out, Raises, Raising, Signature};
 use crate::rt::Ctx;
 
 /// `rt_*` is declared, not defined: `ply_bind` supplies the addresses after `dlopen`, since a
@@ -288,6 +288,8 @@ machine! {
     "?cost_mark" => rt_cost_mark(Out);
     "?cost_spent" => rt_cost_spent(Out);
     "?performs_since" => rt_performs_since(I64);
+    "?in_carried" => rt_in_carried() -> Handed;
+    "?array_bad" => rt_array_bad(I64, I64, I64) -> Raises;
 }
 
 /// The natives the compiler declares itself over machine data.
@@ -423,6 +425,10 @@ helpers! {
     ) -> Handed;
     rt_box_wide(lo: I64, hi: I64, t: I64) -> Word;
     rt_builtin_encoded(index: I64);
+    rt_region(body: Block, answer: *const PlyType) -> Handed;
+    rt_branches(slots: *const Handed, n: I64);
+    rt_branches_past(slots: *const Handed, n: I64, reach: *const Word, count: I64);
+    rt_memo(index: I64, keep: KeepRoot) -> Handed;
 }
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since

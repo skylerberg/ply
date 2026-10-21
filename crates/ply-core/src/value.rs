@@ -876,7 +876,8 @@ pub(crate) fn secret_has_no_order(v: &Value, what: &str, span: Span) -> Result<(
     ))
 }
 
-pub(crate) fn type_error(span: Span, what: &str, expected: &str, got: &Value) -> Diagnostic {
+/// `what` was handed `got` where it reads `expected`.
+pub fn type_error(span: Span, what: &str, expected: &str, got: &Value) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
         format!("{what} expects {expected}, but got {}", got.type_name()),

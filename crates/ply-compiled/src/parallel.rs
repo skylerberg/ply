@@ -1,10 +1,55 @@
 //! `parallel { .. }`: branches the checker showed touch no resource in common, run at once on
 //! threads of their own and answered as evaluating them left to right answers.
 
+use crate::emitted::Block;
 use crate::heap::{self, Word};
 use crate::rt::{Ctx, FAILED_OUT_OF_STEPS, PROGRAM_STACK, call_value, stack_floor};
 use std::cell::Cell;
 use std::sync::OnceLock;
+
+/// What a `parallel` block's branches are: closures the release's code made, or closure blocks
+/// emitted code made. Each is taken, called with nothing, and let go once it has run.
+#[derive(Clone, Copy)]
+pub(crate) enum Branches {
+    Words,
+    Blocks,
+}
+
+impl Branches {
+    fn call(self, ctx: *mut Ctx, f: Word) -> Word {
+        match self {
+            Branches::Words => call_value(ctx, f, &[]),
+            Branches::Blocks => unsafe { Block::of(f).call(ctx, &[]) },
+        }
+    }
+
+    fn let_go(self, ctx: *mut Ctx, f: Word) {
+        match self {
+            Branches::Words => heap::dec(f),
+            Branches::Blocks => unsafe { Block::of(f).let_go_function(ctx) },
+        }
+    }
+
+    /// What is left in the slot of a branch that answered after one before it failed: the release's
+    /// code's answer is let go here, emitted code's is left for the code that knows its type.
+    fn abandoned(self, answer: Word) -> Word {
+        match self {
+            Branches::Words => {
+                heap::dec(answer);
+                0
+            }
+            Branches::Blocks => answer,
+        }
+    }
+
+    /// Marks everything the branches hold shared, or answers that one cannot leave this thread.
+    fn share(self, ctx: *mut Ctx, branches: &[Word]) -> bool {
+        match self {
+            Branches::Words => heap::share(branches),
+            Branches::Blocks => branches.iter().all(|f| unsafe { Block::of(*f).share(ctx) }),
+        }
+    }
+}
 
 thread_local! {
     /// The machine whose branch this thread is running, while it runs one, and 0 otherwise.
@@ -31,8 +76,8 @@ fn pool() -> Option<&'static rayon::ThreadPool> {
 }
 
 /// Runs the `n` nullary closures at `slots`, writing each one's answer over it, at once where
-/// `allowed`.
-pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: bool) {
+/// `allowed`. Where the block fails, a branch that failed or never ran leaves 0 in its slot.
+pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: bool, kind: Branches) {
     let branches = unsafe { std::slice::from_raw_parts_mut(slots, n) };
     let c = unsafe { &*ctx };
     // A thread that waits on a block takes up the pool's other branches meanwhile. A machine
@@ -41,26 +86,28 @@ pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: boo
     let nested = BRANCH_OF.with(|of| of.get() != 0 && of.get() != c.id.0);
     let at_once = !nested && allowed;
     match pool() {
-        Some(pool) if n >= 2 && at_once && heap::share(branches) => unsafe {
-            in_parallel(ctx, pool, branches)
+        Some(pool) if n >= 2 && at_once && kind.share(ctx, branches) => unsafe {
+            in_parallel(ctx, pool, branches, kind)
         },
-        _ => unsafe { in_order(ctx, branches) },
+        _ => unsafe { in_order(ctx, branches, kind) },
     }
 }
 
 /// What the block means: each branch in turn, until one fails.
-unsafe fn in_order(ctx: *mut Ctx, branches: &mut [Word]) {
+unsafe fn in_order(ctx: *mut Ctx, branches: &mut [Word], kind: Branches) {
     for i in 0..branches.len() {
         let closure = branches[i];
-        branches[i] = call_value(ctx, closure, &[]);
-        heap::dec(closure);
+        let answer = kind.call(ctx, closure);
+        kind.let_go(ctx, closure);
         if unsafe { (*ctx).failed } != 0 {
+            branches[i] = 0;
             for rest in &mut branches[i + 1..] {
-                heap::dec(*rest);
+                kind.let_go(ctx, *rest);
                 *rest = 0;
             }
             return;
         }
+        branches[i] = answer;
     }
 }
 
@@ -69,6 +116,7 @@ struct Branch {
     ctx: Box<Ctx>,
     closure: Word,
     answer: Word,
+    kind: Branches,
 }
 
 /// A branch handed to a pool thread. The parent waits for every branch before it reads one again,
@@ -91,8 +139,8 @@ impl Handed {
         let running_was = crate::rt::swap_running(ctx);
         let mine = c.instances();
         let instances_were = ply_core::instances::swap(mine);
-        branch.answer = call_value(ctx, branch.closure, &[]);
-        heap::dec(branch.closure);
+        branch.answer = branch.kind.call(ctx, branch.closure);
+        branch.kind.let_go(ctx, branch.closure);
         // A reactor belongs to the thread that made it, and this branch is over.
         c.runtime = None;
         ply_core::instances::swap(instances_were);
@@ -103,7 +151,12 @@ impl Handed {
     }
 }
 
-unsafe fn in_parallel(ctx: *mut Ctx, pool: &rayon::ThreadPool, branches: &mut [Word]) {
+unsafe fn in_parallel(
+    ctx: *mut Ctx,
+    pool: &rayon::ThreadPool,
+    branches: &mut [Word],
+    kind: Branches,
+) {
     let parent = unsafe { &mut *ctx };
     let mut runs: Vec<Branch> = branches
         .iter()
@@ -111,6 +164,7 @@ unsafe fn in_parallel(ctx: *mut Ctx, pool: &rayon::ThreadPool, branches: &mut [W
             ctx: Box::new(parent.branch()),
             closure,
             answer: 0,
+            kind,
         })
         .collect();
     pool.in_place_scope(|scope| {
@@ -128,8 +182,11 @@ unsafe fn in_parallel(ctx: *mut Ctx, pool: &rayon::ThreadPool, branches: &mut [W
         let Branch { ctx, answer, .. } = run;
         let mut ctx = *ctx;
         if ended {
-            heap::dec(answer);
-            *slot = 0;
+            *slot = if ctx.failed == 0 {
+                kind.abandoned(answer)
+            } else {
+                0
+            };
             parent.absorb(ctx);
             continue;
         }
@@ -137,7 +194,7 @@ unsafe fn in_parallel(ctx: *mut Ctx, pool: &rayon::ThreadPool, branches: &mut [W
         let out_of_steps =
             ctx.failed == FAILED_OUT_OF_STEPS || left.is_some_and(|left| spent > left);
         let failure = ctx.take_branch_failure();
-        *slot = answer;
+        *slot = if failure.is_some() { 0 } else { answer };
         parent.absorb(ctx);
         if out_of_steps {
             parent.fail_out_of_steps();
