@@ -512,6 +512,15 @@ pub unsafe extern "C" fn rt_in_carried(ctx: *mut Ctx) -> Handed {
     }))
 }
 
+/// What a descriptor lifts by where a value of its type can hold a function, which crosses out of
+/// compiled code and never back: it fails the entry.
+pub unsafe extern "C" fn rt_never_lifted(ctx: *mut Ctx) {
+    unsafe { &mut *ctx }.fail(err_crossing(
+        "a value whose type can hold a function lifted from the runtime: a function crosses out \
+         of compiled code and never back",
+    ));
+}
+
 /// The head of a function the runtime made, which only a generated one is: its case among
 /// `std.value.Fun`'s, its arity written to `out`'s word 0, and to word 1 a projection's index or a
 /// table's count of entries. A constant's value, or a table's entries and then its default,

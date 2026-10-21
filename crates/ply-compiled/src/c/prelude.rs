@@ -444,6 +444,7 @@ helpers! {
     rt_branches(slots: *const Handed, n: I64);
     rt_branches_past(slots: *const Handed, n: I64, reach: *const Word, count: I64);
     rt_memo(index: I64, keep: KeepRoot) -> Handed;
+    rt_never_lifted();
 }
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since
