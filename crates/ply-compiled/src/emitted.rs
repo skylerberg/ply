@@ -107,10 +107,15 @@ impl Block {
     /// # Safety
     /// The block is a closure emitted code laid out; `ctx` is the running entry's.
     pub unsafe fn release_function(self, ctx: *mut Ctx) {
-        unsafe {
-            let desc = &**(self.0 as *const *const PlyFnDesc).byte_add(HEADER);
-            (desc.release)(ctx, Handed(self.0));
-        }
+        unsafe { (self.desc().release)(ctx, Handed(self.0)) };
+    }
+
+    /// The descriptor of the function value this block is, which its first word names.
+    ///
+    /// # Safety
+    /// The block is a closure emitted code laid out, and live.
+    unsafe fn desc(&self) -> &'static PlyFnDesc {
+        unsafe { &**(self.0 as *const *const PlyFnDesc).byte_add(HEADER) }
     }
 }
 
@@ -250,10 +255,22 @@ impl Block {
     /// # Safety
     /// The block is a closure emitted code laid out, and live; `ctx` is the running entry's.
     pub unsafe fn call(&self, ctx: *mut Ctx, args: &[Word]) -> Word {
-        unsafe {
-            let desc = &**(self.0 as *const *const PlyFnDesc).byte_add(HEADER);
-            (desc.uniform)(ctx, self.0, args.as_ptr())
+        unsafe { (self.desc().uniform)(ctx, self.0, args.as_ptr()) }
+    }
+
+    /// Marks the function, and through its descriptor what it holds, shared, before a thread other
+    /// than this one may hold it: whether it may, its descriptor's `share` answering 0 where a
+    /// capture cannot cross threads.
+    ///
+    /// # Safety
+    /// As [`Block::call`].
+    pub unsafe fn share(&self, ctx: *mut Ctx) -> bool {
+        let o = self.obj();
+        let rc = unsafe { heap::count_of(o) };
+        if rc < SHARED {
+            unsafe { (*o).rc = rc | SHARED };
         }
+        unsafe { (self.desc().share)(ctx, self.0) != 0 }
     }
 
     /// One holder of the function fewer, the last releasing it.
@@ -296,6 +313,15 @@ impl Lent {
     /// The value as the bytes of a lowering hold it.
     pub(crate) fn lower(&self, ctx: *mut Ctx) -> Result<ply_core::Value, String> {
         lowered(ctx, self.word, self.ty)
+    }
+
+    /// The value held once more through its type, to keep past the crossing.
+    pub(crate) fn kept(&self, ctx: *mut Ctx) -> Carried {
+        unsafe { (self.ty.inc)(ctx, self.word) };
+        Carried {
+            word: self.word,
+            ty: self.ty,
+        }
     }
 }
 
@@ -376,7 +402,8 @@ pub struct PlyFnDesc {
     /// Releases a block whose last holder let it go: its captures, then its memory.
     pub release: DropRoot,
     /// Marks what the block holds shared, before a thread other than the one that made it may hold
-    /// it; 0, with nothing marked, where a capture cannot cross threads.
+    /// it, the block's own count being its caller's to mark: anything but 0, or 0 with nothing
+    /// marked where a capture cannot cross threads.
     pub share: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
     /// The block copied to outlive every entry, as a memoized constant does; 0 where a capture may
     /// not outlive the entry that made it.

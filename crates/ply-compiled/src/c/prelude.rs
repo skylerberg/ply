@@ -424,6 +424,9 @@ helpers! {
     ) -> Handed;
     rt_box_wide(lo: I64, hi: I64, t: I64) -> Word;
     rt_builtin_encoded(index: I64);
+    rt_region(body: Block, answer: *const PlyType) -> Handed;
+    rt_branches(slots: *const Handed, n: I64);
+    rt_branches_past(slots: *const Handed, n: I64, reach: *const Word, count: I64);
 }
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since

@@ -29,7 +29,9 @@ pub(crate) struct Lowering {
     functions: bool,
 }
 
-enum Beside {
+/// What crosses beside a lowering's bytes, lent for as long as the crossing lasts: a runtime
+/// object, or a value compiled code lent with its type.
+pub(crate) enum Beside {
     Runtime(Word),
     Lent(Lent),
 }
@@ -640,7 +642,7 @@ impl Ctx {
 
 /// What a value of a runtime object reads as: a bridge's value. Nothing else the runtime lays out
 /// is read here.
-fn runtime_value(w: Word) -> Result<Value, String> {
+pub(crate) fn runtime_value(w: Word) -> Result<Value, String> {
     if heap::kind(w) != KIND_BRIDGE {
         return Err(format!(
             "an object of kind {} crossed as a handle",
@@ -653,6 +655,12 @@ fn runtime_value(w: Word) -> Result<Value, String> {
 /// What `write` writes into a lowering of its own, read back as a value, each handle as the value
 /// it stands for: a runtime object's own, a carried value lowered through its type.
 pub(crate) fn lowered_value(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Result<Value, String> {
+    let l = lowering(ctx, write)?;
+    read_back(ctx, l)
+}
+
+/// What `write` writes into a lowering of its own.
+fn lowering(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Result<Lowering, String> {
     let depth = unsafe { &*ctx }.crossings.len();
     unsafe { &mut *ctx }
         .crossings
@@ -666,7 +674,20 @@ pub(crate) fn lowered_value(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Resu
     let Some(Crossing::Lowering(l)) = c.crossings.pop() else {
         return Err("a lowering ended a crossing it did not begin".into());
     };
-    read_back(ctx, l)
+    Ok(l)
+}
+
+/// `w` lowered through `ty` into a lowering of its own: its bytes, and what stands at each handle
+/// they name, lent while `w` lives.
+pub(crate) fn lowering_of(
+    ctx: *mut Ctx,
+    w: Word,
+    ty: &'static PlyType,
+) -> Result<(Vec<u8>, Vec<Beside>), String> {
+    let l = lowering(ctx, |ctx| unsafe {
+        (ty.lower)(ctx, w);
+    })?;
+    Ok((l.w.finish(), l.beside))
 }
 
 /// A lowering's bytes read as a value, each handle as the value it stands for: a runtime object's
@@ -727,8 +748,24 @@ pub(crate) fn encoded(v: &Value) -> (Vec<u8>, Vec<Value>) {
 pub(crate) fn lifted(ctx: *mut Ctx, v: &Value, ty: &PlyType) -> Option<Handed> {
     let (bytes, held) = encoded(v);
     let c = unsafe { &mut *ctx };
+    let beside = held
+        .into_iter()
+        .map(|v| Lifted::Runtime(c.heap.bridge(v)))
+        .collect();
+    lifted_from(ctx, bytes, beside, ty)
+}
+
+/// `bytes` lifted through `ty`, `beside` the handles they name, whose counts it takes; `None` with
+/// the context failed where they do not cross.
+pub(crate) fn lifted_from(
+    ctx: *mut Ctx,
+    bytes: Vec<u8>,
+    beside: Vec<Lifted>,
+    ty: &PlyType,
+) -> Option<Handed> {
+    let c = unsafe { &mut *ctx };
     let depth = c.crossings.len();
-    c.lift_holding(bytes, held);
+    c.lift_from(bytes, beside);
     let w = unsafe { (ty.lift)(ctx) };
     let c = unsafe { &mut *ctx };
     if c.crossings.len() != depth + 1 {

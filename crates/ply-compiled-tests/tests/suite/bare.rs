@@ -27,7 +27,9 @@ pub fn context_calling(builtins: &[&str]) -> Ctx {
     context_over(&[], Vec::new(), builtins)
 }
 
-fn context_over(fields: &[&str], functions: Vec<usize>, builtins: &[&str]) -> Ctx {
+/// A context over a unit whose bodies read `fields`, whose compiled functions are `functions`, by
+/// index, and whose pool of builtins holds those named `builtins`, in order.
+pub fn context_over(fields: &[&str], functions: Vec<usize>, builtins: &[&str]) -> Ctx {
     Ctx::new(Arc::new(Tables {
         consts: Vec::new(),
         const_words: Vec::new(),
