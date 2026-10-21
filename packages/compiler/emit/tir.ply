@@ -8,7 +8,6 @@ import std.bytes (ascii_of_int)
 import syntax.parsing (Span, dummy_span)
 import syntax.patterns (Lit, LUnit, LStr)
 import emit.c (Width)
-import emit.reps (FieldTy)
 import emit.answer (GenericCall, Need, Pass)
 import emit.keys (RootKey, Callee, Generic, Named, TypeOp, Copy, Share, Keep)
 import emit.layout (SumLaid, LSum, LWords, P, R, WordIs, WordOutside, Nullary, Inline, counts)
@@ -20,10 +19,9 @@ import emit.tir.strings (StringOp, StringArg, TakesBlock, OwnBlock, string_args,
 
 /// How a value is held. A function of the value's type (`lower.held`), but for `RSlice`, a view the
 /// lowering chooses for a list walked by its rest in a loop, which is made a list where it leaves,
-/// and `RToken`, which the ownership pass alone writes. `RFlat` is a record as its leaves and then
-/// its object's word, zero until one is made; `RCases` a sum as its constructor's index and each
-/// case's leaves; `RToken(n)` the cells of a block of `n` payload words whose fields a `Reset` let
-/// go of, or zero: freed where it is let go, never released as a value. `RSum` is a sum in the words
+/// and `RToken`, which the ownership pass alone writes. `RFlat` is a record as its leaves;
+/// `RToken(n)` the cells of a block of `n` payload words whose fields a `Reset` let go of, or zero:
+/// freed where it is let go, never released as a value. `RSum` is a sum in the words
 /// `laid` lays it in, its cases its constructors as the table names them, in declared order; it is
 /// one part of the form, never opened into its words, and counted through the case it holds. `RUnit`
 /// is a value of no words; `RAddr` an address into a block's payload, borrowed from the block.
@@ -34,10 +32,7 @@ pub type Rep =
   | RFloat
   | RDec
   | RWord
-  | RMaybe
-  | RTagged
   | RFlat(List<Leaf>)
-  | RCases(Cases)
   | RSlice
   | RToken(Int)
   | RSum({ laid: SumLaid, cases: List<Bytes> })
@@ -46,10 +41,6 @@ pub type Rep =
 
 /// A leaf of a flattened record or of a sum's case: never itself flat.
 pub type Leaf = { name: Bytes, rep: Rep }
-
-/// A sum's cases in declared order, and whether the sum is a `Result`'s tagged word where it is
-/// one word rather than an `Option`'s.
-pub type Cases = { tagged: Bool, cases: List<{ name: Bytes, leaves: List<Leaf> }> }
 
 /// A local of a root's body: its number, the checker's type at the root's type arguments, and how
 /// a value of that type is held.
@@ -82,18 +73,13 @@ pub type Convention = { params: List<Handed>, reps: List<Rep>, answer: Rep, answ
 pub type Uses = { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool }
 
 /// What a `Make` allocates. `MRecord` is a record the runtime lays out by its names, as it does one
-/// whose layout a type variable leaves open; `MCtor` a constructor's object holding each argument as
-/// its word; `MLaid` an
-/// object laid out as `fields` says, a constructor's where `ctor` names one and a record's otherwise,
-/// each argument held as its field is and a record held in place given as its leaves or its word.
+/// whose layout a type variable leaves open.
 /// `MClosure` is a closure over body `nth` of the root's lambdas, holding `captures` words and taking
 /// `params` arguments; a `stacked` one is lent and laid out on the caller's stack. `MBox` is a box of
 /// a value laid by its type, `words` of payload; `MCase` a sum's case `case` (its place among the
 /// sum's cases) boxed, `skip` words of tag holding `case` and then `words` of payload.
 pub type Made =
   | MRecord({ names: List<Bytes>, width: Int })
-  | MCtor({ name: Bytes, width: Int })
-  | MLaid({ ctor: Option<Bytes>, fields: List<FieldTy> })
   | MList(Int)
   | MClosure({ nth: Int, captures: Int, params: Int, stacked: Bool })
   | MBox({ words: Int })
@@ -311,10 +297,7 @@ pub fn rep_said(r: Rep) -> Bytes =
     RFloat -> b"Float",
     RDec -> b"Decimal",
     RWord -> b"a word",
-    RMaybe -> b"an Option's word",
-    RTagged -> b"a Result's word",
     RFlat(ls) -> Bytes::concat_all([b"flat, ", ascii_of_int(ls.len()), b" leaves"]),
-    RCases(c) -> Bytes::concat_all([b"cases, ", ascii_of_int(c.cases.len()), b" of them"]),
     RSlice -> b"a view",
     RToken(n) -> Bytes::concat_all([b"a token of ", ascii_of_int(n), b" words"]),
     RSum(s) -> Bytes::concat_all([b"a sum's words, ", ascii_of_int(s.cases.len()), b" cases"]),
@@ -330,47 +313,29 @@ pub fn var_said(v: Var) -> Bytes =
 pub fn made_said(m: Made) -> Bytes =
   match m {
     MRecord(r) -> Bytes::concat_all([b"a record of ", Bytes::join(r.names, b", ")]),
-    MCtor(c) -> Bytes::concat_all([b"constructor ", c.name]),
-    MLaid(l) -> match l.ctor {
-      Some(c) -> Bytes::concat_all([b"constructor ", c, b" laid out"]),
-      None ->
-        Bytes::concat_all([b"a record of ", ascii_of_int(l.fields.len()), b" fields laid out"]),
-    },
     MList(n) -> Bytes::concat_all([b"a list of ", ascii_of_int(n)]),
     MClosure(c) -> Bytes::concat_all([b"closure ", ascii_of_int(c.nth)]),
     MBox(b) -> Bytes::concat_all([b"a box of ", ascii_of_int(b.words), b" words"]),
     MCase(c) -> Bytes::concat_all([b"case ", ascii_of_int(c.case), b" boxed"]),
   }
 
-/// Whether a value held as `r` holds a count: a word, an `Option`'s or `Result`'s, a view of a
-/// list, a reuse token, a flat value with a counted leaf, or a sum some case of which holds one.
+/// Whether a value held as `r` holds a count: a word, a view of a list, a reuse token, a flat value
+/// with a counted leaf, or a sum some case of which holds one.
 pub fn counted(r: Rep) -> Bool =
   match r {
     RWord -> true,
-    RMaybe -> true,
-    RTagged -> true,
     RSlice -> true,
     RToken(_) -> true,
     RFlat(leaves) -> leaves.fold(false, |any: Bool, l: Leaf| any || counted(l.rep)),
-    RCases(c) ->
-      c.cases.fold(false, |any: Bool, x: { name: Bytes, leaves: List<Leaf> }|
-        any || x.leaves.fold(false, |a: Bool, l: Leaf| a || counted(l.rep))),
     RSum(s) -> counts(LSum(s.laid)),
     _ -> false,
   }
 
-/// The parts a value held as `r` is laid in, each as it is held: a flat value's leaves, a sum's
-/// index and then each case's leaves, a view's list and its offset, anything else itself (an `RSum`
-/// among them, which only a printer lays out as its words).
+/// The parts a value held as `r` is laid in, each as it is held: a flat value's leaves, a view's
+/// list and its offset, anything else itself (an `RSum` among them, which only a printer lays out as
+/// its words).
 pub fn parts_of(r: Rep) -> List<Rep> =
-  match r {
-    RFlat(leaves) -> leaves.map(|l: Leaf| l.rep),
-    RCases(c) ->
-      c.cases.fold([RInt], |acc: List<Rep>, x: { name: Bytes, leaves: List<Leaf> }|
-        acc.concat(x.leaves.map(|l: Leaf| l.rep))),
-    RSlice -> [RWord, RInt],
-    _ -> [r],
-  }
+  match r { RFlat(leaves) -> leaves.map(|l: Leaf| l.rep), RSlice -> [RWord, RInt], _ -> [r] }
 
 /// How operand `a` is held: a variable as its own representation says, a constant as C names it.
 pub fn rep_of_arg(a: Arg) -> Rep =
@@ -636,9 +601,7 @@ test "what can fail is what tests the runtime: a checked operator, a call, never
   assert_eq(fails(Pack({ arg: AInt(7), to: RWord })), false);
   assert_eq(fails(Pack({ arg: AVar(flat), to: RWord })), false);
   assert_eq(
-    fails(
-      Make({ made: MCtor({ name: b"m.Box", width: 1 }), args: [AVar(w)], reuse: None, kept: [] }),
-    ),
+    fails(Make({ made: MBox({ words: 1 }), args: [AVar(w)], reuse: None, kept: [] })),
     false,
   );
   assert_eq(fails(Gathered({ parts: [AInt(1)] })), false);
