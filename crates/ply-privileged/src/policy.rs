@@ -51,9 +51,9 @@ pub const FAMILIES: &[Family] = &[
     },
     Family {
         name: "toolchain",
-        effects: &["compilers", "toolchain"],
+        effects: &["compilers", "toolchain", "memory"],
         hermetic: None,
-        summary: "compile and link C with the host's compiler, below the toolchain's cache",
+        summary: "compile and link C with the host's compiler, below the toolchain's cache, and read the program's own heap",
     },
 ];
 
@@ -75,7 +75,7 @@ fn own(effect: &str) -> String {
     match effect {
         "prover" => "claims",
         "shipped" => "compiler.unit",
-        "compilers" | "toolchain" => "compiler.cc",
+        "compilers" | "toolchain" | "memory" => "compiler.cc",
         other => other,
     }
     .to_string()

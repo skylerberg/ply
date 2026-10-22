@@ -3,8 +3,8 @@
 //! `tcc`, and starts and waits for them; `toolchain` reads and writes files below the toolchain's
 //! cache and nowhere else, and runs the programs linked there. What to compile, with what flags and what to keep is the program's: this
 //! side only runs what it is asked to and confines where it writes. A compiler's output is a
-//! function of what it is given, so the family is deterministic, but for `heap` and `census`, which
-//! read the asking program's own heap for a build that tells its phases.
+//! function of what it is given, so `compilers` and `toolchain` are deterministic. `memory` reads the
+//! asking program's own heap for a build that tells its phases, which no two runs need answer alike.
 
 use ply_core::host::{HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity};
 use ply_core::{Diagnostic, Resource, Span, Value as PlyValue, codes};
@@ -43,10 +43,9 @@ const OPERATIONS: [(&str, &str, &str); 14] = [
     ("toolchain", "ran", "ply_privileged::toolchain::ran"),
 ];
 
-/// The operations that read the asking program's own heap, which no two runs need answer alike.
 const READINGS: [(&str, &str, &str); 2] = [
-    ("toolchain", "heap", "ply_privileged::toolchain::heap"),
-    ("toolchain", "census", "ply_privileged::toolchain::census"),
+    ("memory", "heap", "ply_privileged::toolchain::heap"),
+    ("memory", "census", "ply_privileged::toolchain::census"),
 ];
 
 /// What the runtime's library needs linked after it on this platform, as `rustc` names its native
@@ -355,25 +354,22 @@ impl HostHandler for Toolchain {
                     .iter()
                     .map(|a| a.as_str(span, "an argument").map(str::to_string))
                     .collect::<Result<Vec<_>, _>>()?;
-                match Command::new(&program)
+                let ran = Command::new(&program)
                     .args(&args)
                     .stdin(Stdio::null())
-                    .output()
-                {
-                    Ok(out) => crate::payload::record(vec![
-                        (
-                            "code",
-                            PlyValue::Int(out.status.code().map_or(-1, i64::from)),
-                        ),
-                        ("out", PlyValue::bytes(&out.stdout)),
-                        ("err", PlyValue::bytes(&out.stderr)),
-                    ]),
-                    Err(e) => crate::payload::record(vec![
-                        ("code", PlyValue::Int(-1)),
-                        ("out", PlyValue::bytes(b"")),
-                        ("err", PlyValue::bytes(e.to_string().as_bytes())),
-                    ]),
-                }
+                    .stderr(Stdio::inherit())
+                    .output();
+                let (code, out) = match ran {
+                    Ok(out) => (out.status.code().map_or(-1, i64::from), out.stdout),
+                    Err(e) => {
+                        eprintln!("{} did not start: {e}", program.display());
+                        (-1, Vec::new())
+                    }
+                };
+                crate::payload::record(vec![
+                    ("code", PlyValue::Int(code)),
+                    ("out", PlyValue::bytes(&out)),
+                ])
             }
             ("cleared", [dir]) => {
                 let at = below(dir.as_str(span, "a path")?, span)?;
