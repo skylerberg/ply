@@ -913,6 +913,19 @@ test "a builtin the runtime answers a sum of crosses over its encoding, at whate
   ])
 }
 
+test "a builtin crossing over its encoding is handed the witnesses the elaboration passes first, as the runtime declares it" {
+  let src = b"fn whole(x: U8) -> Option<Int> = to_int(x)\n";
+  let out = emit_all_program([{ name: b"m", src: src }], [], [b"to_int"], true);
+  assert_eq(out.map(|e: Emitted| e.why), [None]);
+  let code = own_code(out.get(0).text);
+  // The runtime's `to_int` takes a witness, then the value.
+  assert(code.index_of(b"rt_builtin_encoded_p(") != None, Some(String::of_bytes_lossy(code)));
+  assert(
+    code.index_of(b"builtin_elaborated_out_count_p(ctx, INT64_C(9), INT64_C(2))") != None,
+    Some(String::of_bytes_lossy(code)),
+  )
+}
+
 test "a record rebuilt from another's fields is written into the constructor that holds it" {
   let src = Bytes::concat_all([
     b"type T = | Con({ name: Bytes, args: List<T> }) | Leaf\n",
@@ -1658,14 +1671,59 @@ test "a value is digested through a root written for its type, its parts encoded
   assert(body(keyed).tables.calls.contains(Named(b"m.cents")), None)
 }
 
-test "a part written code files no type for is the runtime's to encode, never the root's own" {
+test "a keyed sum is compared and ordered by its key through roots its module writes, generic or not" {
+  let src = Bytes::concat_all([
+    b"type Name = | Name(String)\n",
+    b"key for Name by folded\n",
+    b"fn folded(n: Name) -> String = match n { Name(s) -> s }\n",
+    b"type Bag<a> = | Bag(List<a>)\n",
+    b"key for Bag by items\n",
+    b"fn items<a>(b: Bag<a>) -> List<a> = match b { Bag(xs) -> xs }\n",
+    b"fn same(a: Name, b: Name) -> Bool = a == b\n",
+    b"fn ordered(a: Name, b: Name) -> Ordering = compare(a, b)\n",
+    b"fn bags(a: Bag<Int>, b: Bag<Int>) -> Bool = a == b\n",
+  ]);
+  let name = TyCon({ name: b"m.Name", args: [] });
+  let bag = TyCon({ name: b"m.Bag", args: [TyCon({ name: b"Int", args: [] })] });
+  let roots = [in_m(keys::Equal, name), in_m(Order, name), in_m(keys::Equal, bag)];
+  let answers = answers_at(
+    [b"m"],
+    [src],
+    [b"m.Name", b"m.Bag"],
+    [b"m.same", b"m.ordered", b"m.bags"].map(Named).concat(roots),
+  );
+  let body = |name: Bytes|
+    match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
+        if answer_name(a) == name { Some(a) } else { acc }) {
+      Some(a) -> match a.answer {
+        Body(b) -> b,
+        Refused(r) -> panic(String::of_bytes_lossy(Bytes::concat_all([name, b": ", r.why]))),
+      },
+      None -> panic(String::of_bytes_lossy(b"no answer for ".concat(name))),
+    };
+  // A comparison calls the root its type's module writes; none asks the runtime to compare.
+  [
+    { at: b"m.same", root: roots.get(0) },
+    { at: b"m.ordered", root: roots.get(1) },
+    { at: b"m.bags", root: roots.get(2) },
+  ].fold((), |_: Unit, c: { at: Bytes, root: RootKey }| {
+    assert(body(c.at).tables.calls.contains(c.root), Some(String::of_bytes_lossy(c.at)));
+    assert(body(c.at).text.index_of(b"rt_builtin_encoded_p") == None, None)
+  });
+  // Each root orders the two keys, which the key's function answers.
+  assert(body(printed(roots.get(0))).tables.calls.contains(Named(b"m.folded")), None);
+  assert(body(printed(roots.get(1))).tables.calls.contains(Named(b"m.folded")), None);
+  roots.map(printed).fold((), |_: Unit, r: Bytes|
+    assert(body(r).text.index_of(b"rt_builtin_encoded_p") == None, Some(String::of_bytes_lossy(r))))
+}
+
+test "a generic keyed sum is digested as its key, which its function answers at the sum's arguments" {
   let src = Bytes::concat_all([
     b"pub type Deque<a> = | Deque(List<a>, List<a>)\n",
     b"key for Deque by to_list\n",
     b"pub fn to_list<a>(d: Deque<a>) -> List<a> = match d { Deque(front, _) -> front }\n",
     b"fn hashed(d: Deque<Int>) -> Bytes = digest(d)\n",
   ]);
-  // A generic key is no function this root can call at the type, so the runtime reads the key.
   let key = in_m(Digest, TyCon({ name: b"m.Deque", args: [TyCon({ name: b"Int", args: [] })] }));
   let answers = answers_at([b"m"], [src], [b"m.Deque"], [Named(b"m.hashed"), key]);
   let body = match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
@@ -1673,8 +1731,17 @@ test "a part written code files no type for is the runtime's to encode, never th
     Some(a) -> match a.answer { Body(b) -> b, Refused(r) -> panic(String::of_bytes_lossy(r.why)) },
     None -> panic("no answer"),
   };
+  // The key is the list `to_list` answers at `Int`, encoded by its own root; the runtime reads no
+  // deque.
   assert(!body.tables.calls.contains(key), None);
-  assert(body.text.index_of(b"builtin_elaborated_encoded_p") != None, None)
+  assert_eq(
+    body.tables.generics.calls.map(|g: GenericCall| { callee: g.callee, args: g.args }),
+    [{ callee: Named(b"m.to_list"), args: [TyCon({ name: b"Int", args: [] })] }],
+  );
+  assert(
+    body.text.index_of(b"builtin_elaborated_encoded_p") == None,
+    Some(String::of_bytes_lossy(body.text)),
+  )
 }
 
 test "an update of a record held as its box writes the fields it sets, in the box or a copy of it" {

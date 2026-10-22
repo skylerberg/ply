@@ -610,6 +610,81 @@ fn walked_code(
 pub fn local_root(module: Bytes, root: Bytes) -> Bytes / {abort.raise} =
   if module.len() == 0 { root } else { root.slice(module.len() + 1, root.len()) }
 
+/// How a value of a keyed sum reaches its key: `f`'s name in the sum's module, the type arguments a
+/// call of it files, its type at them, and the key's type.
+pub type Keyed = { f: Bytes, args: List<Type>, fn_type: Type, key: Type }
+
+/// The key the module states for the declared sum `ty` (`key for T by f`), at `ty`'s arguments; none
+/// where it states none.
+pub fn keyed_by(module: Bytes, here: List<Def>, items: List<Item>, ty: Type) -> Option<Keyed> =
+  match ty {
+    TyCon(c) -> {
+      let stated = items.fold(None, |acc: Option<Bytes>, item: Item|
+        match item {
+          IInstance(d) -> if d.kind == NKey && qualify(module, d.target.name) == c.name {
+            Some(d.by.name)
+          } else { acc },
+          _ -> acc,
+        });
+      let scheme = |f: Bytes|
+        here.fold(None, |s: Option<Scheme>, h: Def| if h.name == f { h.scheme } else { s });
+      match stated {
+        None -> None,
+        Some(f) -> match scheme(f) {
+          Some(sc) -> match sc.ty {
+            TyFn(fn_ty) -> match fn_ty.params.at(0) {
+              Some(TyCon(p)) -> {
+                // Each of `f`'s variables is the argument of `ty` its parameter names it at.
+                let args = sc.ty_vars.map(|v: Int|
+                  range(0, p.args.len()).fold(unknown_type(), |found: Type, i: Int|
+                    if p.args.at(i) == Some(TyVar(v)) {
+                      match c.args.at(i) { Some(t) -> t, None -> found }
+                    } else { found }));
+                Some({
+                  f: f,
+                  args: args,
+                  fn_type: at_args(sc.ty, sc.ty_vars, args),
+                  key: at_args(fn_ty.ret, sc.ty_vars, args),
+                })
+              },
+              _ -> None,
+            },
+            _ -> None,
+          },
+          None -> None,
+        },
+      }
+    },
+    _ -> None,
+  }
+
+/// The body of `T#cmp`, or of `T#eq` where `eq`, for a sum whose module states its key `k`, over its
+/// two parameters and the types it files: the parameters' keys ordered, and equal where they order
+/// so, as values whose keys are equal are.
+pub fn keyed_code(k: Keyed, eq: Bool) -> { code: Code, typed: Map<Int, Typed> } = {
+  let at = |node: Node, span: Span| { node: node, span: span };
+  let placed = |n: Int| { start: 0, end: n, site: n + 1 };
+  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
+  let key_of = |x: Code, n: Int|
+    at(NApp({ func: at(NVar({ name: k.f, slot: None }), placed(n)), args: [x] }), dummy_span());
+  let ordered = at(
+    NApp({
+      func: at(NVar({ name: b"?compare", slot: None }), placed(0)),
+      args: [key_of(var(b"a", 0), 1), key_of(var(b"b", 1), 2)],
+    }),
+    dummy_span(),
+  );
+  let called = |m: Map<Int, Typed>, n: Int| m.insert(placed(n).site, filed_as(k.fn_type, k.args));
+  {
+    code: if eq { at(NBinary({ op: b"eq", lhs: ordered, rhs: said(b"Equal") }), placed(3)) }
+    else { ordered },
+    typed: said_typed(
+      called(called(Map::new().insert(placed(0).site, filed_as(unknown_type(), [k.key])), 1), 2),
+      [],
+    ),
+  }
+}
+
 /// The body of `T#eq` for a sum of constructors `cs`, as lowered code over its two parameters, and the
 /// binder types it files: each constructor's arguments compared in turn where both are that
 /// constructor.
@@ -846,7 +921,7 @@ fn le64(n: Int) -> Bytes =
 /// The body of the root `Digest` is written as for `ty`, over its parameter `a`, a value of `ty`,
 /// and the types it files: the encoding `digest.rs` writes, a record's and a constructor's own
 /// bytes written here and each part's encoding at its type. A type whose module states `key` is its
-/// key's encoding; one stated generic is read by the runtime.
+/// key's encoding.
 pub fn digest_code(
   module: Bytes,
   ctors: Ctors,
@@ -896,32 +971,21 @@ pub fn digest_code(
       TyCon(c) -> match ctors.sums.get(c.name) {
         None -> read,
         Some(cs) -> {
-          let stated = items.fold(None, |acc: Option<Bytes>, item: Item|
-            match item {
-              IInstance(d) -> if d.kind == NKey && qualify(module, d.target.name) == c.name {
-                Some(d.by.name)
-              } else { acc },
-              _ -> acc,
-            });
-          let scheme = |f: Bytes|
-            here.fold(None, |s: Option<Scheme>, h: Def| if h.name == f { h.scheme } else { s });
-          match stated {
+          match keyed_by(module, here, items, ty) {
             // Values whose keys are equal are equal, so the key is what is written.
-            Some(f) -> match scheme(f) {
-              Some(s) -> match s.ty {
-                TyFn(fn_ty) -> if s.ty_vars.len() > 0 { read } else {
-                  {
-                    code: joined([
-                      written(byte_of_int(16)),
-                      part(call(named(f), [var(b"a", 0)]), 1),
-                    ]),
-                    typed: parted(Map::new(), fn_ty.ret, 1),
-                  }
-                },
-                _ -> read,
+            Some(k) ->
+              {
+                code: joined([
+                  written(byte_of_int(16)),
+                  part(call({ node: NVar({ name: k.f, slot: None }), span: placed(2) }, [
+                    var(b"a", 0),
+                  ]), 1),
+                ]),
+                typed: parted(Map::new(), k.key, 1).insert(
+                  placed(2).site,
+                  filed_as(k.fn_type, k.args),
+                ),
               },
-              None -> read,
-            },
             None -> {
               let walked = cs.fold(
                 { arms: [], typed: Map::new(), next: 1, slot: 1 },
