@@ -868,6 +868,53 @@ fn a_block_emitted_code_laid_out_is_counted_under_a_kind_of_its_own() {
     assert_eq!(ctx.heap.live_by_kind(), vec![(KIND_REFUSED, 1, 16)]);
 }
 
+#[test]
+fn a_census_tells_a_record_by_its_fields_and_an_emitted_block_by_its_size_most_bytes_first() {
+    let mut ctx = crate::bare::context();
+    for _ in 0..3 {
+        emitted(&mut ctx);
+    }
+    let shape = ctx
+        .tables
+        .layouts
+        .shape(vec![Symbol::new("a"), Symbol::new("b")]);
+    let r = ctx.heap.alloc(KIND_RECORD, FLAT, 2, shape);
+    ctx.heap.alloc_bytes(KIND_STR, 40);
+    unsafe {
+        set_word(r, 0, imm(1));
+        set_word(r, 1, imm(2));
+    }
+    assert_eq!(
+        ctx.census(),
+        vec![
+            (
+                "emitted blocks of 16 bytes past the header".to_string(),
+                3,
+                48
+            ),
+            ("strings".to_string(), 1, 40),
+            ("{a, b}".to_string(), 1, 16),
+        ]
+    );
+}
+
+#[test]
+fn live_bytes_are_the_blocks_live_objects_take_and_a_dead_objects_block_leaves_them() {
+    let mut h = Heap::new();
+    enter(&mut h);
+    assert_eq!(h.live_bytes(), 0);
+    let small = h.alloc(KIND_RECORD, FLAT, 1, 0);
+    unsafe { set_word(small, 0, imm(1)) };
+    h.alloc_bytes(KIND_BYTES, 1 << 20);
+    let big = (1 << 20) + HEADER;
+    assert_eq!(h.live_bytes(), Heap::object_size(8) + big);
+    dec(small as Word);
+    assert_eq!(h.live_bytes(), big, "the dead object's block still counted");
+    assert!(h.live_bytes() <= h.held());
+    leave();
+    h.end();
+}
+
 /// A walker named, over a word.
 type Walk<'a> = (&'static str, Box<dyn Fn(Word) + 'a>);
 

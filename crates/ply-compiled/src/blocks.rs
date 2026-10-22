@@ -499,6 +499,23 @@ impl Blocks {
         pages * PAGE + self.large.values().sum::<usize>()
     }
 
+    /// The bytes of the blocks handed out and not given back, each its size class's whole block: a
+    /// block another thread let go of counts until this heap takes it back.
+    pub fn live(&self) -> usize {
+        let pages: usize = self
+            .segments
+            .iter()
+            .map(|&address| unsafe {
+                (*(address as *mut Segment))
+                    .pages
+                    .iter()
+                    .map(|page| page.live as usize * page.block as usize)
+                    .sum::<usize>()
+            })
+            .sum();
+        pages + self.large.values().sum::<usize>()
+    }
+
     /// The bytes mapped for pages, in use or not.
     pub fn mapped(&self) -> usize {
         self.segments.len() * SEGMENT

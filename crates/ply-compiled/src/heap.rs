@@ -52,6 +52,35 @@ pub const KIND_DEAD: u8 = 255;
 /// How many kinds [`Heap::allocated_by_kind`] tells apart: every `KIND_*` an object is made with.
 pub const KINDS: usize = 32;
 
+/// What objects of `kind` are, as a census of them is told.
+pub fn kind_name(kind: u8) -> String {
+    match kind {
+        KIND_UNIT => "units",
+        KIND_BOOL => "Bools",
+        KIND_INT => "boxed Ints",
+        KIND_RECORD => "records",
+        KIND_CTOR => "constructors",
+        KIND_LIST => "lists",
+        KIND_CLOSURE => "closures",
+        KIND_BRIDGE => "bridges",
+        KIND_MAP => "maps",
+        KIND_STR => "strings",
+        KIND_BYTES => "byte strings",
+        KIND_LEAF => "list leaves",
+        KIND_BRANCH => "list branches",
+        KIND_MLEAF => "map leaves",
+        KIND_MBRANCH => "map branches",
+        KIND_ARRAY => "arrays",
+        KIND_FLOAT => "Floats",
+        KIND_FIXED => "fixed-width integers",
+        KIND_DECIMAL => "Decimals",
+        KIND_COLUMNS => "columns",
+        KIND_REFUSED => "emitted blocks",
+        _ => return format!("kind {kind}"),
+    }
+    .to_string()
+}
+
 /// The walker `walker`, handed a block emitted code laid out, which no walker reads.
 #[cold]
 #[inline(never)]
@@ -1478,32 +1507,70 @@ impl Heap {
         h
     }
 
-    /// Live objects by kind, with their count and payload bytes: for a block emitted code laid out,
-    /// what its block holds past the header.
-    pub fn live_by_kind(&self) -> Vec<(u8, usize, usize)> {
-        let mut tally: std::collections::BTreeMap<u8, (usize, usize)> = Default::default();
+    /// Live objects tallied under what `key` makes of each one's kind, `layout` and payload bytes,
+    /// with their count and payload bytes: for a block emitted code laid out, what its block holds
+    /// past the header.
+    fn live_by<K: Ord>(
+        &self,
+        key: impl Fn(u8, u32, usize) -> K,
+    ) -> std::collections::BTreeMap<K, (usize, usize)> {
+        let mut tally: std::collections::BTreeMap<K, (usize, usize)> = Default::default();
         self.blocks.each(|block, bytes| {
             let o: *mut Obj = block.cast();
-            let (kind, rc) = unsafe { ((*o).kind, (*o).rc) };
+            let (kind, rc, layout) = unsafe { ((*o).kind, (*o).rc, (*o).layout) };
             if kind == KIND_DEAD || rc == 0 {
                 return;
             }
-            let size = if kind == KIND_REFUSED {
-                bytes - HEADER
-            } else {
-                unsafe { payload_bytes(o) }
+            let size = match kind {
+                KIND_REFUSED => bytes - HEADER,
+                // Unsized: the header alone.
+                _ => match unsafe { payload_bytes(o) } {
+                    usize::MAX => HEADER,
+                    size => size,
+                },
             };
-            let e = tally.entry(kind).or_insert((0, 0));
+            let e = tally.entry(key(kind, layout, size)).or_insert((0, 0));
             e.0 += 1;
-            // `usize::MAX` means unsized: count the header alone.
-            e.1 += if size == usize::MAX { HEADER } else { size };
+            e.1 += size;
         });
-        tally.into_iter().map(|(k, (n, b))| (k, n, b)).collect()
+        tally
+    }
+
+    /// Live objects by kind, with their count and payload bytes.
+    pub fn live_by_kind(&self) -> Vec<(u8, usize, usize)> {
+        self.live_by(|kind, _, _| kind)
+            .into_iter()
+            .map(|(k, (n, b))| (k, n, b))
+            .collect()
+    }
+
+    /// Live objects by what their headers say they are, the most bytes first, with their count and
+    /// payload bytes: a record by its kind and shape, a constructor by its kind and index, a block
+    /// emitted code laid out, whose header names no type, by its kind and payload bytes, and any
+    /// other object by its kind and 0.
+    pub fn census(&self) -> Vec<((u8, u32), usize, usize)> {
+        let mut rows: Vec<((u8, u32), usize, usize)> = self
+            .live_by(|kind, layout, size| match kind {
+                KIND_RECORD | KIND_CTOR => (kind, layout),
+                KIND_REFUSED => (kind, u32::try_from(size).unwrap_or(u32::MAX)),
+                _ => (kind, 0),
+            })
+            .into_iter()
+            .map(|(k, (n, b))| (k, n, b))
+            .collect();
+        rows.sort_by_key(|&(k, _, b)| (std::cmp::Reverse(b), k));
+        rows
     }
 
     /// How many objects are live.
     pub fn live(&self) -> usize {
         self.live_by_kind().iter().map(|(_, n, _)| n).sum()
+    }
+
+    /// The bytes of the blocks the entry's live objects take, read from the pages without a walk:
+    /// a dead block waiting under `PLY_HEAP_DELAY` still counts.
+    pub fn live_bytes(&self) -> usize {
+        self.blocks.live()
     }
 
     /// The bytes of the memory holding the entry's objects, whatever is live in it.
