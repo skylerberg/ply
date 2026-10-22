@@ -2,11 +2,13 @@
 //! written for a type, a test, a law, a clause, a stored value or an entry. Its name is printed from
 //! the key, never read back into one.
 
-import check.types (Type, TyCon, spelled_type, type_bin)
+import check.types (Type, TyCon, TyRecord, TyNominal, Field, spelled_type, type_bin)
 import check.resolve.tables (qualify, module_of_name)
 import std.bin
 import std.bytes (ascii_of_int)
 import std.hash (blake3)
+import std.math (ilog2)
+import std.pace (paced)
 
 /// A root. `Named` is a definition, by its qualified name. `At` is a definition at type arguments,
 /// running in place the lambdas `lent` names where it calls the parameters they are handed as.
@@ -117,7 +119,7 @@ fn spelled(k: RootKey) -> Bytes =
           b"@",
           Bytes::join(
             a.args.map(|x: KeyArg|
-              match x { KeyType(t) -> spelled_type(t), KeyLayout(l) -> l.key }),
+              match x { KeyType(t) -> name_spelled(t), KeyLayout(l) -> l.key }),
             b",",
           ),
         ].concat(
@@ -133,8 +135,8 @@ fn spelled(k: RootKey) -> Bytes =
         ),
       ),
     Written(w) -> {
-      let ty = if w.marks.len() == 0 { spelled_type(w.ty) } else {
-        Bytes::concat_all([spelled_type(w.ty), b"^", Bytes::join(w.marks.map(ascii_of_int), b",")])
+      let ty = if w.marks.len() == 0 { name_spelled(w.ty) } else {
+        Bytes::concat_all([name_spelled(w.ty), b"^", Bytes::join(w.marks.map(ascii_of_int), b",")])
       };
       match w.op {
         Equal -> ty.concat(b"#eq"),
@@ -156,6 +158,90 @@ fn spelled(k: RootKey) -> Bytes =
     Stored(s) -> spelled(s).concat(b"#stored"),
     Entered(e) -> spelled(e).concat(b"#entered"),
   }
+
+/// `ty` as a root's name spells it: as `spelled_type` does, but each record it holds as
+/// `digest_spelled` of that record's own spelling here, so a record a type holds twice at each level
+/// is spelled once, and a name grows with the type's distinct records rather than doubling with each.
+fn name_spelled(ty: Type) -> Bytes = spelled_at(ty, Map::new()).text
+
+/// A type's spelling, and the digests of the records spelled so far.
+type Spelled = { text: Bytes, digests: Map<Type, Bytes> }
+
+/// `ty` spelled as `name_spelled` spells it, the records already spelled read off `digests`.
+fn spelled_at(ty: Type, digests: Map<Type, Bytes>) -> Spelled =
+  match ty {
+    TyCon(c) -> {
+      let args = all_held(c.args, digests);
+      { text: named_spelled(c.name, args.texts), digests: args.digests }
+    },
+    TyRecord(fs) -> fields_spelled(b"", fs, digests),
+    TyNominal(x) -> {
+      let args = all_held(x.args, digests);
+      fields_spelled(named_spelled(x.name, args.texts), x.fields, args.digests)
+    },
+    _ -> { text: spelled_type(ty), digests: digests },
+  }
+
+/// `ty` held in another type: a record as its digest, any other type as `spelled_at` spells it.
+fn held_spelled(ty: Type, digests: Map<Type, Bytes>) -> Spelled =
+  match ty {
+    TyRecord(_) -> digested(ty, digests),
+    TyNominal(_) -> digested(ty, digests),
+    _ -> spelled_at(ty, digests),
+  }
+
+/// Record `ty` as its digest, spelling it where no digest of it is read yet.
+fn digested(ty: Type, digests: Map<Type, Bytes>) -> Spelled =
+  match digests.get(ty) {
+    Some(d) -> { text: d, digests: digests },
+    None -> {
+      let own = spelled_at(ty, digests);
+      let d = digest_spelled(own.text);
+      { text: d, digests: own.digests.insert(ty, d) }
+    },
+  }
+
+/// `tys` each held in another type, in order.
+fn all_held(
+  tys: List<Type>,
+  digests: Map<Type, Bytes>,
+) -> { texts: List<Bytes>, digests: Map<Type, Bytes> } =
+  tys.fold(
+    { texts: [], digests: digests },
+    |acc: { texts: List<Bytes>, digests: Map<Type, Bytes> }, t: Type| {
+      let s = held_spelled(t, acc.digests);
+      { texts: acc.texts.push(s.text), digests: s.digests }
+    },
+  )
+
+/// `head` and the fields `fs` between braces, each named and its type held.
+fn fields_spelled(head: Bytes, fs: List<Field>, digests: Map<Type, Bytes>) -> Spelled = {
+  let walked = fs.fold(
+    { texts: [], digests: digests },
+    |acc: { texts: List<Bytes>, digests: Map<Type, Bytes> }, f: Field| {
+      let s = held_spelled(f.ty, acc.digests);
+      { texts: acc.texts.push(Bytes::concat_all([f.name, b":", s.text])), digests: s.digests }
+    },
+  );
+  {
+    text: Bytes::concat_all([head, b"{", Bytes::join(walked.texts, b","), b"}"]),
+    digests: walked.digests,
+  }
+}
+
+/// A type named `name`, at the arguments spelled `args`, as `spelled_type` spells it.
+fn named_spelled(name: Bytes, args: List<Bytes>) -> Bytes = {
+  let n = spelled_type(TyCon({ name: name, args: [] }));
+  if args.len() == 0 { n } else { Bytes::concat_all([n, b"<", Bytes::join(args, b","), b">"]) }
+}
+
+/// A record spelled `text`, as a name holds it: `%` and 63 bits of `text`'s blake3, in decimal.
+fn digest_spelled(text: Bytes) -> Bytes = {
+  let h = text.blake3();
+  let low = match h.u32_at(0) { Some(v) -> v, None -> 0 };
+  let high = match h.u32_at(4) { Some(v) -> v, None -> 0 };
+  b"%".concat(ascii_of_int(high << 31 | low >>> 1))
+}
 
 /// The name of the entry of the root named `root`, as `Entered` names it.
 pub fn entry_name(root: RootName) -> RootName = { spelling: root.spelling.concat(b"#entered") }
@@ -282,6 +368,45 @@ pub fn written(op: TypeOp, ty: Type, asking: Bytes) -> RootKey =
 pub fn unspecialised(k: RootKey) -> RootKey = match k { At(a) -> Named(a.def), _ -> k }
 
 fn printed(k: RootKey) -> Bytes = root_text(root_name(k))
+
+test "a root's name spells each record its type holds by digest, once however deep records nest" {
+  let string = TyCon({ name: b"String", args: [] });
+  // Records nested `d` deep over `leaf`, each holding the one below in a field and in a list.
+  let nested = |leaf: Type, d: Int|
+    range(0, d).fold(leaf, |below: Type, _: Int|
+      TyRecord([
+        { name: b"x", ty: below },
+        { name: b"y", ty: TyCon({ name: b"List", args: [below] }) },
+      ]));
+  let deep = |d: Int| nested(TyRecord([{ name: b"s", ty: string }]), d);
+  let named = |op: TypeOp, d: Int| printed(written(op, deep(d), b"m"));
+  // The type's own record spells its fields; the record it holds twice is one digest, written twice.
+  let below = digest_spelled(
+    Bytes::concat_all([
+      b"{x:",
+      digest_spelled(b"{s:String}"),
+      b",y:List<",
+      digest_spelled(b"{s:String}"),
+      b">}",
+    ]),
+  );
+  assert_eq(named(Drop, 2), Bytes::concat_all([b"m.drop#{x:", below, b",y:List<", below, b">}"]));
+  // Two types whose records part deep down have two names, and a name stays short at any depth.
+  assert(
+    named(Drop, 9)
+      != printed(
+        written(
+          Drop,
+          nested(TyRecord([{ name: b"s", ty: TyCon({ name: b"Int", args: [] }) }]), 9),
+          b"m",
+        ),
+      ),
+    None,
+  );
+  assert(named(Lift, 16).len() < 64, None);
+  paced(|d: Int| d * d * (ilog2(d) + 1), |d: Int|
+    [Drop, Lift, Lower].map(|op: TypeOp| named(op, d).len()))
+}
 
 test "a key prints as the name roots were spelled with before they were keys" {
   let int = TyCon({ name: b"Int", args: [] });
