@@ -9,8 +9,8 @@ import emit.reps (SumCtor, Ctors, kind_of, laid_known, ctors_of)
 import emit.c (Kind, KInt, KBool, KNum, KFloat, KDec)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RFlat, Leaf, RSum, RUnit, RSlice,
                  RImm, Convention, Given, Owned, parts_of)
-import emit.layout (Laid, LSum, LRecord, LWords, P, U, Always, Inline, Boxed, Nullary, SumLaid,
-                    words, register_words, raw, counts)
+import emit.layout (Laid, LSum, LRecord, LWords, FieldLaid, P, U, Always, Inline, Boxed, Nullary,
+                    SumLaid, words, register_words, raw, counts)
 import emit.lower.setting (Setting)
 
 /// How a value of `ty` is held in a body, and so how it crosses a call: `held_with` the setting's
@@ -42,21 +42,23 @@ pub fn flat_leaves() -> Int = 32
 
 /// `held_with`, a record past `flat_leaves` held as its box where `boxing`, else as its leaves.
 fn held_boxing(ctors: Ctors, ty: Type, boxing: Bool) -> Rep =
-  match laid_known(ctors, ty) {
-    None -> RWord,
-    Some(l) -> if words(l) == 0 { RUnit } else {
-      match l {
-        LSum(x) -> RSum({ laid: x, cases: case_names(ctors, ty) }),
-        LRecord(_) -> {
-          let ls = record_leaves(ctors, ty);
-          if boxing && ls.len() > flat_leaves() { RWord } else { RFlat(ls) }
-        },
-        LWords(_) -> match slot_rep(kind_of(ty).kind) {
-          RWord -> if counts(l) { RWord } else { RImm },
-          r -> r,
-        },
-      }
-    },
+  match laid_known(ctors, ty) { None -> RWord, Some(l) -> held_laid(ctors, ty, l, boxing) }
+
+/// `held_boxing` of a value of `ty` laid as `l`, each field of a record held as the layout it has
+/// there says, so no field is laid out again.
+fn held_laid(ctors: Ctors, ty: Type, l: Laid, boxing: Bool) -> Rep =
+  if words(l) == 0 { RUnit } else {
+    match l {
+      LSum(x) -> RSum({ laid: x, cases: case_names(ctors, ty) }),
+      LRecord(fs) -> {
+        let ls = record_leaves(ctors, ty, fs);
+        if boxing && ls.len() > flat_leaves() { RWord } else { RFlat(ls) }
+      },
+      LWords(_) -> match slot_rep(kind_of(ty).kind) {
+        RWord -> if counts(l) { RWord } else { RImm },
+        r -> r,
+      },
+    }
   }
 
 /// The leaves a record of type `ty` is laid in, however wide: what its box holds where it is held as
@@ -93,19 +95,24 @@ fn slot_rep(k: Kind) -> Rep =
 fn record_fields(ty: Type) -> List<Field> =
   match ty { TyRecord(fs) -> fs, TyNominal(x) -> x.fields, _ -> [] }
 
-/// The leaves of a record of type `ty` laid out, in its words' order: each field held as its type
-/// holds it, named by it, a record's leaves, however wide, named `field.leaf` in place, and a field
-/// of no words none.
-fn record_leaves(ctors: Ctors, ty: Type) -> List<Leaf> =
-  record_fields(ty).fold([], |acc: List<Leaf>, f: Field|
-    match held_boxing(ctors, f.ty, false) {
-      RUnit -> acc,
-      RFlat(inner) ->
-        acc.concat(
-          inner.map(|l: Leaf| { name: Bytes::concat_all([f.name, b".", l.name]), rep: l.rep }),
-        ),
-      r -> acc.push({ name: f.name, rep: r }),
+/// The leaves of a record of type `ty` whose fields are laid as `fs`, in its words' order: each
+/// field held as its type holds it, named by it, a record's leaves, however wide, named
+/// `field.leaf` in place, and a field of no words none.
+fn record_leaves(ctors: Ctors, ty: Type, fs: List<FieldLaid>) -> List<Leaf> = {
+  let fields = record_fields(ty);
+  range(0, fields.len()).fold([], |acc: List<Leaf>, i: Int|
+    match ((fields.at(i), fs.at(i))) {
+      (Some(f), Some(laid)) -> match held_laid(ctors, f.ty, laid.laid, false) {
+        RUnit -> acc,
+        RFlat(inner) ->
+          acc.concat(
+            inner.map(|l: Leaf| { name: Bytes::concat_all([f.name, b".", l.name]), rep: l.rep }),
+          ),
+        r -> acc.push({ name: f.name, rep: r }),
+      },
+      _ -> acc,
     })
+}
 
 /// Where field `name` of a flat record of leaves `ls` lies among them: its first leaf and how many
 /// it takes, a record's leaves all; none for a field of no words, which holds no leaf.
