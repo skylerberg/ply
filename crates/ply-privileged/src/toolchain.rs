@@ -330,25 +330,22 @@ impl HostHandler for Toolchain {
                     .iter()
                     .map(|a| a.as_str(span, "an argument").map(str::to_string))
                     .collect::<Result<Vec<_>, _>>()?;
-                match Command::new(&program)
+                let ran = Command::new(&program)
                     .args(&args)
                     .stdin(Stdio::null())
-                    .output()
-                {
-                    Ok(out) => crate::payload::record(vec![
-                        (
-                            "code",
-                            PlyValue::Int(out.status.code().map_or(-1, i64::from)),
-                        ),
-                        ("out", PlyValue::bytes(&out.stdout)),
-                        ("err", PlyValue::bytes(&out.stderr)),
-                    ]),
-                    Err(e) => crate::payload::record(vec![
-                        ("code", PlyValue::Int(-1)),
-                        ("out", PlyValue::bytes(b"")),
-                        ("err", PlyValue::bytes(e.to_string().as_bytes())),
-                    ]),
-                }
+                    .stderr(Stdio::inherit())
+                    .output();
+                let (code, out) = match ran {
+                    Ok(out) => (out.status.code().map_or(-1, i64::from), out.stdout),
+                    Err(e) => {
+                        eprintln!("{} did not start: {e}", program.display());
+                        (-1, Vec::new())
+                    }
+                };
+                crate::payload::record(vec![
+                    ("code", PlyValue::Int(code)),
+                    ("out", PlyValue::bytes(&out)),
+                ])
             }
             ("cleared", [dir]) => {
                 let at = below(dir.as_str(span, "a path")?, span)?;
