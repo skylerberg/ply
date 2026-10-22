@@ -1276,6 +1276,69 @@ thread_local! {
     static CURRENT: std::cell::Cell<*mut Heap> = const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
+/// The live objects of `blocks` tallied under what `key` makes of each one's kind, `layout` and
+/// payload bytes, with their count and payload bytes: for a block emitted code laid out, what its
+/// block holds past the header.
+pub(crate) fn live_in<K: Ord>(
+    blocks: &Blocks,
+    key: impl Fn(u8, u32, usize) -> K,
+) -> std::collections::BTreeMap<K, (usize, usize)> {
+    let mut tally: std::collections::BTreeMap<K, (usize, usize)> = Default::default();
+    blocks.each(|block, bytes| {
+        let o: *mut Obj = block.cast();
+        let (kind, rc, layout) = unsafe { ((*o).kind, (*o).rc, (*o).layout) };
+        if kind == KIND_DEAD || rc == 0 {
+            return;
+        }
+        let size = match kind {
+            KIND_REFUSED => bytes - HEADER,
+            // Unsized: the header alone.
+            _ => match unsafe { payload_bytes(o) } {
+                usize::MAX => HEADER,
+                size => size,
+            },
+        };
+        let e = tally.entry(key(kind, layout, size)).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += size;
+    });
+    tally
+}
+
+/// The live objects of `blocks` by what their headers say they are, as [`Heap::census`] reads them.
+pub(crate) fn census_in(blocks: &Blocks) -> Vec<((u8, u32), usize, usize)> {
+    let mut rows: Vec<((u8, u32), usize, usize)> =
+        live_in(blocks, |kind, layout, size| match kind {
+            KIND_RECORD | KIND_CTOR => (kind, layout),
+            KIND_REFUSED => (kind, u32::try_from(size).unwrap_or(u32::MAX)),
+            _ => (kind, 0),
+        })
+        .into_iter()
+        .map(|(k, (n, b))| (k, n, b))
+        .collect();
+    rows.sort_by_key(|&(k, _, b)| (std::cmp::Reverse(b), k));
+    rows
+}
+
+/// Two censuses as one, each sort's counts and bytes summed, the most bytes first.
+pub(crate) fn census_merged(
+    a: Vec<((u8, u32), usize, usize)>,
+    b: Vec<((u8, u32), usize, usize)>,
+) -> Vec<((u8, u32), usize, usize)> {
+    let mut sums: std::collections::BTreeMap<(u8, u32), (usize, usize)> = Default::default();
+    for (k, n, bytes) in a.into_iter().chain(b) {
+        let e = sums.entry(k).or_insert((0, 0));
+        e.0 += n;
+        e.1 += bytes;
+    }
+    let mut rows: Vec<((u8, u32), usize, usize)> = sums
+        .into_iter()
+        .map(|(k, (n, bytes))| (k, n, bytes))
+        .collect();
+    rows.sort_by_key(|&(k, _, bytes)| (std::cmp::Reverse(bytes), k));
+    rows
+}
+
 /// The entry beginning on this thread allocates from `heap`; its dead objects go back to it.
 pub fn enter(heap: *mut Heap) {
     CURRENT.with(|c| c.set(heap));
@@ -1500,6 +1563,11 @@ impl Heap {
         }
     }
 
+    /// `blocks` in place of the blocks this heap takes from, which it answers.
+    pub(crate) fn swap_blocks(&mut self, blocks: Blocks) -> Blocks {
+        std::mem::replace(&mut self.blocks, blocks)
+    }
+
     /// A heap whose entries never end: what outlives every entry lives here.
     pub fn persistent() -> Heap {
         let mut h = Heap::new();
@@ -1507,33 +1575,11 @@ impl Heap {
         h
     }
 
-    /// Live objects tallied under what `key` makes of each one's kind, `layout` and payload bytes,
-    /// with their count and payload bytes: for a block emitted code laid out, what its block holds
-    /// past the header.
     fn live_by<K: Ord>(
         &self,
         key: impl Fn(u8, u32, usize) -> K,
     ) -> std::collections::BTreeMap<K, (usize, usize)> {
-        let mut tally: std::collections::BTreeMap<K, (usize, usize)> = Default::default();
-        self.blocks.each(|block, bytes| {
-            let o: *mut Obj = block.cast();
-            let (kind, rc, layout) = unsafe { ((*o).kind, (*o).rc, (*o).layout) };
-            if kind == KIND_DEAD || rc == 0 {
-                return;
-            }
-            let size = match kind {
-                KIND_REFUSED => bytes - HEADER,
-                // Unsized: the header alone.
-                _ => match unsafe { payload_bytes(o) } {
-                    usize::MAX => HEADER,
-                    size => size,
-                },
-            };
-            let e = tally.entry(key(kind, layout, size)).or_insert((0, 0));
-            e.0 += 1;
-            e.1 += size;
-        });
-        tally
+        live_in(&self.blocks, key)
     }
 
     /// Live objects by kind, with their count and payload bytes.
@@ -1549,17 +1595,7 @@ impl Heap {
     /// emitted code laid out, whose header names no type, by its kind and payload bytes, and any
     /// other object by its kind and 0.
     pub fn census(&self) -> Vec<((u8, u32), usize, usize)> {
-        let mut rows: Vec<((u8, u32), usize, usize)> = self
-            .live_by(|kind, layout, size| match kind {
-                KIND_RECORD | KIND_CTOR => (kind, layout),
-                KIND_REFUSED => (kind, u32::try_from(size).unwrap_or(u32::MAX)),
-                _ => (kind, 0),
-            })
-            .into_iter()
-            .map(|(k, (n, b))| (k, n, b))
-            .collect();
-        rows.sort_by_key(|&(k, _, b)| (std::cmp::Reverse(b), k));
-        rows
+        census_in(&self.blocks)
     }
 
     /// How many objects are live.

@@ -85,6 +85,8 @@ pub struct Ctx {
     /// The last at-most-once host operation this entry performed, for `E0426`.
     pub(crate) last_linear: Option<crate::host::HostMark>,
     pub(crate) id: ply_core::host::MachineId,
+    /// Whether the entry's branches ran on the pool's threads, whose blocks then hold its objects too.
+    pub(crate) pooled: bool,
     /// What the host runtime said when an entry ended, for the machine's teardown warnings.
     pub(crate) teardown: Vec<Diagnostic>,
     /// The seed the driver set, and the step budget, for the regions this entry opens.
@@ -209,6 +211,7 @@ impl Ctx {
             host_ops: 0,
             last_linear: None,
             id: ply_core::host::MachineId::next(),
+            pooled: false,
             teardown: Vec::new(),
             seed: ply_core::Seed::default(),
             sim_steps: ply_core::sim::DEFAULT_STEPS,
@@ -332,6 +335,7 @@ impl Ctx {
     /// its calls, and what it performed.
     pub(crate) fn absorb(&mut self, mut branch: Ctx) {
         self.heap.adopt_heap(std::mem::take(&mut branch.heap));
+        self.pooled |= branch.pooled;
         self.ticks = self.ticks.saturating_add(branch.ticks);
         self.charged = self.charged.plus(branch.charged);
         self.grown += branch.grown;
@@ -510,7 +514,7 @@ impl Ctx {
                 "entry: {} objects allocated, {} recycled, {}MB held, {} stacks grown",
                 self.heap.allocated(),
                 self.heap.recycled(),
-                self.heap.held() / 1_000_000,
+                self.held() / 1_000_000,
                 self.grown
             );
             let by_kind = self.heap.allocated_by_kind();
@@ -539,6 +543,42 @@ impl Ctx {
             }
         }
         self.heap.end();
+        if std::mem::take(&mut self.pooled) {
+            crate::parallel::workers_ended(self.id.0);
+        }
+    }
+
+    /// What `read` makes of the blocks the pool's threads hold of this entry's branches, summed.
+    fn workers(&self, read: impl Fn(&crate::blocks::Blocks) -> usize + Sync) -> usize {
+        if self.pooled {
+            crate::parallel::worker_blocks(self.id.0, read)
+                .into_iter()
+                .sum()
+        } else {
+            0
+        }
+    }
+
+    /// The bytes of the blocks the entry's live objects take, its branches' on the pool's threads
+    /// among them, read from the pages without a walk.
+    pub fn live_bytes(&self) -> usize {
+        self.heap.live_bytes() + self.workers(|b| b.live())
+    }
+
+    /// The bytes of the memory holding the entry's objects, whatever is live in it.
+    pub fn held(&self) -> usize {
+        self.heap.held() + self.workers(|b| b.held())
+    }
+
+    /// How many of the entry's objects are live, its branches' on the pool's threads among them.
+    pub fn live(&self) -> usize {
+        self.heap.live()
+            + self.workers(|b| {
+                heap::live_in(b, |kind, _, _| kind)
+                    .values()
+                    .map(|e| e.0)
+                    .sum()
+            })
     }
 
     /// The entry's live objects by what they are, the most bytes first, with their count and payload
@@ -546,9 +586,13 @@ impl Ctx {
     /// out, whose header names no type, by its payload bytes, and any other object by its kind.
     pub fn census(&self) -> Vec<(String, usize, usize)> {
         let layouts = &self.tables.layouts;
-        self.heap
-            .census()
-            .into_iter()
+        let mut rows = self.heap.census();
+        if self.pooled {
+            for tally in crate::parallel::worker_blocks(self.id.0, heap::census_in) {
+                rows = heap::census_merged(rows, tally);
+            }
+        }
+        rows.into_iter()
             .map(|((kind, key), n, bytes)| {
                 let what = layout_named(layouts, kind, key).unwrap_or_else(|| match kind {
                     heap::KIND_REFUSED => format!("emitted blocks of {key} bytes past the header"),
