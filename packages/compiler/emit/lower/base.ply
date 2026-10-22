@@ -338,8 +338,8 @@ pub fn handed(l: Lowered, to: Rep, at: Span) -> Lowered =
         _ -> packed,
       },
       AZero(r) -> if !counted(r) && !counted(to) { { st: l.st, arg: AZero(to) } } else { packed },
-      AVar(v) -> match unpacked(l.st, v, to) {
-        Some(back) -> back,
+      AVar(v) -> match packed_from(l.st, v, to) {
+        Some(s) -> { st: l.st, arg: AVar(s) },
         None -> if counted(to) && counts_in(to) <= counts_in(v.rep) && !slot_named(l.st, v) {
           packed_after(l.st, v, to, at)
         } else { packed },
@@ -388,27 +388,34 @@ fn after_naming(b: Block, id: Int) -> Int =
     else { { at: s.at - 1, found: false } }).at
 
 /// Whether instruction `i`, or a block it holds, names variable `id`.
-fn names(i: Inst, id: Int) -> Bool =
+fn names(i: Inst, id: Int) -> Bool = named_by(i, id, true)
+
+fn names_in(b: Block, id: Int) -> Bool = b.any(|i: Inst| names(i, id))
+
+/// Whether instruction `i`, or a block it holds, names variable `id`, a `Let` binding it among them
+/// where `binding`.
+fn named_by(i: Inst, id: Int, binding: Bool) -> Bool = {
+  let within = |b: Block| b.any(|x: Inst| named_by(x, id, binding));
   match i {
     Let(l) ->
-      l.var.id == id || operands(l.val).any(|o: { arg: Arg, takes: Bool }| arg_names(o.arg, id)),
+      (binding && l.var.id == id)
+        || operands(l.val).any(|o: { arg: Arg, takes: Bool }| arg_names(o.arg, id)),
     Do(d) -> operands(d.val).any(|o: { arg: Arg, takes: Bool }| arg_names(o.arg, id)),
     Decl(v) -> v.id == id,
     Assign(s) -> s.var.id == id || arg_names(s.arg, id),
-    If(x) -> arg_names(x.cond, id) || names_in(x.then, id) || names_in(x.otherwise, id),
+    If(x) -> arg_names(x.cond, id) || within(x.then) || within(x.otherwise),
     Case(c) ->
-      c.on.id == id || names_in(c.rest, id)
-        || c.arms.any(|a: { when: Int, body: Block }| names_in(a.body, id)),
-    Match(m) -> names_in(m.rest, id) || m.arms.any(|a: Block| names_in(a, id)),
+      c.on.id == id || within(c.rest) || c.arms.any(|a: { when: Int, body: Block }| within(a.body)),
+    Match(m) -> within(m.rest) || m.arms.any(within),
     Loop(l) ->
       l.answer.id == id || l.state.any(|s: Var| s.id == id) || l.init.any(|a: Arg| arg_names(a, id))
-        || names_in(l.body, id),
+        || within(l.body),
     Next(args) -> args.any(|a: Arg| arg_names(a, id)),
     Done(a) -> arg_names(a, id),
     Return(a) -> arg_names(a, id),
     Restart(args) -> args.any(|a: Arg| arg_names(a, id)),
     Enter(e) -> e.args.any(|a: Arg| arg_names(a, id)),
-    Handle(h) -> h.answer.id == id || h.args.any(|a: Arg| arg_names(a, id)) || names_in(h.body, id),
+    Handle(h) -> h.answer.id == id || h.args.any(|a: Arg| arg_names(a, id)) || within(h.body),
     Inc(n) -> n.var.id == id,
     Dec(v) -> v.id == id,
     Reset(r) -> r.token.id == id || r.of.id == id,
@@ -418,8 +425,68 @@ fn names(i: Inst, id: Int) -> Bool =
     Miss -> false,
     Sited(_) -> false,
   }
+}
 
-fn names_in(b: Block, id: Int) -> Bool = b.any(|i: Inst| names(i, id))
+/// The variable `v` was packed from, held as `to`, where `st`'s block makes `v` by packing one that
+/// block does not declare to be set again: what a read of `v` reads where it lies, `v` left to any
+/// other reader.
+pub fn packed_from(st: Lowering, v: Var, to: Rep) -> Option<Var> = {
+  let declared = |s: Var| st.insts.any(|i: Inst| i == Decl(s));
+  st.insts.fold(None, |found: Option<Var>, i: Inst|
+    match i {
+      Let(l) -> if l.var != v { found } else {
+        match l.val {
+          Pack(p) -> match p.arg {
+            AVar(s) -> if s.rep == to && !declared(s) { Some(s) } else { None },
+            _ -> None,
+          },
+          _ -> None,
+        }
+      },
+      _ -> found,
+    })
+}
+
+/// Body `b` without each `Pack` nothing in it reads: a value made for a reader that read what it was
+/// made from instead.
+pub fn unread_packs_dropped(b: Block) -> Block =
+  unread_dropped_in(b, |id: Int| b.any(|i: Inst| named_by(i, id, false)))
+
+fn unread_dropped_in(b: Block, read: (Int) -> Bool) -> Block =
+  b.fold([], |acc: List<Inst>, i: Inst|
+    match i {
+      Let(l) -> match l.val {
+        Pack(_) -> if read(l.var.id) { acc.push(i) } else { acc },
+        _ -> acc.push(i),
+      },
+      If(x) ->
+        acc.push(
+          If({
+            ..x,
+            then: unread_dropped_in(x.then, read),
+            otherwise: unread_dropped_in(x.otherwise, read),
+          }),
+        ),
+      Case(c) ->
+        acc.push(
+          Case({
+            ..c,
+            arms: c.arms.map(|a: { when: Int, body: Block }|
+              { when: a.when, body: unread_dropped_in(a.body, read) }),
+            rest: unread_dropped_in(c.rest, read),
+          }),
+        ),
+      Match(m) ->
+        acc.push(
+          Match({
+            arms: m.arms.map(|a: Block| unread_dropped_in(a, read)),
+            rest: unread_dropped_in(m.rest, read),
+          }),
+        ),
+      Loop(l) -> acc.push(Loop({ ..l, body: unread_dropped_in(l.body, read) })),
+      Handle(h) -> acc.push(Handle({ ..h, body: unread_dropped_in(h.body, read) })),
+      _ -> acc.push(i),
+    })
 
 fn arg_names(a: Arg, id: Int) -> Bool = match a { AVar(v) -> v.id == id, _ -> false }
 
@@ -519,24 +586,6 @@ pub fn unsaid(t: Type) -> Bool =
     TyNominal(x) -> x.fields.any(|f: Field| unsaid(f.ty)),
   }
 
-/// `st` without the instruction that makes `v` by holding a variable held as `to` otherwise, where
-/// nothing after it names `v` and no slot does, and that variable: `v` was made for one reader,
-/// which takes the variable instead.
-pub fn unpacked(st: Lowering, v: Var, to: Rep) -> Option<Lowered> = {
-  let k = after_naming(st.insts, v.id);
-  match st.insts.at(k - 1) {
-    Some(Let(x)) -> match x.val {
-      Pack(p) -> match p.arg {
-        AVar(s) -> if x.var != v || s.rep != to || slot_named(st, v) { None } else {
-          Some({ st: { ..st, insts: st.insts.take(k - 1).concat(st.insts.drop(k)) }, arg: AVar(s) })
-        },
-        _ -> None,
-      },
-      _ -> None,
-    },
-    _ -> None,
-  }
-}
 
 /// `args` each handed over as a word.
 pub fn as_words(st: Lowering, args: List<Arg>, at: Span) -> { st: Lowering, args: List<Arg> } =
@@ -637,10 +686,11 @@ test "a word just opened to its type and handed straight back as a word is the w
   let opened = bound_as(started([w]), int, RInt, Pack({ arg: AVar(w), to: RInt }), dummy_span());
   let back = handed(opened, RWord, dummy_span());
   assert_eq(back.arg, AVar(w));
-  assert_eq(back.st.insts, []);
-  // A value a slot names may be read again, so it stays and is packed back.
+  // The opening stays for any other reader, and goes where nothing reads it.
+  assert_eq(back.st.insts, opened.st.insts);
+  assert_eq(unread_packs_dropped(back.st.insts), []);
   let named = { ..opened, st: { ..opened.st, env: opened.st.env.insert(1, opened.arg) } };
-  assert(handed(named, RWord, dummy_span()).arg != AVar(w), None);
+  assert_eq(handed(named, RWord, dummy_span()).arg, AVar(w));
   // Held back as another representation than the word it came from, it is packed.
   let byte = RNum({ bits: 8, signed: false });
   assert(handed(opened, byte, dummy_span()).arg != AVar(w), None)
