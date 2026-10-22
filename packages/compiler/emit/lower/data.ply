@@ -8,16 +8,17 @@
 import syntax.parsing (Span)
 import check.types (Type, TyCon, TyFn, TyRecord, TyNominal, Field)
 import emit.typing (unknown_type)
-import emit.reps (Ctors, SumCtor, open_vars, ctor_fields_at)
+import emit.reps (Ctors, SumCtor, open_vars, ctor_fields_at, laid_known)
 import emit.c (sorted_names)
 import emit.answer (Layout)
 import emit.layout (SumLaid, Boxed, words, tag_bits)
 import emit.tir (Rep, RWord, RFlat, RSum, RUnit, Leaf, Var, Arg, AVar, AInt, AZero, Make, MRecord,
-                 MCase, Get, Gathered, PLeaf, PNamed, PField, Data, rep_of_arg)
+                 MCase, Get, Gathered, Updated, FieldSet, PLeaf, PNamed, PField, Data, rep_of_arg)
 import emit.lower.setting (ctor_named, ctor_sum)
 import emit.lower.held (held_as, leaf_span, leaf_spans, leaves_within, field_type, field_types,
                         field_offsets, case_index, leaf_type, laid_leaves, laid_held)
-import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, filed, unfiled, noted)
+import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, filed, unfiled, noted,
+                        unpacked)
 
 /// Constructor `name`, written at `ctor_at`, applied to `args` by the call at `at`, made at the type
 /// the checker filed for the constructor.
@@ -303,18 +304,27 @@ fn names_of(ty: Type, written: List<Bytes>) -> List<Bytes> =
 /// Field `name` of `base`, held as its type says, borrowed: a flat record's leaves, or the words at
 /// its offset in the box a record's word is; no value for a field of no words; or, where a type
 /// variable leaves the layout open, read by name, a placeholder no printer sees.
-pub fn field(cx: Context, base: Lowered, name: Bytes, at: Span) -> Lowered =
-  match base.arg {
+pub fn field(cx: Context, base: Lowered, name: Bytes, at: Span) -> Lowered = {
+  // A record read out of the record around it and boxed for this read alone is read where it lies.
+  let lies = match base.arg {
+    AVar(b) -> match ((b.rep, laid_leaves(cx.setting.ctors, b.ty))) {
+      (RWord, Some(ls)) -> match unpacked(base.st, b, RFlat(ls)) { Some(u) -> u, None -> base },
+      _ -> base,
+    },
+    _ -> base,
+  };
+  match lies.arg {
     AVar(b) -> {
       let fty = match field_type(b.ty, name) { Some(t) -> t, None -> unknown_type() };
-      match read_in(cx, base.st, b, lay_of(cx, b), name, fty, held_as(cx.setting, fty), at) {
-        None -> refuse(base.st, Data, b"a field its record does not hold: ".concat(name)),
+      match read_in(cx, lies.st, b, lay_of(cx, b), name, fty, held_as(cx.setting, fty), at) {
+        None -> refuse(lies.st, Data, b"a field its record does not hold: ".concat(name)),
         Some(r) -> r,
       }
     },
-    AZero(RUnit) -> { st: base.st, arg: AZero(RUnit) },
-    _ -> refuse(base.st, Data, b"a field of a value that is no record: ".concat(name)),
+    AZero(RUnit) -> { st: lies.st, arg: AZero(RUnit) },
+    _ -> refuse(lies.st, Data, b"a field of a value that is no record: ".concat(name)),
   }
+}
 
 /// Where the fields of a record lie, read once for every field read out of it: each field's span
 /// of a flat record's leaves; each field's first word in the box a record's word is; nothing for a
@@ -435,31 +445,37 @@ pub fn updated(
               m.insert(f.name, f.arg));
             let kept = copies.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true));
             let lay = lay_of(cx, b);
-            let parts = fields_of(ty).fold(
-              { st: st, parts: [], missing: false },
-              |acc: { st: Lowering, parts: List<Arg>, missing: Bool }, f: Field| {
-                let laid = laid_held(cx.setting.ctors, f.ty);
-                match given.get(f.name) {
-                  Some(a) -> {
-                    let h = handed({ st: acc.st, arg: a }, laid, at);
-                    { ..acc, st: h.st, parts: acc.parts.push(h.arg) }
-                  },
-                  None -> if !kept.contains(f.name) { { ..acc, missing: true } } else {
-                    match read_in(cx, acc.st, b, lay, f.name, f.ty, laid, at) {
-                      None -> { ..acc, missing: true },
-                      Some(r) -> { ..acc, st: r.st, parts: acc.parts.push(r.arg) },
-                    }
-                  },
-                }
-              },
-            );
-            if parts.missing {
-              refuse(
-                st,
-                Data,
-                b"an update of a field its base does not hold where its type lays it",
-              )
-            } else { held_made(record_made(parts.st, ty, ls, parts.parts, at), rep, at) }
+            // A record held as its box is written in its box, or a copy of it: only the fields set.
+            let in_place = rep == RWord && b.rep == RWord
+              && laid_known(cx.setting.ctors, b.ty) == laid_known(cx.setting.ctors, ty)
+              && fields_of(ty).all(|f: Field| given.contains(f.name) || kept.contains(f.name));
+            if in_place { written_over(cx, st, b, ty, sets, at) } else {
+              let parts = fields_of(ty).fold(
+                { st: st, parts: [], missing: false },
+                |acc: { st: Lowering, parts: List<Arg>, missing: Bool }, f: Field| {
+                  let laid = laid_held(cx.setting.ctors, f.ty);
+                  match given.get(f.name) {
+                    Some(a) -> {
+                      let h = handed({ st: acc.st, arg: a }, laid, at);
+                      { ..acc, st: h.st, parts: acc.parts.push(h.arg) }
+                    },
+                    None -> if !kept.contains(f.name) { { ..acc, missing: true } } else {
+                      match read_in(cx, acc.st, b, lay, f.name, f.ty, laid, at) {
+                        None -> { ..acc, missing: true },
+                        Some(r) -> { ..acc, st: r.st, parts: acc.parts.push(r.arg) },
+                      }
+                    },
+                  }
+                },
+              );
+              if parts.missing {
+                refuse(
+                  st,
+                  Data,
+                  b"an update of a field its base does not hold where its type lays it",
+                )
+              } else { held_made(record_made(parts.st, ty, ls, parts.parts, at), rep, at) }
+            }
           },
           None -> {
             let names = names_of(
@@ -491,3 +507,31 @@ pub fn updated(
     },
     (_, Some(_)) -> refuse(st, Data, b"an update of a value that is no record"),
   }
+
+/// `{ ..b, sets }` of type `ty`, `b` the box a record of its layout is held as: the box, or a copy
+/// of it, with each field `sets` names written at its word, laid as the box lays it.
+fn written_over(
+  cx: Context,
+  st: Lowering,
+  b: Var,
+  ty: Type,
+  sets: List<{ name: Bytes, arg: Arg }>,
+  at: Span,
+) -> Lowered = {
+  let offsets = field_offsets(cx.setting, ty);
+  let written = sets.fold(
+    { st: st, sets: [] },
+    |acc: { st: Lowering, sets: List<FieldSet> }, f: { name: Bytes, arg: Arg }| {
+      let fty = match field_type(ty, f.name) { Some(t) -> t, None -> unknown_type() };
+      let laid = laid_held(cx.setting.ctors, fty);
+      match offsets.get(f.name) {
+        Some(o) -> if laid == RUnit { acc } else {
+          let h = handed({ st: acc.st, arg: f.arg }, laid, at);
+          { st: h.st, sets: acc.sets.push({ at: o, ty: fty, arg: h.arg }) }
+        },
+        None -> acc,
+      }
+    },
+  );
+  bound_as(written.st, ty, RWord, Updated({ of: b, sets: written.sets }), at)
+}
