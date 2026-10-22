@@ -36,10 +36,60 @@ import emit.answer (Exact)
 import emit.lower.scalars (literal)
 import emit.lower.data (field, recorded_as)
 
-/// The externs a body calls over its arguments' encoding, which the runtime decodes, answers as it
-/// always has, and encodes the answer of: those whose signatures hold a record, a list or a sum.
+/// The externs a body calls over its arguments' encoding whatever type it calls them at, which the
+/// runtime decodes, answers as it always has, and encodes the answer of. Any other builtin the
+/// runtime answers is called so where its signature `laid_out_here` at the types it is called at.
 pub fn encoded_externs() -> List<Bytes> =
   [b"assert_eq", b"sqlite_run", b"Secret::private_key", b"Secret::rsa_jwk"]
+
+/// Whether a value of `ty` holds a sum or a record, which emitted code lays out itself and the
+/// runtime reads and makes only through their encoding.
+pub fn laid_out_here(ctors: Ctors, ty: Type) -> Bool =
+  match ty {
+    TyCon(c) -> ctors.sums.contains(c.name) || c.args.any(|a: Type| laid_out_here(ctors, a)),
+    TyRecord(_) -> true,
+    TyNominal(_) -> true,
+    _ -> false,
+  }
+
+/// Extern `name` called on `args` over their encoding, as `by_encoding` calls it; in a body generic
+/// over its types, a call settled in the specialisations its callers settle. `observe` is the
+/// identity through that crossing, which no C compiler sees through. `callee` is where its name is
+/// written, which the types it is called at are filed under.
+pub fn over_encoding(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  callee: Span,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  match builtin_at(cx.setting, filed(cx, callee), name) {
+    None -> refuse(st, Handling, b"an extern called over its encoding at no type: ".concat(name)),
+    Some(types) -> if !types.params.push(types.ret).all(settled) {
+      bound(
+        cx,
+        types.params.push(types.ret).fold(st, |s: Lowering, t: Type|
+          type_vars(t).fold(s, |n: Lowering, v: Int| noted(n, { var: v, reads: Exact }))),
+        types.ret,
+        Op({
+          op: OHandle(Unsettled(name)),
+          args: args,
+          uses: { takes: args.map(|_: Arg| false), owned: true, fails: true, stops: false },
+        }),
+        at,
+      )
+    } else if name == b"observe" {
+      let at_type = called_at(cx, callee, args);
+      match args {
+        [x] -> {
+          let e = encoded(cx, st, x, at_type, false, at);
+          decoded(cx, e.st, e.arg, at_type, at)
+        },
+        _ -> refuse(st, Handling, b"`observe` of other than one value"),
+      }
+    } else { by_encoding(cx, st, name, args, callee, at) },
+  }
 
 /// Whether a call of builtin `name` is lowered here: a crossing native, a part of a crossing root,
 /// an encoding or a decoding, `observe`, or an extern called over its arguments' encoding.
@@ -98,33 +148,7 @@ pub fn crossed(
       _ -> refuse(st, Handling, b"a decoding of other than one byte string"),
     }
   } else if name == b"observe" || encoded_externs().contains(name) {
-    match builtin_at(cx.setting, filed(cx, callee), name) {
-      None -> refuse(st, Handling, b"an extern called over its encoding at no type: ".concat(name)),
-      Some(types) -> if !types.params.push(types.ret).all(settled) {
-        // A body generic over the types crosses only in the specialisations its callers settle.
-        bound(
-          cx,
-          types.params.push(types.ret).fold(st, |s: Lowering, t: Type|
-            type_vars(t).fold(s, |n: Lowering, v: Int| noted(n, { var: v, reads: Exact }))),
-          types.ret,
-          Op({
-            op: OHandle(Unsettled(name)),
-            args: args,
-            uses: { takes: args.map(|_: Arg| false), owned: true, fails: true, stops: false },
-          }),
-          at,
-        )
-      } else if name == b"observe" {
-        // The identity through the runtime's crossing, which no C compiler sees through.
-        match args {
-          [x] -> {
-            let e = encoded(cx, st, x, at_type, false, at);
-            decoded(cx, e.st, e.arg, at_type, at)
-          },
-          _ -> refuse(st, Handling, b"`observe` of other than one value"),
-        }
-      } else { by_encoding(cx, st, name, args, callee, at) },
-    }
+    over_encoding(cx, st, name, args, callee, at)
   } else {
     match machine_named(name) {
       Some(m) -> machine(cx, st, m, args, at_type, at),
