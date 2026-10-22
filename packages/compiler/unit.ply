@@ -25,7 +25,7 @@ import emit.keys (RootKey, Named, At, Written, Test, Cases, Clause, Stored, Ente
                   entry_name)
 import store.kept (Record, kept_records, with_kept)
 import emit
-import emit (emit_roots_answer)
+import emit.lend (Handing, handed_from)
 import emit.reps (Ctors, laid_vars, has_vars, held_apart, ctor_sums, ctors_of, type_vars,
                   layout_key, no_ctors)
 import front.rows (Dump, EmitterRoot, EmitterCtor, CtorRow, KeyRow, ModuleRow, OrdinalRow,
@@ -41,13 +41,14 @@ import expand.rewrite (Elaborated, elaborated_natives)
 import emit.layout (Intrinsic, Layouts, intrinsics, layouts)
 import emit.print.head (head_part)
 import std.prelude_source
-import front.interface (read_key, sized, stubbed)
+import front.interface (read_key, sized)
 import expand.embed (EmbedAt, embed_file)
 import check.resolve.scopes (PackageDeps)
 import check.resolve.tables (Diag, Label, ParsedModule, error_with_labels)
 import std.bin
 import std.list
 import std.graph
+import std.pace (paced)
 import std.bytes (u64_le, hex_digit, ascii_of_int)
 import std.fs
 import std.fs (fs)
@@ -394,8 +395,10 @@ pub fn identity_of(definitions: Bytes, roots: List<Bytes>) -> Bytes / {abort.rai
   )
 
 /// The definitions an emitter's answer is a function of besides the root it answers for: the one
-/// that asks the emitter, and the one that makes the front end's answer it is asked over.
-pub fn emitter_roots() -> List<Bytes> = [b"unit.emitter_answers", b"front.seam.view_dump"]
+/// that reads the program the emitter lowers from, the one that asks the emitter, and the one that
+/// makes the front end's answer it is asked over.
+pub fn emitter_roots() -> List<Bytes> =
+  [b"unit.scope_over", b"unit.answers_in", b"front.seam.view_dump"]
 
 pub fn emitter_identity(definitions: Bytes) -> Bytes / {abort.raise} =
   identity_of(definitions, emitter_roots())
@@ -1522,40 +1525,6 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program / {abort.raise} = {
 
 fn text_at(program: Program, index: Int) -> Option<Bytes> = program.sources.at(index)
 
-/// The home modules each of `modules` calls a function of a type of with no import, as the front
-/// end pulled them for it ([`homes_called`]): the checker names each such function through a binder
-/// of its home, which no import of the module reaches.
-fn homes_called_by(program: Program, modules: List<Bytes>) -> List<Bytes> / {abort.raise} = {
-  let texts = program.modules.fold(Map::new(), |acc: Map<Bytes, Bytes>, m: ModuleRow|
-    match text_at(program, m.index) { Some(t) -> acc.insert(m.name, t), None -> acc });
-  let declared = homes_declaring(|h: Bytes| texts.get(h));
-  modules.fold([], |acc: List<Bytes>, m: Bytes|
-    match texts.get(m) {
-      Some(t) -> acc.concat(homes_called(m, parsing::start(t).input, || declared)),
-      None -> acc,
-    })
-}
-
-/// `modules` and every module they import, directly or not: all the emitter reads to lower a body
-/// of one of them.
-fn imported(program: Program, modules: List<Bytes>) -> Map<Bytes, Bool> / {abort.raise} = {
-  let start = ordered(modules);
-  iterate(
-    { seen: Map::new(), stack: start },
-    start.len() + program.imports.fold(1, |n: Int, _: Bytes, xs: List<Bytes>| n + xs.len()),
-    |s: { seen: Map<Bytes, Bool>, stack: List<Bytes> }|
-      match s.stack {
-        [] -> Stop(s.seen),
-        [m, ..rest] -> if s.seen.contains(m) { Continue({ seen: s.seen, stack: rest }) } else {
-          Continue({
-            seen: s.seen.insert(m, true),
-            stack: rest.concat(match program.imports.get(m) { Some(xs) -> xs, None -> [] }),
-          })
-        },
-      },
-  )
-}
-
 /// What a kept answer is a function of beyond the emitter and the runtime: the root's name, the key
 /// the front end gave it, the text it is written in, since its sites are offsets into that text, and
 /// what its module embeds, which that text's calls are written out as; for a specialisation, the
@@ -1834,63 +1803,80 @@ fn program_ctors(dump: Dump, ctors: List<Ctor>) -> Ctors =
     ctor_sums(dump.ctors),
   )
 
-/// What the emitter answers for `missed`: entered once, over the modules those roots are in, the
-/// ones whose lambdas they run, the home modules those call functions of types of, and the ones
-/// all of those import. `published` are the handings the unit holds, which a call of a definition
-/// emitted apart is written against.
-fn emitter_answers(
+/// The emitter's scope over every module of `p`, each whole, reading what the check filed of the
+/// bodies `offered` reads (`emit.scope_of`): built once, when a walk first asks the emitter for a
+/// root.
+fn scope_over(
   runtime: Runtime,
   dump: Dump,
   p: Program,
   ctors: List<Ctor>,
-  missed: List<RootKey>,
-  published: List<Published>,
-) -> List<RootAnswer> / {abort.raise} = {
-  let lowered = modules_lowered(missed);
-  let needed = imported(p, lowered.keys().concat(homes_called_by(p, lowered.keys())));
-  let placed = range(0, p.modules.len()).filter(|i: Int| needed.contains(p.modules.get(i).name));
-  let names = placed.map(|i: Int| p.modules.get(i).name);
-  // A module no wanted root is in is read for its declarations, its rows standing for its bodies.
-  let text_of = |m: ModuleRow| {
-    let text = match text_at(p, m.index) { Some(t) -> t, None -> b"" };
-    if lowered.contains(m.name) { text } else { stubbed(text, m.cuts) }
-  };
-  emit_roots_answer(
-    names,
-    placed.map(|i: Int| text_of(p.modules.get(i))),
+  offered: List<RootKey>,
+) -> Result<emit::Scope, Bytes> / {abort.raise} = {
+  let names = p.modules.map(|m: ModuleRow| m.name);
+  emit::scope_of(
+    emit::zip_sources(
+      names,
+      p.modules.map(|m: ModuleRow| match text_at(p, m.index) { Some(t) -> t, None -> b"" }),
+    ),
     program_ctors(dump, ctors),
     runtime.natives.map(|n: Native| n.name),
-    missed,
+    true,
+    offered,
     if dump.packages.len() == 0 { [{ prefix: b"", deps: [] }] } else { dump.packages },
-    if dump.packages.len() == 0 { names.map(|_: Bytes| 0) }
-    else { placed.map(|i: Int| match dump.module_packages.at(i) { Some(k) -> k, None -> 0 }) },
+    if dump.packages.len() == 0 { names.map(|_: Bytes| 0) } else {
+      range(0, names.len()).map(|i: Int|
+        match dump.module_packages.at(i) { Some(k) -> k, None -> 0 })
+    },
     dump.embeds,
     dump.rows,
     dump.walked,
-    published,
   )
 }
 
-/// The calls a place's work is dealt over, run at once, about as many as the cores. Each repeats
-/// the front end's work over its modules' imports, so more of them lose more than they gain.
+/// What the emitter answers in `scope` for `roots`, each written against `handed` where it calls a
+/// definition answered apart: each refused alike where the program lowers nothing.
+fn answers_in(
+  scope: Result<emit::Scope, Bytes>,
+  roots: List<RootKey>,
+  handed: Map<RootName, Handing>,
+) -> List<RootAnswer> / {abort.raise} =
+  match scope {
+    Err(why) ->
+      roots.fold(Map::new(), |acc: Map<RootName, Bool>, k: RootKey|
+        acc.insert(root_name(k), true)).keys(
+      ).map(|n: RootName| { name: n, answer: Refused({ why: why }) }),
+    Ok(s) -> emit::answered(s, roots, handed),
+  }
+
+/// The lists an ask of the emitter is dealt over, answered at once: about as many as the cores.
 fn pieces() -> Int = 8
 
 type Piece = { weight: Int, roots: List<RootKey> }
 
-/// `missed` as at most `pieces()` lists that lower about as much each: the longest module first onto
-/// the lightest list, and a module's roots together (`dealt_module`), since the emitter groups what
-/// one call wants.
+/// What a root written for a type weighs beside a definition, which weighs the length of its text:
+/// about a short definition's.
+fn written_weight() -> Int = 256
+
+/// `missed` as at most `pieces()` lists that lower about as much each, the heaviest first onto the
+/// lightest list: a module's roots together (`dealt_module`), since the emitter forms a loop of them
+/// in one call, weighing the text they are written in, and each root written for a type alone.
 fn dealt(p: Program, missed: List<RootKey>) -> List<List<RootKey>> / {abort.raise} = {
-  let by_module = missed.fold(Map::new(), |acc: Map<Bytes, List<RootKey>>, k: RootKey| {
-    let m = dealt_module(k);
-    acc.insert(m, List::push(match acc.get(m) { Some(xs) -> xs, None -> [] }, k))
-  });
-  let lengths = p.modules.fold(Map::new(), |acc: Map<Bytes, Int>, m: ModuleRow|
-    acc.insert(m.name, match text_at(p, m.index) { Some(t) -> t.len(), None -> 0 }));
-  let weighed = by_module.fold([], |acc: List<Piece>, m: Bytes, roots: List<RootKey>|
-    acc.push({ weight: match lengths.get(m) { Some(n) -> n, None -> 0 }, roots: roots }));
-  let longest_first = weighed.sort_by(|a: Piece, b: Piece| a.weight >= b.weight);
-  let dealt = longest_first.fold([], |acc: List<Piece>, m: Piece|
+  let weight = |k: RootKey|
+    match p.roots.get(sited_as(k)) { Some(r) -> r.at.end - r.at.start, None -> written_weight() };
+  let by_module = missed.fold(Map::new(), |acc: Map<Bytes, Piece>, k: RootKey|
+    match k {
+      Written(_) -> acc,
+      _ -> {
+        let m = dealt_module(k);
+        let had = match acc.get(m) { Some(x) -> x, None -> { weight: 0, roots: [] } };
+        acc.insert(m, { weight: had.weight + weight(k), roots: had.roots.push(k) })
+      },
+    });
+  let weighed = missed.fold(by_module.values(), |acc: List<Piece>, k: RootKey|
+    match k { Written(_) -> acc.push({ weight: weight(k), roots: [k] }), _ -> acc });
+  let heaviest_first = weighed.sort_by(|a: Piece, b: Piece| a.weight >= b.weight);
+  let dealt = heaviest_first.fold([], |acc: List<Piece>, m: Piece|
     if acc.len() < pieces() { acc.push(m) } else {
       let lightest = range(0, acc.len()).fold(0, |best: Int, i: Int|
         if acc.get(i).weight < acc.get(best).weight { i } else { best });
@@ -1903,33 +1889,42 @@ fn dealt(p: Program, missed: List<RootKey>) -> List<List<RootKey>> / {abort.rais
   dealt.map(|piece: Piece| piece.roots)
 }
 
-/// What the emitter answers for every list of `pieces` from `lo` up to `hi`, each list a call of its
-/// own and the calls at once: a root's answer is the same whichever call asks for it. `room` is the
-/// halvings left, and 64 take any length to one.
+/// What the emitter answers in `scope` for every list of `pieces` from `lo` up to `hi`, each list
+/// asked apart and the lists at once, each written against `handed`: a root's answer is the same
+/// whichever list asks for it. `room` is the halvings left, and 64 take any length to one.
 fn answers_at_once(
-  runtime: Runtime,
-  dump: Dump,
-  p: Program,
-  ctors: List<Ctor>,
+  scope: Result<emit::Scope, Bytes>,
   pieces: List<List<RootKey>>,
   lo: Int,
   hi: Int,
   room: Int,
-  published: List<Published>,
+  handed: Map<RootName, Handing>,
 ) -> List<RootAnswer> / {abort.raise} =
   if hi - lo <= 1 {
-    match pieces.at(lo) {
-      Some(roots) -> emitter_answers(runtime, dump, p, ctors, roots, published),
-      None -> [],
-    }
+    match pieces.at(lo) { Some(roots) -> answers_in(scope, roots, handed), None -> [] }
   } else if room <= 0 { panic("more halvings than a length has") } else {
     let mid = lo + (hi - lo) / 2;
     let halves = parallel {
-      answers_at_once(runtime, dump, p, ctors, pieces, lo, mid, room - 1, published),
-      answers_at_once(runtime, dump, p, ctors, pieces, mid, hi, room - 1, published),
+      answers_at_once(scope, pieces, lo, mid, room - 1, handed),
+      answers_at_once(scope, pieces, mid, hi, room - 1, handed),
     };
     halves._0.concat(halves._1)
   }
+
+/// `handed` with the handing each body of `answers` publishes, as the lending reads it.
+fn handed_with(
+  handed: Map<RootName, Handing>,
+  answers: Map<RootName, Answer>,
+) -> Map<RootName, Handing> =
+  answers.fold(handed, |acc: Map<RootName, Handing>, _: RootName, a: Answer|
+    match a {
+      Body(b) ->
+        handed_from(b.tables.handings).fold(
+          acc,
+          |m: Map<RootName, Handing>, n: RootName, h: Handing| m.insert(n, h),
+        ),
+      Refused(_) -> acc,
+    })
 
 /// Each definition's handing as the bodies of `answers` publish it, over `before`: what every
 /// caller's code is written against.
@@ -2042,84 +2037,298 @@ fn places_of(p: Program) -> Map<Bytes, Int> / {abort.raise} = {
 fn dealt_module(k: RootKey) -> Bytes / {abort.raise} =
   match key_lent(k).at(0) { Some(f) -> module_of(f.owner), None -> module_of(k) }
 
-/// How far `answers_settled` has come: the answers it has had, the kept answers still standing, how
-/// many roots it has asked the emitter for, the digests of keys the store is known to hold, and the
-/// roots of the place it is at not yet asked for.
-type Settling = {
+/// What asking the emitter for some roots came to: their answers, and what the emitter holds for the
+/// next ask.
+type Asked<s> = { held: s, answers: List<RootAnswer> }
+
+/// How far a unit's walk of its program has come: each root's answer and key; the handing each
+/// answered definition publishes, as answers publish it and as the lending reads it; how many answers
+/// it took kept, how many roots it asked the emitter for and how many answers are refusals; the roots
+/// it found beyond those offered; the digests of the keys the store is known to hold; the needs and
+/// the parameters called as functions of the generic bodies whose calls it settled, closed over the
+/// calls they make; the roots answered whose calls it has not read, and those whose generic calls it
+/// has not settled; and what the emitter holds.
+type Walk<s> = {
+  answers: Map<RootName, Answer>,
+  keys: Map<RootName, RootKey>,
+  held: Map<RootName, Published>,
+  handed: Map<RootName, Handing>,
+  kept: Int,
+  asked: Int,
+  refused: Int,
+  added: List<RootKey>,
+  known: Map<Bytes, Bool>,
+  needs: Map<RootName, List<Need>>,
+  called: Map<RootName, List<Int>>,
+  unread: List<RootName>,
+  unsettled: List<RootName>,
+  emitter: s,
+}
+
+/// What one place of a unit's walk came to: the place, the roots it answered, how many of those an
+/// earlier run kept, how many it asked the emitter for, how many were refused, the steps it took, each
+/// answering what the one before found, and the clock as it began and ended.
+pub type PlaceTally = {
+  place: Int,
+  roots: Int,
+  kept: Int,
+  asked: Int,
+  refused: Int,
+  steps: Int,
+  began: Int,
+  ended: Int,
+}
+
+/// The answer to each root of `offered`, and to each root those answers reach, place by place
+/// (`places_of`), the emitter asked through `ask`, which starts from `emitter`. At each place its
+/// offered roots are answered as `answered_now` answers them, and then each root their answers name
+/// that no answer holds: a root written for a type, the generic body of a definition called
+/// generically, and, once every such body is in, the root each generic call settles on, until none
+/// is new. Each callee of a definition is answered at an earlier place or with it, so every body is
+/// written once, against its callees' final handings; a root a place finds takes its definition's
+/// handing or a fixed one. `types` is what a root written for a type reads of the program's types
+/// (`types_material`). Each place is told to `phases` as it ends.
+fn walked<s | e>(
+  p: Program,
+  types: Bytes,
+  program: Ctors,
+  offered: List<RootKey>,
+  read: (Bytes) -> Option<Bytes> / e,
+  keep: (List<Record>) -> Unit / e,
+  phases: Option<{ now: () -> Int / e, told: (PlaceTally) -> Unit / e }>,
+  emitter: s,
+  ask: (s, List<RootKey>, Map<RootName, Handing>) -> Asked<s> / {abort.raise | e},
+) -> Walk<s> / {abort.raise | e} = {
+  let places = places_of(p);
+  let place = |k: RootKey| match places.get(dealt_module(k)) { Some(l) -> l, None -> 0 };
+  let at = offered.fold(Map::new(), |acc: Map<Int, List<RootKey>>, k: RootKey| {
+    let l = place(k);
+    acc.insert(l, List::push(match acc.get(l) { Some(ks) -> ks, None -> [] }, k))
+  });
+  let last = offered.fold(0, |m: Int, k: RootKey| if place(k) > m { place(k) } else { m });
+  range(0, last + 1).fold(
+    {
+      answers: Map::new(),
+      keys: Map::new(),
+      held: Map::new(),
+      handed: Map::new(),
+      kept: 0,
+      asked: 0,
+      refused: 0,
+      added: [],
+      known: Map::new(),
+      needs: Map::new(),
+      called: Map::new(),
+      unread: [],
+      unsettled: [],
+      emitter: emitter,
+    },
+    |w: Walk<s>, l: Int|
+      match at.get(l) {
+        None -> w,
+        Some(roots) ->
+          told_place(phases, l, w, || place_walked(p, types, program, w, roots, read, keep, ask)),
+      },
+  )
+}
+
+/// `run`, the walk of place `l` on from `w`, told to `phases` as it ends.
+fn told_place<s | e>(
+  phases: Option<{ now: () -> Int / e, told: (PlaceTally) -> Unit / e }>,
+  l: Int,
+  w: Walk<s>,
+  run: () -> { walk: Walk<s>, steps: Int } / {abort.raise | e},
+) -> Walk<s> / {abort.raise | e} =
+  match phases {
+    None -> run().walk,
+    Some(t) -> {
+      let began = t.now();
+      let r = run();
+      t.told({
+        place: l,
+        roots: r.walk.keys.len() - w.keys.len(),
+        kept: r.walk.kept - w.kept,
+        asked: r.walk.asked - w.asked,
+        refused: r.walk.refused - w.refused,
+        steps: r.steps,
+        began: began,
+        ended: t.now(),
+      });
+      r.walk
+    },
+  }
+
+/// `w` with each of `roots` answered, and each root those answers reach (`found`, `settling`), step
+/// after step until a step finds none or 64 steps have passed; and how many steps it took.
+fn place_walked<s | e>(
+  p: Program,
+  types: Bytes,
+  program: Ctors,
+  w: Walk<s>,
+  roots: List<RootKey>,
+  read: (Bytes) -> Option<Bytes> / e,
+  keep: (List<Record>) -> Unit / e,
+  ask: (s, List<RootKey>, Map<RootName, Handing>) -> Asked<s> / {abort.raise | e},
+) -> { walk: Walk<s>, steps: Int } / {abort.raise | e} =
+  iterate(
+    { walk: answered_now(p, types, w, roots, read, keep, ask), steps: 1 },
+    66,
+    |b: { walk: Walk<s>, steps: Int }| {
+      let named = found(b.walk);
+      let read_all = { ..b.walk, unread: [] };
+      // Only once every generic body is in are the needs closed, so no call settles on a part of them.
+      let next = if named.len() > 0 { { walk: read_all, more: named } }
+      else { settling(read_all, program) };
+      if next.more.len() == 0 || b.steps > 64 { Stop({ ..b, walk: next.walk }) } else {
+        let more = next.more.values();
+        let after = answered_now(p, types, next.walk, more, read, keep, ask);
+        Continue({ walk: { ..after, added: after.added.concat(more) }, steps: b.steps + 1 })
+      }
+    },
+  )
+
+/// Where `answered_now` is in asking the emitter: the answers the emitter gave, the kept answers
+/// still standing, how many roots it asked for, the digests of the keys the store is known to hold,
+/// the roots not yet asked for, and what the emitter holds.
+type Asking<s> = {
   fresh: Map<RootName, Answer>,
-  held: Map<RootName, Answer>,
+  kept: Map<RootName, Answer>,
   asked: Int,
   known: Map<Bytes, Bool>,
   pending: List<RootKey>,
+  emitter: s,
 }
 
-/// What the emitter answers for `ask`, and how many roots it was asked for, with `held` the answers
-/// in hand, each of a root `keys` holds, and `published` the handings of the rest. The roots are
-/// asked for place by place (`places_of`), a place's calls at once with the handings each earlier
-/// place published, so a body's every callee has its final handing before the body is written, and
-/// none is asked for twice. A kept answer of a place written against a handing that moved since is
-/// asked for again there, with its group. Each call's answers are handed to `kept` as they come
-/// back, with the digests of the keys the store is known to hold, which it answers grown.
-fn answers_settled<| e>(
-  runtime: Runtime,
-  dump: Dump,
+/// `w` with each of `roots` it holds no answer of answered: each kept answer read where it stands,
+/// the emitter asked through `ask` for the rest, each written against the handings `w` holds and
+/// those these answers publish. A kept answer written against a handing that has moved since is asked
+/// for again, as is every other one of a recursion group it leaves. What the emitter answers is kept
+/// through `keep` as it comes back, so a run that dies keeps what it was answered; a root it answers
+/// nothing for is refused as one it declined.
+fn answered_now<s | e>(
   p: Program,
-  ctors: List<Ctor>,
-  held: Map<RootName, Answer>,
-  published: Map<RootName, Published>,
-  ask: List<RootKey>,
-  keys: Map<RootName, RootKey>,
-  kept: (Map<RootName, Answer>, Map<Bytes, Bool>) -> Map<Bytes, Bool> / e,
-  known: Map<Bytes, Bool>,
-) -> { fresh: Map<RootName, Answer>, asked: Int } / {abort.raise | e} = {
-  let places = places_of(p);
-  let place = |k: RootKey| match places.get(dealt_module(k)) { Some(l) -> l, None -> 0 };
-  let held_at = |n: RootName| match keys.get(n) { Some(k) -> Some(place(k)), None -> None };
-  let last = held.keys().fold(
-    ask.fold(0, |m: Int, k: RootKey| if place(k) > m { place(k) } else { m }),
-    |m: Int, n: RootName| match held_at(n) { Some(l) -> if l > m { l } else { m }, None -> m },
+  types: Bytes,
+  w: Walk<s>,
+  roots: List<RootKey>,
+  read: (Bytes) -> Option<Bytes> / e,
+  keep: (List<Record>) -> Unit / e,
+  ask: (s, List<RootKey>, Map<RootName, Handing>) -> Asked<s> / {abort.raise | e},
+) -> Walk<s> / {abort.raise | e} = {
+  let keys = roots.fold(Map::new(), |acc: Map<RootName, RootKey>, k: RootKey|
+    if w.answers.contains(root_name(k)) { acc } else { acc.insert(root_name(k), k) });
+  let names = keys.keys();
+  let asked = names.fold(Map::new(), |acc: Map<RootName, Bool>, n: RootName| acc.insert(n, true));
+  let materials = keys.fold(Map::new(), |acc: Map<RootName, Bytes>, n: RootName, k: RootKey|
+    match root_material(p, types, k) { Some(m) -> acc.insert(n, m), None -> acc });
+  let looked = kept_answers(p.keys, materials, read);
+  let standing_now = standing(looked.answers, asked);
+  let stale = stale_of(standing_now, handings_held(w.held, standing_now), keys);
+  let kept = groups_whole(
+    stale.fold(standing_now, |m: Map<RootName, Answer>, k: RootKey| m.remove(root_name(k))),
+    names,
   );
-  let settled = range(0, last + 1).fold(
-    { fresh: Map::new(), held: held, asked: 0, known: known, pending: [] },
-    |s: Settling, l: Int|
-      iterate(
-        { ..s, pending: ask.filter(|k: RootKey| place(k) == l) },
-        s.held.len() + 2,
-        |t: Settling| {
-          let before = handings_held(handings_held(published, t.held), t.fresh);
-          let here = t.held.fold(Map::new(), |m: Map<RootName, Answer>, n: RootName, a: Answer|
-            if held_at(n) == Some(l) { m.insert(n, a) } else { m });
-          let stale = stale_of(here, before, keys);
-          let asking = t.pending.concat(stale);
-          if asking.len() == 0 { Stop(t) } else {
-            let pieces = dealt(p, asking);
-            let got = answers_of(
-              answers_at_once(
-                runtime,
-                dump,
-                p,
-                ctors,
-                pieces,
-                0,
-                pieces.len(),
-                64,
-                before.values(),
-              ),
-            );
-            Continue({
-              fresh: got.fold(t.fresh, |m: Map<RootName, Answer>, n: RootName, a: Answer|
-                m.insert(n, a)),
-              held: stale.fold(t.held, |m: Map<RootName, Answer>, k: RootKey|
-                m.remove(root_name(k))),
-              asked: t.asked + asking.len(),
-              known: kept(got, t.known),
-              pending: [],
-            })
-          }
-        },
-      ),
+  let missed = keys.values().filter(|k: RootKey| !kept.contains(root_name(k)));
+  let settled = iterate(
+    {
+      fresh: Map::new(),
+      kept: kept,
+      asked: 0,
+      known: looked.known.fold(w.known, |m: Map<Bytes, Bool>, d: Bytes, _: Bool| m.insert(d, true)),
+      pending: missed,
+      emitter: w.emitter,
+    },
+    kept.len() + 2,
+    |t: Asking<s>| {
+      let now = t.fresh.fold(t.kept, |m: Map<RootName, Answer>, n: RootName, a: Answer|
+        m.insert(n, a));
+      let moved = stale_of(t.kept, handings_held(w.held, now), keys);
+      let asking = t.pending.concat(moved);
+      if asking.len() == 0 { Stop(t) } else {
+        let got = ask(t.emitter, asking, handed_with(w.handed, now));
+        let answers = answers_of(got.answers);
+        let r = answers_kept(p.keys, materials, answers, t.known, read);
+        if r.records.len() > 0 { keep(r.records) };
+        Continue({
+          fresh: answers.fold(t.fresh, |m: Map<RootName, Answer>, n: RootName, a: Answer|
+            m.insert(n, a)),
+          kept: moved.fold(t.kept, |m: Map<RootName, Answer>, k: RootKey| m.remove(root_name(k))),
+          asked: t.asked + asking.len(),
+          known: r.known,
+          pending: [],
+          emitter: got.held,
+        })
+      }
+    },
   );
-  { fresh: settled.fresh, asked: settled.asked }
+  let answered = missed.fold(settled.fresh, |acc: Map<RootName, Answer>, k: RootKey|
+    if acc.contains(root_name(k)) { acc }
+    else { acc.insert(root_name(k), Refused({ why: unanswered_why() })) });
+  let all = answered.fold(settled.kept, |acc: Map<RootName, Answer>, n: RootName, a: Answer|
+    acc.insert(n, a));
+  let now = all.keys();
+  {
+    ..w,
+    answers: all.fold(w.answers, |acc: Map<RootName, Answer>, n: RootName, a: Answer|
+      acc.insert(n, a)),
+    keys: keys.fold(w.keys, |acc: Map<RootName, RootKey>, n: RootName, k: RootKey|
+      acc.insert(n, k)),
+    held: handings_held(w.held, all),
+    handed: handed_with(w.handed, all),
+    kept: w.kept + all.len() - answered.len(),
+    asked: w.asked + settled.asked,
+    refused: w.refused
+      + all.fold(0, |c: Int, _: RootName, a: Answer| match a { Refused(_) -> c + 1, Body(_) -> c }),
+    known: settled.known,
+    unread: w.unread.concat(now),
+    unsettled: w.unsettled.concat(now),
+    emitter: settled.emitter,
+  }
+}
+
+/// The roots the answers `w` has not read call that no answer holds: each root written for a type a
+/// body calls, and the generic body of each definition a body calls generically, whose needs settle
+/// those calls. Of a body's other calls none can be new: it calls a specialisation only as itself.
+fn found<s>(w: Walk<s>) -> Map<RootName, RootKey> =
+  w.unread.fold(Map::new(), |acc: Map<RootName, RootKey>, n: RootName|
+    match w.answers.get(n) {
+      Some(Body(b)) -> {
+        let written = b.tables.calls.fold(acc, |m: Map<RootName, RootKey>, c: RootKey|
+          match c {
+            Written(_) -> if w.answers.contains(root_name(c)) { m }
+            else { m.insert(root_name(c), c) },
+            _ -> m,
+          });
+        b.tables.generics.calls.fold(written, |m: Map<RootName, RootKey>, g: GenericCall|
+          if w.answers.contains(root_name(g.callee)) { m }
+          else { m.insert(root_name(g.callee), g.callee) })
+      },
+      _ -> acc,
+    })
+
+/// `w` with the generic calls of the answers it has not settled settled: the needs and the parameters
+/// called as functions of the generic bodies among them closed over the calls they make, and the root
+/// each call of a body the unit emits settles on, where no answer holds it. The first call in name
+/// order settling on a layout gives the root its type.
+fn settling<s>(
+  w: Walk<s>,
+  program: Ctors,
+) -> { walk: Walk<s>, more: Map<RootName, RootKey> } / {abort.raise} = {
+  let names = names_ordered(w.unsettled);
+  let bodies = generic_bodies(w.answers, w.keys, names);
+  let needs = needs_closed(bodies, w.needs);
+  let called = called_closed(bodies, w.called);
+  let more = names.fold(Map::new(), |acc: Map<RootName, RootKey>, n: RootName|
+    match w.answers.get(n) {
+      Some(Body(b)) -> if settled_by_its_callers(w.keys, n, b.tables, needs) { acc } else {
+        b.tables.generics.calls.fold(acc, |m: Map<RootName, RootKey>, g: GenericCall| {
+          let root = settled_root(g, needs, called, program);
+          let name = root_name(root);
+          if w.answers.contains(name) || m.contains(name) { m } else { m.insert(name, root) }
+        })
+      },
+      _ -> acc,
+    });
+  { walk: { ..w, needs: needs, called: called, unsettled: [] }, more: more }
 }
 
 // --- Values a build kept ----------------------------------------------------------
@@ -2185,13 +2394,13 @@ fn kept_body(ctors: Ctors, p: Program, b: Baked) -> Answer / {abort.raise} = {
 }
 
 /// The unit over `every` root offered: each one's answer taken from what an earlier run kept where it
-/// stands, the emitter entered once for the rest, what it answered kept for the next run, and the
-/// unit produced over all of it. `inputs` holds the bytes of each file `dump` says the program
-/// embeds, by digest. `read` reads a record of the store of answers `answers_store` names, and
-/// `keep` keeps a batch of them, each batch as the emitter answers it. A root the emitter answers
-/// nothing for is refused. `Err` names the roots whose handings still moved when the rounds ran out.
-/// A root `baked` names is held as that value in place of its body, which the emitter is not asked
-/// for. Each round is told to `phases` as it ends.
+/// stands, the emitter asked for the rest, in one scope over the program built when it is first
+/// asked, what it answered kept for the next run, and the unit produced over all of it. `inputs`
+/// holds the bytes of each file `dump` says the program embeds, by digest. `read` reads a record of
+/// the store of answers `answers_store` names, and `keep` keeps a batch of them, each batch as the
+/// emitter answers it. A root the emitter answers nothing for is refused. A root `baked` names is
+/// held as that value in place of its body, which the emitter is not asked for. Each place the unit
+/// walks is told to `phases` as it ends.
 pub fn emitted<| e>(
   runtime: Runtime,
   dump: Dump,
@@ -2201,7 +2410,7 @@ pub fn emitted<| e>(
   read: (Bytes) -> Option<Bytes> / e,
   keep: (List<Record>) -> Unit / e,
   baked: List<Baked> = [],
-  phases: Option<{ now: () -> Int / e, told: (RoundTally) -> Unit / e }> = None,
+  phases: Option<{ now: () -> Int / e, told: (PlaceTally) -> Unit / e }> = None,
 ) -> Result<Emission, Bytes> / {abort.raise | e} = {
   let p = program_of(dump, sources);
   let ctors = dump.emitter_ctors.map(|c: EmitterCtor| { name: c.name, arity: c.arity });
@@ -2214,9 +2423,21 @@ pub fn emitted<| e>(
   let entries = every.filter(|k: RootKey| entered_root(p, k)).map(Entered);
   let offered = every.filter(|k: RootKey| !values.contains(root_name(k))).concat(entries);
   let program = program_ctors(dump, ctors);
-  let first = told_round(phases, 1, ||
-    answered_round(runtime, dump, p, ctors, offered, Map::new(), read, keep));
-  let all = closed_rounds(runtime, dump, p, ctors, program, read, keep, phases, first, 64);
+  let all = walked(
+    p,
+    types_material(dump),
+    program,
+    offered,
+    read,
+    keep,
+    phases,
+    None,
+    |held: Option<Result<emit::Scope, Bytes>>, roots: List<RootKey>, handed: Map<RootName, Handing>| {
+      let scope = match held { Some(s) -> s, None -> scope_over(runtime, dump, p, ctors, offered) };
+      let pieces = dealt(p, roots);
+      { held: Some(scope), answers: answers_at_once(scope, pieces, 0, pieces.len(), 64, handed) }
+    },
+  );
   {
     let shared = alike(all.answers, all.keys);
     let unemitted = settled_only(all.answers, all.keys, closed_needs(all.answers, all.keys));
@@ -2267,187 +2488,27 @@ pub fn emitted<| e>(
   }
 }
 
-/// The answers to some roots by their names, the key of each by the same, and how many came from
-/// what an earlier run kept and how many were asked of the emitter: each kept answer read where it
-/// stands, the emitter entered for the rest, and what it answered kept for the next run.
-type Answered = {
-  answers: Map<RootName, Answer>,
-  keys: Map<RootName, RootKey>,
-  kept: Int,
-  asked: Int,
-  added: List<RootKey>,
-}
-
-/// What one round of the unit's answers came to: the roots it took, those an earlier run kept, those
-/// it asked the emitter for, those refused, and the clock as it began and ended.
-pub type RoundTally = {
-  round: Int,
-  roots: Int,
-  kept: Int,
-  asked: Int,
-  refused: Int,
-  began: Int,
-  ended: Int,
-}
-
-/// `run`, round `n` of a unit's answers, told to `phases` as it ends: what a build that tells its
-/// phases hands the unit, its clock and what it does as a round ends.
-fn told_round<| e>(
-  phases: Option<{ now: () -> Int / e, told: (RoundTally) -> Unit / e }>,
-  n: Int,
-  run: () -> Answered / {abort.raise | e},
-) -> Answered / {abort.raise | e} =
-  match phases {
-    None -> run(),
-    Some(t) -> {
-      let began = t.now();
-      let a = run();
-      t.told({
-        round: n,
-        roots: a.keys.len(),
-        kept: a.kept,
-        asked: a.asked,
-        refused: a.answers.fold(0, |c: Int, _: RootName, x: Answer|
-          match x { Refused(_) -> c + 1, Body(_) -> c }),
-        began: began,
-        ended: t.now(),
-      });
-      a
-    },
-  }
-
 /// The definition the root named `n` specialises, where `keys` holds it as a specialisation.
 fn specialising(keys: Map<RootName, RootKey>, n: RootName) -> Option<Bytes> =
   match keys.get(n) { Some(At(a)) -> Some(a.def), _ -> None }
 
-fn answered_round<| e>(
-  runtime: Runtime,
-  dump: Dump,
-  p: Program,
-  ctors: List<Ctor>,
-  roots: List<RootKey>,
-  published: Map<RootName, Published>,
-  read: (Bytes) -> Option<Bytes> / e,
-  keep: (List<Record>) -> Unit / e,
-) -> Answered / {abort.raise | e} = {
-  let keys = roots.fold(Map::new(), |acc: Map<RootName, RootKey>, k: RootKey|
-    acc.insert(root_name(k), k));
-  let names = keys.keys();
-  let asked = names.fold(Map::new(), |acc: Map<RootName, Bool>, n: RootName| acc.insert(n, true));
-  let types = types_material(dump);
-  let materials = keys.fold(Map::new(), |acc: Map<RootName, Bytes>, n: RootName, k: RootKey|
-    match root_material(p, types, k) { Some(m) -> acc.insert(n, m), None -> acc });
-  let looked = kept_answers(p.keys, materials, read);
-  let standing_now = standing(looked.answers, asked);
-  // A kept answer written against a handing that has moved since is asked for again, as is every
-  // other one of a recursion group it leaves.
-  let stale = stale_of(standing_now, handings_held(published, standing_now), keys);
-  let kept = groups_whole(
-    stale.fold(standing_now, |m: Map<RootName, Answer>, k: RootKey| m.remove(root_name(k))),
-    names,
-  );
-  let missed = keys.values().filter(|k: RootKey| !kept.contains(root_name(k)));
-  // Each call's answers are kept as they come back, so a run that dies keeps what it was answered.
-  let kept_now = |got: Map<RootName, Answer>, known: Map<Bytes, Bool>| {
-    let r = answers_kept(p.keys, materials, got, known, read);
-    if r.records.len() > 0 { keep(r.records) };
-    r.known
-  };
-  let settled = if missed.len() == 0 { { fresh: Map::new(), asked: 0 } } else {
-    answers_settled(runtime, dump, p, ctors, kept, published, missed, keys, kept_now, looked.known)
-  };
-  // A root the emitter answered nothing for is refused as one it declined: it never hides what was
-  // answered of the rest.
-  let answered = missed.fold(settled.fresh, |acc: Map<RootName, Answer>, k: RootKey|
-    if acc.contains(root_name(k)) { acc }
-    else { acc.insert(root_name(k), Refused({ why: unanswered_why() })) });
-  let all = answered.fold(kept, |acc: Map<RootName, Answer>, n: RootName, a: Answer|
-    acc.insert(n, a));
-  { answers: all, keys: keys, kept: all.len() - answered.len(), asked: settled.asked, added: [] }
-}
-
 /// Why a root is refused that the emitter was asked for and answered nothing for.
 fn unanswered_why() -> Bytes = b"the emitter answered nothing for it"
 
-/// `had` with each root its bodies reach answered too, round after round until none lacks one: a
-/// specialisation a body names, the generic body of each definition a body calls generically,
-/// whose needs settle those calls, and once every such body is in, the root each call of a body
-/// the unit emits settles on. `room` is the rounds left, of 64 after the first. A root a later round
-/// asks for takes or publishes no handing an earlier round's body was written against otherwise:
-/// specialisations and roots written for a type take theirs, and every definition is asked for
-/// first (`answers_settled`), so no round asks for a body again.
-fn closed_rounds<| e>(
-  runtime: Runtime,
-  dump: Dump,
-  p: Program,
-  ctors: List<Ctor>,
-  program: Ctors,
-  read: (Bytes) -> Option<Bytes> / e,
-  keep: (List<Record>) -> Unit / e,
-  phases: Option<{ now: () -> Int / e, told: (RoundTally) -> Unit / e }>,
-  had: Answered,
-  room: Int,
-) -> Answered / {abort.raise | e} = {
-  // Of a body's calls only a root written for a type can be new: it calls a specialisation only as itself.
-  let named = had.answers.fold(Map::new(), |acc: Map<RootName, RootKey>, _: RootName, a: Answer|
-    match a {
-      Body(b) -> {
-        let written_calls = b.tables.calls.fold(acc, |m: Map<RootName, RootKey>, c: RootKey|
-          match c {
-            Written(_) -> if had.answers.contains(root_name(c)) { m }
-            else { m.insert(root_name(c), c) },
-            _ -> m,
-          });
-        b.tables.generics.calls.fold(written_calls, |m: Map<RootName, RootKey>, g: GenericCall|
-          if had.answers.contains(root_name(g.callee)) { m }
-          else { m.insert(root_name(g.callee), g.callee) })
-      },
-      Refused(_) -> acc,
-    });
-  // Only once every generic body is in are the needs closed, so no call settles on a part of them.
-  let more = if named.len() > 0 { named } else {
-    let needs = closed_needs(had.answers, had.keys);
-    let called = closed_called(had.answers, had.keys);
-    let unemitted = settled_only(had.answers, had.keys, needs);
-    had.answers.fold(Map::new(), |acc: Map<RootName, RootKey>, n: RootName, a: Answer|
-      match a {
-        Body(b) -> if unemitted.contains(n) { acc } else {
-          b.tables.generics.calls.fold(acc, |m: Map<RootName, RootKey>, g: GenericCall| {
-            let root = settled_root(g, needs, called, program);
-            let name = root_name(root);
-            // The first call in name order settling on a layout gives the root its type.
-            if had.answers.contains(name) || m.contains(name) { m } else { m.insert(name, root) }
-          })
-        },
-        Refused(_) -> acc,
-      })
-  };
-  if more.len() == 0 || room <= 0 { had } else {
-    let r = told_round(phases, 66 - room, ||
-      answered_round(
-        runtime,
-        dump,
-        p,
-        ctors,
-        more.values(),
-        handings_held(Map::new(), had.answers),
-        read,
-        keep,
-      ));
-    let next = {
-      answers: r.answers.fold(had.answers, |acc: Map<RootName, Answer>, n: RootName, a: Answer|
-        acc.insert(n, a)),
-      keys: r.keys.fold(had.keys, |acc: Map<RootName, RootKey>, n: RootName, k: RootKey|
-        acc.insert(n, k)),
-      kept: had.kept + r.kept,
-      asked: had.asked + r.asked,
-      added: had.added.concat(more.values()),
-    };
-    closed_rounds(runtime, dump, p, ctors, program, read, keep, phases, next, room - 1)
-  }
-}
-
 // --- Generic calls ---------------------------------------------------------------
+
+/// The tables of each body of `answers` among `names` that is no specialisation, by name: a generic
+/// body, whose calls its specialisations' callers settle.
+fn generic_bodies(
+  answers: Map<RootName, Answer>,
+  keys: Map<RootName, RootKey>,
+  names: List<RootName>,
+) -> Map<RootName, Tables> =
+  names.fold(Map::new(), |acc: Map<RootName, Tables>, n: RootName|
+    match answers.get(n) {
+      Some(Body(b)) -> if specialising(keys, n) == None { acc.insert(n, b.tables) } else { acc },
+      _ -> acc,
+    })
 
 /// What each generic definition's code needs of its type arguments, closed over the calls its
 /// generic body makes: a callee's need of the layout of an argument is the caller's need of each
@@ -2456,30 +2517,47 @@ fn closed_rounds<| e>(
 fn closed_needs(
   answers: Map<RootName, Answer>,
   keys: Map<RootName, RootKey>,
+) -> Map<RootName, List<Need>> / {abort.raise} =
+  needs_closed(generic_bodies(answers, keys, answers.keys()), Map::new())
+
+/// `closed` with the needs of each body of `bodies` closed over the calls it makes, as
+/// `closed_needs` closes them, a callee outside `bodies` needing what `closed` holds of it.
+fn needs_closed(
+  bodies: Map<RootName, Tables>,
+  closed: Map<RootName, List<Need>>,
 ) -> Map<RootName, List<Need>> / {abort.raise} = {
-  let generic = answers.fold(Map::new(), |acc: Map<RootName, Generics>, n: RootName, a: Answer|
-    match a {
-      Body(b) -> if specialising(keys, n) == None { acc.insert(n, b.tables.generics) } else { acc },
-      Refused(_) -> acc,
-    });
-  let start = generic.fold(
-    Map::new(),
-    |acc: Map<RootName, List<Need>>, n: RootName, g: Generics| acc.insert(n, g.needs),
-  );
+  let start = bodies.fold(closed, |acc: Map<RootName, List<Need>>, n: RootName, t: Tables|
+    acc.insert(n, t.generics.needs));
+  // Needs only grow, so a round adding none is the last.
+  let held = |needs: Map<RootName, List<Need>>|
+    bodies.fold(0, |c: Int, n: RootName, _: Tables|
+      c + (match needs.get(n) { Some(ns) -> ns.len(), None -> 0 }));
   // Each round adds a need or stops, and a definition has two needs a variable at most.
-  let most = generic.fold(1, |acc: Int, _: RootName, g: Generics|
-    acc + 2 * g.calls.fold(1, |n: Int, c: GenericCall| n + c.args.len()));
+  let most = bodies.fold(1, |acc: Int, _: RootName, t: Tables|
+    acc + 2 * t.generics.calls.fold(1, |n: Int, c: GenericCall| n + c.args.len()));
   iterate(start, most, |needs: Map<RootName, List<Need>>| {
-    let next = generic.fold(needs, |acc: Map<RootName, List<Need>>, n: RootName, g: Generics|
-      g.calls.fold(acc, |a: Map<RootName, List<Need>>, call: GenericCall|
+    let next = bodies.fold(needs, |acc: Map<RootName, List<Need>>, n: RootName, t: Tables|
+      t.generics.calls.fold(acc, |a: Map<RootName, List<Need>>, call: GenericCall|
         widened(a, n, call, needs)));
-    if next == needs { Stop(needs) } else { Continue(next) }
+    if held(next) == held(needs) { Stop(needs) } else { Continue(next) }
   })
 }
 
-/// The generic bodies the unit never emits: each whose needs, its own or what its callees need of
-/// what it hands them (`needs`), read a type variable's layout or the type itself, which only the
-/// type arguments its callers settle say. Its calls are settled on its specialisations instead.
+/// Whether the body of root `n`, whose tables are `t`, is a generic body the unit never emits: its
+/// needs, its own or what its callees need of what it hands them (`needs`), read a type variable's
+/// layout or the type itself, which only the type arguments its callers settle say.
+fn settled_by_its_callers(
+  keys: Map<RootName, RootKey>,
+  n: RootName,
+  t: Tables,
+  needs: Map<RootName, List<Need>>,
+) -> Bool =
+  specialising(keys, n) == None
+    && (settled_by_callers(t.generics.needs)
+    || settled_by_callers(match needs.get(n) { Some(ns) -> ns, None -> [] }))
+
+/// The generic bodies the unit never emits (`settled_by_its_callers`). Their calls are settled on
+/// their specialisations instead.
 fn settled_only(
   answers: Map<RootName, Answer>,
   keys: Map<RootName, RootKey>,
@@ -2487,11 +2565,8 @@ fn settled_only(
 ) -> Map<RootName, Bool> =
   answers.fold(Map::new(), |acc: Map<RootName, Bool>, n: RootName, a: Answer|
     match a {
-      Body(b) -> if specialising(keys, n) == None
-          && (settled_by_callers(b.tables.generics.needs)
-          || settled_by_callers(match needs.get(n) { Some(ns) -> ns, None -> [] })) {
-        acc.insert(n, true)
-      } else { acc },
+      Body(b) -> if settled_by_its_callers(keys, n, b.tables, needs) { acc.insert(n, true) }
+      else { acc },
       Refused(_) -> acc,
     })
 
@@ -2531,20 +2606,27 @@ fn settled_bodies(
 fn closed_called(
   answers: Map<RootName, Answer>,
   keys: Map<RootName, RootKey>,
+) -> Map<RootName, List<Int>> / {abort.raise} =
+  called_closed(generic_bodies(answers, keys, answers.keys()), Map::new())
+
+/// `closed` with the parameters each body of `bodies` calls as functions closed over the calls it
+/// hands them on to, as `closed_called` closes them, a callee outside `bodies` calling what `closed`
+/// holds of it.
+fn called_closed(
+  bodies: Map<RootName, Tables>,
+  closed: Map<RootName, List<Int>>,
 ) -> Map<RootName, List<Int>> / {abort.raise} = {
-  let bodies = answers.fold(Map::new(), |acc: Map<RootName, Generics>, n: RootName, a: Answer|
-    match a {
-      Body(b) -> if specialising(keys, n) == None && b.tables.members.len() <= 1 {
-        acc.insert(n, b.tables.generics)
-      } else { acc },
-      Refused(_) -> acc,
-    });
-  let start = bodies.fold(Map::new(), |acc: Map<RootName, List<Int>>, n: RootName, g: Generics|
+  let alone = bodies.fold(Map::new(), |acc: Map<RootName, Generics>, n: RootName, t: Tables|
+    if t.members.len() <= 1 { acc.insert(n, t.generics) } else { acc });
+  let start = alone.fold(closed, |acc: Map<RootName, List<Int>>, n: RootName, g: Generics|
     acc.insert(n, g.called));
+  let held = |called: Map<RootName, List<Int>>|
+    alone.fold(0, |c: Int, n: RootName, _: Generics|
+      c + (match called.get(n) { Some(cs) -> cs.len(), None -> 0 }));
   // Each round adds a parameter or stops, and a body has as many to add as it hands on.
-  let most = bodies.fold(1, |acc: Int, _: RootName, g: Generics| acc + g.passes.len());
+  let most = alone.fold(1, |acc: Int, _: RootName, g: Generics| acc + g.passes.len());
   iterate(start, most, |called: Map<RootName, List<Int>>| {
-    let next = bodies.fold(called, |acc: Map<RootName, List<Int>>, n: RootName, g: Generics|
+    let next = alone.fold(called, |acc: Map<RootName, List<Int>>, n: RootName, g: Generics|
       g.passes.fold(acc, |a: Map<RootName, List<Int>>, pass: Pass| {
         let theirs = match called.get(root_name(pass.callee)) { Some(cs) -> cs, None -> [] };
         let mine = match a.get(n) { Some(cs) -> cs, None -> [] };
@@ -2552,7 +2634,7 @@ fn closed_called(
           a.insert(n, mine.push(pass.param))
         } else { a }
       }));
-    if next == called { Stop(called) } else { Continue(next) }
+    if held(next) == held(called) { Stop(called) } else { Continue(next) }
   })
 }
 
@@ -2859,7 +2941,9 @@ fn spelled(s: Bytes) -> Type / {abort.raise} =
   }
 
 /// `answers` by their keys' names, and the keys by the same.
-fn keyed(answers: List<{ key: RootKey, value: Answer }>) -> Answered =
+fn keyed(
+  answers: List<{ key: RootKey, value: Answer }>,
+) -> { answers: Map<RootName, Answer>, keys: Map<RootName, RootKey> } =
   {
     answers: answers.fold(
       Map::new(),
@@ -2871,9 +2955,6 @@ fn keyed(answers: List<{ key: RootKey, value: Answer }>) -> Answered =
       |m: Map<RootName, RootKey>, x: { key: RootKey, value: Answer }|
         m.insert(root_name(x.key), x.key),
     ),
-    kept: 0,
-    asked: 0,
-    added: [],
   }
 
 /// The name of the root of definition `n`.
@@ -3767,6 +3848,15 @@ fn three_modules_dump() -> Dump / {abort.raise} = {
   )
 }
 
+test "roots written for types are dealt apart, however many one module writes" {
+  let p = program_of(three_modules_dump(), three_modules());
+  let written = range(0, pieces()).map(|i: Int|
+    keys::written(keys::Drop, spelled(b"a.T".concat(ascii_of_int(i))), b"a"));
+  let lists = dealt(p, written.push(Named(b"a.f")));
+  assert_eq(lists.len(), pieces());
+  assert_eq(lists.fold(0, |n: Int, roots: List<RootKey>| n + roots.len()), pieces() + 1)
+}
+
 test "roots are dealt a module at a time, each once, over no more lists than there are pieces" {
   let dump = three_modules_dump();
   let p = program_of(dump, three_modules());
@@ -3907,42 +3997,42 @@ test "a body written against a handing that moved is asked for again, with its r
   )
 }
 
-test "the emitter answers roots dealt over calls as it answers them in one" {
+test "a walk answers the roots it deals over lists, place by place, as the emitter answers them in one" {
   let dump = three_modules_dump();
   let p = program_of(dump, three_modules());
   let missed = offered_roots(dump).keys;
-  let runtime = a_runtime(b"r");
-  let keys = missed.fold(Map::new(), |m: Map<RootName, RootKey>, k: RootKey|
-    m.insert(root_name(k), k));
-  let rows = |answers: Map<RootName, Answer>|
-    answers.fold([], |acc: List<RootAnswer>, n: RootName, a: Answer|
-      acc.push({ name: n, answer: a }));
-  let together = rows(answers_of(emitter_answers(runtime, dump, p, [], missed, [])));
+  let scope = scope_over(a_runtime(b"r"), dump, p, [], missed);
+  let together = answers_of(answers_in(scope, missed, Map::new()));
   assert(
-    together.fold(false, |found: Bool, r: RootAnswer|
+    together.fold(false, |found: Bool, _: RootName, a: Answer|
       found
-        || (match r.answer {
+        || (match a {
           Body(b) -> b.tables.members == [Named(b"c.even"), Named(b"c.odd")],
           Refused(_) -> false,
         })),
     None,
   );
-  // Dealt apart, place by place, a call of a definition another call emits is written against the
-  // handing that call published, and no root is asked for twice.
-  let dealt_apart = answers_settled(
-    runtime,
-    dump,
+  // Dealt apart, place by place, a call of a definition another list answers is written against the
+  // handing that list published, and no root is asked for twice.
+  let walk = walked(
     p,
-    [],
-    Map::new(),
-    Map::new(),
+    types_material(dump),
+    program_ctors(dump, []),
     missed,
-    keys,
-    |_: Map<RootName, Answer>, known: Map<Bytes, Bool>| known,
-    Map::new(),
+    |_: Bytes| None,
+    |_: List<Record>| (),
+    None,
+    0,
+    |asks: Int, roots: List<RootKey>, handed: Map<RootName, Handing>| {
+      let pieces = dealt(p, roots);
+      { held: asks + 1, answers: answers_at_once(scope, pieces, 0, pieces.len(), 64, handed) }
+    },
   );
-  assert_eq(rows(dealt_apart.fresh), together);
-  assert_eq(dealt_apart.asked, missed.len());
+  assert(
+    together.fold(true, |ok: Bool, n: RootName, a: Answer| ok && walk.answers.get(n) == Some(a)),
+    None,
+  );
+  assert_eq(walk.asked, walk.keys.len());
   // Each module past every module it imports.
   let places = places_of(p);
   assert(
@@ -3954,19 +4044,19 @@ test "the emitter answers roots dealt over calls as it answers them in one" {
   )
 }
 
-test "a cold unit asks the emitter for each root once, round by round" {
+test "a cold unit asks the emitter for each root once, place by place" {
   let dump = three_modules_dump();
   let every = offered_roots(dump).keys;
-  // Each round asks for its roots once each: no handing moves under a body already written.
+  // Each place asks for its roots once each: no handing moves under a body already written.
   let paced = {
     now: || 0,
-    told: |t: RoundTally|
+    told: |t: PlaceTally|
       if t.asked == t.roots - t.kept { () } else {
         panic(
           String::of_bytes_lossy(
             Bytes::concat_all([
-              b"round ",
-              ascii_of_int(t.round),
+              b"place ",
+              ascii_of_int(t.place),
               b" asked ",
               ascii_of_int(t.asked),
               b" of ",
@@ -4382,16 +4472,23 @@ test "a root the front end offers with no typed row to key it by fails the build
   }
 }
 
-test "a unit tells each of its rounds to a build's phases as it ends, numbered from one" {
+test "a unit tells each place it walks to a build's phases as it ends, in the places' order" {
   let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
   kept_bodies(|| {
-    // A round is kept under its number, as a byte for each root it asked the emitter for.
-    let told = |r: RoundTally|
+    // Each place is kept under its number, as a byte for each root it asked the emitter for, and the
+    // places in the order they were told.
+    let told = |r: PlaceTally|
       body_store.put([
         {
-          key: ascii_of_int(r.round),
+          key: ascii_of_int(r.place),
           bytes: Bytes::concat_all(range(0, r.asked).map(|_: Int| b"x")),
+        },
+        {
+          key: b"told",
+          bytes: (match body_store.get(b"told") { Some(b) -> b, None -> b"" }).concat(
+            Bytes::concat_all([ascii_of_int(r.place), b","]),
+          ),
         },
       ]);
     match emitted(
@@ -4406,13 +4503,17 @@ test "a unit tells each of its rounds to a build's phases as it ends, numbered f
       ) {
       Err(why) -> panic(String::of_bytes_lossy(why)),
       Ok(e) -> {
-        let rounds = body_store.all();
+        let said = match body_store.get(b"told") { Some(b) -> b.split(b","), None -> [] };
+        let order = said.filter(|p: Bytes| p.len() > 0).map(|p: Bytes| digits(p));
         assert(
-          rounds.len() > 0
-            && range(1, rounds.len() + 1).all(|i: Int| rounds.contains(ascii_of_int(i))),
+          order.len() > 0 && range(1, order.len()).all(|i: Int| order.get(i - 1) < order.get(i)),
           None,
         );
-        assert_eq(rounds.values().fold(0, |n: Int, v: Bytes| n + v.len()), e.asked)
+        assert_eq(
+          order.fold(0, |n: Int, l: Int|
+            n + (match body_store.get(ascii_of_int(l)) { Some(v) -> v.len(), None -> 0 })),
+          e.asked,
+        )
       },
     }
   })
@@ -4519,9 +4620,17 @@ test "a function of a type a module calls with no import is read from its home, 
   ];
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
   let p = program_of(dump, sources_placed(dump, user.concat(shipped)));
+  let root = Named(b"m.first");
+  // Placed past its home, the module is answered with the home's handings.
+  let places = places_of(p);
+  assert(
+    match ((places.get(b"m"), places.get(b"std.list"))) { (Some(a), Some(b)) -> a > b, _ -> false },
+    None,
+  );
   assert_eq(
-    emitter_answers(a_runtime(b"r"), dump, p, [], [Named(b"m.first")], []).map(|r: RootAnswer|
-      match r.answer { Body(_) -> root_text(r.name), Refused(no) -> no.why }),
+    answers_in(scope_over(a_runtime(b"r"), dump, p, [], [root]), [root], Map::new()).map(
+      |r: RootAnswer| match r.answer { Body(_) -> root_text(r.name), Refused(no) -> no.why },
+    ),
     [b"m.first"],
   )
 }
@@ -4537,8 +4646,9 @@ test "a law's body over a sort it leaves uninterpreted is lowered as a generic b
   let p = program_of(dump, sources_placed(dump, user));
   let root = law_key(b"m", b"identity is identity", LawBody);
   assert_eq(
-    emitter_answers(a_runtime(b"r"), dump, p, [], [root], []).map(|r: RootAnswer|
-      match r.answer { Body(_) -> root_text(r.name), Refused(no) -> no.why }),
+    answers_in(scope_over(a_runtime(b"r"), dump, p, [], [root]), [root], Map::new()).map(
+      |r: RootAnswer| match r.answer { Body(_) -> root_text(r.name), Refused(no) -> no.why },
+    ),
     [printed(root)],
   )
 }
@@ -4643,11 +4753,11 @@ fn kept_bodies<a | e>(
     },
   }
 
-/// The unit over every root of `user`, its answers kept in the store at `s`, told each round as
+/// The unit over every root of `user`, its answers kept in the store at `s`, told each place as
 /// `told` says.
 fn unit_kept<[r]>(
   user: List<{ name: Bytes, src: Bytes }>,
-  told: keep (RoundTally) -> Unit / {abort.raise},
+  told: keep (PlaceTally) -> Unit / {abort.raise},
 ) -> Emission / {fs.read[r], fs.write[r], abort.raise} = {
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
   with_kept[r, ans]("s", ||
@@ -4685,7 +4795,7 @@ fn store_files(tree: fs::MemFs) -> List<{ name: String, size: Int }> / {abort.ra
 fn store_bytes(tree: fs::MemFs) -> Int / {abort.raise} =
   store_files(tree).fold(0, |n: Int, f: { name: String, size: Int }| n + f.size)
 
-fn unaided(_: RoundTally) -> Unit = ()
+fn unaided(_: PlaceTally) -> Unit = ()
 
 fn kept_program() -> List<{ name: Bytes, src: Bytes }> =
   [
@@ -4708,15 +4818,14 @@ test "a run that dies keeps the answers of every call the emitter finished" {
   let whole = kept_over(fs::mem_of([]), kept_program());
   let died = fs::on_mem[abs](fs::mem_of([]), ||
     handle {
-      unit_kept[abs](kept_program(), |r: RoundTally|
-        if r.round == 1 { panic("the run dies as its first round ends") });
+      unit_kept[abs](kept_program(), |_: PlaceTally| panic("the run dies as its first place ends"));
       false
     } with {
       abort.raise(_) -> true,
     });
   assert(died.value, None);
   let next = kept_over(died.tree, kept_program());
-  // The answers of its first round were kept as they came back; the next run asks for the rest.
+  // The answers of its first place were kept as they came back; the next run asks for the rest.
   assert(next.value.kept > 0 && next.value.asked < whole.value.asked, None);
   assert_eq(next.value.produced.taken, whole.value.produced.taken)
 }
@@ -4930,4 +5039,164 @@ test "a read of a definition of no parameters keeps its value for good through i
   assert(read_with(symbol_of(printed(root_of(keys::Keep, string_type())))), None);
   // A generic definition is called at its caller's type arguments, which settle its body.
   assert_eq(held.produced.dropped.map(|d: Dropped| d.function), [])
+}
+
+/// The unit over every root `user` offers, its answers read from and kept in the test's store, and
+/// each place it walks kept there as `place` and its number. Stops where it keeps an answer the store
+/// holds already, which is a root answered twice.
+fn unit_in_store(
+  user: List<{ name: Bytes, src: Bytes }>,
+) -> Emission / {body_store.get, body_store.put, abort.raise} = {
+  let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
+  match emitted(
+      a_runtime(b"r"),
+      dump,
+      sources_placed(dump, user),
+      Map::new(),
+      offered_roots(dump).keys,
+      |k: Bytes| body_store.get(k),
+      |rs: List<Record>|
+        match rs.find(|r: Record|
+            r.key.starts_with(b"answer\x00") && body_store.get(r.key) != None) {
+          Some(r) -> panic(String::of_bytes_lossy(b"an answer kept twice: ".concat(r.key))),
+          None -> body_store.put(rs),
+        },
+      phases: Some({
+        now: || 0,
+        told: |r: PlaceTally|
+          body_store.put([{ key: b"place ".concat(ascii_of_int(r.place)), bytes: b"" }]),
+      }),
+    ) {
+    Ok(e) -> e,
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+  }
+}
+
+/// A module of records nested `d` deep, each holding the one below and a list of them, and a function
+/// of the deepest the runtime enters: its entry lifts the record and lets go of it.
+fn nested_records(d: Int) -> List<{ name: Bytes, src: Bytes }> =
+  [
+    {
+      name: b"m",
+      src: Bytes::concat_all(
+        range(1, d + 1).fold([b"type T0 = { s: String }\n"], |acc: List<Bytes>, k: Int| {
+          let below = ascii_of_int(k - 1);
+          acc.push(
+            Bytes::concat_all([
+              b"type T",
+              ascii_of_int(k),
+              b" = { x: T",
+              below,
+              b", y: List<T",
+              below,
+              b"> }\n",
+            ]),
+          )
+        }).push(
+          Bytes::concat_all([b"pub fn crossed(t: T", ascii_of_int(d), b") -> Int = 1\n"]),
+        ),
+      ),
+    },
+  ]
+
+test "a unit's places do not grow with how deep the records it crosses nest, and it answers each root once" {
+  let places = [2, 4, 8].map(|d: Int|
+    kept_bodies(|| {
+      let e = unit_in_store(nested_records(d));
+      assert_eq(e.produced.dropped, []);
+      body_store.all().keys().filter(|k: Bytes| k.starts_with(b"place ")).len()
+    }));
+  assert(
+    places.all(|n: Int| n == places.get(0)),
+    Some("places at depths 2, 4 and 8: " ++ String::join(places.map(|n: Int| n.to_string()), ", ")),
+  )
+}
+
+/// What a test's emitter holds: its scope once built, how many scopes it built, and the roots it was
+/// asked for, in order, each as often as it was asked for.
+type Counted = { scope: Option<Result<emit::Scope, Bytes>>, built: Int, asked: List<RootName> }
+
+/// The walk of every root `user` offers, its answers read from and kept in the test's store, the
+/// emitter counting the scopes it builds and the roots it is asked for.
+fn walk_in_store(
+  user: List<{ name: Bytes, src: Bytes }>,
+) -> Walk<Counted> / {body_store.get, body_store.put, abort.raise} = {
+  let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
+  let p = program_of(dump, sources_placed(dump, user));
+  let offered = offered_roots(dump).keys;
+  let ctors = dump.emitter_ctors.map(|c: EmitterCtor| { name: c.name, arity: c.arity });
+  walked(
+    p,
+    types_material(dump),
+    program_ctors(dump, ctors),
+    offered,
+    |k: Bytes| body_store.get(k),
+    |rs: List<Record>| body_store.put(rs),
+    None,
+    { scope: None, built: 0, asked: [] },
+    |held: Counted, roots: List<RootKey>, handed: Map<RootName, Handing>| {
+      let scope = match held.scope {
+        Some(s) -> s,
+        None -> scope_over(a_runtime(b"r"), dump, p, ctors, offered),
+      };
+      let pieces = dealt(p, roots);
+      {
+        held: {
+          scope: Some(scope),
+          built: match held.scope { Some(_) -> held.built, None -> held.built + 1 },
+          asked: held.asked.concat(roots.map(root_name)),
+        },
+        answers: answers_at_once(scope, pieces, 0, pieces.len(), 64, handed),
+      }
+    },
+  )
+}
+
+test "a cold walk asks the emitter for each root once over one scope, and a warm one builds none" {
+  kept_bodies(|| {
+    let cold = walk_in_store(kept_program());
+    assert_eq(cold.emitter.built, 1);
+    assert(cold.emitter.asked.len() > 0, None);
+    assert_eq(names_ordered(cold.emitter.asked).len(), cold.emitter.asked.len());
+    assert_eq(cold.asked, cold.emitter.asked.len());
+    let warm = walk_in_store(kept_program());
+    assert_eq((warm.emitter.built, warm.emitter.asked), (0, []));
+    assert_eq(warm.answers.keys(), cold.answers.keys())
+  })
+}
+
+/// The base-2 logarithm of `n`, rounded down.
+fn log2(n: Int) -> Int =
+  range(0, 63).fold(0, |k: Int, i: Int| if n >> i + 1 > 0 { i + 1 } else { k })
+
+test "a walk's steps grow with the roots it answers, however long the chain of calls that finds them" {
+  let p = program_of(three_modules_dump(), []);
+  // Root `i` of a chain of roots written for types of module `a`, each calling the next.
+  let link = |i: Int| keys::written(keys::Drop, spelled(b"a.T".concat(ascii_of_int(i))), b"a");
+  paced(|n: Int| n * (log2(n) + 1), |n: Int| {
+    let at = range(0, n).fold(Map::new(), |m: Map<RootName, Int>, i: Int|
+      m.insert(root_name(link(i)), i));
+    let answer = |k: RootKey|
+      match at.get(root_name(k)) {
+        Some(i) ->
+          Body({
+            text: b"",
+            tables: { ..no_tables(), calls: if i + 1 < n { [link(i + 1)] } else { [] } },
+          }),
+        None -> Refused({ why: b"no root of the chain" }),
+      };
+    walked(
+      p,
+      b"",
+      no_ctors(),
+      [link(0)],
+      |_: Bytes| None,
+      |_: List<Record>| (),
+      None,
+      (),
+      |_: Unit, roots: List<RootKey>, _: Map<RootName, Handing>|
+        { held: (), answers: roots.map(|k: RootKey| { name: root_name(k), answer: answer(k) }) },
+    ).answers.len(
+    )
+  })
 }
