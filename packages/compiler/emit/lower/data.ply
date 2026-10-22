@@ -16,7 +16,7 @@ import emit.tir (Rep, RWord, RFlat, RSum, RUnit, Leaf, Var, Arg, AVar, AInt, AZe
                  MCase, Get, Gathered, PLeaf, PNamed, PField, Data, rep_of_arg)
 import emit.lower.setting (ctor_named, ctor_sum)
 import emit.lower.held (held_as, leaf_span, leaf_spans, leaves_within, field_type, field_types,
-                        field_offsets, case_index, leaf_type)
+                        field_offsets, case_index, leaf_type, laid_leaves)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, filed, unfiled, noted)
 
 /// Constructor `name`, written at `ctor_at`, applied to `args` by the call at `at`, made at the type
@@ -222,33 +222,39 @@ pub fn recorded_as(
   let value = |name: Bytes|
     fields.fold(None, |acc: Option<Arg>, f: { name: Bytes, arg: Arg }|
       if f.name == name { Some(f.arg) } else { acc });
-  match held_as(cx.setting, ty) {
-    RUnit -> { st: st, arg: AZero(RUnit) },
-    RFlat(ls) -> {
-      let given = fields_of(ty).fold(
-        { xs: [], missing: false },
-        |acc: { xs: List<{ arg: Arg, to: Rep }>, missing: Bool }, f: Field|
-          match value(f.name) {
-            Some(a) -> { ..acc, xs: acc.xs.push({ arg: a, to: held_as(cx.setting, f.ty) }) },
-            None -> { ..acc, missing: true },
-          },
-      );
-      if given.missing { refuse(st, Data, b"a record literal missing a field its type holds") }
-      else {
-        let held = handed_all(st, given.xs, at);
-        record_made(held.st, ty, ls, held.args, at)
-      }
-    },
-    _ -> {
-      let names = names_of(ty, fields.map(|f: { name: Bytes, arg: Arg }| f.name));
-      let given = names.fold([], |acc: List<Arg>, n: Bytes|
-        match value(n) { Some(a) -> acc.push(a), None -> acc });
-      if given.len() != names.len() {
-        refuse(st, Data, b"a record literal missing a field its type holds")
-      } else { by_value(cx, st, ty, names, given, at) }
-    },
+  let rep = held_as(cx.setting, ty);
+  if rep == RUnit { { st: st, arg: AZero(RUnit) } } else {
+    match laid_leaves(cx.setting.ctors, ty) {
+      Some(ls) -> {
+        let given = fields_of(ty).fold(
+          { xs: [], missing: false },
+          |acc: { xs: List<{ arg: Arg, to: Rep }>, missing: Bool }, f: Field|
+            match value(f.name) {
+              Some(a) -> { ..acc, xs: acc.xs.push({ arg: a, to: held_as(cx.setting, f.ty) }) },
+              None -> { ..acc, missing: true },
+            },
+        );
+        if given.missing { refuse(st, Data, b"a record literal missing a field its type holds") }
+        else {
+          let parts = handed_all(st, given.xs, at);
+          held_made(record_made(parts.st, ty, ls, parts.args, at), rep, at)
+        }
+      },
+      None -> {
+        let names = names_of(ty, fields.map(|f: { name: Bytes, arg: Arg }| f.name));
+        let given = names.fold([], |acc: List<Arg>, n: Bytes|
+          match value(n) { Some(a) -> acc.push(a), None -> acc });
+        if given.len() != names.len() {
+          refuse(st, Data, b"a record literal missing a field its type holds")
+        } else { by_value(cx, st, ty, names, given, at) }
+      },
+    }
   }
 }
+
+/// `flat`, a record made as its leaves, held as `rep` its type holds it as: as it is, or boxed.
+fn held_made(flat: Lowered, rep: Rep, at: Span) -> Lowered =
+  if rep_of_arg(flat.arg) == rep { flat } else { handed(flat, rep, at) }
 
 /// The record of type `ty` held as the leaves `ls`, gathered from `parts`, its fields' values in
 /// order, a field of no words giving none.
@@ -319,10 +325,9 @@ fn lay_of(cx: Context, b: Var) -> Lay =
   match b.rep {
     RFlat(ls) -> Spans({ leaves: ls, of: leaf_spans(ls) }),
     RUnit -> Empty,
-    _ -> match held_as(cx.setting, b.ty) {
-      RFlat(_) -> Slots(field_offsets(cx.setting, b.ty)),
-      RUnit -> Empty,
-      _ -> Open,
+    _ -> match laid_leaves(cx.setting.ctors, b.ty) {
+      Some(_) -> Slots(field_offsets(cx.setting, b.ty)),
+      None -> if held_as(cx.setting, b.ty) == RUnit { Empty } else { Open },
     },
   }
 
@@ -346,8 +351,15 @@ fn read_in(
       },
       Slots(offsets) -> match offsets.get(name) {
         None -> None,
-        Some(o) ->
-          Some(bound_as(st, fty, want, Get({ of: b, path: PField({ name: name, at: o }) }), at)),
+        Some(o) -> {
+          let read = Get({ of: b, path: PField({ name: name, at: o }) });
+          // A record held as its box lies in place in the box around it: read as its leaves, boxed.
+          Some(match laid_leaves(cx.setting.ctors, fty) {
+            Some(ls) -> if want == RFlat(ls) { bound_as(st, fty, want, read, at) }
+            else { handed(bound_as(st, fty, RFlat(ls), read, at), want, at) },
+            None -> bound_as(st, fty, want, read, at),
+          })
+        },
       },
       Empty -> None,
       Open ->
@@ -413,56 +425,65 @@ pub fn updated(
     (_, None) -> unfiled(cx, st, b"a record update", at),
     (AVar(b), Some(t)) -> {
       let ty = t.ty;
-      match held_as(cx.setting, ty) {
-        RUnit -> { st: st, arg: AZero(RUnit) },
-        RFlat(ls) -> {
-          // Each field is looked up once in maps read once, however wide the record is.
-          let given = sets.fold(Map::new(), |m: Map<Bytes, Arg>, f: { name: Bytes, arg: Arg }|
-            m.insert(f.name, f.arg));
-          let kept = copies.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true));
-          let lay = lay_of(cx, b);
-          let parts = fields_of(ty).fold(
-            { st: st, parts: [], missing: false },
-            |acc: { st: Lowering, parts: List<Arg>, missing: Bool }, f: Field|
-              match given.get(f.name) {
-                Some(a) -> {
-                  let h = handed({ st: acc.st, arg: a }, held_as(cx.setting, f.ty), at);
-                  { ..acc, st: h.st, parts: acc.parts.push(h.arg) }
+      let rep = held_as(cx.setting, ty);
+      if rep == RUnit { { st: st, arg: AZero(RUnit) } } else {
+        match laid_leaves(cx.setting.ctors, ty) {
+          Some(ls) -> {
+            // Each field is looked up once in maps read once, however wide the record is.
+            let given = sets.fold(Map::new(), |m: Map<Bytes, Arg>, f: { name: Bytes, arg: Arg }|
+              m.insert(f.name, f.arg));
+            let kept = copies.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true));
+            let lay = lay_of(cx, b);
+            let parts = fields_of(ty).fold(
+              { st: st, parts: [], missing: false },
+              |acc: { st: Lowering, parts: List<Arg>, missing: Bool }, f: Field|
+                match given.get(f.name) {
+                  Some(a) -> {
+                    let h = handed({ st: acc.st, arg: a }, held_as(cx.setting, f.ty), at);
+                    { ..acc, st: h.st, parts: acc.parts.push(h.arg) }
+                  },
+                  None -> if !kept.contains(f.name) { { ..acc, missing: true } } else {
+                    match read_in(cx, acc.st, b, lay, f.name, f.ty, at) {
+                      None -> { ..acc, missing: true },
+                      Some(r) -> { ..acc, st: r.st, parts: acc.parts.push(r.arg) },
+                    }
+                  },
                 },
-                None -> if !kept.contains(f.name) { { ..acc, missing: true } } else {
-                  match read_in(cx, acc.st, b, lay, f.name, f.ty, at) {
-                    None -> { ..acc, missing: true },
-                    Some(r) -> { ..acc, st: r.st, parts: acc.parts.push(r.arg) },
-                  }
+            );
+            if parts.missing {
+              refuse(
+                st,
+                Data,
+                b"an update of a field its base does not hold where its type lays it",
+              )
+            } else { held_made(record_made(parts.st, ty, ls, parts.parts, at), rep, at) }
+          },
+          None -> {
+            let names = names_of(
+              ty,
+              copies.concat(sets.map(|f: { name: Bytes, arg: Arg }| f.name)),
+            );
+            let given = names.fold(
+              { st: open_needed(cx, st, b.ty), args: [] },
+              |acc: { st: Lowering, args: List<Arg> }, n: Bytes|
+                match sets.fold(None, |found: Option<Arg>, f: { name: Bytes, arg: Arg }|
+                    if f.name == n { Some(f.arg) } else { found }) {
+                  Some(a) -> { ..acc, args: acc.args.push(a) },
+                  None -> {
+                    let g = bound_as(
+                      acc.st,
+                      match field_type(ty, n) { Some(t) -> t, None -> unknown_type() },
+                      RWord,
+                      Get({ of: b, path: PNamed(n) }),
+                      at,
+                    );
+                    { st: g.st, args: acc.args.push(g.arg) }
+                  },
                 },
-              },
-          );
-          if parts.missing {
-            refuse(st, Data, b"an update of a field its base does not hold where its type lays it")
-          } else { record_made(parts.st, ty, ls, parts.parts, at) }
-        },
-        _ -> {
-          let names = names_of(ty, copies.concat(sets.map(|f: { name: Bytes, arg: Arg }| f.name)));
-          let given = names.fold(
-            { st: open_needed(cx, st, b.ty), args: [] },
-            |acc: { st: Lowering, args: List<Arg> }, n: Bytes|
-              match sets.fold(None, |found: Option<Arg>, f: { name: Bytes, arg: Arg }|
-                  if f.name == n { Some(f.arg) } else { found }) {
-                Some(a) -> { ..acc, args: acc.args.push(a) },
-                None -> {
-                  let g = bound_as(
-                    acc.st,
-                    match field_type(ty, n) { Some(t) -> t, None -> unknown_type() },
-                    RWord,
-                    Get({ of: b, path: PNamed(n) }),
-                    at,
-                  );
-                  { st: g.st, args: acc.args.push(g.arg) }
-                },
-              },
-          );
-          by_value(cx, given.st, ty, names, given.args, at)
-        },
+            );
+            by_value(cx, given.st, ty, names, given.args, at)
+          },
+        }
       }
     },
     (_, Some(_)) -> refuse(st, Data, b"an update of a value that is no record"),
