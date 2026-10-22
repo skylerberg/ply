@@ -233,7 +233,8 @@ pub fn recorded_as(
           { xs: [], missing: false },
           |acc: { xs: List<{ arg: Arg, to: Rep }>, missing: Bool }, f: Field|
             match value(f.name) {
-              Some(a) -> { ..acc, xs: acc.xs.push({ arg: a, to: held_as(cx.setting, f.ty) }) },
+              Some(a) ->
+                { ..acc, xs: acc.xs.push({ arg: a, to: laid_held(cx.setting.ctors, f.ty) }) },
               None -> { ..acc, missing: true },
             },
         );
@@ -306,7 +307,7 @@ pub fn field(cx: Context, base: Lowered, name: Bytes, at: Span) -> Lowered =
   match base.arg {
     AVar(b) -> {
       let fty = match field_type(b.ty, name) { Some(t) -> t, None -> unknown_type() };
-      match read_in(cx, base.st, b, lay_of(cx, b), name, fty, at) {
+      match read_in(cx, base.st, b, lay_of(cx, b), name, fty, held_as(cx.setting, fty), at) {
         None -> refuse(base.st, Data, b"a field its record does not hold: ".concat(name)),
         Some(r) -> r,
       }
@@ -334,8 +335,8 @@ fn lay_of(cx: Context, b: Var) -> Lay =
     },
   }
 
-/// Field `name` of type `fty` of `b`, laid out as `lay` says, held as its type holds it and borrowed
-/// from `b`; nothing where `b`'s layout holds no such field.
+/// Field `name` of type `fty` of `b`, laid out as `lay` says, held as `want` and borrowed from `b`;
+/// nothing where `b`'s layout holds no such field.
 fn read_in(
   cx: Context,
   st: Lowering,
@@ -343,23 +344,24 @@ fn read_in(
   lay: Lay,
   name: Bytes,
   fty: Type,
+  want: Rep,
   at: Span,
-) -> Option<Lowered> = {
-  let want = held_as(cx.setting, fty);
+) -> Option<Lowered> =
   if want == RUnit { Some({ st: st, arg: AZero(RUnit) }) } else {
+    // A record lies in place in the record around it: read as its leaves, then held as wanted.
+    let nested = laid_leaves(cx.setting.ctors, fty);
+    let as_wanted = |l: Lowered| if rep_of_arg(l.arg) == want { l } else { handed(l, want, at) };
     match lay {
       Spans(s) -> match s.of.get(name) {
         None -> None,
-        Some(sp) -> Some(leaves_read(st, b, s.leaves, sp, fty, want, at)),
+        Some(sp) -> Some(as_wanted(leaves_read(st, b, s.leaves, sp, fty, nested != None, at))),
       },
       Slots(offsets) -> match offsets.get(name) {
         None -> None,
         Some(o) -> {
           let read = Get({ of: b, path: PField({ name: name, at: o }) });
-          // A record held as its box lies in place in the box around it: read as its leaves, boxed.
-          Some(match laid_leaves(cx.setting.ctors, fty) {
-            Some(ls) -> if want == RFlat(ls) { bound_as(st, fty, want, read, at) }
-            else { handed(bound_as(st, fty, RFlat(ls), read, at), want, at) },
+          Some(match nested {
+            Some(ls) -> as_wanted(bound_as(st, fty, RFlat(ls), read, at)),
             None -> bound_as(st, fty, want, read, at),
           })
         },
@@ -375,38 +377,34 @@ fn read_in(
         ),
     }
   }
-}
 
-/// The leaves `sp` spans of the flat record `b` of leaves `ls`, a field of type `fty` held as
-/// `want`: the one leaf, or a record's leaves each read at its type and gathered.
+/// The leaves `sp` spans of the flat record `b` of leaves `ls`, a field of type `fty`: a record's
+/// leaves, where it is one, each read at its type and gathered; otherwise the one leaf.
 fn leaves_read(
   st: Lowering,
   b: Var,
   ls: List<Leaf>,
   sp: { at: Int, n: Int },
   fty: Type,
-  want: Rep,
+  record: Bool,
   at: Span,
 ) -> Lowered = {
   let one = |s: Lowering, k: Int, ty: Type|
     bound_as(s, ty, leaf_rep(ls, k), Get({ of: b, path: PLeaf(k) }), at);
-  match want {
-    RFlat(_) -> {
-      let inner = leaves_within(ls, sp);
-      let read = range(0, inner.len()).fold(
-        { st: st, parts: [] },
-        |acc: { st: Lowering, parts: List<Arg> }, j: Int| {
-          let name = match inner.at(j) { Some(l) -> l.name, None -> b"" };
-          let g = match leaf_type(fty, name) {
-            Some(t) -> one(acc.st, sp.at + j, t),
-            None -> refuse(acc.st, Data, b"a leaf its record's type does not hold: ".concat(name)),
-          };
-          { st: g.st, parts: acc.parts.push(g.arg) }
-        },
-      );
-      bound_as(read.st, fty, RFlat(inner), Gathered({ parts: read.parts }), at)
-    },
-    _ -> one(st, sp.at, fty),
+  if !record { one(st, sp.at, fty) } else {
+    let inner = leaves_within(ls, sp);
+    let read = range(0, inner.len()).fold(
+      { st: st, parts: [] },
+      |acc: { st: Lowering, parts: List<Arg> }, j: Int| {
+        let name = match inner.at(j) { Some(l) -> l.name, None -> b"" };
+        let g = match leaf_type(fty, name) {
+          Some(t) -> one(acc.st, sp.at + j, t),
+          None -> refuse(acc.st, Data, b"a leaf its record's type does not hold: ".concat(name)),
+        };
+        { st: g.st, parts: acc.parts.push(g.arg) }
+      },
+    );
+    bound_as(read.st, fty, RFlat(inner), Gathered({ parts: read.parts }), at)
   }
 }
 
@@ -439,19 +437,21 @@ pub fn updated(
             let lay = lay_of(cx, b);
             let parts = fields_of(ty).fold(
               { st: st, parts: [], missing: false },
-              |acc: { st: Lowering, parts: List<Arg>, missing: Bool }, f: Field|
+              |acc: { st: Lowering, parts: List<Arg>, missing: Bool }, f: Field| {
+                let laid = laid_held(cx.setting.ctors, f.ty);
                 match given.get(f.name) {
                   Some(a) -> {
-                    let h = handed({ st: acc.st, arg: a }, held_as(cx.setting, f.ty), at);
+                    let h = handed({ st: acc.st, arg: a }, laid, at);
                     { ..acc, st: h.st, parts: acc.parts.push(h.arg) }
                   },
                   None -> if !kept.contains(f.name) { { ..acc, missing: true } } else {
-                    match read_in(cx, acc.st, b, lay, f.name, f.ty, at) {
+                    match read_in(cx, acc.st, b, lay, f.name, f.ty, laid, at) {
                       None -> { ..acc, missing: true },
                       Some(r) -> { ..acc, st: r.st, parts: acc.parts.push(r.arg) },
                     }
                   },
-                },
+                }
+              },
             );
             if parts.missing {
               refuse(
