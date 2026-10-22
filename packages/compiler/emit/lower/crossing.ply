@@ -10,7 +10,6 @@
 import std.list
 import std.bytes
 import syntax.parsing (Span, dummy_span)
-import syntax.patterns (LUnit)
 import check.types (Type, TyCon, TyVar, TyFn, TyRecord, TyNominal, Field, named_type, int_type,
                     unit_type, bytes_type, list_type, spelled_type)
 import emit.typing (unknown_type)
@@ -18,22 +17,22 @@ import emit.c (Width, width_named, width_index)
 import emit.roots (builtin_helper)
 import emit.keys
 import emit.keys (RootKey, Root, Written, TypeOp, Lower, Lift, Dup, Worded)
-import emit.tir (Rep, RInt, RWord, RFloat, RNum, RAddr, Arg, AVar, AInt, AZero, Var, Val, Uses,
-                 Prim, Get, PField, PPayload, Pack, Call, Native, Op, OContainer, OHandle, Lent,
-                 Owned, Handling, Static, Fn, Inst, Let, Do, Return, Rooted, Declined, no_links)
+import emit.tir (Rep, RInt, RWord, RFloat, RNum, RAddr, RUnit, Arg, AVar, AInt, AZero, Var, Val,
+                 Uses, Prim, Get, PField, PPayload, Pack, Call, Native, Op, OContainer, OHandle,
+                 Lent, Owned, Handling, Static, Fn, Inst, Let, Do, Return, Rooted, Declined,
+                 no_links)
 import emit.tir.containers (Taken, Length)
 import emit.tir.handling (Encoded, Unsettled)
 import emit.tir.statics (SPlain, SStruct, WRaw, WAddress, WEntry, WBytes, WField, WHead)
 import emit.release (word_form_heads)
-import emit.lower.setting (builtin_at)
+import emit.lower.setting (CallTypes, builtin_at)
 import emit.lower.held (held_as, held_with, typed_convention)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound, bound_as, done, handed, type_of,
-                        filed, unfiled, noted, static_added)
+                        filed, unfiled, noted, static_added, as_words)
 import emit.reps (Ctors, SumCtor, OpMode, type_vars)
 import emit.print.counting (never_lifted_fn)
 import emit.marks (marks_of, marked_key, carried_by)
 import emit.answer (Exact)
-import emit.lower.scalars (literal)
 import emit.lower.data (field, recorded_as)
 
 /// The externs a body calls over its arguments' encoding whatever type it calls them at, which the
@@ -67,20 +66,7 @@ pub fn over_encoding(
 ) -> Lowered / {abort.raise} =
   match builtin_at(cx.setting, filed(cx, callee), name) {
     None -> refuse(st, Handling, b"an extern called over its encoding at no type: ".concat(name)),
-    Some(types) -> if !types.params.push(types.ret).all(settled) {
-      bound(
-        cx,
-        types.params.push(types.ret).fold(st, |s: Lowering, t: Type|
-          type_vars(t).fold(s, |n: Lowering, v: Int| noted(n, { var: v, reads: Exact }))),
-        types.ret,
-        Op({
-          op: OHandle(Unsettled(name)),
-          args: args,
-          uses: { takes: args.map(|_: Arg| false), owned: true, fails: true, stops: false },
-        }),
-        at,
-      )
-    } else if name == b"observe" {
+    Some(types) -> if name == b"observe" && types.params.push(types.ret).all(settled) {
       let at_type = called_at(cx, callee, args);
       match args {
         [x] -> {
@@ -89,7 +75,62 @@ pub fn over_encoding(
         },
         _ -> refuse(st, Handling, b"`observe` of other than one value"),
       }
-    } else { by_encoding(cx, st, name, args, callee, at) },
+    } else { encoded_at(cx, st, name, args, types, at) },
+  }
+
+/// Extern `name` called on `args` over their encoding at `types`, as `by_encoding` calls it; where a
+/// type variable leaves them open, a call settled in the specialisations its callers settle.
+fn encoded_at(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  types: CallTypes,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  if types.params.push(types.ret).all(settled) { by_encoding(cx, st, name, args, types, at) } else {
+    bound(
+      cx,
+      types.params.push(types.ret).fold(st, |s: Lowering, t: Type|
+        type_vars(t).fold(s, |n: Lowering, v: Int| noted(n, { var: v, reads: Exact }))),
+      types.ret,
+      Op({
+        op: OHandle(Unsettled(name)),
+        args: args,
+        uses: { takes: args.map(|_: Arg| false), owned: true, fails: true, stops: false },
+      }),
+      at,
+    )
+  }
+
+/// Builtin `name` the runtime answers, called on `args`, answering a value of `ty`: over their
+/// encoding where `ty` is a sum or a record (`laid_out_here`), which the runtime makes as an object
+/// of its own; else on their words, which it reads by the unit's layouts, each handed over as a word
+/// the helper takes, its answer a word with a count of its own, held as a value of `ty` is.
+pub fn through_runtime(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  ty: Type,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  if laid_out_here(cx.setting.ctors, ty) {
+    encoded_at(cx, st, name, args, { params: args.map(type_of), ret: ty }, at)
+  } else {
+    let words = as_words(st, args, at);
+    let answer = bound_as(
+      words.st,
+      ty,
+      RWord,
+      Native({
+        name: builtin_helper(name).concat(b"_p"),
+        args: words.args,
+        uses: { takes: args.map(|_: Arg| true), owned: true, fails: true, stops: false },
+      }),
+      at,
+    );
+    handed(answer, held_as(cx.setting, ty), at)
   }
 
 /// Whether a call of builtin `name` is lowered here: a crossing native, a part of a crossing root,
@@ -124,7 +165,7 @@ pub fn crossed(
       [x] -> {
         let word = handed({ st: st, arg: x }, RWord, at);
         let d = type_described(cx, word.st, at_type, at);
-        unit_after(cx, native_done(d.st, b"?out_carried", [word.arg, d.arg], false, at), at)
+        unit_after(native_done(d.st, b"?out_carried", [word.arg, d.arg], false, at))
       },
       _ -> refuse(st, Handling, b"a carried value written other than alone"),
     }
@@ -215,9 +256,9 @@ fn handler_var(
         );
       if name == b"?handler_init" {
         let d = type_described(cx, word.st, type_of(x), at);
-        unit_after(cx, given(d.st, b"?handler_typed", [place.arg, word.arg, d.arg]), at)
+        unit_after(given(d.st, b"?handler_typed", [place.arg, word.arg, d.arg]))
       } else if name == b"?handler_set" {
-        unit_after(cx, given(word.st, b"?handler_put", [place.arg, word.arg]), at)
+        unit_after(given(word.st, b"?handler_put", [place.arg, word.arg]))
       } else { refuse(word.st, Handling, b"a handler variable's read handed a value") }
     },
     _ -> refuse(st, Handling, b"a handler variable named by other than its place"),
@@ -314,44 +355,36 @@ fn decoded(cx: Context, st: Lowering, b: Arg, ty: Type, at: Span) -> Lowered / {
   { st: native_done(v.st, b"?lift_close", [], true, at), arg: v.arg }
 }
 
-/// Extern `name` called over its arguments' encoding: each argument lowered at the type the extern
-/// takes it at into a list the runtime decodes and calls the extern on, which raises as the extern
-/// does, or opens a lifting of its answer's encoding, which the answer is read from. `callee` is
-/// where the extern's name is written, which the types it is called at are filed under.
-pub fn by_encoding(
+/// Extern `name` called over its arguments' encoding at `types`, those it takes and answers: each
+/// argument lowered at its type into a list the runtime decodes and calls the extern on, which raises
+/// as the extern does, or opens a lifting of its answer's encoding, which the answer is read from.
+fn by_encoding(
   cx: Context,
   st: Lowering,
   name: Bytes,
   args: List<Arg>,
-  callee: Span,
+  types: CallTypes,
   at: Span,
 ) -> Lowered / {abort.raise} =
-  match builtin_at(cx.setting, filed(cx, callee), name) {
-    None -> refuse(st, Handling, b"an extern called over its encoding at no type: ".concat(name)),
-    Some(types) -> if types.params.len() != args.len() {
-      refuse(
-        st,
-        Handling,
-        b"an extern called over its encoding with other arguments: ".concat(name),
-      )
+  if types.params.len() != args.len() {
+    refuse(st, Handling, b"an extern called over its encoding with other arguments: ".concat(name))
+  } else {
+    let opened = native_done(st, b"?lower_open", [AInt(0)], false, at);
+    let head = native_done(opened, b"?out_count", [AInt(9), AInt(args.len())], false, at);
+    let written = range(0, args.len()).fold(head, |s: Lowering, i: Int|
+      lowered_part(cx, s, args.get(i), types.params.get(i), at).st);
+    let call = Op({
+      op: OHandle(Encoded(name)),
+      args: [],
+      uses: { takes: [], owned: false, fails: true, stops: false },
+    });
+    // One that never answers raises with nothing open: its answer is a word nothing reads.
+    if never_answers(cx, name) {
+      handed(bound_as(written, types.ret, RWord, call, at), held_as(cx.setting, types.ret), at)
     } else {
-      let opened = native_done(st, b"?lower_open", [AInt(0)], false, at);
-      let head = native_done(opened, b"?out_count", [AInt(9), AInt(args.len())], false, at);
-      let written = range(0, args.len()).fold(head, |s: Lowering, i: Int|
-        lowered_part(cx, s, args.get(i), types.params.get(i), at).st);
-      let call = Op({
-        op: OHandle(Encoded(name)),
-        args: [],
-        uses: { takes: [], owned: false, fails: true, stops: false },
-      });
-      // One that never answers raises with nothing open: its answer is a word nothing reads.
-      if never_answers(cx, name) {
-        handed(bound_as(written, types.ret, RWord, call, at), held_as(cx.setting, types.ret), at)
-      } else {
-        let answer = lifted_part(cx, done(written, call, at), types.ret, at);
-        { st: native_done(answer.st, b"?lift_close", [], true, at), arg: answer.arg }
-      }
-    },
+      let answer = lifted_part(cx, done(written, call, at), types.ret, at);
+      { st: native_done(answer.st, b"?lift_close", [], true, at), arg: answer.arg }
+    }
   }
 
 /// `metered(f)`: `f()` and what it cost, the runtime's counts from a mark taken before the call to
@@ -518,7 +551,7 @@ fn machine(
         },
     );
     match m.answer {
-      Nothing -> unit_after(cx, native_done(given.st, m.name, given.args, m.fails, at), at),
+      Nothing -> unit_after(native_done(given.st, m.name, given.args, m.fails, at)),
       WithBits -> native_int(given.st, m.name, given.args, m.fails, at),
       WithFloat -> {
         let b = native_int(given.st, m.name, given.args, m.fails, at);
@@ -575,7 +608,7 @@ fn decimal_out(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered 
             Get({ of: v, path: PField({ name: b"hi", at: 1 }) }),
             at,
           );
-          unit_after(cx, native_done(hi.st, b"?out_decimal", [lo.arg, hi.arg], false, at), at)
+          unit_after(native_done(hi.st, b"?out_decimal", [lo.arg, hi.arg], false, at))
         },
       }
     },
@@ -598,9 +631,7 @@ fn fixed_out(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / 
           at,
         );
         unit_after(
-          cx,
           native_done(lo.st, b"?out_fixed", [AInt(width_index(w)), lo.arg, AInt(0)], false, at),
-          at,
         )
       } else {
         let boxed = handed({ st: st, arg: x }, RWord, at);
@@ -622,9 +653,7 @@ fn fixed_out(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / 
               at,
             );
             unit_after(
-              cx,
               native_done(hi.st, b"?out_fixed", [AInt(width_index(w)), lo.arg, hi.arg], false, at),
-              at,
             )
           },
         }
@@ -764,8 +793,7 @@ fn native_int(
   )
 
 /// `()`, the value of what is done for its effect alone.
-fn unit_after(cx: Context, st: Lowering, at: Span) -> Lowered / {abort.raise} =
-  literal(cx, st, LUnit, at)
+fn unit_after(st: Lowering) -> Lowered = { st: st, arg: AZero(RUnit) }
 
 // --- Descriptors ---------------------------------------------------------------------------
 
