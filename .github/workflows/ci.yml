@@ -1,6 +1,6 @@
 # `build` compiles the workspace into one nextest archive, and each `nextest` job runs a shard of it;
-# `build-ply` bootstraps `ply`, and each `runs` job takes the Ply runs `.github/ci-shards.sh` lists
-# for it. `ci` is the one check that says a run is green.
+# `build-ply` bootstraps `ply`, `self-host` bootstraps it again with itself, and each `runs` job takes
+# the Ply runs `.github/ci-shards.sh` lists for it. `ci` is the one check that says a run is green.
 # The toolchain pin recurs in every workflow under .github/: raise it everywhere at once.
 
 name: CI
@@ -234,9 +234,12 @@ jobs:
     name: Bootstrap ply, unless main bootstrapped this toolchain
     needs: [plan]
     runs-on: ubuntu-24.04
-    # A change to how definitions hash or to the prelude bootstraps twice cold: about 95 minutes.
     timeout-minutes: 120
     outputs:
+      # Whether this job bootstrapped, so `self-host` bootstraps again with the `ply` it made, and
+      # whether it found the `ply` main bootstrapped of this toolchain kept.
+      bootstrapped: ${{ steps.boots.outputs.yes == 'true' }}
+      kept: ${{ steps.built.outputs.cache-hit == 'true' }}
       # The artifact holding the C cache and stages the run's jobs read, which a pull request that
       # bootstrapped a toolchain no cache held a stage of hands them; empty otherwise.
       stage: ${{ steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true' && github.event_name != 'push' && steps.stage-name.outputs.name || '' }}
@@ -324,13 +327,6 @@ jobs:
         if: steps.boots.outputs.yes == 'true'
         with:
           out: target/release/ply
-      # From main alone, as the stage is: a pull request's cache reaches no other run, and a `ply`
-      # kept without its stage would leave every job after to compile the toolchain's C again.
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: steps.built.outputs.cache-hit != 'true' && github.event_name == 'push'
-        with:
-          path: target/release/ply
-          key: ply-built-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}
 
       # Every job restores what this one saves, so it saves what this job's `ply`s read and wrote.
       - name: Cut the stage to what this job used
@@ -363,10 +359,46 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-      # The `ply` every suite job runs, and the one `publish` puts out on main.
+      # The `ply` every suite job runs: what the tree's own compiler builds is the same program, its
+      # unit's C whichever builder wrote it, so the suites need not wait for `self-host`.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ply
+          path: target/release/ply
+          retention-days: 2
+          if-no-files-found: error
+
+  # The `ply` build-ply bootstrapped bootstraps the tree again, so its builder is the tree's
+  # compiler as that compiler compiles it: what main publishes, and on a pull request the check
+  # that the tree builds itself, beside the suites rather than before them.
+  self-host:
+    name: Bootstrap ply again with the ply this tree built
+    needs: [build-ply]
+    if: needs.build-ply.outputs.bootstrapped == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/suite
+        with:
+          stage: ${{ needs.build-ply.outputs.stage }}
+      - uses: ./.github/actions/bootstrap
+        with:
+          driver: target/debug/ply
+          out: target/release/ply
+      # From main alone, as the stage is: a pull request's cache reaches no other run, and a `ply`
+      # kept without its stage would leave every job after to compile the toolchain's C again.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: needs.build-ply.outputs.kept != 'true' && github.event_name == 'push'
+        with:
+          path: target/release/ply
+          key: ply-built-${{ runner.os }}-${{ runner.arch }}-${{ needs.build-ply.outputs.toolchain }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'push'
+        with:
+          name: ply-self-hosted
           path: target/release/ply
           retention-days: 2
           if-no-files-found: error
@@ -550,7 +582,7 @@ jobs:
   publish:
     name: Publish main's ply for Linux and start the macOS bootstrap
     if: ${{ !cancelled() && github.event_name == 'push' && needs.ci.result == 'success' }}
-    needs: [ci]
+    needs: [ci, self-host]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -558,9 +590,11 @@ jobs:
       # `gh workflow run`.
       actions: write
     steps:
+      # The `ply` the tree's own compiler built, or where nothing was bootstrapped, the one main
+      # bootstrapped of this toolchain and kept.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ply
+          name: ${{ needs.self-host.result == 'success' && 'ply-self-hosted' || 'ply' }}
           path: /tmp/ply
       - name: Upload it to the release
         env:
@@ -877,7 +911,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [plan, clippy, build, build-ply, nextest, gates, hosts, runs, nightly, treesitter]
+    needs: [plan, clippy, build, build-ply, self-host, nextest, gates, hosts, runs, nightly, treesitter]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -888,11 +922,13 @@ jobs:
           set -euo pipefail
           echo '${{ toJSON(needs) }}' > /tmp/needs.json
           cat /tmp/needs.json
-          # The nightly job runs only at night, and a Rust a run passed runs no Rust test.
+          # The nightly job runs only at night, a toolchain nothing bootstrapped is not bootstrapped
+          # again, and a Rust a run passed runs no Rust test.
           not_ok=$(jq -r --arg passed "$PASSED" '
             to_entries[]
             | select(.value.result != "success")
             | select((.value.result == "skipped" and .key == "nightly") | not)
+            | select((.value.result == "skipped" and .key == "self-host") | not)
             | select(($passed == "true" and .value.result == "skipped"
                 and (.key == "nextest" or .key == "hosts")) | not)
             | "\(.key) = \(.value.result)"
