@@ -399,27 +399,14 @@ impl Blocks {
         }
     }
 
-    /// A page none of whose blocks is live leaves its class: kept as it is while few are, else let
-    /// go. Its segment goes back with it when that leaves the heap a segment's worth of others.
+    /// A page none of whose blocks is live leaves its class. Its segment goes back with it when that
+    /// leaves the heap a segment's worth of others.
     unsafe fn retire(&mut self, page: *mut Page) {
         unsafe {
             if (*page).listed {
                 unlink(&mut self.filling[(*page).class as usize], page);
             }
-            (*page).block = 0;
-            if self.spares < SPARES {
-                (*page).spare = true;
-                self.spares += 1;
-                push(&mut self.spare, page);
-            } else {
-                let (start, len) = room(page);
-                // A first page begins after the header, where the system's own pages need not.
-                if len == PAGE {
-                    vm::let_go(start, len);
-                }
-                push(&mut self.clean, page);
-            }
-            self.empty += 1;
+            self.shelve(page);
             let segment = segment_of(page);
             (*segment).held -= 1;
             if (*segment).held > 0 || self.empty < 2 * PAGES {
@@ -437,6 +424,27 @@ impl Blocks {
             self.empty -= PAGES;
             self.segments.remove(&segment.addr());
             vm::unmap(segment.cast(), SEGMENT);
+        }
+    }
+
+    /// Lists a page none of whose blocks is live among the emptied: kept as it is while few are,
+    /// else let go.
+    unsafe fn shelve(&mut self, page: *mut Page) {
+        unsafe {
+            (*page).block = 0;
+            (*page).spare = self.spares < SPARES;
+            if (*page).spare {
+                self.spares += 1;
+                push(&mut self.spare, page);
+            } else {
+                let (start, len) = room(page);
+                // A first page begins after the header, where the system's own pages need not.
+                if len == PAGE {
+                    vm::let_go(start, len);
+                }
+                push(&mut self.clean, page);
+            }
+            self.empty += 1;
         }
     }
 
@@ -499,6 +507,11 @@ impl Blocks {
         pages * PAGE + self.large.values().sum::<usize>()
     }
 
+    /// The bytes of the emptied pages kept as they are, not let go, for the next page needed.
+    pub fn kept(&self) -> usize {
+        self.spares * PAGE
+    }
+
     /// The bytes of the blocks handed out and not given back, each its size class's whole block: a
     /// block another thread let go of counts until this heap takes it back.
     pub fn live(&self) -> usize {
@@ -526,29 +539,36 @@ impl Blocks {
         self.reused
     }
 
-    /// Takes over everything `other` holds: its blocks are this heap's from here on.
+    /// Takes over everything `other` holds: its blocks are this heap's from here on, and its pages
+    /// with no live block are kept, let go or given back as this heap's own would be.
     pub fn adopt(&mut self, mut other: Blocks) {
         unsafe {
-            for &address in &other.segments {
+            other.segments.retain(|&address| {
                 let segment = address as *mut Segment;
+                if (*segment).pages.iter().all(|page| page.live == 0) && self.empty >= PAGES {
+                    vm::unmap(segment.cast(), SEGMENT);
+                    return false;
+                }
                 for i in 0..PAGES {
                     let page = &raw mut (*segment).pages[i];
-                    if (*page).block == 0 {
-                        if (*page).spare {
-                            self.spares += 1;
-                            push(&mut self.spare, page);
-                        } else {
-                            push(&mut self.clean, page);
+                    if (*page).live > 0 {
+                        (*page).owner.store(self.name(), Release);
+                        if (*page).listed {
+                            push_behind(&mut self.filling[(*page).class as usize], page);
                         }
+                    } else if (*page).block > 0 || (*page).spare {
+                        // A page the branch was filling holds no live block and was never retired.
+                        if (*page).block > 0 {
+                            (*segment).held -= 1;
+                        }
+                        self.shelve(page);
+                    } else {
+                        push(&mut self.clean, page);
                         self.empty += 1;
-                        continue;
-                    }
-                    (*page).owner.store(self.name(), Release);
-                    if (*page).listed {
-                        push_behind(&mut self.filling[(*page).class as usize], page);
                     }
                 }
-            }
+                true
+            });
             for (&address, &bytes) in &other.large {
                 owner(address as *mut u8, bytes).store(self.name(), Release);
             }
