@@ -45,11 +45,11 @@ impl Ctx {
 pub(super) fn metered(ctx: &mut Ctx, f: Word) -> Word {
     let before = ctx.cost();
     crate::detached::drain(ctx);
-    let held = ctx.heap.live();
+    let held = ctx.live();
     let performed = ctx.performed.len();
     let value = call_value(std::ptr::from_mut(ctx), f, &[]);
     crate::detached::drain(ctx);
-    let live = ctx.heap.live() as i64 - held as i64;
+    let live = ctx.live() as i64 - held as i64;
     heap::dec(f);
     if ctx.failed != 0 {
         return 0;
@@ -103,7 +103,7 @@ pub unsafe extern "C" fn rt_cost_mark(ctx: *mut Ctx) -> I64 {
     let c = unsafe { &mut *ctx };
     let mark = CostMark {
         cost: c.cost(),
-        live: c.heap.live() as i64,
+        live: c.live() as i64,
         performed: c.performed.len(),
     };
     c.cost_marks.push(mark);
@@ -132,7 +132,7 @@ pub unsafe extern "C" fn rt_cost_spent(ctx: *mut Ctx, mark: I64, _f: I64) {
     let (at, m) = m;
     c.cost_marks.truncate(at);
     let spent = c.cost().minus(m.cost);
-    let live = c.heap.live() as i64 - m.live;
+    let live = c.live() as i64 - m.live;
     let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
     for atom in &c.performed[m.performed.min(c.performed.len())..] {
         *counts.entry(atom.to_string()).or_insert(0) += 1;

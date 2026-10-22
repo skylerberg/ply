@@ -378,8 +378,8 @@ impl HostHandler for Toolchain {
             }
             ("heap", []) => running(span, |c| {
                 crate::payload::record(vec![
-                    ("live", crate::payload::count(c.heap.live_bytes())),
-                    ("held", crate::payload::count(c.heap.held())),
+                    ("live", crate::payload::count(c.live_bytes())),
+                    ("held", crate::payload::count(c.held())),
                 ])
             })?,
             ("census", []) => running(span, |c| {
