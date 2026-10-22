@@ -258,18 +258,12 @@ impl Block {
         unsafe { (self.desc().uniform)(ctx, self.0, args.as_ptr()) }
     }
 
-    /// Marks the function, and through its descriptor what it holds, shared, before a thread other
-    /// than this one may hold it: whether it may, its descriptor's `share` answering 0 where a
-    /// capture cannot cross threads.
+    /// Marks the function and what it holds shared, through its descriptor, before a thread other
+    /// than this one may hold it: whether it may.
     ///
     /// # Safety
     /// As [`Block::call`].
     pub unsafe fn share(&self, ctx: *mut Ctx) -> bool {
-        let o = self.obj();
-        let rc = unsafe { heap::count_of(o) };
-        if rc < SHARED {
-            unsafe { (*o).rc = rc | SHARED };
-        }
         unsafe { (self.desc().share)(ctx, self.0) != 0 }
     }
 
@@ -407,9 +401,9 @@ pub struct PlyFnDesc {
     pub convention: Word,
     /// Releases a block whose last holder let it go: its captures, then its memory.
     pub release: DropRoot,
-    /// Marks what the block holds shared, before a thread other than the one that made it may hold
-    /// it, the block's own count being its caller's to mark: anything but 0, or 0 with nothing
-    /// marked where a capture cannot cross threads.
+    /// Marks the block and what it holds shared, before a thread other than the one that made it
+    /// may hold it: anything but 0, or 0 where a capture cannot cross threads. A block is marked
+    /// only once everything it holds is, so one marked already is answered for without a walk.
     pub share: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
     /// The block copied to outlive every entry, as a memoized constant does; 0 where a capture may
     /// not outlive the entry that made it.

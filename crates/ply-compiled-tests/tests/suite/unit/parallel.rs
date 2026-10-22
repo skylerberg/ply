@@ -92,9 +92,9 @@ fn a_block_leaves_this_thread_past_every_handler_its_site_says_it_cannot_reach()
 mod emitted {
     use crate::bare::{context, helper};
     use ply_compiled::emitted::{Handed, PlyFnDesc};
-    use ply_compiled::heap::{HEADER, Word};
+    use ply_compiled::heap::{HEADER, SHARED, Word};
     use ply_compiled::rt::Ctx;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
     type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
@@ -130,6 +130,19 @@ mod emitted {
     /// Captures what may not leave this thread.
     unsafe extern "C" fn stays(_ctx: *mut Ctx, _f: Word) -> Word {
         0
+    }
+
+    static WALKED: AtomicBool = AtomicBool::new(false);
+
+    /// Shares as emitted code's roots do: what the block captures is walked only where nothing has
+    /// marked the block yet, and the block marked after it.
+    unsafe extern "C" fn walks_then_marks(_ctx: *mut Ctx, f: Word) -> Word {
+        let count = unsafe { &*(f as *const AtomicU32) };
+        if count.load(Ordering::Relaxed) < SHARED {
+            WALKED.store(true, Ordering::SeqCst);
+            count.fetch_or(SHARED, Ordering::Relaxed);
+        }
+        1
     }
 
     static UNRUN_RAN: AtomicBool = AtomicBool::new(false);
@@ -172,6 +185,7 @@ mod emitted {
     static FAILS: PlyFnDesc = desc(fails, crosses);
     static FAILS_HERE: PlyFnDesc = desc(fails, stays);
     static UNRUN: PlyFnDesc = desc(unrun, crosses);
+    static WALKS: PlyFnDesc = desc(first, walks_then_marks);
 
     fn multicore() -> bool {
         std::thread::available_parallelism().map_or(1, |n| n.get()) >= 2
@@ -197,6 +211,27 @@ mod emitted {
         free(&mut ctx, a);
         free(&mut ctx, b);
         assert_eq!(ctx.heap.live(), 0, "a branch's closure was not let go");
+        ctx.end();
+    }
+
+    /// A branch's closure is marked shared by its descriptor, which walks what it captures on the
+    /// way: one the runtime marked first would cross with its captures counted as this thread's.
+    #[test]
+    fn a_branch_crossing_threads_is_marked_by_its_descriptor() {
+        if !multicore() {
+            return;
+        }
+        let mut ctx = context();
+        ctx.begin(1_000);
+        let [a, b] = branches(&mut ctx, [&WALKS, &SECOND]);
+        assert!(
+            WALKED.load(Ordering::SeqCst),
+            "the closure was marked before its descriptor walked it"
+        );
+        assert_eq!((held(a), held(b)), (1, 2));
+        free(&mut ctx, a);
+        free(&mut ctx, b);
+        assert_eq!(ctx.heap.live(), 0);
         ctx.end();
     }
 

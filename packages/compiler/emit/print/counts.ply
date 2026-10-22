@@ -896,7 +896,8 @@ pub fn walked_value(
 /// `dropped`; `Keep` answers it kept for good, a copy on the unit's persistent heap each counted word
 /// of which is kept too, or `of` itself where it is kept already, or 0 at once, nothing walked or
 /// copied, where it is `never_kept`; `Share` marks it, and each block it reaches, shared, answering 0
-/// where a function value's capture or a runtime handle may not cross and 1 otherwise.
+/// where a function value's capture or a runtime handle may not cross and 1 otherwise, a block
+/// marked only after what it holds.
 pub fn walked(
   pr: Printing,
   depth: Int,
@@ -944,10 +945,10 @@ pub fn walked(
           );
           {
             pr: parts.pr,
-            out: [Text(Bytes::concat_all([b"if (", marked_fn(), b"(", x, b")) { "]))].concat(
+            out: [Text(Bytes::concat_all([b"if (", unshared_fn(), b"(", x, b")) { "]))].concat(
               parts.out,
             ).push(
-              Text(b" }"),
+              Text(Bytes::concat_all([b" if (", a, b") ", call_text(mark_fn(), [x]), b"; }"])),
             ),
           }
         },
@@ -1102,30 +1103,67 @@ fn sum_walked(
   let held = if op == Keep { b"*ply_into" } else { a };
   let tag = if untagged { b"" }
   else { Bytes::concat_all([b" | (ply_x & ", ascii_of_int(tag_mask()), b")"]) };
+  let opened = |b: { case: Int, ty: Type, rep: Rep, opening: Opening }|
+    Bytes::concat_all([
+      case_label(s.laid, b.case),
+      b" { Word ply_b = ",
+      if as_it_is(s.laid, b.rep) { b"ply_x" }
+      else { Bytes::concat_all([b"(ply_x & ~(Word)", ascii_of_int(tag_mask()), b")"]) },
+      b"; ",
+    ]);
+  let looped = |armed: List<Int>, arms: List<Piece>|
+    [
+      Text(
+        Bytes::concat_all([
+          b"Word ply_x = ",
+          x,
+          b"; for (;;) { Word ply_n = 0; switch (",
+          case_switched(s.laid, [b"ply_x"]),
+          b") { ",
+        ]),
+      ),
+    ].concat(
+      arms,
+    ).push(
+      Text(unarmed(s.laid, armed).concat(b"} if (!ply_n) break; ply_x = ply_n; }")),
+    );
   let arms = blocks.fold(
     { pr: pr, out: [] },
     |acc: Said, b: { case: Int, ty: Type, rep: Rep, opening: Opening }| {
       let body = case_walked(acc.pr, held, tag, op, of, b.ty, b.rep, b.opening);
-      {
-        pr: body.pr,
-        out: acc.out.push(
-          Text(
-            Bytes::concat_all([
-              case_label(s.laid, b.case),
-              b" { Word ply_b = ",
-              if as_it_is(s.laid, b.rep) { b"ply_x" }
-              else { Bytes::concat_all([b"(ply_x & ~(Word)", ascii_of_int(tag_mask()), b")"]) },
-              b"; ",
-            ]),
-          ),
-        ).concat(
-          body.out,
-        ).push(
-          Text(b" } break; "),
-        ),
-      }
+      { pr: body.pr, out: acc.out.push(Text(opened(b))).concat(body.out).push(Text(b" } break; ")) }
     },
   );
+  // A shared chain is marked once all of it is judged, block by block from its head.
+  let boxes = if op == Share {
+    blocks.filter(|b: { case: Int, ty: Type, rep: Rep, opening: Opening }|
+      !walked_by_root(b.rep, b.opening))
+  } else { [] };
+  let marking = if boxes.len() == 0 { [] } else {
+    [Text(Bytes::concat_all([b" if (", a, b") { "]))].concat(
+      looped(
+        boxes.map(|b: { case: Int, ty: Type, rep: Rep, opening: Opening }| b.case),
+        boxes.map(|b: { case: Int, ty: Type, rep: Rep, opening: Opening }|
+          Text(
+            Bytes::concat_all([
+              opened(b),
+              b"if (",
+              unshared_fn(),
+              b"(ply_b)) { ",
+              call_text(mark_fn(), [b"ply_b"]),
+              b";",
+              match chained(b.opening, of).next {
+                Some(at) -> Bytes::concat_all([b" ply_n = ", slot(b"ply_b", at), b";"]),
+                None -> b"",
+              },
+              b" } } break; ",
+            ]),
+          )),
+      ),
+    ).push(
+      Text(b" }"),
+    )
+  };
   stated(depth, {
     pr: arms.pr,
     out: [
@@ -1137,27 +1175,20 @@ fn sum_walked(
           if op == Keep { x } else { b"1" },
           b"; ",
           if op == Keep { Bytes::concat_all([b"Word *ply_into = &", a, b"; "]) } else { b"" },
-          b"Word ply_x = ",
-          x,
-          b"; for (;;) { Word ply_n = 0; switch (",
-          case_switched(s.laid, [b"ply_x"]),
-          b") { ",
         ]),
       ),
     ].concat(
-      arms.out,
-    ).push(
-      Text(
-        unarmed(
-          s.laid,
-          blocks.map(|b: { case: Int, ty: Type, rep: Rep, opening: Opening }| b.case),
-        ).concat(
-          b"} if (!ply_n) break; ply_x = ply_n; }",
-        ),
-      ),
+      looped(blocks.map(|b: { case: Int, ty: Type, rep: Rep, opening: Opening }| b.case), arms.out),
+    ).concat(
+      marking,
     ),
   })
 }
+
+/// Whether a sum's case holding a block held as `rep` and laid as `o` says walks it through its
+/// type's root rather than as a box in place.
+fn walked_by_root(rep: Rep, o: Opening) -> Bool =
+  rep == RWord || (match o { SumInPlace(_) -> true, _ -> false })
 
 /// The block `ply_b` a sum's case holds, of type `ty` held as `rep` and laid as `o` says, walked as
 /// `op` does, into `held`: the object of a pointer, or a sum of one word, laid in place through its
@@ -1173,7 +1204,7 @@ fn case_walked(
   rep: Rep,
   o: Opening,
 ) -> Said / {abort.raise} =
-  match ((op, rep == RWord || (match o { SumInPlace(_) -> true, _ -> false }))) {
+  match ((op, walked_by_root(rep, o))) {
     (Keep, true) -> {
       let c = rooted_call(pr, root_of(Keep, ty), RWord, b"ply_b");
       {
@@ -1238,7 +1269,7 @@ fn case_walked(
           };
           {
             pr: slots.pr,
-            out: [Text(Bytes::concat_all([b"if (", marked_fn(), b"(ply_b)) { "]))].concat(
+            out: [Text(Bytes::concat_all([b"if (", unshared_fn(), b"(ply_b)) { "]))].concat(
               slots.out,
             ).push(
               Text(Bytes::concat_all([on, b" }"])),
@@ -1335,12 +1366,16 @@ pub fn kept_block_fn() -> Bytes = b"ply_kept_block"
 /// and payload words, held once: what a copy copies a block into.
 pub fn fresh_block_fn() -> Bytes = b"ply_fresh_block"
 
-/// The head's C function marking the block `x` shared where it is one held by this thread alone,
-/// answering whether it marked it.
-pub fn marked_fn() -> Bytes = b"ply_marked_shared"
+/// The head's C function answering whether `x` is a block this thread alone holds: not marked shared,
+/// immortal or counted by its holder.
+pub fn unshared_fn() -> Bytes = b"ply_unshared"
 
-/// The definitions of `kept_block_fn`, `fresh_block_fn` and `marked_fn`. A copy takes each header
-/// field but the count, which its allocation sets.
+/// The head's C function marking the block `x` shared. A share marks a block only once what it
+/// holds may cross, so a block marked is one judged.
+pub fn mark_fn() -> Bytes = b"ply_mark_shared"
+
+/// The definitions of `kept_block_fn`, `fresh_block_fn`, `unshared_fn` and `mark_fn`. A copy takes
+/// each header field but the count, which its allocation sets.
 pub fn walk_helpers() -> Bytes = {
   let copied = |made: Bytes|
     Bytes::concat_all([
@@ -1368,12 +1403,15 @@ pub fn walk_helpers() -> Bytes = {
     fresh_block_fn(),
     copied(b"rt_alloc_bytes_p"),
     b"static inline int ",
-    marked_fn(),
-    b"(Word x) { if (!x || ",
+    unshared_fn(),
+    b"(Word x) { return x && ",
     field(b"x", b"rc"),
-    b" >= UINT32_C(0x80000000)) return 0; ",
+    b" < UINT32_C(0x80000000); }\n",
+    b"static inline void ",
+    mark_fn(),
+    b"(Word x) { ",
     field(b"x", b"rc"),
-    b" |= UINT32_C(0x80000000); return 1; }\n",
+    b" |= UINT32_C(0x80000000); }\n",
   ])
 }
 
@@ -2568,10 +2606,19 @@ test "a sum of one word walks the block its case holds, a chain of its own type 
   let shared = walk(Share);
   [
     b"Word t1 = 1; Word ply_x = p0; for (;;) { Word ply_n = 0; switch (",
-    Bytes::concat_all([b"if (", marked_fn(), b"(ply_b)) {"]),
+    Bytes::concat_all([b"if (", unshared_fn(), b"(ply_b)) {"]),
     b" ply_n = ply_words(ply_b)[1]; }",
     Bytes::concat_all([b"if (!", root_spelled(root_of(Share, string)), b"(ctx, ply_b)) t1 = 0;"]),
-  ].fold((), |_: Unit, part: Bytes| assert(shared.contains(part), None));
+    // Marked from its head only once all of it may cross, so a chain a share refused stays unmarked.
+    b" if (t1) { Word ply_x = p0; for (;;) {",
+    Bytes::concat_all([
+      b"if (",
+      unshared_fn(),
+      b"(ply_b)) { ",
+      call_text(mark_fn(), [b"ply_b"]),
+      b"; ply_n = ply_words(ply_b)[1]; } } break;",
+    ]),
+  ].fold((), |_: Unit, part: Bytes| assert(shared.contains(part), Some(String::of_bytes_lossy(shared))));
   // However long the chain, no walk calls its own root: the loop goes on to the rest.
   assert(!kept.contains(root_spelled(root_of(Keep, own))), None);
   assert(!shared.contains(root_spelled(root_of(Share, own))), None)
@@ -2583,10 +2630,19 @@ test "a box shared marks it and shares each block it holds; kept, it is copied f
   let share = keys::written(Share, string, b"std.prelude");
   let keep = keys::written(Keep, string, b"std.prelude");
   let shared = walked_said(Share, boxed, dropping_of(b"m.R"));
-  // Marked shared once, and its word shared through the word's own root.
+  // Its word shared through the word's own root, then it marked, where nothing has marked it yet.
   assert(
-    shared.text.contains(call_text(marked_fn(), [b"p0"]))
-      && shared.text.contains(Bytes::concat_all([root_spelled(share), b"(ctx, ply_words(p0)[0])"])),
+    shared.text.contains(
+      Bytes::concat_all([
+        b"if (",
+        call_text(unshared_fn(), [b"p0"]),
+        b") { if (ply_words(p0)[0] && !",
+        root_spelled(share),
+        b"(ctx, ply_words(p0)[0])) t1 = 0; if (t1) ",
+        call_text(mark_fn(), [b"p0"]),
+        b"; }",
+      ]),
+    ),
     Some(String::of_bytes_lossy(shared.text)),
   );
   assert_eq(shared.calls, [share]);
@@ -2679,10 +2735,15 @@ test "what is or reaches a runtime handle, a hold or a function value is kept as
   );
   assert(plain.text.contains(call_text(kept_block_fn(), [b"ctx", b"p0", b"32"])), None);
   assert_eq(plain.calls, [root_of(Keep, int), root_of(Keep, string)]);
-  // Shared, a channel still refuses to cross.
+  // Shared, a channel still refuses to cross, and what holds it is left unmarked.
   assert(
     walked_said(Share, captured(chan), dropped).text.contains(
-      Bytes::concat_all([call_text(marked_fn(), [b"p0"]), b") { if (ply_words(p0)[1]) t1 = 0; }"]),
+      Bytes::concat_all([
+        call_text(unshared_fn(), [b"p0"]),
+        b") { if (ply_words(p0)[1]) t1 = 0; if (t1) ",
+        call_text(mark_fn(), [b"p0"]),
+        b"; }",
+      ]),
     ),
     None,
   )
