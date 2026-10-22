@@ -141,6 +141,32 @@ pub(crate) fn swap_running(c: *mut Ctx) -> *mut Ctx {
     RUNNING.with(|r| r.replace(c))
 }
 
+/// `f` of the context whose entry runs on this thread, which a host operation that entry performs
+/// reads while the entry waits on it; `None` outside an entry.
+pub fn with_running<T>(f: impl FnOnce(&Ctx) -> T) -> Option<T> {
+    unsafe { RUNNING.with(std::cell::Cell::get).as_ref() }.map(f)
+}
+
+/// A record shape's fields or a constructor's name, as a tally of objects by layout tells them.
+fn layout_named(layouts: &heap::Layouts, kind: u8, key: u32) -> Option<String> {
+    match kind {
+        heap::KIND_CTOR => layouts
+            .ctors
+            .get(key as usize)
+            .map(|(name, _)| format!("`{name}`")),
+        heap::KIND_RECORD if (key as usize) < layouts.shape_count() => Some(format!(
+            "{{{}}}",
+            layouts
+                .shape_names(key)
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ => None,
+    }
+}
+
 impl Ctx {
     pub fn new(tables: Arc<Tables>) -> Ctx {
         Ctx {
@@ -495,34 +521,42 @@ impl Ctx {
             }
             let layouts = &self.tables.layouts;
             for ((kind, key), n) in self.heap.allocated_by_layout().into_iter().take(24) {
-                let what = match kind {
-                    heap::KIND_CTOR => format!("`{}`", layouts.ctors[key as usize].0),
-                    heap::KIND_RECORD => format!(
-                        "{{{}}}",
-                        layouts
-                            .shape_names(key)
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
+                let what = layout_named(layouts, kind, key).unwrap_or_else(|| match kind {
                     heap::KIND_BYTES => format!("bytes under {key}"),
                     heap::KIND_REFUSED => format!("emitted blocks of {key} bytes past the header"),
                     _ => format!("str under {key}"),
-                };
+                });
                 eprintln!("  allocated: {n} of {what}");
             }
-            let live = self.heap.live_by_kind();
+            let live = self.census();
             if live.iter().map(|(_, n, _)| n).sum::<usize>() > 1000 {
-                for (kind, n, bytes) in live {
+                for (what, n, bytes) in live.into_iter().take(24) {
                     eprintln!(
-                        "  live at end: kind {kind}: {n} objects, {}MB",
+                        "  live at end: {what}: {n} objects, {}MB",
                         bytes / 1_000_000
                     );
                 }
             }
         }
         self.heap.end();
+    }
+
+    /// The entry's live objects by what they are, the most bytes first, with their count and payload
+    /// bytes: a record by its shape's fields, a constructor by its name, a block emitted code laid
+    /// out, whose header names no type, by its payload bytes, and any other object by its kind.
+    pub fn census(&self) -> Vec<(String, usize, usize)> {
+        let layouts = &self.tables.layouts;
+        self.heap
+            .census()
+            .into_iter()
+            .map(|((kind, key), n, bytes)| {
+                let what = layout_named(layouts, kind, key).unwrap_or_else(|| match kind {
+                    heap::KIND_REFUSED => format!("emitted blocks of {key} bytes past the header"),
+                    _ => heap::kind_name(kind),
+                });
+                (what, n, bytes)
+            })
+            .collect()
     }
 
     /// The singleton a nullary constructor is.

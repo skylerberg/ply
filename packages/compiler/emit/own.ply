@@ -416,7 +416,7 @@ fn facts_of(f: Fn) -> Facts = {
         None -> acc,
       },
   );
-  let alias = first.gets.fold(
+  let direct = first.gets.fold(
     Map::new(),
     |m: Map<Int, Var>, id: Int, g: { of: Int, path: Path }|
       match words.opened.get(g.of) {
@@ -430,7 +430,7 @@ fn facts_of(f: Fn) -> Facts = {
         None -> match first.vars.get(g.of) {
           Some(x) -> match first.vars.get(id) {
             Some(y) -> match payload_of(Get({ of: x, path: g.path }), y) {
-              Some(_) -> m.insert(id, match m.get(x.id) { Some(t) -> t, None -> x }),
+              Some(_) -> m.insert(id, x),
               None -> m,
             },
             None -> m,
@@ -439,6 +439,8 @@ fn facts_of(f: Fn) -> Facts = {
         },
       },
   );
+  let alias = direct.fold(Map::new(), |m: Map<Int, Var>, id: Int, v: Var|
+    m.insert(id, aliased(direct, v, direct.len())));
   let read = if words.opened.len() == 0 && alias.len() == 0 { first } else {
     // The words first, so what is read out of a word's alias is read out of the word.
     let start = words.opened.fold(
@@ -841,7 +843,7 @@ fn gathered(fx: Facts, b: Block) -> Facts =
         None -> if acc.immortal.contains(l.var.id) { holding_none(acc, l.var) } else {
           // A borrowed value held again as another is read, and holds as that one does.
           let a = match re_held(l.var, l.val) {
-            Some(x) -> match acc.held.get(x.id) {
+            Some(x) -> match held_through(acc, x) {
               Some(ReadOf(_)) -> ReadsOf([x]),
               _ -> answer_held(l.val),
             },
@@ -900,12 +902,19 @@ fn base_of(fx: Facts, v: Var) -> List<Int> = {
   match fx.held.get(x.id) { Some(Own) -> [x.id], Some(ReadOf(bs)) -> flattened(fx, bs), None -> [] }
 }
 
-/// `bs` with each borrowed join among them as what it was read out of: a join's holding is settled
-/// after the values read out of it took it as their base.
 /// How `v` is held: an alias, a sum's payload that is its one count, as the sum it is read out of is.
 fn held_through(fx: Facts, v: Var) -> Option<Held> =
   match fx.alias.get(v.id) { Some(t) -> fx.held.get(t.id), None -> fx.held.get(v.id) }
 
+/// What `v` stands for through the aliases `direct` names, each the value it was read out of: a
+/// payload's payload is the outermost sum's count, however the two are numbered. `depth` bounds the
+/// chain, which `direct`'s size does.
+fn aliased(direct: Map<Int, Var>, v: Var, depth: Int) -> Var =
+  if depth <= 0 { v }
+  else { match direct.get(v.id) { Some(t) -> aliased(direct, t, depth - 1), None -> v } }
+
+/// `bs` with each borrowed join among them as what it was read out of: a join's holding is settled
+/// after the values read out of it took it as their base.
 fn flattened(fx: Facts, bs: List<Int>) -> List<Int> =
   bs.fold([], |acc: List<Int>, b: Int|
     ints_joined(acc, match fx.held.get(b) { Some(ReadOf(cs)) -> cs, _ -> [b] }))
@@ -2454,6 +2463,69 @@ test "an answer handed back borrowed takes no count, and a join of borrowed valu
     }),
     { body: [Decl(either), maybe, Return(AVar(either))], refused: None },
   )
+}
+
+test "a sum's payload that is its one count, held again as another sum's word, is borrowed as the sum is" {
+  let text = TyCon({ name: b"String", args: [] });
+  let opt = |inner: Type| TyCon({ name: b"Option", args: [inner] });
+  let m = { id: 0, ty: opt(text), rep: maybe_word() };
+  let s = word(1);
+  let y = { id: 2, ty: opt(text), rep: maybe_word() };
+  let some_of = |of: Var| bind(s, Get({ of: of, path: PCase({ case: 1, at: 0 }) }), []);
+  let answering = |p: Var, body: Block, answered: Returned| {
+    let f = root_of([p], [0], maybe_word(), body);
+    { ..f, conv: { ..f.conv, answered: answered } }
+  };
+  let whole = Borrowed([{ param: 0, whole: true }]);
+  // `Some(x) -> Some(x)`, packed or gathered.
+  [Pack({ arg: AVar(s), to: maybe_word() }), Gathered({ parts: [AInt(1), AVar(s)] })].fold(
+    (),
+    |_: Unit, val: Val| {
+      let body = [some_of(m), bind(y, val, []), Return(AVar(y))];
+      assert_eq(counted_body(answering(m, body, whole)), { body: body, refused: None });
+      assert_eq(counted_body(answering(m, body, Owned)), {
+        body: [some_of(m), bind(y, val, []), Inc({ var: y, n: 1 }), Return(AVar(y))],
+        refused: None,
+      })
+    },
+  );
+  let again = bind(y, Gathered({ parts: [AInt(1), AVar(s)] }), []);
+  // `Some(V(x)) -> Some(x)`: a payload's payload is the outer sum's count.
+  let v = TyCon({ name: b"m.V", args: [] });
+  let n = { id: 0, ty: opt(v), rep: maybe_word() };
+  let inner = {
+    id: 3,
+    ty: v,
+    rep: RSum({
+      laid: {
+        classes: [P],
+        cases: [
+          { test: Always, payload: Inline({ offset: 0, laid: LWords([P]), stripped: None }) },
+        ],
+      },
+      cases: [b"m.V"],
+    }),
+  };
+  let nested = [
+    bind(inner, Get({ of: n, path: PCase({ case: 1, at: 0 }) }), []),
+    bind(s, Get({ of: inner, path: PCase({ case: 0, at: 0 }) }), []),
+    again,
+    Return(AVar(y)),
+  ];
+  assert_eq(counted_body(answering(n, nested, whole)), { body: nested, refused: None });
+  // `match r.f { Some(x) -> Some(x) }`: the sum read out of what the root is lent.
+  let r = word(0);
+  let f = { ..m, id: 3 };
+  let field = [
+    bind(f, Get({ of: r, path: PField({ name: b"f", at: 0 }) }), []),
+    some_of(f),
+    again,
+    Return(AVar(y)),
+  ];
+  assert_eq(counted_body(answering(r, field, Borrowed([{ param: 0, whole: false }]))), {
+    body: field,
+    refused: None,
+  })
 }
 
 test "a record is made by value, so one let go of lends its cells to none" {

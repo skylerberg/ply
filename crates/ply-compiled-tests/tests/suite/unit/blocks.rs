@@ -140,6 +140,57 @@ fn an_adopted_heaps_blocks_are_the_adopters() {
     assert!(next.iter().all(|block| parent.holds(block.addr())));
 }
 
+/// Branches that each emptied all but one page cost their adopter those pages and no more.
+#[test]
+fn an_adopter_keeps_no_more_emptied_pages_than_of_its_own() {
+    let mut parent = Blocks::default();
+    let live: Vec<*mut u8> = (0..100)
+        .map(|_| {
+            let mut branch = Blocks::default();
+            let blocks: Vec<*mut u8> = (0..4_000).map(|_| branch.take(1024)).collect();
+            for &block in &blocks[1..] {
+                unsafe { branch.give(block, 1024) };
+            }
+            assert!(branch.kept() > 0);
+            parent.adopt(branch);
+            blocks[0]
+        })
+        .collect();
+    assert!(parent.kept() <= 2 * MIB, "{} bytes kept", parent.kept());
+    assert!(
+        parent.held() <= live.len() * (64 << 10),
+        "{} bytes held",
+        parent.held()
+    );
+    for block in live {
+        unsafe { parent.give(block, 1024) };
+    }
+    assert!(
+        parent.mapped() <= 8 * MIB,
+        "{} bytes mapped",
+        parent.mapped()
+    );
+}
+
+#[test]
+fn an_adopted_segment_with_no_live_block_goes_back() {
+    let mut parent = Blocks::default();
+    for _ in 0..100 {
+        let mut branch = Blocks::default();
+        let blocks: Vec<*mut u8> = (0..4_000).map(|_| branch.take(1024)).collect();
+        for block in blocks {
+            unsafe { branch.give(block, 1024) };
+        }
+        parent.adopt(branch);
+    }
+    assert!(
+        parent.mapped() <= 4 * MIB,
+        "{} bytes mapped",
+        parent.mapped()
+    );
+    assert_eq!(parent.held(), 0);
+}
+
 #[test]
 fn a_reset_heap_holds_nothing_and_hands_out_afresh() {
     let mut b = Blocks::default();
