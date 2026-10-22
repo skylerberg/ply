@@ -20,9 +20,9 @@ import emit.roots (builtin_helper, symbol_of, entry_of, root_id)
 import emit.keys
 import emit.keys (RootKey, Named, At, Written, Test, Cases, Clause, Stored, Entered, Requires,
                   Ensures, LawGuard, LawBody, FnArg, KeyArg, KeyType, KeyLayout, RootName,
-                  root_name, root_text, definition_of, sited_as, key_lent, key_types, at_key,
-                  module_of, modules_lowered, key_bytes, root_key_bin, test_key, law_key,
-                  entry_name)
+                  root_name, root_text, definition_of, definition_root, sited_as, key_lent,
+                  key_types, at_key, module_of, modules_lowered, key_bytes, root_key_bin, test_key,
+                  law_key, entry_name)
 import store.kept (Record, kept_records, with_kept)
 import emit
 import emit.lend (Handing, handed_from)
@@ -1849,8 +1849,9 @@ fn answers_in(
     Ok(s) -> emit::answered(s, roots, handed),
   }
 
-/// The lists an ask of the emitter is dealt over, answered at once: about as many as the cores.
-fn pieces() -> Int = 8
+/// The lists an ask of the emitter is dealt over, answered at once: several to a core, so the cores
+/// a list that lowers for longer than it weighs leaves idle take the others.
+fn pieces() -> Int = 16
 
 type Piece = { weight: Int, roots: List<RootKey> }
 
@@ -1859,23 +1860,17 @@ type Piece = { weight: Int, roots: List<RootKey> }
 fn written_weight() -> Int = 256
 
 /// `missed` as at most `pieces()` lists that lower about as much each, the heaviest first onto the
-/// lightest list: a module's roots together (`dealt_module`), since the emitter forms a loop of them
-/// in one call, weighing the text they are written in, and each root written for a type alone.
+/// lightest list, each root weighing the text it is written in: the roots of a definition together
+/// (`dealt_with`), since each list asking for one prepares the definition, and any other alone.
 fn dealt(p: Program, missed: List<RootKey>) -> List<List<RootKey>> / {abort.raise} = {
   let weight = |k: RootKey|
     match p.roots.get(sited_as(k)) { Some(r) -> r.at.end - r.at.start, None -> written_weight() };
-  let by_module = missed.fold(Map::new(), |acc: Map<Bytes, Piece>, k: RootKey|
-    match k {
-      Written(_, _) -> acc,
-      _ -> {
-        let m = dealt_module(k);
-        let had = match acc.get(m) { Some(x) -> x, None -> { weight: 0, roots: [] } };
-        acc.insert(m, { weight: had.weight + weight(k), roots: had.roots.push(k) })
-      },
-    });
-  let weighed = missed.fold(by_module.values(), |acc: List<Piece>, k: RootKey|
-    match k { Written(_, _) -> acc.push({ weight: weight(k), roots: [k] }), _ -> acc });
-  let heaviest_first = weighed.sort_by(|a: Piece, b: Piece| a.weight >= b.weight);
+  let together = missed.fold(Map::new(), |acc: Map<Bytes, Piece>, k: RootKey| {
+    let d = dealt_with(k);
+    let had = match acc.get(d) { Some(x) -> x, None -> { weight: 0, roots: [] } };
+    acc.insert(d, { weight: had.weight + weight(k), roots: had.roots.push(k) })
+  });
+  let heaviest_first = together.values().sort_by(|a: Piece, b: Piece| a.weight >= b.weight);
   let dealt = heaviest_first.fold([], |acc: List<Piece>, m: Piece|
     if acc.len() < pieces() { acc.push(m) } else {
       let lightest = range(0, acc.len()).fold(0, |best: Int, i: Int|
@@ -2036,6 +2031,14 @@ fn places_of(p: Program) -> Map<Bytes, Int> / {abort.raise} = {
 /// module, which its call lowers too.
 fn dealt_module(k: RootKey) -> Bytes / {abort.raise} =
   match key_lent(k).at(0) { Some(f) -> module_of(f.owner), None -> module_of(k) }
+
+/// What a root is dealt with: the definition it is formed from (`definition_root`), its lender's
+/// where it runs a lambda in place, which its form reads; a root of no definition alone.
+fn dealt_with(k: RootKey) -> Bytes / {abort.raise} =
+  match key_lent(k).at(0) {
+    Some(f) -> dealt_with(f.owner),
+    None -> match definition_root(k) { Some(d) -> d, None -> root_text(root_name(k)) },
+  }
 
 /// What asking the emitter for some roots came to: their answers, and what the emitter holds for the
 /// next ask.
@@ -3857,24 +3860,31 @@ test "roots written for types are dealt apart, however many one module writes" {
   assert_eq(lists.fold(0, |n: Int, roots: List<RootKey>| n + roots.len()), pieces() + 1)
 }
 
-test "roots are dealt a module at a time, each once, over no more lists than there are pieces" {
+test "roots are dealt a definition at a time, each once, over no more lists than there are pieces" {
   let dump = three_modules_dump();
   let p = program_of(dump, three_modules());
-  let missed = offered_roots(dump).keys;
+  let lent = at_key(b"c.even", [string_type()], [{ param: 0, owner: Named(b"b.g"), nth: 0 }]);
+  let missed = offered_roots(dump).keys.concat([at_key(b"c.h", [string_type()], []), lent]);
   let lists = dealt(p, missed);
-  // Fewer modules than pieces: a list a module.
-  assert_eq(lists.len(), ordered(missed.map(module_of)).len());
+  // Fewer definitions than pieces: a list a definition, each with its specialisations, and one
+  // running a lambda in place with its lender.
+  assert_eq(lists.len(), ordered(missed.map(dealt_with)).len());
+  assert_eq(dealt_with(lent), b"b.g");
   assert_eq(
     names_ordered(
       lists.fold([], |acc: List<RootName>, roots: List<RootKey>| acc.concat(roots.map(root_name))),
     ),
     names_ordered(missed.map(root_name)),
   );
-  assert_eq(lists.fold(0, |n: Int, roots: List<RootKey>| n + roots.len()), missed.len());
-  let modules = |roots: List<RootKey>| ordered(roots.map(module_of));
+  let definitions = |roots: List<RootKey>| ordered(roots.map(dealt_with));
   assert_eq(
-    lists.fold(0, |n: Int, roots: List<RootKey>| n + modules(roots).len()),
-    modules(missed).len(),
+    lists.fold(0, |n: Int, roots: List<RootKey>| n + definitions(roots).len()),
+    definitions(missed).len(),
+  );
+  // A module's definitions are dealt apart.
+  assert(
+    lists.filter(|roots: List<RootKey>| roots.any(|k: RootKey| module_of(k) == b"c")).len() > 1,
+    None,
   );
   let many = range(0, 3 * pieces()).map(|i: Int|
     Named(Bytes::concat_all([b"m", ascii_of_int(i), b".f"])));
