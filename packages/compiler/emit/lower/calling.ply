@@ -28,7 +28,7 @@ import emit.tir (Rep, RInt, RBool, RWord, RSlice, RSum, RUnit, Var, Arg, AVar, A
                  rep_of_arg, counted)
 import emit.tir.calling (ConstantRead, Ticked)
 import emit.lower.setting (Setting, Root, imported_target, ctor_named)
-import emit.lower.held (held_as, case_index, arg_word, typed_convention, laid_held)
+import emit.lower.held (held_as, case_index, arg_word, typed_convention, laid_held, value_words)
 import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
                         ToInPlace, Frame, Opened, GroupMember, Restarts, Enters, Calls, refuse,
                         fresh, bound_as, done, emitted, opened, nested, unnested, with_lambda,
@@ -260,11 +260,17 @@ pub fn global(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered / {ab
     None -> unfiled(cx, st, b"a name read as a value", at),
     Some(t) -> match t.ty {
       TyFn(f) -> {
-        let frame = { params: f.params.len(), size: f.params.len(), captures: [], resumes: false };
+        let func = { node: NVar({ name: name, slot: None }), span: at };
+        let frame = {
+          params: f.params.len(),
+          size: f.params.len(),
+          captures: [],
+          resumes: false,
+          body: func,
+        };
         let o = lambda_opened(cx, st, frame, at);
         let params = range(0, frame.params).fold([], |acc: List<Arg>, j: Int|
           match o.st.env.get(j) { Some(a) -> acc.push(a), None -> acc });
-        let func = { node: NVar({ name: name, slot: None }), span: at };
         closure(
           cx,
           st,
@@ -513,6 +519,7 @@ fn in_frame(
         else { done(sited, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at) },
         None -> done(sited, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at),
       };
+      let held = captures_held(cx, k.lambda.body, k.lambda.captures);
       let caps = range(0, k.lambda.captures.len()).fold(
         { st: counted, env: Map::new() },
         |acc: { st: Lowering, env: Map<Int, Arg> }, i: Int|
@@ -522,8 +529,8 @@ fn in_frame(
               let read = bound_as(
                 acc.st,
                 captured_type(cx, st, k.lambda, i),
-                RWord,
-                Get({ of: closure, path: PCapture(i) }),
+                match held.at(i) { Some(r) -> r, None -> RWord },
+                Get({ of: closure, path: PCapture(capture_at(held, i)) }),
                 at,
               );
               { st: read.st, env: acc.env.insert(c.dst, read.arg) }
@@ -1158,20 +1165,23 @@ pub fn closure(
         ..after,
         lambdas: after.lambdas.set(nth, Closure({ body: body, captures: s.captures, at: at })),
       };
-      let caps = frame.captures.fold(
+      // Each capture laid in the closure as its body holds it.
+      let caps = range(0, frame.captures.len()).fold(
         { st: captured(cx, placed, frame.captures, at), args: [] },
-        |acc: { st: Lowering, args: List<Arg> }, c: Capture|
-          match acc.st.env.get(c.src) {
+        |acc: { st: Lowering, args: List<Arg> }, i: Int| {
+          let rep = match s.params.at(i) { Some(q) -> q.rep, None -> RWord };
+          match match frame.captures.at(i) { Some(c) -> acc.st.env.get(c.src), None -> None } {
             Some(a) -> {
-              let h = handed({ st: acc.st, arg: a }, RWord, at);
+              let h = handed({ st: acc.st, arg: a }, rep, at);
               { st: h.st, args: acc.args.push(h.arg) }
             },
             None ->
               {
                 st: refuse(acc.st, Calling, b"a capture nothing bound").st,
-                args: acc.args.push(AZero(RWord)),
+                args: acc.args.push(AZero(rep)),
               },
-          },
+          }
+        },
       );
       bound_as(
         function_laid(captures_released(caps.st, s.params.take(s.captures)), s.ty),
@@ -1361,15 +1371,18 @@ fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Option<Sha
       let continued = |j: Int| frame.resumes && j == frame.params - 1;
       let answer = if frame.resumes { RWord } else { held_as(cx.setting, f.ret) };
       let n = frame.captures.len();
-      let caps = range(0, n).map(|i: Int|
+      let held = captures_held(cx, frame.body, frame.captures);
+      let caps = range(0, n).map(|i: Int| {
+        let rep = match held.at(i) { Some(r) -> r, None -> RWord };
         {
           id: i,
           ty: match frame.captures.at(i) {
             Some(c) -> match env.get(c.src) { Some(a) -> type_of(a), None -> unknown_type() },
             None -> unknown_type(),
           },
-          rep: RWord,
-        });
+          rep: rep,
+        }
+      });
       let own = f.params.fold([], |acc: List<Var>, t: Type| {
         let j = acc.len();
         acc.push(if continued(j) {
@@ -1424,6 +1437,20 @@ fn capture_type(st: Lowering, at: Span, i: Int) -> Type =
       } else { acc },
       None -> acc,
     })
+
+/// How a closure of the body `body` holds each of `captures` in its block: as the type the checker
+/// filed where the body reads it holds it, which the closure's maker and a body another root runs
+/// in place read alike; as a word where the body reads it nowhere.
+fn captures_held(cx: Context, body: Code, captures: List<Capture>) -> List<Rep> =
+  captures.map(|c: Capture|
+    match slot_read_at(body, c.dst) {
+      Some(at) -> match filed(cx, at) { Some(t) -> held_as(cx.setting, t.ty), None -> RWord },
+      None -> RWord,
+    })
+
+/// The words of a closure's block before capture `i`, its captures held as `held`.
+fn capture_at(held: List<Rep>, i: Int) -> Int =
+  held.take(i).fold(0, |n: Int, r: Rep| n + value_words(r))
 
 /// The type capture `i` of `l` holds: as this root's closure of `l` took it, or for a lambda another
 /// root made the closure of, as the checker filed a read of the capture in `l`'s body.
