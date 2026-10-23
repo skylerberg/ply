@@ -662,7 +662,7 @@ impl Ctx {
     }
 
     pub(crate) fn fail(&mut self, d: Diagnostic) -> i64 {
-        self.fail_with(1, d)
+        self.fail_with(FAILED, d)
     }
 
     /// Fails as a raise of `abort.raise`, bound for the innermost `handle` in reach with a clause

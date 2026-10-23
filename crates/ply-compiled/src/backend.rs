@@ -693,13 +693,20 @@ impl Bodies {
                 .primary(ctx.site(), "the call that overran it"),
             )
         } else {
-            ctx.take_failure().or_else(|| {
-                (ctx.failed == crate::rt::FAILED_UNWIND).then(|| {
+            ctx.take_failure().or_else(|| match ctx.failed {
+                crate::rt::FAILED_UNWIND => Some(ply_core::Diagnostic::error(
+                    ply_core::codes::RUNTIME_ERROR,
+                    "a `handle` clause unwound past the compiled fragment's entry",
+                )),
+                // Every failure records why; one that did not is a fault to find, not a decline.
+                crate::rt::FAILED => Some(
                     ply_core::Diagnostic::error(
-                        ply_core::codes::RUNTIME_ERROR,
-                        "a `handle` clause unwound past the compiled fragment's entry",
+                        ply_core::codes::INTERNAL_ERROR,
+                        "the compiled body failed without recording why",
                     )
-                })
+                    .primary(ctx.site(), "the last site it reached"),
+                ),
+                _ => None,
             })
         };
         ctx.end();

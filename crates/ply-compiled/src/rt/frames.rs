@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// `Ctx::failed` when the entry failed with the diagnostic it records.
+pub const FAILED: i64 = 1;
+
 /// `Ctx::failed` when the fuel ran out.
 pub const FAILED_OUT_OF_FUEL: i64 = 2;
 
