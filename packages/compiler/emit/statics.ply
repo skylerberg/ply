@@ -20,7 +20,8 @@ import emit.tir (Fn, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Val, L
                  Gathered, Pack, RInt, RBool, RFloat, RNum, RImm, RUnit, RFlat, RDec, RWord, RSum,
                  Rep, Var, Return, Rooted, Kept, Owned, Lambda, Closure, no_links, rep_of_arg,
                  in_box)
-import emit.lower.held (values_of, words_held, held_with, laid_held)
+import emit.lower.held (values_of, words_held, held_with, laid_held, record_fields, record_parts,
+                        RecordPart, case_parts)
 import emit.tir.statics (StaticDef, StaticLaid, SBlock, SFile, WRaw, named, text_block, wide_kind,
                          str_kind, bytes_kind)
 import emit.tir.statics (SPlain, WBytes, WAddress, StaticWord, int_kind, float_kind, decimal_kind,
@@ -412,12 +413,7 @@ fn joined(a: Laying, b: Laying) -> Laying =
   { words: a.words.concat(b.words), defs: a.defs.concat(b.defs) }
 
 /// The types of a record's fields in its type's order; none for another type.
-fn record_types(ty: Type) -> List<Type> =
-  match ty {
-    TyRecord(fs) -> fs.map(|f: Field| f.ty),
-    TyNominal(n) -> n.fields.map(|f: Field| f.ty),
-    _ -> [],
-  }
+fn record_types(ty: Type) -> List<Type> = record_fields(ty).map(|f: Field| f.ty)
 
 fn mislaid<a>(ty: Type) -> a / {abort.raise} =
   panic(
@@ -529,18 +525,6 @@ fn known_as(
       },
     }
   };
-  let parts = |types: List<Type>, ks: List<Known>, first: List<Arg>, laid: Bool|
-    if types.len() != ks.len() { mislaid(ty) } else {
-      range(0, ks.len()).fold(
-        { args: first, b: b },
-        |acc: { args: List<Arg>, b: Binding }, i: Int| {
-          let t = types.get(i);
-          let h = known_as(ctors, t, ks.get(i), acc.b, if laid { laid_held(ctors, t) }
-          else { held_with(ctors, t) });
-          { args: acc.args.push(h.arg), b: h.b }
-        },
-      )
-    };
   let raw = match k { KnownWord(n) -> n, _ -> 0 };
   let scalar = |a: Arg| match k { KnownWord(_) -> { arg: a, b: b }, _ -> mislaid(ty) };
   match rep {
@@ -560,9 +544,15 @@ fn known_as(
       _ -> mislaid(ty),
     },
     RFlat(_) -> match k {
-      KnownRecord(ks) -> {
-        let p = parts(record_types(ty), ks, [], true);
-        bound(p.b, rep, Gathered({ parts: p.args.filter(|a: Arg| rep_of_arg(a) != RUnit) }))
+      KnownRecord(ks) -> if ks.len() != record_fields(ty).len() { mislaid(ty) } else {
+        let p = record_parts(ctors, ty).fold(
+          { args: [], b: b },
+          |acc: { args: List<Arg>, b: Binding }, part: RecordPart| {
+            let h = known_as(ctors, part.ty, ks.get(part.field), acc.b, part.rep);
+            { args: acc.args.push(h.arg), b: h.b }
+          },
+        );
+        bound(p.b, rep, Gathered({ parts: p.args }))
       },
       _ -> mislaid(ty),
     },
@@ -574,12 +564,19 @@ fn known_as(
             let box = bound(b, RWord, Static(l.defs.get(l.defs.len() - 1).name));
             bound(box.b, rep, Gathered({ parts: [AInt(c.case), box.arg] }))
           },
-          _ -> match ctors.sums.get(t.name) {
-            Some(cs) -> {
-              let p = parts(ctor_fields_at(cs.get(c.case), t.args), c.args, [AInt(c.case)], true);
+          _ -> {
+            let cps = case_parts(ctors, ty, c.case);
+            if cps.len() != c.args.len() { mislaid(ty) } else {
+              let p = range(0, cps.len()).fold(
+                { args: [AInt(c.case)], b: b },
+                |acc: { args: List<Arg>, b: Binding }, i: Int| {
+                  let cp = cps.get(i);
+                  let h = known_as(ctors, cp.ty, c.args.get(i), acc.b, cp.rep);
+                  { args: acc.args.push(h.arg), b: h.b }
+                },
+              );
               bound(p.b, rep, Gathered({ parts: p.args }))
-            },
-            None -> mislaid(ty),
+            }
           },
         },
         None -> mislaid(ty),

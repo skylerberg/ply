@@ -16,7 +16,8 @@ import emit.tir (Rep, RWord, RFlat, RSum, RUnit, Leaf, Var, Arg, AVar, AInt, AZe
                  MCase, Get, Gathered, Updated, FieldSet, PLeaf, PNamed, PField, Data, rep_of_arg)
 import emit.lower.setting (ctor_named, ctor_sum)
 import emit.lower.held (held_as, leaf_span, leaf_spans, leaves_within, field_type, field_types,
-                        field_offsets, case_index, leaf_type, laid_leaves, laid_held)
+                        field_offsets, case_index, leaf_type, laid_leaves, laid_held, record_parts,
+                        RecordPart, case_parts)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, filed, unfiled, noted,
                         packed_from)
 
@@ -132,29 +133,16 @@ fn case_gathered(
   args: List<Arg>,
   at: Span,
 ) -> Lowered = {
-  let types = match ty {
-    TyCon(c) -> match cx.setting.ctors.sums.get(c.name) {
-      Some(cs) -> match cs.at(i) { Some(k) -> ctor_fields_at(k, c.args), None -> [] },
-      None -> [],
-    },
-    _ -> [],
-  };
-  if types.len() != args.len() {
+  let cps = case_parts(cx.setting.ctors, ty, i);
+  if cps.len() != args.len() {
     refuse(st, Data, b"a constructor applied to other than its arguments")
   } else {
     let held = handed_all(
       st,
       range(0, args.len()).fold([], |acc: List<{ arg: Arg, to: Rep }>, k: Int|
-        match args.at(k) {
-          Some(a) ->
-            acc.push({
-              arg: a,
-              to: laid_held(cx.setting.ctors, match types.at(k) {
-                Some(t) -> t,
-                None -> unknown_type(),
-              }),
-            }),
-          None -> acc,
+        match ((args.at(k), cps.at(k))) {
+          (Some(a), Some(cp)) -> acc.push({ arg: a, to: cp.rep }),
+          _ -> acc,
         }),
       at,
     );
@@ -197,10 +185,6 @@ fn handed_all(
     },
   )
 
-/// The fields of a record type, in the checker's order (sorted by name).
-fn fields_of(ty: Type) -> List<Field> =
-  match ty { TyRecord(fs) -> fs, TyNominal(x) -> x.fields, _ -> [] }
-
 /// A record literal of `fields`, each lowered in written order, at the type the checker filed for
 /// it: gathered into its leaves where its type lays it out, no value where it lays it in none, and
 /// made by value where a type variable leaves the layout open.
@@ -230,12 +214,11 @@ pub fn recorded_as(
   if rep == RUnit { { st: st, arg: AZero(RUnit) } } else {
     match laid_leaves(cx.setting.ctors, ty) {
       Some(ls) -> {
-        let given = fields_of(ty).fold(
+        let given = record_parts(cx.setting.ctors, ty).fold(
           { xs: [], missing: false },
-          |acc: { xs: List<{ arg: Arg, to: Rep }>, missing: Bool }, f: Field|
-            match value(f.name) {
-              Some(a) ->
-                { ..acc, xs: acc.xs.push({ arg: a, to: laid_held(cx.setting.ctors, f.ty) }) },
+          |acc: { xs: List<{ arg: Arg, to: Rep }>, missing: Bool }, p: RecordPart|
+            match value(p.name) {
+              Some(a) -> { ..acc, xs: acc.xs.push({ arg: a, to: p.rep }) },
               None -> { ..acc, missing: true },
             },
         );
@@ -261,16 +244,10 @@ pub fn recorded_as(
 fn held_made(flat: Lowered, rep: Rep, at: Span) -> Lowered =
   if rep_of_arg(flat.arg) == rep { flat } else { handed(flat, rep, at) }
 
-/// The record of type `ty` held as the leaves `ls`, gathered from `parts`, its fields' values in
-/// order, a field of no words giving none.
+/// The record of type `ty` held as the leaves `ls`, gathered from `parts`, the values of its
+/// `record_parts` in order.
 fn record_made(st: Lowering, ty: Type, ls: List<Leaf>, parts: List<Arg>, at: Span) -> Lowered =
-  bound_as(
-    st,
-    ty,
-    RFlat(ls),
-    Gathered({ parts: parts.filter(|a: Arg| rep_of_arg(a) != RUnit) }),
-    at,
-  )
+  bound_as(st, ty, RFlat(ls), Gathered({ parts: parts }), at)
 
 /// A record of `names` holding `args`, each as its word, of a layout a type variable leaves open: a
 /// placeholder no printer sees, the layout a need of each such variable.
@@ -449,21 +426,21 @@ pub fn updated(
             let kept = copies.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true));
             let lay = lay_of(cx, b);
             // A record held as its box is written in its box, or a copy of it: only the fields set.
+            let parts_of_ty = record_parts(cx.setting.ctors, ty);
             let in_place = rep == RWord && b.rep == RWord
               && laid_known(cx.setting.ctors, b.ty) == laid_known(cx.setting.ctors, ty)
-              && fields_of(ty).all(|f: Field| given.contains(f.name) || kept.contains(f.name));
+              && parts_of_ty.all(|p: RecordPart| given.contains(p.name) || kept.contains(p.name));
             if in_place { written_over(cx, st, b, ty, sets, at) } else {
-              let parts = fields_of(ty).fold(
+              let parts = parts_of_ty.fold(
                 { st: st, parts: [], missing: false },
-                |acc: { st: Lowering, parts: List<Arg>, missing: Bool }, f: Field| {
-                  let laid = laid_held(cx.setting.ctors, f.ty);
-                  match given.get(f.name) {
+                |acc: { st: Lowering, parts: List<Arg>, missing: Bool }, p: RecordPart| {
+                  match given.get(p.name) {
                     Some(a) -> {
-                      let h = handed({ st: acc.st, arg: a }, laid, at);
+                      let h = handed({ st: acc.st, arg: a }, p.rep, at);
                       { ..acc, st: h.st, parts: acc.parts.push(h.arg) }
                     },
-                    None -> if !kept.contains(f.name) { { ..acc, missing: true } } else {
-                      match read_in(cx, acc.st, b, lay, f.name, f.ty, laid, at) {
+                    None -> if !kept.contains(p.name) { { ..acc, missing: true } } else {
+                      match read_in(cx, acc.st, b, lay, p.name, p.ty, p.rep, at) {
                         None -> { ..acc, missing: true },
                         Some(r) -> { ..acc, st: r.st, parts: acc.parts.push(r.arg) },
                       }

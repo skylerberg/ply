@@ -3,9 +3,10 @@
 //! its leaves names each leaf by its field, and the leaves of a record it holds by `field.leaf`, so a
 //! flat representation spells the layout it was flattened from.
 
+import check.types
 import check.types (Type, TyVar, TyCon, TyRecord, TyNominal, Field, int_type, option_type,
                     string_type)
-import emit.reps (SumCtor, Ctors, kind_of, laid_known, ctors_of)
+import emit.reps (SumCtor, Ctors, kind_of, laid_known, ctors_of, ctor_fields_at)
 import emit.c (Kind, KInt, KBool, KNum, KFloat, KDec)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RFlat, Leaf, RSum, RUnit, RSlice,
                  RImm, Convention, Given, Owned, parts_of)
@@ -92,27 +93,59 @@ fn slot_rep(k: Kind) -> Rep =
   }
 
 /// The fields of a record type, in the checker's order (sorted by name); none for any other type.
-fn record_fields(ty: Type) -> List<Field> =
-  match ty { TyRecord(fs) -> fs, TyNominal(x) -> x.fields, _ -> [] }
+pub fn record_fields(ty: Type) -> List<Field> =
+  match types::record_fields(ty) { Some(fs) -> fs, None -> [] }
 
-/// The leaves of a record of type `ty` whose fields are laid as `fs`, in its words' order: each
-/// field held as its type holds it, named by it, a record's leaves, however wide, named
-/// `field.leaf` in place, and a field of no words none.
-fn record_leaves(ctors: Ctors, ty: Type, fs: List<FieldLaid>) -> List<Leaf> = {
+/// A field of a record that holds a value: its place among the type's fields, its name and type,
+/// and how it lies in the record, a record however wide as its leaves (`laid_held`).
+pub type RecordPart = { field: Int, name: Bytes, ty: Type, rep: Rep }
+
+/// The parts of a record of type `ty`, in its words' order: each field that holds a value, a field
+/// of no words none. Whatever makes, reads or lays out a record's fields walks these.
+pub fn record_parts(ctors: Ctors, ty: Type) -> List<RecordPart> =
+  match laid_known(ctors, ty) { Some(LRecord(fs)) -> parts_laid(ctors, ty, fs), _ -> [] }
+
+fn parts_laid(ctors: Ctors, ty: Type, fs: List<FieldLaid>) -> List<RecordPart> = {
   let fields = record_fields(ty);
-  range(0, fields.len()).fold([], |acc: List<Leaf>, i: Int|
+  range(0, fields.len()).fold([], |acc: List<RecordPart>, i: Int|
     match ((fields.at(i), fs.at(i))) {
       (Some(f), Some(laid)) -> match held_laid(ctors, f.ty, laid.laid, false) {
         RUnit -> acc,
-        RFlat(inner) ->
-          acc.concat(
-            inner.map(|l: Leaf| { name: Bytes::concat_all([f.name, b".", l.name]), rep: l.rep }),
-          ),
-        r -> acc.push({ name: f.name, rep: r }),
+        r -> acc.push({ field: i, name: f.name, ty: f.ty, rep: r }),
       },
       _ -> acc,
     })
 }
+
+/// An argument of a sum's case: its type at the sum's arguments, and how it lies in the case's
+/// payload (`laid_held`).
+pub type CasePart = { ty: Type, rep: Rep }
+
+/// The arguments of case `case` of the sum `ty`, in order; none where `ty` declares no such case.
+/// Whatever makes or lays out a case's payload walks these.
+pub fn case_parts(ctors: Ctors, ty: Type, case: Int) -> List<CasePart> =
+  match ty {
+    TyCon(c) -> match ctors.sums.get(c.name) {
+      Some(cs) -> match cs.at(case) {
+        Some(k) -> ctor_fields_at(k, c.args).map(|t: Type| { ty: t, rep: laid_held(ctors, t) }),
+        None -> [],
+      },
+      None -> [],
+    },
+    _ -> [],
+  }
+
+/// The leaves of a record of type `ty` whose fields are laid as `fs`, in its words' order: each
+/// part held as it lies, named by its field, a record's leaves named `field.leaf` in place.
+fn record_leaves(ctors: Ctors, ty: Type, fs: List<FieldLaid>) -> List<Leaf> =
+  parts_laid(ctors, ty, fs).fold([], |acc: List<Leaf>, p: RecordPart|
+    match p.rep {
+      RFlat(inner) ->
+        acc.concat(
+          inner.map(|l: Leaf| { name: Bytes::concat_all([p.name, b".", l.name]), rep: l.rep }),
+        ),
+      r -> acc.push({ name: p.name, rep: r }),
+    })
 
 /// Where field `name` of a flat record of leaves `ls` lies among them: its first leaf and how many
 /// it takes, a record's leaves all; none for a field of no words, which holds no leaf.
