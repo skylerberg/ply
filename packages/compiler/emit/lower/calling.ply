@@ -6,7 +6,7 @@
 import emit.code (Code, Node, NVar, NKnown, NLambda, NApp, NUnary, NBinary, NField, NIf, NBlock,
                   NList, NRecord, NUpdate, NMatch, NPerform, NSimulate, NParallel, NHandle, Lambda,
                   Capture, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm, CodeClause, PxList,
-                  PxVar)
+                  PxVar, is_label_binder)
 import check.types (Type, TyFn, TyVar, TyCon, Scheme, Row, int_type, bool_type, run_needs)
 import emit.typing (Filings, no_filings, unknown_type)
 import syntax.parsing (Span, dummy_span)
@@ -1507,8 +1507,8 @@ fn capture_type(st: Lowering, at: Span, i: Int) -> Type =
 /// or a call hands it by reference.
 fn captures_held(cx: Context, body: Code, captures: List<Capture>) -> List<Rep> =
   captures.map(|c: Capture|
-    match slot_read_at(body, c.dst) {
-      Some(at) -> match filed(cx, at) {
+    match slot_read(body, c.dst) {
+      Some(read) -> match filed(cx, read.span) {
         Some(t) -> {
           let r = held_as(cx.setting, t.ty);
           if passing(r) == InWords { r } else { RWord }
@@ -1523,30 +1523,36 @@ fn capture_at(held: List<Rep>, i: Int) -> Int =
   held.take(i).fold(0, |n: Int, r: Rep| n + value_words(r))
 
 /// The type capture `i` of `l` holds: as this root's closure of `l` took it, or for a lambda another
-/// root made the closure of, as the checker filed a read of the capture in `l`'s body.
+/// root made the closure of, as the checker filed a read of the capture in `l`'s body; a label, which
+/// the checker files nothing for, is the `Int` a label parameter crosses as.
 fn captured_type(cx: Context, st: Lowering, l: Lambda, i: Int) -> Type = {
   let own = capture_type(st, l.at, i);
   if own != unknown_type() { own } else {
-    match match l.captures.at(i) { Some(c) -> slot_read_at(l.body, c.dst), None -> None } {
-      Some(at) -> match filed(cx, at) { Some(t) -> t.ty, None -> unknown_type() },
+    match match l.captures.at(i) { Some(c) -> slot_read(l.body, c.dst), None -> None } {
+      Some(read) -> match read.node {
+        NVar(v) -> if is_label_binder(v.name) { int_type() }
+        else { match filed(cx, read.span) { Some(t) -> t.ty, None -> unknown_type() } },
+        _ -> match filed(cx, read.span) { Some(t) -> t.ty, None -> unknown_type() },
+      },
       None -> unknown_type(),
     }
   }
 }
 
-/// Where `c` reads slot `slot` of its frame, or reads it in a barrier inside that copies it in.
-fn slot_read_at(c: Code, slot: Int) -> Option<Span> = {
+/// The node of `c` that reads slot `slot` of its frame first, or reads it in a barrier inside that
+/// copies it in.
+fn slot_read(c: Code, slot: Int) -> Option<Code> = {
   let first = |codes: List<Code>|
-    codes.fold(None, |acc: Option<Span>, x: Code|
-      match acc { Some(_) -> acc, None -> slot_read_at(x, slot) });
+    codes.fold(None, |acc: Option<Code>, x: Code|
+      match acc { Some(_) -> acc, None -> slot_read(x, slot) });
   // The slot a barrier copies `slot` into, where it copies it.
   let into = |captures: List<Capture>|
     captures.fold(None, |acc: Option<Int>, k: Capture|
       match acc { Some(_) -> acc, None -> if k.src == slot { Some(k.dst) } else { None } });
   match c.node {
-    NVar(v) -> if v.slot == Some(slot) { Some(c.span) } else { None },
-    NKnown(k) -> if k.slot == slot { Some(c.span) } else { None },
-    NUnary(u) -> slot_read_at(u.operand, slot),
+    NVar(v) -> if v.slot == Some(slot) { Some(c) } else { None },
+    NKnown(k) -> if k.slot == slot { Some(c) } else { None },
+    NUnary(u) -> slot_read(u.operand, slot),
     NBinary(b) -> first([b.lhs, b.rhs]),
     NApp(a) -> first(a.args.push(a.func)),
     NIf(i) -> first([i.cond, i.then_branch, i.else_branch]),
@@ -1567,22 +1573,22 @@ fn slot_read_at(c: Code, slot: Int) -> Option<Span> = {
           List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
       ),
     NPerform(p) -> first(match p.label { Some(l) -> p.args.push(l), None -> p.args }),
-    NField(f) -> slot_read_at(f.base, slot),
+    NField(f) -> slot_read(f.base, slot),
     NParallel(p) -> first(p.branches),
-    NLambda(l) -> match into(l.captures) { Some(d) -> slot_read_at(l.body, d), None -> None },
-    NSimulate(s) -> match into(s.captures) { Some(d) -> slot_read_at(s.body, d), None -> None },
-    NHandle(h) -> match slot_read_at(h.body, slot) {
+    NLambda(l) -> match into(l.captures) { Some(d) -> slot_read(l.body, d), None -> None },
+    NSimulate(s) -> match into(s.captures) { Some(d) -> slot_read(s.body, d), None -> None },
+    NHandle(h) -> match slot_read(h.body, slot) {
       Some(x) -> Some(x),
       None ->
         h.clauses.fold(
           match h.ret {
-            Some(r) -> match into(r.captures) { Some(d) -> slot_read_at(r.body, d), None -> None },
+            Some(r) -> match into(r.captures) { Some(d) -> slot_read(r.body, d), None -> None },
             None -> None,
           },
-          |acc: Option<Span>, cl: CodeClause|
+          |acc: Option<Code>, cl: CodeClause|
             match acc {
               Some(_) -> acc,
-              None -> match into(cl.captures) { Some(d) -> slot_read_at(cl.body, d), None -> None },
+              None -> match into(cl.captures) { Some(d) -> slot_read(cl.body, d), None -> None },
             },
         ),
     },
