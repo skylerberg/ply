@@ -28,8 +28,8 @@ import emit.roots (builtin_helper, symbol_of, entry_of)
 import emit.release (root_of)
 import emit.keys
 import emit.keys (RootKey, Named, Written, Clause, ClauseKind, Requires, Ensures, FnArg, TypeOp,
-                  Order, Reflect, Shown, Digest, Contained, RootName, at_key, root_name, root_text,
-                  module_of, test_key)
+                  Order, Reflect, Shown, Digest, Contained, Lift, Lower, RootName, at_key,
+                  root_name, root_text, module_of, test_key)
 import emit.answer (Defined, Expect, CallAt, GenericAt, expected_callee, Head, word_head,
                     GenericCall, Need, Exact, Layout, Scalar, no_generics, Tables, no_tables,
                     Emitted, Body, Refused, RootAnswer, Published)
@@ -1841,6 +1841,65 @@ test "an array is made, written and listed into as the type of its elements lays
   );
   // A write is counted in place or into a copy.
   assert_eq(has(b"rt_note_update_p(ctx, "), [false, true, false, false])
+}
+
+test "a parameter a tail call hands a part of what calling it answered is given, not lent" {
+  let src = Bytes::concat_all([
+    b"type Step = | Over | More(Bytes, () -> Step)\n",
+    b"fn pulled(k: () -> Step, fuel: Int) -> Bytes =\n",
+    b"  match k() { Over -> b\"\", More(b, rest) -> if fuel <= 1 { b } else { pulled(rest, fuel - 1) } }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [b"m.Over", b"m.More"], [], true);
+  let why = out.fold(b"", |acc: Bytes, e: Emitted|
+    match e.why { Some(w) -> acc.concat(w), None -> acc });
+  assert(why == b"", Some(String::of_bytes_lossy(why)))
+}
+
+test "a body generic over a label alone lays nothing out by it, so it is emitted as it stands" {
+  let src = Bytes::concat_all([
+    b"fn held_byte<[r]>(h: Hold<Bytes, [r]>, i: Int) -> Int / {hold.read[r]} =\n",
+    b"  if 0 <= i && i < h.get().len() { h.get().at(i) } else { -1 }\n",
+  ]);
+  let answers = answers_at([b"m"], [src], [], [Named(b"m.held_byte")]);
+  assert_eq(
+    answers.map(|a: RootAnswer|
+      match a.answer {
+        Body(b) -> b.tables.generics.needs,
+        Refused(_) -> [{ var: 0 - 1, reads: Exact }],
+      }),
+    [[]],
+  )
+}
+
+test "a root written where its module declares the prelude's constructor names still builds and matches the prelude's" {
+  let src = Bytes::concat_all([
+    b"pub type Op = | Equal | Less | Greater | Some(Int) | None | Ok | Err\n",
+    b"pub type Name = | Name(Bytes)\n",
+    b"fn maybe(a: Option<Name>) -> Option<Name> = observe(a)\n",
+    b"fn either(a: Result<Name, Int>) -> Result<Name, Int> = observe(a)\n",
+    b"fn order(o: Ordering) -> Ordering = observe(o)\n",
+    b"fn ordered(a: Option<Name>, b: Option<Name>) -> Ordering = compare(a, b)\n",
+  ]);
+  let name = TyCon({ name: b"m.Name", args: [] });
+  let maybe = TyCon({ name: b"Option", args: [name] });
+  let either = TyCon({ name: b"Result", args: [name, TyCon({ name: b"Int", args: [] })] });
+  let ordering = TyCon({ name: b"Ordering", args: [] });
+  let roots = [maybe, either, ordering].fold([], |acc: List<RootKey>, t: Type|
+    acc.push(in_m(Lift, t)).push(in_m(Lower, t)));
+  let answers = answers_at(
+    [b"m"],
+    [src],
+    [b"m.Equal", b"m.Less", b"m.Greater", b"m.Some", b"m.None", b"m.Ok", b"m.Err", b"m.Name"],
+    [b"m.maybe", b"m.either", b"m.order", b"m.ordered"].map(Named).concat(roots),
+  );
+  assert_eq(
+    answers.fold([], |acc: List<Bytes>, a: RootAnswer|
+      match a.answer {
+        Refused(r) -> acc.push(Bytes::concat_all([answer_name(a), b": ", r.why])),
+        _ -> acc,
+      }),
+    [],
+  )
 }
 
 test "a list pattern reads its items and its rest in place, whatever the items' type lays out" {
