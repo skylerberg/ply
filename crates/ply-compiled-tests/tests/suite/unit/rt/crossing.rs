@@ -363,6 +363,30 @@ fn a_builtin_called_encoded_answers_a_lifting_of_its_answer() {
     unfailed(&mut ctx);
 }
 
+/// A runtime object is read as it is written into a lowering, so the code that wrote it may let it
+/// go before the builtin the lowering is read for runs.
+#[test]
+fn a_runtime_object_written_into_a_lowering_outlives_the_count_that_wrote_it() {
+    let mut ctx = context_calling(&["Secret::is_empty", "Secret::of_string"]);
+    let c: *mut Ctx = &mut ctx;
+    unsafe {
+        called_encoded(c, 1, |c| {
+            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
+            text(c, "?out_str", b"hunter2");
+        });
+        let secret = native::<A0>("?in_handle")(c);
+        native::<N0>("?lift_close")(c);
+        called_encoded(c, 0, |c| {
+            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
+            native::<N1>("?out_handle")(c, secret);
+            helper::<N1>("rt_handle_free")(c, secret);
+        });
+        assert_eq!(native::<A0>("?in_tag")(c), tag::FALSE as Word);
+        native::<N0>("?lift_close")(c);
+    }
+    unfailed(&mut ctx);
+}
+
 /// A builtin that raises ends the lowering of its arguments and opens nothing, so the crossing it
 /// was called inside goes on where it was.
 #[test]

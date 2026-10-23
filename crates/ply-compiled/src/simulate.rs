@@ -9,7 +9,7 @@ use crate::heap::{self, Word};
 use crate::rt::{
     Beside, Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_UNWIND, Frames, HandlerFrame, Lifted,
     call_value, drop_frame, err_crossing, inherit_frames, lifted_from, lowered_values, lowering_of,
-    no_stack_to_take, raise_error, running, runtime_value, switch_keeping, values_taken,
+    no_stack_to_take, raise_error, released, running, switch_keeping, values_taken,
 };
 use crate::stack::{Stack, switch};
 use ply_core::codec::{self, Reader, Writer, tag};
@@ -1046,8 +1046,11 @@ unsafe fn select_of(ctx: *mut Ctx, args: &[Word], described: Option<&PlyOp>) -> 
         }
         Some(op) => {
             let params = op.params();
-            let arms = lowering_of(ctx, args[0], params[0])
-                .and_then(|(bytes, beside)| arms_read(ctx, &bytes, &beside, site));
+            let arms = lowering_of(ctx, args[0], params[0]).and_then(|(bytes, beside)| {
+                let arms = arms_read(ctx, &bytes, &beside, site);
+                released(ctx, beside);
+                arms
+            });
             let wait = lowered_values(ctx, &args[1..2], &params[1..2]);
             for (w, ty) in args.iter().zip(params) {
                 unsafe { Carried::new(Handed::of(*w), *ty) }.release(ctx);
@@ -1118,10 +1121,8 @@ fn arms_read(
         }
         field(&mut r, "_0")?;
         let chan = match handle_at(&mut r, beside)? {
-            Beside::Runtime(w) => runtime_value(*w)?
-                .as_chan(span, "`task.select`")
-                .map_err(|d| d.message)?,
-            Beside::Lent(_) => return Err("an arm's channel kept with a type".into()),
+            Beside::Runtime(v) => v.as_chan(span, "`task.select`").map_err(|d| d.message)?,
+            Beside::Carried(_) => return Err("an arm's channel kept with a type".into()),
         };
         field(&mut r, "_1")?;
         r.expect(tag::CTOR)?;
@@ -1129,7 +1130,7 @@ fn arms_read(
         let send = match (name.as_str(), r.count()?) {
             ("None", 0) => None,
             ("Some", 1) => match handle_at(&mut r, beside)? {
-                Beside::Lent(v) => Some(Item::carried(v.kept(ctx))),
+                Beside::Carried(v) => Some(Item::carried(v.dup(ctx))),
                 Beside::Runtime(_) => {
                     return Err("what an arm sends read as a runtime object".into());
                 }

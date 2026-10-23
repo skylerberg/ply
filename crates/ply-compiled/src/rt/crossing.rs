@@ -8,7 +8,7 @@
 //! emitted code makes room for them and copies them out with [`rt_taken`] before it calls another.
 
 use super::*;
-use crate::emitted::{Handed, Handle, Lent, PlyType};
+use crate::emitted::{Carried, Handed, Handle, PlyType};
 use crate::native::{Addr, F64, I64, Out};
 use ply_core::codec::{self, Reader, Writer, fun, tag};
 
@@ -29,11 +29,21 @@ pub(crate) struct Lowering {
     functions: bool,
 }
 
-/// What crosses beside a lowering's bytes, lent for as long as the crossing lasts: a runtime
-/// object, or a value compiled code lent with its type.
+/// What crosses beside a lowering's bytes, held by the lowering itself, since compiled code may let
+/// go of what it wrote before the lowering is read: a runtime object's value, or a value compiled
+/// code lent with its type, held once more until the lowering ends.
 pub(crate) enum Beside {
-    Runtime(Word),
-    Lent(Lent),
+    Runtime(Value),
+    Carried(Carried),
+}
+
+/// Lets go of what a lowering's `beside` holds.
+pub(crate) fn released(ctx: *mut Ctx, beside: Vec<Beside>) {
+    for b in beside {
+        if let Beside::Carried(v) = b {
+            v.release(ctx);
+        }
+    }
 }
 
 /// What a lowering that writes a value shared as `AGAIN` knows of the values written so far.
@@ -316,16 +326,26 @@ pub unsafe extern "C" fn rt_out_name(ctx: *mut Ctx, p: Addr, n: I64) {
     unsafe { &mut *ctx }.write(|l| l.w.name(name));
 }
 
-/// A runtime object, lent for as long as the lowering lasts.
+/// A runtime object, its value read as it is written.
 pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
-    unsafe { &mut *ctx }.write(|l| l.beside(Beside::Runtime(h.word())));
+    let c = unsafe { &mut *ctx };
+    match runtime_value(h.word()) {
+        Ok(v) => c.write(|l| l.beside(Beside::Runtime(v))),
+        Err(why) => {
+            c.fail(err_crossing(&why));
+        }
+    }
 }
 
-/// A value the runtime keeps rather than reads, with its type, lent for as long as the lowering
-/// lasts: what is in the position of an operation's own type parameter.
+/// A value the runtime keeps rather than reads, with its type, which compiled code lends: what is
+/// in the position of an operation's own type parameter, held until the lowering ends.
 pub unsafe extern "C" fn rt_out_carried(ctx: *mut Ctx, w: Handed, ty: *const PlyType) {
-    let lent = unsafe { Lent::new(w, ty) };
-    unsafe { &mut *ctx }.write(|l| l.beside(Beside::Lent(lent)));
+    let held = unsafe { Carried::kept_of(ctx, w, ty) };
+    let c = unsafe { &mut *ctx };
+    match c.lowering() {
+        Ok(l) => l.beside(Beside::Carried(held)),
+        Err(_) => held.release(ctx),
+    }
 }
 
 /// A function the program wrote: named by the `len` bytes at `name`, or anonymous where `len` is 0.
@@ -568,6 +588,7 @@ pub unsafe extern "C" fn rt_lower_close(ctx: *mut Ctx) -> I64 {
         c.fail(err_crossing(
             "a value the bytes cannot hold, which no handles were kept beside",
         ));
+        released(ctx, l.beside);
         return I64(0);
     }
     c.give(l.w.finish())
@@ -704,14 +725,16 @@ pub(crate) fn lowering_of(
 fn read_back(ctx: *mut Ctx, l: Lowering) -> Result<Value, String> {
     let bytes = l.w.finish();
     let beside = l.beside;
-    codec::decode_with(&bytes, &mut |at| match usize::try_from(at)
+    let read = codec::decode_with(&bytes, &mut |at| match usize::try_from(at)
         .ok()
         .and_then(|at| beside.get(at))
     {
-        Some(Beside::Runtime(w)) => runtime_value(*w),
-        Some(Beside::Lent(v)) => v.lower(ctx),
+        Some(Beside::Runtime(v)) => Ok(v.clone()),
+        Some(Beside::Carried(v)) => v.lower(ctx),
         None => Err(format!("handle {at}, which was not kept")),
-    })
+    });
+    released(ctx, beside);
+    read
 }
 
 /// The items of the list of arguments `v` is.

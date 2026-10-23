@@ -288,37 +288,6 @@ impl Block {
     }
 }
 
-/// A value compiled code lends the runtime with its type while a crossing lasts.
-pub(crate) struct Lent {
-    word: Word,
-    ty: &'static PlyType,
-}
-
-impl Lent {
-    /// # Safety
-    /// As [`Carried::new`]; the value outlives the crossing it is lent to.
-    pub(crate) unsafe fn new(w: Handed, ty: *const PlyType) -> Lent {
-        Lent {
-            word: w.0,
-            ty: unsafe { &*ty },
-        }
-    }
-
-    /// The value as the bytes of a lowering hold it.
-    pub(crate) fn lower(&self, ctx: *mut Ctx) -> Result<ply_core::Value, String> {
-        lowered(ctx, self.word, self.ty)
-    }
-
-    /// The value held once more through its type, to keep past the crossing.
-    pub(crate) fn kept(&self, ctx: *mut Ctx) -> Carried {
-        unsafe { (self.ty.inc)(ctx, self.word) };
-        Carried {
-            word: self.word,
-            ty: self.ty,
-        }
-    }
-}
-
 /// `w` lowered through `ty` into a crossing of its own, read back as a value.
 fn lowered(ctx: *mut Ctx, w: Word, ty: &'static PlyType) -> Result<ply_core::Value, String> {
     crate::rt::lowered_value(ctx, |ctx| unsafe {
@@ -346,6 +315,17 @@ impl Carried {
             word: w.0,
             ty: unsafe { &*ty },
         }
+    }
+
+    /// `w`, which compiled code lends, held once more through its type: compiled code may let it go
+    /// while this holds it.
+    ///
+    /// # Safety
+    /// As [`Carried::new`].
+    pub(crate) unsafe fn kept_of(ctx: *mut Ctx, w: Handed, ty: *const PlyType) -> Carried {
+        let ty = unsafe { &*ty };
+        unsafe { (ty.inc)(ctx, w.0) };
+        Carried { word: w.0, ty }
     }
 
     pub fn ty(&self) -> &'static PlyType {
