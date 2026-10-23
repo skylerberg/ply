@@ -581,29 +581,11 @@ fn a_bridge_lowered_as_a_handle_reads_as_what_it_bridges() {
 }
 
 #[test]
-fn a_function_the_program_wrote_crosses_by_name_and_a_generated_one_reads_whole() {
+fn a_function_the_program_wrote_crosses_by_name_which_only_its_own_run_reads_back() {
     let mut ctx = context();
     let named = lowered(&mut ctx, false, |c| text(c, "?out_fun", b"m.double"));
     let refused = decode(&named).unwrap_err();
     assert!(refused.contains("only its own run"), "{refused}");
-    let generated = Value::Closure(Arc::new(ply_core::Closure {
-        name: None,
-        kind: ply_core::ClosureKind::Synth {
-            arity: 3,
-            rule: ply_core::Synth::Project(2),
-        },
-    }));
-    let bytes = encode(&generated).unwrap();
-    let c: *mut Ctx = &mut ctx;
-    let mut out = [0 as Word; 2];
-    let case = unsafe {
-        native::<N2>("?lift_open")(c, bytes.as_ptr() as Word, bytes.len() as Word);
-        let case = native::<A1>("?in_fun")(c, out.as_mut_ptr() as Word);
-        native::<N0>("?lift_close")(c);
-        case
-    };
-    unfailed(&mut ctx);
-    assert_eq!((case, out), (ply_core::codec::fun::PROJECT as Word, [3, 2]));
 }
 
 /// A value of `m.Box`, a block of one word, counted at its offset 0 and freed by size.

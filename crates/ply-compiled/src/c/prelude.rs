@@ -3,7 +3,7 @@
 
 use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
-use crate::native::{Addr, F64, I64, Native, Out, Raises, Raising, Signature};
+use crate::native::{Addr, F64, I64, Native, Raises, Raising, Signature};
 use crate::rt::Ctx;
 
 /// `rt_*` is declared, not defined: `ply_bind` supplies the addresses after `dlopen`, since a
@@ -287,7 +287,6 @@ machine! {
     "?in_field" => rt_in_field(Addr, I64);
     "?in_name_is" => rt_in_name_is(Addr, I64) -> I64;
     "?in_handle" => rt_in_handle() -> Handle;
-    "?in_fun" => rt_in_fun(Out) -> I64;
     "?lower_open" => rt_lower_open(I64);
     "?lower_close" => rt_lower_close() -> I64;
     "?lift_open" => rt_lift_open(Addr, I64);

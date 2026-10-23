@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::emitted::{Carried, Handed, Handle, PlyType};
-use crate::native::{Addr, F64, I64, Out};
+use crate::native::{Addr, F64, I64};
 use ply_core::codec::{self, Reader, Writer, fun, tag};
 
 /// One crossing under way.
@@ -539,31 +539,6 @@ pub unsafe extern "C" fn rt_never_lifted(ctx: *mut Ctx) {
         "a value whose type can hold a function lifted from the runtime: a function crosses out \
          of compiled code and never back",
     ));
-}
-
-/// The head of a function the runtime made, which only a generated one is: its case among
-/// `std.value.Fun`'s, its arity written to `out`'s word 0, and to word 1 a projection's index or a
-/// table's count of entries. A constant's value, or a table's entries and then its default,
-/// follow.
-pub unsafe extern "C" fn rt_in_fun(ctx: *mut Ctx, out: Out) -> I64 {
-    let (case, arity, more) = unsafe { &mut *ctx }.read(|l| {
-        l.r.expect(tag::FUN)?;
-        let case = l.r.byte()?;
-        let (arity, more) = match case {
-            fun::CONST => (l.r.varint()?, 0),
-            fun::PROJECT | fun::TABLE => (l.r.varint()?, l.r.varint()?),
-            fun::NAMED | fun::ANON => {
-                return Err("a function the program wrote, which only its own run can hold".into());
-            }
-            other => return Err(format!("a function of case {other}")),
-        };
-        Ok((i64::from(case), arity as i64, more as i64))
-    });
-    unsafe {
-        *out.0 = arity;
-        *out.0.add(1) = more;
-    }
-    I64(case)
 }
 
 /// Begins a lowering inside whatever crossing is under way; where `again` is not 0, a value written
