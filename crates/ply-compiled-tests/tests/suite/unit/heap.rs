@@ -283,6 +283,19 @@ fn every_value_kind_round_trips() {
     h.end();
 }
 
+/// Compiled code holds `()` as the word 0, which no object lies at.
+#[test]
+fn the_zero_word_is_unit_as_the_runtime_s_own_is() {
+    let l = layouts();
+    assert_eq!(Heap::to_value(&l, 0), Value::Unit);
+    assert_eq!(cmp_words(&l, 0, unit()), std::cmp::Ordering::Equal);
+    assert_eq!(
+        cmp_words(&l, 0, bool(false)),
+        Value::Unit.cmp(&Value::Bool(false))
+    );
+    assert!(native_key(&l, 0));
+}
+
 /// Below 64 bits a width is the immediate compiled code computes with, which reads back as the
 /// width only where its carry says so; at 64 bits it is the runtime's own object and says itself.
 #[test]

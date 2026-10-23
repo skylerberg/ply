@@ -235,6 +235,12 @@ pub fn is_object(w: Word) -> bool {
     !is_imm(w) && w >= POINTER_FLOOR
 }
 
+/// Whether `w` is `()`: the runtime's own object, or the word 0 emitted code holds one as.
+#[inline]
+pub fn is_unit(w: Word) -> bool {
+    w == 0 || w == unit()
+}
+
 /// Whether `w` is an `Int` held in the word.
 #[inline]
 pub fn is_int(w: Word) -> bool {
@@ -2195,6 +2201,9 @@ impl Heap {
         if is_imm(w) {
             return read_int(imm_value(w), carry, walked);
         }
+        if is_unit(w) {
+            return Value::Unit;
+        }
         walked.read += 1;
         let o = obj(w);
         unsafe {
@@ -2825,6 +2834,9 @@ fn rank(w: Word) -> u8 {
     if is_imm(w) {
         return 2;
     }
+    if is_unit(w) {
+        return 0;
+    }
     let o = obj(w);
     unsafe {
         match (*o).kind {
@@ -3086,7 +3098,7 @@ unsafe fn cmp_fields(
 
 /// Whether a word can be a native map's key: one [`cmp_words`] orders in place.
 pub fn native_key(layouts: &Layouts, w: Word) -> bool {
-    if is_imm(w) {
+    if is_imm(w) || is_unit(w) {
         return true;
     }
     let o = obj(w);
