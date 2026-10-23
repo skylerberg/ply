@@ -182,7 +182,8 @@ impl Unit {
             Code::Linked => source.row(name).is_some(),
             Code::Opened(_) => true,
         };
-        let members: BTreeSet<Symbol> = (compiled.iter())
+        let entered = native.entered_names();
+        let members: BTreeSet<Symbol> = (compiled.iter().chain(entered.iter()))
             .filter(offered)
             .filter(|name| native.enterable(name))
             .map(Symbol::new)
@@ -397,7 +398,14 @@ impl Bodies {
             let Some(entry) = entry else {
                 bail!("`{name}` was admitted and cannot be entered");
             };
-            let Some(arity) = code.arity(name.as_str()) else {
+            // An entry lifts each parameter the root states, whatever the root it calls takes.
+            let row = unit.source.row(name.as_str());
+            let arity = if encoded {
+                row.map(|r| r.params.len())
+            } else {
+                code.arity(name.as_str())
+            };
+            let Some(arity) = arity else {
                 bail!("`{name}` was compiled without an arity");
             };
             if !encoded && arity > MAX_ARITY {
@@ -416,7 +424,11 @@ impl Bodies {
                 (true, Some(slot)) => Memo::Constant(slot),
                 (true, None) => Memo::Calls,
             };
-            let row = unit.source.row(name.as_str());
+            // An entry calls a specialisation, so it is handed no witness.
+            let witnesses = match row {
+                Some(r) if !encoded => r.witnesses.clone(),
+                _ => Vec::new(),
+            };
             admitted.insert(
                 name.clone(),
                 Admitted {
@@ -425,7 +437,7 @@ impl Bodies {
                     memo,
                     params: row.map_or_else(Vec::new, |r| r.params.clone()),
                     answer: row.map_or(Carry::Open, |r| r.answer.clone()),
-                    witnesses: row.map_or_else(Vec::new, |r| r.witnesses.clone()),
+                    witnesses,
                 },
             );
         }

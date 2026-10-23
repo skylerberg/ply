@@ -34,14 +34,14 @@ import emit.keys (RootKey, Named, At, Written, Cases, Clause, Stored, Entered, F
                   Stated, Reflect, Shown, Digest, Lower, Lift, Contained, LawPart, LawGuard,
                   LawBody, ClauseKind, Requires, Ensures, RootName, root_name, root_text, filed_as,
                   key_types, key_lent, op_name, module_of, modules_lowered, test_key, law_key,
-                  law_owner)
+                  law_owner, judged_at)
 import emit.answer (Emitted, Body, Refused, RootAnswer, Published)
 import emit.tir
 import emit.tir (Fn)
 import emit.lend (Handing, handings_of, lendings_of, declared_lent, handed_from, lent_form)
 import emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, Imported, EffectName, EmitParam,
                   BoundLambda, OwnerLambdas, kind_of, boxed, Sig, sig_of, param_kinds, param_types,
-                  typed_kind, filings_at, at_args)
+                  typed_kind, filings_at, at_args, substituted)
 import emit.written (WrittenRoot, CrossedSums, container_code, contained_formed, crossing_root,
                      crossing_op, entered_code, stored_code, crosses, equality_code, ordering_code,
                      keyed_by, keyed_code, numeric_stated, stated_code, digest_code,
@@ -50,7 +50,7 @@ import emit.entry (Prepared, RootForm, Formed, Unformed, root_formed, formed_fro
 import emit.release (generated)
 import emit.lower.crossing (worded)
 import emit.special (specialisations_wanted, witnessed_needs, definition_at, specialised_formed,
-                     instance_group, instances_formed)
+                     instance_group, instances_formed, written_at)
 
 /// What an arm that refuses a program before lowering anything can say: the checker's own words, one
 /// per diagnostic. There is no renderer for a diagnostic on this side -- the driver's `explain` has
@@ -824,6 +824,7 @@ fn module_formed(
             sig_of(schemes, qualify(module, d.name.name)),
             wanted,
             p.filed,
+            schemes,
           )
         },
       },
@@ -903,7 +904,7 @@ fn module_formed(
                 else { formed.push(Unformed({ name: root_name(Entered(part(which))), why: why })) }
               },
               Ok(ps) ->
-                judged(s, wanted, part(which), ps, if !wants_root(wanted, part(which)) { out }
+                judged(s, wanted, part(which), ps, [], if !wants_root(wanted, part(which)) { out }
                 else {
                   out.push(root_formed(s, d.span.start, part(which), names, ps, known, filed, body))
                 }),
@@ -1121,14 +1122,21 @@ fn plain_written(op: TypeOp) -> Bool =
 
 type Walk = { out: List<RootForm> }
 
-/// Whether a root typed by `sc` can be entered: a function over no type or label variable, each of
-/// whose parameters a lifting reads and whose answer a lowering writes.
+/// Whether a root typed by `sc` can be entered: a function over no label variable, each of whose
+/// parameters a lifting reads and whose answer a lowering writes at the types it is judged at.
 pub fn enterable(c: CrossedSums, sc: Scheme) -> Bool =
-  sc.ty_vars.len() == 0 && sc.label_vars.len() == 0
-    && (match sc.ty {
+  sc.label_vars.len() == 0
+    && (match judged_type(sc) {
       TyFn(f) -> f.params.all(|t: Type| crosses(c, t, true)) && crosses(c, f.ret, false),
       _ -> false,
     })
+
+/// `sc`'s type at the specialisation the runtime enters a generic root at (`keys.judged_at`).
+fn judged_type(sc: Scheme) -> Type = substituted(sc.ty, judged_args(sc.ty_vars))
+
+/// The type arguments `keys.judged_at` names, by each of `vars`' numbers.
+fn judged_args(vars: List<Int>) -> List<Type> =
+  range(0, vars.fold(0, |w: Int, v: Int| max(w, v + 1))).map(|_: Int| int_type())
 
 /// `out` and, where `wanted` holds it, the entry the runtime enters root `root` through, `root`
 /// typed by `scheme`: one over a monomorphic function's parameters and answer, and refused for any
@@ -1143,10 +1151,17 @@ fn entering(
   let key = Entered(root);
   if !wants_root(wanted, key) { out } else {
     match scheme {
-      // An entry over a type variable declines where its crossing reaches the variable.
+      // A generic root is entered at the specialisation its claims are judged at.
       Some(sc) -> match sc.ty {
         TyFn(f) -> {
-          let e = entered_code(s.module, root, f.params, f.ret);
+          let ints = judged_args(sc.ty_vars);
+          let e = entered_code(
+            s.module,
+            root,
+            judged_callee(root, sc.ty_vars.len()),
+            f.params.map(|t: Type| substituted(t, ints)),
+            substituted(f.ret, ints),
+          );
           out.push(
             formed_from(
               { ..s, here: s.here.concat(e.here) },
@@ -1167,20 +1182,36 @@ fn entering(
   }
 }
 
-/// `out` and, where `wanted` holds it, the entry of the claim root `root` taking `params`: a judge
-/// enters a law's guard or body with its binders' values, and a clause with the values it states over.
+/// What the entry of `root`, generic over `vars` type variables, calls: `root` itself where it has
+/// none, else the root at the specialisation a generic definition is judged at (`judged_at`).
+fn judged_callee(root: RootKey, vars: Int) -> RootKey =
+  if vars == 0 { root } else {
+    match root {
+      Named(d) -> judged_at(d, vars),
+      Clause(c) -> match c.def { Named(d) -> Clause({ ..c, def: judged_at(d, vars) }), _ -> root },
+      _ -> root,
+    }
+  }
+
+/// `out` and, where `wanted` holds it, the entry of the claim root `root` taking `params`, over the
+/// type variables `vars` of the definition a clause states of: a judge enters a law's guard or body
+/// with its binders' values, and a clause with the values it states over.
 fn judged(
   s: Setting,
   wanted: Map<RootName, Bool>,
   root: RootKey,
   params: List<EmitParam>,
+  vars: List<Int>,
   out: List<RootForm>,
 ) -> List<RootForm> / {abort.raise} =
   entering(
     s,
     wanted,
     root,
-    Some(monomorphic(fn_type(params.map(param_type), bool_type(), row_empty()))),
+    Some({
+      ..monomorphic(fn_type(params.map(param_type), bool_type(), row_empty())),
+      ty_vars: vars,
+    }),
     out,
   )
 
@@ -1289,38 +1320,57 @@ fn clause_roots(
   sig: Option<Sig>,
   wanted: Map<RootName, Bool>,
   filed: Result<Filings, Bytes>,
+  schemes: Map<Bytes, Scheme>,
 ) -> Walk / {abort.raise} = {
   let known = kinds.fold(true, |acc2: Bool, k: Option<{ kind: Kind, ty: Ty }>| acc2 && k != None);
   let types = param_types(def, sig);
-  let clause = |kind: ClauseKind, k: Int|
-    Clause({ def: Named(qualify(s.module, def.name.name)), kind: kind, n: k });
+  let full = qualify(s.module, def.name.name);
+  let vars = match schemes.get(full) { Some(sc) -> sc.ty_vars, None -> [] };
+  let ints = judged_args(vars);
+  let clause = |kind: ClauseKind, k: Int| Clause({ def: Named(full), kind: kind, n: k });
+  // A clause, a generic definition's also at the specialisation its entry calls, and its entry.
+  let rooted = |out: List<RootForm>, key: RootKey, ns: List<Bytes>, ps: List<EmitParam>, e: Expr| {
+    let own = if !wants_root(wanted, key) { out }
+    else { out.push(root_formed(s, def.span.start, key, ns, ps, known, filed, e)) };
+    let at = judged_callee(key, vars.len());
+    let specialised = if at == key || !wants_root(wanted, at) { own } else {
+      let tys = ps.map(|p: EmitParam| substituted(param_type(p), ints));
+      own.push(
+        root_formed(
+          s,
+          def.span.start,
+          at,
+          ns,
+          params_carried(ns, tys.map(|t: Type| Some(kind_of(t))), tys.map(|t: Type| Some(t))),
+          true,
+          match filed { Ok(f) -> Ok(filings_at(f, ints)), Err(why) -> Err(why) },
+          written_at(s.ctors, full, def, ints, schemes, e),
+        ),
+      )
+    };
+    judged(s, wanted, key, ps, vars, specialised)
+  };
   let walked = def.spec.fold(
     { out: acc.out, requires: 0, ensures: 0 },
     |w: { out: List<RootForm>, requires: Int, ensures: Int }, c: SpecClause|
       match c.kind {
         SRequires -> {
           let key = clause(Requires, w.requires);
-          let ps = params_carried(names, kinds, types);
           {
-            out: judged(s, wanted, key, ps, if !wants_root(wanted, key) { w.out } else {
-              w.out.push(root_formed(s, def.span.start, key, names, ps, known, filed, c.expr))
-            }),
+            out: rooted(w.out, key, names, params_carried(names, kinds, types), c.expr),
             requires: w.requires + 1,
             ensures: w.ensures,
           }
         },
         SEnsures -> match def.ret {
           None -> { out: w.out, requires: w.requires, ensures: w.ensures + 1 },
-          Some(r) -> {
+          Some(_) -> {
             let key = clause(Ensures, w.ensures);
             let rnames = names.push(b"result");
             let rkinds = kinds.push(Some(match sig { Some(g) -> kind_of(g.ret), None -> boxed() }));
             let rtypes = types.push(match sig { Some(g) -> Some(g.ret), None -> None });
-            let ps = params_carried(rnames, rkinds, rtypes);
             {
-              out: judged(s, wanted, key, ps, if !wants_root(wanted, key) { w.out } else {
-                w.out.push(root_formed(s, def.span.start, key, rnames, ps, known, filed, c.expr))
-              }),
+              out: rooted(w.out, key, rnames, params_carried(rnames, rkinds, rtypes), c.expr),
               requires: w.requires,
               ensures: w.ensures + 1,
             }

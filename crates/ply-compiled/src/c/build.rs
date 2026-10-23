@@ -69,6 +69,12 @@ impl Native {
         !self.encoded() || self.entered.contains_key(name)
     }
 
+    /// Each root the unit is entered at through its `R#entered`: a generic one's entry calls a
+    /// specialisation, so the root itself may be no body the unit holds.
+    pub fn entered_names(&self) -> Vec<String> {
+        self.entered.keys().cloned().collect()
+    }
+
     /// The memo index of a pure nullary root, if `name` is one.
     pub fn constant_index(&self, name: &str) -> Option<usize> {
         self.constants.get(name).copied()
