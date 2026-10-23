@@ -5,24 +5,22 @@ import emit.code (Code, CodeClause, CodeStmt, CLet, CLetPat, CDo, CodeArm, CodeF
                   NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform, NLabel,
                   NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, NKnown, slots_read,
                   all_read, lower_fn)
-import check.types (Type, TyFn, Row, RSingleton, fn_type, int_type, row_empty, row_open, row_closed,
-                    run_needs)
-import syntax.type_syntax (MRead, MRaise)
 import syntax.items (Item, IFn, parse)
 import syntax.exprs (Param)
 import expand.rewrite (expand)
 import syntax.sites (numbered)
 
-/// The runtime's code for clause `cl`, which resumes off its tail, `ty` the type the checker filed
-/// for its closure: `2` where it calls its continuation at most once however it runs, so the stop it
-/// resumes needs no snapshot, and `4` where it may call it again. At most once is every read of the
-/// continuation a direct call whose argument does not read it, none under a lambda, `handle`,
-/// `simulate` or `parallel`, no path making two, and nothing before the call that may stop: a
-/// handler around the clause that resumes such a stop twice would run the call twice.
-pub fn off_tail_code(cl: CodeClause, ty: Option<Type>) -> Int = {
+/// The runtime's code for clause `cl`, which resumes off its tail: `2` where it calls its
+/// continuation at most once however it runs, so the stop it resumes needs no snapshot, and `4`
+/// where it may call it again. At most once is every read of the continuation a direct call whose
+/// argument does not read it, none under a lambda, `handle`, `simulate` or `parallel`, no path
+/// making two, and nothing before the call that may stop: a handler around the clause that resumes
+/// such a stop twice would run the call twice. Read off the code alone, since the type filed for a
+/// clause carries no row of what its body performs.
+pub fn off_tail_code(cl: CodeClause) -> Int = {
   let r = run(cl.body, continuation_slot(cl));
   let once = match r.calls { Some(n) -> n <= 1, None -> false };
-  if once && !(r.stops_first && may_stop(ty)) { 2 } else { 4 }
+  if once && !r.stops_first { 2 } else { 4 }
 }
 
 /// The most calls of continuation `k`, slot `k`, on one path through `code`; none where some read of
@@ -32,14 +30,6 @@ pub fn max_calls_on_a_path(code: Code, k: Int) -> Option<Int> = run(code, k).cal
 
 /// The slot a clause's continuation takes: after its parameters and the label it binds.
 fn continuation_slot(cl: CodeClause) -> Int = cl.params + (if cl.binds_label { 1 } else { 0 })
-
-/// Whether a clause of type `ty` may stop for a handler around it: where the checker filed no
-/// function type for it, or its row is open or names an operation that is no raise.
-fn may_stop(ty: Option<Type>) -> Bool =
-  match ty {
-    Some(TyFn(f)) -> f.effects.tail != None || run_needs(f.effects.atoms).len() > 0,
-    _ -> true,
-  }
 
 /// What running code may do with a continuation: the most calls of it on one path, as
 /// `max_calls_on_a_path` answers; whether it may stop; and whether some path may stop before it
@@ -162,9 +152,8 @@ fn clauses_in(src: Bytes) -> List<CodeClause> / {abort.raise} = {
     })
 }
 
-/// The code of the one clause of `fn f(c: Bool) -> Int = handle { .. } with { <clause> }`, its
-/// closure of type `ty`.
-fn code_of(clause: Bytes, ty: Option<Type>) -> Option<Int> / {abort.raise} =
+/// The code of the one clause of `fn f(c: Bool) -> Int = handle { .. } with { <clause> }`.
+fn code_of(clause: Bytes) -> Option<Int> / {abort.raise} =
   match clauses_in(
       Bytes::concat_all([
         b"fn f(c: Bool, xs: List<Int>) -> Int = handle { if amb.flip() { 1 } else { 2 } } with { ",
@@ -172,15 +161,11 @@ fn code_of(clause: Bytes, ty: Option<Type>) -> Option<Int> / {abort.raise} =
         b" }\n",
       ]),
     ) {
-    [cl] -> Some(off_tail_code(cl, ty)),
+    [cl] -> Some(off_tail_code(cl)),
     _ -> None,
   }
 
-/// A clause's closure type whose row is `row`.
-fn performing(row: Row) -> Option<Type> = Some(fn_type([], int_type(), row))
-
 test "a clause that may call its continuation twice on one path, or hands it on, may resume again" {
-  let pure = performing(row_empty());
   assert_eq(
     [
       b"amb.flip() resume k -> k(true) + k(false)",
@@ -189,44 +174,37 @@ test "a clause that may call its continuation twice on one path, or hands it on,
       b"amb.flip() resume k -> xs.map(|x: Int| if k(x > 0) > 0 { 1 } else { 0 }).len()",
       b"amb.flip() resume k -> { let f = k; f(true) + 1 }",
       b"amb.flip() resume k -> handle { k(true) + 1 } with { abort.raise(m) -> 0 }",
-    ].map(|clause: Bytes| code_of(clause, pure)),
+    ].map(
+      code_of,
+    ),
     [Some(4), Some(4), Some(4), Some(4), Some(4), Some(4)],
   )
 }
 
 test "a clause that calls its continuation directly at most once on every path resumes at most once" {
-  let pure = performing(row_empty());
   assert_eq(
     [
       b"amb.flip() resume k -> if c { k(true) * 2 } else { k(false) + 1 }",
       b"amb.flip() resume r -> { let v = r(true); v + 1 }",
       b"amb.flip() resume k -> match xs { [] -> k(true) + 1, _ -> 0 }",
-    ].map(|clause: Bytes| code_of(clause, pure)),
+    ].map(
+      code_of,
+    ),
     [Some(2), Some(2), Some(2)],
   )
 }
 
-test "a clause that may stop before it calls its continuation once may resume again, unless nothing in it can stop" {
-  let stopping = performing(
-    row_closed([{ effect: b"m.coin", resource: RSingleton, mode: MRead, op: Some(b"toss") }]),
-  );
-  let raising = performing(
-    row_closed([{ effect: b"abort", resource: RSingleton, mode: MRaise, op: Some(b"raise") }]),
-  );
-  let before = b"amb.flip() resume k -> { let b = coin.toss(); k(b) * 2 }";
-  let in_argument = b"amb.flip() resume k -> k(coin.toss()) * 2";
-  let after = b"amb.flip() resume k -> { let v = k(true); coin.toss(); v }";
-  assert_eq([before, in_argument, after].map(|cl: Bytes| code_of(cl, stopping)), [
-    Some(4),
-    Some(4),
-    Some(2),
-  ]);
-  assert_eq([before, in_argument].map(|cl: Bytes| code_of(cl, raising)), [Some(2), Some(2)]);
-  // A row left open, or no type filed at all, may stop.
-  assert_eq([performing(row_open(0)), None].map(|ty: Option<Type>| code_of(before, ty)), [
-    Some(4),
-    Some(4),
-  ])
+test "a clause that may stop before it calls its continuation once may resume again" {
+  assert_eq(
+    [
+      b"amb.flip() resume k -> { let b = coin.toss(); k(b) * 2 }",
+      b"amb.flip() resume k -> k(coin.toss()) * 2",
+      b"amb.flip() resume k -> { let v = k(true); coin.toss(); v }",
+    ].map(
+      code_of,
+    ),
+    [Some(4), Some(4), Some(2)],
+  )
 }
 
 test "the most calls on a path add along it and take the larger of two branches" {
