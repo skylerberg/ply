@@ -37,38 +37,57 @@ fn digest_of(key: Bytes) -> Bytes = key.blake3()
 /// How many bytes of frames a merge reads at once.
 fn carry_bound() -> Int = 16777216
 
-/// What a run holds of a store: the manifest it read or last named, each segment's table as read
-/// (none where it is damaged), what the run kept by the digests of their keys, the segments it found
-/// damaged, and how many batches it wrote.
+/// What a run holds of a store: the manifest it read or last named, the segments it named when the
+/// run opened, where each key they hold lies once a read needs it, what the run kept by the digests
+/// of their keys, the segments it found damaged, and how many batches it wrote.
 type Open = {
   manifest: Manifest,
-  tables: Map<Bytes, Option<Bytes>>,
+  opened: List<Segment>,
+  index: Option<Map<Bytes, Placed>>,
   mine: Map<Bytes, Bytes>,
   lost: List<Bytes>,
   batches: Int,
 }
+
+/// Where a key's frame lies: its segment, the frame's offset and its payload's bytes.
+type Placed = { seg: Segment, at: Int, len: Int }
 
 /// `o` with the segment `seg` found damaged: it is read no more, and the next batch's commit
 /// drops it from the manifest.
 fn damaged(o: Open, seg: Segment) -> Open =
   if o.lost.contains(seg.token) { o } else { { ..o, lost: o.lost.push(seg.token) } }
 
-/// The table of `seg`, read once a run.
-fn table_of<[r]>(
-  dir: String,
-  o: Open,
-  seg: Segment,
-) -> { open: Open, rows: Option<Bytes> } / {fs.read[r], abort.raise} =
-  match o.tables.get(seg.token) {
-    Some(t) -> { open: o, rows: t },
-    None -> {
-      let t = segments::rows[r](dir, seg, records_table());
-      { open: { ..o, tables: o.tables.insert(seg.token, t) }, rows: t }
-    },
+/// `o` with where each key the segments it opened with hold lies, the newest segment's row of it,
+/// read once a run: a key the run keeps is its own to read, so no segment it writes is read.
+fn indexed<[r]>(dir: String, o: Open) -> Open / {fs.read[r], abort.raise} =
+  match o.index {
+    Some(_) -> o,
+    None ->
+      o.opened.fold({ ..o, index: Some(Map::new()) }, |acc: Open, seg: Segment|
+        match segments::rows[r](dir, seg, records_table()) {
+          None -> damaged(acc, seg),
+          Some(rows) ->
+            {
+              ..acc,
+              index: Some(
+                range(0, rows.len() / row_width()).fold(
+                  match acc.index { Some(ix) -> ix, None -> Map::new() },
+                  |ix: Map<Bytes, Placed>, i: Int| {
+                    let at = i * row_width();
+                    ix.insert(rows.slice(at, at + 32), {
+                      seg: seg,
+                      at: segments::long_at(rows, at + 32),
+                      len: segments::word_at(rows, at + 40),
+                    })
+                  },
+                ),
+              ),
+            },
+        }),
   }
 
 /// The bytes kept under the key whose digest is `digest`: what the run kept, else the newest
-/// segment's that holds it whole.
+/// segment's that holds it, where that segment reads whole.
 fn found<[r]>(
   dir: String,
   o: Open,
@@ -77,40 +96,21 @@ fn found<[r]>(
   match o.mine.get(digest) {
     Some(b) -> { open: o, bytes: Some(b) },
     None -> {
-      let segs = o.manifest.segments;
-      range(0, segs.len()).fold(
-        { open: o, bytes: None },
-        |acc: { open: Open, bytes: Option<Bytes> }, i: Int|
-          match acc.bytes {
-            Some(_) -> acc,
-            None -> {
-              let seg = segs.get(segs.len() - 1 - i);
-              if acc.open.lost.contains(seg.token) { acc } else {
-                let t = table_of[r](dir, acc.open, seg);
-                match t.rows {
-                  None -> { open: damaged(t.open, seg), bytes: None },
-                  Some(rows) -> match segments::row_of(rows, row_width(), digest) {
-                    None -> { open: t.open, bytes: None },
-                    Some(row) -> match segments::payload[r](
-                        dir,
-                        seg.token,
-                        segments::long_at(row, 32),
-                        segments::word_at(row, 40),
-                      ) {
-                      Some(b) -> { open: t.open, bytes: Some(b) },
-                      None -> { open: damaged(t.open, seg), bytes: None },
-                    },
-                  },
-                }
-              }
-            },
-          },
-      )
+      let x = indexed[r](dir, o);
+      match match x.index { Some(ix) -> ix.get(digest), None -> None } {
+        None -> { open: x, bytes: None },
+        Some(p) -> if x.lost.contains(p.seg.token) { { open: x, bytes: None } } else {
+          match segments::payload[r](dir, p.seg.token, p.at, p.len) {
+            Some(b) -> { open: x, bytes: Some(b) },
+            None -> { open: damaged(x, p.seg), bytes: None },
+          }
+        },
+      }
     },
   }
 
-/// `o` with `records` kept: those it has not kept already, written as one segment the store's
-/// manifest names at once. A run that takes no write, or a write the file system refuses, keeps
+/// `o` with `records` kept: those it does not hold as they are already, a key kept twice as it was
+/// kept last, written as one segment the store's manifest names at once. A run that takes no write, or a write the file system refuses, keeps
 /// them for the run alone.
 fn batch_kept<[r]>(
   dir: String,
@@ -118,9 +118,10 @@ fn batch_kept<[r]>(
   o: Open,
   records: List<Record>,
 ) -> Open / {fs.read[r], fs.write[r], abort.raise} = {
+  // A key kept again holds what it was kept with last.
   let fresh = records.fold(Map::new(), |acc: Map<Bytes, Bytes>, x: Record| {
     let d = digest_of(x.key);
-    if o.mine.contains(d) || acc.contains(d) { acc } else { acc.insert(d, x.bytes) }
+    if o.mine.get(d) == Some(x.bytes) { acc.remove(d) } else { acc.insert(d, x.bytes) }
   });
   let mine = fresh.fold(o.mine, |acc: Map<Bytes, Bytes>, d: Bytes, b: Bytes| acc.insert(d, b));
   if fresh.len() == 0 || run == None { { ..o, mine: mine } } else {
@@ -275,9 +276,11 @@ pub fn with_kept<a, [r], [s] | e>(
     fs.write_file[r](dir ++ "/" ++ used_file(), b"");
     ()
   };
+  let manifest = segments::manifest[r](dir, shapes());
   let opened = {
-    manifest: segments::manifest[r](dir, shapes()),
-    tables: Map::new(),
+    manifest: manifest,
+    opened: manifest.segments,
+    index: None,
     mine: Map::new(),
     lost: [],
     batches: 0,
@@ -410,6 +413,37 @@ test "a segment the manifest names that cannot be read is passed over, and the n
       match first { Some(n) -> "seg-" ++ seg.token.hex_of() != n, None -> true }),
     None,
   )
+}
+
+test "a key two segments hold reads as the newer keeps it, and one the run keeps as the run does" {
+  // The first segment far outweighs the second, so no run writes the two again as one.
+  let big = Bytes::concat_all(range(0, 400).map(|_: Int| b"x"));
+  let made = fs::on_mem[abs](fs::mem_of([]), || {
+    with_kept[abs, t]("s", || kept_records.put[t]([rec(b"big", big), rec(b"a", b"one")]));
+    with_kept[abs, t]("s", || kept_records.put[t]([rec(b"a", b"two")]))
+  });
+  let read = fs::on_mem[abs](made.tree, ||
+    with_kept[abs, t]("s", || {
+      let a = kept_records.get[t](b"a");
+      let whole = kept_records.get[t](b"big") == Some(big);
+      kept_records.put[t]([rec(b"b", b"three")]);
+      { a: a, whole: whole, b: kept_records.get[t](b"b"), none: kept_records.get[t](b"none") }
+    }));
+  assert(segments_of(made.tree).len() >= 2, None);
+  assert_eq(read.value, { a: Some(b"two"), whole: true, b: Some(b"three"), none: None })
+}
+
+test "a key a run keeps again reads as it was kept last, in the run and in the next" {
+  let made = fs::on_mem[abs](fs::mem_of([]), ||
+    with_kept[abs, t]("s", || {
+      kept_records.put[t]([rec(b"a", b"one"), rec(b"a", b"two")]);
+      let first = kept_records.get[t](b"a");
+      kept_records.put[t]([rec(b"a", b"three")]);
+      [first, kept_records.get[t](b"a")]
+    }));
+  let next = fs::on_mem[abs](made.tree, || with_kept[abs, t]("s", || kept_records.get[t](b"a")));
+  assert_eq(made.value, [Some(b"two"), Some(b"three")]);
+  assert_eq(next.value, Some(b"three"))
 }
 
 test "runs that each keep a little leave a store of a handful of segments, all of it read back" {
