@@ -11,9 +11,9 @@ import emit.compare (Program, program_of, formed, checked, printed_text, printed
                      printed_by_form)
 import emit.own (owned)
 import emit.tir (Rep, RFloat, RWord, RInt, RSum, RFlat, Var, AVar, AInt, AZero, Val, Make, MRecord,
-                 Get, Pack, Gathered, PLeaf, PNamed, Inst, Let, Decl, Assign, If, Case, Match,
-                 Block, Fn, Family, Data, Calling, Leaf, counted, rep_of_arg)
-import emit.lower.held (held_as, passing, ByReference, values_of)
+                 Get, Pack, Gathered, Updated, PLeaf, PNamed, PField, Inst, Let, Decl, Assign, If,
+                 Case, Match, Block, Fn, Family, Data, Calling, Leaf, counted, rep_of_arg)
+import emit.lower.held (held_as, values_of)
 import emit.lower.base (Context, started)
 import emit.lower.calling (context_of)
 import emit.lower.data (updated)
@@ -261,34 +261,33 @@ test "a field of a record held as its leaves is the leaf it borrows" {
   ])
 }
 
-test "a record wider than four words is held as its leaves, crossing a call by reference" {
+test "a record wider than four words is held as its box, a field read out of it alone" {
   let f = form_of(program(), b"last");
   let w = param(f, 0);
-  // Five words of fields: past `register_words`, the record crosses as the address of its words.
-  assert_eq(passing(w.rep), ByReference);
+  // Five words of fields: past `register_words`, the record is one word, its box's address.
+  assert_eq(w.rep, RWord);
   assert_eq(lets(f.body).map(|l: { var: Var, val: Val }| { rep: l.var.rep, val: l.val }), [
-    { rep: RFloat, val: Get({ of: w, path: PLeaf(4) }) },
+    { rep: RFloat, val: Get({ of: w, path: PField({ name: b"e", at: 4 }) }) },
   ])
 }
 
-test "a record held in place is read as its leaves among its holder's, and through to a field" {
+test "a record held as its leaves lies in place in the box holding it, read out of it as them" {
   let p = program();
-  // `from` is the first two of `Seg`'s leaves, a record in place having no word of its own.
+  // `from` is `Seg`'s first two words, read out of its box as a point's leaves.
   let s = form_of(p, b"start");
-  let read = lets(s.body);
-  assert_eq(read.map(|l: { var: Var, val: Val }| l.val).take(2), [
-    Get({ of: param(s, 0), path: PLeaf(0) }),
-    Get({ of: param(s, 0), path: PLeaf(1) }),
-  ]);
-  assert_eq(read.map(|l: { var: Var, val: Val }| l.var.rep).drop(2), [floats([b"x", b"y"])]);
-  // `to.x` is the fourth, and nothing is read but leaves.
-  let e = form_of(p, b"end_x");
-  assert(vals(e).contains(Get({ of: param(e, 0), path: PLeaf(3) })), None);
+  assert_eq(param(s, 0).rep, RWord);
   assert_eq(
-    vals(e).filter(|v: Val|
-      match v { Get(g) -> match g.path { PLeaf(_) -> false, _ -> true }, _ -> false }),
-    [],
-  )
+    lets(s.body).map(|l: { var: Var, val: Val }| { rep: l.var.rep, val: l.val }).take(1),
+    [
+      {
+        rep: floats([b"x", b"y"]),
+        val: Get({ of: param(s, 0), path: PField({ name: b"from", at: 0 }) }),
+      },
+    ],
+  );
+  // `to.x` is read through `to`'s leaves, read out of the box at its fourth word.
+  let e = form_of(p, b"end_x");
+  assert(vals(e).contains(Get({ of: param(e, 0), path: PField({ name: b"to", at: 3 }) })), None)
 }
 
 test "an update gathers what it keeps from its base and what it sets" {
@@ -330,7 +329,7 @@ fn bare_context() -> Context / {abort.raise} =
     { node: NLit(LUnit), span: dummy_span() },
   )
 
-test "an update reads its base's layout once, however wide the record" {
+test "an update writes over its base's box, reading the layout once however wide the record" {
   let cx = bare_context();
   let named = |i: Int| b"f".concat(ascii_of_int(100000 + i));
   let moved = |n: Int| {
@@ -345,11 +344,11 @@ test "an update reads its base's layout once, however wide the record" {
       { ..dummy_span(), site: 1 },
     )
   };
-  // Each kept field is read off its leaf, then all are gathered, however wide the record.
+  // A record wider than the registers is its box, which the update writes over, however wide.
   let wide = moved(6).st.insts;
   assert_eq(
     match wide.at(wide.len() - 1) {
-      Some(Let(l)) -> match l.val { Gathered(_) -> true, _ -> false },
+      Some(Let(l)) -> match l.val { Updated(_) -> true, _ -> false },
       _ -> false,
     },
     true,
@@ -357,13 +356,17 @@ test "an update reads its base's layout once, however wide the record" {
   paced(|n: Int| n * (ilog2(n) + 1), |n: Int| moved(n).st.insts.len())
 }
 
-test "a record wider than four words is held as its leaves, and an update gathers them with nothing made" {
+test "a record wider than four words is held as its box, and an update writes over it with nothing gathered" {
   let f = form_of(program(), b"relabelled");
   let s = param(f, 0);
-  // `Seg` is its points' leaves and its label: five words, crossing by reference.
-  assert_eq(passing(s.rep), ByReference);
-  assert_eq(vals(f).filter(|v: Val| match v { Make(_) -> true, Pack(_) -> true, _ -> false }), []);
-  match vals(f).at(vals(f).len() - 1) { Some(Gathered(_)) -> (), other -> assert_eq(other, None) }
+  // `Seg` is its points' words and its label: five words, held as its box.
+  assert_eq(s.rep, RWord);
+  assert_eq(
+    vals(f).filter(|v: Val|
+      match v { Make(_) -> true, Pack(_) -> true, Gathered(_) -> true, _ -> false }),
+    [],
+  );
+  match vals(f).at(vals(f).len() - 1) { Some(Updated(_)) -> (), other -> assert_eq(other, None) }
 }
 
 test "a join of records is a variable of their type held as its leaves, each arm setting it" {
@@ -476,7 +479,8 @@ test "a record made its word is a box of its words, its floats as their bits" {
   let has = |text: Bytes|
     [b"wides", b"segments", b"relabelleds"].map(|n: Bytes| own_code(p, n).index_of(text) != None);
   assert_eq(has(b"rt_box_float_p"), [false, false, false]);
-  assert_eq(has(b" = ply_f64_bits("), [true, true, true]);
+  // An update writes over `Seg`'s box, or a copy of it, reading none of its floats.
+  assert_eq(has(b" = ply_f64_bits("), [true, true, false]);
   assert_eq(has(b"rt_alloc_bytes_p(ctx, "), [true, true, true]);
   // `Wide`'s box holds its five words, and `Seg`'s its points' words in place: five words, no
   // header or bitmap of a point's.
@@ -630,13 +634,14 @@ test "a case's record argument is read out of the sum's words where its case lay
   assert_eq([dx.index_of(b"(ply_words("), dx.index_of(b"rt_field_p")], [None, None])
 }
 
-test "a case holding a wide record holds its words inline, with nothing made" {
+test "a case holding a record wider than the registers holds its box, made only where the record is" {
   let p = nested();
   let made = [b"line", b"line_of"].map(|n: Bytes| built(p, n));
-  assert_eq(made.map(|t: Bytes| [t.index_of(b"rt_alloc_bytes_p"), t.index_of(b"rt_alloc_p(")]), [
-    [None, None],
-    [None, None],
-  ])
+  assert_eq(
+    made.map(|t: Bytes|
+      [t.index_of(b"rt_alloc_bytes_p") != None, t.index_of(b"rt_alloc_p(") != None]),
+    [[false, false], [true, false]],
+  )
 }
 
 test "records held in place at any depth are read as their holder's leaves" {

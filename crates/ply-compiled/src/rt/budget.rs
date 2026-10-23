@@ -183,12 +183,12 @@ pub fn time_budget_ms() -> u64 {
 
 /// The stack of a thread that runs a program, as large as a runtime stack can grow: the runtime
 /// recurses on the native stack, a compiled body honours its call bound there, and an unoptimised
-/// frame runs to hundreds of kilobytes. Reserved, not committed. A `parallel` block's thread is one: a
+/// frame runs to tens of kilobytes. Reserved, not committed. A `parallel` block's thread is one: a
 /// run's lane enters a whole test on it.
 pub const PROGRAM_STACK: usize = crate::stack::RESERVE;
 
 /// Room below the floor for the runtime's frames and the deepest compiled frame itself.
-pub const STACK_MARGIN: usize = 1024 * 1024;
+pub const STACK_MARGIN: usize = 512 * 1024;
 
 /// The floor compiled code honours on the stack this frame is on: the running runtime stack's, or
 /// this thread's own. `None` on a stack the runtime does not know, a segment a Rust recursion grew
