@@ -1,7 +1,8 @@
 //! Where a heap's objects live. A block is one object's memory. Blocks of one size fill a page,
 //! pages are cut from segments mapped from the operating system, and a block too big for a page is
 //! the system allocator's. A dead block is listed through its own second word; a page left with no
-//! live block serves any size next, and a segment left with no such page goes back.
+//! live block serves any size next, and a segment left with no such page goes back, kept mapped for
+//! the next heap that needs one while few are.
 
 use crate::vm;
 use std::alloc::{Layout, alloc, dealloc};
@@ -9,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::null_mut;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::{Mutex, PoisonError};
 
 /// A mapping's bytes, which it is aligned to, so a block's address names its segment and page.
 const SEGMENT: usize = 4 << 20;
@@ -23,6 +25,38 @@ const SPARES: usize = 32;
 const HEAD: usize = size_of::<Segment>().next_multiple_of(16);
 /// The bytes before a larger block, the first word of them naming its owner.
 const LEAD: usize = 16;
+/// The most segments kept mapped that no heap holds.
+const EMPTIED: usize = 64;
+
+/// Segments no heap holds, their headers zeros: a heap takes one before it maps one, so a heap that
+/// empties a segment and soon needs another, as a parallel branch's does, costs the system nothing.
+static EMPTIED_SEGMENTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// A segment whose header is zeros, or null when the system maps no more.
+fn segment_taken() -> *mut Segment {
+    let emptied = EMPTIED_SEGMENTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .pop();
+    match emptied {
+        Some(address) => address as *mut Segment,
+        None => unsafe { vm::map_aligned(SEGMENT) }.cast(),
+    }
+}
+
+/// Gives back a segment none of whose blocks any heap hands out again.
+unsafe fn segment_given(segment: *mut Segment) {
+    unsafe { segment.write_bytes(0, 1) };
+    let mut emptied = EMPTIED_SEGMENTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if emptied.len() < EMPTIED {
+        emptied.push(segment.addr());
+        return;
+    }
+    drop(emptied);
+    unsafe { vm::unmap(segment.cast(), SEGMENT) };
+}
 
 /// What other threads hand back to a heap: dead blocks, each naming the next in its second word.
 #[derive(Default)]
@@ -332,10 +366,10 @@ impl Blocks {
         unsafe {
             let page = if self.spare.is_null() {
                 if self.clean.is_null() {
-                    let segment = vm::map_aligned(SEGMENT);
+                    let segment = segment_taken();
                     assert!(!segment.is_null(), "the heap is out of memory");
                     self.segments.insert(segment.addr());
-                    self.list(segment.cast());
+                    self.list(segment);
                 }
                 let page = self.clean;
                 unlink(&mut self.clean, page);
@@ -423,7 +457,7 @@ impl Blocks {
             }
             self.empty -= PAGES;
             self.segments.remove(&segment.addr());
-            vm::unmap(segment.cast(), SEGMENT);
+            segment_given(segment);
         }
     }
 
@@ -546,7 +580,7 @@ impl Blocks {
             other.segments.retain(|&address| {
                 let segment = address as *mut Segment;
                 if (*segment).pages.iter().all(|page| page.live == 0) && self.empty >= PAGES {
-                    vm::unmap(segment.cast(), SEGMENT);
+                    segment_given(segment);
                     return false;
                 }
                 for i in 0..PAGES {
@@ -588,7 +622,7 @@ impl Blocks {
             let kept = self.segments.first().copied();
             self.segments.retain(|&address| {
                 if Some(address) != kept {
-                    vm::unmap(address as *mut u8, SEGMENT);
+                    segment_given(address as *mut Segment);
                 }
                 Some(address) == kept
             });
@@ -615,7 +649,7 @@ impl Drop for Blocks {
                 dealloc((address as *mut u8).sub(LEAD), large(bytes));
             }
             for &address in &self.segments {
-                vm::unmap(address as *mut u8, SEGMENT);
+                segment_given(address as *mut Segment);
             }
         }
     }

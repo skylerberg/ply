@@ -9,7 +9,7 @@ use std::ffi::{c_char, c_void};
 pub const SYMBOL: &str = "ply_descriptor";
 
 /// One definition a unit holds, a `struct ply_taken`: its Ply name, the entry the runtime calls it
-/// through, and how many words it takes.
+/// through, null for one only compiled code calls, and how many words it takes.
 #[repr(C)]
 pub struct TakenRow {
     name: *const c_char,
@@ -24,8 +24,9 @@ impl TakenRow {
         std::str::from_utf8(bytes).unwrap_or("")
     }
 
-    pub fn entry(&self) -> *mut c_void {
-        self.entry
+    /// The entry, or `None` for a definition the runtime cannot call.
+    pub fn entry(&self) -> Option<*mut c_void> {
+        (!self.entry.is_null()).then_some(self.entry)
     }
 
     pub fn arity(&self) -> usize {

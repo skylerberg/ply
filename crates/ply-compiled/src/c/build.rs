@@ -31,9 +31,9 @@ pub struct Native {
     _lib: Library,
 }
 
-fn entry_of(row: &TakenRow) -> Entry {
+fn entry_of(row: &TakenRow) -> Option<Entry> {
     // SAFETY: a unit defines each entry it names as a function of an entry's type.
-    unsafe { std::mem::transmute::<*mut c_void, Entry>(row.entry()) }
+    (row.entry()).map(|entry| unsafe { std::mem::transmute::<*mut c_void, Entry>(entry) })
 }
 
 impl Native {
@@ -45,7 +45,7 @@ impl Native {
     }
 
     pub fn entry(&self, name: &str) -> Option<Entry> {
-        self.unit.taking(name).map(entry_of)
+        self.unit.taking(name).and_then(entry_of)
     }
 
     pub fn arity(&self, name: &str) -> Option<usize> {
@@ -163,13 +163,13 @@ fn finish(
         .into_iter()
         .map(|root| {
             let through = format!("{root}#entered");
-            match unit.taking(&through) {
-                Some(row) if row.arity() == 0 => Ok((root, entry_of(row))),
-                Some(row) => bail!(
-                    "`{through}` takes {} words, where `{root}` is entered through it with none",
-                    row.arity()
+            let row = unit.taking(&through);
+            match (row.map(TakenRow::arity), row.and_then(entry_of)) {
+                (Some(0), Some(entry)) => Ok((root, entry)),
+                (Some(arity), _) if arity != 0 => bail!(
+                    "`{through}` takes {arity} words, where `{root}` is entered through it with none"
                 ),
-                None => {
+                _ => {
                     bail!("`{root}` is entered through `{through}`, which the unit does not take")
                 }
             }
@@ -196,7 +196,9 @@ fn finish(
     let taking = |function: &str, takes: usize| match (function, unit.taking(function)) {
         ("-", _) => Ok(Stated::No),
         (_, None) => Ok(Stated::Absent),
-        (_, Some(row)) if row.arity() == takes => Ok(Stated::By(entry_of(row) as usize)),
+        (_, Some(row)) if row.arity() == takes => {
+            Ok(entry_of(row).map_or(Stated::Absent, |entry| Stated::By(entry as usize)))
+        }
         (name, Some(row)) => bail!(
             "`{name}` is stated of a type and takes {} words, where it is called with {takes}",
             row.arity()

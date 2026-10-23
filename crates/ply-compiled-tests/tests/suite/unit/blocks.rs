@@ -88,6 +88,28 @@ fn segments_left_with_no_block_go_back() {
     assert!(b.holds(again.addr()));
 }
 
+/// A heap that takes a segment an ended heap held walks only its own blocks there.
+#[test]
+fn a_segment_an_ended_heap_held_holds_none_of_its_blocks() {
+    let mut first = Blocks::default();
+    for class in 1..=64 {
+        for _ in 0..1_000 {
+            first.take(class * 16);
+        }
+    }
+    drop(first);
+    for _ in 0..16 {
+        let mut next = Blocks::default();
+        let mut taken: Vec<usize> = (0..1_000).map(|_| next.take(48).addr()).collect();
+        let mut walked = Vec::new();
+        next.each(|block, _| walked.push(block.addr()));
+        taken.sort_unstable();
+        walked.sort_unstable();
+        assert_eq!(walked, taken);
+        assert_eq!(next.held(), 64 << 10);
+    }
+}
+
 /// A block handed back off its heap's thread is the heap's to hand out once it looks for one.
 #[test]
 fn a_block_another_thread_hands_back_is_handed_out_again() {
