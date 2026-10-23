@@ -3,7 +3,7 @@
 //! and its helper table are the runtime's to say, and are handed in.
 
 import store.hash.encoding (hex)
-import check.types (Type, TyVar, TyFn, Scheme, type_text, type_spelled, digits, string_type)
+import check.types (Type, TyVar, TyFn, TyCon, Scheme, type_text, type_spelled, digits, string_type)
 import emit.answer (Answer, Body, Refused, RootAnswer, Tables, Defined, Head, Expect, CallAt,
                     GenericAt, expected_callee, word_head, no_generics, answer_bin, tables_bin,
                     no_tables, GenericCall, Generics, Need, Pass, Reads, Scalar, Layout, Exact,
@@ -27,9 +27,10 @@ import store.kept (Record, kept_records, with_kept)
 import emit
 import emit.lend (Handing, handed_from, published_of, taking_all)
 import emit.reps (Ctors, laid_vars, has_vars, held_apart, ctor_sums, ctors_of, type_vars,
-                  layout_key, no_ctors, numeric_sum)
+                  layout_key, no_ctors, numeric_sum, type_names)
 import front.rows (Dump, EmitterRoot, EmitterCtor, CtorRow, KeyRow, ModuleRow, OrdinalRow,
-                   KnownDefRow, DefRow, SpecRow, TestRow, LawRow, BinderRow)
+                   KnownDefRow, DefRow, SpecRow, TestRow, LawRow, BinderRow, TypeRow, HashFrame,
+                   HDef)
 import emit.written (CrossedSums, sums_crossed)
 import front.published (Linked, analyse, no_rows, dump_of)
 import front (analyse_pulling_std_with)
@@ -1508,6 +1509,9 @@ type Program = {
   /// The types of each law's binders, by its guard's and its body's root.
   binders: Map<RootName, List<Type>>,
   crossing: CrossedSums,
+  /// Each declared type's hash, which covers all it reaches, by its name: another program may
+  /// declare another type under the same name.
+  declared: Map<Bytes, Bytes>,
 }
 
 fn program_of(dump: Dump, sources: List<Bytes>) -> Program / {abort.raise} = {
@@ -1553,6 +1557,18 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program / {abort.raise} = {
         m.insert(root_name(law_key(l.module, l.name, part)), tys))
     }),
     crossing: sums_crossed(ctor_sums(dump.ctors), |n: Bytes| schemes.contains(prelude.concat(n))),
+    declared: {
+      let types = dump.types.fold(Map::new(), |acc: Map<Bytes, Bool>, t: TypeRow|
+        acc.insert(t.name, true));
+      dump.hashes.fold(Map::new(), |acc: Map<Bytes, Bytes>, f: HashFrame|
+        match f {
+          HDef(row) -> match row.decl {
+            Some(h) -> if types.contains(row.name) { acc.insert(row.name, h) } else { acc },
+            None -> acc,
+          },
+          _ -> acc,
+        })
+    },
   }
 }
 
@@ -1561,7 +1577,8 @@ fn text_at(program: Program, index: Int) -> Option<Bytes> = program.sources.at(i
 /// What a kept answer is a function of beyond the emitter and the runtime: the root's name, the key
 /// the front end gave it, the text it is written in, since its sites are offsets into that text, and
 /// what its module embeds, which that text's calls are written out as; for a specialisation, the
-/// kinds it is at and the definitions whose lambdas it runs; for a root written from a type, its
+/// kinds it is at, the declarations of the types it is at, and the definitions whose lambdas it
+/// runs; for a root written from a type, its
 /// module's text and the program's `types`, which together say how it is written. `None` for a root
 /// with no key or no place, which is asked again every time.
 fn root_material(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> / {abort.raise} = {
@@ -1581,7 +1598,7 @@ fn root_material(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> / 
     At(a, _) ->
       a.lent.fold(
         match definition_material(program, root_name(Named(a.def))) {
-          Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
+          Some(m) -> Some(Bytes::concat_all([m, b"\x00", name, declarations_named(program, k)])),
           None -> None,
         },
         |acc: Option<Bytes>, f: FnArg|
@@ -1637,6 +1654,20 @@ fn types_material(dump: Dump) -> Bytes / {abort.raise} =
       ),
     ),
   )
+
+/// The hash of each declared type the types specialisation `k` is at name, in order of name: a key
+/// names a type, and two programs may declare two types under one name.
+fn declarations_named(program: Program, k: RootKey) -> Bytes = {
+  let names = key_types(k).fold(Map::new(), |acc: Map<Bytes, Bool>, t: Type|
+    type_names(t).fold(acc, |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true)));
+  Bytes::concat_all(
+    names.keys().map(|n: Bytes|
+      match program.declared.get(n) {
+        Some(h) -> Bytes::concat_all([b"\x00", n, b"=", h]),
+        None -> b"",
+      }),
+  )
+}
 
 fn definition_material(program: Program, name: RootName) -> Option<Bytes> =
   match program.keys.get(name) {
@@ -3980,6 +4011,34 @@ test "a root's kept answer moves with what its module embeds, and with no other 
     root_material(p, b"", at_key(b"c.h", [], [{ param: 0, owner: Named(lender), nth: 0 }]));
   assert(spec(embedding(b"one"), b"a.f") != spec(embedding(b"two"), b"a.f"), None);
   assert(spec(embedding(b"one"), b"a.f") != spec(embedding(b"one"), b"b.g"), None)
+}
+
+/// A program of module `s`, declaring `E` as `cases`, and module `g`, a definition generic over its
+/// list's items.
+fn declaring(cases: Bytes) -> Program / {abort.raise} = {
+  let texts = [
+    Bytes::concat_all([b"pub type E = ", cases, b"\n"]),
+    b"pub fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n",
+  ];
+  program_of(
+    dump_of(
+      analyse(parse_all([{ name: b"s", src: texts.get(0) }, { name: b"g", src: texts.get(1) }])),
+    ),
+    texts,
+  )
+}
+
+test "a specialisation's kept answer moves with the declaration of a type it is at, not its name alone" {
+  let at = |p: Program, t: Type| root_material(p, b"", at_key(b"g.first", [t], []));
+  let e = TyCon({ name: b"s.E", args: [] });
+  let two = declaring(b"| A | B");
+  let three = declaring(b"| A | B | C");
+  assert(at(two, e) != None, None);
+  assert(at(two, e) != at(three, e), None);
+  assert_eq(at(two, e), at(declaring(b"| A | B"), e));
+  // A type no program declares is no part of it.
+  let int = TyCon({ name: b"Int", args: [] });
+  assert_eq(at(two, int), at(three, int))
 }
 
 test "a root written from a type is kept under its module's text and the program's types" {

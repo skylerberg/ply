@@ -200,11 +200,12 @@ type Sight = {
 }
 
 /// `f` with a `Take` for each `Get` that is the one read, on any way through the body, of a counted
-/// one-word field, not a record held in place, out of a block this body holds as a word or the box a
-/// sum's case holds, where the field is handed on: where the block is held only here, the field's
-/// count moves to its reader instead of being taken again. The block must be used otherwise only to
-/// read its other fields or test its constructor, in the pass that bound it, so nothing reads the
-/// field after it is taken.
+/// one-word field, not a record held in place, out of a block this body holds a count of as a word or
+/// the box a sum's case holds, where the field is handed on: where the block is held only here, the
+/// field's count moves to its reader instead of being taken again. The block must be used otherwise
+/// only to read its other fields or test its constructor, in the pass that bound it, so nothing reads
+/// the field after it is taken. Whether the body holds the block's count is what `facts_of` says, as
+/// the counts are placed: a join set only from borrowed reads holds none.
 fn took(f: Fn) -> Fn = {
   let start = f.members.fold(
     given_bound(f.params, f.conv, Map::new()),
@@ -217,7 +218,7 @@ fn took(f: Fn) -> Fn = {
   );
   let taking = s.gets.fold(
     Map::new(),
-    |m: Map<Int, Bool>, g: { var: Var, of: Var, path: Path, pass: Int }|
+    |m: Map<Int, Var>, g: { var: Var, of: Var, path: Path, pass: Int }|
       if s.bound.get(g.of.id) == Some(g.pass)
           && ((g.of.rep == RWord && field_path(g.path)) || boxed_read(g.of.rep, g.path))
           && word_held(g.var.rep)
@@ -225,10 +226,15 @@ fn took(f: Fn) -> Fn = {
           && !s.whole.contains(g.of.id)
           && s.handed.contains(g.var.id)
           && (match s.reads.get(g.of.id) { Some(ps) -> ps.get(g.path), None -> None }) == Some(1) {
-        m.insert(g.var.id, true)
+        m.insert(g.var.id, g.of)
       } else { m },
   );
-  if taking.len() == 0 { f } else { { ..f, body: retaken(f.body, taking) } }
+  if taking.len() == 0 { f } else {
+    let fx = facts_of(f);
+    let held = taking.fold(Map::new(), |m: Map<Int, Bool>, id: Int, of: Var|
+      if owns(fx, of) { m.insert(id, true) } else { m });
+    if held.len() == 0 { f } else { { ..f, body: retaken(f.body, held) } }
+  }
 }
 
 fn given_bound(params: List<Var>, conv: Convention, m: Map<Int, Int>) -> Map<Int, Int> =
@@ -3282,6 +3288,32 @@ test "a field read once in each arm of a branch is taken in each, and in neither
   assert_eq(took(f([])).body, [branch(Take({ of: o, path: at }))]);
   let first = bind(word(6), Get({ of: o, path: at }), []);
   assert_eq(took(f([first])).body, [first, branch(Get({ of: o, path: at }))])
+}
+
+test "a field is taken out of a join only where the join holds a count, never out of one set from borrowed reads" {
+  let o = word(0);
+  let c = flag(1);
+  let j = word(2);
+  let set = |val: Val, at: Int| [bind(word(at), val, []), Assign({ var: j, arg: AVar(word(at)) })];
+  let f = |val: Val|
+    root_of([o, c], [0], RWord, [
+      Decl(j),
+      If({ cond: AVar(c), then: set(val, 3), otherwise: set(val, 4) }),
+      bind(word(5), Get({ of: j, path: PField({ name: b"f", at: 0 }) }), []),
+      bind(word(6), call_of([AVar(word(5))], []), []),
+      Return(AVar(word(6))),
+    ]);
+  let taken = |g: Fn|
+    owned(g).body.any(|i: Inst|
+      match i { Let(l) -> match l.val { Take(_) -> true, _ -> false }, _ -> false });
+  // Read out of a borrowed block, the join borrows it too, and holds no count to move a field out of.
+  let read = f(Get({ of: o, path: PField({ name: b"g", at: 1 }) }));
+  assert(!taken(read), None);
+  assert_eq(counted_body(read).refused, None);
+  // Answered by a call, the join holds the count the call answered.
+  let made = f(call_of([], []));
+  assert(taken(made), None);
+  assert_eq(counted_body(made).refused, None)
 }
 
 test "the fields a body takes out of its blocks are found in one walk, however many it reads" {
