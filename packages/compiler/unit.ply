@@ -2025,17 +2025,86 @@ fn answers_at_once(
   hi: Int,
   room: Int,
   handed: Map<RootName, Handing>,
-) -> List<RootAnswer> / {abort.raise} =
+  done: Done,
+) -> Answered / {abort.raise} =
   if hi - lo <= 1 {
-    match pieces.at(lo) { Some(roots) -> answers_in(scope, roots, handed), None -> [] }
+    match pieces.at(lo) {
+      Some(roots) -> answers_closed(scope, roots, handed, done),
+      None -> { answers: [], found: [] },
+    }
   } else if room <= 0 { panic("more halvings than a length has") } else {
     let mid = lo + (hi - lo) / 2;
     let halves = parallel {
-      answers_at_once(scope, pieces, lo, mid, room - 1, handed),
-      answers_at_once(scope, pieces, mid, hi, room - 1, handed),
+      answers_at_once(scope, pieces, lo, mid, room - 1, handed, done),
+      answers_at_once(scope, pieces, mid, hi, room - 1, handed, done),
     };
-    halves._0.concat(halves._1)
+    {
+      answers: halves._0.answers.concat(halves._1.answers),
+      found: halves._0.found.concat(halves._1.found),
+    }
   }
+
+/// What a list was answered with: the answers, and the roots written for types they call that the
+/// list did not name, answered with them (`answers_closed`).
+type Answered = { answers: List<RootAnswer>, found: List<RootKey> }
+
+/// The roots a walk holds an answer of: those of earlier steps, and those of this one so far.
+type Done = { before: Map<RootName, Answer>, now: Map<RootName, Answer> }
+
+/// `answers_in` of `roots`, and of each root written for a type an answer calls that no answer
+/// `done` or this holds, until none is new: such a root's handing is fixed, so it is answered here
+/// rather than at a step of its own.
+fn answers_closed(
+  scope: Result<emit::Scope, Bytes>,
+  roots: List<RootKey>,
+  handed: Map<RootName, Handing>,
+  done: Done,
+) -> Answered / {abort.raise} = {
+  let held = |n: RootName| done.before.contains(n) || done.now.contains(n);
+  iterate(
+    {
+      out: { answers: [], found: [] },
+      asking: roots,
+      seen: roots.fold(Map::new(), |m: Map<RootName, Bool>, k: RootKey|
+        m.insert(root_name(k), true)),
+      first: true,
+    },
+    64,
+    |st: { out: Answered, asking: List<RootKey>, seen: Map<RootName, Bool>, first: Bool }|
+      if st.asking.len() == 0 { Stop(st) } else {
+        let got = answers_in(scope, st.asking, handed);
+        let next = got.fold(
+          { keys: [], seen: st.seen },
+          |acc: { keys: List<RootKey>, seen: Map<RootName, Bool> }, a: RootAnswer|
+            match a.answer {
+              Body(b) ->
+                b.tables.calls.fold(
+                  acc,
+                  |m: { keys: List<RootKey>, seen: Map<RootName, Bool> }, c: RootKey|
+                    match c {
+                      Written(_, _) -> {
+                        let n = root_name(c);
+                        if m.seen.contains(n) || held(n) { m }
+                        else { { keys: m.keys.push(c), seen: m.seen.insert(n, true) } }
+                      },
+                      _ -> m,
+                    },
+                ),
+              Refused(_) -> acc,
+            },
+        );
+        Continue({
+          out: {
+            answers: st.out.answers.concat(got),
+            found: if st.first { st.out.found } else { st.out.found.concat(st.asking) },
+          },
+          asking: next.keys,
+          seen: next.seen,
+          first: false,
+        })
+      },
+  ).out
+}
 
 /// `handed` with the handing each body of `answers` publishes, as the lending reads it.
 fn handed_with(
@@ -2174,9 +2243,9 @@ fn dealt_with(k: RootKey) -> Bytes / {abort.raise} =
     _ -> dealt_module(k),
   }
 
-/// What asking the emitter for some roots came to: their answers, and what the emitter holds for the
-/// next ask.
-type Asked<s> = { held: s, answers: List<RootAnswer> }
+/// What asking the emitter for some roots came to: their answers, among them those of the roots
+/// written for types it `found` they call, and what the emitter holds for the next ask.
+type Asked<s> = { held: s, answers: List<RootAnswer>, found: List<RootKey> }
 
 /// How far a unit's walk of its program has come: each root's answer and key; the handing each
 /// answered definition publishes, as answers publish it and as the lending reads it; how many answers
@@ -2234,7 +2303,7 @@ fn walked<s | e>(
   keep: (List<Record>) -> Unit / e,
   phases: Option<{ now: () -> Int / e, told: (PlaceTally) -> Unit / e }>,
   emitter: s,
-  ask: (s, List<RootKey>, Map<RootName, Handing>) -> Asked<s> / {abort.raise | e},
+  ask: (s, List<RootKey>, Map<RootName, Handing>, Done) -> Asked<s> / {abort.raise | e},
 ) -> Walk<s> / {abort.raise | e} = {
   let places = places_of(p);
   let place = |k: RootKey| match places.get(dealt_module(k)) { Some(l) -> l, None -> 0 };
@@ -2305,7 +2374,7 @@ fn place_walked<s | e>(
   roots: List<RootKey>,
   read: (Bytes) -> Option<Bytes> / e,
   keep: (List<Record>) -> Unit / e,
-  ask: (s, List<RootKey>, Map<RootName, Handing>) -> Asked<s> / {abort.raise | e},
+  ask: (s, List<RootKey>, Map<RootName, Handing>, Done) -> Asked<s> / {abort.raise | e},
 ) -> { walk: Walk<s>, steps: Int } / {abort.raise | e} =
   iterate(
     { walk: answered_now(p, types, w, roots, read, keep, ask), steps: 1 },
@@ -2358,6 +2427,7 @@ type Asking<s> = {
   known: Map<Bytes, Bool>,
   pending: List<RootKey>,
   emitter: s,
+  found: Map<RootName, RootKey>,
 }
 
 /// `w` with each of `roots` it holds no answer of answered: each kept answer read where it stands,
@@ -2373,7 +2443,7 @@ fn answered_now<s | e>(
   roots: List<RootKey>,
   read: (Bytes) -> Option<Bytes> / e,
   keep: (List<Record>) -> Unit / e,
-  ask: (s, List<RootKey>, Map<RootName, Handing>) -> Asked<s> / {abort.raise | e},
+  ask: (s, List<RootKey>, Map<RootName, Handing>, Done) -> Asked<s> / {abort.raise | e},
 ) -> Walk<s> / {abort.raise | e} = {
   let keys = roots.fold(Map::new(), |acc: Map<RootName, RootKey>, k: RootKey|
     if w.answers.contains(root_name(k)) { acc } else { acc.insert(root_name(k), k) });
@@ -2397,6 +2467,7 @@ fn answered_now<s | e>(
       known: looked.known.fold(w.known, |m: Map<Bytes, Bool>, d: Bytes, _: Bool| m.insert(d, true)),
       pending: missed,
       emitter: w.emitter,
+      found: Map::new(),
     },
     kept.len() + 2,
     |t: Asking<s>| {
@@ -2407,9 +2478,23 @@ fn answered_now<s | e>(
       let moved = stale_of(now, handings_held(w.held, now), keys);
       let asking = t.pending.concat(moved);
       if asking.len() == 0 { Stop(t) } else {
-        let got = ask(t.emitter, asking, handed_with(w.handed, now));
+        let got = ask(t.emitter, asking, handed_with(w.handed, now), {
+          before: w.answers,
+          now: now,
+        });
         let answers = answers_of(got.answers);
-        let r = answers_kept(p.keys, materials, answers, t.known, read);
+        // The roots written for types the answers call, answered with them, are kept as asked ones.
+        let found = got.found.fold(t.found, |m: Map<RootName, RootKey>, k: RootKey|
+          if keys.contains(root_name(k)) { m } else { m.insert(root_name(k), k) });
+        let r = answers_kept(
+          p.keys,
+          found.fold(materials, |m: Map<RootName, Bytes>, n: RootName, k: RootKey|
+            if m.contains(n) { m }
+            else { match root_material(p, types, k) { Some(x) -> m.insert(n, x), None -> m } }),
+          answers,
+          t.known,
+          read,
+        );
         if r.records.len() > 0 { keep(r.records) };
         let stood = moved.fold(t.fresh, |m: Map<RootName, Answer>, k: RootKey|
           m.remove(root_name(k)));
@@ -2417,17 +2502,29 @@ fn answered_now<s | e>(
           fresh: answers.fold(stood, |m: Map<RootName, Answer>, n: RootName, a: Answer|
             m.insert(n, a)),
           kept: moved.fold(t.kept, |m: Map<RootName, Answer>, k: RootKey| m.remove(root_name(k))),
-          asked: t.asked + asking.len(),
+          asked: t.asked + asking.len() + found.len() - t.found.len(),
           known: r.known,
           pending: [],
           emitter: got.held,
+          found: found,
         })
       }
     },
   );
-  let answered = missed.fold(settled.fresh, |acc: Map<RootName, Answer>, k: RootKey|
-    if acc.contains(root_name(k)) { acc }
-    else { acc.insert(root_name(k), Refused({ why: unanswered_why() })) });
+  let reached = found_reached(
+    settled.fresh.fold(settled.kept, |acc: Map<RootName, Answer>, n: RootName, a: Answer|
+      acc.insert(n, a)),
+    names,
+    settled.found,
+  );
+  // A root found off a body asked for again since is no root this step reaches.
+  let answered = missed.fold(
+    settled.found.fold(settled.fresh, |acc: Map<RootName, Answer>, n: RootName, _: RootKey|
+      if reached.contains(n) { acc } else { acc.remove(n) }),
+    |acc: Map<RootName, Answer>, k: RootKey|
+      if acc.contains(root_name(k)) { acc }
+      else { acc.insert(root_name(k), Refused({ why: unanswered_why() })) },
+  );
   let all = answered.fold(settled.kept, |acc: Map<RootName, Answer>, n: RootName, a: Answer|
     acc.insert(n, a));
   let now = all.keys();
@@ -2435,8 +2532,11 @@ fn answered_now<s | e>(
     ..w,
     answers: all.fold(w.answers, |acc: Map<RootName, Answer>, n: RootName, a: Answer|
       acc.insert(n, a)),
-    keys: keys.fold(w.keys, |acc: Map<RootName, RootKey>, n: RootName, k: RootKey|
-      acc.insert(n, k)),
+    keys: reached.fold(
+      keys.fold(w.keys, |acc: Map<RootName, RootKey>, n: RootName, k: RootKey| acc.insert(n, k)),
+      |acc: Map<RootName, RootKey>, n: RootName, k: RootKey| acc.insert(n, k),
+    ),
+    added: w.added.concat(reached.values()),
     held: handings_held(w.held, all),
     handed: handed_with(w.handed, all),
     kept: w.kept + all.len() - answered.len(),
@@ -2449,6 +2549,37 @@ fn answered_now<s | e>(
     emitter: settled.emitter,
   }
 }
+
+/// Of the roots `found` answered ahead, those a body of `roots` calls, or a body of one of them, in
+/// `answers`.
+fn found_reached(
+  answers: Map<RootName, Answer>,
+  roots: List<RootName>,
+  found: Map<RootName, RootKey>,
+) -> Map<RootName, RootKey> / {abort.raise} =
+  iterate(
+    { reached: Map::new(), from: roots },
+    found.len() + 1,
+    |s: { reached: Map<RootName, RootKey>, from: List<RootName> }| {
+      let next = s.from.fold(Map::new(), |acc: Map<RootName, RootKey>, n: RootName|
+        match answers.get(n) {
+          Some(Body(b)) ->
+            b.tables.calls.fold(acc, |m: Map<RootName, RootKey>, c: RootKey| {
+              let callee = root_name(c);
+              if found.contains(callee) && !s.reached.contains(callee) { m.insert(callee, c) }
+              else { m }
+            }),
+          _ -> acc,
+        });
+      if next.len() == 0 { Stop(s) } else {
+        Continue({
+          reached: next.fold(s.reached, |m: Map<RootName, RootKey>, n: RootName, k: RootKey|
+            m.insert(n, k)),
+          from: next.keys(),
+        })
+      }
+    },
+  ).reached
 
 /// The roots the answers `w` has not read call that no answer holds: each root written for a type a
 /// body calls, each clause an entry judges at its definition's specialisation, and the generic body
@@ -2615,10 +2746,11 @@ pub fn emitted<| e>(
     keep,
     phases,
     scope_held,
-    |held: Option<Result<emit::Scope, Bytes>>, roots: List<RootKey>, handed: Map<RootName, Handing>| {
+    |held: Option<Result<emit::Scope, Bytes>>, roots: List<RootKey>, handed: Map<RootName, Handing>, done: Done| {
       let scope = match held { Some(s) -> s, None -> scope_over(runtime, dump, p, ctors, reading) };
       let pieces = dealt(p, roots);
-      { held: Some(scope), answers: answers_at_once(scope, pieces, 0, pieces.len(), 64, handed) }
+      let a = answers_at_once(scope, pieces, 0, pieces.len(), 64, handed, done);
+      { held: Some(scope), answers: a.answers, found: a.found }
     },
   );
   {
@@ -4257,9 +4389,10 @@ test "a walk answers the roots it deals over lists, place by place, as the emitt
     |_: List<Record>| (),
     None,
     0,
-    |asks: Int, roots: List<RootKey>, handed: Map<RootName, Handing>| {
+    |asks: Int, roots: List<RootKey>, handed: Map<RootName, Handing>, done: Done| {
       let pieces = dealt(p, roots);
-      { held: asks + 1, answers: answers_at_once(scope, pieces, 0, pieces.len(), 64, handed) }
+      let a = answers_at_once(scope, pieces, 0, pieces.len(), 64, handed, done);
+      { held: asks + 1, answers: a.answers, found: a.found }
     },
   );
   assert(
@@ -5491,19 +5624,22 @@ fn walk_in_store(
     |rs: List<Record>| body_store.put(rs),
     None,
     { scope: None, built: 0, asked: [] },
-    |held: Counted, roots: List<RootKey>, handed: Map<RootName, Handing>| {
+    |held: Counted, roots: List<RootKey>, handed: Map<RootName, Handing>, done: Done| {
       let scope = match held.scope {
         Some(s) -> s,
         None -> scope_over(a_runtime(b"r"), dump, p, ctors, offered),
       };
       let pieces = dealt(p, roots);
+      let answered = answers_at_once(scope, pieces, 0, pieces.len(), 64, handed, done);
       {
         held: {
           scope: Some(scope),
           built: match held.scope { Some(_) -> held.built, None -> held.built + 1 },
-          asked: held.asked.concat(roots.map(root_name)),
+          // The roots written for types it found are asked of it too, with those it was handed.
+          asked: held.asked.concat(roots.map(root_name)).concat(answered.found.map(root_name)),
         },
-        answers: answers_at_once(scope, pieces, 0, pieces.len(), 64, handed),
+        answers: answered.answers,
+        found: answered.found,
       }
     },
   )
@@ -5551,8 +5687,12 @@ test "a walk's steps grow with the roots it answers, however long the chain of c
       |_: List<Record>| (),
       None,
       (),
-      |_: Unit, roots: List<RootKey>, _: Map<RootName, Handing>|
-        { held: (), answers: roots.map(|k: RootKey| { name: root_name(k), answer: answer(k) }) },
+      |_: Unit, roots: List<RootKey>, _: Map<RootName, Handing>, _: Done|
+        {
+          held: (),
+          answers: roots.map(|k: RootKey| { name: root_name(k), answer: answer(k) }),
+          found: [],
+        },
     ).answers.len(
     )
   })
