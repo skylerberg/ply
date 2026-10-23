@@ -9,8 +9,8 @@ import compiler.check.resolve.tables (Diag, error_at)
 import compiler.cc
 import compiler.cc (compilers, toolchain, TooWide)
 import compiler.syntax.parsing (no_module, dummy_span)
-import compiler.unit (Baked, Dropped, Emission, Made, shipped, answers_store, baked_key, emitted,
-                      emitter_identity, held)
+import compiler.unit (Baked, Dropped, Emission, Made, Scoped, scope_key, shipped, answers_store,
+                      baked_key, emitted, emitter_identity, held)
 import compiler.store.kept (Record, kept_records, with_kept)
 import compiler.emit.keys (RootKey, Named, RootName, root_name, root_text)
 import env (env)
@@ -142,16 +142,26 @@ fn kept_values<| e>(
   }
 
 /// The unit over `offered`, its C as the runtime compiles it, with the emitter's answers kept under
-/// the toolchain's cache.
+/// the toolchain's cache: the unit, and the scope it walked under for an ask of another unit of this
+/// program, or `None` where the walk built no scope to keep.
 fn unit_of(
   front: LoadedAnalysis,
   offered: List<RootKey>,
-) -> Result<Emitted, List<Diag>> / {shipped.runtime, shipped.definitions, env.bodies[sys], env.var[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
+  scoped: Option<Scoped>,
+) -> { unit: Result<Emitted, List<Diag>>, scoped: Option<Scoped> } / {shipped.runtime, shipped.definitions, env.bodies[sys], env.var[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
   let k = knobs();
   let wanted = narrowed(k, offered);
   let identity = emitter_identity(shipped.definitions());
   let runtime = shipped.runtime();
   let started = time.elapsed_ms();
+  // The roots the program offers, not the ones this ask wants: a scope read for this ask holds the
+  // facts of every root another ask of the same program may name, so both walk under one scope.
+  let facts_of = every_root(front);
+  let key = scope_key(front.dump, texts(front), front.inputs, facts_of);
+  let scope = match scoped {
+    Some(s) -> if s.key == key { Some(s.scope) } else { None },
+    None -> None,
+  };
   let emission = with_kept[abs, ans](answers_store(kept_dir(), runtime, identity), || {
     let read = |key: Bytes| kept_records.get[ans](key);
     emitted(
@@ -163,10 +173,18 @@ fn unit_of(
       read,
       |rs: List<Record>| kept_records.put[ans](rs),
       kept_values(front.dump.baked, wanted, read),
+      scope_held: scope,
+      facts_of: Some(facts_of),
     )
   });
   told(k, wanted.len(), emission, identity, time.elapsed_ms() - started);
-  emitted_of(front, wanted, emission)
+  {
+    unit: emitted_of(front, wanted, emission),
+    scoped: match emission {
+      Ok(e) -> match e.scope { Some(s) -> Some({ key: key, scope: s }), None -> None },
+      Err(_) -> None,
+    },
+  }
 }
 
 /// A unit's C alone, for whoever only enters it.
@@ -214,7 +232,12 @@ pub fn emitting<a | e>(
   handle {
     body()
   } with {
-    emit.unit(front, offered) -> unit_of(front, offered),
+    var scoped: Option<Scoped> = None,
+    emit.unit(front, offered) -> {
+      let r = unit_of(front, offered, scoped);
+      scoped = r.scoped;
+      r.unit
+    },
     emit.compiled(text, profile) -> compiled_of(text, profile),
   }
 
