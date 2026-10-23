@@ -645,6 +645,10 @@ impl Bodies {
             let call = matches!(admitted.memo, Memo::Calls);
             self.kept.borrow_mut().keep(key, &value, call);
         }
+        let inward = filled.iter().map(objects_of).sum();
+        self.unit
+            .counters
+            .note_converted(inward, objects_of(&value));
         self.entered.set(self.entered.get() + 1);
         EntryOutcome::Answered(value)
     }
@@ -737,6 +741,43 @@ impl Bodies {
 }
 
 /// How one entry ended.
+/// How many objects the value `v` crossing the seam is made of: each string, byte string,
+/// container, record and constructor holding arguments; an immediate is none.
+fn objects_of(v: &Value) -> u64 {
+    let mut pending = vec![v];
+    let mut n = 0u64;
+    while let Some(v) = pending.pop() {
+        match v {
+            Value::Str(_) | Value::Bytes(_) => n += 1,
+            Value::List(items) => {
+                n += 1;
+                pending.extend(items.iter());
+            }
+            Value::Array(items) => {
+                n += 1;
+                pending.extend(items.iter());
+            }
+            Value::Map(entries) => {
+                n += 1;
+                for (k, v) in entries.iter() {
+                    pending.push(k);
+                    pending.push(v);
+                }
+            }
+            Value::Record(fields) => {
+                n += 1;
+                pending.extend(fields.iter().map(|(_, v)| v));
+            }
+            Value::Ctor { args, .. } if !args.is_empty() => {
+                n += 1;
+                pending.extend(args.iter());
+            }
+            _ => {}
+        }
+    }
+    n
+}
+
 enum EntryOutcome {
     Answered(Value),
     Raised(Diagnostic),
