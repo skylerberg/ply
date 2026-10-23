@@ -12,8 +12,8 @@ import check.resolve.scopes (PackageDeps, no_packages, of_binder)
 import expand.derive (expand_derives)
 import check.infer.checker (MemberSite, WitnessOp, listing_ty)
 import check.infer (RootFacts, expanded_mods)
-import check.types (Type, TyCon, TyVar, TyFn, Scheme, int_type, bytes_type, unit_type, fn_type,
-                    monomorphic, row_empty)
+import check.types (Type, TyCon, TyVar, TyFn, Scheme, int_type, bool_type, bytes_type, unit_type,
+                    fn_type, monomorphic, row_empty)
 import emit.lower.setting (Setting, declared_schemes, walked_read, defs_in, resolved_imports,
                            effects_in, params_carried, law_params, facts_by_item, filings_of,
                            labels_of, param_type)
@@ -880,28 +880,39 @@ fn module_formed(
         { out: out }
       },
       // A law's guard and body are roots the judge enters with the binders' values.
-      ILaw(d) -> if !wants_root(wanted, law_key(module, d.name, LawGuard))
-          && !wants_root(wanted, law_key(module, d.name, LawBody)) { acc } else {
-        let filed = filed_of(law_owner(module, d.name));
-        let typed = match filed { Ok(f) -> f.typed, Err(_) -> Map::new() };
-        let names = d.binders.map(|binder: Binder| binder.name.name);
-        let kinds = d.binders.map(|binder: Binder| Some(typed_kind(typed, binder.span)));
-        let known = kinds.fold(true, |acc2: Bool, k: Option<{ kind: Kind, ty: Ty }>|
-          acc2 && k != None);
+      ILaw(d) -> {
         let part = |which: LawPart| law_key(module, d.name, which);
-        let rooted = |which: LawPart, body: Expr|
-          match law_params(law_owner(module, d.name), filed, d.binders) {
-            Err(why) -> formed_from(s, d.span.start, part(which), [], true, Err(why), filed),
-            Ok(ps) -> root_formed(s, d.span.start, part(which), names, ps, known, filed, body),
+        let asked = |which: LawPart|
+          wants_root(wanted, part(which)) || wants_root(wanted, Entered(part(which)));
+        if !asked(LawGuard) && !asked(LawBody) { acc } else {
+          let filed = filed_of(law_owner(module, d.name));
+          let typed = match filed { Ok(f) -> f.typed, Err(_) -> Map::new() };
+          let names = d.binders.map(|binder: Binder| binder.name.name);
+          let kinds = d.binders.map(|binder: Binder| Some(typed_kind(typed, binder.span)));
+          let known = kinds.fold(true, |acc2: Bool, k: Option<{ kind: Kind, ty: Ty }>|
+            acc2 && k != None);
+          let params = law_params(law_owner(module, d.name), filed, d.binders);
+          // Each part, then the entry a judge enters it through.
+          let rooted = |out: List<RootForm>, which: LawPart, body: Expr|
+            match params {
+              Err(why) -> {
+                let formed = if !wants_root(wanted, part(which)) { out } else {
+                  out.push(formed_from(s, d.span.start, part(which), [], true, Err(why), filed))
+                };
+                if !wants_root(wanted, Entered(part(which))) { formed }
+                else { formed.push(Unformed({ name: root_name(Entered(part(which))), why: why })) }
+              },
+              Ok(ps) ->
+                judged(s, wanted, part(which), ps, if !wants_root(wanted, part(which)) { out }
+                else {
+                  out.push(root_formed(s, d.span.start, part(which), names, ps, known, filed, body))
+                }),
+            };
+          let with_guard = match d.guard {
+            None -> acc.out,
+            Some(g) -> rooted(acc.out, LawGuard, g),
           };
-        let with_guard = match d.guard {
-          None -> acc.out,
-          Some(g) -> if !wants_root(wanted, part(LawGuard)) { acc.out }
-          else { acc.out.push(rooted(LawGuard, g)) },
-        };
-        {
-          out: if !wants_root(wanted, part(LawBody)) { with_guard }
-          else { with_guard.push(rooted(LawBody, d.body)) },
+          { out: rooted(with_guard, LawBody, d.body) }
         }
       },
       // A sum some body compares or orders is compared through a root written from its
@@ -1156,6 +1167,23 @@ fn entering(
   }
 }
 
+/// `out` and, where `wanted` holds it, the entry of the claim root `root` taking `params`: a judge
+/// enters a law's guard or body with its binders' values, and a clause with the values it states over.
+fn judged(
+  s: Setting,
+  wanted: Map<RootName, Bool>,
+  root: RootKey,
+  params: List<EmitParam>,
+  out: List<RootForm>,
+) -> List<RootForm> / {abort.raise} =
+  entering(
+    s,
+    wanted,
+    root,
+    Some(monomorphic(fn_type(params.map(param_type), bool_type(), row_empty()))),
+    out,
+  )
+
 /// `out` and, where `wanted` holds it, the root a build keeps the value of the `const` definition
 /// `full`, typed by `scheme`, by: the encoding of what its body answers. Refused for a definition
 /// that takes a parameter.
@@ -1272,21 +1300,11 @@ fn clause_roots(
       match c.kind {
         SRequires -> {
           let key = clause(Requires, w.requires);
+          let ps = params_carried(names, kinds, types);
           {
-            out: if !wants_root(wanted, key) { w.out } else {
-              w.out.push(
-                root_formed(
-                  s,
-                  def.span.start,
-                  key,
-                  names,
-                  params_carried(names, kinds, types),
-                  known,
-                  filed,
-                  c.expr,
-                ),
-              )
-            },
+            out: judged(s, wanted, key, ps, if !wants_root(wanted, key) { w.out } else {
+              w.out.push(root_formed(s, def.span.start, key, names, ps, known, filed, c.expr))
+            }),
             requires: w.requires + 1,
             ensures: w.ensures,
           }
@@ -1298,21 +1316,11 @@ fn clause_roots(
             let rnames = names.push(b"result");
             let rkinds = kinds.push(Some(match sig { Some(g) -> kind_of(g.ret), None -> boxed() }));
             let rtypes = types.push(match sig { Some(g) -> Some(g.ret), None -> None });
+            let ps = params_carried(rnames, rkinds, rtypes);
             {
-              out: if !wants_root(wanted, key) { w.out } else {
-                w.out.push(
-                  root_formed(
-                    s,
-                    def.span.start,
-                    key,
-                    rnames,
-                    params_carried(rnames, rkinds, rtypes),
-                    known,
-                    filed,
-                    c.expr,
-                  ),
-                )
-              },
+              out: judged(s, wanted, key, ps, if !wants_root(wanted, key) { w.out } else {
+                w.out.push(root_formed(s, def.span.start, key, rnames, ps, known, filed, c.expr))
+              }),
               requires: w.requires,
               ensures: w.ensures + 1,
             }
