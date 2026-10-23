@@ -398,12 +398,12 @@ impl Bodies {
             let Some(entry) = entry else {
                 bail!("`{name}` was admitted and cannot be entered");
             };
-            // An entry lifts each parameter the root states, whatever the root it calls takes.
+            // An entry lifts each parameter the root states, whatever the root it calls takes; a
+            // stored root, which states none, takes nothing.
             let row = unit.source.row(name.as_str());
-            let arity = if encoded {
-                row.map(|r| r.params.len())
-            } else {
-                code.arity(name.as_str())
+            let arity = match row {
+                Some(r) if encoded => Some(r.params.len()),
+                _ => code.arity(name.as_str()),
             };
             let Some(arity) = arity else {
                 bail!("`{name}` was compiled without an arity");
