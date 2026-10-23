@@ -106,7 +106,7 @@ pub fn binary(cx: Context, l: Lowered, r: Lowered, op: Bytes, at: Span) -> Lower
   } else {
     let eq = op == b"eq" || op == b"ne";
     let equal = match class_of(cx.setting.ctors, ty) {
-      CRecord(fs) -> if eq { Some(fields_equal(cx, r.st, ty, fs, l.arg, r.arg, at)) } else { None },
+      CRecord(fs) -> if eq { Some(fields_equal(cx, r.st, fs, l.arg, r.arg, at)) } else { None },
       _ -> None,
     };
     match equal {
@@ -182,19 +182,11 @@ fn classed(
   }
 }
 
-/// Whether `a` and `b`, records of type `ty` of fields `fs`, are equal: field by field in order, each
-/// compared only where those before it were equal and as its own type compares, a field of a record
-/// type field by field again.
-fn fields_equal(
-  cx: Context,
-  st: Lowering,
-  ty: Type,
-  fs: List<Field>,
-  a: Arg,
-  b: Arg,
-  at: Span,
-) -> Lowered =
-  fs.fold(
+/// Whether `a` and `b`, records of fields `fs`, are equal: field by field in order, a field of no
+/// words being equal, each compared only where those before it were equal and as its own type
+/// compares, a field of a record type field by field again.
+fn fields_equal(cx: Context, st: Lowering, fs: List<Field>, a: Arg, b: Arg, at: Span) -> Lowered =
+  valued(cx, fs).fold(
     { out: { st: st, arg: ABool(true) }, first: true },
     |acc: { out: Lowered, first: Bool }, f: Field| {
       let x = field(
@@ -206,26 +198,25 @@ fn fields_equal(
       let y = field(cx, { st: x.st, arg: b }, f.name, at);
       let xs = { st: y.st, arg: x.arg };
       let e = match f.ty {
-        TyRecord(gs) -> fields_equal(cx, y.st, f.ty, gs, x.arg, y.arg, at),
-        TyNominal(n) -> fields_equal(cx, y.st, f.ty, n.fields, x.arg, y.arg, at),
+        TyRecord(gs) -> fields_equal(cx, y.st, gs, x.arg, y.arg, at),
+        TyNominal(n) -> fields_equal(cx, y.st, n.fields, x.arg, y.arg, at),
         _ -> classed(cx, xs, y, b"eq", f.ty, class_of(cx.setting.ctors, f.ty), at),
       };
       { out: if acc.first { e } else { short_circuit(cx, acc.out, e, true, at) }, first: false }
     },
   ).out
 
-/// The sign of `a` and `b`'s order, records of type `ty` of fields `fs`: by their fields in order,
+/// The sign of `a` and `b`'s order, records of fields `fs`: by their fields of any words in order,
 /// the first that orders them apart deciding, each read only where those before it were equal.
 fn fields_order(
   cx: Context,
   st: Lowering,
-  ty: Type,
   fs: List<Field>,
   a: Arg,
   b: Arg,
   at: Span,
 ) -> Lowered / {abort.raise} =
-  fs.fold(
+  valued(cx, fs).fold(
     { out: { st: st, arg: AInt(0) }, first: true },
     |acc: { out: Lowered, first: Bool }, f: Field| {
       let x = field(
@@ -236,13 +227,17 @@ fn fields_order(
       );
       let y = field(cx, { st: x.st, arg: b }, f.name, at);
       let s = match f.ty {
-        TyRecord(gs) -> fields_order(cx, y.st, f.ty, gs, x.arg, y.arg, at),
-        TyNominal(n) -> fields_order(cx, y.st, f.ty, n.fields, x.arg, y.arg, at),
+        TyRecord(gs) -> fields_order(cx, y.st, gs, x.arg, y.arg, at),
+        TyNominal(n) -> fields_order(cx, y.st, n.fields, x.arg, y.arg, at),
         _ -> sign_at(cx, { st: y.st, arg: x.arg }, y, f.ty, at),
       };
       { out: if acc.first { s } else { decided(cx, acc.out, s, at) }, first: false }
     },
   ).out
+
+/// The fields of `fs` that hold a value, a field of no words none, as `held.record_parts` says.
+fn valued(cx: Context, fs: List<Field>) -> List<Field> =
+  fs.filter(|f: Field| held_as(cx.setting, f.ty) != RUnit)
 
 /// The sign `l` where it is not zero, else `r`, lowered in a block of its own after `l`'s state.
 fn decided(cx: Context, l: Lowered, r: Lowered, at: Span) -> Lowered = {
@@ -618,7 +613,7 @@ fn ordered(
       let made = |s: Lowered|
         bound(cx, s.st, order, Prim({ op: b"ordering", on: RInt, args: [s.arg] }), at);
       match class_of(cx.setting.ctors, ty) {
-        CRecord(fs) -> made(fields_order(cx, st, ty, fs, a, b, at)),
+        CRecord(fs) -> made(fields_order(cx, st, fs, a, b, at)),
         c -> if c_orders(c, ty) {
           made(sign_at(cx, { st: st, arg: a }, { st: st, arg: b }, ty, at))
         } else { through_runtime(cx, needing(st, ty, true), name, [a, b], order, at) },
@@ -639,7 +634,7 @@ fn extreme(
 ) -> Lowered / {abort.raise} = {
   let ty = match a { AInt(_) -> type_of(b), _ -> type_of(a) };
   let s = match class_of(cx.setting.ctors, ty) {
-    CRecord(fs) -> fields_order(cx, st, ty, fs, b, a, at),
+    CRecord(fs) -> fields_order(cx, st, fs, b, a, at),
     _ -> sign_at(cx, { st: st, arg: b }, { st: st, arg: a }, ty, at),
   };
   let past = bound(
@@ -666,15 +661,15 @@ fn c_orders(c: Class, ty: Type) -> Bool =
     _ -> false,
   }
 
-/// The order of `a` and `b` where a root written for their type answers it: a sum a module declares,
-/// a container, an `Option` or a `Result` known throughout.
+/// The order of `a` and `b` where a root written for their type answers it: a declared sum, a
+/// container, an `Option` or a `Result` known throughout.
 fn by_root(cx: Context, st: Lowering, ty: Type, a: Arg, b: Arg, at: Span) -> Option<Lowered> = {
   let order = named_type(b"Ordering");
   let at_root = |op: TypeOp, t: Type|
     Some(rooted(cx, st, keys::written(op, t, cx.setting.module), [a, b], [t, t], order, at));
   match class_of(cx.setting.ctors, ty) {
-    CNullary(t) -> if spelled_type(t).index_of(b".") != None { at_root(Order, t) } else { None },
-    CSum(t) -> if spelled_type(t).index_of(b".") != None { at_root(Order, t) } else { None },
+    CNullary(t) -> at_root(Order, t),
+    CSum(t) -> at_root(Order, t),
     CWalked(t) -> at_root(Contained(b"ordered"), t),
     CWord(t) -> if is_option(t) && !has_vars(t) { at_root(Contained(b"ordered"), t) } else { None },
     _ -> None,
