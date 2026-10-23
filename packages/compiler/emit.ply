@@ -38,7 +38,7 @@ import emit.keys (RootKey, Named, At, Written, Cases, Clause, Stored, Entered, F
 import emit.answer (Emitted, Body, Refused, RootAnswer, Published)
 import emit.tir
 import emit.tir (Fn)
-import emit.lend (Handing, handings_of, lendings_of, declared_lent, handed_from, lent_form)
+import emit.lend (Handing, Settled, handings_of, lendings_of, declared_lent, handed_from, lent_form)
 import emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, Imported, EffectName, EmitParam,
                   BoundLambda, OwnerLambdas, kind_of, boxed, Sig, sig_of, param_kinds, param_types,
                   typed_kind, filings_at, at_args, substituted)
@@ -157,46 +157,53 @@ pub fn emitted_program(w: Walked) -> List<Emitted> / {abort.raise} = {
   let forms = w.roots.fold([], |acc: List<Fn>, r: RootForm|
     match r { Formed(f) -> match f.form { Ok(x) -> acc.push(x), Err(_) -> acc }, _ -> acc });
   let settled = handings_of(lendings_of(w.lent, forms), w.handed);
-  // Once the handings are settled each root is counted, checked and printed on its own.
-  mapped_at_once(w.roots, |r: RootForm|
-    match r {
-      Formed(f) -> match f.form {
-        Ok(x) -> {
-          let l = lent_form(x, settled);
-          let e = calling_instances(
-            w.stated,
-            tags_in(l.form),
-            emitted_of(Formed({ ..f, form: Ok(l.form) }), w.ctors),
-          );
-          { ..e, tables: { ..e.tables, handings: l.handings, assumed: l.assumed, group: l.group } }
-        },
-        Err(_) -> emitted_of(r, w.ctors),
-      },
-      _ -> emitted_of(r, w.ctors),
-    })
+  roots_emitted(w.roots, settled, w.stated, w.ctors, 0, w.roots.len(), 64)
 }
 
-/// `f` of each of `xs`, in their order, the halves of the list taken at once.
-fn mapped_at_once<a, b>(xs: List<a>, f: (a) -> b / {abort.raise}) -> List<b> / {abort.raise} =
-  halves_mapped(xs, 0, xs.len(), 64, f)
-
-/// `mapped_at_once` of `xs` from `lo` up to `hi`; `room` is the halvings left, and 64 take any length
-/// to one.
-fn halves_mapped<a, b>(
-  xs: List<a>,
+/// Each of `roots` from `lo` up to `hi` counted, checked and printed against the handings `settled`,
+/// on its own, so the halves of the list at once. Only values cross into the halves: a closure's
+/// captures are not shared across threads. `room` is the halvings left, and 64 take any length to
+/// one.
+fn roots_emitted(
+  roots: List<RootForm>,
+  settled: Settled,
+  stated: Map<Bytes, List<Bytes>>,
+  ctors: Ctors,
   lo: Int,
   hi: Int,
   room: Int,
-  f: (a) -> b / {abort.raise},
-) -> List<b> / {abort.raise} =
-  if hi - lo <= 1 { match xs.at(lo) { Some(x) -> [f(x)], None -> [] } }
-  else if room <= 0 { panic("more halvings than a length has") } else {
+) -> List<Emitted> / {abort.raise} =
+  if hi - lo <= 1 {
+    match roots.at(lo) { Some(r) -> [root_emitted(r, settled, stated, ctors)], None -> [] }
+  } else if room <= 0 { panic("more halvings than a length has") } else {
     let mid = lo + (hi - lo) / 2;
     let both = parallel {
-      halves_mapped(xs, lo, mid, room - 1, f),
-      halves_mapped(xs, mid, hi, room - 1, f),
+      roots_emitted(roots, settled, stated, ctors, lo, mid, room - 1),
+      roots_emitted(roots, settled, stated, ctors, mid, hi, room - 1),
     };
     both._0.concat(both._1)
+  }
+
+fn root_emitted(
+  r: RootForm,
+  settled: Settled,
+  stated: Map<Bytes, List<Bytes>>,
+  ctors: Ctors,
+) -> Emitted / {abort.raise} =
+  match r {
+    Formed(f) -> match f.form {
+      Ok(x) -> {
+        let l = lent_form(x, settled);
+        let e = calling_instances(
+          stated,
+          tags_in(l.form),
+          emitted_of(Formed({ ..f, form: Ok(l.form) }), ctors),
+        );
+        { ..e, tables: { ..e.tables, handings: l.handings, assumed: l.assumed, group: l.group } }
+      },
+      Err(_) -> emitted_of(r, ctors),
+    },
+    _ -> emitted_of(r, ctors),
   }
 
 /// The roots `roots` keys of the program `given`, lowered as `scope_of` reads the program and each
@@ -563,41 +570,41 @@ pub fn walked_in(
         Some(code) -> Some({ ..o.bound, nth: nth, code: code, named: nth >= o.lambdas }),
       },
     };
-  let lowering = range(0, mods.len()).filter(|i: Int|
-    match mods.at(i) { Some(m) -> lowered.contains(m.name), None -> false });
   {
-    // Each module's roots are formed on their own, so the modules are formed at once.
-    roots: mapped_at_once(lowering, |i: Int|
+    roots: range(0, mods.len()).fold([], |acc: List<RootForm>, i: Int|
       match mods.at(i) {
-        None -> [],
-        Some(m) -> {
+        None -> acc,
+        Some(m) -> if !lowered.contains(m.name) { acc } else {
           let tab = module_at(i);
-          module_formed(
-            m.module,
-            {
-              module: m.name,
-              here: tab.here,
-              imports: tab.imports,
-              ctors: s.ctors,
-              builtins: s.builtins,
-              declared: s.declared,
-              effects: tab.effects,
-              release: s.release,
-            },
-            schemes,
-            wanted,
-            touched,
-            written_roots.filter(|w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }|
-              w.module == m.name).map(|w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }|
-              { key: w.key, op: w.op, ty: w.ty }),
-            specialised,
-            filed_of,
-            s.reading,
-            tab.ops,
-            lambda_at,
+          acc.concat(
+            module_formed(
+              m.module,
+              {
+                module: m.name,
+                here: tab.here,
+                imports: tab.imports,
+                ctors: s.ctors,
+                builtins: s.builtins,
+                declared: s.declared,
+                effects: tab.effects,
+                release: s.release,
+              },
+              schemes,
+              wanted,
+              touched,
+              written_roots.filter(
+                |w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }| w.module == m.name,
+              ).map(|w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }|
+                { key: w.key, op: w.op, ty: w.ty }),
+              specialised,
+              filed_of,
+              s.reading,
+              tab.ops,
+              lambda_at,
+            ),
           )
         },
-      }).fold([], |acc: List<RootForm>, rs: List<RootForm>| acc.concat(rs)),
+      }),
     stated: s.stated,
     ctors: s.ctors,
     lent: s.lent,
