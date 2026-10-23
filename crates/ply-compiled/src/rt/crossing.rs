@@ -8,7 +8,7 @@
 //! emitted code makes room for them and copies them out with [`rt_taken`] before it calls another.
 
 use super::*;
-use crate::emitted::{Carried, Handed, Handle, PlyType};
+use crate::emitted::{Block, Carried, Handed, Handle, PlyType};
 use crate::native::{Addr, F64, I64};
 use ply_core::codec::{self, Reader, Writer, fun, tag};
 
@@ -27,6 +27,9 @@ pub(crate) struct Lowering {
     shareables: u64,
     /// Whether a function the program wrote was written, which no reader outside its run can hold.
     functions: bool,
+    /// Whether a function holding what may not leave its run was written, which the boundary
+    /// refuses as the continuation it holds.
+    resumes: bool,
 }
 
 /// What crosses beside a lowering's bytes, held by the lowering itself, since compiled code may let
@@ -64,6 +67,7 @@ impl Lowering {
             }),
             shareables: 0,
             functions: false,
+            resumes: false,
         }
     }
 
@@ -348,10 +352,18 @@ pub unsafe extern "C" fn rt_out_carried(ctx: *mut Ctx, w: Handed, ty: *const Ply
     }
 }
 
-/// A function the program wrote: named by the `len` bytes at `name`, or anonymous where `len` is 0.
-pub unsafe extern "C" fn rt_out_fun(ctx: *mut Ctx, name: Addr, len: I64) {
+/// A function the program wrote, `f`, which compiled code lends: named by the `len` bytes at
+/// `name`, or anonymous where `len` is 0; or, an anonymous one holding what may not leave its
+/// thread, as a continuation's closure does, one no run but its own can resume.
+pub unsafe extern "C" fn rt_out_fun(ctx: *mut Ctx, f: Handed, name: Addr, len: I64) {
     let name = unsafe { lent(name, len) };
+    let leaves = !name.is_empty() || unsafe { Block::of(f.word()).share(ctx) };
     unsafe { &mut *ctx }.write(|l| {
+        if !leaves {
+            l.resumes = true;
+            l.w.fun(fun::RESUMES);
+            return;
+        }
         l.functions = true;
         if name.is_empty() {
             l.w.fun(fun::ANON);
@@ -866,7 +878,7 @@ pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryAnswer, String> {
     if l.functions {
         return Ok(EntryAnswer::Function);
     }
-    let holding = !l.beside.is_empty();
+    let holding = !l.beside.is_empty() || l.resumes;
     Ok(EntryAnswer::Read {
         value: read_back(ctx, l)?,
         holding,

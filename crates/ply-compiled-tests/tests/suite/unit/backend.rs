@@ -310,7 +310,7 @@ fn encoded_defs() -> Vec<Def> {
             "m.closure#entered",
             0,
             &format!(
-                "{}  {}(ctx, (Word)(intptr_t)\"m.f\", 3);\n  return 0;",
+                "{}  {}(ctx, 0, (Word)(intptr_t)\"m.f\", 3);\n  return 0;",
                 lifting(""),
                 native("?out_fun"),
             ),

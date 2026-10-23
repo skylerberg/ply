@@ -272,7 +272,7 @@ machine! {
     "?out_name" => rt_out_name(Addr, I64);
     "?out_handle" => rt_out_handle(Handle);
     "?out_carried" => rt_out_carried(Handed, *const PlyType);
-    "?out_fun" => rt_out_fun(Addr, I64);
+    "?out_fun" => rt_out_fun(Handed, Addr, I64);
     "?out_again" => rt_out_again(Handed) -> I64;
     "?in_tag" => rt_in_tag() -> I64;
     "?in_int" => rt_in_int() -> I64;

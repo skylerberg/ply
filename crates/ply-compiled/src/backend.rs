@@ -752,7 +752,6 @@ impl Bodies {
     }
 }
 
-/// How one entry ended.
 /// How many objects the value `v` crossing the seam is made of: each string, byte string,
 /// container, record and constructor holding arguments; an immediate is none.
 fn objects_of(v: &Value) -> u64 {
@@ -790,6 +789,7 @@ fn objects_of(v: &Value) -> u64 {
     n
 }
 
+/// How one entry ended.
 enum EntryOutcome {
     Answered(Value),
     Raised(Diagnostic),

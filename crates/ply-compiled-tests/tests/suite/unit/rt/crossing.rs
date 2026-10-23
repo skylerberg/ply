@@ -583,7 +583,10 @@ fn a_bridge_lowered_as_a_handle_reads_as_what_it_bridges() {
 #[test]
 fn a_function_the_program_wrote_crosses_by_name_which_only_its_own_run_reads_back() {
     let mut ctx = context();
-    let named = lowered(&mut ctx, false, |c| text(c, "?out_fun", b"m.double"));
+    let name = b"m.double";
+    let named = lowered(&mut ctx, false, |c| unsafe {
+        native::<N3>("?out_fun")(c, 0, name.as_ptr() as Word, name.len() as Word)
+    });
     let refused = decode(&named).unwrap_err();
     assert!(refused.contains("only its own run"), "{refused}");
 }

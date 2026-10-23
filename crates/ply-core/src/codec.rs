@@ -47,6 +47,9 @@ pub mod fun {
     pub const CONST: u8 = 2;
     pub const PROJECT: u8 = 3;
     pub const TABLE: u8 = 4;
+    /// A function the program wrote that holds what may not leave the run that made it, as a
+    /// continuation does: read back as a continuation, which the boundary refuses by name.
+    pub const RESUMES: u8 = 5;
 }
 
 /// Whether a value of `tag` is numbered for [`tag::AGAIN`].
@@ -584,6 +587,14 @@ impl Decoder<'_, '_> {
                 }
                 Err("a function the program wrote, which only its own run can hold".into())
             }
+            fun::RESUMES => Ok(Value::Closure(Arc::new(Closure {
+                name: None,
+                kind: ClosureKind::Continuation {
+                    code: 0,
+                    arity: 0,
+                    captured: Vec::new(),
+                },
+            }))),
             fun::CONST => {
                 let arity = self.r.varint()?;
                 synth(arity, Synth::Const(self.value()?))
