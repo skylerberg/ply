@@ -13,7 +13,8 @@ import syntax.parsing (Span, dummy_span)
 import check.resolve.tables (qualify)
 import std.bytes (ascii_of_int)
 import emit.reps (Def, Imported, EmitParam, BoundLambda, has_vars, word_type, substituted,
-                  substituted_fully, type_vars, resumption, resumed, layout_key, laid_known)
+                  substituted_fully, type_vars, resumption, resumed, resumed_as, layout_key,
+                  laid_known)
 import emit.layout (P, classes)
 import emit.answer (Layout, Exact)
 import emit.release (released_vars)
@@ -268,6 +269,7 @@ pub fn global(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered / {ab
           captures: [],
           resumes: false,
           body: func,
+          ty: Some(t.ty),
         };
         let o = lambda_opened(cx, st, frame, at);
         let params = range(0, frame.params).fold([], |acc: List<Arg>, j: Int|
@@ -295,18 +297,20 @@ pub fn global(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered / {ab
     },
   }
 
-/// A clause's continuation, held in `slot`, read as the function value the checker filed at `at`: the
-/// closure of a lambda that resumes it, whose typed entry a call by the function's type enters, as
-/// the runtime's continuation has none. A call of the continuation itself resumes it directly.
+/// A clause's continuation `k`, held in `slot`, read as a value: the closure of a lambda of the
+/// function type the continuation is called at, which resumes it, whose typed entry a call by that
+/// type enters, as the runtime's continuation has none. A call of the continuation itself resumes it
+/// directly.
 pub fn resumption_closed(
   cx: Context,
   st: Lowering,
   slot: Int,
+  k: Arg,
   at: Span,
 ) -> Lowered / {abort.raise} =
-  match filed(cx, at) {
-    None -> unfiled(cx, st, b"a continuation read as a value", at),
-    Some(t) -> match t.ty {
+  match resumed_as(type_of(k)) {
+    None -> refuse(st, Calling, b"a continuation of no function type read as a value"),
+    Some(t) -> match t {
       TyFn(f) -> {
         let n = f.params.len();
         let frame = {
@@ -315,6 +319,7 @@ pub fn resumption_closed(
           captures: [{ src: slot, dst: n }],
           resumes: false,
           body: { node: NVar({ name: b"resume", slot: Some(n) }), span: at },
+          ty: Some(t),
         };
         let o = lambda_opened(cx, st, frame, at);
         let resumed_by = match o.st.env.get(n) {
@@ -860,13 +865,14 @@ fn filed_fn(
   at: Span,
   arity: Int,
 ) -> Option<{ ty: Type, params: List<Type>, ret: Type }> =
-  match filed(cx, at) {
-    Some(t) -> match t.ty {
-      TyFn(f) -> if f.params.len() == arity { Some({ ty: t.ty, params: f.params, ret: f.ret }) }
-      else { None },
-      _ -> None,
-    },
-    None -> None,
+  match filed(cx, at) { Some(t) -> fn_of(t.ty, arity), None -> None }
+
+/// `t` as a function type of `arity` parameters; none where it is no such type.
+fn fn_of(t: Type, arity: Int) -> Option<{ ty: Type, params: List<Type>, ret: Type }> =
+  match t {
+    TyFn(f) -> if f.params.len() == arity { Some({ ty: t, params: f.params, ret: f.ret }) }
+    else { None },
+    _ -> None,
   }
 
 /// A step's loop variables, numbered from `st` alike in `entered` and in `left`: its state, the
@@ -1405,7 +1411,10 @@ type Shape = { params: List<Var>, conv: Convention, ty: Type, ret: Type, capture
 /// The shape of the closure laid out as `frame` at `at`, from the function type the checker filed
 /// there; none where it filed none of the frame's arity.
 fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Option<Shape> =
-  match filed_fn(cx, at, frame.params) {
+  match match frame.ty {
+      Some(t) -> fn_of(t, frame.params),
+      None -> filed_fn(cx, at, frame.params),
+    } {
     None -> None,
     Some(f) -> {
       // A continuation is a word the runtime calls, and a clause binding one answers the word it
@@ -1427,13 +1436,8 @@ fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Option<Sha
       });
       let own = f.params.fold([], |acc: List<Var>, t: Type| {
         let j = acc.len();
-        acc.push(if continued(j) {
-          {
-            id: n + j,
-            ty: resumption(match t { TyFn(k) -> k.ret, _ -> unknown_type() }),
-            rep: RWord,
-          }
-        } else { { id: n + j, ty: t, rep: held_as(cx.setting, t) } })
+        acc.push(if continued(j) { { id: n + j, ty: resumption(t), rep: RWord } }
+        else { { id: n + j, ty: t, rep: held_as(cx.setting, t) } })
       });
       let params = caps.concat(own);
       Some({
