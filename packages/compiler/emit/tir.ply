@@ -3,7 +3,7 @@
 //! variable of its own type; every count is an instruction, which the ownership pass alone writes.
 //! Blocks nest only in `If`, `Case`, `Match`, `Loop` and `Handle`.
 
-import check.types (Type, TyCon)
+import check.types (Type, TyCon, TyFn, int_type, row_empty)
 import std.bytes (ascii_of_int)
 import syntax.parsing (Span, dummy_span)
 import syntax.patterns (Lit, LUnit, LStr)
@@ -378,14 +378,19 @@ pub fn rep_of_arg(a: Arg) -> Rep =
 /// The variable an operand is, if it is one.
 pub fn var_of(a: Arg) -> Option<Var> = match a { AVar(v) -> Some(v), _ -> None }
 
+/// Whether a call applies the function value `f` through its descriptor's typed entry, which takes
+/// the closure: a value of a function type. A continuation, which has none, is applied through its
+/// uniform entry, which borrows it.
+pub fn applied_typed(f: Arg) -> Bool =
+  match f { AVar(v) -> match v.ty { TyFn(_) -> true, _ -> false }, _ -> false }
+
 /// Each operand of `v` and whether `v` consumes it, by the fixed signature each operation has: a
-/// call takes what its convention gives and borrows what it lends, and borrows the function it
-/// applies, which its body reads its captures out of while the call runs; an operator and a field
-/// read borrow, as do holding a value as one that holds no count and reading a word as the box of
-/// words it is (`unpacks`); what allocates or answers takes but
-/// a stacked closure, which reads its captures while its caller holds them; a runtime function or a
-/// family's operation does as its `uses` say; a test of a last holder takes what it tests; a walk
-/// takes what it copies and borrows what it shares or keeps.
+/// call takes what its convention gives and borrows what it lends, and takes the function it applies
+/// where it enters it typed (`applied_typed`); an operator and a field read borrow, as do holding a
+/// value as one that holds no count and reading a word as the box of words it is (`unpacks`); what
+/// allocates or answers takes but a stacked closure, which reads its captures while its caller holds
+/// them; a runtime function or a family's operation does as its `uses` say; a test of a last holder
+/// takes what it tests; a walk takes what it copies and borrows what it shares or keeps.
 pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
   match v {
     Prim(p) -> p.args.map(|a: Arg| { arg: a, takes: false }),
@@ -409,7 +414,7 @@ pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
         u.sets.map(|s: FieldSet| { arg: s.arg, takes: true }),
       ),
     Call(c) -> handed(c.args, c.conv),
-    Apply(c) -> [{ arg: c.f, takes: false }].concat(handed(c.args, c.conv)),
+    Apply(c) -> [{ arg: c.f, takes: applied_typed(c.f) }].concat(handed(c.args, c.conv)),
     Native(n) -> used_as(n.args, n.uses),
     Op(o) -> used_as(o.args, o.uses),
     LastOf(x) -> [{ arg: AVar(x), takes: true }],
@@ -592,12 +597,18 @@ test "each operation consumes or borrows each operand as its signature says" {
   let call = Call({ callee: Generic(0), args: [AVar(s), AVar(s)], conv: conv, stops: false });
   let takes = |v: Val| operands(v).map(|o: { arg: Arg, takes: Bool }| o.takes);
   assert_eq(takes(call), [true, false]);
-  // The function a call applies is lent to it, its body reading its captures borrowed.
-  assert_eq(takes(Apply({ f: AVar(s), args: [AVar(s), AVar(s)], conv: conv, stops: false })), [
-    false,
+  // A call takes a function value it enters typed, and borrows a continuation.
+  let f = {
+    id: 2,
+    ty: TyFn({ params: [s.ty, s.ty], ret: int_type(), effects: row_empty() }),
+    rep: RWord,
+  };
+  assert_eq(takes(Apply({ f: AVar(f), args: [AVar(s), AVar(s)], conv: conv, stops: false })), [
+    true,
     true,
     false,
   ]);
+  assert_eq(takes(Apply({ f: AVar(s), args: [AVar(s)], conv: conv, stops: false })), [false, true]);
   assert_eq(takes(Get({ of: s, path: PLeaf(0) })), [false]);
   assert_eq(takes(Gathered({ parts: [AVar(s), AInt(1)] })), [true, true]);
   // A word read as a scalar is borrowed; a scalar boxed is taken.

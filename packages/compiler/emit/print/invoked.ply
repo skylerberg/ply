@@ -15,7 +15,8 @@ import emit.pieces (Piece, Text, Hole, Symbol, LambdaEntry, spelled)
 import emit.answer (Expect, GenericAt, call_at)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RFlat, RSum, RUnit, Leaf, Var, Arg,
                  AVar, Given, Lent, Owned, Borrowed, Convention, Made, MClosure, Fn, Member, Lambda,
-                 Closure, Uses, Calling, Return, Rooted, rep_of_arg, made_said, no_links, in_box)
+                 Closure, Uses, Calling, Return, Rooted, rep_of_arg, made_said, no_links, in_box,
+                 applied_typed)
 import emit.tir.calling (CallingOp, ConstantRead, Ticked)
 import emit.tir.statics (StaticWord)
 import emit.print.statics (word_c)
@@ -199,9 +200,9 @@ fn answer_read(
 
 fn nth(xs: List<Bytes>, k: Int) -> Bytes = match xs.at(k) { Some(x) -> x, None -> b"" }
 
-/// A call of the function value `c.f` on `c.args`, which it lends: through the entry its descriptor
-/// holds at its function type's convention; a continuation's, which has none, through its uniform
-/// entry, each argument and the answer a word.
+/// A call of the function value `c.f` on `c.args`: through the entry its descriptor holds at its
+/// function type's convention, which takes the closure; a continuation's, which has none, through
+/// its uniform entry, which borrows it, each argument and the answer a word.
 pub fn applied(
   p: Place,
   pr: Printing,
@@ -209,8 +210,7 @@ pub fn applied(
   c: { f: Arg, args: List<Arg>, conv: Convention, stops: Bool },
 ) -> Printing / {abort.raise} = {
   let f = arg_text(pr, c.f);
-  let typed = match c.f { AVar(v) -> match v.ty { TyFn(_) -> true, _ -> false }, _ -> false };
-  if typed {
+  if applied_typed(c.f) {
     invoked(
       p,
       pr,
@@ -302,7 +302,7 @@ pub fn closure_made(
               b"Word ",
               n.name,
               b" = rt_alloc_bytes_p(ctx, ",
-              ascii_of_int(block_bytes(words.len() - 1)),
+              ascii_of_int(block_bytes(words.len())),
               b");",
               Bytes::concat_all(
                 range(0, words.len()).map(|k: Int|
@@ -321,9 +321,8 @@ pub fn closure_made(
 fn lambda_symbol(symbol: Bytes, nth: Int) -> Bytes =
   Bytes::concat_all([symbol, b"_lambda", ascii_of_int(nth)])
 
-/// The bytes of a closure's block of `words` words of captures, its header and its descriptor's word
-/// among them.
-fn block_bytes(words: Int) -> Int = header_bytes() + 8 * (1 + words)
+/// The bytes of a closure's block of `words` words, its descriptor's among them, and its header.
+fn block_bytes(words: Int) -> Int = header_bytes() + 8 * words
 
 /// The capture of the closure `of` at word `i` past the closure's descriptor, read where it lies as
 /// the variable it is read into holds it: borrowed, so no count is taken.
@@ -653,8 +652,8 @@ pub fn lambda_names(l: Lambda, nth: Int) -> Map<Int, Bytes> / {abort.raise} =
 
 /// The function of closure body `nth` of `root`, its body printed as `pr.out`: its captures, each a
 /// word it reads out of the closure, then its own parameters as the closure's convention carries
-/// them. Then the closure's entries: by its function type's convention and by words, each lending
-/// the captures out of the closure it is handed; its release, share and keep, which walk each
+/// them. Then the closure's entries: by its function type's convention, which takes the closure, and
+/// by words, which borrows it, each handing the body its captures; its release, share and keep, which walk each
 /// capture as its type lays it out; and its descriptor naming them, and where it captures nothing
 /// the root's one block of it. The printing after it holds the tables they add to.
 pub fn lambda_text(
@@ -682,22 +681,23 @@ pub fn lambda_text(
             at: acc.at + value_words(v.rep),
           },
       );
-      let taken = captures_taken(pr, caps.parts);
+      let taken = captures_read(pr, caps.parts, true, block_bytes(caps.at));
+      let lent = captures_read(taken.pr, caps.parts, false, block_bytes(caps.at));
       let block = InBox({
         parts: caps.parts.fold([], |acc: List<Held>, h: { at: Int, ty: Type, rep: Rep }|
           acc.concat(held_at(pr.ctors, h.ty, h.rep, h.at))),
         words: caps.at,
       });
       let uniform = entry_text(
-        taken.pr,
+        lent.pr,
         Bytes::concat_all([
           b"static Word ",
           name,
           b"_uniform(PlyCtx *ctx, Word self, const Word *args)",
         ]),
         name,
-        taken.out,
-        taken.names,
+        lent.out,
+        lent.names,
         {
           conv: own,
           types: c.body.params.drop(c.captures).map(|v: Var| v.ty),
@@ -743,7 +743,7 @@ pub fn lambda_text(
     },
   }
 
-/// The entry a call by a closure's type enters its function `name` through: the closure lent, its
+/// The entry a call by a closure's type enters its function `name` through: the closure taken, its
 /// captures `taken` out of it, and the rest of the head handed on as the function, of convention
 /// `own` past its captures, takes it.
 fn typed_entry(name: Bytes, taken: Taken, own: Convention) -> List<Piece> =
@@ -790,63 +790,69 @@ fn capture_params(caps: List<Var>) -> Bytes =
     }),
   )
 
-/// What `captures_taken` writes, the printing after it, and the names it reads the captures into.
+/// What `captures_read` writes, the printing after it, and the names it reads the captures into.
 type Taken = { pr: Printing, out: List<Piece>, names: List<Bytes> }
 
-/// A closure's captures, laid in the block as `parts` say, read out of the closure `self` into
-/// `c<i>`, which its function takes: taken out where the closure is held only by the caller, which
-/// lets it go after, and otherwise counted once more, each as its type counts it.
-fn captures_taken(
+/// A closure's captures, laid in its block of `bytes` as `parts` say, read out of the closure `self`
+/// into `c<i>`, which its function takes. An entry that `takes` the closure moves them out of it
+/// where it was held only there, giving its block back, and otherwise counts each once more as its
+/// type counts it and lets the closure go; one that borrows it counts each once more.
+fn captures_read(
   pr: Printing,
   parts: List<{ at: Int, ty: Type, rep: Rep }>,
-) -> Taken / {abort.raise} =
-  if parts.len() == 0 { { pr: pr, out: [], names: [] } } else {
-    range(0, parts.len()).fold(
-      { pr: pr, out: [Text(b"  int unique = ply_obj(self)->rc == 1;\n")], names: [] },
-      |acc: Taken, i: Int|
-        match parts.at(i) {
-          None -> acc,
-          Some(part) -> {
-            let names = part_names(b"c".concat(ascii_of_int(i)), part.rep);
-            let types = c_types(part.rep);
-            let read = read_from(|k: Int| slot(b"self", part.at + k), part.rep);
-            let emptied = range(0, value_words(part.rep)).map(|k: Int|
-              Bytes::concat_all([slot(b"self", part.at + k), b" = 0;"]));
-            let d = duped(acc.pr, part.ty, part.rep, names);
-            {
-              pr: d.pr,
-              out: acc.out.push(
-                Text(
-                  Bytes::concat_all(
-                    range(0, names.len()).map(|k: Int|
-                      Bytes::concat_all([
-                        b"  ",
-                        nth(types, k),
-                        b" ",
-                        nth(names, k),
-                        b" = ",
-                        nth(read, k),
-                        b";\n",
-                      ])),
-                  ).concat(
-                    Bytes::concat_all([
-                      b"  if (unique) { ",
-                      Bytes::join(emptied, b" "),
-                      b" } else { ",
-                    ]),
-                  ),
-                ),
-              ).concat(
-                d.out,
-              ).push(
-                Text(b" }\n"),
-              ),
-              names: acc.names.concat(names),
-            }
-          },
+  takes: Bool,
+  bytes: Int,
+) -> Taken / {abort.raise} = {
+  let read = range(0, parts.len()).fold(
+    { pr: pr, reads: [], dups: [], names: [] },
+    |acc: { pr: Printing, reads: List<Bytes>, dups: List<Piece>, names: List<Bytes> }, i: Int|
+      match parts.at(i) {
+        None -> acc,
+        Some(part) -> {
+          let names = part_names(b"c".concat(ascii_of_int(i)), part.rep);
+          let types = c_types(part.rep);
+          let words = read_from(|k: Int| slot(b"self", part.at + k), part.rep);
+          let d = duped(acc.pr, part.ty, part.rep, names);
+          {
+            pr: d.pr,
+            reads: acc.reads.concat(
+              range(0, names.len()).map(|k: Int|
+                Bytes::concat_all([
+                  b"  ",
+                  nth(types, k),
+                  b" ",
+                  nth(names, k),
+                  b" = ",
+                  nth(words, k),
+                  b";\n",
+                ])),
+            ),
+            dups: acc.dups.concat(d.out),
+            names: acc.names.concat(names),
+          }
         },
+      },
+  );
+  let let_go = call_text(dec_fn(), [b"ctx", b"self"]).concat(b";");
+  let reads = Text(Bytes::concat_all(read.reads));
+  let out = if !takes { [reads, Text(b"  ")].concat(read.dups).push(Text(b"\n")) }
+  else if parts.len() == 0 { [Text(Bytes::concat_all([b"  ", let_go, b"\n"]))] } else {
+    [Text(b"  int unique = ply_obj(self)->rc == 1;\n"), reads].push(
+      Text(
+        Bytes::concat_all([
+          b"  if (unique) { ",
+          call_text(free_fn(), [b"ctx", b"self", ascii_of_int(bytes)]),
+          b"; } else { ",
+        ]),
+      ),
+    ).concat(
+      read.dups,
+    ).push(
+      Text(Bytes::concat_all([b" ", let_go, b" }\n"])),
     )
-  }
+  };
+  { pr: read.pr, out: out, names: read.names }
+}
 
 /// The release entry of the closure of function `name`, a block laid as `block` says: each capture
 /// let go of as its type counts it, then its memory given back.
@@ -878,7 +884,7 @@ fn release_entry(
           Text(
             Bytes::concat_all([
               b"  ",
-              call_text(free_fn(), [b"ctx", b"self", ascii_of_int(header_bytes() + 8 * b.words)]),
+              call_text(free_fn(), [b"ctx", b"self", ascii_of_int(block_bytes(b.words))]),
               b";\n  return 0;\n}\n",
             ]),
           ),
@@ -1468,10 +1474,11 @@ test "a closure's entries hand over its captures out of its block, its release l
   let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
   // The body takes its captures as words, then its own parameters.
   has(Bytes::concat_all([name, b"(PlyCtx *ctx, Word q0, Word q1, int64_t p0)"]));
-  // Its entries hand it the captures, taken out of a block its caller alone holds and counted once
-  // more otherwise: the `Int`'s word as an `Int`'s, the continuation through its descriptor.
+  // Its entries hand it the captures: the typed one, which takes the closure, moves them out of a
+  // block held only there and gives the block back; otherwise each is counted once more, the
+  // `Int`'s word as an `Int`'s and the continuation through its descriptor.
   has(b"int unique = ply_obj(self)->rc == 1;");
-  has(b"Word c1 = ply_words(self)[2];\n  if (unique) { ply_words(self)[2] = 0; } else {");
+  has(b"Word c1 = ply_words(self)[2];\n  if (unique) { ply_free(ctx, self, 40); } else {");
   has(Bytes::concat_all([name, b"(ctx, c0, c1, "]));
   // The release lets the `Int` go as an `Int`'s, the continuation through its descriptor, and gives
   // the block's five words back.
