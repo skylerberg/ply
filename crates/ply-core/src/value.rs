@@ -888,7 +888,7 @@ pub fn type_error(span: Span, what: &str, expected: &str, got: &Value) -> Diagno
 
 /// Comparing functions is an error rather than a silently-false answer.
 pub fn values_equal(a: &Value, b: &Value, span: Span) -> Result<bool, Diagnostic> {
-    equal_at(a, b, span, 0)
+    equal_at(a, b, span, 0, true)
 }
 
 /// Refuses past the bound; otherwise grows the stack so the bound is what a program meets.
@@ -903,7 +903,15 @@ fn descend(
     grow(f)
 }
 
-fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diagnostic> {
+/// `a == b`, two keyed constructors' values compared by their keys where `keyed`, which the
+/// program states, and by what they hold where not.
+fn equal_at(
+    a: &Value,
+    b: &Value,
+    span: Span,
+    depth: usize,
+    keyed: bool,
+) -> Result<bool, Diagnostic> {
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Fixed(x), Value::Fixed(y)) => x == y,
@@ -922,7 +930,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
             }
             return descend(span, depth, || {
                 for (p, q) in x.iter().zip(y.iter()) {
-                    if !equal_at(p, q, span, depth + 1)? {
+                    if !equal_at(p, q, span, depth + 1, keyed)? {
                         return Ok(false);
                     }
                 }
@@ -935,7 +943,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
             }
             return descend(span, depth, || {
                 for (p, q) in x.iter().zip(y.iter()) {
-                    if !equal_at(p, q, span, depth + 1)? {
+                    if !equal_at(p, q, span, depth + 1, keyed)? {
                         return Ok(false);
                     }
                 }
@@ -948,7 +956,9 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
             }
             return descend(span, depth, || {
                 for ((k1, v1), (k2, v2)) in x.iter().zip(y.iter()) {
-                    if !equal_at(k1, k2, span, depth + 1)? || !equal_at(v1, v2, span, depth + 1)? {
+                    if !equal_at(k1, k2, span, depth + 1, keyed)?
+                        || !equal_at(v1, v2, span, depth + 1, keyed)?
+                    {
                         return Ok(false);
                     }
                 }
@@ -961,7 +971,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
             }
             return descend(span, depth, || {
                 for (p, q) in x.values().zip(y.values()) {
-                    if !equal_at(p, q, span, depth + 1)? {
+                    if !equal_at(p, q, span, depth + 1, keyed)? {
                         return Ok(false);
                     }
                 }
@@ -969,15 +979,17 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
             });
         }
         (Value::Ctor { name: n1, args: a1 }, Value::Ctor { name: n2, args: a2 }) => {
-            if let Some((x, y)) = crate::instances::keys(a, b) {
-                return descend(span, depth, || equal_at(&x, &y, span, depth + 1));
+            if keyed {
+                if let Some((x, y)) = crate::instances::keys(a, b) {
+                    return descend(span, depth, || equal_at(&x, &y, span, depth + 1, keyed));
+                }
             }
             if n1 != n2 || a1.len() != a2.len() {
                 return Ok(false);
             }
             return descend(span, depth, || {
                 for (p, q) in a1.iter().zip(a2.iter()) {
-                    if !equal_at(p, q, span, depth + 1)? {
+                    if !equal_at(p, q, span, depth + 1, keyed)? {
                         return Ok(false);
                     }
                 }
@@ -1025,19 +1037,23 @@ pub enum PathStep {
     Arg(Symbol, usize),
 }
 
+/// Where two unequal values first part. A keyed value is equal to another as their keys are, which
+/// only the program reads, so a part outside every keyed value is sought first, and a keyed value is
+/// where they part only where nothing else differs, compared then as a whole by what it holds.
 pub fn first_difference(actual: &Value, expected: &Value) -> Option<Difference> {
     fn go(
         actual: &Value,
         expected: &Value,
         path: &mut Vec<PathStep>,
         depth: usize,
+        keyed: bool,
     ) -> Option<Difference> {
         if depth >= MAX_VALUE_DEPTH {
             return None;
         }
         let within = |step: PathStep, x: &Value, y: &Value, path: &mut Vec<PathStep>| {
             path.push(step);
-            let found = go(x, y, path, depth + 1);
+            let found = go(x, y, path, depth + 1, keyed);
             if found.is_none() {
                 path.pop();
             }
@@ -1080,8 +1096,13 @@ pub fn first_difference(actual: &Value, expected: &Value) -> Option<Difference> 
                         .find_map(|(i, (x, y))| within(PathStep::Arg(n1.clone(), i), x, y, path))
                 })
             }
+            (Value::Ctor { name: n1, .. }, Value::Ctor { .. })
+                if !keyed && crate::instances::keyed(n1) =>
+            {
+                None
+            }
             (a, e) => {
-                if equal_at(a, e, Span::DUMMY, depth).unwrap_or(false) || path.is_empty() {
+                if equal_at(a, e, Span::DUMMY, depth, false).unwrap_or(false) || path.is_empty() {
                     None
                 } else {
                     Some(Difference {
@@ -1093,5 +1114,6 @@ pub fn first_difference(actual: &Value, expected: &Value) -> Option<Difference> 
             }
         }
     }
-    go(actual, expected, &mut Vec::new(), 0)
+    go(actual, expected, &mut Vec::new(), 0, false)
+        .or_else(|| go(actual, expected, &mut Vec::new(), 0, true))
 }
