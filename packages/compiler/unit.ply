@@ -19,18 +19,17 @@ import emit.statics (SStr, statics_of)
 import emit.roots (builtin_helper, symbol_of, entry_of, root_id)
 import emit.keys
 import emit.keys (RootKey, Named, At, Written, Test, Cases, Clause, Law, Stored, Entered, Requires,
-                  Ensures, LawGuard, LawBody, FnArg, KeyArg, KeyType, KeyLayout, RootName,
+                  Ensures, LawGuard, LawBody, LawPart, FnArg, KeyArg, KeyType, KeyLayout, RootName,
                   root_name, root_text, definition_of, sited_as, key_lent, key_types, at_key,
                   module_of, modules_lowered, key_bytes, root_key_bin, test_key, law_key,
-                  entry_name)
+                  entry_name, judged_at)
 import store.kept (Record, kept_records, with_kept)
 import emit
 import emit.lend (Handing, handed_from, published_of, taking_all)
 import emit.reps (Ctors, laid_vars, has_vars, held_apart, ctor_sums, ctors_of, type_vars,
                   layout_key, no_ctors, numeric_sum)
 import front.rows (Dump, EmitterRoot, EmitterCtor, CtorRow, KeyRow, ModuleRow, OrdinalRow,
-                   KnownDefRow, DefRow, SpecRow, TestRow, LawRow, Carry, CVar, CFn, CList, CMap,
-                   CRecord, CSum, CarriedField)
+                   KnownDefRow, DefRow, SpecRow, TestRow, LawRow, BinderRow)
 import emit.written (CrossedSums, sums_crossed)
 import front.published (Linked, analyse, no_rows, dump_of)
 import front (analyse_pulling_std_with)
@@ -678,19 +677,28 @@ pub fn fatal(offered: List<RootName>, dropped: List<Dropped>) -> List<Dropped> /
 }
 
 /// Whether the runtime enters root `k` of `p`, so the unit takes its entry: a stored root, a test's
-/// run or the listing of its cases, a law's guard and body where its binders cross, a definition
-/// `emit.enterable` admits by its scheme, and that definition's clauses. A specialisation has none.
+/// run or the listing of its cases, a law's guard and body where a lifting reads each of its
+/// binders, a definition `emit.enterable` admits by its scheme, and that definition's clauses where
+/// a lifting reads its answer too. A specialisation has none.
 fn entered_root(p: Program, k: RootKey) -> Bool =
   match k {
     Stored(_) -> true,
     Test(_) -> true,
     Cases(_) -> true,
-    Law(_) -> match p.roots.get(root_name(k)) {
-      Some(r) -> r.params.all(binder_crosses),
+    // A law over a type variable is judged by a proof over its sort, never entered.
+    Law(_) -> match p.binders.get(root_name(k)) {
+      Some(tys) -> tys.all(|t: Type| emit::lifted(p.crossing, t)),
       None -> false,
     },
-    // A clause states over its definition's parameters and answer, so it crosses where they do.
-    Clause(c) -> entered_root(p, c.def),
+    Clause(c) ->
+      entered_root(p, c.def)
+        && (match c.def {
+          Named(n) -> match p.schemes.get(n) {
+            Some(sc) -> emit::judgeable(p.crossing, sc),
+            None -> false,
+          },
+          _ -> false,
+        }),
     // A generic one is entered where it is judged, at `Int`, only over variables no constraint
     // hands a witness for: those its specialisation reads.
     Named(n) -> match ((p.schemes.get(n), p.roots.get(root_name(k)))) {
@@ -701,25 +709,6 @@ fn entered_root(p: Program, k: RootKey) -> Bool =
     },
     _ -> false,
   }
-
-/// Whether a law's binder carried as `c` crosses into an entry: neither a type variable, which only
-/// a proof over its sort judges, nor a function.
-fn binder_crosses(c: Carry) -> Bool =
-  match c {
-    CVar(_) -> false,
-    CFn(_, _) -> false,
-    CList(x) -> binder_crosses(x),
-    CMap(a, b) -> binder_crosses(a) && binder_crosses(b),
-    CRecord(fields) -> fields_cross(fields),
-    CSum(xs) -> carries_cross(xs),
-    _ -> true,
-  }
-
-fn fields_cross(fields: List<CarriedField>) -> Bool =
-  match fields { [f, ..rest] -> binder_crosses(f.carry) && fields_cross(rest), [] -> true }
-
-fn carries_cross(xs: List<Carry>) -> Bool =
-  match xs { [x, ..rest] -> binder_crosses(x) && carries_cross(rest), [] -> true }
 
 /// The roots a program's answer offers, in the order `Dump.emitter_roots` lists them, each keyed by
 /// what the front end's typed rows say it is, never by reading its name; and the name of each the
@@ -1516,6 +1505,8 @@ type Program = {
   embeds: Map<Int, Bytes>,
   /// Each definition's scheme, as the emitter types it.
   schemes: Map<Bytes, Scheme>,
+  /// The types of each law's binders, by its guard's and its body's root.
+  binders: Map<RootName, List<Type>>,
   crossing: CrossedSums,
 }
 
@@ -1556,6 +1547,11 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program / {abort.raise} = {
     embeds: reads.fold(Map::new(), |acc: Map<Int, Bytes>, i: Int, parts: List<Bytes>|
       acc.insert(i, blake3(Bytes::concat_all(ordered(parts))))),
     schemes: schemes,
+    binders: dump.laws.fold(Map::new(), |acc: Map<RootName, List<Type>>, l: LawRow| {
+      let tys = l.binders.map(|b: BinderRow| b.ty);
+      [LawGuard, LawBody].fold(acc, |m: Map<RootName, List<Type>>, part: LawPart|
+        m.insert(root_name(law_key(l.module, l.name, part)), tys))
+    }),
     crossing: sums_crossed(ctor_sums(dump.ctors), |n: Bytes| schemes.contains(prelude.concat(n))),
   }
 }
@@ -2354,18 +2350,17 @@ fn answered_now<s | e>(
 }
 
 /// The roots the answers `w` has not read call that no answer holds: each root written for a type a
-/// body calls, and the generic body of each definition a body calls generically, whose needs settle
-/// those calls. Of a body's other calls none can be new: it calls a specialisation only as itself.
+/// body calls, each clause an entry judges at its definition's specialisation, and the generic body
+/// of each definition a body calls generically, whose needs settle those calls. Of a body's other
+/// calls none can be new: it calls a specialisation only as itself.
 fn found<s>(w: Walk<s>) -> Map<RootName, RootKey> =
   w.unread.fold(Map::new(), |acc: Map<RootName, RootKey>, n: RootName|
     match w.answers.get(n) {
       Some(Body(b)) -> {
+        let unheld = |m: Map<RootName, RootKey>, c: RootKey|
+          if w.answers.contains(root_name(c)) { m } else { m.insert(root_name(c), c) };
         let written = b.tables.calls.fold(acc, |m: Map<RootName, RootKey>, c: RootKey|
-          match c {
-            Written(_, _) -> if w.answers.contains(root_name(c)) { m }
-            else { m.insert(root_name(c), c) },
-            _ -> m,
-          });
+          match c { Written(_, _) -> unheld(m, c), Clause(_) -> unheld(m, c), _ -> m });
         b.tables.generics.calls.fold(written, |m: Map<RootName, RootKey>, g: GenericCall|
           if w.answers.contains(root_name(g.callee)) { m }
           else { m.insert(root_name(g.callee), g.callee) })
@@ -4568,6 +4563,77 @@ test "each root a program offers is keyed by the row that says what it is, and p
     mine.filter(|k: RootKey| entered_root(p, k)),
     mine.filter(|k: RootKey| k != law_key(b"m", b"s", LawBody)),
   )
+}
+
+test "a generic definition's clause is entered at the specialisation it is judged at, which the unit asks for" {
+  let user = [{ name: b"m", src: b"pub fn none<a>() -> List<a> ensures result.len() == 0 = []\n" }];
+  let dump = dump_of(analyse(parse_all(user)));
+  let clause = |def: RootKey| Clause({ def: def, kind: Ensures, n: 0 });
+  match emitted(
+      a_runtime(b"r"),
+      dump,
+      sources_placed(dump, user),
+      Map::new(),
+      offered_roots(dump).keys,
+      |_: Bytes| None,
+      |_: List<Record>| (),
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(e) -> {
+      let judged = [Entered(clause(Named(b"m.none"))), clause(judged_at(b"m.none", 1))].map(
+        root_name,
+      );
+      assert(judged.all(|n: RootName| e.produced.taken.contains(n)), None);
+      assert(!e.produced.dropped.any(|d: Dropped| judged.contains(d.function)), None)
+    },
+  }
+}
+
+test "a generic definition's entry is taken, its call settled where the entry judges it" {
+  let user = [
+    {
+      name: b"m",
+      src: Bytes::concat_all([
+        b"pub fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n",
+        b"pub fn made<a>(make: () -> a) -> a = make()\n",
+        b"pub fn total<a>(xs: List<a>) -> a where numeric(a) = xs.fold(numeric_of_int(0), |s: a, x: a| s + x)\n",
+      ]),
+    },
+  ];
+  let dump = dump_of(analyse(parse_all(user)));
+  match emitted(
+      a_runtime(b"r"),
+      dump,
+      sources_placed(dump, user),
+      Map::new(),
+      offered_roots(dump).keys,
+      |_: Bytes| None,
+      |_: List<Record>| (),
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(e) -> {
+      let entry = |n: Bytes| root_name(Entered(Named(n)));
+      assert_eq(e.produced.dropped.filter(|d: Dropped| d.function == entry(b"m.first")), []);
+      // A function crosses only out, and a witnessed variable has no specialisation at `Int`.
+      assert_eq(
+        [b"m.first", b"m.made", b"m.total"].filter(|n: Bytes| e.produced.taken.contains(entry(n))),
+        [b"m.first"],
+      )
+    },
+  }
+}
+
+test "a clause over a function its definition answers has no entry, as a function crosses only out" {
+  let user = [
+    {
+      name: b"m",
+      src: b"pub fn adder(n: Int) -> (Int) -> Int ensures result(1) == n + 1 = |x: Int| x + n\n",
+    },
+  ];
+  let dump = dump_of(analyse(parse_all(user)));
+  let p = program_of(dump, sources_placed(dump, user));
+  assert(entered_root(p, Named(b"m.adder")), None);
+  assert(!entered_root(p, Clause({ def: Named(b"m.adder"), kind: Ensures, n: 0 })), None)
 }
 
 test "a root the front end offers with no typed row to key it by fails the build, and what calls it is dropped" {
