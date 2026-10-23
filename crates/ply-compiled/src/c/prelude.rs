@@ -518,14 +518,14 @@ pub fn runtime_header() -> String {
          \x20 return o;\n\
          }\n\
          \nstatic inline void ply_inc(Word w) {\n\
-         \x20 if ((w & 3) != 0 || w == 0) return;\n\
+         \x20 if ((w & 3) != 0 || (uint64_t)w < 4096) return;\n\
          \x20 PlyObj *o = ply_counted_by(ply_obj(w & ~(Word)7));\n\
          \x20 uint32_t rc = o->rc;\n\
          \x20 if (rc < UINT32_C(0x80000000)) o->rc = rc + 1;\n\
          \x20 else if (rc != UINT32_MAX) rt_inc_shared_p(0, (Word)o);\n\
          }\n\
          \nstatic inline void ply_dec(PlyCtx *ctx, Word w) {\n\
-         \x20 if ((w & 3) != 0 || w == 0) return;\n\
+         \x20 if ((w & 3) != 0 || (uint64_t)w < 4096) return;\n\
          \x20 PlyObj *o = ply_counted_by(ply_obj(w & ~(Word)7));\n\
          \x20 uint32_t rc = o->rc;\n\
          \x20 if (rc == UINT32_MAX) return;\n\

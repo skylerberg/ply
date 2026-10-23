@@ -225,6 +225,16 @@ pub fn is_imm(w: Word) -> bool {
     w & 7 != 0
 }
 
+/// No object lies below this address, so a word under it is a value of its own: 0, or a one-word
+/// sum's nullary value `8, 16, ..`, as emitted code lays them (`layout.pointer_floor`).
+pub const POINTER_FLOOR: Word = 4096;
+
+/// Whether `w` is an object's address: a multiple of eight at or above [`POINTER_FLOOR`].
+#[inline]
+pub fn is_object(w: Word) -> bool {
+    !is_imm(w) && w >= POINTER_FLOOR
+}
+
 /// Whether `w` is an `Int` held in the word.
 #[inline]
 pub fn is_int(w: Word) -> bool {
@@ -348,7 +358,7 @@ pub fn small_bytes(b: &[u8]) -> Option<Word> {
 
 /// The poison diagnostic: the dead-payload word and the check every object read passes.
 pub mod poison {
-    use super::{IMMORTAL, KIND_DEAD, Obj, Word, is_imm};
+    use super::{IMMORTAL, KIND_DEAD, Obj, Word, is_object};
 
     /// Dead by its header and immortal by its count: a read through it is caught, never counted.
     static POISONED: Obj = Obj {
@@ -380,7 +390,7 @@ pub mod poison {
 
     /// Panics, naming the body's site, when `w` is the poison word or points at a dead header.
     pub fn check(w: Word) {
-        if is_imm(w) || w == 0 {
+        if !is_object(w) {
             return;
         }
         let why = if w == word() {
@@ -1985,7 +1995,7 @@ impl Heap {
 
     fn copy(&mut self, w: Word, copies: &mut HashMap<usize, Word>) -> Word {
         // Zero is an `Option` held as its payload's word: `None`.
-        if is_imm(w) || w == 0 {
+        if !is_object(w) {
             return w;
         }
         let o = obj(w);
@@ -2375,7 +2385,7 @@ impl Drop for Heap {
 /// One more holder of `w`. Zero is no object, as `ply_inc` and `ply_dec` read it.
 #[inline]
 pub fn inc(w: Word) {
-    if is_imm(w) || w == 0 {
+    if !is_object(w) {
         return;
     }
     let o = obj(w);
@@ -2394,7 +2404,7 @@ pub fn inc(w: Word) {
 /// One holder fewer; the last one dismantles the object, children and all.
 #[inline]
 pub fn dec(w: Word) {
-    if is_imm(w) || w == 0 {
+    if !is_object(w) {
         return;
     }
     let o = obj(w);
@@ -2449,7 +2459,7 @@ pub fn share(words: &[Word]) -> bool {
     let mut marked: Vec<*mut Obj> = Vec::new();
     let mut pending: Vec<Word> = words.to_vec();
     while let Some(w) = pending.pop() {
-        if is_imm(w) || w == 0 {
+        if !is_object(w) {
             continue;
         }
         let o = unsafe { counted_by(obj(w)) };
@@ -2533,7 +2543,7 @@ unsafe fn release(o: *mut Obj, heap: *mut Heap) {
 /// after releasing anything else. It keeps its width and is marked flat, so a token released unused
 /// walks nothing and goes back to the free list of its own size.
 pub fn reset(w: Word) -> Word {
-    if is_imm(w) || w == 0 {
+    if !is_object(w) {
         return 0;
     }
     let o = obj(w);
@@ -2637,7 +2647,7 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, hea
                 continue;
             }
             let c = word_at(o, i);
-            if is_imm(c) || c == 0 {
+            if !is_object(c) {
                 continue;
             }
             let co = counted_by(obj(c));
@@ -2740,7 +2750,7 @@ unsafe fn counted_view(o: *mut Obj, by: i32) {
 /// Whether bytes or a string `w` may grow in place: no holder but one has it, besides the views of
 /// it, which read only bytes it already holds.
 pub fn grows_in_place(w: Word) -> bool {
-    if is_imm(w) || w == 0 {
+    if !is_object(w) {
         return false;
     }
     let o = obj(w);
@@ -2794,7 +2804,7 @@ pub fn as_int(w: Word) -> Option<i64> {
 
 #[inline]
 pub fn as_bool(w: Word) -> Option<bool> {
-    if is_imm(w) || w == 0 {
+    if !is_object(w) {
         return None;
     }
     let o = obj(w);

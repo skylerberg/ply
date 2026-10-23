@@ -195,7 +195,7 @@ impl Tables {
             words.insert(id, w);
         }
         // A scalar answer is its own word, with no parts to remember.
-        if heap::is_imm(w) || w == 0 {
+        if !heap::is_object(w) {
             return;
         }
         let o = obj(w);
