@@ -979,10 +979,8 @@ fn equal_at(
             });
         }
         (Value::Ctor { name: n1, args: a1 }, Value::Ctor { name: n2, args: a2 }) => {
-            if keyed {
-                if let Some((x, y)) = crate::instances::keys(a, b) {
-                    return descend(span, depth, || equal_at(&x, &y, span, depth + 1, keyed));
-                }
+            if keyed && let Some((x, y)) = crate::instances::keys(a, b) {
+                return descend(span, depth, || equal_at(&x, &y, span, depth + 1, keyed));
             }
             if n1 != n2 || a1.len() != a2.len() {
                 return Ok(false);
