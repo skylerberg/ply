@@ -137,6 +137,32 @@ pub fn support_flags(resolved: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The code `program` ended with, and what a person is told where a signal stopped it, which the
+/// program had no chance to say: -1 and the signal then.
+pub fn ended(program: &Path, status: std::process::ExitStatus) -> (i64, Option<String>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            let name = match signal {
+                6 => " (SIGABRT)",
+                9 => " (SIGKILL)",
+                11 => " (SIGSEGV)",
+                15 => " (SIGTERM)",
+                _ => "",
+            };
+            return (
+                -1,
+                Some(format!(
+                    "{} was stopped by signal {signal}{name}",
+                    program.display()
+                )),
+            );
+        }
+    }
+    (status.code().map_or(-1, i64::from), None)
+}
+
 fn compiler_value(label: &str) -> PlyValue {
     let Some(path) = compiler_path(label) else {
         return PlyValue::ctor("None", Vec::new());
@@ -360,7 +386,13 @@ impl HostHandler for Toolchain {
                     .stderr(Stdio::inherit())
                     .output();
                 let (code, out) = match ran {
-                    Ok(out) => (out.status.code().map_or(-1, i64::from), out.stdout),
+                    Ok(out) => {
+                        let (code, said) = ended(&program, out.status);
+                        if let Some(said) = said {
+                            eprintln!("{said}");
+                        }
+                        (code, out.stdout)
+                    }
                     Err(e) => {
                         eprintln!("{} did not start: {e}", program.display());
                         (-1, Vec::new())
