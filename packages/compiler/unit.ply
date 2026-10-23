@@ -25,9 +25,9 @@ import emit.keys (RootKey, Named, At, Written, Test, Cases, Clause, Stored, Ente
                   entry_name)
 import store.kept (Record, kept_records, with_kept)
 import emit
-import emit.lend (Handing, handed_from)
+import emit.lend (Handing, handed_from, published_of, taking_all)
 import emit.reps (Ctors, laid_vars, has_vars, held_apart, ctor_sums, ctors_of, type_vars,
-                  layout_key, no_ctors)
+                  layout_key, no_ctors, numeric_sum)
 import front.rows (Dump, EmitterRoot, EmitterCtor, CtorRow, KeyRow, ModuleRow, OrdinalRow,
                    KnownDefRow, DefRow, SpecRow, TestRow, LawRow)
 import emit.written (CrossedSums, sums_crossed)
@@ -585,7 +585,14 @@ fn defines(name: RootName, tables: Tables) -> Defined / {abort.raise} = {
     if acc < 0 && root_name(tables.members.get(i)) == name { i } else { acc });
   match tables.symbols.at(if found < 0 { 0 } else { found }) {
     Some(d) -> d,
-    None -> panic("an emitted body publishes the C it defines"),
+    None ->
+      panic(
+        String::of_bytes_lossy(
+          b"an emitted body publishes the C it defines, and `".concat(root_text(name)).concat(
+            b"`'s publishes none",
+          ),
+        ),
+      ),
   }
 }
 
@@ -1793,13 +1800,14 @@ fn answers_kept<| e>(
   )
 
 /// The program's constructors as the emitter reads them, the unit's table `ctors` laid out as the
-/// dump says, with each sum's cases and the constructors whose module states a `key`.
+/// dump says, with each sum's cases and the constructors whose module states a `key` or arithmetic.
 fn program_ctors(dump: Dump, ctors: List<Ctor>) -> Ctors =
   ctors_of(
     ctors.map(|c: Ctor| c.name),
     // Program-wide: a specialisation is emitted where its definition is, which may not import
     // the module stating a `key` for the type it is at.
     dump.emitter_ctors.filter(|c: EmitterCtor| c.key != None).map(|c: EmitterCtor| c.name),
+    dump.emitter_ctors.filter(|c: EmitterCtor| c.numeric.len() > 0).map(|c: EmitterCtor| c.name),
     ctor_sums(dump.ctors),
   )
 
@@ -2360,8 +2368,9 @@ pub fn stored_root(name: Bytes) -> Bytes = root_text(root_name(Stored(Named(name
 
 /// A `const` definition as the value a build kept of it, laid out as static data: its body answers
 /// the value from there and calls nothing, so the unit need not hold what the body reaches, and a
-/// read of it neither steps nor allocates. Stops the unit where the value does not lay out at the
-/// definition's type, which no value a build kept fails to.
+/// read of it neither steps nor allocates; refused where the emitter refuses that body. Stops the
+/// unit where the value does not lay out at the definition's type, which no value a build kept
+/// fails to.
 fn kept_body(ctors: Ctors, p: Program, b: Baked) -> Answer / {abort.raise} = {
   let unlaid = |why: Bytes|
     panic(
@@ -2380,14 +2389,20 @@ fn kept_body(ctors: Ctors, p: Program, b: Baked) -> Answer / {abort.raise} = {
       TyFn(f) -> match value::decode(b.bytes) {
         Some(v) -> match known_of_value(ctors, f.ret, v) {
           Ok(k) -> {
+            let name = root_name(Named(b.name));
             let e = emitted_of(
-              Formed({
-                name: root_name(Named(b.name)),
-                form: Ok(kept_root(ctors, Named(b.name), f.ret, k)),
-              }),
+              Formed({ name: name, form: Ok(kept_root(ctors, Named(b.name), f.ret, k)) }),
               ctors,
             );
-            Body({ text: e.text, tables: e.tables })
+            match e.why {
+              Some(why) -> Refused({ why: why }),
+              // Its answer owned, as the lending settles any definition's of no parameters.
+              None ->
+                Body({
+                  text: e.text,
+                  tables: { ..e.tables, handings: [published_of(name, taking_all(0))] },
+                }),
+            }
           },
           Err(why) -> unlaid(why),
         },
@@ -2672,8 +2687,9 @@ fn widened(
 
 /// The root a generic call settles on over the program's constructors `ctors`: each type argument
 /// the callee's code needs and the call knows, keyed by the type itself where the code reads which
-/// type it is, and otherwise by its layout (where the code needs that, does a scalar's operators in
-/// C, or the call carries the argument raw), lowered at the call's own argument; every other
+/// type it is or does the operators a type's module states, and otherwise by its layout (where the
+/// code needs that, does a scalar's operators in C, or the call carries the argument raw), lowered
+/// at the call's own argument; every other
 /// argument left as the callee's generic body has it. Calls settling on one layout share a root's
 /// name. A tail loop's member reads each variable exactly, so its loop runs at its callers' types.
 fn settled_root(
@@ -2692,6 +2708,7 @@ fn settled_root(
     else if ns.contains({ var: j, reads: Exact }) { KeyType(arg) }
     else if call.carried.contains(j) || ns.contains({ var: j, reads: Layout }) { laid() }
     else if ns.contains({ var: j, reads: Scalar }) && held_apart(arg) { laid() }
+    else if ns.contains({ var: j, reads: Scalar }) && numeric_sum(ctors, arg) { KeyType(arg) }
     else { open }
   });
   // A lambda is run in place only by a callee that calls the parameter it is handed as.

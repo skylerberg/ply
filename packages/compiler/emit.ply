@@ -31,8 +31,8 @@ import expand.embed (EmbedAt, embed_tables, rewritten)
 import emit.c (KBoxed, KInt, Kind, bytes_join)
 import emit.keys
 import emit.keys (RootKey, Named, At, Written, Cases, Clause, Stored, Entered, FnArg, TypeOp, Order,
-                  Reflect, Shown, Digest, Lower, Lift, Contained, LawPart, LawGuard, LawBody,
-                  ClauseKind, Requires, Ensures, RootName, root_name, root_text, filed_as,
+                  Stated, Reflect, Shown, Digest, Lower, Lift, Contained, LawPart, LawGuard,
+                  LawBody, ClauseKind, Requires, Ensures, RootName, root_name, root_text, filed_as,
                   key_types, key_lent, op_name, module_of, modules_lowered, test_key, law_key,
                   law_owner)
 import emit.answer (Emitted, Body, Refused, RootAnswer, Published)
@@ -44,7 +44,8 @@ import emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, Imported, EffectName
                   typed_kind, filings_at, at_args)
 import emit.written (WrittenRoot, CrossedSums, container_code, contained_formed, crossing_root,
                      crossing_op, entered_code, stored_code, crosses, equality_code, ordering_code,
-                     keyed_by, keyed_code, digest_code, reflection_code)
+                     keyed_by, keyed_code, numeric_stated, stated_code, digest_code,
+                     reflection_code)
 import emit.entry (Prepared, RootForm, Formed, Unformed, root_formed, formed_from, emitted_of)
 import emit.release (generated)
 import emit.lower.crossing (worded)
@@ -493,7 +494,7 @@ pub fn walked_in(
             },
           },
           Some(d) -> {
-            let source = definition_at(of.base, d, of.args, schemes, module_at(i).ops);
+            let source = definition_at(s.ctors, of.base, d, of.args, schemes, module_at(i).ops);
             let filed = filed_of(of.base);
             match lower_fn(
                 d.params.map(|param: Param| param.name.name),
@@ -911,12 +912,13 @@ fn module_formed(
         // At its own name, or at the arguments a body asked for one at.
         let asked = written_roots.fold(
           [],
-          |acc2: List<{ key: RootKey, eq: Bool, args: List<Type> }>, w: { key: RootKey, op: TypeOp, ty: Type }|
+          |acc2: List<{ key: RootKey, op: TypeOp, args: List<Type> }>, w: { key: RootKey, op: TypeOp, ty: Type }|
             match w.ty {
               TyCon(c) -> if c.name != named { acc2 } else {
                 match w.op {
-                  keys::Equal -> acc2.push({ key: w.key, eq: true, args: c.args }),
-                  Order -> acc2.push({ key: w.key, eq: false, args: c.args }),
+                  keys::Equal -> acc2.push({ key: w.key, op: w.op, args: c.args }),
+                  Order -> acc2.push({ key: w.key, op: w.op, args: c.args }),
+                  Stated(_) -> acc2.push({ key: w.key, op: w.op, args: c.args }),
                   _ -> acc2,
                 }
               },
@@ -926,7 +928,7 @@ fn module_formed(
         match s.ctors.sums.get(named) {
           None -> acc,
           Some(declared) ->
-            asked.fold(acc, |a2: Walk, d: { key: RootKey, eq: Bool, args: List<Type> }| {
+            asked.fold(acc, |a2: Walk, d: { key: RootKey, op: TypeOp, args: List<Type> }| {
               let cs = if d.args.len() == 0 { declared } else {
                 declared.map(|c: SumCtor|
                   { ..c, fields: c.fields.map(|f: Type| at_args(f, c.params, d.args)) })
@@ -938,26 +940,47 @@ fn module_formed(
                   match declared.at(0) { Some(c) -> c.params.map(|v: Int| TyVar(v)), None -> [] }
                 },
               });
-              let e = match keyed_by(module, here, x_module.items, compared) {
-                Some(k) -> keyed_code(k, d.eq),
-                None -> if d.eq { equality_code(cs) } else { ordering_code(cs) },
+              let param = |n: Bytes, ty: Type| {
+                let held = kind_of(ty);
+                { name: n, kind: held.kind, ty: held.ty, of: Some(ty), lambda: None }
               };
-              let word = |n: Bytes|
-                { name: n, kind: KBoxed, ty: TyOpen([]), of: Some(compared), lambda: None };
-              {
-                ..a2,
-                out: a2.out.push(
-                  formed_from(
-                    s,
-                    t.span.start,
-                    d.key,
-                    [word(b"a"), word(b"b")],
-                    true,
-                    Ok(e.code),
-                    Ok({ ..no_filings(), typed: e.typed }),
-                  ),
-                ),
-              }
+              let formed = |ps: List<EmitParam>, e: Result<{ code: Code, typed: Map<Int, Typed> }, Bytes>|
+                match e {
+                  Ok(x) ->
+                    formed_from(
+                      s,
+                      t.span.start,
+                      d.key,
+                      ps,
+                      true,
+                      Ok(x.code),
+                      Ok({ ..no_filings(), typed: x.typed }),
+                    ),
+                  Err(why) ->
+                    formed_from(s, t.span.start, d.key, ps, true, Err(why), Ok(no_filings())),
+                };
+              let made = match d.op {
+                Stated(op) -> {
+                  let ps = if op == b"of_int" { [param(b"a", int_type())] }
+                  else if op == b"neg" { [param(b"a", compared)] }
+                  else { [param(b"a", compared), param(b"b", compared)] };
+                  formed(ps, match numeric_stated(module, here, x_module.items, compared, op) {
+                    Some(f) -> Ok(stated_code(f, ps.len())),
+                    None -> Err(b"no function stated for an operator of the type: ".concat(op)),
+                  })
+                },
+                _ -> {
+                  let eq = d.op == keys::Equal;
+                  formed(
+                    [param(b"a", compared), param(b"b", compared)],
+                    Ok(match keyed_by(module, here, x_module.items, compared) {
+                      Some(k) -> keyed_code(k, eq),
+                      None -> if eq { equality_code(cs) } else { ordering_code(cs) },
+                    }),
+                  )
+                },
+              };
+              { ..a2, out: a2.out.push(made) }
             }),
         }
       },

@@ -5,7 +5,7 @@
 use crate::bare::{context, helper};
 use ply_compiled::emitted::Block;
 use ply_compiled::heap::{
-    CLOSURE_CAPTURES, IMMORTAL, KIND_DEAD, KIND_LIST, KIND_REFUSED, SHARED, Word, kind, obj,
+    CLOSURE_CAPTURES, IMMORTAL, KIND_DEAD, KIND_LIST, KIND_REFUSED, SHARED, Word, inc, kind, obj,
     word_at,
 };
 use ply_compiled::native::Answered;
@@ -219,6 +219,28 @@ fn a_bridge_is_given_back_with_the_value_it_bridged() {
     assert_eq!(kind(b), KIND_DEAD);
     assert_eq!(Arc::strong_count(&held), 1);
     assert_eq!(ctx.heap.bridges(), 0);
+}
+
+/// A hold of `()`, whose word is 0, is let go once like any other: what marks it let go is no word
+/// of what it holds.
+#[test]
+fn a_hold_of_the_zero_word_is_let_go_once() {
+    use ply_compiled::c::builtin_helper_name;
+    let mut ctx = context();
+    ctx.begin(1_000);
+    let made: Counted = helper(&builtin_helper_name("?hold_new"));
+    let take: Counted = helper(&builtin_helper_name("?hold_take"));
+    let h = unsafe { made(&mut ctx, 0) };
+    inc(h);
+    assert_eq!(unsafe { take(&mut ctx, h) }, 0);
+    assert!(ctx.take_failure().is_none(), "the first take let go");
+    unsafe { take(&mut ctx, h) };
+    let said = ctx
+        .take_failure()
+        .expect("a second take is refused")
+        .message;
+    assert!(said.contains("let go after its region released"), "{said}");
+    ctx.end();
 }
 
 #[test]

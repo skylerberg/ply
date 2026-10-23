@@ -670,9 +670,14 @@ impl Ctx {
     }
 }
 
-/// What a value of a runtime object reads as: a bridge's value. Nothing else the runtime lays out
-/// is read here.
+/// What a value of a runtime object reads as: a bridge's value, or a hold, whose held value is laid
+/// out by a type the crossing does not carry, so it reads as holding none. Nothing else the runtime
+/// lays out is read here.
 pub(crate) fn runtime_value(w: Word) -> Result<Value, String> {
+    if let Some(id) = hold_id(w) {
+        let kind = ClosureKind::Hold { held: None, id };
+        return Ok(Value::Closure(Arc::new(Closure { name: None, kind })));
+    }
     if heap::kind(w) != KIND_BRIDGE {
         return Err(format!(
             "an object of kind {} crossed as a handle",

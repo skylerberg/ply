@@ -70,6 +70,9 @@ macro_rules! builtins {
 builtins! { $
     Assert = "assert" (cond, message) -> Raising;
     AssertEq = "assert_eq" (actual, expected) -> Raising;
+    /// `assert_eq` failing where compiled code compared the two and found them unequal: raises with
+    /// both shown, comparing nothing. No source can spell it.
+    AssertFailed = "?assert_failed" (actual, expected) -> Raising;
     Len = "List::len" (xs) -> Word;
     Push = "List::push" (xs, x) -> Word;
     WithCapacity = "List::with_capacity" (n) -> Word;
@@ -516,6 +519,8 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 Err(assertion_failure(&args[0], &args[1], span))
             }
         }
+
+        Builtin::AssertFailed => Err(assertion_failure(&args[0], &args[1], span)),
 
         Builtin::Len => match &args[0] {
             Value::List(xs) => Ok(Value::Int(xs.len() as i64)),

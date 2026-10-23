@@ -16,12 +16,12 @@ import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, Tail
                     KidSize, NewLeaf, NewMapBranch, PairPut, PairSet, PairTake, LeafCut, BranchCut,
                     KidOut, KidBack, KidPut, KidDrop, MapSwap, P, S, CaseLaid, Inline, classes,
                     words, intrinsic_named)
-import emit.reps (Def, has_vars, laid_vars, laid_known)
+import emit.reps (Def, has_vars, laid_vars, laid_known, numeric_sum)
 import emit.answer (Layout)
 import emit.roots (builtin_helper, generated_builtin)
 import emit.release (released_vars)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RSum, RFlat, Leaf, Var, Arg, AVar,
-                 AInt, Make, MList, Native, Op, OContainer, Let, Prim, Containers)
+                 AInt, AZero, RUnit, Make, MList, Native, Op, OContainer, Let, Prim, If, Containers)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, Within, ArrayNew, ArraySet,
                             ArrayOfList, ArrayGet, ColumnsNew, ColumnsSet, ColumnsOfList,
                             ColumnsGet, ColumnField, ColumnOf, ItemAt, Rest, LeafOf, Room, Position,
@@ -33,9 +33,9 @@ import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, no
                         type_of, as_words, opened, continued)
 import emit.lower.base
 import emit.lower.data (constructed_as)
-import emit.lower.scalars (operated, runtime_builtin)
+import emit.lower.scalars (operated, runtime_builtin, stated, binary)
 import emit.lower.crossing (crossing_builtin, crossed, type_described, laid_out_here, over_encoding,
-                            through_runtime)
+                            by_encoding, by_words, through_runtime)
 import emit.lower.strings
 import emit.lower.strings (string_builtin)
 
@@ -78,11 +78,49 @@ fn builtin_filed(
         // Written code files a part's type where a root of its own writes it; the rest only the
         // runtime can answer, the root that asks among them.
         runtime_builtin(cx, st, b, args, at)
-      } else if crossing_builtin(b) { crossed(cx, st, b, args, callee, at) }
+      } else if b == b"assert_eq" { asserted(cx, st, args, callee, at) }
+      else if crossing_builtin(b) { crossed(cx, st, b, args, callee, at) }
       else if string_builtin(b) { strings::lowered(cx, st, b, args, callee, at) }
       else if scalar_builtin(b) { operated(cx, st, b, args, at) }
       else { contained(cx, st, b, args, called_at(cx, b, callee), callee, at) },
     },
+  }
+
+/// `assert_eq(actual, expected)`: the two compared as `==` compares them, and handed the runtime over
+/// their encoding only where they differ, which raises with both shown. In a body generic over their
+/// type, the runtime's builtin, which only the specialisations its callers settle run.
+fn asserted(
+  cx: Context,
+  st: Lowering,
+  args: List<Arg>,
+  callee: Span,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  match args {
+    [a, b] -> {
+      let ty = type_of(a);
+      if has_vars(ty) { crossed(cx, st, b"assert_eq", args, callee, at) } else {
+        let equal = binary(cx, { st: st, arg: a }, { st: st, arg: b }, b"eq", at);
+        let failed = by_encoding(
+          cx,
+          opened(equal.st),
+          b"?assert_failed",
+          args,
+          { params: [ty, ty], ret: unit_type() },
+          at,
+        );
+        {
+          st: {
+            ..continued(equal.st, failed.st),
+            insts: equal.st.insts.push(
+              If({ cond: equal.arg, then: [], otherwise: failed.st.insts }),
+            ),
+          },
+          arg: AZero(RUnit),
+        }
+      }
+    },
+    _ -> refuse(st, Containers, b"`assert_eq` of other than two values"),
   }
 
 /// Whether `name` is a builtin written code calls on a part of the value its root takes, encoding or
@@ -275,6 +313,13 @@ fn contained(
       },
       _ -> refuse(st, Containers, b"an empty list made at no type the checker filed"),
     }
+  } else if name == b"numeric_of_int" && args.len() == 2
+      && (match f.ret { Some(t) -> numeric_sum(cx.setting.ctors, t), None -> false }) {
+    // The witness the elaboration passes first names the type the answer already does.
+    match f.ret {
+      Some(t) -> stated(cx, st, b"of_int", args.drop(1), [int_type()], t, at),
+      None -> refuse(st, Containers, b"`numeric_of_int` at no type the checker filed"),
+    }
   } else if name == b"Bytes::position" { positioned(cx, st, args, at) }
   else if name == b"bracket" || name == b"?hold_bracket" { bracketed(cx, st, args, at) }
   else if name.starts_with(b"Array::") || name.starts_with(b"Columns::") {
@@ -294,7 +339,8 @@ fn contained(
 
 /// A builtin called through the runtime, which must implement it, answering the type `f` gives: over
 /// its arguments' encoding where its signature at the types filed at `callee` holds a sum or a record
-/// (`laid_out_here`); else on their words.
+/// (`laid_out_here`); else on their words. A hold's builtins read only the hold, never what it holds,
+/// which crosses as its word whatever its type.
 fn called(
   cx: Context,
   st: Lowering,
@@ -306,6 +352,12 @@ fn called(
 ) -> Lowered / {abort.raise} =
   if !cx.setting.builtins.contains(name) {
     refuse(st, Containers, b"a name the runtime implements no builtin of: ".concat(name))
+  } else if name == b"?hold_new" || name == b"?hold_take" || name == b"Hold::get" {
+    match f.ret {
+      Some(ret) -> by_words(cx, st, name, args, ret, at),
+      None ->
+        refuse(st, Containers, b"a hold's builtin at no type the checker filed: ".concat(name)),
+    }
   } else {
     match builtin_at(cx.setting, filed(cx, callee), name) {
       Some(types) -> if types.params.push(types.ret).any(|t: Type|
@@ -883,6 +935,8 @@ pub fn scalar_builtin(name: Bytes) -> Bool =
     b"?encoded",
     b"?same",
     b"compare",
+    b"min",
+    b"max",
     b"compare_values",
     b"wrap_add",
     b"wrap_sub",

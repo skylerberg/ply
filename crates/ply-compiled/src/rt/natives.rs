@@ -233,23 +233,34 @@ pub(super) fn narrow_binary(op: i64, w: i64, a: i64, b: i64) -> Option<Word> {
 /// The entry's next hold, holding `held`.
 pub(super) fn hold_new(c: &mut Ctx, held: Word) -> Word {
     c.holds_made += 1;
-    hold_word(&mut c.heap, held, c.holds_made)
+    hold_word(&mut c.heap, Some(held), c.holds_made)
 }
 
 /// The payload word a hold keeps what it holds in, which emitted code reads and empties itself.
 pub const HOLD_HELD: usize = CLOSURE_CAPTURES;
 
-/// A hold, as a closure no call enters: what it holds in its first capture, the null word once it
-/// has let go, so a second release or a read after is refused; and `id`, its number in the entry,
-/// in its second, which names it to the scheduler. A continuation resumed twice shares it.
-pub(crate) fn hold_word(heap: &mut Heap, held: Word, id: u64) -> Word {
-    let o = heap.alloc(KIND_CLOSURE, 0, (2 + CLOSURE_CAPTURES) as u32, 0);
+/// The word a hold marks itself let go in, apart from what it holds, whose word may be 0 itself (a
+/// `()`, or a `None` held as one pointer).
+const HOLD_LET_GO: usize = CLOSURE_CAPTURES + 2;
+
+/// A hold, as a closure no call enters: what it holds in its first capture, emptied once it has let
+/// go; `id`, its number in the entry, in its second, which names it to the scheduler; and in its
+/// third whether it has let go, as one made with nothing held has, so a second release or a read
+/// after is refused. A continuation resumed twice shares it.
+pub(crate) fn hold_word(heap: &mut Heap, held: Option<Word>, id: u64) -> Word {
+    let o = heap.alloc(KIND_CLOSURE, 0, (3 + CLOSURE_CAPTURES) as u32, 0);
     unsafe {
         set_word(o, CLOSURE_CODE, rt_hold_entry as *const () as usize as Word);
-        set_word(o, HOLD_HELD, held);
+        set_word(o, HOLD_HELD, held.unwrap_or(0));
         set_word(o, CLOSURE_CAPTURES + 1, heap::imm(id as i64));
+        set_word(o, HOLD_LET_GO, heap::imm(i64::from(held.is_none())));
     }
     o as Word
+}
+
+/// Whether the hold `o` has let go of what it held.
+pub(crate) fn hold_let_go(o: *mut heap::Obj) -> bool {
+    heap::imm_value(unsafe { word_at(o, HOLD_LET_GO) }) != 0
 }
 
 /// The object a hold is, where `w` is one.
@@ -309,7 +320,7 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
         (Builtin::HoldGet, [h]) => {
             let o = hold_object(*h)?;
             let held = unsafe { word_at(o, HOLD_HELD) };
-            let answer = if held == 0 {
+            let answer = if hold_let_go(o) {
                 let site = ctx.site();
                 ctx.fail(hold_released(site, "read"))
             } else {
@@ -322,11 +333,14 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
         (Builtin::HoldTake, [h]) => {
             let o = hold_object(*h)?;
             let held = unsafe { word_at(o, HOLD_HELD) };
-            let answer = if held == 0 {
+            let answer = if hold_let_go(o) {
                 let site = ctx.site();
                 ctx.fail(hold_released(site, "let go"))
             } else {
-                unsafe { set_word(o, HOLD_HELD, 0) };
+                unsafe {
+                    set_word(o, HOLD_HELD, 0);
+                    set_word(o, HOLD_LET_GO, heap::imm(1));
+                }
                 held
             };
             heap::dec(*h);

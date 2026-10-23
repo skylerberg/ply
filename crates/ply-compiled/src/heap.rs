@@ -2148,7 +2148,7 @@ impl Heap {
                     o as Word
                 }
                 ClosureKind::Hold { held, id } => {
-                    let held = held.as_ref().map_or(0, |x| self.to_word(layouts, x));
+                    let held = held.as_ref().map(|x| self.to_word(layouts, x));
                     crate::rt::hold_word(self, held, *id)
                 }
                 ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) | ClosureKind::Synth { .. } => {
@@ -2296,7 +2296,7 @@ impl Heap {
                     let kind = if let Some(id) = crate::rt::hold_id(w) {
                         let held = word_at(o, CLOSURE_CAPTURES);
                         ClosureKind::Hold {
-                            held: (held != 0)
+                            held: (!crate::rt::hold_let_go(o))
                                 .then(|| Heap::to_value_counted(layouts, held, walked)),
                             id,
                         }

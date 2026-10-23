@@ -9,7 +9,7 @@ import check.infer (facts_at)
 import check.types (Type, TyCon, TyRecord, int_type, bytes_type, string_type, type_spelled)
 import emit.typing (unknown_type)
 import front
-import front.rows (Rows, KnownDefRow, Dump, CtorRow)
+import front.rows (Rows, KnownDefRow, Dump, CtorRow, EmitterCtor)
 import front.published (analyse, analyse_with, no_rows, dump_of)
 import front (analyse_pulling_std_with)
 import std.list
@@ -891,8 +891,8 @@ test "a value's layout is read off its node's type where the value carries none"
   // field by name or whether the record holds one.
   assert_eq(has(b"rt_field_p"), [false, false, false, false]);
   assert_eq(has(b"rt_record_has_p"), [false, false, false, false]);
-  // A record crosses to the runtime as its encoding, never as the block emitted code lays out.
-  assert_eq(has(b"rt_builtin_encoded_p("), [true, true, true, true]);
+  // `max` orders the two field by field and answers one; neither crosses to the runtime.
+  assert_eq(has(b"rt_builtin_encoded_p("), [false, false, false, false]);
   assert_eq(has(b"builtin_max_p"), [false, false, false, false])
 }
 
@@ -1698,6 +1698,7 @@ test "a keyed sum is compared and ordered by its key through roots its module wr
     b"fn same(a: Name, b: Name) -> Bool = a == b\n",
     b"fn ordered(a: Name, b: Name) -> Ordering = compare(a, b)\n",
     b"fn bags(a: Bag<Int>, b: Bag<Int>) -> Bool = a == b\n",
+    b"fn top(a: Name, b: Name) -> Name = max(a, b)\n",
   ]);
   let name = TyCon({ name: b"m.Name", args: [] });
   let bag = TyCon({ name: b"m.Bag", args: [TyCon({ name: b"Int", args: [] })] });
@@ -1706,7 +1707,7 @@ test "a keyed sum is compared and ordered by its key through roots its module wr
     [b"m"],
     [src],
     [b"m.Name", b"m.Bag"],
-    [b"m.same", b"m.ordered", b"m.bags"].map(Named).concat(roots),
+    [b"m.same", b"m.ordered", b"m.bags", b"m.top"].map(Named).concat(roots),
   );
   let body = |name: Bytes|
     match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
@@ -1722,15 +1723,138 @@ test "a keyed sum is compared and ordered by its key through roots its module wr
     { at: b"m.same", root: roots.get(0) },
     { at: b"m.ordered", root: roots.get(1) },
     { at: b"m.bags", root: roots.get(2) },
+    { at: b"m.top", root: roots.get(1) },
   ].fold((), |_: Unit, c: { at: Bytes, root: RootKey }| {
     assert(body(c.at).tables.calls.contains(c.root), Some(String::of_bytes_lossy(c.at)));
     assert(body(c.at).text.index_of(b"rt_builtin_encoded_p") == None, None)
   });
+  // `max` picks by that order, and the runtime is handed neither.
+  assert_eq(body(b"m.top").tables.builtins, []);
   // Each root orders the two keys, which the key's function answers.
   assert(body(printed(roots.get(0))).tables.calls.contains(Named(b"m.folded")), None);
   assert(body(printed(roots.get(1))).tables.calls.contains(Named(b"m.folded")), None);
   roots.map(printed).fold((), |_: Unit, r: Bytes|
     assert(body(r).text.index_of(b"rt_builtin_encoded_p") == None, Some(String::of_bytes_lossy(r))))
+}
+
+test "a type's stated arithmetic is called through roots its module writes, and a generic body is settled at the type" {
+  let src = Bytes::concat_all([
+    b"type Length = | Metres(Int) | Millimetres(Int)\n",
+    b"key for Length by millimetres\n",
+    b"numeric for Length by { add: plus, sub: minus, mul: times, neg: negated, of_int: metres }\n",
+    b"fn millimetres(l: Length) -> Int = match l { Metres(n) -> n * 1000, Millimetres(n) -> n }\n",
+    b"fn plus(a: Length, b: Length) -> Length = Millimetres(millimetres(a) + millimetres(b))\n",
+    b"fn minus(a: Length, b: Length) -> Length = Millimetres(millimetres(a) - millimetres(b))\n",
+    b"fn times(a: Length, b: Length) -> Length = Millimetres(millimetres(a) * millimetres(b))\n",
+    b"fn negated(a: Length) -> Length = Millimetres(0 - millimetres(a))\n",
+    b"fn metres(n: Int) -> Length = Metres(n)\n",
+    b"fn grown(a: Length, b: Length) -> Length = -(a + b)\n",
+    b"fn shorter(a: Length, b: Length) -> Bool = a < b\n",
+    b"fn total<a>(xs: List<a>) -> a where numeric(a) = xs.fold(numeric_of_int(0), |s: a, x: a| s + x)\n",
+    b"fn all(xs: List<Length>) -> Length = total(xs)\n",
+  ]);
+  let length = TyCon({ name: b"m.Length", args: [] });
+  let add = in_m(keys::Stated(b"add"), length);
+  let neg = in_m(keys::Stated(b"neg"), length);
+  let of_int = in_m(keys::Stated(b"of_int"), length);
+  let at_length = at_spelled(b"m.total", [b"m.Length"]);
+  let answers = answers_at([b"m"], [src], [b"m.Length"], [
+    Named(b"m.grown"),
+    Named(b"m.shorter"),
+    Named(b"m.all"),
+    Named(b"m.total"),
+    at_length,
+    add,
+    neg,
+    of_int,
+    in_m(Order, length),
+  ]);
+  let body = |name: Bytes|
+    match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
+        if answer_name(a) == name { Some(a) } else { acc }) {
+      Some(a) -> match a.answer {
+        Body(b) -> b,
+        Refused(r) -> panic(String::of_bytes_lossy(Bytes::concat_all([name, b": ", r.why]))),
+      },
+      None -> panic(String::of_bytes_lossy(b"no answer for ".concat(name))),
+    };
+  let unasked = |name: Bytes|
+    assert(
+      body(name).text.index_of(b"rt_binary_p") == None
+        && body(name).text.index_of(b"rt_negate_p") == None,
+      Some(String::of_bytes_lossy(name)),
+    );
+  // Each operator calls the root written for it, which calls the function the module names.
+  assert(body(b"m.grown").tables.calls.contains(add), None);
+  assert(body(b"m.grown").tables.calls.contains(neg), None);
+  assert(body(printed(add)).tables.calls.contains(Named(b"m.plus")), None);
+  assert(body(printed(neg)).tables.calls.contains(Named(b"m.negated")), None);
+  assert(body(printed(of_int)).tables.calls.contains(Named(b"m.metres")), None);
+  // An order's comparison reads the sign of the order the key's root answers.
+  assert(body(b"m.shorter").tables.calls.contains(in_m(Order, length)), None);
+  // A body over a numeric variable is settled at the type, where its operators are the type's own.
+  assert(body(b"m.total").tables.generics.needs.contains({ var: 0, reads: Scalar }), None);
+  assert(body(printed(at_length)).text.index_of(b"numeric_binary") == None, None);
+  [b"m.grown", b"m.shorter", printed(at_length)].fold((), |_: Unit, n: Bytes| unasked(n))
+}
+
+test "`assert_eq` compares as `==` does, and hands the runtime two values only where they differ" {
+  let src = Bytes::concat_all([
+    b"type Name = | Name(String)\n",
+    b"key for Name by folded\n",
+    b"fn folded(n: Name) -> String = match n { Name(s) -> s }\n",
+    b"fn same(a: Name, b: Name) -> Unit / {abort.raise} = assert_eq(a, b)\n",
+    b"fn either<a>(x: a, y: a) -> Unit / {abort.raise} = assert_eq(x, y)\n",
+    b"fn names(a: Name, b: Name) -> Unit / {abort.raise} = either(a, b)\n",
+  ]);
+  let name = TyCon({ name: b"m.Name", args: [] });
+  let at_name = at_spelled(b"m.either", [b"m.Name"]);
+  let answers = answers_at([b"m"], [src], [b"m.Name"], [
+    Named(b"m.same"),
+    Named(b"m.names"),
+    at_name,
+    in_m(keys::Equal, name),
+  ]);
+  let body = |n: Bytes|
+    match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
+        if answer_name(a) == n { Some(a) } else { acc }) {
+      Some(a) -> match a.answer {
+        Body(b) -> b,
+        Refused(r) -> panic(String::of_bytes_lossy(Bytes::concat_all([n, b": ", r.why]))),
+      },
+      None -> panic(String::of_bytes_lossy(b"no answer for ".concat(n))),
+    };
+  [b"m.same", printed(at_name)].fold((), |_: Unit, n: Bytes| {
+    assert(body(n).tables.calls.contains(in_m(keys::Equal, name)), Some(String::of_bytes_lossy(n)));
+    assert_eq(body(n).tables.builtins, [b"?assert_failed"])
+  })
+}
+
+test "a generic sum is shown by the function its module states, at the sum's arguments" {
+  let src = Bytes::concat_all([
+    b"import std.value (Value)\n",
+    b"pub type Deque<a> = | Deque(List<a>, List<a>)\n",
+    b"show for Deque by written\n",
+    b"pub fn written<a>(d: Deque<a>) -> String = match d { Deque(front, _) -> \"deque\" }\n",
+  ]);
+  let key = in_m(Shown, TyCon({ name: b"m.Deque", args: [TyCon({ name: b"Int", args: [] })] }));
+  let answers = answers_at(
+    [b"m"],
+    [src],
+    [b"m.Deque", b"std.value.VShown"],
+    [key],
+    shipped: [value_fixture()],
+  );
+  let body = match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
+      if a.name == root_name(key) { Some(a) } else { acc }) {
+    Some(a) -> match a.answer { Body(b) -> b, Refused(r) -> panic(String::of_bytes_lossy(r.why)) },
+    None -> panic("no answer"),
+  };
+  // The runtime shows no deque: the function is called at `Int`.
+  assert_eq(body.tables.generics.calls.map(|g: GenericCall| { callee: g.callee, args: g.args }), [
+    { callee: Named(b"m.written"), args: [TyCon({ name: b"Int", args: [] })] },
+  ]);
+  assert_eq(body.tables.builtins, [])
 }
 
 test "a generic keyed sum is digested as its key, which its function answers at the sum's arguments" {
@@ -2305,6 +2429,37 @@ test "two maps are compared by a root that walks `std.prelude`'s `Map::entries`"
   assert_eq(own_code(body.text).index_of(b"rt_equal_p"), None)
 }
 
+test "two columns are compared and ordered by roots that read each record in place, as arrays are" {
+  let src = Bytes::concat_all([
+    b"fn same(a: Columns<{ x: Int, id: Int }>, b: Columns<{ x: Int, id: Int }>) -> Bool = a == b\n",
+    b"fn ordered(a: Columns<{ x: Int, id: Int }>, b: Columns<{ x: Int, id: Int }>) -> Ordering =\n",
+    b"  compare(a, b)\n",
+  ]);
+  let columns = TyCon({
+    name: b"Columns",
+    args: [
+      TyRecord([{ name: b"id", ty: int_type() }, { name: b"x", ty: int_type() }]),
+    ],
+  });
+  let equal = in_m(Contained(b"equal"), columns);
+  let ordered = in_m(Contained(b"ordered"), columns);
+  let answers = answers_at([b"m"], [src], [], [
+    Named(b"m.same"),
+    Named(b"m.ordered"),
+    equal,
+    ordered,
+  ]);
+  assert(answered_body(answers, b"m.same").tables.calls.contains(equal), None);
+  assert(answered_body(answers, b"m.ordered").tables.calls.contains(ordered), None);
+  // The runtime reads no columns emitted code lays out.
+  [b"m.same", b"m.ordered", printed(equal), printed(ordered)].fold((), |_: Unit, n: Bytes|
+    assert(
+      own_code(answered_body(answers, n).text).index_of(b"rt_equal_p") == None
+        && answered_body(answers, n).tables.builtins == [],
+      Some(String::of_bytes_lossy(n)),
+    ))
+}
+
 test "a lambda a call lends is laid out on the caller's stack with its descriptor, whoever the callee is" {
   let src = Bytes::concat_all([
     b"fn apply(f: (Int) -> Int, x: Int) -> Int = f(x)\n",
@@ -2777,7 +2932,7 @@ test "a shipped module's extern is called as the builtin of its own name" {
   let answers = emit_roots_answer(
     names,
     srcs,
-    ctors_of([], [], ctor_sums(d.ctors)),
+    ctors_of([], [], [], ctor_sums(d.ctors)),
     [b"doubled"],
     [Named(b"m.f")],
     [],
@@ -3072,7 +3227,7 @@ test "`ListNode::leaf_of` is read down the list's trie in place, its leaf its pa
   let answers = emit_roots_answer(
     names,
     srcs,
-    ctors_of([b"Some", b"None"], [], ctor_sums(d.ctors)),
+    ctors_of([b"Some", b"None"], [], [], ctor_sums(d.ctors)),
     // The natives as a runtime that implements it describes them.
     [b"ListNode::leaf_of"],
     [Named(root)],
@@ -3193,6 +3348,33 @@ test "a generic definition reached at a type held apart from a word is emitted a
   assert(has(b"m.down@Int", b"goto ply_loop;"));
   assert(!has(b"m.down@Int", b"numeric_binary"));
   assert_eq(body(b"m.down@Int").tables.calls, [])
+}
+
+test "a call carries a variable that changes how a parameter or the answer holding it is held" {
+  let src = Bytes::concat_all([
+    b"fn first<a>(xs: List<a>) -> Option<a> = xs.at(0)\n",
+    b"fn rest<a>(xs: List<a>) -> List<a> = xs.drop(1)\n",
+    b"fn floats(xs: List<Float>) -> Float = match first(xs) { Some(x) -> x, None -> 0.0 }\n",
+    b"fn tails(xs: List<Float>) -> Int = rest(xs).len()\n",
+  ]);
+  let answers = answers_at([b"m"], [src], [], [Named(b"m.floats"), Named(b"m.tails")]);
+  let calls = |name: Bytes|
+    match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
+        if answer_name(a) == name { Some(a) } else { acc }) {
+      Some(a) -> match a.answer {
+        Body(b) -> b.tables.generics.calls,
+        Refused(r) -> panic(String::of_bytes_lossy(Bytes::concat_all([name, b": ", r.why]))),
+      },
+      None -> panic("no answer"),
+    };
+  // An `Option<Float>` holds its float apart from a word, which an `Option` of a variable cannot.
+  assert_eq(calls(b"m.floats"), [
+    { callee: Named(b"m.first"), args: types_spelled([b"Float"]), carried: [0], fns: [] },
+  ]);
+  // A list is one pointer whatever it holds, so a generic body holds it alike.
+  assert_eq(calls(b"m.tails"), [
+    { callee: Named(b"m.rest"), args: types_spelled([b"Float"]), carried: [], fns: [] },
+  ])
 }
 
 test "a contract's clauses read the parameters, and an `ensures` the answer, at the types the scheme gives them" {
@@ -3980,7 +4162,8 @@ test "a root written for a type is called at the head it is defined at, a value 
 fn loaded_ctors(d: Dump, named: List<Bytes>) -> Ctors =
   ctors_of(
     named.concat(d.ctors.map(|c: CtorRow| c.name).filter(|n: Bytes| !named.contains(n))),
-    [],
+    d.emitter_ctors.filter(|c: EmitterCtor| c.key != None).map(|c: EmitterCtor| c.name),
+    d.emitter_ctors.filter(|c: EmitterCtor| c.numeric.len() > 0).map(|c: EmitterCtor| c.name),
     ctor_sums(d.ctors),
   )
 

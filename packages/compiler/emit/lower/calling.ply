@@ -24,8 +24,8 @@ import emit.tir (Rep, RInt, RBool, RWord, RSlice, RSum, RUnit, Var, Arg, AVar, A
                  Lent, Convention, Val, Prim, Make, Get, Gathered, Pack, Native, Op, OCalling,
                  MClosure, PCapture, PCase, TTag, TInt, Call, Apply, Inst, Let, Do, Decl, Assign,
                  If, Case, Match, Loop, Next, Done, Restart, Enter, Return, Fail, NoArm, Sited,
-                 Block, Fn, Rooted, Member, Closure, Declined, Calling, no_links, falls_through,
-                 rep_of_arg, counted)
+                 Block, Fn, FnKind, Rooted, Plain, Member, Closure, Declined, Calling, no_links,
+                 falls_through, rep_of_arg, counted)
 import emit.tir.calling (ConstantRead, Ticked)
 import emit.lower.setting (Setting, Root, imported_target, ctor_named)
 import emit.lower.held (held_as, case_index, arg_word, typed_convention, laid_held)
@@ -124,22 +124,36 @@ fn crossing_at(s: Setting, d: Def, args: List<Type>) -> Option<Crossing> / {abor
     },
   }
 
-/// The variables of `scheme` a call at `args` carries as its arguments are held: each standing bare
-/// as a parameter, or as the answer of a function taking any, at an argument naming no variable that
-/// a body holds other than as a plain word, neither a word nor laid as one pointer, which a generic
-/// body holds alike. The unit settles such a call on the callee's specialisation at each argument's
-/// layout.
+/// The variables of `scheme` a call at `args` carries as its arguments are held: each at an argument
+/// naming no variable that changes how a body holds a parameter, or the answer of a function taking
+/// any, it stands in, as an `Option<Float>` is held apart from an `Option` of a word, but where that
+/// part is laid as one pointer, which a generic body holds alike. The unit settles such a call on
+/// the callee's specialisation at each argument's layout.
 fn carried_at(s: Setting, scheme: Scheme, args: List<Type>, arity: Int) -> List<Int> =
   match scheme.ty {
-    TyFn(f) ->
+    TyFn(f) -> {
+      let crossing = if arity > 0 { f.params.push(f.ret) } else { f.params };
+      let open = args.map(|_: Type| unknown_type());
       range(0, args.len()).filter(|j: Int|
-        (f.params.contains(TyVar(j)) || (arity > 0 && f.ret == TyVar(j)))
-          && (match args.at(j) {
-            Some(t) ->
-              !has_vars(t) && held_as(s, t) != RWord
-                && (match laid_known(s.ctors, t) { Some(l) -> classes(l) != [P], None -> false }),
-            None -> false,
-          })),
+        match args.at(j) {
+          Some(t) ->
+            !has_vars(t)
+              && crossing.any(|p: Type|
+                type_vars(p).contains(j)
+                  && {
+                    let at = substituted(
+                      p,
+                      range(0, args.len()).map(|k: Int| if k == j { t } else { unknown_type() }),
+                    );
+                    held_as(s, at) != held_as(s, substituted(p, open))
+                      && (match laid_known(s.ctors, at) {
+                        Some(l) -> classes(l) != [P],
+                        None -> false,
+                      })
+                  }),
+          None -> false,
+        })
+    },
     _ -> [],
   }
 
@@ -265,6 +279,7 @@ pub fn global(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered / {ab
             _ -> refuse(o.st, Calling, b"a global the lowering does not resolve: ".concat(name)),
           },
           frame,
+          Plain,
           at,
         )
       },
@@ -1101,12 +1116,14 @@ pub fn step_captured(cx: Context, st: Lowering, args: List<Code>, which: Option<
   }
 
 /// The closure of the body lowered to `inner` from `lambda_opened`'s state, made after `outer` of
-/// the values it captures, each as its word.
+/// the values it captures, each as its word: a lambda's `Rooted`, which counts a step as a call
+/// does, or a `Plain` one standing for what a name reads as a value, which counts none of its own.
 pub fn closure(
   cx: Context,
   outer: Lowering,
   inner: Lowered,
   frame: Frame,
+  kind: FnKind,
   at: Span,
 ) -> Lowered / {abort.raise} =
   match shaped(cx, outer.env, frame, at) {
@@ -1120,7 +1137,7 @@ pub fn closure(
       } else { answered.st.insts };
       let body = {
         key: cx.key,
-        kind: Rooted,
+        kind: kind,
         params: s.params,
         conv: s.conv,
         answer_ty: if frame.resumes { word_type() } else { s.ret },

@@ -5,7 +5,7 @@
 use crate::bare::{context, context_calling, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Carried, Handed, PlyType};
-use ply_compiled::heap::{Heap, Word};
+use ply_compiled::heap::{Heap, Word, imm};
 use ply_compiled::native::Answered;
 use ply_compiled::rt::{Ctx, Lifted};
 use ply_core::codec::{decode, encode, tag};
@@ -383,6 +383,29 @@ fn a_runtime_object_written_into_a_lowering_outlives_the_count_that_wrote_it() {
         });
         assert_eq!(native::<A0>("?in_tag")(c), tag::FALSE as Word);
         native::<N0>("?lift_close")(c);
+    }
+    unfailed(&mut ctx);
+}
+
+/// A hold written into a lowering reads as a hold, whatever it holds, which no crossing reads.
+#[test]
+fn a_hold_written_into_a_lowering_reads_as_a_hold() {
+    let mut ctx = context_calling(&["reflect"]);
+    let c: *mut Ctx = &mut ctx;
+    let name = b"std.value.VHold";
+    unsafe {
+        let hold = native::<A1>("?hold_new")(c, imm(42));
+        called_encoded(c, 0, |c| {
+            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
+            native::<N1>("?out_handle")(c, hold);
+        });
+        assert_eq!(native::<A1>("?in_count")(c, tag::CTOR as Word), 0);
+        assert_eq!(
+            native::<A2>("?in_name_is")(c, name.as_ptr() as Word, name.len() as Word),
+            1
+        );
+        native::<N0>("?lift_close")(c);
+        helper::<N1>("rt_handle_free")(c, hold);
     }
     unfailed(&mut ctx);
 }

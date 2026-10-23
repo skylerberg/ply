@@ -4,7 +4,7 @@ import syntax.parsing (Span, dummy_span, site_digit)
 import emit.code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NField, NApp, NRecord,
                   NMatch, CodePattern, PxWild, PxVar, PxCtor, CLet, CDo, CodeStmt, CodeArm,
                   CodeField)
-import syntax.items (Item, IInstance, NKey)
+import syntax.items (Item, IInstance, NKey, INumeric, numeric_by)
 import check.resolve.tables (qualify)
 import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, int_type,
                     bytes_type, bool_type, unit_type, named_type, list_type, fn_type, monomorphic,
@@ -214,7 +214,7 @@ pub fn container_code(
 
 /// The body of the root written for `op` of containers of type `t`, as lowered code over its
 /// parameters `a`, `b` and, for the loops, `i`, the types it files, and the definitions its calls
-/// name. Two lists or arrays are equal where they have one length and each
+/// name. Two lists, arrays or columns are equal where they have one length and each
 /// pair at an index is equal, and ordered by the first pair that is not equal, a shorter one first
 /// where the other begins with it; two maps as the lists of their entries in key order are. A
 /// container is reflected, shown or digested item by item at the items' type, a map entry by entry.
@@ -260,7 +260,9 @@ fn walked_code(
         fs.fold(unknown_type(), |acc: Type, f: Field| if f.name == name { f.ty } else { acc }),
       _ -> unknown_type(),
     };
-  let of = if kind == b"Array" { b"Array::" } else { b"List::" };
+  let of = if kind == b"Array" { b"Array::" }
+  else if kind == b"Columns" { b"Columns::" }
+  else { b"List::" };
   let loop_named = |name: Bytes|
     local_root(module, root_text(root_name(keys::written(Contained(name), walked, module))));
   let here = if kind == b"Map" { container_defs(module, t).concat(container_defs(module, walked)) }
@@ -306,17 +308,21 @@ fn walked_code(
       args: [PxVar({ name: name, slot: Some(slot), span: placed(k) })],
     });
   let none = PxCtor({ name: prelude_ctor(b"None"), args: [] });
-  // An array's item is read by the inline `Array::get`, so no root calls a prelude function the
+  // An array's or columns' item is read by the inline `get`, so no root calls a prelude function the
   // program may not reach.
   let match_at = |list: Code, k: Int, name: Bytes, slot: Int, binder: Int, found: Code, ended: Code|
-    if kind == b"Array" {
+    if kind == b"Array" || kind == b"Columns" {
       at(
         NIf({
           cond: binary(b"lt", i, length(list, k), 27),
           then_branch: at(
             NBlock({
               stmts: [
-                CLet({ name: name, slot: slot, value: call(builtin(b"Array::get", k), [list, i]) }),
+                CLet({
+                  name: name,
+                  slot: slot,
+                  value: call(builtin(of.concat(b"get"), k), [list, i]),
+                }),
               ],
               tail: Some(found),
             }),
@@ -616,58 +622,103 @@ fn walked_code(
 pub fn local_root(module: Bytes, root: Bytes) -> Bytes / {abort.raise} =
   if module.len() == 0 { root } else { root.slice(module.len() + 1, root.len()) }
 
-/// How a value of a keyed sum reaches its key: `f`'s name in the sum's module, the type arguments a
-/// call of it files, its type at them, and the key's type.
-pub type Keyed = { f: Bytes, args: List<Type>, fn_type: Type, key: Type }
+/// A function the module of a declared sum states for it: `f`'s name in the sum's module, the type
+/// arguments a call of it files, its type at them, and what it answers there.
+pub type StatedFn = { f: Bytes, args: List<Type>, fn_type: Type, ret: Type }
 
 /// The key the module states for the declared sum `ty` (`key for T by f`), at `ty`'s arguments; none
 /// where it states none.
-pub fn keyed_by(module: Bytes, here: List<Def>, items: List<Item>, ty: Type) -> Option<Keyed> =
+pub fn keyed_by(module: Bytes, here: List<Def>, items: List<Item>, ty: Type) -> Option<StatedFn> =
+  stated_for(here, ty, |c: Bytes|
+    items.fold(None, |acc: Option<Bytes>, item: Item|
+      match item {
+        IInstance(d) -> if d.kind == NKey && qualify(module, d.target.name) == c { Some(d.by.name) }
+        else { acc },
+        _ -> acc,
+      }))
+
+/// The function the module states `op` of the declared sum `ty`'s arithmetic is (`numeric for T by
+/// { op: f, .. }`), at `ty`'s arguments; none where it states none.
+pub fn numeric_stated(
+  module: Bytes,
+  here: List<Def>,
+  items: List<Item>,
+  ty: Type,
+  op: Bytes,
+) -> Option<StatedFn> =
+  stated_for(here, ty, |c: Bytes|
+    items.fold(None, |acc: Option<Bytes>, item: Item|
+      match item {
+        INumeric(d) -> if qualify(module, d.target.name) == c {
+          match numeric_by(d, op) { Some(by) -> Some(by.name), None -> acc }
+        } else { acc },
+        _ -> acc,
+      }))
+
+/// The function `named` finds stated for the sum `ty` names, at `ty`'s arguments: each of its
+/// variables the argument of `ty` its signature names it at.
+fn stated_for(here: List<Def>, ty: Type, named: (Bytes) -> Option<Bytes>) -> Option<StatedFn> =
   match ty {
-    TyCon(c) -> {
-      let stated = items.fold(None, |acc: Option<Bytes>, item: Item|
-        match item {
-          IInstance(d) -> if d.kind == NKey && qualify(module, d.target.name) == c.name {
-            Some(d.by.name)
-          } else { acc },
-          _ -> acc,
-        });
-      let scheme = |f: Bytes|
-        here.fold(None, |s: Option<Scheme>, h: Def| if h.name == f { h.scheme } else { s });
-      match stated {
-        None -> None,
-        Some(f) -> match scheme(f) {
-          Some(sc) -> match sc.ty {
-            TyFn(fn_ty) -> match fn_ty.params.at(0) {
-              Some(TyCon(p)) -> {
-                // Each of `f`'s variables is the argument of `ty` its parameter names it at.
-                let args = sc.ty_vars.map(|v: Int|
-                  range(0, p.args.len()).fold(unknown_type(), |found: Type, i: Int|
-                    if p.args.at(i) == Some(TyVar(v)) {
-                      match c.args.at(i) { Some(t) -> t, None -> found }
-                    } else { found }));
-                Some({
-                  f: f,
-                  args: args,
-                  fn_type: at_args(sc.ty, sc.ty_vars, args),
-                  key: at_args(fn_ty.ret, sc.ty_vars, args),
-                })
-              },
-              _ -> None,
-            },
-            _ -> None,
+    TyCon(c) -> match named(c.name) {
+      None -> None,
+      Some(f) -> match here.fold(None, |s: Option<Scheme>, h: Def|
+          if h.name == f { h.scheme } else { s }) {
+        Some(sc) -> match sc.ty {
+          TyFn(fn_ty) -> {
+            let at_ty = fn_ty.params.push(fn_ty.ret).fold(
+              None,
+              |acc: Option<List<Type>>, t: Type|
+                match acc {
+                  Some(_) -> acc,
+                  None -> match t {
+                    TyCon(p) -> if p.name == c.name { Some(p.args) } else { None },
+                    _ -> None,
+                  },
+                },
+            );
+            let written = match at_ty { Some(xs) -> xs, None -> [] };
+            let args = sc.ty_vars.map(|v: Int|
+              range(0, written.len()).fold(unknown_type(), |found: Type, i: Int|
+                if written.at(i) == Some(TyVar(v)) {
+                  match c.args.at(i) { Some(t) -> t, None -> found }
+                } else { found }));
+            Some({
+              f: f,
+              args: args,
+              fn_type: at_args(sc.ty, sc.ty_vars, args),
+              ret: at_args(fn_ty.ret, sc.ty_vars, args),
+            })
           },
-          None -> None,
+          _ -> None,
         },
-      }
+        None -> None,
+      },
     },
     _ -> None,
   }
 
+/// The body of a root doing what `s` does over its `arity` parameters, `a` and `b`, and the types it
+/// files: a call of `s`.
+pub fn stated_code(s: StatedFn, arity: Int) -> { code: Code, typed: Map<Int, Typed> } = {
+  let placed = { start: 0, end: 0, site: 1 };
+  let var = |name: Bytes, slot: Int|
+    { node: NVar({ name: name, slot: Some(slot) }), span: dummy_span() };
+  {
+    code: {
+      node: NApp({
+        func: { node: NVar({ name: s.f, slot: None }), span: placed },
+        args: range(0, arity).map(|i: Int| var(if i == 0 { b"a" } else { b"b" }, i)),
+      }),
+      span: dummy_span(),
+    },
+    typed: said_typed(Map::new().insert(placed.site, filed_as(s.fn_type, s.args)), []),
+  }
+}
+
 /// The body of `T#cmp`, or of `T#eq` where `eq`, for a sum whose module states its key `k`, over its
 /// two parameters and the types it files: the parameters' keys ordered, and equal where they order
 /// so, as values whose keys are equal are.
-pub fn keyed_code(k: Keyed, eq: Bool) -> { code: Code, typed: Map<Int, Typed> } = {
+pub fn keyed_code(k: StatedFn, eq: Bool) -> { code: Code, typed: Map<Int, Typed> } = {
   let at = |node: Node, span: Span| { node: node, span: span };
   let placed = |n: Int| { start: 0, end: n, site: n + 1 };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
@@ -685,7 +736,7 @@ pub fn keyed_code(k: Keyed, eq: Bool) -> { code: Code, typed: Map<Int, Typed> } 
     code: if eq { at(NBinary({ op: b"eq", lhs: ordered, rhs: said(b"Equal") }), placed(3)) }
     else { ordered },
     typed: said_typed(
-      called(called(Map::new().insert(placed(0).site, filed_as(unknown_type(), [k.key])), 1), 2),
+      called(called(Map::new().insert(placed(0).site, filed_as(unknown_type(), [k.ret])), 1), 2),
       [],
     ),
   }
@@ -1002,7 +1053,7 @@ pub fn digest_code(
                     1,
                   ),
                 ]),
-                typed: parted(Map::new(), k.key, 1).insert(
+                typed: parted(Map::new(), k.ret, 1).insert(
                   placed(2).site,
                   filed_as(k.fn_type, k.args),
                 ),
@@ -1083,7 +1134,6 @@ pub fn reflection_code(
   let at = |node: Node| { node: node, span: dummy_span() };
   let placed = |k: Int| { start: 0, end: k, site: k + 1 };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
-  let named = |name: Bytes| at(NVar({ name: name, slot: None }));
   let call = |f: Code, args: List<Code>| at(NApp({ func: f, args: args }));
   let builtin = if shown { b"?shown" } else { b"?reflect" };
   // `x`, of type `t`, reflected at its type: a call the emitter settles by what is filed at `k`.
@@ -1132,27 +1182,24 @@ pub fn reflection_code(
         None -> { code: part(var(b"a", 0), 1), typed: Map::new() },
         Some(cs) -> {
           let stated = if !shown { None } else {
-            items.fold(None, |acc: Option<Bytes>, item: Item|
-              match item {
-                IInstance(d) -> if d.kind != NKey && qualify(module, d.target.name) == c.name {
-                  Some(d.by.name)
-                } else { acc },
-                _ -> acc,
-              })
+            stated_for(here, ty, |n: Bytes|
+              items.fold(None, |acc: Option<Bytes>, item: Item|
+                match item {
+                  IInstance(d) -> if d.kind != NKey && qualify(module, d.target.name) == n {
+                    Some(d.by.name)
+                  } else { acc },
+                  _ -> acc,
+                }))
           };
-          let generic = |f: Bytes|
-            here.fold(false, |g: Bool, h: Def|
-              g
-                || (h.name == f
-                && (match h.scheme { Some(s) -> s.ty_vars.len() > 0, None -> false })));
           match stated {
-            // What the runtime reads, it reads through the function at the type it is called at.
-            Some(f) -> if generic(f) { { code: part(var(b"a", 0), 1), typed: Map::new() } } else {
+            // The function the module states, at the type's arguments.
+            Some(f) ->
               {
-                code: call(said(b"std.value.VShown"), [call(named(f), [var(b"a", 0)])]),
-                typed: Map::new(),
-              }
-            },
+                code: call(said(b"std.value.VShown"), [
+                  call({ node: NVar({ name: f.f, slot: None }), span: placed(1) }, [var(b"a", 0)]),
+                ]),
+                typed: Map::new().insert(placed(1).site, filed_as(f.fn_type, f.args)),
+              },
             None -> {
               let walked = cs.fold(
                 { arms: [], typed: Map::new(), next: 1, slot: 1 },
