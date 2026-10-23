@@ -494,13 +494,15 @@ pub type Produced = { text: Bytes, taken: List<RootName>, dropped: List<Dropped>
 
 /// A unit produced over answers an earlier run kept and answers the emitter gave now: how many of
 /// the offered roots each covered, the natives the unit calls that the runtime does not implement as
-/// they are declared, and its calls written against a handing other than their callee's.
+/// they are declared, its calls written against a handing other than their callee's, and the scope
+/// it walked under, for an ask of another unit of the same program to walk under.
 pub type Emission = {
   produced: Produced,
   kept: Int,
   asked: Int,
   unbound: List<Unbound>,
   misassumed: List<Misassumed>,
+  scope: Option<Result<emit::Scope, Bytes>>,
 }
 
 /// Each root's answer, a group's one body answering for every member.
@@ -1869,14 +1871,14 @@ fn program_ctors(dump: Dump, ctors: List<Ctor>) -> Ctors =
   )
 
 /// The emitter's scope over every module of `p`, each whole, reading what the check filed of the
-/// bodies `offered` reads (`emit.scope_of`): built once, when a walk first asks the emitter for a
+/// bodies `roots` reads (`emit.scope_of`): built once, when a walk first asks the emitter for a
 /// root.
 fn scope_over(
   runtime: Runtime,
   dump: Dump,
   p: Program,
   ctors: List<Ctor>,
-  offered: List<RootKey>,
+  roots: List<RootKey>,
 ) -> Result<emit::Scope, Bytes> / {abort.raise} = {
   let names = p.modules.map(|m: ModuleRow| m.name);
   emit::scope_of(
@@ -1887,7 +1889,7 @@ fn scope_over(
     program_ctors(dump, ctors),
     runtime.natives.map(|n: Native| n.name),
     true,
-    offered,
+    roots,
     if dump.packages.len() == 0 { [{ prefix: b"", deps: [] }] } else { dump.packages },
     if dump.packages.len() == 0 { names.map(|_: Bytes| 0) } else {
       range(0, names.len()).map(|i: Int|
@@ -1897,6 +1899,66 @@ fn scope_over(
     dump.rows,
     dump.walked,
   )
+}
+
+/// A program's scope kept from one ask of the emitter to the next: the digest of what it was read
+/// from, and the scope itself. A build asks for more than one unit of one program (the unit its
+/// `const` values are evaluated in, then the unit it ships), and the scope is the same value for
+/// each, so all but the first ask take it from here.
+pub type Scoped = { key: Bytes, scope: Result<emit::Scope, Bytes> }
+
+/// What a scope over a program is read from, digested: the front end's identity for the analysis it
+/// published, each module's name and text, each file the program embeds, the packages it resolves
+/// against, and the owners whose facts a scope over `facts_of` reads (`emit.read_in`). The scope is
+/// a function of these, so asks that agree on them share one.
+pub fn scope_key(
+  dump: Dump,
+  sources: List<Bytes>,
+  inputs: Map<Bytes, Bytes>,
+  facts_of: List<RootKey>,
+) -> Bytes / {abort.raise} = {
+  let embedded = inputs.entries().map(|e: { key: Bytes, value: Bytes }|
+    Bytes::concat_all([sized(e.key), sized(e.value)]));
+  let packages = dump.packages.map(|p: PackageDeps|
+    Bytes::concat_all([sized(p.prefix)].concat(p.deps.map(|d: Bytes| sized(d)))));
+  let module_packages = dump.module_packages.map(|k: Int|
+    Bytes::concat_all([ascii_of_int(k), b"\x00"]));
+  let read = emit::read_in(dump.rows, facts_of).keys().map(|n: Bytes| sized(n));
+  blake3(
+    Bytes::concat_all([
+      sized(dump.hashes_digest),
+      Bytes::concat_all(dump.modules.map(|m: ModuleRow| sized(m.name))),
+      Bytes::concat_all(sources.map(|s: Bytes| sized(s))),
+      Bytes::concat_all(embedded),
+      Bytes::concat_all(packages),
+      Bytes::concat_all(module_packages),
+      Bytes::concat_all(read),
+    ]),
+  )
+}
+
+test "a scope's key holds while asks read the same facts, and moves with anything it reads" {
+  let dump = three_modules_dump();
+  let texts = three_modules();
+  let roots = [Named(b"a.f")];
+  let one = scope_key(dump, texts, Map::new(), roots);
+  // Every owner these roots are dealt with holds facts, so both asks read every definition's, and
+  // the scope one of them resolves answers the other's.
+  assert_eq(
+    emit::read_in(dump.rows, roots).keys(),
+    emit::read_in(dump.rows, [Named(b"a.f"), Named(b"b.g")]).keys(),
+  );
+  assert_eq(scope_key(dump, texts, Map::new(), [Named(b"a.f"), Named(b"b.g")]), one);
+  // A root no row holds facts of makes its ask read an owner another ask does not.
+  assert(scope_key(dump, texts, Map::new(), [Named(b"a.absent")]) != one, None);
+  // So does a root filed under a name no definition has, which is why a driver hands the roots its
+  // program offers rather than the ones one ask of it wants: `Stored`, `Written`, `Test` and a
+  // clause's roots each file under a name of their own.
+  assert(scope_key(dump, texts, Map::new(), [Stored(Named(b"a.f"))]) != one, None);
+  // Any module's text, and any file the program embeds, moves it.
+  let edited = texts.set(1, b"pub fn g(x: Int) -> Int = x\n");
+  assert(scope_key(dump, edited, Map::new(), roots) != one, None);
+  assert(scope_key(dump, texts, Map::new().insert(b"h", b"x"), roots) != one, None)
 }
 
 /// What the emitter answers in `scope` for `roots`, each written against `handed` where it calls a
@@ -2501,7 +2563,10 @@ fn kept_body(ctors: Ctors, p: Program, b: Baked) -> Answer / {abort.raise} = {
 /// the store of answers `answers_store` names, and `keep` keeps a batch of them, each batch as the
 /// emitter answers it. A root the emitter answers nothing for is refused. A root `baked` names is
 /// held as that value in place of its body, which the emitter is not asked for. Each place the unit
-/// walks is told to `phases` as it ends.
+/// walks is told to `phases` as it ends. `scope_held` is the scope an earlier ask of this program
+/// walked under, which this one walks under too, or `None` to resolve the program here. `facts_of`
+/// are the roots whose bodies the scope reads what the check filed of; it is the roots offered where
+/// none is given, so that every root a walk may be asked for is one the scope holds facts of.
 pub fn emitted<| e>(
   runtime: Runtime,
   dump: Dump,
@@ -2512,6 +2577,8 @@ pub fn emitted<| e>(
   keep: (List<Record>) -> Unit / e,
   baked: List<Baked> = [],
   phases: Option<{ now: () -> Int / e, told: (PlaceTally) -> Unit / e }> = None,
+  scope_held: Option<Result<emit::Scope, Bytes>> = None,
+  facts_of: Option<List<RootKey>> = None,
 ) -> Result<Emission, Bytes> / {abort.raise | e} = {
   let p = program_of(dump, sources);
   let ctors = dump.emitter_ctors.map(|c: EmitterCtor| { name: c.name, arity: c.arity });
@@ -2523,6 +2590,7 @@ pub fn emitted<| e>(
   });
   let entries = every.filter(|k: RootKey| entered_root(p, k)).map(Entered);
   let offered = every.filter(|k: RootKey| !values.contains(root_name(k))).concat(entries);
+  let reading = match facts_of { Some(rs) -> rs, None -> offered };
   let program = program_ctors(dump, ctors);
   let all = walked(
     p,
@@ -2532,9 +2600,9 @@ pub fn emitted<| e>(
     read,
     keep,
     phases,
-    None,
+    scope_held,
     |held: Option<Result<emit::Scope, Bytes>>, roots: List<RootKey>, handed: Map<RootName, Handing>| {
-      let scope = match held { Some(s) -> s, None -> scope_over(runtime, dump, p, ctors, offered) };
+      let scope = match held { Some(s) -> s, None -> scope_over(runtime, dump, p, ctors, reading) };
       let pieces = dealt(p, roots);
       { held: Some(scope), answers: answers_at_once(scope, pieces, 0, pieces.len(), 64, handed) }
     },
@@ -2585,6 +2653,7 @@ pub fn emitted<| e>(
           text_at(p, m.index)),
       ),
       misassumed: misassumed_in(all.answers, produced.taken),
+      scope: all.emitter,
     })
   }
 }
@@ -4087,6 +4156,7 @@ test "a call written against a handing its callee does not publish fails the bui
     asked: 0,
     unbound: [],
     misassumed: wrong,
+    scope: None,
   };
   match held(dump, [], Ok(e)) {
     Ok(_) -> assert(false, Some("a unit holding a call against the wrong handing was held")),
