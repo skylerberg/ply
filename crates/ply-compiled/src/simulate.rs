@@ -65,11 +65,14 @@ impl Drop for Item {
     }
 }
 
-/// The word compiled code holds `item` as, which takes it: a value's made of it, a kept one's the
-/// word it was handed the region as.
+/// The word compiled code holds `item` as, which takes it: a kept one's the word it was handed the
+/// region as, `()` the word 0. A value read without its type has no word to be held as.
 pub(crate) fn word_of(c: &mut Ctx, item: Item) -> Word {
     match item.take() {
-        Passed::Value(v) => c.word(&v),
+        Passed::Value(Value::Unit) => 0,
+        Passed::Value(_) => c.fail(err_crossing(
+            "a region answered a value read without the type that lays it out",
+        )),
         Passed::Carried(v) => v.handed().word(),
     }
 }

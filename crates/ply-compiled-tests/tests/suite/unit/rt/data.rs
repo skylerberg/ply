@@ -5,7 +5,7 @@
 use crate::bare::{context_of, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Handed, PlyFnDesc, PlyType};
-use ply_compiled::heap::Word;
+use ply_compiled::heap::{IMMORTAL, Obj, Word};
 use ply_compiled::rt::{Ctx, FAILED_ABORT};
 use ply_core::builtins::call;
 use ply_core::{Builtin, Diagnostic, Span, Value, codes};
@@ -289,14 +289,12 @@ static CLAUSE: PlyFnDesc = PlyFnDesc {
 /// A static closure over nothing: an immortal count, then the descriptor's address.
 #[repr(C)]
 struct Static {
-    rc: u32,
-    header: [u32; 3],
+    h: Obj,
     desc: &'static PlyFnDesc,
 }
 
 static CLOSURE: Static = Static {
-    rc: u32::MAX,
-    header: [0; 3],
+    h: Obj { rc: IMMORTAL },
     desc: &CLAUSE,
 };
 

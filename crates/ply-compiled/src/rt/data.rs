@@ -1,4 +1,4 @@
-//! Lists, maps, arrays and records as compiled code walks and writes them.
+//! The runtime's part of `bracket`, and the refusals and notes compiled code over data raises or makes.
 
 use super::*;
 
@@ -267,8 +267,8 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
     Raises(())
 }
 
-/// A fused `iterate`'s failure: `what` 0 a budget under one, 1 the budget spent, 2 a bad step
-/// answer `n`, which it takes.
+/// A fused `iterate`'s failure: `what` 0 a budget under one, 1 the budget spent, 2 a step answer
+/// that is no `Iter`, which its type rules out.
 pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {
     let ctx = unsafe { &mut *ctx };
     match what {
@@ -282,14 +282,10 @@ pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {
             ctx,
             error(format!("`iterate` did not stop within its budget of {n}")),
         ),
-        _ => {
-            let d = error(format!(
-                "the step given to `iterate` answered {}, not `Continue` or `Stop`",
-                ctx.type_name(n)
-            ));
-            heap::dec(n);
-            ctx.fail(d)
-        }
+        _ => ctx.fail(
+            error("the step given to `iterate` answered neither `Continue` nor `Stop`")
+                .note("this is Ply's fault, not the program's"),
+        ),
     };
 }
 
@@ -310,88 +306,6 @@ pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64, which: i64) {
             "a `{ty}` is {width} bits, so no other count names a shift of it"
         ));
     ctx.fail(d);
-}
-
-/// One field of a record by name. `own`: 0 reads the base and holds the field once more; 2 moves
-/// the field out of a unique base that stays; 1 and 3 also take and release the base.
-pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    if heap::kind(base) != KIND_RECORD {
-        let d = error(format!(
-            "a field access needs a record, and this is {}",
-            ctx.type_name(base)
-        ));
-        return ctx.fail(d);
-    }
-    let o = obj(base);
-    let shape = unsafe { (*o).layout };
-    let Some(at) = ctx
-        .tables
-        .layouts
-        .offset_by_index(shape, index as usize, &ctx.tables.fields)
-    else {
-        let d = error(format!(
-            "this record has no field `{}`",
-            ctx.tables.fields[index as usize]
-        ));
-        return ctx.fail(d);
-    };
-    let slot = ctx.tables.layouts.slot_at(shape, at);
-    if slot != heap::Slot::Word {
-        let tables = Arc::clone(&ctx.tables);
-        let w = heap::field_word(&mut ctx.heap, &tables.layouts, o, at, slot);
-        if own == 1 || own == 3 {
-            heap::dec(base);
-        }
-        return w;
-    }
-    let w = unsafe { word_at(o, at) };
-    match own {
-        0 => heap::inc(w),
-        2 => {
-            if is_unique(base) {
-                unsafe { set_word(o, at, heap::unit()) };
-            } else {
-                heap::inc(w);
-            }
-        }
-        _ => {
-            if is_unique(base) {
-                unsafe { set_word(o, at, heap::unit()) };
-            } else {
-                heap::inc(w);
-            }
-            heap::dec(base);
-        }
-    }
-    w
-}
-
-/// A record of `shape`'s fields holding `n` words at `args`, which it takes: laid out as a record of
-/// the values they are, as one of its type is wherever it is made.
-pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, n: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let tables = Arc::clone(&ctx.tables);
-    let names = tables.layouts.shape_names(shape as u32);
-    let fields: Vec<(Symbol, Word)> = names
-        .iter()
-        .cloned()
-        .zip(args_of(args, n).iter().copied())
-        .collect();
-    ctx.heap.record(&tables.layouts, &fields)
-}
-
-/// A fresh object of `kind` with `len` words, whose fields the compiled caller stores itself.
-pub unsafe extern "C" fn rt_alloc(
-    ctx: *mut Ctx,
-    kind: i64,
-    len: i64,
-    layout: i64,
-    flags: i64,
-) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    ctx.heap
-        .alloc(kind as u8, flags as u8, len as u32, layout as u32) as Word
 }
 
 /// A write of one element the emitted code made: in place, or into a copy of `copied` elements.

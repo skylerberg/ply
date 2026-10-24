@@ -24,7 +24,7 @@ const PAIR: Word = HEADER as Word + 16;
 fn alloc(ctx: *mut Ctx, bytes: Word, words: &[Word]) -> Word {
     let w = unsafe { helper::<Alloc>("rt_alloc_bytes")(ctx, bytes) };
     for (i, word) in words.iter().enumerate() {
-        unsafe { *(w as *mut Word).add(2 + i) = *word };
+        unsafe { *(w as *mut Word).byte_add(HEADER).add(i) = *word };
     }
     w
 }
@@ -34,7 +34,7 @@ fn block(ctx: *mut Ctx, word: Word) -> Word {
 }
 
 fn held(w: Word) -> Word {
-    unsafe { *(w as *const Word).add(2) }
+    unsafe { *(w as *const Word).byte_add(HEADER) }
 }
 
 fn free(ctx: *mut Ctx, w: Word) {
@@ -99,7 +99,7 @@ unsafe extern "C" fn fails(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word 
 /// Whether the branch ran in a context other than that of the block it is a branch of, which is
 /// what a branch on another thread is given.
 unsafe extern "C" fn apart(ctx: *mut Ctx, f: Word, _args: *const Word) -> Word {
-    let from = unsafe { *(f as *const Word).add(3) };
+    let from = unsafe { *(f as *const Word).byte_add(HEADER).add(1) };
     block(ctx, Word::from(from != ctx as Word))
 }
 

@@ -5,7 +5,7 @@
 use crate::bare::{context, helper};
 use ply_compiled::emitted::{Block, Carried, Handed, PlyFnDesc, PlyType};
 use ply_compiled::frames::{Held, PlyFrame, Snapshot, base, held_across, release_live};
-use ply_compiled::heap::Word;
+use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::Answered;
 use ply_compiled::rt::Ctx;
 use ply_compiled::stack::Stack;
@@ -17,10 +17,10 @@ type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
 
 /// A box: a block of one word, a marker the box is told apart by.
-const BOX: Word = 16 + 8;
+const BOX: Word = (HEADER + 8) as Word;
 
 /// A closure: a block of its descriptor, a marker, and a box it captures.
-const CLOSURE: Word = 16 + 8 * 3;
+const CLOSURE: Word = (HEADER + 8 * 3) as Word;
 
 thread_local! {
     /// The markers of the blocks released, in the order they went.
@@ -46,7 +46,7 @@ pub(super) fn count(w: Word) -> u32 {
 }
 
 fn word(w: Word, at: usize) -> *mut Word {
-    unsafe { (w as *mut Word).add(2 + at) }
+    unsafe { (w as *mut Word).byte_add(HEADER).add(at) }
 }
 
 pub(super) fn boxed(ctx: *mut Ctx, marker: Word) -> Word {

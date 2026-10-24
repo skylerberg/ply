@@ -6,7 +6,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ply_compiled::c::helpers;
-use ply_compiled::heap::{Heap, Layouts};
+use ply_compiled::heap::Heap;
 use ply_compiled::rt::{Ctx, Tables};
 use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
@@ -31,8 +31,6 @@ pub fn context_calling(builtins: &[&str]) -> Ctx {
 /// index, and whose pool of builtins holds those named `builtins`, in order.
 pub fn context_over(fields: &[&str], functions: Vec<usize>, builtins: &[&str]) -> Ctx {
     Ctx::new(Arc::new(Tables {
-        consts: Vec::new(),
-        layouts: Layouts::new(Vec::new()),
         fields: fields.iter().map(ply_core::Symbol::new).collect(),
         builtins: (builtins.iter())
             .map(|b| ply_core::Builtin::from_name(b).unwrap_or_else(|| panic!("no builtin `{b}`")))
@@ -43,9 +41,6 @@ pub fn context_over(fields: &[&str], functions: Vec<usize>, builtins: &[&str]) -
             .collect(),
         functions,
         immortals: Mutex::new(Heap::persistent()),
-        bytes: std::array::from_fn(|_| AtomicI64::new(0)),
-        nullaries: Vec::new(),
-        empty_map: 0,
         roots: Vec::new(),
     }))
 }

@@ -1,4 +1,5 @@
-//! A unit's tables, which every thread running the unit reads: its constants, roots and the identities of what it keeps.
+//! A unit's tables, which every thread running the unit reads: its memo, roots and the identities of
+//! what it keeps.
 
 use super::*;
 
@@ -13,9 +14,6 @@ pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
 /// A unit's tables, which every thread running the unit reads: what a `parallel` branch may change
 /// is behind an atomic or a lock.
 pub struct Tables {
-    /// The constant pool as values.
-    pub consts: Vec<Value>,
-    pub layouts: Layouts,
     /// Every field name a compiled body reads, so a field access is an index.
     pub fields: Vec<Symbol>,
     /// Every builtin a compiled body may call.
@@ -28,13 +26,8 @@ pub struct Tables {
     /// before the answer is: a later read charges it, so a cost is the same whether or not it was
     /// memoized.
     pub memo_costs: Box<[(AtomicI64, AtomicI64, AtomicI64)]>,
-    /// Owns the constant pool's and the memo's objects for as long as the unit lives.
+    /// Owns the memo's blocks for as long as the unit lives.
     pub immortals: Mutex<Heap>,
-    /// The 256 one-byte values, each made immortal when first asked for; `0` is not yet.
-    pub bytes: [AtomicI64; 256],
-    /// Per constructor index, a nullary one's immortal singleton, or `0`.
-    pub nullaries: Vec<Word>,
-    pub empty_map: Word,
     /// Every root, sorted by `id`: what a body's stored site names.
     pub roots: Vec<Root>,
 }
@@ -123,55 +116,5 @@ impl Tables {
             },
             None => Cost::default(),
         }
-    }
-
-    /// The immortal `Bytes` holding just `b`.
-    pub fn byte(&self, b: u8) -> Word {
-        let slot = &self.bytes[b as usize];
-        let cached = slot.load(Acquire);
-        if cached != 0 {
-            return cached;
-        }
-        let mut immortals = lock(&self.immortals);
-        // Another thread may have made it while this one waited.
-        let cached = slot.load(Acquire);
-        if cached != 0 {
-            return cached;
-        }
-        let w = immortals.bytes(&[b]);
-        heap::mark_immortal(w);
-        slot.store(w, Release);
-        w
-    }
-
-    /// Whether the constant pool holds a value that must not outlive the call that made it.
-    pub fn retains_a_handle(&self) -> Option<&'static str> {
-        self.consts.iter().find_map(holds_a_handle)
-    }
-}
-
-/// The same question of one value, to its leaves.
-pub(crate) fn holds_a_handle(value: &Value) -> Option<&'static str> {
-    match value {
-        Value::Secret(_) => Some("a Secret"),
-        Value::Task(_) => Some("a Task"),
-        Value::Chan(_) => Some("a Chan"),
-        Value::Closure(_) => Some("a Closure"),
-        Value::List(items) => items.iter().find_map(holds_a_handle),
-        Value::Array(items) => items.iter().find_map(holds_a_handle),
-        Value::Map(entries) => entries
-            .iter()
-            .find_map(|(k, v)| holds_a_handle(k).or_else(|| holds_a_handle(v))),
-        Value::Record(fields) => fields.values().find_map(holds_a_handle),
-        Value::Ctor { args, .. } => args.iter().find_map(holds_a_handle),
-        Value::Int(_)
-        | Value::Fixed(_)
-        | Value::Char(_)
-        | Value::Bool(_)
-        | Value::Float(_)
-        | Value::Decimal(_)
-        | Value::Str(_)
-        | Value::Bytes(_)
-        | Value::Unit => None,
     }
 }

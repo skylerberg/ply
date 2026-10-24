@@ -308,12 +308,6 @@ impl Kept {
 
 impl Bodies {
     fn new(unit: Arc<Unit>, code: crate::c::Native) -> Result<Bodies> {
-        if let Some(what) = code.tables().retains_a_handle() {
-            bail!(
-                "the constant pool holds {what}, which must not outlive the call that made it; \
-                 refusing the whole registration rather than entering anything"
-            );
-        }
         let mut admitted = HashMap::new();
         for name in &unit.members {
             let Some(entry) = code.entered(name.as_str()) else {

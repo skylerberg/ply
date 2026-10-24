@@ -418,7 +418,8 @@ impl HostHandler for Toolchain {
                 PlyValue::list(
                     c.census()
                         .into_iter()
-                        .map(|(what, objects, bytes)| {
+                        .map(|(size, objects, bytes)| {
+                            let what = format!("blocks of {size} bytes past the header");
                             crate::payload::record(vec![
                                 ("what", PlyValue::str(what)),
                                 ("objects", crate::payload::count(objects)),

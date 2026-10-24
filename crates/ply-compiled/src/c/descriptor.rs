@@ -41,7 +41,8 @@ pub struct Descriptor {
     exports: *const c_char,
     exports_len: usize,
     bind: *mut c_void,
-    bind_singletons: *mut c_void,
+    /// Null in every unit, read by nothing.
+    _unbound: *mut c_void,
     code: *const *mut c_void,
     code_count: usize,
     taken: *const TakenRow,
@@ -64,11 +65,6 @@ impl Descriptor {
     /// The unit's `ply_bind`, which takes the address of each helper it calls.
     pub fn bind(&self) -> *mut c_void {
         self.bind
-    }
-
-    /// The unit's `ply_bind_singletons`, where it lays one out.
-    pub fn bind_singletons(&self) -> Option<*mut c_void> {
-        (!self.bind_singletons.is_null()).then_some(self.bind_singletons)
     }
 
     /// Each compiled function's address, by its position in the unit's code table.

@@ -93,14 +93,7 @@ static RESUME_DESC: PlyFnDesc = PlyFnDesc {
 };
 
 static RESUME: ResumeBlock = ResumeBlock {
-    header: heap::Obj {
-        rc: heap::IMMORTAL,
-        kind: heap::KIND_REFUSED,
-        flags: 0,
-        aux: 0,
-        len: 0,
-        layout: 0,
-    },
+    header: heap::Obj { rc: heap::IMMORTAL },
     desc: &RESUME_DESC,
 };
 
@@ -542,7 +535,7 @@ pub unsafe extern "C" fn rt_handler_typed(ctx: *mut Ctx, i: I64, x: Handed, ty: 
     f.vars
         .get_or_insert_with(|| shared(HandlerVars(Vec::new())))
         .borrow_mut()
-        .set(i.0 as usize, Var::Carried(v));
+        .set(i.0 as usize, v);
 }
 
 /// Variable `i` of the handler whose clause runs, held once more for the caller.
@@ -568,14 +561,9 @@ pub unsafe extern "C" fn rt_handler_put(ctx: *mut Ctx, i: I64, x: Handed) {
     }
 }
 
-/// One more holder of a shared object, for compiled code, which has no atomics of its own.
+/// One more holder of a shared block, for compiled code, which has no atomics of its own.
 pub unsafe extern "C" fn rt_inc_shared(_ctx: *mut Ctx, w: i64) {
     heap::inc_shared(w);
-}
-
-/// One holder fewer of a shared object.
-pub unsafe extern "C" fn rt_dec_shared(_ctx: *mut Ctx, w: i64) {
-    heap::dec_shared(w);
 }
 
 /// `parallel { .. }`: the `n` slots at `slots` hold closure blocks, which this takes, and each

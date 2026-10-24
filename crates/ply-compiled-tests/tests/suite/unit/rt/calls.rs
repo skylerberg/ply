@@ -20,12 +20,12 @@ const BOX: Word = HEADER as Word + 8;
 
 fn boxed(ctx: *mut Ctx, n: Word) -> Word {
     let w = unsafe { helper::<Alloc>("rt_alloc_bytes")(ctx, BOX) };
-    unsafe { *(w as *mut Word).add(2) = n };
+    unsafe { *(w as *mut Word).byte_add(HEADER) = n };
     w
 }
 
 fn held(w: Word) -> Word {
-    unsafe { *(w as *const Word).add(2) }
+    unsafe { *(w as *const Word).byte_add(HEADER) }
 }
 
 fn count(w: Word) -> u32 {
@@ -42,7 +42,7 @@ fn let_go(ctx: *mut Ctx, w: Word) {
 /// `keep#m.Box`: the box copied onto the unit's persistent heap.
 unsafe extern "C" fn keep_box(ctx: *mut Ctx, w: Word) -> Word {
     let kept = unsafe { helper::<Alloc>("rt_alloc_kept")(ctx, BOX) };
-    unsafe { *(kept as *mut Word).add(2) = held(w) };
+    unsafe { *(kept as *mut Word).byte_add(HEADER) = held(w) };
     kept
 }
 

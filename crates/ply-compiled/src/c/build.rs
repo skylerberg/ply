@@ -5,8 +5,8 @@ use super::Refused;
 use super::descriptor::{Descriptor, TakenRow};
 use super::exports::Exports;
 use super::load::Library;
-use super::tables::{UnitTables, root_id};
-use crate::heap::{Heap, Stated, Word, mark_immortal};
+use super::tables::root_id;
+use crate::heap::Heap;
 use crate::rt::Entry;
 use crate::rt::{Ctx, Root, Tables};
 use crate::source::Source;
@@ -123,8 +123,7 @@ fn refused_of(exports: &Exports) -> Vec<Refused> {
 }
 
 /// A loaded object, what it lays out and what it says, made into an enterable `Native`; `source`
-/// places its sites. Invariant: every field of `UnitTables` must be recorded in `Exports`, or
-/// the ids move.
+/// places its sites.
 fn finish(
     lib: Library,
     unit: &'static Descriptor,
@@ -134,17 +133,11 @@ fn finish(
     let helpers = exports.bound()?;
     let Exports {
         helpers: _,
-        ctors,
         constants,
         modules: _,
         refusals: _,
-        consts,
         fields,
         builtins,
-        shapes,
-        instances,
-        numerics,
-        layout,
         entered,
     } = exports;
     let entered = entered
@@ -164,10 +157,6 @@ fn finish(
         })
         .collect::<Result<HashMap<_, _>>>()?;
     bind(unit, &helpers);
-    let Some(held) = UnitTables::from_tables(ctors, consts, fields, builtins, &shapes, layout)
-    else {
-        bail!("a unit's shapes do not intern to the ids its C was emitted against");
-    };
     let functions: Vec<usize> = unit.code().iter().map(|p| *p as usize).collect();
     let mut roots: Vec<Root> = (unit.taken().iter())
         .map(|row| Root {
@@ -180,45 +169,18 @@ fn finish(
     if roots.windows(2).any(|w| w[0].id == w[1].id) {
         bail!("two roots of this unit share a site id");
     }
-    let mut tables = tables_of(held);
-    let taking = |function: &str, takes: usize| match (function, unit.taking(function)) {
-        ("-", _) => Ok(Stated::No),
-        (_, None) => Ok(Stated::Absent),
-        (_, Some(row)) if row.arity() == takes => {
-            Ok(entry_of(row).map_or(Stated::Absent, |entry| Stated::By(entry as usize)))
-        }
-        (name, Some(row)) => bail!(
-            "`{name}` is stated of a type and takes {} words, where it is called with {takes}",
-            row.arity()
-        ),
+    let tables = Tables {
+        fields,
+        builtins,
+        memo: functions.iter().map(|_| AtomicI64::new(0)).collect(),
+        memo_costs: functions
+            .iter()
+            .map(|_| (AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)))
+            .collect(),
+        functions,
+        immortals: std::sync::Mutex::new(Heap::persistent()),
+        roots,
     };
-    let by = |function: &str| taking(function, 1);
-    let mut stated = vec![(Stated::No, Stated::No); tables.layouts.ctors.len()];
-    for (ctor, key, show) in &instances {
-        let Some(index) = tables.layouts.ctor_index(ctor) else {
-            bail!("the unit states a `key` or a `show` of `{ctor}`, which it does not hold");
-        };
-        stated[index as usize] = (by(key)?, by(show)?);
-    }
-    tables.layouts.state(stated);
-    let mut stated = vec![[Stated::No; 5]; tables.layouts.ctors.len()];
-    for (ctor, functions) in &numerics {
-        let Some(index) = tables.layouts.ctor_index(ctor) else {
-            bail!("the unit states a `numeric` of `{ctor}`, which it does not hold");
-        };
-        for (role, function) in functions.iter().enumerate() {
-            let takes = ply_core::instances::NUMERIC_WORDS[role];
-            stated[index as usize][role] = taking(function, takes)?;
-        }
-    }
-    tables.layouts.state_numeric(stated);
-    tables.memo = functions.iter().map(|_| AtomicI64::new(0)).collect();
-    tables.memo_costs = functions
-        .iter()
-        .map(|_| (AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)))
-        .collect();
-    tables.functions = functions;
-    tables.roots = roots;
     Ok(Native {
         _lib: lib,
         unit,
@@ -230,52 +192,8 @@ fn finish(
 
 /// `helpers` are the addresses the unit's own table binds, in its order.
 fn bind(unit: &Descriptor, helpers: &[*mut c_void]) {
-    // SAFETY: a unit lays its two binders out as functions of these types.
+    // SAFETY: a unit lays its binder out as a function of this type.
     let bind: unsafe extern "C" fn(*const *mut c_void) =
         unsafe { std::mem::transmute(unit.bind()) };
     unsafe { bind(helpers.as_ptr()) };
-    // A unit whose code names none of the runtime's singletons lays out no binder for them.
-    if let Some(binder) = unit.bind_singletons() {
-        let singletons: unsafe extern "C" fn(Word, Word, Word) =
-            unsafe { std::mem::transmute(binder) };
-        unsafe {
-            singletons(
-                crate::heap::bool(true),
-                crate::heap::bool(false),
-                crate::heap::unit(),
-            )
-        };
-    }
-}
-
-fn tables_of(mut unit: UnitTables) -> Tables {
-    unit.layouts.index_fields(&unit.fields);
-    let mut immortals = Heap::persistent();
-    let mut nullaries = Vec::with_capacity(unit.layouts.ctors.len());
-    for (index, (_, arity)) in unit.layouts.ctors.iter().enumerate() {
-        let w = if *arity == 0 {
-            let w = immortals.alloc(crate::heap::KIND_CTOR, 0, 0, index as u32) as Word;
-            mark_immortal(w);
-            w
-        } else {
-            0
-        };
-        nullaries.push(w);
-    }
-    let empty_map = immortals.map_new();
-    mark_immortal(empty_map);
-    Tables {
-        consts: unit.consts,
-        layouts: unit.layouts,
-        fields: unit.fields,
-        builtins: unit.builtins,
-        functions: Vec::new(),
-        memo: Default::default(),
-        memo_costs: Default::default(),
-        immortals: std::sync::Mutex::new(immortals),
-        bytes: std::array::from_fn(|_| AtomicI64::new(0)),
-        nullaries,
-        empty_map,
-        roots: Vec::new(),
-    }
 }

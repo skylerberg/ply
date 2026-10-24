@@ -3,9 +3,7 @@
 
 use crate::emitted::{Block, Carried, Handed, KeepRoot, PlyFnDesc, PlyOp, PlyType};
 use crate::heap::{
-    self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_CTOR,
-    KIND_RECORD, KIND_STR, Layouts, Stated, Word, bridged, bytes_of, is_unique, obj, set_word,
-    word_at,
+    self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, Word, bridged, obj, set_word, word_at,
 };
 use crate::host::Served;
 use crate::native::{I64, Native, Raises, Raising, Signature};
@@ -16,7 +14,7 @@ use ply_core::sched::Shield;
 use ply_core::sim::Access;
 use ply_core::{
     BinOp, Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Plain, Resource, Span,
-    Symbol, Value, codes, values_equal,
+    Symbol, Value, codes,
 };
 use std::collections::HashMap;
 use std::rc::Rc;

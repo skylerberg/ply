@@ -6,20 +6,16 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-pub mod array;
 pub mod backend;
 pub mod blocks;
 pub mod c;
-pub mod columns;
 pub mod detached;
 pub mod emitted;
 pub mod frames;
 pub mod heap;
 pub mod host;
 pub mod laid;
-pub mod list;
 pub mod machine;
-pub mod map;
 pub mod native;
 mod parallel;
 pub mod rt;

@@ -43,12 +43,12 @@ const BOX: Word = HEADER as Word + 8;
 
 fn boxed(ctx: *mut Ctx, n: Word) -> Word {
     let w = unsafe { helper::<A1>("rt_alloc_bytes")(ctx, BOX) };
-    unsafe { *(w as *mut Word).add(2) = n };
+    unsafe { *(w as *mut Word).byte_add(HEADER) = n };
     w
 }
 
 fn held(w: Word) -> Word {
-    unsafe { *(w as *const Word).add(2) }
+    unsafe { *(w as *const Word).byte_add(HEADER) }
 }
 
 unsafe extern "C" fn counted_inc(_ctx: *mut Ctx, w: Word) -> Word {
@@ -207,7 +207,7 @@ unsafe extern "C" fn fn_dec(ctx: *mut Ctx, w: Word) -> Word {
         if count(w) > 1 {
             *(w as *mut u32) -= 1;
         } else {
-            let desc = *(w as *const *const PlyFnDesc).add(2);
+            let desc = *(w as *const *const PlyFnDesc).byte_add(HEADER);
             ((*desc).release)(ctx, <Handed as Answered>::of(w));
         }
     }
@@ -307,7 +307,7 @@ const fn desc(uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word
 
 fn closure(ctx: *mut Ctx, d: &'static PlyFnDesc) -> Word {
     let w = unsafe { helper::<A1>("rt_alloc_bytes")(ctx, CLOSURE) };
-    unsafe { *(w as *mut *const PlyFnDesc).add(2) = d };
+    unsafe { *(w as *mut *const PlyFnDesc).byte_add(HEADER) = d };
     w
 }
 

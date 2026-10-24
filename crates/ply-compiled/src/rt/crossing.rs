@@ -98,7 +98,7 @@ pub enum Lifted {
 impl Lifted {
     fn release(self, ctx: *mut Ctx) {
         match self {
-            Lifted::Runtime(w) => heap::dec(w),
+            Lifted::Runtime(w) => heap::release_handle(w),
             Lifted::Carried(v) => v.release(ctx),
         }
     }
@@ -665,11 +665,8 @@ pub(crate) fn runtime_value(w: Word) -> Result<Value, String> {
         let kind = ClosureKind::Hold { held: None, id };
         return Ok(Value::Closure(Arc::new(Closure { name: None, kind })));
     }
-    if heap::kind(w) != KIND_BRIDGE {
-        return Err(format!(
-            "an object of kind {} crossed as a handle",
-            heap::kind(w)
-        ));
+    if !heap::is_bridge(w) {
+        return Err("a block that is no runtime handle crossed as one".to_string());
     }
     Ok(unsafe { bridged(obj(w)) }.clone())
 }
