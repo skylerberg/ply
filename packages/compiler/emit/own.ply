@@ -190,25 +190,27 @@ fn headed(
 /// What `took` reads off a body: each `Get` and the loop pass it runs in (`-1` outside any loop), the
 /// variables used other than to read a field, test a constructor or be updated, those an operation
 /// consumes, those holding a count made where they are bound, with the pass that binds them, how
-/// often each block's field is read on the way through the body that reads it most, and the fields
-/// each update of a record writes.
+/// often each block's field is read on the way through the body that reads it most, the reads of
+/// each block on the way to where the walk stands, and the reads an update after them on their way
+/// makes a record without writing their field.
 type Sight = {
   gets: List<{ var: Var, of: Var, path: Path, pass: Int }>,
   whole: Map<Int, Bool>,
   handed: Map<Int, Bool>,
   bound: Map<Int, Int>,
   reads: Map<Int, Map<Path, Int>>,
-  updates: Map<Int, List<List<Int>>>,
+  passed: Map<Int, List<{ id: Int, path: Path }>>,
+  unwritten: Map<Int, Bool>,
 }
 
 /// `f` with a `Take` for each `Get` that is the one read, on any way through the body, of a counted
 /// one-word field, not a record held in place, out of a block this body holds a count of as a word or
 /// the box a sum's case holds, where the field is handed on: where the block is held only here, the
 /// field's count moves to its reader instead of being taken again. The block must be used otherwise
-/// only to read its other fields, test its constructor or be updated with a new value of that field,
-/// in the pass that bound it, so nothing reads the field after it is taken. Whether the body holds
-/// the block's count is what `facts_of` says, as the counts are placed: a join set only from borrowed
-/// reads holds none.
+/// only to read its other fields, test its constructor or be updated, past the read, with a new value
+/// of that field, in the pass that bound it, so nothing reads the field after it is taken. Whether
+/// the body holds the block's count is what `facts_of` says, as the counts are placed: a join set
+/// only from borrowed reads holds none.
 fn took(f: Fn) -> Fn = {
   let start = f.members.fold(
     given_bound(f.params, f.conv, Map::new()),
@@ -221,7 +223,8 @@ fn took(f: Fn) -> Fn = {
       handed: Map::new(),
       bound: start,
       reads: Map::new(),
-      updates: Map::new(),
+      passed: Map::new(),
+      unwritten: Map::new(),
     },
     f.body,
     0 - 1,
@@ -234,7 +237,7 @@ fn took(f: Fn) -> Fn = {
           && word_held(g.var.rep)
           && !held_in_place(g.of, g.path, g.var)
           && !s.whole.contains(g.of.id)
-          && rewritten(s.updates, g.of, g.path)
+          && !s.unwritten.contains(g.var.id)
           && s.handed.contains(g.var.id)
           && (match s.reads.get(g.of.id) { Some(ps) -> ps.get(g.path), None -> None }) == Some(1) {
         m.insert(g.var.id, g.of)
@@ -248,13 +251,40 @@ fn took(f: Fn) -> Fn = {
   }
 }
 
-/// Whether every update of `of` writes the field at `path`, so the one each makes holds none of
-/// what a take of that field left behind.
-fn rewritten(updates: Map<Int, List<List<Int>>>, of: Var, path: Path) -> Bool =
-  match updates.get(of.id) {
-    None -> true,
-    Some(us) -> match path { PField(p) -> us.all(|ats: List<Int>| ats.contains(p.at)), _ -> false },
+/// `s` past update `u`: each read of `u.of` on the way here whose field `u` does not write is one
+/// a take would leave a hole in the record `u` makes.
+fn updated_past(s: Sight, u: { of: Var, sets: List<FieldSet> }) -> Sight =
+  match s.passed.get(u.of.id) {
+    None -> s,
+    Some(rs) ->
+      {
+        ..s,
+        unwritten: rs.fold(s.unwritten, |m: Map<Int, Bool>, r: { id: Int, path: Path }|
+          match r.path {
+            PField(p) -> if u.sets.any(|x: FieldSet| x.at == p.at) { m }
+            else { m.insert(r.id, true) },
+            _ -> m.insert(r.id, true),
+          }),
+      },
   }
+
+/// The reads on the way to after a branch: those on the way through `a` and those through `b`, both
+/// walked from one start.
+fn passed_joined(
+  a: Map<Int, List<{ id: Int, path: Path }>>,
+  b: Map<Int, List<{ id: Int, path: Path }>>,
+) -> Map<Int, List<{ id: Int, path: Path }>> =
+  b.fold(
+    a,
+    |m: Map<Int, List<{ id: Int, path: Path }>>, of: Int, rs: List<{ id: Int, path: Path }>| {
+      let into = match m.get(of) { Some(x) -> x, None -> [] };
+      m.insert(
+        of,
+        rs.fold(into, |acc: List<{ id: Int, path: Path }>, r: { id: Int, path: Path }|
+          if acc.any(|x: { id: Int, path: Path }| x.id == r.id) { acc } else { acc.push(r) }),
+      )
+    },
+  )
 
 fn given_bound(params: List<Var>, conv: Convention, m: Map<Int, Int>) -> Map<Int, Int> =
   range(0, params.len()).fold(m, |acc: Map<Int, Int>, i: Int|
@@ -308,20 +338,18 @@ fn sighted(s: Sight, b: Block, pass: Int) -> Sight =
               ..acc,
               gets: acc.gets.push({ var: l.var, of: g.of, path: g.path, pass: pass }),
               reads: read_once_more(acc.reads, g.of.id, g.path),
+              passed: acc.passed.insert(
+                g.of.id,
+                (match acc.passed.get(g.of.id) { Some(rs) -> rs, None -> [] }).push({
+                  id: l.var.id,
+                  path: g.path,
+                }),
+              ),
             },
           // An update hands its record on, the fields it does not write read where they lie.
           Updated(u) -> {
             let sets = used_in(acc, u.sets.map(|x: FieldSet| { arg: x.arg, takes: true }));
-            {
-              ..sets,
-              handed: sets.handed.insert(u.of.id, true),
-              updates: sets.updates.insert(
-                u.of.id,
-                (match sets.updates.get(u.of.id) { Some(us) -> us, None -> [] }).push(
-                  u.sets.map(|x: FieldSet| x.at),
-                ),
-              ),
-            }
+            updated_past({ ..sets, handed: sets.handed.insert(u.of.id, true) }, u)
           },
           _ -> used_in(acc, operands(l.val)),
         };
@@ -335,17 +363,23 @@ fn sighted(s: Sight, b: Block, pass: Int) -> Sight =
       If(x) -> {
         let c = used_in(acc, [{ arg: x.cond, takes: false }]);
         let t = sighted({ ..c, reads: Map::new() }, x.then, pass);
-        let o = sighted({ ..t, reads: Map::new() }, x.otherwise, pass);
-        { ..o, reads: reads_joined(c.reads, reads_joined(t.reads, o.reads, false), true) }
+        let o = sighted({ ..t, reads: Map::new(), passed: c.passed }, x.otherwise, pass);
+        {
+          ..o,
+          reads: reads_joined(c.reads, reads_joined(t.reads, o.reads, false), true),
+          passed: passed_joined(t.passed, o.passed),
+        }
       },
       Case(c) -> {
-        let arms = c.arms.fold(
-          sighted({ ..acc, reads: Map::new() }, c.rest, pass),
-          |a: Sight, arm: { when: Int, body: Block }| {
-            let s = sighted({ ..a, reads: Map::new() }, arm.body, pass);
-            { ..s, reads: reads_joined(a.reads, s.reads, false) }
-          },
-        );
+        let rest = sighted({ ..acc, reads: Map::new() }, c.rest, pass);
+        let arms = c.arms.fold(rest, |a: Sight, arm: { when: Int, body: Block }| {
+          let s = sighted({ ..a, reads: Map::new(), passed: acc.passed }, arm.body, pass);
+          {
+            ..s,
+            reads: reads_joined(a.reads, s.reads, false),
+            passed: passed_joined(a.passed, s.passed),
+          }
+        });
         { ..arms, reads: reads_joined(acc.reads, arms.reads, true) }
       },
       Match(m) ->

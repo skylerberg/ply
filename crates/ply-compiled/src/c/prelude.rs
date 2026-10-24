@@ -88,6 +88,10 @@ typedef struct {
 
 static inline Word *ply_words(Word w) { return (Word *)((char *)(intptr_t)w + PLY_HEADER); }
 static inline PlyObj *ply_obj(Word w) { return (PlyObj *)(intptr_t)w; }
+/* `byte_of_int`'s answer for each byte: an immortal object the unit's tail lays out once. */
+typedef struct { PlyObj h; unsigned char b[8]; } PlyOneByte;
+extern const PlyOneByte ply_one_bytes[256];
+static inline Word ply_one_byte(PlyCtx *ctx, int64_t b) { (void)ctx; return (Word)(intptr_t)&ply_one_bytes[b]; }
 /* Held in the word itself: an `Int` (low bit set) or a `Char` (low bits `010`, its code point
    above them). An object's address is a multiple of eight. */
 static inline int ply_is_imm(Word w) { return (w & 7) != 0; }
@@ -598,6 +602,14 @@ pub fn runtime_object() -> String {
     out.push_str(
         "void ply_bind_singletons(Word t, Word f, Word u) { ply_true = t; ply_false = f; ply_unit = u; }\n",
     );
+    out.push_str("const PlyOneByte ply_one_bytes[256] = {\n");
+    for b in 0..256 {
+        out.push_str(&format!(
+            "  {{ {{ .rc = UINT32_MAX, .kind = {}, .len = 1, .layout = 1 }}, {{ {b} }} }},\n",
+            crate::heap::KIND_BYTES
+        ));
+    }
+    out.push_str("};\n");
     out.push_str("\nvoid ply_bind(void **fns) {\n");
     for (i, h) in helpers().iter().enumerate() {
         let (ret, params) = signature(h);
