@@ -1,6 +1,6 @@
 use ply_compiled::heap::*;
-use ply_compiled::{list, map};
-use ply_core::{Carry, CtorCarries, Fields, Fixed, IntTy, Symbol, Value};
+use ply_compiled::map;
+use ply_core::{Fields, Fixed, IntTy, Symbol, Value};
 use std::sync::Arc;
 
 fn layouts() -> Layouts {
@@ -296,22 +296,13 @@ fn the_zero_word_is_unit_as_the_runtime_s_own_is() {
     assert!(native_key(&l, 0));
 }
 
-/// Below 64 bits a width is the immediate compiled code computes with, which reads back as the
-/// width only where its carry says so; at 64 bits it is the runtime's own object and says itself.
+/// Below 64 bits a width is the immediate compiled code computes with; at 64 bits it is the
+/// runtime's own object and reads back as itself.
 #[test]
-fn a_width_crosses_as_the_word_compiled_code_holds_and_reads_back_by_its_carry() {
+fn a_width_crosses_as_the_word_compiled_code_holds() {
     let mut h = Heap::new();
     let l = layouts();
-    let ctors = CtorCarries::from([
-        (Symbol::new("Some"), vec![Carry::Var(0)]),
-        (Symbol::new("None"), vec![]),
-    ]);
     let fixed = |ty: IntTy, n: i128| Value::Fixed(Fixed::of(ty, n).expect("a value of the width"));
-    let read = |w: Word, carry: &Carry| {
-        let mut walked = Walked::default();
-        let v = Heap::read(&l, w, carry, &ctors, &mut walked);
-        (v, walked.unread)
-    };
     for (ty, n) in [
         (IntTy::U8, 255),
         (IntTy::I8, -128),
@@ -320,28 +311,14 @@ fn a_width_crosses_as_the_word_compiled_code_holds_and_reads_back_by_its_carry()
         (IntTy::U32, 4_294_967_295),
         (IntTy::I32, -2_147_483_648),
     ] {
-        let w = h.to_word(&l, &fixed(ty, n));
-        assert_eq!(w, imm(n as i64), "{ty} {n}");
-        assert_eq!(read(w, &Carry::Width(ty)), (fixed(ty, n), false));
-        assert_eq!(read(w, &Carry::Plain), (Value::Int(n as i64), false));
+        assert_eq!(h.to_word(&l, &fixed(ty, n)), imm(n as i64), "{ty} {n}");
     }
     for n in [i128::from(u64::MAX), 1 << 63, 0] {
         let v = fixed(IntTy::U64, n);
         let w = h.to_word(&l, &v);
         assert!(!is_imm(w), "a `U64` is no immediate");
-        assert_eq!(read(w, &Carry::Plain), (v, false));
+        assert_eq!(Heap::to_value(&l, w), v);
     }
-    let bytes = Value::list(vec![fixed(IntTy::U8, 1), fixed(IntTy::U8, 200)]);
-    let w = h.to_word(&l, &bytes);
-    let carry = Carry::List(Box::new(Carry::Width(IntTy::U8)));
-    assert_eq!(read(w, &carry), (bytes, false));
-    let some = Value::ctor("Some", vec![fixed(IntTy::I16, -3)]);
-    let w = h.to_word(&l, &some);
-    let option = Carry::Sum(vec![Carry::Width(IntTy::I16)]);
-    assert_eq!(read(w, &option), (some, false));
-    // Nothing says whether this `Int` word is an `Int` or a width, and 300 is no `U8`.
-    assert!(read(imm(3), &Carry::Open).1);
-    assert!(read(imm(300), &Carry::Width(IntTy::U8)).1);
     h.end();
 }
 
@@ -695,29 +672,6 @@ fn a_native_map_holds_its_entries_in_the_interpreters_order_and_round_trips() {
 }
 
 #[test]
-fn an_adopted_word_is_a_copy_that_outlives_the_entry_and_shares_what_was_already_immortal() {
-    let l = layouts();
-    let mut entry = Heap::new();
-    let mut kept = Heap::persistent();
-    let shared = kept.to_word(&l, &Value::str("shared"));
-    mark_immortal(shared);
-    let record = Value::Record(Arc::new(Fields::from_unsorted(vec![
-        (Symbol::new("n"), Value::Int(1)),
-        (Symbol::new("s"), Value::str("own")),
-    ])));
-    let w = entry.to_word(&l, &record);
-    let list = entry.list_from(&[w, shared]);
-    let copy = kept.adopt(list);
-    assert_ne!(copy, list);
-    assert_eq!(list::get(obj(copy), 1), shared);
-    entry.end();
-    assert_eq!(
-        Heap::to_value(&l, copy),
-        Value::list(vec![record, Value::str("shared")])
-    );
-}
-
-#[test]
 fn an_immortal_word_survives_the_end_of_every_entry_and_counts_nothing() {
     let mut h = Heap::persistent();
     let l = layouts();
@@ -938,7 +892,6 @@ fn every_walker_refuses_a_block_emitted_code_laid_out_by_its_own_name() {
         ("dismantle", Box::new(dec)),
         ("share", Box::new(|w| _ = share(&[w]))),
         ("Heap::read", Box::new(|w| _ = Heap::to_value(&l, w))),
-        ("Heap::copy", Box::new(|w| _ = Heap::persistent().adopt(w))),
         ("mark_immortal", Box::new(mark_immortal)),
         ("world_independent", Box::new(|w| _ = world_independent(w))),
         ("native_key", Box::new(|w| _ = native_key(&l, w))),

@@ -100,8 +100,7 @@ pub const OPTION_WORDS: &str = "options held as their payload's word";
 /// What opens a line after a unit's tables naming a root `R` the unit is entered at through the
 /// definition `R#entered` it takes, which takes no words: the runtime opens a lowering for the
 /// answer and over it a lifting of the arguments' list, and `R#entered` reads them, calls `R` and
-/// writes its answer. A unit with no such line is entered with its arguments as words and its
-/// answer read by its layout.
+/// writes its answer. The runtime enters no root such a line does not name.
 pub const ENTERED: &str = "entered ";
 
 impl Exports {

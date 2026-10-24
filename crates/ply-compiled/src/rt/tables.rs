@@ -35,11 +35,6 @@ pub struct Tables {
     /// Per constructor index, a nullary one's immortal singleton, or `0`.
     pub nullaries: Vec<Word>,
     pub empty_map: Word,
-    /// Memo words and their converted values, both ways, so a tree crosses the seam unrebuilt.
-    pub memo_values: Mutex<HashMap<Word, Value>>,
-    pub memo_words: Mutex<HashMap<Identity, Word>>,
-    /// Answers of roots called with only memo words, up to [`CALL_MEMO_LIMIT`].
-    pub calls: Mutex<HashMap<(Symbol, Vec<Word>), Word>>,
     /// Every root, sorted by `id`: what a body's stored site names.
     pub roots: Vec<Root>,
 }
@@ -67,21 +62,6 @@ pub enum Identity {
     Bytes(usize),
     List(usize),
     Array(usize),
-}
-
-/// Each of `values`, the parts of record, constructor or array `o` in order, beside the word `o`
-/// holds it as; a part held as its bits is no word of its own and is left out.
-pub(super) fn held_words<'v>(
-    layouts: &Layouts,
-    o: *mut heap::Obj,
-    values: impl Iterator<Item = &'v Value>,
-) -> Vec<(Word, &'v Value)> {
-    layouts
-        .parts(o)
-        .into_iter()
-        .zip(values)
-        .filter_map(|((at, slot), part)| unsafe { heap::part_word(o, at, slot) }.map(|w| (w, part)))
-        .collect()
 }
 
 /// The identities of `v` and of its direct parts, the first [`PARTS_LIMIT`] of them: what a body
@@ -118,16 +98,6 @@ impl Tables {
         (w != 0).then_some(w)
     }
 
-    /// Remembers `w` as pure nullary function `index`'s answer, copied into the immortal heap. Two
-    /// threads memoizing at once keep one copy each and answer the same value.
-    pub fn memoize(&self, index: usize, w: Word) -> Word {
-        let kept = lock(&self.immortals).adopt(w);
-        if let Some(slot) = self.memo.get(index) {
-            slot.store(kept, Release);
-        }
-        kept
-    }
-
     /// Remembers `kept`, an immortal copy emitted code made, as pure nullary function `index`'s
     /// answer, with what computing it cost, which every later read charges. The first kept stays;
     /// one another thread keeps after it stays in the unit's persistent heap, unread.
@@ -153,73 +123,6 @@ impl Tables {
             },
             None => Cost::default(),
         }
-    }
-
-    /// The value a memo word was converted to before, if it was.
-    pub fn memo_value(&self, w: Word) -> Option<Value> {
-        lock(&self.memo_values).get(&w).cloned()
-    }
-
-    /// The memo word a value came from; `memo_values` holds the allocations, so ids are not reused.
-    pub fn memo_word(&self, v: &Value) -> Option<Word> {
-        let id = identity(v)?;
-        lock(&self.memo_words).get(&id).copied()
-    }
-
-    /// Keeps `v` for memo word `w` and maps its direct parts to their words, since a body that
-    /// takes a memo value apart hands those parts back in.
-    pub fn remember(&self, w: Word, v: &Value) {
-        // Replacing the value would free allocations its recorded identities still name.
-        let mut values = lock(&self.memo_values);
-        if values.contains_key(&w) {
-            return;
-        }
-        values.insert(w, v.clone());
-        let mut words = lock(&self.memo_words);
-        if let Some(id) = identity(v) {
-            words.insert(id, w);
-        }
-        // A scalar answer is its own word, with no parts to remember.
-        if !heap::is_object(w) {
-            return;
-        }
-        let o = obj(w);
-        let layouts = &self.layouts;
-        let parts: Vec<(Word, &Value)> = match v {
-            Value::Record(fields) => held_words(layouts, o, fields.iter().map(|(_, part)| part)),
-            Value::Ctor { args, .. } => held_words(layouts, o, args.iter()),
-            Value::List(items) if items.len() <= PARTS_LIMIT => items
-                .iter()
-                .enumerate()
-                .map(|(i, part)| (list::get(o, i), part))
-                .collect(),
-            Value::Array(items) if items.len() <= PARTS_LIMIT => {
-                held_words(layouts, o, items.iter())
-            }
-            _ => Vec::new(),
-        };
-        for (part_word, part) in parts.into_iter().take(PARTS_LIMIT) {
-            if let Some(id) = identity(part) {
-                words.insert(id, part_word);
-            }
-        }
-    }
-
-    /// The remembered answer of `root` over exactly these memo words, if it has one.
-    pub fn memo_call(&self, root: &Symbol, words: &[Word]) -> Option<Value> {
-        let kept = *lock(&self.calls).get(&(root.clone(), words.to_vec()))?;
-        self.memo_value(kept)
-    }
-
-    /// Remembers `out` for `root` over these memo words; `None` once the bound is reached.
-    pub fn memoize_call(&self, root: &Symbol, words: &[Word], out: Word) -> Option<Word> {
-        let mut calls = lock(&self.calls);
-        if calls.len() >= CALL_MEMO_LIMIT {
-            return None;
-        }
-        let kept = lock(&self.immortals).adopt(out);
-        calls.insert((root.clone(), words.to_vec()), kept);
-        Some(kept)
     }
 
     /// The immortal `Bytes` holding just `b`.

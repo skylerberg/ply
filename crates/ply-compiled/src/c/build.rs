@@ -52,21 +52,9 @@ impl Native {
         self.unit.taking(name).map(TakenRow::arity)
     }
 
-    /// Whether the unit is entered through its roots' `R#entered`, its arguments and answer
-    /// crossing encoded, rather than with words.
-    pub fn encoded(&self) -> bool {
-        !self.entered.is_empty()
-    }
-
     /// The entry of `R#entered` for the root `name`, which takes no words.
     pub fn entered(&self, name: &str) -> Option<Entry> {
         self.entered.get(name).copied()
-    }
-
-    /// Whether the root `name` can be entered: any root of a unit entered with words, and of one
-    /// entered encoded each that has its `R#entered`.
-    pub fn enterable(&self, name: &str) -> bool {
-        !self.encoded() || self.entered.contains_key(name)
     }
 
     /// Each root the unit is entered at through its `R#entered`: a generic one's entry calls a
@@ -285,9 +273,6 @@ fn tables_of(mut unit: UnitTables) -> Tables {
         bytes: std::array::from_fn(|_| AtomicI64::new(0)),
         nullaries,
         empty_map,
-        memo_values: Default::default(),
-        memo_words: Default::default(),
-        calls: Default::default(),
         roots: Vec::new(),
     }
 }

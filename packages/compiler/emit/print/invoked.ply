@@ -4,6 +4,7 @@
 //! their entries and descriptors.
 
 import std.bytes (ascii_of_int)
+import std.hash (blake3)
 import syntax.parsing (span_between)
 import check.types (Type, TyCon, TyFn, TyVar, row_empty)
 import emit.c (int_lit, tick_line)
@@ -13,7 +14,7 @@ import emit.keys (Callee, Root, Generic, Named, Share, Keep, TypeOp, root_name, 
                   has_entry)
 import emit.layout (header_bytes)
 import emit.pieces (Piece, Text, Hole, Symbol, LambdaEntry, spelled)
-import emit.answer (Expect, GenericAt, call_at)
+import emit.answer (Expect, GenericAt, SharedFn, call_at)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RFlat, RSum, RUnit, Leaf, Var, Arg,
                  AVar, Given, Lent, Owned, Borrowed, Convention, Made, MClosure, Fn, Member, Lambda,
                  Closure, Uses, Calling, Return, Rooted, rep_of_arg, made_said, no_links, in_box,
@@ -684,28 +685,16 @@ pub fn lambda_text(
           },
       );
       let taken = captures_read(pr, caps.parts, true, block_bytes(caps.at));
-      let lent = captures_read(taken.pr, caps.parts, false, block_bytes(caps.at));
       let block = InBox({
         parts: caps.parts.fold([], |acc: List<Held>, h: { at: Int, ty: Type, rep: Rep }|
           acc.concat(held_at(pr.ctors, h.ty, h.rep, h.at))),
         words: caps.at,
       });
-      let uniform = entry_text(
-        lent.pr,
-        Bytes::concat_all([
-          b"static Word ",
-          name,
-          b"_uniform(PlyCtx *ctx, Word self, const Word *args)",
-        ]),
-        name,
-        lent.out,
-        lent.names,
-        {
-          conv: own,
-          types: c.body.params.drop(c.captures).map(|v: Var| v.ty),
-          answer_ty: c.body.answer_ty,
-        },
-      );
+      let uniform = uniform_entry(taken.pr, name, {
+        conv: own,
+        types: c.body.params.drop(c.captures).map(|v: Var| v.ty),
+        answer_ty: c.body.answer_ty,
+      });
       let freed = release_entry(uniform.pr, name, block);
       let shared = walk_entry(freed.pr, name, Share, block);
       let kept = walk_entry(shared.pr, name, Keep, block);
@@ -739,11 +728,89 @@ pub fn lambda_text(
         ).concat(
           kept.out,
         ).push(
-          Text(descriptor(name, c.captures, own.reps, answer)),
+          Text(
+            descriptor(
+              name,
+              {
+                uniform: uniform.symbol,
+                release: freed.symbol,
+                share: shared.symbol,
+                keep: kept.symbol,
+              },
+              c.captures,
+              own.reps,
+              answer,
+            ),
+          ),
         ),
       }
     },
   }
+
+/// The entry the runtime calls a closure of function `name` through, words in and out: the closure
+/// counted once more and handed with each argument, opened as `e` holds it, to the typed entry its
+/// descriptor names. Its text is the convention's and the types' alone, so where it names nothing
+/// only this root's tables place, closures alike share one, named by a digest of that text.
+fn uniform_entry(
+  pr: Printing,
+  name: Bytes,
+  e: Entered,
+) -> { pr: Printing, out: List<Piece>, symbol: Bytes } / {abort.raise} = {
+  let h = head_types(e.conv);
+  let typed = Bytes::concat_all([
+    b"((",
+    h.answer,
+    b" (*)(PlyCtx *, Word",
+    Bytes::concat_all(h.params.map(|t: Bytes| b", ".concat(t))),
+    b"))((const PlyFnDesc *)(intptr_t)ply_words(self)[0])->typed)",
+  ]);
+  let body = entry_text(pr, b"", typed, [Text(b"  ply_dup(self);\n")], [b"self"], e);
+  shared_fn(
+    body.pr,
+    name.concat(b"_uniform"),
+    b"(PlyCtx *ctx, Word self, const Word *args)",
+    body.out,
+  )
+}
+
+/// A function of a closure's block answering a word, `params` its C parameters and `body` what
+/// follows them: written here as `own` where its text names what only this root's tables place, and
+/// otherwise the one function of its text that every closure alike shares, named by a digest of that
+/// text and noted among `pr`'s shared functions, which the unit writes once in each part.
+fn shared_fn(
+  pr: Printing,
+  own: Bytes,
+  params: Bytes,
+  body: List<Piece>,
+) -> { pr: Printing, out: List<Piece>, symbol: Bytes } / {abort.raise} =
+  if !body.all(placed_alike) {
+    {
+      pr: pr,
+      out: [Text(Bytes::concat_all([b"static Word ", own, params]))].concat(body),
+      symbol: own,
+    }
+  } else {
+    let text = params.concat(spelled(body));
+    let symbol = b"ply_c_".concat(Bytes::of_string(blake3(text).slice(0, 8).hex_of()));
+    {
+      pr: if pr.shared.any(|f: SharedFn| f.symbol == symbol) { pr } else {
+        {
+          ..pr,
+          shared: pr.shared.push({
+            symbol: symbol,
+            text: Bytes::concat_all([b"static Word ", symbol, text]),
+          }),
+        }
+      },
+      out: [],
+      symbol: symbol,
+    }
+  }
+
+/// Whether `p` reads alike in every root once spelled: text, and a root's symbol, which is spelled
+/// as itself; every other hole the unit fills by the root's own tables.
+fn placed_alike(p: Piece) -> Bool =
+  match p { Text(_) -> true, Hole(Symbol(Root(_))) -> true, _ -> false }
 
 /// The entry a call by a closure's type enters its function `name` through: the closure taken, its
 /// captures `taken` out of it, and the rest of the head handed on as the function, of convention
@@ -868,16 +935,16 @@ fn release_entry(
   pr: Printing,
   name: Bytes,
   block: Opening,
-) -> { pr: Printing, out: List<Piece> } / {abort.raise} =
+) -> { pr: Printing, out: List<Piece>, symbol: Bytes } / {abort.raise} =
   match block {
     InBox(b) -> {
       let go = slots_walked(pr, b"self", block, |q: Printing, ps: List<Part>, ws: List<Bytes>|
         let_go_of(q, ps, ws));
-      {
-        pr: go.pr,
-        out: [
-          Text(Bytes::concat_all([b"static Word ", name, b"_release(PlyCtx *ctx, Word self) {\n"])),
-        ].concat(if go.out.len() == 0 { [] }
+      shared_fn(
+        go.pr,
+        name.concat(b"_release"),
+        b"(PlyCtx *ctx, Word self)",
+        [Text(b" {\n")].concat(if go.out.len() == 0 { [] }
         else { [Text(pad(0))].concat(go.out).push(Text(b"\n")) }).push(
           Text(
             Bytes::concat_all([
@@ -887,7 +954,7 @@ fn release_entry(
             ]),
           ),
         ),
-      }
+      )
     },
     _ -> unprinted(Calling, b"a closure's block opened as no box", name),
   }
@@ -899,7 +966,7 @@ fn walk_entry(
   name: Bytes,
   op: TypeOp,
   block: Opening,
-) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
+) -> { pr: Printing, out: List<Piece>, symbol: Bytes } / {abort.raise} = {
   let of = { id: 0, ty: word_type(), rep: RWord };
   let into = { id: 1, ty: word_type(), rep: RWord };
   let walk = walked(
@@ -911,40 +978,38 @@ fn walk_entry(
     block,
     drop_of(word_type()),
   );
-  {
-    pr: walk,
-    out: [
-      Text(
-        Bytes::concat_all([
-          b"static Word ",
-          name,
-          if op == Share { b"_share" } else { b"_keep" },
-          b"(PlyCtx *ctx, Word self) {\n",
-        ]),
-      ),
-    ].concat(
-      walk.out,
-    ).push(
+  shared_fn(
+    walk,
+    name.concat(if op == Share { b"_share" } else { b"_keep" }),
+    b"(PlyCtx *ctx, Word self)",
+    [Text(b" {\n")].concat(walk.out).push(
       Text(Bytes::concat_all([b"  return ", name_of(walk, into), b";\n}\n"])),
     ),
-  }
+  )
 }
 
-/// The descriptor of the closures of function `name`, naming its entries and its convention; and
-/// where it captures nothing, the one block of it the root's closures share, which no one counts.
-fn descriptor(name: Bytes, captures: Int, own: List<Rep>, answer: Rep) -> Bytes =
+/// The descriptor of the closures of function `name`, naming its typed entry, the functions
+/// `entries` names and its convention; and where it captures nothing, the one block of it the root's
+/// closures share, which no one counts.
+fn descriptor(
+  name: Bytes,
+  entries: { uniform: Bytes, release: Bytes, share: Bytes, keep: Bytes },
+  captures: Int,
+  own: List<Rep>,
+  answer: Rep,
+) -> Bytes =
   Bytes::concat_all([
     b"const PlyFnDesc ",
     name,
     b"_desc = { ",
     Bytes::join(
       [
-        name.concat(b"_uniform"),
+        entries.uniform,
         Bytes::concat_all([b"(void (*)(void))", name, b"_typed"]),
         convention_id(own, answer),
-        name.concat(b"_release"),
-        name.concat(b"_share"),
-        name.concat(b"_keep"),
+        entries.release,
+        entries.share,
+        entries.keep,
       ],
       b", ",
     ),
@@ -1117,7 +1182,9 @@ pub fn group_wrapper(
         ),
         b")",
       ]);
-      let entered = if !has_entry(m.key, m.params.len()) { { pr: words.pr, out: [] } } else {
+      let entered = if !has_entry(m.key, m.params.len(), words.pr.ctors.stated) {
+        { pr: words.pr, out: [] }
+      } else {
         runtime_entry(words.pr, name, {
           conv: m.conv,
           types: m.params.map(|v: Var| v.ty),
@@ -1469,7 +1536,11 @@ test "a closure's entries hand over its captures out of its block, its release l
     statics: [],
   };
   let l = Closure({ body: body, captures: 2, at: span_between(0, 0) });
-  let text = spelled(lambda_text(body, 0, l, printing(Map::new())).out);
+  let printed = lambda_text(body, 0, l, printing(Map::new()));
+  // The functions closures alike share, which the unit writes before the root, then the closure's.
+  let text = Bytes::concat_all(
+    printed.pr.shared.map(|s: SharedFn| s.text).push(spelled(printed.out)),
+  );
   let name = symbol_of(b"m.outer").concat(b"_lambda0");
   let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
   // The body takes its captures as words, then its own parameters.
@@ -1486,18 +1557,11 @@ test "a closure's entries hand over its captures out of its block, its release l
   has(b"->release(ctx, ply_words(self)[2])");
   has(call_text(free_fn(), [b"ctx", b"self", b"40"]));
   has(b"->share(ctx, ply_words(self)[2])");
-  // The runtime's ABI: each entry a descriptor names takes the block.
-  has(name.concat(b"_keep(PlyCtx *ctx, Word self)"));
-  has(
-    Bytes::concat_all([
-      b"const PlyFnDesc ",
-      name,
-      b"_desc = { ",
-      name,
-      b"_uniform, (void (*)(void))",
-      name,
-      b"_typed, ",
-    ]),
-  );
+  // The runtime's ABI: each entry a descriptor names takes the block, and those but the typed one
+  // are the functions of their texts every closure alike shares.
+  has(b"static Word ply_c_");
+  has(Bytes::concat_all([b"const PlyFnDesc ", name, b"_desc = { ply_c_"]));
+  has(Bytes::concat_all([b", (void (*)(void))", name, b"_typed, "]));
+  assert_eq(text.index_of(name.concat(b"_keep")), None);
   assert(text.index_of(b"PlyFnBlock ") == None, Some(String::of_bytes_lossy(text)))
 }

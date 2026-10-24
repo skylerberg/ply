@@ -30,7 +30,7 @@ import emit.keys
 import emit.keys (RootKey, Named, Written, Clause, ClauseKind, Requires, Ensures, FnArg, TypeOp,
                   Order, Reflect, Shown, Digest, Contained, Lift, Lower, RootName, at_key,
                   root_name, root_text, module_of, test_key)
-import emit.answer (Defined, Expect, CallAt, GenericAt, expected_callee, Head, word_head,
+import emit.answer (Defined, Expect, CallAt, GenericAt, SharedFn, expected_callee, Head, word_head,
                     GenericCall, Need, Exact, Layout, Scalar, no_generics, Tables, no_tables,
                     Emitted, Body, Refused, RootAnswer, Published)
 import emit.tir.statics (array_kind, columns_kind)
@@ -130,7 +130,7 @@ test "a tail call into a definition's own recursive group jumps instead of nesti
   assert(group.text.index_of(grouped) != None, None);
   assert(group.text.index_of(grouped.concat(b"ctx, 1, ")) != None, None);
   assert(group.text.index_of(b"goto ply_loop;") != None, None);
-  assert(group.text.index_of(entry_of(b"m.even").concat(b"(")) != None, None);
+  assert(group.text.index_of(entry_of(b"m.even")) == None, None);
   assert_eq(group.text.index_of(b"PLY_SITE(ctx, @@r@@") != None, false);
   // A caller outside the group calls a member's own symbol, and a self loop outside a group keeps its label.
   let parity = match out.at(1) { Some(e) -> e, None -> group };
@@ -330,15 +330,12 @@ fn expects_named(t: Tables) -> List<CallHead> =
       head: e.head,
     })
 
-/// A root's own code: what it runs past its fuel head and before its entry, leaving out the
-/// adapters that box what it carries raw for the runtime.
+/// A root's own code: what its function runs past its fuel head, leaving out its entry and its
+/// closures, which follow it.
 fn own_code(text: Bytes) -> Bytes / {abort.raise} = {
   let from = match text.index_of(entered_fn()) { Some(i) -> i, None -> 0 };
-  let to = match text.index_of(b"_entry(PlyCtx *ctx, const Word *args) {") {
-    Some(i) -> i,
-    None -> text.len(),
-  };
-  text.slice(from, to)
+  let rest = text.slice(from, text.len());
+  match rest.index_of(b"\n}\n") { Some(i) -> rest.slice(0, i), None -> rest }
 }
 
 test "a record holds every `Float` field as its bits, wherever the field stands" {
@@ -370,9 +367,15 @@ test "a record holds every `Float` field as its bits, wherever the field stands"
     false,
     false,
   ]);
-  // `Point` and `weighed`'s record are two words each, made a box of them by the entries of the
-  // roots that answer one to the runtime.
-  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(32));"), [true, false, true, true, false, false]);
+  // `Point` and `weighed`'s record are two words each, answered as them: no root makes a box.
+  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(32));"), [
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+  ]);
   // A record of a known type holds a `Float` as its bits wherever it was made, so a read is a load,
   // the 70th field's at its place as the first's: in the box a record this wide is held as.
   assert(
@@ -745,14 +748,23 @@ test "a closure lets go of a sum it captured by the case the sum's words hold, a
       0,
     ) {
     Some(a) -> match a.answer {
-      Body(b) -> b.text,
+      // The functions closures alike share, which the unit writes before the root, then its own C.
+      Body(b) -> Bytes::concat_all(b.tables.shared.map(|f: SharedFn| f.text).push(b.text)),
       Refused(r) -> panic(String::of_bytes_lossy(r.why)),
     },
     None -> panic("no answer"),
   };
-  // The C of the closure's entry ending in `suffix`, and what each of its switches tests.
-  let switched = |suffix: Bytes| {
-    let from = match text.index_of(suffix.concat(b"(PlyCtx")) {
+  // The C of the closure's entry its descriptor names at place `at`, and what each of its switches
+  // tests.
+  let named = match text.index_of(b"_desc = { ") {
+    Some(i) -> text.slice(i + 10, text.len()),
+    None -> b"",
+  };
+  let entries = named.slice(0, match named.index_of(b" };") { Some(e) -> e, None -> 0 }).split(
+    b", ",
+  );
+  let switched = |at: Int| {
+    let from = match text.index_of(entries.get(at).concat(b"(PlyCtx")) {
       Some(i) -> text.slice(i, text.len()),
       None -> b"",
     };
@@ -760,22 +772,23 @@ test "a closure lets go of a sum it captured by the case the sum's words hold, a
     body.split(b"switch (").drop(1).map(|s: Bytes|
       s.slice(0, match s.index_of(b") {") { Some(e) -> e, None -> s.len() }))
   };
-  assert_eq(switched(b"_release").len(), 2);
-  assert_eq(switched(b"_release"), switched(b"_share"))
+  assert_eq(switched(3).len(), 2);
+  assert_eq(switched(3), switched(4))
 }
 
-test "a specialisation, which only compiled code calls, has no entry the runtime calls it through" {
-  let src = b"fn id<a>(x: a) -> a = x\nfn twice(n: Int) -> Int = id(n) + id(n)\n";
+test "only a definition of no parameters has an entry by words, which a constant read runs it through" {
+  let src = b"fn id<a>(x: a) -> a = x\nfn twice(n: Int) -> Int = id(n) + id(n)\nfn ten() -> Int = twice(5)\n";
   let at = at_key(b"m.id", [TyCon({ name: b"Int", args: [] })], []);
-  let answers = answers_at([b"m"], [src], [], [at, Named(b"m.twice")]);
-  assert_eq(answers.map(answer_name), [printed(at), b"m.twice"]);
+  let answers = answers_at([b"m"], [src], [], [at, Named(b"m.twice"), Named(b"m.ten")]);
+  assert_eq(answers.map(answer_name), [printed(at), b"m.twice", b"m.ten"]);
   let bodies = answers.map(|a: RootAnswer|
     match a.answer { Body(b) -> b, Refused(r) -> panic(String::of_bytes_lossy(r.why)) });
   assert_eq(
     bodies.map(|b: { text: Bytes, tables: Tables }| b.tables.symbols.map(|d: Defined| d.entry)),
-    [[b""], [entry_of(b"m.twice")]],
+    [[b""], [b""], [entry_of(b"m.ten")]],
   );
   assert_eq(bodies.map(|b: { text: Bytes, tables: Tables }| b.text.index_of(b"_entry") != None), [
+    false,
     false,
     true,
   ])
@@ -851,9 +864,8 @@ test "a record of a record type holds it in place, its words among its holder's"
   // finds it shared.
   assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(56));"), [true, false, false, false, false, false]);
   assert_eq(has(b"_copy_"), [false, false, false, true, false, true]);
-  assert_eq(has(b"rt_box_float_p"), [false, true, false, false, false, false]);
-  // No record is made behind a header, and nothing is moved out of a holder.
-  [b"rt_alloc_p(", b"(ply_words(p0) + "].fold((), |_: Unit, t: Bytes|
+  // No record is made behind a header, nothing is moved out of a holder, and no `Float` is boxed.
+  [b"rt_alloc_p(", b"(ply_words(p0) + ", b"rt_box_float_p"].fold((), |_: Unit, t: Bytes|
     assert_eq(has(t), [false, false, false, false, false, false]));
   // A record holding one of a variable's type in place is laid out only where its callers settle
   // the variable: the generic body has no C of its own.
@@ -2770,11 +2782,12 @@ test "a constructor holds its arguments as its declaration types them" {
   let has = |text: Bytes| out.map(|e: Emitted| e.text.index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None, None]);
   // A circle's point and radius lie in the sum's words after its tag word, a label's string among
-  // them: a value is boxed only by the entries answering one to the runtime, never built as an
-  // object, held behind a header or tested by its object's tag.
-  assert_eq(has(b"rt_alloc_bytes_p("), [true, false, false, false, true]);
-  [b"rt_alloc_p(", b"->layout == ", b"rt_equal_p(ctx, "].fold((), |_: Unit, t: Bytes|
-    assert_eq(has(t), [false, false, false, false, false]))
+  // them: a value is never boxed, built as an object, held behind a header or tested by its
+  // object's tag.
+  [b"rt_alloc_bytes_p(", b"rt_alloc_p(", b"->layout == ", b"rt_equal_p(ctx, "].fold(
+    (),
+    |_: Unit, t: Bytes| assert_eq(has(t), [false, false, false, false, false]),
+  )
 }
 
 test "a record of ints crosses a call as its fields and is made only where its word is asked for" {
@@ -2805,13 +2818,11 @@ test "a record literal held in place is written there, with no record made first
     b"fn held(c: { tag: Bytes, n: Int }, v: Int) -> { counter: { tag: Bytes, n: Int }, at: Int } = { counter: c, at: v }\n",
   ]);
   let out = emit_all_program([{ name: b"m", src: src }], [b"m.TyC", b"m.TyV"], [], true);
-  let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
+  let has = |text: Bytes| out.map(|e: Emitted| e.text.index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None, None]);
-  let whole = |text: Bytes| out.map(|e: Emitted| e.text.index_of(text) != None);
-  // The literal's fields are the holder's words: a sum's case and a record are gathered in the root's
-  // own code with nothing made, and only the entries answering one to the runtime make a box of it.
-  assert_eq(has(b"rt_alloc"), [false, false, false, false, false]);
-  assert_eq(whole(b"rt_alloc_bytes_p("), [true, true, true, true, true])
+  // The literal's fields are the holder's words: a sum's case and a record are gathered with
+  // nothing made.
+  assert_eq(has(b"rt_alloc"), [false, false, false, false, false])
 }
 
 test "a record holding a small record in place crosses a call as its leaves" {
@@ -2986,10 +2997,10 @@ test "a `Decimal` is held in registers as its two words, and in a record or an a
   let has = |text: Bytes| out.map(|e: Emitted| e.text.index_of(text) != None);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None, None, None, None]);
   // A line holds its price as two words and its count after them, each as its own bits: flat and
-  // raw, as a record of a price alone is. It crosses a call as its fields, and is made a word, a box
-  // of its three words, where an entry hands it to the runtime.
+  // raw, as a record of a price alone is. It crosses a call as its fields, and no root makes a box
+  // of its three words.
   assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(40));"), [
-    true,
+    false,
     false,
     false,
     false,

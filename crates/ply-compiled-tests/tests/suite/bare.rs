@@ -46,9 +46,6 @@ pub fn context_over(fields: &[&str], functions: Vec<usize>, builtins: &[&str]) -
         bytes: std::array::from_fn(|_| AtomicI64::new(0)),
         nullaries: Vec::new(),
         empty_map: 0,
-        memo_values: Mutex::default(),
-        memo_words: Mutex::default(),
-        calls: Mutex::default(),
         roots: Vec::new(),
     }))
 }

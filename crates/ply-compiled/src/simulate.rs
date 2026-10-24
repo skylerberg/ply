@@ -4,7 +4,7 @@
 //! what it is answered is written as PLV1 and lifted through them.
 
 use crate::emitted::{Block, Carried, Handed, PlyOp, PlyType};
-use crate::heap::{self, Word};
+use crate::heap::Word;
 use crate::rt::{
     Beside, Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_UNWIND, Frames, HandlerFrame, Lifted,
     drop_frame, err_crossing, inherit_frames, lifted_from, lowered_values, lowering_of,
@@ -279,26 +279,18 @@ extern "C" fn loop_entry(arg: usize) {
     std::process::abort();
 }
 
-/// Once a production root's entry has returned: the loop drains the other tasks, and the region
-/// answers what the root did. `root` is the word the entry answered, which the region reads; none for an entry that wrote its answer's encoding itself, of which the region keeps
-/// nothing.
-pub unsafe fn finish_root(ctx: *mut Ctx, root: Option<Word>) -> Word {
+/// Once a production root's entry has returned, having written its answer's encoding itself: the
+/// loop drains the other tasks.
+pub unsafe fn finish_root(ctx: *mut Ctx) {
     let c = unsafe { &mut *ctx };
     if c.sims.last().expect("a region is running").loop_done {
         ended_under_root(c);
-        return root.unwrap_or(0);
+        return;
     }
     let request = if c.failed != 0 {
         Request::Failed
     } else {
-        Request::Finished(match root {
-            Some(w) => {
-                let v = c.value(w);
-                heap::dec(w);
-                Item::value(v)
-            }
-            None => Item::value(Value::Unit),
-        })
+        Request::Finished(Item::value(Value::Unit))
     };
     let sim = c.sims.last_mut().expect("a region is running");
     sim.request = Some((ROOT, request));
@@ -309,9 +301,6 @@ pub unsafe fn finish_root(ctx: *mut Ctx, root: Option<Word>) -> Word {
     let mut sim = end(c);
     c.current = sim.slot(ROOT).frames;
     drop(sim.loop_stack.take());
-    let answer = sim.answer.take();
-    drop(sim);
-    answer.map_or(0, |a| word_of(c, a))
 }
 
 /// The production loop failed while the root was suspended in it, and resumed the root directly.
