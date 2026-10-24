@@ -27,14 +27,6 @@ pub fn natives() -> Vec<MachineNative> {
             rt_utf8_lossy as unsafe extern "C" fn(_, _, _) -> _,
         ),
         machine_native(
-            "?str_lower",
-            rt_str_lower as unsafe extern "C" fn(_, _, _) -> _,
-        ),
-        machine_native(
-            "?str_upper",
-            rt_str_upper as unsafe extern "C" fn(_, _, _) -> _,
-        ),
-        machine_native(
             "?trim_start",
             rt_trim_start as unsafe extern "C" fn(_, _, _) -> _,
         ),
@@ -241,24 +233,6 @@ pub unsafe extern "C" fn rt_utf8_valid(_: *mut Ctx, p: Addr, n: I64) -> I64 {
 pub unsafe extern "C" fn rt_utf8_lossy(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     let text = String::from_utf8_lossy(unsafe { lent(p, n) }).into_owned();
     unsafe { &mut *ctx }.give(text.into_bytes())
-}
-
-/// The string at `p` in lower case, as taken bytes.
-pub unsafe extern "C" fn rt_str_lower(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    cased(ctx, p, n, Builtin::StringLower)
-}
-
-/// The string at `p` in upper case, as taken bytes.
-pub unsafe extern "C" fn rt_str_upper(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    cased(ctx, p, n, Builtin::StringUpper)
-}
-
-fn cased(ctx: *mut Ctx, p: Addr, n: I64, b: Builtin) -> I64 {
-    let c = unsafe { &mut *ctx };
-    match c.text(unsafe { lent(p, n) }) {
-        Some(s) => c.taken_of(b, vec![Value::str(s)]),
-        None => I64(0),
-    }
 }
 
 /// Where the string at `p` begins once its leading white space is trimmed, in bytes.

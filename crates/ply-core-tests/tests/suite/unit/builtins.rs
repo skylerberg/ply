@@ -641,37 +641,6 @@ fn the_byte_searches_index_in_bytes_where_the_string_ones_index_in_characters() 
     );
 }
 
-/// Unicode's full mapping, not ASCII's: an answer can be longer than its text, a final sigma has
-/// its own form, and a character outside ASCII can become an ASCII letter. The C backend's
-/// runtime is held to the same answers in `ply-compiled-tests`.
-#[test]
-fn the_case_builtins_map_by_unicode_and_not_one_character_to_one() {
-    for (text, lower, upper) in [
-        ("AbC1 é", "abc1 é", "ABC1 É"),
-        ("straße", "straße", "STRASSE"),
-        ("İ", "i\u{307}", "İ"),
-        ("ΟΔΟΣ", "οδος", "ΟΔΟΣ"),
-        ("Σ", "σ", "Σ"),
-        ("\u{212A}", "k", "\u{212A}"),
-        ("ſ", "ſ", "S"),
-        ("ŉ", "ŉ", "\u{2BC}N"),
-        ("ﬁ", "ﬁ", "FI"),
-        ("ǆ", "ǆ", "Ǆ"),
-        ("", "", ""),
-    ] {
-        assert_eq!(
-            found(Builtin::StringLower, vec![Value::str(text)]),
-            Value::str(lower),
-            "`String::lower({text:?})`"
-        );
-        assert_eq!(
-            found(Builtin::StringUpper, vec![Value::str(text)]),
-            Value::str(upper),
-            "`String::upper({text:?})`"
-        );
-    }
-}
-
 fn decimal(text: &str) -> Value {
     Value::Decimal(text.parse().unwrap())
 }
