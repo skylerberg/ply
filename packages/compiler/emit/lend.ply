@@ -26,7 +26,7 @@ import emit.tir (Rep, RWord, RInt, RBool, RFlat, RSlice, RSum, Var, Arg, AVar, A
                  Done, Return, Restart, Enter, Handle, Reset, Opened, Block, Fn, Member, Rooted,
                  Lambda, Closure, Handed, Given, Lent, Returned, Owned, Borrowed, Convention, TTag,
                  Uses, ReadsOf, LastOf, Walked, no_links, counted, rep_of_arg, used_as, operands,
-                 answered, var_of, unpacks, Unsettled)
+                 answered, var_of, unpacks, Unsettled, MFramed, stops_at, laid_made)
 import emit.tir.handling (Perform)
 import emit.verify (payload_of, allocates, re_held)
 import emit.own (owned, may_reuse)
@@ -157,8 +157,10 @@ pub type Settled = { handed: Map<RootName, Handing>, groups: Map<RootName, List<
 /// calls and jumps settled after every group it calls.
 pub fn handings_of(
   lendings: List<Lending>,
-  published: Map<RootName, Handing>,
+  given: Map<RootName, Handing>,
+  declared: Map<RootName, List<Int>>,
 ) -> Settled / {abort.raise} = {
+  let published = with_declared(given, declared, lendings);
   let at = range(0, lendings.len()).fold(Map::new(), |m: Map<RootName, Int>, k: Int|
     match lendings.at(k) { Some(l) -> m.insert(l.def, k), None -> m });
   let out = lendings.map(|l: Lending|
@@ -183,6 +185,35 @@ pub fn handings_of(
     },
   )
 }
+
+/// `published` with a handing for each definition `lendings` call that it has none for and that
+/// declares a parameter lent: that parameter lent, every other given, as the call's arity says.
+fn with_declared(
+  published: Map<RootName, Handing>,
+  declared: Map<RootName, List<Int>>,
+  lendings: List<Lending>,
+) -> Map<RootName, Handing> =
+  lendings.fold(published, |look: Map<RootName, Handing>, l: Lending| {
+    let generics = generics_of(l.f);
+    vals_folded(l.f.body, look, |m: Map<RootName, Handing>, v: Val|
+      match v {
+        Call(c) -> match callee_def(generics, c.callee) {
+          Some(d) -> if m.contains(d) { m } else {
+            match declared.get(d) {
+              Some(lent) ->
+                m.insert(d, {
+                  params: range(0, c.args.len()).map(|k: Int|
+                    if lent.contains(k) { Lent } else { Given }),
+                  answer: Owned,
+                }),
+              None -> m,
+            }
+          },
+          None -> m,
+        },
+        _ -> m,
+      })
+  })
 
 /// A handing as text: each parameter `lent` or `given` in order, then how it answers, each
 /// parameter a borrowed answer reads out of by place and `part` where it is only something read out
@@ -521,13 +552,14 @@ type Walk = {
 }
 
 /// What a walk reads beside the body: each definition's handing as this round has it, the definition
-/// each of the root's generic calls names, the definition walked, and its tail group's members in
-/// the order an `Enter` numbers them.
+/// each of the root's generic calls names, the definition walked, its tail group's members in the
+/// order an `Enter` numbers them, and the variables of the blocks it takes to lie in the frame.
 type Sight = {
   look: Map<RootName, Handing>,
   generics: List<RootName>,
   def: RootName,
   group: List<RootName>,
+  framed: Map<Int, Bool>,
 }
 
 /// A parameter of definition `to` that a jump hands what the jumping member does not lend on, and
@@ -579,7 +611,13 @@ fn round(
       Some(l) -> match cur.at(k) {
         Some(c) -> {
           let w = member_walk(
-            { look: look, generics: generics_of(l.f), def: l.def, group: l.group },
+            {
+              look: look,
+              generics: generics_of(l.f),
+              def: l.def,
+              group: l.group,
+              framed: Map::new(),
+            },
             l.f,
           );
           acc.push({
@@ -604,20 +642,147 @@ fn round(
     ))
 }
 
-/// A walk of root `f`'s body, each counted parameter its own base.
-fn member_walk(s: Sight, f: Fn) -> Walk =
-  walked(
-    s,
-    range(0, f.params.len()).fold(
-      { origins: Map::new(), captured: Map::new(), uses: [], at: dummy_span() },
-      |w: Walk, k: Int|
-        match f.params.at(k) {
-          Some(p) -> defined(w, p, { bases: Map::new().insert(k, true), fresh: false }),
-          None -> w,
+/// A walk of root `f`'s body, each counted parameter its own base, with its blocks placed.
+fn member_walk(s: Sight, f: Fn) -> Walk = framed_walk(s, f).walk
+
+/// A walk of `f`'s body with the blocks it makes placed: each that could lie in the frame does,
+/// until a use consumes it whole, which lays it on the heap, and the body is walked again so, until
+/// no use moves another. It ends, as each walk lays one more block on the heap or settles.
+fn framed_walk(s: Sight, f: Fn) -> { walk: Walk, framed: Map<Int, Bool> } = {
+  let start = range(0, f.params.len()).fold(
+    { origins: Map::new(), captured: Map::new(), uses: [], at: dummy_span() },
+    |w: Walk, k: Int|
+      match f.params.at(k) {
+        Some(p) -> defined(w, p, { bases: Map::new().insert(k, true), fresh: false }),
+        None -> w,
+      },
+  );
+  let candidates = framing(f);
+  walked_until_placed(s, start, f.body, candidates, candidates.len())
+}
+
+/// `b` walked from `start` with the blocks `framed` names in the frame, again with those a use
+/// consumes laid on the heap until none is; `room` more walks at most, which is how many blocks
+/// could still go.
+fn walked_until_placed(
+  s: Sight,
+  start: Walk,
+  b: Block,
+  framed: Map<Int, Bool>,
+  room: Int,
+) -> { walk: Walk, framed: Map<Int, Bool> } = {
+  let w = walked({ ..s, framed: framed }, start, b);
+  let gone = gone_blocks(w);
+  let kept = framed.fold(Map::new(), |m: Map<Int, Bool>, id: Int, _: Bool|
+    if gone.contains(id) { m } else { m.insert(id, true) });
+  if kept.len() == framed.len() || room <= 0 { { walk: w, framed: framed } }
+  else { walked_until_placed(s, start, b, kept, room - 1) }
+}
+
+/// The base a block made in the frame is to the walk: below every parameter's place.
+fn block_base(id: Int) -> Int = 0 - 1 - id
+
+/// The variables of the blocks `f` makes that could lie in its frame: each list of at most a leaf's
+/// items, where nothing in `f` stops for a handler that may resume it more than once, since a
+/// snapshot of the frame would hold what the list holds without counting it. A closure lies there
+/// where the lowering laid it, at an argument its callee lends.
+fn framing(f: Fn) -> Map<Int, Bool> =
+  if stops_in(f.body) { Map::new() } else {
+    vals_bound(f.body, Map::new(), |m: Map<Int, Bool>, v: Var, val: Val|
+      match val {
+        Make(x) -> match x.made {
+          MList(n) -> if n > 0 && n <= layout::layouts().trie.width { m.insert(v.id, true) }
+          else { m },
+          _ -> m,
         },
-    ),
-    f.body,
-  )
+        _ -> m,
+      })
+  }
+
+/// Whether anything in `b` may stop for a handler that can resume it more than once.
+fn stops_in(b: Block) -> Bool = vals_folded(b, false, |acc: Bool, v: Val| acc || stops_at(v))
+
+/// `acc` past each variable `b` and the blocks it holds bind to a value, with that value.
+fn vals_bound<s>(b: Block, acc: s, on: (s, Var, Val) -> s) -> s =
+  b.fold(acc, |a: s, i: Inst|
+    match i {
+      Let(l) -> on(a, l.var, l.val),
+      If(x) -> vals_bound(x.otherwise, vals_bound(x.then, a, on), on),
+      Case(c) ->
+        c.arms.fold(vals_bound(c.rest, a, on), |q: s, arm: { when: Int, body: Block }|
+          vals_bound(arm.body, q, on)),
+      Match(m) -> m.arms.fold(vals_bound(m.rest, a, on), |q: s, arm: Block| vals_bound(arm, q, on)),
+      Loop(l) -> vals_bound(l.body, a, on),
+      Handle(h) -> vals_bound(h.body, a, on),
+      _ -> a,
+    })
+
+/// The variables of the blocks in the frame a use in `w` consumes whole, or carries in part or
+/// whole across a jump: none of them may die with the frame.
+fn gone_blocks(w: Walk) -> Map<Int, Bool> = {
+  let blocks = |g: Map<Int, Bool>, o: Origin, part: Bool|
+    o.bases.fold(g, |m: Map<Int, Bool>, k: Int, whole: Bool|
+      if k < 0 && (whole || part) { m.insert(0 - 1 - k, true) } else { m });
+  w.uses.fold(Map::new(), |g: Map<Int, Bool>, u: Use|
+    match u.does {
+      Consumes(o) -> blocks(g, o, false),
+      Hands(o) -> blocks(g, o, false),
+      Answers(o) -> blocks(g, o, false),
+      Sets(x) -> blocks(g, x.of, false),
+      Jumps(j) -> blocks(g, j.of, true),
+    })
+}
+
+/// `f` and the closures it makes with each block a walk keeps in the frame laid there, against
+/// `look`, the handing of each definition its calls name.
+pub fn framed_form(f: Fn, look: Map<RootName, Handing>) -> Fn = {
+  let s = {
+    look: look,
+    generics: generics_of(f),
+    def: root_name(f.key),
+    group: f.members.map(|m: Member| root_name(m.key)),
+    framed: Map::new(),
+  };
+  {
+    ..f,
+    body: block_framed(f.body, framed_walk(s, f).framed),
+    lambdas: f.lambdas.map(|l: Lambda|
+      match l { Closure(c) -> Closure({ ..c, body: framed_form(c.body, look) }) }),
+  }
+}
+
+/// `b` with each block `framed` names laid in the frame.
+fn block_framed(b: Block, framed: Map<Int, Bool>) -> Block =
+  b.map(|i: Inst|
+    match i {
+      Let(l) -> match l.val {
+        Make(m) -> if framed.contains(l.var.id) {
+          Let({ ..l, val: Make({ ..m, made: MFramed(m.made) }) })
+        } else { i },
+        _ -> i,
+      },
+      If(x) ->
+        If({
+          ..x,
+          then: block_framed(x.then, framed),
+          otherwise: block_framed(x.otherwise, framed),
+        }),
+      Case(c) ->
+        Case({
+          ..c,
+          arms: c.arms.map(|a: { when: Int, body: Block }|
+            { when: a.when, body: block_framed(a.body, framed) }),
+          rest: block_framed(c.rest, framed),
+        }),
+      Match(m) ->
+        Match({
+          arms: m.arms.map(|a: Block| block_framed(a, framed)),
+          rest: block_framed(m.rest, framed),
+        }),
+      Loop(l) -> Loop({ ..l, body: block_framed(l.body, framed) }),
+      Handle(h) -> Handle({ ..h, body: block_framed(h.body, framed) }),
+      _ -> i,
+    })
 
 /// What walk `w` gives, against `look`, the group's handings this round, and `h`, the walked
 /// member's own: its parameter whose value is consumed, answered owned, set to an owned join or
@@ -747,6 +912,16 @@ fn read_out(o: Origin) -> Origin =
     fresh: o.fresh,
   }
 
+/// What an answer borrowed out of a value of origin `o` holds of it: read out of each parameter it
+/// reaches, but whole of a block laid in the frame, since the answer may be that block, whose count
+/// nothing takes, so keeping the answer must keep the block off the frame.
+fn borrowed_out(o: Origin) -> Origin =
+  {
+    bases: o.bases.fold(Map::new(), |m: Map<Int, Bool>, k: Int, whole: Bool|
+      m.insert(k, k < 0 && whole)),
+    fresh: o.fresh,
+  }
+
 /// `v`'s origin; one the walk never bound holds a count of its own, so nothing is lent through it.
 fn origin_of(w: Walk, v: Var) -> Origin =
   match w.origins.get(v.id) { Some(o) -> o, None -> if counted(v.rep) { made() } else { none() } }
@@ -849,14 +1024,61 @@ fn placed(w: Walk, at: Span) -> Walk = { ..w, at: at }
 /// applied, which the call reads while its caller holds it; and a word held again as another
 /// (`verify.re_held`), which holds what its operand holds. A value read out of another holds that
 /// one's bases as read out of them, a part of a transparent value or a sum's payload as they are.
-fn valued(s: Sight, w: Walk, val: Val, bound: Option<Var>) -> { walk: Walk, origin: Origin } =
+fn valued(s: Sight, w: Walk, val: Val, bound: Option<Var>) -> { walk: Walk, origin: Origin } = {
+  let v = valued_as(s, w, val, bound);
+  { ..v, walk: borrowed_from_blocks(blocks_taken(v.walk, w, val), val, bound, v.origin) }
+}
+
+/// `w` past a counted value `val` that holds anything of a block laid in the frame, read out of it,
+/// borrowed of it, or that block held again: that block goes on the heap, since a block in the frame
+/// holds no count to keep what is read out of it alive by, nor to promote it with.
+fn borrowed_from_blocks(w: Walk, val: Val, bound: Option<Var>, o: Origin) -> Walk = {
+  let borrows = match val { Make(_) -> false, _ -> true };
+  let counts = match bound { Some(v) -> counted(v.rep), None -> false };
+  let blocks = o.bases.fold(Map::new(), |m: Map<Int, Bool>, k: Int, _: Bool|
+    if k < 0 { m.insert(k, true) } else { m });
+  if !borrows || !counts || blocks.len() == 0 { w }
+  else { used(w, Consumes({ bases: blocks, fresh: false })) }
+}
+
+/// `after` past what `val` takes of the blocks laid in the frame, read off `before`: anything but a
+/// call or an application, which hand what their convention gives, takes what `tir.operands` says,
+/// and a block it takes cannot die with the frame.
+fn blocks_taken(after: Walk, before: Walk, val: Val) -> Walk =
+  match val {
+    Call(_) -> after,
+    Apply(_) -> after,
+    Make(_) -> after,
+    _ ->
+      operands(val).fold(after, |a: Walk, o: { arg: Arg, takes: Bool }|
+        if !o.takes { a } else {
+          let blocks = arg_origin(before, o.arg).bases.fold(
+            Map::new(),
+            |m: Map<Int, Bool>, k: Int, whole: Bool|
+              if k < 0 && whole { m.insert(k, true) } else { m },
+          );
+          if blocks.len() == 0 { a } else { used(a, Consumes({ bases: blocks, fresh: false })) }
+        }),
+  }
+
+fn valued_as(s: Sight, w: Walk, val: Val, bound: Option<Var>) -> { walk: Walk, origin: Origin } =
   match val {
     Prim(_) -> { walk: w, origin: made() },
     Literal(_) -> { walk: w, origin: made() },
     Static(_) -> { walk: w, origin: none() },
     Tag(_) -> { walk: w, origin: none() },
     Make(m) -> {
-      let stored = taken(w, operands(val));
+      let framed = laid_made(m.made) != m.made
+        || (match bound { Some(to) -> s.framed.contains(to.id), None -> false });
+      // A block laid in the frame borrows what it holds, but never a block that could lie there.
+      let stored = if framed {
+        m.args.fold(w, |a: Walk, x: Arg| {
+          let o = arg_origin(w, x);
+          let blocks = o.bases.fold(Map::new(), |b: Map<Int, Bool>, k: Int, whole: Bool|
+            if k < 0 { b.insert(k, whole) } else { b });
+          if blocks.len() == 0 { a } else { used(a, Consumes({ bases: blocks, fresh: false })) }
+        })
+      } else { taken(w, operands(val)) };
       {
         walk: match bound {
           Some(to) -> match m.made {
@@ -869,7 +1091,12 @@ fn valued(s: Sight, w: Walk, val: Val, bound: Option<Var>) -> { walk: Walk, orig
           },
           None -> stored,
         },
-        origin: made(),
+        origin: match bound {
+          Some(to) -> if s.framed.contains(to.id) {
+            { bases: Map::new().insert(block_base(to.id), true), fresh: false }
+          } else { made() },
+          None -> made(),
+        },
       }
     },
     Get(g) ->
@@ -920,7 +1147,7 @@ fn valued(s: Sight, w: Walk, val: Val, bound: Option<Var>) -> { walk: Walk, orig
             from.fold(none(), |o: Origin, x: { param: Int, whole: Bool }|
               match c.args.at(x.param) {
                 Some(a) ->
-                  union(o, if x.whole { arg_origin(w, a) } else { read_out(arg_origin(w, a)) }),
+                  union(o, if x.whole { arg_origin(w, a) } else { borrowed_out(arg_origin(w, a)) }),
                 None -> o,
               }),
         },
@@ -943,7 +1170,7 @@ fn again_of(bound: Option<Var>, val: Val) -> Option<Var> =
 /// of its first operand.
 fn answered_by(w: Walk, args: List<Arg>, uses: Uses) -> Origin =
   if uses.owned { made() }
-  else { match args.at(0) { Some(a) -> read_out(arg_origin(w, a)), None -> none() } }
+  else { match args.at(0) { Some(a) -> borrowed_out(arg_origin(w, a)), None -> none() } }
 
 /// How `c`, called with `arity` arguments, is handed them: a definition as `look` has it, the
 /// definition a generic call names found in `generics` by its number, a root written for a type as
@@ -1076,7 +1303,7 @@ pub type LentForm = {
 /// `f`, a form of the build, written against `s`: its own convention, each member's, and each of its
 /// calls' as their definitions' handings say (`conventions`).
 pub fn lent_form(f: Fn, s: Settled) -> LentForm / {abort.raise} = {
-  let lent = conventions(f, s.handed);
+  let lent = framed_form(conventions(f, s.handed), s.handed);
   let own = if lent.members.len() == 0 { [{ key: lent.key, conv: lent.conv }] }
   else { lent.members.map(|m: Member| { key: m.key, conv: m.conv }) };
   let defs = own.fold([], |acc: List<RootKey>, o: { key: RootKey, conv: Convention }|
@@ -1269,10 +1496,7 @@ test "a parameter stored, updated in place, performed, given on, or captured by 
     gives,
   );
   assert_eq(by(call_of(b"keep", [AVar(s)])), gives);
-  assert_eq(
-    by(made_of(MClosure({ nth: 0, captures: 1, params: 1, stacked: false }), [AVar(s)])),
-    gives,
-  );
+  assert_eq(by(made_of(MClosure({ nth: 0, captures: 1, params: 1 }), [AVar(s)])), gives);
   // Handed to a parameter its callee lends, it stays lent.
   assert_eq(
     settled_with(
@@ -1314,7 +1538,7 @@ test "a closure laid on this frame's stack only reads its captures, whatever its
   let x = int(1);
   let with_body = |answer: Rep, body: Block| {
     let f = def_of(b"f", [s], RInt, [
-      bind(k, made_of(MClosure({ nth: 0, captures: 1, params: 1, stacked: true }), [AVar(s)])),
+      bind(k, made_of(MFramed(MClosure({ nth: 0, captures: 1, params: 1 })), [AVar(s)])),
       bind(r, call_of(b"each", [AVar(k)])),
       Return(AVar(r)),
     ]);
@@ -1498,10 +1722,8 @@ test "a group that hands a parameter around lends it, and gives it once any memb
       name,
       [s],
       RInt,
-      (if keeps { [bind(kept, made_of(MList(1), [AVar(s)]))] } else { [] }).concat([
-        bind(y, call_of(to, [AVar(s)])),
-        Return(AVar(y)),
-      ]),
+      (if keeps { [bind(kept, made_of(MCase({ case: 0, skip: 0, words: 1 }), [AVar(s)]))] }
+      else { [] }).concat([bind(y, call_of(to, [AVar(s)])), Return(AVar(y))]),
     );
   let lends = { params: [Lent], answer: Owned };
   let gives = { params: [Given], answer: Owned };
@@ -1552,7 +1774,7 @@ test "every recursion group is settled after the groups it calls" {
     bind(r, call_of(b"keeps", [AVar(s)])),
     Return(AVar(r)),
   ]);
-  let handed = handings_of([hands, keeps], Map::new()).handed;
+  let handed = handings_of([hands, keeps], Map::new(), Map::new()).handed;
   assert_eq(handed.get(of_m(b"hands")), Some({ params: [Given], answer: Owned }));
   assert_eq(handed.get(of_m(b"keeps")), Some({ params: [Given], answer: Owned }))
 }
