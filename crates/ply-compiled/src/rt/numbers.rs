@@ -322,6 +322,21 @@ pub unsafe extern "C" fn rt_let_no_match(ctx: *mut Ctx) {
     raise_error(ctx, d);
 }
 
+/// An `Int` divided by zero, raised: `what` 0 a division's, any other a remainder's.
+pub unsafe extern "C" fn rt_by_zero(ctx: *mut Ctx, what: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let name = if what == 0 { "division" } else { "remainder" };
+    raise_error(ctx, error(format!("{name} by zero")));
+}
+
+/// `Int::of_u64` of `value`'s bits, past what an `Int` holds, raised.
+pub unsafe extern "C" fn rt_not_an_int(ctx: *mut Ctx, value: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let d = error(format!("`Int::of_u64` was given {}", value as u64))
+        .note("an `Int` is 64 bits and signed, so it does not hold every `U64`");
+    raise_error(ctx, d);
+}
+
 /// `what` is `emit/c.ply`'s `overflow_code`.
 pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };
@@ -330,7 +345,8 @@ pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
         1 => "subtraction",
         2 => "negation",
         3 => "multiplication",
-        _ => "division",
+        4 => "division",
+        _ => "remainder",
     };
     let d = error(format!("integer overflow in {name}"));
     ctx.fail(d);

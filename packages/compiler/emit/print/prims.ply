@@ -8,7 +8,7 @@ import syntax.patterns (Lit, LUnit, LStr)
 import check.types (TyCon)
 import syntax.parsing (span_between)
 import emit.c (Width, KNum, ctype, int_lit, is_bitop, bitop_c, unsigned_ctype, width_index,
-               width_min, width_max, binary_code, arith_code, overflow_code)
+               width_min, width_max, binary_code, overflow_code)
 import emit.pieces (spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RSum, RImm, Var, Arg, AVar, AInt,
                  ANum, Scalars, rep_of_arg, arithmetic, comparison, shift)
@@ -99,7 +99,7 @@ fn int_printed(
   if op == b"ne" { bound(p, pr, v, Bytes::concat_all([b"!((", a, b") == (", b, b"))"])) }
   else if comparison(op) { bound(p, pr, v, infix(a, compare_c(op), b)) }
   else if is_bitop(op) { bound(p, pr, v, infix(a, bitop_c(op), b)) }
-  else if op == b"add" || op == b"sub" {
+  else if op == b"add" || op == b"sub" || op == b"mul" {
     let n = named(site(p, pr), v);
     line(
       line(n.pr, p.depth, Bytes::concat_all([b"int64_t ", n.name, b";"])),
@@ -122,23 +122,42 @@ fn int_printed(
     )
   } else if (op == b"div" || op == b"rem") && by_literal {
     bound(p, pr, v, Bytes::concat_all([b"(", a, if op == b"div" { b") / " } else { b") % " }, b]))
-  } else if arithmetic(op) {
-    check(
+  } else if op == b"div" || op == b"rem" {
+    // By zero is the program's to catch; the one quotient past the range is a fault, as `+`'s is.
+    let s = site(p, pr);
+    let zero = line(
+      s,
+      p.depth,
+      Bytes::concat_all([
+        b"if ((",
+        b,
+        b") == 0) { rt_by_zero_p(ctx, ",
+        if op == b"div" { b"0" } else { b"1" },
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    let past = line(
+      zero,
+      p.depth,
+      Bytes::concat_all([
+        b"if ((",
+        b,
+        b") == -1 && (",
+        a,
+        b") == INT64_MIN) { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    bound(
       p,
-      bound(
-        p,
-        site(p, pr),
-        v,
-        Bytes::concat_all([
-          b"rt_arith_p(ctx, ",
-          ascii_of_int(arith_code(op)),
-          b", ",
-          a,
-          b", ",
-          b,
-          b")",
-        ]),
-      ),
+      past,
+      v,
+      Bytes::concat_all([b"(", a, if op == b"div" { b") / (" } else { b") % (" }, b, b")"]),
     )
   } else if shift(op) { shifted(p, pr, v, op, None, a, count) } else if op == b"neg" {
     let guarded = line(
@@ -500,25 +519,56 @@ fn width_printed(
         ),
         t.name,
       )
-    } else {
+    } else if op == b"mul" {
+      let declared = line(t.pr, p.depth, Bytes::concat_all([b"int64_t ", t.name, b";"]));
       narrowed(
-        check(
-          p,
-          line(
-            t.pr,
-            p.depth,
-            Bytes::concat_all([
-              b"int64_t ",
-              t.name,
-              b" = rt_arith_p(ctx, ",
-              ascii_of_int(arith_code(op)),
-              b", (int64_t)(",
-              a,
-              b"), (int64_t)(",
-              b,
-              b"));",
-            ]),
-          ),
+        line(
+          declared,
+          p.depth,
+          Bytes::concat_all([
+            b"if (ply_mul_ov((int64_t)(",
+            a,
+            b"), (int64_t)(",
+            b,
+            b"), &",
+            t.name,
+            b")) { rt_overflow_p(ctx, ",
+            ascii_of_int(overflow_code(op)),
+            b"); ",
+            p.leave,
+            b" }",
+          ]),
+        ),
+        t.name,
+      )
+    } else {
+      // Below 64 bits the quotient is exact in an `int64_t`, and the width's ends are checked after.
+      let zero = line(
+        t.pr,
+        p.depth,
+        Bytes::concat_all([
+          b"if ((int64_t)(",
+          b,
+          b") == 0) { rt_by_zero_p(ctx, ",
+          if op == b"div" { b"0" } else { b"1" },
+          b"); ",
+          p.leave,
+          b" }",
+        ]),
+      );
+      narrowed(
+        line(
+          zero,
+          p.depth,
+          Bytes::concat_all([
+            b"int64_t ",
+            t.name,
+            b" = (int64_t)(",
+            a,
+            if op == b"div" { b") / (int64_t)(" } else { b") % (int64_t)(" },
+            b,
+            b");",
+          ]),
         ),
         t.name,
       )
@@ -636,9 +686,26 @@ fn width_printed(
     )
   } else if op == b"rotl" || op == b"rotr" { rotated(p, pr, v, op, w, a, count) }
   else if op == b"saturating_add" || op == b"saturating_sub" || op == b"saturating_mul" {
-    saturated(p, pr, v, op, w, a, b)
+    if w.bits == 64 { saturated_word(p, pr, v, op, w, a, b) }
+    else { saturated(p, pr, v, op, w, a, b) }
   } else if op == b"to_int" {
-    bound(p, site(p, pr), v, Bytes::concat_all([b"(int64_t)(", a, b")"]))
+    let s = site(p, pr);
+    let held = if w.signed || w.bits < 64 { s } else {
+      line(
+        s,
+        p.depth,
+        Bytes::concat_all([
+          b"if ((uint64_t)(",
+          a,
+          b") > (uint64_t)INT64_MAX) { rt_not_an_int_p(ctx, (int64_t)(",
+          a,
+          b")); ",
+          p.leave,
+          b" }",
+        ]),
+      )
+    };
+    bound(p, held, v, Bytes::concat_all([b"(int64_t)(", a, b")"]))
   } else if op == b"exact_add" || op == b"exact_sub" || op == b"exact_mul" || op == b"exact_neg" {
     // Exact in the 64 bits the answer is held in, which the width's operands cannot overflow.
     let wide = |e: Bytes| Bytes::concat_all([b"(", c_type(v.rep), b")(", e, b")"]);
@@ -716,6 +783,99 @@ fn rotated(
       b")))",
     ]),
   )
+}
+
+/// At 64 bits, where nothing wider holds the exact answer: the wrapped answer where the operation
+/// does not overflow, else the end the exact one lies past.
+fn saturated_word(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  b: Bytes,
+) -> Printing = {
+  let r = temp(site(p, pr));
+  let held = if w.signed {
+    let past = if op == b"saturating_add" { Bytes::concat_all([b"(", b, b") > 0"]) }
+    else if op == b"saturating_sub" { Bytes::concat_all([b"(", b, b") < 0"]) }
+    else { Bytes::concat_all([b"((", a, b") < 0) == ((", b, b") < 0)"]) };
+    Bytes::concat_all([
+      b"int64_t ",
+      r.name,
+      b"; if (",
+      if op == b"saturating_add" { b"ply_add_ov" }
+      else if op == b"saturating_sub" { b"ply_sub_ov" }
+      else { b"ply_mul_ov" },
+      b"(",
+      a,
+      b", ",
+      b,
+      b", &",
+      r.name,
+      b")) ",
+      r.name,
+      b" = ",
+      past,
+      b" ? INT64_MAX : INT64_MIN;",
+    ])
+  } else {
+    let x = Bytes::concat_all([b"(uint64_t)(", a, b")"]);
+    let y = Bytes::concat_all([b"(uint64_t)(", b, b")"]);
+    if op == b"saturating_sub" {
+      Bytes::concat_all([
+        b"uint64_t ",
+        r.name,
+        b" = ",
+        x,
+        b" < ",
+        y,
+        b" ? 0 : ",
+        x,
+        b" - ",
+        y,
+        b";",
+      ])
+    } else if op == b"saturating_add" {
+      Bytes::concat_all([
+        b"uint64_t ",
+        r.name,
+        b" = ",
+        x,
+        b" + ",
+        y,
+        b"; if (",
+        r.name,
+        b" < ",
+        x,
+        b") ",
+        r.name,
+        b" = UINT64_MAX;",
+      ])
+    } else {
+      Bytes::concat_all([
+        b"uint64_t ",
+        r.name,
+        b" = ",
+        x,
+        b" * ",
+        y,
+        b"; if (",
+        x,
+        b" != 0 && ",
+        r.name,
+        b" / ",
+        x,
+        b" != ",
+        y,
+        b") ",
+        r.name,
+        b" = UINT64_MAX;",
+      ])
+    }
+  };
+  bound(p, line(r.pr, p.depth, held), v, r.name)
 }
 
 /// Exact in 64 bits, then held to the width's ends; only an unsigned 32-bit product needs the

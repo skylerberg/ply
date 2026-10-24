@@ -117,6 +117,7 @@ static inline uint32_t ply_le32(uint32_t v) {
 #ifdef PLY_OV_BUILTIN
 static inline int ply_add_ov(int64_t a, int64_t b, int64_t *r) { return __builtin_add_overflow(a, b, r); }
 static inline int ply_sub_ov(int64_t a, int64_t b, int64_t *r) { return __builtin_sub_overflow(a, b, r); }
+static inline int ply_mul_ov(int64_t a, int64_t b, int64_t *r) { return __builtin_mul_overflow(a, b, r); }
 #else
 /* Signed overflow is undefined in C, so the sum is formed unsigned and the sign bits are read:
    an addition overflows when both operands differ in sign from the result. */
@@ -129,6 +130,16 @@ static inline int ply_sub_ov(int64_t a, int64_t b, int64_t *r) {
   uint64_t s = (uint64_t)a - (uint64_t)b;
   *r = (int64_t)s;
   return (int)((((uint64_t)a ^ (uint64_t)b) & ((uint64_t)a ^ s)) >> 63);
+}
+/* The product of the magnitudes, unsigned, overflows where dividing it back does not give the other
+   magnitude; then it must fit the sign's range, one more below zero than above. */
+static inline int ply_mul_ov(int64_t a, int64_t b, int64_t *r) {
+  uint64_t x = a < 0 ? 0 - (uint64_t)a : (uint64_t)a;
+  uint64_t y = b < 0 ? 0 - (uint64_t)b : (uint64_t)b;
+  uint64_t m = x * y;
+  *r = (int64_t)((uint64_t)a * (uint64_t)b);
+  if (x != 0 && m / x != y) return 1;
+  return m > (uint64_t)INT64_MAX + ((a < 0) != (b < 0));
 }
 #endif
 
@@ -328,6 +339,8 @@ helpers! {
     rt_no_match();
     rt_let_no_match();
     rt_overflow(what);
+    rt_by_zero(what);
+    rt_not_an_int(value);
     rt_not_that_width(which, value);
     rt_equal(a, b) -> Word;
     rt_concat(a, b) -> Word;
