@@ -630,17 +630,6 @@ pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64, which: i64) {
     ctx.fail(d);
 }
 
-/// An applied constructor. Takes the arguments.
-pub unsafe extern "C" fn rt_ctor(ctx: *mut Ctx, index: i64, args: *const i64, n: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    if n == 0 {
-        return ctx.nullary(index as u32);
-    }
-    let tables = Arc::clone(&ctx.tables);
-    ctx.heap
-        .ctor(&tables.layouts, index as u32, args_of(args, n))
-}
-
 /// One field of a record by name. `own`: 0 reads the base and holds the field once more; 2 moves
 /// the field out of a unique base that stays; 1 and 3 also take and release the base.
 pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64) -> i64 {
@@ -710,52 +699,6 @@ pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, 
     ctx.heap.record(&tables.layouts, &fields)
 }
 
-/// A list literal. Takes the items.
-pub unsafe extern "C" fn rt_list(ctx: *mut Ctx, args: *const i64, n: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    ctx.heap.list_from(args_of(args, n))
-}
-
-/// Whether a value is a record a pattern admits: of exactly `len` fields when `exact`. Reads.
-pub unsafe extern "C" fn rt_record_fits(ctx: *mut Ctx, value: i64, len: i64, exact: i64) -> i64 {
-    if heap::kind(value) != KIND_RECORD {
-        return 0;
-    }
-    let ctx = unsafe { &*ctx };
-    i64::from(
-        exact == 0
-            || ctx
-                .tables
-                .layouts
-                .shape_fields(unsafe { (*obj(value)).layout }) as i64
-                == len,
-    )
-}
-
-/// Whether a record holds the field a pattern names; a missing one fails the match. Reads.
-pub unsafe extern "C" fn rt_record_has(ctx: *mut Ctx, value: i64, index: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    if heap::kind(value) != KIND_RECORD {
-        return 0;
-    }
-    let shape = unsafe { (*obj(value)).layout };
-    i64::from(
-        ctx.tables
-            .layouts
-            .offset_by_index(shape, index as usize, &ctx.tables.fields)
-            .is_some(),
-    )
-}
-
-/// Whether a value is a list of `len` elements when `exact`, else of at least `len`. Reads.
-pub unsafe extern "C" fn rt_list_fits(_ctx: *mut Ctx, value: i64, len: i64, exact: i64) -> i64 {
-    if heap::kind(value) != KIND_LIST {
-        return 0;
-    }
-    let n = unsafe { (*obj(value)).len } as i64;
-    i64::from(if exact != 0 { n == len } else { n >= len })
-}
-
 /// An empty list with room in its tail for `n` elements, at most a leaf's: a loop pushing that
 /// many onto it grows it in place.
 pub unsafe extern "C" fn rt_list_room(ctx: *mut Ctx, n: i64) -> i64 {
@@ -764,7 +707,7 @@ pub unsafe extern "C" fn rt_list_room(ctx: *mut Ctx, n: i64) -> i64 {
         .alloc_list(n.clamp(0, crate::list::WIDTH as i64) as u32) as Word
 }
 
-/// One element of a list, once [`rt_list_fits`] has admitted its length: held once more. Reads.
+/// One element of a list whose length admits `i`: held once more. Reads.
 pub unsafe extern "C" fn rt_list_at(ctx: *mut Ctx, value: i64, i: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(value) != KIND_LIST {
@@ -791,23 +734,6 @@ pub unsafe extern "C" fn rt_list_rest(ctx: *mut Ctx, value: i64, from: i64) -> i
     ctx.heap.list_skip(value, from.max(0) as usize)
 }
 
-/// `Map::get` as an `Option` held as its payload's word: the value held once more, or `0` when
-/// absent, with no constructor built. Takes the map and the key.
-pub unsafe extern "C" fn rt_map_lookup(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    if heap::kind(m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, k) {
-        let found = map::get(&ctx.tables.layouts, obj(m), k);
-        if let Some(v) = found {
-            heap::inc(v);
-        }
-        heap::dec(m);
-        heap::dec(k);
-        return found.unwrap_or(0);
-    }
-    let answer = builtin_over_values(ctx, Builtin::MapGet, &[m, k]);
-    unwrapped(ctx, answer)
-}
-
 /// A fresh object of `kind` with `len` words, whose fields the compiled caller stores itself.
 pub unsafe extern "C" fn rt_alloc(
     ctx: *mut Ctx,
@@ -819,98 +745,6 @@ pub unsafe extern "C" fn rt_alloc(
     let ctx = unsafe { &mut *ctx };
     ctx.heap
         .alloc(kind as u8, flags as u8, len as u32, layout as u32) as Word
-}
-
-/// The value inside an `Option` answer, held once more, or `0` for `None`; the answer is let go.
-/// An `Option` compiled code held as its payload's word, zero for `None`, as the object it stands
-/// for, which takes the payload's count.
-pub unsafe extern "C" fn rt_maybe_take(ctx: *mut Ctx, w: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let tables = Arc::clone(&ctx.tables);
-    match (w, tables.layouts.some, tables.layouts.none) {
-        (0, _, Some(none)) => ctx.nullary(none),
-        (_, Some(some), _) if w != 0 => ctx.heap.ctor(&tables.layouts, some, &[w]),
-        _ => ctx.fail(error(
-            "an `Option` held as its payload's word in a program with no `Option`",
-        )),
-    }
-}
-
-/// The `Option` object `w`, which it takes, as compiled code holds it: its payload's word with a
-/// count of its own, or zero for `None`. A box nothing else holds hands its payload over whole.
-pub unsafe extern "C" fn rt_maybe_open(ctx: *mut Ctx, w: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    unwrapped(ctx, w)
-}
-
-/// As `rt_maybe_take`, holding one more count of the payload, which the caller keeps its own of.
-pub unsafe extern "C" fn rt_maybe_box(ctx: *mut Ctx, w: i64) -> i64 {
-    heap::inc(w);
-    unsafe { rt_maybe_take(ctx, w) }
-}
-
-/// A `Result` compiled code held as one word, its `Ok`'s argument's word or its `Err`'s tagged `100`,
-/// as the object it stands for, which takes the argument's count.
-pub unsafe extern "C" fn rt_tagged_take(ctx: *mut Ctx, w: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let tables = Arc::clone(&ctx.tables);
-    let (ctor, arg) = if w & 7 == 4 {
-        (tables.layouts.err, w & !7)
-    } else {
-        (tables.layouts.ok, w)
-    };
-    match ctor {
-        Some(c) => ctx.heap.ctor(&tables.layouts, c, &[arg]),
-        None => ctx.fail(error(
-            "a `Result` held as one word in a program with no `Result`",
-        )),
-    }
-}
-
-/// As `rt_tagged_take`, holding one more count of the argument, which the caller keeps its own of.
-pub unsafe extern "C" fn rt_tagged_box(ctx: *mut Ctx, w: i64) -> i64 {
-    heap::inc(if w & 7 == 4 { w & !7 } else { w });
-    unsafe { rt_tagged_take(ctx, w) }
-}
-
-/// The `Result` object `w`, which it takes, as compiled code holds it: its argument's word with a
-/// count of its own, tagged `100` for an `Err`.
-pub unsafe extern "C" fn rt_tagged_open(ctx: *mut Ctx, w: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    if ctx.failed != 0 {
-        return 0;
-    }
-    let o = obj(w);
-    let (layout, len) = unsafe { ((*o).layout, (*o).len) };
-    let arg = if len == 1 {
-        unsafe { word_at(o, 0) }
-    } else {
-        0
-    };
-    heap::inc(arg);
-    heap::dec(w);
-    if ctx.tables.layouts.err == Some(layout) {
-        arg | 4
-    } else {
-        arg
-    }
-}
-
-pub(super) fn unwrapped(ctx: &mut Ctx, answer: Word) -> Word {
-    if ctx.failed != 0 {
-        return 0;
-    }
-    let o = obj(answer);
-    let held = unsafe { (*o).len == 1 && ctx.tables.layouts.some == Some((*o).layout) };
-    let v = if held {
-        let v = unsafe { word_at(o, 0) };
-        heap::inc(v);
-        v
-    } else {
-        0
-    };
-    heap::dec(answer);
-    v
 }
 
 /// A write of one element the emitted code made: in place, or into a copy of `copied` elements.
@@ -926,70 +760,6 @@ pub unsafe extern "C" fn rt_node(ctx: *mut Ctx, kind: i64) -> i64 {
         KIND_MBRANCH => ctx.heap.alloc_branch() as Word,
         kind => ctx.heap.alloc_node(kind, &[]),
     }
-}
-
-/// The node `n` of a list's trie or a map's tree, which it takes, held once: itself where it
-/// already is, else a copy holding what it holds once more.
-pub unsafe extern "C" fn rt_node_writable(ctx: *mut Ctx, n: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    match heap::kind(n) {
-        KIND_MLEAF | KIND_MBRANCH => ctx.heap.writable_node(n) as Word,
-        _ => ctx.heap.writable(n),
-    }
-}
-
-/// The list `xs`, which it takes, held once with room for `room` tail elements: itself where it
-/// already is, else a copy holding its contents once more.
-pub unsafe extern "C" fn rt_list_writable(ctx: *mut Ctx, xs: i64, room: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    ctx.heap
-        .list_writable(xs, room.clamp(1, list::WIDTH as i64) as usize)
-}
-
-/// The map `m`, which it takes, held once: itself where it already is, else a copy holding its
-/// root once more.
-pub unsafe extern "C" fn rt_map_writable(ctx: *mut Ctx, m: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    ctx.heap.writable_map(m) as Word
-}
-
-/// `Array::at` as an `Option` held as its payload's word, like [`rt_map_lookup`].
-pub unsafe extern "C" fn rt_array_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    if heap::kind(xs) == KIND_ARRAY
-        && let Some(index) = heap::as_int(i)
-    {
-        let tables = Arc::clone(&ctx.tables);
-        let held = usize::try_from(index)
-            .ok()
-            .filter(|at| *at < array::len(obj(xs)))
-            .map(|at| array::element(&mut ctx.heap, &tables.layouts, obj(xs), at));
-        heap::dec(xs);
-        return held.unwrap_or(0);
-    }
-    let answer = builtin_over_values(ctx, Builtin::ArrayAt, &[xs, i]);
-    unwrapped(ctx, answer)
-}
-
-/// `List::at` as an `Option` held as its payload's word, like [`rt_map_lookup`].
-pub unsafe extern "C" fn rt_list_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    if heap::kind(xs) == KIND_LIST
-        && let Some(index) = heap::as_int(i)
-    {
-        let o = obj(xs);
-        let w = if index >= 0 && (index as usize) < list::len(o) {
-            let item = list::get(o, index as usize);
-            heap::inc(item);
-            item
-        } else {
-            0
-        };
-        heap::dec(xs);
-        return w;
-    }
-    let answer = builtin_over_values(ctx, Builtin::ListAt, &[xs, i]);
-    unwrapped(ctx, answer)
 }
 
 pub unsafe extern "C" fn rt_push(ctx: *mut Ctx, xs: i64, x: i64) -> i64 {

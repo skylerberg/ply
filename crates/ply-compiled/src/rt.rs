@@ -3,10 +3,9 @@
 
 use crate::emitted::{Block, Carried, Handed, KeepRoot, PlyFnDesc, PlyOp, PlyType};
 use crate::heap::{
-    self, CLOSURE_CAPTURES, CLOSURE_CODE, CLOSURE_DESCRIBED, Heap, KIND_ARRAY, KIND_BRIDGE,
-    KIND_BYTES, KIND_CLOSURE, KIND_COLUMNS, KIND_CTOR, KIND_LIST, KIND_MAP, KIND_MBRANCH,
-    KIND_MLEAF, KIND_RECORD, KIND_STR, Layouts, Stated, Word, bridged, bytes_of, is_unique, obj,
-    set_word, str_of, word_at,
+    self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_ARRAY, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE,
+    KIND_COLUMNS, KIND_CTOR, KIND_LIST, KIND_MAP, KIND_MBRANCH, KIND_MLEAF, KIND_RECORD, KIND_STR,
+    Layouts, Stated, Word, bridged, bytes_of, is_unique, obj, set_word, str_of, word_at,
 };
 use crate::host::Served;
 use crate::map;

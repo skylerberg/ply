@@ -3,7 +3,7 @@
 
 use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
-use crate::native::{Addr, F64, I64, Native, Raises, Raising, Signature};
+use crate::native::{Addr, F64, I64, Native, Raises, Signature};
 use crate::rt::Ctx;
 
 /// `rt_*` is declared, not defined: `ply_bind` supplies the addresses after `dlopen`, since a
@@ -342,86 +342,45 @@ macro_rules! helpers {
 
 helpers! {
     rt_dec(w);
-    rt_reset(w) -> Word;
     rt_box_int(v) -> Word;
     rt_unbox_int(w) -> Word;
-    rt_unbox_bool(w) -> Word;
     rt_box_float(bits) -> Word;
     rt_box_fixed(bits, t) -> Word;
     rt_box_decimal(lo, hi) -> Word;
     rt_decimal_binary(op, a_lo, a_hi, b_lo, b_hi, out);
     rt_decimal_compare(a_lo, a_hi, b_lo, b_hi) -> Word;
     rt_decimal_negate(lo, hi, out);
-    rt_columns_field(xs, i, k) -> Word;
     rt_unbox_float(w) -> Word;
     rt_float_rem(a, b) -> Word;
     rt_no_fuel();
-    rt_no_stack();
     rt_binary(op, a, b) -> Word;
     rt_wide_binary(op, t, a, b) -> Word;
     rt_negate(a) -> Word;
     rt_arith(op, a, b) -> Word;
-    rt_lit(index) -> Word;
     rt_no_match();
     rt_let_no_match();
     rt_overflow(what);
     rt_not_that_width(which, value);
     rt_equal(a, b) -> Word;
-    rt_between(v, lo, hi) -> Word;
     rt_concat(a, b) -> Word;
-    rt_bytes_join(args: *const Word, n) -> Word;
-    rt_builtin_value(index) -> Word;
-    rt_ctor_value(index) -> Word;
-    rt_constant(index) -> Word;
-    rt_call(callee, args: *const Word, n) -> Word;
-    rt_closure(index, arity, env: *const Word, n) -> Word;
-    rt_lambda_value(index, arity, desc) -> Word;
-    rt_iterate(seed, budget, f) -> Raising;
     rt_iterate_bad(what, n);
     rt_shift_count(n, which);
-    rt_ctor(index, args: *const Word, n) -> Word;
     rt_field(base, index, own) -> Word;
-    rt_list(args: *const Word, n) -> Word;
     rt_record(shape, args: *const Word, n) -> Word;
-    rt_record_fits(value, len, exact) -> Word;
-    rt_record_has(value, index) -> Word;
-    rt_list_fits(value, len, exact) -> Word;
     rt_list_at(value, i) -> Word;
     rt_list_room(n) -> Word;
     rt_list_rest(value, from) -> Word;
     rt_alloc(kind, len, layout, flags) -> Word;
-    rt_nullary(index) -> Word;
 
-    rt_handle_push(clauses: *const Word, n, ret) -> Word;
-    rt_perform(effect, op, resource, mode, args: *const Word, n) -> Word;
     rt_handle_land(depth, value) -> Word;
-    rt_simulate(body) -> Word;
-    rt_handle_detached(clauses: *const Word, n, ret, body) -> Word;
 
-    rt_list_lookup(xs, i) -> Word;
-    rt_map_lookup(m, k) -> Word;
-    rt_maybe_take(w) -> Word;
-    rt_maybe_box(w) -> Word;
-    rt_maybe_open(w) -> Word;
-    rt_tagged_take(w) -> Word;
-    rt_tagged_box(w) -> Word;
-    rt_tagged_open(w) -> Word;
     rt_tick();
     rt_stack_more() -> Word;
-    rt_grow(entry, args) -> Word;
     rt_bitnot(a) -> Word;
     rt_inc_shared(w);
     rt_dec_shared(w);
-    rt_parallel(slots, n);
-    rt_parallel_past(slots, n, reach: *const Word, count);
-    rt_array_lookup(xs, i) -> Word;
     rt_note_update(in_place, copied);
-    rt_baked(text, len) -> Word;
-    rt_stored(w) -> Word;
     rt_node(kind) -> Word;
-    rt_node_writable(n) -> Word;
-    rt_list_writable(xs, room) -> Word;
-    rt_map_writable(m) -> Word;
 
     rt_alloc_bytes(bytes) -> Block;
     rt_alloc_kept(bytes) -> Block;

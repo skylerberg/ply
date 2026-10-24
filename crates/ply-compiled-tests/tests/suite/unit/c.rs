@@ -269,43 +269,15 @@ fn a_unit_compiles_loads_binds_and_answers() {
     assert_eq!(imm_value(answer), 42);
 }
 
-/// What a body's prologue does when its frame lies below the floor.
-#[derive(Clone, Copy)]
-enum Prologue {
-    /// Asks for room on the stack it runs on and goes on in its own frame.
-    MakesRoom,
-    /// As a released emitter writes it: makes the call again through `entry` with the arguments
-    /// in `args`, and returns what that answers.
-    Reenters,
-}
-
-/// The prologue a body opens with: the fuel it spends, and room made below the floor.
-fn prologue(kind: Prologue, entry: &str, args: &[&str]) -> String {
-    let below = match kind {
-        Prologue::MakesRoom => {
-            "if ((uintptr_t)&probe < ctx->stack_floor && !rt_stack_more_p(ctx)) return 0;"
-                .to_string()
-        }
-        Prologue::Reenters => {
-            let mut held = format!("Word ply_grown[{}];", args.len());
-            for (i, a) in args.iter().enumerate() {
-                held.push_str(&format!(" ply_grown[{i}] = {a};"));
-            }
-            format!(
-                "if ((uintptr_t)&probe < ctx->stack_floor) {{ {held} return rt_grow_p(ctx, (Word)(intptr_t)&{entry}, (Word)(intptr_t)ply_grown); }}"
-            )
-        }
-    };
-    format!(
-        "  if (ctx->fuel <= 0) {{ rt_no_fuel_p(ctx); return 0; }}\n\
-         \x20 {{ char probe; {below} }}\n\
-         \x20 ctx->fuel -= 1;\n"
-    )
-}
+/// The prologue a body opens with: the fuel it spends, and room asked for on the stack it runs on
+/// where its frame lies below the floor.
+const PROLOGUE: &str = "  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n\
+     \x20 { char probe; if ((uintptr_t)&probe < ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n\
+     \x20 ctx->fuel -= 1;\n";
 
 /// `ladder(n)` is `n` calls deep, none of them a tail call, each frame a kilobyte and more;
 /// `spin` has no base case.
-fn deep_calls(kind: Prologue) -> [units::Def; 2] {
+fn deep_calls() -> [units::Def; 2] {
     let ladder = units::symbol("m.ladder");
     let spin = units::symbol("m.spin");
     [
@@ -313,25 +285,23 @@ fn deep_calls(kind: Prologue) -> [units::Def; 2] {
             "m.ladder",
             1,
             &format!(
-                "{}  volatile char pad[1024];\n\
+                "{PROLOGUE}  volatile char pad[1024];\n\
                  \x20 int64_t n = ply_imm_value(p0);\n\
                  \x20 pad[n & 1023] = 1;\n\
                  \x20 Word r = ply_imm(0);\n\
                  \x20 if (n > 0) {{ r = {ladder}(ctx, ply_imm(n - 1)); if (ctx->failed) return 0; r = ply_imm(ply_imm_value(r) + pad[n & 1023]); }}\n\
                  \x20 ctx->fuel += 1;\n\
-                 \x20 return r;",
-                prologue(kind, &format!("{ladder}_entry"), &["p0"])
+                 \x20 return r;"
             ),
         ),
         def(
             "m.spin",
             1,
             &format!(
-                "{}  Word r = {spin}(ctx, ply_imm(ply_imm_value(p0) + 1));\n\
+                "{PROLOGUE}  Word r = {spin}(ctx, ply_imm(ply_imm_value(p0) + 1));\n\
                  \x20 if (ctx->failed) return 0;\n\
                  \x20 ctx->fuel += 1;\n\
-                 \x20 return ply_imm(ply_imm_value(r) + 1);",
-                prologue(kind, &format!("{spin}_entry"), &["p0"])
+                 \x20 return ply_imm(ply_imm_value(r) + 1);"
             ),
         ),
     ]
@@ -362,11 +332,11 @@ extern "C" fn enter_from_an_unknown_stack(arg: usize) {
     std::process::abort();
 }
 
-/// `m.ladder(DEEP)` of a unit whose bodies open with `kind`, begun on a stack the runtime does not
-/// know: what it answered, the chunks it grew by, and how it failed.
-fn ladder_from_an_unknown_stack(kind: Prologue) -> Option<(i64, u64, i64, Option<String>)> {
+/// `m.ladder(DEEP)` begun on a stack the runtime does not know: what it answered, the chunks it grew
+/// by, and how it failed.
+fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
     let dir = tempfile::tempdir().expect("a scratch directory");
-    let loaded = units::opened(dir.path(), &deep_calls(kind), |_| {})?;
+    let loaded = units::opened(dir.path(), &deep_calls(), |_| {})?;
     let (native, _) = loaded.expect("the unit loads");
     let mut ctx = native.context();
     ctx.begin(DEEP * 2);
@@ -395,24 +365,7 @@ fn ladder_from_an_unknown_stack(kind: Prologue) -> Option<(i64, u64, i64, Option
 /// stack is given one of its own.
 #[test]
 fn a_recursion_past_a_stacks_first_chunk_grows_it_in_place_and_answers() {
-    let Some((answer, grown, failed, raised)) = ladder_from_an_unknown_stack(Prologue::MakesRoom)
-    else {
-        return;
-    };
-    assert_eq!(failed, 0, "`m.ladder({DEEP})` raised: {raised:?}");
-    assert_eq!(answer, DEEP);
-    assert!(
-        grown >= 2,
-        "the call never crossed the floor twice: {grown}"
-    );
-}
-
-/// The prologue a released emitter writes re-enters the call through `rt_grow`, which makes room on
-/// the same stack, so code that release built nests on this runtime as deep as its fuel allows.
-#[test]
-fn a_released_prologue_grows_in_place_too() {
-    let Some((answer, grown, failed, raised)) = ladder_from_an_unknown_stack(Prologue::Reenters)
-    else {
+    let Some((answer, grown, failed, raised)) = ladder_from_an_unknown_stack() else {
         return;
     };
     assert_eq!(failed, 0, "`m.ladder({DEEP})` raised: {raised:?}");
@@ -431,7 +384,7 @@ fn a_recursion_past_a_threads_floor_fails_out_of_stack() {
         .stack_size(4 << 20)
         .spawn(|| {
             let dir = tempfile::tempdir().expect("a scratch directory");
-            let loaded = units::opened(dir.path(), &deep_calls(Prologue::MakesRoom), |_| {})?;
+            let loaded = units::opened(dir.path(), &deep_calls(), |_| {})?;
             let (native, _) = loaded.expect("the unit loads");
             let entry = native.entry("m.ladder").expect("`m.ladder` is taken");
             let mut ctx = native.context();
@@ -461,7 +414,7 @@ fn a_recursion_past_a_threads_floor_fails_out_of_stack() {
 #[test]
 fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
     let dir = tempfile::tempdir().expect("a scratch directory");
-    let Some(loaded) = units::opened(dir.path(), &deep_calls(Prologue::MakesRoom), |_| {}) else {
+    let Some(loaded) = units::opened(dir.path(), &deep_calls(), |_| {}) else {
         return;
     };
     let (native, _) = loaded.expect("the unit loads");

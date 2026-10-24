@@ -143,56 +143,6 @@ pub(crate) fn raise_error(ctx: &mut Ctx, d: Diagnostic) -> i64 {
     ctx.raise(d, message)
 }
 
-/// `Bytes::concat_all` over a list literal's pieces, without building the list. Takes the pieces.
-pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let pieces = args_of(args, n);
-    if pieces.iter().any(|w| heap::kind(*w) != KIND_BYTES) {
-        let xs = ctx.heap.list_from(pieces);
-        return builtin_over_values(ctx, Builtin::BytesConcatAll, &[xs]);
-    }
-    // A unique accumulator grows in place; a fresh buffer per step would be quadratic.
-    if let Some((&first, rest)) = pieces.split_first()
-        && heap::grows_in_place(first)
-    {
-        let mut out = first;
-        for w in rest {
-            out = ctx.heap.append(out, unsafe { bytes_of(obj(*w)) });
-            heap::dec(*w);
-        }
-        return out;
-    }
-    let total: usize = pieces
-        .iter()
-        .map(|w| unsafe { (*obj(*w)).len } as usize)
-        .sum();
-    if total <= 1 {
-        let one = pieces
-            .iter()
-            .find_map(|w| unsafe { bytes_of(obj(*w)) }.first().copied());
-        for w in pieces {
-            heap::dec(*w);
-        }
-        return ctx.heap.bytes(one.as_slice());
-    }
-    let out = ctx.heap.alloc_bytes(KIND_BYTES, total as u32);
-    let mut at = 0;
-    for w in pieces {
-        let piece = unsafe { bytes_of(obj(*w)) };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                piece.as_ptr(),
-                heap::bytes_ptr(out).add(at),
-                piece.len(),
-            );
-        }
-        at += piece.len();
-        heap::dec(*w);
-    }
-    unsafe { (*out).len = total as u32 };
-    out as Word
-}
-
 /// A witnessed operator over two immediates, when the witness is `Int` or a width compiled code
 /// holds as its `Int`: the answer, or `None` for the value path to give, or to raise, instead.
 pub(super) fn narrow_binary(op: i64, w: i64, a: i64, b: i64) -> Option<Word> {
@@ -652,7 +602,7 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
             if !all_bytes {
                 return None;
             }
-            // As `rt_bytes_join`: a unique first piece of a unique list grows in place.
+            // A unique first piece of a unique list grows in place.
             if heap::is_unique(*xs) {
                 let items = list::to_vec(o);
                 if let Some(&first) = items.first()

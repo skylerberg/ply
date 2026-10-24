@@ -5,7 +5,7 @@
 
 use crate::emitted::{Block, Handed, PlyFnDesc};
 use crate::frames::{self, PlyFrame, Snapshot};
-use crate::heap::{self, CLOSURE_CAPTURES, CLOSURE_CODE, HEADER, KIND_CLOSURE, Obj, Word, word_at};
+use crate::heap::{HEADER, Word};
 use crate::rt::{
     Ctx, FAILED_ABORT, FAILED_UNWIND, FrameClause, HandlerFrame, StackCopy, call_clause, call_fun,
     drop_frame, no_stack_to_take, release_fun, release_vars, switch_keeping,
@@ -30,8 +30,6 @@ pub struct Detached {
     /// Owned here, not by the entry frame, which every restored snapshot would release again.
     body: Word,
     ret: Word,
-    /// Whether `body` and `ret` are closures emitted code made.
-    emitted: bool,
     starting: Option<Word>,
     state: State,
     captures: Vec<Capture>,
@@ -58,11 +56,9 @@ enum State {
 }
 
 enum Stopped {
-    /// `emitted`: the clause is a closure emitted code made. `again`: it may resume the stop more
-    /// than once.
+    /// `again`: the clause may resume the stop more than once.
     Performed {
         closure: Word,
-        emitted: bool,
         args: Vec<Word>,
         again: bool,
     },
@@ -72,23 +68,17 @@ enum Stopped {
 
 const ONE_SHOT: &str = "the `handle` this continuation was captured in has already ended";
 
-/// `rt_handle_detached`: runs the body on a fresh stack until it stops; answers the handle's value.
-/// `ret` and `body` are closures emitted code made where `emitted`.
-pub(crate) unsafe fn open(
-    ctx: *mut Ctx,
-    clauses: Vec<FrameClause>,
-    ret: Word,
-    body: Word,
-    emitted: bool,
-) -> Word {
+/// `rt_handle_install_detached`: runs the body on a fresh stack until it stops; answers the
+/// handle's value.
+pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, body: Word) -> Word {
     drain(ctx);
     let c = unsafe { &mut *ctx };
     let Some(stack) = Stack::take() else {
         clauses.into_iter().for_each(FrameClause::release);
         if ret != 0 {
-            release_fun(emitted, ret);
+            release_fun(ret);
         }
-        release_fun(emitted, body);
+        release_fun(body);
         return no_stack_to_take(c);
     };
     let id = c.detached.len();
@@ -113,7 +103,6 @@ pub(crate) unsafe fn open(
         answer: 0,
         body,
         ret,
-        emitted,
         starting: Some(body),
         state: State::Fresh,
         captures: Vec::new(),
@@ -207,19 +196,18 @@ pub(crate) unsafe fn resume(
     match d.request.take() {
         Some(Stopped::Performed {
             closure,
-            emitted,
             mut args,
             again,
         }) => {
             d.state = State::Suspended;
             let k = capture_stop(ctx, id, again);
             let c = unsafe { &mut *ctx };
-            args.push(token(c, id, k, emitted));
+            args.push(token(c, id, k));
             // The clause works on its own copy of the variables, so each resumption it makes starts
             // from what the clause holds, whatever an earlier one did to the body's.
             let frames = c.detached[id].frames;
             let held = c.stacks[frames].list.first().and_then(|f| f.vars_copied());
-            let r = call_clause(ctx, closure, emitted, args, held);
+            let r = call_clause(ctx, closure, args, held);
             drain(ctx);
             r
         }
@@ -258,7 +246,7 @@ fn give_back(c: &mut Ctx, id: usize) {
     d.stack = None;
     for f in [std::mem::take(&mut d.body), std::mem::take(&mut d.ret)] {
         if f != 0 {
-            release_fun(d.emitted, f);
+            release_fun(f);
         }
     }
 }
@@ -347,7 +335,7 @@ fn restore(ctx: *mut Ctx, id: usize, k: usize) -> bool {
 pub(crate) unsafe fn stop(
     ctx: *mut Ctx,
     id: usize,
-    (closure, emitted): (Word, bool),
+    closure: Word,
     args: Vec<Word>,
     again: bool,
     owned: (Symbol, Symbol, Option<Symbol>),
@@ -358,7 +346,6 @@ pub(crate) unsafe fn stop(
     let d = &mut c.detached[id];
     d.request = Some(Stopped::Performed {
         closure,
-        emitted,
         args,
         again,
     });
@@ -388,8 +375,7 @@ extern "C" fn entry(arg: usize) {
         c.frames = frames::base();
         (id, body)
     };
-    let emitted = unsafe { &*ctx }.detached[id].emitted;
-    let mut r = call_fun(ctx, emitted, body, &[]);
+    let mut r = call_fun(ctx, body, &[]);
     let c = unsafe { &mut *ctx };
     let frames = c.detached[id].frames;
     let mut frame = c.stacks[frames].list.pop();
@@ -417,20 +403,14 @@ extern "C" fn entry(arg: usize) {
     {
         c.failed = 0;
         let clause = f.take_clause(a.clause);
-        r = call_clause(
-            ctx,
-            clause.closure,
-            clause.emitted,
-            a.args.handed(),
-            held.take(),
-        );
+        r = call_clause(ctx, clause.closure, a.args.handed(), held.take());
         clause.release();
         answered = true;
     }
     let c = unsafe { &mut *ctx };
     let ret = c.detached[id].ret;
     if c.failed == 0 && ret != 0 && !answered {
-        r = Ctx::holding(ctx, held.take(), || call_fun(ctx, emitted, ret, &[r]));
+        r = Ctx::holding(ctx, held.take(), || call_fun(ctx, ret, &[r]));
     }
     if let Some((_, v)) = held {
         release_vars(v);
@@ -452,26 +432,11 @@ extern "C" fn entry(arg: usize) {
     std::process::abort();
 }
 
-/// Whether `code` is a continuation's: the closure names a handler or a body that only the entry
-/// which captured it holds, so it means nothing to any other.
-pub(crate) fn is_continuation(code: usize) -> bool {
-    code == rt_resume_detached_entry as *const () as usize
-        || code == crate::rt::rt_resume_entry as *const () as usize
-}
-
-/// The `k` a clause off the tail is handed: a closure resuming the body from its capture, and the
-/// entry it was captured in. A clause emitted code made gets a block it calls and lets go of through
-/// [`TOKEN`]; any other, the runtime's closure over [`rt_resume_detached_entry`].
-fn token(c: &mut Ctx, id: usize, capture: usize, emitted: bool) -> Word {
+/// The `k` a clause off the tail is handed: a block resuming the body from its capture in the entry
+/// it was captured in, which the clause calls and lets go of through [`TOKEN`].
+fn token(c: &mut Ctx, id: usize, capture: usize) -> Word {
     let packed = ((id << 32) | capture) as Word;
     let entry = c.entry as Word;
-    if !emitted {
-        return crate::rt::closure_of(
-            c,
-            rt_resume_detached_entry as *const () as usize,
-            &[packed, entry],
-        );
-    }
     let block = Block::alloc(&mut c.heap, TOKEN_BYTES).word();
     unsafe {
         let words = (block as *mut Word).byte_add(HEADER);
@@ -543,49 +508,10 @@ fn unpacked(packed: i64) -> (usize, usize) {
     (packed >> 32, packed & 0xffff_ffff)
 }
 
-unsafe extern "C" fn rt_resume_detached_entry(ctx: *mut Ctx, args: *const i64) -> i64 {
-    let (packed, entry, v) = unsafe {
-        (
-            heap::imm_value(*args),
-            heap::imm_value(*args.add(1)),
-            *args.add(2),
-        )
-    };
-    let (id, k) = unpacked(packed);
-    let c = unsafe { &mut *ctx };
-    if !captured_here(c, entry, id, k) {
-        return c.fail(err_stale_continuation());
-    }
-    unsafe { resume(ctx, id, Some(k), Some(v)) }
-}
-
 /// Whether this entry captured stop `k` of body `id`. A token from another entry may carry an index
 /// this entry uses for a body of its own, or one past every body it has.
 fn captured_here(c: &Ctx, entry: i64, id: usize, k: usize) -> bool {
     entry == c.entry as i64 && c.detached.get(id).is_some_and(|d| k < d.captures.len())
-}
-
-/// Notes that the last holder of `o`, a runtime handle, let it go: where it is a continuation this
-/// entry captured, the stop it resumes is dropped at the next drain.
-///
-/// # Safety
-/// `o` is a live runtime handle, and `ctx` the running entry's.
-pub(crate) unsafe fn died(ctx: *mut Ctx, o: *mut Obj) {
-    let resumes_a_body = rt_resume_detached_entry as *const () as Word;
-    if unsafe { (*o).kind != KIND_CLOSURE || word_at(o, CLOSURE_CODE) != resumes_a_body } {
-        return;
-    }
-    let (packed, entry) = unsafe {
-        (
-            heap::imm_value(word_at(o, CLOSURE_CAPTURES)),
-            heap::imm_value(word_at(o, CLOSURE_CAPTURES + 1)),
-        )
-    };
-    let (id, k) = unpacked(packed);
-    let c = unsafe { &mut *ctx };
-    if captured_here(c, entry, id, k) {
-        c.continuations_died.push((id, k));
-    }
 }
 
 /// Drops every stop whose continuation died since the last drain, and every stop that dropping

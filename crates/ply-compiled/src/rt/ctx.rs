@@ -677,23 +677,18 @@ impl Ctx {
         let (stack, depth, clause) = at;
         let clause = &self.stacks[stack].list[depth].clauses[clause];
         let message = Value::str(message);
-        // An emitted clause takes the message as emitted code lays a `String`, lifted through the
-        // type its `handle` site handed.
-        let args = match (clause.emitted, clause.string) {
-            (false, _) => Raised::Words(vec![self.word(&message)]),
-            (true, Some(ty)) => {
-                let Some(w) = lifted(self, &message, ty) else {
-                    return 0;
-                };
-                Raised::Carried(vec![unsafe { Carried::new(w, ty) }])
-            }
-            (true, None) => {
-                return self.fail(
-                    error("an `abort.raise` clause emitted code installed has no `String` type")
-                        .note("this is Ply's fault, not the program's"),
-                );
-            }
+        // The clause takes the message as emitted code lays a `String`, lifted through the type its
+        // `handle` site handed.
+        let Some(ty) = clause.string else {
+            return self.fail(
+                error("an `abort.raise` clause emitted code installed has no `String` type")
+                    .note("this is Ply's fault, not the program's"),
+            );
         };
+        let Some(w) = lifted(self, &message, ty) else {
+            return 0;
+        };
+        let args = Raised(vec![unsafe { Carried::new(w, ty) }]);
         self.bind_raise(at, args, d)
     }
 

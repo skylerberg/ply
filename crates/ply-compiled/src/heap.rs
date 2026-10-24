@@ -814,9 +814,6 @@ pub fn field_word(heap: &mut Heap, layouts: &Layouts, o: *mut Obj, at: usize, sl
 /// A closure's payload: its compiled code's address first, then the captured values.
 pub const CLOSURE_CODE: usize = 0;
 pub const CLOSURE_CAPTURES: usize = 1;
-/// A closure flag: its first capture is the immediate address of the descriptor compiled code
-/// reads to call it by its type.
-pub const CLOSURE_DESCRIBED: u8 = 16;
 
 /// A bridge's payload: one owned `Value`.
 const BRIDGE_BYTES: usize = std::mem::size_of::<Value>();
@@ -1507,16 +1504,14 @@ unsafe fn sized_as(o: *mut Obj, heap: *mut Heap, object: usize) {
 }
 
 /// Gives back a runtime handle whose last holder was emitted code, with what the runtime keeps for
-/// it, and without a walk: a bridge's value is dropped, and a hold's or a continuation's words are
-/// left unread, emitted code having let go of what a hold held.
+/// it, and without a walk: a bridge's value is dropped, and a hold's words are left unread,
+/// emitted code having let go of what it held.
 pub(crate) unsafe fn free_handle(o: *mut Obj, heap: *mut Heap) {
     unsafe {
         debug_assert!(((*o).rc == SHARED || (*o).rc == 1) && (*o).kind != KIND_DEAD);
         match (*o).kind {
             KIND_BRIDGE => std::ptr::drop_in_place(bridge_slot(o)),
-            KIND_CLOSURE
-                if crate::rt::hold_id(o as Word).is_some()
-                    || crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize) => {}
+            KIND_CLOSURE if crate::rt::hold_id(o as Word).is_some() => {}
             kind => {
                 panic!("`rt_handle_free` was handed an object of kind {kind}, which is no handle")
             }
@@ -2325,19 +2320,10 @@ impl Heap {
                         let captured: Vec<Value> = (CLOSURE_CAPTURES..(*o).len as usize)
                             .map(|i| Heap::to_value_counted(layouts, word_at(o, i), walked))
                             .collect();
-                        // Only the code tells: a continuation's captures are plain immediates.
-                        if crate::detached::is_continuation(code) {
-                            ClosureKind::Continuation {
-                                code,
-                                arity,
-                                captured,
-                            }
-                        } else {
-                            ClosureKind::Native {
-                                code,
-                                arity,
-                                captured,
-                            }
+                        ClosureKind::Native {
+                            code,
+                            arity,
+                            captured,
                         }
                     };
                     Value::Closure(Arc::new(Closure { name: None, kind }))
@@ -2480,9 +2466,6 @@ pub fn share(words: &[Word]) -> bool {
         let stays = unsafe {
             match (*o).kind {
                 KIND_BRIDGE => crosses_threads(bridged(o)),
-                KIND_CLOSURE => {
-                    !crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize)
-                }
                 KIND_REFUSED => refused("share"),
                 _ => true,
             }
@@ -2721,12 +2704,8 @@ pub fn world_independent(w: Word) -> bool {
         let o = obj(w);
         unsafe {
             match (*o).kind {
-                // A continuation's captures are immediates naming a body its entry alone holds, and
-                // a hold is its entry's.
-                KIND_CLOSURE
-                    if crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize)
-                        || crate::rt::hold_id(w).is_some() =>
-                {
+                // A hold is its entry's.
+                KIND_CLOSURE if crate::rt::hold_id(w).is_some() => {
                     return false;
                 }
                 KIND_BRIDGE => {

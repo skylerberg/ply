@@ -159,29 +159,6 @@ pub unsafe extern "C" fn rt_cost_spent(ctx: *mut Ctx, mark: I64, _f: I64) {
     c.lift_from(w.finish(), Vec::new());
 }
 
-/// The value of the pure nullary function at `index`, memoized when world-independent.
-pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
-    let tables = Arc::clone(&unsafe { &*ctx }.tables);
-    if let Some(w) = tables.memoized(index as usize) {
-        let c = unsafe { &mut *ctx };
-        c.charged = c.charged.plus(tables.memo_cost(index as usize));
-        return w;
-    }
-    let before = unsafe { &*ctx }.cost();
-    // SAFETY: as in `call_value`; a nullary function never reads the null argument pointer.
-    let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(tables.functions[index as usize]) };
-    let w = unsafe { f(ctx, std::ptr::null()) };
-    let c = unsafe { &mut *ctx };
-    if c.failed != 0 {
-        return 0;
-    }
-    // The memo keeps a copy; the entry keeps using its own word.
-    if heap::world_independent(w) {
-        tables.memoize_costing(index as usize, w, c.cost().minus(before));
-    }
-    w
-}
-
 /// A read of the pure nullary definition at `index` in the unit's code table, which emitted code
 /// writes for a constant's read: its value's word form. The first read evaluates the definition and
 /// hands `keep`, the `keep#T` root of its type, the value, whose immortal copy the unit then keeps
@@ -224,55 +201,6 @@ pub unsafe extern "C" fn rt_memo(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> H
         tables.keep(index, kept, cost);
     }
     Handed::of(w)
-}
-
-/// The value a unit holds as `len` bytes of text at `text`: what a build kept of a `const`
-/// definition, read into the unit's own heap, so the entry that reads it is charged nothing.
-pub unsafe extern "C" fn rt_baked(ctx: *mut Ctx, text: i64, len: i64) -> i64 {
-    let c = unsafe { &mut *ctx };
-    let tables = Arc::clone(&c.tables);
-    let text = unsafe { std::slice::from_raw_parts(text as *const u8, len as usize) };
-    let read = crate::stored::read(
-        &tables.layouts,
-        &tables.nullaries,
-        &mut lock(&tables.immortals),
-        text,
-    );
-    match read {
-        Ok(w) => w,
-        Err(why) => c.fail(
-            Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!("the value a build kept of a `const` definition does not read: {why}"),
-            )
-            .primary(Span::DUMMY, "in compiled code")
-            .note("this is Ply's fault: a unit holds only values this runtime wrote"),
-        ),
-    }
-}
-
-/// `w` as the text [`rt_baked`] reads back, a `Bytes`. Reads `w`.
-pub unsafe extern "C" fn rt_stored(ctx: *mut Ctx, w: i64) -> i64 {
-    let c = unsafe { &mut *ctx };
-    let tables = Arc::clone(&c.tables);
-    match crate::stored::text(&tables.layouts, w) {
-        Ok(text) if u32::try_from(text.len()).is_ok() => c.heap.bytes(&text),
-        Ok(text) => c.fail(error(format!(
-            "a value of {} stored bytes has no stored form",
-            text.len()
-        ))),
-        Err(what) => c.fail(error(format!("{what} has no stored form"))),
-    }
-}
-
-/// A call through a value. Takes the callee and the arguments. A closure this call holds the only
-/// count of is never called again, so it gives the call its captures rather than sharing them.
-pub unsafe extern "C" fn rt_call(ctx: *mut Ctx, callee: i64, args: *const i64, n: i64) -> i64 {
-    let args = args_of(args, n);
-    let give = heap::kind(callee) == KIND_CLOSURE && is_unique(callee);
-    let r = applied(ctx, callee, args, give);
-    heap::dec(callee);
-    r
 }
 
 /// Applies `callee` to `args`, or answers 0 with the context failed. Reads the callee, takes the

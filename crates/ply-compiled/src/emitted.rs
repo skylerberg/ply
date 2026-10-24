@@ -55,17 +55,13 @@ impl Block {
         unsafe { heap::last_of_shared(o) }
     }
 
-    /// Gives back a runtime handle whose last holder was the caller. A continuation's stop is dropped
-    /// at the next drain of the entry's dead continuations.
+    /// Gives back a runtime handle whose last holder was the caller.
     ///
     /// # Safety
-    /// The block is a live handle the runtime made: a bridge, a hold or a continuation; `ctx` is
-    /// the running entry's.
+    /// The block is a live handle the runtime made, a bridge or a hold; `ctx` is the running
+    /// entry's.
     pub unsafe fn free_handle(self, ctx: *mut Ctx) {
-        unsafe {
-            crate::detached::died(ctx, self.obj());
-            heap::free_handle(self.obj(), &raw mut (*ctx).heap);
-        }
+        unsafe { heap::free_handle(self.obj(), &raw mut (*ctx).heap) }
     }
 
     /// One holder more, counted as emitted code's `ply_dup` counts one: an immortal block keeps its
