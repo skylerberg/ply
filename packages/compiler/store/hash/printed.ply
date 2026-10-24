@@ -11,8 +11,8 @@ import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMat
                      EParallel, ETagged, EHole, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign,
                      Param, MatchArm, HandleClause, ReturnClause, HandlerVar, RecField, NamedArg,
                      Hole, RaiseName)
-import syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, RowExpr, AtomExpr, MWrite,
-                           Generics)
+import syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, RowExpr, AtomExpr, Mode,
+                           MWrite, Generics)
 import syntax.items (Module, Item, IFn, IType, IEffect, ITest, IInstance, INumeric, FnDef, TypeDef,
                      TDAlias, TDSum, TDNominal, TDExtern, VariantDef, EffectDef, OpDef, TestDef,
                      Constraint, NKey, NShow, ReturnsFresh, ReturnsParam, VPub)
@@ -29,18 +29,20 @@ import std.string
 import store.hash.encoding (hex, Choice, Slot)
 import store.hash.forms (member_hash)
 import store.hash.stored
-import store.hash.stored (Ref, Hashed, Member, Itself, ByName, Free, Literal, IntLit, FixedLit,
-                          WideLit, BoolLit, StrLit, BytesLit, EmbeddedLit, FloatLit, DecimalLit,
-                          CharLit, UnitLit, Local, Defined, Constructed, Unbound, Value, Label,
-                          LabelParam, LabelName, Effect, Declared, EffectUnbound, TypeParam,
-                          TypeDefined, TypeUnbound, Ty, Applied, AppliedOver, Function, Fields,
-                          UnitType, RowParam, RowName, Row, Moded, OfOp, Pat, Wild, Bind, Again,
-                          LitPat, RangePat, CtorPat, RecordPat, ListPat, OrPat, InFull, Among,
-                          Constant, Unwritten, Var, Binary, Unary, Lambda, App, OnValue, If, Match,
-                          Record, RecordUpdate, Field, ListOf, Perform, Handle, WithHold, Simulate,
-                          Parallel, Tagged, Filled, TryBlock, Block, One, Commuting, Let, LetElse,
-                          Effectful, Assign, Unstated, Fresh, ParamReturned, Alias, Sum, Nominal,
-                          Extern, FnOf, TypeOf, EffectOf, TestOf, LawOf, SpecOf, Stored, stored_bin)
+import store.hash.stored (Reference, Hashed, Member, Itself, ByName, Free, Literal, IntLiteral,
+                          FixedLiteral, WideLiteral, BoolLiteral, StringLiteral, BytesLiteral,
+                          EmbeddedLiteral, FloatLiteral, DecimalLiteral, CharLiteral, UnitLiteral,
+                          Local, Defined, Constructed, Unbound, Value, Label, LabelParameter,
+                          LabelName, Effect, Declared, EffectUnbound, TypeParameter, TypeDefined,
+                          TypeUnbound, Type, Applied, AppliedOver, Function, Fields, UnitType,
+                          RowParameter, RowName, Row, Moded, OfOperation, Wild, Bind, Again,
+                          LiteralPattern, RangePattern, ConstructorPattern, RecordPattern,
+                          ListPattern, OrPattern, InFull, Among, Constant, Unwritten, Variable,
+                          Binary, Unary, Lambda, Call, OnValue, If, Match, Record, RecordUpdate,
+                          Field, ListOf, Perform, Handle, WithHold, Simulate, Parallel, Tagged,
+                          Filled, TryBlock, Block, One, Commuting, Let, LetElse, Effectful, Assign,
+                          Unstated, Fresh, ParameterReturned, Alias, Sum, Nominal, Extern,
+                          FunctionOf, TypeOf, EffectOf, TestOf, LawOf, SpecOf, Stored, stored_bin)
 
 // --- The hash table ----------------------------------------------------------------------
 
@@ -181,10 +183,14 @@ type Naming = {
 /// How many value, type, row and label binders are in scope: each is named by its level.
 type Depth = { values: Int, types: Int, rows: Int, labels: Int }
 
-type Out<a> = { naming: Naming, node: a }
+/// A node the namer built, and the naming it leaves.
+type Spelled<a> = { naming: Naming, node: a }
 
 /// A pattern named, and the binders it leaves in scope.
 type Bound = { naming: Naming, depth: Depth, node: Pattern }
+
+/// Patterns named in order, and the binders they leave in scope.
+type BoundAll = { naming: Naming, depth: Depth, node: List<Pattern> }
 
 /// A statement named, and the binders it leaves in scope.
 type Said = { naming: Naming, depth: Depth, node: Stmt }
@@ -201,23 +207,54 @@ fn space_name(at: Int) -> Bytes = b"_s".concat(ascii_of_int(at))
 
 fn short_hex(h: Bytes) -> Bytes / {abort.raise} = hex(h).slice(0, 12)
 
-fn id(name: Bytes) -> Ident = { name: name, span: dummy_span() }
+fn ident(name: Bytes) -> Ident = { name: name, span: dummy_span() }
 
-fn bare_q(name: Bytes) -> QName = { module: None, name: id(name), span: dummy_span() }
+fn unqualified(name: Bytes) -> QName = { module: None, name: ident(name), span: dummy_span() }
 
-fn free_q(f: Free) -> QName =
-  match f.module {
-    Some(m) -> { module: Some(id(m)), name: id(f.name), span: dummy_span() },
-    None -> bare_q(f.name),
+fn free_name(free: Free) -> QName =
+  match free.module {
+    Some(module) -> { module: Some(ident(module)), name: ident(free.name), span: dummy_span() },
+    None -> unqualified(free.name),
   }
 
 /// A qualified name as one identifier, as a call on a value writes the function it names in full.
-fn q_text(q: QName) -> Bytes =
-  match q.module { Some(m) -> Bytes::concat_all([m.name, b"::", q.name.name]), None -> q.name.name }
+fn qualified_text(name: QName) -> Bytes =
+  match name.module {
+    Some(module) -> Bytes::concat_all([module.name, b"::", name.name.name]),
+    None -> name.name.name,
+  }
 
 /// What a `{ e }` is to the parser: the block a branch, a test or a fallback is written as.
-fn as_block(e: Expr) -> Expr =
-  match e { EBlock(_) -> e, _ -> EBlock({ span: dummy_span(), tail: Some(e), stmts: [] }) }
+fn as_block(expression: Expr) -> Expr =
+  match expression {
+    EBlock(_) -> expression,
+    _ -> EBlock({ span: dummy_span(), tail: Some(expression), stmts: [] }),
+  }
+
+/// `items` named in order, each under the naming the ones before it left.
+fn named_in_turn<a, b>(
+  naming: Naming,
+  items: List<a>,
+  name_one: (Naming, a) -> Spelled<b> / {abort.raise},
+) -> Spelled<List<b>> / {abort.raise} =
+  items.fold({ naming: naming, node: [] }, |acc: Spelled<List<b>>, item: a| {
+    let spelled = name_one(acc.naming, item);
+    { naming: spelled.naming, node: acc.node.push(spelled.node) }
+  })
+
+/// `item` named, where there is one.
+fn named_if_any<a, b>(
+  naming: Naming,
+  item: Option<a>,
+  name_one: (Naming, a) -> Spelled<b> / {abort.raise},
+) -> Spelled<Option<b>> / {abort.raise} =
+  match item {
+    None -> { naming: naming, node: None },
+    Some(present) -> {
+      let spelled = name_one(naming, present);
+      { naming: spelled.naming, node: Some(spelled.node) }
+    },
+  }
 
 // --- Naming references -------------------------------------------------------------------------
 
@@ -288,87 +325,102 @@ fn pick(
 /// What a filled reference is: a hash and, for a member of the component being printed, its class.
 type Target = { hash: Bytes, class: Int }
 
-fn target(printer: BodyPrinter, n: Naming, r: Ref) -> Out<Target> / {abort.raise} =
-  match r {
-    Hashed(stored) -> {
-      let h = match printer.layout.relink.get(stored) { Some(to) -> to, None -> stored };
+fn target_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  reference: Reference,
+) -> Spelled<Target> / {abort.raise} =
+  match reference {
+    Hashed(written) -> {
+      let hash = match printer.layout.relink.get(written) { Some(to) -> to, None -> written };
       {
-        naming: if printer.layout.by_hash.contains(h) { n }
-        else { { ..n, missing: n.missing.insert(h, true) } },
-        node: { hash: h, class: 0 - 1 },
+        naming: if printer.layout.by_hash.contains(hash) { naming }
+        else { { ..naming, missing: naming.missing.insert(hash, true) } },
+        node: { hash: hash, class: 0 - 1 },
       }
     },
-    Member(c) -> {
+    Member(class) -> {
       let hashes = if printer.part < 0 { [] }
       else { printer.layout.parts.get(printer.part).hashes };
-      if c >= hashes.len() { panic("a reference to a member this component does not have") }
-      else { { naming: n, node: { hash: hashes.get(c), class: c } } }
+      if class >= hashes.len() { panic("a reference to a member this component does not have") }
+      else { { naming: naming, node: { hash: hashes.get(class), class: class } } }
     },
     Itself -> panic("a stored body refers to its own definition by no hash"),
     ByName(_) -> panic("a stored body names a definition by its name"),
   }
 
-/// The name `t` is printed under, its module imported where it is another's; `ctor` names a
-/// constructor of the type `t` is.
+/// The name `target` is printed under, its module imported where it is another's; `constructor`
+/// names a constructor of the type `target` is.
 fn named(
   printer: BodyPrinter,
-  n: Naming,
-  t: Target,
-  ctor: Option<Bytes>,
-) -> Out<QName> / {abort.raise} = {
+  naming: Naming,
+  target: Target,
+  constructor: Option<Bytes>,
+) -> Spelled<QName> / {abort.raise} = {
   // One body under two modules' names: the checker tells them apart where the hash does not.
-  let meant = |s: Slot| {
-    let p = printer.layout.parts.get(s.part);
-    printer.meant.contains(qualify(p.module, p.names.get(s.class)))
+  let meant = |slot: Slot| {
+    let part = printer.layout.parts.get(slot.part);
+    printer.meant.contains(qualify(part.module, part.names.get(slot.class)))
   };
-  let told = match printer.layout.by_hash.get(t.hash) {
+  let told = match printer.layout.by_hash.get(target.hash) {
     Some(slots) -> slots.filter(meant).len() > 0,
     None -> false,
   };
-  let found = if t.class >= 0 { Some({ part: printer.part, class: t.class }) } else {
-    pick(printer.layout, printer.graph, n.imports, t.hash, printer.own, |s: Slot| !told || meant(s))
+  let found = if target.class >= 0 { Some({ part: printer.part, class: target.class }) } else {
+    pick(printer.layout, printer.graph, naming.imports, target.hash, printer.own, |slot: Slot|
+      !told || meant(slot))
   };
   match found {
     // A body with no name this module may write is filed with the ones it has no body for: either
     // way the reference cannot be printed, and a refusal names it rather than a name standing in.
     None ->
       {
-        naming: { ..n, missing: n.missing.insert(t.hash, true) },
-        node: bare_q(match ctor { Some(c) -> c, None -> short_hex(t.hash) }),
+        naming: { ..naming, missing: naming.missing.insert(target.hash, true) },
+        node: unqualified(match constructor {
+          Some(given) -> given,
+          None -> short_hex(target.hash),
+        }),
       },
-    Some(s) -> {
-      let p = printer.layout.parts.get(s.part);
-      let name = match ctor { Some(c) -> c, None -> p.names.get(s.class) };
-      if p.module == printer.own { { naming: n, node: bare_q(name) } } else {
+    Some(slot) -> {
+      let part = printer.layout.parts.get(slot.part);
+      let name = match constructor { Some(given) -> given, None -> part.names.get(slot.class) };
+      if part.module == printer.own { { naming: naming, node: unqualified(name) } } else {
         {
-          naming: { ..n, imports: n.imports.insert(p.module, p.binder) },
-          node: { module: Some(id(p.binder)), name: id(name), span: dummy_span() },
+          naming: { ..naming, imports: naming.imports.insert(part.module, part.binder) },
+          node: { module: Some(ident(part.binder)), name: ident(name), span: dummy_span() },
         }
       }
     },
   }
 }
 
-fn named_ref(
+fn reference_named(
   printer: BodyPrinter,
-  n: Naming,
-  r: Ref,
-  ctor: Option<Bytes>,
-) -> Out<QName> / {abort.raise} = {
-  let t = target(printer, n, r);
-  named(printer, t.naming, t.node, ctor)
+  naming: Naming,
+  reference: Reference,
+  constructor: Option<Bytes>,
+) -> Spelled<QName> / {abort.raise} = {
+  let target = target_of(printer, naming, reference);
+  named(printer, target.naming, target.node, constructor)
 }
 
-/// `t`, a function a call on a value may be, with its module imported where the module being
+/// `target`, a function a call on a value may be, with its module imported where the module being
 /// printed may name it: the call is answered among the modules its own can see.
-fn seen(printer: BodyPrinter, n: Naming, t: Target) -> Naming / {abort.raise} =
-  if t.class >= 0 { n } else {
-    match pick(printer.layout, printer.graph, n.imports, t.hash, printer.own, |_: Slot| true) {
-      None -> n,
-      Some(s) -> {
-        let p = printer.layout.parts.get(s.part);
-        if p.module == printer.own { n }
-        else { { ..n, imports: n.imports.insert(p.module, p.binder) } }
+fn seen(printer: BodyPrinter, naming: Naming, target: Target) -> Naming / {abort.raise} =
+  if target.class >= 0 { naming } else {
+    match pick(
+        printer.layout,
+        printer.graph,
+        naming.imports,
+        target.hash,
+        printer.own,
+        |_: Slot| true,
+      ) {
+      None -> naming,
+      Some(slot) -> {
+        let part = printer.layout.parts.get(slot.part);
+        if part.module == printer.own { naming }
+        else { { ..naming, imports: naming.imports.insert(part.module, part.binder) } }
       },
     }
   }
@@ -395,27 +447,33 @@ fn names_body(
 /// making an interpolated or a byte string.
 fn tag_binder(
   printer: BodyPrinter,
-  n: Naming,
-  t: Target,
+  naming: Naming,
+  target: Target,
   parser: Bytes,
   filler: Option<Bytes>,
-) -> Out<Ident> / {abort.raise} = {
+) -> Spelled<Ident> / {abort.raise} = {
   let layout = printer.layout;
-  let found = pick(layout, printer.graph, n.imports, t.hash, printer.own, |s: Slot| {
-    let p = layout.parts.get(s.part);
-    p.module != printer.own && p.names.get(s.class) == parser && p.binder != b"f"
-      && p.binder != b"b"
+  let found = pick(layout, printer.graph, naming.imports, target.hash, printer.own, |slot: Slot| {
+    let part = layout.parts.get(slot.part);
+    part.module != printer.own && part.names.get(slot.class) == parser && part.binder != b"f"
+      && part.binder != b"b"
       && (match filler {
         None -> true,
-        Some(hash) -> names_body(layout, p.module, hash, b"fill", printer.own),
+        Some(hash) -> names_body(layout, part.module, hash, b"fill", printer.own),
       })
   });
   match found {
     None ->
-      { naming: { ..n, missing: n.missing.insert(t.hash, true) }, node: id(short_hex(t.hash)) },
-    Some(s) -> {
-      let p = layout.parts.get(s.part);
-      { naming: { ..n, imports: n.imports.insert(p.module, p.binder) }, node: id(p.binder) }
+      {
+        naming: { ..naming, missing: naming.missing.insert(target.hash, true) },
+        node: ident(short_hex(target.hash)),
+      },
+    Some(slot) -> {
+      let part = layout.parts.get(slot.part);
+      {
+        naming: { ..naming, imports: naming.imports.insert(part.module, part.binder) },
+        node: ident(part.binder),
+      }
     },
   }
 }
@@ -423,24 +481,24 @@ fn tag_binder(
 /// Two effects declared alike share a hash, and only the slot tells them apart.
 fn effect_named(
   printer: BodyPrinter,
-  n: Naming,
-  e: Effect<Ref, Int>,
-) -> Out<QName> / {abort.raise} =
-  match e {
-    EffectUnbound(free) -> { naming: n, node: free_q(free) },
-    Declared(r, slot) -> {
-      let t = target(printer, n, r);
-      match t.naming.slots.get(t.node.hash) {
+  naming: Naming,
+  performed: Effect<Reference, Int>,
+) -> Spelled<QName> / {abort.raise} =
+  match performed {
+    EffectUnbound(free) -> { naming: naming, node: free_name(free) },
+    Declared(reference, slot) -> {
+      let target = target_of(printer, naming, reference);
+      match target.naming.slots.get(target.node.hash) {
         Some(was) -> if was != slot {
           panic(
             "two distinct effects share one declaration, which a hash-keyed body cannot tell apart",
           )
-        } else { named(printer, t.naming, t.node, None) },
+        } else { named(printer, target.naming, target.node, None) },
         None ->
           named(
             printer,
-            { ..t.naming, slots: t.naming.slots.insert(t.node.hash, slot) },
-            t.node,
+            { ..target.naming, slots: target.naming.slots.insert(target.node.hash, slot) },
+            target.node,
             None,
           ),
       }
@@ -449,211 +507,220 @@ fn effect_named(
 
 fn value_named(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  v: Value<Ref, Int>,
-) -> Out<QName> / {abort.raise} =
-  match v.named {
-    Local(l) -> if l >= d.values { panic("a local that is not in scope") }
-    else { { naming: n, node: bare_q(local_name(l)) } },
-    Defined(r) -> named_ref(printer, n, r, None),
-    Constructed(r, name) -> named_ref(printer, n, r, Some(name)),
-    Unbound(free) -> { naming: n, node: free_q(free) },
+  naming: Naming,
+  depth: Depth,
+  value: Value<Reference, Int>,
+) -> Spelled<QName> / {abort.raise} =
+  match value.named {
+    Local(level) -> if level >= depth.values { panic("a local that is not in scope") }
+    else { { naming: naming, node: unqualified(local_name(level)) } },
+    Defined(reference) -> reference_named(printer, naming, reference, None),
+    Constructed(reference, name) -> reference_named(printer, naming, reference, Some(name)),
+    Unbound(free) -> { naming: naming, node: free_name(free) },
   }
 
-fn label_of(d: Depth, l: Label) -> Ident / {abort.raise} =
-  match l {
-    LabelParam(x) -> if x >= d.labels { panic("a label parameter that is not in scope") }
-    else { id(label_name(x)) },
-    LabelName(name) -> id(name),
+fn label_of(depth: Depth, label: Label) -> Ident / {abort.raise} =
+  match label {
+    LabelParameter(level) -> if level >= depth.labels {
+      panic("a label parameter that is not in scope")
+    } else { ident(label_name(level)) },
+    LabelName(name) -> ident(name),
   }
+
+fn optional_label_of(depth: Depth, label: Option<Label>) -> Option<Ident> / {abort.raise} =
+  match label { Some(given) -> Some(label_of(depth, given)), None -> None }
 
 // --- Types -------------------------------------------------------------------------------------
 
-fn tys(
+fn types_of(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  ts: List<Ty<Ref, Int>>,
-) -> Out<List<TypeExpr>> / {abort.raise} =
-  ts.fold({ naming: n, node: [] }, |acc: Out<List<TypeExpr>>, t: Ty<Ref, Int>| {
-    let x = ty_of(printer, acc.naming, d, t);
-    { naming: x.naming, node: acc.node.push(x.node) }
-  })
+  naming: Naming,
+  depth: Depth,
+  types: List<Type<Reference, Int>>,
+) -> Spelled<List<TypeExpr>> / {abort.raise} =
+  named_in_turn(naming, types, |so_far: Naming, each: Type<Reference, Int>|
+    type_of(printer, so_far, depth, each))
 
-fn opt_ty(
+fn optional_type_of(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  t: Option<Ty<Ref, Int>>,
-) -> Out<Option<TypeExpr>> / {abort.raise} =
-  match t {
-    None -> { naming: n, node: None },
-    Some(x) -> {
-      let y = ty_of(printer, n, d, x);
-      { naming: y.naming, node: Some(y.node) }
-    },
-  }
+  naming: Naming,
+  depth: Depth,
+  annotation: Option<Type<Reference, Int>>,
+) -> Spelled<Option<TypeExpr>> / {abort.raise} =
+  named_if_any(naming, annotation, |so_far: Naming, present: Type<Reference, Int>|
+    type_of(printer, so_far, depth, present))
 
 fn type_named(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  name: stored::TypeName<Ref>,
-) -> Out<QName> / {abort.raise} =
+  naming: Naming,
+  depth: Depth,
+  name: stored::TypeName<Reference>,
+) -> Spelled<QName> / {abort.raise} =
   match name {
-    TypeParam(l) -> if l >= d.types { panic("a type parameter out of scope") }
-    else { { naming: n, node: bare_q(type_var_name(l)) } },
-    TypeDefined(r) -> named_ref(printer, n, r, None),
-    TypeUnbound(free) -> { naming: n, node: free_q(free) },
+    TypeParameter(level) -> if level >= depth.types { panic("a type parameter out of scope") }
+    else { { naming: naming, node: unqualified(type_var_name(level)) } },
+    TypeDefined(reference) -> reference_named(printer, naming, reference, None),
+    TypeUnbound(free) -> { naming: naming, node: free_name(free) },
   }
 
-fn ty_of(
+fn type_of(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  t: Ty<Ref, Int>,
-) -> Out<TypeExpr> / {abort.raise} =
-  match t {
-    Applied(TypeParam(l), _, args) -> if l >= d.types || args.len() > 0 {
+  naming: Naming,
+  depth: Depth,
+  original: Type<Reference, Int>,
+) -> Spelled<TypeExpr> / {abort.raise} =
+  match original {
+    Applied(TypeParameter(level), _, arguments) -> if level >= depth.types || arguments.len() > 0 {
       panic("a type parameter out of scope, or applied")
-    } else { { naming: n, node: TVar(id(type_var_name(l))) } },
-    Applied(name, _, args) -> {
-      let q = type_named(printer, n, d, name);
-      let xs = tys(printer, q.naming, d, args);
+    } else { { naming: naming, node: TVar(ident(type_var_name(level))) } },
+    Applied(name, _, arguments) -> {
+      let head = type_named(printer, naming, depth, name);
+      let spelled = types_of(printer, head.naming, depth, arguments);
       {
-        naming: xs.naming,
-        node: TCon({ span: dummy_span(), name: q.node, args: xs.node, labels: [], rows: [] }),
-      }
-    },
-    AppliedOver(name, _, args, labels, rows) -> {
-      let q = type_named(printer, n, d, name);
-      let xs = tys(printer, q.naming, d, args);
-      let rs = rows.fold(
-        { naming: xs.naming, node: [] },
-        |acc: Out<List<RowExpr>>, r: Row<Ref, Int>| {
-          let x = row_of(printer, acc.naming, d, r);
-          { naming: x.naming, node: acc.node.push(x.node) }
-        },
-      );
-      {
-        naming: rs.naming,
+        naming: spelled.naming,
         node: TCon({
           span: dummy_span(),
-          name: q.node,
-          args: xs.node,
-          labels: labels.map(|l: Label| label_of(d, l)),
-          rows: rs.node,
+          name: head.node,
+          args: spelled.node,
+          labels: [],
+          rows: [],
         }),
       }
     },
-    Function(params, ret, r) -> {
-      let ps = tys(printer, n, d, params);
-      let rt = ty_of(printer, ps.naming, d, ret);
-      let rw = opt_row(printer, rt.naming, d, r);
+    AppliedOver(name, _, arguments, labels, rows) -> {
+      let head = type_named(printer, naming, depth, name);
+      let spelled = types_of(printer, head.naming, depth, arguments);
+      let spelled_rows = named_in_turn(
+        spelled.naming,
+        rows,
+        |so_far: Naming, row: Row<Reference, Int>| row_of(printer, so_far, depth, row),
+      );
       {
-        naming: rw.naming,
-        node: TFn({ span: dummy_span(), params: ps.node, ret: rt.node, effects: rw.node }),
+        naming: spelled_rows.naming,
+        node: TCon({
+          span: dummy_span(),
+          name: head.node,
+          args: spelled.node,
+          labels: labels.map(|label: Label| label_of(depth, label)),
+          rows: spelled_rows.node,
+        }),
       }
     },
-    Fields(fs) -> {
-      let xs = fs.fold(
-        { naming: n, node: [] },
-        |acc: Out<List<{ name: Ident, ty: TypeExpr }>>, f: stored::TyField<Ref, Int>| {
-          let x = ty_of(printer, acc.naming, d, f.ty);
-          { naming: x.naming, node: acc.node.push({ name: id(f.name), ty: x.node }) }
+    Function(parameters, returned, row) -> {
+      let spelled_parameters = types_of(printer, naming, depth, parameters);
+      let spelled_returned = type_of(printer, spelled_parameters.naming, depth, returned);
+      let spelled_row = optional_row_of(printer, spelled_returned.naming, depth, row);
+      {
+        naming: spelled_row.naming,
+        node: TFn({
+          span: dummy_span(),
+          params: spelled_parameters.node,
+          ret: spelled_returned.node,
+          effects: spelled_row.node,
+        }),
+      }
+    },
+    Fields(fields) -> {
+      let spelled = named_in_turn(
+        naming,
+        fields,
+        |so_far: Naming, field: stored::TypeField<Reference, Int>| {
+          let field_type = type_of(printer, so_far, depth, field.field_type);
+          { naming: field_type.naming, node: { name: ident(field.name), ty: field_type.node } }
         },
       );
-      { naming: xs.naming, node: TRecord({ span: dummy_span(), fields: xs.node }) }
+      { naming: spelled.naming, node: TRecord({ span: dummy_span(), fields: spelled.node }) }
     },
-    UnitType -> { naming: n, node: TUnit({ span: dummy_span() }) },
+    UnitType -> { naming: naming, node: TUnit({ span: dummy_span() }) },
   }
 
-fn opt_row(
+fn optional_row_of(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  r: Option<Row<Ref, Int>>,
-) -> Out<Option<RowExpr>> / {abort.raise} =
-  match r {
-    None -> { naming: n, node: None },
-    Some(x) -> {
-      let y = row_of(printer, n, d, x);
-      { naming: y.naming, node: Some(y.node) }
-    },
-  }
+  naming: Naming,
+  depth: Depth,
+  row: Option<Row<Reference, Int>>,
+) -> Spelled<Option<RowExpr>> / {abort.raise} =
+  named_if_any(naming, row, |so_far: Naming, present: Row<Reference, Int>|
+    row_of(printer, so_far, depth, present))
 
 /// What a label `[*]` and `[*t]` and a plain one are to an atom or a clause.
 type Labelled = { resource: Option<Ident>, every: Bool, binder: Option<Ident> }
 
-fn labelled(d: Depth, l: Option<Label>) -> Labelled / {abort.raise} =
-  match l {
+fn labelled(depth: Depth, label: Option<Label>) -> Labelled / {abort.raise} =
+  match label {
     None -> { resource: None, every: false, binder: None },
     Some(LabelName(name)) -> if name == b"*" { { resource: None, every: true, binder: None } }
     else if name.starts_with(b"*") {
-      { resource: None, every: true, binder: Some(id(name.slice(1, name.len()))) }
-    } else { { resource: Some(id(name)), every: false, binder: None } },
-    Some(x) -> { resource: Some(label_of(d, x)), every: false, binder: None },
+      { resource: None, every: true, binder: Some(ident(name.slice(1, name.len()))) }
+    } else { { resource: Some(ident(name)), every: false, binder: None } },
+    Some(parameter) -> { resource: Some(label_of(depth, parameter)), every: false, binder: None },
   }
+
+fn atom_named(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  performed: Effect<Reference, Int>,
+  mode: Mode,
+  operation: Option<Ident>,
+  label: Option<Label>,
+  bounded: Bool,
+) -> Spelled<AtomExpr> / {abort.raise} = {
+  let effect_name = effect_named(printer, naming, performed);
+  let labelled_by = labelled(depth, label);
+  {
+    naming: effect_name.naming,
+    node: {
+      eff: effect_name.node,
+      mode: mode,
+      op: operation,
+      resource: labelled_by.resource,
+      every: labelled_by.every,
+      bounded: bounded,
+      span: dummy_span(),
+    },
+  }
+}
 
 fn row_of(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  r: Row<Ref, Int>,
-) -> Out<RowExpr> / {abort.raise} = {
-  let atoms = r.atoms.fold(
-    { naming: n, node: [] },
-    |acc: Out<List<AtomExpr>>, a: stored::Atom<Ref, Int>| {
-      let x = match a {
-        Moded(e, mode, label, bounded) -> {
-          let q = effect_named(printer, acc.naming, e);
-          let l = labelled(d, label);
-          {
-            naming: q.naming,
-            node: {
-              eff: q.node,
-              mode: mode,
-              op: None,
-              resource: l.resource,
-              every: l.every,
-              bounded: bounded,
-              span: dummy_span(),
-            },
-          }
-        },
-        OfOp(e, op, label, bounded) -> {
-          let q = effect_named(printer, acc.naming, e);
-          let l = labelled(d, label);
-          {
-            naming: q.naming,
-            node: {
-              eff: q.node,
-              mode: MWrite,
-              op: Some(id(op)),
-              resource: l.resource,
-              every: l.every,
-              bounded: bounded,
-              span: dummy_span(),
-            },
-          }
-        },
-      };
-      { naming: x.naming, node: acc.node.push(x.node) }
-    },
+  naming: Naming,
+  depth: Depth,
+  row: Row<Reference, Int>,
+) -> Spelled<RowExpr> / {abort.raise} = {
+  let atoms = named_in_turn(
+    naming,
+    row.atoms,
+    |so_far: Naming, atom: stored::Atom<Reference, Int>|
+      match atom {
+        Moded(performed, mode, label, bounded) ->
+          atom_named(printer, so_far, depth, performed, mode, None, label, bounded),
+        OfOperation(performed, operation, label, bounded) ->
+          atom_named(
+            printer,
+            so_far,
+            depth,
+            performed,
+            MWrite,
+            Some(ident(operation)),
+            label,
+            bounded,
+          ),
+      },
   );
   {
     naming: atoms.naming,
     node: {
       atoms: atoms.node,
       aliases: [],
-      tail: match r.tail {
+      tail: match row.tail {
         None -> None,
-        Some(RowParam(l)) -> if l >= d.rows { panic("a row parameter that is not in scope") }
-        else { Some(id(row_var_name(l))) },
-        Some(RowName(name)) -> Some(id(name)),
+        Some(RowParameter(level)) -> if level >= depth.rows {
+          panic("a row parameter that is not in scope")
+        } else { Some(ident(row_var_name(level))) },
+        Some(RowName(name)) -> Some(ident(name)),
       },
-      tail_bounded: r.bounded,
+      tail_bounded: row.bounded,
       span: dummy_span(),
     },
   }
@@ -662,147 +729,161 @@ fn row_of(
 // --- Literals and patterns ---------------------------------------------------------------------
 
 fn width_name(at: Int) -> Bytes / {abort.raise} =
-  match widths().at(at) { Some(w) -> w.name, None -> panic("a literal of no width the lexer has") }
-
-fn lit_of(l: Literal) -> Lit / {abort.raise} =
-  match l {
-    IntLit(i) -> LInt(i),
-    FixedLit(w, v) -> LFixed(width_name(w), v),
-    WideLit(w, high, low) -> LWide(width_name(w), high, low),
-    BoolLit(b) -> LBool(b),
-    StrLit(s) -> LStr(s),
-    BytesLit(b) -> LBytes(b),
-    EmbeddedLit(_, _) -> panic("an embedded file where only a literal is written"),
-    FloatLit(bits) -> LFloat(float_text(bits)),
-    DecimalLit(mantissa, scale) -> LDec(decimal_text(mantissa, scale)),
-    CharLit(v) -> LChar(v),
-    UnitLit -> LUnit,
+  match widths().at(at) {
+    Some(width) -> width.name,
+    None -> panic("a literal of no width the lexer has"),
   }
 
-fn pats(
+fn literal_of(literal: Literal) -> Lit / {abort.raise} =
+  match literal {
+    IntLiteral(value) -> LInt(value),
+    FixedLiteral(width, bits) -> LFixed(width_name(width), bits),
+    WideLiteral(width, high, low) -> LWide(width_name(width), high, low),
+    BoolLiteral(value) -> LBool(value),
+    StringLiteral(text) -> LStr(text),
+    BytesLiteral(content) -> LBytes(content),
+    EmbeddedLiteral(_, _) -> panic("an embedded file where only a literal is written"),
+    FloatLiteral(bits) -> LFloat(float_text(bits)),
+    DecimalLiteral(mantissa, scale) -> LDec(decimal_text(mantissa, scale)),
+    CharLiteral(value) -> LChar(value),
+    UnitLiteral -> LUnit,
+  }
+
+fn patterns_of(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  ps: List<Pat<Ref, Int>>,
-) -> { naming: Naming, depth: Depth, node: List<Pattern> } / {abort.raise} =
-  ps.fold(
-    { naming: n, depth: d, node: [] },
-    |acc: { naming: Naming, depth: Depth, node: List<Pattern> }, p: Pat<Ref, Int>| {
-      let x = pat_of(printer, acc.naming, acc.depth, p);
-      { naming: x.naming, depth: x.depth, node: acc.node.push(x.node) }
+  naming: Naming,
+  depth: Depth,
+  originals: List<stored::Pattern<Reference, Int>>,
+) -> BoundAll / {abort.raise} =
+  originals.fold(
+    { naming: naming, depth: depth, node: [] },
+    |acc: BoundAll, original: stored::Pattern<Reference, Int>| {
+      let bound = pattern_of(printer, acc.naming, acc.depth, original);
+      { naming: bound.naming, depth: bound.depth, node: acc.node.push(bound.node) }
     },
   )
 
-fn pat_of(printer: BodyPrinter, n: Naming, d: Depth, p: Pat<Ref, Int>) -> Bound / {abort.raise} = {
-  let s = dummy_span();
-  match p {
-    Wild -> { naming: n, depth: d, node: PWild({ span: s }) },
+fn pattern_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  original: stored::Pattern<Reference, Int>,
+) -> Bound / {abort.raise} = {
+  let span = dummy_span();
+  match original {
+    Wild -> { naming: naming, depth: depth, node: PWild({ span: span }) },
     Bind ->
       {
-        naming: n,
-        depth: { ..d, values: d.values + 1 },
-        node: PVar({ span: s, name: id(local_name(d.values)) }),
+        naming: naming,
+        depth: { ..depth, values: depth.values + 1 },
+        node: PVar({ span: span, name: ident(local_name(depth.values)) }),
       },
-    Again(l) -> if l >= d.values { panic("an alternative names a binder that is not in scope") }
-    else { { naming: n, depth: d, node: PVar({ span: s, name: id(local_name(l)) }) } },
-    LitPat(l) -> { naming: n, depth: d, node: PLit({ span: s, lit: lit_of(l) }) },
-    RangePat(lo, hi) ->
-      { naming: n, depth: d, node: PRange({ span: s, lo: lit_of(lo), hi: lit_of(hi) }) },
-    CtorPat(c, args) -> {
-      let q = match c {
-        Constructed(r, name) -> named_ref(printer, n, r, Some(name)),
-        Unbound(free) -> { naming: n, node: free_q(free) },
+    Again(level) -> if level >= depth.values {
+      panic("an alternative names a binder that is not in scope")
+    } else {
+      { naming: naming, depth: depth, node: PVar({ span: span, name: ident(local_name(level)) }) }
+    },
+    LiteralPattern(literal) ->
+      { naming: naming, depth: depth, node: PLit({ span: span, lit: literal_of(literal) }) },
+    RangePattern(low, high) ->
+      {
+        naming: naming,
+        depth: depth,
+        node: PRange({ span: span, lo: literal_of(low), hi: literal_of(high) }),
+      },
+    ConstructorPattern(constructor, arguments) -> {
+      let name = match constructor {
+        Constructed(reference, simple) -> reference_named(printer, naming, reference, Some(simple)),
+        Unbound(free) -> { naming: naming, node: free_name(free) },
         _ -> panic("a pattern of no constructor"),
       };
-      let xs = pats(printer, q.naming, d, args);
-      { naming: xs.naming, depth: xs.depth, node: PCtor({ span: s, name: q.node, args: xs.node }) }
+      let bound = patterns_of(printer, name.naming, depth, arguments);
+      {
+        naming: bound.naming,
+        depth: bound.depth,
+        node: PCtor({ span: span, name: name.node, args: bound.node }),
+      }
     },
-    RecordPat(fs, rest) -> {
-      let xs = fs.fold(
-        { naming: n, depth: d, node: [] },
-        |acc: { naming: Naming, depth: Depth, node: List<{ name: Ident, pat: Pattern }> }, f: stored::PatField<Ref, Int>| {
-          let x = pat_of(printer, acc.naming, acc.depth, f.pat);
+    RecordPattern(fields, rest) -> {
+      let bound = fields.fold(
+        { naming: naming, depth: depth, node: [] },
+        |acc: { naming: Naming, depth: Depth, node: List<{ name: Ident, pat: Pattern }> }, field: stored::PatternField<Reference, Int>| {
+          let field_bound = pattern_of(printer, acc.naming, acc.depth, field.pattern);
           {
-            naming: x.naming,
-            depth: x.depth,
-            node: acc.node.push({ name: id(f.name), pat: x.node }),
+            naming: field_bound.naming,
+            depth: field_bound.depth,
+            node: acc.node.push({ name: ident(field.name), pat: field_bound.node }),
           }
         },
       );
       {
-        naming: xs.naming,
-        depth: xs.depth,
-        node: PRecord({ span: s, rest: rest, fields: xs.node }),
+        naming: bound.naming,
+        depth: bound.depth,
+        node: PRecord({ span: span, rest: rest, fields: bound.node }),
       }
     },
-    ListPat(items, rest) -> {
-      let xs = pats(printer, n, d, items);
+    ListPattern(items, rest) -> {
+      let bound = patterns_of(printer, naming, depth, items);
       match rest {
         None ->
           {
-            naming: xs.naming,
-            depth: xs.depth,
-            node: PList({ span: s, rest: None, items: xs.node }),
+            naming: bound.naming,
+            depth: bound.depth,
+            node: PList({ span: span, rest: None, items: bound.node }),
           },
-        Some(r) -> {
-          let y = pat_of(printer, xs.naming, xs.depth, r);
+        Some(tail) -> {
+          let tail_bound = pattern_of(printer, bound.naming, bound.depth, tail);
           {
-            naming: y.naming,
-            depth: y.depth,
-            node: PList({ span: s, rest: Some(y.node), items: xs.node }),
+            naming: tail_bound.naming,
+            depth: tail_bound.depth,
+            node: PList({ span: span, rest: Some(tail_bound.node), items: bound.node }),
           }
         },
       }
     },
-    OrPat(alts) -> {
-      let xs = pats(printer, n, d, alts);
-      { naming: xs.naming, depth: xs.depth, node: POr({ span: s, alts: xs.node }) }
+    OrPattern(alternatives) -> {
+      let bound = patterns_of(printer, naming, depth, alternatives);
+      { naming: bound.naming, depth: bound.depth, node: POr({ span: span, alts: bound.node }) }
     },
   }
 }
 
 // --- Expressions -------------------------------------------------------------------------------
 
-type SExpr = stored::Expr<Ref, Int, Int, Unit>
+type StoredExpression = stored::Expression<Reference, Int, Int, Unit>
 
-type SStmt = stored::Stmt<Ref, Int, Int, Unit>
+type StoredStatement = stored::Statement<Reference, Int, Int, Unit>
 
-fn exprs(
+fn expressions_of(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  es: List<SExpr>,
-) -> Out<List<Expr>> / {abort.raise} =
-  es.fold({ naming: n, node: [] }, |acc: Out<List<Expr>>, e: SExpr| {
-    let x = expr_of(printer, acc.naming, d, e);
-    { naming: x.naming, node: acc.node.push(x.node) }
-  })
+  naming: Naming,
+  depth: Depth,
+  expressions: List<StoredExpression>,
+) -> Spelled<List<Expr>> / {abort.raise} =
+  named_in_turn(naming, expressions, |so_far: Naming, each: StoredExpression|
+    expression_of(printer, so_far, depth, each))
 
-fn opt_expr(
+fn optional_expression_of(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  e: Option<SExpr>,
-) -> Out<Option<Expr>> / {abort.raise} =
-  match e {
-    None -> { naming: n, node: None },
-    Some(x) -> {
-      let y = expr_of(printer, n, d, x);
-      { naming: y.naming, node: Some(y.node) }
-    },
-  }
+  naming: Naming,
+  depth: Depth,
+  expression: Option<StoredExpression>,
+) -> Spelled<Option<Expr>> / {abort.raise} =
+  named_if_any(naming, expression, |so_far: Naming, present: StoredExpression|
+    expression_of(printer, so_far, depth, present))
 
 fn fields_of(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  fs: List<stored::RecField<Ref, Int, Int, Unit>>,
-) -> Out<List<RecField>> / {abort.raise} =
-  fs.fold(
-    { naming: n, node: [] },
-    |acc: Out<List<RecField>>, f: stored::RecField<Ref, Int, Int, Unit>| {
-      let x = expr_of(printer, acc.naming, d, f.value);
-      { naming: x.naming, node: acc.node.push({ name: id(f.name), value: x.node }) }
+  naming: Naming,
+  depth: Depth,
+  fields: List<stored::RecordField<Reference, Int, Int, Unit>>,
+) -> Spelled<List<RecField>> / {abort.raise} =
+  named_in_turn(
+    naming,
+    fields,
+    |so_far: Naming, field: stored::RecordField<Reference, Int, Int, Unit>| {
+      let value = expression_of(printer, so_far, depth, field.value);
+      { naming: value.naming, node: { name: ident(field.name), value: value.node } }
     },
   )
 
@@ -812,312 +893,381 @@ fn fields_of(
 /// argument the call names is named so too, where the check said which parameter it fills.
 fn on_value_of(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  c: stored::OnValueCall<Ref, Int, Int, Unit>,
-) -> Out<Expr> / {abort.raise} = {
-  let s = dummy_span();
-  let base = expr_of(printer, n, d, c.base);
-  let args = exprs(printer, base.naming, d, c.args);
-  let given = fields_of(printer, args.naming, d, c.named);
-  let pick: Choice = match given.naming.picks.at(given.naming.picked) {
-    Some(x) -> x,
+  naming: Naming,
+  depth: Depth,
+  call: stored::OnValueCall<Reference, Int, Int, Unit>,
+) -> Spelled<Expr> / {abort.raise} = {
+  let span = dummy_span();
+  let base = expression_of(printer, naming, depth, call.base);
+  let arguments = expressions_of(printer, base.naming, depth, call.arguments);
+  let given = fields_of(printer, arguments.naming, depth, call.named);
+  let choice: Choice = match given.naming.picks.at(given.naming.picked) {
+    Some(found) -> found,
     None -> { callee: 0 - 1, named: [] },
   };
   let after = { ..given.naming, picked: given.naming.picked + 1 };
-  let named_args = range(0, given.node.len()).map(|j: Int|
+  let named_arguments = range(0, given.node.len()).map(|i: Int|
     {
-      name: if pick.named.len() == given.node.len() { id(local_name(pick.named.get(j))) }
-      else { given.node.get(j).name },
-      value: given.node.get(j).value,
-      span: s,
+      name: if choice.named.len() == given.node.len() { ident(local_name(choice.named.get(i))) }
+      else { given.node.get(i).name },
+      value: given.node.get(i).value,
+      span: span,
     });
-  let labels = c.labels.map(|l: Label| label_of(d, l));
+  let labels = call.labels.map(|label: Label| label_of(depth, label));
   let apart = printer.layout.apart;
-  let local = match c.base { Var(v) -> match v.named { Local(_) -> true, _ -> false }, _ -> false };
-  // A call on a local is written as a perform on it, which is how the parser reads one.
-  let on_value = |field: Bytes|
-    match base.node {
-      EVar(v) -> if local && named_args.len() == 0 && labels.len() <= 1
-          && field.index_of(b"::") == None {
-        EPerform({ span: s, eff: v.name, op: id(field), resource: labels.at(0), args: args.node })
-      } else {
-        EApp({
-          span: s,
-          func: EField({ span: s, base: base.node, field: id(field) }),
-          named: named_args,
-          args: args.node,
-          labels: labels,
-        })
-      },
-      _ ->
-        EApp({
-          span: s,
-          func: EField({ span: s, base: base.node, field: id(field) }),
-          named: named_args,
-          args: args.node,
-          labels: labels,
-        }),
-    };
-  let plain = |callee: QName|
-    EApp({
-      span: s,
-      func: EVar({ span: s, name: callee }),
-      named: named_args,
-      args: List::concat([base.node], args.node),
+  let local = match call.base {
+    Variable(value) -> match value.named { Local(_) -> true, _ -> false },
+    _ -> false,
+  };
+  let on_value = |field: Bytes| {
+    let written = EApp({
+      span: span,
+      func: EField({ span: span, base: base.node, field: ident(field) }),
+      named: named_arguments,
+      args: arguments.node,
       labels: labels,
     });
-  match c.callees {
-    InFull(v) -> {
-      let q = value_named(printer, after, d, v);
-      { naming: q.naming, node: if apart { plain(q.node) } else { on_value(q_text(q.node)) } }
+    // A call on a local is written as a perform on it, which is how the parser reads one.
+    match base.node {
+      EVar(variable) -> if local && named_arguments.len() == 0 && labels.len() <= 1
+          && field.index_of(b"::") == None {
+        EPerform({
+          span: span,
+          eff: variable.name,
+          op: ident(field),
+          resource: labels.at(0),
+          args: arguments.node,
+        })
+      } else { written },
+      _ -> written,
+    }
+  };
+  let plain = |callee: QName|
+    EApp({
+      span: span,
+      func: EVar({ span: span, name: callee }),
+      named: named_arguments,
+      args: List::concat([base.node], arguments.node),
+      labels: labels,
+    });
+  match call.callees {
+    InFull(value) -> {
+      let name = value_named(printer, after, depth, value);
+      {
+        naming: name.naming,
+        node: if apart { plain(name.node) } else { on_value(qualified_text(name.node)) },
+      }
     },
-    Among(refs) -> {
-      let chosen = if apart { pick.callee } else { 0 - 1 };
-      let walked = range(0, refs.len()).fold(
+    Among(references) -> {
+      let chosen = if apart { choice.callee } else { 0 - 1 };
+      let walked = range(0, references.len()).fold(
         { naming: after, node: None },
-        |acc: Out<Option<QName>>, i: Int| {
-          let t = target(printer, acc.naming, refs.get(i));
+        |acc: Spelled<Option<QName>>, i: Int| {
+          let target = target_of(printer, acc.naming, references.get(i));
           if i == chosen {
-            let q = named(printer, t.naming, t.node, None);
-            { naming: q.naming, node: Some(q.node) }
-          } else if chosen >= 0 { { naming: t.naming, node: acc.node } }
-          else { { naming: seen(printer, t.naming, t.node), node: acc.node } }
+            let name = named(printer, target.naming, target.node, None);
+            { naming: name.naming, node: Some(name.node) }
+          } else if chosen >= 0 { { naming: target.naming, node: acc.node } }
+          else { { naming: seen(printer, target.naming, target.node), node: acc.node } }
         },
       );
       {
         naming: walked.naming,
-        node: match walked.node { Some(q) -> plain(q), None -> on_value(c.name) },
+        node: match walked.node { Some(name) -> plain(name), None -> on_value(call.name) },
       }
     },
   }
 }
 
-fn expr_of(printer: BodyPrinter, n: Naming, d: Depth, e: SExpr) -> Out<Expr> / {abort.raise} = {
-  let s = dummy_span();
-  match e {
+fn expression_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  original: StoredExpression,
+) -> Spelled<Expr> / {abort.raise} = {
+  let span = dummy_span();
+  match original {
     // The bytes are not in the form: what prints embeds the file named by the digest's hex, which a
     // load handed the bytes under that digest reads back as this literal.
-    Constant(EmbeddedLit(digest, _)) ->
+    Constant(EmbeddedLiteral(digest, _)) ->
       {
-        naming: n,
+        naming: naming,
         node: EApp({
-          span: s,
-          func: EVar({ span: s, name: bare_q(b"embed") }),
+          span: span,
+          func: EVar({ span: span, name: unqualified(b"embed") }),
           named: [],
-          args: [ELit({ span: s, lit: LStr(hex(digest)) })],
+          args: [ELit({ span: span, lit: LStr(hex(digest)) })],
           labels: [],
         }),
       },
-    Constant(l) -> { naming: n, node: ELit({ span: s, lit: lit_of(l) }) },
-    Unwritten -> { naming: n, node: EHole({ span: s, text: b"???" }) },
-    Var(v) -> {
-      let q = value_named(printer, n, d, v);
-      { naming: q.naming, node: EVar({ span: s, name: q.node }) }
+    Constant(literal) -> { naming: naming, node: ELit({ span: span, lit: literal_of(literal) }) },
+    Unwritten -> { naming: naming, node: EHole({ span: span, text: b"???" }) },
+    Variable(value) -> {
+      let name = value_named(printer, naming, depth, value);
+      { naming: name.naming, node: EVar({ span: span, name: name.node }) }
     },
-    Binary(op, l, r, _) -> {
-      let a = expr_of(printer, n, d, l);
-      let b = expr_of(printer, a.naming, d, r);
-      { naming: b.naming, node: EBinary({ span: s, op: op, lhs: a.node, rhs: b.node }) }
-    },
-    Unary(op, x) -> {
-      let a = expr_of(printer, n, d, x);
-      { naming: a.naming, node: EUnary({ span: s, op: op, operand: a.node }) }
-    },
-    Lambda(types, body) -> {
-      let ts = types.fold(
-        { naming: n, node: [] },
-        |acc: Out<List<Option<TypeExpr>>>, t: Option<Ty<Ref, Int>>| {
-          let x = opt_ty(printer, acc.naming, d, t);
-          { naming: x.naming, node: acc.node.push(x.node) }
-        },
-      );
-      let b = expr_of(printer, ts.naming, { ..d, values: d.values + types.len() }, body);
+    Binary(operator, left, right, _) -> {
+      let spelled_left = expression_of(printer, naming, depth, left);
+      let spelled_right = expression_of(printer, spelled_left.naming, depth, right);
       {
-        naming: b.naming,
+        naming: spelled_right.naming,
+        node: EBinary({
+          span: span,
+          op: operator,
+          lhs: spelled_left.node,
+          rhs: spelled_right.node,
+        }),
+      }
+    },
+    Unary(operator, operand) -> {
+      let spelled = expression_of(printer, naming, depth, operand);
+      { naming: spelled.naming, node: EUnary({ span: span, op: operator, operand: spelled.node }) }
+    },
+    Lambda(annotations, body) -> {
+      let spelled_annotations = named_in_turn(
+        naming,
+        annotations,
+        |so_far: Naming, annotation: Option<Type<Reference, Int>>|
+          optional_type_of(printer, so_far, depth, annotation),
+      );
+      let spelled_body = expression_of(
+        printer,
+        spelled_annotations.naming,
+        { ..depth, values: depth.values + annotations.len() },
+        body,
+      );
+      {
+        naming: spelled_body.naming,
         node: ELambda({
-          span: s,
-          body: b.node,
-          params: range(0, types.len()).map(|i: Int|
+          span: span,
+          body: spelled_body.node,
+          params: range(0, annotations.len()).map(|i: Int|
             {
-              name: id(local_name(d.values + i)),
+              name: ident(local_name(depth.values + i)),
               keep: false,
-              ty: ts.node.get(i),
+              ty: spelled_annotations.node.get(i),
               cost: None,
               space: None,
               default: None,
-              span: s,
+              span: span,
             }),
           ret: None,
         }),
       }
     },
-    App(func, args, labels) -> {
-      let f = expr_of(printer, n, d, func);
-      let xs = exprs(printer, f.naming, d, args);
+    Call(callee, arguments, labels) -> {
+      let spelled_callee = expression_of(printer, naming, depth, callee);
+      let spelled_arguments = expressions_of(printer, spelled_callee.naming, depth, arguments);
       {
-        naming: xs.naming,
+        naming: spelled_arguments.naming,
         node: EApp({
-          span: s,
-          func: f.node,
+          span: span,
+          func: spelled_callee.node,
           named: [],
-          args: xs.node,
-          labels: labels.map(|l: Label| label_of(d, l)),
+          args: spelled_arguments.node,
+          labels: labels.map(|label: Label| label_of(depth, label)),
         }),
       }
     },
-    OnValue(c) -> on_value_of(printer, n, d, c),
-    If(c, t, x) -> {
-      let a = expr_of(printer, n, d, c);
-      let b = expr_of(printer, a.naming, d, t);
-      let f = expr_of(printer, b.naming, d, x);
+    OnValue(call) -> on_value_of(printer, naming, depth, call),
+    If(condition, then_branch, else_branch) -> {
+      let spelled_condition = expression_of(printer, naming, depth, condition);
+      let spelled_then = expression_of(printer, spelled_condition.naming, depth, then_branch);
+      let spelled_else = expression_of(printer, spelled_then.naming, depth, else_branch);
       // `if c { t }` is the parser's own spelling of an `else ()`.
-      let otherwise = match f.node {
-        ELit(l) -> match l.lit { LUnit -> f.node, _ -> as_block(f.node) },
-        EIf(_) -> f.node,
-        _ -> as_block(f.node),
+      let otherwise = match spelled_else.node {
+        ELit(literal) -> match literal.lit {
+          LUnit -> spelled_else.node,
+          _ -> as_block(spelled_else.node),
+        },
+        EIf(_) -> spelled_else.node,
+        _ -> as_block(spelled_else.node),
       };
       {
-        naming: f.naming,
-        node: EIf({ span: s, cond: a.node, then_branch: as_block(b.node), else_branch: otherwise }),
+        naming: spelled_else.naming,
+        node: EIf({
+          span: span,
+          cond: spelled_condition.node,
+          then_branch: as_block(spelled_then.node),
+          else_branch: otherwise,
+        }),
       }
     },
     Match(scrutinee, arms) -> {
-      let a = expr_of(printer, n, d, scrutinee);
-      let xs = arms.fold(
-        { naming: a.naming, node: [] },
-        |acc: Out<List<MatchArm>>, arm: stored::Arm<Ref, Int, Int, Unit>| {
-          let p = pat_of(printer, acc.naming, d, arm.pat);
-          let g = opt_expr(printer, p.naming, p.depth, arm.guard);
-          let b = expr_of(printer, g.naming, p.depth, arm.body);
+      let spelled_scrutinee = expression_of(printer, naming, depth, scrutinee);
+      let spelled_arms = named_in_turn(
+        spelled_scrutinee.naming,
+        arms,
+        |so_far: Naming, arm: stored::Arm<Reference, Int, Int, Unit>| {
+          let bound = pattern_of(printer, so_far, depth, arm.pattern);
+          let guard = optional_expression_of(printer, bound.naming, bound.depth, arm.guard);
+          let body = expression_of(printer, guard.naming, bound.depth, arm.body);
           {
-            naming: b.naming,
-            node: acc.node.push({ pat: p.node, guard: g.node, body: b.node, span: s }),
+            naming: body.naming,
+            node: { pat: bound.node, guard: guard.node, body: body.node, span: span },
           }
         },
       );
-      { naming: xs.naming, node: EMatch({ span: s, scrutinee: a.node, arms: xs.node }) }
+      {
+        naming: spelled_arms.naming,
+        node: EMatch({ span: span, scrutinee: spelled_scrutinee.node, arms: spelled_arms.node }),
+      }
     },
-    Record(fs) -> {
-      let xs = fields_of(printer, n, d, fs);
-      { naming: xs.naming, node: ERecord({ span: s, fields: xs.node }) }
+    Record(fields) -> {
+      let spelled = fields_of(printer, naming, depth, fields);
+      { naming: spelled.naming, node: ERecord({ span: span, fields: spelled.node }) }
     },
-    RecordUpdate(base, fs) -> {
-      let a = expr_of(printer, n, d, base);
-      let xs = fields_of(printer, a.naming, d, fs);
-      { naming: xs.naming, node: ERecordUpdate({ span: s, base: a.node, fields: xs.node }) }
+    RecordUpdate(base, fields) -> {
+      let spelled_base = expression_of(printer, naming, depth, base);
+      let spelled_fields = fields_of(printer, spelled_base.naming, depth, fields);
+      {
+        naming: spelled_fields.naming,
+        node: ERecordUpdate({ span: span, base: spelled_base.node, fields: spelled_fields.node }),
+      }
     },
     Field(base, name) -> {
-      let a = expr_of(printer, n, d, base);
-      { naming: a.naming, node: EField({ span: s, base: a.node, field: id(name) }) }
+      let spelled = expression_of(printer, naming, depth, base);
+      {
+        naming: spelled.naming,
+        node: EField({ span: span, base: spelled.node, field: ident(name) }),
+      }
     },
     ListOf(items) -> {
-      let xs = exprs(printer, n, d, items);
-      { naming: xs.naming, node: EList({ span: s, items: xs.node }) }
+      let spelled = expressions_of(printer, naming, depth, items);
+      { naming: spelled.naming, node: EList({ span: span, items: spelled.node }) }
     },
-    Perform(eff, op, label, args) -> {
-      let q = effect_named(printer, n, eff);
-      let xs = exprs(printer, q.naming, d, args);
+    Perform(performed, operation, label, arguments) -> {
+      let effect_name = effect_named(printer, naming, performed);
+      let spelled_arguments = expressions_of(printer, effect_name.naming, depth, arguments);
       {
-        naming: xs.naming,
+        naming: spelled_arguments.naming,
         node: EPerform({
-          span: s,
-          eff: q.node,
-          op: id(op),
-          resource: match label { Some(l) -> Some(label_of(d, l)), None -> None },
-          args: xs.node,
+          span: span,
+          eff: effect_name.node,
+          op: ident(operation),
+          resource: optional_label_of(depth, label),
+          args: spelled_arguments.node,
         }),
       }
     },
-    Handle(h) -> handle_of(printer, n, d, h),
+    Handle(handled) -> handle_of(printer, naming, depth, handled),
     WithHold(resource, acquire, release, body) -> {
-      let a = expr_of(printer, n, d, acquire);
-      let r = expr_of(printer, a.naming, d, release);
-      let b = expr_of(printer, r.naming, { ..d, values: d.values + 1 }, body);
+      let spelled_acquire = expression_of(printer, naming, depth, acquire);
+      let spelled_release = expression_of(printer, spelled_acquire.naming, depth, release);
+      let spelled_body = expression_of(
+        printer,
+        spelled_release.naming,
+        { ..depth, values: depth.values + 1 },
+        body,
+      );
       {
-        naming: b.naming,
+        naming: spelled_body.naming,
         node: EWithHold({
-          span: s,
-          resource: id(resource),
-          acquire: a.node,
-          release: r.node,
-          binder: id(local_name(d.values)),
-          body: b.node,
+          span: span,
+          resource: ident(resource),
+          acquire: spelled_acquire.node,
+          release: spelled_release.node,
+          binder: ident(local_name(depth.values)),
+          body: spelled_body.node,
         }),
       }
     },
     Simulate(body) -> {
-      let b = expr_of(printer, n, d, body);
-      { naming: b.naming, node: ESimulate({ span: s, body: as_block(b.node) }) }
+      let spelled = expression_of(printer, naming, depth, body);
+      { naming: spelled.naming, node: ESimulate({ span: span, body: as_block(spelled.node) }) }
     },
     Parallel(branches) -> {
-      let xs = exprs(printer, n, d, branches);
-      { naming: xs.naming, node: EParallel({ span: s, branches: xs.node }) }
+      let spelled = expressions_of(printer, naming, depth, branches);
+      { naming: spelled.naming, node: EParallel({ span: span, branches: spelled.node }) }
     },
     Tagged(parser, text) -> {
-      let t = parsed_by(printer, n, parser);
-      let tag = tag_binder(printer, t.naming, t.node, b"literal", None);
+      let parser_target = parsed_by(printer, naming, parser);
+      let tag = tag_binder(printer, parser_target.naming, parser_target.node, b"literal", None);
       {
         naming: tag.naming,
-        node: ETagged({ span: s, tag: tag.node, text: text, quoted: s, holes: [] }),
+        node: ETagged({ span: span, tag: tag.node, text: text, quoted: span, holes: [] }),
       }
     },
     Filled(parser, filler, head, holes) -> {
-      let t = parsed_by(printer, n, parser);
-      let f = parsed_by(printer, t.naming, filler);
-      let tag = tag_binder(printer, f.naming, t.node, b"compile", Some(f.node.hash));
-      let hs = holes.fold(
-        { naming: tag.naming, node: [] },
-        |acc: Out<List<Hole>>, h: stored::FilledHole<Ref, Int, Int, Unit>| {
-          let v = expr_of(printer, acc.naming, d, h.value);
-          { naming: v.naming, node: acc.node.push({ value: v.node, text: h.text, quoted: s }) }
+      let parser_target = parsed_by(printer, naming, parser);
+      let filler_target = parsed_by(printer, parser_target.naming, filler);
+      let tag = tag_binder(
+        printer,
+        filler_target.naming,
+        parser_target.node,
+        b"compile",
+        Some(filler_target.node.hash),
+      );
+      let spelled_holes = named_in_turn(
+        tag.naming,
+        holes,
+        |so_far: Naming, hole: stored::FilledHole<Reference, Int, Int, Unit>| {
+          let value = expression_of(printer, so_far, depth, hole.value);
+          { naming: value.naming, node: { value: value.node, text: hole.text, quoted: span } }
         },
       );
       {
-        naming: hs.naming,
-        node: ETagged({ span: s, tag: tag.node, text: head, quoted: s, holes: hs.node }),
+        naming: spelled_holes.naming,
+        node: ETagged({
+          span: span,
+          tag: tag.node,
+          text: head,
+          quoted: span,
+          holes: spelled_holes.node,
+        }),
       }
     },
     TryBlock(raised, body) -> {
-      let r = match raised {
-        None -> { naming: n, node: None },
-        Some(x) -> {
-          let q = effect_named(printer, n, x.effect);
-          { naming: q.naming, node: Some({ eff: q.node, op: id(x.op) }) }
+      let spelled_raised = match raised {
+        None -> { naming: naming, node: None },
+        Some(given) -> {
+          let effect_name = effect_named(printer, naming, given.effect);
+          {
+            naming: effect_name.naming,
+            node: Some({ eff: effect_name.node, op: ident(given.operation) }),
+          }
         },
       };
-      let b = expr_of(printer, r.naming, d, body);
-      { naming: b.naming, node: ETryBlock({ span: s, raise: r.node, body: as_block(b.node) }) }
+      let spelled_body = expression_of(printer, spelled_raised.naming, depth, body);
+      {
+        naming: spelled_body.naming,
+        node: ETryBlock({
+          span: span,
+          raise: spelled_raised.node,
+          body: as_block(spelled_body.node),
+        }),
+      }
     },
     Block(entries, tail) -> {
-      let stmts = entries.fold(
-        { naming: n, depth: d, node: [] },
-        |acc: { naming: Naming, depth: Depth, node: List<Stmt> }, x: stored::Entry<Ref, Int, Int, Unit>|
-          match x {
-            One(st) -> {
-              let y = stmt_of(printer, acc.naming, acc.depth, st);
-              { naming: y.naming, depth: y.depth, node: acc.node.push(y.node) }
-            },
-            Commuting(_, members) ->
-              members.fold(
-                acc,
-                |a: { naming: Naming, depth: Depth, node: List<Stmt> }, st: SStmt| {
-                  let y = stmt_of(printer, a.naming, a.depth, st);
-                  { naming: y.naming, depth: y.depth, node: a.node.push(y.node) }
-                },
-              ),
+      let said = |acc: { naming: Naming, depth: Depth, node: List<Stmt> }, statement: StoredStatement| {
+        let spelled = statement_of(printer, acc.naming, acc.depth, statement);
+        { naming: spelled.naming, depth: spelled.depth, node: acc.node.push(spelled.node) }
+      };
+      let statements = entries.fold(
+        { naming: naming, depth: depth, node: [] },
+        |acc: { naming: Naming, depth: Depth, node: List<Stmt> }, entry: stored::Entry<Reference, Int, Int, Unit>|
+          match entry {
+            One(statement) -> said(acc, statement),
+            Commuting(_, members) -> members.fold(acc, said),
           },
       );
-      let t = opt_expr(printer, stmts.naming, stmts.depth, tail);
-      { naming: t.naming, node: EBlock({ span: s, tail: t.node, stmts: stmts.node }) }
+      let spelled_tail = optional_expression_of(printer, statements.naming, statements.depth, tail);
+      {
+        naming: spelled_tail.naming,
+        node: EBlock({ span: span, tail: spelled_tail.node, stmts: statements.node }),
+      }
     },
   }
 }
 
 /// The value a tagged literal's parser or filler is: a definition, which names the module it is of.
-fn parsed_by(printer: BodyPrinter, n: Naming, v: Value<Ref, Int>) -> Out<Target> / {abort.raise} =
-  match v.named {
-    Defined(r) -> target(printer, n, r),
+fn parsed_by(
+  printer: BodyPrinter,
+  naming: Naming,
+  value: Value<Reference, Int>,
+) -> Spelled<Target> / {abort.raise} =
+  match value.named {
+    Defined(reference) -> target_of(printer, naming, reference),
     _ -> panic("a tagged literal whose parser is no definition"),
   }
 
@@ -1125,135 +1275,163 @@ fn parsed_by(printer: BodyPrinter, n: Naming, v: Value<Ref, Int>) -> Out<Target>
 /// them, then its clauses and its `return`, which see them all.
 fn handle_of(
   printer: BodyPrinter,
-  n: Naming,
-  d: Depth,
-  h: stored::Handled<Ref, Int, Int, Unit>,
-) -> Out<Expr> / {abort.raise} = {
-  let s = dummy_span();
-  let level = d.values;
-  let vars = range(0, h.vars.len()).fold(
-    { naming: n, node: [] },
-    |acc: Out<List<HandlerVar>>, i: Int| {
-      let v = h.vars.get(i);
-      let at = { ..d, values: level + i };
-      let t = opt_ty(printer, acc.naming, at, v.ty);
-      let x = expr_of(printer, t.naming, at, v.init);
+  naming: Naming,
+  depth: Depth,
+  handled: stored::Handled<Reference, Int, Int, Unit>,
+) -> Spelled<Expr> / {abort.raise} = {
+  let span = dummy_span();
+  let level = depth.values;
+  let variables = range(0, handled.variables.len()).fold(
+    { naming: naming, node: [] },
+    |acc: Spelled<List<HandlerVar>>, i: Int| {
+      let variable = handled.variables.get(i);
+      let seeing = { ..depth, values: level + i };
+      let annotation = optional_type_of(printer, acc.naming, seeing, variable.annotation);
+      let first = expression_of(printer, annotation.naming, seeing, variable.first);
       {
-        naming: x.naming,
-        node: acc.node.push({ name: id(local_name(level + i)), ty: t.node, init: x.node, span: s }),
-      }
-    },
-  );
-  let body = expr_of(printer, vars.naming, d, h.body);
-  let held = level + h.vars.len();
-  let clauses = h.clauses.fold(
-    { naming: body.naming, node: [] },
-    |acc: Out<List<HandleClause>>, c: stored::Clause<Ref, Int, Int, Unit>| {
-      let q = effect_named(printer, acc.naming, c.effect);
-      let l = labelled(d, c.label);
-      let bound = held + c.params;
-      let b = expr_of(
-        printer,
-        q.naming,
-        { ..d, values: if c.resumes { bound + 1 } else { bound } },
-        c.body,
-      );
-      {
-        naming: b.naming,
+        naming: first.naming,
         node: acc.node.push({
-          eff: q.node,
-          op: id(c.op),
-          resource: l.resource,
-          every_label: l.every,
-          label_binder: l.binder,
-          resume: if c.resumes { Some(id(local_name(bound))) } else { None },
-          body: b.node,
-          span: s,
-          params: range(held, bound).map(|i: Int| id(local_name(i))),
+          name: ident(local_name(level + i)),
+          ty: annotation.node,
+          init: first.node,
+          span: span,
         }),
       }
     },
   );
-  let ret = match h.ret {
+  let body = expression_of(printer, variables.naming, depth, handled.body);
+  let held = level + handled.variables.len();
+  let clauses = named_in_turn(
+    body.naming,
+    handled.clauses,
+    |so_far: Naming, clause: stored::Clause<Reference, Int, Int, Unit>| {
+      let effect_name = effect_named(printer, so_far, clause.effect);
+      let labelled_by = labelled(depth, clause.label);
+      let bound = held + clause.parameters;
+      let clause_body = expression_of(
+        printer,
+        effect_name.naming,
+        { ..depth, values: if clause.resumes { bound + 1 } else { bound } },
+        clause.body,
+      );
+      {
+        naming: clause_body.naming,
+        node: {
+          eff: effect_name.node,
+          op: ident(clause.operation),
+          resource: labelled_by.resource,
+          every_label: labelled_by.every,
+          label_binder: labelled_by.binder,
+          resume: if clause.resumes { Some(ident(local_name(bound))) } else { None },
+          body: clause_body.node,
+          span: span,
+          params: range(held, bound).map(|i: Int| ident(local_name(i))),
+        },
+      }
+    },
+  );
+  let returned = match handled.returned {
     None -> { naming: clauses.naming, node: None },
-    Some(r) -> {
-      let b = expr_of(printer, clauses.naming, { ..d, values: held + 1 }, r);
-      { naming: b.naming, node: Some({ binder: id(local_name(held)), body: b.node, span: s }) }
+    Some(given) -> {
+      let spelled = expression_of(printer, clauses.naming, { ..depth, values: held + 1 }, given);
+      {
+        naming: spelled.naming,
+        node: Some({ binder: ident(local_name(held)), body: spelled.node, span: span }),
+      }
     },
   };
   {
-    naming: ret.naming,
+    naming: returned.naming,
     node: EHandle({
-      span: s,
+      span: span,
       body: body.node,
-      ret: ret.node,
+      ret: returned.node,
       clauses: clauses.node,
-      vars: vars.node,
+      vars: variables.node,
     }),
   }
 }
 
-fn stmt_of(printer: BodyPrinter, n: Naming, d: Depth, st: SStmt) -> Said / {abort.raise} = {
-  let s = dummy_span();
-  match st {
-    Let(t, v, p) -> {
-      let a = opt_ty(printer, n, d, t);
-      let b = expr_of(printer, a.naming, d, v);
-      let c = pat_of(printer, b.naming, d, p);
+fn statement_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  original: StoredStatement,
+) -> Said / {abort.raise} = {
+  let span = dummy_span();
+  match original {
+    Let(annotation, value, pattern) -> {
+      let spelled_annotation = optional_type_of(printer, naming, depth, annotation);
+      let spelled_value = expression_of(printer, spelled_annotation.naming, depth, value);
+      let bound = pattern_of(printer, spelled_value.naming, depth, pattern);
       {
-        naming: c.naming,
-        depth: c.depth,
-        node: SLet({ span: s, pat: c.node, ty: a.node, value: b.node }),
-      }
-    },
-    LetElse(t, v, p, fallback) -> {
-      let a = opt_ty(printer, n, d, t);
-      let b = expr_of(printer, a.naming, d, v);
-      let c = pat_of(printer, b.naming, d, p);
-      let f = expr_of(printer, c.naming, c.depth, fallback);
-      {
-        naming: f.naming,
-        depth: c.depth,
-        node: SLetElse({
-          span: s,
-          pat: c.node,
-          ty: a.node,
-          value: b.node,
-          fallback: as_block(f.node),
+        naming: bound.naming,
+        depth: bound.depth,
+        node: SLet({
+          span: span,
+          pat: bound.node,
+          ty: spelled_annotation.node,
+          value: spelled_value.node,
         }),
       }
     },
-    Effectful(x) -> {
-      let a = expr_of(printer, n, d, x);
-      { naming: a.naming, depth: d, node: SExpr(a.node) }
+    LetElse(annotation, value, pattern, fallback) -> {
+      let spelled_annotation = optional_type_of(printer, naming, depth, annotation);
+      let spelled_value = expression_of(printer, spelled_annotation.naming, depth, value);
+      let bound = pattern_of(printer, spelled_value.naming, depth, pattern);
+      let spelled_fallback = expression_of(printer, bound.naming, bound.depth, fallback);
+      {
+        naming: spelled_fallback.naming,
+        depth: bound.depth,
+        node: SLetElse({
+          span: span,
+          pat: bound.node,
+          ty: spelled_annotation.node,
+          value: spelled_value.node,
+          fallback: as_block(spelled_fallback.node),
+        }),
+      }
     },
-    Assign(v, x) -> {
-      let name = match v.named {
-        Local(l) -> if l >= d.values { panic("a handler variable that is not in scope") }
-        else { id(local_name(l)) },
+    Effectful(expression) -> {
+      let spelled = expression_of(printer, naming, depth, expression);
+      { naming: spelled.naming, depth: depth, node: SExpr(spelled.node) }
+    },
+    Assign(variable, value) -> {
+      let name = match variable.named {
+        Local(level) -> if level >= depth.values {
+          panic("a handler variable that is not in scope")
+        } else { ident(local_name(level)) },
         _ -> panic("an assignment to no handler variable"),
       };
-      let a = expr_of(printer, n, d, x);
-      { naming: a.naming, depth: d, node: SAssign({ span: s, name: name, value: a.node }) }
+      let spelled = expression_of(printer, naming, depth, value);
+      {
+        naming: spelled.naming,
+        depth: depth,
+        node: SAssign({ span: span, name: name, value: spelled.node }),
+      }
     },
   }
 }
 
 // --- Definitions -------------------------------------------------------------------------------
 
-fn generics_of(g: stored::Generics) -> Generics =
+fn generics_of(generics: stored::Generics) -> Generics =
   {
-    types: range(0, g.types).map(|i: Int| id(type_var_name(i))),
-    effects: range(0, g.rows).map(|i: Int| id(row_var_name(i))),
-    labels: range(0, g.labels).map(|i: Int| id(label_name(i))),
+    types: range(0, generics.types).map(|i: Int| ident(type_var_name(i))),
+    effects: range(0, generics.rows).map(|i: Int| ident(row_var_name(i))),
+    labels: range(0, generics.labels).map(|i: Int| ident(label_name(i))),
   }
 
-fn constraints_of(cs: List<stored::Constrained>) -> List<Constraint> =
-  cs.map(|c: stored::Constrained|
+/// What is in scope at the head of a declaration binding `generics`.
+fn depth_of(generics: stored::Generics) -> Depth =
+  { values: 0, types: generics.types, rows: generics.rows, labels: generics.labels }
+
+fn constraints_of(constraints: List<stored::Constrained>) -> List<Constraint> =
+  constraints.map(|constrained: stored::Constrained|
     {
-      deriver: c.deriver,
+      deriver: constrained.deriver,
       deriver_span: dummy_span(),
-      param: id(type_var_name(c.level)),
+      param: ident(type_var_name(constrained.level)),
       span: dummy_span(),
     })
 
@@ -1261,198 +1439,205 @@ fn constraints_of(cs: List<stored::Constrained>) -> List<Constraint> =
 /// `numeric` follow it.
 fn items_of(
   printer: BodyPrinter,
-  n: Naming,
+  naming: Naming,
   form: Stored,
   name: Bytes,
-) -> Out<List<Item>> / {abort.raise} = {
-  let s = dummy_span();
+) -> Spelled<List<Item>> / {abort.raise} = {
+  let span = dummy_span();
   match form {
-    FnOf(f) -> {
-      let d = {
-        values: 0,
-        types: f.generics.types,
-        rows: f.generics.rows,
-        labels: f.generics.labels,
-      };
-      let params = range(0, f.params.len()).fold(
-        { naming: n, node: [] },
-        |acc: Out<List<Param>>, i: Int| {
-          let p = f.params.get(i);
-          let t = opt_ty(printer, acc.naming, d, p.ty);
-          let x = opt_expr(printer, t.naming, d, p.default);
+    FunctionOf(function) -> {
+      let depth = depth_of(function.generics);
+      let parameters = range(0, function.parameters.len()).fold(
+        { naming: naming, node: [] },
+        |acc: Spelled<List<Param>>, i: Int| {
+          let parameter = function.parameters.get(i);
+          let annotation = optional_type_of(printer, acc.naming, depth, parameter.annotation);
+          let default_value = optional_expression_of(
+            printer,
+            annotation.naming,
+            depth,
+            parameter.default,
+          );
           {
-            naming: x.naming,
+            naming: default_value.naming,
             node: acc.node.push({
-              name: id(local_name(i)),
-              keep: p.kept,
-              ty: t.node,
+              name: ident(local_name(i)),
+              keep: parameter.kept,
+              ty: annotation.node,
               cost: None,
-              space: if p.spaced { Some(id(space_name(i))) } else { None },
-              default: x.node,
-              span: s,
+              space: if parameter.spaced { Some(ident(space_name(i))) } else { None },
+              default: default_value.node,
+              span: span,
             }),
           }
         },
       );
-      let ret = opt_ty(printer, params.naming, d, f.ret);
-      let row = opt_row(printer, ret.naming, d, f.row);
-      let inner = { ..d, values: f.params.len() };
-      let measure = opt_expr(printer, row.naming, inner, f.decreases);
-      let body = expr_of(printer, measure.naming, inner, f.body);
+      let returned = optional_type_of(printer, parameters.naming, depth, function.returned);
+      let row = optional_row_of(printer, returned.naming, depth, function.row);
+      let inside = { ..depth, values: function.parameters.len() };
+      let measure = optional_expression_of(printer, row.naming, inside, function.decreases);
+      let body = expression_of(printer, measure.naming, inside, function.body);
       {
         naming: body.naming,
         node: [
           IFn({
             vis: VPub,
-            name: id(name),
-            generics: generics_of(f.generics),
-            params: params.node,
-            ret: ret.node,
+            name: ident(name),
+            generics: generics_of(function.generics),
+            params: parameters.node,
+            ret: returned.node,
             effects: row.node,
-            constraints: constraints_of(f.constraints),
+            constraints: constraints_of(function.constraints),
             spec: [],
-            returns: match f.returns {
+            returns: match function.returns {
               Unstated -> None,
-              Fresh -> Some(ReturnsFresh(s)),
-              ParamReturned(i) -> if i >= f.params.len() {
+              Fresh -> Some(ReturnsFresh(span)),
+              ParameterReturned(i) -> if i >= function.parameters.len() {
                 panic("a `returns` clause names a parameter out of scope")
-              } else { Some(ReturnsParam(id(local_name(i)))) },
+              } else { Some(ReturnsParam(ident(local_name(i)))) },
             },
             reuse: None,
             transparent: None,
-            baked: match f.baked { Some(_) -> Some(s), None -> None },
+            baked: match function.baked { Some(_) -> Some(span), None -> None },
             decreases: measure.node,
             body: body.node,
             doc: None,
-            span: s,
+            span: span,
           }),
         ],
       }
     },
-    TypeOf(t) -> {
-      let d = {
-        values: 0,
-        types: t.generics.types,
-        rows: t.generics.rows,
-        labels: t.generics.labels,
-      };
-      let body = match t.body {
-        Alias(x) -> {
-          let y = ty_of(printer, n, d, x);
-          { naming: y.naming, node: TDAlias(y.node) }
+    TypeOf(declared) -> {
+      let depth = depth_of(declared.generics);
+      let body = match declared.body {
+        Alias(aliased) -> {
+          let spelled = type_of(printer, naming, depth, aliased);
+          { naming: spelled.naming, node: TDAlias(spelled.node) }
         },
         Sum(_, variants) -> {
-          let vs = variants.fold(
-            { naming: n, node: [] },
-            |acc: Out<List<VariantDef>>, v: stored::Variant<Ref, Int>| {
-              let fs = tys(printer, acc.naming, d, v.fields);
+          let spelled = named_in_turn(
+            naming,
+            variants,
+            |so_far: Naming, variant: stored::Variant<Reference, Int>| {
+              let fields = types_of(printer, so_far, depth, variant.fields);
               {
-                naming: fs.naming,
-                node: acc.node.push({ name: id(v.name), fields: fs.node, doc: None, span: s }),
+                naming: fields.naming,
+                node: { name: ident(variant.name), fields: fields.node, doc: None, span: span },
               }
             },
           );
-          { naming: vs.naming, node: TDSum(vs.node) }
+          { naming: spelled.naming, node: TDSum(spelled.node) }
         },
-        Nominal(_, x) -> {
-          let y = ty_of(printer, n, d, x);
-          { naming: y.naming, node: TDNominal(y.node) }
+        Nominal(_, wrapped) -> {
+          let spelled = type_of(printer, naming, depth, wrapped);
+          { naming: spelled.naming, node: TDNominal(spelled.node) }
         },
-        Extern(_) -> { naming: n, node: TDExtern },
+        Extern(_) -> { naming: naming, node: TDExtern },
       };
-      let stated = t.through.fold(
-        { naming: body.naming, node: [] },
-        |acc: Out<List<Item>>, x: stored::Through<Ref, Int>| {
-          let q = value_named(printer, acc.naming, d, x.by);
+      let instances = named_in_turn(
+        body.naming,
+        declared.through,
+        |so_far: Naming, through: stored::Through<Reference, Int>| {
+          let function_name = value_named(printer, so_far, depth, through.by);
           {
-            naming: q.naming,
-            node: acc.node.push(
-              IInstance({
-                kind: if x.key { NKey } else { NShow },
-                target: id(name),
-                by: id(q_text(q.node)),
-                span: s,
-              }),
-            ),
-          }
-        },
-      );
-      let numeric = t.numerics.fold(
-        { naming: stated.naming, node: [] },
-        |acc: Out<List<{ op: Ident, by: Ident }>>, x: stored::Numeric<Ref, Int>| {
-          let q = value_named(printer, acc.naming, d, x.by);
-          { naming: q.naming, node: acc.node.push({ op: id(x.op), by: id(q_text(q.node)) }) }
-        },
-      );
-      let declared = IType({
-        vis: VPub,
-        // Set apart, what only the type's module may write is written wherever a body landed.
-        opaque: if t.opaque && !printer.layout.apart { Some({ span: s, answer: [], take: [] }) }
-        else { None },
-        name: id(name),
-        generics: generics_of(t.generics),
-        constraints: constraints_of(t.constraints),
-        body: body.node,
-        doc: None,
-        field_docs: [],
-        span: s,
-      });
-      {
-        naming: numeric.naming,
-        node: List::concat([declared], stated.node).concat(if numeric.node.len() == 0 { [] }
-        else { [INumeric({ target: id(name), ops: numeric.node, span: s })] }),
-      }
-    },
-    EffectOf(e) -> {
-      let ops = e.ops.fold(
-        { naming: n, node: [] },
-        |acc: Out<List<OpDef>>, op: stored::Op<Ref, Int>| {
-          let d = { values: 0, types: op.types, rows: 0, labels: 0 };
-          let ps = tys(printer, acc.naming, d, op.params);
-          let rt = ty_of(printer, ps.naming, d, op.ret);
-          {
-            naming: rt.naming,
-            node: acc.node.push({
-              name: id(op.name),
-              mode: op.mode,
-              resource_param: op.resource,
-              ty_params: range(0, op.types).map(|i: Int| id(type_var_name(i))),
-              params: ps.node,
-              ret: rt.node,
-              doc: None,
-              span: s,
+            naming: function_name.naming,
+            node: IInstance({
+              kind: if through.key { NKey } else { NShow },
+              target: ident(name),
+              by: ident(qualified_text(function_name.node)),
+              span: span,
             }),
           }
         },
       );
+      let arithmetic = named_in_turn(
+        instances.naming,
+        declared.numerics,
+        |so_far: Naming, operation: stored::Numeric<Reference, Int>| {
+          let function_name = value_named(printer, so_far, depth, operation.by);
+          {
+            naming: function_name.naming,
+            node: { op: ident(operation.operation), by: ident(qualified_text(function_name.node)) },
+          }
+        },
+      );
+      let declaration = IType({
+        vis: VPub,
+        // Set apart, what only the type's module may write is written wherever a body landed.
+        opaque: if declared.opaque && !printer.layout.apart {
+          Some({ span: span, answer: [], take: [] })
+        } else { None },
+        name: ident(name),
+        generics: generics_of(declared.generics),
+        constraints: constraints_of(declared.constraints),
+        body: body.node,
+        doc: None,
+        field_docs: [],
+        span: span,
+      });
       {
-        naming: ops.naming,
+        naming: arithmetic.naming,
+        node: List::concat([declaration], instances.node).concat(if arithmetic.node.len() == 0 {
+          []
+        } else { [INumeric({ target: ident(name), ops: arithmetic.node, span: span })] }),
+      }
+    },
+    EffectOf(declared) -> {
+      let operations = named_in_turn(
+        naming,
+        declared.operations,
+        |so_far: Naming, operation: stored::Operation<Reference, Int>| {
+          let depth = { values: 0, types: operation.types, rows: 0, labels: 0 };
+          let parameters = types_of(printer, so_far, depth, operation.parameters);
+          let returned = type_of(printer, parameters.naming, depth, operation.returned);
+          {
+            naming: returned.naming,
+            node: {
+              name: ident(operation.name),
+              mode: operation.mode,
+              resource_param: operation.resource,
+              ty_params: range(0, operation.types).map(|i: Int| ident(type_var_name(i))),
+              params: parameters.node,
+              ret: returned.node,
+              doc: None,
+              span: span,
+            },
+          }
+        },
+      );
+      {
+        naming: operations.naming,
         node: [
           IEffect({
             vis: VPub,
-            name: id(name),
-            is_nondet: e.nondet,
-            ops: ops.node,
+            name: ident(name),
+            is_nondet: declared.nondet,
+            ops: operations.node,
             doc: None,
-            span: s,
+            span: span,
           }),
         ],
       }
     },
-    TestOf(t) -> match t.cases {
+    TestOf(declared) -> match declared.cases {
       Some(_) -> panic("a test over cases has no body to print without its table"),
       None -> {
-        let body = expr_of(printer, n, { values: 0, types: 0, rows: 0, labels: 0 }, t.body);
+        let body = expression_of(
+          printer,
+          naming,
+          { values: 0, types: 0, rows: 0, labels: 0 },
+          declared.body,
+        );
         {
           naming: body.naming,
           node: [
             ITest({
               name: name,
-              name_span: s,
-              is_nondet: t.nondet,
+              name_span: span,
+              is_nondet: declared.nondet,
               cases: None,
               body: as_block(body.node),
-              span: s,
+              span: span,
             }),
           ],
         }
@@ -1520,15 +1705,15 @@ fn comp_of(body: Bytes) -> Component / {abort.raise} =
 
 /// The stored forms a body holds: its own, or each member's of the component it is part of.
 pub fn stored_forms(body: Bytes) -> List<Stored> / {abort.raise} = {
-  let c = comp_of(body);
-  c.members.map(|m: Bytes| stored_of(m, short_hex(c.key)))
+  let component = comp_of(body);
+  component.members.map(|member: Bytes| stored_of(member, short_hex(component.key)))
 }
 
 /// What kind of definition a member of a component is: two of one name and one kind are one
 /// definition, and two of one name and two kinds are two.
 fn kind_of(member: Bytes, name: Bytes) -> Int / {abort.raise} =
   match stored_of(member, name) {
-    FnOf(_) -> 0,
+    FunctionOf(_) -> 0,
     TypeOf(_) -> 1,
     EffectOf(_) -> 2,
     TestOf(_) -> 3,
