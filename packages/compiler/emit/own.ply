@@ -42,9 +42,8 @@ import emit.tir (Rep, RWord, RInt, RBool, RFloat, RFlat, RToken, RSum, MCase, Va
                  Static, Op, OStrings, RAddr, PPayload, no_links, counted, operands, fails, used_as,
                  var_of, rep_of_arg, parts_of, ends, string_uses)
 import emit.tir.strings (ByteRead)
-import emit.verify (verified, stacked_captures, payload_of, field_path, held_in_place, reuses_cells,
-                    made_width, re_held, leaves, answer_held, boxed_read, word_held, immortals,
-                    points_into)
+import emit.verify (verified, stacked_captures, payload_of, takeable, held_in_place, reuses_cells,
+                    made_width, re_held, leaves, answer_held, word_held, immortals, points_into)
 
 /// How a counted variable is held: a count of its own, or read without one out of the owned
 /// variables `bases` names, each live while it is (none where nothing the body lets go of holds
@@ -204,9 +203,10 @@ type Sight = {
 }
 
 /// `f` with a `Take` for each `Get` that is the one read, on any way through the body, of a counted
-/// one-word field, not a record held in place, out of a block this body holds a count of as a word or
-/// the box a sum's case holds, where the field is handed on: where the block is held only here, the
-/// field's count moves to its reader instead of being taken again. The block must be used otherwise
+/// one-word field, not a record held in place, out of a block this body holds a count of as a word,
+/// the box a sum's case holds or the words of a sum held as them (`verify.takeable`), where the field
+/// is handed on: where the block is held only here, the field's count moves to its reader instead of
+/// being taken again. The block must be used otherwise
 /// only to read its other fields, test its constructor or be updated, past the read, with a new value
 /// of that field, in the pass that bound it, so nothing reads the field after it is taken. Whether
 /// the body holds the block's count is what `facts_of` says, as the counts are placed: a join set
@@ -232,8 +232,8 @@ fn took(f: Fn) -> Fn = {
   let taking = s.gets.fold(
     Map::new(),
     |m: Map<Int, Var>, g: { var: Var, of: Var, path: Path, pass: Int }|
-      if s.bound.get(g.of.id) == Some(g.pass)
-          && ((g.of.rep == RWord && field_path(g.path)) || boxed_read(g.of.rep, g.path))
+      if s.bound.get(g.of.id) == Some(g.pass) && takeable(g.of.rep, g.path)
+          && payload_of(Get({ of: g.of, path: g.path }), g.var) == None
           && word_held(g.var.rep)
           && !held_in_place(g.of, g.path, g.var)
           && !s.whole.contains(g.of.id)
@@ -2284,13 +2284,19 @@ test "a word read out of a sum whose case lays it as its one counted word holds 
     body: reads.push(Return(AVar(out))),
     refused: None,
   });
-  // Where the case lays two counted words, either read is borrowed and counted again.
+  // Where the case lays two counted words, a read moves its word out of the sum this body holds, and
+  // the sum's release lets go of the other.
   let u = { ..t, rep: laid([P, P]) };
-  let first = bind(out, Get({ of: u, path: PCase({ case: 0, at: 0 }) }), []);
-  assert_eq(counted_body(root_of([u], [], RWord, [first, Return(AVar(out))])), {
-    body: [first, Inc({ var: out, n: 1 }), Dec(u), Return(AVar(out))],
-    refused: None,
-  });
+  let at_first = PCase({ case: 0, at: 0 });
+  assert_eq(
+    counted_body(
+      root_of([u], [], RWord, [bind(out, Get({ of: u, path: at_first }), []), Return(AVar(out))]),
+    ),
+    {
+      body: [bind(out, Take({ of: u, path: at_first }), []), Dec(u), Return(AVar(out))],
+      refused: None,
+    },
+  );
   // A word of the box a case holds is taken out of the box where the sum is held only here.
   let boxed = RSum({
     laid: {

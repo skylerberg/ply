@@ -13,7 +13,7 @@ import emit.roots (symbol_of, root_id)
 import emit.keys
 import emit.keys (RootKey, Named, Root, Written, root_name, root_text, has_entry)
 import emit.reps (Ctors, no_ctors)
-import emit.layout (Boxed, tag_bits)
+import emit.layout (Boxed, tag_bits, inline_word_at)
 import emit.pieces (Piece, Text, Hole, Symbol, TagOf, InGroup, LentBy, merged, spelled)
 import emit.release (drop_of)
 import emit.tir (Rep, RInt, RBool, RWord, RFlat, RSum, RUnit, RSlice, Var, Arg, AVar, AInt, ABool,
@@ -622,10 +622,11 @@ fn value_printed(p: Place, pr: Printing, into: Option<Var>, val: Val) -> Printin
     Walked(w) -> walked_value(p, pr, into, w.of, w.op),
   }
 
-/// The field held as one word at `t.path`'s offset in the block `t.of`, or in the box the case of the
-/// sum `t.of` holds, read with a count of its own: moved out of its slot, which is emptied, where the
-/// block is held only here, and counted once more where it is shared. A block held in place in
-/// another is held only here where the object counting for it is: its own header holds no count.
+/// The field held as one word at `t.path`'s offset in the block `t.of`, in the box the case of the
+/// sum `t.of` holds, or among the words of a sum held as them, read with a count of its own: moved
+/// out of its slot, which is emptied, where the block is held only here, and counted once more where
+/// it is shared. A block held in place in another is held only here where the object counting for
+/// it is: its own header holds no count. A sum's words are this body's alone.
 fn taken(
   p: Place,
   pr: Printing,
@@ -634,42 +635,68 @@ fn taken(
 ) -> Printing / {abort.raise} =
   match into {
     None -> unprinted(Spine, b"a field taken that nothing holds", var_said(t.of)),
-    Some(v) -> match field_of(name_of(pr, t.of), t.of.rep, t.path) {
-      None ->
-        unprinted(
-          Spine,
-          b"a field taken other than out of a block's word or a case's box",
-          var_said(t.of),
-        ),
-      Some(at) -> {
+    // A sum held as its words holds each alone: its word moves out, none left for its release.
+    Some(v) -> match match ((t.of.rep, t.path)) {
+        (RSum(s), PCase(c)) -> inline_word_at(s.laid, c.case, c.at),
+        _ -> None,
+      } {
+      Some(w) -> {
+        let name = name_of(pr, t.of);
+        let word = match part_names(name, t.of.rep).at(w) { Some(x) -> x, None -> name };
         let n = named(pr, v);
-        let read = line(
-          n.pr,
+        line(
+          line(n.pr, p.depth, Bytes::concat_all([c_type(v.rep), b" ", n.name, b" = ", word, b";"])),
           p.depth,
-          Bytes::concat_all([c_type(v.rep), b" ", n.name, b" = ", at.field, b";"]),
-        );
-        let held = Bytes::concat_all([
-          b"if (ply_counted_by(ply_obj(",
-          at.block,
-          b"))->rc == 1) ",
-          at.field,
-          b" = ply_unit; else",
-        ]);
-        // A word that is a sum is counted through its case, which its class says.
-        if v.rep == RWord {
-          line(read, p.depth, Bytes::concat_all([held, b" ", call_text(inc_fn(), [n.name]), b";"]))
-        } else {
-          line(
-            count_printed(
-              { ..p, depth: p.depth + 1 },
-              line(read, p.depth, held.concat(b" {")),
-              Inc({ var: v, n: 1 }),
-            ),
-            p.depth,
-            b"}",
-          )
-        }
+          word.concat(b" = 0;"),
+        )
       },
+      None -> taken_from_block(p, pr, v, t),
+    },
+  }
+
+/// `v` taken out of the block a word or a case's box holds, which leaves `ply_unit` in its place
+/// where the block is held only here and counts it again otherwise.
+fn taken_from_block(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  t: { of: Var, path: Path },
+) -> Printing / {abort.raise} =
+  match field_of(name_of(pr, t.of), t.of.rep, t.path) {
+    None ->
+      unprinted(
+        Spine,
+        b"a field taken other than out of a block's word or a case's box",
+        var_said(t.of),
+      ),
+    Some(at) -> {
+      let n = named(pr, v);
+      let read = line(
+        n.pr,
+        p.depth,
+        Bytes::concat_all([c_type(v.rep), b" ", n.name, b" = ", at.field, b";"]),
+      );
+      let held = Bytes::concat_all([
+        b"if (ply_counted_by(ply_obj(",
+        at.block,
+        b"))->rc == 1) ",
+        at.field,
+        b" = ply_unit; else",
+      ]);
+      // A word that is a sum is counted through its case, which its class says.
+      if v.rep == RWord {
+        line(read, p.depth, Bytes::concat_all([held, b" ", call_text(inc_fn(), [n.name]), b";"]))
+      } else {
+        line(
+          count_printed(
+            { ..p, depth: p.depth + 1 },
+            line(read, p.depth, held.concat(b" {")),
+            Inc({ var: v, n: 1 }),
+          ),
+          p.depth,
+          b"}",
+        )
+      }
     },
   }
 
