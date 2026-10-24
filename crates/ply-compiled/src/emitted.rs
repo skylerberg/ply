@@ -183,14 +183,6 @@ pub struct PlyType {
 // SAFETY: a descriptor is read-only data, which nothing writes once its unit is loaded.
 unsafe impl Sync for PlyType {}
 
-impl PlyType {
-    /// The type's spelling.
-    pub fn spelling(&self) -> &str {
-        let b = unsafe { std::slice::from_raw_parts(self.spelled, self.spelled_len as usize) };
-        std::str::from_utf8(b).unwrap_or("a type")
-    }
-}
-
 /// `op#effect.op@T1..Tk`: an operation at its perform's type arguments, static data emitted code
 /// lays out and hands [`crate::rt::rt_dispatch`], through whose types the runtime crosses what the
 /// perform passes and is answered.

@@ -17,4 +17,3 @@ mod map;
 mod parallel;
 mod rt;
 mod stack;
-mod stored;

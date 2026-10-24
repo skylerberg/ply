@@ -70,9 +70,9 @@ fn a_natives_signature_is_its_functions_type() {
         <Typed as Native>::SIGNATURE,
         of(&[Addr, I64, Moved, Type], Some(I64), false)
     );
-    let push = ply_core::Builtin::from_name("List::push").expect("a builtin");
+    let concat = ply_core::Builtin::from_name("Bytes::concat").expect("a builtin");
     let words = of(&[Machine::Word; 2], Some(Machine::Word), false);
-    assert_eq!(ply_compiled::rt::signature(push), words);
+    assert_eq!(ply_compiled::rt::signature(concat), words);
     let at = ply_core::Builtin::from_name("Bytes::at").expect("a builtin");
     assert_eq!(
         ply_compiled::rt::signature(at),
@@ -162,8 +162,8 @@ fn the_prelude_agrees_with_the_layouts_it_mirrors() {
     assert!(PRELUDE.contains("#define PLY_RAW 4"));
     assert_eq!(ply_compiled::heap::VIEW, 8, "PLY_VIEW");
     assert!(PRELUDE.contains("#define PLY_VIEW 8"));
-    assert_eq!(ply_compiled::heap::EMBEDDED, 0xC000_0000, "ply_embedded");
-    assert!(PRELUDE.contains("UINT32_C(0xC0000000) | (uint32_t)(PLY_HEADER / 8 + at)"));
+    assert_eq!(ply_compiled::heap::EMBEDDED, 0xC000_0000, "ply_counted_by");
+    assert!(ply_compiled::c::runtime_header().contains("rc >= UINT32_C(0xC0000000)"));
 }
 
 /// A unit binds the helpers it records by name, in its own order, each to this runtime's own.

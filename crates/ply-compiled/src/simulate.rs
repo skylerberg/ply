@@ -1,7 +1,6 @@
 //! `simulate` and production regions in the C backend: each task runs on its own stack and
 //! switches back to the machine's scheduler loop to perform `task`, `clock` or `random`. What the
-//! tasks pass each other is the release's code's values, read from its words, or emitted code's,
-//! kept with their types; emitted code's arguments cross in through its operation's types, and
+//! tasks pass each other is read as values or kept with their types; emitted code's arguments cross in through its operation's types, and
 //! what it is answered is written as PLV1 and lifted through them.
 
 use crate::emitted::{Block, Carried, Handed, PlyOp, PlyType};
@@ -29,8 +28,7 @@ use std::collections::BTreeMap;
 /// hears it, and let go when the region lets it go.
 pub(crate) struct Item(Option<Passed>);
 
-/// What an [`Item`] is: a value the release's code passed, read from its word, or one emitted code
-/// passed, kept with its type.
+/// What an [`Item`] is: a value read from what a task passed, or what it passed kept with its type.
 pub(crate) enum Passed {
     Value(Value),
     Carried(Carried),
@@ -67,8 +65,8 @@ impl Drop for Item {
     }
 }
 
-/// The word compiled code holds `item` as, which takes it: the release's code's made of its value,
-/// emitted code's the word it handed the region.
+/// The word compiled code holds `item` as, which takes it: a value's made of it, a kept one's the
+/// word it was handed the region as.
 pub(crate) fn word_of(c: &mut Ctx, item: Item) -> Word {
     match item.take() {
         Passed::Value(v) => c.word(&v),
@@ -282,8 +280,7 @@ extern "C" fn loop_entry(arg: usize) {
 }
 
 /// Once a production root's entry has returned: the loop drains the other tasks, and the region
-/// answers what the root did. `root` is the word the release's code answered, which the region
-/// reads; none for an entry that wrote its answer's encoding itself, of which the region keeps
+/// answers what the root did. `root` is the word the entry answered, which the region reads; none for an entry that wrote its answer's encoding itself, of which the region keeps
 /// nothing.
 pub unsafe fn finish_root(ctx: *mut Ctx, root: Option<Word>) -> Word {
     let c = unsafe { &mut *ctx };

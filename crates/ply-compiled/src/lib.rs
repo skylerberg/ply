@@ -26,7 +26,6 @@ pub mod rt;
 pub mod simulate;
 pub mod source;
 pub mod stack;
-pub mod stored;
 mod vm;
 
 pub use backend::{Bodies, Declines, Unit};

@@ -66,8 +66,7 @@ pub struct HandlerFrame {
 /// the entry's heap is gone.
 pub(crate) struct HandlerVars(pub(super) Vec<Var>);
 
-/// One handler variable: a uniform word the release's code set, or a value emitted code set with
-/// its type.
+/// One handler variable: a uniform word `?handler_set` set, or a value set with its type.
 pub(crate) enum Var {
     Word(Word),
     Carried(Carried),

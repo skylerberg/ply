@@ -145,38 +145,10 @@ typedef Word PlyMaybe;
 typedef Word PlyTagged;
 static inline PlyDec ply_dec_at(Word base, int64_t at) { PlyDec d; d.lo = ply_words(base)[at]; d.hi = ply_words(base)[at + 1]; return d; }
 static inline PlyDec ply_dec_of(Word w) { return ply_dec_at(w, 0); }
-static inline void ply_set_dec(Word base, int64_t at, PlyDec d) { ply_words(base)[at] = d.lo; ply_words(base)[at + 1] = d.hi; }
 
 static inline Word ply_imm(int64_t v) { return (Word)(((uint64_t)v << 1) | 1); }
 static inline int64_t ply_imm_value(Word w) { return w >> 1; }
 static inline int ply_fits_imm(int64_t v) { return v >= -(INT64_C(1) << 62) && v < (INT64_C(1) << 62); }
-
-/* An immortal object carries `rc == UINT32_MAX` and is never counted, exactly as `heap.rs` says. */
-/* A record or constructor dying at a count of one, with no children to let go of, becomes the
-   token the next record or constructor of its size takes, its header as it was, so one released
-   unused goes back to its own size. That is the whole of `heap::reset` for
-   the shape the kernel builds, and inlining it here is what keeps a record's death off the call
-   boundary --- the profile put `heap::reset` beside `round` itself, all of it the sixteen-child
-   walk a FLAT record skips. */
-static inline Word ply_reset_flat(Word w) {
-  if (ply_is_imm(w) || w == 0) return 0;
-  PlyObj *o = ply_obj(w);
-  if ((o->kind != 3 && o->kind != 4) || o->rc != 1 || !(o->flags & 1)) return 0;
-  return w;
-}
-
-/* A record held in place at word `at` of `base`'s, its header written as `heap::embed` writes it:
-   its count is how many words before it its holder's header starts. */
-static inline Word ply_embedded(Word base, int at, uint8_t flags, uint32_t len, uint32_t layout) {
-  PlyObj *e = (PlyObj *)&ply_words(base)[at];
-  e->rc = UINT32_C(0xC0000000) | (uint32_t)(PLY_HEADER / 8 + at);
-  e->kind = 3;
-  e->flags = flags;
-  e->aux = 0;
-  e->len = len;
-  e->layout = layout;
-  return (Word)(intptr_t)e;
-}
 
 /* A string's or bytes value's first byte: its own, or for a view the one its value holds where the
    view begins. */
@@ -191,10 +163,6 @@ static inline int64_t ply_array_len(Word w) {
   PlyObj *o = ply_obj(w);
   return o->aux ? (int64_t)(o->len / o->aux) : (int64_t)o->len;
 }
-
-/* The word a field holds, at a statically known offset. */
-static inline Word ply_field_at(Word base, int at) { return ply_words(base)[at]; }
-static inline void ply_set_field(Word base, int at, Word v) { ply_words(base)[at] = v; }
 "#;
 
 /// A runtime helper the emitted C may call: arguments past the context, whether it answers, and
@@ -494,56 +462,6 @@ pub fn runtime_header() -> String {
          \x20 if (rc >= UINT32_C(0x80000000)) { rt_dec_shared_p(ctx, (Word)o); return; }\n\
          \x20 if (rc > 1) { o->rc = rc - 1; return; }\n\
          \x20 rt_dec_p(ctx, (Word)o);\n\
-         }\n",
-    );
-    // `heap::embed`: a unique record's words move, so only its shell is let go.
-    out.push_str(
-        "\nstatic inline void ply_embed(PlyCtx *ctx, Word base, int at, Word child, int tail) {\n\
-         \x20 PlyObj *c = ply_obj(child);\n\
-         \x20 uint32_t len = c->len;\n\
-         \x20 uint8_t flags = c->flags;\n\
-         \x20 Word *src = ply_words(child);\n\
-         \x20 Word *dst = ply_words(base) + at + PLY_HEADER / 8;\n\
-         \x20 memcpy(dst, src, (size_t)len * 8);\n\
-         \x20 if (tail) {\n\
-         \x20   if (flags & PLY_MIXED) memcpy(dst + len, src + len, (size_t)tail * 8);\n\
-         \x20   else memset(dst + len, 0, (size_t)tail * 8);\n\
-         \x20 }\n\
-         \x20 ply_embedded(base, at, flags, len, c->layout);\n\
-         \x20 if (c->rc == 1) c->flags = flags | PLY_FLAT;\n\
-         \x20 else if (!(flags & PLY_FLAT))\n\
-         \x20   for (uint32_t i = 0; i < len; i++)\n\
-         \x20     if (!(flags & PLY_MIXED) || ((uint64_t)src[len + i / 64] >> (i % 64)) & 1) ply_inc(src[i]);\n\
-         \x20 ply_dec(ctx, child);\n\
-         }\n",
-    );
-    // What a record held in place counts, let go of before another is written over it.
-    out.push_str(
-        "\nstatic inline void ply_drop_embedded(PlyCtx *ctx, Word base, int at) {\n\
-         \x20 PlyObj *e = (PlyObj *)&ply_words(base)[at];\n\
-         \x20 uint32_t len = e->len;\n\
-         \x20 uint8_t flags = e->flags;\n\
-         \x20 Word *w = ply_words(base) + at + PLY_HEADER / 8;\n\
-         \x20 if (flags & PLY_FLAT) return;\n\
-         \x20 for (uint32_t i = 0; i < len; i++)\n\
-         \x20   if (!(flags & PLY_MIXED) || ((uint64_t)w[len + i / 64] >> (i % 64)) & 1) ply_dec(ctx, w[i]);\n\
-         }\n",
-    );
-    // A field's last read, where the record is its only holder: what it counts moves with it.
-    out.push_str(
-        "\nstatic inline Word ply_take(PlyCtx *ctx, Word base, int at) {\n\
-         \x20 Word inner = (Word)(intptr_t)(ply_words(base) + at);\n\
-         \x20 if (ply_obj(base)->rc != 1) { ply_inc(inner); return inner; }\n\
-         \x20 PlyObj *e = ply_obj(inner);\n\
-         \x20 uint32_t len = e->len;\n\
-         \x20 uint8_t flags = e->flags;\n\
-         \x20 Word *src = ply_words(inner);\n\
-         \x20 Word out = rt_alloc_p(ctx, 3, len, e->layout, flags);\n\
-         \x20 memcpy(ply_words(out), src, ((size_t)len + ((flags & PLY_MIXED) ? (len + 63) / 64 : 0)) * 8);\n\
-         \x20 if (!(flags & PLY_FLAT))\n\
-         \x20   for (uint32_t i = 0; i < len; i++)\n\
-         \x20     if (!(flags & PLY_MIXED) || ((uint64_t)src[len + i / 64] >> (i % 64)) & 1) src[i] = 0;\n\
-         \x20 return out;\n\
          }\n",
     );
     out

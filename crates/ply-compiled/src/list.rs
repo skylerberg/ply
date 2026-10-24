@@ -215,95 +215,6 @@ impl Heap {
         out
     }
 
-    /// `xs`, which it takes, held once with room for `room` tail elements: itself where it is held
-    /// once and has the room, else a copy holding its contents once more (the original released).
-    pub fn list_writable(&mut self, xs: Word, room: usize) -> Word {
-        let o = obj(xs);
-        if is_unique(xs) && cap(o) >= room {
-            return xs;
-        }
-        let copy = self.clone_list(o, room.max(cap(o)).min(WIDTH));
-        dec(xs);
-        copy as Word
-    }
-
-    /// `xs` with `x` appended. Takes both; an unshared list grows in place.
-    pub fn list_push(&mut self, xs: Word, x: Word) -> Word {
-        // The machine's reuse counters, which `ply run --json` reports.
-        let in_place = is_unique(xs);
-        ply_core::rc::note_update_of(
-            in_place,
-            if in_place { 0 } else { tail_len(obj(xs)) },
-            ply_core::Span::DUMMY,
-        );
-        self.list_grown(xs, x)
-    }
-
-    /// `list_push` as the runtime gathers a list itself: no update the program wrote, so the
-    /// reuse counters are not told.
-    pub fn list_grown(&mut self, xs: Word, x: Word) -> Word {
-        let n = tail_len(obj(xs));
-        let room = if n == cap(obj(xs)) {
-            cap(obj(xs)) * 2
-        } else {
-            cap(obj(xs))
-        };
-        let o = obj(self.list_writable(xs, room.min(WIDTH)));
-        let n = tail_len(o);
-        if n == WIDTH {
-            let leaf = self.alloc_node(KIND_LEAF, tail(o));
-            let r = self.push_leaf(root(o), tail_offset(o), leaf);
-            unsafe { set_word(o, ROOT, r) };
-            set_tail_len(o, 0);
-        }
-        let n = tail_len(o);
-        unsafe {
-            set_word(o, TAIL + n, x);
-            (*o).len += 1;
-        }
-        set_tail_len(o, n + 1);
-        o as Word
-    }
-
-    /// `xs` with in-range element `i` replaced by `v`, in place when unshared. Takes both.
-    pub fn list_set(&mut self, xs: Word, i: usize, v: Word) -> Word {
-        debug_assert!(i < len(obj(xs)));
-        let mut copied = (!is_unique(xs)).then(|| tail_len(obj(xs)));
-        let o = obj(self.list_writable(xs, cap(obj(xs))));
-        let p = start(o) + i;
-        let offset = tail_offset(o);
-        let (node, at) = if p >= offset {
-            (o, TAIL + p - offset)
-        } else {
-            let r = self.owned(root(o), &mut copied);
-            unsafe { set_word(o, ROOT, r) };
-            let mut node = obj(r);
-            let mut shift = shift_for(offset);
-            while shift > 0 {
-                let k = (p >> shift) & MASK;
-                let child = self.owned(unsafe { word_at(node, k) }, &mut copied);
-                unsafe { set_word(node, k, child) };
-                node = obj(child);
-                shift -= BITS;
-            }
-            (node, p & MASK)
-        };
-        let old = unsafe { word_at(node, at) };
-        unsafe { set_word(node, at, v) };
-        dec(old);
-        ply_core::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), ply_core::Span::DUMMY);
-        o as Word
-    }
-
-    /// [`Heap::writable`], counting the children a shared node was copied for.
-    fn owned(&mut self, node: Word, copied: &mut Option<usize>) -> Word {
-        if !is_unique(node) {
-            let n = unsafe { (*obj(node)).len } as usize;
-            *copied = Some(copied.unwrap_or(0) + n);
-        }
-        self.writable(node)
-    }
-
     /// The list without its first `k` elements, sharing the trie and copying at most the tail.
     /// Reads `xs`.
     pub fn list_skip(&mut self, xs: Word, k: usize) -> Word {
@@ -410,22 +321,4 @@ pub fn children(o: *mut Obj) -> impl Iterator<Item = Word> {
         .then_some(r)
         .into_iter()
         .chain(tail(o).iter().copied())
-}
-
-/// Whether the list's whole structure is held by this list alone.
-pub fn unique_throughout(xs: Word) -> bool {
-    fn unique_path(node: Word) -> bool {
-        if !is_unique(node) {
-            return false;
-        }
-        let o = obj(node);
-        if unsafe { (*o).kind } == KIND_LEAF {
-            return true;
-        }
-        kids(o).last().is_none_or(|k| unique_path(*k))
-    }
-    is_unique(xs) && {
-        let r = root(obj(xs));
-        r == 0 || unique_path(r)
-    }
 }

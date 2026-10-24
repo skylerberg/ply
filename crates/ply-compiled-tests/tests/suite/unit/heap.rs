@@ -684,16 +684,13 @@ fn a_native_map_holds_its_entries_in_the_interpreters_order_and_round_trips() {
     );
     assert!(map::get(&l, obj(m), imm(3)).is_some());
     assert!(map::get(&l, obj(m), imm(2)).is_none());
-    let m = h.map_remove(&l, m, imm(3));
-    let m = h.map_remove(&l, m, imm(99));
-    assert_eq!(unsafe { (*obj(m)).len }, 3);
     // A shared map is copied by an insert and the original keeps its entries.
     inc(m);
     let kw = h.to_word(&l, &Value::Int(2));
     let m2 = h.map_insert(&l, m, kw, imm(0));
     assert_ne!(m, m2);
-    assert_eq!(unsafe { (*obj(m)).len }, 3);
-    assert_eq!(unsafe { (*obj(m2)).len }, 4);
+    assert_eq!(unsafe { (*obj(m)).len }, 4);
+    assert_eq!(unsafe { (*obj(m2)).len }, 5);
     h.end();
 }
 
@@ -702,7 +699,8 @@ fn an_adopted_word_is_a_copy_that_outlives_the_entry_and_shares_what_was_already
     let l = layouts();
     let mut entry = Heap::new();
     let mut kept = Heap::persistent();
-    let shared = kept.immortal(&l, &Value::str("shared"));
+    let shared = kept.to_word(&l, &Value::str("shared"));
+    mark_immortal(shared);
     let record = Value::Record(Arc::new(Fields::from_unsorted(vec![
         (Symbol::new("n"), Value::Int(1)),
         (Symbol::new("s"), Value::str("own")),
@@ -723,7 +721,8 @@ fn an_adopted_word_is_a_copy_that_outlives_the_entry_and_shares_what_was_already
 fn an_immortal_word_survives_the_end_of_every_entry_and_counts_nothing() {
     let mut h = Heap::persistent();
     let l = layouts();
-    let w = h.immortal(&l, &Value::list(vec![Value::str("a"), Value::Int(1)]));
+    let w = h.to_word(&l, &Value::list(vec![Value::str("a"), Value::Int(1)]));
+    mark_immortal(w);
     h.end();
     inc(w);
     dec(w);
@@ -945,10 +944,6 @@ fn every_walker_refuses_a_block_emitted_code_laid_out_by_its_own_name() {
         ("native_key", Box::new(|w| _ = native_key(&l, w))),
         ("cmp_words", Box::new(|w| _ = cmp_words(&l, w, imm(1)))),
         ("Layouts::parts", Box::new(|w| _ = l.parts(obj(w)))),
-        (
-            "stored::text",
-            Box::new(|w| _ = ply_compiled::stored::text(&l, w)),
-        ),
     ];
     for (walker, walk) in walks {
         let w = emitted(&mut ctx);

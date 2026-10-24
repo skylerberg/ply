@@ -15,8 +15,6 @@ pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
 pub struct Tables {
     /// The constant pool as values.
     pub consts: Vec<Value>,
-    /// The same constants as immortal words, which a literal answers.
-    pub const_words: Vec<Word>,
     pub layouts: Layouts,
     /// Every field name a compiled body reads, so a field access is an index.
     pub fields: Vec<Symbol>,
@@ -30,15 +28,12 @@ pub struct Tables {
     /// before the answer is: a later read charges it, so a cost is the same whether or not it was
     /// memoized.
     pub memo_costs: Box<[(AtomicI64, AtomicI64, AtomicI64)]>,
-    /// Each function's closure over nothing, by index, once a body asked for it; `0` is not yet.
-    pub lambdas: Box<[AtomicI64]>,
     /// Owns the constant pool's and the memo's objects for as long as the unit lives.
     pub immortals: Mutex<Heap>,
     /// The 256 one-byte values, each made immortal when first asked for; `0` is not yet.
     pub bytes: [AtomicI64; 256],
     /// Per constructor index, a nullary one's immortal singleton, or `0`.
     pub nullaries: Vec<Word>,
-    pub empty_list: Word,
     pub empty_map: Word,
     /// Memo words and their converted values, both ways, so a tree crosses the seam unrebuilt.
     pub memo_values: Mutex<HashMap<Word, Value>>,
@@ -131,16 +126,6 @@ impl Tables {
             slot.store(kept, Release);
         }
         kept
-    }
-
-    /// As [`Tables::memoize`], with what computing the answer cost, which every later read charges.
-    pub fn memoize_costing(&self, index: usize, w: Word, cost: Cost) -> Word {
-        if let Some((steps, allocations, bytes)) = self.memo_costs.get(index) {
-            steps.store(cost.steps, Release);
-            allocations.store(cost.allocations, Release);
-            bytes.store(cost.bytes, Release);
-        }
-        self.memoize(index, w)
     }
 
     /// Remembers `kept`, an immortal copy emitted code made, as pure nullary function `index`'s

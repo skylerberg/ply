@@ -484,15 +484,6 @@ impl Slot {
             _ => 1,
         }
     }
-
-    /// Whether a field of the slot is a scalar held as its own words: an `Int`, a `Float`, a
-    /// 64-bit width or a `Decimal`.
-    pub fn is_raw(self) -> bool {
-        matches!(
-            self,
-            Slot::Int | Slot::Float | Slot::Wide(_) | Slot::Decimal
-        )
-    }
 }
 
 /// What a field a record holds in place as a record is spelled with: after its name, and its shape's
@@ -947,10 +938,6 @@ pub struct Layouts {
     /// The prelude constructors the runtime builds itself, resolved once.
     pub some: Option<u32>,
     pub none: Option<u32>,
-    pub ok: Option<u32>,
-    pub err: Option<u32>,
-    pub stop: Option<u32>,
-    pub go: Option<u32>,
     pub less: Option<u32>,
     pub equal: Option<u32>,
     pub greater: Option<u32>,
@@ -1030,8 +1017,7 @@ impl Layouts {
             .map(|(i, (n, _))| (n.clone(), i as u32))
             .collect();
         let by = |name: &str| ctor_ids.get(&Symbol::new(name)).copied();
-        let (some, none, stop, go) = (by("Some"), by("None"), by("Stop"), by("Continue"));
-        let (ok, err) = (by("Ok"), by("Err"));
+        let (some, none) = (by("Some"), by("None"));
         let (less, equal, greater) = (by("Less"), by("Equal"), by("Greater"));
         let mut interned = Shapes::default();
         for names in shapes {
@@ -1044,10 +1030,6 @@ impl Layouts {
             ctor_ids,
             some,
             none,
-            ok,
-            err,
-            stop,
-            go,
             less,
             equal,
             greater,
@@ -1220,13 +1202,6 @@ impl Layouts {
     /// How a shape's records hold each field, in its order.
     pub fn shape_slots(&self, shape: u32) -> Arc<[Slot]> {
         self.read().slots[shape as usize].clone()
-    }
-
-    /// Whether a shape's records hold anything but words: a `Float`'s bits, or a record in place.
-    pub fn holds_raw(&self, shape: u32) -> bool {
-        self.read().slots[shape as usize]
-            .iter()
-            .any(|s| *s != Slot::Word)
     }
 
     /// How many fields a shape has.
@@ -1969,17 +1944,6 @@ impl Heap {
         unsafe { bridge_slot(o).write(v) };
         self.bridges.push(o);
         o as Word
-    }
-
-    /// A constant-pool word: immortal, as is everything under it.
-    pub fn immortal(&mut self, layouts: &Layouts, v: &Value) -> Word {
-        debug_assert!(
-            self.persistent,
-            "an immortal word needs a heap that never resets"
-        );
-        let w = self.to_word(layouts, v);
-        mark_immortal(w);
-        w
     }
 
     /// An immortal deep copy of `w` into this persistent heap, sharing what is already immortal.

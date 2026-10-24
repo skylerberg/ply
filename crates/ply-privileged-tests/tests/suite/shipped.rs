@@ -110,16 +110,13 @@ fn the_runtime_describes_each_native_under_the_fields_a_build_reads() {
             .find(|n| n["name"] == name)
             .unwrap_or_else(|| panic!("no native `{name}`"))
     };
-    let push = named("List::push");
+    let concat = named("Bytes::concat");
     assert_eq!(
-        (&push["words"], &push["answers"], &push["raises"]),
+        (&concat["words"], &concat["answers"], &concat["raises"]),
         (&2.into(), &true.into(), &false.into())
     );
-    let range = named("Map::range");
-    assert_eq!(
-        (&range["words"], &range["raises"]),
-        (&6.into(), &false.into())
-    );
+    let div = named("Decimal::div");
+    assert_eq!((&div["words"], &div["raises"]), (&4.into(), &true.into()));
     let decode = named("Secret::decode");
     assert_eq!(
         (&decode["words"], &decode["raises"]),
@@ -171,9 +168,9 @@ fn the_runtime_describes_what_emitted_code_lays_out_against() {
             .unwrap_or_else(|| panic!("no native `{name}`"))
             .clone()
     };
-    let push = native("List::push");
-    assert_eq!(push["params"], serde_json::json!(["Word", "Word"]));
-    assert_eq!(push["answer"], "Word");
+    let concat = native("Bytes::concat");
+    assert_eq!(concat["params"], serde_json::json!(["Word", "Word"]));
+    assert_eq!(concat["answer"], "Word");
     let out = native("?out_str");
     assert_eq!(
         (&out["params"], &out["answer"], &out["words"]),
