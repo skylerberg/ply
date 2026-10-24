@@ -88,6 +88,43 @@ pub fn natives() -> Vec<MachineNative> {
             rt_refused_text as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
     ]
+    .into_iter()
+    .chain(float_natives())
+    .collect()
+}
+
+/// Each `Float` function as compiled code calls it: its operands' bits in, its answer's out,
+/// computed as the value builtin of the same name computes it.
+macro_rules! float_functions {
+    ($($name:literal => $f:ident = $($math:ident)::+ ($($a:ident),+);)+) => {
+        $(unsafe extern "C" fn $f(_ctx: *mut Ctx, $($a: F64),+) -> F64 {
+            F64(ply_core::float::bits($($math)::+($(f64::from_bits($a.0)),+)))
+        })+
+
+        fn float_natives() -> Vec<MachineNative> {
+            vec![$(machine_native($name, $f as unsafe extern "C" fn(*mut Ctx, $(float_functions!(@f64 $a)),+) -> F64)),+]
+        }
+    };
+    (@f64 $a:ident) => { F64 };
+}
+
+float_functions! {
+    "?float_floor" => rt_float_floor = f64::floor(x);
+    "?float_ceil" => rt_float_ceil = f64::ceil(x);
+    "?float_sqrt" => rt_float_sqrt = f64::sqrt(x);
+    "?float_exp" => rt_float_exp = ply_core::float::exp(x);
+    "?float_ln" => rt_float_ln = ply_core::float::ln(x);
+    "?float_log2" => rt_float_log2 = ply_core::float::log2(x);
+    "?float_log10" => rt_float_log10 = ply_core::float::log10(x);
+    "?float_sin" => rt_float_sin = ply_core::float::sin(x);
+    "?float_cos" => rt_float_cos = ply_core::float::cos(x);
+    "?float_tan" => rt_float_tan = ply_core::float::tan(x);
+    "?float_asin" => rt_float_asin = ply_core::float::asin(x);
+    "?float_acos" => rt_float_acos = ply_core::float::acos(x);
+    "?float_atan" => rt_float_atan = ply_core::float::atan(x);
+    "?float_pow" => rt_float_pow = ply_core::float::pow(x, y);
+    "?float_atan2" => rt_float_atan2 = ply_core::float::atan2(y, x);
+    "?float_hypot" => rt_float_hypot = ply_core::float::hypot(x, y);
 }
 
 #[cold]
