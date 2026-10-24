@@ -8,7 +8,6 @@ use crate::heap::{
     Layouts, Stated, Word, bridged, bytes_of, is_unique, obj, set_word, str_of, word_at,
 };
 use crate::host::Served;
-use crate::map;
 use crate::native::{Answered, I64, Native, Raises, Raising, Signature};
 use crate::stack::{Stack, switch};
 use crate::{array, columns, list};

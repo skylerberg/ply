@@ -362,15 +362,6 @@ impl StackCopy {
     }
 }
 
-/// A flat record of `n` words, which holds no count of what is put in them.
-pub(super) fn uncounted(c: &mut Ctx, n: usize) -> Word {
-    let o = c.heap.alloc(KIND_RECORD, heap::FLAT, n as u32, 0);
-    for i in 0..n {
-        unsafe { set_word(o, i, heap::unit()) };
-    }
-    o as Word
-}
-
 /// A raise on its way to the `handle` that answers it: that frame's stack and depth, which of its
 /// clauses, what the clause is given, and what the entry fails with should the frame be gone.
 pub(crate) struct Aborting {

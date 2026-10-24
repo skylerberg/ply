@@ -1,9 +1,7 @@
 //! The prelude, in one definition per builtin.
 
 use crate::semantics::arity_error;
-use crate::value::{
-    Decimal, Fixed, FixedOp, List, Value, first_difference, type_error, values_equal,
-};
+use crate::value::{Decimal, Fixed, FixedOp, Value, first_difference, type_error, values_equal};
 use crate::{BinOp, Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, float, map, slot};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
@@ -74,18 +72,11 @@ builtins! { $
     /// both shown, comparing nothing. No source can spell it.
     AssertFailed = "?assert_failed" (actual, expected) -> Raising;
     Len = "List::len" (xs) -> Word;
-    Push = "List::push" (xs, x) -> Word;
     WithCapacity = "List::with_capacity" (n) -> Word;
-    ListAt = "List::at" (xs, i) -> Word;
-    /// One element replaced, sharing the rest; raises where `List::at` answers `None`.
-    ListSet = "List::set" (xs, i, v) -> Raising;
     /// The leaf of a list's trie that holds its items `j * 32` on, counting from the leaf a `rest`
     /// cut starts in, as compiled code holds an `Option`: the leaf's word with a count of the
     /// caller's, or zero past the last.
     ListLeafOf = "ListNode::leaf_of" (xs, j) -> Word;
-    Map = "List::map" (xs, f) -> Word;
-    Filter = "List::filter" (xs, f) -> Word;
-    Fold = "List::fold" (xs, init, f) -> Word;
     Iterate = "iterate" (seed, budget, step) -> Raising;
     Metered = "metered" (f) -> Word;
     Range = "range" (lo, hi) -> Word;
@@ -157,18 +148,7 @@ builtins! { $
     StringContains = "String::contains" (s, t) -> Word;
     StringFind = "String::find" (s, needle) -> Raising;
     MapNew = "Map::new" () -> Word;
-    MapInsert = "Map::insert" (m, key, value) -> Word;
-    MapGet = "Map::get" (m, key) -> Word;
-    MapContains = "Map::contains" (m, key) -> Word;
-    MapRemove = "Map::remove" (m, key) -> Word;
     MapLen = "Map::len" (m) -> Word;
-    MapKeys = "Map::keys" (m) -> Word;
-    MapValues = "Map::values" (m) -> Word;
-    MapEntries = "Map::entries" (m) -> Word;
-    MapOfEntries = "Map::of_entries" (es) -> Word;
-    MapMerge = "Map::merge" (a, b) -> Word;
-    MapFold = "Map::fold" (m, init, f) -> Word;
-    MapUpdate = "Map::update" (m, key, f) -> Word;
     DecimalDiv = "Decimal::div" (a, b, scale, mode) -> Raising;
     DecimalRound = "Decimal::round" (d, scale, mode) -> Raising;
     DecimalOfInt = "Decimal::of_int" (n) -> Word;
@@ -213,7 +193,6 @@ builtins! { $
     StringOfChars = "String::of_chars" (cs) -> Word;
     ArrayNew = "Array::new" (n, x) -> Raising;
     ArrayOfList = "Array::of_list" (xs) -> Word;
-    ArrayToList = "Array::to_list" (xs) -> Word;
     ArrayLen = "Array::len" (xs) -> Word;
     ArrayAt = "Array::at" (xs, i) -> Word;
     /// Raises where `Array::at` answers `None`.
@@ -224,7 +203,6 @@ builtins! { $
     /// is the array of its records, and each builtin answers as its `array_` namesake does.
     ColumnsNew = "Columns::new" (n, x) -> Raising;
     ColumnsOfList = "Columns::of_list" (xs) -> Word;
-    ColumnsToList = "Columns::to_list" (xs) -> Word;
     ColumnsLen = "Columns::len" (xs) -> Word;
     ColumnsAt = "Columns::at" (xs, i) -> Word;
     ColumnsGet = "Columns::get" (xs, i) -> Raising;
@@ -270,20 +248,6 @@ builtins! { $
     Atan = "Float::atan" (x) -> Word;
     Atan2 = "Float::atan2" (y, x) -> Word;
     Hypot = "Float::hypot" (x, y) -> Word;
-    /// The entry at an end of a map's key order, as `Some({key, value})`.
-    MapFirst = "Map::first" (m) -> Word;
-    MapLast = "Map::last" (m) -> Word;
-    /// The entry nearest a key from one side, the key's own counted or not.
-    MapFloor = "Map::floor" (m, key) -> Word;
-    MapCeiling = "Map::ceiling" (m, key) -> Word;
-    MapBelow = "Map::below" (m, key) -> Word;
-    MapAbove = "Map::above" (m, key) -> Word;
-    /// An end's entry with the map that is left, in place while the map has one holder.
-    MapPopFirst = "Map::pop_first" (m) -> Word;
-    MapPopLast = "Map::pop_last" (m) -> Word;
-    /// `Map::range(m, lo, lo_inclusive, hi, hi_inclusive, limit)`.
-    MapRange = "Map::range" (m, lo, lo_inclusive, hi, hi_inclusive, limit) -> Word;
-    MapSplit = "Map::split" (m, key) -> Word;
     /// What a hold holds, while its region has not let it go.
     HoldGet = "Hold::get" (h) -> Word;
     /// A hold's contents moved out for its release, so the next read finds them gone. No source
@@ -371,34 +335,6 @@ impl Builtin {
     pub fn converts_from(self) -> Option<IntTy> {
         INT_TYPES.into_iter().find(|t| Builtin::int_of(*t) == self)
     }
-}
-
-fn push(args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
-    let x = args.pop().expect("arity checked");
-    let mut xs = args.pop().expect("arity checked");
-    let Value::List(list) = &mut xs else {
-        return Err(type_error(span, "`List::push`", "List", &xs));
-    };
-    let copied = list.push(x);
-    crate::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), span);
-    Ok(xs)
-}
-
-/// `List::set`, taking the list out of its arguments so the last holder writes in place.
-fn list_set(args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
-    let v = args.pop().expect("arity checked");
-    let index = args.pop().expect("arity checked");
-    let mut xs = args.pop().expect("arity checked");
-    let Value::List(list) = &mut xs else {
-        return Err(type_error(span, "`List::set`", "List", &xs));
-    };
-    let i = index.as_int(span, "`List::set`")?;
-    let Some(at) = usize::try_from(i).ok().filter(|at| *at < list.len()) else {
-        return Err(out_of_range(span, "List::set", i, list.len(), "elements"));
-    };
-    let copied = list.set(at, v);
-    crate::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), span);
-    Ok(xs)
 }
 
 /// A value of a `numeric` or `integer` parameter, read as the type its witness names: one of the
@@ -528,29 +464,14 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             other => Err(type_error(span, "`List::len`", "a List or String", other)),
         },
 
-        Builtin::Push => push(args, span),
-
         Builtin::WithCapacity => {
             args[0].as_int(span, "`List::with_capacity`")?;
             Ok(Value::list(Vec::new()))
         }
 
-        Builtin::ListAt => {
-            let xs = args[0].as_list(span, "`List::at`")?;
-            let i = args[1].as_int(span, "`List::at`")?;
-            Ok(option(at(xs, i).cloned()))
-        }
-
-        Builtin::ListSet => list_set(args, span),
-
-        Builtin::Map
-        | Builtin::Filter
-        | Builtin::Fold
-        | Builtin::Iterate
+        Builtin::Iterate
         | Builtin::Metered
         | Builtin::BytesPosition
-        | Builtin::MapUpdate
-        | Builtin::MapFold
         | Builtin::Bracket
         | Builtin::HoldGet
         | Builtin::HoldTake
@@ -1010,10 +931,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 .collect(),
         )),
 
-        Builtin::ArrayToList | Builtin::ColumnsToList => Ok(Value::list(
-            args[0].as_array(span, &format!("`{}`", b.name()))?.to_vec(),
-        )),
-
         Builtin::ArrayLen | Builtin::ColumnsLen => Ok(Value::Int(
             args[0].as_array(span, &format!("`{}`", b.name()))?.len() as i64,
         )),
@@ -1231,34 +1148,8 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             ))
         }
 
-        // Every map builtin reaches keys through `map::key`, the one gate before `Value::cmp`.
         Builtin::MapNew => Ok(map::new()),
-        Builtin::MapInsert => {
-            let (k, v) = (args.remove(1), args.remove(1));
-            Ok(map::insert(args.remove(0), k, v, span)?)
-        }
-        Builtin::MapGet => Ok(map::get(&args[0], &args[1], span)?),
-        Builtin::MapContains => Ok(map::contains(&args[0], &args[1], span)?),
-        Builtin::MapRemove => {
-            let k = args.remove(1);
-            Ok(map::remove(args.remove(0), &k, span)?)
-        }
         Builtin::MapLen => Ok(map::len(&args[0], span)?),
-        Builtin::MapKeys => Ok(map::keys(&args[0], span)?),
-        Builtin::MapValues => Ok(map::values(&args[0], span)?),
-        Builtin::MapEntries => Ok(map::entries(&args[0], span)?),
-        Builtin::MapOfEntries => Ok(map::of_entries(&args[0], span)?),
-        Builtin::MapMerge => Ok(map::merge(&args[0], &args[1], span)?),
-        Builtin::MapFirst | Builtin::MapLast => Ok(map::end(&args[0], b, span)?),
-        Builtin::MapFloor | Builtin::MapCeiling | Builtin::MapBelow | Builtin::MapAbove => {
-            Ok(map::beside(&args[0], &args[1], b, span)?)
-        }
-        Builtin::MapPopFirst | Builtin::MapPopLast => Ok(map::pop(args.remove(0), b, span)?),
-        Builtin::MapRange => Ok(map::range(args, span)?),
-        Builtin::MapSplit => {
-            let k = args.remove(1);
-            Ok(map::split(args.remove(0), &k, span)?)
-        }
 
         Builtin::DecimalDiv => {
             let a = args[0].as_decimal(span, "`Decimal::div`")?;
@@ -1403,10 +1294,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::SqliteRun => crate::sqlite::run_image(args, span),
         Builtin::SqliteFunctions => Ok(crate::sqlite::functions()),
     }
-}
-
-fn at(xs: &List, i: i64) -> Option<&Value> {
-    usize::try_from(i).ok().and_then(|i| xs.get(i))
 }
 
 /// Digits, after a `-` only for a signed width, and a value the width holds.
