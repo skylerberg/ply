@@ -1464,7 +1464,7 @@ fn decimal_of_float(f: f64) -> Option<Decimal> {
 }
 
 /// The nearest `f64`, so `Float::of_decimal(decimal_of_float(f)) == f` wherever defined.
-fn float_of_decimal(d: Decimal) -> f64 {
+pub fn float_of_decimal(d: Decimal) -> f64 {
     d.to_string()
         .parse::<f64>()
         .unwrap_or_else(|_| d.to_f64().unwrap_or(f64::NAN))

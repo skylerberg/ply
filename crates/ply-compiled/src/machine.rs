@@ -52,6 +52,10 @@ pub fn natives() -> Vec<MachineNative> {
             rt_decimal_text as unsafe extern "C" fn(_, _, _) -> _,
         ),
         machine_native(
+            "?decimal_float",
+            rt_decimal_float as unsafe extern "C" fn(_, _, _) -> _,
+        ),
+        machine_native(
             "?wide_text",
             rt_wide_text as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
@@ -265,6 +269,13 @@ pub unsafe extern "C" fn rt_float_text(ctx: *mut Ctx, bits: F64) -> I64 {
 pub unsafe extern "C" fn rt_decimal_text(ctx: *mut Ctx, lo: I64, hi: I64) -> I64 {
     let d = decimal_of(lo, hi);
     unsafe { &mut *ctx }.taken_of(Builtin::DecimalToString, vec![Value::Decimal(d)])
+}
+
+/// `Float::of_decimal` of the `Decimal` whose two words are `lo` and `hi`, as its bits.
+pub unsafe extern "C" fn rt_decimal_float(_ctx: *mut Ctx, lo: I64, hi: I64) -> F64 {
+    F64(ply_core::float::bits(ply_core::builtins::float_of_decimal(
+        decimal_of(lo, hi),
+    )))
 }
 
 /// `I128::to_string` where `signed` is not 0, else `U128::to_string`, of the 128 bits `hi` then

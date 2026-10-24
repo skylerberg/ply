@@ -310,6 +310,7 @@ pub fn operated(
         let x = handed({ st: st, arg: a }, RFloat, at);
         bound(cx, x.st, named_type(b"Int"), Prim({ op: b"bits", on: RFloat, args: [x.arg] }), at)
       } else if float_function(name) != None { float_called(st, name, args, at) }
+      else if decimal_conversion(name) { decimal_converted(cx, st, name, a, at) }
       else if wrapping(name) || saturating(name) || name.starts_with(b"checked_") {
         width_arithmetic(cx, st, name, args, at)
       } else if name == b"?stated_witness" { witnessed(cx, st, a, at) } else {
@@ -321,7 +322,7 @@ pub fn operated(
             bound(cx, x.st, width_type(w), Prim({ op: b"of_int", on: RInt, args: [x.arg] }), at)
           },
           None -> match int_of_width(name) {
-            Some(w) -> if w.bits > 64 || (w.bits == 64 && !w.signed) {
+            Some(w) -> if w.bits > 64 {
               through_runtime(
                 cx,
                 st,
@@ -346,6 +347,74 @@ pub fn operated(
       }
     },
   }
+
+/// Whether builtin `name` converts to or from a `Decimal` over its two words.
+pub fn decimal_conversion(name: Bytes) -> Bool =
+  name == b"Decimal::of_int" || name == b"Decimal::scale" || name == b"Float::of_decimal"
+
+/// `Decimal::of_int`, `Decimal::scale` or `Float::of_decimal` of `a`, over a `Decimal`'s two words,
+/// which hold it as `rust_decimal` serializes it: the flags (the scale in bits 16 to 23, the sign in
+/// bit 31) with the mantissa's low 32 bits above them, then its other 64.
+fn decimal_converted(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  a: Arg,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  if name == b"Decimal::of_int" {
+    let x = handed({ st: st, arg: a }, RInt, at);
+    bound(
+      cx,
+      x.st,
+      named_type(b"Decimal"),
+      Prim({ op: b"to_decimal", on: RInt, args: [x.arg] }),
+      at,
+    )
+  } else if name == b"Decimal::scale" {
+    let d = handed({ st: st, arg: a }, RDec, at);
+    bound(cx, d.st, named_type(b"Int"), Prim({ op: b"scale", on: RDec, args: [d.arg] }), at)
+  } else {
+    let w = dec_words(st, a, at);
+    let bits = bound_as(
+      w.st,
+      named_type(b"Int"),
+      RInt,
+      Native({
+        name: builtin_helper(b"?decimal_float").concat(b"_p"),
+        args: [w.lo, w.hi],
+        uses: { takes: [false, false], owned: true, fails: false, stops: false },
+      }),
+      at,
+    );
+    bound_as(
+      bits.st,
+      named_type(b"Float"),
+      RFloat,
+      Prim({ op: b"of_bits", on: RInt, args: [bits.arg] }),
+      at,
+    )
+  }
+
+/// The two words of `Decimal` `a`, read from the registers that hold it.
+pub fn dec_words(st: Lowering, a: Arg, at: Span) -> { st: Lowering, lo: Arg, hi: Arg } = {
+  let d = handed({ st: st, arg: a }, RDec, at);
+  let lo = bound_as(
+    d.st,
+    named_type(b"Int"),
+    RInt,
+    Prim({ op: b"dec_lo", on: RDec, args: [d.arg] }),
+    at,
+  );
+  let hi = bound_as(
+    lo.st,
+    named_type(b"Int"),
+    RInt,
+    Prim({ op: b"dec_hi", on: RDec, args: [d.arg] }),
+    at,
+  );
+  { st: hi.st, lo: lo.arg, hi: hi.arg }
+}
 
 /// The type builtin `name` answers called on operands of type `ty`: its declared scheme at that
 /// type, or `known` where the setting declares no such builtin.
@@ -382,6 +451,28 @@ fn read_literal(st: Lowering, a: Arg) -> Option<{ st: Lowering, name: Bytes }> =
     },
     _ -> None,
   }
+
+/// Whether `numeric_of_int` at `ty` is a conversion written in place: at `Int`, `Float` or a width a
+/// register holds.
+pub fn numeric_in_place(ctors: Ctors, ty: Type) -> Bool =
+  match class_of(ctors, ty) { CInt -> true, CFloat -> true, CWidth(w) -> w.bits <= 64, _ -> false }
+
+/// `numeric_of_int(n)` at `ty`, where `numeric_in_place` holds: `n` itself at `Int`, else `n`
+/// converted as `Float::of_int` or the width's `of_int` converts it.
+pub fn numeric_converted(
+  cx: Context,
+  st: Lowering,
+  n: Arg,
+  ty: Type,
+  at: Span,
+) -> Lowered / {abort.raise} = {
+  let x = handed({ st: st, arg: n }, RInt, at);
+  match class_of(cx.setting.ctors, ty) {
+    CFloat -> bound(cx, x.st, ty, Prim({ op: b"to_float", on: RInt, args: [x.arg] }), at),
+    CWidth(w) -> bound(cx, x.st, ty, Prim({ op: b"of_int", on: RInt, args: [x.arg] }), at),
+    _ -> x,
+  }
+}
 
 /// What an operator over two values of a type does, read off the type alone: C's own over a scalar
 /// a register holds, a character's word, a string's bytes or the constructor a word holds; a root
@@ -843,9 +934,9 @@ fn written(cx: Context, st: Lowering, op: TypeOp, ty: Type, a: Arg, at: Span) ->
     at,
   )
 
-/// A width's wrapping, saturating or checked builtin at the type its operands hold, in C where a
-/// register holds the width, saturating and checked only below 64 bits, where the exact answer fits
-/// a word; by the runtime's builtin at any other type.
+/// A width's or an `Int`'s wrapping, saturating or checked builtin at the type its operands hold, in C
+/// where a register holds the value, checked only below 64 bits, where the exact answer fits a word;
+/// by the runtime's builtin at any other type.
 fn width_arithmetic(
   cx: Context,
   st: Lowering,
@@ -860,11 +951,24 @@ fn width_arithmetic(
   let answer = answer_of(cx, name, ty, if checked { TyCon({ name: b"Option", args: [ty] }) }
   else { ty });
   match class_of(cx.setting.ctors, ty) {
-    CWidth(w) -> if wrapping(name) {
+    CWidth(w) -> if wrapping(name) || (saturating(name) && w.bits == 64) {
       over(cx, { st: st, arg: a }, { st: st, arg: b }, name, RNum(w), ty, at)
     } else if w.bits >= 64 { through_runtime(cx, st, name, args, answer, at) }
     else if checked { checked_width(cx, st, name, a, b, w, answer, at) }
     else { over(cx, { st: st, arg: a }, { st: st, arg: b }, name, RNum(w), ty, at) },
+    // An `Int` wraps and saturates as the 64-bit signed width its register holds.
+    CInt -> if wrapping(name) || saturating(name) {
+      let x = handed({ st: st, arg: a }, RInt, at);
+      let y = if counts(name) { { st: x.st, arg: b } }
+      else { handed({ st: x.st, arg: b }, RInt, at) };
+      bound(
+        cx,
+        y.st,
+        ty,
+        Prim({ op: name, on: RNum({ bits: 64, signed: true }), args: [x.arg, y.arg] }),
+        at,
+      )
+    } else { through_runtime(cx, st, name, args, answer, at) },
     _ -> through_runtime(cx, needing(st, ty, false), name, args, answer, at),
   }
 }
