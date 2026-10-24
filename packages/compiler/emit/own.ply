@@ -34,13 +34,13 @@ import syntax.parsing (dummy_span)
 import emit.keys (Named, Root)
 import emit.tir (Rep, RWord, RInt, RBool, RFloat, RFlat, RToken, RSum, MCase, Var, Arg, AVar, AInt,
                  ABool, AFloat, AZero, Val, Prim, Make, Get, Take, Pack, Call, Apply, Native,
-                 Gathered, Path, PField, PArg, PLeaf, PNamed, PCase, Made, MRecord, MList, MClosure,
-                 TLength, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next, Done,
-                 Return, Restart, Enter, Fail, NoArm, Handle, Sited, Inc, Dec, Reset, Free, Opened,
-                 Block, Fn, Member, Convention, Rooted, Lambda, Closure, Handed, Given, Lent, Owned,
-                 Borrowed, Returned, Test, TTag, Owns, ReadsOf, Lasts, Static, Op, OStrings, RAddr,
-                 PPayload, no_links, counted, operands, fails, used_as, var_of, rep_of_arg,
-                 parts_of, ends, string_uses)
+                 Gathered, Updated, FieldSet, Path, PField, PArg, PLeaf, PNamed, PCase, Made,
+                 MRecord, MList, MClosure, TLength, Inst, Let, Do, Decl, Assign, If, Case, Match,
+                 Miss, Loop, Next, Done, Return, Restart, Enter, Fail, NoArm, Handle, Sited, Inc,
+                 Dec, Reset, Free, Opened, Block, Fn, Member, Convention, Rooted, Lambda, Closure,
+                 Handed, Given, Lent, Owned, Borrowed, Returned, Test, TTag, Owns, ReadsOf, Lasts,
+                 Static, Op, OStrings, RAddr, PPayload, no_links, counted, operands, fails, used_as,
+                 var_of, rep_of_arg, parts_of, ends, string_uses)
 import emit.tir.strings (ByteRead)
 import emit.verify (verified, stacked_captures, payload_of, field_path, held_in_place, reuses_cells,
                     made_width, re_held, leaves, answer_held, boxed_read, word_held, immortals,
@@ -188,31 +188,41 @@ fn headed(
 }
 
 /// What `took` reads off a body: each `Get` and the loop pass it runs in (`-1` outside any loop), the
-/// variables used other than to read a field or test a constructor, those an operation consumes,
-/// those holding a count made where they are bound, with the pass that binds them, and how often
-/// each block's field is read on the way through the body that reads it most.
+/// variables used other than to read a field, test a constructor or be updated, those an operation
+/// consumes, those holding a count made where they are bound, with the pass that binds them, how
+/// often each block's field is read on the way through the body that reads it most, and the fields
+/// each update of a record writes.
 type Sight = {
   gets: List<{ var: Var, of: Var, path: Path, pass: Int }>,
   whole: Map<Int, Bool>,
   handed: Map<Int, Bool>,
   bound: Map<Int, Int>,
   reads: Map<Int, Map<Path, Int>>,
+  updates: Map<Int, List<List<Int>>>,
 }
 
 /// `f` with a `Take` for each `Get` that is the one read, on any way through the body, of a counted
 /// one-word field, not a record held in place, out of a block this body holds a count of as a word or
 /// the box a sum's case holds, where the field is handed on: where the block is held only here, the
 /// field's count moves to its reader instead of being taken again. The block must be used otherwise
-/// only to read its other fields or test its constructor, in the pass that bound it, so nothing reads
-/// the field after it is taken. Whether the body holds the block's count is what `facts_of` says, as
-/// the counts are placed: a join set only from borrowed reads holds none.
+/// only to read its other fields, test its constructor or be updated with a new value of that field,
+/// in the pass that bound it, so nothing reads the field after it is taken. Whether the body holds
+/// the block's count is what `facts_of` says, as the counts are placed: a join set only from borrowed
+/// reads holds none.
 fn took(f: Fn) -> Fn = {
   let start = f.members.fold(
     given_bound(f.params, f.conv, Map::new()),
     |m: Map<Int, Int>, x: Member| given_bound(x.params, x.conv, m),
   );
   let s = sighted(
-    { gets: [], whole: Map::new(), handed: Map::new(), bound: start, reads: Map::new() },
+    {
+      gets: [],
+      whole: Map::new(),
+      handed: Map::new(),
+      bound: start,
+      reads: Map::new(),
+      updates: Map::new(),
+    },
     f.body,
     0 - 1,
   );
@@ -224,6 +234,7 @@ fn took(f: Fn) -> Fn = {
           && word_held(g.var.rep)
           && !held_in_place(g.of, g.path, g.var)
           && !s.whole.contains(g.of.id)
+          && rewritten(s.updates, g.of, g.path)
           && s.handed.contains(g.var.id)
           && (match s.reads.get(g.of.id) { Some(ps) -> ps.get(g.path), None -> None }) == Some(1) {
         m.insert(g.var.id, g.of)
@@ -236,6 +247,14 @@ fn took(f: Fn) -> Fn = {
     if held.len() == 0 { f } else { { ..f, body: retaken(f.body, held) } }
   }
 }
+
+/// Whether every update of `of` writes the field at `path`, so the one each makes holds none of
+/// what a take of that field left behind.
+fn rewritten(updates: Map<Int, List<List<Int>>>, of: Var, path: Path) -> Bool =
+  match updates.get(of.id) {
+    None -> true,
+    Some(us) -> match path { PField(p) -> us.all(|ats: List<Int>| ats.contains(p.at)), _ -> false },
+  }
 
 fn given_bound(params: List<Var>, conv: Convention, m: Map<Int, Int>) -> Map<Int, Int> =
   range(0, params.len()).fold(m, |acc: Map<Int, Int>, i: Int|
@@ -290,6 +309,20 @@ fn sighted(s: Sight, b: Block, pass: Int) -> Sight =
               gets: acc.gets.push({ var: l.var, of: g.of, path: g.path, pass: pass }),
               reads: read_once_more(acc.reads, g.of.id, g.path),
             },
+          // An update hands its record on, the fields it does not write read where they lie.
+          Updated(u) -> {
+            let sets = used_in(acc, u.sets.map(|x: FieldSet| { arg: x.arg, takes: true }));
+            {
+              ..sets,
+              handed: sets.handed.insert(u.of.id, true),
+              updates: sets.updates.insert(
+                u.of.id,
+                (match sets.updates.get(u.of.id) { Some(us) -> us, None -> [] }).push(
+                  u.sets.map(|x: FieldSet| x.at),
+                ),
+              ),
+            }
+          },
           _ -> used_in(acc, operands(l.val)),
         };
         if answer_held(l.val) == Owns && stacked_captures(l.val) == None {
