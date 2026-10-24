@@ -156,7 +156,7 @@ fn cancel_carried(c: &mut Ctx) {
 /// The builtins emitted code writes in place whose refusal of their operands it hands the runtime,
 /// each numbered by its place here: through [`rt_refused`] where the refusal names numbers, and
 /// through [`rt_refused_text`](crate::machine::rt_refused_text) where it names text.
-pub const REFUSED: [Builtin; 23] = [
+pub const REFUSED: [Builtin; 24] = [
     Builtin::ArrayNew,
     Builtin::ColumnsNew,
     Builtin::ArrayOfList,
@@ -180,6 +180,7 @@ pub const REFUSED: [Builtin; 23] = [
     Builtin::StringFind,
     Builtin::StringOfBytes,
     Builtin::Assert,
+    Builtin::BytesPosition,
 ];
 
 /// The builtin [`REFUSED`] numbers `what`.
@@ -245,7 +246,9 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
         Builtin::StringSlice => said::range_outside(site, name, a.0, b.0, len(c), "characters"),
         Builtin::ByteOfInt => said::byte_of_int_refused(site, a.0),
         Builtin::BytesIndexOfByte => said::not_a_byte(site, name, a.0),
-        Builtin::BytesIndexOfFrom => said::start_outside(a.0, len(b), site, name),
+        Builtin::BytesIndexOfFrom | Builtin::BytesPosition => {
+            said::start_outside(a.0, len(b), site, name)
+        }
         Builtin::BytesScan | Builtin::BytesScanUntil => {
             if usize::try_from(a.0).is_ok_and(|from| from <= len(b)) {
                 said::negative_budget(site, name, c.0)

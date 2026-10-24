@@ -9,8 +9,8 @@ import std.bytes (ascii_of_int)
 import syntax.parsing (dummy_span)
 import emit.layout (Laid, LWords, LRecord, LSum, FieldLaid, SumLaid, CaseLaid, Payload, Nullary,
                     Inline, Boxed, WordClass, P, S, R, U, Always, WordIs, WordOutside, WordForm,
-                    Itself, Immediate, RuntimeBox, Singleton, Box, words, counts, hold_laid,
-                    record_laid, sum_laid, raw_sum, inside)
+                    Itself, Bits, RuntimeBox, Box, words, counts, hold_laid, record_laid, sum_laid,
+                    raw_sum, inside)
 import emit.reps
 import emit.reps (Ctors, SumCtor, ctors_of)
 import emit.keys
@@ -23,28 +23,23 @@ import emit.tir (Var, Rep, RWord, RInt, RSum, RFlat, RSlice, RToken, Leaf, AVar,
 import emit.tir.handling (HandleSite)
 import emit.lower.held (held_with)
 import emit.answer (Need, Reads, Scalar, Layout, Exact)
-import emit.print.counting (same_word_fn, no_word_fn, int_dup_fn, int_released_fn, box_dup_fn,
-                            box_released_fn)
+import emit.print.counting (same_word_fn, no_word_fn, box_dup_fn, box_released_fn)
 
 /// How one counted word is counted. `Object`: 0 or a block's start, given to the drop root it names
 /// where its last count goes. `CaseBox`: the box case `case` of the sum `sum` is held in, given to
 /// that case's drop root. `SumWord`: a sum of one word over pointers, counted where at or above the
 /// pointer floor, its block the word with its tag bits clear, the sum's drop root given the word as
-/// it is. `IntWord`: an `Int`'s word form, an immediate or the runtime's box of its bits.
-/// `ScalarWord`: the runtime's box of the bits of a scalar of `ty`, `words` of them. A scalar's box
+/// it is. `ScalarWord`: the runtime's box of the bits of a scalar of `ty`, `words` of them. A scalar's box
 /// holds nothing counted, so its last count gives it back by its size, through no root. `Through`: a
 /// function value, let go of through the release entry of the descriptor its block's first word
-/// names. `RuntimeHandle`: a handle the runtime gives back. `RuntimeWord`: an object the runtime
-/// lays out and counts itself, as it does the record a `parallel` block gathers its answers into.
+/// names. `RuntimeHandle`: a handle the runtime gives back.
 pub type Counted =
   | Object(RootKey)
   | CaseBox({ sum: Type, case: Int })
   | SumWord(RootKey)
-  | IntWord
   | ScalarWord({ ty: Type, words: Int })
   | Through
   | RuntimeHandle
-  | RuntimeWord
 
 /// A counted part of a value laid in words. `WordAt`: the word at `at`, read with its tag bits
 /// clear where `masked`. `ByCase`: a sum of several words from `at`, whose case decides which of its
@@ -179,7 +174,6 @@ fn pointer(ctors: Ctors, ty: Type, c: WordClass) -> Option<Counted> / {abort.rai
         TyNominal(_) -> Object(drop_of(ty)),
         TyCon(n) -> if laid_block(n.name) || ctors.sums.contains(n.name) { Object(drop_of(ty)) }
         else if runtime_handle(n.name) { RuntimeHandle }
-        else if ty == reps::gathered_type() { RuntimeWord }
         else { refused(b"not yet: a pointer type the release does not know", ty) },
         _ -> refused(b"not yet: a pointer type the release does not know", ty),
       })
@@ -209,6 +203,7 @@ fn laid_block(name: Bytes) -> Bool =
     b"Array",
     b"Columns",
     b"Hold",
+    reps::gathered_name(),
   ].contains(
     name,
   )
@@ -458,13 +453,8 @@ pub fn form_parts_of(
 ) -> List<Part> / {abort.raise} =
   match form {
     Itself -> laid_parts(ctors, ty, l, 0),
-    // An `Int`, or a sum holding one as its raw word, may be the runtime's box.
-    Immediate -> if ty == int_type() || (match l { LSum(s) -> raw_sum(s), _ -> false }) {
-      [WordAt({ at: 0, masked: false, how: IntWord })]
-    } else { [] },
-    RuntimeBox ->
-      [WordAt({ at: 0, masked: false, how: ScalarWord({ ty: ty, words: max(1, words(l)) }) })],
-    Singleton -> [],
+    Bits -> [],
+    RuntimeBox -> [WordAt({ at: 0, masked: false, how: ScalarWord({ ty: ty, words: words(l) }) })],
     Box(_) -> [whole(ty)],
   }
 
@@ -477,32 +467,25 @@ pub fn form_parts(ctors: Ctors, ty: Type) -> List<Part> / {abort.raise} =
 /// lets go of.
 pub type WordHeads = { dup: Bytes, release: Bytes }
 
-/// The head's functions a descriptor of `ty` counts and lets go of its word form by: an immediate's,
-/// which holds no count; an `Int`'s; a scalar's box, given back by its size. None where the word form
-/// holds a block only the type's own roots let go of.
+/// The head's functions a descriptor of `ty` counts and lets go of its word form by: a word that
+/// holds no count; a scalar's box, given back by its size. None where the word form holds a block
+/// only the type's own roots let go of.
 pub fn word_form_heads(ctors: Ctors, ty: Type) -> Option<WordHeads> / {abort.raise} =
   match form_parts(ctors, ty) {
     [] -> Some(immediate_heads()),
-    [WordAt(w)] -> match w.how {
-      IntWord -> Some(int_heads()),
-      ScalarWord(s) -> Some(box_heads(s.words)),
-      _ -> None,
-    },
+    [WordAt(w)] -> match w.how { ScalarWord(s) -> Some(box_heads(s.words)), _ -> None },
     _ -> None,
   }
 
 /// The head's functions for a word form holding no count.
 pub fn immediate_heads() -> WordHeads = { dup: same_word_fn(), release: no_word_fn() }
 
-/// The head's functions for an `Int`'s word form, an immediate or the runtime's box.
-pub fn int_heads() -> WordHeads = { dup: int_dup_fn(), release: int_released_fn() }
-
 /// The head's functions for a scalar's box of `words` payload words.
 pub fn box_heads(words: Int) -> WordHeads = { dup: box_dup_fn(), release: box_released_fn(words) }
 
-/// How many payload words a scalar's box can hold: a `Float`'s or a 64-bit width's, a `Decimal`'s
-/// or a 128-bit width's. The head defines a release for each.
-pub fn scalar_box_words() -> List<Int> = [1, 2]
+/// How many payload words a scalar's box holds: a `Decimal`'s or a 128-bit width's. The head defines
+/// a release for each.
+pub fn scalar_box_words() -> List<Int> = [2]
 
 /// The counted parts of each part of a value of `ty` held as `rep`, in `parts_of(rep)`'s order, each
 /// counted from that part's own first C word: a word form's; a sum's words; a flat record's leaves
@@ -637,14 +620,16 @@ fn named_opening(
   } else if name == b"Hold" {
     // The checker lays a hold's region label first and the type it holds last.
     Holding({ at: hold_laid().held, ty: arg(args.len() - 1), rep: RWord })
-  } else if runtime_handle(name) { HandleBlock }
-  else if ctors.sums.contains(name) { in_box(ctors, ty, laid_of) } else {
+  } else if runtime_handle(name) { HandleBlock } else if name == reps::gathered_name() {
+    InBox({
+      parts: range(0, args.len()).fold([], |acc: List<Held>, i: Int|
+        if form_parts_of(ctors, arg(i), form_of(arg(i)), laid_of(arg(i))) == [] { acc }
+        else { acc.push({ at: i, ty: arg(i), rep: RWord }) }),
+      words: args.len(),
+    })
+  } else if ctors.sums.contains(name) { in_box(ctors, ty, laid_of) } else {
     match form_of(ty) {
-      RuntimeBox -> {
-        let n = words(laid_of(ty));
-        ScalarBox(if n < 1 { 1 } else { n })
-      },
-      Immediate -> ScalarBox(1),
+      RuntimeBox -> ScalarBox(words(laid_of(ty))),
       _ -> refused(b"not yet: a block of a type the release does not know", ty),
     }
   }
@@ -707,7 +692,6 @@ fn parts_reach(parts: List<Part>) -> Reach =
     reached(acc, match p {
       WordAt(w) -> match w.how {
         RuntimeHandle -> { found: true, types: [] },
-        RuntimeWord -> { found: true, types: [] },
         Through -> { found: true, types: [] },
         Object(k) -> match k {
           Written(x, _) -> { found: false, types: [x.ty] },
@@ -717,7 +701,6 @@ fn parts_reach(parts: List<Part>) -> Reach =
           Written(x, _) -> { found: false, types: [x.ty] },
           _ -> { found: false, types: [] },
         },
-        IntWord -> { found: false, types: [] },
         ScalarWord(_) -> { found: false, types: [] },
         CaseBox(c) -> { found: false, types: [c.sum] },
       },
@@ -1366,7 +1349,6 @@ test "a block reaching a handle, a hold or a function value at any depth is neve
   ];
   // A phantom parameter holds nothing, and a `Columns` only what its records' fields hold.
   let kept = [
-    int_type(),
     named(b"String"),
     con(b"List", [int_type()]),
     con(b"Columns", [TyRecord([{ name: b"n", ty: int_type() }])]),
@@ -1514,12 +1496,12 @@ fn laid_for(ty: Type) -> Laid / {abort.raise} =
   else if ty == applied(b"Option", [named(b"m.Hue")]) { LSum(maybe_of(hue_laid())) }
   else if ty == int_type() || ty == named(b"Bool") { LWords([raw()]) }
   else if ty == named(b"Float") { LWords([raw()]) }
-  else if ty == named(b"U128") { LWords([raw(), raw()]) }
+  else if ty == named(b"U128") || ty == named(b"Decimal") { LWords([raw(), raw()]) }
   else { LWords([P]) }
 
 fn form_for(ty: Type) -> WordForm =
-  if ty == int_type() || ty == named(b"Bool") { Immediate }
-  else if ty == named(b"Float") || ty == named(b"U128") { RuntimeBox }
+  if ty == int_type() || ty == named(b"Bool") || ty == named(b"Float") { Bits }
+  else if ty == named(b"U128") || ty == named(b"Decimal") { RuntimeBox }
   else if ty == point() { Box(3) }
   else if ty == named(b"m.E") { Box(2) }
   else { Itself }
@@ -1539,10 +1521,14 @@ test "a record counts its pointers at their words, a record held in it at its ow
   assert_eq(laid_parts(table(), applied(b"Task", [int_type()]), LWords([P]), 0), [
     WordAt({ at: 0, masked: false, how: RuntimeHandle }),
   ]);
-  // What a `parallel` block gathers is the runtime's own record, which it counts as any of its own.
-  assert_eq(laid_parts(table(), reps::gathered_type(), LWords([P]), 0), [
-    WordAt({ at: 0, masked: false, how: RuntimeWord }),
-  ]);
+  // What a `parallel` block gathers is a box let go of at its drop root, which opens it as each
+  // answer's word form: an `Int` counts nothing there.
+  let gathered = reps::gathered_of([named(b"String"), int_type()]);
+  assert_eq(laid_parts(table(), gathered, LWords([P]), 0), [object(gathered, 0)]);
+  assert_eq(
+    opening_with(table(), gathered, RWord, laid_for, form_for),
+    InBox({ parts: [{ at: 0, ty: named(b"String"), rep: RWord }], words: 2 }),
+  );
   assert_eq(laid_parts(table(), int_type(), LWords([raw()]), 0), []);
   // A pointer of a type the release does not know is refused, not guessed at.
   let refusal = handle {
@@ -1612,10 +1598,10 @@ test "a stripped word of a case's payload is read with its tag bits clear" {
 
 test "a word form counts as its type lays it in one word, a scalar's box by its size" {
   let parts = |ty: Type| form_parts_of(table(), ty, form_for(ty), laid_for(ty));
-  assert_eq(parts(int_type()), [WordAt({ at: 0, masked: false, how: IntWord })]);
-  assert_eq(parts(named(b"Bool")), []);
-  assert_eq(parts(named(b"Float")), [
-    WordAt({ at: 0, masked: false, how: ScalarWord({ ty: named(b"Float"), words: 1 }) }),
+  // A scalar of one word is its own bits, which count nothing.
+  assert_eq([int_type(), named(b"Bool"), named(b"Float")].map(parts), [[], [], []]);
+  assert_eq(parts(named(b"U128")), [
+    WordAt({ at: 0, masked: false, how: ScalarWord({ ty: named(b"U128"), words: 2 }) }),
   ]);
   // A 128-bit width a record holds is its two words, which count nothing.
   assert_eq(laid_parts(table(), named(b"U128"), reps::laid(table(), named(b"U128")), 0), []);
@@ -1631,16 +1617,16 @@ test "a word form counts as its type lays it in one word, a scalar's box by its 
       named(b"Bool"),
     ].map(|t: Type| word_form_heads(table(), t)),
     [
-      Some(int_heads()),
-      Some(box_heads(1)),
+      Some(immediate_heads()),
+      Some(immediate_heads()),
       Some(box_heads(2)),
-      Some(box_heads(1)),
+      Some(immediate_heads()),
       Some(box_heads(2)),
       Some(immediate_heads()),
     ],
   );
   assert_eq(word_form_heads(table(), named(b"String")), None);
-  assert_eq(scalar_box_words(), [1, 2]);
+  assert_eq(scalar_box_words(), [2]);
   assert_eq(parts(point()), [object(point(), 0)]);
   assert_eq(parts(named(b"String")), [object(named(b"String"), 0)])
 }
@@ -1854,7 +1840,7 @@ test "a container's drop root opens it whole, and its opening names its parts' r
     opened(applied(b"Hold", [label_type(b"r"), named(b"String")])),
     Holding({ at: 1, ty: named(b"String"), rep: RWord }),
   );
-  assert_eq(opened(named(b"Float")), ScalarBox(1));
+  assert_eq(opened(named(b"Decimal")), ScalarBox(2));
   assert_eq(opened(named(b"U128")), ScalarBox(2));
   assert_eq(
     opened(named(b"m.E")),
@@ -1869,7 +1855,7 @@ test "a word a block holds is its type's word form, a function's or a continuati
   let stored = |ty: Type| stored_parts(table(), { at: 1, ty: ty, rep: RWord });
   let word = |how: Counted| [WordAt({ at: 0, masked: false, how: how })];
   let record = TyRecord([{ name: b"a", ty: named(b"String") }, { name: b"b", ty: int_type() }]);
-  assert_eq(stored(int_type()), word(IntWord));
+  assert_eq(stored(int_type()), []);
   assert_eq(stored(record), [object(record, 0)]);
   assert_eq(stored(named(b"Bool")), []);
   assert_eq(stored(named(b"String")), [object(named(b"String"), 0)]);
@@ -1882,7 +1868,7 @@ test "a word a block holds is its type's word form, a function's or a continuati
   assert_eq(opening(table(), k, RWord), FnBlock);
   assert_eq(released_vars(k), []);
   match opening(table(), applied(b"Hold", [int_type()]), RWord) {
-    Holding(h) -> assert_eq(stored_parts(table(), h), word(IntWord)),
+    Holding(h) -> assert_eq(stored_parts(table(), h), []),
     other -> assert_eq(other, Holding({ at: 0, ty: int_type(), rep: RWord })),
   }
 }

@@ -22,8 +22,9 @@ import emit.pieces (spelled)
 import emit.release (root_of)
 import emit.code (Code, NField)
 import emit.tir (Rep, RInt, RBool, RFloat, RWord, RSum, RNum, RFlat, Leaf, Var, Arg, AVar, AInt,
-                 Val, Make, Made, MList, Call, Native, Op, OContainer, Operation, Pack, Uses, Inst,
-                 Let, Fn, Lambda, Closure, Spine, Data, Containers, rep_of_arg)
+                 Val, Make, Made, MList, Call, Native, Op, OContainer, OHandle, Operation, Pack,
+                 Uses, Inst, Let, Do, Fn, Lambda, Closure, Spine, Data, Containers, rep_of_arg)
+import emit.tir.handling (Unsettled, Encoded)
 import emit.tir.containers (Laid, Length, Elements, Within, ArrayNew, ArraySet, ArrayOfList,
                             ArrayGet, ColumnsNew, ColumnsSet, ColumnsOfList, ColumnsGet,
                             ColumnField, ColumnOf, ItemAt, Rest, Position, Element)
@@ -147,26 +148,17 @@ test "a list pattern's item is read where it lies, and its rest made a list of i
   assert_eq(natives_in(bound(item).concat(bound(rest))), [])
 }
 
-test "a builtin the runtime implements is called through its helper over words, its answer held as its type" {
+test "an empty map is static data at every type, an open one too, so making one calls nothing" {
   let p = program(
     Bytes::concat_all([
       b"fn fresh() -> Map<Int, String> = Map::new()\n",
       b"fn open<a>() -> Map<a, Int> = Map::new()\n",
     ]),
   );
-  let name = |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name;
-  // An empty map is static data, so making one calls nothing.
-  assert_eq(natives_in(bound_in(p, b"fresh")).map(name), []);
-  // At a type a variable leaves open it is the builtin its type names, its answer the word the map
-  // is.
-  let calls = natives_in(bound_in(p, b"open"));
-  assert_eq(calls.map(name), [b"builtin_map_new_p"]);
-  assert_eq(
-    calls.map(|c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }|
-      { args: c.args.map(rep_of_arg), uses: c.uses, answer: c.answer }),
-    [{ args: [], uses: { takes: [], owned: true, fails: true, stops: false }, answer: RWord }],
-  );
-  assert_eq(packs_in(bound_in(p, b"open")), [])
+  [b"fresh", b"open"].fold((), |_: Unit, f: Bytes| {
+    assert_eq(natives_in(bound_in(p, f)).len(), 0);
+    assert_eq(packs_in(bound_in(p, f)), [])
+  })
 }
 
 test "a length is read in place off its header, never failing and taking nothing" {
@@ -383,16 +375,16 @@ test "a Columns is made, written, read, measured and searched one array per fiel
   })
 }
 
-test "an array of a type variable's elements is made by the runtime, its layout noted for a specialisation" {
+test "an array of a type variable's elements is made at the layout its callers settle" {
   let p = program(b"fn made<a>(n: Int, x: a) -> Array<a> / {abort.raise} = Array::new(n, x)\n");
   match formed(p, b"made") {
     Ok(f) -> {
       assert_eq(f.links.needs.map(|n: Need| n.reads), [Layout]);
       assert_eq(
-        natives_in(bound_in(p, b"made")).map(
-          |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
+        ops_in(bound_in(p, b"made")).map(
+          |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.op,
         ),
-        [b"builtin_array_new_p"],
+        [OHandle(Unsettled(b"Array::new"))],
       )
     },
     Err(no) -> panic(String::of_bytes_lossy(no.why)),
@@ -424,13 +416,7 @@ test "a builtin where only its type arguments are filed, as in code written for 
     );
   assert_eq(op(b"count"), [OContainer(Length)]);
   assert_eq(op(b"read"), [OContainer(ArrayGet(element_in(q, con(b"Int", []))))]);
-  // A call through the runtime answers a value of the type its declaration gives it there.
-  assert_eq(
-    natives_in(bound_in(q, b"open")).map(
-      |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
-    ),
-    [b"builtin_map_new_p"],
-  )
+  assert_eq(natives_in(bound_in(q, b"open")).len(), 0)
 }
 
 test "a field of a Columns' record is read from its column, with no record made" {
@@ -689,7 +675,7 @@ test "a handler's variables are the runtime's, a hold's region its `rt_with_clea
   )
 }
 
-test "an operator at a type a witness stands for is the runtime's, a comparison answering a `Bool`" {
+test "an operator at a type a witness stands for is written at the type its callers settle" {
   let p = program(
     Bytes::concat_all([
       b"fn less<a>(x: a, y: a) -> Bool where numeric(a) = x < y\n",
@@ -704,25 +690,15 @@ test "an operator at a type a witness stands for is the runtime's, a comparison 
       match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, why: why }) }),
     [],
   );
+  let binary = OHandle(Unsettled(b"?numeric_binary"));
   assert_eq(
     names.map(|n: Bytes|
-      natives_in(bound_in(p, n)).map(
-        |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
+      ops_in(bound_in(p, n)).map(
+        |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.op,
       )),
-    [
-      [b"builtin_elaborated_numeric_binary_p"],
-      [b"builtin_elaborated_numeric_binary_p"],
-      [b"builtin_elaborated_numeric_unary_p"],
-      [b"builtin_elaborated_numeric_binary_p"],
-    ],
+    [[binary], [binary], [OHandle(Unsettled(b"?numeric_unary"))], [binary]],
   );
-  // The runtime's word is unboxed only where the operator compares.
-  assert_eq(names.map(|n: Bytes| packs_in(bound_in(p, n)).filter(|r: Rep| r == RBool).len()), [
-    1,
-    0,
-    0,
-    0,
-  ])
+  assert_eq(names.map(|n: Bytes| natives_in(bound_in(p, n)).len()), [0, 0, 0, 0])
 }
 
 /// Module `m` of the program of `sources`, run by a runtime implementing `natives`.
@@ -788,41 +764,44 @@ test "a name no import takes is the builtin's, and an import that takes a builti
   )
 }
 
-test "a builtin the runtime lacks is declined, and one written at a scalar's type goes on to scalars" {
-  let src = Bytes::concat_all([
-    b"fn fresh<a>() -> Map<a, Int> = Map::new()\n",
-    b"fn wrapped(a: U8, b: U8) -> U8 = wrap_add(a, b)\n",
-  ]);
-  let by = |p: Program, name: Bytes|
-    match formed(p, name) { Ok(_) -> None, Err(no) -> Some(no.by) };
-  let bare = program(src);
-  assert_eq(by({ ..bare, setting: { ..bare.setting, builtins: [] } }, b"fresh"), Some(Containers));
-  assert_eq(by(program(src), b"fresh"), None);
-  assert(by(program(src), b"wrapped") != Some(Containers), None)
-}
-
-test "a shipped module's extern is called as the builtin of its own name" {
-  let user = b"import std.native (doubled)\nimport std.native as n\nfn f() -> Int = doubled(2) + n::doubled(3)\n";
+/// The program of `user` beside the shipped module `std.native` declaring `extern fn doubled`, run
+/// by a runtime implementing `natives`.
+fn with_doubled(user: Bytes, natives: List<Bytes>) -> Program / {abort.raise} = {
   let shipped = [{ name: b"std.native", src: b"pub extern fn doubled(x: Int) -> Int\n" }];
   match analyse_pulling_std_with([{ name: b"m", src: user }], shipped, no_rows()).out {
     Analysed(a) -> match setting_in(a, b"m") {
-      Ok(s) -> {
-        let p = {
-          src: user,
-          analysis: a,
-          setting: { ..s.setting, builtins: [b"doubled"] },
-          roots: s.roots,
-        };
-        assert_eq(
-          natives_in(bound_in(p, b"f")).map(
-            |c: { name: Bytes, args: List<Arg>, uses: Uses, answer: Rep }| c.name,
-          ),
-          [b"builtin_doubled_p", b"builtin_doubled_p"],
-        )
-      },
+      Ok(s) ->
+        { src: user, analysis: a, setting: { ..s.setting, builtins: natives }, roots: s.roots },
       Err(why) -> panic(String::of_bytes_lossy(why)),
     },
     _ -> panic("the program does not check"),
+  }
+}
+
+test "a builtin the runtime lacks is declined, and one written at a scalar's type goes on to scalars" {
+  let user = b"import std.native (doubled)\nfn f() -> Int = doubled(2)\n";
+  let by = |p: Program, name: Bytes|
+    match formed(p, name) { Ok(_) -> None, Err(no) -> Some(no.by) };
+  assert_eq(by(with_doubled(user, []), b"f"), Some(Containers));
+  assert_eq(by(with_doubled(user, [b"doubled"]), b"f"), None);
+  let src = b"fn wrapped(a: U8, b: U8) -> U8 = wrap_add(a, b)\n";
+  assert(by(program(src), b"wrapped") != Some(Containers), None)
+}
+
+test "a shipped module's extern is called as the builtin of its own name, over its encoding" {
+  let user = b"import std.native (doubled)\nimport std.native as n\nfn f() -> Int = doubled(2) + n::doubled(3)\n";
+  match formed(with_doubled(user, [b"doubled"]), b"f") {
+    Ok(f) ->
+      assert_eq(
+        f.body.filter(|i: Inst|
+          match i {
+            Do(d) -> match d.val { Op(o) -> o.op == OHandle(Encoded(b"doubled")), _ -> false },
+            _ -> false,
+          }).len(
+        ),
+        2,
+      ),
+    Err(no) -> panic(String::of_bytes_lossy(no.why)),
   }
 }
 

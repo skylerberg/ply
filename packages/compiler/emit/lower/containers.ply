@@ -21,8 +21,9 @@ import emit.answer (Layout)
 import emit.roots (builtin_helper, generated_builtin)
 import emit.release (released_vars)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RSum, RFlat, Leaf, Var, Arg,
-                 AVar, AInt, AZero, RUnit, Make, MList, Native, Op, OContainer, Let, Prim, If,
-                 Containers, Static)
+                 AVar, AInt, AZero, RUnit, Make, MList, Native, Op, OContainer, OHandle, Let, Prim,
+                 If, Containers, Static)
+import emit.tir.handling (Unsettled)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, Within, ArrayNew, ArraySet,
                             ArrayOfList, ArrayGet, ColumnsNew, ColumnsSet, ColumnsOfList,
                             ColumnsGet, ColumnField, ColumnOf, ItemAt, Rest, LeafOf, Room, Position,
@@ -39,8 +40,8 @@ import emit.lower.scalars (operated, runtime_builtin, stated, binary, numeric_in
 import expand.rewrite (float_function)
 import emit.statics (laid_at, KnownMap)
 import emit.tir.statics (StaticDef)
-import emit.lower.crossing (crossing_builtin, crossed, type_described, laid_out_here, over_encoding,
-                            by_encoding, through_runtime)
+import emit.lower.crossing (crossing_builtin, crossed, type_described, over_encoding, by_encoding,
+                            through_runtime)
 import emit.lower.strings
 import emit.lower.strings (string_builtin)
 
@@ -130,7 +131,7 @@ fn asserted(
   }
 
 /// `Map::new()`: the empty map laid out as static data, immortal as the runtime's own is, which a
-/// write copies; at a type a variable leaves open, the runtime's.
+/// write copies. Its object is the same at every type, an open one too.
 fn empty_map(
   cx: Context,
   st: Lowering,
@@ -139,9 +140,7 @@ fn empty_map(
   at: Span,
 ) -> Lowered / {abort.raise} =
   match called_at(cx, b"Map::new", callee).ret {
-    Some(ty) -> if has_vars(ty) {
-      contained(cx, st, b"Map::new", args, called_at(cx, b"Map::new", callee), callee, at)
-    } else {
+    Some(ty) -> {
       let l = laid_at(cx.setting.ctors, ty, KnownMap({ keys: [], values: [] }));
       let statics = l.defs.fold(st.statics, |acc: List<StaticDef>, d: StaticDef|
         if acc.any(|x: StaticDef| x.name == d.name) { acc } else { acc.push(d) });
@@ -361,7 +360,8 @@ fn contained(
       Some(t) -> match if name.starts_with(b"Array::") {
           match element_of(cx, t) { Some(e) -> Some([e]), None -> None }
         } else { columns_of(cx, t) } {
-        None -> called(cx, layout_needed(st, t), name, args, f, callee, at),
+        None -> if open(t) { unlaid(cx, layout_needed(st, t), name, args, f, at) }
+        else { called(cx, st, name, args, f, callee, at) },
         Some(es) -> if name.starts_with(b"Array::") {
           arrayed(cx, layout_noted(st, t), name, args, t, es, f, at)
         } else { columns_called(cx, layout_noted(st, t), name, args, t, es, f, at) },
@@ -369,9 +369,40 @@ fn contained(
     }
   } else { called(cx, st, name, args, f, callee, at) }
 
-/// A builtin called through the runtime, which must implement it, answering the type `f` gives: over
-/// its arguments' encoding where its signature at the types filed at `callee` holds a sum or a record
-/// (`laid_out_here`); else on their words. A hold's builtins are the runtime's natives over the hold
+/// Builtin `name` over elements whose layout a type variable leaves open, in a body its callers
+/// settle at that layout (`layout_needed`) and lower again there: a placeholder no printer sees,
+/// taking its arguments so the body lets go of none of them by a type it does not know.
+fn unlaid(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  f: Settled,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  match f.ret {
+    None ->
+      refuse(st, Containers, b"an array's builtin at no type the checker filed: ".concat(name)),
+    Some(ret) ->
+      handed(
+        bound_as(
+          st,
+          ret,
+          RWord,
+          Op({
+            op: OHandle(Unsettled(name)),
+            args: args,
+            uses: { takes: args.map(|_: Arg| true), owned: true, fails: true, stops: false },
+          }),
+          at,
+        ),
+        held_as(cx.setting, ret),
+        at,
+      ),
+  }
+
+/// A builtin called through the runtime, which must implement it, over its arguments' encoding,
+/// answering the type `f` gives. A hold's builtins are the runtime's natives over the hold
 /// (`held_through`).
 fn called(
   cx: Context,
@@ -392,10 +423,16 @@ fn called(
     }
   } else {
     match builtin_at(cx.setting, filed(cx, callee), name) {
-      Some(types) -> if types.params.push(types.ret).any(|t: Type|
-          laid_out_here(cx.setting.ctors, t)) { over_encoding(cx, st, name, args, callee, at) }
-      else { on_words(cx, st, name, args, f, at) },
-      None -> on_words(cx, st, name, args, f, at),
+      Some(_) -> over_encoding(cx, st, name, args, callee, at),
+      None -> match match f.ret { Some(r) -> Some(r), None -> elaborated_answer(name, args) } {
+        None ->
+          refuse(
+            st,
+            Containers,
+            b"a builtin called at a type neither filed nor declared: ".concat(name),
+          ),
+        Some(ret) -> through_runtime(cx, st, name, args, ret, at),
+      },
     }
   }
 
@@ -432,26 +469,6 @@ fn held_through(
     },
     _ -> refuse(st, Containers, b"a hold's builtin of other than one operand: ".concat(name)),
   }
-
-/// Builtin `name` called through the runtime on the words of `args`, answering the type `f` gives.
-fn on_words(
-  cx: Context,
-  st: Lowering,
-  name: Bytes,
-  args: List<Arg>,
-  f: Settled,
-  at: Span,
-) -> Lowered / {abort.raise} = {
-  match match f.ret { Some(r) -> Some(r), None -> elaborated_answer(name, args) } {
-    None ->
-      refuse(
-        st,
-        Containers,
-        b"a builtin called at a type neither filed nor declared: ".concat(name),
-      ),
-    Some(ret) -> through_runtime(cx, st, name, args, ret, at),
-  }
-}
 
 /// What a native the elaboration writes calls of answers, which no declaration states: an operator
 /// at a type a witness stands for its operands' type, but `<`, `<=`, `>` and `>=`, which the

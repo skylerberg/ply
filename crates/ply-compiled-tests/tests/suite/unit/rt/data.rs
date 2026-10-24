@@ -160,6 +160,12 @@ fn a_string_operation_refused_numbers_says_what_its_builtin_says_over_values() {
             Builtin::StringSplit,
             vec![Value::str("abc"), Value::str("")],
         ),
+        (
+            23,
+            [9, 3, 0],
+            Builtin::BytesPosition,
+            vec![abc(), Value::Int(9), Value::Int(0)],
+        ),
     ] {
         let [a, b2, c] = numbers;
         assert_eq!(
@@ -224,7 +230,7 @@ fn a_string_operation_refused_text_says_what_its_builtin_says_over_values() {
 #[test]
 fn an_operation_no_number_names_fails_the_entry_as_plys_fault() {
     for d in [
-        refused(23, 0, 0, 0),
+        refused(24, 0, 0, 0),
         refused(-1, 0, 0, 0),
         refused(20, 0, 0, 0),
         refused_text(8, None, b""),
