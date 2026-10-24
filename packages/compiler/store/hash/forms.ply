@@ -31,34 +31,11 @@ import store.hash.graph (NodeBody, NodeEffect, NodeFn, NodeType, Node, TestNode,
                          qualifier, simple_of, Building, Declaring, declare, no_declaring,
                          instances_in, is_effect, value_target, ctor_target, type_target,
                          effect_target, is_cyclic)
-import store.hash.encoding (rposition, width_index, i64_le, float_bits, decimal_parts, tag_local,
-                            tag_ref_hash, tag_ref_self, tag_ref_index, tag_free, tag_ctor,
-                            tag_ty_param, tag_row_param, tag_free_qualified, tag_none, tag_some,
-                            tag_ref_name, tag_param_default, tag_param_kept, tag_param_spaced,
-                            tag_fn, tag_type_alias, tag_type_sum, tag_effect, tag_test, tag_variant,
-                            tag_op, tag_type, tag_law, tag_spec, tag_ty_con, tag_ty_fn,
-                            tag_ty_record, tag_ty_unit, tag_lit_int, tag_lit_bool, tag_lit_str,
-                            tag_lit_unit, tag_lit_bytes, tag_lit_float, tag_lit_decimal,
-                            tag_lit_char, tag_lit_embedded, tag_lit_fixed, tag_lit_wide, tag_e_lit,
-                            tag_e_var, tag_e_binary, tag_e_unary, tag_e_lambda, tag_e_app, tag_e_if,
-                            tag_e_match, tag_e_block, tag_e_record, tag_e_field, tag_e_list,
-                            tag_e_perform, tag_e_handle, tag_e_with_hold, tag_e_on_value,
-                            tag_type_extern, tag_written, tag_e_simulate, tag_e_tagged,
-                            tag_e_filled, tag_e_parallel, tag_e_try_block, tag_e_record_update,
-                            tag_e_hole, tag_e_handle_vars, tag_s_let, tag_s_expr, tag_s_let_else,
-                            tag_s_assign, tag_p_wildcard, tag_p_var, tag_p_lit, tag_p_ctor,
-                            tag_p_record, tag_p_list, tag_p_or, tag_p_range, tag_p_again, tag_row,
-                            tag_atom, tag_atom_op, tag_label_param, tag_arm, tag_clause,
-                            tag_return_clause, tag_constraint, tag_returns_fresh, tag_returns_param,
-                            tag_bounded, tag_decreases, tag_const, tag_type_nominal, tag_cases,
-                            tag_type_over, tag_ty_con_over, tag_key, tag_show, tag_numeric,
-                            tag_opaque, binop_byte, unop_byte, mode_byte, spec_tag, deriver_byte,
-                            Spot, Bound, Atoms, Chose, Fields, Level, Pending, Piece, Raw, Ref, Run,
-                            AtomForm, RunMember, RunForm, Choice, Called, Found, Pick, Waiting,
-                            pick_bin, piece_bin, Encoder, Finished, template_of, chosen_template,
-                            compact, put_piece, put_bytes, put_tag, put_u32, put_bool, put_text,
-                            spot_here, bind, bind_all, bound_at, put_level, Captured, capture,
-                            node_ref, Slot)
+import store.hash.encoding (Choice, Called, Found, Pick, Waiting, pick_bin, spec_tag)
+import store.hash.stored (Template, template_bin)
+import store.hash.template (node_template, test_template, law_template, spec_template,
+                            expr_template, renumbered, written_code)
+import store.hash.fill (Filling, blank, Finished, finished, references, expr_references)
 
 // --- The reference graph over every top-level definition ------------------------------
 
@@ -247,587 +224,13 @@ fn sketch_effects(index: Index) -> Map<Int, Bytes> / {abort.raise} =
       NodeEffect(_) ->
         acc.insert(
           v,
-          filled(
-            template_of(index, node.module, |encoder: Encoder| normalize_node(encoder, node.body)),
-            blank(),
-          ).bytes,
+          finished(node_template(index, node.module, node.name, None, node.body), blank()).bytes,
         ),
       _ -> acc,
     }
   })
 
-// --- The byte encoding ----------------------------------------------------------------
-
-fn normalize_node(encoder: Encoder, body: NodeBody) -> Encoder / {abort.raise} =
-  match body {
-    NodeFn(d) -> fn_def(encoder, d),
-    NodeType(d) -> type_def(encoder, d),
-    NodeEffect(d) -> effect_def(encoder, d),
-  }
-
-// --- Filling a form --------------------------------------------------------------------------
-
-/// What a form's holes are filled from: each referenced node's hash, its class where it shares the
-/// component being hashed, each effect's slot in the enumeration the form is written under, and
-/// whether a reference is written as the name `names` gives its node instead.
-type Filling = {
-  hashes: Map<Int, Bytes>,
-  component: Map<Int, Int>,
-  effects: Map<Int, Int>,
-  by_name: Bool,
-  names: List<Bytes>,
-}
-
-/// Each reference with nothing known: what orders a cycle's members and what a node references.
-fn blank() -> Filling =
-  { hashes: Map::new(), component: Map::new(), effects: Map::new(), by_name: false, names: [] }
-
-type RunAt = { base: Int, offsets: List<Int> }
-
-/// The bytes so far, and each reference in first-mention order unless a row is holding its
-/// mentions back.
-type Fill = {
-  out: List<Bytes>,
-  refs: List<Int>,
-  seen: Map<Int, Bool>,
-  deferred: Option<List<Int>>,
-  runs: Map<Int, RunAt>,
-  chosen: List<Pick>,
-}
-
-/// `pieces` written as `f` fills them.
-fn filled(pieces: List<Piece>, f: Filling) -> Finished / {abort.raise} = {
-  let s = fill_all(
-    f,
-    { out: [], refs: [], seen: Map::new(), deferred: None, runs: Map::new(), chosen: [] },
-    pieces,
-  );
-  { bytes: Bytes::concat_all(s.out), refs: s.refs, chosen: s.chosen }
-}
-
-fn fill_all(f: Filling, s: Fill, pieces: List<Piece>) -> Fill / {abort.raise} =
-  pieces.fold(s, |acc: Fill, p: Piece| fill(f, acc, p))
-
-fn mention(s: Fill, node: Int) -> Fill =
-  match s.deferred {
-    Some(held) -> { ..s, deferred: Some(held.push(node)) },
-    None -> if s.seen.contains(node) { s }
-    else { { ..s, seen: s.seen.insert(node, true), refs: s.refs.push(node) } },
-  }
-
-fn level_at(s: Fill, spot: Spot) -> Int / {abort.raise} =
-  if spot.run < 0 { spot.within } else {
-    match s.runs.get(spot.run) {
-      Some(r) -> r.base + r.offsets.get(spot.member) + spot.within,
-      None -> panic("a level names a run not written"),
-    }
-  }
-
-type Written = { fill: Fill, bytes: Bytes }
-
-/// `pieces` written apart, for their bytes to be placed by the caller: what they choose is left
-/// for the caller's own writing of them.
-fn written(f: Filling, s: Fill, pieces: List<Piece>) -> Written / {abort.raise} = {
-  let inner = fill_all(f, { ..s, out: [] }, pieces);
-  { fill: { ..inner, out: s.out, chosen: s.chosen }, bytes: Bytes::concat_all(inner.out) }
-}
-
-fn fill(f: Filling, s: Fill, p: Piece) -> Fill / {abort.raise} =
-  match p {
-    Raw(b) -> { ..s, out: s.out.push(b) },
-    Ref(v) -> {
-      let m = mention(s, v);
-      let b = if f.by_name {
-        let name = f.names.get(v);
-        Bytes::concat_all([byte_of_int(tag_ref_name()), u32_le(name.len()), name])
-      } else {
-        match f.component.get(v) {
-          Some(ix) -> byte_of_int(tag_ref_index()).concat(u32_le(ix)),
-          None -> match f.hashes.get(v) {
-            Some(h) -> byte_of_int(tag_ref_hash()).concat(h),
-            None -> byte_of_int(tag_ref_self()),
-          },
-        }
-      };
-      { ..m, out: m.out.push(b) }
-    },
-    Slot(v) -> { ..s, out: s.out.push(u32_le(match f.effects.get(v) { Some(x) -> x, None -> 0 })) },
-    Level(spot) -> { ..s, out: s.out.push(u32_le(level_at(s, spot))) },
-    Fields(members) -> {
-      let each = members.fold(
-        { fill: s, encoded: [] },
-        |acc: { fill: Fill, encoded: List<Bytes> }, m: List<Piece>| {
-          let w = written(f, acc.fill, m);
-          { fill: w.fill, encoded: acc.encoded.push(w.bytes) }
-        },
-      );
-      let sorted = sort_bytes(each.encoded);
-      { ..each.fill, out: each.fill.out.push(u32_le(sorted.len())).concat(sorted) }
-    },
-    Atoms(atoms) -> atoms_filled(f, s, atoms),
-    Run(r) -> run_filled(f, s, r),
-    Chose(callee, named) -> { ..s, chosen: s.chosen.push(Found({ callee: callee, named: named })) },
-    Pending(at, candidates) ->
-      { ..s, chosen: s.chosen.push(Waiting({ at: at, candidates: candidates })) },
-  }
-
-type AtomEncoding = { bytes: Bytes, tie: Bytes, held: List<Int> }
-
-/// A row is a set: atoms sorted by encoding, then by the effect's declaration, and deduplicated.
-/// Every atom is mentioned, including one the dedup drops.
-fn atoms_filled(f: Filling, s: Fill, atoms: List<AtomForm>) -> Fill / {abort.raise} = {
-  let each = atoms.fold(
-    { fill: s, encoded: [] },
-    |acc: { fill: Fill, encoded: List<AtomEncoding> }, a: AtomForm| {
-      let outer = acc.fill.deferred;
-      let w = written(f, { ..acc.fill, deferred: Some([]) }, a.pieces);
-      let held = match w.fill.deferred { Some(h) -> h, None -> [] };
-      {
-        fill: { ..w.fill, deferred: outer },
-        encoded: acc.encoded.push({ bytes: w.bytes, tie: a.tie, held: held }),
-      }
-    },
-  );
-  let sorted = each.encoded.fold([], |acc: List<AtomEncoding>, x: AtomEncoding|
-    insert_atom(acc, x));
-  let distinct = range(0, sorted.len()).fold(0, |acc: Int, i: Int|
-    if i == 0 || sorted.get(i - 1).bytes != sorted.get(i).bytes { acc + 1 } else { acc });
-  range(0, sorted.len()).fold(
-    { ..each.fill, out: each.fill.out.push(u32_le(distinct)) },
-    |acc: Fill, i: Int| {
-      let x = sorted.get(i);
-      let mentioned: Fill = x.held.fold(acc, |a: Fill, node: Int| mention(a, node));
-      if i > 0 && sorted.get(i - 1).bytes == x.bytes { mentioned }
-      else { { ..mentioned, out: mentioned.out.push(x.bytes) } }
-    },
-  )
-}
-
-fn atom_lt(a: AtomEncoding, b: AtomEncoding) -> Bool =
-  bytes_lt(a.bytes, b.bytes) || (a.bytes == b.bytes && bytes_lt(a.tie, b.tie))
-
-fn insert_atom(sorted: List<AtomEncoding>, x: AtomEncoding) -> List<AtomEncoding> / {abort.raise} = {
-  let n = sorted.len();
-  let i = range(0, n).fold(n, |p: Int, j: Int|
-    if p < n { p } else if atom_lt(x, sorted.get(j)) { j } else { p });
-  sorted.take(i).push(x).concat(range(i, n).map(|j: Int| sorted.get(j)))
-}
-
-/// Each member's encoding at the run's base orders the run, ties in source order; each member is
-/// then written where that order puts it, after the binders of those before it.
-fn run_filled(f: Filling, s: Fill, r: RunForm) -> Fill / {abort.raise} = {
-  let base = level_at(s, r.base);
-  let n = r.members.len();
-  let keyed = range(0, n).fold(
-    {
-      fill: {
-        ..s,
-        runs: s.runs.insert(r.id, { base: base, offsets: range(0, n).map(|i: Int| 0) }),
-      },
-      keys: [],
-    },
-    |acc: { fill: Fill, keys: List<{ key: Bytes, i: Int }> }, i: Int| {
-      let w = written(f, acc.fill, r.members.get(i).pieces);
-      { fill: w.fill, keys: acc.keys.push({ key: w.bytes, i: i }) }
-    },
-  );
-  let order = keyed.keys.fold(
-    [],
-    |acc: List<{ key: Bytes, i: Int }>, x: { key: Bytes, i: Int }| {
-      let k = acc.len();
-      let i = range(0, k).fold(k, |p: Int, j: Int|
-        if p < k { p } else {
-          let y = acc.get(j);
-          if bytes_lt(x.key, y.key) || (x.key == y.key && x.i < y.i) { j } else { p }
-        });
-      acc.take(i).push(x).concat(range(i, k).map(|j: Int| acc.get(j)))
-    },
-  ).map(|x: { key: Bytes, i: Int }| x.i);
-  let offsets = order.fold(
-    { next: 0, offsets: range(0, n).map(|i: Int| 0) },
-    |acc: { next: Int, offsets: List<Int> }, i: Int|
-      { next: acc.next + r.members.get(i).binders, offsets: acc.offsets.set(i, acc.next) },
-  ).offsets;
-  order.fold(
-    { ..keyed.fill, runs: keyed.fill.runs.insert(r.id, { base: base, offsets: offsets }) },
-    |acc: Fill, i: Int| fill_all(f, acc, r.members.get(i).pieces),
-  )
-}
-
-fn free_ref(encoder: Encoder, qual: Option<Bytes>, name: Bytes) -> Encoder / {abort.raise} =
-  match qual {
-    None -> put_text(put_tag(encoder, tag_free()), name),
-    Some(m) -> put_text(put_text(put_tag(encoder, tag_free_qualified()), m), name),
-  }
-
-fn ctor_bytes(encoder: Encoder, owner: Int, name: Bytes) -> Encoder / {abort.raise} =
-  put_text(node_ref(put_tag(encoder, tag_ctor()), owner), name)
-
-/// A local binder wins over everything, and only a bare name can be one. A name a container type
-/// qualifies references what crossing the container calls (`crossed_by`), however it resolves.
-fn value_ref(encoder: Encoder, qname: QName) -> Encoder / {abort.raise} = {
-  let referenced = resolved_ref(encoder, qname);
-  match qualifier(qname) {
-    Some(of) -> if container_named(of) {
-      written_block(referenced, crossed_by(module_name(encoder), of))
-    } else { referenced },
-    None -> referenced,
-  }
-}
-
-fn resolved_ref(encoder: Encoder, qname: QName) -> Encoder / {abort.raise} = {
-  let local = if is_bare(qname) { bound_at(encoder.values, qname.name.name) } else { None };
-  match local {
-    Some(i) -> put_level(put_tag(encoder, tag_local()), i),
-    None -> match value_target(encoder.index, encoder.module, qname) {
-      Some(t) -> match t {
-        FnTarget(node) -> node_ref(encoder, node),
-        CtorTarget(c) -> ctor_bytes(encoder, c.owner, c.name),
-      },
-      // A function of a language type that no module declares is the prelude's, under the one
-      // name it has however it is written.
-      None -> {
-        let called = written_for(qname.name.name);
-        match qualifier(qname) {
-          Some(of) -> if starts_upper(of)
-              && encoder.index.scopes.get(encoder.module).modules.get(of) == None {
-            written_block(free_ref(encoder, None, member_name(of, qname.name.name)), [])
-          } else { written_block(free_ref(encoder, Some(of), qname.name.name), called) },
-          None -> written_block(free_ref(encoder, None, qname.name.name), called),
-        }
-      },
-    },
-  }
-}
-
-/// The code the emitter writes for a container a body compares, digests, shows or hands the runtime,
-/// as `==` of two lists walks them with `List::at` and of two maps walks their entries with
-/// `Map::entries`; and for a builtin that builds or walks a list in Ply, as `range` pushes its
-/// items: the operators a body writes it for, by name and as the lexer names their tokens, the
-/// builtins, and the functions of [`prelude_module`] it calls, by their names there. `lifting` are
-/// the builtins whose code reads a value of any type back from the runtime, which also calls
-/// `lifts`, as a map read back is built with `Map::insert`. A body that writes one of those
-/// references each of what its code calls, so a load that reaches the body reaches them, and a check
-/// groups them with it where they reach it back.
-pub type WrittenCode = {
-  operators: List<Bytes>,
-  tokens: List<Bytes>,
-  builtins: List<Bytes>,
-  calls: List<Bytes>,
-  lifting: List<Bytes>,
-  lifts: List<Bytes>,
-}
-
-pub fn written_code() -> WrittenCode =
-  {
-    operators: [b"eq", b"ne"],
-    tokens: [b"eqeq", b"bangeq"],
-    builtins: [
-      b"compare",
-      b"compare_values",
-      b"digest",
-      b"reflect",
-      b"shown",
-      b"assert_eq",
-      b"observe",
-      b"sqlite_run",
-      b"private_key",
-      b"rsa_jwk",
-      b"range",
-      b"split",
-      b"chars",
-      b"of_chars",
-      b"concat_all",
-    ],
-    calls: [b"List::at", b"List::push", b"Map::entries"],
-    lifting: [b"observe"],
-    lifts: [b"Map::insert"],
-  }
-
-/// What the code the emitter writes where a body names `name` alone calls, by the functions'
-/// names in [`prelude_module`]: none where it writes none.
-pub fn written_for(name: Bytes) -> List<Bytes> =
-  if written_code().lifting.contains(name) { written_code().calls.concat(written_code().lifts) }
-  else if written_code().builtins.contains(name) { written_code().calls }
-  else { [] }
-
-/// Whether `name` is a container type a root crosses to or from the runtime through code of the
-/// prelude: a reference naming one, as a type or as the qualifier of a function, is followed by
-/// what that code calls (`crossed_by`).
-pub fn container_named(name: Bytes) -> Bool = name == b"List" || name == b"Map"
-
-/// What the code crossing a container to or from the runtime calls (`written_code`) where a text
-/// of `module` names the container type `name`: a root over one crosses it, at an entry or a
-/// perform, though the text names none of that code. The prelude's own texts name none of it.
-pub fn crossed_by(module: Bytes, name: Bytes) -> List<Bytes> =
-  if module == prelude_module() || !container_named(name) { [] }
-  else { written_code().calls.concat(written_code().lifts) }
-
-/// `encoder` past a binary operator or a value named by its name alone, and `called`, what the code
-/// the emitter writes there (`written_code`) calls, which the body references with it under
-/// `tag_written`.
-fn written_block(encoder: Encoder, called: List<Bytes>) -> Encoder / {abort.raise} = {
-  let nodes = called.fold([], |acc: List<Int>, n: Bytes|
-    match encoder.index.written.get(n) { Some(v) -> acc.push(v), None -> acc });
-  nodes.fold(put_u32(put_tag(encoder, tag_written()), nodes.len()), node_ref)
-}
-
-fn type_ref(encoder: Encoder, qual: Option<Bytes>, name: Bytes) -> Encoder / {abort.raise} = {
-  let param = match qual { None -> rposition(encoder.ty_params, name), Some(_) -> None };
-  match param {
-    Some(level) -> put_u32(put_tag(encoder, tag_ty_param()), level),
-    None -> match type_target(encoder.index, encoder.module, qual, name) {
-      Some(node) -> node_ref(encoder, node),
-      None -> if qual == None && container_named(name) {
-        written_block(free_ref(encoder, qual, name), crossed_by(module_name(encoder), name))
-      } else { free_ref(encoder, qual, name) },
-    },
-  }
-}
-
-fn module_name(encoder: Encoder) -> Bytes =
-  match encoder.index.mods.at(encoder.module) { Some(m) -> m.name, None -> b"" }
-
-/// Effects are nominal: the declaration referenced, then the slot the component's enumeration gave
-/// it. What makes that true is the simple name in the declaration's own encoding; its module path is
-/// not, so two modules declaring one effect alike declare one effect.
-fn effect_ref(encoder: Encoder, qname: QName) -> Encoder / {abort.raise} =
-  match effect_target(encoder.index, encoder.module, qname) {
-    Some(node) -> put_piece(node_ref(encoder, node), Slot(node)),
-    None -> free_ref(encoder, qualifier(qname), qname.name.name),
-  }
-
-fn ctor_ref(encoder: Encoder, qname: QName) -> Encoder / {abort.raise} =
-  match ctor_target(encoder.index, encoder.module, qname) {
-    Some(CtorTarget(c)) -> ctor_bytes(encoder, c.owner, c.name),
-    _ -> free_ref(encoder, qualifier(qname), qname.name.name),
-  }
-
-/// A resource the signature binds is a level, so renaming the binder is not an edit; a real one stays a name.
-fn label_ref(encoder: Encoder, ident: Ident) -> Encoder / {abort.raise} =
-  match rposition(encoder.label_params, ident.name) {
-    Some(level) -> put_u32(put_tag(encoder, tag_label_param()), level),
-    None -> put_text(put_tag(encoder, tag_free()), ident.name),
-  }
-
-fn opt_type(encoder: Encoder, ty: Option<TypeExpr>) -> Encoder / {abort.raise} =
-  match ty {
-    None -> put_tag(encoder, tag_none()),
-    Some(te) -> type_expr(put_tag(encoder, tag_some()), te),
-  }
-
-fn opt_row(encoder: Encoder, r: Option<RowExpr>) -> Encoder / {abort.raise} =
-  match r {
-    None -> put_tag(encoder, tag_none()),
-    Some(row) -> row_expr(put_tag(encoder, tag_some()), row),
-  }
-
-fn opt_expr(encoder: Encoder, e: Option<Expr>) -> Encoder / {abort.raise} =
-  match e { None -> put_tag(encoder, tag_none()), Some(x) -> expr(put_tag(encoder, tag_some()), x) }
-
-/// A `[*]` clause is not the clause that names no label, so the wildcard is spelled out rather
-/// than shared with the empty case. A `[*t]` clause is not a `[*]` one either: naming the label is
-/// what the body reads, so the binder is part of what the clause is.
-fn clause_label(clause: HandleClause) -> Option<Ident> =
-  match clause.label_binder {
-    Some(t) -> Some({ name: b"*".concat(t.name), span: clause.span }),
-    None -> if clause.every_label { Some({ name: b"*", span: clause.span }) }
-    else { clause.resource },
-  }
-
-fn opt_label(encoder: Encoder, i: Option<Ident>) -> Encoder / {abort.raise} =
-  match i {
-    None -> put_tag(encoder, tag_none()),
-    Some(x) -> label_ref(put_tag(encoder, tag_some()), x),
-  }
-
-fn push_generics(encoder: Encoder, def: FnDef) -> Encoder =
-  {
-    ..encoder,
-    ty_params: encoder.ty_params.concat(def.generics.types.map(|ident: Ident| ident.name)),
-    row_params: encoder.row_params.concat(def.generics.effects.map(|ident: Ident| ident.name)),
-    label_params: encoder.label_params.concat(def.generics.labels.map(|ident: Ident| ident.name)),
-  }
-
-fn fn_def(encoder: Encoder, def: FnDef) -> Encoder / {abort.raise} = {
-  let generic: Encoder = push_generics(
-    put_u32(
-      put_u32(
-        put_u32(put_tag(encoder, tag_fn()), def.generics.types.len()),
-        def.generics.effects.len(),
-      ),
-      def.generics.labels.len(),
-    ),
-    def,
-  );
-  // Before the parameter names reach `values`: a default is closed.
-  let with_params: Encoder = def.params.fold(
-    put_u32(generic, def.params.len()),
-    |acc: Encoder, param: Param| {
-      let kept = if param.keep { put_tag(acc, tag_param_kept()) } else { acc };
-      let spaced = if param.space != None { put_tag(kept, tag_param_spaced()) } else { kept };
-      match param.default {
-        Some(dflt) -> expr(opt_type(put_tag(spaced, tag_param_default()), param.ty), dflt),
-        None -> opt_type(spaced, param.ty),
-      }
-    },
-  );
-  let signature: Encoder = returns(
-    constraints(opt_row(opt_type(with_params, def.ret), def.effects), def.constraints),
-    def,
-  );
-  let bound: Encoder = bind_all(signature, def.params.map(|param: Param| param.name.name));
-  // A stated measure decides the definition's verdict, so it is part of what was written.
-  let measured: Encoder = match def.decreases {
-    Some(m) -> expr(put_tag(bound, tag_decreases()), m),
-    None -> bound,
-  };
-  // A `const` publishes no raise its body can make, so its callers read another definition, and its
-  // value is written out by the code the emitter writes, which it references as a comparison does.
-  let marked: Encoder = match def.baked {
-    Some(_) -> written_block(put_tag(measured, tag_const()), written_code().calls),
-    None -> measured,
-  };
-  expr(marked, def.body)
-}
-
-/// A `returns` clause names a parameter by its position, so renaming one moves nothing.
-fn returns(encoder: Encoder, def: FnDef) -> Encoder / {abort.raise} =
-  match def.returns {
-    None -> encoder,
-    Some(ReturnsFresh(_)) -> put_tag(encoder, tag_returns_fresh()),
-    Some(ReturnsParam(x)) ->
-      put_u32(
-        put_tag(encoder, tag_returns_param()),
-        range(0, def.params.len()).fold(0, |acc: Int, i: Int|
-          if def.params.get(i).name.name == x.name { i } else { acc }),
-      ),
-  }
-
-/// Sorted and deduplicated: the same two constraints in the other order are one definition.
-fn constraints(encoder: Encoder, cs: List<Constraint>) -> Encoder / {abort.raise} = {
-  let levels = cs.fold([], |acc: List<{ level: Int, deriver: Int }>, c: Constraint|
-    match rposition(encoder.ty_params, c.param.name) {
-      Some(level) -> acc.push({ level: level, deriver: deriver_byte(c.deriver) }),
-      None -> acc,
-    });
-  let sorted = levels.fold(
-    [],
-    |acc: List<{ level: Int, deriver: Int }>, x: { level: Int, deriver: Int }| insert_pair(acc, x),
-  );
-  sorted.fold(put_u32(encoder, sorted.len()), |acc: Encoder, x: { level: Int, deriver: Int }|
-    put_tag(put_u32(put_tag(acc, tag_constraint()), x.level), x.deriver))
-}
-
-fn insert_pair(
-  sorted: List<{ level: Int, deriver: Int }>,
-  x: { level: Int, deriver: Int },
-) -> List<{ level: Int, deriver: Int }> / {abort.raise} = {
-  let dup = sorted.fold(false, |b: Bool, y: { level: Int, deriver: Int }|
-    b || (y.level == x.level && y.deriver == x.deriver));
-  if dup { sorted } else {
-    let n = sorted.len();
-    let i = range(0, n).fold(n, |acc: Int, j: Int|
-      if acc < n { acc } else {
-        let y = sorted.get(j);
-        if x.level < y.level || (x.level == y.level && x.deriver < y.deriver) { j } else { acc }
-      });
-    sorted.take(i).push(x).concat(range(i, n).map(|j: Int| sorted.get(j)))
-  }
-}
-
-/// A sum and a `new` record are nominal and an alias is transparent, exactly as the checker has
-/// them: `conv_type` gives a sum a `TyCon` and a `new` record a `TyNominal` under its name, which
-/// `unify_structural` compares by name, and expands an alias in place, so two aliases of one
-/// expansion are one type there and must be one type here. The name is the simple one: a module
-/// path is no part of an identity, so vendoring a module moves nothing.
-fn type_def(encoder: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
-  let g = d.generics;
-  // Only a declaration that binds a row or a label writes their counts, under a tag of its own.
-  let over = g.effects.len() > 0 || g.labels.len() > 0;
-  let tagged: Encoder = put_u32(
-    put_tag(encoder, if over { tag_type_over() } else { tag_type() }),
-    g.types.len(),
-  );
-  let headed: Encoder = if over { put_u32(put_u32(tagged, g.effects.len()), g.labels.len()) }
-  else { tagged };
-  let counted: Encoder = {
-    ..headed,
-    ty_params: headed.ty_params.concat(g.types.map(|ident: Ident| ident.name)),
-    row_params: headed.row_params.concat(g.effects.map(|ident: Ident| ident.name)),
-    label_params: headed.label_params.concat(g.labels.map(|ident: Ident| ident.name)),
-  };
-  // What a use of the type must meet is part of what the type is, as it is of a `fn`.
-  let constrained: Encoder = constraints(counted, d.constraints);
-  let declared: Encoder = match d.body {
-    TDAlias(t) -> type_expr(put_tag(constrained, tag_type_alias()), t),
-    TDSum(variants) ->
-      variants.fold(
-        put_u32(put_text(put_tag(constrained, tag_type_sum()), d.name.name), variants.len()),
-        |acc: Encoder, variant: VariantDef|
-          variant.fields.fold(
-            put_u32(put_text(put_tag(acc, tag_variant()), variant.name.name), variant.fields.len()),
-            |a: Encoder, ty: TypeExpr| type_expr(a, ty),
-          ),
-      ),
-    TDNominal(t) -> type_expr(put_text(put_tag(constrained, tag_type_nominal()), d.name.name), t),
-    TDExtern -> put_text(put_tag(constrained, tag_type_extern()), d.name.name),
-  };
-  // Unlike `pub`, `opaque` refuses bodies that name nothing of the type's: a literal where a
-  // closed record is expected. Only the type's own hash reaches each of them.
-  let closed: Encoder = match d.opaque {
-    Some(_) -> put_tag(declared, tag_opaque()),
-    None -> declared,
-  };
-  // What a value of the type compares and shows through is part of what the type is: each function
-  // is a reference, so the type's hash moves when the function it names does.
-  let stated: Encoder = match closed.index.items.get(closed.module).instances.get(d.name.name) {
-    None -> closed,
-    Some(stated) ->
-      stated.fold(closed, |acc: Encoder, x: InstanceDef|
-        value_ref(put_tag(acc, match x.kind { NKey -> tag_key(), _ -> tag_show() }), {
-          module: None,
-          name: x.by,
-          span: x.by.span,
-        })),
-  };
-  // In the operations' own order, so the order a module wrote them in moves nothing.
-  match stated.index.items.get(stated.module).numerics.get(d.name.name) {
-    None -> stated,
-    Some(numeric) ->
-      numeric_ops().fold(stated, |acc: Encoder, op: Bytes|
-        match numeric_by(numeric, op) {
-          None -> acc,
-          Some(by) ->
-            value_ref(put_text(put_tag(acc, tag_numeric()), op), {
-              module: None,
-              name: by,
-              span: by.span,
-            }),
-        }),
-  }
-}
-
-/// Operations are looked up by name, so their declaration order is sorted away.
-/// An effect is nominal: it is the declaration this name declares, not a shape another declaration
-/// could match. Two effects differing only in their names are two effects, so the name is encoded —
-/// a published row names its atoms' effects, and nothing else would make a hash pin those names.
-/// The name is the simple one: a module path is no part of an identity here, so the same declaration
-/// vendored under another path is still that declaration.
-fn effect_def(encoder: Encoder, d: EffectDef) -> Encoder / {abort.raise} = {
-  let header: Encoder = put_bool(
-    put_text(put_tag(encoder, tag_effect()), d.name.name),
-    d.is_nondet,
-  );
-  let ops = d.ops.fold(
-    { encoder: header, encoded: [] },
-    |acc: { encoder: Encoder, encoded: List<List<Piece>> }, op: OpDef| {
-      let captured: Captured = capture(acc.encoder, |x: Encoder| op_def(x, op));
-      { encoder: captured.encoder, encoded: acc.encoded.push(captured.pieces) }
-    },
-  );
-  put_piece(ops.encoder, Fields(ops.encoded))
-}
+// --- Tests and nodes as templates ------------------------------------------------------------
 
 fn bytes_lt(a: Bytes, b: Bytes) -> Bool = match compare_values(a, b) { Less -> true, _ -> false }
 
@@ -839,835 +242,16 @@ pub fn sort_bytes(xs: List<Bytes>) -> List<Bytes> / {abort.raise} =
     acc.take(i).push(x).concat(range(i, n).map(|j: Int| acc.get(j)))
   })
 
-/// An effect's operations share one encoder, so each one's type parameters go out of scope after it.
-fn op_def(encoder: Encoder, op: OpDef) -> Encoder / {abort.raise} = {
-  let header: Encoder = put_u32(
-    put_bool(
-      put_bytes(
-        put_text(put_tag(encoder, tag_op()), op.name.name),
-        byte_of_int(mode_byte(op.mode)),
-      ),
-      op.resource_param,
-    ),
-    op.ty_params.len(),
-  );
-  let bound: Encoder = {
-    ..header,
-    ty_params: header.ty_params.concat(op.ty_params.map(|p: Ident| p.name)),
-  };
-  let encoded: Encoder = type_expr(
-    op.params.fold(put_u32(bound, op.params.len()), |acc: Encoder, p: TypeExpr| type_expr(acc, p)),
-    op.ret,
-  );
-  { ..encoded, ty_params: encoder.ty_params }
-}
-
-/// A test over cases hashes as what one case runs: the case's type and the body over it. Its table
-/// and its label are no part of that, so a case added to the table moves no other case's hash.
-pub fn test_def(encoder: Encoder, d: TestDef) -> Encoder / {abort.raise} = {
-  let headed: Encoder = put_bool(put_tag(encoder, tag_test()), d.is_nondet);
-  match d.cases {
-    None -> expr(headed, d.body),
-    Some(c) -> {
-      let typed: Encoder = type_expr(put_tag(headed, tag_cases()), c.ty);
-      let inner: Encoder = expr(bind(typed, c.binder.name), d.body);
-      { ..inner, values: typed.values }
-    },
-  }
-}
-
 /// What a test over cases references besides what its hash is taken over: what its two roots
 /// run, its table and its label among it.
 pub fn listed_refs(index: Index, t: TestNode) -> List<Int> / {abort.raise} =
   match t.def.cases {
     None -> [],
     Some(c) ->
-      refs_of(index, t.module, |encoder: Encoder| {
-        let listed: Encoder = expr(encoder, test_listing(c));
-        expr(bind_all(listed, case_params()), test_run(t.def))
-      }),
-  }
-
-/// A law's binder types are part of its identity; their names are levels like any other binder.
-pub fn law_def(encoder: Encoder, d: LawDef) -> Encoder / {abort.raise} = {
-  let typed: Encoder = d.binders.fold(
-    put_u32(put_tag(encoder, tag_law()), d.binders.len()),
-    |acc: Encoder, binder: Binder| type_expr(acc, binder.ty),
-  );
-  let bound: Encoder = bind_all(typed, d.binders.map(|binder: Binder| binder.name.name));
-  expr(opt_expr(bound, d.guard), d.body)
-}
-
-/// In its owner's scope: generics, parameters, `result` for an `ensures`, cost names for a `cost` and
-/// space names for a `space`. Parameter defaults are not written.
-pub fn spec_clause(encoder: Encoder, owner: FnDef, clause: SpecClause) -> Encoder / {abort.raise} = {
-  let generic: Encoder = push_generics(
-    put_u32(
-      put_u32(
-        put_u32(
-          put_bytes(put_tag(encoder, tag_spec()), byte_of_int(spec_tag(clause.kind))),
-          owner.generics.types.len(),
-        ),
-        owner.generics.effects.len(),
+      expr_references(expr_template(index, t.module, case_params(), test_run(t.def))).fold(
+        expr_references(expr_template(index, t.module, [], test_listing(c))),
+        |acc: List<Int>, v: Int| if acc.contains(v) { acc } else { acc.push(v) },
       ),
-      owner.generics.labels.len(),
-    ),
-    owner,
-  );
-  let counted: Encoder = put_u32(generic, owner.params.len());
-  let bound: Encoder = bind_all(counted, owner.params.map(|param: Param| param.name.name));
-  let in_scope: Encoder = match clause.kind {
-    SEnsures -> bind(bound, b"result"),
-    SRequires -> bound,
-    // Written only where a parameter names its space, so a clause over none hashes as it always has.
-    SSpace -> {
-      let named = owner.params.map(|param: Param| param.space);
-      if !named.any(|s: Option<Ident>| s != None) { bound } else { names_bound(bound, named) }
-    },
-    SCost -> names_bound(bound, owner.params.map(|param: Param| param.cost)),
-  };
-  expr(in_scope, clause.expr)
-}
-
-/// Each name after the parameters, with the parameter it names the cost or space of.
-fn names_bound(bound: Encoder, named: List<Option<Ident>>) -> Encoder / {abort.raise} = {
-  let at = range(0, named.len()).filter(|i: Int| named.get(i) != None);
-  at.fold(put_u32(bound, at.len()), |e: Encoder, i: Int|
-    match named.get(i) { Some(k) -> bind(put_u32(e, i), k.name), None -> e })
-}
-
-pub fn type_expr(encoder: Encoder, t: TypeExpr) -> Encoder / {abort.raise} =
-  match t {
-    TVar(name) -> put_u32(type_ref(put_tag(encoder, tag_ty_con()), None, name.name), 0),
-    TCon(c) -> {
-      // Only a use that fills a label or a row writes them, under a tag of its own.
-      let over = c.labels.len() > 0 || c.rows.len() > 0;
-      let applied: Encoder = c.args.fold(
-        put_u32(
-          type_ref(
-            put_tag(encoder, if over { tag_ty_con_over() } else { tag_ty_con() }),
-            qualifier(c.name),
-            c.name.name.name,
-          ),
-          c.args.len(),
-        ),
-        |acc: Encoder, a: TypeExpr| type_expr(acc, a),
-      );
-      if !over { applied } else {
-        c.rows.fold(
-          put_u32(c.labels.fold(put_u32(applied, c.labels.len()), label_ref), c.rows.len()),
-          row_expr,
-        )
-      }
-    },
-    TFn(f) ->
-      opt_row(
-        type_expr(
-          f.params.fold(
-            put_u32(put_tag(encoder, tag_ty_fn()), f.params.len()),
-            |acc: Encoder, p: TypeExpr| type_expr(acc, p),
-          ),
-          f.ret,
-        ),
-        f.effects,
-      ),
-    // A record type is a map from label to type, so field order is sorted away.
-    TRecord(r) -> {
-      let fields = r.fields.fold(
-        { encoder: put_tag(encoder, tag_ty_record()), encoded: [] },
-        |acc: { encoder: Encoder, encoded: List<List<Piece>> }, f: { name: Ident, ty: TypeExpr }| {
-          let captured: Captured = capture(acc.encoder, |x: Encoder|
-            type_expr(put_text(x, f.name.name), f.ty));
-          { encoder: captured.encoder, encoded: acc.encoded.push(captured.pieces) }
-        },
-      );
-      put_piece(fields.encoder, Fields(fields.encoded))
-    },
-    TUnit(_) -> put_tag(encoder, tag_ty_unit()),
-    TBad(_) -> put_tag(encoder, tag_ty_unit()),
-  }
-
-/// A row is a set, its atoms ordered and deduplicated as they are filled.
-fn row_expr(encoder: Encoder, row: RowExpr) -> Encoder / {abort.raise} = {
-  let tagged: Encoder = put_tag(encoder, tag_row());
-  let atoms = row.atoms.fold(
-    { encoder: tagged, atoms: [] },
-    |acc: { encoder: Encoder, atoms: List<AtomForm> }, a: AtomExpr| {
-      let captured: Captured = capture(acc.encoder, |x: Encoder| atom(x, a));
-      let tie = match effect_target(acc.encoder.index, acc.encoder.module, a.eff) {
-        Some(node) -> match acc.encoder.index.effect_sketches.get(node) {
-          Some(s) -> s,
-          None -> b"",
-        },
-        None -> b"",
-      };
-      { encoder: captured.encoder, atoms: acc.atoms.push({ pieces: captured.pieces, tie: tie }) }
-    },
-  );
-  let written: Encoder = put_piece(atoms.encoder, Atoms(atoms.atoms));
-  let tailed: Encoder = match row.tail {
-    None -> put_tag(written, tag_none()),
-    Some(t) -> match rposition(written.row_params, t.name) {
-      Some(level) -> put_u32(put_tag(put_tag(written, tag_some()), tag_row_param()), level),
-      None -> put_text(put_tag(put_tag(written, tag_some()), tag_free()), t.name),
-    },
-  };
-  if row.tail_bounded { put_tag(tailed, tag_bounded()) } else { tailed }
-}
-
-fn atom(encoder: Encoder, a: AtomExpr) -> Encoder / {abort.raise} = {
-  let named: Encoder = match a.op {
-    None ->
-      opt_label(
-        put_bytes(effect_ref(put_tag(encoder, tag_atom()), a.eff), byte_of_int(mode_byte(a.mode))),
-        atom_label(a),
-      ),
-    Some(op) ->
-      opt_label(
-        put_text(effect_ref(put_tag(encoder, tag_atom_op()), a.eff), op.name),
-        atom_label(a),
-      ),
-  };
-  if a.bounded { put_tag(named, tag_bounded()) } else { named }
-}
-
-/// `[*]` is not the absence of a label, so the wildcard is spelled out and hashes apart from it.
-fn atom_label(atom: AtomExpr) -> Option<Ident> =
-  if atom.every { Some({ name: b"*", span: atom.span }) } else { atom.resource }
-
-/// What a call on a value written `.name(..)` at `at` may call: `m::f` where it names its function
-/// in full, and otherwise every function `X::name` of a module its own can see, in the order of
-/// their program-wide names. Which of them it is the value's type says, which no hash reads: the
-/// check's choice follows, written as nothing. `names` is whether the call names an argument.
-fn on_value(encoder: Encoder, at: Span, name: Ident, names: Bool) -> Encoder / {abort.raise} = {
-  let site = site_key(encoder.owner, at.site);
-  let chosen = |c: Choice| Chose(c.callee, c.named);
-  // With no function to choose and no argument to place, the check has nothing to say.
-  let picked = |candidates: List<Bytes>|
-    match encoder.chose {
-      Some(chose) -> chosen(choice_of(chose.get(site), candidates)),
-      None -> if candidates.len() == 0 && !names { chosen(choice_of(None, [])) }
-      else { Pending(site, candidates) },
-    };
-  match member_of(name.name) {
-    Some(of) ->
-      put_piece(
-        value_ref(put_tag(put_u32(encoder, 1), tag_e_var()), {
-          module: Some({ name: of.of, span: name.span }),
-          name: { name: of.member, span: name.span },
-          span: name.span,
-        }),
-        picked([]),
-      ),
-    None -> {
-      let index = encoder.index;
-      let found = index.scopes.get(encoder.module).sees.fold(
-        [],
-        |acc: List<Int>, k: Int|
-          match index.items.get(k).members.get(name.name) {
-            Some(nodes) -> acc.concat(nodes),
-            None -> acc,
-          },
-      ).sort_by(|a: Int, b: Int|
-        match compare_values(index.nodes.get(a).name, index.nodes.get(b).name) {
-          Greater -> false,
-          _ -> true,
-        });
-      put_piece(
-        found.fold(put_u32(put_u32(encoder, 0), found.len()), node_ref),
-        picked(found.map(|v: Int| index.nodes.get(v).name)),
-      )
-    },
-  }
-}
-
-/// Where a check files what it found of a call on a value: the item the call is a node of, by its
-/// owner, and the call's site there.
-pub fn site_key(owner: Bytes, site: Int) -> Bytes =
-  Bytes::concat_all([owner, b"#", Bytes::of_string(site.to_string())])
-
-/// What a check found of each call on a value `sites` record, by `site_key`, each function by its
-/// program-wide name, as a call's candidates name it. A call of a function a record holds in a
-/// field calls none of a type's.
-pub fn called_at(sites: List<MemberSite>) -> Map<Bytes, Called> =
-  sites.fold(Map::new(), |acc: Map<Bytes, Called>, x: MemberSite|
-    if x.callee == b"" { acc } else {
-      acc.insert(site_key(x.owner, x.site), {
-        // The check names a function the prelude binds by its bare name.
-        callee: if x.qualifier == prelude_binder() { qualify(prelude_module(), x.callee) }
-        else { x.callee },
-        named: x.named,
-      })
-    })
-
-/// `called`, what a check found of a call on a value, as a choice among `candidates`: none where
-/// it found nothing or calls a function none of them is.
-pub fn choice_of(called: Option<Called>, candidates: List<Bytes>) -> Choice / {abort.raise} =
-  match called {
-    None -> { callee: 0 - 1, named: [] },
-    Some(c) ->
-      {
-        callee: range(0, candidates.len()).fold(0 - 1, |acc: Int, i: Int|
-          if acc < 0 && candidates.get(i) == c.callee { i } else { acc }),
-        named: c.named,
-      },
-  }
-
-/// What follows the value and the name in the form of `value.name[labels](args, named)`: the
-/// labels, the arguments, those given by name, and every function the call may be.
-fn called_on(
-  encoder: Encoder,
-  at: Span,
-  name: Ident,
-  labels: List<Ident>,
-  args: List<Expr>,
-  named: List<NamedArg>,
-) -> Encoder / {abort.raise} = {
-  let labelled: Encoder = labels.fold(put_u32(encoder, labels.len()), label_ref);
-  let passed: Encoder = args.fold(put_u32(labelled, args.len()), |acc: Encoder, x: Expr|
-    expr(acc, x));
-  on_value(
-    named.fold(put_u32(passed, named.len()), |acc: Encoder, n: NamedArg|
-      expr(put_text(acc, n.name.name), n.value)),
-    at,
-    name,
-    named.len() > 0,
-  )
-}
-
-fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
-  match e {
-    // `{ e }` and `e` are the same computation.
-    EBlock(b) -> if b.stmts.len() == 0 {
-      match b.tail { Some(t) -> expr(encoder, t), None -> block(encoder, b.stmts, b.tail) }
-    } else { block(encoder, b.stmts, b.tail) },
-    ELit(l) -> lit(put_tag(encoder, tag_e_lit()), l.lit),
-    EHole(_) -> put_tag(encoder, tag_e_hole()),
-    EVar(v) -> value_ref(put_tag(encoder, tag_e_var()), v.name),
-    EBinary(b) ->
-      written_block(
-        expr(
-          expr(put_bytes(put_tag(encoder, tag_e_binary()), byte_of_int(binop_byte(b.op))), b.lhs),
-          b.rhs,
-        ),
-        if written_code().operators.contains(b.op) { written_code().calls } else { [] },
-      ),
-    EUnary(u) ->
-      expr(put_bytes(put_tag(encoder, tag_e_unary()), byte_of_int(unop_byte(u.op))), u.operand),
-    ELambda(l) -> {
-      let typed: Encoder = l.params.fold(
-        put_u32(put_tag(encoder, tag_e_lambda()), l.params.len()),
-        |acc: Encoder, p: Param| opt_type(acc, p.ty),
-      );
-      let inner: Encoder = expr(bind_all(typed, l.params.map(|p: Param| p.name.name)), l.body);
-      { ..inner, values: typed.values }
-    },
-    EApp(a) -> match a.func {
-      // A call on a value: its named arguments are the call's to fill, and its callee the
-      // value's type's to say, so every function it may be is part of what the call is.
-      EField(f) ->
-        called_on(
-          put_text(expr(put_tag(encoder, tag_e_on_value()), f.base), f.field.name),
-          a.span,
-          f.field,
-          a.labels,
-          a.args,
-          a.named,
-        ),
-      _ -> {
-        let called: Encoder = a.args.fold(
-          put_u32(expr(put_tag(encoder, tag_e_app()), a.func), a.args.len()),
-          |acc: Encoder, x: Expr| expr(acc, x),
-        );
-        a.labels.fold(put_u32(called, a.labels.len()), label_ref)
-      },
-    },
-    EIf(i) -> expr(expr(expr(put_tag(encoder, tag_e_if()), i.cond), i.then_branch), i.else_branch),
-    EMatch(m) ->
-      m.arms.fold(
-        put_u32(expr(put_tag(encoder, tag_e_match()), m.scrutinee), m.arms.len()),
-        |acc: Encoder, arm: MatchArm| {
-          let inner: Encoder = expr(
-            opt_expr(pattern(put_tag(acc, tag_arm()), arm.pat), arm.guard),
-            arm.body,
-          );
-          { ..inner, values: acc.values }
-        },
-      ),
-    ERecord(r) ->
-      r.fields.fold(
-        put_u32(put_tag(encoder, tag_e_record()), r.fields.len()),
-        |acc: Encoder, f: RecField| expr(put_text(acc, f.name.name), f.value),
-      ),
-    // The update is the definition, not the literal it expands to: its meaning follows the base's type.
-    ERecordUpdate(r) ->
-      r.fields.fold(
-        put_u32(expr(put_tag(encoder, tag_e_record_update()), r.base), r.fields.len()),
-        |acc: Encoder, f: RecField| expr(put_text(acc, f.name.name), f.value),
-      ),
-    ETry(_) -> panic("`e?` is expanded away before hashing"),
-    EField(f) -> put_text(expr(put_tag(encoder, tag_e_field()), f.base), f.field.name),
-    EList(l) ->
-      l.items.fold(
-        put_u32(put_tag(encoder, tag_e_list()), l.items.len()),
-        |acc: Encoder, x: Expr| expr(acc, x),
-      ),
-    EPerform(p) -> match if is_bare(p.eff) { bound_at(encoder.values, p.eff.name.name) }
-      else { None } {
-      None ->
-        p.args.fold(
-          put_u32(
-            opt_label(
-              put_text(effect_ref(put_tag(encoder, tag_e_perform()), p.eff), p.op.name),
-              p.resource,
-            ),
-            p.args.len(),
-          ),
-          |acc: Encoder, x: Expr| expr(acc, x),
-        ),
-      // On a binding it is a call on the value the binding holds.
-      Some(i) ->
-        called_on(
-          put_text(
-            put_level(
-              put_tag(put_tag(put_tag(encoder, tag_e_on_value()), tag_e_var()), tag_local()),
-              i,
-            ),
-            p.op.name,
-          ),
-          p.span,
-          p.op,
-          match p.resource { Some(r) -> [r], None -> [] },
-          p.args,
-          [],
-        ),
-    },
-    EHandle(h) -> if h.vars.len() == 0 {
-      handled(expr(put_tag(encoder, tag_e_handle()), h.body), h.clauses, h.ret)
-    } else {
-      // The first values are read where the `handle` stands, before its body, each seeing the
-      // variables above it; the clauses and the `return` see the variables, the body does not.
-      let inits: Encoder = h.vars.fold(
-        put_u32(put_tag(encoder, tag_e_handle_vars()), h.vars.len()),
-        |acc: Encoder, v: HandlerVar| bind(expr(opt_type(acc, v.ty), v.init), v.name.name),
-      );
-      let held: Encoder = bind_all(
-        expr({ ..inits, values: encoder.values }, h.body),
-        h.vars.map(|v: HandlerVar| v.name.name),
-      );
-      { ..handled(held, h.clauses, h.ret), values: encoder.values }
-    },
-    EWithHold(c) -> {
-      let head: Encoder = expr(
-        expr(put_text(put_tag(encoder, tag_e_with_hold()), c.resource.name), c.acquire),
-        c.release,
-      );
-      let inner: Encoder = expr(bind(head, c.binder.name), c.body);
-      { ..inner, values: head.values }
-    },
-    ESimulate(s) -> expr(put_tag(encoder, tag_e_simulate()), s.body),
-    EParallel(v) ->
-      v.branches.fold(
-        put_u32(put_tag(encoder, tag_e_parallel()), v.branches.len()),
-        |acc: Encoder, x: Expr| expr(acc, x),
-      ),
-    // Apart from the call it stands for, which has another type and another row.
-    ETagged(t) -> if t.holes.len() == 0 {
-      lit(value_ref(put_tag(encoder, tag_e_tagged()), tagged_parser(t)), LStr(t.text))
-    } else {
-      let named: Encoder = value_ref(
-        value_ref(put_tag(encoder, tag_e_filled()), tagged_parser(t)),
-        tagged_filler(t),
-      );
-      t.holes.fold(lit(put_u32(named, t.holes.len()), LStr(t.text)), |acc: Encoder, h: Hole|
-        lit(expr(acc, h.value), LStr(h.text)))
-    },
-    EBad(_) -> panic("a placeholder reached the hasher"),
-    // A `try` that names no raise answers the one its body's row names, which the body settles.
-    ETryBlock(t) -> {
-      let tagged: Encoder = put_tag(encoder, tag_e_try_block());
-      let named: Encoder = match t.raise {
-        None -> put_tag(tagged, tag_none()),
-        Some(r) -> put_text(effect_ref(put_tag(tagged, tag_some()), r.eff), r.op.name),
-      };
-      expr(named, t.body)
-    },
-  }
-
-fn block(encoder: Encoder, stmts: List<Stmt>, tail: Option<Expr>) -> Encoder / {abort.raise} = {
-  let head: Encoder = put_u32(put_tag(encoder, tag_e_block()), stmts.len());
-  let tailed: Encoder = opt_expr(stmts_in_order(head, stmts), tail);
-  { ..tailed, values: head.values }
-}
-
-/// Each statement in turn, consecutive `let`s that commute in the order their own encodings sort
-/// in. A run is ordered where it stands, after the statements before it are written, so what it
-/// reads of an earlier `let` of its block is that binder's level and never its name.
-fn stmts_in_order(encoder: Encoder, stmts: List<Stmt>) -> Encoder / {abort.raise} = {
-  let n = stmts.len();
-  iterate({ encoder: encoder, i: 0 }, n + 2, |s: { encoder: Encoder, i: Int }|
-    if s.i >= n { Stop(s) } else {
-      let run = commutable_run(stmts, s.i);
-      if run < 2 { Continue({ encoder: stmt(s.encoder, stmts.get(s.i)), i: s.i + 1 }) }
-      else { Continue({ encoder: sorted_run(s.encoder, stmts, s.i, s.i + run), i: s.i + run }) }
-    }).encoder
-}
-
-/// The members of the run, each written from where the run starts: filling orders them by those
-/// encodings, ties in source order, and writes each after the binders of those it puts first.
-fn sorted_run(encoder: Encoder, stmts: List<Stmt>, from: Int, to: Int) -> Encoder / {abort.raise} = {
-  let id = encoder.runs;
-  let n = encoder.values.len();
-  let members = range(from, to).fold(
-    { encoder: { ..encoder, runs: id + 1 }, members: [], bound: [] },
-    |acc: { encoder: Encoder, members: List<RunMember>, bound: List<Bound> }, i: Int| {
-      let inner: Encoder = stmt(
-        {
-          ..acc.encoder,
-          out: [],
-          values: encoder.values,
-          scope: { run: id, member: i - from, within: n },
-        },
-        stmts.get(i),
-      );
-      let binders = range(n, inner.values.len()).map(|k: Int| inner.values.get(k));
-      {
-        encoder: { ..inner, out: acc.encoder.out, values: encoder.values, scope: encoder.scope },
-        members: acc.members.push({ pieces: compact(inner.out), binders: binders.len() }),
-        bound: acc.bound.concat(binders),
-      }
-    },
-  );
-  {
-    ..put_piece(members.encoder, Run({ id: id, base: spot_here(encoder), members: members.members })),
-    values: encoder.values.concat(members.bound),
-  }
-}
-
-/// A `handle`'s clauses and `return`, after its body.
-fn handled(
-  encoder: Encoder,
-  clauses: List<HandleClause>,
-  ret: Option<ReturnClause>,
-) -> Encoder / {abort.raise} = {
-  let walked: Encoder = clauses.fold(
-    put_u32(encoder, clauses.len()),
-    |acc: Encoder, c: HandleClause| {
-      let head: Encoder = put_u32(
-        opt_label(
-          put_text(effect_ref(put_tag(acc, tag_clause()), c.eff), c.op.name),
-          clause_label(c),
-        ),
-        c.params.len(),
-      );
-      let bound: Encoder = bind_all(head, c.params.map(|p: Ident| p.name));
-      // Whether a clause binds a continuation is part of what the definition is.
-      let resumed: Encoder = match c.resume {
-        None -> put_tag(bound, tag_none()),
-        Some(k) -> bind(put_tag(bound, tag_some()), k.name),
-      };
-      let inner: Encoder = expr(resumed, c.body);
-      { ..inner, values: acc.values }
-    },
-  );
-  match ret {
-    None -> put_tag(walked, tag_none()),
-    Some(rc) -> {
-      let head: Encoder = put_tag(put_tag(walked, tag_some()), tag_return_clause());
-      let inner: Encoder = expr(bind(head, rc.binder.name), rc.body);
-      { ..inner, values: walked.values }
-    },
-  }
-}
-
-fn stmt(encoder: Encoder, s: Stmt) -> Encoder / {abort.raise} =
-  match s {
-    SLet(l) -> pattern(expr(opt_type(put_tag(encoder, tag_s_let()), l.ty), l.value), l.pat),
-    SLetElse(l) ->
-      expr(
-        pattern(expr(opt_type(put_tag(encoder, tag_s_let_else()), l.ty), l.value), l.pat),
-        l.fallback,
-      ),
-    SExpr(e) -> expr(put_tag(encoder, tag_s_expr()), e),
-    SAssign(a) -> expr(value_ref(put_tag(encoder, tag_s_assign()), bare(a.name)), a.value),
-  }
-
-fn lit(encoder: Encoder, literal: Lit) -> Encoder / {abort.raise} =
-  match literal {
-    LInt(i) -> put_bytes(put_tag(encoder, tag_lit_int()), i64_le(i)),
-    LFixed(ty, v) ->
-      put_bytes(put_bytes(put_tag(encoder, tag_lit_fixed()), width_index(ty)), i64_le(v)),
-    LWide(ty, high, low) ->
-      put_bytes(
-        put_bytes(put_bytes(put_tag(encoder, tag_lit_wide()), width_index(ty)), i64_le(high)),
-        i64_le(low),
-      ),
-    LBool(b) -> put_bool(put_tag(encoder, tag_lit_bool()), b),
-    LStr(s) -> put_text(put_tag(encoder, tag_lit_str()), s),
-    LBytes(b) -> put_bytes(put_u32(put_tag(encoder, tag_lit_bytes()), b.len()), b),
-    LEmbedded(digest, size) ->
-      put_text(put_bytes(put_tag(encoder, tag_lit_embedded()), i64_le(size)), digest),
-    LFloat(text) -> put_bytes(put_tag(encoder, tag_lit_float()), i64_le(float_bits(text))),
-    LDec(text) -> {
-      let p = decimal_parts(text);
-      put_bytes(put_bytes(put_tag(encoder, tag_lit_decimal()), p.mantissa), u32_le(p.scale))
-    },
-    LChar(v) -> put_bytes(put_tag(encoder, tag_lit_char()), u32_le(v)),
-    LUnit -> put_tag(encoder, tag_lit_unit()),
-    LBad -> panic("a placeholder literal reached the hasher"),
-  }
-
-fn pattern(encoder: Encoder, p: Pattern) -> Encoder / {abort.raise} = pattern_in(encoder, p, None)
-
-/// `again` is where the binders of an or-pattern's first alternative start, inside a later one: a
-/// variable there is that alternative's binder of its name, written by its level, and binds
-/// nothing more. So one binder stands for a name whichever alternative matched, and which binder
-/// each alternative gives it is part of the form.
-fn pattern_in(encoder: Encoder, p: Pattern, again: Option<Int>) -> Encoder / {abort.raise} =
-  match p {
-    PWild(_) -> put_tag(encoder, tag_p_wildcard()),
-    PVar(v) -> {
-      let bound = match again {
-        None -> None,
-        Some(from) -> match bound_at(encoder.values, v.name.name) {
-          Some(i) -> if i >= from { Some(i) } else { None },
-          None -> None,
-        },
-      };
-      match bound {
-        Some(i) -> put_level(put_tag(encoder, tag_p_again()), i),
-        None -> bind(put_tag(encoder, tag_p_var()), v.name.name),
-      }
-    },
-    PLit(l) -> lit(put_tag(encoder, tag_p_lit()), l.lit),
-    PRange(r) -> lit(lit(put_tag(encoder, tag_p_range()), r.lo), r.hi),
-    PCtor(c) ->
-      c.args.fold(
-        put_u32(ctor_ref(put_tag(encoder, tag_p_ctor()), c.name), c.args.len()),
-        |acc: Encoder, a: Pattern| pattern_in(acc, a, again),
-      ),
-    PRecord(r) ->
-      put_bool(
-        r.fields.fold(
-          put_u32(put_tag(encoder, tag_p_record()), r.fields.len()),
-          |acc: Encoder, f: { name: Ident, pat: Pattern }|
-            pattern_in(put_text(acc, f.name.name), f.pat, again),
-        ),
-        r.rest,
-      ),
-    PList(l) -> {
-      let items: Encoder = l.items.fold(
-        put_u32(put_tag(encoder, tag_p_list()), l.items.len()),
-        |acc: Encoder, i: Pattern| pattern_in(acc, i, again),
-      );
-      match l.rest {
-        None -> put_tag(items, tag_none()),
-        Some(rest) -> pattern_in(put_tag(items, tag_some()), rest, again),
-      }
-    },
-    POr(o) -> {
-      let head: Encoder = put_u32(put_tag(encoder, tag_p_or()), o.alts.len());
-      let later = match again { Some(_) -> again, None -> Some(head.values.len()) };
-      range(0, o.alts.len()).fold(head, |acc: Encoder, i: Int|
-        pattern_in(acc, o.alts.get(i), if i == 0 { again } else { later }))
-    },
-    PBad(_) -> panic("a placeholder pattern reached the hasher"),
-  }
-
-fn commutable_run(stmts: List<Stmt>, from: Int) -> Int / {abort.raise} = {
-  let n = stmts.len();
-  let to = iterate(from, n - from + 1, |i: Int|
-    if i >= n { Stop(i) } else {
-      match stmts.get(i) {
-        SLet(l) -> if is_pure(l.value) { Continue(i + 1) } else { Stop(i) },
-        _ -> Stop(i),
-      }
-    });
-  if to - from < 2 { 0 } else {
-    let run = range(from, to).map(|i: Int| stmts.get(i));
-    let counted = run.fold(
-      { count: 0, bound: [] },
-      |acc: { count: Int, bound: List<Bytes> }, stmt: Stmt|
-        match stmt {
-          SLet(l) -> {
-            let b = pattern_binders(l.pat, acc.bound);
-            { count: acc.count + b.count, bound: b.bound }
-          },
-          _ -> acc,
-        },
-    );
-    if counted.count != counted.bound.len() { 0 }
-    else if run.fold(false, |b: Bool, stmt: Stmt|
-        b || (match stmt { SLet(l) -> mentions(l.value, counted.bound), _ -> false })) { 0 }
-    else { to - from }
-  }
-}
-
-fn pattern_binders(p: Pattern, out: List<Bytes>) -> { count: Int, bound: List<Bytes> } =
-  match p {
-    PVar(v) -> { count: 1, bound: out.push_unique(v.name.name) },
-    PWild(_) -> { count: 0, bound: out },
-    PLit(_) -> { count: 0, bound: out },
-    PRange(_) -> { count: 0, bound: out },
-    PBad(_) -> { count: 0, bound: out },
-    PCtor(c) ->
-      c.args.fold(
-        { count: 0, bound: out },
-        |acc: { count: Int, bound: List<Bytes> }, a: Pattern| {
-          let b = pattern_binders(a, acc.bound);
-          { count: acc.count + b.count, bound: b.bound }
-        },
-      ),
-    PRecord(r) ->
-      r.fields.fold(
-        { count: 0, bound: out },
-        |acc: { count: Int, bound: List<Bytes> }, f: { name: Ident, pat: Pattern }| {
-          let b = pattern_binders(f.pat, acc.bound);
-          { count: acc.count + b.count, bound: b.bound }
-        },
-      ),
-    PList(l) -> {
-      let items = l.items.fold(
-        { count: 0, bound: out },
-        |acc: { count: Int, bound: List<Bytes> }, i: Pattern| {
-          let b = pattern_binders(i, acc.bound);
-          { count: acc.count + b.count, bound: b.bound }
-        },
-      );
-      match l.rest {
-        Some(rest) -> {
-          let b = pattern_binders(rest, items.bound);
-          { count: items.count + b.count, bound: b.bound }
-        },
-        None -> items,
-      }
-    },
-    // Every alternative binds the same names, which the checker holds them to.
-    POr(o) -> match o.alts.at(0) {
-      Some(a) -> pattern_binders(a, out),
-      None -> { count: 0, bound: out },
-    },
-  }
-
-pub fn is_pure(e: Expr) -> Bool =
-  match e {
-    EApp(_) -> false,
-    EPerform(_) -> false,
-    EHandle(_) -> false,
-    EWithHold(_) -> false,
-    ESimulate(_) -> false,
-    ETryBlock(_) -> false,
-    EParallel(v) -> v.branches.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
-    ETry(_) -> false,
-    EBad(_) -> false,
-    EHole(_) -> false,
-    ELit(_) -> true,
-    ETagged(t) -> t.holes.len() == 0,
-    EVar(_) -> true,
-    EBinary(b) -> is_pure(b.lhs) && is_pure(b.rhs),
-    EUnary(u) -> is_pure(u.operand),
-    ELambda(l) -> is_pure(l.body),
-    EIf(i) -> is_pure(i.cond) && is_pure(i.then_branch) && is_pure(i.else_branch),
-    EMatch(m) ->
-      is_pure(m.scrutinee)
-        && m.arms.fold(true, |acc: Bool, arm: MatchArm|
-          acc && is_pure(arm.body) && (match arm.guard { Some(g) -> is_pure(g), None -> true })),
-    EBlock(b) ->
-      b.stmts.fold(true, |acc: Bool, stmt: Stmt|
-          acc
-            && (match stmt {
-              SLet(l) -> is_pure(l.value),
-              SLetElse(l) -> is_pure(l.value) && is_pure(l.fallback),
-              SExpr(x) -> is_pure(x),
-              SAssign(_) -> false,
-            }))
-        && (match b.tail { Some(t) -> is_pure(t), None -> true }),
-    ERecord(r) -> r.fields.fold(true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
-    ERecordUpdate(r) ->
-      is_pure(r.base) && r.fields.fold(true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
-    EField(f) -> is_pure(f.base),
-    EList(l) -> l.items.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
-  }
-
-/// Deliberately blind to scope: any occurrence of the name counts.
-fn mentions(e: Expr, names: List<Bytes>) -> Bool =
-  match e {
-    ELit(_) -> false,
-    ETagged(t) -> t.holes.fold(false, |acc: Bool, h: Hole| acc || mentions(h.value, names)),
-    EHole(_) -> false,
-    EBad(_) -> false,
-    EVar(v) -> is_bare(v.name) && names.contains(v.name.name.name),
-    EBinary(b) -> mentions(b.lhs, names) || mentions(b.rhs, names),
-    EUnary(u) -> mentions(u.operand, names),
-    ELambda(l) ->
-      l.params.fold(false, |acc: Bool, p: Param| acc || names.contains(p.name.name))
-        || mentions(l.body, names),
-    EApp(a) ->
-      mentions(a.func, names) || a.args.fold(false, |acc: Bool, x: Expr| acc || mentions(x, names)),
-    EIf(i) ->
-      mentions(i.cond, names) || mentions(i.then_branch, names) || mentions(i.else_branch, names),
-    EMatch(m) ->
-      mentions(m.scrutinee, names)
-        || m.arms.fold(false, |acc: Bool, a: MatchArm|
-          acc || pattern_mentions(a.pat, names)
-            || (match a.guard { Some(g) -> mentions(g, names), None -> false })
-            || mentions(a.body, names)),
-    EBlock(b) ->
-      b.stmts.fold(false, |acc: Bool, s: Stmt|
-          acc
-            || (match s {
-              SLet(l) -> pattern_mentions(l.pat, names) || mentions(l.value, names),
-              SLetElse(l) ->
-                pattern_mentions(l.pat, names) || mentions(l.value, names)
-                  || mentions(l.fallback, names),
-              SExpr(x) -> mentions(x, names),
-              SAssign(x) -> names.contains(x.name.name) || mentions(x.value, names),
-            }))
-        || (match b.tail { Some(t) -> mentions(t, names), None -> false }),
-    ERecord(r) -> r.fields.fold(false, |acc: Bool, f: RecField| acc || mentions(f.value, names)),
-    ERecordUpdate(r) ->
-      mentions(r.base, names)
-        || r.fields.fold(false, |acc: Bool, f: RecField| acc || mentions(f.value, names)),
-    EField(f) -> mentions(f.base, names),
-    ETry(t) -> mentions(t.operand, names),
-    EList(l) -> l.items.fold(false, |acc: Bool, x: Expr| acc || mentions(x, names)),
-    EPerform(p) -> p.args.fold(false, |acc: Bool, x: Expr| acc || mentions(x, names)),
-    EHandle(h) ->
-      h.vars.fold(false, |acc: Bool, v: HandlerVar|
-          acc || names.contains(v.name.name) || mentions(v.init, names))
-        || mentions(h.body, names)
-        || h.clauses.fold(false, |acc: Bool, c: HandleClause|
-          acc || c.params.fold(false, |b: Bool, p: Ident| b || names.contains(p.name))
-            || mentions(c.body, names))
-        || (match h.ret {
-          Some(rc) -> names.contains(rc.binder.name) || mentions(rc.body, names),
-          None -> false,
-        }),
-    EWithHold(c) ->
-      names.contains(c.binder.name) || mentions(c.acquire, names) || mentions(c.release, names)
-        || mentions(c.body, names),
-    ESimulate(s) -> mentions(s.body, names),
-    ETryBlock(t) -> mentions(t.body, names),
-    EParallel(v) -> v.branches.fold(false, |acc: Bool, x: Expr| acc || mentions(x, names)),
-  }
-
-fn pattern_mentions(p: Pattern, names: List<Bytes>) -> Bool =
-  match p {
-    PWild(_) -> false,
-    PLit(_) -> false,
-    PRange(_) -> false,
-    PBad(_) -> false,
-    PVar(v) -> names.contains(v.name.name),
-    PCtor(c) ->
-      (is_bare(c.name) && names.contains(c.name.name.name))
-        || c.args.fold(false, |acc: Bool, a: Pattern| acc || pattern_mentions(a, names)),
-    PRecord(r) ->
-      r.fields.fold(false, |acc: Bool, f: { name: Ident, pat: Pattern }|
-        acc || pattern_mentions(f.pat, names)),
-    PList(l) ->
-      l.items.fold(false, |acc: Bool, i: Pattern| acc || pattern_mentions(i, names))
-        || (match l.rest { Some(rest) -> pattern_mentions(rest, names), None -> false }),
-    POr(o) -> o.alts.fold(false, |acc: Bool, a: Pattern| acc || pattern_mentions(a, names)),
   }
 
 // --- The hash table ----------------------------------------------------------------------
@@ -1836,17 +420,18 @@ pub type Shape = { name: Bytes, decl: Bool, effect: Bool, package: Int, form: Op
 /// A node normalized and, for a function, what another package reads of it: its signature with the
 /// body left out, each clause of its specification, and whether its body is `transparent`.
 pub type NodeForm = {
-  pieces: List<Piece>,
-  signature: List<Piece>,
+  form: Template,
+  /// A function's signature: its form with the body left out.
+  signature: Option<Template>,
   clauses: List<ClauseForm>,
   transparent: Bool,
 }
 
-pub type ClauseForm = { kind: Int, pieces: List<Piece> }
+pub type ClauseForm = { kind: Int, form: Template }
 
 /// A test or a law normalized, and what a test over cases references besides: its table, its label
 /// and what one case runs.
-pub type ItemForm = { pieces: List<Piece>, listed: List<Int>, listing: List<Int> }
+pub type ItemForm = { form: Template, listed: List<Int>, listing: List<Int> }
 
 pub type ItemShape = { key: Bytes, form: Option<ItemForm> }
 
@@ -1876,21 +461,21 @@ fn formless(shape: Shape) -> Bool = match shape.form { None -> true, Some(_) -> 
 /// What filling reads throughout one hashing: the shapes, each node's name, and the graph over them.
 type Over = { shapes: Shapes, names: List<Bytes>, graph: Graph }
 
-fn pieces_of(over: Over, v: Int) -> List<Piece> / {abort.raise} =
+fn form_of(over: Over, v: Int) -> Template / {abort.raise} =
   match over.shapes.nodes.get(v).form {
-    Some(f) -> f.pieces,
+    Some(f) -> f.form,
     None -> panic("a node hashed again has no form"),
   }
 
-/// `pieces` filled from `hashes`, its effects numbered as `effects` says.
+/// `form` filled from `hashes`, its effects numbered as `effects` says.
 fn filled_under(
   over: Over,
-  pieces: List<Piece>,
+  form: Template,
   hashes: Map<Int, Bytes>,
   effects: Map<Int, Int>,
   by_name: Bool,
 ) -> Finished / {abort.raise} =
-  filled(pieces, {
+  finished(form, {
     hashes: hashes,
     component: Map::new(),
     effects: effects,
@@ -1899,16 +484,16 @@ fn filled_under(
   })
 
 /// The effect enumeration an item is written under, fixed by what it references with nothing known.
-fn slots_of(over: Over, pieces: List<Piece>) -> Map<Int, Int> / {abort.raise} =
-  slots(effect_order(over.shapes, filled(pieces, blank()).refs, over.graph.scc, None, []))
+fn slots_of(over: Over, form: Template) -> Map<Int, Int> / {abort.raise} =
+  slots(effect_order(over.shapes, references(form), over.graph.scc, None, []))
 
-/// `pieces` filled from `hashes` under the enumeration its own references fix.
+/// `form` filled from `hashes` under the enumeration its own references fix.
 fn filled_item(
   over: Over,
-  pieces: List<Piece>,
+  form: Template,
   hashes: Map<Int, Bytes>,
   by_name: Bool,
-) -> Finished / {abort.raise} = filled_under(over, pieces, hashes, slots_of(over, pieces), by_name)
+) -> Finished / {abort.raise} = filled_under(over, form, hashes, slots_of(over, form), by_name)
 
 fn sketch_lt(a: Bytes, ia: Int, b: Bytes, ib: Int) -> Bool = bytes_lt(a, b) || (a == b && ia < ib)
 
@@ -1927,7 +512,7 @@ fn hash_component(
   effects: Map<Int, Int>,
 ) -> Refined / {abort.raise} = {
   let encode = |classes: Map<Int, Int>, v: Int|
-    filled(pieces_of(over, v), {
+    finished(form_of(over, v), {
       hashes: hashes,
       component: classes,
       effects: effects,
@@ -2068,7 +653,7 @@ fn first_of(shapes: Shapes, fixed: Map<Int, List<Int>>) -> List<Finished> / {abo
     match shapes.nodes.get(v).form {
       None -> { bytes: b"", refs: match edges { Some(es) -> es, None -> [] }, chosen: [] },
       Some(f) -> {
-        let x: Finished = filled(f.pieces, blank());
+        let x: Finished = finished(f.form, blank());
         match edges { Some(es) -> { ..x, refs: es }, None -> x }
       },
     }
@@ -2078,23 +663,25 @@ fn first_of(shapes: Shapes, fixed: Map<Int, List<Int>>) -> List<Finished> / {abo
 /// is what [`Chosen`] says of its module's calls on values.
 fn node_form(index: Index, v: Int, chose: Option<Map<Bytes, Called>>) -> NodeForm / {abort.raise} = {
   let node = index.nodes.get(v);
-  let pieces = chosen_template(index, node.module, node.name, chose, |encoder: Encoder|
-    normalize_node(encoder, node.body));
+  let form = node_template(index, node.module, node.name, chose, node.body);
   match node.body {
     NodeFn(d) ->
       {
-        pieces: pieces,
-        signature: template_of(index, node.module, |encoder: Encoder|
-          normalize_node(encoder, NodeFn({ ..d, body: ELit({ span: d.name.span, lit: LUnit }) }))),
+        form: form,
+        signature: Some(
+          node_template(
+            index,
+            node.module,
+            node.name,
+            None,
+            NodeFn({ ..d, body: ELit({ span: d.name.span, lit: LUnit }) }),
+          ),
+        ),
         clauses: d.spec.map(|clause: SpecClause|
-          {
-            kind: spec_tag(clause.kind),
-            pieces: template_of(index, node.module, |encoder: Encoder|
-              spec_clause(encoder, d, clause)),
-          }),
+          { kind: spec_tag(clause.kind), form: spec_template(index, node.module, d, clause) }),
         transparent: d.transparent != None,
       },
-    _ -> { pieces: pieces, signature: [], clauses: [], transparent: false },
+    _ -> { form: form, signature: None, clauses: [], transparent: false },
   }
 }
 
@@ -2104,26 +691,22 @@ fn test_form(
   chose: Option<Map<Bytes, Called>>,
 ) -> ItemForm / {abort.raise} =
   {
-    pieces: chosen_template(
+    form: test_template(
       index,
       t.module,
       test_owner(index.mods.get(t.module).name, t.def.name),
       chose,
-      |encoder: Encoder| test_def(encoder, t.def),
+      t.def,
     ),
     listed: listed_refs(index, t),
     listing: match t.def.cases {
-      Some(c) -> refs_of(index, t.module, |encoder: Encoder| expr(encoder, test_listing(c))),
+      Some(c) -> expr_references(expr_template(index, t.module, [], test_listing(c))),
       None -> [],
     },
   }
 
 fn law_form(index: Index, l: LawNode) -> ItemForm / {abort.raise} =
-  {
-    pieces: template_of(index, l.module, |encoder: Encoder| law_def(encoder, l.def)),
-    listed: [],
-    listing: [],
-  }
+  { form: law_template(index, l.module, l.def), listed: [], listing: [] }
 
 type Shaped = { shapes: Shapes, first: List<Finished> }
 
@@ -2285,7 +868,7 @@ fn key_component(
     })
   } else {
     let v = component.get(0);
-    let encoding = filled_under(over, pieces_of(over, v), acc.hashes, effects, false);
+    let encoding = filled_under(over, form_of(over, v), acc.hashes, effects, false);
     {
       ..acc,
       fresh: acc.fresh.insert(v, blake3(encoding.bytes)),
@@ -2420,9 +1003,9 @@ pub fn hashed_over(
           None -> panic("a test read as fixed is not fixed"),
         },
         Some(form) -> {
-          let effects = slots_of(over, form.pieces);
-          let f: Finished = filled_under(over, form.pieces, hashes, effects, false);
-          let text: Finished = filled_under(over, form.pieces, hashes, effects, true);
+          let effects = slots_of(over, form.form);
+          let f: Finished = filled_under(over, form.form, hashes, effects, false);
+          let text: Finished = filled_under(over, form.form, hashes, effects, true);
           {
             hashes: acc.hashes.push(blake3(f.bytes)),
             bodies: acc.bodies.push(solo_body(f)),
@@ -2450,9 +1033,9 @@ pub fn hashed_over(
           None -> panic("a law read as fixed is not fixed"),
         },
         Some(form) -> {
-          let effects = slots_of(over, form.pieces);
-          let f: Finished = filled_under(over, form.pieces, hashes, effects, false);
-          let text: Finished = filled_under(over, form.pieces, hashes, effects, true);
+          let effects = slots_of(over, form.form);
+          let f: Finished = filled_under(over, form.form, hashes, effects, false);
+          let text: Finished = filled_under(over, form.form, hashes, effects, true);
           {
             hashes: acc.hashes.push(blake3(f.bytes)),
             refs: acc.refs.push(f.refs),
@@ -2504,8 +1087,7 @@ pub fn hashed_over(
       clauses: range(0, shapes.nodes.len()).map(|v: Int|
         match shapes.nodes.get(v).form {
           Some(form) ->
-            form.clauses.fold([], |acc: List<Int>, c: ClauseForm|
-              acc.concat(filled(c.pieces, blank()).refs)),
+            form.clauses.fold([], |acc: List<Int>, c: ClauseForm| acc.concat(references(c.form))),
           None -> match held.get(v) { Some(f) -> present(f.clauses), None -> [] },
         }),
       test_listings: tests.listings,
@@ -2531,10 +1113,13 @@ pub fn contract_of(
     match shape.form {
       None -> match held.get(v) { Some(f) -> f.contract, None -> hash },
       Some(form) -> {
-        let signature = filled_item(over, form.signature, hashes, false).bytes;
+        let signature = match form.signature {
+          Some(s) -> filled_item(over, s, hashes, false).bytes,
+          None -> b"",
+        };
         // Normalizing erases the specifications, which a dependent is owed as much as the types.
         let clauses = form.clauses.map(|clause: ClauseForm|
-          filled_item(over, clause.pieces, hashes, false).bytes);
+          filled_item(over, clause.form, hashes, false).bytes);
         // A `transparent` body is read too, so the contract holds the hash of it and all it reaches.
         let body = if form.transparent { b"transparent".concat(hash) } else { b"" };
         blake3(Bytes::concat_all([contract_domain(), signature, Bytes::concat_all(clauses), body]))
@@ -2625,7 +1210,7 @@ fn check_key_components(
             let v = component.get(0);
             let encoding = filled_under(
               over,
-              pieces_of(over, v),
+              form_of(over, v),
               gathered.view,
               effects,
               false,
@@ -2671,7 +1256,7 @@ fn unfixed_stated(
     Some(form) -> if shape.decl { acc } else {
       let own: Finished = filled_under(
         over,
-        form.pieces,
+        form.form,
         hashes,
         slots(effect_order(over.shapes, refs, over.graph.scc, None, [])),
         true,
@@ -2684,9 +1269,9 @@ fn unfixed_stated(
         match hashes.get(v) {
           None -> owned,
           Some(owner) -> {
-            let effects = form.clauses.map(|c: ClauseForm| slots_of(over, c.pieces));
+            let effects = form.clauses.map(|c: ClauseForm| slots_of(over, c.form));
             let encoded = |i: Int, table: Map<Int, Bytes>, by_name: Bool|
-              filled_under(over, form.clauses.get(i).pieces, table, effects.get(i), by_name).bytes;
+              filled_under(over, form.clauses.get(i).form, table, effects.get(i), by_name).bytes;
             let kinds = range(0, form.clauses.len());
             let clauses = kinds.map(|i: Int|
               spec_hash(owner, form.clauses.get(i).kind, i, encoded(i, hashes, false)));
@@ -2710,40 +1295,24 @@ fn unfixed_stated(
 
 // --- A module's forms ------------------------------------------------------------------------
 
-/// Each node `pieces` names, after those of `seen`, in the order first named.
-fn piece_nodes(pieces: List<Piece>, seen: Taken) -> Taken / {abort.raise} =
-  pieces.fold(seen, |acc: Taken, p: Piece|
-    match p {
-      Ref(v) -> taken(acc, v),
-      Slot(v) -> taken(acc, v),
-      Fields(ms) -> ms.fold(acc, |a: Taken, m: List<Piece>| piece_nodes(m, a)),
-      Atoms(xs) -> xs.fold(acc, |a: Taken, x: AtomForm| piece_nodes(x.pieces, a)),
-      Run(r) -> r.members.fold(acc, |a: Taken, m: RunMember| piece_nodes(m.pieces, a)),
-      _ -> acc,
-    })
+/// Each node `form` names, after those of `seen`, in the order first named.
+fn form_nodes(form: Template, seen: Taken) -> Taken / {abort.raise} =
+  references(form).fold(seen, taken)
+
+fn opt_form_nodes(form: Option<Template>, seen: Taken) -> Taken / {abort.raise} =
+  match form { Some(f) -> form_nodes(f, seen), None -> seen }
 
 type Taken = { order: List<Int>, at: Map<Int, Int> }
 
 fn taken(t: Taken, v: Int) -> Taken =
   if t.at.contains(v) { t } else { { order: t.order.push(v), at: t.at.insert(v, t.order.len()) } }
 
-fn renumbered(pieces: List<Piece>, ids: Map<Int, Int>) -> List<Piece> / {abort.raise} = {
-  let id = |v: Int|
-    match ids.get(v) { Some(k) -> k, None -> panic("a form names a node not taken") };
-  pieces.map(|p: Piece|
-    match p {
-      Ref(v) -> Ref(id(v)),
-      Slot(v) -> Slot(id(v)),
-      Fields(ms) -> Fields(ms.map(|m: List<Piece>| renumbered(m, ids))),
-      Atoms(xs) -> Atoms(xs.map(|x: AtomForm| { ..x, pieces: renumbered(x.pieces, ids) })),
-      Run(r) ->
-        Run({
-          ..r,
-          members: r.members.map(|m: RunMember| { ..m, pieces: renumbered(m.pieces, ids) }),
-        }),
-      _ -> p,
-    })
-}
+fn moved(form: Template, ids: Map<Int, Int>) -> Template / {abort.raise} =
+  renumbered(form, |v: Int|
+    match ids.get(v) { Some(k) -> k, None -> panic("a form names a node not taken") })
+
+fn opt_moved(form: Option<Template>, ids: Map<Int, Int>) -> Option<Template> / {abort.raise} =
+  match form { Some(f) -> Some(moved(f, ids)), None -> None }
 
 /// What hashing reads of the module at `module` of `index`, its modules in `packages`: each node
 /// of it, test and law with its forms, and each node of another module those reference, by what it
@@ -2813,13 +1382,13 @@ pub fn chosen_forms(index: Index, packages: List<Int>, chosen: Chosen) -> Shapes
   let test_forms = tests.map(|t: TestNode| test_form(index, t, chosen.called));
   let law_forms = laws.map(|l: LawNode| law_form(index, l));
   let item_nodes = |acc: Taken, x: ItemForm|
-    x.listed.concat(x.listing).fold(piece_nodes(x.pieces, acc), |a: Taken, v: Int| taken(a, v));
+    x.listed.concat(x.listing).fold(form_nodes(x.form, acc), |a: Taken, v: Int| taken(a, v));
   let table = law_forms.fold(
     test_forms.fold(
       forms.fold(own.fold({ order: [], at: Map::new() }, taken), |acc: Taken, f: NodeForm|
         f.clauses.fold(
-          piece_nodes(f.signature, piece_nodes(f.pieces, acc)),
-          |a: Taken, c: ClauseForm| piece_nodes(c.pieces, a),
+          opt_form_nodes(f.signature, form_nodes(f.form, acc)),
+          |a: Taken, c: ClauseForm| form_nodes(c.form, a),
         )),
       item_nodes,
     ),
@@ -2828,7 +1397,7 @@ pub fn chosen_forms(index: Index, packages: List<Int>, chosen: Chosen) -> Shapes
   let ids = table.at;
   let item = |x: ItemForm|
     {
-      pieces: renumbered(x.pieces, ids),
+      form: moved(x.form, ids),
       listed: x.listed.map(|v: Int| match ids.get(v) { Some(k) -> k, None -> v }),
       listing: x.listing.map(|v: Int| match ids.get(v) { Some(k) -> k, None -> v }),
     };
@@ -2844,9 +1413,9 @@ pub fn chosen_forms(index: Index, packages: List<Int>, chosen: Chosen) -> Shapes
         form: if k < own.len() {
           let f = forms.get(k);
           Some({
-            pieces: renumbered(f.pieces, ids),
-            signature: renumbered(f.signature, ids),
-            clauses: f.clauses.map(|c: ClauseForm| { ..c, pieces: renumbered(c.pieces, ids) }),
+            form: moved(f.form, ids),
+            signature: opt_moved(f.signature, ids),
+            clauses: f.clauses.map(|c: ClauseForm| { ..c, form: moved(c.form, ids) }),
             transparent: f.transparent,
           })
         } else { None },
@@ -2901,7 +1470,7 @@ pub fn joined_forms(parts: List<Shapes>) -> Shapes / {abort.raise} = {
           None -> None,
           Some(f) ->
             Some({
-              pieces: renumbered(f.pieces, ids.get(k)),
+              form: moved(f.form, ids.get(k)),
               listed: f.listed.map(|v: Int| match ids.get(k).get(v) { Some(w) -> w, None -> v }),
               listing: f.listing.map(|v: Int| match ids.get(k).get(v) { Some(w) -> w, None -> v }),
             }),
@@ -2915,10 +1484,9 @@ pub fn joined_forms(parts: List<Shapes>) -> Shapes / {abort.raise} = {
           {
             ..j.shape,
             form: Some({
-              pieces: renumbered(f.pieces, ids.get(j.part)),
-              signature: renumbered(f.signature, ids.get(j.part)),
-              clauses: f.clauses.map(|c: ClauseForm|
-                { ..c, pieces: renumbered(c.pieces, ids.get(j.part)) }),
+              form: moved(f.form, ids.get(j.part)),
+              signature: opt_moved(f.signature, ids.get(j.part)),
+              clauses: f.clauses.map(|c: ClauseForm| { ..c, form: moved(c.form, ids.get(j.part)) }),
               transparent: f.transparent,
             }),
           },
@@ -3046,10 +1614,7 @@ pub fn fixed_nodes(
   let edges_of = |v: Int, node: Node|
     match hashes.refs.edges.at(v) {
       Some(refs) -> node_refs(refs),
-      None ->
-        node_refs(
-          refs_of(index, node.module, |encoder: Encoder| normalize_node(encoder, node.body)),
-        ),
+      None -> node_refs(references(node_template(index, node.module, node.name, None, node.body))),
     };
   let own = hashes.own.fold(
     Map::new(),
@@ -3207,7 +1772,7 @@ pub fn rehash_index(index: Index, pins: List<Pin>) -> Rehashed / {abort.raise} =
       {
         key: t.key,
         hash: match t.form {
-          Some(f) -> blake3(filled_item(over, f.pieces, keyed.hashes, false).bytes),
+          Some(f) -> blake3(filled_item(over, f.form, keyed.hashes, false).bytes),
           None -> b"",
         },
       }),
@@ -3622,12 +2187,6 @@ pub fn walk(edges: List<List<Int>>, from: List<Int>) -> List<Int> / {abort.raise
   walked(edges, from).all
 
 // --- What nothing reaches -------------------------------------------------------------------------------
-
-pub fn refs_of<| e>(
-  index: Index,
-  module: Int,
-  encode: (Encoder) -> Encoder / e,
-) -> List<Int> / {abort.raise | e} = filled(template_of(index, module, encode), blank()).refs
 
 // --- Tests ------------------------------------------------------------------
 

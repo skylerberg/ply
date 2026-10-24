@@ -1,0 +1,1504 @@
+//! What the encoder makes of a definition's syntax: its template, the stored form with what it
+//! references left as nodes of the program (`stored.Template`). Every name is resolved here, once.
+
+import syntax.parsing (Span, Ident, QName, is_bare, bare, starts_upper, prelude_binder)
+import syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr)
+import syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit,
+                        LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded, LFloat, LDec, LChar,
+                        LUnit, LBad)
+import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
+                     ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
+                     EParallel, EBad, EHole, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign, Param,
+                     MatchArm, HandleClause, ReturnClause, HandlerVar, RecField, ETagged, Hole,
+                     tagged_parser, tagged_filler, NamedArg, prelude_module)
+import syntax.items (FnDef, TypeDef, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef,
+                     Binder, Constraint, SRequires, SEnsures, SCost, SSpace, SpecClause,
+                     ReturnsFresh, ReturnsParam, TDNominal, TDExtern, InstanceDef, NKey,
+                     numeric_ops, numeric_by, member_of, member_name)
+import check.resolve.tables (qualify)
+import check.infer.checker (MemberSite)
+import std.list
+import std.option
+import std.bytes
+import std.string
+import store.hash.graph (NodeBody, NodeEffect, NodeFn, NodeType, CtorTarget, FnTarget, Index,
+                         qualifier, value_target, ctor_target, type_target, effect_target)
+import store.hash.encoding (rposition, width_index, float_bits, decimal_parts, Spot, Bound, Choice,
+                            Called, Found, Pick, Waiting)
+import store.hash.stored
+import store.hash.stored (Note, Picked, Ran, Free, Literal, IntLit, FixedLit, WideLit, BoolLit,
+                          StrLit, BytesLit, EmbeddedLit, FloatLit, DecimalLit, CharLit, UnitLit,
+                          Named, Local, Defined, Constructed, Unbound, Value, Label, LabelParam,
+                          LabelName, Effect, Declared, EffectUnbound, TypeName, TypeParam,
+                          TypeDefined, TypeUnbound, Ty, Applied, AppliedOver, Function, Fields,
+                          UnitType, TyField, RowTail, RowParam, RowName, Row, Atom, Moded, OfOp,
+                          Pat, Wild, Bind, Again, LitPat, RangePat, CtorPat, RecordPat, PatField,
+                          ListPat, OrPat, Callees, InFull, Among, Constant, Unwritten, Var, Binary,
+                          Unary, Lambda, App, OnValue, OnValueCall, If, Match, Record, RecordUpdate,
+                          Field, ListOf, Perform, Handle, WithHold, Simulate, Parallel, Tagged,
+                          Filled, FilledHole, TryBlock, Raised, Block, Arm, Handled, Clause, Entry,
+                          One, Commuting, Let, LetElse, Effectful, Assign, Generics, Constrained,
+                          Returning, Unstated, Fresh, ParamReturned, FnForm, Variant, TypeBody,
+                          Alias, Sum, Nominal, Extern, Through, Numeric, TypeForm, Op, EffectForm,
+                          TestForm, LawForm, SpecForm, Form, FnOf, TypeOf, EffectOf, TestOf, LawOf,
+                          SpecOf, Template)
+
+pub type TValue = Value<Int, Spot>
+
+pub type TTy = Ty<Int, Bytes>
+
+pub type TRow = Row<Int, Bytes>
+
+pub type TPat = Pat<Int, Spot>
+
+pub type TExpr = stored::Expr<Int, Bytes, Spot, Note>
+
+pub type TStmt = stored::Stmt<Int, Bytes, Spot, Note>
+
+/// What a template is written in: the program and module, the item whose calls on values the check
+/// filed under `owner`, the binders in scope, and how many commutable runs the definition has.
+/// `scope` is the member of a run being written, with `within` where its binders start among
+/// `values`; `run` -1 outside every run. `chose` is what the check found of each call on a value,
+/// by `site_key`; `None` where hashing runs before the check, which leaves each call pending.
+/// `reads` is the place in `values` of each binder a name has been resolved to, in order.
+pub type Encoder = {
+  index: Index,
+  module: Int,
+  owner: Bytes,
+  values: List<Bound>,
+  ty_params: List<Bytes>,
+  row_params: List<Bytes>,
+  label_params: List<Bytes>,
+  scope: Spot,
+  runs: Int,
+  chose: Option<Map<Bytes, Called>>,
+  reads: List<Int>,
+}
+
+/// What a walk built and the encoder it leaves.
+pub type Built<a> = { encoder: Encoder, form: a }
+
+fn no_scope() -> Spot = { run: 0 - 1, member: 0, within: 0 }
+
+pub fn new_encoder(index: Index, module: Int) -> Encoder =
+  {
+    index: index,
+    module: module,
+    owner: b"",
+    values: [],
+    ty_params: [],
+    row_params: [],
+    label_params: [],
+    scope: no_scope(),
+    runs: 0,
+    chose: Some(Map::new()),
+    reads: [],
+  }
+
+/// The template of `body` in `module`, each call on a value read as calling what `chose` holds at
+/// its site under `owner`.
+pub fn node_template(
+  index: Index,
+  module: Int,
+  owner: Bytes,
+  chose: Option<Map<Bytes, Called>>,
+  body: NodeBody,
+) -> Template / {abort.raise} = {
+  let e = { ..new_encoder(index, module), owner: owner, chose: chose };
+  match body {
+    NodeFn(d) -> FnOf(fn_def(e, d)),
+    NodeType(d) -> TypeOf(type_def(e, d)),
+    NodeEffect(d) -> EffectOf(effect_def(e, d)),
+  }
+}
+
+pub fn test_template(
+  index: Index,
+  module: Int,
+  owner: Bytes,
+  chose: Option<Map<Bytes, Called>>,
+  d: TestDef,
+) -> Template / {abort.raise} =
+  TestOf(test_def({ ..new_encoder(index, module), owner: owner, chose: chose }, d))
+
+pub fn law_template(index: Index, module: Int, d: LawDef) -> Template / {abort.raise} =
+  LawOf(law_def(new_encoder(index, module), d))
+
+pub fn spec_template(
+  index: Index,
+  module: Int,
+  owner: FnDef,
+  clause: SpecClause,
+) -> Template / {abort.raise} = SpecOf(spec_clause(new_encoder(index, module), owner, clause))
+
+/// The template of the expression `e` written in `module` under the binders `params`, as a test's
+/// table and roots are: what it references is all that is read of it.
+pub fn expr_template(
+  index: Index,
+  module: Int,
+  params: List<Bytes>,
+  e: Expr,
+) -> TExpr / {abort.raise} = expr(bind_all(new_encoder(index, module), params), e).form
+
+// --- Scope -------------------------------------------------------------------------------------
+
+/// Where the next binder stands: within the member being written, if any.
+fn spot_here(encoder: Encoder) -> Spot = {
+  let n = encoder.values.len();
+  if encoder.scope.run < 0 { { run: 0 - 1, member: 0, within: n } }
+  else { { ..encoder.scope, within: n - encoder.scope.within } }
+}
+
+fn bind(encoder: Encoder, name: Bytes) -> Encoder =
+  { ..encoder, values: encoder.values.push({ name: name, spot: spot_here(encoder) }) }
+
+fn bind_all(encoder: Encoder, names: List<Bytes>) -> Encoder = names.fold(encoder, bind)
+
+/// The binder `name` names, searching from the last bound: its place in `values`.
+fn bound_at(values: List<Bound>, name: Bytes) -> Option<Int> / {abort.raise} =
+  range(0, values.len()).fold(None, |acc: Option<Int>, i: Int|
+    if values.get(i).name == name { Some(i) } else { acc })
+
+/// `encoder` having read the binder `qname` names, where it names a local.
+fn read(encoder: Encoder, qname: QName) -> Encoder / {abort.raise} =
+  match if is_bare(qname) { bound_at(encoder.values, qname.name.name) } else { None } {
+    Some(i) -> { ..encoder, reads: encoder.reads.push(i) },
+    None -> encoder,
+  }
+
+/// `encoder` with the binders of `inner` dropped: what a scope that closes leaves.
+fn closed(inner: Encoder, outer: Encoder) -> Encoder = { ..inner, values: outer.values }
+
+// --- What the emitter writes beside the text ---------------------------------------------------
+
+/// The code the emitter writes for a container a body compares, digests, shows or hands the runtime,
+/// as `==` of two lists walks them with `List::at` and of two maps walks their entries with
+/// `Map::entries`; and for a builtin that builds or walks a list in Ply, as `range` pushes its
+/// items: the operators a body writes it for, by name and as the lexer names their tokens, the
+/// builtins, and the functions of [`prelude_module`] it calls, by their names there. `lifting` are
+/// the builtins whose code reads a value of any type back from the runtime, which also calls
+/// `lifts`, as a map read back is built with `Map::insert`. A body that writes one of those
+/// references each of what its code calls, so a load that reaches the body reaches them, and a check
+/// groups them with it where they reach it back.
+pub type WrittenCode = {
+  operators: List<Bytes>,
+  tokens: List<Bytes>,
+  builtins: List<Bytes>,
+  calls: List<Bytes>,
+  lifting: List<Bytes>,
+  lifts: List<Bytes>,
+}
+
+pub fn written_code() -> WrittenCode =
+  {
+    operators: [b"eq", b"ne"],
+    tokens: [b"eqeq", b"bangeq"],
+    builtins: [
+      b"compare",
+      b"compare_values",
+      b"digest",
+      b"reflect",
+      b"shown",
+      b"assert_eq",
+      b"observe",
+      b"sqlite_run",
+      b"private_key",
+      b"rsa_jwk",
+      b"range",
+      b"split",
+      b"chars",
+      b"of_chars",
+      b"concat_all",
+    ],
+    calls: [b"List::at", b"List::push", b"Map::entries"],
+    lifting: [b"observe"],
+    lifts: [b"Map::insert"],
+  }
+
+/// What the code the emitter writes where a body names `name` alone calls, by the functions'
+/// names in [`prelude_module`]: none where it writes none.
+pub fn written_for(name: Bytes) -> List<Bytes> =
+  if written_code().lifting.contains(name) { written_code().calls.concat(written_code().lifts) }
+  else if written_code().builtins.contains(name) { written_code().calls }
+  else { [] }
+
+/// Whether `name` is a container type a root crosses to or from the runtime through code of the
+/// prelude: a reference naming one, as a type or as the qualifier of a function, carries what that
+/// code calls (`crossed_by`).
+pub fn container_named(name: Bytes) -> Bool = name == b"List" || name == b"Map"
+
+/// What the code crossing a container to or from the runtime calls (`written_code`) where a text
+/// of `module` names the container type `name`: a root over one crosses it, at an entry or a
+/// perform, though the text names none of that code. The prelude's own texts name none of it.
+pub fn crossed_by(module: Bytes, name: Bytes) -> List<Bytes> =
+  if module == prelude_module() || !container_named(name) { [] }
+  else { written_code().calls.concat(written_code().lifts) }
+
+fn module_name(encoder: Encoder) -> Bytes =
+  match encoder.index.mods.at(encoder.module) { Some(m) -> m.name, None -> b"" }
+
+/// The prelude's functions `called` names, as the nodes they are.
+fn written_nodes(encoder: Encoder, called: List<Bytes>) -> List<Int> =
+  called.fold([], |acc: List<Int>, n: Bytes|
+    match encoder.index.written.get(n) { Some(v) -> acc.push(v), None -> acc })
+
+// --- References --------------------------------------------------------------------------------
+
+/// A local binder wins over everything, and only a bare name can be one. A function of a container
+/// type carries what crossing the container calls (`crossed_by`), however it resolves and whichever
+/// module it is named through: `Map::union` and `map::Map::union` are one reference.
+fn value_of(encoder: Encoder, qname: QName) -> TValue / {abort.raise} = {
+  let v = resolved(encoder, qname);
+  match container_of(qname) {
+    Some(of) ->
+      {
+        ..v,
+        written: v.written.concat(written_nodes(encoder, crossed_by(module_name(encoder), of))),
+      },
+    None -> v,
+  }
+}
+
+/// The container type `qname` names a function of: its qualifier, or the type its name is a
+/// function of where a module qualifies it.
+fn container_of(qname: QName) -> Option<Bytes> / {abort.raise} =
+  match qualifier(qname) {
+    Some(of) -> if container_named(of) { Some(of) } else {
+      match member_of(qname.name.name) {
+        Some(m) -> if container_named(m.of) { Some(m.of) } else { None },
+        None -> None,
+      }
+    },
+    None -> match member_of(qname.name.name) {
+      Some(m) -> if container_named(m.of) { Some(m.of) } else { None },
+      None -> None,
+    },
+  }
+
+fn resolved(encoder: Encoder, qname: QName) -> TValue / {abort.raise} = {
+  let local = if is_bare(qname) { bound_at(encoder.values, qname.name.name) } else { None };
+  match local {
+    Some(i) -> { named: Local(encoder.values.get(i).spot), written: [] },
+    None -> match value_target(encoder.index, encoder.module, qname) {
+      Some(FnTarget(node)) -> { named: Defined(node), written: [] },
+      Some(CtorTarget(c)) -> { named: Constructed(c.owner, c.name), written: [] },
+      // A function of a language type that no module declares is the prelude's, under the one
+      // name it has however it is written.
+      None -> {
+        let called = written_nodes(encoder, written_for(qname.name.name));
+        match qualifier(qname) {
+          Some(of) -> if starts_upper(of)
+              && encoder.index.scopes.get(encoder.module).modules.get(of) == None {
+            {
+              named: Unbound({ module: None, name: member_name(of, qname.name.name) }),
+              written: [],
+            }
+          } else {
+            { named: Unbound({ module: Some(of), name: qname.name.name }), written: called }
+          },
+          None -> { named: Unbound({ module: None, name: qname.name.name }), written: called },
+        }
+      },
+    },
+  }
+}
+
+fn ctor_named(encoder: Encoder, qname: QName) -> Named<Int, Spot> / {abort.raise} =
+  match ctor_target(encoder.index, encoder.module, qname) {
+    Some(CtorTarget(c)) -> Constructed(c.owner, c.name),
+    _ -> Unbound({ module: qualifier(qname), name: qname.name.name }),
+  }
+
+/// Effects are nominal: the declaration referenced, then the slot the component's enumeration gives
+/// it. What makes that true is the simple name in the declaration's own encoding; its module path
+/// is not, so two modules declaring one effect alike declare one effect. A template carries the
+/// declaration's sketch, which orders atoms equal in their bytes.
+fn effect_of(encoder: Encoder, qname: QName) -> Effect<Int, Bytes> / {abort.raise} =
+  match effect_target(encoder.index, encoder.module, qname) {
+    Some(node) ->
+      Declared(node, match encoder.index.effect_sketches.get(node) { Some(s) -> s, None -> b"" }),
+    None -> EffectUnbound({ module: qualifier(qname), name: qname.name.name }),
+  }
+
+/// A resource the signature binds is a level, so renaming the binder is not an edit; a real one
+/// stays a name.
+fn label_of(encoder: Encoder, ident: Ident) -> Label / {abort.raise} =
+  match rposition(encoder.label_params, ident.name) {
+    Some(level) -> LabelParam(level),
+    None -> LabelName(ident.name),
+  }
+
+fn opt_label(encoder: Encoder, i: Option<Ident>) -> Option<Label> / {abort.raise} =
+  match i { None -> None, Some(x) -> Some(label_of(encoder, x)) }
+
+/// A `[*]` clause is not the clause that names no label, so the wildcard is spelled out rather
+/// than shared with the empty case. A `[*t]` clause is not a `[*]` one either: naming the label is
+/// what the body reads, so the binder is part of what the clause is.
+fn clause_label(clause: HandleClause) -> Option<Ident> =
+  match clause.label_binder {
+    Some(t) -> Some({ name: b"*".concat(t.name), span: clause.span }),
+    None -> if clause.every_label { Some({ name: b"*", span: clause.span }) }
+    else { clause.resource },
+  }
+
+/// `[*]` is not the absence of a label, so the wildcard is spelled out and hashes apart from it.
+fn atom_label(atom: AtomExpr) -> Option<Ident> =
+  if atom.every { Some({ name: b"*", span: atom.span }) } else { atom.resource }
+
+// --- Types -------------------------------------------------------------------------------------
+
+type Typed = { name: TypeName<Int>, written: List<Int> }
+
+fn type_named(encoder: Encoder, qual: Option<Bytes>, name: Bytes) -> Typed / {abort.raise} = {
+  let param = match qual { None -> rposition(encoder.ty_params, name), Some(_) -> None };
+  match param {
+    Some(level) -> { name: TypeParam(level), written: [] },
+    None -> match type_target(encoder.index, encoder.module, qual, name) {
+      Some(node) -> { name: TypeDefined(node), written: [] },
+      None ->
+        {
+          name: TypeUnbound({ module: qual, name: name }),
+          written: if qual == None {
+            written_nodes(encoder, crossed_by(module_name(encoder), name))
+          } else { [] },
+        },
+    },
+  }
+}
+
+fn opt_ty(encoder: Encoder, t: Option<TypeExpr>) -> Option<TTy> / {abort.raise} =
+  match t { None -> None, Some(te) -> Some(ty(encoder, te)) }
+
+pub fn ty(encoder: Encoder, t: TypeExpr) -> TTy / {abort.raise} =
+  match t {
+    TVar(name) -> {
+      let n = type_named(encoder, None, name.name);
+      Applied(n.name, n.written, [])
+    },
+    TCon(c) -> {
+      let n = type_named(encoder, qualifier(c.name), c.name.name.name);
+      let args = c.args.map(|a: TypeExpr| ty(encoder, a));
+      // Only a use that fills a label or a row writes them, under a form of its own.
+      if c.labels.len() == 0 && c.rows.len() == 0 { Applied(n.name, n.written, args) } else {
+        AppliedOver(
+          n.name,
+          n.written,
+          args,
+          c.labels.map(|l: Ident| label_of(encoder, l)),
+          c.rows.map(|r: RowExpr| row(encoder, r)),
+        )
+      }
+    },
+    TFn(f) ->
+      Function(
+        f.params.map(|p: TypeExpr| ty(encoder, p)),
+        ty(encoder, f.ret),
+        opt_row(encoder, f.effects),
+      ),
+    // A record type is a map from label to type: filling sorts its fields.
+    TRecord(r) ->
+      Fields(
+        r.fields.map(|f: { name: Ident, ty: TypeExpr }|
+          { name: f.name.name, ty: ty(encoder, f.ty) }),
+      ),
+    TUnit(_) -> UnitType,
+    TBad(_) -> UnitType,
+  }
+
+fn opt_row(encoder: Encoder, r: Option<RowExpr>) -> Option<TRow> / {abort.raise} =
+  match r { None -> None, Some(x) -> Some(row(encoder, x)) }
+
+/// A row is a set: filling orders and deduplicates its atoms.
+fn row(encoder: Encoder, r: RowExpr) -> TRow / {abort.raise} =
+  {
+    atoms: r.atoms.map(|a: AtomExpr| atom(encoder, a)),
+    tail: match r.tail {
+      None -> None,
+      Some(t) -> match rposition(encoder.row_params, t.name) {
+        Some(level) -> Some(RowParam(level)),
+        None -> Some(RowName(t.name)),
+      },
+    },
+    bounded: r.tail_bounded,
+  }
+
+fn atom(encoder: Encoder, a: AtomExpr) -> Atom<Int, Bytes> / {abort.raise} = {
+  let eff = effect_of(encoder, a.eff);
+  let label = opt_label(encoder, atom_label(a));
+  match a.op {
+    None -> Moded(eff, a.mode, label, a.bounded),
+    Some(op) -> OfOp(eff, op.name, label, a.bounded),
+  }
+}
+
+// --- Literals and patterns ---------------------------------------------------------------------
+
+fn literal(l: Lit) -> Literal / {abort.raise} =
+  match l {
+    LInt(i) -> IntLit(i),
+    LFixed(width, v) -> FixedLit(width_index(width).at(0), v),
+    LWide(width, high, low) -> WideLit(width_index(width).at(0), high, low),
+    LBool(b) -> BoolLit(b),
+    LStr(s) -> StrLit(s),
+    LBytes(b) -> BytesLit(b),
+    LEmbedded(digest, size) -> EmbeddedLit(digest, size),
+    LFloat(text) -> FloatLit(float_bits(text)),
+    LDec(text) -> {
+      let p = decimal_parts(text);
+      DecimalLit(p.mantissa, p.scale)
+    },
+    LChar(v) -> CharLit(v),
+    LUnit -> UnitLit,
+    LBad -> panic("a placeholder literal reached the hasher"),
+  }
+
+fn pattern(encoder: Encoder, p: Pattern) -> Built<TPat> / {abort.raise} =
+  pattern_in(encoder, p, None)
+
+fn patterns(
+  encoder: Encoder,
+  ps: List<Pattern>,
+  again: Option<Int>,
+) -> Built<List<TPat>> / {abort.raise} =
+  ps.fold({ encoder: encoder, form: [] }, |acc: Built<List<TPat>>, p: Pattern| {
+    let b = pattern_in(acc.encoder, p, again);
+    { encoder: b.encoder, form: acc.form.push(b.form) }
+  })
+
+/// `again` is where the binders of an or-pattern's first alternative start, inside a later one: a
+/// variable there is that alternative's binder of its name, written by its level, and binds
+/// nothing more. So one binder stands for a name whichever alternative matched, and which binder
+/// each alternative gives it is part of the form.
+fn pattern_in(encoder: Encoder, p: Pattern, again: Option<Int>) -> Built<TPat> / {abort.raise} =
+  match p {
+    PWild(_) -> { encoder: encoder, form: Wild },
+    PVar(v) -> {
+      let bound = match again {
+        None -> None,
+        Some(from) -> match bound_at(encoder.values, v.name.name) {
+          Some(i) -> if i >= from { Some(i) } else { None },
+          None -> None,
+        },
+      };
+      match bound {
+        Some(i) -> { encoder: encoder, form: Again(encoder.values.get(i).spot) },
+        None -> { encoder: bind(encoder, v.name.name), form: Bind },
+      }
+    },
+    PLit(l) -> { encoder: encoder, form: LitPat(literal(l.lit)) },
+    PRange(r) -> { encoder: encoder, form: RangePat(literal(r.lo), literal(r.hi)) },
+    PCtor(c) -> {
+      let args = patterns(encoder, c.args, again);
+      { encoder: args.encoder, form: CtorPat(ctor_named(encoder, c.name), args.form) }
+    },
+    PRecord(r) -> {
+      let fields = r.fields.fold(
+        { encoder: encoder, form: [] },
+        |acc: Built<List<PatField<Int, Spot>>>, f: { name: Ident, pat: Pattern }| {
+          let b = pattern_in(acc.encoder, f.pat, again);
+          { encoder: b.encoder, form: acc.form.push({ name: f.name.name, pat: b.form }) }
+        },
+      );
+      { encoder: fields.encoder, form: RecordPat(fields.form, r.rest) }
+    },
+    PList(l) -> {
+      let items = patterns(encoder, l.items, again);
+      match l.rest {
+        None -> { encoder: items.encoder, form: ListPat(items.form, None) },
+        Some(rest) -> {
+          let r = pattern_in(items.encoder, rest, again);
+          { encoder: r.encoder, form: ListPat(items.form, Some(r.form)) }
+        },
+      }
+    },
+    POr(o) -> {
+      let later = match again { Some(_) -> again, None -> Some(encoder.values.len()) };
+      let alts = range(0, o.alts.len()).fold(
+        { encoder: encoder, form: [] },
+        |acc: Built<List<TPat>>, i: Int| {
+          let b = pattern_in(acc.encoder, o.alts.get(i), if i == 0 { again } else { later });
+          { encoder: b.encoder, form: acc.form.push(b.form) }
+        },
+      );
+      { encoder: alts.encoder, form: OrPat(alts.form) }
+    },
+    PBad(_) -> panic("a placeholder pattern reached the hasher"),
+  }
+
+// --- Expressions -------------------------------------------------------------------------------
+
+fn exprs(encoder: Encoder, es: List<Expr>) -> Built<List<TExpr>> / {abort.raise} =
+  es.fold({ encoder: encoder, form: [] }, |acc: Built<List<TExpr>>, e: Expr| {
+    let b = expr(acc.encoder, e);
+    { encoder: b.encoder, form: acc.form.push(b.form) }
+  })
+
+fn opt_expr(encoder: Encoder, e: Option<Expr>) -> Built<Option<TExpr>> / {abort.raise} =
+  match e {
+    None -> { encoder: encoder, form: None },
+    Some(x) -> {
+      let b = expr(encoder, x);
+      { encoder: b.encoder, form: Some(b.form) }
+    },
+  }
+
+fn fields(
+  encoder: Encoder,
+  fs: List<RecField>,
+) -> Built<List<stored::RecField<Int, Bytes, Spot, Note>>> / {abort.raise} =
+  fs.fold(
+    { encoder: encoder, form: [] },
+    |acc: Built<List<stored::RecField<Int, Bytes, Spot, Note>>>, f: RecField| {
+      let b = expr(acc.encoder, f.value);
+      { encoder: b.encoder, form: acc.form.push({ name: f.name.name, value: b.form }) }
+    },
+  )
+
+/// What a call on a value written `.name(..)` at `at` may call: `m::f` where it names its function
+/// in full, and otherwise every function `X::name` of a module its own can see, in the order of
+/// their program-wide names. Which of them it is the value's type says, which no hash reads: the
+/// note carries the check's choice. `names` is whether the call names an argument.
+fn callees(
+  encoder: Encoder,
+  at: Span,
+  name: Ident,
+  names: Bool,
+) -> { callees: Callees<Int, Spot>, note: Note } / {abort.raise} = {
+  let site = site_key(encoder.owner, at.site);
+  let chosen = |c: Choice| Picked(Found(c));
+  // With no function to choose and no argument to place, the check has nothing to say.
+  let picked = |candidates: List<Bytes>|
+    match encoder.chose {
+      Some(chose) -> chosen(choice_of(chose.get(site), candidates)),
+      None -> if candidates.len() == 0 && !names { chosen(choice_of(None, [])) }
+      else { Picked(Waiting({ at: site, candidates: candidates })) },
+    };
+  match member_of(name.name) {
+    Some(of) ->
+      {
+        callees: InFull(
+          value_of(encoder, {
+            module: Some({ name: of.of, span: name.span }),
+            name: { name: of.member, span: name.span },
+            span: name.span,
+          }),
+        ),
+        note: picked([]),
+      },
+    None -> {
+      let index = encoder.index;
+      let found = index.scopes.get(encoder.module).sees.fold(
+        [],
+        |acc: List<Int>, k: Int|
+          match index.items.get(k).members.get(name.name) {
+            Some(nodes) -> acc.concat(nodes),
+            None -> acc,
+          },
+      ).sort_by(|a: Int, b: Int|
+        match compare_values(index.nodes.get(a).name, index.nodes.get(b).name) {
+          Greater -> false,
+          _ -> true,
+        });
+      { callees: Among(found), note: picked(found.map(|v: Int| index.nodes.get(v).name)) }
+    },
+  }
+}
+
+/// Where a check files what it found of a call on a value: the item the call is a node of, by its
+/// owner, and the call's site there.
+pub fn site_key(owner: Bytes, site: Int) -> Bytes =
+  Bytes::concat_all([owner, b"#", Bytes::of_string(site.to_string())])
+
+/// What a check found of each call on a value `sites` record, by `site_key`, each function by its
+/// program-wide name, as a call's candidates name it. A call of a function a record holds in a
+/// field calls none of a type's.
+pub fn called_at(sites: List<MemberSite>) -> Map<Bytes, Called> =
+  sites.fold(Map::new(), |acc: Map<Bytes, Called>, x: MemberSite|
+    if x.callee == b"" { acc } else {
+      acc.insert(site_key(x.owner, x.site), {
+        // The check names a function the prelude binds by its bare name.
+        callee: if x.qualifier == prelude_binder() { qualify(prelude_module(), x.callee) }
+        else { x.callee },
+        named: x.named,
+      })
+    })
+
+/// `called`, what a check found of a call on a value, as a choice among `candidates`: none where
+/// it found nothing or calls a function none of them is.
+pub fn choice_of(called: Option<Called>, candidates: List<Bytes>) -> Choice / {abort.raise} =
+  match called {
+    None -> { callee: 0 - 1, named: [] },
+    Some(c) ->
+      {
+        callee: range(0, candidates.len()).fold(0 - 1, |acc: Int, i: Int|
+          if acc < 0 && candidates.get(i) == c.callee { i } else { acc }),
+        named: c.named,
+      },
+  }
+
+/// The call `value.name[labels](args, named)` written at `at`.
+fn on_value(
+  encoder: Encoder,
+  base: TExpr,
+  at: Span,
+  name: Ident,
+  labels: List<Ident>,
+  args: List<Expr>,
+  named: List<NamedArg>,
+) -> Built<TExpr> / {abort.raise} = {
+  let passed = exprs(encoder, args);
+  let given = named.fold(
+    { encoder: passed.encoder, form: [] },
+    |acc: Built<List<stored::RecField<Int, Bytes, Spot, Note>>>, n: NamedArg| {
+      let b = expr(acc.encoder, n.value);
+      { encoder: b.encoder, form: acc.form.push({ name: n.name.name, value: b.form }) }
+    },
+  );
+  let c = callees(given.encoder, at, name, named.len() > 0);
+  {
+    encoder: given.encoder,
+    form: OnValue({
+      base: base,
+      name: name.name,
+      labels: labels.map(|l: Ident| label_of(encoder, l)),
+      args: passed.form,
+      named: given.form,
+      callees: c.callees,
+      note: c.note,
+    }),
+  }
+}
+
+fn expr(encoder: Encoder, e: Expr) -> Built<TExpr> / {abort.raise} =
+  match e {
+    // `{ e }` and `e` are the same computation.
+    EBlock(b) -> if b.stmts.len() == 0 {
+      match b.tail { Some(t) -> expr(encoder, t), None -> block(encoder, b.stmts, b.tail) }
+    } else { block(encoder, b.stmts, b.tail) },
+    ELit(l) -> { encoder: encoder, form: Constant(literal(l.lit)) },
+    EHole(_) -> { encoder: encoder, form: Unwritten },
+    EVar(v) -> { encoder: read(encoder, v.name), form: Var(value_of(encoder, v.name)) },
+    EBinary(b) -> {
+      let l = expr(encoder, b.lhs);
+      let r = expr(l.encoder, b.rhs);
+      let called = if written_code().operators.contains(b.op) {
+        written_nodes(encoder, written_code().calls)
+      } else { [] };
+      { encoder: r.encoder, form: Binary(b.op, l.form, r.form, called) }
+    },
+    EUnary(u) -> {
+      let x = expr(encoder, u.operand);
+      { encoder: x.encoder, form: Unary(u.op, x.form) }
+    },
+    ELambda(l) -> {
+      let types = l.params.map(|p: Param| opt_ty(encoder, p.ty));
+      let body = expr(bind_all(encoder, l.params.map(|p: Param| p.name.name)), l.body);
+      { encoder: closed(body.encoder, encoder), form: Lambda(types, body.form) }
+    },
+    EApp(a) -> match a.func {
+      // A call on a value: its named arguments are the call's to fill, and its callee the
+      // value's type's to say, so every function it may be is part of what the call is.
+      EField(f) -> {
+        let base = expr(encoder, f.base);
+        on_value(base.encoder, base.form, a.span, f.field, a.labels, a.args, a.named)
+      },
+      _ -> {
+        let func = expr(encoder, a.func);
+        let args = exprs(func.encoder, a.args);
+        {
+          encoder: args.encoder,
+          form: App(func.form, args.form, a.labels.map(|l: Ident| label_of(encoder, l))),
+        }
+      },
+    },
+    EIf(i) -> {
+      let c = expr(encoder, i.cond);
+      let t = expr(c.encoder, i.then_branch);
+      let f = expr(t.encoder, i.else_branch);
+      { encoder: f.encoder, form: If(c.form, t.form, f.form) }
+    },
+    EMatch(m) -> {
+      let s = expr(encoder, m.scrutinee);
+      let arms = m.arms.fold(
+        { encoder: s.encoder, form: [] },
+        |acc: Built<List<Arm<Int, Bytes, Spot, Note>>>, arm: MatchArm| {
+          let p = pattern(acc.encoder, arm.pat);
+          let g = opt_expr(p.encoder, arm.guard);
+          let body = expr(g.encoder, arm.body);
+          {
+            encoder: closed(body.encoder, acc.encoder),
+            form: acc.form.push({ pat: p.form, guard: g.form, body: body.form }),
+          }
+        },
+      );
+      { encoder: arms.encoder, form: Match(s.form, arms.form) }
+    },
+    ERecord(r) -> {
+      let fs = fields(encoder, r.fields);
+      { encoder: fs.encoder, form: Record(fs.form) }
+    },
+    // The update is the definition, not the literal it expands to: its meaning follows the base's type.
+    ERecordUpdate(r) -> {
+      let base = expr(encoder, r.base);
+      let fs = fields(base.encoder, r.fields);
+      { encoder: fs.encoder, form: RecordUpdate(base.form, fs.form) }
+    },
+    ETry(_) -> panic("`e?` is expanded away before hashing"),
+    EField(f) -> {
+      let base = expr(encoder, f.base);
+      { encoder: base.encoder, form: Field(base.form, f.field.name) }
+    },
+    EList(l) -> {
+      let items = exprs(encoder, l.items);
+      { encoder: items.encoder, form: ListOf(items.form) }
+    },
+    EPerform(p) -> match if is_bare(p.eff) { bound_at(encoder.values, p.eff.name.name) }
+      else { None } {
+      None -> {
+        let args = exprs(encoder, p.args);
+        {
+          encoder: args.encoder,
+          form: Perform(
+            effect_of(encoder, p.eff),
+            p.op.name,
+            opt_label(encoder, p.resource),
+            args.form,
+          ),
+        }
+      },
+      // On a binding it is a call on the value the binding holds.
+      Some(i) ->
+        on_value(
+          { ..encoder, reads: encoder.reads.push(i) },
+          Var({ named: Local(encoder.values.get(i).spot), written: [] }),
+          p.span,
+          p.op,
+          match p.resource { Some(r) -> [r], None -> [] },
+          p.args,
+          [],
+        ),
+    },
+    EHandle(h) -> {
+      // The first values are read where the `handle` stands, before its body, each seeing the
+      // variables above it; the clauses and the `return` see the variables, the body does not.
+      let inits = h.vars.fold(
+        { encoder: encoder, form: [] },
+        |acc: Built<List<stored::HandlerVar<Int, Bytes, Spot, Note>>>, v: HandlerVar| {
+          let init = expr(acc.encoder, v.init);
+          {
+            encoder: bind(init.encoder, v.name.name),
+            form: acc.form.push({ ty: opt_ty(acc.encoder, v.ty), init: init.form }),
+          }
+        },
+      );
+      let body = expr(closed(inits.encoder, encoder), h.body);
+      let held = bind_all(closed(body.encoder, encoder), h.vars.map(|v: HandlerVar| v.name.name));
+      let clauses = handled_clauses(held, h.clauses);
+      let ret = match h.ret {
+        None -> { encoder: clauses.encoder, form: None },
+        Some(rc) -> {
+          let b = expr(bind(clauses.encoder, rc.binder.name), rc.body);
+          { encoder: closed(b.encoder, clauses.encoder), form: Some(b.form) }
+        },
+      };
+      {
+        encoder: closed(ret.encoder, encoder),
+        form: Handle({ vars: inits.form, body: body.form, clauses: clauses.form, ret: ret.form }),
+      }
+    },
+    EWithHold(c) -> {
+      let acquire = expr(encoder, c.acquire);
+      let release = expr(acquire.encoder, c.release);
+      let body = expr(bind(release.encoder, c.binder.name), c.body);
+      {
+        encoder: closed(body.encoder, encoder),
+        form: WithHold(c.resource.name, acquire.form, release.form, body.form),
+      }
+    },
+    ESimulate(s) -> {
+      let body = expr(encoder, s.body);
+      { encoder: body.encoder, form: Simulate(body.form) }
+    },
+    EParallel(v) -> {
+      let branches = exprs(encoder, v.branches);
+      { encoder: branches.encoder, form: Parallel(branches.form) }
+    },
+    // Apart from the call it stands for, which has another type and another row.
+    ETagged(t) -> if t.holes.len() == 0 {
+      { encoder: encoder, form: Tagged(value_of(encoder, tagged_parser(t)), t.text) }
+    } else {
+      let holes = t.holes.fold(
+        { encoder: encoder, form: [] },
+        |acc: Built<List<FilledHole<Int, Bytes, Spot, Note>>>, h: Hole| {
+          let b = expr(acc.encoder, h.value);
+          { encoder: b.encoder, form: acc.form.push({ value: b.form, text: h.text }) }
+        },
+      );
+      {
+        encoder: holes.encoder,
+        form: Filled(
+          value_of(encoder, tagged_parser(t)),
+          value_of(encoder, tagged_filler(t)),
+          t.text,
+          holes.form,
+        ),
+      }
+    },
+    EBad(_) -> panic("a placeholder reached the hasher"),
+    // A `try` that names no raise answers the one its body's row names, which the body settles.
+    ETryBlock(t) -> {
+      let body = expr(encoder, t.body);
+      {
+        encoder: body.encoder,
+        form: TryBlock(
+          match t.raise {
+            None -> None,
+            Some(r) -> Some({ effect: effect_of(encoder, r.eff), op: r.op.name }),
+          },
+          body.form,
+        ),
+      }
+    },
+  }
+
+fn handled_clauses(
+  encoder: Encoder,
+  clauses: List<HandleClause>,
+) -> Built<List<Clause<Int, Bytes, Spot, Note>>> / {abort.raise} =
+  clauses.fold(
+    { encoder: encoder, form: [] },
+    |acc: Built<List<Clause<Int, Bytes, Spot, Note>>>, c: HandleClause| {
+      let bound = bind_all(acc.encoder, c.params.map(|p: Ident| p.name));
+      // Whether a clause binds a continuation is part of what the definition is.
+      let resumed = match c.resume { None -> bound, Some(k) -> bind(bound, k.name) };
+      let body = expr(resumed, c.body);
+      {
+        encoder: closed(body.encoder, acc.encoder),
+        form: acc.form.push({
+          effect: effect_of(acc.encoder, c.eff),
+          op: c.op.name,
+          label: opt_label(acc.encoder, clause_label(c)),
+          params: c.params.len(),
+          resumes: c.resume != None,
+          body: body.form,
+        }),
+      }
+    },
+  )
+
+fn block(encoder: Encoder, stmts: List<Stmt>, tail: Option<Expr>) -> Built<TExpr> / {abort.raise} = {
+  let entries = entries_in_order(encoder, stmts);
+  let t = opt_expr(entries.encoder, tail);
+  { encoder: closed(t.encoder, encoder), form: Block(entries.form, t.form) }
+}
+
+/// Each statement in turn, consecutive `let`s that commute as one run. A run is ordered where it
+/// stands, after the statements before it, so what it reads of an earlier `let` of its block is
+/// that binder's level and never its name.
+fn entries_in_order(
+  encoder: Encoder,
+  stmts: List<Stmt>,
+) -> Built<List<Entry<Int, Bytes, Spot, Note>>> / {abort.raise} = {
+  let n = stmts.len();
+  let one = |b: Built<List<Entry<Int, Bytes, Spot, Note>>>, st: Stmt| {
+    let x = stmt(b.encoder, st);
+    { encoder: x.encoder, form: b.form.push(One(x.form)) }
+  };
+  iterate(
+    { built: { encoder: encoder, form: [] }, i: 0 },
+    n + 2,
+    |s: { built: Built<List<Entry<Int, Bytes, Spot, Note>>>, i: Int }|
+      if s.i >= n { Stop(s) } else {
+        let run = pure_run(stmts, s.i);
+        if run < 2 { Continue({ built: one(s.built, stmts.get(s.i)), i: s.i + 1 }) } else {
+          let members = range(s.i, s.i + run).map(|k: Int| stmts.get(k));
+          let apart = members.fold({ encoder: s.built.encoder, form: [] }, one);
+          if reads_run(s.built.encoder, members) {
+            Continue({
+              built: { encoder: apart.encoder, form: s.built.form.concat(apart.form) },
+              i: s.i + run,
+            })
+          } else {
+            let r = commuting(s.built.encoder, stmts, s.i, s.i + run);
+            Continue({
+              built: { encoder: r.encoder, form: s.built.form.push(r.form) },
+              i: s.i + run,
+            })
+          }
+        }
+      },
+  ).built
+}
+
+/// Whether a member of `members`, written in turn from `encoder`, reads a binder a member before
+/// it binds: only `let`s that read none of each other's binders commute. What a name reads is the
+/// binder it resolves to, so a binder of the value's own shadows a member's of its name.
+fn reads_run(encoder: Encoder, members: List<Stmt>) -> Bool / {abort.raise} = {
+  let from = encoder.values.len();
+  members.fold(
+    { encoder: encoder, read: false },
+    |acc: { encoder: Encoder, read: Bool }, st: Stmt| {
+      let bound = acc.encoder.values.len();
+      let before = acc.encoder.reads.len();
+      let x = stmt(acc.encoder, st);
+      let reads = range(before, x.encoder.reads.len()).map(|k: Int| x.encoder.reads.get(k));
+      { encoder: x.encoder, read: acc.read || reads.any(|r: Int| r >= from && r < bound) }
+    },
+  ).read
+}
+
+/// The members of a run, each written from where the run starts: filling orders them by their
+/// encodings, ties in source order, and puts each one's binders after those of the members
+/// before it.
+fn commuting(
+  encoder: Encoder,
+  stmts: List<Stmt>,
+  from: Int,
+  to: Int,
+) -> Built<Entry<Int, Bytes, Spot, Note>> / {abort.raise} = {
+  let id = encoder.runs;
+  let n = encoder.values.len();
+  let members = range(from, to).fold(
+    { encoder: { ..encoder, runs: id + 1 }, stmts: [], binders: [], bound: [] },
+    |acc: { encoder: Encoder, stmts: List<TStmt>, binders: List<Int>, bound: List<Bound> }, i: Int| {
+      let inner = stmt(
+        { ..acc.encoder, values: encoder.values, scope: { run: id, member: i - from, within: n } },
+        stmts.get(i),
+      );
+      let bound = range(n, inner.encoder.values.len()).map(|k: Int| inner.encoder.values.get(k));
+      {
+        encoder: { ..inner.encoder, values: encoder.values, scope: encoder.scope },
+        stmts: acc.stmts.push(inner.form),
+        binders: acc.binders.push(bound.len()),
+        bound: acc.bound.concat(bound),
+      }
+    },
+  );
+  {
+    encoder: { ..members.encoder, values: encoder.values.concat(members.bound) },
+    form: Commuting(
+      Ran({ id: id, base: spot_here(encoder), binders: members.binders }),
+      members.stmts,
+    ),
+  }
+}
+
+fn stmt(encoder: Encoder, s: Stmt) -> Built<TStmt> / {abort.raise} =
+  match s {
+    SLet(l) -> {
+      let v = expr(encoder, l.value);
+      let p = pattern(v.encoder, l.pat);
+      { encoder: p.encoder, form: Let(opt_ty(encoder, l.ty), v.form, p.form) }
+    },
+    SLetElse(l) -> {
+      let v = expr(encoder, l.value);
+      let p = pattern(v.encoder, l.pat);
+      let f = expr(p.encoder, l.fallback);
+      { encoder: f.encoder, form: LetElse(opt_ty(encoder, l.ty), v.form, p.form, f.form) }
+    },
+    SExpr(e) -> {
+      let x = expr(encoder, e);
+      { encoder: x.encoder, form: Effectful(x.form) }
+    },
+    SAssign(a) -> {
+      let v = expr(read(encoder, bare(a.name)), a.value);
+      { encoder: v.encoder, form: Assign(value_of(encoder, bare(a.name)), v.form) }
+    },
+  }
+
+/// How many consecutive `let`s from `from` have pure values: what may commute, fewer than two
+/// being no run.
+fn pure_run(stmts: List<Stmt>, from: Int) -> Int / {abort.raise} = {
+  let n = stmts.len();
+  let to = iterate(from, n - from + 1, |i: Int|
+    if i >= n { Stop(i) } else {
+      match stmts.get(i) {
+        SLet(l) -> if is_pure(l.value) { Continue(i + 1) } else { Stop(i) },
+        _ -> Stop(i),
+      }
+    });
+  if to - from < 2 { 0 } else { to - from }
+}
+
+// --- Items -------------------------------------------------------------------------------------
+
+fn with_generics(
+  encoder: Encoder,
+  types: List<Ident>,
+  rows: List<Ident>,
+  labels: List<Ident>,
+) -> Encoder =
+  {
+    ..encoder,
+    ty_params: encoder.ty_params.concat(types.map(|ident: Ident| ident.name)),
+    row_params: encoder.row_params.concat(rows.map(|ident: Ident| ident.name)),
+    label_params: encoder.label_params.concat(labels.map(|ident: Ident| ident.name)),
+  }
+
+fn generics_of(types: List<Ident>, rows: List<Ident>, labels: List<Ident>) -> Generics =
+  { types: types.len(), rows: rows.len(), labels: labels.len() }
+
+/// Sorted and deduplicated by filling: the same two constraints in the other order are one
+/// definition. One over a name no type parameter has constrains nothing.
+fn constraints(encoder: Encoder, cs: List<Constraint>) -> List<Constrained> / {abort.raise} =
+  cs.fold([], |acc: List<Constrained>, c: Constraint|
+    match rposition(encoder.ty_params, c.param.name) {
+      Some(level) -> acc.push({ level: level, deriver: c.deriver }),
+      None -> acc,
+    })
+
+/// A `returns` clause names a parameter by its position, so renaming one moves nothing.
+fn returning(def: FnDef) -> Returning / {abort.raise} =
+  match def.returns {
+    None -> Unstated,
+    Some(ReturnsFresh(_)) -> Fresh,
+    Some(ReturnsParam(x)) ->
+      ParamReturned(
+        range(0, def.params.len()).fold(0, |acc: Int, i: Int|
+          if def.params.get(i).name.name == x.name { i } else { acc }),
+      ),
+  }
+
+fn fn_def(encoder: Encoder, def: FnDef) -> FnForm<Int, Bytes, Spot, Note> / {abort.raise} = {
+  let g = def.generics;
+  let generic = with_generics(encoder, g.types, g.effects, g.labels);
+  // Before the parameter names are bound: a default is closed.
+  let params = def.params.fold(
+    { encoder: generic, form: [] },
+    |acc: Built<List<stored::Param<Int, Bytes, Spot, Note>>>, param: Param| {
+      let dflt = opt_expr(acc.encoder, param.default);
+      {
+        encoder: dflt.encoder,
+        form: acc.form.push({
+          kept: param.keep,
+          spaced: param.space != None,
+          ty: opt_ty(generic, param.ty),
+          default: dflt.form,
+        }),
+      }
+    },
+  );
+  let bound = bind_all(params.encoder, def.params.map(|param: Param| param.name.name));
+  // A stated measure decides the definition's verdict, so it is part of what was written.
+  let measure = opt_expr(bound, def.decreases);
+  let body = expr(measure.encoder, def.body);
+  {
+    generics: generics_of(g.types, g.effects, g.labels),
+    params: params.form,
+    ret: opt_ty(generic, def.ret),
+    row: opt_row(generic, def.effects),
+    constraints: constraints(generic, def.constraints),
+    returns: returning(def),
+    decreases: measure.form,
+    // A `const` publishes no raise its body can make, so its callers read another definition, and
+    // its value is written out by the code the emitter writes, which it references as a
+    // comparison does.
+    baked: match def.baked {
+      Some(_) -> Some(written_nodes(encoder, written_code().calls)),
+      None -> None,
+    },
+    body: body.form,
+  }
+}
+
+/// A sum and a `new` record are nominal and an alias is transparent, exactly as the checker has
+/// them: `conv_type` gives a sum a `TyCon` and a `new` record a `TyNominal` under its name, which
+/// `unify_structural` compares by name, and expands an alias in place, so two aliases of one
+/// expansion are one type there and must be one type here. The name is the simple one: a module
+/// path is no part of an identity, so vendoring a module moves nothing.
+fn type_def(encoder: Encoder, d: TypeDef) -> TypeForm<Int, Bytes, Spot> / {abort.raise} = {
+  let g = d.generics;
+  let inner = with_generics(encoder, g.types, g.effects, g.labels);
+  let unqualified = |by: Ident| { module: None, name: by, span: by.span };
+  let items = inner.index.items.get(inner.module);
+  {
+    generics: generics_of(g.types, g.effects, g.labels),
+    over: g.effects.len() > 0 || g.labels.len() > 0,
+    // What a use of the type must meet is part of what the type is, as it is of a `fn`.
+    constraints: constraints(inner, d.constraints),
+    body: match d.body {
+      TDAlias(t) -> Alias(ty(inner, t)),
+      TDSum(variants) ->
+        Sum(
+          d.name.name,
+          variants.map(|v: VariantDef|
+            { name: v.name.name, fields: v.fields.map(|t: TypeExpr| ty(inner, t)) }),
+        ),
+      TDNominal(t) -> Nominal(d.name.name, ty(inner, t)),
+      TDExtern -> Extern(d.name.name),
+    },
+    // Unlike `pub`, `opaque` refuses bodies that name nothing of the type's: a literal where a
+    // closed record is expected. Only the type's own hash reaches each of them.
+    opaque: d.opaque != None,
+    // What a value of the type compares and shows through is part of what the type is: each
+    // function is a reference, so the type's hash moves when the function it names does.
+    through: match items.instances.get(d.name.name) {
+      None -> [],
+      Some(stated) ->
+        stated.map(|x: InstanceDef|
+          {
+            key: match x.kind { NKey -> true, _ -> false },
+            by: value_of(inner, unqualified(x.by)),
+          }),
+    },
+    // In the operations' own order, so the order a module wrote them in moves nothing.
+    numerics: match items.numerics.get(d.name.name) {
+      None -> [],
+      Some(numeric) ->
+        numeric_ops().fold([], |acc: List<Numeric<Int, Spot>>, op: Bytes|
+          match numeric_by(numeric, op) {
+            None -> acc,
+            Some(by) -> acc.push({ op: op, by: value_of(inner, unqualified(by)) }),
+          }),
+    },
+  }
+}
+
+/// An effect is nominal: it is the declaration this name declares, not a shape another declaration
+/// could match. Two effects differing only in their names are two effects, so the name is in its
+/// form: a published row names its atoms' effects, and nothing else would make a hash pin those
+/// names. The name is the simple one, so the same declaration vendored under another path is still
+/// that declaration. Operations are looked up by name: filling sorts them.
+fn effect_def(encoder: Encoder, d: EffectDef) -> EffectForm<Int, Bytes> / {abort.raise} =
+  { name: d.name.name, nondet: d.is_nondet, ops: d.ops.map(|op: OpDef| op_def(encoder, op)) }
+
+fn op_def(encoder: Encoder, op: OpDef) -> Op<Int, Bytes> / {abort.raise} = {
+  let inner = {
+    ..encoder,
+    ty_params: encoder.ty_params.concat(op.ty_params.map(|p: Ident| p.name)),
+  };
+  {
+    name: op.name.name,
+    mode: op.mode,
+    resource: op.resource_param,
+    types: op.ty_params.len(),
+    params: op.params.map(|p: TypeExpr| ty(inner, p)),
+    ret: ty(inner, op.ret),
+  }
+}
+
+/// A test over cases is what one case runs: the case's type and the body over it. Its table and
+/// its label are no part of that, so a case added to the table moves no other case's hash.
+fn test_def(encoder: Encoder, d: TestDef) -> TestForm<Int, Bytes, Spot, Note> / {abort.raise} =
+  match d.cases {
+    None -> { nondet: d.is_nondet, cases: None, body: expr(encoder, d.body).form },
+    Some(c) ->
+      {
+        nondet: d.is_nondet,
+        cases: Some(ty(encoder, c.ty)),
+        body: expr(bind(encoder, c.binder.name), d.body).form,
+      },
+  }
+
+/// A law's binder types are part of its identity; their names are levels like any other binder.
+fn law_def(encoder: Encoder, d: LawDef) -> LawForm<Int, Bytes, Spot, Note> / {abort.raise} = {
+  let bound = bind_all(encoder, d.binders.map(|binder: Binder| binder.name.name));
+  let guard = opt_expr(bound, d.guard);
+  {
+    binders: d.binders.map(|binder: Binder| ty(encoder, binder.ty)),
+    guard: guard.form,
+    body: expr(guard.encoder, d.body).form,
+  }
+}
+
+/// In its owner's scope: generics, parameters, `result` for an `ensures`, cost names for a `cost`
+/// and space names for a `space`. Parameter defaults are not part of it.
+fn spec_clause(
+  encoder: Encoder,
+  owner: FnDef,
+  clause: SpecClause,
+) -> SpecForm<Int, Bytes, Spot, Note> / {abort.raise} = {
+  let g = owner.generics;
+  let bound = bind_all(
+    with_generics(encoder, g.types, g.effects, g.labels),
+    owner.params.map(|param: Param| param.name.name),
+  );
+  let named = |names: List<Option<Ident>>| {
+    let at = range(0, names.len()).filter(|i: Int| names.get(i) != None);
+    {
+      encoder: at.fold(bound, |e: Encoder, i: Int|
+        match names.get(i) { Some(k) -> bind(e, k.name), None -> e }),
+      form: Some(at),
+    }
+  };
+  let scoped = match clause.kind {
+    SEnsures -> { encoder: bind(bound, b"result"), form: None },
+    SRequires -> { encoder: bound, form: None },
+    // A `space` over no parameter that names its space binds none, as one over none named does.
+    SSpace -> {
+      let spaces = owner.params.map(|param: Param| param.space);
+      if !spaces.any(|s: Option<Ident>| s != None) { { encoder: bound, form: None } }
+      else { named(spaces) }
+    },
+    SCost -> named(owner.params.map(|param: Param| param.cost)),
+  };
+  {
+    kind: clause.kind,
+    generics: generics_of(g.types, g.effects, g.labels),
+    params: owner.params.len(),
+    names: scoped.form,
+    body: expr(scoped.encoder, clause.expr).form,
+  }
+}
+
+// --- Which `let`s commute ----------------------------------------------------------------------
+
+pub fn is_pure(e: Expr) -> Bool =
+  match e {
+    EApp(_) -> false,
+    EPerform(_) -> false,
+    EHandle(_) -> false,
+    EWithHold(_) -> false,
+    ESimulate(_) -> false,
+    ETryBlock(_) -> false,
+    EParallel(v) -> v.branches.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
+    ETry(_) -> false,
+    EBad(_) -> false,
+    EHole(_) -> false,
+    ELit(_) -> true,
+    ETagged(t) -> t.holes.len() == 0,
+    EVar(_) -> true,
+    EBinary(b) -> is_pure(b.lhs) && is_pure(b.rhs),
+    EUnary(u) -> is_pure(u.operand),
+    ELambda(l) -> is_pure(l.body),
+    EIf(i) -> is_pure(i.cond) && is_pure(i.then_branch) && is_pure(i.else_branch),
+    EMatch(m) ->
+      is_pure(m.scrutinee)
+        && m.arms.fold(true, |acc: Bool, arm: MatchArm|
+          acc && is_pure(arm.body) && (match arm.guard { Some(g) -> is_pure(g), None -> true })),
+    EBlock(b) ->
+      b.stmts.fold(true, |acc: Bool, stmt: Stmt|
+          acc
+            && (match stmt {
+              SLet(l) -> is_pure(l.value),
+              SLetElse(l) -> is_pure(l.value) && is_pure(l.fallback),
+              SExpr(x) -> is_pure(x),
+              SAssign(_) -> false,
+            }))
+        && (match b.tail { Some(t) -> is_pure(t), None -> true }),
+    ERecord(r) -> r.fields.fold(true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
+    ERecordUpdate(r) ->
+      is_pure(r.base) && r.fields.fold(true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
+    EField(f) -> is_pure(f.base),
+    EList(l) -> l.items.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
+  }
+
+// --- Another program's numbering ---------------------------------------------------------------
+
+/// `t` with each node it references numbered as `id` says: a template taken into a program that
+/// numbers its nodes otherwise.
+pub fn renumbered(t: Template, id: (Int) -> Int / {abort.raise}) -> Template / {abort.raise} =
+  match t {
+    FnOf(d) ->
+      FnOf({
+        ..d,
+        params: d.params.map(|p: stored::Param<Int, Bytes, Spot, Note>|
+          { ..p, ty: re_opt_ty(p.ty, id), default: re_opt_expr(p.default, id) }),
+        ret: re_opt_ty(d.ret, id),
+        row: re_opt_row(d.row, id),
+        decreases: re_opt_expr(d.decreases, id),
+        baked: match d.baked { Some(vs) -> Some(vs.map(id)), None -> None },
+        body: re_expr(d.body, id),
+      }),
+    TypeOf(d) ->
+      TypeOf({
+        ..d,
+        body: match d.body {
+          Alias(x) -> Alias(re_ty(x, id)),
+          Sum(name, vs) ->
+            Sum(
+              name,
+              vs.map(|v: Variant<Int, Bytes>| { ..v, fields: v.fields.map(|x: TTy| re_ty(x, id)) }),
+            ),
+          Nominal(name, x) -> Nominal(name, re_ty(x, id)),
+          Extern(name) -> Extern(name),
+        },
+        through: d.through.map(|x: Through<Int, Spot>| { ..x, by: re_value(x.by, id) }),
+        numerics: d.numerics.map(|x: Numeric<Int, Spot>| { ..x, by: re_value(x.by, id) }),
+      }),
+    EffectOf(d) ->
+      EffectOf({
+        ..d,
+        ops: d.ops.map(|op: Op<Int, Bytes>|
+          { ..op, params: op.params.map(|x: TTy| re_ty(x, id)), ret: re_ty(op.ret, id) }),
+      }),
+    TestOf(d) -> TestOf({ ..d, cases: re_opt_ty(d.cases, id), body: re_expr(d.body, id) }),
+    LawOf(d) ->
+      LawOf({
+        binders: d.binders.map(|x: TTy| re_ty(x, id)),
+        guard: re_opt_expr(d.guard, id),
+        body: re_expr(d.body, id),
+      }),
+    SpecOf(d) -> SpecOf({ ..d, body: re_expr(d.body, id) }),
+  }
+
+fn re_named(
+  n: Named<Int, Spot>,
+  id: (Int) -> Int / {abort.raise},
+) -> Named<Int, Spot> / {abort.raise} =
+  match n {
+    Local(l) -> Local(l),
+    Defined(v) -> Defined(id(v)),
+    Constructed(v, name) -> Constructed(id(v), name),
+    Unbound(free) -> Unbound(free),
+  }
+
+fn re_value(v: TValue, id: (Int) -> Int / {abort.raise}) -> TValue / {abort.raise} =
+  { named: re_named(v.named, id), written: v.written.map(id) }
+
+fn re_effect(
+  e: Effect<Int, Bytes>,
+  id: (Int) -> Int / {abort.raise},
+) -> Effect<Int, Bytes> / {abort.raise} =
+  match e { Declared(v, tie) -> Declared(id(v), tie), EffectUnbound(free) -> EffectUnbound(free) }
+
+fn re_type_name(
+  n: TypeName<Int>,
+  id: (Int) -> Int / {abort.raise},
+) -> TypeName<Int> / {abort.raise} =
+  match n {
+    TypeParam(l) -> TypeParam(l),
+    TypeDefined(v) -> TypeDefined(id(v)),
+    TypeUnbound(free) -> TypeUnbound(free),
+  }
+
+fn re_ty(t: TTy, id: (Int) -> Int / {abort.raise}) -> TTy / {abort.raise} =
+  match t {
+    Applied(n, written, args) ->
+      Applied(re_type_name(n, id), written.map(id), args.map(|x: TTy| re_ty(x, id))),
+    AppliedOver(n, written, args, labels, rows) ->
+      AppliedOver(
+        re_type_name(n, id),
+        written.map(id),
+        args.map(|x: TTy| re_ty(x, id)),
+        labels,
+        rows.map(|r: TRow| re_row(r, id)),
+      ),
+    Function(params, ret, r) ->
+      Function(params.map(|x: TTy| re_ty(x, id)), re_ty(ret, id), re_opt_row(r, id)),
+    Fields(fs) -> Fields(fs.map(|f: TyField<Int, Bytes>| { ..f, ty: re_ty(f.ty, id) })),
+    UnitType -> UnitType,
+  }
+
+fn re_opt_ty(t: Option<TTy>, id: (Int) -> Int / {abort.raise}) -> Option<TTy> / {abort.raise} =
+  match t { Some(x) -> Some(re_ty(x, id)), None -> None }
+
+fn re_row(r: TRow, id: (Int) -> Int / {abort.raise}) -> TRow / {abort.raise} =
+  {
+    ..r,
+    atoms: r.atoms.map(|a: Atom<Int, Bytes>|
+      match a {
+        Moded(e, mode, label, bounded) -> Moded(re_effect(e, id), mode, label, bounded),
+        OfOp(e, op, label, bounded) -> OfOp(re_effect(e, id), op, label, bounded),
+      }),
+  }
+
+fn re_opt_row(r: Option<TRow>, id: (Int) -> Int / {abort.raise}) -> Option<TRow> / {abort.raise} =
+  match r { Some(x) -> Some(re_row(x, id)), None -> None }
+
+fn re_pat(p: TPat, id: (Int) -> Int / {abort.raise}) -> TPat / {abort.raise} =
+  match p {
+    Wild -> Wild,
+    Bind -> Bind,
+    Again(l) -> Again(l),
+    LitPat(l) -> LitPat(l),
+    RangePat(lo, hi) -> RangePat(lo, hi),
+    CtorPat(n, args) -> CtorPat(re_named(n, id), args.map(|x: TPat| re_pat(x, id))),
+    RecordPat(fs, rest) ->
+      RecordPat(fs.map(|f: PatField<Int, Spot>| { ..f, pat: re_pat(f.pat, id) }), rest),
+    ListPat(items, rest) ->
+      ListPat(items.map(|x: TPat| re_pat(x, id)), match rest {
+        Some(r) -> Some(re_pat(r, id)),
+        None -> None,
+      }),
+    OrPat(alts) -> OrPat(alts.map(|x: TPat| re_pat(x, id))),
+  }
+
+fn re_opt_expr(
+  e: Option<TExpr>,
+  id: (Int) -> Int / {abort.raise},
+) -> Option<TExpr> / {abort.raise} = match e { Some(x) -> Some(re_expr(x, id)), None -> None }
+
+fn re_fields(
+  fs: List<stored::RecField<Int, Bytes, Spot, Note>>,
+  id: (Int) -> Int / {abort.raise},
+) -> List<stored::RecField<Int, Bytes, Spot, Note>> / {abort.raise} =
+  fs.map(|f: stored::RecField<Int, Bytes, Spot, Note>| { ..f, value: re_expr(f.value, id) })
+
+fn re_stmt(s: TStmt, id: (Int) -> Int / {abort.raise}) -> TStmt / {abort.raise} =
+  match s {
+    Let(t, v, p) -> Let(re_opt_ty(t, id), re_expr(v, id), re_pat(p, id)),
+    LetElse(t, v, p, f) -> LetElse(re_opt_ty(t, id), re_expr(v, id), re_pat(p, id), re_expr(f, id)),
+    Effectful(x) -> Effectful(re_expr(x, id)),
+    Assign(v, x) -> Assign(re_value(v, id), re_expr(x, id)),
+  }
+
+fn re_expr(e: TExpr, id: (Int) -> Int / {abort.raise}) -> TExpr / {abort.raise} =
+  match e {
+    Constant(l) -> Constant(l),
+    Unwritten -> Unwritten,
+    Var(v) -> Var(re_value(v, id)),
+    Binary(op, l, r, written) -> Binary(op, re_expr(l, id), re_expr(r, id), written.map(id)),
+    Unary(op, x) -> Unary(op, re_expr(x, id)),
+    Lambda(types, body) -> Lambda(types.map(|t: Option<TTy>| re_opt_ty(t, id)), re_expr(body, id)),
+    App(func, args, labels) -> App(re_expr(func, id), args.map(|x: TExpr| re_expr(x, id)), labels),
+    OnValue(c) ->
+      OnValue({
+        ..c,
+        base: re_expr(c.base, id),
+        args: c.args.map(|x: TExpr| re_expr(x, id)),
+        named: re_fields(c.named, id),
+        callees: match c.callees {
+          InFull(v) -> InFull(re_value(v, id)),
+          Among(vs) -> Among(vs.map(id)),
+        },
+      }),
+    If(c, t, x) -> If(re_expr(c, id), re_expr(t, id), re_expr(x, id)),
+    Match(s, arms) ->
+      Match(
+        re_expr(s, id),
+        arms.map(|a: Arm<Int, Bytes, Spot, Note>|
+          { pat: re_pat(a.pat, id), guard: re_opt_expr(a.guard, id), body: re_expr(a.body, id) }),
+      ),
+    Record(fs) -> Record(re_fields(fs, id)),
+    RecordUpdate(base, fs) -> RecordUpdate(re_expr(base, id), re_fields(fs, id)),
+    Field(base, name) -> Field(re_expr(base, id), name),
+    ListOf(items) -> ListOf(items.map(|x: TExpr| re_expr(x, id))),
+    Perform(eff, op, label, args) ->
+      Perform(re_effect(eff, id), op, label, args.map(|x: TExpr| re_expr(x, id))),
+    Handle(h) ->
+      Handle({
+        vars: h.vars.map(|v: stored::HandlerVar<Int, Bytes, Spot, Note>|
+          { ty: re_opt_ty(v.ty, id), init: re_expr(v.init, id) }),
+        body: re_expr(h.body, id),
+        clauses: h.clauses.map(|c: Clause<Int, Bytes, Spot, Note>|
+          { ..c, effect: re_effect(c.effect, id), body: re_expr(c.body, id) }),
+        ret: re_opt_expr(h.ret, id),
+      }),
+    WithHold(resource, acquire, release, body) ->
+      WithHold(resource, re_expr(acquire, id), re_expr(release, id), re_expr(body, id)),
+    Simulate(body) -> Simulate(re_expr(body, id)),
+    Parallel(branches) -> Parallel(branches.map(|x: TExpr| re_expr(x, id))),
+    Tagged(parser, text) -> Tagged(re_value(parser, id), text),
+    Filled(parser, filler, head, holes) ->
+      Filled(
+        re_value(parser, id),
+        re_value(filler, id),
+        head,
+        holes.map(|h: FilledHole<Int, Bytes, Spot, Note>| { ..h, value: re_expr(h.value, id) }),
+      ),
+    TryBlock(raised, body) ->
+      TryBlock(
+        match raised { Some(r) -> Some({ ..r, effect: re_effect(r.effect, id) }), None -> None },
+        re_expr(body, id),
+      ),
+    Block(entries, tail) ->
+      Block(
+        entries.map(|x: stored::Entry<Int, Bytes, Spot, Note>|
+          match x {
+            One(s) -> One(re_stmt(s, id)),
+            Commuting(note, members) -> Commuting(note, members.map(|s: TStmt| re_stmt(s, id))),
+          }),
+        re_opt_expr(tail, id),
+      ),
+  }

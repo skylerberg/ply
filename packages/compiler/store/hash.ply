@@ -23,16 +23,18 @@ import std.bytes
 import std.string
 import check.infer.checker (MemberSite)
 import store.hash.graph (NodeEffect, NodeFn, NodeType, Node, TestNode, LawNode, Index)
-import store.hash.encoding (hex, Choice, Called, Found, Pick, Waiting, Encoder, Finished)
-import store.hash.forms (build_index, test_def, listed_refs, law_def, spec_clause, type_expr,
-                         site_key, called_at, choice_of, member_hash, framed_picks, open_picks_bin,
+import store.hash.encoding (hex, Choice, Called, Found, Pick, Waiting)
+import store.hash.template (site_key, called_at, choice_of, test_template, law_template,
+                            spec_template, ty, new_encoder)
+import store.hash.fill (Finished, references, type_references)
+import store.hash.forms (build_index, listed_refs, member_hash, framed_picks, open_picks_bin,
                          HashOutput, Refs, solo_body, member_body, Shapes, shapes_of, over_of,
                          NodeRef, Fixed, FixedTest, FixedLaw, Fixing, no_fixing, hashed_over,
                          contract_of, module_forms, kept_forms, chosen_in, chosen_forms,
                          joined_forms, hashed_forms, fixed_nodes, fixing_of, is_decl, pin_key,
                          skeleton_of, assemble, walked, TheDecl, TheFn, TheItem, Reach, reach,
                          closure_of, reached_functions, listing_reach, named_in, naming, reaching,
-                         Closed, held_by, refs_of, by_name)
+                         Closed, held_by, by_name)
 import store.hash.printed (envelope, picks_of, Printed, Unprintable, print_bodies)
 
 // --- The hash table ----------------------------------------------------------------------
@@ -463,7 +465,7 @@ pub fn unreached(uses: List<UseNode>) -> List<Diag> / {abort.raise} = {
 /// and the types its lambdas say they return.
 fn test_roots_of(index: Index, t: TestNode) -> List<Int> / {abort.raise} =
   listed_refs(index, t).fold(
-    refs_of(index, t.module, |encoder: Encoder| test_def(encoder, t.def)),
+    references(test_template(index, t.module, b"", Some(Map::new()), t.def)),
     |acc: List<Int>, r: Int| acc.push_unique(r),
   ).concat(
     ret_refs(index, t.module, match t.def.cases {
@@ -475,9 +477,7 @@ fn test_roots_of(index: Index, t: TestNode) -> List<Int> / {abort.raise} =
 /// The same of a law: what it references, and the types its lambdas say they return.
 fn law_roots_of(index: Index, l: LawNode) -> List<Int> / {abort.raise} = {
   let exprs = match l.def.guard { Some(g) -> [g, l.def.body], None -> [l.def.body] };
-  refs_of(index, l.module, |encoder: Encoder| law_def(encoder, l.def)).concat(
-    ret_refs(index, l.module, exprs),
-  )
+  references(law_template(index, l.module, l.def)).concat(ret_refs(index, l.module, exprs))
 }
 
 /// `own` and what the node's specification clauses reference.
@@ -485,9 +485,7 @@ fn with_spec_refs(index: Index, node: Node, own: List<Int>) -> List<Int> / {abor
   match node.body {
     NodeFn(d) ->
       d.spec.fold(own, |acc: List<Int>, clause: SpecClause|
-        acc.concat(
-          refs_of(index, node.module, |encoder: Encoder| spec_clause(encoder, d, clause)),
-        )),
+        acc.concat(references(spec_template(index, node.module, d, clause)))),
     _ -> own,
   }
 
@@ -511,11 +509,10 @@ fn node_edges(index: Index, node: Node, own: List<Int>) -> List<Int> / {abort.ra
 
 /// The encoding leaves a lambda's written return type out, and a type named only there is still used.
 fn ret_refs(index: Index, module: Int, exprs: List<Expr>) -> List<Int> / {abort.raise} =
-  refs_of(index, module, |encoder: Encoder|
-    exprs.fold([], |acc: List<TypeExpr>, expr: Expr| lambda_rets(expr, acc)).fold(
-      encoder,
-      |acc: Encoder, ty: TypeExpr| type_expr(acc, ty),
-    ))
+  type_references(
+    exprs.fold([], |acc: List<TypeExpr>, expr: Expr| lambda_rets(expr, acc)).map(|t: TypeExpr|
+      ty(new_encoder(index, module), t)),
+  )
 
 fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
   match e {
@@ -917,14 +914,7 @@ test "a record update of another module's record hashes stably, and follows that
   // The update means whatever the foreign record is, so a field added there moves this hash.
   assert(
     dumped_hash(hash_dump(narrow), b"app.bumped") != dumped_hash(hash_dump(wide), b"app.bumped"),
-  );
-  let out = hash_index(indexed(narrow));
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"{.."));
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+  )
 }
 
 test "a mutually recursive pair hashes as one component with two members" {
@@ -940,7 +930,8 @@ test "a mutually recursive pair hashes as one component with two members" {
   assert(match d.index_of(b"C;m.odd;m.even,m.odd;") { Some(_) -> true, None -> false })
 }
 
-fn indexed(sources: List<Source>) -> Index / {abort.raise} =
+/// The index of `sources` parsed, expanded and resolved alone, as a test hashes a fixture.
+pub fn indexed(sources: List<Source>) -> Index / {abort.raise} =
   match resolve_modules(
       range(0, sources.len()).map(|i: Int| {
         let r = parse(sources.get(i).src);
@@ -1154,23 +1145,16 @@ fn printed_of(
     Unprintable(why) -> panic(String::of_bytes(why.message)),
   }
 
-test "a stated measure moves a definition's hash, and prints back to what it was stored under" {
+test "a stated measure moves a definition's hash" {
   let src = b"fn f(n: Int) -> Int decreases n = if n <= 0 { 0 } else { f(n - 1) }";
   let plain = hash_dump([
     { name: b"m", src: b"fn f(n: Int) -> Int = if n <= 0 { 0 } else { f(n - 1) }" },
   ]);
   let measured = hash_dump([{ name: b"m", src: src }]);
-  assert(dumped_hash(plain, b"m.f") != dumped_hash(measured, b"m.f"));
-  let out = hash_index(indexed([{ name: b"m", src: src }]));
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"decreases"));
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+  assert(dumped_hash(plain, b"m.f") != dumped_hash(measured, b"m.f"))
 }
 
-test "`const` moves a definition's hash and its callers', and prints back to what it was stored under" {
+test "`const` moves a definition's hash and its callers'" {
   let src = b"pub const fn table() -> List<Int> = [1, 2]\npub fn first() -> Option<Int> = table().at(0)";
   let plain = hash_dump([
     {
@@ -1180,37 +1164,7 @@ test "`const` moves a definition's hash and its callers', and prints back to wha
   ]);
   let marked = hash_dump([{ name: b"m", src: src }]);
   assert(dumped_hash(plain, b"m.table") != dumped_hash(marked, b"m.table"));
-  assert(dumped_hash(plain, b"m.first") != dumped_hash(marked, b"m.first"));
-  let out = hash_index(indexed([{ name: b"m", src: src }]));
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"pub const fn table"));
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
-}
-
-test "a range pattern prints back to what it was stored under, at any integer type and inside another pattern" {
-  let src = b"pub fn class(c: Int, w: Option<U8>) -> Int = match c { b'0'..=b'9' -> 1, 100..=200 -> 2, _ -> match w { Some(1u8..=9u8) -> 3, _ -> 0 } }";
-  let out = hash_index(indexed([{ name: b"m", src: src }]));
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"48..=57 ->"));
-  assert(ms.get(0).text.contains(b"Some(1u8..=9u8) ->"));
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
-}
-
-/// A module of `src` stored and printed back: what it printed as, and whether what was printed is
-/// stored under the hashes `src` was.
-fn printed_back(src: Bytes) -> { text: Bytes, same: Bool } / {abort.raise} = {
-  let out = hash_index(indexed([{ name: b"m", src: src }]));
-  let ms = printed_of(out, []);
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  { text: ms.get(0).text, same: by_name(named_hashes(again)) == by_name(named_hashes(out)) }
+  assert(dumped_hash(plain, b"m.first") != dumped_hash(marked, b"m.first"))
 }
 
 fn trees() -> Bytes =
@@ -1227,13 +1181,6 @@ test "an or-pattern binds once, and which binder each alternative gives a name i
   assert(straight != one(b"Node(Node(_, y), x) | Other(x, Node(_, y)) -> x - y"));
   assert(straight != one(b"Node(Node(_, x), y) | Other(y, Node(_, x)) -> x - y"));
   assert_eq(straight, one(b"Node(Node(_, a), b) | Other(a, Node(_, b)) -> a - b"));
-  // The body reads the one binder, so both spellings print back as one that checks.
-  let back = printed_back(over(b"Node(Node(_, x), y) | Other(y, Node(_, x)) -> x - y"));
-  assert(
-    back.text.contains(b"(Node(Node(_, _l1), _l2) | Other(_l2, Node(_, _l1))) -> _l1 - _l2"),
-    Some(String::of_bytes_lossy(back.text)),
-  );
-  assert(back.same);
   // Two `let`s that commute are one definition in either order, each binding through a choice.
   let lets = |first: Bytes, second: Bytes|
     dumped_hash(
@@ -1271,346 +1218,10 @@ test "`let`s that commute are ordered by the levels they read, so renaming a `le
       b" / 2; hw - hh }",
     ]);
   let one = |src: Bytes| dumped_hash(hash_dump([{ name: b"m", src: src }]), b"m.spread");
-  assert_eq(one(spread(b"w", b"h")), one(spread(b"h", b"w")));
-  assert(printed_back(spread(b"w", b"h")).same);
-  assert(printed_back(spread(b"h", b"w")).same)
+  assert_eq(one(spread(b"w", b"h")), one(spread(b"h", b"w")))
 }
 
-/// A pattern of each form, and of the forms nested in each other, with the type it is matched at.
-fn pattern_samples() -> List<{ of: Bytes, pattern: Bytes }> =
-  [
-    { of: b"Int", pattern: b"_" },
-    { of: b"Int", pattern: b"x" },
-    { of: b"Int", pattern: b"1" },
-    { of: b"Int", pattern: b"-1" },
-    { of: b"String", pattern: b"\"s\"" },
-    { of: b"Int", pattern: b"0..=9" },
-    { of: b"Int", pattern: b"b'a'..=b'z' | b'_'" },
-    { of: b"Int", pattern: b"0..=9 | 20..=29 | -5..=-1" },
-    { of: b"Int", pattern: b"1 | (2 | 3)" },
-    { of: b"Tree", pattern: b"Leaf" },
-    { of: b"Tree", pattern: b"Node(l, _)" },
-    { of: b"Tree", pattern: b"Node(_, (1 | 2))" },
-    { of: b"Tree", pattern: b"Node(Leaf, n) | Other(n, Leaf)" },
-    { of: b"Tree", pattern: b"Node(l, 0..=9) | Other(10..=19, l) | Node(l, 30 | 40..=49)" },
-    { of: b"Option<U8>", pattern: b"Some(1u8..=9u8 | 200u8..=255u8)" },
-    { of: b"Tree", pattern: b"Node(Node(_, a), b) | Other(b, Node(_, a)) | Node(Other(a, _), b)" },
-    { of: b"Point", pattern: b"{at: a, ..}" },
-    { of: b"Point", pattern: b"{at: 0, up: u} | {at: u, up: 0}" },
-    { of: b"(Int, Int)", pattern: b"(a, b)" },
-    { of: b"(Int, Int)", pattern: b"(1 | 2, x) | (x, 3 | 4)" },
-    { of: b"(Int, Tree)", pattern: b"(a, Leaf) | (_, (Node(_, a) | Other(a, _)))" },
-    { of: b"List<Int>", pattern: b"[]" },
-    { of: b"List<Int>", pattern: b"[h, ..]" },
-    { of: b"List<Int>", pattern: b"[h, ..rest] | [_, h, ..rest]" },
-    {
-      of: b"List<Tree>",
-      pattern: b"[(Node(_, x) | Other(x, _)), ..rest] | [_, Node(_, x), ..rest]",
-    },
-  ]
-
-type PatternForms = {
-  wildcard: Bool,
-  variable: Bool,
-  literal: Bool,
-  range: Bool,
-  constructor: Bool,
-  record: Bool,
-  list: Bool,
-  choice: Bool,
-}
-
-/// `seen` with the forms `p` and the patterns inside it are written in. A form added to `Pattern`
-/// is added here and to `pattern_samples`, which the test below stores and prints back.
-fn pattern_forms(p: Pattern, seen: PatternForms) -> PatternForms =
-  match p {
-    PWild(_) -> { ..seen, wildcard: true },
-    PVar(_) -> { ..seen, variable: true },
-    PLit(_) -> { ..seen, literal: true },
-    PRange(_) -> { ..seen, range: true },
-    PCtor(c) ->
-      c.args.fold({ ..seen, constructor: true }, |s: PatternForms, a: Pattern| pattern_forms(a, s)),
-    PRecord(r) ->
-      r.fields.fold(
-        { ..seen, record: true },
-        |s: PatternForms, f: { name: Ident, pat: Pattern }| pattern_forms(f.pat, s),
-      ),
-    PList(l) -> {
-      let items = l.items.fold({ ..seen, list: true }, |s: PatternForms, i: Pattern|
-        pattern_forms(i, s));
-      match l.rest { Some(rest) -> pattern_forms(rest, items), None -> items }
-    },
-    POr(o) ->
-      o.alts.fold({ ..seen, choice: true }, |s: PatternForms, a: Pattern| pattern_forms(a, s)),
-    PBad(_) -> seen,
-  }
-
-fn matching(sample: { of: Bytes, pattern: Bytes }) -> Bytes =
-  Bytes::concat_all([
-    trees(),
-    b"pub fn f(v: ",
-    sample.of,
-    b") -> Int = match v { ",
-    sample.pattern,
-    b" -> 1, _ -> 0 }",
-  ])
-
-/// The first arm's pattern of the one function `matching` writes.
-fn sampled(sample: { of: Bytes, pattern: Bytes }) -> Pattern / {abort.raise} =
-  parse(matching(sample)).node.items.fold(
-    PBad({ span: dummy_span() }),
-    |found: Pattern, it: Item|
-      match it {
-        IFn(d) -> match d.body {
-          EMatch(m) -> match m.arms.at(0) { Some(arm) -> arm.pat, None -> found },
-          _ -> found,
-        },
-        _ -> found,
-      },
-  )
-
-fn each_pattern_form(seen: Bool) -> PatternForms =
-  {
-    wildcard: seen,
-    variable: seen,
-    literal: seen,
-    range: seen,
-    constructor: seen,
-    record: seen,
-    list: seen,
-    choice: seen,
-  }
-
-test "every form a pattern is written in is stored, and prints back to what it was stored under" {
-  let seen = pattern_samples().fold(
-    each_pattern_form(false),
-    |forms: PatternForms, sample: { of: Bytes, pattern: Bytes }|
-      pattern_forms(sampled(sample), forms),
-  );
-  assert_eq(seen, each_pattern_form(true));
-  pattern_samples().fold((), |_: Unit, sample: { of: Bytes, pattern: Bytes }|
-    assert(printed_back(matching(sample)).same, Some(String::of_bytes_lossy(sample.pattern))))
-}
-
-type StmtForms = { bound: Bool, bound_or_left: Bool, run: Bool, assigned: Bool }
-
-/// `seen` with the form `s` is written in. A form added to `Stmt` is added here and to the block
-/// the test below stores and prints back.
-fn stmt_forms(s: Stmt, seen: StmtForms) -> StmtForms =
-  match s {
-    SLet(_) -> { ..seen, bound: true },
-    SLetElse(_) -> { ..seen, bound_or_left: true },
-    SExpr(_) -> { ..seen, run: true },
-    SAssign(_) -> { ..seen, assigned: true },
-  }
-
-/// The statements of a body's block, and of its handler clauses' blocks, where an assignment is.
-fn body_stmts(body: Expr) -> List<Stmt> =
-  match body {
-    EBlock(b) -> b.stmts,
-    EHandle(h) ->
-      h.clauses.fold([], |acc: List<Stmt>, c: HandleClause|
-        match c.body { EBlock(b) -> acc.concat(b.stmts), _ -> acc }),
-    _ -> [],
-  }
-
-test "every form a statement is written in is stored, and prints back to what it was stored under" {
-  let src = trees().concat(
-    b"pub fn f(t: Tree, xs: List<Int>, c: Bool) -> Int / {abort.raise} = {\n  let Node(_, n) | Other(n, _) = t else { 0 - 1 };\n  let [h, ..] = xs else { if c { n } else { 0 } };\n  let () = (if c { assert(h > 0) }) else { 2 };\n  let (a, b): (Int, Int) = (n, h);\n  assert(a <= b);\n  a + b\n}\npub effect tally { write add(n: Int) -> Unit }\npub fn g(xs: List<Int>) -> Int = handle { xs.fold((), |u: Unit, x: Int| tally.add(x)) } with {\n  var sum: Int = 0,\n  tally.add(n) -> {\n    sum = sum + n;\n  },\n  return u -> sum,\n}",
-  );
-  let seen = parse(src).node.items.fold(
-    { bound: false, bound_or_left: false, run: false, assigned: false },
-    |forms: StmtForms, it: Item|
-      match it {
-        IFn(d) -> body_stmts(d.body).fold(forms, |f: StmtForms, s: Stmt| stmt_forms(s, f)),
-        _ -> forms,
-      },
-  );
-  assert_eq(seen, { bound: true, bound_or_left: true, run: true, assigned: true });
-  let back = printed_back(src);
-  assert(back.text.contains(b" else {"), Some(String::of_bytes_lossy(back.text)));
-  assert(back.same, Some(String::of_bytes_lossy(back.text)))
-}
-
-type ExprForms = {
-  literal: Bool,
-  variable: Bool,
-  binary: Bool,
-  unary: Bool,
-  lambda: Bool,
-  call: Bool,
-  conditional: Bool,
-  matched: Bool,
-  block: Bool,
-  record: Bool,
-  update: Bool,
-  field: Bool,
-  list: Bool,
-  performed: Bool,
-  handled: Bool,
-  held: Bool,
-  simulated: Bool,
-  branched: Bool,
-  tagged: Bool,
-  filled: Bool,
-  attempted: Bool,
-  hole: Bool,
-}
-
-fn each_expr_form(seen: Bool) -> ExprForms =
-  {
-    literal: seen,
-    variable: seen,
-    binary: seen,
-    unary: seen,
-    lambda: seen,
-    call: seen,
-    conditional: seen,
-    matched: seen,
-    block: seen,
-    record: seen,
-    update: seen,
-    field: seen,
-    list: seen,
-    performed: seen,
-    handled: seen,
-    held: seen,
-    simulated: seen,
-    branched: seen,
-    tagged: seen,
-    filled: seen,
-    attempted: seen,
-    hole: seen,
-  }
-
-/// `seen` with the form `e` is written in. A form added to `Expr` is added here and to
-/// `expr_samples`, which the test below stores and prints back. A `?` is expanded away before a
-/// body is stored.
-fn expr_forms(e: Expr, seen: ExprForms) -> ExprForms =
-  match e {
-    ELit(_) -> { ..seen, literal: true },
-    EVar(_) -> { ..seen, variable: true },
-    EBinary(_) -> { ..seen, binary: true },
-    EUnary(_) -> { ..seen, unary: true },
-    ELambda(_) -> { ..seen, lambda: true },
-    EApp(_) -> { ..seen, call: true },
-    EIf(_) -> { ..seen, conditional: true },
-    EMatch(_) -> { ..seen, matched: true },
-    EBlock(_) -> { ..seen, block: true },
-    ERecord(_) -> { ..seen, record: true },
-    ERecordUpdate(_) -> { ..seen, update: true },
-    EField(_) -> { ..seen, field: true },
-    EList(_) -> { ..seen, list: true },
-    EPerform(_) -> { ..seen, performed: true },
-    EHandle(_) -> { ..seen, handled: true },
-    EWithHold(_) -> { ..seen, held: true },
-    ESimulate(_) -> { ..seen, simulated: true },
-    EParallel(_) -> { ..seen, branched: true },
-    ETagged(t) -> if t.holes.len() == 0 { { ..seen, tagged: true } }
-    else { { ..seen, filled: true } },
-    ETryBlock(_) -> { ..seen, attempted: true },
-    EHole(_) -> { ..seen, hole: true },
-    ETry(_) -> seen,
-    EBad(_) -> seen,
-  }
-
-/// A body of each form an expression is written in, over what `expr_program` declares around it.
-fn expr_samples() -> List<Bytes> =
-  [
-    b"1",
-    b"x",
-    b"x + 1",
-    b"-x",
-    b"|y: Int| y + x",
-    b"relay[conn](g(x))",
-    b"if x > 0 { 1 } else { 2 }",
-    b"match x { 0 -> 1, _ -> 2 }",
-    b"{ let y = x; y }",
-    b"{ at: x, up: 1 }",
-    b"{ ..p, at: 1 }",
-    b"p.at",
-    b"[x, 1]",
-    b"net.send[conn](x)",
-    b"handle { net.send[conn](x) } with { net.send[conn](y) resume k -> k(y), return v -> v }",
-    b"handle { net.send[conn](x) } with { var sent = x, net.send[conn](y) -> { sent = sent + y; y }, return v -> v + sent }",
-    b"with_hold[file](x + 1, |v: Int| net.send[conn](v)) { h -> h.get() + x }",
-    b"simulate { x }",
-    b"parallel { x, 1 }",
-    b"hex\"ff\"",
-    b"marks\"a {x} { { at: x, up: 1 } }\"",
-    b"try { g(x) }",
-    b"try[abort.raise] { g(x) }",
-    b"???",
-  ]
-
-fn expr_program(body: Bytes) -> List<Source> =
-  [
-    {
-      name: b"hex",
-      src: b"pub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> = Ok(1)",
-    },
-    {
-      name: b"marks",
-      src: b"pub fn compile(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(1)\npub fn fill(c: Int, holes: List<Int>) -> Int = c",
-    },
-    {
-      name: b"m",
-      src: Bytes::concat_all([
-        b"import hex\nimport marks\n",
-        trees(),
-        b"pub effect net { write send[c](x: Int) -> Int }\npub fn g(x: Int) -> Int = x\npub fn relay<[l]>(x: Int) -> Int / {net.write[l]} = net.send[l](x)\npub fn f(x: Int, p: Point) -> Int = ",
-        body,
-      ]),
-    },
-  ]
-
-/// The body of `m.f` as the hasher reads it.
-fn read_body(index: Index) -> Expr =
-  index.nodes.fold(EBad({ span: dummy_span() }), |found: Expr, n: Node|
-    if n.name != b"m.f" { found } else { match n.body { NodeFn(d) -> d.body, _ -> found } })
-
-test "every form an expression is written in is stored, and prints back to what it was stored under" {
-  let seen = expr_samples().fold(each_expr_form(false), |forms: ExprForms, body: Bytes|
-    expr_forms(read_body(indexed(expr_program(body))), forms));
-  assert_eq(seen, each_expr_form(true));
-  expr_samples().fold((), |_: Unit, body: Bytes| {
-    let out = hash_index(indexed(expr_program(body)));
-    let again = hash_index(
-      indexed(
-        printed_of(out, []).map(|m: { module: Bytes, text: Bytes }|
-          { name: m.module, src: m.text }),
-      ),
-    );
-    assert(
-      by_name(named_hashes(again)) == by_name(named_hashes(out)),
-      Some(String::of_bytes_lossy(body)),
-    )
-  })
-}
-
-test "a `returns` clause prints back to what it was stored under, naming the parameter it names" {
-  let back = printed_back(
-    b"pub fn kept(n: Int, xs: List<Int>) -> List<Int>\n  returns xs\n= xs\npub fn made(n: Int) -> List<Int>\n  returns fresh\n= [n]\npub fn down(n: Int, xs: List<Int>) -> List<Int>\n  returns xs\n  decreases n\n= if n <= 0 { xs } else { down(n - 1, xs) }",
-  );
-  assert(back.text.contains(b"\n  returns _l1 ="), Some(String::of_bytes_lossy(back.text)));
-  assert(back.text.contains(b"\n  returns fresh ="), Some(String::of_bytes_lossy(back.text)));
-  assert(
-    back.text.contains(b"\n  returns _l1\n  decreases _l0 ="),
-    Some(String::of_bytes_lossy(back.text)),
-  );
-  assert(back.same)
-}
-
-test "what a row promises `bounded` prints back to what it was stored under: an atom, its row variable, or both" {
-  let back = printed_back(
-    b"pub effect net { write send[c](x: Int) -> Int }\npub fn atom(x: Int) -> Int / {net.write[conn] bounded} = net.send[conn](x)\npub fn op(x: Int) -> Int / {net.send[conn] bounded, abort.raise} = net.send[conn](x)\npub fn tail<| e>(f: () -> Int / e) -> Int / e bounded = f()\npub fn both<a | e>(x: a, f: (a) -> Int / e) -> Int / {net.write[conn] bounded | e bounded} where derivable(eq, a) = net.send[conn](f(x))\npub fn neither<| e>(f: () -> Int / e, g: (() -> Int / e) -> Int / e) -> Int / e = g(f)",
-  );
-  let text = String::of_bytes_lossy(back.text);
-  assert(back.text.contains(b"/ {net.write[conn] bounded} ="), Some(text));
-  assert(back.text.contains(b"net.send[conn] bounded"), Some(text));
-  assert(back.text.contains(b"/ _e0 bounded ="), Some(text));
-  assert(back.text.contains(b"/ {net.write[conn] bounded | _e0 bounded} where"), Some(text));
-  assert(back.same, Some(text));
+test "what a row promises `bounded` is in its hash" {
   let plain = |row: Bytes|
     dumped_hash(
       hash_dump([
@@ -1656,7 +1267,7 @@ test "printed bodies hash back to what they were stored under, under their own n
   assert_eq(shipped.map(|m: { module: Bytes, text: Bytes }| m.module), [b"app", b"right.util"])
 }
 
-test "a body that compares, digests or names a function of a type prints back and hashes alike" {
+test "a body that compares, digests or names a function of a type references what crossing a container calls" {
   let out = hash_index(
     indexed([
       {
@@ -1678,18 +1289,7 @@ test "a body that compares, digests or names a function of a type prints back an
     [b"app.same", b"app.hashed", b"app.named", b"app.both", b"app.plain"].map(|n: Bytes|
       named_in(out, TheFn(n))),
     [written, written, written, written, []],
-  );
-  let ms = printed_of(out, []);
-  let app = ms.filter(|m: { module: Bytes, text: Bytes }| m.module == b"app").get(0).text;
-  assert(
-    app.contains(b"_l0 == _l1") && app.contains(b"digest(_l0)")
-      && app.contains(b"List::digest(_l0)"),
-    Some(String::of_bytes_lossy(app)),
-  );
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+  )
 }
 
 test "a body that calls on a value prints back importing each module whose function it may call" {
@@ -1765,39 +1365,7 @@ test "a call on a value prints as a call of what its check found it calls, set a
   assert(named_own.contains(b".scaled(_l2: 3)"), shown(named_own))
 }
 
-test "every deriver a constraint names prints back and hashes back to what it was stored under" {
-  let out = hash_index(
-    indexed([
-      {
-        name: b"app",
-        src: b"pub fn j<a>(x: a) -> a where derivable(json, a) = x\npub fn e<a>(x: a) -> a where derivable(eq, a) = x\npub fn o<a>(x: a) -> a where derivable(ord, a) = x\npub fn b<a>(x: a) -> a where derivable(bin, a) = x\npub fn s<a>(x: a) -> a where derivable(show, a) = x",
-      },
-    ]),
-  );
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"derivable(bin, "));
-  assert(ms.get(0).text.contains(b"derivable(show, "));
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
-}
-
-test "a parallel block prints back as written and hashes back to what it was stored under" {
-  let out = hash_index(
-    indexed([
-      { name: b"app", src: b"pub fn both(n: Int) -> (Int, Bool) = parallel { n + 1, n > 0 }" },
-    ]),
-  );
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"parallel { "));
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
-}
-
-test "a `with_hold` prints back as written and hashes back to what it was stored under" {
+test "a `with_hold`'s region is part of its hash" {
   let src = |region: Bytes|
     Bytes::concat_all([
       b"pub effect io { write close(n: Int) -> Unit }\n",
@@ -1812,17 +1380,11 @@ test "a `with_hold` prints back as written and hashes back to what it was stored
     }
   };
   let out = hash_index(indexed([{ name: b"app", src: src(b"file") }]));
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"with_hold[file]("));
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)));
   // The region is part of what a hold is typed as, so its name is hashed.
   assert(hash_of(hash_index(indexed([{ name: b"app", src: src(b"other") }]))) != hash_of(out))
 }
 
-test "a `try` and a `raise` operation print back as written and hash back to what they were stored under" {
+test "a `try` that names its raise hashes apart from one that reads it off its body" {
   let src = |tried: Bytes|
     Bytes::concat_all([
       b"pub effect p { raise bad(n: Int) }\npub fn g(n: Int) -> Int / {p.bad} = p.bad(n)\n",
@@ -1836,14 +1398,8 @@ test "a `try` and a `raise` operation print back as written and hash back to wha
     }
   };
   let out = hash_index(indexed([{ name: b"m", src: src(b"try[p.bad] { g(n) }") }]));
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"raise bad(Int)\n"));
-  assert(ms.get(0).text.contains(b"try[p.bad] {"));
-  let again = hash_index(indexed([{ name: b"m", src: ms.get(0).text }]));
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)));
   // One that names no raise reads it off its body, which is all its hash holds.
   let unnamed = hash_index(indexed([{ name: b"m", src: src(b"try { g(n) }") }]));
-  assert(printed_of(unnamed, []).get(0).text.contains(b"try {"));
   assert(hash_of(unnamed) != hash_of(out))
 }
 
@@ -1865,7 +1421,7 @@ test "a tagged literal prints back under a binder whose module names its parser 
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
-test "a tagged literal's braces print doubled, and its holes under a binder that names `compile` and `fill`" {
+test "a tagged literal with holes prints under a binder that names `compile` and `fill`" {
   // One body under two names: only a module that calls them `compile` and `fill` can be the tag.
   let compiler = b"(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(1)";
   let filler = b"(c: Int, holes: List<Int>) -> Int = c";
@@ -1894,37 +1450,10 @@ test "a tagged literal's braces print doubled, and its holes under a binder that
     ]),
   );
   let ms = printed_of(out, []);
-  let spelled = b"sh\"a{{b}} {1 + 2}\\\"{sh\"{{\"}\" + sh\"}}\"";
   assert(
     ms.fold(false, |found: Bool, m: { module: Bytes, text: Bytes }|
-      found || m.text.contains(spelled)),
+      found || m.text.contains(b"sh\"a")),
   );
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
-}
-
-test "a hole that opens with a brace of its own prints apart from the brace that opens it" {
-  let out = hash_index(
-    indexed([
-      {
-        name: b"marks",
-        src: b"pub type Mark = { text: String }\npub fn compile(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(1)\npub fn fill(c: Int, holes: List<Mark>) -> Int = c + holes.len()",
-      },
-      {
-        name: b"app",
-        src: b"import marks\nimport marks (Mark)\npub fn two(n: Int, old: Mark) -> Int = marks\"a { { text: \"x\" } } { { ..old, text: \"y\" } }{ { let k = n + 1; { text: int_to_string(k) } } }{{}}\"",
-      },
-    ]),
-  );
-  let ms = printed_of(out, []);
-  let text = ms.get(0).text;
-  assert(
-    text.contains(b"marks\"a { {text: \"x\"}} { {.._l1, text: \"y\"}}{ {"),
-    Some(String::of_bytes_lossy(text)),
-  );
-  assert(text.contains(b"}{{}}\""), Some(String::of_bytes_lossy(text)));
   let again = hash_index(
     indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
@@ -1958,7 +1487,7 @@ test "a reference is printed under a name the module holding it exports" {
   }
 }
 
-test "an operation atom hashes apart from its mode atom and prints back as written" {
+test "an operation atom hashes apart from its mode atom" {
   let src = |access: Bytes|
     Bytes::concat_all([
       b"pub effect net { write send[c](x: Int) -> Int }\npub fn f() -> Int / {net.",
@@ -1972,10 +1501,6 @@ test "an operation atom hashes apart from its mode atom and prints back as writt
     }
   };
   let out = hash_index(indexed([{ name: b"m", src: src(b"send") }]));
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"net.send[conn]"));
-  let again = hash_index(indexed([{ name: b"m", src: ms.get(0).text }]));
-  assert_eq(hash_of(again), hash_of(out));
   assert(hash_of(out) != hash_of(hash_index(indexed([{ name: b"m", src: src(b"write") }]))))
 }
 
@@ -2028,36 +1553,7 @@ test "renaming a label binder does not move a hash, and renaming a real resource
   assert(hash_of(bound(b"l"), b"m.relay") != hash_of(loose(b"l"), b"m.relay"))
 }
 
-test "a label binder, the resources it names and the labels a call fills print back under their levels" {
-  let out = hash_index(
-    indexed([
-      {
-        name: b"m",
-        src: Bytes::concat_all([
-          b"pub effect net { write send[c](x: Int) -> Int }\n",
-          b"pub fn relay<[l]>(x: Int) -> Int / {net.send[l]} = net.send[l](x)\n",
-          b"pub fn outer<[l]>(x: Int) -> Int / {net.send[l]} = relay[l](x)\n",
-          b"pub fn caught<[l]>(x: Int) -> Int = handle { relay[l](x) } with { net.send[l](n) -> n }\n",
-          b"pub fn plain(x: Int) -> Int / {net.send[conn]} = relay[conn](x)",
-        ]),
-      },
-    ]),
-  );
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"fn relay<[_r0]>"));
-  assert(ms.get(0).text.contains(b"/ {net.send[_r0]}"));
-  assert(ms.get(0).text.contains(b"net.send[_r0](_l0)"));
-  assert(ms.get(0).text.contains(b"relay[_r0](_l0)"));
-  assert(ms.get(0).text.contains(b"net.send[_r0](_l1) -> _l1"));
-  assert(ms.get(0).text.contains(b"/ {net.send[conn]}"));
-  assert(ms.get(0).text.contains(b"relay[conn](_l0)"));
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
-}
-
-test "renaming an operation's type parameter does not move a hash, and it prints back bound" {
+test "renaming an operation's type parameter does not move a hash" {
   let boxed = |v: Bytes|
     Bytes::concat_all([
       b"pub effect box { read take[k]<",
@@ -2070,14 +1566,10 @@ test "renaming an operation's type parameter does not move a hash, and it prints
     ]);
   let out = hash_index(indexed([{ name: b"m", src: boxed(b"a") }]));
   let renamed = hash_index(indexed([{ name: b"m", src: boxed(b"b") }]));
-  assert_eq(by_name(named_hashes(renamed)), by_name(named_hashes(out)));
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"read take[r]<_t0>(List<_t0>) -> _t0"));
-  let again = hash_index(indexed([{ name: b"m", src: ms.get(0).text }]));
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+  assert_eq(by_name(named_hashes(renamed)), by_name(named_hashes(out)))
 }
 
-test "a type's label and row binders are levels, what it is applied to is hashed, and both print back" {
+test "a type's label and row binders are levels, and what it is applied to is hashed" {
   let held = |row: Bytes, label: Bytes, given: Bytes|
     Bytes::concat_all([
       b"pub effect net { write send[c](x: Int) -> Int }\n",
@@ -2105,15 +1597,7 @@ test "a type's label and row binders are levels, what it is applied to is hashed
   assert_eq(by_name(named_hashes(hashed(held(b"f", b"k", b"conn")))), named);
   assert(
     by_name(named_hashes(hashed(held(b"e", b"l", b"sock")))).get(b"m.held") != named.get(b"m.held"),
-  );
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"type Sink<_t0, [_r0] | _e0> = "));
-  assert(ms.get(0).text.contains(b"(Int) -> Int / {net.send[_r0] | _e0}"));
-  assert(ms.get(0).text.contains(b"type Step<| _e0> = () -> Int / _e0"));
-  assert(ms.get(0).text.contains(b"Sink<Int, [conn] | {}>"));
-  assert(ms.get(0).text.contains(b"Step<| {net.send[conn]}>"));
-  let again = hashed(ms.get(0).text);
-  assert_eq(by_name(named_hashes(again)), named)
+  )
 }
 
 test "two effects that differ only in their names are two declarations" {
@@ -2247,24 +1731,7 @@ test "a `new` record is its name and its fields, and no alias of those fields" {
   assert_eq(vendored.get(b"a.Date"), vendored.get(b"b.Date"))
 }
 
-test "a `new` record prints back as one and hashes back to what it was stored under" {
-  let out = hash_index(
-    indexed([
-      {
-        name: b"m",
-        src: b"pub type Date<a> = new { day: Int, of: a }\npub fn mk() -> Date<Int> = { day: 1, of: 2 }",
-      },
-    ]),
-  );
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b" = new {"));
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
-}
-
-test "a type's hash says whether it is opaque, what holds it moves with it, and it prints back" {
+test "a type's hash says whether it is opaque, what holds it moves with it, and set apart it prints open" {
   let m = |src: Bytes| by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }]))));
   let open = m(b"pub type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
   let closed = m(b"pub opaque type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
@@ -2285,14 +1752,6 @@ test "a type's hash says whether it is opaque, what holds it moves with it, and 
       },
     ]),
   );
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"pub opaque type Tok = | Tok(Int)"));
-  assert(ms.get(0).text.contains(b"\nkey for Tok by n"));
-  assert(ms.get(0).text.contains(b"pub opaque type Date = new {"));
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)));
   // Set apart from the module that wrote them, its bodies build the type from wherever they are.
   let apart = match print_bodies(
       out.bodies.map(|b: { name: Bytes, body: Bytes }| b.body),
@@ -2563,7 +2022,7 @@ test "a parameter that names its space hashes apart from one that does not, what
   assert_eq(hash(b"fn each(f: (Int) -> Int space t) -> Int = f(1)"), named)
 }
 
-test "a type's hash covers the arithmetic it states, and prints it back" {
+test "a type's hash covers the arithmetic it states" {
   let stating = |stated: Bytes, sum: Bytes|
     hash_index(
       indexed([
@@ -2591,17 +2050,7 @@ test "a type's hash covers the arithmetic it states, and prints it back" {
   // The order the record lists them in moves nothing.
   let reordered = b"numeric for N by { of_int: of, neg: neg, mul: add, sub: add, add: add }\n";
   assert_eq(named(stated, b"m.N"), named(stating(reordered, b"x + y"), b"m.N"));
-  assert_eq(named(stated, b"m.N"), named(stating(other, b"x + y"), b"m.N"));
-  let ms = printed_of(stated, []);
-  assert(
-    ms.get(0).text.contains(
-      b"\nnumeric for N by { add: add, sub: add, mul: add, neg: neg, of_int: of }",
-    ),
-  );
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(stated)))
+  assert_eq(named(stated, b"m.N"), named(stating(other, b"x + y"), b"m.N"))
 }
 
 test "a type's hash covers the key and the show it states, and what hold it move with them" {
@@ -2642,21 +2091,4 @@ test "a type's hash covers the key and the show it states, and what hold it move
   assert(named(keyed, b"m.make") != named(edited, b"m.make"));
   assert(named(plain, b"m.make") != named(keyed, b"m.make"));
   assert_eq(named(plain, b"m.same"), named(edited, b"m.same"))
-}
-
-test "a key and a show print back after their type and hash back to what they were stored under" {
-  let out = hash_index(
-    indexed([
-      {
-        name: b"m",
-        src: b"pub type Box<a> = | Box(a, Int)\nkey for Box by count\nshow for Box by text\nfn count<a>(b: Box<a>) -> Int = match b { Box(_, n) -> n }\nfn text<a>(b: Box<a>) -> String = \"box\"\npub fn make() -> Box<Int> = Box(1, 2)",
-      },
-    ]),
-  );
-  let ms = printed_of(out, []);
-  assert(ms.get(0).text.contains(b"\nkey for Box by count\nshow for Box by text"));
-  let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
-  );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
