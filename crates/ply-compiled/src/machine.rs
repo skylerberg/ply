@@ -12,33 +12,12 @@ use crate::emitted::Handle;
 use crate::heap::{bridged, obj};
 use crate::native::{Addr, F64, I64, Raises};
 use crate::rt::{Ctx, lent, refuse, refused_builtin, refused_unknown};
-use ply_core::builtins::{assert_failure, call, not_found, not_utf8};
-use ply_core::{Builtin, Decimal, Diagnostic, Fixed, IntTy, Span, Value, codes};
+use ply_core::builtins::{assert_failure, call, not_found};
+use ply_core::{Builtin, Decimal, Diagnostic, Fixed, Span, Value, codes};
 
 /// Every native here, under the name the compiler declares it by.
 pub fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native(
-            "?utf8_valid",
-            rt_utf8_valid as unsafe extern "C" fn(_, _, _) -> _,
-        ),
-        machine_native(
-            "?utf8_lossy",
-            rt_utf8_lossy as unsafe extern "C" fn(_, _, _) -> _,
-        ),
-        machine_native(
-            "?trim_start",
-            rt_trim_start as unsafe extern "C" fn(_, _, _) -> _,
-        ),
-        machine_native(
-            "?trim_end",
-            rt_trim_end as unsafe extern "C" fn(_, _, _) -> _,
-        ),
-        machine_native("?int_text", rt_int_text as unsafe extern "C" fn(_, _) -> _),
-        machine_native(
-            "?float_text",
-            rt_float_text as unsafe extern "C" fn(_, _) -> _,
-        ),
         machine_native(
             "?decimal_text",
             rt_decimal_text as unsafe extern "C" fn(_, _, _) -> _,
@@ -48,20 +27,8 @@ pub fn natives() -> Vec<MachineNative> {
             rt_decimal_float as unsafe extern "C" fn(_, _, _) -> _,
         ),
         machine_native(
-            "?wide_text",
-            rt_wide_text as unsafe extern "C" fn(_, _, _, _) -> _,
-        ),
-        machine_native(
-            "?float_parse",
-            rt_float_parse as unsafe extern "C" fn(_, _, _) -> _,
-        ),
-        machine_native(
             "?decimal_parse",
             rt_decimal_parse as unsafe extern "C" fn(_, _, _) -> _,
-        ),
-        machine_native(
-            "?wide_parse",
-            rt_wide_parse as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
         machine_native(
             "?taken_word",
@@ -222,50 +189,6 @@ impl Ctx {
     }
 }
 
-/// 1 where the `n` bytes at `p` are UTF-8, else 0.
-pub unsafe extern "C" fn rt_utf8_valid(_: *mut Ctx, p: Addr, n: I64) -> I64 {
-    I64(i64::from(
-        std::str::from_utf8(unsafe { lent(p, n) }).is_ok(),
-    ))
-}
-
-/// The `n` bytes at `p` as UTF-8, each run that is not replaced by U+FFFD, as taken bytes.
-pub unsafe extern "C" fn rt_utf8_lossy(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    let text = String::from_utf8_lossy(unsafe { lent(p, n) }).into_owned();
-    unsafe { &mut *ctx }.give(text.into_bytes())
-}
-
-/// Where the string at `p` begins once its leading white space is trimmed, in bytes.
-pub unsafe extern "C" fn rt_trim_start(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    let c = unsafe { &mut *ctx };
-    match c.text(unsafe { lent(p, n) }) {
-        Some(s) => I64((s.len() - s.trim_start().len()) as i64),
-        None => I64(0),
-    }
-}
-
-/// Where the string at `p` ends once its trailing white space is trimmed, in bytes.
-pub unsafe extern "C" fn rt_trim_end(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    let c = unsafe { &mut *ctx };
-    match c.text(unsafe { lent(p, n) }) {
-        Some(s) => I64(s.trim_end().len() as i64),
-        None => I64(0),
-    }
-}
-
-/// `Int::to_string` of `v`, as taken bytes.
-pub unsafe extern "C" fn rt_int_text(ctx: *mut Ctx, v: I64) -> I64 {
-    unsafe { &mut *ctx }.taken_of(Builtin::IntToString, vec![Value::Int(v.0)])
-}
-
-/// `Float::to_string` of the `Float` whose bits are `bits`, as taken bytes.
-pub unsafe extern "C" fn rt_float_text(ctx: *mut Ctx, bits: F64) -> I64 {
-    unsafe { &mut *ctx }.taken_of(
-        Builtin::FloatToString,
-        vec![Value::Float(f64::from_bits(bits.0))],
-    )
-}
-
 /// `Decimal::to_string` of the `Decimal` whose two words, as `rust_decimal` serializes it, are `lo`
 /// and `hi`, as taken bytes.
 pub unsafe extern "C" fn rt_decimal_text(ctx: *mut Ctx, lo: I64, hi: I64) -> I64 {
@@ -280,39 +203,10 @@ pub unsafe extern "C" fn rt_decimal_float(_ctx: *mut Ctx, lo: I64, hi: I64) -> F
     )))
 }
 
-/// `I128::to_string` where `signed` is not 0, else `U128::to_string`, of the 128 bits `hi` then
-/// `lo`, as taken bytes.
-pub unsafe extern "C" fn rt_wide_text(ctx: *mut Ctx, signed: I64, lo: I64, hi: I64) -> I64 {
-    let (ty, b) = wide(signed);
-    let bits = (u128::from(hi.0 as u64) << 64) | u128::from(lo.0 as u64);
-    let builtin = if b {
-        Builtin::I128ToString
-    } else {
-        Builtin::U128ToString
-    };
-    unsafe { &mut *ctx }.taken_of(builtin, vec![Value::Fixed(Fixed::new(ty, bits))])
-}
-
-/// `Float::of_string` of the string at `p`: 8, its bits left as taken bytes, or -1 for `None`.
-pub unsafe extern "C" fn rt_float_parse(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    parse(ctx, p, n, Builtin::FloatOfString)
-}
-
 /// `Decimal::of_string` of the string at `p`: 16, its two words left as taken bytes, or -1 for
 /// `None`.
 pub unsafe extern "C" fn rt_decimal_parse(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     parse(ctx, p, n, Builtin::DecimalOfString)
-}
-
-/// `I128::of_string` where `signed` is not 0, else `U128::of_string`, of the string at `p`: 16, its
-/// low word then its high word left as taken bytes, or -1 for `None`.
-pub unsafe extern "C" fn rt_wide_parse(ctx: *mut Ctx, signed: I64, p: Addr, n: I64) -> I64 {
-    let b = if wide(signed).1 {
-        Builtin::I128OfString
-    } else {
-        Builtin::U128OfString
-    };
-    parse(ctx, p, n, b)
 }
 
 fn parse(ctx: *mut Ctx, p: Addr, n: I64, b: Builtin) -> I64 {
@@ -341,7 +235,6 @@ pub unsafe extern "C" fn rt_taken_word(ctx: *mut Ctx, k: I64) -> I64 {
     }
 }
 
-/// The BLAKE3 digest of the `n` bytes at `p`, as taken bytes.
 /// The encoding `digest` hashes of a scalar, left as taken bytes, answering their count: `kind` 0 a
 /// `()`, 1 a `Bool` that is `lo`, 2 an `Int` or a narrower width that reads as `lo`, 3 the width at
 /// `t` in [`ply_core::INT_TYPES`] whose bits are `lo` and above them `hi`, 4 the `Char` of scalar
@@ -402,6 +295,7 @@ fn encoded_given(c: &mut Ctx, v: &Value) -> I64 {
     }
 }
 
+/// The BLAKE3 digest of the `n` bytes at `p`, as taken bytes.
 pub unsafe extern "C" fn rt_blake3(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     let digest = blake3::hash(unsafe { lent(p, n) });
     unsafe { &mut *ctx }.give(digest.as_bytes().to_vec())
@@ -571,16 +465,6 @@ pub unsafe extern "C" fn rt_refused_text(
             };
             not_found(site, s, needle)
         }
-        Builtin::StringOfBytes => {
-            let bytes = unsafe { lent(p, n) };
-            match std::str::from_utf8(bytes) {
-                Err(e) => not_utf8(site, bytes, &e),
-                Ok(_) => {
-                    c.fail(err_machine("bytes refused as not UTF-8 that are"));
-                    return Raises(());
-                }
-            }
-        }
         Builtin::Assert => {
             let message = if n.0 < 0 {
                 Value::ctor("None", Vec::new())
@@ -606,13 +490,4 @@ fn decimal_of(lo: I64, hi: I64) -> Decimal {
     d[..8].copy_from_slice(&lo.0.to_le_bytes());
     d[8..].copy_from_slice(&hi.0.to_le_bytes());
     Decimal::deserialize(d)
-}
-
-/// The 128-bit width `signed` names, and whether it is signed.
-fn wide(signed: I64) -> (IntTy, bool) {
-    if signed.0 != 0 {
-        (IntTy::I128, true)
-    } else {
-        (IntTy::U128, false)
-    }
 }

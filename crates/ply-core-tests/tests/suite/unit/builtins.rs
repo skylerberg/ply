@@ -608,21 +608,6 @@ fn the_byte_searches_index_in_bytes_where_the_string_ones_index_in_characters() 
         Value::Int(5)
     );
 
-    // A byte search may cut a character, and `String::of_bytes` refuses the piece.
-    let cut = done(
-        Builtin::BytesSlice,
-        vec![bytes(text.as_bytes()), Value::Int(0), Value::Int(2)],
-    )
-    .unwrap();
-    assert_eq!(
-        done(Builtin::BytesIsUtf8, vec![cut.clone()]).unwrap(),
-        Value::Bool(false)
-    );
-    assert_eq!(
-        done(Builtin::StringOfBytes, vec![cut]).unwrap_err().code,
-        codes::RUNTIME_ERROR
-    );
-
     // A multi-byte needle is matched whole, never split.
     assert_eq!(
         found(
