@@ -24,7 +24,7 @@ import emit.lower.base (Context, Lowering, Lowered, refuse, fresh, bound, bound_
                         pair_words, continued, type_of, handed, noted, set_join, joined,
                         short_circuit, as_words)
 import emit.lower.data (constructed_as, field)
-import emit.lower.crossing (through_runtime, blake3_of, scalar_encoding)
+import emit.lower.crossing (through_runtime, blake3_of, scalar_encoding, concatenated)
 import emit.roots (builtin_helper)
 import expand.rewrite (FloatFunction, float_function)
 
@@ -97,7 +97,7 @@ pub fn unary(cx: Context, o: Lowered, op: Bytes, at: Span) -> Lowered =
 /// a comparison answers a `Bool`, any other operator a value of the operands' type.
 pub fn binary(cx: Context, l: Lowered, r: Lowered, op: Bytes, at: Span) -> Lowered = {
   let ty = match l.arg { AInt(_) -> type_of(r.arg), _ -> type_of(l.arg) };
-  if op == b"concat" { by_runtime(cx, r.st, b"rt_concat_p", [], [l.arg, r.arg], ty, at) }
+  if op == b"concat" { concatenated(cx, r.st, l.arg, r.arg, ty, at) }
   else if !comparison(op) && !arithmetic(op) && !shift(op) && !is_bitop(op) {
     refuse(r.st, Scalars, b"an operator: ".concat(op))
   } else if ty == unknown_type() {
@@ -902,8 +902,9 @@ fn written(cx: Context, st: Lowering, op: TypeOp, ty: Type, a: Arg, at: Span) ->
   )
 
 /// A width's or an `Int`'s wrapping, saturating or checked builtin at the type its operands hold, in C
-/// where a register holds the value, checked below 64 bits, where the exact answer fits a word, and
-/// at 128 bits over the width's two words; by the runtime's builtin at any other type.
+/// where a register holds the value, checked below 64 bits exactly in a word, at 64 bits by C's
+/// overflow tests and at 128 bits over the width's two words; by the runtime's builtin at any other
+/// type.
 fn width_arithmetic(
   cx: Context,
   st: Lowering,
@@ -919,12 +920,14 @@ fn width_arithmetic(
   else { ty });
   match class_of(cx.setting.ctors, ty) {
     CWidth(w) -> if w.bits > 64 {
-      if checked { checked_wide(cx, st, name, a, b, w, answer, at) }
-      else { over(cx, { st: st, arg: a }, { st: st, arg: b }, name, RWide(w), ty, at) }
+      if checked {
+        checked_in_place(cx, st, name, a, b, { ty: ty, held: RWide(w), on: RWide(w) }, answer, at)
+      } else { over(cx, { st: st, arg: a }, { st: st, arg: b }, name, RWide(w), ty, at) }
     } else if wrapping(name) || (saturating(name) && w.bits == 64) {
       over(cx, { st: st, arg: a }, { st: st, arg: b }, name, RNum(w), ty, at)
-    } else if w.bits == 64 { through_runtime(cx, st, name, args, answer, at) }
-    else if checked { checked_width(cx, st, name, a, b, w, answer, at) }
+    } else if w.bits == 64 {
+      checked_in_place(cx, st, name, a, b, { ty: ty, held: RNum(w), on: RNum(w) }, answer, at)
+    } else if checked { checked_width(cx, st, name, a, b, w, answer, at) }
     else { over(cx, { st: st, arg: a }, { st: st, arg: b }, name, RNum(w), ty, at) },
     // An `Int` wraps and saturates as the 64-bit signed width its register holds.
     CInt -> if wrapping(name) || saturating(name) {
@@ -938,7 +941,10 @@ fn width_arithmetic(
         Prim({ op: name, on: RNum({ bits: 64, signed: true }), args: [x.arg, y.arg] }),
         at,
       )
-    } else { through_runtime(cx, st, name, args, answer, at) },
+    } else {
+      let word = RNum({ bits: 64, signed: true });
+      checked_in_place(cx, st, name, a, b, { ty: ty, held: RInt, on: word }, answer, at)
+    },
     _ -> through_runtime(cx, needing(st, ty, false), name, args, answer, at),
   }
 }
@@ -995,39 +1001,40 @@ fn checked_width(
   some_where(cx, fits, narrowed, option, at)
 }
 
-/// A 128-bit width's checked arithmetic, answering an `Option` of type `option`: whether the exact
-/// answer fits, as the runtime finds it over the two words, and `Some` of the wrapped answer there,
-/// which is the exact one.
-fn checked_wide(
+/// The checked arithmetic of an `Int`, a 64-bit width or a 128-bit width, its operands of type
+/// `k.ty` held as `k.held` and operated on as `k.on`, answering an `Option` of type `option`:
+/// whether the exact answer fits, as C or the runtime over the words tests it, and `Some` of the
+/// wrapped answer there, which is the exact one.
+fn checked_in_place(
   cx: Context,
   st: Lowering,
   name: Bytes,
   a: Arg,
   b: Arg,
-  w: Width,
+  k: { ty: Type, held: Rep, on: Rep },
   option: Type,
   at: Span,
 ) -> Lowered = {
   let neg = name == b"checked_neg";
-  let x = handed({ st: st, arg: a }, RWide(w), at);
-  let y = if neg { x } else { handed({ st: x.st, arg: b }, RWide(w), at) };
+  let x = handed({ st: st, arg: a }, k.held, at);
+  let y = if neg { x } else { handed({ st: x.st, arg: b }, k.held, at) };
   let fits = bound(
     cx,
     y.st,
     named_type(b"Bool"),
-    Prim({ op: name, on: RWide(w), args: if neg { [x.arg] } else { [x.arg, y.arg] } }),
+    Prim({ op: name, on: k.on, args: if neg { [x.arg] } else { [x.arg, y.arg] } }),
     at,
   );
   let wrapped = bound(
     cx,
     opened(fits.st),
-    width_type(w),
+    k.ty,
     Prim({
       op: if neg || name == b"checked_sub" { b"wrap_sub" }
       else if name == b"checked_add" { b"wrap_add" }
       else { b"wrap_mul" },
-      on: RWide(w),
-      args: if neg { [AZero(RWide(w)), x.arg] } else { [x.arg, y.arg] },
+      on: k.on,
+      args: if neg { [AZero(k.held), x.arg] } else { [x.arg, y.arg] },
     }),
     at,
   );
