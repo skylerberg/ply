@@ -8,12 +8,12 @@
 import std.bytes (ascii_of_int)
 import syntax.parsing (span_between)
 import check.types (TyCon)
-import emit.c (KNum, KInt, KBool, KFloat, KDec, ctype, width_index, int_lit)
+import emit.c (KNum, KInt, KBool, KFloat, KDec, KWide, ctype, width_index, int_lit)
 import emit.pieces (Piece, Text, Hole, ShapeOf, spelled)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RFlat, RSlice, RToken, Var, Arg, AVar,
-                 AInt, AZero, Made, MRecord, MCase, Path, PField, PNamed, PArg, PCapture, PLeaf,
-                 PCase, PPayload, RUnit, RSum, Data, Convention, Given, Lent, Owned, rep_of_arg,
-                 rep_said, var_said, made_said, in_box)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RFlat, RSlice, RToken, Var,
+                 Arg, AVar, AInt, AZero, Made, MRecord, MCase, Path, PField, PNamed, PArg, PCapture,
+                 PLeaf, PCase, PPayload, RUnit, RSum, Data, Convention, Given, Lent, Owned,
+                 rep_of_arg, rep_said, var_said, made_said, in_box)
 import emit.layout (Laid, LWords, LRecord, LSum, SumLaid, P, S, U, Nullary, Inline, Boxed, WordIs,
                     LowBits, words, header_bytes, pointer_floor, tag_bits, CaseArgs, sum_laid,
                     record_laid, raw)
@@ -44,6 +44,7 @@ fn one_type(r: Rep) -> Bytes =
     RNum(w) -> ctype(KNum(w)),
     RFloat -> ctype(KFloat),
     RDec -> ctype(KDec),
+    RWide(w) -> ctype(KWide(w)),
     _ -> b"Word",
   }
 
@@ -59,7 +60,7 @@ pub fn arg_parts(pr: Printing, a: Arg) -> List<Bytes> =
   }
 
 /// A scalar held as `r`, named `e`, as the word a value of its type is: an `Int` an immediate or
-/// the runtime's box, a `Float`, a `Decimal` or a 64-bit width the runtime's box, a `Bool` 0 or 1's
+/// the runtime's box, a `Float`, a `Decimal` or a width of 64 bits or more the runtime's box, a `Bool` 0 or 1's
 /// singleton; any value of one word as that word.
 pub fn as_word(e: Bytes, r: Rep) -> Bytes =
   match r {
@@ -67,6 +68,16 @@ pub fn as_word(e: Bytes, r: Rep) -> Bytes =
     RBool -> Bytes::concat_all([b"(", e, b" ? ply_true : ply_false)"]),
     RFloat -> Bytes::concat_all([b"rt_box_float_p(ctx, ply_f64_bits(", e, b"))"]),
     RDec -> Bytes::concat_all([b"rt_box_decimal_p(ctx, (", e, b").lo, (", e, b").hi)"]),
+    RWide(w) ->
+      Bytes::concat_all([
+        b"rt_box_wide_p(ctx, (",
+        e,
+        b").lo, (",
+        e,
+        b").hi, ",
+        ascii_of_int(width_index(w)),
+        b")",
+      ]),
     RNum(w) -> if w.bits < 64 { Bytes::concat_all([b"ply_imm((int64_t)", e, b")"]) } else {
       Bytes::concat_all([
         b"rt_box_fixed_p(ctx, (Word)(",
@@ -116,6 +127,7 @@ pub fn word_as(w: Bytes, r: Rep) -> Bytes =
         b")))",
       ]),
     RDec -> Bytes::concat_all([b"ply_dec_of(", w, b")"]),
+    RWide(_) -> Bytes::concat_all([b"ply_wide_of(", w, b")"]),
     RNum(n) -> if n.bits < 64 {
       Bytes::concat_all([b"(", ctype(KNum(n)), b")ply_imm_value(", w, b")"])
     } else { Bytes::concat_all([b"(", ctype(KNum(n)), b")", slot(w, 0)]) },
@@ -198,13 +210,15 @@ pub fn params_opened(names: List<Bytes>, reps: List<Rep>) -> List<Bytes> =
     })
 
 /// The words a buffer or a box holds of the C values `exprs`, held as `reps`, in order: each value's
-/// bits, a `Decimal`'s two words, nothing of a value of no words.
+/// bits, a `Decimal`'s or a 128-bit width's two words, nothing of a value of no words.
 pub fn words_laid(exprs: List<Bytes>, reps: List<Rep>) -> List<Bytes> =
   range(0, reps.len()).fold([], |acc: List<Bytes>, k: Int| {
     let e = nth(exprs, k);
     acc.concat(match reps.at(k) {
       Some(RFloat) -> [Bytes::concat_all([b"ply_f64_bits(", e, b")"])],
       Some(RDec) -> [Bytes::concat_all([b"(", e, b").lo"]), Bytes::concat_all([b"(", e, b").hi"])],
+      Some(RWide(_)) ->
+        [Bytes::concat_all([b"(", e, b").lo"]), Bytes::concat_all([b"(", e, b").hi"])],
       Some(RUnit) -> [],
       Some(RWord) -> [e],
       _ -> [Bytes::concat_all([b"(Word)(", e, b")"])],
@@ -676,6 +690,7 @@ pub fn word_parts(word: Bytes, r: Rep, into: List<Bytes>) -> List<Piece> =
       RNum(_) -> scalar_read(word, r, into),
       RFloat -> scalar_read(word, r, into),
       RDec -> scalar_read(word, r, into),
+      RWide(_) -> scalar_read(word, r, into),
       RSum(s) -> if layout::raw_sum(s.laid) { scalar_read(word, r, into) }
       else { [Text(Bytes::concat_all([b"Word ", nth(into, 0), b" = ", word, b";"]))] },
       _ -> [Text(Bytes::concat_all([b"Word ", nth(into, 0), b" = ", word, b";"]))],
@@ -919,6 +934,7 @@ fn values_read(word: (Int) -> Bytes, vs: List<Rep>) -> List<Bytes> =
       out: acc.out.push(match h {
         RFloat -> Bytes::concat_all([b"ply_f64(", word(acc.at), b")"]),
         RDec -> Bytes::concat_all([b"(PlyDec){", word(acc.at), b", ", word(acc.at + 1), b"}"]),
+        RWide(_) -> Bytes::concat_all([b"(PlyWide){", word(acc.at), b", ", word(acc.at + 1), b"}"]),
         RUnit -> b"0",
         RWord -> word(acc.at),
         _ -> Bytes::concat_all([b"(", one_type(h), b")", word(acc.at)]),

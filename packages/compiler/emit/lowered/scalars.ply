@@ -6,13 +6,13 @@ import syntax.patterns (LStr, LDec, LWide, LUnit)
 import emit.answer (Exact)
 import emit.keys
 import emit.keys (Root, RootName, root_name, root_text)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RSum, RImm, Var, Arg, AVar, AInt,
-                 ANum, AChar, Val, Prim, Literal, Get, Tag, Call, Native, Inst, Let, Do, If, Block,
-                 Scalars)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RSum, RImm, Var, Arg, AVar,
+                 AInt, ANum, AChar, Val, Prim, Literal, Get, Tag, Call, Native, Inst, Let, Do, If,
+                 Block, Scalars)
 import emit.compare (Program, program_of, formed, printed_by_form, not_built)
 
 import emit.tir (Static)
-import emit.statics (Datum, SStr, SWide, statics_of)
+import emit.statics (Datum, SStr, statics_of)
 
 /// Every value `b` binds or does, through the blocks its branches hold.
 fn values(b: Block) -> List<Val> =
@@ -167,41 +167,9 @@ test "an operator is read at the type its operands hold, a width's literal as it
   assert_eq(applied(p, b"half"), Ok([{ op: b"mul", on: RFloat }]));
   assert_eq(applied(p, b"less"), Ok([{ op: b"lt", on: RInt }]));
   assert_eq(applied(p, b"wide"), Ok([{ op: b"mul", on: width(64, false) }]));
-  // No register holds 128 bits: the runtime's operator takes the words.
-  assert_eq(applied(p, b"big"), Ok([]));
-  assert_eq(natives(p, b"big"), Ok([b"rt_binary_p"]))
-}
-
-/// The codes root `name` of `p` hands `rt_binary_p`, in order, or why it was not formed.
-fn runtime_codes(p: Program, name: Bytes) -> Result<List<Int>, Bytes> / {abort.raise} =
-  match formed(p, name) {
-    Err(no) -> Err(no.why),
-    Ok(f) ->
-      Ok(
-        values(f.body).fold([], |acc: List<Int>, v: Val|
-          match v {
-            Native(n) -> if n.name != b"rt_binary_p" { acc }
-            else { match n.args.at(0) { Some(AInt(code)) -> acc.push(code), _ -> acc } },
-            _ -> acc,
-          }),
-      ),
-  }
-
-test "an operator the runtime does over two words is named by its place in the runtime's table" {
-  let p = analysed(
-    Bytes::concat_all([
-      b"fn ops(a: U128, b: U128, n: Int) -> U128 / {abort.raise} = {\n",
-      b"  let s = a + b;\n  let d = s - a;\n  let m = d * b;\n  let q = m / b;\n  let r = q % b;\n",
-      b"  let x = r & a;\n  let o = x | b;\n  let e = o ^ a;\n  let l = e << n;\n  let h = l >> n;\n",
-      b"  h >>> n\n}\n",
-      b"fn orders(a: I128, b: I128) -> Bool = {\n",
-      b"  let lt = a < b;\n  let le = a <= b;\n  let gt = a > b;\n  let ge = a >= b;\n",
-      b"  lt == le && gt == ge\n}\n",
-    ]),
-  );
-  // The runtime's `BINOPS`: `concat` at 11 lies between the orders and the bit operators.
-  assert_eq(runtime_codes(p, b"ops"), Ok([0, 1, 2, 3, 4, 12, 13, 14, 15, 16, 17]));
-  assert_eq(runtime_codes(p, b"orders"), Ok([7, 8, 9, 10]))
+  // A 128-bit width is its two words, its operator applied to them.
+  assert_eq(applied(p, b"big"), Ok([{ op: b"add", on: RWide({ bits: 128, signed: false }) }]));
+  assert_eq(natives(p, b"big"), Ok([]))
 }
 
 test "an Int quotient or remainder by a literal is C's own operator, and by anything else the runtime's" {
@@ -464,7 +432,7 @@ test "a value of a type variable is compared by the runtime, which notes the typ
   }
 }
 
-test "a constant is a static object, a decimal its two words, and a register's written as itself" {
+test "a constant is a static object, a decimal or a 128-bit width its two words, and a register's written as itself" {
   let p = analysed(
     Bytes::concat_all([
       b"fn text() -> String = \"ply\"\n",
@@ -497,8 +465,8 @@ test "a constant is a static object, a decimal its two words, and a register's w
     read(b"huge"),
     Ok(
       Some({
-        val: named(SWide({ width: { bits: 128, signed: false }, high: 0, low: 7 })),
-        rep: RWord,
+        val: Prim({ op: b"wide", on: RInt, args: [AInt(7), AInt(0)] }),
+        rep: RWide({ bits: 128, signed: false }),
       }),
     ),
   );
@@ -552,15 +520,13 @@ test "what C does not write at a type is the runtime's builtin, an encoding writ
       b"type P = { x: Int, name: String }\n",
       b"fn h(x: Int) -> Bytes = digest(x)\n",
       b"fn hr(x: P) -> Bytes = digest(x)\n",
-      b"fn sat(a: U128, b: U128) -> U128 = a +| b\n",
-      b"fn big(a: U128) -> Option<U128> = checked_neg(a)\n",
+      b"fn big(a: U64) -> Option<U64> = checked_neg(a)\n",
     ]),
   );
-  assert_eq([b"h", b"hr", b"sat", b"big"].map(|n: Bytes| natives(p, n)), [
+  assert_eq([b"h", b"hr", b"big"].map(|n: Bytes| natives(p, n)), [
     Ok([b"builtin_digest_p"]),
     // The encoding is hashed in place by the native over its bytes.
     Ok([b"builtin_elaborated_blake3_p"]),
-    Ok([b"builtin_saturating_add_p"]),
     // An `Option` the runtime answers crosses back as its encoding.
     Ok([
       b"builtin_elaborated_lower_open_p",
@@ -573,6 +539,29 @@ test "what C does not write at a type is the runtime's builtin, an encoding writ
       rs.map(|r: RootName| root_text(r).starts_with(b"m.digest#"))),
     Ok([true]),
   )
+}
+
+test "a 128-bit width's arithmetic is the runtime's over its two words, its checked arithmetic `Some` of the wrapped answer where it fits" {
+  let p = analysed(
+    Bytes::concat_all([
+      b"fn sat(a: U128, b: U128) -> U128 = a +| b\n",
+      b"fn big(a: I128) -> Option<I128> = checked_neg(a)\n",
+    ]),
+  );
+  let wide = RWide({ bits: 128, signed: true });
+  assert_eq(
+    applied(p, b"sat"),
+    Ok([{ op: b"saturating_add", on: RWide({ bits: 128, signed: false }) }]),
+  );
+  assert_eq(
+    applied(p, b"big"),
+    Ok([{ op: b"checked_neg", on: wide }, { op: b"wrap_sub", on: wide }]),
+  );
+  assert_eq([b"sat", b"big"].map(|n: Bytes| natives(p, n)), [Ok([]), Ok([])]);
+  match printed_by_form(p, b"sat") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(t) -> assert(t.index_of(b"rt_wide_op_p(ctx, 24, ") != None, Some(String::of_bytes_lossy(t))),
+  }
 }
 
 test "a width's checked arithmetic is exact in 64 bits, its answer `Some` where the width holds it" {

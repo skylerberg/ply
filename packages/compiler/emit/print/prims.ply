@@ -8,10 +8,10 @@ import syntax.patterns (Lit, LUnit, LStr)
 import check.types (TyCon)
 import syntax.parsing (span_between)
 import emit.c (Width, KNum, ctype, int_lit, is_bitop, bitop_c, unsigned_ctype, width_index,
-               width_min, width_max, binary_code, overflow_code)
+               width_min, width_max, binary_code, overflow_code, wide_code)
 import emit.pieces (spelled)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RSum, RImm, Var, Arg, AVar, AInt,
-                 ANum, Scalars, rep_of_arg, arithmetic, comparison, shift)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RSum, RImm, Var, Arg, AVar,
+                 AInt, ANum, Scalars, rep_of_arg, arithmetic, comparison, shift, checked)
 import emit.print.text (Printing, Place, printing, line, temp, named, arg_text, assigned, site,
                         check, unprinted)
 import emit.print.made (c_type)
@@ -31,8 +31,9 @@ pub fn literal(p: Place, pr: Printing, into: Option<Var>, l: Lit) -> Printing / 
 /// An operator over operands held as `x.on`, as C does it: an integer's sum or difference under an
 /// overflow test, its other arithmetic through the runtime but for a literal divisor, a width's
 /// arithmetic wide and narrowed back under the same test, a float's as C's own, a decimal's by the
-/// runtime over its two words, and words compared where they lie. `decimal` makes the `Decimal`
-/// whose two words are its two `Int`s.
+/// runtime over its two words, a 128-bit width's as `wide_printed` says, and words compared where
+/// they lie. `decimal` makes the `Decimal` whose two words are its two `Int`s, and `wide` the
+/// 128-bit width.
 pub fn prim(
   p: Place,
   pr: Printing,
@@ -57,12 +58,15 @@ pub fn prim(
         )
       } else if x.op == b"decimal" {
         bound(p, pr, v, Bytes::concat_all([b"((PlyDec){ ", a, b", ", b, b" })"]))
+      } else if x.op == b"wide" {
+        bound(p, pr, v, Bytes::concat_all([b"((PlyWide){ (Word)(", a, b"), (Word)(", b, b") })"]))
       } else {
         match x.on {
           RInt -> int_printed(p, pr, v, x.op, a, b, count, literal_divisor(x.args.at(1))),
           RBool -> bool_printed(p, pr, v, x.op, a, b),
           RFloat -> float_printed(p, pr, v, x.op, a, b),
           RDec -> dec_printed(p, pr, v, x.op, a, b),
+          RWide(w) -> wide_printed(p, pr, v, x.op, w, a, b, count),
           RNum(w) -> width_printed(p, pr, v, x.op, w, a, b, count),
           RWord -> word_printed(p, pr, v, x.op, a, b),
           RImm -> word_printed(p, pr, v, x.op, a, b),
@@ -231,21 +235,35 @@ fn int_printed(
   // The runtime numbers a type's stated witnesses from 13 past its constructor's tag.
   else if op == b"witness" { bound(p, pr, v, Bytes::concat_all([b"(13 + ", a, b")"])) }
   else if op == b"of_int" {
+    let refused = |w: Width|
+      Bytes::concat_all([
+        b") { rt_not_that_width_p(ctx, ",
+        ascii_of_int(width_index(w)),
+        b", ",
+        a,
+        b"); ",
+        p.leave,
+        b" }",
+      ]);
     match v.rep {
+      // A 128-bit width holds every `Int` but an unsigned one the negative ones, its high word the
+      // sign's.
+      RWide(w) -> {
+        let s = site(p, pr);
+        let guarded = if w.signed { s }
+        else { line(s, p.depth, Bytes::concat_all([b"if (", a, b" < 0", refused(w)])) };
+        bound(
+          p,
+          guarded,
+          v,
+          Bytes::concat_all([b"((PlyWide){ (Word)(", a, b"), (Word)((", a, b") < 0 ? -1 : 0) })"]),
+        )
+      },
       RNum(w) -> {
         let s = site(p, pr);
-        let refused = Bytes::concat_all([
-          b") { rt_not_that_width_p(ctx, ",
-          ascii_of_int(width_index(w)),
-          b", ",
-          a,
-          b"); ",
-          p.leave,
-          b" }",
-        ]);
-        let guarded = if w.bits == 64 && w.signed { s }
-        else if w.bits == 64 { line(s, p.depth, Bytes::concat_all([b"if (", a, b" < 0", refused])) }
-        else {
+        let guarded = if w.bits == 64 && w.signed { s } else if w.bits == 64 {
+          line(s, p.depth, Bytes::concat_all([b"if (", a, b" < 0", refused(w)]))
+        } else {
           line(
             s,
             p.depth,
@@ -258,7 +276,7 @@ fn int_printed(
               a,
               b" > ",
               int_lit(width_max(w)),
-              refused,
+              refused(w),
             ]),
           )
         };
@@ -346,13 +364,8 @@ fn dec_printed(
   b: Bytes,
 ) -> Printing / {abort.raise} = {
   let words = Bytes::concat_all([a, b".lo, ", a, b".hi, ", b, b".lo, ", b, b".hi"]);
-  if op == b"dec_lo" || op == b"dec_hi" {
-    bound(
-      p,
-      pr,
-      v,
-      Bytes::concat_all([b"(int64_t)(", a, if op == b"dec_lo" { b").lo" } else { b").hi" }]),
-    )
+  if op == b"lo" || op == b"hi" {
+    bound(p, pr, v, Bytes::concat_all([b"(int64_t)(", a, b").", op]))
   } else if op == b"scale" {
     bound(p, pr, v, Bytes::concat_all([b"(int64_t)(((uint64_t)(", a, b").lo >> 16) & 0xFF)"]))
   } else if comparison(op) {
@@ -402,6 +415,107 @@ fn dec_printed(
       ]),
     )
   } else { unwritten(p, pr, op) }
+}
+
+/// An operator over a 128-bit width held as its two words: compared, ordered, masked and read in
+/// place; anything else by the runtime over the words (`rt_wide_op`), a shift's or a rotation's
+/// count as the second's low word, a checked operation answering whether the exact answer fits.
+fn wide_printed(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  b: Bytes,
+  count: Bytes,
+) -> Printing / {abort.raise} = {
+  let part = |x: Bytes, half: Bytes| Bytes::concat_all([b"(", x, b").", half]);
+  let pairwise = |c: Bytes|
+    Bytes::concat_all([
+      b"((PlyWide){ ",
+      part(a, b"lo"),
+      b" ",
+      c,
+      b" ",
+      part(b, b"lo"),
+      b", ",
+      part(a, b"hi"),
+      b" ",
+      c,
+      b" ",
+      part(b, b"hi"),
+      b" })",
+    ]);
+  let order = Bytes::concat_all([
+    b"ply_wide_order(",
+    a,
+    b", ",
+    b,
+    b", ",
+    if w.signed { b"1" } else { b"0" },
+    b")",
+  ]);
+  let same = Bytes::concat_all([
+    b"(",
+    part(a, b"lo"),
+    b" == ",
+    part(b, b"lo"),
+    b" && ",
+    part(a, b"hi"),
+    b" == ",
+    part(b, b"hi"),
+    b")",
+  ]);
+  if op == b"lo" || op == b"hi" { bound(p, pr, v, Bytes::concat_all([b"(int64_t)", part(a, op)])) }
+  else if op == b"eq" { bound(p, pr, v, same) }
+  else if op == b"ne" { bound(p, pr, v, b"!".concat(same)) } else if comparison(op) {
+    bound(p, pr, v, Bytes::concat_all([b"(", order, b" ", compare_c(op), b" 0)"]))
+  } else if op == b"order" { bound(p, pr, v, order) }
+  else if is_bitop(op) { bound(p, pr, v, pairwise(bitop_c(op))) } else if op == b"bitnot" {
+    bound(
+      p,
+      pr,
+      v,
+      Bytes::concat_all([b"((PlyWide){ ~", part(a, b"lo"), b", ~", part(a, b"hi"), b" })"]),
+    )
+  } else {
+    let second = if shift(op) || op == b"rotl" || op == b"rotr" {
+      Bytes::concat_all([count, b", 0"])
+    } else if op == b"neg" || op == b"checked_neg" || op == b"to_int" { b"0, 0" }
+    else { Bytes::concat_all([part(b, b"lo"), b", ", part(b, b"hi")]) };
+    let call = |out: Bytes|
+      Bytes::concat_all([
+        b"rt_wide_op_p(ctx, ",
+        ascii_of_int(wide_code(op, w)),
+        b", ",
+        part(a, b"lo"),
+        b", ",
+        part(a, b"hi"),
+        b", ",
+        second,
+        b", (Word)(intptr_t)&",
+        out,
+        b")",
+      ]);
+    if op.starts_with(b"checked_") {
+      let t = temp(pr);
+      bound(
+        p,
+        line(t.pr, p.depth, Bytes::concat_all([b"PlyWide ", t.name, b";"])),
+        v,
+        Bytes::concat_all([b"(", call(t.name), b" != 0)"]),
+      )
+    } else {
+      let n = named(site(p, pr), v);
+      let made = line(
+        n.pr,
+        p.depth,
+        Bytes::concat_all([c_type(v.rep), b" ", n.name, b"; ", call(n.name), b";"]),
+      );
+      if checked(op, RWide(w)) { check(p, made) } else { made }
+    }
+  }
 }
 
 /// Words compared where they lie: a character's as its scalar value, two strings' or byte

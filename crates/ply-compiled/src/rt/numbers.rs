@@ -170,6 +170,136 @@ pub unsafe extern "C" fn rt_wide_binary(ctx: *mut Ctx, op: i64, t: i64, a: i64, 
     }
 }
 
+/// What [`rt_wide_op`] does to a 128-bit width, by its code over two; `emit/c.ply`'s `wide_code`
+/// must match.
+#[derive(Clone, Copy)]
+enum WideOp {
+    /// An operator over the two, a shift's count the second's low word.
+    Binary(BinOp),
+    Negate,
+    /// A builtin over the two, a rotation's count the second's low word, `checked_neg` over the
+    /// first alone.
+    Builtin(Builtin),
+    /// The first as an `Int`, raised where an `Int` does not hold it.
+    ToInt,
+}
+
+const WIDE_OPS: [WideOp; 22] = [
+    WideOp::Binary(BinOp::Add),
+    WideOp::Binary(BinOp::Sub),
+    WideOp::Binary(BinOp::Mul),
+    WideOp::Binary(BinOp::Div),
+    WideOp::Binary(BinOp::Rem),
+    WideOp::Binary(BinOp::Shl),
+    WideOp::Binary(BinOp::Shr),
+    WideOp::Binary(BinOp::Ushr),
+    WideOp::Negate,
+    WideOp::Builtin(Builtin::WrapAdd),
+    WideOp::Builtin(Builtin::WrapSub),
+    WideOp::Builtin(Builtin::WrapMul),
+    WideOp::Builtin(Builtin::SaturatingAdd),
+    WideOp::Builtin(Builtin::SaturatingSub),
+    WideOp::Builtin(Builtin::SaturatingMul),
+    WideOp::Builtin(Builtin::CheckedAdd),
+    WideOp::Builtin(Builtin::CheckedSub),
+    WideOp::Builtin(Builtin::CheckedMul),
+    WideOp::Builtin(Builtin::CheckedNeg),
+    WideOp::Builtin(Builtin::Rotl),
+    WideOp::Builtin(Builtin::Rotr),
+    WideOp::ToInt,
+];
+
+/// Operation `code / 2` of `WIDE_OPS` over the 128-bit widths whose words are `a_lo`, `a_hi` and
+/// `b_lo`, `b_hi`, an `I128` where `code` is odd and a `U128` where it is even: the answer's two
+/// words written at `out`, or an `Int`'s one, raised or failed as the evaluator raises or fails.
+/// Answers 0 for a checked operation's `None`, else 1.
+pub unsafe extern "C" fn rt_wide_op(
+    ctx: *mut Ctx,
+    code: i64,
+    a_lo: i64,
+    a_hi: i64,
+    b_lo: i64,
+    b_hi: i64,
+    out: i64,
+) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let ty = if code & 1 == 1 {
+        ply_core::IntTy::I128
+    } else {
+        ply_core::IntTy::U128
+    };
+    let Some(op) = usize::try_from(code >> 1)
+        .ok()
+        .and_then(|i| WIDE_OPS.get(i).copied())
+    else {
+        return ctx.fail(error(
+            "an operation over 128 bits this runtime has no code for",
+        ));
+    };
+    let wide = |lo: i64, hi: i64| {
+        ply_core::Fixed::new(ty, (u128::from(hi as u64) << 64) | u128::from(lo as u64))
+    };
+    let (x, y, count) = (wide(a_lo, a_hi), wide(b_lo, b_hi), Value::Int(b_lo));
+    let answer = match op {
+        WideOp::Binary(b) => {
+            let r = if matches!(b, BinOp::Shl | BinOp::Shr | BinOp::Ushr) {
+                count
+            } else {
+                Value::Fixed(y)
+            };
+            let d = Span::DUMMY;
+            match ply_core::strict_binary(b, &Value::Fixed(x), &r, d, d, d) {
+                Ok(v) => v,
+                Err(e) if matches!(b, BinOp::Div | BinOp::Rem) && is_zero(&r) => {
+                    return raise_error(ctx, e);
+                }
+                Err(e) => return ctx.fail(e),
+            }
+        }
+        WideOp::Negate => match x.checked_neg() {
+            Some(n) => Value::Fixed(n),
+            None => return ctx.fail(error("negation overflowed its width")),
+        },
+        WideOp::Builtin(b) => {
+            let args = match b {
+                Builtin::CheckedNeg => vec![Value::Fixed(x)],
+                Builtin::Rotl | Builtin::Rotr => vec![Value::Fixed(x), count],
+                _ => vec![Value::Fixed(x), Value::Fixed(y)],
+            };
+            match ply_core::builtins::call(b, args, Span::DUMMY) {
+                Ok(v) => v,
+                Err(e) => return ctx.fail(e),
+            }
+        }
+        WideOp::ToInt => {
+            let b = if ty == ply_core::IntTy::I128 {
+                Builtin::IntOfI128
+            } else {
+                Builtin::IntOfU128
+            };
+            match ply_core::builtins::call(b, vec![Value::Fixed(x)], Span::DUMMY) {
+                Ok(v) => v,
+                Err(e) => return raise_error(ctx, e),
+            }
+        }
+    };
+    let held = match &answer {
+        Value::Ctor { name, args } if name.as_str() == "Some" => args.first().cloned(),
+        Value::Ctor { .. } => return 0,
+        v => Some(v.clone()),
+    };
+    let words = out as *mut i64;
+    match held {
+        Some(Value::Fixed(f)) => unsafe {
+            words.write(f.bits() as u64 as i64);
+            words.add(1).write((f.bits() >> 64) as u64 as i64);
+        },
+        Some(Value::Int(n)) => unsafe { words.write(n) },
+        _ => return ctx.fail(error("an operation over 128 bits answered no width")),
+    }
+    1
+}
+
 /// The object of a 64-bit width, the width at `t` in [`ply_core::INT_TYPES`], holding `bits`.
 pub unsafe extern "C" fn rt_box_fixed(ctx: *mut Ctx, bits: i64, t: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };

@@ -9,20 +9,20 @@ import syntax.patterns (Lit, LInt, LBool, LFloat, LFixed, LWide, LChar, LStr, LB
 import check.types (Type, TyVar, TyCon, TyRecord, TyNominal, Field, named_type, spelled_type)
 import emit.typing (unknown_type)
 import syntax.parsing (Span)
-import emit.c (Width, width_named, lit_int, is_bitop, binary_code)
+import emit.c (Width, width_named, lit_int, is_bitop)
 import emit.reps (Ctors, has_vars, type_vars, compared_by_root, keyed_sum, numeric_sum, nullary_sum,
                   generic_sum, written_sum)
 import emit.answer (Scalar, Exact, literal_bits)
 import emit.keys
 import emit.keys (RootKey, TypeOp, Root, Order, Stated, Reflect, Shown, Digest, Contained)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RSum, RUnit, RImm, Arg, AVar, AInt,
-                 AZero, ABool, AFloat, ANum, AChar, Val, Prim, Literal, Get, Tag, Call, Native, Let,
-                 Decl, Assign, If, Scalars, rep_of_arg, comparison, arithmetic, shift)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RSum, RUnit, RImm, Arg, AVar,
+                 AInt, AZero, ABool, AFloat, ANum, AChar, Val, Prim, Literal, Get, Tag, Call,
+                 Native, Let, Decl, Assign, If, Scalars, rep_of_arg, comparison, arithmetic, shift)
 import emit.lower.setting (declared_at, prelude_ctor)
-import emit.lower.held (held_as, typed_convention)
+import emit.lower.held (held_as, typed_convention, width_held)
 import emit.lower.base (Context, Lowering, Lowered, refuse, fresh, bound, bound_as, opened,
-                        continued, type_of, handed, noted, set_join, joined, short_circuit,
-                        as_words)
+                        pair_words, continued, type_of, handed, noted, set_join, joined,
+                        short_circuit, as_words)
 import emit.lower.data (constructed_as, field)
 import emit.lower.crossing (through_runtime, blake3_of)
 import emit.roots (builtin_helper)
@@ -81,7 +81,7 @@ pub fn unary(cx: Context, o: Lowered, op: Bytes, at: Span) -> Lowered =
         CInt -> alone(cx, o, op, RInt, ty, at),
         CWidth(w) -> if op == b"neg" && w.bits == 64 && !w.signed {
           by_runtime(cx, o.st, helper, [], [o.arg], ty, at)
-        } else { alone(cx, o, op, RNum(w), ty, at) },
+        } else { alone(cx, o, op, width_held(w), ty, at) },
         CFloat -> if op == b"neg" { alone(cx, o, op, RFloat, ty, at) } else { lacking(o.st, op) },
         CDec -> if op == b"neg" { alone(cx, o, op, RDec, ty, at) } else { lacking(o.st, op) },
         CWord(t) -> by_runtime(cx, needing(o.st, t, false), helper, [], [o.arg], ty, at),
@@ -135,7 +135,7 @@ fn classed(
   {
     match c {
       CInt -> over(cx, l, r, op, RInt, answer, at),
-      CWidth(w) -> over(cx, l, r, op, RNum(w), answer, at),
+      CWidth(w) -> over(cx, l, r, op, width_held(w), answer, at),
       CBool -> if eq { over(cx, l, r, op, RBool, truth, at) } else { lacking(r.st, op) },
       CFloat -> if comparison(op) || arithmetic(op) { over(cx, l, r, op, RFloat, answer, at) }
       else { lacking(r.st, op) },
@@ -144,7 +144,7 @@ fn classed(
       CChar -> if comparison(op) { over(cx, l, r, op, RImm, truth, at) } else { lacking(r.st, op) },
       CText -> if eq {
         over(cx, l, r, if op == b"eq" { b"bytes_eq" } else { b"bytes_ne" }, RWord, truth, at)
-      } else { words(cx, l, r, op, ty, at) },
+      } else { lacking(r.st, op) },
       // Two objects, as they cross a call, by the constructor each header names, never opened;
       // otherwise by their constructors' indices.
       CNullary(_) -> if eq {
@@ -315,29 +315,18 @@ pub fn operated(
         width_arithmetic(cx, st, name, args, at)
       } else if name == b"?stated_witness" { witnessed(cx, st, a, at) } else {
         match of_int_width(name) {
-          Some(w) -> if w.bits > 64 {
-            through_runtime(cx, st, name, args, answer_of(cx, name, type_of(a), width_type(w)), at)
-          } else {
+          Some(w) -> {
             let x = handed({ st: st, arg: a }, RInt, at);
             bound(cx, x.st, width_type(w), Prim({ op: b"of_int", on: RInt, args: [x.arg] }), at)
           },
           None -> match int_of_width(name) {
-            Some(w) -> if w.bits > 64 {
-              through_runtime(
-                cx,
-                st,
-                name,
-                args,
-                answer_of(cx, name, type_of(a), named_type(b"Int")),
-                at,
-              )
-            } else {
-              let x = handed({ st: st, arg: a }, RNum(w), at);
+            Some(w) -> {
+              let x = handed({ st: st, arg: a }, width_held(w), at);
               bound(
                 cx,
                 x.st,
                 named_type(b"Int"),
-                Prim({ op: b"to_int", on: RNum(w), args: [x.arg] }),
+                Prim({ op: b"to_int", on: width_held(w), args: [x.arg] }),
                 at,
               )
             },
@@ -375,7 +364,7 @@ fn decimal_converted(
     let d = handed({ st: st, arg: a }, RDec, at);
     bound(cx, d.st, named_type(b"Int"), Prim({ op: b"scale", on: RDec, args: [d.arg] }), at)
   } else {
-    let w = dec_words(st, a, at);
+    let w = pair_words(st, a, RDec, at);
     let bits = bound_as(
       w.st,
       named_type(b"Int"),
@@ -395,26 +384,6 @@ fn decimal_converted(
       at,
     )
   }
-
-/// The two words of `Decimal` `a`, read from the registers that hold it.
-pub fn dec_words(st: Lowering, a: Arg, at: Span) -> { st: Lowering, lo: Arg, hi: Arg } = {
-  let d = handed({ st: st, arg: a }, RDec, at);
-  let lo = bound_as(
-    d.st,
-    named_type(b"Int"),
-    RInt,
-    Prim({ op: b"dec_lo", on: RDec, args: [d.arg] }),
-    at,
-  );
-  let hi = bound_as(
-    lo.st,
-    named_type(b"Int"),
-    RInt,
-    Prim({ op: b"dec_hi", on: RDec, args: [d.arg] }),
-    at,
-  );
-  { st: hi.st, lo: lo.arg, hi: hi.arg }
-}
 
 /// The type builtin `name` answers called on operands of type `ty`: its declared scheme at that
 /// type, or `known` where the setting declares no such builtin.
@@ -452,10 +421,9 @@ fn read_literal(st: Lowering, a: Arg) -> Option<{ st: Lowering, name: Bytes }> =
     _ -> None,
   }
 
-/// Whether `numeric_of_int` at `ty` is a conversion written in place: at `Int`, `Float` or a width a
-/// register holds.
+/// Whether `numeric_of_int` at `ty` is a conversion written in place: at `Int`, `Float` or a width.
 pub fn numeric_in_place(ctors: Ctors, ty: Type) -> Bool =
-  match class_of(ctors, ty) { CInt -> true, CFloat -> true, CWidth(w) -> w.bits <= 64, _ -> false }
+  match class_of(ctors, ty) { CInt -> true, CFloat -> true, CWidth(_) -> true, _ -> false }
 
 /// `numeric_of_int(n)` at `ty`, where `numeric_in_place` holds: `n` itself at `Int`, else `n`
 /// converted as `Float::of_int` or the width's `of_int` converts it.
@@ -512,12 +480,7 @@ fn class_of(ctors: Ctors, ty: Type) -> Class =
           && !keyed_sum(ctors, c.name)
           && !numeric_sum(ctors, ty) { CNullary(ty) }
       else { CSum(ty) }
-    } else {
-      match width_named(c.name) {
-        Some(w) -> if w.bits <= 64 { CWidth(w) } else { CWord(ty) },
-        None -> CWord(ty),
-      }
-    },
+    } else { match width_named(c.name) { Some(w) -> CWidth(w), None -> CWord(ty) } },
     _ -> CWord(ty),
   }
 
@@ -544,12 +507,12 @@ fn over(
   bound(cx, b.st, answer, Prim({ op: op, on: on, args: [a.arg, b.arg] }), at)
 }
 
-/// `l op r` by the runtime over the operands' words: `==` as the evaluator compares two values,
-/// any other operator as it does it. A type variable's operands note what a specialisation reads.
+/// `l == r` or `l != r` by the runtime over the operands' words, as the evaluator compares two
+/// values; any other operator no such type has. A type variable's operands note what a
+/// specialisation reads.
 fn words(cx: Context, l: Lowered, r: Lowered, op: Bytes, ty: Type, at: Span) -> Lowered = {
-  let eq = op == b"eq" || op == b"ne";
-  let st = needing(r.st, ty, eq);
-  if eq {
+  if op != b"eq" && op != b"ne" { lacking(r.st, op) } else {
+    let st = needing(r.st, ty, true);
     let a = handed({ st: st, arg: l.arg }, RWord, at);
     let b = handed({ st: a.st, arg: r.arg }, RWord, at);
     let e = bound(
@@ -564,16 +527,6 @@ fn words(cx: Context, l: Lowered, r: Lowered, op: Bytes, ty: Type, at: Span) -> 
       at,
     );
     if op == b"ne" { negation(cx, e, at) } else { e }
-  } else {
-    by_runtime(
-      cx,
-      st,
-      b"rt_binary_p",
-      [AInt(binary_code(op))],
-      [l.arg, r.arg],
-      if comparison(op) { named_type(b"Bool") } else { ty },
-      at,
-    )
   }
 }
 
@@ -782,7 +735,7 @@ fn sign_at(cx: Context, l: Lowered, r: Lowered, ty: Type, at: Span) -> Lowered /
       CInt -> over(cx, l, r, b"order", RInt, int, at),
       CBool -> over(cx, l, r, b"order", RBool, int, at),
       CChar -> over(cx, l, r, b"order", RImm, int, at),
-      CWidth(w) -> over(cx, l, r, b"order", RNum(w), int, at),
+      CWidth(w) -> over(cx, l, r, b"order", width_held(w), int, at),
       CDec -> over(cx, l, r, b"order", RDec, int, at),
       CText -> over(cx, l, r, b"bytes_order", RWord, int, at),
       CWord(t) -> if t == named_type(b"Unit") { { st: r.st, arg: AInt(0) } } else {
@@ -935,8 +888,8 @@ fn written(cx: Context, st: Lowering, op: TypeOp, ty: Type, a: Arg, at: Span) ->
   )
 
 /// A width's or an `Int`'s wrapping, saturating or checked builtin at the type its operands hold, in C
-/// where a register holds the value, checked only below 64 bits, where the exact answer fits a word;
-/// by the runtime's builtin at any other type.
+/// where a register holds the value, checked below 64 bits, where the exact answer fits a word, and
+/// at 128 bits over the width's two words; by the runtime's builtin at any other type.
 fn width_arithmetic(
   cx: Context,
   st: Lowering,
@@ -951,9 +904,12 @@ fn width_arithmetic(
   let answer = answer_of(cx, name, ty, if checked { TyCon({ name: b"Option", args: [ty] }) }
   else { ty });
   match class_of(cx.setting.ctors, ty) {
-    CWidth(w) -> if wrapping(name) || (saturating(name) && w.bits == 64) {
+    CWidth(w) -> if w.bits > 64 {
+      if checked { checked_wide(cx, st, name, a, b, w, answer, at) }
+      else { over(cx, { st: st, arg: a }, { st: st, arg: b }, name, RWide(w), ty, at) }
+    } else if wrapping(name) || (saturating(name) && w.bits == 64) {
       over(cx, { st: st, arg: a }, { st: st, arg: b }, name, RNum(w), ty, at)
-    } else if w.bits >= 64 { through_runtime(cx, st, name, args, answer, at) }
+    } else if w.bits == 64 { through_runtime(cx, st, name, args, answer, at) }
     else if checked { checked_width(cx, st, name, a, b, w, answer, at) }
     else { over(cx, { st: st, arg: a }, { st: st, arg: b }, name, RNum(w), ty, at) },
     // An `Int` wraps and saturates as the 64-bit signed width its register holds.
@@ -1022,7 +978,52 @@ fn checked_width(
     Prim({ op: b"narrow", on: rep_of_arg(exact.arg), args: [exact.arg] }),
     at,
   );
-  let some = constructed_as(cx, narrowed.st, prelude_ctor(b"Some"), [narrowed.arg], option, at);
+  some_where(cx, fits, narrowed, option, at)
+}
+
+/// A 128-bit width's checked arithmetic, answering an `Option` of type `option`: whether the exact
+/// answer fits, as the runtime finds it over the two words, and `Some` of the wrapped answer there,
+/// which is the exact one.
+fn checked_wide(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  a: Arg,
+  b: Arg,
+  w: Width,
+  option: Type,
+  at: Span,
+) -> Lowered = {
+  let neg = name == b"checked_neg";
+  let x = handed({ st: st, arg: a }, RWide(w), at);
+  let y = if neg { x } else { handed({ st: x.st, arg: b }, RWide(w), at) };
+  let fits = bound(
+    cx,
+    y.st,
+    named_type(b"Bool"),
+    Prim({ op: name, on: RWide(w), args: if neg { [x.arg] } else { [x.arg, y.arg] } }),
+    at,
+  );
+  let wrapped = bound(
+    cx,
+    opened(fits.st),
+    width_type(w),
+    Prim({
+      op: if neg || name == b"checked_sub" { b"wrap_sub" }
+      else if name == b"checked_add" { b"wrap_add" }
+      else { b"wrap_mul" },
+      on: RWide(w),
+      args: if neg { [AZero(RWide(w)), x.arg] } else { [x.arg, y.arg] },
+    }),
+    at,
+  );
+  some_where(cx, fits, wrapped, option, at)
+}
+
+/// `Some(value)` of type `option` where `fits` holds and `None` where it does not, `value` lowered
+/// in a block of its own after `fits`.
+fn some_where(cx: Context, fits: Lowered, value: Lowered, option: Type, at: Span) -> Lowered = {
+  let some = constructed_as(cx, value.st, prelude_ctor(b"Some"), [value.arg], option, at);
   let none = constructed_as(
     cx,
     continued(opened(fits.st), some.st),
