@@ -226,17 +226,29 @@ fn column_at(
     },
   }
 
-/// A list literal of `items`, each a word the list takes, of the type the checker filed for it.
+/// A list literal of `items`, each held as the item's type holds it and taken by the list, which
+/// lays it as that type lays it, of the type the checker filed for it.
 pub fn listed(cx: Context, st: Lowering, items: List<Arg>, at: Span) -> Lowered / {abort.raise} =
   match filed(cx, at) {
     None -> unfiled(cx, st, b"a list", at),
     Some(t) -> {
-      let words = as_words(st, items, at);
+      let item = match t.ty { TyCon(c) -> c.args.at(0), _ -> None };
+      let held = items.fold(
+        { st: match item { Some(i) -> layout_needed(st, i), None -> st }, args: [] },
+        |acc: { st: Lowering, args: List<Arg> }, a: Arg| {
+          let h = handed(
+            { st: acc.st, arg: a },
+            match item { Some(i) -> held_as(cx.setting, i), None -> RWord },
+            at,
+          );
+          { st: h.st, args: acc.args.push(h.arg) }
+        },
+      );
       bound_as(
-        words.st,
+        held.st,
         t.ty,
         held_as(cx.setting, t.ty),
-        Make({ made: MList(items.len()), args: words.args, reuse: None }),
+        Make({ made: MList(items.len()), args: held.args, reuse: None }),
         at,
       )
     },
@@ -245,19 +257,15 @@ pub fn listed(cx: Context, st: Lowering, items: List<Arg>, at: Span) -> Lowered 
 /// Item `i` of the list `xs`, which a length test admitted, as a value of `item` is held: borrowed
 /// from the list, a scalar read out of its word.
 pub fn item_read(cx: Context, st: Lowering, xs: Arg, i: Arg, item: Type) -> Lowered =
-  handed(
-    bound_as(
-      st,
-      item,
-      item_rep(cx, item),
-      Op({
-        op: OContainer(ItemAt),
-        args: [xs, i],
-        uses: { takes: [false, false], owned: false, fails: false, stops: false },
-      }),
-      dummy_span(),
-    ),
+  bound_as(
+    layout_needed(st, item),
+    item,
     held_as(cx.setting, item),
+    Op({
+      op: OContainer(ItemAt),
+      args: [xs, i],
+      uses: { takes: [false, false], owned: false, fails: false, stops: false },
+    }),
     dummy_span(),
   )
 
@@ -324,7 +332,12 @@ fn contained(
   } else if name == b"List::with_capacity" && args.len() == 1 {
     match ((f.ret, args)) {
       (Some(ret), [n]) -> {
-        let count = handed({ st: st, arg: n }, RInt, at);
+        // The room is its items' words, which the item's layout says.
+        let laid_st = match ret {
+          TyCon(c) -> match c.args.at(0) { Some(item) -> layout_needed(st, item), None -> st },
+          _ -> st,
+        };
+        let count = handed({ st: laid_st, arg: n }, RInt, at);
         bound_as(
           count.st,
           ret,
@@ -561,9 +574,10 @@ type Laying = { operands: List<Operand>, answer: Answer, owned: Bool }
 /// Extern `op` called on `args`, answering a value of `ty`, written over the runtime's objects.
 fn laid(cx: Context, st: Lowering, op: Intrinsic, args: List<Arg>, ty: Type, at: Span) -> Lowered = {
   let l = laying(op);
+  let items = laid_items(op);
   let answer = match l.answer {
     Plain(r) -> Some(r),
-    Item -> Some(item_rep(cx, ty)),
+    Item -> Some(held_as(cx.setting, ty)),
     Fields -> match fields_held(cx, ty) { Some(ls) -> Some(RFlat(ls)), None -> None },
   };
   match answer {
@@ -571,7 +585,7 @@ fn laid(cx: Context, st: Lowering, op: Intrinsic, args: List<Arg>, ty: Type, at:
     Some(rep) -> if l.operands.len() != args.len() {
       refuse(st, Containers, b"an extern written in place on other operands than it takes")
     } else if (match l.answer {
-          // An item is its word form, which `handed` reads as its type holds it.
+          // An item is laid as its type lays it, and read as its type holds it.
           Item -> false,
           _ -> is_option(ty) && !pointer_option(cx, ty),
         })
@@ -585,8 +599,21 @@ fn laid(cx: Context, st: Lowering, op: Intrinsic, args: List<Arg>, ty: Type, at:
             })) {
       refuse(st, Containers, b"an extern written in place over an Option of other than one pointer")
     } else {
+      // An item lies in its node as its type lays it, which a specialisation reads: a list's
+      // item, or a map's key and value, whose words a pair and a greatest key take.
+      let object = match args.at(0) { Some(a) -> type_of(a), None -> ty };
+      let laid_types = match op {
+        OfList(_) -> if items.read { [ty] } else if items.at.len() > 0 || op == OfList(Spill) {
+          match object { TyCon(c) -> c.args.take(1), _ -> [] }
+        } else { [] },
+        OfMap(_) -> match object {
+          TyCon(c) -> if c.name == b"Map" { [] } else { c.args },
+          _ -> [],
+        },
+      };
+      let laid_st = laid_types.fold(st, |s: Lowering, t: Type| layout_needed(s, t));
       let handed_over = range(0, args.len()).fold(
-        { st: st, args: [] },
+        { st: laid_st, args: [] },
         |acc: { st: Lowering, args: List<Arg> }, i: Int|
           match args.at(i) {
             None -> acc,
@@ -596,7 +623,7 @@ fn laid(cx: Context, st: Lowering, op: Intrinsic, args: List<Arg>, ty: Type, at:
                 match l.operands.at(i) {
                   Some(Index) -> RInt,
                   Some(TakenMaybe) -> RWord,
-                  _ -> RWord,
+                  _ -> if items.at.contains(i) { held_as(cx.setting, type_of(a)) } else { RWord },
                 },
                 at,
               );
@@ -646,16 +673,27 @@ fn fields_held(cx: Context, ty: Type) -> Option<List<Leaf>> = {
   if ls.len() == 0 { None } else { Some(ls) }
 }
 
-/// An item read out of an object as the scalar its type holds, or else as the word it is there.
-fn item_rep(cx: Context, ty: Type) -> Rep =
-  match held_as(cx.setting, ty) {
-    RInt -> RInt,
-    RBool -> RBool,
-    RFloat -> RFloat,
-    RDec -> RDec,
-    RWide(w) -> RWide(w),
-    RNum(w) -> RNum(w),
-    _ -> RWord,
+/// Whether an extern written in place reads an item out, and which operands are items it writes: an
+/// item, a list's or a map's key or value, lies in its node as its type lays it, held as its type
+/// holds it.
+type LaidItems = { read: Bool, at: List<Int> }
+
+fn laid_items(op: Intrinsic) -> LaidItems =
+  match op {
+    OfList(TailAt) -> { read: true, at: [] },
+    OfList(LeafAt) -> { read: true, at: [] },
+    OfList(TailPush) -> { read: false, at: [1] },
+    OfList(TailStart) -> { read: false, at: [1] },
+    OfList(TailSet) -> { read: false, at: [2] },
+    OfList(LeafSet) -> { read: false, at: [2] },
+    OfMap(NodeKey) -> { read: true, at: [] },
+    OfMap(NodeValue) -> { read: true, at: [] },
+    OfMap(KidMax) -> { read: true, at: [] },
+    OfMap(PairPut) -> { read: false, at: [2, 3] },
+    OfMap(PairSet) -> { read: false, at: [2, 3] },
+    OfMap(KidBack) -> { read: false, at: [3] },
+    OfMap(KidPut) -> { read: false, at: [3] },
+    _ -> { read: false, at: [] },
   }
 
 /// How each extern written in place takes its operands and answers.
