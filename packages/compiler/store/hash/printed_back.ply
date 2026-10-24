@@ -12,7 +12,7 @@ import std.list
 import std.option
 import std.bytes
 import std.string
-import store.hash (indexed, hash_index)
+import store.hash (indexed, hash_index, checked_body)
 import store.hash.forms (HashOutput, by_name)
 import store.hash.printed (Printed, Unprintable, print_bodies, stored_forms)
 import store.hash.stored (Stored)
@@ -56,10 +56,22 @@ fn constructors(v: Value, seen: Map<Bytes, Bool>) -> Map<Bytes, Bool> =
     _ -> seen,
   }
 
-type Printing = { out: HashOutput, again: HashOutput }
+type Printing = { out: HashOutput, again: HashOutput, texts: List<{ module: Bytes, text: Bytes }> }
+
+/// `sources` hashed, each call on a value read as a check that found nothing of it reads it, which
+/// a print needs.
+fn hashed(sources: List<Source>) -> HashOutput / {abort.raise} = {
+  let out = hash_index(indexed(sources));
+  {
+    ..out,
+    bodies: out.bodies.map(|b: { name: Bytes, body: Bytes }| { ..b, body: checked_body(b.body, Map::new()) }),
+    test_bodies: out.test_bodies.fold(Map::new(), |acc: Map<Bytes, Bytes>, key: Bytes, body: Bytes|
+      acc.insert(key, checked_body(body, Map::new()))),
+  }
+}
 
 fn round_trip(sources: List<Source>) -> Printing / {abort.raise} = {
-  let out = hash_index(indexed(sources));
+  let out = hashed(sources);
   let names = out.defs.concat(out.decls).map(|x: { name: Bytes, hash: Bytes }|
     { name: x.name, hash: x.hash, public: true });
   match print_bodies(
@@ -74,6 +86,7 @@ fn round_trip(sources: List<Source>) -> Printing / {abort.raise} = {
       {
         out: out,
         again: hash_index(indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text }))),
+        texts: ms,
       },
   }
 }
@@ -84,12 +97,23 @@ test "every definition and test of the examples prints back to what it was store
   let after = by_name(p.again.defs.concat(p.again.decls));
   let moved = before.fold([], |acc: List<Bytes>, name: Bytes, hash: Bytes|
     if after.get(name) == Some(hash) { acc } else { acc.push(name) });
-  assert(moved.len() == 0, Some(String::of_bytes_lossy(Bytes::join(moved, b", "))));
+  // What moved, and the text its module printed as, which is where to look.
+  let printed = |name: Bytes|
+    p.texts.fold(b"", |acc: Bytes, m: { module: Bytes, text: Bytes }|
+      if name.starts_with(m.module.concat(b".")) { m.text } else { acc });
+  assert(
+    moved.len() == 0,
+    Some(
+      String::of_bytes_lossy(
+        Bytes::concat_all([Bytes::join(moved, b", "), b" moved; printed as:\n", printed(moved.at(0).unwrap_or(b""))]),
+      ),
+    ),
+  );
   assert_eq(p.again.tests.values().sort(), p.out.tests.values().sort())
 }
 
 test "the examples hold every variant a printed stored form can" {
-  let out = hash_index(indexed(examples()));
+  let out = hashed(examples());
   let seen = out.bodies.map(|b: { name: Bytes, body: Bytes }| b.body).concat(out.test_bodies.values()).fold(
     Map::new(),
     |acc: Map<Bytes, Bool>, body: Bytes|
