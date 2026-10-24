@@ -570,15 +570,16 @@ fn a_unit_stating_a_function_of_more_than_the_value_is_refused() {
     assert!(refused.contains("`m.scaled`"), "{refused}");
 }
 
-/// `m.double`, compiled and opened as a program's unit.
+/// `m.double`, compiled and opened as a program's unit entered through `m.double#entered`.
 fn doubling(dir: &std::path::Path) -> Option<(ply_core::Analysis, std::path::PathBuf)> {
-    let defs = [def(
-        "m.double",
-        1,
-        "  return ply_imm(ply_imm_value(p0) * 2);",
-    )];
-    let lib = units::library(dir, &units::text(&defs, &units::exports_of(&defs)))?;
-    Some((units::front(b"doubling", &defs, &[]), lib))
+    let defs = [
+        def("m.double", 1, "  return ply_imm(ply_imm_value(p0) * 2);"),
+        def("m.double#entered", 0, &units::int_entry("m.double")),
+    ];
+    let mut exports = units::exports_of(&defs);
+    exports.entered = vec!["m.double".to_string()];
+    let lib = units::library(dir, &units::text(&defs, &exports))?;
+    Some((units::front(b"doubling", &defs[..1], &[]), lib))
 }
 
 /// The unit is loaded once to read what it holds, and every backend over it answers alike.
@@ -590,7 +591,7 @@ fn every_backend_over_a_unit_answers_what_it_holds() {
         return;
     };
     let unit = ply_compiled::Unit::opened(&front, &lib).expect("the unit opens");
-    assert_eq!(unit.compiled(), ["m.double"]);
+    assert_eq!(unit.compiled(), ["m.double", "m.double#entered"]);
     let first = std::sync::Arc::clone(&unit).attach();
     let second = std::sync::Arc::clone(&unit).attach();
     assert_eq!(unit.compilation().units, 2);

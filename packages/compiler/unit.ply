@@ -1521,6 +1521,8 @@ type Program = {
   declared: Map<Bytes, Bytes>,
   /// Each module's text digested, by its name, taken once however many roots it writes.
   digests: Map<Bytes, Bytes>,
+  /// The functions the program's types state, each printed with the entry the runtime calls it by.
+  stated: Map<Bytes, Bool>,
 }
 
 fn program_of(dump: Dump, sources: List<Bytes>) -> Program / {abort.raise} = {
@@ -1580,8 +1582,17 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program / {abort.raise} = {
     },
     digests: dump.modules.fold(Map::new(), |acc: Map<Bytes, Bytes>, m: ModuleRow|
       match sources.at(m.index) { Some(t) -> acc.insert(m.name, blake3(t)), None -> acc }),
+    stated: stated_fns(dump),
   }
 }
+
+/// The functions the program's types state: each `key`, `show` and `numeric` function.
+fn stated_fns(dump: Dump) -> Map<Bytes, Bool> =
+  dump.emitter_ctors.fold(Map::new(), |acc: Map<Bytes, Bool>, c: EmitterCtor|
+    [c.key, c.show].fold(
+      c.numeric.fold(acc, |m: Map<Bytes, Bool>, f: Bytes| m.insert(f, true)),
+      |m: Map<Bytes, Bool>, f: Option<Bytes>| match f { Some(n) -> m.insert(n, true), None -> m },
+    ))
 
 fn text_at(program: Program, index: Int) -> Option<Bytes> = program.sources.at(index)
 
@@ -1624,6 +1635,11 @@ fn root_material(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> / 
     },
     Stored(s) -> match definition_material(program, root_name(s)) {
       Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
+      None -> None,
+    },
+    // A definition a type states is printed with an entry the others lack.
+    Named(n) -> match definition_material(program, root_name(k)) {
+      Some(m) -> Some(if program.stated.contains(n) { m.concat(b"\x00stated") } else { m }),
       None -> None,
     },
     _ -> definition_material(program, root_name(k)),
@@ -1863,16 +1879,12 @@ fn answers_kept<| e>(
 /// The program's constructors as the emitter reads them, the unit's table `ctors` laid out as the
 /// dump says, with each sum's cases and the constructors whose module states a `key` or arithmetic.
 fn program_ctors(dump: Dump, ctors: List<Ctor>) -> Ctors =
-  with_sums_laid(
-    ctors_of(
-      ctors.map(|c: Ctor| c.name),
-      // Program-wide: a specialisation is emitted where its definition is, which may not import
-      // the module stating a `key` for the type it is at.
-      dump.emitter_ctors.filter(|c: EmitterCtor| c.key != None).map(|c: EmitterCtor| c.name),
-      dump.emitter_ctors.filter(|c: EmitterCtor| c.numeric.len() > 0).map(|c: EmitterCtor| c.name),
-      ctor_sums(dump.ctors),
-    ),
-  )
+  with_sums_laid({
+    ..ctors_of(ctors.map(|c: Ctor| c.name), dump.emitter_ctors.filter(|c: EmitterCtor| c.key != None).map(|c: EmitterCtor| c.name), dump.emitter_ctors.filter(|c: EmitterCtor| c.numeric.len() > 0).map(|c: EmitterCtor| c.name), ctor_sums(dump.ctors)),
+    // Program-wide: a specialisation is emitted where its definition is, which may not import
+    // the module stating a `key` for the type it is at.
+    stated: stated_fns(dump),
+  })
 
 /// The emitter's scope over every module of `p`, each whole, reading what the check filed of the
 /// bodies `roots` reads (`emit.scope_of`): built once, when a walk first asks the emitter for a
@@ -4928,6 +4940,39 @@ test "a generic definition's clause is entered at the specialisation it is judge
   }
 }
 
+test "a definition a type states keeps the entry by words the runtime calls it through, and one taking a parameter has none" {
+  let user = [
+    {
+      name: b"m",
+      src: Bytes::concat_all([
+        b"pub type Box = | Box(Int)\n",
+        b"pub fn size(b: Box) -> Int = match b { Box(n) -> n }\n",
+        b"key for Box by size\n",
+        b"pub fn grown(b: Box, by: Int) -> Box = match b { Box(n) -> Box(n + by) }\n",
+      ]),
+    },
+  ];
+  let dump = dump_of(analyse(parse_all(user)));
+  match emitted(
+      a_runtime(b"r"),
+      dump,
+      sources_placed(dump, user),
+      Map::new(),
+      offered_roots(dump).keys,
+      |_: Bytes| None,
+      |_: List<Record>| (),
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(e) -> {
+      let entry = |n: Bytes| entry_of(n).concat(b"(PlyCtx *ctx, const Word *args) {");
+      assert_eq(
+        [b"m.size", b"m.grown"].map(|n: Bytes| e.produced.text.index_of(entry(n)) != None),
+        [true, false],
+      )
+    },
+  }
+}
+
 test "a generic definition's entry is taken, its call settled where the entry judges it" {
   let user = [
     {
@@ -5374,12 +5419,14 @@ test "a run keeps only what it was answered anew, however much the store holds" 
     let next = kept_over(first.tree, user);
     { asked: next.value.asked, wrote: store_bytes(next.tree) - store_bytes(first.tree) }
   };
-  // A definition more is a root more and the keys it calls; nothing kept before is written again.
+  // A definition more is a root more and the keys it calls; nothing kept before is written again, so
+  // each definition more writes what the one before it did.
   let one = grown(b"fn aside() -> Int = 7\n");
+  let two = grown(b"fn aside() -> Int = 7\nfn beside() -> Int = 8\n");
   let three = grown(b"fn aside() -> Int = 7\nfn beside() -> Int = 8\nfn below() -> Int = 9\n");
-  assert(one.asked > 0 && three.asked > one.asked, None);
+  assert(one.asked > 0 && two.asked > one.asked && three.asked > two.asked, None);
   assert(one.wrote > 0 && one.wrote * 2 < store_bytes(first.tree), None);
-  assert(three.wrote <= one.wrote * three.asked / one.asked + 400, None)
+  assert(three.wrote - two.wrote <= two.wrote - one.wrote + 400, None)
 }
 
 test "a run passes over a store's segment it cannot read and asks for those roots again" {

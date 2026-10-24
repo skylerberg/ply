@@ -23,6 +23,32 @@ pub fn def(name: &'static str, arity: usize, body: &str) -> Def {
     }
 }
 
+/// The C pointer a unit calls the native the compiler declares as `name` through.
+pub fn native(name: &str) -> String {
+    ply_compiled::c::pointer_name(&ply_compiled::c::builtin_helper_name(name))
+}
+
+/// The C that opens an `R#entered`: the arguments' list read, `read` reading each, and the
+/// lifting ended, returning where the context failed.
+pub fn lifting(read: &str) -> String {
+    format!(
+        "  {}(ctx, {});\n{read}\n  {}(ctx);\n  if (ctx->failed) return 0;\n",
+        native("?in_count"),
+        ply_core::codec::tag::LIST,
+        native("?lift_close"),
+    )
+}
+
+/// The C of an `R#entered` that reads one `Int`, calls `root` over it and writes the `Int` it answers.
+pub fn int_entry(root: &str) -> String {
+    format!(
+        "{}  Word r = {}(ctx, ply_imm(n));\n  if (ctx->failed) return 0;\n  {}(ctx, ply_imm_value(r));\n  return 0;",
+        lifting(&format!("  Word n = {}(ctx);", native("?in_int"))),
+        symbol(root),
+        native("?out_int"),
+    )
+}
+
 /// The C function `name`'s body is written as.
 pub fn symbol(name: &str) -> String {
     format!("ply_t_{}", name.replace(['.', '#'], "_"))

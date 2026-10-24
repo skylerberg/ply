@@ -3,92 +3,27 @@
 use crate::rt::Entry;
 use crate::source::Source;
 use anyhow::{Result, bail};
-use ply_core::{
-    Carry, Compilation, Counters, CtorCarries, DefHash, Diagnostic, Entered, Provider, Symbol,
-    Value,
-};
-use std::borrow::Cow;
+use ply_core::{Compilation, Counters, DefHash, Diagnostic, Entered, Provider, Symbol, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-/// The widest arity this boundary carries without allocating an argument array.
-const MAX_ARITY: usize = 16;
-
-/// One admitted definition: what an entry calls (its own code, or in an encoded unit its
-/// `R#entered`), how many arguments it takes, what may answer an entry instead of running it, and
-/// how its arguments and answer read.
+/// One admitted definition: its `R#entered`, which the runtime enters it through, how many
+/// arguments the definition takes, and what may answer an entry instead of running it.
 struct Admitted {
     entry: Entry,
     arity: usize,
     memo: Memo,
-    params: Vec<Carry>,
-    answer: Carry,
-    witnesses: Vec<usize>,
-}
-
-impl Admitted {
-    /// How this entry's answer reads: its type, each variable bound by what the arguments show of
-    /// it. What no argument shows stays open, since only a value of that type could show it, except
-    /// a witnessed variable, which [`Admitted::entered_with`] passed as `Int`.
-    fn reading(&self, args: &[Value], ctors: &CtorCarries) -> Cow<'_, Carry> {
-        if !self.answer.mentions_var() {
-            return Cow::Borrowed(&self.answer);
-        }
-        let mut vars = Vec::new();
-        for (param, arg) in self.written().iter().zip(args) {
-            param.bind(arg, &mut vars, ctors);
-        }
-        for &var in &self.witnesses {
-            if vars.len() <= var {
-                vars.resize(var + 1, Carry::Open);
-            }
-            if vars[var] == Carry::Open {
-                vars[var] = Carry::Plain;
-            }
-        }
-        Cow::Owned(self.answer.instantiate(&vars))
-    }
-
-    /// The parameters a caller from outside passes: those after the witnesses.
-    fn written(&self) -> &[Carry] {
-        self.params.get(self.witnesses.len()..).unwrap_or(&[])
-    }
-
-    /// `args` behind the witness of each variable it is entered with: the type the arguments show
-    /// for it, or `Int`'s when none does.
-    fn entered_with<'a>(&self, args: &'a [Value], ctors: &CtorCarries) -> Cow<'a, [Value]> {
-        if self.witnesses.is_empty() {
-            return Cow::Borrowed(args);
-        }
-        let shown = |var: usize| {
-            self.written()
-                .iter()
-                .zip(args)
-                .find_map(|(param, arg)| param.value_at(var, arg, ctors))
-                .map_or(
-                    ply_core::builtins::INT_WITNESS,
-                    ply_core::builtins::witness_of,
-                )
-        };
-        Cow::Owned(
-            self.witnesses
-                .iter()
-                .map(|&var| Value::Int(shown(var)))
-                .chain(args.iter().cloned())
-                .collect(),
-        )
-    }
 }
 
 /// Decided once, from the purity the compiler published: an impure root has no memo to consult.
 #[derive(Clone, Copy)]
 enum Memo {
     Never,
-    /// A pure root of no arguments, and its memo slot.
-    Constant(usize),
+    /// A pure root of no arguments.
+    Constant,
     /// A pure root, whose entries over memo words alone are remembered.
     Calls,
 }
@@ -105,14 +40,11 @@ pub struct Declines {
 
     /// The answer held a closure or a secret, which cannot cross out; a handle raises `E0449`.
     pub answer: u64,
-    /// The answer held an `Int` word where neither its type nor the arguments say whether it is
-    /// an `Int` or a width, or one that is no value of the width its type says.
-    pub unread: u64,
 }
 
 impl Declines {
     pub fn total(&self) -> u64 {
-        self.not_compiled + self.arity + self.reentered + self.answer + self.unread
+        self.not_compiled + self.arity + self.reentered + self.answer
     }
 }
 
@@ -182,10 +114,8 @@ impl Unit {
             Code::Linked => source.row(name).is_some(),
             Code::Opened(_) => true,
         };
-        let entered = native.entered_names();
-        let members: BTreeSet<Symbol> = (compiled.iter().chain(entered.iter()))
+        let members: BTreeSet<Symbol> = (native.entered_names().iter())
             .filter(offered)
-            .filter(|name| native.enterable(name))
             .map(Symbol::new)
             .collect();
         let unit = Unit {
@@ -338,17 +268,14 @@ pub struct Bodies {
     declines: Cell<Declines>,
     /// `run` clears it first, so an entry no body ran for reports none of the one before it.
     last: RefCell<LastEntry>,
-    /// Whether the unit is entered through its roots' `R#entered`, its arguments and answers
-    /// crossing encoded.
-    encoded: bool,
-    /// What an encoded unit's pure roots answered.
+    /// What the unit's pure roots answered.
     kept: RefCell<Kept>,
     /// Kept alive because every [`Entry`] above points into its executable pages. Last, so the
     /// context and the memo, which may hold a word of its static data, go before it is unmapped.
     _code: crate::c::Native,
 }
 
-/// What an encoded unit's pure roots answered, as values, each under its root and its arguments'
+/// What a unit's pure roots answered, as values, each under its root and its arguments'
 /// encoding; and the identity of each answer and of its direct parts, by which an argument the
 /// memo answered is known.
 #[derive(Default)]
@@ -388,58 +315,29 @@ impl Bodies {
             );
         }
         let mut admitted = HashMap::new();
-        let encoded = code.encoded();
         for name in &unit.members {
-            let entry = if encoded {
-                code.entered(name.as_str())
-            } else {
-                code.entry(name.as_str())
-            };
-            let Some(entry) = entry else {
+            let Some(entry) = code.entered(name.as_str()) else {
                 bail!("`{name}` was admitted and cannot be entered");
             };
             // An entry lifts each parameter the root states, whatever the root it calls takes; a
             // stored root, which states none, takes nothing.
-            let row = unit.source.row(name.as_str());
-            let arity = match row {
-                Some(r) if encoded => Some(r.params.len()),
-                _ => code.arity(name.as_str()),
+            let arity = match unit.source.row(name.as_str()) {
+                Some(r) => Some(r.params.len()),
+                None => code.arity(name.as_str()),
             };
             let Some(arity) = arity else {
                 bail!("`{name}` was compiled without an arity");
             };
-            if !encoded && arity > MAX_ARITY {
-                bail!(
-                    "`{name}` takes {arity} arguments and this boundary carries {MAX_ARITY}; \
-                     refusing the registration rather than leaving one name that declines \
-                     every call and no reason recorded against it"
-                );
-            }
             // An embedded unit's slots were chosen when it was built; this program's purity decides.
             let memo = match (
                 unit.source.pure(name.as_str()),
                 code.constant_index(name.as_str()),
             ) {
                 (false, _) => Memo::Never,
-                (true, Some(slot)) => Memo::Constant(slot),
+                (true, Some(_)) => Memo::Constant,
                 (true, None) => Memo::Calls,
             };
-            // An entry calls a specialisation, so it is handed no witness.
-            let witnesses = match row {
-                Some(r) if !encoded => r.witnesses.clone(),
-                _ => Vec::new(),
-            };
-            admitted.insert(
-                name.clone(),
-                Admitted {
-                    entry,
-                    arity,
-                    memo,
-                    params: row.map_or_else(Vec::new, |r| r.params.clone()),
-                    answer: row.map_or(Carry::Open, |r| r.answer.clone()),
-                    witnesses,
-                },
-            );
+            admitted.insert(name.clone(), Admitted { entry, arity, memo });
         }
         let mut ctx = code.context();
         ctx.program = Some(Arc::clone(&unit.source.front));
@@ -452,7 +350,6 @@ impl Bodies {
             entered: Cell::new(0),
             declines: Cell::new(Declines::default()),
             last: RefCell::new(LastEntry::default()),
-            encoded,
             kept: RefCell::default(),
         })
     }
@@ -495,121 +392,23 @@ impl Bodies {
         let Some(admitted) = self.admitted.get(name) else {
             return self.decline(|d| d.not_compiled += 1);
         };
-        if admitted.arity != admitted.witnesses.len() + args.len() {
+        if admitted.arity != args.len() {
             return self.decline(|d| d.arity += 1);
         }
         let Ok(mut ctx) = self.ctx.try_borrow_mut() else {
             return self.decline(|d| d.reentered += 1);
         };
-        let filled = admitted.entered_with(args, &self.unit.source.front.ctor_carries);
-        if self.encoded {
-            return self.run_encoded(name, admitted, &mut ctx, &filled, fuel);
-        }
-
-        let tables = std::sync::Arc::clone(&ctx.tables);
-        if let Memo::Constant(index) = admitted.memo
-            && let Some(kept) = tables.memoized(index)
-            && let Some(value) = tables.memo_value(kept)
-        {
-            drop(ctx);
-            self.unit.counters.note_converted(0, 0);
-            self.entered.set(self.entered.get() + 1);
-            return EntryOutcome::Answered(value);
-        }
-        let calls = i64::try_from(fuel).unwrap_or(i64::MAX);
-        ctx.begin(calls);
-        // Values are deep-converted in and out: nothing outside the entry ever holds a word.
-        let mut handles = [0i64; MAX_ARITY];
-        let before = ctx.heap.allocated();
-        // A call whose arguments are all memoized words is itself memoized.
-        let mut all_memo = matches!(admitted.memo, Memo::Calls) && !filled.is_empty();
-        for (slot, value) in handles.iter_mut().zip(filled.iter()) {
-            *slot = match tables.memo_word(value) {
-                Some(w) => w,
-                None => {
-                    all_memo = false;
-                    ctx.heap.to_word(&tables.layouts, value)
-                }
-            };
-        }
-        let words = &handles[..filled.len()];
-        if all_memo && let Some(value) = tables.memo_call(name, words) {
-            ctx.end();
-            drop(ctx);
-            self.unit.counters.note_converted(0, 0);
-            self.entered.set(self.entered.get() + 1);
-            return EntryOutcome::Answered(value);
-        }
-        let inward = (ctx.heap.allocated() - before) as u64;
-        let entering = &mut *ctx as *mut crate::rt::Ctx;
-        // SAFETY: `self._code` owns the entry's pages, `ctx` is uniquely borrowed, and
-        // `handles` is `MAX_ARITY` wide, which `Bodies::new` refused to exceed.
-        let out = crate::rt::on_known_stack(entering, || unsafe {
-            (admitted.entry)(entering, handles.as_ptr())
-        });
-        let out = self.returned(&mut ctx, Some(out));
-        if ctx.failed != 0 {
-            return self.failure(&mut ctx, fuel);
-        }
-        debug_assert_eq!(
-            ctx.fuel, calls,
-            "`{name}` returned without every call it made given back, or with more"
-        );
-
-        // Memoize the word and its converted value, so later entries skip both run and conversion.
-        let mut walked = crate::heap::Walked::default();
-        let ctors = &self.unit.source.front.ctor_carries;
-        let value = crate::heap::Heap::read(
-            &tables.layouts,
-            out,
-            &admitted.reading(args, ctors),
-            ctors,
-            &mut walked,
-        );
-        let kept = match admitted.memo {
-            Memo::Constant(index) if crate::heap::world_independent(out) => {
-                Some(tables.memoize(index, out))
-            }
-            Memo::Calls if all_memo && crate::heap::world_independent(out) => {
-                tables.memoize_call(name, words, out)
-            }
-            _ => None,
-        };
-        ctx.end();
-        drop(ctx);
-        // Covers every handle `escape` refuses; a closure or secret that holds none declines.
-        if walked.handle {
-            return self.holding_a_handle(name, &value);
-        }
-        if walked.unread {
-            return self.decline(|d| d.unread += 1);
-        }
-        if let Some(kept) = kept {
-            tables.remember(kept, &value);
-        }
-        self.unit.counters.note_converted(inward, walked.read);
-        self.entered.set(self.entered.get() + 1);
-        EntryOutcome::Answered(value)
-    }
-
-    /// [`Bodies::run`] of an encoded unit: the arguments cross in as one encoded list, which the
-    /// root's `R#entered` reads before it calls the root and writes the answer's encoding, and the
-    /// memo keeps values under the arguments' encoding.
-    fn run_encoded(
-        &self,
-        name: &Symbol,
-        admitted: &Admitted,
-        ctx: &mut crate::rt::Ctx,
-        filled: &[Value],
-        fuel: usize,
-    ) -> EntryOutcome {
-        let (bytes, held) = crate::rt::encoded(&Value::list(filled.to_vec()));
+        let ctx = &mut *ctx;
+        // The arguments cross in as one encoded list, which the root's `R#entered` reads before it
+        // calls the root and writes the answer's encoding, and the memo keeps values under the
+        // arguments' encoding.
+        let (bytes, held) = crate::rt::encoded(&Value::list(args.to_vec()));
         // A call whose arguments are all answers of the memo, or their parts, is itself memoized.
         let keeps = held.is_empty()
             && match admitted.memo {
                 Memo::Never => false,
-                Memo::Constant(_) => true,
-                Memo::Calls => !filled.is_empty() && self.kept.borrow().knows_all(filled),
+                Memo::Constant => true,
+                Memo::Calls => !args.is_empty() && self.kept.borrow().knows_all(args),
             };
         let key = keeps.then(|| (name.clone(), bytes.clone()));
         if let Some(key) = &key
@@ -628,7 +427,7 @@ impl Bodies {
         crate::rt::on_known_stack(entering, || unsafe {
             (admitted.entry)(entering, none.as_ptr())
         });
-        self.returned(ctx, None);
+        self.returned(ctx);
         if ctx.failed != 0 {
             return self.failure(ctx, fuel);
         }
@@ -657,7 +456,7 @@ impl Bodies {
             let call = matches!(admitted.memo, Memo::Calls);
             self.kept.borrow_mut().keep(key, &value, call);
         }
-        let inward = filled.iter().map(objects_of).sum();
+        let inward = args.iter().map(objects_of).sum();
         self.unit
             .counters
             .note_converted(inward, objects_of(&value));
@@ -665,15 +464,9 @@ impl Bodies {
         EntryOutcome::Answered(value)
     }
 
-    /// What an entry that returned `out` leaves for the machine, kept for it to read: its
-    /// production region's other tasks run to their ends first, which may answer another word.
-    /// `out` is none for an entry that wrote its answer's encoding itself.
-    fn returned(
-        &self,
-        ctx: &mut crate::rt::Ctx,
-        out: Option<crate::heap::Word>,
-    ) -> crate::heap::Word {
-        let mut answer = out.unwrap_or(0);
+    /// What an entry leaves for the machine once it returned, kept for it to read: its production
+    /// region's other tasks run to their ends first.
+    fn returned(&self, ctx: &mut crate::rt::Ctx) {
         let production = ctx.sims.last().filter(|sim| sim.is_production());
         let held = ply_core::Held {
             bridges: ctx.heap.bridges() as u64,
@@ -682,7 +475,7 @@ impl Bodies {
             frame_tables: ctx.stack_slots() as u64,
         };
         if ctx.sims.last().is_some_and(|sim| sim.is_production()) {
-            answer = unsafe { crate::simulate::finish_root(std::ptr::from_mut(ctx), out) };
+            unsafe { crate::simulate::finish_root(std::ptr::from_mut(ctx)) };
         }
         if let Some(rt) = ctx.runtime.clone() {
             let warned = rt.end_entry_point(ctx.id);
@@ -694,7 +487,6 @@ impl Bodies {
             record: ctx.record.take(),
             performed: std::mem::take(&mut ctx.performed),
         };
-        answer
     }
 
     /// How an entry that failed ends: what it raised, or a decline where it raised nothing.
