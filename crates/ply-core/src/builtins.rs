@@ -469,9 +469,15 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             Ok(Value::list(Vec::new()))
         }
 
+        // Compiled code searches in place and calls this only to raise for a start past the end.
+        Builtin::BytesPosition => {
+            let bytes = args[0].as_bytes(span, "`Bytes::position`")?;
+            start_at(&args[1], bytes.len(), span, "Bytes::position")?;
+            Err(answered_by_the_backend(b, span))
+        }
+
         Builtin::Iterate
         | Builtin::Metered
-        | Builtin::BytesPosition
         | Builtin::Bracket
         | Builtin::HoldGet
         | Builtin::HoldTake
