@@ -39,8 +39,8 @@ import front.diagnostics (parse_all)
 import check.infer (dump_flag)
 import check.infer.definitions (Extern, prelude_externs, externs_in, module_externs)
 import expand.rewrite (Elaborated, elaborated_natives)
-import emit.layout (Intrinsic, Layouts, intrinsics, layouts)
-import emit.print.head (head_part)
+import emit.layout (Intrinsic, intrinsics)
+import emit.print.head (head_part, tail_part)
 import std.prelude_source
 import front.interface (read_key, sized)
 import expand.embed (EmbedAt, embed_file)
@@ -74,14 +74,12 @@ pub type Native = { name: Bytes, words: Int, answers: Bool, raises: Bool }
 
 /// The runtime a unit is compiled against: the C every unit opens with, through the runtime's
 /// declarations, and closes with, its definitions; the helpers those bind by position; the natives
-/// a body may call; how it lays out the objects the emitter writes code over in place; and the
-/// digest of the runtime's sources and helper table.
+/// a body may call; and the digest of the runtime's sources and helper table.
 pub type Runtime = {
   head: Bytes,
   tail: Bytes,
   helpers: List<Helper>,
   natives: List<Native>,
-  layouts: Layouts,
   identity: Bytes,
 }
 
@@ -1103,7 +1101,7 @@ fn laid(
     ),
     b"  { 0, 0, 0 } };\n",
     b"struct ply_descriptor { const char *exports; unsigned long exports_len; void *bind; void *bind_singletons; void *const *code; unsigned long code_count; const struct ply_taken *taken; unsigned long taken_count; };\n",
-    b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, (void *)ply_bind_singletons, ply_code, ",
+    b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, (void *)0, ply_code, ",
     ascii_of_int(lambdas.len()),
     b", ply_taken, ",
     ascii_of_int(taken.len()),
@@ -1271,6 +1269,7 @@ fn assembled(
       }),
     ),
     runtime.tail,
+    tail_part(),
     statics,
     embedded(exports),
     tables,
@@ -3683,7 +3682,6 @@ fn a_runtime(identity: Bytes) -> Runtime / {abort.raise} =
     tail: b"",
     helpers: [],
     natives: program_natives([]).map(native_of),
-    layouts: layouts(),
     identity: identity,
   }
 
@@ -4195,7 +4193,7 @@ test "an embedded file is laid out once from the bytes the unit is handed, raw" 
   );
   let laid = tail_of(p.text);
   assert_eq(laid.split(b"\"\\000\\377\"").len() - 1, 1);
-  assert(laid.index_of(b".len = 2, .layout = 2") != None, None)
+  assert(laid.index_of(b"{ .len = 2, .room = 2 }") != None, None)
 }
 
 test "two statics of one name holding different content stop the unit" {
@@ -4626,12 +4624,9 @@ test "a unit holds a `const` definition as its kept value laid out as static dat
     ));
   // The list and the map are laid out as the code reads them: a list's items in its tail, a map's
   // pairs in a leaf with room for its words.
-  assert(
-    has(b"{ .rc = UINT32_MAX, .kind = 5, .len = 2, .layout = 0, .flags = 2, .aux = 2 }"),
-    None,
-  );
-  assert(has(b"{ .rc = UINT32_MAX, .kind = 13, .len = 2, .layout = 64 }"), None);
-  assert(has(b"{ .rc = UINT32_MAX, .kind = 8, .len = 2, .layout = 0 }"), None);
+  assert(has(b"{ .len = 2, .start = 0, .tail_len = 2, .room = 2 }"), None);
+  assert(has(b"{ .len = 2, .room = 64, .kind = 13 }"), None);
+  assert(has(b"{ .len = 2, .height = 0 }"), None);
   // A value for a root the unit does not hold is no part of it.
   let apart = k.unit([Named(b"m.spread")], kept);
   assert_eq(apart.produced.text.index_of(symbol_of(b"m.table")), None)
@@ -5495,8 +5490,9 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
   );
   assert(p.text.index_of(b"Word f_m.f(PlyCtx*);\n") != None, None);
   // The tail defines the static the body names, then says what the unit holds.
+  let tail = match p.text.index_of(b"/* tail */\n") { Some(i) -> i, None -> p.text.len() };
   assert(
-    p.text.index_of(Bytes::concat_all([b"/* tail */\nconst struct ", own, b" {"])) != None,
+    p.text.index_of_from(Bytes::concat_all([b"const struct ", own, b" {"]), tail) != None,
     None,
   );
   assert(p.text.index_of(b"};\n\n/* --- what this unit says about itself") != None, None);
@@ -5513,7 +5509,7 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
     None,
   );
   assert(
-    p.text.index_of(b"(void *)ply_bind_singletons, ply_code, 1, ply_taken, 1 };\n") != None,
+    p.text.index_of(b"(void *)ply_bind, (void *)0, ply_code, 1, ply_taken, 1 };\n") != None,
     None,
   )
 }
@@ -5547,7 +5543,7 @@ test "a unit lays its definitions out by name in byte order, each name as a C li
       b"struct ply_taken { const char *name; void *entry; unsigned long arity; };\n",
       b"const struct ply_taken ply_taken[] = {\n  { \"m.\\\"q\\\"\", (void *)&e, 0 },\n  { 0, 0, 0 } };\n",
       b"struct ply_descriptor { const char *exports; unsigned long exports_len; void *bind; void *bind_singletons; void *const *code; unsigned long code_count; const struct ply_taken *taken; unsigned long taken_count; };\n",
-      b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, (void *)ply_bind_singletons, ply_code, 0, ply_taken, 1 };\n",
+      b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, (void *)0, ply_code, 0, ply_taken, 1 };\n",
     ]),
   )
 }

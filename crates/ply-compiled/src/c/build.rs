@@ -234,15 +234,18 @@ fn bind(unit: &Descriptor, helpers: &[*mut c_void]) {
     let bind: unsafe extern "C" fn(*const *mut c_void) =
         unsafe { std::mem::transmute(unit.bind()) };
     unsafe { bind(helpers.as_ptr()) };
-    let singletons: unsafe extern "C" fn(Word, Word, Word) =
-        unsafe { std::mem::transmute(unit.bind_singletons()) };
-    unsafe {
-        singletons(
-            crate::heap::bool(true),
-            crate::heap::bool(false),
-            crate::heap::unit(),
-        )
-    };
+    // A unit whose code names none of the runtime's singletons lays out no binder for them.
+    if let Some(binder) = unit.bind_singletons() {
+        let singletons: unsafe extern "C" fn(Word, Word, Word) =
+            unsafe { std::mem::transmute(binder) };
+        unsafe {
+            singletons(
+                crate::heap::bool(true),
+                crate::heap::bool(false),
+                crate::heap::unit(),
+            )
+        };
+    }
 }
 
 fn tables_of(mut unit: UnitTables) -> Tables {

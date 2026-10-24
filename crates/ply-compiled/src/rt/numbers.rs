@@ -8,40 +8,6 @@ pub unsafe extern "C" fn rt_dec(ctx: *mut Ctx, w: i64) {
     ctx.heap.release_last(w);
 }
 
-pub unsafe extern "C" fn rt_box_int(ctx: *mut Ctx, v: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    ctx.heap.boxed_int(v)
-}
-
-pub unsafe extern "C" fn rt_unbox_int(ctx: *mut Ctx, w: i64) -> i64 {
-    match heap::as_int(w) {
-        Some(i) => i,
-        None => {
-            let ctx = unsafe { &mut *ctx };
-            let d = error(format!("an `Int` operation on a {}", ctx.type_name(w)));
-            ctx.fail(d)
-        }
-    }
-}
-
-/// A `Float` held as a word, from its bits.
-pub unsafe extern "C" fn rt_box_float(ctx: *mut Ctx, bits: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    ctx.heap.boxed_float(f64::from_bits(bits as u64))
-}
-
-/// The bits of a `Float` held in a word compiled code cannot read in place.
-pub unsafe extern "C" fn rt_unbox_float(ctx: *mut Ctx, w: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    match (w != 0).then(|| ctx.value(w)) {
-        Some(Value::Float(f)) => ply_core::float::bits(f) as i64,
-        _ => {
-            let d = error(format!("a `Float` operation on a {}", ctx.type_name(w)));
-            ctx.fail(d)
-        }
-    }
-}
-
 /// `a % b` over two `Float`s' bits, which C reaches only through `fmod`.
 pub unsafe extern "C" fn rt_float_rem(_ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     let (a, b) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
@@ -115,31 +81,6 @@ pub unsafe extern "C" fn rt_bitnot(ctx: *mut Ctx, a: i64) -> i64 {
         },
     };
     c.word(&answer)
-}
-
-/// The machine's own operator over two words of a `Float`, a `Decimal` or a width past 32 bits.
-/// Takes both.
-pub unsafe extern "C" fn rt_binary(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let Some(op) = usize::try_from(op)
-        .ok()
-        .and_then(|i| BINOPS.get(i).copied())
-    else {
-        return ctx.fail(error("an operator this runtime has no code for"));
-    };
-    let vals = values_taken(ctx, &[a, b]);
-    match ply_core::strict_binary(
-        op,
-        &vals[0],
-        &vals[1],
-        Span::DUMMY,
-        Span::DUMMY,
-        Span::DUMMY,
-    ) {
-        Ok(v) => ctx.word(&v),
-        Err(d) if matches!(op, BinOp::Div | BinOp::Rem) && is_zero(&vals[1]) => raise_error(ctx, d),
-        Err(d) => ctx.fail(d),
-    }
 }
 
 /// `rt_binary` over two 64-bit widths' bits, the width at `t` in [`ply_core::INT_TYPES`]: the
@@ -300,14 +241,6 @@ pub unsafe extern "C" fn rt_wide_op(
     1
 }
 
-/// The object of a 64-bit width, the width at `t` in [`ply_core::INT_TYPES`], holding `bits`.
-pub unsafe extern "C" fn rt_box_fixed(ctx: *mut Ctx, bits: i64, t: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let ty = ply_core::INT_TYPES[t as usize];
-    ctx.heap
-        .boxed_fixed(ply_core::Fixed::new(ty, bits as u64 as u128))
-}
-
 /// The object of a 128-bit width, the width at `t` in [`ply_core::INT_TYPES`], whose bits are `lo`
 /// and above it `hi`.
 pub unsafe extern "C" fn rt_box_wide(ctx: *mut Ctx, lo: I64, hi: I64, t: I64) -> Word {
@@ -414,27 +347,6 @@ pub(super) fn is_zero(v: &Value) -> bool {
         Value::Fixed(f) => f.raw() == 0,
         Value::Decimal(d) => d.is_zero(),
         _ => false,
-    }
-}
-
-/// Whichever of `checked_mul`, `checked_div` and `checked_rem` the operator was.
-pub unsafe extern "C" fn rt_arith(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let (result, what) = match op {
-        0 => (a.checked_mul(b), "multiplication"),
-        1 => (a.checked_div(b), "division"),
-        _ => (a.checked_rem(b), "remainder"),
-    };
-    match result {
-        Some(n) => n,
-        None => {
-            // The machine's own words, so a failure reads the same on either engine.
-            if op != 0 && b == 0 {
-                raise_error(ctx, error(format!("{what} by zero")))
-            } else {
-                ctx.fail(error(format!("integer overflow in {what}")))
-            }
-        }
     }
 }
 
@@ -688,25 +600,6 @@ pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     let (l, r) = (ctx.value(a), ctx.value(b));
     match values_equal(&l, &r, Span::DUMMY) {
         Ok(eq) => i64::from(eq),
-        Err(d) => ctx.fail(d),
-    }
-}
-
-/// `++`: two strings or two byte strings append natively, answering the kind they share; anything
-/// else raises what `strict_binary` raises. Takes both.
-pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let kind = heap::kind(a);
-    if kind == heap::kind(b) && (kind == KIND_STR || kind == KIND_BYTES) {
-        let out = ctx.heap.append(a, unsafe { bytes_of(obj(b)) });
-        heap::dec(b);
-        return out;
-    }
-    let (l, r) = (ctx.value(a), ctx.value(b));
-    heap::dec(a);
-    heap::dec(b);
-    match ply_core::strict_binary(BinOp::Concat, &l, &r, Span::DUMMY, Span::DUMMY, Span::DUMMY) {
-        Ok(v) => ctx.word(&v),
         Err(d) => ctx.fail(d),
     }
 }

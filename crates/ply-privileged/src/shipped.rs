@@ -287,29 +287,9 @@ fn layouts_json() -> serde_json::Value {
     )
 }
 
-fn layouts_value() -> PlyValue {
-    use crate::payload::record;
-    use ply_compiled::laid::Fact;
-    record(
-        ply_compiled::laid::layouts()
-            .into_iter()
-            .map(|(object, facts)| {
-                let facts = facts.into_iter().map(|(name, fact)| {
-                    let value = match fact {
-                        Fact::Number(n) => PlyValue::Int(n as i64),
-                        Fact::Field(field) => PlyValue::bytes(field),
-                    };
-                    (name, value)
-                });
-                (object, record(facts.collect()))
-            })
-            .collect(),
-    )
-}
-
 /// The runtime a unit is compiled against, as `compiler.unit.Runtime` reads it: the C a unit opens
-/// and closes with, the helpers it binds by position, the natives an `extern fn` names, how it lays
-/// out what the emitter writes in place, and what all of that is a function of.
+/// and closes with, the helpers it binds by position, the natives an `extern fn` names, and what all
+/// of that is a function of.
 fn runtime() -> PlyValue {
     use crate::payload::record;
     use ply_compiled::c;
@@ -346,7 +326,6 @@ fn runtime() -> PlyValue {
                     .collect(),
             ),
         ),
-        ("layouts", layouts_value()),
         ("identity", PlyValue::bytes(c::runtime_identity())),
     ])
 }

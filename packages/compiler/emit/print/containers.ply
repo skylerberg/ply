@@ -10,7 +10,8 @@ import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, Tail
                     NewBranch, MapRoot, NodeCount, MapHeight, NodeKey, NodeValue, NodeKid, KidMax,
                     KidSize, NewLeaf, NewMapBranch, PairPut, PairSet, PairTake, LeafCut, BranchCut,
                     KidOut, KidBack, KidPut, KidDrop, MapSwap, layouts, header_bytes, words,
-                    raw_sum)
+                    raw_sum, head_field, head_words, length_head, text_head, list_head, node_head,
+                    map_head, array_head)
 import emit.roots (builtin_helper)
 import emit.keys (Root, Copy)
 import emit.answer (CallAt)
@@ -19,7 +20,6 @@ import emit.pieces (Piece, Text, Hole, Symbol, ShapeOf, spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RFlat, RSum, Leaf, Var, Arg,
                  AVar, AInt, AZero, Made, MList, Uses, Containers, Convention, Given, Owned,
                  counted, var_said, made_said, rep_of_arg, in_box)
-import emit.tir.statics (array_kind, columns_kind, flat_flag)
 import emit.layout (BranchLaid, branch_laid)
 import emit.tir.containers (ContainerOp, Laid, Length, Elements, Within, ArrayNew, ArraySet,
                             ArrayOfList, ArrayGet, ColumnsNew, ColumnsSet, ColumnsOfList,
@@ -33,7 +33,7 @@ import emit.print.made (c_type, c_types, as_word, word_as, word_parts, head_type
 import emit.print.counts (Said, released, duped, let_go_of, dup_of)
 import emit.print.lists (item_read, leaf_read, rest_made, list_made, room_made, node_made,
                          node_words_made)
-import emit.print.strings (taken_printed)
+import emit.print.strings (taken_printed, bytes_of)
 import emit.print.invoked (typed_callee, convention_of)
 import emit.print.head (writable_fn)
 import emit.print.counting (dup_fn, rel_fn, free_fn, inc_fn, dec_fn, call_text, call_start, calls,
@@ -92,23 +92,16 @@ pub fn container_op(
           p.depth,
           v,
           c_type(v.rep),
-          Bytes::concat_all([b"(int64_t)ply_obj(", object, b")->len"]),
+          Bytes::concat_all([b"(int64_t)", head_field(length_head(), object, b"len")]),
         ),
-      Elements ->
-        assigned(
-          site(p, pr),
-          p.depth,
-          v,
-          c_type(v.rep),
-          Bytes::concat_all([b"ply_array_len(", object, b")"]),
-        ),
+      Elements -> assigned(site(p, pr), p.depth, v, c_type(v.rep), array_len(object)),
       Within ->
         assigned(
           pr,
           p.depth,
           v,
           c_type(v.rep),
-          Bytes::concat_all([b"(uint64_t)", index, b" < (uint64_t)ply_array_len(", object, b")"]),
+          Bytes::concat_all([b"(uint64_t)", index, b" < (uint64_t)", array_len(object)]),
         ),
       Laid(i) -> laid_printed(p, pr, v, i, args),
       ArrayNew(e) -> array_new(p, pr, v, e, args),
@@ -269,8 +262,11 @@ fn laid_printed(
   let raw = |e: Bytes| assigned(pr, p.depth, v, c_type(v.rep), e);
   // An item is a word in the object, read as the scalar it is where `v` holds one.
   let read = |slot: Bytes| raw(word_as(slot, v.rep));
-  let header = |w: Bytes, field: Bytes| Bytes::concat_all([b"ply_obj(", w, b")->", field]);
-  let header_int = |field: Bytes| raw(Bytes::concat_all([b"(int64_t)", header(o, field)]));
+  let lh = |w: Bytes, f: Bytes| head_field(list_head(), w, f);
+  let nh = |w: Bytes, f: Bytes| head_field(node_head(), w, f);
+  let int_of = |field: Bytes| raw(Bytes::concat_all([b"(int64_t)", field]));
+  // What a node holds lies past its head: its kids, items or pairs from word `first`.
+  let first = laid.trie.first;
   let made = |kind: Int, words: Int|
     assigned(pr, p.depth, v, c_type(v.rep), node_words_made(kind, words));
   let held = assigned(pr, p.depth, v, c_type(v.rep), o);
@@ -291,8 +287,7 @@ fn laid_printed(
     ]);
   // A map's index is parenthesised where it is written into a larger index.
   let index = Bytes::concat_all([b"(", i, b")"]);
-  let after = |less: Bytes|
-    Bytes::concat_all([b"(int64_t)", header(a, b"len"), b" - ", index, less]);
+  let after = |less: Bytes| Bytes::concat_all([b"(int64_t)", nh(a, b"len"), b" - ", index, less]);
   let node = operand_type(args, 0);
   // The value of type `ty` laid as `e` from word `from` of the `k`-th run of `stride` words of `a`
   // written over by `x`, what it held let go of as its type lays it.
@@ -331,18 +326,18 @@ fn laid_printed(
   // A map node's pairs and greatest keys, laid as its key and value types lay them.
   let pl = || pair_laid(pr, if args.len() == 0 { v.ty } else { node });
   // How many words a copy of a leaf's pairs takes.
-  let pairs = ||
-    Some(Bytes::concat_all([ascii_of_int(pl().pair), b" * (int64_t)", header(a, b"len")]));
+  let pairs = || Some(Bytes::concat_all([ascii_of_int(pl().pair), b" * (int64_t)", nh(a, b"len")]));
   match op {
-    OfList(ListStart) -> header_int(laid.list.start),
-    OfList(TailLen) -> header_int(laid.list.tail_len),
-    OfList(NodeLen) -> header_int(b"len"),
+    OfList(ListStart) -> int_of(lh(o, b"start")),
+    OfList(TailLen) -> int_of(lh(o, b"tail_len")),
+    OfList(NodeLen) -> int_of(nh(o, b"len")),
     // The slot holds the root as an `Option`'s payload's word, the node or zero.
     OfList(ListRoot) -> raw(slot_of(o, ascii_of_int(laid.list.root))),
     OfList(TailAt) ->
       parts_declared(p, pr, v, item_values(o, laid.list.tail, i, item_element(pr, v.ty), v.rep)),
-    OfList(LeafAt) -> parts_declared(p, pr, v, item_values(o, 0, i, item_element(pr, v.ty), v.rep)),
-    OfList(KidAt) -> read(slot_of(o, past(0, i))),
+    OfList(LeafAt) ->
+      parts_declared(p, pr, v, item_values(o, first, i, item_element(pr, v.ty), v.rep)),
+    OfList(KidAt) -> read(slot_of(o, past(first, i))),
     OfList(NewBranch) -> assigned(pr, p.depth, v, c_type(v.rep), node_made(laid.trie.branch, 1)),
     OfList(TailPush) -> {
       let e = item();
@@ -351,10 +346,10 @@ fn laid_printed(
         g.pr,
         p.depth,
         Bytes::concat_all([
-          b"{ int in_place = ",
-          header(a, b"rc"),
-          b" == 1; int64_t n = (int64_t)",
-          header(a, laid.list.tail_len),
+          b"{ int in_place = ply_obj(",
+          a,
+          b")->rc == 1; int64_t n = (int64_t)",
+          lh(a, b"tail_len"),
           b";",
         ]),
       );
@@ -362,7 +357,7 @@ fn laid_printed(
       // A full tail moves into a block of twice the room, the list held once by then.
       let moved = Bytes::concat_all([
         b"if (n == (int64_t)",
-        header(a, laid.list.room),
+        lh(a, b"room"),
         b") { Word ",
         g.name,
         b" = ",
@@ -373,8 +368,8 @@ fn laid_printed(
         slot_of(a, ascii_of_int(laid.list.root)),
         b"; ",
         Bytes::concat_all(
-          [laid.list.start, b"len", laid.list.tail_len].map(|f: Bytes|
-            Bytes::concat_all([header(g.name, f), b" = ", header(a, f), b"; "])),
+          [b"start", b"len", b"tail_len"].map(|f: Bytes|
+            Bytes::concat_all([lh(g.name, f), b" = ", lh(a, f), b"; "])),
         ),
         b"memcpy(&",
         slot_of(g.name, ascii_of_int(laid.list.tail)),
@@ -405,11 +400,11 @@ fn laid_printed(
         grown,
         p.depth,
         Bytes::concat_all([
-          item_set(pr, a, laid.list.tail, header(a, laid.list.tail_len), e, operand_arg(args, 1)),
+          item_set(pr, a, laid.list.tail, lh(a, b"tail_len"), e, operand_arg(args, 1)),
           b" ",
-          header(a, laid.list.tail_len),
+          lh(a, b"tail_len"),
           b" += 1; ",
-          header(a, b"len"),
+          lh(a, b"len"),
           b" += 1;",
         ]),
       )
@@ -419,29 +414,24 @@ fn laid_printed(
         Bytes::concat_all([
           item_set(pr, a, laid.list.tail, b"0", item(), operand_arg(args, 1)),
           b" ",
-          header(a, laid.list.tail_len),
+          lh(a, b"tail_len"),
           b" = 1; ",
-          header(a, b"len"),
+          lh(a, b"len"),
           b" += 1;",
         ]),
       ),
     OfList(TailSet) ->
-      item_replaced(
-        owned(Some(header(a, laid.list.tail_len))),
-        laid.list.tail,
-        i,
-        operand_arg(args, 2),
-      ),
-    OfList(LeafSet) -> item_replaced(owned(Some(header(a, b"len"))), 0, i, operand_arg(args, 2)),
+      item_replaced(owned(Some(lh(a, b"tail_len"))), laid.list.tail, i, operand_arg(args, 2)),
+    OfList(LeafSet) -> item_replaced(owned(Some(nh(a, b"len"))), first, i, operand_arg(args, 2)),
     OfMap(MapRoot) -> raw(slot_of(o, ascii_of_int(laid.map.root))),
-    OfMap(MapHeight) -> header_int(laid.map.height),
-    OfMap(NodeCount) -> header_int(b"len"),
-    OfMap(NodeKey) -> parts_declared(p, pr, v, strided_values(o, 0, i, pl().pair, v.rep)),
+    OfMap(MapHeight) -> int_of(head_field(map_head(), o, b"height")),
+    OfMap(NodeCount) -> int_of(nh(o, b"len")),
+    OfMap(NodeKey) -> parts_declared(p, pr, v, strided_values(o, first, i, pl().pair, v.rep)),
     OfMap(NodeValue) -> {
       let l = pl();
-      parts_declared(p, pr, v, strided_values(o, l.key.stride, i, l.pair, v.rep))
+      parts_declared(p, pr, v, strided_values(o, first + l.key.stride, i, l.pair, v.rep))
     },
-    OfMap(NodeKid) -> read(slot_of(o, past(0, i))),
+    OfMap(NodeKid) -> read(slot_of(o, past(first, i))),
     OfMap(KidMax) -> {
       let l = pl();
       parts_declared(p, pr, v, strided_values(o, l.branch.keys, i, l.key.stride, v.rep))
@@ -458,15 +448,15 @@ fn laid_printed(
         p.depth,
         Bytes::concat_all([
           shifted(
-            Bytes::concat_all([index, b" * ", ps]),
+            past(first, Bytes::concat_all([index, b" * ", ps])),
             Bytes::concat_all([b"(", after(b""), b") * ", ps]),
             ps,
           ),
-          strided_set(pr, a, 0, i, l.pair, l.key, operand_arg(args, 2)),
+          strided_set(pr, a, first, i, l.pair, l.key, operand_arg(args, 2)),
           b" ",
-          strided_set(pr, a, l.key.stride, i, l.pair, l.value, operand_arg(args, 3)),
+          strided_set(pr, a, first + l.key.stride, i, l.pair, l.value, operand_arg(args, 3)),
           b" ",
-          header(a, b"len"),
+          nh(a, b"len"),
           b" += 1;",
         ]),
       )
@@ -475,14 +465,22 @@ fn laid_printed(
       let l = pl();
       let keyed = replaced(
         owned(pairs()),
-        0,
+        first,
         i,
         l.pair,
         l.key,
         type_arg(node, 0),
         operand_arg(args, 2),
       );
-      replaced(keyed, l.key.stride, i, l.pair, l.value, type_arg(node, 1), operand_arg(args, 3))
+      replaced(
+        keyed,
+        first + l.key.stride,
+        i,
+        l.pair,
+        l.value,
+        type_arg(node, 1),
+        operand_arg(args, 3),
+      )
     },
     OfMap(KidBack) -> {
       let l = pl();
@@ -499,7 +497,7 @@ fn laid_printed(
         maxed,
         p.depth,
         Bytes::concat_all([
-          at(index),
+          at(past(first, i)),
           b" = ",
           operand(pr, args, 2),
           b"; ",
@@ -518,14 +516,14 @@ fn laid_printed(
         owned(None),
         p.depth,
         Bytes::concat_all([
-          shifted(index, n, b"1"),
+          shifted(past(first, i), n, b"1"),
           shifted(
             run(l.branch.keys, index, ks),
             Bytes::concat_all([b"(", n, b") * ", ascii_of_int(ks)]),
             ascii_of_int(ks),
           ),
           shifted(past(l.branch.sizes, i), n, b"1"),
-          at(index),
+          at(past(first, i)),
           b" = ",
           operand(pr, args, 2),
           b"; ",
@@ -535,7 +533,7 @@ fn laid_printed(
           b" = ply_imm(",
           operand(pr, args, 4),
           b"); ",
-          header(a, b"len"),
+          nh(a, b"len"),
           b" += 1;",
         ]),
       )
@@ -546,7 +544,7 @@ fn laid_printed(
       let n = after(b" - 1");
       let next = index.concat(b" + 1");
       // The kid dropped goes to its node's drop, the greatest key under it as its type lays it.
-      let kid = said_line(released(owned(None), node, RWord, [at(index)]), p.depth);
+      let kid = said_line(released(owned(None), node, RWord, [at(past(first, i))]), p.depth);
       let key = said_line(
         let_go_of(
           kid,
@@ -559,14 +557,14 @@ fn laid_printed(
         key,
         p.depth,
         Bytes::concat_all([
-          shifted(next, n, b"-1"),
+          shifted(past(first, next), n, b"-1"),
           shifted(
             run(l.branch.keys, next, ks),
             Bytes::concat_all([b"(", n, b") * ", ascii_of_int(ks)]),
             Bytes::concat_all([b"-", ascii_of_int(ks)]),
           ),
           shifted(past(l.branch.sizes, next), n, b"-1"),
-          header(a, b"len"),
+          nh(a, b"len"),
           b" -= 1;",
         ]),
       )
@@ -596,8 +594,11 @@ fn record_printed(
   let a = held.name;
   let i = operand(pr, args, 1);
   let index = Bytes::concat_all([b"(", i, b")"]);
-  let header = |field: Bytes| Bytes::concat_all([b"ply_obj(", a, b")->", field]);
+  let lh = |f: Bytes| head_field(list_head(), a, f);
+  let nh = |w: Bytes, f: Bytes| head_field(node_head(), w, f);
   let at = |k: Bytes| slot_of(a, k);
+  // What a node holds lies past its head: its kids, items or pairs from word `first`.
+  let first = laid.trie.first;
   // A map node's pairs and greatest keys, laid as its key and value types lay them.
   let pairs = || pair_laid(pr, operand_type(args, 0));
   // Every one of them writes the object, held once first; a spill and a pair taken out count it.
@@ -607,9 +608,9 @@ fn record_printed(
     a,
     operand_type(args, 0),
     match op {
-      OfList(Spill) -> Some(header(laid.list.tail_len)),
+      OfList(Spill) -> Some(lh(b"tail_len")),
       OfMap(PairTake) ->
-        Some(Bytes::concat_all([ascii_of_int(pairs().pair), b" * (int64_t)", header(b"len")])),
+        Some(Bytes::concat_all([ascii_of_int(pairs().pair), b" * (int64_t)", nh(a, b"len")])),
       _ -> None,
     },
   );
@@ -622,7 +623,7 @@ fn record_printed(
   let cut = |kind: Int, words: Int, runs: List<{ from: Int, width: Int }>|
     took(
       |r: Bytes| {
-        let rest = Bytes::concat_all([b"((int64_t)", header(b"len"), b" - ", index, b")"]);
+        let rest = Bytes::concat_all([b"((int64_t)", nh(a, b"len"), b" - ", index, b")"]);
         Bytes::concat_all([
           b"Word ",
           r,
@@ -651,12 +652,11 @@ fn record_printed(
                 b") * sizeof(Word)); ",
               ])),
           ),
-          b"ply_obj(",
-          r,
-          b")->len = (uint32_t)",
+          nh(r, b"len"),
+          b" = (uint32_t)",
           rest,
           b"; ",
-          header(b"len"),
+          nh(a, b"len"),
           b" = (uint32_t)",
           index,
           b";",
@@ -681,17 +681,17 @@ fn record_printed(
             b" = 0; if (",
             i,
             b" < (int64_t)",
-            header(b"len"),
+            nh(a, b"len"),
             b") ",
             old,
             b" = ",
-            at(i),
+            at(past(first, i)),
             b"; else ",
-            header(b"len"),
+            nh(a, b"len"),
             b" = (uint32_t)(",
             i,
             b") + 1; ",
-            at(i),
+            at(past(first, i)),
             b" = ",
             operand(pr, args, 2),
             b";",
@@ -708,18 +708,18 @@ fn record_printed(
             leaf,
             b" = ",
             node_made(laid.trie.leaf, e.stride),
-            b"; memcpy(ply_words(",
-            leaf,
-            b"), &",
-            at(past(laid.list.tail, b"0")),
+            b"; memcpy(&",
+            slot_of(leaf, ascii_of_int(first)),
+            b", &",
+            at(ascii_of_int(laid.list.tail)),
             b", ",
             item_words(width, e),
-            b" * sizeof(Word)); ply_obj(",
-            leaf,
-            b")->len = ",
+            b" * sizeof(Word)); ",
+            nh(leaf, b"len"),
+            b" = ",
             width,
             b"; ",
-            header(laid.list.tail_len),
+            lh(b"tail_len"),
             b" = 0;",
           ]),
         |leaf: Bytes| [whole(b"leaf", leaf), whole(b"list", a)],
@@ -728,7 +728,7 @@ fn record_printed(
     OfMap(PairTake) -> {
       let l = pairs();
       let ps = ascii_of_int(l.pair);
-      let first = Bytes::concat_all([index, b" * ", ps]);
+      let start = past(first, Bytes::concat_all([index, b" * ", ps]));
       // The pair's words, each into a temporary of its own, the key's and then the value's.
       let words = range(0, l.pair).fold(
         { pr: started, names: [] },
@@ -746,23 +746,23 @@ fn record_printed(
               b"Word ",
               nth(words.names, j),
               b" = ",
-              slot_of(a, run(j, index, l.pair)),
+              slot_of(a, run(first + j, index, l.pair)),
               b"; ",
             ])),
         ).concat(
           Bytes::concat_all([
             b"memmove(&",
-            at(first),
+            at(start),
             b", &",
-            at(Bytes::concat_all([first, b" + ", ps])),
+            at(Bytes::concat_all([start, b" + ", ps])),
             b", (size_t)(",
             ps,
             b" * ((int64_t)",
-            header(b"len"),
+            nh(a, b"len"),
             b" - ",
             index,
             b" - 1)) * sizeof(Word)); ",
-            header(b"len"),
+            nh(a, b"len"),
             b" -= 1;",
           ]),
         ),
@@ -775,12 +775,12 @@ fn record_printed(
     },
     OfMap(LeafCut) -> {
       let l = pairs();
-      cut(laid.tree.leaf, laid.tree.width * l.pair, [{ from: 0, width: l.pair }])
+      cut(laid.tree.leaf, laid.tree.width * l.pair, [{ from: first, width: l.pair }])
     },
     OfMap(BranchCut) -> {
       let l = pairs();
       cut(laid.tree.branch, l.branch.words, [
-        { from: 0, width: 1 },
+        { from: first, width: 1 },
         { from: l.branch.keys, width: l.key.stride },
         { from: l.branch.sizes, width: 1 },
       ])
@@ -788,7 +788,15 @@ fn record_printed(
     OfMap(KidOut) ->
       took(
         |kid: Bytes|
-          Bytes::concat_all([b"Word ", kid, b" = ", at(index), b"; ", at(index), b" = 0;"]),
+          Bytes::concat_all([
+            b"Word ",
+            kid,
+            b" = ",
+            at(past(first, i)),
+            b"; ",
+            at(past(first, i)),
+            b" = 0;",
+          ]),
         |kid: Bytes| [whole(b"kid", kid), whole(b"node", a)],
       ),
     OfMap(MapSwap) -> {
@@ -805,11 +813,11 @@ fn record_printed(
             b" = ",
             i,
             b"; ",
-            header(laid.map.height),
+            head_field(map_head(), a, b"height"),
             b" = (uint32_t)(",
             operand(pr, args, 2),
             b"); ",
-            header(b"len"),
+            head_field(map_head(), a, b"len"),
             b" = (uint32_t)(",
             operand(pr, args, 3),
             b");",
@@ -1022,7 +1030,7 @@ fn array_set(
   let a = name_of(started, v);
   let n = temp(started);
   let opened = line(
-    line(n.pr, d, Bytes::concat_all([b"int64_t ", n.name, b" = ply_array_len(", a, b");"])),
+    line(n.pr, d, Bytes::concat_all([b"int64_t ", n.name, b" = ", array_len(a), b";"])),
     d,
     Bytes::concat_all([b"if ((uint64_t)", i, b" >= (uint64_t)", n.name, b") {"]),
   );
@@ -1072,19 +1080,17 @@ fn array_writable(
           pad(depth),
           b"if (!in_place) { Word ",
           c.name,
-          b" = ",
-          allocated(array_kind(), Bytes::concat_all([b"ply_obj(", a, b")->len"])),
-          b"; ply_obj(",
-          c.name,
-          b")->aux = ply_obj(",
-          a,
-          b")->aux; memcpy(ply_words(",
+          b" = rt_alloc_bytes_p(ctx, ",
+          array_bytes(n, e),
+          b"); memcpy(ply_words(",
           c.name,
           b"), ply_words(",
           a,
-          b"), (size_t)ply_obj(",
-          a,
-          b")->len * 8); ",
+          b"), (size_t)(",
+          array_bytes(n, e),
+          b" - ",
+          ascii_of_int(header_bytes()),
+          b")); ",
           if dups.len() == 0 { b"" }
           else { Bytes::concat_all([for_each(j.name, b"0", n), dups, b" } "]) },
         ]),
@@ -1119,7 +1125,17 @@ fn array_of_list(
   let count = temp(site(p, pr));
   let n = count.name;
   let started = assigned(
-    line(count.pr, d, Bytes::concat_all([b"int64_t ", n, b" = (int64_t)ply_obj(", l, b")->len;"])),
+    line(
+      count.pr,
+      d,
+      Bytes::concat_all([
+        b"int64_t ",
+        n,
+        b" = (int64_t)",
+        head_field(list_head(), l, b"len"),
+        b";",
+      ]),
+    ),
     d,
     v,
     c_type(v.rep),
@@ -1214,7 +1230,7 @@ fn outside_refused(
   a: Bytes,
   i: Bytes,
 ) -> Printing / {abort.raise} = {
-  let length = Bytes::concat_all([b"ply_array_len(", a, b")"]);
+  let length = array_len(a);
   line(
     site(p, pr),
     p.depth,
@@ -1240,7 +1256,7 @@ fn position_printed(p: Place, pr: Printing, v: Var, args: List<Arg>) -> Printing
   let from = operand(pr, args, 1);
   let f = operand(pr, args, 2);
   let d = p.depth;
-  let len = Bytes::concat_all([b"(int64_t)ply_obj(", b, b")->len"]);
+  let len = Bytes::concat_all([b"(int64_t)", head_field(text_head(), b, b"len")]);
   let guarded = line(
     site(p, pr),
     d,
@@ -1269,9 +1285,9 @@ fn position_printed(p: Place, pr: Printing, v: Var, args: List<Arg>) -> Printing
       from,
       b"; ",
       i.name,
-      b" < (int64_t)ply_obj(",
-      b,
-      b")->len; ",
+      b" < ",
+      len,
+      b"; ",
       i.name,
       b" += 1) {",
     ]),
@@ -1292,9 +1308,9 @@ fn position_printed(p: Place, pr: Printing, v: Var, args: List<Arg>) -> Printing
       typed_callee(f, conv),
       b"(ctx, ",
       f,
-      b", (int64_t)(ply_bytes(",
-      b,
-      b"))[",
+      b", (int64_t)(",
+      bytes_of(b),
+      b")[",
       i.name,
       b"]);",
     ]),
@@ -1419,7 +1435,17 @@ fn columns_of_list(
   let count = temp(site(p, pr));
   let n = count.name;
   let started = assigned(
-    line(count.pr, d, Bytes::concat_all([b"int64_t ", n, b" = (int64_t)ply_obj(", l, b")->len;"])),
+    line(
+      count.pr,
+      d,
+      Bytes::concat_all([
+        b"int64_t ",
+        n,
+        b" = (int64_t)",
+        head_field(list_head(), l, b"len"),
+        b";",
+      ]),
+    ),
     d,
     v,
     c_type(v.rep),
@@ -1529,7 +1555,7 @@ fn columns_set(
     line(
       n.pr,
       d,
-      Bytes::concat_all([b"int64_t ", n.name, b" = ply_array_len(", slot_of(c, b"0"), b");"]),
+      Bytes::concat_all([b"int64_t ", n.name, b" = ", array_len(slot_of(c, b"0")), b";"]),
     ),
     d,
     Bytes::concat_all([b"if ((uint64_t)", i, b" >= (uint64_t)", n.name, b") {"]),
@@ -1562,7 +1588,7 @@ fn columns_set(
           b")->rc != 1) { Word ",
           b.name,
           b" = ",
-          allocated(columns_kind(), ascii_of_int(es.len())),
+          columns_made(es.len()),
           b"; memcpy(ply_words(",
           b.name,
           b"), ply_words(",
@@ -1636,7 +1662,7 @@ fn operand_arg(args: List<Arg>, k: Int) -> Arg =
 fn for_each(i: Bytes, from: Bytes, n: Bytes) -> Bytes =
   Bytes::concat_all([b"for (int64_t ", i, b" = ", from, b"; ", i, b" < ", n, b"; ", i, b"++) { "])
 
-/// Word `j` of element `i` of the array `a`, its elements `stride` words apart.
+/// Word `j` of element `i` of the array `a`, its elements `stride` words apart past its head.
 fn element_slot(a: Bytes, i: Bytes, stride: Int, j: Int) -> Bytes =
   Bytes::concat_all([
     b"ply_words(",
@@ -1646,7 +1672,7 @@ fn element_slot(a: Bytes, i: Bytes, stride: Int, j: Int) -> Bytes =
     b") * ",
     ascii_of_int(stride),
     b" + ",
-    ascii_of_int(j),
+    ascii_of_int(head_words(array_head()) + j),
     b"]",
   ])
 
@@ -1671,7 +1697,17 @@ fn element_set(a: Bytes, i: Bytes, e: Element, ws: List<Bytes>) -> Bytes =
 /// The C values of element `i` of the array `a`, laid out as `e`, held as `r`.
 fn element_values(a: Bytes, i: Bytes, e: Element, r: Rep) -> List<Bytes> =
   parts_read(
-    Bytes::concat_all([b"(ply_words(", a, b") + (", i, b") * ", ascii_of_int(e.stride), b")"]),
+    Bytes::concat_all([
+      b"(ply_words(",
+      a,
+      b") + ",
+      ascii_of_int(head_words(array_head())),
+      b" + (",
+      i,
+      b") * ",
+      ascii_of_int(e.stride),
+      b")",
+    ]),
     values_of(r),
   )
 
@@ -1680,34 +1716,41 @@ fn element_values(a: Bytes, i: Bytes, e: Element, r: Rep) -> List<Bytes> =
 fn field_words(ws: List<Bytes>, es: List<Element>, f: Int) -> List<Bytes> / {abort.raise} =
   ws.drop(es.take(f).fold(0, |n: Int, e: Element| n + words(e.laid))).take(words(es.get(f).laid))
 
-/// The C making `a` an array of `n` elements laid out as `e`: its header's `len` their words, and
-/// its `aux` their stride where that is past one.
+/// The C making `a` an array of `n` elements laid out as `e`, its head counting them, each element
+/// the caller's to write.
 fn array_alloc(a: Bytes, n: Bytes, e: Element) -> Bytes =
   Bytes::concat_all([
     a,
+    b" = rt_alloc_bytes_p(ctx, ",
+    array_bytes(n, e),
+    b"); ",
+    array_len(a),
     b" = ",
-    allocated(array_kind(), Bytes::concat_all([b"(", n, b") * ", ascii_of_int(e.stride)])),
+    n,
     b";",
-    if e.stride > 1 {
-      Bytes::concat_all([b" ply_obj(", a, b")->aux = ", ascii_of_int(e.stride), b";"])
-    } else { b"" },
   ])
 
+/// The bytes of an array of `n` elements laid out as `e`: its header, its head and their words.
+fn array_bytes(n: Bytes, e: Element) -> Bytes =
+  Bytes::concat_all([
+    ascii_of_int(header_bytes() + 8 * head_words(array_head())),
+    b" + 8 * (",
+    n,
+    b") * ",
+    ascii_of_int(e.stride),
+  ])
+
+/// How many elements the array `a` holds, as its head says.
+fn array_len(a: Bytes) -> Bytes = head_field(array_head(), a, b"len")
+
 /// The C making `c` a `Columns` of `k` columns, each the caller's to write.
-fn columns_alloc(c: Bytes, k: Int) -> Bytes =
-  Bytes::concat_all([c, b" = ", allocated(columns_kind(), ascii_of_int(k)), b";"])
+fn columns_alloc(c: Bytes, k: Int) -> Bytes = Bytes::concat_all([c, b" = ", columns_made(k), b";"])
 
-/// The C allocating a flat object of `kind` whose header's `len` is `len`, as a static of it is laid:
-/// the kind and the flag `emit.tir.statics` gives both.
-pub fn allocated(kind: Int, len: Bytes) -> Bytes =
-  Bytes::concat_all([allocating(kind), len, b", 0, ", ascii_of_int(flat_flag()), b")"])
+/// The C allocating a `Columns` of `k` columns, its words the caller's to write.
+fn columns_made(k: Int) -> Bytes =
+  Bytes::concat_all([b"rt_alloc_bytes_p(ctx, ", ascii_of_int(header_bytes() + 8 * k), b")"])
 
-/// The C `allocated` starts with, up to the header's `len`.
-pub fn allocating(kind: Int) -> Bytes =
-  Bytes::concat_all([b"rt_alloc_p(ctx, ", ascii_of_int(kind), b", "])
-
-/// The most elements laid out as `e` an array holds: as many as its header's `len` counts the
-/// words of, and 2^26 at most.
+/// The most elements laid out as `e` an array holds: 2^26, fewer where their words would pass 2^32.
 fn most(e: Element) -> Int / {abort.raise} = min(67108864, 4294967295 / e.stride)
 
 /// The most records a `Columns` whose columns are laid out as `es` holds.
@@ -1794,8 +1837,8 @@ test "a list literal is laid out by the emitted code, its tail holding what fits
   has(two, b"ply_list_room(ctx, 2, 1)");
   has(two, tail(0).concat(b"p0;"));
   has(two, tail(1).concat(b"0;"));
-  has(two, Bytes::concat_all([b"->", laid.tail_len, b" = 2;"]));
-  assert_eq(made([]).index_of(b"ply_words("), None);
+  has(two, b"))->tail_len = 2;");
+  assert_eq(made([]).index_of(b")["), None);
   // A `Decimal` lies in the tail as its two words.
   let dec = made_of(b"Decimal", [AZero(RDec)]);
   has(dec, b"ply_list_room(ctx, 1, 2)");
@@ -1835,7 +1878,7 @@ test "a list literal past a tail's room lays its whole leaves under a branch and
   let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
   has(b"->len = 2;");
   has(Bytes::concat_all([b"[", ascii_of_int(laid.root), b"] = t"]));
-  has(Bytes::concat_all([b"->", laid.tail_len, b" = 3;"]))
+  has(b"))->tail_len = 3;")
 }
 
 test "a list's item is read where it lies and its rest shares its trie, neither through the runtime" {
@@ -1884,8 +1927,10 @@ test "an array of `Int`s holds each as its bits a word apart, with no shape, and
   let text = spelled(pr.out);
   let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
   assert_eq(pr.shapes, []);
-  has(Bytes::concat_all([b" = ", allocated(array_kind(), b"(p0) * 1"), b";"]));
-  has(b" * 1 + 0] = (Word)(INT64_C(7));");
+  let ints = { laid: laid(no_ctors(), int), stride: 1 };
+  has(Bytes::concat_all([b" = rt_alloc_bytes_p(ctx, ", array_bytes(b"p0", ints), b");"]));
+  has(Bytes::concat_all([array_len(b"t1"), b" = p0;"]));
+  has(b" * 1 + 1] = (Word)(INT64_C(7));");
   has(b"builtin_elaborated_refused_p(ctx, 0, p0, 0, 0);");
   assert_eq([text.index_of(b"builtin_array_"), text.index_of(b"->aux")], [None, None])
 }
@@ -1915,12 +1960,13 @@ test "an array of records holds each record's words in place, and a write lets g
   );
   let text = spelled(pr.out);
   let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
-  // A copy keeps the stride, and its strings are counted where it copies them.
-  has(b")->aux = ply_obj(");
+  // A copy takes the head and every element's words, and its strings are counted where it copies
+  // them.
+  has(b") * 2); memcpy(ply_words(");
   has(b"rt_note_update_p(ctx, in_place, in_place ? 0 : ");
   // The string of the record replaced goes to its drop root, never to the runtime's; the float is bits.
-  has(call_start(rel_fn(), [b"ctx", b"ply_words(t1)[(p1) * 2 + 0]"]));
-  has(b"ply_words(t1)[(p1) * 2 + 1] = ply_f64_bits(");
+  has(call_start(rel_fn(), [b"ctx", b"ply_words(t1)[(p1) * 2 + 1]"]));
+  has(b"ply_words(t1)[(p1) * 2 + 2] = ply_f64_bits(");
   has(b"builtin_elaborated_refused_p(ctx, 5, p1, ");
   assert(!calls(text, dec_fn()), Some(String::of_bytes_lossy(text)))
 }
@@ -1940,8 +1986,8 @@ test "a field of a Columns' record is read from its column in place, an index na
   );
   let text = spelled(pr.out);
   let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
-  has(b"(uint64_t)p1 >= (uint64_t)ply_array_len(ply_words(p0)[2])");
+  has(Bytes::concat_all([b"(uint64_t)p1 >= (uint64_t)", array_len(b"ply_words(p0)[2]")]));
   has(b"builtin_elaborated_refused_p(ctx, 6, p1, ");
-  has(b"(ply_words(ply_words(p0)[2]) + (p1) * 1)[0]");
-  assert_eq(text.index_of(allocating(columns_kind())), None)
+  has(b"(ply_words(ply_words(p0)[2]) + 1 + (p1) * 1)[0]");
+  assert_eq(text.index_of(b"rt_alloc"), None)
 }

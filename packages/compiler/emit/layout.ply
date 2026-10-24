@@ -1,8 +1,10 @@
 //! Layout facts, with one home: what a word of a value may hold, how a type lays a value out in
 //! words (records and sums, `sum_laid`'s one algorithm for every sum), the constants those rest on,
-//! where the runtime's own objects keep their parts and the externs written in place over them, and
-//! the structs emitted code and the runtime both lay out. It imports nothing from the compiler: `record_laid` and `sum_laid` take layouts, not
-//! types.
+//! the heads containers keep their counts in and the externs written in place over them, and the
+//! structs emitted code and the runtime both lay out. It imports nothing from the compiler:
+//! `record_laid` and `sum_laid` take layouts, not types.
+
+import std.bytes (ascii_of_int)
 
 /// What a word of a laid value may hold. `P` is a counted pointer or 0: nonzero, 8-aligned and at or
 /// above `pointer_floor()` where nonzero, its low `tag_bits()` spare. `C(m)` is a `Char`'s immediate
@@ -386,57 +388,140 @@ pub fn tag_bits() -> Int = 3
 /// How far apart a one-word sum's nullary values are, so none has a tag bit set.
 pub fn nullary_step() -> Int = 8
 
-/// The bytes of a block's header, its count among them, before its payload.
+/// The bytes of a block's header, its count, before its payload.
 pub fn header_bytes() -> Int = 16
 
-/// The kind in the header of a block emitted code lays out, which the runtime's own walks refuse.
-pub fn refused_kind() -> Int = 21
+/// The counts a block of a string, a byte string, a list, a node or an array keeps for itself: a
+/// struct at its payload's start, which emitted code alone reads. A string's or a byte string's
+/// `len` bytes follow it, with room for `room`.
+pub fn text_head() -> MachineStruct =
+  {
+    name: b"PlyTextHead",
+    bytes: 8,
+    fields: [
+      { name: b"len", decl: b"uint32_t len", at: 0, bytes: 4 },
+      { name: b"room", decl: b"uint32_t room", at: 4, bytes: 4 },
+    ],
+  }
 
-/// A list's own object: the root of its trie at word `root`, zero for none, then the tail's items
-/// from word `tail`. Its header's `len` holds how many items the list has, and the fields named
-/// here hold how many items a `rest` dropped from the trie's front, how many the tail holds, and
-/// how many it has room for.
-pub type ListLaid = { root: Int, tail: Int, start: Bytes, tail_len: Bytes, room: Bytes }
+/// A list's: how many items it has, how many a `rest` dropped from its trie's front, how many its
+/// tail holds and how many it has room for.
+pub fn list_head() -> MachineStruct =
+  {
+    name: b"PlyListHead",
+    bytes: 16,
+    fields: [
+      { name: b"len", decl: b"uint32_t len", at: 0, bytes: 4 },
+      { name: b"start", decl: b"uint32_t start", at: 4, bytes: 4 },
+      { name: b"tail_len", decl: b"uint32_t tail_len", at: 8, bytes: 4 },
+      { name: b"room", decl: b"uint32_t room", at: 12, bytes: 4 },
+    ],
+  }
+
+/// A node's of a list's trie or a map's tree: how many items, pairs or children it holds, the words
+/// it has room for, and whether it is a leaf or a branch (`TrieLaid`, `TreeLaid`).
+pub fn node_head() -> MachineStruct =
+  {
+    name: b"PlyNodeHead",
+    bytes: 8,
+    fields: [
+      { name: b"len", decl: b"uint32_t len", at: 0, bytes: 4 },
+      { name: b"room", decl: b"uint16_t room", at: 4, bytes: 2 },
+      { name: b"kind", decl: b"uint16_t kind", at: 6, bytes: 2 },
+    ],
+  }
+
+/// A map's: how many entries it has, and how many levels of branches stand above its leaves, every
+/// leaf at that depth.
+pub fn map_head() -> MachineStruct =
+  {
+    name: b"PlyMapHead",
+    bytes: 8,
+    fields: [
+      { name: b"len", decl: b"uint32_t len", at: 0, bytes: 4 },
+      { name: b"height", decl: b"uint32_t height", at: 4, bytes: 4 },
+    ],
+  }
+
+/// An array's: how many elements it holds.
+pub fn array_head() -> MachineStruct =
+  {
+    name: b"PlyArrayHead",
+    bytes: 8,
+    fields: [{ name: b"len", decl: b"int64_t len", at: 0, bytes: 8 }],
+  }
+
+/// The head a length is read through at a string, a byte string, a list or a map alike: each of
+/// their heads opens with the same `len`.
+pub fn length_head() -> MachineStruct = text_head()
+
+/// The bytes of a string's or byte string's block with room for `room` bytes, a C expression: its
+/// header, its head, and its room rounded up to a word.
+pub fn text_bytes(room: Bytes) -> Bytes =
+  Bytes::concat_all([
+    ascii_of_int(header_bytes() + 8 * head_words(text_head())),
+    b" + (((int64_t)",
+    room,
+    b" + 7) & ~(int64_t)7)",
+  ])
+
+/// Every head, as the emitter's head declares them.
+pub fn head_structs() -> List<MachineStruct> =
+  [text_head(), list_head(), node_head(), map_head(), array_head()]
+
+/// The words a head takes at its block's payload's start, before what the block holds.
+pub fn head_words(s: MachineStruct) -> Int = s.bytes / 8
+
+/// The C naming field `f` of the head `s` of the block `x`.
+pub fn head_field(s: MachineStruct, x: Bytes, f: Bytes) -> Bytes =
+  Bytes::concat_all([b"((", s.name, b" *)ply_words(", x, b"))->", f])
+
+/// A list's own object: its head, the root of its trie at word `root`, zero for none, then the
+/// tail's items from word `tail`.
+pub type ListLaid = { root: Int, tail: Int }
 
 /// The nodes of a list's trie, of kind `leaf` or `branch`: each holds at most `width` items or
-/// children from word 0, as many as its header's `len`.
-pub type TrieLaid = { leaf: Int, branch: Int, width: Int }
+/// children from word `first`, as many as its head's `len`.
+pub type TrieLaid = { leaf: Int, branch: Int, width: Int, first: Int }
 
-/// A map's own object: the root of its tree at word `root`, zero for none. Its header's `len` holds
-/// how many entries the map has, and the field `height` how many levels of branches stand above its
-/// leaves, every leaf at that depth.
-pub type MapLaid = { root: Int, height: Bytes }
+/// A map's own object: its head, then the root of its tree at word `root`, zero for none; `words`
+/// in all.
+pub type MapLaid = { root: Int, words: Int }
 
-/// The nodes of a map's tree, as many pairs or children as their header's `len`: a leaf of kind
-/// `leaf` holds at most `width` pairs in key order, each pair its key's words and then its value's;
-/// a branch of kind `branch` at most `width` children from word 0, with room for one more until a
-/// cut, the greatest key under each from word `keys`, a key's words apart, and how many entries lie
-/// under each after them (`branch_laid`), as an immediate. `sizes` is where those lie past keys of
-/// one word, as the runtime describes its own.
-pub type TreeLaid = { leaf: Int, branch: Int, width: Int, keys: Int, sizes: Int }
+/// The nodes of a map's tree, as many pairs or children as their head's `len`, from word `first`: a
+/// leaf of kind `leaf` holds at most `width` pairs in key order, each pair its key's words and then
+/// its value's; a branch of kind `branch` at most `width` children, with room for one more until a
+/// cut, then the greatest key under each, a key's words apart, and how many entries lie under each
+/// (`branch_laid`), as an immediate.
+pub type TreeLaid = { leaf: Int, branch: Int, width: Int, first: Int }
 
 /// Where a map's branch over keys of `key_words` words lays the greatest key under each child, a key
-/// apart from word `keys`, and how many entries lie under each from word `sizes`; and its words.
+/// apart from word `keys`, and how many entries lie under each from word `sizes`; and the words it
+/// has room for past its head.
 pub type BranchLaid = { keys: Int, sizes: Int, words: Int }
 
 pub fn branch_laid(key_words: Int) -> BranchLaid = {
   let t = layouts().tree;
-  let sizes = t.keys + (t.width + 1) * key_words;
-  { keys: t.keys, sizes: sizes, words: sizes + t.width + 1 }
+  let keys = t.first + t.width + 1;
+  let sizes = keys + (t.width + 1) * key_words;
+  { keys: keys, sizes: sizes, words: sizes + t.width + 1 - t.first }
 }
 
-/// Each object the emitter writes code over in place, laid out as the runtime lays it out. A header
-/// field is named as the C prelude's `PlyObj` names it.
+/// Each object the emitter writes code over in place.
 pub type Layouts = { list: ListLaid, trie: TrieLaid, map: MapLaid, tree: TreeLaid }
 
 /// The layouts the emitter writes against.
-pub fn layouts() -> Layouts =
+pub fn layouts() -> Layouts = {
+  let list = head_words(list_head());
+  let node = head_words(node_head());
+  let map = head_words(map_head());
   {
-    list: { root: 0, tail: 1, start: b"layout", tail_len: b"flags", room: b"aux" },
-    trie: { leaf: 11, branch: 12, width: 32 },
-    map: { root: 0, height: b"layout" },
-    tree: { leaf: 13, branch: 14, width: 32, keys: 33, sizes: 66 },
+    list: { root: list, tail: list + 1 },
+    trie: { leaf: 11, branch: 12, width: 32, first: node },
+    map: { root: map, words: map + 1 },
+    tree: { leaf: 13, branch: 14, width: 32, first: node },
   }
+}
 
 /// A function of `ListNode` the emitter writes in place over a list's objects.
 pub type ListOp =
@@ -531,31 +616,6 @@ fn intrinsic_map() -> Map<Bytes, Intrinsic> =
 /// What the emitter writes in place of a call of the extern whose program-wide name is `name`;
 /// `None` for any other.
 pub fn intrinsic_named(name: Bytes) -> Option<Intrinsic> = intrinsic_map().get(name)
-
-/// A string's or a byte string's own object: its header's `len` bytes from its payload's start, with
-/// room for as many as its header's field `room` holds. A view, whose header's field `flags` holds
-/// `view`, is a block of `view_words` words holding the value it views at word `viewed` and where its
-/// bytes begin there at word `from`; a value counts its views in its header's field `views`.
-pub type StrLaid = {
-  room: Bytes,
-  flags: Bytes,
-  view: Int,
-  view_words: Int,
-  viewed: Int,
-  from: Int,
-  views: Bytes,
-}
-
-/// Where the runtime's strings and byte strings keep their parts.
-pub fn str_laid() -> StrLaid =
-  { room: b"layout", flags: b"flags", view: 8, view_words: 2, viewed: 0, from: 1, views: b"aux" }
-
-/// How big the runtime's other blocks are, which a release frees by their size: a node of a list's
-/// trie or a map's tree has room for as many words as its header's field `node_room` holds, a map's
-/// own block is `map_words`.
-pub type BlockSizes = { node_room: Bytes, map_words: Int }
-
-pub fn block_sizes() -> BlockSizes = { node_room: b"layout", map_words: 1 }
 
 /// A hold's object: the value it holds at word `held`, 0 once it has let go.
 pub type HoldLaid = { held: Int }
@@ -924,12 +984,24 @@ test "a word some case leaves zero never offers 0 to an enclosing sum's niche" {
   ])
 }
 
+test "a string's, a list's and a map's heads open with the length read through any of them" {
+  let opening = |s: MachineStruct| s.fields.at(0);
+  assert_eq(
+    [text_head(), list_head(), map_head()].map(opening).filter(|f: Option<MachineField>|
+      f != opening(length_head())),
+    [],
+  )
+}
+
 test "each machine struct's fields lie in order, each at a multiple of its size, within the struct" {
-  machine_structs().push(ctx_struct()).fold((), |_: Unit, s: MachineStruct| {
-    let end = s.fields.fold(0, |at: Int, f: MachineField| {
-      assert(f.at >= at && f.at % f.bytes == 0 && f.decl.index_of(f.name) != None, None);
-      f.at + f.bytes
-    });
-    assert(end <= s.bytes && s.bytes % 8 == 0, None)
-  })
+  machine_structs().push(ctx_struct()).concat(head_structs()).fold(
+    (),
+    |_: Unit, s: MachineStruct| {
+      let end = s.fields.fold(0, |at: Int, f: MachineField| {
+        assert(f.at >= at && f.at % f.bytes == 0 && f.decl.index_of(f.name) != None, None);
+        f.at + f.bytes
+      });
+      assert(end <= s.bytes && s.bytes % 8 == 0, None)
+    },
+  )
 }

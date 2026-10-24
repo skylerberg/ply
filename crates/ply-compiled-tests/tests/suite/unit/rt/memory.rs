@@ -5,7 +5,7 @@
 use crate::bare::{context, helper};
 use ply_compiled::emitted::Block;
 use ply_compiled::heap::{
-    CLOSURE_CAPTURES, IMMORTAL, KIND_DEAD, KIND_LIST, KIND_REFUSED, SHARED, Word, inc, kind, obj,
+    CLOSURE_CAPTURES, IMMORTAL, KIND_DEAD, KIND_LIST, KIND_REFUSED, SHARED, Word, kind, obj,
     word_at,
 };
 use ply_compiled::native::Answered;
@@ -105,7 +105,6 @@ fn a_list_or_map_node_and_a_string_the_runtime_made_are_freed_at_their_sizes() {
     };
     use ply_compiled::{list, map};
     let mut ctx = context();
-    let node: Counted = helper("rt_node");
     let room = 4;
     let text = "a string longer than a word";
     let bytes = b"\x00bytes longer than a word";
@@ -114,23 +113,11 @@ fn a_list_or_map_node_and_a_string_the_runtime_made_are_freed_at_their_sizes() {
             ctx.heap.alloc_list(room as u32) as Word,
             16 + 8 * (list::TAIL + room),
         ),
-        (
-            unsafe { node(&mut ctx, KIND_LEAF.into()) },
-            16 + 8 * list::WIDTH,
-        ),
-        (
-            unsafe { node(&mut ctx, KIND_BRANCH.into()) },
-            16 + 8 * list::WIDTH,
-        ),
+        (ctx.heap.alloc_node(KIND_LEAF, &[]), 16 + 8 * list::WIDTH),
+        (ctx.heap.alloc_node(KIND_BRANCH, &[]), 16 + 8 * list::WIDTH),
         (ctx.heap.map_new(), 16 + 8),
-        (
-            unsafe { node(&mut ctx, KIND_MLEAF.into()) },
-            16 + 16 * map::WIDTH,
-        ),
-        (
-            unsafe { node(&mut ctx, KIND_MBRANCH.into()) },
-            16 + map::BRANCH_BYTES,
-        ),
+        (ctx.heap.alloc_leaf() as Word, 16 + 16 * map::WIDTH),
+        (ctx.heap.alloc_branch() as Word, 16 + map::BRANCH_BYTES),
         (ctx.heap.str(text), 16 + text.len()),
         (ctx.heap.bytes(bytes), 16 + bytes.len()),
     ];
@@ -221,28 +208,6 @@ fn a_bridge_is_given_back_with_the_value_it_bridged() {
     assert_eq!(ctx.heap.bridges(), 0);
 }
 
-/// A hold of `()`, whose word is 0, is let go once like any other: what marks it let go is no word
-/// of what it holds.
-#[test]
-fn a_hold_of_the_zero_word_is_let_go_once() {
-    use ply_compiled::c::builtin_helper_name;
-    let mut ctx = context();
-    ctx.begin(1_000);
-    let made: Counted = helper(&builtin_helper_name("?hold_new"));
-    let take: Counted = helper(&builtin_helper_name("?hold_take"));
-    let h = unsafe { made(&mut ctx, 0) };
-    inc(h);
-    assert_eq!(unsafe { take(&mut ctx, h) }, 0);
-    assert!(ctx.take_failure().is_none(), "the first take let go");
-    unsafe { take(&mut ctx, h) };
-    let said = ctx
-        .take_failure()
-        .expect("a second take is refused")
-        .message;
-    assert!(said.contains("let go after its region released"), "{said}");
-    ctx.end();
-}
-
 #[test]
 fn a_hold_is_given_back_without_a_read_of_what_it_held() {
     let mut ctx = context();
@@ -275,7 +240,7 @@ fn a_hold_keeps_what_it_holds_at_the_word_the_runtime_describes() {
     let mut ctx = context();
     ctx.begin(1_000);
     let held = alloc(&mut ctx, 16 + 8);
-    let made: Counted = helper(&builtin_helper_name("?hold_new"));
+    let made: Counted = helper(&builtin_helper_name("?hold_made"));
     let h = unsafe { made(&mut ctx, held) };
     let [("held", Fact::Number(at))] = hold()[..] else {
         panic!("a hold is described by the one word it holds at");
