@@ -1,4 +1,6 @@
 //! `derive D for T` becomes an ordinary definition: generated as source, parsed back, and retargeted.
+//! A built-in deriver writes the source here; a library deriver is a module's `derive`, which the load
+//! runs and whose answer the expansion is handed.
 
 import syntax.parsing (Span, Ident, QName, span_to, is_bare, qname_text, span_between)
 import syntax.sites (numbered)
@@ -13,12 +15,13 @@ import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMat
                      hidden_binder, ETagged, Hole, expr_span)
 import syntax.items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TypeDefBody, TDAlias, TDSum,
                      VariantDef, DeriveDef, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric,
-                     DInteger, DRow, deriver_text, deriver_tag, ImportDecl, ImportKind, IModule,
-                     IAlias, INames, Vis, VPub, VPriv, Derived, Derivation, RuntimeBinder,
-                     Constraint, SpecClause, parse, constraint_written, TDNominal, TDExtern,
-                     IInstance, InstanceDef, NKey, NShow)
+                     DInteger, DRow, DLibrary, deriver_text, deriver_tag, derivers, ImportDecl,
+                     ImportKind, IModule, IAlias, INames, Vis, VPub, VPriv, Derived, Derivation,
+                     RuntimeBinder, Constraint, SpecClause, parse, constraint_written, TDNominal,
+                     TDExtern, IInstance, InstanceDef, NKey, NShow)
 import expand.rewrite (expand)
 import expand.rewrite.shared (find_type, picked_in)
+import expand.declared (declaration_of)
 import check.resolve.tables (Diag, Source, error_at, error_at_and, path_span)
 import check.resolve (dump_diags)
 import std.list
@@ -26,6 +29,8 @@ import std.bytes (ascii_of_int)
 import std.string
 import std.bin
 import std.text
+import std.derive
+import std.derive (Refused, refused_bin)
 
 // --- Rules ---------------------------------------------------------------------------------------
 
@@ -69,7 +74,7 @@ fn is_fixed_width(name: Bytes) -> Bool =
     || name == b"I64"
     || name == b"I128"
 
-pub fn same_deriver(a: Deriver, b: Deriver) -> Bool = deriver_tag(a) == deriver_tag(b)
+pub fn same_deriver(a: Deriver, b: Deriver) -> Bool = deriver_text(a) == deriver_text(b)
 
 /// The module a `derive` by `deriver` calls into, which the module stating it must import: the one
 /// whose definitions a generated body calls, if any.
@@ -189,6 +194,7 @@ fn function_refusal(deriver: Deriver) -> Bytes =
     DNumeric -> b"a function is not a number",
     DInteger -> b"a function is not an integer",
     DRow -> b"a function has no column to be stored in",
+    DLibrary(_) -> b"a function has no fields to derive from",
   }
 
 pub fn refusal_reason(w: DeriveRefusal, deriver: Deriver, simple: Bytes) -> Bytes =
@@ -218,6 +224,7 @@ pub fn secret_reason(deriver: Deriver) -> Bytes =
     DNumeric -> b"a credential is not a number",
     DInteger -> b"a credential is not an integer",
     DRow -> b"a derived row would write the credential into the database",
+    DLibrary(_) -> b"a derivation would read the credential",
   }
 
 pub fn refusal_note(w: DeriveRefusal, deriver: Deriver) -> Option<Bytes> =
@@ -760,7 +767,7 @@ derive bin for RowField
 /// The fields `derive row for target` reads, in order, as the module that declares the type writes
 /// them; `None` for a type the module does not declare as a record.
 pub fn row_shape(module: Module, target: Bytes) -> Option<List<RowField>> / {abort.raise} = {
-  let ex = new_expander(0, b"", module, []);
+  let ex = new_expander(0, b"", module, [], []);
   match find_type(ex.types, target) {
     None -> None,
     Some(def) -> match row_fields(def) {
@@ -1940,8 +1947,29 @@ fn retarget_pat(p: Pattern, span: Span) -> Pattern =
 type Runtime = { wanted: Bytes, prefix: Bytes, added: Option<ImportDecl> }
 type Claimed = { name: Bytes, def: DeriveDef }
 type Generated = { source: Bytes, defs: List<FnDef>, derived: Derived }
+
+/// A library derivation to run: the deriver's module and the `std.derive` declaration it reads,
+/// encoded.
+pub type LibraryAsk = { module: Bytes, declaration: Bytes }
+
+/// Why no library deriver answered: the diagnostic the derivation reports.
+pub type Unrun = { code: Bytes, message: Bytes, notes: List<Bytes> }
+
+/// What a library derivation answered: the source its deriver wrote, its refusal, or why it did not
+/// run.
+pub type LibraryAnswer = | Wrote(Bytes) | Declined(Refused) | Unran(Unrun)
+
+derive bin for LibraryAsk
+
+derive bin for Unrun
+
+derive bin for LibraryAnswer
+
+/// The answer to the library derivation of the `derive` item at `span`.
+type Answered = { span: Span, answer: LibraryAnswer }
+
 /// `taken` holds what the module's own expansion wrote of the derivations of the part of it being
-/// expanded, which are expanded to that.
+/// expanded, which are expanded to that; `answers` what each library deriver answered.
 type Expander = {
   m: Int,
   path: Bytes,
@@ -1949,6 +1977,7 @@ type Expander = {
   types: List<TypeDef>,
   aliases: List<Alias>,
   taken: List<Derivation>,
+  answers: List<Answered>,
   claimed: List<Claimed>,
   generated: List<Generated>,
   runtimes: List<Runtime>,
@@ -1995,7 +2024,13 @@ fn eq_ignore_case(a: Bytes, b: Bytes) -> Bool / {abort.raise} =
   String::of_bytes(a).eq_ignore_ascii_case(String::of_bytes(b))
 
 /// Each table keeps the first of a name on its own, so an alias may follow a same-named sum type.
-fn new_expander(m: Int, path: Bytes, module: Module, taken: List<Derivation>) -> Expander = {
+fn new_expander(
+  m: Int,
+  path: Bytes,
+  module: Module,
+  taken: List<Derivation>,
+  answers: List<Answered>,
+) -> Expander = {
   let walked = module.items.fold(
     { types: [], aliases: [] },
     |acc: { types: List<TypeDef>, aliases: List<Alias> }, item: Item|
@@ -2024,6 +2059,7 @@ fn new_expander(m: Int, path: Bytes, module: Module, taken: List<Derivation>) ->
     types: walked.types,
     aliases: walked.aliases,
     taken: taken,
+    answers: answers,
     claimed: [],
     generated: [],
     runtimes: [],
@@ -2033,7 +2069,228 @@ fn new_expander(m: Int, path: Bytes, module: Module, taken: List<Derivation>) ->
 
 fn run_expander(expander: Expander) -> Expander / {abort.raise} =
   expander.module.items.fold(expander, |acc: Expander, item: Item|
-    match item { IDerive(def) -> unlabelled(acc, def), _ -> acc })
+    match item {
+      IDerive(def) -> match def.deriver {
+        DLibrary(binder) -> library_one(acc, def, binder),
+        _ -> unlabelled(acc, def),
+      },
+      _ -> acc,
+    })
+
+// --- Library derivers ----------------------------------------------------------------------------
+
+/// The module `binder` names in `module`'s imports: the deriver a `derive` by that name runs.
+fn deriver_module(module: Module, binder: Bytes) -> Option<Bytes> / {abort.raise} =
+  module.imports.fold(None, |acc: Option<Bytes>, decl: ImportDecl|
+    match acc {
+      Some(_) -> acc,
+      None -> if import_binder(decl) == Some(binder) { Some(dotted(decl)) } else { None },
+    })
+
+/// What each library derivation of `module` asks, by its `derive` item, with what `taken` already
+/// holds and what names no deriver left out: those the expander reports or expands without one.
+fn asked_of(
+  path: Bytes,
+  module: Module,
+  taken: List<Derivation>,
+) -> List<{ span: Span, ask: LibraryAsk }> / {abort.raise} =
+  module.items.fold([], |acc: List<{ span: Span, ask: LibraryAsk }>, item: Item|
+    match item {
+      IDerive(d) -> match d.deriver {
+        DLibrary(binder) -> if taken.any(|t: Derivation|
+            same_deriver(t.deriver, d.deriver) && t.target == d.target.name) { acc } else {
+          let declares = module.items.any(|i: Item|
+            match i { IType(t) -> t.name.name == d.target.name, _ -> false });
+          match if declares { deriver_module(module, binder) } else { None } {
+            None -> acc,
+            Some(deriver) ->
+              acc.push({
+                span: d.span,
+                ask: {
+                  module: deriver,
+                  declaration: bin::encode(
+                    declaration_of(path, module, d.target.name, d.deriver, binder),
+                    derive::declaration_bin(),
+                  ),
+                },
+              }),
+          }
+        },
+        _ -> acc,
+      },
+      _ -> acc,
+    })
+
+/// What a read of a module answers for a library derivation where nothing runs derivers.
+fn unrun_alone() -> LibraryAnswer =
+  Unran({
+    code: b"E0155",
+    message: b"a library deriver runs only where a load checks the program",
+    notes: [
+      b"`ply check`, `ply test`, `ply run` and `ply build` run each deriver a module names; this read of the module ran none",
+    ],
+  })
+
+fn library_one(expander: Expander, def: DeriveDef, binder: Bytes) -> Expander / {abort.raise} =
+  match find_type(expander.types, def.target.name) {
+    None -> orphan(expander, def),
+    Some(target) -> match expander.taken.find(|d: Derivation|
+        same_deriver(d.deriver, def.deriver) && d.target == def.target.name) {
+      Some(d) -> library_wrote(expander, def, d.written),
+      None -> match expander.answers.find(|a: Answered| a.span == def.span) {
+        None -> unknown_deriver(expander, def, binder),
+        Some(a) -> match a.answer {
+          Wrote(text) -> library_wrote(expander, def, [text]),
+          Declined(refused) -> declined(expander, def, target, refused),
+          Unran(u) ->
+            report(
+              expander,
+              error_at(u.code, expander.m, def.span, u.message, b"this derivation", u.notes),
+            ),
+        },
+      },
+    },
+  }
+
+/// `def` expanded to the functions its deriver wrote, each claimed by its name.
+fn library_wrote(
+  expander: Expander,
+  def: DeriveDef,
+  written: List<Bytes>,
+) -> Expander / {abort.raise} = {
+  let source = Bytes::join(written, b"\n");
+  let r = parse(source);
+  let x = expand(r.node, r.parser.diags);
+  let fns = x.module.items.fold([], |acc: List<FnDef>, item: Item|
+    match item { IFn(d) -> acc.push(retarget_fn(d, def.span)), _ -> acc });
+  if x.diags.len() > 0 || fns.len() != x.module.items.len() || r.node.imports.len() > 0 {
+    report(
+      expander,
+      error_at(
+        b"E0155",
+        expander.m,
+        def.span,
+        Bytes::concat_all([
+          b"the `",
+          deriver_text(def.deriver),
+          b"` deriver answered source that is not functions",
+        ]),
+        b"this derivation",
+        [
+          b"a deriver answers the functions it derives and nothing else, each read into the module as if written there",
+          b"it answered: ".concat(source),
+        ],
+      ),
+    )
+  } else {
+    let named = fns.fold(
+      { ex: expander, clash: false },
+      |acc: { ex: Expander, clash: Bool }, f: FnDef|
+        match find_claimed(acc.ex.claimed, f.name.name) {
+          Some(prev) -> { ex: collision(acc.ex, def, prev, f.name.name), clash: true },
+          None ->
+            {
+              ex: { ..acc.ex, claimed: acc.ex.claimed.push({ name: f.name.name, def: def }) },
+              clash: acc.clash,
+            },
+        },
+    );
+    if named.clash { named.ex } else {
+      {
+        ..named.ex,
+        generated: named.ex.generated.push({
+          source: source,
+          defs: fns,
+          derived: {
+            deriver: def.deriver,
+            target: def.target.name,
+            span: def.span,
+            written: written,
+            binders: [],
+          },
+        }),
+      }
+    }
+  }
+}
+
+/// Where a refusal that names `at`, a field or a variant of `target`, points: there, else at the
+/// type's name.
+fn refused_at(target: TypeDef, at: Option<String>) -> Span / {abort.raise} =
+  match at {
+    None -> target.name.span,
+    Some(s) -> {
+      let name = Bytes::of_string(s);
+      let fields = |t: TypeExpr|
+        match t {
+          TRecord(r) ->
+            r.fields.find(|f: { name: Ident, ty: TypeExpr }| f.name.name == name).map(
+              |f: { name: Ident, ty: TypeExpr }| span_to(f.name.span, ty_span(f.ty)),
+            ),
+          _ -> None,
+        };
+      let found = match target.body {
+        TDSum(variants) ->
+          variants.find(|v: VariantDef| v.name.name == name).map(|v: VariantDef| v.span),
+        TDAlias(t) -> fields(t),
+        TDNominal(t) -> fields(t),
+        TDExtern -> None,
+      };
+      match found { Some(span) -> span, None -> target.name.span }
+    },
+  }
+
+fn declined(
+  expander: Expander,
+  def: DeriveDef,
+  target: TypeDef,
+  refused: Refused,
+) -> Expander / {abort.raise} =
+  report(
+    expander,
+    error_at_and(
+      b"E0206",
+      expander.m,
+      refused_at(target, refused.at),
+      Bytes::concat_all([
+        b"`",
+        deriver_text(def.deriver),
+        b"` cannot be derived for `",
+        def.target.name,
+        b"`",
+      ]),
+      Bytes::of_string(refused.message),
+      expander.m,
+      def.span,
+      b"required by this derivation",
+      refused.notes.map(Bytes::of_string),
+    ),
+  )
+
+fn unknown_deriver(expander: Expander, def: DeriveDef, binder: Bytes) -> Expander =
+  report(
+    expander,
+    error_at(
+      b"E0207",
+      expander.m,
+      def.deriver_span,
+      Bytes::concat_all([b"`", binder, b"` is not a deriver"]),
+      b"unknown deriver",
+      [
+        b"the built-in derivers are ".concat(
+          Bytes::join(
+            derivers().map(|d: Deriver| Bytes::concat_all([b"`", deriver_text(d), b"`"])),
+            b", ",
+          ),
+        ),
+        Bytes::concat_all([
+          b"any other deriver is a module this file imports as `",
+          binder,
+          b"`, whose `pub fn derive` writes the derivation",
+        ]),
+      ],
+    ),
+  )
 
 // A target that binds a label is refused before its fields are read.
 fn unlabelled(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
@@ -2529,18 +2786,22 @@ fn internal(expander: Expander, def: DeriveDef, source: Bytes) -> Expander =
 
 /// Appends the generated definitions and any import a runtime module needed; `path` names the module.
 /// `module` is part of that module where `taken` holds what the module's expansion wrote of each
-/// derivation of the part: each is expanded to that.
-pub fn expand_derives(
+/// derivation of the part: each is expanded to that. `library` runs a library derivation; with none,
+/// each is reported unrun.
+pub fn expand_derives<| e>(
   m: Int,
   path: Bytes,
   module: Module,
   taken: List<Derivation> = [],
-) -> Expansion / {abort.raise} =
+  library: Option<(LibraryAsk) -> LibraryAnswer / {abort.raise | e}> = None,
+) -> Expansion / {abort.raise | e} =
   if !module.items.fold(false, |b: Bool, item: Item|
       b || (match item { IDerive(_) -> true, _ -> false })) {
     { module: module, derived: [], diags: [] }
   } else {
-    let ex = run_expander(new_expander(m, path, module, taken));
+    let answers = asked_of(path, module, taken).map(|x: { span: Span, ask: LibraryAsk }|
+      { span: x.span, answer: match library { Some(run) -> run(x.ask), None -> unrun_alone() } });
+    let ex = run_expander(new_expander(m, path, module, taken, answers));
     let added = ex.runtimes.fold([], |acc: List<ImportDecl>, runtime: Runtime|
       match runtime.added { Some(i) -> acc.push(i), None -> acc });
     {
@@ -2557,7 +2818,7 @@ pub fn expand_derives(
 
 /// The source each of this module's derivations generates, in `derive` order.
 pub fn preview(path: Bytes, module: Module) -> List<Bytes> / {abort.raise} =
-  run_expander(new_expander(0, path, module, [])).generated.map(|generated: Generated|
+  run_expander(new_expander(0, path, module, [], [])).generated.map(|generated: Generated|
     generated.source)
 
 /// Each module expanded on its own: its generated sources length-prefixed, then its diagnostics.
@@ -2824,4 +3085,86 @@ test "an orphan, a collision, a missing runtime and a refused field each report 
   let first = refused.diags.get(0).labels.get(0);
   assert_eq(first.start, 39);
   assert_eq(first.end, 65)
+}
+
+/// `src` expanded with each library derivation answered `answer`, beside what each one asked.
+fn library_expanded(
+  src: Bytes,
+  answer: LibraryAnswer,
+) -> { expansion: Expansion, asked: List<LibraryAsk> } / {abort.raise} =
+  handle {
+    let x = expand_derives(
+      0,
+      b"t",
+      parse(src).node,
+      library: Some(|ask: LibraryAsk| {
+        asks.told(ask);
+        answer
+      }),
+    );
+    { expansion: x, asked: [] }
+  } with {
+    var seen: List<LibraryAsk> = [],
+    asks.told(ask) -> {
+      seen = seen.push(ask);
+    },
+    return v -> { ..v, asked: seen },
+  }
+
+effect asks {
+  write told(ask: LibraryAsk) -> Unit
+}
+
+test "a library derivation asks its module's deriver with the module's types, and reads in what it wrote" {
+  let src = b"import lib.mapping as mapping\ntype Box<a> = | Box(a, List<a>)\ntype Pair = { left: Int }\nderive mapping for Box\n";
+  let x = library_expanded(
+    src,
+    Wrote(
+      b"fn Box::map<a, b | e>(original: Box<a>, a: (a) -> b / e) -> Box<b> / e = match original { Box(x, xs) -> Box(a(x), xs.map(a)) }",
+    ),
+  );
+  assert_eq(x.expansion.diags, []);
+  assert_eq(x.asked.map(|a: LibraryAsk| a.module), [b"lib.mapping"]);
+  let declaration = derive::declared_of(x.asked.get(0).declaration);
+  assert_eq(declaration.target, "Box");
+  assert_eq(declaration.binder, "mapping");
+  assert_eq(declaration.derived, ["Box"]);
+  assert_eq(declaration.types.map(|t: derive::TypeDeclaration| t.name), ["Box", "Pair"]);
+  assert_eq(
+    derive::type_text(match derive::target(declaration).body {
+      derive::Sum(vs) -> vs.get(0).fields.get(1),
+      _ -> derive::Unit,
+    }),
+    "List<a>",
+  );
+  let generated = x.expansion.module.items.fold([], |acc: List<Bytes>, item: Item|
+    match item { IFn(d) -> acc.push(d.name.name), _ -> acc });
+  assert_eq(generated, [b"Box::map"]);
+  assert_eq(x.expansion.derived.map(|d: Derived| d.written), [
+    [
+      b"fn Box::map<a, b | e>(original: Box<a>, a: (a) -> b / e) -> Box<b> / e = match original { Box(x, xs) -> Box(a(x), xs.map(a)) }",
+    ],
+  ])
+}
+
+test "a library deriver's refusal, failure, or text that is not functions each report at the derivation" {
+  let src = b"import lib.mapping as mapping\ntype Box<a> = | Box(a) | Empty\nderive mapping for Box\n";
+  let codes = |answer: LibraryAnswer|
+    library_expanded(src, answer).expansion.diags.map(|d: Diag| d.code);
+  let declined = library_expanded(
+    src,
+    Declined({ message: "no", at: Some("Empty"), notes: ["why"] }),
+  );
+  assert_eq(declined.expansion.diags.map(|d: Diag| d.code), [b"E0206"]);
+  // The refusal points at the variant it names.
+  assert_eq(Some(declined.expansion.diags.get(0).labels.get(0).start), src.index_of(b"Empty"));
+  assert_eq(codes(Unran({ code: b"E0155", message: b"raised", notes: [] })), [b"E0155"]);
+  assert_eq(codes(Wrote(b"type Wrong = Int")), [b"E0155"]);
+  assert_eq(codes(Wrote(b"fn broken( = 1")), [b"E0155"]);
+  // A read of the module that runs no deriver says so.
+  assert_eq(expand_derives(0, b"t", parse(src).node).diags.map(|d: Diag| d.code), [b"E0155"]);
+  // A name no import binds is no deriver, and nothing is asked.
+  let unknown = library_expanded(b"type Box<a> = | Box(a)\nderive mapping for Box\n", Wrote(b""));
+  assert_eq(unknown.expansion.diags.map(|d: Diag| d.code), [b"E0207"]);
+  assert_eq(unknown.asked, [])
 }
