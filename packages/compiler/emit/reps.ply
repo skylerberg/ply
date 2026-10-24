@@ -11,8 +11,8 @@ import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme
                     row_empty, over_arg)
 import emit.layout
 import emit.layout (WordClass, P, C, R, S, U, LWords, LSum, SumLaid, CaseLaid, CaseArgs, Payload,
-                    Nullary, Inline, Boxed, WordForm, Itself, Immediate, RuntimeBox, Singleton, Box,
-                    record_laid, sum_laid, words, classes, raw, flat_words)
+                    Nullary, Inline, Boxed, WordForm, Itself, Bits, RuntimeBox, Box, record_laid,
+                    sum_laid, words, classes, raw, flat_words)
 import emit.typing (Typed, Filings, unknown_type)
 import front.rows (CtorRow)
 import std.list
@@ -939,16 +939,15 @@ fn key_within(ctors: Ctors, ty: Type, depth: Int) -> Bytes / {abort.raise} =
     }
   }
 
-/// How a value of `ty` is one word where one word is required: an `Int` or a narrower width as an
-/// immediate, a `Float`, a `Decimal` or a width of 64 bits or more in the runtime's box, a `Bool` as the
-/// runtime's object of it, a record of any words and a value of more than one word in a box of it,
-/// as `tir.in_box` holds them, and any other as its one word (0 for one of none). Raises as `laid`
-/// does.
+/// How a value of `ty` is one word where one word is required: a scalar a register holds in one word
+/// as its own bits, a `Decimal` or a 128-bit width in the runtime's box, a record of any words and a
+/// value of more than one word in a box of it, as `tir.in_box` holds them, and any other as its one
+/// word (0 for one of none). Raises as `laid` does.
 pub fn word_form(ctors: Ctors, ty: Type) -> WordForm / {abort.raise} = {
   let l = laid(ctors, ty);
   let n = words(l);
   let held = match l {
-    LSum(s) -> if layout::raw_sum(s) { Immediate } else if n <= 1 { Itself } else { Box(n) },
+    LSum(s) -> if layout::raw_sum(s) { Bits } else if n <= 1 { Itself } else { Box(n) },
     _ -> if n <= 1 { Itself } else { Box(n) },
   };
   let record = if n == 0 { Itself } else { Box(n) };
@@ -956,11 +955,10 @@ pub fn word_form(ctors: Ctors, ty: Type) -> WordForm / {abort.raise} = {
     TyRecord(_) -> record,
     TyNominal(_) -> record,
     TyCon(c) -> if ctors.sums.contains(c.name) { held }
-    else if c.name == b"Int" { Immediate }
-    else if c.name == b"Bool" { Singleton }
-    else if c.name == b"Float" || c.name == b"Decimal" { RuntimeBox } else {
+    else if c.name == b"Int" || c.name == b"Bool" || c.name == b"Float" { Bits }
+    else if c.name == b"Decimal" { RuntimeBox } else {
       match width_named(c.name) {
-        Some(w) -> if in_imm(w) { Immediate } else { RuntimeBox },
+        Some(w) -> if carried(w) { Bits } else { RuntimeBox },
         None -> held,
       }
     },
@@ -973,9 +971,12 @@ pub fn word_form(ctors: Ctors, ty: Type) -> WordForm / {abort.raise} = {
 /// A type whose values are words and say nothing more of their layout.
 pub fn word_type() -> Type = TyCon({ name: b"_", args: [] })
 
-/// The record the runtime gathers a `parallel` block's answers into, each answer's word under its
-/// field's name, which emitted code reads by name and the runtime gives back. No source spells it.
-pub fn gathered_type() -> Type = TyCon({ name: b"?gathered", args: [] })
+/// The box a `parallel` block gathers the answers of its branches into, of the types `answers`:
+/// each answer's word form in a word of its own, in the branches' order. No source spells it.
+pub fn gathered_of(answers: List<Type>) -> Type = TyCon({ name: gathered_name(), args: answers })
+
+/// The name of `gathered_of`'s types.
+pub fn gathered_name() -> Bytes = b"?gathered"
 
 /// The type a clause's continuation is held at, which no program writes: a function value called
 /// only through its descriptor's uniform entry, of the function type `called` (where its clause says
@@ -1340,7 +1341,7 @@ test "two sums laid alike share a layout key, and Option<Color> and Option<Strin
   )
 }
 
-test "a value is one word as itself, an immediate, the runtime's box or object, or a box of its own words" {
+test "a value is one word as itself, a scalar's bits, the runtime's box, or a box of its own words" {
   let t = sample_ctors();
   let form = |ty: Type| word_form(t, ty);
   assert_eq(
@@ -1357,19 +1358,7 @@ test "a value is one word as itself, an immediate, the runtime's box or object, 
       b"String",
       b"U128",
     ].map(|n: Bytes| form(named_type(n))),
-    [
-      Immediate,
-      Immediate,
-      Immediate,
-      RuntimeBox,
-      RuntimeBox,
-      RuntimeBox,
-      Singleton,
-      Itself,
-      Itself,
-      Itself,
-      RuntimeBox,
-    ],
+    [Bits, Bits, Bits, Bits, Bits, RuntimeBox, Bits, Itself, Itself, Itself, RuntimeBox],
   );
   // A record is boxed however few its words, as `tir.in_box` holds it wherever emitted code makes
   // its word form, and a record of none is nothing.
@@ -1403,7 +1392,7 @@ test "a value is one word as itself, an immediate, the runtime's box or object, 
     ]),
   );
   assert_eq([named_type(b"m.Id"), named_type(b"m.Small")].map(|t: Type| word_form(ids, t)), [
-    Immediate,
-    Immediate,
+    Bits,
+    Bits,
   ])
 }

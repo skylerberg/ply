@@ -1,0 +1,81 @@
+//! A scalar a register holds in one word, an `Int`, a `Bool`, a `Float`, a width or a sum of raw
+//! scalars, crosses a function value's call, a closure's captures, a hold and a task as its own
+//! bits, whatever those bits read as, and no such crossing allocates.
+
+type Id = | Id(Int)
+
+type Light = | Red | Amber | Green
+
+/// Raw words that read as an object's address, or as an immediate's tag.
+fn odd_words() -> List<Int> =
+  [8, 16, 4096, 4097, 0 - 8, 9223372036854775807, 0 - 9223372036854775807 - 1]
+
+fn least() -> Int = 0 - 9223372036854775807 - 1
+
+fn through<a>(fs: List<(a) -> a>, x: a) -> a = fs.fold(x, |y: a, f: (a) -> a| f(y))
+
+/// `n` rounds of `fs` over `x`.
+fn rounds<a>(fs: List<(a) -> a>, x: a, n: Int) -> a =
+  if n <= 0 { x } else { rounds(fs, through(fs, x), n - 1) }
+
+fn held<a>(x: a) -> a = with_hold[h](x, |_: a| ()) { k -> k.get() }
+
+fn next(l: Light) -> Light = match l { Red -> Amber, Amber -> Green, Green -> Red }
+
+test "a function value takes and answers every one-word scalar as its bits" {
+  let shift = |x: Int| x +% least();
+  assert_eq(odd_words().map(|n: Int| through([shift, shift], n)), odd_words());
+  assert_eq(through([|b: Bool| !b], true), false);
+  let negative_zero = Float::of_bits(least());
+  assert_eq(
+    bits_of_float(through([|f: Float| f * 1.0], negative_zero)),
+    bits_of_float(negative_zero),
+  );
+  assert_eq(through([|w: U8| wrap_add(w, 200u8)], 100u8), 44u8);
+  assert_eq(through([|w: U64| w], 18446744073709551615u64), 18446744073709551615u64);
+  assert_eq(through([|i: Id| match i { Id(n) -> Id(n +% 1) }], Id(4095)), Id(4096));
+  assert_eq(through([next, next], Green), Amber);
+  assert_eq(through([|d: Decimal| d], 1.50m), 1.50m);
+  assert_eq(through([|w: I128| w], -1i128), -1i128)
+}
+
+test "a closure holds the one-word scalars it captures as their bits" {
+  let n = least();
+  let half = -0.5;
+  let on = true;
+  let top = 255u8;
+  let stop = Amber;
+  let k = |x: Int| if on { x +% n } else { x };
+  assert_eq(through([k, k], 4097), 4097);
+  assert_eq(through([|x: Float| x + half], 1.0), 0.5);
+  assert_eq(through([|x: U8| wrap_add(x, top)], 1u8), 0u8);
+  assert_eq(through([|x: Light| if x == stop { Red } else { x }], Amber), Red)
+}
+
+test "a hold and a task give back every one-word scalar as it was" {
+  assert_eq(odd_words().map(|n: Int| held(n)), odd_words());
+  assert_eq([held(true), held(false)], [true, false]);
+  assert_eq(held(-2.5), -2.5);
+  assert_eq(held(-1i8), -1i8);
+  assert_eq(held(Green), Green);
+  assert_eq(held(1.50m), 1.50m);
+  simulate {
+    assert_eq(odd_words().map(|n: Int| task.join(task.spawn(|| n))), odd_words());
+    assert_eq(task.join(task.spawn(|| -0.5)), -0.5);
+    assert_eq(task.join(task.spawn(|| Amber)), Amber);
+    assert_eq(task.join(task.spawn(|| 255u8)), 255u8)
+  }
+}
+
+test "calling a function value over Ints or Floats allocates alike however many calls it makes" {
+  let ints = [|x: Int| x +% 4611686018427387904, |x: Int| x *% 3];
+  assert_eq(
+    metered(|| rounds(ints, 4097, 1000)).allocations,
+    metered(|| rounds(ints, 4097, 10)).allocations,
+  );
+  let floats = [|x: Float| x * 1.5, |x: Float| x / 1.25];
+  assert_eq(
+    metered(|| rounds(floats, 0.5, 1000)).allocations,
+    metered(|| rounds(floats, 0.5, 10)).allocations,
+  )
+}
