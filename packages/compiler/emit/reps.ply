@@ -17,7 +17,7 @@ import emit.typing (Typed, Filings, unknown_type)
 import front.rows (CtorRow)
 import std.list
 import check.lent (passed)
-import emit.c (KBool, KBoxed, KDec, KFloat, KInt, KNum, Kind, width_named, carried, in_imm)
+import emit.c (KBool, KBoxed, KDec, KFloat, KInt, KNum, KWide, Kind, width_named, carried, in_imm)
 import emit.keys (RootKey, Named, at_key, root_name, root_text)
 
 /// The program's constructor table: the names its tags are positions of.
@@ -597,9 +597,9 @@ pub fn written_sum(ctors: Ctors, c: { name: Bytes, args: List<Type> }) -> Bool =
 pub fn nullary_sum(cs: List<SumCtor>) -> Bool =
   cs.fold(true, |ok: Bool, c: SumCtor| ok && c.fields.len() == 0)
 
-/// How a value of `ty` is held: an `Int` or a `Bool` untagged, a width below 64 bits in its own C
-/// type, a `Float` in a `double`, anything else a word, with what a field read or an inline builtin
-/// can take of its type.
+/// How a value of `ty` is held: an `Int` or a `Bool` untagged, a width in its own C type, a `Float`
+/// in a `double`, a `Decimal` or a 128-bit width in its two words, anything else a word, with what a
+/// field read or an inline builtin can take of its type.
 pub fn kind_of(ty: Type) -> { kind: Kind, ty: Ty } =
   match ty {
     TyCon(c) -> if c.args.len() == 0 && c.name == b"Int" { { kind: KInt, ty: TyOpen([]) } }
@@ -613,11 +613,10 @@ pub fn kind_of(ty: Type) -> { kind: Kind, ty: Ty } =
         kind: KBoxed,
         ty: TyArr(match c.args.at(0) { Some(e) -> laid_field(b"e", e), None -> None }),
       }
-    }
-    // A width below 64 bits is carried in a register; the wider ones are the runtime's own words.
-    else if c.args.len() == 0 {
+    } else if c.args.len() == 0 {
       match width_named(c.name) {
-        Some(w) -> if carried(w) { { kind: KNum(w), ty: TyOpen([]) } } else { boxed() },
+        Some(w) -> if carried(w) { { kind: KNum(w), ty: TyOpen([]) } }
+        else { { kind: KWide(w), ty: TyOpen([]) } },
         None -> boxed(),
       }
     } else { boxed() },
@@ -883,7 +882,10 @@ fn classes_named(name: Bytes) -> List<WordClass> =
   else if name == b"Char" { [C(0)] }
   else if name == b"Decimal" { [raw(), raw()] }
   else if name == b"Int" || name == b"Float" { [raw()] } else {
-    match width_named(name) { Some(w) -> if carried(w) { [raw()] } else { [P] }, None -> [P] }
+    match width_named(name) {
+      Some(w) -> if carried(w) { [raw()] } else { [raw(), raw()] },
+      None -> [P],
+    }
   }
 
 /// The key a specialisation at `ty` is named and kept by: what decides `ty`'s layout and nothing
@@ -938,7 +940,7 @@ fn key_within(ctors: Ctors, ty: Type, depth: Int) -> Bytes / {abort.raise} =
   }
 
 /// How a value of `ty` is one word where one word is required: an `Int` or a narrower width as an
-/// immediate, a `Float`, a `Decimal` or a 64-bit width in the runtime's box, a `Bool` as the
+/// immediate, a `Float`, a `Decimal` or a width of 64 bits or more in the runtime's box, a `Bool` as the
 /// runtime's object of it, a record of any words and a value of more than one word in a box of it,
 /// as `tir.in_box` holds them, and any other as its one word (0 for one of none). Raises as `laid`
 /// does.
@@ -958,7 +960,7 @@ pub fn word_form(ctors: Ctors, ty: Type) -> WordForm / {abort.raise} = {
     else if c.name == b"Bool" { Singleton }
     else if c.name == b"Float" || c.name == b"Decimal" { RuntimeBox } else {
       match width_named(c.name) {
-        Some(w) -> if in_imm(w) { Immediate } else if carried(w) { RuntimeBox } else { held },
+        Some(w) -> if in_imm(w) { Immediate } else { RuntimeBox },
         None -> held,
       }
     },
@@ -1198,7 +1200,7 @@ test "a type lays a value out in its words, a record in its fields' and a sum by
   assert_eq(
     [b"Unit", b"Bool", b"Char", b"Decimal", b"U8", b"U128", b"String"].map(|n: Bytes|
       classes(lay(named_type(n)))),
-    [[], [R({ lo: 0, hi: 1 })], [C(0)], [raw(), raw()], [raw()], [P], [P]],
+    [[], [R({ lo: 0, hi: 1 })], [C(0)], [raw(), raw()], [raw()], [raw(), raw()], [P]],
   );
   assert_eq(classes(lay(list_type(int_type()))), [P]);
   assert_eq(classes(lay(TyFn({ params: [int_type()], ret: int_type(), effects: row_empty() }))), [
@@ -1324,10 +1326,7 @@ test "two sums laid alike share a layout key, and Option<Color> and Option<Strin
   assert_eq(key(either(named_type(b"Char"))) == key(either(string_type())), false);
   // Whatever is laid as one pointer is one key, but a record, whose one word is a box of it.
   let pointer = key(string_type());
-  assert_eq(
-    [list_type(int_type()), named_type(b"U128"), applied(b"m.Wrap", [int_type()])].map(key),
-    [pointer, pointer, pointer],
-  );
+  assert_eq([list_type(int_type()), applied(b"m.Wrap", [int_type()])].map(key), [pointer, pointer]);
   assert_eq(key(TyRecord([{ name: b"s", ty: string_type() }])), b"{s:_}");
   // A record is keyed by its fields, a pointer among them by the one key of every pointer.
   let rec = |b: Type| key(TyRecord([{ name: b"a", ty: int_type() }, { name: b"b", ty: b }]));
@@ -1369,7 +1368,7 @@ test "a value is one word as itself, an immediate, the runtime's box or object, 
       Itself,
       Itself,
       Itself,
-      Itself,
+      RuntimeBox,
     ],
   );
   // A record is boxed however few its words, as `tir.in_box` holds it wherever emitted code makes

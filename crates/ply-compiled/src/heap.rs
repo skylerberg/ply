@@ -481,6 +481,7 @@ impl Slot {
     pub fn raw_words(self) -> usize {
         match self {
             Slot::Decimal => 2,
+            Slot::Wide(t) if ply_core::INT_TYPES[t as usize].bits() == 128 => 2,
             _ => 1,
         }
     }
@@ -497,6 +498,8 @@ pub fn spelled(name: &Symbol, slot: Slot) -> Symbol {
         Slot::Int => "int",
         Slot::Float => "f",
         Slot::Wide(t) if t == ply_core::IntTy::I64 as u8 => "i64",
+        Slot::Wide(t) if t == ply_core::IntTy::U128 as u8 => "u128",
+        Slot::Wide(t) if t == ply_core::IntTy::I128 as u8 => "i128",
         Slot::Wide(_) => "u64",
         Slot::Decimal => "d",
         Slot::Maybe => "m",
@@ -512,6 +515,8 @@ fn raw_of(spelling: &str) -> Option<Slot> {
         "f" => Some(Slot::Float),
         "u64" => Some(Slot::Wide(ply_core::IntTy::U64 as u8)),
         "i64" => Some(Slot::Wide(ply_core::IntTy::I64 as u8)),
+        "u128" => Some(Slot::Wide(ply_core::IntTy::U128 as u8)),
+        "i128" => Some(Slot::Wide(ply_core::IntTy::I128 as u8)),
         "d" => Some(Slot::Decimal),
         "m" => Some(Slot::Maybe),
         _ => None,
@@ -534,10 +539,17 @@ unsafe fn raw_value(o: *mut Obj, at: usize, slot: Slot) -> Value {
         match slot {
             Slot::Int => Value::Int(word_at(o, at) as i64),
             Slot::Float => Value::Float(f64::from_bits(word_at(o, at) as u64)),
-            Slot::Wide(t) => Value::Fixed(Fixed::new(
-                ply_core::INT_TYPES[t as usize],
-                word_at(o, at) as u64 as u128,
-            )),
+            Slot::Wide(t) => {
+                let high = if slot.raw_words() == 2 {
+                    u128::from(word_at(o, at + 1) as u64) << 64
+                } else {
+                    0
+                };
+                Value::Fixed(Fixed::new(
+                    ply_core::INT_TYPES[t as usize],
+                    high | u128::from(word_at(o, at) as u64),
+                ))
+            }
             Slot::Decimal => Value::Decimal(decimal_at(o, at)),
             Slot::Word | Slot::Record(_) | Slot::Maybe => {
                 unreachable!("a field held as a word, a record or an option")
@@ -576,7 +588,7 @@ pub fn raw_slot_of(layouts: &Layouts, w: Word) -> Option<Slot> {
     match kind(w) {
         KIND_INT if layouts.layout.raw_ints => Some(Slot::Int),
         KIND_FLOAT => Some(Slot::Float),
-        KIND_FIXED if unsafe { (*obj(w)).len } == 1 => {
+        KIND_FIXED if unsafe { (*obj(w)).len } == 1 || layouts.layout.raw_wides => {
             Some(Slot::Wide(unsafe { (*obj(w)).layout } as u8))
         }
         KIND_DECIMAL if layouts.layout.raw_decimals => Some(Slot::Decimal),
@@ -963,6 +975,8 @@ pub struct RecordLayout {
     pub raw_ints: bool,
     /// A `Decimal` held as its own two words, rather than by its word.
     pub raw_decimals: bool,
+    /// A `U128` or an `I128` held as its own two words, rather than by its word.
+    pub raw_wides: bool,
     /// A long slice of a bytes value a view of its bytes, rather than a copy of them.
     pub bytes_views: bool,
     /// An `Option` held as its payload's word, rather than by its word.
@@ -974,6 +988,7 @@ impl RecordLayout {
     pub const CURRENT: RecordLayout = RecordLayout {
         raw_ints: true,
         raw_decimals: true,
+        raw_wides: true,
         bytes_views: true,
         option_words: true,
     };

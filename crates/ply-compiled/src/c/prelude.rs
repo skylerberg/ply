@@ -156,6 +156,15 @@ typedef Word PlyMaybe;
 typedef Word PlyTagged;
 static inline PlyDec ply_dec_at(Word base, int64_t at) { PlyDec d; d.lo = ply_words(base)[at]; d.hi = ply_words(base)[at + 1]; return d; }
 static inline PlyDec ply_dec_of(Word w) { return ply_dec_at(w, 0); }
+/* A `U128` or an `I128` in registers: its low word, then its high one. */
+typedef struct { Word lo, hi; } PlyWide;
+static inline PlyWide ply_wide_at(Word base, int64_t at) { PlyWide x; x.lo = ply_words(base)[at]; x.hi = ply_words(base)[at + 1]; return x; }
+static inline PlyWide ply_wide_of(Word w) { return ply_wide_at(w, 0); }
+/* -1, 0 or 1 as `a` is below, at or above `b`, their high words signed where `s` is. */
+static inline int64_t ply_wide_order(PlyWide a, PlyWide b, int s) {
+  if (a.hi != b.hi) return (s ? (int64_t)a.hi < (int64_t)b.hi : (uint64_t)a.hi < (uint64_t)b.hi) ? -1 : 1;
+  return ((uint64_t)a.lo > (uint64_t)b.lo) - ((uint64_t)a.lo < (uint64_t)b.lo);
+}
 
 static inline Word ply_imm(int64_t v) { return (Word)(((uint64_t)v << 1) | 1); }
 static inline int64_t ply_imm_value(Word w) { return w >> 1; }
@@ -329,6 +338,7 @@ helpers! {
     rt_decimal_binary(op, a_lo, a_hi, b_lo, b_hi, out);
     rt_decimal_compare(a_lo, a_hi, b_lo, b_hi) -> Word;
     rt_decimal_negate(lo, hi, out);
+    rt_wide_op(code, a_lo, a_hi, b_lo, b_hi, out) -> Word;
     rt_unbox_float(w) -> Word;
     rt_float_rem(a, b) -> Word;
     rt_no_fuel();

@@ -18,8 +18,8 @@ import emit.layout (Laid, LSum, SumLaid, WordClass, CaseTest, WordIs, LowBits, N
                     block_sizes, columns_laid)
 import emit.tir (Fn, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Val, Literal, Static,
                  Prim, AInt, ABool, AVar, AFloat, AChar, ANum, AZero, Arg, Make, Made, MCase,
-                 Gathered, Pack, RInt, RBool, RFloat, RNum, RImm, RUnit, RFlat, RDec, RWord, RSum,
-                 Rep, Var, Return, Rooted, Kept, Owned, Lambda, Closure, no_links, rep_of_arg,
+                 Gathered, Pack, RInt, RBool, RFloat, RNum, RImm, RUnit, RFlat, RDec, RWide, RWord,
+                 RSum, Rep, Var, Return, Rooted, Kept, Owned, Lambda, Closure, no_links, rep_of_arg,
                  in_box)
 import emit.lower.held (values_of, words_held, held_with, record_fields, record_parts, RecordPart,
                         case_parts)
@@ -29,12 +29,8 @@ import emit.tir.statics (SPlain, WBytes, WAddress, StaticWord, int_kind, float_k
                          list_kind, map_kind, array_kind, columns_kind, flat_flag, bool_kind)
 
 /// A value the build knows whole, as static data holds it: a string's or a byte string's bytes, an
-/// embedded file by its bytes' digest, a 128-bit width's value as its high and low 64 bits.
-pub type Datum =
-  | SStr(Bytes)
-  | SBytes(Bytes)
-  | SEmbedded(Bytes)
-  | SWide({ width: Width, high: Int, low: Int })
+/// embedded file by its bytes' digest.
+pub type Datum = | SStr(Bytes) | SBytes(Bytes) | SEmbedded(Bytes)
 
 /// How `s` is laid out as one static object.
 pub fn laid_of(s: Datum) -> StaticLaid =
@@ -42,15 +38,6 @@ pub fn laid_of(s: Datum) -> StaticLaid =
     SStr(b) -> SBlock(text_block(b, str_kind())),
     SBytes(b) -> SBlock(text_block(b, bytes_kind())),
     SEmbedded(digest) -> SFile(digest),
-    SWide(w) ->
-      SBlock({
-        head: [
-          { field: b"kind", value: wide_kind() },
-          { field: b"len", value: 2 },
-          { field: b"layout", value: width_index(w.width) },
-        ],
-        words: [WRaw(w.low), WRaw(w.high)],
-      }),
   }
 
 /// The definitions `s` needs, each it addresses before it and itself last, which names it.
@@ -58,13 +45,13 @@ pub fn statics_of(s: Datum) -> List<StaticDef> / {abort.raise} = [named(laid_of(
 
 /// A value the build knows whole, as its type lays it in place: a word held raw (an `Int`'s, a
 /// `Float`'s bits, a `Bool`'s 0 or 1, a narrower width's bits extended as a register holds them, a
-/// `Char`'s immediate), a `Decimal`'s two words, a record's fields in its type's order, a sum's case
+/// `Char`'s immediate), a `Decimal`'s or a 128-bit width's two words, a record's fields in its type's order, a sum's case
 /// by its place among the sum's cases with that case's arguments in order, the address of a static
 /// object, a list's items or an array's elements in order (a `Columns`' records), or a map's
 /// entries in its order.
 pub type Known =
   | KnownWord(Int)
-  | KnownDecimal({ lo: Int, hi: Int })
+  | KnownPair({ lo: Int, hi: Int })
   | KnownRecord(List<Known>)
   | KnownCase({ case: Int, args: List<Known> })
   | KnownObject(Datum)
@@ -82,7 +69,7 @@ pub type Laying = { words: List<StaticWord>, defs: List<StaticDef> }
 pub fn laid_at(ctors: Ctors, ty: Type, k: Known) -> Laying / {abort.raise} = {
   let l = match k {
     KnownWord(n) -> { words: [WRaw(n)], defs: [] },
-    KnownDecimal(d) -> { words: [WRaw(d.lo), WRaw(d.hi)], defs: [] },
+    KnownPair(d) -> { words: [WRaw(d.lo), WRaw(d.hi)], defs: [] },
     KnownObject(d) -> {
       let defs = statics_of(d);
       { words: [WAddress({ name: defs.get(defs.len() - 1).name, tag: 0 })], defs: defs }
@@ -562,6 +549,11 @@ fn known_as(
   };
   let raw = match k { KnownWord(n) -> n, _ -> 0 };
   let scalar = |a: Arg| match k { KnownWord(_) -> { arg: a, b: b }, _ -> mislaid(ty) };
+  let paired = |op: Bytes|
+    match k {
+      KnownPair(d) -> bound(b, rep, Prim({ op: op, on: RInt, args: [AInt(d.lo), AInt(d.hi)] })),
+      _ -> mislaid(ty),
+    };
   match rep {
     RInt -> scalar(AInt(raw)),
     RBool -> scalar(ABool(raw != 0)),
@@ -569,11 +561,8 @@ fn known_as(
     RNum(w) -> scalar(ANum({ width: w, bits: raw })),
     RImm -> if (raw - 2) % 8 == 0 { scalar(AChar((raw - 2) / 8)) } else { mislaid(ty) },
     RUnit -> { arg: AZero(RUnit), b: b },
-    RDec -> match k {
-      KnownDecimal(d) ->
-        bound(b, rep, Prim({ op: b"decimal", on: RInt, args: [AInt(d.lo), AInt(d.hi)] })),
-      _ -> mislaid(ty),
-    },
+    RDec -> paired(b"decimal"),
+    RWide(_) -> paired(b"wide"),
     RWord -> match word_at(ctors, ty, k).word {
       WAddress(a) -> if a.tag == 0 { bound(b, rep, Static(a.name)) } else { mislaid(ty) },
       _ -> mislaid(ty),
@@ -622,7 +611,8 @@ fn known_as(
   }
 }
 
-/// The header of the runtime's box of a value of `ty`: a `Float`'s, a `Decimal`'s, a 64-bit width's.
+/// The header of the runtime's box of a value of `ty`: a `Float`'s, a `Decimal`'s, a width's of 64
+/// bits or more.
 fn runtime_head(ty: Type) -> List<{ field: Bytes, value: Int }> / {abort.raise} =
   match ty {
     TyCon(c) -> if c.name == b"Float" {
@@ -634,7 +624,7 @@ fn runtime_head(ty: Type) -> List<{ field: Bytes, value: Int }> / {abort.raise} 
         Some(w) ->
           [
             { field: b"kind", value: wide_kind() },
-            { field: b"len", value: 1 },
+            { field: b"len", value: if w.bits > 64 { 2 } else { 1 } },
             { field: b"layout", value: width_index(w) },
           ],
         None -> mislaid(ty),
@@ -654,7 +644,7 @@ pub fn known_of_value(ctors: Ctors, ty: Type, v: Value) -> Result<Known, Bytes> 
     VInt(n) -> scalar(ty, b"Int", KnownWord(n)),
     VFloat(x) -> scalar(ty, b"Float", KnownWord(bits_of_float(x))),
     VDecimal(d) ->
-      scalar(ty, b"Decimal", KnownDecimal(decimal_words(Bytes::of_string(d.to_string())))),
+      scalar(ty, b"Decimal", KnownPair(decimal_words(Bytes::of_string(d.to_string())))),
     VChar(c) -> scalar(ty, b"Char", KnownWord(Int::of_char(c) * 8 + 2)),
     VStr(s) -> scalar(ty, b"String", KnownObject(SStr(Bytes::of_string(s)))),
     VBytes(b) -> scalar(ty, b"Bytes", KnownObject(SBytes(b))),
@@ -754,16 +744,10 @@ fn knowns_of(
     })
 
 /// The bits a width's value `bits` (nothing above the width) is held as: its register's word, sign-
-/// or zero-extended, below 128 bits; its runtime box's two words at 128.
+/// or zero-extended, below 128 bits; its low and its high word at 128.
 fn fixed_known(w: Width, bits: U128) -> Known / {abort.raise} =
   if w.bits == 128 {
-    KnownObject(
-      SWide({
-        width: w,
-        high: signed(bits >>> 64),
-        low: signed(bits & wrap_sub(1u128 << 64, 1u128)),
-      }),
-    )
+    KnownPair({ lo: signed(bits & wrap_sub(1u128 << 64, 1u128)), hi: signed(bits >>> 64) })
   } else if w.signed && bits >= 1u128 << w.bits - 1 {
     KnownWord(0 - Int::of_u128((1u128 << w.bits) - bits))
   } else { KnownWord(signed(bits)) }
@@ -869,6 +853,21 @@ fn folded_val(into: Option<Var>, v: Val, held: Held) -> { val: Val, held: Held }
           let w = decimal_words(text);
           { val: Prim({ op: b"decimal", on: RInt, args: [AInt(w.lo), AInt(w.hi)] }), held: held }
         },
+        LWide(_, high, low) ->
+          { val: Prim({ op: b"wide", on: RInt, args: [AInt(low), AInt(high)] }), held: held },
+        LFixed(name, bits) -> match width_named(name) {
+          Some(w) -> if w.bits < 128 { { val: v, held: held } } else {
+            {
+              val: Prim({
+                op: b"wide",
+                on: RInt,
+                args: [AInt(bits), AInt(if bits < 0 { 0 - 1 } else { 0 })],
+              }),
+              held: held,
+            }
+          },
+          None -> { val: v, held: held },
+        },
         _ -> { val: v, held: held },
       },
     },
@@ -889,7 +888,7 @@ fn known_bound(y: Var, v: Val, held: Held) -> { val: Val, held: Held } / {abort.
   match v {
     Static(name) -> { val: v, held: knowing(held, y, [WAddress({ name: name, tag: 0 })]) },
     Prim(p) -> match p.args {
-      [AInt(lo), AInt(hi)] -> if p.op == b"decimal" {
+      [AInt(lo), AInt(hi)] -> if p.op == b"decimal" || p.op == b"wide" {
         { val: v, held: knowing(held, y, [WRaw(lo), WRaw(hi)]) }
       } else { same },
       _ -> same,
@@ -1034,23 +1033,13 @@ fn with_tag(w: StaticWord, bits: Int) -> StaticWord / {abort.raise} =
     }
   }
 
-/// The static object literal `l` is, where it is one: a string, a byte string, an embedded file, and
-/// a width wider than a register, whose literal holds its low 64 bits alone where the high ones only
-/// extend their sign.
+/// The static object literal `l` is, where it is one: a string, a byte string, an embedded file.
 fn static_of_lit(l: Lit) -> Option<Datum> =
   match l {
     LStr(s) -> Some(SStr(s)),
     LBytes(b) -> Some(SBytes(b)),
     LEmbedded(digest, _) -> Some(SEmbedded(digest)),
-    LWide(name, high, low) -> wide_of(name, high, low),
-    LFixed(name, bits) -> wide_of(name, if bits < 0 { 0 - 1 } else { 0 }, bits),
     _ -> None,
-  }
-
-fn wide_of(name: Bytes, high: Int, low: Int) -> Option<Datum> =
-  match width_named(name) {
-    Some(w) -> if w.bits > 64 { Some(SWide({ width: w, high: high, low: low })) } else { None },
-    None -> None,
   }
 
 /// The two words a `Decimal` literal's text names, as the runtime lays a decimal out: its flags (its
@@ -1198,24 +1187,21 @@ test "a decimal literal is its two words, its scale as written and a zero never 
   assert_eq(d.statics, [])
 }
 
-test "a width wider than a register is the runtime's box of it: its place among widths, its low word, its high" {
+test "a 128-bit width is its two words in its registers, its low word first, and a box of them as a word" {
   let wide = { bits: 128, signed: true };
-  assert_eq(
-    laid_of(SWide({ width: wide, high: 0 - 1, low: 0 - 5 })),
-    SBlock({
-      head: [
-        { field: b"kind", value: wide_kind() },
-        { field: b"len", value: 2 },
-        { field: b"layout", value: width_index(wide) },
-      ],
-      words: [WRaw(0 - 5), WRaw(0 - 1)],
-    }),
-  );
   // A literal holding only its low word extends its sign into the high one.
-  let f = folded(root([bind(local(0, b"I128", RWord), Literal(LFixed(b"I128", 0 - 5)))], []));
+  let f = folded(root([bind(local(0, b"I128", RWide(wide)), Literal(LFixed(b"I128", 0 - 5)))], []));
   assert_eq(bound_values(f.body), [
-    Static(name_of(SWide({ width: wide, high: 0 - 1, low: 0 - 5 }))),
+    Prim({ op: b"wide", on: RInt, args: [AInt(0 - 5), AInt(0 - 1)] }),
   ]);
+  assert_eq(f.statics, []);
+  let big = folded(
+    root(
+      [bind(local(0, b"U128", RWide({ bits: 128, signed: false })), Literal(LWide(b"U128", 1, 7)))],
+      [],
+    ),
+  );
+  assert_eq(bound_values(big.body), [Prim({ op: b"wide", on: RInt, args: [AInt(7), AInt(1)] })]);
   // `()` stays the runtime's word.
   let u = folded(root([bind(local(0, b"Unit", RWord), Literal(LUnit))], []));
   assert_eq(bound_values(u.body), [Literal(LUnit)])
@@ -1392,7 +1378,7 @@ test "a value is its word form where one word is required" {
     ),
   );
   assert_eq(
-    boxed(named_type(b"Decimal"), KnownDecimal({ lo: 1, hi: 2 })),
+    boxed(named_type(b"Decimal"), KnownPair({ lo: 1, hi: 2 })),
     Some(
       SBlock({
         head: [{ field: b"kind", value: decimal_kind() }, { field: b"len", value: 2 }],
@@ -1440,12 +1426,12 @@ test "a value std.value holds is known as its type lays it, and one its type hol
   );
   assert_eq(
     know(named_type(b"I128"), VFixed("I128", wrap_sub(0u128, 5u128))),
-    Ok(KnownObject(SWide({ width: { bits: 128, signed: true }, high: 0 - 1, low: 0 - 5 }))),
+    Ok(KnownPair({ lo: 0 - 5, hi: 0 - 1 })),
   );
   assert_eq(know(named_type(b"Char"), VChar('a')), Ok(KnownWord(97 * 8 + 2)));
   assert_eq(
     know(named_type(b"Decimal"), VDecimal(Decimal::of_int(3))),
-    Ok(KnownDecimal(decimal_words(b"3m"))),
+    Ok(KnownPair(decimal_words(b"3m"))),
   );
   let ints = of(b"List", [int_type()]);
   assert_eq(know(ints, VList([VInt(1), VInt(2)])), Ok(KnownList([KnownWord(1), KnownWord(2)])));

@@ -76,6 +76,14 @@ pub fn natives() -> Vec<MachineNative> {
             rt_taken_word as unsafe extern "C" fn(_, _) -> _,
         ),
         machine_native("?blake3", rt_blake3 as unsafe extern "C" fn(_, _, _) -> _),
+        machine_native(
+            "?scalar_encoded",
+            rt_scalar_encoded as unsafe extern "C" fn(_, _, _, _, _) -> _,
+        ),
+        machine_native(
+            "?text_encoded",
+            rt_text_encoded as unsafe extern "C" fn(_, _, _, _) -> _,
+        ),
         machine_native("?gzip", rt_gzip as unsafe extern "C" fn(_, _, _) -> _),
         machine_native("?gunzip", rt_gunzip as unsafe extern "C" fn(_, _, _) -> _),
         machine_native("?zstd", rt_zstd as unsafe extern "C" fn(_, _, _) -> _),
@@ -352,6 +360,66 @@ pub unsafe extern "C" fn rt_taken_word(ctx: *mut Ctx, k: I64) -> I64 {
 }
 
 /// The BLAKE3 digest of the `n` bytes at `p`, as taken bytes.
+/// The encoding `digest` hashes of a scalar, left as taken bytes, answering their count: `kind` 0 a
+/// `()`, 1 a `Bool` that is `lo`, 2 an `Int` or a narrower width that reads as `lo`, 3 the width at
+/// `t` in [`ply_core::INT_TYPES`] whose bits are `lo` and above them `hi`, 4 the `Char` of scalar
+/// value `lo`, 5 the `Decimal` whose two words are `lo` and `hi`.
+pub unsafe extern "C" fn rt_scalar_encoded(
+    ctx: *mut Ctx,
+    kind: I64,
+    t: I64,
+    lo: I64,
+    hi: I64,
+) -> I64 {
+    let c = unsafe { &mut *ctx };
+    let v = match kind.0 {
+        0 => Some(Value::Unit),
+        1 => Some(Value::Bool(lo.0 != 0)),
+        2 => Some(Value::Int(lo.0)),
+        3 => usize::try_from(t.0)
+            .ok()
+            .and_then(|i| ply_core::INT_TYPES.get(i))
+            .map(|ty| {
+                let bits = (u128::from(hi.0 as u64) << 64) | u128::from(lo.0 as u64);
+                Value::Fixed(Fixed::new(*ty, bits))
+            }),
+        4 => u32::try_from(lo.0)
+            .ok()
+            .and_then(char::from_u32)
+            .map(Value::Char),
+        5 => Some(Value::Decimal(decimal_of(lo, hi))),
+        _ => None,
+    };
+    let Some(v) = v else {
+        return I64(c.fail(err_machine("a scalar's encoding of no scalar")));
+    };
+    encoded_given(c, &v)
+}
+
+/// The encoding `digest` hashes of the string, where `text` is not 0, or else the byte string, of
+/// the `n` bytes at `p`, left as taken bytes, answering their count.
+pub unsafe extern "C" fn rt_text_encoded(ctx: *mut Ctx, text: I64, p: Addr, n: I64) -> I64 {
+    let c = unsafe { &mut *ctx };
+    let bytes = unsafe { lent(p, n) };
+    let v = if text.0 != 0 {
+        match c.text(bytes) {
+            Some(s) => Value::str(s),
+            None => return I64(0),
+        }
+    } else {
+        Value::bytes(bytes)
+    };
+    encoded_given(c, &v)
+}
+
+/// `v`'s encoding left as taken bytes, its count answered.
+fn encoded_given(c: &mut Ctx, v: &Value) -> I64 {
+    match ply_core::digest::encoded(v, Span::DUMMY) {
+        Ok(bytes) => c.give(bytes),
+        Err(d) => I64(c.fail(d)),
+    }
+}
+
 pub unsafe extern "C" fn rt_blake3(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     let digest = blake3::hash(unsafe { lent(p, n) });
     unsafe { &mut *ctx }.give(digest.as_bytes().to_vec())

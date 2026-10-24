@@ -15,19 +15,18 @@ import emit.keys
 import emit.keys (Root, Contained, root_name, root_text)
 import emit.reps (Def, EmitParam, SumCtor, kind_of)
 import emit.roots (builtin_helper)
-import emit.c (width_named, width_index)
-import emit.tir (Rep, RInt, RBool, RNum, RWord, RFloat, RAddr, RSum, RImm, Var, Arg, AVar, AInt,
-                 AZero, Prim, Get, Path, PField, PPayload, PCase, Native, Op, OContainer, OStrings,
-                 Containers, Make, MList, Call, If, Case, TTag, string_uses, rep_of_arg)
+import emit.tir (Rep, RInt, RBool, RNum, RDec, RWide, RWord, RFloat, RAddr, RSum, RImm, Var, Arg,
+                 AVar, AInt, AZero, Prim, Get, Path, PPayload, PCase, Native, Op, OContainer,
+                 OStrings, Containers, Make, MList, Call, If, Case, TTag, string_uses, rep_of_arg)
 import emit.tir.containers (Length, Taken)
 import emit.tir.strings (StringOp, Made, Copied, ByteSet, ByteRead, U32Read, Grown, Compared, Found,
                          CharsIn, CharStart, Scanned)
 import emit.lower.setting (ctor_named, ctor_sum, prelude_ctor)
 import emit.lower.held (held_as, case_index, arg_word, typed_convention)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, done, handed, opened,
-                        continued, joined, short_circuit, filed)
+                        pair_words, continued, joined, short_circuit, filed)
 import emit.lower.data (constructed_as, open_needed)
-import emit.lower.scalars (literal, dec_words)
+import emit.lower.scalars (literal)
 import emit.lower.crossing (addressed, taken_out, over_encoding, blake3_of)
 
 /// Whether a call of builtin `name` is written here.
@@ -270,13 +269,13 @@ fn one_converted(c: Asked, st: Lowering, a: Arg) -> Lowered / {abort.raise} = {
     let k = native_int(b.st, b"?float_text", [b.arg], at);
     taken_out(k.st, k.arg, string_type(), at)
   } else if n == b"Decimal::to_string" {
-    let w = dec_words(st, a, at);
+    let w = pair_words(st, a, RDec, at);
     let k = native_int(w.st, b"?decimal_text", [w.lo, w.hi], at);
     taken_out(k.st, k.arg, string_type(), at)
   } else if n == b"U128::to_string" || n == b"I128::to_string" {
-    let w = words_of(st, a, at);
-    let signed = AInt(if n.starts_with(b"I") { 1 } else { 0 });
-    let k = native_int(w.st, b"?wide_text", [signed, w.lo, w.hi], at);
+    let signed = n.starts_with(b"I");
+    let w = pair_words(st, a, RWide({ bits: 128, signed: signed }), at);
+    let k = native_int(w.st, b"?wide_text", [AInt(if signed { 1 } else { 0 }), w.lo, w.hi], at);
     taken_out(k.st, k.arg, string_type(), at)
   } else if n == b"Float::of_string" {
     let k = native_over(st, b"?float_parse", a, [], at);
@@ -294,13 +293,15 @@ fn one_converted(c: Asked, st: Lowering, a: Arg) -> Lowered / {abort.raise} = {
   } else if n == b"Decimal::of_string" {
     let k = native_over(st, b"?decimal_parse", a, [], at);
     let d = named_type(b"Decimal");
-    maybe(c.cx, k, d, |s: Lowering| boxed_words(c.cx, s, b"rt_box_decimal_p", [], d, at), at)
+    maybe(c.cx, k, d, |s: Lowering| taken_pair(s, b"decimal", { ty: d, rep: RDec }, at), at)
   } else if n == b"U128::of_string" || n == b"I128::of_string" {
     let signed = AInt(if n.starts_with(b"I") { 1 } else { 0 });
     let k = native_over_after(st, b"?wide_parse", [signed], a, at);
-    let w = named_type(n.slice(0, 4));
-    let width = AInt(match width_named(n.slice(0, 4)) { Some(x) -> width_index(x), None -> 0 });
-    maybe(c.cx, k, w, |s: Lowering| boxed_words(c.cx, s, b"rt_box_wide_p", [width], w, at), at)
+    let w = {
+      ty: named_type(n.slice(0, 4)),
+      rep: RWide({ bits: 128, signed: n.starts_with(b"I") }),
+    };
+    maybe(c.cx, k, w.ty, |s: Lowering| taken_pair(s, b"wide", w, at), at)
   } else if n == b"Secret::of_string" || n == b"Secret::of_bytes" {
     let t = addressed(st, a, at);
     let text = AInt(if n == b"Secret::of_string" { 1 } else { 0 });
@@ -808,65 +809,17 @@ fn maybe(
   joined(cx, none, n, s, false, at)
 }
 
-/// The value of type `ty` whose two words a parse left taken, boxed by the runtime's helper `boxer`
-/// (handed `extra` after them) and held as `ty` is.
-fn boxed_words(
-  cx: Context,
+/// The `Decimal` or 128-bit width of type `two.ty`, held as `two.rep`, whose two words a parse left
+/// taken, made in its registers by `op`.
+fn taken_pair(
   st: Lowering,
-  boxer: Bytes,
-  extra: List<Arg>,
-  ty: Type,
+  op: Bytes,
+  two: { ty: Type, rep: Rep },
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let lo = native_int(st, b"?taken_word", [AInt(0)], at);
   let hi = native_int(lo.st, b"?taken_word", [AInt(1)], at);
-  let w = bound_as(
-    hi.st,
-    ty,
-    RWord,
-    Native({
-      name: boxer,
-      args: [lo.arg, hi.arg].concat(extra),
-      uses: {
-        takes: [false, false].concat(extra.map(|_: Arg| false)),
-        owned: true,
-        fails: false,
-        stops: false,
-      },
-    }),
-    at,
-  );
-  handed(w, held_as(cx.setting, ty), at)
-}
-
-/// The two words of a 128-bit width `a`, read out of its box.
-fn words_of(st: Lowering, a: Arg, at: Span) -> { st: Lowering, lo: Arg, hi: Arg } = {
-  let boxed = handed({ st: st, arg: a }, RWord, at);
-  match boxed.arg {
-    AVar(v) -> {
-      let lo = bound_as(
-        boxed.st,
-        int_type(),
-        RInt,
-        Get({ of: v, path: PField({ name: b"lo", at: 0 }) }),
-        at,
-      );
-      let hi = bound_as(
-        lo.st,
-        int_type(),
-        RInt,
-        Get({ of: v, path: PField({ name: b"hi", at: 1 }) }),
-        at,
-      );
-      { st: hi.st, lo: lo.arg, hi: hi.arg }
-    },
-    _ ->
-      {
-        st: refuse(boxed.st, Containers, b"a number's words no variable holds").st,
-        lo: AInt(0),
-        hi: AInt(0),
-      },
-  }
+  bound_as(hi.st, two.ty, two.rep, Prim({ op: op, on: RInt, args: [lo.arg, hi.arg] }), at)
 }
 
 /// `a`, a string or byte string, as the same block at type `ty`: the two are laid alike.

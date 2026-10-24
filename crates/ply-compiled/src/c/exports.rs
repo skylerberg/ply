@@ -73,8 +73,9 @@ pub struct Exports {
     /// Each constructor whose type's module states a `numeric`, with its functions in the
     /// order of [`ply_core::instances`]' roles, spelled as the others are. Each has a row above.
     pub numerics: Vec<(Symbol, [String; 5])>,
-    /// How the unit's C reads an `Int`, a `Decimal`, a bytes slice and an `Option`, as its
-    /// [`RAW_INTS`], [`RAW_DECIMALS`], [`BYTES_VIEWS`] and [`OPTION_WORDS`] lines say.
+    /// How the unit's C reads an `Int`, a `Decimal`, a 128-bit width, a bytes slice and an
+    /// `Option`, as its [`RAW_INTS`], [`RAW_DECIMALS`], [`RAW_WIDES`], [`BYTES_VIEWS`] and
+    /// [`OPTION_WORDS`] lines say.
     pub layout: RecordLayout,
     /// Each root the unit is entered at through its `R#entered`, as its [`ENTERED`] lines say.
     pub entered: Vec<String>,
@@ -88,6 +89,10 @@ pub const RAW_INTS: &str = "ints held raw";
 /// holds as its two words. A unit without it was emitted by a `ply` that reads the `Decimal`'s word,
 /// as a bootstrap's first builder is.
 pub const RAW_DECIMALS: &str = "decimals held raw";
+
+/// A line after a unit's tables, where its C reads a `U128` or an `I128` a record, an array or a
+/// constructor holds as its two words; a unit without it reads the width's word.
+pub const RAW_WIDES: &str = "128-bit widths held raw";
 
 /// A line after a unit's tables, where its C reads a bytes value's bytes through `ply_bytes`, which
 /// follows a view to the value it views; a unit without it reads them in place.
@@ -189,6 +194,9 @@ impl Exports {
         if self.layout.raw_decimals {
             out.push_str(&format!("{RAW_DECIMALS}\n"));
         }
+        if self.layout.raw_wides {
+            out.push_str(&format!("{RAW_WIDES}\n"));
+        }
         if self.layout.bytes_views {
             out.push_str(&format!("{BYTES_VIEWS}\n"));
         }
@@ -265,6 +273,7 @@ impl Exports {
         let mut layout = RecordLayout {
             raw_ints: false,
             raw_decimals: false,
+            raw_wides: false,
             bytes_views: false,
             option_words: false,
         };
@@ -273,6 +282,7 @@ impl Exports {
             match line(s, &mut at)? {
                 RAW_INTS => layout.raw_ints = true,
                 RAW_DECIMALS => layout.raw_decimals = true,
+                RAW_WIDES => layout.raw_wides = true,
                 BYTES_VIEWS => layout.bytes_views = true,
                 OPTION_WORDS => layout.option_words = true,
                 other => {

@@ -197,12 +197,13 @@ fn a_unit_says_how_it_lays_out_records_and_constructors() {
             spelled(&["a000!r(x!f,y!f)", "a001"]),
         ),
     ];
-    for bits in 0..16 {
+    for bits in 0..32 {
         exports.layout = ply_compiled::heap::RecordLayout {
             raw_decimals: bits & 1 != 0,
             bytes_views: bits & 2 != 0,
             option_words: bits & 4 != 0,
             raw_ints: bits & 8 != 0,
+            raw_wides: bits & 16 != 0,
         };
         let read =
             ply_compiled::c::Exports::decode(&exports.encode()).expect("the table reads back");
