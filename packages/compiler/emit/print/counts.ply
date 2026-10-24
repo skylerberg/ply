@@ -16,7 +16,7 @@ import emit.answer (CallAt, Expect)
 import emit.roots (symbol_of)
 import emit.layout (SumLaid, WordIs, WordOutside, LowBits, Nullary, Inline, Boxed, LWords, P, R, S,
                     U, LSum, words, pointer_floor, tag_bits, header_bytes, str_laid, layouts,
-                    columns_laid, block_sizes)
+                    columns_laid, block_sizes, branch_laid)
 import emit.lower.held (values_of, leaf_values, passing, InWords, ByReference, answer_buffer,
                         held_with)
 import std.pace (Measure, outgrown)
@@ -672,23 +672,10 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
     },
     ListOf(l) -> {
       let laid = layouts().list;
-      let items = let_go_of(pr, l.item, [b"ply_w"]);
+      let w = item_read_at(x, laid.tail, l.stride);
+      let items = let_go_of(pr, l.item, w.names);
       let root = rooted(items.pr, l.node, rel_fn(), slot(x, laid.root));
-      let tail = if items.out.len() == 0 { [] } else {
-        [
-          Text(
-            Bytes::concat_all([
-              b"Word ply_w = ply_words(",
-              x,
-              b")[",
-              ascii_of_int(laid.tail),
-              b" + ply_i]; ",
-            ]),
-          ),
-        ].concat(
-          items.out,
-        )
-      };
+      let tail = if items.out.len() == 0 { [] } else { [Text(w.read)].concat(items.out) };
       {
         pr: root.pr,
         out: [Text(b"{ ")].concat(looped(field(x, laid.tail_len), tail)).push(Text(b" ")).concat(
@@ -703,8 +690,8 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
                   ascii_of_int(header_bytes()),
                   b" + 8 * (",
                   ascii_of_int(laid.tail),
-                  b" + (int64_t)",
-                  field(x, laid.room),
+                  b" + ",
+                  items_words(Bytes::concat_all([b"(int64_t)", field(x, laid.room)]), l.stride),
                   b")",
                 ]),
               ),
@@ -717,10 +704,9 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
     NodeOf(n) -> {
       let trie = layouts().trie;
       let kids = rooted(pr, n.node, rel_fn(), slot_at(x, b"ply_i"));
-      let items = let_go_of(kids.pr, n.item, [b"ply_w"]);
-      let leaves = if items.out.len() == 0 { [] } else {
-        [Text(Bytes::concat_all([b"Word ply_w = ", slot_at(x, b"ply_i"), b"; "]))].concat(items.out)
-      };
+      let w = item_read_at(x, 0, n.stride);
+      let items = let_go_of(kids.pr, n.item, w.names);
+      let leaves = if items.out.len() == 0 { [] } else { [Text(w.read)].concat(items.out) };
       {
         pr: items.pr,
         out: [
@@ -762,21 +748,19 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
     },
     PairsOf(m) -> {
       let tree = layouts().tree;
+      let br = branch_laid(m.key_words);
+      let pair = m.key_words + m.value_words;
       let kid = rooted(pr, m.node, rel_fn(), slot_at(x, b"ply_i"));
-      let max = let_go_of(kid.pr, m.key, [b"ply_k"]);
-      let keys = let_go_of(max.pr, m.key, [b"ply_k"]);
-      let values = let_go_of(keys.pr, m.value, [b"ply_v"]);
-      let read = |into: Bytes, at: Bytes, s: Said|
-        if s.out.len() == 0 { [] } else {
-          [Text(Bytes::concat_all([b"Word ", into, b" = ", slot_at(x, at), b"; "]))].concat(s.out)
-        };
-      let branch = kid.out.push(Text(b" ")).concat(
-        read(b"ply_k", Bytes::concat_all([ascii_of_int(tree.keys), b" + ply_i"]), max),
-      );
-      let leaf = spaced(
-        read(b"ply_k", b"2 * ply_i", keys),
-        read(b"ply_v", b"2 * ply_i + 1", values),
-      );
+      let greatest = run_read(x, b"ply_k", br.keys, m.key_words, m.key_words);
+      let max = let_go_of(kid.pr, m.key, greatest.names);
+      let leaf_keys = run_read(x, b"ply_k", 0, pair, m.key_words);
+      let keys = let_go_of(max.pr, m.key, leaf_keys.names);
+      let leaf_values = run_read(x, b"ply_v", m.key_words, pair, m.value_words);
+      let values = let_go_of(keys.pr, m.value, leaf_values.names);
+      let read = |r: { names: List<Bytes>, read: Bytes }, s: Said|
+        if s.out.len() == 0 { [] } else { [Text(r.read)].concat(s.out) };
+      let branch = kid.out.push(Text(b" ")).concat(read(greatest, max));
+      let leaf = spaced(read(leaf_keys, keys), read(leaf_values, values));
       {
         pr: values.pr,
         out: [
@@ -792,22 +776,21 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
         ].concat(
           looped(field(x, b"len"), branch),
         ).push(
-          Text(Bytes::concat_all([b" ", freed(x, block_sizes().branch_words), b" } else { "])),
+          Text(b" } else { "),
         ).concat(
           looped(field(x, b"len"), leaf),
         ).push(
           Text(
             Bytes::concat_all([
-              b" ",
+              b" } ",
               given_back(
                 x,
                 Bytes::concat_all([
                   ascii_of_int(header_bytes()),
-                  b" + 16 * (int64_t)",
-                  field(x, block_sizes().leaf_room),
+                  b" + 8 * (int64_t)",
+                  field(x, block_sizes().node_room),
                 ]),
               ),
-              b" }",
             ]),
           ),
         ),
@@ -848,6 +831,52 @@ fn contents_let_go(pr: Printing, x: Bytes, opening: Opening) -> Said / {abort.ra
 
 /// Word `at`, a C expression, of the block `x`.
 fn slot_at(x: Bytes, at: Bytes) -> Bytes = Bytes::concat_all([b"ply_words(", x, b")[", at, b"]"])
+
+/// The names the words of item `ply_i` of the block `x` are read into, its items lying `stride`
+/// words apart from word `from`, and the C declaring them.
+fn item_read_at(
+  x: Bytes,
+  from: Int,
+  stride: Int,
+) -> { names: List<Bytes>, read: Bytes } / {abort.raise} =
+  run_read(x, b"ply_w", from, stride, stride)
+
+/// The names `count` words of the `ply_i`-th run of `stride` words of the block `x` from its word
+/// `from` are read into, `prefix` and their place, and the C declaring them.
+fn run_read(
+  x: Bytes,
+  prefix: Bytes,
+  from: Int,
+  stride: Int,
+  count: Int,
+) -> { names: List<Bytes>, read: Bytes } / {abort.raise} = {
+  let slots = run_slots(x, from, stride, count);
+  let names = if count == 1 { [prefix] }
+  else { range(0, count).map(|j: Int| prefix.concat(ascii_of_int(j))) };
+  {
+    names: names,
+    read: Bytes::concat_all(
+      range(0, count).map(|j: Int|
+        Bytes::concat_all([b"Word ", names.get(j), b" = ", slots.get(j), b"; "])),
+    ),
+  }
+}
+
+/// The words of item `ply_i` of the block `x`, its items lying `stride` words apart from word
+/// `from`, as C.
+fn item_slots_at(x: Bytes, from: Int, stride: Int) -> List<Bytes> =
+  run_slots(x, from, stride, stride)
+
+/// `count` words of the `ply_i`-th run of `stride` words of the block `x` from its word `from`, as C.
+fn run_slots(x: Bytes, from: Int, stride: Int, count: Int) -> List<Bytes> =
+  range(0, count).map(|j: Int|
+    slot_at(x, if stride != 1 {
+      Bytes::concat_all([ascii_of_int(from + j), b" + ply_i * ", ascii_of_int(stride)])
+    } else if from + j == 0 { b"ply_i" }
+    else { ascii_of_int(from + j).concat(b" + ply_i") }))
+/// The C counting `n` items' words, `stride` to an item.
+fn items_words(n: Bytes, stride: Int) -> Bytes =
+  if stride == 1 { n } else { Bytes::concat_all([n, b" * ", ascii_of_int(stride)]) }
 
 /// `Walked({ of, op })` into `into`: a sum of one word through the block its case holds, anything
 /// else through the block its word names.
@@ -1305,13 +1334,13 @@ fn block_size(x: Bytes, o: Opening) -> Bytes =
         field(x, str_laid().room),
         b" + 7) & ~(int64_t)7))",
       ]),
-    ListOf(_) ->
+    ListOf(l) ->
       Bytes::concat_all([
         ascii_of_int(header_bytes()),
         b" + 8 * (",
         ascii_of_int(layouts().list.tail),
-        b" + (int64_t)",
-        field(x, layouts().list.room),
+        b" + ",
+        items_words(Bytes::concat_all([b"(int64_t)", field(x, layouts().list.room)]), l.stride),
         b")",
       ]),
     NodeOf(_) ->
@@ -1323,17 +1352,9 @@ fn block_size(x: Bytes, o: Opening) -> Bytes =
     MapOf(_) -> ascii_of_int(header_bytes() + 8 * block_sizes().map_words),
     PairsOf(_) ->
       Bytes::concat_all([
-        b"(",
-        field(x, b"kind"),
-        b" == ",
-        ascii_of_int(layouts().tree.branch),
-        b" ? ",
-        ascii_of_int(header_bytes() + 8 * block_sizes().branch_words),
-        b" : ",
         ascii_of_int(header_bytes()),
-        b" + 16 * (int64_t)",
-        field(x, block_sizes().leaf_room),
-        b")",
+        b" + 8 * (int64_t)",
+        field(x, block_sizes().node_room),
       ]),
     ArrayOf(_) ->
       Bytes::concat_all([ascii_of_int(header_bytes()), b" + 8 * (int64_t)", field(x, b"len")]),
@@ -1443,15 +1464,13 @@ pub fn slots_walked(
       }
     },
     ListOf(l) -> {
-      let items = act(pr, l.item, [
-        slot_at(b, Bytes::concat_all([ascii_of_int(layouts().list.tail), b" + ply_i"])),
-      ]);
+      let items = act(pr, l.item, item_slots_at(b, layouts().list.tail, l.stride));
       let root = act(items.pr, node(l.node), [slot(b, layouts().list.root)]);
       { pr: root.pr, out: spaced(looped(field(b, layouts().list.tail_len), items.out), root.out) }
     },
     NodeOf(n) -> {
       let kids = act(pr, node(n.node), [slot_at(b, b"ply_i")]);
-      let items = act(kids.pr, n.item, [slot_at(b, b"ply_i")]);
+      let items = act(kids.pr, n.item, item_slots_at(b, 0, n.stride));
       {
         pr: items.pr,
         out: [
@@ -1478,12 +1497,15 @@ pub fn slots_walked(
     MapOf(k) -> act(pr, node(k), [slot(b, layouts().map.root)]),
     PairsOf(m) -> {
       let tree = layouts().tree;
+      let pair = m.key_words + m.value_words;
       let kid = act(pr, node(m.node), [slot_at(b, b"ply_i")]);
-      let greatest = act(kid.pr, m.key, [
-        slot_at(b, Bytes::concat_all([ascii_of_int(tree.keys), b" + ply_i"])),
-      ]);
-      let keys = act(greatest.pr, m.key, [slot_at(b, b"2 * ply_i")]);
-      let values = act(keys.pr, m.value, [slot_at(b, b"2 * ply_i + 1")]);
+      let greatest = act(
+        kid.pr,
+        m.key,
+        run_slots(b, branch_laid(m.key_words).keys, m.key_words, m.key_words),
+      );
+      let keys = act(greatest.pr, m.key, run_slots(b, 0, pair, m.key_words));
+      let values = act(keys.pr, m.value, run_slots(b, m.key_words, pair, m.value_words));
       {
         pr: values.pr,
         out: [
@@ -2210,7 +2232,7 @@ test "a list opened lets go of its tail's items and its trie, and gives itself b
     0,
     local(0, RWord),
     [],
-    ListOf({ node: node, item: [word(0, Object(item))] }),
+    ListOf({ node: node, item: [word(0, Object(item))], stride: 1 }),
   );
   // Each tail item at the item's root, the trie at the node's, the list given back by its room.
   let text = spelled(opened.out);
@@ -2495,7 +2517,11 @@ fn walked_said(
 test "a node copied is a fresh block of its header and words, each counted once more, the original let go" {
   let item = dropping_of(b"String");
   let node = drop_of(TyCon({ name: list_node_name(), args: [string()] }));
-  let copy = walked_said(Copy, NodeOf({ node: node, item: [word(0, Object(item))] }), node);
+  let copy = walked_said(
+    Copy,
+    NodeOf({ node: node, item: [word(0, Object(item))], stride: 1 }),
+    node,
+  );
   [
     call_text(fresh_block_fn(), [b"ctx", b"p0", b"16 + 8 * (int64_t)ply_obj(p0)->layout"]),
     Bytes::concat_all([
@@ -2659,7 +2685,7 @@ test "what is or reaches a runtime handle, a hold or a function value is kept as
   let captured = |ty: Type| InBox({ parts: [{ at: 1, ty: ty, rep: RWord }], words: 2 });
   let inner = TyRecord([{ name: b"c", ty: chan }, { name: b"n", ty: int }]);
   let outer = TyRecord([{ name: b"r", ty: inner }, { name: b"s", ty: string }]);
-  let closures = ListOf({ node: dropping_of(b"ListNode"), item: [word(0, Through)] });
+  let closures = ListOf({ node: dropping_of(b"ListNode"), item: [word(0, Through)], stride: 1 });
   let dropped = dropping_of(b"m.R");
   [
     captured(chan),

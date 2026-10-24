@@ -15,7 +15,7 @@ import emit.keys (RootKey, Named)
 import emit.reps (Ctors, SumCtor, ctors_of, laid, laid_inside, word_form, ctor_fields_at, has_vars)
 import emit.layout (Laid, LSum, SumLaid, WordClass, CaseTest, WordIs, LowBits, Nullary, Inline,
                     Boxed, Itself, Bits, RuntimeBox, Box, LWords, words, layouts, block_sizes,
-                    columns_laid)
+                    columns_laid, branch_laid)
 import emit.tir (Fn, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Val, Literal, Static,
                  Prim, AInt, ABool, AVar, AFloat, AChar, ANum, AZero, Arg, Make, Made, MCase,
                  Gathered, Pack, RInt, RBool, RFloat, RNum, RImm, RUnit, RFlat, RDec, RWide, RWord,
@@ -112,8 +112,11 @@ pub fn laid_at(ctors: Ctors, ty: Type, k: Known) -> Laying / {abort.raise} = {
     },
     KnownList(ks) -> match container_args(ty, b"List") {
       [item] -> {
-        let held = ks.fold([], |acc: List<Held1>, x: Known| acc.push(word_at(ctors, item, x)));
-        objected(defs_of(held), list_laid(held.map(|w: Held1| w.word)))
+        let laid = ks.fold([], |acc: List<Laying>, x: Known| acc.push(inside_at(ctors, item, x)));
+        objected(
+          laid.fold([], |acc: List<StaticDef>, l: Laying| acc.concat(l.defs)),
+          list_laid(laid.map(|l: Laying| l.words), stride_of(ctors, item)),
+        )
       },
       _ -> mislaid(ty),
     },
@@ -151,12 +154,21 @@ pub fn laid_at(ctors: Ctors, ty: Type, k: Known) -> Laying / {abort.raise} = {
     },
     KnownMap(m) -> match container_args(ty, b"Map") {
       [key, value] -> if m.keys.len() != m.values.len() { mislaid(ty) } else {
-        let keys = m.keys.fold([], |acc: List<Held1>, x: Known| acc.push(word_at(ctors, key, x)));
-        let values = m.values.fold([], |acc: List<Held1>, x: Known|
-          acc.push(word_at(ctors, value, x)));
+        let keys = m.keys.fold([], |acc: List<Laying>, x: Known|
+          acc.push(inside_at(ctors, key, x)));
+        let values = m.values.fold([], |acc: List<Laying>, x: Known|
+          acc.push(inside_at(ctors, value, x)));
         objected(
-          defs_of(keys).concat(defs_of(values)),
-          map_laid(keys.map(|w: Held1| w.word), values.map(|w: Held1| w.word)),
+          keys.concat(values).fold([], |acc: List<StaticDef>, l: Laying| acc.concat(l.defs)),
+          // An empty map's object holds no pair, so it is the same at every type, an open one too.
+          if m.keys.len() == 0 { map_laid([], [], 1, 1) } else {
+            map_laid(
+              keys.map(|l: Laying| l.words),
+              values.map(|l: Laying| l.words),
+              stride_of(ctors, key),
+              stride_of(ctors, value),
+            )
+          },
         )
       },
       _ -> mislaid(ty),
@@ -164,12 +176,6 @@ pub fn laid_at(ctors: Ctors, ty: Type, k: Known) -> Laying / {abort.raise} = {
   };
   if l.words.len() != words(laid(ctors, ty)) { mislaid(ty) } else { l }
 }
-
-/// One word of static data and the statics it addresses, each after those it addresses.
-type Held1 = { word: StaticWord, defs: List<StaticDef> }
-
-fn defs_of(held: List<Held1>) -> List<StaticDef> =
-  held.fold([], |acc: List<StaticDef>, w: Held1| acc.concat(w.defs))
 
 /// The type arguments of `ty` where it is the builtin `name`; none otherwise.
 fn container_args(ty: Type, name: Bytes) -> List<Type> =
@@ -253,21 +259,32 @@ fn columns_static(
   )
 }
 
-/// The statics of a map of the words `keys` and `values`, pair by pair in its order, as the runtime lays sorted
-/// entries out: leaves of a node's width of pairs in order, the last of fewer, and branches of a
-/// node's width of children over them, each child's greatest key and its count of entries beside
-/// it, until one root stands; the map's own object, last, holds the root and how many levels of
-/// branches stand over the leaves. Each node has room for a full one, as a copy of it is written to.
-fn map_laid(keys: List<StaticWord>, values: List<StaticWord>) -> List<StaticDef> / {abort.raise} = {
-  let pairs = range(0, keys.len()).map(|i: Int| { key: keys.get(i), value: values.get(i) });
+/// The statics of a map of `keys` and `values`, each the words its type lays it as, `key_words` and
+/// `value_words` to each, pair by pair in its order: leaves of a node's width of pairs in order, the
+/// last of fewer, and branches of a node's width of children over them, each child's greatest key
+/// and its count of entries beside it, until one root stands; the map's own object, last, holds the
+/// root and how many levels of branches stand over the leaves. Each node has room for a full one, as
+/// a copy of it is written to.
+fn map_laid(
+  keys: List<List<StaticWord>>,
+  values: List<List<StaticWord>>,
+  key_words: Int,
+  value_words: Int,
+) -> List<StaticDef> / {abort.raise} = {
   let t = layouts().tree;
+  let br = branch_laid(key_words);
+  // `x`'s words, `n` of them, a word it leaves out zero.
+  let padded = |x: List<StaticWord>, n: Int|
+    range(0, n).map(|j: Int| match x.at(j) { Some(w) -> w, None -> WRaw(0) });
+  let pairs = range(0, keys.len()).map(|i: Int|
+    { key: padded(keys.get(i), key_words), value: padded(values.get(i), value_words) });
   let room = |kind: Int, n: Int, ws: List<StaticWord>, size: Int|
     named(
       SBlock({
         head: [
           { field: b"kind", value: kind },
           { field: b"len", value: n },
-          { field: block_sizes().leaf_room, value: t.width },
+          { field: block_sizes().node_room, value: size },
         ],
         words: ws.concat(range(ws.len(), size).map(|_: Int| WRaw(0))),
       }),
@@ -279,9 +296,12 @@ fn map_laid(keys: List<StaticWord>, values: List<StaticWord>) -> List<StaticDef>
       def: room(
         t.leaf,
         run.len(),
-        run.fold([], |acc: List<StaticWord>, p: { key: StaticWord, value: StaticWord }|
-          acc.push(p.key).push(p.value)),
-        2 * t.width,
+        run.fold(
+          [],
+          |acc: List<StaticWord>, p: { key: List<StaticWord>, value: List<StaticWord> }|
+            acc.concat(p.key).concat(p.value),
+        ),
+        t.width * (key_words + value_words),
       ),
       max: run.get(run.len() - 1).key,
       size: run.len(),
@@ -300,14 +320,14 @@ fn map_laid(keys: List<StaticWord>, values: List<StaticWord>) -> List<StaticDef>
             t.branch,
             kids.len(),
             slots(
-              t.sizes,
-              slots(t.keys, kids.map(|k: Node| WAddress({ name: k.def.name, tag: 0 }))).concat(
-                kids.map(|k: Node| k.max),
+              br.sizes,
+              slots(br.keys, kids.map(|k: Node| WAddress({ name: k.def.name, tag: 0 }))).concat(
+                kids.fold([], |acc: List<StaticWord>, k: Node| acc.concat(k.max)),
               ),
             ).concat(
               kids.map(|k: Node| WRaw(k.size * 2 + 1)),
             ),
-            block_sizes().branch_words,
+            br.words,
           ),
           max: kids.get(kids.len() - 1).max,
           size: kids.fold(0, |n: Int, k: Node| n + k.size),
@@ -335,9 +355,9 @@ fn map_laid(keys: List<StaticWord>, values: List<StaticWord>) -> List<StaticDef>
   )
 }
 
-/// A node of a map's tree laid out: its static, its greatest key's word and how many entries lie
+/// A node of a map's tree laid out: its static, its greatest key's words and how many entries lie
 /// under it.
-type Node = { def: StaticDef, max: StaticWord, size: Int }
+type Node = { def: StaticDef, max: List<StaticWord>, size: Int }
 
 /// How many levels of branches stand over `count` nodes laid a node's width to a branch, as
 /// `std.prelude`'s packing counts them.
@@ -355,26 +375,30 @@ fn levels_over(count: Int) -> Int / {abort.raise} =
 /// leaves gathered into branches until one root stands, and the rest the tail. A node has room for a
 /// full one, as a copy of it is written to; the list has room for its tail, and at least one item.
 /// The list's object is last.
-fn list_laid(items: List<StaticWord>) -> List<StaticDef> / {abort.raise} = {
+fn list_laid(items: List<List<StaticWord>>, stride: Int) -> List<StaticDef> / {abort.raise} = {
   let laid = layouts();
   let width = laid.trie.width;
   let n = items.len();
   let full = if n <= width { 0 } else { n / width * width };
   let padded = |ws: List<StaticWord>, room: Int|
     ws.concat(range(ws.len(), room).map(|_: Int| WRaw(0)));
-  let node = |kind: Int, ws: List<StaticWord>|
+  // The words of `xs`, `s` to each, a word one leaves out zero.
+  let flat = |xs: List<List<StaticWord>>, s: Int|
+    xs.fold([], |acc: List<StaticWord>, x: List<StaticWord>|
+      acc.concat(range(0, s).map(|j: Int| match x.at(j) { Some(w) -> w, None -> WRaw(0) })));
+  let node = |kind: Int, xs: List<List<StaticWord>>, s: Int|
     named(
       SBlock({
         head: [
           { field: b"kind", value: kind },
-          { field: b"len", value: ws.len() },
-          { field: block_sizes().node_room, value: width },
+          { field: b"len", value: xs.len() },
+          { field: block_sizes().node_room, value: width * s },
         ],
-        words: padded(ws, width),
+        words: padded(flat(xs, s), width * s),
       }),
     );
   let leaves = range(0, full / width).map(|i: Int|
-    node(laid.trie.leaf, items.slice(i * width, (i + 1) * width)));
+    node(laid.trie.leaf, items.slice(i * width, (i + 1) * width), stride));
   let trie = iterate(
     { level: leaves, defs: leaves },
     n + 1,
@@ -384,7 +408,8 @@ fn list_laid(items: List<StaticWord>) -> List<StaticDef> / {abort.raise} = {
           node(
             laid.trie.branch,
             s.level.drop(i * width).take(width).map(|d: StaticDef|
-              WAddress({ name: d.name, tag: 0 })),
+              [WAddress({ name: d.name, tag: 0 })]),
+            1,
           ));
         Continue({ level: up, defs: s.defs.concat(up) })
       },
@@ -395,9 +420,10 @@ fn list_laid(items: List<StaticWord>) -> List<StaticDef> / {abort.raise} = {
   };
   let tail = items.drop(full);
   let room = max(1, tail.len());
-  let slots = range(0, laid.list.tail + room).map(|i: Int|
+  let tail_words = flat(tail, stride);
+  let slots = range(0, laid.list.tail + room * stride).map(|i: Int|
     if i == laid.list.root { root }
-    else { match tail.at(i - laid.list.tail) { Some(w) -> w, None -> WRaw(0) } });
+    else { match tail_words.at(i - laid.list.tail) { Some(w) -> w, None -> WRaw(0) } });
   let list = named(
     SBlock({
       head: [
@@ -1555,8 +1581,13 @@ test "a map is laid as the runtime lays sorted entries: full leaves in order and
       { field: b"len", value: n },
       { field: b"layout", value: height },
     ];
+  // A node's room is its words: a leaf's 32 pairs of two, a branch's children, keys and sizes.
   let node_head = |kind: Int, n: Int|
-    [{ field: b"kind", value: kind }, { field: b"len", value: n }, { field: b"layout", value: 32 }];
+    [
+      { field: b"kind", value: kind },
+      { field: b"len", value: n },
+      { field: b"layout", value: if kind == 13 { 64 } else { 99 } },
+    ];
   let pairs = |from: Int, to: Int|
     range(from, to).fold([], |acc: List<StaticWord>, i: Int| acc.push(WRaw(i)).push(WRaw(0 - i)));
   assert_eq(upto(0).map(|d: StaticDef| d.laid), [
