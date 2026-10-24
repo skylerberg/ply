@@ -499,12 +499,14 @@ fn joined(a: List<Int>, b: List<Int>) -> List<Int> =
 type Origin = { bases: Map<Int, Bool>, fresh: Bool }
 
 /// What a body does with a value, read once its walk knows every join, and where in the text: it
-/// consumes it, hands it to parameter `param` of definition `to` by a jump to that one's start,
+/// consumes it into what it makes, hands it to a call or an operation that takes it and may write
+/// it where it lies, hands it to parameter `param` of definition `to` by a jump to that one's start,
 /// answers it, or sets join `join` to it.
 type Use = { does: Does, at: Span }
 
 type Does =
   | Consumes(Origin)
+  | Hands(Origin)
   | Jumps({ to: RootName, param: Int, of: Origin, counts: Bool })
   | Answers(Origin)
   | Sets({ join: Int, of: Origin })
@@ -618,9 +620,10 @@ fn member_walk(s: Sight, f: Fn) -> Walk =
   )
 
 /// What walk `w` gives, against `look`, the group's handings this round, and `h`, the walked
-/// member's own: its parameter whose value is consumed whole, answered owned, set to an owned join
-/// or jumped with to a given place; and a parameter a jump hands, at a lent place, something the
-/// jumping member does not lend on, so nothing outlasts the jump to release it.
+/// member's own: its parameter whose value is consumed, answered owned, set to an owned join or
+/// jumped with to a given place, or a part of which is handed to a call or an operation that takes
+/// it; and a parameter a jump hands, at a lent place, something the jumping member does not lend
+/// on, so nothing outlasts the jump to release it.
 fn gone_in(
   h: Handing,
   look: Map<RootName, Handing>,
@@ -631,6 +634,7 @@ fn gone_in(
   w.uses.fold({ own: Map::new(), jumped: [] }, |g: Gone, u: Use|
     match u.does {
       Consumes(o) -> { ..g, own: wholes(g.own, o, u.at) },
+      Hands(o) -> { ..g, own: parts(g.own, o, u.at) },
       Jumps(j) -> {
         let lent_there = match look.get(j.to) {
           Some(t) -> t.params.at(j.param) == Some(Lent),
@@ -714,6 +718,12 @@ fn wholes(g: Map<Int, Span>, o: Origin, at: Span) -> Map<Int, Span> =
   o.bases.fold(g, |acc: Map<Int, Span>, k: Int, whole: Bool|
     if whole { first_at(acc, k, at) } else { acc })
 
+/// `g` giving each parameter `o` holds or was read out of, as Lean's inference owns a value whose
+/// part is owned: a part a callee may write moves out of what is given, and out of what is lent is
+/// counted again, which leaves the write a part held twice to copy.
+fn parts(g: Map<Int, Span>, o: Origin, at: Span) -> Map<Int, Span> =
+  o.bases.fold(g, |acc: Map<Int, Span>, k: Int, _: Bool| first_at(acc, k, at))
+
 fn first_at(g: Map<Int, Span>, k: Int, at: Span) -> Map<Int, Span> =
   if g.contains(k) { g } else { g.insert(k, at) }
 
@@ -758,6 +768,14 @@ fn consumed(w: Walk, a: Arg) -> Walk =
 fn taken(w: Walk, ops: List<{ arg: Arg, takes: Bool }>) -> Walk =
   ops.fold(w, |acc: Walk, o: { arg: Arg, takes: Bool }|
     if o.takes { consumed(acc, o.arg) } else { acc })
+
+/// `w` past handing `a` to a call or an operation that takes it, where it holds a count.
+fn handed_on(w: Walk, a: Arg) -> Walk =
+  if counted(rep_of_arg(a)) { used(w, Hands(arg_origin(w, a))) } else { w }
+
+fn handed_all(w: Walk, ops: List<{ arg: Arg, takes: Bool }>) -> Walk =
+  ops.fold(w, |acc: Walk, o: { arg: Arg, takes: Bool }|
+    if o.takes { handed_on(acc, o.arg) } else { acc })
 
 /// Each of `args` handed to its parameter of `to` by a jump to that one's start.
 fn jumped(w: Walk, to: RootName, args: List<Arg>) -> Walk =
@@ -896,7 +914,7 @@ fn valued(s: Sight, w: Walk, val: Val, bound: Option<Var>) -> { walk: Walk, orig
       {
         walk: range(0, c.args.len()).fold(w, |a: Walk, k: Int|
           if h.params.at(k) == Some(Lent) { a }
-          else { match c.args.at(k) { Some(x) -> consumed(a, x), None -> a } }),
+          else { match c.args.at(k) { Some(x) -> handed_on(a, x), None -> a } }),
         origin: match h.answer {
           Owned -> made(),
           Borrowed(from) ->
@@ -910,9 +928,9 @@ fn valued(s: Sight, w: Walk, val: Val, bound: Option<Var>) -> { walk: Walk, orig
       }
     },
     Updated(_) -> { walk: taken(w, operands(val)), origin: made() },
-    Apply(_) -> { walk: taken(w, operands(val).drop(1)), origin: made() },
-    Native(n) -> { walk: taken(w, operands(val)), origin: answered_by(w, n.args, n.uses) },
-    Op(o) -> { walk: taken(w, operands(val)), origin: answered_by(w, o.args, o.uses) },
+    Apply(_) -> { walk: handed_all(w, operands(val).drop(1)), origin: made() },
+    Native(n) -> { walk: handed_all(w, operands(val)), origin: answered_by(w, n.args, n.uses) },
+    Op(o) -> { walk: handed_all(w, operands(val)), origin: answered_by(w, o.args, o.uses) },
     LastOf(x) -> { walk: taken(w, operands(val)), origin: arg_origin(w, AVar(x)) },
     Walked(x) ->
       { walk: taken(w, operands(val)), origin: if x.op == Share { none() } else { made() } },
