@@ -1,0 +1,769 @@
+//! A template filled: each reference by what it is to the hashing at hand, each level by where a
+//! commutable run's order puts its binder, and each set in the order its members' stored encodings
+//! sort in. What fills is the one stored form a hash is taken over (`stored.Stored`).
+
+import std.bin
+import std.list
+import std.option
+import std.bytes
+import store.hash.encoding (Spot, Pick)
+import store.hash.stored
+import store.hash.stored (Ref, Hashed, Member, Itself, ByName, Note, Picked, Ran, RunAt, Named, Local,
+                          Defined, Constructed, Unbound, Value, Effect, Declared, EffectUnbound,
+                          TypeName, TypeParam, TypeDefined, TypeUnbound, Ty, Applied, AppliedOver,
+                          Function, Fields, UnitType, TyField, Row, Atom, Moded, OfOp, Pat, Wild,
+                          Bind, Again, LitPat, RangePat, CtorPat, RecordPat, PatField, ListPat, OrPat,
+                          Callees, InFull, Among, Constant, Unwritten, Var, Binary, Unary, Lambda, App,
+                          OnValue, If, Match, Record, RecordUpdate, Field, ListOf, Perform, Handle,
+                          WithHold, Simulate, Parallel, Tagged, Filled, TryBlock, Block, Arm, Clause,
+                          Entry, One, Commuting, Let, LetElse, Effectful, Assign, Constrained, FnForm,
+                          Variant, TypeBody, Alias, Sum, Nominal, Extern, Through, Numeric, TypeForm,
+                          Op, EffectForm, TestForm, LawForm, SpecForm, Form, FnOf, TypeOf, EffectOf,
+                          TestOf, LawOf, SpecOf, Template, Stored, ref_bin, ty_field_bin, atom_bin,
+                          op_bin, stmt_bin, constrained_bin, stored_bin)
+
+/// What a template's holes are filled from: each referenced node's hash, its class where it shares
+/// the component being hashed, each effect's slot in the enumeration the form is written under, and
+/// whether a reference is written as the name `names` gives its node instead.
+pub type Filling = {
+  hashes: Map<Int, Bytes>,
+  component: Map<Int, Int>,
+  effects: Map<Int, Int>,
+  by_name: Bool,
+  names: List<Bytes>,
+}
+
+/// Each reference with nothing known: what orders a cycle's members and what a node references.
+pub fn blank() -> Filling =
+  { hashes: Map::new(), component: Map::new(), effects: Map::new(), by_name: false, names: [] }
+
+/// A filled template: its stored form, what it references in first-mention order, and each call
+/// on a value's pick in the order the form holds them.
+pub type Filled = { form: Stored, refs: List<Int>, chosen: List<Pick> }
+
+/// What filling has done so far: the references mentioned, those a row is holding back, where each
+/// run written so far starts and puts its members, and the picks met.
+type Fill = {
+  refs: List<Int>,
+  seen: Map<Int, Bool>,
+  deferred: Option<List<Int>>,
+  runs: Map<Int, Placed>,
+  chosen: List<Pick>,
+}
+
+/// A run's base level and each member's offset from it, by the member's place in the source.
+type Placed = { base: Int, offsets: List<Int> }
+
+type At<a> = { fill: Fill, form: a }
+
+pub fn filled(template: Template, f: Filling) -> Filled / {abort.raise} = {
+  let x = form(f, { refs: [], seen: Map::new(), deferred: None, runs: Map::new(), chosen: [] }, template);
+  { form: x.form, refs: x.fill.refs, chosen: x.fill.chosen }
+}
+
+/// The bytes a filled form's hash is taken over.
+pub fn bytes_of(stored: Stored) -> Bytes / {abort.raise} = bin::encode(stored, stored_bin())
+
+// --- References ----------------------------------------------------------------------------------
+
+fn mention(s: Fill, node: Int) -> Fill =
+  match s.deferred {
+    Some(held) -> { ..s, deferred: Some(held.push(node)) },
+    None -> if s.seen.contains(node) { s }
+    else { { ..s, seen: s.seen.insert(node, true), refs: s.refs.push(node) } },
+  }
+
+fn ref_of(f: Filling, v: Int) -> Ref / {abort.raise} =
+  if f.by_name { ByName(f.names.get(v)) } else {
+    match f.component.get(v) {
+      Some(ix) -> Member(ix),
+      None -> match f.hashes.get(v) { Some(h) -> Hashed(h), None -> Itself },
+    }
+  }
+
+fn refer(f: Filling, s: Fill, v: Int) -> At<Ref> / {abort.raise} = { fill: mention(s, v), form: ref_of(f, v) }
+
+fn refer_all(f: Filling, s: Fill, vs: List<Int>) -> At<List<Ref>> / {abort.raise} =
+  vs.fold({ fill: s, form: [] }, |acc: At<List<Ref>>, v: Int| {
+    let r = refer(f, acc.fill, v);
+    { fill: r.fill, form: acc.form.push(r.form) }
+  })
+
+fn level(s: Fill, spot: Spot) -> Int / {abort.raise} =
+  if spot.run < 0 { spot.within } else {
+    match s.runs.get(spot.run) {
+      Some(r) -> r.base + r.offsets.get(spot.member) + spot.within,
+      None -> panic("a level names a run not written"),
+    }
+  }
+
+fn named(f: Filling, s: Fill, n: Named<Int, Spot>) -> At<Named<Ref, Int>> / {abort.raise} =
+  match n {
+    Local(spot) -> { fill: s, form: Local(level(s, spot)) },
+    Defined(v) -> {
+      let r = refer(f, s, v);
+      { fill: r.fill, form: Defined(r.form) }
+    },
+    Constructed(v, name) -> {
+      let r = refer(f, s, v);
+      { fill: r.fill, form: Constructed(r.form, name) }
+    },
+    Unbound(free) -> { fill: s, form: Unbound(free) },
+  }
+
+fn value(f: Filling, s: Fill, v: Value<Int, Spot>) -> At<Value<Ref, Int>> / {abort.raise} = {
+  let n = named(f, s, v.named);
+  let w = refer_all(f, n.fill, v.written);
+  { fill: w.fill, form: { named: n.form, written: w.form } }
+}
+
+fn effect_of(f: Filling, s: Fill, e: Effect<Int, Bytes>) -> At<Effect<Ref, Int>> / {abort.raise} =
+  match e {
+    Declared(v, _) -> {
+      let r = refer(f, s, v);
+      { fill: r.fill, form: Declared(r.form, match f.effects.get(v) { Some(x) -> x, None -> 0 }) }
+    },
+    EffectUnbound(free) -> { fill: s, form: EffectUnbound(free) },
+  }
+
+// --- Sets ----------------------------------------------------------------------------------------
+
+type Keyed<a> = { key: Bytes, tie: Bytes, at: Int, value: a }
+
+fn keyed_lt<a>(x: Keyed<a>, y: Keyed<a>) -> Bool =
+  match compare_values(x.key, y.key) {
+    Less -> true,
+    Greater -> false,
+    Equal -> match compare_values(x.tie, y.tie) {
+      Less -> true,
+      Greater -> false,
+      Equal -> x.at < y.at,
+    },
+  }
+
+/// `xs` in the order of their keys, ties in the order given.
+fn sorted<a>(xs: List<Keyed<a>>) -> List<Keyed<a>> / {abort.raise} =
+  xs.sort_by(|x: Keyed<a>, y: Keyed<a>| !keyed_lt(y, x))
+
+/// `xs` sorted with one of each key kept.
+fn distinct<a>(xs: List<Keyed<a>>) -> List<Keyed<a>> / {abort.raise} =
+  sorted(xs).fold([], |acc: List<Keyed<a>>, x: Keyed<a>|
+    match acc.last() { Some(y) -> if y.key == x.key { acc } else { acc.push(x) }, None -> acc.push(x) })
+
+/// Each member filled where it stands, so what it mentions is mentioned in the order written; the
+/// members then sorted by their encodings.
+fn set_of<a, b>(
+  s: Fill,
+  xs: List<a>,
+  fill_one: (Fill, a) -> At<b> / {abort.raise},
+  key: (b) -> Bytes / {abort.raise},
+) -> At<List<b>> / {abort.raise} = {
+  let each = range(0, xs.len()).fold(
+    { fill: s, form: [] },
+    |acc: At<List<Keyed<b>>>, i: Int| {
+      let x = fill_one(acc.fill, xs.get(i));
+      { fill: x.fill, form: acc.form.push({ key: key(x.form), tie: b"", at: i, value: x.form }) }
+    },
+  );
+  { fill: each.fill, form: sorted(each.form).map(|k: Keyed<b>| k.value) }
+}
+
+// --- Types ---------------------------------------------------------------------------------------
+
+fn type_name(f: Filling, s: Fill, n: TypeName<Int>) -> At<TypeName<Ref>> / {abort.raise} =
+  match n {
+    TypeParam(l) -> { fill: s, form: TypeParam(l) },
+    TypeDefined(v) -> {
+      let r = refer(f, s, v);
+      { fill: r.fill, form: TypeDefined(r.form) }
+    },
+    TypeUnbound(free) -> { fill: s, form: TypeUnbound(free) },
+  }
+
+fn tys(f: Filling, s: Fill, ts: List<Ty<Int, Bytes>>) -> At<List<Ty<Ref, Int>>> / {abort.raise} =
+  ts.fold({ fill: s, form: [] }, |acc: At<List<Ty<Ref, Int>>>, t: Ty<Int, Bytes>| {
+    let x = ty(f, acc.fill, t);
+    { fill: x.fill, form: acc.form.push(x.form) }
+  })
+
+fn opt_ty(f: Filling, s: Fill, t: Option<Ty<Int, Bytes>>) -> At<Option<Ty<Ref, Int>>> / {abort.raise} =
+  match t {
+    None -> { fill: s, form: None },
+    Some(x) -> {
+      let y = ty(f, s, x);
+      { fill: y.fill, form: Some(y.form) }
+    },
+  }
+
+fn ty(f: Filling, s: Fill, t: Ty<Int, Bytes>) -> At<Ty<Ref, Int>> / {abort.raise} =
+  match t {
+    Applied(n, written, args) -> {
+      let a = type_name(f, s, n);
+      let w = refer_all(f, a.fill, written);
+      let xs = tys(f, w.fill, args);
+      { fill: xs.fill, form: Applied(a.form, w.form, xs.form) }
+    },
+    AppliedOver(n, written, args, labels, rows) -> {
+      let a = type_name(f, s, n);
+      let w = refer_all(f, a.fill, written);
+      let xs = tys(f, w.fill, args);
+      let rs = rows.fold({ fill: xs.fill, form: [] }, |acc: At<List<Row<Ref, Int>>>, r: Row<Int, Bytes>| {
+        let x = row(f, acc.fill, r);
+        { fill: x.fill, form: acc.form.push(x.form) }
+      });
+      { fill: rs.fill, form: AppliedOver(a.form, w.form, xs.form, labels, rs.form) }
+    },
+    Function(params, ret, r) -> {
+      let ps = tys(f, s, params);
+      let rt = ty(f, ps.fill, ret);
+      let rw = opt_row(f, rt.fill, r);
+      { fill: rw.fill, form: Function(ps.form, rt.form, rw.form) }
+    },
+    // A record type is a map from label to type, so field order is sorted away.
+    Fields(fs) -> {
+      let x = set_of(
+        s,
+        fs,
+        |st: Fill, field: TyField<Int, Bytes>| {
+          let y = ty(f, st, field.ty);
+          { fill: y.fill, form: { name: field.name, ty: y.form } }
+        },
+        |field: TyField<Ref, Int>| bin::encode(field, ty_field_bin(ref_bin(), bin::int_bin())),
+      );
+      { fill: x.fill, form: Fields(x.form) }
+    },
+    UnitType -> { fill: s, form: UnitType },
+  }
+
+fn opt_row(f: Filling, s: Fill, r: Option<Row<Int, Bytes>>) -> At<Option<Row<Ref, Int>>> / {abort.raise} =
+  match r {
+    None -> { fill: s, form: None },
+    Some(x) -> {
+      let y = row(f, s, x);
+      { fill: y.fill, form: Some(y.form) }
+    },
+  }
+
+/// A row is a set: atoms sorted by encoding, then by the effect's declaration, and deduplicated.
+/// Every atom's references are mentioned in that order, an atom the dedup drops included.
+fn row(f: Filling, s: Fill, r: Row<Int, Bytes>) -> At<Row<Ref, Int>> / {abort.raise} = {
+  let outer = s.deferred;
+  let each = range(0, r.atoms.len()).fold(
+    { fill: s, form: [] },
+    |acc: At<List<Keyed<{ atom: Atom<Ref, Int>, held: List<Int> }>>>, i: Int| {
+      let a = r.atoms.get(i);
+      let x = atom(f, { ..acc.fill, deferred: Some([]) }, a);
+      let tie = match a { Moded(Declared(_, t), _, _, _) -> t, OfOp(Declared(_, t), _, _, _) -> t, _ -> b"" };
+      {
+        fill: { ..x.fill, deferred: outer },
+        form: acc.form.push({
+          key: bin::encode(x.form, atom_bin(ref_bin(), bin::int_bin())),
+          tie: tie,
+          at: i,
+          value: { atom: x.form, held: match x.fill.deferred { Some(h) -> h, None -> [] } },
+        }),
+      }
+    },
+  );
+  let ordered = sorted(each.form);
+  let mentioned = ordered.fold(each.fill, |acc: Fill, k: Keyed<{ atom: Atom<Ref, Int>, held: List<Int> }>|
+    k.value.held.fold(acc, mention));
+  {
+    fill: mentioned,
+    form: {
+      atoms: distinct(ordered).map(|k: Keyed<{ atom: Atom<Ref, Int>, held: List<Int> }>| k.value.atom),
+      tail: r.tail,
+      bounded: r.bounded,
+    },
+  }
+}
+
+fn atom(f: Filling, s: Fill, a: Atom<Int, Bytes>) -> At<Atom<Ref, Int>> / {abort.raise} =
+  match a {
+    Moded(e, mode, label, bounded) -> {
+      let x = effect_of(f, s, e);
+      { fill: x.fill, form: Moded(x.form, mode, label, bounded) }
+    },
+    OfOp(e, op, label, bounded) -> {
+      let x = effect_of(f, s, e);
+      { fill: x.fill, form: OfOp(x.form, op, label, bounded) }
+    },
+  }
+
+// --- Patterns ------------------------------------------------------------------------------------
+
+fn pats(f: Filling, s: Fill, ps: List<Pat<Int, Spot>>) -> At<List<Pat<Ref, Int>>> / {abort.raise} =
+  ps.fold({ fill: s, form: [] }, |acc: At<List<Pat<Ref, Int>>>, p: Pat<Int, Spot>| {
+    let x = pat(f, acc.fill, p);
+    { fill: x.fill, form: acc.form.push(x.form) }
+  })
+
+fn pat(f: Filling, s: Fill, p: Pat<Int, Spot>) -> At<Pat<Ref, Int>> / {abort.raise} =
+  match p {
+    Wild -> { fill: s, form: Wild },
+    Bind -> { fill: s, form: Bind },
+    Again(spot) -> { fill: s, form: Again(level(s, spot)) },
+    LitPat(l) -> { fill: s, form: LitPat(l) },
+    RangePat(lo, hi) -> { fill: s, form: RangePat(lo, hi) },
+    CtorPat(n, args) -> {
+      let c = named(f, s, n);
+      let xs = pats(f, c.fill, args);
+      { fill: xs.fill, form: CtorPat(c.form, xs.form) }
+    },
+    RecordPat(fs, rest) -> {
+      let xs = fs.fold({ fill: s, form: [] }, |acc: At<List<PatField<Ref, Int>>>, field: PatField<Int, Spot>| {
+        let x = pat(f, acc.fill, field.pat);
+        { fill: x.fill, form: acc.form.push({ name: field.name, pat: x.form }) }
+      });
+      { fill: xs.fill, form: RecordPat(xs.form, rest) }
+    },
+    ListPat(items, rest) -> {
+      let xs = pats(f, s, items);
+      match rest {
+        None -> { fill: xs.fill, form: ListPat(xs.form, None) },
+        Some(r) -> {
+          let y = pat(f, xs.fill, r);
+          { fill: y.fill, form: ListPat(xs.form, Some(y.form)) }
+        },
+      }
+    },
+    OrPat(alts) -> {
+      let xs = pats(f, s, alts);
+      { fill: xs.fill, form: OrPat(xs.form) }
+    },
+  }
+
+// --- Expressions ---------------------------------------------------------------------------------
+
+type TExpr = stored::Expr<Int, Bytes, Spot, Note>
+
+type SExpr = stored::Expr<Ref, Int, Int, Unit>
+
+type TStmt = stored::Stmt<Int, Bytes, Spot, Note>
+
+type SStmt = stored::Stmt<Ref, Int, Int, Unit>
+
+fn exprs(f: Filling, s: Fill, es: List<TExpr>) -> At<List<SExpr>> / {abort.raise} =
+  es.fold({ fill: s, form: [] }, |acc: At<List<SExpr>>, e: TExpr| {
+    let x = expr(f, acc.fill, e);
+    { fill: x.fill, form: acc.form.push(x.form) }
+  })
+
+fn opt_expr(f: Filling, s: Fill, e: Option<TExpr>) -> At<Option<SExpr>> / {abort.raise} =
+  match e {
+    None -> { fill: s, form: None },
+    Some(x) -> {
+      let y = expr(f, s, x);
+      { fill: y.fill, form: Some(y.form) }
+    },
+  }
+
+fn rec_fields(
+  f: Filling,
+  s: Fill,
+  fs: List<stored::RecField<Int, Bytes, Spot, Note>>,
+) -> At<List<stored::RecField<Ref, Int, Int, Unit>>> / {abort.raise} =
+  fs.fold(
+    { fill: s, form: [] },
+    |acc: At<List<stored::RecField<Ref, Int, Int, Unit>>>, x: stored::RecField<Int, Bytes, Spot, Note>| {
+      let y = expr(f, acc.fill, x.value);
+      { fill: y.fill, form: acc.form.push({ name: x.name, value: y.form }) }
+    },
+  )
+
+fn callees(f: Filling, s: Fill, c: Callees<Int, Spot>) -> At<Callees<Ref, Int>> / {abort.raise} =
+  match c {
+    InFull(v) -> {
+      let x = value(f, s, v);
+      { fill: x.fill, form: InFull(x.form) }
+    },
+    Among(vs) -> {
+      let x = refer_all(f, s, vs);
+      { fill: x.fill, form: Among(x.form) }
+    },
+  }
+
+fn picked(s: Fill, note: Note) -> Fill / {abort.raise} =
+  match note {
+    Picked(p) -> { ..s, chosen: s.chosen.push(p) },
+    Ran(_) -> panic("a call on a value noted as a run"),
+  }
+
+fn expr(f: Filling, s: Fill, e: TExpr) -> At<SExpr> / {abort.raise} =
+  match e {
+    Constant(l) -> { fill: s, form: Constant(l) },
+    Unwritten -> { fill: s, form: Unwritten },
+    Var(v) -> {
+      let x = value(f, s, v);
+      { fill: x.fill, form: Var(x.form) }
+    },
+    Binary(op, l, r, written) -> {
+      let a = expr(f, s, l);
+      let b = expr(f, a.fill, r);
+      let w = refer_all(f, b.fill, written);
+      { fill: w.fill, form: Binary(op, a.form, b.form, w.form) }
+    },
+    Unary(op, x) -> {
+      let a = expr(f, s, x);
+      { fill: a.fill, form: Unary(op, a.form) }
+    },
+    Lambda(types, body) -> {
+      let ts = types.fold({ fill: s, form: [] }, |acc: At<List<Option<Ty<Ref, Int>>>>, t: Option<Ty<Int, Bytes>>| {
+        let x = opt_ty(f, acc.fill, t);
+        { fill: x.fill, form: acc.form.push(x.form) }
+      });
+      let b = expr(f, ts.fill, body);
+      { fill: b.fill, form: Lambda(ts.form, b.form) }
+    },
+    App(func, args, labels) -> {
+      let a = expr(f, s, func);
+      let xs = exprs(f, a.fill, args);
+      { fill: xs.fill, form: App(a.form, xs.form, labels) }
+    },
+    OnValue(c) -> {
+      let base = expr(f, s, c.base);
+      let args = exprs(f, base.fill, c.args);
+      let named = rec_fields(f, args.fill, c.named);
+      let cs = callees(f, named.fill, c.callees);
+      {
+        fill: picked(cs.fill, c.note),
+        form: OnValue({
+          base: base.form,
+          name: c.name,
+          labels: c.labels,
+          args: args.form,
+          named: named.form,
+          callees: cs.form,
+          note: (),
+        }),
+      }
+    },
+    If(c, t, x) -> {
+      let a = expr(f, s, c);
+      let b = expr(f, a.fill, t);
+      let d = expr(f, b.fill, x);
+      { fill: d.fill, form: If(a.form, b.form, d.form) }
+    },
+    Match(scrutinee, arms) -> {
+      let a = expr(f, s, scrutinee);
+      let xs = arms.fold({ fill: a.fill, form: [] }, |acc: At<List<Arm<Ref, Int, Int, Unit>>>, arm: Arm<Int, Bytes, Spot, Note>| {
+        let p = pat(f, acc.fill, arm.pat);
+        let g = opt_expr(f, p.fill, arm.guard);
+        let b = expr(f, g.fill, arm.body);
+        { fill: b.fill, form: acc.form.push({ pat: p.form, guard: g.form, body: b.form }) }
+      });
+      { fill: xs.fill, form: Match(a.form, xs.form) }
+    },
+    Record(fs) -> {
+      let xs = rec_fields(f, s, fs);
+      { fill: xs.fill, form: Record(xs.form) }
+    },
+    RecordUpdate(base, fs) -> {
+      let a = expr(f, s, base);
+      let xs = rec_fields(f, a.fill, fs);
+      { fill: xs.fill, form: RecordUpdate(a.form, xs.form) }
+    },
+    Field(base, name) -> {
+      let a = expr(f, s, base);
+      { fill: a.fill, form: Field(a.form, name) }
+    },
+    ListOf(items) -> {
+      let xs = exprs(f, s, items);
+      { fill: xs.fill, form: ListOf(xs.form) }
+    },
+    Perform(e, op, label, args) -> {
+      let x = effect_of(f, s, e);
+      let xs = exprs(f, x.fill, args);
+      { fill: xs.fill, form: Perform(x.form, op, label, xs.form) }
+    },
+    Handle(h) -> {
+      let vars = h.vars.fold(
+        { fill: s, form: [] },
+        |acc: At<List<stored::HandlerVar<Ref, Int, Int, Unit>>>, v: stored::HandlerVar<Int, Bytes, Spot, Note>| {
+          let t = opt_ty(f, acc.fill, v.ty);
+          let i = expr(f, t.fill, v.init);
+          { fill: i.fill, form: acc.form.push({ ty: t.form, init: i.form }) }
+        },
+      );
+      let body = expr(f, vars.fill, h.body);
+      let clauses = h.clauses.fold(
+        { fill: body.fill, form: [] },
+        |acc: At<List<Clause<Ref, Int, Int, Unit>>>, c: Clause<Int, Bytes, Spot, Note>| {
+          let x = effect_of(f, acc.fill, c.effect);
+          let b = expr(f, x.fill, c.body);
+          {
+            fill: b.fill,
+            form: acc.form.push({
+              effect: x.form,
+              op: c.op,
+              label: c.label,
+              params: c.params,
+              resumes: c.resumes,
+              body: b.form,
+            }),
+          }
+        },
+      );
+      let ret = opt_expr(f, clauses.fill, h.ret);
+      {
+        fill: ret.fill,
+        form: Handle({ vars: vars.form, body: body.form, clauses: clauses.form, ret: ret.form }),
+      }
+    },
+    WithHold(resource, acquire, release, body) -> {
+      let a = expr(f, s, acquire);
+      let r = expr(f, a.fill, release);
+      let b = expr(f, r.fill, body);
+      { fill: b.fill, form: WithHold(resource, a.form, r.form, b.form) }
+    },
+    Simulate(body) -> {
+      let b = expr(f, s, body);
+      { fill: b.fill, form: Simulate(b.form) }
+    },
+    Parallel(branches) -> {
+      let xs = exprs(f, s, branches);
+      { fill: xs.fill, form: Parallel(xs.form) }
+    },
+    Tagged(parser, text) -> {
+      let p = value(f, s, parser);
+      { fill: p.fill, form: Tagged(p.form, text) }
+    },
+    Filled(parser, filler, head, holes) -> {
+      let p = value(f, s, parser);
+      let q = value(f, p.fill, filler);
+      let xs = holes.fold(
+        { fill: q.fill, form: [] },
+        |acc: At<List<stored::FilledHole<Ref, Int, Int, Unit>>>, h: stored::FilledHole<Int, Bytes, Spot, Note>| {
+          let v = expr(f, acc.fill, h.value);
+          { fill: v.fill, form: acc.form.push({ value: v.form, text: h.text }) }
+        },
+      );
+      { fill: xs.fill, form: Filled(p.form, q.form, head, xs.form) }
+    },
+    TryBlock(raised, body) -> {
+      let r = match raised {
+        None -> { fill: s, form: None },
+        Some(x) -> {
+          let y = effect_of(f, s, x.effect);
+          { fill: y.fill, form: Some({ effect: y.form, op: x.op }) }
+        },
+      };
+      let b = expr(f, r.fill, body);
+      { fill: b.fill, form: TryBlock(r.form, b.form) }
+    },
+    Block(entries, tail) -> {
+      let xs = entries.fold(
+        { fill: s, form: [] },
+        |acc: At<List<Entry<Ref, Int, Int, Unit>>>, x: Entry<Int, Bytes, Spot, Note>| {
+          let y = entry(f, acc.fill, x);
+          { fill: y.fill, form: acc.form.push(y.form) }
+        },
+      );
+      let t = opt_expr(f, xs.fill, tail);
+      { fill: t.fill, form: Block(xs.form, t.form) }
+    },
+  }
+
+fn entry(f: Filling, s: Fill, x: Entry<Int, Bytes, Spot, Note>) -> At<Entry<Ref, Int, Int, Unit>> / {abort.raise} =
+  match x {
+    One(st) -> {
+      let y = stmt(f, s, st);
+      { fill: y.fill, form: One(y.form) }
+    },
+    Commuting(note, members) -> match note {
+      Ran(r) -> run(f, s, r, members),
+      Picked(_) -> panic("a run noted as a pick"),
+    },
+  }
+
+/// Each member's encoding at the run's base orders the run, ties in source order; each member is
+/// then filled where that order puts it, after the binders of those before it. What the members
+/// mention is mentioned in the order written; their picks in the order filled.
+fn run(f: Filling, s: Fill, r: RunAt, members: List<TStmt>) -> At<Entry<Ref, Int, Int, Unit>> / {abort.raise} = {
+  let base = level(s, r.base);
+  let n = members.len();
+  let flat = { base: base, offsets: range(0, n).map(|i: Int| 0) };
+  let keyed = range(0, n).fold(
+    { fill: { ..s, runs: s.runs.insert(r.id, flat) }, form: [] },
+    |acc: At<List<Keyed<Int>>>, i: Int| {
+      let x = stmt(f, acc.fill, members.get(i));
+      {
+        fill: { ..x.fill, chosen: acc.fill.chosen },
+        form: acc.form.push({
+          key: bin::encode(x.form, stmt_bin(ref_bin(), bin::int_bin(), bin::int_bin(), bin::unit_bin())),
+          tie: b"",
+          at: i,
+          value: i,
+        }),
+      }
+    },
+  );
+  let order = sorted(keyed.form).map(|k: Keyed<Int>| k.value);
+  let offsets = order.fold(
+    { next: 0, offsets: range(0, n).map(|i: Int| 0) },
+    |acc: { next: Int, offsets: List<Int> }, i: Int|
+      { next: acc.next + r.binders.get(i), offsets: acc.offsets.set(i, acc.next) },
+  ).offsets;
+  let placed = order.fold(
+    { fill: { ..keyed.fill, runs: keyed.fill.runs.insert(r.id, { base: base, offsets: offsets }) }, form: [] },
+    |acc: At<List<SStmt>>, i: Int| {
+      let x = stmt(f, acc.fill, members.get(i));
+      { fill: x.fill, form: acc.form.push(x.form) }
+    },
+  );
+  { fill: placed.fill, form: Commuting((), placed.form) }
+}
+
+fn stmt(f: Filling, s: Fill, st: TStmt) -> At<SStmt> / {abort.raise} =
+  match st {
+    Let(t, v, p) -> {
+      let a = opt_ty(f, s, t);
+      let b = expr(f, a.fill, v);
+      let c = pat(f, b.fill, p);
+      { fill: c.fill, form: Let(a.form, b.form, c.form) }
+    },
+    LetElse(t, v, p, fallback) -> {
+      let a = opt_ty(f, s, t);
+      let b = expr(f, a.fill, v);
+      let c = pat(f, b.fill, p);
+      let d = expr(f, c.fill, fallback);
+      { fill: d.fill, form: LetElse(a.form, b.form, c.form, d.form) }
+    },
+    Effectful(x) -> {
+      let a = expr(f, s, x);
+      { fill: a.fill, form: Effectful(a.form) }
+    },
+    Assign(v, x) -> {
+      let a = value(f, s, v);
+      let b = expr(f, a.fill, x);
+      { fill: b.fill, form: Assign(a.form, b.form) }
+    },
+  }
+
+// --- Items ---------------------------------------------------------------------------------------
+
+/// Sorted and deduplicated: the same two constraints in the other order are one definition.
+fn constraints(cs: List<Constrained>) -> List<Constrained> / {abort.raise} =
+  distinct(range(0, cs.len()).map(|i: Int|
+    { key: bin::encode(cs.get(i), constrained_bin()), tie: b"", at: i, value: cs.get(i) })).map(
+    |k: Keyed<Constrained>| k.value,
+  )
+
+fn values(f: Filling, s: Fill, vs: List<Value<Int, Spot>>) -> At<List<Value<Ref, Int>>> / {abort.raise} =
+  vs.fold({ fill: s, form: [] }, |acc: At<List<Value<Ref, Int>>>, v: Value<Int, Spot>| {
+    let x = value(f, acc.fill, v);
+    { fill: x.fill, form: acc.form.push(x.form) }
+  })
+
+fn form(f: Filling, s: Fill, t: Template) -> At<Stored> / {abort.raise} =
+  match t {
+    FnOf(d) -> {
+      let params = d.params.fold(
+        { fill: s, form: [] },
+        |acc: At<List<stored::Param<Ref, Int, Int, Unit>>>, p: stored::Param<Int, Bytes, Spot, Note>| {
+          let t = opt_ty(f, acc.fill, p.ty);
+          let x = opt_expr(f, t.fill, p.default);
+          { fill: x.fill, form: acc.form.push({ kept: p.kept, spaced: p.spaced, ty: t.form, default: x.form }) }
+        },
+      );
+      let ret = opt_ty(f, params.fill, d.ret);
+      let r = opt_row(f, ret.fill, d.row);
+      let measure = opt_expr(f, r.fill, d.decreases);
+      let baked = match d.baked {
+        None -> { fill: measure.fill, form: None },
+        Some(vs) -> {
+          let x = refer_all(f, measure.fill, vs);
+          { fill: x.fill, form: Some(x.form) }
+        },
+      };
+      let body = expr(f, baked.fill, d.body);
+      {
+        fill: body.fill,
+        form: FnOf({
+          generics: d.generics,
+          params: params.form,
+          ret: ret.form,
+          row: r.form,
+          constraints: constraints(d.constraints),
+          returns: d.returns,
+          decreases: measure.form,
+          baked: baked.form,
+          body: body.form,
+        }),
+      }
+    },
+    TypeOf(d) -> {
+      let body = match d.body {
+        Alias(x) -> {
+          let y = ty(f, s, x);
+          { fill: y.fill, form: Alias(y.form) }
+        },
+        Sum(name, variants) -> {
+          let vs = variants.fold({ fill: s, form: [] }, |acc: At<List<Variant<Ref, Int>>>, v: Variant<Int, Bytes>| {
+            let x = tys(f, acc.fill, v.fields);
+            { fill: x.fill, form: acc.form.push({ name: v.name, fields: x.form }) }
+          });
+          { fill: vs.fill, form: Sum(name, vs.form) }
+        },
+        Nominal(name, x) -> {
+          let y = ty(f, s, x);
+          { fill: y.fill, form: Nominal(name, y.form) }
+        },
+        Extern(name) -> { fill: s, form: Extern(name) },
+      };
+      let through = d.through.fold({ fill: body.fill, form: [] }, |acc: At<List<Through<Ref, Int>>>, x: Through<Int, Spot>| {
+        let v = value(f, acc.fill, x.by);
+        { fill: v.fill, form: acc.form.push({ key: x.key, by: v.form }) }
+      });
+      let numerics = d.numerics.fold({ fill: through.fill, form: [] }, |acc: At<List<Numeric<Ref, Int>>>, x: Numeric<Int, Spot>| {
+        let v = value(f, acc.fill, x.by);
+        { fill: v.fill, form: acc.form.push({ op: x.op, by: v.form }) }
+      });
+      {
+        fill: numerics.fill,
+        form: TypeOf({
+          generics: d.generics,
+          over: d.over,
+          constraints: constraints(d.constraints),
+          body: body.form,
+          opaque: d.opaque,
+          through: through.form,
+          numerics: numerics.form,
+        }),
+      }
+    },
+    EffectOf(d) -> {
+      let ops = set_of(
+        s,
+        d.ops,
+        |st: Fill, op: Op<Int, Bytes>| {
+          let ps = tys(f, st, op.params);
+          let rt = ty(f, ps.fill, op.ret);
+          {
+            fill: rt.fill,
+            form: { name: op.name, mode: op.mode, resource: op.resource, types: op.types, params: ps.form, ret: rt.form },
+          }
+        },
+        |op: Op<Ref, Int>| bin::encode(op, op_bin(ref_bin(), bin::int_bin())),
+      );
+      { fill: ops.fill, form: EffectOf({ name: d.name, nondet: d.nondet, ops: ops.form }) }
+    },
+    TestOf(d) -> {
+      let cases = opt_ty(f, s, d.cases);
+      let body = expr(f, cases.fill, d.body);
+      { fill: body.fill, form: TestOf({ nondet: d.nondet, cases: cases.form, body: body.form }) }
+    },
+    LawOf(d) -> {
+      let binders = tys(f, s, d.binders);
+      let guard = opt_expr(f, binders.fill, d.guard);
+      let body = expr(f, guard.fill, d.body);
+      { fill: body.fill, form: LawOf({ binders: binders.form, guard: guard.form, body: body.form }) }
+    },
+    SpecOf(d) -> {
+      let body = expr(f, s, d.body);
+      {
+        fill: body.fill,
+        form: SpecOf({ kind: d.kind, generics: d.generics, params: d.params, names: d.names, body: body.form }),
+      }
+    },
+  }
