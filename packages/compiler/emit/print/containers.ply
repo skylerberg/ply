@@ -14,7 +14,7 @@ import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, Tail
 import emit.roots (builtin_helper)
 import emit.keys (Root, Copy)
 import emit.answer (CallAt)
-import emit.release (root_of, laid_parts, form_parts)
+import emit.release (root_of, laid_parts, form_parts, item_parts)
 import emit.pieces (Piece, Text, Hole, Symbol, ShapeOf, spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RFlat, RSum, Leaf, Var, Arg, AVar,
                  AInt, AZero, Made, MList, Uses, Containers, Convention, Given, Owned, counted,
@@ -26,9 +26,10 @@ import emit.tir.containers (ContainerOp, Laid, Length, Elements, Within, ArrayNe
                             Taken, Element)
 import emit.print.text (Printing, Place, printing, line, pad, pieces, temp, named, name_of,
                         arg_text, assigned, site, check, shape_at, zero, part_names, unprinted)
-import emit.lower.held (leaf_span, leaves_within, leaf_values, values_of, held_with)
+import emit.lower.held (leaf_span, leaves_within, leaf_values, values_of, held_with, item_held,
+                        leaf_type)
 import emit.print.made (c_type, c_types, as_word, word_as, word_parts, head_types, arg_parts,
-                        words_laid, parts_read)
+                        words_laid, parts_read, read_from)
 import emit.print.counts (Said, released, duped, let_go_of, dup_of)
 import emit.print.lists (item_read, leaf_read, rest_made, list_made)
 import emit.print.strings (taken_printed)
@@ -48,7 +49,12 @@ pub fn contained(
     MList(_) -> match into {
       Some(v) -> {
         let n = named(pr, v);
-        list_made(n.pr, p.depth, n.name, m.args.map(|a: Arg| arg_text(pr, a)))
+        list_made(
+          n.pr,
+          p.depth,
+          n.name,
+          range(0, m.args.len()).map(|k: Int| item_word(pr, m.args, k)),
+        )
       },
       None -> unprinted(Containers, b"a list made that nothing holds", made_said(m.made)),
     },
@@ -127,7 +133,7 @@ pub fn container_op(
           object,
           index,
         );
-        assigned(read, p.depth, v, c_type(v.rep), word_as(w.name, v.rep))
+        assigned(read, p.depth, v, c_type(v.rep), item_value(pr, w.name, v))
       },
       LeafOf -> {
         let n = named(pr, v);
@@ -186,8 +192,10 @@ fn laid_printed(
   let o = operand(pr, args, 0);
   let i = operand(pr, args, 1);
   let raw = |e: Bytes| assigned(pr, p.depth, v, c_type(v.rep), e);
-  // An item is a word in the object, read as the scalar it is where `v` holds one.
-  let read = |slot: Bytes| raw(word_as(slot, v.rep));
+  // An item is a word in the object: a scalar's own bits, or its word form read as `v` holds it.
+  let read = |slot: Bytes| raw(item_value(pr, slot, v));
+  // An item written is the word its slot holds: a scalar's bits, or its word form.
+  let item = |k: Int| item_word(pr, args, k);
   let header = |w: Bytes, field: Bytes| Bytes::concat_all([b"ply_obj(", w, b")->", field]);
   let header_int = |field: Bytes| raw(Bytes::concat_all([b"(int64_t)", header(o, field)]));
   let made = |kind: Int|
@@ -231,7 +239,7 @@ fn laid_printed(
       p.depth,
       Bytes::concat_all([b"Word ", old.name, b" = ", slot, b"; ", slot, b" = ", x, b";"]),
     );
-    said_line(let_go_of(set, form_parts(pr.ctors, ty), [old.name]), p.depth)
+    said_line(let_go_of(set, item_parts(pr.ctors, ty), [old.name]), p.depth)
   };
   match op {
     OfList(ListStart) -> header_int(laid.list.start),
@@ -299,7 +307,7 @@ fn laid_printed(
         Bytes::concat_all([
           tail(header(a, laid.list.tail_len)),
           b" = ",
-          operand(pr, args, 1),
+          item(1),
           b"; ",
           header(a, laid.list.tail_len),
           b" += 1; ",
@@ -313,7 +321,7 @@ fn laid_printed(
         Bytes::concat_all([
           tail(b"0"),
           b" = ",
-          operand(pr, args, 1),
+          item(1),
           b"; ",
           header(a, laid.list.tail_len),
           b" = 1; ",
@@ -322,14 +330,8 @@ fn laid_printed(
         ]),
       ),
     OfList(TailSet) ->
-      replaced(
-        owned(Some(header(a, laid.list.tail_len))),
-        tail(i),
-        operand(pr, args, 2),
-        held_type(node),
-      ),
-    OfList(LeafSet) ->
-      replaced(owned(Some(header(a, b"len"))), at(i), operand(pr, args, 2), held_type(node)),
+      replaced(owned(Some(header(a, laid.list.tail_len))), tail(i), item(2), held_type(node)),
+    OfList(LeafSet) -> replaced(owned(Some(header(a, b"len"))), at(i), item(2), held_type(node)),
     OfMap(MapRoot) -> raw(slot_of(o, ascii_of_int(laid.map.root))),
     OfMap(MapHeight) -> header_int(laid.map.height),
     OfMap(NodeCount) -> header_int(b"len"),
@@ -350,11 +352,11 @@ fn laid_printed(
           shifted(pair, Bytes::concat_all([b"2 * (", after(b""), b")"]), b"2"),
           at(pair),
           b" = ",
-          operand(pr, args, 2),
+          item(2),
           b"; ",
           at(pair.concat(b" + 1")),
           b" = ",
-          operand(pr, args, 3),
+          item(3),
           b"; ",
           header(a, b"len"),
           b" += 1;",
@@ -363,11 +365,11 @@ fn laid_printed(
     },
     OfMap(PairSet) -> {
       let pair = Bytes::concat_all([b"2 * ", index]);
-      let keyed = replaced(owned(pairs), at(pair), operand(pr, args, 2), type_arg(node, 0));
-      replaced(keyed, at(pair.concat(b" + 1")), operand(pr, args, 3), type_arg(node, 1))
+      let keyed = replaced(owned(pairs), at(pair), item(2), type_arg(node, 0));
+      replaced(keyed, at(pair.concat(b" + 1")), item(3), type_arg(node, 1))
     },
     OfMap(KidBack) -> {
-      let maxed = replaced(owned(None), at(keys(index)), operand(pr, args, 3), type_arg(node, 0));
+      let maxed = replaced(owned(None), at(keys(index)), item(3), type_arg(node, 0));
       line(
         maxed,
         p.depth,
@@ -398,7 +400,7 @@ fn laid_printed(
           b"; ",
           at(keys(index)),
           b" = ",
-          operand(pr, args, 3),
+          item(3),
           b"; ",
           at(sizes(index)),
           b" = ply_imm(",
@@ -415,7 +417,7 @@ fn laid_printed(
       // The kid dropped goes to its node's drop, the greatest key under it as its type counts it.
       let kid = said_line(released(owned(None), node, RWord, [at(index)]), p.depth);
       let key = said_line(
-        let_go_of(kid, form_parts(pr.ctors, type_arg(node, 0)), [at(keys(index))]),
+        let_go_of(kid, item_parts(pr.ctors, type_arg(node, 0)), [at(keys(index))]),
         p.depth,
       );
       line(
@@ -685,7 +687,13 @@ fn fields_set(p: Place, pr: Printing, v: Var, fields: List<Answered>) -> Printin
         } else {
           // A sum's word form is the sum itself, whatever it counts, but for one of a raw scalar,
           // read out as that scalar is.
+          let raw_item = x.item
+            && (match leaf_type(v.ty, x.name) {
+              Some(t) -> item_held(pr.ctors, t) != RWord,
+              None -> false,
+            });
           let value = if !x.item { x.word }
+          else if raw_item { nth(read_from(|_: Int| x.word, r), 0) }
           else if counted(r) || (match r { RSum(s) -> !raw_sum(s.laid), _ -> false }) {
             word_as(x.word, r)
           } else {
@@ -698,6 +706,19 @@ fn fields_set(p: Place, pr: Printing, v: Var, fields: List<Answered>) -> Printin
 }
 
 fn nth(xs: List<Bytes>, k: Int) -> Bytes = match xs.at(k) { Some(x) -> x, None -> b"" }
+
+/// The item the word `slot` of a list's or a map's node holds, read as `v` holds it: a scalar's
+/// own bits, or its word form read as its type is (`held.item_held`).
+pub fn item_value(pr: Printing, slot: Bytes, v: Var) -> Bytes =
+  if item_held(pr.ctors, v.ty) != RWord { nth(read_from(|_: Int| slot, v.rep), 0) }
+  else { word_as(slot, v.rep) }
+
+/// Operand `k`, an item or a node, as the word a node's slot holds of it.
+fn item_word(pr: Printing, args: List<Arg>, k: Int) -> Bytes =
+  match args.at(k) {
+    Some(a) -> nth(words_laid([arg_text(pr, a)], [rep_of_arg(a)]), 0),
+    None -> b"0",
+  }
 
 fn slot_of(w: Bytes, at: Bytes) -> Bytes = Bytes::concat_all([b"ply_words(", w, b")[", at, b"]"])
 
@@ -976,7 +997,7 @@ fn array_of_list(
 }
 
 /// The C opening a loop over the `n` items of the list `l`, each item of type `ty` read as the
-/// word the list holds it as, counted once more and taken into the C values `values`, held as `rep`,
+/// list holds it, counted once more and taken into the C values `values`, held as `rep`,
 /// for the loop's body, which the caller writes at `depth + 1` and closes.
 fn items_held(
   pr: Printing,
@@ -992,13 +1013,25 @@ fn items_held(
   let names = part_names(x.name, rep);
   let opened = line(x.pr, depth, Bytes::concat_all([for_each(i, b"0", n), b"Word ", w.name, b";"]));
   let read = item_read(opened, depth + 1, w.name, l, i);
-  let dup = dup_of(form_parts(pr.ctors, ty), [w.name]);
+  let dup = dup_of(item_parts(pr.ctors, ty), [w.name]);
   let counted = if dup.len() == 0 { read } else { line(read, depth + 1, dup) };
+  // A scalar the list holds as its own bits is read out of them; any other item out of its word form.
+  let taken = if item_held(pr.ctors, ty) != RWord {
+    [
+      Text(
+        Bytes::concat_all([
+          c_type(rep),
+          b" ",
+          nth(names, 0),
+          b" = ",
+          nth(read_from(|_: Int| w.name, rep), 0),
+          b";",
+        ]),
+      ),
+    ]
+  } else { word_parts(w.name, rep, names) };
   {
-    pr: pieces(
-      counted,
-      [Text(pad(depth + 1))].concat(word_parts(w.name, rep, names)).push(Text(b"\n")),
-    ),
+    pr: pieces(counted, [Text(pad(depth + 1))].concat(taken).push(Text(b"\n"))),
     values: names,
     rep: rep,
   }
@@ -1668,16 +1701,16 @@ test "a list's item is read where it lies and its rest shares its trie, neither 
     assert_eq(text.index_of(b"ctx->failed"), None)
   });
   // A read counts nothing; a rest counts the root it shares and each item it copies, as the item's
-  // type counts it: an `Int`'s word only where it is the runtime's box.
+  // type counts it: an `Int`, its own bits, not at all.
   [item, scalar].fold((), |_: Unit, text: Bytes|
     assert(!counts_any(text), Some(String::of_bytes_lossy(text))));
   assert(rest.split(call_start(dup_fn(), [])).len() > 2, Some(String::of_bytes_lossy(rest)));
+  assert(ints.split(call_start(dup_fn(), [])).len() == 2, Some(String::of_bytes_lossy(ints)));
+  // A scalar is its item's own bits.
   assert(
-    ints.index_of(Bytes::concat_all([b" & 7)) ", call_start(dup_fn(), [])])) != None,
-    Some(String::of_bytes_lossy(ints)),
-  );
-  // A scalar is read out of the item's word.
-  assert(scalar.index_of(b"int64_t ") != None, Some(String::of_bytes_lossy(scalar)))
+    scalar.index_of(b"int64_t ") != None && scalar.index_of(b"rt_unbox_int") == None,
+    Some(String::of_bytes_lossy(scalar)),
+  )
 }
 
 fn con(name: Bytes, args: List<Type>) -> Type = TyCon({ name: name, args: args })

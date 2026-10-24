@@ -10,6 +10,7 @@ import emit.code (Code, NApp, NVar)
 import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, int_type, bool_type,
                     unit_type, option_type, record_fields)
 import check.resolve.tables (qualify)
+import emit.typing (unknown_type)
 import emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt, NodeLen, LeafAt,
                     KidAt, TailPush, TailSet, LeafSet, RootSwap, KidSwap, TailStart, Spill,
                     NewBranch, MapRoot, NodeCount, MapHeight, NodeKey, NodeValue, NodeKid, KidMax,
@@ -29,9 +30,9 @@ import emit.tir.containers (ContainerOp, Laid, Length, Elements, Within, ArrayNe
                             Element)
 import emit.lower.setting (imported_target, qualified, from_import, module_import, builtin_at,
                            prelude_ctor)
-import emit.lower.held (held_as, laid_leaves)
+import emit.lower.held (held_as, laid_leaves, item_held)
 import emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, noted, filed, unfiled,
-                        type_of, as_words, opened, continued)
+                        type_of, opened, continued)
 import emit.lower.base
 import emit.lower.data (constructed_as)
 import emit.lower.scalars (operated, runtime_builtin, stated, binary, numeric_in_place,
@@ -227,12 +228,20 @@ fn column_at(
     },
   }
 
-/// A list literal of `items`, each a word the list takes, of the type the checker filed for it.
+/// A list literal of `items`, each taken as the list holds an item (`held.item_held`), of the type
+/// the checker filed for it.
 pub fn listed(cx: Context, st: Lowering, items: List<Arg>, at: Span) -> Lowered / {abort.raise} =
   match filed(cx, at) {
     None -> unfiled(cx, st, b"a list", at),
     Some(t) -> {
-      let words = as_words(st, items, at);
+      let rep = item_held(cx.setting.ctors, type_arg_of(t.ty, 0));
+      let words = items.fold(
+        { st: st, args: [] },
+        |acc: { st: Lowering, args: List<Arg> }, a: Arg| {
+          let h = handed({ st: acc.st, arg: a }, rep, at);
+          { st: h.st, args: acc.args.push(h.arg) }
+        },
+      );
       bound_as(
         words.st,
         t.ty,
@@ -495,8 +504,9 @@ fn is_option(t: Type) -> Bool =
   match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
 
 /// What an extern written in place does with an operand: reads the object it reads, takes a word it
-/// writes or stores, takes an `Option` as its payload's word, or reads an index or a count.
-type Operand = | Read | Taken | TakenMaybe | Index
+/// writes or stores, takes an `Option` as its payload's word, reads an index or a count, or takes an
+/// item of the type argument `k` of its first operand's type, as a node holds one.
+type Operand = | Read | Taken | TakenMaybe | Index | ItemOf(Int)
 
 /// What an extern written in place answers: a value held as a representation of its own, an item,
 /// held as the item's type says where that is a scalar and as its word otherwise, or the record of
@@ -544,7 +554,10 @@ fn laid(cx: Context, st: Lowering, op: Intrinsic, args: List<Arg>, ty: Type, at:
                 { st: acc.st, arg: a },
                 match l.operands.at(i) {
                   Some(Index) -> RInt,
-                  Some(TakenMaybe) -> RWord,
+                  Some(ItemOf(k)) -> match args.at(0) {
+                    Some(o) -> item_held(cx.setting.ctors, type_arg_of(type_of(o), k)),
+                    None -> RWord,
+                  },
                   _ -> RWord,
                 },
                 at,
@@ -568,7 +581,8 @@ fn laid(cx: Context, st: Lowering, op: Intrinsic, args: List<Arg>, ty: Type, at:
           op: OContainer(Laid(op)),
           args: handed_over.args,
           uses: {
-            takes: l.operands.map(|o: Operand| o == Taken || o == TakenMaybe),
+            takes: l.operands.map(|o: Operand|
+              match o { Taken -> true, TakenMaybe -> true, ItemOf(_) -> true, _ -> false }),
             owned: l.owned,
             fails: false,
             stops: false,
@@ -594,6 +608,13 @@ fn fields_held(cx: Context, ty: Type) -> Option<List<Leaf>> = {
   };
   if ls.len() == 0 { None } else { Some(ls) }
 }
+
+/// Type argument `k` of `ty`, a container's or a node's type; none known otherwise.
+fn type_arg_of(ty: Type, k: Int) -> Type =
+  match ty {
+    TyCon(c) -> match c.args.at(k) { Some(a) -> a, None -> unknown_type() },
+    _ -> unknown_type(),
+  }
 
 /// An item read out of an object as the scalar its type holds, or else as the word it is there.
 fn item_rep(cx: Context, ty: Type) -> Rep =
@@ -623,10 +644,10 @@ fn laying(op: Intrinsic) -> Laying = {
     OfList(TailAt) -> item,
     OfList(LeafAt) -> item,
     OfList(KidAt) -> read([Read, Index], RWord),
-    OfList(TailPush) -> written([Taken, Taken]),
-    OfList(TailStart) -> written([Taken, Taken]),
-    OfList(TailSet) -> written([Taken, Index, Taken]),
-    OfList(LeafSet) -> written([Taken, Index, Taken]),
+    OfList(TailPush) -> written([Taken, ItemOf(0)]),
+    OfList(TailStart) -> written([Taken, ItemOf(0)]),
+    OfList(TailSet) -> written([Taken, Index, ItemOf(0)]),
+    OfList(LeafSet) -> written([Taken, Index, ItemOf(0)]),
     OfList(NewBranch) -> made,
     OfList(RootSwap) -> record([Taken, TakenMaybe]),
     OfList(KidSwap) -> record([Taken, Index, TakenMaybe]),
@@ -641,10 +662,10 @@ fn laying(op: Intrinsic) -> Laying = {
     OfMap(KidSize) -> read([Read, Index], RInt),
     OfMap(NewLeaf) -> made,
     OfMap(NewMapBranch) -> made,
-    OfMap(PairPut) -> written([Taken, Index, Taken, Taken]),
-    OfMap(PairSet) -> written([Taken, Index, Taken, Taken]),
-    OfMap(KidBack) -> written([Taken, Index, Taken, Taken, Index]),
-    OfMap(KidPut) -> written([Taken, Index, Taken, Taken, Index]),
+    OfMap(PairPut) -> written([Taken, Index, ItemOf(0), ItemOf(1)]),
+    OfMap(PairSet) -> written([Taken, Index, ItemOf(0), ItemOf(1)]),
+    OfMap(KidBack) -> written([Taken, Index, Taken, ItemOf(0), Index]),
+    OfMap(KidPut) -> written([Taken, Index, Taken, ItemOf(0), Index]),
     OfMap(KidDrop) -> written([Taken, Index]),
     OfMap(PairTake) -> record([Taken, Index]),
     OfMap(LeafCut) -> record([Taken, Index]),
