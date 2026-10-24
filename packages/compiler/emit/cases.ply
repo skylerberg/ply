@@ -945,20 +945,21 @@ test "a value's layout is read off its node's type where the value carries none"
   assert_eq(has(b"builtin_max_p"), [false, false, false, false])
 }
 
-test "a builtin the runtime answers a sum of crosses over its encoding, at whatever type it is called" {
+test "a builtin the runtime answers a sum of crosses over its encoding, and a word's checked arithmetic is written in place" {
   let src = Bytes::concat_all([
     b"fn added(a: Int, b: Int) -> Option<Int> = checked_add(a, b)\n",
     b"fn multiplied(a: Int, b: Int) -> Option<Int> = checked_mul(a, b)\n",
     b"fn wide(a: U64, b: U64) -> Option<U64> = checked_add(a, b)\n",
+    b"fn decoded(s: Secret<String>) -> Option<Secret<Bytes>> / {abort.raise} = Secret::decode(\"hex\", s)\n",
   ]);
-  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
-  assert_eq(out.map(|e: Emitted| e.why), [None, None, None]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [b"Secret::decode"], true);
+  assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None]);
   let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
   // The runtime makes a sum as an object of its own, which no layout emitted code reads holds.
-  assert_eq(has(b"rt_builtin_encoded_p("), [true, true, true]);
+  assert_eq(has(b"rt_builtin_encoded_p("), [false, false, false, true]);
   assert_eq([has(b"builtin_checked_add_p"), has(b"builtin_checked_mul_p")], [
-    [false, false, false],
-    [false, false, false],
+    [false, false, false, false],
+    [false, false, false, false],
   ])
 }
 
@@ -2605,7 +2606,7 @@ test "a byte `byte_of_int` answers is the unit's own, so a loop appending bytes 
     answered_body(answers_at([b"m"], [src], [], [Named(b"m.bytes")]), b"m.bytes").text,
   );
   assert(
-    text.index_of(b"ply_one_byte(") != None && text.index_of(b"rt_alloc") == None,
+    text.index_of(b"ply_one_byte(") != None && outside_appends(text).index_of(b"rt_alloc") == None,
     Some(String::of_bytes_lossy(text)),
   )
 }
@@ -4039,6 +4040,24 @@ test "a wanted body is lowered though the answer holds nothing of a test beside 
   }
 }
 
+/// Where emitted C appends one string's or byte string's bytes to another's: `++` and `concat`.
+fn appended() -> Bytes = b"{ int64_t sl = "
+
+/// `text` without the appends it writes, which grow their buffer into a block they make where it
+/// lacks the room.
+fn outside_appends(text: Bytes) -> Bytes / {abort.raise} = {
+  let parts = text.split(appended());
+  Bytes::concat_all(
+    parts.take(1).concat(
+      parts.drop(1).map(|p: Bytes|
+        match p.index_of(b"; } }") { Some(e) -> p.slice(e + 5, p.len()), None -> b"" }),
+    ),
+  )
+}
+
+/// Where a branch of the body itself, not of an append it writes, gives way to its `else`.
+fn body_else() -> Bytes = b"\n  } else {"
+
 test "a buffer read out of a record this body holds alone reaches its append unshared" {
   let src = Bytes::concat_all([
     b"type S = { out: Bytes, n: Int }\n",
@@ -4076,8 +4095,10 @@ test "a buffer read out of a record this body holds alone reaches its append uns
   assert_eq(
     names.filter(|n: Bytes| {
       let body = code(n);
-      match body.index_of(b"rt_concat_p(") {
-        Some(c) -> takes_count(body.slice(0, c)) || body.index_of(b"rt_alloc") != None,
+      // The append grows the buffer in place where it holds the room, else into a block it makes.
+      match body.index_of(appended()) {
+        Some(c) ->
+          takes_count(body.slice(0, c)) || outside_appends(body).index_of(b"rt_alloc") != None,
         None -> true,
       }
     }),
@@ -4303,7 +4324,7 @@ test "a branch lets go as it opens of a parameter only another branch takes, and
   // The branch that does not take `x` lets it go before anything else it does.
   let slot = text(b"m.slot");
   assert(
-    match slot.index_of(b"} else {") {
+    match slot.index_of(body_else()) {
       Some(a) -> {
         let rest = slot.slice(a, slot.len()).split(b";");
         match rest.at(0) { Some(first) -> lets_go_of(first.concat(b";"), b"p0"), None -> false }
@@ -4316,7 +4337,7 @@ test "a branch lets go as it opens of a parameter only another branch takes, and
   // leaves: the branch that reads only its moved field has nothing of it to let go before its concat.
   let quiet = |name: Bytes| {
     let t = text(name);
-    match ((t.index_of(b"} else {"), t.index_of(b"rt_concat_p("))) {
+    match ((t.index_of(body_else()), t.index_of(appended()))) {
       (Some(a), Some(b)) -> a < b && !lets_count_go(t.slice(a, b)),
       _ -> false,
     }
