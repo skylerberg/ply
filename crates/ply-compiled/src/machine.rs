@@ -84,6 +84,18 @@ pub fn natives() -> Vec<MachineNative> {
             rt_secret_verify as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
         machine_native(
+            "?secret_len",
+            rt_secret_len as unsafe extern "C" fn(_, _) -> _,
+        ),
+        machine_native(
+            "?secret_bytes",
+            rt_secret_bytes as unsafe extern "C" fn(_, _) -> _,
+        ),
+        machine_native(
+            "?secret_concat",
+            rt_secret_concat as unsafe extern "C" fn(_, _, _) -> _,
+        ),
+        machine_native(
             "?refused_text",
             rt_refused_text as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
@@ -385,18 +397,58 @@ pub unsafe extern "C" fn rt_secret_of(ctx: *mut Ctx, p: Addr, n: I64, text: I64)
 /// compared in constant time; else 0.
 pub unsafe extern "C" fn rt_secret_verify(ctx: *mut Ctx, stored: Handle, p: Addr, n: I64) -> I64 {
     let c = unsafe { &mut *ctx };
-    let w = stored.word();
-    if w == 0 || crate::heap::kind(w) != KIND_BRIDGE {
-        c.fail(err_machine("a credential that is no runtime object"));
+    let Some(held) = secret_held(c, &stored) else {
         return I64(0);
-    }
-    let held = unsafe { bridged(obj(w)) }.clone();
+    };
     let Some(s) = c.text(unsafe { lent(p, n) }) else {
         return I64(0);
     };
     match c.builtin(Builtin::SecretVerify, vec![held, Value::str(s)]) {
         Some(Value::Bool(b)) => I64(i64::from(b)),
         _ => I64(0),
+    }
+}
+
+/// The secret the lent handle `s` holds, or none where it is no runtime object, which fails the
+/// entry as Ply's fault.
+fn secret_held(c: &mut Ctx, s: &Handle) -> Option<Value> {
+    let w = s.word();
+    if w == 0 || crate::heap::kind(w) != KIND_BRIDGE {
+        c.fail(err_machine("a credential that is no runtime object"));
+        return None;
+    }
+    Some(unsafe { bridged(obj(w)) }.clone())
+}
+
+/// How many bytes the secret the lent handle `s` holds; 0 where it holds none.
+pub unsafe extern "C" fn rt_secret_len(ctx: *mut Ctx, s: Handle) -> I64 {
+    let c = unsafe { &mut *ctx };
+    match &secret_held(c, &s) {
+        Some(Value::Secret(held)) => I64(held.bytes().len() as i64),
+        _ => I64(0),
+    }
+}
+
+/// `Secret::bytes` of the secret the lent handle `s` holds, as a handle of its own.
+pub unsafe extern "C" fn rt_secret_bytes(ctx: *mut Ctx, s: Handle) -> Handle {
+    let c = unsafe { &mut *ctx };
+    let made = secret_held(c, &s).and_then(|v| c.builtin(Builtin::SecretBytes, vec![v]));
+    match made {
+        Some(v @ Value::Secret(_)) => Handle::of(c.heap.bridge(v)),
+        _ => Handle::of(0),
+    }
+}
+
+/// `Secret::concat` of the secrets the lent handles `a` and `b` hold, as a handle of its own.
+pub unsafe extern "C" fn rt_secret_concat(ctx: *mut Ctx, a: Handle, b: Handle) -> Handle {
+    let c = unsafe { &mut *ctx };
+    let made = match (secret_held(c, &a), secret_held(c, &b)) {
+        (Some(x), Some(y)) => c.builtin(Builtin::SecretConcat, vec![x, y]),
+        _ => None,
+    };
+    match made {
+        Some(v @ Value::Secret(_)) => Handle::of(c.heap.bridge(v)),
+        _ => Handle::of(0),
     }
 }
 
